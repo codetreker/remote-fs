@@ -1,0 +1,39 @@
+[thresholds]
+total = 85
+function = 50
+package = 70
+print = 85
+
+[test]
+timeout = "180s"
+race = false
+
+[exclude]
+# Deliberately empty. Excluding `cmd` here would drop the end-to-end tests from the run
+# altogether, and a coverage number computed without them is a number reported while the
+# evidence for it is missing. This key selects what gets tested, not what gets measured.
+packages = [
+]
+
+# Built by cmd/processes_test.go with plain `go build` and executed as subprocesses.
+# Subprocess coverage needs -cover, GOCOVERDIR and `go tool covdata`, none of which
+# go-cov does, so these two sit at a permanent 0%. Naming them as files rather than as a
+# package keeps `cmd` in the test run, so a compile break in them still fails.
+#
+# storagetest is test code that happens not to live in a _test.go file: it imports
+# `testing`, its only export is Run(t *testing.T, …), it is imported by two _test.go files
+# and by nothing else, and it is linked into zero binaries. Measuring how well the tests
+# test themselves answers nothing.
+files = [
+  "cmd/remote-fs/main.go",
+  "cmd/remote-fs-server/main.go",
+  "packages/storage/storagetest/storagetest.go",
+]
+funcs = []
+
+[html]
+enabled = false
+path = ".coverage/test_coverage.html"
+
+[critical_blocks]
+fail = false

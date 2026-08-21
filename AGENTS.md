@@ -55,6 +55,67 @@ lacks.
 **`docs/design/` moves with the code**, in the same change. It does not lead by a
 separate step and it does not lag behind.
 
+## Checks
+
+Before pushing, run the ones that cover this diff — not the full suite:
+
+```
+go build ./...                 # every package, including cmd/
+go vet ./...
+gofmt -l .                     # prints nothing when the tree is formatted
+go test ./...                  # mount and end-to-end tests need /dev/fuse
+go test -race ./packages/fuse/ ./packages/transport/httprest/
+```
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs those same commands on every
+pull request and on every commit that reaches `main`, in two jobs: one for the layers that
+need no mountpoint, one that mounts filesystems. They are split because a mount can wedge,
+and a wedged job should not take the rest of the answer down with it. Exhaustive coverage
+is that run's job, and it starts itself.
+
+CI adds four things that working on a single change does not need.
+
+**`-count=1` on every invocation.** The test cache keys on environment variables but not on
+files outside the module, so a pass recorded where `/dev/fuse` existed replays unchanged
+where it does not.
+
+**[`assert-every-test-ran.sh`](.github/scripts/assert-every-test-ran.sh) in place of bare
+`go test`.** `go test` exits 0 when a test skips, and without `/dev/fuse` the differential
+and end-to-end layers skip themselves — so the run that proved nothing reports the same
+green as the run that proved everything. The script fails on any skip, on a package pattern
+that matches no test, and on any test that reaches no verdict. It takes `go test`'s own
+flags and packages, so it substitutes for any line above.
+
+**The coverage gate.** `-coverpkg` is not optional here: the contract suite is one package
+executed by two others, so per-package measurement reports it as 0% and understates the
+module by more than thirty points.
+
+```
+GOFLAGS="-coverpkg=$(go list -m)/... -count=1" go-cov --ci --skip-result-packages cmd
+```
+
+`--ci` is what turns a threshold breach into a non-zero exit; without it `go-cov` prints
+`CRITICAL` and exits 0. `--skip-result-packages cmd` drops the summary row for a package
+that has tests but no statements of its own; its failures still fail the run. For one
+boundary in isolation, `go test -coverpkg=<import paths> -coverprofile=/tmp/c.out` followed
+by `go tool cover -func=/tmp/c.out` still answers faster.
+
+**A check that nothing stayed mounted.** Tests that mount leave the machine dirty when they
+fail badly, and the run that left one behind has usually already reported success. After a
+run that went wrong, confirm `/proc/self/mounts` holds no `fuse.remote-fs` line, that
+`/sys/fs/fuse/connections/` is back to what it was, and that no `fusermount` process
+survived.
+
+Relative links in Markdown are mechanically checkable, and CI checks them; check them
+yourself after moving or renaming anything:
+
+```
+while IFS= read -r f; do d=$(dirname "$f"); \
+  grep -oP '\]\(\K[^)#]+(?=[)#])' "$f" | grep -v '^https\?://' | \
+  while read -r l; do [ -e "$d/$l" ] || echo "BROKEN $f -> $l"; done; \
+done < <(find . -name '*.md' -not -path './.git/*')
+```
+
 ## Two rules learned the hard way
 
 **An architecture nobody has attacked is not ready to build against.** An
@@ -95,3 +156,32 @@ naturally that way.
 
 `docs/research/`, `.agents/skills/`, code, comments, and commit messages are in
 English.
+
+---
+
+## Rules
+
+### All changes go through a worktree (hard rule)
+
+- **Always** make any code, config, or doc change in a dedicated worktree under `.worktrees/` — even a tiny single-file bug fix or a throwaway experiment.
+- **Never** edit the primary working tree (the repo's current checkout) directly — it must stay clean so you can switch branches / pull main anytime.
+- **One task = one worktree = one branch = one PR.** Implementation, tests, doc sync, and acceptance state all land in that single PR.
+  - Work that genuinely **depends on an unmerged PR** stacks on top of that PR's branch instead of waiting for it or bundling into it.
+- Already edited the primary tree? **Move** those changes into a worktree before continuing.
+
+### The main context coordinates; it delegates context-heavy work
+
+The main context does what **needs a global view but doesn't burn context** — driving the workflow, deciding gates, draft architecture, breaking down tasks, feeding each subagent the context it needs, reviewing, merging, and synthesizing results. It preserves its own context by handing off everything that would consume a lot of it.
+
+- **Delegate context-heavy work to worker subagents** — deep research, coding, detailed verification, and broad git / GitHub operations (commit, push, opening PRs, checking CI gates, merging, cleaning up worktrees / branches). Only simple orientation queries (e.g. `git status`, `git log --oneline -5`) stay inline, when they keep the main context oriented without derailing it.
+
+### Writing large files (hard rule)
+
+- **Write large files in chunks.** When creating or heavily editing a large file, write an initial slice, then **append** the rest with follow-up edits — **never** emit the whole file in one tool call. One oversized write can time out and waste the turn.
+
+### Use Subagent Driven Development
+
+- Figure out the task clearly.
+- Breakdown into tasks and resolve the dependencies.
+- Spawn worker subagents in parallel where the dependencies allow it.
+- Review independently.
