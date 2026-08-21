@@ -783,6 +783,61 @@ var cases = []testCase{
 		mustFailWithAny(t, s.Rename(ctx(t), "from", "to"), syscall.ENOTEMPTY, syscall.EEXIST)
 	}},
 
+	// POSIX settles this and settles it as a no-op: when the two names "resolve to either
+	// the same existing directory entry or different directory entries for the same
+	// existing file, rename() shall return successfully and perform no other action". The
+	// node keeps its place and its contents however either name is spelled. Nothing is
+	// destroyed, which is what an implementation counting what the namespace holds has to
+	// see — there is no removal here for it to credit anyone for.
+	// https://pubs.opengroup.org/onlinepubs/9799919799/functions/rename.html
+	{"rename onto itself succeeds and changes nothing", func(t *testing.T, s storage.Storage) {
+		mustSucceed(t, s.Mkdir(ctx(t), "d"))
+		mustSucceed(t, s.Write(ctx(t), "f", []byte("payload")))
+		mustSucceed(t, s.Write(ctx(t), "d/inner", []byte("deeper")))
+
+		for _, move := range [][2]string{
+			{"f", "f"},
+			{"f", "./f"},
+			{"d/../f", "f"},
+			{"d", "d"},
+			{"d/inner", "d/./inner"},
+		} {
+			if err := s.Rename(ctx(t), move[0], move[1]); err != nil {
+				t.Fatalf("rename %q to %q: %v", move[0], move[1], err)
+			}
+		}
+
+		for _, held := range [][2]string{{"f", "payload"}, {"d/inner", "deeper"}} {
+			got, err := s.Read(ctx(t), held[0])
+			if err != nil {
+				t.Fatalf("read %q: %v", held[0], err)
+			}
+			if string(got) != held[1] {
+				t.Fatalf("read %q gave %q, want %q", held[0], got, held[1])
+			}
+		}
+		mustHoldExactly(t, s, "d", "f")
+	}},
+
+	// The node still has to be there, and this is the input that says whether an
+	// implementation established that. Two names that resolve to one node are cheap to spot
+	// from the operands alone, and answering from them is a report that a move happened
+	// where the truth is that there was nothing to move — indistinguishable, to everything
+	// above, from the successful no-op above it.
+	{"rename a missing node onto itself is ENOENT", func(t *testing.T, s storage.Storage) {
+		mustSucceed(t, s.Mkdir(ctx(t), "d"))
+		for _, move := range [][2]string{
+			{"missing", "missing"},
+			{"d/../missing", "missing"},
+			{"d/missing", "d/./missing"},
+		} {
+			if err := s.Rename(ctx(t), move[0], move[1]); !errors.Is(err, syscall.ENOENT) {
+				t.Fatalf("rename %q to %q failed with %v, want ENOENT", move[0], move[1], err)
+			}
+		}
+		mustHoldExactly(t, s, "d")
+	}},
+
 	// --- paths --------------------------------------------------------------------
 
 	{"an absolute path is EINVAL", func(t *testing.T, s storage.Storage) {

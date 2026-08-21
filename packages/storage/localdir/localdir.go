@@ -303,6 +303,14 @@ func (s *Storage) RemoveDir(_ context.Context, path string) error {
 // a directory cannot be moved inside itself, and the destination root always holds at
 // least the source — but the errnos that come back, EINVAL and EEXIST, each name an
 // incidental obstacle rather than the rule, and they differ by direction and by host.
+//
+// The move itself calls rename(2) rather than os.Rename, which lstats the destination and,
+// finding a directory there, returns an EEXIST of its own making without issuing the
+// syscall at all. Four answers the kernel gives are lost to that: POSIX has a rename whose
+// operands resolve to the same existing entry return successfully and perform no other
+// action, a rename onto an empty directory succeed, a destination that still has entries
+// answer ENOTEMPTY, and a file onto a directory answer EISDIR. A program written for a
+// local directory gets all four, and it gets them here (R-FS-2).
 func (s *Storage) Rename(_ context.Context, from, to string) error {
 	hostFrom, err := s.host(from)
 	if err != nil {
@@ -315,7 +323,10 @@ func (s *Storage) Rename(_ context.Context, from, to string) error {
 	if hostFrom == s.root || hostTo == s.root {
 		return &os.LinkError{Op: "rename", Old: from, New: to, Err: syscall.EBUSY}
 	}
-	return os.Rename(hostFrom, hostTo)
+	if err := syscall.Rename(hostFrom, hostTo); err != nil {
+		return &os.LinkError{Op: "rename", Old: from, New: to, Err: err}
+	}
+	return nil
 }
 
 // host maps a namespace path onto a path in the underlying directory. Everything that
