@@ -12,27 +12,73 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// Reserve records the intent to write an object and returns the key to write it under.
+// Reserve records the intent to write path's new contents and returns the key to write them
+// under.
 //
 // The row is committed before the key is handed back, and that is the whole point of the
 // call. An object written under a key no committed record mentions cannot be told apart
 // from one a writer is about to commit, and a sweeper that cannot tell those apart either
 // deletes live data or waits out a grace period long enough to make its own correctness a
 // guess about how slow a write can be.
-func (s *Store) Reserve(ctx context.Context) (metastore.Key, error) {
+//
+// The refusals below are the commit's, made early so that a write which cannot land does
+// not pay to upload its bytes first. They are advisory: the namespace may change between
+// the reservation and the commit, so commit asks all of them again and is the one whose
+// answer decides. A refusal here leaves nothing behind — the reservation is inserted in the
+// same transaction that checks, so a refused reservation is not a key for a sweeper to find.
+func (s *Store) Reserve(ctx context.Context, path string, size int64) (metastore.Key, error) {
+	cleaned, err := storage.CleanPath(path)
+	if err != nil {
+		return "", pathError("reserve", path, err)
+	}
+	if size < 0 {
+		return "", pathError("reserve", path, fmt.Errorf(
+			"an object of %d bytes is not a length: %w", size, syscall.EINVAL))
+	}
+	// The root is a directory, and a directory holds no contents to write.
+	if cleaned == "" {
+		return "", pathError("reserve", path, syscall.EISDIR)
+	}
+
 	key, err := newKey()
 	if err != nil {
 		return "", err
 	}
 	sec, nsec := storedTime(time.Now())
 	if err := s.mutate(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `
+		// The same questions the commit will ask, asked before the bytes are paid for. The
+		// answers are not binding — the namespace may change between the two calls, which is
+		// why commit asks them again and is the one that decides — so nothing here is
+		// recorded except the reservation itself.
+		parent, name, err := s.resolveParent(ctx, tx, cleaned)
+		if err != nil {
+			return err
+		}
+		node, found, err := lookup(ctx, tx, parent.ID, name)
+		if err != nil {
+			return err
+		}
+		if found && node.IsDir() {
+			return syscall.EISDIR
+		}
+		// What the commit would charge: the difference against whatever the name holds now,
+		// not the whole object, so overwriting a large file with a slightly larger one is not
+		// refused by a namespace that has room for the difference.
+		var held int64
+		if found {
+			held = node.Size
+		}
+		if err := s.roomFor(ctx, tx, size-held); err != nil {
+			return err
+		}
+
+		_, err = tx.ExecContext(ctx, `
 			INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
 			VALUES (?, ?, ?, 0, NULL, ?, ?)`,
 			string(key), s.namespace, stateReserved, sec, nsec)
 		return err
 	}); err != nil {
-		return "", fmt.Errorf("reserving an object key: %w", failure(err))
+		return "", pathError("reserve", path, failure(err))
 	}
 	return key, nil
 }
@@ -181,24 +227,40 @@ func (s *Store) createCommitted(ctx context.Context, tx *sql.Tx, parent metastor
 // pay for.
 //
 // The refusal and the charge are one step inside the caller's transaction, which is what
-// leaves no window between deciding there is room and taking it. A namespace with no
-// allowance is never refused, and neither is a change that shrinks one: a workspace already
-// over its limit would otherwise have no way back under it.
+// leaves no window between deciding there is room and taking it.
 func (s *Store) account(ctx context.Context, tx *sql.Tx, delta int64) error {
-	if s.allowance > 0 && delta > 0 {
-		used, err := s.used(ctx, tx)
-		if err != nil {
-			return err
-		}
-		// Written as a subtraction from the allowance rather than an addition to the count,
-		// so that a namespace holding close to what a byte count holds cannot wrap the sum
-		// into a figure that passes.
-		if delta > s.allowance-used {
-			return fmt.Errorf("%d more bytes would carry the namespace past its allowance of %d bytes, of which %d are taken: %w",
-				delta, s.allowance, used, syscall.EDQUOT)
-		}
+	if err := s.roomFor(ctx, tx, delta); err != nil {
+		return err
 	}
 	return s.charge(ctx, tx, delta)
+}
+
+// roomFor refuses a change of delta bytes the allowance cannot pay for, without moving the
+// counter.
+//
+// It is separate from the charge because a reservation asks the question without taking the
+// room: the bytes are not the namespace's until they are committed, and a reservation that
+// charged would have to be refunded by something — nothing refunds a reservation that is
+// never committed, so the counter would drift up by every abandoned write.
+//
+// A namespace with no allowance is never refused, and neither is a change that shrinks one:
+// a workspace already over its limit would otherwise have no way back under it.
+func (s *Store) roomFor(ctx context.Context, tx *sql.Tx, delta int64) error {
+	if s.allowance == 0 || delta <= 0 {
+		return nil
+	}
+	used, err := s.used(ctx, tx)
+	if err != nil {
+		return err
+	}
+	// Written as a subtraction from the allowance rather than an addition to the count, so
+	// that a namespace holding close to what a byte count holds cannot wrap the sum into a
+	// figure that passes.
+	if delta > s.allowance-used {
+		return fmt.Errorf("%d more bytes would carry the namespace past its allowance of %d bytes, of which %d are taken: %w",
+			delta, s.allowance, used, syscall.EDQUOT)
+	}
+	return nil
 }
 
 // charge moves the counter without asking the allowance anything.
@@ -223,6 +285,13 @@ func (s *Store) used(ctx context.Context, tx *sql.Tx) (int64, error) {
 // was displaced. A reservation nobody committed is garbage once it is older than grace,
 // which is the one place a duration bounds anything here: it says how long a write may take
 // between reserving a key and committing it.
+//
+// Handing a key out and retiring the reservation that held it happen in one change, and
+// that is what makes the sweep safe rather than merely usual. A reservation the caller is
+// about to delete the bytes of must stop being committable at the moment it is offered: if
+// it did not, a write slow enough to be swept could still commit afterwards, and the name
+// it committed would point at bytes the sweeper had already deleted. Nothing would report a
+// failure — the write would return success and the file would be unreadable from then on.
 func (s *Store) Garbage(ctx context.Context, limit int, grace time.Duration) ([]metastore.Key, error) {
 	if limit < 0 {
 		return nil, fmt.Errorf("a limit of %d objects is not a count: %w", limit, syscall.EINVAL)
@@ -236,7 +305,7 @@ func (s *Store) Garbage(ctx context.Context, limit int, grace time.Duration) ([]
 	cutoffSec, cutoffNsec := storedTime(time.Now().Add(-grace))
 
 	var keys []metastore.Key
-	if err := s.inspect(ctx, func(tx *sql.Tx) error {
+	if err := s.mutate(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `
 			SELECT key FROM objects
 			WHERE namespace = ?
@@ -258,7 +327,18 @@ func (s *Store) Garbage(ctx context.Context, limit int, grace time.Duration) ([]
 			}
 			keys = append(keys, metastore.Key(key))
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		rows.Close()
+
+		for _, key := range keys {
+			if _, err := tx.ExecContext(ctx, `UPDATE objects SET state = ? WHERE key = ? AND namespace = ?`,
+				stateGarbage, string(key), s.namespace); err != nil {
+				return err
+			}
+		}
+		return nil
 	}); err != nil {
 		return nil, fmt.Errorf("collecting objects nothing references: %w", failure(err))
 	}

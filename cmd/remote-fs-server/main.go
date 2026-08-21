@@ -265,10 +265,13 @@ func openBlobs(blob blobSource, quota int64) (opened, error) {
 	if blob.prefix != "" {
 		what = fmt.Sprintf("%s under %s", what, blob.prefix)
 	}
-	result := opened{namespace: namespace, exact: true, what: what, close: namespace.Close}
+	result := opened{namespace: namespace, what: what, close: namespace.Close}
 	if quota == 0 {
 		return result, nil
 	}
+	// Under an allowance the count is kept as the bytes move, so SIGHUP has nothing to
+	// repair here. Without one there is no count at all and nothing to say that about.
+	result.exact = true
 
 	space, err := namespace.Space(context.Background())
 	if err != nil {

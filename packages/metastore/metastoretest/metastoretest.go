@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"slices"
 	"syscall"
@@ -664,8 +665,8 @@ var objectCases = []testCase{
 	// the object it names is gone. Distinctness is the part a test can put a question to.
 	{name: "every reservation is a key of its own", run: func(t *testing.T, s metastore.Store) {
 		seen := map[metastore.Key]bool{}
-		for range 32 {
-			key, err := s.Reserve(ctx(t))
+		for i := range 32 {
+			key, err := s.Reserve(ctx(t), fmt.Sprintf("f%d", i), 16)
 			mustSucceed(t, err)
 			if key == "" {
 				t.Fatal("a reservation returned the empty key, which is what a file with no contents holds")
@@ -679,7 +680,7 @@ var objectCases = []testCase{
 
 	{name: "a commit makes a file and points it at the object", run: func(t *testing.T, s metastore.Store) {
 		changed := time.Date(2019, 5, 6, 7, 8, 9, 10, time.UTC)
-		key, err := s.Reserve(ctx(t))
+		key, err := s.Reserve(ctx(t), "f", 1234)
 		mustSucceed(t, err)
 		mustSucceed(t, s.Commit(ctx(t), "f", metastore.Object{
 			Key: key, Size: 1234, Digest: []byte{1, 2, 3}, ModTime: changed,
@@ -725,7 +726,9 @@ var objectCases = []testCase{
 	{name: "a commit whose parent directory is absent is ENOENT and creates nothing",
 		run: func(t *testing.T, s metastore.Store) {
 			for _, p := range []string{".go-fuse.1234/deleted", "absent/f", "a/b/c"} {
-				key, err := s.Reserve(ctx(t))
+				// The reservation is taken against a name that could be written, so that what
+				// is under test is the commit's own refusal rather than the reservation's.
+				key, err := s.Reserve(ctx(t), "reservable", 7)
 				mustSucceed(t, err)
 				mustFailAt(t, p, s.Commit(ctx(t), p, metastore.Object{Key: key, Size: 7, ModTime: time.Now()}), syscall.ENOENT)
 				// Neither the leaf nor any directory on the way to it was recorded.
@@ -738,7 +741,7 @@ var objectCases = []testCase{
 
 	{name: "a commit through a file is ENOTDIR", run: func(t *testing.T, s metastore.Store) {
 		mustSucceed(t, s.Create(ctx(t), "f"))
-		key, err := s.Reserve(ctx(t))
+		key, err := s.Reserve(ctx(t), "reservable", 1)
 		mustSucceed(t, err)
 		mustFail(t, s.Commit(ctx(t), "f/under", metastore.Object{Key: key, Size: 1, ModTime: time.Now()}), syscall.ENOTDIR)
 		mustHoldExactly(t, s, "f")
@@ -746,7 +749,7 @@ var objectCases = []testCase{
 
 	{name: "a commit onto a directory is EISDIR", run: func(t *testing.T, s metastore.Store) {
 		mustSucceed(t, s.Mkdir(ctx(t), "d"))
-		key, err := s.Reserve(ctx(t))
+		key, err := s.Reserve(ctx(t), "reservable", 1)
 		mustSucceed(t, err)
 		mustFail(t, s.Commit(ctx(t), "d", metastore.Object{Key: key, Size: 1, ModTime: time.Now()}), syscall.EISDIR)
 		mustFail(t, s.Commit(ctx(t), "", metastore.Object{Key: key, Size: 1, ModTime: time.Now()}), syscall.EISDIR)
@@ -760,7 +763,7 @@ var objectCases = []testCase{
 	}},
 
 	{name: "a reservation is committed once", run: func(t *testing.T, s metastore.Store) {
-		key, err := s.Reserve(ctx(t))
+		key, err := s.Reserve(ctx(t), "f", 4)
 		mustSucceed(t, err)
 		mustSucceed(t, s.Commit(ctx(t), "f", metastore.Object{Key: key, Size: 4, ModTime: time.Now()}))
 		mustFail(t, s.Commit(ctx(t), "g", metastore.Object{Key: key, Size: 4, ModTime: time.Now()}), syscall.EINVAL)
@@ -849,24 +852,29 @@ var objectCases = []testCase{
 	// grace long enough that no write could have finished protects it.
 	{name: "a reservation is collectable only once it is older than the grace period",
 		run: func(t *testing.T, s metastore.Store) {
-			key, err := s.Reserve(ctx(t))
+			key, err := s.Reserve(ctx(t), "f", 1)
 			mustSucceed(t, err)
 			if got := mustGarbage(t, s, time.Hour); len(got) != 0 {
 				t.Fatalf("a fresh reservation is already collectable under an hour of grace: %v", got)
 			}
-			if got := mustGarbage(t, s, 0); !slices.Equal(got, []metastore.Key{key}) {
-				t.Fatalf("collectable objects under no grace are %v, want just %q", got, key)
-			}
-			// Committing it takes it back out of the sweep, however old it is.
+			// Committing it while the grace still protects it takes it out of the sweep for
+			// good: it is referenced, not reserved.
 			mustSucceed(t, s.Commit(ctx(t), "f", metastore.Object{Key: key, Size: 1, ModTime: time.Now()}))
 			if got := mustGarbage(t, s, 0); len(got) != 0 {
 				t.Fatalf("a committed object is collectable: %v", got)
 			}
+
+			// A reservation the grace no longer covers is handed out instead.
+			stale, err := s.Reserve(ctx(t), "g", 1)
+			mustSucceed(t, err)
+			if got := mustGarbage(t, s, 0); !slices.Equal(got, []metastore.Key{stale}) {
+				t.Fatalf("collectable objects under no grace are %v, want just %q", got, stale)
+			}
 		}},
 
 	{name: "a collection is capped at the limit it was given", run: func(t *testing.T, s metastore.Store) {
-		for range 5 {
-			_, err := s.Reserve(ctx(t))
+		for i := range 5 {
+			_, err := s.Reserve(ctx(t), fmt.Sprintf("f%d", i), 1)
 			mustSucceed(t, err)
 		}
 		for _, limit := range []int{0, 1, 3, 5, 50} {
@@ -912,12 +920,112 @@ var objectCases = []testCase{
 
 		// The refusal covers the whole call: a batch holding one referenced key drops none
 		// of the others, so a caller is never left unable to say what happened.
-		spare, err := s.Reserve(ctx(t))
+		spare, err := s.Reserve(ctx(t), "spare", 1)
 		mustSucceed(t, err)
 		mustFail(t, s.Forget(ctx(t), []metastore.Key{spare, key}), syscall.EINVAL)
 		if got := mustGarbage(t, s, 0); !slices.Equal(got, []metastore.Key{spare}) {
 			t.Fatalf("collectable objects are %v, want the untouched %q", got, spare)
 		}
+	}},
+
+	// The sweep and an in-flight write race for the same key, and the sweeper wins by taking
+	// the key out of the state a commit accepts. A collection hands its caller keys it is
+	// about to delete the bytes of; if the reservation stayed committable, the writer that
+	// reserved it would commit after the blob was gone and the name would point at nothing —
+	// Write returns nil, and every Read afterwards is EIO. No adversary is needed, because
+	// Reserve stamps wall-clock time and one forward clock step ages every reservation in
+	// flight past the grace at once.
+	{name: "a key a collection handed out can no longer be committed", run: func(t *testing.T, s metastore.Store) {
+		key, err := s.Reserve(ctx(t), "f", 10)
+		mustSucceed(t, err)
+		if got := mustGarbage(t, s, 0); !slices.Equal(got, []metastore.Key{key}) {
+			t.Fatalf("collectable objects are %v, want the swept reservation %q", got, key)
+		}
+		mustFail(t, s.Commit(ctx(t), "f", metastore.Object{Key: key, Size: 10, ModTime: time.Now()}), syscall.EINVAL)
+		// The refused commit left no file behind, so nothing points at bytes the sweeper is
+		// about to delete.
+		mustHoldExactly(t, s)
+	}},
+
+	// A second collection may return the same key — it is garbage until Forget drops the
+	// record — but it must not have gone back to being committable in between.
+	{name: "collecting twice does not make a swept key committable again", run: func(t *testing.T, s metastore.Store) {
+		key, err := s.Reserve(ctx(t), "f", 10)
+		mustSucceed(t, err)
+		first := mustGarbage(t, s, 0)
+		second := mustGarbage(t, s, 0)
+		if !slices.Equal(first, second) {
+			t.Fatalf("two collections returned %v then %v, want the same keys until they are forgotten", first, second)
+		}
+		// The grace period no longer protects it: it is garbage now, not a reservation.
+		if got := mustGarbage(t, s, time.Hour); !slices.Equal(got, []metastore.Key{key}) {
+			t.Fatalf("a swept key under an hour of grace is %v, want %q", got, key)
+		}
+		mustFail(t, s.Commit(ctx(t), "f", metastore.Object{Key: key, Size: 10, ModTime: time.Now()}), syscall.EINVAL)
+	}},
+
+	// A reservation knows the write it is for, so it refuses what the commit would refuse
+	// anyway. That is not the authority — the commit asks again, because the namespace may
+	// change in between — but it is what stops a write that cannot land from paying to
+	// upload its bytes first.
+	{name: "a reservation refuses a write that cannot land", run: func(t *testing.T, s metastore.Store) {
+		mustSucceed(t, s.Mkdir(ctx(t), "d"))
+		mustSucceed(t, s.Create(ctx(t), "f"))
+
+		for _, c := range []struct {
+			path string
+			size int64
+			want syscall.Errno
+		}{
+			{"absent/g", 1, syscall.ENOENT},
+			{".go-fuse.1234/deleted", 1, syscall.ENOENT},
+			{"f/under", 1, syscall.ENOTDIR},
+			{"d", 1, syscall.EISDIR},
+			{"", 1, syscall.EISDIR},
+			{"g", -1, syscall.EINVAL},
+		} {
+			_, err := s.Reserve(ctx(t), c.path, c.size)
+			mustFailAt(t, c.path, err, c.want)
+		}
+
+		// A refused reservation leaves no record. One that recorded a key before deciding it
+		// could not be used would leak an object for the sweeper to find, and the sweeper
+		// cannot tell it from a write that is still in flight.
+		if got := mustGarbage(t, s, 0); len(got) != 0 {
+			t.Fatalf("refused reservations left %v behind, want nothing", got)
+		}
+		mustHoldExactly(t, s, "d", "f")
+	}},
+
+	// The ordinary path is unaffected: a reservation the namespace has room for is taken,
+	// and the commit that follows it works.
+	{name: "a reservation the namespace has room for is committed", allowance: allowance, run: func(t *testing.T, s metastore.Store) {
+		key, err := s.Reserve(ctx(t), "f", 500)
+		mustSucceed(t, err)
+		// The reservation itself takes no room; the bytes are the namespace's only once they
+		// are committed.
+		mustUsed(t, s, 0)
+		mustSucceed(t, s.Commit(ctx(t), "f", metastore.Object{Key: key, Size: 500, ModTime: time.Now()}))
+		mustUsed(t, s, 500)
+		mustHoldExactly(t, s, "f")
+	}},
+
+	{name: "a reservation past the allowance is EDQUOT and records nothing", allowance: allowance, run: func(t *testing.T, s metastore.Store) {
+		put(t, s, "f", allowance-100)
+
+		_, err := s.Reserve(ctx(t), "g", 101)
+		mustFail(t, err, syscall.EDQUOT)
+		if got := mustGarbage(t, s, 0); len(got) != 0 {
+			t.Fatalf("a refused reservation left %v behind, want nothing", got)
+		}
+		mustUsed(t, s, allowance-100)
+
+		// Replacing a file is charged the difference, so a reservation that would overwrite
+		// the large file is taken even though the whole size would not fit twice.
+		_, err = s.Reserve(ctx(t), "f", allowance-100)
+		mustSucceed(t, err)
+		_, err = s.Reserve(ctx(t), "g", 100)
+		mustSucceed(t, err)
 	}},
 
 	// Forgetting is driven by a sweeper that may have been interrupted between deleting the
@@ -1010,7 +1118,10 @@ var spaceCases = []testCase{
 		put(t, s, "f", allowance-100)
 		mustUsed(t, s, allowance-100)
 
-		key, err := s.Reserve(ctx(t))
+		// The reservation is for what fits; the commit then asks for more than the namespace
+		// has left. That is the arrangement a namespace which filled up between the two calls
+		// produces, and it is what makes the commit rather than the reservation the authority.
+		key, err := s.Reserve(ctx(t), "g", 100)
 		mustSucceed(t, err)
 		mustFail(t, s.Commit(ctx(t), "g", metastore.Object{Key: key, Size: 101, ModTime: time.Now()}), syscall.EDQUOT)
 
@@ -1022,7 +1133,7 @@ var spaceCases = []testCase{
 		mustHoldExactly(t, s, "f")
 
 		// What fits is taken.
-		fits, err := s.Reserve(ctx(t))
+		fits, err := s.Reserve(ctx(t), "g", 100)
 		mustSucceed(t, err)
 		mustSucceed(t, s.Commit(ctx(t), "g", metastore.Object{Key: fits, Size: 100, ModTime: time.Now()}))
 		mustUsed(t, s, allowance)
@@ -1040,7 +1151,9 @@ var spaceCases = []testCase{
 		put(t, s, "f", allowance)
 		mustUsed(t, s, allowance)
 
-		key, err := s.Reserve(ctx(t))
+		// Reserving the size the file already holds costs the namespace nothing, so the
+		// reservation is taken; the commit then asks for one byte more than there is room for.
+		key, err := s.Reserve(ctx(t), "f", allowance)
 		mustSucceed(t, err)
 		mustFail(t, s.Commit(ctx(t), "f", metastore.Object{Key: key, Size: allowance + 1, ModTime: time.Now()}), syscall.EDQUOT)
 
@@ -1058,7 +1171,7 @@ var spaceCases = []testCase{
 	}},
 
 	{name: "a commit of a negative length is EINVAL", allowance: allowance, run: func(t *testing.T, s metastore.Store) {
-		key, err := s.Reserve(ctx(t))
+		key, err := s.Reserve(ctx(t), "f", 0)
 		mustSucceed(t, err)
 		mustFail(t, s.Commit(ctx(t), "f", metastore.Object{Key: key, Size: -1, ModTime: time.Now()}), syscall.EINVAL)
 		mustUsed(t, s, 0)
@@ -1078,7 +1191,7 @@ func mode(m fs.FileMode) *fs.FileMode { return &m }
 // steps every write through this contract takes.
 func put(t *testing.T, s metastore.Store, path string, size int64) metastore.Key {
 	t.Helper()
-	key, err := s.Reserve(ctx(t))
+	key, err := s.Reserve(ctx(t), path, size)
 	mustSucceed(t, err)
 	mustSucceed(t, s.Commit(ctx(t), path, metastore.Object{Key: key, Size: size, ModTime: time.Now()}))
 	return key

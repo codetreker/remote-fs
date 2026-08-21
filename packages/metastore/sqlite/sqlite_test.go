@@ -68,9 +68,6 @@ func TestNamespacesInOneDatabaseAreSeparate(t *testing.T) {
 	}
 
 	commit(t, first, "big", 900)
-	if _, err := second.Space(t.Context()); err != nil {
-		t.Fatalf("the second namespace: %v", err)
-	}
 	space, err := second.Space(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +77,7 @@ func TestNamespacesInOneDatabaseAreSeparate(t *testing.T) {
 	}
 
 	// An object reserved in one namespace is not one the other may commit or collect.
-	key, err := second.Reserve(t.Context())
+	key, err := second.Reserve(t.Context(), "borrowed", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +135,7 @@ func mode(m fs.FileMode) *fs.FileMode { return &m }
 // commit writes an object of the given length at path.
 func commit(t *testing.T, s metastore.Store, path string, size int64) metastore.Key {
 	t.Helper()
-	key, err := s.Reserve(t.Context())
+	key, err := s.Reserve(t.Context(), path, size)
 	if err != nil {
 		t.Fatalf("reserving a key: %v", err)
 	}
@@ -226,12 +223,12 @@ func TestConcurrentCommitsEachTakeTheirOwnBytes(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := range each {
-				key, err := store.Reserve(t.Context())
+				path := fmt.Sprintf("w%d-%d", w, i)
+				key, err := store.Reserve(t.Context(), path, size)
 				if err != nil {
 					failures <- err
 					return
 				}
-				path := fmt.Sprintf("w%d-%d", w, i)
 				if err := store.Commit(t.Context(), path, metastore.Object{
 					Key: key, Size: size, ModTime: time.Now(),
 				}); err != nil {
@@ -258,12 +255,9 @@ func TestConcurrentCommitsEachTakeTheirOwnBytes(t *testing.T) {
 		t.Fatalf("the namespace reports %d bytes available, want none", space.Avail)
 	}
 	// One more byte does not fit, which is the count being exact rather than approximately
-	// right in the safe direction.
-	key, err := store.Reserve(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Commit(t.Context(), "overflow", metastore.Object{Key: key, Size: 1, ModTime: time.Now()}); !errors.Is(err, syscall.EDQUOT) {
-		t.Fatalf("committing one byte past a full namespace: %v, want EDQUOT", err)
+	// right in the safe direction. The reservation is where it is refused, so the byte is
+	// never uploaded.
+	if _, err := store.Reserve(t.Context(), "overflow", 1); !errors.Is(err, syscall.EDQUOT) {
+		t.Fatalf("reserving one byte past a full namespace: %v, want EDQUOT", err)
 	}
 }

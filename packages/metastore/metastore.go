@@ -91,9 +91,9 @@ type Store interface {
 	// the whole path — is the one an implementer reaches for first.
 	Rename(ctx context.Context, from, to string) error
 
-	// Reserve records the intent to write an object and returns the key to write it under.
-	// The key is opaque: nothing may derive it from the path, and nothing may reuse it after
-	// the object it names is gone.
+	// Reserve records the intent to write path's new contents and returns the key to write
+	// them under. The key is opaque: nothing may derive it from the path, and nothing may
+	// reuse it after the object it names is gone.
 	//
 	// It is called before the bytes are written, and that order is the whole point. An
 	// object written under a key no committed record mentions is indistinguishable from an
@@ -101,7 +101,16 @@ type Store interface {
 	// apart either deletes live data or waits out a grace period long enough to make its own
 	// correctness a guess about how slow a write can be. A key that is on record before its
 	// bytes exist is never ambiguous.
-	Reserve(ctx context.Context) (Key, error)
+	//
+	// Knowing the write it is for, a reservation refuses what the commit would refuse
+	// anyway: a path whose parent directory is not there, a path holding a directory, and a
+	// size the allowance has no room for. Those refusals are not the authority — Commit is,
+	// because the namespace may change between the two — but making them here is what keeps
+	// a write that cannot land from paying to upload its bytes first. Without it, a caller
+	// sitting at its allowance can put an unbounded number of objects into the store at full
+	// speed, each one billed and each one waiting on a sweep, which is the cost the
+	// allowance exists to bound.
+	Reserve(ctx context.Context, path string, size int64) (Key, error)
 
 	// Commit points path at an object that has been written, creating the file if it is not
 	// there, and accounts for the bytes. It fails with syscall.EDQUOT if the namespace has
@@ -110,9 +119,14 @@ type Store interface {
 	// and taking it.
 	//
 	// The object previously at path, if any, becomes garbage. The object being committed
-	// must have been reserved; committing an unreserved key is syscall.EINVAL. An empty key
-	// commits a file with no contents at all, which is what a zero-byte write is: no object
-	// is worth a round trip to hold no bytes.
+	// must still be reserved; a key that was never reserved, has already been committed, or
+	// has been handed to a sweeper is syscall.EINVAL. That last case is why the state is
+	// checked rather than merely the existence of a record: a write slow enough to have its
+	// reservation swept must fail here, because its bytes are gone.
+	//
+	// An empty key commits a file with no contents at all, which is what a zero-byte write
+	// is: no object is worth a round trip to hold no bytes, so nothing is reserved for one
+	// and there is nothing to check. An empty key with a non-zero size is syscall.EINVAL.
 	Commit(ctx context.Context, path string, object Object) error
 
 	// Space reports the room the namespace has, or syscall.ENOSYS if it has no allowance.
@@ -128,6 +142,12 @@ type Store interface {
 	// delete them from the object store. Objects reserved but never committed are included
 	// once they are older than grace, which bounds how long a write may take between
 	// reserving a key and committing it.
+	//
+	// A key this returns is no longer committable, and it stops being committable in the
+	// same change that hands it out. The caller is about to delete the bytes, so a write
+	// still holding that key must fail rather than succeed onto an object that is gone —
+	// and a caller that took the keys and then died has lost nothing, because a key nobody
+	// can commit is garbage whether or not its bytes were reached.
 	Garbage(ctx context.Context, limit int, grace time.Duration) ([]Key, error)
 
 	// Forget drops the records of objects whose bytes are gone. A key passed here that is

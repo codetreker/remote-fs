@@ -154,6 +154,11 @@ func (s *Storage) Read(ctx context.Context, path string) ([]byte, error) {
 // is the atomicity the contract asks for and which no sequence of writes to a single blob
 // could offer.
 //
+// The reservation is told what it is for, so a write with nowhere to land — no such
+// directory, a directory at the name, no room under the allowance — is refused before its
+// bytes are sent rather than after. The commit refuses it again, and that one is the
+// authority; this one only keeps a caller from paying to upload what will not be kept.
+//
 // A failure after the put and before the commit leaves an object nothing references. It
 // costs storage until a sweep reaches it and costs nothing else — no name points at it, so
 // nothing can read it, and the namespace is what it was before the write began.
@@ -165,7 +170,7 @@ func (s *Storage) Write(ctx context.Context, path string, content []byte) error 
 
 	object := metastore.Object{Size: int64(len(content)), ModTime: s.now()}
 	if len(content) > 0 {
-		key, err := s.meta.Reserve(ctx)
+		key, err := s.meta.Reserve(ctx, cleaned, object.Size)
 		if err != nil {
 			return err
 		}
