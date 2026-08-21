@@ -52,6 +52,8 @@ Moving the file is not enough. The `Status:` line and the section skeleton must 
 
 An implemented note describes reality. When the code later moves a file, renames a package, or changes a default, **update the note in the same change** — facts only, never the decision.
 
+"Facts" here means sentences about the system as it stands now. A note also carries sentences about the moment the decision was made — what the premise was, what was weighed, what shipped, what it cost — and those belong to that moment and do not move. The README owns this distinction; read it before editing an implemented note, because syncing a count or a table row that describes the past is how a note quietly loses the reasoning it exists to preserve.
+
 If the decision itself changes, that is a new note (see the supersession rules above).
 
 ## Pruning
