@@ -60,12 +60,17 @@ separate step and it does not lag behind.
 Before pushing, run the ones that cover this diff — not the full suite:
 
 ```
-go build ./...                 # every package, including cmd/
+make build                     # both binaries, into bin/
+make test                      # every package; mount and end-to-end need /dev/fuse
 go vet ./...
 gofmt -l .                     # prints nothing when the tree is formatted
-go test ./...                  # mount and end-to-end tests need /dev/fuse
 go test -race ./packages/fuse/ ./packages/transport/httprest/
 ```
+
+`make build` writes to `bin/` rather than letting `go build ./...` drop two binaries in
+the repository root, which is where it puts them when given more than one main package.
+`bin/` is ignored, as is `vendor/`; a vendor directory is honoured when it is there and
+nothing depends on it being there.
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs those same commands on every
 pull request and on every commit that reaches `main`, in two jobs: one for the layers that
