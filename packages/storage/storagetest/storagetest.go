@@ -838,6 +838,42 @@ var cases = []testCase{
 		mustHoldExactly(t, s, "d")
 	}},
 
+	// --- space --------------------------------------------------------------------
+
+	// Space has two permitted outcomes and no third. Any other error would leave whatever
+	// asked unable to tell "this namespace has no room of its own to report" from "the
+	// room could not be measured this time", and those call for opposite reactions: the
+	// first is settled for good, the second is worth asking again.
+	//
+	// Figures that could not be true of anything are the same failure wearing a plausible
+	// face. They arrive as room that exists, and a program that checks for space before
+	// writing acts on them.
+	{"space either answers with figures that can be true, or reports ENOSYS", func(t *testing.T, s storage.Storage) {
+		spaceOf(t, s)
+	}},
+
+	// Whether a namespace has room of its own to report is a property of what it is, not
+	// of what it currently holds. An implementation that answered only once it had
+	// something to count would have a caller reading its refusal as a transient failure —
+	// and an empty namespace is the state anything asks about first.
+	{"whether space answers does not change over a namespace's life", func(t *testing.T, s storage.Storage) {
+		_, answered := spaceOf(t, s)
+
+		mustSucceed(t, s.Mkdir(ctx(t), "d"))
+		mustSucceed(t, s.Write(ctx(t), "d/f", bytes.Repeat([]byte{'x'}, 64<<10)))
+		if _, again := spaceOf(t, s); again != answered {
+			t.Fatalf("space %s for an empty namespace and %s once it held a file",
+				answerKind(answered), answerKind(again))
+		}
+
+		mustSucceed(t, s.Remove(ctx(t), "d/f"))
+		mustSucceed(t, s.RemoveDir(ctx(t), "d"))
+		if _, again := spaceOf(t, s); again != answered {
+			t.Fatalf("space %s for an empty namespace and %s once it was empty again",
+				answerKind(answered), answerKind(again))
+		}
+	}},
+
 	// --- paths --------------------------------------------------------------------
 
 	{"an absolute path is EINVAL", func(t *testing.T, s storage.Storage) {
@@ -918,6 +954,36 @@ func summarize(b []byte) string {
 		}
 	}
 	return fmt.Sprintf("%d bytes, %s", len(b), strings.Join(runs, " then "))
+}
+
+// spaceOf asks for the room the namespace has and refuses everything the contract does
+// not allow: a refusal other than ENOSYS, and an answer that could not be true of
+// anything. The second result says whether figures came back, so that a case which goes
+// on to read them says so rather than passing quietly on a namespace that refused —
+// silence there would let an implementation satisfy the whole section by answering ENOSYS
+// to all of it.
+func spaceOf(t *testing.T, s storage.Storage) (storage.Space, bool) {
+	t.Helper()
+	space, err := s.Space(ctx(t))
+	if errors.Is(err, syscall.ENOSYS) {
+		return storage.Space{}, false
+	}
+	if err != nil {
+		t.Fatalf("space failed with %v, want either figures or ENOSYS", err)
+	}
+	if !space.Coherent() {
+		t.Fatalf("space reports a total of %d bytes with %d used and %d available, which cannot be true of anything",
+			space.Total, space.Used, space.Avail)
+	}
+	return space, true
+}
+
+// answerKind names what Space did, for the message of a case that compares two calls.
+func answerKind(answered bool) string {
+	if answered {
+		return "answered"
+	}
+	return "reported ENOSYS"
 }
 
 func mustSucceed(t *testing.T, err error) {

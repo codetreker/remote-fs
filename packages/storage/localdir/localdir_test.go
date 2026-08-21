@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/localdir"
 	"github.com/codetreker/remote-fs/packages/storage/storagetest"
@@ -60,6 +62,74 @@ func TestReadsReportWhatTheDirectoryHolds(t *testing.T) {
 	}
 	if string(got) != "payload" {
 		t.Fatalf("read %q, want %q", got, "payload")
+	}
+}
+
+// --- space -----------------------------------------------------------------------------
+
+// A directory carries no allowance of its own, so the figures a namespace held in one
+// reports are the host filesystem's. The contract suite cannot settle that: it has to
+// accept ENOSYS from any implementation, and would pass unchanged against one that
+// reported nothing. So what the figures are is checked here, against a statfs of the same
+// directory.
+func TestSpaceReportsTheHostFilesystemsOwnFigures(t *testing.T) {
+	root := t.TempDir()
+	s := newStorage(t, root)
+
+	before := statfsOf(t, root)
+	space, err := s.Space(t.Context())
+	if err != nil {
+		t.Fatalf("space: %v", err)
+	}
+	after := statfsOf(t, root)
+
+	if want := int64(before.Blocks) * int64(before.Bsize); space.Total != want {
+		t.Errorf("space reports a total of %d bytes; the filesystem holding the served directory has %d blocks of %d bytes, which is %d",
+			space.Total, before.Blocks, before.Bsize, want)
+	}
+	// Everything else on the machine writes to that same filesystem while this runs, so
+	// the two figures that move are checked against the range the readings either side of
+	// the call put them in rather than against one reading alone.
+	mustLieBetween(t, "used", space.Used,
+		int64(before.Blocks-before.Bfree)*int64(before.Bsize),
+		int64(after.Blocks-after.Bfree)*int64(after.Bsize))
+	mustLieBetween(t, "available", space.Avail,
+		int64(before.Bavail)*int64(before.Bsize),
+		int64(after.Bavail)*int64(after.Bsize))
+}
+
+// A namespace whose directory has been taken away has to fail rather than report a
+// filesystem of no size — which reads as a mount with nothing left to write into, and is
+// acted on by whatever asked.
+func TestSpaceFailsWhenTheServedDirectoryIsGone(t *testing.T) {
+	root := t.TempDir()
+	s := newStorage(t, root)
+
+	if err := os.Remove(root); err != nil {
+		t.Fatal(err)
+	}
+	space, err := s.Space(t.Context())
+	if !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("space reported %+v with error %v, want ENOENT", space, err)
+	}
+}
+
+func statfsOf(t *testing.T, dir string) unix.Statfs_t {
+	t.Helper()
+	var st unix.Statfs_t
+	if err := unix.Statfs(dir, &st); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+// mustLieBetween checks a figure that moves under the test against the two readings taken
+// either side of the call, in whichever order they fell.
+func mustLieBetween(t *testing.T, what string, got, first, second int64) {
+	t.Helper()
+	if got < min(first, second) || got > max(first, second) {
+		t.Errorf("space reports %d bytes %s; a statfs either side of the call reported %d and %d",
+			got, what, first, second)
 	}
 }
 

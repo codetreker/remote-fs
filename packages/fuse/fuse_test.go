@@ -28,6 +28,7 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/fuse"
 	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/limited"
 	"github.com/codetreker/remote-fs/packages/storage/localdir"
 )
 
@@ -240,6 +241,12 @@ func treeDiff(t *testing.T, mountpoint, plain string) string {
 
 // The sequence builds on itself, so later steps operate on what earlier ones left. Each
 // step reports what it observed; the tree is compared after every one of them.
+//
+// A statfs step does not belong here, tempting as the symmetry is. Both roots sit on the
+// same host filesystem, so the two answers would agree by construction and say nothing
+// about the conversion into blocks; and the host's own free-block counters move between
+// the two calls, so the comparison would fail at random as well.
+// TestSpaceIsReportedInWholeBlocks drives that conversion from figures chosen for it.
 var differentialSteps = []step{
 	{"list the empty root", func(root string) (string, error) {
 		return listDir(root)
@@ -2141,20 +2148,6 @@ func TestRenameFlagsThatCannotBeHonouredAreRefused(t *testing.T) {
 	}
 }
 
-// Nothing here knows how much room there is behind the namespace. The FUSE library's own
-// default is to reply to statfs with a zeroed answer, which reads as a filesystem with
-// no space left, and a program that checks for room before writing would believe it
-// (R-ERR-2).
-func TestSpaceThatCannotBeSeenIsNotDescribed(t *testing.T) {
-	mountpoint, _, _ := mountedPair(t)
-
-	var described unix.Statfs_t
-	if err := unix.Statfs(mountpoint, &described); !errors.Is(err, syscall.ENOSYS) {
-		t.Fatalf("statfs returned %v and reported %d blocks of %d bytes, want ENOSYS",
-			err, described.Blocks, described.Bsize)
-	}
-}
-
 // The namespace has no extended attributes. The answer has to be about the filesystem —
 // "there are none here" — and not about the file, because "this file has no such
 // attribute" invites the caller to try setting one.
@@ -2570,4 +2563,342 @@ func TestTheTerabyteTruncateIsRefusedRatherThanAllocated(t *testing.T) {
 	if body, err := os.ReadFile(path); err != nil || string(body) != "payload" {
 		t.Fatalf("the file reads %q, %v after the refused truncation", body, err)
 	}
+}
+
+// --- the room the namespace has --------------------------------------------------------
+
+// Two facts about statfs belong here as a record rather than as a case, because neither is
+// this filesystem's to decide.
+//
+// The kernel answers statfs itself, with a zeroed struct, for any caller that is not the
+// user who made the mount, and never forwards the request. `sudo df` therefore sees a
+// mount of zero blocks whatever the namespace would have said, and the zeroes it prints
+// are the kernel's answer rather than one of ours.
+//
+// The ceiling on a single file applies whatever Avail says, so a tool that reads statfs,
+// sees room, and starts copying can still be refused with EFBIG partway through. The two
+// limits answer different questions — how large a file this mount will hold in memory, and
+// how much the workspace may hold in all — and neither stands in for the other.
+
+// reportedBlock is the unit the mount reports space in. The figures below are written as
+// multiples of it so that what each case is checking stays legible.
+const reportedBlock = 4096
+
+// tellsSpace answers Space with a figure of the test's choosing. The arithmetic has to be
+// checked against exact numbers, and the room a real filesystem has left is neither exact
+// nor still.
+type tellsSpace struct {
+	storage.Storage
+	space storage.Space
+	err   error
+}
+
+func (s *tellsSpace) Space(context.Context) (storage.Space, error) {
+	if s.err != nil {
+		return storage.Space{}, s.err
+	}
+	return s.space, nil
+}
+
+// mountTelling mounts a namespace held in a fresh directory that reports the given room.
+func mountTelling(t *testing.T, space storage.Space, err error) (mountpoint, backing string) {
+	t.Helper()
+	backing = t.TempDir()
+	inner, openErr := localdir.New(backing)
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	s := &tellsSpace{Storage: inner, space: space, err: err}
+	return mountStorage(t, s, fuse.Options{Logger: testLogger(t)}), backing
+}
+
+// A namespace with no room of its own to report answers ENOSYS, and that reaches the caller
+// as it stands: df says "Function not implemented". The answer that may never be given is
+// the FUSE library's own default, a zeroed reply, which reads as a filesystem with no space
+// left — a program that checks for room before writing would believe it (R-ERR-2).
+func TestSpaceThatCannotBeSeenIsNotDescribed(t *testing.T) {
+	mountpoint, _ := mountTelling(t, storage.Space{}, syscall.ENOSYS)
+
+	var described unix.Statfs_t
+	if err := unix.Statfs(mountpoint, &described); !errors.Is(err, syscall.ENOSYS) {
+		t.Fatalf("statfs returned %v and reported %d blocks of %d bytes, want ENOSYS",
+			err, described.Blocks, described.Bsize)
+	}
+}
+
+// A namespace that does report its room has that report converted into blocks, and the
+// conversion floors: a block that cannot be filled is not offered.
+func TestSpaceIsReportedInWholeBlocks(t *testing.T) {
+	for _, c := range []struct {
+		name                  string
+		space                 storage.Space
+		blocks, bfree, bavail uint64
+	}{
+		{"a workspace with nothing in it",
+			storage.Space{Total: 100 * reportedBlock, Avail: 100 * reportedBlock}, 100, 100, 100},
+		{"a workspace part spent",
+			storage.Space{Total: 100 * reportedBlock, Used: 40 * reportedBlock, Avail: 60 * reportedBlock}, 100, 60, 60},
+		// A filesystem keeps a reserve only the superuser may spend, which makes what may
+		// still be written smaller than what the limit leaves. Reporting either as the other
+		// would state a quantity nobody measured.
+		{"a reserve that only the superuser may spend",
+			storage.Space{Total: 100 * reportedBlock, Used: 40 * reportedBlock, Avail: 55 * reportedBlock}, 100, 60, 55},
+		// What an allowance lowered underneath content already written looks like. Nothing
+		// is repaired and nothing goes negative: what is left is none.
+		{"more spent than the limit allows",
+			storage.Space{Total: 100 * reportedBlock, Used: 140 * reportedBlock}, 100, 0, 0},
+		{"a limit that is not a whole number of blocks",
+			storage.Space{Total: 100*reportedBlock + 4095, Avail: 100*reportedBlock + 4095}, 100, 100, 100},
+		{"a part-filled block counts as spent",
+			storage.Space{Total: 100 * reportedBlock, Used: 1, Avail: 100*reportedBlock - 1}, 100, 99, 99},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			mountpoint, _ := mountTelling(t, c.space, nil)
+
+			var described unix.Statfs_t
+			if err := unix.Statfs(mountpoint, &described); err != nil {
+				t.Fatalf("statfs failed with %v", err)
+			}
+			if described.Bsize != reportedBlock || described.Frsize != reportedBlock {
+				t.Fatalf("the mount reports blocks of %d and fragments of %d bytes, want %d",
+					described.Bsize, described.Frsize, reportedBlock)
+			}
+			if described.Blocks != c.blocks || described.Bfree != c.bfree || described.Bavail != c.bavail {
+				t.Fatalf("the mount reports %d blocks, %d free, %d available; want %d, %d, %d",
+					described.Blocks, described.Bfree, described.Bavail, c.blocks, c.bfree, c.bavail)
+			}
+			if described.Bavail > described.Bfree || described.Bfree > described.Blocks {
+				t.Fatalf("the mount reports %d available of %d free of %d blocks, which cannot all be true",
+					described.Bavail, described.Bfree, described.Blocks)
+			}
+			// This system charges bytes and counts no inodes, so there is no figure to give.
+			if described.Files != 0 || described.Ffree != 0 {
+				t.Fatalf("the mount reports %d inodes and %d free; it counts none",
+					described.Files, described.Ffree)
+			}
+			if described.Namelen != 255 {
+				t.Fatalf("the mount says a name may be %d bytes, want 255", described.Namelen)
+			}
+		})
+	}
+}
+
+// An answer that cannot be true of anything is a failure to report, not a set of numbers
+// to repair. These fields cross into the kernel unsigned, where a negative arrives as an
+// enormous positive and offers room no disk anywhere holds (R-ERR-2).
+func TestASpaceThatCannotBeTrueIsRefused(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		space storage.Space
+	}{
+		{"a negative limit", storage.Space{Total: -reportedBlock}},
+		{"more spent than can be spent", storage.Space{Total: reportedBlock, Used: -1}},
+		{"a negative amount left", storage.Space{Total: reportedBlock, Avail: -1}},
+		{"more left than the limit leaves",
+			storage.Space{Total: 100 * reportedBlock, Used: 40 * reportedBlock, Avail: 61 * reportedBlock}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			mountpoint, _ := mountTelling(t, c.space, nil)
+
+			var described unix.Statfs_t
+			if err := unix.Statfs(mountpoint, &described); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("statfs returned %v and reported %d blocks, %d available; want EIO",
+					err, described.Blocks, described.Bavail)
+			}
+		})
+	}
+}
+
+// A write that would carry the namespace past its limit is refused at the write(2) that
+// asked for it, with EDQUOT: the disk is not full, an allowance is spent.
+//
+// Which call reports it is the whole point. The contents of an open file are held until
+// the commit, and the commit happens at close(2), so a refusal discovered only there
+// reaches a caller that in a large share of programs never looks at what close(2)
+// returned — and the bytes go missing in silence.
+func TestAWriteWithNoRoomForItIsRefusedAtTheWrite(t *testing.T) {
+	const room = 10
+	full := storage.Space{Total: 1 << 20, Used: 1<<20 - room, Avail: room}
+
+	t.Run("a write larger than the room left", func(t *testing.T) {
+		mountpoint, backing := mountTelling(t, full, nil)
+		f, err := os.Create(filepath.Join(mountpoint, "f"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+
+		if _, err := f.Write(make([]byte, room+1)); !errors.Is(err, syscall.EDQUOT) {
+			t.Fatalf("writing %d bytes into a workspace with %d left returned %v, want EDQUOT",
+				room+1, room, err)
+		}
+		// Nothing was buffered, so there is nothing to commit and close has nothing to
+		// report. This is where the refusal would have surfaced had it waited for the
+		// commit, which is the arrival nobody would have seen.
+		if err := f.Close(); err != nil {
+			t.Fatalf("close returned %v; the refusal already reached the write", err)
+		}
+		if body, err := os.ReadFile(filepath.Join(backing, "f")); err != nil || len(body) != 0 {
+			t.Fatalf("the namespace holds %d bytes, %v; a refused write left something behind",
+				len(body), err)
+		}
+	})
+
+	t.Run("a write that exactly fills the room left", func(t *testing.T) {
+		mountpoint, backing := mountTelling(t, full, nil)
+		if err := os.WriteFile(filepath.Join(mountpoint, "f"), make([]byte, room), 0o644); err != nil {
+			t.Fatalf("writing exactly the %d bytes left returned %v", room, err)
+		}
+		if body, err := os.ReadFile(filepath.Join(backing, "f")); err != nil || len(body) != room {
+			t.Fatalf("the namespace holds %d bytes, %v; want %d", len(body), err, room)
+		}
+	})
+
+	// What a write needs is the room its growth asks for, not the room the whole file would
+	// take. A mount that weighed the file's length would refuse every change to a large file
+	// in a workspace near its limit, including one that shortens it.
+	t.Run("appending to a file the namespace already holds", func(t *testing.T) {
+		mountpoint, backing := mountTelling(t, full, nil)
+		const held = 1 << 16
+		if err := os.WriteFile(filepath.Join(backing, "big"), pattern(held), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		f, err := os.OpenFile(filepath.Join(mountpoint, "big"), os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if _, err := f.Write([]byte("tail")); err != nil {
+			t.Fatalf("appending 4 bytes to a file of %d bytes returned %v, with %d bytes of room left",
+				held, err, room)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if info, err := os.Stat(filepath.Join(backing, "big")); err != nil || info.Size() != held+4 {
+			t.Fatalf("the namespace holds %v bytes, %v; want %d", info.Size(), err, held+4)
+		}
+	})
+}
+
+// mountLimited mounts a namespace held in backing under an allowance of that many bytes.
+// The allowance is enforced by the storage rather than described by a fixture, because the
+// cases below turn on one operation reaching the namespace by two routes and having to be
+// answered the same way on both.
+func mountLimited(t *testing.T, backing string, allowance int64) string {
+	t.Helper()
+	inner, err := localdir.New(backing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := limited.New(context.Background(), inner, allowance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mountStorage(t, held, fuse.Options{Logger: testLogger(t)})
+}
+
+// A truncation that would carry the namespace past its allowance is refused at the call
+// that asked for it, and is refused there whether or not the caller holds the file open.
+//
+// ftruncate(2) arrives as a size change on an open handle, whose contents are held until
+// the commit at close(2); truncate(2) on the same file arrives with no handle and goes
+// straight to the namespace, which refuses it at the syscall. Weighing only the ceiling on
+// a single file's size in the first would leave the allowance to be discovered at the
+// commit — a refusal that reaches only close(2), which a large share of programs never
+// look at (R-WS-5) — and one operation would then be answered in two different places.
+func TestATruncationWithNoRoomForItIsRefusedAtTheTruncation(t *testing.T) {
+	const allowance = 64 << 10
+
+	t.Run("growing through an open descriptor", func(t *testing.T) {
+		backing := t.TempDir()
+		mountpoint := mountLimited(t, backing, allowance)
+
+		f, err := os.Create(filepath.Join(mountpoint, "f"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+
+		if err := f.Truncate(allowance + 1); !errors.Is(err, syscall.EDQUOT) {
+			t.Fatalf("ftruncate to %d bytes under an allowance of %d returned %v, want EDQUOT",
+				allowance+1, allowance, err)
+		}
+		// Nothing was lengthened, so there is nothing to commit and close has nothing to
+		// report. This is where the refusal would have surfaced had it waited for the
+		// commit, which is the arrival nobody would have seen.
+		if err := f.Close(); err != nil {
+			t.Fatalf("close returned %v; the refusal already reached the ftruncate", err)
+		}
+		held, err := os.Stat(filepath.Join(backing, "f"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if held.Size() != 0 {
+			t.Fatalf("the namespace holds %d bytes; a refused truncation lengthened the file",
+				held.Size())
+		}
+	})
+
+	t.Run("growing with no descriptor", func(t *testing.T) {
+		backing := t.TempDir()
+		mountpoint := mountLimited(t, backing, allowance)
+		path := filepath.Join(mountpoint, "f")
+		if err := os.WriteFile(path, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := os.Truncate(path, allowance+1); !errors.Is(err, syscall.EDQUOT) {
+			t.Fatalf("truncate to %d bytes under an allowance of %d returned %v, want EDQUOT",
+				allowance+1, allowance, err)
+		}
+		held, err := os.Stat(filepath.Join(backing, "f"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if held.Size() != 0 {
+			t.Fatalf("the namespace holds %d bytes; a refused truncation lengthened the file",
+				held.Size())
+		}
+	})
+
+	// A workspace past its allowance has to have a way back under it, and shortening a file
+	// is that way. There is no room left at all here, and the truncation is carried out
+	// regardless, because what it needs is the room its growth asks for and it grows by
+	// nothing.
+	t.Run("shrinking from over the allowance", func(t *testing.T) {
+		const stands = allowance + (16 << 10)
+		backing := t.TempDir()
+		if err := os.WriteFile(filepath.Join(backing, "f"), pattern(stands), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mountpoint := mountLimited(t, backing, allowance)
+
+		var described unix.Statfs_t
+		if err := unix.Statfs(mountpoint, &described); err != nil || described.Bavail != 0 {
+			t.Fatalf("the mount reports %d blocks available, %v; the workspace holds %d of an allowance of %d and has none",
+				described.Bavail, err, stands, allowance)
+		}
+
+		f, err := os.OpenFile(filepath.Join(mountpoint, "f"), os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if err := f.Truncate(1024); err != nil {
+			t.Fatalf("ftruncate to 1024 bytes of a file of %d returned %v, with the workspace over its allowance of %d",
+				stands, err, allowance)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("committing the truncation returned %v", err)
+		}
+		held, err := os.Stat(filepath.Join(backing, "f"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if held.Size() != 1024 {
+			t.Fatalf("the namespace holds %d bytes, want 1024", held.Size())
+		}
+	})
 }

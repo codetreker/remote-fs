@@ -18,9 +18,11 @@ import (
 // the same file open do not write into each other's copy. The one that commits last wins,
 // which is the concurrency the namespace offers.
 //
-// Nothing here may grow the buffer past the mount's ceiling on a single file's size. That
-// is the only reason a write or a resize is ever refused, and it is why both report an
-// errno rather than simply doing what they were asked.
+// Nothing here may grow the buffer past the mount's ceiling on a single file's size, which
+// is why a write and a resize alike report an errno rather than simply doing what they
+// were asked. Both are weighed against the room the namespace says it has left as well, so
+// that a workspace at its limit refuses at the call that asked rather than leaving the
+// commit to discover it at the close(2).
 type handle struct {
 	node *node
 
@@ -28,6 +30,16 @@ type handle struct {
 	contents []byte
 	// dirty says the buffer holds something the namespace does not have yet.
 	dirty bool
+	// stored is how many of this file's bytes the namespace already holds, so that a
+	// change is weighed against the room its growth needs rather than against the file's
+	// whole length: appending to a large file in a nearly full workspace costs what it
+	// appends.
+	//
+	// A handle opened with O_TRUNC leaves it at zero although the namespace still holds
+	// the contents that are about to be replaced, because nothing on that path asked how
+	// long they were. The replacement is then charged in full, which is the direction that
+	// refuses a write that would have fitted rather than accepting one that will not.
+	stored int64
 	// changed is when the buffer last changed, reported while it is uncommitted so that
 	// a program which writes a file and stats it does not see the previous time.
 	changed time.Time
@@ -51,6 +63,9 @@ var (
 
 func newHandle(n *node, contents []byte, dirty bool) *handle {
 	h := &handle{node: n, contents: contents, dirty: dirty, changed: time.Now()}
+	if !dirty {
+		h.stored = int64(len(contents))
+	}
 	n.track(h)
 	return h
 }
@@ -81,7 +96,12 @@ func (h *handle) Write(ctx context.Context, data []byte, off int64) (uint32, sys
 		return 0, syscall.EFBIG
 	}
 
-	if end := off + int64(len(data)); end > int64(len(h.contents)) {
+	end := off + int64(len(data))
+	if errno := h.weigh(ctx, max(end, int64(len(h.contents)))); errno != 0 {
+		return 0, errno
+	}
+
+	if end > int64(len(h.contents)) {
 		h.contents = resized(h.contents, end)
 	}
 	copy(h.contents[off:], data)
@@ -90,16 +110,48 @@ func (h *handle) Write(ctx context.Context, data []byte, off int64) (uint32, sys
 	return uint32(len(data)), 0
 }
 
-func (h *handle) resize(size int64) syscall.Errno {
+func (h *handle) resize(ctx context.Context, size int64) syscall.Errno {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	if !h.node.ns.holds(size) {
 		return syscall.EFBIG
 	}
+	if errno := h.weigh(ctx, size); errno != 0 {
+		return errno
+	}
 	h.contents = resized(h.contents, size)
 	h.dirty = true
 	h.changed = time.Now()
+	return 0
+}
+
+// weigh answers whether the buffer may take on a given length, against the room the
+// namespace last said it had left. Called with h.mu held.
+//
+// What is weighed is the growth: the length the namespace would end up holding for this
+// file beyond what it holds for it now. A change that leaves the file no longer than the
+// namespace already has it therefore costs nothing and is never refused, whatever the
+// figure says — a workspace past its allowance has to have a way back under it, and
+// shortening a file is that way.
+//
+// The namespace's own limit is weighed here as well as at the commit, and for the same
+// reason the ceiling on a single file is weighed before the buffer grows: the commit
+// happens at close(2), and a large share of programs never look at what close(2) returned,
+// so a refusal discovered only there loses the bytes in silence (R-WS-5). EDQUOT rather
+// than ENOSPC — no disk is full, an allowance is spent.
+//
+// The figure may be as old as roomWindow, so a change that no longer fits can still be
+// accepted here; the commit refuses it and remains the authority. This is what carries that
+// answer back to the program that caused it, at the call that caused it.
+func (h *handle) weigh(ctx context.Context, length int64) syscall.Errno {
+	grown := length - h.stored
+	if grown <= 0 {
+		return 0
+	}
+	if avail, measured := h.node.ns.room.remaining(ctx, h.node.ns.storage); measured && grown > avail {
+		return syscall.EDQUOT
+	}
 	return 0
 }
 
@@ -143,6 +195,7 @@ func (h *handle) commit(ctx context.Context) syscall.Errno {
 		return errnoOf(err)
 	}
 	h.dirty = false
+	h.stored = int64(len(h.contents))
 	return 0
 }
 

@@ -25,6 +25,10 @@ type namespace struct {
 
 	// maxFileSize is Options.MaxFileSize, already resolved: never zero, never negative.
 	maxFileSize int64
+
+	// room is what this mount last heard about the space left in the namespace. It is
+	// shared by every handle, because it describes the namespace rather than any one file.
+	room roomGauge
 }
 
 // holds reports whether a file of size bytes can be held in memory, which every operation
@@ -241,7 +245,7 @@ func (ns *namespace) requestedChange(in *gofuse.SetAttrIn) (storage.AttrChange, 
 // nothing to defer to and the change is written straight through.
 func (n *node) resize(ctx context.Context, f fs.FileHandle, size int64) syscall.Errno {
 	if h, ok := f.(*handle); ok {
-		return h.resize(size)
+		return h.resize(ctx, size)
 	}
 
 	if !n.ns.holds(size) {
@@ -424,14 +428,6 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 	// the two are live at once.
 	n.id.move(name, target.id, newName)
 	return 0
-}
-
-// Statfs refuses rather than answering. The namespace reports nothing about the capacity
-// behind it, and the FUSE library's own default is to reply with a zeroed answer, which
-// reads as a full filesystem with no space left — a fabricated fact of exactly the kind
-// this filesystem must not produce (R-ERR-2).
-func (n *node) Statfs(ctx context.Context, out *gofuse.StatfsOut) syscall.Errno {
-	return syscall.ENOSYS
 }
 
 // --- identity ------------------------------------------------------------------------

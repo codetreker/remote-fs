@@ -43,7 +43,7 @@ func allOps() []httprest.Op {
 	return []httprest.Op{
 		httprest.OpStat, httprest.OpSetAttr, httprest.OpList, httprest.OpRead,
 		httprest.OpWrite, httprest.OpCreate, httprest.OpMkdir, httprest.OpRemove,
-		httprest.OpRemoveDir, httprest.OpRename,
+		httprest.OpRemoveDir, httprest.OpRename, httprest.OpSpace,
 	}
 }
 
@@ -64,9 +64,14 @@ func TestRequestSurvivesURLRoundTrip(t *testing.T) {
 	for _, op := range allOps() {
 		for _, p := range awkwardPaths {
 			for _, to := range awkwardPaths {
-				want := httprest.Request{Op: op, Path: p}
-				if op == httprest.OpRename {
-					want.To = to
+				want := httprest.Request{Op: op}
+				switch op {
+				case httprest.OpSpace:
+					// Space takes no operands, so it has nothing a URL could damage.
+				case httprest.OpRename:
+					want.Path, want.To = p, to
+				default:
+					want.Path = p
 				}
 
 				u, err := want.URL(base)
@@ -158,8 +163,31 @@ func TestRequestURLKeepsTheBasePrefix(t *testing.T) {
 	}
 }
 
+// An operation that takes no operands is addressed by its name alone. The refusal of an
+// empty query for every other operation is what keeps a damaged request from reading as a
+// request against the whole namespace, so the one operation that legitimately carries no
+// query is asserted here.
+func TestSpaceIsAddressedWithNoOperands(t *testing.T) {
+	u, err := httprest.Request{Op: httprest.OpSpace}.URL(mustBase(t, "http://example.invalid/"))
+	if err != nil {
+		t.Fatalf("URL for space: %v", err)
+	}
+	if want := "/v1/space"; u.RequestURI() != want {
+		t.Fatalf("space is requested as %q, want %q", u.RequestURI(), want)
+	}
+	got, err := httprest.ParseRequest(http.MethodGet, u)
+	if err != nil {
+		t.Fatalf("ParseRequest for space: %v", err)
+	}
+	if want := (httprest.Request{Op: httprest.OpSpace}); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
 func TestMethods(t *testing.T) {
-	reads := map[httprest.Op]bool{httprest.OpStat: true, httprest.OpList: true, httprest.OpRead: true}
+	reads := map[httprest.Op]bool{
+		httprest.OpStat: true, httprest.OpList: true, httprest.OpRead: true, httprest.OpSpace: true,
+	}
 	for _, op := range allOps() {
 		want := http.MethodPost
 		if reads[op] {
@@ -212,11 +240,16 @@ func TestParseRequestRejectsMalformedRequests(t *testing.T) {
 		{"an operand nobody asked for", http.MethodGet, "/v1/stat?path=a&to=b", httprest.ErrOperands},
 		{"rename without a destination", http.MethodPost, "/v1/rename?path=a", httprest.ErrOperands},
 		{"rename with the destination twice", http.MethodPost, "/v1/rename?path=a&to=b&to=c", httprest.ErrOperands},
+		// Space describes the whole namespace, so a path beside it is a question nothing
+		// can answer rather than one to answer about the root.
+		{"space with a path", http.MethodGet, "/v1/space?path=a", httprest.ErrOperands},
+		{"space with an empty path", http.MethodGet, "/v1/space?path=", httprest.ErrOperands},
 		{"an operation that does not exist", http.MethodGet, "/v1/teleport?path=a", httprest.ErrUnknownOp},
 		{"no version prefix", http.MethodGet, "/stat?path=a", httprest.ErrUnknownOp},
 		{"a deeper path under the prefix", http.MethodGet, "/v1/stat/extra?path=a", httprest.ErrUnknownOp},
 		{"reading with a write method", http.MethodPost, "/v1/stat?path=a", httprest.ErrMethod},
 		{"writing with a read method", http.MethodGet, "/v1/remove?path=a", httprest.ErrMethod},
+		{"space with a write method", http.MethodPost, "/v1/space", httprest.ErrMethod},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -233,6 +233,79 @@ func (r ListResponse) Storage() []storage.Entry {
 	return entries
 }
 
+// Space is storage.Space on the wire.
+//
+// Each count travels by pointer and the decoding below refuses an absent one. They are
+// byte counts whose zero is a legitimate figure — a namespace holding nothing has used
+// none, and a full one has none available — so once a field has been read there is no
+// telling absence from zero. As plain fields, a report that lost one would describe a
+// namespace with no room left, which reads as an ordinary answer and stops every write.
+type Space struct {
+	Total *int64 `json:"total"`
+	Used  *int64 `json:"used"`
+	Avail *int64 `json:"avail"`
+}
+
+// SpaceOf renders s for the wire.
+func SpaceOf(s storage.Space) *Space {
+	return &Space{Total: &s.Total, Used: &s.Used, Avail: &s.Avail}
+}
+
+// UnmarshalJSON decodes a space report, refusing one that is missing a count and one whose
+// counts could not all be true of anything.
+//
+// Coherence is settled here so that no reader of these messages can omit it. These figures
+// end up in a kernel reply whose fields are unsigned, where a negative becomes an enormous
+// positive and a program asking whether its write will fit is told it has room no disk
+// holds — a fabricated fact rather than a set of figures to repair (R-ERR-2).
+func (s *Space) UnmarshalJSON(data []byte) error {
+	type space Space
+	var decoded space
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	for _, count := range []struct {
+		name  string
+		value *int64
+	}{{"total", decoded.Total}, {"used", decoded.Used}, {"avail", decoded.Avail}} {
+		if count.value == nil {
+			return fmt.Errorf("the space report carried no %s", count.name)
+		}
+	}
+	report := Space(decoded)
+	if reported := report.Storage(); !reported.Coherent() {
+		return fmt.Errorf("the space report holds %d bytes in all, of which %d are used and %d available, which cannot all be true",
+			reported.Total, reported.Used, reported.Avail)
+	}
+	*s = report
+	return nil
+}
+
+// Storage returns the counts s carries. Every Space this package produces has all three:
+// SpaceOf sets them, and the decoding refuses a report missing one.
+func (s Space) Storage() storage.Space {
+	return storage.Space{Total: *s.Total, Used: *s.Used, Avail: *s.Avail}
+}
+
+// SpaceResponse is the body of a successful OpSpace.
+type SpaceResponse struct {
+	Space *Space `json:"space"`
+}
+
+// UnmarshalJSON decodes the response, and refuses a body that carries no space report.
+func (r *SpaceResponse) UnmarshalJSON(data []byte) error {
+	type response SpaceResponse
+	var decoded response
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if decoded.Space == nil {
+		return errors.New("the response carried no space report")
+	}
+	*r = SpaceResponse(decoded)
+	return nil
+}
+
 // ErrorResponse is the body of every response that is not a success.
 //
 // Errno is set exactly when the status is StatusStorageError, and it holds the symbolic

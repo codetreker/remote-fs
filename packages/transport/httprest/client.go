@@ -117,6 +117,27 @@ func (s *Storage) Rename(ctx context.Context, from, to string) error {
 	return s.change(ctx, Request{Op: OpRename, Path: from, To: to}, nil)
 }
 
+// Space reports the room the namespace behind the wire has.
+//
+// A namespace with no room of its own to report says so with ENOSYS, which arrives as an
+// ordinary storage error under that name. This side cannot know statically what is behind
+// it, so the refusal is an answer rather than an absent method.
+func (s *Storage) Space(ctx context.Context) (storage.Space, error) {
+	req := Request{Op: OpSpace}
+	body, err := s.call(ctx, req, nil)
+	if err != nil {
+		return storage.Space{}, err
+	}
+	// A body that is not this operation's answer — one missing a count, or carrying
+	// figures that cannot all be true — does not decode, so there is nothing further to
+	// check here.
+	var resp SpaceResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return storage.Space{}, unreachable(req, err)
+	}
+	return resp.Space.Storage(), nil
+}
+
 // change performs an operation whose whole answer is that it happened.
 //
 // The empty body is the only evidence such an operation has, so a body carrying anything
@@ -244,14 +265,24 @@ type operationError struct {
 }
 
 func (e *operationError) Error() string {
-	target := strconv.Quote(e.req.Path)
-	if e.req.Op == OpRename {
-		target += " to " + strconv.Quote(e.req.To)
-	}
 	if e.detail == "" {
-		return fmt.Sprintf("%s %s: %v", e.req.Op, target, e.errno)
+		return fmt.Sprintf("%s: %v", e.req.subject(), e.errno)
 	}
-	return fmt.Sprintf("%s %s: %s: %v", e.req.Op, target, e.detail, e.errno)
+	return fmt.Sprintf("%s: %s: %v", e.req.subject(), e.detail, e.errno)
+}
+
+// subject names the operation and what it was aimed at. An operation taking no operands
+// names nothing further: OpSpace describes the whole namespace, and an empty path quoted
+// beside it would read as a report about the root.
+func (r Request) subject() string {
+	switch {
+	case len(ops[r.Op].operands) == 0:
+		return string(r.Op)
+	case r.Op == OpRename:
+		return fmt.Sprintf("%s %s to %s", r.Op, strconv.Quote(r.Path), strconv.Quote(r.To))
+	default:
+		return fmt.Sprintf("%s %s", r.Op, strconv.Quote(r.Path))
+	}
 }
 
 func (e *operationError) Unwrap() error { return e.errno }

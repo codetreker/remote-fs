@@ -155,6 +155,14 @@ func (p *process) interrupt(t *testing.T) {
 	}
 }
 
+// hangup asks a process for whatever it does about SIGHUP and leaves it running.
+func (p *process) hangup(t *testing.T) {
+	t.Helper()
+	if err := p.cmd.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatalf("hanging up %s: %v", p.name, err)
+	}
+}
+
 func (p *process) wait(t *testing.T) error {
 	t.Helper()
 	select {
