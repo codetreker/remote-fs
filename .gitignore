@@ -33,3 +33,9 @@ go.work.sum
 
 # Git worktrees
 .worktrees/
+
+# Vendored dependencies
+vendor/
+
+# Build output
+bin/
