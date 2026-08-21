@@ -3,6 +3,7 @@
 package fuse
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -300,10 +301,10 @@ func TestTheBufferBehavesLikeAFile(t *testing.T) {
 	})
 
 	t.Run("shortening and lengthening", func(t *testing.T) {
-		if errno := h.resize(3); errno != 0 {
+		if errno := h.resize(t.Context(), 3); errno != 0 {
 			t.Fatalf("shortening failed with %v", errno)
 		}
-		if errno := h.resize(5); errno != 0 {
+		if errno := h.resize(t.Context(), 5); errno != 0 {
 			t.Fatalf("lengthening failed with %v", errno)
 		}
 		result, errno := h.Read(t.Context(), dest, 0)
@@ -320,10 +321,21 @@ func TestTheBufferBehavesLikeAFile(t *testing.T) {
 	})
 }
 
-// aHandle is one open file with a ceiling and nothing behind it. Its node has no storage,
-// which is all a handle needs until it commits.
+// aHandle is one open file with a ceiling, behind a namespace that reports no room of its
+// own. A write and a resize alike ask how much room is left before they grow the buffer,
+// and a namespace with no figure to give imposes nothing, so what these cases exercise is
+// the ceiling alone.
 func aHandle(contents []byte, maxFileSize int64) *handle {
-	return newHandle(&node{ns: &namespace{maxFileSize: maxFileSize}}, contents, committed)
+	n := &node{ns: &namespace{storage: unmeasured{}, maxFileSize: maxFileSize}}
+	return newHandle(n, contents, committed)
+}
+
+// unmeasured is a namespace with no room of its own to report. Nothing but Space is
+// reached through it, because a handle needs nothing else until it commits.
+type unmeasured struct{ storage.Storage }
+
+func (unmeasured) Space(context.Context) (storage.Space, error) {
+	return storage.Space{}, syscall.ENOSYS
 }
 
 // The buffer is the whole file, so its size is what one caller can ask this process to
@@ -338,7 +350,7 @@ func TestTheBufferRefusesToGrowPastTheCeiling(t *testing.T) {
 		name string
 		act  func(h *handle) syscall.Errno
 	}{
-		{"a resize to exactly the ceiling", func(h *handle) syscall.Errno { return h.resize(ceiling) }},
+		{"a resize to exactly the ceiling", func(h *handle) syscall.Errno { return h.resize(t.Context(), ceiling) }},
 		{"a write ending exactly at the ceiling", func(h *handle) syscall.Errno {
 			_, errno := h.Write(t.Context(), make([]byte, 8), ceiling-8)
 			return errno
@@ -355,8 +367,8 @@ func TestTheBufferRefusesToGrowPastTheCeiling(t *testing.T) {
 		name string
 		act  func(h *handle) syscall.Errno
 	}{
-		{"a resize one byte past the ceiling", func(h *handle) syscall.Errno { return h.resize(ceiling + 1) }},
-		{"a resize well past the ceiling", func(h *handle) syscall.Errno { return h.resize(1 << 20) }},
+		{"a resize one byte past the ceiling", func(h *handle) syscall.Errno { return h.resize(t.Context(), ceiling+1) }},
+		{"a resize well past the ceiling", func(h *handle) syscall.Errno { return h.resize(t.Context(), 1<<20) }},
 		{"a write ending one byte past the ceiling", func(h *handle) syscall.Errno {
 			_, errno := h.Write(t.Context(), make([]byte, 8), ceiling-7)
 			return errno
@@ -384,11 +396,11 @@ func TestTheBufferRefusesToGrowPastTheCeiling(t *testing.T) {
 	// second overflows int64 into a negative length. Neither can be allowed to run
 	// before the ceiling has been shown to hold at a harmless size.
 	t.Run("sizes that cannot safely be attempted without the ceiling", func(t *testing.T) {
-		if errno := aHandle(nil, ceiling).resize(ceiling + 1); errno != syscall.EFBIG {
+		if errno := aHandle(nil, ceiling).resize(t.Context(), ceiling+1); errno != syscall.EFBIG {
 			t.Fatalf("the ceiling returned %v at %d bytes; the larger sizes are not attempted",
 				errno, ceiling+1)
 		}
-		if errno := aHandle(nil, ceiling).resize(1 << 40); errno != syscall.EFBIG {
+		if errno := aHandle(nil, ceiling).resize(t.Context(), 1<<40); errno != syscall.EFBIG {
 			t.Fatalf("a resize to 1 TiB returned %v, want EFBIG", errno)
 		}
 		// off is whatever the caller seeked to, so off+len(data) is where int64 runs out.
@@ -739,5 +751,179 @@ func TestAListingDropsTheNamesTheDirectoryNoLongerHas(t *testing.T) {
 		t.Fatal("a name the listing does not hold kept its identity")
 	} else if again.child("beneath", syscall.S_IFREG).ino == gone.children["beneath"].ino {
 		t.Fatal("a name beneath the one that went kept its identity")
+	}
+}
+
+// --- the room left in the namespace ----------------------------------------------------
+
+// answersSpace answers Space as the case requires and counts how often it was asked, which
+// is the property that matters: write(2) is a filesystem's hottest path, and a question to
+// the namespace on each one would cost far more than the refusal it pays for.
+type answersSpace struct {
+	storage.Storage
+	mu      sync.Mutex
+	asked   int
+	entered chan struct{}
+	release chan struct{}
+	space   storage.Space
+	err     error
+}
+
+func (s *answersSpace) Space(context.Context) (storage.Space, error) {
+	s.mu.Lock()
+	s.asked++
+	s.mu.Unlock()
+	if s.entered != nil {
+		s.entered <- struct{}{}
+		<-s.release
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.space, s.err
+}
+
+func (s *answersSpace) times() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.asked
+}
+
+func (s *answersSpace) answer(space storage.Space, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.space, s.err = space, err
+}
+
+func TestTheRoomLeftIsMeasuredOnceAWindow(t *testing.T) {
+	answering := &answersSpace{space: storage.Space{Total: 1000, Used: 400, Avail: 600}}
+	var g roomGauge
+
+	for range 100 {
+		avail, measured := g.remaining(t.Context(), answering)
+		if !measured || avail != 600 {
+			t.Fatalf("the gauge reports %d, %v; want 600 measured", avail, measured)
+		}
+	}
+	if answering.times() != 1 {
+		t.Fatalf("the namespace was asked %d times for one window's worth of writes", answering.times())
+	}
+
+	// Aged past the window, the namespace is asked again and the new figure replaces the
+	// old one. The clock is moved rather than waited on, because a window's wait in a test
+	// is a window's wait on every run.
+	answering.answer(storage.Space{Total: 1000, Used: 900, Avail: 100}, nil)
+	g.asked = time.Now().Add(-roomWindow)
+	if avail, measured := g.remaining(t.Context(), answering); !measured || avail != 100 {
+		t.Fatalf("the gauge reports %d, %v after the window passed; want 100 measured", avail, measured)
+	}
+	if answering.times() != 2 {
+		t.Fatalf("the namespace was asked %d times, want a second question once the figure aged",
+			answering.times())
+	}
+}
+
+// A namespace with no room of its own to report is asked once. The contract makes that a
+// standing property of the implementation rather than a condition of the call, so asking
+// again could only produce the same refusal at the price of a round trip on the write path.
+func TestANamespaceWithNoRoomToReportIsAskedOnce(t *testing.T) {
+	answering := &answersSpace{err: syscall.ENOSYS}
+	var g roomGauge
+
+	for range 10 {
+		if avail, measured := g.remaining(t.Context(), answering); measured {
+			t.Fatalf("the gauge reports %d as measured; the namespace reports no room of its own", avail)
+		}
+		g.asked = time.Now().Add(-roomWindow)
+	}
+	if answering.times() != 1 {
+		t.Fatalf("the namespace was asked %d times after refusing once", answering.times())
+	}
+}
+
+// A namespace that could not be reached leaves the last figure standing. It is still the
+// last thing anybody measured, and the alternative — forgetting it — would stop weighing
+// writes at exactly the moment the commit is about to fail as well.
+func TestAFailedQuestionLeavesTheLastFigureStanding(t *testing.T) {
+	answering := &answersSpace{space: storage.Space{Total: 1000, Used: 400, Avail: 600}}
+	var g roomGauge
+
+	if avail, measured := g.remaining(t.Context(), answering); !measured || avail != 600 {
+		t.Fatalf("the gauge reports %d, %v; want 600 measured", avail, measured)
+	}
+
+	for _, c := range []struct {
+		name  string
+		space storage.Space
+		err   error
+	}{
+		{"a namespace that could not be reached", storage.Space{}, errors.New("unreachable")},
+		// An answer that cannot be true of anything is not an answer. Recording it would
+		// weigh writes against a figure nobody measured.
+		{"an answer that cannot be true", storage.Space{Total: 1000, Used: 400, Avail: 900}, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			answering.answer(c.space, c.err)
+			g.asked = time.Now().Add(-roomWindow)
+			if avail, measured := g.remaining(t.Context(), answering); !measured || avail != 600 {
+				t.Fatalf("the gauge reports %d, %v; want the last measured figure, 600", avail, measured)
+			}
+		})
+	}
+}
+
+// Two programs writing two different files may not be made to wait on each other (R-CC-2),
+// so a write that arrives while the namespace is being asked uses the figure that is
+// already there instead of queueing behind the question.
+func TestAWriteDoesNotQueueBehindAQuestionAlreadyInFlight(t *testing.T) {
+	answering := &answersSpace{
+		space:   storage.Space{Total: 1000, Used: 400, Avail: 600},
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	var g roomGauge
+
+	asking := make(chan struct{})
+	go func() {
+		defer close(asking)
+		g.remaining(t.Context(), answering)
+	}()
+	<-answering.entered
+
+	// This one must come back rather than block; with no figure yet there is none to give,
+	// and the write it belongs to goes ahead and is weighed at the commit.
+	if avail, measured := g.remaining(t.Context(), answering); measured {
+		t.Fatalf("the gauge reports %d as measured before any question has been answered", avail)
+	}
+	if answering.times() != 1 {
+		t.Fatalf("the namespace was asked %d times, want the second caller to have used what was there",
+			answering.times())
+	}
+
+	close(answering.release)
+	<-asking
+	if avail, measured := g.remaining(t.Context(), answering); !measured || avail != 600 {
+		t.Fatalf("the gauge reports %d, %v once the question was answered; want 600 measured", avail, measured)
+	}
+}
+
+// A change that leaves a file no longer than the namespace already holds it needs no room,
+// so it is carried out whatever the figure says, and the namespace is not asked. A
+// workspace past its allowance has to have a way back under it (R-WS-5), and shortening a
+// file is that way.
+func TestShorteningNeedsNoRoomAndAsksForNone(t *testing.T) {
+	answering := &answersSpace{space: storage.Space{Total: 1000, Used: 1000}}
+	h := newHandle(&node{ns: &namespace{storage: answering, maxFileSize: 1 << 20}},
+		make([]byte, 500), committed)
+
+	if errno := h.resize(t.Context(), 100); errno != 0 {
+		t.Fatalf("shortening a file of 500 bytes to 100 returned %v, in a workspace with nothing left",
+			errno)
+	}
+	if len(h.contents) != 100 {
+		t.Fatalf("the buffer is %d bytes after being shortened to 100", len(h.contents))
+	}
+	if answering.times() != 0 {
+		t.Fatalf("the namespace was asked %d times about room a shortening does not need",
+			answering.times())
 	}
 }

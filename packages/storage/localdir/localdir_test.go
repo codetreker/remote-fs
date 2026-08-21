@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/localdir"
 	"github.com/codetreker/remote-fs/packages/storage/storagetest"
@@ -60,6 +62,74 @@ func TestReadsReportWhatTheDirectoryHolds(t *testing.T) {
 	}
 	if string(got) != "payload" {
 		t.Fatalf("read %q, want %q", got, "payload")
+	}
+}
+
+// --- space -----------------------------------------------------------------------------
+
+// A directory carries no allowance of its own, so the figures a namespace held in one
+// reports are the host filesystem's. The contract suite cannot settle that: it has to
+// accept ENOSYS from any implementation, and would pass unchanged against one that
+// reported nothing. So what the figures are is checked here, against a statfs of the same
+// directory.
+func TestSpaceReportsTheHostFilesystemsOwnFigures(t *testing.T) {
+	root := t.TempDir()
+	s := newStorage(t, root)
+
+	before := statfsOf(t, root)
+	space, err := s.Space(t.Context())
+	if err != nil {
+		t.Fatalf("space: %v", err)
+	}
+	after := statfsOf(t, root)
+
+	if want := int64(before.Blocks) * int64(before.Bsize); space.Total != want {
+		t.Errorf("space reports a total of %d bytes; the filesystem holding the served directory has %d blocks of %d bytes, which is %d",
+			space.Total, before.Blocks, before.Bsize, want)
+	}
+	// Everything else on the machine writes to that same filesystem while this runs, so
+	// the two figures that move are checked against the range the readings either side of
+	// the call put them in rather than against one reading alone.
+	mustLieBetween(t, "used", space.Used,
+		int64(before.Blocks-before.Bfree)*int64(before.Bsize),
+		int64(after.Blocks-after.Bfree)*int64(after.Bsize))
+	mustLieBetween(t, "available", space.Avail,
+		int64(before.Bavail)*int64(before.Bsize),
+		int64(after.Bavail)*int64(after.Bsize))
+}
+
+// A namespace whose directory has been taken away has to fail rather than report a
+// filesystem of no size — which reads as a mount with nothing left to write into, and is
+// acted on by whatever asked.
+func TestSpaceFailsWhenTheServedDirectoryIsGone(t *testing.T) {
+	root := t.TempDir()
+	s := newStorage(t, root)
+
+	if err := os.Remove(root); err != nil {
+		t.Fatal(err)
+	}
+	space, err := s.Space(t.Context())
+	if !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("space reported %+v with error %v, want ENOENT", space, err)
+	}
+}
+
+func statfsOf(t *testing.T, dir string) unix.Statfs_t {
+	t.Helper()
+	var st unix.Statfs_t
+	if err := unix.Statfs(dir, &st); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+// mustLieBetween checks a figure that moves under the test against the two readings taken
+// either side of the call, in whichever order they fell.
+func mustLieBetween(t *testing.T, what string, got, first, second int64) {
+	t.Helper()
+	if got < min(first, second) || got > max(first, second) {
+		t.Errorf("space reports %d bytes %s; a statfs either side of the call reported %d and %d",
+			got, what, first, second)
 	}
 }
 
@@ -317,6 +387,102 @@ func entryNamed(t *testing.T, s storage.Storage, name string) storage.Entry {
 	}
 	t.Fatalf("the listing holds %v, and none of them is %q", entries, name)
 	return storage.Entry{}
+}
+
+// --- rename ------------------------------------------------------------------------------
+
+// Rename calls rename(2) rather than os.Rename, and these are the spellings that settle
+// which of the two answered. os.Rename lstats the destination and returns an EEXIST of its
+// own making whenever a directory is there, before any syscall is made, so each case below
+// turns red the moment the call is routed back through the standard library.
+//
+// The contract suite cannot pin any of this. It has to hold on whatever filesystem an
+// implementation sits on, so it permits either errno for a destination that still has
+// entries and says nothing at all about the other two. Here the host is Linux and the
+// answers are the kernel's own.
+
+// A destination directory is not in the way of a rename by being a directory. rename(2)
+// takes an empty one's place, and a program written for a local directory relies on it
+// (R-FS-2) — that is how a build tool swaps a staging tree for the one it replaces.
+func TestRenameTakesAnEmptyDirectorysPlace(t *testing.T) {
+	root := t.TempDir()
+	s := newStorage(t, root)
+	plantDir(t, root, "from", "held")
+	plantDir(t, root, "to")
+
+	if err := s.Rename(t.Context(), "from", "to"); err != nil {
+		t.Fatalf("renaming a directory onto an empty one failed with %v, want it to succeed", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(root, "to", "held"))
+	if err != nil {
+		t.Fatalf("what the moved directory held: %v", err)
+	}
+	if string(got) != "payload" {
+		t.Errorf("the moved directory holds %q, want %q", got, "payload")
+	}
+	if _, err := os.Lstat(filepath.Join(root, "from")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the source is still there (%v)", err)
+	}
+}
+
+// The errnos rename(2) gives for a destination it will not replace. Each one names what is
+// actually in the way, where the EEXIST os.Rename hands back for both says only that
+// something is there.
+func TestRenameReportsTheKernelsErrnoForADestinationItCannotReplace(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		plant func(t *testing.T, root string)
+		want  syscall.Errno
+	}{
+		{"a directory onto a directory that still has entries", func(t *testing.T, root string) {
+			plantDir(t, root, "from")
+			plantDir(t, root, "to", "held")
+		}, syscall.ENOTEMPTY},
+		{"a file onto a directory", func(t *testing.T, root string) {
+			if err := os.WriteFile(filepath.Join(root, "from"), []byte("payload"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			plantDir(t, root, "to")
+		}, syscall.EISDIR},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root := t.TempDir()
+			s := newStorage(t, root)
+			c.plant(t, root)
+
+			err := s.Rename(t.Context(), "from", "to")
+			if !errors.Is(err, c.want) {
+				t.Fatalf("the rename failed with %v, want %v", err, c.want)
+			}
+			// The operands are the namespace's, not the directory the namespace happens to
+			// be held in: this error travels to a caller on another machine, and the host
+			// paths are the server's own layout for it to know nothing about.
+			var link *os.LinkError
+			if !errors.As(err, &link) {
+				t.Fatalf("the rename failed with %T, want an *os.LinkError", err)
+			}
+			if link.Old != "from" || link.New != "to" {
+				t.Errorf("the error names %q and %q, want %q and %q", link.Old, link.New, "from", "to")
+			}
+			if _, err := os.Lstat(filepath.Join(root, "from")); err != nil {
+				t.Errorf("the source is gone after a rename that failed: %v", err)
+			}
+		})
+	}
+}
+
+// plantDir makes a directory holding one file per name given, each of them "payload".
+func plantDir(t *testing.T, root, dir string, holds ...string) {
+	t.Helper()
+	if err := os.Mkdir(filepath.Join(root, dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range holds {
+		if err := os.WriteFile(filepath.Join(root, dir, name), []byte("payload"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestWriteLeavesNoLitterBehind(t *testing.T) {

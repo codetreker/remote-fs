@@ -102,6 +102,59 @@ type Storage interface {
 	// Rename moves the node at from to to. An existing file at to is replaced. Naming
 	// the root as either operand is syscall.EBUSY.
 	Rename(ctx context.Context, from, to string) error
+
+	// Space reports the room the namespace has. It describes the whole namespace rather
+	// than the part of it under any one path, because one namespace is one workspace
+	// under one limit, and asking about a subtree is a question nothing here can answer.
+	//
+	// A namespace that has no room of its own to report answers syscall.ENOSYS. That is
+	// a standing property of the implementation rather than a condition of the call: one
+	// that answers answers for as long as it exists, and one that refuses never starts.
+	// Nothing above may therefore treat a refusal as a transient failure to retry, and
+	// nothing may infer a figure it was not given.
+	Space(ctx context.Context) (Space, error)
+}
+
+// Space is the room a namespace has, in bytes.
+//
+// The three are separately measured rather than derived from one another, because for a
+// namespace held in a directory they genuinely differ: a filesystem keeps a reserve only
+// the superuser may spend, which makes Avail smaller than Total-Used. Reporting either as
+// the other would state a quantity nobody measured.
+type Space struct {
+	// Total is what the namespace may hold in all.
+	Total int64
+
+	// Used is how much of Total is gone. What that counts is the namespace's own
+	// business: one holding its own allowance counts the content it holds, while one
+	// held in a directory reports what that whole filesystem has consumed, other
+	// people's files included. Both answer the question Total asks — how much of the
+	// room reported here is left — and neither is a census of this namespace's files.
+	//
+	// It may exceed Total, which is what an allowance lowered underneath content already
+	// written looks like. Avail is then zero.
+	Used int64
+
+	// Avail is what may still be written. It is not Total-Used: an implementation that
+	// knows of a tighter limit beneath it reports the tighter figure, because an
+	// allowance is a ceiling on what may be written rather than evidence that the bytes
+	// will fit.
+	Avail int64
+}
+
+// Coherent reports whether s is an answer that can be true of anything.
+//
+// A negative field describes an impossibility, and Avail above what Total leaves offers
+// room that cannot exist. Both matter beyond tidiness: these are byte counts on their way
+// into a kernel reply whose fields are unsigned, where a negative becomes an enormous
+// positive and a program that checks for room before writing is told it has space no disk
+// anywhere holds. That is the fabricated fact R-ERR-2 forbids, so an incoherent answer is
+// a failure to report rather than a set of numbers to repair.
+func (s Space) Coherent() bool {
+	if s.Total < 0 || s.Used < 0 || s.Avail < 0 {
+		return false
+	}
+	return s.Avail <= max(s.Total-s.Used, 0)
 }
 
 // Attr describes one node — the one that is at the name it was asked about. A symbolic

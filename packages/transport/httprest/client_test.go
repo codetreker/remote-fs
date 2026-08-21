@@ -272,6 +272,7 @@ func TestEveryAnswerDeclaresItsLength(t *testing.T) {
 				{"list", func() error { _, err := s.List(ctx, "d"); return err }},
 				{"rename", func() error { return s.Rename(ctx, "d/f", "d/g") }},
 				{"remove", func() error { return s.Remove(ctx, "d/g") }},
+				{"space", func() error { _, err := s.Space(ctx); return err }},
 			} {
 				if err := op.run(); err != nil {
 					t.Fatalf("%s: %v", op.name, err)

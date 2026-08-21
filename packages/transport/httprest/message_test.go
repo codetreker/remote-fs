@@ -3,6 +3,7 @@ package httprest_test
 import (
 	"encoding/json"
 	"io/fs"
+	"math"
 	"testing"
 	"time"
 
@@ -178,6 +179,70 @@ func TestATimeOutsideTheNanosecondRange(t *testing.T) {
 	}
 }
 
+// The three counts a space report carries are byte counts whose zero is a legitimate
+// figure, so a field lost on the way across cannot be told from one that says nothing is
+// there. The shape is what tells them apart, and the decoding is what refuses it.
+func TestASpaceReportSurvivesJSON(t *testing.T) {
+	cases := []storage.Space{
+		{},
+		{Total: 1 << 40, Used: 1 << 20, Avail: 1<<40 - 1<<20},
+		{Total: 4096, Used: 4096},
+		// An allowance lowered underneath content already written, with nothing available.
+		{Total: 4096, Used: 8192},
+		// The superuser reserve a filesystem keeps, which is why the contract carries
+		// three figures rather than deriving the third.
+		{Total: 1 << 40, Used: 1 << 30, Avail: 1 << 20},
+		{Total: math.MaxInt64, Used: math.MaxInt64, Avail: 0},
+	}
+	for _, want := range cases {
+		encoded, err := json.Marshal(httprest.SpaceResponse{Space: httprest.SpaceOf(want)})
+		if err != nil {
+			t.Fatalf("marshal %+v: %v", want, err)
+		}
+		var resp httprest.SpaceResponse
+		if err := json.Unmarshal(encoded, &resp); err != nil {
+			t.Fatalf("unmarshal %s: %v", encoded, err)
+		}
+		if got := resp.Space.Storage(); got != want {
+			t.Fatalf("round trip of %+v through %s gave %+v", want, encoded, got)
+		}
+	}
+}
+
+// A count that never arrived reads as zero, and zero available is a namespace that
+// refuses every write. Neither an absent count nor figures that could not all be true of
+// anything may be delivered as a report.
+func TestABodyThatCarriesNoSpaceReport(t *testing.T) {
+	cases := map[string]bool{
+		`{}`:                                 false,
+		`null`:                               false,
+		`{"space":null}`:                     false,
+		`{"space":{}}`:                       false,
+		`{"attr":{"mode":0}}`:                false,
+		`{"space":{"used":0,"avail":0}}`:     false,
+		`{"space":{"total":4096,"avail":0}}`: false,
+		`{"space":{"total":4096,"used":0}}`:  false,
+		`{"space":{"total":4096,"used":0,"free":4096}}`:   false,
+		`{"space":{"total":"4096","used":0,"avail":0}}`:   false,
+		`{"space":{"total":-1,"used":0,"avail":0}}`:       false,
+		`{"space":{"total":4096,"used":-1,"avail":0}}`:    false,
+		`{"space":{"total":4096,"used":0,"avail":-1}}`:    false,
+		`{"space":{"total":4096,"used":4096,"avail":1}}`:  false,
+		`{"space":{"total":0,"used":0,"avail":0}}`:        true,
+		`{"space":{"total":4096,"used":1024,"avail":10}}`: true,
+		`{"space":{"total":4096,"used":8192,"avail":0}}`:  true,
+	}
+	for body, want := range cases {
+		t.Run(body, func(t *testing.T) {
+			var resp httprest.SpaceResponse
+			err := json.Unmarshal([]byte(body), &resp)
+			if got := err == nil; got != want {
+				t.Fatalf("%s decoded as %+v, %v", body, resp.Space, err)
+			}
+		})
+	}
+}
+
 // Absence has to be visible in the shape of a body, because it is not visible in the
 // values once they have been read: a zero Attr reads as a regular file of length 0 dated
 // the epoch, and a file whose mode really is 0 is a legitimate answer with exactly those
@@ -290,5 +355,16 @@ func TestTheWireForm(t *testing.T) {
 	}
 	if want := `{"change":{}}`; string(encoded) != want {
 		t.Fatalf("a change naming nothing encodes as %s, want %s", encoded, want)
+	}
+
+	// Every count is written out, zero included: they are pointers so that an absent one
+	// can be refused, and omitting the zeroes would send exactly the shape that refusal
+	// exists to catch.
+	encoded, err = json.Marshal(httprest.SpaceResponse{Space: httprest.SpaceOf(storage.Space{Total: 4096})})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if want := `{"space":{"total":4096,"used":0,"avail":0}}`; string(encoded) != want {
+		t.Fatalf("a space report encodes as %s, want %s", encoded, want)
 	}
 }

@@ -72,7 +72,7 @@ var (
 // Op names one storage operation. The name is the last segment of the request URL path.
 type Op string
 
-// The ten operations of the storage contract.
+// The eleven operations of the storage contract.
 const (
 	OpStat      Op = "stat"
 	OpSetAttr   Op = "setattr"
@@ -84,6 +84,7 @@ const (
 	OpRemove    Op = "remove"
 	OpRemoveDir Op = "removedir"
 	OpRename    Op = "rename"
+	OpSpace     Op = "space"
 )
 
 // Query keys for the operands. Operands travel in the query string rather than in the
@@ -121,12 +122,17 @@ var ops = map[Op]opSpec{
 	OpRemove:    {method: http.MethodPost, operands: []string{keyPath}},
 	OpRemoveDir: {method: http.MethodPost, operands: []string{keyPath}},
 	OpRename:    {method: http.MethodPost, operands: []string{keyPath, keyTo}},
+	// Space describes the whole namespace rather than anything under a path, so it takes
+	// no operands. A path sent beside it is refused like any operand nobody asked for.
+	OpSpace: {method: http.MethodGet},
 }
 
 // Request is one operation and its operands.
 //
-// Path is the operand every operation takes, and for OpRename it is the source. To is
-// the destination and is meaningful for OpRename alone.
+// Path is the operand every operation but OpSpace takes, and for OpRename it is the
+// source. To is the destination and is meaningful for OpRename alone. A field an
+// operation does not take is not carried, so it does not survive a round trip through a
+// URL.
 type Request struct {
 	Op   Op
 	Path string

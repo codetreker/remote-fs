@@ -10,13 +10,21 @@
 // Nothing is cached. The kernel's entry and attribute timeouts are zero, so every call
 // the kernel makes becomes a call on the storage, and every answer describes the
 // namespace as it is at that moment. That is why this mount needs no change
-// notification: there is nothing held locally that could go stale.
+// notification: every attribute and every byte it reports is read at the moment it is
+// asked for.
 //
 // The one thing that is held locally is the contents of an open file, because
 // storage.Read and storage.Write deal in whole files. Each open handle reads the file
 // once and serves the kernel's requests out of that buffer; writes patch the buffer and
 // are committed on close. Options.MaxFileSize bounds that buffer, and every operation
 // that would grow one past it fails with EFBIG instead.
+//
+// One figure is held besides: what the namespace last said about the room left in it.
+// Every change that would make a workspace hold more is weighed against it, so that one at
+// its limit refuses at the call that asked — the write(2), the ftruncate(2) — rather than
+// at the close(2) where the commit would discover it, with EDQUOT. That figure goes stale
+// between refreshes by design, and nothing is settled on it — the commit is where the
+// namespace itself refuses, and its answer is the one that stands.
 //
 // Linked into somebody else's process this package touches nothing of that process
 // (R-INT-2): no signal handlers, no writes to its output, no exiting it, no work at

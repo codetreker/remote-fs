@@ -101,6 +101,7 @@ func TestSuccessIsAlwaysStatus200(t *testing.T) {
 		{Op: httprest.OpRename, Path: "new", To: "renamed"},
 		{Op: httprest.OpRemove, Path: "renamed"},
 		{Op: httprest.OpRemoveDir, Path: "d"},
+		{Op: httprest.OpSpace},
 	} {
 		if w := serve(t, h, req, nil); w.Code != http.StatusOK {
 			t.Fatalf("%s %q answered %d, want 200: %s", req.Op, req.Path, w.Code, w.Body)
@@ -265,6 +266,7 @@ func TestAnUnnameableFailureBecomesEIO(t *testing.T) {
 				{Op: httprest.OpList, Path: "f"},
 				{Op: httprest.OpRead, Path: "f"},
 				{Op: httprest.OpCreate, Path: "f"},
+				{Op: httprest.OpSpace},
 			} {
 				w := serve(t, h, req, nil)
 				if w.Code != httprest.StatusStorageError {
@@ -285,6 +287,28 @@ func TestAnUnnameableFailureBecomesEIO(t *testing.T) {
 	}
 }
 
+// A namespace with no room of its own to report answers ENOSYS, and this protocol has no
+// separate way to say so: the refusal is the namespace's answer, so it travels as an
+// ordinary storage error under its own name. Collapsing it to EIO would turn a standing
+// property into a failure worth retrying.
+func TestANamespaceWithNoRoomToReportSaysSoByName(t *testing.T) {
+	h, err := httprest.NewHandler(failing{syscall.ENOSYS})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := serve(t, h, httprest.Request{Op: httprest.OpSpace}, nil)
+	if w.Code != httprest.StatusStorageError {
+		t.Fatalf("space answered %d, want %d: %s", w.Code, httprest.StatusStorageError, w.Body)
+	}
+	var resp httprest.ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("space answered an unparseable body %s: %v", w.Body, err)
+	}
+	if resp.Errno != "ENOSYS" {
+		t.Fatalf("space reported errno %q, want ENOSYS", resp.Errno)
+	}
+}
+
 // failing is a storage whose every operation reports one fixed error.
 type failing struct{ err error }
 
@@ -302,6 +326,7 @@ func (f failing) Mkdir(context.Context, string) error          { return f.err }
 func (f failing) Remove(context.Context, string) error         { return f.err }
 func (f failing) RemoveDir(context.Context, string) error      { return f.err }
 func (f failing) Rename(context.Context, string, string) error { return f.err }
+func (f failing) Space(context.Context) (storage.Space, error) { return storage.Space{}, f.err }
 
 func TestReadAnswersTheExactBytesWithALength(t *testing.T) {
 	h, dir := newHandler(t)

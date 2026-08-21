@@ -104,6 +104,17 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) 
 		h.report(w, h.storage.RemoveDir(ctx, req.Path))
 	case OpRename:
 		h.report(w, h.storage.Rename(ctx, req.Path, req.To))
+
+	case OpSpace:
+		// ENOSYS from a namespace with no room of its own to report is an answer about
+		// that namespace rather than a gap in this protocol, so it travels under its own
+		// name like every other errno.
+		space, err := h.storage.Space(ctx)
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, SpaceResponse{Space: SpaceOf(space)})
 	}
 }
 

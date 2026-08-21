@@ -92,6 +92,12 @@ func TestTheBinariesRefuseWhatTheyCannotDo(t *testing.T) {
 			[]string{"-listen", free}, "-dir is required"},
 		{"a flag nobody defined", serverBinary(t),
 			[]string{"-listen", free, "-dir", backing, "-nonsense"}, "not defined"},
+		{"an allowance that is not a size", serverBinary(t),
+			[]string{"-listen", free, "-dir", backing, "-quota", "banana"}, "is not a size"},
+		{"an allowance spelled as a power of 1000", serverBinary(t),
+			[]string{"-listen", free, "-dir", backing, "-quota", "5MB"}, "power of 1000"},
+		{"an allowance below the smallest there is", serverBinary(t),
+			[]string{"-listen", free, "-dir", backing, "-quota", "1K"}, "smallest allowance"},
 
 		{"a mountpoint that is not a directory", mountBinary(t),
 			[]string{"-server", reachable.url, "-mountpoint", notADirectory}, "not a directory"},

@@ -119,6 +119,7 @@ func exerciseTheLibrary() error {
 		{"rename", func() error { return s.Rename(ctx, "d/f", "d/g") }},
 		{"remove", func() error { return s.Remove(ctx, "d/g") }},
 		{"removedir", func() error { return s.RemoveDir(ctx, "d") }},
+		{"space", func() error { _, err := s.Space(ctx); return err }},
 	} {
 		if err := step.run(); err != nil {
 			return fmt.Errorf("%s: %w", step.what, err)

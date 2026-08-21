@@ -10,8 +10,11 @@ package localdir
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
+	"math"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -303,6 +306,14 @@ func (s *Storage) RemoveDir(_ context.Context, path string) error {
 // a directory cannot be moved inside itself, and the destination root always holds at
 // least the source — but the errnos that come back, EINVAL and EEXIST, each name an
 // incidental obstacle rather than the rule, and they differ by direction and by host.
+//
+// The move itself calls rename(2) rather than os.Rename, which lstats the destination and,
+// finding a directory there, returns an EEXIST of its own making without issuing the
+// syscall at all. Four answers the kernel gives are lost to that: POSIX has a rename whose
+// operands resolve to the same existing entry return successfully and perform no other
+// action, a rename onto an empty directory succeed, a destination that still has entries
+// answer ENOTEMPTY, and a file onto a directory answer EISDIR. A program written for a
+// local directory gets all four, and it gets them here (R-FS-2).
 func (s *Storage) Rename(_ context.Context, from, to string) error {
 	hostFrom, err := s.host(from)
 	if err != nil {
@@ -315,7 +326,73 @@ func (s *Storage) Rename(_ context.Context, from, to string) error {
 	if hostFrom == s.root || hostTo == s.root {
 		return &os.LinkError{Op: "rename", Old: from, New: to, Err: syscall.EBUSY}
 	}
-	return os.Rename(hostFrom, hostTo)
+	if err := syscall.Rename(hostFrom, hostTo); err != nil {
+		return &os.LinkError{Op: "rename", Old: from, New: to, Err: err}
+	}
+	return nil
+}
+
+// Space reports what the filesystem holding the served directory says about itself.
+//
+// A directory has no allowance of its own, so the host filesystem's own figures are the
+// only measured ones there are. Used is therefore that whole filesystem's consumption,
+// other people's files included, rather than a census of this namespace's files — which
+// is what makes it the companion of a Total that is also the whole filesystem's.
+//
+// Avail comes from Bavail rather than from Bfree, which is the reason the contract carries
+// three figures instead of two. A filesystem keeps a reserve only the superuser may spend,
+// and an unprivileged writer offered it is refused the moment it writes.
+//
+// All three are counted in Bsize. Frsize is the fragment size, and the block counts
+// statfs(2) reports are not expressed in it, so taking one figure in each would misreport
+// the filesystem by whatever ratio separates the two.
+func (s *Storage) Space(_ context.Context) (storage.Space, error) {
+	var st unix.Statfs_t
+	if err := unix.Statfs(s.root, &st); err != nil {
+		return storage.Space{}, &os.PathError{Op: "statfs", Path: s.root, Err: err}
+	}
+	space, err := spaceOf(st)
+	if err != nil {
+		return storage.Space{}, fmt.Errorf("the filesystem holding %s: %w", s.root, err)
+	}
+	return space, nil
+}
+
+// spaceOf renders what statfs(2) reported. It is kept apart from the call that obtained
+// st because the answers it refuses are ones a working kernel does not give, so they can
+// be put to it here and nowhere else.
+func spaceOf(st unix.Statfs_t) (storage.Space, error) {
+	// A filesystem with no block size, with more free blocks than it has, or with more
+	// available than free, describes a state that cannot be true. Deriving figures from
+	// it anyway would put either a filesystem of no size or a Used that wrapped into an
+	// enormous one in front of a caller as measured fact, so an answer like this is a
+	// failure to report rather than a set of figures to repair (R-ERR-2).
+	blockSize := int64(st.Bsize)
+	if blockSize <= 0 {
+		return storage.Space{}, fmt.Errorf("statfs reports a block size of %d bytes: %w", blockSize, syscall.EIO)
+	}
+	if st.Bfree > st.Blocks || st.Bavail > st.Bfree {
+		return storage.Space{}, fmt.Errorf("statfs reports %d blocks of which %d are free and %d are available, which cannot all be true: %w",
+			st.Blocks, st.Bfree, st.Bavail, syscall.EIO)
+	}
+
+	// EOVERFLOW is the errno the kernel itself gives for a figure that does not fit, and
+	// no filesystem is that large today — an int64 of bytes runs to eight exbibytes. The
+	// product is checked rather than assumed because getting it wrong is silent: one that
+	// wrapped would come back as a small or a negative figure with nothing marking it
+	// wrong. Saturating at the maximum instead would describe a filesystem nobody has.
+	high, low := bits.Mul64(st.Blocks, uint64(blockSize))
+	if high != 0 || low > math.MaxInt64 {
+		return storage.Space{}, fmt.Errorf("statfs reports %d blocks of %d bytes each, which is more than a byte count holds: %w",
+			st.Blocks, blockSize, syscall.EOVERFLOW)
+	}
+	// The other two count fewer blocks than the total does, at the same block size, so
+	// the product checked above settles them as well.
+	return storage.Space{
+		Total: int64(low),
+		Used:  int64(st.Blocks-st.Bfree) * blockSize,
+		Avail: int64(st.Bavail) * blockSize,
+	}, nil
 }
 
 // host maps a namespace path onto a path in the underlying directory. Everything that

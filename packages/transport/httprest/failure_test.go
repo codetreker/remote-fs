@@ -66,6 +66,21 @@ func exerciseAll(t *testing.T, ctx context.Context, s storage.Storage) {
 	t.Run("remove", func(t *testing.T) { requireUnreachable(t, s.Remove(ctx, "f")) })
 	t.Run("removedir", func(t *testing.T) { requireUnreachable(t, s.RemoveDir(ctx, "d")) })
 	t.Run("rename", func(t *testing.T) { requireUnreachable(t, s.Rename(ctx, "from", "to")) })
+	t.Run("space", func(t *testing.T) {
+		space, err := s.Space(ctx)
+		requireUnreachable(t, err)
+		// Zero bytes free is the shape that stops every write while looking like an
+		// ordinary answer, so the failure is what has to arrive, never the figures.
+		if err == nil {
+			t.Fatalf("space reported %+v instead of a failure", space)
+		}
+		// A namespace that cannot be reached is not a namespace that has no room to
+		// report: ENOSYS is a standing property, and nothing above may learn it from a
+		// server it never reached.
+		if errors.Is(err, syscall.ENOSYS) {
+			t.Fatalf("a transport failure arrived as ENOSYS: %v", err)
+		}
+	})
 }
 
 func requireUnreachable(t *testing.T, err error) {
@@ -185,9 +200,9 @@ func TestAnswersThatAreNotThisProtocol(t *testing.T) {
 // A response that is marked as this protocol's and carries a status of success, but
 // whose body is not the answer the operation asked for.
 //
-// Stat and List catch it by failing to read the body. The operations that change the
-// namespace catch it because their answer is an empty body and nothing else — they have
-// no other evidence, and a change reported as done that never happened is not
+// Stat, List and Space catch it by failing to read the body. The operations that change
+// the namespace catch it because their answer is an empty body and nothing else — they
+// have no other evidence, and a change reported as done that never happened is not
 // recoverable. Read is absent on purpose: a file holds arbitrary bytes, so once the
 // response is marked and its declared length checks out, the body is the answer.
 func TestABodyThatIsNotTheAnswer(t *testing.T) {
@@ -215,6 +230,12 @@ func TestABodyThatIsNotTheAnswer(t *testing.T) {
 			requireUnreachable(t, err)
 			if err == nil && len(entries) == 0 {
 				t.Fatal("list reported an empty directory instead of a failure")
+			}
+
+			space, err := s.Space(ctx)
+			requireUnreachable(t, err)
+			if err == nil {
+				t.Fatalf("space reported %+v instead of a failure", space)
 			}
 
 			if c.body == "" {
@@ -299,6 +320,55 @@ func TestAReadThatIsCutShort(t *testing.T) {
 			}
 			if string(content) != whole {
 				t.Fatalf("read gave %q, want %q", content, whole)
+			}
+		})
+	}
+}
+
+// A space report is subject to the same framing rule as a read, and for a worse reason. A
+// report that ends early and is read anyway offers zero bytes free, which refuses every
+// write while looking like an ordinary answer from a workspace that is genuinely full.
+//
+// A close-delimited answer is therefore refused whole, exactly as a read is: with no
+// length and no chunking there is nothing about the body to check afterwards, so a report
+// cut short and a report that arrived complete are the same bytes.
+func TestASpaceReportThatIsCutShort(t *testing.T) {
+	const whole = `{"space":{"total":8192,"used":1024,"avail":7168}}`
+	const prefix = `{"space":{"total":8192,`
+
+	cases := []struct {
+		name    string
+		answer  string
+		wantErr bool
+	}{
+		{"a declared length, whole", rawHead("Content-Length: "+strconv.Itoa(len(whole))) + whole, false},
+		{"a declared length, cut short", rawHead("Content-Length: 4096") + prefix, true},
+
+		{"chunked, whole", rawHead("Transfer-Encoding: chunked") + chunk(whole) + "0\r\n\r\n", false},
+		{"chunked, cut short", rawHead("Transfer-Encoding: chunked") + chunk(prefix), true},
+
+		{"close-delimited, cut short", rawHead() + prefix, true},
+		{"close-delimited, whole", rawHead() + whole, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := httprest.Dial(newRawServer(t, c.answer), &http.Client{Timeout: 5 * time.Second})
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			space, err := s.Space(t.Context())
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("space returned %+v and called it a success", space)
+				}
+				requireUnreachable(t, err)
+				return
+			}
+			if err != nil {
+				t.Fatalf("space: %v", err)
+			}
+			if want := (storage.Space{Total: 8192, Used: 1024, Avail: 7168}); space != want {
+				t.Fatalf("space reported %+v, want %+v", space, want)
 			}
 		})
 	}
@@ -599,9 +669,94 @@ func TestAListingEntryThatCarriesNoAttributes(t *testing.T) {
 	}
 }
 
-// The caller supplies the http.Client, so a transport of the caller's own can hand back
-// a body shorter than the length it declares. A read that stops early must not arrive as
-// a shorter file.
+// A count that never arrived must not read as the figure zero. All three are byte counts
+// whose zero is a legitimate answer — a namespace holding nothing has used none, a full
+// one has none available — so nothing in the values tells absence apart from it, and a
+// report read as zero available refuses every write on a namespace that has room.
+//
+// Figures that could not all be true of anything are refused for the same reason they are
+// never repaired: they end up in a kernel reply whose fields are unsigned, where a
+// negative becomes an enormous positive.
+func TestASpaceReportThatIsNotThere(t *testing.T) {
+	cases := []struct {
+		body    string
+		want    storage.Space
+		wantErr bool
+	}{
+		{body: `{}`, wantErr: true},
+		{body: `null`, wantErr: true},
+		{body: `{"space":null}`, wantErr: true},
+		// A stat answer delivered to a space report: the right protocol, the wrong answer.
+		{body: `{"attr":{"mode":420,"size":7}}`, wantErr: true},
+
+		{body: `{"space":{"used":1024,"avail":3072}}`, wantErr: true},
+		{body: `{"space":{"total":4096,"avail":3072}}`, wantErr: true},
+		{body: `{"space":{"total":4096,"used":1024}}`, wantErr: true},
+		{body: `{"space":{}}`, wantErr: true},
+		// Counts under a name this side does not read are counts it did not get.
+		{body: `{"space":{"total":4096,"used":1024,"available":3072}}`, wantErr: true},
+
+		{body: `{"space":{"total":-1,"used":0,"avail":0}}`, wantErr: true},
+		{body: `{"space":{"total":4096,"used":-1,"avail":0}}`, wantErr: true},
+		{body: `{"space":{"total":4096,"used":0,"avail":-1}}`, wantErr: true},
+		{body: `{"space":{"total":4096,"used":4096,"avail":1}}`, wantErr: true},
+
+		{body: `{"space":{"total":4096,"used":1024,"avail":3072}}`,
+			want: storage.Space{Total: 4096, Used: 1024, Avail: 3072}},
+		// The shapes that must still be accepted: a namespace with nothing written and one
+		// with nothing left both carry zeroes, and both are answers a caller may be given.
+		{body: `{"space":{"total":0,"used":0,"avail":0}}`, want: storage.Space{}},
+		{body: `{"space":{"total":4096,"used":4096,"avail":0}}`,
+			want: storage.Space{Total: 4096, Used: 4096}},
+		// An allowance lowered underneath content already written, which is why Used may
+		// exceed Total.
+		{body: `{"space":{"total":4096,"used":8192,"avail":0}}`,
+			want: storage.Space{Total: 4096, Used: 8192}},
+	}
+	for _, c := range cases {
+		t.Run(c.body, func(t *testing.T) {
+			s := dialHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set(httprest.HeaderProtocol, httprest.Version)
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(c.body))
+			}))
+			got, err := s.Space(t.Context())
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("space delivered %+v from a body that does not report one", got)
+				}
+				requireUnreachable(t, err)
+				return
+			}
+			if err != nil {
+				t.Fatalf("space: %v", err)
+			}
+			if got != c.want {
+				t.Fatalf("space delivered %+v, want %+v", got, c.want)
+			}
+		})
+	}
+}
+
+// ENOSYS from Space states a property of the namespace rather than a failure to reach it,
+// so it has to arrive as itself, over the same machinery that carries every other errno.
+// Delivered as EIO it would read as a condition worth retrying; delivered as figures it
+// would be a quantity nobody measured.
+func TestANamespaceWithNoRoomToReport(t *testing.T) {
+	s := dialHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(httprest.HeaderProtocol, httprest.Version)
+		w.WriteHeader(httprest.StatusStorageError)
+		w.Write([]byte(`{"errno":"ENOSYS","message":"this namespace has no room of its own to report"}`))
+	}))
+	space, err := s.Space(t.Context())
+	if !errors.Is(err, syscall.ENOSYS) {
+		t.Fatalf("space reported %+v, %v; want ENOSYS", space, err)
+	}
+	if errors.Is(err, syscall.EIO) {
+		t.Fatalf("a refusal this side understands arrived as EIO as well: %v", err)
+	}
+}
+
 func TestABodyShorterThanItsDeclaredLength(t *testing.T) {
 	s, err := httprest.Dial("http://server.invalid", &http.Client{Transport: shortTransport{}})
 	if err != nil {
@@ -652,6 +807,13 @@ func TestErrorsSayWhatFailed(t *testing.T) {
 		if !strings.Contains(renameErr.Error(), want) {
 			t.Fatalf("the rename error reads %q, which does not mention %q", renameErr, want)
 		}
+	}
+
+	// An operation that takes no operands names none. A quoted empty path beside it would
+	// read as a report about the root.
+	_, spaceErr := s.Space(ctx)
+	if !strings.HasPrefix(spaceErr.Error(), "space: ") {
+		t.Fatalf("the space error reads %q, want it to name the operation and nothing under a path", spaceErr)
 	}
 
 	// A storage error carrying no message still has to render.
