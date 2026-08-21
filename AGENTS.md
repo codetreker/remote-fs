@@ -95,3 +95,32 @@ naturally that way.
 
 `docs/research/`, `.agents/skills/`, code, comments, and commit messages are in
 English.
+
+---
+
+## Rules
+
+### All changes go through a worktree (hard rule)
+
+- **Always** make any code, config, or doc change in a dedicated worktree under `.worktrees/` — even a tiny single-file bug fix or a throwaway experiment.
+- **Never** edit the primary working tree (the repo's current checkout) directly — it must stay clean so you can switch branches / pull main anytime.
+- **One task = one worktree = one branch = one PR.** Implementation, tests, doc sync, and acceptance state all land in that single PR.
+  - Work that genuinely **depends on an unmerged PR** stacks on top of that PR's branch instead of waiting for it or bundling into it.
+- Already edited the primary tree? **Move** those changes into a worktree before continuing.
+
+### The main context coordinates; it delegates context-heavy work
+
+The main context does what **needs a global view but doesn't burn context** — driving the workflow, deciding gates, draft architecture, breaking down tasks, feeding each subagent the context it needs, reviewing, merging, and synthesizing results. It preserves its own context by handing off everything that would consume a lot of it.
+
+- **Delegate context-heavy work to worker subagents** — deep research, coding, detailed verification, and broad git / GitHub operations (commit, push, opening PRs, checking CI gates, merging, cleaning up worktrees / branches). Only simple orientation queries (e.g. `git status`, `git log --oneline -5`) stay inline, when they keep the main context oriented without derailing it.
+
+### Writing large files (hard rule)
+
+- **Write large files in chunks.** When creating or heavily editing a large file, write an initial slice, then **append** the rest with follow-up edits — **never** emit the whole file in one tool call. One oversized write can time out and waste the turn.
+
+### Use Subagent Driven Development
+
+- Figure out the task clearly.
+- Breakdown into tasks and resolve the dependencies.
+- Spawn worker subagents in parallel where the dependencies allow it.
+- Review independently.
