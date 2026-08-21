@@ -61,6 +61,7 @@ Before pushing, run the ones that cover this diff — not the full suite:
 
 ```
 make build                     # both binaries, into bin/
+make azurite                   # the Blob emulator the object store layer runs against
 make test                      # every package; mount and end-to-end need /dev/fuse
 go vet ./...
 gofmt -l .                     # prints nothing when the tree is formatted
@@ -72,11 +73,21 @@ the repository root, which is where it puts them when given more than one main p
 `bin/` is ignored, as is `vendor/`; a vendor directory is honoured when it is there and
 nothing depends on it being there.
 
+`make azurite` brings up the Azure Blob emulator defined in
+[`deployments/azurite.yml`](deployments/azurite.yml); `make azurite-down` stops it, and it
+holds its state in memory so nothing outlives it. `packages/storage/objectstore/azblob`
+fails rather than skips without it. The emulator's tag is pinned there because each
+Azurite release moves the highest `x-ms-version` its blob service will accept, and the
+pinned SDK sits exactly on that ceiling.
+
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs those same commands on every
 pull request and on every commit that reaches `main`, in two jobs: one for the layers that
 need no mountpoint, one that mounts filesystems. They are split because a mount can wedge,
 and a wedged job should not take the rest of the answer down with it. Exhaustive coverage
-is that run's job, and it starts itself.
+is that run's job, and it starts itself. Both jobs bring up the same emulator through
+[`deployments/ci/docker-compose.yml`](deployments/ci/docker-compose.yml) — the second one
+needs it because the coverage gate runs `go test` over the whole module rather than over
+that job's packages.
 
 CI adds four things that working on a single change does not need.
 

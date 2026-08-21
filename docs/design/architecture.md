@@ -43,7 +43,7 @@
 ║           │ storage 接口                                             ║
 ║           ▼                                                          ║
 ║   ┌────────────────┐                                                 ║
-║   │    storage     │  本地目录 / 集成方自有实现                      ║
+║   │    storage     │  本地目录 / 对象存储 / 集成方自有实现            ║
 ║   └────────────────┘                                                 ║
 ╚══════════════════════════════════════════════════════════════════════╝
 ```
@@ -103,6 +103,8 @@ client 侧的 remote storage 与 server 侧的 storage **实现同一个接口**
 | 容量的三个数能同时为真：都不为负，且还能写入的量不超过总量减已用 | 这三个数要进内核回复的无符号字段，一个负数在那里变成一个巨大的正数，先查空间再决定写不写的程序据此认为有盘上根本不存在的余量（R-ERR-2） |
 | 容量要么如实答出来，要么以 `ENOSYS` 拒绝；绝不报一个推算出来的数字 | 一个凑出来的容量与一个实测的容量在调用方那里长得一模一样，而它是先查空间再写的程序唯一的依据（R-ERR-2、R-WS-5） |
 | 答不答容量在一份命名空间的一生中不变：会答的一直会答，不会答的从来不答 | 一次拒绝被读成暂时故障并被反复重试，或者一次回答被读成永久能力而此后不再问（R-WS-5） |
+| 两个不同的对象绝不被呈现为同一个；一个对象被删除后，此前指代它的东西不再转而指代别的对象 | 读到的是别人的字节，而没有任何迹象表明发生过这件事（R-INT-11） |
+| 由多个可以各自失败的部分拼成的实现，任何一部分够不到都按错误报告，不用还读得到的那部分拼一个看起来成功的答案 | 记着名字却读不到字节被答成一个成功的读，上层据此认为文件是空的（R-ERR-6） |
 
 这些义务的可执行形式是 `packages/storage/storagetest`：一个实现合规，当且仅当它通过那套用例（R-INT-6）。
 
@@ -204,15 +206,20 @@ go.mod
 packages/                    可被外部与自身 import
   storage/                   接口定义、实现者义务与 errno 词汇（两个角色共用）
     localdir/                本地目录实现
+    objectstore/             对象存储实现：字节在对象存储里，树在 metastore 里
+      azblob/                Azure Blob 的对象接口实现
     limited/                 把任意一份 storage 置于字节配额之下
     storagetest/             义务的可执行形式：每个实现都跑这一套用例
+  metastore/                 名字的树、节点的属性、路径到对象键的指向
+    sqlite/                  SQLite 实现
+    metastoretest/           metastore 义务的可执行形式
   transport/                 把 storage 契约搬到线上，一种传输一个包
     httprest/                HTTP：URL 与消息的形状、服务端、拨号端
   fuse/                      挂载呈现层：FUSE 适配；仅 Linux
 
 cmd/                         二进制，不被 import
   remote-fs/                 把一个 server 的命名空间挂到本地目录
-  remote-fs-server/          把一个本地目录服务出去
+  remote-fs-server/          把一份命名空间服务出去
 
 docs/
 ```
@@ -223,11 +230,15 @@ docs/
 |---|---|
 | `storage`、`storage/storagetest` | 两个角色共用 |
 | `storage/localdir` | server 侧（也用于挂载层不经网络的验证路径） |
+| `storage/objectstore`、`storage/objectstore/azblob` | server 侧 |
+| `metastore`、`metastore/sqlite`、`metastore/metastoretest` | server 侧，只被 `storage/objectstore` 用 |
 | `storage/limited` | server 侧 |
 | `transport/httprest` | 两个角色共用：服务端在 server 侧，拨号端在 client 侧 |
 | `fuse` | client 侧 |
 
-五处拆分有明确理由：`storage` 与 `storage/localdir` 分开，使得第三方实现自有存储时只需引入接口（R-INT-6）；配额自成 `storage/limited`，因为它是一层包装而不是某一个实现的性质 —— 任意一份 storage 都能被它套住，集成方自有的那份也不例外（R-WS-5、R-INT-3）；契约用例自成 `storage/storagetest`，使得它独立于任何一个实现，两侧跑的是同一套；每种传输自成 `transport/` 下的一个包，使得选定一种传输不会牵入其余传输的依赖（R-INT-9、R-INT-10）；`fuse` 与传输分开，使得不挂载的使用者不被 FUSE 与平台限制绑住（R-INT-5、R-INT-8）。
+六处拆分有明确理由：`storage` 与它的各份实现分开，使得第三方实现自有存储时只需引入接口（R-INT-6）；配额自成 `storage/limited`，因为它是一层包装而不是某一个实现的性质 —— 任意一份 storage 都能被它套住，集成方自有的那份也不例外（R-WS-5、R-INT-3）；`metastore` 与 `storage/objectstore` 分开，因为「一棵有属性的名字树」不是「一份 storage」，它没有内容、没有配额、也不认识对象存储，把两者合在一起会让换一个数据库变成改一份 storage 实现；契约用例自成 `storage/storagetest` 与 `metastore/metastoretest`，使得它们独立于任何一个实现；每种传输自成 `transport/` 下的一个包，使得选定一种传输不会牵入其余传输的依赖（R-INT-9、R-INT-10）；`fuse` 与传输分开，使得不挂载的使用者不被 FUSE 与平台限制绑住（R-INT-5、R-INT-8）。
+
+带外部依赖的实现各自成包，也是为了让依赖跟着选择走：只用本地目录的集成方不会链接进 Azure SDK 或 SQLite 驱动（R-INT-10 的同一条道理，用在存储上）。
 
 errno 词汇归 `storage` 而非某一种传输：一个实现可以报出哪些错误，是契约的性质。若它留在某一种传输里，第二种传输要么抄一份而后各自漂移，要么去 import 第一种。
 

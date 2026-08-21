@@ -65,6 +65,19 @@
 
 其中一条不能推迟：**够不到命名空间时，不得回答一个读起来像事实的答案。** 不是「文件不存在」，不是空目录，不是一份编造出来的属性（R-ERR-1、R-ERR-2）。十一个操作各自解析自己的失败，因此每一个都要各测一次；只测其中一个，是在赌另外十个的作者当时想的是同一件事。
 
+## 对象存储那一层要一个模拟器
+
+`packages/storage/objectstore/azblob` 对着一个真的 Blob 端点跑，那个端点是 Azurite。它定义在
+[`deployments/azurite.yml`](../deployments/azurite.yml)：本地 `make azurite` 起、`make azurite-down`
+停；CI 的两个 job 各起同一份，第二个也要 —— 覆盖率闸门自己会把 `go test` 跑遍整个 module，而不是只跑
+那个 job 的那几个包。
+
+**够不到模拟器时这一层失败，不跳过。** 依赖缺席是一个必须报出来的事实，不是一个可以让用例自己消失的条件。
+
+模拟器的版本和 SDK 的版本是一对，不是两个独立选择：Azurite 每个 release 都会抬高它接受的 `x-ms-version`
+上限，超出上限的请求被答以 400 InvalidHeaderValue 而不是被服务。所以那份定义钉住具体的 tag 而不是
+`latest`，理由写在 azblob 的 package 注释里。
+
 ## 挂载相关的测试是独立的一套
 
 它们需要 `/dev/fuse`，且卸载不总是第一次就成功；CI 因此把这一层单独放进一个 job，并给 `go test` 一个比 job 更短的 `-timeout` —— 卡住的卸载要留下 goroutine 栈，而不是被超时静默杀掉。单元测试必须在任何地方都能跑 —— 那是它们真的会被跑的前提。
