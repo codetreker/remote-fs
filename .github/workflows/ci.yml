@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A superseded pull request has nothing to say, but every commit that lands on main
+  # gets a result of its own.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  # The layers that mount a filesystem, named once. The two jobs below divide the suite
+  # on exactly this line: the second runs these, the first runs everything else.
+  MOUNTING_PACKAGES: ./packages/fuse/... ./cmd/...
+
+jobs:
+  checks:
+    name: build, format, links, contract and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - run: go build ./...
+      - run: go vet ./...
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would rewrite these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Relative links in Markdown resolve
+        run: |
+          set -uo pipefail
+          # grep finds nothing in a file whose links are all absolute, and that is not a
+          # failure, so the assignment must not inherit its status.
+          broken="$(while IFS= read -r f; do
+            d=$(dirname "$f")
+            grep -oP '\]\(\K[^)#]+(?=[)#])' "$f" | grep -v '^https\?://' |
+              while read -r l; do [ -e "$d/$l" ] || echo "$f -> $l"; done
+          done < <(find . -name '*.md' -not -path './.git/*'))" || true
+          if [ -n "$broken" ]; then
+            echo "::error::these relative links point at nothing:"
+            echo "$broken"
+            exit 1
+          fi
+
+      - name: Contract and unit tests
+        run: |
+          set -euo pipefail
+          # Both expansions are lists of import paths and must split into arguments.
+          # shellcheck disable=SC2046,SC2086
+          go list $MOUNTING_PACKAGES >"$RUNNER_TEMP/mounting"
+          # shellcheck disable=SC2046
+          .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 5m \
+            $(go list ./... | grep -vxF -f "$RUNNER_TEMP/mounting")
+
+  mounted:
+    name: differential and end-to-end tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # This job's whole purpose is to mount filesystems. If the runner cannot, that is
+      # a result to report, not a condition to work around, so every precondition is
+      # asserted here where the diagnosis is one line rather than inferred later from a
+      # wall of test failures.
+      - name: Assert this runner can mount a filesystem
+        run: |
+          set -uo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          uname -a
+          # fuse3 reaches the image as a dependency of other packages rather than as a
+          # documented part of it, so it can leave without notice.
+          command -v fusermount3 >/dev/null ||
+            { sudo apt-get update && sudo apt-get install -y fuse3; }
+          helper="$(command -v fusermount3)" ||
+            fail "no fusermount3 on this runner, and installing fuse3 did not provide one"
+          ls -l /dev/fuse "$helper"
+          test -c /dev/fuse ||
+            fail "/dev/fuse is not a character device on this runner; the layers this job exists to run cannot run here"
+          # actions/runner-images#14516 shipped a non-setuid, world-writable
+          # fusermount3 earlier on PATH than the distro's, and every unprivileged mount
+          # failed for a week. These are the properties that made the real one work.
+          if ! { test -u "$helper" && [ "$(stat -Lc %u "$helper")" = 0 ] && [ ! -w "$helper" ]; }; then
+            fail "$helper is not a setuid-root helper, so unprivileged mounting will fail (actions/runner-images#14516)"
+          fi
+          # This distro's libfuse counts existing mounts by reading /proc, which is not
+          # atomic and can see one mount thousands of times; the differential layer
+          # mounts once per case. Fixed upstream in libfuse 3.18.0, which 24.04 predates.
+          echo 'mount_max = 10000' | sudo tee -a /etc/fuse.conf
+          ls /sys/fs/fuse/connections >"$RUNNER_TEMP/fuse-connections-before" 2>/dev/null || true
+
+      - name: Differential and end-to-end tests
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m $MOUNTING_PACKAGES
+
+      # The newest tag predates the fix that recomputes per-package and total coverage
+      # from the profile. Under -coverpkg that version reports numbers which are simply
+      # wrong — packages/fuse as 24.4% where the figure is 100% — so this is pinned to
+      # the commit that fixed it rather than to a release or to @latest.
+      - name: Install the coverage gate
+        run: go install github.com/codetreker/go-cov/cmd/go-cov@v0.1.4-0.20260617124522-d6caf2759e33
+
+      - name: Coverage gate
+        run: |
+          set -euo pipefail
+          # go-cov does not expose -coverpkg, and without it this repository measures more
+          # than thirty points low: the contract suite is one package executed by two
+          # others, so it is instrumented only in its own build, where nothing runs it.
+          # -count=1 is here because go-cov's `go test` is otherwise served from the test
+          # cache, which does not notice that /dev/fuse came or went.
+          module="$(go list -m)"
+          export GOFLAGS="-coverpkg=$module/... -count=1"
+          go-cov --ci --skip-result-packages cmd
+
+      # A mount that outlived the test that made it means a t.Cleanup did not do what
+      # the test reported it did. This runner is thrown away, so nothing later is at
+      # risk — the reason to fail is that the run already claimed success about a
+      # teardown that did not happen.
+      - name: No mount left behind
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          leaked=0
+          report() { echo "::error::$1"; echo "$2"; leaked=1; }
+
+          # Each of these three finds nothing on a clean run and says so by exiting
+          # non-zero, which is the answer we want rather than a step failure.
+          mounts="$(awk '$3 == "fuse.remote-fs" { print $2 }' /proc/self/mounts)" || true
+          [ -z "$mounts" ] || report "these mountpoints outlived the tests that made them:" "$mounts"
+
+          if [ -d /sys/fs/fuse/connections ] && [ -f "$RUNNER_TEMP/fuse-connections-before" ]; then
+            ls /sys/fs/fuse/connections >"$RUNNER_TEMP/fuse-connections-after"
+            connections="$(grep -vxF -f "$RUNNER_TEMP/fuse-connections-before" \
+              "$RUNNER_TEMP/fuse-connections-after")" || true
+            [ -z "$connections" ] ||
+              report "these FUSE connections are still open:" "$connections"
+          fi
+
+          survivors="$(pgrep -a fusermount)" || true
+          [ -z "$survivors" ] || report "fusermount processes survived the run:" "$survivors"
+
+          exit "$leaked"

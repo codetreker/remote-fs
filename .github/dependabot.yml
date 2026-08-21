@@ -1,0 +1,10 @@
+version: 2
+
+updates:
+  # The workflow pins both actions to a commit SHA, which is the only immutable form a
+  # tag cannot be moved out from under. Pins that nothing updates rot into old, unpatched
+  # code, so the two travel together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
