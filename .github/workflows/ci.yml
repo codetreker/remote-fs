@@ -63,6 +63,13 @@ jobs:
             exit 1
           fi
 
+      # packages/storage/objectstore/azblob is tested against a real Blob endpoint, and
+      # this suite fails on a skipped test rather than tolerating a missing dependency, so
+      # the emulator is a precondition brought up here. `--wait` returns only once the
+      # service answers a request, so the step below cannot start ahead of it.
+      - name: Start the Azure Blob emulator
+        run: docker compose -f deployments/ci/docker-compose.yml up -d --wait --wait-timeout 120
+
       - name: Contract and unit tests
         run: |
           set -euo pipefail
@@ -128,6 +135,12 @@ jobs:
       # the commit that fixed it rather than to a release or to @latest.
       - name: Install the coverage gate
         run: go install github.com/codetreker/go-cov/cmd/go-cov@v0.1.4-0.20260617124522-d6caf2759e33
+
+      # The gate runs `go test` over the whole module rather than over this job's packages,
+      # so it reaches azblob and needs the same emulator the other job starts, even though
+      # nothing above this line touches one.
+      - name: Start the Azure Blob emulator
+        run: docker compose -f deployments/ci/docker-compose.yml up -d --wait --wait-timeout 120
 
       - name: Coverage gate
         run: |

@@ -1,0 +1,5 @@
+# What CI brings up before running the tests. Every service here is a test dependency;
+# nothing that only a person would want belongs in this file.
+
+include:
+  - ../azurite.yml

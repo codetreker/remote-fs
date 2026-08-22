@@ -1,0 +1,49 @@
+# The Azure Blob Storage emulator that packages/storage/objectstore/azblob is tested
+# against. Both environments under this directory include this one definition, so a
+# developer's emulator and CI's are the same emulator configured the same way.
+
+services:
+  azurite:
+    # Pinned, not `latest`. Each Azurite release moves the highest x-ms-version its blob
+    # service accepts, and anything above that ceiling is answered 400 InvalidHeaderValue
+    # rather than served — so the emulator's version and the SDK's are one compatibility
+    # pair, not two independent choices. 3.36.0 accepts up to 2025-11-05, which is exactly
+    # what the pinned azblob SDK sends; the azblob package comment owns that argument.
+    image: mcr.microsoft.com/azure-storage/azurite:3.36.0
+
+    command:
+      # The blob service alone. The image's default command also starts the queue and
+      # table services, which nothing here speaks to.
+      - azurite-blob
+      # Where the service listens inside the container. Left at its default it binds the
+      # container's loopback, which the published port cannot reach.
+      - --blobHost
+      - 0.0.0.0
+      # State lives in memory, bounded by default at half the host's: no run inherits
+      # blobs from the run before it, and there is no file on disk to grow or to rotate.
+      - --inMemoryPersistence
+
+    # Loopback only. This emulator authenticates with a published, well-known account key,
+    # so it must not be reachable from the network the developer's machine is on.
+    ports:
+      - "127.0.0.1:10000:10000"
+
+    healthcheck:
+      # The image declares no healthcheck, and the port accepts connections before the
+      # service answers on it, so a TCP probe reports ready too early. This asks the blob
+      # service to identify itself instead. An unauthenticated request is refused, and the
+      # refusal still carries the Server header — that header is the fact being tested,
+      # not the status code.
+      test:
+        - CMD-SHELL
+        - >-
+          printf 'GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n'
+          | nc -w 2 127.0.0.1 10000 | grep -q '^Server: Azurite-Blob/'
+      # Fast while starting so that `up --wait` returns as soon as the service is up,
+      # slow afterwards so that a container left running all day is not polled four times
+      # a second.
+      start_period: 30s
+      start_interval: 250ms
+      interval: 30s
+      timeout: 5s
+      retries: 3
