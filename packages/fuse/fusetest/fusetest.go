@@ -18,6 +18,7 @@ package fusetest
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -28,6 +29,12 @@ import (
 // mountTable is where the kernel publishes what is attached. It is a variable so that the
 // branch taken when it cannot be read is reachable from a test; nothing else assigns to it.
 var mountTable = "/proc/self/mountinfo"
+
+// report is where a leak is announced. It is a variable for the case that drives Run into
+// announcing one: a rehearsal that printed a real-looking `left behind:` line into the
+// run's own output would put a line in every CI log that names a mount nobody ever made,
+// and a signal that cries wolf once is one people learn to grep past.
+var report io.Writer = os.Stderr
 
 // A TempRoot is the directory this run puts its temporary files in, and the answer to
 // whether it left anything mounted.
@@ -247,7 +254,7 @@ func Run(name string, tests func() int) int {
 	before, had := os.LookupEnv("TMPDIR")
 	root, err := NewTempRoot(name)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(report, err)
 		return 1
 	}
 	// The root is removed below, and a TMPDIR still naming it would send whatever ran next
@@ -263,11 +270,11 @@ func Run(name string, tests func() int) int {
 
 	leaks, err := root.Leaks()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(report, err)
 		code = 1
 	}
 	for _, leak := range slices.Concat(leaks, fusermountChildren()) {
-		fmt.Fprintf(os.Stderr, "left behind: %s\n", leak)
+		fmt.Fprintf(report, "left behind: %s\n", leak)
 		code = 1
 	}
 
@@ -276,7 +283,7 @@ func Run(name string, tests func() int) int {
 	// question could not be answered.
 	if err == nil && len(leaks) == 0 {
 		if err := root.Remove(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintln(report, err)
 			code = 1
 		}
 	}

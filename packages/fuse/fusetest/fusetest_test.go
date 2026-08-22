@@ -335,19 +335,28 @@ func TestRunLeavesTheTestsVerdictAloneWhenNothingLeaks(t *testing.T) {
 // a guard, so this is that demonstration rather than a note that one was done by hand.
 func TestRunFailsAndKeepsTheEvidenceWhenSomethingIsLeftBehind(t *testing.T) {
 	keepTMPDIR(t)
-	restore := mountTable
-	t.Cleanup(func() { mountTable = restore })
+	restoreTable, restoreReport := mountTable, report
+	t.Cleanup(func() { mountTable, report = restoreTable, restoreReport })
 
-	var beneath string
+	// Collected rather than let out: a rehearsal that printed `left behind:` on this run's
+	// own standard error would put a line in the log naming a mount nobody ever made.
+	var announced strings.Builder
+	report = &announced
+
+	var beneath, leaked string
 	code := Run("fusetest", func() int {
 		beneath = os.TempDir()
-		mountedAt(t, filepath.Join(beneath, "TestX", "001"))
+		leaked = filepath.Join(beneath, "TestX", "001")
+		mountedAt(t, leaked)
 		return 0
 	})
 	t.Cleanup(func() { os.RemoveAll(beneath) })
 
 	if code != 1 {
 		t.Fatalf("Run returned %d for a run that left a mount attached, want 1", code)
+	}
+	if want := "left behind: a mount: " + leaked + " "; !strings.HasPrefix(announced.String(), want) {
+		t.Fatalf("it announced %q, want a line starting %q", announced.String(), want)
 	}
 	if _, err := os.Stat(beneath); err != nil {
 		t.Fatalf("the root was removed although a mount was still attached beneath it: %v", err)
