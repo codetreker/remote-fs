@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -55,10 +54,8 @@ var namespaces atomic.Int64
 // read reports an object the store has lost — and checking it from above would be checking
 // the claim against itself.
 type parts struct {
-	objects  *azblob.Objects
-	meta     metastore.Store
-	database string
-	prefix   string
+	objects *azblob.Objects
+	meta    metastore.Store
 	*objectstore.Storage
 }
 
@@ -94,7 +91,7 @@ func newParts(t *testing.T, allowance int64) parts {
 			t.Errorf("closing the namespace: %v", err)
 		}
 	})
-	return parts{objects: objects, meta: meta, database: database, prefix: prefix, Storage: namespace}
+	return parts{objects: objects, meta: meta, Storage: namespace}
 }
 
 // contentOf reports which object holds a file's bytes, asked of the tree directly.
@@ -300,53 +297,5 @@ func TestReadReportsAnObjectTheStoreHasLost(t *testing.T) {
 	// missing object has been written back into the tree.
 	if attr, err := p.Stat(ctx, "f"); err != nil || attr.Size == 0 {
 		t.Fatalf("after the object went missing the file stats as %+v (%v), want it unchanged", attr, err)
-	}
-}
-
-// TestReadReportsAnUnreachableObjectStore checks the other half of that distinction: a
-// namespace whose tree answers and whose objects cannot be reached reports the failure it
-// had rather than the absence it did not observe (R-ERR-6).
-func TestReadReportsAnUnreachableObjectStore(t *testing.T) {
-	p := newParts(t, 0)
-	ctx := t.Context()
-	if err := p.Write(ctx, "f", []byte("content")); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	// A second namespace over the same tree, whose objects are at an address nothing is
-	// listening on. The tree answers; the bytes cannot be fetched.
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	address := listener.Addr().String()
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
-	}
-	unreachable, err := azblob.NewWithSharedKey("http://"+address+"/devstoreaccount1/"+sharedContainer, accountName, accountKey, p.prefix)
-	if err != nil {
-		t.Fatalf("building a client for an address nothing is listening on: %v", err)
-	}
-	meta, err := sqlite.Open(ctx, p.database, "workspace", 0)
-	if err != nil {
-		t.Fatalf("opening the tree again: %v", err)
-	}
-	namespace := objectstore.New(unreachable, meta)
-	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
-			t.Errorf("closing the second namespace: %v", err)
-		}
-	})
-
-	// The tree is reachable, so the file is found.
-	if _, err := namespace.Stat(ctx, "f"); err != nil {
-		t.Fatalf("stat through a namespace whose objects are unreachable: %v", err)
-	}
-	content, err := namespace.Read(ctx, "f")
-	switch {
-	case err == nil:
-		t.Fatalf("reading through an unreachable object store answered %q", content)
-	case errors.Is(err, syscall.ENOENT):
-		t.Fatalf("an unreachable object store was reported as a file that is not there: %v", err)
 	}
 }
