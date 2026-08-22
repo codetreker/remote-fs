@@ -14,109 +14,31 @@ package cmd_test
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/fuse"
+	"github.com/codetreker/remote-fs/packages/fuse/fusetest"
 	"github.com/codetreker/remote-fs/packages/storage/localdir"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-// TestMain checks afterwards that nothing was left attached to this machine. A test that
-// leaves a mountpoint behind wedges every path under it until somebody detaches it by
-// hand, and the run that did it has usually already reported success.
+// TestMain runs the tests beneath a temporary directory of this run's own, so that a
+// mountpoint still attached afterwards is one this run attached. See
+// packages/fuse/fusetest for why the mount table cannot be read any other way.
 func TestMain(m *testing.M) {
-	before := fuseConnections()
-	code := m.Run()
-	removeBuiltBinaries()
-	for _, leak := range mountLeaks(before) {
-		fmt.Fprintf(os.Stderr, "left behind: %s\n", leak)
-		code = 1
-	}
-	os.Exit(code)
-}
-
-// mountLeaks reports anything this run attached and did not detach.
-//
-// The FUSE connections present beforehand are subtracted rather than the directory being
-// required to be empty, because it is shared with everything else on the machine that
-// uses FUSE and a developer's desktop rarely has none.
-func mountLeaks(connectionsBefore map[string]bool) []string {
-	var leaks []string
-
-	mounts, err := os.ReadFile("/proc/self/mounts")
-	if err != nil {
-		return []string{fmt.Sprintf("cannot read /proc/self/mounts, so leaks cannot be ruled out: %v", err)}
-	}
-	for line := range strings.SplitSeq(strings.TrimSpace(string(mounts)), "\n") {
-		if strings.HasPrefix(line, "remote-fs ") {
-			leaks = append(leaks, "a mount: "+line)
-		}
-	}
-
-	for id := range fuseConnections() {
-		if !connectionsBefore[id] {
-			leaks = append(leaks, "a FUSE connection: /sys/fs/fuse/connections/"+id)
-		}
-	}
-
-	for _, pid := range fusermountChildren() {
-		leaks = append(leaks, "a fusermount process: pid "+pid)
-	}
-	return leaks
-}
-
-func fuseConnections() map[string]bool {
-	present := map[string]bool{}
-	entries, err := os.ReadDir("/sys/fs/fuse/connections")
-	if err != nil {
-		// Not mounted on this machine, so there is nothing to compare against and nothing
-		// this check can claim either way.
-		return present
-	}
-	for _, entry := range entries {
-		present[entry.Name()] = true
-	}
-	return present
-}
-
-// fusermountChildren reports the fusermount processes this process started and did not
-// reap. Only our own children are considered: fusermount is a setuid helper that anything
-// on the machine may be running, and a stranger's is not evidence about this run.
-func fusermountChildren() []string {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return nil
-	}
-	var found []string
-	self := strconv.Itoa(os.Getpid())
-	for _, entry := range entries {
-		if _, isPID := strconv.Atoi(entry.Name()); isPID != nil {
-			continue
-		}
-		status, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
-		if err != nil {
-			// The process exited between the listing and the read, which is what we want
-			// it to have done.
-			continue
-		}
-		text := string(status)
-		if strings.Contains(text, "\nPPid:\t"+self+"\n") && strings.Contains(text, "Name:\tfusermount") {
-			found = append(found, entry.Name())
-		}
-	}
-	return found
+	os.Exit(fusetest.Run("remote-fs-cmd", func() int {
+		code := m.Run()
+		removeBuiltBinaries()
+		return code
+	}))
 }
 
 // --- the system under test -----------------------------------------------------------
