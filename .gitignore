@@ -39,3 +39,6 @@ vendor/
 
 # Build output
 bin/
+
+# Temporary files
+.tmp/
