@@ -30,6 +30,11 @@ import (
 type failingObjects struct {
 	objectstore.Objects
 	onGet, onPut, onDelete error
+	// refusedDeletes counts the deletes onDelete turned away. Most cases here reach the
+	// object store through a call that reports its own failure, which is proof enough that
+	// the injected error was reached; a sweep that a mutation triggers reports nothing, so
+	// the case built on one asserts this instead of assuming it.
+	refusedDeletes int
 }
 
 func (f *failingObjects) Get(ctx context.Context, key string) ([]byte, error) {
@@ -48,6 +53,7 @@ func (f *failingObjects) Put(ctx context.Context, key string, content []byte) ([
 
 func (f *failingObjects) Delete(ctx context.Context, key string) error {
 	if f.onDelete != nil {
+		f.refusedDeletes++
 		return f.onDelete
 	}
 	return f.Objects.Delete(ctx, key)
@@ -219,6 +225,12 @@ func TestAMutationSurvivesASweepItCouldNotFinish(t *testing.T) {
 	objects.onDelete = errors.New("the object store is not answering deletes")
 	if err := namespace.Write(ctx, "f", []byte("the second contents")); err != nil {
 		t.Fatalf("a write failed because the object it displaced could not be deleted: %v", err)
+	}
+	// The sweep a mutation triggers reports nothing, so without this the case reads the same
+	// whether it exercised a failing sweep or no sweep at all, and a write that stopped
+	// sweeping would pass it.
+	if objects.refusedDeletes == 0 {
+		t.Fatal("the write finished without its sweep reaching the object store, so no failing sweep was exercised")
 	}
 	if content, err := namespace.Read(ctx, "f"); err != nil || string(content) != "the second contents" {
 		t.Fatalf("the file reads as %q (%v), want the contents the write stored", content, err)
