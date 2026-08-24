@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/codetreker/remote-fs/packages/fuse/fusetest"
 )
 
 // startup is how long a binary is given to report that it is up. Generous: it covers a
@@ -51,7 +53,9 @@ func TestTheBinariesServeAndMount(t *testing.T) {
 	if err := mnt.wait(t); err != nil {
 		t.Fatalf("remote-fs exited with %v after SIGINT\n%s", err, mnt.output())
 	}
-	if stillMounted(t, mountpoint) {
+	if mounted, err := fusetest.Mounted(mountpoint); err != nil {
+		t.Fatal(err)
+	} else if mounted {
 		t.Fatalf("%s is still mounted after remote-fs exited", mountpoint)
 	}
 
@@ -179,18 +183,4 @@ func shell(t *testing.T, script string) string {
 		t.Fatalf("`%s` failed: %v\n%s", script, err, out)
 	}
 	return string(out)
-}
-
-func stillMounted(t *testing.T, mountpoint string) bool {
-	t.Helper()
-	mounts, err := os.ReadFile("/proc/self/mounts")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for line := range strings.SplitSeq(string(mounts), "\n") {
-		if fields := strings.Fields(line); len(fields) > 1 && fields[1] == mountpoint {
-			return true
-		}
-	}
-	return false
 }

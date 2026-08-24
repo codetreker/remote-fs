@@ -27,19 +27,24 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/codetreker/remote-fs/packages/fuse"
+	"github.com/codetreker/remote-fs/packages/fuse/fusetest"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/limited"
 	"github.com/codetreker/remote-fs/packages/storage/localdir"
 )
 
-// TestMain fixes the umask so that the modes a plain directory gives new files and
-// directories are the same ones the storage hands out, and the comparison below is
-// therefore comparing filesystems rather than comparing this process against itself.
+// TestMain runs the tests beneath a temporary directory of this run's own, so that a
+// mountpoint still attached afterwards is one this run attached — see
+// packages/fuse/fusetest — and fixes the umask so that the modes a plain directory gives
+// new files and directories are the same ones the storage hands out, and the comparison
+// below is therefore comparing filesystems rather than comparing this process against
+// itself.
 func TestMain(m *testing.M) {
-	previous := syscall.Umask(0o022)
-	code := m.Run()
-	syscall.Umask(previous)
-	os.Exit(code)
+	os.Exit(fusetest.Run("remote-fs-fuse", func() int {
+		previous := syscall.Umask(0o022)
+		defer syscall.Umask(previous)
+		return m.Run()
+	}))
 }
 
 func requireFUSE(t *testing.T) {
