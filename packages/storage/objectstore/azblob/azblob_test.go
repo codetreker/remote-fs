@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 
@@ -259,23 +260,32 @@ func closedPort(t *testing.T) string {
 	return address
 }
 
+// impatient is a context that turns the SDK's retries off.
+//
+// The default policy makes four attempts with an exponential backoff, so one call against an
+// address that refuses every connection spends seven to eleven seconds asleep. What the
+// cases below assert is how a failure is classified, and the fourth attempt's error is
+// classified the way the first one's is: the wait costs them the whole of their runtime and
+// buys nothing they check. A negative MaxRetries is how the SDK is told "none" — zero means
+// "whatever the default is", which is three.
+func impatient(ctx context.Context) context.Context {
+	return policy.WithRetryOptions(ctx, policy.RetryOptions{MaxRetries: -1})
+}
+
 // A store nothing answers for must not report an object as absent. This is the mistake
 // R-ERR-2 exists to forbid: a Get that answers ENOENT because the network is down tells a
 // caller the file is gone, and a Delete that answers success because it could not reach the
 // service tells a sweeper the object was removed.
-//
-// The subtests run in parallel because each waits out the SDK's retries against an address
-// that refuses every connection.
 func TestAnUnreachableServiceIsNeverReportedAsAbsent(t *testing.T) {
 	address := closedPort(t)
 	objects, err := NewWithSharedKey("http://"+address+"/devstoreaccount1/somewhere", accountName, accountKey, "prefix/")
 	if err != nil {
 		t.Fatalf("opening a store on an address nothing listens on: %v", err)
 	}
+	ctx := impatient(context.Background())
 
 	t.Run("get", func(t *testing.T) {
-		t.Parallel()
-		content, err := objects.Get(context.Background(), "a-key")
+		content, err := objects.Get(ctx, "a-key")
 		if err == nil {
 			t.Fatalf("Get returned %q and no error", content)
 		}
@@ -285,8 +295,7 @@ func TestAnUnreachableServiceIsNeverReportedAsAbsent(t *testing.T) {
 	})
 
 	t.Run("delete", func(t *testing.T) {
-		t.Parallel()
-		err := objects.Delete(context.Background(), "a-key")
+		err := objects.Delete(ctx, "a-key")
 		if err == nil {
 			t.Fatal("Delete reported success against an unreachable service")
 		}
@@ -296,8 +305,7 @@ func TestAnUnreachableServiceIsNeverReportedAsAbsent(t *testing.T) {
 	})
 
 	t.Run("put", func(t *testing.T) {
-		t.Parallel()
-		digest, err := objects.Put(context.Background(), "a-key", []byte("bytes nobody received"))
+		digest, err := objects.Put(ctx, "a-key", []byte("bytes nobody received"))
 		if err == nil {
 			t.Fatalf("Put reported success against an unreachable service, with digest %x", digest)
 		}
