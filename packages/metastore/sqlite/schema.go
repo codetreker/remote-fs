@@ -86,15 +86,26 @@ func treeStatements() []string {
 		// is a node id and node ids are unique across the database.
 		//
 		// It leads the key for locality. A picture of the tree is a range over this key, and
-		// with the namespace in front, one namespace's entries are one contiguous stretch of it
-		// — so the scan reads that namespace and nothing else. Without it the filter has to
-		// come from the node on the other side of the join, and every plan that produces is
-		// either a scan of every namespace's entries with the foreign ones thrown away one at
-		// a time, or a sort of the whole namespace repeated for every page. Measured against
-		// modernc.org/sqlite v1.57.0 over a million entries: 10m34s as a per-page sort, 578ms
-		// sieving with the join order pinned, 123ms as this range. The column is therefore
-		// redundant with nodes.namespace and is kept equal to it by every statement that
-		// writes an entry.
+		// with the namespace in front, one namespace's entries are one contiguous stretch of
+		// it — so a page seeks straight to its cursor and reads this namespace and nothing
+		// else.
+		//
+		// Without it the namespace can only be filtered from the node on the far side of the
+		// join, and both plans SQLite has for that cost the whole table rather than the page:
+		// read every namespace's entries and discard the foreign ones one at a time, or drive
+		// from the node table and sort the namespace's rows again for every page. Which one it
+		// picks depends on the statistics, so the cost is not merely high, it changes shape as
+		// a database fills. An index on nodes(namespace) does not settle it — it gives the
+		// planner a cheaper-looking route into the sorting plan, and a database holding
+		// several namespaces then takes that route.
+		//
+		// TestAPictureIsPagedByRangeRatherThanByScanningAndSorting holds the plan to the range
+		// and refuses both of the others. The plan is where this claim is checkable: what it
+		// costs depends on the machine, the cache and the shape of the tree, and none of those
+		// belong in a comment.
+		//
+		// The namespace column is therefore redundant with nodes.namespace, and every
+		// statement that writes an entry keeps the two equal.
 		//
 		// WITHOUT ROWID stores the rows in primary key order, so a directory's children are
 		// contiguous and `ORDER BY name` is a scan of them in byte order rather than a sort.

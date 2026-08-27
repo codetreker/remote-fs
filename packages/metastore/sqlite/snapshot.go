@@ -103,17 +103,22 @@ func (p *snapshot) Next(ctx context.Context, limit int) ([]metastore.Row, bool, 
 // pageQuery reads one page of a picture: the namespace's entries after a cursor, in key
 // order, with the node each one names.
 //
-// Every clause here is chosen so that one plan is the only plan, and the plan is the thing
-// under test — pageStatementPlan asserts it, because what went wrong before was never the
-// rows this returns but what it cost to return them.
+// Every clause is chosen so that one plan is the only plan, and the plan is what is under
+// test rather than the rows — what went wrong here before was never the rows this returns,
+// only what it cost to return them.
 //
 // The namespace equality and the cursor range both address the entry table's primary key, so
-// the range is a seek to the cursor and a read forward over this namespace's rows and no
-// others. The cursor is a row value rather than the `parent > ? OR (parent = ? AND name > ?)`
-// that says the same thing: measured against modernc.org/sqlite v1.57.0, SQLite does not
-// recognise the spelled-out form as a range over the key when its operands are bound
-// parameters, so every page restarted at the beginning of the table and skipped its way back
-// to the cursor. The ordering falls out of the key, so no page sorts anything.
+// a page is a seek to the cursor and a read forward over this namespace's rows and no
+// others. The ordering falls out of the same key, so no page sorts anything.
+//
+// The cursor is a row value rather than the `parent > ? OR (parent = ? AND name > ?)` that
+// says the same thing, and the difference is not cosmetic: SQLite will not treat the
+// spelled-out form as a range over both key columns when its operands are bound parameters.
+// Put the long form back and EXPLAIN QUERY PLAN drops the name from the range, leaving
+// `SEARCH e USING PRIMARY KEY (namespace=? AND parent>?)` — every page then re-reads the
+// whole of the current directory to find where it left off.
+//
+// TestAPictureIsPagedByRangeRatherThanByScanningAndSorting asserts the plan this produces.
 const pageQuery = `
 	SELECT e.parent, e.name, ` + nodeColumns + `
 	FROM entries e JOIN nodes n ON n.id = e.node
