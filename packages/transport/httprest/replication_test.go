@@ -1,6 +1,7 @@
 package httprest_test
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -57,6 +58,10 @@ type fakeLog struct {
 	// stall holds a snapshot part way through its delivery, so that abandoning one is
 	// abandoning something genuinely in flight.
 	stall bool
+
+	// slowPage is how long the store takes over each page after the first, which is what a
+	// large tree on a busy database looks like from the outside.
+	slowPage time.Duration
 
 	// open counts the snapshots that have been taken and not yet closed.
 	open int
@@ -166,7 +171,7 @@ func (l *fakeLog) Snapshot(context.Context) (metastore.Snap, metastore.Position,
 		return nil, 0, l.snapshotErr
 	}
 	l.open++
-	return &fakeSnap{log: l, pages: l.pages, stall: l.stall}, l.tail, nil
+	return &fakeSnap{log: l, pages: l.pages, stall: l.stall, slow: l.slowPage}, l.tail, nil
 }
 
 type fakeSnap struct {
@@ -174,6 +179,7 @@ type fakeSnap struct {
 	pages  [][]metastore.Row
 	sent   int
 	stall  bool
+	slow   time.Duration
 	closed bool
 }
 
@@ -187,6 +193,13 @@ func (s *fakeSnap) Next(ctx context.Context, _ int) ([]metastore.Row, bool, erro
 	if s.stall && s.sent > 0 {
 		<-ctx.Done()
 		return nil, false, ctx.Err()
+	}
+	if s.slow > 0 && s.sent > 0 {
+		select {
+		case <-time.After(s.slow):
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
 	}
 	page := s.pages[s.sent]
 	s.sent++
@@ -225,6 +238,13 @@ func (r recording) Mkdir(ctx context.Context, path string) error {
 // listener, and returns a storage that reaches it.
 func serveLog(t *testing.T, log metastore.Log, limits httprest.Limits) *httprest.Storage {
 	t.Helper()
+	return serveLogWatchedFor(t, log, limits, httprest.DefaultSilence)
+}
+
+// serveLogWatchedFor is serveLog with the reading end's bound on a quiet stream given
+// rather than defaulted, so that a case about that bound need not wait out the default.
+func serveLogWatchedFor(t *testing.T, log metastore.Log, limits httprest.Limits, silence time.Duration) *httprest.Storage {
+	t.Helper()
 	backing, err := localdir.New(t.TempDir())
 	if err != nil {
 		t.Fatalf("open the namespace: %v", err)
@@ -240,7 +260,7 @@ func serveLog(t *testing.T, log metastore.Log, limits httprest.Limits) *httprest
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	s, err := httprest.Dial(srv.URL, srv.Client())
+	s, err := httprest.DialWithSilence(srv.URL, srv.Client(), silence)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -1899,5 +1919,172 @@ func TestAStreamSaysHowFarTheLogHadGot(t *testing.T) {
 	}
 	if !current.CaughtUp() {
 		t.Fatal("a stream beginning at the tail was not reported as caught up")
+	}
+}
+
+// A picture the store is slow to produce is still a picture being delivered, and the reading
+// end cannot tell the two apart by itself: it bounds how long a stream may say nothing before
+// it stops believing in it, and that bound is armed on every stream this package opens. So a
+// server grinding out a page has to say it is still there for the same reason an idle one
+// does. Without that, a cold sync of a tree large enough to be worth replicating is judged
+// dead on a timer, the mount never comes up, and each retry opens another read the store has
+// to hold.
+func TestAPictureSlowToProduceIsNotJudgedDead(t *testing.T) {
+	log := newFakeLog()
+	want := []metastore.Row{
+		{Parent: 0, Name: nil, Node: metastore.Node{ID: 1, Mode: fs.ModeDir | 0o755}},
+		row(1, "first", metastore.Node{ID: 2, Mode: 0o644}),
+		row(1, "second", metastore.Node{ID: 3, Mode: 0o644}),
+	}
+	log.pages = [][]metastore.Row{want[:1], want[1:2], want[2:]}
+	limits := httprest.DefaultLimits()
+	limits.Keepalive = 40 * time.Millisecond
+	// Each page after the first takes several times the silence this reader allows, which is
+	// what a large tree does to a small bound. Nothing about the wire is slowed.
+	const silence = 200 * time.Millisecond
+	log.slowPage = 3 * silence
+
+	s := serveLogWatchedFor(t, log, limits, silence)
+	snap, err := s.Snapshot(t.Context())
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	defer snap.Close()
+
+	var got []metastore.Row
+	for {
+		rows, err := snap.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("a picture that was being delivered the whole time failed after %d rows: %v", len(got), err)
+		}
+		got = append(got, rows...)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("the picture holds %d rows, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if describe(got[i]) != describe(want[i]) {
+			t.Fatalf("row %d arrived as\n\t%s\nwant\n\t%s", i, describe(got[i]), describe(want[i]))
+		}
+	}
+}
+
+// Stopping a server has to release a picture being delivered as well as a change stream. A
+// cold sync holds its connection non-idle for exactly as long as it takes, so a shutdown
+// waiting for connections to become idle waits for the whole of it — the same hang, by the
+// other door — and the replica meanwhile learns nothing about why its picture stopped.
+func TestStoppingAServerReleasesAPictureBeingDelivered(t *testing.T) {
+	log := newFakeLog()
+	twoStalledPages(log)
+	limits := httprest.DefaultLimits()
+	// Far longer than this test, so that nothing but the stop can be what released it.
+	limits.SnapshotDeadline = time.Minute
+
+	backing, err := localdir.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := httprest.NewHandlerWithLimits(backing, log, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	srv.Config.RegisterOnShutdown(h.Stop)
+
+	s, err := httprest.Dial(srv.URL, srv.Client())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	snap, err := s.Snapshot(t.Context())
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	defer snap.Close()
+	if _, err := snap.Next(); err != nil {
+		t.Fatalf("the first page: %v", err)
+	}
+	if log.opened() != 1 {
+		t.Fatalf("%d pictures are open, want the one this test is about", log.opened())
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	started := time.Now()
+	if err := srv.Config.Shutdown(ctx); err != nil {
+		t.Fatalf("stopping with a picture being delivered: %v", err)
+	}
+	if took := time.Since(started); took > 5*time.Second {
+		t.Fatalf("stopping took %v with a picture being delivered, which is waiting for it rather than ending it", took)
+	}
+	if log.opened() != 0 {
+		t.Fatalf("%d pictures are still open on a server that has stopped", log.opened())
+	}
+
+	// And the replica is told which of the two it was. A picture cannot be resumed, so what
+	// it needs to know is that taking another is worth doing.
+	_, err = snap.Next()
+	if !errors.Is(err, httprest.ErrServerStopping) {
+		t.Fatalf("the replica was given %v, want it to be told the server was stopping", err)
+	}
+	if errors.Is(err, io.EOF) {
+		t.Fatal("a picture that was cut off by a shutdown was reported as complete")
+	}
+	if !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("a picture ended by a stopping server gave %v, and does not read as something to try again", err)
+	}
+}
+
+// The done frame is the one that says a picture is whole, so a picture the server stopped
+// part way through must not carry one. Nothing a replica does reveals this — it acts on the
+// gone frame and never reads past it — so the claim is checked where it is made, on the wire.
+func TestAPictureEndedByAShutdownIsNotAnnouncedAsWhole(t *testing.T) {
+	log := newFakeLog()
+	twoStalledPages(log)
+	limits := httprest.DefaultLimits()
+	limits.SnapshotDeadline = time.Minute
+
+	backing, err := localdir.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := httprest.NewHandlerWithLimits(backing, log, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := srv.Client().Get(srv.URL + "/v1/snapshot")
+	if err != nil {
+		t.Fatalf("ask for a picture: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read up to the end of the first page, so the delivery is genuinely under way when the
+	// server is stopped.
+	body := bufio.NewReader(resp.Body)
+	var opening strings.Builder
+	for !strings.Contains(opening.String(), "event: "+"rows") {
+		line, err := body.ReadString('\n')
+		if err != nil {
+			t.Fatalf("reading the first page: %v", err)
+		}
+		opening.WriteString(line)
+	}
+	h.Stop()
+
+	rest, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("reading what followed the stop: %v", err)
+	}
+	if !strings.Contains(string(rest), "event: gone") {
+		t.Fatalf("the stream ended without saying the server was going away: %q", rest)
+	}
+	if strings.Contains(string(rest), "event: done") {
+		t.Fatalf("a picture the server stopped part way through was announced as whole: %q", rest)
 	}
 }

@@ -31,10 +31,16 @@ type Storage struct {
 // DefaultSilence is how long a stream may say nothing before a caller with no reason of its
 // own to choose stops believing in it.
 //
+// It holds every stream this package opens, changes and snapshots alike, so both have to be
+// kept spoken for. A server working through a large tree has nothing to send for as long as
+// that takes, and to a reader that is the same nothing an abandoned connection produces.
+//
 // It has to be a comfortable multiple of the interval the server sends its keepalives at —
 // Limits.Keepalive, ten seconds by default — because the two are configured separately and
 // a bound below that interval would sever every healthy stream on a timer. Three times it,
-// so that losing one keepalive to a stall is not a broken stream.
+// so that losing one keepalive to a stall is not a broken stream. Limits.SnapshotDeadline is
+// a larger figure than this and is not the thing to compare it against: that bounds a whole
+// delivery, this bounds a silence.
 //
 // What it bounds is how long a replica may go on answering from a copy whose stream has
 // stopped arriving without saying so — a machine that vanished, a firewall that dropped the

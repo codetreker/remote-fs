@@ -31,6 +31,12 @@ type Limits struct {
 	// SnapshotDeadline is how long one snapshot may take to deliver, after which it is
 	// abandoned and what it held is released. A snapshot cannot be resumed — a consistent
 	// picture that is gone is gone — so a replica that runs into this starts over.
+	//
+	// It bounds the whole delivery and has nothing to do with the bound a reader keeps on a
+	// quiet stream, which Keepalive answers. Reading the two as a pair is a mistake worth
+	// naming, because they look like one: this being the larger figure suggests a slow
+	// picture is tolerated, when what decides that is whether anything is being said
+	// meanwhile. A picture may take all of this as long as it keeps speaking.
 	SnapshotDeadline time.Duration
 
 	// SnapshotPage is how many rows travel in one frame. The snapshot is the largest bulk
@@ -42,19 +48,23 @@ type Limits struct {
 	// catches up.
 	EventPage int
 
-	// Keepalive is how often a change stream with nothing to say says so.
+	// Keepalive is how often a stream with nothing to say says so — both kinds, because
+	// both can be quiet for reasons that are nobody's fault. A namespace nobody is writing
+	// to produces no events, and a store working through a large tree produces no page for
+	// as long as it takes.
 	//
-	// It is what makes a live stream distinguishable from a dead one. A namespace that
-	// nobody is writing to produces no events, and so does a connection that a firewall
-	// dropped, a machine that vanished, or a partition — the reader sees the same thing in
-	// all four cases, which is nothing at all. A replica that could not tell them apart
-	// would go on answering from a copy it can no longer justify, for as long as the
-	// mistake lasted, which is what R-ERR-1 and R-ERR-2 forbid above everything else.
+	// It is what makes a live stream distinguishable from a dead one. Neither of those
+	// silences looks any different from a connection a firewall dropped, a machine that
+	// vanished, or a partition — the reader sees the same thing in all of them, which is
+	// nothing at all. A replica that could not tell them apart would go on answering from a
+	// copy it can no longer justify, for as long as the mistake lasted, which is what
+	// R-ERR-1 and R-ERR-2 forbid above everything else.
 	//
 	// It is paired with the bound the reading end keeps: DefaultSilence is three times this
 	// figure. The two are configured separately, so raising this above what a client allows
 	// severs every one of that client's streams on a timer — which is loud rather than
-	// silent, and is the direction to err in.
+	// silent, and is the direction to err in. SnapshotDeadline is not part of that pairing
+	// and must not be read as though it were; what it bounds is said there.
 	Keepalive time.Duration
 }
 
@@ -236,9 +246,8 @@ func (h *Handler) startOf(ctx context.Context, incarnation metastore.Incarnation
 		// exists to make loud.
 		return StreamStart{}, 0, fmt.Errorf("position %d is past the log's tail at %d: %w", at, retention.Tail, syscall.EINVAL)
 	}
-	verdict := verdictFor(at, retention)
-	if verdict.rebuild != "" {
-		return StreamStart{Rebuild: verdict.rebuild}, 0, nil
+	if rebuild := rebuildFor(at, retention); rebuild != "" {
+		return StreamStart{Rebuild: rebuild}, 0, nil
 	}
 	return startAt(incarnation, at, retention.Tail), at, nil
 }
@@ -250,43 +259,30 @@ func startAt(incarnation metastore.Incarnation, at, tail metastore.Position) Str
 	return StreamStart{Incarnation: string(incarnation), Position: &position, Tail: &reached}
 }
 
-// verdict is what a log can do for a replica sitting at some position.
-type verdict struct {
-	// rebuild is empty when the stream can go on, and otherwise says which dimension
-	// pushed the replica out of the window.
-	rebuild RebuildReason
-
-	// caughtUp reports that the position is the log's tail, so nothing is replayed.
-	caughtUp bool
-}
-
-// verdictFor compares a position against what the log still holds.
+// rebuildFor is the rebuild a replica sitting at some position calls for, and is empty when
+// the stream can simply go on.
 //
-// The three answers are three different things for the replica to do, and the case that
-// makes them worth separating is a log that has discarded everything: what it still holds
-// is then nothing at all, and only the tail can tell "you are caught up" from "you missed
-// all of it" — two answers that differ by a full rebuild of the replica.
+// It asks what the log discarded rather than what survived it, and the difference between
+// those two is the whole reason Retention carries both. A replica has missed nothing exactly
+// when it has already seen everything the log threw away; how far its position sits below
+// the oldest surviving entry is not the same question, because positions are dense in no
+// particular way. A store numbering every namespace in one database from a single sequence
+// leaves each namespace's positions spread by however much its neighbours were written to in
+// between, so a replica that had missed nothing would be sent off to walk the whole tree
+// again — and one that had applied nothing at all, sitting at position zero, would be sent
+// away by every namespace whose first change is not position 1.
 //
-// The middle test asks what was discarded rather than what survives, and the difference
-// between those two is the whole reason Retention carries both. A replica has missed
-// nothing exactly when it has already seen everything the log threw away; how far its
-// position sits below the oldest surviving entry is not the same question, because
-// positions are dense in no particular way. A store numbering every namespace in one
-// database from a single sequence leaves each namespace's positions spread by however much
-// its neighbours were written to in between, so a replica that had missed nothing would be
-// sent off to walk the whole tree again — and one that had applied nothing at all, sitting
-// at position zero, would be sent away by every namespace whose first change is not
-// position 1.
-func verdictFor(at metastore.Position, retention metastore.Retention) verdict {
+// A replica at the tail needs no case of its own. Nothing can have been discarded above the
+// newest position ever recorded, so being at the tail already means being at or past
+// whatever was thrown away.
+func rebuildFor(at metastore.Position, retention metastore.Retention) RebuildReason {
 	switch {
-	case at == retention.Tail:
-		return verdict{caughtUp: true}
 	case at >= retention.TrimmedThrough:
-		return verdict{}
+		return ""
 	case retention.TrimmedByAge:
-		return verdict{rebuild: RebuildAge}
+		return RebuildAge
 	default:
-		return verdict{rebuild: RebuildVolume}
+		return RebuildVolume
 	}
 }
 
@@ -323,8 +319,8 @@ func (h *Handler) publish(ctx context.Context, out *frameWriter, at metastore.Po
 			// happened between here and the log's oldest entry is gone, so delivering
 			// what follows would leave the replica silently wrong about everything in
 			// between, permanently and with nothing left to notice it by.
-			if verdict := verdictFor(at, retention); verdict.rebuild != "" {
-				return out.send(eventStart, StreamStart{Rebuild: verdict.rebuild})
+			if rebuild := rebuildFor(at, retention); rebuild != "" {
+				return out.send(eventStart, StreamStart{Rebuild: rebuild})
 			}
 			if len(changes) == 0 {
 				break
@@ -410,7 +406,7 @@ func (h *Handler) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = h.pages(ctx, out, snap)
+	stopping, err := h.pages(ctx, out, snap)
 	// Closing belongs to the delivery rather than to cleanup after it. What it releases is
 	// held inside the store, and a failure to release it is not something to find out about
 	// later from a database that has quietly stopped reclaiming space. A picture that was
@@ -424,35 +420,101 @@ func (h *Handler) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 		out.fault(err)
 		return
 	}
+	if stopping {
+		// The replica has already been told this server is going away. A picture it will
+		// never receive the rest of must not also be announced as whole.
+		return
+	}
 	// The last frame, and the only one that makes the picture usable. A failure to write it
 	// leaves the replica with a stream that stopped, which it treats as one cut short — the
 	// right answer, and the only one left once there is nothing further to write.
 	out.send(eventDone, struct{}{})
 }
 
-// pages streams the whole picture and returns once it is complete.
-func (h *Handler) pages(ctx context.Context, out *frameWriter, snap metastore.Snap) error {
+// pages streams the whole picture, and reports whether it ended because this server is
+// stopping rather than because the picture was complete.
+//
+// The rows are produced beside the writing rather than in front of it, and that is what lets
+// the stream say something while the store is working. The reading end bounds how long a
+// stream may go without a word before it stops believing in it, and it arms that bound on
+// every stream — it cannot see the difference between a store taking its time over a page
+// and a connection that is no longer there, because both look like nothing arriving. A page
+// produced in front of the writing would leave the stream silent for exactly as long as the
+// store took, so a tree large enough to be worth replicating would be judged dead on a timer
+// and every retry would open another read for the store to hold.
+func (h *Handler) pages(ctx context.Context, out *frameWriter, snap metastore.Snap) (stopping bool, err error) {
+	// A context of this loop's own, so that leaving early stops the production: the picture
+	// is closed as soon as this returns, and closing one while a read is still inside it is
+	// not something the contract allows.
+	producing, stopProducing := context.WithCancel(ctx)
+	type produced struct {
+		rows []metastore.Row
+		done bool
+		err  error
+	}
+	ready := make(chan produced)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		for {
+			rows, done, err := snap.Next(producing, h.limits.SnapshotPage)
+			select {
+			case ready <- produced{rows, done, err}:
+			case <-producing.Done():
+				return
+			}
+			if done || err != nil {
+				return
+			}
+		}
+	}()
+	defer func() {
+		stopProducing()
+		<-finished
+	}()
+
+	keepalive := time.NewTicker(h.limits.Keepalive)
+	defer keepalive.Stop()
+
 	for {
-		rows, done, err := snap.Next(ctx, h.limits.SnapshotPage)
-		if err != nil {
-			return err
-		}
-		if len(rows) > 0 {
-			page := SnapshotPage{Rows: make([]Row, 0, len(rows))}
-			for _, row := range rows {
-				page.Rows = append(page.Rows, RowOf(row))
+		select {
+		case page := <-ready:
+			if page.err != nil {
+				return false, page.err
 			}
-			if err := out.send(eventRows, page); err != nil {
-				return err
+			if len(page.rows) > 0 {
+				rows := SnapshotPage{Rows: make([]Row, 0, len(page.rows))}
+				for _, row := range page.rows {
+					rows.Rows = append(rows.Rows, RowOf(row))
+				}
+				if err := out.send(eventRows, rows); err != nil {
+					return false, err
+				}
 			}
-		}
-		if done {
-			return nil
-		}
-		if len(rows) == 0 {
-			// A picture that is not complete and yields nothing would have this loop ask
-			// forever, holding open the very resource the bounds above exist to release.
-			return errors.New("the snapshot yielded no rows and reported itself incomplete")
+			if page.done {
+				return false, nil
+			}
+			if len(page.rows) == 0 {
+				// A picture that is not complete and yields nothing would have this loop
+				// ask forever, holding open the very resource the bounds above exist to
+				// release.
+				return false, errors.New("the snapshot yielded no rows and reported itself incomplete")
+			}
+		case <-keepalive.C:
+			// Failing to write it is how this side learns that nobody is reading any more,
+			// which is worth as much here as it is on a change stream: a picture nobody is
+			// receiving is a read transaction held open for nothing.
+			if err := out.alive(); err != nil {
+				return false, err
+			}
+		case <-h.stopping:
+			// A picture cannot be resumed, so there is nothing to hand over — but saying so
+			// is what lets the replica take another from whatever server comes up next,
+			// rather than holding this connection open through a shutdown that is waiting
+			// for it to become idle.
+			return true, out.send(eventGone, struct{}{})
+		case <-ctx.Done():
+			return false, ctx.Err()
 		}
 	}
 }

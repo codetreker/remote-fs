@@ -272,6 +272,10 @@ func (snap *Snapshot) Position() metastore.Position { return snap.at }
 // stopped without saying so is an error instead — the distinction the whole delivery turns
 // on, because a snapshot cut short is a tree with some of its nodes missing, and a replica
 // built from one reports "no such file" for every one of them.
+//
+// ErrServerStopping is the one failure worth telling from the rest: the server said it was
+// going away, so another server will have the same picture to give, and taking one from it
+// is all this needs.
 func (snap *Snapshot) Next() ([]metastore.Row, error) {
 	if snap.stream.failed != nil {
 		return nil, snap.stream.failed
@@ -298,6 +302,12 @@ func (snap *Snapshot) Next() ([]metastore.Row, error) {
 	case eventDone:
 		snap.done = true
 		return nil, io.EOF
+	case eventGone:
+		// A picture cannot be resumed, so there is nothing here to carry on from — but
+		// knowing the server went away on purpose is still worth more than a stream that
+		// stopped: taking another from whatever comes up next is the whole answer, and
+		// EAGAIN says so where a cut-short picture would say the outcome is unknown.
+		return nil, snap.stream.fail(ErrServerStopping)
 	case eventFault:
 		return nil, snap.stream.fail(unreachable(snap.stream.req, faultOf(data)))
 	default:
