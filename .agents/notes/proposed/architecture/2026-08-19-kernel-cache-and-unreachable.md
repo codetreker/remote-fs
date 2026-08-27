@@ -2,6 +2,8 @@
 
 Status: proposed
 
+本 note 处理的是内核那一层。它**不得晚于** [元数据复制](2026-08-27-metadata-replication.md) 落地：本地副本一旦存在而三个内核超时跟着离开 0，这里的每一条就同时到期，而在那之前 R-ERR-1 的违反窗口是无界的。
+
 ## 问题
 
 `docs/spec/requirements.md` 把这条列为最坏的失败（R-ERR-1、R-ERR-2），MVP 用 G3 承诺它：服务端不可达时报 I/O 错误，**绝不**返回空目录、绝不报告文件不存在。
