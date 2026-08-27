@@ -119,12 +119,22 @@ func treeStatements() []string {
 		//
 		// Those two paragraphs are what was measured over the shapes above, not statements
 		// about how SQLite chooses, and a later measurement may move them. The sentence this
-		// key rests on is the first one and does not depend on them: the key was best or tied
-		// in every shape measured either way, including the ones where that index beat having
-		// no index at all.
+		// key rests on is the first one, and it does not depend on them.
 		//
-		// The plan is where all of this is checkable — what it costs depends on the machine,
-		// the cache and the shape of the tree, and none of those belong in a comment.
+		// The key is not free, and the shape where it costs is the one where sieving has
+		// nothing to sieve. A database holding a single namespace gains nothing from the
+		// namespace column and still pays for it: the column widens every row of the entry
+		// b-tree, so a picture reads a few percent more pages than the same picture over the
+		// narrower key, and over a million entries it came out a few percent slower in every
+		// run of an alternating comparison. That is the trade — a few percent where one
+		// namespace is alone, against several times over where many share a database — and it
+		// is the right way round for a system whose premise is that many workspaces exist and
+		// few are mounted at once. It is written down rather than left out because the first
+		// person to measure a single-namespace database will find it, and a comment claiming
+		// this key wins everywhere is what would read as false then.
+		//
+		// The plan is where the rest of this is checkable — what it costs depends on the
+		// machine, the cache and the shape of the tree, and none of those belong in a comment.
 		//
 		// The namespace column is therefore redundant with nodes.namespace, and every
 		// statement that writes an entry keeps the two equal.
