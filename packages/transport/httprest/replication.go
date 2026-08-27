@@ -237,6 +237,12 @@ const (
 	eventRows = "rows"
 	eventDone = "done"
 
+	// A change stream that this server is ending on purpose, because it is stopping. It is
+	// its own frame rather than an absent one, because a stream that simply ends is what a
+	// server that vanished also looks like — and those call for different things: a replica
+	// told this keeps what it has and comes back to the position it holds.
+	eventGone = "gone"
+
 	// Either stream, in place of everything that would have followed.
 	eventFault = "fault"
 )
@@ -286,6 +292,16 @@ type StreamStart struct {
 	// including it, and every change that follows is later than it.
 	Position *int64 `json:"position,omitempty"`
 
+	// Tail is the newest position the log had reached when the stream began.
+	//
+	// It is what tells a replica that has missed changes when it has stopped missing them.
+	// Everything between Position and this is on its way, and applying the last of it is the
+	// moment the copy is current again — which is the moment, and not before, that it may be
+	// answered from. Without it a replica knows it is behind and has no way to learn that it
+	// no longer is, since a stream with nothing left to replay and a stream that has not
+	// begun replaying look the same from the reading end.
+	Tail *int64 `json:"tail,omitempty"`
+
 	// CaughtUp reports that the replica had missed nothing, so no change is replayed
 	// before the live ones begin.
 	CaughtUp *bool `json:"caught_up,omitempty"`
@@ -320,6 +336,19 @@ func (s *StreamStart) UnmarshalJSON(data []byte) error {
 	}
 	if got.CaughtUp == nil {
 		return errors.New("the stream does not say whether anything was missed")
+	}
+	if got.Tail == nil {
+		return errors.New("the stream does not say how far the log had reached, so nothing could tell when it has been caught up with")
+	}
+	if *got.Tail < *got.Position {
+		return fmt.Errorf("the stream begins at position %d, past the log's tail at %d", *got.Position, *got.Tail)
+	}
+	// The two are one fact stated twice, and a frame where they disagree is one this side
+	// cannot act on: it would be told both that nothing was missed and that something is
+	// still to come, and the two call for opposite treatment of the copy.
+	if caughtUp := *got.Tail == *got.Position; caughtUp != *got.CaughtUp {
+		return fmt.Errorf("the stream begins at position %d with the log's tail at %d, and says it is %v that nothing was missed",
+			*got.Position, *got.Tail, *got.CaughtUp)
 	}
 	*s = got
 	return nil

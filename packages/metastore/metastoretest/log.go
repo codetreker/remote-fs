@@ -397,8 +397,8 @@ var sinceCases = []testCase{
 		if len(changes) == 0 {
 			t.Fatalf("two writes after position %d are offered as nothing, want the changes", at)
 		}
-		if retention.Oldest == 0 || retention.Oldest > at+1 {
-			t.Fatalf("the log's oldest entry is %d, which does not cover a caller resuming at %d", retention.Oldest, at)
+		if retention.TrimmedThrough > at {
+			t.Fatalf("the log has discarded through %d, which is past a caller resuming at %d, and nothing has been trimmed", retention.TrimmedThrough, at)
 		}
 		if retention.Tail <= at {
 			t.Fatalf("the log's tail is %d after two writes past %d", retention.Tail, at)
@@ -407,6 +407,41 @@ var sinceCases = []testCase{
 			t.Fatalf("the last change offered is at %d and the tail is %d, want them equal", got, retention.Tail)
 		}
 	}},
+
+	// What separates a caller that can carry on from one that cannot is what the log threw
+	// away, and never how far the caller sits from the oldest entry that survived. Those are
+	// the same number only where a namespace's positions have no gaps in them, which this
+	// contract does not promise and an implementation numbering every namespace in one
+	// database from a single sequence does not provide. Reading resumability off that distance
+	// sends callers that had missed nothing away to rebuild a whole tree.
+	{name: "what the log discarded is what decides resuming, not what survived it",
+		run: func(t *testing.T, s metastore.Store) {
+			build(t, s)
+			_, retention, err := s.Since(ctx(t), 0, 0)
+			mustSucceed(t, err)
+
+			// A log that has discarded nothing admits every caller, including one that has
+			// applied nothing at all — whatever position its first entry happens to sit on.
+			if retention.TrimmedThrough != 0 {
+				t.Fatalf("a log that has discarded nothing reports having discarded through %d", retention.TrimmedThrough)
+			}
+			if retention.Oldest == 0 {
+				t.Fatalf("the log holds nothing after a tree was built in it")
+			}
+
+			// Every position the log holds is resumable from, and so is everything before the
+			// oldest of them, because nothing has been thrown away.
+			for _, from := range []metastore.Position{0, retention.Oldest - 1, retention.Oldest} {
+				changes, again, err := s.Since(ctx(t), from, 100)
+				mustSucceed(t, err)
+				if again.TrimmedThrough > from {
+					t.Fatalf("resuming at %d is refused by a log that has discarded nothing", from)
+				}
+				if from < again.Tail && len(changes) == 0 {
+					t.Fatalf("resuming at %d before the tail at %d is offered nothing", from, again.Tail)
+				}
+			}
+		}},
 
 	{name: "since returns at most the limit it was given, oldest first", run: func(t *testing.T, s metastore.Store) {
 		build(t, s)

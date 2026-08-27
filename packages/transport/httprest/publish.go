@@ -226,7 +226,7 @@ func (h *Handler) startOf(ctx context.Context, incarnation metastore.Incarnation
 	}
 
 	if from == nil {
-		return startAt(incarnation, retention.Tail, true), retention.Tail, nil
+		return startAt(incarnation, retention.Tail, retention.Tail), retention.Tail, nil
 	}
 	if at > retention.Tail {
 		// The incarnation matched, so this is the log the replica was watching, and yet it
@@ -240,12 +240,15 @@ func (h *Handler) startOf(ctx context.Context, incarnation metastore.Incarnation
 	if verdict.rebuild != "" {
 		return StreamStart{Rebuild: verdict.rebuild}, 0, nil
 	}
-	return startAt(incarnation, at, verdict.caughtUp), at, nil
+	return startAt(incarnation, at, retention.Tail), at, nil
 }
 
-func startAt(incarnation metastore.Incarnation, at metastore.Position, caughtUp bool) StreamStart {
-	position, missed := int64(at), caughtUp
-	return StreamStart{Incarnation: string(incarnation), Position: &position, CaughtUp: &missed}
+// startAt says where a stream begins and how far the log had got, which between them say
+// whether anything is about to be replayed and when it will have been.
+func startAt(incarnation metastore.Incarnation, at, tail metastore.Position) StreamStart {
+	position, reached := int64(at), int64(tail)
+	caughtUp := at == tail
+	return StreamStart{Incarnation: string(incarnation), Position: &position, Tail: &reached, CaughtUp: &caughtUp}
 }
 
 // verdict is what a log can do for a replica sitting at some position.
@@ -264,11 +267,22 @@ type verdict struct {
 // makes them worth separating is a log that has discarded everything: Retention.Oldest is
 // then zero and says nothing, and only the tail can tell "you are caught up" from "you
 // missed all of it" — two answers that differ by a full rebuild of the replica.
+//
+// The middle test asks what was discarded rather than what survives, and the difference
+// between those two is the whole reason Retention carries both. A replica has missed
+// nothing exactly when it has already seen everything the log threw away; how far its
+// position sits below the oldest surviving entry is not the same question, because
+// positions are dense in no particular way. A store numbering every namespace in one
+// database from a single sequence leaves each namespace's positions spread by however much
+// its neighbours were written to in between, so a replica that had missed nothing would be
+// sent off to walk the whole tree again — and one that had applied nothing at all, sitting
+// at position zero, would be sent away by every namespace whose first change is not
+// position 1.
 func verdictFor(at metastore.Position, retention metastore.Retention) verdict {
 	switch {
 	case at == retention.Tail:
 		return verdict{caughtUp: true}
-	case retention.Oldest != 0 && at+1 >= retention.Oldest:
+	case at >= retention.TrimmedThrough:
 		return verdict{}
 	case retention.TrimmedByAge:
 		return verdict{rebuild: RebuildAge}
@@ -290,6 +304,11 @@ func verdictFor(at metastore.Position, retention metastore.Retention) verdict {
 // The one thing that does happen on a timer is the keepalive, and it carries nothing: a
 // stream that has said nothing for a while is indistinguishable from a stream that is no
 // longer arriving, and the whole worth of a replica rests on being able to tell those apart.
+//
+// A stream also ends when the server is stopped, and it says so rather than stopping. A
+// replica told that keeps what it has and reconnects at the position it holds; one that
+// merely saw its connection end cannot tell a server that went away on purpose from one
+// that vanished.
 func (h *Handler) publish(ctx context.Context, out *frameWriter, at metastore.Position, woken <-chan struct{}) error {
 	keepalive := time.NewTicker(h.limits.Keepalive)
 	defer keepalive.Stop()
@@ -321,9 +340,17 @@ func (h *Handler) publish(ctx context.Context, out *frameWriter, at metastore.Po
 				}
 				at = change.Position
 			}
+			// A backlog is left part way through when the server is stopping. What the
+			// replica has been given stands and it resumes from there, whereas draining the
+			// rest first would hold the shutdown open for as long as the backlog is.
+			if h.stopped() {
+				return out.send(eventGone, struct{}{})
+			}
 		}
 		select {
 		case <-woken:
+		case <-h.stopping:
+			return out.send(eventGone, struct{}{})
 		case <-keepalive.C:
 			// Failing to write it is how this side learns that nobody is reading any more,
 			// which is worth as much as the keepalive itself: without it, a replica that
@@ -333,8 +360,8 @@ func (h *Handler) publish(ctx context.Context, out *frameWriter, at metastore.Po
 				return err
 			}
 		case <-ctx.Done():
-			// The replica went away, or the server is going down. There is nobody left to
-			// tell, so there is nothing to say.
+			// The replica went away. There is nobody left to tell, so there is nothing to
+			// say.
 			return nil
 		}
 	}

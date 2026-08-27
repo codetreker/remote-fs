@@ -311,12 +311,20 @@ func trim(ctx context.Context, tx *sql.Tx, namespace int64, window Window) error
 		`DELETE FROM changes WHERE namespace = ? AND position <= ?`, namespace, cut); err != nil {
 		return err
 	}
-	// Which dimension pushed the oldest entries out, for whoever is told they fell out of the
-	// window: age says that caller was away too long, volume says the namespace changes faster
-	// than the log was configured to hold. When both would have cut to the same place, volume
-	// did it — the entries were over the cap whether or not anybody had been away.
-	_, err = tx.ExecContext(ctx, `UPDATE logs SET trimmed_by_age = ? WHERE namespace = ?`,
-		byAge > byVolume, namespace)
+	// The cut itself is recorded, because it is the only thing that can decide whether a
+	// returning replica has missed anything: it has missed nothing exactly when it has already
+	// seen everything at or below this. Working that out from the oldest surviving entry
+	// instead would be working it out from a distance that the other namespaces in this
+	// database set, which is a fact about them rather than about this replica.
+	//
+	// Alongside it, which dimension pushed the oldest entries out, for whoever is told they
+	// fell out of the window: age says that caller was away too long, volume says the
+	// namespace changes faster than the log was configured to hold. When both would have cut
+	// to the same place, volume did it — the entries were over the cap whether or not anybody
+	// had been away.
+	_, err = tx.ExecContext(ctx,
+		`UPDATE logs SET trimmed_through = ?, trimmed_by_age = ? WHERE namespace = ?`,
+		int64(cut), byAge > byVolume, namespace)
 	return err
 }
 
@@ -526,19 +534,25 @@ func (s *Store) Since(ctx context.Context, after metastore.Position, limit int) 
 // a full rebuild of the tree.
 func (s *Store) retention(ctx context.Context, tx *sql.Tx) (metastore.Retention, error) {
 	var (
-		tail         int64
-		trimmedByAge bool
+		tail           int64
+		trimmedThrough int64
+		trimmedByAge   bool
 	)
 	if err := tx.QueryRowContext(ctx,
-		`SELECT committed_position, trimmed_by_age FROM logs WHERE namespace = ?`,
-		s.namespace).Scan(&tail, &trimmedByAge); err != nil {
+		`SELECT committed_position, trimmed_through, trimmed_by_age FROM logs WHERE namespace = ?`,
+		s.namespace).Scan(&tail, &trimmedThrough, &trimmedByAge); err != nil {
 		return metastore.Retention{}, err
 	}
 	oldest, _, err := oldestEntry(ctx, tx, s.namespace)
 	if err != nil {
 		return metastore.Retention{}, err
 	}
-	return metastore.Retention{Oldest: oldest, Tail: metastore.Position(tail), TrimmedByAge: trimmedByAge}, nil
+	return metastore.Retention{
+		Oldest:         oldest,
+		Tail:           metastore.Position(tail),
+		TrimmedThrough: metastore.Position(trimmedThrough),
+		TrimmedByAge:   trimmedByAge,
+	}, nil
 }
 
 // Incarnation names this log as a continuation of itself.

@@ -272,9 +272,14 @@ type Log interface {
 	// answers call for different actions and an implementation that could not tell them
 	// apart would answer the worst of them silently:
 	//
-	//   after == Tail        — caught up; nothing was missed
-	//   after >= Oldest-1    — resumable; the changes are returned
-	//   otherwise            — the log no longer holds them, and the caller must rebuild
+	//   after == Tail             — caught up; nothing was missed
+	//   after >= TrimmedThrough   — resumable; the changes are returned
+	//   otherwise                 — the log no longer holds them, and the caller must rebuild
+	//
+	// The middle test is against what was discarded rather than against what survives,
+	// because those are different questions wherever positions have gaps in them. Asking
+	// whether the oldest surviving entry is the caller's very next position asks about
+	// adjacency, which no implementation promises.
 	Since(ctx context.Context, after Position, limit int) ([]Change, Retention, error)
 
 	// Incarnation identifies this log as a continuation of itself.
@@ -337,6 +342,21 @@ type Retention struct {
 	// that has discarded everything cannot otherwise tell "you are caught up" from "you
 	// missed everything", and those two answers differ by a full rebuild.
 	Tail Position
+
+	// TrimmedThrough is the newest position this log has discarded, and 0 when it has
+	// discarded nothing. A caller that has seen everything up to it has missed nothing,
+	// because everything later is still here.
+	//
+	// It is what makes resuming decidable, and Oldest is not. Positions are dense in no
+	// particular way, so the distance between a caller's position and the oldest surviving
+	// entry says nothing about whether anything in between was thrown away: an
+	// implementation numbering every namespace in one database from a single sequence
+	// leaves each namespace's positions spread by however much its neighbours were written
+	// to in the meantime. Deciding from that distance rejects callers that had missed
+	// nothing, and the cost of being wrong is a full rebuild of a tree.
+	//
+	// An implementation that discards nothing leaves this at 0, which admits every caller.
+	TrimmedThrough Position
 
 	// TrimmedByAge reports whether anything was discarded for being old rather than for
 	// being too much. A caller that fell out of the window is told which dimension pushed

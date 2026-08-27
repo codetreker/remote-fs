@@ -138,7 +138,21 @@ func run(args []string, errOut io.Writer) error {
 	// anything reading this output parses it for.
 	fmt.Fprintf(errOut, "remote-fs-server: serving %s%s at http://%s\n", ns.what, ns.allowance, listener.Addr())
 
-	return serve(&http.Server{Handler: handler}, listener, ns, errOut)
+	return serve(newServer(handler), listener, ns, errOut)
+}
+
+// newServer builds the HTTP server this command serves with.
+//
+// The registration is the whole reason it is a function rather than a literal. A change
+// stream never becomes idle, and http.Server.Shutdown waits for connections that are, so
+// without telling the streams to let go, stopping a server with one mount attached waits
+// out the entire grace period and then reports that it expired — an ordinary stop turned
+// into a stall and a failure — while every attached mount sees its stream break rather than
+// being told the server was going away.
+func newServer(handler *httprest.Handler) *http.Server {
+	server := &http.Server{Handler: handler}
+	server.RegisterOnShutdown(handler.Stop)
+	return server
 }
 
 // blobSource names the parts of a namespace whose contents are in a blob container. The

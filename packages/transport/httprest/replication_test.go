@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/localdir"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
@@ -39,9 +41,10 @@ type fakeLog struct {
 	// ever recorded whether or not it is still held. They are separate for the reason the
 	// contract keeps them separate: a log that has discarded everything cannot otherwise
 	// tell a caller that is caught up from one that has missed all of it.
-	kept         []metastore.Change
-	tail         metastore.Position
-	trimmedByAge bool
+	kept           []metastore.Change
+	tail           metastore.Position
+	trimmedThrough metastore.Position
+	trimmedByAge   bool
 
 	// sinceCalls counts the reads of the log, so that a test can assert that nothing
 	// reads it on a schedule.
@@ -89,11 +92,12 @@ func created(name string) metastore.Change {
 	}
 }
 
-// discard drops the n oldest changes, the way trimming a log does, and says which
-// dimension did it.
+// discard drops the n oldest changes, the way trimming a log does, recording the newest
+// position it threw away and which dimension did it.
 func (l *fakeLog) discard(n int, byAge bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.trimmedThrough = l.kept[n-1].Position
 	l.kept = l.kept[n:]
 	l.trimmedByAge = byAge
 }
@@ -127,7 +131,7 @@ func (l *fakeLog) Since(_ context.Context, after metastore.Position, limit int) 
 	if l.sinceErr != nil {
 		return nil, metastore.Retention{}, l.sinceErr
 	}
-	retention := metastore.Retention{Tail: l.tail, TrimmedByAge: l.trimmedByAge}
+	retention := metastore.Retention{Tail: l.tail, TrimmedThrough: l.trimmedThrough, TrimmedByAge: l.trimmedByAge}
 	if len(l.kept) > 0 {
 		retention.Oldest = l.kept[0].Position
 	}
@@ -893,7 +897,7 @@ func TestASnapshotThatStopsIsNotACompletePicture(t *testing.T) {
 // rather than that the namespace has settled. A replica that read the second as the first
 // would sit on a copy it believes is current, indefinitely.
 func TestAChangeStreamThatEndsIsAFailure(t *testing.T) {
-	start := frame("start", `{"incarnation":"a-log","position":4,"caught_up":true}`)
+	start := frame("start", `{"incarnation":"a-log","position":4,"tail":4,"caught_up":true}`)
 	cases := map[string]string{
 		"nothing follows the start":      start,
 		"a change and then nothing":      start + frame("change", `{"position":5,"kind":"removed","parent":1,"name":"YQ=="}`),
@@ -1052,13 +1056,22 @@ func TestAFrameMissingWhatItCarriesIsRefused(t *testing.T) {
 			// An empty incarnation matches every position every replica ever held, so a
 			// replica holding one would be told it was caught up by a log that had lost
 			// its history.
-			"no incarnation":                 {"position": 4, "caught_up": true},
-			"no position":                    {"incarnation": "a-log", "caught_up": true},
-			"nothing about what was missed":  {"incarnation": "a-log", "position": 4},
-			"a rebuild reason nobody knows":  {"rebuild": "because"},
-			"a rebuild carrying a position":  {"rebuild": "age", "position": 4},
-			"a rebuild carrying what to do":  {"rebuild": "age", "incarnation": "a-log", "caught_up": true},
-			"an empty object saying nothing": {},
+			"no incarnation":                {"position": 4, "tail": 4, "caught_up": true},
+			"no position":                   {"incarnation": "a-log", "tail": 4, "caught_up": true},
+			"nothing about what was missed": {"incarnation": "a-log", "position": 4, "tail": 4},
+			// Without the log's tail a replica that is behind has no way to learn that it
+			// has stopped being behind, and would answer from a copy it knows is missing
+			// changes.
+			"nothing about how far the log had got": {"incarnation": "a-log", "position": 4, "caught_up": true},
+			// The two say one thing twice, and a frame where they disagree tells this side
+			// both that nothing was missed and that something is still to come.
+			"a tail behind the position where the stream begins": {"incarnation": "a-log", "position": 4, "tail": 3, "caught_up": false},
+			"a backlog and nothing missed at once":               {"incarnation": "a-log", "position": 4, "tail": 9, "caught_up": true},
+			"nothing missed and a backlog at once":               {"incarnation": "a-log", "position": 4, "tail": 4, "caught_up": false},
+			"a rebuild reason nobody knows":                      {"rebuild": "because"},
+			"a rebuild carrying a position":                      {"rebuild": "age", "position": 4},
+			"a rebuild carrying what to do":                      {"rebuild": "age", "incarnation": "a-log", "caught_up": true},
+			"an empty object saying nothing":                     {},
 		}
 		for name, fields := range refused {
 			t.Run(name, func(t *testing.T) {
@@ -1069,8 +1082,8 @@ func TestAFrameMissingWhatItCarriesIsRefused(t *testing.T) {
 			})
 		}
 		for name, fields := range map[string]map[string]any{
-			"a stream that is caught up": {"incarnation": "a-log", "position": 4, "caught_up": true},
-			"a stream with a backlog":    {"incarnation": "a-log", "position": 4, "caught_up": false},
+			"a stream that is caught up": {"incarnation": "a-log", "position": 4, "tail": 4, "caught_up": true},
+			"a stream with a backlog":    {"incarnation": "a-log", "position": 4, "tail": 9, "caught_up": false},
 			"a rebuild":                  {"rebuild": "volume"},
 		} {
 			t.Run(name, func(t *testing.T) {
@@ -1301,7 +1314,7 @@ func TestAFaultNobodyCanReadIsStillAFailure(t *testing.T) {
 // something this side has no reading for, and guessing at it would have the replica carry
 // on from a position nothing agreed on.
 func TestAStreamThatBeginsTwiceIsRefused(t *testing.T) {
-	start := frame("start", `{"incarnation":"a-log","position":4,"caught_up":true}`)
+	start := frame("start", `{"incarnation":"a-log","position":4,"tail":4,"caught_up":true}`)
 	s := streamOf(t, start+start)
 	sub, err := s.Subscribe(t.Context())
 	if err != nil {
@@ -1459,7 +1472,7 @@ func TestAChangeThatCannotBeNamedEndsTheStreamRatherThanBeingGuessedAt(t *testin
 // A frame on a change stream that is not one, or is one that does not decode, ends the
 // stream rather than being skipped past. A skipped change is a permanent hole in a replica.
 func TestAFrameAChangeStreamCannotUseEndsIt(t *testing.T) {
-	start := frame("start", `{"incarnation":"a-log","position":4,"caught_up":true}`)
+	start := frame("start", `{"incarnation":"a-log","position":4,"tail":4,"caught_up":true}`)
 	cases := map[string]string{
 		"a change that does not decode": start + frame("change", `{"position":5,"kind":"created","parent":1,"name":"YQ=="}`),
 		"a change that is not JSON":     start + frame("change", "not json"),
@@ -1506,4 +1519,316 @@ func TestAServerThatCannotBoundItsWritesRefusesToTakeAPicture(t *testing.T) {
 	if log.opened() != 0 {
 		t.Fatalf("%d pictures are open after one that was refused", log.opened())
 	}
+}
+
+// interleaved opens two namespaces in one database and writes to them in turn, so that the
+// positions of each have real gaps in them.
+//
+// The gaps are the point. A position comes from one sequence shared by every namespace in
+// the database, so a namespace's own positions are consecutive only when nothing else was
+// written in between — which is to say almost never. A stand-in that handed out 1, 2, 3
+// would agree with any amount of arithmetic about adjacency, and adjacency is exactly what
+// must not be assumed.
+func interleaved(t *testing.T, rounds int, window sqlite.Window) (quiet *sqlite.Store, everGiven []metastore.Position) {
+	t.Helper()
+	database := filepath.Join(t.TempDir(), "namespaces.db")
+	open := func(name string) *sqlite.Store {
+		s, err := sqlite.Open(t.Context(), database, name, 0, window)
+		if err != nil {
+			t.Fatalf("open %q: %v", name, err)
+		}
+		t.Cleanup(func() { s.Close() })
+		return s
+	}
+	quiet, busy := open("quiet"), open("busy")
+
+	// Read after every round rather than at the end, so that the positions the quiet
+	// namespace was given are known even where the window has since discarded them.
+	seen := metastore.Position(0)
+	for round := range rounds {
+		// Several changes to the busy namespace for each one to the quiet namespace, so the
+		// quiet one's positions are spread far apart rather than merely not adjacent.
+		for other := range 3 {
+			if err := busy.Create(t.Context(), fmt.Sprintf("busy-%d-%d", round, other)); err != nil {
+				t.Fatalf("create in the busy namespace: %v", err)
+			}
+		}
+		if err := quiet.Create(t.Context(), fmt.Sprintf("quiet-%d", round)); err != nil {
+			t.Fatalf("create in the quiet namespace: %v", err)
+		}
+		changes, _, err := quiet.Since(t.Context(), seen, 1000)
+		if err != nil {
+			t.Fatalf("read the quiet namespace's log: %v", err)
+		}
+		for _, change := range changes {
+			everGiven = append(everGiven, change.Position)
+			seen = change.Position
+		}
+	}
+	return quiet, everGiven
+}
+
+// positionsOf reports the positions a namespace's log still holds.
+func positionsOf(t *testing.T, log metastore.Log) []metastore.Position {
+	t.Helper()
+	changes, _, err := log.Since(t.Context(), 0, 1000)
+	if err != nil {
+		t.Fatalf("read the log: %v", err)
+	}
+	positions := make([]metastore.Position, 0, len(changes))
+	for _, change := range changes {
+		positions = append(positions, change.Position)
+	}
+	return positions
+}
+
+// retentionOf reports what a log still holds.
+func retentionOf(t *testing.T, log metastore.Log) metastore.Retention {
+	t.Helper()
+	_, retention, err := log.Since(t.Context(), 0, 0)
+	if err != nil {
+		t.Fatalf("read what the log holds: %v", err)
+	}
+	return retention
+}
+
+// A replica is resumable when the log still holds everything it has not seen. Whether the
+// next position happens to be the next integer says nothing about that: positions come from
+// a sequence shared by every namespace in the database, so a quiet namespace's positions are
+// spread out by however much its neighbours were written to in between.
+//
+// Getting this wrong sends a replica off to walk the whole tree again for no reason, which
+// is expensive and honest rather than silent — but it is triggered by a namespace simply
+// not being the only one in its database, which is the ordinary case.
+func TestAReplicaResumesAcrossTheGapsInItsPositions(t *testing.T) {
+	quiet, _ := interleaved(t, 4, sqlite.DefaultWindow())
+	positions := positionsOf(t, quiet)
+	if len(positions) < 3 {
+		t.Fatalf("the quiet namespace recorded %d changes, want at least 3", len(positions))
+	}
+	// Without this the whole test would pass against dense positions and prove nothing.
+	gaps := 0
+	for i := 1; i < len(positions); i++ {
+		if positions[i] > positions[i-1]+1 {
+			gaps++
+		}
+	}
+	if gaps == 0 {
+		t.Fatalf("the quiet namespace's positions are %v, every one of them next to the last: the interleaving did not produce the gaps this is about", positions)
+	}
+
+	s := serveLog(t, quiet, httprest.DefaultLimits())
+	for _, at := range positions[:len(positions)-1] {
+		sub, err := s.Resubscribe(t.Context(), incarnationOf(t, quiet), at)
+		if err != nil {
+			t.Fatalf("resuming at position %d of %v: %v", at, positions, err)
+		}
+		if sub.Position() != at {
+			sub.Close()
+			t.Fatalf("resuming at %d began at %d", at, sub.Position())
+		}
+		sub.Close()
+	}
+}
+
+// A replica that has applied nothing resumes from position zero, and a namespace that is not
+// the first one written in its database has no change at position 1 — so nothing about zero
+// being far below the oldest entry means anything was discarded.
+func TestAReplicaThatHasAppliedNothingResumesFromZero(t *testing.T) {
+	quiet, _ := interleaved(t, 2, sqlite.DefaultWindow())
+	positions := positionsOf(t, quiet)
+	if positions[0] <= 1 {
+		t.Fatalf("the quiet namespace's first change is at position %d; this is about one that does not start at 1", positions[0])
+	}
+
+	s := serveLog(t, quiet, httprest.DefaultLimits())
+	sub, err := s.Resubscribe(t.Context(), incarnationOf(t, quiet), 0)
+	if err != nil {
+		t.Fatalf("resuming from zero against a log that has discarded nothing: %v", err)
+	}
+	defer sub.Close()
+
+	// Everything it has not seen is everything there is, oldest first.
+	for _, want := range positions {
+		change, err := sub.Next()
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if change.Position != want {
+			t.Fatalf("got the change at %d, want %d of %v", change.Position, want, positions)
+		}
+	}
+}
+
+func incarnationOf(t *testing.T, log metastore.Log) metastore.Incarnation {
+	t.Helper()
+	incarnation, err := log.Incarnation(t.Context())
+	if err != nil {
+		t.Fatalf("read the incarnation: %v", err)
+	}
+	return incarnation
+}
+
+// A replica sitting on the newest position a trim discarded has missed nothing: everything
+// it still needs is on the far side of the cut. Whether the cut and the oldest surviving
+// entry are consecutive integers is a fact about what the other namespaces in the database
+// were doing at the time, and says nothing about whether this replica can carry on.
+func TestAReplicaOnTheNewestDiscardedPositionResumes(t *testing.T) {
+	window := sqlite.DefaultWindow()
+	window.Floor, window.Cap = 1, 4
+	quiet, everGiven := interleaved(t, 6, window)
+
+	retention := retentionOf(t, quiet)
+	if retention.Oldest == 0 {
+		t.Fatal("the quiet namespace's log holds nothing, so there is no cut to resume across")
+	}
+	var cut metastore.Position
+	for _, position := range everGiven {
+		if position >= retention.Oldest {
+			break
+		}
+		cut = position
+	}
+	if cut == 0 {
+		t.Fatalf("nothing was discarded from %v, so there is no cut to resume across", everGiven)
+	}
+	// Without a gap after the cut this would pass against arithmetic that assumes the next
+	// position is the next integer, which is the thing under test.
+	if cut+1 == retention.Oldest {
+		t.Fatalf("the cut at %d is next to the oldest entry at %d: this is about a cut with a gap after it", cut, retention.Oldest)
+	}
+
+	s := serveLog(t, quiet, httprest.DefaultLimits())
+	sub, err := s.Resubscribe(t.Context(), incarnationOf(t, quiet), cut)
+	if err != nil {
+		t.Fatalf("resuming at %d, the newest position discarded, with %d the oldest still held: %v", cut, retention.Oldest, err)
+	}
+	defer sub.Close()
+
+	// And it is given what follows the cut, rather than an empty stream that reads as being
+	// caught up.
+	change, err := sub.Next()
+	if err != nil {
+		t.Fatalf("next: %v", err)
+	}
+	if change.Position != retention.Oldest {
+		t.Fatalf("the first change after the cut is at %d, want the oldest still held at %d", change.Position, retention.Oldest)
+	}
+}
+
+// The other side of the same cut: a replica that has not seen everything the trim discarded
+// has lost changes for good, and must be told so.
+func TestAReplicaBehindTheCutIsToldToRebuild(t *testing.T) {
+	window := sqlite.DefaultWindow()
+	window.Floor, window.Cap = 1, 4
+	quiet, everGiven := interleaved(t, 6, window)
+
+	retention := retentionOf(t, quiet)
+	var behind metastore.Position
+	for _, position := range everGiven {
+		if position >= retention.Oldest {
+			break
+		}
+		if behind != 0 {
+			break
+		}
+		behind = position
+	}
+	if behind == 0 || behind >= retention.Oldest {
+		t.Fatalf("no position of %v sits behind the cut at %d", everGiven, retention.Oldest)
+	}
+
+	s := serveLog(t, quiet, httprest.DefaultLimits())
+	sub, err := s.Resubscribe(t.Context(), incarnationOf(t, quiet), behind)
+	if err == nil {
+		sub.Close()
+		t.Fatalf("resuming at %d, behind the cut, succeeded: changes it needed are gone", behind)
+	}
+	var rebuild *httprest.RebuildError
+	if !errors.As(err, &rebuild) {
+		t.Fatalf("resuming behind the cut gave %v, want a RebuildError", err)
+	}
+}
+
+// A server going away on purpose and a server vanishing are different events, and a replica
+// does different things about them: told the first, it keeps its copy and comes back with
+// the position it holds; left to infer the second, it has a connection that stopped and no
+// idea whether anything happened while it was gone.
+//
+// Being polite must therefore not cost the replica anything. This asserts both halves —
+// that the stream ends, and that what ends it says which of the two it was.
+func TestStoppingAServerTellsItsReplicasRatherThanBreakingTheirStreams(t *testing.T) {
+	log := newFakeLog()
+	backing, err := localdir.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := httprest.NewHandler(recording{Storage: backing, log: log}, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	srv.Config.RegisterOnShutdown(h.Stop)
+
+	s, err := httprest.Dial(srv.URL, srv.Client())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	sub, err := s.Subscribe(t.Context())
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer sub.Close()
+
+	// A change stream never becomes idle, so a Shutdown that waited for one would sit here
+	// until this context expired.
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	started := time.Now()
+	if err := srv.Config.Shutdown(ctx); err != nil {
+		t.Fatalf("stopping with a stream attached: %v", err)
+	}
+	if took := time.Since(started); took > 5*time.Second {
+		t.Fatalf("stopping took %v with a stream attached, which is waiting on the stream rather than ending it", took)
+	}
+
+	_, err = sub.Next()
+	if !errors.Is(err, httprest.ErrServerStopping) {
+		t.Fatalf("the replica was given %v, want it to be told the server was stopping", err)
+	}
+	// Nothing was lost, so this must not read as either of the two answers that would cost
+	// the replica its copy or leave it unsure what happened.
+	var rebuild *httprest.RebuildError
+	if errors.As(err, &rebuild) {
+		t.Fatal("a server that stopped on purpose was reported as a reason to rebuild")
+	}
+	if errors.Is(err, syscall.EIO) {
+		t.Fatalf("a server that stopped on purpose was reported as one that could not be reached: %v", err)
+	}
+	// Trying again is exactly what settles it.
+	if !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("a server that stopped gave %v, and does not read as something to try again", err)
+	}
+	// The same answer to every call afterwards, rather than a second, unrelated failure
+	// from a stream that is already over.
+	if _, again := sub.Next(); !errors.Is(again, httprest.ErrServerStopping) {
+		t.Fatalf("reading the stream again gave %v, want the same answer", again)
+	}
+}
+
+// Stopping is safe to ask for twice, and means nothing to a namespace that has no streams
+// to end. A server holds one handler for its whole life and Shutdown may be called from
+// anywhere, so neither of these may be a panic.
+func TestStoppingTwiceAndStoppingAnUnreplicableNamespaceAreBothHarmless(t *testing.T) {
+	backing, err := localdir.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := httprest.NewHandler(backing, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Stop()
+	h.Stop()
 }

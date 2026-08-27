@@ -65,6 +65,28 @@ func (e *RebuildError) detail() string {
 
 func (e *RebuildError) Unwrap() error { return syscall.ESTALE }
 
+// ErrServerStopping ends a change stream because the server said it was going away, rather
+// than because anything happened to the namespace or to the connection.
+//
+// It is worth telling apart from every other way a stream can end. A replica given this has
+// lost nothing: its position is still good, the log outlives the process that was serving
+// it, and the thing to do is reconnect with Resubscribe and keep the copy it has. A stream
+// that merely stopped says none of that — it is equally what a server that vanished looks
+// like — so being told is the difference between coming back with a position and coming
+// back with nothing.
+//
+// It reports syscall.EAGAIN to errors.Is: there is nothing wrong here that trying again
+// does not settle.
+var ErrServerStopping = &stoppingError{}
+
+type stoppingError struct{}
+
+func (e *stoppingError) Error() string {
+	return "the server is stopping, and ended the change stream rather than letting it break"
+}
+
+func (e *stoppingError) Unwrap() error { return syscall.EAGAIN }
+
 // Subscribe watches the namespace from now on.
 //
 // The stream begins at the log's current tail: nothing older is delivered, and every
@@ -114,6 +136,7 @@ func (s *Storage) subscribe(ctx context.Context, req Request) (*Subscription, er
 		stream:      stream,
 		incarnation: metastore.Incarnation(start.Incarnation),
 		at:          metastore.Position(*start.Position),
+		tail:        metastore.Position(*start.Tail),
 		caughtUp:    *start.CaughtUp,
 	}, nil
 }
@@ -124,6 +147,7 @@ type Subscription struct {
 
 	incarnation metastore.Incarnation
 	at          metastore.Position
+	tail        metastore.Position
 	caughtUp    bool
 }
 
@@ -139,6 +163,12 @@ func (sub *Subscription) Position() metastore.Position { return sub.at }
 // ones begin. A stream opened by Subscribe is always caught up: it begins at the tail.
 func (sub *Subscription) CaughtUp() bool { return sub.caughtUp }
 
+// Tail is how far the log had reached when the stream began. Everything between Position and
+// it is replayed before the live changes, so a caller that was behind knows from it when it
+// has stopped being behind — which is the moment its copy is worth answering from again, and
+// not one change earlier.
+func (sub *Subscription) Tail() metastore.Position { return sub.tail }
+
 // Next returns the next change, blocking until one is recorded.
 //
 // Every error it reports ends the stream, and the same one is reported to every call
@@ -149,7 +179,9 @@ func (sub *Subscription) CaughtUp() bool { return sub.caughtUp }
 //
 // A *RebuildError here means the caller fell out of the log's window while it was watching
 // — too slow, or a namespace changing faster than the log holds — and what it has applied
-// so far is no longer a copy of anything.
+// so far is no longer a copy of anything. ErrServerStopping is the opposite of that: the
+// server went away on purpose, nothing has been lost, and the position this subscription
+// reached is still the one to come back with.
 func (sub *Subscription) Next() (metastore.Change, error) {
 	if sub.stream.failed != nil {
 		return metastore.Change{}, sub.stream.failed
@@ -178,6 +210,8 @@ func (sub *Subscription) Next() (metastore.Change, error) {
 				fmt.Errorf("the stream began again at position %d, and a stream begins once", *start.Position)))
 		}
 		return metastore.Change{}, sub.stream.fail(&RebuildError{Reason: start.Rebuild})
+	case eventGone:
+		return metastore.Change{}, sub.stream.fail(ErrServerStopping)
 	case eventFault:
 		return metastore.Change{}, sub.stream.fail(unreachable(sub.stream.req, faultOf(data)))
 	default:

@@ -208,6 +208,16 @@ func logStatements() []string {
 		// logs both sitting at 1 is entirely possible. A random value makes "does not match,
 		// so rebuild" the only branch there is.
 		//
+		// trimmed_through is the newest position the trim has discarded, and 0 while it has
+		// discarded nothing. It is what decides whether a returning replica can carry on, and
+		// the oldest surviving entry cannot decide it: the position sequence is shared with
+		// every other namespace in this database, so a namespace's own positions are spread by
+		// however much its neighbours were written to in between. Reading resumability off
+		// that distance sends replicas that had missed nothing away to walk the whole tree
+		// again — and a namespace whose first change is not position 1, which is every
+		// namespace but the first one written here, would send away even a replica that had
+		// applied nothing at all.
+		//
 		// trimmed_by_age records which dimension pushed the oldest entries out, because age
 		// and volume say different things to whoever is holding the pager: age means that
 		// caller was away too long, volume means the namespace changes faster than the log
@@ -216,6 +226,7 @@ func logStatements() []string {
 			namespace          INTEGER PRIMARY KEY REFERENCES namespaces(id),
 			incarnation        TEXT    NOT NULL,
 			committed_position INTEGER NOT NULL,
+			trimmed_through    INTEGER NOT NULL,
 			trimmed_by_age     INTEGER NOT NULL
 		)`,
 	}
@@ -414,7 +425,7 @@ func createLog(ctx context.Context, tx *sql.Tx, namespace int64) error {
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO logs (namespace, incarnation, committed_position, trimmed_by_age)
-		VALUES (?, ?, 0, 0)`, namespace, string(incarnation))
+		INSERT INTO logs (namespace, incarnation, committed_position, trimmed_through, trimmed_by_age)
+		VALUES (?, ?, 0, 0, 0)`, namespace, string(incarnation))
 	return err
 }
