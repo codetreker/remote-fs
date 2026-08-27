@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"sync"
 	"syscall"
 	"time"
@@ -200,19 +201,29 @@ func (h *Handler) serveEvents(w http.ResponseWriter, r *http.Request, from *resu
 		return
 	}
 
+	// A stream that cannot be given a write deadline cannot be ended from outside itself,
+	// and this one has to be: it will spend unbounded time inside a write to a replica that
+	// has stopped reading, and a shutdown waiting on that waits for as long as that replica
+	// cares to say nothing. Refused rather than served unbounded, exactly as a picture is.
+	if err := boundedWrites(w); err != nil {
+		writeStorageError(w, fmt.Errorf("this server cannot bound a write to a stream, so a stream could not be ended when it stops: %w", err))
+		return
+	}
+
 	// Past here the response is a success and a stream, so nothing below can report a
 	// status and everything that goes wrong travels as a fault frame.
 	out, err := openStream(w)
 	if err != nil {
 		return
 	}
+	defer out.endWritesWhen(h.stopping)()
 	if err := out.send(eventStart, start); err != nil {
 		return
 	}
 	if start.Rebuild != "" {
 		return
 	}
-	if err := h.publish(ctx, out, at, woken); err != nil {
+	if err := h.publish(ctx, out, at, woken); err != nil && !h.endedByStop(err) {
 		out.fault(err)
 	}
 }
@@ -291,10 +302,14 @@ func rebuildFor(at metastore.Position, retention metastore.Retention) RebuildRea
 //
 // No change waits for an interval to come round. The inner loop reads the log until it has
 // nothing more, and the outer one blocks until this server changes the namespace or the
-// replica goes away. A subscriber too slow to keep up blocks its own write and nothing else;
-// there is deliberately no deadline on that write, because a change stream is meant to stay
-// open with nothing on it, and a stalled one costs a goroutine and a connection rather than
-// anything inside the store.
+// replica goes away.
+//
+// A subscriber too slow to keep up blocks its own write, and a subscriber that has stopped
+// reading altogether blocks it for good — which is not a rare state but the designed one, as
+// a replica does not read its change stream while it is filling a picture. The write carries
+// no deadline of its own, because a stream is meant to stay open with nothing on it and any
+// deadline would sever the healthy case. What ends it is the server stopping, and that
+// reaches a write in flight rather than only the moment between two of them.
 //
 // The one thing that does happen on a timer is the keepalive, and it carries nothing: a
 // stream that has said nothing for a while is indistinguishable from a stream that is no
@@ -400,6 +415,8 @@ func (h *Handler) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 		snap.Close()
 		return
 	}
+	defer out.endWritesWhen(h.stopping)()
+
 	position := int64(at)
 	if err := out.send(eventOpen, SnapshotOpen{Position: &position}); err != nil {
 		snap.Close()
@@ -417,7 +434,9 @@ func (h *Handler) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 		err = closeErr
 	}
 	if err != nil {
-		out.fault(err)
+		if !h.endedByStop(err) {
+			out.fault(err)
+		}
 		return
 	}
 	if stopping {
@@ -517,6 +536,26 @@ func (h *Handler) pages(ctx context.Context, out *frameWriter, snap metastore.Sn
 			return false, ctx.Err()
 		}
 	}
+}
+
+// boundedWrites reports whether writes to w can be given a deadline, which is what lets a
+// stream be ended from outside the write it is parked in.
+//
+// A zero time sets no deadline, so this asks the question without answering it: the streams
+// below set what they need afterwards.
+func boundedWrites(w http.ResponseWriter) error {
+	return http.NewResponseController(w).SetWriteDeadline(time.Time{})
+}
+
+// endedByStop reports whether a stream failed because this server cut it short on its way
+// out, rather than because of anything about the stream.
+//
+// A write ended that way has a deadline behind it that is still in the past, so a fault frame
+// explaining it could not be written either — and the explanation would be wrong in any case.
+// Nothing else may be swallowed here: the error has to be the deadline, and the server has to
+// be stopping, before either is read as the other.
+func (h *Handler) endedByStop(err error) bool {
+	return h.stopped() && errors.Is(err, os.ErrDeadlineExceeded)
 }
 
 // refuseUnreplicable answers a namespace that has no log at all.

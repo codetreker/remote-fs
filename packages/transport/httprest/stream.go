@@ -61,6 +61,58 @@ func openStream(w http.ResponseWriter) (*frameWriter, error) {
 	return f, f.control.Flush()
 }
 
+// departureGrace is how long a stream has to say it is going before it is cut off.
+//
+// A write completes as soon as the kernel accepts the bytes, so a stream anybody is reading
+// uses almost none of this: the frame is a few hundred bytes and there is room for it. A
+// stream nobody is reading cannot use it at all, because the buffers between the two ends
+// are already full — which is what makes the two cases sharply different rather than a
+// matter of degree, and this figure a formality rather than a tuning knob. It is paid once
+// by a shutdown, concurrently by every stream, and only by the streams that are stuck.
+const departureGrace = 100 * time.Millisecond
+
+// endWritesWhen makes whatever this stream is in the middle of writing fail shortly after
+// done is closed, and returns the function that takes the arrangement down again.
+//
+// Between frames a stream can be told to stop through an ordinary channel, and both loops
+// that drive one do exactly that. Inside a write there is no such moment. A reader that has
+// stopped consuming fills every buffer between the two ends, and the write then blocks until
+// they drain — which, for a reader that is not going to read again, is never. A deadline
+// already in the past is the only thing that reaches a write in that state, and a
+// connection's deadline may be set from another goroutine while a write on it is in flight,
+// which is what this relies on.
+//
+// It waits out departureGrace first, and stands down the moment the stream ends on its own.
+// Cutting immediately would race the frame the loop writes to say it is going, and win often
+// enough to turn a deliberate departure into a connection that merely stopped — the very
+// distinction the frame exists to draw.
+//
+// Once the deadline is set it stays set, so nothing further can be written to this stream.
+// That is the honest end of it: a reader that is not reading cannot be told anything, and
+// what it will find when it looks is a stream that stopped.
+func (f *frameWriter) endWritesWhen(done <-chan struct{}) (release func()) {
+	released, watched := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(watched)
+		select {
+		case <-released:
+			return
+		case <-done:
+		}
+		select {
+		case <-released:
+		case <-time.After(departureGrace):
+			// Its failure would mean the connection is already gone, in which case the
+			// write this exists to interrupt is failing of its own accord.
+			f.control.SetWriteDeadline(time.Now())
+		}
+	}()
+	return func() {
+		close(released)
+		<-watched
+	}
+}
+
 func (f *frameWriter) send(event string, payload any) error {
 	// Rendered whole before anything is written, so that a payload that will not encode
 	// cannot leave half a frame on a stream that has no way to retract it.

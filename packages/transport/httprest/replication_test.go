@@ -2088,3 +2088,27 @@ func TestAPictureEndedByAShutdownIsNotAnnouncedAsWhole(t *testing.T) {
 		t.Fatalf("a picture the server stopped part way through was announced as whole: %q", rest)
 	}
 }
+
+// A stream on a writer whose writes cannot be given a deadline cannot be ended from outside
+// the write it is parked in, and that is the one thing a stopping server has to be able to
+// do. It is refused rather than served unbounded, exactly as a picture is.
+func TestAStreamWhoseWritesCannotBeBoundedIsRefused(t *testing.T) {
+	log := newFakeLog()
+	log.record(created("a"))
+	backing, err := localdir.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := httprest.NewHandler(backing, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A recorder is a response writer with no deadline to set, which is the shape this has
+	// to refuse. Serving it would also park this test in a stream that never ends.
+	for _, op := range []httprest.Op{httprest.OpSubscribe, httprest.OpResubscribe} {
+		w := serve(t, h, httprest.Request{Op: op, Incarnation: log.incarnation, Position: 1}, nil)
+		if w.Code == 200 {
+			t.Fatalf("%s was answered with a stream by a server that cannot bound a write to one", op)
+		}
+	}
+}
