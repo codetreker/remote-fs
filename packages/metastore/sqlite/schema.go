@@ -90,24 +90,32 @@ func treeStatements() []string {
 		// it — so a page seeks straight to its cursor and reads this namespace and nothing
 		// else.
 		//
-		// Without it the namespace can only be filtered from the node on the far side of the
-		// join, and SQLite then chooses between two plans that both cost the whole table
-		// rather than the page: read every namespace's entries and discard the foreign ones
-		// one at a time, or drive from the node table and sort the namespace's rows again for
-		// every page. Which of the two it picks moves with the table statistics, with how many
-		// namespaces share the database, and with what other indexes exist — so the cost is
-		// not merely high, it changes shape as a database fills and as it is maintained. An
-		// index on nodes(namespace) does not rescue it: with that index present the planner
-		// takes the sorting plan, statistics or none.
+		// This key leaves the planner no choice to make. The namespace equality and the cursor
+		// range address one index, and that index supplies the ordering as well, so there is no
+		// join order to weigh and no sort to consider — the plan is a property of the key
+		// rather than a verdict that could be revisited. It held byte for byte across every
+		// combination tried: one namespace and twenty, tiny and four hundred thousand entries,
+		// with and without table statistics, and with and without an index on nodes(namespace).
+		// TestAPictureIsPagedByRangeRatherThanByScanningAndSorting holds it there in the two
+		// worlds a test can build.
 		//
-		// This key leaves no such choice to make, because the namespace equality and the
-		// cursor range address one index and that index supplies the ordering as well.
-		// Measured across one namespace and twenty, with and without table statistics, and
-		// with and without an index on nodes(namespace), the plan is the same in every
-		// combination; TestAPictureIsPagedByRangeRatherThanByScanningAndSorting holds it there
-		// in the two worlds a test can build. The plan is where this claim is checkable — what
-		// it costs depends on the machine, the cache and the shape of the tree, and none of
-		// those belong in a comment.
+		// Without the namespace in the key it can only be filtered from the node on the far
+		// side of the join, and SQLite then has a choice between two plans that both cost the
+		// whole table rather than the page: read every namespace's entries and discard the
+		// foreign ones one at a time, or drive from the node table and sort the namespace's
+		// rows again for every page. Which one it took varied, in the shapes measured, with
+		// the table statistics, with how many namespaces shared the database, and with what
+		// other indexes existed — so the cost is not merely high, it changes shape as a
+		// database fills and as it is maintained. Adding an index on nodes(namespace) did not
+		// recover it in any shape tried: it moved the planner into the sorting plan rather
+		// than away from it, with statistics and without.
+		//
+		// Those last two are what was measured over the combinations above rather than
+		// statements about how SQLite chooses, and a later measurement may narrow them. The
+		// sentence this key rests on is the first one, and it does not depend on them.
+		//
+		// The plan is where all of this is checkable — what it costs depends on the machine,
+		// the cache and the shape of the tree, and none of those belong in a comment.
 		//
 		// The namespace column is therefore redundant with nodes.namespace, and every
 		// statement that writes an entry keeps the two equal.

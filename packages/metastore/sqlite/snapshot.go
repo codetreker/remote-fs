@@ -112,13 +112,27 @@ func (p *snapshot) Next(ctx context.Context, limit int) ([]metastore.Row, bool, 
 // others. The ordering falls out of the same key, so no page sorts anything.
 //
 // The cursor is a row value rather than the `parent > ? OR (parent = ? AND name > ?)` that
-// says the same thing, and the difference is not cosmetic: SQLite will not treat the
-// spelled-out form as a range over the key at all when its operands are bound parameters.
-// Put the long form back and EXPLAIN QUERY PLAN drops both cursor columns, leaving
-// `SEARCH e USING PRIMARY KEY (namespace=?)` — the namespace still bounds the search, so a
-// page reads this namespace's entries and no others, but it reads them from the first one
-// every time and tests the cursor row by row. That is the same page cost the whole picture
-// pays over again for each page.
+// says the same thing, and what separates them is not syntax but what the planner can prove.
+// Three placeholders are three unrelated values as far as it knows, so nothing ties the
+// second to the first and nothing constrains parent at all. Write the same predicate with one
+// parameter referenced twice and it can prove them equal, and constrains parent but not name.
+// A row value constrains both. Measured against modernc.org/sqlite v1.57.0 over a database of
+// eighty entries and one of four hundred thousand, with and without table statistics, the
+// four spellings give three different plans:
+//
+//	(parent, name) > (?, ?)                      PRIMARY KEY (namespace=? AND (parent,name)>(?,?))
+//	parent > ?  OR (parent = ?  AND name > ?)    PRIMARY KEY (namespace=?)
+//	parent > ?2 OR (parent = ?2 AND name > ?3)   PRIMARY KEY (namespace=? AND parent>?)
+//	parent > ?2 OR (parent = ?3 AND name > ?4)   PRIMARY KEY (namespace=?)
+//
+// The second line is what a page costs without the row value: the namespace still bounds the
+// search, so no foreign row is read, but every page starts at this namespace's first entry
+// and tests the cursor row by row. The fourth line is the control that says which thing is
+// doing the work — numbering the parameters changes nothing on its own.
+//
+// Anyone rewriting this predicate should check which line they landed on rather than which
+// one they meant. An equivalent-looking rewrite is a different query here, and it is a
+// difference no result distinguishes.
 //
 // TestAPictureIsPagedByRangeRatherThanByScanningAndSorting asserts the plan this produces,
 // with and without table statistics.
