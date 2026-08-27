@@ -1,6 +1,7 @@
 package sqlite_test
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 	"testing"
@@ -12,7 +13,8 @@ import (
 )
 
 // A picture pages the tree, and what a page costs is decided entirely by the plan SQLite
-// chooses for one statement. This asserts that plan.
+// chooses for one statement. This asserts that plan, both against a database that has been
+// analysed and against one that has not.
 //
 // A plan rather than a clock, because the defect this guards against is not one a correct
 // answer distinguishes: the query returned exactly the right rows when it took ten minutes
@@ -22,11 +24,14 @@ import (
 // term is invisible until the picture is large. The plan is the property itself, and it reads
 // the same on every machine.
 //
-// Two phrases are what the assertions turn on. SCAN says a table is being read end to end
-// rather than sought into, so a page is paying for rows it will discard. USE TEMP B-TREE FOR
-// ORDER BY says the rows are being sorted after they are found, and since a page sorts
-// everything it might return before taking its slice, that sort is repeated for every page of
-// the picture — which is the quadratic term.
+// Both worlds, because statistics decide plans and nothing in this package ever runs ANALYZE:
+// a served database has no sqlite_stat1 at all, so the unanalysed plan is the one that ships,
+// while a database somebody has analysed by hand is one this store must still serve well. The
+// two are not the same planner. Measured against modernc.org/sqlite v1.57.0, filtering the
+// namespace on the joined node instead of on the entry gives `SCAN n` with a sort without
+// statistics and a skip-scan of the entry key with a sort with them — one query, one tree, two
+// plans. Asserting only the analysed one would leave the shipped planner unguarded, and it was
+// the statistics-dependence of the alternatives that decided this key in the first place.
 func TestAPictureIsPagedByRangeRatherThanByScanningAndSorting(t *testing.T) {
 	path := database(t)
 	store := open(t, path, "workspace", 0)
@@ -45,11 +50,29 @@ func TestAPictureIsPagedByRangeRatherThanByScanningAndSorting(t *testing.T) {
 	}
 
 	db := raw(t, path)
-	// ANALYZE, because without statistics the planner is choosing from guesses and the plan a
-	// test saw would not be the plan a served database gets.
+	// Unanalysed first, because ANALYZE cannot be undone within one database and that is the
+	// order the two worlds exist in: every database starts without statistics, and the shipped
+	// store never gives it any. Each is its own verdict, so neither hides the other's answer.
+	t.Run("without statistics", func(t *testing.T) {
+		assertPagePlan(t, db)
+	})
 	if _, err := db.Exec(`ANALYZE`); err != nil {
 		t.Fatal(err)
 	}
+	t.Run("with statistics", func(t *testing.T) {
+		assertPagePlan(t, db)
+	})
+}
+
+// assertPagePlan reads the plan for one page and holds it to the shape a range gives.
+//
+// Two phrases are what the assertions turn on. SCAN says a table is being read end to end
+// rather than sought into, so a page is paying for rows it will discard. USE TEMP B-TREE FOR
+// ORDER BY says the rows are being sorted after they are found, and since a page sorts
+// everything it might return before taking its slice, that sort is repeated for every page of
+// the picture — which is the quadratic term.
+func assertPagePlan(t *testing.T, db *sql.DB) {
+	t.Helper()
 	rows, err := db.Query(`EXPLAIN QUERY PLAN `+sqlite.PageQuery, 1, int64(0), []byte{}, 1024)
 	if err != nil {
 		t.Fatal(err)

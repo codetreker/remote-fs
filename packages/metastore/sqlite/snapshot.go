@@ -113,12 +113,15 @@ func (p *snapshot) Next(ctx context.Context, limit int) ([]metastore.Row, bool, 
 //
 // The cursor is a row value rather than the `parent > ? OR (parent = ? AND name > ?)` that
 // says the same thing, and the difference is not cosmetic: SQLite will not treat the
-// spelled-out form as a range over both key columns when its operands are bound parameters.
-// Put the long form back and EXPLAIN QUERY PLAN drops the name from the range, leaving
-// `SEARCH e USING PRIMARY KEY (namespace=? AND parent>?)` — every page then re-reads the
-// whole of the current directory to find where it left off.
+// spelled-out form as a range over the key at all when its operands are bound parameters.
+// Put the long form back and EXPLAIN QUERY PLAN drops both cursor columns, leaving
+// `SEARCH e USING PRIMARY KEY (namespace=?)` — the namespace still bounds the search, so a
+// page reads this namespace's entries and no others, but it reads them from the first one
+// every time and tests the cursor row by row. That is the same page cost the whole picture
+// pays over again for each page.
 //
-// TestAPictureIsPagedByRangeRatherThanByScanningAndSorting asserts the plan this produces.
+// TestAPictureIsPagedByRangeRatherThanByScanningAndSorting asserts the plan this produces,
+// with and without table statistics.
 const pageQuery = `
 	SELECT e.parent, e.name, ` + nodeColumns + `
 	FROM entries e JOIN nodes n ON n.id = e.node
