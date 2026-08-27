@@ -751,8 +751,8 @@ func drain(t *testing.T, s metastore.Store, after metastore.Position) []metastor
 	for {
 		changes, retention, err := s.Since(ctx(t), after, 64)
 		mustSucceed(t, err)
-		if retention.Oldest > after+1 {
-			t.Fatalf("the log's oldest entry is %d, so a caller at %d has fallen out of the window", retention.Oldest, after)
+		if retention.TrimmedThrough > after {
+			t.Fatalf("the log has discarded through %d, so a caller at %d has lost changes it needed", retention.TrimmedThrough, after)
 		}
 		if len(changes) == 0 {
 			if after != retention.Tail {

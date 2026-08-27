@@ -1070,8 +1070,11 @@ func TestAFrameMissingWhatItCarriesIsRefused(t *testing.T) {
 			"nothing missed and a backlog at once":               {"incarnation": "a-log", "position": 4, "tail": 4, "caught_up": false},
 			"a rebuild reason nobody knows":                      {"rebuild": "because"},
 			"a rebuild carrying a position":                      {"rebuild": "age", "position": 4},
-			"a rebuild carrying what to do":                      {"rebuild": "age", "incarnation": "a-log", "caught_up": true},
-			"an empty object saying nothing":                     {},
+			// A tail is a thing to measure progress against, and a replica told to rebuild
+			// has no progress left to measure: everything it held is worth nothing.
+			"a rebuild carrying a tail":      {"rebuild": "age", "tail": 9},
+			"a rebuild carrying what to do":  {"rebuild": "age", "incarnation": "a-log", "caught_up": true},
+			"an empty object saying nothing": {},
 		}
 		for name, fields := range refused {
 			t.Run(name, func(t *testing.T) {
@@ -1759,14 +1762,7 @@ func TestAReplicaBehindTheCutIsToldToRebuild(t *testing.T) {
 // that the stream ends, and that what ends it says which of the two it was.
 func TestStoppingAServerTellsItsReplicasRatherThanBreakingTheirStreams(t *testing.T) {
 	log := newFakeLog()
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	h, err := httprest.NewHandler(recording{Storage: backing, log: log}, log)
-	if err != nil {
-		t.Fatal(err)
-	}
+	h := mustHandler(t, log)
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 	srv.Config.RegisterOnShutdown(h.Stop)
@@ -1815,6 +1811,38 @@ func TestStoppingAServerTellsItsReplicasRatherThanBreakingTheirStreams(t *testin
 	if _, again := sub.Next(); !errors.Is(again, httprest.ErrServerStopping) {
 		t.Fatalf("reading the stream again gave %v, want the same answer", again)
 	}
+
+	// And the point of all of it: what the replica was holding is still good against the
+	// server that comes up next. A restart that cost every mount a full snapshot would be
+	// the thing this is here to avoid, and the log is what outlives the process.
+	restarted := httptest.NewServer(mustHandler(t, log))
+	defer restarted.Close()
+	next, err := httprest.Dial(restarted.URL, restarted.Client())
+	if err != nil {
+		t.Fatalf("dial the restarted server: %v", err)
+	}
+	resumed, err := next.Resubscribe(t.Context(), sub.Incarnation(), sub.Position())
+	if err != nil {
+		t.Fatalf("resuming after a restart with the incarnation and position the stream left off at: %v", err)
+	}
+	defer resumed.Close()
+	if resumed.Position() != sub.Position() {
+		t.Fatalf("the resumed stream begins at %d, want the %d the stopped one left off at", resumed.Position(), sub.Position())
+	}
+}
+
+// mustHandler builds a handler over a log and a fresh directory.
+func mustHandler(t *testing.T, log metastore.Log) *httprest.Handler {
+	t.Helper()
+	backing, err := localdir.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := httprest.NewHandler(backing, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
 }
 
 // Stopping is safe to ask for twice, and means nothing to a namespace that has no streams
@@ -1831,4 +1859,48 @@ func TestStoppingTwiceAndStoppingAnUnreplicableNamespaceAreBothHarmless(t *testi
 	}
 	h.Stop()
 	h.Stop()
+}
+
+// A replica that is behind has to be able to learn that it has stopped being behind, and a
+// stream carrying only its starting position cannot tell it: a stream with nothing left to
+// replay and one that has not begun replaying look identical from the reading end. The tail
+// the log had reached is what closes that, so it has to arrive and it has to be the log's.
+func TestAStreamSaysHowFarTheLogHadGot(t *testing.T) {
+	log := newFakeLog()
+	for _, name := range []string{"a", "b", "c", "d"} {
+		log.record(created(name))
+	}
+	s := serveLog(t, log, httprest.DefaultLimits())
+
+	// Two changes behind: the stream begins at 2 and the log had reached 4, so the replica
+	// knows both that it is behind and exactly where being current is.
+	behind := watch(t, s, func() (*httprest.Subscription, error) {
+		return s.Resubscribe(t.Context(), log.incarnation, 2)
+	})
+	if behind.Tail() != 4 {
+		t.Fatalf("a stream beginning at %d reports the log's tail as %d, want 4", behind.Position(), behind.Tail())
+	}
+	if behind.CaughtUp() {
+		t.Fatal("a replica two changes behind was told it had missed nothing")
+	}
+	// Applying up to the tail is the moment it is current again, and the positions it is
+	// given have to reach that tail for the claim to mean anything.
+	for range 2 {
+		change, err := behind.Next()
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if change.Position > behind.Tail() {
+			t.Fatalf("the stream delivered position %d, past the tail of %d it began by naming", change.Position, behind.Tail())
+		}
+	}
+
+	// At the tail, the two are the same fact and the replica has nothing to wait for.
+	current := watch(t, s, func() (*httprest.Subscription, error) { return s.Subscribe(t.Context()) })
+	if current.Tail() != current.Position() {
+		t.Fatalf("a stream beginning at the tail reports position %d and tail %d, want them equal", current.Position(), current.Tail())
+	}
+	if !current.CaughtUp() {
+		t.Fatal("a stream beginning at the tail was not reported as caught up")
+	}
 }

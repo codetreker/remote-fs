@@ -264,9 +264,9 @@ type verdict struct {
 // verdictFor compares a position against what the log still holds.
 //
 // The three answers are three different things for the replica to do, and the case that
-// makes them worth separating is a log that has discarded everything: Retention.Oldest is
-// then zero and says nothing, and only the tail can tell "you are caught up" from "you
-// missed all of it" — two answers that differ by a full rebuild of the replica.
+// makes them worth separating is a log that has discarded everything: what it still holds
+// is then nothing at all, and only the tail can tell "you are caught up" from "you missed
+// all of it" — two answers that differ by a full rebuild of the replica.
 //
 // The middle test asks what was discarded rather than what survives, and the difference
 // between those two is the whole reason Retention carries both. A replica has missed

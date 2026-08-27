@@ -319,7 +319,7 @@ func (s *StreamStart) UnmarshalJSON(data []byte) error {
 		if !rebuildReasons[got.Rebuild] {
 			return fmt.Errorf("the stream must be rebuilt for the reason %q, which this side does not know", got.Rebuild)
 		}
-		if got.Position != nil || got.CaughtUp != nil || got.Incarnation != "" {
+		if got.Position != nil || got.Tail != nil || got.CaughtUp != nil || got.Incarnation != "" {
 			return errors.New("the stream must be rebuilt, and the frame carries a place to continue from anyway")
 		}
 		*s = got

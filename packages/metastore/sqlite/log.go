@@ -317,6 +317,13 @@ func trim(ctx context.Context, tx *sql.Tx, namespace int64, window Window) error
 	// instead would be working it out from a distance that the other namespaces in this
 	// database set, which is a fact about them rather than about this replica.
 	//
+	// What makes it usable is that it is a position this namespace actually held and no longer
+	// does, rather than a bound the DELETE was phrased with. Both candidates above are read out
+	// of the table — nthOldest returns the nth entry's own position, and lastBefore returns the
+	// newest position among the entries older than an instant rather than the instant — so the
+	// larger of them is a row this statement is about to remove. That is what lets a replica
+	// below it be told, truthfully, that something it needed is gone.
+	//
 	// Alongside it, which dimension pushed the oldest entries out, for whoever is told they
 	// fell out of the window: age says that caller was away too long, volume says the
 	// namespace changes faster than the log was configured to hold. When both would have cut

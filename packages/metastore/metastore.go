@@ -334,7 +334,14 @@ type Incarnation string
 // Retention is what a log still holds.
 type Retention struct {
 	// Oldest is the position of the oldest change still recorded, or 0 when the log holds
-	// nothing.
+	// nothing. It says what is here, which is a question worth being able to ask: whether a
+	// log has begun discarding at all, and how much of one is left.
+	//
+	// It is not how a caller decides whether it may carry on — TrimmedThrough is, and the
+	// two are not interchangeable. The distance between a caller's position and this is the
+	// distance to the oldest thing that *survived*, which in a store numbering several
+	// namespaces from one sequence is set by what the other namespaces were doing. Deciding
+	// from it sends callers that had missed nothing away to rebuild a whole tree.
 	Oldest Position
 
 	// Tail is the newest position recorded, whether or not the change at it is still
@@ -355,7 +362,15 @@ type Retention struct {
 	// to in the meantime. Deciding from that distance rejects callers that had missed
 	// nothing, and the cost of being wrong is a full rebuild of a tree.
 	//
-	// An implementation that discards nothing leaves this at 0, which admits every caller.
+	// It must be a position this log recorded and no longer holds — the newest such — and
+	// never a boundary some discard was expressed in terms of. The whole of its worth is
+	// that a caller below it has provably lost a change it needed, and a value that was
+	// merely an upper bound on what went, or a figure derived from when entries were
+	// written rather than from where they sat, would put callers who lost nothing below it
+	// and reintroduce exactly the rebuild this exists to remove.
+	//
+	// An implementation that discards nothing leaves this at 0, which admits every caller,
+	// including one that has applied nothing at all.
 	TrimmedThrough Position
 
 	// TrimmedByAge reports whether anything was discarded for being old rather than for
