@@ -247,8 +247,7 @@ func (h *Handler) startOf(ctx context.Context, incarnation metastore.Incarnation
 // whether anything is about to be replayed and when it will have been.
 func startAt(incarnation metastore.Incarnation, at, tail metastore.Position) StreamStart {
 	position, reached := int64(at), int64(tail)
-	caughtUp := at == tail
-	return StreamStart{Incarnation: string(incarnation), Position: &position, Tail: &reached, CaughtUp: &caughtUp}
+	return StreamStart{Incarnation: string(incarnation), Position: &position, Tail: &reached}
 }
 
 // verdict is what a log can do for a replica sitting at some position.

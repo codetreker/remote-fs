@@ -137,7 +137,6 @@ func (s *Storage) subscribe(ctx context.Context, req Request) (*Subscription, er
 		incarnation: metastore.Incarnation(start.Incarnation),
 		at:          metastore.Position(*start.Position),
 		tail:        metastore.Position(*start.Tail),
-		caughtUp:    *start.CaughtUp,
 	}, nil
 }
 
@@ -148,7 +147,6 @@ type Subscription struct {
 	incarnation metastore.Incarnation
 	at          metastore.Position
 	tail        metastore.Position
-	caughtUp    bool
 }
 
 // Incarnation names the run of history this stream belongs to. A caller records it beside
@@ -161,7 +159,11 @@ func (sub *Subscription) Position() metastore.Position { return sub.at }
 
 // CaughtUp reports that nothing had been missed, so no change is replayed before the live
 // ones begin. A stream opened by Subscribe is always caught up: it begins at the tail.
-func (sub *Subscription) CaughtUp() bool { return sub.caughtUp }
+//
+// It is Position and Tail compared rather than anything the server sent beside them. Derived
+// here, it cannot disagree with them; sent, it could, and a frame saying both that nothing
+// was missed and that something is still to come calls for opposite treatment of the copy.
+func (sub *Subscription) CaughtUp() bool { return sub.at == sub.tail }
 
 // Tail is how far the log had reached when the stream began. Everything between Position and
 // it is replayed before the live changes, so a caller that was behind knows from it when it

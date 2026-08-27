@@ -300,11 +300,10 @@ type StreamStart struct {
 	// answered from. Without it a replica knows it is behind and has no way to learn that it
 	// no longer is, since a stream with nothing left to replay and a stream that has not
 	// begun replaying look the same from the reading end.
+	// Whether anything was missed is this and Position compared, and is not sent beside
+	// them: it is one fact, and stating it twice buys nothing but a frame that can
+	// contradict itself.
 	Tail *int64 `json:"tail,omitempty"`
-
-	// CaughtUp reports that the replica had missed nothing, so no change is replayed
-	// before the live ones begin.
-	CaughtUp *bool `json:"caught_up,omitempty"`
 }
 
 // UnmarshalJSON decodes the frame and refuses one that is neither shape whole.
@@ -319,7 +318,7 @@ func (s *StreamStart) UnmarshalJSON(data []byte) error {
 		if !rebuildReasons[got.Rebuild] {
 			return fmt.Errorf("the stream must be rebuilt for the reason %q, which this side does not know", got.Rebuild)
 		}
-		if got.Position != nil || got.Tail != nil || got.CaughtUp != nil || got.Incarnation != "" {
+		if got.Position != nil || got.Tail != nil || got.Incarnation != "" {
 			return errors.New("the stream must be rebuilt, and the frame carries a place to continue from anyway")
 		}
 		*s = got
@@ -334,21 +333,13 @@ func (s *StreamStart) UnmarshalJSON(data []byte) error {
 	if got.Position == nil {
 		return errors.New("the stream names no position to begin at")
 	}
-	if got.CaughtUp == nil {
-		return errors.New("the stream does not say whether anything was missed")
-	}
 	if got.Tail == nil {
 		return errors.New("the stream does not say how far the log had reached, so nothing could tell when it has been caught up with")
 	}
+	// A tail behind the position the stream begins at describes a log that has not reached
+	// what it is about to deliver, which is nothing a replica can act on.
 	if *got.Tail < *got.Position {
 		return fmt.Errorf("the stream begins at position %d, past the log's tail at %d", *got.Position, *got.Tail)
-	}
-	// The two are one fact stated twice, and a frame where they disagree is one this side
-	// cannot act on: it would be told both that nothing was missed and that something is
-	// still to come, and the two call for opposite treatment of the copy.
-	if caughtUp := *got.Tail == *got.Position; caughtUp != *got.CaughtUp {
-		return fmt.Errorf("the stream begins at position %d with the log's tail at %d, and says it is %v that nothing was missed",
-			*got.Position, *got.Tail, *got.CaughtUp)
 	}
 	*s = got
 	return nil

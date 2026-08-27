@@ -897,7 +897,7 @@ func TestASnapshotThatStopsIsNotACompletePicture(t *testing.T) {
 // rather than that the namespace has settled. A replica that read the second as the first
 // would sit on a copy it believes is current, indefinitely.
 func TestAChangeStreamThatEndsIsAFailure(t *testing.T) {
-	start := frame("start", `{"incarnation":"a-log","position":4,"tail":4,"caught_up":true}`)
+	start := frame("start", `{"incarnation":"a-log","position":4,"tail":4}`)
 	cases := map[string]string{
 		"nothing follows the start":      start,
 		"a change and then nothing":      start + frame("change", `{"position":5,"kind":"removed","parent":1,"name":"YQ=="}`),
@@ -1056,24 +1056,21 @@ func TestAFrameMissingWhatItCarriesIsRefused(t *testing.T) {
 			// An empty incarnation matches every position every replica ever held, so a
 			// replica holding one would be told it was caught up by a log that had lost
 			// its history.
-			"no incarnation":                {"position": 4, "tail": 4, "caught_up": true},
-			"no position":                   {"incarnation": "a-log", "tail": 4, "caught_up": true},
-			"nothing about what was missed": {"incarnation": "a-log", "position": 4, "tail": 4},
+			"no incarnation": {"position": 4, "tail": 4},
+			"no position":    {"incarnation": "a-log", "tail": 4},
 			// Without the log's tail a replica that is behind has no way to learn that it
 			// has stopped being behind, and would answer from a copy it knows is missing
 			// changes.
-			"nothing about how far the log had got": {"incarnation": "a-log", "position": 4, "caught_up": true},
-			// The two say one thing twice, and a frame where they disagree tells this side
-			// both that nothing was missed and that something is still to come.
-			"a tail behind the position where the stream begins": {"incarnation": "a-log", "position": 4, "tail": 3, "caught_up": false},
-			"a backlog and nothing missed at once":               {"incarnation": "a-log", "position": 4, "tail": 9, "caught_up": true},
-			"nothing missed and a backlog at once":               {"incarnation": "a-log", "position": 4, "tail": 4, "caught_up": false},
+			"nothing about how far the log had got": {"incarnation": "a-log", "position": 4},
+			// A log that has not reached what the stream is about to deliver is nothing a
+			// replica can act on.
+			"a tail behind the position where the stream begins": {"incarnation": "a-log", "position": 4, "tail": 3},
 			"a rebuild reason nobody knows":                      {"rebuild": "because"},
 			"a rebuild carrying a position":                      {"rebuild": "age", "position": 4},
 			// A tail is a thing to measure progress against, and a replica told to rebuild
 			// has no progress left to measure: everything it held is worth nothing.
 			"a rebuild carrying a tail":      {"rebuild": "age", "tail": 9},
-			"a rebuild carrying what to do":  {"rebuild": "age", "incarnation": "a-log", "caught_up": true},
+			"a rebuild carrying what to do":  {"rebuild": "age", "incarnation": "a-log"},
 			"an empty object saying nothing": {},
 		}
 		for name, fields := range refused {
@@ -1085,8 +1082,8 @@ func TestAFrameMissingWhatItCarriesIsRefused(t *testing.T) {
 			})
 		}
 		for name, fields := range map[string]map[string]any{
-			"a stream that is caught up": {"incarnation": "a-log", "position": 4, "tail": 4, "caught_up": true},
-			"a stream with a backlog":    {"incarnation": "a-log", "position": 4, "tail": 9, "caught_up": false},
+			"a stream that is caught up": {"incarnation": "a-log", "position": 4, "tail": 4},
+			"a stream with a backlog":    {"incarnation": "a-log", "position": 4, "tail": 9},
 			"a rebuild":                  {"rebuild": "volume"},
 		} {
 			t.Run(name, func(t *testing.T) {
@@ -1317,7 +1314,7 @@ func TestAFaultNobodyCanReadIsStillAFailure(t *testing.T) {
 // something this side has no reading for, and guessing at it would have the replica carry
 // on from a position nothing agreed on.
 func TestAStreamThatBeginsTwiceIsRefused(t *testing.T) {
-	start := frame("start", `{"incarnation":"a-log","position":4,"tail":4,"caught_up":true}`)
+	start := frame("start", `{"incarnation":"a-log","position":4,"tail":4}`)
 	s := streamOf(t, start+start)
 	sub, err := s.Subscribe(t.Context())
 	if err != nil {
@@ -1475,7 +1472,7 @@ func TestAChangeThatCannotBeNamedEndsTheStreamRatherThanBeingGuessedAt(t *testin
 // A frame on a change stream that is not one, or is one that does not decode, ends the
 // stream rather than being skipped past. A skipped change is a permanent hole in a replica.
 func TestAFrameAChangeStreamCannotUseEndsIt(t *testing.T) {
-	start := frame("start", `{"incarnation":"a-log","position":4,"tail":4,"caught_up":true}`)
+	start := frame("start", `{"incarnation":"a-log","position":4,"tail":4}`)
 	cases := map[string]string{
 		"a change that does not decode": start + frame("change", `{"position":5,"kind":"created","parent":1,"name":"YQ=="}`),
 		"a change that is not JSON":     start + frame("change", "not json"),
