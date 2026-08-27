@@ -91,18 +91,23 @@ func treeStatements() []string {
 		// else.
 		//
 		// Without it the namespace can only be filtered from the node on the far side of the
-		// join, and both plans SQLite has for that cost the whole table rather than the page:
-		// read every namespace's entries and discard the foreign ones one at a time, or drive
-		// from the node table and sort the namespace's rows again for every page. Which one it
-		// picks depends on the statistics, so the cost is not merely high, it changes shape as
-		// a database fills. An index on nodes(namespace) does not settle it — it gives the
-		// planner a cheaper-looking route into the sorting plan, and a database holding
-		// several namespaces then takes that route.
+		// join, and SQLite then chooses between two plans that both cost the whole table
+		// rather than the page: read every namespace's entries and discard the foreign ones
+		// one at a time, or drive from the node table and sort the namespace's rows again for
+		// every page. Which of the two it picks moves with the table statistics, with how many
+		// namespaces share the database, and with what other indexes exist — so the cost is
+		// not merely high, it changes shape as a database fills and as it is maintained. An
+		// index on nodes(namespace) does not rescue it: with that index present the planner
+		// takes the sorting plan, statistics or none.
 		//
-		// TestAPictureIsPagedByRangeRatherThanByScanningAndSorting holds the plan to the range
-		// and refuses both of the others. The plan is where this claim is checkable: what it
-		// costs depends on the machine, the cache and the shape of the tree, and none of those
-		// belong in a comment.
+		// This key leaves no such choice to make, because the namespace equality and the
+		// cursor range address one index and that index supplies the ordering as well.
+		// Measured across one namespace and twenty, with and without table statistics, and
+		// with and without an index on nodes(namespace), the plan is the same in every
+		// combination; TestAPictureIsPagedByRangeRatherThanByScanningAndSorting holds it there
+		// in the two worlds a test can build. The plan is where this claim is checkable — what
+		// it costs depends on the machine, the cache and the shape of the tree, and none of
+		// those belong in a comment.
 		//
 		// The namespace column is therefore redundant with nodes.namespace, and every
 		// statement that writes an entry keeps the two equal.
