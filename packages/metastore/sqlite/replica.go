@@ -92,11 +92,17 @@ func (r *Replica) Position() metastore.Position {
 // file lives is the caller's decision, and so is when it stops existing.
 func (r *Replica) Close() error { return r.store.Close() }
 
-// Apply brings the copy forward by one change.
+// Apply brings the copy forward by one change, and reports whether the change was new to it.
 //
 // A change at a position this copy already holds is discarded rather than applied again, and
 // that one rule is what makes a replica's own echo free of charge: the change it caused
 // arrives on the stream like any other, and either it is new to this copy or it is not.
+//
+// Which of the two it was is reported rather than left to be inferred, because the caller
+// keeps its own account of what the copy holds. A caller that took every change it delivered
+// as applied would move that account onto a position this copy never reached — backwards,
+// where a picture had already carried it further — and would then answer questions about
+// changes the copy discarded.
 //
 // Nothing here tolerates a change that does not find what it describes. A rename whose source
 // is missing, a modification of a node this copy does not hold and a removal of a name that
@@ -104,27 +110,27 @@ func (r *Replica) Close() error { return r.store.Close() }
 // having quietly not applied something: there is no revalidation behind these changes and no
 // timeout that repairs one. The consistent picture is what makes the strictness safe — every
 // change after it acts on something that picture already contained.
-func (r *Replica) Apply(ctx context.Context, change metastore.Change) error {
+func (r *Replica) Apply(ctx context.Context, change metastore.Change) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if change.Position <= r.at {
-		return nil
+		return false, nil
 	}
 	tx, err := r.store.write.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("applying the change at position %d: %w", change.Position, failure(err))
+		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, failure(err))
 	}
 	defer tx.Rollback()
 
 	if err := r.apply(ctx, tx, change); err != nil {
-		return fmt.Errorf("applying the change at position %d: %w", change.Position, failure(err))
+		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, failure(err))
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("applying the change at position %d: %w", change.Position, failure(err))
+		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, failure(err))
 	}
 	r.at = change.Position
-	return nil
+	return true, nil
 }
 
 func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change) error {

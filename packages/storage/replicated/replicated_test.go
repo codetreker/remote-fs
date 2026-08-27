@@ -3,6 +3,7 @@ package replicated_test
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -621,4 +622,246 @@ func TestAPictureMayTakeLongerThanTheStreamIsAllowedToBeQuiet(t *testing.T) {
 	requireCaughtUp(t, s, replica)
 	requireSameTree(t, walkSource(t, s), walkCopy(t, replica))
 	t.Logf("the picture took %v, and the stream beside it was quiet for all of it (allowed %v)", took, silence)
+}
+
+// TestACallerThatCannotConfirmItsChangeLeavesTheMountWorking.
+//
+// A mutation waits for its own change to come back, and it gives up after a while. What it
+// gives up on is that one call: the change happened, this side could not confirm it in time,
+// and it says so. What it must not do is declare the stream broken — a stream working through
+// a backlog looks exactly like this from here, and a mount that broke its own healthy stream
+// would reconnect to the same backlog and break it again. Worse, nothing would put it back:
+// the goroutine following the stream is inside a read that has not returned, so it never
+// reaches the reconnect that is the only thing that clears the failure, and the mount answers
+// EIO for the rest of its life.
+func TestACallerThatCannotConfirmItsChangeLeavesTheMountWorking(t *testing.T) {
+	const grace = 200 * time.Millisecond
+
+	s := serve(t, httprest.DefaultLimits())
+	write(t, s, "before.txt", "here before the mount")
+	// Every frame of the change stream held back for longer than a caller waits, so a
+	// mutation's own change cannot come back in time.
+	s.events.slowEvents(2 * grace)
+
+	mounted, replica := mountWithGrace(t, s, grace)
+
+	err := mounted.Write(t.Context(), "a.txt", []byte("written while the stream is slow"))
+	if err == nil {
+		t.Fatal("the write reported success, and its change had not come back")
+	}
+	requireErrno(t, "a write whose change could not be confirmed", err, syscall.EIO)
+	if !strings.Contains(err.Error(), "could not confirm") {
+		t.Fatalf("the write failed with %v, which does not say that the change was made and could not be confirmed", err)
+	}
+	t.Logf("Write: %v", err)
+
+	// The mount is still a mount. This is the assertion the whole test is for: everything
+	// below fails, forever, if giving up on one confirmation is taken for a broken stream.
+	if _, err := mounted.Stat(t.Context(), "before.txt"); err != nil {
+		t.Fatalf("stat after a write that could not be confirmed: %v", err)
+	}
+	if entries, err := mounted.List(t.Context(), ""); err != nil {
+		t.Fatalf("listing after a write that could not be confirmed: %v", err)
+	} else if len(entries) == 0 {
+		t.Fatal("the listing came back empty")
+	}
+
+	// And the change it could not confirm was real, and arrives.
+	t.Logf("unconfirmed → held by the copy: %v", requireHolding(t, mounted, "a.txt"))
+	requireCaughtUp(t, s, replica)
+	requireSameTree(t, walkSource(t, s), walkCopy(t, replica))
+
+	// And a mutation on a stream that is not being held back is confirmed as usual. The delay
+	// belongs to the stream it was opened with, so this takes a new one.
+	s.events.slowEvents(0)
+	s.events.cut()
+	requireUnusable(t, mounted)
+	s.events.mend()
+	requireHolding(t, mounted, "a.txt")
+
+	if err := mounted.Write(t.Context(), "b.txt", []byte("after")); err != nil {
+		t.Fatalf("writing on a stream that is not being held back: %v", err)
+	}
+	if attr, err := mounted.Stat(t.Context(), "b.txt"); err != nil || attr.Size != 5 {
+		t.Fatalf("stat straight after a confirmed write gave %+v, %v", attr, err)
+	}
+}
+
+// TestACopyIsNotAnsweredFromWhileItIsCatchingUp.
+//
+// Getting the stream back is not the same as being current again. The log says how far it had
+// reached when the stream was picked up, and everything between what the copy holds and that
+// is on its way but not here — so a copy answered from in between reports what a name held
+// before somebody else changed it, as fact. That is the stale answer R-ERR-1 and R-ERR-2
+// forbid, and it differs from ordinary steady state in the one way that matters: the gap is
+// known, not merely possible.
+func TestACopyIsNotAnsweredFromWhileItIsCatchingUp(t *testing.T) {
+	const stale = "old"
+	const current = "a great deal newer, and a different length"
+
+	s := serve(t, httprest.DefaultLimits())
+	write(t, s, "watched.txt", stale)
+	mounted, replica := mount(t, s)
+	if attr, err := mounted.Stat(t.Context(), "watched.txt"); err != nil || attr.Size != int64(len(stale)) {
+		t.Fatalf("stat before the outage gave %+v, %v", attr, err)
+	}
+
+	s.events.cut()
+	requireUnusable(t, mounted)
+
+	// The namespace moves on, and the last thing it does is change the name being watched.
+	for i := range 5 {
+		write(t, s, fmt.Sprintf("during-%d.txt", i), "written during the outage")
+	}
+	write(t, s, "watched.txt", current)
+
+	// Slowly enough that catching up is something a caller can be caught in the middle of.
+	s.events.slowEvents(100 * time.Millisecond)
+	s.events.mend()
+
+	// The first answer that is not a refusal has to be the current one. A copy that believed
+	// itself the moment it was attached again would answer with what it holds, which is what
+	// the name held before the outage.
+	refusals := 0
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		attr, err := mounted.Stat(t.Context(), "watched.txt")
+		if err == nil {
+			if attr.Size != int64(len(current)) {
+				t.Fatalf("the copy answered with %d bytes while it was still catching up; the name holds %d",
+					attr.Size, len(current))
+			}
+			break
+		}
+		requireErrno(t, "stat while the copy is catching up", err, syscall.EIO)
+		refusals++
+		if time.Now().After(deadline) {
+			t.Fatal("the copy never came back")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// A run in which the copy was never behind proves nothing about what it does when it is.
+	if refusals == 0 {
+		t.Fatal("the copy answered on the first attempt, so it was never seen catching up")
+	}
+	if resumed := s.calls.of(httprest.OpResubscribe); resumed == 0 {
+		t.Fatal("the stream came back without a resume, so this is not the catching-up path")
+	}
+	t.Logf("refused %d times while catching up, then answered with the current contents", refusals)
+
+	requireCaughtUp(t, s, replica)
+	requireSameTree(t, walkSource(t, s), walkCopy(t, replica))
+}
+
+// TestAChangeToTheRootIsConfirmedLikeAnyOther.
+//
+// The root is the one node a log names differently: it has no parent and no name, so a change
+// to it arrives under parent zero and no name, while every other node arrives under the id of
+// the directory holding it. A caller that named the root the way it names everything else
+// would wait for an event that had already arrived, give up after its whole grace, and report
+// EIO for a chmod of the mountpoint — an ordinary thing to do to a mountpoint.
+func TestAChangeToTheRootIsConfirmedLikeAnyOther(t *testing.T) {
+	const grace = 2 * time.Second
+
+	s := serve(t, httprest.DefaultLimits())
+	mounted, _ := mountWithGrace(t, s, grace)
+
+	mode := fs.FileMode(0o711)
+	started := time.Now()
+	if err := mounted.SetAttr(t.Context(), "", storage.AttrChange{Mode: &mode}); err != nil {
+		t.Fatalf("changing the root's mode: %v", err)
+	}
+	took := time.Since(started)
+
+	// It has to be confirmed by the event, not by the grace running out — and the grace here
+	// is long enough that waiting it out is unmistakable.
+	if took >= grace {
+		t.Fatalf("changing the root's mode took %v, which is the whole grace: its own change never matched", took)
+	}
+	attr, err := mounted.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatalf("stat of the root straight after changing its mode: %v", err)
+	}
+	if attr.Mode.Perm() != mode.Perm() {
+		t.Fatalf("the copy reports the root as %v straight after it was set to %v", attr.Mode, mode)
+	}
+	t.Logf("the root's mode was changed and confirmed in %v", took)
+}
+
+// TestAChangeTheCopyDiscardedReleasesNobody.
+//
+// A stream is attached before the picture is taken, so everything the picture already covered
+// arrives on it afterwards and is discarded. Those changes moved nothing. An account of where
+// the copy stands that took them for applied would run backwards — to a position the picture
+// had already carried it past — and a caller waiting for its own change to come back would
+// then be released by one of them: a change at the same name, newer than a position that has
+// been dragged backwards, and not in the copy at all. What the caller reads next is what the
+// name held before it wrote, which is R-CON-4 broken by bookkeeping.
+func TestAChangeTheCopyDiscardedReleasesNobody(t *testing.T) {
+	const written = "the contents this caller wrote, of a length nothing else here has"
+	const frame = 10 * time.Millisecond
+
+	s := serve(t, httprest.DefaultLimits())
+	write(t, s, "hot.txt", "before the picture")
+	// The picture is not taken until this test says so, and the stream is delivered slowly —
+	// so everything written in between is replayed and discarded, and is still being
+	// discarded while the write below waits.
+	release := s.events.holdBackPicture()
+	s.events.slowEvents(frame)
+
+	// One name, changed over and over, and every one of those changes lands before the
+	// picture is taken: nothing at that name is recorded after it, so what is replayed at
+	// that name is entirely changes the copy already holds. There are more of them than the
+	// stream carries in that time, so a good many are still on their way afterwards.
+	// Recorded straight into the namespace rather than through a request, so that how many of
+	// them there are does not depend on how fast requests happen to be: what has to be true is
+	// that there are more of them than the stream carries before the write below is made. The
+	// one request at the end is what tells the stream to read the log at all.
+	const changes = 60
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer release()
+		for s.calls.of(httprest.OpSubscribe) == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		for round := range changes {
+			if err := s.storage.Write(t.Context(), "hot.txt", []byte(strings.Repeat("x", round%17+1))); err != nil {
+				t.Errorf("writing before the picture: %v", err)
+				return
+			}
+		}
+		if err := s.elsewhere.Mkdir(t.Context(), "poke"); err != nil {
+			t.Errorf("waking the stream: %v", err)
+		}
+	}()
+
+	mounted, _ := mountWithGrace(t, s, 30*time.Second)
+	wg.Wait()
+
+	// Long enough that the replay is under way, so that a caller registering now reads
+	// whatever the replay has done to the account of where the copy stands.
+	time.Sleep(5 * frame)
+
+	started := time.Now()
+	if err := mounted.Write(t.Context(), "hot.txt", []byte(written)); err != nil {
+		t.Fatalf("writing hot.txt: %v", err)
+	}
+	took := time.Since(started)
+
+	attr, err := mounted.Stat(t.Context(), "hot.txt")
+	if err != nil {
+		t.Fatalf("stat hot.txt straight after writing it: %v", err)
+	}
+	if attr.Size != int64(len(written)) {
+		t.Fatalf("the copy reports hot.txt as %d bytes straight after %d were written: the write was released by a change the copy discarded",
+			attr.Size, len(written))
+	}
+	// Its own change is behind everything still being replayed, so a write that came back
+	// inside one frame did not wait for it.
+	if took < 5*frame {
+		t.Fatalf("the write was confirmed in %v, and the replay it is behind delivers a change every %v: nothing it waited for can have been its own change", took, frame)
+	}
+	t.Logf("the write waited %v, through a replay of changes at the same name that the copy discarded", took)
 }

@@ -84,8 +84,12 @@ func replay(t *testing.T, from *sqlite.Store, into *sqlite.Replica) {
 		t.Fatalf("reading the log: %v", err)
 	}
 	for _, change := range changes {
-		if err := into.Apply(t.Context(), change); err != nil {
+		applied, err := into.Apply(t.Context(), change)
+		if err != nil {
 			t.Fatalf("applying the change at position %d: %v", change.Position, err)
+		}
+		if !applied {
+			t.Fatalf("the change at position %d was discarded, and the copy stands at %d", change.Position, into.Position())
 		}
 	}
 }
@@ -310,7 +314,10 @@ func TestAChangeThatDoesNotFindWhatItDescribesIsRefused(t *testing.T) {
 		t.Run(c.name+" is refused", func(t *testing.T) {
 			c.change.Position = filled + metastore.Position(at) + 1
 			before := into.Position()
-			err := into.Apply(t.Context(), c.change)
+			applied, err := into.Apply(t.Context(), c.change)
+			if applied {
+				t.Fatal("the change was reported as applied")
+			}
 			if err == nil {
 				t.Fatal("the change was applied, and the copy now holds something the namespace never recorded")
 			}
@@ -345,10 +352,16 @@ func TestAChangeAtAPositionTheCopyAlreadyHoldsIsDiscarded(t *testing.T) {
 	at := into.Position()
 
 	// Every change again, in order. A copy that applied any of them a second time would fail
-	// on the first creation, and one that took the position back would replay the rest.
+	// on the first creation, and one that took the position back would replay the rest. Each
+	// one says it was discarded, which is what keeps the caller's own account of the copy
+	// from being moved by a change the copy did not take.
 	for _, change := range changes {
-		if err := into.Apply(t.Context(), change); err != nil {
+		applied, err := into.Apply(t.Context(), change)
+		if err != nil {
 			t.Fatalf("applying the change at position %d a second time: %v", change.Position, err)
+		}
+		if applied {
+			t.Fatalf("the change at position %d was applied a second time", change.Position)
 		}
 	}
 	if into.Position() != at {

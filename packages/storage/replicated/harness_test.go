@@ -230,7 +230,14 @@ type eventFaults struct {
 	// pictureDelay is how long each frame of a picture is held back, so that a namespace can
 	// be written to throughout one.
 	pictureDelay time.Duration
-	open         map[*http.Request]context.CancelFunc
+	// eventDelay is how long each frame of a change stream is held back, which is what a
+	// replica that is behind looks like: the stream is being delivered, and slowly.
+	eventDelay time.Duration
+	// pictureGate holds a request for a picture until it is closed, which puts the window
+	// between a stream being attached and the picture being taken under a test's control —
+	// the window whose changes a copy is told about twice and applies once.
+	pictureGate chan struct{}
+	open        map[*http.Request]context.CancelFunc
 }
 
 func (f *eventFaults) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -263,6 +270,7 @@ func (f *eventFaults) serveStream(w http.ResponseWriter, r *http.Request, resumi
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	f.open[r] = cancel
+	delay := f.eventDelay
 	f.mu.Unlock()
 
 	defer func() {
@@ -271,14 +279,21 @@ func (f *eventFaults) serveStream(w http.ResponseWriter, r *http.Request, resumi
 		f.mu.Unlock()
 		cancel()
 	}()
+	if delay > 0 {
+		f.handler.ServeHTTP(&heldBack{ResponseWriter: w, delay: delay}, r.WithContext(ctx))
+		return
+	}
 	f.handler.ServeHTTP(w, r.WithContext(ctx))
 }
 
 func (f *eventFaults) servePicture(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
-	refuse, delay := f.refusePicture, f.pictureDelay
+	refuse, delay, gate := f.refusePicture, f.pictureDelay, f.pictureGate
 	f.mu.Unlock()
 
+	if gate != nil {
+		<-gate
+	}
 	if refuse {
 		http.Error(w, "no picture of this tree can be taken", http.StatusServiceUnavailable)
 		return
@@ -300,6 +315,28 @@ type heldBack struct {
 func (h *heldBack) Write(p []byte) (int, error) {
 	time.Sleep(h.delay)
 	return h.ResponseWriter.Write(p)
+}
+
+// mount is mount, with the bound on how long a caller waits for its own change given rather
+// than defaulted.
+func mountWithGrace(t *testing.T, s *served, grace time.Duration) (*replicated.Storage, *sqlite.Replica) {
+	t.Helper()
+
+	replica, err := sqlite.OpenReplica(t.Context(), path.Join(t.TempDir(), "replica.db"))
+	if err != nil {
+		t.Fatalf("opening the copy: %v", err)
+	}
+	remote, err := httprest.DialWithSilence(s.url, &http.Client{Timeout: 10 * time.Second}, s.silence)
+	if err != nil {
+		t.Fatalf("dialling the namespace: %v", err)
+	}
+	mounted, err := replicated.NewWithEchoGrace(t.Context(), replica, remote, grace)
+	if err != nil {
+		replica.Close()
+		t.Fatalf("building the copy: %v", err)
+	}
+	t.Cleanup(func() { mounted.Close() })
+	return mounted, replica
 }
 
 // Unwrap is what http.NewResponseController follows to reach the flushing and the deadlines
@@ -349,6 +386,33 @@ func (f *eventFaults) slowSnapshot(delay time.Duration) {
 	defer f.mu.Unlock()
 
 	f.pictureDelay = delay
+}
+
+// holdBackPicture holds a request for a picture until the returned function is called, so
+// that a test decides what is changed after a stream has been attached and before the picture
+// is taken. Everything changed in that window arrives on the stream as well as being in the
+// picture, and is discarded when it does.
+func (f *eventFaults) holdBackPicture() func() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	gate := make(chan struct{})
+	f.pictureGate = gate
+	return sync.OnceFunc(func() { close(gate) })
+}
+
+// slowEvents holds every frame of a change stream back by delay, which is a stream that is
+// being delivered and is behind — the state a replica is in while it works through what it
+// missed, and the one where the difference between "attached again" and "current again"
+// matters.
+//
+// It applies to streams opened after it is set, since a stream's delay is fixed when it is
+// opened.
+func (f *eventFaults) slowEvents(delay time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.eventDelay = delay
 }
 
 func withIncarnation(r *http.Request, incarnation string) *http.Request {

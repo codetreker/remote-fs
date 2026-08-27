@@ -22,16 +22,20 @@ import (
 // What it bounds is how fast a server that is not there is dialled.
 const reconnectDelay = 250 * time.Millisecond
 
-// echoGrace is how long a caller waits for the change it made to come back before deciding
-// that the stream is no longer delivering.
+// DefaultEchoGrace is how long a caller waits for the change it made to come back before it
+// gives up on confirming it.
 //
-// It bounds a failure rather than a latency. The event is written as soon as the change
-// commits, over a connection that is already open, so reaching this means a change was
-// committed and its event did not arrive — and a copy that is missing a change may not be
-// answered from, however long ago it was told so. That is why running out here breaks the
-// stream rather than failing one operation: the alternative is a mount that goes on
-// answering from a copy it has just discovered is incomplete.
-const echoGrace = 10 * time.Second
+// What runs out here is one operation's patience, and nothing else. It does not end the
+// stream: whether the stream is still being delivered is a question the transport already
+// answers, by a keepalive on one side and a bound on silence on the other, and a stream that
+// is merely slow is not one that is gone. Ending it from here would be worse than useless —
+// a mount whose backlog takes longer than this to apply would break its own healthy stream,
+// reconnect to the same backlog, and do it again.
+//
+// So a caller that reaches this is told that the change happened and could not be confirmed,
+// and everything else carries on. The copy is behind by that one change for as long as the
+// stream needs, which is the same thing that is true of every change made anywhere else.
+const DefaultEchoGrace = 10 * time.Second
 
 // build attaches to the stream and fills the copy from one picture of the tree.
 //
@@ -123,10 +127,16 @@ func (s *Storage) attend(sub *httprest.Subscription) error {
 		// A change that could not be applied ends the stream too. The copy is missing it from
 		// here on and nothing later carries it again, so carrying on would be answering from a
 		// copy that is known to be wrong — which is worse than the stream having failed.
-		if err := s.local.Apply(s.lifetime, change); err != nil {
+		applied, err := s.local.Apply(s.lifetime, change)
+		if err != nil {
 			return err
 		}
-		s.applied(change)
+		// A change the copy discarded is one it already held — everything a picture covered
+		// arrives again on a stream that was attached before the picture was taken — and it
+		// moved nothing, so nothing here moves either.
+		if applied {
+			s.applied(change)
+		}
 	}
 }
 
@@ -145,7 +155,7 @@ func (s *Storage) reattach() *httprest.Subscription {
 		incarnation, at := s.watching()
 		sub, err := s.remote.Resubscribe(s.lifetime, incarnation, at)
 		if err == nil {
-			s.resumed(sub.Incarnation())
+			s.resumed(sub.Incarnation(), sub.Tail())
 			return sub
 		}
 		var rebuild *httprest.RebuildError
@@ -183,18 +193,32 @@ func (s *Storage) seeded(incarnation metastore.Incarnation, at metastore.Positio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.incarnation, s.at, s.failure = incarnation, at, nil
+	s.incarnation, s.at, s.failure, s.behind = incarnation, at, nil, 0
 	s.wake()
 }
 
-// resumed records a stream that has been picked up where the copy left off. The copy is what
-// it was — nothing about it changed while the stream was down — and it may be answered from
-// again.
-func (s *Storage) resumed(incarnation metastore.Incarnation) {
+// resumed records a stream that has been picked up where the copy left off.
+//
+// Being attached again is not the same as being current again. The log tells the stream how
+// far it had reached, and everything between what the copy holds and that is on its way but
+// not here yet — so until the last of it has been applied the copy is knowingly missing
+// changes, and answering from it would be answering with what a name held before somebody
+// else changed it. That is a stale answer given as fact, which is the one thing R-ERR-1 and
+// R-ERR-2 put above every other consideration, and the difference from ordinary steady state
+// is that here the gap is known rather than merely possible.
+func (s *Storage) resumed(incarnation metastore.Incarnation, tail metastore.Position) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.incarnation, s.failure = incarnation, nil
+	s.incarnation = incarnation
+	if s.at >= tail {
+		s.behind, s.failure = 0, nil
+		s.wake()
+		return
+	}
+	s.behind = tail
+	s.failure = fmt.Errorf("the stream was picked up again at position %d and the log had reached %d, so this copy is missing what happened in between",
+		s.at, tail)
 	s.wake()
 }
 
@@ -204,17 +228,25 @@ func (s *Storage) fail(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.failure = err
+	s.failure, s.behind = err, 0
 	s.wake()
 }
 
-// applied records a change that is now in the copy.
+// applied records a change that is now in the copy. Only a change the copy took reaches here:
+// one it discarded moved nothing, and treating it as applied would take this account of where
+// the copy stands backwards — to a position the copy passed when a picture carried it further
+// — and would answer a caller waiting for its own change with a change that was never applied.
 func (s *Storage) applied(change metastore.Change) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.at = change.Position
-	if s.waiting > 0 {
+	// The last of what a resumed stream said it would replay. From here the copy holds
+	// everything the log had when the stream began, so it may be answered from again.
+	if s.behind != 0 && s.at >= s.behind {
+		s.behind, s.failure = 0, nil
+	}
+	if len(s.waiting) > 0 {
 		s.record(change)
 	}
 	s.wake()
@@ -280,19 +312,39 @@ func (s *Storage) expect() metastore.Position {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.waiting++
+	s.waiting = append(s.waiting, s.at)
 	return s.at
 }
 
-// forget drops a caller's interest, and with it everything that was being remembered for it
-// once it was the last one.
-func (s *Storage) forget() {
+// forget drops a caller's interest and everything that was only being remembered for it.
+//
+// What is kept is what some caller still waiting could be released by: a change at or before
+// the position the earliest of them started from can release nobody, since each of them waits
+// for something strictly later than where it began. Without this the map would keep an entry
+// for every name touched between the first mutation and the moment the mount happened to have
+// none in flight — which on a busy mount is never, and is unbounded growth (R-INT-3).
+func (s *Storage) forget(after metastore.Position) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.waiting--
-	if s.waiting == 0 {
+	for i, at := range s.waiting {
+		if at == after {
+			s.waiting = append(s.waiting[:i], s.waiting[i+1:]...)
+			break
+		}
+	}
+	if len(s.waiting) == 0 {
 		clear(s.touched)
+		return
+	}
+	earliest := s.waiting[0]
+	for _, at := range s.waiting[1:] {
+		earliest = min(earliest, at)
+	}
+	for where, landed := range s.touched {
+		if landed.filled <= earliest && landed.emptied <= earliest {
+			delete(s.touched, where)
+		}
 	}
 }
 
@@ -325,7 +377,7 @@ func (s *Storage) record(change metastore.Change) {
 // already declared undecided. Every other case is exact: the change this caller made is the
 // only one at that name newer than the position it started from.
 func (s *Storage) await(ctx context.Context, op string, after metastore.Position, want echoed) error {
-	grace := time.NewTimer(echoGrace)
+	grace := time.NewTimer(s.grace)
 	defer grace.Stop()
 
 	for {
@@ -363,12 +415,13 @@ func (s *Storage) await(ctx context.Context, op string, after metastore.Position
 			return &os.PathError{Op: op, Path: want.path, Err: fmt.Errorf(
 				"the change was made, and this copy was released before it came back: %w", syscall.EIO)}
 		case <-grace.C:
-			// A change that was committed and never delivered means this copy is missing
-			// something, and there is nothing that would put it back. Saying so ends the stream:
-			// an incomplete copy may not go on being answered from.
-			missed := fmt.Errorf("the change at %q was made and its event did not arrive within %v", want.path, echoGrace)
-			s.fail(missed)
-			return &os.PathError{Op: op, Path: want.path, Err: fmt.Errorf("%s: %w", missed, syscall.EIO)}
+			// This caller gives up, and nothing else does. The stream has not said anything
+			// wrong — a backlog it is working through looks exactly like this — and whether it
+			// is still being delivered at all is answered by the bound the transport keeps on
+			// a stream that has gone quiet, not by how long one caller has been waiting.
+			return &os.PathError{Op: op, Path: want.path, Err: fmt.Errorf(
+				"the change at %q was made, and this copy could not confirm it within %v: %w",
+				want.path, s.grace, syscall.EIO)}
 		}
 	}
 }
@@ -381,11 +434,17 @@ func (s *Storage) locate(ctx context.Context, path string) (location, error) {
 	if err != nil {
 		return location{}, err
 	}
-	dir, name := cleaned, ""
+	// The root has no parent and no name, and that is how a change names it too: a log
+	// records the node with no entry at parent zero under no name. Naming it here the way
+	// every other node is named — the id of the directory holding it, which for the root is
+	// itself — would produce a name no change can ever match, so a caller that changed the
+	// root's attributes would wait out its whole grace for an event that had already arrived.
+	if cleaned == "" {
+		return location{}, nil
+	}
+	dir, name := "", cleaned
 	if i := strings.LastIndexByte(cleaned, '/'); i >= 0 {
 		dir, name = cleaned[:i], cleaned[i+1:]
-	} else {
-		dir, name = "", cleaned
 	}
 	node, err := s.local.Stat(ctx, dir)
 	if err != nil {

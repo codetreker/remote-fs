@@ -40,8 +40,11 @@ package replicated
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
@@ -68,8 +71,13 @@ type Storage struct {
 	stopped  chan struct{}
 
 	// incarnation names the run of history the copy was built against, and is offered back
-	// when reattaching. Written once, before anything reads it.
+	// when reattaching.
 	incarnation metastore.Incarnation
+
+	// grace is how long one caller waits for the change it made to come back. What it is
+	// for, and why running out of it is one operation's failure rather than the stream's,
+	// is on DefaultEchoGrace.
+	grace time.Duration
 
 	mu sync.Mutex
 
@@ -82,16 +90,23 @@ type Storage struct {
 	// has arrived.
 	at metastore.Position
 
+	// behind is the position a resumed stream said the log had reached, while the copy has
+	// not reached it yet. It is zero when the copy is current. Between the two the copy is
+	// knowingly missing changes and may not be answered from, which is what separates being
+	// behind by what is in flight — ordinary, and true at every moment — from being behind
+	// by an outage the log has just described.
+	behind metastore.Position
+
 	// notify is closed and replaced whenever a waiter's answer may have changed: a change
 	// applied, the stream broken, the stream alive again.
 	notify chan struct{}
 
-	// waiting counts the callers watching for their own change to come back, and touched is
-	// what has changed at a name since the earliest of them started. Nothing is recorded
-	// while nobody is waiting, and what was recorded is dropped when the last one leaves, so
-	// the map holds the changes of one operation's length rather than of the namespace's
-	// life (R-INT-3).
-	waiting int
+	// waiting holds the position each caller watching for its own change started from, and
+	// touched is what has changed at a name since the earliest of them. Nothing is recorded
+	// while nobody is waiting, and what no remaining waiter could be released by is dropped
+	// as each one leaves — so the map holds the changes of the longest mutation still in
+	// flight rather than of the namespace's life (R-INT-3).
+	waiting []metastore.Position
 	touched map[location]touch
 }
 
@@ -116,6 +131,15 @@ var _ storage.Storage = (*Storage)(nil)
 //
 // local is closed by Close, and where it lives is the caller's decision.
 func New(ctx context.Context, local *sqlite.Replica, remote *httprest.Storage) (*Storage, error) {
+	return NewWithEchoGrace(ctx, local, remote, DefaultEchoGrace)
+}
+
+// NewWithEchoGrace is New with the bound on how long a caller waits for its own change given
+// rather than defaulted. What that bound is for is on DefaultEchoGrace.
+func NewWithEchoGrace(ctx context.Context, local *sqlite.Replica, remote *httprest.Storage, grace time.Duration) (*Storage, error) {
+	if grace <= 0 {
+		return nil, fmt.Errorf("a caller allowed %v to see the change it made is one that cannot be told it happened: %w", grace, syscall.EINVAL)
+	}
 	lifetime, stop := context.WithCancel(context.Background())
 	s := &Storage{
 		remote:   remote,
@@ -124,6 +148,7 @@ func New(ctx context.Context, local *sqlite.Replica, remote *httprest.Storage) (
 		stop:     stop,
 		stopped:  make(chan struct{}),
 		notify:   make(chan struct{}),
+		grace:    grace,
 		touched:  map[location]touch{},
 		failure:  errors.New("the copy of this namespace has not been built yet"),
 	}
@@ -211,12 +236,12 @@ func (s *Storage) Space(ctx context.Context) (storage.Space, error) {
 // the network is in the latency of every write, every create, every rename, and on a link
 // where a round trip is 20 ms a write costs about half of one again.
 //
-// And the wait has a ceiling, echoGrace. A mutation whose event has not arrived by then
-// reports EIO even though the change did happen, and ends the stream as it goes: a change
-// that was committed and never delivered means this copy is missing something, and a copy
-// that is missing something may not be answered from. A caller that sees it should read
-// rather than write again — the failure is this side's inability to confirm, not a statement
-// that nothing happened.
+// And the wait has a ceiling, DefaultEchoGrace. A mutation whose event has not arrived by
+// then reports EIO even though the change did happen, and it is that one call that gives up:
+// the stream carries on, because a stream working through a backlog looks exactly like one
+// that has stopped, and whether it has stopped is answered by the bound the transport keeps
+// on a stream that has gone quiet. A caller that sees it should read rather than write again
+// — the failure is this side's inability to confirm, not a statement that nothing happened.
 
 func (s *Storage) SetAttr(ctx context.Context, path string, change storage.AttrChange) error {
 	// A change that names no attribute changes nothing, and a namespace records nothing for
@@ -299,7 +324,7 @@ func (s *Storage) change(ctx context.Context, op, path string, echo *echoed, sen
 		return err
 	}
 	after := s.expect()
-	defer s.forget()
+	defer s.forget(after)
 
 	if err := send(); err != nil {
 		return err
