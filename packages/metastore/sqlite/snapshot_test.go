@@ -64,16 +64,33 @@ func TestAPictureIsPagedByRangeRatherThanByScanningAndSorting(t *testing.T) {
 	})
 }
 
-// assertPagePlan reads the plan for one page and holds it to the shape a range gives.
+// assertPagePlan holds the plan to the shape a range gives, at several points along the cursor.
 //
 // Two phrases are what the assertions turn on. SCAN says a table is being read end to end
 // rather than sought into, so a page is paying for rows it will discard. USE TEMP B-TREE FOR
 // ORDER BY says the rows are being sorted after they are found, and since a page sorts
 // everything it might return before taking its slice, that sort is repeated for every page of
 // the picture — which is the quadratic term.
+//
+// Several cursor positions rather than one, because the plan for a statement is not always the
+// plan for a whole picture. modernc.org/sqlite v1.57.0 is built with SQLITE_ENABLE_STAT4, so
+// on an analysed database SQLite plans from the bound values and re-plans when they move far
+// enough. The statement this one replaced did exactly that: over twenty namespaces of fifty
+// thousand entries it planned the per-page sort near the start of the cursor and switched to
+// driving from the entry key partway along, so a plan read at one position was not the plan
+// that picture ran under. This statement gave one plan at every position tried. That is what
+// makes a single reading of it trustworthy, and it is a property of this statement rather than
+// a general one, so it is checked here instead of assumed.
 func assertPagePlan(t *testing.T, db *sql.DB) {
 	t.Helper()
-	rows, err := db.Query(`EXPLAIN QUERY PLAN `+sqlite.PageQuery, 1, int64(0), []byte{}, 1024)
+	for _, cursor := range []int64{0, 25, 60, 1000} {
+		assertPagePlanAt(t, db, cursor)
+	}
+}
+
+func assertPagePlanAt(t *testing.T, db *sql.DB, cursor int64) {
+	t.Helper()
+	rows, err := db.Query(`EXPLAIN QUERY PLAN `+sqlite.PageQuery, 1, cursor, []byte{}, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,12 +116,13 @@ func assertPagePlan(t *testing.T, db *sql.DB) {
 	// The entry table is sought into by its primary key, using both the namespace and the
 	// cursor. Either one missing from the range is a page that reads rows it will throw away.
 	if !strings.Contains(whole, "SEARCH e USING PRIMARY KEY (namespace=? AND (parent,name)>(?,?))") {
-		t.Fatalf("a page does not seek the entry table by namespace and cursor together; the plan is: %s", whole)
+		t.Fatalf("at cursor %d a page does not seek the entry table by namespace and cursor together; the plan is: %s",
+			cursor, whole)
 	}
 	for _, refused := range []string{"SCAN", "TEMP B-TREE"} {
 		if strings.Contains(whole, refused) {
-			t.Fatalf("a page plans a %s, so its cost grows with the whole table rather than with the page; the plan is: %s",
-				refused, whole)
+			t.Fatalf("at cursor %d a page plans a %s, so its cost grows with the whole table rather than with the page; the plan is: %s",
+				cursor, refused, whole)
 		}
 	}
 }

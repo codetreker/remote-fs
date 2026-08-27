@@ -106,13 +106,22 @@ func treeStatements() []string {
 		// rows again for every page. Which one it took varied, in the shapes measured, with
 		// the table statistics, with how many namespaces shared the database, and with what
 		// other indexes existed — so the cost is not merely high, it changes shape as a
-		// database fills and as it is maintained. Adding an index on nodes(namespace) did not
-		// recover it in any shape tried: it moved the planner into the sorting plan rather
-		// than away from it, with statistics and without.
+		// database fills and as it is maintained.
 		//
-		// Those last two are what was measured over the combinations above rather than
-		// statements about how SQLite chooses, and a later measurement may narrow them. The
-		// sentence this key rests on is the first one, and it does not depend on them.
+		// An index on nodes(namespace) settles that choice on the sorting plan, and settling a
+		// choice is not the same as making it a good one. A per-page sort costs what the
+		// pictured namespace costs, so with that index a picture of a small namespace came out
+		// several times faster than without it and a picture of a large one several times
+		// slower — measured both ways with the same million rows in the database, so what
+		// decides it is the size of the namespace being pictured rather than how many share
+		// the file. Nobody knows that size when the schema is written, which makes the index a
+		// bet on the shape of somebody's workspace rather than an answer to the question.
+		//
+		// Those two paragraphs are what was measured over the shapes above, not statements
+		// about how SQLite chooses, and a later measurement may move them. The sentence this
+		// key rests on is the first one and does not depend on them: the key was best or tied
+		// in every shape measured either way, including the ones where that index beat having
+		// no index at all.
 		//
 		// The plan is where all of this is checkable — what it costs depends on the machine,
 		// the cache and the shape of the tree, and none of those belong in a comment.
