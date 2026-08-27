@@ -123,15 +123,17 @@ func treeStatements() []string {
 		//
 		// The key is not free, and the shape where it costs is the one where sieving has
 		// nothing to sieve. A database holding a single namespace gains nothing from the
-		// namespace column and still pays for it: the column widens every row of the entry
-		// b-tree, so a picture reads a few percent more pages than the same picture over the
-		// narrower key, and over a million entries it came out a few percent slower in every
-		// run of an alternating comparison. That is the trade — a few percent where one
-		// namespace is alone, against several times over where many share a database — and it
-		// is the right way round for a system whose premise is that many workspaces exist and
-		// few are mounted at once. It is written down rather than left out because the first
-		// person to measure a single-namespace database will find it, and a comment claiming
-		// this key wins everywhere is what would read as false then.
+		// namespace column and still pays for it — not in the plan, which is the same range
+		// either way, but in what that plan reads: the column widens every row of the entry
+		// b-tree, so a picture touches a few percent more pages to cover the same entries.
+		// That is the trade, and it is pages rather than planning — a few percent where one
+		// namespace is alone, against several times over where many share a database, which is
+		// the right way round for a system whose premise is that many workspaces exist and few
+		// are mounted at once. Over a million entries the cost showed in every run of an
+		// alternating comparison and tracked the extra pages closely, so it is mechanical
+		// rather than noise. It is written down rather than left out because the first person
+		// to measure a single-namespace database will find it, and a comment claiming this key
+		// wins everywhere is what would read as false then.
 		//
 		// The plan is where the rest of this is checkable — what it costs depends on the
 		// machine, the cache and the shape of the tree, and none of those belong in a comment.
