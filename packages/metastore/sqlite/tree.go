@@ -72,10 +72,11 @@ func (s *Store) rootNode(ctx context.Context, tx *sql.Tx) (metastore.Node, error
 }
 
 // lookup finds the child of parent called name, byte for byte.
-func lookup(ctx context.Context, tx *sql.Tx, parent int64, name []byte) (metastore.Node, bool, error) {
+func (s *Store) lookup(ctx context.Context, tx *sql.Tx, parent int64, name []byte) (metastore.Node, bool, error) {
 	node, err := scanNode(tx.QueryRowContext(ctx,
-		`SELECT `+nodeColumns+` FROM entries e JOIN nodes n ON n.id = e.node WHERE e.parent = ? AND e.name = ?`,
-		parent, name))
+		`SELECT `+nodeColumns+` FROM entries e JOIN nodes n ON n.id = e.node
+		 WHERE e.namespace = ? AND e.parent = ? AND e.name = ?`,
+		s.namespace, parent, name))
 	if errors.Is(err, sql.ErrNoRows) {
 		return metastore.Node{}, false, nil
 	}
@@ -107,7 +108,7 @@ func (s *Store) resolve(ctx context.Context, tx *sql.Tx, cleaned string) (metast
 		if !node.IsDir() {
 			return metastore.Node{}, syscall.ENOTDIR
 		}
-		child, found, err := lookup(ctx, tx, node.ID, []byte(name))
+		child, found, err := s.lookup(ctx, tx, node.ID, []byte(name))
 		if err != nil {
 			return metastore.Node{}, err
 		}
@@ -177,7 +178,7 @@ func (s *Store) List(ctx context.Context, path string) ([]metastore.Child, error
 		if !dir.IsDir() {
 			return syscall.ENOTDIR
 		}
-		children, err = listChildren(ctx, tx, dir.ID)
+		children, err = s.listChildren(ctx, tx, dir.ID)
 		return err
 	}); err != nil {
 		return nil, pathError("list", path, failure(err))
@@ -185,10 +186,11 @@ func (s *Store) List(ctx context.Context, path string) ([]metastore.Child, error
 	return children, nil
 }
 
-func listChildren(ctx context.Context, tx *sql.Tx, parent int64) ([]metastore.Child, error) {
+func (s *Store) listChildren(ctx context.Context, tx *sql.Tx, parent int64) ([]metastore.Child, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT e.name, `+nodeColumns+` FROM entries e JOIN nodes n ON n.id = e.node WHERE e.parent = ? ORDER BY e.name`,
-		parent)
+		`SELECT e.name, `+nodeColumns+` FROM entries e JOIN nodes n ON n.id = e.node
+		 WHERE e.namespace = ? AND e.parent = ? ORDER BY e.name`,
+		s.namespace, parent)
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +314,7 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 		if err != nil {
 			return err
 		}
-		if err := link(ctx, tx, parent.ID, name, id); err != nil {
+		if err := s.link(ctx, tx, parent.ID, name, id); err != nil {
 			return err
 		}
 		if err := s.recordCreated(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, id); err != nil {
@@ -325,12 +327,11 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 	return nil
 }
 
-// link puts a name in a directory. A name already there is EEXIST, which the primary key
-// over (parent, name) is what decides — so two writers racing for one name cannot both be
-// told they made it.
-func link(ctx context.Context, tx *sql.Tx, parent int64, name []byte, node int64) error {
-	if _, err := tx.ExecContext(ctx, `INSERT INTO entries (parent, name, node) VALUES (?, ?, ?)`,
-		parent, name, node); err != nil {
+// link puts a name in a directory. A name already there is EEXIST, which the primary key is
+// what decides — so two writers racing for one name cannot both be told they made it.
+func (s *Store) link(ctx context.Context, tx *sql.Tx, parent int64, name []byte, node int64) error {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO entries (namespace, parent, name, node) VALUES (?, ?, ?, ?)`,
+		s.namespace, parent, name, node); err != nil {
 		if isUniqueViolation(err) {
 			return syscall.EEXIST
 		}
@@ -339,8 +340,9 @@ func link(ctx context.Context, tx *sql.Tx, parent int64, name []byte, node int64
 	return nil
 }
 
-func unlink(ctx context.Context, tx *sql.Tx, parent int64, name []byte) error {
-	_, err := tx.ExecContext(ctx, `DELETE FROM entries WHERE parent = ? AND name = ?`, parent, name)
+func (s *Store) unlink(ctx context.Context, tx *sql.Tx, parent int64, name []byte) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM entries WHERE namespace = ? AND parent = ? AND name = ?`,
+		s.namespace, parent, name)
 	return err
 }
 
@@ -363,9 +365,10 @@ func (s *Store) touch(ctx context.Context, tx *sql.Tx, id int64, at time.Time) e
 }
 
 // isEmpty reports whether a directory holds no names.
-func isEmpty(ctx context.Context, tx *sql.Tx, parent int64) (bool, error) {
+func (s *Store) isEmpty(ctx context.Context, tx *sql.Tx, parent int64) (bool, error) {
 	var one int
-	switch err := tx.QueryRowContext(ctx, `SELECT 1 FROM entries WHERE parent = ? LIMIT 1`, parent).Scan(&one); {
+	switch err := tx.QueryRowContext(ctx,
+		`SELECT 1 FROM entries WHERE namespace = ? AND parent = ? LIMIT 1`, s.namespace, parent).Scan(&one); {
 	case errors.Is(err, sql.ErrNoRows):
 		return true, nil
 	case err != nil:
@@ -390,7 +393,7 @@ func (s *Store) Remove(ctx context.Context, path string) error {
 		if err != nil {
 			return err
 		}
-		node, found, err := lookup(ctx, tx, parent.ID, name)
+		node, found, err := s.lookup(ctx, tx, parent.ID, name)
 		if err != nil {
 			return err
 		}
@@ -400,7 +403,7 @@ func (s *Store) Remove(ctx context.Context, path string) error {
 		if node.IsDir() {
 			return syscall.EISDIR
 		}
-		if err := unlink(ctx, tx, parent.ID, name); err != nil {
+		if err := s.unlink(ctx, tx, parent.ID, name); err != nil {
 			return err
 		}
 		if err := s.discard(ctx, tx, node); err != nil {
@@ -432,7 +435,7 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 		if err != nil {
 			return err
 		}
-		node, found, err := lookup(ctx, tx, parent.ID, name)
+		node, found, err := s.lookup(ctx, tx, parent.ID, name)
 		if err != nil {
 			return err
 		}
@@ -442,14 +445,14 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 		if !node.IsDir() {
 			return syscall.ENOTDIR
 		}
-		empty, err := isEmpty(ctx, tx, node.ID)
+		empty, err := s.isEmpty(ctx, tx, node.ID)
 		if err != nil {
 			return err
 		}
 		if !empty {
 			return syscall.ENOTEMPTY
 		}
-		if err := unlink(ctx, tx, parent.ID, name); err != nil {
+		if err := s.unlink(ctx, tx, parent.ID, name); err != nil {
 			return err
 		}
 		if err := s.discard(ctx, tx, node); err != nil {
@@ -512,7 +515,7 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 	if err != nil {
 		return err
 	}
-	moving, found, err := lookup(ctx, tx, fromParent.ID, fromName)
+	moving, found, err := s.lookup(ctx, tx, fromParent.ID, fromName)
 	if err != nil {
 		return err
 	}
@@ -524,7 +527,7 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 	if err != nil {
 		return err
 	}
-	displaced, occupied, err := lookup(ctx, tx, toParent.ID, toName)
+	displaced, occupied, err := s.lookup(ctx, tx, toParent.ID, toName)
 	if err != nil {
 		return err
 	}
@@ -551,7 +554,7 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 		case !displaced.IsDir() && moving.IsDir():
 			return syscall.ENOTDIR
 		case displaced.IsDir():
-			empty, err := isEmpty(ctx, tx, displaced.ID)
+			empty, err := s.isEmpty(ctx, tx, displaced.ID)
 			if err != nil {
 				return err
 			}
@@ -559,7 +562,7 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 				return syscall.ENOTEMPTY
 			}
 		}
-		if err := unlink(ctx, tx, toParent.ID, toName); err != nil {
+		if err := s.unlink(ctx, tx, toParent.ID, toName); err != nil {
 			return err
 		}
 		if err := s.discard(ctx, tx, displaced); err != nil {
@@ -570,8 +573,9 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 		}
 	}
 
-	if _, err := tx.ExecContext(ctx, `UPDATE entries SET parent = ?, name = ? WHERE parent = ? AND name = ?`,
-		toParent.ID, toName, fromParent.ID, fromName); err != nil {
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE entries SET parent = ?, name = ? WHERE namespace = ? AND parent = ? AND name = ?`,
+		toParent.ID, toName, s.namespace, fromParent.ID, fromName); err != nil {
 		return err
 	}
 	// The node itself is untouched by the move — only the entry naming it was rewritten — so

@@ -54,7 +54,7 @@ func (s *Store) Reserve(ctx context.Context, path string, size int64) (metastore
 		if err != nil {
 			return err
 		}
-		node, found, err := lookup(ctx, tx, parent.ID, name)
+		node, found, err := s.lookup(ctx, tx, parent.ID, name)
 		if err != nil {
 			return err
 		}
@@ -141,7 +141,7 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 	if err != nil {
 		return err
 	}
-	node, found, err := lookup(ctx, tx, parent.ID, name)
+	node, found, err := s.lookup(ctx, tx, parent.ID, name)
 	if err != nil {
 		return err
 	}
@@ -223,7 +223,7 @@ func (s *Store) createCommitted(ctx context.Context, tx *sql.Tx, parent metastor
 	if err != nil {
 		return err
 	}
-	if err := link(ctx, tx, parent.ID, name, id); err != nil {
+	if err := s.link(ctx, tx, parent.ID, name, id); err != nil {
 		return err
 	}
 	if err := s.recordCreated(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, id); err != nil {

@@ -100,18 +100,30 @@ func (p *snapshot) Next(ctx context.Context, limit int) ([]metastore.Row, bool, 
 	return append(rows, page...), p.done, nil
 }
 
-// page reads the next want entries in (parent, name) order and advances the cursor.
+// pageQuery reads one page of a picture: the namespace's entries after a cursor, in key
+// order, with the node each one names.
 //
-// The namespace filter is on the node rather than on the entry, because an entry belongs to
-// whichever namespace the node it names does. Node ids are unique across the database, so
-// (parent, name) remains a total order over one namespace's entries.
+// Every clause here is chosen so that one plan is the only plan, and the plan is the thing
+// under test — pageStatementPlan asserts it, because what went wrong before was never the
+// rows this returns but what it cost to return them.
+//
+// The namespace equality and the cursor range both address the entry table's primary key, so
+// the range is a seek to the cursor and a read forward over this namespace's rows and no
+// others. The cursor is a row value rather than the `parent > ? OR (parent = ? AND name > ?)`
+// that says the same thing: measured against modernc.org/sqlite v1.57.0, SQLite does not
+// recognise the spelled-out form as a range over the key when its operands are bound
+// parameters, so every page restarted at the beginning of the table and skipped its way back
+// to the cursor. The ordering falls out of the key, so no page sorts anything.
+const pageQuery = `
+	SELECT e.parent, e.name, ` + nodeColumns + `
+	FROM entries e JOIN nodes n ON n.id = e.node
+	WHERE e.namespace = ? AND (e.parent, e.name) > (?, ?)
+	ORDER BY e.parent, e.name
+	LIMIT ?`
+
+// page reads the next want entries in (parent, name) order and advances the cursor.
 func (p *snapshot) page(ctx context.Context, want int) ([]metastore.Row, error) {
-	rows, err := p.tx.QueryContext(ctx, `
-		SELECT e.parent, e.name, `+nodeColumns+`
-		FROM entries e JOIN nodes n ON n.id = e.node
-		WHERE n.namespace = ? AND (e.parent > ? OR (e.parent = ? AND e.name > ?))
-		ORDER BY e.parent, e.name
-		LIMIT ?`, p.store.namespace, p.parent, p.parent, p.name, want)
+	rows, err := p.tx.QueryContext(ctx, pageQuery, p.store.namespace, p.parent, p.name, want)
 	if err != nil {
 		return nil, err
 	}

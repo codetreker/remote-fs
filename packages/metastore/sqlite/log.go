@@ -228,7 +228,8 @@ func (s *Store) locate(ctx context.Context, tx *sql.Tx, id int64) (metastore.Loc
 		name   []byte
 	)
 	switch err := tx.QueryRowContext(ctx,
-		`SELECT parent, name FROM entries WHERE node = ?`, id).Scan(&parent, &name); {
+		`SELECT parent, name FROM entries WHERE node = ? AND namespace = ?`,
+		id, s.namespace).Scan(&parent, &name); {
 	case errors.Is(err, sql.ErrNoRows):
 		if id != s.root {
 			return metastore.Location{}, fmt.Errorf("%w: node %d holds no name in this namespace", syscall.EIO, id)

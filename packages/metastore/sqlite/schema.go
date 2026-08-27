@@ -81,16 +81,29 @@ func treeStatements() []string {
 			content    TEXT REFERENCES objects(key)
 		)`,
 
-		// One row per name. The primary key is byte-exact over (parent, name), which is the
-		// uniqueness a directory has.
+		// One row per name. Uniqueness is byte-exact over (parent, name), which is the
+		// uniqueness a directory has; the namespace in front of it adds none, because a parent
+		// is a node id and node ids are unique across the database.
+		//
+		// It leads the key for locality. A picture of the tree is a range over this key, and
+		// with the namespace in front, one namespace's entries are one contiguous stretch of it
+		// — so the scan reads that namespace and nothing else. Without it the filter has to
+		// come from the node on the other side of the join, and every plan that produces is
+		// either a scan of every namespace's entries with the foreign ones thrown away one at
+		// a time, or a sort of the whole namespace repeated for every page. Measured against
+		// modernc.org/sqlite v1.57.0 over a million entries: 10m34s as a per-page sort, 578ms
+		// sieving with the join order pinned, 123ms as this range. The column is therefore
+		// redundant with nodes.namespace and is kept equal to it by every statement that
+		// writes an entry.
 		//
 		// WITHOUT ROWID stores the rows in primary key order, so a directory's children are
 		// contiguous and `ORDER BY name` is a scan of them in byte order rather than a sort.
 		`CREATE TABLE IF NOT EXISTS entries (
-			parent INTEGER NOT NULL REFERENCES nodes(id),
-			name   BLOB    NOT NULL,
-			node   INTEGER NOT NULL REFERENCES nodes(id),
-			PRIMARY KEY (parent, name)
+			namespace INTEGER NOT NULL REFERENCES namespaces(id),
+			parent    INTEGER NOT NULL REFERENCES nodes(id),
+			name      BLOB    NOT NULL,
+			node      INTEGER NOT NULL REFERENCES nodes(id),
+			PRIMARY KEY (namespace, parent, name)
 		) WITHOUT ROWID`,
 
 		// Removing a node has SQLite check that no entry still points at it, which is a scan
@@ -344,6 +357,9 @@ func versionOf(ctx context.Context, tx *sql.Tx) (version int, recorded bool, err
 // never had before, which is the truthful statement: no replica can resume against a log
 // whose history was never written down, and a new incarnation is how that is said.
 func migrateToTwo(ctx context.Context, tx *sql.Tx) error {
+	if err := rebuildEntries(ctx, tx); err != nil {
+		return err
+	}
 	for _, statement := range logStatements() {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("adding the change log: %w", err)
@@ -376,6 +392,39 @@ func migrateToTwo(ctx context.Context, tx *sql.Tx) error {
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE schema_version SET version = ?`, schemaVersion); err != nil {
 		return err
+	}
+	return nil
+}
+
+// rebuildEntries carries the entry table from the shape version 1 gave it — keyed by
+// (parent, name) — to the one version 2 needs, with the namespace in front of the key.
+//
+// A key cannot be changed in place, so the table is rebuilt: SQLite's ALTER TABLE will add a
+// column but not move it into the primary key, and the primary key is the whole point of the
+// change. The namespace each row belongs to is the one its node belongs to, which is where
+// version 1 kept that fact and is the invariant every writer maintains from here on.
+//
+// Nothing references entries, so dropping it does not disturb a foreign key anywhere else,
+// and the new table's own references to nodes and namespaces are satisfied by rows that are
+// already there. The index over the node column goes with the old table and is rebuilt after.
+func rebuildEntries(ctx context.Context, tx *sql.Tx) error {
+	for _, statement := range []string{
+		`CREATE TABLE entries_rebuilt (
+			namespace INTEGER NOT NULL REFERENCES namespaces(id),
+			parent    INTEGER NOT NULL REFERENCES nodes(id),
+			name      BLOB    NOT NULL,
+			node      INTEGER NOT NULL REFERENCES nodes(id),
+			PRIMARY KEY (namespace, parent, name)
+		) WITHOUT ROWID`,
+		`INSERT INTO entries_rebuilt (namespace, parent, name, node)
+		 SELECT n.namespace, e.parent, e.name, e.node FROM entries e JOIN nodes n ON n.id = e.node`,
+		`DROP TABLE entries`,
+		`ALTER TABLE entries_rebuilt RENAME TO entries`,
+		`CREATE INDEX IF NOT EXISTS entries_by_node ON entries (node)`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("moving the entry table to its version 2 key: %w", err)
+		}
 	}
 	return nil
 }

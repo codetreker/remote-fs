@@ -150,17 +150,17 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 		if err := insertNode(ctx, tx, r.store.namespace, *change.Node); err != nil {
 			return err
 		}
-		return insertEntry(ctx, tx, change.Parent, change.Name, change.Node.ID)
+		return insertEntry(ctx, tx, r.store.namespace, change.Parent, change.Name, change.Node.ID)
 
 	case metastore.Modified:
 		return updateNode(ctx, tx, *change.Node)
 
 	case metastore.Removed:
-		id, err := entryNode(ctx, tx, change.Parent, change.Name)
+		id, err := entryNode(ctx, tx, r.store.namespace, change.Parent, change.Name)
 		if err != nil {
 			return err
 		}
-		if err := removeEntry(ctx, tx, change.Parent, change.Name); err != nil {
+		if err := removeEntry(ctx, tx, r.store.namespace, change.Parent, change.Name); err != nil {
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, id)
@@ -172,10 +172,10 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 		// none of their rows is touched. That is the property that made carrying the node in the
 		// change worth its cost, and it is the one a replica would give up if it discarded the
 		// subtree and asked for it again.
-		if err := removeEntry(ctx, tx, change.From.Parent, change.From.Name); err != nil {
+		if err := removeEntry(ctx, tx, r.store.namespace, change.From.Parent, change.From.Name); err != nil {
 			return err
 		}
-		if err := insertEntry(ctx, tx, change.Parent, change.Name, change.Node.ID); err != nil {
+		if err := insertEntry(ctx, tx, r.store.namespace, change.Parent, change.Name, change.Node.ID); err != nil {
 			return err
 		}
 		return updateNode(ctx, tx, *change.Node)
@@ -213,27 +213,29 @@ func updateNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
 	return exactlyOne(result, fmt.Sprintf("node %d, which this copy does not hold", node.ID))
 }
 
-func insertEntry(ctx context.Context, tx *sql.Tx, parent int64, name []byte, node int64) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO entries (parent, name, node) VALUES (?, ?, ?)`,
-		parent, name, node)
+func insertEntry(ctx context.Context, tx *sql.Tx, namespace, parent int64, name []byte, node int64) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO entries (namespace, parent, name, node) VALUES (?, ?, ?, ?)`,
+		namespace, parent, name, node)
 	if err != nil && isUniqueViolation(err) {
 		return fmt.Errorf("%w: %q under node %d is already taken in this copy", syscall.EIO, name, parent)
 	}
 	return err
 }
 
-func removeEntry(ctx context.Context, tx *sql.Tx, parent int64, name []byte) error {
-	result, err := tx.ExecContext(ctx, `DELETE FROM entries WHERE parent = ? AND name = ?`, parent, name)
+func removeEntry(ctx context.Context, tx *sql.Tx, namespace, parent int64, name []byte) error {
+	result, err := tx.ExecContext(ctx,
+		`DELETE FROM entries WHERE namespace = ? AND parent = ? AND name = ?`, namespace, parent, name)
 	if err != nil {
 		return err
 	}
 	return exactlyOne(result, fmt.Sprintf("%q under node %d, which this copy does not hold", name, parent))
 }
 
-func entryNode(ctx context.Context, tx *sql.Tx, parent int64, name []byte) (int64, error) {
+func entryNode(ctx context.Context, tx *sql.Tx, namespace, parent int64, name []byte) (int64, error) {
 	var id int64
 	switch err := tx.QueryRowContext(ctx,
-		`SELECT node FROM entries WHERE parent = ? AND name = ?`, parent, name).Scan(&id); {
+		`SELECT node FROM entries WHERE namespace = ? AND parent = ? AND name = ?`,
+		namespace, parent, name).Scan(&id); {
 	case errors.Is(err, sql.ErrNoRows):
 		return 0, fmt.Errorf("%w: the change names %q under node %d, which this copy does not hold",
 			syscall.EIO, name, parent)
@@ -313,7 +315,7 @@ type Seeding struct {
 // deleted while it names it, and that reference is one this schema means.
 func (s *Seeding) empty(ctx context.Context) error {
 	for _, statement := range []string{
-		`DELETE FROM entries WHERE node IN (SELECT id FROM nodes WHERE namespace = ?)`,
+		`DELETE FROM entries WHERE namespace = ?`,
 		`DELETE FROM nodes WHERE namespace = ?`,
 	} {
 		if _, err := s.tx.ExecContext(ctx, statement, s.replica.store.namespace); err != nil {
@@ -346,7 +348,7 @@ func (s *Seeding) add(ctx context.Context, row metastore.Row) error {
 		s.root = row.Node.ID
 		return nil
 	}
-	return insertEntry(ctx, s.tx, row.Parent, row.Name, row.Node.ID)
+	return insertEntry(ctx, s.tx, s.replica.store.namespace, row.Parent, row.Name, row.Node.ID)
 }
 
 // Complete records that the picture was whole and that the copy stands at the position it was
