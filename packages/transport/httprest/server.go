@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -17,16 +18,50 @@ import (
 // server; http.StripPrefix is how it is mounted somewhere other than the root.
 type Handler struct {
 	storage storage.Storage
+	log     metastore.Log
+	limits  Limits
+
+	// publisher is present exactly when log is, and wakes the open subscriptions.
+	publisher *publisher
+
+	// snapshots holds one token per snapshot that may be open at once.
+	snapshots chan struct{}
 }
 
 var _ http.Handler = (*Handler)(nil)
 
-// NewHandler builds a handler over s.
-func NewHandler(s storage.Storage) (*Handler, error) {
+// NewHandler builds a handler over s, publishing log to whatever replicates the namespace.
+//
+// The log is a second input rather than something discovered through s, because not every
+// namespace has one: a local directory is a namespace with no metastore behind it and
+// therefore no ordered record of what changed. Such a namespace is served whole here, and
+// the two replication endpoints answer ENOSYS — a nil log passed in on purpose, rather
+// than an absence this package could infer, so that a caller that has a log and forgets to
+// pass it is making a visible choice instead of silently serving a namespace nothing can
+// replicate.
+func NewHandler(s storage.Storage, log metastore.Log) (*Handler, error) {
+	return NewHandlerWithLimits(s, log, DefaultLimits())
+}
+
+// NewHandlerWithLimits is NewHandler with the bounds on the replication endpoints given
+// rather than defaulted. What the defaults are, and why they are guesses, is on Limits.
+func NewHandlerWithLimits(s storage.Storage, log metastore.Log, limits Limits) (*Handler, error) {
 	if s == nil {
 		return nil, errors.New("httprest: a handler needs a storage to serve")
 	}
-	return &Handler{storage: s}, nil
+	if err := limits.check(); err != nil {
+		return nil, err
+	}
+	h := &Handler{
+		storage:   s,
+		log:       log,
+		limits:    limits,
+		snapshots: make(chan struct{}, limits.Snapshots),
+	}
+	if log != nil {
+		h.publisher = newPublisher()
+	}
+	return h, nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -115,6 +150,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) 
 			return
 		}
 		writeJSON(w, http.StatusOK, SpaceResponse{Space: SpaceOf(space)})
+
+	case OpSubscribe:
+		h.serveEvents(w, r, nil)
+	case OpResubscribe:
+		h.serveEvents(w, r, &resumeFrom{incarnation: req.Incarnation, position: req.Position})
+	case OpSnapshot:
+		h.serveSnapshot(w, r)
 	}
 }
 
@@ -123,6 +165,13 @@ func (h *Handler) report(w http.ResponseWriter, err error) {
 	if err != nil {
 		writeStorageError(w, err)
 		return
+	}
+	// Every operation that changes the namespace is answered here, so this is the one
+	// place that knows the namespace has just moved — and the moment it knows is the
+	// moment the subscriptions are told to read the log again. Nothing is handed to them:
+	// what they read is the log itself, which is the only record of what changed.
+	if h.publisher != nil {
+		h.publisher.wake()
 	}
 	w.Header().Set("Content-Length", "0")
 	w.WriteHeader(http.StatusOK)

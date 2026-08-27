@@ -62,7 +62,9 @@ func serveDirectory(t *testing.T) *namespaceServer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := httprest.NewHandler(namespace)
+	// A local directory keeps no metastore and therefore no change log, so the replication
+	// endpoints answer ENOSYS for the namespaces this harness serves.
+	handler, err := httprest.NewHandler(namespace, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

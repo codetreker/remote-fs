@@ -89,7 +89,7 @@ func exerciseTheLibrary() error {
 	if err != nil {
 		return err
 	}
-	handler, err := httprest.NewHandler(backing)
+	handler, err := httprest.NewHandler(backing, nil)
 	if err != nil {
 		return err
 	}
@@ -137,5 +137,12 @@ func exerciseTheLibrary() error {
 	s.Mkdir(ctx, "../outside")
 	s.Write(ctx, "missing/f", []byte("x"))
 	s.SetAttr(ctx, "missing", storage.AttrChange{})
+
+	// A local directory keeps no change log, so these three refuse. The refusing path is
+	// the one worth running here: a diagnostic printed on the way out is what this test
+	// exists to catch, and that is where one gets written.
+	s.Subscribe(ctx)
+	s.Resubscribe(ctx, "a-log", 1)
+	s.Snapshot(ctx)
 	return nil
 }

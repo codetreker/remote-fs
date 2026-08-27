@@ -118,7 +118,10 @@ func run(args []string, errOut io.Writer) error {
 	}
 	defer ns.close()
 
-	handler, err := httprest.NewHandler(ns.namespace)
+	// A nil log: this server hands out the namespace but no record of what changes in it,
+	// so the replication endpoints answer ENOSYS and nothing may build a local copy of
+	// this namespace and trust it.
+	handler, err := httprest.NewHandler(ns.namespace, nil)
 	if err != nil {
 		return err
 	}
@@ -255,7 +258,7 @@ func openBlobs(blob blobSource, quota int64) (opened, error) {
 	if err != nil {
 		return opened{}, err
 	}
-	meta, err := sqlite.Open(context.Background(), blob.database, blob.workspace, quota)
+	meta, err := sqlite.Open(context.Background(), blob.database, blob.workspace, quota, sqlite.DefaultWindow())
 	if err != nil {
 		return opened{}, err
 	}

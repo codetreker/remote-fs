@@ -15,7 +15,9 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// Storage is a namespace held by a server.
+// Storage is a namespace held by a server: its contents through the storage contract, and
+// beside that the replication endpoints a replica of its metadata is built and kept from.
+// One Dial is one namespace, and a replica needs both halves of it.
 type Storage struct {
 	base *url.URL
 	http *http.Client
@@ -250,7 +252,8 @@ func readWhole(resp *http.Response) ([]byte, error) {
 	return body, nil
 }
 
-// operationError is every error this package returns.
+// operationError is every error this package returns but one, the exception being the
+// RebuildError a change stream answers with.
 //
 // Unwrap yields the errno alone and never the underlying cause, which is why the cause
 // is carried as rendered text instead. A cause left in the errors.Is chain would leak
@@ -276,10 +279,12 @@ func (e *operationError) Error() string {
 // beside it would read as a report about the root.
 func (r Request) subject() string {
 	switch {
-	case len(ops[r.Op].operands) == 0:
-		return string(r.Op)
 	case r.Op == OpRename:
 		return fmt.Sprintf("%s %s to %s", r.Op, strconv.Quote(r.Path), strconv.Quote(r.To))
+	case r.Op == OpResubscribe:
+		return fmt.Sprintf("%s at position %d of log %s", r.Op, r.Position, strconv.Quote(string(r.Incarnation)))
+	case len(ops[r.Op].operands) == 0:
+		return string(r.Op)
 	default:
 		return fmt.Sprintf("%s %s", r.Op, strconv.Quote(r.Path))
 	}
