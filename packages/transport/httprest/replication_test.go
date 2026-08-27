@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -707,36 +708,89 @@ func TestOnlySoManySnapshotsAreOpenAtOnce(t *testing.T) {
 	second.Close()
 }
 
-// A namespace with no change log cannot be replicated, and has to say so. An empty stream
-// and a picture of no rows are the shape of a namespace that exists, holds nothing and
-// never changes — which a replica would believe, and go on believing (R-ERR-1, R-ERR-2).
-func TestANamespaceWithNoLogRefusesRatherThanLookingEmpty(t *testing.T) {
-	s := serveLog(t, nil, httprest.DefaultLimits())
-	for name, reach := range map[string]func() error{
-		"subscribe": func() error {
+// replicationCalls is every way of reaching the replication half, so that a property of
+// all three is asserted about all three rather than about whichever one came to mind.
+func replicationCalls() map[string]func(*testing.T, *httprest.Storage) error {
+	return map[string]func(*testing.T, *httprest.Storage) error{
+		"subscribe": func(t *testing.T, s *httprest.Storage) error {
 			sub, err := s.Subscribe(t.Context())
 			if err == nil {
 				sub.Close()
 			}
 			return err
 		},
-		"resubscribe": func() error {
+		"resubscribe": func(t *testing.T, s *httprest.Storage) error {
 			sub, err := s.Resubscribe(t.Context(), "any-log-at-all", 0)
 			if err == nil {
 				sub.Close()
 			}
 			return err
 		},
-		"snapshot": func() error {
+		"snapshot": func(t *testing.T, s *httprest.Storage) error {
 			snap, err := s.Snapshot(t.Context())
 			if err == nil {
 				snap.Close()
 			}
 			return err
 		},
-	} {
+	}
+}
+
+// A namespace that keeps no log and a server that cannot be reached are opposite facts,
+// and what a caller does about them is opposite too: the first will never be replicable and
+// the mount goes on without a local copy, the second will answer in a moment and the mount
+// waits. They must not arrive as the same error, and neither may be read as the other.
+//
+// What separates them is that ENOSYS can only have been said by a handler speaking this
+// protocol — the response carried this protocol's mark and the one status that states an
+// outcome — whereas everything else this side could not establish is EIO.
+func TestNotReplicableIsNotTheSameFailureAsNotReachable(t *testing.T) {
+	unreplicable := serveLog(t, nil, httprest.DefaultLimits())
+
+	// Bind and release, so the address is one that was valid a moment ago and has nothing
+	// behind it now.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	unreachable, err := httprest.Dial("http://"+address, &http.Client{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	for name, reach := range replicationCalls() {
 		t.Run(name, func(t *testing.T) {
-			err := reach()
+			permanent := reach(t, unreplicable)
+			if !errors.Is(permanent, syscall.ENOSYS) {
+				t.Fatalf("a namespace that keeps no log gave %v, want ENOSYS", permanent)
+			}
+			if errors.Is(permanent, syscall.EIO) {
+				t.Fatalf("a namespace that keeps no log reads as a server that could not be reached: %v", permanent)
+			}
+
+			transient := reach(t, unreachable)
+			if !errors.Is(transient, syscall.EIO) {
+				t.Fatalf("a server that is not there gave %v, want EIO", transient)
+			}
+			if errors.Is(transient, syscall.ENOSYS) {
+				t.Fatalf("a server that could not be reached reads as a namespace that keeps no log: %v", transient)
+			}
+		})
+	}
+}
+
+// A namespace with no change log cannot be replicated, and has to say so. An empty stream
+// and a picture of no rows are the shape of a namespace that exists, holds nothing and
+// never changes — which a replica would believe, and go on believing (R-ERR-1, R-ERR-2).
+func TestANamespaceWithNoLogRefusesRatherThanLookingEmpty(t *testing.T) {
+	s := serveLog(t, nil, httprest.DefaultLimits())
+	for name, reach := range replicationCalls() {
+		t.Run(name, func(t *testing.T) {
+			err := reach(t, s)
 			if err == nil {
 				t.Fatal("an unreplicable namespace answered as though it could be replicated")
 			}
