@@ -42,6 +42,9 @@ type served struct {
 	storage *objectstore.Storage
 	url     string
 
+	// server is kept so that the connections a mount holds can be closed from underneath it.
+	server *httptest.Server
+
 	// elsewhere is a client of this namespace that keeps no copy: it is how a second machine
 	// changes the namespace in these tests. Changing it through the storage object directly
 	// would reach the tree without reaching the handler, and it is the handler that tells the
@@ -60,8 +63,18 @@ type served struct {
 // serve stands up a namespace whose tree is in SQLite and whose bytes are in memory.
 func serve(t *testing.T, limits httprest.Limits) *served {
 	t.Helper()
+	return serveWithAllowance(t, limits, 0)
+}
 
-	meta, err := sqlite.Open(t.Context(), path.Join(t.TempDir(), "namespace.db"), "ws", 0, sqlite.DefaultWindow())
+// serveWithAllowance is serve, with a ceiling on how many bytes the namespace may hold.
+//
+// It is how a mutation is refused for a reason that is nobody's mistake: a workspace that is
+// full answers EDQUOT, and that answer has to reach the caller as itself rather than as
+// anything this copy made of it.
+func serveWithAllowance(t *testing.T, limits httprest.Limits, allowance int64) *served {
+	t.Helper()
+
+	meta, err := sqlite.Open(t.Context(), path.Join(t.TempDir(), "namespace.db"), "ws", allowance, sqlite.DefaultWindow())
 	if err != nil {
 		t.Fatalf("opening the namespace's metastore: %v", err)
 	}
@@ -83,11 +96,19 @@ func serve(t *testing.T, limits httprest.Limits) *served {
 		t.Fatalf("dialling the namespace: %v", err)
 	}
 	return &served{
-		meta: meta, storage: backing, url: server.URL,
+		meta: meta, storage: backing, url: server.URL, server: server,
 		elsewhere: elsewhere, events: faults, calls: counted,
 		silence: httprest.DefaultSilence,
 	}
 }
+
+// sever closes the connections the server holds, which ends every stream on them at once.
+//
+// Cutting a stream ends it where the server is, so a frame the server is already in the middle
+// of writing is still written and still arrives — which is right, and is what makes it the
+// wrong tool for arranging that a particular change never comes back. A connection that is
+// gone takes what was being written with it.
+func (s *served) sever() { s.server.CloseClientConnections() }
 
 // mount builds a copy of the namespace and returns the storage over it, together with the
 // copy itself so that a test may compare it against the source node for node.
@@ -519,6 +540,30 @@ func requireCaughtUp(t *testing.T, s *served, r *sqlite.Replica) {
 		if time.Now().After(deadline) {
 			t.Fatalf("the copy stands at position %d and the namespace was last changed at %d",
 				r.Position(), committed)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// requireRecordedPast waits until the namespace itself has recorded a change later than at.
+//
+// It is how a test knows a mutation has reached the namespace without asking the copy, which is
+// what is under test. The waiting is not the assertion: what is asserted is what the caller is
+// told once the stream behind it goes.
+func requireRecordedPast(t *testing.T, s *served, at metastore.Position) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		committed, err := s.meta.CommittedPosition(t.Context())
+		if err != nil {
+			t.Fatalf("reading the position the namespace was last changed at: %v", err)
+		}
+		if committed > at {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the namespace still stands at position %d, and the change made through the copy should have reached it", committed)
 		}
 		time.Sleep(time.Millisecond)
 	}

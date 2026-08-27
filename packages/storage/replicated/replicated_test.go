@@ -865,3 +865,232 @@ func TestAChangeTheCopyDiscardedReleasesNobody(t *testing.T) {
 	}
 	t.Logf("the write waited %v, through a replay of changes at the same name that the copy discarded", took)
 }
+
+// TestADirectoryRemovedThroughTheCopyIsGoneFromItAtOnce is R-CON-4 for the operations whose
+// change empties a name rather than filling it.
+//
+// The direction of the wait is the whole of it. A caller held until the name holds something
+// would be waiting for a change that is never coming: it would spend its entire grace and then
+// report EIO for a directory that is in fact gone — and the listing it was refused would have
+// been correct.
+func TestADirectoryRemovedThroughTheCopyIsGoneFromItAtOnce(t *testing.T) {
+	s := serve(t, httprest.DefaultLimits())
+	mounted, replica := mount(t, s)
+
+	for _, at := range []string{"d", "d/inner"} {
+		if err := mounted.Mkdir(t.Context(), at); err != nil {
+			t.Fatalf("mkdir %s: %v", at, err)
+		}
+	}
+
+	if err := mounted.RemoveDir(t.Context(), "d/inner"); err != nil {
+		t.Fatalf("rmdir d/inner: %v", err)
+	}
+	if _, err := mounted.Stat(t.Context(), "d/inner"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat d/inner straight after removing it gave %v, want ENOENT", err)
+	}
+	if entries, err := mounted.List(t.Context(), "d"); err != nil || len(entries) != 0 {
+		t.Fatalf("listing d straight after removing the only thing in it gave %v (%v)", entries, err)
+	}
+
+	// And the directory that held it, so that the name being emptied is one something else was
+	// listing rather than a leaf at the bottom of the tree.
+	if err := mounted.RemoveDir(t.Context(), "d"); err != nil {
+		t.Fatalf("rmdir d: %v", err)
+	}
+	if entries, err := mounted.List(t.Context(), ""); err != nil || len(entries) != 0 {
+		t.Fatalf("listing the root straight after removing the only thing in it gave %v (%v)", entries, err)
+	}
+
+	requireCaughtUp(t, s, replica)
+	requireSameTree(t, walkSource(t, s), walkCopy(t, replica))
+}
+
+// TestAMutationThatRecordsNothingIsNotWaitedFor.
+//
+// Two operations succeed while the namespace records nothing: an attribute change that names no
+// attribute, and a rename of a name onto itself, which POSIX has "return successfully and
+// perform no other action". No event is coming for either, so a copy that waited for one would
+// hold its caller for the whole grace and then report EIO for something that succeeded.
+//
+// Both are still sent, and the names that are not there are how that half is held: whether a
+// name exists at all is the server's answer and never this copy's to invent.
+func TestAMutationThatRecordsNothingIsNotWaitedFor(t *testing.T) {
+	// Short, so that a wait for an echo that is never coming shows up as a failure rather than
+	// as a test that takes a while. Every mutation here that does record something is confirmed
+	// in a millisecond or two.
+	const grace = 2 * time.Second
+
+	s := serve(t, httprest.DefaultLimits())
+	write(t, s, "a.txt", "some contents")
+	mkdir(t, s, "d")
+	mounted, replica := mountWithGrace(t, s, grace)
+
+	before, err := mounted.Stat(t.Context(), "a.txt")
+	if err != nil {
+		t.Fatalf("stat a.txt: %v", err)
+	}
+
+	if err := mounted.SetAttr(t.Context(), "a.txt", storage.AttrChange{}); err != nil {
+		t.Fatalf("an attribute change that names no attribute: %v", err)
+	}
+	if err := mounted.SetAttr(t.Context(), "nowhere", storage.AttrChange{}); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("an attribute change naming nothing, at a name that is not there, gave %v, want ENOENT: it is sent for exactly this answer", err)
+	}
+
+	// Three spellings of one name. What decides whether anything was recorded is what the paths
+	// mean rather than how they were typed.
+	for _, onto := range []string{"a.txt", "./a.txt", "d/../a.txt"} {
+		if err := mounted.Rename(t.Context(), "a.txt", onto); err != nil {
+			t.Fatalf("renaming a.txt onto %q, which is the same name: %v", onto, err)
+		}
+	}
+	if err := mounted.Rename(t.Context(), "nowhere", "nowhere"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("renaming a name that is not there onto itself gave %v, want ENOENT: it is sent for exactly this answer", err)
+	}
+
+	if after, err := mounted.Stat(t.Context(), "a.txt"); err != nil || after != before {
+		t.Fatalf("a.txt is now %+v (%v), and nothing here changed it from %+v", after, err, before)
+	}
+	requireCaughtUp(t, s, replica)
+	requireSameTree(t, walkSource(t, s), walkCopy(t, replica))
+}
+
+// TestAMutationTheServerRefusesIsReportedAsTheServerRefusedIt.
+//
+// A refused mutation never happened, so no event is coming and there is nothing to wait for.
+// The refusal is the answer, and it has to arrive under the errno the namespace chose: a copy
+// that swallowed it and waited would turn "that name is taken" into "this copy could not
+// confirm it", which sends whoever reads it looking for a broken mount instead of for the file
+// they tried to create — and would do it after a delay as long as the grace, every time.
+func TestAMutationTheServerRefusesIsReportedAsTheServerRefusedIt(t *testing.T) {
+	const grace = 2 * time.Second
+	const allowance = 4096
+
+	s := serveWithAllowance(t, httprest.DefaultLimits(), allowance)
+	mounted, replica := mountWithGrace(t, s, grace)
+
+	if err := mounted.Mkdir(t.Context(), "d"); err != nil {
+		t.Fatalf("mkdir d: %v", err)
+	}
+	if err := mounted.Create(t.Context(), "d/f"); err != nil {
+		t.Fatalf("create d/f: %v", err)
+	}
+
+	for _, c := range []struct {
+		what string
+		do   func() error
+		want syscall.Errno
+	}{
+		{"a name that is already taken", func() error { return mounted.Create(t.Context(), "d/f") }, syscall.EEXIST},
+		{"a name that is not there", func() error { return mounted.Remove(t.Context(), "d/gone") }, syscall.ENOENT},
+		{"a directory with something in it", func() error { return mounted.RemoveDir(t.Context(), "d") }, syscall.ENOTEMPTY},
+		{"more bytes than the namespace may hold", func() error {
+			return mounted.Write(t.Context(), "big", make([]byte, allowance+1))
+		}, syscall.EDQUOT},
+	} {
+		t.Run(c.what, func(t *testing.T) {
+			err := c.do()
+			if errors.Is(err, syscall.EIO) {
+				t.Fatalf("%s was answered with %v: EIO is what a copy says when it waited for an echo that was never coming, and the namespace had already answered", c.what, err)
+			}
+			if !errors.Is(err, c.want) {
+				t.Fatalf("%s was answered with %v, want %v", c.what, err, c.want)
+			}
+		})
+	}
+
+	// Nothing a refusal touched is in the copy, and nothing it did not touch has gone missing.
+	requireCaughtUp(t, s, replica)
+	requireSameTree(t, walkSource(t, s), walkCopy(t, replica))
+}
+
+// TestAChangeWhoseStreamWentWhileItWasWaitedForSaysWhichHappened.
+//
+// A mutation waits for its own change, and the stream carrying it can end while it waits. That
+// is a different thing from the wait running out: nothing is coming any more, so the caller is
+// told now rather than held for the rest of its grace. What it must never be told is that its
+// change did not happen — it did, and what failed is this copy's ability to confirm it.
+func TestAChangeWhoseStreamWentWhileItWasWaitedForSaysWhichHappened(t *testing.T) {
+	const frame = 300 * time.Millisecond
+	const grace = 3 * time.Second
+
+	s := serve(t, httprest.DefaultLimits())
+	write(t, s, "before.txt", "here before the mount")
+	// Every frame held back for long enough that the change made below cannot come back before
+	// the stream is cut, while the grace is ten times that: what ends the wait has to be the
+	// stream going, and running out of patience has to be ruled out as the explanation.
+	s.events.slowEvents(frame)
+	mounted, _ := mountWithGrace(t, s, grace)
+
+	at, err := s.meta.CommittedPosition(t.Context())
+	if err != nil {
+		t.Fatalf("reading the position the namespace stands at: %v", err)
+	}
+
+	made := make(chan error, 1)
+	go func() { made <- mounted.Mkdir(t.Context(), "d") }()
+
+	// Cut only once the namespace itself holds the change. Before that the mutation has not
+	// been sent, and what would be under test is the refusal to send it at all.
+	//
+	// The connections go with it. A stream that is merely told to end still delivers the frame
+	// it is in the middle of writing, and that frame is this caller's own change — so cutting
+	// alone would race the very echo this test is arranging not to arrive.
+	requireRecordedPast(t, s, at)
+	started := time.Now()
+	s.events.cut()
+	s.sever()
+
+	err = <-made
+	took := time.Since(started)
+	requireErrno(t, "a change whose stream ended while it was being confirmed", err, syscall.EIO)
+	if !strings.Contains(err.Error(), "stopped being kept current") {
+		t.Fatalf("the change failed with %v, which does not say that the stream behind the copy went while it was being confirmed", err)
+	}
+	if took >= grace {
+		t.Fatalf("the caller was held for %v, which is the whole grace: it was told by the wait running out rather than by the stream going", took)
+	}
+	t.Logf("told in %v, of a grace of %v: %v", took.Round(time.Millisecond), grace, err)
+
+	// And the change is real. The namespace holds it, read from the namespace's own tree rather
+	// than through anything that just failed.
+	if _, err := s.meta.Stat(t.Context(), "d"); err != nil {
+		t.Fatalf("the namespace does not hold d, and the caller was told its change was made: %v", err)
+	}
+	requireUnusable(t, mounted)
+}
+
+// TestAChangeUnderADirectoryTheCopyHasNotSeenYetIsWaitedFor.
+//
+// The name a mutation waits for is resolved against the copy on every pass, and this is the
+// case that requires it: the directory holding that name may itself still be arriving on the
+// same stream. A copy that resolved once, at the moment the wait began, would find no parent
+// and have nothing to compare against — and the caller would be told its change could not be
+// confirmed, when what was true is that the copy had not yet caught up with the directory the
+// change was made in.
+func TestAChangeUnderADirectoryTheCopyHasNotSeenYetIsWaitedFor(t *testing.T) {
+	const frame = 300 * time.Millisecond
+
+	s := serve(t, httprest.DefaultLimits())
+	s.events.slowEvents(frame)
+	mounted, replica := mount(t, s)
+
+	// Made elsewhere, so the copy can learn of it only from the stream — which is holding every
+	// frame back for long enough that it cannot have arrived by the time the file below is made
+	// inside it.
+	mkdir(t, s, "d")
+	if _, err := replica.Stat(t.Context(), "d"); err == nil {
+		t.Fatal("the copy already holds d, so nothing here is waiting for a parent that has not arrived: this case tests nothing as written")
+	}
+
+	if err := mounted.Create(t.Context(), "d/f"); err != nil {
+		t.Fatalf("creating d/f while the copy has not seen d yet: %v", err)
+	}
+	if _, err := mounted.Stat(t.Context(), "d/f"); err != nil {
+		t.Fatalf("stat d/f straight after creating it: %v", err)
+	}
+
+	requireCaughtUp(t, s, replica)
+	requireSameTree(t, walkSource(t, s), walkCopy(t, replica))
+}
