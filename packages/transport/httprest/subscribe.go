@@ -315,7 +315,18 @@ func (s *Storage) dialStream(ctx context.Context, req Request) (opened *stream, 
 	}
 	httpReq.Header.Set("Accept", contentEventStream)
 
-	resp, err := s.http.Do(httpReq)
+	// The caller's client, with its timeout dropped. http.Client.Timeout bounds the whole
+	// exchange, the reading of the body included, which is the right bound for an operation
+	// and the wrong one for a stream: a change stream is meant to stay open with nothing on
+	// it, so the only thing that bound could ever report is that the namespace was quiet. A
+	// subscription severed on a timer would also be a subscription whose replica goes
+	// unusable on that timer, which is the interval R-CON-2 exists to keep out. Everything
+	// else the caller configured is kept, and how long the far side has to answer at all
+	// remains whatever its transport enforces.
+	streaming := *s.http
+	streaming.Timeout = 0
+
+	resp, err := streaming.Do(httpReq)
 	if err != nil {
 		return nil, unreachable(req, err)
 	}
@@ -343,7 +354,11 @@ func (s *Storage) dialStream(ctx context.Context, req Request) (opened *stream, 
 		return nil, unreachable(req, fmt.Errorf("the stream is typed %q, not %q", got, contentEventStream))
 	}
 
-	opened = &stream{req: req, frames: newFrameReader(resp.Body), body: resp.Body, cancel: cancel}
+	// The stream is bounded by how long it may say nothing at all, which is the only bound
+	// left on it: the caller's timeout was dropped above because it bounds the whole
+	// exchange, and a stream is meant to stay open. Cancelling is what returns a read that
+	// is waiting, so it is what the bound acts through.
+	opened = &stream{req: req, frames: newFrameReader(resp.Body, s.silence, cancel), body: resp.Body, cancel: cancel}
 	return opened, nil
 }
 

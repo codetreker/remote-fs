@@ -19,11 +19,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/fuse"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/replicated"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
@@ -61,13 +64,22 @@ func run(args []string, errOut io.Writer) error {
 	// gone away waits forever instead of failing, and a filesystem that hangs is worse to
 	// be behind than one that reports an error.
 	timeout := flags.Duration("timeout", 30*time.Second, "how long one operation may take before it fails as an I/O error")
+	replicaDir := flags.String("replica-dir", "", "directory to keep the local copy of the namespace's metadata under.\n"+
+		"A directory of its own is made inside it, readable only by this user, and\n"+
+		"removed when the mountpoint is detached. The default is the system\n"+
+		"temporary directory, which on many systems is held in memory — give a path\n"+
+		"on disk for a workspace whose tree is large.")
 	debug := flags.Bool("debug", false, "trace every kernel request and reply to standard error")
 	flags.Usage = func() {
 		fmt.Fprint(errOut, "usage: remote-fs -server URL -mountpoint DIR\n\n"+
 			"Presents the namespace served at URL as an ordinary directory tree at DIR.\n"+
 			"Runs until interrupted, then detaches DIR.\n\n"+
-			"Nothing is cached: every operation is a request to the server, so what is read\n"+
-			"is what the server holds at that moment.\n\n")
+			"A copy of the namespace's tree is kept locally and fed by a stream of the\n"+
+			"changes the server records, so listing a directory and asking about a name cost\n"+
+			"no request. The copy is answered from only while that stream is being read: if\n"+
+			"it breaks, every operation fails until it is back, and nothing stale is served.\n"+
+			"Mounting waits for the copy to be built. A namespace that keeps no change log is\n"+
+			"mounted without one, and every operation on it is a request to the server.\n\n")
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
@@ -89,7 +101,7 @@ func run(args []string, errOut io.Writer) error {
 		return fmt.Errorf("-timeout must be positive, not %v", *timeout)
 	}
 
-	namespace, err := httprest.Dial(*serverURL, &http.Client{Timeout: *timeout})
+	namespace, err := httprest.Dial(*serverURL, callerClient(*timeout))
 	if err != nil {
 		return err
 	}
@@ -109,7 +121,13 @@ func run(args []string, errOut io.Writer) error {
 		return fmt.Errorf("the namespace at %s cannot be reached: %w", *serverURL, err)
 	}
 
-	m, err := fuse.New(*mountpoint, namespace, fuse.Options{
+	served, release, err := replicate(ctx, namespace, *replicaDir, errOut)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	m, err := fuse.New(*mountpoint, served, fuse.Options{
 		Logger: log.New(errOut, "remote-fs: ", log.LstdFlags),
 		Debug:  *debug,
 	})
@@ -119,6 +137,108 @@ func run(args []string, errOut io.Writer) error {
 	fmt.Fprintf(errOut, "remote-fs: %s mounted at %s\n", *serverURL, *mountpoint)
 
 	return wait(ctx, stop, m, *mountpoint, errOut)
+}
+
+// callerClient is the HTTP client every request to the server is made with.
+//
+// The timeout is the one this program decides on, because the transport cannot: with no
+// timeout anywhere, an operation against a server that has gone away waits forever instead
+// of failing, and a filesystem that hangs is worse to be behind than one that reports an
+// error.
+//
+// It bounds a whole exchange, the reading of the response included, which is why the
+// transport drops it for the two operations that are streams — a change stream is meant to
+// stay open with nothing on it. The header timeout below is what still bounds those: it
+// covers getting an answer at all, which is where a server that is not answering shows up,
+// and leaves the body unbounded, which is where a healthy stream lives.
+func callerClient(timeout time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = timeout
+	return &http.Client{Timeout: timeout, Transport: transport}
+}
+
+// replicate builds the local copy of the namespace's metadata, and returns the storage the
+// mountpoint is served from together with what releases it.
+//
+// It blocks until the copy has been built. There is no mode in which the mountpoint comes up
+// first and the copy catches up behind it: until the copy is there, an operation answered
+// from it would be answered from an empty tree, and a mount that reported a namespace as
+// empty is the failure this whole system is arranged to avoid.
+//
+// A namespace that keeps no change log answers ENOSYS, and that is not a failure. It is a
+// standing property of that namespace — a namespace held in a local directory has no
+// metastore and so no ordered record of what changed in it — so it is mounted exactly as it
+// was before there was any such thing as a copy, with every operation a request to the
+// server. The distinction from EIO is the whole point of it having its own errno: one says
+// this namespace will never be replicable, the other says the server might answer in a
+// moment.
+func replicate(ctx context.Context, namespace *httprest.Storage, where string, errOut io.Writer) (storage.Storage, func(), error) {
+	dir, database, err := privateDatabase(where)
+	if err != nil {
+		return nil, nil, err
+	}
+	discard := func() {
+		if err := os.RemoveAll(dir); err != nil {
+			fmt.Fprintf(errOut, "remote-fs: the copy of the namespace's metadata is still at %s: %v\n", dir, err)
+		}
+	}
+
+	replica, err := sqlite.OpenReplica(ctx, database)
+	if err != nil {
+		discard()
+		return nil, nil, fmt.Errorf("making room for a copy of the namespace's metadata: %w", err)
+	}
+
+	started := time.Now()
+	served, err := replicated.New(ctx, replica, namespace)
+	switch {
+	case errors.Is(err, syscall.ENOSYS):
+		replica.Close()
+		discard()
+		fmt.Fprintln(errOut, "remote-fs: this namespace keeps no record of what changes in it, so every operation is a request to the server")
+		return namespace, func() {}, nil
+	case err != nil:
+		replica.Close()
+		discard()
+		return nil, nil, fmt.Errorf("copying the namespace's metadata: %w", err)
+	}
+	fmt.Fprintf(errOut, "remote-fs: copied the namespace's metadata in %v\n", time.Since(started).Round(time.Millisecond))
+
+	return served, func() {
+		if err := served.Close(); err != nil {
+			fmt.Fprintf(errOut, "remote-fs: releasing the copy of the namespace's metadata: %v\n", err)
+		}
+		discard()
+	}, nil
+}
+
+// privateDatabase makes the directory the copy is held in and the file it is held in, both
+// out of everybody else's reach.
+//
+// R-SEC-3 asks for both halves of that, and the contents are what make it worth asking: the
+// names, the sizes and the times of somebody's whole workspace. The directory is created with
+// only its owner able to enter it, and with a name nothing could have taken first — os.MkdirTemp
+// fails rather than opening one that is already there, so a path somebody planted is a failure
+// to mount rather than somewhere this writes into. The database file is created here rather
+// than left to SQLite so that its mode is decided rather than inherited from whatever umask
+// this process was started with; SQLite gives the write-ahead log and the shared-memory file
+// beside it the mode of the database file, so deciding it once decides it for all three.
+func privateDatabase(where string) (dir, database string, err error) {
+	dir, err = os.MkdirTemp(where, "remote-fs-replica-")
+	if err != nil {
+		return "", "", fmt.Errorf("making a directory for the copy of the namespace's metadata: %w", err)
+	}
+	database = filepath.Join(dir, "tree.db")
+	file, err := os.OpenFile(database, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		os.RemoveAll(dir)
+		return "", "", fmt.Errorf("making a file for the copy of the namespace's metadata: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		os.RemoveAll(dir)
+		return "", "", fmt.Errorf("making a file for the copy of the namespace's metadata: %w", err)
+	}
+	return dir, database, nil
 }
 
 // reach asks the namespace for its root once, so that a server nobody is listening on is

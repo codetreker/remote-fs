@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -21,7 +22,25 @@ import (
 type Storage struct {
 	base *url.URL
 	http *http.Client
+
+	// silence is how long a stream may say nothing at all before this side stops believing
+	// it is being delivered.
+	silence time.Duration
 }
+
+// DefaultSilence is how long a stream may say nothing before a caller with no reason of its
+// own to choose stops believing in it.
+//
+// It has to be a comfortable multiple of the interval the server sends its keepalives at —
+// Limits.Keepalive, ten seconds by default — because the two are configured separately and
+// a bound below that interval would sever every healthy stream on a timer. Three times it,
+// so that losing one keepalive to a stall is not a broken stream.
+//
+// What it bounds is how long a replica may go on answering from a copy whose stream has
+// stopped arriving without saying so — a machine that vanished, a firewall that dropped the
+// flow, a partition. Nothing shorter than the network's own scheduling is safe, and nothing
+// longer is honest; this is chosen rather than measured, like the other bounds here.
+const DefaultSilence = 30 * time.Second
 
 var _ storage.Storage = (*Storage)(nil)
 
@@ -38,8 +57,17 @@ var _ storage.Storage = (*Storage)(nil)
 // across the wire — rather than promising that the far side answered; whether it is there
 // is the answer to the first operation, and to every one after it.
 func Dial(baseURL string, httpClient *http.Client) (*Storage, error) {
+	return DialWithSilence(baseURL, httpClient, DefaultSilence)
+}
+
+// DialWithSilence is Dial with the bound on a quiet stream given rather than defaulted. What
+// that bound is for, and what it has to be a multiple of, is on DefaultSilence.
+func DialWithSilence(baseURL string, httpClient *http.Client, silence time.Duration) (*Storage, error) {
 	if httpClient == nil {
 		return nil, errors.New("httprest: an HTTP client is required; it carries the timeout policy")
+	}
+	if silence <= 0 {
+		return nil, fmt.Errorf("httprest: a stream allowed to say nothing for %v is a stream nothing is watching", silence)
 	}
 	base, err := url.Parse(baseURL)
 	if err != nil {
@@ -48,7 +76,7 @@ func Dial(baseURL string, httpClient *http.Client) (*Storage, error) {
 	if base.Scheme == "" || base.Host == "" {
 		return nil, fmt.Errorf("httprest: %q needs a scheme and a host", baseURL)
 	}
-	return &Storage{base: base, http: httpClient}, nil
+	return &Storage{base: base, http: httpClient, silence: silence}, nil
 }
 
 func (s *Storage) Stat(ctx context.Context, path string) (storage.Attr, error) {

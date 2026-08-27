@@ -17,20 +17,24 @@ import (
 //	machine A:   echo hello > /mnt/ws/a.txt
 //	machine B:   cat /mnt/ws/a.txt        →  hello      (within one second)
 //
-// Here the two machines are two mountpoints with a client each, against one server over
-// one directory. What that arrangement leaves out is the network between two hosts; what
-// it keeps is every piece of this system that stands between the write and the read.
+// Here the two machines are two mountpoints with a client each, against one server over one
+// namespace. What that arrangement leaves out is the network between two hosts; what it keeps
+// is every piece of this system that stands between the write and the read — including the
+// copy of the metadata each mountpoint keeps, and the stream of changes that feeds it.
 //
 // The second in R-CON-1 is measured from close() returning on A to a successful read on
 // B. That is the interval a person waits: the write is finished when close() returns, and
 // the read is answered when the bytes come back. The scope note never said where the
 // second is measured from, so this is where this suite puts it.
 //
-// The read is attempted once and is not retried. Retrying would turn the assertion into
-// "it becomes visible eventually", and R-CON-2 is the requirement that visibility does
-// not wait for an interval to come round.
+// B's answer becomes true when B's own event arrives, which is a moment after the server
+// recorded the change rather than at the instant A's close() returned, so the read is
+// re-attempted until it succeeds — with no pause between attempts and a hard failure at the
+// second R-CON-1 allows. What that does not prove is R-CON-2: nothing about a measured delay
+// says an interval did not elapse. The test that proves it is the one that counts requests,
+// because a poll is a request and that count is zero.
 func TestWhatOneMountpointWritesAnotherReads(t *testing.T) {
-	s := serveDirectory(t)
+	s := serveNamespace(t)
 	a, b := mountpointOn(t, s), mountpointOn(t, s)
 
 	content := []byte("hello\n")
@@ -46,16 +50,25 @@ func TestWhatOneMountpointWritesAnotherReads(t *testing.T) {
 	}
 	written := time.Now()
 
-	got, err := os.ReadFile(filepath.Join(b, "a.txt"))
-	visible := time.Since(written)
-	if err != nil {
-		t.Fatalf("reading a.txt through B %v after close() returned on A: %v", visible, err)
+	var (
+		got     []byte
+		visible time.Duration
+	)
+	for {
+		got, err = os.ReadFile(filepath.Join(b, "a.txt"))
+		visible = time.Since(written)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("reading a.txt through B %v after close() returned on A: %v", visible, err)
+		}
+		if visible >= time.Second {
+			t.Fatalf("B could not read a.txt %v after close() returned on A; R-CON-1 allows one second", visible)
+		}
 	}
 	if !bytes.Equal(got, content) {
 		t.Fatalf("B read %q, A wrote %q", got, content)
-	}
-	if visible >= time.Second {
-		t.Fatalf("B saw the contents %v after close() returned on A; R-CON-1 allows one second", visible)
 	}
 	t.Logf("close() returned on A → contents read on B: %v", visible)
 }
@@ -88,12 +101,13 @@ func TestTheBytesReachTheBackingDirectory(t *testing.T) {
 // test does not: reading a file by name proves the name resolves, not that the directory
 // reports it. Anything that walks a tree finds files this way.
 func TestACreationOnOneMountpointAppearsInAListingOnTheOther(t *testing.T) {
-	s := serveDirectory(t)
+	s := serveNamespace(t)
 	a, b := mountpointOn(t, s), mountpointOn(t, s)
 
 	if err := os.WriteFile(filepath.Join(a, "a.txt"), []byte("hello\n"), 0o644); err != nil {
 		t.Fatalf("writing a.txt through A: %v", err)
 	}
+	settled(t, "a.txt reaching B", present(filepath.Join(b, "a.txt")))
 	if got := namesIn(t, b); !slices.Equal(got, []string{"a.txt"}) {
 		t.Fatalf("B lists %v, want [a.txt]", got)
 	}
@@ -102,12 +116,13 @@ func TestACreationOnOneMountpointAppearsInAListingOnTheOther(t *testing.T) {
 // TestARemovalOnOneMountpointDisappearsFromTheOther. A deletion that does not propagate
 // is how a mount starts serving files that are gone.
 func TestARemovalOnOneMountpointDisappearsFromTheOther(t *testing.T) {
-	s := serveDirectory(t)
+	s := serveNamespace(t)
 	a, b := mountpointOn(t, s), mountpointOn(t, s)
 
 	if err := os.WriteFile(filepath.Join(a, "a.txt"), []byte("hello\n"), 0o644); err != nil {
 		t.Fatalf("writing a.txt through A: %v", err)
 	}
+	settled(t, "a.txt reaching B", present(filepath.Join(b, "a.txt")))
 	if got := namesIn(t, b); !slices.Equal(got, []string{"a.txt"}) {
 		t.Fatalf("B lists %v before the removal, want [a.txt]", got)
 	}
@@ -115,6 +130,7 @@ func TestARemovalOnOneMountpointDisappearsFromTheOther(t *testing.T) {
 	if err := os.Remove(filepath.Join(a, "a.txt")); err != nil {
 		t.Fatalf("removing a.txt through A: %v", err)
 	}
+	settled(t, "the removal reaching B", absent(filepath.Join(b, "a.txt")))
 	if got := namesIn(t, b); len(got) != 0 {
 		t.Fatalf("B still lists %v after the removal", got)
 	}
@@ -127,7 +143,7 @@ func TestARemovalOnOneMountpointDisappearsFromTheOther(t *testing.T) {
 // file is worse than one that does not arrive: everything that walks the tree stops
 // there and reports the subtree as absent.
 func TestADirectoryMadeOnOneMountpointIsADirectoryOnTheOther(t *testing.T) {
-	s := serveDirectory(t)
+	s := serveNamespace(t)
 	a, b := mountpointOn(t, s), mountpointOn(t, s)
 
 	if err := os.Mkdir(filepath.Join(a, "d"), 0o755); err != nil {
@@ -137,6 +153,7 @@ func TestADirectoryMadeOnOneMountpointIsADirectoryOnTheOther(t *testing.T) {
 		t.Fatalf("writing d/inner.txt through A: %v", err)
 	}
 
+	settled(t, "d/inner.txt reaching B", present(filepath.Join(b, "d", "inner.txt")))
 	info, err := os.Stat(filepath.Join(b, "d"))
 	if err != nil {
 		t.Fatalf("stat d through B: %v", err)
@@ -154,7 +171,7 @@ func TestADirectoryMadeOnOneMountpointIsADirectoryOnTheOther(t *testing.T) {
 // the old name survive would leave whatever is watching the directory with two files
 // where the writer left one, and no way to tell which is current.
 func TestARenameOnOneMountpointIsSeenAsARename(t *testing.T) {
-	s := serveDirectory(t)
+	s := serveNamespace(t)
 	a, b := mountpointOn(t, s), mountpointOn(t, s)
 
 	content := []byte("hello\n")
@@ -165,6 +182,7 @@ func TestARenameOnOneMountpointIsSeenAsARename(t *testing.T) {
 		t.Fatalf("renaming through A: %v", err)
 	}
 
+	settled(t, "the rename reaching B", present(filepath.Join(b, "after.txt")))
 	if got := namesIn(t, b); !slices.Equal(got, []string{"after.txt"}) {
 		t.Fatalf("B lists %v, want [after.txt] alone — the old name surviving would make this a copy", got)
 	}
@@ -184,7 +202,7 @@ func TestARenameOnOneMountpointIsSeenAsARename(t *testing.T) {
 // a replacement done in place: contents written over a longer file leave the old tail
 // behind, and the result reads as a file that was never written by anyone (R-CON-3).
 func TestAnOverwriteOnOneMountpointIsSeenWhole(t *testing.T) {
-	s := serveDirectory(t)
+	s := serveNamespace(t)
 	a, b := mountpointOn(t, s), mountpointOn(t, s)
 
 	path := filepath.Join(a, "a.txt")
@@ -196,6 +214,10 @@ func TestAnOverwriteOnOneMountpointIsSeenWhole(t *testing.T) {
 		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 			t.Fatalf("writing %q through A: %v", content, err)
 		}
+		settled(t, "the new contents reaching B", func() bool {
+			info, err := os.Stat(filepath.Join(b, "a.txt"))
+			return err == nil && info.Size() == int64(len(content))
+		})
 		got, err := os.ReadFile(filepath.Join(b, "a.txt"))
 		if err != nil {
 			t.Fatalf("reading through B after writing %q: %v", content, err)
@@ -277,7 +299,7 @@ func TestASymbolicLinkSurvivesTheWholeChain(t *testing.T) {
 // Every operation the contract offers resolves its own failure, so each gets a case of its
 // own here rather than one standing in for the rest.
 func TestAnUnreachableServerFailsRatherThanAnswering(t *testing.T) {
-	s := serveDirectory(t)
+	s := serveNamespace(t)
 	a := mountpointOn(t, s)
 
 	if err := os.WriteFile(filepath.Join(a, "a.txt"), []byte("hello\n"), 0o644); err != nil {
@@ -291,6 +313,14 @@ func TestAnUnreachableServerFailsRatherThanAnswering(t *testing.T) {
 	}
 
 	s.stop()
+
+	// The mountpoint learns that the server is gone when the stream it is fed by ends, which
+	// is a moment after the listener closed rather than at the instant it closed. Waiting for
+	// that is not what is being tested: what is tested is every answer given afterwards.
+	settled(t, "the mountpoint noticing that the server is gone", func() bool {
+		_, err := os.Lstat(filepath.Join(a, "a.txt"))
+		return errnoOf(err) == syscall.EIO
+	})
 
 	t.Run("a listing fails rather than coming back empty", func(t *testing.T) {
 		entries, err := os.ReadDir(a)
@@ -334,6 +364,34 @@ func TestAnUnreachableServerFailsRatherThanAnswering(t *testing.T) {
 			t.Logf("%v", err)
 		})
 	}
+}
+
+// settled waits for something to become true through a second mountpoint, and fails if it
+// has not within the second R-CON-1 allows.
+//
+// It is not an assertion and nothing turns on it. A mountpoint holds a change when its own
+// event arrives, which is a moment after the server recorded it rather than at the instant
+// the write on the other mountpoint returned — so this decides when to look, and what is
+// asserted afterwards is asserted exactly, once, with everything it has to say about a
+// failure.
+func settled(t *testing.T, what string, holds func() bool) {
+	t.Helper()
+
+	started := time.Now()
+	for !holds() {
+		if waited := time.Since(started); waited >= time.Second {
+			t.Fatalf("%s has not happened %v after the change was made on the other mountpoint; R-CON-1 allows one second", what, waited)
+		}
+	}
+	t.Logf("%s: %v", what, time.Since(started))
+}
+
+func present(at string) func() bool {
+	return func() bool { _, err := os.Lstat(at); return err == nil }
+}
+
+func absent(at string) func() bool {
+	return func() bool { _, err := os.Lstat(at); return errors.Is(err, os.ErrNotExist) }
 }
 
 func namesIn(t *testing.T, dir string) []string {

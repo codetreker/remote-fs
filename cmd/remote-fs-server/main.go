@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/limited"
@@ -118,10 +119,10 @@ func run(args []string, errOut io.Writer) error {
 	}
 	defer ns.close()
 
-	// A nil log: this server hands out the namespace but no record of what changes in it,
-	// so the replication endpoints answer ENOSYS and nothing may build a local copy of
-	// this namespace and trust it.
-	handler, err := httprest.NewHandler(ns.namespace, nil)
+	// The log is what a mount replicates the namespace's metadata from. A namespace with no
+	// metastore behind it has none, and is served with a nil one: its replication endpoints
+	// then answer ENOSYS, and a mount of it goes on making a request for every operation.
+	handler, err := httprest.NewHandler(ns.namespace, ns.log)
 	if err != nil {
 		return err
 	}
@@ -162,6 +163,12 @@ const connectionEnv = "AZURE_STORAGE_CONNECTION_STRING"
 // opened is a namespace ready to be served.
 type opened struct {
 	namespace storage.Storage
+
+	// log is the record of what changes in the namespace, and nil for a namespace that keeps
+	// none. Only a namespace held in a metastore has one: the log's positions are allocated
+	// inside the same transaction that changes the tree, so nothing that does not own that
+	// transaction can produce one.
+	log metastore.Log
 
 	// held is the allowance wrapped around the namespace, and nil when the namespace keeps
 	// its own count or is under no allowance at all. Only a count that can drift has
@@ -268,7 +275,7 @@ func openBlobs(blob blobSource, quota int64) (opened, error) {
 	if blob.prefix != "" {
 		what = fmt.Sprintf("%s under %s", what, blob.prefix)
 	}
-	result := opened{namespace: namespace, what: what, close: namespace.Close}
+	result := opened{namespace: namespace, log: meta, what: what, close: namespace.Close}
 	if quota == 0 {
 		return result, nil
 	}

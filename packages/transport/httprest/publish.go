@@ -41,6 +41,21 @@ type Limits struct {
 	// EventPage is how many changes one read of the log may return while a subscription
 	// catches up.
 	EventPage int
+
+	// Keepalive is how often a change stream with nothing to say says so.
+	//
+	// It is what makes a live stream distinguishable from a dead one. A namespace that
+	// nobody is writing to produces no events, and so does a connection that a firewall
+	// dropped, a machine that vanished, or a partition — the reader sees the same thing in
+	// all four cases, which is nothing at all. A replica that could not tell them apart
+	// would go on answering from a copy it can no longer justify, for as long as the
+	// mistake lasted, which is what R-ERR-1 and R-ERR-2 forbid above everything else.
+	//
+	// It is paired with the bound the reading end keeps: DefaultSilence is three times this
+	// figure. The two are configured separately, so raising this above what a client allows
+	// severs every one of that client's streams on a timer — which is loud rather than
+	// silent, and is the direction to err in.
+	Keepalive time.Duration
 }
 
 // DefaultLimits are the bounds a handler uses when it is not given any.
@@ -54,6 +69,7 @@ func DefaultLimits() Limits {
 		SnapshotDeadline: 5 * time.Minute,
 		SnapshotPage:     1024,
 		EventPage:        256,
+		Keepalive:        10 * time.Second,
 	}
 }
 
@@ -66,6 +82,7 @@ func (l Limits) check() error {
 		{"SnapshotDeadline", int64(l.SnapshotDeadline)},
 		{"SnapshotPage", int64(l.SnapshotPage)},
 		{"EventPage", int64(l.EventPage)},
+		{"Keepalive", int64(l.Keepalive)},
 	} {
 		if bound.value <= 0 {
 			return fmt.Errorf("httprest: Limits.%s is %d, and every bound has to leave room for one of whatever it bounds", bound.name, bound.value)
@@ -263,13 +280,20 @@ func verdictFor(at metastore.Position, retention metastore.Retention) verdict {
 // publish delivers what the log holds after at, and then every change recorded afterwards,
 // for as long as the replica watches.
 //
-// Nothing here waits for an interval. The inner loop reads the log until it has nothing
-// more, and the outer one blocks until this server changes the namespace or the replica
-// goes away. A subscriber too slow to keep up blocks its own write and nothing else; there
-// is deliberately no deadline on that write, because a change stream is meant to stay open
-// with nothing on it, and a stalled one costs a goroutine and a connection rather than
+// No change waits for an interval to come round. The inner loop reads the log until it has
+// nothing more, and the outer one blocks until this server changes the namespace or the
+// replica goes away. A subscriber too slow to keep up blocks its own write and nothing else;
+// there is deliberately no deadline on that write, because a change stream is meant to stay
+// open with nothing on it, and a stalled one costs a goroutine and a connection rather than
 // anything inside the store.
+//
+// The one thing that does happen on a timer is the keepalive, and it carries nothing: a
+// stream that has said nothing for a while is indistinguishable from a stream that is no
+// longer arriving, and the whole worth of a replica rests on being able to tell those apart.
 func (h *Handler) publish(ctx context.Context, out *frameWriter, at metastore.Position, woken <-chan struct{}) error {
+	keepalive := time.NewTicker(h.limits.Keepalive)
+	defer keepalive.Stop()
+
 	for {
 		for {
 			changes, retention, err := h.log.Since(ctx, at, h.limits.EventPage)
@@ -300,6 +324,14 @@ func (h *Handler) publish(ctx context.Context, out *frameWriter, at metastore.Po
 		}
 		select {
 		case <-woken:
+		case <-keepalive.C:
+			// Failing to write it is how this side learns that nobody is reading any more,
+			// which is worth as much as the keepalive itself: without it, a replica that
+			// vanished without closing its connection holds a goroutine and a connection
+			// here until some later change happens to be published.
+			if err := out.alive(); err != nil {
+				return err
+			}
 		case <-ctx.Done():
 			// The replica went away, or the server is going down. There is nobody left to
 			// tell, so there is nothing to say.

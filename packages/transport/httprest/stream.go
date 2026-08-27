@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 // A replication stream is a sequence of server-sent events: for each frame, a line naming
@@ -79,15 +81,76 @@ func (f *frameWriter) fault(cause error) {
 	f.send(eventFault, StreamFault{Message: cause.Error()})
 }
 
+// alive says that the stream is still there, on a stream that has nothing else to say.
+//
+// It is a server-sent event comment — a line beginning with a colon, which carries no event
+// and is discarded by whatever reads it — and it exists because a stream nobody is writing
+// to and a stream whose connection is gone are the same observation on this side of it:
+// silence. Without it the far side has nothing to distinguish "this namespace is quiet"
+// from "these bytes stopped arriving twenty minutes ago", and a replica fed by that stream
+// would go on answering from a copy it can no longer justify (R-ERR-1, R-ERR-2).
+//
+// A failure to write one is how this side learns that the reader is gone, which is the same
+// thing the other way round: without it a replica that vanished without closing its
+// connection holds a goroutine here until something else happens to be published.
+func (f *frameWriter) alive() error {
+	if _, err := fmt.Fprint(f.to, ": alive\n"); err != nil {
+		return err
+	}
+	return f.control.Flush()
+}
+
 // frameReader reads the frames of one stream.
 type frameReader struct {
 	lines *bufio.Scanner
+
+	// silenced records that the stream was abandoned for having gone quiet, so that the
+	// read it interrupted is reported as what it is rather than as the cancellation that
+	// carried it out.
+	silenced *atomic.Bool
+	silence  time.Duration
 }
 
-func newFrameReader(from io.Reader) *frameReader {
-	lines := bufio.NewScanner(from)
+// newFrameReader reads frames from a stream, and gives up on one that has said nothing at
+// all for silence.
+//
+// The bound is on a read that is waiting rather than on the connection, which is what makes
+// it right in both directions. A caller that is not reading this stream — a replica taking
+// a picture of the tree, which leaves what arrives meanwhile queued on the connection — is
+// not relying on it and is not timed out for that; a caller that is waiting is told, within
+// one bound, that nothing is coming. It is reset by bytes rather than by frames, so a page
+// of a snapshot that takes longer than the bound to cross a slow link is not mistaken for a
+// stream that has stopped.
+//
+// abandon is what makes the waiting read return. There is nothing else that could: a
+// response body offers no deadline, and http.Client.Timeout bounds the whole exchange,
+// which on a stream that is meant to stay open with nothing on it is a timer that severs
+// healthy subscriptions.
+func newFrameReader(from io.Reader, silence time.Duration, abandon func()) *frameReader {
+	silenced := &atomic.Bool{}
+	quiet := time.AfterFunc(silence, func() {
+		silenced.Store(true)
+		abandon()
+	})
+	quiet.Stop()
+
+	lines := bufio.NewScanner(&watched{from: from, silence: silence, quiet: quiet})
 	lines.Buffer(make([]byte, 0, 64<<10), maxFrameBytes)
-	return &frameReader{lines: lines}
+	return &frameReader{lines: lines, silenced: silenced, silence: silence}
+}
+
+// watched is a reader whose every wait is bounded.
+type watched struct {
+	from    io.Reader
+	silence time.Duration
+	quiet   *time.Timer
+}
+
+func (w *watched) Read(p []byte) (int, error) {
+	w.quiet.Reset(w.silence)
+	n, err := w.from.Read(p)
+	w.quiet.Stop()
+	return n, err
 }
 
 // next returns the next frame's name and its payload.
@@ -100,6 +163,11 @@ func (f *frameReader) next() (string, []byte, error) {
 	var frame []string
 	for f.lines.Scan() {
 		line := f.lines.Text()
+		// A comment: the far side saying that the stream is still there and it has nothing
+		// else to say. It carries no event, so it is not part of any frame.
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
 		if line != "" {
 			if len(frame) == 2 {
 				return "", nil, fmt.Errorf("a frame carries a line beyond its event and its data: %q", line)
@@ -119,6 +187,11 @@ func (f *frameReader) next() (string, []byte, error) {
 			return "", nil, fmt.Errorf("the %s frame continues with %q, which is not its data", event, frame[1])
 		}
 		return event, []byte(payload), nil
+	}
+	// Checked before the error the read came back with, because that error is this side's
+	// own cancellation and says nothing about what happened.
+	if f.silenced.Load() {
+		return "", nil, fmt.Errorf("nothing at all arrived on this stream for %v, so it is no longer being delivered", f.silence)
 	}
 	if err := f.lines.Err(); err != nil {
 		return "", nil, fmt.Errorf("the stream ended early: %w", err)

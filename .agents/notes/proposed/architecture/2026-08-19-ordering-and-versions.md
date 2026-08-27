@@ -2,7 +2,7 @@
 
 Status: proposed
 
-本 note 的定序规则被 [元数据复制](2026-08-27-metadata-replication.md) 原样采纳，并在那里多了一种输入：一次一致性快照是精确的切割而非下界。
+本 note 的定序规则被 [元数据复制](../../implemented/architecture/2026-08-27-metadata-replication.md) 原样采纳，并在那里多了一种输入：一次一致性快照是精确的切割而非下界。
 
 ## 问题
 
