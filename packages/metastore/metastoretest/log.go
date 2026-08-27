@@ -50,6 +50,21 @@ var logCases = []testCase{
 		}
 	}},
 
+	// Zero is before every change there has ever been, so no change may be recorded at it. A
+	// log that handed the first one out at 0 would be invisible to the caller that has applied
+	// nothing: that caller resumes at 0 and takes only what is strictly greater.
+	{name: "no change is recorded at position zero", run: func(t *testing.T, s metastore.Store) {
+		mustSucceed(t, s.Create(ctx(t), "first"))
+		changes := drain(t, s, 0)
+		if len(changes) == 0 {
+			t.Fatal("the first write to a namespace recorded nothing")
+		}
+		if changes[0].Position <= 0 {
+			t.Fatalf("the first change is at position %d; a caller that has applied nothing resumes at 0 and would never see it",
+				changes[0].Position)
+		}
+	}},
+
 	// It does not change because a process asked again, and it does not change because the
 	// namespace was written to. Only a log that is no longer a continuation of what a caller
 	// saw changes it.
@@ -420,6 +435,33 @@ var sinceCases = []testCase{
 		whole := drain(t, s, 0)
 		if len(walked) != len(whole) {
 			t.Fatalf("walking one change at a time reached %d of them, want the %d one page holds", len(walked), len(whole))
+		}
+	}},
+
+	// A limit of zero asks what the log holds without asking for any of it, which is how a
+	// caller subscribing from now learns the tail to start from and how a reconnecting one
+	// decides between resuming and rebuilding before a single change is sent. The retention it
+	// gets back has to be the whole of it — a limit read as "unset, use some default" would
+	// hand back changes nobody asked for, and one that refused zero would leave the tail
+	// unreachable without them.
+	{name: "a limit of zero reports what the log holds and none of it", run: func(t *testing.T, s metastore.Store) {
+		build(t, s)
+		none, reported, err := s.Since(ctx(t), 0, 0)
+		mustSucceed(t, err)
+		if len(none) != 0 {
+			t.Fatalf("a limit of zero returned %d changes", len(none))
+		}
+		all, whole, err := s.Since(ctx(t), 0, 1000)
+		mustSucceed(t, err)
+		if len(all) == 0 {
+			t.Fatal("the log recorded nothing for a tree that was just built")
+		}
+		if reported != whole {
+			t.Fatalf("a limit of zero reports %+v and a full read reports %+v", reported, whole)
+		}
+		if reported.Tail != all[len(all)-1].Position {
+			t.Fatalf("a limit of zero reports a tail of %d and the newest change is at %d",
+				reported.Tail, all[len(all)-1].Position)
 		}
 	}},
 

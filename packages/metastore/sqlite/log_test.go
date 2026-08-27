@@ -181,6 +181,65 @@ func TestTheFloorSurvivesAnAgeBoundNothingOutlives(t *testing.T) {
 	}
 }
 
+// The tail is read from what the tree recorded, not from the entries the log still holds, and
+// that separation is what keeps "you are caught up" and "you missed everything" apart. A caller
+// arriving at position 0 against a log that holds nothing must be able to tell a namespace
+// nobody has written to from one whose entries are gone.
+//
+// The trim here cannot reach that state — a floor of at least one always keeps the newest entry
+// — so the entries are removed from underneath a live store, which is what a maintenance
+// deletion or a log kept somewhere the tree's transaction does not reach would leave behind.
+func TestTheTailOutlivesTheEntriesItCounted(t *testing.T) {
+	path := database(t)
+	store := open(t, path, "workspace", 0)
+
+	// A namespace nobody has written to: nothing held, nothing recorded, and a caller at 0 is
+	// caught up rather than behind.
+	_, fresh, err := store.Since(t.Context(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Oldest != 0 || fresh.Tail != 0 {
+		t.Fatalf("a namespace nobody has written to holds %+v, want an oldest and a tail of 0", fresh)
+	}
+
+	for i := range 5 {
+		if err := store.Create(t.Context(), fmt.Sprintf("f%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, filled, err := store.Since(t.Context(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filled.Tail == 0 {
+		t.Fatal("five writes left the tail at 0")
+	}
+
+	emptied := raw(t, path)
+	if _, err := emptied.Exec(`DELETE FROM changes`); err != nil {
+		t.Fatal(err)
+	}
+	if err := emptied.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	changes, lost, err := store.Since(t.Context(), 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("an emptied log offered %d changes", len(changes))
+	}
+	if lost.Oldest != 0 {
+		t.Fatalf("an emptied log reports its oldest entry at %d, want 0", lost.Oldest)
+	}
+	if lost.Tail != filled.Tail {
+		t.Fatalf("an emptied log reports a tail of %d, want the %d the tree was changed at; a caller at 0 would read this as being caught up",
+			lost.Tail, filled.Tail)
+	}
+}
+
 // Startup compares the position the tree was last changed at against the newest entry the log
 // still holds. Nothing this package does can put the two apart — the position is allocated in
 // the transaction that applies the change — so the entries are deleted from underneath it
