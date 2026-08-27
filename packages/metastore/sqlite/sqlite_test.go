@@ -1,7 +1,6 @@
 package sqlite_test
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -36,7 +35,15 @@ func database(t *testing.T) string {
 
 func open(t *testing.T, path, namespace string, allowance int64) *sqlite.Store {
 	t.Helper()
-	store, err := sqlite.Open(t.Context(), path, namespace, allowance)
+	return openUnder(t, path, namespace, allowance, sqlite.DefaultWindow())
+}
+
+// openUnder opens a store whose log is held to a window of the case's choosing, which is what
+// the retention cases need: the shipped window keeps ten thousand entries for ten minutes, and
+// a case that filled it would be measuring how fast a test machine writes.
+func openUnder(t *testing.T, path, namespace string, allowance int64, window sqlite.Window) *sqlite.Store {
+	t.Helper()
+	store, err := sqlite.Open(t.Context(), path, namespace, allowance, window)
 	if err != nil {
 		t.Fatalf("opening %q in %s: %v", namespace, path, err)
 	}
@@ -94,7 +101,7 @@ func TestANamespaceOutlivesTheStoreThatMadeIt(t *testing.T) {
 	path := database(t)
 	changed := time.Date(2400, 6, 1, 12, 0, 0, 500000000, time.UTC)
 
-	first, err := sqlite.Open(t.Context(), path, "workspace", 4096)
+	first, err := sqlite.Open(t.Context(), path, "workspace", 4096, sqlite.DefaultWindow())
 	if err != nil {
 		t.Fatalf("opening: %v", err)
 	}
@@ -145,48 +152,14 @@ func commit(t *testing.T, s metastore.Store, path string, size int64) metastore.
 	return key
 }
 
-// A database written by a version we do not understand is refused rather than adapted.
-// Every statement here addresses columns by the meaning this version gives them, so running
-// them against another layout would not fail loudly — it would update the wrong things.
-func TestADatabaseFromAnotherSchemaVersionIsRefused(t *testing.T) {
-	path := database(t)
-	store, err := sqlite.Open(t.Context(), path, "workspace", 0)
-	if err != nil {
-		t.Fatalf("opening a fresh database: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("closing: %v", err)
-	}
-
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`UPDATE schema_version SET version = 999`); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	reopened, err := sqlite.Open(t.Context(), path, "workspace", 0)
-	if err == nil {
-		reopened.Close()
-		t.Fatal("a database of an unknown schema version opened, want a refusal")
-	}
-	if !errors.Is(err, syscall.EINVAL) {
-		t.Fatalf("opening a database of an unknown schema version: %v, want EINVAL", err)
-	}
-}
-
 func TestOpenRefusesArgumentsThatNameNothing(t *testing.T) {
-	if store, err := sqlite.Open(t.Context(), database(t), "", 0); !errors.Is(err, syscall.EINVAL) {
+	if store, err := sqlite.Open(t.Context(), database(t), "", 0, sqlite.DefaultWindow()); !errors.Is(err, syscall.EINVAL) {
 		if err == nil {
 			store.Close()
 		}
 		t.Fatalf("opening a namespace with no name: %v, want EINVAL", err)
 	}
-	if store, err := sqlite.Open(t.Context(), database(t), "workspace", -1); !errors.Is(err, syscall.EINVAL) {
+	if store, err := sqlite.Open(t.Context(), database(t), "workspace", -1, sqlite.DefaultWindow()); !errors.Is(err, syscall.EINVAL) {
 		if err == nil {
 			store.Close()
 		}
@@ -197,7 +170,7 @@ func TestOpenRefusesArgumentsThatNameNothing(t *testing.T) {
 // A database that cannot be created is a failure to report, not a namespace to serve.
 func TestOpenReportsADatabaseItCannotCreate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "no-such-directory", "metastore.db")
-	store, err := sqlite.Open(t.Context(), path, "workspace", 0)
+	store, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
 	if err == nil {
 		store.Close()
 		t.Fatal("opening a database under a directory that does not exist succeeded, want a failure")

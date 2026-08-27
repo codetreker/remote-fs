@@ -1,0 +1,265 @@
+package sqlite_test
+
+import (
+	"errors"
+	"syscall"
+	"testing"
+	"time"
+
+	_ "modernc.org/sqlite"
+
+	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
+)
+
+// A database written by a version we do not understand is refused rather than adapted. Every
+// statement in this package addresses columns by the meaning its own version gives them, so
+// running them against another layout would not fail loudly — it would update the wrong
+// things.
+//
+// The direction that matters most is the one this simulates: a database written by a later
+// build, opened by an earlier one. There is nothing an earlier build can do but stop, because
+// it cannot know which of the columns it addresses the later layout dropped or repurposed.
+// Version 0 recorded in the row is here too, because a store that read it as "no schema yet"
+// would build a fresh layout over a populated database.
+func TestADatabaseFromAnotherSchemaVersionIsRefused(t *testing.T) {
+	for _, version := range []int{0, 3, 999} {
+		path := database(t)
+		store, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
+		if err != nil {
+			t.Fatalf("opening a fresh database: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("closing: %v", err)
+		}
+
+		db := raw(t, path)
+		if _, err := db.Exec(`UPDATE schema_version SET version = ?`, version); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		reopened, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
+		if err == nil {
+			reopened.Close()
+			t.Fatalf("a database recording schema version %d opened, want a refusal", version)
+		}
+		if !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("opening a database recording schema version %d: %v, want EINVAL", version, err)
+		}
+	}
+}
+
+// A database with tables but no recorded version is not a database with no schema, and the
+// difference decides between building a layout over data that is already there and refusing to
+// touch it. There is nothing to guess from, so it is refused.
+func TestADatabaseWithASchemaAndNoVersionIsRefused(t *testing.T) {
+	path := database(t)
+	store, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
+	if err != nil {
+		t.Fatalf("opening a fresh database: %v", err)
+	}
+	if err := store.Create(t.Context(), "held"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db := raw(t, path)
+	if _, err := db.Exec(`DELETE FROM schema_version`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
+	if err == nil {
+		reopened.Close()
+		t.Fatal("a database whose schema records no version opened, want a refusal")
+	}
+	if !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("opening a database whose schema records no version: %v, want EINVAL", err)
+	}
+}
+
+// Version 1 is the layout that had no change log. Carrying it forward adds the log and the
+// bookkeeping beside it, and leaves everything the tree already held exactly where it was.
+//
+// The layout below is written out rather than derived from today's statements, which is the
+// only way this asks the real question: a migration tested against a schema the current build
+// produced is a migration tested against nothing.
+func TestAVersionOneDatabaseIsCarriedForwardIntact(t *testing.T) {
+	path := database(t)
+	writeVersionOne(t, path)
+
+	store := open(t, path, "workspace", 4096)
+
+	// Everything the tree held is still there, with the same node ids: a replica keyed by node
+	// id is the reason those may not be reassigned by a migration.
+	dir, err := store.Stat(t.Context(), "d")
+	if err != nil {
+		t.Fatalf("the directory did not survive the migration: %v", err)
+	}
+	if !dir.IsDir() || dir.ID != 2 {
+		t.Fatalf("the directory came back as node %d with mode %v, want node 2 and a directory", dir.ID, dir.Mode)
+	}
+	file, err := store.Stat(t.Context(), "d/f")
+	if err != nil {
+		t.Fatalf("the file did not survive the migration: %v", err)
+	}
+	if file.ID != 3 || file.Size != 700 || file.Content != "carried" {
+		t.Fatalf("the file came back as %+v, want node 3 of 700 bytes referencing \"carried\"", file)
+	}
+	if file.Mode.Perm() != 0o640 {
+		t.Fatalf("the file came back with mode %v, want 0640", file.Mode)
+	}
+	space, err := store.Space(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if space.Used != 700 {
+		t.Fatalf("the migrated namespace reports %d bytes used, want the 700 it held", space.Used)
+	}
+
+	// The log is there, and it is empty. That is the truthful state: nothing recorded the
+	// history this database accumulated before it had a log, so no replica may resume against
+	// it — which is exactly what an incarnation nothing has ever seen says.
+	changes, retention, err := store.Since(t.Context(), 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 || retention.Tail != 0 || retention.Oldest != 0 {
+		t.Fatalf("the migrated log holds %d changes and %+v, want an empty log", len(changes), retention)
+	}
+	incarnation, err := store.Incarnation(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if incarnation == "" {
+		t.Fatal("the migrated log names its history with the empty string, which every other log would match")
+	}
+
+	// And it records from here on.
+	if err := store.Create(t.Context(), "d/after"); err != nil {
+		t.Fatal(err)
+	}
+	changes, _, err = store.Since(t.Context(), 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) == 0 {
+		t.Fatal("a write after the migration recorded nothing")
+	}
+	if changes[0].Kind != metastore.Created || changes[0].Parent != dir.ID {
+		t.Fatalf("the first change after the migration is a %v under %d, want a creation under the directory %d",
+			changes[0].Kind, changes[0].Parent, dir.ID)
+	}
+
+	// Reopening does not migrate again, and does not decide the log lost anything: the
+	// reconciliation at startup must read an empty log at committed position 0 as consistent.
+	settled, err := store.Incarnation(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again := open(t, path, "workspace", 4096)
+	stable, err := again.Incarnation(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stable != settled {
+		t.Fatalf("reopening the migrated database moved the incarnation from %q to %q", settled, stable)
+	}
+}
+
+// writeVersionOne builds a database in the layout schema version 1 produced, holding one
+// namespace with a directory, a file of 700 bytes and the object those bytes are under.
+func writeVersionOne(t *testing.T, path string) {
+	t.Helper()
+	db := raw(t, path)
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Fatalf("closing the version 1 database: %v", err)
+		}
+	}()
+
+	for _, statement := range []string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL)`,
+		`CREATE TABLE nodes (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			namespace  INTEGER NOT NULL REFERENCES namespaces(id),
+			mode       INTEGER NOT NULL,
+			size       INTEGER NOT NULL,
+			atime_sec  INTEGER NOT NULL,
+			atime_nsec INTEGER NOT NULL,
+			mtime_sec  INTEGER NOT NULL,
+			mtime_nsec INTEGER NOT NULL,
+			content    TEXT REFERENCES objects(key)
+		)`,
+		`CREATE TABLE entries (
+			parent INTEGER NOT NULL REFERENCES nodes(id),
+			name   BLOB    NOT NULL,
+			node   INTEGER NOT NULL REFERENCES nodes(id),
+			PRIMARY KEY (parent, name)
+		) WITHOUT ROWID`,
+		`CREATE INDEX entries_by_node ON entries (node)`,
+		`CREATE TABLE namespaces (
+			id   INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT    NOT NULL UNIQUE,
+			root INTEGER NOT NULL,
+			used INTEGER NOT NULL
+		)`,
+		`CREATE TABLE objects (
+			key          TEXT PRIMARY KEY,
+			namespace    INTEGER NOT NULL REFERENCES namespaces(id),
+			state        INTEGER NOT NULL,
+			size         INTEGER NOT NULL,
+			digest       BLOB,
+			created_sec  INTEGER NOT NULL,
+			created_nsec INTEGER NOT NULL
+		)`,
+		`CREATE INDEX objects_by_state ON objects (namespace, state, created_sec)`,
+		`CREATE INDEX nodes_by_content ON nodes (content)`,
+		`INSERT INTO schema_version (version) VALUES (1)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("building the version 1 layout: %v", err)
+		}
+	}
+
+	// io/fs's bits: a directory of 0755 for the root and for d, a file of 0640 for d/f.
+	const (
+		directory = 1<<31 | 0o755
+		file      = 0o640
+	)
+	at := time.Date(2020, 1, 2, 3, 4, 5, 6, time.UTC).Unix()
+	for _, statement := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO namespaces (id, name, root, used) VALUES (1, 'workspace', 1, 700)`, nil},
+		{`INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		  VALUES (1, 1, ?, 0, ?, 0, ?, 0, NULL)`, []any{directory, at, at}},
+		{`INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		  VALUES (2, 1, ?, 0, ?, 0, ?, 0, NULL)`, []any{directory, at, at}},
+		{`INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
+		  VALUES ('carried', 1, 1, 700, NULL, ?, 0)`, []any{at}},
+		{`INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		  VALUES (3, 1, ?, 700, ?, 0, ?, 0, 'carried')`, []any{file, at, at}},
+		// The names go in as bytes, which is what the BLOB column holds and what version 1
+		// wrote: a string literal here would be stored as TEXT and would never compare equal to
+		// the name a lookup asks with.
+		{`INSERT INTO entries (parent, name, node) VALUES (1, ?, 2)`, []any{[]byte("d")}},
+		{`INSERT INTO entries (parent, name, node) VALUES (2, ?, 3)`, []any{[]byte("f")}},
+	} {
+		if _, err := db.Exec(statement.sql, statement.args...); err != nil {
+			t.Fatalf("filling the version 1 database: %v", err)
+		}
+	}
+}

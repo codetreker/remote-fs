@@ -169,6 +169,12 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 			object.Size, sec, nsec, storedKey(object.Key), node.ID); err != nil {
 			return err
 		}
+		// Modified rather than Created, because the name held this node before the commit. The
+		// commit that makes the file records Created instead: a replica told that a name it has
+		// never held was modified would have to invent the entry the event describes.
+		if err := s.recordChanged(ctx, tx, node.ID); err != nil {
+			return err
+		}
 	} else if err := s.createCommitted(ctx, tx, parent, name, object); err != nil {
 		return err
 	}
@@ -220,7 +226,10 @@ func (s *Store) createCommitted(ctx context.Context, tx *sql.Tx, parent metastor
 	if err := link(ctx, tx, parent.ID, name, id); err != nil {
 		return err
 	}
-	return touch(ctx, tx, parent.ID, now)
+	if err := s.recordCreated(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, id); err != nil {
+		return err
+	}
+	return s.touch(ctx, tx, parent.ID, now)
 }
 
 // account moves the namespace's byte counter by delta, refusing what the allowance cannot
