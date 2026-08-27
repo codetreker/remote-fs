@@ -219,26 +219,35 @@ func replicate(ctx context.Context, namespace *httprest.Storage, where string, e
 // names, the sizes and the times of somebody's whole workspace. The directory is created with
 // only its owner able to enter it, and with a name nothing could have taken first — os.MkdirTemp
 // fails rather than opening one that is already there, so a path somebody planted is a failure
-// to mount rather than somewhere this writes into. The database file is created here rather
-// than left to SQLite so that its mode is decided rather than inherited from whatever umask
-// this process was started with; SQLite gives the write-ahead log and the shared-memory file
-// beside it the mode of the database file, so deciding it once decides it for all three.
+// to mount rather than somewhere this writes into.
 func privateDatabase(where string) (dir, database string, err error) {
 	dir, err = os.MkdirTemp(where, "remote-fs-replica-")
 	if err != nil {
 		return "", "", fmt.Errorf("making a directory for the copy of the namespace's metadata: %w", err)
 	}
 	database = filepath.Join(dir, "tree.db")
-	file, err := os.OpenFile(database, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		os.RemoveAll(dir)
-		return "", "", fmt.Errorf("making a file for the copy of the namespace's metadata: %w", err)
-	}
-	if err := file.Close(); err != nil {
+	if err := createPrivately(database); err != nil {
 		os.RemoveAll(dir)
 		return "", "", fmt.Errorf("making a file for the copy of the namespace's metadata: %w", err)
 	}
 	return dir, database, nil
+}
+
+// createPrivately makes an empty file that only its owner can read or write, and refuses a
+// path anything is already at rather than opening it.
+//
+// The file is made here rather than left to SQLite so that its mode is decided rather than
+// inherited from whatever umask this process was started with; SQLite gives the write-ahead
+// log and the shared-memory file beside it the mode of the database file, so deciding it once
+// decides it for all three. O_EXCL is what makes "already there" a refusal, and it refuses a
+// symbolic link without following it — the case that matters most, because following one
+// would write the shape of somebody's workspace wherever it pointed.
+func createPrivately(path string) error {
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	return file.Close()
 }
 
 // reach asks the namespace for its root once, so that a server nobody is listening on is
