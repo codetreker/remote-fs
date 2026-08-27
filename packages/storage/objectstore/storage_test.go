@@ -84,7 +84,7 @@ func newParts(t *testing.T, allowance int64) parts {
 	if err != nil {
 		t.Fatalf("reaching the blob container: %v", err)
 	}
-	meta, err := sqlite.Open(t.Context(), database, "workspace", allowance)
+	meta, err := sqlite.Open(t.Context(), database, "workspace", allowance, sqlite.DefaultWindow())
 	if err != nil {
 		t.Fatalf("opening the metastore: %v", err)
 	}
@@ -327,7 +327,7 @@ func TestReadReportsAnUnreachableObjectStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("building a client for an address nothing is listening on: %v", err)
 	}
-	meta, err := sqlite.Open(ctx, p.database, "workspace", 0)
+	meta, err := sqlite.Open(ctx, p.database, "workspace", 0, sqlite.DefaultWindow())
 	if err != nil {
 		t.Fatalf("opening the tree again: %v", err)
 	}
