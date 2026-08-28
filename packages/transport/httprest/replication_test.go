@@ -1810,6 +1810,13 @@ func TestStoppingAServerTellsItsReplicasRatherThanBreakingTheirStreams(t *testin
 	if !errors.Is(err, httprest.ErrServerStopping) {
 		t.Fatalf("the replica was given %v, want it to be told the server was stopping", err)
 	}
+	// What it says, not only what it is. errors.Is compares identity and never reads the
+	// message, so without this the one sentence an operator sees for a stopping server is
+	// unasserted — and it is the sentence that has to keep "went away on purpose" apart
+	// from "went away".
+	if said := err.Error(); !strings.Contains(said, "stopping") || !strings.Contains(said, "rather than letting it break") {
+		t.Fatalf("a stopping server told the replica %q, which does not say it left on purpose", said)
+	}
 	// Nothing was lost, so this must not read as either of the two answers that would cost
 	// the replica its copy or leave it unsure what happened.
 	var rebuild *httprest.RebuildError
