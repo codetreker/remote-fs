@@ -75,14 +75,63 @@ func reindent(statement string) string {
 // Where a line breaks and whether a bracket is followed by a space are properties of the text
 // SQLite was handed and of nothing else — one schema's tables may have been created from Go
 // string literals and another's from .sql files — and the layout of neither is something a
-// database can be wrong about. Every token survives, which is the whole content of the
+// database can be wrong about. Everything else survives, which is the whole content of the
 // comparison: AUTOINCREMENT, WITHOUT ROWID, REFERENCES and the column types are visible only in
 // this text, and a structural reading through PRAGMA table_info would drop the first two
 // entirely.
+//
+// A quoted run is one token and is compared exactly. Inside quotes there is no syntax to
+// normalise — it is a default value, a check constraint's operand or a quoted name — so
+// splitting it on the whitespace it contains would make `DEFAULT 'not set'` and
+// `DEFAULT 'not  set'` compare equal, which is the false negative this comparison exists to
+// avoid.
 func Structure(dump string) string {
-	spaced := dump
-	for _, punctuation := range []string{"(", ")", ","} {
-		spaced = strings.ReplaceAll(spaced, punctuation, " "+punctuation+" ")
+	var (
+		tokens []string
+		plain  strings.Builder
+	)
+	flush := func() {
+		tokens = append(tokens, strings.Fields(plain.String())...)
+		plain.Reset()
 	}
-	return strings.Join(strings.Fields(spaced), " ")
+	for i := 0; i < len(dump); {
+		switch c := dump[i]; c {
+		case '\'', '"', '`':
+			flush()
+			end := pastClosingQuote(dump, i)
+			tokens = append(tokens, dump[i:end])
+			i = end
+		case '(', ')', ',':
+			plain.WriteByte(' ')
+			plain.WriteByte(c)
+			plain.WriteByte(' ')
+			i++
+		default:
+			plain.WriteByte(c)
+			i++
+		}
+	}
+	flush()
+	return strings.Join(tokens, " ")
+}
+
+// pastClosingQuote returns the index just past the run opened at start, where a doubled quote is
+// one character of the value rather than the end of it — which is how SQLite escapes a quote
+// inside all three of the marks it accepts.
+//
+// A run nothing closes takes the rest of the dump. That is not a schema SQLite would produce,
+// and keeping it whole is the reading that cannot make two different dumps compare equal.
+func pastClosingQuote(dump string, start int) int {
+	quote := dump[start]
+	for i := start + 1; i < len(dump); i++ {
+		if dump[i] != quote {
+			continue
+		}
+		if i+1 < len(dump) && dump[i+1] == quote {
+			i++
+			continue
+		}
+		return i + 1
+	}
+	return len(dump)
 }

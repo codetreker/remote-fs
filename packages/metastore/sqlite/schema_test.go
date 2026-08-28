@@ -38,12 +38,15 @@ const goldenPreamble = `-- The schema the migrations in migrations/ arrive at, a
 // A fresh database and a database carried forward from version 1 must be the same schema, and
 // must be the one recorded in testdata/schema.sql.
 //
-// The first half is the property the whole arrangement rests on. A fresh database is not built
-// from a description of the current layout; it replays every migration, so there is only one
-// path and it cannot drift from itself. What that leaves open is whether a landed migration has
-// been edited, and this closes it: the version 1 database below is written out by hand, so if
-// 0001_tree.sql ever stops describing version 1, the fresh side gains what the migrated side
-// does not and the two stop matching.
+// A fresh database is not built from a description of the current layout; it replays every
+// migration, so there is only one path and it cannot drift from itself. What this case checks
+// is that replaying the migrations and carrying a real version 1 forward reach the same place.
+//
+// It says nothing about whether a landed migration still describes the version it is named for.
+// Both routes end at the current schema, so an edit to 0001_tree.sql touching anything
+// 0002_replication.sql rebuilds — the entry table and its index, which is most of what
+// 0001_tree.sql says — is replaced before either route finishes and passes here.
+// TestTheFirstMigrationDescribesTheVersionOneDatabasesThatExist is what covers that.
 func TestEveryRouteToTheCurrentSchemaArrivesAtTheSameOne(t *testing.T) {
 	fresh := database(t)
 	open(t, fresh, "workspace", 0)
@@ -92,8 +95,9 @@ func schemaOf(t *testing.T, path string) string {
 // applied — and it is the thing an added migration is easiest to get wrong, by landing a file
 // that nothing runs.
 //
-// The count comes from the directory rather than from what the package embedded, so that a glob
-// which stopped matching is a failure here rather than a schema quietly missing a table.
+// The count comes from the directory rather than from what the package embedded, so a go:embed
+// pattern that stopped agreeing with the directory MustLoad is given is a failure here rather
+// than a schema quietly missing a table.
 func TestTheRecordedVersionIsTheNumberOfMigrations(t *testing.T) {
 	files, err := filepath.Glob("migrations/*.sql")
 	if err != nil {
@@ -116,6 +120,47 @@ func TestTheRecordedVersionIsTheNumberOfMigrations(t *testing.T) {
 		t.Fatalf("a fresh database records schema version %d and there are %d migrations (%v): "+
 			"a migration that does not move the version is one nothing will ever run",
 			version, len(files), files)
+	}
+}
+
+// 0001_tree.sql must describe the version 1 databases that exist, and the comparison above
+// cannot check that. That one compares where the two routes end, and 0002_replication.sql
+// rebuilds the entry table — so whatever 0001_tree.sql says about `entries` is replaced before
+// either route finishes, and both arrive at the same place regardless. An edit claiming version
+// 1 stored names as TEXT rather than BLOB passes it, which was measured rather than reasoned
+// about.
+//
+// This is the check that does not depend on where the routes end. writeVersionOne is version 1
+// written out by hand; running 0001_tree.sql by itself must arrive at the same layout, so an
+// edit to it is an edit to a claim about databases nobody can go back and change.
+func TestTheFirstMigrationDescribesTheVersionOneDatabasesThatExist(t *testing.T) {
+	stated := database(t)
+	statements, err := os.ReadFile(filepath.Join("migrations", "0001_tree.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := raw(t, stated)
+	if _, err := db.Exec(string(statements)); err != nil {
+		t.Fatalf("running 0001_tree.sql on its own: %v", err)
+	}
+	// The version table belongs to the migration runner rather than to any migration, and a
+	// version 1 database has it from its own DDL. Adding it is what makes the two comparable.
+	if _, err := db.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	witness := database(t)
+	writeVersionOne(t, witness)
+
+	said, was := schemaOf(t, stated), schemaOf(t, witness)
+	if sqliteschema.Structure(said) != sqliteschema.Structure(was) {
+		t.Fatalf("0001_tree.sql no longer describes the version 1 databases that exist.\n"+
+			"what it states:\n%s\nwhat version 1 was:\n%s\n"+
+			"A landed migration is a claim about databases already written; changing the schema "+
+			"means adding a file.", said, was)
 	}
 }
 

@@ -364,6 +364,66 @@ func TestStructureIgnoresLayoutAndNothingElse(t *testing.T) {
 	}
 }
 
+// What a quoted run holds is compared exactly. Normalising inside one would be normalising a
+// value rather than syntax, and two schemas differing only in a default or a check constraint
+// would compare equal — a false negative in the comparison this exists to make trustworthy.
+//
+// The cases are pairs that differ only inside quotes, and the marks SQLite accepts for a name
+// are here beside the one it accepts for a string.
+func TestWhatIsInsideQuotesIsCompared(t *testing.T) {
+	for _, pair := range [][2]string{
+		{`CREATE TABLE t (x TEXT DEFAULT 'not set');`, `CREATE TABLE t (x TEXT DEFAULT 'not  set');`},
+		{`CREATE TABLE t (x TEXT DEFAULT 'a,b');`, `CREATE TABLE t (x TEXT DEFAULT 'a ,b');`},
+		{`CREATE TABLE t (x TEXT DEFAULT '(1)');`, `CREATE TABLE t (x TEXT DEFAULT '( 1 )');`},
+		{`CREATE TABLE t (x TEXT CHECK (x <> 'p q'));`, `CREATE TABLE t (x TEXT CHECK (x <> 'p  q'));`},
+		{`CREATE INDEX i ON t (x) WHERE y = 'a b';`, `CREATE INDEX i ON t (x) WHERE y = 'a  b';`},
+		{`CREATE TABLE "a b" (x INTEGER);`, `CREATE TABLE "a  b" (x INTEGER);`},
+		{"CREATE TABLE `a b` (x INTEGER);", "CREATE TABLE `a  b` (x INTEGER);"},
+		// A doubled quote is one character of the value, so these two hold different names.
+		{`CREATE TABLE t (x TEXT DEFAULT 'it''s');`, `CREATE TABLE t (x TEXT DEFAULT 'it s');`},
+	} {
+		if a, b := sqliteschema.Structure(pair[0]), sqliteschema.Structure(pair[1]); a == b {
+			t.Errorf("these compared equal, both reducing to %s:\n  %s\n  %s", a, pair[0], pair[1])
+		}
+	}
+
+	// And the layout outside the quotes is still ignored, which is the whole point of the
+	// reduction: a quoted run must not turn it into a comparison of text.
+	spread := "CREATE TABLE t (\n\tx TEXT DEFAULT 'not set',\n\ty BLOB\n);"
+	packed := `CREATE TABLE t (x TEXT DEFAULT 'not set', y BLOB);`
+	if sqliteschema.Structure(spread) != sqliteschema.Structure(packed) {
+		t.Errorf("the same table laid out two ways did not compare equal.\n%q\n%q",
+			sqliteschema.Structure(spread), sqliteschema.Structure(packed))
+	}
+}
+
+// A quoted run reaches SQLite from a real database as well, so the reduction is checked over
+// what Dump produces rather than only over statements written here.
+func TestAQuotedRunSurvivesADump(t *testing.T) {
+	loose, tight := database(t), database(t)
+	if _, err := loose.ExecContext(t.Context(),
+		"CREATE TABLE t (\n\t\tx TEXT NOT NULL DEFAULT 'not set'\n\t);"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tight.ExecContext(t.Context(),
+		`CREATE TABLE t (x TEXT NOT NULL DEFAULT 'not  set');`); err != nil {
+		t.Fatal(err)
+	}
+
+	looseOut, err := sqliteschema.Dump(t.Context(), loose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tightOut, err := sqliteschema.Dump(t.Context(), tight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sqliteschema.Structure(looseOut) == sqliteschema.Structure(tightOut) {
+		t.Fatalf("two defaults differing by a space compared equal after a dump: %s",
+			sqliteschema.Structure(looseOut))
+	}
+}
+
 // Dump names what SQLite maintains itself rather than skipping it, because whether an implicit
 // index exists is part of the layout even though nothing wrote it.
 func TestDumpNamesWhatNothingWrote(t *testing.T) {

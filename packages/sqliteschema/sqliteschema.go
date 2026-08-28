@@ -31,8 +31,14 @@
 //
 // What that gives up is the current shape being written down in one readable place. Dump is
 // here for that: generate the schema a replay arrives at, record it beside the migrations, and
-// compare. Comparing the two routes with Structure is the stronger check, because it fails even
-// when somebody regenerates the record.
+// compare with Structure.
+//
+// A recorded schema pins where the replay ends, and that is less than it sounds. A migration
+// that rebuilds what an earlier one made — a key that had to change, a table replaced — leaves
+// the earlier statement with no trace in the end state, so editing it moves nothing here.
+// Holding a landed migration to what it says needs a witness of its own: something that
+// describes that version independently, compared against replaying up to it. Nothing in this
+// package can supply that, because the witness is the caller's history rather than the runner's.
 package sqliteschema
 
 import (
@@ -74,8 +80,10 @@ type step struct {
 // Nothing is executed here and nothing is parsed beyond the names. A file's contents reach
 // SQLite exactly as they were written.
 func Load(fsys fs.FS, dir string) (Migrations, error) {
-	// fs.Glob returns its matches sorted, and four digits make that order the numeric one. The
-	// contiguity check below is what holds the two together.
+	// The order fs.Glob returns is not something io/fs promises — a filesystem implementing
+	// GlobFS answers for itself — so nothing here depends on it. The contiguity check below
+	// refuses every ordering but the numeric one, since "this file is version len(steps)+1"
+	// can hold for all of them only when they arrive in order.
 	names, err := fs.Glob(fsys, path.Join(dir, "*.sql"))
 	if err != nil {
 		return Migrations{}, fmt.Errorf("reading the migrations in %s: %w", dir, err)
@@ -113,7 +121,7 @@ func Load(fsys fs.FS, dir string) (Migrations, error) {
 // MustLoad is Load for the package-level variable a caller keeps its embedded migrations in.
 //
 // It panics rather than returning, because everything Load refuses is an authoring mistake in
-// the build itself: a misnumbered file, a misnamed one, a glob that stopped matching. No caller
+// the build itself: a misnumbered file, a misnamed one, a directory holding none. No caller
 // could handle any of them, and a build carrying one is broken wherever it is deployed — so it
 // stops here rather than at the first database somebody opens.
 func MustLoad(fsys fs.FS, dir string) Migrations {

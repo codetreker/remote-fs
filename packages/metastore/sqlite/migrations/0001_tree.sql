@@ -86,7 +86,7 @@ CREATE TABLE namespaces (
 -- sweeper reads: an object nothing references is garbage whatever put it there, and a
 -- reservation nobody committed becomes garbage once it is old enough that no write could
 -- still be in flight for it. The numbers a state takes are stored, so they are part of this
--- schema; they are named in schema.go, beside the statements that read them.
+-- schema; they are named in schema.go and read in objects.go.
 CREATE TABLE objects (
 	key          TEXT PRIMARY KEY,
 	namespace    INTEGER NOT NULL REFERENCES namespaces(id),
