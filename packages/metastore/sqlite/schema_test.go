@@ -1,12 +1,10 @@
 package sqlite_test
 
 import (
-	"database/sql"
 	"errors"
 	"flag"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -15,6 +13,7 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
+	"github.com/codetreker/remote-fs/packages/sqliteschema"
 )
 
 var update = flag.Bool("update", false, "rewrite testdata/schema.sql from the schema the migrations produce")
@@ -24,10 +23,6 @@ var update = flag.Bool("update", false, "rewrite testdata/schema.sql from the sc
 // spread across files. This answers it, and it is also the alarm on the rule those files are
 // kept under. A landed migration is never edited, and an edit that changes what it produces
 // moves this file — so the diff is in the review whether or not anyone thought to mention it.
-//
-// It is the schema SQLite itself reports rather than a copy of the statements, so it holds
-// what was really built: implicit indexes, sqlite_sequence, and the text SQLite chose to store
-// for each object.
 const goldenSchema = "testdata/schema.sql"
 
 // goldenPreamble says what the file is to whoever opens it without having read this test.
@@ -58,7 +53,7 @@ func TestEveryRouteToTheCurrentSchemaArrivesAtTheSameOne(t *testing.T) {
 	open(t, migrated, "workspace", 0)
 
 	built, carried := schemaOf(t, fresh), schemaOf(t, migrated)
-	if structureOf(built) != structureOf(carried) {
+	if sqliteschema.Structure(built) != sqliteschema.Structure(carried) {
 		t.Fatalf("a database built from nothing and one carried forward from version 1 hold different schemas.\n"+
 			"built from nothing:\n%s\ncarried forward:\n%s", built, carried)
 	}
@@ -81,75 +76,15 @@ func TestEveryRouteToTheCurrentSchemaArrivesAtTheSameOne(t *testing.T) {
 	}
 }
 
-// schemaOf reads back everything SQLite holds about the database's layout.
-//
-// The statements are re-indented rather than taken as they are stored. SQLite keeps the text
-// of a CREATE statement exactly as it was given, so the same table written by a Go string
-// literal and by a .sql file is stored with different leading whitespace — and whitespace is
-// not something two databases can disagree about. Every token survives this, which is what the
-// comparison is for: AUTOINCREMENT, WITHOUT ROWID, REFERENCES and the column types are all
-// visible only in this text, and a structural reading through PRAGMA table_info would drop the
-// first two entirely.
-//
-// Objects with no statement of their own — the index SQLite builds for a PRIMARY KEY, and the
-// like — are named rather than skipped, because whether one exists is part of the layout even
-// though nothing wrote it.
 func schemaOf(t *testing.T, path string) string {
 	t.Helper()
 	db := raw(t, path)
 	defer db.Close()
-
-	rows, err := db.Query(`SELECT type, name, sql FROM sqlite_schema ORDER BY type, name`)
+	dump, err := sqliteschema.Dump(t.Context(), db)
 	if err != nil {
-		t.Fatalf("reading the schema back: %v", err)
+		t.Fatalf("reading the schema of %s back: %v", path, err)
 	}
-	defer rows.Close()
-
-	var out strings.Builder
-	for rows.Next() {
-		var kind, name string
-		var statement sql.NullString
-		if err := rows.Scan(&kind, &name, &statement); err != nil {
-			t.Fatal(err)
-		}
-		if statement.Valid {
-			out.WriteString(reindent(statement.String) + ";\n\n")
-			continue
-		}
-		out.WriteString("-- " + kind + " " + name + ", which SQLite maintains itself\n\n")
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	return out.String()
-}
-
-// reindent puts a stored statement on one indentation: the first line flush, every line under
-// it one tab in, and a line closing the column list back at the margin. This is for reading;
-// structureOf is what the comparison uses.
-func reindent(statement string) string {
-	lines := strings.Split(statement, "\n")
-	for i, line := range lines {
-		lines[i] = strings.TrimSpace(line)
-		if i > 0 && !strings.HasPrefix(lines[i], ")") {
-			lines[i] = "\t" + lines[i]
-		}
-	}
-	return strings.Join(lines, "\n")
-}
-
-// structureOf reduces a schema to the tokens in it, so that two databases holding the same
-// layout compare equal however the statements that built them were laid out. Where a line
-// breaks and whether a bracket is followed by a space are properties of the text SQLite was
-// handed and of nothing else: version 1 built its tables from Go string literals and this build
-// reads them from .sql files, and the layout of neither is something a database can be wrong
-// about. Every token survives, which is the whole content of the comparison.
-func structureOf(schema string) string {
-	spaced := schema
-	for _, punctuation := range []string{"(", ")", ","} {
-		spaced = strings.ReplaceAll(spaced, punctuation, " "+punctuation+" ")
-	}
-	return strings.Join(strings.Fields(spaced), " ")
+	return dump
 }
 
 // The version a database ends up at is the number of migrations there are. That is what makes

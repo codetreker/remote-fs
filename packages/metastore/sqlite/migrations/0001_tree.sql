@@ -8,10 +8,9 @@
 -- Prose goes between statements rather than inside them. SQLite stores the text of a
 -- CREATE statement verbatim, comments and all, so a comment inside one ends up in
 -- sqlite_schema and in testdata/schema.sql beside it.
-
-CREATE TABLE schema_version (
-	version INTEGER NOT NULL
-);
+--
+-- There is no schema_version table here: packages/sqliteschema owns the record of how far a
+-- database has been carried, and creates it. A migration describes the caller's own schema.
 
 -- The tree is an inode table with an entry table beside it, which is what makes renaming a
 -- directory a change to one row rather than to every path beneath it. Keying a row by its

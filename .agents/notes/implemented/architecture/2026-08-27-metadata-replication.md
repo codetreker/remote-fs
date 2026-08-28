@@ -31,7 +31,7 @@ Status: implemented
 | 三个内核超时仍然是 0 | 每次内核调用仍然到达这一层，只是答案来自本地 SQLite 而不是网络 |
 | 没有直通模式、没有降级 | 副本没建好，挂载点就还不能用；R-WS-4 知情推后 |
 | 只支持有 metastore 的后端 | `localdir` 后端保持原来的行为 |
-| 迁移机制只到「够用」为止 | 编号的 `.sql` 文件顺序重放，没有回滚、没有校验和、没有跨后端的共享层 |
+| 迁移机制只到「够用」为止 | 编号的 `.sql` 文件顺序重放，没有回滚、没有校验和 |
 | 三个保留窗口参数不实测 | 用默认值交付，踩到再调 |
 
 ### 内核超时保持为 0
@@ -312,6 +312,7 @@ type Storage struct {
 
 ```
 packages/metastore/           + 日志能力，+ Change / Position / Incarnation 这些类型
+packages/sqliteschema/        编号 `.sql` 迁移的加载与重放，schema 的读回与比对    ← 新
 packages/metastore/sqlite/    + schema v2（`migrations/*.sql`），+ Replica / Seeding
 packages/storage/replicated/  读本地、写远端的装饰器                      ← 新
 packages/transport/httprest/  + SSE 事件端点、快照端点、客户端订阅与重放
@@ -352,7 +353,7 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 这一版给 metastore 加日志表、`incarnation` 与 `committed_position`，并把 `entries` 的主键换成 `(namespace, parent, name)`，也就是 schema 从 1 变成 2。在此之前 `schema.go` 只会拒绝：版本对不上就不启动，往前搬的那条路一行代码都没有。
 
-**迁移是 `packages/metastore/sqlite/migrations/` 下编号的 `.sql` 文件，按序重放。** 每个文件就是一个版本：`0001_tree.sql` 到版本 1，`0002_replication.sql` 到版本 2，数据库记下的版本号等于最后跑过的那个文件的编号。编号从 1 起连续，缺号在加载时直接 panic——这样「记录的版本」与「跑过几个文件」是同一句话。
+**迁移是 `packages/metastore/sqlite/migrations/` 下编号的 `.sql` 文件，由 `packages/sqliteschema` 按序重放。** 每个文件就是一个版本：`0001_tree.sql` 到版本 1，`0002_replication.sql` 到版本 2，数据库记下的版本号等于最后跑过的那个文件的编号。编号从 1 起连续，缺号在加载时直接 panic——这样「记录的版本」与「跑过几个文件」是同一句话。
 
 **已落地的迁移必须脱离当前 build 的可及范围，这是选 `.sql` 而不是 Go 的全部理由。** 它替换掉的写法是一条叫 `migrateToTwo` 的 Go 函数，函数体里调 `logStatements()`——也就是**当前 build 写的那份 DDL**。今天两者是同一串字符串，但下一个版本一改 `logStatements()`，「把数据库搬到版本 2」就悄悄变成了「给它版本 3 的形状」，紧接着 v2→v3 的迁移再在这个形状上跑一遍。一个文件不会这样，因为没有东西会去改它。由此得到这里唯一的纪律：**落地的文件永远不改，改 schema 就是加文件。**
 
@@ -360,7 +361,9 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 `testdata/schema.sql` 是这套安排的可读面：迁移分散之后「`entries` 现在长什么样」不再有单一答案，这个文件回答它，由测试从 SQLite 自己报告的 schema 生成。而真正的机器保证是另一条——测试同时建一个新库和一个从手写的版本 1 搬上来的库，比对两者的 schema。改了 `0001_tree.sql`，新库那侧就会多出旧库没有的东西，**即使有人顺手重新生成了 golden，这一条仍然红**。
 
-其余的（回滚、校验和、跨后端的共享层、并发启动的额外互斥）都不做。回滚在只能前滚的语义下没有意义；`prepare` 的那一个事务已经把并发启动、部分失败与版本拒绝三件事一起解决了；共享层要等第二个有 schema 的后端。
+**机制本身放在 `packages/sqliteschema`，不在 sqlite 后端里面。** 它今天只有一个使用者，所以这不是「按需抽象」而是一次判断：这里面没有一行是关于树、日志或命名空间的，它回答的是「把一个 SQLite 数据库搬到某个版本」，而这个问题跟谁在用它无关。边界也因此变干净了——`schema_version` 归运行器所有并由它建表，迁移文件只描述调用方自己的 schema，`0001_tree.sql` 里不再有那张表。它同时把 `Dump` 与 `Structure` 一起给出去：读回 schema 并按 token 比对，是任何用这套机制的人都要写的同一段代码，而且正是那条「已落地的迁移不许改」的守卫赖以成立的东西。
+
+其余的（回滚、校验和、并发启动的额外互斥）都不做。回滚在只能前滚的语义下没有意义；`prepare` 的那一个事务已经把并发启动、部分失败与版本拒绝三件事一起解决了。
 
 降级仍然是拒绝：比数据库新的二进制往前搬，比数据库旧的二进制拒绝启动，永远不猜。版本号记在 `schema_version` 表而不是 `PRAGMA user_version`，因为后者对「没建过库」和「有人写了 0」给同一个 0，而这两者要求相反的动作。
 

@@ -82,9 +82,7 @@ CREATE TABLE objects (
 	created_nsec INTEGER NOT NULL
 );
 
-CREATE TABLE schema_version (
-	version INTEGER NOT NULL
-);
+CREATE TABLE schema_version (version INTEGER NOT NULL);
 
 CREATE TABLE sqlite_sequence(name,seq);
 
