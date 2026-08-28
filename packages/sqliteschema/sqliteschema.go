@@ -39,6 +39,12 @@
 // Holding a landed migration to what it says needs a witness of its own: something that
 // describes that version independently, compared against replaying up to it. Nothing in this
 // package can supply that, because the witness is the caller's history rather than the runner's.
+//
+// The last migration is the one case where that is not yet a gap. It is not history: no database
+// has reached the version after it, so there is nothing it can be a false claim about, and every
+// edit to it moves the recorded schema. What follows is an obligation on whoever adds the next
+// migration — the file it supersedes becomes history at that moment, and it needs a witness from
+// then on.
 package sqliteschema
 
 import (
