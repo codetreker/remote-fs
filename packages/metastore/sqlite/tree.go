@@ -13,7 +13,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// nodeColumns is every column of a node, in the order scanNode reads them. Queries that
+// nodeColumns is every column of a node, in the order nodeScan reads them. Queries that
 // join entries to nodes alias the node table `n`.
 const nodeColumns = `n.id, n.mode, n.size, n.atime_sec, n.atime_nsec, n.mtime_sec, n.mtime_nsec, n.content`
 
@@ -21,41 +21,62 @@ const nodeColumns = `n.id, n.mode, n.size, n.atime_sec, n.atime_nsec, n.mtime_se
 // both the single lookups and the listing.
 type scanner interface{ Scan(dest ...any) error }
 
-// scanNode reads one node's columns.
+// nodeScan holds a node's columns as the database spells them.
 //
-// content is NULL for a directory and for a file that has never been written, and both of
-// those are the empty Key: the contract has one absence, not two.
+// It exists because Scan takes a whole row at once: a query that puts the name or the parent
+// in front of a node's columns cannot delegate to a reader that only knows about the node,
+// and three copies of the same eight-column scan are three places for the column order to
+// drift away from nodeColumns.
+type nodeScan struct {
+	id                 int64
+	mode               int64
+	size               int64
+	atimeSec, mtimeSec int64
+	atimeNsec          int32
+	mtimeNsec          int32
+	content            sql.NullString
+}
+
+// fields are the destinations for nodeColumns, in that order.
+func (s *nodeScan) fields() []any {
+	return []any{&s.id, &s.mode, &s.size, &s.atimeSec, &s.atimeNsec, &s.mtimeSec, &s.mtimeNsec, &s.content}
+}
+
+// node renders what was scanned. content is NULL for a directory and for a file that has
+// never been written, and both of those are the empty Key: the contract has one absence, not
+// two.
+func (s *nodeScan) node() metastore.Node {
+	return metastore.Node{
+		ID:         s.id,
+		Mode:       fs.FileMode(s.mode),
+		Size:       s.size,
+		AccessTime: loadedTime(s.atimeSec, s.atimeNsec),
+		ModTime:    loadedTime(s.mtimeSec, s.mtimeNsec),
+		Content:    metastore.Key(s.content.String),
+	}
+}
+
+// scanNode reads one node's columns.
 func scanNode(row scanner) (metastore.Node, error) {
-	var (
-		node               metastore.Node
-		mode               int64
-		atimeSec, mtimeSec int64
-		atimeNsec          int32
-		mtimeNsec          int32
-		content            sql.NullString
-	)
-	if err := row.Scan(&node.ID, &mode, &node.Size, &atimeSec, &atimeNsec, &mtimeSec, &mtimeNsec, &content); err != nil {
+	var node nodeScan
+	if err := row.Scan(node.fields()...); err != nil {
 		return metastore.Node{}, err
 	}
-	node.Mode = fs.FileMode(mode)
-	node.AccessTime = loadedTime(atimeSec, atimeNsec)
-	node.ModTime = loadedTime(mtimeSec, mtimeNsec)
-	node.Content = metastore.Key(content.String)
-	return node, nil
+	return node.node(), nil
 }
 
 // rootNode reads the directory the namespace starts from. It is a node nobody made, and
 // nothing removes or replaces it.
 func (s *Store) rootNode(ctx context.Context, tx *sql.Tx) (metastore.Node, error) {
-	return scanNode(tx.QueryRowContext(ctx,
-		`SELECT `+nodeColumns+` FROM nodes n JOIN namespaces ns ON ns.root = n.id WHERE ns.id = ?`, s.namespace))
+	return scanNode(tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes n WHERE n.id = ?`, s.root))
 }
 
 // lookup finds the child of parent called name, byte for byte.
-func lookup(ctx context.Context, tx *sql.Tx, parent int64, name []byte) (metastore.Node, bool, error) {
+func (s *Store) lookup(ctx context.Context, tx *sql.Tx, parent int64, name []byte) (metastore.Node, bool, error) {
 	node, err := scanNode(tx.QueryRowContext(ctx,
-		`SELECT `+nodeColumns+` FROM entries e JOIN nodes n ON n.id = e.node WHERE e.parent = ? AND e.name = ?`,
-		parent, name))
+		`SELECT `+nodeColumns+` FROM entries e JOIN nodes n ON n.id = e.node
+		 WHERE e.namespace = ? AND e.parent = ? AND e.name = ?`,
+		s.namespace, parent, name))
 	if errors.Is(err, sql.ErrNoRows) {
 		return metastore.Node{}, false, nil
 	}
@@ -87,7 +108,7 @@ func (s *Store) resolve(ctx context.Context, tx *sql.Tx, cleaned string) (metast
 		if !node.IsDir() {
 			return metastore.Node{}, syscall.ENOTDIR
 		}
-		child, found, err := lookup(ctx, tx, node.ID, []byte(name))
+		child, found, err := s.lookup(ctx, tx, node.ID, []byte(name))
 		if err != nil {
 			return metastore.Node{}, err
 		}
@@ -157,7 +178,7 @@ func (s *Store) List(ctx context.Context, path string) ([]metastore.Child, error
 		if !dir.IsDir() {
 			return syscall.ENOTDIR
 		}
-		children, err = listChildren(ctx, tx, dir.ID)
+		children, err = s.listChildren(ctx, tx, dir.ID)
 		return err
 	}); err != nil {
 		return nil, pathError("list", path, failure(err))
@@ -165,10 +186,11 @@ func (s *Store) List(ctx context.Context, path string) ([]metastore.Child, error
 	return children, nil
 }
 
-func listChildren(ctx context.Context, tx *sql.Tx, parent int64) ([]metastore.Child, error) {
+func (s *Store) listChildren(ctx context.Context, tx *sql.Tx, parent int64) ([]metastore.Child, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT e.name, `+nodeColumns+` FROM entries e JOIN nodes n ON n.id = e.node WHERE e.parent = ? ORDER BY e.name`,
-		parent)
+		`SELECT e.name, `+nodeColumns+` FROM entries e JOIN nodes n ON n.id = e.node
+		 WHERE e.namespace = ? AND e.parent = ? ORDER BY e.name`,
+		s.namespace, parent)
 	if err != nil {
 		return nil, err
 	}
@@ -177,23 +199,13 @@ func listChildren(ctx context.Context, tx *sql.Tx, parent int64) ([]metastore.Ch
 	children := []metastore.Child{}
 	for rows.Next() {
 		var (
-			name               []byte
-			node               metastore.Node
-			mode               int64
-			atimeSec, mtimeSec int64
-			atimeNsec          int32
-			mtimeNsec          int32
-			content            sql.NullString
+			name []byte
+			node nodeScan
 		)
-		if err := rows.Scan(&name, &node.ID, &mode, &node.Size,
-			&atimeSec, &atimeNsec, &mtimeSec, &mtimeNsec, &content); err != nil {
+		if err := rows.Scan(append([]any{&name}, node.fields()...)...); err != nil {
 			return nil, err
 		}
-		node.Mode = fs.FileMode(mode)
-		node.AccessTime = loadedTime(atimeSec, atimeNsec)
-		node.ModTime = loadedTime(mtimeSec, mtimeNsec)
-		node.Content = metastore.Key(content.String)
-		children = append(children, metastore.Child{Name: name, Node: node})
+		children = append(children, metastore.Child{Name: name, Node: node.node()})
 	}
 	return children, rows.Err()
 }
@@ -218,10 +230,16 @@ func (s *Store) SetAttr(ctx context.Context, path string, change storage.AttrCha
 		if err != nil {
 			return err
 		}
+		// Nothing was written, so nothing is recorded. An event carrying a node identical to
+		// the one every replica already holds would still cost a position and a slot in the
+		// retention window, and a caller sending empty changes would push real events out of it.
 		if change.Empty() {
 			return nil
 		}
-		return applyChange(ctx, tx, node, change)
+		if err := applyChange(ctx, tx, node, change); err != nil {
+			return err
+		}
+		return s.recordChanged(ctx, tx, node.ID)
 	}); err != nil {
 		return pathError("setattr", path, failure(err))
 	}
@@ -296,22 +314,24 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 		if err != nil {
 			return err
 		}
-		if err := link(ctx, tx, parent.ID, name, id); err != nil {
+		if err := s.link(ctx, tx, parent.ID, name, id); err != nil {
 			return err
 		}
-		return touch(ctx, tx, parent.ID, now)
+		if err := s.recordCreated(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, id); err != nil {
+			return err
+		}
+		return s.touch(ctx, tx, parent.ID, now)
 	}); err != nil {
 		return pathError(op, path, failure(err))
 	}
 	return nil
 }
 
-// link puts a name in a directory. A name already there is EEXIST, which the primary key
-// over (parent, name) is what decides — so two writers racing for one name cannot both be
-// told they made it.
-func link(ctx context.Context, tx *sql.Tx, parent int64, name []byte, node int64) error {
-	if _, err := tx.ExecContext(ctx, `INSERT INTO entries (parent, name, node) VALUES (?, ?, ?)`,
-		parent, name, node); err != nil {
+// link puts a name in a directory. A name already there is EEXIST, which the primary key is
+// what decides — so two writers racing for one name cannot both be told they made it.
+func (s *Store) link(ctx context.Context, tx *sql.Tx, parent int64, name []byte, node int64) error {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO entries (namespace, parent, name, node) VALUES (?, ?, ?, ?)`,
+		s.namespace, parent, name, node); err != nil {
 		if isUniqueViolation(err) {
 			return syscall.EEXIST
 		}
@@ -320,24 +340,35 @@ func link(ctx context.Context, tx *sql.Tx, parent int64, name []byte, node int64
 	return nil
 }
 
-func unlink(ctx context.Context, tx *sql.Tx, parent int64, name []byte) error {
-	_, err := tx.ExecContext(ctx, `DELETE FROM entries WHERE parent = ? AND name = ?`, parent, name)
+func (s *Store) unlink(ctx context.Context, tx *sql.Tx, parent int64, name []byte) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM entries WHERE namespace = ? AND parent = ? AND name = ?`,
+		s.namespace, parent, name)
 	return err
 }
 
 // touch records that a directory's contents changed. A directory's modification time is the
 // moment a name was last added to it or taken out of it, which is what a local filesystem
 // reports and what anything comparing a directory against what it holds reads.
-func touch(ctx context.Context, tx *sql.Tx, id int64, at time.Time) error {
+//
+// The log entry is part of touching rather than a step beside it, so that no future caller can
+// move a directory's time without saying so. A replica is a snapshot plus the changes after
+// it: a modification time that moved without an event stays frozen at whatever the snapshot
+// caught, and a build tool comparing a directory against its contents would read a time that
+// stopped being true, with nothing behind it to correct the answer.
+func (s *Store) touch(ctx context.Context, tx *sql.Tx, id int64, at time.Time) error {
 	sec, nsec := storedTime(at)
-	_, err := tx.ExecContext(ctx, `UPDATE nodes SET mtime_sec = ?, mtime_nsec = ? WHERE id = ?`, sec, nsec, id)
-	return err
+	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET mtime_sec = ?, mtime_nsec = ? WHERE id = ?`,
+		sec, nsec, id); err != nil {
+		return err
+	}
+	return s.recordChanged(ctx, tx, id)
 }
 
 // isEmpty reports whether a directory holds no names.
-func isEmpty(ctx context.Context, tx *sql.Tx, parent int64) (bool, error) {
+func (s *Store) isEmpty(ctx context.Context, tx *sql.Tx, parent int64) (bool, error) {
 	var one int
-	switch err := tx.QueryRowContext(ctx, `SELECT 1 FROM entries WHERE parent = ? LIMIT 1`, parent).Scan(&one); {
+	switch err := tx.QueryRowContext(ctx,
+		`SELECT 1 FROM entries WHERE namespace = ? AND parent = ? LIMIT 1`, s.namespace, parent).Scan(&one); {
 	case errors.Is(err, sql.ErrNoRows):
 		return true, nil
 	case err != nil:
@@ -362,7 +393,7 @@ func (s *Store) Remove(ctx context.Context, path string) error {
 		if err != nil {
 			return err
 		}
-		node, found, err := lookup(ctx, tx, parent.ID, name)
+		node, found, err := s.lookup(ctx, tx, parent.ID, name)
 		if err != nil {
 			return err
 		}
@@ -372,13 +403,16 @@ func (s *Store) Remove(ctx context.Context, path string) error {
 		if node.IsDir() {
 			return syscall.EISDIR
 		}
-		if err := unlink(ctx, tx, parent.ID, name); err != nil {
+		if err := s.unlink(ctx, tx, parent.ID, name); err != nil {
 			return err
 		}
 		if err := s.discard(ctx, tx, node); err != nil {
 			return err
 		}
-		return touch(ctx, tx, parent.ID, time.Now())
+		if err := s.recordRemoved(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}); err != nil {
+			return err
+		}
+		return s.touch(ctx, tx, parent.ID, time.Now())
 	}); err != nil {
 		return pathError("unlink", path, failure(err))
 	}
@@ -401,7 +435,7 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 		if err != nil {
 			return err
 		}
-		node, found, err := lookup(ctx, tx, parent.ID, name)
+		node, found, err := s.lookup(ctx, tx, parent.ID, name)
 		if err != nil {
 			return err
 		}
@@ -411,20 +445,23 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 		if !node.IsDir() {
 			return syscall.ENOTDIR
 		}
-		empty, err := isEmpty(ctx, tx, node.ID)
+		empty, err := s.isEmpty(ctx, tx, node.ID)
 		if err != nil {
 			return err
 		}
 		if !empty {
 			return syscall.ENOTEMPTY
 		}
-		if err := unlink(ctx, tx, parent.ID, name); err != nil {
+		if err := s.unlink(ctx, tx, parent.ID, name); err != nil {
 			return err
 		}
 		if err := s.discard(ctx, tx, node); err != nil {
 			return err
 		}
-		return touch(ctx, tx, parent.ID, time.Now())
+		if err := s.recordRemoved(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}); err != nil {
+			return err
+		}
+		return s.touch(ctx, tx, parent.ID, time.Now())
 	}); err != nil {
 		return pathError("rmdir", path, failure(err))
 	}
@@ -478,7 +515,7 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 	if err != nil {
 		return err
 	}
-	moving, found, err := lookup(ctx, tx, fromParent.ID, fromName)
+	moving, found, err := s.lookup(ctx, tx, fromParent.ID, fromName)
 	if err != nil {
 		return err
 	}
@@ -490,7 +527,7 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 	if err != nil {
 		return err
 	}
-	displaced, occupied, err := lookup(ctx, tx, toParent.ID, toName)
+	displaced, occupied, err := s.lookup(ctx, tx, toParent.ID, toName)
 	if err != nil {
 		return err
 	}
@@ -517,7 +554,7 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 		case !displaced.IsDir() && moving.IsDir():
 			return syscall.ENOTDIR
 		case displaced.IsDir():
-			empty, err := isEmpty(ctx, tx, displaced.ID)
+			empty, err := s.isEmpty(ctx, tx, displaced.ID)
 			if err != nil {
 				return err
 			}
@@ -525,25 +562,36 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 				return syscall.ENOTEMPTY
 			}
 		}
-		if err := unlink(ctx, tx, toParent.ID, toName); err != nil {
+		if err := s.unlink(ctx, tx, toParent.ID, toName); err != nil {
 			return err
 		}
 		if err := s.discard(ctx, tx, displaced); err != nil {
 			return err
 		}
+		if err := s.recordRemoved(ctx, tx, metastore.Location{Parent: toParent.ID, Name: toName}); err != nil {
+			return err
+		}
 	}
 
-	if _, err := tx.ExecContext(ctx, `UPDATE entries SET parent = ?, name = ? WHERE parent = ? AND name = ?`,
-		toParent.ID, toName, fromParent.ID, fromName); err != nil {
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE entries SET parent = ?, name = ? WHERE namespace = ? AND parent = ? AND name = ?`,
+		toParent.ID, toName, s.namespace, fromParent.ID, fromName); err != nil {
+		return err
+	}
+	// The node itself is untouched by the move — only the entry naming it was rewritten — so
+	// the one read before the move is what the destination holds now.
+	if err := s.recordRenamed(ctx, tx,
+		metastore.Location{Parent: toParent.ID, Name: toName},
+		metastore.Location{Parent: fromParent.ID, Name: fromName}, moving); err != nil {
 		return err
 	}
 
 	now := time.Now()
-	if err := touch(ctx, tx, fromParent.ID, now); err != nil {
+	if err := s.touch(ctx, tx, fromParent.ID, now); err != nil {
 		return err
 	}
 	if toParent.ID == fromParent.ID {
 		return nil
 	}
-	return touch(ctx, tx, toParent.ID, now)
+	return s.touch(ctx, tx, toParent.ID, now)
 }

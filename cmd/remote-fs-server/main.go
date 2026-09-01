@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/limited"
@@ -118,7 +119,10 @@ func run(args []string, errOut io.Writer) error {
 	}
 	defer ns.close()
 
-	handler, err := httprest.NewHandler(ns.namespace)
+	// The log is what a mount replicates the namespace's metadata from. A namespace with no
+	// metastore behind it has none, and is served with a nil one: its replication endpoints
+	// then answer ENOSYS, and a mount of it goes on making a request for every operation.
+	handler, err := httprest.NewHandler(ns.namespace, ns.log)
 	if err != nil {
 		return err
 	}
@@ -134,7 +138,21 @@ func run(args []string, errOut io.Writer) error {
 	// anything reading this output parses it for.
 	fmt.Fprintf(errOut, "remote-fs-server: serving %s%s at http://%s\n", ns.what, ns.allowance, listener.Addr())
 
-	return serve(&http.Server{Handler: handler}, listener, ns, errOut)
+	return serve(newServer(handler), listener, ns, errOut)
+}
+
+// newServer builds the HTTP server this command serves with.
+//
+// The registration is the whole reason it is a function rather than a literal. A change
+// stream never becomes idle, and http.Server.Shutdown waits for connections that are, so
+// without telling the streams to let go, stopping a server with one mount attached waits
+// out the entire grace period and then reports that it expired — an ordinary stop turned
+// into a stall and a failure — while every attached mount sees its stream break rather than
+// being told the server was going away.
+func newServer(handler *httprest.Handler) *http.Server {
+	server := &http.Server{Handler: handler}
+	server.RegisterOnShutdown(handler.Stop)
+	return server
 }
 
 // blobSource names the parts of a namespace whose contents are in a blob container. The
@@ -159,6 +177,12 @@ const connectionEnv = "AZURE_STORAGE_CONNECTION_STRING"
 // opened is a namespace ready to be served.
 type opened struct {
 	namespace storage.Storage
+
+	// log is the record of what changes in the namespace, and nil for a namespace that keeps
+	// none. Only a namespace held in a metastore has one: the log's positions are allocated
+	// inside the same transaction that changes the tree, so nothing that does not own that
+	// transaction can produce one.
+	log metastore.Log
 
 	// held is the allowance wrapped around the namespace, and nil when the namespace keeps
 	// its own count or is under no allowance at all. Only a count that can drift has
@@ -255,7 +279,7 @@ func openBlobs(blob blobSource, quota int64) (opened, error) {
 	if err != nil {
 		return opened{}, err
 	}
-	meta, err := sqlite.Open(context.Background(), blob.database, blob.workspace, quota)
+	meta, err := sqlite.Open(context.Background(), blob.database, blob.workspace, quota, sqlite.DefaultWindow())
 	if err != nil {
 		return opened{}, err
 	}
@@ -265,7 +289,7 @@ func openBlobs(blob blobSource, quota int64) (opened, error) {
 	if blob.prefix != "" {
 		what = fmt.Sprintf("%s under %s", what, blob.prefix)
 	}
-	result := opened{namespace: namespace, what: what, close: namespace.Close}
+	result := opened{namespace: namespace, log: meta, what: what, close: namespace.Close}
 	if quota == 0 {
 		return result, nil
 	}

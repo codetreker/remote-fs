@@ -1,16 +1,23 @@
 // Package httprest carries the storage contract over HTTP: the shape of a request URL,
 // the shape of a response body, the handler that answers one, and the storage.Storage
-// that reaches one.
+// that reaches one. Beside it, it carries the replication contract: the change stream a
+// replica watches, and the consistent picture it starts from.
 //
 // Both ends live here because they share the messages, and a message type one end could
 // change without the other noticing is the failure this arrangement exists to prevent.
 // Neither end needs anything beyond net/http, so taking one of them links nothing that
 // was not asked for.
 //
-// One operation is one request. Nothing here is stateful, and nothing here assumes that
-// a single connection carries more than one exchange — the change-event stream this
-// system will grow is a separate endpoint on a separate connection, and adding it does
-// not disturb anything below.
+// One storage operation is one request, and nothing about one is stateful. The two
+// replication endpoints are the exception and are streams by nature: one stays open for
+// as long as a replica is watching, the other for as long as a whole tree takes to cross
+// the wire. They are separate endpoints, so an HTTP client puts them on separate
+// connections without being asked to — which is the property the design turns on. A
+// change must reach a watching replica in a time that does not depend on what bulk
+// transfer is in flight beside it, and a snapshot is the largest bulk transfer this
+// system has. Merging the two onto one connection, or multiplexing them as two streams of
+// one HTTP/2 connection, gives that property up: one lost packet stalls every stream on
+// that TCP connection, and one large frame occupies it regardless.
 //
 // The handler holds no state of its own and caches nothing: the namespace's facts live
 // in the storage it was built over, and a copy of them here could only ever be a copy
@@ -32,7 +39,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+
+	"github.com/codetreker/remote-fs/packages/metastore"
 )
 
 const (
@@ -69,7 +79,7 @@ var (
 	ErrOperands  = errors.New("malformed operands")
 )
 
-// Op names one storage operation. The name is the last segment of the request URL path.
+// Op names one operation. The name is the last segment of the request URL path.
 type Op string
 
 // The eleven operations of the storage contract.
@@ -87,14 +97,33 @@ const (
 	OpSpace     Op = "space"
 )
 
+// The three operations of the replication contract.
+//
+// Beginning a stream at the log's tail and continuing one from a recorded position are
+// two operations rather than one with an optional resume point, and the reason is the
+// same one that makes every operand mandatory below: url.Values reports a query that did
+// not parse, an operand that is absent and an operand that arrived twice all as an empty
+// string. An optional resume point would let a replica asking to continue at position
+// 12345 be answered with a stream that begins at the tail — every change in between lost,
+// no error anywhere, and nothing left afterwards by which to notice. The distinction sits
+// in the URL path instead, which is the one part of a request that cannot degrade into
+// something else.
+const (
+	OpSubscribe   Op = "subscribe"
+	OpResubscribe Op = "resubscribe"
+	OpSnapshot    Op = "snapshot"
+)
+
 // Query keys for the operands. Operands travel in the query string rather than in the
 // URL path because the query string is the only part of a URL that survives a namespace
 // path intact: http.ServeMux collapses "a//f" to "a/f" and resolves "a/b/../f" before a
 // handler sees it, and an encoded slash in a path segment cannot be told apart from a
 // separator. url.Values escaping round-trips any byte sequence, valid UTF-8 or not.
 const (
-	keyPath = "path"
-	keyTo   = "to"
+	keyPath        = "path"
+	keyTo          = "to"
+	keyIncarnation = "incarnation"
+	keyPosition    = "position"
 )
 
 type opSpec struct {
@@ -125,18 +154,28 @@ var ops = map[Op]opSpec{
 	// Space describes the whole namespace rather than anything under a path, so it takes
 	// no operands. A path sent beside it is refused like any operand nobody asked for.
 	OpSpace: {method: http.MethodGet},
+
+	// The replication endpoints read; none of them changes anything. Subscribe and
+	// Snapshot both mean "as the namespace is now", which is a question with no operands.
+	OpSubscribe:   {method: http.MethodGet},
+	OpResubscribe: {method: http.MethodGet, operands: []string{keyIncarnation, keyPosition}},
+	OpSnapshot:    {method: http.MethodGet},
 }
 
 // Request is one operation and its operands.
 //
-// Path is the operand every operation but OpSpace takes, and for OpRename it is the
-// source. To is the destination and is meaningful for OpRename alone. A field an
+// Path is the operand every storage operation but OpSpace takes, and for OpRename it is
+// the source. To is the destination and is meaningful for OpRename alone. Incarnation and
+// Position are the resume point and are meaningful for OpResubscribe alone. A field an
 // operation does not take is not carried, so it does not survive a round trip through a
 // URL.
 type Request struct {
 	Op   Op
 	Path string
 	To   string
+
+	Incarnation metastore.Incarnation
+	Position    metastore.Position
 }
 
 // Method reports the HTTP method the operation is sent with. Operations that only read
@@ -216,24 +255,52 @@ func ParseRequest(method string, u *url.URL) (Request, error) {
 		if !present || len(values) != 1 {
 			return Request{}, fmt.Errorf("%w: %s takes exactly one %q, got %d", ErrOperands, op, operand, len(values))
 		}
-		req.setOperand(operand, values[0])
+		if err := req.setOperand(operand, values[0]); err != nil {
+			return Request{}, fmt.Errorf("%w: %s: %w", ErrOperands, op, err)
+		}
 	}
 	return req, nil
 }
 
 func (r Request) operand(key string) string {
-	if key == keyTo {
+	switch key {
+	case keyTo:
 		return r.To
+	case keyIncarnation:
+		return string(r.Incarnation)
+	case keyPosition:
+		return strconv.FormatInt(int64(r.Position), 10)
+	default:
+		return r.Path
 	}
-	return r.Path
 }
 
-func (r *Request) setOperand(key, value string) {
-	if key == keyTo {
+// setOperand records one operand, refusing a value that is not one.
+//
+// A position is the only operand that is not a byte sequence, so it is the only one that
+// can arrive as something the request cannot hold. Refusing it here rather than repairing
+// it is what keeps a damaged resume point from reading as position zero, which is where a
+// replica that has seen nothing resumes from — the whole log replayed, or, once the log
+// no longer reaches back that far, an unexplained rebuild.
+func (r *Request) setOperand(key, value string) error {
+	switch key {
+	case keyTo:
 		r.To = value
-		return
+	case keyIncarnation:
+		r.Incarnation = metastore.Incarnation(value)
+	case keyPosition:
+		position, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("%q is not a position: %w", value, err)
+		}
+		if position < 0 {
+			return fmt.Errorf("%q is not a position: the first position is zero", value)
+		}
+		r.Position = metastore.Position(position)
+	default:
+		r.Path = value
 	}
-	r.Path = value
+	return nil
 }
 
 func keysOf(query url.Values) []string {

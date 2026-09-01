@@ -156,6 +156,11 @@ type Store interface {
 
 	// Close releases whatever the Store holds open.
 	Close() error
+
+	// Log is what a mount replicates from. Every Store provides it, because a position has
+	// to be allocated inside the same change that applies the tree edit, and only the thing
+	// that owns that change can do it.
+	Log
 }
 
 // Key names one stored object. It is opaque to everything above the store that allocated
@@ -224,4 +229,213 @@ type Object struct {
 
 	// ModTime is the instant the contents are recorded as having changed.
 	ModTime time.Time
+}
+
+// --- the change log ------------------------------------------------------------------
+
+// Log is what makes a namespace replicable: an ordered record of what changed, plus a way
+// to take a consistent picture of the tree to start from.
+//
+// It is part of the Store contract rather than a capability beside it because the two
+// cannot be separated safely. A position has to be allocated in the same atomic change
+// that applies the tree edit; an implementation that appended to a log afterwards would
+// leave a window in which a change is committed and its event is not, and once the log
+// outlives the process that window stops healing itself. Only the thing that owns the
+// transaction can close it.
+//
+// Nothing here writes. Recording a change is a side effect of the tree operation that
+// caused it, so there is no Append: an implementation that let a caller append would let
+// the log say something the tree does not.
+type Log interface {
+	// Snapshot opens a consistent picture of the whole tree and reports the position it is
+	// taken at. Every row it yields reflects the same instant, and no change later than
+	// that position is in it.
+	//
+	// A caller subscribes first and takes a snapshot second. The reverse order does not
+	// converge: the scan takes time, changes accumulate while it runs, and if enough of
+	// them accumulate to push the snapshot's position out of the retention window the
+	// caller must start over — with a cost proportional to the size of the tree, so the
+	// larger the namespace the less likely it is to ever finish. Subscribing first takes
+	// the window off that path entirely.
+	//
+	// Consistency is required of the picture, not of the mechanism: a read transaction, a
+	// multi-version read, or a lock held only long enough to take a cheap reference all
+	// satisfy it. What an implementation may not do is hold a lock for the whole delivery,
+	// because the rows are streamed to somewhere far away and the delivery is as slow as
+	// the network.
+	Snapshot(ctx context.Context) (Snap, Position, error)
+
+	// Since returns at most limit changes recorded after the given position, oldest first,
+	// along with what the log still holds.
+	//
+	// A caller compares the two to learn which of three things happened, because the
+	// answers call for different actions and an implementation that could not tell them
+	// apart would answer the worst of them silently:
+	//
+	//   after == Tail             — caught up; nothing was missed
+	//   after >= TrimmedThrough   — resumable; the changes are returned
+	//   otherwise                 — the log no longer holds them, and the caller must rebuild
+	//
+	// The middle test is against what was discarded rather than against what survives,
+	// because those are different questions wherever positions have gaps in them. Asking
+	// whether the oldest surviving entry is the caller's very next position asks about
+	// adjacency, which no implementation promises.
+	Since(ctx context.Context, after Position, limit int) ([]Change, Retention, error)
+
+	// Incarnation identifies this log as a continuation of itself.
+	//
+	// A caller resumes with the pair (incarnation, position); a position alone is not
+	// enough. A log that lost its history — a fresh in-memory one after a restart, or one
+	// whose tail did not survive a crash — would otherwise be asked to resume at a position
+	// it has never heard of, and the reasonable-looking answer, "that is within my window,
+	// you are caught up", loses every change in between with nothing left to notice it by.
+	//
+	// It changes whenever the log is not a verbatim continuation of what the caller last
+	// saw, and it does not change merely because a process restarted.
+	Incarnation(ctx context.Context) (Incarnation, error)
+
+	// CommittedPosition is the newest position the tree itself was changed at, which for a
+	// log kept beside the tree is the log's own tail.
+	//
+	// It exists for the one case where those two can disagree: a log kept somewhere that
+	// does not share the tree's transaction can be missing its last entries after a crash.
+	// Comparing the two at startup turns that from permanent silent divergence into one
+	// honest rebuild, and an implementation that finds them apart must change its
+	// incarnation.
+	CommittedPosition(ctx context.Context) (Position, error)
+}
+
+// Snap is one consistent picture of a tree, delivered in pages.
+//
+// It holds a resource for as long as it is open — a read transaction, a version, a
+// reference — so a caller closes it as soon as it is done, and an implementation is free
+// to refuse one that has been open too long. Whatever it holds is released by Close.
+type Snap interface {
+	// Next returns at most limit rows and reports whether the picture is complete. A caller
+	// that stops early still calls Close.
+	Next(ctx context.Context, limit int) (rows []Row, done bool, err error)
+
+	// Close releases what the picture holds.
+	Close() error
+}
+
+// Position orders the changes to one namespace. It increases with every change and is
+// never reused, so a caller that has applied everything up to some position can ask for
+// what came after it. Zero is before every change there has ever been.
+//
+// Positions are dense in no particular way: an implementation may leave gaps, and a caller
+// may only compare them.
+type Position int64
+
+// Incarnation names a run of history. It is compared for equality and nothing else; two
+// values that differ mean the caller must start over.
+type Incarnation string
+
+// Retention is what a log still holds.
+type Retention struct {
+	// Oldest is the position of the oldest change still recorded, or 0 when the log holds
+	// nothing. It says what is here, which is a question worth being able to ask: whether a
+	// log has begun discarding at all, and how much of one is left.
+	//
+	// It is not how a caller decides whether it may carry on — TrimmedThrough is, and the
+	// two are not interchangeable. The distance between a caller's position and this is the
+	// distance to the oldest thing that *survived*, which in a store numbering several
+	// namespaces from one sequence is set by what the other namespaces were doing. Deciding
+	// from it sends callers that had missed nothing away to rebuild a whole tree.
+	Oldest Position
+
+	// Tail is the newest position recorded, whether or not the change at it is still
+	// retained. It is kept apart from the entries for a reason that is easy to miss: a log
+	// that has discarded everything cannot otherwise tell "you are caught up" from "you
+	// missed everything", and those two answers differ by a full rebuild.
+	Tail Position
+
+	// TrimmedThrough is the newest position this log has discarded, and 0 when it has
+	// discarded nothing. A caller that has seen everything up to it has missed nothing,
+	// because everything later is still here.
+	//
+	// It is what makes resuming decidable, and Oldest is not. Positions are dense in no
+	// particular way, so the distance between a caller's position and the oldest surviving
+	// entry says nothing about whether anything in between was thrown away: an
+	// implementation numbering every namespace in one database from a single sequence
+	// leaves each namespace's positions spread by however much its neighbours were written
+	// to in the meantime. Deciding from that distance rejects callers that had missed
+	// nothing, and the cost of being wrong is a full rebuild of a tree.
+	//
+	// It must be a position this log recorded and no longer holds — the newest such — and
+	// never a boundary some discard was expressed in terms of. The whole of its worth is
+	// that a caller below it has provably lost a change it needed, and a value that was
+	// merely an upper bound on what went, or a figure derived from when entries were
+	// written rather than from where they sat, would put callers who lost nothing below it
+	// and reintroduce exactly the rebuild this exists to remove.
+	//
+	// An implementation that discards nothing leaves this at 0, which admits every caller,
+	// including one that has applied nothing at all.
+	TrimmedThrough Position
+
+	// TrimmedByAge reports whether anything was discarded for being old rather than for
+	// being too much. A caller that fell out of the window is told which dimension pushed
+	// it out, because the two say different things: age means this caller was away too
+	// long, volume means the namespace changes faster than the log was configured to hold.
+	TrimmedByAge bool
+}
+
+// ChangeKind says what happened to a name.
+type ChangeKind int
+
+const (
+	// Created: the name did not exist and now holds a node.
+	Created ChangeKind = iota
+
+	// Removed: the name held a node and now holds nothing.
+	Removed
+
+	// Modified: the node at the name changed — its attributes, its size, its contents.
+	Modified
+
+	// Renamed: the node arrived at this name from another one, which is now empty.
+	Renamed
+)
+
+// Change is one recorded change to the tree.
+//
+// It carries the node rather than only the name, so that a replica applies it without
+// asking anything back. The alternative — an event saying only that something under a name
+// changed — is cheaper to produce and much worse to consume: a directory rename is one row
+// here and one row in a replica, whereas an invalidation of a directory forces a replica to
+// discard everything beneath it and walk it again, and renaming directories is what build
+// tools, version control and package managers do constantly.
+//
+// The price is that a replica is exactly as correct as this record is. There is no
+// revalidation behind it and no timeout that repairs a change that was recorded wrongly, so
+// producing these is an obligation of the same weight as applying them.
+type Change struct {
+	Position Position
+	Kind     ChangeKind
+
+	// Parent and Name are where the change landed. The parent is a node id rather than a
+	// path, which is what makes a directory rename one row: everything beneath it keeps
+	// pointing at the same parent and needs no event of its own.
+	Parent int64
+	Name   []byte
+
+	// From is where a renamed node came from, and nil for every other kind.
+	From *Location
+
+	// Node is what the name holds afterwards, and nil for Removed.
+	Node *Node
+}
+
+// Location is a name in a directory.
+type Location struct {
+	Parent int64
+	Name   []byte
+}
+
+// Row is one node of a snapshot, named the way a Change names one.
+type Row struct {
+	// Parent is 0 and Name is nil for the root, which has no name and no parent.
+	Parent int64
+	Name   []byte
+	Node   Node
 }

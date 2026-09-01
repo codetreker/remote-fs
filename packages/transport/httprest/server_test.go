@@ -23,7 +23,8 @@ import (
 )
 
 // newHandler returns a handler over a fresh temporary directory, and that directory, so
-// that a test can check what actually landed on disk instead of believing the response.
+// that a test can check what actually landed on disk instead of believing the response. A
+// local directory keeps no change log, so this handler serves an unreplicable namespace.
 func newHandler(t *testing.T) (http.Handler, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -31,7 +32,7 @@ func newHandler(t *testing.T) (http.Handler, string) {
 	if err != nil {
 		t.Fatalf("open the namespace: %v", err)
 	}
-	h, err := httprest.NewHandler(s)
+	h, err := httprest.NewHandler(s, nil)
 	if err != nil {
 		t.Fatalf("new handler: %v", err)
 	}
@@ -55,8 +56,37 @@ func serve(t *testing.T, h http.Handler, req httprest.Request, body io.Reader) *
 }
 
 func TestNewHandlerRejectsAMissingStorage(t *testing.T) {
-	if _, err := httprest.NewHandler(nil); err == nil {
-		t.Fatal("NewHandler(nil) succeeded, want an error")
+	if _, err := httprest.NewHandler(nil, nil); err == nil {
+		t.Fatal("NewHandler with no storage succeeded, want an error")
+	}
+}
+
+// Every bound on the replication endpoints has to leave room for one of whatever it
+// bounds. A handler built with a bound of zero would answer every snapshot with EAGAIN, or
+// read the log a page of no changes at a time forever — both of which look like a working
+// server that never delivers anything.
+func TestNewHandlerRejectsBoundsWithNoRoomInThem(t *testing.T) {
+	usable := httprest.DefaultLimits()
+	cases := map[string]func(*httprest.Limits){
+		"no snapshots at all":       func(l *httprest.Limits) { l.Snapshots = 0 },
+		"no time to send one in":    func(l *httprest.Limits) { l.SnapshotDeadline = 0 },
+		"pages of no rows":          func(l *httprest.Limits) { l.SnapshotPage = 0 },
+		"pages of no changes":       func(l *httprest.Limits) { l.EventPage = 0 },
+		"a negative number of them": func(l *httprest.Limits) { l.Snapshots = -1 },
+	}
+	for name, spoil := range cases {
+		t.Run(name, func(t *testing.T) {
+			limits := usable
+			spoil(&limits)
+			if _, err := httprest.NewHandlerWithLimits(failing{syscall.EIO}, nil, limits); err == nil {
+				t.Fatalf("NewHandlerWithLimits(%+v) succeeded, want an error", limits)
+			}
+		})
+	}
+	if _, err := httprest.NewHandlerWithLimits(failing{syscall.EIO}, nil, usable); err != nil {
+		// Without this the cases above would pass for a handler that refuses every set of
+		// bounds there is.
+		t.Fatalf("NewHandlerWithLimits with usable bounds failed: %v", err)
 	}
 }
 
@@ -257,7 +287,7 @@ func TestAnUnnameableFailureBecomesEIO(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			h, err := httprest.NewHandler(failing{c.err})
+			h, err := httprest.NewHandler(failing{c.err}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -292,7 +322,7 @@ func TestAnUnnameableFailureBecomesEIO(t *testing.T) {
 // ordinary storage error under its own name. Collapsing it to EIO would turn a standing
 // property into a failure worth retrying.
 func TestANamespaceWithNoRoomToReportSaysSoByName(t *testing.T) {
-	h, err := httprest.NewHandler(failing{syscall.ENOSYS})
+	h, err := httprest.NewHandler(failing{syscall.ENOSYS}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

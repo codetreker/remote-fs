@@ -2,6 +2,8 @@
 
 Status: proposed
 
+本 note 的定序规则被 [元数据复制](../../implemented/architecture/2026-08-27-metadata-replication.md) 原样采纳，并在那里多了一种输入：一次一致性快照是精确的切割而非下界。
+
 ## 问题
 
 `docs/design/` 声明了两条定序规则，而系统里没有任何机制能产出它们要求的值。

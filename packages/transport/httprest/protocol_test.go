@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
@@ -44,6 +45,7 @@ func allOps() []httprest.Op {
 		httprest.OpStat, httprest.OpSetAttr, httprest.OpList, httprest.OpRead,
 		httprest.OpWrite, httprest.OpCreate, httprest.OpMkdir, httprest.OpRemove,
 		httprest.OpRemoveDir, httprest.OpRename, httprest.OpSpace,
+		httprest.OpSubscribe, httprest.OpResubscribe, httprest.OpSnapshot,
 	}
 }
 
@@ -66,8 +68,13 @@ func TestRequestSurvivesURLRoundTrip(t *testing.T) {
 			for _, to := range awkwardPaths {
 				want := httprest.Request{Op: op}
 				switch op {
-				case httprest.OpSpace:
-					// Space takes no operands, so it has nothing a URL could damage.
+				case httprest.OpSpace, httprest.OpSubscribe, httprest.OpSnapshot:
+					// These take no operands, so they have nothing a URL could damage.
+				case httprest.OpResubscribe:
+					// A resume point rather than a path: an incarnation is opaque and may
+					// be any byte sequence at all, so the awkward names are as good a
+					// source of one as anything.
+					want.Incarnation, want.Position = metastore.Incarnation(p), 9007199254740993
 				case httprest.OpRename:
 					want.Path, want.To = p, to
 				default:
@@ -187,6 +194,7 @@ func TestSpaceIsAddressedWithNoOperands(t *testing.T) {
 func TestMethods(t *testing.T) {
 	reads := map[httprest.Op]bool{
 		httprest.OpStat: true, httprest.OpList: true, httprest.OpRead: true, httprest.OpSpace: true,
+		httprest.OpSubscribe: true, httprest.OpResubscribe: true, httprest.OpSnapshot: true,
 	}
 	for _, op := range allOps() {
 		want := http.MethodPost
@@ -250,6 +258,21 @@ func TestParseRequestRejectsMalformedRequests(t *testing.T) {
 		{"reading with a write method", http.MethodPost, "/v1/stat?path=a", httprest.ErrMethod},
 		{"writing with a read method", http.MethodGet, "/v1/remove?path=a", httprest.ErrMethod},
 		{"space with a write method", http.MethodPost, "/v1/space", httprest.ErrMethod},
+		// A resume point that does not parse must not degrade into one that does. Position
+		// zero is where a replica that has seen nothing resumes from, so a damaged one
+		// read as zero asks for the whole log — or, once the log no longer reaches that
+		// far back, produces a rebuild nobody can account for.
+		{"a position that is not a number", http.MethodGet, "/v1/resubscribe?incarnation=x&position=soon", httprest.ErrOperands},
+		{"a position that is empty", http.MethodGet, "/v1/resubscribe?incarnation=x&position=", httprest.ErrOperands},
+		{"a position before the first one", http.MethodGet, "/v1/resubscribe?incarnation=x&position=-1", httprest.ErrOperands},
+		{"a position no int64 holds", http.MethodGet, "/v1/resubscribe?incarnation=x&position=99999999999999999999", httprest.ErrOperands},
+		{"a resume point with no incarnation", http.MethodGet, "/v1/resubscribe?position=7", httprest.ErrOperands},
+		{"a resume point with no position", http.MethodGet, "/v1/resubscribe?incarnation=x", httprest.ErrOperands},
+		// Subscribing means "from now", which is a question with no operands. A resume
+		// point sent beside it is a request to continue from somewhere, and answering it
+		// from the tail instead would lose everything in between.
+		{"subscribing with a resume point", http.MethodGet, "/v1/subscribe?incarnation=x&position=7", httprest.ErrOperands},
+		{"a snapshot of a path", http.MethodGet, "/v1/snapshot?path=a", httprest.ErrOperands},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
