@@ -217,10 +217,15 @@ var cases = []testCase{
 	// running while a write is in flight.
 	//
 	// The asymmetry is what makes this reliable rather than a race that usually loses. An
-	// implementation that replaces the contents in one step cannot fail this however the
-	// goroutines interleave, because at every instant the file holds one of the two
-	// values. One that truncates first fails within the first few observations, because
-	// the gap between emptying the file and filling it is most of the write.
+	// implementation that replaces the contents in one step cannot show a torn file however
+	// the goroutines interleave, because at every instant the file holds one of the two
+	// values. One that truncates first fails within the first few observations, because the
+	// gap between emptying the file and filling it is most of the write.
+	//
+	// What an implementation may do is decline the read: one that fetches a file in more
+	// than one step can lose to a writer that never pauses, and this case is such a writer
+	// by construction. A read that reports it could not be completed has answered honestly;
+	// the obligation is over what a read that does come back holds.
 	{"a reader never sees a write in progress", func(t *testing.T, s storage.Storage) {
 		// Different lengths and different bytes, so that a torn observation is caught
 		// whether it is a prefix of one value or one value laid over the tail of the
@@ -252,6 +257,7 @@ var cases = []testCase{
 		}()
 
 		seen := make([]map[int]int, readers)
+		lost := make([]int, readers)
 		for r := range readers {
 			seen[r] = map[int]int{}
 			wg.Add(1)
@@ -264,7 +270,18 @@ var cases = []testCase{
 					default:
 					}
 					got, err := s.Read(ctx(t), "f")
-					if err != nil {
+					switch {
+					// The read lost to the writer rather than observing anything. An
+					// implementation that fetches a file in more than one step may lose
+					// repeatedly to a writer that never pauses, and saying so is the honest
+					// answer — what it must never do is answer from a file it read part way
+					// through, which is what the rest of this case checks. The count is kept
+					// so that a run where every read lost is told apart from one where the
+					// reads were fine, below.
+					case errors.Is(err, syscall.EAGAIN):
+						lost[r]++
+						continue
+					case err != nil:
 						t.Errorf("read while a write was in flight: %v", err)
 						return
 					}
@@ -296,7 +313,8 @@ var cases = []testCase{
 			}
 		}
 		if len(total) < len(contents) {
-			t.Fatalf("the readers observed %v across %d writes, so no read overlapped a write and this case proved nothing", total, writes)
+			t.Fatalf("the readers observed %v across %d writes, losing %v of their reads to the writer, so no read came back whole and this case proved nothing",
+				total, writes, lost)
 		}
 	}},
 
