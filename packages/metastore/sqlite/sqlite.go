@@ -69,29 +69,50 @@ type Store struct {
 
 	namespace int64
 
+	// root is the id of the directory the namespace starts from. It is fixed for the life of
+	// the namespace — nothing removes or replaces the root — so it is read once rather than
+	// joined for on every path resolution, and it is what tells the one node with no name from
+	// a node that has lost the one it had.
+	root int64
+
 	// allowance is the namespace's ceiling in bytes, or zero for a namespace that has none.
 	// It belongs to the Store rather than to the database because it is a property of how
 	// the namespace is being served, and because the contract makes it unchanging for the
 	// life of the value: one that answers Space answers always, and one that refuses never
 	// starts.
 	allowance int64
+
+	// window is how much of the change log this Store keeps. It belongs here for the same
+	// reason the allowance does: it says how the namespace is being served rather than what it
+	// holds, and two processes serving one database may reasonably differ about it.
+	window Window
 }
 
 var _ metastore.Store = (*Store)(nil)
 
 // Open holds the namespace called namespace in the SQLite database at database, under an
-// allowance of allowance bytes. An allowance of zero is a namespace with none, whose Space
-// reports syscall.ENOSYS for as long as the Store exists.
+// allowance of allowance bytes and a change log held to window.
+//
+// An allowance of zero is a namespace with none, whose Space reports syscall.ENOSYS for as
+// long as the Store exists. A window is required rather than defaulted, because every number
+// in it is a value a log could plausibly be held to and none of them has a zero that means
+// "unset"; DefaultWindow is the answer for a caller with no reason of its own.
 //
 // The database is created if it is not there, as is the namespace: a namespace with no
 // tree yet is one holding an empty root directory, not an error. Several namespaces may
-// share one database, and one Store is bound to exactly one of them.
-func Open(ctx context.Context, database, namespace string, allowance int64) (*Store, error) {
+// share one database, and one Store is bound to exactly one of them. A database written
+// against an older schema is carried forward here; one written against a newer schema is
+// refused, because nothing in this build can know what a later version did to the columns it
+// addresses.
+func Open(ctx context.Context, database, namespace string, allowance int64, window Window) (*Store, error) {
 	if namespace == "" {
 		return nil, fmt.Errorf("a namespace needs a name: %w", syscall.EINVAL)
 	}
 	if allowance < 0 {
 		return nil, fmt.Errorf("an allowance of %d bytes is not a quantity of bytes: %w", allowance, syscall.EINVAL)
+	}
+	if err := window.check(); err != nil {
+		return nil, err
 	}
 
 	write, err := openPool(database, true)
@@ -108,13 +129,13 @@ func Open(ctx context.Context, database, namespace string, allowance int64) (*St
 		return nil, err
 	}
 
-	id, err := prepare(ctx, write, namespace)
+	id, root, err := prepare(ctx, write, namespace, window)
 	if err != nil {
 		write.Close()
 		read.Close()
 		return nil, fmt.Errorf("opening namespace %q in %s: %w", namespace, database, err)
 	}
-	return &Store{write: write, read: read, namespace: id, allowance: allowance}, nil
+	return &Store{write: write, read: read, namespace: id, root: root, allowance: allowance, window: window}, nil
 }
 
 // openPool opens one connection pool over the database file.
@@ -180,6 +201,12 @@ func (s *Store) Space(ctx context.Context) (storage.Space, error) {
 // file, charges its bytes and retires the object it displaced either does all three or none
 // of them, and no window exists in which a caller could observe the counter disagreeing with
 // the tree.
+//
+// The trim rides here rather than beside each append. A write transaction is the only moment
+// this package is guaranteed to have one to ride on, and running it on every one of them
+// rather than only on the ones that recorded something is what lets an object sweep keep an
+// otherwise quiet namespace's log inside its age bound. A transaction with nothing to discard
+// pays two indexed lookups for the answer.
 func (s *Store) mutate(ctx context.Context, f func(tx *sql.Tx) error) error {
 	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
@@ -189,6 +216,9 @@ func (s *Store) mutate(ctx context.Context, f func(tx *sql.Tx) error) error {
 
 	if err := f(tx); err != nil {
 		return err
+	}
+	if err := trim(ctx, tx, s.namespace, s.window); err != nil {
+		return failure(err)
 	}
 	if err := tx.Commit(); err != nil {
 		return failure(err)
@@ -261,11 +291,22 @@ func loadedTime(sec int64, nsec int32) time.Time {
 // object it named is gone; a counter satisfies neither once a database is restored from a
 // backup, and a path-derived key would have two writers to one path choose the same key.
 func newKey() (metastore.Key, error) {
-	var raw [16]byte
-	if _, err := rand.Read(raw[:]); err != nil {
+	value, err := randomHex(16)
+	if err != nil {
 		return "", fmt.Errorf("%w: minting an object key: %w", syscall.EIO, err)
 	}
-	return metastore.Key(hex.EncodeToString(raw[:])), nil
+	return metastore.Key(value), nil
+}
+
+// randomHex returns n random bytes rendered as hex. The values built on it — an object key
+// and a log's incarnation — have the same requirement and it is the only one they have: to
+// differ from every other value ever minted, by this process or any other.
+func randomHex(n int) (string, error) {
+	raw := make([]byte, n)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw), nil
 }
 
 // pathError wraps err as a failure at a namespace path.

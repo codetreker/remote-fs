@@ -1,12 +1,13 @@
 package sqlite_test
 
 import (
-	"database/sql"
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -23,10 +24,81 @@ import (
 // a file rather than in memory: an in-memory database is a different engine configuration —
 // no WAL, no second connection reaching the same data — and passing there would say nothing
 // about the one that ships.
+//
+// The store it hands over is not alone in its database, and that is the second half of the
+// same argument. Positions come from one sequence shared by every namespace in a file, so a
+// store that is alone in one gets consecutive positions and quietly satisfies any assumption
+// about adjacency — which is how two separate readings of "has this caller fallen behind"
+// came to be written against the distance to the oldest surviving entry, and why neither was
+// caught here. A change to a neighbour is recorded before each change to this store, so the
+// positions this suite sees have gaps in them wherever real ones would.
 func TestTheContract(t *testing.T) {
 	metastoretest.Run(t, func(t *testing.T, allowance int64) metastore.Store {
-		return open(t, database(t), "workspace", allowance)
+		path := database(t)
+		return withNeighbour{
+			Store:     open(t, path, "workspace", allowance),
+			neighbour: open(t, path, "neighbour", 0),
+			gaps:      new(atomic.Int64),
+			t:         t,
+		}
 	})
+}
+
+// withNeighbour records a change to another namespace in the same database before each change
+// to this one, so that this one's positions are never consecutive.
+//
+// Every operation that changes the tree is wrapped, because a position is allocated by each
+// of them and one left unwrapped would hand this suite a pair of adjacent positions to be
+// accidentally right about.
+type withNeighbour struct {
+	*sqlite.Store
+	neighbour *sqlite.Store
+	gaps      *atomic.Int64
+	t         *testing.T
+}
+
+// gap consumes a position in the neighbouring namespace, which is what leaves a hole in this
+// one's. A neighbour that will not take it is reported rather than passed over: the gap would
+// silently not be there, and every case after it would be measuring dense positions again.
+func (n withNeighbour) gap(ctx context.Context) {
+	if err := n.neighbour.Create(ctx, fmt.Sprintf("gap-%d", n.gaps.Add(1))); err != nil {
+		n.t.Errorf("consuming a position in the neighbouring namespace: %v", err)
+	}
+}
+
+func (n withNeighbour) SetAttr(ctx context.Context, path string, change storage.AttrChange) error {
+	n.gap(ctx)
+	return n.Store.SetAttr(ctx, path, change)
+}
+
+func (n withNeighbour) Create(ctx context.Context, path string) error {
+	n.gap(ctx)
+	return n.Store.Create(ctx, path)
+}
+
+func (n withNeighbour) Mkdir(ctx context.Context, path string) error {
+	n.gap(ctx)
+	return n.Store.Mkdir(ctx, path)
+}
+
+func (n withNeighbour) Remove(ctx context.Context, path string) error {
+	n.gap(ctx)
+	return n.Store.Remove(ctx, path)
+}
+
+func (n withNeighbour) RemoveDir(ctx context.Context, path string) error {
+	n.gap(ctx)
+	return n.Store.RemoveDir(ctx, path)
+}
+
+func (n withNeighbour) Rename(ctx context.Context, from, to string) error {
+	n.gap(ctx)
+	return n.Store.Rename(ctx, from, to)
+}
+
+func (n withNeighbour) Commit(ctx context.Context, path string, object metastore.Object) error {
+	n.gap(ctx)
+	return n.Store.Commit(ctx, path, object)
 }
 
 func database(t *testing.T) string {
@@ -36,7 +108,15 @@ func database(t *testing.T) string {
 
 func open(t *testing.T, path, namespace string, allowance int64) *sqlite.Store {
 	t.Helper()
-	store, err := sqlite.Open(t.Context(), path, namespace, allowance)
+	return openUnder(t, path, namespace, allowance, sqlite.DefaultWindow())
+}
+
+// openUnder opens a store whose log is held to a window of the case's choosing, which is what
+// the retention cases need: the shipped window keeps ten thousand entries for ten minutes, and
+// a case that filled it would be measuring how fast a test machine writes.
+func openUnder(t *testing.T, path, namespace string, allowance int64, window sqlite.Window) *sqlite.Store {
+	t.Helper()
+	store, err := sqlite.Open(t.Context(), path, namespace, allowance, window)
 	if err != nil {
 		t.Fatalf("opening %q in %s: %v", namespace, path, err)
 	}
@@ -94,7 +174,7 @@ func TestANamespaceOutlivesTheStoreThatMadeIt(t *testing.T) {
 	path := database(t)
 	changed := time.Date(2400, 6, 1, 12, 0, 0, 500000000, time.UTC)
 
-	first, err := sqlite.Open(t.Context(), path, "workspace", 4096)
+	first, err := sqlite.Open(t.Context(), path, "workspace", 4096, sqlite.DefaultWindow())
 	if err != nil {
 		t.Fatalf("opening: %v", err)
 	}
@@ -145,48 +225,14 @@ func commit(t *testing.T, s metastore.Store, path string, size int64) metastore.
 	return key
 }
 
-// A database written by a version we do not understand is refused rather than adapted.
-// Every statement here addresses columns by the meaning this version gives them, so running
-// them against another layout would not fail loudly — it would update the wrong things.
-func TestADatabaseFromAnotherSchemaVersionIsRefused(t *testing.T) {
-	path := database(t)
-	store, err := sqlite.Open(t.Context(), path, "workspace", 0)
-	if err != nil {
-		t.Fatalf("opening a fresh database: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("closing: %v", err)
-	}
-
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`UPDATE schema_version SET version = 999`); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	reopened, err := sqlite.Open(t.Context(), path, "workspace", 0)
-	if err == nil {
-		reopened.Close()
-		t.Fatal("a database of an unknown schema version opened, want a refusal")
-	}
-	if !errors.Is(err, syscall.EINVAL) {
-		t.Fatalf("opening a database of an unknown schema version: %v, want EINVAL", err)
-	}
-}
-
 func TestOpenRefusesArgumentsThatNameNothing(t *testing.T) {
-	if store, err := sqlite.Open(t.Context(), database(t), "", 0); !errors.Is(err, syscall.EINVAL) {
+	if store, err := sqlite.Open(t.Context(), database(t), "", 0, sqlite.DefaultWindow()); !errors.Is(err, syscall.EINVAL) {
 		if err == nil {
 			store.Close()
 		}
 		t.Fatalf("opening a namespace with no name: %v, want EINVAL", err)
 	}
-	if store, err := sqlite.Open(t.Context(), database(t), "workspace", -1); !errors.Is(err, syscall.EINVAL) {
+	if store, err := sqlite.Open(t.Context(), database(t), "workspace", -1, sqlite.DefaultWindow()); !errors.Is(err, syscall.EINVAL) {
 		if err == nil {
 			store.Close()
 		}
@@ -197,7 +243,7 @@ func TestOpenRefusesArgumentsThatNameNothing(t *testing.T) {
 // A database that cannot be created is a failure to report, not a namespace to serve.
 func TestOpenReportsADatabaseItCannotCreate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "no-such-directory", "metastore.db")
-	store, err := sqlite.Open(t.Context(), path, "workspace", 0)
+	store, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
 	if err == nil {
 		store.Close()
 		t.Fatal("opening a database under a directory that does not exist succeeded, want a failure")

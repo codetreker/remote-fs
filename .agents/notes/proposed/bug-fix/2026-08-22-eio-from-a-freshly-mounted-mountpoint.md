@@ -1,58 +1,67 @@
-# Agent Note: 刚挂好的挂载点答 EIO
+# Agent Note: 一次被中断的请求答成了 EIO
 
 Status: proposed
 
 ## 问题
 
-挂载层的用例会以大约每二十轮一次的比例变红，失败的形态是**一个刚挂好的挂载点上的第一批操作答 EIO**，而不是任何断言不成立。它与[挂载归属那次修复](../../implemented/testing/2026-08-22-a-mount-belongs-to-whoever-attached-it.md)无关：那一次修的是「把别人的挂载算成自己漏的」，这一次是挂载本身答错。两者在同一个 job 里，所以在这次之前它们混在一起看起来像同一个 flaky。
-
-本机（Linux 6.8.0-137，16 核，go1.26.5）实测到的四次，路径不同、操作不同、断言位置不同：
+挂载层的用例会以大约每二十轮一次的比例变红，失败的形态是**挂载点上的一个操作答 EIO**，而不是任何断言不成立。本机（Linux 6.8.0-137，16 核，go1.26.5）实测到的四种，路径不同、操作不同、断言位置不同：
 
 | 用例 | 位置 | 报出来的 |
 |---|---|---|
-| `TestAnOverwriteOnOneMountpointIsSeenWhole` | `endtoend_test.go:201` | `reading through B after writing "first": read …/a.txt: input/output error` |
-| `TestARenameOnOneMountpointIsSeenAsARename` | `endtoend_test.go:172` | `stat before.txt through B gave … input/output error, want ENOENT` |
-| `TestADirectoryMadeOnOneMountpointIsADirectoryOnTheOther` | `endtoend_test.go:134` | `making d through A: mkdir …/d: input/output error` |
-| `TestASymbolicLinkSurvivesTheWholeChain` | `endtoend_test.go:251` | `os.ReadDir: readdirent …: input/output error` |
+| `TestAnOverwriteOnOneMountpointIsSeenWhole` | `endtoend_test.go:201` | `read …/a.txt: input/output error` |
+| `TestARenameOnOneMountpointIsSeenAsARename` | `endtoend_test.go:172` | `stat before.txt gave … input/output error, want ENOENT` |
+| `TestADirectoryMadeOnOneMountpointIsADirectoryOnTheOther` | `endtoend_test.go:134` | `mkdir …/d: input/output error` |
+| `TestAnAllowanceIsSpentAgainstWhatTheWorkspaceAlreadyHolds` | `quota_test.go` | `open …/over.bin: input/output error` |
 
-共同点：**都发生在 `mountpointOn` 刚返回之后的头几个操作上**，都是 EIO，都不重现于同一条用例的单独重跑。
+合计约 6 / 73；CI 历史 13 次运行里 1 次。
 
-数出来的比例：`go test -count=1 ./cmd/...` 连跑 20 轮，1 轮红；同一条命令在这次修复之前的 commit 上连跑 20 轮，1 轮以这个形态红；`assert-every-test-ran.sh -race` 连跑 3 轮，1 轮红；更早一批 `-race` 下 30 轮，3 轮红。合计约 6 / 73。CI 的历史里 13 次运行中有 1 次是这个形态。**修复前后的比例分不出差别**，也就是说它既不是这次引入的，也不是这次修掉的。
+### 根因
 
-EIO 在这个系统里是「够不到命名空间」的意思（R-ERR-1）。真正的坏处不是这几条用例红，而是**这条路径上的 EIO 说明有一段时间挂载点是挂着的、却答不了任何问题**。如果那是真的，它就不只是测试的问题。
+内核在调用线程收到信号时发 `FUSE_INTERRUPT`；go-fuse 据此关掉那次请求的 cancel channel；这一侧的 storage 调用于是死在 `context canceled` 上；而 `errnoOf` 对任何不带 errno 的错误一律答 **EIO**。在 `errnoOf` 里临时打一行日志抓到了原文：
 
-### 现在诊断不下去的原因
+```
+stat "over.bin": Get "http://…/v1/stat?path=over.bin": context canceled: input/output error
+```
 
-`endtoend_test.go` 的挂载走 `mountpointOn`，它给 `fuse.Options{Logger: testLogger(t)}` 但 `Debug` 是关的，所以日志里没有内核问了什么、这一侧答了什么。服务端那一侧是同进程的 `http.Server`，它的失败只在 `t.Errorf` 里出现一次。
+决定性的对照是驱动方：同一批二进制，用 Python 在重载下驱动 **52/52 全清**；换成 `go test` 驱动约 **5%** 复现。差别是 Go 的**异步抢占** —— 运行时用 SIGURG 打断长时间不进入安全点的线程，而那个线程正阻塞在 `open` 里。这解释了为什么它只在这套测试里出现，以及为什么它换一个用例就换一个失败点：被打中的是哪个操作，纯粹看信号落在谁身上。
 
-另一处更彻底：`cmd/quota_test.go` 里 `startMountBinary(...)` 的返回值被直接丢掉（例如 `:41`、`:113`、`:218`），而那个 `*process` 是唯一持有挂载二进制自己 stderr 的东西。这些用例红的时候，日志里没有任何一行来自那个进程。
+它**与元数据复制无关**：复现它的那个用例的服务端是 `-dir`，挂载时一份副本都没有。
+
+### 为什么这不只是测试的毛病
+
+EIO 的意思是「够不到命名空间」（R-ERR-1），而事实是「这次请求被撤回了」。一个会重试 `EINTR` 的程序本来能自己恢复，拿到 EIO 就只能失败 —— 而**任何信号密集的程序都会碰上它**，Go 写的程序尤其，因为异步抢占是它的常态而不是异常。R-FS-2 要的是「未经修改的、为本地目录编写的程序能在挂载点上正常工作」，这一条正落在它上面。
+
+测试只是第一个碰到的用户。
 
 ## 提案
 
-先让它可诊断，再谈修。
+**先分开「被撤回」与「够不到」。** `errnoOf` 那个「不认识的错误一律 EIO」的兜底要先分出 `context.Canceled` 与 `context.DeadlineExceeded` 两支：前者是调用方撤回了请求，后者才是够不到。这一步无论下面怎么选都要做，而且它自己就能把这批红变成一个正确的 errno。
 
-1. **留住挂载二进制的输出。** `quota_test.go` 里丢掉的 `*process` 收起来，失败时把 `p.output()` 一起打出来。这是纯增量，不改任何断言。
-2. **失败时打开 FUSE trace。** 挂载层的用例在环境变量或 `-args` 开关下把 `fuse.Options.Debug` 打开，让复现跑能拿到一次完整的请求/应答序列。默认关着——常开会把日志淹掉。
-3. **拿到一次带 trace 的复现之后再决定修哪里。** 眼下有三条互不排斥的猜测，都没有证据：`fuse.New` 返回时挂载尚未完全就绪，第一批请求打在半就绪的连接上；`httprest` 客户端与同进程服务端之间某个连接在挂载点刚建立时被复用/关闭；或者 EIO 是真的、来自服务端一侧某个短暂失败被 `errnoOf` 归并成了 EIO（`errnoOf` 对不带 errno 的错误一律答 EIO）。第三条最容易先排除，因为它只要求错误链里保留原因。
+**再决定对一次被中断的请求回什么。** 两条路，都还没选：
+
+- 回 `EINTR`（或 `ECANCELED`），让内核照常把它交给调用方；
+- 干脆不回答 —— FUSE 允许对一个已被 `FUSE_INTERRUPT` 的请求不作答。
+
+选哪条取决于 go-fuse 在 `FUSE_INTERRUPT` 之后还接不接受对原请求的回复。**这需要读它的源码确认，不是讨论能定的。**
 
 ## 备选方案
 
-**在这几条用例里重试。** 最省事，也最危险：R-CON-2 禁止让可见性取决于轮询，端到端判据里「B 上的读只做一次，永不重试」是被专门写下来的（见 [MVP 范围](../../implemented/process/2026-08-19-mvp-scope.md)）。加重试会把这个缺陷变成看不见的，而它可能是产品缺陷而不是测试缺陷。
+**在这几条用例里重试。** 最省事。输在它把一个产品缺陷伪装成测试抖动 —— 而且 R-CON-2 与端到端判据里「B 上的读只做一次，永不重试」是被专门写下来的（见 [MVP 范围](../../implemented/process/2026-08-19-mvp-scope.md)）。
 
-**挂载后先做一次预热操作再开始计时/断言。** 同样把证据抹掉，而且 mvp-scope 已经写明预热会把第一次访问的成本挪出测量区间，而那个成本在真实使用里是有人付的。
+**挂载后先做一次预热操作。** 同样抹掉证据，而且 mvp-scope 已经写明预热会把第一次访问的成本挪出测量区间，而那个成本在真实使用里是有人付的。
 
-**当作已知噪音，重跑 CI。** 6/73 的比例意味着挂载层的每一次 CI 都有约 8% 概率无故变红；照 AGENTS.md 的说法，把不稳定的检查当噪音就是在训练所有人忽略它。
+**当作已知噪音，重跑 CI。** 照 AGENTS.md 的说法，把不稳定的检查当噪音就是在训练所有人忽略它。而现在根因已知，这条连「暂时容忍」的理由都没有了。
 
-**先修不先诊断。** 上面三条猜测里挑一条改掉，绿了就算完。输在无法分辨「修好了」和「概率被压到这批样本以下」——6/73 的现象需要几十轮才能证伪一次改动。
+**先修不先诊断。** 这一条已经**不再是备选** —— 诊断做完了。留在这里是因为当时它看起来很有道理：挑一条猜测改掉、绿了就算完。而 6/73 的现象需要几十轮才能证伪一次改动，那条路会以「大概修好了」收场。
 
 ## 验收标准
 
-- 一次带 FUSE trace 的复现被抓到，能说清 EIO 是从哪一层产生的。
-- 原因写进 `docs/research/` 或本 note 的续写，然后才动代码。
-- 改完之后 `go test -count=1 ./cmd/...` 连跑 100 轮零红；100 是从 6/73 这个比例推的——20 轮全绿说明不了什么。
+- `errnoOf` 对 `context.Canceled` 与 `context.DeadlineExceeded` 各有一条用例，且两者答不同的 errno。
+- 一次被中断的请求在挂载点上表现为可重试的错误，而不是 EIO —— 用一个真的对自己发信号的调用方驱动，而不是靠注入。
+- 改完之后 `go test -count=1 ./cmd/` 连跑 100 轮零红。100 是从 6/73 推的；20 轮全绿说明不了什么。
 
 ## 风险
 
-- **它可能不是测试的缺陷。** 如果挂载点确实有一段时间答不了问题，那么在真实使用里那一段时间里的每一个操作都会拿到 EIO，而 R-ERR-1 的意思是这句话不能是假的。真是这样的话，这份 note 要升级成一个产品缺陷。
-- 打开 trace 会显著拖慢挂载层，且 trace 本身可能改变时序、让现象消失。这时要退回到「留住输出」那一半，并接受用更多轮次换一次复现。
-- 上面还观察到一次形态不同的红（`TestAnAllowanceIsSpentAgainstWhatTheWorkspaceAlreadyHolds`：一次 36864 字节的 `write(2)` 全部写入并返回 `<nil>`，本该是 EDQUOT，配额在随后的 `close` 上才报出来），只见过一次，没有并入上表。它可能同源，也可能是配额记账自己的问题。
+- **不回答一个被中断的请求，若 go-fuse 不接受，会挂住那个调用方。** 这是两条路里更干净的一条，也是更容易做错的一条；确认它之前不要选它。
+- **改了 `errnoOf` 的兜底，会影响每一条错误路径。** 那个函数今天是所有「说不出 errno 的错误」的汇合处，动它等于动整层的失败语义，因此每一支都要有自己的用例。
+- **异步抢占是 Go 运行时的行为，将来只会更频繁。** 这个缺陷不会因为不管它而消退。

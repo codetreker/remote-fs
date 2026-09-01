@@ -77,6 +77,15 @@ type Storage interface {
 	List(ctx context.Context, path string) ([]Entry, error)
 
 	// Read returns the entire contents of the file at path.
+	//
+	// A read may report syscall.EAGAIN while the file is there: an implementation that
+	// fetches a file in more than one step can lose to a writer that replaces it between
+	// them, and one facing a writer that never pauses can lose every time it tries. That
+	// is a report about this attempt rather than about the file, and it is distinct from
+	// both syscall.ENOENT, which says the name is gone, and syscall.EIO, which says the
+	// namespace no longer has bytes it still claims to hold. A caller that wants the
+	// contents tries again; a caller that cannot has learned that it did not read them,
+	// which is the one thing it must not be left guessing about.
 	Read(ctx context.Context, path string) ([]byte, error)
 
 	// Write replaces the contents of the file at path, creating the file if it is not

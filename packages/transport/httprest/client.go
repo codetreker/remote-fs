@@ -11,15 +11,42 @@ import (
 	"net/url"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// Storage is a namespace held by a server.
+// Storage is a namespace held by a server: its contents through the storage contract, and
+// beside that the replication endpoints a replica of its metadata is built and kept from.
+// One Dial is one namespace, and a replica needs both halves of it.
 type Storage struct {
 	base *url.URL
 	http *http.Client
+
+	// silence is how long a stream may say nothing at all before this side stops believing
+	// it is being delivered.
+	silence time.Duration
 }
+
+// DefaultSilence is how long a stream may say nothing before a caller with no reason of its
+// own to choose stops believing in it.
+//
+// It holds every stream this package opens, changes and snapshots alike, so both have to be
+// kept spoken for. A server working through a large tree has nothing to send for as long as
+// that takes, and to a reader that is the same nothing an abandoned connection produces.
+//
+// It has to be a comfortable multiple of the interval the server sends its keepalives at —
+// Limits.Keepalive, ten seconds by default — because the two are configured separately and
+// a bound below that interval would sever every healthy stream on a timer. Three times it,
+// so that losing one keepalive to a stall is not a broken stream. Limits.SnapshotDeadline is
+// a larger figure than this and is not the thing to compare it against: that bounds a whole
+// delivery, this bounds a silence.
+//
+// What it bounds is how long a replica may go on answering from a copy whose stream has
+// stopped arriving without saying so — a machine that vanished, a firewall that dropped the
+// flow, a partition. Nothing shorter than the network's own scheduling is safe, and nothing
+// longer is honest; this is chosen rather than measured, like the other bounds here.
+const DefaultSilence = 30 * time.Second
 
 var _ storage.Storage = (*Storage)(nil)
 
@@ -36,8 +63,17 @@ var _ storage.Storage = (*Storage)(nil)
 // across the wire — rather than promising that the far side answered; whether it is there
 // is the answer to the first operation, and to every one after it.
 func Dial(baseURL string, httpClient *http.Client) (*Storage, error) {
+	return DialWithSilence(baseURL, httpClient, DefaultSilence)
+}
+
+// DialWithSilence is Dial with the bound on a quiet stream given rather than defaulted. What
+// that bound is for, and what it has to be a multiple of, is on DefaultSilence.
+func DialWithSilence(baseURL string, httpClient *http.Client, silence time.Duration) (*Storage, error) {
 	if httpClient == nil {
 		return nil, errors.New("httprest: an HTTP client is required; it carries the timeout policy")
+	}
+	if silence <= 0 {
+		return nil, fmt.Errorf("httprest: a stream allowed to say nothing for %v is a stream nothing is watching", silence)
 	}
 	base, err := url.Parse(baseURL)
 	if err != nil {
@@ -46,7 +82,7 @@ func Dial(baseURL string, httpClient *http.Client) (*Storage, error) {
 	if base.Scheme == "" || base.Host == "" {
 		return nil, fmt.Errorf("httprest: %q needs a scheme and a host", baseURL)
 	}
-	return &Storage{base: base, http: httpClient}, nil
+	return &Storage{base: base, http: httpClient, silence: silence}, nil
 }
 
 func (s *Storage) Stat(ctx context.Context, path string) (storage.Attr, error) {
@@ -250,7 +286,8 @@ func readWhole(resp *http.Response) ([]byte, error) {
 	return body, nil
 }
 
-// operationError is every error this package returns.
+// operationError is every error this package returns but one, the exception being the
+// RebuildError a change stream answers with.
 //
 // Unwrap yields the errno alone and never the underlying cause, which is why the cause
 // is carried as rendered text instead. A cause left in the errors.Is chain would leak
@@ -276,10 +313,12 @@ func (e *operationError) Error() string {
 // beside it would read as a report about the root.
 func (r Request) subject() string {
 	switch {
-	case len(ops[r.Op].operands) == 0:
-		return string(r.Op)
 	case r.Op == OpRename:
 		return fmt.Sprintf("%s %s to %s", r.Op, strconv.Quote(r.Path), strconv.Quote(r.To))
+	case r.Op == OpResubscribe:
+		return fmt.Sprintf("%s at position %d of log %s", r.Op, r.Position, strconv.Quote(string(r.Incarnation)))
+	case len(ops[r.Op].operands) == 0:
+		return string(r.Op)
 	default:
 		return fmt.Sprintf("%s %s", r.Op, strconv.Quote(r.Path))
 	}

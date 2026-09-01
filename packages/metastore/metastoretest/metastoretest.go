@@ -55,7 +55,8 @@ type testCase struct {
 var rootNames = []string{"", ".", "./", "a/.."}
 
 // cases is every obligation, grouped by the part of the contract it comes from.
-var cases = slices.Concat(rootCases, pathCases, nodeCases, attrCases, renameCases, objectCases, spaceCases)
+var cases = slices.Concat(rootCases, pathCases, nodeCases, attrCases, renameCases, objectCases, spaceCases,
+	logCases, renameLogCases, snapshotCases, sinceCases)
 
 var rootCases = []testCase{
 	{name: "root is a directory, however it is named", run: func(t *testing.T, s metastore.Store) {

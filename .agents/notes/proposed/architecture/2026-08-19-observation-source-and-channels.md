@@ -2,6 +2,8 @@
 
 Status: proposed
 
+本 note 的结论被 [元数据复制](../../implemented/architecture/2026-08-27-metadata-replication.md) 采纳并接续：观察源在那里被定为**服务端的构件**，metastore 提供日志的后端与没有日志的后端各有一种拿法。
+
 ## 问题
 
 两个缺陷，是同一条概念边界在两个高度上的投影。

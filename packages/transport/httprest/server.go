@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 
+	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -17,16 +19,89 @@ import (
 // server; http.StripPrefix is how it is mounted somewhere other than the root.
 type Handler struct {
 	storage storage.Storage
+	log     metastore.Log
+	limits  Limits
+
+	// publisher is present exactly when log is, and wakes the open subscriptions.
+	publisher *publisher
+
+	// snapshots holds one token per snapshot that may be open at once.
+	snapshots chan struct{}
+
+	// stopping is closed by Stop and read by every open change stream.
+	stopping  chan struct{}
+	stopsOnce sync.Once
 }
 
 var _ http.Handler = (*Handler)(nil)
 
-// NewHandler builds a handler over s.
-func NewHandler(s storage.Storage) (*Handler, error) {
+// NewHandler builds a handler over s, publishing log to whatever replicates the namespace.
+//
+// The log is a second input rather than something discovered through s, because not every
+// namespace has one: a local directory is a namespace with no metastore behind it and
+// therefore no ordered record of what changed. Such a namespace is served whole here, and
+// the two replication endpoints answer ENOSYS — a nil log passed in on purpose, rather
+// than an absence this package could infer, so that a caller that has a log and forgets to
+// pass it is making a visible choice instead of silently serving a namespace nothing can
+// replicate.
+func NewHandler(s storage.Storage, log metastore.Log) (*Handler, error) {
+	return NewHandlerWithLimits(s, log, DefaultLimits())
+}
+
+// NewHandlerWithLimits is NewHandler with the bounds on the replication endpoints given
+// rather than defaulted. What the defaults are, and why they are guesses, is on Limits.
+func NewHandlerWithLimits(s storage.Storage, log metastore.Log, limits Limits) (*Handler, error) {
 	if s == nil {
 		return nil, errors.New("httprest: a handler needs a storage to serve")
 	}
-	return &Handler{storage: s}, nil
+	if err := limits.check(); err != nil {
+		return nil, err
+	}
+	h := &Handler{
+		storage:   s,
+		log:       log,
+		limits:    limits,
+		snapshots: make(chan struct{}, limits.Snapshots),
+		stopping:  make(chan struct{}),
+	}
+	if log != nil {
+		h.publisher = newPublisher()
+	}
+	return h, nil
+}
+
+// Stop ends every open change stream, telling each replica that this server is going away.
+//
+// It exists because a change stream never becomes idle. http.Server.Shutdown waits for
+// connections to return to idle and does not cancel request contexts, so a server with one
+// replica attached waits out whatever deadline Shutdown was given and then reports that it
+// expired — an ordinary stop turned into a stall and a failure. Handing this to
+// http.Server.RegisterOnShutdown is what lets the streams let go when shutdown begins:
+//
+//	server := &http.Server{Handler: handler}
+//	server.RegisterOnShutdown(handler.Stop)
+//
+// A stream ended this way says so, and a replica told this keeps what it has and reconnects
+// with the position it holds. That is the point of saying it at all: a connection that
+// simply stopped could equally be a server that vanished, and being polite about going away
+// must not cost a replica more than being abrupt would have.
+//
+// It returns as soon as the streams have been told, not when they have gone; waiting for
+// them is what Shutdown is already doing. Calling it more than once is harmless, and calling
+// it on a handler that serves a namespace with no log does nothing, because such a namespace
+// has no streams to end.
+func (h *Handler) Stop() {
+	h.stopsOnce.Do(func() { close(h.stopping) })
+}
+
+// stopped reports whether Stop has been called.
+func (h *Handler) stopped() bool {
+	select {
+	case <-h.stopping:
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -115,6 +190,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) 
 			return
 		}
 		writeJSON(w, http.StatusOK, SpaceResponse{Space: SpaceOf(space)})
+
+	case OpSubscribe:
+		h.serveEvents(w, r, nil)
+	case OpResubscribe:
+		h.serveEvents(w, r, &resumeFrom{incarnation: req.Incarnation, position: req.Position})
+	case OpSnapshot:
+		h.serveSnapshot(w, r)
 	}
 }
 
@@ -123,6 +205,13 @@ func (h *Handler) report(w http.ResponseWriter, err error) {
 	if err != nil {
 		writeStorageError(w, err)
 		return
+	}
+	// Every operation that changes the namespace is answered here, so this is the one
+	// place that knows the namespace has just moved — and the moment it knows is the
+	// moment the subscriptions are told to read the log again. Nothing is handed to them:
+	// what they read is the log itself, which is the only record of what changed.
+	if h.publisher != nil {
+		h.publisher.wake()
 	}
 	w.Header().Set("Content-Length", "0")
 	w.WriteHeader(http.StatusOK)

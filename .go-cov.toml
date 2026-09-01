@@ -29,6 +29,7 @@ files = [
   "cmd/remote-fs-server/main.go",
   "packages/storage/storagetest/storagetest.go",
   "packages/metastore/metastoretest/metastoretest.go",
+  "packages/metastore/metastoretest/log.go",
 ]
 funcs = []
 

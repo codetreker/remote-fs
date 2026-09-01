@@ -81,7 +81,7 @@ func newParts(t *testing.T, allowance int64) parts {
 	if err != nil {
 		t.Fatalf("reaching the blob container: %v", err)
 	}
-	meta, err := sqlite.Open(t.Context(), database, "workspace", allowance)
+	meta, err := sqlite.Open(t.Context(), database, "workspace", allowance, sqlite.DefaultWindow())
 	if err != nil {
 		t.Fatalf("opening the metastore: %v", err)
 	}
