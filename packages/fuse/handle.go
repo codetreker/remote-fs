@@ -199,16 +199,29 @@ func (h *handle) commit(ctx context.Context) syscall.Errno {
 	return 0
 }
 
-// describeUncommitted overrides what the namespace reports about a file with what this
-// handle holds, while the two differ.
-func (h *handle) describeUncommitted(out *gofuse.Attr) {
+// describe overrides what the namespace reports about a file with what this handle holds.
+//
+// The size is always this handle's, because Read serves this handle's buffer and the two
+// have to agree: the kernel will not ask for a byte past the length it was told, so a
+// length taken from the namespace clips the read at whatever is at that path now. That is
+// how a name replaced by another mount — a rename over it, which is how every editor saves
+// — turned a held descriptor into a reader of the old contents cut to the new file's
+// length, with no error anywhere. A descriptor reads the file it opened (R-FS-5, R-CON-3).
+//
+// The times are overridden only while the buffer is uncommitted, where a program that
+// writes a file and stats it must not see the time from before its own write (R-CON-4).
+// A clean handle still reports the namespace's times, so a descriptor held across a
+// replacement reports the length of what it will serve and the time of what replaced it.
+// That is a smaller inconsistency than the one above and not the same kind: it misdescribes
+// the file, where the other one hands over another file's bytes.
+func (h *handle) describe(out *gofuse.Attr) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	out.Size = uint64(len(h.contents))
 	if !h.dirty {
 		return
 	}
-	out.Size = uint64(len(h.contents))
 	out.Mtime, out.Ctime = uint64(h.changed.Unix()), uint64(h.changed.Unix())
 	out.Mtimensec = uint32(h.changed.Nanosecond())
 	out.Ctimensec = out.Mtimensec

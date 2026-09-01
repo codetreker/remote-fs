@@ -317,6 +317,7 @@ func TestABodyThatCarriesNoAttributes(t *testing.T) {
 // needless one to walk into.
 func TestTheWireForm(t *testing.T) {
 	attr := storage.Attr{
+		ID:         77,
 		Mode:       fs.ModeDir | 0o755,
 		Size:       4096,
 		AccessTime: time.Unix(1700000000, 1),
@@ -326,7 +327,7 @@ func TestTheWireForm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	want := `{"attr":{"mode":2147484141,"size":4096,` +
+	want := `{"attr":{"id":77,"mode":2147484141,"size":4096,` +
 		`"access_time":{"unix_sec":1700000000,"nanos":1},` +
 		`"mod_time":{"unix_sec":1755000000,"nanos":123456789}}}`
 	if string(encoded) != want {

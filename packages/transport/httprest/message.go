@@ -41,6 +41,7 @@ func (t Time) Time() time.Time { return time.Unix(t.UnixSec, int64(t.Nanos)) }
 // ends of this protocol are Go and the translation to what a kernel wants belongs to
 // whatever presents the namespace as a filesystem.
 type Attr struct {
+	ID         uint64 `json:"id"`
 	Mode       uint32 `json:"mode"`
 	Size       int64  `json:"size"`
 	AccessTime Time   `json:"access_time"`
@@ -57,6 +58,7 @@ type Attr struct {
 // in the UnmarshalJSON methods below, where no decoder of these messages can omit them.
 func AttrOf(a storage.Attr) *Attr {
 	return &Attr{
+		ID:         a.ID,
 		Mode:       uint32(a.Mode),
 		Size:       a.Size,
 		AccessTime: TimeOf(a.AccessTime),
@@ -67,6 +69,7 @@ func AttrOf(a storage.Attr) *Attr {
 // Storage returns the attributes a carries.
 func (a Attr) Storage() storage.Attr {
 	return storage.Attr{
+		ID:         a.ID,
 		Mode:       fs.FileMode(a.Mode),
 		Size:       a.Size,
 		AccessTime: a.AccessTime.Time(),

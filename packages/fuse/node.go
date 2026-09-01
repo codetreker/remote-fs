@@ -132,7 +132,7 @@ func (n *node) Lookup(ctx context.Context, name string, out *gofuse.EntryOut) (*
 	if errno := n.ns.fillAttr(&out.Attr, attr); errno != 0 {
 		return nil, errno
 	}
-	return n.child(ctx, name, out.Attr.Mode), 0
+	return n.child(ctx, name, out.Attr.Mode, attr.ID), 0
 }
 
 func (n *node) Getattr(ctx context.Context, f fs.FileHandle, out *gofuse.AttrOut) syscall.Errno {
@@ -143,10 +143,11 @@ func (n *node) Getattr(ctx context.Context, f fs.FileHandle, out *gofuse.AttrOut
 	if errno := n.ns.fillAttr(&out.Attr, attr); errno != 0 {
 		return errno
 	}
-	// A program that writes a file and then checks its size must see what it wrote,
-	// even though the commit has not happened yet (R-CON-4).
+	// An open descriptor answers for the file it opened rather than for whatever is at
+	// that path now: the namespace is asked by path, and a name replaced since the open
+	// describes another node. The handle holds what this descriptor will actually serve.
 	if h, ok := f.(*handle); ok {
-		h.describeUncommitted(&out.Attr)
+		h.describe(&out.Attr)
 	}
 	return 0
 }
@@ -299,7 +300,7 @@ func (n *node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		present[e.Name] = struct{}{}
 		// The number a listing reports has to be the number a stat of the same name
 		// reports, or programs that pair the two see two different files.
-		listing = append(listing, gofuse.DirEntry{Name: e.Name, Mode: mode, Ino: n.id.child(e.Name, mode).ino})
+		listing = append(listing, gofuse.DirEntry{Name: e.Name, Mode: mode, Ino: n.id.child(e.Name, mode, e.Attr.ID).ino})
 	}
 	n.id.keepOnly(present, before)
 
@@ -357,7 +358,7 @@ func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	}
 	// The file the handle holds is the empty one just created, so a handle that is
 	// closed without a write has nothing to commit.
-	child := n.child(ctx, name, out.Attr.Mode)
+	child := n.child(ctx, name, out.Attr.Mode, attr.ID)
 	return child, newHandle(child.Operations().(*node), nil, committed), 0, 0
 }
 
@@ -376,7 +377,7 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *gofuse.
 	if errno := n.ns.fillAttr(&out.Attr, attr); errno != 0 {
 		return nil, errno
 	}
-	return n.child(ctx, name, out.Attr.Mode), 0
+	return n.child(ctx, name, out.Attr.Mode, attr.ID), 0
 }
 
 // wearMode gives a node just made the permissions the caller asked for.
@@ -437,8 +438,8 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 // identity stable across a rename: the FUSE library moves the existing inode to the new
 // name, so looking that name up has to find it again rather than mint a second inode for
 // the same file.
-func (n *node) child(ctx context.Context, name string, mode uint32) *fs.Inode {
-	id := n.id.child(name, mode)
+func (n *node) child(ctx context.Context, name string, mode uint32, nodeID uint64) *fs.Inode {
+	id := n.id.child(name, mode, nodeID)
 	if existing := n.GetChild(name); existing != nil && existing.StableAttr().Ino == id.ino {
 		return existing
 	}

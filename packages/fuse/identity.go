@@ -10,12 +10,19 @@ import (
 // the kernel: it maps one of them against the other's length, and the program reading
 // there takes SIGBUS.
 //
-// Nothing arrives from below that could serve as that number. The namespace is addressed
-// by path and says nothing about what a node is, and a path cannot stand in for an
-// identity either — a rename moves a node to another name and frees the one it left, and
-// the next node created there is a second, different node that would be given the first
-// one's number. So the numbers are allocated here, and this is the record of which of them
-// is in use for which name.
+// What arrives from below is storage.Attr.ID, which says which node is at a name but is
+// not itself fit to be the number: a backend over a host filesystem supplies inode numbers
+// the host hands back once a node is gone, and a number the kernel has been told about must
+// never name a second node. So the numbers are allocated here and never reused, and the
+// namespace's own identity is what decides when a name has stopped holding the node this
+// record has a number for.
+//
+// A name cannot stand in for either of them. A rename moves a node to another name and
+// frees the one it left, and the next node created there is a second, different node that
+// would be given the first one's number. Keying only by name is how that happens, and it
+// is not enough to update the record from the operations this mount performs: a rename on
+// another mount, or by a client that is not a mount at all, reaches none of them. Comparing
+// the identity below is what covers the changes this mount never sees. R-FS-5.
 //
 // The record is a tree of names rather than a table of paths. Naming one node costs the
 // depth of its name and nothing costs the size of the record: a directory that moves
@@ -44,6 +51,12 @@ type identity struct {
 	ino  uint64
 	kind uint32
 
+	// node is what the namespace called the node this number was minted for. A lookup
+	// that finds another one has found a different node under a name this record already
+	// had, and the number goes with the node that left rather than to the one that
+	// arrived.
+	node uint64
+
 	// children is allocated for a directory and left nil for everything else. Only a
 	// directory is ever asked for one: a name this mount reported as a file is a name the
 	// kernel does not look inside or rename into.
@@ -52,28 +65,39 @@ type identity struct {
 
 // rootIdentity returns the identity of one mount's root, from which every other identity
 // in that mount descends.
+// The root's own node is left unset and never compared: a mount's root is the namespace's
+// root for as long as the mount exists, and nothing can rename another node over it.
 func rootIdentity() *identity {
 	all := &identities{handed: 1}
 	return &identity{all: all, ino: all.handed, kind: syscall.S_IFDIR, children: map[string]*identity{}}
 }
 
 // child returns the identity of the name directly beneath this one, giving it a number if
-// this mount has not named it before.
+// this mount has not named it before or if what it named there is no longer what is there.
+//
+// The number is kept only when the namespace agrees the node is the same one. That is the
+// check that holds R-FS-5 against changes this mount did not make: the record is otherwise
+// updated only by this mount's own operations, and a name replaced by somebody else would
+// keep a number the kernel already holds attributes and cached pages against.
+//
+// The kind is compared as well as the identity. A backend whose identities are the host's
+// inode numbers may hand the same one to a node of another kind once the first is gone, and
+// the kernel holding one number for a file and a directory at once is the same fault.
 //
 // Two lookups of one name must agree on the answer, including two that run at the same
 // time: a name that resolved to two numbers would be two nodes. That is what this record
 // is for. The FUSE library reconciles two inodes made for one number into one inode;
 // nothing reconciles two numbers.
-func (i *identity) child(name string, mode uint32) *identity {
+func (i *identity) child(name string, mode uint32, nodeID uint64) *identity {
 	kind := mode & syscall.S_IFMT
 
 	i.all.mu.Lock()
 	defer i.all.mu.Unlock()
 
-	if known := i.children[name]; known != nil && known.kind == kind {
+	if known := i.children[name]; known != nil && known.kind == kind && known.node == nodeID {
 		return known
 	}
-	fresh := i.all.mint(kind)
+	fresh := i.all.mint(kind, nodeID)
 	i.children[name] = fresh
 	return fresh
 }
@@ -139,9 +163,9 @@ func (i *identity) move(name string, to *identity, newName string) {
 }
 
 // mint hands out the next number. The caller holds the lock.
-func (all *identities) mint(kind uint32) *identity {
+func (all *identities) mint(kind uint32, nodeID uint64) *identity {
 	all.handed++
-	fresh := &identity{all: all, ino: all.handed, kind: kind}
+	fresh := &identity{all: all, ino: all.handed, kind: kind, node: nodeID}
 	if kind == syscall.S_IFDIR {
 		fresh.children = map[string]*identity{}
 	}

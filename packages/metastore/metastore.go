@@ -199,7 +199,9 @@ func (n Node) IsDir() bool { return n.Mode.IsDir() }
 
 // Attr renders the node as the storage contract describes it.
 func (n Node) Attr() storage.Attr {
-	return storage.Attr{Mode: n.Mode, Size: n.Size, AccessTime: n.AccessTime, ModTime: n.ModTime}
+	return storage.Attr{
+		ID: uint64(n.ID), Mode: n.Mode, Size: n.Size, AccessTime: n.AccessTime, ModTime: n.ModTime,
+	}
 }
 
 // Child is one member of a directory listing. The name is a byte sequence rather than a

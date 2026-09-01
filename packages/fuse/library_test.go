@@ -9,6 +9,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"hash/fnv"
 	iofs "io/fs"
 	"math"
 	"os"
@@ -598,6 +599,20 @@ func TestACeilingThatAdmitsNothingIsRefused(t *testing.T) {
 	}
 }
 
+// named resolves a name whose node has not changed. Every case below about the record's
+// own behaviour wants that: a stand-in identity, stable across calls and distinct between
+// names, so that a case about names is not also a case about a node being replaced. The
+// cases that are about that pass their own.
+func (i *identity) named(name string, mode uint32) *identity {
+	return i.child(name, mode, stableNode(name))
+}
+
+func stableNode(name string) uint64 {
+	sum := fnv.New64a()
+	sum.Write([]byte(name))
+	return sum.Sum64()
+}
+
 // The record of which node each name refers to is the mount's answer to a namespace that
 // has no notion of identity. These reach it directly, because several of its cases — one
 // name resolved twice at the same time, a name whose identity was dropped between a lookup
@@ -606,11 +621,11 @@ func TestACeilingThatAdmitsNothingIsRefused(t *testing.T) {
 func TestOneNameKeepsOneIdentity(t *testing.T) {
 	root := rootIdentity()
 
-	first := root.child("f", syscall.S_IFREG)
-	if again := root.child("f", syscall.S_IFREG); again != first {
+	first := root.named("f", syscall.S_IFREG)
+	if again := root.named("f", syscall.S_IFREG); again != first {
 		t.Fatalf("the same name resolved to %d and then to %d", first.ino, again.ino)
 	}
-	if other := root.child("g", syscall.S_IFREG); other.ino == first.ino {
+	if other := root.named("g", syscall.S_IFREG); other.ino == first.ino {
 		t.Fatalf("two names share the number %d", other.ino)
 	}
 	if root.ino == first.ino {
@@ -634,7 +649,7 @@ func TestOneNameResolvedAtOnceKeepsOneIdentity(t *testing.T) {
 			defer done.Done()
 			ready.Done()
 			<-start
-			resolved[i] = root.child("f", syscall.S_IFREG)
+			resolved[i] = root.named("f", syscall.S_IFREG)
 		}()
 	}
 	ready.Wait()
@@ -653,8 +668,8 @@ func TestOneNameResolvedAtOnceKeepsOneIdentity(t *testing.T) {
 func TestANameThatChangesKindChangesIdentity(t *testing.T) {
 	root := rootIdentity()
 
-	asFile := root.child("x", syscall.S_IFREG)
-	asDir := root.child("x", syscall.S_IFDIR)
+	asFile := root.named("x", syscall.S_IFREG)
+	asDir := root.named("x", syscall.S_IFDIR)
 	if asDir.ino == asFile.ino {
 		t.Fatalf("a name that became a directory kept the number %d it had as a file", asFile.ino)
 	}
@@ -675,38 +690,48 @@ func TestAnIdentityIsNeverHandedOutTwice(t *testing.T) {
 		seen[id.ino] = what
 	}
 
-	record("f", root.child("f", syscall.S_IFREG))
+	record("f", root.named("f", syscall.S_IFREG))
 	root.forget("f")
-	record("f again", root.child("f", syscall.S_IFREG))
+	record("f again", root.named("f", syscall.S_IFREG))
 
-	d := root.child("d", syscall.S_IFDIR)
+	d := root.named("d", syscall.S_IFDIR)
 	record("d", d)
-	record("d/x", d.child("x", syscall.S_IFREG))
+	record("d/x", d.named("x", syscall.S_IFREG))
 	root.move("d", root, "moved")
-	record("d again", root.child("d", syscall.S_IFDIR))
+	record("d again", root.named("d", syscall.S_IFDIR))
 }
 
 // A directory carries the identities beneath it, and leaves nothing behind at the name it
 // came from.
+// The identities are written out here rather than derived from the names, because a rename
+// is the one thing that separates the two: the node that arrives at "onto" is the node that
+// was at "from", and it keeps the identity it had. A stand-in derived from the name would be
+// asserting the opposite of what a rename means.
 func TestMovingADirectoryCarriesWhatIsBeneathIt(t *testing.T) {
+	const (
+		mover  = 1 // the directory that is renamed
+		sub    = 2 // a directory beneath it
+		buried = 3 // a file beneath that
+		onto   = 4 // the directory the rename lands on top of
+	)
 	root := rootIdentity()
-	from := root.child("from", syscall.S_IFDIR)
-	deep := from.child("sub", syscall.S_IFDIR).child("f", syscall.S_IFREG)
-	doomed := root.child("onto", syscall.S_IFDIR)
+	from := root.child("from", syscall.S_IFDIR, mover)
+	deep := from.child("sub", syscall.S_IFDIR, sub).child("f", syscall.S_IFREG, buried)
+	doomed := root.child("onto", syscall.S_IFDIR, onto)
 
 	root.move("from", root, "onto")
 
-	moved := root.child("onto", syscall.S_IFDIR)
+	moved := root.child("onto", syscall.S_IFDIR, mover)
 	if moved != from {
 		t.Fatal("the destination does not refer to the node that moved there")
 	}
 	if moved.ino == doomed.ino {
 		t.Fatalf("what arrived kept the number %d of what it replaced", doomed.ino)
 	}
-	if carried := moved.child("sub", syscall.S_IFDIR).child("f", syscall.S_IFREG); carried != deep {
+	if carried := moved.child("sub", syscall.S_IFDIR, sub).child("f", syscall.S_IFREG, buried); carried != deep {
 		t.Fatal("a file beneath the directory did not move with it")
 	}
-	if fresh := root.child("from", syscall.S_IFDIR); fresh == from {
+	if fresh := root.child("from", syscall.S_IFDIR, mover); fresh == from {
 		t.Fatal("the name the directory left still refers to it")
 	}
 }
@@ -715,11 +740,11 @@ func TestMovingADirectoryCarriesWhatIsBeneathIt(t *testing.T) {
 // there, and it is gone.
 func TestMovingANameThatWasNeverResolvedStillClearsTheDestination(t *testing.T) {
 	root := rootIdentity()
-	doomed := root.child("onto", syscall.S_IFREG)
+	doomed := root.named("onto", syscall.S_IFREG)
 
 	root.move("never-resolved", root, "onto")
 
-	if fresh := root.child("onto", syscall.S_IFREG); fresh.ino == doomed.ino {
+	if fresh := root.named("onto", syscall.S_IFREG); fresh.ino == doomed.ino {
 		t.Fatalf("the destination still refers to %d, the node the rename replaced", doomed.ino)
 	}
 	if _, named := root.children["never-resolved"]; named {
@@ -733,23 +758,23 @@ func TestMovingANameThatWasNeverResolvedStillClearsTheDestination(t *testing.T) 
 // would give the node that has it a second identity on the next lookup.
 func TestAListingDropsTheNamesTheDirectoryNoLongerHas(t *testing.T) {
 	root := rootIdentity()
-	gone := root.child("gone", syscall.S_IFDIR)
-	gone.child("beneath", syscall.S_IFREG)
-	kept := root.child("kept", syscall.S_IFREG)
+	gone := root.named("gone", syscall.S_IFDIR)
+	gone.named("beneath", syscall.S_IFREG)
+	kept := root.named("kept", syscall.S_IFREG)
 
 	before := root.given()
-	appeared := root.child("appeared", syscall.S_IFREG)
+	appeared := root.named("appeared", syscall.S_IFREG)
 	root.keepOnly(map[string]struct{}{"kept": {}}, before)
 
-	if root.child("kept", syscall.S_IFREG) != kept {
+	if root.named("kept", syscall.S_IFREG) != kept {
 		t.Fatal("a name the listing holds lost its identity")
 	}
-	if root.child("appeared", syscall.S_IFREG) != appeared {
+	if root.named("appeared", syscall.S_IFREG) != appeared {
 		t.Fatal("a name that appeared while the listing was in flight lost its identity")
 	}
-	if again := root.child("gone", syscall.S_IFDIR); again == gone {
+	if again := root.named("gone", syscall.S_IFDIR); again == gone {
 		t.Fatal("a name the listing does not hold kept its identity")
-	} else if again.child("beneath", syscall.S_IFREG).ino == gone.children["beneath"].ino {
+	} else if again.named("beneath", syscall.S_IFREG).ino == gone.children["beneath"].ino {
 		t.Fatal("a name beneath the one that went kept its identity")
 	}
 }
@@ -925,5 +950,69 @@ func TestShorteningNeedsNoRoomAndAsksForNone(t *testing.T) {
 	if answering.times() != 0 {
 		t.Fatalf("the namespace was asked %d times about room a shortening does not need",
 			answering.times())
+	}
+}
+
+// A name whose node has been replaced refers to a different node, and must not keep the
+// number the kernel already holds attributes and cached pages against. This is R-FS-5, and
+// it is the case the record could not answer while it was keyed by name alone: the
+// operations that update it are this mount's own, so a rename over the name by another
+// mount — or by a client that is not a mount at all — reached none of them.
+//
+// Nothing about the name changes here, and neither does the kind. Only the identity the
+// namespace reports does, which is exactly what arrives from a change this mount did not
+// make.
+func TestANameWhoseNodeWasReplacedGetsANewIdentity(t *testing.T) {
+	root := rootIdentity()
+
+	before := root.child("doc.txt", syscall.S_IFREG, 42)
+	after := root.child("doc.txt", syscall.S_IFREG, 43)
+	if after.ino == before.ino {
+		t.Fatalf("a name holding a different node kept the number %d, so the kernel has two nodes under one", before.ino)
+	}
+	if again := root.child("doc.txt", syscall.S_IFREG, 43); again != after {
+		t.Fatalf("the replacement resolved to %d and then to %d", after.ino, again.ino)
+	}
+	// The number the node that left had is not handed out again, so nothing still holding
+	// it finds it naming somebody else's node.
+	if third := root.child("other", syscall.S_IFREG, 44); third.ino == before.ino {
+		t.Fatalf("the number %d that named the replaced node was given to another name", before.ino)
+	}
+}
+
+// The same node under the same name keeps its number, which is the other half of R-FS-5 and
+// the half a record that minted a fresh number every time would fail. A mount that renumbered
+// a file on every lookup would break everything that remembers an inode across two calls.
+func TestANameWhoseNodeIsUnchangedKeepsItsIdentity(t *testing.T) {
+	root := rootIdentity()
+
+	first := root.child("f", syscall.S_IFREG, 7)
+	for range 3 {
+		if again := root.child("f", syscall.S_IFREG, 7); again != first {
+			t.Fatalf("an unchanged node was renumbered from %d to %d", first.ino, again.ino)
+		}
+	}
+	// And it survives a rename, because a rename changes a name and not a node.
+	root.move("f", root, "g")
+	if moved := root.child("g", syscall.S_IFREG, 7); moved != first {
+		t.Fatalf("a renamed node came back as %d, want the %d it had", moved.ino, first.ino)
+	}
+}
+
+// A directory replaced by another directory is a different node, and the identities beneath
+// the old one go with it. Keeping them would leave the children of a directory nobody can
+// reach holding numbers the kernel still has.
+func TestAReplacedDirectoryDoesNotKeepWhatWasBeneathIt(t *testing.T) {
+	root := rootIdentity()
+
+	before := root.child("d", syscall.S_IFDIR, 10)
+	beneath := before.child("f", syscall.S_IFREG, 11)
+
+	after := root.child("d", syscall.S_IFDIR, 20)
+	if after.ino == before.ino {
+		t.Fatalf("a replaced directory kept the number %d", before.ino)
+	}
+	if fresh := after.child("f", syscall.S_IFREG, 21); fresh.ino == beneath.ino {
+		t.Fatalf("a name under the replacement kept %d, the number it had under the directory that left", beneath.ino)
 	}
 }

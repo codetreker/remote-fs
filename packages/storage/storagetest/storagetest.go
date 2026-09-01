@@ -44,6 +44,99 @@ type testCase struct {
 }
 
 var cases = []testCase{
+	// --- identity (R-FS-5) --------------------------------------------------------
+
+	{"a node has an identity, and it is not zero", func(t *testing.T, s storage.Storage) {
+		mustSucceed(t, s.Create(ctx(t), "f"))
+		mustSucceed(t, s.Mkdir(ctx(t), "d"))
+		for _, p := range []string{"", "f", "d"} {
+			attr, err := s.Stat(ctx(t), p)
+			if err != nil {
+				t.Fatalf("stat %q: %v", p, err)
+			}
+			// Zero is what a namespace that never filled this in reports, and it would
+			// compare equal for every node — a mountpoint above it would hand one node's
+			// bytes to a descriptor open on another and never say so.
+			if attr.ID == 0 {
+				t.Fatalf("%q reports no identity, so nothing above can tell it from any other node", p)
+			}
+		}
+	}},
+
+	{"two nodes have two identities", func(t *testing.T, s storage.Storage) {
+		mustSucceed(t, s.Create(ctx(t), "f"))
+		mustSucceed(t, s.Create(ctx(t), "g"))
+		mustSucceed(t, s.Mkdir(ctx(t), "d"))
+
+		seen := map[uint64]string{}
+		for _, p := range []string{"", "f", "g", "d"} {
+			attr, err := s.Stat(ctx(t), p)
+			if err != nil {
+				t.Fatalf("stat %q: %v", p, err)
+			}
+			if previous, taken := seen[attr.ID]; taken {
+				t.Fatalf("%q and %q share the identity %d", previous, p, attr.ID)
+			}
+			seen[attr.ID] = p
+		}
+	}},
+
+	// A rename is the case R-FS-5 turns on, and it is the one every namespace can answer:
+	// a name changes and a node does not.
+	//
+	// Whether a *write* keeps a node's identity is deliberately not asked here. A namespace
+	// that keeps its tree separately from its bytes repoints the node and keeps it; one over
+	// a host filesystem stages the new contents beside the old and renames them into place,
+	// which is the only way to make the replacement atomic there and gives the host's own
+	// numbering no choice but to change. Both are honest, so the contract asks for neither.
+	{"an identity survives a rename", func(t *testing.T, s storage.Storage) {
+		mustSucceed(t, s.Write(ctx(t), "before", []byte("one")))
+		was := statID(t, s, "before")
+
+		mustSucceed(t, s.Rename(ctx(t), "before", "after"))
+		if now := statID(t, s, "after"); now != was {
+			t.Fatalf("a renamed node reports identity %d, want the %d it had: a rename changes a name, not a node", now, was)
+		}
+	}},
+
+	// A name removed and then created again is deliberately not asked about either. A
+	// namespace with its own numbering never reuses one, and a host filesystem hands the
+	// number back as soon as the node holding it is gone, so a name recreated at once can
+	// come back with the number that just left. What that costs is bounded by where the
+	// number the kernel sees is minted, which is above this contract and never reuses one:
+	// the identity here is only ever compared to decide whether a name still holds the node
+	// it held before, and a recycled one makes that comparison miss rather than lie.
+	{"a name that holds a new node holds a new identity", func(t *testing.T, s storage.Storage) {
+		mustSucceed(t, s.Write(ctx(t), "doc", []byte("one")))
+		was := statID(t, s, "doc")
+
+		// The ordinary atomic save. What is at the name afterwards is a different node,
+		// and reporting the identity the old one had is what lets a mountpoint above hand
+		// an open descriptor another file's bytes.
+		mustSucceed(t, s.Write(ctx(t), "doc.tmp", []byte("two")))
+		mustSucceed(t, s.Rename(ctx(t), "doc.tmp", "doc"))
+		if now := statID(t, s, "doc"); now == was {
+			t.Fatalf("a name renamed over kept the identity %d of the node it held before", was)
+		}
+	}},
+
+	{"a listing reports the same identities a stat does", func(t *testing.T, s storage.Storage) {
+		mustSucceed(t, s.Create(ctx(t), "f"))
+		mustSucceed(t, s.Mkdir(ctx(t), "d"))
+
+		entries, err := s.List(ctx(t), "")
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		for _, e := range entries {
+			// A listing and a stat of one name must agree, or a program that pairs the two
+			// sees two files where there is one.
+			if want := statID(t, s, e.Name); e.Attr.ID != want {
+				t.Fatalf("the listing gives %q identity %d and a stat gives it %d", e.Name, e.Attr.ID, want)
+			}
+		}
+	}},
+
 	// --- the root -----------------------------------------------------------------
 
 	{"root is a directory, however it is named", func(t *testing.T, s storage.Storage) {
@@ -924,6 +1017,16 @@ var cases = []testCase{
 			}
 		}
 	}},
+}
+
+// statID is the identity the namespace reports for one name.
+func statID(t *testing.T, s storage.Storage, path string) uint64 {
+	t.Helper()
+	attr, err := s.Stat(ctx(t), path)
+	if err != nil {
+		t.Fatalf("stat %q: %v", path, err)
+	}
+	return attr.ID
 }
 
 func ctx(t *testing.T) context.Context { return t.Context() }

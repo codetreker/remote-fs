@@ -160,6 +160,22 @@ func (s Space) Coherent() bool {
 // Attr describes one node — the one that is at the name it was asked about. A symbolic
 // link's attributes are the link's own, and nothing here describes what it points at.
 type Attr struct {
+	// ID is what the node is, as distinct from what it is called. Two attributes
+	// describing one node carry the same ID, and a name whose node has been replaced —
+	// by a rename over it, or by a removal and a creation — carries a different one. It
+	// survives a rename, because a rename changes a name and not a node.
+	//
+	// It is opaque: compare it for equality, and do nothing else with it. Neither its
+	// magnitude nor its ordering means anything, and two namespaces may use the same
+	// value for unrelated nodes.
+	//
+	// Zero is not a value. R-FS-5 is the whole reason this field exists, and an
+	// implementation that left it unset would satisfy every equality comparison above it
+	// — which is to say it would report every node as the same node, silently. A
+	// namespace that cannot tell one node from another cannot serve a mountpoint, and
+	// the contract suite refuses one that tries.
+	ID uint64
+
 	// Mode carries the type bits and the permission bits. The type bits say what kind of
 	// node is at the name, so a symbolic link reads as fs.ModeSymlink.
 	Mode fs.FileMode
