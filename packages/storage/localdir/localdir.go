@@ -415,11 +415,24 @@ func (s *Storage) host(path string) (string, error) {
 // for it. os.Stat and fs.DirEntry.Info both produce a *syscall.Stat_t underneath on this
 // platform, so the assertion holds for every caller here.
 func attrOf(info fs.FileInfo) storage.Attr {
-	accessed := info.Sys().(*syscall.Stat_t).Atim
+	system := info.Sys().(*syscall.Stat_t)
+	// The host filesystem's inode number is this backend's node identity. It is unique
+	// among the nodes alive at one moment on one filesystem, and it follows a node through
+	// a rename, which is the clause of R-FS-5 this backend meets.
+	//
+	// It is not never-reused: the host hands a number back as soon as the node holding it
+	// is gone, so a name removed and created again can come back with the number that just
+	// left. Nothing above repairs that. The mount mints its own numbers and never reuses
+	// one, but a number already given to the kernel then names two nodes in turn, and the
+	// comparison this identity exists for does not fire — measured on ext4, a name removed
+	// and recreated keeps its number on another mount every time. R-FS-5's third clause is
+	// therefore not met by a namespace over a host filesystem, and a descriptor still open
+	// on the node that left is the case it costs.
 	return storage.Attr{
+		ID:         system.Ino,
 		Mode:       info.Mode(),
 		Size:       info.Size(),
-		AccessTime: time.Unix(accessed.Unix()),
+		AccessTime: time.Unix(system.Atim.Unix()),
 		ModTime:    info.ModTime(),
 	}
 }

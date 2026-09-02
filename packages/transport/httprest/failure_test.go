@@ -604,8 +604,15 @@ func TestAStatThatCarriesNoAttributes(t *testing.T) {
 		// Attributes under a name this side does not read are attributes it did not get.
 		{`{"attributes":{"mode":420,"size":7}}`, 0, true},
 
-		{`{"attr":{"mode":420,"size":7}}`, 0o644, false},
-		{`{"attr":{"mode":0,"size":0}}`, 0, false},
+		// A peer that sends attributes without an identity is not sending nothing, it is
+		// saying every node is the same node, and every comparison of that above returns
+		// equal. It is refused here, where the other absences are.
+		{`{"attr":{"mode":420,"size":7}}`, 0, true},
+		{`{"attr":{"id":0,"mode":420,"size":7}}`, 0, true},
+
+		// A mode of zero is a legitimate answer, unlike an identity of zero.
+		{`{"attr":{"id":9,"mode":420,"size":7}}`, 0o644, false},
+		{`{"attr":{"id":9,"mode":0,"size":0}}`, 0, false},
 	}
 	for _, c := range cases {
 		t.Run(c.body, func(t *testing.T) {
@@ -641,8 +648,10 @@ func TestAListingEntryThatCarriesNoAttributes(t *testing.T) {
 	}{
 		{`{"entries":[{"name":"Zg=="}]}`, true},
 		{`{"entries":[{"name":"Zg==","attr":null}]}`, true},
-		{`{"entries":[{"name":"Zg==","attr":{"mode":420}},{"name":"Zw=="}]}`, true},
-		{`{"entries":[{"name":"Zg==","attr":{"mode":0}}]}`, false},
+		{`{"entries":[{"name":"Zg==","attr":{"id":9,"mode":420}},{"name":"Zw=="}]}`, true},
+		// An entry whose attributes carry no identity is refused with the rest of them.
+		{`{"entries":[{"name":"Zg==","attr":{"mode":0}}]}`, true},
+		{`{"entries":[{"name":"Zg==","attr":{"id":9,"mode":0}}]}`, false},
 	}
 	for _, c := range cases {
 		t.Run(c.body, func(t *testing.T) {

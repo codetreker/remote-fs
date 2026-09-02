@@ -1,12 +1,15 @@
 package cmd_test
 
 import (
+	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // The tests here are about the copy of the namespace's metadata each mountpoint keeps: what
@@ -190,4 +193,167 @@ func inodeOf(t *testing.T, at string) uint64 {
 		t.Fatalf("stat %s reports no inode number", at)
 	}
 	return stat.Ino
+}
+
+// A descriptor reads the file it was opened on, even after another mountpoint has renamed a
+// different file over that name. R-FS-5 is what makes this possible and R-CON-3 is what it
+// delivers: the reader sees the old contents or the new ones, never a piece of each.
+//
+// The sequence is the ordinary atomic save — write a temp file, rename it over the target —
+// which is how editors, compilers, package managers and git all replace a file. Before the
+// mount had node identity this returned the old file's bytes cut to the new file's length,
+// silently, with no error at either end: the name kept the inode number the kernel already
+// held attributes against, so the size came from the node that arrived and the bytes from
+// the node the descriptor was opened on.
+//
+// It is here rather than beside the identity record because every layer has to hold for the
+// program to be right: the namespace has to report which node is at a name, the wire has to
+// carry it, the record has to compare it, and an open descriptor has to describe the file it
+// holds rather than the path it came from. A case under any one of them passes with the
+// other three broken.
+func TestADescriptorKeepsReadingTheFileItOpened(t *testing.T) {
+	s := serveNamespace(t)
+	a, b := mountpointOn(t, s), mountpointOn(t, s)
+
+	const (
+		old = "the contents this descriptor was opened on\n"
+		new = "shorter\n"
+	)
+	if err := os.WriteFile(filepath.Join(a, "doc.txt"), []byte(old), 0o644); err != nil {
+		t.Fatalf("writing doc.txt through A: %v", err)
+	}
+
+	// B opens it and reads it once, so the descriptor is established and the name has an
+	// identity on that mount before anything changes.
+	held, err := os.Open(filepath.Join(b, "doc.txt"))
+	if err != nil {
+		t.Fatalf("opening doc.txt through B: %v", err)
+	}
+	defer held.Close()
+	if first, err := io.ReadAll(held); err != nil || string(first) != old {
+		t.Fatalf("B first read %q (%v), want %q", first, err, old)
+	}
+	before, err := held.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A saves over the name the way every tool does.
+	if err := os.WriteFile(filepath.Join(a, "doc.tmp"), []byte(new), 0o644); err != nil {
+		t.Fatalf("writing the staging file through A: %v", err)
+	}
+	if err := os.Rename(filepath.Join(a, "doc.tmp"), filepath.Join(a, "doc.txt")); err != nil {
+		t.Fatalf("renaming over doc.txt through A: %v", err)
+	}
+
+	// Wait for B to see the replacement at the name, so that what is checked afterwards is a
+	// descriptor held across a change B has already applied rather than one that arrived early.
+	replaced := time.Now()
+	for {
+		got, err := os.ReadFile(filepath.Join(b, "doc.txt"))
+		if err != nil {
+			t.Fatalf("reading doc.txt through B: %v", err)
+		}
+		if string(got) == new {
+			break
+		}
+		if waited := time.Since(replaced); waited >= time.Second {
+			t.Fatalf("B still read the old contents %v after the rename returned on A; R-CON-1 allows one second", waited)
+		}
+	}
+
+	// The descriptor still reads what it was opened on, whole.
+	if _, err := held.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	again, err := io.ReadAll(held)
+	if err != nil {
+		t.Fatalf("reading through the held descriptor: %v", err)
+	}
+	if string(again) != old {
+		t.Fatalf("a descriptor held across a rename over its name read %q, want the %q it was opened on", again, old)
+	}
+
+	// And its own attributes describe that file rather than the one that took its place. The
+	// length is what the kernel clips a read at, so a length from the wrong node is how the
+	// bytes above went wrong.
+	after, err := held.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != int64(len(old)) {
+		t.Fatalf("fstat on the held descriptor reports %d bytes, want the %d it holds", after.Size(), len(old))
+	}
+
+	// The name now refers to a different node, and must not have kept the number the kernel
+	// still holds for the one the descriptor has open.
+	arrived, err := os.Stat(filepath.Join(b, "doc.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, arrivedIno := before.Sys().(*syscall.Stat_t).Ino, arrived.Sys().(*syscall.Stat_t).Ino
+	if opened == arrivedIno {
+		t.Fatalf("the node that arrived and the one the descriptor holds are both inode %d, so the kernel has two nodes under one number", opened)
+	}
+}
+
+// A stat of a path answers for the file at that path, whoever else has it open.
+//
+// The kernel sends no file handle with a GETATTR for a path, and go-fuse fills that in from
+// whichever descriptor happens to be open on the node — fs/bridge.go, "the linux kernel
+// doesnt pass along the file descriptor, so we have to fake it here". So anything the mount
+// answers out of a handle reaches an ordinary stat(2) as well, from a descriptor that has
+// nothing to do with the caller.
+//
+// This is on a namespace with a metastore rather than a directory, and that is the point: a
+// directory backend stages and renames on every write, so the node changes, the mount mints
+// a new number, and a stale handle is stranded on an inode nothing looks up. Everything in
+// packages/fuse mounts a directory, which is why nothing there sees this.
+func TestAStatOfAPathIsNotAnsweredFromSomebodyElsesDescriptor(t *testing.T) {
+	s := serveNamespace(t)
+	a := mountpointOn(t, s)
+	f := filepath.Join(a, "f")
+
+	if err := os.WriteFile(f, []byte("123456"), 0o644); err != nil {
+		t.Fatalf("writing f: %v", err)
+	}
+	// A reader that only ever reads, and holds the file open across somebody else's write.
+	held, err := os.Open(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	if _, err := io.ReadAll(held); err != nil {
+		t.Fatal(err)
+	}
+
+	grown := bytes.Repeat([]byte("x"), 55)
+	if err := os.WriteFile(f, grown, 0o644); err != nil {
+		t.Fatalf("rewriting f: %v", err)
+	}
+
+	// Every way of asking has to give the length the file now has, while that unrelated
+	// descriptor is still open. A read of the same path returning 55 bytes beside a stat
+	// saying 6 is R-CON-4 broken in the way nothing reports.
+	attr, err := os.Stat(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attr.Size() != int64(len(grown)) {
+		t.Fatalf("stat reports %d bytes while an unrelated descriptor is open, want the %d the file holds",
+			attr.Size(), len(grown))
+	}
+	read, err := os.ReadFile(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(read) != len(grown) {
+		t.Fatalf("a read returned %d bytes where stat said %d", len(read), attr.Size())
+	}
+
+	// And the descriptor that is open still answers for the file it holds, which is the
+	// same file: nothing renamed over the name, so its length is the current one.
+	if own, err := held.Stat(); err != nil || own.Size() != int64(len(grown)) {
+		t.Fatalf("fstat on the held descriptor reports %v (%v), want %d", own, err, len(grown))
+	}
 }

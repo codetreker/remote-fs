@@ -173,9 +173,11 @@ type Node struct {
 	// ID identifies the node itself rather than the name it currently has. It survives a
 	// rename and is never reused after the node is gone.
 	//
-	// Nothing above uses it yet — the storage contract addresses nodes by path. It is here
-	// because a tree stored as parent-and-name has it for free, and because the shape that
-	// would not have it is the one that makes it expensive to add later.
+	// The storage contract addresses nodes by path and carries this alongside, as
+	// storage.Attr.ID: it is how a mount tells a name that holds a different node from one
+	// that holds the same node still, which is what keeps an open descriptor reading the
+	// file it was opened on (R-FS-5). A tree stored as parent-and-name has it for free, and
+	// the shape that would not have it is the one that makes it expensive to add later.
 	ID int64
 
 	// Mode carries the type bits and the permission bits, in io/fs's layout rather than a
@@ -199,7 +201,9 @@ func (n Node) IsDir() bool { return n.Mode.IsDir() }
 
 // Attr renders the node as the storage contract describes it.
 func (n Node) Attr() storage.Attr {
-	return storage.Attr{Mode: n.Mode, Size: n.Size, AccessTime: n.AccessTime, ModTime: n.ModTime}
+	return storage.Attr{
+		ID: uint64(n.ID), Mode: n.Mode, Size: n.Size, AccessTime: n.AccessTime, ModTime: n.ModTime,
+	}
 }
 
 // Child is one member of a directory listing. The name is a byte sequence rather than a
