@@ -328,7 +328,9 @@ func TestTheBufferBehavesLikeAFile(t *testing.T) {
 // the ceiling alone.
 func aHandle(contents []byte, maxFileSize int64) *handle {
 	n := &node{ns: &namespace{storage: unmeasured{}, maxFileSize: maxFileSize}}
-	return newHandle(n, contents, committed)
+	// These reach the buffer directly rather than through a mountpoint, so the node
+	// the buffer was filled from does not come into it.
+	return newHandle(n, contents, committed, 0)
 }
 
 // unmeasured is a namespace with no room of its own to report. Nothing but Space is
@@ -613,8 +615,9 @@ func stableNode(name string) uint64 {
 	return sum.Sum64()
 }
 
-// The record of which node each name refers to is the mount's answer to a namespace that
-// has no notion of identity. These reach it directly, because several of its cases — one
+// The record of which node each name refers to turns the namespace's identity for a node
+// into the number the kernel knows it by. These reach it directly, because several of its
+// cases — one
 // name resolved twice at the same time, a name whose identity was dropped between a lookup
 // and the rename that follows it, a name that appears while a listing is in flight — are
 // races through a mountpoint and plain calls here.
@@ -938,7 +941,7 @@ func TestAWriteDoesNotQueueBehindAQuestionAlreadyInFlight(t *testing.T) {
 func TestShorteningNeedsNoRoomAndAsksForNone(t *testing.T) {
 	answering := &answersSpace{space: storage.Space{Total: 1000, Used: 1000}}
 	h := newHandle(&node{ns: &namespace{storage: answering, maxFileSize: 1 << 20}},
-		make([]byte, 500), committed)
+		make([]byte, 500), committed, 0)
 
 	if errno := h.resize(t.Context(), 100); errno != 0 {
 		t.Fatalf("shortening a file of 500 bytes to 100 returned %v, in a workspace with nothing left",

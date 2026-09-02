@@ -43,6 +43,13 @@ type handle struct {
 	// changed is when the buffer last changed, reported while it is uncommitted so that
 	// a program which writes a file and stats it does not see the previous time.
 	changed time.Time
+
+	// opened is the node the namespace had at this name when the buffer was filled, and
+	// it is what tells a descriptor held across a replacement from one whose file is
+	// still there. Zero for a handle that never read a file — one opened with O_TRUNC,
+	// or made by a creation — whose buffer is the file until it is committed and is the
+	// file afterwards, so neither needs telling apart from anything.
+	opened uint64
 }
 
 // The two states a fresh buffer can be in. A handle opened with O_TRUNC starts empty and
@@ -61,8 +68,8 @@ var (
 	_ fs.FileReleaser = (*handle)(nil)
 )
 
-func newHandle(n *node, contents []byte, dirty bool) *handle {
-	h := &handle{node: n, contents: contents, dirty: dirty, changed: time.Now()}
+func newHandle(n *node, contents []byte, dirty bool, opened uint64) *handle {
+	h := &handle{node: n, contents: contents, dirty: dirty, changed: time.Now(), opened: opened}
 	if !dirty {
 		h.stored = int64(len(contents))
 	}
@@ -199,32 +206,47 @@ func (h *handle) commit(ctx context.Context) syscall.Errno {
 	return 0
 }
 
-// describe overrides what the namespace reports about a file with what this handle holds.
+// describe overrides what the namespace reports with what this handle holds, where the two
+// are about different things. at is the node the namespace has at the name now.
 //
-// The size is always this handle's, because Read serves this handle's buffer and the two
-// have to agree: the kernel will not ask for a byte past the length it was told, so a
-// length taken from the namespace clips the read at whatever is at that path now. That is
-// how a name replaced by another mount — a rename over it, which is how every editor saves
-// — turned a held descriptor into a reader of the old contents cut to the new file's
-// length, with no error anywhere. A descriptor reads the file it opened (R-FS-5, R-CON-3).
+// An uncommitted buffer is the file: a program that writes and then stats must see what it
+// wrote, size and time both, before the commit has happened (R-CON-4).
 //
-// The times are overridden only while the buffer is uncommitted, where a program that
-// writes a file and stats it must not see the time from before its own write (R-CON-4).
-// A clean handle still reports the namespace's times, so a descriptor held across a
-// replacement reports the length of what it will serve and the time of what replaced it.
-// That is a smaller inconsistency than the one above and not the same kind: it misdescribes
-// the file, where the other one hands over another file's bytes.
-func (h *handle) describe(out *gofuse.Attr) {
+// A committed buffer is overridden only when the name no longer holds the node the buffer
+// was filled from. Then this descriptor and that name are two different files, and the
+// length has to be the one this descriptor will serve: the kernel will not ask for a byte
+// past the length it was told, so a length taken from the name clips the read at whatever
+// is there now — which is how a rename over the name by another mount turned a held
+// descriptor into a reader of the old contents cut to the new file's length (R-FS-5,
+// R-CON-3).
+//
+// Overriding unconditionally instead is what this must not do, and it is not hypothetical:
+// the kernel sends no file handle with a GETATTR for a path, and go-fuse fills that in from
+// whichever descriptor happens to be open on the node (fs/bridge.go, "the linux kernel
+// doesnt pass along the file descriptor, so we have to fake it here"). An unconditional
+// override therefore answers an ordinary stat from an unrelated reader's buffer: a file
+// rewritten while somebody holds it open reported the holder's length to every program on
+// the machine until that descriptor closed — 6 where the file was 55, from stat(1), du(1)
+// and os.Stat alike, while a read of the same path returned all 55 bytes.
+//
+// The times are not overridden for a committed buffer, so a descriptor held across a
+// replacement reports the length of what it will serve with the time of what replaced it.
+// That misdescribes the file, where the other one hands over another file's bytes; it is
+// not the same kind of wrong and it is left.
+func (h *handle) describe(out *gofuse.Attr, at uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	out.Size = uint64(len(h.contents))
-	if !h.dirty {
+	if h.dirty {
+		out.Size = uint64(len(h.contents))
+		out.Mtime, out.Ctime = uint64(h.changed.Unix()), uint64(h.changed.Unix())
+		out.Mtimensec = uint32(h.changed.Nanosecond())
+		out.Ctimensec = out.Mtimensec
 		return
 	}
-	out.Mtime, out.Ctime = uint64(h.changed.Unix()), uint64(h.changed.Unix())
-	out.Mtimensec = uint32(h.changed.Nanosecond())
-	out.Ctimensec = out.Mtimensec
+	if h.opened != 0 && at != h.opened {
+		out.Size = uint64(len(h.contents))
+	}
 }
 
 // resized returns body at exactly size bytes, padded with zeroes when it grows. The

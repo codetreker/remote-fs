@@ -13,10 +13,10 @@ import (
 
 func TestAttrSurvivesJSON(t *testing.T) {
 	cases := []storage.Attr{
-		{Mode: 0o644, Size: 0, AccessTime: time.Unix(0, 0), ModTime: time.Unix(0, 0)},
-		{Mode: fs.ModeDir | 0o755, Size: 4096, AccessTime: time.Now(), ModTime: time.Now()},
-		{Mode: 0o600, Size: 1 << 40, AccessTime: time.Unix(1600000000, 1), ModTime: time.Unix(1755000000, 123456789)},
-		{Mode: 0o755 | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky, Size: 1},
+		{ID: 9, Mode: 0o644, Size: 0, AccessTime: time.Unix(0, 0), ModTime: time.Unix(0, 0)},
+		{ID: 9, Mode: fs.ModeDir | 0o755, Size: 4096, AccessTime: time.Now(), ModTime: time.Now()},
+		{ID: 9, Mode: 0o600, Size: 1 << 40, AccessTime: time.Unix(1600000000, 1), ModTime: time.Unix(1755000000, 123456789)},
+		{ID: 9, Mode: 0o755 | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky, Size: 1},
 	}
 	for _, want := range cases {
 		encoded, err := json.Marshal(httprest.AttrOf(want))
@@ -87,9 +87,9 @@ func TestAnAttrChangeSurvivesJSON(t *testing.T) {
 
 func TestEntriesSurviveJSON(t *testing.T) {
 	want := []storage.Entry{
-		{Name: "a file", Attr: storage.Attr{Mode: 0o644, Size: 3, AccessTime: time.Unix(9, 0), ModTime: time.Unix(1, 0)}},
-		{Name: "日本語", Attr: storage.Attr{Mode: fs.ModeDir | 0o755, ModTime: time.Unix(2, 0)}},
-		{Name: "\xff not utf-8", Attr: storage.Attr{Mode: 0o600, Size: 7, ModTime: time.Unix(3, 0)}},
+		{Name: "a file", Attr: storage.Attr{ID: 9, Mode: 0o644, Size: 3, AccessTime: time.Unix(9, 0), ModTime: time.Unix(1, 0)}},
+		{Name: "日本語", Attr: storage.Attr{ID: 9, Mode: fs.ModeDir | 0o755, ModTime: time.Unix(2, 0)}},
+		{Name: "\xff not utf-8", Attr: storage.Attr{ID: 9, Mode: 0o600, Size: 7, ModTime: time.Unix(3, 0)}},
 	}
 	encoded, err := json.Marshal(httprest.ListResponse{Entries: httprest.EntriesOf(want)})
 	if err != nil {
@@ -147,7 +147,7 @@ func TestATimeOutsideTheNanosecondRange(t *testing.T) {
 	}
 	for name, want := range cases {
 		t.Run("reported "+name, func(t *testing.T) {
-			encoded, err := json.Marshal(httprest.AttrOf(storage.Attr{AccessTime: want, ModTime: want}))
+			encoded, err := json.Marshal(httprest.AttrOf(storage.Attr{ID: 9, AccessTime: want, ModTime: want}))
 			if err != nil {
 				t.Fatalf("marshal: %v", err)
 			}
@@ -250,14 +250,19 @@ func TestABodyThatCarriesNoSpaceReport(t *testing.T) {
 // that no reader of these messages has to remember to.
 func TestABodyThatCarriesNoAttributes(t *testing.T) {
 	statCases := map[string]bool{
-		`{}`:                                    false,
-		`null`:                                  false,
-		`{"attr":null}`:                         false,
-		`{"entries":[]}`:                        false,
-		`{"attr":{"mode":0}}`:                   true,
-		`{"attr":{"mode":420,"size":7}}`:        true,
-		`{"attr":{"mode":420},"entries":[]}`:    true,
-		`{"attr":{"mode":2147484141,"size":0}}`: true,
+		`{}`:             false,
+		`null`:           false,
+		`{"attr":null}`:  false,
+		`{"entries":[]}`: false,
+		// Attributes carrying no identity are an absence too, and the one that does not
+		// show in the shape of the body: every comparison of a zero identity above
+		// returns equal, so a peer that omits it reads as saying every node is one node.
+		`{"attr":{"mode":0}}`:                          false,
+		`{"attr":{"id":0,"mode":420,"size":7}}`:        false,
+		`{"attr":{"id":9,"mode":0}}`:                   true,
+		`{"attr":{"id":9,"mode":420,"size":7}}`:        true,
+		`{"attr":{"id":9,"mode":420},"entries":[]}`:    true,
+		`{"attr":{"id":9,"mode":2147484141,"size":0}}`: true,
 	}
 	for body, want := range statCases {
 		t.Run("stat "+body, func(t *testing.T) {
@@ -276,7 +281,8 @@ func TestABodyThatCarriesNoAttributes(t *testing.T) {
 		`{"entries":[{"name":"Zg==","attr":null}]}`:  false,
 		`{"entries":[{"name":7,"attr":{"mode":0}}]}`: false,
 		`{"entries":[]}`: true,
-		`{"entries":[{"name":"Zg==","attr":{"mode":0}}]}`: true,
+		`{"entries":[{"name":"Zg==","attr":{"mode":0}}]}`:        false,
+		`{"entries":[{"name":"Zg==","attr":{"id":9,"mode":0}}]}`: true,
 	}
 	for body, want := range listCases {
 		t.Run("list "+body, func(t *testing.T) {

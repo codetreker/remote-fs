@@ -173,9 +173,11 @@ type Node struct {
 	// ID identifies the node itself rather than the name it currently has. It survives a
 	// rename and is never reused after the node is gone.
 	//
-	// Nothing above uses it yet — the storage contract addresses nodes by path. It is here
-	// because a tree stored as parent-and-name has it for free, and because the shape that
-	// would not have it is the one that makes it expensive to add later.
+	// The storage contract addresses nodes by path and carries this alongside, as
+	// storage.Attr.ID: it is how a mount tells a name that holds a different node from one
+	// that holds the same node still, which is what keeps an open descriptor reading the
+	// file it was opened on (R-FS-5). A tree stored as parent-and-name has it for free, and
+	// the shape that would not have it is the one that makes it expensive to add later.
 	ID int64
 
 	// Mode carries the type bits and the permission bits, in io/fs's layout rather than a

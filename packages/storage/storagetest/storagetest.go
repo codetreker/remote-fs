@@ -100,12 +100,15 @@ var cases = []testCase{
 	}},
 
 	// A name removed and then created again is deliberately not asked about either. A
-	// namespace with its own numbering never reuses one, and a host filesystem hands the
-	// number back as soon as the node holding it is gone, so a name recreated at once can
-	// come back with the number that just left. What that costs is bounded by where the
-	// number the kernel sees is minted, which is above this contract and never reuses one:
-	// the identity here is only ever compared to decide whether a name still holds the node
-	// it held before, and a recycled one makes that comparison miss rather than lie.
+	// namespace with its own numbering never reuses one; a host filesystem hands the number
+	// back as soon as the node holding it is gone, so a name recreated at once can come back
+	// with the number that just left.
+	//
+	// That is a gap rather than a bounded cost, and it is written down as one. A recycled
+	// identity makes the comparison above a mount miss, so the mount keeps the number it
+	// already gave the kernel for a node that is gone — which is R-FS-5's third clause
+	// failing, on a namespace over a host filesystem. Minting never reusing a number does
+	// not repair it: the harm is an already-minted number naming a second node.
 	{"a name that holds a new node holds a new identity", func(t *testing.T, s storage.Storage) {
 		mustSucceed(t, s.Write(ctx(t), "doc", []byte("one")))
 		was := statID(t, s, "doc")

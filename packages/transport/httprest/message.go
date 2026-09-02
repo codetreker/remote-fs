@@ -77,6 +77,33 @@ func (a Attr) Storage() storage.Attr {
 	}
 }
 
+// UnmarshalJSON decodes attributes, and refuses ones that carry no identity.
+//
+// This is the one field here whose zero is silent rather than loud. A mode of zero is a
+// legitimate answer and an instant at the epoch is a value somebody could have set, so the
+// refusals elsewhere in this file are about the whole Attr being absent. An identity of zero
+// is different: storage.Attr calls it illegal, and every comparison of it in a mount above
+// returns equal — so a peer that does not send the field is not read as sending nothing, it
+// is read as saying every node is the same node. Measured against a server built before the
+// field existed: after an ordinary rename over a name, a held descriptor and the node that
+// arrived came back under one inode number, with no diagnostic anywhere.
+//
+// Refusing here rather than moving the protocol version is deliberate. The version says which
+// vocabulary is spoken; this is a peer speaking it and leaving out a word, which the decoders
+// in this file are where we catch.
+func (a *Attr) UnmarshalJSON(data []byte) error {
+	type attr Attr
+	var decoded attr
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if decoded.ID == 0 {
+		return errors.New("the attributes carry no identity for the node they describe")
+	}
+	*a = Attr(decoded)
+	return nil
+}
+
 // AttrChange is storage.AttrChange on the wire.
 //
 // Every field is optional and stays optional here, because an attribute the change does

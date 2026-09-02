@@ -46,7 +46,7 @@ type node struct {
 	ns *namespace
 
 	// id is what the kernel knows this node by. It is this mount's to allocate and keep,
-	// because the namespace has no notion of identity; see identity.go.
+	// because the number the kernel knows a node by is this mount's own; see identity.go.
 	id *identity
 
 	// open holds the handles this node is presently read and written through, so that a
@@ -147,7 +147,7 @@ func (n *node) Getattr(ctx context.Context, f fs.FileHandle, out *gofuse.AttrOut
 	// that path now: the namespace is asked by path, and a name replaced since the open
 	// describes another node. The handle holds what this descriptor will actually serve.
 	if h, ok := f.(*handle); ok {
-		h.describe(&out.Attr)
+		h.describe(&out.Attr, attr.ID)
 	}
 	return 0
 }
@@ -312,7 +312,7 @@ func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	// fetching. The empty buffer counts as uncommitted, because `> f` truncates a file
 	// without ever writing a byte and the truncation still has to be committed.
 	if flags&syscall.O_TRUNC != 0 {
-		return newHandle(n, nil, uncommitted), 0, 0
+		return newHandle(n, nil, uncommitted, 0), 0, 0
 	}
 
 	// The whole file is read once here and served out of the buffer from then on.
@@ -336,7 +336,7 @@ func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	if err != nil {
 		return nil, 0, errnoOf(err)
 	}
-	return newHandle(n, body, committed), 0, 0
+	return newHandle(n, body, committed, attr.ID), 0, 0
 }
 
 // Create makes the file in the namespace straight away, rather than at the commit, so
@@ -359,7 +359,7 @@ func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	// The file the handle holds is the empty one just created, so a handle that is
 	// closed without a write has nothing to commit.
 	child := n.child(ctx, name, out.Attr.Mode, attr.ID)
-	return child, newHandle(child.Operations().(*node), nil, committed), 0, 0
+	return child, newHandle(child.Operations().(*node), nil, committed, attr.ID), 0, 0
 }
 
 func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *gofuse.EntryOut) (*fs.Inode, syscall.Errno) {

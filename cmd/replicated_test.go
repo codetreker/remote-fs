@@ -1,6 +1,7 @@
 package cmd_test
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"path/filepath"
@@ -293,5 +294,66 @@ func TestADescriptorKeepsReadingTheFileItOpened(t *testing.T) {
 	opened, arrivedIno := before.Sys().(*syscall.Stat_t).Ino, arrived.Sys().(*syscall.Stat_t).Ino
 	if opened == arrivedIno {
 		t.Fatalf("the node that arrived and the one the descriptor holds are both inode %d, so the kernel has two nodes under one number", opened)
+	}
+}
+
+// A stat of a path answers for the file at that path, whoever else has it open.
+//
+// The kernel sends no file handle with a GETATTR for a path, and go-fuse fills that in from
+// whichever descriptor happens to be open on the node — fs/bridge.go, "the linux kernel
+// doesnt pass along the file descriptor, so we have to fake it here". So anything the mount
+// answers out of a handle reaches an ordinary stat(2) as well, from a descriptor that has
+// nothing to do with the caller.
+//
+// This is on a namespace with a metastore rather than a directory, and that is the point: a
+// directory backend stages and renames on every write, so the node changes, the mount mints
+// a new number, and a stale handle is stranded on an inode nothing looks up. Everything in
+// packages/fuse mounts a directory, which is why nothing there sees this.
+func TestAStatOfAPathIsNotAnsweredFromSomebodyElsesDescriptor(t *testing.T) {
+	s := serveNamespace(t)
+	a := mountpointOn(t, s)
+	f := filepath.Join(a, "f")
+
+	if err := os.WriteFile(f, []byte("123456"), 0o644); err != nil {
+		t.Fatalf("writing f: %v", err)
+	}
+	// A reader that only ever reads, and holds the file open across somebody else's write.
+	held, err := os.Open(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	if _, err := io.ReadAll(held); err != nil {
+		t.Fatal(err)
+	}
+
+	grown := bytes.Repeat([]byte("x"), 55)
+	if err := os.WriteFile(f, grown, 0o644); err != nil {
+		t.Fatalf("rewriting f: %v", err)
+	}
+
+	// Every way of asking has to give the length the file now has, while that unrelated
+	// descriptor is still open. A read of the same path returning 55 bytes beside a stat
+	// saying 6 is R-CON-4 broken in the way nothing reports.
+	attr, err := os.Stat(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attr.Size() != int64(len(grown)) {
+		t.Fatalf("stat reports %d bytes while an unrelated descriptor is open, want the %d the file holds",
+			attr.Size(), len(grown))
+	}
+	read, err := os.ReadFile(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(read) != len(grown) {
+		t.Fatalf("a read returned %d bytes where stat said %d", len(read), attr.Size())
+	}
+
+	// And the descriptor that is open still answers for the file it holds, which is the
+	// same file: nothing renamed over the name, so its length is the current one.
+	if own, err := held.Stat(); err != nil || own.Size() != int64(len(grown)) {
+		t.Fatalf("fstat on the held descriptor reports %v (%v), want %d", own, err, len(grown))
 	}
 }
