@@ -400,6 +400,85 @@ func TestClientListBoundedInvalidatesAnEarlyDecodedPrefix(t *testing.T) {
 	}
 }
 
+func TestClientListBoundedStreamsACompleteStrictListing(t *testing.T) {
+	want := []storage.Entry{
+		{Name: "b", Attr: storage.Attr{ID: 2, Mode: 0o600, Size: 7}},
+		{Name: "a", Attr: storage.Attr{ID: 1, Mode: fs.ModeDir | 0o700}},
+	}
+	body, err := json.Marshal(httprest.ListResponse{Entries: httprest.EntriesOf(want)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := dialListingBody(t, body)
+	result := newClientListResult(t)
+	if err := client.ListBounded(t.Context(), "", result); err != nil {
+		t.Fatalf("ListBounded: %v", err)
+	}
+	got, err := result.Entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.SortFunc(want, func(a, b storage.Entry) int { return strings.Compare(a.Name, b.Name) })
+	if !slices.Equal(got, want) {
+		t.Fatalf("streamed listing = %+v, want %+v", got, want)
+	}
+}
+
+func TestClientListBoundedRejectsEveryIncompleteOrExtendedResponseShape(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty body":               ``,
+		"array instead of object":  `[]`,
+		"missing listing":          `{}`,
+		"truncated field":          `{"`,
+		"wrong first field":        `{"other":[]}`,
+		"truncated array field":    `{"entries"`,
+		"null listing":             `{"entries":null}`,
+		"invalid entry":            `{"entries":[{}]}`,
+		"unterminated array":       `{"entries":[`,
+		"extra response field":     `{"entries":[],"extra":1}`,
+		"unterminated response":    `{"entries":[]`,
+		"content after the object": `{"entries":[]} {}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			result := newClientListResult(t)
+			err := dialListingBody(t, []byte(body)).ListBounded(t.Context(), "", result)
+			if !errors.Is(err, syscall.EIO) {
+				t.Fatalf("ListBounded returned %v, want EIO", err)
+			}
+			if entries, resultErr := result.Entries(); entries != nil || !errors.Is(resultErr, syscall.EIO) {
+				t.Fatalf("failed response exposed entries=%+v, err=%v", entries, resultErr)
+			}
+		})
+	}
+}
+
+func dialListingBody(t *testing.T, body []byte) *httprest.Storage {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(httprest.HeaderProtocol, httprest.Version)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(server.Close)
+	client, err := httprest.Dial(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+func newClientListResult(t *testing.T) *storage.ListResult {
+	t.Helper()
+	result, err := storage.NewListResult(1<<20, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+		return nameBytes + 256, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
 func TestTheClientBoundsReadResponses(t *testing.T) {
 	const limit = int64(8)
 	options := httprest.DefaultDialOptions()

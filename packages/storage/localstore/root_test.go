@@ -46,6 +46,80 @@ func TestRootAnchorDetectsPathReplacement(t *testing.T) {
 	}
 }
 
+func TestOpenCleansAnInterruptedCompletionStage(t *testing.T) {
+	newConfig := func(t *testing.T) Config {
+		t.Helper()
+		root := filepath.Join(t.TempDir(), "store")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return Config{
+			Root: root, Workspace: "workspace", Quota: 1 << 20,
+			Window: sqlite.DefaultWindow(),
+			Maintenance: objectstore.Options{
+				SweepInterval: time.Hour,
+				SweepBatch:    8,
+			},
+		}
+	}
+	initialize := func(t *testing.T, config Config) {
+		t.Helper()
+		store, err := Open(t.Context(), config)
+		if err != nil {
+			t.Fatalf("initialize local store: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("close initialized local store: %v", err)
+		}
+	}
+
+	t.Run("regular stage", func(t *testing.T) {
+		config := newConfig(t)
+		initialize(t, config)
+		stage := filepath.Join(config.Root, completionStage)
+		if err := os.WriteFile(stage, []byte("interrupted marker"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		store, err := Open(t.Context(), config)
+		if err != nil {
+			t.Fatalf("reopen with completion stage: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(stage); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("completion stage still exists after reopen: %v", err)
+		}
+	})
+
+	t.Run("directory stage", func(t *testing.T) {
+		config := newConfig(t)
+		initialize(t, config)
+		stage := filepath.Join(config.Root, completionStage)
+		if err := os.Mkdir(stage, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		store, err := Open(t.Context(), config)
+		if err == nil {
+			store.Close()
+			t.Fatal("Open removed a directory posing as the completion stage")
+		}
+		if !errors.Is(err, syscall.EISDIR) {
+			t.Fatalf("Open returned %v, want EISDIR", err)
+		}
+		if info, err := os.Lstat(stage); err != nil || !info.IsDir() {
+			t.Fatalf("failed cleanup changed the stage directory: %v, %v", info, err)
+		}
+		objects, err := localdisk.Open(t.Context(), config.Root, localdisk.Options{})
+		if err != nil {
+			t.Fatalf("failed Open retained the object-store lock: %v", err)
+		}
+		if err := objects.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestInitializationIntentRecoversInterruptedFirstOpen(t *testing.T) {
 	parent := t.TempDir()
 	if err := os.Chmod(parent, 0o700); err != nil {

@@ -326,15 +326,13 @@ type Log interface {
 	// Incarnation identifies this log as a continuation of itself.
 	//
 	// A caller resumes with the pair (incarnation, position); a position alone is not
-	// enough. A log that lost its history — a fresh in-memory one after a restart, or one
-	// whose tail did not survive a crash — would otherwise be asked to resume at a position
-	// it has never heard of, and the reasonable-looking answer, "that is within my window,
-	// you are caught up", loses every change in between with nothing left to notice it by.
+	// enough. A newly initialized log has a new incarnation. A durable log whose committed
+	// position and retained history disagree is corrupt: it must fail integrity validation
+	// with EIO and preserve the recorded incarnation, not present the corruption as a new
+	// coherent history that a caller can rebuild from.
 	//
-	// It changes whenever the log is not a verbatim continuation of what the caller last
-	// saw, and it does not change merely because a process restarted.
-	// Incarnation reports the identity with its UTF-8 byte length limited before the value
-	// is loaded or copied into the caller's process. A larger identity is syscall.EFBIG.
+	// Incarnation reports the identity with its UTF-8 byte length limited before the value is
+	// loaded or copied into the caller's process. A larger identity is syscall.EFBIG.
 	Incarnation(ctx context.Context, maxBytes int64) (Incarnation, error)
 
 	// Barrier atomically reports this log's incarnation and committed position. The

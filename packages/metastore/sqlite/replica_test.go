@@ -173,6 +173,45 @@ func TestACopyIsFilledFromAPictureAndHoldsTheSourcesIds(t *testing.T) {
 	requireSame(t, from, into)
 }
 
+func TestReplicaListBoundedPreservesCompleteResultsAndFailures(t *testing.T) {
+	from := source(t)
+	build(t, from)
+	into := copyOf(t)
+	fill(t, from, into, 1024)
+
+	newResult := func() *storage.ListResult {
+		result, err := storage.NewListResult(1<<20, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+			return 64 + nameBytes, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	complete := newResult()
+	if err := into.ListBounded(t.Context(), "", complete); err != nil {
+		t.Fatalf("listing the replica root: %v", err)
+	}
+	entries, err := complete.Entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("the bounded replica listing omitted every root entry")
+	}
+
+	failed := newResult()
+	if err := into.ListBounded(t.Context(), "missing", failed); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("listing a missing replica directory: %v, want ENOENT", err)
+	}
+	if entries, err := failed.Entries(); !errors.Is(err, syscall.ENOENT) || entries != nil {
+		t.Fatalf("the failed replica listing exposed %+v, %v", entries, err)
+	}
+	if err := into.ListBounded(t.Context(), "", nil); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("listing into a nil result: %v, want EINVAL", err)
+	}
+}
+
 // TestAPictureIsAcceptedWhateverOrderItsRowsArriveIn.
 //
 // A page of one row delivers the tree in as many frames as it has nodes, and a child may

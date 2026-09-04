@@ -41,6 +41,23 @@ func TestABackingStoreBindingSurvivesReopen(t *testing.T) {
 	}
 }
 
+func TestOpenBoundWithObjectLimitsUsesTheRequestedPendingLimit(t *testing.T) {
+	store, err := sqlite.OpenBoundWithObjectLimits(
+		t.Context(), database(t), "workspace", "store-a", 0, sqlite.DefaultWindow(),
+		sqlite.ObjectLimits{MaxPendingObjects: 1, MaxPendingBytes: 1024},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Reserve(t.Context(), "first", 1); err != nil {
+		t.Fatalf("reserving within the configured object limit: %v", err)
+	}
+	if _, err := store.Reserve(t.Context(), "second", 1); !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("reserving beyond the configured object limit: %v, want EAGAIN", err)
+	}
+}
+
 func TestABoundDatabaseRefusesADifferentBackingStoreWithoutCreatingANamespace(t *testing.T) {
 	path := database(t)
 	store, err := sqlite.OpenBound(t.Context(), path, "workspace", "store-a", 0, sqlite.DefaultWindow())

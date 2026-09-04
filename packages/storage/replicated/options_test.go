@@ -51,3 +51,9 @@ func TestDefaultConfirmationOptionsAreFinite(t *testing.T) {
 		t.Fatalf("default options are %+v and do not match their exported defaults", options)
 	}
 }
+
+func TestConfirmationGraceCompatibilityConstructorValidatesBeforeDependencies(t *testing.T) {
+	if _, err := replicated.NewWithConfirmationGrace(context.Background(), nil, nil, 0); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("NewWithConfirmationGrace returned %v, want EINVAL", err)
+	}
+}

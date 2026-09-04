@@ -108,6 +108,71 @@ func TestInitializationPersistsIdentityAndPrivateLayout(t *testing.T) {
 	}
 }
 
+func TestFailedManifestSyncLeavesARecoverablePartialIdentity(t *testing.T) {
+	root := privateRoot(t)
+	stagePath := filepath.Join(root, manifestStageName)
+	ops := systemFileOperations
+	originalSync := ops.fsync
+	failedStageSync := false
+	ops.fsync = func(fd int) error {
+		var opened unix.Stat_t
+		if err := unix.Fstat(fd, &opened); err != nil {
+			return err
+		}
+		var stage unix.Stat_t
+		if !failedStageSync && unix.Stat(stagePath, &stage) == nil &&
+			opened.Dev == stage.Dev && opened.Ino == stage.Ino {
+			failedStageSync = true
+			return syscall.EIO
+		}
+		return originalSync(fd)
+	}
+
+	if _, err := open(t.Context(), root, Options{}, ops); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("Open returned %v, want the FORMAT file-sync failure", err)
+	}
+	if !failedStageSync {
+		t.Fatal("the fault seam did not reach the FORMAT staging file")
+	}
+	for _, name := range []string{manifestName, manifestStageName} {
+		if _, err := os.Stat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("failed FORMAT publication left %s: %v", name, err)
+		}
+	}
+
+	markerPath := filepath.Join(root, objectsDirectory, storeIdentityName)
+	markerBefore, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read the partial objects identity: %v", err)
+	}
+	reopened, err := Open(t.Context(), root, Options{})
+	if err != nil {
+		t.Fatalf("resume initialization from the partial identity: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	if !reopened.NewlyInitialized() {
+		t.Fatal("resumed initialization did not publish FORMAT")
+	}
+	markerAfter, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read the resumed objects identity: %v", err)
+	}
+	if !bytes.Equal(markerAfter, markerBefore) {
+		t.Fatal("resumed initialization replaced the durable partial store identity")
+	}
+	manifest, err := os.ReadFile(filepath.Join(root, manifestName))
+	if err != nil {
+		t.Fatalf("read resumed FORMAT: %v", err)
+	}
+	if got := encodeManifest(reopened.ID()); !bytes.Equal(manifest, got[:]) {
+		t.Fatal("resumed FORMAT does not bind the partial objects identity")
+	}
+}
+
 func TestOpenRequiresAnOwnedRecognizedRoot(t *testing.T) {
 	t.Run("missing", func(t *testing.T) {
 		root := filepath.Join(privateRoot(t), "missing")

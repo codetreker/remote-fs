@@ -348,9 +348,23 @@ func (h *heldBack) Flush() {
 
 // mountWithGrace is mount with an explicit mutation-barrier confirmation bound.
 func mountWithGrace(t *testing.T, s *served, grace time.Duration) (*replicated.Storage, *sqlite.Replica) {
-	options := replicated.DefaultOptions()
-	options.ConfirmationGrace = grace
-	return mountWithOptions(t, s, options)
+	t.Helper()
+
+	replica, err := sqlite.OpenReplica(t.Context(), path.Join(t.TempDir(), "replica.db"))
+	if err != nil {
+		t.Fatalf("opening the copy: %v", err)
+	}
+	remote, err := httprest.DialWithSilence(s.url, &http.Client{Timeout: 10 * time.Second}, s.silence)
+	if err != nil {
+		t.Fatalf("dialling the namespace: %v", err)
+	}
+	mounted, err := replicated.NewWithConfirmationGrace(t.Context(), replica, remote, grace)
+	if err != nil {
+		replica.Close()
+		t.Fatalf("building the copy: %v", err)
+	}
+	t.Cleanup(func() { mounted.Close() })
+	return mounted, replica
 }
 
 func mountWithOptions(t *testing.T, s *served, options replicated.Options) (*replicated.Storage, *sqlite.Replica) {

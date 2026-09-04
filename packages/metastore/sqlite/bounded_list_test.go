@@ -10,6 +10,38 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
+func TestListBoundedLoadsANameOnlyAfterItsReservation(t *testing.T) {
+	store, err := Open(t.Context(), filepath.Join(t.TempDir(), "meta.db"), "workspace", 0, DefaultWindow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Create(t.Context(), "entry"); err != nil {
+		t.Fatal(err)
+	}
+	reserved := false
+	result, err := storage.NewListResult(1024, 0, func(_ int, nameBytes int64, attr storage.Attr) (int64, error) {
+		reserved = true
+		if nameBytes != int64(len("entry")) || attr.ID == 0 {
+			t.Fatalf("reservation received name length %d and attributes %+v", nameBytes, attr)
+		}
+		return nameBytes, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ListBounded(t.Context(), "", result); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := result.Entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reserved || len(entries) != 1 || entries[0].Name != "entry" {
+		t.Fatalf("ListBounded returned %+v after reserved=%v", entries, reserved)
+	}
+}
+
 func TestListBoundedRefusesAStoredHugeNameBeforeLoadingItsBlob(t *testing.T) {
 	store, err := Open(t.Context(), filepath.Join(t.TempDir(), "meta.db"), "workspace", 0, DefaultWindow())
 	if err != nil {
