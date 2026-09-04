@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -28,6 +29,10 @@ import (
 // never observe each other's writes.
 type NewStorage func(t *testing.T) storage.Storage
 
+// NewBoundedStorage produces a namespace that can be served from an embedded process
+// without materialising an unbounded read or listing.
+type NewBoundedStorage func(t *testing.T) storage.BoundedStorage
+
 // Run exercises the whole contract.
 func Run(t *testing.T, newStorage NewStorage) {
 	t.Helper()
@@ -36,6 +41,74 @@ func Run(t *testing.T, newStorage NewStorage) {
 			c.run(t, newStorage(t))
 		})
 	}
+}
+
+// RunBounded exercises the additional obligations a server backend must satisfy.
+func RunBounded(t *testing.T, newStorage NewBoundedStorage) {
+	t.Helper()
+	t.Run("bounded storage dependencies are ready before serving", func(t *testing.T) {
+		if err := newStorage(t).CheckBounded(); err != nil {
+			t.Fatalf("CheckBounded returned %v", err)
+		}
+	})
+	t.Run("a read is refused before returning an oversized payload", func(t *testing.T) {
+		s := newStorage(t)
+		if err := s.Write(ctx(t), "f", []byte("four")); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := s.ReadBounded(ctx(t), "f", 3); got != nil || !errors.Is(err, syscall.EFBIG) {
+			t.Fatalf("ReadBounded returned %q, %v; want EFBIG and no payload", got, err)
+		}
+		if got, err := s.ReadBounded(ctx(t), "f", 4); err != nil || string(got) != "four" {
+			t.Fatalf("ReadBounded at the boundary returned %q, %v", got, err)
+		}
+		if got, err := s.ReadBounded(ctx(t), "f", math.MaxInt64); err != nil || string(got) != "four" {
+			t.Fatalf("ReadBounded under MaxInt64 returned %q, %v", got, err)
+		}
+	})
+	t.Run("a listing refuses the entry that crosses its result budget", func(t *testing.T) {
+		s := newStorage(t)
+		if err := s.Mkdir(ctx(t), "d"); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"a", "bb", "ccc"} {
+			if err := s.Create(ctx(t), "d/"+name); err != nil {
+				t.Fatal(err)
+			}
+		}
+		result, err := storage.NewListResult(3, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+			return nameBytes, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ListBounded(ctx(t), "d", result); !errors.Is(err, syscall.EIO) {
+			t.Fatalf("ListBounded returned %v, want EIO", err)
+		}
+		if entries, resultErr := result.Entries(); resultErr == nil || entries != nil {
+			t.Fatalf("an errored listing exposed a partial result: %+v, %v", entries, resultErr)
+		}
+	})
+	t.Run("cancellation stops bounded result production", func(t *testing.T) {
+		s := newStorage(t)
+		if err := s.Write(ctx(t), "f", []byte("content")); err != nil {
+			t.Fatal(err)
+		}
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		if got, err := s.ReadBounded(cancelled, "f", 16); got != nil || err == nil {
+			t.Fatalf("cancelled ReadBounded returned %q, %v", got, err)
+		}
+		result, err := storage.NewListResult(16, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+			return nameBytes, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ListBounded(cancelled, "", result); err == nil {
+			t.Fatal("cancelled ListBounded succeeded")
+		}
+	})
 }
 
 type testCase struct {

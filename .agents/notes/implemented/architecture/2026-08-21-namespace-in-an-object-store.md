@@ -17,13 +17,15 @@ Status: implemented
 | 包 | 承担什么 |
 |---|---|
 | `packages/storage/objectstore` | 组合两者，实现契约 |
-| `packages/storage/objectstore/azblob` | `Objects`：不可变字节，按不透明键寻址 |
+| `packages/storage/objectstore/azblob` | 一份 `Objects` 实现：Azure Blob 中的不可变字节 |
+| `packages/storage/objectstore/localdisk` | 一份 `Objects` 实现：本地磁盘上的不可变文件、完整性与物理容量 |
+| `packages/storage/localstore` | 组合 local-disk objects 与绑定到同一 store ID 的 SQLite，拥有初始化、维护与关闭 |
 | `packages/metastore` | `Store`：名字的树、节点的属性、路径到对象键的指向 |
-| `packages/metastore/sqlite` | 第一份 `Store` 实现 |
+| `packages/metastore/sqlite` | 第一份 `Store` 实现，也提供绑定到 backing store ID 的打开方式 |
 
-`localdir` 与 `limited` 不变，两者都还是命名空间的合法持有方式。
+`localdir` 与 `limited` 仍是命名空间的合法持有方式。本地磁盘实现的格式、持久化与组合所有权由[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)记录；它扩展这份两层结构，不改变树与对象的职责划分。
 
-**写入的顺序是登记、上传、指过去。** `Reserve` 先在库里落一行「我要写这个键」并提交，然后字节被放到那个键下，最后 `Commit` 把路径指向它并在同一个事务里记账。对象一经写入不再修改，所以并发的读者要么读到树当时指向的那个对象的全部，要么读到树已经指向别处——不存在读到一半被换掉的文件。这正是契约里那条原子性要求，而对单个 blob 的任何一串写入都给不了它。
+**写入的顺序是登记、上传、指过去。** `Reserve` 先在库里落一行「我要写这个键」并提交，然后字节被放到那个键下，最后 `Commit` 把路径指向它并在同一个事务里记账。`Put` error 把 reservation 变成不可清扫的 unresolved；`Put` 成功而 `Commit` 失败才 `Abandon` 成 garbage。调用方已经取消的 request 不会取消这些 storage-owned cleanup，清理本身失败则与原失败一起返回。对象一经写入不再修改，所以并发的读者要么读到树当时指向的那个对象的全部，要么读到树已经指向别处——不存在读到一半被换掉的文件。这正是契约里那条原子性要求，而对单个 blob 的任何一串写入都给不了它。
 
 **树按 `(parent, name)` 存，不按完整路径存。** 改名一个目录改一行，而不是把子树里每一行的前缀都 UPDATE 一遍。附带的好处是行号天然就是[存储操作词汇](../../proposed/architecture/2026-08-19-storage-operation-vocabulary.md)要的那种「跨改名稳定、删除后不复用」的节点身份，将来要用时不必推翻重来。
 
@@ -31,7 +33,7 @@ Status: implemented
 
 **时间是两列整数**（秒与纳秒），不是一个纳秒整数。契约测试要求 `1902-01-01` 与 `2400-06-01T12:00:00.5Z` 都完整往返，而 int64 纳秒只覆盖 1678 到 2262。
 
-**配额在提交的同一个事务里校验，`Space` 报的是精确数。** 这份实现不被 `limited` 包起来——见下。
+**配额在提交的同一个事务里校验，`Space` 的逻辑总量与已用量是精确数。** 这份实现不被 `limited` 包起来——见下。`Objects` 能实测底层容量时，可写量还会收紧为配额余量与物理余量的较小值；测量失败按对象存储失败暴露，只有稳定的 `ENOSYS` 表示该实现没有这项能力。
 
 ## 为什么先登记再上传
 
@@ -39,7 +41,7 @@ Status: implemented
 
 调查过的系统分成两类做法（每一条的出处见[对象存储后端](../../../../docs/research/object-store-backends.md)）。一类先传后提交、中间什么都不记，于是只能靠时间去猜：JuiceFS 一小时，SeaweedFS 五小时，Iceberg 三天，Delta Lake 七天——每一家的文档都带着一句「间隔太短会损坏数据」的警告，因为这个间隔实际上是在赌一次写入能有多慢。另一类不猜：s3ql 在上传**之前**就把一行意图写进元数据库，于是每个对象从诞生那一刻起就有一条已提交的记录说明它是谁的；它的清扫器因此完全不需要宽限期。Ceph RGW 从另一头解决——它从不扫描，回收项在解除引用的那个原子操作里入队。
 
-这份实现两头都取：上传前登记（对付「传完了还没提交就崩」），解引用时入队（对付覆盖与删除产生的旧对象）。合起来的结果是**清扫器永远不需要列举 container，也永远不需要一个赌出来的宽限期**。仍然保留一个宽限期，但它只作用于「登记了却迟迟不提交」的行，它约束的是一次写入自身的时长，而不是别人的写入有多快。
+这份实现两头都取：上传前登记使每个 key 在 publication 之前已有 durable record，权威解引用 transaction 则把覆盖与删除产生的旧对象明确标成 garbage。`Garbage` 只返回这类 deletion-authorized record；reserved 不因年龄变成 garbage，`Put` error 进入不可清扫的 unresolved，只有 `Put` 已成功而 `Commit` 失败时才由 `Abandon` 记录本次写入的归属证明。清扫器因此既不列举 container，也不靠宽限期猜测对象归属。完整的 nil/error 删除权限边界见[未证实对象发布进入 unresolved](./2026-09-04-unresolved-object-publication.md)。
 
 s3ql 那套之所以成立，前提是它强制单挂载独占——它的清扫器会直接删掉库里不认识的对象。这里不需要那个前提，因为所有写入者共用同一个 metastore，登记行对谁都可见。
 
@@ -101,6 +103,6 @@ SQLite 只有一个写者。这里选择接受它，理由是被否决的那个�
 - **依赖从 2 个模块变成 20 余个。** 这个仓库此前明确为了守住依赖体量否决过一整个 FUSE 库。
 - **服务端多了一个要运维的数据库**，且它与对象存储可以各自失败——R-ERR-6 是为此新加的。
 - **写不同文件在 SQLite 实现上会互相阻塞**，R-CC-2 只以上面那个口径成立。
-- **崩溃留下垃圾对象**。它们不可读、不计入用量、也不会变成错误的答案，但在被清扫之前一直占着存储。
-- **一个读者可能输给一个不停歇的写者**。读是两步——问树、取对象——而清扫在提交之后当场发生，于是读者手里的键可能已经被删掉。读者认得出这件事并重来，次数耗尽则报 `EAGAIN`；代价与去掉这条代价的办法见[在途的读者与清扫器](../../proposed/architecture/2026-08-21-readers-in-flight-and-the-sweeper.md)。
+- **崩溃留下垃圾对象**。它们不可读、不计入用量、也不会变成错误的答案，但在后台清扫到达之前一直占着存储；清扫的批次、周期与失败状态由拥有 namespace 的组合层管理。
+- **一个读者可能输给一个不停歇的写者**。读是两步——问树、取对象——而一次提交会把旧对象交给异步或定期清扫，于是读者手里的键可能在取回前被删掉。读者认得出这件事并重来，次数耗尽则报 `EAGAIN`；代价与去掉这条代价的办法见[在途的读者与清扫器](../../proposed/architecture/2026-08-21-readers-in-flight-and-the-sweeper.md)。
 - **一个字节的修改要重传整个文件**。这是整文件提交的固有代价，[存储操作词汇](../../proposed/architecture/2026-08-19-storage-operation-vocabulary.md)已经记下它，这份实现没有改变它。

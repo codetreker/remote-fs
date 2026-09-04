@@ -3,6 +3,7 @@ package sqlite_test
 import (
 	"errors"
 	"flag"
+	"math"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -164,6 +165,605 @@ func TestTheFirstMigrationDescribesTheVersionOneDatabasesThatExist(t *testing.T)
 	}
 }
 
+// Adding version 3 made version 2 part of the database history this build must continue to
+// describe exactly. The witness is independent of the migrations: replaying 0001 and 0002 is
+// compared with the layout a version 2 build actually wrote down, so an edit to either landed
+// file cannot make both sides move together.
+func TestTheSecondMigrationDescribesTheVersionTwoDatabasesThatExist(t *testing.T) {
+	stated := database(t)
+	db := raw(t, stated)
+	for _, name := range []string{"0001_tree.sql", "0002_replication.sql"} {
+		statements, err := os.ReadFile(filepath.Join("migrations", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(string(statements)); err != nil {
+			t.Fatalf("running %s: %v", name, err)
+		}
+	}
+	if _, err := db.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	witness := database(t)
+	writeVersionTwo(t, witness)
+
+	said, was := schemaOf(t, stated), schemaOf(t, witness)
+	if sqliteschema.Structure(said) != sqliteschema.Structure(was) {
+		t.Fatalf("0002_replication.sql no longer describes the version 2 databases that exist.\n"+
+			"what it states:\n%s\nwhat version 2 was:\n%s\n"+
+			"A landed migration is a claim about databases already written; changing the schema "+
+			"means adding a file.", said, was)
+	}
+}
+
+// writeVersionTwo builds the independent historical schema witness with the same referenced
+// file used by the version 1 fixture and the log row version 2 required for that namespace.
+func writeVersionTwo(t *testing.T, path string) {
+	t.Helper()
+	statements, err := os.ReadFile(filepath.Join("testdata", "version2.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := raw(t, path)
+	if _, err := db.Exec(string(statements)); err != nil {
+		db.Close()
+		t.Fatalf("building the version 2 witness: %v", err)
+	}
+	const (
+		directory = 1<<31 | 0o755
+		file      = 0o640
+	)
+	at := time.Date(2020, 1, 2, 3, 4, 5, 6, time.UTC).Unix()
+	for _, statement := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO namespaces (id, name, root, used) VALUES (1, 'workspace', 1, 700)`, nil},
+		{`INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		  VALUES (1, 1, ?, 0, ?, 0, ?, 0, NULL)`, []any{directory, at, at}},
+		{`INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		  VALUES (2, 1, ?, 0, ?, 0, ?, 0, NULL)`, []any{directory, at, at}},
+		{`INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
+		  VALUES ('carried', 1, 1, 700, NULL, ?, 0)`, []any{at}},
+		{`INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		  VALUES (3, 1, ?, 700, ?, 0, ?, 0, 'carried')`, []any{file, at, at}},
+		{`INSERT INTO entries (namespace, parent, name, node) VALUES (1, 1, ?, 2)`, []any{[]byte("d")}},
+		{`INSERT INTO entries (namespace, parent, name, node) VALUES (1, 2, ?, 3)`, []any{[]byte("f")}},
+		{`INSERT INTO logs (namespace, incarnation, committed_position, trimmed_through, trimmed_by_age)
+		  VALUES (1, 'version-two-incarnation', 0, 0, 0)`, nil},
+	} {
+		if _, err := db.Exec(statement.sql, statement.args...); err != nil {
+			db.Close()
+			t.Fatalf("filling the version 2 database: %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Versions 1 and 2 stored zero as a reservation's size and had no state for a Put whose
+// ownership outcome was unknown. Neither a reserved nor a garbage row can therefore authorize
+// deletion after an upgrade, even when its stored size happens to be non-zero.
+func TestLegacyNonReferencedObjectsAreRefusedWithoutMigrating(t *testing.T) {
+	versions := []struct {
+		name    string
+		version int
+		write   func(*testing.T, string)
+	}{
+		{"version 1", 1, writeVersionOne},
+		{"version 2", 2, writeVersionTwo},
+	}
+	states := []struct {
+		name  string
+		state int
+	}{
+		{"reserved", 0},
+		{"garbage", 2},
+	}
+
+	for _, version := range versions {
+		for _, state := range states {
+			t.Run(version.name+" "+state.name, func(t *testing.T) {
+				path := database(t)
+				version.write(t, path)
+				db := raw(t, path)
+				if _, err := db.Exec(`
+					INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
+					VALUES ('ambiguous', 1, ?, 0, NULL, 0, 0)`, state.state); err != nil {
+					db.Close()
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				before := schemaOf(t, path)
+
+				assertLegacyMigrationRefused(t, path, version.version, before)
+
+				db = raw(t, path)
+				var gotState, gotSize int
+				if err := db.QueryRow(`SELECT state, size FROM objects WHERE key = 'ambiguous'`).Scan(
+					&gotState, &gotSize,
+				); err != nil {
+					db.Close()
+					t.Fatal(err)
+				}
+				if gotState != state.state || gotSize != 0 {
+					db.Close()
+					t.Fatalf("the refused migration rewrote the ambiguous object to state %d at size %d", gotState, gotSize)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
+// Referenced rows are the only legacy state that carries enough ownership information to
+// preserve. Migration still requires the node and object halves to agree before changing the
+// database schema.
+func TestLegacyReferencedObjectsMustBeConsistentBeforeMigrating(t *testing.T) {
+	versions := []struct {
+		name    string
+		version int
+		write   func(*testing.T, string)
+	}{
+		{"version 1", 1, writeVersionOne},
+		{"version 2", 2, writeVersionTwo},
+	}
+	damage := []struct {
+		name      string
+		statement string
+	}{
+		{"missing object", `DELETE FROM objects WHERE key = 'carried'`},
+		{"invalid node mode", `UPDATE nodes SET mode = 'regular' WHERE content = 'carried'`},
+		{"size mismatch", `UPDATE nodes SET size = 701 WHERE content = 'carried'`},
+		{"unreferenced object", `UPDATE nodes SET content = NULL, size = 0 WHERE content = 'carried'`},
+	}
+
+	for _, version := range versions {
+		for _, corruption := range damage {
+			t.Run(version.name+" "+corruption.name, func(t *testing.T) {
+				path := database(t)
+				version.write(t, path)
+				db := raw(t, path)
+				if _, err := db.Exec(corruption.statement); err != nil {
+					db.Close()
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				before := schemaOf(t, path)
+				assertLegacyMigrationRefused(t, path, version.version, before)
+			})
+		}
+	}
+}
+
+func TestLegacyNodeEntryRelationshipsMustBeConsistentBeforeMigrating(t *testing.T) {
+	versions := []struct {
+		name    string
+		version int
+		write   func(*testing.T, string)
+	}{
+		{"version 1", 1, writeVersionOne},
+		{"version 2", 2, writeVersionTwo},
+	}
+	relations := []struct {
+		name string
+		v1   string
+		v2   string
+	}{
+		{
+			name: "duplicate node entry",
+			v1:   `INSERT INTO entries (parent, name, node) VALUES (1, CAST('alias' AS BLOB), 3)`,
+			v2:   `INSERT INTO entries (namespace, parent, name, node) VALUES (1, 1, CAST('alias' AS BLOB), 3)`,
+		},
+		{
+			name: "orphan node",
+			v1:   `DELETE FROM entries WHERE node = 3`,
+			v2:   `DELETE FROM entries WHERE node = 3`,
+		},
+		{
+			name: "root entry",
+			v1:   `INSERT INTO entries (parent, name, node) VALUES (1, CAST('root-alias' AS BLOB), 1)`,
+			v2:   `INSERT INTO entries (namespace, parent, name, node) VALUES (1, 1, CAST('root-alias' AS BLOB), 1)`,
+		},
+		{
+			name: "missing child endpoint",
+			v1:   `UPDATE entries SET node = 999 WHERE node = 3`,
+			v2:   `UPDATE entries SET node = 999 WHERE node = 3`,
+		},
+		{
+			name: "missing parent endpoint",
+			v1:   `UPDATE entries SET parent = 999 WHERE node = 3`,
+			v2:   `UPDATE entries SET parent = 999 WHERE node = 3`,
+		},
+	}
+
+	for _, version := range versions {
+		for _, relation := range relations {
+			t.Run(version.name+" "+relation.name, func(t *testing.T) {
+				path := database(t)
+				version.write(t, path)
+				statement := relation.v1
+				if version.version == 2 {
+					statement = relation.v2
+				}
+				db := raw(t, path)
+				if _, err := db.Exec(statement); err != nil {
+					db.Close()
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				before := schemaOf(t, path)
+				assertLegacyMigrationRefused(t, path, version.version, before)
+			})
+		}
+	}
+}
+
+func TestLegacyEntryNamesMustRemainAddressableBytes(t *testing.T) {
+	versions := []struct {
+		name    string
+		version int
+		write   func(*testing.T, string)
+	}{
+		{"version 1", 1, writeVersionOne},
+		{"version 2", 2, writeVersionTwo},
+	}
+	corruptions := []struct {
+		name  string
+		value string
+	}{
+		{"text storage", `'text-name'`},
+		{"empty component", `X''`},
+		{"dot component", `X'2e'`},
+		{"slash component", `CAST('bad/name' AS BLOB)`},
+		{"nul component", `X'626164006e616d65'`},
+	}
+	for _, version := range versions {
+		for _, corruption := range corruptions {
+			t.Run(version.name+" "+corruption.name, func(t *testing.T) {
+				path := database(t)
+				version.write(t, path)
+				db := raw(t, path)
+				if _, err := db.Exec(`UPDATE entries SET name = ` + corruption.value + ` WHERE node = 3`); err != nil {
+					db.Close()
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				before := schemaOf(t, path)
+				assertLegacyMigrationRefused(t, path, version.version, before)
+			})
+		}
+	}
+}
+
+func TestVersionTwoLogIntegrityMustHoldBeforeMigration(t *testing.T) {
+	tests := []struct {
+		name   string
+		damage string
+	}{
+		{"missing log", `DELETE FROM logs WHERE namespace = 1`},
+		{"empty incarnation", `UPDATE logs SET incarnation = '' WHERE namespace = 1`},
+		{"missing committed tail", `UPDATE logs SET committed_position = 1 WHERE namespace = 1`},
+		{"text change name", `
+			INSERT INTO changes (
+				position, namespace, kind, parent, name, node, mode, size,
+				atime_sec, atime_nsec, mtime_sec, mtime_nsec, content, recorded_sec, recorded_nsec
+			)
+			SELECT 1, 1, 0, 2, 'text-name', id, mode, size,
+				atime_sec, atime_nsec, mtime_sec, mtime_nsec, content, 0, 0
+			FROM nodes WHERE id = 3;
+			UPDATE logs SET committed_position = 1 WHERE namespace = 1`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := database(t)
+			writeVersionTwo(t, path)
+			db := raw(t, path)
+			if _, err := db.Exec(test.damage); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before := schemaOf(t, path)
+			assertLegacyMigrationRefused(t, path, 2, before)
+		})
+	}
+}
+
+func addLegacyDisconnectedDirectories(t *testing.T, path string, version int, cycle bool) {
+	t.Helper()
+	db := raw(t, path)
+	tx, err := db.Begin()
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	insertNode := func() int64 {
+		result, err := tx.Exec(`
+			INSERT INTO nodes (namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+			SELECT ns.id, root.mode, 0, 0, 0, 0, 0, NULL
+			FROM namespaces ns JOIN nodes root ON root.id = ns.root
+			WHERE ns.id = 1`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	first, second := insertNode(), insertNode()
+	insertEntry := func(parent int64, name string, node int64) {
+		statement := `INSERT INTO entries (parent, name, node) VALUES (?, CAST(? AS BLOB), ?)`
+		args := []any{parent, name, node}
+		if version == 2 {
+			statement = `INSERT INTO entries (namespace, parent, name, node) VALUES (1, ?, CAST(? AS BLOB), ?)`
+		}
+		if _, err := tx.Exec(statement, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertEntry(first, "child", second)
+	if cycle {
+		insertEntry(second, "parent", first)
+	}
+	if err := tx.Commit(); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLegacyNodesMustBeReachableFromTheirNamespaceRoot(t *testing.T) {
+	versions := []struct {
+		name    string
+		version int
+		write   func(*testing.T, string)
+	}{
+		{"version 1", 1, writeVersionOne},
+		{"version 2", 2, writeVersionTwo},
+	}
+	shapes := []struct {
+		name  string
+		cycle bool
+	}{
+		{"disconnected cycle", true},
+		{"disconnected subtree", false},
+	}
+	for _, version := range versions {
+		for _, shape := range shapes {
+			t.Run(version.name+" "+shape.name, func(t *testing.T) {
+				path := database(t)
+				version.write(t, path)
+				addLegacyDisconnectedDirectories(t, path, version.version, shape.cycle)
+				before := schemaOf(t, path)
+				assertLegacyMigrationRefused(t, path, version.version, before)
+			})
+		}
+	}
+}
+
+func makeLegacyFileSizesOverflow(t *testing.T, path string, version int) {
+	t.Helper()
+	db := raw(t, path)
+	tx, err := db.Begin()
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`UPDATE objects SET size = ? WHERE key = 'carried'`, []any{int64(math.MaxInt64)}},
+		{`UPDATE nodes SET size = ? WHERE content = 'carried'`, []any{int64(math.MaxInt64)}},
+		{`INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
+		  VALUES ('overflow-byte', 1, 1, 1, NULL, 0, 0)`, nil},
+		{`UPDATE namespaces SET used = ? WHERE id = 1`, []any{int64(math.MaxInt64)}},
+	} {
+		if _, err := tx.Exec(statement.query, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := tx.Exec(`
+		INSERT INTO nodes (namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		SELECT namespace, mode, 1, 0, 0, 0, 0, 'overflow-byte' FROM nodes WHERE id = 3`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statement := `INSERT INTO entries (parent, name, node) VALUES (1, CAST('overflow' AS BLOB), ?)`
+	if version == 2 {
+		statement = `INSERT INTO entries (namespace, parent, name, node) VALUES (1, 1, CAST('overflow' AS BLOB), ?)`
+	}
+	if _, err := tx.Exec(statement, node); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLegacyUsedAccountingMustBeExactBeforeMigrating(t *testing.T) {
+	versions := []struct {
+		name    string
+		version int
+		write   func(*testing.T, string)
+	}{
+		{"version 1", 1, writeVersionOne},
+		{"version 2", 2, writeVersionTwo},
+	}
+	damage := []struct {
+		name      string
+		statement string
+		overflow  bool
+	}{
+		{name: "undercount", statement: `UPDATE namespaces SET used = 699 WHERE id = 1`},
+		{name: "overcount", statement: `UPDATE namespaces SET used = 701 WHERE id = 1`},
+		{name: "non-integer", statement: `UPDATE namespaces SET used = 'seven hundred' WHERE id = 1`},
+		{name: "overflow", overflow: true},
+	}
+	for _, version := range versions {
+		for _, corruption := range damage {
+			t.Run(version.name+" "+corruption.name, func(t *testing.T) {
+				path := database(t)
+				version.write(t, path)
+				if corruption.overflow {
+					makeLegacyFileSizesOverflow(t, path, version.version)
+				} else {
+					db := raw(t, path)
+					if _, err := db.Exec(corruption.statement); err != nil {
+						db.Close()
+						t.Fatal(err)
+					}
+					if err := db.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				before := schemaOf(t, path)
+				assertLegacyMigrationRefused(t, path, version.version, before)
+			})
+		}
+	}
+}
+
+func TestLegacyMigrationValidatesEveryNamespaceUsedCounter(t *testing.T) {
+	versions := []struct {
+		name    string
+		version int
+		write   func(*testing.T, string)
+	}{
+		{"version 1", 1, writeVersionOne},
+		{"version 2", 2, writeVersionTwo},
+	}
+	for _, version := range versions {
+		t.Run(version.name, func(t *testing.T) {
+			path := database(t)
+			version.write(t, path)
+			db := raw(t, path)
+			tx, err := db.Begin()
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			result, err := tx.Exec(`INSERT INTO namespaces (name, root, used) VALUES ('neighbour', 0, 1)`)
+			if err != nil {
+				tx.Rollback()
+				db.Close()
+				t.Fatal(err)
+			}
+			namespace, err := result.LastInsertId()
+			if err != nil {
+				tx.Rollback()
+				db.Close()
+				t.Fatal(err)
+			}
+			result, err = tx.Exec(`
+				INSERT INTO nodes (namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+				SELECT ?, mode, 0, 0, 0, 0, 0, NULL FROM nodes WHERE id = 1`, namespace)
+			if err != nil {
+				tx.Rollback()
+				db.Close()
+				t.Fatal(err)
+			}
+			root, err := result.LastInsertId()
+			if err != nil {
+				tx.Rollback()
+				db.Close()
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(`UPDATE namespaces SET root = ? WHERE id = ?`, root, namespace); err != nil {
+				tx.Rollback()
+				db.Close()
+				t.Fatal(err)
+			}
+			if version.version == 2 {
+				if _, err := tx.Exec(`
+					INSERT INTO logs (namespace, incarnation, committed_position, trimmed_through, trimmed_by_age)
+					VALUES (?, 'neighbour-incarnation', 0, 0, 0)`, namespace); err != nil {
+					tx.Rollback()
+					db.Close()
+					t.Fatal(err)
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before := schemaOf(t, path)
+			assertLegacyMigrationRefused(t, path, version.version, before)
+		})
+	}
+}
+
+func assertLegacyMigrationRefused(t *testing.T, path string, version int, before string) {
+	t.Helper()
+	store, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
+	if err == nil {
+		store.Close()
+		t.Fatalf("opening inconsistent schema version %d succeeded, want EIO", version)
+	}
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("opening inconsistent schema version %d: %v, want EIO", version, err)
+	}
+	if after := schemaOf(t, path); after != before {
+		t.Fatalf("refusing schema version %d changed its schema\nbefore:\n%s\nafter:\n%s", version, before, after)
+	}
+	db := raw(t, path)
+	defer db.Close()
+	var recorded int
+	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&recorded); err != nil {
+		t.Fatal(err)
+	}
+	if recorded != version {
+		t.Fatalf("refusing schema version %d recorded version %d", version, recorded)
+	}
+}
+
+func TestAReferencedOnlyVersionTwoDatabaseIsCarriedForward(t *testing.T) {
+	path := database(t)
+	writeVersionTwo(t, path)
+	store := open(t, path, "workspace", 4096)
+	node, err := store.Stat(t.Context(), "d/f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.Content != "carried" || node.Size != 700 {
+		t.Fatalf("the migrated version 2 file is %+v, want 700 bytes under object carried", node)
+	}
+}
+
 // A database written by a version we do not understand is refused rather than adapted. Every
 // statement in this package addresses columns by the meaning its own version gives them, so
 // running them against another layout would not fail loudly — it would update the wrong
@@ -175,7 +775,7 @@ func TestTheFirstMigrationDescribesTheVersionOneDatabasesThatExist(t *testing.T)
 // Version 0 recorded in the row is here too, because a store that read it as "no schema yet"
 // would build a fresh layout over a populated database.
 func TestADatabaseFromAnotherSchemaVersionIsRefused(t *testing.T) {
-	for _, version := range []int{0, 3, 999} {
+	for _, version := range []int{0, 4, 999} {
 		path := database(t)
 		store, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
 		if err != nil {
@@ -280,14 +880,14 @@ func TestAVersionOneDatabaseIsCarriedForwardIntact(t *testing.T) {
 	// The log is there, and it is empty. That is the truthful state: nothing recorded the
 	// history this database accumulated before it had a log, so no replica may resume against
 	// it — which is exactly what an incarnation nothing has ever seen says.
-	changes, retention, err := store.Since(t.Context(), 0, 100)
+	changes, retention, err := readChanges(t.Context(), store, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(changes) != 0 || retention.Tail != 0 || retention.Oldest != 0 {
 		t.Fatalf("the migrated log holds %d changes and %+v, want an empty log", len(changes), retention)
 	}
-	incarnation, err := store.Incarnation(t.Context())
+	incarnation, err := store.Incarnation(t.Context(), 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,7 +899,7 @@ func TestAVersionOneDatabaseIsCarriedForwardIntact(t *testing.T) {
 	if err := store.Create(t.Context(), "d/after"); err != nil {
 		t.Fatal(err)
 	}
-	changes, _, err = store.Since(t.Context(), 0, 100)
+	changes, _, err = readChanges(t.Context(), store, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,9 +911,8 @@ func TestAVersionOneDatabaseIsCarriedForwardIntact(t *testing.T) {
 			changes[0].Kind, changes[0].Parent, dir.ID)
 	}
 
-	// Reopening does not migrate again, and does not decide the log lost anything: the
-	// reconciliation at startup must read an empty log at committed position 0 as consistent.
-	settled, err := store.Incarnation(t.Context())
+	// Reopening does not migrate again; an empty log at committed position 0 remains consistent.
+	settled, err := store.Incarnation(t.Context(), 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,7 +920,7 @@ func TestAVersionOneDatabaseIsCarriedForwardIntact(t *testing.T) {
 		t.Fatal(err)
 	}
 	again := open(t, path, "workspace", 4096)
-	stable, err := again.Incarnation(t.Context())
+	stable, err := again.Incarnation(t.Context(), 1024)
 	if err != nil {
 		t.Fatal(err)
 	}

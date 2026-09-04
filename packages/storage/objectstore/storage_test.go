@@ -149,6 +149,12 @@ func TestContract(t *testing.T) {
 	storagetest.Run(t, newStorage)
 }
 
+func TestBoundedContract(t *testing.T) {
+	storagetest.RunBounded(t, func(t *testing.T) storage.BoundedStorage {
+		return newParts(t, 0).Storage
+	})
+}
+
 // TestSpaceRefusesWithoutAnAllowance holds the one thing the contract suite checks only for
 // consistency: a namespace in a blob container has no capacity of its own to report, so
 // without an allowance it has no figures at all rather than invented ones.
@@ -235,9 +241,7 @@ func TestSweepClearsABacklog(t *testing.T) {
 	keys := make([]metastore.Key, 0, files)
 	for i := range files {
 		name := fmt.Sprintf("f%d", i)
-		if err := p.Write(ctx, name, []byte(name)); err != nil {
-			t.Fatalf("write: %v", err)
-		}
+		putDirect(t, p.meta, p.objects, name, []byte(name))
 		keys = append(keys, contentOf(t, p, name))
 	}
 	// Every file is written before any is removed. Interleaving the two would let each

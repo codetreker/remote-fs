@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 )
@@ -35,6 +36,50 @@ type Node struct {
 	// store that allocated it, so this side may not assume it is text, and a key that came
 	// back altered names bytes that are not there.
 	Content []byte `json:"content"`
+}
+
+// UnmarshalJSON refuses node values a replica could persist as plausible metadata.
+func (n *Node) UnmarshalJSON(data []byte) error {
+	type node Node
+	var decoded node
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	got := Node(decoded)
+	if err := got.check(); err != nil {
+		return err
+	}
+	*n = got
+	return nil
+}
+
+func (n Node) check() error {
+	if n.ID <= 0 {
+		return fmt.Errorf("the node carries invalid identity %d", n.ID)
+	}
+	if n.Size < 0 {
+		return fmt.Errorf("node %d carries negative size %d", n.ID, n.Size)
+	}
+	if err := checkWireTime("access", n.AccessTime); err != nil {
+		return fmt.Errorf("node %d: %w", n.ID, err)
+	}
+	if err := checkWireTime("modification", n.ModTime); err != nil {
+		return fmt.Errorf("node %d: %w", n.ID, err)
+	}
+	mode := fs.FileMode(n.Mode)
+	switch mode.Type() {
+	case 0, fs.ModeDir, fs.ModeSymlink:
+	default:
+		return fmt.Errorf("node %d carries unsupported type bits %v", n.ID, mode.Type())
+	}
+	return nil
+}
+
+func checkWireTime(name string, instant Time) error {
+	if instant.Nanos < 0 || instant.Nanos >= int32(time.Second) {
+		return fmt.Errorf("the %s time carries nanoseconds %d outside [0, 1000000000)", name, instant.Nanos)
+	}
+	return nil
 }
 
 // NodeOf renders n for the wire.
@@ -113,6 +158,17 @@ type Change struct {
 // ChangeOf renders c for the wire. A kind outside the vocabulary is refused rather than
 // carried, because the receiving side would have to guess what happened to the name.
 func ChangeOf(c metastore.Change) (*Change, error) {
+	wire, err := changeShapeOf(c)
+	if err != nil {
+		return nil, err
+	}
+	if err := wire.check(); err != nil {
+		return nil, fmt.Errorf("the change at position %d cannot be sent: %w", c.Position, err)
+	}
+	return wire, nil
+}
+
+func changeShapeOf(c metastore.Change) (*Change, error) {
 	name, known := kindNames[c.Kind]
 	if !known {
 		return nil, fmt.Errorf("the change at position %d is of kind %d, which this protocol cannot name", c.Position, c.Kind)
@@ -123,9 +179,6 @@ func ChangeOf(c metastore.Change) (*Change, error) {
 	}
 	if c.Node != nil {
 		wire.Node = NodeOf(*c.Node)
-	}
-	if err := wire.check(); err != nil {
-		return nil, fmt.Errorf("the change at position %d cannot be sent: %w", c.Position, err)
 	}
 	return wire, nil
 }
@@ -154,6 +207,12 @@ func (c *Change) UnmarshalJSON(data []byte) error {
 }
 
 func (c Change) check() error {
+	if c.Position <= 0 {
+		return fmt.Errorf("the change carries invalid position %d", c.Position)
+	}
+	if c.Parent < 0 {
+		return fmt.Errorf("the change carries negative parent %d", c.Parent)
+	}
 	kind, known := kindsByName[c.Kind]
 	if !known {
 		return fmt.Errorf("the change carries kind %q, which this protocol does not know", c.Kind)
@@ -169,6 +228,14 @@ func (c Change) check() error {
 			return fmt.Errorf("the rename at position %d did not say where the node came from", c.Position)
 		}
 		return fmt.Errorf("the %s change at position %d says where a node came from, and only a rename does", c.Kind, c.Position)
+	}
+	if c.From != nil && c.From.Parent < 0 {
+		return fmt.Errorf("the rename source carries negative parent %d", c.From.Parent)
+	}
+	if c.Node != nil {
+		if err := c.Node.check(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -215,6 +282,12 @@ func (r *Row) UnmarshalJSON(data []byte) error {
 	}
 	if decoded.Node == nil {
 		return fmt.Errorf("the snapshot row for %q under %d carried no node", decoded.Name, decoded.Parent)
+	}
+	if err := decoded.Node.check(); err != nil {
+		return err
+	}
+	if decoded.Parent < 0 {
+		return fmt.Errorf("the snapshot row carries negative parent %d", decoded.Parent)
 	}
 	*r = Row(decoded)
 	return nil
@@ -336,6 +409,9 @@ func (s *StreamStart) UnmarshalJSON(data []byte) error {
 	if got.Tail == nil {
 		return errors.New("the stream does not say how far the log had reached, so nothing could tell when it has been caught up with")
 	}
+	if *got.Position < 0 || *got.Tail < 0 {
+		return fmt.Errorf("the stream carries negative position %d or tail %d", *got.Position, *got.Tail)
+	}
 	// A tail behind the position the stream begins at describes a log that has not reached
 	// what it is about to deliver, which is nothing a replica can act on.
 	if *got.Tail < *got.Position {
@@ -367,6 +443,9 @@ func (o *SnapshotOpen) UnmarshalJSON(data []byte) error {
 	if decoded.Position == nil {
 		return errors.New("the snapshot does not say what position it was taken at")
 	}
+	if *decoded.Position < 0 {
+		return fmt.Errorf("the snapshot carries negative position %d", *decoded.Position)
+	}
 	*o = SnapshotOpen(decoded)
 	return nil
 }
@@ -376,16 +455,16 @@ type SnapshotPage struct {
 	Rows []Row `json:"rows"`
 }
 
-// UnmarshalJSON decodes a page and refuses one carrying no rows at all. JSON null and an
-// empty list are two characters apart, and a page that lost its rows would otherwise
-// remove from the replica every node it was carrying.
+// UnmarshalJSON decodes a page and refuses one carrying no rows. Such a page makes no
+// snapshot progress, and an endless sequence could keep the stream's silence timer alive
+// while preventing the replica from ever completing its seed.
 func (p *SnapshotPage) UnmarshalJSON(data []byte) error {
 	type page SnapshotPage
 	var decoded page
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return err
 	}
-	if decoded.Rows == nil {
+	if len(decoded.Rows) == 0 {
 		return errors.New("the snapshot page carried no rows")
 	}
 	*p = SnapshotPage(decoded)

@@ -8,7 +8,7 @@
 
 | 组件 | 职责 | 需求 |
 |---|---|---|
-| **remote storage** `packages/transport/httprest` | storage 接口的远端实现：每次调用一次 HTTP 请求，两次调用之间不留任何状态。旁边是复制那一半 —— 订阅变更流、取一次一致性快照 —— 与请求／响应天然分在两条连接上。超时策略随调用方给的 `http.Client` 而定。自身不缓存。 | R-INT-5、R-INT-9 |
+| **remote storage** `packages/transport/httprest` | storage 接口的远端实现：每次调用一次 HTTP 请求，两次调用之间不留任何状态。旁边是复制那一半 —— 订阅变更流、取一次一致性快照 —— 与请求／响应天然分在两条连接上。超时策略随调用方给的 `http.Client` 而定；`DialOptions` 限制 stream silence、non-streaming body 与 response admission。自身不缓存。 | R-INT-3、R-INT-5、R-INT-9 |
 | **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：`Stat` 与 `List` 走本地那份元数据副本，其余走远端。副本是一份 SQLite（`packages/metastore/sqlite` 的 `Replica`），由变更流喂着。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
 | **挂载呈现层** `packages/fuse` | 把一份 storage 呈现为本地目录。本地只持有正在被打开的文件的内容，以及命名空间最后一次报出的剩余空间。仅 Linux。 | R-FS-1、R-CON-1~3、R-ERR-1、R-ERR-2、R-WS-5、R-INT-3、R-INT-8 |
 | **生命周期** | 挂载的建立与拆除。 | R-WS-2 |
@@ -39,6 +39,12 @@
 
 挂载呈现层只认 storage 接口，因此把一份本地 storage 交给它即可得到一个不经网络的挂载点；它同样不知道底下那份 storage 有没有副本。不记变更日志的命名空间（`localdir` 后端）没有副本可建，挂载时以 `ENOSYS` 说明这一点，此后每一次调用都是一次请求。
 
+remote storage 的 `DialOptions.MaxBodyBytes` 缺省为 1 GiB，限制 non-write 请求与 non-streaming response；`MaxWriteBytes` 在默认 options 中保持零值，拨号时继承 settled `MaxBodyBytes`，显式值必须为正且不大于它。`Write` 在发请求之前按 `MaxWriteBytes` 以 `EFBIG` 拒绝。读取 response 时先检查 `Content-Length`，再用 limit reader 检查实际字节数，因此错误或缺失的长度也不能绕过 `MaxBodyBytes`。过大的 `Read` 以 `EFBIG` 返回；过大的 listing、attribute、space 或 error message 是无法解码的协议答案，以 `EIO` 返回。无法安全计算四倍 response reservation 的 `MaxBodyBytes`，包括 `MaxInt64`，在拨号前被拒绝。
+
+SSE 不把整个 stream 保存在内存里，但每一帧仍有独立的 `DialOptions.MaxFrameBytes`，默认 8 MiB。scanner 在读取下一帧时按这个值限制自己的 buffer；server 与 client 可以选择不同的值，实际可用上限由较小者决定，超出 client 上限的帧使 stream 失败。`remote-fs -http-max-frame-bytes SIZE` 把这个 client 上限交给部署方，使提高了 server frame 上限的命名空间仍能被挂载；它与 server 的同名 flag 接受相同的 1024 进制 suffix，显式非正值在连接前被拒绝。一个 stream reader 同时只保留一帧；`httprest.Storage` 不拥有调用方建立的 stream 数量，所以调用方仍须约束自己同时打开的 subscription 与 snapshot。
+
+每个非流式调用都要先取得 client 自己的 response admission。默认同时保留 64 份响应、允许 64 个等待者，aggregate 上限为 8 GiB；每份都按 `4 * MaxBodyBytes` 预留，覆盖 raw body、decoded listing 与转换过程的同时保留。Subscribe、Resubscribe 与 Snapshot 在发出 HTTP 前也取得同一名额，用来约束 stream 尚未成功建立时可能返回的普通 error body；确认 `200 text/event-stream` 后立即释放，后续 frame 由 `MaxFrameBytes` 约束。等待者已满时，`Stat`、`Write`、`Create` 或 stream setup 都会在发出 HTTP 请求前以 `EAGAIN` 失败；context cancellation 会移除等待计数。non-stream admission 一直持有到 response 解码、mutation response/barrier 验证完成。`ReadBounded` 取 client 与调用方 byte bound 中较小者；`ListBounded` 把解码后的 entry 逐项交给调用方的 `ListResult`。普通 `Read` 与 `List` 仍返回完整 materialized value，但整个 HTTP body 及其同时表示都在上述单体与 aggregate 边界内。server 侧的 backend 预算与 response admission 见 [`../server/architecture.md`](../server/architecture.md#六请求与响应的内存边界)。
+
 **FUSE 到这一层为止。** client 侧只有挂载呈现层说 FUSE 协议，它向下只用 storage 接口 —— 一份按路径寻址的命名空间 API，不挂载的那条路径（R-INT-5）用的是同一份。内核要而命名空间没有的东西 —— 打开的文件的内容、挂载的生命周期，以及内核用来认一个节点的那个编号 —— 都建立并保存在这一层。节点身份本身不在此列：它由命名空间给（R-FS-5），这一层只是把它翻译成一个编号。
 
 ## 二、内核什么都不缓存，答案来自本地副本
@@ -54,7 +60,11 @@
 
 **「流一断」是被观测到的，不是被假定的。** 服务端在无话可说时按固定间隔发一行心跳，这一层给「一个字节都没来」设一个数倍于心跳的上限，超限与流上任何一次失败走同一条路。没有这条，一条被切断的 TCP 与一个安静的命名空间是同一个观测结果 —— 沉默 —— 而副本会一直答下去，且没有时间上界。上限压在**正在等的那次读**上而不是压在连接上，因为首次同步期间没有人读变更流；计时由**字节**重置而不是由帧重置，因为一个快照分页可以是一整行一兆字节。
 
-这份副本因此不是缓存。它的建立、它作废与恢复的规则、以及写入方为什么等自己的回显，见[元数据复制](../../../.agents/notes/implemented/architecture/2026-08-27-metadata-replication.md)。
+这份副本因此不是缓存。server 提供 change log 时，每个会产生日志的 mutation 在发出请求前先 admission 一条 fixed-size confirmation record，不保留 target path、direction 或 touched-name history。`ConfirmationGrace`、`MaxActiveConfirmations` 与 `MaxWaitingConfirmations` 默认分别为 10 秒、64 与 64；`remote-fs` 用 `-confirmation-grace`、`-max-active-mutation-confirmations` 与 `-max-waiting-mutation-confirmations` 暴露同一组设置。active 名额不足时有限等待，waiter 已满、等待被取消或 storage 开始关闭时，请求尚未发出并以可重试的 `EAGAIN` 拒绝。server 以 `ENOSYS` 表明没有 change log 时不建立副本，也不保留 confirmation state。
+
+mutation 成功后，replicated client 从严格验证过的 response 取得 `(incarnation, position)` barrier，把它与当前 replica incarnation/generation 对齐，再等待本地 position 达到或越过它。event 先于 HTTP response 到达时当前位置已经足够，立即完成；另一个 writer 的较早 change 不能误确认本次 mutation，因为 barrier 不早于本次 commit。stream rebuild 改变 generation、barrier incarnation 不匹配、stream failure、调用方取消、storage 关闭或 grace 到期都以 `EIO` 报告「namespace 已改变但本地副本无法确认」。失败只结束该调用，不把仍连续的 stream 单独判坏；迟到事件仍按 change-log 顺序应用。空 attribute change 与 rename onto itself 不产生日志，仍发送给 server 取得 pathname 的权威结果，但不预留或等待 barrier。
+
+副本的建立、作废与恢复规则，以及写入方等待 mutation barrier 的原因，见[元数据复制](../../../.agents/notes/implemented/architecture/2026-08-27-metadata-replication.md)。
 
 只有一个数字例外，它不描述命名空间里的任何一个节点：命名空间最后一次报出的剩余空间，见第七节。
 
@@ -80,6 +90,8 @@ storage 的读与写以整文件为单位，内核的读与写以 128 KiB 为单
 ### 单个文件的大小上限
 
 一个打开的文件整份驻留在内存里，因此单个文件的大小就是一次调用能让进程分配的内存量。`Options.MaxFileSize` 给它设上限，缺省为 `fuse.DefaultMaxFileSize`（1 GiB）。调用方可以调高，但没有「不设上限」这个取值；负值在 `New` 处被拒绝。
+
+通过 HTTP 挂载时，文件提交同时受 `Options.MaxFileSize`、client 与 server 各自的 `MaxWriteBytes` 以及 backend 可能具有的单对象上限约束；文件取回同时受 `MaxFileSize`、两端的 `MaxBodyBytes` 与 backend 的 bounded-read 实现约束。每个方向都取整条路径上更紧的值。只调高 FUSE 上限不会让 transport 或 backend 接受更大的文件，只调高 write 上限也不会让一个打开的描述符超过 `MaxFileSize`；调高 protocol body 上限不会隐式放宽写入。
 
 超过上限的请求一律以 EFBIG 拒绝，且**拒绝发生在分配之前**：
 

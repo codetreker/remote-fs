@@ -16,12 +16,14 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,8 +36,117 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/localdir"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/memory"
+	"github.com/codetreker/remote-fs/packages/storage/replicated"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
+
+func TestMutationConfirmationFlagsAreValidatedBeforeTheServerIsContacted(t *testing.T) {
+	tests := []struct {
+		flag  string
+		value string
+	}{
+		{"-confirmation-grace", "0s"},
+		{"-max-active-mutation-confirmations", "0"},
+		{"-max-active-mutation-confirmations", strconv.Itoa(math.MaxInt)},
+		{"-max-waiting-mutation-confirmations", "-1"},
+		{"-max-waiting-mutation-confirmations", strconv.Itoa(math.MaxInt)},
+	}
+	for _, test := range tests {
+		t.Run(test.flag, func(t *testing.T) {
+			err := run([]string{
+				"-server", "http://127.0.0.1:1",
+				"-mountpoint", t.TempDir(),
+				test.flag, test.value,
+			}, io.Discard)
+			if !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("run returned %v, want EINVAL", err)
+			}
+		})
+	}
+}
+
+func TestHTTPFrameLimitIsValidatedBeforeTheServerIsContacted(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  string
+	}{
+		{"0", "positive"},
+		{"-1", "whole-number"},
+		{"1KB", "decimal suffix"},
+		{"1", "DialOptions.MaxFrameBytes"},
+		{strconv.FormatInt(math.MaxInt64, 10), "DialOptions.MaxFrameBytes"},
+	} {
+		var output strings.Builder
+		err := run([]string{
+			"-server", "http://127.0.0.1:1",
+			"-mountpoint", t.TempDir(),
+			"-http-max-frame-bytes", test.value,
+		}, &output)
+		diagnostic := output.String()
+		if err != nil {
+			diagnostic += err.Error()
+		}
+		if err == nil || !strings.Contains(diagnostic, test.want) {
+			t.Fatalf("-http-max-frame-bytes %s returned %v and %q, want local validation containing %q", test.value, err, output.String(), test.want)
+		}
+	}
+}
+
+func TestMutationConfirmationLimitsAreInCommandHelp(t *testing.T) {
+	var said strings.Builder
+	if err := run([]string{"-h"}, &said); err != nil {
+		t.Fatalf("asking for help: %v", err)
+	}
+	for _, flag := range []string{
+		"-http-max-frame-bytes",
+		"-confirmation-grace",
+		"-max-active-mutation-confirmations",
+		"-max-waiting-mutation-confirmations",
+	} {
+		if !strings.Contains(said.String(), flag) {
+			t.Errorf("help does not describe %s", flag)
+		}
+	}
+}
+
+func TestHTTPFrameLimitIsForwardedToTheReplicationClient(t *testing.T) {
+	url, namespace := serveNamespace(t)
+	longName := strings.Repeat("x", 1500)
+	if err := namespace.Create(t.Context(), longName); err != nil {
+		t.Fatalf("creating a row larger than the minimum frame: %v", err)
+	}
+
+	small, err := dialNamespace(url, startup, 1024)
+	if err != nil {
+		t.Fatalf("dialling with the minimum frame bound: %v", err)
+	}
+	if _, release, err := replicate(t.Context(), small, t.TempDir(), io.Discard); err == nil {
+		release()
+		t.Fatal("a 1024-byte client accepted the larger replication frame")
+	}
+
+	large, err := dialNamespace(url, startup, 4096)
+	if err != nil {
+		t.Fatalf("dialling with a larger frame bound: %v", err)
+	}
+	_, release, err := replicate(t.Context(), large, t.TempDir(), io.Discard)
+	if err != nil {
+		t.Fatalf("the configured larger client frame bound was not forwarded: %v", err)
+	}
+	release()
+}
+
+func TestInvalidMutationConfirmationOptionsDoNotCreateTheReplicaDirectory(t *testing.T) {
+	where := t.TempDir()
+	options := replicated.DefaultOptions()
+	options.MaxActiveConfirmations = 0
+	if _, _, err := replicateWithOptions(t.Context(), nil, where, io.Discard, options); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("replicateWithOptions returned %v, want EINVAL", err)
+	}
+	if entries, err := os.ReadDir(where); err != nil || len(entries) != 0 {
+		t.Fatalf("invalid options left %d entries in the replica directory (%v)", len(entries), err)
+	}
+}
 
 func TestMain(m *testing.M) {
 	os.Exit(fusetest.Run("remote-fs-mount", m.Run))
@@ -66,9 +177,13 @@ func replicableNamespace(t *testing.T) (storage.Storage, *httprest.Handler) {
 	if err != nil {
 		t.Fatalf("opening the namespace's metastore: %v", err)
 	}
-	t.Cleanup(func() { meta.Close() })
 
 	namespace := objectstore.New(memory.New(), meta)
+	t.Cleanup(func() {
+		if err := namespace.Close(); err != nil {
+			t.Errorf("closing the namespace: %v", err)
+		}
+	})
 	handler, err := httprest.NewHandler(namespace, meta)
 	if err != nil {
 		t.Fatal(err)

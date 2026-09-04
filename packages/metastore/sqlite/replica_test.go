@@ -59,7 +59,7 @@ func fill(t *testing.T, from *sqlite.Store, into *sqlite.Replica, page int) {
 	defer seeding.Close()
 
 	for {
-		rows, done, err := snap.Next(t.Context(), page)
+		rows, done, err := readRows(t.Context(), snap, page)
 		if err != nil {
 			t.Fatalf("reading the picture: %v", err)
 		}
@@ -79,7 +79,7 @@ func fill(t *testing.T, from *sqlite.Store, into *sqlite.Replica, page int) {
 func replay(t *testing.T, from *sqlite.Store, into *sqlite.Replica) {
 	t.Helper()
 
-	changes, _, err := from.Since(t.Context(), into.Position(), 1000)
+	changes, _, err := readChanges(t.Context(), from, into.Position(), 1000)
 	if err != nil {
 		t.Fatalf("reading the log: %v", err)
 	}
@@ -336,15 +336,15 @@ func TestAChangeThatDoesNotFindWhatItDescribesIsRefused(t *testing.T) {
 	requireSame(t, from, into)
 }
 
-// TestAChangeAtAPositionTheCopyAlreadyHoldsIsDiscarded, which is what makes a replica's own
-// echo free: the change it caused arrives on the stream like any other.
+// TestAChangeAtAPositionTheCopyAlreadyHoldsIsDiscarded covers stream changes already included
+// in the snapshot that built the copy.
 func TestAChangeAtAPositionTheCopyAlreadyHoldsIsDiscarded(t *testing.T) {
 	from := source(t)
 	into := copyOf(t)
 	fill(t, from, into, 1024)
 
 	build(t, from)
-	changes, _, err := from.Since(t.Context(), 0, 1000)
+	changes, _, err := readChanges(t.Context(), from, 0, 1000)
 	if err != nil {
 		t.Fatalf("reading the log: %v", err)
 	}

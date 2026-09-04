@@ -26,6 +26,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -60,6 +61,7 @@ type Objects struct {
 }
 
 var _ objectstore.Objects = (*Objects)(nil)
+var _ objectstore.BoundedObjects = (*Objects)(nil)
 
 // NewWithSharedKey opens the objects under prefix in the container at containerURL, signing
 // with the account's shared key.
@@ -165,19 +167,44 @@ func (o *Objects) Put(ctx context.Context, key string, content []byte) ([]byte, 
 // client is expected to report a truncated response of its own accord; this makes the
 // guarantee hold whether or not it does.
 func (o *Objects) Get(ctx context.Context, key string) ([]byte, error) {
+	return o.GetBounded(ctx, key, MaxObjectBytes)
+}
+
+// GetBounded refuses the service's declared length before reading the response body. A
+// limit reader also contains a response whose framing understates its payload; that case
+// is EIO because the service contradicted its own object metadata.
+func (o *Objects) GetBounded(ctx context.Context, key string, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("get %q: the byte limit %d is not positive: %w", key, maxBytes, syscall.EINVAL)
+	}
 	response, err := o.container.NewBlobClient(o.name(key)).DownloadStream(ctx, nil)
 	if err != nil {
 		return nil, failure("get", key, err)
 	}
 	defer response.Body.Close()
 
-	content, err := io.ReadAll(response.Body)
-	if err != nil {
-		return nil, failure("get", key, err)
-	}
 	if response.ContentLength == nil {
 		return nil, fmt.Errorf("get %q: the service did not say how many bytes the object holds, "+
 			"so a truncated body cannot be told from a whole one: %w", key, syscall.EIO)
+	}
+	if *response.ContentLength > maxBytes {
+		return nil, fmt.Errorf("get %q: the object contains %d bytes, above the result limit of %d: %w",
+			key, *response.ContentLength, maxBytes, syscall.EFBIG)
+	}
+	content, err := io.ReadAll(io.LimitReader(response.Body, maxBytes))
+	if err != nil {
+		return nil, failure("get", key, err)
+	}
+	if int64(len(content)) == maxBytes {
+		var excess [1]byte
+		n, err := io.ReadFull(response.Body, excess[:])
+		if n != 0 {
+			return nil, fmt.Errorf("get %q: the service sent more than the %d bytes its bounded response permits: %w",
+				key, maxBytes, syscall.EIO)
+		}
+		if !errors.Is(err, io.EOF) {
+			return nil, failure("get", key, err)
+		}
 	}
 	if int64(len(content)) != *response.ContentLength {
 		return nil, fmt.Errorf("get %q: the service said the object holds %d bytes and sent %d: %w",
@@ -202,6 +229,20 @@ func (o *Objects) Delete(ctx context.Context, key string) error {
 	}
 	return nil
 }
+
+// Available first proves that the container still exists and accepts this client's
+// credentials, then refuses a physical-capacity figure. A blob container exposes no
+// measured writable byte count belonging to this prefix; returning ENOSYS after the probe
+// says exactly that without hiding an unreachable half of the namespace behind its quota.
+func (o *Objects) Available(ctx context.Context) (int64, error) {
+	if _, err := o.container.GetProperties(ctx, nil); err != nil {
+		return 0, failure("probe", "container", err)
+	}
+	return 0, fmt.Errorf("the blob container has no physical capacity to report: %w", syscall.ENOSYS)
+}
+
+// Close releases no resources. Azure clients are safe to discard without a shutdown call.
+func (o *Objects) Close() error { return nil }
 
 // name is the blob a key stands for. Keys are reserved by the metastore, so they arrive
 // already fit to be used and are not inspected here.

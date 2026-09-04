@@ -121,3 +121,32 @@ func TestTheAllowanceFlagRefusesWhatTheStorageWouldRefuse(t *testing.T) {
 		t.Fatalf("a flag that was never given reports %q", unset.String())
 	}
 }
+
+func TestAByteBoundMustBePositive(t *testing.T) {
+	bound := positiveSizeFlag{bytes: 8 << 20}
+	if err := bound.Set("0"); err == nil {
+		t.Fatal("a zero byte bound was accepted")
+	}
+	if bound.bytes != 8<<20 {
+		t.Fatalf("a refused byte bound replaced the previous value with %d", bound.bytes)
+	}
+	if err := bound.Set("2G"); err != nil {
+		t.Fatalf("2G was refused: %v", err)
+	}
+	if bound.bytes != 2<<30 {
+		t.Fatalf("2G reached the flag as %d bytes", bound.bytes)
+	}
+}
+
+func TestAnInheritedByteBoundHasNoIndependentDefault(t *testing.T) {
+	var inherited inheritedSizeFlag
+	if inherited.String() != "" {
+		t.Fatalf("an inherited bound reports an independent default of %q", inherited.String())
+	}
+	if err := inherited.Set("4M"); err != nil {
+		t.Fatal(err)
+	}
+	if inherited.bytes != 4<<20 || inherited.String() != "4194304" {
+		t.Fatalf("the explicit inherited bound is %d and reports %q", inherited.bytes, inherited.String())
+	}
+}

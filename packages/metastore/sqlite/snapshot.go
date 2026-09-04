@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io/fs"
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
@@ -12,11 +13,11 @@ import (
 // Snapshot opens a consistent picture of the whole tree and reports the position it is taken
 // at.
 //
-// The picture is a read transaction against the reader pool, and the first statement issued
-// in it is the one that reads the position. That order is what makes the position and the
-// rows one instant rather than two: SQLite takes its read snapshot when a deferred
-// transaction first reads, so a position sampled before the transaction had touched anything
-// could describe a moment the rows do not come from. Sampling it afterwards is the worse
+// The picture is a read transaction against the dedicated snapshot pool, and the first
+// statement issued in it is the one that reads the position. That order is what makes the
+// position and the rows one instant rather than two: SQLite takes its read snapshot when a
+// deferred transaction first reads, so a position sampled before the transaction had touched
+// anything could describe a moment the rows do not come from. Sampling it afterwards is the worse
 // mistake and the easier one to write — a picture stamped with a position newer than itself
 // makes a replica discard the very events that would have corrected the rows it scanned
 // early, and nothing afterwards ever corrects them.
@@ -27,15 +28,19 @@ import (
 // by the network — a caller closes it as soon as it is done with it, and the worst moment is
 // the one where every replica rebuilds at once.
 func (s *Store) Snapshot(ctx context.Context) (metastore.Snap, metastore.Position, error) {
-	tx, err := s.read.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := s.snapshotRead.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, 0, fmt.Errorf("opening a picture of the tree: %w", failure(err))
 	}
 	var committed int64
 	if err := tx.QueryRowContext(ctx,
 		`SELECT committed_position FROM logs WHERE namespace = ?`, s.namespace).Scan(&committed); err != nil {
-		tx.Rollback()
-		return nil, 0, fmt.Errorf("opening a picture of the tree: %w", failure(err))
+		primary := fmt.Errorf("opening a picture of the tree: %w", failure(err))
+		return nil, 0, finishReadTransaction("snapshot transaction", tx, primary)
+	}
+	if err := validateNamespaceIntegrity(ctx, tx, s.namespace, s.maxIntegrityRecords); err != nil {
+		primary := fmt.Errorf("validating the picture of the tree: %w", failure(err))
+		return nil, 0, finishReadTransaction("snapshot transaction", tx, primary)
 	}
 	// The cursor starts before every entry there is. The name is an empty blob rather than
 	// nothing at all, so that the comparison in page is over two values rather than over a NULL.
@@ -61,47 +66,93 @@ type snapshot struct {
 	parent int64
 	name   []byte
 
-	done bool
+	done   bool
+	failed error
 }
 
-func (p *snapshot) Next(ctx context.Context, limit int) ([]metastore.Row, bool, error) {
+func (p *snapshot) Next(ctx context.Context, limit int, result *metastore.RowResult) (done bool, returnErr error) {
+	if result == nil {
+		return false, fmt.Errorf("reading a snapshot needs a bounded result: %w", syscall.EINVAL)
+	}
+	if p.failed != nil {
+		return false, result.Fail(p.failed)
+	}
+	defer func() {
+		if returnErr != nil {
+			p.failed = returnErr
+		}
+	}()
 	if p.tx == nil {
-		return nil, false, fmt.Errorf("this picture of the tree has been closed: %w", syscall.EINVAL)
+		return false, result.Fail(fmt.Errorf("this picture of the tree has been closed: %w", syscall.EINVAL))
 	}
 	if limit < 1 {
-		return nil, false, fmt.Errorf("a page of %d rows is not a page: %w", limit, syscall.EINVAL)
+		return false, result.Fail(fmt.Errorf("a page of %d rows is not a page: %w", limit, syscall.EINVAL))
 	}
 	if p.done {
-		return nil, true, nil
+		return true, nil
 	}
 
-	rows := make([]metastore.Row, 0, limit)
+	produced := 0
 	if !p.sentRoot {
-		root, err := p.store.rootNode(ctx, p.tx)
+		root, contentBytes, err := p.store.rootMetadata(ctx, p.tx)
 		if err != nil {
-			return nil, false, fmt.Errorf("reading the root of the picture: %w", failure(err))
+			return false, result.Fail(fmt.Errorf("reading the root of the picture: %w", failure(err)))
 		}
-		// Parent 0 and no name, which is how metastore.Row names the node that has neither.
-		rows = append(rows, metastore.Row{Node: root})
+		reservation, fits, err := result.Reserve(
+			metastore.Row{Node: root}, metastore.RowPayloadLengths{Content: contentBytes},
+		)
+		if err != nil {
+			return false, err
+		}
+		if !fits {
+			return false, result.Fail(fmt.Errorf("the root did not fit an empty snapshot page: %w", syscall.EIO))
+		}
+		content, err := p.store.nodeContent(ctx, p.tx, root.ID)
+		if err != nil {
+			return false, result.Fail(fmt.Errorf("reading the root content key: %w", failure(err)))
+		}
+		if err := reservation.Commit(nil, content); err != nil {
+			return false, err
+		}
 		p.sentRoot = true
-		if len(rows) == limit {
-			return rows, false, nil
+		produced++
+		if produced == limit {
+			return false, nil
 		}
 	}
 
-	budget := limit - len(rows)
-	page, err := p.page(ctx, budget)
-	if err != nil {
-		return nil, false, fmt.Errorf("reading a page of the picture: %w", failure(err))
+	for produced < limit {
+		row, lengths, found, err := p.nextMetadata(ctx)
+		if err != nil {
+			return false, result.Fail(fmt.Errorf("reading a page of the picture: %w", failure(err)))
+		}
+		if !found {
+			p.done = true
+			return true, nil
+		}
+		reservation, fits, err := result.Reserve(row, lengths)
+		if err != nil {
+			return false, err
+		}
+		if !fits {
+			return false, nil
+		}
+		name, content, err := p.payload(ctx, row.Parent, row.Node.ID)
+		if err != nil {
+			return false, result.Fail(fmt.Errorf("reading a snapshot row payload: %w", failure(err)))
+		}
+		if err := reservation.Commit(name, content); err != nil {
+			return false, err
+		}
+		p.parent, p.name = row.Parent, name
+		produced++
 	}
-	// A page short of what was asked for is the end of the tree: the cursor advances strictly,
-	// so there is nothing after the last row it returned.
-	p.done = len(page) < budget
-	return append(rows, page...), p.done, nil
+	return false, nil
 }
 
-// pageQuery reads one page of a picture: the namespace's entries after a cursor, in key
-// order, with the node each one names.
+// pageQuery reads the fixed-width metadata and payload lengths of the next entry after a
+// cursor. The name and content key are deliberately absent: the result reserves their wire
+// representation before a second query is allowed to load them.
 //
 // Every clause is chosen so that one plan is the only plan, and the plan is what is under
 // test rather than the rows — what went wrong here before was never the rows this returns,
@@ -137,40 +188,82 @@ func (p *snapshot) Next(ctx context.Context, limit int) ([]metastore.Row, bool, 
 // TestAPictureIsPagedByRangeRatherThanByScanningAndSorting asserts the plan this produces,
 // with and without table statistics.
 const pageQuery = `
-	SELECT e.parent, e.name, ` + nodeColumns + `
+	SELECT e.parent, length(CAST(e.name AS BLOB)), n.id, n.mode, n.size,
+	       n.atime_sec, n.atime_nsec, n.mtime_sec, n.mtime_nsec,
+	       COALESCE(length(CAST(n.content AS BLOB)), 0)
 	FROM entries e JOIN nodes n ON n.id = e.node
 	WHERE e.namespace = ? AND (e.parent, e.name) > (?, ?)
 	ORDER BY e.parent, e.name
 	LIMIT ?`
 
-// page reads the next want entries in (parent, name) order and advances the cursor.
-func (p *snapshot) page(ctx context.Context, want int) ([]metastore.Row, error) {
-	rows, err := p.tx.QueryContext(ctx, pageQuery, p.store.namespace, p.parent, p.name, want)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+type nodeMetadataScan struct {
+	id                 int64
+	mode               int64
+	size               int64
+	atimeSec, mtimeSec int64
+	atimeNsec          int32
+	mtimeNsec          int32
+	contentBytes       int64
+}
 
-	page := make([]metastore.Row, 0, want)
-	for rows.Next() {
-		var (
-			parent int64
-			name   []byte
-			node   nodeScan
-		)
-		if err := rows.Scan(append([]any{&parent, &name}, node.fields()...)...); err != nil {
-			return nil, err
-		}
-		page = append(page, metastore.Row{Parent: parent, Name: name, Node: node.node()})
+func (s *nodeMetadataScan) fields() []any {
+	return []any{&s.id, &s.mode, &s.size, &s.atimeSec, &s.atimeNsec, &s.mtimeSec, &s.mtimeNsec, &s.contentBytes}
+}
+
+func (s nodeMetadataScan) node() metastore.Node {
+	return metastore.Node{
+		ID: s.id, Mode: fs.FileMode(s.mode), Size: s.size,
+		AccessTime: loadedTime(s.atimeSec, s.atimeNsec),
+		ModTime:    loadedTime(s.mtimeSec, s.mtimeNsec),
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+}
+
+func (s *Store) rootMetadata(ctx context.Context, tx *sql.Tx) (metastore.Node, int64, error) {
+	var node nodeMetadataScan
+	err := tx.QueryRowContext(ctx, `
+		SELECT n.id, n.mode, n.size, n.atime_sec, n.atime_nsec, n.mtime_sec, n.mtime_nsec,
+		       COALESCE(length(CAST(n.content AS BLOB)), 0)
+		FROM nodes n WHERE n.id = ?`, s.root).Scan(node.fields()...)
+	return node.node(), node.contentBytes, err
+}
+
+func (s *Store) nodeContent(ctx context.Context, tx *sql.Tx, id int64) (metastore.Key, error) {
+	var content sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT content FROM nodes WHERE id = ?`, id).Scan(&content)
+	return metastore.Key(content.String), err
+}
+
+func (p *snapshot) nextMetadata(ctx context.Context) (metastore.Row, metastore.RowPayloadLengths, bool, error) {
+	var (
+		parent    int64
+		nameBytes int64
+		node      nodeMetadataScan
+	)
+	err := p.tx.QueryRowContext(ctx, pageQuery, p.store.namespace, p.parent, p.name, 1).Scan(
+		append([]any{&parent, &nameBytes}, node.fields()...)...,
+	)
+	if err == sql.ErrNoRows {
+		return metastore.Row{}, metastore.RowPayloadLengths{}, false, nil
 	}
-	if len(page) > 0 {
-		last := page[len(page)-1]
-		p.parent, p.name = last.Parent, last.Name
+	if err != nil {
+		return metastore.Row{}, metastore.RowPayloadLengths{}, false, err
 	}
-	return page, nil
+	return metastore.Row{Parent: parent, Name: []byte{}, Node: node.node()}, metastore.RowPayloadLengths{
+		Name: nameBytes, Content: node.contentBytes,
+	}, true, nil
+}
+
+func (p *snapshot) payload(ctx context.Context, parent, node int64) ([]byte, metastore.Key, error) {
+	var (
+		name    []byte
+		content sql.NullString
+	)
+	err := p.tx.QueryRowContext(ctx, `
+		SELECT e.name, n.content
+		FROM entries e JOIN nodes n ON n.id = e.node
+		WHERE e.namespace = ? AND e.parent = ? AND e.node = ?`,
+		p.store.namespace, parent, node).Scan(&name, &content)
+	return name, metastore.Key(content.String), err
 }
 
 // Close releases the read transaction the picture is taken in, and with it the WAL that

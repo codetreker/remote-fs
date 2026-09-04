@@ -1,7 +1,9 @@
 package httprest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -153,8 +155,9 @@ type Subscription struct {
 // the positions it applies, and offers both back to Resubscribe.
 func (sub *Subscription) Incarnation() metastore.Incarnation { return sub.incarnation }
 
-// Position is where the stream begins. Everything up to and including it is the caller's
-// already, and every change Next returns is later than it.
+// Position is the latest position delivered by this stream, or its starting position before
+// the first change. Everything up to and including it is the caller's already, and every
+// later change Next returns advances it.
 func (sub *Subscription) Position() metastore.Position { return sub.at }
 
 // CaughtUp reports that nothing had been missed, so no change is replayed before the live
@@ -163,7 +166,7 @@ func (sub *Subscription) Position() metastore.Position { return sub.at }
 // It is Position and Tail compared rather than anything the server sent beside them. Derived
 // here, it cannot disagree with them; sent, it could, and a frame saying both that nothing
 // was missed and that something is still to come calls for opposite treatment of the copy.
-func (sub *Subscription) CaughtUp() bool { return sub.at == sub.tail }
+func (sub *Subscription) CaughtUp() bool { return sub.at >= sub.tail }
 
 // Tail is how far the log had reached when the stream began. Everything between Position and
 // it is replayed before the live changes, so a caller that was behind knows from it when it
@@ -199,7 +202,13 @@ func (sub *Subscription) Next() (metastore.Change, error) {
 		if err := decodeFrame(event, data, &change); err != nil {
 			return metastore.Change{}, sub.stream.fail(unreachable(sub.stream.req, err))
 		}
-		return change.Metastore(), nil
+		got := change.Metastore()
+		if got.Position <= sub.at {
+			return metastore.Change{}, sub.stream.fail(unreachable(sub.stream.req,
+				fmt.Errorf("change position %d does not follow position %d", got.Position, sub.at)))
+		}
+		sub.at = got.Position
+		return got, nil
 	case eventStart:
 		// The stream restating what it can do for the caller, part way through, is how it
 		// says the caller has fallen out of the window since it attached.
@@ -213,6 +222,9 @@ func (sub *Subscription) Next() (metastore.Change, error) {
 		}
 		return metastore.Change{}, sub.stream.fail(&RebuildError{Reason: start.Rebuild})
 	case eventGone:
+		if err := decodeEmptyControl(event, data); err != nil {
+			return metastore.Change{}, sub.stream.fail(unreachable(sub.stream.req, err))
+		}
 		return metastore.Change{}, sub.stream.fail(ErrServerStopping)
 	case eventFault:
 		return metastore.Change{}, sub.stream.fail(unreachable(sub.stream.req, faultOf(data)))
@@ -220,6 +232,32 @@ func (sub *Subscription) Next() (metastore.Change, error) {
 		return metastore.Change{}, sub.stream.fail(unreachable(sub.stream.req,
 			fmt.Errorf("a %s frame arrived on a change stream", event)))
 	}
+}
+
+func decodeEmptyControl(event string, data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	open, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("the %s frame does not carry an empty object: %w", event, err)
+	}
+	if delimiter, ok := open.(json.Delim); !ok || delimiter != '{' {
+		return fmt.Errorf("the %s frame does not carry an empty object", event)
+	}
+	if decoder.More() {
+		return fmt.Errorf("the %s frame's control object is not empty", event)
+	}
+	if close, err := decoder.Token(); err != nil {
+		return fmt.Errorf("the %s frame does not close its empty object: %w", event, err)
+	} else if delimiter, ok := close.(json.Delim); !ok || delimiter != '}' {
+		return fmt.Errorf("the %s frame does not close its empty object", event)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("a second JSON value followed the empty object")
+		}
+		return fmt.Errorf("the %s frame has trailing data: %w", event, err)
+	}
+	return nil
 }
 
 // Close ends the subscription and releases the connection it holds. A Next blocked waiting
@@ -300,9 +338,15 @@ func (snap *Snapshot) Next() ([]metastore.Row, error) {
 		}
 		return rows, nil
 	case eventDone:
+		if err := decodeEmptyControl(event, data); err != nil {
+			return nil, snap.stream.fail(unreachable(snap.stream.req, err))
+		}
 		snap.done = true
 		return nil, io.EOF
 	case eventGone:
+		if err := decodeEmptyControl(event, data); err != nil {
+			return nil, snap.stream.fail(unreachable(snap.stream.req, err))
+		}
 		// A picture cannot be resumed, so there is nothing here to carry on from — but
 		// knowing the server went away on purpose is still worth more than a stream that
 		// stopped: taking another from whatever comes up next is the whole answer, and
@@ -360,6 +404,14 @@ func (s *Storage) dialStream(ctx context.Context, req Request) (opened *stream, 
 		return nil, unreachable(req, err)
 	}
 	httpReq.Header.Set("Accept", contentEventStream)
+	releaseResponse, err := s.responses.acquire(ctx, retainedResponseMultiplier*s.maxBodyBytes)
+	if err != nil {
+		if errors.Is(err, syscall.EAGAIN) {
+			return nil, &operationError{req: req, errno: syscall.EAGAIN, detail: err.Error()}
+		}
+		return nil, unreachable(req, err)
+	}
+	defer releaseResponse()
 
 	// The caller's client, with its timeout dropped. http.Client.Timeout bounds the whole
 	// exchange, the reading of the body included, which is the right bound for an operation
@@ -388,7 +440,7 @@ func (s *Storage) dialStream(ctx context.Context, req Request) (opened *stream, 
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case StatusStorageError:
-		body, err := readWhole(resp)
+		body, err := readWhole(resp, s.maxBodyBytes)
 		if err != nil {
 			return nil, unreachable(req, err)
 		}
@@ -399,12 +451,16 @@ func (s *Storage) dialStream(ctx context.Context, req Request) (opened *stream, 
 	if got := resp.Header.Get("Content-Type"); got != contentEventStream {
 		return nil, unreachable(req, fmt.Errorf("the stream is typed %q, not %q", got, contentEventStream))
 	}
+	releaseResponse()
 
 	// The stream is bounded by how long it may say nothing at all, which is the only bound
 	// left on it: the caller's timeout was dropped above because it bounds the whole
 	// exchange, and a stream is meant to stay open. Cancelling is what returns a read that
 	// is waiting, so it is what the bound acts through.
-	opened = &stream{req: req, frames: newFrameReader(resp.Body, s.silence, cancel), body: resp.Body, cancel: cancel}
+	opened = &stream{
+		req: req, frames: newFrameReader(resp.Body, s.silence, s.maxFrameBytes, cancel),
+		body: resp.Body, cancel: cancel,
+	}
 	return opened, nil
 }
 

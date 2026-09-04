@@ -19,6 +19,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 
 	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore/objectstoretest"
 )
 
 // These tests run against Azurite, and they never skip: a run that cannot reach it fails,
@@ -111,20 +113,10 @@ func md5Of(content []byte) []byte {
 	return sum[:]
 }
 
-func TestPutStoresWhatGetReturns(t *testing.T) {
-	objects := objectsUnder(t)
-	content := []byte("a file's bytes, stored under an opaque key")
-
-	if _, err := objects.Put(context.Background(), "written-once", content); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	got, err := objects.Get(context.Background(), "written-once")
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if string(got) != string(content) {
-		t.Errorf("Get returned %q, want %q", got, content)
-	}
+func TestContract(t *testing.T) {
+	objectstoretest.Run(t, func(t *testing.T) objectstore.Objects {
+		return objectsUnder(t)
+	})
 }
 
 // The digest is the service's Content-MD5 for the bytes it stored. Comparing it against the
@@ -152,64 +144,6 @@ func TestPutReportsTheDigestTheServiceComputed(t *testing.T) {
 		if want := md5Of(content); string(digest) != string(want) {
 			t.Errorf("Put of %d bytes reported digest %x, want %x", size, digest, want)
 		}
-	}
-}
-
-// A key is reserved once and written once, so a second Put is a reservation handed out
-// twice. It must be refused, and it must not replace what is already there.
-func TestPutRefusesAKeyThatHasBeenWritten(t *testing.T) {
-	objects := objectsUnder(t)
-	first := []byte("the object the metastore points at")
-
-	if _, err := objects.Put(context.Background(), "taken", first); err != nil {
-		t.Fatalf("the first Put: %v", err)
-	}
-
-	_, err := objects.Put(context.Background(), "taken", []byte("a second writer's bytes"))
-	if !errors.Is(err, syscall.EEXIST) {
-		t.Fatalf("the second Put returned %v, want EEXIST", err)
-	}
-
-	got, err := objects.Get(context.Background(), "taken")
-	if err != nil {
-		t.Fatalf("Get after the refused Put: %v", err)
-	}
-	if string(got) != string(first) {
-		t.Errorf("the refused Put replaced the object: Get returned %q, want %q", got, first)
-	}
-}
-
-func TestGetOfAKeyNobodyWroteIsAbsent(t *testing.T) {
-	objects := objectsUnder(t)
-
-	got, err := objects.Get(context.Background(), "never-written")
-	if !errors.Is(err, syscall.ENOENT) {
-		t.Fatalf("Get returned %v, want ENOENT", err)
-	}
-	if got != nil {
-		t.Errorf("Get returned %q alongside its error, want nil", got)
-	}
-}
-
-// Deletion is driven by a sweeper that may be running again after being interrupted between
-// removing the object and recording that it did, so a second Delete must converge.
-func TestDeleteRemovesTheObjectAndRunsAgainWithoutFailing(t *testing.T) {
-	objects := objectsUnder(t)
-	if _, err := objects.Put(context.Background(), "swept", []byte("unreferenced")); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-
-	if err := objects.Delete(context.Background(), "swept"); err != nil {
-		t.Fatalf("the first Delete: %v", err)
-	}
-	if _, err := objects.Get(context.Background(), "swept"); !errors.Is(err, syscall.ENOENT) {
-		t.Fatalf("Get after Delete returned %v, want ENOENT", err)
-	}
-	if err := objects.Delete(context.Background(), "swept"); err != nil {
-		t.Fatalf("the second Delete: %v", err)
-	}
-	if err := objects.Delete(context.Background(), "never-written"); err != nil {
-		t.Fatalf("Delete of a key nobody wrote: %v", err)
 	}
 }
 
@@ -386,22 +320,6 @@ func TestPutRefusesContentLargerThanOneWriteStores(t *testing.T) {
 	err := refuseOversize("a-key", MaxObjectBytes+1)
 	if !errors.Is(err, syscall.EFBIG) {
 		t.Fatalf("content one byte over the limit was refused with %v, want EFBIG", err)
-	}
-}
-
-func TestAWithdrawnRequestIsReportedAsInterrupted(t *testing.T) {
-	objects := objectsUnder(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	if _, err := objects.Put(ctx, "withdrawn", []byte("bytes")); !errors.Is(err, syscall.EINTR) {
-		t.Errorf("Put on a cancelled context returned %v, want EINTR", err)
-	}
-	if _, err := objects.Get(ctx, "withdrawn"); !errors.Is(err, syscall.EINTR) {
-		t.Errorf("Get on a cancelled context returned %v, want EINTR", err)
-	}
-	if err := objects.Delete(ctx, "withdrawn"); !errors.Is(err, syscall.EINTR) {
-		t.Errorf("Delete on a cancelled context returned %v, want EINTR", err)
 	}
 }
 

@@ -113,3 +113,34 @@ func (f *sizeFlag) Set(text string) error {
 	f.bytes = size
 	return nil
 }
+
+// positiveSizeFlag is a byte bound on a retained or admitted resource. Unlike an
+// allowance, every one of these bounds must leave room for at least one byte.
+type positiveSizeFlag struct{ bytes int64 }
+
+var _ flag.Value = (*positiveSizeFlag)(nil)
+
+func (f *positiveSizeFlag) String() string { return strconv.FormatInt(f.bytes, 10) }
+
+func (f *positiveSizeFlag) Set(text string) error {
+	size, err := parseByteSize(text)
+	if err != nil {
+		return err
+	}
+	if size <= 0 {
+		return fmt.Errorf("%q is %d bytes, and a byte bound must be positive", text, size)
+	}
+	f.bytes = size
+	return nil
+}
+
+// inheritedSizeFlag is a positive byte bound whose zero value delegates to another bound.
+// String reports no numeric default because the effective value belongs to that other flag.
+type inheritedSizeFlag struct{ positiveSizeFlag }
+
+func (f *inheritedSizeFlag) String() string {
+	if f.bytes == 0 {
+		return ""
+	}
+	return f.positiveSizeFlag.String()
+}

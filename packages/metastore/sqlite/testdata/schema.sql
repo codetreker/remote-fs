@@ -17,6 +17,11 @@ CREATE INDEX objects_by_state ON objects (namespace, state, created_sec);
 
 -- index sqlite_autoindex_objects_1, which SQLite maintains itself
 
+CREATE TABLE backing_store (
+	singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+	store_id  TEXT    NOT NULL CHECK (store_id <> '')
+) WITHOUT ROWID;
+
 CREATE TABLE changes (
 	position      INTEGER PRIMARY KEY AUTOINCREMENT,
 	namespace     INTEGER NOT NULL REFERENCES namespaces(id),

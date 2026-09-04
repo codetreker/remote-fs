@@ -38,7 +38,7 @@ func TestPositionsKeepIncreasingAcrossTrims(t *testing.T) {
 
 	// The trim really did happen, so the run above was not a log that simply never filled: the
 	// entries are far fewer than the eighty a name and its directory make.
-	changes, retention, err := store.Since(t.Context(), 0, 1000)
+	changes, retention, err := readChanges(t.Context(), store, 0, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestFallingOutOfTheWindowNamesTheDimension(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		_, retention, err := store.Since(t.Context(), 0, 1000)
+		_, retention, err := readChanges(t.Context(), store, 0, 1000)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -143,7 +143,7 @@ func TestFallingOutOfTheWindowNamesTheDimension(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		_, retention, err := store.Since(t.Context(), 0, 1000)
+		_, retention, err := readChanges(t.Context(), store, 0, 1000)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -168,7 +168,7 @@ func TestTheFloorSurvivesAnAgeBoundNothingOutlives(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	changes, retention, err := store.Since(t.Context(), 0, 1000)
+	changes, retention, err := readChanges(t.Context(), store, 0, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestTheTailOutlivesTheEntriesItCounted(t *testing.T) {
 
 	// A namespace nobody has written to: nothing held, nothing recorded, and a caller at 0 is
 	// caught up rather than behind.
-	_, fresh, err := store.Since(t.Context(), 0, 0)
+	_, fresh, err := readChanges(t.Context(), store, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestTheTailOutlivesTheEntriesItCounted(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	_, filled, err := store.Since(t.Context(), 0, 0)
+	_, filled, err := readChanges(t.Context(), store, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestTheTailOutlivesTheEntriesItCounted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	changes, lost, err := store.Since(t.Context(), 0, 1000)
+	changes, lost, err := readChanges(t.Context(), store, 0, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,12 +240,9 @@ func TestTheTailOutlivesTheEntriesItCounted(t *testing.T) {
 	}
 }
 
-// Startup compares the position the tree was last changed at against the newest entry the log
-// still holds. Nothing this package does can put the two apart — the position is allocated in
-// the transaction that applies the change — so the entries are deleted from underneath it
-// here, which is the state an implementation whose log did not share the tree's transaction
-// would find after a crash. The honest answer is a new incarnation and one expensive rebuild.
-func TestALogMissingItsTailChangesIncarnation(t *testing.T) {
+// Startup refuses a log whose committed tail is missing. The tree and log share one
+// transaction, so this state is corruption rather than a crash boundary that can be repaired.
+func TestALogMissingItsTailIsRefused(t *testing.T) {
 	path := database(t)
 	first, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
 	if err != nil {
@@ -256,7 +253,7 @@ func TestALogMissingItsTailChangesIncarnation(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	before, err := first.Incarnation(t.Context())
+	before, err := first.Incarnation(t.Context(), 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +265,7 @@ func TestALogMissingItsTailChangesIncarnation(t *testing.T) {
 	// resumes rather than rebuilding. Without this the case below would pass for a store that
 	// simply minted a new incarnation every time it opened.
 	restarted := open(t, path, "workspace", 0)
-	unchanged, err := restarted.Incarnation(t.Context())
+	unchanged, err := restarted.Incarnation(t.Context(), 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,13 +282,23 @@ func TestALogMissingItsTailChangesIncarnation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened := open(t, path, "workspace", 0)
-	after, err := reopened.Incarnation(t.Context())
-	if err != nil {
+	reopened, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
+	if err == nil {
+		reopened.Close()
+		t.Fatal("opening a log whose committed tail is missing succeeded")
+	}
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("opening a log whose committed tail is missing: %v, want EIO", err)
+	}
+
+	db := raw(t, path)
+	defer db.Close()
+	var after string
+	if err := db.QueryRow(`SELECT incarnation FROM logs`).Scan(&after); err != nil {
 		t.Fatal(err)
 	}
-	if after == before {
-		t.Fatalf("the log lost every entry past position 0 and still calls itself %q; a replica would be told it was caught up", after)
+	if after != string(before) {
+		t.Fatalf("a refused open changed the incarnation from %q to %q", before, after)
 	}
 }
 
@@ -366,7 +373,7 @@ func TestRenamingADirectoryIsTwoRows(t *testing.T) {
 	if err := store.Rename(t.Context(), "a", "moved"); err != nil {
 		t.Fatal(err)
 	}
-	changes, _, err := store.Since(t.Context(), before, 100)
+	changes, _, err := readChanges(t.Context(), store, before, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,11 +405,11 @@ func TestEachNamespaceHasItsOwnLog(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mine, _, err := first.Since(t.Context(), 0, 100)
+	mine, _, err := readChanges(t.Context(), first, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	theirs, _, err := second.Since(t.Context(), 0, 100)
+	theirs, _, err := readChanges(t.Context(), second, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,11 +428,11 @@ func TestEachNamespaceHasItsOwnLog(t *testing.T) {
 
 	// Two logs, two incarnations. A replica that mistook one for the other would be told it
 	// could resume against history belonging to a namespace it has never read.
-	one, err := first.Incarnation(t.Context())
+	one, err := first.Incarnation(t.Context(), 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
-	other, err := second.Incarnation(t.Context())
+	other, err := second.Incarnation(t.Context(), 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -481,11 +488,11 @@ func TestTheLogReportsADatabaseItCannotReach(t *testing.T) {
 
 	for name, ask := range map[string]func() error{
 		"since": func() error {
-			_, _, err := store.Since(t.Context(), 0, 10)
+			_, _, err := readChanges(t.Context(), store, 0, 10)
 			return err
 		},
 		"incarnation": func() error {
-			_, err := store.Incarnation(t.Context())
+			_, err := store.Incarnation(t.Context(), 1024)
 			return err
 		},
 		"committed position": func() error {

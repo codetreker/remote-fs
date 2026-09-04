@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io/fs"
 	"strings"
 	"syscall"
@@ -16,6 +17,10 @@ import (
 // nodeColumns is every column of a node, in the order nodeScan reads them. Queries that
 // join entries to nodes alias the node table `n`.
 const nodeColumns = `n.id, n.mode, n.size, n.atime_sec, n.atime_nsec, n.mtime_sec, n.mtime_nsec, n.content`
+
+// nodeAttrColumns omits content for bounded directory enumeration. A listing exposes Attr,
+// and loading a content key before the caller reserves an entry would defeat its byte bound.
+const nodeAttrColumns = `n.id, n.mode, n.size, n.atime_sec, n.atime_nsec, n.mtime_sec, n.mtime_nsec`
 
 // scanner is what a *sql.Row and a *sql.Rows have in common, so that one node reader serves
 // both the single lookups and the listing.
@@ -35,6 +40,29 @@ type nodeScan struct {
 	atimeNsec          int32
 	mtimeNsec          int32
 	content            sql.NullString
+}
+
+type nodeAttrScan struct {
+	id                 int64
+	mode               int64
+	size               int64
+	atimeSec, mtimeSec int64
+	atimeNsec          int32
+	mtimeNsec          int32
+}
+
+func (s *nodeAttrScan) fields() []any {
+	return []any{&s.id, &s.mode, &s.size, &s.atimeSec, &s.atimeNsec, &s.mtimeSec, &s.mtimeNsec}
+}
+
+func (s *nodeAttrScan) attr() storage.Attr {
+	return storage.Attr{
+		ID:         uint64(s.id),
+		Mode:       fs.FileMode(s.mode),
+		Size:       s.size,
+		AccessTime: loadedTime(s.atimeSec, s.atimeNsec),
+		ModTime:    loadedTime(s.mtimeSec, s.mtimeNsec),
+	}
 }
 
 // fields are the destinations for nodeColumns, in that order.
@@ -186,28 +214,149 @@ func (s *Store) List(ctx context.Context, path string) ([]metastore.Child, error
 	return children, nil
 }
 
+// ListBounded first scans only each name's length and fixed-size attributes. The caller
+// reserves that entry before SQLite is allowed to copy the name BLOB into Go memory, then
+// the name is loaded and committed under the same read transaction.
+func (s *Store) ListBounded(ctx context.Context, path string, result *storage.ListResult) (returned error) {
+	if result == nil {
+		return pathError("list", path, syscall.EINVAL)
+	}
+	defer func() {
+		if returned != nil {
+			result.Fail(returned)
+		}
+	}()
+	cleaned, err := storage.CleanPath(path)
+	if err != nil {
+		return pathError("list", path, err)
+	}
+	if err := s.inspect(ctx, func(tx *sql.Tx) error {
+		dir, err := s.resolve(ctx, tx, cleaned)
+		if err != nil {
+			return err
+		}
+		if !dir.IsDir() {
+			return syscall.ENOTDIR
+		}
+		return s.listChildrenBounded(ctx, tx, dir.ID, result)
+	}); err != nil {
+		return pathError("list", path, failure(err))
+	}
+	return nil
+}
+
+type reservedChild struct {
+	node        int64
+	nameBytes   int64
+	reservation *storage.ListReservation
+}
+
+func (s *Store) listChildrenBounded(ctx context.Context, tx *sql.Tx, parent int64, result *storage.ListResult) error {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT length(CAST(e.name AS BLOB)), `+nodeAttrColumns+` FROM entries e JOIN nodes n ON n.id = e.node
+		 WHERE e.namespace = ? AND e.parent = ? ORDER BY e.name`,
+		s.namespace, parent)
+	if err != nil {
+		return err
+	}
+	reserved := []reservedChild{}
+	for rows.Next() {
+		var (
+			nameBytes int64
+			node      nodeAttrScan
+		)
+		if err := rows.Scan(append([]any{&nameBytes}, node.fields()...)...); err != nil {
+			rows.Close()
+			return err
+		}
+		reservation, err := result.Reserve(nameBytes, node.attr())
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		reserved = append(reserved, reservedChild{node: node.id, nameBytes: nameBytes, reservation: reservation})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	for _, child := range reserved {
+		name, err := s.reservedName(ctx, tx, parent, child)
+		if err != nil {
+			return err
+		}
+		if err := child.reservation.Commit(name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) reservedName(ctx context.Context, tx *sql.Tx, parent int64, child reservedChild) (string, error) {
+	var total, matching int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT count(*), coalesce(sum(
+			parent = ? AND length(CAST(name AS BLOB)) = ? AND typeof(name) = 'blob' AND
+			length(name) > 0 AND name NOT IN (X'2e', X'2e2e') AND
+			instr(name, X'2f') = 0 AND instr(name, X'00') = 0
+		), 0)
+		FROM entries WHERE namespace = ? AND node = ?`,
+		parent, child.nameBytes, s.namespace, child.node).Scan(&total, &matching); err != nil {
+		return "", err
+	}
+	if total != 1 || matching != 1 {
+		return "", fmt.Errorf(
+			"node %d has %d entries, of which %d match its reserved parent and name: %w",
+			child.node, total, matching, syscall.EIO,
+		)
+	}
+	var name []byte
+	if err := tx.QueryRowContext(ctx,
+		`SELECT name FROM entries WHERE namespace = ? AND node = ?`,
+		s.namespace, child.node).Scan(&name); err != nil {
+		return "", err
+	}
+	return string(name), nil
+}
+
 func (s *Store) listChildren(ctx context.Context, tx *sql.Tx, parent int64) ([]metastore.Child, error) {
+	children := []metastore.Child{}
+	if err := s.visitChildren(ctx, tx, parent, func(child metastore.Child) error {
+		children = append(children, child)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return children, nil
+}
+
+func (s *Store) visitChildren(ctx context.Context, tx *sql.Tx, parent int64, add func(metastore.Child) error) error {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT e.name, `+nodeColumns+` FROM entries e JOIN nodes n ON n.id = e.node
 		 WHERE e.namespace = ? AND e.parent = ? ORDER BY e.name`,
 		s.namespace, parent)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer rows.Close()
 
-	children := []metastore.Child{}
 	for rows.Next() {
 		var (
 			name []byte
 			node nodeScan
 		)
 		if err := rows.Scan(append([]any{&name}, node.fields()...)...); err != nil {
-			return nil, err
+			return err
 		}
-		children = append(children, metastore.Child{Name: name, Node: node.node()})
+		if err := add(metastore.Child{Name: name, Node: node.node()}); err != nil {
+			return err
+		}
 	}
-	return children, rows.Err()
+	return rows.Err()
 }
 
 // SetAttr applies the attributes a change names and leaves the rest alone.

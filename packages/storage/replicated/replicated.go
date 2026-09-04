@@ -73,11 +73,9 @@ type Storage struct {
 	// incarnation names the run of history the copy was built against, and is offered back
 	// when reattaching.
 	incarnation metastore.Incarnation
+	generation  uint64
 
-	// grace is how long one caller waits for the change it made to come back. What it is
-	// for, and why running out of it is one operation's failure rather than the stream's,
-	// is on DefaultEchoGrace.
-	grace time.Duration
+	options Options
 
 	mu sync.Mutex
 
@@ -85,9 +83,8 @@ type Storage struct {
 	// it is set the copy may not be answered from at all.
 	failure error
 
-	// at is how far the copy has been brought, mirrored here so that a caller waiting for
-	// its own change to come back reads it in the same critical section that records what
-	// has arrived.
+	// at is how far the copy has been brought, mirrored here so mutation confirmation reads
+	// it in the same critical section that records what has arrived.
 	at metastore.Position
 
 	// behind is the position a resumed stream said the log had reached, while the copy has
@@ -101,16 +98,19 @@ type Storage struct {
 	// applied, the stream broken, the stream alive again.
 	notify chan struct{}
 
-	// waiting holds the position each caller watching for its own change started from, and
-	// touched is what has changed at a name since the earliest of them. Nothing is recorded
-	// while nobody is waiting, and what no remaining waiter could be released by is dropped
-	// as each one leaves — so the map holds the changes of the longest mutation still in
-	// flight rather than of the namespace's life (R-INT-3).
-	waiting []metastore.Position
-	touched map[location]touch
+	// confirmationCapacity is separate from notify so an unrelated change flood does not wake every
+	// caller waiting only for confirmation capacity.
+	confirmationCapacity chan struct{}
+
+	// activeConfirmations counts fixed-size records whose server result or local barrier
+	// confirmation is still in flight. Callers waiting to enter are bounded separately.
+	activeConfirmations int
+	confirmationWaiters int
+	closing             bool
 }
 
 var _ storage.Storage = (*Storage)(nil)
+var _ storage.BoundedStorage = (*Storage)(nil)
 
 // New builds a copy of the namespace at remote in local, and returns once it is usable.
 //
@@ -131,26 +131,33 @@ var _ storage.Storage = (*Storage)(nil)
 //
 // local is closed by Close, and where it lives is the caller's decision.
 func New(ctx context.Context, local *sqlite.Replica, remote *httprest.Storage) (*Storage, error) {
-	return NewWithEchoGrace(ctx, local, remote, DefaultEchoGrace)
+	return NewWithOptions(ctx, local, remote, DefaultOptions())
 }
 
-// NewWithEchoGrace is New with the bound on how long a caller waits for its own change given
-// rather than defaulted. What that bound is for is on DefaultEchoGrace.
-func NewWithEchoGrace(ctx context.Context, local *sqlite.Replica, remote *httprest.Storage, grace time.Duration) (*Storage, error) {
-	if grace <= 0 {
-		return nil, fmt.Errorf("a caller allowed %v to see the change it made is one that cannot be told it happened: %w", grace, syscall.EINVAL)
+// NewWithConfirmationGrace is New with the bound on how long a successful mutation waits for
+// the copy to reach its returned barrier. What that bound is for is on DefaultConfirmationGrace.
+func NewWithConfirmationGrace(ctx context.Context, local *sqlite.Replica, remote *httprest.Storage, grace time.Duration) (*Storage, error) {
+	options := DefaultOptions()
+	options.ConfirmationGrace = grace
+	return NewWithOptions(ctx, local, remote, options)
+}
+
+// NewWithOptions is New with explicit bounds for mutation confirmation resources.
+func NewWithOptions(ctx context.Context, local *sqlite.Replica, remote *httprest.Storage, options Options) (*Storage, error) {
+	if err := options.Check(); err != nil {
+		return nil, err
 	}
 	lifetime, stop := context.WithCancel(context.Background())
 	s := &Storage{
-		remote:   remote,
-		local:    local,
-		lifetime: lifetime,
-		stop:     stop,
-		stopped:  make(chan struct{}),
-		notify:   make(chan struct{}),
-		grace:    grace,
-		touched:  map[location]touch{},
-		failure:  errors.New("the copy of this namespace has not been built yet"),
+		remote:               remote,
+		local:                local,
+		lifetime:             lifetime,
+		stop:                 stop,
+		stopped:              make(chan struct{}),
+		notify:               make(chan struct{}),
+		confirmationCapacity: make(chan struct{}),
+		options:              options,
+		failure:              errors.New("the copy of this namespace has not been built yet"),
 	}
 
 	sub, err := s.build(ctx)
@@ -164,8 +171,22 @@ func NewWithEchoGrace(ctx context.Context, local *sqlite.Replica, remote *httpre
 
 // Close stops following the namespace and releases the copy.
 func (s *Storage) Close() error {
+	s.mu.Lock()
+	s.closing = true
+	s.wake()
+	s.wakeConfirmationCapacity()
+	s.mu.Unlock()
 	s.stop()
 	<-s.stopped
+
+	s.mu.Lock()
+	for s.activeConfirmations != 0 || s.confirmationWaiters != 0 {
+		notify := s.confirmationCapacity
+		s.mu.Unlock()
+		<-notify
+		s.mu.Lock()
+	}
+	s.mu.Unlock()
 	return s.local.Close()
 }
 
@@ -180,6 +201,8 @@ func (s *Storage) Stat(ctx context.Context, path string) (storage.Attr, error) {
 	}
 	return node.Attr(), nil
 }
+
+func (s *Storage) CheckBounded() error { return s.remote.CheckBounded() }
 
 // List returns the entries of the directory at path from the copy.
 func (s *Storage) List(ctx context.Context, path string) ([]storage.Entry, error) {
@@ -197,6 +220,22 @@ func (s *Storage) List(ctx context.Context, path string) ([]storage.Entry, error
 	return entries, nil
 }
 
+// ListBounded holds the same replica position for the whole ordered query and transfers
+// each child directly into the caller's bounded result.
+func (s *Storage) ListBounded(ctx context.Context, path string, result *storage.ListResult) (returned error) {
+	if result != nil {
+		defer func() {
+			if returned != nil {
+				result.Fail(returned)
+			}
+		}()
+	}
+	if err := s.usable("list", path); err != nil {
+		return err
+	}
+	return s.local.ListBounded(ctx, path, result)
+}
+
 // Read returns the contents of the file at path, from the server.
 //
 // Contents are not replicated and are not this copy's to answer. Only the tree is here.
@@ -205,6 +244,13 @@ func (s *Storage) Read(ctx context.Context, path string) ([]byte, error) {
 		return nil, err
 	}
 	return s.remote.Read(ctx, path)
+}
+
+func (s *Storage) ReadBounded(ctx context.Context, path string, maxBytes int64) ([]byte, error) {
+	if err := s.usable("read", path); err != nil {
+		return nil, err
+	}
+	return s.remote.ReadBounded(ctx, path, maxBytes)
 }
 
 // Space reports the room the namespace has, from the server. A namespace's allowance and
@@ -219,24 +265,21 @@ func (s *Storage) Space(ctx context.Context) (storage.Space, error) {
 
 // --- changing the namespace --------------------------------------------------------------
 
-// The mutations. Each is performed by the server and each returns only once the change it
-// made has come back on the stream and been applied here.
+// The mutations. Each is performed by the server and returns only once the copy has applied
+// through the atomic log barrier returned with the successful response.
 //
-// Waiting for the echo is what makes R-CON-4 hold: a program that writes a file and then
-// stats it must see what it wrote, including the size and the modification time. Between the
-// server committing a change and its event arriving, the copy still holds what the name held
-// before — so a mutation that returned at the commit would leave the caller one stat away
-// from the previous contents, which is what a build tool comparing a target against its
-// sources reads. There is no version of this that reports a locally invented size or time
-// instead: what a mutation waits for is the server's own record of what it did.
+// The barrier makes R-CON-4 hold: a program that writes a file and then stats it must see what
+// it wrote, including the size and modification time. Returning before the copy reaches the
+// barrier could expose the previous contents. The position also avoids guessing which event a
+// mutation produced when other writers change the same name concurrently.
 //
 // What that costs, stated here rather than left to be found: every mutation now takes as long
-// as the server needs plus as long as its event needs to come back. No second request is made
-// — the event is already travelling on a connection that is open — but one more crossing of
+// as the server needs plus as long as its barrier needs to be applied. No second request is made
+// — the changes are already travelling on a connection that is open — but one more crossing of
 // the network is in the latency of every write, every create, every rename, and on a link
 // where a round trip is 20 ms a write costs about half of one again.
 //
-// And the wait has a ceiling, DefaultEchoGrace. A mutation whose event has not arrived by
+// The wait has a ceiling, DefaultConfirmationGrace. A copy that has not reached the barrier by
 // then reports EIO even though the change did happen, and it is that one call that gives up:
 // the stream carries on, because a stream working through a backlog looks exactly like one
 // that has stopped, and whether it has stopped is answered by the bound the transport keeps
@@ -244,73 +287,68 @@ func (s *Storage) Space(ctx context.Context) (storage.Space, error) {
 // — the failure is this side's inability to confirm, not a statement that nothing happened.
 
 func (s *Storage) SetAttr(ctx context.Context, path string, change storage.AttrChange) error {
-	// A change that names no attribute changes nothing, and a namespace records nothing for
-	// it — so there is no echo to wait for, and waiting for one would hang until the grace
-	// below ran out. It is still sent, because whether the node is there at all is the
-	// server's answer rather than this copy's.
-	echo := &echoed{path: path, holds: true}
 	if change.Empty() {
-		echo = nil
+		if err := s.usable("setattr", path); err != nil {
+			return err
+		}
+		return s.remote.SetAttr(ctx, path, change)
 	}
-	return s.change(ctx, "setattr", path, echo, func() error { return s.remote.SetAttr(ctx, path, change) })
+	return s.change(ctx, "setattr", path, func(sendCtx context.Context) (httprest.MutationBarrier, error) {
+		return s.remote.SetAttrWithBarrier(sendCtx, path, change)
+	})
 }
 
 func (s *Storage) Write(ctx context.Context, path string, content []byte) error {
-	return s.change(ctx, "write", path, &echoed{path: path, holds: true},
-		func() error { return s.remote.Write(ctx, path, content) })
+	return s.change(ctx, "write", path,
+		func(sendCtx context.Context) (httprest.MutationBarrier, error) {
+			return s.remote.WriteWithBarrier(sendCtx, path, content)
+		})
 }
 
 func (s *Storage) Create(ctx context.Context, path string) error {
-	return s.change(ctx, "create", path, &echoed{path: path, holds: true},
-		func() error { return s.remote.Create(ctx, path) })
+	return s.change(ctx, "create", path,
+		func(sendCtx context.Context) (httprest.MutationBarrier, error) {
+			return s.remote.CreateWithBarrier(sendCtx, path)
+		})
 }
 
 func (s *Storage) Mkdir(ctx context.Context, path string) error {
-	return s.change(ctx, "mkdir", path, &echoed{path: path, holds: true},
-		func() error { return s.remote.Mkdir(ctx, path) })
+	return s.change(ctx, "mkdir", path,
+		func(sendCtx context.Context) (httprest.MutationBarrier, error) {
+			return s.remote.MkdirWithBarrier(sendCtx, path)
+		})
 }
 
 func (s *Storage) Remove(ctx context.Context, path string) error {
-	return s.change(ctx, "unlink", path, &echoed{path: path, holds: false},
-		func() error { return s.remote.Remove(ctx, path) })
+	return s.change(ctx, "unlink", path,
+		func(sendCtx context.Context) (httprest.MutationBarrier, error) {
+			return s.remote.RemoveWithBarrier(sendCtx, path)
+		})
 }
 
 func (s *Storage) RemoveDir(ctx context.Context, path string) error {
-	return s.change(ctx, "rmdir", path, &echoed{path: path, holds: false},
-		func() error { return s.remote.RemoveDir(ctx, path) })
+	return s.change(ctx, "rmdir", path,
+		func(sendCtx context.Context) (httprest.MutationBarrier, error) {
+			return s.remote.RemoveDirWithBarrier(sendCtx, path)
+		})
 }
 
-// Rename waits for the destination, which is the one name a rename changes: applying that
-// one change empties the source and fills the destination in a single step, because a rename
-// is one row in the log and one row here.
-//
 // Renaming a name onto itself is the exception. POSIX has rename(2) "return successfully and
 // perform no other action" when both names resolve to one entry, so nothing is recorded and
-// there is no echo — but it is still sent, because whether the name is there at all, and
-// whether it is the root, are the server's answers.
+// no barrier confirmation is required. The operation is still sent because whether the name
+// exists, and whether it is the root, are the server's answers.
 func (s *Storage) Rename(ctx context.Context, from, to string) error {
 	if err := s.usable("rename", from); err != nil {
 		return &os.LinkError{Op: "rename", Old: from, New: to, Err: err.Err}
 	}
-	var echo *echoed
 	if cleanFrom, err := storage.CleanPath(from); err == nil {
-		if cleanTo, err := storage.CleanPath(to); err == nil && cleanFrom != cleanTo {
-			echo = &echoed{path: to, holds: true}
+		if cleanTo, err := storage.CleanPath(to); err == nil && cleanFrom == cleanTo {
+			return s.remote.Rename(ctx, from, to)
 		}
 	}
-	return s.change(ctx, "rename", to, echo, func() error { return s.remote.Rename(ctx, from, to) })
-}
-
-// echoed is the change a mutation waits to see come back: the name it acted on, and whether
-// that name holds a node afterwards.
-//
-// The direction matters, and the case that shows why is a rename onto an occupied name. That
-// records two changes — the destination emptied, then the node arriving there — and a caller
-// released by the first of them would stat the destination and be told there is nothing
-// there, which is the one answer this system exists not to give.
-type echoed struct {
-	path  string
-	holds bool
+	return s.change(ctx, "rename", to, func(sendCtx context.Context) (httprest.MutationBarrier, error) {
+		return s.remote.RenameWithBarrier(sendCtx, from, to)
+	})
 }
 
 // change performs one mutation and returns once the copy holds it.
@@ -319,18 +357,48 @@ type echoed struct {
 // response to the request that caused it — they travel on different connections — and a
 // caller that started watching afterwards would be watching for something that had already
 // happened.
-func (s *Storage) change(ctx context.Context, op, path string, echo *echoed, send func() error) error {
+func (s *Storage) change(ctx context.Context, op, path string, send func(context.Context) (httprest.MutationBarrier, error)) error {
 	if err := s.usable(op, path); err != nil {
 		return err
 	}
-	after := s.expect()
-	defer s.forget(after)
-
-	if err := send(); err != nil {
+	if _, err := storage.CleanPath(path); err != nil {
+		return &os.PathError{Op: op, Path: path, Err: err}
+	}
+	confirmation, err := s.expect(ctx, op, path)
+	if err != nil {
 		return err
 	}
-	if echo == nil {
-		return nil
+	defer s.forget(confirmation)
+
+	if err := ctx.Err(); err != nil {
+		return confirmationAdmissionError(op, path, fmt.Errorf("the caller stopped waiting before the mutation was sent: %w", err))
 	}
-	return s.await(ctx, op, after, *echo)
+	s.mu.Lock()
+	closing := s.closing
+	s.mu.Unlock()
+	if closing {
+		return confirmationAdmissionError(op, path, errors.New("the replicated storage started closing before the mutation was sent"))
+	}
+
+	sendCtx, cancel := context.WithCancelCause(ctx)
+	stopCancellation := context.AfterFunc(s.lifetime, func() {
+		cancel(errors.New("the replicated storage was closed"))
+	})
+	defer func() {
+		stopCancellation()
+		cancel(nil)
+	}()
+
+	barrier, err := send(sendCtx)
+	if err != nil {
+		return err
+	}
+	if err := s.setBarrier(confirmation, barrier); err != nil {
+		return &os.PathError{Op: op, Path: path, Err: err}
+	}
+	return s.await(ctx, op, path, confirmation)
+}
+
+func confirmationAdmissionError(op, path string, cause error) error {
+	return &os.PathError{Op: op, Path: path, Err: fmt.Errorf("mutation confirmation was not admitted before the mutation was sent: %s: %w", cause, syscall.EAGAIN)}
 }

@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // replicaNamespace is the name a copy's namespace carries in its own database. One file
@@ -80,6 +81,22 @@ func (r *Replica) List(ctx context.Context, path string) ([]metastore.Child, err
 	return r.store.List(ctx, path)
 }
 
+// ListBounded holds the replica read lock while one ordered database observation is
+// enumerated, so applying a concurrent change cannot splice two replica positions into a
+// successful listing.
+func (r *Replica) ListBounded(ctx context.Context, path string, result *storage.ListResult) (returned error) {
+	if result != nil {
+		defer func() {
+			if returned != nil {
+				result.Fail(returned)
+			}
+		}()
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.store.ListBounded(ctx, path, result)
+}
+
 // Position is how far this copy has been brought: everything the source recorded up to and
 // including it is here, and nothing later is.
 func (r *Replica) Position() metastore.Position {
@@ -94,9 +111,9 @@ func (r *Replica) Close() error { return r.store.Close() }
 
 // Apply brings the copy forward by one change, and reports whether the change was new to it.
 //
-// A change at a position this copy already holds is discarded rather than applied again, and
-// that one rule is what makes a replica's own echo free of charge: the change it caused
-// arrives on the stream like any other, and either it is new to this copy or it is not.
+// A change at a position this copy already holds is discarded rather than applied again. This
+// occurs when the stream attached before a snapshot later replays changes already covered by
+// that snapshot.
 //
 // Which of the two it was is reported rather than left to be inferred, because the caller
 // keeps its own account of what the copy holds. A caller that took every change it delivered

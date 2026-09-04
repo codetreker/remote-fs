@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -29,32 +31,23 @@ const (
 	fieldData  = "data: "
 )
 
-// maxFrameBytes is the largest frame this side will assemble.
-//
-// A stream is read from a party that has already been established as speaking this
-// protocol, but "speaking this protocol" is not "will not exhaust this process's memory":
-// the frame length arrives as the data itself, so without a bound a single frame that
-// never ends is an unbounded allocation (R-INT-3). It is far above any frame the handler
-// here produces — a page of snapshot rows is hundreds of kilobytes at the default page
-// size — so reaching it means something on the far side is not sizing its pages.
-const maxFrameBytes = 8 << 20
-
 // frameWriter writes the frames of one stream.
 //
 // Every frame is flushed as it is written. A change that sits in a buffer is a change that
 // has not been delivered, and R-CON-2 forbids visibility that waits for anything to
 // elapse — including the moment a write buffer happens to fill.
 type frameWriter struct {
-	to      io.Writer
-	control *http.ResponseController
+	to            io.Writer
+	control       *http.ResponseController
+	maxFrameBytes int64
 }
 
 // openStream begins a stream: it commits the response to a success and to this framing, so
 // nothing after it can report a status.
-func openStream(w http.ResponseWriter) (*frameWriter, error) {
+func openStream(w http.ResponseWriter, maxFrameBytes int64) (*frameWriter, error) {
 	w.Header().Set("Content-Type", contentEventStream)
 	w.WriteHeader(http.StatusOK)
-	f := &frameWriter{to: w, control: http.NewResponseController(w)}
+	f := &frameWriter{to: w, control: http.NewResponseController(w), maxFrameBytes: maxFrameBytes}
 	// The headers are of no use to the far side until they arrive: a client that has not
 	// seen them is still waiting for a response, and cannot tell that from a server that
 	// has not answered.
@@ -116,21 +109,82 @@ func (f *frameWriter) endWritesWhen(done <-chan struct{}) (release func()) {
 func (f *frameWriter) send(event string, payload any) error {
 	// Rendered whole before anything is written, so that a payload that will not encode
 	// cannot leave half a frame on a stream that has no way to retract it.
+	encoded, err := marshalFrame(event, payload, f.maxFrameBytes)
+	if err != nil {
+		return err
+	}
+	return f.sendEncoded(event, encoded)
+}
+
+func marshalFrame(event string, payload any, maxFrameBytes int64) ([]byte, error) {
 	encoded, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("cannot render the %s frame: %w", event, err)
+		return nil, fmt.Errorf("cannot render the %s frame: %w", event, err)
 	}
-	if _, err := fmt.Fprintf(f.to, "%s%s\n%s%s\n\n", fieldEvent, event, fieldData, encoded); err != nil {
+	frameBytes, err := encodedFrameBytes(event, int64(len(encoded)))
+	if err != nil {
+		return nil, err
+	}
+	if frameBytes > maxFrameBytes {
+		return nil, fmt.Errorf("the %s frame requires %d bytes under the %d-byte frame bound: %w",
+			event, frameBytes, maxFrameBytes, syscall.EFBIG)
+	}
+	return encoded, nil
+}
+
+func (f *frameWriter) sendEncoded(event string, encoded []byte) error {
+	for _, part := range []string{fieldEvent, event, "\n", fieldData} {
+		if err := writeFrameString(f.to, part); err != nil {
+			return err
+		}
+	}
+	if n, err := f.to.Write(encoded); err != nil {
+		return err
+	} else if n != len(encoded) {
+		return io.ErrShortWrite
+	}
+	if err := writeFrameString(f.to, "\n\n"); err != nil {
 		return err
 	}
 	return f.control.Flush()
+}
+
+func writeFrameString(to io.Writer, value string) error {
+	n, err := io.WriteString(to, value)
+	if err != nil {
+		return err
+	}
+	if n != len(value) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func encodedFrameBytes(event string, payloadBytes int64) (int64, error) {
+	if payloadBytes < 0 {
+		return 0, fmt.Errorf("a frame payload cannot have negative length: %w", syscall.EINVAL)
+	}
+	fixed := int64(len(fieldEvent) + len(event) + 1 + len(fieldData) + 2)
+	if payloadBytes > math.MaxInt64-fixed {
+		return 0, fmt.Errorf("the %s frame length overflows byte accounting: %w", event, syscall.EFBIG)
+	}
+	return fixed + payloadBytes, nil
 }
 
 // fault ends the stream by saying why, in place of everything that would have followed.
 // Its own failure to reach the far side changes nothing: the stream is over either way,
 // and the far side treats a stream that stopped as a failure whether or not it was told.
 func (f *frameWriter) fault(cause error) {
-	f.send(eventFault, StreamFault{Message: cause.Error()})
+	message := cause.Error()
+	const faultEnvelopeBytes int64 = 128
+	maxMessage := (f.maxFrameBytes - faultEnvelopeBytes) / 6
+	if maxMessage < 0 {
+		maxMessage = 0
+	}
+	if int64(len(message)) > maxMessage {
+		message = "the stream failed and its detail exceeds the configured frame bound"
+	}
+	f.send(eventFault, StreamFault{Message: message})
 }
 
 // alive says that the stream is still there, on a stream that has nothing else to say.
@@ -161,6 +215,7 @@ type frameReader struct {
 	// carried it out.
 	silenced *atomic.Bool
 	silence  time.Duration
+	maxBytes int64
 }
 
 // newFrameReader reads frames from a stream, and gives up on one that has said nothing at
@@ -178,7 +233,7 @@ type frameReader struct {
 // response body offers no deadline, and http.Client.Timeout bounds the whole exchange,
 // which on a stream that is meant to stay open with nothing on it is a timer that severs
 // healthy subscriptions.
-func newFrameReader(from io.Reader, silence time.Duration, abandon func()) *frameReader {
+func newFrameReader(from io.Reader, silence time.Duration, maxFrameBytes int64, abandon func()) *frameReader {
 	silenced := &atomic.Bool{}
 	quiet := time.AfterFunc(silence, func() {
 		silenced.Store(true)
@@ -187,8 +242,9 @@ func newFrameReader(from io.Reader, silence time.Duration, abandon func()) *fram
 	quiet.Stop()
 
 	lines := bufio.NewScanner(&watched{from: from, silence: silence, quiet: quiet})
-	lines.Buffer(make([]byte, 0, 64<<10), maxFrameBytes)
-	return &frameReader{lines: lines, silenced: silenced, silence: silence}
+	initial := min(int64(64<<10), maxFrameBytes)
+	lines.Buffer(make([]byte, 0, int(initial)), int(maxFrameBytes))
+	return &frameReader{lines: lines, silenced: silenced, silence: silence, maxBytes: maxFrameBytes}
 }
 
 // watched is a reader whose every wait is bounded.
@@ -213,6 +269,7 @@ func (w *watched) Read(p []byte) (int, error) {
 // exactly what a connection dropped at that moment also looks like.
 func (f *frameReader) next() (string, []byte, error) {
 	var frame []string
+	var frameBytes int64
 	for f.lines.Scan() {
 		line := f.lines.Text()
 		// A comment: the far side saying that the stream is still there and it has nothing
@@ -221,12 +278,21 @@ func (f *frameReader) next() (string, []byte, error) {
 			continue
 		}
 		if line != "" {
+			lineBytes := int64(len(line)) + 1
+			if lineBytes > f.maxBytes-frameBytes {
+				return "", nil, fmt.Errorf("a stream frame exceeds its %d-byte bound", f.maxBytes)
+			}
+			frameBytes += lineBytes
 			if len(frame) == 2 {
 				return "", nil, fmt.Errorf("a frame carries a line beyond its event and its data: %q", line)
 			}
 			frame = append(frame, line)
 			continue
 		}
+		if frameBytes == f.maxBytes {
+			return "", nil, fmt.Errorf("a stream frame exceeds its %d-byte bound", f.maxBytes)
+		}
+		frameBytes++
 		if len(frame) != 2 {
 			return "", nil, fmt.Errorf("a frame of %d lines arrived, and a frame is an event and its data", len(frame))
 		}

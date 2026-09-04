@@ -38,6 +38,7 @@ type Objects struct {
 }
 
 var _ objectstore.Objects = (*Objects)(nil)
+var _ objectstore.BoundedObjects = (*Objects)(nil)
 
 // New opens an empty set of objects.
 func New() *Objects {
@@ -80,6 +81,19 @@ func (o *Objects) Put(ctx context.Context, key string, content []byte) ([]byte, 
 // R-ERR-2 wants it to: there is no endpoint to be unreachable, so absence is the only
 // thing a lookup that comes back empty can mean.
 func (o *Objects) Get(ctx context.Context, key string) ([]byte, error) {
+	return o.get(ctx, key, 0, false)
+}
+
+// GetBounded checks the retained object's length while holding the map lock and before
+// making the caller-owned copy.
+func (o *Objects) GetBounded(ctx context.Context, key string, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("get %q: the byte limit %d is not positive: %w", key, maxBytes, syscall.EINVAL)
+	}
+	return o.get(ctx, key, maxBytes, true)
+}
+
+func (o *Objects) get(ctx context.Context, key string, maxBytes int64, bounded bool) ([]byte, error) {
 	if err := withdrawn(ctx, "get", key); err != nil {
 		return nil, err
 	}
@@ -89,6 +103,10 @@ func (o *Objects) Get(ctx context.Context, key string) ([]byte, error) {
 	stored, ok := o.content[key]
 	if !ok {
 		return nil, fmt.Errorf("get %q: nothing is stored under this key: %w", key, syscall.ENOENT)
+	}
+	if bounded && int64(len(stored)) > maxBytes {
+		return nil, fmt.Errorf("get %q: the object contains %d bytes, above the result limit of %d: %w",
+			key, len(stored), maxBytes, syscall.EFBIG)
 	}
 	return copyOf(stored), nil
 }
@@ -106,6 +124,17 @@ func (o *Objects) Delete(ctx context.Context, key string) error {
 	delete(o.content, key)
 	return nil
 }
+
+// Available refuses a physical-capacity figure. Heap capacity is neither a stable limit nor
+// a measurement of room reserved for this object store, so reporting one would invent a
+// constraint the process does not own.
+func (o *Objects) Available(context.Context) (int64, error) {
+	return 0, fmt.Errorf("the in-memory object store has no physical capacity to report: %w", syscall.ENOSYS)
+}
+
+// Close releases no resources. Objects retained here belong to this value and become
+// collectible with it.
+func (o *Objects) Close() error { return nil }
 
 // withdrawn reports the context's own failure, if it has one, before anything is stored or
 // read.

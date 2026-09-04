@@ -1,6 +1,7 @@
 package httprest
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -333,6 +334,102 @@ func (r *SpaceResponse) UnmarshalJSON(data []byte) error {
 		return errors.New("the response carried no space report")
 	}
 	*r = SpaceResponse(decoded)
+	return nil
+}
+
+// MutationBarrier identifies a log position at or after a successful mutation. Waiting
+// until a replica of the same incarnation has applied through Position establishes
+// read-after-write visibility without guessing which change record the mutation produced.
+type MutationBarrier struct {
+	Incarnation string `json:"incarnation"`
+	Position    int64  `json:"position"`
+}
+
+// MaxIncarnationBytes is the protocol-wide ceiling for a change-log identity in both stream
+// starts and mutation barriers. A Handler may impose a smaller value so the worst-case JSON
+// escaping fits its configured body and frame limits.
+const MaxIncarnationBytes = 256
+
+const (
+	maxMutationBarrierJSONBytes  = 6*MaxIncarnationBytes + 128
+	maxMutationResponseJSONBytes = maxMutationBarrierJSONBytes + 32
+)
+
+func (b *MutationBarrier) UnmarshalJSON(data []byte) error {
+	if len(data) > maxMutationBarrierJSONBytes {
+		return errors.New("the mutation barrier exceeds its protocol bound")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if fields == nil {
+		return errors.New("the mutation barrier is not an object")
+	}
+	for name := range fields {
+		if name != "incarnation" && name != "position" {
+			return fmt.Errorf("the mutation barrier carries unknown field %q", name)
+		}
+	}
+	var decoded struct {
+		Incarnation json.RawMessage `json:"incarnation"`
+		Position    *int64          `json:"position"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if len(decoded.Incarnation) == 0 || len(decoded.Incarnation) > 6*MaxIncarnationBytes+2 {
+		return errors.New("the mutation barrier carries no bounded log incarnation")
+	}
+	var incarnation string
+	if err := json.Unmarshal(decoded.Incarnation, &incarnation); err != nil {
+		return fmt.Errorf("the mutation barrier incarnation is not a string: %w", err)
+	}
+	if incarnation == "" || len(incarnation) > MaxIncarnationBytes {
+		return errors.New("the mutation barrier names no log incarnation")
+	}
+	if decoded.Position == nil || *decoded.Position < 0 {
+		return errors.New("the mutation barrier carries no valid log position")
+	}
+	*b = MutationBarrier{Incarnation: incarnation, Position: *decoded.Position}
+	return nil
+}
+
+// MutationResponse is the successful response to an operation that may change the
+// namespace. Barrier is absent only when the served namespace has no change log.
+type MutationResponse struct {
+	Barrier *MutationBarrier `json:"barrier,omitempty"`
+}
+
+func (r *MutationResponse) UnmarshalJSON(data []byte) error {
+	if len(data) > maxMutationResponseJSONBytes {
+		return errors.New("the mutation response exceeds its protocol bound")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if fields == nil {
+		return errors.New("the mutation response is not an object")
+	}
+	for name := range fields {
+		if name != "barrier" {
+			return fmt.Errorf("the mutation response carries unknown field %q", name)
+		}
+	}
+	raw, present := fields["barrier"]
+	if !present {
+		*r = MutationResponse{}
+		return nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return errors.New("the mutation response carries a null barrier")
+	}
+	var barrier MutationBarrier
+	if err := json.Unmarshal(raw, &barrier); err != nil {
+		return err
+	}
+	*r = MutationResponse{Barrier: &barrier}
 	return nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 
@@ -12,18 +13,24 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// sweepBatch is how many objects a mutation clears out of the way before returning.
-//
-// Bounded rather than exhaustive: the caller is waiting, and a namespace that has
-// accumulated garbage faster than its writes clear it is one where the alternative is a
-// write that takes as long as the backlog. What this batch does not reach stays recorded,
-// and Sweep exists for a caller that wants to drain it.
+// sweepBatch is the most garbage one metastore query hands to the object store. Bounded
+// queries keep one maintenance step from monopolising the worker; a full background pass
+// queues another, while an explicit Sweep may run several batches up to its caller-supplied
+// limit.
 const sweepBatch = 8
 
-// reserveGrace is how long an object may sit reserved before a sweep may take it as
-// abandoned. It bounds the time between reserving a key and committing it, which is one
-// put of one file's contents; a value this far above that is a value no live write reaches.
-const reserveGrace = time.Hour
+const (
+	// DefaultSweepInterval bounds how long background maintenance normally waits before
+	// retrying recorded garbage.
+	DefaultSweepInterval = time.Minute
+
+	// DefaultSweepBatch bounds the object-store and metastore work performed by one
+	// background maintenance attempt.
+	DefaultSweepBatch = 64
+
+	// MaxSweepBatch prevents one maintenance attempt from becoming effectively unbounded.
+	MaxSweepBatch = 1 << 20
+)
 
 // readAttempts is how many times a read will start over because the file was replaced
 // while it was being fetched. Each retry means another writer got between the two steps of
@@ -37,23 +44,200 @@ type Storage struct {
 	objects Objects
 	meta    metastore.Store
 	now     func() time.Time
+
+	maintenanceStop    context.CancelFunc
+	maintenanceDone    chan struct{}
+	maintenanceTrigger chan struct{}
+	cleanupContext     context.Context
+	stopCleanup        context.CancelFunc
+	sweepPermit        chan struct{}
+	statusMu           sync.Mutex
+	maintenanceStatus  MaintenanceStatus
+	operations         sync.RWMutex
+	closeMu            sync.Mutex
+	closeDone          chan struct{}
+	closeErr           error
 }
 
 var _ storage.Storage = (*Storage)(nil)
+var _ storage.BoundedStorage = (*Storage)(nil)
 
-// New assembles a namespace from the two halves that hold it.
-func New(objects Objects, meta metastore.Store) *Storage {
-	return &Storage{objects: objects, meta: meta, now: time.Now}
+// Options configures storage-owned background maintenance.
+//
+// Both fields are required. Background maintenance is explicit because it owns a goroutine
+// and outlives every request made through the Storage.
+type Options struct {
+	SweepInterval time.Duration
+	SweepBatch    int
 }
 
-// Close releases the metastore. The object store holds nothing that outlives a request.
-func (s *Storage) Close() error { return s.meta.Close() }
+// DefaultOptions returns the bounded background-maintenance defaults. Callers may replace
+// either value before passing the result to NewWithOptions.
+func DefaultOptions() Options {
+	return Options{SweepInterval: DefaultSweepInterval, SweepBatch: DefaultSweepBatch}
+}
+
+// Check validates that one maintenance attempt remains finite and can make progress.
+func (o Options) Check() error {
+	if o.SweepInterval <= 0 {
+		return fmt.Errorf("the sweep interval %v is not positive: %w", o.SweepInterval, syscall.EINVAL)
+	}
+	if o.SweepBatch <= 0 {
+		return fmt.Errorf("the sweep batch %d is not positive: %w", o.SweepBatch, syscall.EINVAL)
+	}
+	if o.SweepBatch > MaxSweepBatch {
+		return fmt.Errorf("the sweep batch %d exceeds the finite maximum %d: %w", o.SweepBatch, MaxSweepBatch, syscall.EINVAL)
+	}
+	return nil
+}
+
+// MaintenanceStatus is the result of the most recent sweep attempt. A zero LastSweepTime
+// means no attempt has completed yet. LastSweepError is cleared by a later successful sweep,
+// so it describes the current maintenance outcome rather than an historical error log.
+type MaintenanceStatus struct {
+	LastSweepTime    time.Time
+	LastSweepRemoved int
+	LastSweepError   error
+}
+
+// New assembles a namespace from the two halves that hold it and takes ownership of both.
+// It uses DefaultOptions, so committed mutations trigger prompt bounded cleanup and the
+// periodic pass retries retained garbage after transient failures or a quiet restart.
+func New(objects Objects, meta metastore.Store) *Storage {
+	options := DefaultOptions()
+	return newStorage(objects, meta, options.SweepInterval, options.SweepBatch)
+}
+
+// NewWithOptions assembles a namespace whose sweeper is owned by the returned Storage. A
+// successful call takes ownership of objects and meta; a failed call leaves both with the
+// caller. The sweeper uses a storage-lifetime context, so cancellation of the request which
+// caused garbage does not cancel its later cleanup.
+func NewWithOptions(objects Objects, meta metastore.Store, options Options) (*Storage, error) {
+	if err := options.Check(); err != nil {
+		return nil, err
+	}
+
+	return newStorage(objects, meta, options.SweepInterval, options.SweepBatch), nil
+}
+
+func newStorage(objects Objects, meta metastore.Store, interval time.Duration, batch int) *Storage {
+	lifetime, stop := context.WithCancel(context.Background())
+	cleanupContext, stopCleanup := context.WithCancel(context.Background())
+	s := &Storage{
+		objects:            objects,
+		meta:               meta,
+		now:                time.Now,
+		maintenanceStop:    stop,
+		maintenanceDone:    make(chan struct{}),
+		maintenanceTrigger: make(chan struct{}, 1),
+		cleanupContext:     cleanupContext,
+		stopCleanup:        stopCleanup,
+		sweepPermit:        make(chan struct{}, 1),
+	}
+	s.sweepPermit <- struct{}{}
+	go s.maintain(lifetime, interval, batch)
+	s.sweepAfterMutation()
+	return s
+}
+
+// Close stops storage-owned maintenance, waits for every sweep already in progress, and
+// releases both durable halves. The metastore closes first while object-store ownership is
+// still held; both close failures are returned. Concurrent callers receive the same result.
+func (s *Storage) Close() error {
+	s.closeMu.Lock()
+	if s.closeDone != nil {
+		done := s.closeDone
+		s.closeMu.Unlock()
+		<-done
+		return s.closeErr
+	}
+	s.closeDone = make(chan struct{})
+	done := s.closeDone
+	s.closeMu.Unlock()
+
+	s.maintenanceStop()
+	s.stopCleanup()
+	<-s.maintenanceDone
+	// Every public operation holds this gate across all metastore and object-store steps.
+	// Marking the storage closed above refuses new entrants; the write lock waits for those
+	// already admitted before either durable half is released.
+	s.operations.Lock()
+
+	metaErr := s.meta.Close()
+	objectsErr := s.objects.Close()
+	err := errors.Join(wrapClose("metastore", metaErr), wrapClose("object store", objectsErr))
+	s.operations.Unlock()
+
+	s.closeMu.Lock()
+	s.closeErr = err
+	close(done)
+	s.closeMu.Unlock()
+	return err
+}
+
+func wrapClose(what string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("closing the %s: %w", what, err)
+}
+
+func (s *Storage) maintain(ctx context.Context, interval time.Duration, batch int) {
+	defer close(s.maintenanceDone)
+	var ticks <-chan time.Time
+	var ticker *time.Ticker
+	if interval > 0 {
+		ticker = time.NewTicker(interval)
+		ticks = ticker.C
+		defer ticker.Stop()
+	}
+	for {
+		select {
+		case <-s.maintenanceTrigger:
+			s.maintainBatch(ctx, batch)
+		case <-ticks:
+			s.maintainBatch(ctx, batch)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *Storage) maintainBatch(ctx context.Context, batch int) {
+	removed, err := s.runBackgroundSweep(ctx, batch)
+	if err == nil && removed == batch {
+		s.sweepAfterMutation()
+	}
+}
+
+// MaintenanceStatus returns a snapshot of the most recent sweep outcome.
+func (s *Storage) MaintenanceStatus() MaintenanceStatus {
+	s.statusMu.Lock()
+	defer s.statusMu.Unlock()
+	return s.maintenanceStatus
+}
+
+func (s *Storage) beginOperation() error {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if s.closeDone != nil {
+		return fmt.Errorf("the object-store namespace is closed: %w", syscall.EIO)
+	}
+	s.operations.RLock()
+	return nil
+}
+
+func (s *Storage) endOperation() { s.operations.RUnlock() }
 
 func (s *Storage) Stat(ctx context.Context, path string) (storage.Attr, error) {
 	cleaned, err := storage.CleanPath(path)
 	if err != nil {
 		return storage.Attr{}, &os.PathError{Op: "stat", Path: path, Err: err}
 	}
+	if err := s.beginOperation(); err != nil {
+		return storage.Attr{}, &os.PathError{Op: "stat", Path: path, Err: err}
+	}
+	defer s.endOperation()
 	node, err := s.meta.Stat(ctx, cleaned)
 	if err != nil {
 		return storage.Attr{}, err
@@ -69,7 +253,23 @@ func (s *Storage) SetAttr(ctx context.Context, path string, change storage.AttrC
 	if err := change.Check(); err != nil {
 		return &os.PathError{Op: "setattr", Path: path, Err: err}
 	}
+	if err := s.beginOperation(); err != nil {
+		return &os.PathError{Op: "setattr", Path: path, Err: err}
+	}
+	defer s.endOperation()
 	return s.meta.SetAttr(ctx, cleaned, change)
+}
+
+// CheckBounded verifies that neither durable half requires an unbounded intermediate for
+// ReadBounded or ListBounded. A handler calls this before accepting requests.
+func (s *Storage) CheckBounded() error {
+	if _, ok := s.objects.(BoundedObjects); !ok {
+		return errors.New("the object backend does not implement bounded reads")
+	}
+	if _, ok := s.meta.(metastore.BoundedLister); !ok {
+		return errors.New("the metastore does not implement bounded listings")
+	}
+	return nil
 }
 
 func (s *Storage) List(ctx context.Context, path string) ([]storage.Entry, error) {
@@ -77,6 +277,10 @@ func (s *Storage) List(ctx context.Context, path string) ([]storage.Entry, error
 	if err != nil {
 		return nil, &os.PathError{Op: "list", Path: path, Err: err}
 	}
+	if err := s.beginOperation(); err != nil {
+		return nil, &os.PathError{Op: "list", Path: path, Err: err}
+	}
+	defer s.endOperation()
 	children, err := s.meta.List(ctx, cleaned)
 	if err != nil {
 		return nil, err
@@ -86,6 +290,34 @@ func (s *Storage) List(ctx context.Context, path string) ([]storage.Entry, error
 		entries[i] = storage.Entry{Name: string(c.Name), Attr: c.Node.Attr()}
 	}
 	return entries, nil
+}
+
+// ListBounded converts children directly from one metastore query into the caller's
+// bounded result. No complete []metastore.Child exists beside the returned entries.
+func (s *Storage) ListBounded(ctx context.Context, path string, result *storage.ListResult) (returned error) {
+	if result != nil {
+		defer func() {
+			if returned != nil {
+				result.Fail(returned)
+			}
+		}()
+	}
+	cleaned, err := storage.CleanPath(path)
+	if err != nil {
+		return &os.PathError{Op: "list", Path: path, Err: err}
+	}
+	if result == nil {
+		return &os.PathError{Op: "list", Path: path, Err: syscall.EINVAL}
+	}
+	lister, ok := s.meta.(metastore.BoundedLister)
+	if !ok {
+		return &os.PathError{Op: "list", Path: path, Err: syscall.ENOSYS}
+	}
+	if err := s.beginOperation(); err != nil {
+		return &os.PathError{Op: "list", Path: path, Err: err}
+	}
+	defer s.endOperation()
+	return lister.ListBounded(ctx, cleaned, result)
 }
 
 // Read returns the whole contents of the file at path.
@@ -104,10 +336,28 @@ func (s *Storage) List(ctx context.Context, path string) ([]storage.Entry, error
 // it names the same one, something that should exist does not, and that is reported rather
 // than retried, because no number of retries will make it appear.
 func (s *Storage) Read(ctx context.Context, path string) ([]byte, error) {
+	return s.read(ctx, path, nil)
+}
+
+// ReadBounded refuses a file from its metastore size before asking the object store for
+// bytes, then gives the same bound to the object backend so corrupted or inconsistent
+// object metadata cannot trigger a larger allocation below this layer.
+func (s *Storage) ReadBounded(ctx context.Context, path string, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return nil, &os.PathError{Op: "read", Path: path, Err: syscall.EINVAL}
+	}
+	return s.read(ctx, path, &maxBytes)
+}
+
+func (s *Storage) read(ctx context.Context, path string, maxBytes *int64) ([]byte, error) {
 	cleaned, err := storage.CleanPath(path)
 	if err != nil {
 		return nil, &os.PathError{Op: "read", Path: path, Err: err}
 	}
+	if err := s.beginOperation(); err != nil {
+		return nil, &os.PathError{Op: "read", Path: path, Err: err}
+	}
+	defer s.endOperation()
 	missing := metastore.Key("")
 	for attempt := 0; ; attempt++ {
 		node, err := s.meta.Stat(ctx, cleaned)
@@ -118,22 +368,39 @@ func (s *Storage) Read(ctx context.Context, path string) ([]byte, error) {
 		case node.IsDir():
 			return nil, &os.PathError{Op: "read", Path: path, Err: syscall.EISDIR}
 		case node.Content == "":
+			if node.Size != 0 {
+				return nil, fmt.Errorf("the contents of %s have size %d but no object: %w", path, node.Size, syscall.EIO)
+			}
 			return nil, nil
 		case node.Content == missing:
 			return nil, fmt.Errorf("the contents of %s are recorded under an object the store does not have: %w", path, syscall.EIO)
 		}
+		if maxBytes != nil && node.Size > *maxBytes {
+			return nil, fmt.Errorf("the file contains %d bytes, above the result limit of %d: %w", node.Size, *maxBytes, syscall.EFBIG)
+		}
 
-		content, err := s.objects.Get(ctx, string(node.Content))
+		var content []byte
+		if maxBytes == nil {
+			content, err = s.objects.Get(ctx, string(node.Content))
+		} else if bounded, ok := s.objects.(BoundedObjects); ok {
+			content, err = bounded.GetBounded(ctx, string(node.Content), *maxBytes)
+		} else {
+			return nil, fmt.Errorf("the object backend cannot enforce a bounded read: %w", syscall.ENOSYS)
+		}
 		switch {
 		case err == nil:
+			if int64(len(content)) != node.Size {
+				return nil, fmt.Errorf("the contents of %s are %d bytes but the namespace records %d: %w",
+					path, len(content), node.Size, syscall.EIO)
+			}
 			return content, nil
-		case !errors.Is(err, syscall.ENOENT):
+		case !isOnly(err, syscall.ENOENT):
 			// The tree named an object and the object store could not produce it. That is not
 			// "the file is not there" — the file is there, and its bytes are what could not be
 			// reached. Reporting it as absence is the fabricated answer R-ERR-2 forbids, and
 			// R-ERR-6 says a storage assembled from parts that fail separately answers for the
 			// part that failed.
-			return nil, fmt.Errorf("reading the contents of %s: %w", path, err)
+			return nil, objectFailure("reading", path, err)
 		case attempt == readAttempts:
 			// Every attempt lost the same race to a different write. Answering with a report
 			// that the file could not be read is worse than useless here — the file is there
@@ -159,14 +426,21 @@ func (s *Storage) Read(ctx context.Context, path string) ([]byte, error) {
 // bytes are sent rather than after. The commit refuses it again, and that one is the
 // authority; this one only keeps a caller from paying to upload what will not be kept.
 //
-// A failure after the put and before the commit leaves an object nothing references. It
-// costs storage until a sweep reaches it and costs nothing else — no name points at it, so
-// nothing can read it, and the namespace is what it was before the write began.
+// Put success is the proof that this reservation created the object under its key. A Put
+// error provides no such proof: the key is quarantined as unresolved and is never offered
+// to deletion, including when the error is EEXIST or the response was lost after the
+// request may have landed. Once Put has succeeded, a failed commit may safely abandon the
+// object for collection. An ambiguously successful commit refuses abandonment as
+// referenced, preserving the object the tree may already name.
 func (s *Storage) Write(ctx context.Context, path string, content []byte) error {
 	cleaned, err := storage.CleanPath(path)
 	if err != nil {
 		return &os.PathError{Op: "write", Path: path, Err: err}
 	}
+	if err := s.beginOperation(); err != nil {
+		return &os.PathError{Op: "write", Path: path, Err: err}
+	}
+	defer s.endOperation()
 
 	object := metastore.Object{Size: int64(len(content)), ModTime: s.now()}
 	if len(content) > 0 {
@@ -176,16 +450,166 @@ func (s *Storage) Write(ctx context.Context, path string, content []byte) error 
 		}
 		digest, err := s.objects.Put(ctx, string(key), content)
 		if err != nil {
-			return fmt.Errorf("storing the contents of %s: %w", path, err)
+			return s.quarantine(path, key, objectFailure("storing", path, err))
 		}
 		object.Key, object.Digest = key, digest
 	}
 
 	if err := s.meta.Commit(ctx, cleaned, object); err != nil {
+		if object.Key != "" {
+			return s.abandon(path, object.Key, err)
+		}
 		return err
 	}
-	s.sweep(ctx, sweepBatch)
+	s.sweepAfterMutation()
 	return nil
+}
+
+func (s *Storage) abandon(path string, key metastore.Key, operationErr error) error {
+	abandonErr := s.meta.Abandon(s.cleanupContext, key)
+	s.sweepAfterMutation()
+	if abandonErr == nil {
+		return operationErr
+	}
+	if isNamespaceFact(abandonErr) {
+		operationErr = ambiguousCommitFailure(path, operationErr)
+	}
+	return errors.Join(operationErr,
+		internalFailure("abandoning", path, abandonErr))
+}
+
+func (s *Storage) quarantine(path string, key metastore.Key, operationErr error) error {
+	quarantineErr := s.meta.Quarantine(s.cleanupContext, key)
+	if quarantineErr == nil {
+		return operationErr
+	}
+	return errors.Join(operationErr,
+		internalFailure("quarantining", path, quarantineErr))
+}
+
+func objectFailure(action, path string, err error) error {
+	if isNamespaceFact(err) {
+		return sanitizeFailure(
+			fmt.Sprintf("%s the contents of %s failed with an object-key result", action, path),
+			err, isNamespaceFact,
+		)
+	}
+	return fmt.Errorf("%s the contents of %s: %w", action, path, err)
+}
+
+func internalFailure(action, path string, err error) error {
+	if isNamespaceFact(err) {
+		return sanitizeFailure(
+			fmt.Sprintf("%s the object reserved for %s reached an internal state", action, path),
+			err, isNamespaceFact,
+		)
+	}
+	return fmt.Errorf("%s the object reserved for %s: %w", action, path, err)
+}
+
+func ambiguousCommitFailure(path string, err error) error {
+	return sanitizeFailure(
+		fmt.Sprintf("the commit outcome for %s is unknown", path),
+		err,
+		func(err error) bool {
+			var errno syscall.Errno
+			return errors.As(err, &errno)
+		},
+	)
+}
+
+func sanitizeFailure(description string, err error, reject func(error) bool) error {
+	return &sanitizedFailureError{
+		message:     fmt.Sprintf("%s (%v): %v", description, err, syscall.EIO),
+		retained:    acceptedSubtrees(err, reject),
+		diagnostics: classifiedSubtrees(err, reject),
+	}
+}
+
+type sanitizedFailureError struct {
+	message     string
+	retained    []error
+	diagnostics []error
+}
+
+func (e *sanitizedFailureError) Error() string { return e.message }
+
+func (e *sanitizedFailureError) Unwrap() []error {
+	return append([]error{syscall.EIO}, e.retained...)
+}
+
+func (e *sanitizedFailureError) As(target any) bool {
+	if _, asksForErrno := target.(*syscall.Errno); asksForErrno {
+		return false
+	}
+	for _, diagnostic := range e.diagnostics {
+		if errors.As(diagnostic, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func acceptedSubtrees(err error, reject func(error) bool) []error {
+	if err == nil {
+		return nil
+	}
+	if !reject(err) {
+		return []error{err}
+	}
+	// A classified error deliberately separates its safe public rendering from diagnostic
+	// causes retained for errors.As. Once its classification is rejected, unwrapping those
+	// causes here would bypass that rendering and expose transport dumps through errors.Join.
+	if _, ok := err.(interface{ Classification() error }); ok {
+		return nil
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var accepted []error
+		for _, child := range joined.Unwrap() {
+			accepted = append(accepted, acceptedSubtrees(child, reject)...)
+		}
+		return accepted
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return acceptedSubtrees(wrapped.Unwrap(), reject)
+	}
+	return nil
+}
+
+func classifiedSubtrees(err error, reject func(error) bool) []error {
+	if err == nil || !reject(err) {
+		return nil
+	}
+	if _, ok := err.(interface{ Classification() error }); ok {
+		return []error{err}
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var classified []error
+		for _, child := range joined.Unwrap() {
+			classified = append(classified, classifiedSubtrees(child, reject)...)
+		}
+		return classified
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return classifiedSubtrees(wrapped.Unwrap(), reject)
+	}
+	return nil
+}
+
+func isNamespaceFact(err error) bool {
+	for _, errno := range []syscall.Errno{
+		syscall.ENOENT,
+		syscall.EEXIST,
+		syscall.EISDIR,
+		syscall.ENOTDIR,
+		syscall.ENOTEMPTY,
+		syscall.EINVAL,
+	} {
+		if errors.Is(err, errno) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Storage) Create(ctx context.Context, path string) error {
@@ -193,6 +617,10 @@ func (s *Storage) Create(ctx context.Context, path string) error {
 	if err != nil {
 		return &os.PathError{Op: "create", Path: path, Err: err}
 	}
+	if err := s.beginOperation(); err != nil {
+		return &os.PathError{Op: "create", Path: path, Err: err}
+	}
+	defer s.endOperation()
 	return s.meta.Create(ctx, cleaned)
 }
 
@@ -201,6 +629,10 @@ func (s *Storage) Mkdir(ctx context.Context, path string) error {
 	if err != nil {
 		return &os.PathError{Op: "mkdir", Path: path, Err: err}
 	}
+	if err := s.beginOperation(); err != nil {
+		return &os.PathError{Op: "mkdir", Path: path, Err: err}
+	}
+	defer s.endOperation()
 	return s.meta.Mkdir(ctx, cleaned)
 }
 
@@ -209,10 +641,14 @@ func (s *Storage) Remove(ctx context.Context, path string) error {
 	if err != nil {
 		return &os.PathError{Op: "remove", Path: path, Err: err}
 	}
+	if err := s.beginOperation(); err != nil {
+		return &os.PathError{Op: "remove", Path: path, Err: err}
+	}
+	defer s.endOperation()
 	if err := s.meta.Remove(ctx, cleaned); err != nil {
 		return err
 	}
-	s.sweep(ctx, sweepBatch)
+	s.sweepAfterMutation()
 	return nil
 }
 
@@ -221,6 +657,10 @@ func (s *Storage) RemoveDir(ctx context.Context, path string) error {
 	if err != nil {
 		return &os.PathError{Op: "removedir", Path: path, Err: err}
 	}
+	if err := s.beginOperation(); err != nil {
+		return &os.PathError{Op: "removedir", Path: path, Err: err}
+	}
+	defer s.endOperation()
 	return s.meta.RemoveDir(ctx, cleaned)
 }
 
@@ -233,15 +673,81 @@ func (s *Storage) Rename(ctx context.Context, from, to string) error {
 	if err != nil {
 		return &os.PathError{Op: "rename", Path: to, Err: err}
 	}
+	if err := s.beginOperation(); err != nil {
+		return &os.LinkError{Op: "rename", Old: from, New: to, Err: err}
+	}
+	defer s.endOperation()
 	if err := s.meta.Rename(ctx, cleanFrom, cleanTo); err != nil {
 		return err
 	}
-	s.sweep(ctx, sweepBatch)
+	s.sweepAfterMutation()
 	return nil
 }
 
 func (s *Storage) Space(ctx context.Context) (storage.Space, error) {
-	return s.meta.Space(ctx)
+	if err := s.beginOperation(); err != nil {
+		return storage.Space{}, err
+	}
+	defer s.endOperation()
+	space, err := s.meta.Space(ctx)
+	if err != nil {
+		return storage.Space{}, err
+	}
+	if !space.Coherent() {
+		return storage.Space{}, fmt.Errorf("the metastore reports a total of %d bytes with %d used and %d available, which cannot be true of anything: %w",
+			space.Total, space.Used, space.Avail, syscall.EIO)
+	}
+
+	available, err := s.objects.Available(ctx)
+	switch {
+	case isOnly(err, syscall.ENOSYS):
+		return space, nil
+	case err != nil:
+		return storage.Space{}, fmt.Errorf("measuring the object store's available space: %w", err)
+	case available < 0:
+		return storage.Space{}, fmt.Errorf("the object store reports %d available bytes, which cannot be true of anything: %w",
+			available, syscall.EIO)
+	default:
+		space.Avail = min(space.Avail, available)
+		return space, nil
+	}
+}
+
+// isOnly reports whether every leaf in err is target. errors.Is alone is not enough for an
+// unsupported-capability decision: a joined ENOSYS and I/O failure carries ENOSYS, but it
+// also carries the failure that must not be hidden behind the quota figure.
+func isOnly(err, target error) bool {
+	return onlyLeaves(err, target)
+}
+
+func onlyLeaves(err error, targets ...error) bool {
+	if err == nil {
+		return false
+	}
+	if classified, ok := err.(interface{ Classification() error }); ok {
+		return onlyLeaves(classified.Classification(), targets...)
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !onlyLeaves(child, targets...) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return onlyLeaves(wrapped.Unwrap(), targets...)
+	}
+	for _, target := range targets {
+		if err == target {
+			return true
+		}
+	}
+	return false
 }
 
 // Sweep deletes objects nothing references and forgets them, until it runs out or reaches
@@ -251,10 +757,59 @@ func (s *Storage) Space(ctx context.Context) (storage.Space, error) {
 // the mutations clear only a batch each, so a namespace that was written to by a process
 // that then died has a backlog nobody is walking.
 func (s *Storage) Sweep(ctx context.Context, limit int) (int, error) {
+	if limit < 0 {
+		return 0, fmt.Errorf("the sweep limit %d is negative: %w", limit, syscall.EINVAL)
+	}
+	if err := s.beginOperation(); err != nil {
+		return 0, err
+	}
+	defer s.endOperation()
+	if limit == 0 {
+		return 0, nil
+	}
+	if err := s.acquireSweep(ctx); err != nil {
+		return 0, err
+	}
+	defer s.releaseSweep()
+	return s.runSweepLocked(ctx, limit)
+}
+
+func (s *Storage) runBackgroundSweep(ctx context.Context, limit int) (int, error) {
+	if err := s.acquireSweep(ctx); err != nil {
+		return 0, err
+	}
+	defer s.releaseSweep()
+	return s.runSweepLocked(ctx, limit)
+}
+
+func (s *Storage) acquireSweep(ctx context.Context) error {
+	select {
+	case <-s.sweepPermit:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Storage) releaseSweep() { s.sweepPermit <- struct{}{} }
+
+func (s *Storage) runSweepLocked(ctx context.Context, limit int) (int, error) {
+	removed, err := s.sweep(ctx, limit)
+	s.statusMu.Lock()
+	s.maintenanceStatus = MaintenanceStatus{
+		LastSweepTime:    s.now(),
+		LastSweepRemoved: removed,
+		LastSweepError:   err,
+	}
+	s.statusMu.Unlock()
+	return removed, err
+}
+
+func (s *Storage) sweep(ctx context.Context, limit int) (int, error) {
 	removed := 0
 	for removed < limit {
 		batch := min(limit-removed, sweepBatch)
-		keys, err := s.meta.Garbage(ctx, batch, reserveGrace)
+		keys, err := s.meta.Garbage(ctx, batch)
 		if err != nil {
 			return removed, err
 		}
@@ -275,20 +830,18 @@ func (s *Storage) Sweep(ctx context.Context, limit int) (int, error) {
 	return removed, nil
 }
 
-// sweep clears what it can and reports nothing.
+// sweepAfterMutation asks the storage-owned worker to clear a bounded batch.
 //
-// It is called after a mutation has already succeeded, where a failure to delete an object
-// is not a failure of the operation the caller made: the write happened, the name points
-// where it should, and the only casualty is that some bytes nobody references are still
-// being paid for. That failure is not lost — the record that named them is still there, so
-// the next mutation or the next Sweep tries again. State carries the retry, which is why
-// there is nothing here to return.
-func (s *Storage) sweep(ctx context.Context, limit int) {
-	keys, err := s.meta.Garbage(ctx, limit, reserveGrace)
-	if err != nil || len(keys) == 0 {
-		return
+// It is called whenever a successful namespace edit or a failed write can have produced
+// garbage, so neither outcome waits for unrelated object deletion. The one-place buffer
+// coalesces a burst, and a signal arriving while a sweep runs remains buffered for the next
+// batch. Failures are retained in MaintenanceStatus, while the metastore record keeps the
+// garbage eligible for later retry.
+func (s *Storage) sweepAfterMutation() {
+	select {
+	case s.maintenanceTrigger <- struct{}{}:
+	default:
 	}
-	s.discard(ctx, keys)
 }
 
 // discard deletes the objects behind keys and forgets the ones that are gone, returning how
@@ -305,8 +858,8 @@ func (s *Storage) discard(ctx context.Context, keys []metastore.Key) (int, error
 		gone = append(gone, key)
 	}
 	if len(gone) > 0 {
-		if err := s.meta.Forget(ctx, gone); err != nil && failure == nil {
-			failure = err
+		if err := s.meta.Forget(ctx, gone); err != nil {
+			failure = errors.Join(failure, err)
 		}
 	}
 	return len(gone), failure

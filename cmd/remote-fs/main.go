@@ -69,6 +69,17 @@ func run(args []string, errOut io.Writer) error {
 		"removed when the mountpoint is detached. The default is the system\n"+
 		"temporary directory, which on many systems is held in memory — give a path\n"+
 		"on disk for a workspace whose tree is large.")
+	confirmationDefaults := replicated.DefaultOptions()
+	confirmationGrace := flags.Duration("confirmation-grace", confirmationDefaults.ConfirmationGrace,
+		"maximum time a successful mutation waits for its replication barrier before failing with EIO")
+	maxActiveConfirmations := flags.Int("max-active-mutation-confirmations", confirmationDefaults.MaxActiveConfirmations,
+		"maximum mutations concurrently retaining fixed-size confirmation state")
+	maxWaitingConfirmations := flags.Int("max-waiting-mutation-confirmations", confirmationDefaults.MaxWaitingConfirmations,
+		"maximum callers waiting for mutation confirmation capacity; additional mutations fail with EAGAIN")
+	dialDefaults := httprest.DefaultDialOptions()
+	maxHTTPFrameBytes := clientPositiveSizeFlag{bytes: dialDefaults.MaxFrameBytes}
+	flags.Var(&maxHTTPFrameBytes, "http-max-frame-bytes",
+		"maximum encoded replication frame retained by the client, as SIZE")
 	debug := flags.Bool("debug", false, "trace every kernel request and reply to standard error")
 	flags.Usage = func() {
 		fmt.Fprint(errOut, "usage: remote-fs -server URL -mountpoint DIR\n\n"+
@@ -100,8 +111,16 @@ func run(args []string, errOut io.Writer) error {
 	if *timeout <= 0 {
 		return fmt.Errorf("-timeout must be positive, not %v", *timeout)
 	}
+	confirmationOptions := replicated.Options{
+		ConfirmationGrace:       *confirmationGrace,
+		MaxActiveConfirmations:  *maxActiveConfirmations,
+		MaxWaitingConfirmations: *maxWaitingConfirmations,
+	}
+	if err := confirmationOptions.Check(); err != nil {
+		return fmt.Errorf("invalid mutation confirmation limits: %w", err)
+	}
 
-	namespace, err := httprest.Dial(*serverURL, callerClient(*timeout))
+	namespace, err := dialNamespace(*serverURL, *timeout, maxHTTPFrameBytes.bytes)
 	if err != nil {
 		return err
 	}
@@ -121,7 +140,7 @@ func run(args []string, errOut io.Writer) error {
 		return fmt.Errorf("the namespace at %s cannot be reached: %w", *serverURL, err)
 	}
 
-	served, release, err := replicate(ctx, namespace, *replicaDir, errOut)
+	served, release, err := replicateWithOptions(ctx, namespace, *replicaDir, errOut, confirmationOptions)
 	if err != nil {
 		return err
 	}
@@ -157,6 +176,12 @@ func callerClient(timeout time.Duration) *http.Client {
 	return &http.Client{Timeout: timeout, Transport: transport}
 }
 
+func dialNamespace(baseURL string, timeout time.Duration, maxFrameBytes int64) (*httprest.Storage, error) {
+	options := httprest.DefaultDialOptions()
+	options.MaxFrameBytes = maxFrameBytes
+	return httprest.DialWithOptions(baseURL, callerClient(timeout), options)
+}
+
 // replicate builds the local copy of the namespace's metadata, and returns the storage the
 // mountpoint is served from together with what releases it.
 //
@@ -173,6 +198,19 @@ func callerClient(timeout time.Duration) *http.Client {
 // this namespace will never be replicable, the other says the server might answer in a
 // moment.
 func replicate(ctx context.Context, namespace *httprest.Storage, where string, errOut io.Writer) (storage.Storage, func(), error) {
+	return replicateWithOptions(ctx, namespace, where, errOut, replicated.DefaultOptions())
+}
+
+func replicateWithOptions(
+	ctx context.Context,
+	namespace *httprest.Storage,
+	where string,
+	errOut io.Writer,
+	options replicated.Options,
+) (storage.Storage, func(), error) {
+	if err := options.Check(); err != nil {
+		return nil, nil, fmt.Errorf("invalid mutation confirmation limits: %w", err)
+	}
 	dir, database, err := privateDatabase(where)
 	if err != nil {
 		return nil, nil, err
@@ -190,7 +228,7 @@ func replicate(ctx context.Context, namespace *httprest.Storage, where string, e
 	}
 
 	started := time.Now()
-	served, err := replicated.New(ctx, replica, namespace)
+	served, err := replicated.NewWithOptions(ctx, replica, namespace, options)
 	switch {
 	case errors.Is(err, syscall.ENOSYS):
 		replica.Close()

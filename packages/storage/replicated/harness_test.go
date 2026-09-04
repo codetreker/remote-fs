@@ -78,9 +78,13 @@ func serveWithAllowance(t *testing.T, limits httprest.Limits, allowance int64) *
 	if err != nil {
 		t.Fatalf("opening the namespace's metastore: %v", err)
 	}
-	t.Cleanup(func() { meta.Close() })
 
 	backing := objectstore.New(memory.New(), meta)
+	t.Cleanup(func() {
+		if err := backing.Close(); err != nil {
+			t.Errorf("closing the namespace: %v", err)
+		}
+	})
 	handler, err := httprest.NewHandlerWithLimits(backing, meta, limits)
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
@@ -334,13 +338,22 @@ type heldBack struct {
 }
 
 func (h *heldBack) Write(p []byte) (int, error) {
-	time.Sleep(h.delay)
 	return h.ResponseWriter.Write(p)
 }
 
-// mount is mount, with the bound on how long a caller waits for its own change given rather
-// than defaulted.
+func (h *heldBack) Flush() {
+	time.Sleep(h.delay)
+	h.ResponseWriter.(http.Flusher).Flush()
+}
+
+// mountWithGrace is mount with an explicit mutation-barrier confirmation bound.
 func mountWithGrace(t *testing.T, s *served, grace time.Duration) (*replicated.Storage, *sqlite.Replica) {
+	options := replicated.DefaultOptions()
+	options.ConfirmationGrace = grace
+	return mountWithOptions(t, s, options)
+}
+
+func mountWithOptions(t *testing.T, s *served, options replicated.Options) (*replicated.Storage, *sqlite.Replica) {
 	t.Helper()
 
 	replica, err := sqlite.OpenReplica(t.Context(), path.Join(t.TempDir(), "replica.db"))
@@ -351,7 +364,7 @@ func mountWithGrace(t *testing.T, s *served, grace time.Duration) (*replicated.S
 	if err != nil {
 		t.Fatalf("dialling the namespace: %v", err)
 	}
-	mounted, err := replicated.NewWithEchoGrace(t.Context(), replica, remote, grace)
+	mounted, err := replicated.NewWithOptions(t.Context(), replica, remote, options)
 	if err != nil {
 		replica.Close()
 		t.Fatalf("building the copy: %v", err)

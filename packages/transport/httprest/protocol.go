@@ -48,7 +48,7 @@ import (
 const (
 	// Prefix begins the URL path of every request, relative to wherever the handler is
 	// mounted. The version segment is the place a future incompatible change lands.
-	Prefix = "/v1/"
+	Prefix = "/v2/"
 
 	// HeaderProtocol names the response header that identifies an answer as having come
 	// from a handler speaking this protocol, and Version is its only accepted value.
@@ -59,12 +59,13 @@ const (
 	// it never reached the handler. Requiring a header the intermediary does not know
 	// about closes that.
 	HeaderProtocol = "Remote-Fs-Protocol"
-	Version        = "1"
+	Version        = "2"
 
-	// StatusStorageError marks the one response that carries a storage error: the
-	// request reached the storage and the storage refused it. The errno itself travels
-	// in the body, because the status space does not map onto errno and any mapping
-	// would collapse cases the caller has to keep apart.
+	// StatusStorageError marks the one response that carries an operation outcome in the
+	// storage contract's errno vocabulary. Most come from the storage. A handler-owned
+	// bound may also refuse an operation before storage is called when the refusal is
+	// already exact — EFBIG for a write whose body is too large, for example. The errno
+	// travels in the body because the status space cannot preserve these distinctions.
 	//
 	// Every other non-200 status means the operation's outcome is unknown.
 	StatusStorageError = http.StatusUnprocessableEntity
@@ -129,9 +130,9 @@ const (
 type opSpec struct {
 	method   string
 	operands []string
-	// body is the media type of the request body, and empty for an operation that sends
-	// none. Two operations send one, and they send different things: the contents of a
-	// file are bytes nobody may reinterpret, an attribute change is a document.
+	// body is the media type of the request body, and empty for an operation that requires
+	// an empty body. Two operations send one, and they send different things: the contents
+	// of a file are bytes nobody may reinterpret, an attribute change is a document.
 	body string
 }
 

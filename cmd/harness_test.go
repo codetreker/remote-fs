@@ -80,8 +80,13 @@ func serveNamespace(t *testing.T) *namespaceServer {
 	if err != nil {
 		t.Fatalf("opening the namespace's metastore: %v", err)
 	}
-	t.Cleanup(func() { meta.Close() })
-	return serveStorage(t, objectstore.New(memory.New(), meta), meta, "")
+	namespace := objectstore.New(memory.New(), meta)
+	t.Cleanup(func() {
+		if err := namespace.Close(); err != nil {
+			t.Errorf("closing the namespace: %v", err)
+		}
+	})
+	return serveStorage(t, namespace, meta, "")
 }
 
 // serveDirectory starts a server over a fresh directory and returns once it is listening.

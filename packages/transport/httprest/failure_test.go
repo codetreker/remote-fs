@@ -200,10 +200,9 @@ func TestAnswersThatAreNotThisProtocol(t *testing.T) {
 // A response that is marked as this protocol's and carries a status of success, but
 // whose body is not the answer the operation asked for.
 //
-// Stat, List and Space catch it by failing to read the body. The operations that change
-// the namespace catch it because their answer is an empty body and nothing else — they
-// have no other evidence, and a change reported as done that never happened is not
-// recoverable. Read is absent on purpose: a file holds arbitrary bytes, so once the
+// Stat, List and Space catch it by failing to read the body. Mutations require an exact JSON
+// response object, optionally carrying a valid replication barrier. Read is absent on purpose:
+// a file holds arbitrary bytes, so once the
 // response is marked and its declared length checks out, the body is the answer.
 func TestABodyThatIsNotTheAnswer(t *testing.T) {
 	cases := []struct {
@@ -238,10 +237,6 @@ func TestABodyThatIsNotTheAnswer(t *testing.T) {
 				t.Fatalf("space reported %+v instead of a failure", space)
 			}
 
-			if c.body == "" {
-				// An empty body is what a successful change actually answers with.
-				return
-			}
 			requireUnreachable(t, s.SetAttr(ctx, "f", storage.AttrChange{}))
 			requireUnreachable(t, s.Write(ctx, "f", []byte("x")))
 			requireUnreachable(t, s.Create(ctx, "f"))
