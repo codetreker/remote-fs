@@ -636,13 +636,13 @@ func TestAPictureMayTakeLongerThanTheStreamIsAllowedToBeQuiet(t *testing.T) {
 // reaches the reconnect that is the only thing that clears the failure, and the mount answers
 // EIO for the rest of its life.
 func TestACallerThatCannotConfirmItsChangeLeavesTheMountWorking(t *testing.T) {
-	const grace = 200 * time.Millisecond
+	const grace = 2 * time.Second
 
 	s := serve(t, httprest.DefaultLimits())
 	write(t, s, "before.txt", "here before the mount")
 	// Every frame of the change stream is held back longer than the confirmation grace, so
 	// the copy cannot reach the mutation's barrier in time.
-	s.events.slowEvents(2 * grace)
+	s.events.slowEvents(3 * time.Second)
 
 	mounted, replica := mountWithGrace(t, s, grace)
 
