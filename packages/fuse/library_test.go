@@ -153,6 +153,10 @@ func TestErrnoOf(t *testing.T) {
 		{"a bare errno", syscall.ENOENT, syscall.ENOENT},
 		{"an errno inside a PathError", &os.PathError{Op: "stat", Err: syscall.EACCES}, syscall.EACCES},
 		{"an errno wrapped in text", fmt.Errorf("reaching the namespace: %w", syscall.ENOSPC), syscall.ENOSPC},
+		{"a canceled request", context.Canceled, syscall.EINTR},
+		{"a wrapped canceled request", fmt.Errorf("stat: %w", context.Canceled), syscall.EINTR},
+		{"an expired deadline", context.DeadlineExceeded, syscall.EIO},
+		{"an unknown outcome with cancellation", errors.Join(syscall.EIO, context.Canceled), syscall.EIO},
 		{"an error carrying no errno", errors.New("the namespace is unreachable"), syscall.EIO},
 		{"a wrapped error carrying no errno", fmt.Errorf("dialling: %w", errors.New("no route")), syscall.EIO},
 	} {
@@ -302,10 +306,10 @@ func TestTheBufferBehavesLikeAFile(t *testing.T) {
 	})
 
 	t.Run("shortening and lengthening", func(t *testing.T) {
-		if errno := h.resize(t.Context(), 3); errno != 0 {
+		if errno := errnoOf(h.resize(t.Context(), 3)); errno != 0 {
 			t.Fatalf("shortening failed with %v", errno)
 		}
-		if errno := h.resize(t.Context(), 5); errno != 0 {
+		if errno := errnoOf(h.resize(t.Context(), 5)); errno != 0 {
 			t.Fatalf("lengthening failed with %v", errno)
 		}
 		result, errno := h.Read(t.Context(), dest, 0)
@@ -327,7 +331,7 @@ func TestTheBufferBehavesLikeAFile(t *testing.T) {
 // and a namespace with no figure to give imposes nothing, so what these cases exercise is
 // the ceiling alone.
 func aHandle(contents []byte, maxFileSize int64) *handle {
-	n := &node{ns: &namespace{storage: unmeasured{}, maxFileSize: maxFileSize}}
+	n := &node{ns: &namespace{storage: unmeasured{}, maxFileSize: maxFileSize, flushTimeout: DefaultFlushTimeout}}
 	// These reach the buffer directly rather than through a mountpoint, so the node
 	// the buffer was filled from does not come into it.
 	return newHandle(n, contents, committed, 0)
@@ -353,7 +357,7 @@ func TestTheBufferRefusesToGrowPastTheCeiling(t *testing.T) {
 		name string
 		act  func(h *handle) syscall.Errno
 	}{
-		{"a resize to exactly the ceiling", func(h *handle) syscall.Errno { return h.resize(t.Context(), ceiling) }},
+		{"a resize to exactly the ceiling", func(h *handle) syscall.Errno { return errnoOf(h.resize(t.Context(), ceiling)) }},
 		{"a write ending exactly at the ceiling", func(h *handle) syscall.Errno {
 			_, errno := h.Write(t.Context(), make([]byte, 8), ceiling-8)
 			return errno
@@ -370,8 +374,8 @@ func TestTheBufferRefusesToGrowPastTheCeiling(t *testing.T) {
 		name string
 		act  func(h *handle) syscall.Errno
 	}{
-		{"a resize one byte past the ceiling", func(h *handle) syscall.Errno { return h.resize(t.Context(), ceiling+1) }},
-		{"a resize well past the ceiling", func(h *handle) syscall.Errno { return h.resize(t.Context(), 1<<20) }},
+		{"a resize one byte past the ceiling", func(h *handle) syscall.Errno { return errnoOf(h.resize(t.Context(), ceiling+1)) }},
+		{"a resize well past the ceiling", func(h *handle) syscall.Errno { return errnoOf(h.resize(t.Context(), 1<<20)) }},
 		{"a write ending one byte past the ceiling", func(h *handle) syscall.Errno {
 			_, errno := h.Write(t.Context(), make([]byte, 8), ceiling-7)
 			return errno
@@ -399,11 +403,11 @@ func TestTheBufferRefusesToGrowPastTheCeiling(t *testing.T) {
 	// second overflows int64 into a negative length. Neither can be allowed to run
 	// before the ceiling has been shown to hold at a harmless size.
 	t.Run("sizes that cannot safely be attempted without the ceiling", func(t *testing.T) {
-		if errno := aHandle(nil, ceiling).resize(t.Context(), ceiling+1); errno != syscall.EFBIG {
+		if errno := errnoOf(aHandle(nil, ceiling).resize(t.Context(), ceiling+1)); errno != syscall.EFBIG {
 			t.Fatalf("the ceiling returned %v at %d bytes; the larger sizes are not attempted",
 				errno, ceiling+1)
 		}
-		if errno := aHandle(nil, ceiling).resize(t.Context(), 1<<40); errno != syscall.EFBIG {
+		if errno := errnoOf(aHandle(nil, ceiling).resize(t.Context(), 1<<40)); errno != syscall.EFBIG {
 			t.Fatalf("a resize to 1 TiB returned %v, want EFBIG", errno)
 		}
 		// off is whatever the caller seeked to, so off+len(data) is where int64 runs out.
@@ -827,8 +831,8 @@ func TestTheRoomLeftIsMeasuredOnceAWindow(t *testing.T) {
 	var g roomGauge
 
 	for range 100 {
-		avail, measured := g.remaining(t.Context(), answering)
-		if !measured || avail != 600 {
+		avail, measured, err := g.remaining(t.Context(), answering)
+		if err != nil || !measured || avail != 600 {
 			t.Fatalf("the gauge reports %d, %v; want 600 measured", avail, measured)
 		}
 	}
@@ -841,7 +845,7 @@ func TestTheRoomLeftIsMeasuredOnceAWindow(t *testing.T) {
 	// is a window's wait on every run.
 	answering.answer(storage.Space{Total: 1000, Used: 900, Avail: 100}, nil)
 	g.asked = time.Now().Add(-roomWindow)
-	if avail, measured := g.remaining(t.Context(), answering); !measured || avail != 100 {
+	if avail, measured, err := g.remaining(t.Context(), answering); err != nil || !measured || avail != 100 {
 		t.Fatalf("the gauge reports %d, %v after the window passed; want 100 measured", avail, measured)
 	}
 	if answering.times() != 2 {
@@ -858,7 +862,7 @@ func TestANamespaceWithNoRoomToReportIsAskedOnce(t *testing.T) {
 	var g roomGauge
 
 	for range 10 {
-		if avail, measured := g.remaining(t.Context(), answering); measured {
+		if avail, measured, err := g.remaining(t.Context(), answering); err != nil || measured {
 			t.Fatalf("the gauge reports %d as measured; the namespace reports no room of its own", avail)
 		}
 		g.asked = time.Now().Add(-roomWindow)
@@ -875,7 +879,7 @@ func TestAFailedQuestionLeavesTheLastFigureStanding(t *testing.T) {
 	answering := &answersSpace{space: storage.Space{Total: 1000, Used: 400, Avail: 600}}
 	var g roomGauge
 
-	if avail, measured := g.remaining(t.Context(), answering); !measured || avail != 600 {
+	if avail, measured, err := g.remaining(t.Context(), answering); err != nil || !measured || avail != 600 {
 		t.Fatalf("the gauge reports %d, %v; want 600 measured", avail, measured)
 	}
 
@@ -892,7 +896,7 @@ func TestAFailedQuestionLeavesTheLastFigureStanding(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			answering.answer(c.space, c.err)
 			g.asked = time.Now().Add(-roomWindow)
-			if avail, measured := g.remaining(t.Context(), answering); !measured || avail != 600 {
+			if avail, measured, err := g.remaining(t.Context(), answering); err != nil || !measured || avail != 600 {
 				t.Fatalf("the gauge reports %d, %v; want the last measured figure, 600", avail, measured)
 			}
 		})
@@ -919,7 +923,7 @@ func TestAWriteDoesNotQueueBehindAQuestionAlreadyInFlight(t *testing.T) {
 
 	// This one must come back rather than block; with no figure yet there is none to give,
 	// and the write it belongs to goes ahead and is weighed at the commit.
-	if avail, measured := g.remaining(t.Context(), answering); measured {
+	if avail, measured, err := g.remaining(t.Context(), answering); err != nil || measured {
 		t.Fatalf("the gauge reports %d as measured before any question has been answered", avail)
 	}
 	if answering.times() != 1 {
@@ -929,7 +933,7 @@ func TestAWriteDoesNotQueueBehindAQuestionAlreadyInFlight(t *testing.T) {
 
 	close(answering.release)
 	<-asking
-	if avail, measured := g.remaining(t.Context(), answering); !measured || avail != 600 {
+	if avail, measured, err := g.remaining(t.Context(), answering); err != nil || !measured || avail != 600 {
 		t.Fatalf("the gauge reports %d, %v once the question was answered; want 600 measured", avail, measured)
 	}
 }
@@ -940,10 +944,10 @@ func TestAWriteDoesNotQueueBehindAQuestionAlreadyInFlight(t *testing.T) {
 // file is that way.
 func TestShorteningNeedsNoRoomAndAsksForNone(t *testing.T) {
 	answering := &answersSpace{space: storage.Space{Total: 1000, Used: 1000}}
-	h := newHandle(&node{ns: &namespace{storage: answering, maxFileSize: 1 << 20}},
+	h := newHandle(&node{ns: &namespace{storage: answering, maxFileSize: 1 << 20, flushTimeout: DefaultFlushTimeout}},
 		make([]byte, 500), committed, 0)
 
-	if errno := h.resize(t.Context(), 100); errno != 0 {
+	if errno := errnoOf(h.resize(t.Context(), 100)); errno != 0 {
 		t.Fatalf("shortening a file of 500 bytes to 100 returned %v, in a workspace with nothing left",
 			errno)
 	}

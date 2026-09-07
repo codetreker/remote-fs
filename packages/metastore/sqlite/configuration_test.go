@@ -444,7 +444,7 @@ func (r *rollbackFailure) Rollback() error {
 func TestReadTransactionRollbackFailureIsReportedAfterSuccessfulWork(t *testing.T) {
 	closeFailure := errors.New("rollback failed")
 	tx := &rollbackFailure{err: closeFailure}
-	err := finishReadTransaction("reader transaction", tx, nil)
+	err := finishReadTransaction(t.Context(), "reader transaction", tx, nil)
 	if tx.calls != 1 || !errors.Is(err, closeFailure) || !errors.Is(err, syscall.EIO) ||
 		!strings.Contains(err.Error(), "reader transaction") {
 		t.Fatalf("successful read with rollback failure returned %v after %d calls", err, tx.calls)
@@ -455,7 +455,7 @@ func TestReadTransactionRollbackFailureIsJoinedWithPrimaryFailure(t *testing.T) 
 	primary := context.Canceled
 	closeFailure := errors.New("rollback failed")
 	tx := &rollbackFailure{err: closeFailure}
-	err := finishReadTransaction("snapshot transaction", tx, primary)
+	err := finishReadTransaction(t.Context(), "snapshot transaction", tx, primary)
 	if tx.calls != 1 || !errors.Is(err, primary) || !errors.Is(err, closeFailure) ||
 		!errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), "snapshot transaction") {
 		t.Fatalf("failed read with rollback failure returned %v after %d calls", err, tx.calls)

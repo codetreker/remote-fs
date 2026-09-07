@@ -101,10 +101,7 @@ handler 用 `MaxBodyBytes` 限制 non-write 请求与所有 non-streaming 响应
 
 `packages/storage` 持有一张 errno 与符号名之间的双向表，它同时是一个 storage 实现允许报出的 errno 的全集。它归契约而不归某一种传输：一个实现可以报出哪些错误，是契约的性质。
 
-storage 返回错误时，请求处理从错误链里取出 `syscall.Errno`：
-
-- 取得到，且在表里 → 用它的名字，`422`。
-- 取不到，或者不在表里 → `EIO`，`422`，原始错误的文本放进 `message`。
+storage 返回错误时，请求处理用 `storage.ErrnoNameOf` 取得 `422` 响应里的符号名。它与 FUSE 共用 `storage.ErrnoOf` 的错误树分类：已接受的纯取消为 `EINTR`，deadline 与未知错误为 `EIO`，词汇表内的已命名错误保留。当前节点的 `Classification() error` 对其子树具有权威性；独立故障分支不会被深层取消覆盖，join 顺序不改变这一点。`message` 保留原错误文本；没有失败对象可编码时 `ErrnoNameOf(nil)` 仍为 `EIO`。
 
 **无法命名的失败一律是 `EIO`。** 挑一个最接近的名字，等于把一个不确定的失败说成一个确定的事实；而 `ENOENT` 一旦被这样说出去，上层会据以删除、重新生成或覆盖（R-ERR-1、R-ERR-2）。
 

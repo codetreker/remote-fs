@@ -73,7 +73,8 @@ func TestReplicaReadersCancelBeforeThePhaseWhenPermitsAreFull(t *testing.T) {
 			cancel()
 			err = receiveReplica(t, read)
 			var pathErr *fs.PathError
-			if !errors.Is(err, context.Canceled) || !errors.Is(err, syscall.EIO) || !errors.As(err, &pathErr) {
+			if !errors.Is(err, context.Canceled) || storage.ErrnoOf(err) != syscall.EINTR ||
+				errors.Is(err, syscall.EIO) || !errors.As(err, &pathErr) {
 				t.Fatalf("canceled permit wait lost its path/error chain: %v", err)
 			}
 			replica.admission.mu.Lock()

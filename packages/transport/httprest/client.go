@@ -352,7 +352,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 		if errors.Is(err, syscall.EAGAIN) {
 			return nil, &operationError{req: req, errno: syscall.EAGAIN, detail: err.Error()}
 		}
-		return nil, unreachable(req, err)
+		return nil, operationFailure(req, err, true)
 	}
 	retained := false
 	defer func() {
@@ -376,10 +376,13 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 	if content != nil {
 		httpReq.Header.Set("Content-Type", req.ContentType())
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, operationFailure(req, err, true)
+	}
 
 	resp, err := s.http.Do(httpReq)
 	if err != nil {
-		return nil, unreachable(req, err)
+		return nil, operationFailure(req, err, req.Method() == http.MethodGet)
 	}
 	defer resp.Body.Close()
 
@@ -398,14 +401,14 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 			return nil, &operationError{req: req, errno: syscall.EFBIG, detail: err.Error()}
 		}
 		if err != nil {
-			return nil, unreachable(req, err)
+			return nil, operationFailure(req, err, req.Method() == http.MethodGet)
 		}
 		retained = true
 		return &retainedBody{content: body, done: release}, nil
 	case StatusStorageError:
 		body, err := readWhole(resp, s.maxBodyBytes)
 		if err != nil {
-			return nil, unreachable(req, err)
+			return nil, operationFailure(req, err, req.Method() == http.MethodGet)
 		}
 		return nil, s.storageError(req, body)
 	default:
@@ -538,16 +541,18 @@ func readWhole(resp *http.Response, limit int64) ([]byte, error) {
 // operationError is every error this package returns but one, the exception being the
 // RebuildError a change stream answers with.
 //
-// Unwrap yields the errno alone and never the underlying cause, which is why the cause
-// is carried as rendered text instead. A cause left in the errors.Is chain would leak
+// Unwrap yields the errno alone. Is preserves cancellation and deadline identity without
+// exposing the underlying cause. A cause left in the errors.Is chain would leak
 // errnos that belong to the network into answers about the namespace: dialling a Unix
 // socket that is not there produces a chain containing syscall.ENOENT, and a caller
 // asking errors.Is(err, syscall.ENOENT) would be told the file does not exist when the
 // truth is that the server was never reached.
 type operationError struct {
-	req    Request
-	errno  syscall.Errno
-	detail string
+	req      Request
+	errno    syscall.Errno
+	detail   string
+	canceled bool
+	deadline bool
 }
 
 func (e *operationError) Error() string {
@@ -574,6 +579,28 @@ func (r Request) subject() string {
 }
 
 func (e *operationError) Unwrap() error { return e.errno }
+
+func (e *operationError) Classification() error { return e.errno }
+
+func (e *operationError) Is(target error) bool {
+	return target == context.Canceled && e.canceled || target == context.DeadlineExceeded && e.deadline
+}
+
+// An interrupted read can be retried. Once a mutation enters Do, cancellation cannot
+// establish whether the server committed it, so its storage classification stays EIO.
+func operationFailure(req Request, cause error, interruptible bool) error {
+	errno := syscall.EIO
+	if interruptible && errors.Is(cause, context.Canceled) && storage.ErrnoOf(cause) == syscall.EINTR {
+		errno = syscall.EINTR
+	}
+	return &operationError{
+		req:      req,
+		errno:    errno,
+		detail:   cause.Error(),
+		canceled: errors.Is(cause, context.Canceled),
+		deadline: errors.Is(cause, context.DeadlineExceeded),
+	}
+}
 
 // unreachable reports that the outcome of req is unknown.
 func unreachable(req Request, cause error) error {

@@ -24,10 +24,11 @@ const (
 // Options bounds the resources retained while mutations wait for their replication barrier.
 //
 // A mutation reserves one fixed-size record before its request is sent.
-// MaxWaitingConfirmations bounds callers waiting for one. Saturation and cancellation
-// while waiting return EAGAIN because no mutation has reached the server. Once the server
-// reports success, the operation returns success only after the local replica reaches its
-// barrier; cancellation and timeout are then EIO because the namespace has changed.
+// MaxWaitingConfirmations bounds callers waiting for one. Capacity saturation and closing
+// before dispatch return EAGAIN. Caller cancellation before dispatch returns EINTR; a
+// deadline returns EIO. Once the server reports success, the operation returns success
+// only after the local replica reaches its barrier; cancellation and timeout are then
+// EIO because the namespace has changed.
 type Options struct {
 	ConfirmationGrace       time.Duration
 	MaxActiveConfirmations  int

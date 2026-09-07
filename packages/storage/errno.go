@@ -1,7 +1,7 @@
 package storage
 
 import (
-	"errors"
+	"context"
 	"maps"
 	"slices"
 	"syscall"
@@ -78,13 +78,63 @@ func ErrnoName(e syscall.Errno) (string, bool) {
 // not how to say why, and choosing the nearest available name would put a specific claim
 // — "no such file" above all — behind an unspecific failure.
 func ErrnoNameOf(err error) string {
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
-		if name, ok := errnoNames[errno]; ok {
-			return name
-		}
+	if name, ok := errnoNames[ErrnoOf(err)]; ok {
+		return name
 	}
 	return errnoNames[syscall.EIO]
+}
+
+// ErrnoOf classifies an operation's error; nil is success. A canceled request is EINTR,
+// while a deadline or an unrecognized failure is EIO. An error may implement
+// Classification() error to identify its result while retaining diagnostic causes.
+// That classification owns only its subtree: independent joined failures still count.
+// Joined failures must agree, except that a failure takes precedence over cancellation.
+func ErrnoOf(err error) syscall.Errno {
+	if err == nil {
+		return 0
+	}
+	if classified, ok := err.(interface{ Classification() error }); ok {
+		if result := classified.Classification(); result != nil {
+			return ErrnoOf(result)
+		}
+		return syscall.EIO
+	}
+	if errno, ok := err.(syscall.Errno); ok {
+		if _, known := errnoNames[errno]; known {
+			return errno
+		}
+		return syscall.EIO
+	}
+	if err == context.Canceled {
+		return syscall.EINTR
+	}
+	if err == context.DeadlineExceeded {
+		return syscall.EIO
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var result syscall.Errno
+		for _, child := range joined.Unwrap() {
+			next := ErrnoOf(child)
+			switch {
+			case next == 0:
+			case result == 0 || result == syscall.EINTR:
+				result = next
+			case next == syscall.EINTR || next == result:
+			default:
+				return syscall.EIO
+			}
+		}
+		if result != 0 {
+			return result
+		}
+		return syscall.EIO
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		if cause := wrapped.Unwrap(); cause != nil {
+			return ErrnoOf(cause)
+		}
+	}
+	return syscall.EIO
 }
 
 // ErrnoByName returns the errno that name stands for, and whether the name is one this

@@ -64,7 +64,7 @@ SQLite replica 的 `Stat`、`List`、`ListBounded` 先取得 SQL 读取名额，
 
 **「流一断」是被观测到的，不是被假定的。** 服务端在无话可说时按固定间隔发一行心跳，这一层给「一个字节都没来」设一个数倍于心跳的上限，超限与流上任何一次失败走同一条路。没有这条，一条被切断的 TCP 与一个安静的命名空间是同一个观测结果 —— 沉默 —— 而副本会一直答下去，且没有时间上界。上限压在**正在等的那次读**上而不是压在连接上，因为首次同步期间没有人读变更流；计时由**字节**重置而不是由帧重置，因为一个快照分页可以是一整行一兆字节。
 
-这份副本因此不是缓存。server 提供 change log 时，每个会产生日志的 mutation 在发出请求前先 admission 一条 fixed-size confirmation record，不保留 target path、direction 或 touched-name history。`ConfirmationGrace`、`MaxActiveConfirmations` 与 `MaxWaitingConfirmations` 默认分别为 10 秒、64 与 64；`remote-fs` 用 `-confirmation-grace`、`-max-active-mutation-confirmations` 与 `-max-waiting-mutation-confirmations` 暴露同一组设置。active 名额不足时有限等待，waiter 已满、等待被取消或 storage 开始关闭时，请求尚未发出并以可重试的 `EAGAIN` 拒绝。server 以 `ENOSYS` 表明没有 change log 时不建立副本，也不保留 confirmation state。
+这份副本因此不是缓存。server 提供 change log 时，每个会产生日志的 mutation 在发出请求前先 admission 一条 fixed-size confirmation record，不保留 target path、direction 或 touched-name history。`ConfirmationGrace`、`MaxActiveConfirmations` 与 `MaxWaitingConfirmations` 默认分别为 10 秒、64 与 64；`remote-fs` 用 `-confirmation-grace`、`-max-active-mutation-confirmations` 与 `-max-waiting-mutation-confirmations` 暴露同一组设置。active 名额不足时有限等待；请求尚未发出时，纯调用方取消为 `EINTR`、deadline 为 `EIO`，实际容量饱和或 storage 开始关闭则以 `EAGAIN` 拒绝，原始原因被保留。server 以 `ENOSYS` 表明没有 change log 时不建立副本，也不保留 confirmation state。
 
 mutation 成功后，replicated client 从严格验证过的 response 取得 `(incarnation, position)` barrier，把它与当前 replica incarnation/generation 对齐，再等待本地 position 达到或越过它。event 先于 HTTP response 到达时当前位置已经足够，立即完成；另一个 writer 的较早 change 不能误确认本次 mutation，因为 barrier 不早于本次 commit。stream rebuild 改变 generation、barrier incarnation 不匹配、stream failure、调用方取消、storage 关闭或 grace 到期都以 `EIO` 报告「namespace 已改变但本地副本无法确认」。失败只结束该调用，不把仍连续的 stream 单独判坏；迟到事件仍按 change-log 顺序应用。空 attribute change 与 rename onto itself 不产生日志，仍发送给 server 取得 pathname 的权威结果，但不预留或等待 barrier。
 
@@ -79,7 +79,7 @@ storage 的读与写以整文件为单位，内核的读与写以 128 KiB 为单
 ```
 打开   ──▶ 先问大小，再取回整个文件，放进这个描述符的缓冲区
 读     ──▶ 从缓冲区切片，不产生 RPC
-写     ──▶ 打补丁或扩展缓冲区，标记为未提交；除了至多每秒一次去问剩余空间，不产生 RPC
+写     ──▶ 必要时询问剩余空间，再打补丁或扩展缓冲区，标记为未提交
 关闭   ──▶ 未提交则整个写回
 ```
 
@@ -111,17 +111,23 @@ storage 的读与写以整文件为单位，内核的读与写以 128 KiB 为单
 
 ## 四、提交发生在关闭时
 
-`close(2)` 是失败还能被告知给发起者的最后时刻，提交因此挂在它上面，而不是挂在描述符的最后一个引用被释放时 —— 后者的返回值被内核丢弃。`fsync` 走同一条提交路径。
+`Flush` 对应 `close(2)`，提交失败仍能在这里报告；`Release` 的返回值被内核丢弃。`Flush` 使用独立的完成 context，保留请求值与较早的既有 deadline，忽略关闭线程的取消。`Options.FlushTimeout` 为正数时限定这一次提交的 context 预算，零值采用 `DefaultFlushTimeout` 的 30 秒，负值在挂载前被拒绝。独立命令的 `-timeout` 同时配置 HTTP 操作与该预算。
 
-提交失败时错误返回给 `close`，缓冲区里的内容不保留、无处查询（R-ERR-3 不在这一版内）。不重试。
+预算在调用提交逻辑、等待句柄 mutex 之前只计算一次，等待消耗同一 deadline，不会在取得锁后重置。一次有未提交内容的 `Flush` 至多调用一次底层 `Write`，不自动重试；预算不承诺 mutex 等待、`Mount.Wait` 或 `Unmount` 的总耗时。storage 的 `Close` 生命周期保持独立。
+
+`Fsync` 与 `Setattr` 设置时间前的句柄提交仍使用可取消的请求 context，已有副作用时按第五节保留 `EIO`。提交失败时错误返回给调用方，最终关闭后缓冲区里的内容不保留、无处查询（R-ERR-3 不在这一版内）。
 
 **写入方自己通过同一个描述符看得到自己写的内容**，包括大小与修改时间。同机的其它进程在提交之前看到的是命名空间里的旧内容。
 
-## 五、够不到就报错
+## 五、取消与故障分别作答
 
-storage 的错误是 `syscall.Errno`，挂载呈现层原样交给内核。取不到 errno 的错误一律成为 EIO。
+挂载呈现层通过 `storage.ErrnoOf` 分类错误，`nil` 为成功。已接受的请求取消返回 `EINTR`；deadline、未知错误与无法证明修改结果的失败返回 `EIO`。go-fuse 的请求 context 被取消后，原始 FUSE 请求仍得到回复。
 
-**绝不返回空目录、绝不报告文件不存在、绝不返回过期内容**（R-ERR-1、R-ERR-2）。这一条覆盖每一个操作，包括那些「回答不出来就随便给个值」看起来无害的：目录大小、扩展属性。
+`Create`、`Mkdir`、`Setattr` 可能包含多个步骤；`Setattr` 设置访问或修改时间前，会提交该节点已打开句柄中的未提交内容。某一步已改变 namespace 或本地句柄状态后，后续取消被包成拥有最终分类的 `EIO`，同时保留底层原因；不能让调用方把整个复合操作当成尚未发生的请求重试。一次操作在任何效果发生前接受的取消仍返回 `EINTR`。
+
+remote storage 在调用 HTTP `Do` 前接受取消时返回 `EINTR`；已经发出的只读操作也可放弃读取并返回 `EINTR`。mutation 一旦进入 `Do`，取消就不能证明请求未发出；没有权威结果时以 `EIO` 报告结果未知。已经成功而副本 barrier 未能确认的修改同样返回 `EIO`。网络底层 errno 不进入 namespace 的错误链。协议标记、状态码、分帧或数据形状不合法仍以 `EIO` 失败。
+
+到达挂载呈现层的 storage 错误不会被改写为空目录或不存在；目录大小、扩展属性等无法回答的操作同样返回错误。分类与阶段判定的取舍见[请求中断](../../../.agents/notes/implemented/bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)。
 
 ## 六、命名空间答不上来的，挂载呈现层不代答
 
@@ -189,9 +195,10 @@ storage 契约有模式与两个时间的写入口，也有整个命名空间的
 这个数字：
 
 - **整个挂载点共用一个**，因为它描述的是命名空间，不是某一个文件。
-- **至多每秒重新问一次。** `write(2)` 是文件系统最热的一条路，每次都问一遍，代价远超过它买到的那次拒绝。
+- **回答或非中断故障后的刷新窗口为一秒。** 窗口内复用已有测量状态；被分类为 `EINTR` 的探测不推进这个窗口，可以立即重试。`write(2)` 是文件系统最热的一条路，正常情况下不为每次写入增加一次往返。
 - **过了期就由发现它过期的那次写入去换掉它**，其余在途的写入照旧用手上这个数，谁也不必排在别人后面等（R-CC-2）。
-- **问失败不清空它**：上一次量到的仍然是最后有人量到的。一次都没问到之前没有数字，也就不做任何比对。
+- **被权威分类为 `EINTR` 的探测立即结束这次写入**：直接、包裹或通过 wire 返回的 `EINTR` 均成立，不要求还能找到原 context 的身份。缓冲区保持原样，探测占用被释放，上次有效数字与探测时间保持不变。标准库处理中断后立即重试时，会重新取得已经过期或尚不存在的测量，再决定是否以 `EDQUOT` 拒绝。
+- **其它探测失败不清空旧数字**：上一次量到的仍然是最后有人量到的。一次都没问到之前没有数字，也就不做任何比对。
 - 命名空间报了 `ENOSYS` 的话，这个问题不再问第二次，此后任何写入都不做这项比对。
 
 **它按设计就是会过期的，因此它只提前拒绝、从不放行。** 数字偏大，放不下的写入会被放过，由提交去拒绝 —— 提交才是权威。数字偏小，一次本来放得下的写入被拒，下一次就通过了。它唯一的作用，是把那个终归要来的拒绝送到造成它的那次调用上。

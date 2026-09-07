@@ -769,8 +769,8 @@ func TestCancelledConfirmationAdmissionWaiterNeverSendsAMutation(t *testing.T) {
 		t.Fatalf("the waiting mutation reached the server before admission: create calls=%d", before)
 	}
 	cancel()
-	if err := <-waiting; !errors.Is(err, syscall.EAGAIN) {
-		t.Fatalf("the cancelled pre-send waiter returned %v, want EAGAIN", err)
+	if err := <-waiting; !errors.Is(err, context.Canceled) || !errors.Is(err, syscall.EINTR) || storage.ErrnoOf(err) != syscall.EINTR {
+		t.Fatalf("the cancelled pre-send waiter returned %v, want cancellation classified EINTR", err)
 	}
 	if after := s.calls.of(httprest.OpCreate); after != before {
 		t.Fatalf("the cancelled waiter reached the server: create calls moved from %d to %d", before, after)

@@ -637,7 +637,7 @@ func (s *Store) Space(ctx context.Context) (storage.Space, error) {
 	}
 	var used int64
 	if err := s.read.QueryRowContext(ctx, `SELECT used FROM namespaces WHERE id = ?`, s.namespace).Scan(&used); err != nil {
-		return storage.Space{}, fmt.Errorf("reading what the namespace holds: %w", failure(err))
+		return storage.Space{}, fmt.Errorf("reading what the namespace holds: %w", readFailure(ctx, err))
 	}
 	space := storage.Space{Total: s.allowance, Used: used, Avail: max(s.allowance-used, 0)}
 	// The counter is exact, so a figure that could not be true of anything is this package
@@ -711,7 +711,7 @@ func (s *Store) inspect(ctx context.Context, f func(tx *sql.Tx) error) error {
 	if err != nil {
 		return err
 	}
-	return finishReadTransaction("reader transaction", tx, f(tx))
+	return finishReadTransaction(ctx, "reader transaction", tx, f(tx))
 }
 
 // beginReadSnapshot orders a read transaction before an unresolved commit or after its
@@ -725,7 +725,7 @@ func (s *Store) beginReadSnapshot(ctx context.Context, pool *sql.DB) (*sql.Tx, e
 	tx, err := pool.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		s.coordinator.endHealthyRead()
-		return nil, failure(err)
+		return nil, readFailure(ctx, err)
 	}
 	var singleton int
 	pinErr := tx.QueryRowContext(ctx,
@@ -733,7 +733,7 @@ func (s *Store) beginReadSnapshot(ctx context.Context, pool *sql.DB) (*sql.Tx, e
 	).Scan(&singleton)
 	s.coordinator.endHealthyRead()
 	if pinErr != nil {
-		return nil, finishReadTransaction("snapshot pin transaction", tx, failure(pinErr))
+		return nil, finishReadTransaction(ctx, "snapshot pin transaction", tx, pinErr)
 	}
 	return tx, nil
 }
@@ -742,28 +742,93 @@ type rollbacker interface {
 	Rollback() error
 }
 
-func finishReadTransaction(subject string, tx rollbacker, primary error) error {
+func finishReadTransaction(ctx context.Context, subject string, tx rollbacker, primary error) error {
+	primary = readFailure(ctx, primary)
 	rollbackErr := tx.Rollback()
+	// database/sql rolls back when the transaction's owning context ends. The direct
+	// ErrTxDone then reports completed cleanup, not another database failure.
+	// https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/database/sql/sql.go#L2207-L2230
+	if rollbackErr == sql.ErrTxDone && ctx.Err() != nil {
+		if primary == nil {
+			return failure(ctx.Err())
+		}
+		return primary
+	}
 	if rollbackErr != nil {
-		rollbackErr = fmt.Errorf("releasing the SQLite %s: %w", subject, failure(rollbackErr))
+		rollbackErr = fmt.Errorf("releasing the SQLite %s: %w", subject, &readCleanupFailure{cause: rollbackErr})
 	}
 	return errors.Join(primary, rollbackErr)
 }
 
-// failure names what a driver-level error means to a caller of this contract.
-//
-// Anything that is already an errno keeps it — those are ours, decided by the operations in
-// this package. Everything else is the database failing to answer, which is EIO: it is not
-// a missing file, and reporting it as one would put "that file is not there" in front of a
-// caller when the truth is that we could not find out. That is the answer R-ERR-2 forbids
-// above every other.
+type readCleanupFailure struct{ cause error }
+
+func (e *readCleanupFailure) Error() string         { return e.cause.Error() }
+func (e *readCleanupFailure) Unwrap() error         { return e.cause }
+func (e *readCleanupFailure) Is(target error) bool  { return target == syscall.EIO }
+func (e *readCleanupFailure) Classification() error { return syscall.EIO }
+
+// failure preserves cancellation and known operation errors. An unclassified database
+// failure or an expired deadline cannot establish a filesystem result and is EIO.
 func failure(err error) error {
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
+	if err == nil || storage.ErrnoOf(err) != syscall.EIO || errors.Is(err, syscall.EIO) {
 		return err
 	}
 	return fmt.Errorf("%w: %w", syscall.EIO, err)
 }
+
+// SQLite can return SQLITE_INTERRUPT without the driver's ctx.Err substitution. A read
+// transaction can also return ErrTxDone when automatic rollback wins after its context
+// check. ctx must own the transaction when classifying ErrTxDone. Independent joined
+// failures and writes with an uncertain outcome retain their fault classification.
+// https://gitlab.com/cznic/sqlite/-/blob/6e86ac4a89e3f36359d1947e36355c469b18430c/rows.go#L107-120
+// https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/database/sql/sql.go#L2245-L2258
+func readFailure(ctx context.Context, err error) error {
+	if ctx.Err() != nil && (err == sql.ErrTxDone || interruptedRead(err)) {
+		return failure(&readCancellationError{cause: err, canceled: ctx.Err()})
+	}
+	return failure(err)
+}
+
+func interruptedRead(err error) bool {
+	if err == nil {
+		return false
+	}
+	if _, classified := err.(interface{ Classification() error }); classified {
+		return false
+	}
+	if coded, ok := err.(interface{ Code() int }); ok {
+		const sqliteInterrupt = 9
+		return coded.Code() == sqliteInterrupt
+	}
+	if err == context.Canceled || err == syscall.EINTR {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		causes := joined.Unwrap()
+		if len(causes) == 0 {
+			return false
+		}
+		for _, cause := range causes {
+			if !interruptedRead(cause) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return interruptedRead(wrapped.Unwrap())
+	}
+	return false
+}
+
+type readCancellationError struct {
+	cause    error
+	canceled error
+}
+
+func (e *readCancellationError) Error() string         { return e.cause.Error() }
+func (e *readCancellationError) Unwrap() []error       { return []error{e.cause, e.canceled} }
+func (e *readCancellationError) Classification() error { return e.canceled }
 
 // isUniqueViolation reports whether err is the database refusing a duplicate name.
 //

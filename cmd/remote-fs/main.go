@@ -147,8 +147,9 @@ func run(args []string, errOut io.Writer) error {
 	defer release()
 
 	m, err := fuse.New(*mountpoint, served, fuse.Options{
-		Logger: log.New(errOut, "remote-fs: ", log.LstdFlags),
-		Debug:  *debug,
+		Logger:       log.New(errOut, "remote-fs: ", log.LstdFlags),
+		Debug:        *debug,
+		FlushTimeout: *timeout,
 	})
 	if err != nil {
 		return err
