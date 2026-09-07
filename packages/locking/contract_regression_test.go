@@ -208,11 +208,17 @@ func TestAuthorityCloseWaitsForPublicationWithoutDiscoveredResources(t *testing.
 func TestAuthorityForgetFailureFencesAndIsNotRetriedByClose(t *testing.T) {
 	h := newContractHarness(t, func(o *locking.Options, _ *contractPersistence) { o.ResourceTTL = time.Millisecond })
 	owner := h.owner()
+	registered, releaseTimer := h.clock.holdTimer(h.clock.Now().Add(time.Millisecond))
+	t.Cleanup(releaseTimer)
 	h.resource(owner, "a")
 	cause := errors.New("native pin cleanup outcome unavailable")
 	h.closeErr = cause
 	h.native.setForget("a", func() error { return cause })
+	// Hold the registered timer until clock advancement so maintenance cannot
+	// consume an earlier wake and replace it with a later relative timer.
+	contractAwait(t, registered)
 	h.clock.advance(time.Millisecond)
+	releaseTimer()
 	contractAwaitUnavailable(t, h)
 	called, err := h.publish("b", locking.MutationScope{}, locking.PublicationOutcome{Known: true, Changed: true})
 	if called || !errors.Is(err, cause) {

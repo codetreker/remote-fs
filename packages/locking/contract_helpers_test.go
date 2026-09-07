@@ -14,9 +14,16 @@ import (
 )
 
 type contractClock struct {
-	mu     sync.Mutex
-	now    time.Time
-	timers []contractTimer
+	mu        sync.Mutex
+	now       time.Time
+	timers    []contractTimer
+	heldTimer *contractHeldTimer
+}
+
+type contractHeldTimer struct {
+	deadline   time.Time
+	registered chan struct{}
+	release    chan struct{}
 }
 
 type contractTimer struct {
@@ -36,14 +43,33 @@ func (c *contractClock) Now() time.Time {
 
 func (c *contractClock) After(d time.Duration) <-chan time.Time {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	ch := make(chan time.Time, 1)
+	deadline := c.now.Add(d)
 	if d <= 0 {
 		ch <- c.now
 	} else {
-		c.timers = append(c.timers, contractTimer{when: c.now.Add(d), ch: ch})
+		c.timers = append(c.timers, contractTimer{when: deadline, ch: ch})
+	}
+	var held *contractHeldTimer
+	if c.heldTimer != nil && c.heldTimer.deadline.Equal(deadline) {
+		held = c.heldTimer
+		c.heldTimer = nil
+		close(held.registered)
+	}
+	c.mu.Unlock()
+	if held != nil {
+		<-held.release
 	}
 	return ch
+}
+
+func (c *contractClock) holdTimer(deadline time.Time) (<-chan struct{}, func()) {
+	held := &contractHeldTimer{deadline: deadline, registered: make(chan struct{}), release: make(chan struct{})}
+	c.mu.Lock()
+	c.heldTimer = held
+	c.mu.Unlock()
+	var once sync.Once
+	return held.registered, func() { once.Do(func() { close(held.release) }) }
 }
 
 func (c *contractClock) advance(d time.Duration) {
