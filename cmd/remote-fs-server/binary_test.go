@@ -40,7 +40,7 @@ func TestLocalStorePersistsThroughABinaryRestartAndRefusesASecondOwner(t *testin
 		"-max-pending-bytes", "2G",
 	}
 
-	first := startServerBinary(t, binary, args)
+	first := startServerBinary(t, binary, append(append([]string(nil), args...), "-initialize-lock-state"))
 	remote := dialBinaryServer(t, first.url)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()

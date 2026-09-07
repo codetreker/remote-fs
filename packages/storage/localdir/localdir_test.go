@@ -28,6 +28,11 @@ func TestBoundedContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(func() {
+			if err := s.Close(); err != nil {
+				t.Error(err)
+			}
+		})
 		return s
 	})
 }
@@ -38,6 +43,11 @@ func TestBoundedReadAndListRefuseWithoutReturningAPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	if err := os.WriteFile(filepath.Join(root, "large"), []byte("large"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +153,15 @@ func TestSpaceReportsTheHostFilesystemsOwnFigures(t *testing.T) {
 // acted on by whatever asked.
 func TestSpaceFailsWhenTheServedDirectoryIsGone(t *testing.T) {
 	root := t.TempDir()
-	s := newStorage(t, root)
+	s, err := localdir.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); !errors.Is(err, syscall.ENOENT) {
+			t.Errorf("closing a namespace with a missing root lost its failure: %v", err)
+		}
+	})
 
 	if err := os.Remove(root); err != nil {
 		t.Fatal(err)
@@ -151,6 +169,9 @@ func TestSpaceFailsWhenTheServedDirectoryIsGone(t *testing.T) {
 	space, err := s.Space(t.Context())
 	if !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("space reported %+v with error %v, want ENOENT", space, err)
+	}
+	if err := s.Close(); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("closing a fenced namespace returned %v, want the missing-root cause", err)
 	}
 }
 
@@ -632,5 +653,10 @@ func newStorage(t *testing.T, root string) storage.Storage {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	return s
 }

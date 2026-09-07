@@ -30,8 +30,11 @@ const (
 
 // Options configures the serving resources of one Store.
 type Options struct {
-	Window       Window
-	ObjectLimits ObjectLimits
+	leaseRecoveryOwner       bool
+	leaseOwner               *leaseDatabaseFile
+	requireExistingNamespace bool
+	Window                   Window
+	ObjectLimits             ObjectLimits
 
 	// MaxReaderConnections bounds the physical SQLite connections used by ordinary namespace
 	// and log reads. Zero selects DefaultMaxReaderConnections. A read waits for a connection

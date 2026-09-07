@@ -306,7 +306,7 @@ func TestWriteAndProtocolBodiesHaveSeparateLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	h, err := httprest.NewHandlerWithOptions(listingStorage{
-		failing: failing{syscall.EIO},
+		failing: failingStorage(t, syscall.EIO),
 		entries: entries,
 	}, nil, serverOptions)
 	if err != nil {
@@ -376,7 +376,7 @@ func TestClientListBoundedInvalidatesAnEarlyDecodedPrefix(t *testing.T) {
 		{Name: "a", Attr: storage.Attr{ID: 1, Mode: 0o600}},
 		{Name: "b", Attr: storage.Attr{ID: 2, Mode: 0o600}},
 	}
-	h, err := httprest.NewHandler(listingStorage{failing: failing{syscall.EIO}, entries: entries}, nil)
+	h, err := httprest.NewHandler(listingStorage{failing: failingStorage(t, syscall.EIO), entries: entries}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

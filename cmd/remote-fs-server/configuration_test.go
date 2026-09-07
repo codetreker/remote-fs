@@ -146,6 +146,7 @@ func TestDirectoryMeasurementBoundsReachTheQuotaLayer(t *testing.T) {
 	config, help, err := parseConfig([]string{
 		"-listen", "127.0.0.1:0",
 		"-dir", "/data",
+		"-lock-state-root", "/state",
 		"-quota", "8M",
 		"-quota-max-directory-bytes", "3M",
 		"-quota-max-frontier-bytes", "5M",
@@ -501,6 +502,7 @@ func TestInvalidMeasurementBoundsAreRejectedBeforeListenerAcquisition(t *testing
 			_, _, err := parseConfig([]string{
 				"-listen", "127.0.0.1",
 				"-dir", t.TempDir(),
+				"-lock-state-root", t.TempDir(),
 				"-quota", "8M",
 				flagName, strconv.FormatInt(math.MaxInt64, 10),
 			}, &bytes.Buffer{})

@@ -2,6 +2,7 @@ package httprest_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/localdir"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
@@ -78,17 +80,32 @@ func TestNothingIsPrinted(t *testing.T) {
 // exerciseTheLibrary runs every operation across both ends of the transport. The failing
 // paths are driven alongside the successful ones because a diagnostic printed on the way
 // out is the likely form of the mistake.
-func exerciseTheLibrary() error {
+func exerciseTheLibrary() (result error) {
 	dir, err := os.MkdirTemp("", "remote-fs-library")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(dir)
 
-	backing, err := localdir.New(dir)
+	config := localdir.Config{
+		Root:      filepath.Join(dir, "root"),
+		StateRoot: filepath.Join(dir, "state"),
+		Locks:     locking.DefaultOptions(),
+		Limits:    localdir.DefaultLimits(),
+	}
+	for _, path := range []string{config.Root, config.StateRoot} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			return err
+		}
+	}
+	if err := localdir.Init(context.Background(), config); err != nil {
+		return err
+	}
+	backing, err := localdir.Open(context.Background(), config)
 	if err != nil {
 		return err
 	}
+	defer func() { result = errors.Join(result, backing.Close()) }()
 	handler, err := httprest.NewHandler(backing, nil)
 	if err != nil {
 		return err

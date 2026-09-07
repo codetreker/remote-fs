@@ -25,9 +25,21 @@ import (
 // path it cleaned differently from the storage beneath it — shows up as one of these
 // sixty-odd cases failing, and nothing else looks for it.
 func TestContract(t *testing.T) {
-	storagetest.Run(t, func(t *testing.T) storage.Storage {
-		return newStorage(t, t.TempDir(), 1<<30)
-	})
+	for _, native := range []bool{true, false} {
+		name := "native publication"
+		if !native {
+			name = "unmanaged bounded storage"
+		}
+		t.Run(name, func(t *testing.T) {
+			storagetest.Run(t, func(t *testing.T) storage.Storage {
+				backing := openDir(t, t.TempDir())
+				if !native {
+					backing = &faulty{BoundedStorage: backing}
+				}
+				return newStorageOver(t, backing, 1<<30)
+			})
+		})
+	}
 }
 
 func TestBoundedContract(t *testing.T) {
@@ -179,14 +191,9 @@ func TestAWriteTheStoreBeneathRefusesGivesTheChargeBack(t *testing.T) {
 	mustUse(t, s, 0)
 }
 
-// What comes back is what was taken, which is not the same as what was asked for once the
-// floor has bitten. A count of 5 charged the -10 of a write that shrinks a 15-byte file to
-// 5 bytes lands at 0, having moved by 5; handing 10 back would leave 10 taken for a write
-// that never happened, and the namespace would lose room a failure at a time.
-//
-// The count sits below what the file holds because the file was grown out of band, which is
-// the only way in: everything passing through here is counted exactly.
-func TestAWriteThatFailedGivesBackOnlyWhatItTook(t *testing.T) {
+// Failed shrinking writes retain the original count even when an out-of-band change
+// has left it below the file's current size.
+func TestFailedShrinkPreservesTheCountAfterOutOfBandGrowth(t *testing.T) {
 	root := t.TempDir()
 	beneath := &faulty{BoundedStorage: openDir(t, root)}
 	s := newStorageOver(t, beneath, 8192)
@@ -700,6 +707,13 @@ func openDir(t *testing.T, root string) storage.BoundedStorage {
 	backing, err := localdir.New(root)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if closer, ok := any(backing).(interface{ Close() error }); ok {
+		t.Cleanup(func() {
+			if err := closer.Close(); err != nil {
+				t.Errorf("closing backing directory: %v", err)
+			}
+		})
 	}
 	return backing
 }

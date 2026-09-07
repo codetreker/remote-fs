@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/localdir"
@@ -480,10 +481,22 @@ func TestTheMountFailsWhenTheNamespaceCannotBeWatched(t *testing.T) {
 // other means either a mount that never comes up or a mount that quietly gave up on being
 // current.
 func TestANamespaceThatKeepsNoLogRefusesToBeCopied(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
+	config := localdir.Config{Root: t.TempDir(), StateRoot: t.TempDir(), Locks: locking.DefaultOptions(), Limits: localdir.DefaultLimits()}
+	if err := os.Chmod(config.StateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := localdir.Init(t.Context(), config); err != nil {
+		t.Fatal(err)
+	}
+	backing, err := localdir.Open(t.Context(), config)
 	if err != nil {
 		t.Fatalf("opening a local directory: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := backing.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	// A nil log, which is what a namespace with no metastore is served with.
 	handler, err := httprest.NewHandler(backing, nil)
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -372,7 +373,7 @@ func (s *Store) SetAttr(ctx context.Context, path string, change storage.AttrCha
 	if err != nil {
 		return pathError("setattr", path, err)
 	}
-	if err := s.mutate(ctx, func(tx *sql.Tx) error {
+	if err := s.mutateNamespace(ctx, locking.SetAttrMutation, []string{cleaned}, func(tx *sql.Tx) error {
 		// A change that names nothing still answers for the node it names, and resolving the
 		// path is what answers for it.
 		node, err := s.resolve(ctx, tx, cleaned)
@@ -445,7 +446,7 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 	if cleaned == "" {
 		return pathError(op, path, syscall.EEXIST)
 	}
-	if err := s.mutate(ctx, func(tx *sql.Tx) error {
+	if err := s.mutateNamespace(ctx, locking.CreateMutation, []string{cleaned}, func(tx *sql.Tx) error {
 		parent, name, err := s.resolveParent(ctx, tx, cleaned)
 		if err != nil {
 			return err
@@ -536,7 +537,7 @@ func (s *Store) Remove(ctx context.Context, path string) error {
 	if cleaned == "" {
 		return pathError("unlink", path, syscall.EISDIR)
 	}
-	if err := s.mutate(ctx, func(tx *sql.Tx) error {
+	if err := s.mutateNamespace(ctx, locking.RemoveMutation, []string{cleaned}, func(tx *sql.Tx) error {
 		parent, name, err := s.resolveParent(ctx, tx, cleaned)
 		if err != nil {
 			return err
@@ -578,7 +579,7 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 	if cleaned == "" {
 		return pathError("rmdir", path, syscall.EBUSY)
 	}
-	if err := s.mutate(ctx, func(tx *sql.Tx) error {
+	if err := s.mutateNamespace(ctx, locking.RemoveMutation, []string{cleaned}, func(tx *sql.Tx) error {
 		parent, name, err := s.resolveParent(ctx, tx, cleaned)
 		if err != nil {
 			return err
@@ -650,7 +651,7 @@ func (s *Store) Rename(ctx context.Context, from, to string) error {
 	if cleanFrom == "" || cleanTo == "" {
 		return linkError(from, to, syscall.EBUSY)
 	}
-	if err := s.mutate(ctx, func(tx *sql.Tx) error {
+	if err := s.mutateNamespace(ctx, locking.RenameMutation, []string{cleanFrom, cleanTo}, func(tx *sql.Tx) error {
 		return s.rename(ctx, tx, cleanFrom, cleanTo)
 	}); err != nil {
 		return linkError(from, to, failure(err))

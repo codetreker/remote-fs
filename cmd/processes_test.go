@@ -205,6 +205,15 @@ type runningServer struct {
 	url string
 }
 
+func startDirectoryServerBinary(t *testing.T, directory string, args ...string) *runningServer {
+	t.Helper()
+	configured := []string{
+		"-listen", "127.0.0.1:0", "-dir", directory,
+		"-lock-state-root", privateDirectory(t), "-initialize-lock-state",
+	}
+	return startServerBinary(t, append(configured, args...)...)
+}
+
 func startServerBinary(t *testing.T, args ...string) *runningServer {
 	t.Helper()
 	p := start(t, "remote-fs-server", serverBinary(t), args...)

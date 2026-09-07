@@ -28,7 +28,7 @@ func TestTheBinariesServeAndMount(t *testing.T) {
 	requireFUSE(t)
 
 	backing := t.TempDir()
-	srv := startServerBinary(t, "-listen", "127.0.0.1:0", "-dir", backing)
+	srv := startDirectoryServerBinary(t, backing)
 	mountpoint := t.TempDir()
 	mnt := startMountBinary(t, "-server", srv.url, "-mountpoint", mountpoint)
 
@@ -78,7 +78,7 @@ func TestTheBinariesRefuseWhatTheyCannotDo(t *testing.T) {
 
 	// A server the mount binary can reach, so that the mountpoint failure below is
 	// reported for the mountpoint rather than for the server.
-	reachable := startServerBinary(t, "-listen", "127.0.0.1:0", "-dir", backing)
+	reachable := startDirectoryServerBinary(t, backing)
 
 	for _, c := range []struct {
 		name    string
@@ -87,11 +87,13 @@ func TestTheBinariesRefuseWhatTheyCannotDo(t *testing.T) {
 		expects string
 	}{
 		{"a directory that is not there", serverBinary(t),
-			[]string{"-listen", free, "-dir", filepath.Join(backing, "absent")}, "no such file or directory"},
+			[]string{"-listen", free, "-dir", filepath.Join(backing, "absent"), "-lock-state-root", privateDirectory(t), "-initialize-lock-state"}, "no such file or directory"},
 		{"a directory that is a file", serverBinary(t),
-			[]string{"-listen", free, "-dir", notADirectory}, "not a directory"},
+			[]string{"-listen", free, "-dir", notADirectory, "-lock-state-root", privateDirectory(t), "-initialize-lock-state"}, "not a directory"},
 		{"an address already in use", serverBinary(t),
-			[]string{"-listen", occupied, "-dir", backing}, "address already in use"},
+			[]string{"-listen", occupied, "-dir", t.TempDir(), "-lock-state-root", privateDirectory(t), "-initialize-lock-state"}, "address already in use"},
+		{"a directory without lock state configured", serverBinary(t),
+			[]string{"-listen", free, "-dir", backing}, "-lock-state-root is required"},
 		{"no namespace at all", serverBinary(t),
 			[]string{"-listen", free}, "a namespace is required"},
 		{"several namespaces at once", serverBinary(t),
@@ -106,11 +108,11 @@ func TestTheBinariesRefuseWhatTheyCannotDo(t *testing.T) {
 		{"a flag nobody defined", serverBinary(t),
 			[]string{"-listen", free, "-dir", backing, "-nonsense"}, "not defined"},
 		{"an allowance that is not a size", serverBinary(t),
-			[]string{"-listen", free, "-dir", backing, "-quota", "banana"}, "is not a size"},
+			[]string{"-listen", free, "-dir", backing, "-lock-state-root", privateDirectory(t), "-quota", "banana"}, "is not a size"},
 		{"an allowance spelled as a power of 1000", serverBinary(t),
-			[]string{"-listen", free, "-dir", backing, "-quota", "5MB"}, "power of 1000"},
+			[]string{"-listen", free, "-dir", backing, "-lock-state-root", privateDirectory(t), "-quota", "5MB"}, "power of 1000"},
 		{"an allowance below the smallest there is", serverBinary(t),
-			[]string{"-listen", free, "-dir", backing, "-quota", "1K"}, "smallest allowance"},
+			[]string{"-listen", free, "-dir", backing, "-lock-state-root", privateDirectory(t), "-quota", "1K"}, "smallest allowance"},
 
 		{"a mountpoint that is not a directory", mountBinary(t),
 			[]string{"-server", reachable.url, "-mountpoint", notADirectory}, "not a directory"},

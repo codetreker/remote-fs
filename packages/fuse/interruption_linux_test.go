@@ -24,6 +24,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/codetreker/remote-fs/packages/fuse"
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/localdir"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
@@ -71,10 +72,22 @@ func TestSignalInterruptsARequestWithoutBreakingTheMount(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(backing, "file"), []byte("still readable"), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			local, err := localdir.New(backing)
+			config := localdir.Config{Root: backing, StateRoot: t.TempDir(), Locks: locking.DefaultOptions(), Limits: localdir.DefaultLimits()}
+			if err := os.Chmod(config.StateRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := localdir.Init(t.Context(), config); err != nil {
+				t.Fatal(err)
+			}
+			local, err := localdir.Open(t.Context(), config)
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() {
+				if err := local.Close(); err != nil {
+					t.Error(err)
+				}
+			})
 			handler, err := httprest.NewHandler(local, nil)
 			if err != nil {
 				t.Fatal(err)

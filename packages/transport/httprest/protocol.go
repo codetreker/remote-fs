@@ -8,21 +8,11 @@
 // Neither end needs anything beyond net/http, so taking one of them links nothing that
 // was not asked for.
 //
-// One storage operation is one request, and nothing about one is stateful. The two
-// replication endpoints are the exception and are streams by nature: one stays open for
-// as long as a replica is watching, the other for as long as a whole tree takes to cross
-// the wire. They are separate endpoints, so an HTTP client puts them on separate
-// connections without being asked to — which is the property the design turns on. A
-// change must reach a watching replica in a time that does not depend on what bulk
-// transfer is in flight beside it, and a snapshot is the largest bulk transfer this
-// system has. Merging the two onto one connection, or multiplexing them as two streams of
-// one HTTP/2 connection, gives that property up: one lost packet stalls every stream on
-// that TCP connection, and one large frame occupies it regardless.
-//
-// The handler holds no state of its own and caches nothing: the namespace's facts live
-// in the storage it was built over, and a copy of them here could only ever be a copy
-// that might be out of date. Every request is answered by calling the storage and
-// reporting what it said.
+// Namespace calls, explicit lock controls, and replication share one protocol version.
+// Lock controls retain authoritative owner and action state in the paired backend. Bulk
+// bodies and replication streams have admission separate from the short lock controls.
+// Replication endpoints use separate connections so snapshot delivery does not consume
+// the connection carrying changes.
 //
 // The obligation the dialling end exists to meet is that a failure to reach the far side
 // must never arrive as an answer about the namespace. Anything that is not an outcome the
@@ -48,7 +38,7 @@ import (
 const (
 	// Prefix begins the URL path of every request, relative to wherever the handler is
 	// mounted. The version segment is the place a future incompatible change lands.
-	Prefix = "/v2/"
+	Prefix = "/v3/"
 
 	// HeaderProtocol names the response header that identifies an answer as having come
 	// from a handler speaking this protocol, and Version is its only accepted value.
@@ -59,7 +49,7 @@ const (
 	// it never reached the handler. Requiring a header the intermediary does not know
 	// about closes that.
 	HeaderProtocol = "Remote-Fs-Protocol"
-	Version        = "2"
+	Version        = "3"
 
 	// StatusStorageError marks the one response that carries an operation outcome in the
 	// storage contract's errno vocabulary. Most come from the storage. A handler-owned

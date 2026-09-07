@@ -929,7 +929,11 @@ func TestLegacyNodeSequenceHighWaterSurvivesMigration(t *testing.T) {
 // Version 0 recorded in the row is here too, because a store that read it as "no schema yet"
 // would build a fresh layout over a populated database.
 func TestADatabaseFromAnotherSchemaVersionIsRefused(t *testing.T) {
-	for _, version := range []int{0, 4, 999} {
+	migrations, err := filepath.Glob("migrations/*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, version := range []int{0, len(migrations) + 1, 999} {
 		path := database(t)
 		store, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
 		if err != nil {

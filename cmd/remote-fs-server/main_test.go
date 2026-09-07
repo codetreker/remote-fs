@@ -23,14 +23,34 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/limited"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/localdisk"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore/memory"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
+
+func testLockConfig(t *testing.T) lockConfig {
+	t.Helper()
+	return lockConfig{options: locking.DefaultOptions(), stateRoot: emptyPrivateDirectory(t), initialize: true}
+}
+
+func newTestDirectory(t *testing.T, root string) (storage.Storage, error) {
+	t.Helper()
+	namespace, err := openDirectory(root, 0, limited.DefaultMeasurementLimits(), testLockConfig(t))
+	if err != nil {
+		return nil, err
+	}
+	t.Cleanup(func() {
+		if err := namespace.close(); err != nil {
+			t.Errorf("close directory namespace: %v", err)
+		}
+	})
+	return namespace.namespace, nil
+}
 
 func TestStorageClosesAfterServingAndItsFailureIsReturned(t *testing.T) {
 	actionFailure := errors.New("HTTP server failed")
@@ -59,10 +79,11 @@ func TestDirectoryRecountReportsItsMeasurementBounds(t *testing.T) {
 	ns, err := openDirectory(t.TempDir(), 1<<20, limited.MeasurementLimits{
 		MaxDirectoryBytes: 3 << 20,
 		MaxFrontierBytes:  5 << 20,
-	})
+	}, testLockConfig(t))
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = ns.close() })
 	var output bytes.Buffer
 	recount(t.Context(), ns, &output)
 	for _, phrase := range []string{
@@ -112,6 +133,8 @@ func TestDirectoryMeasurementOverflowFailsBeforeReadiness(t *testing.T) {
 			err := run([]string{
 				"-listen", "127.0.0.1:0",
 				"-dir", root,
+				"-lock-state-root", emptyPrivateDirectory(t),
+				"-initialize-lock-state",
 				"-quota", "8M",
 				test.flag, test.value,
 			}, &output)
@@ -130,10 +153,11 @@ func TestFailedSIGHUPMeasurementKeepsTheCountAndServerUsable(t *testing.T) {
 	ns, err := openDirectory(root, 1<<20, limited.MeasurementLimits{
 		MaxDirectoryBytes: 256,
 		MaxFrontierBytes:  limited.DefaultMaxFrontierBytes,
-	})
+	}, testLockConfig(t))
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = ns.close() })
 	if err := ns.namespace.Write(t.Context(), "held", []byte("1234567")); err != nil {
 		t.Fatal(err)
 	}
@@ -221,6 +245,7 @@ func TestInvalidListenAddressDoesNotInitializeALocalStore(t *testing.T) {
 	err := run([]string{
 		"-listen", "127.0.0.1",
 		"-local-store", root,
+		"-initialize-lock-state",
 		"-workspace", "workspace",
 		"-quota", "8M",
 	}, io.Discard)
@@ -241,6 +266,7 @@ func TestAddressInUseDoesNotInitializeALocalStore(t *testing.T) {
 	err = run([]string{
 		"-listen", held.Addr().String(),
 		"-local-store", root,
+		"-initialize-lock-state",
 		"-workspace", "workspace",
 		"-quota", "8M",
 	}, io.Discard)
@@ -526,7 +552,7 @@ func waitForNewConnections(t *testing.T, tracker *connectionTracker, want int, t
 
 func unreplicatedHandler(t *testing.T) *httprest.Handler {
 	t.Helper()
-	backing, err := localdir.New(t.TempDir())
+	backing, err := newTestDirectory(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +714,7 @@ func TestOpenLocalExposesReplicationAndOperationalStatus(t *testing.T) {
 	const maxIntegrityBytes = 7 << 20
 	ns, err := openLocal(
 		source, 1<<20, sqlite.DefaultObjectLimits(), maxReaderConnections,
-		maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance,
+		maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance, testLockConfig(t),
 	)
 	if err != nil {
 		t.Fatalf("openLocal: %v", err)
@@ -742,7 +768,7 @@ func TestOpenBlobsExposesPendingAndMaintenanceStatus(t *testing.T) {
 		container: "container",
 		database:  filepath.Join(t.TempDir(), "metastore.sqlite"),
 		workspace: "workspace",
-	}, 0, limits, maxReaderConnections, maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance)
+	}, 0, limits, maxReaderConnections, maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance, testLockConfig(t))
 	if err != nil {
 		t.Fatalf("openBlobs: %v", err)
 	}
@@ -789,7 +815,7 @@ func TestBlobStatusFailsWhenTheObjectStoreIsUnreachable(t *testing.T) {
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
 		sqlite.DefaultMaxIntegrityBytes,
-		objectstore.DefaultOptions())
+		objectstore.DefaultOptions(), testLockConfig(t))
 	if err != nil {
 		t.Fatalf("open blob namespace: %v", err)
 	}
@@ -814,7 +840,7 @@ func TestBlobStatusFailsWhenCredentialsAreRejected(t *testing.T) {
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
 		sqlite.DefaultMaxIntegrityBytes,
-		objectstore.DefaultOptions())
+		objectstore.DefaultOptions(), testLockConfig(t))
 	if err != nil {
 		t.Fatalf("open blob namespace: %v", err)
 	}
@@ -841,7 +867,7 @@ func TestBlobStatusReportsUnresolvedWrites(t *testing.T) {
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
 		sqlite.DefaultMaxIntegrityBytes,
-		objectstore.DefaultOptions())
+		objectstore.DefaultOptions(), testLockConfig(t))
 	if err != nil {
 		t.Fatalf("open blob namespace: %v", err)
 	}
@@ -945,7 +971,7 @@ func assertLegacyBlobOpenRefusedWithContext(
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, maxIntegrityRecords,
 		sqlite.DefaultMaxIntegrityBytes,
-		objectstore.DefaultOptions())
+		objectstore.DefaultOptions(), testLockConfig(t))
 	if err == nil {
 		_ = ns.close()
 		t.Fatalf("%s was migrated and served", subject)
@@ -1097,7 +1123,7 @@ func TestExpectedCloseDoesNotHideAJoinedFailure(t *testing.T) {
 }
 
 func TestTerminationReturnsAFatalServeErrorThatWasAlreadyBuffered(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
+	backing, err := newTestDirectory(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1235,7 +1261,7 @@ func (w *blockingWrite) unblock() {
 }
 
 func TestStartingShutdownCancelsAConnectionAcceptedBeforeStartAcknowledgement(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
+	backing, err := newTestDirectory(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1298,7 +1324,7 @@ func TestStartingShutdownCancelsAConnectionAcceptedBeforeStartAcknowledgement(t 
 }
 
 func TestClosedStartSignalUsesGracefulShutdownBeforeTheSelectConsumesIt(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
+	backing, err := newTestDirectory(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1434,7 +1460,7 @@ func TestSIGHUPReportsLocalStatusAndTheLockOutlivesServing(t *testing.T) {
 	maintenance := objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8}
 	ns, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
-		sqlite.DefaultMaxIntegrityBytes, maintenance)
+		sqlite.DefaultMaxIntegrityBytes, maintenance, testLockConfig(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1481,7 +1507,7 @@ func TestSIGHUPReportsLocalStatusAndTheLockOutlivesServing(t *testing.T) {
 
 	contender, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
-		sqlite.DefaultMaxIntegrityBytes, maintenance)
+		sqlite.DefaultMaxIntegrityBytes, maintenance, lockConfig{options: locking.DefaultOptions()})
 	if err == nil {
 		contender.close()
 		t.Fatal("a second server acquired the local-store lock while the first was serving")
@@ -1511,7 +1537,7 @@ func TestSIGHUPReportsLocalStatusAndTheLockOutlivesServing(t *testing.T) {
 	}
 	reopened, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
-		sqlite.DefaultMaxIntegrityBytes, maintenance)
+		sqlite.DefaultMaxIntegrityBytes, maintenance, lockConfig{options: locking.DefaultOptions()})
 	if err != nil {
 		t.Fatalf("the local-store lock remained after HTTP shutdown drained: %v", err)
 	}
@@ -1612,7 +1638,7 @@ func TestUncooperativeStatusWaitsOnlyAfterHTTPShutdown(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			backing, err := localdir.New(t.TempDir())
+			backing, err := newTestDirectory(t, t.TempDir())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1700,7 +1726,7 @@ func TestUncooperativeStatusWaitsOnlyAfterHTTPShutdown(t *testing.T) {
 }
 
 func TestFatalServeErrorCancelsStatusBeforeDrainingHandlers(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
+	backing, err := newTestDirectory(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1796,7 +1822,7 @@ func (s *statusGateStorage) Stat(ctx context.Context, path string) (storage.Attr
 }
 
 func TestDirectoryRecountWaitingForAnActiveRequestLetsForcedShutdownReleaseIt(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
+	backing, err := newTestDirectory(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1933,7 +1959,7 @@ func startBlockedRecountServer(t *testing.T) blockedRecountServer {
 			t.Fatal(err)
 		}
 	}
-	backing, err := localdir.New(root)
+	backing, err := newTestDirectory(t, root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2182,7 +2208,7 @@ func TestShutdownTimeoutKeepsTheLockUntilABlockedRequestLeaves(t *testing.T) {
 	maintenance := objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8}
 	ns, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
-		sqlite.DefaultMaxIntegrityBytes, maintenance)
+		sqlite.DefaultMaxIntegrityBytes, maintenance, testLockConfig(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2233,7 +2259,7 @@ func TestShutdownTimeoutKeepsTheLockUntilABlockedRequestLeaves(t *testing.T) {
 
 	contender, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
-		sqlite.DefaultMaxIntegrityBytes, maintenance)
+		sqlite.DefaultMaxIntegrityBytes, maintenance, lockConfig{options: locking.DefaultOptions()})
 	if err == nil {
 		contender.close()
 		t.Fatal("shutdown released the local-store lock while a handler was still running")
@@ -2257,7 +2283,7 @@ func TestShutdownTimeoutKeepsTheLockUntilABlockedRequestLeaves(t *testing.T) {
 	}
 	reopened, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
-		sqlite.DefaultMaxIntegrityBytes, maintenance)
+		sqlite.DefaultMaxIntegrityBytes, maintenance, lockConfig{options: locking.DefaultOptions()})
 	if err != nil {
 		t.Fatalf("the lock remained after the handler drained: %v", err)
 	}
@@ -2275,6 +2301,14 @@ type blockingStatStorage struct {
 
 type boundedStorageAdapter struct {
 	storage.Storage
+}
+
+func (s boundedStorageAdapter) LockService() locking.Service {
+	return s.Storage.(interface{ LockService() locking.Service }).LockService()
+}
+
+func (s boundedStorageAdapter) CheckPublicationAccounting() error {
+	return s.Storage.(interface{ CheckPublicationAccounting() error }).CheckPublicationAccounting()
 }
 
 func (s boundedStorageAdapter) CheckBounded() error {
@@ -2363,28 +2397,24 @@ func TestStoppingWithAReplicaAttachedIsPromptAndClean(t *testing.T) {
 	}
 }
 
-// replicableNamespace builds what this command serves when the namespace it was given keeps
-// a change log.
-//
-// The tree and the log are not the same store here, which they would be in the command
-// itself. Nothing in this test reads one against the other — what is under test is how the
-// server stops — and pairing a local directory with a real log keeps it away from the blob
-// service the command's own replicable path needs.
 func replicableNamespace(t *testing.T) (*httprest.Handler, opened) {
 	t.Helper()
-	backing, err := localdir.New(t.TempDir())
+	meta, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
+		Database: filepath.Join(t.TempDir(), "metastore.db"), Namespace: "workspace",
+		SQLite: sqlite.DefaultOptions(), Locks: locking.DefaultOptions(), Initialize: true,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	log, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "metastore.db"), "workspace", 0, sqlite.DefaultWindow())
+	namespace := objectstore.New(memory.New(), meta)
+	t.Cleanup(func() {
+		if err := namespace.Close(); err != nil {
+			t.Errorf("close namespace: %v", err)
+		}
+	})
+	handler, err := httprest.NewHandler(namespace, meta)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { log.Close() })
-
-	handler, err := httprest.NewHandler(backing, log)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return handler, opened{namespace: backing, log: log, close: func() error { return nil }}
+	return handler, opened{namespace: namespace, log: meta, close: namespace.Close}
 }

@@ -29,6 +29,7 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/fuse"
 	"github.com/codetreker/remote-fs/packages/fuse/fusetest"
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -76,7 +77,10 @@ type namespaceServer struct {
 func serveNamespace(t *testing.T) *namespaceServer {
 	t.Helper()
 
-	meta, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "namespace.db"), "ws", 0, sqlite.DefaultWindow())
+	meta, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
+		Database: filepath.Join(privateDirectory(t), "namespace.db"), Namespace: "ws",
+		SQLite: sqlite.DefaultOptions(), Locks: locking.DefaultOptions(), Initialize: true,
+	})
 	if err != nil {
 		t.Fatalf("opening the namespace's metastore: %v", err)
 	}
@@ -100,11 +104,32 @@ func serveDirectory(t *testing.T) *namespaceServer {
 	t.Helper()
 
 	backing := t.TempDir()
-	namespace, err := localdir.New(backing)
+	config := localdir.Config{
+		Root: backing, StateRoot: privateDirectory(t),
+		Locks: locking.DefaultOptions(), Limits: localdir.DefaultLimits(),
+	}
+	if err := localdir.Init(t.Context(), config); err != nil {
+		t.Fatalf("initialize directory lock state: %v", err)
+	}
+	namespace, err := localdir.Open(t.Context(), config)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := namespace.Close(); err != nil {
+			t.Errorf("close directory namespace: %v", err)
+		}
+	})
 	return serveStorage(t, namespace, nil, backing)
+}
+
+func privateDirectory(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatalf("make private directory: %v", err)
+	}
+	return directory
 }
 
 func serveStorage(t *testing.T, namespace storage.Storage, log metastore.Log, backing string) *namespaceServer {

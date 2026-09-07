@@ -38,12 +38,14 @@ Status: implemented
 
 - **已用量在 `New` 里走一遍命名空间量出来**，此后由每一次经过这里的修改推动。这是这份 storage 一生中唯一一次无条件的遍历，此后「还剩多少」随时答得出。遍历只调用 `ListBounded`，不会先取得完整 directory slice。
 - **measurement 有两项独立 byte ceiling。** `MeasurementLimits.MaxDirectoryBytes` 限制当前 directory 的 `storage.Entry` 与 name retention，`MaxFrontierBytes` 限制当前及待访问 directory path；零值各自取 64 MiB 默认值，没有 unbounded 取值。任一结构越界时以 `EIO` 失败，取消与 backing error 保留原错误；任何失败都不产生 partial count。
-- **写入按差额收费**：文件将要持有的字节数减去它此刻持有的字节数。检查与收费是同一步，且都发生在写之前；正增量先预留，写失败则退回。负增量也在底层成功前扣账，因此另一写者能花掉一次最终失败的缩短操作释放的额度，[缩短提交后释放配额](../../proposed/bug-fix/2026-09-07-release-shrunk-quota-after-commit.md)处理这项缺陷。
+- **写入按差额收费**：增长在效果发生前预留，缩短只在确定完成后释放。支持 `CheckPublicationAccounting` 的原生 backend 在最终发布处提供实际新旧大小与效果，避免包装层先采样再修改；Applied 按实际效果结算，即使后续确认失败也不倒退已经发生的缩短。NotApplied 退回增长预留；未知效果保留保守额度。修复验收见[缩短提交后释放配额](../bug-fix/2026-09-07-release-shrunk-quota-after-commit.md)。
 - **超出配额以 `EDQUOT` 拒绝**，不是 `ENOSPC`。没有哪块盘满了，是一份额度用完了，而这两句话给使用者指的是完全不同的下一步。两个名字本来就在 errno 词汇表里，那一侧一个字没动。
 - **让命名空间变小的修改从不被拒绝**，已经超出配额时也不拒绝，否则一个超额的 workspace 没有任何回到配额之内的路。同理，一份已经装得比配额多的命名空间照常打开 —— 把配额调到已写内容之下是运维日常，答案是「在吐出一些之前不再收新的」，不是「这份命名空间没法服务了」。
 - **配额不得低于 4096 字节**，见下面「statfs 的算术」。
 
-并发上有三把锁，各自守着一件事。计数自己一把，不跨底层操作持有：一把跨整个操作的锁就是 R-CC-2 所禁止的那种干扰。每条路径一把（固定 256 把，按清洗后的路径散列），串行化散列到同一 stripe 的操作；把数量固定住而不是每条路径一把，是因为后者正是 R-INT-3 点名的无界累积。目录改名只锁源与目标路径，不能保护正在写入的子路径，全部经过 `limited` 的并发调用仍能造成少计，[目录改名中的配额记账](../../proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)处理这项缺陷。最后是一把读写闸，每个操作都以读的方式持有，`Recount` 以写的方式持有。Recount 先在临时变量里完成同一项 bounded measurement，只有全部成功才替换 count；directory/frontier overflow、取消或 backing error 都保留旧 count 并释放闸。
+计数 mutex 不跨底层操作持有。支持原生计费的 Write、Remove 与 Rename 由实际发布协调目标，跳过包装层路径 Stat 与 stripe；这与[文件锁](2026-09-07-file-locks.md)在最终变更处检查实际资源使用同一边界。没有原生能力的有界第三方 backend 仍使用固定 256 把路径 stripe 锁；它们只覆盖直接指定的路径，祖先目录改名可能使子路径采样失效，[目录改名中的配额记账](../../proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)保留这项通用限制。这类 backend 不能向服务端提供非空的锁授权方。
+
+每个操作另持有 Recount 闸的共享访问，Recount 独占它，在临时变量里完成同一项 bounded measurement，只有全部成功才替换 count；directory/frontier overflow、取消或 backing error 都保留旧 count 并释放闸。发布效果未知，或结算、撤销返回 `IsPublicationAccountingUncertain` 时，即使 namespace 已知没有改变，也停止 Space、修改与 Recount，并保留首个不确定错误及原因，直到重新打开。普通准备失败且成功撤销保持可用；不能用一次在线重数掩盖未决计费的后续效果。
 
 配额之下报出的「还能写入的量」，取配额剩余与底层所报之中较小的那个；底层答 `ENOSYS` 时，配额剩余就是任何人手上唯一实测过的数字。底层报出的三个数先过 `Coherent` 再进这个最小值：一个在那里变负的数会从内核回复的无符号字段里出来，成为哪块盘都没有的余量。
 
@@ -55,7 +57,7 @@ Status: implemented
 
 `Space` 探测被权威分类为 `EINTR` 时，错误在改变缓冲区之前返回；直接、包裹或通过 wire 返回的中断都适用，不要求保留原 context 身份。释放探测占用，但保留上次有效数字与原来的探测时间。调用方立即重试会重新探测已经过期或尚不存在的数字，因而不会把取消当成一次完成的刷新。独立故障不会因与取消合并就变成 `EINTR`；其它 advisory measurement failure 的旧值策略与 `ENOSYS` 的能力判断保持不变。取舍见[请求中断](../bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)。
 
-这是这个挂载点持有的唯一一个不描述任何节点的数字。它只用于提前拒绝：数字偏大时，写入可能被放过，提交仍须由命名空间检查；数字偏小时，一次本来放得下的写入可能被拒，刷新后可重试。提交能否正确执行配额，还受上述缩短写与目录改名缺陷约束。
+这是这个挂载点持有的唯一一个不描述任何节点的数字。它只用于提前拒绝：数字偏大时，写入可能被放过，提交仍须由命名空间检查；数字偏小时，一次本来放得下的写入可能被拒，刷新后可重试。原生发布计费与第三方路径采样的准确性边界分别成立，挂载层的数字不能弥补后者的祖先改名缺口。
 
 ### statfs 的算术
 
@@ -81,7 +83,7 @@ Status: implemented
 
 ## 计数依据经过 server 的修改
 
-每一次经过 `limited` 的修改按它观察到的大小推动计数；上述缩短写失败与目录改名交错仍会破坏准确性：
+每一次经过 `limited` 的修改按实际大小差额推动计数；原生 backend 在最终转换处确定这项差额，第三方路径采样仍受祖先改名限制：
 
 | 操作 | 计数怎么动 |
 |---|---|
@@ -127,7 +129,7 @@ Status: implemented
 
 ### 付出的，以及必须叫出名字的缺口
 
-- **计数是 O(1) 的，代价是它在命名空间被从旁边改动之后两个方向都错。** 多收的那一边把一个空目录上的 workspace 卡在 100%；少收的那一边更坏 —— 计数停在真相之下，写入照单被接受，命名空间越过配额而没有任何人被拒绝。全部经过 `limited` 的调用还存在[缩短写失败](../../proposed/bug-fix/2026-09-07-release-shrunk-quota-after-commit.md)与[目录改名交错](../../proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)两项缺陷。计数被压在零以上只约束数字范围，不能证明账本准确；一次成功的 bounded Recount 才重新取得实测值，失败或取消会继续保留旧数。
+- **计数是 O(1) 的，代价是它在命名空间被从旁边改动之后两个方向都错。** 多收会把空目录记为满额，少收会让后续写入超额；压在零以上只约束数字范围。原生发布计费将受管修改的收费与实际目标绑定，第三方路径采样的[目录改名交错](../../proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)仍是缺口。正常账本可以通过成功的 bounded Recount 重新实测，失败保留旧数；发布或计费结果不明的账本必须保持不可用。
 - **「还能写入的量」必须取配额剩余与底层所报之中较小的那个。** 只按配额算出来的数字，在服务端自己那块盘更紧的时候就是一句谎话，而读这个数字的工具会据此中止。这是契约带三个数而不是两个数的原因，也是每一层都得把这个最小值传下去的原因。
 - **配额有一条使用者会撞上的下界。** 低于一个 4096 字节的块会被报成一个零块的文件系统 —— 正是旧的 `ENOSYS` 存在所要挡住的那个全零回复。所以 `limited.New` 拒绝这样的配额，而这是一条会被人撞到的边界，不是一条内部不变式。随附二进制在解析 `-quota` 时就拒绝同一个下界；`-quota 0` 同样被拒，「不给这个 flag」是通往「没有配额」的唯一一条路。measurement flags 只属于同时给出 `-dir` 与 `-quota` 的形态，避免其它 storage 暴露一个不会生效的调节项。
 - **默认配置下，不是挂载者的调用方看到的是一块零块的满盘。** 内核对这样的调用方自己回答 `statfs`，回一个清零的结构（[`fuse_statfs`](https://github.com/torvalds/linux/blob/818bebeb63dd6bf5f4e07e145f6cdbace520a34c/fs/fuse/inode.c#L646-L657)：`fuse_allow_current_process` 不放行时填上 `f_type` 就 `return 0`），守护进程根本不会被问到。于是 `sudo df` 看到的是一块 0 字节、0 可用的盘，别的本地用户也一样。这是既有的内核行为，不是这次引入的 —— 一个不带 `allow_other` 的挂载对他们本来就不可访问。唯一的例外由主机决定而不由本系统决定：fuse 模块参数 `allow_sys_admin_access`（默认关，`0644` 可写）打开后，初始 user namespace 中带 `CAP_SYS_ADMIN` 的调用方[绕过这项检查](https://github.com/torvalds/linux/blob/818bebeb63dd6bf5f4e07e145f6cdbace520a34c/fs/fuse/dir.c#L1684-L1697)，`sudo df` 读到的就是真数字。因此 **`df` 默认是一条只对挂载者有效的通道**：配额报得再准，别人要看见得先在主机上开那个参数。

@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -196,7 +197,7 @@ func (s *Store) Commit(ctx context.Context, path string, object metastore.Object
 		return pathError("commit", path, fmt.Errorf(
 			"an object of %d bytes is not a length: %w", object.Size, syscall.EINVAL))
 	}
-	if err := s.mutate(ctx, func(tx *sql.Tx) error {
+	if err := s.mutateNamespace(ctx, locking.WriteMutation, []string{cleaned}, func(tx *sql.Tx) error {
 		return s.commit(ctx, tx, cleaned, object)
 	}); err != nil {
 		return pathError("commit", path, failure(err))
@@ -1513,7 +1514,7 @@ func (s *Store) Garbage(ctx context.Context, limit int) ([]metastore.Key, error)
 	if limit < 0 {
 		return nil, fmt.Errorf("a limit of %d objects is not a count: %w", limit, syscall.EINVAL)
 	}
-	if err := s.coordinator.beginHealthyRead(); err != nil {
+	if err := s.beginHealthyRead(ctx); err != nil {
 		return nil, err
 	}
 	defer s.coordinator.endHealthyRead()

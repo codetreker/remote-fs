@@ -83,6 +83,11 @@ func mutationTree(t *testing.T) (*node, *node, *mutationStorage) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := local.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	downstream := &mutationStorage{Storage: local}
 	root := &node{ns: &namespace{storage: downstream, maxFileSize: 1024, flushTimeout: DefaultFlushTimeout}, id: rootIdentity()}
 	fs.NewNodeFS(root, &fs.Options{})

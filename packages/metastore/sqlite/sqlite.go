@@ -9,7 +9,8 @@
 // SQLite rather than a server database because a namespace's metadata is small, is read and
 // written by one process, and needs transactions more than it needs a network. The driver
 // is modernc.org/sqlite, which is a translation of SQLite into Go rather than a binding, so
-// this package builds with cgo off and cross-compiles like any other Go code.
+// this package builds with cgo off. Native lease ownership and recovery use Linux
+// filesystem facilities, including xattrs and flock.
 //
 // # Three pools
 //
@@ -40,6 +41,7 @@ import (
 	"io/fs"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -47,6 +49,7 @@ import (
 
 	"modernc.org/sqlite"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -71,7 +74,8 @@ type Store struct {
 	read         *sql.DB
 	snapshotRead *sql.DB
 
-	namespace int64
+	namespace    int64
+	databasePath string
 
 	// root is the id of the directory the namespace starts from. It is fixed for the life of
 	// the namespace — nothing removes or replaces the root — so it is read once rather than
@@ -102,6 +106,9 @@ type Store struct {
 	maxIntegrityBytes   int64
 
 	coordinator          *databaseCoordinator
+	locks                *locking.Authority
+	leaseRecovery        *LeaseRecovery
+	leaseOwner           *leaseDatabaseFile
 	witness              CommitWitness
 	closeMu              sync.Mutex
 	closed               bool
@@ -115,6 +122,8 @@ var _ metastore.Store = (*Store)(nil)
 
 // Open holds the namespace called namespace in the SQLite database at database, under an
 // allowance of allowance bytes and a change log held to window.
+//
+// database is a native filesystem path; URI parameters and percent escapes are rejected.
 //
 // An allowance of zero is a namespace with none, whose Space reports syscall.ENOSYS for as
 // long as the Store exists. A window is required rather than defaulted, because every number
@@ -231,6 +240,7 @@ func OpenBoundDurableWithOptions(
 	return openConfiguredWithHooks(ctx, database, namespace, storeID, allowance, options, durable, storeOpenHooks{
 		openPool:          openPool,
 		openDurableWriter: openPersistentWriterPool,
+		acquireLeaseOwner: acquireLeaseDatabase,
 		prepare:           prepare,
 		closePool: func(db *sql.DB) error {
 			return db.Close()
@@ -245,8 +255,9 @@ func open(
 	options Options,
 ) (*Store, error) {
 	return openWithHooks(ctx, database, namespace, storeID, allowance, options, storeOpenHooks{
-		openPool: openPool,
-		prepare:  prepare,
+		openPool:          openPool,
+		prepare:           prepare,
+		acquireLeaseOwner: acquireLeaseDatabase,
 		closePool: func(db *sql.DB) error {
 			return db.Close()
 		},
@@ -254,6 +265,7 @@ func open(
 }
 
 type storeOpenHooks struct {
+	acquireLeaseOwner func(string, bool, bool) (*leaseDatabaseFile, error)
 	openPool          func(context.Context, string, bool, int) (*sql.DB, error)
 	openDurableWriter func(context.Context, string, int) (*sql.DB, error)
 	prepare           func(context.Context, *sql.DB, string, string, Window, int64, int64) (int64, int64, error)
@@ -277,7 +289,7 @@ func openConfiguredWithHooks(
 	options Options,
 	durable *durableOpen,
 	hooks storeOpenHooks,
-) (*Store, error) {
+) (opened *Store, returnErr error) {
 	if namespace == "" {
 		return nil, fmt.Errorf("a namespace needs a name: %w", syscall.EINVAL)
 	}
@@ -288,16 +300,50 @@ func openConfiguredWithHooks(
 	if err != nil {
 		return nil, err
 	}
-	coordinator, err := acquireCoordinator(database, durable != nil)
+	database, err = filepath.Abs(database)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateNativeLeaseOpening(database, options.leaseRecoveryOwner); err != nil {
+		return nil, err
+	}
+	coordinator, err := acquireCoordinator(database, durable != nil || options.leaseRecoveryOwner)
 	if err != nil {
 		return nil, err
 	}
 	releaseOnFailure := true
+	owner := options.leaseOwner
+	acquiredHere := owner == nil
 	defer func() {
 		if releaseOnFailure {
+			if acquiredHere && owner != nil {
+				if err := owner.Close(); err != nil {
+					returnErr = errors.Join(returnErr, fmt.Errorf("closing native metadata ownership after open failed: %w", &durabilityFailure{err: err}))
+				}
+			}
 			releaseCoordinator(coordinator)
 		}
 	}()
+	if owner != nil {
+		if !options.leaseRecoveryOwner || !owner.exclusive || owner.path != database {
+			return nil, fmt.Errorf("borrowed native metadata ownership does not match this open: %w", syscall.EINVAL)
+		}
+		if err := verifyLeaseDatabase(owner); err != nil {
+			return nil, err
+		}
+	} else if hooks.acquireLeaseOwner != nil {
+		create := durable == nil || durable.mode != RequireExistingNamespace
+		owner, err = hooks.acquireLeaseOwner(database, options.leaseRecoveryOwner, create)
+		if err != nil {
+			if OpenFailureRetainsOwnership(err) {
+				releaseOnFailure = false
+			}
+			return nil, err
+		}
+	}
+	if err := validateNativeLeaseOpening(database, options.leaseRecoveryOwner); err != nil {
+		return nil, err
+	}
 	cleanup := func(primary error, pools ...openPoolHandle) error {
 		cleanupErr := closeOpenPools(hooks.closePool, pools...)
 		if cleanupErr != nil {
@@ -349,7 +395,11 @@ func openConfiguredWithHooks(
 	var id, root int64
 	var state DurableState
 	if durable == nil {
-		id, root, err = hooks.prepare(
+		prepareNamespace := hooks.prepare
+		if options.requireExistingNamespace {
+			prepareNamespace = prepareExistingLeaseNamespace
+		}
+		id, root, err = prepareNamespace(
 			ctx, write, namespace, storeID, options.Window,
 			options.MaxIntegrityRecords, options.MaxIntegrityBytes,
 		)
@@ -372,6 +422,9 @@ func openConfiguredWithHooks(
 			}
 		}
 	}
+	if err == nil {
+		err = validateLeaseOpening(ctx, write, options.leaseRecoveryOwner)
+	}
 	coordinator.commit.release()
 	if err != nil {
 		primary := fmt.Errorf("opening namespace %q in %s: %w", namespace, database, failure(err))
@@ -384,7 +437,9 @@ func openConfiguredWithHooks(
 	store := &Store{
 		write: write, read: read, snapshotRead: snapshotRead,
 		namespace: id, root: root,
-		allowance: allowance, window: options.Window, objectLimits: options.ObjectLimits,
+		databasePath: database,
+		leaseOwner:   owner,
+		allowance:    allowance, window: options.Window, objectLimits: options.ObjectLimits,
 		maxIntegrityRecords: options.MaxIntegrityRecords,
 		maxIntegrityBytes:   options.MaxIntegrityBytes,
 		coordinator:         coordinator,
@@ -510,10 +565,12 @@ func requireFullSynchronous(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// Close releases all pools. A witnessed Store first stops new operations, refuses while a
-// snapshot reader remains, checkpoints every WAL frame, and publishes that checkpoint. EBUSY
-// or a checkpoint-witness failure leaves the writer open so Close can be retried without
-// losing the WAL evidence the external witness still requires.
+// Close retires the lock authority and releases all pools. A witnessed Store stops new
+// operations, refuses while a snapshot reader remains, checkpoints every WAL frame, and
+// publishes that checkpoint. EBUSY or a checkpoint-witness failure leaves the writer open
+// so Close can be retried without losing the WAL evidence the external witness requires.
+// A preserved authority fence remains an error even when SQL pools close successfully;
+// external lifetime ownership can be released only after a nil result.
 func (s *Store) Close() error {
 	return s.CloseContext(context.Background())
 }
@@ -528,16 +585,24 @@ func (s *Store) Terminal() bool {
 }
 
 // CloseContext is Close with a deadline for waiting on the commit gate and completing the
-// witnessed checkpoint. A canceled attempt leaves the writer and persistent WAL open so a
-// later call can retry without losing durability evidence.
+// witnessed checkpoint. Lock authority retirement and admitted operation drain precede
+// that wait. A canceled attempt leaves the writer and persistent WAL open so a later call
+// can retry cleanup; it does not reactivate a retired authority.
 func (s *Store) CloseContext(ctx context.Context) error {
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
 	if s.closed {
 		return s.closeErr
 	}
+	var lockErr error
+	if s.locks != nil {
+		lockErr = s.locks.Close()
+		if lockErr != nil && s.witness != nil {
+			return lockErr
+		}
+	}
 	if err := s.coordinator.commit.acquire(ctx); err != nil {
-		return err
+		return errors.Join(lockErr, err)
 	}
 	defer s.coordinator.commit.release()
 	if s.witness != nil {
@@ -584,10 +649,9 @@ func (s *Store) CloseContext(ctx context.Context) error {
 			poolCloseError("snapshot reader pool", s.closePool(s.snapshotRead)),
 		)
 	}
+	poolErr := s.closeErr
+	s.closeErr = s.finishPoolClosure(poolErr, lockErr)
 	s.closed = true
-	if s.closeErr == nil {
-		releaseCoordinator(s.coordinator)
-	}
 	return s.closeErr
 }
 
@@ -601,24 +665,39 @@ func (s *Store) Abort() error {
 	if s.closed {
 		return s.closeErr
 	}
+	var lockErr error
+	if s.locks != nil {
+		lockErr = s.locks.Close()
+	}
 	if err := s.coordinator.commit.acquire(context.Background()); err != nil {
-		return err
+		return errors.Join(lockErr, err)
 	}
 	defer s.coordinator.commit.release()
 	s.coordinator.health.Lock()
 	s.coordinator.closing = true
 	s.coordinator.health.Unlock()
-	s.closeErr = errors.Join(
+	poolErr := errors.Join(
 		poolCloseError("reader pool", s.closePool(s.read)),
 		poolCloseError("snapshot reader pool", s.closePool(s.snapshotRead)),
 		poolCloseError("writer pool", s.closePool(s.write)),
 	)
+	s.closeErr = s.finishPoolClosure(poolErr, lockErr)
 	s.readClosed = true
 	s.closed = true
-	if s.closeErr == nil {
+	return s.closeErr
+}
+
+func (s *Store) finishPoolClosure(poolErr, authorityErr error) error {
+	var ownerErr error
+	if poolErr == nil && s.leaseOwner != nil && (!s.leaseOwner.exclusive || authorityErr == nil) {
+		if err := s.leaseOwner.Close(); err != nil {
+			ownerErr = fmt.Errorf("closing native metadata ownership: %w", &durabilityFailure{err: err})
+		}
+	}
+	if poolErr == nil {
 		releaseCoordinator(s.coordinator)
 	}
-	return s.closeErr
+	return errors.Join(authorityErr, poolErr, ownerErr)
 }
 
 // Space reports the allowance and what is left of it.
@@ -628,7 +707,7 @@ func (s *Store) Abort() error {
 // zero — an allowance lowered underneath content already written leaves Used above Total,
 // and a negative Avail arrives in a kernel reply's unsigned field as room no disk holds.
 func (s *Store) Space(ctx context.Context) (storage.Space, error) {
-	if err := s.coordinator.beginHealthyRead(); err != nil {
+	if err := s.beginHealthyRead(ctx); err != nil {
 		return storage.Space{}, err
 	}
 	defer s.coordinator.endHealthyRead()
@@ -665,6 +744,10 @@ func (s *Store) Space(ctx context.Context) (storage.Space, error) {
 // otherwise quiet namespace's log inside its age bound. A transaction with nothing to discard
 // pays two indexed lookups for the answer.
 func (s *Store) mutate(ctx context.Context, f func(tx *sql.Tx) error) error {
+	return s.mutatePublication(ctx, nil, f)
+}
+
+func (s *Store) mutatePublication(ctx context.Context, intent *namespaceIntent, f func(tx *sql.Tx) error) (returnErr error) {
 	if err := s.coordinator.commit.acquire(ctx); err != nil {
 		return err
 	}
@@ -676,10 +759,25 @@ func (s *Store) mutate(ctx context.Context, f func(tx *sql.Tx) error) error {
 	if err != nil {
 		return failure(err)
 	}
-	defer tx.Rollback()
+	observationHeld := false
+	defer func() {
+		returnErr = s.finishMutationTransaction(tx, returnErr, observationHeld)
+	}()
 
+	var publication *namespacePublication
+	if intent != nil {
+		publication, err = s.prepareNamespacePublication(ctx, tx, *intent)
+		if err != nil {
+			return err
+		}
+	}
 	if err := f(tx); err != nil {
 		return err
+	}
+	if publication != nil {
+		if err := s.finishNamespacePublication(ctx, tx, publication); err != nil {
+			return err
+		}
 	}
 	if err := trim(ctx, tx, s.namespace, s.window); err != nil {
 		return failure(err)
@@ -689,16 +787,49 @@ func (s *Store) mutate(ctx context.Context, f func(tx *sql.Tx) error) error {
 		return failure(err)
 	}
 	s.coordinator.health.Lock()
-	defer s.coordinator.health.Unlock()
+	observationHeld = true
 	if err := s.coordinator.healthErrorLocked(); err != nil {
 		return err
 	}
+	if publication != nil {
+		return s.publishNamespace(ctx, tx, state, publication)
+	}
+	return s.commitPrepared(tx, state)
+}
+
+// The commit gate remains held until cleanup finishes. Fresh views wait for rollback
+// success or fencing, including when staging failed before publication admission.
+func (s *Store) finishMutationTransaction(tx rollbacker, primary error, observationHeld bool) error {
+	if !observationHeld {
+		s.coordinator.health.Lock()
+	}
+	defer s.coordinator.health.Unlock()
+	rollbackErr := tx.Rollback()
+	if rollbackErr == nil || rollbackErr == sql.ErrTxDone {
+		return primary
+	}
+	err := errors.Join(primary, fmt.Errorf("rolling back the SQLite mutation: %w", &durabilityFailure{err: rollbackErr}))
+	s.coordinator.poisonLocked(err)
+	if s.locks != nil {
+		s.locks.Fence(err)
+	}
+	return err
+}
+
+func (s *Store) commitPrepared(tx *sql.Tx, state DurableState) error {
 	if err := tx.Commit(); err != nil {
 		uncertain := &uncertainCommitError{err: failure(err)}
 		s.coordinator.poisonLocked(uncertain)
+		if s.locks != nil {
+			s.locks.Fence(s.coordinator.healthErrorLocked())
+		}
 		return s.coordinator.healthErrorLocked()
 	}
-	return s.acceptLocked(state)
+	err := s.acceptLocked(state)
+	if err != nil && s.locks != nil {
+		s.locks.Fence(err)
+	}
+	return err
 }
 
 // inspect runs f against the reader pool inside a transaction.
@@ -719,7 +850,7 @@ func (s *Store) inspect(ctx context.Context, f func(tx *sql.Tx) error) error {
 // the potentially long scan and caller-owned result accounting then proceed without delaying
 // a writer's commit boundary.
 func (s *Store) beginReadSnapshot(ctx context.Context, pool *sql.DB) (*sql.Tx, error) {
-	if err := s.coordinator.beginHealthyRead(); err != nil {
+	if err := s.beginHealthyRead(ctx); err != nil {
 		return nil, err
 	}
 	tx, err := pool.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})

@@ -12,9 +12,13 @@
 
 对拍必须跑在**交付出去的那套配置**上。为了让它好过而调松的任何一处 —— 内核超时、提交时机、单文件上限 —— 都会让它去验证一条生产中不存在的路径。
 
+普通对拍中的六处时间设置调用使用 [`comparisonChtimes`](../packages/fuse/fuse_test.go)：每处 `os.Chtimes` 的总尝试次数至多八次，仅在上一次返回 `EINTR` 时重做完全相同的路径、绝对 atime 与 mtime，包括明确省略某个时间的参数。挂载点和普通目录使用同一规则，只重试这一次调用；其它错误立即返回，八次仍中断则保留最后的 `EINTR` 并使对拍失败。这里比较最终的 atime / mtime，ctime 不在对拍结果中。专门验证中断的真实信号用例继续断言第一次系统调用的结果，不使用这个辅助函数。
+
 ## 覆盖率是必要的，从来不是充分的
 
 它只证明那些行跑过了，不证明特性按交付的样子工作。
+
+覆盖率文件本身也须有实际执行证据：mode 头之外有覆盖块、非零执行计数与真实函数记录。`assert-every-test-ran.sh` 当前会把显式 `-coverprofile` 再交给清单调用，可能将已执行的 profile 覆盖为仅有 mode 头的文件；[保留执行覆盖率的提案](../.agents/notes/proposed/bug-fix/2026-09-08-preserve-executed-coverage-in-strict-test-runs.md)单独处理这一缺陷。脚本退出成功或日志中的百分比不能替代对最终文件的核对。
 
 **未覆盖的行往往是死代码 —— 该做的是把它删掉，而不是补一个测试去盖住它。** CI 的覆盖率闸门会把未覆盖的块逐块列出来；名单上的每一行，先问它是不是根本不该存在。
 
@@ -78,6 +82,50 @@ HTTP 用例区分 `Do` 前取消、已发出的只读请求与已发出的 mutat
 
 信号探针独立于纯映射测试，也不把 SIGURG 当作所有历史失败已经证实的原因。四项历史 `cmd` 用例分别以 `-race` 固定采样 100 次，共 400 次；失败如实保留，应用层不增加 `EIO` 重试，不关闭异步抢占，不预热被测操作。这些聚焦样本与信号探针分别提供运行证据，不以重跑整个无关命令套件代替阶段断言。
 
+## 显式文件锁
+
+[文件锁设计](design/server/file-locks.md)的验证分为共享 namespace 契约、authority 状态机、native 最终发布、持久恢复和 HTTP 编码。`X` 证明本次修改的权限，内容版本比较另有自己的义务；普通打开或读取不会隐式取得租约，读取成功也不能充当租约仍有效的断言。
+
+### 保护、身份与有界历史
+
+[共享契约](../packages/storage/lockcontract/contract.go)在普通目录、quota 包装、SQLite/objectstore 和 HTTP namespace 上使用同一套操作。用例覆盖 `S/S` 共存、`S/X` 与不同 Owner 的 `X/X` 冲突，匿名修改与只有 `S` 的持有者自身修改都被拒绝；带有效 `X` 的 Write、显式 mode/atime/mtime、Remove 与 Rename 才能修改受保护目标。普通读取在 `S`、`X` 下仍可完成，无活动保护冲突时匿名修改继续可用。每次拒绝后从 storage 重新读取内容，不能只检查错误码。
+
+身份用例让祖先目录改名、内容原子替换、目标覆盖、删除与同名重建真正发生，验证源文件保持 ResourceID、被覆盖目标退役、旧 proof 不会指向新节点。覆盖式 Rename 必须同时提供受保护源与目标的 `X`；多余或不相关 proof 也必须失败。Scope 用例修改调用方原 proof slice，断言已创建的 scope 不变；显式匿名 scope 不继承外层权限。已解除或到期的 proof 即使没有竞争者，也不能退回匿名执行；空 SetAttr 与自身 Rename 同样验证它。目录、符号链接、缺失路径等不受支持的目标由各 native 适配器另测，普通目录还覆盖 hard link 与外部 inode 变化。
+
+[authority 契约](../packages/locking/authority_contract_test.go)用可控制时钟分别断言不可变动作回执与当前 Grant 状态：冲突或 AlreadyHeld 的已记录拒绝在竞争结束后仍原样重放，成功 Acquire 的原回执在 Release、Expiry 或 TargetGone 后不变，重复 RequestID 携带不同意图必须拒绝。Renew 不缩短已有期限，重复 Renew 不延长第二次，持久水位准备期间到期的 Grant 不得复活。排队写者先于后来读者；排队超时、已授予后取消、尚未到达的 Acquire 被取消，以及取消后迟到的原请求均有确定性交错。控制请求 context 结束不会撤销已经受理的 Pending 意图。
+
+[容量用例](../packages/locking/contract_capacity_test.go)分别耗尽 Session、已消费 enrollment ticket、Owner、Resource、Action、Grant、全局及各层队列、proof 数与请求字节预算，不能用一个较紧的上限代替另一个。活动 Session 上限独立于 ticket 到期；ticket 重放不会创建第二个 Session，原 Session 已关闭也不能借旧 ticket 创建另一个。活动 Owner 的动作回执不被逐条逐出，满历史仍保留 Release、已知 Cancel、RetireOwner 与 CloseSession 的清理路径；新的未见 Cancel 只有取得有界 tombstone 才能确认取消，否则为 OutcomeUnknown。未见动作查询同样不报告“未授予”。NotAdmitted 不产生虚构回执；Renew 在历史满时保留此前已确认期限。引用到期释放 Resource 容量但不缩短已有 Grant，Owner/Session 退役后旧能力不能重新执行动作。
+
+### 最终发布与观察次序
+
+[localdir 用例](../packages/storage/localdir/operations_test.go)与 [objectstore 用例](../packages/storage/objectstore/locking_publication_test.go)在真实 staging 阶段暂停上传，随后推进时钟或取得新的冲突 Grant；恢复上传后必须在最终发布拒绝旧 proof 或匿名修改，原内容保持完整，staging 不暴露为 namespace entry，字节预算最终归还。另一文件的修改必须在暂停期间完成，证明慢上传没有占用它的发布权。SQLite 另让 staging 后的路径指向不同节点，断言 [Commit 根据实际目标验证](../packages/metastore/sqlite/publication_test.go)，Reserve 成功不代表最终发布已经获准。
+
+发布交错用例暂停已经取得最终许可的 native transition，随后启动同资源的 Release、Grant 查询与新的权威视图；它们必须等待该发布结果。localdir 与 authority 独立用例另断言其它文件在最终发布暂停期间可前进；SQLite 保留自身 writer / health 串行化，其发布用例验证新视图等待与旧快照可读。时钟越过租约期限也不能使查询越过未完成发布并先报告 Expired。这里断言授权与效果的次序，不要求已获准的 rename、commit 或同步在到期时刻前物理返回。已经捕获的 immutable object 读取与有界目录快照可以在门外完成；List 的 caller charging 被暂停时，后续修改仍能完成，而旧结果继续呈现捕获时的名字和属性。
+
+失败用例区分未发生、已知发生和结果未知。SetAttr 部分效果与原始错误必须同时保留；已发生的内容替换即使同步或确认失败也更新逻辑绑定，删除与目标覆盖先退役真实受影响身份，再开放后继动作。结果未知、记账收尾失败或持久确认无法证明时，namespace 与 authority 都拒绝继续报告成功；Close 排空在途发布与持久水位准备，关闭失败保留原因和必要所有权，不能对可能已经复用的描述符重试 Close。
+
+[native quota 用例](../packages/storage/limited/publication_test.go)在最终目标确定后计算真实的旧、新大小：增长先预留，只有已知应用才返还缩减或删除释放的字节；未应用的失败返还增长预留并保留原用量。用例暂停 staging 后改名祖先目录并重建原路径，再核对两份内容、即时 Used 与 Recount，避免提前 Stat 的大小被用于另一节点。已应用但回复失败仍按实际效果结算；[未知结果或 unwind/settlement 失败](../packages/storage/limited/publication_uncertainty_test.go)保守保留预留，并使后续修改、Space 与 Recount 失败，已在 staging 的调用也不能越过该状态。嵌套 quota 另验证准备被拒绝后各层预留均已归还。只有实现 native 最终发布记账能力的包装层能同时暴露锁服务；这些断言不把 opaque 第三方 storage 的路径采样包装解释为具有同样保证。
+
+### 恢复与独占所有权
+
+[SQLite 恢复用例](../packages/metastore/sqlite/lock_recovery_test.go)分别在 Prepared 提交、见证写入前后与 Accepted 完成处中断，重新打开后核对恢复出的最大时长与 Prepared 已清除。拒绝用例逐项构造缺失记录、缺失或回退见证、单边状态回退、错误身份、部分 Prepared、跳代、下降的时长与错误字段类型，断言 `EIO`。并发提高水位必须保持单调，取消或持久失败不能确认提高成功，注入的见证错误保留原因链。已有 v3 数据库的迁移先核对原 accepted witness，再改变 schema。
+
+普通目录的 [state 用例](../packages/storage/localdir/state_test.go)与 [fault 用例](../packages/storage/localdir/state_fault_test.go)覆盖明确 Init/Open、匹配的中断初始化 intent、private StateRoot 与服务目录的持久绑定、丢失 READY、复制或替换状态目录，以及 root lifetime lock。恢复期从实际取得独占所有权的单调时刻起算，不能在读取证据后重新起算，也不能被较小的新配置缩短。xattr、flock、rename、文件及目录 fsync 的能力探测在初始化和重开时都要验证失败；暂存和探测残留的清理受数量与字节边界约束。SQLite-backed 模式的 [native lease anchor](../packages/metastore/sqlite/lease_anchor_test.go)另覆盖 workspace/database 绑定、remote filesystem 拒绝、记录校验和、路径替换、探测误报成功及中断 stage 的恢复。
+
+[独立 SQLite 所有权用例](../packages/metastore/sqlite/locking_store_test.go)验证 raw opener 的共享 flock 与授权方的排他 flock 在同进程、跨进程中双向排斥；数据库绑定后不能通过 raw constructor、路径别名或并发拥有者绕过保护。恢复配置和启用入口必须验证真实排他拥有者与 native anchor；重开另一个已有 namespace 时仍须读取同一数据库级最大时长并等待完整恢复间隔，选择不同名字不创建新证据。local store 继续验证单 workspace 根绑定，不能省略锁配置或丢弃见证来恢复为空的 authority。真实子进程在租约已确认后遭 `SIGKILL`，由新的进程或组合 store 重开：内容仍完整，恢复期间读取和状态查询可用，修改为 `EAGAIN`，较小配置不能缩短此前水位；旧 Owner、Grant 和动作不能在新 authority 下重放执行。故障注入与真实退出分别证明具体持久边界和进程生命周期，不把它们当作断电或设备缓存验证。
+
+### HTTP v3 与客户端
+
+[server 用例](../packages/transport/httprest/lock_server_test.go)验证 `/v3/` 协议标记和旧版本拒绝，以及匿名与 scoped 调用都抵达同一个执行保护的 namespace。Scope header 的空值、重复值、错误 base64url、缺失或重复成员、未知字段、超长值和错误使用位置必须在修改前拒绝，随后 Stat 证实目标未创建；读取与控制操作不接受 mutation scope。能力值只在 body/header 中传递，URL 与错误诊断不能泄漏它们。[Scope 用例](../packages/transport/httprest/lock_scope_test.go)逐一验证所有 mutation、WithBarrier 与无效果 mutation 保留复制后的 proof，读取不发送它，匿名 handler 不继承被包装客户端的权限。
+
+[client 编解码用例](../packages/transport/httprest/lock_client_test.go)区分缺失字段与合法零值，覆盖枚举、整数毫秒、溢出、嵌套意图、截断和不一致的成功或错误结果。HTTP 422 的已记录拒绝必须同时返回原 ActionResult 与 typed error；`lockCode`、errno、recorded、意图、Grant 与回执 variant 不匹配时按协议错误处理，未受理的失败没有虚构 receipt。丢失 Acquire 回复后使用原 Owner、RequestID 与 ResourceRef 核对结果，迟到的原请求不能越过已确认 Cancel，也不能用新身份重新申请。错误归类继续保存原 context 或网络错误原因。
+
+[历史窗口用例](../packages/locking/history_test.go)与 wire 用例推进时钟后核对 Resolve 的 `HistoryExpiresMillis` 已报告延长后的 Session 历史期限，同时区分资源引用本身的 expiry。响应缺少 historyExpiresMillis 必须解码失败，Acquire 的嵌套 ResourceRef 与 receipt 也保留该必需字段。其它成功控制与带回执的已记录拒绝均核对当前历史期限；Acquire / Renew 重放在等待查询前不能先延长期限，再因取消返回一份没有期限的错误。测试同时核对实际延长与返回的期限，不能只断言内部 Session 尚未到期。
+
+Pending 用例先占满 authority 的申请队列，随后确认 HTTP control admission 已归还，Renew、QueryAction、Cancel 与 Release 仍可完成；Acquire 的 Wait 是受理后意图的有限寿命，不是 HTTP 长请求的占用时间。另一组用例同时耗尽 server body/response 与 client response admission，enrollment 和状态控制仍须完成。控制 admission 的配置用例分别检查默认值、非法上限和有效配置的传递；client 名额满时，拒绝必须发生在发送前，并保留 `recorded = false`，不能声称动作已有结果。
+
+时间断言使用不同于墙钟的 authority ticks。[毫秒回归用例](../packages/locking/contract_regression_test.go)构造到期 1.1 ms、当前 0.9 ms 的边界，要求仍 Active 的 Grant 报告 `RemainingMillis = 0`，不能把分别取整后的两个时间相减得到 1 ms。客户端本地提示从请求发送时刻加 remaining 起算，零余额不获得新期限，Expired 不产生有效期限；原回执的 TTL、deadline 与 revision 不能重置当前保护。控制操作在 dispatch 前取消为 `EINTR`；已 dispatch 的状态修改即使因取消丢失回复也为结果未知的 `EIO`，只读 Query 的 POST 仍按读取语义分类。上述用例不以 HTTP method 判断操作是否已有副作用。
+
 ## 元数据副本的读写交接
 
 [副本读写门](../.agents/notes/implemented/bug-fix/2026-09-07-let-replica-writers-progress.md)分别验证类间次序和真实入口。门的确定性交错用例先证明写者已登记，再放开旧读者；读者批次必须在唤醒前保留名额，尚未获调度的读者也不能被下一写者越过。覆盖批次内读者的正常进入与取消、后来读者进入下一批、多写者中只撤销本次取消，以及取消最后一个等待写者后重新放行读取。
@@ -101,7 +149,11 @@ HTTP 用例区分 `Do` 前取消、已发出的只读请求与已发出的 mutat
 
 库内部直接调用能通过，而挂载后不行 —— 这类失败只有真实入口能暴露。作为库被链接的那条路径同样要测：不注册信号处理、不写标准输出、不调用进程退出。**这一条要两种检查一起用**：把测试二进制重新当作一个普通程序执行，断言它真实的描述符上什么都没有；以及在源码的语法树上静态检查同一批禁令。两者抓的不是同一类东西 —— 运行时那条抓的是依赖替我们打印的东西，静态那条抓的是没有任何测试到达的代码。
 
-构建出的 `remote-fs-server` 二进制覆盖普通目录的启动、挂载与停止，常见命令行拒绝，以及 local store 的跨进程重启持久性与独占锁竞争。需要证明锁跨进程生效时，第二个真实进程直接尝试打开同一根目录，不以首个进程的日志代替事实。
+构建出的 `remote-fs-server` 二进制覆盖普通目录的启动、挂载与停止，常见命令行拒绝，以及 local store 的跨进程重启持久性与独占锁竞争。需要证明独占所有权跨进程生效时，第二个真实进程直接尝试打开同一根目录，不以首个进程的日志代替事实。
+
+[文件锁二进制用例](../cmd/locks_test.go)分别启动普通目录、quota-limited 目录、local store 与 Azure Blob 三种 mode 的四种配置，经过真实 HTTP 验证 `S/S`、匿名与同 Owner 的 `S` 修改拒绝、`X` 修改、改名后的身份保持、删除重建和不相关 proof 拒绝，再重新读取目标与未触碰文件。重启用例在已确认 3 秒租约后杀死 server，以 500 ms 配置重开，要求恢复剩余时长仍大于 500 ms、期间读取成功而修改为 `EAGAIN`；恢复后修改可用，旧 proof 为 `ESTALE`，旧动作查询为 Retired。普通目录另用真实进程拒绝缺少、复制、替换或重新初始化已有 StateRoot。Blob 路径使用同一 Azurite 依赖，不能以另外两种 mode 的结果代替它。
+
+[锁配置用例](../cmd/remote-fs-server/lock_configuration_test.go)验证容量和期限逐项传入 authority，`-initialize-lock-state` 是显式动作，`-lock-state-root` 仅用于普通目录，非法配置在 listener 或状态初始化之前拒绝；native 目录预算和 HTTP write/staging 上限另有配置断言。[状态用例](../cmd/remote-fs-server/status_test.go)检查 ready、recovering、unavailable 和各项计数，不输出 Authority 能力材料；状态失败不拼接部分容量数字，不可用的 authority 不宣布就绪，缺失 status 能力的 namespace 被关闭且关闭错误保留。这些包内断言验证参数与 lifecycle wiring，跨进程结论仍由二进制用例提供。
 
 其余聚焦的 server 入口行为在 `cmd/remote-fs-server` 包内验证：配置解析与默认值，三种 storage mode 的打开路径，READY 与 signal ownership 的顺序，SIGHUP 的异步 recount 或 metastore-backed status，SIGINT／SIGTERM 的 admission 停止与 handler 排空，以及 partial-open 或 shutdown failure 后的资源释放。quota measurement flags 只允许用于 quota-limited `-dir`；pending、reader、integrity、sweep、snapshot-frame 与 subscription flags 只允许用于 metastore/objectstore-backed mode，local waiting-operation flag 只允许用于 local store，且 invalid bounds 在 listener/root mutation 前拒绝。sweep 用例还拒绝非正 interval/batch 与超过 `MaxSweepBatch` 的 effectively-unbounded batch。write-bound 用例分别验证 local object 上限、Blob 5000 MiB 上限与 pending-byte threshold 的精确边界和超限拒绝。startup 的 directory/frontier 超限不会打印 READY，recount 的对应超限与取消保留此前 `Space.Used` 且服务继续工作；两种 metastore-backed status 都断言打印 effective reader/integrity-record/name-byte limits，local status 另打印 waiting/active operations。blocked recount 用例还断言终止信号在等待 handler 之前关闭 admission 并取消遍历，shutdown 同时使 listener 不再接受新连接。这些用例直接调用命令内部的 opener 与 lifecycle helper；它们验证同一条命令代码路径，不构成已构建二进制的进程边界证据。
 

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -20,10 +21,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	metasqlite "github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/locked"
 )
 
 func TestListResponseFitCalculationMatchesTheWire(t *testing.T) {
@@ -227,7 +230,7 @@ func TestStreamSetupErrorsUseClientResponseAdmission(t *testing.T) {
 }
 
 func TestHandlerAdmissionBoundsStatWaitersAndAQueuedWrite(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
+	backing, err := pairedDirectory(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +279,7 @@ func TestHandlerAdmissionBoundsStatWaitersAndAQueuedWrite(t *testing.T) {
 }
 
 func TestHandlerChargesFixedErrorResponsesAgainstAggregateBytes(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
+	backing, err := pairedDirectory(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +327,7 @@ func TestHandlerChargesFixedErrorResponsesAgainstAggregateBytes(t *testing.T) {
 }
 
 func TestSnapshotFrameAdmissionBoundsAggregateWaitersAndCancellation(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
+	backing, err := pairedDirectory(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +405,7 @@ func TestChangeDeliveryIsIndependentOfSnapshotAdmissionAndASlowSubscriber(t *tes
 	if err := log.Create(t.Context(), "changed"); err != nil {
 		t.Fatal(err)
 	}
-	backing, err := localdir.New(t.TempDir())
+	backing, err := pairedDirectory(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -463,7 +466,7 @@ func TestSnapshotKeepalivesContinueWhileFrameAdmissionWaits(t *testing.T) {
 	if err := log.Create(t.Context(), "entry"); err != nil {
 		t.Fatal(err)
 	}
-	backing, err := localdir.New(t.TempDir())
+	backing, err := pairedDirectory(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -623,7 +626,7 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 }
 
 func TestSubscriptionAdmissionReleasesOnCancelAndStop(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
+	backing, err := pairedDirectory(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -775,6 +778,10 @@ type multiBlockedStatStorage struct {
 	release chan struct{}
 }
 
+func (s *multiBlockedStatStorage) LockService() locking.Service {
+	return s.BoundedStorage.(locked.Backend).LockService()
+}
+
 func (s *multiBlockedStatStorage) Stat(ctx context.Context, path string) (storage.Attr, error) {
 	s.entered <- struct{}{}
 	select {
@@ -783,6 +790,10 @@ func (s *multiBlockedStatStorage) Stat(ctx context.Context, path string) (storag
 		return storage.Attr{}, ctx.Err()
 	}
 	return s.BoundedStorage.Stat(ctx, path)
+}
+
+func (s *blockedStatStorage) LockService() locking.Service {
+	return s.BoundedStorage.(locked.Backend).LockService()
 }
 
 func (s *blockedStatStorage) Stat(ctx context.Context, path string) (storage.Attr, error) {
@@ -824,4 +835,30 @@ func serveInternal(t *testing.T, handler http.Handler, request Request, body io.
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httpRequest)
 	return response
+}
+
+func pairedDirectory(t *testing.T, root string) (*localdir.Storage, error) {
+	t.Helper()
+	config := localdir.Config{
+		Root:      root,
+		StateRoot: t.TempDir(),
+		Locks:     locking.DefaultOptions(),
+		Limits:    localdir.DefaultLimits(),
+	}
+	if err := os.Chmod(config.StateRoot, 0o700); err != nil {
+		return nil, err
+	}
+	if err := localdir.Init(t.Context(), config); err != nil {
+		return nil, err
+	}
+	backend, err := localdir.Open(t.Context(), config)
+	if err != nil {
+		return nil, err
+	}
+	t.Cleanup(func() {
+		if err := backend.Close(); err != nil {
+			t.Errorf("close directory: %v", err)
+		}
+	})
+	return backend, nil
 }

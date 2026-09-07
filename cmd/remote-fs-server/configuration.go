@@ -8,8 +8,10 @@ import (
 	"math"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage/limited"
+	"github.com/codetreker/remote-fs/packages/storage/localdir"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/azblob"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/localdisk"
@@ -51,6 +53,10 @@ type commandConfig struct {
 	http                         httprest.HandlerOptions
 	standalone                   standaloneHTTPOptions
 	measurement                  limited.MeasurementLimits
+	locks                        locking.Options
+	lockStateRoot                string
+	initializeLockState          bool
+	directoryLimits              localdir.Limits
 }
 
 type localSource struct {
@@ -85,6 +91,14 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 	localRoot := flags.String("local-store", "", "existing owner-only directory below a deployment-controlled parent; holds\n"+
 		"local objects, SQLite metadata and the owner lock")
 	workspace := flags.String("workspace", "", "name of the namespace in a blob container or local store")
+	lockStateRoot := flags.String("lock-state-root", "", "existing private directory outside the served tree for durable file-lock state;\n"+
+		"required with -dir and must be on the same mount")
+	initializeLockState := flags.Bool("initialize-lock-state", false, "initialize durable file-lock state explicitly; ordinary startup only opens\n"+
+		"existing state and refuses missing or mismatched evidence")
+	lockOptions := locking.DefaultOptions()
+	bindLockOptions(flags, &lockOptions)
+	directoryLimits := localdir.DefaultLimits()
+	bindDirectoryLimits(flags, &directoryLimits)
 
 	var quota sizeFlag
 	flags.Var(&quota, "quota", "allowance the namespace is held under, as a `SIZE`: a whole number of bytes,\n"+
@@ -135,12 +149,17 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 		"maximum garbage objects removed by one sweep in a blob or local-store namespace")
 
 	httpOptions := httprest.DefaultHandlerOptions()
+	maxConcurrentLockControls := flags.Int("http-max-concurrent-lock-controls", httpOptions.MaxConcurrentLockControls,
+		"maximum lock-management requests admitted independently of file-content requests")
+	maxWaitingLockControls := flags.Int("http-max-waiting-lock-controls", httpOptions.MaxWaitingLockControls,
+		"maximum lock-management requests waiting for admission; zero selects the package default")
 	maxHTTPBody := positiveSizeFlag{bytes: httpOptions.MaxBodyBytes}
 	flags.Var(&maxHTTPBody, "http-max-body-bytes", "largest non-streaming HTTP request or response body, as SIZE; larger\n"+
 		"reads fail with EFBIG, and oversized listings fail with EIO")
 	var maxHTTPWrite inheritedSizeFlag
 	flags.Var(&maxHTTPWrite, "http-max-write-bytes", "largest file-content HTTP request, as SIZE; larger writes fail with EFBIG.\n"+
-		"Without it this inherits -http-max-body-bytes. With -local-store its effective\n"+
+		"Without it this inherits -http-max-body-bytes, capped by -dir-max-staging-bytes\n"+
+		"for a directory namespace. With -local-store its effective\n"+
 		"value may not exceed -local-max-object-bytes")
 	maxConcurrentHTTPBodies := flags.Int("http-max-concurrent-bodies", httpOptions.MaxConcurrentBodies,
 		"maximum HTTP request bodies retained at once")
@@ -192,13 +211,18 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 		"largest traversal frontier retained while measuring a quota-limited -dir, as SIZE")
 
 	flags.Usage = func() {
-		fmt.Fprint(errOut, "usage: remote-fs-server -listen ADDR -dir DIR [-quota SIZE] [HTTP OPTIONS]\n"+
-			"       remote-fs-server -listen ADDR -blob-container NAME -metastore PATH -workspace NAME [-blob-prefix PREFIX] [-quota SIZE] [METASTORE OPTIONS] [HTTP OPTIONS]\n"+
-			"       remote-fs-server -listen ADDR -local-store DIR -workspace NAME -quota SIZE [METASTORE OPTIONS] [LOCAL OPTIONS] [HTTP OPTIONS]\n\n"+
+		fmt.Fprint(errOut, "usage: remote-fs-server -listen ADDR -dir DIR -lock-state-root DIR [-initialize-lock-state] [-quota SIZE] [DIRECTORY OPTIONS] [LOCK OPTIONS] [HTTP OPTIONS]\n"+
+			"       remote-fs-server -listen ADDR -blob-container NAME -metastore PATH -workspace NAME [-initialize-lock-state] [-blob-prefix PREFIX] [-quota SIZE] [METASTORE OPTIONS] [LOCK OPTIONS] [HTTP OPTIONS]\n"+
+			"       remote-fs-server -listen ADDR -local-store DIR -workspace NAME -quota SIZE [-initialize-lock-state] [METASTORE OPTIONS] [LOCAL OPTIONS] [LOCK OPTIONS] [HTTP OPTIONS]\n\n"+
 			"Serves one namespace over HTTP. Mount it with remote-fs.\n\n"+
 			"The namespace comes from exactly one of -dir, -blob-container and -local-store.\n"+
 			"A local store owns its directory exclusively for the server lifetime and keeps\n"+
 			"its objects, SQLite metadata and recovery state below that directory.\n\n"+
+			"Initialize file-lock evidence explicitly with -initialize-lock-state. Reopen\n"+
+			"without that flag to preserve existing evidence. Directory state belongs in\n"+
+			"-lock-state-root; metastore-backed modes keep it beside their database.\n"+
+			"During recovery the server accepts snapshot reads and status queries. Grants\n"+
+			"and mutations fail with EAGAIN until prior protection has expired.\n\n"+
 			"The pending-object thresholds, SQLite reader pools and integrity work limits\n"+
 			"apply to both metastore-backed forms. SIGHUP recounts a quota-limited -dir\n"+
 			"namespace; for either metastore-backed form it reports current backlog and\n"+
@@ -206,8 +230,8 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 			"The standalone server bounds accepted connections and header/idle waits. Active\n"+
 			"change streams keep their handler-owned deadlines rather than a process-wide\n"+
 			"write timeout.\n\n"+
-			"There is no authentication and no authorization: anything that can connect can\n"+
-			"read and write everything in the namespace. Serve only on a trusted network.\n\n")
+			"File locks enforce explicit stable and exclusive grants. Enrollment has no\n"+
+			"identity-provider authentication; serve only on a trusted network.\n\n")
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
@@ -263,8 +287,14 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 			MaxDirectoryBytes: maxDirectoryBytes.bytes,
 			MaxFrontierBytes:  maxFrontierBytes.bytes,
 		},
+		locks:               lockOptions,
+		lockStateRoot:       *lockStateRoot,
+		initializeLockState: *initializeLockState,
+		directoryLimits:     directoryLimits,
 	}
 	config.http.MaxBodyBytes = maxHTTPBody.bytes
+	config.http.MaxConcurrentLockControls = *maxConcurrentLockControls
+	config.http.MaxWaitingLockControls = *maxWaitingLockControls
 	config.http.MaxWriteBytes = maxHTTPWrite.bytes
 	config.http.MaxConcurrentBodies = *maxConcurrentHTTPBodies
 	config.http.MaxWaitingBodies = *maxWaitingHTTPBodies
@@ -277,6 +307,9 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 	config.http.MaxConcurrentSnapshotFrames = *maxConcurrentHTTPSnapshotFrames
 	config.http.MaxInFlightSnapshotFrameBytes = maxInFlightHTTPSnapshotFrameBytes.bytes
 	config.http.MaxWaitingSnapshotFrames = *maxWaitingHTTPSnapshotFrames
+	if config.directory != "" && config.http.MaxWriteBytes == 0 {
+		config.http.MaxWriteBytes = min(config.http.MaxBodyBytes, config.directoryLimits.MaxStagingBytes)
+	}
 	return validateConfig(config, given, flags.Args())
 }
 
@@ -300,6 +333,12 @@ func validateConfig(config commandConfig, given map[string]bool, extra []string)
 	if config.http.MaxConcurrentBodies <= 0 {
 		return commandConfig{}, false, errors.New("-http-max-concurrent-bodies must be positive")
 	}
+	if config.http.MaxConcurrentLockControls <= 0 {
+		return commandConfig{}, false, errors.New("-http-max-concurrent-lock-controls must be positive")
+	}
+	if config.http.MaxWaitingLockControls < 0 {
+		return commandConfig{}, false, errors.New("-http-max-waiting-lock-controls must be non-negative")
+	}
 	if config.http.MaxWaitingBodies < 0 {
 		return commandConfig{}, false, errors.New("-http-max-waiting-bodies must be non-negative")
 	}
@@ -319,6 +358,9 @@ func validateConfig(config commandConfig, given map[string]bool, extra []string)
 		return commandConfig{}, false, errors.New("-http-max-waiting-snapshot-frames must be non-negative")
 	}
 	if err := config.http.Check(); err != nil {
+		return commandConfig{}, false, err
+	}
+	if err := validateLockOptions(config.locks); err != nil {
 		return commandConfig{}, false, err
 	}
 
@@ -379,6 +421,15 @@ func validateConfig(config commandConfig, given map[string]bool, extra []string)
 	}
 	if sources == 0 {
 		return commandConfig{}, false, errors.New("a namespace is required: give exactly one of -dir, -blob-container and -local-store")
+	}
+	if given["lock-state-root"] && config.directory == "" {
+		return commandConfig{}, false, errors.New("-lock-state-root requires -dir; metastore-backed namespaces keep their recovery evidence beside the database")
+	}
+	if config.directory != "" && config.lockStateRoot == "" {
+		return commandConfig{}, false, errors.New("-lock-state-root is required with -dir: a private state directory outside the served tree on the same mount")
+	}
+	if err := validateDirectoryLimits(config, given); err != nil {
+		return commandConfig{}, false, err
 	}
 	if config.directory != "" && config.quota != 0 {
 		if err := config.measurement.Validate(); err != nil {

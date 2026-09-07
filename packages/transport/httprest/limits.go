@@ -147,6 +147,11 @@ func (l Limits) check() error {
 // HandlerOptions configure request-body, non-streaming response, and replication resources
 // retained by a Handler.
 type HandlerOptions struct {
+	// Lock control admission is independent of bulk bodies and replication. Zero selects
+	// the corresponding default; each active call reserves four fixed control bodies.
+	MaxConcurrentLockControls int
+	MaxWaitingLockControls    int
+
 	// Replication bounds change and snapshot streams. A zero value selects DefaultLimits;
 	// otherwise every field must be positive.
 	Replication Limits
@@ -212,6 +217,8 @@ type HandlerOptions struct {
 // it continues to inherit MaxBodyBytes if the returned protocol limit is changed.
 func DefaultHandlerOptions() HandlerOptions {
 	return HandlerOptions{
+		MaxConcurrentLockControls:     DefaultMaxConcurrentLockControls,
+		MaxWaitingLockControls:        DefaultMaxWaitingLockControls,
 		Replication:                   DefaultLimits(),
 		MaxBodyBytes:                  DefaultMaxBodyBytes,
 		MaxConcurrentBodies:           DefaultMaxConcurrentBodies,
@@ -228,6 +235,8 @@ func DefaultHandlerOptions() HandlerOptions {
 }
 
 type handlerOptions struct {
+	maxConcurrentLockControls     int
+	maxWaitingLockControls        int
 	replication                   Limits
 	maxBodyBytes                  int64
 	maxWriteBytes                 int64
@@ -245,6 +254,8 @@ type handlerOptions struct {
 
 func (o HandlerOptions) settle() handlerOptions {
 	settled := handlerOptions{
+		maxConcurrentLockControls:     o.MaxConcurrentLockControls,
+		maxWaitingLockControls:        o.MaxWaitingLockControls,
 		replication:                   o.Replication,
 		maxBodyBytes:                  o.MaxBodyBytes,
 		maxWriteBytes:                 o.MaxWriteBytes,
@@ -258,6 +269,12 @@ func (o HandlerOptions) settle() handlerOptions {
 		maxConcurrentSnapshotFrames:   o.MaxConcurrentSnapshotFrames,
 		maxInFlightSnapshotFrameBytes: o.MaxInFlightSnapshotFrameBytes,
 		maxWaitingSnapshotFrames:      o.MaxWaitingSnapshotFrames,
+	}
+	if settled.maxConcurrentLockControls == 0 {
+		settled.maxConcurrentLockControls = DefaultMaxConcurrentLockControls
+	}
+	if settled.maxWaitingLockControls == 0 {
+		settled.maxWaitingLockControls = DefaultMaxWaitingLockControls
 	}
 	if settled.replication == (Limits{}) {
 		settled.replication = DefaultLimits()
@@ -305,6 +322,9 @@ func (o HandlerOptions) settle() handlerOptions {
 // it before opening the storage that will be handed to NewHandlerWithOptions.
 func (o HandlerOptions) Check() error {
 	settled := o.settle()
+	if err := checkLockControlLimits(settled.maxConcurrentLockControls, settled.maxWaitingLockControls); err != nil {
+		return err
+	}
 	if err := settled.replication.check(); err != nil {
 		return err
 	}
@@ -395,6 +415,11 @@ func retainedEventFrameBytes(subscriptions int, maxFrameBytes int64) (int64, err
 
 // DialOptions configure the resources retained by a Storage obtained through Dial.
 type DialOptions struct {
+	// Lock control admission is independent of bulk bodies and replication. Zero selects
+	// the corresponding default; each active call reserves four fixed control bodies.
+	MaxConcurrentLockControls int
+	MaxWaitingLockControls    int
+
 	// Silence is how long a stream may say nothing before it is treated as no longer
 	// delivered. Zero selects DefaultSilence.
 	Silence time.Duration
@@ -427,16 +452,27 @@ type DialOptions struct {
 // continues to inherit MaxBodyBytes if the returned protocol limit is changed.
 func DefaultDialOptions() DialOptions {
 	return DialOptions{
-		Silence:                  DefaultSilence,
-		MaxBodyBytes:             DefaultMaxBodyBytes,
-		MaxFrameBytes:            DefaultMaxFrameBytes,
-		MaxConcurrentResponses:   DefaultMaxConcurrentResponses,
-		MaxInFlightResponseBytes: DefaultMaxInFlightResponseBytes,
-		MaxWaitingResponses:      DefaultMaxWaitingResponses,
+		MaxConcurrentLockControls: DefaultMaxConcurrentLockControls,
+		MaxWaitingLockControls:    DefaultMaxWaitingLockControls,
+		Silence:                   DefaultSilence,
+		MaxBodyBytes:              DefaultMaxBodyBytes,
+		MaxFrameBytes:             DefaultMaxFrameBytes,
+		MaxConcurrentResponses:    DefaultMaxConcurrentResponses,
+		MaxInFlightResponseBytes:  DefaultMaxInFlightResponseBytes,
+		MaxWaitingResponses:       DefaultMaxWaitingResponses,
 	}
 }
 
 func (o DialOptions) settle() (DialOptions, error) {
+	if o.MaxConcurrentLockControls == 0 {
+		o.MaxConcurrentLockControls = DefaultMaxConcurrentLockControls
+	}
+	if o.MaxWaitingLockControls == 0 {
+		o.MaxWaitingLockControls = DefaultMaxWaitingLockControls
+	}
+	if err := checkLockControlLimits(o.MaxConcurrentLockControls, o.MaxWaitingLockControls); err != nil {
+		return DialOptions{}, err
+	}
 	if o.Silence == 0 {
 		o.Silence = DefaultSilence
 	}

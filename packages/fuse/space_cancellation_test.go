@@ -6,13 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"net/http/httptest"
+	"os"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/locked"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
@@ -133,7 +136,7 @@ func TestSuccessfulQuotaQueryIgnoresLateCancellation(t *testing.T) {
 }
 
 type namedInterruptionSpace struct {
-	storage.BoundedStorage
+	locked.Backend
 	calls atomic.Int32
 }
 
@@ -145,11 +148,23 @@ func (s *namedInterruptionSpace) Space(context.Context) (storage.Space, error) {
 }
 
 func TestQuotaQueryHonorsWireInterruptionAndImmediatelyMeasuresAgain(t *testing.T) {
-	local, err := localdir.New(t.TempDir())
+	config := localdir.Config{Root: t.TempDir(), StateRoot: t.TempDir(), Locks: locking.DefaultOptions(), Limits: localdir.DefaultLimits()}
+	if err := os.Chmod(config.StateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := localdir.Init(t.Context(), config); err != nil {
+		t.Fatal(err)
+	}
+	local, err := localdir.Open(t.Context(), config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	backend := &namedInterruptionSpace{BoundedStorage: local}
+	t.Cleanup(func() {
+		if err := local.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	backend := &namedInterruptionSpace{Backend: local}
 	handler, err := httprest.NewHandler(backend, nil)
 	if err != nil {
 		t.Fatal(err)

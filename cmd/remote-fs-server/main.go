@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -36,9 +37,8 @@ import (
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-// shutdownGrace is how long requests already in flight have to finish once a signal has
-// arrived. A write that is cut off here would leave the caller unable to tell whether it
-// happened, which is the one answer this system must never give.
+// shutdownGrace bounds graceful HTTP draining. After it expires, handlers are cancelled
+// and drained before storage ownership is released.
 const shutdownGrace = 5 * time.Second
 
 // statusDeadline bounds an operator query independently of request shutdown. The status
@@ -195,50 +195,62 @@ type opened struct {
 	status      func(context.Context) (string, error)
 	close       func() error
 	measurement limited.MeasurementLimits
+	lockStatus  func(context.Context) (locking.Status, error)
+}
+
+type lockConfig struct {
+	options         locking.Options
+	stateRoot       string
+	initialize      bool
+	directoryLimits localdir.Limits
 }
 
 // open builds the namespace the validated command line selected.
 func open(config commandConfig) (opened, error) {
+	locks := lockConfig{options: config.locks, stateRoot: config.lockStateRoot, initialize: config.initializeLockState, directoryLimits: config.directoryLimits}
 	switch {
 	case config.directory != "":
-		return openDirectory(config.directory, config.quota, config.measurement)
+		return openDirectory(config.directory, config.quota, config.measurement, locks)
 	case config.local.given():
 		return openLocal(
 			config.local, config.quota, config.objectLimits,
 			config.maxReaderConnections, config.maxSnapshotReaderConnections,
-			config.maxIntegrityRecords, config.maxIntegrityBytes, config.maintenance,
+			config.maxIntegrityRecords, config.maxIntegrityBytes, config.maintenance, locks,
 		)
 	default:
 		return openBlobs(
 			config.blob, config.quota, config.objectLimits,
 			config.maxReaderConnections, config.maxSnapshotReaderConnections,
-			config.maxIntegrityRecords, config.maxIntegrityBytes, config.maintenance,
+			config.maxIntegrityRecords, config.maxIntegrityBytes, config.maintenance, locks,
 		)
 	}
 }
 
-// openDirectory serves a local directory, held under an allowance or exactly as it is.
-//
-// Measuring what the namespace already holds is the only step here that can take real time,
-// so the description says how long it took whenever that is worth knowing.
-func openDirectory(dir string, quota int64, measurement limited.MeasurementLimits) (opened, error) {
-	backing, err := localdir.New(dir)
-	if err != nil {
-		return opened{}, err
+// openDirectory owns the directory's lock evidence and optional quota accounting.
+func openDirectory(dir string, quota int64, measurement limited.MeasurementLimits, locks lockConfig) (opened, error) {
+	options := localdir.Config{Root: dir, StateRoot: locks.stateRoot, Locks: locks.options, Limits: locks.directoryLimits}
+	if locks.initialize {
+		if err := localdir.Init(context.Background(), options); err != nil {
+			return opened{}, fmt.Errorf("initializing directory file-lock state: %w", err)
+		}
 	}
-	result := opened{namespace: backing, what: dir, close: func() error { return nil }}
+	backing, err := localdir.Open(context.Background(), options)
+	if err != nil {
+		return opened{}, fmt.Errorf("opening directory namespace and file-lock state: %w", err)
+	}
+	result := opened{namespace: backing, what: dir, close: backing.Close}
 	if quota == 0 {
-		return result, nil
+		return withLockStatus(result, backing.LockService())
 	}
 
 	started := time.Now()
 	effectiveMeasurement, err := measurement.Effective()
 	if err != nil {
-		return opened{}, err
+		return opened{}, errors.Join(err, closeAfterOpenFailure("directory", backing.Close()))
 	}
 	held, err := limited.NewWithLimits(context.Background(), backing, quota, effectiveMeasurement)
 	if err != nil {
-		return opened{}, err
+		return opened{}, errors.Join(err, closeAfterOpenFailure("directory", backing.Close()))
 	}
 	walk := time.Since(started)
 
@@ -248,7 +260,7 @@ func openDirectory(dir string, quota int64, measurement limited.MeasurementLimit
 	// claims a limit and enforces none of it.
 	space, err := held.Space(context.Background())
 	if err != nil {
-		return opened{}, err
+		return opened{}, errors.Join(err, closeAfterOpenFailure("directory", backing.Close()))
 	}
 	measured := ""
 	if walk >= noticeableWalk {
@@ -257,7 +269,7 @@ func openDirectory(dir string, quota int64, measurement limited.MeasurementLimit
 	result.namespace, result.held = held, held
 	result.measurement = effectiveMeasurement
 	result.allowance = fmt.Sprintf(" under an allowance of %d bytes, %d of them taken%s,", space.Total, space.Used, measured)
-	return result, nil
+	return withLockStatus(result, backing.LockService())
 }
 
 func openLocal(
@@ -269,6 +281,7 @@ func openLocal(
 	maxIntegrityRecords int64,
 	maxIntegrityBytes int64,
 	maintenance objectstore.Options,
+	locks lockConfig,
 ) (opened, error) {
 	maxWaitingOperations := source.objects.MaxWaitingOperations
 	if maxWaitingOperations == 0 {
@@ -286,6 +299,8 @@ func openLocal(
 		MaxIntegrityRecords:          maxIntegrityRecords,
 		MaxIntegrityBytes:            maxIntegrityBytes,
 		Maintenance:                  maintenance,
+		Locks:                        &locks.options,
+		InitializeLocks:              locks.initialize,
 	})
 	if err != nil {
 		return opened{}, err
@@ -294,7 +309,7 @@ func openLocal(
 	if err != nil {
 		return opened{}, errors.Join(err, closeAfterOpenFailure("local store", store.Close()))
 	}
-	return opened{
+	return withLockStatus(opened{
 		namespace:  store,
 		log:        store.Log(),
 		exact:      true,
@@ -309,7 +324,7 @@ func openLocal(
 			return formatLocalStatus(current, maintenance, maxWaitingOperations), nil
 		},
 		close: store.Close,
-	}, nil
+	}, store.LockService())
 }
 
 func closeAfterOpenFailure(what string, err error) error {
@@ -335,10 +350,11 @@ func openBlobs(
 	maxIntegrityRecords int64,
 	maxIntegrityBytes int64,
 	maintenance objectstore.Options,
+	locks lockConfig,
 ) (opened, error) {
 	return openBlobsContext(
 		context.Background(), blob, quota, objectLimits, maxReaderConnections,
-		maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance,
+		maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance, locks,
 	)
 }
 
@@ -352,6 +368,7 @@ func openBlobsContext(
 	maxIntegrityRecords int64,
 	maxIntegrityBytes int64,
 	maintenance objectstore.Options,
+	locks lockConfig,
 ) (opened, error) {
 	switch {
 	case blob.database == "":
@@ -379,9 +396,10 @@ func openBlobsContext(
 	if err != nil {
 		return opened{}, err
 	}
-	meta, err := sqlite.OpenWithOptions(
-		ctx, blob.database, blob.workspace, quota, options,
-	)
+	meta, err := sqlite.OpenLocking(ctx, sqlite.LockingConfig{
+		Database: blob.database, Namespace: blob.workspace, Allowance: quota,
+		SQLite: options, Locks: locks.options, Initialize: locks.initialize,
+	})
 	if err != nil {
 		return opened{}, errors.Join(err, closeAfterOpenFailure("blob object store", objects.Close()))
 	}
@@ -425,7 +443,7 @@ func openBlobsContext(
 		close: namespace.Close,
 	}
 	if quota == 0 {
-		return result, nil
+		return withLockStatus(result, namespace.LockService())
 	}
 	// Under an allowance the count is kept as the bytes move, so SIGHUP has nothing to
 	// repair here. Without one there is no count at all and nothing to say that about.
@@ -436,7 +454,7 @@ func openBlobsContext(
 		return opened{}, errors.Join(err, closeAfterOpenFailure("blob namespace", namespace.Close()))
 	}
 	result.allowance = fmt.Sprintf(" under an allowance of %d bytes, %d of them taken,", space.Total, space.Used)
-	return result, nil
+	return withLockStatus(result, namespace.LockService())
 }
 
 // onlyErrorLeaves recognizes expected errors without hiding an unexpected leaf joined to
@@ -486,7 +504,20 @@ func serveWithGrace(httpServer *drainingServer, listener net.Listener, ns opened
 	// The signal handlers are part of being ready: after this line every lifecycle signal
 	// has a command-owned outcome. The address stays last because it is copied by people
 	// and parsed by launchers.
-	fmt.Fprintf(errOut, "remote-fs-server: serving %s%s at http://%s\n", ns.what, ns.allowance, listener.Addr())
+	lockState := ""
+	if ns.lockStatus != nil {
+		statusContext, cancel := context.WithTimeout(ctx, statusDeadline)
+		current, err := ns.lockStatus(statusContext)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("file-lock status before serving: %w", err)
+		}
+		if current.Unavailable {
+			return errors.New("file-lock authority is unavailable")
+		}
+		lockState = "; " + formatLockStatus(current)
+	}
+	fmt.Fprintf(errOut, "remote-fs-server: serving %s%s%s at http://%s\n", ns.what, ns.allowance, lockState, listener.Addr())
 
 	stopped := make(chan error, 1)
 	started := make(chan struct{})
@@ -561,6 +592,7 @@ func serveWithGrace(httpServer *drainingServer, listener net.Listener, ns opened
 func handleHangup(ctx context.Context, ns opened, errOut io.Writer) {
 	if ns.status == nil {
 		recount(ctx, ns, errOut)
+		writeLockStatus(ctx, ns, errOut)
 		return
 	}
 	writeStatus(readStatus(ctx, ns), ns, errOut)

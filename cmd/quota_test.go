@@ -36,7 +36,7 @@ func TestAServerUnderAnAllowanceReportsItAndRefusesPastIt(t *testing.T) {
 
 	const allowance = 64 << 10
 	backing := t.TempDir()
-	srv := startServerBinary(t, "-listen", "127.0.0.1:0", "-dir", backing, "-quota", "64K")
+	srv := startDirectoryServerBinary(t, backing, "-quota", "64K")
 	mountpoint := t.TempDir()
 	startMountBinary(t, "-server", srv.url, "-mountpoint", mountpoint)
 
@@ -106,7 +106,7 @@ func TestAnAllowanceIsSpentAgainstWhatTheWorkspaceAlreadyHolds(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(backing, "held.bin"), make([]byte, held), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	srv := startServerBinary(t, "-listen", "127.0.0.1:0", "-dir", backing, "-quota", "64K")
+	srv := startDirectoryServerBinary(t, backing, "-quota", "64K")
 	srv.awaitLine(t, fmt.Sprintf("allowance of %d bytes, %d of them taken", allowance, held), startup)
 
 	mountpoint := t.TempDir()
@@ -149,7 +149,7 @@ func TestHangingUpRepairsACountMadeWrongBehindTheServer(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(backing, "held.bin"), make([]byte, held), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	srv := startServerBinary(t, "-listen", "127.0.0.1:0", "-dir", backing, "-quota", "64K")
+	srv := startDirectoryServerBinary(t, backing, "-quota", "64K")
 	client := dial(t, srv)
 
 	if space := spaceOf(t, client); space.Used != held {
@@ -188,7 +188,7 @@ func TestHangingUpRepairsACountMadeWrongBehindTheServer(t *testing.T) {
 // TestHangingUpWithoutAnAllowanceSaysThereIsNothingToRecount. A signal that quietly did
 // nothing would leave an operator waiting on a repair that was never going to happen.
 func TestHangingUpWithoutAnAllowanceSaysThereIsNothingToRecount(t *testing.T) {
-	srv := startServerBinary(t, "-listen", "127.0.0.1:0", "-dir", t.TempDir())
+	srv := startDirectoryServerBinary(t, t.TempDir())
 
 	srv.hangup(t)
 	t.Log(srv.awaitLine(t, "no allowance", startup))
@@ -213,7 +213,7 @@ func TestAServerWithoutAnAllowanceReportsTheHostFilesystemsFigures(t *testing.T)
 	requireFUSE(t)
 
 	backing := t.TempDir()
-	srv := startServerBinary(t, "-listen", "127.0.0.1:0", "-dir", backing)
+	srv := startDirectoryServerBinary(t, backing)
 	mountpoint := t.TempDir()
 	startMountBinary(t, "-server", srv.url, "-mountpoint", mountpoint)
 

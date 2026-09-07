@@ -12,13 +12,15 @@ Status: implemented
 
 对象记录增加 durable `unresolved` 状态。只有 `Put` 返回 `nil` 才证明 create-only publication 完成；任何 `Put` error 都通过 `Quarantine` 把 reserved record 转成 unresolved，保留原错误，并且永远不把该 key 交给 `Garbage`。`Commit` 只接受 reserved；unresolved 不能重新解释成一次成功写入。
 
-`Garbage` 只返回已经由权威 namespace transaction 标记为 garbage 的对象。reserved 不再因创建时间或调用方给出的 grace 变成 garbage；进程崩溃、请求中断或远端结果未知留下的 reservation 同样进入 fail-stop 状态，不产生删除授权。`Put` 已经成功、随后 `Commit` 失败是唯一允许调用 `Abandon` 的上传失败路径，因为此时本进程已经证明该 key 下的对象由本次 reservation 创建。
+`Garbage` 只返回已经由权威 namespace transaction 标记为 garbage 的对象。reserved 不再因创建时间或调用方给出的 grace 变成 garbage；进程崩溃、请求中断或远端结果未知留下的 reservation 同样进入 fail-stop 状态，不产生删除授权。`Put` 已经成功、随后 `Commit` 失败是唯一允许调用 `Abandon` 的上传失败路径，因为此时本进程已经证明该 key 下的对象由本次 reservation 创建。`Abandon` 还必须确认该对象仍未引用；referenced、未知 commit 或已被 poison 的 metastore 都不能被解释成可删除。
+
+[显式文件占有](./2026-09-07-file-locks.md)在上传后的原生最终发布处判定权限。grant 在上传期间到期，且尚未取得最终许可时，`Commit` 明确拒绝，成功 `Put` 留下的未引用对象可经 `Abandon` 成为 garbage。权限在到期前取得、提交稍后完成则按已确定顺序处置，不能仅凭响应时已过期宣称未提交。namespace commit、rollback 或 publication accounting 无法确定时，SQLite 与 authority 一同失败隔离；即使 namespace 已知未修改，未知 accounting 也不能被 cleanup 掩盖。`Quarantine` 仍只表达 `Put` 没有证明归属，不能把未知 namespace commit 重新命名成一次失败上传。
 
 reserved 与 unresolved 都计入 pending object 数量和字节 admission，也由 `ObjectStatus` 暴露。它们不会被时间自动释放；积累到阈值时新 reservation 以 `EAGAIN` 停止，要求运维诊断或将来的显式 reconcile 工具处理。这个有界停服结果比依据延迟猜测执行破坏性删除更安全。
 
 schema v1/v2 写下 pending row 时没有保存如今需要的 requested bytes，也没有能证明对象归属的状态语义。旧数据库只有全部 object row 都是 referenced、且 namespace/node/size 一致性验证通过时才允许迁移；任何 reserved、garbage 或其它 non-referenced row 都使整个 open transaction 以 `EIO` 失败，migration 不提交。升级不能把旧 state 2 当成现在的 deletion authority，也不能为缺失的 pending bytes 编造数值。
 
-这项决定取代旧决定中“超龄 reservation 可以成为 garbage”和“任意 `Put` error 立即 `Abandon`”两项规则。旧 note 保留当时为何选择上传前登记的理由；本 note 拥有对象归属不足时的终止状态。它不改变已经解除 namespace 引用的对象进入 garbage，也不改变[在途读者与清扫器](../../proposed/architecture/2026-08-21-readers-in-flight-and-the-sweeper.md)所讨论的 referenced→garbage 删除宽限期。
+这项决定取代旧决定中“超龄 reservation 可以成为 garbage”和“任意 `Put` error 立即 `Abandon`”两项规则。旧 note 保留当时为何选择上传前登记的理由；本 note 拥有对象归属不足时的终止状态，文件占有 note 拥有最终发布许可与重启保护。已经解除 namespace 引用的对象仍进入 garbage，[在途读者与清扫器](../../proposed/architecture/2026-08-21-readers-in-flight-and-the-sweeper.md)所讨论的 referenced→garbage 删除宽限期独立保留。
 
 ## 备选方案
 
@@ -35,7 +37,7 @@ schema v1/v2 写下 pending row 时没有保存如今需要的 requested bytes�
 ## 后果
 
 - `Put` 的 nil/error 边界成为删除权限边界：nil 只在 create-only publication 已完成时返回；error 不能授权清扫对象。
-- 一次未知发布不会覆盖或删除旧对象，也不会被报告为成功。原错误与 `Quarantine` 失败同时保留，unresolved 状态查询失败则整项操作失败。
+- 一次未知对象发布不会覆盖或删除旧对象，也不会被报告为成功。原错误与 `Quarantine` 失败同时保留，unresolved 状态查询失败则整项操作失败；未知 namespace commit 则保留原记录与失败隔离状态，`Abandon` 失败和原提交错误同时返回。
 - crash reservation 和 ambiguous upload 会永久占用 pending admission，直到有带独立归属证明的恢复工具处理。阈值使成本有限，但一个持续失败的 store 最终会拒绝新写；这是可观察的 fail-stop，不是自动恢复。
 - 含 legacy pending state 的 v1/v2 数据库需要离线、带外的归属恢复才能升级；自动迁移只覆盖 referenced-only 的可验证历史。拒绝发生在迁移事务内，不留下半升级 schema。
 - garbage queue 重新只表达 namespace 已经证明不再引用的对象，清扫器不再把时间当作 ownership proof。给真正 garbage 增加读者宽限期仍是独立提案。

@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/fuse/fusetest"
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/localdir"
@@ -173,7 +174,10 @@ func serveNamespace(t *testing.T) (url string, namespace storage.Storage) {
 func replicableNamespace(t *testing.T) (storage.Storage, *httprest.Handler) {
 	t.Helper()
 
-	meta, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "namespace.db"), "ws", 0, sqlite.DefaultWindow())
+	meta, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
+		Database: filepath.Join(t.TempDir(), "namespace.db"), Namespace: "ws",
+		SQLite: sqlite.DefaultOptions(), Locks: locking.DefaultOptions(), Initialize: true,
+	})
 	if err != nil {
 		t.Fatalf("opening the namespace's metastore: %v", err)
 	}
@@ -196,10 +200,25 @@ func replicableNamespace(t *testing.T) (storage.Storage, *httprest.Handler) {
 func serveDirectory(t *testing.T) string {
 	t.Helper()
 
-	namespace, err := localdir.New(t.TempDir())
+	config := localdir.Config{
+		Root: t.TempDir(), StateRoot: t.TempDir(),
+		Locks: locking.DefaultOptions(), Limits: localdir.DefaultLimits(),
+	}
+	if err := os.Chmod(config.StateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := localdir.Init(t.Context(), config); err != nil {
+		t.Fatal(err)
+	}
+	namespace, err := localdir.Open(t.Context(), config)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := namespace.Close(); err != nil {
+			t.Errorf("close directory namespace: %v", err)
+		}
+	})
 	handler, err := httprest.NewHandler(namespace, nil)
 	if err != nil {
 		t.Fatal(err)

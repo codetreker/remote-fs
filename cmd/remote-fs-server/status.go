@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage/localstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
@@ -19,7 +21,47 @@ type statusReport struct {
 
 func readStatus(ctx context.Context, ns opened) statusReport {
 	line, err := ns.status(ctx)
+	if err == nil && ns.lockStatus != nil {
+		var current locking.Status
+		current, err = ns.lockStatus(ctx)
+		if err == nil {
+			line += "; " + formatLockStatus(current)
+		}
+	}
 	return statusReport{line: line, err: err}
+}
+
+func withLockStatus(ns opened, service locking.Service) (opened, error) {
+	status, ok := service.(locking.StatusService)
+	if !ok {
+		return opened{}, errors.Join(errors.New("file-lock service has no recovery status"), ns.close())
+	}
+	ns.lockStatus = status.Status
+	return ns, nil
+}
+
+func formatLockStatus(status locking.Status) string {
+	state := "ready"
+	switch {
+	case status.Unavailable:
+		state = "unavailable"
+	case status.Recovering:
+		state = fmt.Sprintf("recovering for %v", time.Duration(status.RecoveryRemainingMillis)*time.Millisecond)
+	}
+	return fmt.Sprintf("file locks %s; %d sessions, %d owners, %d resources, %d actions, %d grants, %d queued",
+		state, status.Sessions, status.Owners, status.Resources, status.Actions, status.Grants, status.Queued)
+}
+
+func writeLockStatus(ctx context.Context, ns opened, output io.Writer) {
+	if ns.lockStatus == nil {
+		return
+	}
+	status, err := ns.lockStatus(ctx)
+	if err != nil {
+		fmt.Fprintf(output, "remote-fs-server: file-lock status for %s failed: %v\n", ns.what, err)
+		return
+	}
+	fmt.Fprintf(output, "remote-fs-server: %s: %s\n", ns.what, formatLockStatus(status))
 }
 
 func startStatus(ns opened, timeout time.Duration, results chan<- statusReport) (context.CancelFunc, chan struct{}) {
@@ -41,6 +83,7 @@ func startRecount(ns opened, results chan<- string) (context.CancelFunc, chan st
 		defer close(done)
 		var output strings.Builder
 		recount(ctx, ns, &output)
+		writeLockStatus(ctx, ns, &output)
 		results <- output.String()
 	}()
 	return cancel, done

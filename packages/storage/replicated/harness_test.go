@@ -16,11 +16,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
-	"github.com/codetreker/remote-fs/packages/storage/objectstore/memory"
 	"github.com/codetreker/remote-fs/packages/storage/replicated"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
@@ -73,18 +74,12 @@ func serve(t *testing.T, limits httprest.Limits) *served {
 // anything this copy made of it.
 func serveWithAllowance(t *testing.T, limits httprest.Limits, allowance int64) *served {
 	t.Helper()
+	return serveWithLockOptions(t, limits, allowance, locking.DefaultOptions())
+}
 
-	meta, err := sqlite.Open(t.Context(), path.Join(t.TempDir(), "namespace.db"), "ws", allowance, sqlite.DefaultWindow())
-	if err != nil {
-		t.Fatalf("opening the namespace's metastore: %v", err)
-	}
-
-	backing := objectstore.New(memory.New(), meta)
-	t.Cleanup(func() {
-		if err := backing.Close(); err != nil {
-			t.Errorf("closing the namespace: %v", err)
-		}
-	})
+func serveWithLockOptions(t *testing.T, limits httprest.Limits, allowance int64, options locking.Options) *served {
+	t.Helper()
+	meta, backing := memoryfixture.New(t, "ws", allowance, options)
 	handler, err := httprest.NewHandlerWithLimits(backing, meta, limits)
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)

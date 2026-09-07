@@ -66,6 +66,11 @@ func mountBacking(t *testing.T, backing string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	return mountStorage(t, s, fuse.Options{Logger: testLogger(t)})
 }
 
@@ -573,7 +578,7 @@ var differentialSteps = []step{
 		p := filepath.Join(root, "attr.txt")
 		accessed := time.Date(1999, time.December, 31, 23, 59, 58, 1, time.UTC)
 		changed := time.Date(2004, time.July, 6, 1, 2, 3, 999_999_999, time.UTC)
-		if err := os.Chtimes(p, accessed, changed); err != nil {
+		if err := comparisonChtimes(p, accessed, changed); err != nil {
 			return "", err
 		}
 		return describeTimes(p)
@@ -581,7 +586,7 @@ var differentialSteps = []step{
 	{"set only the access time", func(root string) (string, error) {
 		p := filepath.Join(root, "attr.txt")
 		accessed := time.Date(1987, time.May, 4, 3, 2, 1, 0, time.UTC)
-		if err := os.Chtimes(p, accessed, time.Time{}); err != nil {
+		if err := comparisonChtimes(p, accessed, time.Time{}); err != nil {
 			return "", err
 		}
 		return describeTimes(p)
@@ -591,11 +596,11 @@ var differentialSteps = []step{
 		// than whichever instant the walk between two steps last read the file at.
 		p := filepath.Join(root, "attr.txt")
 		accessed := time.Date(1993, time.August, 7, 6, 5, 4, 3, time.UTC)
-		if err := os.Chtimes(p, accessed, accessed); err != nil {
+		if err := comparisonChtimes(p, accessed, accessed); err != nil {
 			return "", err
 		}
 		changed := time.Date(2038, time.January, 19, 3, 14, 8, 0, time.UTC)
-		if err := os.Chtimes(p, time.Time{}, changed); err != nil {
+		if err := comparisonChtimes(p, time.Time{}, changed); err != nil {
 			return "", err
 		}
 		return describeTimes(p)
@@ -603,7 +608,7 @@ var differentialSteps = []step{
 	{"set a directory's times", func(root string) (string, error) {
 		p := filepath.Join(root, "attrdir")
 		moment := time.Date(2011, time.November, 11, 11, 11, 11, 0, time.UTC)
-		if err := os.Chtimes(p, moment, moment); err != nil {
+		if err := comparisonChtimes(p, moment, moment); err != nil {
 			return "", err
 		}
 		return describeTimes(p)
@@ -613,7 +618,7 @@ var differentialSteps = []step{
 	}},
 	{"change the times of something that is not there", func(root string) (string, error) {
 		moment := time.Unix(1_000_000, 0)
-		return "", os.Chtimes(filepath.Join(root, "absent.txt"), moment, moment)
+		return "", comparisonChtimes(filepath.Join(root, "absent.txt"), moment, moment)
 	}},
 	{"change the mode below a file", func(root string) (string, error) {
 		return "", os.Chmod(filepath.Join(root, "attr.txt", "below"), 0o600)
@@ -638,6 +643,21 @@ var differentialSteps = []step{
 	{"make a directory with permissions of its own", func(root string) (string, error) {
 		return "", os.Mkdir(filepath.Join(root, "owndir"), 0o700)
 	}},
+}
+
+// Runtime preemption can interrupt FUSE requests, and Chtimes does not retry EINTR.
+// Repeating the exact timestamps preserves the atime/mtime values compared here;
+// ctime is outside this comparison.
+// https://github.com/hanwen/go-fuse/blob/423b377e1452ab7b3522229185a3047f72e3f966/fs/api.go#L129-L135
+func comparisonChtimes(path string, accessed, changed time.Time) error {
+	var err error
+	for range 8 {
+		err = os.Chtimes(path, accessed, changed)
+		if !errors.Is(err, syscall.EINTR) {
+			return err
+		}
+	}
+	return err
 }
 
 // describeTimes reports both of a node's times, to the nanosecond. Set explicitly, they
@@ -1368,6 +1388,11 @@ func TestEveryLookAtTheNamespaceReachesIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := inner.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	counted := &countingStorage{Storage: inner, counts: map[string]int{}}
 	mountpoint := mountStorage(t, counted, fuse.Options{Logger: testLogger(t)})
 	path := filepath.Join(mountpoint, "f")
@@ -1526,6 +1551,11 @@ func mountFaulty(t *testing.T, fault func(operation, path string) error, prepare
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := inner.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	s := &faultyStorage{Storage: inner, fault: fault}
 	return mountStorage(t, s, fuse.Options{Logger: testLogger(t)})
 }
@@ -1831,6 +1861,11 @@ func mountOdd(t *testing.T, odd func(path string) bool) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := inner.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	return mountStorage(t, &oddStorage{Storage: inner, odd: odd}, fuse.Options{Logger: testLogger(t)})
 }
 
@@ -2199,6 +2234,11 @@ func TestNothingIsWrittenToTheProcessOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 
 	restore := captureProcessOutput(t)
 	m, mountErr := fuse.New(mountpoint, s, fuse.Options{})
@@ -2226,6 +2266,11 @@ func TestDiagnosticsGoOnlyWhereTheCallerAsked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	collected := &safeBuffer{}
 
 	restore := captureProcessOutput(t)
@@ -2255,6 +2300,11 @@ func TestMountingSomewhereItCannotBeDone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 
 	file := filepath.Join(t.TempDir(), "f")
 	if err := os.WriteFile(file, nil, 0o644); err != nil {
@@ -2375,6 +2425,11 @@ func mountCeiling(t *testing.T, contents []byte, maxFileSize int64) (path string
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := inner.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	counted = &countingStorage{Storage: inner, counts: map[string]int{}}
 	mountpoint := mountStorage(t, counted, fuse.Options{Logger: testLogger(t), MaxFileSize: maxFileSize})
 	return filepath.Join(mountpoint, "f"), counted
@@ -2521,6 +2576,11 @@ func TestAMountConfiguredWithNothingStillHasACeiling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	path := filepath.Join(mountStorage(t, s, fuse.Options{}), "f")
 
 	if err := os.Truncate(path, fuse.DefaultMaxFileSize+1); !errors.Is(err, syscall.EFBIG) {
@@ -2613,6 +2673,11 @@ func mountTelling(t *testing.T, space storage.Space, err error) (mountpoint, bac
 	if openErr != nil {
 		t.Fatal(openErr)
 	}
+	t.Cleanup(func() {
+		if err := inner.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	s := &tellsSpace{Storage: inner, space: space, err: err}
 	return mountStorage(t, s, fuse.Options{Logger: testLogger(t)}), backing
 }
@@ -2797,6 +2862,11 @@ func mountLimited(t *testing.T, backing string, allowance int64) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := inner.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	held, err := limited.New(context.Background(), inner, allowance)
 	if err != nil {
 		t.Fatal(err)
