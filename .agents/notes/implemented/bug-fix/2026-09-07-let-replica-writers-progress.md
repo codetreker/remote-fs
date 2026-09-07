@@ -39,7 +39,7 @@ SQLite replica 先限制能进入读阶段的 SQL 查询数量，再用私有读
 
 本决定补足[元数据复制](../architecture/2026-08-27-metadata-replication.md)的可取消读写准入与推进。它修复的是 R-CON-1 所依赖的本地更新进展；锁本身不给整个复制链路作一秒承诺。
 
-快照重建后过早作答、文件页缓存陈旧与首次订阅取消各有独立的可用性或生命周期条件，仍需分别处理。读写门不改变这些条件，也不引入新的取消错误分类；它保留独立改进这些路径的空间。
+[快照重建后过早作答](../../proposed/bug-fix/2026-09-07-gate-rebuilt-replicas-on-replay.md)、[文件页缓存陈旧](../../proposed/bug-fix/2026-09-07-prevent-cross-handle-page-cache-staleness.md)与[首次订阅取消](../../proposed/bug-fix/2026-09-07-cancel-initial-replica-subscription.md)各有独立的可用性或生命周期条件，仍由各自的提案处理。读写门不改变这些条件，也不引入新的取消错误分类；它保留独立改进这些路径的空间。
 
 ## 备选方案
 

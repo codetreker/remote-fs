@@ -117,7 +117,7 @@ SQLite writer 使用 WAL、单 writer connection、`BEGIN IMMEDIATE`、`synchron
 
 只读 transaction 使用其拥有的 context 解释查询与回滚结果。纯取消保留原因并返回 `EINTR`；该 context 已取消时，直接的 `sql.ErrTxDone` 可表示 `database/sql` 已自动回滚，包括回调成功后才发生的取消。SQLite `SQLITE_INTERRUPT` 只在读取 context 确已取消时映射为取消；deadline、真实查询或独立 cleanup 故障仍是错误。未知 commit 与 poison 拥有 `EIO` 分类，不因保留的 context 原因改成 `EINTR`。该规则也用于 client 的 SQLite replica，取舍见[请求中断](../../../.agents/notes/implemented/bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)。
 
-`METASTORE` 是 SQLite WAL 之外的确认边界。它记录完整的已接受状态 A：数据库 identity、generation、node high-water 与 change high-water，并另记已经完整进入主数据库的 checkpoint generation C，始终满足 `0 <= C <= A.generation`。每次 durable open 或 mutation 先提交 SQLite，再用 `.METASTORE.stage` 写入并同步下一份 A，以 rename 原子替换 `METASTORE`，最后同步 root；见证发布完成后调用才可返回成功。stage 不是确认记录，重开时只把 final name 当作 A；确认发布失败会 poison SQLite，后续读、写与 checkpoint 均以 `EIO` 拒绝。
+`METASTORE` 是 SQLite WAL 之外的确认边界。它记录完整的已接受状态 A：数据库 identity、generation、node high-water 与 change high-water，并另记已经完整进入主数据库的 checkpoint generation C，始终满足 `0 <= C <= A.generation`。每次 durable open 或 mutation 先提交 SQLite，再用 `.METASTORE.stage` 写入并同步下一份 A，以 rename 原子替换 `METASTORE`，最后同步 root；见证发布完成后调用才可返回成功。stage 不是确认记录，重开时只把 final name 当作 A，但还要求残留 stage 通过完整内容校验。checkpoint 在创建 stage 后、写完前中断，会让已有完整 final 与恢复证据的 workspace 也以 `EIO` 拒绝打开；缺口见[恢复中断的见证 stage](../../../.agents/notes/proposed/bug-fix/2026-09-07-recover-interrupted-witness-stages.md)。确认发布失败会 poison SQLite，后续读、写与 checkpoint 均以 `EIO` 拒绝。
 
 rename 本身失败时，publisher 删除未接受的 stage 并同步 root；清理失败则保留错误与现场。`Checkpoint` publication 失败不会 poison accepted state，清理成功后后台 worker 或关闭可以重试；这也包括 rename 已发生、最终 root barrier 失败的 checkpoint 尝试。`Accept` publication 的任何失败都会 poison 当前 SQLite，因为已提交状态没有完成 acknowledgment；rename 已发生而 root barrier 失败时，重开再以 final witness、WAL 与 visible state 对账。
 
@@ -254,7 +254,7 @@ Avail = min(max(quota - Used, 0), localdisk.Available)
 | 每次后台 sweep 的对象数 | 64（最大 1,048,576） |
 | change-log floor / cap / age | 100 entries / 10000 entries / 10 分钟 |
 
-`MaxInFlightBytes` 必须至少容纳一份最大对象及其 envelope/key，recovery-record 上限不得低于 active operation 上限。`MaxWaitingOperations` 必须是小于 `math.MaxInt` 的正数；等待名额已满时新调用以 `EAGAIN` 拒绝。请求先取得 waiting ticket，再等待 per-key/per-shard token，完成 shard 初始化后才把 ticket 提升为 active operation/byte reservation，因此一个 shard 的等待者不会占满全部 active 名额并阻塞其它 shard。等待过程服从 `context.Context`；`Close` 拒绝新的 admission，并等待 waiting、active 与 control operation 离开。
+`MaxInFlightBytes` 必须至少容纳一份最大对象及其 envelope/key，recovery-record 上限不得低于 active operation 上限。`MaxWaitingOperations` 必须是小于 `math.MaxInt` 的正数；等待名额已满时新调用以 `EAGAIN` 拒绝。请求先取得 waiting ticket，再等待 per-key/per-shard token，完成 shard 初始化后才把 ticket 提升为 active operation/byte reservation，因此一个 shard 的等待者不会占满全部 active 名额并阻塞其它 shard。等待过程服从 `context.Context`；`Get` 与 `Delete` 在 active admission 被取消时会泄漏此前打开的 shard descriptor，详见[取消时关闭 shard 描述符](../../../.agents/notes/proposed/bug-fix/2026-09-07-close-shard-descriptors-on-cancel.md)。`Close` 拒绝新的 admission，并等待 waiting、active 与 control operation 离开；排空这些计数不能回收已泄漏的描述符。
 
 ## 八、维护、状态与关闭
 
