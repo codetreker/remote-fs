@@ -62,6 +62,23 @@
 
 原子替换那条用例就是这么写的：两个读者若没有各自观察到两个值中的每一个，说明它们整段时间都跑在两次写入之间，于是它判自己失败。凡是靠交错、靠时机、靠某个前提成立才有意义的用例，都要把那件事断言出来。
 
+## 元数据副本的读写交接
+
+[副本读写门](../.agents/notes/implemented/bug-fix/2026-09-07-let-replica-writers-progress.md)分别验证类间次序和真实入口。门的确定性交错用例先证明写者已登记，再放开旧读者；读者批次必须在唤醒前保留名额，尚未获调度的读者也不能被下一写者越过。覆盖批次内读者的正常进入与取消、后来读者进入下一批、多写者中只撤销本次取消，以及取消最后一个等待写者后重新放行读取。
+
+真实 `Replica` 用例覆盖 `Apply` 与 `Reseed` 等门取消、等待 commit gate 时释放外层名额，以及 `Stat`、`List`、`ListBounded` 在 reseed 后排队时的取消；失败的 `ListResult` 不能暴露已保留前缀。SQL 读取名额另验证与 reader pool 容量一致、名额耗尽时调用不进入阶段、交接后取消归还名额，以及 `Position` 与写者不消耗 SQL 读取名额。完整、回滚、无效 row 与提交失败的 reseed 都同时观察树和 `Position`，并验证重复 `Close`；读者批次还必须在多个真实 `Apply` 的积压之间得到执行机会。取消用例保留现有错误分类与 context 原因。
+
+压力与可见性使用不同的时间判据。[SQLite 压力用例](../packages/metastore/sqlite/replica_progress_test.go)先占满现有 reader pool，再启动 128 个公开 `List` 调用。用例在门的互斥保护下确认只有与 pool 容量相等的读者持有共享访问，其余调用仍在阶段外等待 SQL 名额；确认 `Apply` 已登记等待后才释放 reader pool。4096 文件的读取循环保持运行，直到 `Apply` 成功；race detector 下给已获准的扫描留出 30 秒死锁检测上限，这个上限不代表复制延迟。
+
+[真实 HTTP/SSE 全负载可见性用例](../packages/storage/replicated/replica_acceptance_test.go)使用 4096 文件与 128 个持续列目录的读者，以一秒为独立写者提交后另一客户端观察到新元数据的上限。用例先观察每个读者都成功完成列目录，再提交变更，并断言计时窗口内列目录继续推进；调用进入某个回调不构成负载成立的证据。
+
+这项验收只在测试文件上使用 `rfs_acceptance` build tag，生产实现没有对应分支。CI 在其它包的并行测试与 race suite 之前，以正常构建、串行执行整个 `packages/storage/replicated` 包，使用 `assert-every-test-ran.sh`，不按 `-run` 缩小集合。原有的一秒 HTTP/SSE 可见性用例仍在默认测试集合中并接受 race 检查；阶段交接、取消与 4096 文件压力用例也保留默认 race 覆盖。全负载一秒断言和 race 下的死锁判据分别验收，不互相替代。
+
+```
+.github/scripts/assert-every-test-ran.sh -tags rfs_acceptance -count=1 \
+  -p=1 -parallel=1 -timeout 3m ./packages/storage/replicated
+```
+
 ## 测真实入口
 
 「真实入口」指交付出去的那个形态：真实挂载的挂载点、构建出的二进制、被第三方 import 的 package。

@@ -58,6 +58,10 @@ SSE 不把整个 stream 保存在内存里，但每一帧仍有独立的 `DialOp
 
 副本的可信度只取决于**变更流是不是在被连续观察**：流活着，副本就是服务端在某个位置上的样子；流一断，这里的一切立刻作废，每一个操作以 EIO 失败（R-ERR-1、R-ERR-2）。没有过期时间，没有回源校验，也没有第三种状态——任何基于间隔的方案都被 R-CON-2 挡在门外，一秒的 TTL 字面上满足 R-CON-1 也不行。
 
+SQLite replica 的 `Stat`、`List`、`ListBounded` 先取得 SQL 读取名额，再进入共享读阶段。名额数与 reader pool 使用同一份 `Options.MaxReaderConnections`，默认 16；等待名额的调用不持有读阶段。两次等待都接受调用 context，等阶段失败时归还名额；查询结束时先退出阶段，再归还名额。`Position` 不查询 SQLite，使用无取消的共享阶段，不占 SQL 名额。
+
+私有读写门在共享读阶段与独占写阶段之间交接。写者登记后，新读者排队，现有读者排空后进入写阶段；写者退出时先为已经等待的有限读者批次预留名额，再唤醒它们，下一写者等待这些活跃或预留读者全部退出。等待取消撤回相应名额；门只保存固定数量的计数与共享通知状态，不保存逐等待者队列。`Apply` 与整次 `Reseed` 不占 SQL 读取名额，直接使用独占阶段，后者在 `Seeding.Complete` 完成事务或 `Seeding.Close` 中止时释放；`Add` 或 `Complete` 的前置校验失败仍须由调用方 `Close`。取得多项所有权时的顺序为 SQL 读取名额、replica 门、commit gate、database health lock，各入口只取得自己需要的部分。此机制保证阶段间交接，不承诺多个写者之间的 FIFO 或已进入操作的执行时长；取舍见[副本写者推进](../../../.agents/notes/implemented/bug-fix/2026-09-07-let-replica-writers-progress.md)。
+
 **「流一断」是被观测到的，不是被假定的。** 服务端在无话可说时按固定间隔发一行心跳，这一层给「一个字节都没来」设一个数倍于心跳的上限，超限与流上任何一次失败走同一条路。没有这条，一条被切断的 TCP 与一个安静的命名空间是同一个观测结果 —— 沉默 —— 而副本会一直答下去，且没有时间上界。上限压在**正在等的那次读**上而不是压在连接上，因为首次同步期间没有人读变更流；计时由**字节**重置而不是由帧重置，因为一个快照分页可以是一整行一兆字节。
 
 这份副本因此不是缓存。server 提供 change log 时，每个会产生日志的 mutation 在发出请求前先 admission 一条 fixed-size confirmation record，不保留 target path、direction 或 touched-name history。`ConfirmationGrace`、`MaxActiveConfirmations` 与 `MaxWaitingConfirmations` 默认分别为 10 秒、64 与 64；`remote-fs` 用 `-confirmation-grace`、`-max-active-mutation-confirmations` 与 `-max-waiting-mutation-confirmations` 暴露同一组设置。active 名额不足时有限等待，waiter 已满、等待被取消或 storage 开始关闭时，请求尚未发出并以可重试的 `EAGAIN` 拒绝。server 以 `ENOSYS` 表明没有 change log 时不建立副本，也不保留 confirmation state。

@@ -89,7 +89,7 @@ is that run's job, and it starts itself. Both jobs bring up the same emulator th
 needs it because the coverage gate runs `go test` over the whole module rather than over
 that job's packages.
 
-CI adds four things that working on a single change does not need.
+CI also enforces the following checks.
 
 **`-count=1` on every invocation.** The test cache keys on environment variables but not on
 files outside the module, so a pass recorded where `/dev/fuse` existed replays unchanged
@@ -101,6 +101,15 @@ and end-to-end layers skip themselves — so the run that proved nothing reports
 green as the run that proved everything. The script fails on any skip, on a package pattern
 that matches no test, and on any test that reaches no verdict. It takes `go test`'s own
 flags and packages, so it substitutes for any line above.
+
+**Full-load visibility acceptance.** Before the parallel package and race suites, the
+checks job runs the entire `packages/storage/replicated` package serially in a normal
+build with `-tags=rfs_acceptance`, through `assert-every-test-ran.sh` without a `-run`
+filter. This test-only tag includes the 4096-file, 128-reader HTTP/SSE workload and its
+one-second visibility assertion; it does not select different production code. The
+original one-second visibility case and deterministic contention/cancellation tests
+remain in the default race suite. [The testing strategy](docs/testing.md#元数据副本的读写交接)
+defines the separate timing and concurrency checks.
 
 **The coverage gate.** `-coverpkg` is not optional here: the contract suite is one package
 executed by two others, so per-package measurement reports it as 0% and understates the

@@ -311,7 +311,7 @@ type Storage struct {
 
 副本是 `sqlite.Replica`，不是 `sqlite.Store`：它只给出 `Store` 的读那一半，加上 `Apply` 与 `Reseed`。这个类型的意义就在这里——副本与它所复制的命名空间之间的每一处差异都必须以「某人记下来的一条变更」的形式到达，一个能自己造节点的方法就是这棵树的第二个作者。它抄下源端的节点编号，所以一条指名父目录编号的变更不需要任何翻译；它**不存文件的内容 key**，因为副本永远不去对象存储，那个 key 在这里指向的是本地没有的字节，而 schema 里 `nodes.content` 的外键正是这个意思。
 
-`Reseed` 在整份外部 picture 期间持有 replica exclusive lock 和 SQLite write transaction，使读者不会观察半棵树。exclusive lock 与 commit gate 的等待都遵从调用 context；等待另一份 picture 时取消不会继续占住 commit gate。snapshot rows 可以任意排序，`Seeding` 只累计本轮看到的最大 node ID，在 `Complete` 时一次推进 `database_state.node_high_water` 并核对 `sqlite_sequence`，不为每个 row 重读和更新 allocator state。
+`Reseed` 在整份外部 picture 期间持有 replica 独占门和 SQLite write transaction，使读者不会观察半棵树。读写门与 commit gate 的等待都遵从调用 context；等待另一份 picture 时取消不会继续占住 commit gate。SQL 读取先取得与 reader pool 并发数一致的名额，再进入读阶段；等待 SQL 名额的调用不会增加写者必须排空的读者数量。写者登记后，新读者不能延长已在执行的读阶段；一次写入结束又为已经等待的一批读者预留共享访问，后续写者须等待它们结束或取消。读取名额、固定状态与批次交接的取舍见[副本写者推进](../bug-fix/2026-09-07-let-replica-writers-progress.md)。snapshot rows 可以任意排序，`Seeding` 只累计本轮看到的最大 node ID，在 `Complete` 时一次推进 `database_state.node_high_water` 并核对 `sqlite_sequence`，不为每个 row 重读和更新 allocator state。
 
 ```
 packages/metastore/           + 日志能力，+ Change / Position / Incarnation 这些类型

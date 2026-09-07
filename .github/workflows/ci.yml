@@ -63,6 +63,11 @@ jobs:
             exit 1
           fi
 
+      - name: Replication visibility acceptance
+        run: |
+          .github/scripts/assert-every-test-ran.sh -tags rfs_acceptance -count=1 \
+            -p=1 -parallel=1 -timeout 3m ./packages/storage/replicated
+
       # packages/storage/objectstore/azblob is tested against a real Blob endpoint, and
       # this suite fails on a skipped test rather than tolerating a missing dependency, so
       # the emulator is a precondition brought up here. `--wait` returns only once the
