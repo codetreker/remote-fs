@@ -283,25 +283,39 @@ func (o *Objects) Put(ctx context.Context, key string, content []byte) (_ []byte
 			key, len(content), o.limits.maxObjectBytes, syscall.EFBIG)
 	}
 	objectBytes := int64(fixedEnvelopeBytes) + int64(len(key)) + int64(len(content))
-	ticket, err := o.gate.acquire(ctx, objectBytes)
+	waiting, err := o.gate.acquireWaiting(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("put %q: %w", key, err)
 	}
-	defer ticket.release()
+	var ticket *ticket
+	defer func() {
+		if ticket != nil {
+			ticket.release()
+		}
+		waiting.release()
+	}()
 	if err := o.health.failure(); err != nil {
 		return nil, fmt.Errorf("put %q: %w", key, err)
 	}
+	defer func() { returned = o.health.finish(ctx, returned) }()
 	unlock, err := o.acquireKey(ctx, "put", key)
 	if err != nil {
 		return nil, err
 	}
 	defer unlock()
 
-	shardFD, _, err := o.openShard(location, true)
+	shardFD, _, err := o.openShard(ctx, location, true)
 	if err != nil {
 		return nil, fmt.Errorf("put %q: %w", key, err)
 	}
 	defer unix.Close(shardFD)
+	ticket, err = waiting.promote(ctx, objectBytes)
+	if err != nil {
+		return nil, fmt.Errorf("put %q: %w", key, err)
+	}
+	if err := o.health.failure(); err != nil {
+		return nil, fmt.Errorf("put %q: %w", key, err)
+	}
 	if _, exists, err := inspectObject(
 		ctx, shardFD, location, o.id, key, o.limits.maxObjectBytes, o.filesystem, o.ops,
 	); err != nil {
@@ -452,7 +466,7 @@ func (o *Objects) GetBounded(ctx context.Context, key string, maxBytes int64) ([
 	return o.get(ctx, key, maxBytes, true)
 }
 
-func (o *Objects) get(ctx context.Context, key string, maxBytes int64, bounded bool) ([]byte, error) {
+func (o *Objects) get(ctx context.Context, key string, maxBytes int64, bounded bool) (returnedPayload []byte, returned error) {
 	if err := checkContext(ctx, "get", key); err != nil {
 		return nil, err
 	}
@@ -460,16 +474,35 @@ func (o *Objects) get(ctx context.Context, key string, maxBytes int64, bounded b
 	if err != nil {
 		return nil, fmt.Errorf("get %q: %w", key, err)
 	}
-	ticket, err := o.gate.acquire(ctx, 0)
+	waiting, err := o.gate.acquireWaiting(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get %q: %w", key, err)
 	}
-	defer ticket.release()
+	var ticket *ticket
+	defer func() {
+		if ticket != nil {
+			ticket.release()
+		}
+		waiting.release()
+	}()
 	if err := o.health.failure(); err != nil {
 		return nil, fmt.Errorf("get %q: %w", key, err)
 	}
-	shardFD, absent, err := o.openShard(location, false)
+	defer func() {
+		returned = o.health.finish(ctx, returned)
+		if returned != nil {
+			returnedPayload = nil
+		}
+	}()
+	shardFD, absent, err := o.openShard(ctx, location, false)
 	if err != nil {
+		return nil, fmt.Errorf("get %q: %w", key, err)
+	}
+	ticket, err = waiting.promote(ctx, 0)
+	if err != nil {
+		return nil, fmt.Errorf("get %q: %w", key, err)
+	}
+	if err := o.health.failure(); err != nil {
 		return nil, fmt.Errorf("get %q: %w", key, err)
 	}
 	if absent {
@@ -489,8 +522,10 @@ func (o *Objects) get(ctx context.Context, key string, maxBytes int64, bounded b
 		return nil, fmt.Errorf("get %q: %w", key, err)
 	}
 	if bounded && header.payloadLength > maxBytes {
-		return nil, fmt.Errorf("get %q: payload is %d bytes, above the %d-byte limit: %w",
-			key, header.payloadLength, maxBytes, syscall.EFBIG)
+		return nil, fmt.Errorf(
+			"get %q: payload is %d bytes, above the %d-byte limit: %w",
+			key, header.payloadLength, maxBytes, syscall.EFBIG,
+		)
 	}
 	if err := ticket.addBytes(ctx, header.payloadLength); err != nil {
 		return nil, fmt.Errorf("get %q: %w", key, err)
@@ -514,7 +549,7 @@ func (o *Objects) get(ctx context.Context, key string, maxBytes int64, bounded b
 // Delete validates and removes the published name, then syncs the shard. A missing object
 // is already the requested state, but its existing shard is still synced so a retry can
 // finish an unlink whose earlier directory barrier failed.
-func (o *Objects) Delete(ctx context.Context, key string) error {
+func (o *Objects) Delete(ctx context.Context, key string) (returned error) {
 	if err := checkContext(ctx, "delete", key); err != nil {
 		return err
 	}
@@ -522,22 +557,36 @@ func (o *Objects) Delete(ctx context.Context, key string) error {
 	if err != nil {
 		return fmt.Errorf("delete %q: %w", key, err)
 	}
-	ticket, err := o.gate.acquire(ctx, 0)
+	waiting, err := o.gate.acquireWaiting(ctx)
 	if err != nil {
 		return fmt.Errorf("delete %q: %w", key, err)
 	}
-	defer ticket.release()
+	var ticket *ticket
+	defer func() {
+		if ticket != nil {
+			ticket.release()
+		}
+		waiting.release()
+	}()
 	if err := o.health.failure(); err != nil {
 		return fmt.Errorf("delete %q: %w", key, err)
 	}
+	defer func() { returned = o.health.finish(ctx, returned) }()
 	unlock, err := o.acquireKey(ctx, "delete", key)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
-	shardFD, absent, err := o.openShard(location, false)
+	shardFD, absent, err := o.openShard(ctx, location, false)
 	if err != nil {
+		return fmt.Errorf("delete %q: %w", key, err)
+	}
+	ticket, err = waiting.promote(ctx, 0)
+	if err != nil {
+		return fmt.Errorf("delete %q: %w", key, err)
+	}
+	if err := o.health.failure(); err != nil {
 		return fmt.Errorf("delete %q: %w", key, err)
 	}
 	if absent {

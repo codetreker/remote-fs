@@ -55,7 +55,7 @@ blob  replica=yes   -> b'VER'   ino (2,2)  size (24,3)
 
 所以是分层的：**号仍然由挂载点自己发，单调递增、永不复用；命名空间的身份只用来判断「这个名字后面还是不是原来那个节点」。** 弱保证的后端因此也能接进来，而内核看到的那个强保证由挂载点独立提供。
 
-身份本身**早就存在，只是被扔在边界上**——`metastore.Node.Attr()` 用四个字段构造 `storage.Attr`，把 `n.ID` 丢了，而 `nodes.id` 的 `AUTOINCREMENT` 一直保证它永不重发。`localdir` 那边 `attrOf` 本来就在解 `Stat_t`（为了 `Atim`），`Ino` 就在旁边。两处各一行。
+身份本身**早就存在，只是被扔在边界上**——`metastore.Node.Attr()` 用四个字段构造 `storage.Attr`，把 `n.ID` 丢了；该决定落地时，SQLite 的 no-reuse 依据是 `nodes.id` 的 `AUTOINCREMENT`。`localdir` 那边 `attrOf` 本来就在解 `Stat_t`（为了 `Atim`），`Ino` 就在旁边。两处各一行。SQLite 对 sequence 损坏与回退的持久证明由[显式身份高水位](./2026-09-07-persistent-sqlite-identities-use-explicit-high-water-marks.md)补足，不改变这里的 storage/FUSE 身份分层。
 
 **`Getattr` 从 handle 作答。** `handle` 本来就攥着它将要交付的全部内容，只是**仅在 dirty 时才报自己的长度**。改成无论干净与否都报，长度和字节就一致了——一个描述符读它打开的那个文件。时间戳仍然来自命名空间（干净 handle 的情况下），这是一处更小的不一致，写在代码里说明了：**它把文件描述错，而另一个是把别人的字节交出去**，不是同一类。
 

@@ -33,10 +33,12 @@ func TestLocalStatusReportsEveryBoundedAndDurablePart(t *testing.T) {
 		MaxReaderConnections:         9,
 		MaxSnapshotReaderConnections: 10,
 		MaxIntegrityRecords:          101,
+		MaxIntegrityBytes:            8 << 20,
 		LocalDisk: localdisk.Status{
 			StoreID:            localdisk.ID{1},
 			InFlightOperations: 4,
 			InFlightBytes:      50,
+			WaitingOperations:  5,
 			PhysicalAvailable:  800,
 			RecoveryRecords:    6,
 		},
@@ -45,8 +47,13 @@ func TestLocalStatusReportsEveryBoundedAndDurablePart(t *testing.T) {
 			LastSweepRemoved: 7,
 			LastSweepError:   failed,
 		},
+		Checkpoint: localstore.CheckpointStatus{
+			AcceptedGeneration:     23,
+			CheckpointedGeneration: 17,
+			Pending:                true,
+		},
 	}
-	line := formatLocalStatus(status, objectstore.Options{SweepInterval: 45 * time.Second, SweepBatch: 17})
+	line := formatLocalStatus(status, objectstore.Options{SweepInterval: 45 * time.Second, SweepBatch: 17}, 19)
 	for _, phrase := range []string{
 		`workspace "workspace" in store`,
 		"250 of 1000 workspace bytes used, 700 writable",
@@ -61,9 +68,13 @@ func TestLocalStatusReportsEveryBoundedAndDurablePart(t *testing.T) {
 		"SQLite reader-connection limit is 9",
 		"snapshot reader-connection limit is 10",
 		"integrity record work limit is 101",
+		"integrity name-byte work limit is 8388608",
 		"garbage sweeps run every 45s with at most 17 objects per attempt",
 		"4 operations and 50 bytes in flight",
+		"5 operations waiting under a limit of 19",
 		"6 recovery records",
+		"SQLite checkpoint has accepted generation 23 and checkpointed generation 17",
+		"checkpoint pending is true",
 		"2026-09-04T10:30:00Z",
 		"removed 7 objects",
 		failed.Error(),

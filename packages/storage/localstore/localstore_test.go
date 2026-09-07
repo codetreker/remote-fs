@@ -72,7 +72,7 @@ func TestOpenCreatesAndReopensABoundNamespace(t *testing.T) {
 	if reopenedIncarnation != incarnation {
 		t.Fatalf("the log incarnation changed from %q to %q across reopen", incarnation, reopenedIncarnation)
 	}
-	for _, name := range []string{"FORMAT", "OWNER.lock", "objects", databaseName, "LOCALSTORE"} {
+	for _, name := range []string{"FORMAT", "OWNER.lock", "objects", databaseName, "METASTORE", "LOCALSTORE"} {
 		if _, err := os.Lstat(filepath.Join(config.Root, name)); err != nil {
 			t.Errorf("the local store did not create %s: %v", name, err)
 		}
@@ -497,6 +497,12 @@ func TestConfigurationIsValidatedBeforeTheRootIsTouched(t *testing.T) {
 		"unbounded integrity nodes": func(config *localstore.Config) {
 			config.MaxIntegrityRecords = math.MaxInt64
 		},
+		"integrity byte limit": func(config *localstore.Config) {
+			config.MaxIntegrityBytes = -1
+		},
+		"unbounded integrity bytes": func(config *localstore.Config) {
+			config.MaxIntegrityBytes = math.MaxInt64
+		},
 	}
 	for name, invalidate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -558,6 +564,7 @@ func TestStatusCombinesLogicalObjectAndPhysicalState(t *testing.T) {
 	config.ObjectLimits = sqlite.ObjectLimits{MaxPendingObjects: 8, MaxPendingBytes: 2 << 30}
 	config.MaxSnapshotReaderConnections = 7
 	config.MaxIntegrityRecords = 100
+	config.MaxIntegrityBytes = 1 << 20
 	store := open(t, config)
 	t.Cleanup(func() { closeStore(t, store) })
 
@@ -588,6 +595,9 @@ func TestStatusCombinesLogicalObjectAndPhysicalState(t *testing.T) {
 	if status.MaxIntegrityRecords != config.MaxIntegrityRecords {
 		t.Fatalf("Status.MaxIntegrityRecords = %d, want %d", status.MaxIntegrityRecords, config.MaxIntegrityRecords)
 	}
+	if status.MaxIntegrityBytes != config.MaxIntegrityBytes {
+		t.Fatalf("Status.MaxIntegrityBytes = %d, want %d", status.MaxIntegrityBytes, config.MaxIntegrityBytes)
+	}
 	if status.MaxSnapshotReaderConnections != config.MaxSnapshotReaderConnections {
 		t.Fatalf("Status.MaxSnapshotReaderConnections = %d, want %d",
 			status.MaxSnapshotReaderConnections, config.MaxSnapshotReaderConnections)
@@ -611,7 +621,7 @@ func TestMetadataAndCompletionFilesRemainPrivate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, name := range []string{databaseName, databaseName + "-wal", databaseName + "-shm", "LOCALSTORE"} {
+	for _, name := range []string{databaseName, databaseName + "-wal", databaseName + "-shm", "METASTORE", "LOCALSTORE"} {
 		path := filepath.Join(config.Root, name)
 		info, err := os.Lstat(path)
 		if err != nil {
@@ -739,6 +749,10 @@ func TestStatusReportsEffectiveDefaultObjectLimits(t *testing.T) {
 		t.Fatalf("Status.MaxIntegrityRecords = %d, want default %d",
 			status.MaxIntegrityRecords, sqlite.DefaultMaxIntegrityRecords)
 	}
+	if status.MaxIntegrityBytes != sqlite.DefaultMaxIntegrityBytes {
+		t.Fatalf("Status.MaxIntegrityBytes = %d, want default %d",
+			status.MaxIntegrityBytes, sqlite.DefaultMaxIntegrityBytes)
+	}
 	if status.MaxSnapshotReaderConnections != sqlite.DefaultMaxSnapshotReaderConnections {
 		t.Fatalf("Status.MaxSnapshotReaderConnections = %d, want default %d",
 			status.MaxSnapshotReaderConnections, sqlite.DefaultMaxSnapshotReaderConnections)
@@ -750,6 +764,7 @@ func TestConfiguredReaderConnectionLimitIsReported(t *testing.T) {
 	config.MaxReaderConnections = 3
 	config.MaxSnapshotReaderConnections = 5
 	config.MaxIntegrityRecords = 101
+	config.MaxIntegrityBytes = 202
 	store := open(t, config)
 	t.Cleanup(func() { closeStore(t, store) })
 	status, err := store.Status(t.Context())
@@ -763,6 +778,10 @@ func TestConfiguredReaderConnectionLimitIsReported(t *testing.T) {
 	if status.MaxIntegrityRecords != config.MaxIntegrityRecords {
 		t.Fatalf("Status.MaxIntegrityRecords = %d, want %d",
 			status.MaxIntegrityRecords, config.MaxIntegrityRecords)
+	}
+	if status.MaxIntegrityBytes != config.MaxIntegrityBytes {
+		t.Fatalf("Status.MaxIntegrityBytes = %d, want %d",
+			status.MaxIntegrityBytes, config.MaxIntegrityBytes)
 	}
 	if status.MaxSnapshotReaderConnections != config.MaxSnapshotReaderConnections {
 		t.Fatalf("Status.MaxSnapshotReaderConnections = %d, want %d",
@@ -864,8 +883,8 @@ func TestDatabaseBoundToAnotherObjectStoreIsRefused(t *testing.T) {
 		store.Close()
 		t.Fatal("metadata bound to another object root was accepted")
 	}
-	if !errors.Is(err, syscall.EINVAL) {
-		t.Fatalf("opening mismatched metadata returned %v, want EINVAL", err)
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("opening malformed mismatched metadata returned %v, want EIO", err)
 	}
 
 	objects, openErr := localdisk.Open(t.Context(), config.Root, config.LocalDisk)

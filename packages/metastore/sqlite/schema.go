@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"syscall"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 
 // The migrations that build this package's schema. 0001_tree.sql is the tree as version 1 had
 // it; 0002_replication.sql rekeys the entry table and adds the change log;
-// 0003_backing_store.sql records the object store the metadata belongs to.
+// 0003_durable_state.sql adds the backing-store binding and durable identity witnesses.
 //
 // packages/sqliteschema documents what a numbered set of files buys and what rule they are kept
 // under: a file that has landed is never edited, and a schema change is a new file.
@@ -55,94 +56,142 @@ func prepare(
 	db *sql.DB,
 	namespace, storeID string,
 	window Window,
-	maxIntegrityRecords int64,
+	maxIntegrityRecords, maxIntegrityBytes int64,
 ) (id, root int64, err error) {
+	id, root, _, err = prepareConfigured(
+		ctx, db, namespace, storeID, window, maxIntegrityRecords, maxIntegrityBytes, nil,
+	)
+	return id, root, err
+}
+
+func prepareConfigured(
+	ctx context.Context,
+	db *sql.DB,
+	namespace, storeID string,
+	window Window,
+	maxIntegrityRecords, maxIntegrityBytes int64,
+	durable *durableOpen,
+) (id, root int64, state DurableState, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, DurableState{}, err
 	}
 	defer tx.Rollback()
 
 	version, recorded, err := recordedSchemaVersion(ctx, tx)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, DurableState{}, err
+	}
+	if durable != nil && durable.startup.Accepted.DatabaseID != "" {
+		if !recorded || version != schema.Version() {
+			return 0, 0, DurableState{}, fmt.Errorf(
+				"accepted durable state requires schema version %d, found recorded version %d: %w",
+				schema.Version(), version, syscall.EIO)
+		}
+		if err := reconcileStartup(ctx, tx, durable.startup); err != nil {
+			return 0, 0, DurableState{}, err
+		}
+	}
+	if durable != nil && durable.startup.Accepted.DatabaseID == "" &&
+		durable.mode == CreateNamespaceIfMissing && recorded && version > 0 {
+		return 0, 0, DurableState{}, fmt.Errorf(
+			"creating an unwitnessed namespace requires a pristine database, found schema version %d: %w",
+			version, syscall.EIO)
 	}
 	legacy := recorded && version > 0 && version < firstOwnershipAwareSchemaVersion
 	if legacy {
 		if err := validateIntegrityWork(ctx, tx, nil, maxIntegrityRecords); err != nil {
-			return 0, 0, err
+			return 0, 0, DurableState{}, err
+		}
+		if err := validateIntegrityBytes(ctx, tx, nil, maxIntegrityBytes, version); err != nil {
+			return 0, 0, DurableState{}, err
 		}
 		if err := validateLegacyObjectIntegrity(ctx, tx, version); err != nil {
-			return 0, 0, err
+			return 0, 0, DurableState{}, err
+		}
+		if err := validateLegacySequences(ctx, tx, version); err != nil {
+			return 0, 0, DurableState{}, err
 		}
 		if version == 1 {
 			if err := validateVersionOneNodeRelationships(ctx, tx); err != nil {
-				return 0, 0, err
+				return 0, 0, DurableState{}, err
 			}
 		} else if err := validateNodeRelationships(ctx, tx, nil); err != nil {
-			return 0, 0, err
+			return 0, 0, DurableState{}, err
 		}
 		if err := validateUsedAccounting(ctx, tx, nil); err != nil {
-			return 0, 0, err
+			return 0, 0, DurableState{}, err
 		}
-		// Version 1 predates the log tables. Version 2 already has the current log
-		// layout, so its retained history can be proved before migration work starts.
+		// Version 1 predates the log tables. Version 2's rows and recorded tail are
+		// validated before migration; its missing predecessor chain is why migration
+		// starts a new incarnation rather than carrying that history forward.
 		if version >= 2 {
-			if err := validateLogIntegrity(ctx, tx, nil); err != nil {
-				return 0, 0, err
+			if err := validateVersionTwoLogIntegrity(ctx, tx, nil); err != nil {
+				return 0, 0, DurableState{}, err
 			}
 		}
 	}
 	if err := schema.Reach(ctx, tx); err != nil {
-		return 0, 0, err
+		return 0, 0, DurableState{}, err
 	}
 	// Version 1 did not carry namespace on entries. Validate the global rooted tree and used
 	// accounting after the migrations normalize that table, while the same transaction can
 	// still roll every schema change back on refusal.
 	if legacy {
 		if err := validateStorageClasses(ctx, tx, nil); err != nil {
-			return 0, 0, err
+			return 0, 0, DurableState{}, err
 		}
 		if err := validateNodeValues(ctx, tx, nil); err != nil {
-			return 0, 0, err
+			return 0, 0, DurableState{}, err
 		}
 		if err := validateNodeRelationships(ctx, tx, nil); err != nil {
-			return 0, 0, err
+			return 0, 0, DurableState{}, err
 		}
 		if err := validateUsedAccounting(ctx, tx, nil); err != nil {
-			return 0, 0, err
+			return 0, 0, DurableState{}, err
 		}
 		if err := validateLogIntegrity(ctx, tx, nil); err != nil {
-			return 0, 0, err
+			return 0, 0, DurableState{}, err
 		}
 	}
+	if _, err := validateDurableState(ctx, tx); err != nil {
+		return 0, 0, DurableState{}, err
+	}
 	if err := bindBackingStore(ctx, tx, storeID); err != nil {
-		return 0, 0, err
+		return 0, 0, DurableState{}, err
 	}
 
 	switch err := tx.QueryRowContext(ctx,
 		`SELECT id, root FROM namespaces WHERE name = ?`, namespace).Scan(&id, &root); {
 	case errors.Is(err, sql.ErrNoRows):
+		if durable != nil && durable.mode == RequireExistingNamespace {
+			return 0, 0, DurableState{}, fmt.Errorf("namespace %q is missing from the bound database: %w",
+				namespace, syscall.EIO)
+		}
 		if id, root, err = createNamespace(ctx, tx, namespace); err != nil {
-			return 0, 0, err
+			return 0, 0, DurableState{}, err
 		}
 	case err != nil:
-		return 0, 0, err
+		return 0, 0, DurableState{}, err
 	}
-	if err := validateNamespaceIntegrity(ctx, tx, id, maxIntegrityRecords); err != nil {
-		return 0, 0, err
+	if err := validateNamespaceIntegrity(ctx, tx, id, maxIntegrityRecords, maxIntegrityBytes); err != nil {
+		return 0, 0, DurableState{}, err
 	}
 
 	// A namespace that has been quiet since the last process was here gets the trim that no
 	// append arrived to perform.
 	if err := trim(ctx, tx, id, window); err != nil {
-		return 0, 0, err
+		return 0, 0, DurableState{}, err
+	}
+	state, err = advanceGeneration(ctx, tx)
+	if err != nil {
+		return 0, 0, DurableState{}, err
 	}
 
 	if err := tx.Commit(); err != nil {
-		return 0, 0, err
+		return 0, 0, DurableState{}, &uncertainCommitError{err: err}
 	}
-	return id, root, nil
+	return id, root, state, nil
 }
 
 // recordedSchemaVersion reads enough migration state for package-specific preflight checks.
@@ -156,27 +205,39 @@ func recordedSchemaVersion(ctx context.Context, tx *sql.Tx) (version int, record
 	case err != nil:
 		return 0, false, err
 	}
-	if err := tx.QueryRowContext(ctx, `SELECT version FROM schema_version`).Scan(&version); err != nil {
+	var raw any
+	var storageClass string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT CASE WHEN typeof(version) = 'integer' THEN version END, typeof(version)
+		FROM schema_version LIMIT 1`).Scan(&raw, &storageClass); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, false, nil
 		}
 		return 0, false, err
 	}
-	return version, true, nil
+	stored, ok := storedInteger(raw, storageClass)
+	if !ok || stored < 0 || stored > math.MaxInt {
+		return 0, false, fmt.Errorf("the recorded schema version uses an invalid scalar value: %w", syscall.EIO)
+	}
+	return int(stored), true, nil
 }
 
 // bindBackingStore checks the database-level object-store binding requested by an opener.
 // An empty storeID is the unbound Open API. A non-empty storeID either proves an existing
 // binding or establishes one while the database holds no namespace.
 func bindBackingStore(ctx context.Context, tx *sql.Tx, storeID string) error {
-	var rows, valid int64
+	var rows, valid, matching int64
 	if err := tx.QueryRowContext(ctx, `
 		SELECT count(*), count(CASE
 			WHEN typeof(singleton) = 'integer' AND singleton = 1 AND
 				typeof(store_id) = 'text' AND store_id != ''
 			THEN 1
+		END), count(CASE
+			WHEN typeof(singleton) = 'integer' AND singleton = 1 AND
+				typeof(store_id) = 'text' AND store_id != '' AND store_id = ?
+			THEN 1
 		END)
-		FROM backing_store`).Scan(&rows, &valid); err != nil {
+		FROM backing_store`, storeID).Scan(&rows, &valid, &matching); err != nil {
 		return err
 	}
 	if rows > 1 || valid != rows {
@@ -184,21 +245,15 @@ func bindBackingStore(ctx context.Context, tx *sql.Tx, storeID string) error {
 			rows, valid, syscall.EIO)
 	}
 
-	var bound string
-	switch err := tx.QueryRowContext(ctx,
-		`SELECT store_id FROM backing_store WHERE singleton = 1`).Scan(&bound); {
-	case err == nil:
-		switch {
-		case storeID == "":
-			return fmt.Errorf("the database is bound to backing store %q: %w", bound, syscall.EINVAL)
-		case storeID != bound:
-			return fmt.Errorf("the database is bound to backing store %q, not %q: %w",
-				bound, storeID, syscall.EINVAL)
-		default:
-			return nil
+	if rows == 1 {
+		if storeID == "" {
+			return fmt.Errorf("the database is bound to a backing store: %w", syscall.EINVAL)
 		}
-	case !errors.Is(err, sql.ErrNoRows):
-		return err
+		if matching != 1 {
+			return fmt.Errorf("the database is bound to another backing store, not %q: %w",
+				storeID, syscall.EINVAL)
+		}
+		return nil
 	}
 
 	if storeID == "" {
@@ -236,14 +291,15 @@ func createNamespace(ctx context.Context, tx *sql.Tx, namespace string) (id, roo
 	// the moment the namespace came into being.
 	now := time.Now()
 	sec, nsec := storedTime(now)
-	result, err = tx.ExecContext(ctx, `
-		INSERT INTO nodes (namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-		VALUES (?, ?, 0, ?, ?, ?, ?, NULL)`,
-		id, int64(fs.ModeDir|dirMode), sec, nsec, sec, nsec)
+	root, err = allocateNodeID(ctx, tx)
 	if err != nil {
 		return 0, 0, err
 	}
-	if root, err = result.LastInsertId(); err != nil {
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		VALUES (?, ?, ?, 0, ?, ?, ?, ?, NULL)`,
+		root, id, int64(fs.ModeDir|dirMode), sec, nsec, sec, nsec)
+	if err != nil {
 		return 0, 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE namespaces SET root = ? WHERE id = ?`, root, id); err != nil {

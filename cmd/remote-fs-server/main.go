@@ -32,6 +32,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/localstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/azblob"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore/localdisk"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
@@ -205,13 +206,13 @@ func open(config commandConfig) (opened, error) {
 		return openLocal(
 			config.local, config.quota, config.objectLimits,
 			config.maxReaderConnections, config.maxSnapshotReaderConnections,
-			config.maxIntegrityRecords, config.maintenance,
+			config.maxIntegrityRecords, config.maxIntegrityBytes, config.maintenance,
 		)
 	default:
 		return openBlobs(
 			config.blob, config.quota, config.objectLimits,
 			config.maxReaderConnections, config.maxSnapshotReaderConnections,
-			config.maxIntegrityRecords, config.maintenance,
+			config.maxIntegrityRecords, config.maxIntegrityBytes, config.maintenance,
 		)
 	}
 }
@@ -266,8 +267,13 @@ func openLocal(
 	maxReaderConnections int,
 	maxSnapshotReaderConnections int,
 	maxIntegrityRecords int64,
+	maxIntegrityBytes int64,
 	maintenance objectstore.Options,
 ) (opened, error) {
+	maxWaitingOperations := source.objects.MaxWaitingOperations
+	if maxWaitingOperations == 0 {
+		maxWaitingOperations = localdisk.DefaultMaxWaitingOperations
+	}
 	store, err := localstore.Open(context.Background(), localstore.Config{
 		Root:                         source.root,
 		Workspace:                    source.workspace,
@@ -278,6 +284,7 @@ func openLocal(
 		MaxReaderConnections:         maxReaderConnections,
 		MaxSnapshotReaderConnections: maxSnapshotReaderConnections,
 		MaxIntegrityRecords:          maxIntegrityRecords,
+		MaxIntegrityBytes:            maxIntegrityBytes,
 		Maintenance:                  maintenance,
 	})
 	if err != nil {
@@ -299,7 +306,7 @@ func openLocal(
 			if err != nil {
 				return "", err
 			}
-			return formatLocalStatus(current, maintenance), nil
+			return formatLocalStatus(current, maintenance, maxWaitingOperations), nil
 		},
 		close: store.Close,
 	}, nil
@@ -326,11 +333,12 @@ func openBlobs(
 	maxReaderConnections int,
 	maxSnapshotReaderConnections int,
 	maxIntegrityRecords int64,
+	maxIntegrityBytes int64,
 	maintenance objectstore.Options,
 ) (opened, error) {
 	return openBlobsContext(
 		context.Background(), blob, quota, objectLimits, maxReaderConnections,
-		maxSnapshotReaderConnections, maxIntegrityRecords, maintenance,
+		maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance,
 	)
 }
 
@@ -342,6 +350,7 @@ func openBlobsContext(
 	maxReaderConnections int,
 	maxSnapshotReaderConnections int,
 	maxIntegrityRecords int64,
+	maxIntegrityBytes int64,
 	maintenance objectstore.Options,
 ) (opened, error) {
 	switch {
@@ -361,6 +370,7 @@ func openBlobsContext(
 		MaxReaderConnections:         maxReaderConnections,
 		MaxSnapshotReaderConnections: maxSnapshotReaderConnections,
 		MaxIntegrityRecords:          maxIntegrityRecords,
+		MaxIntegrityBytes:            maxIntegrityBytes,
 	}).Effective()
 	if err != nil {
 		return opened{}, err
@@ -407,7 +417,7 @@ func openBlobsContext(
 			return formatObjectStoreStatus(
 				blob.workspace, status, options.ObjectLimits,
 				options.MaxReaderConnections, options.MaxSnapshotReaderConnections,
-				options.MaxIntegrityRecords,
+				options.MaxIntegrityRecords, options.MaxIntegrityBytes,
 				namespace.MaintenanceStatus(),
 				maintenance,
 			), nil

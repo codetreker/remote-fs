@@ -268,6 +268,44 @@ func TestEveryKindOfChangeIsAppliedAsTheNamespaceRecordedIt(t *testing.T) {
 	}
 }
 
+func TestReplicaRefusesAReusedNodeIdentity(t *testing.T) {
+	from := source(t)
+	into := copyOf(t)
+	fill(t, from, into, 1024)
+	root, err := into.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := metastore.Node{
+		ID: root.ID + 1, Mode: 0o644,
+		AccessTime: time.Unix(1, 0), ModTime: time.Unix(1, 0),
+	}
+	created := metastore.Change{
+		Position: 1, Kind: metastore.Created, Parent: root.ID, Name: []byte("first"), Node: &node,
+	}
+	if applied, err := into.Apply(t.Context(), created); err != nil || !applied {
+		t.Fatalf("applying the initial creation returned applied=%v, err=%v", applied, err)
+	}
+	removed := metastore.Change{
+		Position: 2, Kind: metastore.Removed, Parent: root.ID, Name: []byte("first"),
+	}
+	if applied, err := into.Apply(t.Context(), removed); err != nil || !applied {
+		t.Fatalf("applying the removal returned applied=%v, err=%v", applied, err)
+	}
+	reused := created
+	reused.Position = 3
+	reused.Name = []byte("replacement")
+	if applied, err := into.Apply(t.Context(), reused); !errors.Is(err, syscall.EIO) || applied {
+		t.Fatalf("applying a reused node identity returned applied=%v, err=%v, want false and EIO", applied, err)
+	}
+	if into.Position() != 2 {
+		t.Fatalf("refused reuse advanced the replica to %d, want 2", into.Position())
+	}
+	if _, err := into.Stat(t.Context(), "replacement"); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("refused reuse left a replacement node: %v, want ENOENT", err)
+	}
+}
+
 // TestARenamedDirectoryMovesInTheCopyWithoutItsSubtreeBeingTouched. One row in the log is one
 // row here: everything beneath keeps the identity it had, which is what makes a directory
 // rename cost the same in a copy as it does in the namespace.
@@ -456,6 +494,40 @@ func TestAFillingThatWasNotCompletedLeavesTheCopyAsItWas(t *testing.T) {
 		t.Fatalf("the copy stands at position %d after a filling that was discarded, and stood at %d before", into.Position(), at)
 	}
 	requireSame(t, from, into)
+}
+
+func TestReseedReportsAClosedReplicaAsEIO(t *testing.T) {
+	into := copyOf(t)
+	if err := into.Close(); err != nil {
+		t.Fatal(err)
+	}
+	seeding, err := into.Reseed(t.Context())
+	if seeding != nil {
+		seeding.Close()
+		t.Fatal("a closed replica returned a seeding transaction")
+	}
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("reseeding a closed replica returned %v, want EIO", err)
+	}
+}
+
+func TestReseedWaitingForAnotherPictureHonorsCancellation(t *testing.T) {
+	into := copyOf(t)
+	first, err := into.Reseed(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	second, err := into.Reseed(ctx)
+	if second != nil {
+		second.Close()
+		t.Fatal("a canceled reseed returned a second seeding transaction")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceling a reseed behind an active picture returned %v", err)
+	}
 }
 
 // build puts a small tree into a namespace: a directory with a file and a subtree, and a file

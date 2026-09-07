@@ -28,17 +28,28 @@ import (
 // by the network — a caller closes it as soon as it is done with it, and the worst moment is
 // the one where every replica rebuilds at once.
 func (s *Store) Snapshot(ctx context.Context) (metastore.Snap, metastore.Position, error) {
-	tx, err := s.snapshotRead.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := s.beginReadSnapshot(ctx, s.snapshotRead)
 	if err != nil {
-		return nil, 0, fmt.Errorf("opening a picture of the tree: %w", failure(err))
+		return nil, 0, fmt.Errorf("opening a picture of the tree: %w", err)
 	}
-	var committed int64
+	var committedRaw any
+	var committedType string
 	if err := tx.QueryRowContext(ctx,
-		`SELECT committed_position FROM logs WHERE namespace = ?`, s.namespace).Scan(&committed); err != nil {
+		`SELECT CASE WHEN typeof(committed_position) = 'integer' THEN committed_position END,
+		        typeof(committed_position)
+		 FROM logs WHERE namespace = ?`, s.namespace).Scan(&committedRaw, &committedType); err != nil {
 		primary := fmt.Errorf("opening a picture of the tree: %w", failure(err))
 		return nil, 0, finishReadTransaction("snapshot transaction", tx, primary)
 	}
-	if err := validateNamespaceIntegrity(ctx, tx, s.namespace, s.maxIntegrityRecords); err != nil {
+	committed, ok := storedInteger(committedRaw, committedType)
+	if !ok || committed < 0 {
+		primary := fmt.Errorf("opening a picture of the tree: the log stores an invalid committed position: %w",
+			syscall.EIO)
+		return nil, 0, finishReadTransaction("snapshot transaction", tx, primary)
+	}
+	if err := validateNamespaceIntegrity(
+		ctx, tx, s.namespace, s.maxIntegrityRecords, s.maxIntegrityBytes,
+	); err != nil {
 		primary := fmt.Errorf("validating the picture of the tree: %w", failure(err))
 		return nil, 0, finishReadTransaction("snapshot transaction", tx, primary)
 	}

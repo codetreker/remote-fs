@@ -140,7 +140,7 @@ client 的 `DialOptions.MaxFrameBytes` 默认也是 8 MiB，逐 stream 限制 sc
 
 订阅默认最多 64 条。新订阅在保留唤醒 channel 与 stream state 前检查名额，已满时不排队，以 `EAGAIN` 拒绝；request cancellation、断连、失败或 `Handler.Stop` 结束 stream 时释放名额。快照默认最多 8 份；快照占着 storage 里的一个资源 —— 在 SQLite 上是一个读事务 —— 而它活多久由网络决定，所以已经开满时新的请求也以 `EAGAIN` 拒绝而不是排队：client 是先订阅再来要快照的，重试对它不花什么代价。
 
-SQLite metastore 把普通 namespace/log read 与长期 snapshot 放进两个 reader pool，避免慢 snapshot 占完普通操作与 event catch-up 能用的 connection。`MaxReaderConnections` 与 `MaxSnapshotReaderConnections` 默认各为 16；各自池满时读取等待 connection，并遵从对应 request/snapshot context 取消。snapshot 并发上限限制打开的读事务数，snapshot reader pool 限制数据库为它们持有的物理 connection 数，两者保持独立。
+SQLite metastore 把普通 namespace/log read 与长期 snapshot 放进两个 reader pool，避免慢 snapshot 占完普通操作与 event catch-up 能用的 connection。`MaxReaderConnections` 与 `MaxSnapshotReaderConnections` 默认各为 16；各自池满时读取等待 connection，并遵从对应 request/snapshot context 取消。snapshot 并发上限限制打开的读事务数，snapshot reader pool 限制数据库为它们持有的物理 connection 数，两者保持独立。普通读取只在启动 transaction 并以对 `database_state` 的常量查询钉住 SQLite snapshot 时持有 database health gate，page 扫描和 caller-owned result accounting 不继续占着 mutation commit/Accept 所需的 gate。
 
 **订阅者是被唤醒的，不是被投喂的。** 每一次改动了命名空间的请求在答复之前唤醒所有订阅，被唤醒的订阅自己去读日志。于是「追上」与「跟上」是同一条代码路径，不可能对「一条变更是什么」有两种说法；也没有任何一处等待间隔（R-CON-2）。mutation 成功后，handler 再用 `Log.Barrier` 在 mutation response 的 incarnation budget 下原子读取 log incarnation 与 committed position；并发 mutation 可以让 position 更晚，但同一事务记录本次修改保证它不会更早。barrier 读取失败发生在 namespace 已改变之后，以 `EIO` 返回且不伪装成未修改。它假定的是**这个进程是唯一在写这份命名空间的**：另一个 server 写到同一个数据库，它记下的变更到不了这里的订阅者。`-local-store` 用 lifetime lock 强制这项前提；Azure Blob + SQLite 形态由部署方保证同一 database/namespace 只有一个 active server。
 
@@ -175,10 +175,10 @@ server 通过 storage 接口访问命名空间，不知道底下是什么。集�
 | 形态 | 组成 | 变更日志 |
 |---|---|---|
 | 普通目录 | `packages/storage/localdir` | 无 |
-| 本地持久对象存储 | `packages/storage/localstore` 持有 `objectstore.Storage`、`localdisk.Objects` 与绑定的 `sqlite.Store` | 有 |
+| 本地持久对象存储 | `packages/storage/localstore` 持有 `objectstore.Storage`、`localdisk.Objects`、绑定的 `sqlite.Store` 与外部提交见证 | 有 |
 | Azure 对象存储 | `objectstore.Storage` + `azblob.Objects` + `sqlite.Store` | 有 |
 
-`localdir` 只依赖那个目录。Azure 形态依赖部署方分别提供和运维 Blob container 与数据库，两者可以各自失败（R-INT-12、R-ERR-6）。`localstore` 则拥有一个私有本地目录下的对象、SQLite、恢复状态与独占锁；它的完整设计见 [`local-disk-object-store.md`](local-disk-object-store.md)。
+`localdir` 只依赖那个目录。Azure 形态依赖部署方分别提供和运维 Blob container 与数据库，两者可以各自失败（R-INT-12、R-ERR-6）。`localstore` 则拥有一个私有本地目录下的对象、SQLite、WAL 外部见证、恢复状态与独占锁；它的完整设计见 [`local-disk-object-store.md`](local-disk-object-store.md)。
 
 storage 必须履行的义务、十一个操作的形状、路径规则与错误词汇，由 storage 接口定义，见顶层设计第四节。
 
@@ -200,11 +200,17 @@ storage 必须履行的义务、十一个操作的形状、路径规则与错误
 
 SQLite metastore 还给 reserved、unresolved 与 garbage object records 的合计数量和 payload bytes 配置独立阈值。一个 payload 自身超过 byte threshold 时 `Reserve` 返回 `EFBIG`；请求本身能装下、但现有 backlog 使新记录越界时返回 `EAGAIN`。`Put` 失败时 reservation 转成 unresolved；这类结果没有 ownership proof，不会因为时间经过而被删除。已经存在的 namespace 修改仍可产生 garbage 并把 backlog 推到阈值之上，此时新 reservation 保持拒绝，garbage 清扫与删除继续运行。package 默认值与 `-max-pending-objects`、`-max-pending-bytes` 用于 Azure 和本地形态；本地组合还通过 `Config.ObjectLimits` 暴露覆盖值，见 [`local-disk-object-store.md`](local-disk-object-store.md#七容量与资源上限)。两种 metastore-backed 形态同样使用有界 SQLite reader pool；package 默认为 16，独立 server 以 `-max-reader-connections` 配置。
 
-SQLite 打开与 `ObjectStatus` 会验证每个 namespace 是一棵完整的 rooted tree：root 没有 incoming entry，每个非 root 节点恰有一个同 namespace 的名字，所有节点都从 root 可达，cycle 与孤儿都以 `EIO` 拒绝。`namespaces.used` 必须是非负整数，并等于对所有 regular-file size 做 overflow-checked streaming sum 的结果。SQLite 的动态 storage class 也属于完整性：文件名必须是非空 BLOB，标量字段保持声明的整数/文本/可空类型；log tail、change kind 与 nullable node/from groups、mode/size/time 范围必须彼此一致。`committed_position` 必须等于最新 surviving change position，或在没有 change 时为零；不一致直接使打开以 `EIO` 失败，不通过生成新 incarnation 把损坏解释成一次可重建历史。否则 cursor order、NULL coercion 或 fabricated reconciliation 可以把损坏记录变成一次成功但缺行/零值的复制结果，因此都在开放 namespace 或 history 前拒绝。
+SQLite 打开与 `ObjectStatus` 会验证每个 namespace 是一棵完整的 rooted tree：root 没有 incoming entry，每个非 root 节点恰有一个同 namespace 的名字，所有节点都从 root 可达，cycle 与孤儿都以 `EIO` 拒绝。`namespaces.used` 必须是非负整数，并等于对所有 regular-file size 做 overflow-checked streaming sum 的结果。SQLite 的动态 storage class 也属于完整性：文件名必须是非空 BLOB，标量字段保持声明的整数/文本/可空类型；change kind 与 nullable node/from groups、mode/size/time 范围必须彼此一致。否则 cursor order、NULL coercion 或 fabricated reconciliation 可以把损坏记录变成一次成功但缺行/零值的复制结果，因此都在开放 namespace 或 history 前拒绝。
+
+SQLite 的 `database_state` 另持有数据库 identity、提交 generation，以及 node ID 与全局 change position 的持久高水位。ID 从高水位显式分配，`sqlite_sequence` 是同事务推进的冗余记录。durable-state validation 通过 expression indexes 的类型 discriminator 与最大 identity 边界读取全数据库 surviving references，打开、checkpoint 与每个 `Since` page 都要求 sequence 一致且任一 namespace 的引用不超过高水位；每次分配也重新核对 sequence，change append 还要求当前 committed tail 严格小于新位置。每条 retained change 另保存同 namespace 的 `previous_position`：第一条指向 `trimmed_through`，相邻记录逐条相连，最后一条等于 `committed_position`。位置是全数据库分配的，namespace 内允许被其它 namespace 留下空洞，完整性因此检查前驱链而不检查算术连续。`Open`、`Snapshot` 与 `ObjectStatus` 在暴露 namespace 前验证受 `MaxIntegrityRecords` 限制的完整链；`Since` 用索引锚定 page 起点并执行 O(page) predecessor validation，缺口所在页整体失败，stream error 使 consumer 作废副本。同一 incarnation/position 的续订会在该缺口持续失败，直到持久日志被带外修复或出现合法 rebuild boundary。断链、tail 不一致或高水位回退都不生成新 incarnation 掩盖损坏。
+
+本地持久形态还在 SQLite WAL 外保存 `METASTORE`：每次成功 open 或 mutation 的 SQLite commit 先推进 generation，再原子发布完整 accepted state；调用在发布完成后才成功。durable writer 为每条物理 connection 启用 SQLite `PERSIST_WAL`；accepted state 尚未完成 witnessed checkpoint 时，异常关闭、`Abort` 或未确认 `Accept` 会留下 WAL 供重开对账。checkpoint 只有在全部 WAL frame 已进入主数据库且状态仍等于 accepted state 时才推进见证中的 checkpoint generation。accepted 比 checkpoint 新时，下一次打开必须在 SQLite 打开前看见非空 WAL；缺失、空或仅有 header 的 WAL 表示确认状态可能回退，以 `EIO` 拒绝。accepted-state 见证发布失败会 poison 当前数据库，checkpoint 见证失败由单个后台 worker 定期重试；正常关闭在完整 checkpoint 和见证同步之后才尝试清除 `PERSIST_WAL` 并关闭 writer。清除调用失败时 flag 状态未知，但 `A = C` 已使 WAL 不再是恢复证据；writer 与 lifetime ownership 保留并允许重试。
 
 recursive reachability 之前先以 scalar aggregate 计算这次验证会触及的 namespace seed、node、relevant entry、object、log 与 change records 总数；entry 的 label、parent 或 child 任一接触目标 namespace 都计入，避免 corrupt cross-namespace edge 藏在预算之外。`MaxIntegrityRecords` 默认 1,000,000，`MinIntegrityRecords` 为 3，恰可容纳一个 namespace seed、空 root 与 mandatory log row；零值选择默认，低于 3 或 `math.MaxInt64` 在数据库打开前以 `EINVAL` 拒绝。预检超过上限时返回 `EFBIG` 并要求提高配置，不运行 recursive CTE；count/query 本身失败是 `EIO`。
 
-v1/v2 数据库还面临 object lifecycle 证据缺失：旧实现把 reservation size 记为零，也可以依据时间把 reservation 改成 garbage。只有全部 object row 都是可验证的 referenced 状态且上述完整性成立时才允许前滚迁移；任一 non-referenced row 或结构、计数错误都使打开以 `EIO` 失败，整个迁移 transaction 不提交。legacy preflight 对整个数据库计量 integrity work，不只检查这次请求打开的 namespace。这类旧状态需要运维先证明对象归属并修复数据，新代码不会猜测字节数或授权删除。
+full integrity pass 对 entry 与 retained-change name 执行内容检查前，还以 SQLite `length` 分批累计 variable bytes，不先 materialize BLOB。`MaxIntegrityBytes` 默认 64 MiB，必须是小于 `math.MaxInt64` 的正数；超过上限以 `EFBIG` 拒绝。它与 record count 分别限制“一共有多少关系”和“这些行携带多少变长名字”，不能互相替代。`Since` page 的 variable payload 由 caller-owned frame budget 限制，不计入 full-pass name-byte budget。
+
+v1/v2 数据库还面临 object lifecycle 证据缺失：旧实现把 reservation size 记为零，也可以依据时间把 reservation 改成 garbage。只有全部 object row 都是可验证的 referenced 状态且上述完整性成立时才允许前滚迁移；任一 non-referenced row 或结构、计数、序列错误都使打开以 `EIO` 失败，整个 migration transaction 不提交。legacy preflight 对整个数据库计量 integrity work，不只检查这次请求打开的 namespace。迁移从现有引用与 `sqlite_sequence` 建立 node/change 高水位；v2 retained log 没有 predecessor，迁移会清空旧 retained rows、切换 incarnation 并保留全局 change 高水位，使 replica 明确重建且新 position 不复用旧值。这类旧对象状态需要运维先证明归属并修复数据，新代码不会猜测字节数或授权删除。
 
 `objectstore.Storage.Space` 还会询问 `Objects.Available`。外部 object service 只返回 `ENOSYS` 时，报告继续使用 metastore 的逻辑配额；local-disk objects 返回底层 filesystem 扣除维护与 in-flight reserve 后的物理可用量，最终 `Avail` 是逻辑余量与物理余量中较小的那个。任何实际 measurement error，包括与 `ENOSYS` 一起出现的 error，都使整个调用失败。
 
@@ -235,7 +241,7 @@ v1/v2 数据库还面临 object lifecycle 证据缺失：旧实现把 reservatio
 
 `SIZE` 是一个整数字节数，可带 B、K、M、G、T、P 或 KiB 到 PiB 的后缀，每一级都是 1024 的幂；`KB`、`MB` 这类按 1000 的幂拼写的后缀被拒绝。配额一旦给出就不得小于 4096 字节；不给 `-quota` 是普通目录或 Azure namespace 没有 configured allowance 的唯一方式。本地持久 mode 必须给出配额。
 
-quota-limited 普通目录以 `-quota-max-directory-bytes` 与 `-quota-max-frontier-bytes` 分别配置单目录结果和遍历 frontier，默认各为 64 MiB；只有同时给出 `-dir` 与 `-quota` 时才接受这两个 flags。metastore-backed 形态共用 `-max-pending-objects`、`-max-pending-bytes`、`-max-reader-connections`、`-max-snapshot-reader-connections` 与 `-max-integrity-records`，默认分别为 4096、8 GiB、16、16 和 1,000,000；`-dir` 携带它们会被拒绝。
+quota-limited 普通目录以 `-quota-max-directory-bytes` 与 `-quota-max-frontier-bytes` 分别配置单目录结果和遍历 frontier，默认各为 64 MiB；只有同时给出 `-dir` 与 `-quota` 时才接受这两个 flags。metastore-backed 形态共用 `-max-pending-objects`、`-max-pending-bytes`、`-max-reader-connections`、`-max-snapshot-reader-connections`、`-max-integrity-records` 与 `-max-integrity-bytes`，默认分别为 4096、8 GiB、16、16、1,000,000 和 64 MiB；`-dir` 携带它们会被拒绝。本地形态另以 `-local-max-waiting-operations` 限制尚在 key/shard coordination 或等待 active budget 的调用，默认 256，满额时以 `EAGAIN` 拒绝。
 
 Azure 与 local 两种 objectstore-backed 形态还共用 `-sweep-interval` 与 `-sweep-batch`，默认 1 分钟和 64；前者必须为正，后者必须在 1 到 `objectstore.MaxSweepBatch`（1,048,576）之间。interval 决定 transient cleanup failure 无新 mutation 时的重试上界，batch 限制每轮 object/metastore 工作量。普通目录没有 garbage ledger，显式携带它们会被拒绝。
 
@@ -247,10 +253,10 @@ non-streaming HTTP flags 控制单体 body/write，request body 的 operation、
 
 启动先完成静态配置校验并占用 listener，再进行 storage open/recovery。这个顺序使无法取得服务地址的进程不会初始化一份新的持久 store。quota-limited 普通目录此时才按配置的 directory/frontier bounds 遍历；超限或读取失败会关闭 listener，且不会打印 READY。它与 Azure namespace 还会查询一次容量，local store 会查询一次组合状态；无配额普通目录与无配额 Azure 形态不做这项启动查询。因此 Azure 的 READY 不是一份远端可达性证明；对象服务不可达会由随后的操作或 SIGHUP 状态如实报错。
 
-存储就绪后安装终止与 SIGHUP lifecycle。`serving ... at http://...` 是 READY announcement：这行出现时 storage、listener 与 signal ownership 都已建立；HTTP accept loop 紧接着启动，`startedListener` 使 announcement 与 `Serve` 交接期间到达的终止信号关闭 listener 并等待 server goroutine 退出。READY 之前的失败会关闭已取得的 listener 与 storage，cleanup failure 并入命令结果。
+存储就绪后安装终止与 SIGHUP lifecycle。`serving ... at http://...` 是 READY announcement：这行出现时 storage、listener 与 signal ownership 都已建立；HTTP accept loop 紧接着启动，`startedListener` 使 announcement 与 `Serve` 交接期间到达的终止信号关闭 listener 并等待 server goroutine 退出。READY 之前的失败会关闭已取得的 listener，并在能证明 storage handles 已关闭时释放 storage ownership；pool cleanup 不确定时本地持久形态保留 root lock 到进程退出。cleanup failure 并入命令结果。
 
-收到 SIGINT／SIGTERM 后，外层 admission gate 先拒绝新请求，handler 向每条 change stream 发 server-stopping frame，并给在途请求 5 秒完成。deadline 到期时关闭连接，但仍等待已经进入 application handler 的调用离开，随后停止后台 maintenance、关闭 SQLite，最后释放 object-store lifetime lock。关闭各层的错误合并为命令结果。
+收到 SIGINT／SIGTERM 后，外层 admission gate 先拒绝新请求，handler 向每条 change stream 发 server-stopping frame，并给在途请求 5 秒完成。deadline 到期时关闭连接，但仍等待已经进入 application handler 的调用离开，随后停止并等待后台 maintenance 与 checkpoint worker。local store 再建立独立的 5 秒 close context，用它等待 commit gate 与完整 WAL checkpoint；active reader 立即使本轮关闭返回 `EBUSY`，pool `Close` 本身不接受该 context。reader pools 已关闭后的 checkpoint busy/failure/cancellation 保留 writer/WAL 并可重试；任一 pool close error 是 terminal result，锁保留到进程退出。只有所有 pools 无错误关闭后才释放 object-store lifetime lock，关闭各层的错误合并为命令结果。
 
 SIGHUP 不经过网络控制面，它请求的工作在一个 command-owned goroutine 中运行，同一时刻至多一项。quota-limited 普通目录用启动时同一组 directory/frontier bounds 重新遍历 namespace；只有完整成功才替换可能漂移的计数，超限、取消或读取失败都会报告 recount failure 并保留原计数，服务继续运行。无配额目录说明没有可重数的 allowance。recount 自身没有 deadline，但不占住 signal loop；SIGINT／SIGTERM 先关闭 HTTP admission 并向 recount 发送取消，再关闭 listener、排空 handler，最后等待 recount 离开。已经进入的不可取消 filesystem syscall 仍可延迟进程退出，但不会让 HTTP 继续接受新请求。
 
-两个 metastore-backed 形态执行带 2 秒 context deadline 的只读 status：它们都分别报 reserved、unresolved 与 garbage backlog、pending thresholds、SQLite ordinary/event-reader 与 snapshot-reader connection 上限、integrity record work 上限、effective sweep interval/batch 与最近 maintenance outcome；local store 另外报逻辑/物理空间、store UUID、in-flight resource 和 recovery records。SIGINT／SIGTERM 取消并等待它；已经进入的不可取消 syscall 仍须返回。任一 component 查询失败时只报告 status failure，不打印部分数字。
+两个 metastore-backed 形态执行带 2 秒 context deadline 的只读 status：它们都分别报 reserved、unresolved 与 garbage backlog、pending thresholds、SQLite ordinary/event-reader 与 snapshot-reader connection 上限、integrity record/name-byte work 上限、effective sweep interval/batch 与最近 maintenance outcome；local store 另外报逻辑/物理空间、store UUID、waiting/active resource、recovery records，以及 checkpoint 的 accepted/checkpointed generation 与 pending。SIGINT／SIGTERM 取消并等待它；已经进入的不可取消 syscall 仍须返回。checkpoint error 或任一 component 查询失败时只报告 status failure，不打印部分数字。

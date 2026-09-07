@@ -228,7 +228,7 @@ go.mod
 packages/                    可被外部与自身 import
   storage/                   接口定义、实现者义务与 errno 词汇（两个角色共用）
     localdir/                本地目录实现
-    localstore/              把本地对象、SQLite、格式、锁与恢复组合成一份 storage
+    localstore/              把本地对象、SQLite、外部提交见证、锁与恢复组合成一份 storage
     objectstore/             对象存储实现：字节在对象存储里，树在 metastore 里
       azblob/                Azure Blob 的对象接口实现
       localdisk/             本地不可变文件的对象接口实现
@@ -265,7 +265,7 @@ docs/
 | `transport/httprest` | 两个角色共用：服务端在 server 侧，拨号端在 client 侧 |
 | `fuse` | client 侧 |
 
-这些拆分各自守住一条依赖或 ownership 边界：`storage` 与实现分开，使第三方实现自有存储时只需引入接口（R-INT-6）；配额自成 `storage/limited`，因为它是一层包装而不是某一个实现的性质（R-WS-5、R-INT-3）；`metastore` 与 `storage/objectstore` 分开，因为名字树不持有文件字节，而对象接口不认识路径；`storage/localstore` 负责把两个 durable half、store identity、初始化与 lifetime lock 组合成一个资源，避免这些规则散落在二进制里；契约用例分别属于 `storage/storagetest`、`objectstore/objectstoretest` 与 `metastore/metastoretest`；每种传输自成 `transport/` 下的一个包（R-INT-9、R-INT-10）；`fuse` 与传输分开，使得不挂载的使用者不被 FUSE 与平台限制绑住（R-INT-5、R-INT-8）。
+这些拆分各自守住一条依赖或 ownership 边界：`storage` 与实现分开，使第三方实现自有存储时只需引入接口（R-INT-6）；配额自成 `storage/limited`，因为它是一层包装而不是某一个实现的性质（R-WS-5、R-INT-3）；`metastore` 与 `storage/objectstore` 分开，因为名字树不持有文件字节，而对象接口不认识路径；`storage/localstore` 负责把两个 durable half、WAL 外部见证、store identity、初始化与 lifetime lock 组合成一个资源，避免这些规则散落在二进制里；契约用例分别属于 `storage/storagetest`、`objectstore/objectstoretest` 与 `metastore/metastoretest`；每种传输自成 `transport/` 下的一个包（R-INT-9、R-INT-10）；`fuse` 与传输分开，使得不挂载的使用者不被 FUSE 与平台限制绑住（R-INT-5、R-INT-8）。
 
 带依赖的实现各自成包，使依赖跟着选择走：`localdir` 不链接 Azure SDK 或 SQLite；`localdisk` 不链接 Azure SDK；`localstore` 明确选择 SQLite 与本地对象格式；`azblob` 才选择 Azure SDK。
 

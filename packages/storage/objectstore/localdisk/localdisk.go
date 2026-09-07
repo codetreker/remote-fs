@@ -43,6 +43,7 @@ const (
 
 	DefaultMaxObjectBytes          = int64(1024 * 1024 * 1024)
 	DefaultMaxInFlightOperations   = 64
+	DefaultMaxWaitingOperations    = 256
 	DefaultMaxInFlightBytes        = int64(2 * 1024 * 1024 * 1024)
 	DefaultMaintenanceReserveBytes = int64(64 * 1024 * 1024)
 	DefaultMaxRecoveryEntries      = 4096
@@ -56,6 +57,9 @@ type Options struct {
 	// MaxInFlightOperations includes reads, writes, deletes, and capacity queries. Status
 	// and root verification share one separate serialized control slot.
 	MaxInFlightOperations int
+	// MaxWaitingOperations bounds data operations coordinating on a key or shard, plus
+	// operations waiting to enter the active operation/byte budget.
+	MaxWaitingOperations int
 	// MaxInFlightBytes covers encoded writes and allocated read payloads.
 	MaxInFlightBytes int64
 	// MaintenanceReserveBytes is unavailable to object payloads.
@@ -70,6 +74,7 @@ type Options struct {
 type limits struct {
 	maxObjectBytes          int64
 	maxInFlightOperations   int
+	maxWaitingOperations    int
 	maxInFlightBytes        int64
 	maintenanceReserveBytes int64
 	maxRecoveryEntries      int
@@ -86,6 +91,7 @@ func (o Options) settle() (limits, error) {
 	settled := limits{
 		maxObjectBytes:          o.MaxObjectBytes,
 		maxInFlightOperations:   o.MaxInFlightOperations,
+		maxWaitingOperations:    o.MaxWaitingOperations,
 		maxInFlightBytes:        o.MaxInFlightBytes,
 		maintenanceReserveBytes: o.MaintenanceReserveBytes,
 		maxRecoveryEntries:      o.MaxRecoveryEntries,
@@ -95,6 +101,9 @@ func (o Options) settle() (limits, error) {
 	}
 	if settled.maxInFlightOperations == 0 {
 		settled.maxInFlightOperations = DefaultMaxInFlightOperations
+	}
+	if settled.maxWaitingOperations == 0 {
+		settled.maxWaitingOperations = DefaultMaxWaitingOperations
 	}
 	if settled.maxInFlightBytes == 0 {
 		settled.maxInFlightBytes = DefaultMaxInFlightBytes
@@ -106,9 +115,12 @@ func (o Options) settle() (limits, error) {
 		settled.maxRecoveryEntries = DefaultMaxRecoveryEntries
 	}
 
-	if settled.maxObjectBytes < 0 || settled.maxInFlightOperations < 0 || settled.maxInFlightBytes < 0 ||
+	if settled.maxObjectBytes < 0 || settled.maxInFlightOperations < 0 || settled.maxWaitingOperations < 0 || settled.maxInFlightBytes < 0 ||
 		settled.maintenanceReserveBytes < 0 || settled.maxRecoveryEntries < 0 {
 		return limits{}, fmt.Errorf("local-disk object limits must be positive: %w", syscall.EINVAL)
+	}
+	if settled.maxWaitingOperations >= math.MaxInt {
+		return limits{}, fmt.Errorf("the waiting-operation limit must be below the largest integer: %w", syscall.EINVAL)
 	}
 	if settled.maxRecoveryEntries < settled.maxInFlightOperations {
 		return limits{}, fmt.Errorf("the recovery-record limit %d is smaller than the operation limit %d: %w",
@@ -194,6 +206,7 @@ type Objects struct {
 	health                  *healthState
 	capacity                *physicalCapacity
 	keys                    *keyLocker
+	shards                  *shardLocker
 	recoveryRecords         atomic.Int64
 
 	closeMu   sync.Mutex
@@ -328,9 +341,10 @@ func open(ctx context.Context, root string, options Options, ops fileOperations)
 		filesystem:              rootFilesystem,
 		limits:                  settled,
 		ops:                     ops,
-		gate:                    newAdmission(settled.maxInFlightOperations, settled.maxInFlightBytes),
+		gate:                    newAdmission(settled.maxInFlightOperations, settled.maxWaitingOperations, settled.maxInFlightBytes),
 		health:                  &healthState{},
 		capacity:                &physicalCapacity{},
+		shards:                  newShardLocker(),
 	}
 	store.keys = newKeyLocker()
 	return store, nil
@@ -353,12 +367,17 @@ func (o *Objects) CompositeInitializationState() CompositeInitializationState {
 // lease. A composite opening a pathname-based dependency must also validate that the full
 // ancestor chain cannot be renamed by principals outside the store owner's trust boundary;
 // same-UID and administrative mutation remain trusted deployment actions.
-func (o *Objects) VerifyRootPath() error {
-	ticket, err := o.gate.acquireControl(context.Background())
+func (o *Objects) VerifyRootPath() (returned error) {
+	ctx := context.Background()
+	ticket, err := o.gate.acquireControl(ctx)
 	if err != nil {
 		return fmt.Errorf("verify object-store root path: %w", err)
 	}
 	defer ticket.release()
+	if err := o.health.failure(); err != nil {
+		return fmt.Errorf("verify object-store root path: %w", err)
+	}
+	defer func() { returned = o.health.finish(ctx, returned) }()
 	var pinned unix.Stat_t
 	if err := unix.Fstat(o.rootFD, &pinned); err != nil {
 		return fmt.Errorf("stat pinned object-store root: %v: %w", err, syscall.EIO)

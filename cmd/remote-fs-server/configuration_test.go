@@ -43,11 +43,13 @@ func TestAFlagForAnotherSourceIsRefused(t *testing.T) {
 		{"blob prefix on a directory", []string{"-dir", "/data", "-blob-prefix", "p"}, "-blob-prefix"},
 		{"metastore on a local store", []string{"-local-store", "/data", "-metastore", "meta.db"}, "-metastore"},
 		{"local bound on blobs", []string{"-blob-container", "container", "-local-max-object-bytes", "1M"}, "-local-max-object-bytes"},
+		{"local waiter bound on blobs", []string{"-blob-container", "container", "-local-max-waiting-operations", "8"}, "-local-max-waiting-operations"},
 		{"local recovery on a directory", []string{"-dir", "/data", "-local-max-recovery-entries", "8"}, "-local-max-recovery-entries"},
 		{"pending threshold on a directory", []string{"-dir", "/data", "-max-pending-objects", "8"}, "-max-pending-objects"},
 		{"reader limit on a directory", []string{"-dir", "/data", "-max-reader-connections", "8"}, "-max-reader-connections"},
 		{"snapshot reader limit on a directory", []string{"-dir", "/data", "-max-snapshot-reader-connections", "8"}, "-max-snapshot-reader-connections"},
 		{"integrity limit on a directory", []string{"-dir", "/data", "-max-integrity-records", "100"}, "-max-integrity-records"},
+		{"integrity byte limit on a directory", []string{"-dir", "/data", "-max-integrity-bytes", "8M"}, "-max-integrity-bytes"},
 		{"sweep interval on a directory", []string{"-dir", "/data", "-sweep-interval", "2m"}, "-sweep-interval"},
 		{"sweep batch on a directory", []string{"-dir", "/data", "-sweep-batch", "8"}, "-sweep-batch"},
 		{"subscription limit on a directory", []string{"-dir", "/data", "-http-max-subscriptions", "8"}, "-http-max-subscriptions"},
@@ -102,6 +104,7 @@ func TestLocalDefaultsFollowThePackagesThatEnforceThem(t *testing.T) {
 	if got := config.local.objects; got != (localdisk.Options{
 		MaxObjectBytes:          localdisk.DefaultMaxObjectBytes,
 		MaxInFlightOperations:   localdisk.DefaultMaxInFlightOperations,
+		MaxWaitingOperations:    localdisk.DefaultMaxWaitingOperations,
 		MaxInFlightBytes:        localdisk.DefaultMaxInFlightBytes,
 		MaintenanceReserveBytes: localdisk.DefaultMaintenanceReserveBytes,
 		MaxRecoveryEntries:      localdisk.DefaultMaxRecoveryEntries,
@@ -122,6 +125,9 @@ func TestLocalDefaultsFollowThePackagesThatEnforceThem(t *testing.T) {
 	}
 	if config.maxIntegrityRecords != sqlite.DefaultMaxIntegrityRecords {
 		t.Fatalf("integrity default is %d, want %d", config.maxIntegrityRecords, sqlite.DefaultMaxIntegrityRecords)
+	}
+	if config.maxIntegrityBytes != sqlite.DefaultMaxIntegrityBytes {
+		t.Fatalf("integrity byte default is %d, want %d", config.maxIntegrityBytes, sqlite.DefaultMaxIntegrityBytes)
 	}
 	if config.standalone != defaultStandaloneHTTPOptions() {
 		t.Fatalf("standalone HTTP defaults are %+v, want %+v", config.standalone, defaultStandaloneHTTPOptions())
@@ -163,6 +169,7 @@ func TestLocalBoundsAndHTTPBodyLimitReachTheirOwners(t *testing.T) {
 		"-quota", "64M",
 		"-local-max-object-bytes", "4M",
 		"-local-max-in-flight-operations", "3",
+		"-local-max-waiting-operations", "9",
 		"-local-max-in-flight-bytes", "16M",
 		"-local-maintenance-reserve-bytes", "2M",
 		"-local-max-recovery-entries", "17",
@@ -171,6 +178,7 @@ func TestLocalBoundsAndHTTPBodyLimitReachTheirOwners(t *testing.T) {
 		"-max-reader-connections", "5",
 		"-max-snapshot-reader-connections", "6",
 		"-max-integrity-records", "101",
+		"-max-integrity-bytes", "7M",
 		"-sweep-interval", "45s",
 		"-sweep-batch", "23",
 		"-http-max-body-bytes", "5M",
@@ -196,7 +204,7 @@ func TestLocalBoundsAndHTTPBodyLimitReachTheirOwners(t *testing.T) {
 	if config.quota != 64<<20 {
 		t.Fatalf("quota is %d", config.quota)
 	}
-	if got := config.local.objects; got.MaxObjectBytes != 4<<20 || got.MaxInFlightOperations != 3 ||
+	if got := config.local.objects; got.MaxObjectBytes != 4<<20 || got.MaxInFlightOperations != 3 || got.MaxWaitingOperations != 9 ||
 		got.MaxInFlightBytes != 16<<20 || got.MaintenanceReserveBytes != 2<<20 || got.MaxRecoveryEntries != 17 {
 		t.Fatalf("local bounds are %+v", got)
 	}
@@ -211,6 +219,9 @@ func TestLocalBoundsAndHTTPBodyLimitReachTheirOwners(t *testing.T) {
 	}
 	if config.maxIntegrityRecords != 101 {
 		t.Fatalf("integrity record work limit is %d", config.maxIntegrityRecords)
+	}
+	if config.maxIntegrityBytes != 7<<20 {
+		t.Fatalf("integrity name-byte work limit is %d", config.maxIntegrityBytes)
 	}
 	if config.maintenance.SweepInterval != 45*time.Second || config.maintenance.SweepBatch != 23 {
 		t.Fatalf("maintenance bounds are %+v", config.maintenance)
@@ -268,6 +279,7 @@ func TestMetastoreBoundsApplyToBlobNamespaces(t *testing.T) {
 		"-max-reader-connections", "7",
 		"-max-snapshot-reader-connections", "11",
 		"-max-integrity-records", "103",
+		"-max-integrity-bytes", "13M",
 		"-sweep-interval", "47s",
 		"-sweep-batch", "31",
 		"-http-max-write-bytes", "12M",
@@ -286,6 +298,9 @@ func TestMetastoreBoundsApplyToBlobNamespaces(t *testing.T) {
 	}
 	if config.maxIntegrityRecords != 103 {
 		t.Fatalf("blob integrity record work limit is %d", config.maxIntegrityRecords)
+	}
+	if config.maxIntegrityBytes != 13<<20 {
+		t.Fatalf("blob integrity name-byte work limit is %d", config.maxIntegrityBytes)
 	}
 	if config.maintenance != (objectstore.Options{SweepInterval: 47 * time.Second, SweepBatch: 31}) {
 		t.Fatalf("blob maintenance limits are %+v", config.maintenance)
@@ -345,6 +360,7 @@ func TestNonPositiveCountsAndDurationsAreRefused(t *testing.T) {
 		value string
 	}{
 		{"-local-max-in-flight-operations", "0"},
+		{"-local-max-waiting-operations", "0"},
 		{"-local-max-recovery-entries", "-1"},
 		{"-max-pending-objects", "0"},
 		{"-max-reader-connections", "0"},
@@ -416,6 +432,8 @@ func TestInvalidHTTPBoundsDoNotInitializeALocalStore(t *testing.T) {
 		{"frame aggregate", []string{"-http-max-in-flight-snapshot-frame-bytes", "1M"}},
 		{"frame waiters", []string{"-http-max-waiting-snapshot-frames", "-1"}},
 		{"connections", []string{"-http-max-connections", "0"}},
+		{"waiting operations", []string{"-local-max-waiting-operations", "0"}},
+		{"unbounded waiting operations", []string{"-local-max-waiting-operations", strconv.Itoa(math.MaxInt)}},
 		{"unbounded connections", []string{"-http-max-connections", strconv.Itoa(math.MaxInt)}},
 		{"header timeout", []string{"-http-read-header-timeout", "0s"}},
 		{"idle timeout", []string{"-http-idle-timeout", "0s"}},
@@ -424,6 +442,8 @@ func TestInvalidHTTPBoundsDoNotInitializeALocalStore(t *testing.T) {
 		{"unbounded snapshot readers", []string{"-max-snapshot-reader-connections", strconv.Itoa(math.MaxInt)}},
 		{"integrity work below root minimum", []string{"-max-integrity-records", "1"}},
 		{"unbounded integrity work", []string{"-max-integrity-records", strconv.FormatInt(math.MaxInt64, 10)}},
+		{"zero integrity byte work", []string{"-max-integrity-bytes", "0"}},
+		{"unbounded integrity byte work", []string{"-max-integrity-bytes", strconv.FormatInt(math.MaxInt64, 10)}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -560,6 +580,7 @@ func TestHelpNamesTheLocalStoreAndStatusSignal(t *testing.T) {
 	}
 	for _, phrase := range []string{
 		"-local-store",
+		"-local-max-waiting-operations",
 		"-http-max-body-bytes",
 		"-http-max-write-bytes",
 		"-http-max-waiting-bodies",
@@ -581,11 +602,14 @@ func TestHelpNamesTheLocalStoreAndStatusSignal(t *testing.T) {
 		"-max-reader-connections",
 		"-max-snapshot-reader-connections",
 		"-max-integrity-records",
+		"-max-integrity-bytes",
 		"-sweep-interval",
 		"-sweep-batch",
 		"maximum SQLite reader connections",
+		"maximum local object operations waiting",
 		"maximum SQLite reader connections held by concurrent snapshots",
 		"integrity record work limit",
+		"integrity name-byte work limit",
 		"larger retained namespaces",
 		"reservation-admission threshold",
 		"unresolved",

@@ -452,15 +452,14 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 		}
 		now := time.Now()
 		sec, nsec := storedTime(now)
-		result, err := tx.ExecContext(ctx, `
-			INSERT INTO nodes (namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-			VALUES (?, ?, 0, ?, ?, ?, ?, NULL)`,
-			s.namespace, int64(mode), sec, nsec, sec, nsec)
+		id, err := allocateNodeID(ctx, tx)
 		if err != nil {
 			return err
 		}
-		id, err := result.LastInsertId()
-		if err != nil {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+			VALUES (?, ?, ?, 0, ?, ?, ?, ?, NULL)`,
+			id, s.namespace, int64(mode), sec, nsec, sec, nsec); err != nil {
 			return err
 		}
 		if err := s.link(ctx, tx, parent.ID, name, id); err != nil {

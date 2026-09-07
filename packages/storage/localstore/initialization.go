@@ -16,23 +16,50 @@ const initializationBindingStage = ".LOCALSTORE.init.stage"
 
 var initializationBindingMagic = [8]byte{'R', 'F', 'S', 'I', 'N', 'I', 'T', 0}
 
-func (a *rootAnchor) BindInitialization(id localdisk.ID, workspace string, databaseExists bool) error {
-	if err := a.removeInitializationBindingStage(); err != nil {
-		return err
+type initializationIntent uint8
+
+const (
+	initializationIntentMissing initializationIntent = iota + 1
+	initializationIntentPristine
+	initializationIntentBound
+)
+
+func (a *rootAnchor) InspectInitializationIntent(
+	id localdisk.ID,
+	workspace string,
+	complete bool,
+) (initializationIntent, error) {
+	if complete {
+		if exists, err := a.RequireRegularEntry(initializationBindingStage); err != nil {
+			return 0, err
+		} else if exists {
+			return 0, fmt.Errorf(
+				"a completed local store has an interrupted initialization binding: %w",
+				syscall.EIO,
+			)
+		}
+	} else if err := a.removeInitializationBindingStage(); err != nil {
+		return 0, err
 	}
+
 	path := filepath.Join(a.path, localdisk.InitializationMarkerName)
 	fd, err := unix.Openat(a.fd, localdisk.InitializationMarkerName,
 		unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return &os.PathError{Op: "open local store initialization intent", Path: path, Err: err}
+		if errors.Is(err, syscall.ENOENT) {
+			return initializationIntentMissing, nil
+		}
+		return 0, &os.PathError{Op: "open local store initialization intent", Path: path, Err: err}
 	}
 	stat, validateErr := validatePrivateFile(fd, path, a.device, a.mount, false, a.statx)
 	var encoded []byte
 	readErr := error(nil)
 	if validateErr == nil && stat.Size > 0 {
 		if stat.Size < completionMinBytes || stat.Size > completionMaxBytes {
-			validateErr = fmt.Errorf("the local store initialization intent is %d bytes, want zero or between %d and %d: %w",
-				stat.Size, completionMinBytes, completionMaxBytes, syscall.EIO)
+			validateErr = fmt.Errorf(
+				"the local store initialization intent is %d bytes, want zero or between %d and %d: %w",
+				stat.Size, completionMinBytes, completionMaxBytes, syscall.EIO,
+			)
 		} else {
 			encoded = make([]byte, int(stat.Size))
 			readErr = preadFull(fd, encoded)
@@ -41,10 +68,33 @@ func (a *rootAnchor) BindInitialization(id localdisk.ID, workspace string, datab
 	closeErr := unix.Close(fd)
 	if err := errors.Join(validateErr, readErr,
 		pathFailure("close local store initialization intent", path, closeErr)); err != nil {
+		return 0, err
+	}
+	if len(encoded) == 0 {
+		if complete {
+			return 0, fmt.Errorf(
+				"a completed local store has an unbound initialization intent: %w",
+				syscall.EIO,
+			)
+		}
+		return initializationIntentPristine, nil
+	}
+	if err := validateBinding(encoded, initializationBindingMagic, "initialization intent", id, workspace); err != nil {
+		return 0, err
+	}
+	return initializationIntentBound, nil
+}
+
+func (a *rootAnchor) BindInitialization(id localdisk.ID, workspace string, databaseExists bool) error {
+	intent, err := a.InspectInitializationIntent(id, workspace, false)
+	if err != nil {
 		return err
 	}
-	if len(encoded) > 0 {
-		return validateBinding(encoded, initializationBindingMagic, "initialization intent", id, workspace)
+	if intent == initializationIntentBound {
+		return nil
+	}
+	if intent == initializationIntentMissing {
+		return fmt.Errorf("the local store initialization intent disappeared: %w", syscall.EIO)
 	}
 	if databaseExists {
 		return fmt.Errorf("an unbound initialization intent already has a metadata database: %w", syscall.EIO)

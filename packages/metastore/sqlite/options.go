@@ -19,6 +19,10 @@ const (
 	// examined by one integrity pass when the caller supplies no limit of its own.
 	DefaultMaxIntegrityRecords int64 = 1_000_000
 
+	// DefaultMaxIntegrityBytes bounds variable-length namespace and log fields examined by
+	// one full integrity pass.
+	DefaultMaxIntegrityBytes int64 = 64 << 20
+
 	// MinIntegrityRecords is the namespace row, root node, and log row every usable namespace
 	// contains.
 	MinIntegrityRecords int64 = 3
@@ -42,6 +46,11 @@ type Options struct {
 	// accepted by an integrity pass. A larger retained namespace returns syscall.EFBIG before
 	// recursive traversal or row validation. Zero selects DefaultMaxIntegrityRecords.
 	MaxIntegrityRecords int64
+
+	// MaxIntegrityBytes bounds the combined entry and retained-change name bytes examined by
+	// a full integrity pass before content-sensitive validation. Zero selects
+	// DefaultMaxIntegrityBytes.
+	MaxIntegrityBytes int64
 }
 
 // DefaultOptions returns the default serving configuration.
@@ -52,6 +61,7 @@ func DefaultOptions() Options {
 		MaxReaderConnections:         DefaultMaxReaderConnections,
 		MaxSnapshotReaderConnections: DefaultMaxSnapshotReaderConnections,
 		MaxIntegrityRecords:          DefaultMaxIntegrityRecords,
+		MaxIntegrityBytes:            DefaultMaxIntegrityBytes,
 	}
 }
 
@@ -95,9 +105,20 @@ func (o Options) Effective() (Options, error) {
 	if maxIntegrityRecords == math.MaxInt64 {
 		return Options{}, fmt.Errorf("the SQLite integrity work limit must be bounded below the largest integer: %w", syscall.EINVAL)
 	}
+	maxIntegrityBytes := o.MaxIntegrityBytes
+	if maxIntegrityBytes == 0 {
+		maxIntegrityBytes = DefaultMaxIntegrityBytes
+	}
+	if maxIntegrityBytes < 1 {
+		return Options{}, fmt.Errorf("the SQLite integrity byte limit must be positive: %w", syscall.EINVAL)
+	}
+	if maxIntegrityBytes == math.MaxInt64 {
+		return Options{}, fmt.Errorf("the SQLite integrity byte limit must be bounded below the largest integer: %w", syscall.EINVAL)
+	}
 	o.ObjectLimits = objectLimits
 	o.MaxReaderConnections = maxReaders
 	o.MaxSnapshotReaderConnections = maxSnapshotReaders
 	o.MaxIntegrityRecords = maxIntegrityRecords
+	o.MaxIntegrityBytes = maxIntegrityBytes
 	return o, nil
 }

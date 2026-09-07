@@ -764,6 +764,160 @@ func TestAReferencedOnlyVersionTwoDatabaseIsCarriedForward(t *testing.T) {
 	}
 }
 
+func TestVersionTwoMigrationStartsAVerifiableLogAboveItsOldHighWater(t *testing.T) {
+	path := database(t)
+	writeVersionTwo(t, path)
+	db := raw(t, path)
+	var before string
+	if err := db.QueryRow(`SELECT incarnation FROM logs WHERE namespace = 1`).Scan(&before); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO changes (
+			position, namespace, kind, parent, name, node, mode, size,
+			atime_sec, atime_nsec, mtime_sec, mtime_nsec, content, recorded_sec, recorded_nsec
+		)
+		SELECT 50, 1, 0, 2, CAST('old' AS BLOB), id, mode, size,
+			atime_sec, atime_nsec, mtime_sec, mtime_nsec, content, 0, 0
+		FROM nodes WHERE id = 3;
+		UPDATE logs SET committed_position = 50 WHERE namespace = 1;
+		UPDATE sqlite_sequence SET seq = 80 WHERE name = 'changes'`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store := open(t, path, "workspace", 4096)
+	after, err := store.Incarnation(t.Context(), 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) == before {
+		t.Fatal("migrating an unverifiable version 2 log preserved its incarnation")
+	}
+	changes, retention, err := readChanges(t.Context(), store, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 || retention.Tail != 0 || retention.TrimmedThrough != 0 {
+		t.Fatalf("the migrated log holds %d changes and %+v, want a new empty history", len(changes), retention)
+	}
+	state, err := store.DurableState(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.ChangeHighWater != 80 {
+		t.Fatalf("migration preserved change high-water %d, want 80", state.ChangeHighWater)
+	}
+	if err := store.Create(t.Context(), "after"); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := store.CommittedPosition(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed <= 80 {
+		t.Fatalf("the first new history ended at position %d, want above old high-water 80", committed)
+	}
+}
+
+func TestVersionTwoMigrationAcceptsAFullyTrimmedLog(t *testing.T) {
+	path := database(t)
+	writeVersionTwo(t, path)
+	db := raw(t, path)
+	if _, err := db.Exec(`
+		UPDATE logs
+		SET committed_position = 50, trimmed_through = 50
+		WHERE namespace = 1;
+		DELETE FROM sqlite_sequence WHERE name = 'changes';
+		INSERT INTO sqlite_sequence (name, seq) VALUES ('changes', 50)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store := open(t, path, "workspace", 4096)
+	state, err := store.DurableState(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.ChangeHighWater != 50 {
+		t.Fatalf("fully trimmed migration preserved change high-water %d, want 50", state.ChangeHighWater)
+	}
+	changes, retention, err := readChanges(t.Context(), store, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 || retention.Tail != 0 || retention.TrimmedThrough != 0 {
+		t.Fatalf("fully trimmed migration holds %d changes and %+v, want a new empty history", len(changes), retention)
+	}
+}
+
+func TestLegacySequenceDamageIsRefusedWithoutMigrating(t *testing.T) {
+	tests := []struct {
+		name    string
+		version int
+		write   func(*testing.T, string)
+		damage  string
+	}{
+		{"version 1 node sequence", 1, writeVersionOne, `UPDATE sqlite_sequence SET seq = 2 WHERE name = 'nodes'`},
+		{"version 2 node sequence", 2, writeVersionTwo, `UPDATE sqlite_sequence SET seq = 2 WHERE name = 'nodes'`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := database(t)
+			test.write(t, path)
+			db := raw(t, path)
+			if _, err := db.Exec(test.damage); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before := schemaOf(t, path)
+			assertLegacyMigrationRefused(t, path, test.version, before)
+		})
+	}
+}
+
+func TestLegacyNodeSequenceHighWaterSurvivesMigration(t *testing.T) {
+	path := database(t)
+	writeVersionOne(t, path)
+	db := raw(t, path)
+	if _, err := db.Exec(`UPDATE sqlite_sequence SET seq = 40 WHERE name = 'nodes'`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store := open(t, path, "workspace", 4096)
+	state, err := store.DurableState(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.NodeHighWater != 40 {
+		t.Fatalf("migration preserved node high-water %d, want 40", state.NodeHighWater)
+	}
+	if err := store.Create(t.Context(), "after-high-water"); err != nil {
+		t.Fatal(err)
+	}
+	node, err := store.Stat(t.Context(), "after-high-water")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.ID != 41 {
+		t.Fatalf("the first migrated allocation used node %d, want 41", node.ID)
+	}
+}
+
 // A database written by a version we do not understand is refused rather than adapted. Every
 // statement in this package addresses columns by the meaning its own version gives them, so
 // running them against another layout would not fail loudly — it would update the wrong

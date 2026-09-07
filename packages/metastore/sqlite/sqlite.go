@@ -41,6 +41,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -98,6 +99,16 @@ type Store struct {
 	// maxIntegrityRecords bounds retained graph and history rows examined before this Store
 	// accepts the namespace or reports a successful integrity-checked result.
 	maxIntegrityRecords int64
+	maxIntegrityBytes   int64
+
+	coordinator          *databaseCoordinator
+	witness              CommitWitness
+	closeMu              sync.Mutex
+	closed               bool
+	closeErr             error
+	readClosed           bool
+	closePool            func(*sql.DB) error
+	releasePersistentWAL func(context.Context, *sql.DB) error
 }
 
 var _ metastore.Store = (*Store)(nil)
@@ -198,6 +209,35 @@ func OpenBoundWithOptions(
 	return open(ctx, database, namespace, storeID, allowance, options)
 }
 
+// OpenBoundDurableWithOptions opens a backing-store-bound namespace with an external commit
+// witness. The namespace creation policy is enforced inside the same transaction that binds,
+// validates, and prepares the database.
+func OpenBoundDurableWithOptions(
+	ctx context.Context,
+	database, namespace, storeID string,
+	allowance int64,
+	options Options,
+	mode NamespaceOpenMode,
+	startup DurableStartup,
+	witness CommitWitness,
+) (*Store, error) {
+	if storeID == "" {
+		return nil, fmt.Errorf("a backing store needs an identity: %w", syscall.EINVAL)
+	}
+	durable := &durableOpen{mode: mode, startup: startup, witness: witness}
+	if err := durable.check(); err != nil {
+		return nil, err
+	}
+	return openConfiguredWithHooks(ctx, database, namespace, storeID, allowance, options, durable, storeOpenHooks{
+		openPool:          openPool,
+		openDurableWriter: openPersistentWriterPool,
+		prepare:           prepare,
+		closePool: func(db *sql.DB) error {
+			return db.Close()
+		},
+	})
+}
+
 func open(
 	ctx context.Context,
 	database, namespace, storeID string,
@@ -214,9 +254,10 @@ func open(
 }
 
 type storeOpenHooks struct {
-	openPool  func(context.Context, string, bool, int) (*sql.DB, error)
-	prepare   func(context.Context, *sql.DB, string, string, Window, int64) (int64, int64, error)
-	closePool func(*sql.DB) error
+	openPool          func(context.Context, string, bool, int) (*sql.DB, error)
+	openDurableWriter func(context.Context, string, int) (*sql.DB, error)
+	prepare           func(context.Context, *sql.DB, string, string, Window, int64, int64) (int64, int64, error)
+	closePool         func(*sql.DB) error
 }
 
 func openWithHooks(
@@ -224,6 +265,17 @@ func openWithHooks(
 	database, namespace, storeID string,
 	allowance int64,
 	options Options,
+	hooks storeOpenHooks,
+) (*Store, error) {
+	return openConfiguredWithHooks(ctx, database, namespace, storeID, allowance, options, nil, hooks)
+}
+
+func openConfiguredWithHooks(
+	ctx context.Context,
+	database, namespace, storeID string,
+	allowance int64,
+	options Options,
+	durable *durableOpen,
 	hooks storeOpenHooks,
 ) (*Store, error) {
 	if namespace == "" {
@@ -236,51 +288,154 @@ func openWithHooks(
 	if err != nil {
 		return nil, err
 	}
-
-	write, err := hooks.openPool(ctx, database, true, 1)
+	coordinator, err := acquireCoordinator(database, durable != nil)
 	if err != nil {
+		return nil, err
+	}
+	releaseOnFailure := true
+	defer func() {
+		if releaseOnFailure {
+			releaseCoordinator(coordinator)
+		}
+	}()
+	cleanup := func(primary error, pools ...openPoolHandle) error {
+		cleanupErr := closeOpenPools(hooks.closePool, pools...)
+		if cleanupErr != nil {
+			releaseOnFailure = false
+		}
+		return errors.Join(primary, cleanupErr)
+	}
+
+	var write *sql.DB
+	if durable != nil && hooks.openDurableWriter != nil {
+		write, err = hooks.openDurableWriter(ctx, database, 1)
+	} else {
+		write, err = hooks.openPool(ctx, database, true, 1)
+	}
+	if err != nil {
+		if OpenFailureRetainsOwnership(err) {
+			releaseOnFailure = false
+		}
 		return nil, err
 	}
 
 	read, err := hooks.openPool(ctx, database, false, options.MaxReaderConnections)
 	if err != nil {
-		return nil, errors.Join(err,
-			poolCloseFailure("writer pool", hooks.closePool(write)))
+		return nil, cleanup(err, openPoolHandle{"writer pool", write})
 	}
 	snapshotRead, err := hooks.openPool(ctx, database, false, options.MaxSnapshotReaderConnections)
 	if err != nil {
-		return nil, errors.Join(
-			err,
-			poolCloseFailure("reader pool", hooks.closePool(read)),
-			poolCloseFailure("writer pool", hooks.closePool(write)),
+		return nil, cleanup(err,
+			openPoolHandle{"reader pool", read},
+			openPoolHandle{"writer pool", write},
 		)
 	}
 
-	id, root, err := hooks.prepare(
-		ctx, write, namespace, storeID, options.Window, options.MaxIntegrityRecords,
-	)
-	if err != nil {
-		primary := fmt.Errorf("opening namespace %q in %s: %w", namespace, database, failure(err))
-		return nil, errors.Join(
-			primary,
-			poolCloseFailure("snapshot reader pool", hooks.closePool(snapshotRead)),
-			poolCloseFailure("reader pool", hooks.closePool(read)),
-			poolCloseFailure("writer pool", hooks.closePool(write)),
+	if err := coordinator.commit.acquire(ctx); err != nil {
+		return nil, cleanup(err,
+			openPoolHandle{"snapshot reader pool", snapshotRead},
+			openPoolHandle{"reader pool", read},
+			openPoolHandle{"writer pool", write},
 		)
 	}
-	return &Store{
+	if err := coordinator.healthy(); err != nil {
+		coordinator.commit.release()
+		return nil, cleanup(err,
+			openPoolHandle{"snapshot reader pool", snapshotRead},
+			openPoolHandle{"reader pool", read},
+			openPoolHandle{"writer pool", write},
+		)
+	}
+	var id, root int64
+	var state DurableState
+	if durable == nil {
+		id, root, err = hooks.prepare(
+			ctx, write, namespace, storeID, options.Window,
+			options.MaxIntegrityRecords, options.MaxIntegrityBytes,
+		)
+		if isUncertainCommit(err) {
+			coordinator.poisonWith(err)
+		}
+	} else {
+		id, root, state, err = prepareConfigured(
+			ctx, write, namespace, storeID, options.Window,
+			options.MaxIntegrityRecords, options.MaxIntegrityBytes, durable,
+		)
+		if isUncertainCommit(err) {
+			coordinator.poisonWith(err)
+		}
+		if err == nil {
+			if witnessErr := durable.witness.Accept(state); witnessErr != nil {
+				coordinator.poisonWith(fmt.Errorf("publishing accepted SQLite state at generation %d: %w",
+					state.Generation, witnessErr))
+				err = coordinator.healthy()
+			}
+		}
+	}
+	coordinator.commit.release()
+	if err != nil {
+		primary := fmt.Errorf("opening namespace %q in %s: %w", namespace, database, failure(err))
+		return nil, cleanup(primary,
+			openPoolHandle{"snapshot reader pool", snapshotRead},
+			openPoolHandle{"reader pool", read},
+			openPoolHandle{"writer pool", write},
+		)
+	}
+	store := &Store{
 		write: write, read: read, snapshotRead: snapshotRead,
 		namespace: id, root: root,
 		allowance: allowance, window: options.Window, objectLimits: options.ObjectLimits,
 		maxIntegrityRecords: options.MaxIntegrityRecords,
-	}, nil
+		maxIntegrityBytes:   options.MaxIntegrityBytes,
+		coordinator:         coordinator,
+		closePool:           hooks.closePool,
+	}
+	if durable != nil {
+		store.witness = durable.witness
+		store.releasePersistentWAL = disablePersistentWAL
+	}
+	releaseOnFailure = false
+	return store, nil
+}
+
+type openPoolHandle struct {
+	name string
+	db   *sql.DB
+}
+
+type openOwnershipRetentionError struct{ err error }
+
+func (e *openOwnershipRetentionError) Error() string { return e.err.Error() }
+func (e *openOwnershipRetentionError) Unwrap() error { return e.err }
+
+// OpenFailureRetainsOwnership reports that SQLite could not prove every native handle was
+// closed while abandoning an Open operation. The database coordinator remains reserved, so
+// callers which own the database path must retain that ownership for the process lifetime.
+func OpenFailureRetainsOwnership(err error) bool {
+	var retained *openOwnershipRetentionError
+	return errors.As(err, &retained)
+}
+
+func closeOpenPools(closePool func(*sql.DB) error, pools ...openPoolHandle) error {
+	var failures []error
+	for _, pool := range pools {
+		if err := closePool(pool.db); err != nil {
+			failures = append(failures, poolCloseFailure(pool.name, err))
+		}
+	}
+	return errors.Join(failures...)
 }
 
 func poolCloseFailure(pool string, err error) error {
+	return openCloseFailure("SQLite "+pool, err)
+}
+
+func openCloseFailure(what string, err error) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("closing the SQLite %s after open failed: %w", pool, err)
+	return &openOwnershipRetentionError{err: fmt.Errorf(
+		"closing the %s after open failed; database ownership must be retained: %w", what, err)}
 }
 
 func poolCloseError(pool string, err error) error {
@@ -313,15 +468,7 @@ func openPoolWith(
 	verifySynchronous func(context.Context, *sql.DB) error,
 	closePool func(*sql.DB) error,
 ) (*sql.DB, error) {
-	pragmas := url.Values{}
-	pragmas.Add("_pragma", "journal_mode(WAL)")
-	pragmas.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeout.Milliseconds()))
-	pragmas.Add("_pragma", "foreign_keys(1)")
-	if writer {
-		pragmas.Add("_pragma", "synchronous(FULL)")
-		pragmas.Set("_txlock", "immediate")
-	}
-	db, err := sql.Open("sqlite", "file:"+database+"?"+pragmas.Encode())
+	db, err := sql.Open("sqlite", poolDataSource(database, writer))
 	if err != nil {
 		return nil, err
 	}
@@ -333,6 +480,19 @@ func openPoolWith(
 		}
 	}
 	return db, nil
+}
+
+func poolDataSource(database string, writer bool) string {
+	pragmas := url.Values{}
+	pragmas.Add("_pragma", "journal_mode(WAL)")
+	pragmas.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeout.Milliseconds()))
+	pragmas.Add("_pragma", "foreign_keys(1)")
+	if writer {
+		pragmas.Add("_pragma", "synchronous(FULL)")
+		pragmas.Add("_pragma", "wal_autocheckpoint(0)")
+		pragmas.Set("_txlock", "immediate")
+	}
+	return "file:" + database + "?" + pragmas.Encode()
 }
 
 // requireFullSynchronous confirms that the connection setting the writer DSN requests is the
@@ -350,14 +510,115 @@ func requireFullSynchronous(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// Close releases both pools. A failure to close either is reported, since an unflushed WAL
-// is not something to discover later.
+// Close releases all pools. A witnessed Store first stops new operations, refuses while a
+// snapshot reader remains, checkpoints every WAL frame, and publishes that checkpoint. EBUSY
+// or a checkpoint-witness failure leaves the writer open so Close can be retried without
+// losing the WAL evidence the external witness still requires.
 func (s *Store) Close() error {
-	return errors.Join(
-		poolCloseError("writer pool", s.write.Close()),
-		poolCloseError("reader pool", s.read.Close()),
-		poolCloseError("snapshot reader pool", s.snapshotRead.Close()),
+	return s.CloseContext(context.Background())
+}
+
+// Terminal reports that database/sql cannot retry pool closure. It does not prove that a
+// driver handle was released after a close error and never authorizes releasing external
+// lifetime ownership; only a nil CloseContext result does that.
+func (s *Store) Terminal() bool {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	return s.closed
+}
+
+// CloseContext is Close with a deadline for waiting on the commit gate and completing the
+// witnessed checkpoint. A canceled attempt leaves the writer and persistent WAL open so a
+// later call can retry without losing durability evidence.
+func (s *Store) CloseContext(ctx context.Context) error {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if s.closed {
+		return s.closeErr
+	}
+	if err := s.coordinator.commit.acquire(ctx); err != nil {
+		return err
+	}
+	defer s.coordinator.commit.release()
+	if s.witness != nil {
+		s.coordinator.health.Lock()
+		if s.coordinator.poison != nil {
+			err := s.coordinator.healthErrorLocked()
+			s.coordinator.health.Unlock()
+			return fmt.Errorf("closing a poisoned witnessed SQLite database: %w", err)
+		}
+		s.coordinator.closing = true
+		s.coordinator.health.Unlock()
+		if inUse := s.read.Stats().InUse + s.snapshotRead.Stats().InUse; inUse != 0 {
+			return fmt.Errorf("the SQLite database still has %d active readers at close: %w", inUse, syscall.EBUSY)
+		}
+		if !s.readClosed {
+			if err := errors.Join(
+				poolCloseError("reader pool", s.closePool(s.read)),
+				poolCloseError("snapshot reader pool", s.closePool(s.snapshotRead)),
+			); err != nil {
+				s.closeErr = err
+				s.closed = true
+				return s.closeErr
+			}
+			s.readClosed = true
+		}
+		result, err := s.checkpointLocked(ctx, FullCheckpoint)
+		if err != nil {
+			return fmt.Errorf("checkpointing the witnessed SQLite database before close: %w", err)
+		}
+		if !result.Complete {
+			return fmt.Errorf("SQLite copied %d of %d WAL frames before close: %w",
+				result.CheckpointedFrames, result.LogFrames, syscall.EBUSY)
+		}
+		if err := s.releasePersistentWAL(ctx, s.write); err != nil {
+			return fmt.Errorf("releasing persistent SQLite WAL after witnessed checkpoint: %w", err)
+		}
+	}
+	if s.witness != nil {
+		s.closeErr = poolCloseError("writer pool", s.closePool(s.write))
+	} else {
+		s.closeErr = errors.Join(
+			poolCloseError("writer pool", s.closePool(s.write)),
+			poolCloseError("reader pool", s.closePool(s.read)),
+			poolCloseError("snapshot reader pool", s.closePool(s.snapshotRead)),
+		)
+	}
+	s.closed = true
+	if s.closeErr == nil {
+		releaseCoordinator(s.coordinator)
+	}
+	return s.closeErr
+}
+
+// Abort terminally closes a witnessed Store which will not be exposed to a caller. It omits
+// checkpoint publication and relies on the persistent WAL configured by durable open, so the
+// next open either reconciles that evidence or fails closed. Callers must first stop every
+// operation and retain external ownership until Abort returns.
+func (s *Store) Abort() error {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if s.closed {
+		return s.closeErr
+	}
+	if err := s.coordinator.commit.acquire(context.Background()); err != nil {
+		return err
+	}
+	defer s.coordinator.commit.release()
+	s.coordinator.health.Lock()
+	s.coordinator.closing = true
+	s.coordinator.health.Unlock()
+	s.closeErr = errors.Join(
+		poolCloseError("reader pool", s.closePool(s.read)),
+		poolCloseError("snapshot reader pool", s.closePool(s.snapshotRead)),
+		poolCloseError("writer pool", s.closePool(s.write)),
 	)
+	s.readClosed = true
+	s.closed = true
+	if s.closeErr == nil {
+		releaseCoordinator(s.coordinator)
+	}
+	return s.closeErr
 }
 
 // Space reports the allowance and what is left of it.
@@ -367,6 +628,10 @@ func (s *Store) Close() error {
 // zero — an allowance lowered underneath content already written leaves Used above Total,
 // and a negative Avail arrives in a kernel reply's unsigned field as room no disk holds.
 func (s *Store) Space(ctx context.Context) (storage.Space, error) {
+	if err := s.coordinator.beginHealthyRead(); err != nil {
+		return storage.Space{}, err
+	}
+	defer s.coordinator.endHealthyRead()
 	if s.allowance == 0 {
 		return storage.Space{}, fmt.Errorf("this namespace is held under no allowance: %w", syscall.ENOSYS)
 	}
@@ -400,6 +665,13 @@ func (s *Store) Space(ctx context.Context) (storage.Space, error) {
 // otherwise quiet namespace's log inside its age bound. A transaction with nothing to discard
 // pays two indexed lookups for the answer.
 func (s *Store) mutate(ctx context.Context, f func(tx *sql.Tx) error) error {
+	if err := s.coordinator.commit.acquire(ctx); err != nil {
+		return err
+	}
+	defer s.coordinator.commit.release()
+	if err := s.coordinator.healthy(); err != nil {
+		return err
+	}
 	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
 		return failure(err)
@@ -412,10 +684,21 @@ func (s *Store) mutate(ctx context.Context, f func(tx *sql.Tx) error) error {
 	if err := trim(ctx, tx, s.namespace, s.window); err != nil {
 		return failure(err)
 	}
-	if err := tx.Commit(); err != nil {
+	state, err := advanceGeneration(ctx, tx)
+	if err != nil {
 		return failure(err)
 	}
-	return nil
+	s.coordinator.health.Lock()
+	defer s.coordinator.health.Unlock()
+	if err := s.coordinator.healthErrorLocked(); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		uncertain := &uncertainCommitError{err: failure(err)}
+		s.coordinator.poisonLocked(uncertain)
+		return s.coordinator.healthErrorLocked()
+	}
+	return s.acceptLocked(state)
 }
 
 // inspect runs f against the reader pool inside a transaction.
@@ -424,11 +707,35 @@ func (s *Store) mutate(ctx context.Context, f func(tx *sql.Tx) error) error {
 // component: without one, a rename landing between two of them would let a walk descend
 // into a tree that never existed in that shape.
 func (s *Store) inspect(ctx context.Context, f func(tx *sql.Tx) error) error {
-	tx, err := s.read.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := s.beginReadSnapshot(ctx, s.read)
 	if err != nil {
-		return failure(err)
+		return err
 	}
 	return finishReadTransaction("reader transaction", tx, f(tx))
+}
+
+// beginReadSnapshot orders a read transaction before an unresolved commit or after its
+// witness publication. The first query pins SQLite's snapshot while the health gate is held;
+// the potentially long scan and caller-owned result accounting then proceed without delaying
+// a writer's commit boundary.
+func (s *Store) beginReadSnapshot(ctx context.Context, pool *sql.DB) (*sql.Tx, error) {
+	if err := s.coordinator.beginHealthyRead(); err != nil {
+		return nil, err
+	}
+	tx, err := pool.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		s.coordinator.endHealthyRead()
+		return nil, failure(err)
+	}
+	var singleton int
+	pinErr := tx.QueryRowContext(ctx,
+		`SELECT 1 FROM database_state WHERE singleton = 1`,
+	).Scan(&singleton)
+	s.coordinator.endHealthyRead()
+	if pinErr != nil {
+		return nil, finishReadTransaction("snapshot pin transaction", tx, failure(pinErr))
+	}
+	return tx, nil
 }
 
 type rollbacker interface {

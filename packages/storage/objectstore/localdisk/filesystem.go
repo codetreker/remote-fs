@@ -1,6 +1,7 @@
 package localdisk
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -467,7 +468,7 @@ func openObjectsDirectory(
 		}
 		if err := requireDirectoryMarker(fd, id, directoryKindObjects, 0, expected, ops); err != nil {
 			if !initialized && errors.Is(err, syscall.ENOENT) {
-				if err := writeDirectoryMarker(fd, id, directoryKindObjects, 0, expected, ops); err != nil {
+				if err := writeObjectsDirectoryMarker(fd, id, expected, ops); err != nil {
 					_ = unix.Close(fd)
 					return -1, rootFailure(root, "create objects identity", err)
 				}
@@ -520,7 +521,7 @@ func openObjectsDirectory(
 		_ = unix.Close(fd)
 		return -1, rootFailure(root, "validate created objects filesystem", err)
 	}
-	if err := writeDirectoryMarker(fd, id, directoryKindObjects, 0, expected, ops); err != nil {
+	if err := writeObjectsDirectoryMarker(fd, id, expected, ops); err != nil {
 		_ = unix.Close(fd)
 		return -1, rootFailure(root, "create objects identity", err)
 	}
@@ -770,8 +771,21 @@ func cleanupManifestStage(rootFD int, expected filesystemIdentity, ops fileOpera
 	return ops.fsync(rootFD)
 }
 
-func (o *Objects) openShard(location objectLocation, create bool) (int, bool, error) {
-	return openShardDirectory(o.objectsFD, location.first, location.shard, create, o.rootPath, o.id, o.filesystem, o.ops)
+func (o *Objects) openShard(ctx context.Context, location objectLocation, create bool) (int, bool, error) {
+	unlock, err := o.shards.acquire(ctx, location.shard)
+	if err != nil {
+		return -1, false, contextFailure("open object shard", location.first, err)
+	}
+	defer unlock()
+	fd, absent, err := openShardDirectory(
+		o.objectsFD, location.first, location.shard, create, o.rootPath, o.id, o.filesystem, o.ops,
+	)
+	if errors.Is(err, errShardIdentityPublicationUncertain) {
+		return -1, false, errors.Join(err, o.health.poison(fmt.Errorf(
+			"object shard %q identity publication could not be established", location.first,
+		)))
+	}
+	return fd, absent, err
 }
 
 func openShardDirectory(
@@ -797,7 +811,7 @@ func openShardDirectory(
 		}
 		if err := ensureShardMarker(fd, id, shard, expected, ops, create); err != nil {
 			_ = unix.Close(fd)
-			return -1, false, rootFailure(root, "validate object shard identity", err)
+			return -1, false, shardIdentityFailure(root, "validate object shard identity", err)
 		}
 		if create {
 			if err := ops.fsync(fd); err != nil {
@@ -857,9 +871,17 @@ func openShardDirectory(
 	}
 	if err := ensureShardMarker(fd, id, shard, expected, ops, true); err != nil {
 		_ = unix.Close(fd)
-		return -1, false, rootFailure(root, "create object shard identity", err)
+		return -1, false, shardIdentityFailure(root, "create object shard identity", err)
 	}
 	return fd, false, nil
+}
+
+func shardIdentityFailure(root, action string, err error) error {
+	failure := rootFailure(root, action, err)
+	if errors.Is(err, errShardIdentityPublicationUncertain) {
+		return errors.Join(failure, errShardIdentityPublicationUncertain)
+	}
+	return failure
 }
 
 func shardByte(name string) (byte, error) {

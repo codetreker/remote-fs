@@ -64,7 +64,8 @@ azblob 那一侧继续对着死地址跑真实客户端，那是它自己该证�
 | `packages/storage/objectstore/azblob` | 一份真实的 blob 客户端怎么给失败分类：没人监听的地址、不存在的 container、被撤回的请求，`Get`、`Put`、`Delete` 各一次；`Available` 另探测正常、不可达、container 缺失与凭据拒绝；映射表本身只有 `BlobNotFound` 通向 ENOENT |
 | `packages/storage/objectstore/objectstoretest` | 每份 `Objects` 实现共同履行 create-only、不可变、错误区分、容量、取消与并发契约，并能在用例 cleanup 时成功关闭；memory、azblob 与 localdisk 都运行同一套用例，关闭的并发、幂等与排空由各实现及组合层另测 |
 | `packages/storage/objectstore` | `Get`、`Put`、`Delete` 的任意失败不被改写成名字事实；另以独立包装层覆盖物理容量测量、部分删除、`Forget` 与关闭失败 |
-| `packages/storage/objectstore/localdisk` | 在真实文件系统操作 seam 注入 `fsync`、link、unlink、`statfs`、`statx` 与 device/mount mismatch，覆盖 FORMAT/lock/probe、objects/shard identity、recovery/staging/final object，证明[本地磁盘对象存储](../architecture/2026-09-04-local-disk-object-store.md)在持久性、store 归属或同一文件系统身份无法证明时停止作答 |
+| `packages/storage/objectstore/localdisk` | 在真实文件系统操作 seam 注入 `fsync`、link、unlink、`statfs`、`statx` 与 device/mount mismatch，覆盖 FORMAT/lock/probe、objects/shard identity stage/link/barrier、recovery/staging/final object；并发用例分别锁住同一 shard 与另一 shard，证明[本地磁盘对象存储](../architecture/2026-09-04-local-disk-object-store.md)在持久性、store 归属或同一文件系统身份无法证明时停止作答，同时不把全部对象 I/O 串行化 |
+| `packages/storage/localstore` | 在真实 SQLite 与本地文件系统上构造初始化中断、丢失 workspace、`METASTORE` stage/final 损坏、accepted/checkpointed generation 与 WAL 缺失组合、checkpoint pin/error，以及 active reader 下的关闭；只替换见证、单次 barrier 或 pool close reporting 时，证明确认失败 poison、checkpoint/取消可重试、pool close error 进入 terminal 状态、SQLite constructor cleanup 不确定时内部 coordinator 与外部 lifetime lock 都保留 |
 | 契约套件 | 这两半装在一起，行为和别的命名空间一样。它跑在真的 Azurite 和真的 SQLite 上，不用替身——这一层声称的正是两者合起来对不对 |
 
 ## 备选方案

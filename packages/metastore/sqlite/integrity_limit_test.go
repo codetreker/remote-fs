@@ -13,6 +13,10 @@ func integrityOptions(limit int64) sqlite.Options {
 	return sqlite.Options{Window: sqlite.DefaultWindow(), MaxIntegrityRecords: limit}
 }
 
+func integrityByteOptions(limit int64) sqlite.Options {
+	return sqlite.Options{Window: sqlite.DefaultWindow(), MaxIntegrityBytes: limit}
+}
+
 func TestIntegrityWorkLimitAcceptsItsBoundaryAndRefusesTheNextRecord(t *testing.T) {
 	path := database(t)
 	store, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
@@ -165,5 +169,65 @@ func TestCanceledLegacyOpenDoesNotMigrate(t *testing.T) {
 	}
 	if after := schemaOf(t, path); after != before {
 		t.Fatal("a canceled legacy open changed the schema")
+	}
+}
+
+func TestIntegrityByteLimitAcceptsItsExactBoundary(t *testing.T) {
+	path := database(t)
+	store := open(t, path, "workspace", 0)
+	for _, name := range []string{"a", "bc"} {
+		if err := store.Create(t.Context(), name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Entry names and their Created log records each retain three bytes.
+	atBoundary, err := sqlite.OpenWithOptions(t.Context(), path, "workspace", 0, integrityByteOptions(6))
+	if err != nil {
+		t.Fatalf("opening at the exact integrity byte limit: %v", err)
+	}
+	if err := atBoundary.Close(); err != nil {
+		t.Fatal(err)
+	}
+	over, err := sqlite.OpenWithOptions(t.Context(), path, "workspace", 0, integrityByteOptions(5))
+	if err == nil {
+		over.Close()
+		t.Fatal("opening one byte above the integrity limit succeeded")
+	}
+	if !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("opening one byte above the integrity limit: %v, want EFBIG", err)
+	}
+}
+
+func TestOversizedCorruptNameIsRejectedByLengthAdmission(t *testing.T) {
+	path := database(t)
+	store := open(t, path, "workspace", 0)
+	if err := store.Create(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db := raw(t, path)
+	if _, err := db.Exec(`
+		UPDATE entries
+		SET name = CAST(zeroblob(8388608) AS BLOB)
+		WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+		  AND name = CAST('file' AS BLOB)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := sqlite.OpenWithOptions(t.Context(), path, "workspace", 0, integrityByteOptions(1024))
+	if err == nil {
+		opened.Close()
+		t.Fatal("opening an oversized corrupt name succeeded")
+	}
+	if !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("opening an oversized corrupt name: %v, want EFBIG", err)
 	}
 }

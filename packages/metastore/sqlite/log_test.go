@@ -70,9 +70,10 @@ func TestPositionsKeepIncreasingAcrossTrims(t *testing.T) {
 // without AUTOINCREMENT the next insert starts again at 1, and every position from 1 up is one
 // a replica has already applied and will now discard in silence.
 //
-// The table is emptied here from underneath a live store, which is what a floor of zero, a
-// namespace being dropped, or an operator clearing the log would each leave behind. The
-// promise that a position is never reused belongs to the table, not to how the trim is tuned.
+// The table is emptied at a recorded retention boundary. The configured floor does not
+// produce this state today, but the durable format permits it and allocation must remain safe
+// if a future retention policy does. Position uniqueness belongs to the allocator, not the
+// policy that decides which history remains.
 func TestPositionsAreNeverReusedAfterTheLogIsEmptied(t *testing.T) {
 	path := database(t)
 	store := open(t, path, "workspace", 0)
@@ -90,7 +91,9 @@ func TestPositionsAreNeverReusedAfterTheLogIsEmptied(t *testing.T) {
 	}
 
 	emptied := raw(t, path)
-	if _, err := emptied.Exec(`DELETE FROM changes`); err != nil {
+	if _, err := emptied.Exec(`
+		UPDATE logs SET trimmed_through = committed_position WHERE namespace = 1;
+		DELETE FROM changes WHERE namespace = 1`); err != nil {
 		t.Fatal(err)
 	}
 	if err := emptied.Close(); err != nil {
@@ -186,9 +189,9 @@ func TestTheFloorSurvivesAnAgeBoundNothingOutlives(t *testing.T) {
 // arriving at position 0 against a log that holds nothing must be able to tell a namespace
 // nobody has written to from one whose entries are gone.
 //
-// The trim here cannot reach that state — a floor of at least one always keeps the newest entry
-// — so the entries are removed from underneath a live store, which is what a maintenance
-// deletion or a log kept somewhere the tree's transaction does not reach would leave behind.
+// The configured trim cannot reach this state because its floor keeps the newest entry. The
+// fixture records a complete retention cut explicitly, preserving the anchor which proves
+// that an empty retained log once reached its committed tail.
 func TestTheTailOutlivesTheEntriesItCounted(t *testing.T) {
 	path := database(t)
 	store := open(t, path, "workspace", 0)
@@ -217,7 +220,9 @@ func TestTheTailOutlivesTheEntriesItCounted(t *testing.T) {
 	}
 
 	emptied := raw(t, path)
-	if _, err := emptied.Exec(`DELETE FROM changes`); err != nil {
+	if _, err := emptied.Exec(`
+		UPDATE logs SET trimmed_through = committed_position WHERE namespace = 1;
+		DELETE FROM changes WHERE namespace = 1`); err != nil {
 		t.Fatal(err)
 	}
 	if err := emptied.Close(); err != nil {

@@ -24,6 +24,23 @@ type rootAnchor struct {
 	statx  func(int, string, int, int, *unix.Statx_t) error
 }
 
+type metastoreRootState uint8
+
+const (
+	metastoreMissing metastoreRootState = iota + 1
+	metastorePristine
+	metastoreBootstrap
+	metastoreInitialized
+)
+
+const sqliteWALHeaderBytes int64 = 32
+
+type metastoreRoot struct {
+	State       metastoreRootState
+	WALPresent  bool
+	WALNonEmpty bool
+}
+
 func openRootAnchor(root string) (*rootAnchor, error) {
 	if err := requireControlledPath(root); err != nil {
 		return nil, err
@@ -239,40 +256,70 @@ func (a *rootAnchor) MakeMetastoreFilesPrivate() error {
 }
 
 func (a *rootAnchor) RequireRegularEntry(name string) (bool, error) {
+	exists, _, err := a.regularEntry(name)
+	return exists, err
+}
+
+func (a *rootAnchor) regularEntry(name string) (bool, unix.Stat_t, error) {
 	fd, err := unix.Openat(a.fd, name,
 		unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ENOENT) {
-			return false, nil
+			return false, unix.Stat_t{}, nil
 		}
 		if errors.Is(err, syscall.ELOOP) {
-			return false, &os.PathError{Op: "validate local store entry", Path: filepath.Join(a.path, name),
+			return false, unix.Stat_t{}, &os.PathError{Op: "validate local store entry", Path: filepath.Join(a.path, name),
 				Err: fmt.Errorf("the entry is a symbolic link: %w", syscall.EIO)}
 		}
-		return false, &os.PathError{Op: "open local store entry", Path: filepath.Join(a.path, name), Err: err}
+		return false, unix.Stat_t{}, &os.PathError{Op: "open local store entry", Path: filepath.Join(a.path, name), Err: err}
 	}
 	path := filepath.Join(a.path, name)
-	_, validateErr := validatePrivateFile(
+	stat, validateErr := validatePrivateFile(
 		fd, path, a.device, a.mount, name != metastoreFilename, a.statx,
 	)
 	closeErr := unix.Close(fd)
 	if err := errors.Join(validateErr, pathFailure("close local store entry", path, closeErr)); err != nil {
-		return false, err
+		return false, unix.Stat_t{}, err
 	}
-	return true, nil
+	return true, stat, nil
 }
 
-func (a *rootAnchor) RequireMetastoreFiles() (bool, error) {
-	databaseExists, err := a.RequireRegularEntry(metastoreFilename)
+func (a *rootAnchor) InspectMetastore() (metastoreRoot, error) {
+	databaseExists, databaseStat, err := a.regularEntry(metastoreFilename)
 	if err != nil {
-		return false, err
+		return metastoreRoot{}, err
 	}
+	var state metastoreRootState
+	switch {
+	case !databaseExists:
+		state = metastoreMissing
+	case databaseStat.Size == 0:
+		state = metastorePristine
+	default:
+		state = metastoreInitialized
+	}
+
+	inspected := metastoreRoot{State: state}
 	for _, name := range metastoreAuxiliaryFilenames {
-		if _, err := a.RequireRegularEntry(name); err != nil {
-			return false, err
+		exists, stat, err := a.regularEntry(name)
+		if err != nil {
+			return metastoreRoot{}, err
+		}
+		if !exists {
+			continue
+		}
+		if state != metastoreInitialized {
+			return metastoreRoot{}, fmt.Errorf(
+				"the local store has %s beside a missing or pristine %s: %w",
+				name, metastoreFilename, syscall.EIO,
+			)
+		}
+		if name == metastoreFilename+"-wal" {
+			inspected.WALPresent = true
+			inspected.WALNonEmpty = stat.Size > sqliteWALHeaderBytes
 		}
 	}
-	return databaseExists, nil
+	return inspected, nil
 }
 
 func verifyAnchoredRoot(objects *localdisk.Objects, anchor *rootAnchor) error {

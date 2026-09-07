@@ -679,15 +679,16 @@ func TestOpenLocalExposesReplicationAndOperationalStatus(t *testing.T) {
 	source := localSource{
 		root:      root,
 		workspace: "workspace",
-		objects:   localdisk.Options{},
+		objects:   localdisk.Options{MaxWaitingOperations: 11},
 	}
 	maintenance := objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8}
 	const maxReaderConnections = 3
 	const maxSnapshotReaderConnections = 4
 	const maxIntegrityRecords = 101
+	const maxIntegrityBytes = 7 << 20
 	ns, err := openLocal(
 		source, 1<<20, sqlite.DefaultObjectLimits(), maxReaderConnections,
-		maxSnapshotReaderConnections, maxIntegrityRecords, maintenance,
+		maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance,
 	)
 	if err != nil {
 		t.Fatalf("openLocal: %v", err)
@@ -709,6 +710,17 @@ func TestOpenLocalExposesReplicationAndOperationalStatus(t *testing.T) {
 	if !strings.Contains(status, "integrity record work limit is 101") {
 		t.Fatalf("local status does not report the configured integrity limit: %s", status)
 	}
+	if !strings.Contains(status, "integrity name-byte work limit is 7340032") {
+		t.Fatalf("local status does not report the configured integrity byte limit: %s", status)
+	}
+	if !strings.Contains(status, "0 operations waiting under a limit of 11") {
+		t.Fatalf("local status does not report the configured waiting-operation limit: %s", status)
+	}
+	if !strings.Contains(status, "SQLite checkpoint has accepted generation") ||
+		!strings.Contains(status, "checkpointed generation") ||
+		!strings.Contains(status, "checkpoint pending is false") {
+		t.Fatalf("local status does not report the healthy checkpoint state: %s", status)
+	}
 	if err := ns.close(); err != nil {
 		t.Fatalf("close local namespace: %v", err)
 	}
@@ -724,12 +736,13 @@ func TestOpenBlobsExposesPendingAndMaintenanceStatus(t *testing.T) {
 	const maxReaderConnections = 5
 	const maxSnapshotReaderConnections = 7
 	const maxIntegrityRecords = 103
+	const maxIntegrityBytes = 13 << 20
 	maintenance := objectstore.Options{SweepInterval: 47 * time.Second, SweepBatch: 31}
 	ns, err := openBlobs(blobSource{
 		container: "container",
 		database:  filepath.Join(t.TempDir(), "metastore.sqlite"),
 		workspace: "workspace",
-	}, 0, limits, maxReaderConnections, maxSnapshotReaderConnections, maxIntegrityRecords, maintenance)
+	}, 0, limits, maxReaderConnections, maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance)
 	if err != nil {
 		t.Fatalf("openBlobs: %v", err)
 	}
@@ -748,6 +761,7 @@ func TestOpenBlobsExposesPendingAndMaintenanceStatus(t *testing.T) {
 		"SQLite reader-connection limit is 5",
 		"snapshot reader-connection limit is 7",
 		"integrity record work limit is 103",
+		"integrity name-byte work limit is 13631488",
 		"garbage sweeps run every 47s with at most 31 objects per attempt",
 		"garbage sweep",
 	} {
@@ -774,6 +788,7 @@ func TestBlobStatusFailsWhenTheObjectStoreIsUnreachable(t *testing.T) {
 		workspace: "workspace",
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
+		sqlite.DefaultMaxIntegrityBytes,
 		objectstore.DefaultOptions())
 	if err != nil {
 		t.Fatalf("open blob namespace: %v", err)
@@ -798,6 +813,7 @@ func TestBlobStatusFailsWhenCredentialsAreRejected(t *testing.T) {
 		workspace: "workspace",
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
+		sqlite.DefaultMaxIntegrityBytes,
 		objectstore.DefaultOptions())
 	if err != nil {
 		t.Fatalf("open blob namespace: %v", err)
@@ -824,6 +840,7 @@ func TestBlobStatusReportsUnresolvedWrites(t *testing.T) {
 		workspace: "workspace",
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
+		sqlite.DefaultMaxIntegrityBytes,
 		objectstore.DefaultOptions())
 	if err != nil {
 		t.Fatalf("open blob namespace: %v", err)
@@ -927,6 +944,7 @@ func assertLegacyBlobOpenRefusedWithContext(
 		workspace: "workspace",
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, maxIntegrityRecords,
+		sqlite.DefaultMaxIntegrityBytes,
 		objectstore.DefaultOptions())
 	if err == nil {
 		_ = ns.close()
@@ -1415,7 +1433,8 @@ func TestSIGHUPReportsLocalStatusAndTheLockOutlivesServing(t *testing.T) {
 	}
 	maintenance := objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8}
 	ns, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
-		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords, maintenance)
+		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
+		sqlite.DefaultMaxIntegrityBytes, maintenance)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1461,7 +1480,8 @@ func TestSIGHUPReportsLocalStatusAndTheLockOutlivesServing(t *testing.T) {
 	defer sub.Close()
 
 	contender, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
-		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords, maintenance)
+		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
+		sqlite.DefaultMaxIntegrityBytes, maintenance)
 	if err == nil {
 		contender.close()
 		t.Fatal("a second server acquired the local-store lock while the first was serving")
@@ -1490,7 +1510,8 @@ func TestSIGHUPReportsLocalStatusAndTheLockOutlivesServing(t *testing.T) {
 		t.Fatal("local server did not stop promptly")
 	}
 	reopened, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
-		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords, maintenance)
+		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
+		sqlite.DefaultMaxIntegrityBytes, maintenance)
 	if err != nil {
 		t.Fatalf("the local-store lock remained after HTTP shutdown drained: %v", err)
 	}
@@ -2160,7 +2181,8 @@ func TestShutdownTimeoutKeepsTheLockUntilABlockedRequestLeaves(t *testing.T) {
 	}
 	maintenance := objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8}
 	ns, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
-		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords, maintenance)
+		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
+		sqlite.DefaultMaxIntegrityBytes, maintenance)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2210,7 +2232,8 @@ func TestShutdownTimeoutKeepsTheLockUntilABlockedRequestLeaves(t *testing.T) {
 	}
 
 	contender, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
-		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords, maintenance)
+		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
+		sqlite.DefaultMaxIntegrityBytes, maintenance)
 	if err == nil {
 		contender.close()
 		t.Fatal("shutdown released the local-store lock while a handler was still running")
@@ -2233,7 +2256,8 @@ func TestShutdownTimeoutKeepsTheLockUntilABlockedRequestLeaves(t *testing.T) {
 		t.Fatal("blocked request did not finish")
 	}
 	reopened, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
-		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords, maintenance)
+		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
+		sqlite.DefaultMaxIntegrityBytes, maintenance)
 	if err != nil {
 		t.Fatalf("the lock remained after the handler drained: %v", err)
 	}

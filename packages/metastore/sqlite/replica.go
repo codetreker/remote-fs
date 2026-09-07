@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -128,9 +129,17 @@ func (r *Replica) Close() error { return r.store.Close() }
 // timeout that repairs one. The consistent picture is what makes the strictness safe — every
 // change after it acts on something that picture already contained.
 func (r *Replica) Apply(ctx context.Context, change metastore.Change) (bool, error) {
-	r.mu.Lock()
+	if err := r.lockExclusive(ctx); err != nil {
+		return false, err
+	}
 	defer r.mu.Unlock()
-
+	if err := r.store.coordinator.commit.acquire(ctx); err != nil {
+		return false, err
+	}
+	defer r.store.coordinator.commit.release()
+	if err := r.store.coordinator.healthy(); err != nil {
+		return false, err
+	}
 	if change.Position <= r.at {
 		return false, nil
 	}
@@ -143,8 +152,21 @@ func (r *Replica) Apply(ctx context.Context, change metastore.Change) (bool, err
 	if err := r.apply(ctx, tx, change); err != nil {
 		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, failure(err))
 	}
-	if err := tx.Commit(); err != nil {
+	state, err := advanceGeneration(ctx, tx)
+	if err != nil {
 		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, failure(err))
+	}
+	r.store.coordinator.health.Lock()
+	defer r.store.coordinator.health.Unlock()
+	if err := r.store.coordinator.healthErrorLocked(); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		r.store.coordinator.poisonLocked(&uncertainCommitError{err: failure(err)})
+		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, r.store.coordinator.healthErrorLocked())
+	}
+	if err := r.store.acceptLocked(state); err != nil {
+		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, err)
 	}
 	r.at = change.Position
 	return true, nil
@@ -164,6 +186,9 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 
 	switch change.Kind {
 	case metastore.Created:
+		if err := observeNewNodeID(ctx, tx, change.Node.ID); err != nil {
+			return err
+		}
 		if err := insertNode(ctx, tx, r.store.namespace, *change.Node); err != nil {
 			return err
 		}
@@ -292,13 +317,32 @@ func exactlyOne(result sql.Result, subject string) error {
 // one is its own decision — it is a copy of a log that said to start over, so the answer is
 // to try again rather than to serve it.
 func (r *Replica) Reseed(ctx context.Context) (*Seeding, error) {
-	r.mu.Lock()
+	if err := r.lockExclusive(ctx); err != nil {
+		return nil, err
+	}
+	if err := r.store.coordinator.commit.acquire(ctx); err != nil {
+		r.mu.Unlock()
+		return nil, err
+	}
+	if err := r.store.coordinator.healthy(); err != nil {
+		r.store.coordinator.commit.release()
+		r.mu.Unlock()
+		return nil, err
+	}
 	tx, err := r.store.write.BeginTx(ctx, nil)
 	if err != nil {
+		r.store.coordinator.commit.release()
 		r.mu.Unlock()
 		return nil, fmt.Errorf("beginning to fill the copy: %w", failure(err))
 	}
-	seeding := &Seeding{replica: r, tx: tx}
+	state, err := validateDurableState(ctx, tx)
+	if err != nil {
+		tx.Rollback()
+		r.store.coordinator.commit.release()
+		r.mu.Unlock()
+		return nil, fmt.Errorf("validating the copy's identity allocator: %w", failure(err))
+	}
+	seeding := &Seeding{replica: r, tx: tx, nodeHighWater: state.NodeHighWater}
 	// Rows arrive in whatever order the picture yields them, and a child may therefore reach
 	// this before its parent. Deferring the references to the commit is what lets that be the
 	// picture's business rather than a rule the two sides have to agree on and keep agreeing on;
@@ -314,6 +358,28 @@ func (r *Replica) Reseed(ctx context.Context) (*Seeding, error) {
 	return seeding, nil
 }
 
+func (r *Replica) lockExclusive(ctx context.Context) error {
+	const retry = time.Millisecond
+	for {
+		if r.mu.TryLock() {
+			if err := ctx.Err(); err != nil {
+				r.mu.Unlock()
+				return err
+			}
+			return nil
+		}
+		timer := time.NewTimer(retry)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 // Seeding is a copy being filled from one picture of its source.
 type Seeding struct {
 	replica *Replica
@@ -326,6 +392,11 @@ type Seeding struct {
 	// done marks the transaction as settled, so that closing after completing releases
 	// nothing twice.
 	done bool
+
+	// nodeHighWater is validated once when the reseed begins. maxNodeID accumulates the
+	// unordered source identities so Complete can move both allocator witnesses once.
+	nodeHighWater int64
+	maxNodeID     int64
 }
 
 // empty drops what the copy held. Entries first: a node another row still names cannot be
@@ -353,6 +424,10 @@ func (s *Seeding) Add(ctx context.Context, rows []metastore.Row) error {
 }
 
 func (s *Seeding) add(ctx context.Context, row metastore.Row) error {
+	if row.Node.ID <= 0 {
+		return fmt.Errorf("node identity %d is not positive: %w", row.Node.ID, syscall.EIO)
+	}
+	s.maxNodeID = max(s.maxNodeID, row.Node.ID)
 	if err := insertNode(ctx, s.tx, s.replica.store.namespace, row.Node); err != nil {
 		return err
 	}
@@ -383,9 +458,42 @@ func (s *Seeding) Complete(ctx context.Context, at metastore.Position) error {
 		s.root, s.replica.store.namespace); err != nil {
 		return fmt.Errorf("completing the copy: %w", failure(err))
 	}
-	if err := s.tx.Commit(); err != nil {
+	highWater := max(s.nodeHighWater, s.maxNodeID)
+	if _, err := s.tx.ExecContext(ctx,
+		`UPDATE database_state SET node_high_water = ? WHERE singleton = 1`, highWater,
+	); err != nil {
 		return fmt.Errorf("completing the copy: %w", failure(err))
 	}
+	sequence, err := sequenceValue(ctx, s.tx, "nodes")
+	if err != nil {
+		return fmt.Errorf("completing the copy: %w", failure(err))
+	}
+	if sequence != highWater {
+		return fmt.Errorf("completing the copy: SQLite node sequence %d does not match observed high-water %d: %w",
+			sequence, highWater, syscall.EIO)
+	}
+	state, err := advanceGeneration(ctx, s.tx)
+	if err != nil {
+		return fmt.Errorf("completing the copy: %w", failure(err))
+	}
+	s.replica.store.coordinator.health.Lock()
+	if err := s.replica.store.coordinator.healthErrorLocked(); err != nil {
+		s.replica.store.coordinator.health.Unlock()
+		return fmt.Errorf("completing the copy: %w", err)
+	}
+	if err := s.tx.Commit(); err != nil {
+		s.replica.store.coordinator.poisonLocked(&uncertainCommitError{err: failure(err)})
+		healthErr := s.replica.store.coordinator.healthErrorLocked()
+		s.replica.store.coordinator.health.Unlock()
+		s.settle()
+		return fmt.Errorf("completing the copy: %w", healthErr)
+	}
+	if err := s.replica.store.acceptLocked(state); err != nil {
+		s.replica.store.coordinator.health.Unlock()
+		s.settle()
+		return fmt.Errorf("completing the copy: %w", err)
+	}
+	s.replica.store.coordinator.health.Unlock()
 	// The root of the copy is the source's root, arrived with the picture. It is fixed for the
 	// life of a namespace, so it is read once rather than joined for on every path resolution,
 	// and this is the one moment at which it changes. Both are written before readers are let
@@ -413,5 +521,6 @@ func (s *Seeding) Close() error {
 // settle marks the transaction finished and lets readers back in.
 func (s *Seeding) settle() {
 	s.done = true
+	s.replica.store.coordinator.commit.release()
 	s.replica.mu.Unlock()
 }

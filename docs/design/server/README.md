@@ -15,6 +15,6 @@ server 是命名空间的权威持有者：持有一份 storage，经 HTTP 暴�
 | 文件 | 内容 |
 |---|---|
 | [`architecture.md`](architecture.md) | server 的内部构成、组件职责、内部数据流 |
-| [`local-disk-object-store.md`](local-disk-object-store.md) | 随附本地持久 storage 的磁盘格式、身份绑定、打开与恢复、容量和维护 |
+| [`local-disk-object-store.md`](local-disk-object-store.md) | 随附本地持久 storage 的磁盘格式、身份与 WAL 见证、打开与恢复、容量和维护 |
 
 server 内部若需进一步展开，在本目录增加文档，不影响 client 目录。

@@ -106,7 +106,7 @@ SQLite 把长生命周期 snapshot transaction 放进独立 reader pool。`MaxSn
 
 位置是 int64，在写事务里分配，0 留作「什么都还没发生过」。**它对每个 workspace 单调，但不连续**：SQLite 的实现让所有 workspace 共用一张 `changes` 表的 rowid 序列，于是一个 workspace 的位置之间有别的 workspace 留下的空洞，而只有数据库里第一个被写入的那个才从 1 开始。契约因此只允许比较位置，不允许对它们做算术——任何一处写出 `位置+1` 的判断，都是在假设一件实现没有承诺的事。
 
-**日志表必须是 `INTEGER PRIMARY KEY AUTOINCREMENT`。** 这一条要写进 schema 的注释，因为省掉 `AUTOINCREMENT` 看起来像是一次无害的优化：不带它时 SQLite 会**重用被删除的最大 rowid**，而我们要裁剪日志——裁到只剩下界之后再追加，位置就会**倒退**，于是客户端的「严格大于」规则会把新事件静默丢弃。`AUTOINCREMENT` 靠 `sqlite_sequence` 保证只增不重用。
+**日志表必须是 `INTEGER PRIMARY KEY AUTOINCREMENT`。** 这一条要写进 schema 的注释，因为省掉 `AUTOINCREMENT` 看起来像是一次无害的优化：不带它时 SQLite 会**重用被删除的最大 rowid**，而我们要裁剪日志——裁到只剩下界之后再追加，位置就会**倒退**，于是客户端的「严格大于」规则会把新事件静默丢弃。当前 SQLite 实现还用 `database_state.change_high_water` 显式分配 position，并要求它与 `sqlite_sequence` 一致；本地持久形态把该值复制进 WAL 外部见证。两层损坏与回退保护由[持久身份高水位](../bug-fix/2026-09-07-persistent-sqlite-identities-use-explicit-high-water-marks.md)拥有。
 
 契约承诺的全序义务是弱的：**每节点的事件顺序与该节点的提交顺序一致，跨节点存在一个任意但全序的位置序列。** SQLite 的全局写串行化白送了真全序且必然与提交顺序一致，但不写进契约——否则将来的 PostgreSQL 后端会被一个它不需要的保证捆住。
 
@@ -142,7 +142,7 @@ SQLite 把长生命周期 snapshot transaction 放进独立 reader pool。`MaxSn
     否则             → 重放该位置之后的全部变更
 ```
 
-化身是一个**随机值**，不是计数器。用计数器的话，从备份恢复数据库会让它**倒退**，而两份互不相干的日志都停在 1 也不是不可能；随机值使两条独立历史自然不匹配。它存在 metastore 自己的库里，在新日志初始化时生成；已有日志的 committed position 与 surviving tail 不一致时不修改化身，而是按[日志尾完整性](./2026-09-04-log-tail-integrity-fails-open.md)拒绝打开。
+化身是一个**随机值**，不是计数器。用计数器的话，从备份恢复数据库会让它**倒退**，而两份互不相干的日志都停在 1 也不是不可能；随机值使两条独立历史自然不匹配。它存在 metastore 自己的库里，在新日志初始化时生成；已有日志的 committed tail、trim boundary 与 predecessor chain 不一致时不修改化身，而是按[保留日志完整性](./2026-09-04-retained-log-integrity-refuses-open.md)拒绝打开。
 
 没有化身的后果是这个系统里最坏的那种失败：server 重启后日志为空，客户端拿着位置 12345 来续订，**一个看起来完全正确的实现会回答「在窗口内，你已追平」**——停机期间的全部变更静默丢失，事后无从察觉，而触发它只需要一次普通重启。
 
@@ -176,7 +176,7 @@ metastore 事务 {
 向订阅者发布 Change
 ```
 
-启动时对账要求 `CommittedPosition == 最新 surviving change position`；任一方向不一致都说明日志 invariant 已损坏，Open 在 trim 与其它 maintenance 之前以 `EIO` 失败，不修改化身。具体 supersession 见[日志尾不一致时拒绝打开](./2026-09-04-log-tail-integrity-fails-open.md)。
+启动时对账把 retained log 看成 predecessor chain：第一条 surviving change 指向 `trimmed_through`，每条后续 change 指向同 namespace 的上一条，最后一条等于 `CommittedPosition`；没有 surviving row 时 committed tail 等于 trim boundary。任一缺口都说明日志 invariant 已损坏，Open 在 trim 与其它 maintenance 之前以 `EIO` 失败，不修改化身。完整决定见[保留日志不连续时拒绝打开](./2026-09-04-retained-log-integrity-refuses-open.md)。
 
 由此得到一条要写进契约的规则：**一个后端要么能把位置纳入自己的原子提交，要么它的日志不得持久化。**
 
@@ -311,6 +311,8 @@ type Storage struct {
 
 副本是 `sqlite.Replica`，不是 `sqlite.Store`：它只给出 `Store` 的读那一半，加上 `Apply` 与 `Reseed`。这个类型的意义就在这里——副本与它所复制的命名空间之间的每一处差异都必须以「某人记下来的一条变更」的形式到达，一个能自己造节点的方法就是这棵树的第二个作者。它抄下源端的节点编号，所以一条指名父目录编号的变更不需要任何翻译；它**不存文件的内容 key**，因为副本永远不去对象存储，那个 key 在这里指向的是本地没有的字节，而 schema 里 `nodes.content` 的外键正是这个意思。
 
+`Reseed` 在整份外部 picture 期间持有 replica exclusive lock 和 SQLite write transaction，使读者不会观察半棵树。exclusive lock 与 commit gate 的等待都遵从调用 context；等待另一份 picture 时取消不会继续占住 commit gate。snapshot rows 可以任意排序，`Seeding` 只累计本轮看到的最大 node ID，在 `Complete` 时一次推进 `database_state.node_high_water` 并核对 `sqlite_sequence`，不为每个 row 重读和更新 allocator state。
+
 ```
 packages/metastore/           + 日志能力，+ Change / Position / Incarnation 这些类型
 packages/sqliteschema/        编号 `.sql` 迁移的加载与重放，schema 的读回与比对    ← 新
@@ -321,7 +323,7 @@ cmd/remote-fs                 + 挂载前建立副本，+ -replica-dir
 cmd/remote-fs-server          + 把 metastore 的日志交给 handler
 ```
 
-当前 SQLite schema 是 v3：`0003_backing_store.sql` 增加数据库到 object store ID 的绑定，供 local store 证明树与对象属于彼此。它不改变日志、快照或副本协议；这项后续结构决定由[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)记录。
+当前 SQLite schema 是 v3：`0003_durable_state.sql` 增加数据库到 object store ID 的绑定、database identity/generation、node/change 高水位、全局 identity boundary indexes 与 retained-change predecessor。v2 无法证明旧 retained rows 连续，迁移保留全局高水位、清空旧 rows 并切换 incarnation，使 replica 重建且新 position 不复用旧值。这项后续结构由[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)、[持久身份高水位](../bug-fix/2026-09-07-persistent-sqlite-identities-use-explicit-high-water-marks.md)和[保留日志完整性](./2026-09-04-retained-log-integrity-refuses-open.md)分别记录。
 
 **不新建 `packages/observe`。** 「观察源」作为一条独立契约，是在有两种实现（metastore 日志 vs 服务端合成）时才挣到自己位置的；这一版只有前一种，现在建等于先造一个只有一个实现的抽象。它留在这份 note 里当形状约束。
 
@@ -376,7 +378,7 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **最后一个迁移文件例外，而且是暂时的。** 当时最后一个文件是 `0002_replication.sql`；实测把其中的 `entries.name` 改成 `TEXT`、删掉两个索引之一、或把 `logs.trimmed_by_age` 改成 `TEXT`，两条结构比对**一条都不响**，只有可重新生成的 golden 响。最后一个文件在新库与迁移库两条路上都会运行，所以两边一起变化；它成为历史时必须取得独立见证。
 
-`0003_backing_store.sql` 落地时，`testdata/version2.sql` 与 `TestTheSecondMigrationDescribesTheVersionTwoDatabasesThatExist` 钉住了 v2，上述义务已经成为测试。当前最后一个文件是 `0003`；它在 `0004` 落地时必须以同样方式取得 v3 见证。
+`0003_durable_state.sql` 落地时，`testdata/version2.sql` 与 `TestTheSecondMigrationDescribesTheVersionTwoDatabasesThatExist` 钉住了 v2，上述义务已经成为测试。当前最后一个文件是 `0003`；它在 `0004` 落地时必须以同样方式取得 v3 见证。
 
 （顺带记下一个实测意外：`entries.name` 在 `0002` 里改成 `TEXT` 之后，**没有任何行为测试变红**。原因是 SQLite 的 TEXT 亲和性不会把 BLOB 值转成文本，存进去的字节仍按字节比较。所以那一处是 golden 独自兜住的，不是被行为测试兜住的。）
 

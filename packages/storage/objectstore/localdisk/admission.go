@@ -11,29 +11,99 @@ import (
 // condition variable: every state change closes the channel all current waiters selected.
 type admission struct {
 	maxOperations int
+	maxWaiting    int
 	maxBytes      int64
 
 	mu         chan struct{}
 	control    chan struct{}
 	changed    chan struct{}
 	operations int
+	waiting    int
 	controls   int
 	bytes      int64
 	closing    bool
 }
 
-func newAdmission(maxOperations int, maxBytes int64) *admission {
+func newAdmission(maxOperations, maxWaiting int, maxBytes int64) *admission {
 	mu := make(chan struct{}, 1)
 	mu <- struct{}{}
 	control := make(chan struct{}, 1)
 	control <- struct{}{}
 	return &admission{
 		maxOperations: maxOperations,
+		maxWaiting:    maxWaiting,
 		maxBytes:      maxBytes,
 		mu:            mu,
 		control:       control,
 		changed:       make(chan struct{}),
 	}
+}
+
+type waitingTicket struct {
+	gate *admission
+	once bool
+}
+
+func (a *admission) acquireWaiting(ctx context.Context) (*waitingTicket, error) {
+	if err := take(ctx, a.mu); err != nil {
+		return nil, err
+	}
+	if a.closing {
+		a.unlock()
+		return nil, fmt.Errorf("the object store is closed: %w", syscall.EIO)
+	}
+	if a.waiting == a.maxWaiting {
+		a.unlock()
+		return nil, fmt.Errorf("the object store already has %d waiting operations: %w", a.maxWaiting, syscall.EAGAIN)
+	}
+	a.waiting++
+	a.unlock()
+	return &waitingTicket{gate: a}, nil
+}
+
+func (t *waitingTicket) promote(ctx context.Context, bytes int64) (*ticket, error) {
+	for {
+		if err := take(ctx, t.gate.mu); err != nil {
+			t.release()
+			return nil, err
+		}
+		if bytes > t.gate.maxBytes {
+			t.once = true
+			t.gate.waiting--
+			t.gate.notifyLocked()
+			t.gate.unlock()
+			return nil, fmt.Errorf("one operation requires %d in-flight bytes, above the %d-byte limit: %w",
+				bytes, t.gate.maxBytes, syscall.EFBIG)
+		}
+		if t.gate.operations < t.gate.maxOperations && bytes <= t.gate.maxBytes-t.gate.bytes {
+			t.once = true
+			t.gate.waiting--
+			t.gate.operations++
+			t.gate.bytes += bytes
+			t.gate.notifyLocked()
+			t.gate.unlock()
+			return &ticket{gate: t.gate, bytes: bytes}, nil
+		}
+		changed := t.gate.changed
+		t.gate.unlock()
+		select {
+		case <-ctx.Done():
+			t.release()
+			return nil, contextFailure("admit operation", "", ctx.Err())
+		case <-changed:
+		}
+	}
+}
+
+func (t *waitingTicket) release() {
+	if t == nil || t.once {
+		return
+	}
+	<-t.gate.mu
+	t.once = true
+	t.gate.waiting--
+	t.gate.notifyLocked()
+	t.gate.unlock()
 }
 
 type controlTicket struct {
@@ -75,36 +145,6 @@ type ticket struct {
 	gate  *admission
 	bytes int64
 	once  bool
-}
-
-func (a *admission) acquire(ctx context.Context, bytes int64) (*ticket, error) {
-	for {
-		if err := take(ctx, a.mu); err != nil {
-			return nil, err
-		}
-		if a.closing {
-			a.unlock()
-			return nil, fmt.Errorf("the object store is closed: %w", syscall.EIO)
-		}
-		if bytes > a.maxBytes {
-			a.unlock()
-			return nil, fmt.Errorf("one operation requires %d in-flight bytes, above the %d-byte limit: %w",
-				bytes, a.maxBytes, syscall.EFBIG)
-		}
-		if a.operations < a.maxOperations && bytes <= a.maxBytes-a.bytes {
-			a.operations++
-			a.bytes += bytes
-			a.unlock()
-			return &ticket{gate: a, bytes: bytes}, nil
-		}
-		changed := a.changed
-		a.unlock()
-		select {
-		case <-ctx.Done():
-			return nil, contextFailure("admit operation", "", ctx.Err())
-		case <-changed:
-		}
-	}
 }
 
 // addBytes is used by Get after the envelope reveals the payload size. An operation that
@@ -150,7 +190,7 @@ func (a *admission) closeAndWait() {
 	<-a.mu
 	a.closing = true
 	a.notifyLocked()
-	for a.operations != 0 || a.controls != 0 {
+	for a.operations != 0 || a.waiting != 0 || a.controls != 0 {
 		changed := a.changed
 		a.unlock()
 		<-changed
@@ -159,10 +199,10 @@ func (a *admission) closeAndWait() {
 	a.unlock()
 }
 
-func (a *admission) snapshot() (operations int, bytes int64, closing bool) {
+func (a *admission) snapshot() (operations, waiting int, bytes int64, closing bool) {
 	<-a.mu
 	defer a.unlock()
-	return a.operations, a.bytes, a.closing
+	return a.operations, a.waiting, a.bytes, a.closing
 }
 
 func (a *admission) notifyLocked() {

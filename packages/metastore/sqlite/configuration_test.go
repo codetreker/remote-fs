@@ -13,10 +13,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/metastore"
+
 	_ "modernc.org/sqlite"
 )
 
-func TestEveryWriterConnectionUsesFullSynchronous(t *testing.T) {
+func TestEveryWriterConnectionUsesDurablePragmas(t *testing.T) {
 	db, err := openPool(t.Context(), t.TempDir()+"/metastore.db", true, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -34,6 +36,14 @@ func TestEveryWriterConnectionUsesFullSynchronous(t *testing.T) {
 		if effective != 2 {
 			t.Fatalf("writer connection %d uses synchronous level %d, want FULL (2)", attempt+1, effective)
 		}
+		var autocheckpoint int
+		if err := db.QueryRowContext(t.Context(), `PRAGMA wal_autocheckpoint`).Scan(&autocheckpoint); err != nil {
+			t.Fatalf("reading connection %d's WAL autocheckpoint setting: %v", attempt+1, err)
+		}
+		if autocheckpoint != 0 {
+			t.Fatalf("writer connection %d checkpoints automatically after %d pages, want disabled",
+				attempt+1, autocheckpoint)
+		}
 	}
 }
 
@@ -42,7 +52,8 @@ func TestReaderConnectionOptionsAreBoundedAndValidatedBeforeOpening(t *testing.T
 	if defaults.MaxReaderConnections != DefaultMaxReaderConnections || defaults.MaxReaderConnections < 1 ||
 		defaults.MaxSnapshotReaderConnections != DefaultMaxSnapshotReaderConnections ||
 		defaults.MaxSnapshotReaderConnections < 1 ||
-		defaults.MaxIntegrityRecords != DefaultMaxIntegrityRecords || defaults.MaxIntegrityRecords < 1 {
+		defaults.MaxIntegrityRecords != DefaultMaxIntegrityRecords || defaults.MaxIntegrityRecords < 1 ||
+		defaults.MaxIntegrityBytes != DefaultMaxIntegrityBytes || defaults.MaxIntegrityBytes < 1 {
 		t.Fatalf("default SQLite options are %+v", defaults)
 	}
 	effective, err := (Options{Window: DefaultWindow()}).Effective()
@@ -69,6 +80,11 @@ func TestReaderConnectionOptionsAreBoundedAndValidatedBeforeOpening(t *testing.T
 		store.Close()
 		t.Fatalf("Open configured an integrity record limit of %d, want default %d",
 			store.maxIntegrityRecords, DefaultMaxIntegrityRecords)
+	}
+	if store.maxIntegrityBytes != DefaultMaxIntegrityBytes {
+		store.Close()
+		t.Fatalf("Open configured an integrity byte limit of %d, want default %d",
+			store.maxIntegrityBytes, DefaultMaxIntegrityBytes)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -161,6 +177,24 @@ func TestReaderConnectionOptionsAreBoundedAndValidatedBeforeOpening(t *testing.T
 				t.Fatalf("invalid options touched the database path: %v", statErr)
 			}
 		})
+	}
+
+	for _, limit := range []int64{-1, math.MaxInt64} {
+		path := t.TempDir() + "/nested/metastore.db"
+		store, err := OpenWithOptions(t.Context(), path, "workspace", 0, Options{
+			Window:            DefaultWindow(),
+			MaxIntegrityBytes: limit,
+		})
+		if err == nil {
+			store.Close()
+			t.Fatalf("opening with integrity byte limit %d succeeded", limit)
+		}
+		if !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("opening with integrity byte limit %d: %v, want EINVAL", limit, err)
+		}
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("invalid integrity byte limit touched the database path: %v", statErr)
+		}
 	}
 }
 
@@ -307,7 +341,7 @@ func TestWriterCloseFailureIsJoinedWhenReaderPoolOpenFails(t *testing.T) {
 				}
 				return nil, primary
 			},
-			prepare: func(context.Context, *sql.DB, string, string, Window, int64) (int64, int64, error) {
+			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64) (int64, int64, error) {
 				t.Fatal("prepare ran after reader pool open failed")
 				return 0, 0, nil
 			},
@@ -363,7 +397,7 @@ func TestBothPoolCloseFailuresAreJoinedWhenPrepareFails(t *testing.T) {
 				}
 				return snapshot, nil
 			},
-			prepare: func(context.Context, *sql.DB, string, string, Window, int64) (int64, int64, error) {
+			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64) (int64, int64, error) {
 				return 0, 0, primary
 			},
 			closePool: func(db *sql.DB) error {
@@ -455,7 +489,7 @@ func TestReaderPoolCloseFailuresAreJoinedWhenSnapshotPoolOpenFails(t *testing.T)
 				}
 				return nil, primary
 			},
-			prepare: func(context.Context, *sql.DB, string, string, Window, int64) (int64, int64, error) {
+			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64) (int64, int64, error) {
 				t.Fatal("prepare ran after snapshot reader pool open failed")
 				return 0, 0, nil
 			},
@@ -497,6 +531,349 @@ func TestWriterCloseFailureIsJoinedWhenSynchronousVerificationFails(t *testing.T
 	if !errors.Is(err, primary) || !errors.Is(err, closeFailure) ||
 		!strings.Contains(err.Error(), "writer pool") {
 		t.Fatalf("synchronous verification failure returned %v, want labeled primary and close failures", err)
+	}
+}
+
+type acceptingCommitWitness struct{}
+
+func (acceptingCommitWitness) Accept(DurableState) error     { return nil }
+func (acceptingCommitWitness) Checkpoint(DurableState) error { return nil }
+
+func TestOpenCleanupFailureRetainsDatabaseOwnership(t *testing.T) {
+	for _, stage := range []string{"writer", "reader", "snapshot reader", "prepare"} {
+		t.Run(stage, func(t *testing.T) {
+			path := t.TempDir() + "/metastore.db"
+			primary := errors.New(stage + " open failed")
+			closeFailure := errors.New(stage + " cleanup left a native handle open")
+			var pools []*sql.DB
+			newPool := func(database string, writer bool) (*sql.DB, error) {
+				var db *sql.DB
+				var err error
+				if stage == "prepare" {
+					db, err = openPool(t.Context(), database, writer, 1)
+				} else {
+					db, err = sql.Open("sqlite", ":memory:")
+				}
+				if err == nil {
+					pools = append(pools, db)
+				}
+				return db, err
+			}
+			t.Cleanup(func() {
+				for _, db := range pools {
+					db.Close()
+				}
+			})
+
+			var cleanupTarget *sql.DB
+			readOpens := 0
+			hooks := storeOpenHooks{
+				openDurableWriter: func(_ context.Context, database string, _ int) (*sql.DB, error) {
+					db, err := newPool(database, true)
+					if err != nil {
+						return nil, err
+					}
+					if stage == "writer" {
+						cleanupTarget = db
+						return nil, errors.Join(primary, poolCloseFailure("writer pool", closeFailure))
+					}
+					if stage == "reader" {
+						cleanupTarget = db
+					}
+					return db, nil
+				},
+				openPool: func(_ context.Context, database string, writer bool, _ int) (*sql.DB, error) {
+					if writer {
+						t.Fatal("durable open used the ordinary writer hook")
+					}
+					readOpens++
+					if stage == "reader" && readOpens == 1 || stage == "snapshot reader" && readOpens == 2 {
+						return nil, primary
+					}
+					db, err := newPool(database, false)
+					if err == nil && stage == "snapshot reader" && readOpens == 1 {
+						cleanupTarget = db
+					}
+					if err == nil && stage == "prepare" && readOpens == 2 {
+						cleanupTarget = db
+					}
+					return db, err
+				},
+				closePool: func(db *sql.DB) error {
+					if db == cleanupTarget {
+						return closeFailure
+					}
+					return db.Close()
+				},
+			}
+			durable := &durableOpen{
+				mode: RequireExistingNamespace, witness: acceptingCommitWitness{},
+			}
+			store, err := openConfiguredWithHooks(
+				t.Context(), path, "workspace", "store", 0, DefaultOptions(), durable, hooks,
+			)
+			if store != nil {
+				store.Abort()
+				t.Fatal("failed open returned a Store")
+			}
+			if stage != "prepare" && !errors.Is(err, primary) {
+				t.Fatalf("%s failure returned %v, missing primary error", stage, err)
+			}
+			if !errors.Is(err, closeFailure) || !OpenFailureRetainsOwnership(err) {
+				t.Fatalf("%s cleanup returned %v without ownership-retention classification", stage, err)
+			}
+			if _, err := acquireCoordinator(path, true); !errors.Is(err, syscall.EBUSY) {
+				t.Fatalf("durable reopen after %s cleanup returned %v, want EBUSY", stage, err)
+			}
+		})
+	}
+}
+
+func TestTerminalPoolCloseReportingFailuresAreCached(t *testing.T) {
+	writer, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		writer.Close()
+		t.Fatal(err)
+	}
+	snapshot, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		writer.Close()
+		reader.Close()
+		t.Fatal(err)
+	}
+	readPools := 0
+	writerReporting := errors.New("writer close reporting failed after the pool closed")
+	readerReporting := errors.New("reader close reporting failed after the pool closed")
+	snapshotReporting := errors.New("snapshot close reporting failed after the pool closed")
+	store, err := openWithHooks(
+		t.Context(), "terminal-close", "workspace", "", 0, Options{Window: DefaultWindow()},
+		storeOpenHooks{
+			openPool: func(_ context.Context, _ string, isWriter bool, _ int) (*sql.DB, error) {
+				if isWriter {
+					return writer, nil
+				}
+				readPools++
+				if readPools == 1 {
+					return reader, nil
+				}
+				return snapshot, nil
+			},
+			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64) (int64, int64, error) {
+				return 1, 1, nil
+			},
+			closePool: func(db *sql.DB) error {
+				closed := db.Close()
+				switch db {
+				case writer:
+					return errors.Join(closed, writerReporting)
+				case reader:
+					return errors.Join(closed, readerReporting)
+				case snapshot:
+					return errors.Join(closed, snapshotReporting)
+				}
+				return closed
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeErr := store.Close()
+	for _, want := range []error{writerReporting, readerReporting, snapshotReporting} {
+		if !errors.Is(closeErr, want) {
+			t.Fatalf("terminal pool close returned %v, missing %v", closeErr, want)
+		}
+	}
+	if !store.Terminal() {
+		t.Fatal("Store does not report terminal closure after writer Close returned an error")
+	}
+	if err := store.Close(); !errors.Is(err, writerReporting) ||
+		!errors.Is(err, readerReporting) || !errors.Is(err, snapshotReporting) {
+		t.Fatalf("rechecking an already terminal Store returned %v, want the original failure", err)
+	}
+}
+
+func TestTerminalPoolCloseErrorKeepsDurableCoordinatorReserved(t *testing.T) {
+	for _, target := range []string{"reader", "snapshot", "writer"} {
+		t.Run(target, func(t *testing.T) {
+			writer, err := sql.Open("sqlite", ":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader, err := sql.Open("sqlite", ":memory:")
+			if err != nil {
+				writer.Close()
+				t.Fatal(err)
+			}
+			snapshot, err := sql.Open("sqlite", ":memory:")
+			if err != nil {
+				writer.Close()
+				reader.Close()
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				writer.Close()
+				reader.Close()
+				snapshot.Close()
+			})
+			path := t.TempDir() + "/reserved.db"
+			coordinator, err := acquireCoordinator(path, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			failure := errors.New(target + " driver handle remained open")
+			store := &Store{
+				write: writer, read: reader, snapshotRead: snapshot,
+				coordinator: coordinator,
+				closePool: func(db *sql.DB) error {
+					if target == "writer" && db == writer ||
+						target == "reader" && db == reader ||
+						target == "snapshot" && db == snapshot {
+						return failure
+					}
+					return db.Close()
+				},
+			}
+			if err := store.Close(); !errors.Is(err, failure) {
+				t.Fatalf("terminal %s close returned %v", target, err)
+			}
+			if !store.Terminal() {
+				t.Fatal("Store did not enter terminal state after pool close failure")
+			}
+			if err := store.Close(); !errors.Is(err, failure) {
+				t.Fatalf("repeated terminal close returned %v", err)
+			}
+			if _, err := acquireCoordinator(path, true); !errors.Is(err, syscall.EBUSY) {
+				t.Fatalf("durable reopen after %s close failure returned %v, want EBUSY", target, err)
+			}
+		})
+	}
+}
+
+func TestDurableCloseRetriesPersistentWALReleaseFailure(t *testing.T) {
+	path := t.TempDir() + "/metastore.db"
+	store, err := OpenBoundDurableWithOptions(
+		t.Context(), path, "workspace", "store", 0, DefaultOptions(),
+		CreateNamespaceIfMissing, DurableStartup{}, acceptingCommitWitness{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	releaseCalls := 0
+	store.releasePersistentWAL = func(ctx context.Context, db *sql.DB) error {
+		releaseCalls++
+		if releaseCalls == 1 {
+			return fmt.Errorf("injected persistent WAL release failure: %w", syscall.EIO)
+		}
+		return disablePersistentWAL(ctx, db)
+	}
+	if err := store.Close(); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("closing with failed persistent WAL release returned %v, want EIO", err)
+	}
+	if store.Terminal() {
+		t.Fatal("persistent WAL release failure made Close terminal")
+	}
+	if err := store.write.PingContext(t.Context()); err != nil {
+		t.Fatalf("persistent WAL release failure closed the writer: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("retrying persistent WAL release: %v", err)
+	}
+	if releaseCalls != 2 {
+		t.Fatalf("persistent WAL release ran %d times, want 2", releaseCalls)
+	}
+}
+
+func TestSinceDoesNotAllocateFromAnUnboundedRequestedLimit(t *testing.T) {
+	store, err := open(t.Context(), t.TempDir()+"/metastore.db", "workspace", "", 0, DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.maxIntegrityRecords = math.MaxInt64 - 1
+	t.Cleanup(func() { store.Close() })
+
+	read := func(maxBytes int64) []metastore.Change {
+		result, err := metastore.NewChangeResult(maxBytes, 0,
+			func(_ int, _ metastore.Change, _ metastore.ChangePayloadLengths) (int64, error) {
+				return 1, nil
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Since(t.Context(), 0, math.MaxInt, result); err != nil {
+			t.Fatal(err)
+		}
+		changes, err := result.Changes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return changes
+	}
+
+	if changes := read(1); len(changes) != 0 {
+		t.Fatalf("empty log returned %d changes", len(changes))
+	}
+	if err := store.Create(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	if changes := read(1); len(changes) != 1 {
+		t.Fatalf("one-change result returned %d changes", len(changes))
+	}
+}
+
+func TestGlobalIdentityBoundsUseExpressionIndexSearches(t *testing.T) {
+	store, err := open(t.Context(), t.TempDir()+"/metastore.db", "workspace", "", 0, DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	plan := func(query string) string {
+		rows, err := store.read.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var details []string
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+				t.Fatal(err)
+			}
+			details = append(details, detail)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(details, "\n")
+	}
+
+	combined := plan(globalNodeIdentityBoundsQuery) + "\n" + plan(globalChangeIdentityBoundsQuery)
+	if strings.Contains(combined, "USE TEMP B-TREE") {
+		t.Fatalf("global identity bounds build a temporary ordering:\n%s", combined)
+	}
+	for _, index := range []string{
+		"namespaces_by_root_identity",
+		"entries_by_node_identity",
+		"changes_by_node_identity",
+		"changes_by_position_identity",
+		"logs_by_change_identity",
+	} {
+		if count := strings.Count(combined, index); count != 2 {
+			t.Fatalf("global identity bounds use %s %d times, want invalid and maximum searches:\n%s",
+				index, count, combined)
+		}
+	}
+	for _, table := range []string{"namespaces", "entries", "changes", "logs"} {
+		if strings.Contains(combined, "SCAN "+table) {
+			t.Fatalf("global identity bounds scan %s:\n%s", table, combined)
+		}
 	}
 }
 

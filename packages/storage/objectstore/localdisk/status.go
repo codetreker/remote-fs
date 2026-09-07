@@ -2,7 +2,6 @@ package localdisk
 
 import (
 	"context"
-	"errors"
 	"fmt"
 )
 
@@ -12,6 +11,7 @@ import (
 type Status struct {
 	StoreID            ID
 	InFlightOperations int
+	WaitingOperations  int
 	InFlightBytes      int64
 	PhysicalAvailable  int64
 	RecoveryRecords    int64
@@ -29,10 +29,11 @@ func (o *Objects) Status(ctx context.Context) (Status, error) {
 		return Status{StoreID: o.id}, fmt.Errorf("read local object-store status: %w", err)
 	}
 	defer ticket.release()
-	operations, bytes, _ := o.gate.snapshot()
+	operations, waiting, bytes, _ := o.gate.snapshot()
 	status := Status{
 		StoreID:            o.id,
 		InFlightOperations: operations,
+		WaitingOperations:  waiting,
 		InFlightBytes:      bytes,
 		RecoveryRecords:    o.recoveryRecords.Load(),
 	}
@@ -40,9 +41,7 @@ func (o *Objects) Status(ctx context.Context) (Status, error) {
 	if spaceErr == nil {
 		status.PhysicalAvailable = space.Avail
 	}
-	healthErr := o.health.failure()
-	if healthErr != nil {
-		status.Failure = healthErr.Error()
-	}
-	return status, errors.Join(spaceErr, healthErr)
+	resultErr, failure := o.health.status(spaceErr)
+	status.Failure = failure
+	return status, resultErr
 }

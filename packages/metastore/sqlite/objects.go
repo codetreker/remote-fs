@@ -306,15 +306,14 @@ func (s *Store) createCommitted(ctx context.Context, tx *sql.Tx, parent metastor
 	now := time.Now()
 	accessSec, accessNsec := storedTime(now)
 	sec, nsec := storedTime(object.ModTime)
-	result, err := tx.ExecContext(ctx, `
-		INSERT INTO nodes (namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		s.namespace, int64(fileMode), object.Size, accessSec, accessNsec, sec, nsec, storedKey(object.Key))
+	id, err := allocateNodeID(ctx, tx)
 	if err != nil {
 		return err
 	}
-	id, err := result.LastInsertId()
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, s.namespace, int64(fileMode), object.Size, accessSec, accessNsec, sec, nsec, storedKey(object.Key)); err != nil {
 		return err
 	}
 	if err := s.link(ctx, tx, parent.ID, name, id); err != nil {
@@ -411,11 +410,13 @@ type ObjectStatus struct {
 // before reporting a successful snapshot; Reserve performs only the indexed pending-record
 // validation required on its write path.
 func (s *Store) ObjectStatus(ctx context.Context) (ObjectStatus, error) {
-	tx, err := s.read.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := s.beginReadSnapshot(ctx, s.read)
 	if err != nil {
-		return ObjectStatus{}, fmt.Errorf("opening an object status snapshot: %w", failure(err))
+		return ObjectStatus{}, fmt.Errorf("opening an object status snapshot: %w", err)
 	}
-	if err := validateNamespaceIntegrity(ctx, tx, s.namespace, s.maxIntegrityRecords); err != nil {
+	if err := validateNamespaceIntegrity(
+		ctx, tx, s.namespace, s.maxIntegrityRecords, s.maxIntegrityBytes,
+	); err != nil {
 		primary := fmt.Errorf("validating namespace integrity: %w", failure(err))
 		return ObjectStatus{}, finishReadTransaction("object status transaction", tx, primary)
 	}
@@ -515,6 +516,103 @@ func validateIntegrityWork(
 	return nil
 }
 
+// validateIntegrityBytes admits variable-length names using SQLite's O(1) BLOB length before
+// any content-sensitive predicate such as instr examines them. The row count has already been
+// admitted, so streaming these fixed-width lengths is bounded in both records and bytes.
+func validateIntegrityBytes(
+	ctx context.Context,
+	db integrityQueryer,
+	namespace *int64,
+	maxIntegrityBytes int64,
+	version int,
+) error {
+	remaining := maxIntegrityBytes
+	entryWhere := ""
+	changeWhere := ""
+	entryArgs := []any{}
+	changeArgs := []any{}
+	if namespace != nil {
+		entryWhere = `
+			LEFT JOIN nodes parent ON parent.id = e.parent
+			LEFT JOIN nodes child ON child.id = e.node
+			WHERE e.namespace = ? OR parent.namespace = ? OR child.namespace = ?`
+		changeWhere = "WHERE namespace = ?"
+		entryArgs = []any{*namespace, *namespace, *namespace}
+		changeArgs = []any{*namespace}
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT typeof(e.name), CASE WHEN typeof(e.name) = 'blob' THEN length(e.name) END
+		FROM entries e `+entryWhere, entryArgs...)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var storageClass string
+		var length sql.NullInt64
+		if err := rows.Scan(&storageClass, &length); err != nil {
+			rows.Close()
+			return err
+		}
+		if storageClass != "blob" || !length.Valid || length.Int64 < 0 {
+			rows.Close()
+			return fmt.Errorf("an entry name is stored as %s rather than a BLOB: %w", storageClass, syscall.EIO)
+		}
+		if length.Int64 > remaining {
+			rows.Close()
+			return fmt.Errorf("entry and change names exceed the %d-byte integrity limit: %w",
+				maxIntegrityBytes, syscall.EFBIG)
+		}
+		remaining -= length.Int64
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	if version < 2 {
+		return nil
+	}
+
+	rows, err = db.QueryContext(ctx, `
+		SELECT
+			typeof(name), CASE WHEN typeof(name) = 'blob' THEN length(name) END,
+			typeof(from_name), CASE WHEN typeof(from_name) = 'blob' THEN length(from_name) END
+		FROM changes `+changeWhere, changeArgs...)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var nameType, fromNameType string
+		var nameLength, fromNameLength sql.NullInt64
+		if err := rows.Scan(&nameType, &nameLength, &fromNameType, &fromNameLength); err != nil {
+			rows.Close()
+			return err
+		}
+		for _, field := range []struct {
+			name         string
+			storageClass string
+			length       sql.NullInt64
+		}{
+			{"name", nameType, nameLength},
+			{"from_name", fromNameType, fromNameLength},
+		} {
+			if field.storageClass == "null" {
+				continue
+			}
+			if field.storageClass != "blob" || !field.length.Valid || field.length.Int64 < 0 {
+				rows.Close()
+				return fmt.Errorf("a retained change %s is stored as %s rather than a BLOB or NULL: %w",
+					field.name, field.storageClass, syscall.EIO)
+			}
+			if field.length.Int64 > remaining {
+				rows.Close()
+				return fmt.Errorf("entry and change names exceed the %d-byte integrity limit: %w",
+					maxIntegrityBytes, syscall.EFBIG)
+			}
+			remaining -= field.length.Int64
+		}
+	}
+	return errors.Join(rows.Err(), rows.Close())
+}
+
 // validateStorageClasses rejects SQLite's dynamically typed values before any cursor or
 // payload reader can coerce them into a plausible row or order them in another storage class.
 func validateStorageClasses(ctx context.Context, db integrityQueryer, namespace *int64) error {
@@ -591,6 +689,7 @@ func validateStorageClasses(ctx context.Context, db integrityQueryer, namespace 
 			typeof(trimmed_by_age) != 'integer')`, scopeArgs},
 		{"changes", `SELECT count(*) FROM changes ` + changeWhere + predicateJoin(changeWhere) + `(
 			typeof(position) != 'integer' OR position <= 0 OR
+			typeof(previous_position) != 'integer' OR previous_position < 0 OR
 			typeof(namespace) != 'integer' OR namespace <= 0 OR
 			typeof(kind) != 'integer' OR typeof(parent) != 'integer' OR
 			typeof(name) NOT IN ('blob', 'null') OR
@@ -604,6 +703,12 @@ func validateStorageClasses(ctx context.Context, db integrityQueryer, namespace 
 		{"backing store", `SELECT count(*) FROM backing_store WHERE
 			typeof(singleton) != 'integer' OR singleton != 1 OR
 			typeof(store_id) != 'text' OR store_id = ''`, nil},
+		{"durable state", `SELECT count(*) FROM database_state WHERE
+			typeof(singleton) != 'integer' OR singleton != 1 OR
+			typeof(database_id) != 'text' OR length(database_id) != 32 OR
+			typeof(generation) != 'integer' OR generation < 0 OR
+			typeof(node_high_water) != 'integer' OR node_high_water < 0 OR
+			typeof(change_high_water) != 'integer' OR change_high_water < 0`, nil},
 	}
 	if invalidNamespaces != 0 {
 		return fmt.Errorf("the database holds %d namespace rows in an invalid SQLite storage class: %w",
@@ -659,9 +764,58 @@ func validateNodeValues(ctx context.Context, db integrityQueryer, namespace *int
 	return nil
 }
 
-// validateLogIntegrity checks the durable tail and the operation-dependent shape of every
-// retained change before Snapshot or Since may expose it as history.
+// validateVersionTwoLogIntegrity checks the historical log format before migration resets
+// its incarnation. Version 2 has no predecessor chain, so this proves row shape and tail only.
+func validateVersionTwoLogIntegrity(ctx context.Context, db integrityQueryer, namespace *int64) error {
+	if err := validateVersionTwoLogStorageClasses(ctx, db, namespace); err != nil {
+		return err
+	}
+	return validateLogIntegrityVersion(ctx, db, namespace, false)
+}
+
+func validateVersionTwoLogStorageClasses(ctx context.Context, db integrityQueryer, namespace *int64) error {
+	where := ""
+	var args []any
+	if namespace != nil {
+		where = "WHERE namespace = ? AND "
+		args = []any{*namespace}
+	} else {
+		where = "WHERE "
+	}
+	var invalidLogs, invalidChanges int64
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM logs `+where+`(
+		typeof(namespace) != 'integer' OR typeof(incarnation) != 'text' OR
+		typeof(committed_position) != 'integer' OR typeof(trimmed_through) != 'integer' OR
+		typeof(trimmed_by_age) != 'integer')`, args...).Scan(&invalidLogs); err != nil {
+		return err
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM changes `+where+`(
+		typeof(position) != 'integer' OR typeof(namespace) != 'integer' OR
+		typeof(kind) != 'integer' OR typeof(parent) != 'integer' OR
+		typeof(name) NOT IN ('blob', 'null') OR
+		typeof(from_parent) NOT IN ('integer', 'null') OR
+		typeof(from_name) NOT IN ('blob', 'null') OR
+		typeof(node) NOT IN ('integer', 'null') OR typeof(mode) NOT IN ('integer', 'null') OR
+		typeof(size) NOT IN ('integer', 'null') OR typeof(atime_sec) NOT IN ('integer', 'null') OR
+		typeof(atime_nsec) NOT IN ('integer', 'null') OR typeof(mtime_sec) NOT IN ('integer', 'null') OR
+		typeof(mtime_nsec) NOT IN ('integer', 'null') OR typeof(content) NOT IN ('text', 'null') OR
+		typeof(recorded_sec) != 'integer' OR typeof(recorded_nsec) != 'integer')`, args...).Scan(&invalidChanges); err != nil {
+		return err
+	}
+	if invalidLogs != 0 || invalidChanges != 0 {
+		return fmt.Errorf("schema version 2 holds %d log rows and %d change rows in invalid SQLite storage classes: %w",
+			invalidLogs, invalidChanges, syscall.EIO)
+	}
+	return nil
+}
+
+// validateLogIntegrity checks the durable tail, predecessor chain, and operation-dependent
+// shape of every retained change before Snapshot or Since may expose it as history.
 func validateLogIntegrity(ctx context.Context, db integrityQueryer, namespace *int64) error {
+	return validateLogIntegrityVersion(ctx, db, namespace, true)
+}
+
+func validateLogIntegrityVersion(ctx context.Context, db integrityQueryer, namespace *int64, predecessors bool) error {
 	namespaceWhere := ""
 	changeWhere := ""
 	var args []any
@@ -674,6 +828,26 @@ func validateLogIntegrity(ctx context.Context, db integrityQueryer, namespace *i
 		changeWhere = "WHERE "
 	}
 
+	tailPredicate := `l.committed_position != coalesce((
+				SELECT max(c.position) FROM changes c WHERE c.namespace = ns.id
+			), l.trimmed_through)`
+	if predecessors {
+		tailPredicate = `l.committed_position != coalesce((
+				SELECT max(c.position) FROM changes c WHERE c.namespace = ns.id
+			), l.trimmed_through) OR
+			EXISTS (
+				SELECT 1 FROM (
+					SELECT position, previous_position,
+						row_number() OVER (ORDER BY position) AS ordinal,
+						lag(position) OVER (ORDER BY position) AS preceding
+					FROM changes WHERE namespace = ns.id
+				) chain
+				WHERE chain.previous_position != CASE
+					WHEN chain.ordinal = 1 THEN l.trimmed_through
+					ELSE chain.preceding
+				END
+			)`
+	}
 	var invalidLogs int64
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*)
@@ -683,9 +857,7 @@ func validateLogIntegrity(ctx context.Context, db integrityQueryer, namespace *i
 			l.namespace IS NULL OR l.incarnation = '' OR
 			l.committed_position < 0 OR l.trimmed_through < 0 OR
 			l.trimmed_by_age NOT IN (0, 1) OR l.trimmed_through > l.committed_position OR
-			l.committed_position != coalesce((
-				SELECT max(c.position) FROM changes c WHERE c.namespace = ns.id
-			), 0) OR
+			`+tailPredicate+` OR
 			EXISTS (
 				SELECT 1 FROM changes c
 				WHERE c.namespace = ns.id AND c.position <= l.trimmed_through
@@ -694,6 +866,12 @@ func validateLogIntegrity(ctx context.Context, db integrityQueryer, namespace *i
 		return err
 	}
 
+	predecessorPredicate := ""
+	if predecessors {
+		predecessorPredicate = `
+			OR typeof(c.previous_position) != 'integer'
+			OR c.previous_position < 0 OR c.previous_position >= c.position`
+	}
 	var invalidChanges int64
 	changeArgs := append([]any{}, args...)
 	changeArgs = append(changeArgs,
@@ -747,6 +925,7 @@ func validateLogIntegrity(ctx context.Context, db integrityQueryer, namespace *i
 			(current_parent.id IS NOT NULL AND c.parent != 0 AND current_parent.namespace != c.namespace) OR
 			(current_from_parent.id IS NOT NULL AND current_from_parent.namespace != c.namespace) OR
 			c.recorded_nsec < 0 OR c.recorded_nsec >= 1000000000
+			`+predecessorPredicate+`
 		)`, changeArgs...).Scan(&invalidChanges); err != nil {
 		return err
 	}
@@ -848,12 +1027,18 @@ func validateNamespaceIntegrity(
 	ctx context.Context,
 	db integrityQueryer,
 	namespace int64,
-	maxIntegrityRecords int64,
+	maxIntegrityRecords, maxIntegrityBytes int64,
 ) error {
 	if err := validateIntegrityWork(ctx, db, &namespace, maxIntegrityRecords); err != nil {
 		return err
 	}
+	if err := validateIntegrityBytes(ctx, db, &namespace, maxIntegrityBytes, schema.Version()); err != nil {
+		return err
+	}
 	if err := validateStorageClasses(ctx, db, &namespace); err != nil {
+		return err
+	}
+	if err := validateIdentityBounds(ctx, db, namespace); err != nil {
 		return err
 	}
 	if err := validateNodeValues(ctx, db, &namespace); err != nil {
@@ -1328,6 +1513,10 @@ func (s *Store) Garbage(ctx context.Context, limit int) ([]metastore.Key, error)
 	if limit < 0 {
 		return nil, fmt.Errorf("a limit of %d objects is not a count: %w", limit, syscall.EINVAL)
 	}
+	if err := s.coordinator.beginHealthyRead(); err != nil {
+		return nil, err
+	}
+	defer s.coordinator.endHealthyRead()
 	rows, err := s.read.QueryContext(ctx, garbageQuery, s.namespace, stateGarbage, limit)
 	if err != nil {
 		return nil, fmt.Errorf("collecting objects nothing references: %w", failure(err))

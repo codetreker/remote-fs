@@ -16,15 +16,34 @@ import (
 // Space reports figures derived from statfs. Available subtracts the maintenance reserve,
 // active publication reservations, and the largest envelope/key overhead. Filesystem
 // allocation granularity and concurrent activity remain authoritative at Put time.
-func (o *Objects) Space(ctx context.Context) (storage.Space, error) {
+func (o *Objects) Space(ctx context.Context) (returnedSpace storage.Space, returned error) {
 	if err := checkContext(ctx, "stat object-store space", ""); err != nil {
 		return storage.Space{}, err
 	}
-	ticket, err := o.gate.acquire(ctx, 0)
+	waiting, err := o.gate.acquireWaiting(ctx)
 	if err != nil {
 		return storage.Space{}, fmt.Errorf("stat object-store space: %w", err)
 	}
-	defer ticket.release()
+	var ticket *ticket
+	defer func() {
+		if ticket != nil {
+			ticket.release()
+		}
+		waiting.release()
+	}()
+	if err := o.health.failure(); err != nil {
+		return storage.Space{}, err
+	}
+	defer func() {
+		returned = o.health.finish(ctx, returned)
+		if returned != nil {
+			returnedSpace = storage.Space{}
+		}
+	}()
+	ticket, err = waiting.promote(ctx, 0)
+	if err != nil {
+		return storage.Space{}, fmt.Errorf("stat object-store space: %w", err)
+	}
 	if err := o.health.failure(); err != nil {
 		return storage.Space{}, err
 	}

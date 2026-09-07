@@ -54,14 +54,15 @@ func writeStatus(report statusReport, ns opened, output io.Writer) {
 	fmt.Fprintf(output, "remote-fs-server: %s status for %s: %s\n", ns.statusName, ns.what, report.line)
 }
 
-func formatLocalStatus(status localstore.Status, options objectstore.Options) string {
+func formatLocalStatus(status localstore.Status, options objectstore.Options, maxWaitingOperations int) string {
 	pending := formatPendingStatus(status.Objects, status.ObjectLimits)
 	maintenance := formatMaintenanceStatus(status.Maintenance)
 	return fmt.Sprintf(
 		"workspace %q in store %s: %d of %d workspace bytes used, %d writable; %d physical bytes available; "+
 			"%s; SQLite reader-connection limit is %d; snapshot reader-connection limit is %d; "+
-			"integrity record work limit is %d; garbage sweeps run every %v with at most %d objects per attempt; "+
-			"%d operations and %d bytes in flight; %d recovery records; %s",
+			"integrity record work limit is %d; integrity name-byte work limit is %d; garbage sweeps run every %v with at most %d objects per attempt; "+
+			"%d operations and %d bytes in flight; %d operations waiting under a limit of %d; %d recovery records; "+
+			"SQLite checkpoint has accepted generation %d and checkpointed generation %d; checkpoint pending is %t; %s",
 		status.Workspace,
 		status.LocalDisk.StoreID,
 		status.Space.Used,
@@ -72,11 +73,17 @@ func formatLocalStatus(status localstore.Status, options objectstore.Options) st
 		status.MaxReaderConnections,
 		status.MaxSnapshotReaderConnections,
 		status.MaxIntegrityRecords,
+		status.MaxIntegrityBytes,
 		options.SweepInterval,
 		options.SweepBatch,
 		status.LocalDisk.InFlightOperations,
 		status.LocalDisk.InFlightBytes,
+		status.LocalDisk.WaitingOperations,
+		maxWaitingOperations,
 		status.LocalDisk.RecoveryRecords,
+		status.Checkpoint.AcceptedGeneration,
+		status.Checkpoint.CheckpointedGeneration,
+		status.Checkpoint.Pending,
 		maintenance,
 	)
 }
@@ -88,14 +95,15 @@ func formatObjectStoreStatus(
 	maxReaderConnections int,
 	maxSnapshotReaderConnections int,
 	maxIntegrityRecords int64,
+	maxIntegrityBytes int64,
 	maintenance objectstore.MaintenanceStatus,
 	options objectstore.Options,
 ) string {
 	return fmt.Sprintf(
 		"workspace %q: %s; SQLite reader-connection limit is %d; snapshot reader-connection limit is %d; "+
-			"integrity record work limit is %d; garbage sweeps run every %v with at most %d objects per attempt; %s",
+			"integrity record work limit is %d; integrity name-byte work limit is %d; garbage sweeps run every %v with at most %d objects per attempt; %s",
 		workspace, formatPendingStatus(objects, limits), maxReaderConnections, maxSnapshotReaderConnections,
-		maxIntegrityRecords,
+		maxIntegrityRecords, maxIntegrityBytes,
 		options.SweepInterval,
 		options.SweepBatch,
 		formatMaintenanceStatus(maintenance),

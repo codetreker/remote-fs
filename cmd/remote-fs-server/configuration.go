@@ -46,6 +46,7 @@ type commandConfig struct {
 	maxReaderConnections         int
 	maxSnapshotReaderConnections int
 	maxIntegrityRecords          int64
+	maxIntegrityBytes            int64
 	maintenance                  objectstore.Options
 	http                         httprest.HandlerOptions
 	standalone                   standaloneHTTPOptions
@@ -63,6 +64,7 @@ func (s localSource) given() bool { return s.root != "" }
 var localOnlyFlags = []string{
 	"local-max-object-bytes",
 	"local-max-in-flight-operations",
+	"local-max-waiting-operations",
 	"local-max-in-flight-bytes",
 	"local-maintenance-reserve-bytes",
 	"local-max-recovery-entries",
@@ -95,6 +97,8 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 	flags.Var(&maxObject, "local-max-object-bytes", "largest payload one local object may retain, as SIZE")
 	maxInFlightOperations := flags.Int("local-max-in-flight-operations", localdisk.DefaultMaxInFlightOperations,
 		"maximum local object operations admitted at once")
+	maxWaitingOperations := flags.Int("local-max-waiting-operations", localdisk.DefaultMaxWaitingOperations,
+		"maximum local object operations waiting for key, shard or resource admission")
 	maxInFlightBytes := positiveSizeFlag{bytes: localdisk.DefaultMaxInFlightBytes}
 	flags.Var(&maxInFlightBytes, "local-max-in-flight-bytes", "maximum encoded local object bytes admitted at once, as SIZE")
 	maintenanceReserve := positiveSizeFlag{bytes: localdisk.DefaultMaintenanceReserveBytes}
@@ -120,6 +124,10 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 	maxIntegrityRecords := flags.Int64("max-integrity-records", sqlite.DefaultMaxIntegrityRecords,
 		"integrity record work limit for a metastore-backed namespace; raise it for\n"+
 			"larger retained namespaces")
+	maxIntegrityBytes := positiveSizeFlag{bytes: sqlite.DefaultMaxIntegrityBytes}
+	flags.Var(&maxIntegrityBytes, "max-integrity-bytes",
+		"integrity name-byte work limit for a metastore-backed namespace, as SIZE;\n"+
+			"raise it for namespaces with larger directory or retained-log names")
 	maintenance := objectstore.DefaultOptions()
 	sweepInterval := flags.Duration("sweep-interval", maintenance.SweepInterval,
 		"interval between garbage sweeps in a blob or local-store namespace")
@@ -191,7 +199,7 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 			"The namespace comes from exactly one of -dir, -blob-container and -local-store.\n"+
 			"A local store owns its directory exclusively for the server lifetime and keeps\n"+
 			"its objects, SQLite metadata and recovery state below that directory.\n\n"+
-			"The pending-object thresholds, SQLite reader pools and integrity work limit\n"+
+			"The pending-object thresholds, SQLite reader pools and integrity work limits\n"+
 			"apply to both metastore-backed forms. SIGHUP recounts a quota-limited -dir\n"+
 			"namespace; for either metastore-backed form it reports current backlog and\n"+
 			"maintenance state without changing either.\n\n"+
@@ -226,6 +234,7 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 			objects: localdisk.Options{
 				MaxObjectBytes:          maxObject.bytes,
 				MaxInFlightOperations:   *maxInFlightOperations,
+				MaxWaitingOperations:    *maxWaitingOperations,
 				MaxInFlightBytes:        maxInFlightBytes.bytes,
 				MaintenanceReserveBytes: maintenanceReserve.bytes,
 				MaxRecoveryEntries:      *maxRecoveryEntries,
@@ -239,6 +248,7 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 		maxReaderConnections:         *maxReaderConnections,
 		maxSnapshotReaderConnections: *maxSnapshotReaderConnections,
 		maxIntegrityRecords:          *maxIntegrityRecords,
+		maxIntegrityBytes:            maxIntegrityBytes.bytes,
 		maintenance: objectstore.Options{
 			SweepInterval: *sweepInterval,
 			SweepBatch:    *sweepBatch,
@@ -343,7 +353,7 @@ func validateConfig(config commandConfig, given map[string]bool, extra []string)
 	if !config.blob.given() && !config.local.given() {
 		for _, name := range []string{
 			"max-pending-objects", "max-pending-bytes", "max-reader-connections",
-			"max-snapshot-reader-connections", "max-integrity-records",
+			"max-snapshot-reader-connections", "max-integrity-records", "max-integrity-bytes",
 			"sweep-interval", "sweep-batch",
 			"http-max-subscriptions", "http-max-frame-bytes", "http-max-concurrent-snapshot-frames",
 			"http-max-in-flight-snapshot-frame-bytes", "http-max-waiting-snapshot-frames",
@@ -400,6 +410,10 @@ func validateConfig(config commandConfig, given map[string]bool, extra []string)
 				"-max-integrity-records must be at least %d", sqlite.MinIntegrityRecords)
 		case config.maxIntegrityRecords == math.MaxInt64:
 			return commandConfig{}, false, errors.New("-max-integrity-records must be bounded below the largest integer")
+		case config.maxIntegrityBytes <= 0:
+			return commandConfig{}, false, errors.New("-max-integrity-bytes must be positive")
+		case config.maxIntegrityBytes == math.MaxInt64:
+			return commandConfig{}, false, errors.New("-max-integrity-bytes must be bounded below the largest integer")
 		case config.maintenance.SweepInterval <= 0:
 			return commandConfig{}, false, errors.New("-sweep-interval must be positive")
 		case config.maintenance.SweepBatch <= 0:
@@ -442,6 +456,10 @@ func validateConfig(config commandConfig, given map[string]bool, extra []string)
 			return commandConfig{}, false, errors.New("-quota is required with -local-store: every workspace needs a positive capacity")
 		case config.local.objects.MaxInFlightOperations <= 0:
 			return commandConfig{}, false, errors.New("-local-max-in-flight-operations must be positive")
+		case config.local.objects.MaxWaitingOperations <= 0:
+			return commandConfig{}, false, errors.New("-local-max-waiting-operations must be positive")
+		case config.local.objects.MaxWaitingOperations == math.MaxInt:
+			return commandConfig{}, false, errors.New("-local-max-waiting-operations must be bounded below the largest integer")
 		case config.local.objects.MaxRecoveryEntries <= 0:
 			return commandConfig{}, false, errors.New("-local-max-recovery-entries must be positive")
 		case maxWriteBytes > maxObjectBytes:

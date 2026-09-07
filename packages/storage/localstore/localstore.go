@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
@@ -50,6 +51,8 @@ var metastoreAuxiliaryFilenames = [...]string{
 // uses sqlite.DefaultMaxSnapshotReaderConnections.
 // MaxIntegrityRecords bounds the retained records examined by SQLite integrity checks; zero
 // uses sqlite.DefaultMaxIntegrityRecords.
+// MaxIntegrityBytes bounds the variable-length names examined by SQLite integrity checks;
+// zero uses sqlite.DefaultMaxIntegrityBytes.
 // The backing filesystem remains the hard physical ceiling for all bytes.
 // LocalDisk.MaintenanceReserveBytes keeps deletion and SQLite maintenance possible when that
 // ceiling is reached; removal remains available while new object publication is refused.
@@ -62,6 +65,7 @@ type Config struct {
 	MaxReaderConnections         int
 	MaxSnapshotReaderConnections int
 	MaxIntegrityRecords          int64
+	MaxIntegrityBytes            int64
 	LocalDisk                    localdisk.Options
 	Maintenance                  objectstore.Options
 }
@@ -75,28 +79,59 @@ type Status struct {
 	MaxReaderConnections         int
 	MaxSnapshotReaderConnections int
 	MaxIntegrityRecords          int64
+	MaxIntegrityBytes            int64
 	LocalDisk                    localdisk.Status
 	Maintenance                  objectstore.MaintenanceStatus
+	Checkpoint                   CheckpointStatus
+}
+
+// CheckpointStatus reports whether accepted SQLite state still depends on WAL frames and
+// whether the bounded checkpoint worker has encountered a failure it has not recovered from.
+type CheckpointStatus struct {
+	AcceptedGeneration     int64
+	CheckpointedGeneration int64
+	Pending                bool
+	LastError              error
 }
 
 // Store is one workspace backed by a local object store and its bound SQLite metadata.
 type Store struct {
 	namespace                    *objectstore.Storage
 	meta                         *sqlite.Store
+	durable                      *durableMetastore
 	objects                      *localdisk.Objects
+	anchor                       *rootAnchor
 	objectLimits                 sqlite.ObjectLimits
 	maxReaderConnections         int
 	maxSnapshotReaderConnections int
 	maxIntegrityRecords          int64
+	maxIntegrityBytes            int64
 	workspace                    string
+	closeMu                      sync.Mutex
+	closeRunning                 *closeAttempt
+	namespaceCloseAttempted      bool
+	closed                       bool
+	lastCloseErr                 error
 }
 
 var _ storage.Storage = (*Store)(nil)
 var _ storage.BoundedStorage = (*Store)(nil)
 
 // Open acquires Root, opens the database bound to that root's durable object-store ID, and
-// starts storage maintenance. Every partial failure releases the resources already opened.
+// starts storage maintenance. Partial failures abort unexposed SQLite handles before
+// releasing root ownership; a terminal driver-close error retains ownership fail-closed.
 func Open(ctx context.Context, config Config) (*Store, error) {
+	return open(ctx, config, openHooks{})
+}
+
+type openHooks struct {
+	afterDurableMetastore func(*durableMetastore) error
+	afterNamespace        func(*objectstore.Storage, *durableMetastore) error
+	openDurable           func() (*sqlite.Store, error)
+	retainsOwnership      func(error) bool
+}
+
+func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 	root, err := validate(config)
 	if err != nil {
 		return nil, err
@@ -139,114 +174,176 @@ func Open(ctx context.Context, config Config) (*Store, error) {
 			anchor.Close(),
 		)
 	}
-	if err := anchor.MakeMetastoreFilesPrivate(); err != nil {
-		return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
-	}
-	databaseExists, err := anchor.RequireMetastoreFiles()
+	intent, err := anchor.InspectInitializationIntent(storeID, config.Workspace, complete)
 	if err != nil {
 		return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
 	}
-	if !complete {
-		if err := anchor.BindInitialization(storeID, config.Workspace, databaseExists); err != nil {
+	if !complete && intent == initializationIntentMissing {
+		return nil, errors.Join(
+			fmt.Errorf("the object store initialization intent disappeared: %w", syscall.EIO),
+			closeFailure("local object store", objects.Close()),
+			anchor.Close(),
+		)
+	}
+	if err := anchor.MakeMetastoreFilesPrivate(); err != nil {
+		return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
+	}
+	metastoreRoot, err := anchor.InspectMetastore()
+	if err != nil {
+		return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
+	}
+	witness, witnessExists, witnessStageExists, err := anchor.InspectMetastoreWitness(storeID, config.Workspace)
+	if err != nil {
+		return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
+	}
+	if complete && !witnessExists {
+		return nil, errors.Join(
+			fmt.Errorf("the completed local store has no metastore witness: %w", syscall.EIO),
+			closeFailure("local object store", objects.Close()),
+			anchor.Close(),
+		)
+	}
+	if !complete && intent == initializationIntentBound &&
+		metastoreRoot.State == metastoreInitialized && !witnessExists && !witnessStageExists {
+		bootstrap, err := schemaLessMetastore(ctx, filepath.Join(root, metastoreFilename))
+		if err != nil {
+			return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
+		}
+		if bootstrap {
+			metastoreRoot.State = metastoreBootstrap
+		}
+	}
+	if metastoreRoot.State != metastoreInitialized && (witnessExists || witnessStageExists) {
+		return nil, errors.Join(
+			fmt.Errorf("metastore witness state exists beside an uninitialized metadata database: %w", syscall.EIO),
+			closeFailure("local object store", objects.Close()),
+			anchor.Close(),
+		)
+	}
+	if witnessStageExists {
+		// The final witness is the acknowledgement boundary. A stage proves that a
+		// SQLite commit happened, so it must be considered before an absent database
+		// can be classified as bootstrap state, but it is not promoted as authority.
+		if err := witness.RemoveInterruptedStage(); err != nil {
 			return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
 		}
 	}
-	if complete && !databaseExists {
+	if !complete && intent == initializationIntentPristine {
+		if err := anchor.BindInitialization(
+			storeID,
+			config.Workspace,
+			metastoreRoot.State != metastoreMissing,
+		); err != nil {
+			return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
+		}
+	}
+	if complete && metastoreRoot.State != metastoreInitialized {
 		return nil, errors.Join(
-			fmt.Errorf("the completed local store has no %s and cannot prove its namespace metadata: %w",
+			fmt.Errorf("the completed local store does not have an initialized %s and cannot prove its namespace metadata: %w",
 				metastoreFilename, syscall.EIO),
 			closeFailure("local object store", objects.Close()),
 			anchor.Close(),
 		)
 	}
 	databasePath := filepath.Join(root, metastoreFilename)
-	if complete {
+	if metastoreRoot.State == metastoreInitialized {
 		if err := requireBoundDatabase(ctx, databasePath, storeID.String(), config.Workspace); err != nil {
 			return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
 		}
-	} else if !databaseExists {
+	} else if metastoreRoot.State == metastoreMissing {
 		if err := anchor.CreatePrivateMetastore(); err != nil {
 			return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
 		}
 	}
+	openMode := sqlite.CreateNamespaceIfMissing
+	if metastoreRoot.State == metastoreInitialized {
+		openMode = sqlite.RequireExistingNamespace
+	}
 
-	meta, err := sqlite.OpenBoundWithOptions(
-		ctx,
-		databasePath,
-		config.Workspace,
-		storeID.String(),
-		config.Quota,
-		sqliteOptions,
-	)
+	openDurable := hooks.openDurable
+	if openDurable == nil {
+		openDurable = func() (*sqlite.Store, error) {
+			return sqlite.OpenBoundDurableWithOptions(
+				ctx,
+				databasePath,
+				config.Workspace,
+				storeID.String(),
+				config.Quota,
+				sqliteOptions,
+				openMode,
+				witness.Startup(metastoreRoot.WALPresent, metastoreRoot.WALNonEmpty),
+				witness,
+			)
+		}
+	}
+	meta, err := openDurable()
 	if err != nil {
+		retainsOwnership := hooks.retainsOwnership
+		if retainsOwnership == nil {
+			retainsOwnership = sqlite.OpenFailureRetainsOwnership
+		}
+		if retainsOwnership(err) {
+			return nil, err
+		}
 		return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
 	}
+	durableMeta := newDurableMetastore(meta, witness)
+	if hooks.afterDurableMetastore != nil {
+		if err := hooks.afterDurableMetastore(durableMeta); err != nil {
+			return nil, errors.Join(err, cleanupDurableOpen(durableMeta, objects, anchor))
+		}
+	}
 	if err := verifyAnchoredRoot(objects, anchor); err != nil {
-		return nil, errors.Join(
-			err,
-			closeFailure("metastore", meta.Close()),
-			closeFailure("local object store", objects.Close()),
-			anchor.Close(),
-		)
+		return nil, errors.Join(err, cleanupDurableOpen(durableMeta, objects, anchor))
 	}
 	if err := anchor.MakeMetastoreFilesPrivate(); err != nil {
-		return nil, errors.Join(
-			err,
-			closeFailure("metastore", meta.Close()),
-			closeFailure("local object store", objects.Close()),
-			anchor.Close(),
-		)
+		return nil, errors.Join(err, cleanupDurableOpen(durableMeta, objects, anchor))
 	}
-	if exists, err := anchor.RequireMetastoreFiles(); err != nil || !exists {
+	if inspected, err := anchor.InspectMetastore(); err != nil || inspected.State != metastoreInitialized {
 		if err == nil {
-			err = fmt.Errorf("SQLite opened without creating %s beneath the locked root: %w",
+			err = fmt.Errorf("SQLite opened without initializing %s beneath the locked root: %w",
 				metastoreFilename, syscall.EIO)
 		}
+		return nil, errors.Join(err, cleanupDurableOpen(durableMeta, objects, anchor))
+	}
+	if !witness.Exists() {
 		return nil, errors.Join(
-			err,
-			closeFailure("metastore", meta.Close()),
-			closeFailure("local object store", objects.Close()),
-			anchor.Close(),
+			fmt.Errorf("SQLite opened without publishing a metastore witness: %w", syscall.EIO),
+			cleanupDurableOpen(durableMeta, objects, anchor),
 		)
 	}
 	if err := requireBoundDatabase(ctx, databasePath, storeID.String(), config.Workspace); err != nil {
-		return nil, errors.Join(
-			err,
-			closeFailure("metastore", meta.Close()),
-			closeFailure("local object store", objects.Close()),
-			anchor.Close(),
-		)
+		return nil, errors.Join(err, cleanupDurableOpen(durableMeta, objects, anchor))
 	}
 
-	namespace, err := objectstore.NewWithOptions(objects, meta, config.Maintenance)
+	heldObjects := &durabilityHeldObjects{Objects: objects, durable: durableMeta}
+	namespace, err := objectstore.NewWithOptions(heldObjects, durableMeta, config.Maintenance)
 	if err != nil {
-		return nil, errors.Join(
-			err,
-			closeFailure("metastore", meta.Close()),
-			closeFailure("local object store", objects.Close()),
-			anchor.Close(),
-		)
+		return nil, errors.Join(err, cleanupDurableOpen(durableMeta, objects, anchor))
+	}
+	if hooks.afterNamespace != nil {
+		if err := hooks.afterNamespace(namespace, durableMeta); err != nil {
+			return nil, errors.Join(err, cleanupNamespaceOpen(namespace, durableMeta, objects, anchor))
+		}
 	}
 	if !complete {
 		if err := anchor.PublishCompletion(storeID, config.Workspace); err != nil {
-			return nil, errors.Join(err, closeFailure("namespace", namespace.Close()), anchor.Close())
+			return nil, errors.Join(err, cleanupNamespaceOpen(namespace, durableMeta, objects, anchor))
 		}
 	}
 	if err := anchor.RemoveInitializationIntent(); err != nil {
-		return nil, errors.Join(err, closeFailure("namespace", namespace.Close()), anchor.Close())
+		return nil, errors.Join(err, cleanupNamespaceOpen(namespace, durableMeta, objects, anchor))
 	}
 	if err := verifyAnchoredRoot(objects, anchor); err != nil {
-		return nil, errors.Join(err, closeFailure("namespace", namespace.Close()), anchor.Close())
-	}
-	if err := anchor.Close(); err != nil {
-		return nil, errors.Join(err, closeFailure("namespace", namespace.Close()))
+		return nil, errors.Join(err, cleanupNamespaceOpen(namespace, durableMeta, objects, anchor))
 	}
 	return &Store{
-		namespace: namespace, meta: meta, objects: objects,
+		namespace: namespace, meta: meta, durable: durableMeta, objects: objects, anchor: anchor,
 		workspace: config.Workspace, objectLimits: sqliteOptions.ObjectLimits,
 		maxReaderConnections:         sqliteOptions.MaxReaderConnections,
 		maxSnapshotReaderConnections: sqliteOptions.MaxSnapshotReaderConnections,
 		maxIntegrityRecords:          sqliteOptions.MaxIntegrityRecords,
+		maxIntegrityBytes:            sqliteOptions.MaxIntegrityBytes,
 	}, nil
 }
 
@@ -257,6 +354,7 @@ func (config Config) sqliteOptions() (sqlite.Options, error) {
 		MaxReaderConnections:         config.MaxReaderConnections,
 		MaxSnapshotReaderConnections: config.MaxSnapshotReaderConnections,
 		MaxIntegrityRecords:          config.MaxIntegrityRecords,
+		MaxIntegrityBytes:            config.MaxIntegrityBytes,
 	}).Effective()
 }
 
@@ -321,40 +419,126 @@ func validate(config Config) (string, error) {
 	return root, nil
 }
 
-func requireBoundDatabase(ctx context.Context, path, storeID, workspace string) error {
+func requireBoundDatabase(ctx context.Context, path, storeID, workspace string) (returned error) {
 	database, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
 	if err != nil {
 		return fmt.Errorf("open the existing local store binding: %v: %w", err, syscall.EIO)
 	}
+	defer func() {
+		if err := database.Close(); err != nil {
+			returned = errors.Join(returned,
+				fmt.Errorf("close the existing local store binding: %v: %w", err, syscall.EIO))
+		}
+	}()
+	tx, err := database.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("begin the existing local store binding probe: %v: %w", err, syscall.EIO)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT typeof(singleton),
+		       CASE WHEN typeof(singleton) = 'integer' THEN singleton ELSE 0 END,
+		       typeof(store_id), length(CAST(store_id AS BLOB))
+		FROM backing_store
+		LIMIT 2`)
+	if err != nil {
+		return fmt.Errorf("read the existing local store binding metadata: %v: %w", err, syscall.EIO)
+	}
+	type bindingMetadata struct {
+		singletonClass string
+		singleton      int64
+		storeClass     string
+		storeBytes     int64
+	}
+	var bindings []bindingMetadata
+	for rows.Next() {
+		var binding bindingMetadata
+		if err := rows.Scan(&binding.singletonClass, &binding.singleton, &binding.storeClass, &binding.storeBytes); err != nil {
+			rows.Close()
+			return fmt.Errorf("decode the existing local store binding metadata: %v: %w", err, syscall.EIO)
+		}
+		bindings = append(bindings, binding)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return fmt.Errorf("finish the existing local store binding metadata: %v: %w", err, syscall.EIO)
+	}
+	if len(bindings) != 1 || bindings[0].singletonClass != "integer" || bindings[0].singleton != 1 ||
+		bindings[0].storeClass != "text" || bindings[0].storeBytes != int64(len(storeID)) {
+		return fmt.Errorf("the local store binding metadata is not the expected bounded singleton: %w", syscall.EIO)
+	}
 	var bound string
-	queryErr := database.QueryRowContext(ctx,
-		`SELECT store_id FROM backing_store WHERE singleton = 1`).Scan(&bound)
-	if queryErr != nil {
-		closeErr := database.Close()
-		return fmt.Errorf("read the existing local store binding: %v: %w",
-			errors.Join(queryErr, closeErr), syscall.EIO)
+	if err := tx.QueryRowContext(ctx, `SELECT store_id FROM backing_store WHERE singleton = 1`).Scan(&bound); err != nil {
+		return fmt.Errorf("read the existing local store binding: %v: %w", err, syscall.EIO)
 	}
 	if bound != storeID {
-		return errors.Join(
-			fmt.Errorf("the metadata is bound to object store %q, not %q: %w",
-				bound, storeID, syscall.EINVAL),
-			closeFailure("binding probe", database.Close()),
-		)
+		return fmt.Errorf("the metadata is bound to object store %q, not %q: %w",
+			bound, storeID, syscall.EINVAL)
 	}
-	var namespaces, matching int
-	queryErr = database.QueryRowContext(ctx, `
-		SELECT count(*), count(CASE WHEN name = ? THEN 1 END)
-		FROM namespaces`, workspace).Scan(&namespaces, &matching)
-	closeErr := database.Close()
-	if queryErr != nil || closeErr != nil {
-		return fmt.Errorf("read the existing local store workspace: %v: %w",
-			errors.Join(queryErr, closeErr), syscall.EIO)
+
+	rows, err = tx.QueryContext(ctx, `
+		SELECT typeof(id),
+		       CASE WHEN typeof(id) = 'integer' THEN id ELSE 0 END,
+		       typeof(name), length(CAST(name AS BLOB))
+		FROM namespaces
+		LIMIT 2`)
+	if err != nil {
+		return fmt.Errorf("read the existing local store workspace metadata: %v: %w", err, syscall.EIO)
 	}
-	if namespaces != 1 || matching != 1 {
-		return fmt.Errorf("the local store database holds %d workspaces, of which %d match %q: %w",
-			namespaces, matching, workspace, syscall.EIO)
+	type workspaceMetadata struct {
+		idClass   string
+		id        int64
+		nameClass string
+		nameBytes int64
+	}
+	var workspaces []workspaceMetadata
+	for rows.Next() {
+		var candidate workspaceMetadata
+		if err := rows.Scan(&candidate.idClass, &candidate.id, &candidate.nameClass, &candidate.nameBytes); err != nil {
+			rows.Close()
+			return fmt.Errorf("decode the existing local store workspace metadata: %v: %w", err, syscall.EIO)
+		}
+		workspaces = append(workspaces, candidate)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return fmt.Errorf("finish the existing local store workspace metadata: %v: %w", err, syscall.EIO)
+	}
+	if len(workspaces) != 1 || workspaces[0].idClass != "integer" || workspaces[0].id < 1 ||
+		workspaces[0].nameClass != "text" || workspaces[0].nameBytes < 1 ||
+		workspaces[0].nameBytes > MaxWorkspaceBytes || workspaces[0].nameBytes != int64(len(workspace)) {
+		return fmt.Errorf("the local store database does not hold exactly workspace %q: %w",
+			workspace, syscall.EIO)
+	}
+	var name string
+	if err := tx.QueryRowContext(ctx, `SELECT name FROM namespaces WHERE id = ?`, workspaces[0].id).Scan(&name); err != nil {
+		return fmt.Errorf("read the existing local store workspace: %v: %w", err, syscall.EIO)
+	}
+	if name != workspace {
+		return fmt.Errorf("the local store database binds workspace %q, not %q: %w",
+			name, workspace, syscall.EIO)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("finish the existing local store binding probe: %v: %w", err, syscall.EIO)
 	}
 	return nil
+}
+
+func schemaLessMetastore(ctx context.Context, path string) (bool, error) {
+	database, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	if err != nil {
+		return false, fmt.Errorf("open the interrupted SQLite bootstrap: %v: %w", err, syscall.EIO)
+	}
+	var present int
+	queryErr := database.QueryRowContext(ctx, `SELECT 1 FROM sqlite_schema LIMIT 1`).Scan(&present)
+	closeErr := database.Close()
+	if errors.Is(queryErr, sql.ErrNoRows) && closeErr == nil {
+		return true, nil
+	}
+	if queryErr != nil || closeErr != nil {
+		return false, fmt.Errorf("inspect the interrupted SQLite bootstrap: %v: %w",
+			errors.Join(queryErr, closeErr), syscall.EIO)
+	}
+	return false, nil
 }
 
 func closeFailure(what string, err error) error {
@@ -362,6 +546,48 @@ func closeFailure(what string, err error) error {
 		return nil
 	}
 	return fmt.Errorf("closing the %s after open failed: %w", what, err)
+}
+
+func cleanupDurableOpen(
+	durable *durableMetastore,
+	objects *localdisk.Objects,
+	anchor *rootAnchor,
+) error {
+	metaErr := durable.Close()
+	if !durable.terminallyClosed() {
+		// No Store value will escape an Open failure, so a retryable graceful close
+		// has no future caller. Abort closes the unexposed SQLite handles while root
+		// ownership is still held; recovery then judges the retained disk evidence.
+		metaErr = errors.Join(metaErr, durable.abortUnexposed())
+	}
+	if !durable.closedSuccessfully() {
+		return closeFailure("metastore", metaErr)
+	}
+	return errors.Join(
+		closeFailure("metastore", metaErr),
+		closeFailure("local object store", objects.Close()),
+		anchor.Close(),
+	)
+}
+
+func cleanupNamespaceOpen(
+	namespace *objectstore.Storage,
+	durable *durableMetastore,
+	objects *localdisk.Objects,
+	anchor *rootAnchor,
+) error {
+	namespaceErr := namespace.Close()
+	if !durable.terminallyClosed() {
+		namespaceErr = errors.Join(namespaceErr, durable.abortUnexposed())
+	}
+	if !durable.closedSuccessfully() {
+		return closeFailure("namespace", namespaceErr)
+	}
+	return errors.Join(
+		closeFailure("namespace", namespaceErr),
+		closeFailure("local object store", objects.Close()),
+		anchor.Close(),
+	)
 }
 
 func (s *Store) Stat(ctx context.Context, path string) (storage.Attr, error) {
@@ -437,7 +663,50 @@ func (s *Store) MaintenanceStatus() objectstore.MaintenanceStatus {
 
 // Close stops maintenance, closes SQLite before releasing the local-disk lifetime lock,
 // and gives concurrent callers the same result.
-func (s *Store) Close() error { return s.namespace.Close() }
+func (s *Store) Close() error {
+	s.closeMu.Lock()
+	if s.closed {
+		err := s.lastCloseErr
+		s.closeMu.Unlock()
+		return err
+	}
+	if s.closeRunning != nil {
+		attempt := s.closeRunning
+		s.closeMu.Unlock()
+		<-attempt.done
+		return attempt.err
+	}
+	attempt := &closeAttempt{done: make(chan struct{})}
+	s.closeRunning = attempt
+	firstAttempt := !s.namespaceCloseAttempted
+	s.namespaceCloseAttempted = true
+	s.closeMu.Unlock()
+
+	err := error(nil)
+	if firstAttempt {
+		err = s.namespace.Close()
+	} else {
+		err = s.durable.Close()
+	}
+	if !s.durable.closedSuccessfully() {
+		s.closeMu.Lock()
+		s.lastCloseErr = err
+		attempt.err = err
+		s.closeRunning = nil
+		close(attempt.done)
+		s.closeMu.Unlock()
+		return err
+	}
+	err = errors.Join(err, s.objects.Close(), s.anchor.Close())
+	s.closeMu.Lock()
+	s.closed = true
+	s.lastCloseErr = err
+	attempt.err = err
+	s.closeRunning = nil
+	close(attempt.done)
+	s.closeMu.Unlock()
+	return err
+}
 
 // Log returns the durable change log written in the same transaction as namespace edits.
 func (s *Store) Log() metastore.Log { return s.meta }
@@ -453,6 +722,7 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 		space, spaceStatusErr = clampStatusSpace(space, localDisk, localDiskErr)
 	}
 	objects, objectsErr := s.meta.ObjectStatus(ctx)
+	checkpoint := s.durable.status()
 	return Status{
 			Workspace:                    s.workspace,
 			Space:                        space,
@@ -461,13 +731,16 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 			MaxReaderConnections:         s.maxReaderConnections,
 			MaxSnapshotReaderConnections: s.maxSnapshotReaderConnections,
 			MaxIntegrityRecords:          s.maxIntegrityRecords,
+			MaxIntegrityBytes:            s.maxIntegrityBytes,
 			LocalDisk:                    localDisk,
 			Maintenance:                  s.MaintenanceStatus(),
+			Checkpoint:                   checkpoint,
 		}, errors.Join(
 			statusFailure("logical space", spaceErr),
 			statusFailure("combined space", spaceStatusErr),
 			statusFailure("object records", objectsErr),
 			statusFailure("local object store", localDiskErr),
+			statusFailure("SQLite checkpoint", checkpoint.LastError),
 		)
 }
 

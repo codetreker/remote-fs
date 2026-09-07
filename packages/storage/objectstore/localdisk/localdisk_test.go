@@ -597,7 +597,7 @@ func TestGetBoundedRefusesBeforePayloadAdmission(t *testing.T) {
 	if _, err := objects.GetBounded(cancelled, key, int64(len(content))); !errors.Is(err, syscall.EINTR) {
 		t.Fatalf("cancelled GetBounded returned %v, want EINTR", err)
 	}
-	operations, inFlightBytes, _ := objects.gate.snapshot()
+	operations, _, inFlightBytes, _ := objects.gate.snapshot()
 	if operations != 0 || inFlightBytes != 0 {
 		t.Fatalf("refused bounded read retained %d operations and %d bytes", operations, inFlightBytes)
 	}
@@ -664,7 +664,7 @@ func TestOpenRecoversOnlyDurableStagingResidues(t *testing.T) {
 		}
 		key := "interrupted-put"
 		location, _ := locate(key)
-		shardFD, _, err := objects.openShard(location, true)
+		shardFD, _, err := objects.openShard(t.Context(), location, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -836,7 +836,7 @@ func TestFailedStagingDirectorySyncRetainsRecoveryRecord(t *testing.T) {
 	}
 	key := "cleanup-sync-fails"
 	location, _ := locate(key)
-	shardFD, _, err := objects.openShard(location, true)
+	shardFD, _, err := objects.openShard(t.Context(), location, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1405,7 +1405,7 @@ func TestPutRejectsAReplacedShardBeforeObjectMutation(t *testing.T) {
 			objects := openForTest(t, Options{})
 			key := "submount-replacement-" + mismatch
 			location, _ := locate(key)
-			shardFD, _, err := objects.openShard(location, true)
+			shardFD, _, err := objects.openShard(t.Context(), location, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1560,7 +1560,7 @@ func TestRecoveryRejectsRecordsAndStagingFromAnotherFilesystem(t *testing.T) {
 			}
 			key := "mounted-recovery-" + targetName
 			location, _ := locate(key)
-			shardFD, _, err := objects.openShard(location, true)
+			shardFD, _, err := objects.openShard(t.Context(), location, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1645,7 +1645,7 @@ func TestOpenRejectsSameMountForeignObjectsAndShardDirectories(t *testing.T) {
 		key := "same-shard"
 		location, _ := locate(key)
 		for _, objects := range []*Objects{one, two} {
-			fd, _, err := objects.openShard(location, true)
+			fd, _, err := objects.openShard(t.Context(), location, true)
 			if err != nil {
 				t.Fatal(err)
 			}
