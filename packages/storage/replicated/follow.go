@@ -345,7 +345,7 @@ func (s *Storage) expect(ctx context.Context, op, path string) (*confirmation, e
 				s.wakeConfirmationCapacity()
 			}
 			s.mu.Unlock()
-			return nil, confirmationAdmissionError(op, path, fmt.Errorf("the caller stopped waiting: %w", context.Cause(ctx)))
+			return nil, confirmationContextError(op, path, ctx)
 		case <-s.lifetime.Done():
 		}
 	}

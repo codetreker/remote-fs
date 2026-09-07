@@ -417,15 +417,15 @@ func (s *Store) ObjectStatus(ctx context.Context) (ObjectStatus, error) {
 	if err := validateNamespaceIntegrity(
 		ctx, tx, s.namespace, s.maxIntegrityRecords, s.maxIntegrityBytes,
 	); err != nil {
-		primary := fmt.Errorf("validating namespace integrity: %w", failure(err))
-		return ObjectStatus{}, finishReadTransaction("object status transaction", tx, primary)
+		primary := fmt.Errorf("validating namespace integrity: %w", readFailure(ctx, err))
+		return ObjectStatus{}, finishReadTransaction(ctx, "object status transaction", tx, primary)
 	}
 	status, err := readPendingObjectStatus(ctx, tx, s.namespace, s.objectLimits)
 	if err != nil {
-		return ObjectStatus{}, finishReadTransaction("object status transaction", tx, err)
+		return ObjectStatus{}, finishReadTransaction(ctx, "object status transaction", tx, err)
 	}
-	if err := tx.Commit(); err != nil {
-		return ObjectStatus{}, fmt.Errorf("closing the object status snapshot: %w", failure(err))
+	if err := finishReadTransaction(ctx, "object status transaction", tx, nil); err != nil {
+		return ObjectStatus{}, err
 	}
 	return status, nil
 }
@@ -453,7 +453,7 @@ func validateIntegrityWork(
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*) FROM sqlite_schema
 		WHERE type = 'table' AND name IN ('logs', 'changes')`).Scan(&logTables); err != nil {
-		return fmt.Errorf("reading the integrity-work schema: %w", failure(err))
+		return fmt.Errorf("reading the integrity-work schema: %w", readFailure(ctx, err))
 	}
 	if logTables != 0 && logTables != 2 {
 		return fmt.Errorf("the database has %d of the 2 required log tables: %w", logTables, syscall.EIO)
@@ -503,7 +503,7 @@ func validateIntegrityWork(
 		)
 	}
 	if err != nil {
-		return fmt.Errorf("counting namespace integrity work: %w", failure(err))
+		return fmt.Errorf("counting namespace integrity work: %w", readFailure(ctx, err))
 	}
 	if namespaces < 0 || nodes < 0 || objects < 0 || entries < 0 || logs < 0 || changes < 0 {
 		return fmt.Errorf("the database returned a negative namespace integrity count: %w", syscall.EIO)
@@ -971,7 +971,7 @@ func readPendingObjectStatus(
 		&invalidSize,
 	)
 	if err != nil {
-		return ObjectStatus{}, fmt.Errorf("reading object maintenance status: %w", failure(err))
+		return ObjectStatus{}, fmt.Errorf("reading object maintenance status: %w", readFailure(ctx, err))
 	}
 	if invalidSize != 0 {
 		return ObjectStatus{}, fmt.Errorf("the database holds %d pending objects with an invalid size: %w",
@@ -1519,7 +1519,7 @@ func (s *Store) Garbage(ctx context.Context, limit int) ([]metastore.Key, error)
 	defer s.coordinator.endHealthyRead()
 	rows, err := s.read.QueryContext(ctx, garbageQuery, s.namespace, stateGarbage, limit)
 	if err != nil {
-		return nil, fmt.Errorf("collecting objects nothing references: %w", failure(err))
+		return nil, fmt.Errorf("collecting objects nothing references: %w", readFailure(ctx, err))
 	}
 	defer rows.Close()
 
@@ -1527,12 +1527,12 @@ func (s *Store) Garbage(ctx context.Context, limit int) ([]metastore.Key, error)
 	for rows.Next() {
 		var key string
 		if err := rows.Scan(&key); err != nil {
-			return nil, fmt.Errorf("reading an object eligible for collection: %w", failure(err))
+			return nil, fmt.Errorf("reading an object eligible for collection: %w", readFailure(ctx, err))
 		}
 		keys = append(keys, metastore.Key(key))
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("reading objects eligible for collection: %w", failure(err))
+		return nil, fmt.Errorf("reading objects eligible for collection: %w", readFailure(ctx, err))
 	}
 	return keys, nil
 }

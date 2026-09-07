@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
@@ -25,6 +26,9 @@ type namespace struct {
 
 	// maxFileSize is Options.MaxFileSize, already resolved: never zero, never negative.
 	maxFileSize int64
+
+	// flushTimeout is the resolved, positive completion budget for a closing handle.
+	flushTimeout time.Duration
 
 	// room is what this mount last heard about the space left in the namespace. It is
 	// shared by every handle, because it describes the namespace rather than any one file.
@@ -80,17 +84,20 @@ func (n *node) forget(h *handle) {
 // commitOpen writes back everything held for this node that the namespace does not have
 // yet. Two handles holding different contents commit in no particular order, which is the
 // order two descriptors closing would commit in as well.
-func (n *node) commitOpen(ctx context.Context) syscall.Errno {
+func (n *node) commitOpen(ctx context.Context) (bool, error) {
 	n.mu.Lock()
 	open := slices.Collect(maps.Keys(n.open))
 	n.mu.Unlock()
 
+	changed := false
 	for _, h := range open {
-		if errno := h.Flush(ctx); errno != 0 {
-			return errno
+		committed, err := h.flush(ctx)
+		changed = changed || committed
+		if err != nil {
+			return changed, err
 		}
 	}
-	return 0
+	return changed, nil
 }
 
 var (
@@ -136,9 +143,13 @@ func (n *node) Lookup(ctx context.Context, name string, out *gofuse.EntryOut) (*
 }
 
 func (n *node) Getattr(ctx context.Context, f fs.FileHandle, out *gofuse.AttrOut) syscall.Errno {
+	return errnoOf(n.getattr(ctx, f, out))
+}
+
+func (n *node) getattr(ctx context.Context, f fs.FileHandle, out *gofuse.AttrOut) error {
 	attr, err := n.ns.storage.Stat(ctx, n.path())
 	if err != nil {
-		return errnoOf(err)
+		return err
 	}
 	if errno := n.ns.fillAttr(&out.Attr, attr); errno != 0 {
 		return errno
@@ -149,42 +160,51 @@ func (n *node) Getattr(ctx context.Context, f fs.FileHandle, out *gofuse.AttrOut
 	if h, ok := f.(*handle); ok {
 		h.describe(&out.Attr, attr.ID)
 	}
-	return 0
+	return nil
 }
 
 // Setattr carries out the changes the namespace can hold, and refuses the rest rather than
 // accepting them and doing nothing.
 func (n *node) Setattr(ctx context.Context, f fs.FileHandle, in *gofuse.SetAttrIn, out *gofuse.AttrOut) syscall.Errno {
+	return errnoOf(n.setattr(ctx, f, in, out))
+}
+
+func (n *node) setattr(ctx context.Context, f fs.FileHandle, in *gofuse.SetAttrIn, out *gofuse.AttrOut) error {
 	change, errno := n.ns.requestedChange(in)
 	if errno != 0 {
 		return errno
 	}
-
-	// Size first. A request carrying both is asking for a file of that length dated that
-	// instant, and a write stamps the namespace's own time on what it writes, so a time
-	// applied before it would be overwritten by it.
-	if in.Valid&gofuse.FATTR_SIZE != 0 {
-		if errno := n.resize(ctx, f, int64(in.Size)); errno != 0 {
-			return errno
-		}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
+	changed := false
+	// Writes set the modification time, so a requested time must follow the resized
+	// contents and all pending handle commits.
+	if in.Valid&gofuse.FATTR_SIZE != 0 {
+		if err := n.resize(ctx, f, int64(in.Size)); err != nil {
+			return err
+		}
+		changed = true
+	}
 	if !change.Empty() {
-		// A time is being set on contents this process is still holding, so those contents
-		// have to reach the namespace first: the write that commits them stamps the
-		// namespace's own modification time on what it writes, and it would otherwise land
-		// after the time being asked for here. A mode needs no such care, because replacing
-		// a file's contents keeps the mode it already had.
 		if change.AccessTime != nil || change.ModTime != nil {
-			if errno := n.commitOpen(ctx); errno != 0 {
-				return errno
+			committed, err := n.commitOpen(ctx)
+			changed = changed || committed
+			if err != nil {
+				return afterMutation(changed, err)
 			}
 		}
-		if err := n.ns.storage.SetAttr(ctx, n.path(), change); err != nil {
-			return errnoOf(err)
+		if err := ctx.Err(); err != nil {
+			return afterMutation(changed, err)
 		}
+		if err := n.ns.storage.SetAttr(ctx, n.path(), change); err != nil {
+			// Storage.SetAttr can apply only part of a change before failing.
+			return afterMutation(true, err)
+		}
+		changed = true
 	}
-	return n.Getattr(ctx, f, out)
+	return afterMutation(changed, n.getattr(ctx, f, out))
 }
 
 // requestedChange picks out the attribute changes the namespace can hold, and refuses a
@@ -244,7 +264,7 @@ func (ns *namespace) requestedChange(in *gofuse.SetAttrIn) (storage.AttrChange, 
 // resize applies a new length. An open handle already holds the contents, so the change
 // belongs in that buffer and is committed with the rest of it; without one there is
 // nothing to defer to and the change is written straight through.
-func (n *node) resize(ctx context.Context, f fs.FileHandle, size int64) syscall.Errno {
+func (n *node) resize(ctx context.Context, f fs.FileHandle, size int64) error {
 	if h, ok := f.(*handle); ok {
 		return h.resize(ctx, size)
 	}
@@ -257,7 +277,7 @@ func (n *node) resize(ctx context.Context, f fs.FileHandle, size int64) syscall.
 	// means a file too large to hold can still be emptied, which is the one thing that
 	// can be done to it without holding it.
 	if size == 0 {
-		return errnoOf(n.ns.storage.Write(ctx, n.path(), nil))
+		return n.ns.storage.Write(ctx, n.path(), nil)
 	}
 
 	// Every other length keeps a prefix of what is there, so what is there has to be
@@ -267,7 +287,7 @@ func (n *node) resize(ctx context.Context, f fs.FileHandle, size int64) syscall.
 	// contract does not have.
 	attr, err := n.ns.storage.Stat(ctx, n.path())
 	if err != nil {
-		return errnoOf(err)
+		return err
 	}
 	if !n.ns.holds(attr.Size) {
 		return syscall.EFBIG
@@ -275,9 +295,9 @@ func (n *node) resize(ctx context.Context, f fs.FileHandle, size int64) syscall.
 
 	body, err := n.ns.storage.Read(ctx, n.path())
 	if err != nil {
-		return errnoOf(err)
+		return err
 	}
-	return errnoOf(n.ns.storage.Write(ctx, n.path(), resized(body, size)))
+	return n.ns.storage.Write(ctx, n.path(), resized(body, size))
 }
 
 func (n *node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
@@ -346,12 +366,12 @@ func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	if err := n.ns.storage.Create(ctx, path); err != nil {
 		return nil, nil, 0, errnoOf(err)
 	}
-	if errno := n.ns.wearMode(ctx, path, mode); errno != 0 {
-		return nil, nil, 0, errno
+	if err := n.ns.wearMode(ctx, path, mode); err != nil {
+		return nil, nil, 0, errnoOf(afterMutation(true, err))
 	}
 	attr, err := n.ns.storage.Stat(ctx, path)
 	if err != nil {
-		return nil, nil, 0, errnoOf(err)
+		return nil, nil, 0, errnoOf(afterMutation(true, err))
 	}
 	if errno := n.ns.fillAttr(&out.Attr, attr); errno != 0 {
 		return nil, nil, 0, errno
@@ -367,12 +387,12 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *gofuse.
 	if err := n.ns.storage.Mkdir(ctx, path); err != nil {
 		return nil, errnoOf(err)
 	}
-	if errno := n.ns.wearMode(ctx, path, mode); errno != 0 {
-		return nil, errno
+	if err := n.ns.wearMode(ctx, path, mode); err != nil {
+		return nil, errnoOf(afterMutation(true, err))
 	}
 	attr, err := n.ns.storage.Stat(ctx, path)
 	if err != nil {
-		return nil, errnoOf(err)
+		return nil, errnoOf(afterMutation(true, err))
 	}
 	if errno := n.ns.fillAttr(&out.Attr, attr); errno != 0 {
 		return nil, errno
@@ -391,9 +411,9 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *gofuse.
 // The cost is a third call on every creation, and a moment in which the node is there
 // under the wrong permissions. Both go away together, when the namespace grows a way to
 // make a node with its attributes in one call.
-func (ns *namespace) wearMode(ctx context.Context, path string, mode uint32) syscall.Errno {
+func (ns *namespace) wearMode(ctx context.Context, path string, mode uint32) error {
 	requested := namespaceMode(mode)
-	return errnoOf(ns.storage.SetAttr(ctx, path, storage.AttrChange{Mode: &requested}))
+	return ns.storage.SetAttr(ctx, path, storage.AttrChange{Mode: &requested})
 }
 
 func (n *node) Unlink(ctx context.Context, name string) syscall.Errno {

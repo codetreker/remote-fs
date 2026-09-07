@@ -483,13 +483,13 @@ func TestAServerThatHangs(t *testing.T) {
 	exerciseAll(t, ctx, s)
 }
 
-func TestAContextThatIsAlreadyCancelled(t *testing.T) {
+func TestAContextWhoseDeadlineAlreadyPassed(t *testing.T) {
 	s := dialHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("the server was reached although the caller had already given up")
 	}))
 
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
 	exerciseAll(t, ctx, s)
 }
 

@@ -32,7 +32,6 @@
 package fuse
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -55,6 +54,9 @@ import (
 // gibibyte is far above the source files and documents a shared workspace holds, and low
 // enough that a mount cannot be talked into exhausting an ordinary machine.
 const DefaultMaxFileSize = 1 << 30
+
+// DefaultFlushTimeout bounds the close commit attempt when Options.FlushTimeout is zero.
+const DefaultFlushTimeout = 30 * time.Second
 
 // Options configure a mount.
 type Options struct {
@@ -81,6 +83,23 @@ type Options struct {
 	// a caller who needs a larger one names it, which is a decision, where an omission
 	// would be an oversight.
 	MaxFileSize int64
+
+	// FlushTimeout bounds the storage context for one close commit attempt. Request
+	// cancellation does not cancel that attempt; an earlier request deadline still
+	// applies. Waiting for the handle lock consumes this budget but cannot itself be
+	// interrupted, and this option does not bound Mount.Wait or Mount.Unmount.
+	// Zero means DefaultFlushTimeout; negative values are invalid.
+	FlushTimeout time.Duration
+}
+
+func (o Options) flushTimeout() (time.Duration, error) {
+	if o.FlushTimeout < 0 {
+		return 0, fmt.Errorf("fuse: FlushTimeout is %s; a close commit timeout cannot be negative", o.FlushTimeout)
+	}
+	if o.FlushTimeout == 0 {
+		return DefaultFlushTimeout, nil
+	}
+	return o.FlushTimeout, nil
 }
 
 // Mount is one namespace presented at one mountpoint.
@@ -109,6 +128,10 @@ func New(mountpoint string, s storage.Storage, opts Options) (*Mount, error) {
 	if maxFileSize == 0 {
 		maxFileSize = DefaultMaxFileSize
 	}
+	flushTimeout, err := opts.flushTimeout()
+	if err != nil {
+		return nil, err
+	}
 
 	logger := opts.Logger
 	if logger == nil {
@@ -117,9 +140,10 @@ func New(mountpoint string, s storage.Storage, opts Options) (*Mount, error) {
 
 	root := &node{
 		ns: &namespace{
-			storage:     s,
-			owner:       gofuse.Owner{Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid())},
-			maxFileSize: maxFileSize,
+			storage:      s,
+			owner:        gofuse.Owner{Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid())},
+			maxFileSize:  maxFileSize,
+			flushTimeout: flushTimeout,
 		},
 		id: rootIdentity(),
 	}
@@ -176,21 +200,5 @@ func (m *Mount) Unmount() error { return m.server.Unmount() }
 // or because the kernel tore the connection down.
 func (m *Mount) Wait() { m.server.Wait() }
 
-// errnoOf extracts the errno a storage error carries. Storage errors are syscall.Errno
-// values reachable with errors.As even when an implementation wraps them, so the errno
-// the kernel is given is the one the storage produced.
-//
-// Anything with no errno in it becomes EIO, never ENOENT and never an empty answer: a
-// filesystem that reports "no such file" when the truth is "I could not reach the
-// namespace" makes whatever runs on top regenerate, propagate deletions, or overwrite,
-// and none of that is recoverable (R-ERR-1, R-ERR-2).
-func errnoOf(err error) syscall.Errno {
-	if err == nil {
-		return 0
-	}
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
-		return errno
-	}
-	return syscall.EIO
-}
+// errnoOf converts once at a FUSE callback boundary; internal operations retain their causes.
+func errnoOf(err error) syscall.Errno { return storage.ErrnoOf(err) }

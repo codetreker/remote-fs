@@ -30,11 +30,13 @@ import (
 // whose root has been removed answers syscall.ENOENT to everything afterwards, which
 // reads as "that file is not there" when the truth is that the namespace is not there.
 //
-// Errors are syscall.Errno values, reachable with errors.Is even when an implementation
-// wraps them. A mount can therefore hand them to the kernel unchanged, and no
-// implementation has to translate between two error vocabularies. Which errnos may be
-// reported is itself part of the contract: Errnos enumerates them, and an errno outside
-// that set cannot be named to anyone.
+// Named failures use syscall.Errno values, reachable with errors.Is through wrappers.
+// An honored request cancellation may retain context.Canceled; callers use ErrnoOf to
+// obtain the operation's result. Pure cancellation is EINTR; deadlines and unknown
+// failures are EIO. A mutation whose effects cannot be determined must retain EIO even
+// when its diagnostic causes include cancellation. Classification() error can identify
+// that result for an error's subtree; independent joined failures still count.
+// Errnos enumerates the closed vocabulary, and ErrnoOf maps values outside it to EIO.
 //
 // Times cross this interface as time.Time and are neither rounded nor clamped on the way.
 // What a namespace can keep is its own: one held in a directory keeps what that directory's

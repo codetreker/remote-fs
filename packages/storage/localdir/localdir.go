@@ -306,7 +306,7 @@ func (r *contextReader) Read(p []byte) (int, error) {
 
 func localContextError(ctx context.Context, op, path string) error {
 	if err := ctx.Err(); err != nil {
-		return &os.PathError{Op: op, Path: path, Err: syscall.EINTR}
+		return &os.PathError{Op: op, Path: path, Err: err}
 	}
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
@@ -49,9 +50,10 @@ func TestCancelledAndClosingConfirmationWaitersLeaveNoState(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		end  func(*Storage, context.CancelFunc)
+		want syscall.Errno
 	}{
-		{name: "cancelled", end: func(_ *Storage, cancel context.CancelFunc) { cancel() }},
-		{name: "closing", end: func(s *Storage, _ context.CancelFunc) {
+		{name: "cancelled", want: syscall.EINTR, end: func(_ *Storage, cancel context.CancelFunc) { cancel() }},
+		{name: "closing", want: syscall.EAGAIN, end: func(s *Storage, _ context.CancelFunc) {
 			s.mu.Lock()
 			s.closing = true
 			s.wakeConfirmationCapacity()
@@ -68,6 +70,7 @@ func TestCancelledAndClosingConfirmationWaitersLeaveNoState(t *testing.T) {
 				t.Fatal(err)
 			}
 			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
 			done := make(chan error, 1)
 			go func() {
 				_, err := s.expect(ctx, "create", "waiting")
@@ -75,8 +78,10 @@ func TestCancelledAndClosingConfirmationWaitersLeaveNoState(t *testing.T) {
 			}()
 			waitForConfirmationWaiters(t, s, 1)
 			c.end(s, cancel)
-			if err := <-done; !errors.Is(err, syscall.EAGAIN) {
-				t.Fatalf("waiter returned %v", err)
+			if err := <-done; !errors.Is(err, c.want) || storage.ErrnoOf(err) != c.want {
+				t.Fatalf("waiter returned %v, want %v", err, c.want)
+			} else if c.want == syscall.EINTR && !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancelled waiter lost its cause: %v", err)
 			}
 			s.forget(active)
 			s.mu.Lock()

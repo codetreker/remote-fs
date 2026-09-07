@@ -104,8 +104,8 @@ func (h *handle) Write(ctx context.Context, data []byte, off int64) (uint32, sys
 	}
 
 	end := off + int64(len(data))
-	if errno := h.weigh(ctx, max(end, int64(len(h.contents)))); errno != 0 {
-		return 0, errno
+	if err := h.weigh(ctx, max(end, int64(len(h.contents)))); err != nil {
+		return 0, errnoOf(err)
 	}
 
 	if end > int64(len(h.contents)) {
@@ -117,20 +117,20 @@ func (h *handle) Write(ctx context.Context, data []byte, off int64) (uint32, sys
 	return uint32(len(data)), 0
 }
 
-func (h *handle) resize(ctx context.Context, size int64) syscall.Errno {
+func (h *handle) resize(ctx context.Context, size int64) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	if !h.node.ns.holds(size) {
 		return syscall.EFBIG
 	}
-	if errno := h.weigh(ctx, size); errno != 0 {
-		return errno
+	if err := h.weigh(ctx, size); err != nil {
+		return err
 	}
 	h.contents = resized(h.contents, size)
 	h.dirty = true
 	h.changed = time.Now()
-	return 0
+	return nil
 }
 
 // weigh answers whether the buffer may take on a given length, against the room the
@@ -151,34 +151,37 @@ func (h *handle) resize(ctx context.Context, size int64) syscall.Errno {
 // The figure may be as old as roomWindow, so a change that no longer fits can still be
 // accepted here; the commit refuses it and remains the authority. This is what carries that
 // answer back to the program that caused it, at the call that caused it.
-func (h *handle) weigh(ctx context.Context, length int64) syscall.Errno {
+func (h *handle) weigh(ctx context.Context, length int64) error {
 	grown := length - h.stored
 	if grown <= 0 {
-		return 0
+		return nil
 	}
-	if avail, measured := h.node.ns.room.remaining(ctx, h.node.ns.storage); measured && grown > avail {
+	avail, measured, err := h.node.ns.room.remaining(ctx, h.node.ns.storage)
+	if err != nil {
+		return err
+	}
+	if measured && grown > avail {
 		return syscall.EDQUOT
 	}
-	return 0
+	return nil
 }
 
-// Flush commits. The kernel sends it for every close, which is the last moment a failure
-// can still be reported to whoever caused it; Release, which comes afterwards, has
-// nowhere to report anything.
+// Flush commits under the completion budget independently of request cancellation.
+// The kernel sends it for every close, which is the last moment a failure can still be
+// reported; Release, which comes afterwards, has nowhere to report anything.
 func (h *handle) Flush(ctx context.Context) syscall.Errno {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	return h.commit(ctx)
+	return errnoOf(h.flushForClose(ctx))
 }
 
-// Fsync commits as well. Asking for durability and being told it was achieved, while the
-// contents sat in this process's memory, would be exactly the false report this
-// filesystem exists to avoid.
+// Fsync commits under the requesting caller's context.
 func (h *handle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
+	_, err := h.flush(ctx)
+	return errnoOf(err)
+}
+
+func (h *handle) flush(ctx context.Context) (bool, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-
 	return h.commit(ctx)
 }
 
@@ -192,18 +195,18 @@ func (h *handle) Release(ctx context.Context) syscall.Errno {
 	return 0
 }
 
-func (h *handle) commit(ctx context.Context) syscall.Errno {
+func (h *handle) commit(ctx context.Context) (bool, error) {
 	if !h.dirty {
-		return 0
+		return false, nil
 	}
 	// The path is read now rather than remembered from the open, because the file may
 	// have been renamed since, and the contents belong to the file rather than the name.
 	if err := h.node.ns.storage.Write(ctx, h.node.path(), h.contents); err != nil {
-		return errnoOf(err)
+		return false, err
 	}
 	h.dirty = false
 	h.stored = int64(len(h.contents))
-	return 0
+	return true, nil
 }
 
 // describe overrides what the namespace reports with what this handle holds, where the two

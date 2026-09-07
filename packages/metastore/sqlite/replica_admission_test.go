@@ -198,7 +198,8 @@ func TestReplicaReadersCancelBehindSeeding(t *testing.T) {
 				t.Fatal("reader canceled at the phase gate retained its SQL permit")
 			}
 			var pathErr *fs.PathError
-			if !errors.Is(err, context.Canceled) || !errors.Is(err, syscall.EIO) || !errors.As(err, &pathErr) {
+			if !errors.Is(err, context.Canceled) || storage.ErrnoOf(err) != syscall.EINTR ||
+				errors.Is(err, syscall.EIO) || !errors.As(err, &pathErr) {
 				t.Fatalf("canceled read lost its path/error chain: %v", err)
 			}
 			wantOp, wantPath := "list", ""

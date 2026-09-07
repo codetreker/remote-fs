@@ -88,11 +88,11 @@ fuseblk 挂的是真的块设备，major 不是 0，那个号也就不是连接�
 - **真漏了的时候，证据在 `TestMain` 看到之前已经被削掉一部分。** `t.TempDir` 自己注册的清理会对挂载点做 `RemoveAll`：`rmdir` 失败之后它会打开目录、穿过那个还挂着的挂载点把里面的东西逐个删掉，也就是把被服务的命名空间删空，然后才报错。用例因此在 `TestMain` 之前就已经红了，但报告读起来是两件事而不是一件。跟进项，见下。
 - **`packages/fuse` 那三处挂载仍然没有 `t.Cleanup`**，与 `docs/testing.md` 的「每一个挂载都在 `t.Cleanup` 里拆掉」不符。现在有 sweep 兜着，所以它们漏了会红；把它们改成走 `t.Cleanup` 是另一次改动。
 
-**这次没有买到的：** 它一点也没有让挂载更不容易泄漏 —— 它只让「报出来的泄漏是真的」。这一层另一个红（刚挂好的挂载点上一次操作答 EIO，本机 `-race` 下约 10%，CI 历史 13 次里 1 次）与这次无关，也没有被这次碰到。
+**这次没有买到的：** 它一点也没有让挂载更不容易泄漏 —— 它只让「报出来的泄漏是真的」。这一层另一个红（刚挂好的挂载点上一次操作答 EIO，本机 `-race` 下约 10%，CI 历史 13 次里 1 次）与这次无关，也没有被这次碰到。该错误的后续处理见[请求中断](../bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)。
 
 **跟进项：**
 
 - 让挂载点不再由 `t.TempDir()` 交出，从而不再被 `RemoveAll` 穿过去；这是上面那条证据被削的根。
 - `packages/fuse` 那三处挂载改成走 `t.Cleanup`。
 - `Makefile` 的 `test` 目标没有 `-count=1`：测试缓存不认 `/dev/fuse` 的有无，一个在有 FUSE 的机器上记下的绿会在没有 FUSE 的机器上原样重放。
-- 那个 EIO 的红：`cmd/quota_test.go` 丢掉了持有挂载二进制 stderr 的 `*process`，在把它留住之前这个失败无从诊断。
+- 当时 EIO 故障的诊断障碍是 `cmd/quota_test.go` 丢掉了持有挂载二进制 stderr 的 `*process`；[请求中断](../bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)保留后续证据与错误分类决定。

@@ -115,6 +115,8 @@ SQLite writer 使用 WAL、单 writer connection、`BEGIN IMMEDIATE`、`synchron
 
 普通读取先在 database health 的共享门内启动只读 transaction，并用对 `database_state` 的第一条常量查询钉住 SQLite snapshot；随后释放 health 门，再执行路径扫描、page production 与 caller-owned result accounting。这样读取要么在未决 commit 之前取得完整旧 snapshot，要么等 witness publication 完成后取得新 snapshot；长扫描和调用方预算回调不会继续阻挡 mutation 的 commit/Accept 边界。
 
+只读 transaction 使用其拥有的 context 解释查询与回滚结果。纯取消保留原因并返回 `EINTR`；该 context 已取消时，直接的 `sql.ErrTxDone` 可表示 `database/sql` 已自动回滚，包括回调成功后才发生的取消。SQLite `SQLITE_INTERRUPT` 只在读取 context 确已取消时映射为取消；deadline、真实查询或独立 cleanup 故障仍是错误。未知 commit 与 poison 拥有 `EIO` 分类，不因保留的 context 原因改成 `EINTR`。该规则也用于 client 的 SQLite replica，取舍见[请求中断](../../../.agents/notes/implemented/bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)。
+
 `METASTORE` 是 SQLite WAL 之外的确认边界。它记录完整的已接受状态 A：数据库 identity、generation、node high-water 与 change high-water，并另记已经完整进入主数据库的 checkpoint generation C，始终满足 `0 <= C <= A.generation`。每次 durable open 或 mutation 先提交 SQLite，再用 `.METASTORE.stage` 写入并同步下一份 A，以 rename 原子替换 `METASTORE`，最后同步 root；见证发布完成后调用才可返回成功。stage 不是确认记录，重开时只把 final name 当作 A；确认发布失败会 poison SQLite，后续读、写与 checkpoint 均以 `EIO` 拒绝。
 
 rename 本身失败时，publisher 删除未接受的 stage 并同步 root；清理失败则保留错误与现场。`Checkpoint` publication 失败不会 poison accepted state，清理成功后后台 worker 或关闭可以重试；这也包括 rename 已发生、最终 root barrier 失败的 checkpoint 尝试。`Accept` publication 的任何失败都会 poison 当前 SQLite，因为已提交状态没有完成 acknowledgment；rename 已发生而 root barrier 失败时，重开再以 final witness、WAL 与 visible state 对账。

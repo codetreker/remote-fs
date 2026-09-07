@@ -1,10 +1,13 @@
 package sqlite
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func TestUncertainCommitErrorPreservesItsCauseAndClassification(t *testing.T) {
@@ -18,6 +21,25 @@ func TestUncertainCommitErrorPreservesItsCauseAndClassification(t *testing.T) {
 	}
 	if !isUncertainCommit(errors.Join(errors.New("open failed"), err)) {
 		t.Fatal("a joined uncertain commit was not classified as uncertain")
+	}
+}
+
+func TestCanceledCommitAndPoisonRemainDurabilityFailures(t *testing.T) {
+	uncertain := &uncertainCommitError{err: context.Canceled}
+	coordinator := new(databaseCoordinator)
+	coordinator.poisonWith(uncertain)
+	for _, err := range []error{uncertain, coordinator.healthy()} {
+		if storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, context.Canceled) {
+			t.Fatalf("uncertain durability = %v (%v), want EIO retaining cancellation", err, storage.ErrnoOf(err))
+		}
+		for _, joined := range []error{
+			errors.Join(err, context.Canceled),
+			errors.Join(context.Canceled, err),
+		} {
+			if storage.ErrnoOf(joined) != syscall.EIO {
+				t.Fatalf("joined cancellation displaced durability failure: %v", joined)
+			}
+		}
 	}
 }
 

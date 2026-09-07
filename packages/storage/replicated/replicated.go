@@ -371,7 +371,7 @@ func (s *Storage) change(ctx context.Context, op, path string, send func(context
 	defer s.forget(confirmation)
 
 	if err := ctx.Err(); err != nil {
-		return confirmationAdmissionError(op, path, fmt.Errorf("the caller stopped waiting before the mutation was sent: %w", err))
+		return confirmationContextError(op, path, ctx)
 	}
 	s.mu.Lock()
 	closing := s.closing
@@ -400,5 +400,27 @@ func (s *Storage) change(ctx context.Context, op, path string, send func(context
 }
 
 func confirmationAdmissionError(op, path string, cause error) error {
-	return &os.PathError{Op: op, Path: path, Err: fmt.Errorf("mutation confirmation was not admitted before the mutation was sent: %s: %w", cause, syscall.EAGAIN)}
+	return &os.PathError{Op: op, Path: path, Err: &confirmationRefusal{errno: syscall.EAGAIN, cause: cause}}
 }
+
+// The caller's context ended before dispatch. Its reason owns the result; a custom
+// cancellation cause remains diagnostic and cannot turn an interrupted call into EIO.
+func confirmationContextError(op, path string, ctx context.Context) error {
+	ended, cause := ctx.Err(), context.Cause(ctx)
+	if cause != ended {
+		cause = errors.Join(ended, cause)
+	}
+	return &os.PathError{Op: op, Path: path, Err: &confirmationRefusal{errno: storage.ErrnoOf(ended), cause: cause}}
+}
+
+type confirmationRefusal struct {
+	errno syscall.Errno
+	cause error
+}
+
+func (e *confirmationRefusal) Error() string {
+	return fmt.Sprintf("mutation confirmation was not admitted before the mutation was sent: %v: %v", e.cause, e.errno)
+}
+
+func (e *confirmationRefusal) Unwrap() []error       { return []error{e.errno, e.cause} }
+func (e *confirmationRefusal) Classification() error { return e.errno }

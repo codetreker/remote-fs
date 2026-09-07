@@ -38,24 +38,24 @@ func (s *Store) Snapshot(ctx context.Context) (metastore.Snap, metastore.Positio
 		`SELECT CASE WHEN typeof(committed_position) = 'integer' THEN committed_position END,
 		        typeof(committed_position)
 		 FROM logs WHERE namespace = ?`, s.namespace).Scan(&committedRaw, &committedType); err != nil {
-		primary := fmt.Errorf("opening a picture of the tree: %w", failure(err))
-		return nil, 0, finishReadTransaction("snapshot transaction", tx, primary)
+		primary := fmt.Errorf("opening a picture of the tree: %w", readFailure(ctx, err))
+		return nil, 0, finishReadTransaction(ctx, "snapshot transaction", tx, primary)
 	}
 	committed, ok := storedInteger(committedRaw, committedType)
 	if !ok || committed < 0 {
 		primary := fmt.Errorf("opening a picture of the tree: the log stores an invalid committed position: %w",
 			syscall.EIO)
-		return nil, 0, finishReadTransaction("snapshot transaction", tx, primary)
+		return nil, 0, finishReadTransaction(ctx, "snapshot transaction", tx, primary)
 	}
 	if err := validateNamespaceIntegrity(
 		ctx, tx, s.namespace, s.maxIntegrityRecords, s.maxIntegrityBytes,
 	); err != nil {
-		primary := fmt.Errorf("validating the picture of the tree: %w", failure(err))
-		return nil, 0, finishReadTransaction("snapshot transaction", tx, primary)
+		primary := fmt.Errorf("validating the picture of the tree: %w", readFailure(ctx, err))
+		return nil, 0, finishReadTransaction(ctx, "snapshot transaction", tx, primary)
 	}
 	// The cursor starts before every entry there is. The name is an empty blob rather than
 	// nothing at all, so that the comparison in page is over two values rather than over a NULL.
-	return &snapshot{store: s, tx: tx, name: []byte{}}, metastore.Position(committed), nil
+	return &snapshot{store: s, ctx: ctx, tx: tx, name: []byte{}}, metastore.Position(committed), nil
 }
 
 // snapshot is one consistent picture, delivered in pages.
@@ -66,6 +66,7 @@ func (s *Store) Snapshot(ctx context.Context) (metastore.Snap, metastore.Positio
 // context long after it returned.
 type snapshot struct {
 	store *Store
+	ctx   context.Context
 
 	// tx is the read transaction the picture is taken in, and nil once it is closed.
 	tx *sql.Tx
@@ -107,7 +108,7 @@ func (p *snapshot) Next(ctx context.Context, limit int, result *metastore.RowRes
 	if !p.sentRoot {
 		root, contentBytes, err := p.store.rootMetadata(ctx, p.tx)
 		if err != nil {
-			return false, result.Fail(fmt.Errorf("reading the root of the picture: %w", failure(err)))
+			return false, result.Fail(fmt.Errorf("reading the root of the picture: %w", p.readFailure(ctx, err)))
 		}
 		reservation, fits, err := result.Reserve(
 			metastore.Row{Node: root}, metastore.RowPayloadLengths{Content: contentBytes},
@@ -120,7 +121,7 @@ func (p *snapshot) Next(ctx context.Context, limit int, result *metastore.RowRes
 		}
 		content, err := p.store.nodeContent(ctx, p.tx, root.ID)
 		if err != nil {
-			return false, result.Fail(fmt.Errorf("reading the root content key: %w", failure(err)))
+			return false, result.Fail(fmt.Errorf("reading the root content key: %w", p.readFailure(ctx, err)))
 		}
 		if err := reservation.Commit(nil, content); err != nil {
 			return false, err
@@ -135,7 +136,7 @@ func (p *snapshot) Next(ctx context.Context, limit int, result *metastore.RowRes
 	for produced < limit {
 		row, lengths, found, err := p.nextMetadata(ctx)
 		if err != nil {
-			return false, result.Fail(fmt.Errorf("reading a page of the picture: %w", failure(err)))
+			return false, result.Fail(fmt.Errorf("reading a page of the picture: %w", p.readFailure(ctx, err)))
 		}
 		if !found {
 			p.done = true
@@ -150,7 +151,7 @@ func (p *snapshot) Next(ctx context.Context, limit int, result *metastore.RowRes
 		}
 		name, content, err := p.payload(ctx, row.Parent, row.Node.ID)
 		if err != nil {
-			return false, result.Fail(fmt.Errorf("reading a snapshot row payload: %w", failure(err)))
+			return false, result.Fail(fmt.Errorf("reading a snapshot row payload: %w", p.readFailure(ctx, err)))
 		}
 		if err := reservation.Commit(name, content); err != nil {
 			return false, err
@@ -159,6 +160,13 @@ func (p *snapshot) Next(ctx context.Context, limit int, result *metastore.RowRes
 		produced++
 	}
 	return false, nil
+}
+
+func (p *snapshot) readFailure(ctx context.Context, err error) error {
+	if err == sql.ErrTxDone {
+		return readFailure(p.ctx, err)
+	}
+	return readFailure(ctx, err)
 }
 
 // pageQuery reads the fixed-width metadata and payload lengths of the next entry after a
@@ -286,8 +294,5 @@ func (p *snapshot) Close() error {
 	}
 	tx := p.tx
 	p.tx = nil
-	if err := tx.Rollback(); err != nil {
-		return fmt.Errorf("releasing a picture of the tree: %w", failure(err))
-	}
-	return nil
+	return finishReadTransaction(p.ctx, "snapshot transaction", tx, nil)
 }

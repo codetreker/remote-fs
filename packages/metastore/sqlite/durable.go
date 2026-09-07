@@ -213,7 +213,7 @@ func (c *databaseCoordinator) poisonWith(err error) {
 
 func (c *databaseCoordinator) poisonLocked(err error) {
 	if c.poison == nil {
-		c.poison = fmt.Errorf("%w: %w", syscall.EIO, err)
+		c.poison = &durabilityFailure{err: err}
 	}
 }
 
@@ -779,5 +779,13 @@ func isUncertainCommit(err error) bool {
 
 type uncertainCommitError struct{ err error }
 
-func (e *uncertainCommitError) Error() string { return e.err.Error() }
-func (e *uncertainCommitError) Unwrap() error { return e.err }
+func (e *uncertainCommitError) Error() string         { return e.err.Error() }
+func (e *uncertainCommitError) Unwrap() error         { return e.err }
+func (e *uncertainCommitError) Classification() error { return syscall.EIO }
+
+type durabilityFailure struct{ err error }
+
+func (e *durabilityFailure) Error() string         { return e.err.Error() }
+func (e *durabilityFailure) Unwrap() error         { return e.err }
+func (e *durabilityFailure) Is(target error) bool  { return target == syscall.EIO }
+func (e *durabilityFailure) Classification() error { return syscall.EIO }
