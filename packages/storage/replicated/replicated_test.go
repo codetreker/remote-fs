@@ -1,6 +1,7 @@
 package replicated_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -626,8 +627,8 @@ func TestAPictureMayTakeLongerThanTheStreamIsAllowedToBeQuiet(t *testing.T) {
 
 // TestACallerThatCannotConfirmItsChangeLeavesTheMountWorking.
 //
-// A mutation waits for its own change to come back, and it gives up after a while. What it
-// gives up on is that one call: the change happened, this side could not confirm it in time,
+// A mutation waits for the copy to reach the returned barrier, and it gives up after a while.
+// What it gives up on is that one call: the change happened, this side could not confirm it in time,
 // and it says so. What it must not do is declare the stream broken — a stream working through
 // a backlog looks exactly like this from here, and a mount that broke its own healthy stream
 // would reconnect to the same backlog and break it again. Worse, nothing would put it back:
@@ -635,13 +636,13 @@ func TestAPictureMayTakeLongerThanTheStreamIsAllowedToBeQuiet(t *testing.T) {
 // reaches the reconnect that is the only thing that clears the failure, and the mount answers
 // EIO for the rest of its life.
 func TestACallerThatCannotConfirmItsChangeLeavesTheMountWorking(t *testing.T) {
-	const grace = 200 * time.Millisecond
+	const grace = 2 * time.Second
 
 	s := serve(t, httprest.DefaultLimits())
 	write(t, s, "before.txt", "here before the mount")
-	// Every frame of the change stream held back for longer than a caller waits, so a
-	// mutation's own change cannot come back in time.
-	s.events.slowEvents(2 * grace)
+	// Every frame of the change stream is held back longer than the confirmation grace, so
+	// the copy cannot reach the mutation's barrier in time.
+	s.events.slowEvents(3 * time.Second)
 
 	mounted, replica := mountWithGrace(t, s, grace)
 
@@ -684,6 +685,132 @@ func TestACallerThatCannotConfirmItsChangeLeavesTheMountWorking(t *testing.T) {
 	}
 	if attr, err := mounted.Stat(t.Context(), "b.txt"); err != nil || attr.Size != 5 {
 		t.Fatalf("stat straight after a confirmed write gave %+v, %v", attr, err)
+	}
+}
+
+func TestConfirmationAdmissionRefusesBeforeSendingAndReleasesCapacity(t *testing.T) {
+	const frame = 500 * time.Millisecond
+	s := serve(t, httprest.DefaultLimits())
+	s.events.slowEvents(frame)
+	options := replicated.DefaultOptions()
+	options.ConfirmationGrace = 5 * time.Second
+	options.MaxActiveConfirmations = 1
+	options.MaxWaitingConfirmations = 0
+	mounted, _ := mountWithOptions(t, s, options)
+
+	at, err := s.meta.CommittedPosition(t.Context())
+	if err != nil {
+		t.Fatalf("reading the starting position: %v", err)
+	}
+	first := make(chan error, 1)
+	go func() { first <- mounted.Create(t.Context(), "first") }()
+	requireRecordedPast(t, s, at)
+
+	before := s.calls.of(httprest.OpCreate)
+	if err := mounted.Create(t.Context(), "second"); !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("a mutation beyond the active bound returned %v, want EAGAIN", err)
+	}
+	if after := s.calls.of(httprest.OpCreate); after != before {
+		t.Fatalf("the refused mutation reached the server: create calls moved from %d to %d", before, after)
+	}
+	if _, err := s.meta.Stat(t.Context(), "second"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the pre-send refusal changed the namespace: %v", err)
+	}
+	if err := <-first; err != nil {
+		t.Fatalf("the admitted mutation failed: %v", err)
+	}
+	if err := mounted.Create(t.Context(), "second"); err != nil {
+		t.Fatalf("released confirmation capacity was not reusable: %v", err)
+	}
+}
+
+func TestInvalidMutationPathsAreRejectedBeforeConfirmationAdmission(t *testing.T) {
+	s := serve(t, httprest.DefaultLimits())
+	options := replicated.DefaultOptions()
+	mounted, _ := mountWithOptions(t, s, options)
+
+	before := s.calls.of(httprest.OpCreate)
+	for _, invalid := range []string{"/absolute-path", "../escaping-path"} {
+		if err := mounted.Create(t.Context(), invalid); !errors.Is(err, syscall.EINVAL) {
+			t.Errorf("Create(%q) returned %v, want EINVAL", invalid, err)
+		} else if errors.Is(err, syscall.EAGAIN) {
+			t.Errorf("Create(%q) reported confirmation admission saturation for an invalid path: %v", invalid, err)
+		}
+	}
+	if after := s.calls.of(httprest.OpCreate); after != before {
+		t.Fatalf("invalid paths reached the server: create calls moved from %d to %d", before, after)
+	}
+}
+
+func TestCancelledConfirmationAdmissionWaiterNeverSendsAMutation(t *testing.T) {
+	const frame = 500 * time.Millisecond
+	s := serve(t, httprest.DefaultLimits())
+	s.events.slowEvents(frame)
+	options := replicated.DefaultOptions()
+	options.ConfirmationGrace = 5 * time.Second
+	options.MaxActiveConfirmations = 1
+	options.MaxWaitingConfirmations = 1
+	mounted, _ := mountWithOptions(t, s, options)
+
+	at, err := s.meta.CommittedPosition(t.Context())
+	if err != nil {
+		t.Fatalf("reading the starting position: %v", err)
+	}
+	first := make(chan error, 1)
+	go func() { first <- mounted.Create(t.Context(), "active") }()
+	requireRecordedPast(t, s, at)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	waiting := make(chan error, 1)
+	go func() { waiting <- mounted.Create(ctx, "cancelled") }()
+	time.Sleep(20 * time.Millisecond)
+	before := s.calls.of(httprest.OpCreate)
+	if before != 1 {
+		t.Fatalf("the waiting mutation reached the server before admission: create calls=%d", before)
+	}
+	cancel()
+	if err := <-waiting; !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("the cancelled pre-send waiter returned %v, want EAGAIN", err)
+	}
+	if after := s.calls.of(httprest.OpCreate); after != before {
+		t.Fatalf("the cancelled waiter reached the server: create calls moved from %d to %d", before, after)
+	}
+	if err := <-first; err != nil {
+		t.Fatalf("the active mutation failed: %v", err)
+	}
+}
+
+func TestCancellationAfterServerSuccessReportsAmbiguousEIOAndReleasesCapacity(t *testing.T) {
+	const frame = 500 * time.Millisecond
+	s := serve(t, httprest.DefaultLimits())
+	s.events.slowEvents(frame)
+	options := replicated.DefaultOptions()
+	options.ConfirmationGrace = 5 * time.Second
+	options.MaxActiveConfirmations = 1
+	options.MaxWaitingConfirmations = 0
+	mounted, _ := mountWithOptions(t, s, options)
+
+	at, err := s.meta.CommittedPosition(t.Context())
+	if err != nil {
+		t.Fatalf("reading the starting position: %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- mounted.Create(ctx, "committed") }()
+	requireRecordedPast(t, s, at)
+	cancel()
+	if err := <-done; !errors.Is(err, syscall.EIO) {
+		t.Fatalf("cancellation after server success returned %v, want EIO", err)
+	}
+	if _, err := s.meta.Stat(t.Context(), "committed"); err != nil {
+		t.Fatalf("the mutation reported as ambiguous did not reach the namespace: %v", err)
+	}
+
+	if err := mounted.Create(t.Context(), "after-cancel"); err != nil {
+		t.Fatalf("the cancelled confirmation did not release its capacity: %v", err)
+	}
+	if _, err := mounted.Stat(t.Context(), "committed"); err != nil {
+		t.Fatalf("the replica was invalidated by a caller cancellation: %v", err)
 	}
 }
 
@@ -776,7 +903,7 @@ func TestAChangeToTheRootIsConfirmedLikeAnyOther(t *testing.T) {
 	// It has to be confirmed by the event, not by the grace running out — and the grace here
 	// is long enough that waiting it out is unmistakable.
 	if took >= grace {
-		t.Fatalf("changing the root's mode took %v, which is the whole grace: its own change never matched", took)
+		t.Fatalf("changing the root's mode took %v, which is the whole grace: its barrier was not reached", took)
 	}
 	attr, err := mounted.Stat(t.Context(), "")
 	if err != nil {
@@ -788,16 +915,13 @@ func TestAChangeToTheRootIsConfirmedLikeAnyOther(t *testing.T) {
 	t.Logf("the root's mode was changed and confirmed in %v", took)
 }
 
-// TestAChangeTheCopyDiscardedReleasesNobody.
+// TestSameTargetReplayCannotConfirmBeforeTheMutationBarrier.
 //
 // A stream is attached before the picture is taken, so everything the picture already covered
-// arrives on it afterwards and is discarded. Those changes moved nothing. An account of where
-// the copy stands that took them for applied would run backwards — to a position the picture
-// had already carried it past — and a caller waiting for its own change to come back would
-// then be released by one of them: a change at the same name, newer than a position that has
-// been dragged backwards, and not in the copy at all. What the caller reads next is what the
-// name held before it wrote, which is R-CON-4 broken by bookkeeping.
-func TestAChangeTheCopyDiscardedReleasesNobody(t *testing.T) {
+// arrives afterwards and is discarded. Those frames must not move the applied position backwards.
+// If they did, a later mutation at the same name could be confirmed before its barrier was reached,
+// exposing the contents that preceded the mutation.
+func TestSameTargetReplayCannotConfirmBeforeTheMutationBarrier(t *testing.T) {
 	const written = "the contents this caller wrote, of a length nothing else here has"
 	const frame = 10 * time.Millisecond
 
@@ -844,11 +968,9 @@ func TestAChangeTheCopyDiscardedReleasesNobody(t *testing.T) {
 	// whatever the replay has done to the account of where the copy stands.
 	time.Sleep(5 * frame)
 
-	started := time.Now()
 	if err := mounted.Write(t.Context(), "hot.txt", []byte(written)); err != nil {
 		t.Fatalf("writing hot.txt: %v", err)
 	}
-	took := time.Since(started)
 
 	attr, err := mounted.Stat(t.Context(), "hot.txt")
 	if err != nil {
@@ -858,21 +980,15 @@ func TestAChangeTheCopyDiscardedReleasesNobody(t *testing.T) {
 		t.Fatalf("the copy reports hot.txt as %d bytes straight after %d were written: the write was released by a change the copy discarded",
 			attr.Size, len(written))
 	}
-	// Its own change is behind everything still being replayed, so a write that came back
-	// inside one frame did not wait for it.
-	if took < 5*frame {
-		t.Fatalf("the write was confirmed in %v, and the replay it is behind delivers a change every %v: nothing it waited for can have been its own change", took, frame)
-	}
-	t.Logf("the write waited %v, through a replay of changes at the same name that the copy discarded", took)
+	t.Log("the write returned only after its contents replaced the same-target replay in the copy")
 }
 
 // TestADirectoryRemovedThroughTheCopyIsGoneFromItAtOnce is R-CON-4 for the operations whose
 // change empties a name rather than filling it.
 //
-// The direction of the wait is the whole of it. A caller held until the name holds something
-// would be waiting for a change that is never coming: it would spend its entire grace and then
-// report EIO for a directory that is in fact gone — and the listing it was refused would have
-// been correct.
+// A barrier position confirms removals without interpreting whether a target name should be
+// present or absent. Both the removed child and its parent must therefore be absent immediately
+// after their calls return.
 func TestADirectoryRemovedThroughTheCopyIsGoneFromItAtOnce(t *testing.T) {
 	s := serve(t, httprest.DefaultLimits())
 	mounted, replica := mount(t, s)
@@ -916,9 +1032,7 @@ func TestADirectoryRemovedThroughTheCopyIsGoneFromItAtOnce(t *testing.T) {
 // Both are still sent, and the names that are not there are how that half is held: whether a
 // name exists at all is the server's answer and never this copy's to invent.
 func TestAMutationThatRecordsNothingIsNotWaitedFor(t *testing.T) {
-	// Short, so that a wait for an echo that is never coming shows up as a failure rather than
-	// as a test that takes a while. Every mutation here that does record something is confirmed
-	// in a millisecond or two.
+	// Short enough that accidentally waiting for a no-op barrier is a prompt test failure.
 	const grace = 2 * time.Second
 
 	s := serve(t, httprest.DefaultLimits())
@@ -992,7 +1106,7 @@ func TestAMutationTheServerRefusesIsReportedAsTheServerRefusedIt(t *testing.T) {
 		t.Run(c.what, func(t *testing.T) {
 			err := c.do()
 			if errors.Is(err, syscall.EIO) {
-				t.Fatalf("%s was answered with %v: EIO is what a copy says when it waited for an echo that was never coming, and the namespace had already answered", c.what, err)
+				t.Fatalf("%s was answered with %v: EIO would replace the namespace's definitive refusal with a confirmation failure", c.what, err)
 			}
 			if !errors.Is(err, c.want) {
 				t.Fatalf("%s was answered with %v, want %v", c.what, err, c.want)
@@ -1005,13 +1119,12 @@ func TestAMutationTheServerRefusesIsReportedAsTheServerRefusedIt(t *testing.T) {
 	requireSameTree(t, walkSource(t, s), walkCopy(t, replica))
 }
 
-// TestAChangeWhoseStreamWentWhileItWasWaitedForSaysWhichHappened.
+// TestLosingReplicationWhileAMutationIsOutstandingNeverReportsSuccess.
 //
-// A mutation waits for its own change, and the stream carrying it can end while it waits. That
-// is a different thing from the wait running out: nothing is coming any more, so the caller is
-// told now rather than held for the rest of its grace. What it must never be told is that its
-// change did not happen — it did, and what failed is this copy's ability to confirm it.
-func TestAChangeWhoseStreamWentWhileItWasWaitedForSaysWhichHappened(t *testing.T) {
+// The response carrying the barrier and the stream carrying changes use different connections.
+// Losing both after the server commits can make either side fail first, but neither ordering may
+// report success without proof that the copy reached the barrier.
+func TestLosingReplicationWhileAMutationIsOutstandingNeverReportsSuccess(t *testing.T) {
 	const frame = 300 * time.Millisecond
 	const grace = 3 * time.Second
 
@@ -1034,9 +1147,8 @@ func TestAChangeWhoseStreamWentWhileItWasWaitedForSaysWhichHappened(t *testing.T
 	// Cut only once the namespace itself holds the change. Before that the mutation has not
 	// been sent, and what would be under test is the refusal to send it at all.
 	//
-	// The connections go with it. A stream that is merely told to end still delivers the frame
-	// it is in the middle of writing, and that frame is this caller's own change — so cutting
-	// alone would race the very echo this test is arranging not to arrive.
+	// The connections go with it. A stream merely told to end can still deliver the frame already
+	// being written and reach the barrier, so cutting alone would race the failure arranged here.
 	requireRecordedPast(t, s, at)
 	started := time.Now()
 	s.events.cut()
@@ -1044,10 +1156,7 @@ func TestAChangeWhoseStreamWentWhileItWasWaitedForSaysWhichHappened(t *testing.T
 
 	err = <-made
 	took := time.Since(started)
-	requireErrno(t, "a change whose stream ended while it was being confirmed", err, syscall.EIO)
-	if !strings.Contains(err.Error(), "stopped being kept current") {
-		t.Fatalf("the change failed with %v, which does not say that the stream behind the copy went while it was being confirmed", err)
-	}
+	requireErrno(t, "a mutation that lost both its barrier response and change stream", err, syscall.EIO)
 	if took >= grace {
 		t.Fatalf("the caller was held for %v, which is the whole grace: it was told by the wait running out rather than by the stream going", took)
 	}
@@ -1061,15 +1170,70 @@ func TestAChangeWhoseStreamWentWhileItWasWaitedForSaysWhichHappened(t *testing.T
 	requireUnusable(t, mounted)
 }
 
-// TestAChangeUnderADirectoryTheCopyHasNotSeenYetIsWaitedFor.
+func TestClosingReleasesAServerMutationStillWaitingForItsBarrier(t *testing.T) {
+	const frame = 2 * time.Second
+	s := serve(t, httprest.DefaultLimits())
+	s.events.slowEvents(frame)
+	options := replicated.DefaultOptions()
+	options.ConfirmationGrace = 10 * time.Second
+	options.MaxActiveConfirmations = 1
+	options.MaxWaitingConfirmations = 1
+	mounted, _ := mountWithOptions(t, s, options)
+
+	at, err := s.meta.CommittedPosition(t.Context())
+	if err != nil {
+		t.Fatalf("reading the starting position: %v", err)
+	}
+	mutation := make(chan error, 1)
+	go func() { mutation <- mounted.Create(t.Context(), "made-before-close") }()
+	requireRecordedPast(t, s, at)
+	waiting := make(chan error, 1)
+	go func() { waiting <- mounted.Create(t.Context(), "never-sent") }()
+	time.Sleep(20 * time.Millisecond)
+	before := s.calls.of(httprest.OpCreate)
+	if before != 1 {
+		t.Fatalf("the admission waiter reached the server before Close: create calls=%d", before)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- mounted.Close() }()
+	select {
+	case err := <-mutation:
+		if !errors.Is(err, syscall.EIO) {
+			t.Fatalf("the mutation whose server success could not be confirmed returned %v, want EIO", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closing did not release the mutation waiting for its barrier")
+	}
+	select {
+	case err := <-waiting:
+		if !errors.Is(err, syscall.EAGAIN) {
+			t.Fatalf("the pre-send admission waiter returned %v on Close, want EAGAIN", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not release the confirmation admission waiter")
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("closing the replicated storage: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close waited on a barrier the copy can no longer reach")
+	}
+	if _, err := s.meta.Stat(t.Context(), "made-before-close"); err != nil {
+		t.Fatalf("the server did not retain the mutation whose confirmation became ambiguous: %v", err)
+	}
+	if _, err := s.meta.Stat(t.Context(), "never-sent"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the admission waiter changed the namespace during Close: %v", err)
+	}
+}
+
+// TestAChangeUnderADirectoryTheCopyHasNotSeenYetReachesItsBarrier.
 //
-// The name a mutation waits for is resolved against the copy on every pass, and this is the
-// case that requires it: the directory holding that name may itself still be arriving on the
-// same stream. A copy that resolved once, at the moment the wait began, would find no parent
-// and have nothing to compare against — and the caller would be told its change could not be
-// confirmed, when what was true is that the copy had not yet caught up with the directory the
-// change was made in.
-func TestAChangeUnderADirectoryTheCopyHasNotSeenYetIsWaitedFor(t *testing.T) {
+// A barrier is independent of path resolution. A mutation below a directory that has not yet
+// reached the copy must wait until both the parent and the mutation's position are applied.
+func TestAChangeUnderADirectoryTheCopyHasNotSeenYetReachesItsBarrier(t *testing.T) {
 	const frame = 300 * time.Millisecond
 
 	s := serve(t, httprest.DefaultLimits())

@@ -157,7 +157,7 @@ func TestAPictureHoldsItsOwnNamespaceOnly(t *testing.T) {
 
 	held := map[string]bool{}
 	for {
-		page, done, err := snap.Next(t.Context(), 3)
+		page, done, err := readRows(t.Context(), snap, 3)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -204,7 +204,7 @@ func TestAPictureIsTheSameHoweverItIsPaged(t *testing.T) {
 		defer snap.Close()
 		var all []metastore.Row
 		for {
-			page, done, err := snap.Next(t.Context(), limit)
+			page, done, err := readRows(t.Context(), snap, limit)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -20,8 +20,10 @@ Status: proposed
 内核在调用线程收到信号时发 `FUSE_INTERRUPT`；go-fuse 据此关掉那次请求的 cancel channel；这一侧的 storage 调用于是死在 `context canceled` 上；而 `errnoOf` 对任何不带 errno 的错误一律答 **EIO**。在 `errnoOf` 里临时打一行日志抓到了原文：
 
 ```
-stat "over.bin": Get "http://…/v1/stat?path=over.bin": context canceled: input/output error
+stat "over.bin": Get "http://…/<protocol>/stat?path=over.bin": context canceled: input/output error
 ```
+
+这里把当时 URL 里的版本段省略为 `<protocol>`；根因在 FUSE cancellation 与 errno 分类，不依赖 wire protocol 版本。
 
 决定性的对照是驱动方：同一批二进制，用 Python 在重载下驱动 **52/52 全清**；换成 `go test` 驱动约 **5%** 复现。差别是 Go 的**异步抢占** —— 运行时用 SIGURG 打断长时间不进入安全点的线程，而那个线程正阻塞在 `open` 里。这解释了为什么它只在这套测试里出现，以及为什么它换一个用例就换一个失败点：被打中的是哪个操作，纯粹看信号落在谁身上。
 

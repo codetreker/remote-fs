@@ -22,6 +22,46 @@ func TestContract(t *testing.T) {
 	})
 }
 
+func TestBoundedContract(t *testing.T) {
+	storagetest.RunBounded(t, func(t *testing.T) storage.BoundedStorage {
+		s, err := localdir.New(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	})
+}
+
+func TestBoundedReadAndListRefuseWithoutReturningAPrefix(t *testing.T) {
+	root := t.TempDir()
+	s, err := localdir.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "large"), []byte("large"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.ReadBounded(t.Context(), "large", 4); got != nil || !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("ReadBounded returned %q, %v; want EFBIG", got, err)
+	}
+	if got, err := s.ReadBounded(t.Context(), "large", 5); err != nil || string(got) != "large" {
+		t.Fatalf("ReadBounded at the boundary returned %q, %v", got, err)
+	}
+
+	result, err := storage.NewListResult(4, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+		return nameBytes, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ListBounded(t.Context(), "", result); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("ListBounded returned %v, want EIO", err)
+	}
+	if entries, resultErr := result.Entries(); resultErr == nil || entries != nil {
+		t.Fatalf("an oversized first entry left a usable prefix: %+v, %v", entries, resultErr)
+	}
+}
+
 // The contract suite can only see what the implementation chooses to report back. These
 // cases cross the boundary the other way: they act through the storage and check the
 // directory with plain os calls, and act on the directory and check what the storage

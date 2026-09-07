@@ -2,6 +2,8 @@ package metastoretest
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"syscall"
@@ -26,7 +28,7 @@ import (
 // caller out. Those live beside the implementation that has the window to set.
 var logCases = []testCase{
 	{name: "a fresh log holds nothing and is caught up at zero", run: func(t *testing.T, s metastore.Store) {
-		changes, retention, err := s.Since(ctx(t), 0, 10)
+		changes, retention, err := readChanges(ctx(t), s, 0, 10)
 		mustSucceed(t, err)
 		if len(changes) != 0 {
 			t.Fatalf("a namespace nobody has written to has recorded %d changes, want none", len(changes))
@@ -43,10 +45,110 @@ var logCases = []testCase{
 
 		// A log with no incarnation cannot be resumed against: the pair a caller returns with
 		// is (incarnation, position), and an empty half of it matches everything.
-		incarnation, err := s.Incarnation(ctx(t))
+		incarnation, err := s.Incarnation(ctx(t), 1024)
 		mustSucceed(t, err)
 		if incarnation == "" {
 			t.Fatal("the log names its run of history with the empty string, which every other log would match")
+		}
+	}},
+
+	{name: "bounded log pages stop before the next change and reject an oversized change whole", run: func(t *testing.T, s metastore.Store) {
+		mustSucceed(t, s.Create(ctx(t), "first"))
+		mustSucceed(t, s.Create(ctx(t), "second"))
+		newResult := func(max int64) *metastore.ChangeResult {
+			result, err := metastore.NewChangeResult(max, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
+				return lengths.Name + lengths.FromName + lengths.Content + 1, nil
+			})
+			mustSucceed(t, err)
+			return result
+		}
+		firstPage := newResult(int64(len("first") + 1))
+		retention, err := s.Since(ctx(t), 0, 100, firstPage)
+		mustSucceed(t, err)
+		changes, err := firstPage.Changes()
+		mustSucceed(t, err)
+		if len(changes) != 1 || string(changes[0].Name) != "first" {
+			t.Fatalf("first bounded page = %+v", changes)
+		}
+		if retention.Tail <= changes[0].Position {
+			t.Fatalf("one-change page reported tail %d at position %d", retention.Tail, changes[0].Position)
+		}
+
+		tooSmall := newResult(int64(len("second")))
+		if _, err := s.Since(ctx(t), changes[0].Position, 100, tooSmall); !errors.Is(err, syscall.EFBIG) {
+			t.Fatalf("oversized next change returned %v, want EFBIG", err)
+		}
+		if partial, err := tooSmall.Changes(); !errors.Is(err, syscall.EFBIG) || partial != nil {
+			t.Fatalf("oversized next change exposed %+v, %v", partial, err)
+		}
+	}},
+
+	{name: "log identity and snapshot rows are produced within caller byte bounds", run: func(t *testing.T, s metastore.Store) {
+		if _, err := s.Incarnation(ctx(t), 1); !errors.Is(err, syscall.EFBIG) {
+			t.Fatalf("one-byte incarnation bound returned %v, want EFBIG", err)
+		}
+		if identity, err := s.Incarnation(ctx(t), 1024); err != nil || identity == "" {
+			t.Fatalf("bounded incarnation = %q, %v", identity, err)
+		}
+		mustSucceed(t, s.Create(ctx(t), "first"))
+		mustSucceed(t, s.Create(ctx(t), "second"))
+		snap, _, err := s.Snapshot(ctx(t))
+		mustSucceed(t, err)
+		defer snap.Close()
+		newResult := func(max int64) *metastore.RowResult {
+			result, err := metastore.NewRowResult(max, 0, func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
+				return 1 + lengths.Name + lengths.Content, nil
+			})
+			mustSucceed(t, err)
+			return result
+		}
+		for _, page := range []struct {
+			max  int64
+			name string
+			done bool
+		}{
+			{max: int64(len("first") + 1)},
+			{max: int64(len("second") + 1), name: "first"},
+			{max: int64(len("second") + 1), name: "second", done: true},
+		} {
+			result := newResult(page.max)
+			done, err := snap.Next(ctx(t), 100, result)
+			mustSucceed(t, err)
+			if done != page.done {
+				t.Fatalf("snapshot page %q reported done=%v, want %v", page.name, done, page.done)
+			}
+			rows, err := result.Rows()
+			mustSucceed(t, err)
+			if len(rows) != 1 || string(rows[0].Name) != page.name {
+				t.Fatalf("snapshot page under %d bytes = %+v, want name %q", page.max, rows, page.name)
+			}
+		}
+		last := newResult(1)
+		done, err := snap.Next(ctx(t), 100, last)
+		mustSucceed(t, err)
+		rows, err := last.Rows()
+		mustSucceed(t, err)
+		if !done || len(rows) != 0 {
+			t.Fatalf("snapshot end = done %v rows %+v", done, rows)
+		}
+	}},
+
+	{name: "a barrier is one bounded coherent log identity and position", run: func(t *testing.T, s metastore.Store) {
+		if _, err := s.Barrier(ctx(t), 1); !errors.Is(err, syscall.EFBIG) {
+			t.Fatalf("one-byte barrier identity bound returned %v, want EFBIG", err)
+		}
+		fresh, err := s.Barrier(ctx(t), 1024)
+		mustSucceed(t, err)
+		if fresh.Incarnation == "" || fresh.Position != 0 {
+			t.Fatalf("fresh barrier = %+v", fresh)
+		}
+		mustSucceed(t, s.Create(ctx(t), "after"))
+		changed, err := s.Barrier(ctx(t), 1024)
+		mustSucceed(t, err)
+		committed, err := s.CommittedPosition(ctx(t))
+		mustSucceed(t, err)
+		if changed.Incarnation != fresh.Incarnation || changed.Position != committed || changed.Position <= fresh.Position {
+			t.Fatalf("changed barrier = %+v, fresh=%+v committed=%d", changed, fresh, committed)
 		}
 	}},
 
@@ -69,14 +171,14 @@ var logCases = []testCase{
 	// namespace was written to. Only a log that is no longer a continuation of what a caller
 	// saw changes it.
 	{name: "the incarnation is stable across reads and writes", run: func(t *testing.T, s metastore.Store) {
-		first, err := s.Incarnation(ctx(t))
+		first, err := s.Incarnation(ctx(t), 1024)
 		mustSucceed(t, err)
 
 		mustSucceed(t, s.Mkdir(ctx(t), "d"))
 		put(t, s, "d/f", 100)
 		mustSucceed(t, s.Remove(ctx(t), "d/f"))
 
-		second, err := s.Incarnation(ctx(t))
+		second, err := s.Incarnation(ctx(t), 1024)
 		mustSucceed(t, err)
 		if first != second {
 			t.Fatalf("the incarnation moved from %q to %q over ordinary writes, which would make every replica rebuild", first, second)
@@ -135,7 +237,7 @@ var logCases = []testCase{
 
 		// The tail is the newest position the tree was changed at, and it is the same fact
 		// CommittedPosition reports for a log kept beside the tree.
-		_, retention, err := s.Since(ctx(t), 0, 1)
+		_, retention, err := readChanges(ctx(t), s, 0, 1)
 		mustSucceed(t, err)
 		at, err := s.CommittedPosition(ctx(t))
 		mustSucceed(t, err)
@@ -253,7 +355,7 @@ var snapshotCases = []testCase{
 		if at != 0 {
 			t.Fatalf("a picture of a namespace nobody has written to is at position %d, want 0", at)
 		}
-		rows, done, err := snap.Next(ctx(t), 16)
+		rows, done, err := readRows(ctx(t), snap, 16)
 		mustSucceed(t, err)
 		if !done {
 			t.Fatal("a picture of an empty namespace is not complete after sixteen rows")
@@ -349,13 +451,13 @@ var snapshotCases = []testCase{
 			snap, _, err := s.Snapshot(ctx(t))
 			mustSucceed(t, err)
 
-			if _, _, err := snap.Next(ctx(t), 2); err != nil {
+			if _, _, err := readRows(ctx(t), snap, 2); err != nil {
 				t.Fatalf("reading the first page: %v", err)
 			}
 			mustSucceed(t, snap.Close())
 			mustSucceed(t, snap.Close())
 
-			_, _, err = snap.Next(ctx(t), 2)
+			_, _, err = readRows(ctx(t), snap, 2)
 			mustFail(t, err, syscall.EINVAL)
 		}},
 
@@ -364,7 +466,7 @@ var snapshotCases = []testCase{
 		mustSucceed(t, err)
 		defer func() { mustSucceed(t, snap.Close()) }()
 		for _, limit := range []int{0, -1} {
-			_, _, err := snap.Next(ctx(t), limit)
+			_, _, err := readRows(ctx(t), snap, limit)
 			mustFail(t, err, syscall.EINVAL)
 		}
 	}},
@@ -380,7 +482,7 @@ var sinceCases = []testCase{
 		mustSucceed(t, err)
 
 		// Caught up: the position is the tail, and there is nothing after it.
-		changes, retention, err := s.Since(ctx(t), at, 100)
+		changes, retention, err := readChanges(ctx(t), s, at, 100)
 		mustSucceed(t, err)
 		if len(changes) != 0 {
 			t.Fatalf("a caller at the tail is offered %d changes, want none", len(changes))
@@ -392,7 +494,7 @@ var sinceCases = []testCase{
 		// Resumable: a position inside what the log still holds, and the changes after it.
 		mustSucceed(t, s.Create(ctx(t), "later"))
 		mustSucceed(t, s.Mkdir(ctx(t), "later-still"))
-		changes, retention, err = s.Since(ctx(t), at, 100)
+		changes, retention, err = readChanges(ctx(t), s, at, 100)
 		mustSucceed(t, err)
 		if len(changes) == 0 {
 			t.Fatalf("two writes after position %d are offered as nothing, want the changes", at)
@@ -417,7 +519,7 @@ var sinceCases = []testCase{
 	{name: "what the log discarded is what decides resuming, not what survived it",
 		run: func(t *testing.T, s metastore.Store) {
 			build(t, s)
-			_, retention, err := s.Since(ctx(t), 0, 0)
+			_, retention, err := readChanges(ctx(t), s, 0, 0)
 			mustSucceed(t, err)
 
 			// A log that has discarded nothing admits every caller, including one that has
@@ -432,7 +534,7 @@ var sinceCases = []testCase{
 			// Every position the log holds is resumable from, and so is everything before the
 			// oldest of them, because nothing has been thrown away.
 			for _, from := range []metastore.Position{0, retention.Oldest - 1, retention.Oldest} {
-				changes, again, err := s.Since(ctx(t), from, 100)
+				changes, again, err := readChanges(ctx(t), s, from, 100)
 				mustSucceed(t, err)
 				if again.TrimmedThrough > from {
 					t.Fatalf("resuming at %d is refused by a log that has discarded nothing", from)
@@ -446,7 +548,7 @@ var sinceCases = []testCase{
 	{name: "since returns at most the limit it was given, oldest first", run: func(t *testing.T, s metastore.Store) {
 		build(t, s)
 		for _, limit := range []int{0, 1, 3, 50} {
-			changes, _, err := s.Since(ctx(t), 0, limit)
+			changes, _, err := readChanges(ctx(t), s, 0, limit)
 			mustSucceed(t, err)
 			if len(changes) > limit {
 				t.Fatalf("a limit of %d returned %d changes", limit, len(changes))
@@ -459,7 +561,7 @@ var sinceCases = []testCase{
 		// not allowed to skip anything.
 		var walked []metastore.Change
 		for after := metastore.Position(0); ; {
-			page, _, err := s.Since(ctx(t), after, 1)
+			page, _, err := readChanges(ctx(t), s, after, 1)
 			mustSucceed(t, err)
 			if len(page) == 0 {
 				break
@@ -481,12 +583,12 @@ var sinceCases = []testCase{
 	// unreachable without them.
 	{name: "a limit of zero reports what the log holds and none of it", run: func(t *testing.T, s metastore.Store) {
 		build(t, s)
-		none, reported, err := s.Since(ctx(t), 0, 0)
+		none, reported, err := readChanges(ctx(t), s, 0, 0)
 		mustSucceed(t, err)
 		if len(none) != 0 {
 			t.Fatalf("a limit of zero returned %d changes", len(none))
 		}
-		all, whole, err := s.Since(ctx(t), 0, 1000)
+		all, whole, err := readChanges(ctx(t), s, 0, 1000)
 		mustSucceed(t, err)
 		if len(all) == 0 {
 			t.Fatal("the log recorded nothing for a tree that was just built")
@@ -501,9 +603,9 @@ var sinceCases = []testCase{
 	}},
 
 	{name: "since refuses a position and a limit that are not ones", run: func(t *testing.T, s metastore.Store) {
-		_, _, err := s.Since(ctx(t), -1, 10)
+		_, _, err := readChanges(ctx(t), s, -1, 10)
 		mustFail(t, err, syscall.EINVAL)
-		_, _, err = s.Since(ctx(t), 0, -1)
+		_, _, err = readChanges(ctx(t), s, 0, -1)
 		mustFail(t, err, syscall.EINVAL)
 	}},
 }
@@ -544,7 +646,7 @@ func picture(t *testing.T, s metastore.Store, page int, between func(step int)) 
 
 	r := &replica{nodes: map[int64]metastore.Node{}, entries: map[where]int64{}, at: at}
 	for step := 0; ; step++ {
-		rows, done, err := snap.Next(ctx(t), page)
+		rows, done, err := readRows(ctx(t), snap, page)
 		mustSucceed(t, err)
 		if len(rows) > page {
 			t.Fatalf("a page of %d rows was asked for and %d came back", page, len(rows))
@@ -742,6 +844,36 @@ func sameNode(a, b metastore.Node) bool {
 		a.AccessTime.Equal(b.AccessTime) && a.ModTime.Equal(b.ModTime) && a.Content == b.Content
 }
 
+func readChanges(ctx context.Context, log metastore.Log, after metastore.Position, limit int) ([]metastore.Change, metastore.Retention, error) {
+	result, err := metastore.NewChangeResult(64<<20, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
+		return 256 + lengths.Name + lengths.FromName + lengths.Content, nil
+	})
+	if err != nil {
+		return nil, metastore.Retention{}, err
+	}
+	retention, err := log.Since(ctx, after, limit, result)
+	if err != nil {
+		return nil, metastore.Retention{}, err
+	}
+	changes, err := result.Changes()
+	return changes, retention, err
+}
+
+func readRows(ctx context.Context, snap metastore.Snap, limit int) ([]metastore.Row, bool, error) {
+	result, err := metastore.NewRowResult(64<<20, 0, func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
+		return 192 + lengths.Name + lengths.Content, nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	done, err := snap.Next(ctx, limit, result)
+	if err != nil {
+		return nil, false, err
+	}
+	rows, err := result.Rows()
+	return rows, done, err
+}
+
 // drain reads every change after a position, and fails if the log no longer holds them or if
 // it stops before its own tail. A case that meant to read the whole of a run and silently got
 // the first page of it would otherwise pass while checking a fraction of what it named.
@@ -749,7 +881,7 @@ func drain(t *testing.T, s metastore.Store, after metastore.Position) []metastor
 	t.Helper()
 	var all []metastore.Change
 	for {
-		changes, retention, err := s.Since(ctx(t), after, 64)
+		changes, retention, err := readChanges(ctx(t), s, after, 64)
 		mustSucceed(t, err)
 		if retention.TrimmedThrough > after {
 			t.Fatalf("the log has discarded through %d, so a caller at %d has lost changes it needed", retention.TrimmedThrough, after)

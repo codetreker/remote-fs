@@ -133,6 +133,11 @@ func (f *failed) Unwrap() []error {
 	return []error{f.cause, f.errno}
 }
 
+// Classification identifies the contract result independently of the diagnostic service
+// response retained by Unwrap. A caller deciding whether every component means absence can
+// use this without mistaking the response detail for a second, independent failure.
+func (f *failed) Classification() error { return f.errno }
+
 // failure describes err as a failure of op on key.
 func failure(op, key string, err error) error {
 	return &failed{op: op, key: key, answer: answerOf(err), errno: errnoOf(err), cause: err}

@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 
+	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 )
 
@@ -29,12 +33,14 @@ import (
 // error is the only thing wrong with the namespace.
 type failingObjects struct {
 	objectstore.Objects
-	onGet, onPut, onDelete error
+	onGet, onPut error
+	deleteMu     sync.RWMutex
+	onDelete     error
 	// refusedDeletes counts the deletes onDelete turned away. Most cases here reach the
 	// object store through a call that reports its own failure, which is proof enough that
 	// the injected error was reached; a sweep that a mutation triggers reports nothing, so
 	// the case built on one asserts this instead of assuming it.
-	refusedDeletes int
+	refusedDeletes atomic.Int64
 }
 
 func (f *failingObjects) Get(ctx context.Context, key string) ([]byte, error) {
@@ -52,23 +58,49 @@ func (f *failingObjects) Put(ctx context.Context, key string, content []byte) ([
 }
 
 func (f *failingObjects) Delete(ctx context.Context, key string) error {
-	if f.onDelete != nil {
-		f.refusedDeletes++
-		return f.onDelete
+	f.deleteMu.RLock()
+	failure := f.onDelete
+	f.deleteMu.RUnlock()
+	if failure != nil {
+		f.refusedDeletes.Add(1)
+		return failure
 	}
 	return f.Objects.Delete(ctx, key)
 }
+
+func (f *failingObjects) failDeletes(err error) {
+	f.deleteMu.Lock()
+	defer f.deleteMu.Unlock()
+	f.onDelete = err
+}
+
+// Close is deliberately a no-op: this wrapper borrows p's object store just as the
+// namespace returned by failing borrows p's metastore. Closing either from a failure case
+// would invalidate the fixture whose cleanup owns them.
+func (f *failingObjects) Close() error { return nil }
+
+type borrowedStore struct{ metastore.Store }
+
+func (borrowedStore) Close() error { return nil }
 
 // failing returns a namespace over the same tree and the same objects as p, reached through
 // a wrapper a case switches into failing once the namespace holds what the case needs.
 // Nothing fails while the fixture is being built, so a case exercises only the failure it
 // named.
 //
-// The tree is shared with p rather than opened a second time, and p's cleanup closes it.
-// This namespace therefore borrows the tree and must not be closed.
-func (p parts) failing() (*objectstore.Storage, *failingObjects) {
+// The tree and objects are shared with p rather than opened a second time. Their wrappers
+// make Close release only this namespace's maintenance worker; p's cleanup retains ownership
+// of the durable halves.
+func (p parts) failing(t *testing.T) (*objectstore.Storage, *failingObjects) {
+	t.Helper()
 	objects := &failingObjects{Objects: p.objects}
-	return objectstore.New(objects, p.meta), objects
+	namespace := objectstore.New(objects, borrowedStore{Store: p.meta})
+	t.Cleanup(func() {
+		if err := namespace.Close(); err != nil {
+			t.Errorf("closing the borrowed failing namespace: %v", err)
+		}
+	})
+	return namespace, objects
 }
 
 // objectFailures are answers an Objects can give that are not "the object is not there".
@@ -119,7 +151,7 @@ func TestReadingThroughAFailingObjectStoreReportsTheFailure(t *testing.T) {
 	for _, failure := range objectFailures {
 		t.Run(failure.name, func(t *testing.T) {
 			p := newParts(t, 0)
-			namespace, objects := p.failing()
+			namespace, objects := p.failing(t)
 			ctx := t.Context()
 			if err := namespace.Write(ctx, "f", []byte("content")); err != nil {
 				t.Fatalf("write: %v", err)
@@ -141,15 +173,60 @@ func TestReadingThroughAFailingObjectStoreReportsTheFailure(t *testing.T) {
 	}
 }
 
+func TestReadingDoesNotTurnObjectKeyFailuresIntoNamespaceFacts(t *testing.T) {
+	independent := errors.New("the object service also failed independently")
+	for _, test := range []struct {
+		name     string
+		failure  error
+		retained error
+	}{
+		{
+			name:     "joined absence and independent failure",
+			failure:  errors.Join(syscall.ENOENT, independent),
+			retained: independent,
+		},
+		{name: "EEXIST", failure: syscall.EEXIST},
+		{name: "EISDIR", failure: syscall.EISDIR},
+		{name: "ENOTDIR", failure: syscall.ENOTDIR},
+		{name: "ENOTEMPTY", failure: syscall.ENOTEMPTY},
+		{name: "EINVAL", failure: syscall.EINVAL},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p := newParts(t, 0)
+			namespace, objects := p.failing(t)
+			if err := namespace.Write(t.Context(), "f", []byte("content")); err != nil {
+				t.Fatalf("writing the fixture: %v", err)
+			}
+			objects.onGet = test.failure
+
+			_, err := namespace.Read(t.Context(), "f")
+			if !errors.Is(err, syscall.EIO) {
+				t.Fatalf("Read returned %v, want EIO", err)
+			}
+			if test.retained != nil && !errors.Is(err, test.retained) {
+				t.Fatalf("Read returned %v, want retained failure %v", err, test.retained)
+			}
+			for _, errno := range factsAboutNames {
+				if errors.Is(err, errno) {
+					t.Fatalf("object-key failure arrived as namespace fact %v: %v", errno, err)
+				}
+			}
+			if got := storage.ErrnoNameOf(err); got != "EIO" {
+				t.Fatalf("Read travels over the transport as %s, want EIO", got)
+			}
+		})
+	}
+}
+
 // Bytes that never reached the store must leave no name behind and no charge behind. The
-// reservation the write made is not usage: it is a key nobody will reference, and a sweep
-// reclaims it once the grace period for a write in flight has passed.
+// unresolved reservation remains bounded maintenance state because the object-store error
+// cannot prove whether an object was created under its key.
 func TestAWriteWhoseBytesNeverLandedLeavesNothingBehind(t *testing.T) {
 	const allowance = 1 << 20
 	for _, failure := range objectFailures {
 		t.Run(failure.name, func(t *testing.T) {
 			p := newParts(t, allowance)
-			namespace, objects := p.failing()
+			namespace, objects := p.failing(t)
 			ctx := t.Context()
 
 			objects.onPut = failure.err
@@ -176,15 +253,13 @@ func TestASweepThatCannotDeleteForgetsNothing(t *testing.T) {
 	for _, failure := range objectFailures {
 		t.Run(failure.name, func(t *testing.T) {
 			p := newParts(t, 0)
-			namespace, objects := p.failing()
+			namespace, objects := p.failing(t)
 			ctx := t.Context()
 
 			const files = 3
 			for i := range files {
 				name := fmt.Sprintf("f%d", i)
-				if err := namespace.Write(ctx, name, []byte(name)); err != nil {
-					t.Fatalf("write: %v", err)
-				}
+				putDirect(t, p.meta, p.objects, name, []byte(name))
 			}
 			// The backlog is made through the tree directly, so that no write clears the
 			// garbage the removal before it made.
@@ -194,7 +269,7 @@ func TestASweepThatCannotDeleteForgetsNothing(t *testing.T) {
 				}
 			}
 
-			objects.onDelete = failure.err
+			objects.failDeletes(failure.err)
 			removed, err := namespace.Sweep(ctx, 100)
 			requireReported(t, err, failure.err)
 			if removed != 0 {
@@ -203,7 +278,7 @@ func TestASweepThatCannotDeleteForgetsNothing(t *testing.T) {
 
 			// Nothing was forgotten while its bytes were still being paid for: with the store
 			// answering again, the same backlog is still there to be cleared.
-			objects.onDelete = nil
+			objects.failDeletes(nil)
 			if removed, err = namespace.Sweep(ctx, 100); err != nil || removed != files {
 				t.Fatalf("the sweep after the store recovered removed %d objects (%v), want %d", removed, err, files)
 			}
@@ -216,27 +291,25 @@ func TestASweepThatCannotDeleteForgetsNothing(t *testing.T) {
 // being paid for, which the record that named them offers up again on the next sweep.
 func TestAMutationSurvivesASweepItCouldNotFinish(t *testing.T) {
 	p := newParts(t, 0)
-	namespace, objects := p.failing()
+	namespace, objects := p.failing(t)
 	ctx := t.Context()
 
 	if err := namespace.Write(ctx, "f", []byte("the first contents")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	objects.onDelete = errors.New("the object store is not answering deletes")
+	objects.failDeletes(errors.New("the object store is not answering deletes"))
 	if err := namespace.Write(ctx, "f", []byte("the second contents")); err != nil {
 		t.Fatalf("a write failed because the object it displaced could not be deleted: %v", err)
 	}
 	// The sweep a mutation triggers reports nothing, so without this the case reads the same
 	// whether it exercised a failing sweep or no sweep at all, and a write that stopped
 	// sweeping would pass it.
-	if objects.refusedDeletes == 0 {
-		t.Fatal("the write finished without its sweep reaching the object store, so no failing sweep was exercised")
-	}
+	await(t, "the mutation-triggered failing sweep", func() bool { return objects.refusedDeletes.Load() > 0 })
 	if content, err := namespace.Read(ctx, "f"); err != nil || string(content) != "the second contents" {
 		t.Fatalf("the file reads as %q (%v), want the contents the write stored", content, err)
 	}
 
-	objects.onDelete = nil
+	objects.failDeletes(nil)
 	if removed, err := namespace.Sweep(ctx, 100); err != nil || removed != 1 {
 		t.Fatalf("the sweep after the store recovered removed %d objects (%v), want the one the write displaced", removed, err)
 	}

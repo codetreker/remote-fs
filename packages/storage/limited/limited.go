@@ -4,8 +4,13 @@
 // The count and the refusal are ours. They have to be: the store a namespace is held in
 // need have no notion of an allowance at all — a plain directory has none — and the
 // allowance belongs to the workspace rather than to the disk underneath it. So this wraps
-// any storage.Storage. What the namespace holds is measured once, when it is opened, and
-// moved afterwards by every mutation that passes through.
+// any storage.Storage that can produce bounded results. What the namespace holds is
+// measured once, when it is opened, and moved afterwards by every mutation that passes
+// through.
+//
+// Measurement requires storage.BoundedStorage. A complete directory obtained through
+// Storage.List has already escaped any limit by the time this package sees it; the bounded
+// interface lets the caller's measurement budget stop enumeration before that allocation.
 //
 // The count is exact for everything that goes through here and for nothing else. The
 // served namespace being modified behind the server's back is a stated non-goal, and no
@@ -30,9 +35,10 @@ import (
 	"io/fs"
 	"math"
 	"os"
-	"path"
+	"strings"
 	"sync"
 	"syscall"
+	"unsafe"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -44,6 +50,68 @@ import (
 // to avoid (R-ERR-2).
 const MinLimit = 4096
 
+const (
+	// DefaultMaxDirectoryBytes bounds the entries and names retained for one directory
+	// while the namespace is measured.
+	DefaultMaxDirectoryBytes int64 = 64 << 20
+
+	// DefaultMaxFrontierBytes bounds the directory paths still to be visited, including
+	// the directory currently being listed.
+	DefaultMaxFrontierBytes int64 = 64 << 20
+)
+
+// MeasurementLimits bound the two variable-size structures retained while the namespace
+// is measured. They are independent of any transport limits: a measurement walks storage
+// directly, and its retained representation is storage.Entry values and directory paths.
+// A zero field selects its package default; there is no unbounded value.
+type MeasurementLimits struct {
+	MaxDirectoryBytes int64
+	MaxFrontierBytes  int64
+}
+
+// DefaultMeasurementLimits returns the limits used by New.
+func DefaultMeasurementLimits() MeasurementLimits {
+	return MeasurementLimits{
+		MaxDirectoryBytes: DefaultMaxDirectoryBytes,
+		MaxFrontierBytes:  DefaultMaxFrontierBytes,
+	}
+}
+
+// Effective fills zero fields with their defaults and rejects limits that cannot hold
+// even the fixed part of the structure they govern.
+func (l MeasurementLimits) Effective() (MeasurementLimits, error) {
+	if l.MaxDirectoryBytes == 0 {
+		l.MaxDirectoryBytes = DefaultMaxDirectoryBytes
+	}
+	if l.MaxFrontierBytes == 0 {
+		l.MaxFrontierBytes = DefaultMaxFrontierBytes
+	}
+	if l.MaxDirectoryBytes < 0 {
+		return MeasurementLimits{}, fmt.Errorf("the directory measurement bound cannot be negative: %w", syscall.EINVAL)
+	}
+	if l.MaxDirectoryBytes == 0 {
+		return MeasurementLimits{}, fmt.Errorf("the directory measurement bound must be positive: %w", syscall.EINVAL)
+	}
+	if l.MaxDirectoryBytes == math.MaxInt64 {
+		return MeasurementLimits{}, fmt.Errorf("the directory measurement bound must be below the largest byte count: %w", syscall.EINVAL)
+	}
+	if l.MaxFrontierBytes < measurementFrontierNodeBytes {
+		return MeasurementLimits{}, fmt.Errorf(
+			"the traversal-frontier bound is %d bytes, below the %d bytes needed to retain the root: %w",
+			l.MaxFrontierBytes, measurementFrontierNodeBytes, syscall.EINVAL)
+	}
+	if l.MaxFrontierBytes == math.MaxInt64 {
+		return MeasurementLimits{}, fmt.Errorf("the traversal-frontier bound must be below the largest byte count: %w", syscall.EINVAL)
+	}
+	return l, nil
+}
+
+// Validate reports whether the limits can govern a measurement.
+func (l MeasurementLimits) Validate() error {
+	_, err := l.Effective()
+	return err
+}
+
 // stripeCount is how many path exclusions there are. The set is fixed rather than grown
 // per path because R-INT-3 forbids anything that accumulates without a bound, and one
 // mutex per path in a namespace is that. Two distinct paths that fall on one stripe
@@ -53,8 +121,9 @@ const stripeCount = 256
 
 // Storage is a namespace held under an allowance.
 type Storage struct {
-	backing storage.Storage
-	limit   int64
+	backing     storage.BoundedStorage
+	limit       int64
+	measurement MeasurementLimits
 
 	// gate is closed by Recount and held open by every operation, the read-only ones
 	// included. Only a mutation can spoil the walk Recount makes, but a rule with
@@ -73,6 +142,7 @@ type Storage struct {
 }
 
 var _ storage.Storage = (*Storage)(nil)
+var _ storage.BoundedStorage = (*Storage)(nil)
 
 // New holds the namespace in backing under an allowance of limit bytes.
 //
@@ -85,15 +155,36 @@ var _ storage.Storage = (*Storage)(nil)
 // and the answer to it is a namespace that takes no new bytes until it has shed some — not
 // one that cannot be served at all.
 func New(ctx context.Context, backing storage.Storage, limit int64) (*Storage, error) {
+	return NewWithLimits(ctx, backing, limit, DefaultMeasurementLimits())
+}
+
+// NewWithLimits holds the namespace under limit and applies measurement to the startup
+// walk and every Recount. backing must implement storage.BoundedStorage: measuring through
+// Storage.List would allocate a complete directory before this package could enforce its
+// own bound.
+func NewWithLimits(
+	ctx context.Context,
+	backing storage.Storage,
+	limit int64,
+	measurement MeasurementLimits,
+) (*Storage, error) {
 	if limit < MinLimit {
 		return nil, fmt.Errorf("an allowance of %d bytes is below %d, the smallest a namespace can be held under: %w",
 			limit, MinLimit, syscall.EINVAL)
 	}
-	count, err := measure(ctx, backing)
+	effective, err := measurement.Effective()
 	if err != nil {
 		return nil, err
 	}
-	return &Storage{backing: backing, limit: limit, count: count}, nil
+	bounded, ok := backing.(storage.BoundedStorage)
+	if !ok {
+		return nil, fmt.Errorf("measuring an allowance requires backing storage with bounded listings: %w", syscall.ENOSYS)
+	}
+	count, err := measure(ctx, bounded, effective)
+	if err != nil {
+		return nil, err
+	}
+	return &Storage{backing: bounded, limit: limit, measurement: effective, count: count}, nil
 }
 
 // Recount measures the namespace again and replaces the count with what it finds.
@@ -109,7 +200,7 @@ func (s *Storage) Recount(ctx context.Context) error {
 	s.gate.Lock()
 	defer s.gate.Unlock()
 
-	count, err := measure(ctx, s.backing)
+	count, err := measure(ctx, s.backing, s.measurement)
 	if err != nil {
 		return err
 	}
@@ -125,39 +216,177 @@ func (s *Storage) Recount(ctx context.Context) error {
 // no figure there to add. A symbolic link contributes the length of the target it holds,
 // which is what the link occupies and what a write of that link's own would have charged.
 //
-// The walk is iterative because a namespace's depth is not ours to bound.
-func measure(ctx context.Context, s storage.Storage) (int64, error) {
+// Directory entries and the traversal frontier have independent limits. A complete
+// directory remains retained only while its entries are charged and its child paths are
+// added to the frontier. The frontier is a linked stack, so its allocation has no hidden
+// slice capacity beyond the records charged to MaxFrontierBytes.
+func measure(ctx context.Context, s storage.BoundedStorage, limits MeasurementLimits) (int64, error) {
+	if err := s.CheckBounded(); err != nil {
+		return 0, fmt.Errorf("measuring the namespace requires bounded storage results: %w", err)
+	}
+	frontier, err := newMeasurementFrontier(limits.MaxFrontierBytes)
+	if err != nil {
+		return 0, err
+	}
 	var total int64
-	pending := []string{""}
-	for len(pending) > 0 {
-		dir := pending[len(pending)-1]
-		pending = pending[:len(pending)-1]
+	for frontier.more() {
+		if err := measurementCanceled(ctx); err != nil {
+			return 0, err
+		}
+		current := frontier.take()
+		dir := current.path
 
-		entries, err := s.List(ctx, dir)
+		result, err := storage.NewListResult(limits.MaxDirectoryBytes, 0, measurementEntryBytes)
 		if err != nil {
+			return 0, fmt.Errorf("measuring the namespace, preparing to list %q: %w", dir, err)
+		}
+		if err := s.ListBounded(ctx, dir, result); err != nil {
 			return 0, fmt.Errorf("measuring the namespace, listing %q: %w", dir, err)
 		}
+		if err := measurementCanceled(ctx); err != nil {
+			return 0, err
+		}
+		entries, err := result.Entries()
+		if err != nil {
+			return 0, fmt.Errorf("measuring the namespace, completing the listing of %q: %w", dir, err)
+		}
+		if err := measurementCanceled(ctx); err != nil {
+			return 0, err
+		}
 		for _, e := range entries {
+			if err := measurementCanceled(ctx); err != nil {
+				return 0, err
+			}
 			if e.Attr.IsDir() {
-				pending = append(pending, path.Join(dir, e.Name))
+				if err := frontier.add(dir, e.Name); err != nil {
+					return 0, err
+				}
 				continue
+			}
+			if _, err := measurementPathBytes(dir, e.Name); err != nil {
+				return 0, err
 			}
 			// A negative size and a sum past what a byte count holds are both answers no
 			// namespace can give. Taking either would put an allowance in front of a
 			// caller as a measured fact when it is a wrapped or a nonsensical figure, so
 			// each is a failure to report rather than a number to repair (R-ERR-2).
 			if e.Attr.Size < 0 {
+				name, _ := measurementPath(dir, e.Name)
 				return 0, fmt.Errorf("measuring the namespace, %q holds %d bytes: %w",
-					path.Join(dir, e.Name), e.Attr.Size, syscall.EIO)
+					name, e.Attr.Size, syscall.EIO)
 			}
 			if e.Attr.Size > math.MaxInt64-total {
+				name, _ := measurementPath(dir, e.Name)
 				return 0, fmt.Errorf("measuring the namespace, %q carries the total past what a byte count holds: %w",
-					path.Join(dir, e.Name), syscall.EOVERFLOW)
+					name, syscall.EOVERFLOW)
 			}
 			total += e.Attr.Size
 		}
+		frontier.release(current)
 	}
 	return total, nil
+}
+
+func measurementEntryBytes(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+	fixed := int64(unsafe.Sizeof(storage.Entry{}))
+	if nameBytes > math.MaxInt64-fixed {
+		return 0, fmt.Errorf("a directory entry is too large to measure: %w", syscall.EOVERFLOW)
+	}
+	return fixed + nameBytes, nil
+}
+
+type measurementFrontierNode struct {
+	path string
+	next *measurementFrontierNode
+}
+
+var measurementFrontierNodeBytes = int64(unsafe.Sizeof(measurementFrontierNode{}))
+
+type measurementFrontier struct {
+	head     *measurementFrontierNode
+	used     int64
+	maxBytes int64
+}
+
+func newMeasurementFrontier(maxBytes int64) (*measurementFrontier, error) {
+	frontier := &measurementFrontier{maxBytes: maxBytes}
+	if err := frontier.add("", ""); err != nil {
+		return nil, err
+	}
+	return frontier, nil
+}
+
+func (f *measurementFrontier) more() bool { return f.head != nil }
+
+func (f *measurementFrontier) take() *measurementFrontierNode {
+	node := f.head
+	f.head = node.next
+	node.next = nil
+	return node
+}
+
+func (f *measurementFrontier) release(node *measurementFrontierNode) {
+	f.used -= measurementFrontierNodeBytes + int64(len(node.path))
+}
+
+func (f *measurementFrontier) add(dir, name string) error {
+	joinedBytes, err := measurementPathBytes(dir, name)
+	if err != nil {
+		return err
+	}
+	if joinedBytes > math.MaxInt64-measurementFrontierNodeBytes {
+		return fmt.Errorf("a namespace path is too large to retain for measurement: %w", syscall.EOVERFLOW)
+	}
+	charge := measurementFrontierNodeBytes + joinedBytes
+	if charge > f.maxBytes-f.used {
+		return fmt.Errorf(
+			"measuring the namespace needs more than the configured %d-byte traversal frontier while retaining a child of %q: %w",
+			f.maxBytes, dir, syscall.EIO)
+	}
+	joined, err := measurementPath(dir, name)
+	if err != nil {
+		return err
+	}
+	f.head = &measurementFrontierNode{path: joined, next: f.head}
+	f.used += charge
+	return nil
+}
+
+func measurementPathBytes(dir, name string) (int64, error) {
+	if name == "" {
+		if dir == "" {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("a directory listing returned an empty child name below %q: %w", dir, syscall.EIO)
+	}
+	if name == "." || name == ".." || strings.Contains(name, "/") {
+		return 0, fmt.Errorf("a directory listing returned child name %q below %q: %w", name, dir, syscall.EIO)
+	}
+	separator := int64(0)
+	if dir != "" {
+		separator = 1
+	}
+	if int64(len(name)) > math.MaxInt64-int64(len(dir))-separator {
+		return 0, fmt.Errorf("a namespace path is too large to measure: %w", syscall.EOVERFLOW)
+	}
+	return int64(len(dir)) + separator + int64(len(name)), nil
+}
+
+func measurementPath(dir, name string) (string, error) {
+	if _, err := measurementPathBytes(dir, name); err != nil {
+		return "", err
+	}
+	if dir == "" {
+		return name, nil
+	}
+	return dir + "/" + name, nil
+}
+
+func measurementCanceled(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("measuring the namespace: %w", err)
+	}
+	return nil
 }
 
 // reserve charges delta against the allowance, refusing what the allowance cannot pay for,
@@ -415,16 +644,41 @@ func (s *Storage) SetAttr(ctx context.Context, name string, change storage.AttrC
 	return s.backing.SetAttr(ctx, name, change)
 }
 
+// CheckBounded refuses use as an embedded-server backend when the wrapped namespace
+// cannot enforce caller-owned result bounds before allocation.
+func (s *Storage) CheckBounded() error {
+	return s.backing.CheckBounded()
+}
+
 func (s *Storage) List(ctx context.Context, name string) ([]storage.Entry, error) {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
 	return s.backing.List(ctx, name)
 }
 
+func (s *Storage) ListBounded(ctx context.Context, name string, result *storage.ListResult) (returned error) {
+	if result != nil {
+		defer func() {
+			if returned != nil {
+				result.Fail(returned)
+			}
+		}()
+	}
+	s.gate.RLock()
+	defer s.gate.RUnlock()
+	return s.backing.ListBounded(ctx, name, result)
+}
+
 func (s *Storage) Read(ctx context.Context, name string) ([]byte, error) {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
 	return s.backing.Read(ctx, name)
+}
+
+func (s *Storage) ReadBounded(ctx context.Context, name string, maxBytes int64) ([]byte, error) {
+	s.gate.RLock()
+	defer s.gate.RUnlock()
+	return s.backing.ReadBounded(ctx, name, maxBytes)
 }
 
 func (s *Storage) Create(ctx context.Context, name string) error {

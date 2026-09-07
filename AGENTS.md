@@ -61,7 +61,7 @@ Before pushing, run the ones that cover this diff — not the full suite:
 
 ```
 make build                     # both binaries, into bin/
-make azurite                   # the Blob emulator the object store layer runs against
+make azurite                   # the Blob emulator the azblob implementation runs against
 make test                      # every package; mount and end-to-end need /dev/fuse
 go vet ./...
 gofmt -l .                     # prints nothing when the tree is formatted

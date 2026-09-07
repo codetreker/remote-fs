@@ -88,6 +88,8 @@ t1      拿着 P 去续订
 
 因此快照是一个**有生存期、有并发上限**的对象：每份快照有截止时间，超时即中止并放掉资源；同时打开的快照数有上限（R-INT-3）。中止之后客户端从头再来，而**从头再来之所以可以接受，正是因为订阅在前**——重试不影响日志窗口。
 
+SQLite 把长生命周期 snapshot transaction 放进独立 reader pool。`MaxSnapshotReaderConnections` 默认 16，与普通 `MaxReaderConnections` 默认 16 分开；慢 snapshot 可以占满自己的 pool、钉住 WAL，却不能因此夺走 bounded `Since`、event catch-up 与普通 namespace read 使用的全部 connection。`cmd/remote-fs-server -max-snapshot-reader-connections` 为 Blob/local-store 两种 metastore-backed source 暴露该上限。
+
 代价写明：**快照流断了不能续传。** 一致性切割没了就是没了。
 
 一份位置 P 的快照可以给任何**订阅开始 ≤ P** 的客户端共用；服务端做单飞合并时按这条分组。它让「所有客户端同时重建」从 N 次全树扫描变成一次，而位置正是使共用安全的那个东西。这一版不做单飞，但接口不得把它堵死。
@@ -98,13 +100,13 @@ t1      拿着 P 去续订
 
 | 输入 | 规则 |
 |---|---|
-| 事件 | 位置**严格大于**该节点已应用位置才应用。相等即同一事件——自己提交的回显靠这条免费判重 |
+| 事件 | 位置**严格大于**该节点已应用位置才应用。相等即同一事件，因此重连与重放不会重复应用 |
 | 响应 | 携带的下界**大于等于**该节点已应用位置才接受 |
 | 快照 | 它是精确的切割而非下界，所有节点的已应用位置一律种成 P |
 
 位置是 int64，在写事务里分配，0 留作「什么都还没发生过」。**它对每个 workspace 单调，但不连续**：SQLite 的实现让所有 workspace 共用一张 `changes` 表的 rowid 序列，于是一个 workspace 的位置之间有别的 workspace 留下的空洞，而只有数据库里第一个被写入的那个才从 1 开始。契约因此只允许比较位置，不允许对它们做算术——任何一处写出 `位置+1` 的判断，都是在假设一件实现没有承诺的事。
 
-**日志表必须是 `INTEGER PRIMARY KEY AUTOINCREMENT`。** 这一条要写进 schema 的注释，因为省掉 `AUTOINCREMENT` 看起来像是一次无害的优化：不带它时 SQLite 会**重用被删除的最大 rowid**，而我们要裁剪日志——裁到只剩下界之后再追加，位置就会**倒退**，于是客户端的「严格大于」规则会把新事件静默丢弃。`AUTOINCREMENT` 靠 `sqlite_sequence` 保证只增不重用。
+**日志表必须是 `INTEGER PRIMARY KEY AUTOINCREMENT`。** 这一条要写进 schema 的注释，因为省掉 `AUTOINCREMENT` 看起来像是一次无害的优化：不带它时 SQLite 会**重用被删除的最大 rowid**，而我们要裁剪日志——裁到只剩下界之后再追加，位置就会**倒退**，于是客户端的「严格大于」规则会把新事件静默丢弃。当前 SQLite 实现还用 `database_state.change_high_water` 显式分配 position，并要求它与 `sqlite_sequence` 一致；本地持久形态把该值复制进 WAL 外部见证。两层损坏与回退保护由[持久身份高水位](../bug-fix/2026-09-07-persistent-sqlite-identities-use-explicit-high-water-marks.md)拥有。
 
 契约承诺的全序义务是弱的：**每节点的事件顺序与该节点的提交顺序一致，跨节点存在一个任意但全序的位置序列。** SQLite 的全局写串行化白送了真全序且必然与提交顺序一致，但不写进契约——否则将来的 PostgreSQL 后端会被一个它不需要的保证捆住。
 
@@ -140,7 +142,7 @@ t1      拿着 P 去续订
     否则             → 重放该位置之后的全部变更
 ```
 
-化身是一个**随机值**，不是计数器。「任何不连续都换一个新值」这句话用随机值是自明的；用计数器的话，从备份恢复数据库会让它**倒退**，而两份互不相干的日志都停在 1 也不是不可能。随机值在这两种情况下都表现为「对不上 → 重建」，没有需要额外推理的分支。它存在 metastore 自己的库里，schema 初始化时生成，只在下面那条对账失败时换新。
+化身是一个**随机值**，不是计数器。用计数器的话，从备份恢复数据库会让它**倒退**，而两份互不相干的日志都停在 1 也不是不可能；随机值使两条独立历史自然不匹配。它存在 metastore 自己的库里，在新日志初始化时生成；已有日志的 committed tail、trim boundary 与 predecessor chain 不一致时不修改化身，而是按[保留日志完整性](./2026-09-04-retained-log-integrity-refuses-open.md)拒绝打开。
 
 没有化身的后果是这个系统里最坏的那种失败：server 重启后日志为空，客户端拿着位置 12345 来续订，**一个看起来完全正确的实现会回答「在窗口内，你已追平」**——停机期间的全部变更静默丢失，事后无从察觉，而触发它只需要一次普通重启。
 
@@ -174,7 +176,7 @@ metastore 事务 {
 向订阅者发布 Change
 ```
 
-启动时对账：`CommittedPosition > 日志尾` ⇒ 有事件丢了 ⇒ **化身换新** ⇒ 一次昂贵但诚实的重建。
+启动时对账把 retained log 看成 predecessor chain：第一条 surviving change 指向 `trimmed_through`，每条后续 change 指向同 namespace 的上一条，最后一条等于 `CommittedPosition`；没有 surviving row 时 committed tail 等于 trim boundary。任一缺口都说明日志 invariant 已损坏，Open 在 trim 与其它 maintenance 之前以 `EIO` 失败，不修改化身。完整决定见[保留日志不连续时拒绝打开](./2026-09-04-retained-log-integrity-refuses-open.md)。
 
 由此得到一条要写进契约的规则：**一个后端要么能把位置纳入自己的原子提交，要么它的日志不得持久化。**
 
@@ -184,7 +186,7 @@ metastore 事务 {
 
 **日志是每个 metastore 必须提供的能力**，怎么实现由各自决定。`storage.Storage`（R-INT-6 那条契约）一个字不用改，第三方接自有存储照旧只需实现「一份命名空间的存取」。
 
-于是这一版**只有 metastore 后端的 workspace 会被复制**，`localdir` 后端保持今天的直通行为。[观察源与通道](../../proposed/architecture/2026-08-19-observation-source-and-channels.md)论证过一件事：`mount(localdir)` 必须走与生产相同的缓存与失效路径，否则差分对拍对的是一个生产中永不出现的配置。这一版**没有满足它**，而是把它换了个地方还上：`packages/fuse` 的差分对拍仍然挂 `localdir`，对的仍然是一个不带副本的挂载点——它证明的是「挂载层像一个普通目录」，那件事与复制无关，换掉夹具也不会让它多证明什么，因为那一层根本没有服务端。带副本的那条路径改由 `cmd` 的端到端用例走：它们的夹具换成了 metastore 后端（SQLite + 内存对象），于是真实部署走的那条路正是测试走的那条，另留两个用例在 `localdir` 上盯着 `ENOSYS` 那一支。
+于是这一版**只有 metastore 后端的 workspace 会被复制**，`localdir` 后端保持今天的直通行为。[观察源与通道](../../proposed/architecture/2026-08-19-observation-source-and-channels.md)论证过一件事：`mount(localdir)` 必须走与生产相同的缓存与失效路径，否则差分对拍对的是一个生产中永不出现的配置。这一版**没有满足它**，而是把它换了个地方还上：`packages/fuse` 的差分对拍仍然挂 `localdir`，对的仍然是一个不带副本的挂载点——它证明的是「挂载层像一个普通目录」，那件事与复制无关，换掉夹具也不会让它多证明什么，因为那一层根本没有服务端。带副本的那条路径改由 `cmd` 的端到端用例走：它们的夹具换成了 metastore 后端（SQLite + 内存对象），于是真实部署走的那条路正是测试走的那条，另留两个用例在 `localdir` 上盯着 `ENOSYS` 那一支。`packages/storage/localstore` 也把同一份 SQLite metastore 的日志交给 server，所以[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)走相同的快照与增量复制路径。
 
 **残留的缺口写在这里，不留给读者去推**：差分对拍与复制是两组用例，没有一组同时对拍「带副本的挂载点」与「普通目录」。
 
@@ -217,19 +219,19 @@ type Change struct {
 
 这砍掉的是原方案里的直通模式、原子切换、条目预算与降级可见性——**客户端只有一种模式**。代价是 R-WS-4（冷挂载后必须迅速可用）被知情推后：快照多久，`mount` 就卡多久。
 
-选它而不是「立刻可用 + 后台快照 + 追平后切换」，除了少一半代码，还有一个理由：那条路的降级依赖 R-ERR-4（运行中的系统必须能被查询：连接状态、是否处于任何降级模式），而 R-ERR-4 今天**一行代码都没有**。一个不可见的降级按需求的原话等同于不存在，所以那条路会交付一个「挂载点有时候很慢，没人说得清为什么」的系统。阻塞式失败至少是响亮的。
+选它而不是「立刻可用 + 后台快照 + 追平后切换」，除了少一半代码，还有一个理由：那条路的降级依赖 R-ERR-4（运行中的系统必须能被查询：连接状态、是否处于任何降级模式），而 R-ERR-4 当时**一行代码都没有**。一个不可见的降级按需求的原话等同于不存在，所以那条路会交付一个「挂载点有时候很慢，没人说得清为什么」的系统。阻塞式失败至少是响亮的。
 
-将来要恢复「立刻可用」，需要的是 R-ERR-4 先有实现。
+local store 此后有了服务端容量、维护与持久性状态，客户端副本仍没有可查询状态来说明自己正在直通、后台灌快照、已经追平或切换失败。恢复「立刻可用」仍须先让客户端把首次同步与降级模式按 R-ERR-4 暴露出来；服务端状态不能替它回答。
 
 ### 事件走 SSE，与数据分两条连接
 
 事件与批量数据分开。**对 gRPC 意味着两条 HTTP/2 连接，而不是一个连接上的两个 stream**——一个丢包会拖住那条 TCP 上的所有 stream，一条大的未分块消息无论如何都会独占它。「用 gRPC 所以没问题」是一个舒服且错误的结论。
 
-这一版走 SSE：`httprest` 加一个事件端点，与现有的请求／响应端点天然是两条 HTTP 连接，那条分离义务不需要额外机制就成立。R-INT-9 要求的另外两种传输将来各自说明它用什么机制满足它。
+这一版走 SSE：`httprest` 加一个事件端点，与现有的请求／响应端点天然是两条 HTTP 连接，那条分离义务不需要额外机制就成立。R-INT-9 要求的另外两种传输将来各自说明它用什么机制满足它。独立二进制对 accepted connection 与 header/idle lifetime 的限制由[独立 server 的 HTTP connection 上限](./2026-09-04-standalone-http-connection-limits.md)拥有。
 
 义务写成**性质而不是拓扑**：从一次变更被记入日志，到它的事件抵达一个健康订阅者，其耗时与同一 session 上并发的批量传输无关。
 
-**快照与文件传输都必须分块。** 快照是系统里最大的一次批量传输，它挤掉自己的事件通道，后果是重新拉一份快照——一个自我放大的循环，而触发它只需要一次正常的冷挂载。
+**快照与文件传输都必须分块。** 快照是系统里最大的一次批量传输，它挤掉自己的事件通道，后果是重新拉一份快照——一个自我放大的循环，而触发它只需要一次正常的冷挂载。row count 之外的 single-frame、concurrent production、aggregate bytes 与 waiter 上限由[有界复制 frame](./2026-09-04-bounded-replication-frames.md)拥有。
 
 **流是没有超时的那一个。** `http.Client.Timeout` 界的是一整次交换、读完响应体为止，用在操作上是对的，用在订阅上是错的：一条什么都没发生的变更流正是它应有的样子，而按秒切断它等于把「副本什么时候作废」交给一个计时器——正是 R-CON-2 要挡的那种间隔。因此 `httprest` 只对这两个流式操作丢掉调用方的 `Timeout`，改由传输层的 `ResponseHeaderTimeout` 界住「对面到底答不答」，答之后的流不设上限。
 
@@ -262,20 +264,19 @@ type Change struct {
 
 顺带白拿到一件事：服务端现在也能发现死掉的读者了。心跳写失败是那条流结束的方式，而不是让一个 goroutine 和一条连接挂在那里，等着下一次恰好有东西要发布。
 
-### 回显：写完立刻看得见
+### Mutation barrier：写完立刻看得见
 
-R-CON-4 要求写入方自己以及同机其它进程**立即**看到已写入的内容，大小与修改时间在内。这一条是副本最容易破坏的一条：写入走服务端，它的事件从流上回来，两者之间读副本的人拿到的是这个文件**上一次**的大小和上一次的时间——而拿它跟源文件比时间戳的构建工具正是这么读的。
+R-CON-4 要求写入方自己以及同机其它进程**立即**看到已写入的内容，大小与修改时间在内。这一条是副本最容易破坏的一条：写入走服务端，日志事件从 stream 回来；mutation 已成功而 replica 尚未追上时，紧接着的本地 `Stat` 会读到旧大小和旧时间。
 
-因此**每一个修改操作都等自己的回显落到副本之后才返回**。等的是服务端自己记下来的那条变更，不是本地编出来的大小和时间；不花一次往返，因为事件已经在一条开着的连接上往回走了，而这些操作本来就是一次往返。
+只要 handler 持有非空 `Log`，每个 mutation-shaped operation 成功后都先唤醒 publisher，再从 `Log.Barrier` 原子读取 `(incarnation, committed position)` 放进 response。这也包括语义上不改变状态的 operation：它们得到的是当前 barrier，position 可以为 0。对真正产生变更的 mutation，barrier position 可以是本次提交的尾位置，也可以因并发提交而更晚，但到达它必然已经应用本次 mutation。barrier 查询或编码失败发生在 operation 已成功之后，因此 response 以 `EIO` 失败，不把已执行的 mutation 说成未发生。没有日志的 handler 可以省略 barrier；replicated client 的普通 mutation 方法会解码并忽略可选 barrier，`*WithBarrier` 方法则要求它存在且格式有效。
 
-等待按「名字最后一次朝哪个方向变」来判定，而不是按「这条变更是不是我造成的」——变更里没有作者。于是：
+这个 response 形状把 HTTP protocol 提升为 v2：prefix 是 `/v2/`，header 是 `Remote-Fs-Protocol: 2`。v1 的 mutation success 是空 body，无法被 v2 的严格 `MutationResponse` decoder 接受；server 不保留旧 route，client 不做双版本 fallback。这使旧新 peer 的不兼容立即表现为协议失败，不会把空或陌生 body 读成修改成功。
 
-- 判据是**方向**（名字之后有东西／名字之后空了），不是种类。一次改名到已被占用的名字会记下两条变更：目的地被清空，然后节点到达。按种类等的实现会被第一条放行，那一刻 `stat` 目的地会答「不存在」——正是这个系统存在的意义所要避免的那一个答案。
-- 另一个写者同时改同一个名字时，它的变更可能提前放行这一次等待。那正是 R-CC-1 已经声明为未决的那种情形，而这一版没有版本校验。
-- 服务端**什么都没记**的两种操作不等：属性变更不含任何属性，以及把一个名字改名到它自己（POSIX 要求 rename(2) 此时「成功返回且不做别的事」）。两者都仍然发给服务端，因为「这个名字在不在」是服务端的答案。
-- **等不到只是这一次操作等不到，流照旧。** 宽限期不是活性探测器，也不许当成一个：流还在不在送东西，由传输层的心跳与静默上限回答（见「流的活性」），而从一次修改的内部看，一条正在追赶积压的健康流与一条慢流长得一模一样。让宽限期去判流断裂，会让挂载点亲手掐断自己那条健康的流，重连到同一批积压上，再掐一次。所以等不到的那一次报「这个改动发生了，但确认不了」，别的什么都不变——调用方该做的是去读，不是再写一次。
+replicated storage 在发送 request 前只 admission 一条 fixed-size confirmation record，不保留目标 path、direction 或 touched-name history。`replicated.Options` 默认 `ConfirmationGrace = 10s`、`MaxActiveConfirmations = 64`、`MaxWaitingConfirmations = 64`；active/waiter 的 `math.MaxInt` sentinel 被拒绝。active 名额不足时有限等待，waiter 已满、等待 context 取消或 storage 开始关闭时以 `EAGAIN` 失败，request 没有到达服务端。`cmd/remote-fs` 以 `-confirmation-grace`、`-max-active-mutation-confirmations` 与 `-max-waiting-mutation-confirmations` 暴露三项配置，并在连接 server 或创建 replica directory 之前验证。
 
-这也是写入在流不通时失败的理由：那时回显永远不会到，而一个看不到自己刚写的东西的挂载点不满足 R-CON-4。
+server success 后，replicated storage 把 barrier 与当前 replica incarnation/generation 对齐，再等待 `local position >= barrier position`。event 若早于 HTTP response 到达，当前位置已经越过 barrier，等待立即完成；另一个 writer 的 change 不能提前确认，因为 barrier position 不早于本次 commit。stream rebuild 改变 generation、barrier incarnation 不匹配、stream failure、context cancellation、storage close 或 grace 到期都以 `EIO` 失败：namespace 已改变，只是本地结果无法确认。失败只结束该调用，不把一条仍连续的 stream 判坏；调用方应读取当前事实，不能把 `EIO` 当成“修改没有发生”而盲目重试。
+
+空 attribute change 与 rename onto itself 仍然发给服务端，以取得它对 pathname 的权威答案。logged handler 会在成功 response 中附上当前 barrier；但这两种语义 no-op 没有要等待的状态变更，replicated storage 因此直接调用普通 mutation 方法，不进入 `*WithBarrier` 确认路径。其它写入在 stream 不通时失败，因为 barrier 永远无法被本地可信地满足，一个看不到自己刚写内容的挂载点不满足 R-CON-4。
 
 ### 快照期间不缓冲：套接字就是缓冲区
 
@@ -310,6 +311,8 @@ type Storage struct {
 
 副本是 `sqlite.Replica`，不是 `sqlite.Store`：它只给出 `Store` 的读那一半，加上 `Apply` 与 `Reseed`。这个类型的意义就在这里——副本与它所复制的命名空间之间的每一处差异都必须以「某人记下来的一条变更」的形式到达，一个能自己造节点的方法就是这棵树的第二个作者。它抄下源端的节点编号，所以一条指名父目录编号的变更不需要任何翻译；它**不存文件的内容 key**，因为副本永远不去对象存储，那个 key 在这里指向的是本地没有的字节，而 schema 里 `nodes.content` 的外键正是这个意思。
 
+`Reseed` 在整份外部 picture 期间持有 replica exclusive lock 和 SQLite write transaction，使读者不会观察半棵树。exclusive lock 与 commit gate 的等待都遵从调用 context；等待另一份 picture 时取消不会继续占住 commit gate。snapshot rows 可以任意排序，`Seeding` 只累计本轮看到的最大 node ID，在 `Complete` 时一次推进 `database_state.node_high_water` 并核对 `sqlite_sequence`，不为每个 row 重读和更新 allocator state。
+
 ```
 packages/metastore/           + 日志能力，+ Change / Position / Incarnation 这些类型
 packages/sqliteschema/        编号 `.sql` 迁移的加载与重放，schema 的读回与比对    ← 新
@@ -319,6 +322,8 @@ packages/transport/httprest/  + SSE 事件端点、快照端点、客户端订�
 cmd/remote-fs                 + 挂载前建立副本，+ -replica-dir
 cmd/remote-fs-server          + 把 metastore 的日志交给 handler
 ```
+
+当前 SQLite schema 是 v3：`0003_durable_state.sql` 增加数据库到 object store ID 的绑定、database identity/generation、node/change 高水位、全局 identity boundary indexes 与 retained-change predecessor。v2 无法证明旧 retained rows 连续，迁移保留全局高水位、清空旧 rows 并切换 incarnation，使 replica 重建且新 position 不复用旧值。这项后续结构由[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)、[持久身份高水位](../bug-fix/2026-09-07-persistent-sqlite-identities-use-explicit-high-water-marks.md)和[保留日志完整性](./2026-09-04-retained-log-integrity-refuses-open.md)分别记录。
 
 **不新建 `packages/observe`。** 「观察源」作为一条独立契约，是在有两种实现（metastore 日志 vs 服务端合成）时才挣到自己位置的；这一版只有前一种，现在建等于先造一个只有一个实现的抽象。它留在这份 note 里当形状约束。
 
@@ -331,19 +336,22 @@ cmd/remote-fs-server          + 把 metastore 的日志交给 handler
 Snapshot(ctx context.Context) (Snap, Position, error)
 
 type Snap interface {
-    Next(ctx context.Context, limit int) (rows []Row, done bool, err error)
+    Next(ctx context.Context, limit int, result *RowResult) (done bool, err error)
     Close() error
 }
 
 // 日志。落盘与否由实现决定；要落盘就必须与树的改动同事务。
-Since(ctx context.Context, after Position, limit int) ([]Change, Retention, error)
+Since(ctx context.Context, after Position, limit int, result *ChangeResult) (Retention, error)
 
 // 续订标识与对账。
-Incarnation(ctx context.Context) (Incarnation, error)
+Incarnation(ctx context.Context, maxBytes int64) (Incarnation, error)
+Barrier(ctx context.Context, maxIncarnationBytes int64) (LogBarrier, error)
 CommittedPosition(ctx context.Context) (Position, error)
 ```
 
-这四个方法是 `metastore.Log`，而 `metastore.Store` 内嵌它——不是并列的一项能力。位置必须在改动树的那同一个原子提交里分配出来，能做到这件事的只有拥有那个事务的东西；把日志摆在 Store 旁边，等于容许一个「树改了、事件没记下」的窗口，而日志一旦落盘，这个窗口不再自愈。
+`Incarnation`、`Since` 与 `Next` 的 byte budget、payload ownership 与 frame production 规则由[有界复制 frame](./2026-09-04-bounded-replication-frames.md)拥有；接口没有 count-only 的 unbounded 读取旁路。
+
+这些方法是 `metastore.Log`，而 `metastore.Store` 内嵌它——不是并列的一项能力。位置必须在改动树的那同一个原子提交里分配出来，能做到这件事的只有拥有那个事务的东西；把日志摆在 Store 旁边，等于容许一个「树改了、事件没记下」的窗口，而日志一旦落盘，这个窗口不再自愈。
 
 **没有 `Append`。** 记录一条变更是造成它的那次树操作的副作用，所以写路径上的 `Create`、`Mkdir`、`Remove`、`RemoveDir`、`Rename`、`SetAttr`、`Commit` 都不把分配到的位置交回给调用方——一个能追加的接口，等于容许日志说出树没做过的事，而一个交回位置的操作，等于开出第二条「得知一次变更」的路径。裁剪同样不出现在接口里：它由追加与 `Open` 顺带完成。
 
@@ -368,9 +376,9 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 一般地说：**一个被后来的迁移重建掉的对象，在最终 schema 里没有留下痕迹，所以只能靠一个独立见证去钉住。** 版本 1 的见证是测试里手写的那份 DDL。
 
-**最后一个迁移文件例外，而且是暂时的。** 实测：改 `0002_replication.sql`（`entries.name` 改 `TEXT`、删掉两个索引之一、`logs.trimmed_by_age` 改 `TEXT`）——两条结构比对**一条都不响**，只有 golden 响，而 golden 是能重新生成的。两条比对在这里是构造上瞎的：最后一个文件两条路都要跑，所以两边一起变。
+**最后一个迁移文件例外，而且是暂时的。** 当时最后一个文件是 `0002_replication.sql`；实测把其中的 `entries.name` 改成 `TEXT`、删掉两个索引之一、或把 `logs.trimmed_by_age` 改成 `TEXT`，两条结构比对**一条都不响**，只有可重新生成的 golden 响。最后一个文件在新库与迁移库两条路上都会运行，所以两边一起变化；它成为历史时必须取得独立见证。
 
-但这暂时不是缺口，因为**最后一个文件还不是历史**：没有任何数据库到达过它之后的版本，它不可能是一句关于既有数据的谎话，而且改它必然移动 golden。它是一条落在**下一个人身上的义务**——加 `0003` 的那一刻，`0002` 变成历史，从那时起它需要一个见证。
+`0003_durable_state.sql` 落地时，`testdata/version2.sql` 与 `TestTheSecondMigrationDescribesTheVersionTwoDatabasesThatExist` 钉住了 v2，上述义务已经成为测试。当前最后一个文件是 `0003`；它在 `0004` 落地时必须以同样方式取得 v3 见证。
 
 （顺带记下一个实测意外：`entries.name` 在 `0002` 里改成 `TEXT` 之后，**没有任何行为测试变红**。原因是 SQLite 的 TEXT 亲和性不会把 BLOB 值转成文本，存进去的字节仍按字节比较。所以那一处是 golden 独自兜住的，不是被行为测试兜住的。）
 
@@ -398,7 +406,7 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **事件只发失效通知，客户端自己回源。** 自愈——错一次顶多多一次取回，也不要求事件生成完全正确。输在目录改名：服务端一行的改动，客户端要丢掉整棵子树重走一遍，而目录改名正是工具链最常做的操作。它还买不到多少东西——每次操作仍然要回源，只省掉一次 `List`。
 
-**立刻可用 + 后台快照 + 追平后原子切换。** 满足 R-WS-4，冷挂载不卡。输在两点：客户端要同时维护直通与副本两种模式，以及超预算之后的降级依赖 R-ERR-4，而它今天一行代码都没有——一个不可见的降级按需求原话等同于不存在，于是交付出去的是「挂载点有时候很慢，没人说得清为什么」。阻塞式失败至少是响亮的。将来恢复它的前提是 R-ERR-4 先有实现。
+**立刻可用 + 后台快照 + 追平后原子切换。** 满足 R-WS-4，冷挂载不卡。输在两点：客户端要同时维护直通与副本两种模式，以及超预算之后的降级依赖 R-ERR-4，而它当时一行代码都没有——一个不可见的降级按需求原话等同于不存在，于是交付出去的是「挂载点有时候很慢，没人说得清为什么」。阻塞式失败至少是响亮的。local-store 服务端状态已经存在，但它不报告客户端正在直通、追平或切换失败；这条备选的前提仍是客户端拥有可查询的同步与降级状态。
 
 **允许部分副本，按子树同步。** 冷挂载最快，也不需要 R-SCALE-1 有答案。输在它引入「哪些目录是完整的」这一整类判断，而这是整个缓存里最容易错、错了最难发现的一块。全量或不做把这一整类消掉了。
 
@@ -412,7 +420,13 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **快照期间把到达的变更放进客户端自己的缓冲区。** 是那个时序写下来时最直白的读法，也让「缓冲区排空」成为一个看得见的时刻。输在它要多一个上限（R-INT-3 要求可配）、多一种上限到了那天的失败，而它做的事套接字已经在做，顺序还天生正确。放弃的是「排空」这个时刻：副本在快照灌完那一刻就可用，此后落后多少与稳态下落后多少是同一件事。
 
-**回显按变更的种类匹配。** 直觉上等的就是「我这次操作会记出哪一种变更」。输在改名到已被占用的名字：那里先记一条「目的地被清空」，按种类等的实现会被它放行，而那一刻目的地在副本里确实是空的。按方向等（名字之后有东西／没东西）把这一类消掉了，而且不必列一张「哪个操作记出哪些种类」的表。
+**按目标路径、变更种类或结果方向匹配 event。** 不需要扩展 HTTP response，也可以在本地 event 处理中完成等待。输在另一个 writer 能在同一路径产生外形一样的变更；改名到已被占用的目的地还会先产生一条「目的地被清空」。任何基于路径、种类或方向的启发式都可能在本次 commit 尚未被副本应用时被提前满足。barrier position 是由服务端在成功 commit 之后从同一日志读取的，所以不需要猜哪条 event 属于本次操作。
+
+**收到成功 response 后才取得 confirmation 名额。** 没有被使用的名额不会占用 request 的生命周期。输在 namespace 已经改变后才能发现本地等待资源饱和；返回 `EAGAIN` 会误导调用方把 request 当成没有发送。发送前预留一条固定大小的 record，才能在无副作用的时刻以 `EAGAIN` 拒绝。
+
+**保留所有曾触碰路径及其最后 event。** 后登记的 waiter 可以回看 history，不怕 event 抢先。输在状态随 namespace lifetime 与 mutation 数无界增长，而且历史中的同路径 event 仍然不能证明它由哪个 writer 产生。barrier 只保留 active call 的固定大小状态，也不需要 touched-path history。
+
+**server 成功之后继续返回 caller cancellation。** 保留 context 的原始错误。输在它读起来与 request 从未发出相同，而 namespace 已经改变；`EIO` 才表达“修改发生了，但本地副本结果无法确认”。
 
 **流断裂时读仍然直达服务端。** 原方案的状态表就是这么写的，它保住了一部分可用性：服务端还在，读它是诚实的。输在每一处调用点都得答对「这个答案该从哪来」，答错的表现是 R-ERR-1 禁止的那一类，而重连本来就是几百毫秒的事。
 
@@ -431,11 +445,13 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **代价一点五：一条被切断的流最多还会被信任三十秒。** 暴露窗口从「无界」变成「不超过静默上限」，这是真正的收获；但它不是零，而且那三十秒里副本照常作答。把它调小要么增加心跳频率，要么让一次网络抖动被判成断流——两者都有代价，而这个数和保留窗口那三个一样是猜的。
 
-**代价二：冷挂载会卡，卡多久没人知道。** 阻塞式首次同步加上 R-SCALE-1 仍是【未决】，意味着一棵大树上的挂载体验是未测量的。R-WS-4 被知情推后，恢复「立刻可用」的前提是 R-ERR-4 先有实现。
+**Mutation barrier 把写后可见 latency 与资源 admission 暴露给调用方。** active confirmation 名额耗尽时，新 mutation 可能在发送前以 `EAGAIN` 等待或失败；一旦 server 成功，之后无法确认只能返回 `EIO`，即使 namespace 实际已经改变。固定大小的 active record 不随 pathname 大小或历史变更数增长；代价是高并发写入必须配置与吞吐相称的 confirmation ceiling。
 
-**代价三：快照期间一个数据库资源被网络速度牵着**，而客户端在那段时间不读事件流，于是服务端那一侧还多停一个 goroutine 与一条连接在写上。截止时间与并发上限把损害框住，但框不住它存在这件事。SQLite 上表现为 WAL 涨，最严重的时刻正是所有客户端同时重建那一刻；共用快照能把它从 N 份降到 1 份，这一版不做。
+**代价二：冷挂载会卡，卡多久没人知道。** 阻塞式首次同步加上 R-SCALE-1 仍是【未决】，意味着一棵大树上的挂载体验是未测量的。R-WS-4 被知情推后，恢复「立刻可用」的前提是客户端能查询并暴露首次同步、直通与降级状态；服务端已有的 local-store 维护状态不覆盖这些客户端模式。
 
-**代价四：保留窗口那三个数是猜的。** 一万条挡不住一次动两千文件的分支切换，而掉出窗口的代价随树的规模增长。一把可用的标尺是「日志窗口大到超过树本身的规模就不如重建」。快照的截止时间、并发上限与分块大小同样只取了默认值。运维踩到的第一件事很可能是其中之一。
+**代价三：快照期间一个数据库资源被网络速度牵着**，而客户端在那段时间不读事件流，于是服务端那一侧还多停一个 goroutine 与一条连接在写上。截止时间、snapshot reader pool 与并发上限把损害框住，但框不住它存在这件事。SQLite 上表现为 WAL 涨；独立 pool 保护普通/event reads，不会缩短 WAL pin。最严重的时刻仍是所有客户端同时重建；共用快照能把 N 份 read transaction 降到 1 份，这一版不做。
+
+**代价四：保留窗口与资源 ceiling 的默认值都需要部署校准。** 一万条挡不住一次动两千文件的分支切换，而掉出窗口的代价随树的规模增长。快照 deadline/page、single-frame bytes、subscription 数、snapshot-frame concurrency/aggregate/waiters，以及 confirmation grace/active/waiters 都以有限默认值交付；越界会响亮失败，不会扩张成无界 retention。默认值不能替代对真实 tree、change rate 与并发 mount 数的测量。
 
 **`localdir` 后端没有复制，而它曾经是全部端到端测试的夹具。** 那批测试已经换到 metastore 后端（SQLite + 内存对象），于是它们走的是真实部署走的那条路径；`localdir` 留下两个用例，因为那是这个系统仍然要服务的一种形态，也是唯一能从被测代码之外读到字节的那一种。
 

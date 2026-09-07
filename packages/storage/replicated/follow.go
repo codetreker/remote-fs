@@ -6,12 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
-	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
@@ -21,21 +19,6 @@ import (
 // stream is down nothing here is answered at all, so nothing becomes visible at a boundary.
 // What it bounds is how fast a server that is not there is dialled.
 const reconnectDelay = 250 * time.Millisecond
-
-// DefaultEchoGrace is how long a caller waits for the change it made to come back before it
-// gives up on confirming it.
-//
-// What runs out here is one operation's patience, and nothing else. It does not end the
-// stream: whether the stream is still being delivered is a question the transport already
-// answers, by a keepalive on one side and a bound on silence on the other, and a stream that
-// is merely slow is not one that is gone. Ending it from here would be worse than useless —
-// a mount whose backlog takes longer than this to apply would break its own healthy stream,
-// reconnect to the same backlog, and do it again.
-//
-// So a caller that reaches this is told that the change happened and could not be confirmed,
-// and everything else carries on. The copy is behind by that one change for as long as the
-// stream needs, which is the same thing that is true of every change made anywhere else.
-const DefaultEchoGrace = 10 * time.Second
 
 // build attaches to the stream and fills the copy from one picture of the tree.
 //
@@ -193,6 +176,9 @@ func (s *Storage) seeded(incarnation metastore.Incarnation, at metastore.Positio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.incarnation != incarnation {
+		s.generation++
+	}
 	s.incarnation, s.at, s.failure, s.behind = incarnation, at, nil, 0
 	s.wake()
 }
@@ -210,6 +196,9 @@ func (s *Storage) resumed(incarnation metastore.Incarnation, tail metastore.Posi
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.incarnation != incarnation {
+		s.generation++
+	}
 	s.incarnation = incarnation
 	if s.at >= tail {
 		s.behind, s.failure = 0, nil
@@ -230,12 +219,13 @@ func (s *Storage) fail(err error) {
 
 	s.failure, s.behind = err, 0
 	s.wake()
+	s.wakeConfirmationCapacity()
 }
 
 // applied records a change that is now in the copy. Only a change the copy took reaches here:
 // one it discarded moved nothing, and treating it as applied would take this account of where
 // the copy stands backwards — to a position the copy passed when a picture carried it further
-// — and would answer a caller waiting for its own change with a change that was never applied.
+// — and could satisfy a later mutation barrier with a change that was never applied.
 func (s *Storage) applied(change metastore.Change) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -245,9 +235,6 @@ func (s *Storage) applied(change metastore.Change) {
 	// everything the log had when the stream began, so it may be answered from again.
 	if s.behind != 0 && s.at >= s.behind {
 		s.behind, s.failure = 0, nil
-	}
-	if len(s.waiting) > 0 {
-		s.record(change)
 	}
 	s.wake()
 }
@@ -271,6 +258,9 @@ func (s *Storage) usable(op, path string) *os.PathError {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.closing {
+		return &os.PathError{Op: op, Path: path, Err: fmt.Errorf("the replicated storage is closing: %w", syscall.EIO)}
+	}
 	if s.failure == nil {
 		return nil
 	}
@@ -285,170 +275,144 @@ func (s *Storage) wake() {
 	s.notify = make(chan struct{})
 }
 
-// --- waiting for one's own change to come back ---------------------------------------------
-
-// location is one name in one directory, named the way a change names it.
-type location struct {
-	parent int64
-	name   string
+// wakeConfirmationCapacity releases callers waiting for confirmation admission. The caller holds mu.
+func (s *Storage) wakeConfirmationCapacity() {
+	close(s.confirmationCapacity)
+	s.confirmationCapacity = make(chan struct{})
 }
 
-// touch is the newest change at a name in each direction: where something was last put there,
-// and where the name was last emptied.
-//
-// Both are kept because a name may change in both directions while a caller is watching it,
-// and a caller waiting for one of them must be released by that one alone. A single position
-// with a flag would let a removal that happened afterwards hide the creation that caller was
-// waiting for, and it would wait out the grace for a change that had already arrived.
-type touch struct {
-	filled  metastore.Position
-	emptied metastore.Position
+// --- mutation barrier confirmation ---------------------------------------------------------
+
+// confirmation is one fixed-size admitted mutation. The barrier is filled only after the
+// server reports success; an event may already have advanced the replica by then.
+type confirmation struct {
+	generation uint64
+	position   metastore.Position
+	ready      bool
 }
 
-// expect records that a caller is about to change the namespace and will wait for that change
-// to come back. The position is read in the same breath: everything the copy already holds is
-// older than the change about to be made, so anything newer than this is a candidate for it.
-func (s *Storage) expect() metastore.Position {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Storage) expect(ctx context.Context, op, path string) (*confirmation, error) {
+	waiting := false
+	for {
+		s.mu.Lock()
+		if s.closing {
+			if waiting {
+				s.confirmationWaiters--
+				s.wakeConfirmationCapacity()
+			}
+			s.mu.Unlock()
+			return nil, confirmationAdmissionError(op, path, errors.New("the replicated storage is closing"))
+		}
+		if s.failure != nil {
+			if waiting {
+				s.confirmationWaiters--
+				s.wakeConfirmationCapacity()
+			}
+			failure := s.failure
+			s.mu.Unlock()
+			return nil, &os.PathError{Op: op, Path: path, Err: fmt.Errorf(
+				"the copy of this namespace is not being kept current, so the mutation cannot be confirmed: %s: %w",
+				failure, syscall.EIO)}
+		}
+		if s.activeConfirmations < s.options.MaxActiveConfirmations {
+			if waiting {
+				s.confirmationWaiters--
+			}
+			s.activeConfirmations++
+			confirmation := &confirmation{}
+			s.mu.Unlock()
+			return confirmation, nil
+		}
+		if !waiting {
+			if s.confirmationWaiters == s.options.MaxWaitingConfirmations {
+				s.mu.Unlock()
+				return nil, confirmationAdmissionError(op, path, fmt.Errorf(
+					"%d callers are already waiting for mutation confirmation capacity",
+					s.options.MaxWaitingConfirmations))
+			}
+			s.confirmationWaiters++
+			waiting = true
+		}
+		notify := s.confirmationCapacity
+		s.mu.Unlock()
 
-	s.waiting = append(s.waiting, s.at)
-	return s.at
-}
-
-// forget drops a caller's interest and everything that was only being remembered for it.
-//
-// What is kept is what some caller still waiting could be released by: a change at or before
-// the position the earliest of them started from can release nobody, since each of them waits
-// for something strictly later than where it began. Without this the map would keep an entry
-// for every name touched between the first mutation and the moment the mount happened to have
-// none in flight — which on a busy mount is never, and is unbounded growth (R-INT-3).
-func (s *Storage) forget(after metastore.Position) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for i, at := range s.waiting {
-		if at == after {
-			s.waiting = append(s.waiting[:i], s.waiting[i+1:]...)
-			break
+		select {
+		case <-notify:
+		case <-ctx.Done():
+			s.mu.Lock()
+			if waiting {
+				s.confirmationWaiters--
+				s.wakeConfirmationCapacity()
+			}
+			s.mu.Unlock()
+			return nil, confirmationAdmissionError(op, path, fmt.Errorf("the caller stopped waiting: %w", context.Cause(ctx)))
+		case <-s.lifetime.Done():
 		}
 	}
-	if len(s.waiting) == 0 {
-		clear(s.touched)
+}
+
+func (s *Storage) setBarrier(confirmation *confirmation, barrier httprest.MutationBarrier) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if barrier.Position < 0 {
+		return fmt.Errorf("the mutation barrier reports negative position %d: %w", barrier.Position, syscall.EIO)
+	}
+	if metastore.Incarnation(barrier.Incarnation) != s.incarnation {
+		return fmt.Errorf("the mutation barrier names log %q while the replica follows %q: %w",
+			barrier.Incarnation, s.incarnation, syscall.EIO)
+	}
+	confirmation.generation = s.generation
+	confirmation.position = metastore.Position(barrier.Position)
+	confirmation.ready = true
+	s.wake()
+	return nil
+}
+
+func (s *Storage) forget(*confirmation) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeConfirmations == 0 {
 		return
 	}
-	earliest := s.waiting[0]
-	for _, at := range s.waiting[1:] {
-		earliest = min(earliest, at)
-	}
-	for where, landed := range s.touched {
-		if landed.filled <= earliest && landed.emptied <= earliest {
-			delete(s.touched, where)
-		}
-	}
+	s.activeConfirmations--
+	s.wakeConfirmationCapacity()
 }
 
-// record notes what a change did to the names it touched. The caller holds mu.
-func (s *Storage) record(change metastore.Change) {
-	at := location{parent: change.Parent, name: string(change.Name)}
-	landed := s.touched[at]
-	if change.Kind == metastore.Removed {
-		landed.emptied = change.Position
-	} else {
-		landed.filled = change.Position
-	}
-	s.touched[at] = landed
-
-	if change.From != nil {
-		from := location{parent: change.From.Parent, name: string(change.From.Name)}
-		left := s.touched[from]
-		left.emptied = change.Position
-		s.touched[from] = left
-	}
-}
-
-// await returns once the copy holds a change made after a position that left the name the way
-// the operation left it.
-//
-// What it waits for is a change at that name rather than a particular one, because a change
-// carries no mark saying who caused it. Under a second writer changing the same name at the
-// same moment, that writer's change can release this caller a moment early — and both callers
-// are then told about a name two of them changed at once, which is the one case R-CC-1 has
-// already declared undecided. Every other case is exact: the change this caller made is the
-// only one at that name newer than the position it started from.
-func (s *Storage) await(ctx context.Context, op string, after metastore.Position, want echoed) error {
-	grace := time.NewTimer(s.grace)
+func (s *Storage) await(ctx context.Context, op, path string, confirmation *confirmation) error {
+	grace := time.NewTimer(s.options.ConfirmationGrace)
 	defer grace.Stop()
 
 	for {
 		s.mu.Lock()
-		failure, notify := s.failure, s.notify
+		failure, generation, at, ready, notify := s.failure, s.generation, s.at, confirmation.ready, s.notify
+		barrierGeneration, barrierPosition := confirmation.generation, confirmation.position
 		s.mu.Unlock()
 		if failure != nil {
-			return &os.PathError{Op: op, Path: want.path, Err: fmt.Errorf(
-				"the change was made, and this copy stopped being kept current before it came back: %s: %w",
+			return &os.PathError{Op: op, Path: path, Err: fmt.Errorf(
+				"the change was made, and this copy stopped being kept current before reaching its barrier: %s: %w",
 				failure, syscall.EIO)}
 		}
-
-		// Resolved against the copy each time round, because the directory holding the name may
-		// itself be arriving on this stream: a name whose parent is not here yet is one to wait
-		// for rather than one to answer about.
-		if at, err := s.locate(ctx, want.path); err == nil {
-			s.mu.Lock()
-			landed := s.touched[at]
-			s.mu.Unlock()
-			if want.holds && landed.filled > after {
-				return nil
-			}
-			if !want.holds && landed.emptied > after {
-				return nil
-			}
+		if ready && generation != barrierGeneration {
+			return &os.PathError{Op: op, Path: path, Err: fmt.Errorf(
+				"the change was made under a different log incarnation than this copy now follows: %w", syscall.EIO)}
+		}
+		if ready && at >= barrierPosition {
+			return nil
 		}
 
 		select {
 		case <-notify:
 		case <-ctx.Done():
-			return &os.PathError{Op: op, Path: want.path, Err: fmt.Errorf(
-				"the change was made, and waiting for this copy to hold it was cut short: %s: %w",
+			return &os.PathError{Op: op, Path: path, Err: fmt.Errorf(
+				"the change was made, and waiting for this copy to reach its barrier was cut short: %s: %w",
 				context.Cause(ctx), syscall.EIO)}
 		case <-s.lifetime.Done():
-			return &os.PathError{Op: op, Path: want.path, Err: fmt.Errorf(
-				"the change was made, and this copy was released before it came back: %w", syscall.EIO)}
+			return &os.PathError{Op: op, Path: path, Err: fmt.Errorf(
+				"the change was made, and this copy was released before reaching its barrier: %w", syscall.EIO)}
 		case <-grace.C:
-			// This caller gives up, and nothing else does. The stream has not said anything
-			// wrong — a backlog it is working through looks exactly like this — and whether it
-			// is still being delivered at all is answered by the bound the transport keeps on
-			// a stream that has gone quiet, not by how long one caller has been waiting.
-			return &os.PathError{Op: op, Path: want.path, Err: fmt.Errorf(
-				"the change at %q was made, and this copy could not confirm it within %v: %w",
-				want.path, s.grace, syscall.EIO)}
+			return &os.PathError{Op: op, Path: path, Err: fmt.Errorf(
+				"the change was made, and this copy could not confirm it by reaching position %d within %v: %w",
+				barrierPosition, s.options.ConfirmationGrace, syscall.EIO)}
 		}
 	}
-}
-
-// locate reports the name a path stands for as the copy sees it: the id of the directory
-// holding it, and the name it has there. That is how a change names a place, and it is why no
-// translation is needed between the two — the ids in the copy are the server's own.
-func (s *Storage) locate(ctx context.Context, path string) (location, error) {
-	cleaned, err := storage.CleanPath(path)
-	if err != nil {
-		return location{}, err
-	}
-	// The root has no parent and no name, and that is how a change names it too: a log
-	// records the node with no entry at parent zero under no name. Naming it here the way
-	// every other node is named — the id of the directory holding it, which for the root is
-	// itself — would produce a name no change can ever match, so a caller that changed the
-	// root's attributes would wait out its whole grace for an event that had already arrived.
-	if cleaned == "" {
-		return location{}, nil
-	}
-	dir, name := "", cleaned
-	if i := strings.LastIndexByte(cleaned, '/'); i >= 0 {
-		dir, name = cleaned[:i], cleaned[i+1:]
-	}
-	node, err := s.local.Stat(ctx, dir)
-	if err != nil {
-		return location{}, err
-	}
-	return location{parent: node.ID, name: name}, nil
 }

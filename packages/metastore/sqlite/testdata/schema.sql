@@ -7,7 +7,43 @@
 
 CREATE INDEX changes_by_namespace ON changes (namespace, position);
 
+CREATE INDEX changes_by_node_identity ON changes (
+	CASE
+	WHEN typeof(parent) = 'integer'
+	AND typeof(from_parent) IN ('integer', 'null')
+	AND typeof(node) IN ('integer', 'null')
+	THEN 0 ELSE 1
+	END,
+	max(parent, coalesce(from_parent, 0), coalesce(node, 0))
+);
+
+CREATE INDEX changes_by_position_identity ON changes (
+	CASE
+	WHEN typeof(position) = 'integer' AND typeof(previous_position) = 'integer'
+	THEN 0 ELSE 1
+	END,
+	max(position, previous_position)
+);
+
 CREATE INDEX entries_by_node ON entries (node);
+
+CREATE INDEX entries_by_node_identity ON entries (
+	CASE WHEN typeof(parent) = 'integer' AND typeof(node) = 'integer' THEN 0 ELSE 1 END,
+	max(parent, node)
+);
+
+CREATE INDEX logs_by_change_identity ON logs (
+	CASE
+	WHEN typeof(committed_position) = 'integer' AND typeof(trimmed_through) = 'integer'
+	THEN 0 ELSE 1
+	END,
+	max(committed_position, trimmed_through)
+);
+
+CREATE INDEX namespaces_by_root_identity ON namespaces (
+	CASE WHEN typeof(root) = 'integer' THEN 0 ELSE 1 END,
+	root
+);
 
 CREATE INDEX nodes_by_content ON nodes (content);
 
@@ -17,25 +53,39 @@ CREATE INDEX objects_by_state ON objects (namespace, state, created_sec);
 
 -- index sqlite_autoindex_objects_1, which SQLite maintains itself
 
+CREATE TABLE backing_store (
+	singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+	store_id  TEXT    NOT NULL CHECK (store_id <> '')
+) WITHOUT ROWID;
+
 CREATE TABLE changes (
-	position      INTEGER PRIMARY KEY AUTOINCREMENT,
-	namespace     INTEGER NOT NULL REFERENCES namespaces(id),
-	kind          INTEGER NOT NULL,
-	parent        INTEGER NOT NULL,
-	name          BLOB,
-	from_parent   INTEGER,
-	from_name     BLOB,
-	node          INTEGER,
-	mode          INTEGER,
-	size          INTEGER,
-	atime_sec     INTEGER,
-	atime_nsec    INTEGER,
-	mtime_sec     INTEGER,
-	mtime_nsec    INTEGER,
-	content       TEXT,
-	recorded_sec  INTEGER NOT NULL,
-	recorded_nsec INTEGER NOT NULL
+	position          INTEGER PRIMARY KEY AUTOINCREMENT,
+	previous_position INTEGER NOT NULL,
+	namespace         INTEGER NOT NULL REFERENCES namespaces(id),
+	kind              INTEGER NOT NULL,
+	parent            INTEGER NOT NULL,
+	name              BLOB,
+	from_parent       INTEGER,
+	from_name         BLOB,
+	node              INTEGER,
+	mode              INTEGER,
+	size              INTEGER,
+	atime_sec         INTEGER,
+	atime_nsec        INTEGER,
+	mtime_sec         INTEGER,
+	mtime_nsec        INTEGER,
+	content           TEXT,
+	recorded_sec      INTEGER NOT NULL,
+	recorded_nsec     INTEGER NOT NULL
 );
+
+CREATE TABLE database_state (
+	singleton         INTEGER PRIMARY KEY CHECK (singleton = 1),
+	database_id       TEXT    NOT NULL CHECK (length(database_id) = 32),
+	generation        INTEGER NOT NULL CHECK (generation >= 0),
+	node_high_water   INTEGER NOT NULL CHECK (node_high_water >= 0),
+	change_high_water INTEGER NOT NULL CHECK (change_high_water >= 0)
+) WITHOUT ROWID;
 
 CREATE TABLE entries (
 	namespace INTEGER NOT NULL REFERENCES namespaces(id),

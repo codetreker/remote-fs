@@ -59,7 +59,7 @@ func fill(t *testing.T, from *sqlite.Store, into *sqlite.Replica, page int) {
 	defer seeding.Close()
 
 	for {
-		rows, done, err := snap.Next(t.Context(), page)
+		rows, done, err := readRows(t.Context(), snap, page)
 		if err != nil {
 			t.Fatalf("reading the picture: %v", err)
 		}
@@ -79,7 +79,7 @@ func fill(t *testing.T, from *sqlite.Store, into *sqlite.Replica, page int) {
 func replay(t *testing.T, from *sqlite.Store, into *sqlite.Replica) {
 	t.Helper()
 
-	changes, _, err := from.Since(t.Context(), into.Position(), 1000)
+	changes, _, err := readChanges(t.Context(), from, into.Position(), 1000)
 	if err != nil {
 		t.Fatalf("reading the log: %v", err)
 	}
@@ -173,6 +173,45 @@ func TestACopyIsFilledFromAPictureAndHoldsTheSourcesIds(t *testing.T) {
 	requireSame(t, from, into)
 }
 
+func TestReplicaListBoundedPreservesCompleteResultsAndFailures(t *testing.T) {
+	from := source(t)
+	build(t, from)
+	into := copyOf(t)
+	fill(t, from, into, 1024)
+
+	newResult := func() *storage.ListResult {
+		result, err := storage.NewListResult(1<<20, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+			return 64 + nameBytes, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	complete := newResult()
+	if err := into.ListBounded(t.Context(), "", complete); err != nil {
+		t.Fatalf("listing the replica root: %v", err)
+	}
+	entries, err := complete.Entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("the bounded replica listing omitted every root entry")
+	}
+
+	failed := newResult()
+	if err := into.ListBounded(t.Context(), "missing", failed); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("listing a missing replica directory: %v, want ENOENT", err)
+	}
+	if entries, err := failed.Entries(); !errors.Is(err, syscall.ENOENT) || entries != nil {
+		t.Fatalf("the failed replica listing exposed %+v, %v", entries, err)
+	}
+	if err := into.ListBounded(t.Context(), "", nil); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("listing into a nil result: %v, want EINVAL", err)
+	}
+}
+
 // TestAPictureIsAcceptedWhateverOrderItsRowsArriveIn.
 //
 // A page of one row delivers the tree in as many frames as it has nodes, and a child may
@@ -226,6 +265,44 @@ func TestEveryKindOfChangeIsAppliedAsTheNamespaceRecordedIt(t *testing.T) {
 		}
 		replay(t, from, into)
 		requireSame(t, from, into)
+	}
+}
+
+func TestReplicaRefusesAReusedNodeIdentity(t *testing.T) {
+	from := source(t)
+	into := copyOf(t)
+	fill(t, from, into, 1024)
+	root, err := into.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := metastore.Node{
+		ID: root.ID + 1, Mode: 0o644,
+		AccessTime: time.Unix(1, 0), ModTime: time.Unix(1, 0),
+	}
+	created := metastore.Change{
+		Position: 1, Kind: metastore.Created, Parent: root.ID, Name: []byte("first"), Node: &node,
+	}
+	if applied, err := into.Apply(t.Context(), created); err != nil || !applied {
+		t.Fatalf("applying the initial creation returned applied=%v, err=%v", applied, err)
+	}
+	removed := metastore.Change{
+		Position: 2, Kind: metastore.Removed, Parent: root.ID, Name: []byte("first"),
+	}
+	if applied, err := into.Apply(t.Context(), removed); err != nil || !applied {
+		t.Fatalf("applying the removal returned applied=%v, err=%v", applied, err)
+	}
+	reused := created
+	reused.Position = 3
+	reused.Name = []byte("replacement")
+	if applied, err := into.Apply(t.Context(), reused); !errors.Is(err, syscall.EIO) || applied {
+		t.Fatalf("applying a reused node identity returned applied=%v, err=%v, want false and EIO", applied, err)
+	}
+	if into.Position() != 2 {
+		t.Fatalf("refused reuse advanced the replica to %d, want 2", into.Position())
+	}
+	if _, err := into.Stat(t.Context(), "replacement"); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("refused reuse left a replacement node: %v, want ENOENT", err)
 	}
 }
 
@@ -336,15 +413,15 @@ func TestAChangeThatDoesNotFindWhatItDescribesIsRefused(t *testing.T) {
 	requireSame(t, from, into)
 }
 
-// TestAChangeAtAPositionTheCopyAlreadyHoldsIsDiscarded, which is what makes a replica's own
-// echo free: the change it caused arrives on the stream like any other.
+// TestAChangeAtAPositionTheCopyAlreadyHoldsIsDiscarded covers stream changes already included
+// in the snapshot that built the copy.
 func TestAChangeAtAPositionTheCopyAlreadyHoldsIsDiscarded(t *testing.T) {
 	from := source(t)
 	into := copyOf(t)
 	fill(t, from, into, 1024)
 
 	build(t, from)
-	changes, _, err := from.Since(t.Context(), 0, 1000)
+	changes, _, err := readChanges(t.Context(), from, 0, 1000)
 	if err != nil {
 		t.Fatalf("reading the log: %v", err)
 	}
@@ -417,6 +494,40 @@ func TestAFillingThatWasNotCompletedLeavesTheCopyAsItWas(t *testing.T) {
 		t.Fatalf("the copy stands at position %d after a filling that was discarded, and stood at %d before", into.Position(), at)
 	}
 	requireSame(t, from, into)
+}
+
+func TestReseedReportsAClosedReplicaAsEIO(t *testing.T) {
+	into := copyOf(t)
+	if err := into.Close(); err != nil {
+		t.Fatal(err)
+	}
+	seeding, err := into.Reseed(t.Context())
+	if seeding != nil {
+		seeding.Close()
+		t.Fatal("a closed replica returned a seeding transaction")
+	}
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("reseeding a closed replica returned %v, want EIO", err)
+	}
+}
+
+func TestReseedWaitingForAnotherPictureHonorsCancellation(t *testing.T) {
+	into := copyOf(t)
+	first, err := into.Reseed(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	second, err := into.Reseed(ctx)
+	if second != nil {
+		second.Close()
+		t.Fatal("a canceled reseed returned a second seeding transaction")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceling a reseed behind an active picture returned %v", err)
+	}
 }
 
 // build puts a small tree into a namespace: a directory with a file and a subtree, and a file

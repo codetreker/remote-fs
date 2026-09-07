@@ -49,10 +49,14 @@ type fakeLog struct {
 
 	// sinceCalls counts the reads of the log, so that a test can assert that nothing
 	// reads it on a schedule.
-	sinceCalls int
-	sinceErr   error
+	sinceCalls   int
+	sinceErr     error
+	emptyBounded bool
 
 	snapshotErr error
+	closeErr    error
+	barrierErr  error
+	barrier     *metastore.LogBarrier
 	pages       [][]metastore.Row
 
 	// stall holds a snapshot part way through its delivery, so that abandoning one is
@@ -129,7 +133,7 @@ func (l *fakeLog) opened() int {
 	return l.open
 }
 
-func (l *fakeLog) Since(_ context.Context, after metastore.Position, limit int) ([]metastore.Change, metastore.Retention, error) {
+func (l *fakeLog) readSince(_ context.Context, after metastore.Position, limit int) ([]metastore.Change, metastore.Retention, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.sinceCalls++
@@ -152,10 +156,78 @@ func (l *fakeLog) Since(_ context.Context, after metastore.Position, limit int) 
 	return changes, retention, nil
 }
 
-func (l *fakeLog) Incarnation(context.Context) (metastore.Incarnation, error) {
+func (l *fakeLog) Since(ctx context.Context, after metastore.Position, limit int, result *metastore.ChangeResult) (metastore.Retention, error) {
+	changes, retention, err := l.readSince(ctx, after, limit)
+	if err != nil {
+		return metastore.Retention{}, result.Fail(err)
+	}
+	if l.emptyBounded && limit > 0 {
+		return retention, nil
+	}
+	for _, change := range changes {
+		meta := change
+		name := meta.Name
+		if name == nil {
+			meta.Name = nil
+		} else {
+			meta.Name = []byte{}
+		}
+		var fromName []byte
+		if meta.From != nil {
+			from := *meta.From
+			fromName = from.Name
+			if fromName == nil {
+				from.Name = nil
+			} else {
+				from.Name = []byte{}
+			}
+			meta.From = &from
+		}
+		var content metastore.Key
+		if meta.Node != nil {
+			node := *meta.Node
+			content = node.Content
+			node.Content = ""
+			meta.Node = &node
+		}
+		reservation, fits, err := result.Reserve(meta, metastore.ChangePayloadLengths{
+			Name: int64(len(name)), FromName: int64(len(fromName)), Content: int64(len(content)),
+		})
+		if err != nil {
+			return metastore.Retention{}, err
+		}
+		if !fits {
+			return retention, nil
+		}
+		if err := reservation.Commit(name, fromName, content); err != nil {
+			return metastore.Retention{}, err
+		}
+	}
+	return retention, nil
+}
+
+func (l *fakeLog) Incarnation(_ context.Context, maxBytes int64) (metastore.Incarnation, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if int64(len(l.incarnation)) > maxBytes {
+		return "", syscall.EFBIG
+	}
 	return l.incarnation, nil
+}
+
+func (l *fakeLog) Barrier(_ context.Context, maxBytes int64) (metastore.LogBarrier, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.barrierErr != nil {
+		return metastore.LogBarrier{}, l.barrierErr
+	}
+	if l.barrier != nil {
+		return *l.barrier, nil
+	}
+	if int64(len(l.incarnation)) > maxBytes {
+		return metastore.LogBarrier{}, syscall.EFBIG
+	}
+	return metastore.LogBarrier{Incarnation: l.incarnation, Position: l.tail}, nil
 }
 
 func (l *fakeLog) CommittedPosition(context.Context) (metastore.Position, error) {
@@ -171,19 +243,20 @@ func (l *fakeLog) Snapshot(context.Context) (metastore.Snap, metastore.Position,
 		return nil, 0, l.snapshotErr
 	}
 	l.open++
-	return &fakeSnap{log: l, pages: l.pages, stall: l.stall, slow: l.slowPage}, l.tail, nil
+	return &fakeSnap{log: l, pages: l.pages, stall: l.stall, slow: l.slowPage, closeErr: l.closeErr}, l.tail, nil
 }
 
 type fakeSnap struct {
-	log    *fakeLog
-	pages  [][]metastore.Row
-	sent   int
-	stall  bool
-	slow   time.Duration
-	closed bool
+	log      *fakeLog
+	pages    [][]metastore.Row
+	sent     int
+	stall    bool
+	slow     time.Duration
+	closeErr error
+	closed   bool
 }
 
-func (s *fakeSnap) Next(ctx context.Context, _ int) ([]metastore.Row, bool, error) {
+func (s *fakeSnap) readNext(ctx context.Context, _ int) ([]metastore.Row, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
@@ -206,6 +279,36 @@ func (s *fakeSnap) Next(ctx context.Context, _ int) ([]metastore.Row, bool, erro
 	return page, s.sent == len(s.pages), nil
 }
 
+func (s *fakeSnap) Next(ctx context.Context, limit int, result *metastore.RowResult) (bool, error) {
+	rows, done, err := s.readNext(ctx, limit)
+	if err != nil {
+		return false, result.Fail(err)
+	}
+	for _, row := range rows {
+		meta := row
+		name, content := meta.Name, meta.Node.Content
+		if name == nil {
+			meta.Name = nil
+		} else {
+			meta.Name = []byte{}
+		}
+		meta.Node.Content = ""
+		reservation, fits, err := result.Reserve(meta, metastore.RowPayloadLengths{
+			Name: int64(len(name)), Content: int64(len(content)),
+		})
+		if err != nil {
+			return false, err
+		}
+		if !fits {
+			return false, result.Fail(errors.New("the fake snapshot page exceeded its result bound"))
+		}
+		if err := reservation.Commit(name, content); err != nil {
+			return false, err
+		}
+	}
+	return done, nil
+}
+
 func (s *fakeSnap) Close() error {
 	if s.closed {
 		return errors.New("the snapshot was closed twice")
@@ -214,7 +317,7 @@ func (s *fakeSnap) Close() error {
 	s.log.mu.Lock()
 	defer s.log.mu.Unlock()
 	s.log.open--
-	return nil
+	return s.closeErr
 }
 
 // recording is a storage that appends to a log whatever changes it made, the way a store
@@ -224,6 +327,18 @@ func (s *fakeSnap) Close() error {
 type recording struct {
 	storage.Storage
 	log *fakeLog
+}
+
+func (r recording) CheckBounded() error {
+	return r.Storage.(storage.BoundedStorage).CheckBounded()
+}
+
+func (r recording) ListBounded(ctx context.Context, path string, result *storage.ListResult) error {
+	return r.Storage.(storage.BoundedStorage).ListBounded(ctx, path, result)
+}
+
+func (r recording) ReadBounded(ctx context.Context, path string, maxBytes int64) ([]byte, error) {
+	return r.Storage.(storage.BoundedStorage).ReadBounded(ctx, path, maxBytes)
 }
 
 func (r recording) Mkdir(ctx context.Context, path string) error {
@@ -267,6 +382,30 @@ func serveLogWatchedFor(t *testing.T, log metastore.Log, limits httprest.Limits,
 	return s
 }
 
+func serveLogWithOptions(t *testing.T, log metastore.Log, handlerOptions httprest.HandlerOptions, dialOptions httprest.DialOptions) *httprest.Storage {
+	t.Helper()
+	backing, err := localdir.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("open the namespace: %v", err)
+	}
+	var served storage.Storage = backing
+	if fake, ok := log.(*fakeLog); ok {
+		served = recording{Storage: backing, log: fake}
+	}
+	handler, err := httprest.NewHandlerWithOptions(served, log, handlerOptions)
+	if err != nil {
+		t.Fatalf("new handler: %v", err)
+	}
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	client, err := httprest.DialWithOptions(srv.URL, srv.Client(), dialOptions)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	return client
+}
+
 // watch subscribes and arranges for the subscription to be closed before the server is,
 // because a server waits for the requests still on it and a change stream is one of those.
 func watch(t *testing.T, s *httprest.Storage, open func() (*httprest.Subscription, error)) *httprest.Subscription {
@@ -277,6 +416,117 @@ func watch(t *testing.T, s *httprest.Storage, open func() (*httprest.Subscriptio
 	}
 	t.Cleanup(func() { sub.Close() })
 	return sub
+}
+
+func TestOversizedChangeFaultsBeforeAnyChangeFrameIsAccepted(t *testing.T) {
+	log := newFakeLog()
+	log.record(created(strings.Repeat("x", 1024)))
+	handlerOptions := httprest.DefaultHandlerOptions()
+	handlerOptions.MaxFrameBytes = 1024
+	dialOptions := httprest.DefaultDialOptions()
+	dialOptions.MaxFrameBytes = 1024
+	s := serveLogWithOptions(t, log, handlerOptions, dialOptions)
+
+	sub, err := s.Resubscribe(t.Context(), log.incarnation, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	if change, err := sub.Next(); err == nil {
+		t.Fatalf("oversized change returned %+v, %v; want a stream failure before a change", change, err)
+	}
+}
+
+func TestOversizedSnapshotRowInvalidatesTheWholeProducedPage(t *testing.T) {
+	log := newFakeLog()
+	log.closeErr = errors.New("snapshot release also failed")
+	log.pages = [][]metastore.Row{{
+		{Node: metastore.Node{ID: 1, Mode: fs.ModeDir | 0o755}},
+		{Parent: 1, Name: []byte(strings.Repeat("x", 1024)), Node: metastore.Node{ID: 2, Mode: 0o644}},
+	}}
+	handlerOptions := httprest.DefaultHandlerOptions()
+	handlerOptions.MaxFrameBytes = 1024
+	dialOptions := httprest.DefaultDialOptions()
+	dialOptions.MaxFrameBytes = 1024
+	s := serveLogWithOptions(t, log, handlerOptions, dialOptions)
+
+	snap, err := s.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Close()
+	if rows, err := snap.Next(); err == nil || rows != nil {
+		t.Fatalf("oversized snapshot page returned %+v, %v; want no accepted partial rows", rows, err)
+	} else if !strings.Contains(err.Error(), log.closeErr.Error()) {
+		t.Fatalf("snapshot fault %q dropped Close failure %q", err, log.closeErr)
+	}
+}
+
+func TestClientAndServerFrameBoundsAreIndependentAndCompatible(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		clientMax  int64
+		wantChange bool
+	}{
+		{name: "matching bounds", clientMax: 4096, wantChange: true},
+		{name: "client chooses a lower bound", clientMax: 1024},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			log := newFakeLog()
+			log.record(created(strings.Repeat("x", 1200)))
+			handlerOptions := httprest.DefaultHandlerOptions()
+			handlerOptions.MaxFrameBytes = 4096
+			dialOptions := httprest.DefaultDialOptions()
+			dialOptions.MaxFrameBytes = c.clientMax
+			s := serveLogWithOptions(t, log, handlerOptions, dialOptions)
+			sub, err := s.Resubscribe(t.Context(), log.incarnation, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sub.Close()
+			change, err := sub.Next()
+			if c.wantChange {
+				if err != nil || len(change.Name) != 1200 {
+					t.Fatalf("compatible frame returned name=%d, err=%v", len(change.Name), err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("client accepted a frame above its own %d-byte bound", c.clientMax)
+			}
+		})
+	}
+}
+
+func TestOversizedIncarnationIsRefusedBeforeTheStreamOpens(t *testing.T) {
+	log := newFakeLog()
+	log.incarnation = metastore.Incarnation(strings.Repeat("x", httprest.MaxIncarnationBytes+1))
+	handlerOptions := httprest.DefaultHandlerOptions()
+	handlerOptions.MaxFrameBytes = 1024
+	dialOptions := httprest.DefaultDialOptions()
+	dialOptions.MaxFrameBytes = 1024
+	s := serveLogWithOptions(t, log, handlerOptions, dialOptions)
+	if sub, err := s.Subscribe(t.Context()); err == nil || sub != nil {
+		t.Fatalf("oversized incarnation opened a stream: %v, %v", sub, err)
+	}
+	if err := s.Mkdir(t.Context(), "committed"); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("the same oversized incarnation returned mutation result %v, want EIO", err)
+	}
+}
+
+func TestAByteBoundedLogCannotReturnNoChangesWhileItsTailIsAhead(t *testing.T) {
+	log := newFakeLog()
+	log.record(created("missing"))
+	log.emptyBounded = true
+	s := serveLog(t, log, httprest.DefaultLimits())
+	sub, err := s.Resubscribe(t.Context(), log.incarnation, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	if change, err := sub.Next(); err == nil {
+		t.Fatalf("empty bounded page advanced the stream with %+v, %v", change, err)
+	}
 }
 
 // A replica that fell out of the log's window has to be told to start over, and told which
@@ -972,6 +1222,40 @@ func TestAFaultOnAStreamReachesTheCaller(t *testing.T) {
 	}
 }
 
+func TestCompletionAndDepartureFramesRequireAnExactEmptyObject(t *testing.T) {
+	malformed := map[string]string{
+		"null":           `null`,
+		"array":          `[]`,
+		"scalar":         `1`,
+		"unknown member": `{"extra":1}`,
+		"trailing value": `{} {}`,
+	}
+	for name, payload := range malformed {
+		t.Run("snapshot done "+name, func(t *testing.T) {
+			s := streamOf(t, frame("open", `{"position":1}`)+frame("done", payload))
+			snap, err := s.Snapshot(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer snap.Close()
+			if _, err := snap.Next(); err == nil || errors.Is(err, io.EOF) {
+				t.Fatalf("malformed done frame returned %v", err)
+			}
+		})
+		t.Run("subscription gone "+name, func(t *testing.T) {
+			s := streamOf(t, frame("start", `{"incarnation":"a-log","position":1,"tail":1}`)+frame("gone", payload))
+			sub, err := s.Subscribe(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sub.Close()
+			if _, err := sub.Next(); err == nil || errors.Is(err, httprest.ErrServerStopping) {
+				t.Fatalf("malformed gone frame returned %v", err)
+			}
+		})
+	}
+}
+
 // Everything a plain request checks about an answer is checked about a stream too, because
 // a stream is committed to before its first frame arrives.
 func TestAStreamThatIsNotThisProtocolIsRefused(t *testing.T) {
@@ -1068,6 +1352,79 @@ func TestAChangeThatDoesNotSayWhatHappenedIsRefused(t *testing.T) {
 	}
 }
 
+func TestReplicationNodesAndPositionsRejectValuesAReplicaCannotPersist(t *testing.T) {
+	badNodes := map[string]func(map[string]any){
+		"missing identity":        func(node map[string]any) { node["id"] = 0 },
+		"negative size":           func(node map[string]any) { node["size"] = -1 },
+		"negative access nanos":   func(node map[string]any) { node["access_time"].(map[string]any)["nanos"] = -1 },
+		"overflowing mod nanos":   func(node map[string]any) { node["mod_time"].(map[string]any)["nanos"] = 1_000_000_000 },
+		"unsupported socket type": func(node map[string]any) { node["mode"] = uint32(fs.ModeSocket | 0o600) },
+	}
+	for name, spoil := range badNodes {
+		t.Run(name, func(t *testing.T) {
+			node := aNode()
+			spoil(node)
+			var change httprest.Change
+			if err := decodesInto(t, map[string]any{
+				"position": 1, "kind": "created", "parent": 1, "name": []byte("a"), "node": node,
+			}, &change); err == nil {
+				t.Fatal("invalid node decoded in a change")
+			}
+			var row httprest.Row
+			if err := decodesInto(t, map[string]any{"parent": 1, "name": []byte("a"), "node": node}, &row); err == nil {
+				t.Fatal("invalid node decoded in a snapshot row")
+			}
+		})
+	}
+	for _, position := range []int64{0, -1} {
+		var change httprest.Change
+		if err := decodesInto(t, map[string]any{
+			"position": position, "kind": "removed", "parent": 1, "name": []byte("a"),
+		}, &change); err == nil {
+			t.Fatalf("change at invalid position %d decoded", position)
+		}
+	}
+}
+
+func TestAChangeStreamRejectsRepeatedAndBackwardPositions(t *testing.T) {
+	for name, next := range map[string]int64{"repeated": 5, "backward": 4} {
+		t.Run(name, func(t *testing.T) {
+			body := frame("start", `{"incarnation":"a-log","position":4,"tail":6}`) +
+				frame("change", `{"position":5,"kind":"removed","parent":1,"name":"YQ=="}`) +
+				frame("change", fmt.Sprintf(`{"position":%d,"kind":"removed","parent":1,"name":"Yg=="}`, next))
+			s := streamOf(t, body)
+			sub, err := s.Subscribe(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sub.Close()
+			if _, err := sub.Next(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sub.Next(); err == nil {
+				t.Fatalf("stream accepted %s position %d", name, next)
+			}
+		})
+	}
+}
+
+func TestCaughtUpRemainsTrueAfterALiveChangePastTheOpeningTail(t *testing.T) {
+	body := frame("start", `{"incarnation":"a-log","position":4,"tail":4}`) +
+		frame("change", `{"position":5,"kind":"removed","parent":1,"name":"YQ=="}`)
+	s := streamOf(t, body)
+	sub, err := s.Subscribe(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	if _, err := sub.Next(); err != nil {
+		t.Fatal(err)
+	}
+	if !sub.CaughtUp() || sub.Position() != 5 {
+		t.Fatalf("after live change: caughtUp=%v position=%d", sub.CaughtUp(), sub.Position())
+	}
+}
+
 // The frames a stream is made of carry facts whose absence is indistinguishable from an
 // ordinary value, so each one is refused when it does not arrive.
 func TestAFrameMissingWhatItCarriesIsRefused(t *testing.T) {
@@ -1135,8 +1492,8 @@ func TestAFrameMissingWhatItCarriesIsRefused(t *testing.T) {
 		if err := json.Unmarshal([]byte(`{"rows":null}`), &page); err == nil {
 			t.Fatal("decoded a page carrying no rows, want a refusal")
 		}
-		if err := json.Unmarshal([]byte(`{"rows":[]}`), &page); err != nil {
-			t.Fatalf("refused a page of no rows, which is a page that is simply empty: %v", err)
+		if err := json.Unmarshal([]byte(`{"rows":[]}`), &page); err == nil {
+			t.Fatal("decoded an empty page that makes no snapshot progress")
 		}
 	})
 
@@ -1468,6 +1825,73 @@ func TestALogThatStopsAnsweringMidStreamSaysSo(t *testing.T) {
 	}
 }
 
+func TestBarrierFailureAfterMutationStillWakesTheChangeStream(t *testing.T) {
+	log := newFakeLog()
+	s := serveLog(t, log, httprest.DefaultLimits())
+	sub := watch(t, s, func() (*httprest.Subscription, error) { return s.Subscribe(t.Context()) })
+	log.mu.Lock()
+	log.barrierErr = errors.New("the barrier row cannot be read")
+	log.mu.Unlock()
+	if err := s.Mkdir(t.Context(), "committed"); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("mutation with unreadable barrier returned %v, want EIO", err)
+	}
+	change, err := sub.Next()
+	if err != nil {
+		t.Fatalf("barrier failure left the committed change stream asleep: %v", err)
+	}
+	if string(change.Name) != "committed" {
+		t.Fatalf("woken stream delivered %q", change.Name)
+	}
+}
+
+func TestServerRejectsInvalidLogBarriersAfterMutation(t *testing.T) {
+	for name, barrier := range map[string]metastore.LogBarrier{
+		"empty incarnation": {Position: 1},
+		"negative position": {Incarnation: "log", Position: -1},
+		"incarnation above requested bound": {
+			Incarnation: metastore.Incarnation(strings.Repeat("x", httprest.MaxIncarnationBytes+1)),
+			Position:    1,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			log := newFakeLog()
+			log.barrier = &barrier
+			s := serveLog(t, log, httprest.DefaultLimits())
+			if err := s.Mkdir(t.Context(), "committed"); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("invalid barrier returned %v, want EIO", err)
+			}
+		})
+	}
+}
+
+func TestServerReturnsPositionZeroBarrierForASuccessfulSemanticNoOp(t *testing.T) {
+	log := newFakeLog()
+	s := serveLog(t, log, httprest.DefaultLimits())
+	barrier, err := s.SetAttrWithBarrier(t.Context(), "", storage.AttrChange{})
+	if err != nil {
+		t.Fatalf("empty attribute change: %v", err)
+	}
+	if barrier.Incarnation != string(log.incarnation) || barrier.Position != 0 {
+		t.Fatalf("fresh no-op barrier = %+v, want incarnation %q at position 0", barrier, log.incarnation)
+	}
+}
+
+func TestMutationBarrierWithWorstCaseJSONEscapingFitsTheMinimumBodyBound(t *testing.T) {
+	log := newFakeLog()
+	log.incarnation = metastore.Incarnation(strings.Repeat("\x00", 128))
+	handlerOptions := httprest.DefaultHandlerOptions()
+	handlerOptions.MaxBodyBytes = 1024
+	handlerOptions.MaxWriteBytes = 1024
+	dialOptions := httprest.DefaultDialOptions()
+	dialOptions.MaxBodyBytes = 1024
+	dialOptions.MaxWriteBytes = 1024
+	s := serveLogWithOptions(t, log, handlerOptions, dialOptions)
+
+	if err := s.Mkdir(t.Context(), "committed"); err != nil {
+		t.Fatalf("bounded barrier at the minimum body limit: %v", err)
+	}
+}
+
 // A change of a kind this protocol cannot name must not be sent under a name that means
 // something else. The replica is told the stream failed, which costs a rebuild; a removal
 // delivered as a creation costs a copy that is wrong for good.
@@ -1576,7 +2000,7 @@ func interleaved(t *testing.T, rounds int, window sqlite.Window) (quiet *sqlite.
 		if err := quiet.Create(t.Context(), fmt.Sprintf("quiet-%d", round)); err != nil {
 			t.Fatalf("create in the quiet namespace: %v", err)
 		}
-		changes, _, err := quiet.Since(t.Context(), seen, 1000)
+		changes, _, err := readLogChanges(t, quiet, seen, 1000)
 		if err != nil {
 			t.Fatalf("read the quiet namespace's log: %v", err)
 		}
@@ -1591,7 +2015,7 @@ func interleaved(t *testing.T, rounds int, window sqlite.Window) (quiet *sqlite.
 // positionsOf reports the positions a namespace's log still holds.
 func positionsOf(t *testing.T, log metastore.Log) []metastore.Position {
 	t.Helper()
-	changes, _, err := log.Since(t.Context(), 0, 1000)
+	changes, _, err := readLogChanges(t, log, 0, 1000)
 	if err != nil {
 		t.Fatalf("read the log: %v", err)
 	}
@@ -1602,10 +2026,26 @@ func positionsOf(t *testing.T, log metastore.Log) []metastore.Position {
 	return positions
 }
 
+func readLogChanges(t *testing.T, log metastore.Log, after metastore.Position, limit int) ([]metastore.Change, metastore.Retention, error) {
+	t.Helper()
+	result, err := metastore.NewChangeResult(64<<20, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
+		return 256 + lengths.Name + lengths.FromName + lengths.Content, nil
+	})
+	if err != nil {
+		return nil, metastore.Retention{}, err
+	}
+	retention, err := log.Since(t.Context(), after, limit, result)
+	if err != nil {
+		return nil, metastore.Retention{}, err
+	}
+	changes, err := result.Changes()
+	return changes, retention, err
+}
+
 // retentionOf reports what a log still holds.
 func retentionOf(t *testing.T, log metastore.Log) metastore.Retention {
 	t.Helper()
-	_, retention, err := log.Since(t.Context(), 0, 0)
+	_, retention, err := readLogChanges(t, log, 0, 0)
 	if err != nil {
 		t.Fatalf("read what the log holds: %v", err)
 	}
@@ -1682,7 +2122,7 @@ func TestAReplicaThatHasAppliedNothingResumesFromZero(t *testing.T) {
 
 func incarnationOf(t *testing.T, log metastore.Log) metastore.Incarnation {
 	t.Helper()
-	incarnation, err := log.Incarnation(t.Context())
+	incarnation, err := log.Incarnation(t.Context(), 1024)
 	if err != nil {
 		t.Fatalf("read the incarnation: %v", err)
 	}
@@ -2065,7 +2505,7 @@ func TestAPictureEndedByAShutdownIsNotAnnouncedAsWhole(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	resp, err := srv.Client().Get(srv.URL + "/v1/snapshot")
+	resp, err := srv.Client().Get(srv.URL + "/v2/snapshot")
 	if err != nil {
 		t.Fatalf("ask for a picture: %v", err)
 	}

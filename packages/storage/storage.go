@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -122,6 +123,178 @@ type Storage interface {
 	// Nothing above may therefore treat a refusal as a transient failure to retry, and
 	// nothing may infer a figure it was not given.
 	Space(ctx context.Context) (Space, error)
+}
+
+// BoundedStorage produces the two variable-size results under a caller-owned bound.
+//
+// Storage remains the general namespace contract because callers such as a local mount
+// already own their limits. A server embedded in another process must require this
+// additional contract before it starts serving: checking a completed []byte or []Entry is
+// too late, because the oversized allocation has already happened.
+//
+// Implementations must reject work before retaining anything that would carry the result
+// over its bound. CheckBounded reports whether every dependency behind the implementation
+// can make that guarantee; it must fail before a server accepts requests rather than wait
+// for the first large result to discover an unbounded dependency.
+type BoundedStorage interface {
+	Storage
+
+	CheckBounded() error
+
+	// ListBounded adds every entry at path to result. result owns both the size
+	// accounting and the returned slice. A producer that already holds an independently
+	// bounded Entry calls Add before retaining another copy; a producer that has not loaded
+	// a variable-length name calls Reserve with its length and attributes, loads the name
+	// only after that succeeds, then calls Commit. Any returned error must invalidate result
+	// with Fail; only a successful call exposes a complete result sorted by name.
+	ListBounded(ctx context.Context, path string, result *ListResult) error
+
+	// ReadBounded returns the complete contents of path when they fit in positive maxBytes. A
+	// larger file is syscall.EFBIG, reported before its complete contents are allocated.
+	ReadBounded(ctx context.Context, path string, maxBytes int64) ([]byte, error)
+}
+
+// ListResult retains one complete directory listing under a caller-defined byte charge.
+// The charge names the bytes the caller will retain for an entry, so a transport can count
+// its exact representation without making storage implementations depend on that wire
+// format. fixedBytes accounts for the representation of an empty listing.
+//
+// Add returns syscall.EIO when the complete listing cannot fit. A listing has no useful
+// prefix: treating the entries accumulated before the bound as success would state that
+// every omitted name does not exist.
+type ListResult struct {
+	maxBytes   int64
+	usedBytes  int64
+	entryBytes func(index int, nameBytes int64, attr Attr) (int64, error)
+	entries    []Entry
+	pending    int
+	failure    error
+}
+
+// NewListResult constructs an empty bounded listing. Every bound and charge must be
+// non-negative, and maxBytes must leave room for the empty representation.
+func NewListResult(maxBytes, fixedBytes int64, entryBytes func(index int, nameBytes int64, attr Attr) (int64, error)) (*ListResult, error) {
+	if maxBytes < 0 {
+		return nil, fmt.Errorf("a listing byte bound cannot be negative: %w", syscall.EINVAL)
+	}
+	if fixedBytes < 0 || fixedBytes > maxBytes {
+		return nil, fmt.Errorf("the empty listing requires %d bytes under a %d-byte bound: %w", fixedBytes, maxBytes, syscall.EFBIG)
+	}
+	if entryBytes == nil {
+		return nil, fmt.Errorf("a listing result needs an entry byte charge: %w", syscall.EINVAL)
+	}
+	return &ListResult{maxBytes: maxBytes, usedBytes: fixedBytes, entryBytes: entryBytes}, nil
+}
+
+// Add retains entry if its caller-defined charge fits. The charge is evaluated before the
+// entry is appended, which is the ordering that makes the bound useful to an implementation
+// enumerating a directory one row or one readdir batch at a time.
+func (r *ListResult) Add(entry Entry) error {
+	reservation, err := r.Reserve(int64(len(entry.Name)), entry.Attr)
+	if err != nil {
+		return err
+	}
+	return reservation.Commit(entry.Name)
+}
+
+// Reserve charges one entry before its name is loaded. A database-backed implementation
+// uses the length stored in SQLite to refuse an oversized BLOB before scanning it into a Go
+// allocation. It retains attributes with times normalized to UTC, so the reservation itself
+// cannot keep caller-owned Location data alive. Every successful reservation must be
+// committed exactly once before Entries.
+func (r *ListResult) Reserve(nameBytes int64, attr Attr) (*ListReservation, error) {
+	if r == nil {
+		return nil, fmt.Errorf("a nil listing result cannot retain an entry: %w", syscall.EINVAL)
+	}
+	if r.failure != nil {
+		return nil, r.failure
+	}
+	if nameBytes < 0 {
+		return nil, r.fail(fmt.Errorf("a listing name cannot have negative length: %w", syscall.EIO))
+	}
+	attr.AccessTime = attr.AccessTime.UTC()
+	attr.ModTime = attr.ModTime.UTC()
+	index := len(r.entries) + r.pending
+	bytes, err := r.entryBytes(index, nameBytes, attr)
+	if err != nil {
+		return nil, r.fail(err)
+	}
+	if bytes < 0 {
+		return nil, r.fail(fmt.Errorf("the listing charge at index %d is negative: %w", index, syscall.EINVAL))
+	}
+	if bytes > r.maxBytes-r.usedBytes {
+		return nil, r.fail(fmt.Errorf("the complete listing exceeds its %d-byte result bound: %w", r.maxBytes, syscall.EIO))
+	}
+	r.usedBytes += bytes
+	r.pending++
+	return &ListReservation{result: r, nameBytes: nameBytes, attr: attr}, nil
+}
+
+// Entries returns the completed listing sorted by bytewise name. The returned slice is
+// owned by the ListResult and remains valid until the result is discarded.
+func (r *ListResult) Entries() ([]Entry, error) {
+	if r.failure != nil {
+		return nil, r.failure
+	}
+	if r.pending != 0 {
+		return nil, fmt.Errorf("the listing has %d entries whose names were reserved but not loaded: %w", r.pending, syscall.EIO)
+	}
+	slices.SortFunc(r.entries, func(a, b Entry) int { return strings.Compare(a.Name, b.Name) })
+	if r.entries == nil {
+		return []Entry{}, nil
+	}
+	return r.entries, nil
+}
+
+// Fail invalidates every entry accumulated for an operation that did not complete. Once a
+// ListBounded call returns an error, its result must not expose a plausible partial list.
+func (r *ListResult) Fail(err error) error {
+	if r == nil || err == nil {
+		return err
+	}
+	return r.fail(err)
+}
+
+func (r *ListResult) fail(err error) error {
+	if r.failure == nil {
+		r.failure = err
+	}
+	r.entries = nil
+	r.pending = 0
+	return r.failure
+}
+
+// MaxBytes is the caller-defined bound on the complete listing representation.
+func (r *ListResult) MaxBytes() int64 {
+	if r == nil {
+		return 0
+	}
+	return r.maxBytes
+}
+
+// ListReservation is one charged entry whose name has not yet been loaded.
+type ListReservation struct {
+	result    *ListResult
+	nameBytes int64
+	attr      Attr
+	committed bool
+}
+
+// Commit supplies the name whose length was charged by Reserve and retains an owned copy.
+func (r *ListReservation) Commit(name string) error {
+	if r == nil || r.result == nil || r.committed {
+		return fmt.Errorf("a listing reservation can be committed exactly once: %w", syscall.EINVAL)
+	}
+	if int64(len(name)) != r.nameBytes {
+		return r.result.fail(fmt.Errorf("the listing name has %d bytes after %d were reserved: %w", len(name), r.nameBytes, syscall.EIO))
+	}
+	if r.result.failure != nil {
+		return r.result.failure
+	}
+	r.committed = true
+	r.result.pending--
+	r.result.entries = append(r.result.entries, Entry{Name: strings.Clone(name), Attr: r.attr})
+	return nil
 }
 
 // Space is the room a namespace has, in bytes.

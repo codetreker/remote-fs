@@ -43,8 +43,9 @@ R-ERR-6 说，一份由多个能各自失败的部分拼成的 storage 实现，
 
 - **`Get` 失败** —— 读报出它遇到的失败本身（`errors.Is` 找得到注入的那个错），不是 ENOENT，也不是任何
   别的读起来像「这个名字怎么样了」的 errno；并且树这一半仍然回答，文件还在，长度还在，失败没有被写回树里。
-- **`Put` 失败** —— 写失败，且**什么都没留下**：名字不存在，用量是 0。写为它预留的那个键不是用量，它是
-  一个没人会引用的对象，等宽限期过去由清扫回收。
+- **`Put` 失败** —— 写失败，名字不存在，用量是 0；reservation 进入 unresolved，继续占 pending admission，
+  且永远不授权清扫同 key 的对象。只有 `Put` 已成功、随后 `Commit` 失败时才 `Abandon`，因为这条路径已经
+  证明对象由本次 reservation 创建。两种失败都保留原始对象错误与 metastore cleanup error。
 - **`Delete` 失败** —— 清扫报出失败且报告删掉了 0 个；对象存储恢复之后，同一批积压还在原地等着被清掉。
   一次失败的删除**不忘记任何记录**。另有一例证明反向：一次成功的改动不会因为它触发的那次清扫删不掉
   旧对象而失败——名字指向该指的地方，唯一的代价是还没回收的字节，而记录仍在，下一次清扫拿得到它。
@@ -60,8 +61,11 @@ azblob 那一侧继续对着死地址跑真实客户端，那是它自己该证�
 
 | 层 | 它证的 |
 |---|---|
-| `packages/storage/objectstore/azblob` | 一份真实的 blob 客户端怎么给失败分类：没人监听的地址、不存在的容器、被撤回的请求，三个方法各一次；以及映射表本身只有 `BlobNotFound` 通向 ENOENT |
-| `packages/storage/objectstore` | 不管 `Objects` 报什么，命名空间都不把它答成关于名字的事实，也不留下半个动作的痕迹 |
+| `packages/storage/objectstore/azblob` | 一份真实的 blob 客户端怎么给失败分类：没人监听的地址、不存在的 container、被撤回的请求，`Get`、`Put`、`Delete` 各一次；`Available` 另探测正常、不可达、container 缺失与凭据拒绝；映射表本身只有 `BlobNotFound` 通向 ENOENT |
+| `packages/storage/objectstore/objectstoretest` | 每份 `Objects` 实现共同履行 create-only、不可变、错误区分、容量、取消与并发契约，并能在用例 cleanup 时成功关闭；memory、azblob 与 localdisk 都运行同一套用例，关闭的并发、幂等与排空由各实现及组合层另测 |
+| `packages/storage/objectstore` | `Get`、`Put`、`Delete` 的任意失败不被改写成名字事实；另以独立包装层覆盖物理容量测量、部分删除、`Forget` 与关闭失败 |
+| `packages/storage/objectstore/localdisk` | 在真实文件系统操作 seam 注入 `fsync`、link、unlink、`statfs`、`statx` 与 device/mount mismatch，覆盖 FORMAT/lock/probe、objects/shard identity stage/link/barrier、recovery/staging/final object；并发用例分别锁住同一 shard 与另一 shard，证明[本地磁盘对象存储](../architecture/2026-09-04-local-disk-object-store.md)在持久性、store 归属或同一文件系统身份无法证明时停止作答，同时不把全部对象 I/O 串行化 |
+| `packages/storage/localstore` | 在真实 SQLite 与本地文件系统上构造初始化中断、丢失 workspace、`METASTORE` stage/final 损坏、accepted/checkpointed generation 与 WAL 缺失组合、checkpoint pin/error，以及 active reader 下的关闭；只替换见证、单次 barrier 或 pool close reporting 时，证明确认失败 poison、checkpoint/取消可重试、pool close error 进入 terminal 状态、SQLite constructor cleanup 不确定时内部 coordinator 与外部 lifetime lock 都保留 |
 | 契约套件 | 这两半装在一起，行为和别的命名空间一样。它跑在真的 Azurite 和真的 SQLite 上，不用替身——这一层声称的正是两者合起来对不对 |
 
 ## 备选方案
@@ -98,14 +102,17 @@ azblob 那一侧继续对着死地址跑真实客户端，那是它自己该证�
 
 - **组合层不再有任何用例走真实的网络失败。** 它现在依赖 azblob 那一侧证明真实失败被归成非 ENOENT，
   以及契约套件证明这一层拿到的确实是 `*azblob.Objects`。两侧都在，但它们是两个用例而不是一个。
-- **注入用的包装层嵌了 `objectstore.Objects` 接口**，所以接口以后新增方法时它会静默地继承那个方法，
-  而不是编译失败提醒有一条新的失败路径没被注入过。
-- **注入用的命名空间与夹具共用同一棵树**，借用而不拥有，因此不能被 `Close`。这是一条只写在注释里的
-  约束，编译器不检查它。
-- **`metastore.Store` 那一侧没有对应的注入。** 命名空间有两个会各自失败的下游，这次只给其中一个装上
-  了注入。树报错时命名空间怎么答，眼下只由 sqlite 自己的用例和契约套件间接覆盖，没有任何用例把一个
-  任意的错误送进 `metastore.Store` 再看上面这一层拿它怎么办。
-- **一轮删除里「有的成功、有的失败」没有被注入。** `onDelete` 一旦设上就对每个键失败，于是 `discard`
-  永远走不到「删掉了一部分」那条分支，`Forget` 拿到的 `gone` 与 `keys` 从来不是两个不同的值——把
-  `Forget(ctx, gone)` 换成 `Forget(ctx, keys)`，整个 module 的测试照样全绿。要覆盖它，注入得能只对某
-  一个键失败。
+- **注入用的包装层仍嵌入 `objectstore.Objects`。** 接口增加 `Available` 与 `Close` 时，前者被静默继承，
+  后者必须显式改成 no-op，才能让借用夹具的 namespace 只关闭自己的维护 worker。容量失败由
+  `composition_test.go` 的专用包装层覆盖；以后再加方法，嵌入仍不会用编译失败提醒需要新的故障用例。
+- **注入用的 namespace 与夹具共享 metastore 和 objects。** 两个借用包装层的 `Close` 都是 no-op，测试
+  cleanup 因而可以关闭 namespace、排空后台维护，却由原夹具继续拥有持久资源。这个 ownership 由类型约定
+  与注释维持，编译器不证明底层只关闭一次。
+- **`metastore.Store` 仍没有覆盖全部方法的任意错误注入。** 组合用例已经直接送入 `Space` failure 与
+  `Forget` failure，SQLite 自己的用例和 namespace 契约覆盖其余路径；还没有一个与 `failingObjects`
+  对称、能让每个 metastore 方法分别返回任意错误的包装层。
+- **部分删除与记录失败已经各自进入同一个用例。** 第二个 `Delete` 失败且 `Forget` 也失败时，`Sweep`
+  同时返回两项失败、报告只删除一个对象，维护状态保留同一组事实。`forgetFails` 没有记录传入的 key，
+  所以该用例仍不能区分 `Forget(ctx, gone)` 与错误的 `Forget(ctx, keys)`；成功删除的那一个是否是唯一被
+  交给 `Forget` 的 key 仍缺直接断言。一次 backend 调用内部发生「删除已落地但返回结果未知」的外部服务
+  语义也不在这些注入里。

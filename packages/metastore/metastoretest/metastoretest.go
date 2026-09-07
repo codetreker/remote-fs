@@ -771,6 +771,72 @@ var objectCases = []testCase{
 		mustHoldExactly(t, s, "f")
 	}},
 
+	{name: "an unresolved reservation is never collectable or committable", run: func(t *testing.T, s metastore.Store) {
+		key, err := s.Reserve(ctx(t), "f", 10)
+		mustSucceed(t, err)
+		mustSucceed(t, s.Quarantine(ctx(t), key))
+		if got := mustGarbage(t, s); len(got) != 0 {
+			t.Fatalf("an unresolved reservation is collectable: %v", got)
+		}
+		mustFail(t, s.Commit(ctx(t), "f", metastore.Object{Key: key, Size: 10, ModTime: time.Now()}), syscall.EINVAL)
+		mustHoldExactly(t, s)
+	}},
+
+	{name: "quarantining a missing or already-unresolved key converges", run: func(t *testing.T, s metastore.Store) {
+		mustSucceed(t, s.Quarantine(ctx(t), "missing"))
+		mustSucceed(t, s.Quarantine(ctx(t), "missing"))
+		key, err := s.Reserve(ctx(t), "f", 10)
+		mustSucceed(t, err)
+		mustSucceed(t, s.Quarantine(ctx(t), key))
+		mustSucceed(t, s.Quarantine(ctx(t), key))
+	}},
+
+	{name: "quarantining referenced or garbage objects is EINVAL", run: func(t *testing.T, s metastore.Store) {
+		referenced := put(t, s, "f", 10)
+		mustFail(t, s.Quarantine(ctx(t), referenced), syscall.EINVAL)
+		garbage, err := s.Reserve(ctx(t), "g", 10)
+		mustSucceed(t, err)
+		mustSucceed(t, s.Abandon(ctx(t), garbage))
+		mustFail(t, s.Quarantine(ctx(t), garbage), syscall.EINVAL)
+	}},
+
+	{name: "an abandoned reservation is immediately collectable and cannot commit", run: func(t *testing.T, s metastore.Store) {
+		key, err := s.Reserve(ctx(t), "f", 10)
+		mustSucceed(t, err)
+		mustSucceed(t, s.Abandon(ctx(t), key))
+		if got := mustGarbage(t, s); !slices.Equal(got, []metastore.Key{key}) {
+			t.Fatalf("collectable objects are %v, want the abandoned %q", got, key)
+		}
+		mustFail(t, s.Commit(ctx(t), "f", metastore.Object{Key: key, Size: 10, ModTime: time.Now()}), syscall.EINVAL)
+		mustHoldExactly(t, s)
+	}},
+
+	{name: "abandoning a missing or already-garbage key converges", run: func(t *testing.T, s metastore.Store) {
+		mustSucceed(t, s.Abandon(ctx(t), "missing"))
+		mustSucceed(t, s.Abandon(ctx(t), "missing"))
+
+		key, err := s.Reserve(ctx(t), "f", 10)
+		mustSucceed(t, err)
+		mustSucceed(t, s.Abandon(ctx(t), key))
+		mustSucceed(t, s.Abandon(ctx(t), key))
+		if got := mustGarbage(t, s); !slices.Equal(got, []metastore.Key{key}) {
+			t.Fatalf("collectable objects are %v, want the abandoned %q", got, key)
+		}
+	}},
+
+	{name: "abandoning a referenced key is EINVAL", run: func(t *testing.T, s metastore.Store) {
+		key := put(t, s, "f", 10)
+		mustFail(t, s.Abandon(ctx(t), key), syscall.EINVAL)
+		node, err := s.Stat(ctx(t), "f")
+		mustSucceed(t, err)
+		if node.Content != key {
+			t.Fatalf("the file references %q after the refused abandon, want %q", node.Content, key)
+		}
+		if got := mustGarbage(t, s); len(got) != 0 {
+			t.Fatalf("the refused abandon made referenced objects collectable: %v", got)
+		}
+	}},
+
 	// Zero bytes are worth no round trip to an object store, so a file with no contents
 	// references no object and there is nothing to reserve for it. The empty key is how a
 	// commit says so, and it is the same absence Create leaves behind — a truncation to
@@ -800,7 +866,7 @@ var objectCases = []testCase{
 			t.Fatalf("the truncated file references %q and holds %d bytes, want nothing and 0",
 				node.Content, node.Size)
 		}
-		if got := mustGarbage(t, s, 0); !slices.Equal(got, []metastore.Key{held}) {
+		if got := mustGarbage(t, s); !slices.Equal(got, []metastore.Key{held}) {
 			t.Fatalf("collectable objects are %v, want the released %q", got, held)
 		}
 		mustHoldExactly(t, s, "fresh", "written")
@@ -817,11 +883,11 @@ var objectCases = []testCase{
 	// this interface does not reach the object store.
 	{name: "an object a commit displaces becomes garbage", run: func(t *testing.T, s metastore.Store) {
 		first := put(t, s, "f", 10)
-		if got := mustGarbage(t, s, 0); len(got) != 0 {
+		if got := mustGarbage(t, s); len(got) != 0 {
 			t.Fatalf("a live object is already collectable: %v", got)
 		}
 		second := put(t, s, "f", 20)
-		if got := mustGarbage(t, s, 0); !slices.Equal(got, []metastore.Key{first}) {
+		if got := mustGarbage(t, s); !slices.Equal(got, []metastore.Key{first}) {
 			t.Fatalf("collectable objects are %v, want just the displaced %q", got, first)
 		}
 		node, err := s.Stat(ctx(t), "f")
@@ -834,7 +900,7 @@ var objectCases = []testCase{
 	{name: "removing a file makes its object garbage", run: func(t *testing.T, s metastore.Store) {
 		key := put(t, s, "f", 10)
 		mustSucceed(t, s.Remove(ctx(t), "f"))
-		if got := mustGarbage(t, s, 0); !slices.Equal(got, []metastore.Key{key}) {
+		if got := mustGarbage(t, s); !slices.Equal(got, []metastore.Key{key}) {
 			t.Fatalf("collectable objects are %v, want just %q", got, key)
 		}
 	}},
@@ -843,43 +909,41 @@ var objectCases = []testCase{
 		put(t, s, "from", 10)
 		replaced := put(t, s, "onto", 20)
 		mustSucceed(t, s.Rename(ctx(t), "from", "onto"))
-		if got := mustGarbage(t, s, 0); !slices.Equal(got, []metastore.Key{replaced}) {
+		if got := mustGarbage(t, s); !slices.Equal(got, []metastore.Key{replaced}) {
 			t.Fatalf("collectable objects are %v, want just the replaced %q", got, replaced)
 		}
 	}},
 
-	// A reservation nobody committed is collectable once it is older than grace, which is
-	// what bounds how long a write may take between reserving a key and committing it. A
-	// grace long enough that no write could have finished protects it.
-	{name: "a reservation is collectable only once it is older than the grace period",
+	// Time cannot distinguish a dead writer from a slow writer in another process. A
+	// reservation remains committable until the caller explicitly resolves its outcome.
+	{name: "a reservation never becomes collectable merely because time passes",
 		run: func(t *testing.T, s metastore.Store) {
 			key, err := s.Reserve(ctx(t), "f", 1)
 			mustSucceed(t, err)
-			if got := mustGarbage(t, s, time.Hour); len(got) != 0 {
-				t.Fatalf("a fresh reservation is already collectable under an hour of grace: %v", got)
+			if got := mustGarbage(t, s); len(got) != 0 {
+				t.Fatalf("a fresh reservation is collectable: %v", got)
 			}
-			// Committing it while the grace still protects it takes it out of the sweep for
-			// good: it is referenced, not reserved.
 			mustSucceed(t, s.Commit(ctx(t), "f", metastore.Object{Key: key, Size: 1, ModTime: time.Now()}))
-			if got := mustGarbage(t, s, 0); len(got) != 0 {
+			if got := mustGarbage(t, s); len(got) != 0 {
 				t.Fatalf("a committed object is collectable: %v", got)
 			}
 
-			// A reservation the grace no longer covers is handed out instead.
-			stale, err := s.Reserve(ctx(t), "g", 1)
+			reserved, err := s.Reserve(ctx(t), "g", 1)
 			mustSucceed(t, err)
-			if got := mustGarbage(t, s, 0); !slices.Equal(got, []metastore.Key{stale}) {
-				t.Fatalf("collectable objects under no grace are %v, want just %q", got, stale)
+			if got := mustGarbage(t, s); len(got) != 0 {
+				t.Fatalf("an uncommitted reservation became collectable: %v", got)
 			}
+			mustSucceed(t, s.Commit(ctx(t), "g", metastore.Object{Key: reserved, Size: 1, ModTime: time.Now()}))
 		}},
 
 	{name: "a collection is capped at the limit it was given", run: func(t *testing.T, s metastore.Store) {
 		for i := range 5 {
-			_, err := s.Reserve(ctx(t), fmt.Sprintf("f%d", i), 1)
+			key, err := s.Reserve(ctx(t), fmt.Sprintf("f%d", i), 1)
 			mustSucceed(t, err)
+			mustSucceed(t, s.Abandon(ctx(t), key))
 		}
 		for _, limit := range []int{0, 1, 3, 5, 50} {
-			got, err := s.Garbage(ctx(t), limit, 0)
+			got, err := s.Garbage(ctx(t), limit)
 			mustSucceed(t, err)
 			if len(got) > limit {
 				t.Fatalf("a limit of %d returned %d objects", limit, len(got))
@@ -890,13 +954,9 @@ var objectCases = []testCase{
 		}
 	}},
 
-	// A grace period puts the cutoff in the past. A negative one puts it in the future,
-	// offering up reservations whose bytes a writer is still uploading.
-	{name: "a collection refuses a limit or a grace period that is not one",
+	{name: "a collection refuses a limit that is not a count",
 		run: func(t *testing.T, s metastore.Store) {
-			_, err := s.Garbage(ctx(t), -1, time.Hour)
-			mustFail(t, err, syscall.EINVAL)
-			_, err = s.Garbage(ctx(t), 10, -time.Hour)
+			_, err := s.Garbage(ctx(t), -1)
 			mustFail(t, err, syscall.EINVAL)
 		}},
 
@@ -904,42 +964,44 @@ var objectCases = []testCase{
 		key := put(t, s, "f", 10)
 		mustSucceed(t, s.Remove(ctx(t), "f"))
 		mustSucceed(t, s.Forget(ctx(t), []metastore.Key{key}))
-		if got := mustGarbage(t, s, 0); len(got) != 0 {
+		if got := mustGarbage(t, s); len(got) != 0 {
 			t.Fatalf("a forgotten object is still collectable: %v", got)
 		}
 	}},
 
-	// Dropping the record of a referenced object would leave a name pointing at nothing.
-	{name: "forgetting a referenced object is EINVAL", run: func(t *testing.T, s metastore.Store) {
-		key := put(t, s, "f", 10)
-		mustFail(t, s.Forget(ctx(t), []metastore.Key{key}), syscall.EINVAL)
+	// Only garbage represents an object whose bytes a sweeper has authority to remove.
+	{name: "forgetting any non-garbage object is EINVAL", run: func(t *testing.T, s metastore.Store) {
+		referenced := put(t, s, "f", 10)
+		reserved, err := s.Reserve(ctx(t), "reserved", 1)
+		mustSucceed(t, err)
+		unresolved, err := s.Reserve(ctx(t), "unresolved", 1)
+		mustSucceed(t, err)
+		mustSucceed(t, s.Quarantine(ctx(t), unresolved))
+		for _, key := range []metastore.Key{referenced, reserved, unresolved} {
+			mustFail(t, s.Forget(ctx(t), []metastore.Key{key}), syscall.EINVAL)
+		}
 		node, err := s.Stat(ctx(t), "f")
 		mustSucceed(t, err)
-		if node.Content != key {
-			t.Fatalf("the file references %q after the refused forget, want %q", node.Content, key)
+		if node.Content != referenced {
+			t.Fatalf("the file references %q after the refused forget, want %q", node.Content, referenced)
 		}
 
-		// The refusal covers the whole call: a batch holding one referenced key drops none
+		// The refusal covers the whole call: a batch holding one unresolved key drops none
 		// of the others, so a caller is never left unable to say what happened.
-		spare, err := s.Reserve(ctx(t), "spare", 1)
+		garbage, err := s.Reserve(ctx(t), "garbage", 1)
 		mustSucceed(t, err)
-		mustFail(t, s.Forget(ctx(t), []metastore.Key{spare, key}), syscall.EINVAL)
-		if got := mustGarbage(t, s, 0); !slices.Equal(got, []metastore.Key{spare}) {
-			t.Fatalf("collectable objects are %v, want the untouched %q", got, spare)
+		mustSucceed(t, s.Abandon(ctx(t), garbage))
+		mustFail(t, s.Forget(ctx(t), []metastore.Key{garbage, unresolved}), syscall.EINVAL)
+		if got := mustGarbage(t, s); !slices.Equal(got, []metastore.Key{garbage}) {
+			t.Fatalf("collectable objects are %v, want the untouched %q", got, garbage)
 		}
 	}},
 
-	// The sweep and an in-flight write race for the same key, and the sweeper wins by taking
-	// the key out of the state a commit accepts. A collection hands its caller keys it is
-	// about to delete the bytes of; if the reservation stayed committable, the writer that
-	// reserved it would commit after the blob was gone and the name would point at nothing —
-	// Write returns nil, and every Read afterwards is EIO. No adversary is needed, because
-	// Reserve stamps wall-clock time and one forward clock step ages every reservation in
-	// flight past the grace at once.
-	{name: "a key a collection handed out can no longer be committed", run: func(t *testing.T, s metastore.Store) {
+	{name: "an abandoned key a collection handed out can no longer be committed", run: func(t *testing.T, s metastore.Store) {
 		key, err := s.Reserve(ctx(t), "f", 10)
 		mustSucceed(t, err)
-		if got := mustGarbage(t, s, 0); !slices.Equal(got, []metastore.Key{key}) {
+		mustSucceed(t, s.Abandon(ctx(t), key))
+		if got := mustGarbage(t, s); !slices.Equal(got, []metastore.Key{key}) {
 			t.Fatalf("collectable objects are %v, want the swept reservation %q", got, key)
 		}
 		mustFail(t, s.Commit(ctx(t), "f", metastore.Object{Key: key, Size: 10, ModTime: time.Now()}), syscall.EINVAL)
@@ -953,14 +1015,14 @@ var objectCases = []testCase{
 	{name: "collecting twice does not make a swept key committable again", run: func(t *testing.T, s metastore.Store) {
 		key, err := s.Reserve(ctx(t), "f", 10)
 		mustSucceed(t, err)
-		first := mustGarbage(t, s, 0)
-		second := mustGarbage(t, s, 0)
+		mustSucceed(t, s.Abandon(ctx(t), key))
+		first := mustGarbage(t, s)
+		second := mustGarbage(t, s)
 		if !slices.Equal(first, second) {
 			t.Fatalf("two collections returned %v then %v, want the same keys until they are forgotten", first, second)
 		}
-		// The grace period no longer protects it: it is garbage now, not a reservation.
-		if got := mustGarbage(t, s, time.Hour); !slices.Equal(got, []metastore.Key{key}) {
-			t.Fatalf("a swept key under an hour of grace is %v, want %q", got, key)
+		if got := mustGarbage(t, s); !slices.Equal(got, []metastore.Key{key}) {
+			t.Fatalf("a swept key is %v, want %q", got, key)
 		}
 		mustFail(t, s.Commit(ctx(t), "f", metastore.Object{Key: key, Size: 10, ModTime: time.Now()}), syscall.EINVAL)
 	}},
@@ -992,7 +1054,7 @@ var objectCases = []testCase{
 		// A refused reservation leaves no record. One that recorded a key before deciding it
 		// could not be used would leak an object for the sweeper to find, and the sweeper
 		// cannot tell it from a write that is still in flight.
-		if got := mustGarbage(t, s, 0); len(got) != 0 {
+		if got := mustGarbage(t, s); len(got) != 0 {
 			t.Fatalf("refused reservations left %v behind, want nothing", got)
 		}
 		mustHoldExactly(t, s, "d", "f")
@@ -1016,7 +1078,7 @@ var objectCases = []testCase{
 
 		_, err := s.Reserve(ctx(t), "g", 101)
 		mustFail(t, err, syscall.EDQUOT)
-		if got := mustGarbage(t, s, 0); len(got) != 0 {
+		if got := mustGarbage(t, s); len(got) != 0 {
 			t.Fatalf("a refused reservation left %v behind, want nothing", got)
 		}
 		mustUsed(t, s, allowance-100)
@@ -1219,9 +1281,9 @@ func mustList(t *testing.T, s metastore.Store, path string) []metastore.Child {
 
 // mustGarbage collects with a limit high enough to return everything, and sorts the result:
 // nothing in the contract fixes the order objects come back in.
-func mustGarbage(t *testing.T, s metastore.Store, grace time.Duration) []metastore.Key {
+func mustGarbage(t *testing.T, s metastore.Store) []metastore.Key {
 	t.Helper()
-	keys, err := s.Garbage(ctx(t), 1000, grace)
+	keys, err := s.Garbage(ctx(t), 1000)
 	if err != nil {
 		t.Fatalf("collecting garbage: %v", err)
 	}

@@ -6,7 +6,7 @@
 
 系统只有两个角色，它们运行在不同的机器上，通过 HTTP 交互。
 
-**server** —— 命名空间的权威持有者。它持有一份 **storage**（本地目录、对象存储、或集成方自有的任何东西），并把它经由 HTTP 暴露出去。命名空间的事实以这里为准。
+**server** —— 命名空间的权威持有者。它持有一份 **storage**（普通本地目录、持久本地对象存储、外部对象存储、或集成方自有的任何东西），并把它经由 HTTP 暴露出去。命名空间的事实以这里为准。
 
 **client** —— 命名空间的使用者。它持有一份 **remote storage**：一个把每次调用变成一次 HTTP 请求的 storage 实现。client 侧还负责把这份命名空间呈现为本地目录。
 
@@ -49,7 +49,7 @@
 ║           │ storage 接口                                             ║
 ║           ▼                                                          ║
 ║   ┌────────────────┐                                                 ║
-║   │    storage     │  本地目录 / 对象存储 / 集成方自有实现            ║
+║   │    storage     │  普通目录 / 本地或外部对象存储 / 自有实现        ║
 ║   └────────────────┘                                                 ║
 ╚══════════════════════════════════════════════════════════════════════╝
 ```
@@ -60,14 +60,14 @@
 
 ## 三、同一个接口，两个模块
 
-client 侧的 remote storage 与 server 侧的 storage **实现同一个接口**。
+client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storage.Storage` 接口**。作为 HTTP server backend 使用时，两者还实现它的有界结果扩展 `storage.BoundedStorage`。
 
 它们**不是同一个模块**，也不在同一个角色里：server 侧的那个真正持有数据；client 侧的那个不持有任何数据，它把每次调用翻译成一次 HTTP 请求。
 
 接口相同带来两个直接后果，都不需要额外设计：
 
 - 挂载呈现层只认这个接口，因此**可以直接挂载一份本地 storage，完全不经过网络**。挂载点于是能与一个普通目录逐操作对拍（见 [`../testing.md`](../testing.md)）。
-- HTTP 服务端也只认这个接口，因此**把 remote storage 交给它就得到一个代理**。
+- HTTP 服务端只认 `BoundedStorage`，因此**把同时实现这份扩展的 remote storage 交给它就得到一个代理**。
 
 ## 四、两条契约的分工
 
@@ -93,6 +93,8 @@ client 侧的 remote storage 与 server 侧的 storage **实现同一个接口**
 | `Rename` | 旧路径, 新路径 → —；覆盖目标处已有的文件；根作为任一操作数则 `EBUSY` |
 | `Space` | —（不寻址任何路径）→ 整个命名空间的容量：总量、已用、还能写入的量 |
 
+`storage.BoundedStorage` 在不改变上述十一个操作的前提下增加三项 server-backend 义务：`CheckBounded` 在服务前验证所有依赖都能接收结果预算；`ReadBounded` 在完整 payload 分配前按 byte bound 拒绝；`ListBounded` 把 entry 逐项交给调用方持有的 `ListResult`，在保留超限 entry 之前失败。普通 `Read` 与 `List` 仍是直接调用者可用的整份结果 API；只有要把 namespace 从可嵌入 server 发布出去的调用方必须依赖有界扩展（R-INT-3、R-INT-6）。
+
 属性是节点身份、模式（类型位与权限位）、文件内容的字节数、内容最后被读取的时间与最后改变的时间。身份是一个不透明值，只可比较相等；它随节点走过改名，两个同时存在的节点不共用一个，而 0 不是取值 —— 一个不填它的实现会让每次比较都相等，也就是把所有节点报成同一个节点。可以写回去的是权限位（含 setuid、setgid、sticky）与那两个时间；节点的类型不在其中，`SetAttr` 收到带类型位的模式以 `EINVAL` 拒绝。一次 `SetAttr` 点了不止一个属性时不保证整体生效，报告失败时可能已经改掉了其中一部分。列目录内联属性使得列出 n 个条目花一次调用而不是 n+1 次，这在跨网络时是往返次数的量级差别（R-WS-4）。
 
 根不是任何调用方建出来的节点，删除它、移动它、把别的东西放到它的位置，都不是这个接口提供的操作。若允许，一个根被删掉的命名空间此后对一切回答 `ENOENT` —— 那句话说的是「那个文件不在」，而事实是命名空间不在。
@@ -110,23 +112,24 @@ client 侧的 remote storage 与 server 侧的 storage **实现同一个接口**
 | 错误以 `syscall.Errno` 呈现，且 `errors.Is` 取得到 | 挂载层没有能交给内核的错误码，只能自己编一个 |
 | 判定不了的情况按错误报告，绝不替换成「不存在」或空目录 | 上层把「够不到」当成「不存在」，据此执行破坏性动作（R-ERR-1、R-ERR-2） |
 | 绝对路径、以及爬出根的路径，一律以 `EINVAL` 拒绝 | 命名空间之外的文件可被读写 |
-| 容量的三个数能同时为真：都不为负，且还能写入的量不超过总量减已用 | 这三个数要进内核回复的无符号字段，一个负数在那里变成一个巨大的正数，先查空间再决定写不写的程序据此认为有盘上根本不存在的余量（R-ERR-2） |
+| 容量的三个数能同时为真：都不为负，且还能写入的量不超过 `max(总量 - 已用, 0)` | 这三个数要进内核回复的无符号字段，一个负数在那里变成一个巨大的正数，先查空间再决定写不写的程序据此认为有盘上根本不存在的余量（R-ERR-2） |
 | 容量要么如实答出来，要么以 `ENOSYS` 拒绝；绝不报一个推算出来的数字 | 一个凑出来的容量与一个实测的容量在调用方那里长得一模一样，而它是先查空间再写的程序唯一的依据（R-ERR-2、R-WS-5） |
 | 答不答容量在一份命名空间的一生中不变：会答的一直会答，不会答的从来不答 | 一次拒绝被读成暂时故障并被反复重试，或者一次回答被读成永久能力而此后不再问（R-WS-5） |
 | 两个不同的对象绝不被呈现为同一个；一个对象被删除后，此前指代它的东西不再转而指代别的对象 | 读到的是别人的字节，而没有任何迹象表明发生过这件事（R-INT-11） |
 | 由多个可以各自失败的部分拼成的实现，任何一部分够不到都按错误报告，不用还读得到的那部分拼一个看起来成功的答案 | 记着名字却读不到字节被答成一个成功的读，上层据此认为文件是空的（R-ERR-6） |
 
-这些义务的可执行形式是 `packages/storage/storagetest`：一个实现合规，当且仅当它通过那套用例（R-INT-6）。
+这些义务的可执行形式是 `packages/storage/storagetest`：`Run` 验证一般 namespace 契约，`RunBounded` 验证可发布 server backend 的结果预算与取消义务（R-INT-3、R-INT-6）。
 
 **HTTP 接口**：跨角色的实际边界。它转发 storage 的十一个操作，另加复制那三个 —— 订阅、续订、取快照 —— 并必须满足：
 
 | 义务 | 违反的后果 |
 |---|---|
 | 每个答案都带有本协议自己的标记，认不出标记的答案一律按结果未知处理 | 中途的代理或认证网关自己回的 `200` 被当成一次成功的修改 |
-| 只有「storage 报告了错误」这一种答案携带 errno，其余每一种非成功答案都意味着结果未知 | 一次够不到 server 被读成一句关于命名空间的事实（R-ERR-1、R-ERR-2） |
+| 只有可命名的操作结果携带 errno：storage 报错、handler 在调用 storage 前依据资源边界以 `EFBIG`/`EAGAIN` 拒绝，或 mutation 已成功而 handler 无法读取 replication barrier 时以 `EIO` 报告无法确认；其余每一种非成功答案都意味着结果未知 | 一次够不到 server 被读成一句关于命名空间的事实，或一次已经发生的修改被误报成未发生（R-ERR-1、R-ERR-2） |
 | errno 以符号名传递，取自双方共有的封闭词汇表；名字不在其中即结果未知 | 一个这一侧不认识的名字被当成某个具体的失败 |
 | 响应体的分帧必须能报告自己提前结束 | 被截断的文件与一个恰好这么大的文件无从分辨 |
-| 每种答案的形状是确定的：缺席的属性、缺席的列表、以及本该只报告结果却带回了内容的答案，都不是这个协议的答案 | 一个零值的属性读起来是「1970 年的空文件」，一个缺席的列表读起来是「这个目录是空的」 |
+| 复制帧在 metastore 载入变长字段前取得单帧预算；change/start 与 snapshot cursor 的总量分别由 stream 数推导，snapshot page 另有限制 operation、aggregate retained bytes 与等待者的 admission | wire 端的晚检查挡不住 backend 已经建立的超限 page，多条流还能把各自有界的结果累积成无界总量（R-INT-3） |
+| 每种答案的形状是确定的：缺席的属性、缺席的列表、不是 object 的 mutation response、以及 null/畸形/未知字段的 barrier 都不是这个协议的答案 | 一个零值的属性读起来是「1970 年的空文件」，一个缺席的列表读起来是「这个目录是空的」，一个假的 barrier 会让副本过早确认已经发生的修改 |
 | 复制那三个操作与请求／响应分在不同的连接上，且一次变更抵达一个健康订阅者的耗时与并发的批量传输无关 | 一次快照 —— 系统里最大的一次批量传输 —— 挤掉自己的事件通道，后果是重新拉一份快照，而触发它只需要一次正常的冷挂载 |
 | 不记变更日志的命名空间以 `ENOSYS` 拒绝这三个操作，而不是回一条空的流或一份没有行的快照 | 一份「存在、是空的、永不改变」的命名空间，而这是一个副本会相信的答案 |
 
@@ -142,9 +145,9 @@ client 侧的 remote storage 实现 storage 接口，凡是不满足上述任何
 
 副本的可信度只取决于一件事：**server 的变更流是不是在被连续观察**。server 每个 workspace 记一条有序的变更日志，位置与树的改动在同一个事务里分配；client 先订阅、再取一次一致性快照，此后由流喂着。流活着，副本就是服务端在某个位置上的样子；流一断，副本立刻整份作废，每一个操作以 EIO 失败，绝不返回空目录、绝不报告文件不存在（R-ERR-1、R-ERR-2）。没有过期时间，也没有基于间隔的刷新 —— R-CON-2 不允许可见性在某个周期边界上成立。
 
-于是跨机器的可见性不依赖轮询：一台机器上的提交完成之后，那条变更走事件流到达另一台机器，`stat` 就看得到（R-CON-1、R-CON-2）。写入方自己不必等流 —— 每一个修改操作等到自己的变更回到本地副本之后才返回，所以写完立刻 `stat` 得到的是刚写下去的大小与时间（R-CON-4）。
+于是跨机器的可见性不依赖轮询：一台机器上的提交完成之后，那条变更走事件流到达另一台机器，`stat` 就看得到（R-CON-1、R-CON-2）。对 metastore-backed namespace，成功的 mutation response 携带一次原子读取的 `(incarnation, committed position)` barrier；replicated client 等到同一代副本的位置不小于它才返回。barrier 可以因并发提交而晚于本次 mutation，但不早于它，因此写完立刻 `stat` 得到的是至少包含这次修改的大小与时间（R-CON-4）。
 
-**绕过 server 直接改动底层 storage 不再可见**：那样的改动不经过记录日志的那条路径，因此不产生事件。它一直是写明的非目标，现在它的代价从「计数漂移」变成了「副本不知道」。
+**绕过 server 的改动不产生变更事件。** `localdir` 没有元数据副本，后续请求仍会直接观察到宿主目录的改动；套了 `limited` 时，这类旁路改动会使配额账本漂移。本地持久对象存储不支持旁路修改其私有格式；无法验证的对象或组合状态以 I/O 错误暴露。
 
 本地另外持有的两样东西不是命名空间的副本：
 
@@ -194,12 +197,12 @@ remote-fs ──▶ 建立 remote storage，先访问一次根，确认 server �
 
 | 角色 | 作为库嵌入 | 作为独立二进制 |
 |---|---|---|
-| server | `packages/transport/httprest` 提供一个 `http.Handler`，链接进集成方既有的 server | `cmd/remote-fs-server`：把一个本地目录经 HTTP 服务出去，可选地置于一个字节配额之下 |
+| server | `packages/transport/httprest` 提供一个 `http.Handler`，链接进集成方既有的 server | `cmd/remote-fs-server`：服务普通目录、Azure Blob + SQLite，或同一私有目录中的本地对象 + SQLite |
 | client | `packages/transport/httprest` 与 `packages/fuse` 链接进集成方既有的 daemon service | `cmd/remote-fs`：把一个 server 的命名空间挂到本地目录 |
 
 client 侧还有第三种用法：只使用 remote storage，不挂载（R-INT-5）。这条路径不依赖 FUSE，因此不受 Linux 限制。
 
-两个二进制之间没有控制面。一个 `remote-fs` 进程就是一个挂载点，挂载的生命周期就是这个进程的生命周期，卸载靠向它发信号；运维对一个在跑的 server 的动作同样只有信号，见 [`server/architecture.md`](server/architecture.md)。
+两个二进制之间没有网络控制面。一个 `remote-fs` 进程就是一个挂载点，挂载的生命周期就是这个进程的生命周期，卸载靠向它发信号；独立 server 用信号停止、重数普通目录配额，或查询 metastore-backed storage 状态，见 [`server/architecture.md`](server/architecture.md)。作为 package 使用时，调用方直接使用所组合 storage 的状态 API。
 
 两个角色之间没有鉴权：能连上 server 的任何人都能读写整份命名空间，因此只能部署在可信网络上。
 
@@ -208,6 +211,7 @@ client 侧还有第三种用法：只使用 remote storage，不挂载（R-INT-5
 各角色内部的设计各占一个目录，一个角色一份：
 
 - `server/architecture.md` —— HTTP 服务端、请求与响应的形状、错误如何离开 server
+- `server/local-disk-object-store.md` —— 本地持久 storage 的格式、打开与恢复、容量和维护
 - `client/architecture.md` —— remote storage、挂载呈现层、打开的文件、节点身份、生命周期
 
 第二层只写角色内部，不重讲系统全貌，跨角色只通过本文定义的接口与契约来引用。
@@ -224,8 +228,11 @@ go.mod
 packages/                    可被外部与自身 import
   storage/                   接口定义、实现者义务与 errno 词汇（两个角色共用）
     localdir/                本地目录实现
+    localstore/              把本地对象、SQLite、外部提交见证、锁与恢复组合成一份 storage
     objectstore/             对象存储实现：字节在对象存储里，树在 metastore 里
       azblob/                Azure Blob 的对象接口实现
+      localdisk/             本地不可变文件的对象接口实现
+      objectstoretest/       对象接口义务的可执行形式
     limited/                 把任意一份 storage 置于字节配额之下
     storagetest/             义务的可执行形式：每个实现都跑这一套用例
   metastore/                 名字的树、节点的属性、路径到对象键的指向
@@ -246,17 +253,21 @@ docs/
 
 | 包 | 归属 |
 |---|---|
-| `storage`、`storage/storagetest` | 两个角色共用 |
+| `storage` | 两个角色共用 |
+| `storage/storagetest` | 测试专用：namespace 与 bounded-server 契约的可执行形式 |
 | `storage/localdir` | server 侧（也用于挂载层不经网络的验证路径） |
-| `storage/objectstore`、`storage/objectstore/azblob` | server 侧 |
-| `metastore`、`metastore/sqlite`、`metastore/metastoretest` | server 侧，只被 `storage/objectstore` 用 |
+| `storage/localstore` | server 侧，持有本地对象与绑定的 SQLite metastore |
+| `storage/objectstore`、`storage/objectstore/azblob`、`storage/objectstore/localdisk` | server 侧 |
+| `storage/objectstore/objectstoretest` | 测试专用：object-store 字节接口的可执行契约 |
+| `metastore`、`metastore/sqlite` | 两个角色共用：server 的 object-store/local-store 与 client 的 metadata replica 都依赖它们 |
+| `metastore/metastoretest` | 测试专用：metastore 契约的可执行形式 |
 | `storage/limited` | server 侧 |
 | `transport/httprest` | 两个角色共用：服务端在 server 侧，拨号端在 client 侧 |
 | `fuse` | client 侧 |
 
-六处拆分有明确理由：`storage` 与它的各份实现分开，使得第三方实现自有存储时只需引入接口（R-INT-6）；配额自成 `storage/limited`，因为它是一层包装而不是某一个实现的性质 —— 任意一份 storage 都能被它套住，集成方自有的那份也不例外（R-WS-5、R-INT-3）；`metastore` 与 `storage/objectstore` 分开，因为「一棵有属性的名字树」不是「一份 storage」，它没有内容、没有配额、也不认识对象存储，把两者合在一起会让换一个数据库变成改一份 storage 实现；契约用例自成 `storage/storagetest` 与 `metastore/metastoretest`，使得它们独立于任何一个实现；每种传输自成 `transport/` 下的一个包，使得选定一种传输不会牵入其余传输的依赖（R-INT-9、R-INT-10）；`fuse` 与传输分开，使得不挂载的使用者不被 FUSE 与平台限制绑住（R-INT-5、R-INT-8）。
+这些拆分各自守住一条依赖或 ownership 边界：`storage` 与实现分开，使第三方实现自有存储时只需引入接口（R-INT-6）；配额自成 `storage/limited`，因为它是一层包装而不是某一个实现的性质（R-WS-5、R-INT-3）；`metastore` 与 `storage/objectstore` 分开，因为名字树不持有文件字节，而对象接口不认识路径；`storage/localstore` 负责把两个 durable half、WAL 外部见证、store identity、初始化与 lifetime lock 组合成一个资源，避免这些规则散落在二进制里；契约用例分别属于 `storage/storagetest`、`objectstore/objectstoretest` 与 `metastore/metastoretest`；每种传输自成 `transport/` 下的一个包（R-INT-9、R-INT-10）；`fuse` 与传输分开，使得不挂载的使用者不被 FUSE 与平台限制绑住（R-INT-5、R-INT-8）。
 
-带外部依赖的实现各自成包，也是为了让依赖跟着选择走：只用本地目录的集成方不会链接进 Azure SDK 或 SQLite 驱动（R-INT-10 的同一条道理，用在存储上）。
+带依赖的实现各自成包，使依赖跟着选择走：`localdir` 不链接 Azure SDK 或 SQLite；`localdisk` 不链接 Azure SDK；`localstore` 明确选择 SQLite 与本地对象格式；`azblob` 才选择 Azure SDK。
 
 errno 词汇归 `storage` 而非某一种传输：一个实现可以报出哪些错误，是契约的性质。若它留在某一种传输里，第二种传输要么抄一份而后各自漂移，要么去 import 第一种。
 

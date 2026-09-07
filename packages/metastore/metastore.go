@@ -97,10 +97,9 @@ type Store interface {
 	//
 	// It is called before the bytes are written, and that order is the whole point. An
 	// object written under a key no committed record mentions is indistinguishable from an
-	// object some other writer is about to commit, and a sweeper that cannot tell those
-	// apart either deletes live data or waits out a grace period long enough to make its own
-	// correctness a guess about how slow a write can be. A key that is on record before its
-	// bytes exist is never ambiguous.
+	// object some other writer is about to commit. A key that is on record before its bytes
+	// exist keeps that uncertainty durable and bounded; elapsed time never turns it into
+	// permission to delete whatever may be under the key.
 	//
 	// Knowing the write it is for, a reservation refuses what the commit would refuse
 	// anyway: a path whose parent directory is not there, a path holding a directory, and a
@@ -109,8 +108,30 @@ type Store interface {
 	// a write that cannot land from paying to upload its bytes first. Without it, a caller
 	// sitting at its allowance can put an unbounded number of objects into the store at full
 	// speed, each one billed and each one waiting on a sweep, which is the cost the
-	// allowance exists to bound.
+	// allowance exists to bound. An implementation with a bounded reserved, unresolved, and
+	// garbage backlog returns syscall.EFBIG when this reservation can never fit its byte bound,
+	// or syscall.EAGAIN when the current backlog leaves insufficient room and cleanup may make a
+	// retry succeed.
 	Reserve(ctx context.Context, path string, size int64) (Key, error)
+
+	// Quarantine retires a reservation whose Put did not prove that it created the object
+	// under key. The unresolved record remains durable and counts against pending-object
+	// limits, but Commit must refuse it and Garbage must never return it for deletion.
+	//
+	// A missing key and one already unresolved are successful no-ops, so cleanup may repeat
+	// the call. A referenced or garbage key is syscall.EINVAL: neither state has an
+	// unresolved ownership outcome that may replace its existing meaning.
+	Quarantine(ctx context.Context, key Key) error
+
+	// Abandon makes a reserved key immediately collectable after the object store has
+	// positively reported that this reservation created the object under key. After it
+	// succeeds, Commit must refuse the key and the key is eligible for Garbage without
+	// any inference from elapsed time.
+	//
+	// A missing key and one already marked as garbage are successful no-ops, so recovery may
+	// repeat the call. A referenced or unresolved key is syscall.EINVAL: the former would
+	// leave a file pointing at deletable bytes, and the latter has no ownership proof.
+	Abandon(ctx context.Context, key Key) error
 
 	// Commit points path at an object that has been written, creating the file if it is not
 	// there, and accounts for the bytes. It fails with syscall.EDQUOT if the namespace has
@@ -138,20 +159,20 @@ type Store interface {
 	// allowance it was given and the bytes it is known to hold.
 	Space(ctx context.Context) (storage.Space, error)
 
-	// Garbage returns at most limit objects that nothing references, so that a caller may
-	// delete them from the object store. Objects reserved but never committed are included
-	// once they are older than grace, which bounds how long a write may take between
-	// reserving a key and committing it.
+	// Garbage returns at most limit objects that nothing references and whose ownership is
+	// proven, so that a caller may delete them from the object store. Reserved and unresolved
+	// keys are never returned: elapsed time cannot prove that a writer in another process is
+	// dead or that any object under its key belongs to the reservation. Abandon records the
+	// positive ownership proof that makes a failed write's object collectable.
 	//
-	// A key this returns is no longer committable, and it stops being committable in the
-	// same change that hands it out. The caller is about to delete the bytes, so a write
-	// still holding that key must fail rather than succeed onto an object that is gone —
-	// and a caller that took the keys and then died has lost nothing, because a key nobody
-	// can commit is garbage whether or not its bytes were reached.
-	Garbage(ctx context.Context, limit int, grace time.Duration) ([]Key, error)
+	// Every key this returns is already noncommittable. It remains recorded as garbage until
+	// Forget confirms its bytes are gone, so a caller interrupted after taking a batch loses
+	// nothing and a later caller may retry the same keys.
+	Garbage(ctx context.Context, limit int) ([]Key, error)
 
-	// Forget drops the records of objects whose bytes are gone. A key passed here that is
-	// still referenced is syscall.EINVAL: it would leave a name pointing at nothing.
+	// Forget drops garbage records whose bytes are gone. A reserved, unresolved, or
+	// referenced key is syscall.EINVAL: dropping any of them would erase the only record that
+	// prevents an unproven or live object from becoming untracked.
 	Forget(ctx context.Context, keys []Key) error
 
 	// Close releases whatever the Store holds open.
@@ -161,6 +182,15 @@ type Store interface {
 	// to be allocated inside the same change that applies the tree edit, and only the thing
 	// that owns that change can do it.
 	Log
+}
+
+// BoundedLister enumerates one directory without first assembling its complete child
+// slice. It reserves each name from SQLite's length before loading the BLOB, and any
+// result refusal stops enumeration. This is the metastore capability an
+// object-backed storage needs to implement storage.BoundedStorage without moving an
+// unbounded intermediate allocation one layer down.
+type BoundedLister interface {
+	ListBounded(ctx context.Context, path string, result *storage.ListResult) error
 }
 
 // Key names one stored object. It is opaque to everything above the store that allocated
@@ -269,8 +299,15 @@ type Log interface {
 	// the network.
 	Snapshot(ctx context.Context) (Snap, Position, error)
 
-	// Since returns at most limit changes recorded after the given position, oldest first,
-	// along with what the log still holds.
+	// Since adds at most limit changes recorded after the given position to result,
+	// oldest first, and returns what the log still holds. The count is a secondary work
+	// bound; the caller-defined byte charge in result is the memory bound.
+	//
+	// A producer must reserve each change before loading or copying its variable-length
+	// fields. If the next change fits an empty result but not the space left in this one, it
+	// leaves that change for the next call and returns the completed non-empty page. Any
+	// other error invalidates result with Fail. Returning a plausible prefix as success
+	// would make a replica advance past changes it never received.
 	//
 	// A caller compares the two to learn which of three things happened, because the
 	// answers call for different actions and an implementation that could not tell them
@@ -284,29 +321,35 @@ type Log interface {
 	// because those are different questions wherever positions have gaps in them. Asking
 	// whether the oldest surviving entry is the caller's very next position asks about
 	// adjacency, which no implementation promises.
-	Since(ctx context.Context, after Position, limit int) ([]Change, Retention, error)
+	Since(ctx context.Context, after Position, limit int, result *ChangeResult) (Retention, error)
 
 	// Incarnation identifies this log as a continuation of itself.
 	//
 	// A caller resumes with the pair (incarnation, position); a position alone is not
-	// enough. A log that lost its history — a fresh in-memory one after a restart, or one
-	// whose tail did not survive a crash — would otherwise be asked to resume at a position
-	// it has never heard of, and the reasonable-looking answer, "that is within my window,
-	// you are caught up", loses every change in between with nothing left to notice it by.
+	// enough. A newly initialized log has a new incarnation. A durable log whose committed
+	// position and retained history disagree is corrupt: it must fail integrity validation
+	// with EIO and preserve the recorded incarnation, not present the corruption as a new
+	// coherent history that a caller can rebuild from.
 	//
-	// It changes whenever the log is not a verbatim continuation of what the caller last
-	// saw, and it does not change merely because a process restarted.
-	Incarnation(ctx context.Context) (Incarnation, error)
+	// Incarnation reports the identity with its UTF-8 byte length limited before the value is
+	// loaded or copied into the caller's process. A larger identity is syscall.EFBIG.
+	Incarnation(ctx context.Context, maxBytes int64) (Incarnation, error)
 
-	// CommittedPosition is the newest position the tree itself was changed at, which for a
-	// log kept beside the tree is the log's own tail.
-	//
-	// It exists for the one case where those two can disagree: a log kept somewhere that
-	// does not share the tree's transaction can be missing its last entries after a crash.
-	// Comparing the two at startup turns that from permanent silent divergence into one
-	// honest rebuild, and an implementation that finds them apart must change its
-	// incarnation.
+	// Barrier atomically reports this log's incarnation and committed position. The
+	// incarnation is length-checked before it is loaded. A caller uses the pair to wait
+	// until a replica of the same history has applied through Position.
+	Barrier(ctx context.Context, maxIncarnationBytes int64) (LogBarrier, error)
+
+	// CommittedPosition is the newest position committed with the tree. A log implementation
+	// must preserve equality between this value and its retained tail; a mismatch means its
+	// durable history cannot justify replication and must fail integrity validation with EIO.
 	CommittedPosition(ctx context.Context) (Position, error)
+}
+
+// LogBarrier is one coherent identity and position sampled from a log.
+type LogBarrier struct {
+	Incarnation Incarnation
+	Position    Position
 }
 
 // Snap is one consistent picture of a tree, delivered in pages.
@@ -315,9 +358,13 @@ type Log interface {
 // reference — so a caller closes it as soon as it is done, and an implementation is free
 // to refuse one that has been open too long. Whatever it holds is released by Close.
 type Snap interface {
-	// Next returns at most limit rows and reports whether the picture is complete. A caller
-	// that stops early still calls Close.
-	Next(ctx context.Context, limit int) (rows []Row, done bool, err error)
+	// Next adds at most limit rows to result and reports whether the picture is complete. A
+	// producer reserves every row before loading or copying its variable-length fields. If
+	// the next row fits an empty result but not the remaining page, it is left for the next
+	// call. Any other error invalidates result with Fail, so no partial picture can be
+	// mistaken for a complete page. The count remains a secondary work bound; result owns
+	// the byte bound. A caller that stops early still calls Close.
+	Next(ctx context.Context, limit int, result *RowResult) (done bool, err error)
 
 	// Close releases what the picture holds.
 	Close() error

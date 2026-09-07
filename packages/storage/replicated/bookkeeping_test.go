@@ -1,64 +1,174 @@
 package replicated
 
 import (
+	"context"
+	"errors"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-// What a mount remembers on behalf of the callers waiting for their own changes is the one
-// thing here that grows with traffic rather than with the size of the tree, so it is the one
-// R-INT-3 is about: anything that accumulates needs a ceiling, and a mount that is busy never
-// has a moment with nothing in flight.
-//
-// This reaches inside the type rather than driving it through a mountpoint, because what is
-// asserted is the size of something a caller cannot see. Everything about what it is for is
-// tested from the outside; what is tested here is that it does not grow without bound.
-func TestWhatIsRememberedForAWaiterIsDroppedWhenNoWaiterCouldUseIt(t *testing.T) {
-	s := &Storage{notify: make(chan struct{}), touched: map[location]touch{}}
-
-	// One caller starts, fifty names change, a second caller starts, fifty more change. The
-	// second caller waits for something later than where it began, so nothing from the first
-	// fifty can release it.
-	first := s.expect()
-	for i := range 50 {
-		s.applied(changeAt(int64(i), metastore.Position(i+1)))
+func TestConfirmationAdmissionBoundsActiveRecordsAndWaiters(t *testing.T) {
+	s := confirmationTestStorage(Options{
+		ConfirmationGrace: time.Second, MaxActiveConfirmations: 1, MaxWaitingConfirmations: 1,
+	})
+	first, err := s.expect(t.Context(), "create", "active")
+	if err != nil {
+		t.Fatal(err)
 	}
-	second := s.expect()
-	for i := 50; i < 100; i++ {
-		s.applied(changeAt(int64(i), metastore.Position(i+1)))
+	type result struct {
+		confirmation *confirmation
+		err          error
 	}
-	if held := len(s.touched); held != 100 {
-		t.Fatalf("a hundred names changed while two callers were waiting and %d are remembered", held)
+	waiting := make(chan result, 1)
+	go func() {
+		confirmation, err := s.expect(t.Context(), "create", "waiting")
+		waiting <- result{confirmation, err}
+	}()
+	waitForConfirmationWaiters(t, s, 1)
+	if _, err := s.expect(t.Context(), "create", "refused"); !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("caller above waiter bound returned %v", err)
 	}
-
-	// The first caller leaves. Everything that only it could have been released by is of no
-	// use to anybody now.
 	s.forget(first)
-	if held := len(s.touched); held != 50 {
-		t.Fatalf("%d names are remembered after the caller that could have been released by half of them left, want 50", held)
+	second := <-waiting
+	if second.err != nil {
+		t.Fatal(second.err)
 	}
-	for where, landed := range s.touched {
-		if landed.filled <= second && landed.emptied <= second {
-			t.Fatalf("%v is remembered at %+v, which is at or before where the one remaining caller began (%d)", where, landed, second)
-		}
-	}
-
-	// The last one leaves and nothing is remembered at all.
-	s.forget(second)
-	if held := len(s.touched); held != 0 {
-		t.Fatalf("%d names are still remembered with nobody waiting", held)
+	s.forget(second.confirmation)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeConfirmations != 0 || s.confirmationWaiters != 0 {
+		t.Fatalf("released admission retains active=%d waiters=%d", s.activeConfirmations, s.confirmationWaiters)
 	}
 }
 
-// changeAt is one change to a name of its own.
-func changeAt(name int64, at metastore.Position) metastore.Change {
-	node := metastore.Node{ID: name + 1}
-	return metastore.Change{
-		Position: at,
-		Kind:     metastore.Created,
-		Parent:   1,
-		Name:     []byte{byte(name), byte(name >> 8)},
-		Node:     &node,
+func TestCancelledAndClosingConfirmationWaitersLeaveNoState(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		end  func(*Storage, context.CancelFunc)
+	}{
+		{name: "cancelled", end: func(_ *Storage, cancel context.CancelFunc) { cancel() }},
+		{name: "closing", end: func(s *Storage, _ context.CancelFunc) {
+			s.mu.Lock()
+			s.closing = true
+			s.wakeConfirmationCapacity()
+			s.mu.Unlock()
+			s.stop()
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := confirmationTestStorage(Options{
+				ConfirmationGrace: time.Second, MaxActiveConfirmations: 1, MaxWaitingConfirmations: 1,
+			})
+			active, err := s.expect(t.Context(), "create", "active")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan error, 1)
+			go func() {
+				_, err := s.expect(ctx, "create", "waiting")
+				done <- err
+			}()
+			waitForConfirmationWaiters(t, s, 1)
+			c.end(s, cancel)
+			if err := <-done; !errors.Is(err, syscall.EAGAIN) {
+				t.Fatalf("waiter returned %v", err)
+			}
+			s.forget(active)
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.activeConfirmations != 0 || s.confirmationWaiters != 0 {
+				t.Fatalf("released waiter retains active=%d waiters=%d", s.activeConfirmations, s.confirmationWaiters)
+			}
+		})
 	}
+}
+
+func TestBarrierConfirmationHandlesEitherNetworkOrderingAndLaterTails(t *testing.T) {
+	for _, c := range []struct {
+		name          string
+		appliedBefore int64
+		barrier       int64
+	}{
+		{name: "response before event", barrier: 6},
+		{name: "event before response", appliedBefore: 6, barrier: 6},
+		{name: "same-target writer between admission and response cannot confirm a later barrier", appliedBefore: 7, barrier: 8},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := confirmationTestStorage(DefaultOptions())
+			confirmation, err := s.expect(t.Context(), "create", "target")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.forget(confirmation)
+			if c.appliedBefore != 0 {
+				s.applied(metastore.Change{Position: metastore.Position(c.appliedBefore), Name: []byte("target")})
+			}
+			if err := s.setBarrier(confirmation, httprest.MutationBarrier{Incarnation: "log", Position: c.barrier}); err != nil {
+				t.Fatal(err)
+			}
+			if c.appliedBefore < c.barrier {
+				cancelled, cancel := context.WithCancel(t.Context())
+				cancel()
+				if err := s.await(cancelled, "create", "target", confirmation); !errors.Is(err, syscall.EIO) {
+					t.Fatalf("position %d below barrier %d was accepted: %v", c.appliedBefore, c.barrier, err)
+				}
+				s.applied(metastore.Change{Position: metastore.Position(c.barrier)})
+				if err := s.await(t.Context(), "create", "target", confirmation); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err := s.await(t.Context(), "create", "target", confirmation); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestBarrierIncarnationMismatchAndLaterGenerationFail(t *testing.T) {
+	s := confirmationTestStorage(DefaultOptions())
+	confirmation, err := s.expect(t.Context(), "create", "target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.forget(confirmation)
+	if err := s.setBarrier(confirmation, httprest.MutationBarrier{Incarnation: "other", Position: 1}); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("mismatched barrier returned %v", err)
+	}
+	if err := s.setBarrier(confirmation, httprest.MutationBarrier{Incarnation: "log", Position: 1}); err != nil {
+		t.Fatal(err)
+	}
+	s.seeded("replacement", 1)
+	if err := s.await(t.Context(), "create", "target", confirmation); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("confirmation survived incarnation change with %v", err)
+	}
+}
+
+func confirmationTestStorage(options Options) *Storage {
+	lifetime, stop := context.WithCancel(context.Background())
+	return &Storage{
+		lifetime: lifetime, stop: stop, notify: make(chan struct{}),
+		confirmationCapacity: make(chan struct{}), options: options,
+		incarnation: "log", generation: 1,
+	}
+}
+
+func waitForConfirmationWaiters(t *testing.T, s *Storage, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		got := s.confirmationWaiters
+		s.mu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("confirmation waiter count did not reach %d", want)
 }

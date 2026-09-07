@@ -1,11 +1,14 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
+	"strings"
 	"syscall"
 	"time"
 
@@ -140,18 +143,35 @@ func (s *Store) record(ctx context.Context, tx *sql.Tx, change metastore.Change)
 	}
 
 	sec, nsec := storedTime(time.Now())
-	result, err := tx.ExecContext(ctx, `
-		INSERT INTO changes (namespace, kind, parent, name, from_parent, from_name,
-		                     node, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content,
-		                     recorded_sec, recorded_nsec)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		s.namespace, kind, change.Parent, change.Name, fromParent, fromName,
-		node, mode, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec, content,
-		sec, nsec)
+	var previousRaw any
+	var previousType string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT CASE WHEN typeof(committed_position) = 'integer' THEN committed_position END,
+		        typeof(committed_position)
+		 FROM logs WHERE namespace = ?`, s.namespace,
+	).Scan(&previousRaw, &previousType); err != nil {
+		return err
+	}
+	previous, ok := storedInteger(previousRaw, previousType)
+	if !ok || previous < 0 {
+		return fmt.Errorf("the namespace log stores an invalid committed position: %w", syscall.EIO)
+	}
+	position, err := allocateChangePosition(ctx, tx)
 	if err != nil {
 		return err
 	}
-	position, err := result.LastInsertId()
+	if previous >= position {
+		return fmt.Errorf("the namespace log tail %d does not precede allocated position %d: %w",
+			previous, position, syscall.EIO)
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO changes (position, previous_position, namespace, kind, parent, name, from_parent, from_name,
+		                     node, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content,
+		                     recorded_sec, recorded_nsec)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		position, previous, s.namespace, kind, change.Parent, change.Name, fromParent, fromName,
+		node, mode, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec, content,
+		sec, nsec)
 	if err != nil {
 		return err
 	}
@@ -395,37 +415,6 @@ func lastBefore(ctx context.Context, tx *sql.Tx, namespace int64, cutoff time.Ti
 	return metastore.Position(position), err
 }
 
-// reconcile changes the incarnation when the log is missing entries the tree was changed at.
-//
-// Nothing here can produce that state: the position is allocated in the same transaction as
-// the tree change, so the committed position and the newest entry move together and a crash
-// between them is not a thing that exists. The check is here because the invariant is worth
-// asserting rather than assumed — an implementation that kept its log anywhere the tree's
-// transaction does not reach *would* land in this state after a crash, and the honest answer
-// there is one expensive rebuild rather than replicas that are quietly wrong forever. A test
-// deletes entries behind the store's back to drive it.
-func reconcile(ctx context.Context, tx *sql.Tx, namespace int64) error {
-	var committed int64
-	if err := tx.QueryRowContext(ctx,
-		`SELECT committed_position FROM logs WHERE namespace = ?`, namespace).Scan(&committed); err != nil {
-		return err
-	}
-	newest, err := newestEntry(ctx, tx, namespace)
-	if err != nil {
-		return err
-	}
-	if committed <= int64(newest) {
-		return nil
-	}
-	incarnation, err := newIncarnation()
-	if err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, `UPDATE logs SET incarnation = ? WHERE namespace = ?`,
-		string(incarnation), namespace)
-	return err
-}
-
 // newIncarnation mints a name for a run of history.
 //
 // Random rather than a counter. A counter would go backwards when this database is restored
@@ -442,31 +431,135 @@ func newIncarnation() (metastore.Incarnation, error) {
 
 // --- reading ---------------------------------------------------------------------------
 
-// changeColumns is every column a change is rebuilt from, in the order scanChange reads them.
-const changeColumns = `position, kind, parent, name, from_parent, from_name,
-	node, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content`
+// changeMetadataColumns carries every scalar beside its SQLite storage class and only the
+// lengths of variable payloads. Since validates those facts before asking SQLite to copy a
+// BLOB or TEXT value into Go memory.
+const changeMetadataColumns = `
+	CASE WHEN typeof(position) = 'integer' THEN position END, typeof(position),
+	CASE WHEN typeof(previous_position) = 'integer' THEN previous_position END, typeof(previous_position),
+	CASE WHEN typeof(namespace) = 'integer' THEN namespace END, typeof(namespace),
+	CASE WHEN typeof(kind) = 'integer' THEN kind END, typeof(kind),
+	CASE WHEN typeof(parent) = 'integer' THEN parent END, typeof(parent),
+	COALESCE(length(CAST(name AS BLOB)), 0), typeof(name),
+	CASE WHEN typeof(from_parent) IN ('integer', 'null') THEN from_parent END, typeof(from_parent),
+	COALESCE(length(CAST(from_name AS BLOB)), 0), typeof(from_name),
+	CASE WHEN typeof(node) IN ('integer', 'null') THEN node END, typeof(node),
+	CASE WHEN typeof(mode) IN ('integer', 'null') THEN mode END, typeof(mode),
+	CASE WHEN typeof(size) IN ('integer', 'null') THEN size END, typeof(size),
+	CASE WHEN typeof(atime_sec) IN ('integer', 'null') THEN atime_sec END, typeof(atime_sec),
+	CASE WHEN typeof(atime_nsec) IN ('integer', 'null') THEN atime_nsec END, typeof(atime_nsec),
+	CASE WHEN typeof(mtime_sec) IN ('integer', 'null') THEN mtime_sec END, typeof(mtime_sec),
+	CASE WHEN typeof(mtime_nsec) IN ('integer', 'null') THEN mtime_nsec END, typeof(mtime_nsec),
+	COALESCE(length(CAST(content AS BLOB)), 0), typeof(content),
+	CASE WHEN typeof(recorded_sec) = 'integer' THEN recorded_sec END, typeof(recorded_sec),
+	CASE WHEN typeof(recorded_nsec) = 'integer' THEN recorded_nsec END, typeof(recorded_nsec)`
 
-func scanChange(rows *sql.Rows) (metastore.Change, error) {
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanChangeMetadata(
+	row rowScanner,
+	expectedNamespace int64,
+) (metastore.Change, metastore.ChangePayloadLengths, int64, error) {
 	var (
-		change                                   metastore.Change
-		kind, position                           int64
-		fromParent                               sql.NullInt64
-		fromName                                 []byte
-		id, mode, size                           sql.NullInt64
-		atimeSec, atimeNsec, mtimeSec, mtimeNsec sql.NullInt64
-		content                                  sql.NullString
+		positionRaw, previousRaw, namespaceRaw, kindRaw, parentRaw      any
+		fromParentRaw, idRaw, modeRaw, sizeRaw                          any
+		atimeSecRaw, atimeNsecRaw, mtimeSecRaw, mtimeNsecRaw            any
+		recordedSecRaw, recordedNsecRaw                                 any
+		positionType, previousType, namespaceType, kindType, parentType string
+		nameType, fromParentType, fromNameType                          string
+		idType, modeType, sizeType                                      string
+		atimeSecType, atimeNsecType, mtimeSecType, mtimeNsecType        string
+		contentType, recordedSecType, recordedNsecType                  string
+		lengths                                                         metastore.ChangePayloadLengths
 	)
-	if err := rows.Scan(&position, &kind, &change.Parent, &change.Name, &fromParent, &fromName,
-		&id, &mode, &size, &atimeSec, &atimeNsec, &mtimeSec, &mtimeNsec, &content); err != nil {
-		return metastore.Change{}, err
+	if err := row.Scan(
+		&positionRaw, &positionType, &previousRaw, &previousType,
+		&namespaceRaw, &namespaceType, &kindRaw, &kindType,
+		&parentRaw, &parentType, &lengths.Name, &nameType,
+		&fromParentRaw, &fromParentType, &lengths.FromName, &fromNameType,
+		&idRaw, &idType, &modeRaw, &modeType, &sizeRaw, &sizeType,
+		&atimeSecRaw, &atimeSecType, &atimeNsecRaw, &atimeNsecType,
+		&mtimeSecRaw, &mtimeSecType, &mtimeNsecRaw, &mtimeNsecType,
+		&lengths.Content, &contentType,
+		&recordedSecRaw, &recordedSecType, &recordedNsecRaw, &recordedNsecType,
+	); err != nil {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
 	}
-	loaded, err := loadedKind(kind)
+	position, err := requiredStoredInteger("position", positionRaw, positionType)
 	if err != nil {
-		return metastore.Change{}, err
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
 	}
-	change.Position, change.Kind = metastore.Position(position), loaded
+	previous, err := requiredStoredInteger("previous_position", previousRaw, previousType)
+	if err != nil {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
+	}
+	namespace, err := requiredStoredInteger("namespace", namespaceRaw, namespaceType)
+	if err != nil {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
+	}
+	kindValue, err := requiredStoredInteger("kind", kindRaw, kindType)
+	if err != nil {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
+	}
+	parent, err := requiredStoredInteger("parent", parentRaw, parentType)
+	if err != nil {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
+	}
+	fromParent, ok := nullableStoredInteger(fromParentRaw, fromParentType)
+	if !ok {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "from_parent", fromParentType)
+	}
+	id, ok := nullableStoredInteger(idRaw, idType)
+	if !ok {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "node", idType)
+	}
+	mode, ok := nullableStoredInteger(modeRaw, modeType)
+	if !ok {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "mode", modeType)
+	}
+	size, ok := nullableStoredInteger(sizeRaw, sizeType)
+	if !ok {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "size", sizeType)
+	}
+	atimeSec, ok := nullableStoredInteger(atimeSecRaw, atimeSecType)
+	if !ok {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "atime_sec", atimeSecType)
+	}
+	atimeNsec, ok := nullableStoredInteger(atimeNsecRaw, atimeNsecType)
+	if !ok {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "atime_nsec", atimeNsecType)
+	}
+	mtimeSec, ok := nullableStoredInteger(mtimeSecRaw, mtimeSecType)
+	if !ok {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "mtime_sec", mtimeSecType)
+	}
+	mtimeNsec, ok := nullableStoredInteger(mtimeNsecRaw, mtimeNsecType)
+	if !ok {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "mtime_nsec", mtimeNsecType)
+	}
+	recordedSec, err := requiredStoredInteger("recorded_sec", recordedSecRaw, recordedSecType)
+	if err != nil {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
+	}
+	recordedNsec, err := requiredStoredInteger("recorded_nsec", recordedNsecRaw, recordedNsecType)
+	if err != nil {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
+	}
+	loaded, err := loadedKind(kindValue)
+	if err != nil {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
+	}
+	change := metastore.Change{Position: metastore.Position(position), Kind: loaded, Parent: parent}
+	if nameType == "blob" {
+		change.Name = []byte{}
+	}
 	if fromParent.Valid {
-		change.From = &metastore.Location{Parent: fromParent.Int64, Name: fromName}
+		change.From = &metastore.Location{Parent: fromParent.Int64}
+		if fromNameType == "blob" {
+			change.From.Name = []byte{}
+		}
 	}
 	if id.Valid {
 		change.Node = &metastore.Node{
@@ -475,10 +568,119 @@ func scanChange(rows *sql.Rows) (metastore.Change, error) {
 			Size:       size.Int64,
 			AccessTime: loadedTime(atimeSec.Int64, int32(atimeNsec.Int64)),
 			ModTime:    loadedTime(mtimeSec.Int64, int32(mtimeNsec.Int64)),
-			Content:    metastore.Key(content.String),
 		}
 	}
-	return change, nil
+	if err := validateChangeMetadata(change, lengths, namespace, expectedNamespace,
+		nameType, fromNameType, contentType, id, mode, size, atimeSec, atimeNsec,
+		mtimeSec, mtimeNsec, recordedSec, recordedNsec); err != nil {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
+	}
+	if previous < 0 || previous >= position {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0,
+			fmt.Errorf("%w: change %d has invalid predecessor %d", syscall.EIO, position, previous)
+	}
+	return change, lengths, previous, nil
+}
+
+func requiredStoredInteger(column string, value any, storageClass string) (int64, error) {
+	integer, ok := storedInteger(value, storageClass)
+	if !ok {
+		return 0, invalidStoredChangeScalar(0, column, storageClass)
+	}
+	return integer, nil
+}
+
+func nullableStoredInteger(value any, storageClass string) (sql.NullInt64, bool) {
+	if storageClass == "null" && value == nil {
+		return sql.NullInt64{}, true
+	}
+	integer, ok := storedInteger(value, storageClass)
+	return sql.NullInt64{Int64: integer, Valid: ok}, ok
+}
+
+func invalidStoredChangeScalar(position int64, column, storageClass string) error {
+	if position > 0 {
+		return fmt.Errorf("%w: change %d stores %s as %s", syscall.EIO, position, column, storageClass)
+	}
+	return fmt.Errorf("%w: a change stores %s as %s", syscall.EIO, column, storageClass)
+}
+
+func validateChangeMetadata(
+	change metastore.Change,
+	lengths metastore.ChangePayloadLengths,
+	namespace, expectedNamespace int64,
+	nameType, fromNameType, contentType string,
+	id, mode, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec sql.NullInt64,
+	recordedSec, recordedNsec int64,
+) error {
+	if change.Position <= 0 || namespace <= 0 || namespace != expectedNamespace || change.Parent < 0 ||
+		recordedNsec < 0 || recordedNsec >= int64(time.Second) {
+		return fmt.Errorf("%w: change position %d has invalid identity, parent, or recorded time", syscall.EIO, change.Position)
+	}
+	if nameType != "null" && nameType != "blob" {
+		return fmt.Errorf("%w: change %d stores its name as %s", syscall.EIO, change.Position, nameType)
+	}
+	if fromNameType != "null" && fromNameType != "blob" {
+		return fmt.Errorf("%w: change %d stores its source name as %s", syscall.EIO, change.Position, fromNameType)
+	}
+	if contentType != "null" && contentType != "text" {
+		return fmt.Errorf("%w: change %d stores its content key as %s", syscall.EIO, change.Position, contentType)
+	}
+	if lengths.Name < 0 || lengths.FromName < 0 || lengths.Content < 0 {
+		return fmt.Errorf("%w: change %d has a negative payload length", syscall.EIO, change.Position)
+	}
+	wantFrom := change.Kind == metastore.Renamed
+	if wantFrom != (change.From != nil) {
+		return fmt.Errorf("%w: change %d has an incomplete source location", syscall.EIO, change.Position)
+	}
+	wantNode := change.Kind != metastore.Removed
+	nodeFields := []sql.NullInt64{id, mode, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec}
+	for _, field := range nodeFields {
+		if field.Valid != wantNode {
+			return fmt.Errorf("%w: change %d has an incomplete node", syscall.EIO, change.Position)
+		}
+	}
+	if !wantNode {
+		if contentType != "null" {
+			return fmt.Errorf("%w: removed change %d carries content", syscall.EIO, change.Position)
+		}
+	} else {
+		if contentType == "text" && lengths.Content == 0 {
+			return fmt.Errorf("%w: change %d carries an empty content key", syscall.EIO, change.Position)
+		}
+		if id.Int64 <= 0 || size.Int64 < 0 || mode.Int64 < 0 || mode.Int64 > math.MaxUint32 ||
+			atimeNsec.Int64 < 0 || atimeNsec.Int64 >= int64(time.Second) ||
+			mtimeNsec.Int64 < 0 || mtimeNsec.Int64 >= int64(time.Second) {
+			return fmt.Errorf("%w: change %d carries invalid node metadata", syscall.EIO, change.Position)
+		}
+		if nodeType := fs.FileMode(mode.Int64).Type(); nodeType != 0 && nodeType != fs.ModeDir {
+			return fmt.Errorf("%w: change %d carries unsupported node type %v", syscall.EIO, change.Position, fs.FileMode(mode.Int64).Type())
+		}
+		if fs.FileMode(mode.Int64).IsDir() && (size.Int64 != 0 || contentType != "null") {
+			return fmt.Errorf("%w: change %d carries bytes for a directory", syscall.EIO, change.Position)
+		}
+		if fs.FileMode(mode.Int64).Type() == 0 && contentType == "null" && size.Int64 != 0 {
+			return fmt.Errorf("%w: change %d carries file bytes without a content key", syscall.EIO, change.Position)
+		}
+	}
+	switch change.Kind {
+	case metastore.Created, metastore.Removed:
+		if change.Parent <= 0 || nameType != "blob" || lengths.Name <= 0 {
+			return fmt.Errorf("%w: change %d has no addressable destination", syscall.EIO, change.Position)
+		}
+	case metastore.Modified:
+		root := change.Parent == 0 && nameType == "null" && lengths.Name == 0
+		named := change.Parent > 0 && nameType == "blob" && lengths.Name > 0
+		if !root && !named {
+			return fmt.Errorf("%w: modified change %d has no valid location", syscall.EIO, change.Position)
+		}
+	case metastore.Renamed:
+		if change.Parent <= 0 || nameType != "blob" || lengths.Name <= 0 ||
+			change.From == nil || change.From.Parent <= 0 || fromNameType != "blob" || lengths.FromName <= 0 {
+			return fmt.Errorf("%w: renamed change %d has an incomplete location", syscall.EIO, change.Position)
+		}
+	}
+	return nil
 }
 
 // Since returns the changes recorded after a position, along with what the log still holds.
@@ -492,85 +694,300 @@ func scanChange(rows *sql.Rows) (metastore.Change, error) {
 // puts the comparison on the caller rather than having this decide for it: an implementation
 // that returned nothing to a caller it judged too far behind would be answering a question
 // about retention with an empty page, which reads exactly like being caught up.
-func (s *Store) Since(ctx context.Context, after metastore.Position, limit int) ([]metastore.Change, metastore.Retention, error) {
+func (s *Store) Since(
+	ctx context.Context,
+	after metastore.Position,
+	limit int,
+	result *metastore.ChangeResult,
+) (retention metastore.Retention, returnErr error) {
+	if result == nil {
+		return metastore.Retention{}, fmt.Errorf("reading changes needs a bounded result: %w", syscall.EINVAL)
+	}
 	if after < 0 {
-		return nil, metastore.Retention{}, fmt.Errorf("%d is not a position: %w", after, syscall.EINVAL)
+		return metastore.Retention{}, result.Fail(fmt.Errorf("%d is not a position: %w", after, syscall.EINVAL))
 	}
 	if limit < 0 {
-		return nil, metastore.Retention{}, fmt.Errorf("a limit of %d changes is not a count: %w", limit, syscall.EINVAL)
+		return metastore.Retention{}, result.Fail(fmt.Errorf("a limit of %d changes is not a count: %w", limit, syscall.EINVAL))
 	}
-
-	var (
-		changes   []metastore.Change
-		retention metastore.Retention
-	)
 	if err := s.inspect(ctx, func(tx *sql.Tx) error {
+		var expected, changeHighWater, fixedWork int64
 		var err error
-		if retention, err = s.retention(ctx, tx); err != nil {
+		if retention, expected, changeHighWater, fixedWork, err = s.logPageState(ctx, tx, after); err != nil {
 			return err
 		}
-		rows, err := tx.QueryContext(ctx, `
-			SELECT `+changeColumns+` FROM changes
-			WHERE namespace = ? AND position > ?
-			ORDER BY position
-			LIMIT ?`, s.namespace, int64(after), limit)
-		if err != nil {
-			return err
+		if fixedWork > s.maxIntegrityRecords {
+			return fmt.Errorf("the log page anchors require %d records under a %d-record integrity limit: %w",
+				fixedWork, s.maxIntegrityRecords, syscall.EFBIG)
 		}
-		defer rows.Close()
-
-		changes = []metastore.Change{}
-		for rows.Next() {
-			change, err := scanChange(rows)
+		pageLimit := min(int64(limit), s.maxIntegrityRecords-fixedWork)
+		cursor := after
+		if pageLimit == 0 && limit > 0 && cursor < retention.Tail {
+			return fmt.Errorf("the log page has no record budget remaining before tail %d: %w",
+				retention.Tail, syscall.EFBIG)
+		}
+		var examined int64
+		stoppedAtCapacity := false
+		if pageLimit > 0 {
+			rows, err := tx.QueryContext(ctx, `
+				SELECT `+changeMetadataColumns+` FROM changes
+				WHERE namespace = ? AND position > ?
+				ORDER BY position
+				LIMIT ?`, s.namespace, int64(cursor), pageLimit)
 			if err != nil {
 				return err
 			}
-			changes = append(changes, change)
+			for rows.Next() {
+				examined++
+				change, lengths, previous, err := scanChangeMetadata(rows, s.namespace)
+				if err != nil {
+					rows.Close()
+					return err
+				}
+				if previous != expected {
+					rows.Close()
+					return fmt.Errorf("change %d follows position %d rather than %d: %w",
+						change.Position, previous, expected, syscall.EIO)
+				}
+				if int64(change.Position) > changeHighWater || previous > changeHighWater {
+					rows.Close()
+					return fmt.Errorf("change %d or its predecessor %d exceeds durable high-water %d: %w",
+						change.Position, previous, changeHighWater, syscall.EIO)
+				}
+				if err := ctx.Err(); err != nil {
+					rows.Close()
+					return err
+				}
+				reservation, fits, err := result.Reserve(change, lengths)
+				if err != nil {
+					rows.Close()
+					return err
+				}
+				if !fits {
+					stoppedAtCapacity = true
+					break
+				}
+				var name, fromName []byte
+				var content sql.NullString
+				if err := tx.QueryRowContext(ctx, `
+					SELECT name, from_name, content FROM changes
+					WHERE namespace = ? AND position = ?`, s.namespace, int64(change.Position)).Scan(
+					&name, &fromName, &content,
+				); err != nil {
+					rows.Close()
+					return err
+				}
+				if err := validateChangePayload(change, name, fromName, content); err != nil {
+					rows.Close()
+					return err
+				}
+				if err := reservation.Commit(name, fromName, metastore.Key(content.String)); err != nil {
+					rows.Close()
+					return err
+				}
+				cursor = change.Position
+				expected = int64(change.Position)
+			}
+			if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+				return err
+			}
 		}
-		return rows.Err()
+		if !stoppedAtCapacity && examined < pageLimit && limit > 0 &&
+			cursor >= retention.TrimmedThrough && cursor < retention.Tail {
+			return fmt.Errorf("the log ends after position %d before its committed tail %d: %w",
+				cursor, retention.Tail, syscall.EIO)
+		}
+		return ctx.Err()
 	}); err != nil {
-		return nil, metastore.Retention{}, fmt.Errorf("reading the changes after position %d: %w", after, failure(err))
+		return metastore.Retention{}, result.Fail(fmt.Errorf("reading the changes after position %d: %w", after, failure(err)))
 	}
-	return changes, retention, nil
+	return retention, nil
 }
 
-// retention reports what the log holds, inside the caller's transaction.
-//
-// Tail comes from the committed position rather than from the newest entry, and that is the
-// distinction the whole structure turns on: a log that has discarded everything can otherwise
-// not tell "you are caught up" from "you missed everything", and those two answers differ by
-// a full rebuild of the tree.
-func (s *Store) retention(ctx context.Context, tx *sql.Tx) (metastore.Retention, error) {
-	var (
-		tail           int64
-		trimmedThrough int64
-		trimmedByAge   bool
-	)
-	if err := tx.QueryRowContext(ctx,
-		`SELECT committed_position, trimmed_through, trimmed_by_age FROM logs WHERE namespace = ?`,
-		s.namespace).Scan(&tail, &trimmedThrough, &trimmedByAge); err != nil {
-		return metastore.Retention{}, err
-	}
-	oldest, _, err := oldestEntry(ctx, tx, s.namespace)
+// logPageState validates the indexed anchors needed to continue one page without scanning
+// history the page will not return. The predecessor carried by each returned row proves the
+// interior of the page; a later page continues from the last position this one exposed.
+func (s *Store) logPageState(
+	ctx context.Context,
+	tx *sql.Tx,
+	after metastore.Position,
+) (metastore.Retention, int64, int64, int64, error) {
+	state, err := validateDurableState(ctx, tx)
 	if err != nil {
-		return metastore.Retention{}, err
+		return metastore.Retention{}, 0, 0, 0, err
 	}
-	return metastore.Retention{
-		Oldest:         oldest,
+	var (
+		tailRaw, trimmedRaw, ageRaw    any
+		incarnationRaw                 any
+		tailType, trimmedType, ageType string
+		incarnationType                string
+		incarnationBytes               int64
+	)
+	if err := tx.QueryRowContext(ctx, `
+		SELECT CASE WHEN typeof(committed_position) = 'integer' THEN committed_position END,
+		       typeof(committed_position),
+		       CASE WHEN typeof(trimmed_through) = 'integer' THEN trimmed_through END,
+		       typeof(trimmed_through),
+		       CASE WHEN typeof(trimmed_by_age) = 'integer' THEN trimmed_by_age END,
+		       typeof(trimmed_by_age),
+		       typeof(incarnation), length(CAST(incarnation AS BLOB)),
+		       CASE
+		           WHEN typeof(incarnation) = 'text' AND length(CAST(incarnation AS BLOB)) = 32
+		           THEN incarnation
+		       END
+		FROM logs WHERE namespace = ?`, s.namespace).Scan(
+		&tailRaw, &tailType, &trimmedRaw, &trimmedType, &ageRaw, &ageType,
+		&incarnationType, &incarnationBytes, &incarnationRaw,
+	); err != nil {
+		return metastore.Retention{}, 0, 0, 0, err
+	}
+	tail, tailOK := storedInteger(tailRaw, tailType)
+	trimmed, trimmedOK := storedInteger(trimmedRaw, trimmedType)
+	age, ageOK := storedInteger(ageRaw, ageType)
+	if !tailOK || !trimmedOK || !ageOK || tail < 0 || trimmed < 0 || trimmed > tail ||
+		(age != 0 && age != 1) || incarnationType != "text" || incarnationBytes != 32 {
+		return metastore.Retention{}, 0, 0, 0, fmt.Errorf("the namespace log header is invalid: %w", syscall.EIO)
+	}
+	incarnation, ok := incarnationRaw.(string)
+	if !ok || len(incarnation) != 32 || strings.Trim(incarnation, "0123456789abcdef") != "" {
+		return metastore.Retention{}, 0, 0, 0, fmt.Errorf("the namespace log incarnation is invalid: %w", syscall.EIO)
+	}
+	if tail > state.ChangeHighWater || trimmed > state.ChangeHighWater {
+		return metastore.Retention{}, 0, 0, 0, fmt.Errorf(
+			"the namespace log header exceeds durable change high-water %d: %w",
+			state.ChangeHighWater, syscall.EIO)
+	}
+
+	oldest, predecessor, found, err := storedPositionPair(tx.QueryRowContext(ctx, `
+		SELECT CASE WHEN typeof(position) = 'integer' THEN position END, typeof(position),
+		       CASE WHEN typeof(previous_position) = 'integer' THEN previous_position END,
+		       typeof(previous_position)
+		FROM changes WHERE namespace = ? ORDER BY position LIMIT 1`, s.namespace))
+	if err != nil {
+		return metastore.Retention{}, 0, 0, 0, err
+	}
+	retention := metastore.Retention{
 		Tail:           metastore.Position(tail),
-		TrimmedThrough: metastore.Position(trimmedThrough),
-		TrimmedByAge:   trimmedByAge,
-	}, nil
+		TrimmedThrough: metastore.Position(trimmed),
+		TrimmedByAge:   age == 1,
+	}
+	if !found {
+		if tail != trimmed {
+			return metastore.Retention{}, 0, 0, 0, fmt.Errorf(
+				"the empty retained log ends at %d but is trimmed only through %d: %w",
+				tail, trimmed, syscall.EIO)
+		}
+		return retention, trimmed, state.ChangeHighWater, 1, nil
+	}
+	if oldest <= trimmed || predecessor != trimmed {
+		return metastore.Retention{}, 0, 0, 0, fmt.Errorf(
+			"the oldest retained change %d follows %d with trim anchor %d: %w",
+			oldest, predecessor, trimmed, syscall.EIO)
+	}
+	newest, err := storedPosition(tx.QueryRowContext(ctx, `
+		SELECT CASE WHEN typeof(position) = 'integer' THEN position END, typeof(position)
+		FROM changes WHERE namespace = ? ORDER BY position DESC LIMIT 1`, s.namespace))
+	if err != nil {
+		return metastore.Retention{}, 0, 0, 0, err
+	}
+	if newest != tail {
+		return metastore.Retention{}, 0, 0, 0, fmt.Errorf(
+			"the newest retained change is %d but the committed tail is %d: %w",
+			newest, tail, syscall.EIO)
+	}
+	retention.Oldest = metastore.Position(oldest)
+
+	expected := trimmed
+	position, err := storedPosition(tx.QueryRowContext(ctx, `
+		SELECT CASE WHEN typeof(position) = 'integer' THEN position END, typeof(position)
+		FROM changes
+		WHERE namespace = ? AND position <= ?
+		ORDER BY position DESC LIMIT 1`, s.namespace, int64(after)))
+	switch {
+	case err == nil:
+		expected = position
+	case !errors.Is(err, sql.ErrNoRows):
+		return metastore.Retention{}, 0, 0, 0, err
+	}
+	if oldest > state.ChangeHighWater || predecessor > state.ChangeHighWater ||
+		newest > state.ChangeHighWater || expected > state.ChangeHighWater {
+		return metastore.Retention{}, 0, 0, 0, fmt.Errorf(
+			"the namespace log anchors exceed durable change high-water %d: %w",
+			state.ChangeHighWater, syscall.EIO)
+	}
+	fixedWork := int64(3) // log header, oldest row, and newest row.
+	if err == nil {
+		fixedWork++
+	}
+	return retention, expected, state.ChangeHighWater, fixedWork, nil
+}
+
+func storedPosition(row rowScanner) (int64, error) {
+	var raw any
+	var storageClass string
+	if err := row.Scan(&raw, &storageClass); err != nil {
+		return 0, err
+	}
+	position, ok := storedInteger(raw, storageClass)
+	if !ok || position <= 0 {
+		return 0, fmt.Errorf("the log stores an invalid position as %s: %w", storageClass, syscall.EIO)
+	}
+	return position, nil
+}
+
+func storedPositionPair(row rowScanner) (position, predecessor int64, found bool, err error) {
+	var positionRaw, predecessorRaw any
+	var positionType, predecessorType string
+	if err := row.Scan(&positionRaw, &positionType, &predecessorRaw, &predecessorType); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, 0, false, nil
+		}
+		return 0, 0, false, err
+	}
+	position, positionOK := storedInteger(positionRaw, positionType)
+	predecessor, predecessorOK := storedInteger(predecessorRaw, predecessorType)
+	if !positionOK || !predecessorOK || position <= 0 || predecessor < 0 || predecessor >= position {
+		return 0, 0, false, fmt.Errorf("the log stores an invalid position/predecessor pair: %w", syscall.EIO)
+	}
+	return position, predecessor, true, nil
+}
+
+func validateChangePayload(change metastore.Change, name, fromName []byte, content sql.NullString) error {
+	if change.Name != nil && !validStoredComponent(name) {
+		return fmt.Errorf("%w: change %d carries an invalid destination name", syscall.EIO, change.Position)
+	}
+	if change.From != nil && !validStoredComponent(fromName) {
+		return fmt.Errorf("%w: change %d carries an invalid source name", syscall.EIO, change.Position)
+	}
+	if content.Valid && content.String == "" {
+		return fmt.Errorf("%w: change %d carries an empty content key", syscall.EIO, change.Position)
+	}
+	return nil
+}
+
+func validStoredComponent(name []byte) bool {
+	return len(name) != 0 && !bytes.Equal(name, []byte(".")) && !bytes.Equal(name, []byte("..")) &&
+		bytes.IndexByte(name, '/') < 0 && bytes.IndexByte(name, 0) < 0
 }
 
 // Incarnation names this log as a continuation of itself.
-func (s *Store) Incarnation(ctx context.Context) (metastore.Incarnation, error) {
-	var incarnation string
-	if err := s.read.QueryRowContext(ctx,
-		`SELECT incarnation FROM logs WHERE namespace = ?`, s.namespace).Scan(&incarnation); err != nil {
-		return "", fmt.Errorf("reading the log's incarnation: %w", failure(err))
+func (s *Store) Incarnation(ctx context.Context, maxBytes int64) (metastore.Incarnation, error) {
+	barrier, err := s.Barrier(ctx, maxBytes)
+	return barrier.Incarnation, err
+}
+
+func (s *Store) Barrier(ctx context.Context, maxBytes int64) (metastore.LogBarrier, error) {
+	if maxBytes < 1 {
+		return metastore.LogBarrier{}, fmt.Errorf("an incarnation byte bound of %d cannot hold an identity: %w", maxBytes, syscall.EINVAL)
 	}
-	return metastore.Incarnation(incarnation), nil
+	var barrier metastore.LogBarrier
+	if err := s.inspect(ctx, func(tx *sql.Tx) error {
+		var err error
+		barrier, err = s.readLogBarrier(ctx, tx, maxBytes, true)
+		return err
+	}); err != nil {
+		return metastore.LogBarrier{}, fmt.Errorf("reading the log's barrier: %w", failure(err))
+	}
+	return barrier, nil
 }
 
 // CommittedPosition is the newest position the tree was changed at.
@@ -578,10 +995,73 @@ func (s *Store) Incarnation(ctx context.Context) (metastore.Incarnation, error) 
 // Here that is also the log's tail, because the two are written in one transaction. It is a
 // separate question in the contract for the implementations where they can drift apart.
 func (s *Store) CommittedPosition(ctx context.Context) (metastore.Position, error) {
-	var committed int64
-	if err := s.read.QueryRowContext(ctx,
-		`SELECT committed_position FROM logs WHERE namespace = ?`, s.namespace).Scan(&committed); err != nil {
+	var committed metastore.Position
+	if err := s.inspect(ctx, func(tx *sql.Tx) error {
+		barrier, err := s.readLogBarrier(ctx, tx, 0, false)
+		committed = barrier.Position
+		return err
+	}); err != nil {
 		return 0, fmt.Errorf("reading the position the tree was last changed at: %w", failure(err))
 	}
-	return metastore.Position(committed), nil
+	return committed, nil
+}
+
+func (s *Store) readLogBarrier(
+	ctx context.Context,
+	tx *sql.Tx,
+	maxBytes int64,
+	loadIncarnation bool,
+) (metastore.LogBarrier, error) {
+	state, err := validateDurableState(ctx, tx)
+	if err != nil {
+		return metastore.LogBarrier{}, err
+	}
+	var (
+		incarnationType                string
+		incarnationBytes               int64
+		tailRaw, trimmedRaw, ageRaw    any
+		tailType, trimmedType, ageType string
+	)
+	if err := tx.QueryRowContext(ctx, `
+		SELECT typeof(incarnation), length(CAST(incarnation AS BLOB)),
+		       CASE WHEN typeof(committed_position) = 'integer' THEN committed_position END,
+		       typeof(committed_position),
+		       CASE WHEN typeof(trimmed_through) = 'integer' THEN trimmed_through END,
+		       typeof(trimmed_through),
+		       CASE WHEN typeof(trimmed_by_age) = 'integer' THEN trimmed_by_age END,
+		       typeof(trimmed_by_age)
+		FROM logs WHERE namespace = ?`, s.namespace).Scan(
+		&incarnationType, &incarnationBytes,
+		&tailRaw, &tailType, &trimmedRaw, &trimmedType, &ageRaw, &ageType,
+	); err != nil {
+		return metastore.LogBarrier{}, err
+	}
+	tail, tailOK := storedInteger(tailRaw, tailType)
+	trimmed, trimmedOK := storedInteger(trimmedRaw, trimmedType)
+	age, ageOK := storedInteger(ageRaw, ageType)
+	if incarnationType != "text" || incarnationBytes != 32 || !tailOK || !trimmedOK || !ageOK ||
+		tail < 0 || trimmed < 0 || trimmed > tail || (age != 0 && age != 1) ||
+		tail > state.ChangeHighWater || trimmed > state.ChangeHighWater {
+		return metastore.LogBarrier{}, fmt.Errorf("the namespace log header is invalid: %w", syscall.EIO)
+	}
+	barrier := metastore.LogBarrier{Position: metastore.Position(tail)}
+	if !loadIncarnation {
+		return barrier, nil
+	}
+	if incarnationBytes > maxBytes {
+		return metastore.LogBarrier{}, fmt.Errorf("the log incarnation has %d bytes under a %d-byte bound: %w",
+			incarnationBytes, maxBytes, syscall.EFBIG)
+	}
+	var raw any
+	if err := tx.QueryRowContext(ctx,
+		`SELECT incarnation FROM logs WHERE namespace = ?`, s.namespace,
+	).Scan(&raw); err != nil {
+		return metastore.LogBarrier{}, err
+	}
+	incarnation, ok := raw.(string)
+	if !ok || len(incarnation) != 32 || strings.Trim(incarnation, "0123456789abcdef") != "" {
+		return metastore.LogBarrier{}, fmt.Errorf("the namespace log incarnation is invalid: %w", syscall.EIO)
+	}
+	barrier.Incarnation = metastore.Incarnation(incarnation)
+	return barrier, nil
 }

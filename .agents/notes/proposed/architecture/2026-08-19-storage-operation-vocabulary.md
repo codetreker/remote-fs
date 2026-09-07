@@ -10,13 +10,15 @@ Status: proposed
 
 三个后果：
 
-**往返次数是这个系统的货币，而设计没有决定它。** 一次 `stat` 花几个往返、`ls -l` 一千条目花几个往返，全部取决于操作的粒度。评审给出的算术里每一行都有两个答案，原因就在这。
+**往返次数是这个系统的货币，而设计没有决定它。** 一次 `stat` 花几个往返、`ls -l` 一千条目花几个往返，全部取决于操作的粒度。同一项需求在逐条操作与批量形状下会得到数量级不同的成本，契约必须选择其中一个。
 
 **两个称职的工程师会造出互不兼容的东西。** 路径寻址 vs 节点身份寻址、`读(id, 偏移, 长度)` vs `打开(id) → 流`、整文件提交 vs 区间提交 —— 每一对都是合理的选择，而它们无法互换。
 
 **四行散文交不出去。** R-INT-6 要把这份契约交给第三方，让他们写出合规实现。义务不是词汇，而实现者首先需要的是词汇。
 
 ## 提案
+
+[有界地产生 Read 与 List 响应](../../implemented/architecture/2026-09-04-bounded-read-and-list-responses.md)已经用 caller-owned budget、bounded complete listing builder 与 server/client admission 兑现当前 non-streaming API 的 R-INT-3。它没有实现本 note 拥有的按区间 read、带 cursor 且内联属性的 paginated list；这些操作仍要单独定义 identity、观察一致性和 cursor 生命周期。
 
 ### 操作
 
@@ -75,8 +77,6 @@ Status: proposed
 多传的约 115 KB 换掉 1000 个往返 —— 11 ms 的传输换 20 秒。`git status` 遍历 1 万文件从 220 秒降到 20 秒。
 
 而 `docs/spec/problem.md` 的 S2 明说列目录「极其频繁」，R-WS-4（冷挂载要迅速可用）与 R-SCALE-1（假设是源码树、以元数据访问为主）也都依赖它。
-
-**这条曾经在架构初稿里，重写时丢失。** 记在这里以免再丢。
 
 ## 路径解析仍然是串行的
 

@@ -2,8 +2,11 @@ package httprest
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"sync"
@@ -12,95 +15,6 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 )
-
-// Limits are the bounds a handler puts on the replication endpoints.
-//
-// They exist because both endpoints accumulate something a request-and-response endpoint
-// does not: a subscription holds a connection for as long as a replica watches, and a
-// snapshot holds a resource inside the store — a read transaction, a version, a reference
-// — for as long as its rows take to cross the wire. The second is the one R-INT-3 is
-// about: how long it is held is decided by the network rather than by anything here, and
-// the worst moment for it is the one where every replica rebuilds at once, which is what
-// a server restart produces.
-type Limits struct {
-	// Snapshots is how many snapshots may be open at once. A request arriving when they
-	// all are is refused with EAGAIN rather than queued, because a replica subscribes
-	// before it asks for one — so retrying costs it nothing and loses it nothing, and the
-	// server holding the request open would be holding exactly what this bounds.
-	Snapshots int
-
-	// SnapshotDeadline is how long one snapshot may take to deliver, after which it is
-	// abandoned and what it held is released. A snapshot cannot be resumed — a consistent
-	// picture that is gone is gone — so a replica that runs into this starts over.
-	//
-	// It bounds the whole delivery and has nothing to do with the bound a reader keeps on a
-	// quiet stream, which Keepalive answers. Reading the two as a pair is a mistake worth
-	// naming, because they look like one: this being the larger figure suggests a slow
-	// picture is tolerated, when what decides that is whether anything is being said
-	// meanwhile. A picture may take all of this as long as it keeps speaking.
-	SnapshotDeadline time.Duration
-
-	// SnapshotPage is how many rows travel in one frame. The snapshot is the largest bulk
-	// transfer this system has, and sending it whole would occupy the connection for its
-	// whole length.
-	SnapshotPage int
-
-	// EventPage is how many changes one read of the log may return while a subscription
-	// catches up.
-	EventPage int
-
-	// Keepalive is how often a stream with nothing to say says so — both kinds, because
-	// both can be quiet for reasons that are nobody's fault. A namespace nobody is writing
-	// to produces no events, and a store working through a large tree produces no page for
-	// as long as it takes.
-	//
-	// It is what makes a live stream distinguishable from a dead one. Neither of those
-	// silences looks any different from a connection a firewall dropped, a machine that
-	// vanished, or a partition — the reader sees the same thing in all of them, which is
-	// nothing at all. A replica that could not tell them apart would go on answering from a
-	// copy it can no longer justify, for as long as the mistake lasted, which is what
-	// R-ERR-1 and R-ERR-2 forbid above everything else.
-	//
-	// It is paired with the bound the reading end keeps: DefaultSilence is three times this
-	// figure. The two are configured separately, so raising this above what a client allows
-	// severs every one of that client's streams on a timer — which is loud rather than
-	// silent, and is the direction to err in. SnapshotDeadline is not part of that pairing
-	// and must not be read as though it were; what it bounds is said there.
-	Keepalive time.Duration
-}
-
-// DefaultLimits are the bounds a handler uses when it is not given any.
-//
-// The figures are chosen rather than measured, which the design records as a deliberate
-// deferral: what a snapshot costs at scale is unknown until there is a tree large enough
-// to measure, and the first thing an operator meets is likely to be one of these.
-func DefaultLimits() Limits {
-	return Limits{
-		Snapshots:        8,
-		SnapshotDeadline: 5 * time.Minute,
-		SnapshotPage:     1024,
-		EventPage:        256,
-		Keepalive:        10 * time.Second,
-	}
-}
-
-func (l Limits) check() error {
-	for _, bound := range []struct {
-		name  string
-		value int64
-	}{
-		{"Snapshots", int64(l.Snapshots)},
-		{"SnapshotDeadline", int64(l.SnapshotDeadline)},
-		{"SnapshotPage", int64(l.SnapshotPage)},
-		{"EventPage", int64(l.EventPage)},
-		{"Keepalive", int64(l.Keepalive)},
-	} {
-		if bound.value <= 0 {
-			return fmt.Errorf("httprest: Limits.%s is %d, and every bound has to leave room for one of whatever it bounds", bound.name, bound.value)
-		}
-	}
-	return nil
-}
 
 // publisher wakes the open subscriptions when this server has changed the namespace.
 //
@@ -123,12 +37,13 @@ func (l Limits) check() error {
 // is stated here rather than discovered later as a namespace that updates only when
 // somebody else happens to write to it.
 type publisher struct {
-	mu    sync.Mutex
-	wakes map[chan struct{}]struct{}
+	mu               sync.Mutex
+	maxSubscriptions int
+	wakes            map[chan struct{}]struct{}
 }
 
-func newPublisher() *publisher {
-	return &publisher{wakes: map[chan struct{}]struct{}{}}
+func newPublisher(maxSubscriptions int) *publisher {
+	return &publisher{maxSubscriptions: maxSubscriptions, wakes: map[chan struct{}]struct{}{}}
 }
 
 // wake tells every open subscription to read the log again.
@@ -146,16 +61,20 @@ func (p *publisher) wake() {
 }
 
 // attach returns a channel that wake pokes, and the function that stops it.
-func (p *publisher) attach() (<-chan struct{}, func()) {
-	woken := make(chan struct{}, 1)
+func (p *publisher) attach() (<-chan struct{}, func(), error) {
 	p.mu.Lock()
+	if len(p.wakes) >= p.maxSubscriptions {
+		p.mu.Unlock()
+		return nil, nil, fmt.Errorf("the change-stream limit of %d is full: %w", p.maxSubscriptions, syscall.EAGAIN)
+	}
+	woken := make(chan struct{}, 1)
 	p.wakes[woken] = struct{}{}
 	p.mu.Unlock()
 	return woken, func() {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		delete(p.wakes, woken)
-	}
+	}, nil
 }
 
 // resumeFrom is where a replica asked a change stream to begin. A nil one asks for the
@@ -169,7 +88,7 @@ type resumeFrom struct {
 // serveEvents answers a subscription with a stream of changes.
 func (h *Handler) serveEvents(w http.ResponseWriter, r *http.Request, from *resumeFrom) {
 	if h.publisher == nil {
-		refuseUnreplicable(w)
+		h.refuseUnreplicable(w)
 		return
 	}
 	ctx := r.Context()
@@ -179,25 +98,34 @@ func (h *Handler) serveEvents(w http.ResponseWriter, r *http.Request, from *resu
 	// still holding a stale position until some later change happened to wake it — a
 	// failure with no interval to it at all, and so worse than the interval R-CON-2
 	// forbids.
-	woken, detach := h.publisher.attach()
+	woken, detach, err := h.publisher.attach()
+	if err != nil {
+		h.writeOperationError(w, err)
+		return
+	}
 	defer detach()
 
-	incarnation, err := h.log.Incarnation(ctx)
+	incarnation, err := h.log.Incarnation(ctx, h.maxIncarnationBytes)
 	if err != nil {
-		writeStorageError(w, err)
+		h.writeOperationError(w, err)
 		return
 	}
 	if incarnation == "" {
 		// A log with no identity matches every position any replica ever held, so the one
 		// answer it can give a returning replica is the answer that loses everything:
 		// "that is within my window, you are caught up".
-		writeStorageError(w, errors.New("the log reports no incarnation, so nothing could ever be resumed against it"))
+		h.writeOperationError(w, errors.New("the log reports no incarnation, so nothing could ever be resumed against it"))
 		return
 	}
 
 	start, at, err := h.startOf(ctx, incarnation, from)
 	if err != nil {
-		writeStorageError(w, err)
+		h.writeOperationError(w, err)
+		return
+	}
+	encodedStart, err := marshalStartFrame(start, h.maxFrameBytes, h.maxIncarnationBytes)
+	if err != nil {
+		h.writeOperationError(w, err)
 		return
 	}
 
@@ -206,18 +134,18 @@ func (h *Handler) serveEvents(w http.ResponseWriter, r *http.Request, from *resu
 	// has stopped reading, and a shutdown waiting on that waits for as long as that replica
 	// cares to say nothing. Refused rather than served unbounded, exactly as a picture is.
 	if err := boundedWrites(w); err != nil {
-		writeStorageError(w, fmt.Errorf("this server cannot bound a write to a stream, so a stream could not be ended when it stops: %w", err))
+		h.writeOperationError(w, fmt.Errorf("this server cannot bound a write to a stream, so a stream could not be ended when it stops: %w", err))
 		return
 	}
 
 	// Past here the response is a success and a stream, so nothing below can report a
 	// status and everything that goes wrong travels as a fault frame.
-	out, err := openStream(w)
+	out, err := openStream(w, h.maxFrameBytes)
 	if err != nil {
 		return
 	}
 	defer out.endWritesWhen(h.stopping)()
-	if err := out.send(eventStart, start); err != nil {
+	if err := out.sendEncoded(eventStart, encodedStart); err != nil {
 		return
 	}
 	if start.Rebuild != "" {
@@ -241,7 +169,11 @@ func (h *Handler) startOf(ctx context.Context, incarnation metastore.Incarnation
 	if from != nil {
 		at = from.position
 	}
-	_, retention, err := h.log.Since(ctx, at, 0)
+	result, err := newChangeFrameResult(h.maxFrameBytes)
+	if err != nil {
+		return StreamStart{}, 0, err
+	}
+	retention, err := h.log.Since(ctx, at, 0, result)
 	if err != nil {
 		return StreamStart{}, 0, err
 	}
@@ -325,7 +257,15 @@ func (h *Handler) publish(ctx context.Context, out *frameWriter, at metastore.Po
 
 	for {
 		for {
-			changes, retention, err := h.log.Since(ctx, at, h.limits.EventPage)
+			result, err := newChangeFrameResult(h.maxFrameBytes)
+			if err != nil {
+				return err
+			}
+			retention, err := h.log.Since(ctx, at, h.limits.EventPage, result)
+			if err != nil {
+				return err
+			}
+			changes, err := result.Changes()
 			if err != nil {
 				return err
 			}
@@ -338,6 +278,10 @@ func (h *Handler) publish(ctx context.Context, out *frameWriter, at metastore.Po
 				return out.send(eventStart, StreamStart{Rebuild: rebuild})
 			}
 			if len(changes) == 0 {
+				if retention.Tail > at {
+					return fmt.Errorf("the log has changes through position %d but returned none after %d: %w",
+						retention.Tail, at, syscall.EIO)
+				}
 				break
 			}
 			for _, change := range changes {
@@ -359,6 +303,8 @@ func (h *Handler) publish(ctx context.Context, out *frameWriter, at metastore.Po
 		}
 		select {
 		case <-woken:
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-h.stopping:
 			return out.send(eventGone, struct{}{})
 		case <-keepalive.C:
@@ -369,10 +315,6 @@ func (h *Handler) publish(ctx context.Context, out *frameWriter, at metastore.Po
 			if err := out.alive(); err != nil {
 				return err
 			}
-		case <-ctx.Done():
-			// The replica went away. There is nobody left to tell, so there is nothing to
-			// say.
-			return nil
 		}
 	}
 }
@@ -380,17 +322,20 @@ func (h *Handler) publish(ctx context.Context, out *frameWriter, at metastore.Po
 // serveSnapshot answers with one consistent picture of the tree, in pages.
 func (h *Handler) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	if h.log == nil {
-		refuseUnreplicable(w)
+		h.refuseUnreplicable(w)
 		return
 	}
-	select {
-	case h.snapshots <- struct{}{}:
-		defer func() { <-h.snapshots }()
-	default:
-		writeStorageError(w, fmt.Errorf("%d snapshots are already open, which is as many as this server holds at once: %w",
-			h.limits.Snapshots, syscall.EAGAIN))
+	releaseSnapshot, err := h.snapshots.acquireOperation(r.Context())
+	if err != nil {
+		if errors.Is(err, syscall.EAGAIN) {
+			h.writeOperationError(w, fmt.Errorf("%d snapshots are already open, which is as many as this server holds at once: %w",
+				h.limits.Snapshots, syscall.EAGAIN))
+		} else {
+			h.writeRequestBodyFault(w, fmt.Errorf("snapshot admission: %w", err))
+		}
 		return
 	}
+	defer releaseSnapshot()
 
 	// The deadline has to reach the write as well as the reads. A replica that stops
 	// reading without closing its connection stalls the write, and a context deadline does
@@ -398,7 +343,7 @@ func (h *Handler) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	// stay open for as long as that replica cared to say nothing. A server that cannot
 	// bound its writes is refused the operation rather than given an unbounded one.
 	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(h.limits.SnapshotDeadline)); err != nil {
-		writeStorageError(w, fmt.Errorf("this server cannot bound how long a snapshot may take to send: %w", err))
+		h.writeOperationError(w, fmt.Errorf("this server cannot bound how long a snapshot may take to send: %w", err))
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), h.limits.SnapshotDeadline)
@@ -406,11 +351,11 @@ func (h *Handler) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 
 	snap, at, err := h.log.Snapshot(ctx)
 	if err != nil {
-		writeStorageError(w, err)
+		h.writeOperationError(w, err)
 		return
 	}
 
-	out, err := openStream(w)
+	out, err := openStream(w, h.maxFrameBytes)
 	if err != nil {
 		snap.Close()
 		return
@@ -430,8 +375,8 @@ func (h *Handler) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	// read whole but could not be closed is reported as a failure for the same reason:
 	// this side cannot say what state it was left in, and a replica that starts over pays
 	// one retry, where one built on a picture that was not what it claimed pays forever.
-	if closeErr := snap.Close(); err == nil {
-		err = closeErr
+	if closeErr := snap.Close(); closeErr != nil {
+		err = errors.Join(err, closeErr)
 	}
 	if err != nil {
 		if !h.endedByStop(err) {
@@ -467,19 +412,42 @@ func (h *Handler) pages(ctx context.Context, out *frameWriter, snap metastore.Sn
 	// not something the contract allows.
 	producing, stopProducing := context.WithCancel(ctx)
 	type produced struct {
-		rows []metastore.Row
-		done bool
-		err  error
+		rows    []metastore.Row
+		done    bool
+		err     error
+		release func()
 	}
 	ready := make(chan produced)
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
 		for {
-			rows, done, err := snap.Next(producing, h.limits.SnapshotPage)
+			release, err := h.acquireSnapshotFrame(producing)
+			if err != nil {
+				select {
+				case ready <- produced{err: err}:
+				case <-producing.Done():
+				}
+				return
+			}
+			result, err := newSnapshotFrameResult(h.maxFrameBytes)
+			if err != nil {
+				release()
+				select {
+				case ready <- produced{err: err}:
+				case <-producing.Done():
+				}
+				return
+			}
+			done, err := snap.Next(producing, h.limits.SnapshotPage, result)
+			rows, rowsErr := result.Rows()
+			if err == nil {
+				err = rowsErr
+			}
 			select {
-			case ready <- produced{rows, done, err}:
+			case ready <- produced{rows: rows, done: done, err: err, release: release}:
 			case <-producing.Done():
+				release()
 				return
 			}
 			if done || err != nil {
@@ -499,6 +467,9 @@ func (h *Handler) pages(ctx context.Context, out *frameWriter, snap metastore.Sn
 		select {
 		case page := <-ready:
 			if page.err != nil {
+				if page.release != nil {
+					page.release()
+				}
 				return false, page.err
 			}
 			if len(page.rows) > 0 {
@@ -507,9 +478,11 @@ func (h *Handler) pages(ctx context.Context, out *frameWriter, snap metastore.Sn
 					rows.Rows = append(rows.Rows, RowOf(row))
 				}
 				if err := out.send(eventRows, rows); err != nil {
+					page.release()
 					return false, err
 				}
 			}
+			page.release()
 			if page.done {
 				return false, nil
 			}
@@ -565,6 +538,111 @@ func (h *Handler) endedByStop(err error) bool {
 // protocol or a failure worth retrying. What it must not be answered with is a stream that
 // carries nothing and a snapshot of no rows, which is a namespace that exists, is empty,
 // and never changes — an answer a replica would believe.
-func refuseUnreplicable(w http.ResponseWriter) {
-	writeStorageError(w, fmt.Errorf("this namespace keeps no change log, so it cannot be replicated: %w", syscall.ENOSYS))
+func (h *Handler) refuseUnreplicable(w http.ResponseWriter) {
+	h.writeOperationError(w, fmt.Errorf("this namespace keeps no change log, so it cannot be replicated: %w", syscall.ENOSYS))
+}
+
+func (h *Handler) acquireSnapshotFrame(ctx context.Context) (func(), error) {
+	release, err := h.snapshotFrames.acquire(ctx, retainedFrameMultiplier*h.maxFrameBytes)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot-frame admission failed: %w", err)
+	}
+	return release, nil
+}
+
+func marshalStartFrame(start StreamStart, maxFrameBytes, maxIncarnationBytes int64) ([]byte, error) {
+	// JSON may expand each byte of an arbitrary string to a six-byte escape. Rejecting
+	// from the source length keeps an adversarial Log implementation from making the
+	// encoder allocate an oversized frame before the final encoded-length check.
+	if int64(len(start.Incarnation)) > maxIncarnationBytes {
+		return nil, fmt.Errorf("the log incarnation exceeds the handler's %d-byte identity bound: %w", maxIncarnationBytes, syscall.EFBIG)
+	}
+	return marshalFrame(eventStart, start, maxFrameBytes)
+}
+
+func newChangeFrameResult(maxFrameBytes int64) (*metastore.ChangeResult, error) {
+	return metastore.NewChangeResult(maxFrameBytes, 0, func(_ int, meta metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
+		if err := payloadLengthsFitFrame(maxFrameBytes, lengths.Name, lengths.FromName, lengths.Content); err != nil {
+			return 0, err
+		}
+		if meta.From != nil {
+			from := *meta.From
+			meta.From = &from
+		}
+		if meta.Node != nil {
+			node := *meta.Node
+			node.Content = ""
+			meta.Node = &node
+		}
+		wire, err := changeShapeOf(meta)
+		if err != nil {
+			return 0, err
+		}
+		encoded, err := json.Marshal(wire)
+		if err != nil {
+			return 0, fmt.Errorf("cannot size a change frame: %w", err)
+		}
+		payloadBytes := int64(len(encoded))
+		for _, length := range []int64{lengths.Name, lengths.FromName, lengths.Content} {
+			payloadBytes, err = addFrameBytes(payloadBytes, int64(base64.StdEncoding.EncodedLen(int(length))))
+			if err != nil {
+				return 0, err
+			}
+		}
+		return encodedFrameBytes(eventChange, payloadBytes)
+	})
+}
+
+func newSnapshotFrameResult(maxFrameBytes int64) (*metastore.RowResult, error) {
+	empty, err := json.Marshal(SnapshotPage{Rows: []Row{}})
+	if err != nil {
+		return nil, fmt.Errorf("cannot size an empty snapshot frame: %w", err)
+	}
+	fixed, err := encodedFrameBytes(eventRows, int64(len(empty)))
+	if err != nil {
+		return nil, err
+	}
+	return metastore.NewRowResult(maxFrameBytes, fixed, func(index int, meta metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
+		if err := payloadLengthsFitFrame(maxFrameBytes, lengths.Name, lengths.Content); err != nil {
+			return 0, err
+		}
+		meta.Node.Content = ""
+		one, err := json.Marshal(SnapshotPage{Rows: []Row{RowOf(meta)}})
+		if err != nil {
+			return 0, fmt.Errorf("cannot size a snapshot row: %w", err)
+		}
+		charge := int64(len(one) - len(empty))
+		if index != 0 {
+			charge++
+		}
+		charge, err = addFrameBytes(charge, int64(base64.StdEncoding.EncodedLen(int(lengths.Name))))
+		if err != nil {
+			return 0, err
+		}
+		charge, err = addFrameBytes(charge, int64(base64.StdEncoding.EncodedLen(int(lengths.Content))))
+		if err != nil {
+			return 0, err
+		}
+		return charge, nil
+	})
+}
+
+func addFrameBytes(total, more int64) (int64, error) {
+	if more < 0 || more > math.MaxInt64-total {
+		return 0, fmt.Errorf("stream-frame byte accounting overflowed: %w", syscall.EFBIG)
+	}
+	return total + more, nil
+}
+
+func payloadLengthsFitFrame(maxFrameBytes int64, lengths ...int64) error {
+	maxInt := int64(^uint(0) >> 1)
+	for _, length := range lengths {
+		if length < 0 {
+			return fmt.Errorf("a stream payload has negative length: %w", syscall.EIO)
+		}
+		if length > maxFrameBytes || length > maxInt || length > (maxInt/4)*3 {
+			return fmt.Errorf("a %d-byte stream payload cannot fit the %d-byte frame bound: %w", length, maxFrameBytes, syscall.EFBIG)
+		}
+	}
+	return nil
 }

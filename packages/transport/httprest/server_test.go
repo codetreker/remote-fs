@@ -5,14 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -68,11 +71,16 @@ func TestNewHandlerRejectsAMissingStorage(t *testing.T) {
 func TestNewHandlerRejectsBoundsWithNoRoomInThem(t *testing.T) {
 	usable := httprest.DefaultLimits()
 	cases := map[string]func(*httprest.Limits){
-		"no snapshots at all":       func(l *httprest.Limits) { l.Snapshots = 0 },
-		"no time to send one in":    func(l *httprest.Limits) { l.SnapshotDeadline = 0 },
-		"pages of no rows":          func(l *httprest.Limits) { l.SnapshotPage = 0 },
-		"pages of no changes":       func(l *httprest.Limits) { l.EventPage = 0 },
-		"a negative number of them": func(l *httprest.Limits) { l.Snapshots = -1 },
+		"no subscriptions at all":    func(l *httprest.Limits) { l.MaxSubscriptions = 0 },
+		"no snapshots at all":        func(l *httprest.Limits) { l.Snapshots = 0 },
+		"no time to send one in":     func(l *httprest.Limits) { l.SnapshotDeadline = 0 },
+		"pages of no rows":           func(l *httprest.Limits) { l.SnapshotPage = 0 },
+		"pages of no changes":        func(l *httprest.Limits) { l.EventPage = 0 },
+		"a negative number of them":  func(l *httprest.Limits) { l.Snapshots = -1 },
+		"pathological subscriptions": func(l *httprest.Limits) { l.MaxSubscriptions = math.MaxInt },
+		"pathological snapshots":     func(l *httprest.Limits) { l.Snapshots = math.MaxInt },
+		"pathological snapshot page": func(l *httprest.Limits) { l.SnapshotPage = math.MaxInt },
+		"pathological event page":    func(l *httprest.Limits) { l.EventPage = math.MaxInt },
 	}
 	for name, spoil := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -87,6 +95,109 @@ func TestNewHandlerRejectsBoundsWithNoRoomInThem(t *testing.T) {
 		// Without this the cases above would pass for a handler that refuses every set of
 		// bounds there is.
 		t.Fatalf("NewHandlerWithLimits with usable bounds failed: %v", err)
+	}
+}
+
+func TestNewHandlerOptionsHaveBoundedDefaultsAndRejectInvalidBounds(t *testing.T) {
+	zero := httprest.HandlerOptions{}
+	if err := zero.Check(); err != nil {
+		t.Fatalf("zero HandlerOptions did not validate with bounded defaults: %v", err)
+	}
+	if _, err := httprest.NewHandlerWithOptions(failing{syscall.EIO}, nil, zero); err != nil {
+		t.Fatalf("zero HandlerOptions did not select bounded defaults: %v", err)
+	}
+	inheritedWrite := httprest.DefaultHandlerOptions()
+	inheritedWrite.MaxBodyBytes = 5 << 20
+	inheritedWrite.MaxWriteBytes = 0
+	inheritedWrite.MaxInFlightBodyBytes = 5 << 20
+	if err := inheritedWrite.Check(); err != nil {
+		t.Fatalf("zero MaxWriteBytes did not inherit MaxBodyBytes: %v", err)
+	}
+	usable := httprest.DefaultHandlerOptions()
+	cases := map[string]func(*httprest.HandlerOptions){
+		"body below the protocol minimum": func(o *httprest.HandlerOptions) { o.MaxBodyBytes = 1 },
+		"negative body bytes":             func(o *httprest.HandlerOptions) { o.MaxBodyBytes = -1 },
+		"an effectively unbounded body":   func(o *httprest.HandlerOptions) { o.MaxBodyBytes = math.MaxInt64 },
+		"body too large for response accounting": func(o *httprest.HandlerOptions) {
+			o.MaxBodyBytes = math.MaxInt64/4 + 1
+			o.MaxInFlightBodyBytes = o.MaxBodyBytes
+			o.MaxInFlightResponseBytes = math.MaxInt64
+		},
+		"negative write bytes":          func(o *httprest.HandlerOptions) { o.MaxWriteBytes = -1 },
+		"write above the protocol body": func(o *httprest.HandlerOptions) { o.MaxWriteBytes = o.MaxBodyBytes + 1 },
+		"negative body operations":      func(o *httprest.HandlerOptions) { o.MaxConcurrentBodies = -1 },
+		"negative body waiters":         func(o *httprest.HandlerOptions) { o.MaxWaitingBodies = -1 },
+		"aggregate below one body": func(o *httprest.HandlerOptions) {
+			o.MaxInFlightBodyBytes = o.MaxBodyBytes - 1
+		},
+		"negative response operations": func(o *httprest.HandlerOptions) { o.MaxConcurrentResponses = -1 },
+		"negative response waiters":    func(o *httprest.HandlerOptions) { o.MaxWaitingResponses = -1 },
+		"aggregate below one complete response": func(o *httprest.HandlerOptions) {
+			o.MaxInFlightResponseBytes = 4*o.MaxBodyBytes - 1
+		},
+		"frame below the protocol minimum": func(o *httprest.HandlerOptions) { o.MaxFrameBytes = 1 },
+		"an effectively unbounded frame":   func(o *httprest.HandlerOptions) { o.MaxFrameBytes = math.MaxInt64 },
+		"negative frame operations":        func(o *httprest.HandlerOptions) { o.MaxConcurrentSnapshotFrames = -1 },
+		"negative frame waiters":           func(o *httprest.HandlerOptions) { o.MaxWaitingSnapshotFrames = -1 },
+		"aggregate below one complete frame": func(o *httprest.HandlerOptions) {
+			o.MaxFrameBytes = 1024
+			o.MaxInFlightSnapshotFrameBytes = 3*o.MaxFrameBytes - 1
+		},
+	}
+	for name, spoil := range cases {
+		t.Run(name, func(t *testing.T) {
+			options := usable
+			spoil(&options)
+			if err := options.Check(); err == nil {
+				t.Fatalf("HandlerOptions.Check accepted %+v", options)
+			}
+			if _, err := httprest.NewHandlerWithOptions(failing{syscall.EIO}, nil, options); err == nil {
+				t.Fatalf("NewHandlerWithOptions(%+v) succeeded, want an error", options)
+			}
+		})
+	}
+}
+
+func TestHandlerRefusesStorageWithoutBoundedResults(t *testing.T) {
+	dir := t.TempDir()
+	bounded, err := localdir.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unbounded := struct{ storage.Storage }{Storage: bounded}
+	if _, err := httprest.NewHandler(unbounded, nil); err == nil {
+		t.Fatal("NewHandler accepted a storage without bounded read and list capabilities")
+	}
+}
+
+func TestHandlerUsesBoundedReadAndListEntrypoints(t *testing.T) {
+	probe := &boundedEntrypointProbe{failing: failing{err: syscall.EIO}}
+	options := httprest.DefaultHandlerOptions()
+	options.MaxBodyBytes = 1024
+	options.MaxWriteBytes = 1024
+	options.MaxInFlightBodyBytes = 1024
+	options.MaxInFlightResponseBytes = 4 * options.MaxBodyBytes
+	h, err := httprest.NewHandlerWithOptions(probe, nil, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	read := serve(t, h, httprest.Request{Op: httprest.OpRead, Path: "large"}, nil)
+	var readError httprest.ErrorResponse
+	if err := json.Unmarshal(read.Body.Bytes(), &readError); err != nil {
+		t.Fatal(err)
+	}
+	if readError.Errno != "EFBIG" || probe.readLimit != options.MaxBodyBytes {
+		t.Fatalf("bounded read answered %+v after receiving limit %d", readError, probe.readLimit)
+	}
+
+	listed := serve(t, h, httprest.Request{Op: httprest.OpList, Path: "large"}, nil)
+	var listError httprest.ErrorResponse
+	if err := json.Unmarshal(listed.Body.Bytes(), &listError); err != nil {
+		t.Fatal(err)
+	}
+	if listError.Errno != "EIO" || !probe.listCalled {
+		t.Fatalf("bounded list answered %+v, called=%t", listError, probe.listCalled)
 	}
 }
 
@@ -342,6 +453,7 @@ func TestANamespaceWithNoRoomToReportSaysSoByName(t *testing.T) {
 // failing is a storage whose every operation reports one fixed error.
 type failing struct{ err error }
 
+func (f failing) CheckBounded() error                                { return nil }
 func (f failing) Stat(context.Context, string) (storage.Attr, error) { return storage.Attr{}, f.err }
 func (f failing) SetAttr(context.Context, string, storage.AttrChange) error {
 	return f.err
@@ -349,14 +461,40 @@ func (f failing) SetAttr(context.Context, string, storage.AttrChange) error {
 func (f failing) List(context.Context, string) ([]storage.Entry, error) {
 	return nil, f.err
 }
-func (f failing) Read(context.Context, string) ([]byte, error) { return nil, f.err }
-func (f failing) Write(context.Context, string, []byte) error  { return f.err }
-func (f failing) Create(context.Context, string) error         { return f.err }
-func (f failing) Mkdir(context.Context, string) error          { return f.err }
-func (f failing) Remove(context.Context, string) error         { return f.err }
-func (f failing) RemoveDir(context.Context, string) error      { return f.err }
-func (f failing) Rename(context.Context, string, string) error { return f.err }
-func (f failing) Space(context.Context) (storage.Space, error) { return storage.Space{}, f.err }
+func (f failing) ListBounded(context.Context, string, *storage.ListResult) error { return f.err }
+func (f failing) Read(context.Context, string) ([]byte, error)                   { return nil, f.err }
+func (f failing) ReadBounded(context.Context, string, int64) ([]byte, error)     { return nil, f.err }
+func (f failing) Write(context.Context, string, []byte) error                    { return f.err }
+func (f failing) Create(context.Context, string) error                           { return f.err }
+func (f failing) Mkdir(context.Context, string) error                            { return f.err }
+func (f failing) Remove(context.Context, string) error                           { return f.err }
+func (f failing) RemoveDir(context.Context, string) error                        { return f.err }
+func (f failing) Rename(context.Context, string, string) error                   { return f.err }
+func (f failing) Space(context.Context) (storage.Space, error)                   { return storage.Space{}, f.err }
+
+type boundedEntrypointProbe struct {
+	failing
+	readLimit  int64
+	listCalled bool
+}
+
+func (s *boundedEntrypointProbe) Read(context.Context, string) ([]byte, error) {
+	panic("the unbounded Read entrypoint was called")
+}
+
+func (s *boundedEntrypointProbe) ReadBounded(_ context.Context, _ string, maxBytes int64) ([]byte, error) {
+	s.readLimit = maxBytes
+	return nil, syscall.EFBIG
+}
+
+func (s *boundedEntrypointProbe) List(context.Context, string) ([]storage.Entry, error) {
+	panic("the unbounded List entrypoint was called")
+}
+
+func (s *boundedEntrypointProbe) ListBounded(_ context.Context, _ string, result *storage.ListResult) error {
+	s.listCalled = true
+	return result.Add(storage.Entry{Name: strings.Repeat("x", int(result.MaxBytes()))})
+}
 
 func TestReadAnswersTheExactBytesWithALength(t *testing.T) {
 	h, dir := newHandler(t)
@@ -399,6 +537,503 @@ func TestWriteStoresTheExactBytes(t *testing.T) {
 	if string(got) != string(content) {
 		t.Fatalf("the file on disk holds %q, want %q", got, content)
 	}
+}
+
+func TestWriteBodiesAreBoundedBeforeStorage(t *testing.T) {
+	const limit = int64(1024)
+	newBoundedHandler := func(t *testing.T) (*httprest.Handler, string) {
+		t.Helper()
+		dir := t.TempDir()
+		s, err := localdir.New(dir)
+		if err != nil {
+			t.Fatalf("open the namespace: %v", err)
+		}
+		options := httprest.DefaultHandlerOptions()
+		options.MaxBodyBytes = limit
+		options.MaxWriteBytes = limit
+		options.MaxInFlightBodyBytes = limit
+		h, err := httprest.NewHandlerWithOptions(s, nil, options)
+		if err != nil {
+			t.Fatalf("new handler: %v", err)
+		}
+		return h, dir
+	}
+	request := func(t *testing.T, h http.Handler, body io.Reader, declared int64) *httptest.ResponseRecorder {
+		t.Helper()
+		base, _ := url.Parse("http://server.invalid")
+		u, err := (httprest.Request{Op: httprest.OpWrite, Path: "f"}).URL(base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(http.MethodPost, u.String(), body)
+		r.ContentLength = declared
+		if declared < 0 {
+			r.TransferEncoding = []string{"chunked"}
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	assertTooLarge := func(t *testing.T, w *httptest.ResponseRecorder, dir string) {
+		t.Helper()
+		if w.Code != httprest.StatusStorageError {
+			t.Fatalf("oversized write answered %d, want %d: %s", w.Code, httprest.StatusStorageError, w.Body)
+		}
+		var response httprest.ErrorResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode oversized write response: %v", err)
+		}
+		if response.Errno != "EFBIG" {
+			t.Fatalf("oversized write reported %q, want EFBIG", response.Errno)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "f")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("oversized write reached storage: %v", err)
+		}
+	}
+
+	t.Run("the declared length is rejected without reading", func(t *testing.T) {
+		h, dir := newBoundedHandler(t)
+		assertTooLarge(t, request(t, h, panicReader{}, limit+1), dir)
+	})
+
+	t.Run("an unknown length is stopped after its first excess byte", func(t *testing.T) {
+		h, dir := newBoundedHandler(t)
+		body := &repeatingReader{}
+		assertTooLarge(t, request(t, h, body, -1), dir)
+		if body.read != limit+1 {
+			t.Fatalf("the handler read %d bytes, want the limit plus one (%d)", body.read, limit+1)
+		}
+	})
+
+	t.Run("the boundary is accepted", func(t *testing.T) {
+		h, dir := newBoundedHandler(t)
+		content := bytes.Repeat([]byte("x"), int(limit))
+		w := request(t, h, bytes.NewReader(content), limit)
+		if w.Code != http.StatusOK {
+			t.Fatalf("write at the limit answered %d: %s", w.Code, w.Body)
+		}
+		got, err := os.ReadFile(filepath.Join(dir, "f"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, content) {
+			t.Fatalf("stored %q, want %q", got, content)
+		}
+	})
+}
+
+func TestBodylessOperationsRejectAnyBodyBeforeStorage(t *testing.T) {
+	h, err := httprest.NewHandler(failing{syscall.EIO}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type bodyCase struct {
+		name     string
+		declared int64
+		chunked  bool
+	}
+	bodies := []bodyCase{
+		{name: "declared", declared: 4096},
+		{name: "chunked", declared: -1, chunked: true},
+		{name: "present despite a zero declaration", declared: 0},
+	}
+	for _, req := range bodylessRequests() {
+		for _, bodyCase := range bodies {
+			t.Run(string(req.Op)+"/"+bodyCase.name, func(t *testing.T) {
+				body := &observedReader{from: bytes.NewReader([]byte("x"))}
+				r := newServerRequest(t, req, body)
+				r.ContentLength = bodyCase.declared
+				if bodyCase.chunked {
+					r.TransferEncoding = []string{"chunked"}
+				}
+				w := httptest.NewRecorder()
+				h.ServeHTTP(w, r)
+				if w.Code != http.StatusBadRequest {
+					t.Fatalf("bodyless %s answered %d, want 400: %s", req.Op, w.Code, w.Body)
+				}
+				if w.Code == httprest.StatusStorageError {
+					t.Fatal("an unexpected body was reported as a storage outcome")
+				}
+				wantRead := 1
+				wantCalls := 1
+				if bodyCase.declared > 0 {
+					wantRead = 0
+					wantCalls = 0
+				}
+				if body.read != wantRead {
+					t.Fatalf("the body reader delivered %d bytes, want %d", body.read, wantRead)
+				}
+				if body.calls != wantCalls {
+					t.Fatalf("the body reader was called %d times, want %d", body.calls, wantCalls)
+				}
+				var response httprest.ErrorResponse
+				if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+					t.Fatal(err)
+				}
+				if response.Errno != "" || !strings.Contains(response.Message, string(req.Op)) {
+					t.Fatalf("unexpected-body fault was %+v", response)
+				}
+			})
+		}
+	}
+}
+
+func TestBodylessOperationsAcceptAnEmptyChunkedBody(t *testing.T) {
+	h, err := httprest.NewHandler(failing{syscall.EIO}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, req := range bodylessRequests() {
+		t.Run(string(req.Op), func(t *testing.T) {
+			baseline := serve(t, h, req, nil)
+			body := &observedReader{from: bytes.NewReader(nil)}
+			r := newServerRequest(t, req, body)
+			r.ContentLength = -1
+			r.TransferEncoding = []string{"chunked"}
+			chunked := httptest.NewRecorder()
+			h.ServeHTTP(chunked, r)
+			if chunked.Code != baseline.Code || chunked.Body.String() != baseline.Body.String() {
+				t.Fatalf("empty chunked body answered %d %s, ordinary empty body answered %d %s",
+					chunked.Code, chunked.Body, baseline.Code, baseline.Body)
+			}
+			if body.calls != 1 || body.read != 0 {
+				t.Fatalf("empty chunked body was read with %d calls and %d bytes", body.calls, body.read)
+			}
+		})
+	}
+}
+
+func TestUnknownLengthBodylessRequestsUseOperationAdmission(t *testing.T) {
+	options := httprest.DefaultHandlerOptions()
+	options.MaxConcurrentBodies = 1
+	h, err := httprest.NewHandlerWithOptions(failing{syscall.EIO}, nil, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blocked := &blockingReader{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(blocked.release)
+		}
+	})
+	firstRequest := newServerRequest(t, httprest.Request{Op: httprest.OpStat, Path: "first"}, blocked)
+	firstRequest.ContentLength = -1
+	firstRequest.TransferEncoding = []string{"chunked"}
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, firstRequest)
+		firstDone <- w
+	}()
+	<-blocked.entered
+
+	body := &observedReader{from: bytes.NewReader(nil)}
+	ctx, cancel := context.WithCancel(t.Context())
+	secondRequest := newServerRequest(t, httprest.Request{Op: httprest.OpList, Path: "second"}, body).WithContext(ctx)
+	secondRequest.ContentLength = -1
+	secondRequest.TransferEncoding = []string{"chunked"}
+	secondDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, secondRequest)
+		secondDone <- w
+	}()
+
+	select {
+	case w := <-secondDone:
+		t.Fatalf("the second unknown-length body bypassed admission and answered %d", w.Code)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	var second *httptest.ResponseRecorder
+	select {
+	case second = <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("cancelling an empty-body check waiting for admission did not return it")
+	}
+	if second.Code != http.StatusRequestTimeout {
+		t.Fatalf("cancelled empty-body admission answered %d, want 408: %s", second.Code, second.Body)
+	}
+	if body.calls != 0 {
+		t.Fatalf("the body waiting for admission was read %d times", body.calls)
+	}
+
+	close(blocked.release)
+	released = true
+	if first := <-firstDone; first.Code != httprest.StatusStorageError {
+		t.Fatalf("the admitted request answered %d: %s", first.Code, first.Body)
+	}
+}
+
+func newServerRequest(t *testing.T, req httprest.Request, body io.Reader) *http.Request {
+	t.Helper()
+	base, _ := url.Parse("http://server.invalid")
+	u, err := req.URL(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return httptest.NewRequest(req.Method(), u.String(), body)
+}
+
+func bodylessRequests() []httprest.Request {
+	return []httprest.Request{
+		{Op: httprest.OpStat, Path: "f"},
+		{Op: httprest.OpList, Path: "d"},
+		{Op: httprest.OpRead, Path: "f"},
+		{Op: httprest.OpCreate, Path: "f"},
+		{Op: httprest.OpMkdir, Path: "d"},
+		{Op: httprest.OpRemove, Path: "f"},
+		{Op: httprest.OpRemoveDir, Path: "d"},
+		{Op: httprest.OpRename, Path: "from", To: "to"},
+		{Op: httprest.OpSpace},
+		{Op: httprest.OpSubscribe},
+		{Op: httprest.OpResubscribe, Incarnation: "log", Position: 1},
+		{Op: httprest.OpSnapshot},
+	}
+}
+
+func TestAnOversizedAttributeChangeIsAProtocolFault(t *testing.T) {
+	dir := t.TempDir()
+	s, err := localdir.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	options := httprest.DefaultHandlerOptions()
+	options.MaxBodyBytes = 1024
+	options.MaxWriteBytes = 1024
+	options.MaxInFlightBodyBytes = 1024
+	h, err := httprest.NewHandlerWithOptions(s, nil, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := append([]byte(`{"change":{}}`), bytes.Repeat([]byte(" "), 1024)...)
+	w := serve(t, h, httprest.Request{Op: httprest.OpSetAttr, Path: "f"}, bytes.NewReader(body))
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized attribute change answered %d, want 413: %s", w.Code, w.Body)
+	}
+	if w.Code == httprest.StatusStorageError {
+		t.Fatal("an attribute document refused before decoding was reported as a storage outcome")
+	}
+	info, err := os.Stat(filepath.Join(dir, "f"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode() != 0o600 {
+		t.Fatalf("the refused change altered the mode to %v", info.Mode())
+	}
+}
+
+func TestRequestBodyAdmissionBoundsConcurrentOperationsAndBytes(t *testing.T) {
+	const limit = int64(1024)
+	cases := map[string]func(*httprest.HandlerOptions){
+		"operation bound": func(o *httprest.HandlerOptions) {
+			o.MaxConcurrentBodies = 1
+			o.MaxInFlightBodyBytes = 2 * limit
+		},
+		"aggregate byte bound": func(o *httprest.HandlerOptions) {
+			o.MaxConcurrentBodies = 2
+			o.MaxInFlightBodyBytes = limit
+		},
+	}
+	for name, configure := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			inner, err := localdir.New(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			blocked := &blockingWrite{
+				Storage: inner,
+				entered: make(chan struct{}),
+				release: make(chan struct{}),
+			}
+			released := false
+			t.Cleanup(func() {
+				if !released {
+					close(blocked.release)
+				}
+			})
+			options := httprest.DefaultHandlerOptions()
+			options.MaxBodyBytes = limit
+			options.MaxWriteBytes = limit
+			configure(&options)
+			h, err := httprest.NewHandlerWithOptions(blocked, nil, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			firstDone := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				firstDone <- serve(t, h, httprest.Request{Op: httprest.OpWrite, Path: "first"}, bytes.NewReader([]byte("x")))
+			}()
+			<-blocked.entered
+
+			base, _ := url.Parse("http://server.invalid")
+			u, err := (httprest.Request{Op: httprest.OpWrite, Path: "second"}).URL(base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := &observedReader{from: bytes.NewReader([]byte("y"))}
+			ctx, cancel := context.WithCancel(t.Context())
+			r := httptest.NewRequest(http.MethodPost, u.String(), body).WithContext(ctx)
+			secondDone := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				w := httptest.NewRecorder()
+				h.ServeHTTP(w, r)
+				secondDone <- w
+			}()
+
+			select {
+			case w := <-secondDone:
+				t.Fatalf("the second body bypassed admission and answered %d", w.Code)
+			case <-time.After(50 * time.Millisecond):
+			}
+			cancel()
+			var second *httptest.ResponseRecorder
+			select {
+			case second = <-secondDone:
+			case <-time.After(time.Second):
+				t.Fatal("cancelling a body waiting for admission did not return it")
+			}
+			if second.Code != http.StatusRequestTimeout {
+				t.Fatalf("cancelled admission answered %d, want 408: %s", second.Code, second.Body)
+			}
+			if body.read != 0 {
+				t.Fatalf("a body waiting for admission was read for %d bytes", body.read)
+			}
+
+			close(blocked.release)
+			released = true
+			if first := <-firstDone; first.Code != http.StatusOK {
+				t.Fatalf("the admitted write answered %d: %s", first.Code, first.Body)
+			}
+		})
+	}
+}
+
+func TestWriteAdmissionReservesTheWriteLimit(t *testing.T) {
+	const (
+		writeLimit = int64(4 << 20)
+		bodyLimit  = int64(5 << 20)
+	)
+	blocked := &multiBlockingWrite{
+		Storage: failing{syscall.EIO},
+		entered: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(blocked.release)
+		}
+	})
+	options := httprest.DefaultHandlerOptions()
+	options.MaxBodyBytes = bodyLimit
+	options.MaxWriteBytes = writeLimit
+	options.MaxConcurrentBodies = 2
+	options.MaxInFlightBodyBytes = 2 * writeLimit
+	h, err := httprest.NewHandlerWithOptions(blocked, nil, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan *httptest.ResponseRecorder, 2)
+	for _, path := range []string{"first", "second"} {
+		path := path
+		go func() {
+			done <- serve(t, h, httprest.Request{Op: httprest.OpWrite, Path: path}, bytes.NewReader([]byte("x")))
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-blocked.entered:
+		case <-time.After(time.Second):
+			t.Fatalf("only %d writes entered storage; admission did not reserve the %d-byte write limit", i, writeLimit)
+		}
+	}
+	close(blocked.release)
+	released = true
+	for i := 0; i < 2; i++ {
+		if response := <-done; response.Code != http.StatusOK {
+			t.Fatalf("admitted write answered %d: %s", response.Code, response.Body)
+		}
+	}
+}
+
+func TestHandlerBoundsNonStreamingResponses(t *testing.T) {
+	const limit = int64(1024)
+	newBounded := func(t *testing.T, s storage.Storage) *httprest.Handler {
+		t.Helper()
+		options := httprest.DefaultHandlerOptions()
+		options.MaxBodyBytes = limit
+		options.MaxWriteBytes = limit
+		options.MaxInFlightBodyBytes = limit
+		h, err := httprest.NewHandlerWithOptions(s, nil, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	assertErrno := func(t *testing.T, w *httptest.ResponseRecorder, want string) httprest.ErrorResponse {
+		t.Helper()
+		if w.Code != httprest.StatusStorageError {
+			t.Fatalf("response answered %d, want %d: %s", w.Code, httprest.StatusStorageError, w.Body)
+		}
+		if int64(w.Body.Len()) > limit {
+			t.Fatalf("response retained %d bytes, above limit %d", w.Body.Len(), limit)
+		}
+		var response httprest.ErrorResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Errno != want {
+			t.Fatalf("response reported %q, want %q", response.Errno, want)
+		}
+		return response
+	}
+
+	t.Run("read", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := localdir.New(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "large"), bytes.Repeat([]byte("x"), int(limit+1)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		w := serve(t, newBounded(t, s), httprest.Request{Op: httprest.OpRead, Path: "large"}, nil)
+		assertErrno(t, w, "EFBIG")
+	})
+
+	t.Run("listing", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := localdir.New(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 16; i++ {
+			name := fmt.Sprintf("%02d-%s", i, strings.Repeat("n", 96))
+			if err := os.WriteFile(filepath.Join(dir, name), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		w := serve(t, newBounded(t, s), httprest.Request{Op: httprest.OpList}, nil)
+		assertErrno(t, w, "EIO")
+	})
+
+	t.Run("error detail", func(t *testing.T) {
+		err := fmt.Errorf("%s: %w", strings.Repeat("detail", 1024), syscall.ENOENT)
+		w := serve(t, newBounded(t, failing{err}), httprest.Request{Op: httprest.OpStat, Path: "missing"}, nil)
+		response := assertErrno(t, w, "ENOENT")
+		if response.Message != "the response detail exceeds the configured HTTP body limit" {
+			t.Fatalf("oversized error detail was rendered as %q", response.Message)
+		}
+	})
 }
 
 // A body that ends early is the case that matters most: writing what did arrive would
@@ -461,6 +1096,94 @@ type errorAfter struct {
 	err  error
 }
 
+// panicReader proves a declared oversized body is refused from its metadata alone.
+type panicReader struct{}
+
+func (panicReader) Read([]byte) (int, error) { panic("an oversized declared body was read") }
+
+// repeatingReader has no end, so the test fails by hanging or over-reading if the
+// streaming bound is not enforced.
+type repeatingReader struct{ read int64 }
+
+func (r *repeatingReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	r.read += int64(len(p))
+	return len(p), nil
+}
+
+type observedReader struct {
+	from  io.Reader
+	read  int
+	calls int
+}
+
+type blockingReader struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingReader) Read([]byte) (int, error) {
+	select {
+	case r.entered <- struct{}{}:
+	default:
+	}
+	<-r.release
+	return 0, io.EOF
+}
+
+func (r *observedReader) Read(p []byte) (int, error) {
+	r.calls++
+	n, err := r.from.Read(p)
+	r.read += n
+	return n, err
+}
+
+type blockingWrite struct {
+	storage.Storage
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingWrite) CheckBounded() error {
+	return s.Storage.(storage.BoundedStorage).CheckBounded()
+}
+func (s *blockingWrite) ListBounded(ctx context.Context, path string, result *storage.ListResult) error {
+	return s.Storage.(storage.BoundedStorage).ListBounded(ctx, path, result)
+}
+func (s *blockingWrite) ReadBounded(ctx context.Context, path string, maxBytes int64) ([]byte, error) {
+	return s.Storage.(storage.BoundedStorage).ReadBounded(ctx, path, maxBytes)
+}
+
+func (s *blockingWrite) Write(context.Context, string, []byte) error {
+	close(s.entered)
+	<-s.release
+	return nil
+}
+
+type multiBlockingWrite struct {
+	storage.Storage
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *multiBlockingWrite) CheckBounded() error {
+	return s.Storage.(storage.BoundedStorage).CheckBounded()
+}
+func (s *multiBlockingWrite) ListBounded(ctx context.Context, path string, result *storage.ListResult) error {
+	return s.Storage.(storage.BoundedStorage).ListBounded(ctx, path, result)
+}
+func (s *multiBlockingWrite) ReadBounded(ctx context.Context, path string, maxBytes int64) ([]byte, error) {
+	return s.Storage.(storage.BoundedStorage).ReadBounded(ctx, path, maxBytes)
+}
+
+func (s *multiBlockingWrite) Write(context.Context, string, []byte) error {
+	s.entered <- struct{}{}
+	<-s.release
+	return nil
+}
+
 func (e *errorAfter) Read(p []byte) (int, error) {
 	if len(e.head) > 0 {
 		n := copy(p, e.head)
@@ -478,11 +1201,11 @@ func TestMalformedRequestsGetTheirOwnStatus(t *testing.T) {
 		uri    string
 		want   int
 	}{
-		{"an operation that does not exist", http.MethodGet, "/v1/teleport?path=a", http.StatusNotFound},
+		{"an operation that does not exist", http.MethodGet, "/v2/teleport?path=a", http.StatusNotFound},
 		{"nothing under the prefix", http.MethodGet, "/", http.StatusNotFound},
-		{"the wrong method", http.MethodGet, "/v1/remove?path=a", http.StatusMethodNotAllowed},
-		{"a query that does not parse", http.MethodGet, "/v1/stat?path=%zz", http.StatusBadRequest},
-		{"no path operand", http.MethodGet, "/v1/stat", http.StatusBadRequest},
+		{"the wrong method", http.MethodGet, "/v2/remove?path=a", http.StatusMethodNotAllowed},
+		{"a query that does not parse", http.MethodGet, "/v2/stat?path=%zz", http.StatusBadRequest},
+		{"no path operand", http.MethodGet, "/v2/stat", http.StatusBadRequest},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

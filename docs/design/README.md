@@ -48,6 +48,8 @@ docs/design/
   server/
     README.md             server 目录的规则
     architecture.md       server 角色内部
+    local-disk-object-store.md
+                          本地持久对象存储的磁盘格式、提交见证、打开与恢复协议
   client/
     README.md             client 目录的规则
     architecture.md       client 角色内部

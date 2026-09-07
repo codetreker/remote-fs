@@ -15,7 +15,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -30,8 +29,10 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/limited"
 	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/localstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/azblob"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore/localdisk"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
@@ -40,9 +41,14 @@ import (
 // happened, which is the one answer this system must never give.
 const shutdownGrace = 5 * time.Second
 
+// statusDeadline bounds an operator query independently of request shutdown. The status
+// path reads SQLite, operation admission and filesystem capacity; none may occupy the
+// signal loop indefinitely when termination is waiting behind it.
+const statusDeadline = 2 * time.Second
+
 // noticeableWalk is how long measuring the namespace has to take before the startup line
-// says how long it took. That walk is the one thing standing between the command line and
-// the open listener, so a pause an operator notices is one they are owed the cause of;
+// says how long it took. That walk is the one thing standing between the acquired listener
+// and serving it, so a pause an operator notices is one they are owed the cause of;
 // below this there is nothing to explain.
 const noticeableWalk = 500 * time.Millisecond
 
@@ -62,83 +68,60 @@ func main() {
 var errUsage = errors.New("the command line was rejected")
 
 func run(args []string, errOut io.Writer) error {
-	flags := flag.NewFlagSet("remote-fs-server", flag.ContinueOnError)
-	flags.SetOutput(errOut)
-	listen := flags.String("listen", "", "address to accept connections on, as host:port")
-	dir := flags.String("dir", "", "existing directory whose contents are served as the namespace")
-	container := flags.String("blob-container", "", "name of the Azure Blob container holding the namespace's contents.\n"+
-		"Credentials come from AZURE_STORAGE_CONNECTION_STRING, never from a flag:\n"+
-		"a flag is visible to everyone who can list processes.")
-	prefix := flags.String("blob-prefix", "", "key prefix within the container, so one container may hold several\n"+
-		"namespaces")
-	database := flags.String("metastore", "", "path to the SQLite database holding the namespace's tree")
-	workspace := flags.String("workspace", "", "name of the namespace within the metastore")
-	var quota sizeFlag
-	flags.Var(&quota, "quota", "allowance the namespace is held under, as a `SIZE`: a whole number of bytes,\n"+
-		"optionally with one of the suffixes\n"+
-		suffixes+".\n"+
-		"Without it no write is refused, and the figures reported are the host\n"+
-		"filesystem's own for a directory, and nothing at all for a blob container,\n"+
-		"which has no capacity to report.")
-	flags.Usage = func() {
-		fmt.Fprint(errOut, "usage: remote-fs-server -listen ADDR -dir DIR [-quota SIZE]\n"+
-			"       remote-fs-server -listen ADDR -blob-container NAME -metastore PATH -workspace NAME [-blob-prefix PREFIX] [-quota SIZE]\n\n"+
-			"Serves one namespace over HTTP. Mount it with remote-fs.\n\n"+
-			"The namespace is either a local directory, or a namespace whose file contents\n"+
-			"live in an Azure Blob container and whose tree lives in a SQLite database. The\n"+
-			"second form reads its credentials from AZURE_STORAGE_CONNECTION_STRING.\n\n"+
-			"Given -quota with -dir, SIGHUP measures DIR again and replaces the count of what\n"+
-			"it holds, which is the way back from a count that drifted because DIR was\n"+
-			"modified behind this server's back. A namespace in a blob container keeps its\n"+
-			"count exactly and has nothing to repair.\n\n"+
-			"There is no authentication and no authorization: anything that can connect can\n"+
-			"read and write everything in the namespace. Serve only on a trusted network.\n\n")
-		flags.PrintDefaults()
+	config, help, err := parseConfig(args, errOut)
+	if err != nil || help {
+		return err
 	}
-	if err := flags.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return nil
+
+	// Acquire the public address before opening storage. A local store creates durable
+	// state while it opens, and a server that cannot own its address must leave a new store
+	// untouched.
+	rawListener, err := net.Listen("tcp", config.listen)
+	if err != nil {
+		return fmt.Errorf("listen on %q: %w", config.listen, err)
+	}
+	listener := limitAcceptedConnections(rawListener, config.standalone.maxAcceptedConnections)
+	return withListener(listener, func() error {
+		ns, err := open(config)
+		if err != nil {
+			return err
 		}
-		return errUsage
-	}
-	if extra := flags.Args(); len(extra) > 0 {
-		return fmt.Errorf("%q is not an argument this command takes; everything is a flag", extra[0])
-	}
-	if *listen == "" {
-		return errors.New("-listen is required: the address to accept connections on")
-	}
+		return withOpened(ns, func() error {
+			// The log is what a mount replicates the namespace's metadata from. A namespace with no
+			// metastore behind it has none, and is served with a nil one: its replication endpoints
+			// then answer ENOSYS, and a mount of it goes on making a request for every operation.
+			handler, err := httprest.NewHandlerWithOptions(ns.namespace, ns.log, config.http)
+			if err != nil {
+				return err
+			}
 
-	ns, err := open(*dir, blobSource{
-		container: *container,
-		prefix:    *prefix,
-		database:  *database,
-		workspace: *workspace,
-	}, quota.bytes)
-	if err != nil {
-		return err
-	}
-	defer ns.close()
+			return serve(newServerWithOptions(handler, config.standalone), listener, ns, errOut)
+		})
+	})
+}
 
-	// The log is what a mount replicates the namespace's metadata from. A namespace with no
-	// metastore behind it has none, and is served with a nil one: its replication endpoints
-	// then answer ENOSYS, and a mount of it goes on making a request for every operation.
-	handler, err := httprest.NewHandler(ns.namespace, ns.log)
-	if err != nil {
-		return err
-	}
+// withListener retains the acquired address through storage opening and serving. Serve
+// normally closes it; failures before Serve reaches it are closed here, and an unexpected
+// cleanup failure remains part of the command's result.
+func withListener(listener net.Listener, action func() error) (returned error) {
+	defer func() {
+		closeErr := listener.Close()
+		if onlyErrorLeaves(closeErr, net.ErrClosed) {
+			closeErr = nil
+		}
+		if closeErr != nil {
+			closeErr = fmt.Errorf("closing the listener: %w", closeErr)
+		}
+		returned = errors.Join(returned, closeErr)
+	}()
+	return action()
+}
 
-	// The listener is opened here rather than by http.Server.ListenAndServe so that an
-	// address already in use is reported before anything claims to be serving, and so
-	// that a port of 0 can be resolved and printed.
-	listener, err := net.Listen("tcp", *listen)
-	if err != nil {
-		return err
-	}
-	// The address stays last on the line: it is what a person copies out of it, and what
-	// anything reading this output parses it for.
-	fmt.Fprintf(errOut, "remote-fs-server: serving %s%s at http://%s\n", ns.what, ns.allowance, listener.Addr())
-
-	return serve(newServer(handler), listener, ns, errOut)
+// withOpened keeps every owned storage resource, including a local store's lifetime lock,
+// until the HTTP server has drained. Closing failures are part of the command's result.
+func withOpened(ns opened, action func() error) (returned error) {
+	defer func() { returned = errors.Join(returned, ns.close()) }()
+	return action()
 }
 
 // newServer builds the HTTP server this command serves with.
@@ -149,10 +132,21 @@ func run(args []string, errOut io.Writer) error {
 // out the entire grace period and then reports that it expired — an ordinary stop turned
 // into a stall and a failure — while every attached mount sees its stream break rather than
 // being told the server was going away.
-func newServer(handler *httprest.Handler) *http.Server {
-	server := &http.Server{Handler: handler}
-	server.RegisterOnShutdown(handler.Stop)
-	return server
+func newServer(handler *httprest.Handler) *drainingServer {
+	return newServerWithOptions(handler, defaultStandaloneHTTPOptions())
+}
+
+func newServerWithOptions(handler *httprest.Handler, options standaloneHTTPOptions) *drainingServer {
+	draining := newDrainingHandler(handler)
+	connections := newConnectionTracker()
+	server := &http.Server{
+		Handler:           draining,
+		ReadHeaderTimeout: options.readHeaderTimeout,
+		IdleTimeout:       options.idleTimeout,
+		ConnState:         connections.update,
+	}
+	server.RegisterOnShutdown(draining.Stop)
+	return &drainingServer{Server: server, drain: draining, connections: connections}
 }
 
 // blobSource names the parts of a namespace whose contents are in a blob container. The
@@ -195,26 +189,31 @@ type opened struct {
 	exact bool
 
 	// what is being served, for the line that says so.
-	what      string
-	allowance string
-	close     func() error
+	what        string
+	allowance   string
+	statusName  string
+	status      func(context.Context) (string, error)
+	close       func() error
+	measurement limited.MeasurementLimits
 }
 
-// open builds the namespace the command line asked for.
-//
-// The two forms are exclusive rather than layered. A directory and a blob container are two
-// answers to "where does this namespace live", and a command line naming both has not said
-// which one it means; guessing would serve one of them while the operator watched the other.
-func open(dir string, blob blobSource, quota int64) (opened, error) {
+// open builds the namespace the validated command line selected.
+func open(config commandConfig) (opened, error) {
 	switch {
-	case dir != "" && blob.given():
-		return opened{}, errors.New("-dir and -blob-container name two different namespaces; give one of them")
-	case dir == "" && !blob.given():
-		return opened{}, errors.New("a namespace is required: -dir for a local directory, or -blob-container with -metastore and -workspace")
-	case dir != "":
-		return openDirectory(dir, quota)
+	case config.directory != "":
+		return openDirectory(config.directory, config.quota, config.measurement)
+	case config.local.given():
+		return openLocal(
+			config.local, config.quota, config.objectLimits,
+			config.maxReaderConnections, config.maxSnapshotReaderConnections,
+			config.maxIntegrityRecords, config.maxIntegrityBytes, config.maintenance,
+		)
 	default:
-		return openBlobs(blob, quota)
+		return openBlobs(
+			config.blob, config.quota, config.objectLimits,
+			config.maxReaderConnections, config.maxSnapshotReaderConnections,
+			config.maxIntegrityRecords, config.maxIntegrityBytes, config.maintenance,
+		)
 	}
 }
 
@@ -222,7 +221,7 @@ func open(dir string, blob blobSource, quota int64) (opened, error) {
 //
 // Measuring what the namespace already holds is the only step here that can take real time,
 // so the description says how long it took whenever that is worth knowing.
-func openDirectory(dir string, quota int64) (opened, error) {
+func openDirectory(dir string, quota int64, measurement limited.MeasurementLimits) (opened, error) {
 	backing, err := localdir.New(dir)
 	if err != nil {
 		return opened{}, err
@@ -233,7 +232,11 @@ func openDirectory(dir string, quota int64) (opened, error) {
 	}
 
 	started := time.Now()
-	held, err := limited.New(context.Background(), backing, quota)
+	effectiveMeasurement, err := measurement.Effective()
+	if err != nil {
+		return opened{}, err
+	}
+	held, err := limited.NewWithLimits(context.Background(), backing, quota, effectiveMeasurement)
 	if err != nil {
 		return opened{}, err
 	}
@@ -252,8 +255,68 @@ func openDirectory(dir string, quota int64) (opened, error) {
 		measured = fmt.Sprintf(" (measured in %v)", rounded(walk))
 	}
 	result.namespace, result.held = held, held
+	result.measurement = effectiveMeasurement
 	result.allowance = fmt.Sprintf(" under an allowance of %d bytes, %d of them taken%s,", space.Total, space.Used, measured)
 	return result, nil
+}
+
+func openLocal(
+	source localSource,
+	quota int64,
+	objectLimits sqlite.ObjectLimits,
+	maxReaderConnections int,
+	maxSnapshotReaderConnections int,
+	maxIntegrityRecords int64,
+	maxIntegrityBytes int64,
+	maintenance objectstore.Options,
+) (opened, error) {
+	maxWaitingOperations := source.objects.MaxWaitingOperations
+	if maxWaitingOperations == 0 {
+		maxWaitingOperations = localdisk.DefaultMaxWaitingOperations
+	}
+	store, err := localstore.Open(context.Background(), localstore.Config{
+		Root:                         source.root,
+		Workspace:                    source.workspace,
+		Quota:                        quota,
+		Window:                       sqlite.DefaultWindow(),
+		LocalDisk:                    source.objects,
+		ObjectLimits:                 objectLimits,
+		MaxReaderConnections:         maxReaderConnections,
+		MaxSnapshotReaderConnections: maxSnapshotReaderConnections,
+		MaxIntegrityRecords:          maxIntegrityRecords,
+		MaxIntegrityBytes:            maxIntegrityBytes,
+		Maintenance:                  maintenance,
+	})
+	if err != nil {
+		return opened{}, err
+	}
+	status, err := store.Status(context.Background())
+	if err != nil {
+		return opened{}, errors.Join(err, closeAfterOpenFailure("local store", store.Close()))
+	}
+	return opened{
+		namespace:  store,
+		log:        store.Log(),
+		exact:      true,
+		what:       fmt.Sprintf("%s in local store %s", source.workspace, source.root),
+		allowance:  fmt.Sprintf(" under an allowance of %d bytes, %d of them taken,", status.Space.Total, status.Space.Used),
+		statusName: "local-store",
+		status: func(ctx context.Context) (string, error) {
+			current, err := store.Status(ctx)
+			if err != nil {
+				return "", err
+			}
+			return formatLocalStatus(current, maintenance, maxWaitingOperations), nil
+		},
+		close: store.Close,
+	}, nil
+}
+
+func closeAfterOpenFailure(what string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("closing the %s after startup failed: %w", what, err)
 }
 
 // openBlobs serves a namespace whose contents are in a blob container and whose tree is in
@@ -263,7 +326,33 @@ func openDirectory(dir string, quota int64) (opened, error) {
 // same change that moves the bytes, so there is no walk to seed it and no drift to repair —
 // and wrapping it would put an extra round trip in front of every write to ask a question
 // the metastore has already answered.
-func openBlobs(blob blobSource, quota int64) (opened, error) {
+func openBlobs(
+	blob blobSource,
+	quota int64,
+	objectLimits sqlite.ObjectLimits,
+	maxReaderConnections int,
+	maxSnapshotReaderConnections int,
+	maxIntegrityRecords int64,
+	maxIntegrityBytes int64,
+	maintenance objectstore.Options,
+) (opened, error) {
+	return openBlobsContext(
+		context.Background(), blob, quota, objectLimits, maxReaderConnections,
+		maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance,
+	)
+}
+
+func openBlobsContext(
+	ctx context.Context,
+	blob blobSource,
+	quota int64,
+	objectLimits sqlite.ObjectLimits,
+	maxReaderConnections int,
+	maxSnapshotReaderConnections int,
+	maxIntegrityRecords int64,
+	maxIntegrityBytes int64,
+	maintenance objectstore.Options,
+) (opened, error) {
 	switch {
 	case blob.database == "":
 		return opened{}, errors.New("-metastore is required with -blob-container: the database holding the namespace's tree")
@@ -275,21 +364,66 @@ func openBlobs(blob blobSource, quota int64) (opened, error) {
 		return opened{}, fmt.Errorf("%s is not set, and it is where the credentials for %s come from", connectionEnv, blob.container)
 	}
 
+	options, err := (sqlite.Options{
+		Window:                       sqlite.DefaultWindow(),
+		ObjectLimits:                 objectLimits,
+		MaxReaderConnections:         maxReaderConnections,
+		MaxSnapshotReaderConnections: maxSnapshotReaderConnections,
+		MaxIntegrityRecords:          maxIntegrityRecords,
+		MaxIntegrityBytes:            maxIntegrityBytes,
+	}).Effective()
+	if err != nil {
+		return opened{}, err
+	}
 	objects, err := azblob.NewFromConnectionString(connection, blob.container, blob.prefix)
 	if err != nil {
 		return opened{}, err
 	}
-	meta, err := sqlite.Open(context.Background(), blob.database, blob.workspace, quota, sqlite.DefaultWindow())
+	meta, err := sqlite.OpenWithOptions(
+		ctx, blob.database, blob.workspace, quota, options,
+	)
 	if err != nil {
-		return opened{}, err
+		return opened{}, errors.Join(err, closeAfterOpenFailure("blob object store", objects.Close()))
 	}
-	namespace := objectstore.New(objects, meta)
+	namespace, err := objectstore.NewWithOptions(objects, meta, maintenance)
+	if err != nil {
+		return opened{}, errors.Join(
+			err,
+			closeAfterOpenFailure("metastore", meta.Close()),
+			closeAfterOpenFailure("blob object store", objects.Close()),
+		)
+	}
 
 	what := fmt.Sprintf("%s in container %s", blob.workspace, blob.container)
 	if blob.prefix != "" {
 		what = fmt.Sprintf("%s under %s", what, blob.prefix)
 	}
-	result := opened{namespace: namespace, log: meta, what: what, close: namespace.Close}
+	result := opened{
+		namespace:  namespace,
+		log:        meta,
+		what:       what,
+		statusName: "blob namespace",
+		status: func(ctx context.Context) (string, error) {
+			status, statusErr := meta.ObjectStatus(ctx)
+			_, availabilityErr := objects.Available(ctx)
+			if onlyErrorLeaves(availabilityErr, syscall.ENOSYS) {
+				availabilityErr = nil
+			} else if availabilityErr != nil {
+				availabilityErr = fmt.Errorf("probing the blob object store: %w", availabilityErr)
+			}
+			if err := errors.Join(statusErr, availabilityErr); err != nil {
+				return "", err
+			}
+			return formatObjectStoreStatus(
+				blob.workspace, status, options.ObjectLimits,
+				options.MaxReaderConnections, options.MaxSnapshotReaderConnections,
+				options.MaxIntegrityRecords, options.MaxIntegrityBytes,
+				namespace.MaintenanceStatus(),
+				maintenance,
+			), nil
+		},
+		close: namespace.Close,
+	}
 	if quota == 0 {
 		return result, nil
 	}
@@ -297,16 +431,49 @@ func openBlobs(blob blobSource, quota int64) (opened, error) {
 	// repair here. Without one there is no count at all and nothing to say that about.
 	result.exact = true
 
-	space, err := namespace.Space(context.Background())
+	space, err := namespace.Space(ctx)
 	if err != nil {
-		return opened{}, err
+		return opened{}, errors.Join(err, closeAfterOpenFailure("blob namespace", namespace.Close()))
 	}
 	result.allowance = fmt.Sprintf(" under an allowance of %d bytes, %d of them taken,", space.Total, space.Used)
 	return result, nil
 }
 
+// onlyErrorLeaves recognizes expected errors without hiding an unexpected leaf joined to
+// one of them. errors.Is alone cannot make that distinction.
+func onlyErrorLeaves(err error, targets ...error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !onlyErrorLeaves(child, targets...) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return onlyErrorLeaves(wrapped.Unwrap(), targets...)
+	}
+	for _, target := range targets {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
+}
+
 // serve runs until a request loop fails or a signal arrives.
-func serve(httpServer *http.Server, listener net.Listener, ns opened, errOut io.Writer) error {
+func serve(httpServer *drainingServer, listener net.Listener, ns opened, errOut io.Writer) error {
+	return serveWithGrace(httpServer, listener, ns, errOut, shutdownGrace)
+}
+
+func serveWithGrace(httpServer *drainingServer, listener net.Listener, ns opened, errOut io.Writer, grace time.Duration) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -316,29 +483,87 @@ func serve(httpServer *http.Server, listener net.Listener, ns opened, errOut io.
 	signal.Notify(hangups, syscall.SIGHUP)
 	defer signal.Stop(hangups)
 
+	// The signal handlers are part of being ready: after this line every lifecycle signal
+	// has a command-owned outcome. The address stays last because it is copied by people
+	// and parsed by launchers.
+	fmt.Fprintf(errOut, "remote-fs-server: serving %s%s at http://%s\n", ns.what, ns.allowance, listener.Addr())
+
 	stopped := make(chan error, 1)
-	go func() { stopped <- httpServer.Serve(listener) }()
+	started := make(chan struct{})
+	go func() {
+		stopped <- httpServer.Serve(&startedListener{Listener: listener, started: started})
+	}()
+	statusResults := make(chan statusReport, 1)
+	recountResults := make(chan string, 1)
+	var hangupCancel context.CancelFunc
+	var hangupDone chan struct{}
+	cancelHangup := func() {
+		if hangupCancel == nil {
+			return
+		}
+		hangupCancel()
+	}
+	finishHangup := func() {
+		if hangupCancel == nil {
+			return
+		}
+		cancelHangup()
+		<-hangupDone
+		hangupCancel = nil
+		hangupDone = nil
+	}
+	defer finishHangup()
 
 	for {
 		select {
+		case <-started:
+			started = nil
 		case err := <-stopped:
-			return err
+			stop()
+			httpServer.drain.Stop()
+			cancelHangup()
+			connectionErr := httpServer.connections.closeNew()
+			serverErr := closeAndDrainServer(httpServer, err)
+			finishHangup()
+			return errors.Join(serverErr, connectionErr)
 		case <-hangups:
-			// The walk runs here rather than on a goroutine of its own: it stalls every
-			// writer for its duration, and two of them at once would stall them for twice
-			// as long to arrive at one answer. Connections keep being accepted meanwhile,
-			// and each request waits exactly where it would have waited.
-			recount(context.Background(), ns, errOut)
+			if hangupCancel != nil {
+				continue
+			}
+			if ns.status == nil {
+				hangupCancel, hangupDone = startRecount(ns, recountResults)
+			} else {
+				hangupCancel, hangupDone = startStatus(ns, statusDeadline, statusResults)
+			}
+		case report := <-statusResults:
+			finishHangup()
+			writeStatus(report, ns, errOut)
+		case output := <-recountResults:
+			finishHangup()
+			fmt.Fprint(errOut, output)
 		case <-ctx.Done():
 			// Disarmed before shutting down: a second signal from an operator who has decided
 			// not to wait should kill the process the way it normally would.
 			stop()
+			httpServer.drain.Stop()
+			cancelHangup()
+			connectionErr := httpServer.connections.closeNew()
 			fmt.Fprintln(errOut, "remote-fs-server: stopping")
-			graceful, cancel := context.WithTimeout(context.Background(), shutdownGrace)
-			defer cancel()
-			return httpServer.Shutdown(graceful)
+			serverErr := terminateServer(httpServer, listener, stopped, started, grace)
+			finishHangup()
+			return errors.Join(serverErr, connectionErr)
 		}
 	}
+}
+
+// handleHangup executes the requested operator action synchronously. The server loop gives
+// recount and status their owned goroutines so neither occupies signal handling.
+func handleHangup(ctx context.Context, ns opened, errOut io.Writer) {
+	if ns.status == nil {
+		recount(ctx, ns, errOut)
+		return
+	}
+	writeStatus(readStatus(ctx, ns), ns, errOut)
 }
 
 // recount measures the served namespace again and replaces the count of what it holds.
@@ -382,8 +607,10 @@ func recount(ctx context.Context, ns opened, errOut io.Writer) {
 		fmt.Fprintf(errOut, "remote-fs-server: the namespace was recounted, and what it now holds cannot be read: %v\n", err)
 		return
 	}
-	fmt.Fprintf(errOut, "remote-fs-server: recounted the namespace in %v: %d bytes taken, where the count said %d\n",
-		rounded(walk), after.Used, before.Used)
+	fmt.Fprintf(errOut, "remote-fs-server: recounted the namespace in %v: %d bytes taken, where the count said %d; "+
+		"directory listings were limited to %d bytes and the traversal frontier to %d bytes\n",
+		rounded(walk), after.Used, before.Used,
+		ns.measurement.MaxDirectoryBytes, ns.measurement.MaxFrontierBytes)
 }
 
 // rounded trims a measured interval to what is worth reading. Milliseconds are the useful

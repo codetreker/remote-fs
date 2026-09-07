@@ -31,6 +31,7 @@ type Storage struct {
 }
 
 var _ storage.Storage = (*Storage)(nil)
+var _ storage.BoundedStorage = (*Storage)(nil)
 
 // New opens the namespace rooted at dir, which must already be a directory.
 //
@@ -92,6 +93,9 @@ func (s *Storage) SetAttr(_ context.Context, path string, change storage.AttrCha
 	}
 	return nil
 }
+
+// CheckBounded reports that reads and listings use their caller-owned limits directly.
+func (s *Storage) CheckBounded() error { return nil }
 
 // setTimes applies the times a change names. utimensat takes both at once, so the one a
 // change leaves alone is passed as UTIME_OMIT rather than read back and written out again
@@ -172,6 +176,57 @@ func (s *Storage) List(_ context.Context, path string) ([]storage.Entry, error) 
 	return entries, nil
 }
 
+// ListBounded reads a fixed-size readdir batch at a time and gives each converted entry to
+// result before retaining another batch. ListResult performs the final bytewise sort, so
+// the host directory's iteration order does not become part of the storage contract.
+func (s *Storage) ListBounded(ctx context.Context, path string, result *storage.ListResult) (returned error) {
+	if result != nil {
+		defer func() {
+			if returned != nil {
+				result.Fail(returned)
+			}
+		}()
+	}
+	host, err := s.host(path)
+	if err != nil {
+		return err
+	}
+	if result == nil {
+		return &os.PathError{Op: "list", Path: path, Err: syscall.EINVAL}
+	}
+	dir, err := os.Open(host)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+
+	const batch = 64
+	for {
+		if err := localContextError(ctx, "list", path); err != nil {
+			return err
+		}
+		read, readErr := dir.ReadDir(batch)
+		for _, entry := range read {
+			info, err := entry.Info()
+			if err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					continue
+				}
+				return err
+			}
+			if err := result.Add(storage.Entry{Name: entry.Name(), Attr: attrOf(info)}); err != nil {
+				return err
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+}
+
 // Read opens with O_NOFOLLOW, so that the bytes it hands back are the ones held at the
 // name it was given: open(2) answers ELOOP for a symbolic link rather than opening what
 // the link points at (measured on Linux 6.8). A directory opens and then fails at the
@@ -187,6 +242,73 @@ func (s *Storage) Read(_ context.Context, path string) ([]byte, error) {
 	}
 	defer f.Close()
 	return io.ReadAll(f)
+}
+
+// ReadBounded reads at most one byte beyond maxBytes. The extra byte is used only to prove
+// EFBIG and is never returned, so an oversized host file cannot cause a complete payload
+// allocation before refusal.
+func (s *Storage) ReadBounded(ctx context.Context, path string, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return nil, &os.PathError{Op: "read", Path: path, Err: syscall.EINVAL}
+	}
+	host, err := s.host(path)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(host, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if info, err := f.Stat(); err != nil {
+		return nil, err
+	} else if info.Size() > maxBytes {
+		return nil, &os.PathError{Op: "read", Path: path, Err: syscall.EFBIG}
+	}
+	content, err := readLocalBounded(ctx, f, maxBytes)
+	if err != nil {
+		return nil, &os.PathError{Op: "read", Path: path, Err: err}
+	}
+	return content, nil
+}
+
+func readLocalBounded(ctx context.Context, from io.Reader, maxBytes int64) ([]byte, error) {
+	reader := &contextReader{ctx: ctx, from: from}
+	content, err := io.ReadAll(io.LimitReader(reader, maxBytes))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(content)) < maxBytes {
+		return content, nil
+	}
+	var excess [1]byte
+	n, err := io.ReadFull(reader, excess[:])
+	if n != 0 {
+		return nil, syscall.EFBIG
+	}
+	if errors.Is(err, io.EOF) {
+		return content, nil
+	}
+	return nil, err
+}
+
+type contextReader struct {
+	ctx  context.Context
+	from io.Reader
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	if err := localContextError(r.ctx, "read", ""); err != nil {
+		return 0, err
+	}
+	return r.from.Read(p)
+}
+
+func localContextError(ctx context.Context, op, path string) error {
+	if err := ctx.Err(); err != nil {
+		return &os.PathError{Op: op, Path: path, Err: syscall.EINTR}
+	}
+	return nil
 }
 
 // Write stages the content in a temporary file alongside the target and renames it into

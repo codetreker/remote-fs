@@ -34,10 +34,10 @@ import "context"
 // R-ERR-2 from a rule into a suggestion, and the place that mistake is easiest to make is
 // the place a REST client's 404 is converted into an error.
 type Objects interface {
-	// Put stores content under key. The key was reserved by a metastore and has never been
-	// used before, so an implementation may assume it is writing rather than overwriting;
-	// where the store offers a way to say so, it should, since a key collision would mean
-	// something has gone wrong upstream and silence is the wrong response to that.
+	// Put stores content under key with create-only semantics. A nil error positively proves
+	// that this invocation created the immutable object under key; it must never mean that an
+	// existing object was accepted or overwritten. Any error leaves ownership unresolved to
+	// the caller, including EEXIST and a response lost after the request may have landed.
 	//
 	// The returned digest is whatever the store reports for the bytes it stored, or nil if
 	// it reports nothing. It is a fact about the stored object, not a checksum computed here
@@ -52,4 +52,26 @@ type Objects interface {
 	// deletion is driven by a sweeper that may have been interrupted after the delete and
 	// before the record of it, so running it again must converge rather than fail.
 	Delete(ctx context.Context, key string) error
+
+	// Available reports how many more bytes the storage beneath this container currently
+	// offers, independently of any workspace allowance. A store that has no finite physical
+	// capacity it can measure answers syscall.ENOSYS; that is a standing property of the
+	// implementation, not a transient measurement failure. Every other error is a failure to
+	// determine whether bytes fit and must be preserved as such by callers.
+	Available(ctx context.Context) (int64, error)
+
+	// Close releases resources owned by the object store. It must wait for operations it has
+	// admitted before releasing storage ownership, so a composite can close its metastore
+	// while the backing store is still exclusively held.
+	Close() error
+}
+
+// BoundedObjects retrieves an object under a caller-owned payload limit. Implementations
+// maxBytes must be positive. Implementations must determine that the object exceeds it
+// before allocating the complete payload; a larger object is syscall.EFBIG. The separate capability keeps existing Objects users
+// source-compatible while allowing an embedded server to refuse an object backend that
+// cannot uphold storage.BoundedStorage.
+type BoundedObjects interface {
+	Objects
+	GetBounded(ctx context.Context, key string, maxBytes int64) ([]byte, error)
 }
