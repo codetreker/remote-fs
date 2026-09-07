@@ -128,6 +128,11 @@ jobs:
           echo 'mount_max = 10000' | sudo tee -a /etc/fuse.conf
           ls /sys/fs/fuse/connections >"$RUNNER_TEMP/fuse-connections-before" 2>/dev/null || true
 
+      # The binary lock and restart tests exercise Azure Blob. Coverage later reuses
+      # this ready emulator when it runs the whole module.
+      - name: Start the Azure Blob emulator
+        run: docker compose -f deployments/ci/docker-compose.yml up -d --wait --wait-timeout 120
+
       - name: Differential and end-to-end tests
         run: |
           set -euo pipefail
@@ -140,12 +145,6 @@ jobs:
       # the commit that fixed it rather than to a release or to @latest.
       - name: Install the coverage gate
         run: go install github.com/codetreker/go-cov/cmd/go-cov@v0.1.4-0.20260617124522-d6caf2759e33
-
-      # The gate runs `go test` over the whole module rather than over this job's packages,
-      # so it reaches azblob and needs the same emulator the other job starts, even though
-      # nothing above this line touches one.
-      - name: Start the Azure Blob emulator
-        run: docker compose -f deployments/ci/docker-compose.yml up -d --wait --wait-timeout 120
 
       - name: Coverage gate
         run: |

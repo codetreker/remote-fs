@@ -178,7 +178,7 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 ### Azure Blob
 
-`packages/storage/objectstore/azblob` 对一个真的 Blob 端点跑，那个端点是 Azurite。它定义在 [`deployments/azurite.yml`](../deployments/azurite.yml)：本地 `make azurite` 起、`make azurite-down` 停；CI 的两个 job 各起同一份，第二个也要 —— 覆盖率闸门自己会把 `go test` 跑遍整个 module，而不是只跑那个 job 的那几个包。
+`packages/storage/objectstore/azblob` 对一个真的 Blob 端点跑，那个端点是 Azurite。它定义在 [`deployments/azurite.yml`](../deployments/azurite.yml)：本地 `make azurite` 起、`make azurite-down` 停；CI 的两个 job 各自在依赖 Blob 的测试之前启动同一模拟器，并等待它能够回答请求。挂载 job 的真实 Azure 二进制锁与重启用例依赖该端点，因此启动步骤位于对拍和端到端测试之前；后面的全 module 覆盖率闸门继续使用这份模拟器。
 
 **够不到模拟器时这一层失败，不跳过。** 依赖缺席是一个必须报出来的事实，不是一个可以让用例自己消失的条件。
 
