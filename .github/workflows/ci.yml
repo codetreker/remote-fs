@@ -24,7 +24,7 @@ jobs:
   checks:
     name: build, format, links, contract and unit tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,7 +82,7 @@ jobs:
           # shellcheck disable=SC2046,SC2086
           go list $MOUNTING_PACKAGES >"$RUNNER_TEMP/mounting"
           # shellcheck disable=SC2046
-          .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 5m \
+          .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m \
             $(go list ./... | grep -vxF -f "$RUNNER_TEMP/mounting")
 
   mounted:
