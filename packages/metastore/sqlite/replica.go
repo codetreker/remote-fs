@@ -5,9 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"sync"
 	"syscall"
-	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -38,11 +36,13 @@ const replicaNamespace = "replica"
 type Replica struct {
 	store *Store
 
-	// mu keeps a reader out of a tree that is being rebuilt. A reader that arrived between
-	// the wipe and the rows would be told the namespace is empty, which is the fabricated
-	// answer R-ERR-2 forbids above all others, so a rebuild holds this for its whole length —
-	// the network's length — and an applied change holds it for one transaction.
-	mu sync.RWMutex
+	// admission holds the tree and its position together across each applied change
+	// and the complete lifetime of a reseed transaction.
+	admission replicaGate
+
+	// readSlots limits phase grants to the work the SQLite reader pool can execute.
+	// Callers waiting for a slot must not extend the current reader phase.
+	readSlots chan struct{}
 
 	// at is how far this copy has been brought. It is held here rather than in the database
 	// because nothing ever reads it back: the copy does not outlive the mount that made it,
@@ -61,24 +61,50 @@ type Replica struct {
 // changes of its own, so its log stays empty, and the room the namespace has is the server's
 // answer rather than anything this database knows.
 func OpenReplica(ctx context.Context, path string) (*Replica, error) {
-	store, err := Open(ctx, path, replicaNamespace, 0, DefaultWindow())
+	options := DefaultOptions()
+	store, err := OpenWithOptions(ctx, path, replicaNamespace, 0, options)
 	if err != nil {
 		return nil, err
 	}
-	return &Replica{store: store}, nil
+	return &Replica{
+		store: store, admission: newReplicaGate(),
+		readSlots: make(chan struct{}, options.MaxReaderConnections),
+	}, nil
+}
+
+func (r *Replica) acquireRead(ctx context.Context) error {
+	select {
+	case r.readSlots <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := r.admission.acquireRead(ctx); err != nil {
+		<-r.readSlots
+		return err
+	}
+	return nil
+}
+
+func (r *Replica) releaseRead() {
+	r.admission.releaseRead()
+	<-r.readSlots
 }
 
 // Stat reports the node at path, as the namespace held it at Position.
 func (r *Replica) Stat(ctx context.Context, path string) (metastore.Node, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	if err := r.acquireRead(ctx); err != nil {
+		return metastore.Node{}, pathError("stat", path, failure(err))
+	}
+	defer r.releaseRead()
 	return r.store.Stat(ctx, path)
 }
 
 // List returns the children of the directory at path, as the namespace held them at Position.
 func (r *Replica) List(ctx context.Context, path string) ([]metastore.Child, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	if err := r.acquireRead(ctx); err != nil {
+		return nil, pathError("list", path, failure(err))
+	}
+	defer r.releaseRead()
 	return r.store.List(ctx, path)
 }
 
@@ -93,16 +119,18 @@ func (r *Replica) ListBounded(ctx context.Context, path string, result *storage.
 			}
 		}()
 	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	if err := r.acquireRead(ctx); err != nil {
+		return pathError("list", path, failure(err))
+	}
+	defer r.releaseRead()
 	return r.store.ListBounded(ctx, path, result)
 }
 
 // Position is how far this copy has been brought: everything the source recorded up to and
 // including it is here, and nothing later is.
 func (r *Replica) Position() metastore.Position {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	_ = r.admission.acquireRead(context.Background())
+	defer r.admission.releaseRead()
 	return r.at
 }
 
@@ -129,10 +157,10 @@ func (r *Replica) Close() error { return r.store.Close() }
 // timeout that repairs one. The consistent picture is what makes the strictness safe — every
 // change after it acts on something that picture already contained.
 func (r *Replica) Apply(ctx context.Context, change metastore.Change) (bool, error) {
-	if err := r.lockExclusive(ctx); err != nil {
+	if err := r.admission.acquireWrite(ctx); err != nil {
 		return false, err
 	}
-	defer r.mu.Unlock()
+	defer r.admission.releaseWrite()
 	if err := r.store.coordinator.commit.acquire(ctx); err != nil {
 		return false, err
 	}
@@ -317,29 +345,29 @@ func exactlyOne(result sql.Result, subject string) error {
 // one is its own decision — it is a copy of a log that said to start over, so the answer is
 // to try again rather than to serve it.
 func (r *Replica) Reseed(ctx context.Context) (*Seeding, error) {
-	if err := r.lockExclusive(ctx); err != nil {
+	if err := r.admission.acquireWrite(ctx); err != nil {
 		return nil, err
 	}
 	if err := r.store.coordinator.commit.acquire(ctx); err != nil {
-		r.mu.Unlock()
+		r.admission.releaseWrite()
 		return nil, err
 	}
 	if err := r.store.coordinator.healthy(); err != nil {
 		r.store.coordinator.commit.release()
-		r.mu.Unlock()
+		r.admission.releaseWrite()
 		return nil, err
 	}
 	tx, err := r.store.write.BeginTx(ctx, nil)
 	if err != nil {
 		r.store.coordinator.commit.release()
-		r.mu.Unlock()
+		r.admission.releaseWrite()
 		return nil, fmt.Errorf("beginning to fill the copy: %w", failure(err))
 	}
 	state, err := validateDurableState(ctx, tx)
 	if err != nil {
 		tx.Rollback()
 		r.store.coordinator.commit.release()
-		r.mu.Unlock()
+		r.admission.releaseWrite()
 		return nil, fmt.Errorf("validating the copy's identity allocator: %w", failure(err))
 	}
 	seeding := &Seeding{replica: r, tx: tx, nodeHighWater: state.NodeHighWater}
@@ -356,28 +384,6 @@ func (r *Replica) Reseed(ctx context.Context) (*Seeding, error) {
 		return nil, err
 	}
 	return seeding, nil
-}
-
-func (r *Replica) lockExclusive(ctx context.Context) error {
-	const retry = time.Millisecond
-	for {
-		if r.mu.TryLock() {
-			if err := ctx.Err(); err != nil {
-				r.mu.Unlock()
-				return err
-			}
-			return nil
-		}
-		timer := time.NewTimer(retry)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
 }
 
 // Seeding is a copy being filled from one picture of its source.
@@ -522,5 +528,5 @@ func (s *Seeding) Close() error {
 func (s *Seeding) settle() {
 	s.done = true
 	s.replica.store.coordinator.commit.release()
-	s.replica.mu.Unlock()
+	s.replica.admission.releaseWrite()
 }

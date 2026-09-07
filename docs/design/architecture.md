@@ -143,7 +143,7 @@ client 侧的 remote storage 实现 storage 接口，凡是不满足上述任何
 
 副本只有树 —— 名字、类型、属性、大小。**文件的内容没有副本**，读字节永远走服务端。
 
-副本的可信度只取决于一件事：**server 的变更流是不是在被连续观察**。server 每个 workspace 记一条有序的变更日志，位置与树的改动在同一个事务里分配；client 先订阅、再取一次一致性快照，此后由流喂着。流活着，副本就是服务端在某个位置上的样子；流一断，副本立刻整份作废，每一个操作以 EIO 失败，绝不返回空目录、绝不报告文件不存在（R-ERR-1、R-ERR-2）。没有过期时间，也没有基于间隔的刷新 —— R-CON-2 不允许可见性在某个周期边界上成立。
+server 每个 workspace 记一条有序的变更日志，位置与树的改动在同一个事务里分配；client 先订阅、再取一次一致性快照，此后由流喂着。副本在观测到流断开时整份作废，到达 replicated storage 的操作以 EIO 失败，没有过期时间或基于间隔的刷新。本地副本在读写阶段之间交接，持续查询不能让已登记的更新一直等待读者空闲；快照重建过早恢复作答的缺口仍会使健康连接上的查询返回旧元数据，见 [client 设计](client/architecture.md)。
 
 于是跨机器的可见性不依赖轮询：一台机器上的提交完成之后，那条变更走事件流到达另一台机器，`stat` 就看得到（R-CON-1、R-CON-2）。对 metastore-backed namespace，成功的 mutation response 携带一次原子读取的 `(incarnation, committed position)` barrier；replicated client 等到同一代副本的位置不小于它才返回。barrier 可以因并发提交而晚于本次 mutation，但不早于它，因此写完立刻 `stat` 得到的是至少包含这次修改的大小与时间（R-CON-4）。
 
