@@ -54,7 +54,7 @@ SQLite 的纯只读取消保留 context 原因并归为 `EINTR`。只读事务�
 
 `Space` 探测通过 `ErrnoOf` 被分类为 `EINTR` 时，错误在这次缓冲区增长前返回。直接、包裹或通过 wire 返回的中断都具有同一效力，不要求能找到原 context 身份；独立故障与取消合并时仍由共享分类器保留故障。`roomGauge` 释放 `asking` 占用，保留上次有效数字与原来的 `asked` 时间；立即重试会重新探测过期或尚不存在的测量，再按实际余量拒绝越限写入。其它 advisory measurement fault 的旧值策略与 `ENOSYS` 处理保持不变。
 
-修复覆盖错误的阶段判定与跨层传播。首次副本订阅的构建取消仍需单独处理；它需要初始化与长期订阅之间的生命周期交接。[容量上限](../architecture/2026-08-21-space-limit.md)保留 advisory measurement 的准确性代价，缩短失败与目录改名的配额缺陷也仍需分别处理。
+修复覆盖错误的阶段判定与跨层传播。[首次副本订阅的构建取消](../../proposed/bug-fix/2026-09-07-cancel-initial-replica-subscription.md)仍由独立提案拥有；它需要初始化与长期订阅之间的生命周期交接。[容量上限](../architecture/2026-08-21-space-limit.md)保留 advisory measurement 的准确性代价，缩短失败与目录改名的配额缺陷也继续由各自提案拥有。
 
 ### 原请求必须得到回复
 
