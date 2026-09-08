@@ -403,8 +403,6 @@ func openConfiguredWithHooks(
 		prepareNamespace := hooks.prepare
 		if options.leaseRecoveryOwner {
 			prepareNamespace = prepareOwnedLeaseNamespace
-		} else if options.requireExistingNamespace {
-			prepareNamespace = prepareExistingLeaseNamespace
 		}
 		if options.leaseRecoveryOwner && options.requireExistingNamespace {
 			prepareNamespace = prepareExistingOwnedLeaseNamespace

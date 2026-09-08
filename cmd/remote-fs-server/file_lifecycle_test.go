@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -163,6 +164,9 @@ func TestRegistryTimeoutRetainsNativeOwnershipUntilCleanupIsKnown(t *testing.T) 
 	err = withOpened(ns, func() error { return closeFileRegistry(server, 20*time.Millisecond) })
 	if !errors.Is(err, context.DeadlineExceeded) || closed {
 		t.Fatalf("registry timeout returned closed=%t err=%v", closed, err)
+	}
+	if diagnostic := err.Error(); !strings.Contains(diagnostic, "closing HTTP file sessions") || !strings.Contains(diagnostic, context.DeadlineExceeded.Error()) {
+		t.Fatalf("registry timeout omitted its cleanup stage or cause: %q", diagnostic)
 	}
 	select {
 	case <-backing.entered:

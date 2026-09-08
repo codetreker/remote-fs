@@ -59,6 +59,9 @@ func TestScopedRetainedFilesKeepStrongProofsOnlyForMutations(t *testing.T) {
 	if got, err := file.ReadAt(t.Context(), 0, 100); err != nil || string(got.Data) != "upda" {
 		t.Fatalf("read inherited a stale strong proof: %q, %v", got.Data, err)
 	}
+	if got, err := file.Stat(t.Context()); err != nil || got.ID != attr.ID || got.Size != 4 || got.Mode.Perm() != 0o600 {
+		t.Fatalf("retained stat through a released strong scope = %+v, %v", got, err)
+	}
 	if _, err := session.StatNode(t.Context(), attr.ID); err != nil {
 		t.Fatalf("identity stat inherited a stale strong proof: %v", err)
 	}
@@ -75,6 +78,16 @@ func TestScopedRetainedFilesKeepStrongProofsOnlyForMutations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	renewed, err := session.Renew(t.Context())
+	if err != nil || renewed.Epoch != status.Epoch || renewed.Revision <= status.Revision || renewed.Remaining <= 0 {
+		t.Fatalf("renewal through a released strong scope = %+v, %v", renewed, err)
+	}
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := session.Renew(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled renewal lost its cause: %v", err)
+	}
+	status = renewed
 	request, err := storage.NewLockRequestID(status.ActionEpoch)
 	if err != nil {
 		t.Fatal(err)
@@ -83,11 +96,35 @@ func TestScopedRetainedFilesKeepStrongProofsOnlyForMutations(t *testing.T) {
 	if attempt, err := file.SetLock(t.Context(), 1, lock, request); err != nil || attempt.State != storage.LockGranted {
 		t.Fatalf("advisory acquisition inherited a stale strong proof: %+v, %v", attempt, err)
 	}
+	if conflict, err := file.GetLock(t.Context(), 2, lock); err != nil || !conflict.Found || conflict.Owner != 1 {
+		t.Fatalf("retained advisory holder query = %+v, %v", conflict, err)
+	}
+	pending, err := storage.NewLockRequestID(status.ActionEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting := lock
+	waiting.Wait = true
+	if attempt, err := file.SetLock(t.Context(), 2, waiting, pending); err != nil || attempt.State != storage.LockPending {
+		t.Fatalf("conflicting retained request = %+v, %v", attempt, err)
+	}
+	if _, err := file.CancelLock(t.Context(), 3, pending); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("cancelling another owner's request = %v, want EINVAL", err)
+	}
+	if attempt, err := file.QueryLock(t.Context(), 2, pending); err != nil || attempt.State != storage.LockPending {
+		t.Fatalf("wrong-owner cancellation changed the pending request: %+v, %v", attempt, err)
+	}
+	if attempt, err := file.CancelLock(t.Context(), 2, pending); err != nil || attempt.State != storage.LockCancelled || attempt.EverGranted {
+		t.Fatalf("retained request cancellation = %+v, %v", attempt, err)
+	}
 	if err := file.Sync(t.Context()); err != nil {
 		t.Fatalf("sync inherited a stale strong proof: %v", err)
 	}
 	if err := file.DropLocks(t.Context(), 1, storage.Flock); err != nil {
 		t.Fatal(err)
+	}
+	if attempt, err := file.QueryLock(t.Context(), 2, pending); err != nil || attempt.State != storage.LockCancelled {
+		t.Fatalf("cancelled request acquired after the holder released: %+v, %v", attempt, err)
 	}
 	anonymous := locking.WithScope(t.Context(), locking.MutationScope{})
 	if _, err := file.WriteAt(anonymous, 0, []byte("good")); err != nil {
@@ -95,6 +132,9 @@ func TestScopedRetainedFilesKeepStrongProofsOnlyForMutations(t *testing.T) {
 	}
 	if err := file.Close(t.Context()); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := file.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
+		t.Fatalf("closed retained stat = %v, want EBADF", err)
 	}
 }
 
