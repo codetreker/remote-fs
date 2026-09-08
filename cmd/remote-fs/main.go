@@ -63,7 +63,13 @@ func run(args []string, errOut io.Writer) error {
 	// to be a number: with no timeout anywhere, an operation against a server that has
 	// gone away waits forever instead of failing, and a filesystem that hangs is worse to
 	// be behind than one that reports an error.
-	timeout := flags.Duration("timeout", 30*time.Second, "how long one operation may take before it fails as an I/O error")
+	timeout := flags.Duration("timeout", 30*time.Second, "maximum time for one remote exchange or file cleanup attempt;\n"+
+		"a blocking advisory lock can wait across exchanges while its session remains valid")
+	maxFileSize := clientPositiveSizeFlag{bytes: fuse.DefaultMaxFileSize}
+	flags.Var(&maxFileSize, "max-file-size", "largest file this mount accepts for writes and truncation, as SIZE")
+	fileSession := storage.DefaultFileSessionOptions()
+	fileLease := flags.Duration("file-session-lease", fileSession.Lease, "renewable lifetime requested for this mount's open files and advisory locks")
+	fileHistory := flags.Duration("file-session-history", fileSession.History, "action history interval requested for file and advisory-lock reconciliation")
 	replicaDir := flags.String("replica-dir", "", "directory to keep the local copy of the namespace's metadata under.\n"+
 		"A directory of its own is made inside it, readable only by this user, and\n"+
 		"removed when the mountpoint is detached. The default is the system\n"+
@@ -86,11 +92,16 @@ func run(args []string, errOut io.Writer) error {
 			"Presents the namespace served at URL as an ordinary directory tree at DIR.\n"+
 			"Runs until interrupted, then detaches DIR.\n\n"+
 			"A copy of the namespace's tree is kept locally and fed by a stream of the\n"+
-			"changes the server records, so listing a directory and asking about a name cost\n"+
-			"no request. The copy is answered from only while that stream is being read: if\n"+
+			"changes the server records. Named lookups and directory lists use that copy;\n"+
+			"inode attributes and open-file operations are confirmed by the server.\n"+
+			"The copy is answered from only while that stream is being read: if\n"+
 			"it breaks, every operation fails until it is back, and nothing stale is served.\n"+
 			"Mounting waits for the copy to be built. A namespace that keeps no change log is\n"+
-			"mounted without one, and every operation on it is a request to the server.\n\n")
+			"mounted without one, and every operation on it is a request to the server.\n\n"+
+			"Open file descriptors retain their file object through rename and unlink.\n"+
+			"Writes and truncation are confirmed by the server before returning success.\n"+
+			"File sessions renew while mounted; explicit flock and POSIX record locks are\n"+
+			"advisory and do not restrict applications that do not participate.\n\n")
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
@@ -110,6 +121,10 @@ func run(args []string, errOut io.Writer) error {
 	}
 	if *timeout <= 0 {
 		return fmt.Errorf("-timeout must be positive, not %v", *timeout)
+	}
+	fileSession.Lease, fileSession.History = *fileLease, *fileHistory
+	if err := fileSession.Check(); err != nil {
+		return fmt.Errorf("invalid file session limits: %w", err)
 	}
 	confirmationOptions := replicated.Options{
 		ConfirmationGrace:       *confirmationGrace,
@@ -144,19 +159,34 @@ func run(args []string, errOut io.Writer) error {
 	if err != nil {
 		return err
 	}
-	defer release()
-
 	m, err := fuse.New(*mountpoint, served, fuse.Options{
 		Logger:       log.New(errOut, "remote-fs: ", log.LstdFlags),
 		Debug:        *debug,
 		FlushTimeout: *timeout,
+		MaxFileSize:  maxFileSize.bytes,
+		FileSession:  &fileSession,
 	})
 	if err != nil {
-		return err
+		if m != nil {
+			cleanupErr := unmountPatiently(m, *mountpoint, errOut)
+			select {
+			case <-m.Done():
+				return errors.Join(err, cleanupErr, release())
+			default:
+				return errors.Join(err, cleanupErr)
+			}
+		}
+		return errors.Join(err, release())
 	}
 	fmt.Fprintf(errOut, "remote-fs: %s mounted at %s\n", *serverURL, *mountpoint)
 
-	return wait(ctx, stop, m, *mountpoint, errOut)
+	err = wait(ctx, stop, m, *mountpoint, errOut)
+	select {
+	case <-m.Done():
+		return errors.Join(err, release())
+	default:
+		return err
+	}
 }
 
 // callerClient is the HTTP client every request to the server is made with.
@@ -191,14 +221,10 @@ func dialNamespace(baseURL string, timeout time.Duration, maxFrameBytes int64) (
 // from it would be answered from an empty tree, and a mount that reported a namespace as
 // empty is the failure this whole system is arranged to avoid.
 //
-// A namespace that keeps no change log answers ENOSYS, and that is not a failure. It is a
-// standing property of that namespace — a namespace held in a local directory has no
-// metastore and so no ordered record of what changed in it — so it is mounted exactly as it
-// was before there was any such thing as a copy, with every operation a request to the
-// server. The distinction from EIO is the whole point of it having its own errno: one says
-// this namespace will never be replicable, the other says the server might answer in a
-// moment.
-func replicate(ctx context.Context, namespace *httprest.Storage, where string, errOut io.Writer) (storage.Storage, func(), error) {
+// A namespace that does not publish a change log answers ENOSYS and is mounted with
+// direct remote metadata access. Transport failures remain errors rather than selecting
+// that mode.
+func replicate(ctx context.Context, namespace *httprest.Storage, where string, errOut io.Writer) (storage.Storage, func() error, error) {
 	return replicateWithOptions(ctx, namespace, where, errOut, replicated.DefaultOptions())
 }
 
@@ -208,7 +234,7 @@ func replicateWithOptions(
 	where string,
 	errOut io.Writer,
 	options replicated.Options,
-) (storage.Storage, func(), error) {
+) (storage.Storage, func() error, error) {
 	if err := options.Check(); err != nil {
 		return nil, nil, fmt.Errorf("invalid mutation confirmation limits: %w", err)
 	}
@@ -216,38 +242,43 @@ func replicateWithOptions(
 	if err != nil {
 		return nil, nil, err
 	}
-	discard := func() {
+	discard := func() error {
 		if err := os.RemoveAll(dir); err != nil {
-			fmt.Fprintf(errOut, "remote-fs: the copy of the namespace's metadata is still at %s: %v\n", dir, err)
+			return fmt.Errorf("the copy of the namespace's metadata is still at %s: %w", dir, err)
 		}
+		return nil
 	}
 
 	replica, err := sqlite.OpenReplica(ctx, database)
 	if err != nil {
-		discard()
-		return nil, nil, fmt.Errorf("making room for a copy of the namespace's metadata: %w", err)
+		return nil, nil, errors.Join(fmt.Errorf("making room for a copy of the namespace's metadata: %w", err), discard())
 	}
 
 	started := time.Now()
 	served, err := replicated.NewWithOptions(ctx, replica, namespace, options)
 	switch {
 	case errors.Is(err, syscall.ENOSYS):
-		replica.Close()
-		discard()
+		if closeErr := replica.Close(); closeErr != nil {
+			return nil, nil, errors.Join(err, closeErr)
+		}
+		if discardErr := discard(); discardErr != nil {
+			return nil, nil, discardErr
+		}
 		fmt.Fprintln(errOut, "remote-fs: this namespace keeps no record of what changes in it, so every operation is a request to the server")
-		return namespace, func() {}, nil
+		return namespace, func() error { return nil }, nil
 	case err != nil:
-		replica.Close()
-		discard()
-		return nil, nil, fmt.Errorf("copying the namespace's metadata: %w", err)
+		if closeErr := replica.Close(); closeErr != nil {
+			return nil, nil, errors.Join(err, closeErr)
+		}
+		return nil, nil, errors.Join(fmt.Errorf("copying the namespace's metadata: %w", err), discard())
 	}
 	fmt.Fprintf(errOut, "remote-fs: copied the namespace's metadata in %v\n", time.Since(started).Round(time.Millisecond))
 
-	return served, func() {
+	return served, func() error {
 		if err := served.Close(); err != nil {
-			fmt.Fprintf(errOut, "remote-fs: releasing the copy of the namespace's metadata: %v\n", err)
+			return fmt.Errorf("releasing the copy of the namespace's metadata: %w", err)
 		}
-		discard()
+		return discard()
 	}, nil
 }
 
@@ -301,15 +332,15 @@ func reach(ctx context.Context, namespace storage.Storage, timeout time.Duration
 // wait runs until a signal arrives or the mount stops serving on its own, and detaches
 // the mountpoint in the first case.
 func wait(ctx context.Context, stop context.CancelFunc, m *fuse.Mount, mountpoint string, errOut io.Writer) error {
-	stopped := make(chan struct{})
-	go func() { m.Wait(); close(stopped) }()
+	stopped := make(chan error, 1)
+	go func() { stopped <- m.Wait() }()
 
 	select {
-	case <-stopped:
+	case err := <-stopped:
 		// Somebody detached the mountpoint from outside, or the kernel tore the
 		// connection down. Either way there is nothing left to detach.
 		fmt.Fprintf(errOut, "remote-fs: %s is no longer mounted\n", mountpoint)
-		return nil
+		return err
 	case <-ctx.Done():
 		// Disarmed before unmounting: a second signal from an operator who has decided
 		// not to wait should kill the process the way it normally would.
@@ -326,13 +357,23 @@ func wait(ctx context.Context, stop context.CancelFunc, m *fuse.Mount, mountpoin
 // the grace period; not retrying one that would have cleared costs them a mountpoint.
 func unmountPatiently(m *fuse.Mount, mountpoint string, errOut io.Writer) error {
 	fmt.Fprintf(errOut, "remote-fs: detaching %s\n", mountpoint)
+	finish := func() error {
+		if err := m.Wait(); err != nil {
+			return fmt.Errorf("releasing files after detaching %s: %w", mountpoint, err)
+		}
+		fmt.Fprintf(errOut, "remote-fs: %s detached\n", mountpoint)
+		return nil
+	}
 	deadline := time.Now().Add(unmountGrace)
 	for attempt := 0; ; attempt++ {
 		err := m.Unmount()
 		if err == nil {
-			m.Wait()
-			fmt.Fprintf(errOut, "remote-fs: %s detached\n", mountpoint)
-			return nil
+			return finish()
+		}
+		select {
+		case <-m.Done():
+			return finish()
+		default:
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("%s is still mounted after %v: %w\n"+

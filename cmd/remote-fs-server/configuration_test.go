@@ -119,6 +119,7 @@ func TestLocalDefaultsFollowThePackagesThatEnforceThem(t *testing.T) {
 	}
 
 	wantHTTP := httprest.DefaultHandlerOptions()
+	wantHTTP.Files = httprest.DefaultFileLimits()
 	wantHTTP.MaxWriteBytes = 0
 	if config.http != wantHTTP {
 		t.Fatalf("HTTP defaults are %+v, want %+v with the write bound inherited", config.http, wantHTTP)

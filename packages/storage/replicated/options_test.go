@@ -23,6 +23,8 @@ func TestConfirmationOptionsRejectUnboundedOrImpossibleValues(t *testing.T) {
 		{"unbounded active confirmations", func(options *replicated.Options) { options.MaxActiveConfirmations = math.MaxInt }},
 		{"negative waiters", func(options *replicated.Options) { options.MaxWaitingConfirmations = -1 }},
 		{"unbounded waiters", func(options *replicated.Options) { options.MaxWaitingConfirmations = math.MaxInt }},
+		{"negative file sessions", func(options *replicated.Options) { options.MaxFileSessions = -1 }},
+		{"unbounded file sessions", func(options *replicated.Options) { options.MaxFileSessions = math.MaxInt }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -47,6 +49,7 @@ func TestDefaultConfirmationOptionsAreFinite(t *testing.T) {
 		ConfirmationGrace:       replicated.DefaultConfirmationGrace,
 		MaxActiveConfirmations:  replicated.DefaultMaxActiveConfirmations,
 		MaxWaitingConfirmations: replicated.DefaultMaxWaitingConfirmations,
+		MaxFileSessions:         replicated.DefaultMaxFileSessions,
 	}) {
 		t.Fatalf("default options are %+v and do not match their exported defaults", options)
 	}

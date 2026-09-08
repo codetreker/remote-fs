@@ -2,7 +2,7 @@
 
 Status: implemented
 
-本决定取代[第一个可用版本的范围](../process/2026-08-19-mvp-scope.md)里「`statfs` 一律答 `ENOSYS`」那一条，那份 note 的其余部分不受影响；它也部分改写了[workspace 进入契约](../../proposed/architecture/2026-08-19-workspace-in-the-contract.md)对配额归属的划法，见「配额的取值仍然不归本系统」。[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)保留通用 `limited` package；随附二进制的两种存储形态由 SQLite 维护逻辑账本。
+本决定取代[第一个可用版本的范围](../process/2026-08-19-mvp-scope.md)里「`statfs` 一律答 `ENOSYS`」那一条，那份 note 的其余部分不受影响；它也部分改写了[workspace 进入契约](../../proposed/architecture/2026-08-19-workspace-in-the-contract.md)对配额归属的划法，见「配额的取值仍然不归本系统」。[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)保留通用 `limited` package；随附二进制的两种存储形态由 SQLite 维护逻辑账本。[活文件句柄](2026-09-08-live-file-handles.md)将同步修改与脱离目录后的保留字节纳入同一计费边界。
 
 ## 问题
 
@@ -14,7 +14,7 @@ Status: implemented
 
 当时随附的普通目录后端没有 workspace 配额，R-INT-6 的集成方接入的自有存储同样可能没有。只要求底层报告和执行现成的额度，无法覆盖这类存储；这也是通用配额包装仍然有用的原因。
 
-而「拒绝」这件事不能随便放在哪里。挂载呈现层把整个文件缓冲在描述符里，到 `close(2)` 才提交，因此一个只在提交处被发现的拒绝，到达调用方的时刻是 `close(2)` 的返回值 —— 大量程序从不检查它。那些字节于是无声地消失，而这正是本仓库唯一不肯做的那件事的另一种形态。
+而「拒绝」这件事不能随便放在哪里。当时挂载呈现层把整个文件缓冲在描述符里，到 `close(2)` 才提交，因此一个只在提交处被发现的拒绝，到达调用方的时刻是 `close(2)` 的返回值 —— 大量程序从不检查它。那些字节于是无声地消失，违背了 R-ERR-3。本决定当时采用提前空间检查减少这种迟到的拒绝；[活文件句柄](2026-09-08-live-file-handles.md)把普通描述符修改改为逐次同步确认，配额错误随相应写入或截断返回。
 
 容量还是一个**要被报出去**的数字，因此它同时受另一条纪律管：不报告任何没被测量过的事实（R-ERR-2）。报错了比不报更坏 —— FUSE 库对不作答的文件系统的默认回答是一个全零结构，读起来是一块没有剩余空间的盘。
 
@@ -34,30 +34,32 @@ Status: implemented
 
 ### workspace 配额的计数与拒绝是本系统的事
 
-`packages/storage/limited` 把一份能证明 bounded result production 的 `storage.BoundedStorage` 置于字节配额之下。constructor 仍接收 `storage.Storage`，但在遍历之前要求额外 capability 并调用 `CheckBounded`；缺少或无法兑现这项能力时响亮失败，不退回普通 `List`。集成方自有存储只有履行同一有界契约才能被这层包装（R-INT-3、R-INT-6）。
+`packages/storage/limited` 把一份 `storage.BoundedStorage` 置于字节配额之下。constructor 接收 `storage.Storage`，但要求有界结果能力；用量优先取自原生 `Usage`。没有权威用量且不支持文件句柄的 backend，才通过 `CheckBounded` 与 `ListBounded` 测量目录树。支持文件句柄却不能测量脱离目录后保留字节的组合必须失败，普通 `List` 或只看仍有名字的节点都不能补足这项能力（R-INT-3、R-INT-6、R-WS-7）。
 
-- **已用量在 `New` 里走一遍命名空间量出来**，此后由每一次经过这里的修改推动。这是这份 storage 一生中唯一一次无条件的遍历，此后「还剩多少」随时答得出。遍历只调用 `ListBounded`，不会先取得完整 directory slice。
-- **measurement 有两项独立 byte ceiling。** `MeasurementLimits.MaxDirectoryBytes` 限制当前 directory 的 `storage.Entry` 与 name retention，`MaxFrontierBytes` 限制当前及待访问 directory path；零值各自取 64 MiB 默认值，没有 unbounded 取值。任一结构越界时以 `EIO` 失败，取消与 backing error 保留原错误；任何失败都不产生 partial count。
+- **已用量在 `New` 里从底层权威地量出来**，此后由经过包装层的修改与文件引用清理推动。原生 `Usage` 包含仍有名字和已脱离目录的保留节点；不支持保留句柄的底层才遍历目录树，且只调用 `ListBounded`，不会先取得完整 directory slice。
+- **目录树 measurement 有两项独立 byte ceiling。** `MeasurementLimits.MaxDirectoryBytes` 限制当前 directory 的 `storage.Entry` 与 name retention，`MaxFrontierBytes` 限制当前及待访问 directory path；零值各自取 64 MiB 默认值，没有 unbounded 取值。任一结构越界时以 `EIO` 失败，取消与 backing error 保留原错误；任何失败都不产生 partial count。这些上限约束回退遍历，不定义权威 `Usage` 的字节口径。
 - **写入按差额收费**：增长在效果发生前预留，缩短只在确定完成后释放。支持 `CheckPublicationAccounting` 的原生 backend 在最终发布处提供实际新旧大小与效果，避免包装层先采样再修改；Applied 按实际效果结算，即使后续确认失败也不倒退已经发生的缩短。NotApplied 退回增长预留；未知效果保留保守额度。修复验收见[缩短提交后释放配额](../bug-fix/2026-09-07-release-shrunk-quota-after-commit.md)。
 - **超出配额以 `EDQUOT` 拒绝**，不是 `ENOSPC`。没有哪块盘满了，是一份额度用完了，而这两句话给使用者指的是完全不同的下一步。两个名字本来就在 errno 词汇表里，那一侧一个字没动。
 - **让命名空间变小的修改从不被拒绝**，已经超出配额时也不拒绝，否则一个超额的 workspace 没有任何回到配额之内的路。同理，一份已经装得比配额多的命名空间照常打开 —— 把配额调到已写内容之下是运维日常，答案是「在吐出一些之前不再收新的」，不是「这份命名空间没法服务了」。
 - **配额不得低于 4096 字节**，见下面「statfs 的算术」。
 
-计数 mutex 不跨底层操作持有。支持原生计费的 Write、Remove 与 Rename 由实际发布协调目标，跳过包装层路径 Stat 与 stripe；这与[文件锁](2026-09-07-file-locks.md)在最终变更处检查实际资源使用同一边界。没有原生能力的有界第三方 backend 仍使用固定 256 把路径 stripe 锁；它们只覆盖直接指定的路径，祖先目录改名可能使子路径采样失效，[目录改名中的配额记账](../../proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)保留这项通用限制。这类 backend 不能向服务端提供非空的锁授权方。
+计数 mutex 不跨底层操作持有。支持原生计费的 Write、Remove 与 Rename 由实际发布协调目标，跳过包装层路径 Stat 与 stripe；`File.WriteAt`、`File.Truncate` 与打开时截断同样在原生最终转换处按实际大小结算。这与[文件锁](2026-09-07-file-locks.md)在最终变更处检查实际资源使用同一边界。`limited` 只向外提供满足权威用量与原生计费义务的文件会话。没有原生能力的有界第三方 backend 仍使用固定 256 把路径 stripe 锁；它们只覆盖直接指定的路径，祖先目录改名可能使子路径采样失效，[目录改名中的配额记账](../../proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)保留这项通用限制。这类 backend 不能向服务端提供非空的锁授权方。
 
-每个操作另持有 Recount 闸的共享访问，Recount 独占它，在临时变量里完成同一项 bounded measurement，只有全部成功才替换 count；directory/frontier overflow、取消或 backing error 都保留旧 count 并释放闸。发布效果未知，或结算、撤销返回 `IsPublicationAccountingUncertain` 时，即使 namespace 已知没有改变，也停止 Space、修改与 Recount，并保留首个不确定错误及原因，直到重新打开。普通准备失败且成功撤销保持可用；不能用一次在线重数掩盖未决计费的后续效果。
+命名空间操作与同步句柄修改持有 Recount 闸的共享访问，Recount 独占它。引用到期和最后关闭的清理仍可推进；它们的计费不能在原生发布锁内等待该闸。Recount 先记下计费 revision，再测量权威用量或执行有界遍历，仅在 revision 未变时安装完整结果；清理交错时重新测量，连续八次都交错则返回 `EAGAIN`。越界、取消或 backing error 不安装测量值，已经确定的并发结算仍保留。
+
+发布效果未知，或结算、撤销返回 `IsPublicationAccountingUncertain` 时，即使 namespace 已知没有改变，也停止 Space、修改与 Recount，并保留首个不确定错误及原因，直到重新打开。普通准备失败且成功撤销保持可用；不能用一次在线重数掩盖未决计费的后续效果。
 
 配额之下报出的「还能写入的量」，取配额剩余与底层所报之中较小的那个；底层答 `ENOSYS` 时，配额剩余就是任何人手上唯一实测过的数字。底层报出的三个数先过 `Coherent` 再进这个最小值：一个在那里变负的数会从内核回复的无符号字段里出来，成为哪块盘都没有的余量。
 
 `packages/storage/objectstore` 采用同一条组合规则，但逻辑账在 metastore，物理余量来自 `Objects.Available`：`Space` 的 `Total` 与 `Used` 保持 workspace 口径，`Avail` 取 metastore 余量与 object store 实测值的较小者。只有纯粹的 `ENOSYS` 表示实现没有物理数字；与 I/O failure 合并的 `ENOSYS` 仍然是失败。随附二进制的 local-store 与 Azure Blob 形态都使用 SQLite 事务中的额度与计数，不再套一层 `limited`。`packages/storage/objectstore/localdisk` 从 `f_bavail` 扣掉 maintenance reserve、在途 publication 与格式开销，具体取舍见[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)。
 
-### 拒绝落在造成它的那次调用上，而挂载层持有的那个数字什么都不决定
+### 拒绝随同步写入或截断返回
 
-命名空间在提交处的拒绝是权威，而提交发生在 `close(2)`。挂载层因此持有一个数字 —— 命名空间最后一次报出的「还能写入的量」，整个挂载点共用一份；回答或非中断故障后的刷新窗口为一秒，被分类为 `EINTR` 的探测可以立即重试。每一次会让缓冲区变长的调用，`write(2)` 与落在打开的描述符上的 `ftruncate(2)`，都拿这次改动要多占的字节数与它相比，比不过就地 `EDQUOT`。没有描述符的 `truncate(2)` 直接写穿到命名空间，在那里以同一个 errno 被拒；同一件事不因为手上有没有描述符而在两个地方给出两种答案。变短的改动不做这项比对，从超额状态也放行 —— 越了限的 workspace 必须有一条回到限下的路。单文件上限用 `EFBIG` 在同一处、以同样的理由挡在分配之前，这条路是现成的。
+FUSE 的 `write(2)` 与 `ftruncate(2)` 分别通过绑定同一对象的 `File.WriteAt` 与 `File.Truncate` 同步发布；没有已有描述符的 `truncate(2)` 也先取得对应节点的引用，再执行同一截断操作。服务端在最终转换中按当前对象的实际新旧长度检查额度，增长超额以 `EDQUOT` 在该次调用中失败，缩短不因现有用量已经超额而被拒绝。范围写保留范围外的当前内容；名字改变不能把收费或修改转向同名替代物。
 
-`Space` 探测被权威分类为 `EINTR` 时，错误在改变缓冲区之前返回；直接、包裹或通过 wire 返回的中断都适用，不要求保留原 context 身份。释放探测占用，但保留上次有效数字与原来的探测时间。调用方立即重试会重新探测已经过期或尚不存在的数字，因而不会把取消当成一次完成的刷新。独立故障不会因与取消合并就变成 `EINTR`；其它 advisory measurement failure 的旧值策略与 `ENOSYS` 的能力判断保持不变。取舍见[请求中断](../bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)。
+挂载层不缓存可用容量来预先决定写入能否通过。`Statfs` 仍直接调用 `Space` 报告实测容量；查询失败向调用方返回错误，不能把一个失败的容量回答当成准许写入的依据。普通描述符的修改由同步发布结果决定，取消与结果未知遵守[请求中断](../bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)的错误分类。
 
-这是这个挂载点持有的唯一一个不描述任何节点的数字。它只用于提前拒绝：数字偏大时，写入可能被放过，提交仍须由命名空间检查；数字偏小时，一次本来放得下的写入可能被拒，刷新后可重试。原生发布计费与第三方路径采样的准确性边界分别成立，挂载层的数字不能弥补后者的祖先改名缺口。
+`Close` 负责引用与 owner 清理，写入成功不等待关闭或后续 `fsync`。`FlushTimeout` 是关闭与会话清理的预算；它不提供延后提交内容的窗口。句柄生命周期与范围发布见[文件句柄设计](../../../../docs/design/server/file-handles.md)。原生计费保证与第三方路径采样的准确性边界分别成立，同步句柄接口不能补足未提供该接口的通用路径包装。
 
 ### statfs 的算术
 
@@ -81,16 +83,19 @@ Status: implemented
 
 设定配额是部署方控制面的事，与计费、归属、生命周期策略在一起 —— [workspace 进入契约](../../proposed/architecture/2026-08-19-workspace-in-the-contract.md)把这些划在系统之外，那一条仍然成立。**报出它与执行它则是本系统的**：一个只由部署方记在别处的数字，落到挂载点上的程序那里什么都不是。
 
-## 计数依据经过 server 的修改
+## 计数覆盖有名字与脱离目录的文件
 
 每一次经过 `limited` 的修改按实际大小差额推动计数；原生 backend 在最终转换处确定这项差额，第三方路径采样仍受祖先改名限制：
 
 | 操作 | 计数怎么动 |
 |---|---|
-| `Write` | 加上新内容的长度减去写之前那个文件的长度；名字上没有东西时全额加 |
-| `Remove` | 减去被删掉那个文件的长度，且在它真的没了之后才减 |
-| `Rename` | 减去被覆盖掉的那个文件的长度。被搬动的字节早已在账上，落到哪个名字下都还在账上 |
+| `Write`、`File.WriteAt`、`File.Truncate`、打开时截断 | 按最终目标的实际新旧长度收费。范围写和截断针对同一保留对象；新建内容全额计入 |
+| `Remove` | 有打开引用时只移除名字，保留字节继续收费；没有保留引用时，确定删除后释放额度 |
+| `Rename` | 被搬动的字节继续收费。被覆盖节点仍有引用时成为 detached 并保留收费，没有引用时才释放其额度 |
+| 最后引用关闭或到期清理 | 先终止后续发布，排空已接纳操作，再释放最后一个原生保留引用；确定回收 detached 节点后释放其收费，重复关闭不重复退款 |
 | `Create`、`Mkdir`、`RemoveDir`、`SetAttr`、`Read`、`List`、`Stat` | 不动。`Create` 建的是空文件，字节随后由 `Write` 收费，所以建文件从不因为额度用完而失败 |
+
+脱离目录的文件仍可经有效句柄读写，其内容与属性跟随同一个节点；无名字不等于可回收。引用失效先撤销发布资格，尚未释放的原生 pin 只保护排空期间的物理保留，不允许已失效调用继续提交。清理的最终发布结算来自文件会话持有的独立计费 hook，不复用已取消请求的一次性预留；已知清理拒绝继续保留收费，未知清理或计费结果使账本不可用。逻辑额度的释放与对象存储后续垃圾清扫分开，实测物理余量继续约束 `Space.Avail`。
 
 **它对不经过这里的修改一律不精确，而且两个方向都错。** 绕过 `limited` 直接修改其底层命名空间，是明确的非目标；这不是疏忽，是因为**没有任何经过包装层的流量能把它修回来**：
 
@@ -101,7 +106,7 @@ Status: implemented
 
 **算术被守住，让报出去的数字造不出容量。** 计数在存的地方就被压在零以上，不是只在读的时候才压；报出的「还能写入的量」于是既不超过配额剩下的部分，也不会从内核回复的无符号字段里出来变成一个巨大的正数（R-ERR-2）。**被守住的到此为止 —— 是报出去的数字，不是账本本身。** 计数照样可以停在真相之下：一个从旁边被拷进来、再经由这里被删掉的文件就留下这样一笔，此后的写入照单被接受，命名空间越过配额而没有任何人被拒绝。压在零以上挡不住这件事，只是不让它再从报出去的数字上多骗一份容量。对经过这里的修改，拿不准时一律往「多收」的一边取 —— 一个 stat 不出来的文件被删除时不退款，一次 `O_TRUNC` 之后的写入按整份长度收费而不是按增量 —— 但这条偏向只管得住经过这里的流量。
 
-**集成方可以显式调用 `Recount`，重新测量命名空间。** package 不调度它：重新测量期间不允许任何修改发生，否则遍历得到的数字不属于任何一个时刻。Recount 使用 startup 相同的 `MeasurementLimits`、`CheckBounded` 与 `ListBounded` 路径；完整测量成功后一次替换 count，directory/frontier overflow 以 `EIO` 失败，取消或 backing error 原样返回，旧 count 在所有失败路径上保持不变。调用方会等待这次 bounded traversal，但不会看到 partial count。
+**集成方可以显式调用 `Recount`，重新测量用量。** package 不调度它。支持文件句柄的 backend 必须从权威 `Usage` 计入 detached 字节；只遍历名字会把仍可访问的内容误报为空闲。其它 backend 使用 startup 相同的 `MeasurementLimits`、`CheckBounded` 与 `ListBounded` 路径。同步修改等待测量，后台清理通过前述计费 revision 规则与它协调；仅完整且未被交错结算改变的测量可以替换 count，失败不发布 partial count。
 
 这项 measurement 通过 `limited.NewWithLimits` 配置。随附二进制的 local-store 与 Azure Blob 形态使用事务账本，SIGHUP 报告 reserved/unresolved/garbage、清扫与锁状态；local-store 还报告逻辑容量与物理余量，Azure 执行对象存储可用性探测。两者不执行 Recount，也没有 measurement flags。local-store 要求 `-quota`；Azure Blob 可以不配置额度，容量查询遵守所选存储的 `Space` 契约。
 
@@ -113,7 +118,7 @@ Status: implemented
 
 **按路径记账：一张从路径到「这个路径收了多少字节」的表。** 它有一个真优点，是 O(1) 计数器给不了的：**任何被再次碰到的路径都会自我纠正** —— 下一次写它、删它，都会拿表里那个数去抵，从旁边改动造成的偏差当场结清。输在两处。一是 R-INT-3：一个文件一条记录，就是随命名空间无界增长的每节点状态，而 R-SCALE-1 明说单个 workspace 的体量还没实测过。二是它救不了真正把 workspace 卡死的那种情况 —— 从旁边被删掉的那个路径再也不会被碰到，它那条记录会永远留在表里，和一个 O(1) 计数器里那笔永远退不掉的账一模一样。
 
-**定期全量重数，比如每隔一段时间自己运行 bounded Recount。** 漂移会被自动收敛，运维什么都不用做。输在并发：得到一致数字仍须让每一个写入者等待整次遍历；directory/frontier 上限只限制 retained memory，不消除等待时间与 backing I/O。那是运维可以选择去付的代价，不是定时器可以替所有人决定去付的代价。当时的目录服务用 `SIGHUP` 触发重数；通用 package 保留显式 Recount，由集成方选择调用时机。
+**定期全量重数，比如每隔一段时间自己运行 bounded Recount。** 漂移会被自动收敛，运维什么都不用做。当时否决它，是因为得到一致数字须让每一个写入者等待整次遍历；directory/frontier 上限只限制 retained memory，不消除等待时间与 backing I/O。那是运维可以选择去付的代价，不是定时器可以替所有人决定去付的代价。当时的目录服务用 `SIGHUP` 触发重数；通用 package 保留显式 Recount，由集成方选择调用时机。原生权威用量可免去目录遍历，仍须遵守与并发清理结算的协调规则。
 
 **`statfs` 继续答 `ENOSYS`，只在写入路径上执行配额。** 少一个契约操作、少一整条报告路径，而「不许写超」这条硬保证一点没丢。输在一个先问「还剩多少」再决定写不写的程序 —— `df` 之外，还有安装器、构建工具、`rsync --max-size` 之类的东西 —— 在这里问不到答案，于是照写不误，那次拒绝还是迟到。而配额存在的一半意义，正是让人在动手之前就知道自己有多少地方。
 
@@ -123,18 +128,18 @@ Status: implemented
 
 - 挂载点上的 `df`、`stat -f`、`os.statvfs` 报出的是实测的数字，一个先问再写的程序拿得到答案。契约用例守着它：`Space` 只有两种被允许的结果 —— 一份能同时为真的报告，或者 `ENOSYS` —— 没有第三种，且这两种之间的选择在同一份命名空间的一生中不许改变。
 - 那次拒绝到达的是造成它的那个程序，在造成它的那次调用上 —— `write(2)`、`ftruncate(2)`、`truncate(2)` —— errno 是 `EDQUOT`。
-- 通用配额包装保留给履行 `storage.BoundedStorage` 的底层；`CheckBounded` 与 measurement limits 使 startup/Recount 不用无界 listing 换取计数。具有非空锁授权方的 backend 还须提供原生发布计费，普通有界能力本身不能兑现这项义务。
+- 通用配额包装保留给履行 `storage.BoundedStorage` 的底层；回退遍历受 `CheckBounded` 与 measurement limits 约束。具有非空锁授权方的 backend 还须提供原生发布计费，文件句柄另要求包含 detached 节点的权威 `Usage`，普通有界能力本身不能兑现这些义务。
 - 对象存储组合把逻辑额度与 backing store 的实测物理余量分开保留，再以两者的较小值回答可写量；workspace 用尽仍是 `EDQUOT`，底层磁盘无法容纳 publication 是 `ENOSPC`。
 - 第三方实现（R-INT-6）多欠三条义务，全部可执行：要么答容量、要么答 `ENOSYS`，绝不报一个推算出来的数字；三个数都不为负、且还能写入的量不超过总量减已用；答不答这件事不随命名空间的生命变化。
 
 ### 付出的，以及必须叫出名字的缺口
 
-- **计数是 O(1) 的，代价是它在命名空间被从旁边改动之后两个方向都错。** 多收会把空目录记为满额，少收会让后续写入超额；压在零以上只约束数字范围。原生发布计费将受管修改的收费与实际目标绑定，第三方路径采样的[目录改名交错](../../proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)仍是缺口。正常账本可以通过成功的 bounded Recount 重新实测，失败保留旧数；发布或计费结果不明的账本必须保持不可用。
+- **计数是 O(1) 的，代价是它在命名空间被从旁边改动之后两个方向都错。** 多收会把空目录记为满额，少收会让后续写入超额；压在零以上只约束数字范围。原生发布计费将受管修改的收费与实际目标绑定，第三方路径采样的[目录改名交错](../../proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)仍是缺口。正常账本可以通过成功的 Recount 重新实测；发布或计费结果不明的账本必须保持不可用。
 - **「还能写入的量」必须取配额剩余与底层所报之中较小的那个。** 只按配额算出来的数字，在服务端自己那块盘更紧的时候就是一句谎话，而读这个数字的工具会据此中止。这是契约带三个数而不是两个数的原因，也是每一层都得把这个最小值传下去的原因。
 - **配额有一条使用者会撞上的下界。** 低于一个 4096 字节的块会被报成一个零块的文件系统 —— 正是旧的 `ENOSYS` 存在所要挡住的那个全零回复。所以 `limited.New` 拒绝这样的配额，而这是一条会被人撞到的边界，不是一条内部不变式。随附二进制在解析 `-quota` 时就拒绝同一个下界；`-quota 0` 同样被拒。只有 Azure Blob 形态可以省略该 flag，local-store 必须给出正额度。
 - **默认配置下，不是挂载者的调用方看到的是一块零块的满盘。** 内核对这样的调用方自己回答 `statfs`，回一个清零的结构（[`fuse_statfs`](https://github.com/torvalds/linux/blob/818bebeb63dd6bf5f4e07e145f6cdbace520a34c/fs/fuse/inode.c#L646-L657)：`fuse_allow_current_process` 不放行时填上 `f_type` 就 `return 0`），守护进程根本不会被问到。于是 `sudo df` 看到的是一块 0 字节、0 可用的盘，别的本地用户也一样。这是既有的内核行为，不是这次引入的 —— 一个不带 `allow_other` 的挂载对他们本来就不可访问。唯一的例外由主机决定而不由本系统决定：fuse 模块参数 `allow_sys_admin_access`（默认关，`0644` 可写）打开后，初始 user namespace 中带 `CAP_SYS_ADMIN` 的调用方[绕过这项检查](https://github.com/torvalds/linux/blob/818bebeb63dd6bf5f4e07e145f6cdbace520a34c/fs/fuse/dir.c#L1684-L1697)，`sudo df` 读到的就是真数字。因此 **`df` 默认是一条只对挂载者有效的通道**：配额报得再准，别人要看见得先在主机上开那个参数。
 - **`statfs` 从此永远是一次网络往返**，而它落在一条会走遍机器上每一个挂载点的命令上。内核不缓存 statfs 的回答，也没有任何开关能让它别再问。这次调用因此带自己的 2 秒截止时间，而不是挂载点通用的操作超时：一个够不到的服务端把整台机器上的 `df` 变成一次停顿，而不是一次挂起。
 - **`df` 里的数字对单文件上限一言不发。** 一个先查 `statfs` 再动手的工具，仍然会在拷到一半时撞上 `EFBIG`。这两条限制彼此独立，而只有一条报得出去。
-- **构造 `limited` 要先遍历一次底层命名空间。** 遍历的 retention 由两个默认 64 MiB 上限约束，但工作量仍随文件数量增长；一个 directory 或 frontier 超过配置会以 `EIO` 拒绝整个构造，不会交出 partial count。随附二进制直接使用 SQLite 账本，不承担这项包装层遍历。
-- **显式 Recount 期间每一个调用方都等待一次 bounded traversal。** 这既是它由集成方决定何时发起的理由，也是发起它的人要付的价钱。越界、取消或 backing failure 会保留旧 count；调用方得到错误，现有计数与 operation gate 继续可用。
-- **挂载层那个数字最长会旧一秒**，两个方向都在预期之内：偏大放过的写入由提交拒绝，偏小误拒的写入下一次就通过。
+- **没有权威 Usage 的底层要在构造 `limited` 时遍历一次命名空间。** 遍历的 retention 由两个默认 64 MiB 上限约束，但工作量仍随文件数量增长；一个 directory 或 frontier 超过配置会以 `EIO` 拒绝整个构造，不会交出 partial count。支持保留句柄却缺少权威用量时直接拒绝组合。
+- **显式 Recount 会阻挡同步修改，后台引用清理则继续结算。** 目录遍历的工作量或清理交错带来的重测，由发起它的集成方承担；取消、越界与 backing failure 不安装测量结果，持续交错到达重试上限时返回 `EAGAIN`。
+- **unlink 后的文件仍可能占满额度。** 只要还有有效引用或已接纳操作需要排空，删除名字就不能释放其字节；最后引用清理失败也不能假定容量已经可用。`Space.Used` 因而可能大于目录遍历所得的总量。

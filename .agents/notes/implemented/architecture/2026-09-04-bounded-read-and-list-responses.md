@@ -18,6 +18,8 @@ HTTP 的 wire body 上限若只在 `storage.Read` 返回完整 `[]byte`、`stora
 
 object-store namespace 在 metastore 记录的 size 超限时先拒绝，再要求 backing `Objects` 实现 `GetBounded`。localdisk 先验证 envelope、store ID、key 与 declared length，在 payload admission 和 allocation 之前检查预算；Azure 先检查 service-declared length；memory 在 map lock 下检查 retained slice 长度。listing 通过 `metastore.BoundedLister` 按 bytewise name order 枚举；SQLite 先扫描 name length 与 fixed-size attrs，取得 `ListReservation` 后才把 name BLOB 复制进 Go memory，不建立完整 child slice。
 
+[实时文件句柄](./2026-09-08-live-file-handles.md)另有 `File.ReadAt`，返回同一次内容修订捕获的属性与请求范围。范围响应不等于原生对象已支持稀疏读取：后端仍可能取回完整对象，须先取得覆盖完整 materialization 的聚合预算。范围响应、完整对象暂存与等待者分别有界，不能只按返回给调用方的几个字节计费。
+
 limited、replicated、localstore 与 HTTP client 都传播相同 capability。wrapper 的 `CheckBounded` 必须验证下层；HTTP client 用自己的 wire 上限与调用方预算的较小值取得响应，随后把 decoded entries 逐项加入调用方的 `ListResult`。[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)取消了 localdir 的 capability 实现；有界生产仍是全部可发布后端的共同义务。
 
 server 与 client 各有独立的 response admission，限制 concurrent operations、aggregate retained bytes 和 bounded waiters。server 的 Read/List 在调用 storage 前按 `4 * MaxBodyBytes` 预留，覆盖 storage result、wire conversion 与 encoded body 可能同时存在的保守峰值；其它 fixed-result non-stream operation 按 `MaxBodyBytes` 预留。client 在发出任意 non-stream request 前统一按 `4 * MaxBodyBytes` 预留，使 raw body 与 decoded representation 可以同时留存。context cancellation 会释放等待；饱和且 waiter 已满时以 `EAGAIN` 响亮失败。每个 wire body 本身仍受 `MaxBodyBytes` 限制。
@@ -44,5 +46,5 @@ change/snapshot stream 不计入 non-stream response admission，也不由 `MaxB
 - HTTP handler 的构造阶段成为 capability gate；一个只有旧 `Storage` 方法的第三方实现仍可供其它本地调用方使用，但不能被嵌入 server。
 - server 与 client 的 concurrent response、aggregate bytes 和 waiters 都有独立默认值与配置，不再借用 request-body admission 表达另一类资源。
 - `ListResult` 的 charge 由调用方定义，因此 storage 不依赖 JSON 形状；代价是每个 transport 必须提供与自己 retained representation 一致的 name-length/attribute 计费函数，并用测试钉住边界。reservation 与 commit 必须成对，未提交 reservation 同样使结果失败。
-- 成功结果仍完整驻留在内存里。默认 1 GiB body 上限、server Read/List 的四倍 reservation、server fixed-result operation 的一倍 reservation，以及 client non-stream call 的四倍 reservation 共同给出 ceiling，没有提供 streaming throughput、range read 或 paginated list；这些仍由[storage 操作词汇](../../proposed/architecture/2026-08-19-storage-operation-vocabulary.md)拥有。
+- 路径 Read/List 的成功结果仍完整驻留在内存里。默认 1 GiB body 上限、server Read/List 的四倍 reservation、server fixed-result operation 的一倍 reservation，以及 client non-stream call 的四倍 reservation 共同给出 ceiling。句柄范围读取由独立 File API 提供；底层 streaming throughput 与带一致性语义的 paginated list 仍由[storage 操作词汇](../../proposed/architecture/2026-08-19-storage-operation-vocabulary.md)跟踪。
 - 四倍 reservation 会低估小 Read/List 与 client response 的可并发量，尤其是实际只保留一种 representation 时；server 的 fixed-result operation 不支付这项额外倍数。这个吞吐取舍换取无需依赖 allocation 时序的 aggregate bound。

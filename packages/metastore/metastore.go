@@ -73,9 +73,9 @@ type Store interface {
 	// Mkdir records a directory at path.
 	Mkdir(ctx context.Context, path string) error
 
-	// Remove removes the file at path. Removing a directory is syscall.EISDIR. The object
-	// the file referenced, if any, becomes garbage: it is recorded as such rather than
-	// deleted, because this interface does not reach the object store.
+	// Remove removes the file's name. Removing a directory is syscall.EISDIR.
+	// A retained File keeps its node, current object and quota until last close;
+	// otherwise the object becomes garbage and its bytes leave namespace usage.
 	Remove(ctx context.Context, path string) error
 
 	// RemoveDir removes the empty directory at path. A file is syscall.ENOTDIR, a directory
@@ -83,7 +83,8 @@ type Store interface {
 	RemoveDir(ctx context.Context, path string) error
 
 	// Rename moves the node at from to to, replacing an existing file there. Naming the root
-	// as either operand is syscall.EBUSY. An object displaced by the move becomes garbage.
+	// as either operand is syscall.EBUSY. A retained displaced file survives through its
+	// references; otherwise its object becomes garbage and its bytes leave namespace usage.
 	//
 	// Renaming a directory moves everything beneath it and must not cost more than moving
 	// the directory itself. That is a property of the shape the tree is stored in, not of
@@ -175,7 +176,8 @@ type Store interface {
 	// prevents an unproven or live object from becoming untracked.
 	Forget(ctx context.Context, keys []Key) error
 
-	// Close releases whatever the Store holds open.
+	// Close releases the Store after every retained File is closed. Outstanding
+	// references return EBUSY; unknown cleanup preserves native ownership.
 	Close() error
 
 	// Log is what a mount replicates from. Every Store provides it, because a position has

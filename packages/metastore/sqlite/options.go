@@ -4,9 +4,13 @@ import (
 	"fmt"
 	"math"
 	"syscall"
+
+	"github.com/codetreker/remote-fs/packages/advisory"
 )
 
 const (
+	DefaultMaxRetainedFiles = 65536
+
 	// DefaultMaxReaderConnections bounds the physical SQLite connections used by concurrent
 	// namespace reads when the caller supplies no limit of its own.
 	DefaultMaxReaderConnections = 16
@@ -36,6 +40,13 @@ type Options struct {
 	Window                   Window
 	ObjectLimits             ObjectLimits
 
+	// MaxRetainedFiles bounds native file references across this namespace. Zero
+	// selects DefaultMaxRetainedFiles; admission exhaustion returns EAGAIN.
+	MaxRetainedFiles int
+	// Advisory bounds namespace-wide lock and materialization state. The zero
+	// configuration selects advisory.DefaultConfig; shared opens must agree.
+	Advisory advisory.Config
+
 	// MaxReaderConnections bounds the physical SQLite connections used by ordinary namespace
 	// and log reads. Zero selects DefaultMaxReaderConnections. A read waits for a connection
 	// when the pool is full and observes its context while waiting.
@@ -61,6 +72,8 @@ func DefaultOptions() Options {
 	return Options{
 		Window:                       DefaultWindow(),
 		ObjectLimits:                 DefaultObjectLimits(),
+		MaxRetainedFiles:             DefaultMaxRetainedFiles,
+		Advisory:                     advisory.DefaultConfig(),
 		MaxReaderConnections:         DefaultMaxReaderConnections,
 		MaxSnapshotReaderConnections: DefaultMaxSnapshotReaderConnections,
 		MaxIntegrityRecords:          DefaultMaxIntegrityRecords,
@@ -70,6 +83,18 @@ func DefaultOptions() Options {
 
 // Effective resolves zero-valued defaults and validates Options without opening a database.
 func (o Options) Effective() (Options, error) {
+	if o.Advisory == (advisory.Config{}) {
+		o.Advisory = advisory.DefaultConfig()
+	}
+	if err := o.Advisory.Check(); err != nil {
+		return Options{}, err
+	}
+	if o.MaxRetainedFiles == 0 {
+		o.MaxRetainedFiles = DefaultMaxRetainedFiles
+	}
+	if o.MaxRetainedFiles < 1 || o.MaxRetainedFiles == math.MaxInt {
+		return Options{}, fmt.Errorf("the SQLite retained-file limit must be positive and bounded: %w", syscall.EINVAL)
+	}
 	if err := o.Window.check(); err != nil {
 		return Options{}, err
 	}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"sync"
@@ -15,6 +16,30 @@ type drainingServer struct {
 	*http.Server
 	drain       *drainingHandler
 	connections *connectionTracker
+}
+
+// The handler stays reachable with the error while session cleanup is uncertain.
+// Its native references must outlive both the failed attempt and the owned backend.
+type fileRegistryCloseError struct {
+	cause   error
+	handler *httprest.Handler
+}
+
+func (e *fileRegistryCloseError) Error() string {
+	return fmt.Sprintf("closing HTTP file sessions: %v", e.cause)
+}
+
+func (e *fileRegistryCloseError) Unwrap() error { return e.cause }
+
+func closeFileRegistry(server *drainingServer, grace time.Duration) error {
+	server.drain.Stop()
+	server.drain.Wait()
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	if err := server.drain.inner.Close(ctx); err != nil {
+		return &fileRegistryCloseError{cause: err, handler: server.drain.inner}
+	}
+	return nil
 }
 
 type connectionTracker struct {

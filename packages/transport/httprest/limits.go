@@ -147,6 +147,9 @@ func (l Limits) check() error {
 // HandlerOptions configure request-body, non-streaming response, and replication resources
 // retained by a Handler.
 type HandlerOptions struct {
+	// Files bounds retained sessions, references, and replay records. Zero selects DefaultFileLimits.
+	Files FileLimits
+
 	// Lock control admission is independent of bulk bodies and replication. Zero selects
 	// the corresponding default; each active call reserves four fixed control bodies.
 	MaxConcurrentLockControls int
@@ -321,6 +324,9 @@ func (o HandlerOptions) settle() handlerOptions {
 // Check reports whether the options resolve to usable bounded settings. Callers may use
 // it before opening the storage that will be handed to NewHandlerWithOptions.
 func (o HandlerOptions) Check() error {
+	if err := o.Files.Check(); err != nil {
+		return err
+	}
 	settled := o.settle()
 	if err := checkLockControlLimits(settled.maxConcurrentLockControls, settled.maxWaitingLockControls); err != nil {
 		return err
@@ -439,10 +445,10 @@ type DialOptions struct {
 	// value must not exceed MaxBodyBytes.
 	MaxWriteBytes int64
 
-	// MaxConcurrentResponses, MaxInFlightResponseBytes and MaxWaitingResponses bound
-	// simultaneous non-streaming responses and the goroutines waiting to retain them.
-	// A response reserves four times MaxBodyBytes so raw JSON and its decoded listing can
-	// coexist inside the aggregate bound.
+	// These bounds apply to non-streaming responses, including fixed results.
+	// Retained-file request encoding uses an independent pool with the same bounds.
+	// Each pool reserves four times MaxBodyBytes per operation for simultaneous
+	// encoded and decoded representations.
 	MaxConcurrentResponses   int
 	MaxInFlightResponseBytes int64
 	MaxWaitingResponses      int

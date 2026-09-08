@@ -109,7 +109,7 @@ func TestAnAllowanceIsSpentAgainstWhatTheWorkspaceAlreadyHolds(t *testing.T) {
 	srv.awaitLine(t, fmt.Sprintf("allowance of %d bytes, %d of them taken", allowance, held), startup)
 
 	mountpoint := t.TempDir()
-	startMountBinary(t, "-server", srv.url, "-mountpoint", mountpoint)
+	mount := startMountBinary(t, "-server", srv.url, "-mountpoint", mountpoint, "-debug")
 
 	// Under the allowance, over what is left of it. A workspace weighing this against the
 	// allowance alone would take it and end up holding more than it may. Nothing has been
@@ -126,7 +126,12 @@ func TestAnAllowanceIsSpentAgainstWhatTheWorkspaceAlreadyHolds(t *testing.T) {
 	// workspace that is full and one that refuses everything.
 	fits := allowance - held - mountBlockSize
 	if err := os.WriteFile(filepath.Join(mountpoint, "fits.bin"), make([]byte, fits), 0o644); err != nil {
-		t.Fatalf("writing %d bytes into a workspace with %d left: %v", fits, allowance-held, err)
+		remote := dial(t, srv)
+		fitsAttr, fitsErr := remote.Stat(t.Context(), "fits.bin")
+		overAttr, overErr := remote.Stat(t.Context(), "over.bin")
+		space, spaceErr := remote.Space(t.Context())
+		t.Logf("authority after failed open: fits=%+v (%v), over=%+v (%v), space=%+v (%v)", fitsAttr, fitsErr, overAttr, overErr, space, spaceErr)
+		t.Fatalf("writing %d bytes into a workspace with %d left: %v\nmount output:\n%s\nserver output:\n%s", fits, allowance-held, err, mount.output(), srv.output())
 	}
 	total, used, avail := roomAt(t, mountpoint)
 	if total != allowance || used != int64(held+fits) || avail != int64(allowance-held-fits) {

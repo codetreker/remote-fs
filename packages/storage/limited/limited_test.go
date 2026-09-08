@@ -317,7 +317,7 @@ func TestMeasurementUsesBoundedListingAndStopsBeforeRetainingAHugeDirectory(t *t
 }
 
 func TestDirectoryMeasurementBoundIncludesEntryAndNameRetention(t *testing.T) {
-	backing := newBacking(t)
+	backing := &faulty{BoundedStorage: newBacking(t)}
 	if err := backing.Write(t.Context(), "f", content(7)); err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +350,7 @@ func TestDirectoryMeasurementBoundIncludesEntryAndNameRetention(t *testing.T) {
 }
 
 func TestFrontierMeasurementBoundIncludesActiveAndPendingPaths(t *testing.T) {
-	backing := newBacking(t)
+	backing := &faulty{BoundedStorage: newBacking(t)}
 	if err := backing.Mkdir(t.Context(), "d"); err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ func TestARecountThatCouldNotWalkKeepsTheCountItHad(t *testing.T) {
 }
 
 func TestAFrontierThatExceedsItsAggregateBoundInvalidatesTheRecount(t *testing.T) {
-	backing := newBacking(t)
+	backing := &faulty{BoundedStorage: newBacking(t)}
 	if err := backing.Write(t.Context(), "held", content(7)); err != nil {
 		t.Fatal(err)
 	}

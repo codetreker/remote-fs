@@ -106,12 +106,13 @@ func OpenLocking(ctx context.Context, config LockingConfig) (*LockingStore, erro
 	return opened, nil
 }
 
-func prepareExistingLeaseNamespace(
-	ctx context.Context, db *sql.DB, namespace, storeID string, window Window,
-	maxIntegrityRecords, maxIntegrityBytes int64,
-) (int64, int64, error) {
-	id, root, _, err := prepareConfigured(ctx, db, namespace, storeID, window,
-		maxIntegrityRecords, maxIntegrityBytes, &durableOpen{mode: RequireExistingNamespace})
+func prepareOwnedLeaseNamespace(ctx context.Context, db *sql.DB, namespace, storeID string, window Window, maxRecords, maxBytes int64) (int64, int64, error) {
+	id, root, _, err := prepareConfigured(ctx, db, namespace, storeID, window, maxRecords, maxBytes, &durableOpen{mode: CreateNamespaceIfMissing, reapDetached: true})
+	return id, root, err
+}
+
+func prepareExistingOwnedLeaseNamespace(ctx context.Context, db *sql.DB, namespace, storeID string, window Window, maxRecords, maxBytes int64) (int64, int64, error) {
+	id, root, _, err := prepareConfigured(ctx, db, namespace, storeID, window, maxRecords, maxBytes, &durableOpen{mode: RequireExistingNamespace, reapDetached: true})
 	return id, root, err
 }
 

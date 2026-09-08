@@ -8,7 +8,7 @@
 
 **server** —— 命名空间与文件占有的权威持有者。它将原生支持发布检查的 **storage** 与对应锁服务配对，经 HTTP 暴露出去。命名空间的事实、有效授权和修改顺序以这里为准。
 
-**client** —— 命名空间的使用者。它通过 remote storage 访问数据，通过显式锁控制取得与核对授权；client 侧还负责把命名空间呈现为本地目录。普通文件打开不自动执行占有策略。
+**client** —— 命名空间的使用者。它通过 remote storage 的路径接口与保留文件接口访问数据，通过标准 advisory 协调参与者，并通过显式 S/X 控制取得与核对强权限；client 侧还负责把命名空间呈现为本地目录。普通文件打开不自动执行占有策略。
 
 一个 server 面对多个 client（R-CON-1）。client 之间不直接通信。
 
@@ -20,13 +20,16 @@ flowchart LR
         App[普通文件操作] --> Fuse[挂载呈现层]
         Fuse --> Replica[本地元数据副本]
         Replica --> Remote[remote storage]
-        SDK[显式锁控制]
+        SDK[显式 S/X 控制]
+        Fuse -. 文件引用与 advisory .-> Replica
     end
     subgraph server[server]
         HTTP[HTTP v3]
         subgraph Pair[同一授权方的 namespace 与锁服务]
             Namespace[enforcing namespace] --> Backend[原生 backend]
-            Authority[文件占有与动作历史]
+            Authority[强 S/X 与动作历史]
+            Files[保留对象与 advisory]
+            Namespace --> Files
             Backend -. 最终转换检查 .-> Authority
         end
         HTTP --> Namespace
@@ -44,22 +47,22 @@ flowchart LR
 
 ## 三、同一个接口，两个模块
 
-client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storage.Storage` 基础接口**，并提供有界结果扩展 `storage.BoundedStorage`。锁控制与 mutation scope 是另外的成对能力。
+client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storage.Storage` 基础接口**，并提供有界结果扩展 `storage.BoundedStorage`。`FileStorage` 提供保留文件与 advisory 能力；强 S/X 控制与 mutation scope 是另外的成对能力。
 
-它们**不是同一个模块**，也不在同一个角色里：server 侧的那个真正持有数据；client 侧的那个不持有任何数据，它把每次调用翻译成一次 HTTP 请求。
+它们**不是同一个模块**，也不在同一个角色里：server 侧的那个真正持有数据；client 侧的那个不保存权威内容，它把调用翻译为 HTTP 交换，并保存完成核对所需的有限能力与动作状态。
 
 接口相同带来两个直接后果，都不需要额外设计：
 
-- 挂载呈现层只认这个接口，因此**可以直接挂载一份本地 storage，完全不经过网络**。挂载点于是能与一个普通目录逐操作对拍（见 [`../testing.md`](../testing.md)）。
+- 挂载呈现层要求其中的 `FileStorage` 能力，因此**可以直接挂载一份具有保留文件能力的本地 storage，完全不经过网络**。挂载点于是能与一个普通目录逐操作对拍（见 [`../testing.md`](../testing.md)）。
 - HTTP 服务端要求 namespace 与锁服务属于同一授权方。代理必须共同转发原有控制身份、动作与 scope，不能在一份不透明的远端 `Write` 外另建本地授权方。
 
 ## 四、跨角色契约
 
 基础 storage 描述命名空间操作，锁控制描述跨请求的占有与核对，HTTP 同时承载它们和复制。各自的义务不能由另一层猜测补齐。
 
-**FUSE 到挂载呈现层为止。** 系统里只有这一个组件说 FUSE 协议。它之下的 storage 接口是一份**按路径寻址的命名空间 API**，使用者是挂载呈现层与直接调用这份 API 的程序（R-INT-5），两者拿到的是同一份接口。内核要而命名空间没有的东西 —— 打开的文件、挂载的生命周期，以及内核用来认一个节点的那个编号 —— 由挂载呈现层自己建立并持有，契约因此不必带上内核的形状。
+**FUSE 到挂载呈现层为止。** 底层提供独立于内核的两组接口：按路径寻址的基础 namespace，以及 `FileStorage` 的会话、对象引用、身份属性与 advisory 操作。挂载层只保存内核编号和 owner 的映射；对象在 rename、unlink 或覆盖后的存活由服务端保留引用保证，不由旧路径重建。
 
-**节点身份是例外，它在契约里**（R-FS-5）。属性带一个 `ID`，说的是「这个名字后面是哪个节点」，与它此刻叫什么无关。挂载呈现层分不出这件事就会把两个活着的节点报成一个：一个描述符会读到别人的字节，而 mmap 了它的程序拿到 SIGBUS。而挂载点只直接观测到自己执行的操作，别的客户端做的改名不经过它的任何一条路径，所以这个答案只能由命名空间给。
+**节点身份在契约里**（R-FS-5）。属性带一个 `ID`，说的是「这个名字后面是哪个节点」，与它此刻叫什么无关。挂载呈现层分不出这件事就会把两个活着的节点报成一个：一个描述符会读到别人的字节，而 mmap 了它的程序拿到 SIGBUS。而挂载点只直接观测到自己执行的操作，别的客户端做的改名不经过它的任何一条路径，所以这个答案只能由命名空间给。
 
 **storage 接口**：一份命名空间的存取。命名空间以**相对于根的斜杠分隔路径**寻址，根是空字符串。路径按词法清洗：重复的斜杠、末尾的斜杠、`.` 与 `..` 段都被归并，因此根的各种写法（`""`、`.`、`./`、`a/..`）指的是同一个节点。十一个基础操作各自接受一个 `context.Context`，一次调用完成一次操作；文件句柄与显式占有控制不混入这组词汇：
 
@@ -106,9 +109,11 @@ client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storag
 
 这些义务的可执行形式是 `packages/storage/storagetest`：`Run` 验证一般 namespace 契约，`RunBounded` 验证可发布 server backend 的结果预算与取消义务（R-INT-3、R-INT-6）。
 
-**锁控制接口**：显式创建 Session / Owner，解析现有普通文件，取得、续期、解除与核对 S/X 授予。修改只使用调用方给出的有界不可变 proof 集合，普通读取不声称 grant 有效。所有修改，包括匿名调用，都在原生最终转换处遵守占有顺序；重启通过持久最大时长证据与恢复屏障保留已确认保护。身份、动作结果、当前 grant 状态与内容版本分别定义，完整契约见 [文件锁设计](server/file-locks.md)。
+**保留文件接口**：`FileStorage.NewFileSession` 建立有限会话，`OpenFile` 按路径打开，`OpenNode` 按身份打开；`File` 提供当前属性、区间读取、同步补丁、截断、Sync 和 advisory 控制。每次读取返回同一对象状态的属性与字节，写入在对应调用上确认。失去名字的对象仍存活并收费，直到引用退役、操作排空和最后释放完成。普通重叠写入按实际提交顺序生效，完整契约见[打开的文件](server/file-handles.md)。
 
-**HTTP 接口**：跨角色的实际边界。v3 转发基础 storage、显式锁控制及复制的订阅、续订、快照，并必须满足：
+**强 S/X 控制接口**：显式创建 Session / Owner，解析现有普通文件，取得、续期、解除与核对 S/X 授予。修改只使用调用方给出的有界不可变 proof 集合，普通读取不声称 grant 有效。所有修改，包括匿名调用，都在原生最终转换处遵守占有顺序；重启通过持久最大时长证据与恢复屏障保留已确认保护。身份、动作结果、当前 grant 状态与内容版本分别定义，完整契约见 [文件锁设计](server/file-locks.md)。
+
+**HTTP 接口**：跨角色的实际边界。v3 转发基础 storage、保留文件、advisory 与显式 S/X 控制及复制的订阅、续订、快照，并必须满足：
 
 | 义务 | 违反的后果 |
 |---|---|
@@ -129,9 +134,9 @@ client 侧的 remote storage 实现 storage 接口，凡是不满足上述任何
 
 ### 元数据有副本，内容没有
 
-**内核查名字、问属性、列目录仍到达 storage**：目录项、属性与负项超时都是 0，这些查询在 client 侧由元数据副本通过 SQLite 答复。走遍一棵已经复制下来的树因此不产生 HTTP 请求。文件页缓存独立于这三个超时，仍能直接答复读请求；它与独立 handle 内容的冲突见 [client 设计](client/architecture.md#二元数据查询来自本地副本)。
+**内核查名字、列目录仍到达 storage**：目录项、属性与负项超时都是 0，路径查询由 client 的 SQLite 副本答复。已经取得的 fd 与节点身份属性直接访问权威 FileSession。普通文件使用 direct I/O，每次读取返回服务端保留对象的当前状态，不通过私有全文件副本或内核文件页缓存作答。
 
-副本只有树 —— 名字、类型、属性、大小。文件内容在打开时从服务端取回，此后的读取使用 handle 缓冲区或内核页缓存。
+副本只有名字、类型、属性和大小，不复制文件内容。打开只取得对象引用，字节在每次 ReadAt 时读取。
 
 server 每个 workspace 记一条有序的变更日志，位置与树的改动在同一个事务里分配；client 先订阅、再取一次一致性快照，此后由流喂着。副本在观测到流断开时整份作废，到达 replicated storage 的操作以 EIO 失败，没有过期时间或基于间隔的刷新。本地副本在读写阶段之间交接，持续查询不能让已登记的更新一直等待读者空闲；快照重建过早恢复作答的缺口仍会使健康连接上的查询返回旧元数据，见 [client 设计](client/architecture.md#二元数据查询来自本地副本)。
 
@@ -139,37 +144,23 @@ server 每个 workspace 记一条有序的变更日志，位置与树的改动�
 
 **绕过 server 的改动不产生变更事件。** 保留的本地持久对象存储不支持旁路修改其私有格式；无法验证的对象或组合状态以 I/O 错误暴露。第三方 backend 同样须明确自己的外部写入边界，不能让旁路改动冒充已记录的 namespace mutation。
 
-本地另外持有的两样东西不是命名空间的副本：
-
-- **正在被打开的文件的内容**，随描述符出现，随描述符消失。
-- **命名空间最后一次报出的剩余空间**，一个数字，正常刷新窗口为一秒；容量探测被分类为 `EINTR` 时不推进窗口，并在改变缓冲区前结束这次写入。这个数字按设计会过期，放过去的写入仍然要由提交来裁决。它的作用是提前把容量拒绝送到 `write(2)` 或 `ftruncate(2)`；命名空间自己在提交处的拒绝才是权威。刷新与 advisory failure 的完整规则见 [client 设计](client/architecture.md#配额在造成它的那次调用处就拒)。
-
-三样都见 `client/architecture.md`；这个决定的全部理由与被否的备选见[元数据复制](../../.agents/notes/implemented/architecture/2026-08-27-metadata-replication.md)。
+FileSession、对象引用、advisory owner 与有限控制历史属于挂载生命周期，不是命名空间副本。容量由 Statfs 单独查询；同步 WriteAt 与 Truncate 在服务端发布时取得配额的权威结果。复制与内容操作各自保持资源上限，边界见[client 设计](client/architecture.md)。
 
 代价：提供 change log 的命名空间在副本建好之前不可用。集成方未提供日志时，复制操作以 `ENOSYS` 说明没有副本，每次 metadata 查询仍是一次远端请求；随附的两种服务端形态都提供日志。
 
-### 读
+### 读写
 
 ```
-程序 open  ──▶ 挂载层 ──▶ remote storage ──HTTP──▶ server ──▶ storage
-                          先问大小，再取回整个文件，放进这个描述符的缓冲区
-程序 read  ──▶ 挂载层从缓冲区切片，不产生请求
+程序 open     ──▶ 挂载层 ──▶ FileSession.OpenNode，保留对象
+程序 read     ──▶ File.ReadAt ──HTTP──▶ 同一对象状态的属性与字节
+程序 write    ──▶ File.WriteAt ─HTTP──▶ 当前状态上的区间修改，确认后成功
+程序 truncate ──▶ File.Truncate ─────▶ 原子长度修改，确认后成功
+程序 close    ──▶ 清理 owner 与文件引用
 ```
 
-storage 的读以整文件为单位，内核的读以 128 KiB 为单位；缓冲区是两者的对接处，没有它，读一个文件的代价随文件大小平方增长。
+已有 fd 可读取同一对象的后续覆写、增长和缩短，rename/unlink 后仍指向原对象。同一次成功读取不混合状态。一次写入只修改它的区间，普通重叠写入以实际顺序组合；显式内容版本的比较与冲突报告仍独立。
 
-### 写
-
-```
-程序 write ──▶ 挂载层打补丁到缓冲区，不产生请求
-程序 close ──▶ remote storage 提交整个文件 ──HTTP──▶ server ──▶ storage
-                ├── 成功 ──▶ 其它 client 的下一次读就能看到
-                └── 失败 ──▶ 错误返回给 close
-```
-
-提交是整份内容的一次替换，替换由 storage 保证原子，因此其它 client 读到的要么是旧内容的全部、要么是新内容的全部（R-CON-3）。未提交的内容只有写它的那个描述符看得到。
-
-命名空间若被置于配额之下，超出配额的提交以 `EDQUOT` 失败 —— 说的是「配额已用尽」，不是「磁盘已满」。挂载层还会拿这次写入要多占的字节数去比对它最后问到的剩余空间，在 `write(2)` 处先拒绝一次：大量程序从不查看 `close(2)` 的返回值，只在提交处拒绝，等于让那些字节无声地消失（R-WS-5）。
+objectstore 仍使用不可变完整对象，区间补丁通过有界物化与原生 revision CAS 形成下一对象。Reserve、Put、最终发布与回收保持各自的结果边界。超出配额的增长以 `EDQUOT` 失败，错误返回对应 write 或 truncate；关闭不承担尚未提交内容的失败出口。
 
 ### 挂载与卸载
 
@@ -179,7 +170,7 @@ remote-fs ──▶ 建立 remote storage，先访问一次根，确认 server �
           ──▶ 收到 SIGINT／SIGTERM ──▶ 拆除挂载
 ```
 
-挂载与卸载是频繁的日常操作（R-WS-2）。冷挂载时本地**无任何既有状态**（R-WS-3）——但它要建立一份：一个私有目录、一个 SQLite 副本、一条订阅，以及一份灌满整棵树的快照，**灌完之前挂载点不可用**。R-WS-4（冷挂载后必须迅速可用）因此被知情推后，理由与代价见[元数据复制](../../.agents/notes/implemented/architecture/2026-08-27-metadata-replication.md)。卸载时那份副本连同它的目录一起删掉：它不跨挂载存活，那不是需求（见 `docs/spec/requirements.md` 的「未列入需求的事项」）。
+挂载与卸载是频繁的日常操作（R-WS-2）。冷挂载时本地**无任何既有状态**（R-WS-3）——但它要建立一份：一个私有目录、一个 SQLite 副本、一条订阅，以及一份灌满整棵树的快照，**灌完之前挂载点不可用**。R-WS-4（冷挂载后必须迅速可用）因此被知情推后，理由与代价见[元数据复制](../../.agents/notes/implemented/architecture/2026-08-27-metadata-replication.md)。内核退出后先排空 FileSession，再关闭副本并删除其目录；失败保留清理错误与未释放资源。失败的 Unmount 不停止文件会话续期。
 
 ## 六、部署形态
 
@@ -203,6 +194,7 @@ client 侧还有第三种用法：只使用 remote storage，不挂载（R-INT-5
 - `server/architecture.md` —— HTTP 服务端、请求与响应的形状、错误如何离开 server
 - `server/local-disk-object-store.md` —— 本地持久 storage 的格式、打开与恢复、容量和维护
 - `server/file-locks.md` —— 显式占有、有限授予、最终发布顺序、重启保护与 HTTP 控制协议
+- `server/file-handles.md` —— 保留对象、同步区间修改、advisory owner 与文件会话协议
 - `client/architecture.md` —— remote storage、挂载呈现层、打开的文件、节点身份、生命周期
 
 第二层只写角色内部，不重讲系统全貌，跨角色只通过本文定义的接口与契约来引用。
@@ -217,7 +209,8 @@ client 侧还有第三种用法：只使用 remote storage，不挂载（R-INT-5
 go.mod
 
 packages/                    可被外部与自身 import
-  locking/                   文件权限状态、有限历史与原生发布协调
+  locking/                   强 S/X 权限状态、有限历史与原生发布协调
+  advisory/                  标准 flock/POSIX owner、范围、等待与有限历史
   storage/                   接口定义、实现者义务与 errno 词汇（两个角色共用）
     locked/                  enforcing backend 与其授权方的配对，提供不可变 scope
     lockcontract/            文件保护义务的共享验收
@@ -228,7 +221,7 @@ packages/                    可被外部与自身 import
       objectstoretest/       对象接口义务的可执行形式
     limited/                 把任意一份 storage 置于字节配额之下
     storagetest/             义务的可执行形式：每个实现都跑这一套用例
-  metastore/                 名字的树、节点的属性、路径到对象键的指向
+  metastore/                 名字树、保留节点、内容 revision 与对象键的指向
     sqlite/                  SQLite 实现
     metastoretest/           metastore 义务的可执行形式
   transport/                 把 storage 契约搬到线上，一种传输一个包
@@ -247,6 +240,7 @@ docs/
 | 包 | 归属 |
 |---|---|
 | `storage` | 两个角色共用 |
+| `advisory` | server 侧，按 namespace 共享标准锁状态 |
 | `storage/storagetest` | 测试专用：namespace 与 bounded-server 契约的可执行形式 |
 | `storage/localstore` | server 侧，持有本地对象与绑定的 SQLite metastore |
 | `storage/objectstore`、`storage/objectstore/azblob`、`storage/objectstore/localdisk` | server 侧 |

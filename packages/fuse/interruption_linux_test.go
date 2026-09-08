@@ -27,7 +27,6 @@ import (
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
-	"github.com/codetreker/remote-fs/packages/storage/locked"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
@@ -42,7 +41,7 @@ type interruptedStat struct {
 }
 
 type observedStatStorage struct {
-	storage.BoundedStorage
+	storage.FileStorage
 	request *interruptedStat
 }
 
@@ -54,7 +53,7 @@ func (s *observedStatStorage) Stat(ctx context.Context, name string) (storage.At
 		}
 		s.request.mu.Unlock()
 	}
-	return s.BoundedStorage.Stat(ctx, name)
+	return s.FileStorage.Stat(ctx, name)
 }
 
 // A thread-directed signal reaches the thread blocked in the FUSE syscall. The
@@ -76,7 +75,7 @@ func TestSignalInterruptsARequestWithoutBreakingTheMount(t *testing.T) {
 			if err := backing.Write(t.Context(), "file", []byte("still readable")); err != nil {
 				t.Fatal(err)
 			}
-			handler, err := httprest.NewHandler(struct{ locked.Backend }{backing}, nil)
+			handler, err := httprest.NewHandler(backing, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

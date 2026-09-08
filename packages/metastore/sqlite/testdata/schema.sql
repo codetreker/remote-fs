@@ -130,7 +130,7 @@ CREATE TABLE nodes (
 	mtime_sec  INTEGER NOT NULL,
 	mtime_nsec INTEGER NOT NULL,
 	content    TEXT REFERENCES objects(key)
-);
+	, detached INTEGER NOT NULL DEFAULT 0, content_revision INTEGER NOT NULL DEFAULT 1);
 
 CREATE TABLE objects (
 	key          TEXT PRIMARY KEY,

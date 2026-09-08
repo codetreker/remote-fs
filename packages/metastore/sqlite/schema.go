@@ -17,7 +17,8 @@ import (
 // The migrations that build this package's schema. 0001_tree.sql is the tree as version 1 had
 // it; 0002_replication.sql rekeys the entry table and adds the change log;
 // 0003_durable_state.sql adds the backing-store binding and durable identity witnesses;
-// 0004_lease_recovery.sql stores prepared and accepted lease-duration evidence.
+// 0004_lease_recovery.sql stores prepared and accepted lease-duration evidence;
+// 0005_retained_files.sql records unnamed retained files and their content revisions.
 //
 // packages/sqliteschema documents what a numbered set of files buys and what rule they are kept
 // under: a file that has landed is never edited, and a schema change is a new file.
@@ -44,6 +45,8 @@ const (
 // Schema version 3 is the first version written together with exact reservation sizes and an
 // unresolved state that does not authorize deletion when Put ownership is unknown.
 const firstOwnershipAwareSchemaVersion = 3
+
+const firstRetainedFileSchemaVersion = 5
 
 // prepare brings the database to the layout this build writes, and returns the id of the
 // named namespace and of its root directory, creating both when the namespace is new.
@@ -93,13 +96,18 @@ func prepareConfigured(
 			return 0, 0, DurableState{}, err
 		}
 	}
-	if durable != nil && durable.startup.Accepted.DatabaseID == "" &&
+	if durable != nil && durable.witness != nil && durable.startup.Accepted.DatabaseID == "" &&
 		durable.mode == CreateNamespaceIfMissing && recorded && version > 0 {
 		return 0, 0, DurableState{}, fmt.Errorf(
 			"creating an unwitnessed namespace requires a pristine database, found schema version %d: %w",
 			version, syscall.EIO)
 	}
 	legacy := recorded && version > 0 && version < firstOwnershipAwareSchemaVersion
+	if recorded && version >= firstOwnershipAwareSchemaVersion && version < firstRetainedFileSchemaVersion {
+		if err := validateIntegrity(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes, version); err != nil {
+			return 0, 0, DurableState{}, err
+		}
+	}
 	if legacy {
 		if err := validateIntegrityWork(ctx, tx, nil, maxIntegrityRecords); err != nil {
 			return 0, 0, DurableState{}, err
@@ -117,7 +125,7 @@ func prepareConfigured(
 			if err := validateVersionOneNodeRelationships(ctx, tx); err != nil {
 				return 0, 0, DurableState{}, err
 			}
-		} else if err := validateNodeRelationships(ctx, tx, nil); err != nil {
+		} else if err := validateNodeRelationshipsVersion(ctx, tx, nil, version); err != nil {
 			return 0, 0, DurableState{}, err
 		}
 		if err := validateUsedAccounting(ctx, tx, nil); err != nil {
@@ -177,6 +185,14 @@ func prepareConfigured(
 	}
 	if err := validateNamespaceIntegrity(ctx, tx, id, maxIntegrityRecords, maxIntegrityBytes); err != nil {
 		return 0, 0, DurableState{}, err
+	}
+	if durable != nil && durable.reapDetached {
+		if err := validateIntegrity(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes, schema.Version()); err != nil {
+			return 0, 0, DurableState{}, err
+		}
+		if err := reapDetachedFiles(ctx, tx); err != nil {
+			return 0, 0, DurableState{}, err
+		}
 	}
 
 	// A namespace that has been quiet since the last process was here gets the trim that no

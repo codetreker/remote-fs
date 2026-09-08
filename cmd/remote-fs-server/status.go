@@ -47,7 +47,7 @@ func formatLockStatus(status locking.Status) string {
 	case status.Recovering:
 		state = fmt.Sprintf("recovering for %v", time.Duration(status.RecoveryRemainingMillis)*time.Millisecond)
 	}
-	return fmt.Sprintf("file locks %s; %d sessions, %d owners, %d resources, %d actions, %d grants, %d queued",
+	return fmt.Sprintf("strong file locks %s; %d sessions, %d owners, %d resources, %d actions, %d grants, %d queued",
 		state, status.Sessions, status.Owners, status.Resources, status.Actions, status.Grants, status.Queued)
 }
 

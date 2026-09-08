@@ -74,7 +74,7 @@ Renew 使用 `max(原 deadline, 转换时刻 + 请求 TTL)`，不缩短已确认
 
 | 修改 | 实际受影响的普通文件 |
 |---|---|
-| `Write`、`SetAttr` | 现有目标文件 |
+| `Write`、`SetAttr`、File `WriteAt` / `Truncate` / `SetAttr`、带截断的 Open | 实际目标文件；保留引用按节点身份解析 |
 | `Remove` | 被删除的文件 |
 | `Rename` | 源文件，以及目的地被替换的现有文件 |
 | 目录创建、删除或改名 | 不能借此绕过实际受影响普通文件的保护；不把整个子树当作文件资源 |
@@ -95,11 +95,11 @@ Renew 使用 `max(原 deadline, 转换时刻 + 请求 TTL)`，不缩短已确认
 
 SQLite 的新视图捕获包括开始只读事务、钉住 snapshot，以及在其中取得 node / object key，之后释放观察准入再读取大块对象或产出快照页。内容读取、调用方计费回调与编码在捕获之后执行。其它 backend 同样须区分固定视图与随后读取；一个可变化的目录 FD 不构成不可变列表。异步副本与内核缓存继续遵守各自的已有契约，不因锁控制而获得新的线性一致性保证。
 
-该许可不是一段新 lease，不在上传之前取得，也不把任意长的准备工作算作尚未到期的授权。内容版本前置条件仍独立于权限检查。
+该许可不是一段新 lease，不在上传之前取得，也不把任意长的准备工作算作尚未到期的授权。保留文件还检查 FileSession 与引用是否有效；内容 revision CAS、显式内容版本前置条件仍各自独立于权限检查。
 
 ## Backend 资源身份
 
-SQLite-backed namespace 使用 workspace 内的节点身份作为原生资源键。覆写内容保留节点身份，改名移动该节点，删除后同名创建得到另一个节点。对外 ResourceID 同时区分授权方，不与内容修订、grant generation 或日志位置互换。
+SQLite-backed namespace 使用 workspace 内的节点身份作为原生资源键。覆写内容保留节点身份，改名移动该节点，删除后同名创建得到另一个节点。经授权的 unlink 或覆盖令旧的命名资源退休为 `TargetGone`；已经打开的 File 与标准 advisory 随 detached 对象保留，强 S/X 不转移到同名新对象。对外 ResourceID 同时区分授权方，不与内容修订、grant generation 或日志位置互换。
 
 授权方资源映射受上限约束。有效 ResourceRef、排队动作、活跃 grant 或发布需要目标时，backend 保留相应的原生引用；终态历史可以只保留退休 ResourceID。退休身份不重新分配给别的文件。第三方 backend 须保持这一映射与实际文件一致，不能直接使用可能被复用的宿主 inode 号充当稳定身份。绕开本系统直接修改其私有存储仍是规格中的非目标。
 
@@ -191,6 +191,8 @@ SDK 以产生这份 GrantStatus 的请求首次发送时刻加 `remainingMillis`
 控制端点虽统一使用 POST，Resolve、QueryAction、QueryGrant 与 Status 仍是只读操作，已发出的请求可以接受取消。其余操作进入 HTTP dispatch 后，响应丢失、截断或取消只能说明结果未知；原请求身份与错误原因保留，调用方必须核对或终止该意图。dispatch 前接受的取消遵守普通 `EINTR` 分类。SDK 不在失败后制造新的 Session、Owner 或 Request 重做管理动作。
 
 ## 集成与生命周期
+
+普通 `flock` 与传统 POSIX `fcntl` 是[保留文件接口](file-handles.md)的 advisory 操作，不创建强 S/X Owner 或 grant。它们允许未参与加锁者执行普通修改，阻塞等待按 FileSession 的健康续期维持，不采用这里 Acquire 的有限 Wait。普通 Open 不自动选择任何加锁策略。
 
 独立 server 的 Azure Blob 与本地持久对象存储两种形态都建立配对的 enforcing namespace 与锁服务，向 HTTP v3 同时发布数据操作、锁管理操作和显式 mutation scope。协议不通过忽略未知 proof、旧授权方身份或非法 scope 保持兼容；无法识别的结果保持错误。
 

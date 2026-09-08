@@ -22,17 +22,8 @@ import (
 // is every piece of this system that stands between the write and the read — including the
 // copy of the metadata each mountpoint keeps, and the stream of changes that feeds it.
 //
-// The second in R-CON-1 is measured from close() returning on A to a successful read on
-// B. That is the interval a person waits: the write is finished when close() returns, and
-// the read is answered when the bytes come back. The scope note never said where the
-// second is measured from, so this is where this suite puts it.
-//
-// B's answer becomes true when B's own event arrives, which is a moment after the server
-// recorded the change rather than at the instant A's close() returned, so the read is
-// re-attempted until it succeeds — with no pause between attempts and a hard failure at the
-// second R-CON-1 allows. What that does not prove is R-CON-2: nothing about a measured delay
-// says an interval did not elapse. The test that proves it is the one that counts requests,
-// because a poll is a request and that count is zero.
+// Visibility starts when Write returns. The writer remains open while another mount
+// reads the completed change, so neither Close nor Fsync can trigger its publication.
 func TestWhatOneMountpointWritesAnotherReads(t *testing.T) {
 	s := serveNamespace(t)
 	a, b := mountpointOn(t, s), mountpointOn(t, s)
@@ -42,11 +33,13 @@ func TestWhatOneMountpointWritesAnotherReads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating a.txt through A: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := file.Close(); err != nil {
+			t.Errorf("closing writer through A: %v", err)
+		}
+	})
 	if _, err := file.Write(content); err != nil {
 		t.Fatalf("writing a.txt through A: %v", err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatalf("closing a.txt through A: %v", err)
 	}
 	written := time.Now()
 
@@ -61,16 +54,19 @@ func TestWhatOneMountpointWritesAnotherReads(t *testing.T) {
 			break
 		}
 		if !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("reading a.txt through B %v after close() returned on A: %v", visible, err)
+			t.Fatalf("reading a.txt through B %v after Write returned on A: %v", visible, err)
 		}
 		if visible >= time.Second {
-			t.Fatalf("B could not read a.txt %v after close() returned on A; R-CON-1 allows one second", visible)
+			t.Fatalf("B could not read a.txt %v after Write returned on A; R-CON-1 allows one second", visible)
 		}
 	}
 	if !bytes.Equal(got, content) {
 		t.Fatalf("B read %q, A wrote %q", got, content)
 	}
-	t.Logf("close() returned on A → contents read on B: %v", visible)
+	if visible >= time.Second {
+		t.Fatalf("B read the completed write after %v; R-CON-1 allows one second", visible)
+	}
+	t.Logf("Write returned on A → contents read on B: %v", visible)
 }
 
 // Reading the authoritative storage bypasses the mount and its metadata replica.

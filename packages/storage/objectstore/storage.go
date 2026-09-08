@@ -58,6 +58,11 @@ type Storage struct {
 	closeMu            sync.Mutex
 	closeDone          chan struct{}
 	closeErr           error
+	fileMu             sync.Mutex
+	fileSessions       map[*fileSession]struct{}
+	filesClosing       bool
+	fileCloseMu        sync.Mutex
+	fileCloseRetry     bool
 }
 
 var _ storage.Storage = (*Storage)(nil)
@@ -162,20 +167,43 @@ func newStorage(objects Objects, meta metastore.Store, interval time.Duration, b
 // Close stops storage-owned maintenance, waits for every sweep already in progress, and
 // releases both durable halves. The metastore closes first while object-store ownership is
 // still held; both close failures are returned. Concurrent callers receive the same result.
+// A retained-file cleanup refusal preserves both halves and can be retried.
 func (s *Storage) Close() error {
 	s.closeMu.Lock()
 	if s.closeDone != nil {
 		done := s.closeDone
-		s.closeMu.Unlock()
-		<-done
-		return s.closeErr
+		select {
+		case <-done:
+			if !s.fileCloseRetry {
+				err := s.closeErr
+				s.closeMu.Unlock()
+				return err
+			}
+		default:
+			s.closeMu.Unlock()
+			<-done
+			s.closeMu.Lock()
+			err := s.closeErr
+			s.closeMu.Unlock()
+			return err
+		}
 	}
+	s.fileCloseRetry = false
 	s.closeDone = make(chan struct{})
 	done := s.closeDone
 	s.closeMu.Unlock()
 
-	s.maintenanceStop()
 	s.stopCleanup()
+	if err := s.CloseFileSessions(); err != nil {
+		s.closeMu.Lock()
+		s.closeErr = err
+		s.fileCloseRetry = true
+		close(done)
+		s.closeMu.Unlock()
+		return err
+	}
+
+	s.maintenanceStop()
 	<-s.maintenanceDone
 	// Every public operation holds this gate across all metastore and object-store steps.
 	// Marking the storage closed above refuses new entrants; the write lock waits for those

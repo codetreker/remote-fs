@@ -27,9 +27,12 @@
 //
 // # What is answered from where
 //
-// Stat and List are answered here. Everything else — the bytes of a file, every change to
+// Path-based Stat and List are answered here. Everything else — the bytes of a file, every change to
 // the namespace, and how much room it has — goes to the server, because none of it is
 // metadata this copy holds and none of it is a question a copy may answer.
+// Retained file and node-identity queries also go to the authority: detached objects have
+// no entry in this tree. Their mutations confirm the authority's returned log position,
+// including an unchanged position when the object has no name.
 // Explicit lease control also goes directly to the authority. It remains available when
 // the metadata stream fails, so a caller can reconcile or release an outstanding grant.
 //
@@ -109,6 +112,9 @@ type Storage struct {
 	activeConfirmations int
 	confirmationWaiters int
 	closing             bool
+	closeMu             sync.Mutex
+	fileSessions        map[*fileSession]struct{}
+	fileSessionOpening  int
 }
 
 var _ storage.Storage = (*Storage)(nil)
@@ -149,6 +155,9 @@ func NewWithOptions(ctx context.Context, local *sqlite.Replica, remote *httprest
 	if err := options.Check(); err != nil {
 		return nil, err
 	}
+	if options.MaxFileSessions == 0 {
+		options.MaxFileSessions = DefaultMaxFileSessions
+	}
 	lifetime, stop := context.WithCancel(context.Background())
 	s := &Storage{
 		remote:               remote,
@@ -171,8 +180,11 @@ func NewWithOptions(ctx context.Context, local *sqlite.Replica, remote *httprest
 	return s, nil
 }
 
-// Close stops following the namespace and releases the copy.
+// Close stops following the namespace, closes owned file sessions, and releases
+// the copy. The remote client's lifetime remains owned by its caller.
 func (s *Storage) Close() error {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
 	s.mu.Lock()
 	s.closing = true
 	s.wake()
@@ -182,14 +194,14 @@ func (s *Storage) Close() error {
 	<-s.stopped
 
 	s.mu.Lock()
-	for s.activeConfirmations != 0 || s.confirmationWaiters != 0 {
+	for s.activeConfirmations != 0 || s.confirmationWaiters != 0 || s.fileSessionOpening != 0 {
 		notify := s.confirmationCapacity
 		s.mu.Unlock()
 		<-notify
 		s.mu.Lock()
 	}
 	s.mu.Unlock()
-	return s.local.Close()
+	return errors.Join(s.closeFileSessions(), s.local.Close())
 }
 
 // Stat reports the node at path from the copy.

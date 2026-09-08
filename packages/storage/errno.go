@@ -27,7 +27,9 @@ import (
 var errnoNames = map[syscall.Errno]string{
 	syscall.EACCES:       "EACCES",
 	syscall.EAGAIN:       "EAGAIN",
+	syscall.EBADF:        "EBADF",
 	syscall.EBUSY:        "EBUSY",
+	syscall.EDEADLK:      "EDEADLK",
 	syscall.EDQUOT:       "EDQUOT",
 	syscall.EEXIST:       "EEXIST",
 	syscall.EFBIG:        "EFBIG",
@@ -42,6 +44,7 @@ var errnoNames = map[syscall.Errno]string{
 	syscall.ENFILE:       "ENFILE",
 	syscall.ENODEV:       "ENODEV",
 	syscall.ENOENT:       "ENOENT",
+	syscall.ENOLCK:       "ENOLCK",
 	syscall.ENOMEM:       "ENOMEM",
 	syscall.ENOSPC:       "ENOSPC",
 	syscall.ENOSYS:       "ENOSYS",

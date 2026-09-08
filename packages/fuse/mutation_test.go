@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	fsbridge "github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
@@ -18,7 +19,7 @@ import (
 )
 
 type mutationStorage struct {
-	storage.Storage
+	storage.FileStorage
 	before func(context.Context, string) error
 	after  func(string)
 }
@@ -37,57 +38,152 @@ func (s *mutationStorage) finish(op string, err error) error {
 	return err
 }
 
-func (s *mutationStorage) Create(ctx context.Context, path string) error {
-	if err := s.enter(ctx, "create"); err != nil {
-		return err
-	}
-	return s.finish("create", s.Storage.Create(ctx, path))
-}
-
 func (s *mutationStorage) Mkdir(ctx context.Context, path string) error {
 	if err := s.enter(ctx, "mkdir"); err != nil {
 		return err
 	}
-	return s.finish("mkdir", s.Storage.Mkdir(ctx, path))
-}
-
-func (s *mutationStorage) Write(ctx context.Context, path string, body []byte) error {
-	if err := s.enter(ctx, "write"); err != nil {
-		return err
-	}
-	return s.finish("write", s.Storage.Write(ctx, path, body))
+	return s.finish("mkdir", s.FileStorage.Mkdir(ctx, path))
 }
 
 func (s *mutationStorage) SetAttr(ctx context.Context, path string, change storage.AttrChange) error {
 	if err := s.enter(ctx, "setattr"); err != nil {
 		return err
 	}
-	return s.finish("setattr", s.Storage.SetAttr(ctx, path, change))
+	return s.finish("setattr", s.FileStorage.SetAttr(ctx, path, change))
 }
 
 func (s *mutationStorage) Stat(ctx context.Context, path string) (storage.Attr, error) {
 	if err := s.enter(ctx, "stat"); err != nil {
 		return storage.Attr{}, err
 	}
-	attr, err := s.Storage.Stat(ctx, path)
+	attr, err := s.FileStorage.Stat(ctx, path)
 	return attr, s.finish("stat", err)
+}
+
+func (s *mutationStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+	session, err := s.FileStorage.NewFileSession(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &mutationSession{FileSession: session, owner: s}, nil
+}
+
+type mutationSession struct {
+	storage.FileSession
+	owner *mutationStorage
+}
+
+func (s *mutationSession) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, error) {
+	if err := s.owner.enter(ctx, "open"); err != nil {
+		return nil, err
+	}
+	file, err := s.FileSession.OpenFile(ctx, path, options)
+	if err := s.owner.finish("open", err); err != nil {
+		return nil, err
+	}
+	return &mutationFile{File: file, owner: s.owner}, nil
+}
+
+func (s *mutationSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
+	if err := s.owner.enter(ctx, "open-node"); err != nil {
+		return nil, err
+	}
+	file, err := s.FileSession.OpenNode(ctx, id, options)
+	if err := s.owner.finish("open-node", err); err != nil {
+		return nil, err
+	}
+	return &mutationFile{File: file, owner: s.owner}, nil
+}
+
+func (s *mutationSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
+	if err := s.owner.enter(ctx, "stat"); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := s.FileSession.StatNode(ctx, id)
+	return attr, s.owner.finish("stat", err)
+}
+
+func (s *mutationSession) SetNodeAttr(ctx context.Context, id uint64, change storage.AttrChange) (storage.Attr, error) {
+	if err := s.owner.enter(ctx, "setattr"); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := s.FileSession.SetNodeAttr(ctx, id, change)
+	return attr, s.owner.finish("setattr", err)
+}
+
+type mutationFile struct {
+	storage.File
+	owner *mutationStorage
+}
+
+func (f *mutationFile) Stat(ctx context.Context) (storage.Attr, error) {
+	if err := f.owner.enter(ctx, "stat"); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := f.File.Stat(ctx)
+	return attr, f.owner.finish("stat", err)
+}
+
+func (f *mutationFile) Truncate(ctx context.Context, size int64) (storage.Attr, error) {
+	if err := f.owner.enter(ctx, "truncate"); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := f.File.Truncate(ctx, size)
+	return attr, f.owner.finish("truncate", err)
+}
+
+func (f *mutationFile) WriteAt(ctx context.Context, offset int64, data []byte) (storage.Attr, error) {
+	if err := f.owner.enter(ctx, "write"); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := f.File.WriteAt(ctx, offset, data)
+	return attr, f.owner.finish("write", err)
+}
+
+func (f *mutationFile) SetAttr(ctx context.Context, change storage.AttrChange) (storage.Attr, error) {
+	if err := f.owner.enter(ctx, "setattr"); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := f.File.SetAttr(ctx, change)
+	return attr, f.owner.finish("setattr", err)
+}
+
+func (f *mutationFile) Close(ctx context.Context) error {
+	if err := f.owner.enter(ctx, "close"); err != nil {
+		return err
+	}
+	return f.owner.finish("close", f.File.Close(ctx))
 }
 
 func mutationTree(t *testing.T) (*node, *node, *mutationStorage) {
 	t.Helper()
 	_, local := memoryfixture.New(t, "mutation", 0, locking.DefaultOptions())
-	if err := local.Create(t.Context(), "f"); err != nil {
-		t.Fatal(err)
-	}
 	if err := local.Write(t.Context(), "f", []byte("contents")); err != nil {
 		t.Fatal(err)
 	}
-	mode := fs.FileMode(0o600)
+	mode := fs.FileMode(0600)
 	if err := local.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}); err != nil {
 		t.Fatal(err)
 	}
-	downstream := &mutationStorage{Storage: local}
-	root := &node{ns: &namespace{storage: downstream, maxFileSize: 1024, flushTimeout: DefaultFlushTimeout}, id: rootIdentity()}
+	downstream := &mutationStorage{FileStorage: local}
+	session, err := downstream.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := session.Close(ctx); err != nil {
+			t.Errorf("close mutation session: %v", err)
+		}
+	})
+	attr, err := local.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns := activeTestNamespace(downstream, 1024)
+	ns.files = session
+	root := &node{ns: ns, id: rootIdentity(attr.ID)}
 	fsbridge.NewNodeFS(root, &fsbridge.Options{})
 	child, errno := root.Lookup(t.Context(), "f", &gofuse.EntryOut{})
 	if errno != 0 {
@@ -99,123 +195,111 @@ func mutationTree(t *testing.T) (*node, *node, *mutationStorage) {
 	return root, child.Operations().(*node), downstream
 }
 
+func mutationHandle(t *testing.T, n *node) *handle {
+	t.Helper()
+	file, err := n.ns.files.OpenNode(t.Context(), n.id.node, storage.FileOpenOptions{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newHandle(n, file, true, true)
+}
+
 func TestCreationCancellationAccountsForCompletedStages(t *testing.T) {
-	for _, directory := range []bool{false, true} {
-		for _, stage := range []string{"creation", "mode", "attributes"} {
-			t.Run(stage+map[bool]string{false: " file", true: " directory"}[directory], func(t *testing.T) {
-				root, _, downstream := mutationTree(t)
-				creation := "create"
-				if directory {
-					creation = "mkdir"
+	for _, test := range []struct {
+		name, failedOp     string
+		directory, changed bool
+	}{
+		{"atomic file open", "open", false, false},
+		{"opened file attributes", "stat", false, true},
+		{"directory creation", "mkdir", true, false},
+		{"directory mode", "setattr", true, true},
+		{"directory attributes", "stat", true, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, _, downstream := mutationTree(t)
+			downstream.before = func(_ context.Context, op string) error {
+				if op == test.failedOp {
+					return context.Canceled
 				}
-				failedOp := map[string]string{"creation": creation, "mode": "setattr", "attributes": "stat"}[stage]
+				return nil
+			}
+			var errno syscall.Errno
+			if test.directory {
+				_, errno = root.Mkdir(t.Context(), "new", 0700, &gofuse.EntryOut{})
+			} else {
+				_, _, _, errno = root.Create(t.Context(), "new", syscall.O_RDWR, 0600, &gofuse.EntryOut{})
+			}
+			want := syscall.EINTR
+			if test.changed {
+				want = syscall.EIO
+			}
+			if errno != want {
+				t.Fatalf("creation returned %v, want %v", errno, want)
+			}
+			attr, err := downstream.FileStorage.Stat(t.Context(), "new")
+			if test.changed && err != nil || !test.changed && !errors.Is(err, syscall.ENOENT) {
+				t.Fatalf("namespace after interrupted creation: %v", err)
+			}
+			if test.changed && !test.directory && attr.Mode.Perm() != 0600 {
+				t.Fatalf("atomic create left mode %v instead of requested 0600", attr.Mode)
+			}
+		})
+	}
+}
+
+func TestSetattrCancellationAccountsForCompletedStages(t *testing.T) {
+	for _, withHandle := range []bool{false, true} {
+		for _, test := range []struct {
+			name, failedOp string
+			valid          uint32
+			want           syscall.Errno
+			truncates      int
+		}{
+			{"truncate refused", "truncate", gofuse.FATTR_SIZE, syscall.EINTR, 0},
+			{"truncate then attributes", "stat", gofuse.FATTR_SIZE, syscall.EIO, 1},
+			{"truncate then mode", "setattr", gofuse.FATTR_SIZE | gofuse.FATTR_MODE, syscall.EIO, 1},
+			{"mode refused", "setattr", gofuse.FATTR_MODE, syscall.EIO, 0},
+			{"mode then attributes", "stat", gofuse.FATTR_MODE, syscall.EIO, 0},
+		} {
+			t.Run(fmt.Sprintf("%s/handle=%v", test.name, withHandle), func(t *testing.T) {
+				_, n, downstream := mutationTree(t)
+				var file fsbridge.FileHandle
+				if withHandle {
+					file = mutationHandle(t, n)
+				}
+				truncates := 0
 				downstream.before = func(_ context.Context, op string) error {
-					if op == failedOp {
+					if op == test.failedOp && (op != "stat" || test.valid&gofuse.FATTR_SIZE == 0 || truncates != 0) {
 						return context.Canceled
 					}
 					return nil
 				}
-				var errno syscall.Errno
-				if directory {
-					_, errno = root.Mkdir(t.Context(), "new", 0o700, &gofuse.EntryOut{})
-				} else {
-					_, _, _, errno = root.Create(t.Context(), "new", 0, 0o600, &gofuse.EntryOut{})
+				downstream.after = func(op string) {
+					if op == "truncate" {
+						truncates++
+					}
 				}
-				want := syscall.EIO
-				if stage == "creation" {
-					want = syscall.EINTR
+				err := n.setattr(t.Context(), file, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+					Valid: test.valid, Size: 3, Mode: 0640,
+				}}, &gofuse.AttrOut{})
+				if errnoOf(err) != test.want || !errors.Is(err, context.Canceled) || truncates != test.truncates {
+					t.Fatalf("setattr returned %v, truncates=%d; want %v and %d", err, truncates, test.want, test.truncates)
 				}
-				if errno != want {
-					t.Fatalf("creation interrupted at %s returned %v, want %v", stage, errno, want)
+				body, err := downstream.FileStorage.Read(t.Context(), "f")
+				want := "contents"
+				if test.truncates != 0 {
+					want = "con"
 				}
-				_, err := downstream.Storage.Stat(t.Context(), "new")
-				if stage == "creation" && !errors.Is(err, syscall.ENOENT) || stage != "creation" && err != nil {
-					t.Fatalf("namespace after interruption at %s: %v", stage, err)
+				if err != nil || string(body) != want {
+					t.Fatalf("completed stages left %q, %v; want %q", body, err, want)
 				}
 			})
 		}
 	}
 }
 
-func TestSetattrCancellationAccountsForCompletedStages(t *testing.T) {
-	for _, test := range []struct {
-		name       string
-		valid      uint32
-		buffer     bool
-		dirty      int
-		failOp     string
-		failCall   int
-		wantErrno  syscall.Errno
-		wantWrites int
-	}{
-		{"resize read before write", gofuse.FATTR_SIZE, false, 0, "stat", 1, syscall.EINTR, 0},
-		{"resize write refused", gofuse.FATTR_SIZE, false, 0, "write", 1, syscall.EINTR, 0},
-		{"stored resize then attributes read", gofuse.FATTR_SIZE, false, 0, "stat", 2, syscall.EIO, 1},
-		{"buffer resize then attributes read", gofuse.FATTR_SIZE, true, 0, "stat", 1, syscall.EIO, 0},
-		{"resize then mode", gofuse.FATTR_SIZE | gofuse.FATTR_MODE, false, 0, "setattr", 1, syscall.EIO, 1},
-		{"buffer resize then mode", gofuse.FATTR_SIZE | gofuse.FATTR_MODE, true, 0, "setattr", 1, syscall.EIO, 0},
-		{"mode mutation interrupted", gofuse.FATTR_MODE, false, 0, "setattr", 1, syscall.EIO, 0},
-		{"mode then attributes read", gofuse.FATTR_MODE, false, 0, "stat", 1, syscall.EIO, 0},
-		{"first pending commit refused", gofuse.FATTR_MTIME, false, 2, "write", 1, syscall.EINTR, 0},
-		{"partial pending commits", gofuse.FATTR_MTIME, false, 2, "write", 2, syscall.EIO, 1},
-		{"committed handles then time", gofuse.FATTR_MTIME, false, 2, "setattr", 1, syscall.EIO, 2},
-		{"buffer resize then refused commit", gofuse.FATTR_SIZE | gofuse.FATTR_MTIME, true, 0, "write", 1, syscall.EIO, 0},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			_, n, downstream := mutationTree(t)
-			var file fsbridge.FileHandle
-			if test.buffer {
-				file = newHandle(n, []byte("contents"), committed, 0)
-			}
-			var pending []*handle
-			for range test.dirty {
-				pending = append(pending, newHandle(n, []byte("pending"), uncommitted, 0))
-			}
-			calls, writes := 0, 0
-			downstream.before = func(_ context.Context, op string) error {
-				if op == test.failOp {
-					calls++
-					if calls == test.failCall {
-						return context.Canceled
-					}
-				}
-				return nil
-			}
-			downstream.after = func(op string) {
-				if op == "write" {
-					writes++
-				}
-			}
-			in := &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
-				Valid: test.valid, Size: 3, Mode: 0o640, Mtime: 123456789,
-			}}
-			err := n.setattr(t.Context(), file, in, &gofuse.AttrOut{})
-			if got := errnoOf(err); got != test.wantErrno || !errors.Is(err, context.Canceled) {
-				t.Fatalf("setattr = %v (%v), want %v retaining cancellation", err, got, test.wantErrno)
-			}
-			if writes != test.wantWrites {
-				t.Fatalf("setattr completed %d writes, want %d", writes, test.wantWrites)
-			}
-			if test.buffer && test.valid&gofuse.FATTR_SIZE != 0 && len(file.(*handle).contents) != 3 {
-				t.Fatalf("resized buffer holds %d bytes, want 3", len(file.(*handle).contents))
-			}
-			if test.dirty > 0 {
-				clean := 0
-				for _, h := range pending {
-					if !h.dirty {
-						clean++
-					}
-				}
-				if clean != test.wantWrites {
-					t.Fatalf("%d handles committed, want %d", clean, test.wantWrites)
-				}
-			}
-		})
-	}
-}
-
 func TestSetattrCancellationBetweenSuccessfulMutationStages(t *testing.T) {
-	for _, stage := range []string{"write", "setattr"} {
+	for _, stage := range []string{"truncate", "setattr"} {
 		t.Run(stage, func(t *testing.T) {
 			_, n, downstream := mutationTree(t)
 			ctx, cancel := context.WithCancel(t.Context())
@@ -233,29 +317,57 @@ func TestSetattrCancellationBetweenSuccessfulMutationStages(t *testing.T) {
 				}
 			}
 			in := &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
-				Valid: gofuse.FATTR_SIZE | gofuse.FATTR_MODE, Size: 3, Mode: 0o640,
+				Valid: gofuse.FATTR_SIZE | gofuse.FATTR_MODE, Size: 3, Mode: 0640,
 			}}
 			if errno := n.Setattr(ctx, nil, in, &gofuse.AttrOut{}); errno != syscall.EIO {
-				t.Fatalf("setattr canceled after %s = %v, want EIO", stage, errno)
+				t.Fatalf("setattr canceled after %s returned %v, want EIO", stage, errno)
 			}
-			if stage == "write" && setters != 0 || stage == "setattr" && setters != 1 {
-				t.Fatalf("setattr canceled after %s attempted %d attribute mutations", stage, setters)
+			if stage == "truncate" && setters != 0 || stage == "setattr" && setters != 1 {
+				t.Fatalf("setattr canceled after %s attempted %d attribute changes", stage, setters)
 			}
 		})
 	}
 }
 
+func TestWriteFailureIsReportedBeforeAnAttributeChange(t *testing.T) {
+	_, n, downstream := mutationTree(t)
+	first, second := mutationHandle(t, n), mutationHandle(t, n)
+	writes := 0
+	downstream.after = func(op string) {
+		if op == "write" {
+			writes++
+		}
+	}
+	if n, errno := first.Write(t.Context(), []byte("complete"), 0); errno != 0 || n != 8 {
+		t.Fatalf("first write: %d, %v", n, errno)
+	}
+	downstream.before = func(_ context.Context, op string) error {
+		if op == "write" {
+			return context.Canceled
+		}
+		return nil
+	}
+	if n, errno := second.Write(t.Context(), []byte("rejected"), 0); errno != syscall.EINTR || n != 0 {
+		t.Fatalf("refused write: %d, %v", n, errno)
+	}
+	if errno := n.Setattr(t.Context(), first, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		Valid: gofuse.FATTR_MTIME, Mtime: 123456789,
+	}}, &gofuse.AttrOut{}); errno != 0 {
+		t.Fatal(errno)
+	}
+	if writes != 1 {
+		t.Fatalf("attribute change submitted another write: %d writes", writes)
+	}
+	if body, err := downstream.FileStorage.Read(t.Context(), "f"); err != nil || string(body) != "complete" {
+		t.Fatalf("write outcomes left %q, %v", body, err)
+	}
+}
+
 func TestMutationClassificationPreservesIndependentFailures(t *testing.T) {
 	fault := errors.New("namespace unavailable")
-	for _, cause := range []error{
-		syscall.EACCES,
-		fault,
-		errors.Join(context.Canceled, fault),
-		errors.Join(fault, context.Canceled),
-		context.DeadlineExceeded,
-	} {
+	for _, cause := range []error{syscall.EACCES, fault, errors.Join(context.Canceled, fault), errors.Join(fault, context.Canceled), context.DeadlineExceeded} {
 		if got := afterMutation(true, cause); got != cause {
-			t.Errorf("mutation changed an independent failure %v to %v", cause, got)
+			t.Errorf("mutation changed independent failure %v to %v", cause, got)
 		}
 	}
 	cause := fmt.Errorf("reading attributes after resize: %w", context.Canceled)
@@ -263,10 +375,9 @@ func TestMutationClassificationPreservesIndependentFailures(t *testing.T) {
 	if errnoOf(err) != syscall.EIO || !errors.Is(err, cause) || !errors.Is(err, context.Canceled) || !errors.Is(err, syscall.EIO) {
 		t.Fatalf("partial mutation lost its cause or classification: %v", err)
 	}
-	diagnostic := err.Error()
 	for _, detail := range []string{"after a change", cause.Error(), syscall.EIO.Error()} {
-		if !strings.Contains(diagnostic, detail) {
-			t.Errorf("partial mutation diagnostic omits %q: %q", detail, diagnostic)
+		if !strings.Contains(err.Error(), detail) {
+			t.Errorf("partial mutation diagnostic omits %q: %q", detail, err.Error())
 		}
 	}
 }
@@ -285,12 +396,12 @@ func TestMutationSuccessIgnoresLateCancellation(t *testing.T) {
 			var errno syscall.Errno
 			switch operation {
 			case "create":
-				_, _, _, errno = root.Create(ctx, "new", 0, 0o600, &gofuse.EntryOut{})
+				_, _, _, errno = root.Create(ctx, "new", syscall.O_RDWR, 0600, &gofuse.EntryOut{})
 			case "mkdir":
-				_, errno = root.Mkdir(ctx, "new", 0o700, &gofuse.EntryOut{})
+				_, errno = root.Mkdir(ctx, "new", 0700, &gofuse.EntryOut{})
 			case "setattr":
 				errno = n.Setattr(ctx, nil, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
-					Valid: gofuse.FATTR_MODE, Mode: 0o600,
+					Valid: gofuse.FATTR_MODE, Mode: 0600,
 				}}, &gofuse.AttrOut{})
 			}
 			if errno != 0 || ctx.Err() != context.Canceled {
@@ -302,17 +413,17 @@ func TestMutationSuccessIgnoresLateCancellation(t *testing.T) {
 
 func TestSetattrCanceledBeforeStartingHasNoEffects(t *testing.T) {
 	_, n, downstream := mutationTree(t)
+	h := mutationHandle(t, n)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	downstream.before = func(context.Context, string) error {
-		t.Fatal("a canceled setattr reached storage")
-		return nil
-	}
-	h := newHandle(n, []byte("contents"), committed, 0)
+	downstream.before = func(context.Context, string) error { t.Fatal("a canceled setattr reached storage"); return nil }
 	errno := n.Setattr(ctx, h, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
-		Valid: gofuse.FATTR_SIZE | gofuse.FATTR_MODE, Size: 3, Mode: 0o600,
+		Valid: gofuse.FATTR_SIZE | gofuse.FATTR_MODE, Size: 3, Mode: 0600,
 	}}, &gofuse.AttrOut{})
-	if errno != syscall.EINTR || h.dirty || string(h.contents) != "contents" {
-		t.Fatalf("pre-canceled setattr returned %v and left buffer %q dirty %t", errno, h.contents, h.dirty)
+	if errno != syscall.EINTR {
+		t.Fatalf("pre-canceled setattr returned %v", errno)
+	}
+	if body, err := downstream.FileStorage.Read(t.Context(), "f"); err != nil || string(body) != "contents" {
+		t.Fatalf("pre-canceled setattr changed %q, %v", body, err)
 	}
 }

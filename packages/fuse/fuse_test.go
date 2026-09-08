@@ -60,7 +60,7 @@ func requireFUSE(t *testing.T) {
 	}
 }
 
-func fuseNamespace(t *testing.T) storage.Storage {
+func fuseNamespace(t *testing.T) storage.FileStorage {
 	t.Helper()
 	_, backing := memoryfixture.New(t, "fuse", 0, locking.DefaultOptions())
 	return backing
@@ -74,10 +74,12 @@ func mountStorage(t *testing.T, s storage.Storage, opts fuse.Options) string {
 
 	mountpoint := t.TempDir()
 	m, err := fuse.New(mountpoint, s, opts)
+	if m != nil {
+		t.Cleanup(func() { unmount(t, m, mountpoint) })
+	}
 	if err != nil {
 		t.Fatalf("mounting at %s: %v", mountpoint, err)
 	}
-	t.Cleanup(func() { unmount(t, m, mountpoint) })
 	return mountpoint
 }
 
@@ -86,8 +88,16 @@ func unmount(t *testing.T, m *fuse.Mount, mountpoint string) {
 	var err error
 	for attempt := range 20 {
 		if err = m.Unmount(); err == nil {
-			m.Wait()
+			if err := m.Wait(); err != nil {
+				t.Errorf("draining unmounted file session: %v", err)
+			}
 			return
+		}
+		select {
+		case <-m.Done():
+			t.Errorf("unmount finished with an error: %v", errors.Join(err, m.Wait()))
+			return
+		default:
 		}
 		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
 	}
@@ -803,9 +813,8 @@ func TestModificationTimeAdvancesWithAWrite(t *testing.T) {
 	}
 }
 
-// Reporting that an fsync succeeded while the contents sat in this process's memory
-// would be the false report this filesystem exists to avoid.
-func TestFsyncCommits(t *testing.T) {
+// Fsync confirms the health and durability of contents already published by Write.
+func TestFsyncConfirmsPublishedContents(t *testing.T) {
 	mountpoint, _, backing := mountedPair(t)
 
 	f, err := os.Create(filepath.Join(mountpoint, "f"))
@@ -815,6 +824,9 @@ func TestFsyncCommits(t *testing.T) {
 	defer f.Close()
 	if _, err := f.Write([]byte("payload")); err != nil {
 		t.Fatal(err)
+	}
+	if body, err := backing.Read(t.Context(), "f"); err != nil || string(body) != "payload" {
+		t.Fatalf("the successful write was not published before fsync: %q, %v", body, err)
 	}
 	if err := f.Sync(); err != nil {
 		t.Fatal(err)
@@ -1200,7 +1212,7 @@ func TestAListingNoticesWhatTheDirectoryNoLongerHas(t *testing.T) {
 // and directories, so this decorator describes real sentinel nodes as links, retaining
 // their namespace identities in both Stat and List.
 type linkStorage struct {
-	storage.Storage
+	storage.FileStorage
 	lengths map[uint64]int64
 }
 
@@ -1213,7 +1225,7 @@ func (s *linkStorage) describe(attr storage.Attr) storage.Attr {
 }
 
 func (s *linkStorage) Stat(ctx context.Context, path string) (storage.Attr, error) {
-	attr, err := s.Storage.Stat(ctx, path)
+	attr, err := s.FileStorage.Stat(ctx, path)
 	if err != nil {
 		return storage.Attr{}, err
 	}
@@ -1221,7 +1233,7 @@ func (s *linkStorage) Stat(ctx context.Context, path string) (storage.Attr, erro
 }
 
 func (s *linkStorage) List(ctx context.Context, path string) ([]storage.Entry, error) {
-	entries, err := s.Storage.List(ctx, path)
+	entries, err := s.FileStorage.List(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -1231,13 +1243,19 @@ func (s *linkStorage) List(ctx context.Context, path string) ([]storage.Entry, e
 	return entries, nil
 }
 
+func (s *linkStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+	return decorateSession(ctx, s.FileStorage, options, retainedHooks{
+		attr: func(_ string, attr storage.Attr) storage.Attr { return s.describe(attr) },
+	})
+}
+
 func mountLinks(t *testing.T) (string, storage.Storage) {
 	t.Helper()
 	backing := fuseNamespace(t)
 	if err := backing.Write(t.Context(), "target", []byte("payload")); err != nil {
 		t.Fatal(err)
 	}
-	links := &linkStorage{Storage: backing, lengths: make(map[uint64]int64)}
+	links := &linkStorage{FileStorage: backing, lengths: make(map[uint64]int64)}
 	for name, target := range map[string]string{"link": "target", "dangling": "nowhere"} {
 		if err := backing.Create(t.Context(), name); err != nil {
 			t.Fatal(err)
@@ -1387,7 +1405,7 @@ func TestRemovingASymbolicLinkLeavesWhatItPointsAt(t *testing.T) {
 // countingStorage records how many times each operation was asked for.
 
 type countingStorage struct {
-	storage.Storage
+	storage.FileStorage
 	mu     sync.Mutex
 	counts map[string]int
 }
@@ -1406,17 +1424,23 @@ func (s *countingStorage) count(operation string) int {
 
 func (s *countingStorage) Stat(ctx context.Context, path string) (storage.Attr, error) {
 	s.record("Stat")
-	return s.Storage.Stat(ctx, path)
+	return s.FileStorage.Stat(ctx, path)
 }
 
 func (s *countingStorage) List(ctx context.Context, path string) ([]storage.Entry, error) {
 	s.record("List")
-	return s.Storage.List(ctx, path)
+	return s.FileStorage.List(ctx, path)
 }
 
 func (s *countingStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	s.record("Read")
-	return s.Storage.Read(ctx, path)
+	return s.FileStorage.Read(ctx, path)
+}
+
+func (s *countingStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+	return decorateSession(ctx, s.FileStorage, options, retainedHooks{
+		before: func(operation, _ string) error { s.record(operation); return nil },
+	})
 }
 
 // Nothing is held locally, so nothing can go stale, and that is why this filesystem needs
@@ -1428,7 +1452,7 @@ func TestEveryLookAtTheNamespaceReachesIt(t *testing.T) {
 	if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 		t.Fatal(err)
 	}
-	counted := &countingStorage{Storage: backing, counts: map[string]int{}}
+	counted := &countingStorage{FileStorage: backing, counts: map[string]int{}}
 	mountpoint := mountStorage(t, counted, fuse.Options{Logger: testLogger(t)})
 	path := filepath.Join(mountpoint, "f")
 
@@ -1468,9 +1492,10 @@ var unreachable = errors.New("the namespace is unreachable")
 // resolves its own failure, so each one is a separate chance to turn a failure into a
 // plausible-looking answer.
 type faultyStorage struct {
-	storage.Storage
+	storage.FileStorage
 	mu    sync.Mutex
 	fault func(operation, path string) error
+	paths sync.Map
 }
 
 func (s *faultyStorage) check(operation, path string) error {
@@ -1483,70 +1508,250 @@ func (s *faultyStorage) Stat(ctx context.Context, path string) (storage.Attr, er
 	if err := s.check("Stat", path); err != nil {
 		return storage.Attr{}, err
 	}
-	return s.Storage.Stat(ctx, path)
+	attr, err := s.FileStorage.Stat(ctx, path)
+	if err == nil {
+		s.paths.Store(attr.ID, path)
+	}
+	return attr, err
 }
 
 func (s *faultyStorage) SetAttr(ctx context.Context, path string, change storage.AttrChange) error {
 	if err := s.check("SetAttr", path); err != nil {
 		return err
 	}
-	return s.Storage.SetAttr(ctx, path, change)
+	return s.FileStorage.SetAttr(ctx, path, change)
 }
 
 func (s *faultyStorage) List(ctx context.Context, path string) ([]storage.Entry, error) {
 	if err := s.check("List", path); err != nil {
 		return nil, err
 	}
-	return s.Storage.List(ctx, path)
+	return s.FileStorage.List(ctx, path)
 }
 
 func (s *faultyStorage) Read(ctx context.Context, path string) ([]byte, error) {
 	if err := s.check("Read", path); err != nil {
 		return nil, err
 	}
-	return s.Storage.Read(ctx, path)
+	return s.FileStorage.Read(ctx, path)
 }
 
 func (s *faultyStorage) Write(ctx context.Context, path string, content []byte) error {
 	if err := s.check("Write", path); err != nil {
 		return err
 	}
-	return s.Storage.Write(ctx, path, content)
+	return s.FileStorage.Write(ctx, path, content)
 }
 
 func (s *faultyStorage) Create(ctx context.Context, path string) error {
 	if err := s.check("Create", path); err != nil {
 		return err
 	}
-	return s.Storage.Create(ctx, path)
+	return s.FileStorage.Create(ctx, path)
 }
 
 func (s *faultyStorage) Mkdir(ctx context.Context, path string) error {
 	if err := s.check("Mkdir", path); err != nil {
 		return err
 	}
-	return s.Storage.Mkdir(ctx, path)
+	return s.FileStorage.Mkdir(ctx, path)
 }
 
 func (s *faultyStorage) Remove(ctx context.Context, path string) error {
 	if err := s.check("Remove", path); err != nil {
 		return err
 	}
-	return s.Storage.Remove(ctx, path)
+	return s.FileStorage.Remove(ctx, path)
 }
 
 func (s *faultyStorage) RemoveDir(ctx context.Context, path string) error {
 	if err := s.check("RemoveDir", path); err != nil {
 		return err
 	}
-	return s.Storage.RemoveDir(ctx, path)
+	return s.FileStorage.RemoveDir(ctx, path)
 }
 
 func (s *faultyStorage) Rename(ctx context.Context, from, to string) error {
 	if err := s.check("Rename", from); err != nil {
 		return err
 	}
-	return s.Storage.Rename(ctx, from, to)
+	return s.FileStorage.Rename(ctx, from, to)
+}
+
+func (s *faultyStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+	return decorateSession(ctx, s.FileStorage, options, retainedHooks{
+		before: s.check,
+		path:   func(id uint64) string { return fixturePath(&s.paths, id) },
+	})
+}
+
+// Paths label injected faults; all underlying operations keep their retained identity.
+type retainedHooks struct {
+	before func(operation, path string) error
+	attr   func(path string, attr storage.Attr) storage.Attr
+	path   func(id uint64) string
+}
+
+func (h retainedHooks) check(operation, path string) error {
+	if h.before == nil {
+		return nil
+	}
+	return h.before(operation, path)
+}
+
+func (h retainedHooks) describe(path string, attr storage.Attr) storage.Attr {
+	if h.attr == nil {
+		return attr
+	}
+	return h.attr(path, attr)
+}
+
+func (h retainedHooks) nodePath(id uint64) string {
+	if h.path == nil {
+		return fmt.Sprintf("node:%d", id)
+	}
+	return h.path(id)
+}
+
+func fixturePath(paths *sync.Map, id uint64) string {
+	if path, ok := paths.Load(id); ok {
+		return path.(string)
+	}
+	return fmt.Sprintf("node:%d", id)
+}
+
+func decorateSession(ctx context.Context, backing storage.FileStorage, options storage.FileSessionOptions, hooks retainedHooks) (storage.FileSession, error) {
+	session, err := backing.NewFileSession(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &decoratedSession{FileSession: session, hooks: hooks}, nil
+}
+
+type decoratedSession struct {
+	storage.FileSession
+	hooks retainedHooks
+}
+
+func (s *decoratedSession) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, error) {
+	if err := s.hooks.check("OpenFile", path); err != nil {
+		return nil, err
+	}
+	if options.Create {
+		if err := s.hooks.check("Create", path); err != nil {
+			return nil, err
+		}
+	}
+	file, err := s.FileSession.OpenFile(ctx, path, options)
+	if err != nil {
+		return nil, err
+	}
+	return &decoratedFile{File: file, hooks: s.hooks, path: path}, nil
+}
+
+func (s *decoratedSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
+	path := s.hooks.nodePath(id)
+	if err := s.hooks.check("OpenNode", path); err != nil {
+		return nil, err
+	}
+	file, err := s.FileSession.OpenNode(ctx, id, options)
+	if err != nil {
+		return nil, err
+	}
+	return &decoratedFile{File: file, hooks: s.hooks, path: path}, nil
+}
+
+func (s *decoratedSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
+	path := s.hooks.nodePath(id)
+	if err := s.hooks.check("Stat", path); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := s.FileSession.StatNode(ctx, id)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	return s.hooks.describe(path, attr), nil
+}
+
+func (s *decoratedSession) SetNodeAttr(ctx context.Context, id uint64, change storage.AttrChange) (storage.Attr, error) {
+	path := s.hooks.nodePath(id)
+	if err := s.hooks.check("SetAttr", path); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := s.FileSession.SetNodeAttr(ctx, id, change)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	return s.hooks.describe(path, attr), nil
+}
+
+type decoratedFile struct {
+	storage.File
+	hooks retainedHooks
+	path  string
+}
+
+func (f *decoratedFile) Stat(ctx context.Context) (storage.Attr, error) {
+	if err := f.hooks.check("Stat", f.path); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := f.File.Stat(ctx)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	return f.hooks.describe(f.path, attr), nil
+}
+
+func (f *decoratedFile) ReadAt(ctx context.Context, offset int64, length int) (storage.FileRead, error) {
+	if err := f.hooks.check("Read", f.path); err != nil {
+		return storage.FileRead{}, err
+	}
+	read, err := f.File.ReadAt(ctx, offset, length)
+	if err != nil {
+		return storage.FileRead{}, err
+	}
+	read.Attr = f.hooks.describe(f.path, read.Attr)
+	return read, nil
+}
+
+func (f *decoratedFile) WriteAt(ctx context.Context, offset int64, data []byte) (storage.Attr, error) {
+	if err := f.hooks.check("Write", f.path); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := f.File.WriteAt(ctx, offset, data)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	return f.hooks.describe(f.path, attr), nil
+}
+
+func (f *decoratedFile) Truncate(ctx context.Context, size int64) (storage.Attr, error) {
+	if err := f.hooks.check("Truncate", f.path); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := f.File.Truncate(ctx, size)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	return f.hooks.describe(f.path, attr), nil
+}
+
+func (f *decoratedFile) SetAttr(ctx context.Context, change storage.AttrChange) (storage.Attr, error) {
+	if err := f.hooks.check("SetAttr", f.path); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := f.File.SetAttr(ctx, change)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	return f.hooks.describe(f.path, attr), nil
+}
+
+func (f *decoratedFile) Sync(ctx context.Context) error {
+	if err := f.hooks.check("Sync", f.path); err != nil {
+		return err
+	}
+	return f.File.Sync(ctx)
 }
 
 // failing produces a fault that fails one named operation, whatever it is applied to.
@@ -1582,8 +1787,12 @@ func mountFaulty(t *testing.T, fault func(operation, path string) error, prepare
 	t.Helper()
 	backing := fuseNamespace(t)
 	prepare(backing)
-	s := &faultyStorage{Storage: backing, fault: fault}
-	return mountStorage(t, s, fuse.Options{Logger: testLogger(t)})
+	s := &faultyStorage{FileStorage: backing, fault: func(string, string) error { return nil }}
+	mountpoint := mountStorage(t, s, fuse.Options{Logger: testLogger(t)})
+	s.mu.Lock()
+	s.fault = fault
+	s.mu.Unlock()
+	return mountpoint
 }
 
 func nothingIsThere(storage.Storage) {}
@@ -1630,7 +1839,15 @@ func TestAnUnreachableNamespaceFailsEveryOperation(t *testing.T) {
 		operation string
 		act       func(root string) error
 	}{
-		{"Read", func(root string) error { _, err := os.ReadFile(filepath.Join(root, "f")); return err }},
+		{"Read", func(root string) error {
+			f, err := os.Open(filepath.Join(root, "f"))
+			if err != nil {
+				return fmt.Errorf("opening before the injected read failure: %v", err)
+			}
+			defer f.Close()
+			_, err = f.Read(make([]byte, 16))
+			return err
+		}},
 		{"Write", func(root string) error { return os.WriteFile(filepath.Join(root, "f"), []byte("x"), 0o644) }},
 		{"Create", func(root string) error {
 			f, err := os.OpenFile(filepath.Join(root, "new"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
@@ -1678,12 +1895,9 @@ func TestAStorageErrnoReachesTheCallerUnchanged(t *testing.T) {
 	}
 }
 
-// Setting a time on a file whose buffer is still uncommitted commits it first, so that the
-// write does not stamp its own time over the one being asked for. That commit can fail,
-// and a failure there is the whole request failing: reporting the time as set while the
-// contents it belongs to never arrived would describe a file that does not exist.
-func TestAFailureCommittingBeforeATimeIsSetIsReported(t *testing.T) {
-	mountpoint := mountFaulty(t, failing("Write", unreachable), nothingIsThere)
+// Time changes are independently acknowledged after the preceding write succeeds.
+func TestAFailureSettingATimeAfterAWriteIsReported(t *testing.T) {
+	mountpoint := mountFaulty(t, failing("SetAttr", unreachable), nothingIsThere)
 
 	f, err := os.Create(filepath.Join(mountpoint, "f"))
 	if err != nil {
@@ -1700,21 +1914,20 @@ func TestAFailureCommittingBeforeATimeIsSetIsReported(t *testing.T) {
 	}
 }
 
-// The commit happens on close, because that is the last moment a failure can still be
-// reported to whoever caused it. Release cannot report anything.
-func TestACommitFailureIsReportedToClose(t *testing.T) {
+// A refused write reports its failure before descriptor cleanup is requested.
+func TestAWriteFailureIsReportedBeforeClose(t *testing.T) {
 	mountpoint := mountFaulty(t, failing("Write", unreachable), nothingIsThere)
 
 	f, err := os.Create(filepath.Join(mountpoint, "f"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Write([]byte("payload")); err != nil {
+	if _, err := f.Write([]byte("payload")); !errors.Is(err, syscall.EIO) {
 		f.Close()
-		t.Fatalf("the write itself failed with %v; it should only fail on close", err)
+		t.Fatalf("write returned %v, want EIO", err)
 	}
-	if err := f.Close(); !errors.Is(err, syscall.EIO) {
-		t.Fatalf("close returned %v, want EIO", err)
+	if err := f.Close(); err != nil {
+		t.Fatalf("cleanup after the refused write returned %v", err)
 	}
 }
 
@@ -1747,27 +1960,27 @@ func TestAFailureReadingBackWhatWasJustMadeIsReported(t *testing.T) {
 	}
 }
 
-// Giving a node just made the permissions the caller asked for is a step of its own, and
-// it can fail on its own. Reporting the node as made, with permissions nobody asked for,
-// leaves the caller acting on a file that is not the one they asked for.
-func TestAFailureGivingANewNodeItsModeIsReported(t *testing.T) {
+// File creation includes its initial mode atomically; directory initialization still
+// has a separate metadata mutation. Failure at either boundary must reach the caller.
+func TestAFailureCreatingANodeWithItsModeIsReported(t *testing.T) {
 	for _, c := range []struct {
-		name string
-		act  func(root string) error
+		name      string
+		operation string
+		act       func(root string) error
 	}{
-		{"a created file", func(root string) error {
+		{"a created file", "Create", func(root string) error {
 			f, err := os.OpenFile(filepath.Join(root, "new"), os.O_CREATE|os.O_WRONLY, 0o600)
 			if err != nil {
 				return err
 			}
 			return f.Close()
 		}},
-		{"a created directory", func(root string) error {
+		{"a created directory", "SetAttr", func(root string) error {
 			return os.Mkdir(filepath.Join(root, "new"), 0o700)
 		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			mountpoint := mountFaulty(t, failing("SetAttr", unreachable), nothingIsThere)
+			mountpoint := mountFaulty(t, failing(c.operation, unreachable), nothingIsThere)
 			if err := c.act(mountpoint); !errors.Is(err, syscall.EIO) {
 				t.Fatalf("the operation returned %v, want EIO", err)
 			}
@@ -1775,16 +1988,16 @@ func TestAFailureGivingANewNodeItsModeIsReported(t *testing.T) {
 	}
 }
 
-// Shortening a file with no handle open asks the namespace two questions: how large the
-// file is, which decides whether this mount can hold it at all, and what it holds. Either
-// can fail, and neither can be answered with a guess.
+// A path truncation opens the looked-up identity, validates its current attributes,
+// and asks that retained object to publish its new length. Each boundary can fail.
 func TestAFailureShorteningAFileWithNoHandleOpenIsReported(t *testing.T) {
 	for _, c := range []struct {
 		name  string
 		fault func(operation, path string) error
 	}{
+		{"the identity cannot be opened", failing("OpenNode", unreachable)},
 		{"the size cannot be learned", afterTheLookup("f", unreachable)},
-		{"the contents cannot be fetched", failing("Read", unreachable)},
+		{"the native truncation fails", failing("Truncate", unreachable)},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			mountpoint := mountFaulty(t, c.fault, func(backing storage.Storage) {
@@ -1799,9 +2012,8 @@ func TestAFailureShorteningAFileWithNoHandleOpenIsReported(t *testing.T) {
 	}
 }
 
-// Opening a file asks the namespace how large it is before fetching it, because a file
-// this mount cannot hold has to be refused rather than fetched. That question can fail on
-// its own, and a size we could not find out is not a size to guess at.
+// Opening validates the retained object's size without reading its contents. Unknown
+// attributes must fail the open before it reports a usable descriptor.
 func TestAFailureLearningTheSizeOfAFileBeingOpenedIsReported(t *testing.T) {
 	mountpoint := mountFaulty(t, afterTheLookup("f", unreachable), func(backing storage.Storage) {
 		if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
@@ -1853,26 +2065,42 @@ func TestAFailureStattingAnOpenFileIsReported(t *testing.T) {
 
 // oddStorage reports the nodes odd chooses as a kind the mount has no way to present.
 type oddStorage struct {
-	storage.Storage
-	odd func(path string) bool
+	storage.FileStorage
+	odd   func(path string) bool
+	paths sync.Map
 }
 
 func (s *oddStorage) Stat(ctx context.Context, path string) (storage.Attr, error) {
-	attr, err := s.Storage.Stat(ctx, path)
-	if err == nil && s.odd(path) {
-		attr.Mode |= fs.ModeIrregular
+	attr, err := s.FileStorage.Stat(ctx, path)
+	if err == nil {
+		s.paths.Store(attr.ID, path)
+		attr = s.describe(path, attr)
 	}
 	return attr, err
 }
 
 func (s *oddStorage) List(ctx context.Context, path string) ([]storage.Entry, error) {
-	entries, err := s.Storage.List(ctx, path)
+	entries, err := s.FileStorage.List(ctx, path)
 	for i := range entries {
 		if s.odd(path + "/" + entries[i].Name) {
 			entries[i].Attr.Mode |= fs.ModeIrregular
 		}
 	}
 	return entries, err
+}
+
+func (s *oddStorage) describe(path string, attr storage.Attr) storage.Attr {
+	if s.odd(path) {
+		attr.Mode |= fs.ModeIrregular
+	}
+	return attr
+}
+
+func (s *oddStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+	return decorateSession(ctx, s.FileStorage, options, retainedHooks{
+		attr: s.describe,
+		path: func(id uint64) string { return fixturePath(&s.paths, id) },
+	})
 }
 
 // mountOdd mounts a namespace holding one ordinary file, with odd deciding which nodes
@@ -1883,7 +2111,7 @@ func mountOdd(t *testing.T, odd func(path string) bool) string {
 	if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 		t.Fatal(err)
 	}
-	return mountStorage(t, &oddStorage{Storage: backing, odd: odd}, fuse.Options{Logger: testLogger(t)})
+	return mountStorage(t, &oddStorage{FileStorage: backing, odd: odd}, fuse.Options{Logger: testLogger(t)})
 }
 
 // A node whose kind we cannot name is refused rather than presented as an ordinary file.
@@ -2068,11 +2296,8 @@ func accessTimeOf(info fs.FileInfo) time.Time {
 	return time.Unix(accessed.Unix())
 }
 
-// A file with a handle open holds its contents in this process until the commit, and the
-// commit stamps the namespace's own modification time over whatever was asked for. Setting
-// a time through that handle therefore has to commit first, or a program that writes a file
-// and dates it — tar and cp among them — gets the time of the close instead.
-func TestATimeSetThroughAnOpenHandleSurvivesTheCommit(t *testing.T) {
+// Closing a descriptor cannot change the explicit times set after its last write.
+func TestATimeSetThroughAnOpenHandleSurvivesClose(t *testing.T) {
 	mountpoint, _, backing := mountedPair(t)
 
 	f, err := os.Create(filepath.Join(mountpoint, "f"))
@@ -2097,12 +2322,12 @@ func TestATimeSetThroughAnOpenHandleSurvivesTheCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !underneath.ModTime.Equal(changed) {
-		t.Fatalf("the namespace is dated %v, want %v — the commit landed after the time was set",
+		t.Fatalf("the namespace is dated %v after close, want %v",
 			underneath.ModTime, changed)
 	}
 	body, err := backing.Read(t.Context(), "f")
 	if err != nil || string(body) != "payload" {
-		t.Fatalf("the namespace holds %q, %v; want the contents committed as well", body, err)
+		t.Fatalf("the namespace holds %q, %v; want the published contents", body, err)
 	}
 }
 
@@ -2250,6 +2475,9 @@ func TestNothingIsWrittenToTheProcessOutput(t *testing.T) {
 
 	restore := captureProcessOutput(t)
 	m, mountErr := fuse.New(mountpoint, s, fuse.Options{})
+	if m != nil {
+		t.Cleanup(func() { unmount(t, m, mountpoint) })
+	}
 	if mountErr == nil {
 		exerciseTheMount(t, mountpoint)
 		unmount(t, m, mountpoint)
@@ -2274,6 +2502,9 @@ func TestDiagnosticsGoOnlyWhereTheCallerAsked(t *testing.T) {
 
 	restore := captureProcessOutput(t)
 	m, mountErr := fuse.New(mountpoint, s, fuse.Options{Logger: log.New(collected, "", 0), Debug: true})
+	if m != nil {
+		t.Cleanup(func() { unmount(t, m, mountpoint) })
+	}
 	if mountErr == nil {
 		exerciseTheMount(t, mountpoint)
 		unmount(t, m, mountpoint)
@@ -2310,8 +2541,11 @@ func TestMountingSomewhereItCannotBeDone(t *testing.T) {
 
 	for _, mountpoint := range []string{filepath.Join(t.TempDir(), "absent"), file, unusable} {
 		m, err := fuse.New(mountpoint, s, fuse.Options{Logger: testLogger(t)})
+		if m != nil {
+			t.Cleanup(func() { unmount(t, m, mountpoint) })
+		}
 		if err == nil {
-			m.Unmount()
+			unmount(t, m, mountpoint)
 			t.Errorf("mounting on %s succeeded, want an error", mountpoint)
 			continue
 		}
@@ -2411,17 +2645,14 @@ func mountCeiling(t *testing.T, contents []byte, maxFileSize int64) (path string
 	if err := backing.Write(t.Context(), "f", contents); err != nil {
 		t.Fatal(err)
 	}
-	counted = &countingStorage{Storage: backing, counts: map[string]int{}}
+	counted = &countingStorage{FileStorage: backing, counts: map[string]int{}}
 	mountpoint := mountStorage(t, counted, fuse.Options{Logger: testLogger(t), MaxFileSize: maxFileSize})
 	return filepath.Join(mountpoint, "f"), counted
 }
 
-// An open file is held whole in memory, so the size of one file is the size of one
-// allocation a caller can ask this process to make. Go answers an allocation it cannot
-// satisfy with a fatal error rather than a panic: neither recover nor the FUSE library's
-// panic handling catches it, and the process this package is linked into dies (R-INT-1,
-// R-INT-2). Every path that allocates in proportion to a size has to refuse before
-// allocating, and this covers each of them.
+// The mount's file ceiling bounds accepted file sizes before a native operation can
+// allocate in proportion to a caller-controlled size. Opens read only attributes;
+// writes and nonzero truncation can materialize bounded contents in the backend.
 //
 // The ceiling is small so that no case here allocates anything large, including on a run
 // where the ceiling has stopped working.
@@ -2448,8 +2679,7 @@ func TestNoOperationGrowsAFilePastTheCeiling(t *testing.T) {
 		if err := f.Truncate(ceiling + 1); !errors.Is(err, syscall.EFBIG) {
 			t.Fatalf("ftruncate returned %v, want EFBIG", err)
 		}
-		// The handle holds the buffer the truncation would have grown, so what it reports
-		// afterwards is the evidence that nothing grew.
+		// The retained object's size must remain unchanged after the refused operation.
 		info, err := f.Stat()
 		if err != nil {
 			t.Fatal(err)
@@ -2584,7 +2814,7 @@ func TestTheTerabyteTruncateIsRefusedRatherThanAllocated(t *testing.T) {
 			err, ceiling+1)
 	}
 
-	before := counted.count("Write")
+	before := counted.count("Truncate")
 	out, err := exec.Command(truncateBinary, "-s", "1T", path).CombinedOutput()
 	t.Logf("truncate -s 1T %s\n%s", path, out)
 	if err == nil {
@@ -2594,8 +2824,8 @@ func TestTheTerabyteTruncateIsRefusedRatherThanAllocated(t *testing.T) {
 	if !strings.Contains(string(out), "File too large") {
 		t.Fatalf("truncate -s 1T failed with %v and said %q, want EFBIG", err, out)
 	}
-	if counted.count("Write") != before {
-		t.Fatal("the refused truncation still wrote to the namespace")
+	if counted.count("Truncate") != before {
+		t.Fatal("the refused truncation still reached the native file operation")
 	}
 	if body, err := os.ReadFile(path); err != nil || string(body) != "payload" {
 		t.Fatalf("the file reads %q, %v after the refused truncation", body, err)
@@ -2614,7 +2844,7 @@ func TestTheTerabyteTruncateIsRefusedRatherThanAllocated(t *testing.T) {
 //
 // The ceiling on a single file applies whatever Avail says, so a tool that reads statfs,
 // sees room, and starts copying can still be refused with EFBIG partway through. The two
-// limits answer different questions — how large a file this mount will hold in memory, and
+// limits answer different questions — how large a file this mount will serve, and
 // how much the workspace may hold in all — and neither stands in for the other.
 
 // reportedBlock is the unit the mount reports space in. The figures below are written as
@@ -2625,7 +2855,7 @@ const reportedBlock = 4096
 // checked against exact numbers, and the room a real filesystem has left is neither exact
 // nor still.
 type tellsSpace struct {
-	storage.Storage
+	storage.FileStorage
 	space storage.Space
 	err   error
 }
@@ -2641,7 +2871,7 @@ func (s *tellsSpace) Space(context.Context) (storage.Space, error) {
 func mountTelling(t *testing.T, space storage.Space, err error) (string, storage.Storage) {
 	t.Helper()
 	backing := fuseNamespace(t)
-	s := &tellsSpace{Storage: backing, space: space, err: err}
+	s := &tellsSpace{FileStorage: backing, space: space, err: err}
 	return mountStorage(t, s, fuse.Options{Logger: testLogger(t)}), backing
 }
 
@@ -2745,16 +2975,30 @@ func TestASpaceThatCannotBeTrueIsRefused(t *testing.T) {
 // A write that would carry the namespace past its limit is refused at the write(2) that
 // asked for it, with EDQUOT: the disk is not full, an allowance is spent.
 //
-// Which call reports it is the whole point. The contents of an open file are held until
-// the commit, and the commit happens at close(2), so a refusal discovered only there
-// reaches a caller that in a large share of programs never looks at what close(2)
-// returned — and the bytes go missing in silence.
+// The write call must report refusal before returning any successful byte count.
 func TestAWriteWithNoRoomForItIsRefusedAtTheWrite(t *testing.T) {
 	const room = 10
-	full := storage.Space{Total: 1 << 20, Used: 1<<20 - room, Avail: room}
+	mountWithRoom := func(t *testing.T, held int) (string, storage.Storage) {
+		t.Helper()
+		const allowance = 1 << 20
+		_, backing := memoryfixture.New(t, "write-quota", allowance, locking.DefaultOptions())
+		if held != 0 {
+			if err := backing.Write(t.Context(), "big", pattern(held)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := backing.Write(t.Context(), "reserved", make([]byte, allowance-room-held)); err != nil {
+			t.Fatal(err)
+		}
+		space, err := backing.Space(t.Context())
+		if err != nil || space.Avail != room {
+			t.Fatalf("authoritative remaining quota = %+v, %v", space, err)
+		}
+		return mountStorage(t, backing, fuse.Options{Logger: testLogger(t)}), backing
+	}
 
 	t.Run("a write larger than the room left", func(t *testing.T) {
-		mountpoint, backing := mountTelling(t, full, nil)
+		mountpoint, backing := mountWithRoom(t, 0)
 		f, err := os.Create(filepath.Join(mountpoint, "f"))
 		if err != nil {
 			t.Fatal(err)
@@ -2765,9 +3009,7 @@ func TestAWriteWithNoRoomForItIsRefusedAtTheWrite(t *testing.T) {
 			t.Fatalf("writing %d bytes into a workspace with %d left returned %v, want EDQUOT",
 				room+1, room, err)
 		}
-		// Nothing was buffered, so there is nothing to commit and close has nothing to
-		// report. This is where the refusal would have surfaced had it waited for the
-		// commit, which is the arrival nobody would have seen.
+		// Descriptor cleanup must succeed independently of the refused content change.
 		if err := f.Close(); err != nil {
 			t.Fatalf("close returned %v; the refusal already reached the write", err)
 		}
@@ -2778,7 +3020,7 @@ func TestAWriteWithNoRoomForItIsRefusedAtTheWrite(t *testing.T) {
 	})
 
 	t.Run("a write that exactly fills the room left", func(t *testing.T) {
-		mountpoint, backing := mountTelling(t, full, nil)
+		mountpoint, backing := mountWithRoom(t, 0)
 		if err := os.WriteFile(filepath.Join(mountpoint, "f"), make([]byte, room), 0o644); err != nil {
 			t.Fatalf("writing exactly the %d bytes left returned %v", room, err)
 		}
@@ -2787,15 +3029,10 @@ func TestAWriteWithNoRoomForItIsRefusedAtTheWrite(t *testing.T) {
 		}
 	})
 
-	// What a write needs is the room its growth asks for, not the room the whole file would
-	// take. A mount that weighed the file's length would refuse every change to a large file
-	// in a workspace near its limit, including one that shortens it.
+	// Only the added bytes consume the remaining allowance.
 	t.Run("appending to a file the namespace already holds", func(t *testing.T) {
-		mountpoint, backing := mountTelling(t, full, nil)
 		const held = 1 << 16
-		if err := backing.Write(t.Context(), "big", pattern(held)); err != nil {
-			t.Fatal(err)
-		}
+		mountpoint, backing := mountWithRoom(t, held)
 
 		f, err := os.OpenFile(filepath.Join(mountpoint, "big"), os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
@@ -2831,12 +3068,8 @@ func mountLimited(t *testing.T, backing storage.Storage, allowance int64) string
 // A truncation that would carry the namespace past its allowance is refused at the call
 // that asked for it, and is refused there whether or not the caller holds the file open.
 //
-// ftruncate(2) arrives as a size change on an open handle, whose contents are held until
-// the commit at close(2); truncate(2) on the same file arrives with no handle and goes
-// straight to the namespace, which refuses it at the syscall. Weighing only the ceiling on
-// a single file's size in the first would leave the allowance to be discovered at the
-// commit — a refusal that reaches only close(2), which a large share of programs never
-// look at (R-WS-5) — and one operation would then be answered in two different places.
+// Both descriptor and path truncation publish through retained objects and settle
+// native quota before returning to the syscall that requested the change.
 func TestATruncationWithNoRoomForItIsRefusedAtTheTruncation(t *testing.T) {
 	const allowance = 64 << 10
 
@@ -2854,9 +3087,7 @@ func TestATruncationWithNoRoomForItIsRefusedAtTheTruncation(t *testing.T) {
 			t.Fatalf("ftruncate to %d bytes under an allowance of %d returned %v, want EDQUOT",
 				allowance+1, allowance, err)
 		}
-		// Nothing was lengthened, so there is nothing to commit and close has nothing to
-		// report. This is where the refusal would have surfaced had it waited for the
-		// commit, which is the arrival nobody would have seen.
+		// Cleanup cannot defer or repeat a truncation already refused by its syscall.
 		if err := f.Close(); err != nil {
 			t.Fatalf("close returned %v; the refusal already reached the ftruncate", err)
 		}
@@ -2920,7 +3151,7 @@ func TestATruncationWithNoRoomForItIsRefusedAtTheTruncation(t *testing.T) {
 				stands, err, allowance)
 		}
 		if err := f.Close(); err != nil {
-			t.Fatalf("committing the truncation returned %v", err)
+			t.Fatalf("closing after the truncation returned %v", err)
 		}
 		held, err := backing.Stat(t.Context(), "f")
 		if err != nil {

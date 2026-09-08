@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io"
 	"io/fs"
@@ -183,6 +184,11 @@ func replicableNamespace(t *testing.T) (storage.Storage, *httprest.Handler) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := handler.Close(context.Background()); err != nil {
+			t.Errorf("closing handler file sessions: %v", err)
+		}
+	})
 	return namespace, handler
 }
 
@@ -193,6 +199,11 @@ func serveWithoutReplication(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := handler.Close(context.Background()); err != nil {
+			t.Errorf("closing handler file sessions: %v", err)
+		}
+	})
 	return listenOn(t, handler)
 }
 

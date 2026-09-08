@@ -102,6 +102,8 @@ type Store struct {
 	// accepts the namespace or reports a successful integrity-checked result.
 	maxIntegrityRecords int64
 	maxIntegrityBytes   int64
+	files               map[*retainedFile]struct{}
+	fileDomain          *fileDomain
 
 	coordinator          *databaseCoordinator
 	locks                *locking.Authority
@@ -331,7 +333,7 @@ func openConfiguredWithHooks(
 		}
 	} else if hooks.acquireLeaseOwner != nil {
 		create := durable == nil || durable.mode != RequireExistingNamespace
-		owner, err = hooks.acquireLeaseOwner(database, options.leaseRecoveryOwner, create)
+		owner, err = hooks.acquireLeaseOwner(database, options.leaseRecoveryOwner || durable != nil, create)
 		if err != nil {
 			if OpenFailureRetainsOwnership(err) {
 				releaseOnFailure = false
@@ -392,10 +394,18 @@ func openConfiguredWithHooks(
 	}
 	var id, root int64
 	var state DurableState
+	if durable != nil && owner != nil && owner.exclusive {
+		owned := *durable
+		owned.reapDetached = true
+		durable = &owned
+	}
 	if durable == nil {
 		prepareNamespace := hooks.prepare
-		if options.requireExistingNamespace {
-			prepareNamespace = prepareExistingLeaseNamespace
+		if options.leaseRecoveryOwner {
+			prepareNamespace = prepareOwnedLeaseNamespace
+		}
+		if options.leaseRecoveryOwner && options.requireExistingNamespace {
+			prepareNamespace = prepareExistingOwnedLeaseNamespace
 		}
 		id, root, err = prepareNamespace(
 			ctx, write, namespace, storeID, options.Window,
@@ -440,12 +450,21 @@ func openConfiguredWithHooks(
 		allowance:    allowance, window: options.Window, objectLimits: options.ObjectLimits,
 		maxIntegrityRecords: options.MaxIntegrityRecords,
 		maxIntegrityBytes:   options.MaxIntegrityBytes,
+		files:               make(map[*retainedFile]struct{}),
 		coordinator:         coordinator,
 		closePool:           hooks.closePool,
 	}
 	if durable != nil {
 		store.witness = durable.witness
 		store.releasePersistentWAL = disablePersistentWAL
+	}
+	if err := coordinator.commit.acquire(ctx); err != nil {
+		return nil, cleanup(err, openPoolHandle{"snapshot reader pool", snapshotRead}, openPoolHandle{"reader pool", read}, openPoolHandle{"writer pool", write})
+	}
+	err = store.attachFileDomain(options)
+	coordinator.commit.release()
+	if err != nil {
+		return nil, cleanup(err, openPoolHandle{"snapshot reader pool", snapshotRead}, openPoolHandle{"reader pool", read}, openPoolHandle{"writer pool", write})
 	}
 	releaseOnFailure = false
 	return store, nil
@@ -592,6 +611,16 @@ func (s *Store) CloseContext(ctx context.Context) error {
 	if s.closed {
 		return s.closeErr
 	}
+	if err := s.coordinator.commit.acquire(ctx); err != nil {
+		return err
+	}
+	if len(s.files) != 0 {
+		count := len(s.files)
+		s.coordinator.commit.release()
+		return fmt.Errorf("the SQLite store still owns %d retained file references: %w", count, syscall.EBUSY)
+	}
+	s.files = nil
+	s.coordinator.commit.release()
 	var lockErr error
 	if s.locks != nil {
 		lockErr = s.locks.Close()
@@ -701,6 +730,7 @@ func (s *Store) finishPoolClosure(poolErr, authorityErr error) error {
 		}
 	}
 	if poolErr == nil {
+		s.releaseFileDomain()
 		releaseCoordinator(s.coordinator)
 	}
 	return errors.Join(authorityErr, poolErr, ownerErr)
@@ -757,11 +787,16 @@ func (s *Store) mutatePublication(ctx context.Context, intent *namespaceIntent, 
 	return s.mutateTransaction(ctx, ctx, intent, f)
 }
 
-func (s *Store) mutateTransaction(ctx, transactionContext context.Context, intent *namespaceIntent, f func(tx *sql.Tx) error) (returnErr error) {
-	if err := s.coordinator.commit.acquire(ctx); err != nil {
+func (s *Store) mutateTransaction(admissionContext, ctx context.Context, intent *namespaceIntent, f func(tx *sql.Tx) error) (returnErr error) {
+	if err := s.coordinator.commit.acquire(admissionContext); err != nil {
 		return err
 	}
 	defer s.coordinator.commit.release()
+	return s.mutateTransactionLocked(ctx, ctx, intent, f)
+}
+
+// The caller holds commit ordering across retention or retirement and publication.
+func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context, intent *namespaceIntent, f func(tx *sql.Tx) error) (returnErr error) {
 	if err := s.coordinator.healthy(); err != nil {
 		return err
 	}
