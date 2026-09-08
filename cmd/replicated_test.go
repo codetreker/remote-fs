@@ -6,33 +6,14 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
 )
 
-// The tests here are about the copy of the namespace's metadata each mountpoint keeps: what
-// it costs to walk a tree that has been copied, what a directory rename costs, and what a
-// namespace without a published change log requires.
-//
-// They are at this level rather than beside the copy because what they assert is what a
-// program on the machine sees: a real mountpoint, real system calls, and the kernel's own
-// path resolution in between. The layer beneath has its own tests, and neither set answers
-// for the other — the mount is where "one stat is one request" was true, and it is where it
-// has stopped being true.
-
-// TestWalkingAMountedTreeSendsNothingToTheServer is the whole point of the feature, measured
-// at the mountpoint rather than under it.
-//
-// `ls -R` over a source tree is thousands of these calls. Every one of them was a request to
-// the server, and every name a path search asked about and did not find was one too, which is
-// what made a workspace on a 20 ms link unusable. The number below is zero.
-//
-// The kernel is not caching any of it: packages/fuse leaves its three timeouts at zero, so
-// every one of these lookups, listings and stats arrives at the copy. That is what makes this
-// a measurement of the copy rather than of the kernel.
-func TestWalkingAMountedTreeSendsNothingToTheServer(t *testing.T) {
+// Tree lookups and directory entries use the local replica. Identity-based attributes
+// are confirmed by the authority so an existing inode cannot describe a replacement.
+func TestWalkingAMountedTreeCachesNamesAndConfirmsIdentityAttributes(t *testing.T) {
 	s := serveNamespace(t)
 	a := mountpointOn(t, s)
 
@@ -49,6 +30,7 @@ func TestWalkingAMountedTreeSendsNothingToTheServer(t *testing.T) {
 		}
 	}
 
+	s.calls.waitFileCloses(t, 5)
 	before := s.calls.snapshot()
 
 	// filepath.Walk rather than WalkDir: it stats every name it finds, which is what a build
@@ -78,10 +60,14 @@ func TestWalkingAMountedTreeSendsNothingToTheServer(t *testing.T) {
 		}
 	}
 
-	if arrived := s.calls.since(before); arrived != "" {
-		t.Fatalf("walking a copied tree sent %s to the server; the copy exists so that it sends nothing", arrived)
+	if arrived := s.calls.sinceExcept(before, "file:stat-node", "file-control:renew"); arrived != "" {
+		t.Fatalf("walking a copied tree sent unexpected named/data requests: %s", arrived)
 	}
-	t.Logf("walked %d nodes and asked about 4 absent names, and the server heard nothing", len(walked))
+	identityStats := s.calls.snapshot()["file:stat-node"] - before["file:stat-node"]
+	if identityStats == 0 {
+		t.Fatal("inode attributes were never confirmed by identity")
+	}
+	t.Logf("walked %d nodes and checked 4 absent names: zero named stat/list requests, %d authoritative identity stats", len(walked), identityStats)
 }
 
 // TestADirectoryRenameKeepsTheIdentitiesBeneathIt.
@@ -115,6 +101,7 @@ func TestADirectoryRenameKeepsTheIdentitiesBeneathIt(t *testing.T) {
 		was[at] = inodeOf(t, filepath.Join(a, "before"+at))
 	}
 
+	s.calls.waitFileCloses(t, 2)
 	before := s.calls.snapshot()
 	if err := os.Rename(filepath.Join(a, "before"), filepath.Join(a, "after")); err != nil {
 		t.Fatalf("renaming the directory: %v", err)
@@ -132,10 +119,11 @@ func TestADirectoryRenameKeepsTheIdentitiesBeneathIt(t *testing.T) {
 		t.Fatalf("the moved subtree lists %v, want [g]", got)
 	}
 
-	// One request, and it is the rename. Everything read afterwards came out of the copy.
-	if arrived := s.calls.since(before); arrived != "rename×1" {
-		t.Fatalf("renaming a directory and reading the subtree back sent %q to the server, want the rename alone", arrived)
+	// The rename is the only named mutation; inode attributes still use identity queries.
+	if arrived := s.calls.sinceExcept(before, "file:stat-node", "file-control:renew"); arrived != "rename×1" {
+		t.Fatalf("renaming a directory and reading its copied subtree sent %q, want only one named rename", arrived)
 	}
+	t.Logf("renamed and inspected the subtree with %d authoritative identity stats", s.calls.snapshot()["file:stat-node"]-before["file:stat-node"])
 }
 
 // ENOSYS selects direct remote operations when a handler does not publish replication.
@@ -151,17 +139,13 @@ func TestANamespaceWithoutPublishedLogIsMountedWithoutACopy(t *testing.T) {
 		t.Fatalf("the mountpoint lists %v, want [a.txt]", got)
 	}
 
-	// Every operation is a request, which is the other half of the claim: this mount is not
-	// answering from a copy, because there is no copy. One stat by a program is more than one
-	// request here — the kernel resolves the name and then asks about the node, and with all
-	// three of its timeouts at zero it caches neither — which is exactly the traffic the other
-	// test in this file counts as zero.
+	// Named lookup must also reach the authority when no replica is published.
 	before := s.calls.snapshot()
 	if _, err := os.Lstat(filepath.Join(a, "a.txt")); err != nil {
 		t.Fatalf("stat a.txt: %v", err)
 	}
 	arrived := s.calls.since(before)
-	if !strings.HasPrefix(arrived, "stat×") {
+	if s.calls.snapshot()["stat"] == before["stat"] {
 		t.Fatalf("a stat without published replication sent %q to the server, and with no copy behind it it has nowhere else to come from", arrived)
 	}
 	t.Logf("one stat through the mountpoint: %s", arrived)

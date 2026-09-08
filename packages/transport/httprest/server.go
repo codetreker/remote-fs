@@ -22,6 +22,7 @@ import (
 // It is a plain http.Handler, so it can be run on its own or mounted inside an existing
 // server; http.StripPrefix is how it is mounted somewhere other than the root.
 type Handler struct {
+	files               *fileRegistry
 	storage             *locked.Storage
 	locks               locking.Service
 	lockControls        *bodyAdmission
@@ -129,34 +130,25 @@ func NewHandlerWithOptions(s storage.Storage, log metastore.Log, options Handler
 		snapshots: newBodyAdmission(settled.replication.Snapshots, 0, 0),
 		stopping:  make(chan struct{}),
 	}
+	h.files = newFileRegistry(s, options.Files.settled())
 	if log != nil {
 		h.publisher = newPublisher(settled.replication.MaxSubscriptions)
 	}
 	return h, nil
 }
 
-// Stop ends every open change stream, telling each replica that this server is going away.
-//
-// It exists because a change stream never becomes idle. http.Server.Shutdown waits for
-// connections to return to idle and does not cancel request contexts, so a server with one
-// replica attached waits out whatever deadline Shutdown was given and then reports that it
-// expired — an ordinary stop turned into a stall and a failure. Handing this to
-// http.Server.RegisterOnShutdown is what lets the streams let go when shutdown begins:
-//
-//	server := &http.Server{Handler: handler}
-//	server.RegisterOnShutdown(handler.Stop)
-//
-// A stream ended this way says so, and a replica told this keeps what it has and reconnects
-// with the position it holds. That is the point of saying it at all: a connection that
-// simply stopped could equally be a server that vanished, and being polite about going away
-// must not cost a replica more than being abrupt would have.
-//
-// It returns as soon as the streams have been told, not when they have gone; waiting for
-// them is what Shutdown is already doing. Calling it more than once is harmless, and calling
-// it on a handler that serves a namespace with no log does nothing, because such a namespace
-// has no streams to end.
+// Stop ends change streams and begins retiring this handler's file sessions.
+// It stops admission immediately and returns before in-flight operations drain.
+// Register it with http.Server.RegisterOnShutdown so streams do not keep HTTP
+// shutdown waiting for connections to become idle. Close waits for session
+// cleanup; the backend remains owned by the caller.
 func (h *Handler) Stop() {
-	h.stopsOnce.Do(func() { close(h.stopping) })
+	h.stopsOnce.Do(func() {
+		close(h.stopping)
+		if h.files != nil {
+			h.files.stop()
+		}
+	})
 }
 
 // stopped reports whether Stop has been called.
@@ -180,6 +172,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	req, err := ParseRequest(r.Method, r.URL)
 	if err != nil {
 		h.writeFault(w, statusForParseError(err), err)
+		return
+	}
+	if req.Op == OpFile || req.Op == OpFileControl {
+		h.serveFile(w, r)
 		return
 	}
 	if isLockControl(req.Op) {

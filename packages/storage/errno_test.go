@@ -7,13 +7,12 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// The six errnos the contract names by hand must be in the vocabulary, or an
-// implementation cannot report what the contract obliges it to report.
+// Contract failures must survive transport naming and classification.
 func TestContractErrnosAreInTheVocabulary(t *testing.T) {
 	for _, e := range []syscall.Errno{
 		syscall.EINVAL, syscall.ENOENT, syscall.EEXIST,
 		syscall.ENOTDIR, syscall.EISDIR, syscall.ENOTEMPTY,
-		syscall.EIO,
+		syscall.EIO, syscall.EBADF, syscall.EDEADLK, syscall.ENOLCK,
 	} {
 		name, ok := storage.ErrnoName(e)
 		if !ok {
@@ -22,6 +21,9 @@ func TestContractErrnosAreInTheVocabulary(t *testing.T) {
 		back, ok := storage.ErrnoByName(name)
 		if !ok || back != e {
 			t.Fatalf("name %q maps back to %v (found=%v), want %v", name, back, ok, e)
+		}
+		if classified := storage.ErrnoOf(e); classified != e {
+			t.Fatalf("errno %v classified as %v", e, classified)
 		}
 	}
 }

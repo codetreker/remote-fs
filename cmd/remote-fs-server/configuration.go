@@ -51,6 +51,7 @@ type commandConfig struct {
 	standalone                   standaloneHTTPOptions
 	locks                        locking.Options
 	initializeLockState          bool
+	files                        fileBackendOptions
 }
 
 type localSource struct {
@@ -138,6 +139,9 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 		"maximum garbage objects removed by one sweep in a blob or local-store namespace")
 
 	httpOptions := httprest.DefaultHandlerOptions()
+	httpOptions.Files = httprest.DefaultFileLimits()
+	fileOptions := defaultFileBackendOptions()
+	bindFileOptions(flags, &fileOptions, &httpOptions.Files)
 	maxConcurrentLockControls := flags.Int("http-max-concurrent-lock-controls", httpOptions.MaxConcurrentLockControls,
 		"maximum lock-management requests admitted independently of file-content requests")
 	maxWaitingLockControls := flags.Int("http-max-waiting-lock-controls", httpOptions.MaxWaitingLockControls,
@@ -207,7 +211,8 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 			"It does not change quota accounting.\n\n"+
 			"Accepted connections and header/idle waits are bounded. Active change streams\n"+
 			"use handler-owned deadlines rather than a process-wide write timeout.\n\n"+
-			"File locks enforce explicit stable and exclusive grants. Enrollment has no\n"+
+			"Strong S/X file locks enforce explicit stable and exclusive grants. Standard\n"+
+			"flock and POSIX record locks are separate advisory mechanisms. Enrollment has no\n"+
 			"identity-provider authentication; serve only on a trusted network.\n\n")
 		flags.PrintDefaults()
 	}
@@ -261,6 +266,7 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 		},
 		locks:               lockOptions,
 		initializeLockState: *initializeLockState,
+		files:               fileOptions,
 	}
 	config.http.MaxBodyBytes = maxHTTPBody.bytes
 	config.http.MaxConcurrentLockControls = *maxConcurrentLockControls
@@ -277,6 +283,15 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 	config.http.MaxConcurrentSnapshotFrames = *maxConcurrentHTTPSnapshotFrames
 	config.http.MaxInFlightSnapshotFrameBytes = maxInFlightHTTPSnapshotFrameBytes.bytes
 	config.http.MaxWaitingSnapshotFrames = *maxWaitingHTTPSnapshotFrames
+	config.files.advisory.MaxSessions = config.http.Files.MaxSessions
+	if !given["max-file-size"] {
+		if config.local.given() {
+			config.files.advisory.MaxFileBytes = min(config.files.advisory.MaxFileBytes, config.local.objects.MaxObjectBytes)
+		}
+		if config.blob.given() {
+			config.files.advisory.MaxFileBytes = min(config.files.advisory.MaxFileBytes, config.objectLimits.MaxPendingBytes)
+		}
+	}
 	return validateConfig(config, given, flags.Args())
 }
 
@@ -323,6 +338,9 @@ func validateConfig(config commandConfig, given map[string]bool, extra []string)
 	}
 	if config.http.MaxWaitingSnapshotFrames < 0 {
 		return commandConfig{}, false, errors.New("-http-max-waiting-snapshot-frames must be non-negative")
+	}
+	if err := validateFileOptions(config); err != nil {
+		return commandConfig{}, false, err
 	}
 	if err := config.http.Check(); err != nil {
 		return commandConfig{}, false, err

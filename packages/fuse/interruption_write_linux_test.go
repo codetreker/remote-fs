@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/signal"
@@ -32,7 +31,7 @@ import (
 )
 
 type signalNamespace struct {
-	served *replicated.Storage
+	served storage.FileStorage
 	remote *httprest.Storage
 	writes atomic.Int32
 }
@@ -53,14 +52,16 @@ func newSignalNamespace(t *testing.T, allowance int64, files map[string][]byte) 
 		t.Fatal(err)
 	}
 	namespace := &signalNamespace{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		request, err := httprest.ParseRequest(r.Method, r.URL)
-		if err == nil && request.Op == httprest.OpWrite {
-			namespace.writes.Add(1)
+	server := httptest.NewServer(handler)
+	t.Cleanup(func() {
+		handler.Stop()
+		server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := handler.Close(ctx); err != nil {
+			t.Errorf("close signal handler: %v", err)
 		}
-		handler.ServeHTTP(w, r)
-	}))
-	t.Cleanup(server.Close)
+	})
 	namespace.remote, err = httprest.Dial(server.URL, server.Client())
 	if err != nil {
 		t.Fatal(err)
@@ -69,32 +70,82 @@ func newSignalNamespace(t *testing.T, allowance int64, files map[string][]byte) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	namespace.served, err = replicated.New(t.Context(), replica, namespace.remote)
+	served, err := replicated.New(t.Context(), replica, namespace.remote)
 	if err != nil {
 		replica.Close()
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := namespace.served.Close(); err != nil {
+		if err := served.Close(); err != nil {
 			t.Error(err)
 		}
 	})
+	namespace.served = &signalFileStorage{FileStorage: served, wrap: func(file storage.File) storage.File {
+		return &countedSignalFile{File: file, writes: &namespace.writes}
+	}}
 	return namespace
 }
 
-type heldCloseWrite struct {
-	storage.Storage
+type signalFileStorage struct {
+	storage.FileStorage
+	wrap func(storage.File) storage.File
+}
+
+func (s *signalFileStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+	session, err := s.FileStorage.NewFileSession(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &signalFileSession{FileSession: session, wrap: s.wrap}, nil
+}
+
+type signalFileSession struct {
+	storage.FileSession
+	wrap func(storage.File) storage.File
+}
+
+func (s *signalFileSession) OpenFile(ctx context.Context, name string, options storage.FileOpenOptions) (storage.File, error) {
+	file, err := s.FileSession.OpenFile(ctx, name, options)
+	if err != nil {
+		return nil, err
+	}
+	return s.wrap(file), nil
+}
+
+func (s *signalFileSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
+	file, err := s.FileSession.OpenNode(ctx, id, options)
+	if err != nil {
+		return nil, err
+	}
+	return s.wrap(file), nil
+}
+
+type countedSignalFile struct {
+	storage.File
+	writes *atomic.Int32
+}
+
+func (f *countedSignalFile) WriteAt(ctx context.Context, offset int64, data []byte) (storage.Attr, error) {
+	f.writes.Add(1)
+	return f.File.WriteAt(ctx, offset, data)
+}
+
+type heldCloseCleanup struct {
+	storage.File
 	entered chan context.Context
 	release chan struct{}
 }
 
-func (s *heldCloseWrite) Write(ctx context.Context, name string, body []byte) error {
+func (s *heldCloseCleanup) DropLocks(ctx context.Context, owner storage.LockOwner, family storage.LockFamily) error {
+	if family != storage.POSIX {
+		return s.File.DropLocks(ctx, owner, family)
+	}
 	s.entered <- ctx
 	select {
 	case <-s.release:
 	case <-ctx.Done():
 	}
-	return s.Storage.Write(ctx, name, body)
+	return s.File.DropLocks(ctx, owner, family)
 }
 
 type flushInterruptTrace struct {
@@ -119,80 +170,87 @@ func (trace *flushInterruptTrace) Write(body []byte) (int, error) {
 	return len(body), nil
 }
 
-func TestSignalDuringClosePreservesTheCommit(t *testing.T) {
+func TestSignalDuringClosePreservesOwnerCleanup(t *testing.T) {
 	if mode := os.Getenv(signalChildMode); mode != "" {
 		runWriteSignalChild(t, mode)
 		return
 	}
 	requireFUSE(t)
 	namespace := newSignalNamespace(t, 0, map[string][]byte{"file": []byte("old body")})
-	held := &heldCloseWrite{Storage: namespace.served, entered: make(chan context.Context, 1), release: make(chan struct{})}
+	held := &heldCloseCleanup{entered: make(chan context.Context, 1), release: make(chan struct{})}
+	wrapped := &signalFileStorage{FileStorage: namespace.served, wrap: func(file storage.File) storage.File {
+		held.File = file
+		return held
+	}}
 	var release sync.Once
 	defer release.Do(func() { close(held.release) })
 	trace := &flushInterruptTrace{interrupted: make(chan struct{})}
-	point := mountStorage(t, held, fuse.Options{Logger: log.New(trace, "", 0), Debug: true})
-	runSignalProcess(t, "TestSignalDuringClosePreservesTheCommit", "close", filepath.Join(point, "file"), func(ctx context.Context, pid, tid int) {
+	point := mountStorage(t, wrapped, fuse.Options{Logger: log.New(trace, "", 0), Debug: true})
+	runSignalProcess(t, "TestSignalDuringClosePreservesOwnerCleanup", "close", filepath.Join(point, "file"), func(ctx context.Context, pid, tid int) {
 		var completing context.Context
 		select {
 		case completing = <-held.entered:
 		case <-ctx.Done():
-			t.Fatal("Close did not enter the held commit")
+			t.Fatal("Close did not enter owner cleanup")
 		}
 		trace.mu.Lock()
 		trace.target = trace.flush
 		target := trace.target
 		trace.mu.Unlock()
 		if target == 0 {
-			t.Fatal("the held commit has no FLUSH request")
+			t.Fatal("owner cleanup has no FLUSH request")
 		}
 		if err := unix.Tgkill(pid, tid, syscall.SIGUSR1); err != nil {
 			t.Fatal(err)
 		}
 		// Flush owns a completion context, so its cancellation channel cannot prove
 		// that the original request was interrupted. The FUSE trace identifies that
-		// request and the kernel's INTERRUPT before the held commit is released.
+		// request and the kernel's INTERRUPT before owner cleanup is released.
 		select {
 		case <-trace.interrupted:
 		case <-ctx.Done():
 			t.Fatalf("the kernel did not interrupt FLUSH %d", target)
 		}
 		if err := completing.Err(); err != nil {
-			t.Fatalf("the signal canceled the commit context: %v", err)
+			t.Fatalf("the signal canceled owner cleanup: %v", err)
 		}
 		release.Do(func() { close(held.release) })
 	})
 	if got := namespace.writes.Load(); got != 1 {
-		t.Fatalf("Close sent %d writes, want exactly one", got)
+		t.Fatalf("write followed by Close sent %d writes, want exactly one", got)
 	}
 	body, err := namespace.remote.Read(t.Context(), "file")
 	if err != nil || string(body) != "new body" {
-		t.Fatalf("the completed close saved %q, %v", body, err)
+		t.Fatalf("close cleanup changed completed write contents %q, %v", body, err)
 	}
 }
 
-type interruptedSpace struct {
-	storage.Storage
+type interruptedFileWrite struct {
+	storage.File
 	entered  chan context.Context
 	returned chan error
 	release  chan struct{}
 	calls    atomic.Int32
 }
 
-func (s *interruptedSpace) Space(ctx context.Context) (storage.Space, error) {
+func (s *interruptedFileWrite) WriteAt(ctx context.Context, offset int64, data []byte) (storage.Attr, error) {
 	if s.calls.Add(1) != 1 {
-		return s.Storage.Space(ctx)
+		return s.File.WriteAt(ctx, offset, data)
 	}
 	s.entered <- ctx
 	select {
 	case <-ctx.Done():
 	case <-s.release:
 	}
-	space, err := s.Storage.Space(ctx)
+	err := ctx.Err()
+	if err == nil {
+		err = syscall.EIO
+	}
 	s.returned <- err
-	return space, err
+	return storage.Attr{}, err
 }
 
-func TestSignalDuringQuotaCheckPreservesTheWriteLimit(t *testing.T) {
+func TestSignalDuringWritePreservesTheAuthoritativeQuotaLimit(t *testing.T) {
 	if mode := os.Getenv(signalChildMode); mode != "" {
 		runWriteSignalChild(t, mode)
 		return
@@ -204,18 +262,22 @@ func TestSignalDuringQuotaCheckPreservesTheWriteLimit(t *testing.T) {
 				"used": bytes.Repeat([]byte("x"), 32<<10),
 				"file": {},
 			})
-			held := &interruptedSpace{Storage: namespace.served, entered: make(chan context.Context, 1), returned: make(chan error, 1), release: make(chan struct{})}
+			held := &interruptedFileWrite{entered: make(chan context.Context, 1), returned: make(chan error, 1), release: make(chan struct{})}
+			wrapped := &signalFileStorage{FileStorage: namespace.served, wrap: func(file storage.File) storage.File {
+				held.File = file
+				return held
+			}}
 			defer close(held.release)
-			point := mountStorage(t, held, fuse.Options{Logger: testLogger(t)})
-			runSignalProcess(t, "TestSignalDuringQuotaCheckPreservesTheWriteLimit", mode, filepath.Join(point, "file"), func(ctx context.Context, pid, tid int) {
+			point := mountStorage(t, wrapped, fuse.Options{Logger: testLogger(t)})
+			runSignalProcess(t, "TestSignalDuringWritePreservesTheAuthoritativeQuotaLimit", mode, filepath.Join(point, "file"), func(ctx context.Context, pid, tid int) {
 				var interrupted context.Context
 				select {
 				case interrupted = <-held.entered:
 				case <-ctx.Done():
-					t.Fatal("Write did not enter the quota check")
+					t.Fatal("Write did not enter the retained mutation")
 				}
 				if interrupted.Err() != nil {
-					t.Fatalf("the quota check was already canceled: %v", interrupted.Err())
+					t.Fatalf("the retained write was already canceled: %v", interrupted.Err())
 				}
 				if err := unix.Tgkill(pid, tid, syscall.SIGUSR1); err != nil {
 					t.Fatal(err)
@@ -223,10 +285,10 @@ func TestSignalDuringQuotaCheckPreservesTheWriteLimit(t *testing.T) {
 				select {
 				case err := <-held.returned:
 					if !errors.Is(interrupted.Err(), context.Canceled) || storage.ErrnoOf(err) != syscall.EINTR {
-						t.Fatalf("quota check returned %v with context %v, want EINTR after cancellation", err, interrupted.Err())
+						t.Fatalf("retained write returned %v with context %v, want EINTR after cancellation", err, interrupted.Err())
 					}
 				case <-ctx.Done():
-					t.Fatal("the signal did not cancel the quota check")
+					t.Fatal("the signal did not cancel the retained write")
 				}
 			})
 			wantCalls := int32(1)
@@ -234,10 +296,10 @@ func TestSignalDuringQuotaCheckPreservesTheWriteLimit(t *testing.T) {
 				wantCalls = 2
 			}
 			if calls := held.calls.Load(); calls != wantCalls {
-				t.Fatalf("Space was called %d times, want %d", calls, wantCalls)
+				t.Fatalf("retained WriteAt was called %d times, want %d", calls, wantCalls)
 			}
-			if writes := namespace.writes.Load(); writes != 0 {
-				t.Fatalf("the rejected write sent %d commits", writes)
+			if writes := namespace.writes.Load(); writes != wantCalls-1 {
+				t.Fatalf("the interrupted write sent %d authority requests, want %d", writes, wantCalls-1)
 			}
 			body, err := namespace.remote.Read(t.Context(), "file")
 			if err != nil || len(body) != 0 {

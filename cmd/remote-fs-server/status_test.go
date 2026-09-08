@@ -15,6 +15,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/localstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/localdisk"
+	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
 func TestLocalStatusReportsEveryBoundedAndDurablePart(t *testing.T) {
@@ -137,6 +138,11 @@ func TestMissingLockStatusClosesNamespaceAndPreservesCloseFailure(t *testing.T) 
 
 func TestUnavailableLockAuthorityCannotAnnounceReadiness(t *testing.T) {
 	for _, failure := range []error{nil, errors.New("recovery status read failed")} {
+		namespace, metadata := newTestNamespace(t)
+		handler, err := httprest.NewHandler(namespace, metadata)
+		if err != nil {
+			t.Fatal(err)
+		}
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -145,7 +151,7 @@ func TestUnavailableLockAuthorityCannotAnnounceReadiness(t *testing.T) {
 			return locking.Status{Unavailable: true}, failure
 		}}
 		var output bytes.Buffer
-		err = serveWithGrace(&drainingServer{}, listener, ns, &output, time.Millisecond)
+		err = serveWithGrace(newServer(handler), listener, ns, &output, time.Millisecond)
 		closeErr := listener.Close()
 		if err == nil || closeErr != nil {
 			t.Fatalf("unavailable authority startup returned %v; listener close %v", err, closeErr)

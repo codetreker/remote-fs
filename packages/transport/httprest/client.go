@@ -30,6 +30,7 @@ type Storage struct {
 	// maxFrameBytes bounds one replication frame retained by a stream reader.
 	maxFrameBytes int64
 	responses     *bodyAdmission
+	fileRequests  *bodyAdmission
 	lockControls  *bodyAdmission
 	scope         *locking.MutationScope
 
@@ -116,6 +117,7 @@ func DialWithOptions(baseURL string, httpClient *http.Client, options DialOption
 			settled.MaxInFlightResponseBytes,
 			settled.MaxWaitingResponses,
 		),
+		fileRequests: newBodyAdmission(settled.MaxConcurrentResponses, settled.MaxInFlightResponseBytes, settled.MaxWaitingResponses),
 		silence:      settled.Silence,
 		lockControls: configuredLockControlAdmission(settled.MaxConcurrentLockControls, settled.MaxWaitingLockControls),
 	}, nil
@@ -344,6 +346,9 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 	if req.Op == OpWrite {
 		limit = s.maxWriteBytes
 	}
+	if req.Op == OpFileControl {
+		limit = min(limit, DefaultMaxLockControlBytes)
+	}
 	if int64(len(content)) > limit {
 		tooLarge := fmt.Errorf("the request body is %d bytes, above the configured limit of %d", len(content), limit)
 		if req.Op == OpWrite {
@@ -351,7 +356,13 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 		}
 		return nil, unreachable(req, tooLarge)
 	}
-	release, err := s.responses.acquire(ctx, retainedResponseMultiplier*s.maxBodyBytes)
+	admission, reservation := s.responses, retainedResponseMultiplier*s.maxBodyBytes
+	if req.Op == OpFileControl {
+		admission = s.lockControls
+		reservation = retainedResponseMultiplier * DefaultMaxLockControlBytes
+		successLimit = min(successLimit, DefaultMaxLockControlBytes)
+	}
+	release, err := admission.acquire(ctx, reservation)
 	if err != nil {
 		if errors.Is(err, syscall.EAGAIN) {
 			return nil, &operationError{req: req, errno: syscall.EAGAIN, detail: err.Error()}
@@ -380,7 +391,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 	if content != nil {
 		httpReq.Header.Set("Content-Type", req.ContentType())
 	}
-	if isNamespaceMutation(req.Op) {
+	if isNamespaceMutation(req.Op) || req.Op == OpFile && fileScopeEnabled(ctx) {
 		scope := locking.ScopeFromContext(ctx)
 		if !locking.HasScope(ctx) && s.scope != nil {
 			scope = *s.scope
@@ -399,7 +410,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 
 	resp, err := s.http.Do(httpReq)
 	if err != nil {
-		return nil, operationFailure(req, err, req.Method() == http.MethodGet)
+		return nil, operationFailure(req, err, requestInterruptible(ctx, req))
 	}
 	defer resp.Body.Close()
 
@@ -418,14 +429,18 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 			return nil, &operationError{req: req, errno: syscall.EFBIG, detail: err.Error()}
 		}
 		if err != nil {
-			return nil, operationFailure(req, err, req.Method() == http.MethodGet)
+			return nil, operationFailure(req, err, requestInterruptible(ctx, req))
 		}
 		retained = true
 		return &retainedBody{content: body, done: release}, nil
 	case StatusStorageError:
-		body, err := readWhole(resp, s.maxBodyBytes)
+		errorLimit := s.maxBodyBytes
+		if req.Op == OpFileControl {
+			errorLimit = min(errorLimit, DefaultMaxLockControlBytes)
+		}
+		body, err := readWhole(resp, errorLimit)
 		if err != nil {
-			return nil, operationFailure(req, err, req.Method() == http.MethodGet)
+			return nil, operationFailure(req, err, requestInterruptible(ctx, req))
 		}
 		return nil, s.storageError(req, body)
 	default:
@@ -583,6 +598,7 @@ type operationError struct {
 	detail   string
 	canceled bool
 	deadline bool
+	unknown  bool
 }
 
 func (e *operationError) Error() string {
@@ -629,10 +645,11 @@ func operationFailure(req Request, cause error, interruptible bool) error {
 		detail:   cause.Error(),
 		canceled: errors.Is(cause, context.Canceled),
 		deadline: errors.Is(cause, context.DeadlineExceeded),
+		unknown:  !interruptible,
 	}
 }
 
 // unreachable reports that the outcome of req is unknown.
 func unreachable(req Request, cause error) error {
-	return &operationError{req: req, errno: syscall.EIO, detail: cause.Error()}
+	return &operationError{req: req, errno: syscall.EIO, detail: cause.Error(), unknown: true}
 }

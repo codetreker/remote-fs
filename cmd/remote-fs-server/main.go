@@ -96,10 +96,15 @@ func withListener(listener net.Listener, action func() error) (returned error) {
 	return action()
 }
 
-// withOpened keeps every owned storage resource, including a local store's lifetime lock,
-// until the HTTP server has drained. Closing failures are part of the command's result.
+// withOpened releases storage only after HTTP calls and the handler's retained file
+// sessions have drained. A failed registry close preserves the backend's ownership.
 func withOpened(ns opened, action func() error) (returned error) {
-	defer func() { returned = errors.Join(returned, ns.close()) }()
+	defer func() {
+		var unfinished *fileRegistryCloseError
+		if !errors.As(returned, &unfinished) {
+			returned = errors.Join(returned, ns.close())
+		}
+	}()
 	return action()
 }
 
@@ -159,26 +164,27 @@ type opened struct {
 	lockStatus func(context.Context) (locking.Status, error)
 }
 
-type lockConfig struct {
-	options    locking.Options
-	initialize bool
+type authorityConfig struct {
+	locks           locking.Options
+	initializeLocks bool
+	files           fileBackendOptions
 }
 
 // open builds the namespace the validated command line selected.
 func open(config commandConfig) (opened, error) {
-	locks := lockConfig{options: config.locks, initialize: config.initializeLockState}
+	authority := authorityConfig{locks: config.locks, initializeLocks: config.initializeLockState, files: config.files}
 	switch {
 	case config.local.given():
 		return openLocal(
 			config.local, config.quota, config.objectLimits,
 			config.maxReaderConnections, config.maxSnapshotReaderConnections,
-			config.maxIntegrityRecords, config.maxIntegrityBytes, config.maintenance, locks,
+			config.maxIntegrityRecords, config.maxIntegrityBytes, config.maintenance, authority,
 		)
 	default:
 		return openBlobs(
 			config.blob, config.quota, config.objectLimits,
 			config.maxReaderConnections, config.maxSnapshotReaderConnections,
-			config.maxIntegrityRecords, config.maxIntegrityBytes, config.maintenance, locks,
+			config.maxIntegrityRecords, config.maxIntegrityBytes, config.maintenance, authority,
 		)
 	}
 }
@@ -192,7 +198,7 @@ func openLocal(
 	maxIntegrityRecords int64,
 	maxIntegrityBytes int64,
 	maintenance objectstore.Options,
-	locks lockConfig,
+	authority authorityConfig,
 ) (opened, error) {
 	maxWaitingOperations := source.objects.MaxWaitingOperations
 	if maxWaitingOperations == 0 {
@@ -209,9 +215,11 @@ func openLocal(
 		MaxSnapshotReaderConnections: maxSnapshotReaderConnections,
 		MaxIntegrityRecords:          maxIntegrityRecords,
 		MaxIntegrityBytes:            maxIntegrityBytes,
+		MaxRetainedFiles:             authority.files.retained,
+		Advisory:                     authority.files.advisory,
 		Maintenance:                  maintenance,
-		Locks:                        &locks.options,
-		InitializeLocks:              locks.initialize,
+		Locks:                        &authority.locks,
+		InitializeLocks:              authority.initializeLocks,
 	})
 	if err != nil {
 		return opened{}, err
@@ -260,11 +268,11 @@ func openBlobs(
 	maxIntegrityRecords int64,
 	maxIntegrityBytes int64,
 	maintenance objectstore.Options,
-	locks lockConfig,
+	authority authorityConfig,
 ) (opened, error) {
 	return openBlobsContext(
 		context.Background(), blob, quota, objectLimits, maxReaderConnections,
-		maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance, locks,
+		maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance, authority,
 	)
 }
 
@@ -278,7 +286,7 @@ func openBlobsContext(
 	maxIntegrityRecords int64,
 	maxIntegrityBytes int64,
 	maintenance objectstore.Options,
-	locks lockConfig,
+	authority authorityConfig,
 ) (opened, error) {
 	switch {
 	case blob.database == "":
@@ -292,6 +300,8 @@ func openBlobsContext(
 	}
 
 	options, err := (sqlite.Options{
+		MaxRetainedFiles:             authority.files.retained,
+		Advisory:                     authority.files.advisory,
 		Window:                       sqlite.DefaultWindow(),
 		ObjectLimits:                 objectLimits,
 		MaxReaderConnections:         maxReaderConnections,
@@ -308,7 +318,7 @@ func openBlobsContext(
 	}
 	meta, err := sqlite.OpenLocking(ctx, sqlite.LockingConfig{
 		Database: blob.database, Namespace: blob.workspace, Allowance: quota,
-		SQLite: options, Locks: locks.options, Initialize: locks.initialize,
+		SQLite: options, Locks: authority.locks, Initialize: authority.initializeLocks,
 	})
 	if err != nil {
 		return opened{}, errors.Join(err, closeAfterOpenFailure("blob object store", objects.Close()))
@@ -398,7 +408,8 @@ func serve(httpServer *drainingServer, listener net.Listener, ns opened, errOut 
 	return serveWithGrace(httpServer, listener, ns, errOut, shutdownGrace)
 }
 
-func serveWithGrace(httpServer *drainingServer, listener net.Listener, ns opened, errOut io.Writer, grace time.Duration) error {
+func serveWithGrace(httpServer *drainingServer, listener net.Listener, ns opened, errOut io.Writer, grace time.Duration) (returned error) {
+	defer func() { returned = errors.Join(returned, closeFileRegistry(httpServer, grace)) }()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 

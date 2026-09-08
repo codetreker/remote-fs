@@ -16,6 +16,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/codetreker/remote-fs/packages/advisory"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
@@ -73,10 +74,13 @@ type Config struct {
 	MaxSnapshotReaderConnections int
 	MaxIntegrityRecords          int64
 	MaxIntegrityBytes            int64
-	LocalDisk                    localdisk.Options
-	Maintenance                  objectstore.Options
-	Locks                        *locking.Options
-	InitializeLocks              bool
+	// Retained-file and advisory limits use SQLite defaults when omitted.
+	MaxRetainedFiles int
+	Advisory         advisory.Config
+	LocalDisk        localdisk.Options
+	Maintenance      objectstore.Options
+	Locks            *locking.Options
+	InitializeLocks  bool
 }
 
 // Status is an operational view collected from every durable part of a Store.
@@ -394,6 +398,8 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 
 func (config Config) sqliteOptions() (sqlite.Options, error) {
 	return (sqlite.Options{
+		MaxRetainedFiles:             config.MaxRetainedFiles,
+		Advisory:                     config.Advisory,
 		Window:                       config.Window,
 		ObjectLimits:                 config.ObjectLimits,
 		MaxReaderConnections:         config.MaxReaderConnections,
@@ -734,6 +740,18 @@ func (s *Store) Close() error {
 	}
 	attempt := &closeAttempt{done: make(chan struct{})}
 	s.closeRunning = attempt
+	s.closeMu.Unlock()
+
+	if err := s.namespace.CloseFileSessions(); err != nil {
+		s.closeMu.Lock()
+		s.lastCloseErr = err
+		attempt.err = err
+		s.closeRunning = nil
+		close(attempt.done)
+		s.closeMu.Unlock()
+		return err
+	}
+	s.closeMu.Lock()
 	firstAttempt := !s.namespaceCloseAttempted
 	s.namespaceCloseAttempted = true
 	s.closeMu.Unlock()

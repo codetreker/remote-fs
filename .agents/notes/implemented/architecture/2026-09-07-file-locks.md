@@ -69,12 +69,12 @@ raw SQLite opener 持有数据库共享 flock，启用锁的拥有者取得排�
 | 内容 | 性质与结果 |
 |---|---|
 | 显式 S/X、身份与 Owner 绑定、最终授权顺序、有限期限、重启保护、管理动作核对 | 本决定交付的保证；不能通过未检查的普通修改或重试绕过 |
-| 普通写入的内容版本前置条件（R-CC-1） | 独立的正确性保证仍未补齐；在未受连续保护的时间里，旧内容依据仍可能被提交。将来需要读取与提交共同传递依据，不能拿 grant generation 代替它 |
+| 显式版本工作流的内容前置条件（R-CC-1） | 调用方依据与冲突报告仍独立；普通 fd 修改按 Linux 顺序生效，内部 revision CAS 不代表打开时依据，grant generation 也不能代替内容版本 |
 | FUSE Open 自动取得何种权限 | 独立的调用策略；本机制保持显式 Acquire，保留以后在调用层选择策略的能力，不把远端 Session 当作本地文件描述符 |
 | 目录、子树、未存在名字的锁 | 不由文件资源模式承诺，命中时明确拒绝；不能用路径字符串模拟逻辑文件身份 |
 | 升降级与递归获取 | 不提供隐式转换，重复持有明确失败；不得为它们引入隐藏的引用计数 |
 
-[打开文件未被钉住](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)继续拥有内容依据与普通打开后的提交目标问题；[定序与版本](../../proposed/architecture/2026-08-19-ordering-and-versions.md)继续拥有内容版本与日志顺序的区别。[操作词汇](../../proposed/architecture/2026-08-19-storage-operation-vocabulary.md)里的范围读、分页和版本化提交没有因增加锁控制 API 而被完成。[写会话与暂存](../../proposed/architecture/2026-08-19-write-session-and-staging.md)描述本地暂存的生命周期，与这里远端的占有 Session 不是同一种状态。[workspace 契约](../../proposed/architecture/2026-08-19-workspace-in-the-contract.md)中的多 workspace 注册与名字路由也保持独立；给一份 namespace 配对授权方没有建立这套注册机制。
+[活跃文件句柄](2026-09-08-live-file-handles.md)拥有普通 fd 的同对象读取、rename/unlink 保留、同步区间修改与标准 advisory；它不改变本决定的显式权限。经授权的名字移除使强资源成为 `TargetGone`，保留 File 与 advisory 继续指向旧对象。[打开文件身份](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)保留目录父身份与显式内容依据问题；[定序与版本](../../proposed/architecture/2026-08-19-ordering-and-versions.md)继续区分内容版本与日志位置。[操作词汇](../../proposed/architecture/2026-08-19-storage-operation-vocabulary.md)的分页及显式版本化提交仍独立。被否决的[写会话与暂存](../../rejected/architecture/2026-08-19-write-session-and-staging.md)保留延迟提交的理由与代价，它的本地 dirty 生命周期不等同于远端占有 Session。[workspace 契约](../../proposed/architecture/2026-08-19-workspace-in-the-contract.md)的注册与名字路由也没有由配对授权方完成。
 
 ## 备选方案
 
@@ -94,4 +94,4 @@ raw SQLite opener 持有数据库共享 flock，启用锁的拥有者取得排�
 
 代价落在原生发布集成、有限历史的容量拒绝、数据库持久证据与恢复屏障期间的修改不可用。较长的 lease 会增加后续恢复等待，历史容量耗尽要求持有者结束该作用域，而不是靠逐条淘汰继续接收动作。
 
-未使用连续保护的旧内容写入、隐式 Open 策略、目录级锁、已有读缓存缺陷与失败写入的本地保留仍是各自的独立工作。锁服务的成功不能被当成这些保证已经成立的证据。
+显式内容版本依据、隐式 Open 策略、目录级锁与通用失败写入记录仍是独立工作。普通 fd 的 live identity、同步修改和 advisory 已由[活跃文件句柄](2026-09-08-live-file-handles.md)接管；锁服务的成功不替代这些接口各自的确认与生命周期。

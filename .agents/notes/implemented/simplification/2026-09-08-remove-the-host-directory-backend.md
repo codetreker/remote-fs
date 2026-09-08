@@ -16,7 +16,7 @@ Status: implemented
 
 库的边界继续保持可替换：`Storage`、有界结果、原生发布与配对锁服务的义务不变，`limited` 仍能为履行其契约的第三方 backend 执行配额。调用方没有提供 change log 时，复制操作仍明确返回 `ENOSYS`；不能用删除一个随附实现来把可选日志改成接口的隐含必需项。
 
-库测试复用真实 SQLite 与内存对象组成的 [memoryfixture](../../../../packages/storage/lockcontract/memoryfixture/memory.go)，二进制与持久恢复测试使用保留的 localstore 和 Azure。需要表达特定身份、符号链接属性或错误的测试在对应接口装饰结果；真实信号、Close 与配额边界继续由原断言验证。过期暂存缩短的配额用例迁到 `limited`，不因删除旧 fixture 而删除该保证。
+库测试复用真实 SQLite 与内存对象组成的 [memoryfixture](../../../../packages/storage/lockcontract/memoryfixture/memory.go)，二进制与持久恢复测试使用保留的 localstore 和 Azure。需要表达特定身份、符号链接属性或错误的测试在对应接口装饰结果；当时迁移保留了真实信号、Close 与配额边界的原断言。后续[实时文件句柄](../architecture/2026-09-08-live-file-handles.md)改变提交与关闭职责，验证须按同步修改、引用和 advisory 清理分别表达，不能沿用旧缓冲路径的通过记录。过期暂存缩短的配额用例迁到 `limited`，删除旧 fixture 没有删除该保证。
 
 本决定部分替代[早期范围](../process/2026-08-19-mvp-scope.md)、[文件锁](../architecture/2026-09-07-file-locks.md)与[容量上限](../architecture/2026-08-21-space-limit.md)中的宿主目录实现选择，保留它们的通用契约与历史理由。[本地磁盘对象存储](../architecture/2026-09-04-local-disk-object-store.md)和[对象命名空间](../architecture/2026-08-21-namespace-in-an-object-store.md)继续拥有保留的组合形态。
 
@@ -34,4 +34,4 @@ Status: implemented
 
 调用方不能再用随附二进制直接发布已有宿主目录，需要选择受管理的本地持久存储、Azure，或自行接入满足契约的 backend。本决定不提供旧目录的迁移工具，也不把既有目录内容当作新存储格式自动接受。
 
-以后若增加另一种 backend，仍须满足稳定逻辑身份、完整内容读取、有界资源、所有修改的最终授权与已确认租期的恢复保护；不能通过原路径的无条件读写或另一份不配对的锁服务绕过它们。第三方 `limited` 路径采样的祖先改名缺口、普通内容版本前置条件与自动 Open 占有策略保持各自范围，删除宿主目录实现不等于补齐这些保证。
+以后若增加另一种 backend，仍须满足稳定逻辑身份、完整内容读取、有界资源、所有修改的最终授权与已确认租期的恢复保护；提供 FileStorage 时还须原生保留对象及其生命周期，不能通过重开原路径或另一份不配对的协调服务模拟。第三方 `limited` 的路径采样缺口、显式内容版本工作流与目录父身份约束保持各自范围。普通 Open 不自动取得 advisory 或强 S/X，宿主目录实现的删除不改变这个选择。

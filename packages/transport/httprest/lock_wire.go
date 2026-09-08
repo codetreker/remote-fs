@@ -295,6 +295,9 @@ func checkLockJSON(decoder *json.Decoder, typ reflect.Type) error {
 		for i := 0; i < typ.NumField(); i++ {
 			field := typ.Field(i)
 			name := strings.Split(field.Tag.Get("json"), ",")[0]
+			if name == "" {
+				name = field.Name
+			}
 			if name != "-" && field.IsExported() {
 				fields[name] = field
 			}

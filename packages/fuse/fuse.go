@@ -1,37 +1,20 @@
-// Package fuse presents one storage.Storage as an ordinary directory tree on the local
-// machine, over FUSE. Linux only (R-INT-8).
+// Package fuse presents a remote namespace as a Linux filesystem. Named tree
+// operations use storage.Storage; open descriptors retain storage.File objects
+// through rename and unlink. Reads capture current contents, and writes complete
+// at the authority before the kernel receives success.
 //
-// FUSE ends here. Nothing above or beside this package speaks the protocol, and nothing
-// below it is shaped by the kernel's demands: storage.Storage is a namespace addressed by
-// path, and its consumers are this package and whoever else calls it. Everything the
-// kernel requires and the namespace does not offer — a number identifying each node, an
-// open file's contents, a mount's lifetime — is built and kept in this package.
+// Direct I/O and zero metadata timeouts keep ordinary read and pread independent
+// of cached contents and lengths. Each mount renews a bounded file session and
+// retires it after kernel teardown. Advisory locks use kernel owner identities;
+// opening a file acquires neither advisory nor strong locks.
 //
-// Nothing is cached. The kernel's entry and attribute timeouts are zero, so every call
-// the kernel makes becomes a call on the storage, and every answer describes the
-// namespace as it is at that moment. That is why this mount needs no change
-// notification: every attribute and every byte it reports is read at the moment it is
-// asked for.
-//
-// The one thing that is held locally is the contents of an open file, because
-// storage.Read and storage.Write deal in whole files. Each open handle reads the file
-// once and serves the kernel's requests out of that buffer; writes patch the buffer and
-// are committed on close. Options.MaxFileSize bounds that buffer, and every operation
-// that would grow one past it fails with EFBIG instead.
-//
-// One figure is held besides: what the namespace last said about the room left in it.
-// Every change that would make a workspace hold more is weighed against it, so that one at
-// its limit refuses at the call that asked — the write(2), the ftruncate(2) — rather than
-// at the close(2) where the commit would discover it, with EDQUOT. That figure goes stale
-// between refreshes by design, and nothing is settled on it — the commit is where the
-// namespace itself refuses, and its answer is the one that stands.
-//
-// Linked into somebody else's process this package touches nothing of that process
-// (R-INT-2): no signal handlers, no writes to its output, no exiting it, no work at
-// import time. Diagnostics go to the Logger the caller supplies, or nowhere.
+// The package changes no process-wide state. Diagnostics go only to the Logger
+// supplied by the caller.
 package fuse
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -45,56 +28,41 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// DefaultMaxFileSize is the ceiling a zero Options gets: one gibibyte.
-//
-// The number is a judgement about what a mount can be asked to hold at once rather than
-// about any one file. An open file's contents are held whole, the commit hands the same
-// bytes to the storage, and several files can be open together, so the ceiling has to
-// leave room for a small multiple of itself in a process that has other work to do. A
-// gibibyte is far above the source files and documents a shared workspace holds, and low
-// enough that a mount cannot be talked into exhausting an ordinary machine.
+// DefaultMaxFileSize bounds each file to one gibibyte. The object backend may
+// materialize a whole revision while applying a range write.
 const DefaultMaxFileSize = 1 << 30
 
-// DefaultFlushTimeout bounds the close commit attempt when Options.FlushTimeout is zero.
+// DefaultFlushTimeout bounds owner and reference cleanup when unspecified.
 const DefaultFlushTimeout = 30 * time.Second
 
 // Options configure a mount.
 type Options struct {
-	// Logger receives diagnostics, from this package and from the FUSE library beneath
-	// it. A nil Logger discards them; there is deliberately no default destination,
-	// because the only ones available would be the caller's own output.
+	// Logger receives diagnostics from this package and the FUSE library.
+	// A nil Logger discards them without selecting process output.
 	Logger *log.Logger
+	Debug  bool
 
-	// Debug adds a trace of every kernel request and reply to Logger.
-	Debug bool
-
-	// MaxFileSize is the largest file, in bytes, this mount will hold. A request to
-	// exceed it fails with EFBIG, and a file the namespace reports as larger cannot be
-	// opened. It is the configurable ceiling R-INT-3 requires on the one resource this
-	// package accumulates.
-	//
-	// The ceiling exists because an open file's contents are held whole in memory, so
-	// one caller's `truncate -s 1T` would otherwise ask the runtime for a terabyte. Go
-	// answers an allocation it cannot satisfy with a fatal error rather than a panic:
-	// neither recover nor the FUSE library's panic handling can catch it, and the
-	// process this package is linked into dies with it (R-INT-1, R-INT-2).
-	//
-	// Zero means DefaultMaxFileSize. There is deliberately no value meaning "no ceiling":
-	// a caller who needs a larger one names it, which is a decision, where an omission
-	// would be an oversight.
+	// MaxFileSize limits the size this mount opens or produces. Requests that
+	// exceed it fail with EFBIG before allocating in proportion to that size.
+	// Zero selects DefaultMaxFileSize; negative values are invalid.
 	MaxFileSize int64
 
-	// FlushTimeout bounds the storage context for one close commit attempt. Request
-	// cancellation does not cancel that attempt; an earlier request deadline still
-	// applies. Waiting for the handle lock consumes this budget but cannot itself be
-	// interrupted, and this option does not bound Mount.Wait or Mount.Unmount.
-	// Zero means DefaultFlushTimeout; negative values are invalid.
+	// FlushTimeout bounds owner and reference cleanup after descriptor close,
+	// session retirement, and mount setup. Cleanup ignores request cancellation
+	// but preserves an earlier request deadline. It does not bound kernel
+	// unmount or Mount.Wait. Zero selects DefaultFlushTimeout.
 	FlushTimeout time.Duration
+
+	// FileSession selects lifetime and resource bounds for this mount's dedicated
+	// native session. Nil selects storage.DefaultFileSessionOptions. The supplied
+	// value is copied; every explicitly supplied field must be valid. Its
+	// MaxFileSize is replaced by the resolved mount ceiling above.
+	FileSession *storage.FileSessionOptions
 }
 
 func (o Options) flushTimeout() (time.Duration, error) {
 	if o.FlushTimeout < 0 {
-		return 0, fmt.Errorf("fuse: FlushTimeout is %s; a close commit timeout cannot be negative", o.FlushTimeout)
+		return 0, fmt.Errorf("fuse: FlushTimeout is %s; a cleanup timeout cannot be negative", o.FlushTimeout)
 	}
 	if o.FlushTimeout == 0 {
 		return DefaultFlushTimeout, nil
@@ -102,17 +70,22 @@ func (o Options) flushTimeout() (time.Duration, error) {
 	return o.FlushTimeout, nil
 }
 
-// Mount is one namespace presented at one mountpoint.
+// Mount owns one kernel connection and its dedicated file session.
 type Mount struct {
-	server *gofuse.Server
+	server interface{ Unmount() error }
+	ns     *namespace
+	done   chan struct{}
+	err    error
 }
 
-// New mounts s at mountpoint, which must be an existing directory, and returns once the
-// filesystem is answering kernel calls.
+// New mounts s at an existing directory and returns once kernel requests can
+// be served. Every dependency must support storage.FileStorage. The mount owns
+// its file session; the caller retains ownership of s. If setup fails after
+// attachment and rollback cannot detach the kernel, New returns both a Mount
+// and an error. The caller must retain s and finish unmounting that Mount.
 func New(mountpoint string, s storage.Storage, opts Options) (*Mount, error) {
-	// The mountpoint is checked here rather than left to fusermount, which the FUSE
-	// library runs with this process's own standard error attached and which would
-	// therefore print its complaint into the caller's output (R-INT-2).
+	// fusermount attaches its diagnostics to process stderr, so reject local
+	// mountpoint errors before invoking it.
 	info, err := os.Stat(mountpoint)
 	if err != nil {
 		return nil, err
@@ -121,84 +94,91 @@ func New(mountpoint string, s storage.Storage, opts Options) (*Mount, error) {
 		return nil, &os.PathError{Op: "mount", Path: mountpoint, Err: syscall.ENOTDIR}
 	}
 	if opts.MaxFileSize < 0 {
-		return nil, fmt.Errorf("fuse: MaxFileSize is %d; a ceiling on a file's size cannot be negative",
-			opts.MaxFileSize)
+		return nil, fmt.Errorf("fuse: MaxFileSize is %d; a file size ceiling cannot be negative", opts.MaxFileSize)
 	}
-	maxFileSize := opts.MaxFileSize
-	if maxFileSize == 0 {
-		maxFileSize = DefaultMaxFileSize
-	}
-	flushTimeout, err := opts.flushTimeout()
-	if err != nil {
+	if _, err := opts.flushTimeout(); err != nil {
 		return nil, err
 	}
-
 	logger := opts.Logger
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
-
-	root := &node{
-		ns: &namespace{
-			storage:      s,
-			owner:        gofuse.Owner{Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid())},
-			maxFileSize:  maxFileSize,
-			flushTimeout: flushTimeout,
-		},
-		id: rootIdentity(),
-	}
-
-	// Zero everywhere: the kernel may not hold on to an entry, an attribute, or the
-	// absence of a name for any length of time.
-	never := time.Duration(0)
-	options := &fs.Options{
-		EntryTimeout:    &never,
-		AttrTimeout:     &never,
-		NegativeTimeout: &never,
-		Logger:          logger,
-		// The FUSE library takes the root's number from here and would otherwise report
-		// it as zero, the number a filesystem uses to say a node has no identity. The
-		// root is a node like any other in the tree this mount identifies.
-		RootStableAttr: &fs.StableAttr{Mode: syscall.S_IFDIR, Ino: root.id.ino},
-		// Without this the FUSE library replaces a mode with no permission bits in it by
-		// 0644, or 0755 for a directory, on the way to the kernel. A file the namespace
-		// holds at 0000 is a file somebody set to 0000, and reporting it as readable is a
-		// fact this mount made up (R-ERR-2) — one that a program checking whether it may
-		// read something would act on.
-		NullPermissions: true,
-		MountOptions: gofuse.MountOptions{
-			FsName: "remote-fs",
-			Name:   "remote-fs",
-			Logger: logger,
-			Debug:  opts.Debug,
-			// With this negotiated the kernel carries O_TRUNC into Open, so opening a
-			// file in order to replace it does not first fetch the contents that are
-			// about to be discarded. Without it the kernel sends a separate truncation
-			// instead, which Setattr handles; both paths have to work, because whether
-			// it is negotiated is the kernel's decision.
-			ExtraCapabilities: gofuse.CAP_ATOMIC_O_TRUNC,
-			// The namespace has no extended attributes. Left to the FUSE library the
-			// answer would be "this file has no such attribute", which is a claim about
-			// the file; this makes the answer "this filesystem has none", after which
-			// the kernel stops asking.
-			DisableXAttrs: true,
-		},
-	}
-
-	server, err := fs.Mount(mountpoint, root, options)
+	ns, err := newNamespace(context.Background(), s, opts, logger)
 	if err != nil {
 		return nil, err
 	}
-	return &Mount{server: server}, nil
+	ns.owner = gofuse.Owner{Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid())}
+	ask, cancel := context.WithTimeout(context.Background(), ns.flushTimeout)
+	attr, err := s.Stat(ask, "")
+	cancel()
+	if err == nil && (attr.ID == 0 || !attr.Mode.IsDir()) {
+		err = syscall.EIO
+	}
+	if err != nil {
+		return nil, errors.Join(err, ns.stopSession())
+	}
+	root := &node{ns: ns, id: rootIdentity(attr.ID)}
+	never := time.Duration(0)
+	options := &fs.Options{
+		EntryTimeout: &never, AttrTimeout: &never, NegativeTimeout: &never,
+		Logger:         logger,
+		RootStableAttr: &fs.StableAttr{Mode: syscall.S_IFDIR, Ino: root.id.ino},
+		// Zero permission bits are an actual namespace mode, not an omitted default.
+		NullPermissions: true,
+		MountOptions: gofuse.MountOptions{
+			FsName: "remote-fs", Name: "remote-fs", Logger: logger, Debug: opts.Debug,
+			ExtraCapabilities: gofuse.CAP_ATOMIC_O_TRUNC,
+			DisableXAttrs:     true, EnableLocks: true,
+		},
+	}
+	raw := newRawFilesystem(fs.NewNodeFS(root, options), ns)
+	server, err := gofuse.NewServer(raw, mountpoint, &options.MountOptions)
+	if err != nil {
+		return nil, errors.Join(err, ns.stopSession())
+	}
+	m := &Mount{server: server, ns: ns, done: make(chan struct{})}
+	go func() {
+		server.Serve()
+		m.err = ns.stopSession()
+		close(m.done)
+	}()
+	return m.ready(server.WaitMount())
 }
 
-// Unmount detaches the mountpoint. It fails with EBUSY while anything still holds a file
-// or a working directory inside it.
-func (m *Mount) Unmount() error { return m.server.Unmount() }
+func (m *Mount) ready(handshakeErr error) (*Mount, error) {
+	if handshakeErr == nil {
+		return m, nil
+	}
+	// WaitMount's poll probe can fail while Serve is still live. Detachment
+	// must precede waiting for teardown; a failed rollback retains ownership.
+	cleanupErr := m.Unmount()
+	select {
+	case <-m.done:
+		return nil, errors.Join(handshakeErr, cleanupErr, m.Wait())
+	default:
+		return m, errors.Join(handshakeErr, cleanupErr)
+	}
+}
 
-// Wait returns once the filesystem has stopped serving, whether because it was unmounted
-// or because the kernel tore the connection down.
-func (m *Mount) Wait() { m.server.Wait() }
+// Unmount detaches the kernel connection and waits for session retirement. A
+// busy kernel connection leaves the mount and its renewals alive. A cleanup error after
+// successful detachment is also returned; Done distinguishes these outcomes.
+func (m *Mount) Unmount() error {
+	if err := m.server.Unmount(); err != nil {
+		return err
+	}
+	return m.Wait()
+}
 
-// errnoOf converts once at a FUSE callback boundary; internal operations retain their causes.
+// Done closes after kernel teardown and the native session cleanup attempt.
+// A closed channel does not imply cleanup succeeded; Wait returns its result.
+func (m *Mount) Done() <-chan struct{} { return m.done }
+
+// Wait waits for kernel teardown and session retirement, including when the
+// kernel ends the connection externally. Unknown cleanup returns an error.
+func (m *Mount) Wait() error {
+	<-m.done
+	return m.err
+}
+
 func errnoOf(err error) syscall.Errno { return storage.ErrnoOf(err) }

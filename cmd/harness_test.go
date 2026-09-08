@@ -3,9 +3,12 @@
 package cmd_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -13,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -57,7 +61,8 @@ type namespaceServer struct {
 
 	// stop makes the server unreachable, the way a machine going away makes it
 	// unreachable: the listener closes and every connection is severed.
-	stop func()
+	stop        func()
+	unavailable <-chan struct{}
 }
 
 func serveNamespace(t *testing.T) *namespaceServer {
@@ -108,7 +113,7 @@ func serveStorage(t *testing.T, namespace storage.Storage, log metastore.Log) *n
 	if err != nil {
 		t.Fatal(err)
 	}
-	counted := &calls{handler: handler, counts: map[string]int{}}
+	counted := &calls{handler: handler, counts: map[string]int{}, changed: make(chan struct{})}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -128,26 +133,127 @@ func serveStorage(t *testing.T, namespace storage.Storage, log metastore.Log) *n
 		once.Do(func() {
 			httpServer.Close()
 			<-served
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := handler.Close(ctx); err != nil {
+				t.Errorf("closing handler file sessions: %v", err)
+			}
 		})
 	}
 	t.Cleanup(stop)
 
-	return &namespaceServer{url: "http://" + listener.Addr().String(), authoritative: namespace, calls: counted, stop: stop}
+	return &namespaceServer{url: "http://" + listener.Addr().String(), authoritative: namespace, calls: counted, stop: stop, unavailable: served}
 }
 
 // calls counts the requests that reach the server, by operation.
 type calls struct {
 	handler http.Handler
 
-	mu     sync.Mutex
-	counts map[string]int
+	mu           sync.Mutex
+	counts       map[string]int
+	closedFiles  int
+	closeFailure int
+	changed      chan struct{}
 }
 
 func (c *calls) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	op := strings.TrimPrefix(r.URL.Path, httprest.Prefix)
+	if op == string(httprest.OpFile) || op == string(httprest.OpFileControl) {
+		if fileOp := recordedFileOperation(r); fileOp != "" {
+			op += ":" + fileOp
+		}
+	}
 	c.mu.Lock()
-	c.counts[strings.TrimPrefix(r.URL.Path, httprest.Prefix)]++
+	c.counts[op]++
 	c.mu.Unlock()
+	if op == "file-control:close" {
+		response := &recordedCloseResponse{ResponseWriter: w, status: http.StatusOK}
+		c.handler.ServeHTTP(response, r)
+		c.mu.Lock()
+		if response.status == http.StatusOK {
+			c.closedFiles++
+		} else {
+			c.closeFailure = response.status
+		}
+		close(c.changed)
+		c.changed = make(chan struct{})
+		c.mu.Unlock()
+		return
+	}
 	c.handler.ServeHTTP(w, r)
+}
+
+type recordedCloseResponse struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *recordedCloseResponse) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+// Kernel RELEASE is asynchronous. Setup references must finish their HTTP cleanup
+// before measuring the requests caused by a subsequent namespace walk.
+func (c *calls) waitFileCloses(t *testing.T, expected int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), startup)
+	defer cancel()
+	for {
+		c.mu.Lock()
+		completed, failed, changed := c.closedFiles, c.closeFailure, c.changed
+		c.mu.Unlock()
+		if failed != 0 {
+			t.Fatalf("setup file cleanup returned HTTP %d", failed)
+		}
+		if completed == expected {
+			return
+		}
+		if completed > expected {
+			t.Fatalf("setup closed %d references, want %d", completed, expected)
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			t.Fatalf("setup closed %d of %d references: %v", completed, expected, ctx.Err())
+		}
+	}
+}
+
+// Only the bounded operation prefix is inspected; replay preserves the handler's body
+// parsing, content length and admission behavior.
+func recordedFileOperation(r *http.Request) string {
+	var prefix bytes.Buffer
+	body := r.Body
+	defer func() { r.Body = &recordedRequestBody{Reader: io.MultiReader(&prefix, body), Closer: body} }()
+	decoder := json.NewDecoder(io.TeeReader(io.LimitReader(body, httprest.DefaultMaxLockControlBytes), &prefix))
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') {
+		return ""
+	}
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return ""
+		}
+		if key == "op" {
+			var op string
+			if err := decoder.Decode(&op); err == nil {
+				return op
+			}
+			return ""
+		}
+		var skipped json.RawMessage
+		if err := decoder.Decode(&skipped); err != nil {
+			return ""
+		}
+	}
+	return ""
+}
+
+type recordedRequestBody struct {
+	io.Reader
+	io.Closer
 }
 
 // snapshot is what has arrived so far, so that a later call can be compared against it.
@@ -165,15 +271,23 @@ func (c *calls) snapshot() map[string]int {
 // since renders what has arrived since a snapshot was taken, naming the operations rather
 // than only counting them.
 func (c *calls) since(before map[string]int) string {
+	return c.sinceExcept(before)
+}
+
+func (c *calls) sinceExcept(before map[string]int, allowed ...string) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	var arrived []string
 	for op, count := range c.counts {
+		if slices.Contains(allowed, op) {
+			continue
+		}
 		if extra := count - before[op]; extra > 0 {
 			arrived = append(arrived, fmt.Sprintf("%s×%d", op, extra))
 		}
 	}
+	slices.Sort(arrived)
 	return strings.Join(arrived, " ")
 }
 
@@ -193,22 +307,24 @@ func mountpointOn(t *testing.T, s *namespaceServer) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	served := copyOf(t, namespace)
+	served := copyOf(t, namespace, s.unavailable)
 	// Registered before the mount so that it is removed after the unmount: cleanups run
 	// in reverse, and removing a directory that is still mounted does not work.
 	mountpoint := t.TempDir()
 
 	m, err := fuse.New(mountpoint, served, fuse.Options{Logger: testLogger(t)})
+	if m != nil {
+		t.Cleanup(func() { unmount(t, m, mountpoint, s.unavailable) })
+	}
 	if err != nil {
 		t.Fatalf("mounting %s at %s: %v", s.url, mountpoint, err)
 	}
-	t.Cleanup(func() { unmount(t, m, mountpoint) })
 	return mountpoint
 }
 
 // copyOf builds the local copy the mount is served from, and reports the namespace itself for
 // one that keeps no log.
-func copyOf(t *testing.T, namespace *httprest.Storage) storage.Storage {
+func copyOf(t *testing.T, namespace *httprest.Storage, unavailable <-chan struct{}) storage.Storage {
 	t.Helper()
 
 	replica, err := sqlite.OpenReplica(t.Context(), filepath.Join(t.TempDir(), "replica.db"))
@@ -224,8 +340,39 @@ func copyOf(t *testing.T, namespace *httprest.Storage) storage.Storage {
 		replica.Close()
 		t.Fatalf("copying the namespace's metadata: %v", err)
 	}
-	t.Cleanup(func() { served.Close() })
+	t.Cleanup(func() {
+		if err := served.Close(); err != nil {
+			select {
+			case <-unavailable:
+				if onlyFailedFileSessionCleanup(err) {
+					t.Logf("replica file-session cleanup after the authority stopped: %v", err)
+					return
+				}
+			default:
+			}
+			t.Errorf("closing metadata replica: %v", err)
+		}
+	})
 	return served
+}
+
+// Replica Close joins remote session failures with local database failures. Every
+// component must identify file-control cleanup before an unavailable server explains it.
+func onlyFailedFileSessionCleanup(err error) bool {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		parts := joined.Unwrap()
+		for _, part := range parts {
+			if !onlyFailedFileSessionCleanup(part) {
+				return false
+			}
+		}
+		return len(parts) != 0
+	}
+	classified, ok := err.(interface{ Classification() error })
+	if !ok || !strings.HasPrefix(err.Error(), "file-control:") {
+		return false
+	}
+	return errors.Is(classified.Classification(), syscall.EIO) || errors.Is(classified.Classification(), syscall.ESTALE)
 }
 
 func requireFUSE(t *testing.T) {
@@ -242,13 +389,34 @@ func requireFUSE(t *testing.T) {
 
 // unmount detaches a mountpoint whether or not the test passed. Detaching fails while
 // anything still holds a file inside, which after a failed test it may briefly do.
-func unmount(t *testing.T, m *fuse.Mount, mountpoint string) {
+func unmount(t *testing.T, m *fuse.Mount, mountpoint string, unavailable <-chan struct{}) {
 	t.Helper()
+	finish := func() {
+		err := m.Wait()
+		if err == nil {
+			return
+		}
+		select {
+		case <-unavailable:
+			if errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ESTALE) {
+				t.Logf("file-session cleanup after the authority stopped: %v", err)
+				return
+			}
+		default:
+		}
+		t.Errorf("closing mounted files at %s: %v", mountpoint, err)
+	}
 	var err error
 	for attempt := range 20 {
 		if err = m.Unmount(); err == nil {
-			m.Wait()
+			finish()
 			return
+		}
+		select {
+		case <-m.Done():
+			finish()
+			return
+		default:
 		}
 		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
 	}
@@ -283,6 +451,57 @@ func errnoOf(err error) syscall.Errno {
 type symlinkMetadata struct {
 	*objectstore.Storage
 	linkID uint64
+}
+
+func (s *symlinkMetadata) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+	session, err := s.Storage.NewFileSession(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &symlinkFileSession{FileSession: session, metadata: s}, nil
+}
+
+type symlinkFileSession struct {
+	storage.FileSession
+	metadata *symlinkMetadata
+}
+
+func (s *symlinkFileSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
+	attr, err := s.FileSession.StatNode(ctx, id)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	return s.metadata.describe(attr), nil
+}
+
+func (s *symlinkFileSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
+	if err := options.CheckNode(id); err != nil {
+		return nil, err
+	}
+	if id == s.metadata.linkID {
+		return nil, syscall.ELOOP
+	}
+	return s.FileSession.OpenNode(ctx, id, options)
+}
+
+func (s *symlinkFileSession) OpenFile(ctx context.Context, name string, options storage.FileOpenOptions) (storage.File, error) {
+	if err := options.Check(); err != nil {
+		return nil, err
+	}
+	attr, err := s.metadata.Stat(ctx, name)
+	if err == nil && attr.ID == s.metadata.linkID {
+		if options.ExpectedID != 0 && options.ExpectedID != attr.ID {
+			return nil, syscall.ESTALE
+		}
+		if options.Create && options.Exclusive {
+			return nil, syscall.EEXIST
+		}
+		return nil, syscall.ELOOP
+	}
+	if err != nil && !errors.Is(err, syscall.ENOENT) {
+		return nil, err
+	}
+	return s.FileSession.OpenFile(ctx, name, options)
 }
 
 func (s *symlinkMetadata) describe(attr storage.Attr) storage.Attr {

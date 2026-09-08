@@ -105,7 +105,7 @@ func TestHistoricalLeaseMigrationPreservesAcceptedDurableProof(t *testing.T) {
 	if len(accepted) != 1 || len(visible) != 1 || accepted[0] != want || visible[0] != want {
 		t.Fatalf("migration witness acceptance = %+v, visible = %+v; want %+v", accepted, visible, want)
 	}
-	assertHistoricalLeaseSchemaVersion(t, path, 4)
+	assertHistoricalLeaseSchemaVersion(t, path, 5)
 }
 
 func TestHistoricalLeaseMigrationRefusesRollbackBeforeChangingSchema(t *testing.T) {
@@ -171,7 +171,7 @@ func TestHistoricalLeaseMigrationProtectsEveryNamespaceAcrossReopen(t *testing.T
 	})
 	assertHistoricalLeaseNamespace(t, first.Store, "A")
 	assertHistoricalLeaseRows(t, path, before)
-	assertHistoricalLeaseSchemaVersion(t, path, 4)
+	assertHistoricalLeaseSchemaVersion(t, path, 5)
 	acquireHistoricalLease(t, first.LockService(), "alpha.txt")
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
@@ -309,9 +309,10 @@ func historicalLeaseRows(t *testing.T, path string) map[string][][]any {
 	db := historicalLeaseReadOnly(t, path)
 	result := make(map[string][][]any)
 	for table, query := range map[string]string{
-		"backing_store":   `SELECT * FROM backing_store ORDER BY singleton`,
-		"namespaces":      `SELECT * FROM namespaces ORDER BY id`,
-		"nodes":           `SELECT * FROM nodes ORDER BY id`,
+		"backing_store": `SELECT * FROM backing_store ORDER BY singleton`,
+		"namespaces":    `SELECT * FROM namespaces ORDER BY id`,
+		"nodes": `SELECT id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content
+			FROM nodes ORDER BY id`,
 		"entries":         `SELECT * FROM entries ORDER BY namespace, parent, name`,
 		"objects":         `SELECT * FROM objects ORDER BY key`,
 		"logs":            `SELECT * FROM logs ORDER BY namespace`,

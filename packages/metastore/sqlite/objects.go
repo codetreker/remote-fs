@@ -78,37 +78,41 @@ func (s *Store) Reserve(ctx context.Context, path string, size int64) (metastore
 		if err := s.roomFor(ctx, tx, size-held); err != nil {
 			return err
 		}
-		// Admission reads only the indexed reserved, unresolved, and garbage ranges. Full
-		// validation is performed when the namespace opens and when ObjectStatus is requested;
-		// putting that scan here would make every write grow with the live namespace.
-		status, err := readPendingObjectStatus(ctx, tx, s.namespace, s.objectLimits)
-		if err != nil {
-			return err
-		}
-		if wouldExceed(s.objectLimits.MaxPendingObjects,
-			status.ReservedCount, status.UnresolvedCount, status.GarbageCount, 1) {
-			return fmt.Errorf(
-				"the pending object backlog holds %d reserved, %d unresolved, and %d garbage objects under its limit of %d: %w",
-				status.ReservedCount, status.UnresolvedCount, status.GarbageCount,
-				s.objectLimits.MaxPendingObjects, syscall.EAGAIN)
-		}
-		if wouldExceed(s.objectLimits.MaxPendingBytes,
-			status.ReservedBytes, status.UnresolvedBytes, status.GarbageBytes, size) {
-			return fmt.Errorf(
-				"the pending object backlog holds %d reserved, %d unresolved, and %d garbage bytes and cannot accept %d more under its limit of %d: %w",
-				status.ReservedBytes, status.UnresolvedBytes, status.GarbageBytes, size,
-				s.objectLimits.MaxPendingBytes, syscall.EAGAIN)
-		}
-
-		_, err = tx.ExecContext(ctx, `
-			INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
-			VALUES (?, ?, ?, ?, NULL, ?, ?)`,
-			string(key), s.namespace, stateReserved, size, sec, nsec)
-		return err
+		return s.reserveObject(ctx, tx, key, size, sec, nsec)
 	}); err != nil {
 		return "", pathError("reserve", path, failure(err))
 	}
 	return key, nil
+}
+
+func (s *Store) reserveObject(ctx context.Context, tx *sql.Tx, key metastore.Key, size, sec int64, nsec int32) error {
+	// Admission reads only the indexed reserved, unresolved, and garbage ranges. Full
+	// validation is performed when the namespace opens and when ObjectStatus is requested;
+	// putting that scan here would make every write grow with the live namespace.
+	status, err := readPendingObjectStatus(ctx, tx, s.namespace, s.objectLimits)
+	if err != nil {
+		return err
+	}
+	if wouldExceed(s.objectLimits.MaxPendingObjects,
+		status.ReservedCount, status.UnresolvedCount, status.GarbageCount, 1) {
+		return fmt.Errorf(
+			"the pending object backlog holds %d reserved, %d unresolved, and %d garbage objects under its limit of %d: %w",
+			status.ReservedCount, status.UnresolvedCount, status.GarbageCount,
+			s.objectLimits.MaxPendingObjects, syscall.EAGAIN)
+	}
+	if wouldExceed(s.objectLimits.MaxPendingBytes,
+		status.ReservedBytes, status.UnresolvedBytes, status.GarbageBytes, size) {
+		return fmt.Errorf(
+			"the pending object backlog holds %d reserved, %d unresolved, and %d garbage bytes and cannot accept %d more under its limit of %d: %w",
+			status.ReservedBytes, status.UnresolvedBytes, status.GarbageBytes, size,
+			s.objectLimits.MaxPendingBytes, syscall.EAGAIN)
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
+		VALUES (?, ?, ?, ?, NULL, ?, ?)`,
+		string(key), s.namespace, stateReserved, size, sec, nsec)
+	return err
 }
 
 // Quarantine retires a reservation whose Put did not establish ownership of the key.
@@ -166,7 +170,7 @@ func (s *Store) Abandon(ctx context.Context, key metastore.Key) error {
 		case stateGarbage:
 			return nil
 		case stateReferenced:
-			return fmt.Errorf("object %q is referenced by a name: %w", key, syscall.EINVAL)
+			return fmt.Errorf("object %q is referenced by a file: %w", key, syscall.EINVAL)
 		case stateUnresolved:
 			return fmt.Errorf("ownership of object %q is unresolved: %w", key, syscall.EINVAL)
 		default:
@@ -257,6 +261,9 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 
 	sec, nsec := storedTime(object.ModTime)
 	if found {
+		if err := s.advanceContentRevision(ctx, tx, node.ID); err != nil {
+			return err
+		}
 		// The mode the file already had stands: replacing the contents is not a request to
 		// change it, and the access time belongs to whoever last read the file.
 		if _, err := tx.ExecContext(ctx,
@@ -617,6 +624,10 @@ func validateIntegrityBytes(
 // validateStorageClasses rejects SQLite's dynamically typed values before any cursor or
 // payload reader can coerce them into a plausible row or order them in another storage class.
 func validateStorageClasses(ctx context.Context, db integrityQueryer, namespace *int64) error {
+	return validateStorageClassesVersion(ctx, db, namespace, schema.Version())
+}
+
+func validateStorageClassesVersion(ctx context.Context, db integrityQueryer, namespace *int64, version int) error {
 	namespaceWhere := ""
 	nodeWhere := ""
 	objectWhere := ""
@@ -655,6 +666,10 @@ func validateStorageClasses(ctx context.Context, db integrityQueryer, namespace 
 		objectArgs = []any{*namespace, *namespace}
 		entryArgs = []any{*namespace, *namespace, *namespace}
 	}
+	retainedNodeClasses := ""
+	if version >= firstRetainedFileSchemaVersion {
+		retainedNodeClasses = ` OR typeof(detached) != 'integer' OR typeof(content_revision) != 'integer'`
+	}
 	queries := []struct {
 		name  string
 		query string
@@ -666,7 +681,7 @@ func validateStorageClasses(ctx context.Context, db integrityQueryer, namespace 
 			typeof(mode) != 'integer' OR typeof(size) != 'integer' OR
 			typeof(atime_sec) != 'integer' OR typeof(atime_nsec) != 'integer' OR
 			typeof(mtime_sec) != 'integer' OR typeof(mtime_nsec) != 'integer' OR
-			typeof(content) NOT IN ('text', 'null'))`, scopeArgs},
+			typeof(content) NOT IN ('text', 'null')` + retainedNodeClasses + `)`, scopeArgs},
 		{"objects", `SELECT count(*) FROM objects o ` + objectWhere + predicateJoin(objectWhere) + `(
 			typeof(o.key) != 'text' OR o.key = '' OR
 			typeof(o.namespace) != 'integer' OR o.namespace <= 0 OR
@@ -736,6 +751,10 @@ func predicateJoin(where string) string {
 }
 
 func validateNodeValues(ctx context.Context, db integrityQueryer, namespace *int64) error {
+	return validateNodeValuesVersion(ctx, db, namespace, schema.Version())
+}
+
+func validateNodeValuesVersion(ctx context.Context, db integrityQueryer, namespace *int64, version int) error {
 	where := ""
 	var args []any
 	if namespace != nil {
@@ -748,6 +767,10 @@ func validateNodeValues(ctx context.Context, db integrityQueryer, namespace *int
 		int64(math.MaxUint32), int64(fs.ModeType), int64(fs.ModeDir),
 		int64(fs.ModeType), int64(fs.ModeDir), int64(fs.ModeType),
 	)
+	retainedNodeValues := ""
+	if version >= firstRetainedFileSchemaVersion {
+		retainedNodeValues = ` OR detached NOT IN (0, 1) OR content_revision < 1`
+	}
 	var invalid int64
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*) FROM nodes `+where+`(
@@ -755,7 +778,7 @@ func validateNodeValues(ctx context.Context, db integrityQueryer, namespace *int
 			atime_nsec < 0 OR atime_nsec >= 1000000000 OR
 			mtime_nsec < 0 OR mtime_nsec >= 1000000000 OR
 			((mode & ?) = ? AND (size != 0 OR content IS NOT NULL)) OR
-			(content IS NOT NULL AND content = '')
+			(content IS NOT NULL AND content = '')`+retainedNodeValues+`
 		)`, args...).Scan(&invalid); err != nil {
 		return err
 	}
@@ -1030,29 +1053,49 @@ func validateNamespaceIntegrity(
 	namespace int64,
 	maxIntegrityRecords, maxIntegrityBytes int64,
 ) error {
-	if err := validateIntegrityWork(ctx, db, &namespace, maxIntegrityRecords); err != nil {
+	return validateIntegrity(ctx, db, &namespace, maxIntegrityRecords, maxIntegrityBytes, schema.Version())
+}
+
+// A nil namespace validates the complete database for migration or exclusive-owner recovery.
+// Version selects the stored layout explicitly; ordinary readers validate the current schema.
+func validateIntegrity(
+	ctx context.Context,
+	db integrityQueryer,
+	namespace *int64,
+	maxIntegrityRecords, maxIntegrityBytes int64,
+	version int,
+) error {
+	if err := validateIntegrityWork(ctx, db, namespace, maxIntegrityRecords); err != nil {
 		return err
 	}
-	if err := validateIntegrityBytes(ctx, db, &namespace, maxIntegrityBytes, schema.Version()); err != nil {
+	if err := validateIntegrityBytes(ctx, db, namespace, maxIntegrityBytes, version); err != nil {
 		return err
 	}
-	if err := validateStorageClasses(ctx, db, &namespace); err != nil {
+	if err := validateStorageClassesVersion(ctx, db, namespace, version); err != nil {
 		return err
 	}
-	if err := validateIdentityBounds(ctx, db, namespace); err != nil {
+	if namespace == nil {
+		if _, err := validateDurableState(ctx, db); err != nil {
+			return err
+		}
+	} else if err := validateIdentityBounds(ctx, db, *namespace); err != nil {
 		return err
 	}
-	if err := validateNodeValues(ctx, db, &namespace); err != nil {
+	if err := validateNodeValuesVersion(ctx, db, namespace, version); err != nil {
 		return err
+	}
+	where := ""
+	args := []any{stateReserved, stateReferenced, stateGarbage, stateUnresolved}
+	if namespace != nil {
+		where = "WHERE namespace = ?"
+		args = append(args, *namespace)
 	}
 	var invalidStates, invalidSizes int64
 	if err := db.QueryRowContext(ctx, `
 		SELECT
 			coalesce(sum(CASE WHEN typeof(state) != 'integer' OR state NOT IN (?, ?, ?, ?) THEN 1 ELSE 0 END), 0),
 			coalesce(sum(CASE WHEN typeof(size) != 'integer' OR size < 0 THEN 1 ELSE 0 END), 0)
-		FROM objects
-		WHERE namespace = ?`,
-		stateReserved, stateReferenced, stateGarbage, stateUnresolved, namespace).Scan(
+		FROM objects `+where, args...).Scan(
 		&invalidStates, &invalidSizes,
 	); err != nil {
 		return err
@@ -1061,16 +1104,16 @@ func validateNamespaceIntegrity(
 		return fmt.Errorf("the database holds %d objects in an unknown state and %d objects with an invalid size: %w",
 			invalidStates, invalidSizes, syscall.EIO)
 	}
-	if err := validateObjectRelationships(ctx, db, &namespace); err != nil {
+	if err := validateObjectRelationships(ctx, db, namespace); err != nil {
 		return err
 	}
-	if err := validateNodeRelationships(ctx, db, &namespace); err != nil {
+	if err := validateNodeRelationshipsVersion(ctx, db, namespace, version); err != nil {
 		return err
 	}
-	if err := validateUsedAccounting(ctx, db, &namespace); err != nil {
+	if err := validateUsedAccounting(ctx, db, namespace); err != nil {
 		return err
 	}
-	return validateLogIntegrity(ctx, db, &namespace)
+	return validateLogIntegrity(ctx, db, namespace)
 }
 
 // validateObjectRelationships checks both directions of the node/object relation. A nil
@@ -1234,13 +1277,21 @@ func validateVersionOneNodeRelationships(ctx context.Context, db integrityQuerye
 	return nil
 }
 
-// validateNodeRelationships checks the entry cardinality that makes nodes a tree. The root has
-// no name, every other node has exactly one, and an entry belongs to the same namespace as both
-// nodes it connects. A nil namespace validates every namespace before a legacy migration.
+// Linked nodes form one tree per namespace. Detached nodes are regular non-root files with no
+// incoming or outgoing entries. A nil namespace validates every namespace.
 func validateNodeRelationships(
 	ctx context.Context,
 	db integrityQueryer,
 	namespace *int64,
+) error {
+	return validateNodeRelationshipsVersion(ctx, db, namespace, schema.Version())
+}
+
+func validateNodeRelationshipsVersion(
+	ctx context.Context,
+	db integrityQueryer,
+	namespace *int64,
+	version int,
 ) error {
 	namespaceWhere := ""
 	nodeWhere := ""
@@ -1253,6 +1304,20 @@ func validateNodeRelationships(
 		scopeArgs = []any{*namespace}
 	}
 
+	retainedRoot := ""
+	retainedNode := ""
+	retainedEntry := ""
+	nodeArgs := []any{}
+	if version >= firstRetainedFileSchemaVersion {
+		retainedRoot = ` OR root.detached != 0`
+		retainedNode = `
+				WHEN n.detached = 1 THEN CASE
+					WHEN n.id = ns.root OR (n.mode & ?) != 0 OR count(e.node) != 0
+					THEN 1 ELSE 0 END`
+		retainedEntry = ` OR parent.detached != 0 OR child.detached != 0`
+		nodeArgs = append(nodeArgs, int64(fs.ModeType))
+	}
+	nodeArgs = append(nodeArgs, scopeArgs...)
 	rootArgs := append([]any{int64(fs.ModeDir)}, scopeArgs...)
 	var invalidRoots int64
 	if err := db.QueryRowContext(ctx, `
@@ -1261,7 +1326,7 @@ func validateNodeRelationships(
 				OR root.id IS NULL
 				OR root.namespace != ns.id
 				OR typeof(root.mode) != 'integer'
-				OR (root.mode & ?) = 0
+				OR (root.mode & ?) = 0`+retainedRoot+`
 			THEN 1 ELSE 0
 		END), 0)
 		FROM namespaces ns
@@ -1275,7 +1340,7 @@ func validateNodeRelationships(
 		SELECT coalesce(sum(invalid), 0)
 		FROM (
 			SELECT CASE
-				WHEN ns.id IS NULL THEN 1
+				WHEN ns.id IS NULL THEN 1`+retainedNode+`
 				WHEN n.id = ns.root AND count(e.node) != 0 THEN 1
 				WHEN n.id != ns.root AND (
 					count(e.node) != 1
@@ -1288,7 +1353,7 @@ func validateNodeRelationships(
 			LEFT JOIN entries e ON e.node = n.id
 			`+nodeWhere+`
 			GROUP BY n.id, n.namespace, ns.id, ns.root
-		)`, scopeArgs...).Scan(&invalidNodes); err != nil {
+		)`, nodeArgs...).Scan(&invalidNodes); err != nil {
 		return err
 	}
 
@@ -1305,7 +1370,7 @@ func validateNodeRelationships(
 				OR e.namespace != parent.namespace
 				OR e.namespace != child.namespace
 				OR typeof(parent.mode) != 'integer'
-				OR (parent.mode & ?) = 0
+				OR (parent.mode & ?) = 0`+retainedEntry+`
 			THEN 1 ELSE 0
 		END), 0)
 		FROM entries e
@@ -1320,7 +1385,7 @@ func validateNodeRelationships(
 			"the database holds %d invalid namespace roots, %d nodes with invalid entry cardinality, and %d entries crossing an invalid relationship: %w",
 			invalidRoots, invalidNodes, invalidEntries, syscall.EIO)
 	}
-	return validateNodeReachability(ctx, db, namespace)
+	return validateNodeReachability(ctx, db, namespace, version)
 }
 
 // validateNodeReachability proves that the cardinality-checked entry graph is one tree rooted
@@ -1330,6 +1395,7 @@ func validateNodeReachability(
 	ctx context.Context,
 	db integrityQueryer,
 	namespace *int64,
+	version int,
 ) error {
 	seedWhere := ""
 	nodeWhere := ""
@@ -1338,6 +1404,9 @@ func validateNodeReachability(
 		seedWhere = "WHERE id = ?"
 		nodeWhere = " AND n.namespace = ?"
 		args = []any{*namespace, *namespace}
+	}
+	if version >= firstRetainedFileSchemaVersion {
+		nodeWhere += " AND n.detached = 0"
 	}
 
 	var unreachableNodes int64

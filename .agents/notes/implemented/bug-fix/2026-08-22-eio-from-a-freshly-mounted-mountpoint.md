@@ -16,7 +16,7 @@ stat "over.bin": Get "http://…/<protocol>/stat?path=over.bin": context cancele
 
 四项历史用例各运行 100 次的固定样本记录了 398 次通过与两次失败：一次文件关闭返回 `EAGAIN`；一次在配额 65536 字节、已有 32768 字节时，`Write` 成功接受 36864 字节，直到 `Close` 才以 `EDQUOT` 拒绝。原样本未保存取消原因的轨迹，因此不能把其每次失败直接归因于特定信号。
 
-同步信号探针分别证明了两条机制。关闭请求在写入确认 admission 前被中断，真实 `replicated.Write` 返回 `EAGAIN`，HTTP `Write` 发出零次，存储中的内容保持原样，但 `Close` 已消耗描述符，随后查询该描述符得到 `EBADF`。另一条探针在初次 `Space` 查询期间中断 `Write`：真实查询返回 `EINTR`，缓冲区仍接受全部 36864 字节，提交才被配额拒绝；存储里的目标内容没有越过配额。关闭不能依赖调用方重试，容量探测的取消也不能被当作没有测量结果继续写入；后者违反 R-WS-5 对拒绝时刻的要求。
+当时的同步信号探针分别证明了两条机制。关闭请求在写入确认 admission 前被中断，真实 `replicated.Write` 返回 `EAGAIN`，HTTP `Write` 发出零次，存储中的内容保持原样，但 `Close` 已消耗描述符，随后查询该描述符得到 `EBADF`。另一条探针在初次 `Space` 查询期间中断 `Write`：真实查询返回 `EINTR`，缓冲区仍接受全部 36864 字节，提交才被配额拒绝；存储里的目标内容没有越过配额。关闭不能依赖调用方重试，未完成的容量探测也不能在先接受内容后把拒绝推迟到关闭。这些是旧缓冲路径的观测，当前[实时文件句柄](../architecture/2026-09-08-live-file-handles.md)已将普通修改改为同步确认。
 
 ## 决定
 
@@ -36,25 +36,27 @@ stat "over.bin": Get "http://…/<protocol>/stat?path=over.bin": context cancele
 | mutation 已进入 HTTP `Do`，未获得权威结果 | 无法证明请求未发出或修改未发生，返回 `EIO` |
 | mutation 已成功，副本 barrier 确认被取消 | 命名空间已经改变，返回 `EIO` |
 | FUSE 复合操作已有本地或命名空间效果，后续步骤被取消 | 整个操作不能作为未执行的请求重试，返回 `EIO` |
-| `Flush` 收到关闭线程的取消 | 保留本次完成尝试，使用独立且有 deadline 的 context |
+| Open/Create、Close 或 Renew 已派发，远端结果无法核对 | 可能改变引用或生命周期，返回 `EIO`，不能据传输取消推断未发生 |
+| advisory 获取被取消 | 只有核对证明无残留授予才返回 `EINTR`；未知结果使受影响 I/O 隔离 |
+| `Flush` 收到关闭线程的取消 | 以独立且有 deadline 的 context 完成 owner 清理，不承担内容提交 |
 
-HTTP transport 的底层 errno 保持隔离：连接 Unix socket 失败时的 `ENOENT` 不能变成命名空间不存在。FUSE 的 `Create`、`Mkdir`、`Setattr` 保留已发生效果；`Setattr` 设置访问或修改时间前，先提交该节点已打开句柄中的未提交内容。后续取消的原因可以被追溯，但外层 `EIO` 不被其覆盖。
+HTTP transport 的底层 errno 保持隔离：连接 Unix socket 失败时的 `ENOENT` 不能变成命名空间不存在。FUSE 的 Create、Mkdir、Setattr 仍保留已发生效果；创建并打开在原生结果里完成，File / FileSession 的属性操作按身份访问，没有设置时间前提交其它 handle 缓冲区的阶段。后续取消的原因可以被追溯，但外层 `EIO` 不被其覆盖。
 
 SQLite 的纯只读取消保留 context 原因并归为 `EINTR`。只读事务清理使用拥有该事务的 context 判断自动回滚：[database/sql 的 Tx.awaitDone](https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/database/sql/sql.go#L2207-L2230)在 context 取消后主动回滚，[再次 Rollback](https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/database/sql/sql.go#L2324-L2359)可直接返回 `sql.ErrTxDone`。这种收尾也可能发生在查询回调成功之后。真实查询错误与独立清理故障不会被取消覆盖；deadline、无法命名的故障、未知 commit 或 poison 仍为 `EIO`。SQLite code 9 只在确有已取消的读取 context 时解释为取消，不能仅凭 `SQLITE_INTERRUPT` 数字推断请求已撤回。
 
-### Flush 只完成一次提交尝试
+### 关闭清理不依赖调用方重新关闭
 
 [Linux close 先从描述符表移除 fd，再执行 filp_flush](https://github.com/torvalds/linux/blob/e8f897f4afef0031fe618a8e94127a0934896aba/fs/open.c#L1539-L1554)。[Go 的关闭实现也不重试 EINTR](https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/internal/poll/fd_unixjs.go#L18-L24)，因为同一数字可能已经被复用于另一个文件。关闭失败后的重试不具备普通读取的前提。
 
-`Flush` 从请求 context 保留值与较早的既有 deadline，忽略关闭线程的取消；`Options.FlushTimeout` 为这次尝试提供预算，零值取 `DefaultFlushTimeout` 的 30 秒，负值在挂载前拒绝。独立命令的 `-timeout` 同时配置 HTTP 操作与这一预算。
+当前 Flush 清理内核指定的 POSIX owner，最终 Release 清理 flock 并释放 File 引用。它们从请求 context 保留值与较早 deadline，忽略关闭线程的取消；`Options.FlushTimeout` 为清理提供预算，零值取 `DefaultFlushTimeout` 的 30 秒，负值在挂载前拒绝。独立命令的 `-timeout` 同时配置 HTTP 操作与这一预算。
 
-完成 context 在进入提交逻辑、等待句柄 mutex 之前只建立一次。等待会消耗 deadline，取得锁后不重置；有未提交内容时至多一次底层 `Write`，不自动重试。预算约束传给底层的尝试 context，不承诺 mutex 等待、`Mount.Wait` 或 `Unmount` 的总耗时。storage 的 `Close` 生命周期保持独立，也没有新增挂载关闭 API。`Fsync` 与设置时间前的 `commitOpen` 继续使用可取消请求 context，保留已发生效果的 `EIO` 保护。
+完成 context 在执行清理之前建立，等待会消耗既有 deadline。它不承诺 mutex、Mount.Wait 或 Unmount 的总耗时；同一引用的并发关闭共享结果，未知清理保留错误并隔离 I/O。关闭一项失败不能跳过其它依法需要的清理。普通 WriteAt / Truncate 已在原调用里同步确认，Flush 没有待提交字节；Fsync 调用 Sync，继续核对引用健康与必要的持久性屏障。
 
-### 容量探测取消在改变缓冲区之前返回
+### 配额拒绝发生在同步修改中
 
-`Space` 探测通过 `ErrnoOf` 被分类为 `EINTR` 时，错误在这次缓冲区增长前返回。直接、包裹或通过 wire 返回的中断都具有同一效力，不要求能找到原 context 身份；独立故障与取消合并时仍由共享分类器保留故障。`roomGauge` 释放 `asking` 占用，保留上次有效数字与原来的 `asked` 时间；立即重试会重新探测过期或尚不存在的测量，再按实际余量拒绝越限写入。其它 advisory measurement fault 的旧值策略与 `ENOSYS` 处理保持不变。
+旧实现用 roomGauge 预检本地缓冲区增长，取消必须在接受那些字节前返回，并保留旧探测时间以便立即重试。同步写穿去掉了这个预检器：后端在 WriteAt / Truncate 的实际发布处检查配额，拒绝在同一次调用中返回，不再允许先接受 dirty 内容后于 Close 失败。Statfs 仍查询 Space，查询的取消与未知结果继续通过共享 errno 分类器传播。
 
-修复覆盖错误的阶段判定与跨层传播。[首次副本订阅的构建取消](../../proposed/bug-fix/2026-09-07-cancel-initial-replica-subscription.md)仍由独立提案拥有；它需要初始化与长期订阅之间的生命周期交接。[容量上限](../architecture/2026-08-21-space-limit.md)保留 advisory measurement 的准确性代价，缩短失败与目录改名的配额缺陷也继续由各自提案拥有。
+修复继续拥有错误的阶段判定与跨层传播。[首次副本订阅的构建取消](../../proposed/bug-fix/2026-09-07-cancel-initial-replica-subscription.md)仍需要初始化与长期订阅的生命周期交接；[容量上限](../architecture/2026-08-21-space-limit.md)与其计费决定分别拥有权威用量、实际发布结算及通用包装的剩余限制。
 
 ### 原请求必须得到回复
 
@@ -78,9 +80,9 @@ SQLite 的纯只读取消保留 context 原因并归为 `EINTR`。只读事务�
 
 被接受的中断以 `EINTR` 到达调用方；deadline、独立故障与未知修改结果保持 `EIO`。FUSE 与 wire 编码共用分类，保留底层原因不再等于允许它覆盖外层操作结果。
 
-错误传播的实现成本增加在能证明状态的几处：HTTP 请求是否发出、SQLite 只读事务如何结束、FUSE 复合调用是否已经产生效果，以及关闭是否还能由调用方重试。`Flush` 可能继续等待它的完成预算，但不提供 mutation 的自动重试、幂等键或未知提交的结果查询；预算也不是卸载时延保证。其它 advisory quota fault 仍可能把容量拒绝留到提交，相关取舍不因取消修复而消失。
+错误传播的成本落在能证明状态的几处：HTTP 请求是否派发、SQLite 只读事务如何结束、修改是否已生效，以及关闭之后的清理能否确认。File 与 advisory 控制另有有界动作核对；普通内容修改的未知结果不能靠重试掩盖。清理预算不是卸载时延保证，失败也不授权提前释放未确认的引用或配额。
 
-三项真实信号用例共有五种子进程场景，普通执行与固定五次 `-race` 执行均通过。读取场景在 HTTP `Stat` 已进入服务端后发送 `SIGUSR1`：原始 `Fstatat` 得到 `EINTR`，普通 `os.Stat` 成功，随后两者都读到完整内容。关闭场景关联同一 `FLUSH` 与 `INTERRUPT`，确认 `Close` 成功、HTTP 只写入一次且读回新内容。容量场景中，原始 `Write` 得到 `EINTR`，普通 Go `Write` 重新探测后得到 `EDQUOT`；两者分别查询一次和两次 `Space`，均未提交内容，目标保持为空。恢复旧 HTTP/FUSE 分类的对照会使读取重新得到 `EIO`；恢复旧 `Flush` 与忽略容量中断的对照会使关闭和容量断言失败。
+该修复当时的三项真实信号用例共有五种子进程场景，普通执行与固定五次 `-race` 均通过。读取场景在 HTTP `Stat` 已进入服务端后发送 `SIGUSR1`：原始 `Fstatat` 得到 `EINTR`，普通 `os.Stat` 成功，随后两者读到完整内容。关闭场景关联同一 `FLUSH` 与 `INTERRUPT`，确认 Close 成功、HTTP 只写入一次。容量场景中，原始 Write 得到 EINTR，普通 Go Write 重新探测后得到 EDQUOT，两者分别查询一次和两次 Space，目标保持为空。恢复旧分类、Flush 或忽略容量中断的对照令对应断言失败。这些结果记录的是原来的关闭提交与缓冲区预检机制，不是当前同步文件 API 的验收回执。
 
 以 [32249d3](https://github.com/codetreker/remote-fs/commit/32249d3c91defcd92d62f205523d6c267e874ee8) 为基线的修复通过固定历史样本验收：四项原始 `cmd` 用例各执行 100 次 `-race`，合计 400 次通过、零失败、零跳过，耗时 301.085 秒；运行期间 77 个生产 Go 文件的内容哈希保持不变。
 

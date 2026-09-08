@@ -28,7 +28,7 @@ Status: implemented
 
 | 没做 | 后果 |
 |---|---|
-| 三个内核超时仍然是 0 | 名字与属性查询仍然到达这一层，只是答案来自本地 SQLite 而不是网络；文件页缓存独立存在 |
+| 三个内核超时仍然是 0 | 名字 Lookup 与 List 使用本地 SQLite；保留文件的节点属性向 authority 核对，内容使用 direct I/O |
 | 没有直通模式、没有降级 | 副本没建好，挂载点就还不能用；R-WS-4 知情推后 |
 | 只支持有 metastore 的后端 | 当时的 `localdir` 保持直通；该实现已由[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)取消，第三方 storage 的日志仍是独立能力 |
 | 迁移机制只到「够用」为止 | 编号的 `.sql` 文件顺序重放，没有回滚、没有校验和 |
@@ -40,9 +40,9 @@ Status: implemented
 
 本地副本的直觉用法是把超时调上去、让内核自己作答。那样买到的是**零次调用**，代价是[内核缓存与不可达](../../proposed/architecture/2026-08-19-kernel-cache-and-unreachable.md)整份 note 立刻进入关键路径：缓存时长必须绑到失活探测窗口、负项时长是挂载级常量、客户端必须自己记住答过哪些名字不存在并在驱逐前先向内核发失效、转入断裂时要主动令内核失效、关掉内核自动失效之后不再自愈、失效队列溢出要升级而不是丢弃。六条各自都能单独出错，而**内核不发请求给我们就直接作答**——出错的表现是我们看不见的那一侧在替我们撒谎。
 
-保持为 0，买到的是**名字与属性查询从一次网络往返变成一次本地 SQLite 查询**，微秒对毫秒；那场十秒的探测风暴变成十毫秒级。负项与属性不靠有效期继续作答，因此不需要为这两类答案维护失效记录，副本作废后到达这一层的查询直接返回 EIO。
+当时保持为 0，把名字与属性查询的一次网络往返换成本地 SQLite 查询，微秒对毫秒；那场十秒的探测风暴变成十毫秒级。保留文件接口按对象身份取得属性后，缓存边界按操作划分：路径 Stat、Lookup 与 List 仍使用副本，File.Stat 与 StatNode 向 authority 核对，FileSession 还独立续期。遍历一棵已复制的树不为名字查询或目录列表回源，但仍可产生身份属性与续期请求。三个元数据超时继续为 0，副本不可用时普通查询明确失败。
 
-这三个超时不关闭文件页缓存。`Open` 使用默认缓存标志，各 handle 又分别持有内容，旧 handle 可以填入新 open 随后读到的页；[跨句柄页缓存陈旧](../../proposed/bug-fix/2026-09-07-prevent-cross-handle-page-cache-staleness.md)记录这项缺陷。内核仍能直接答复读请求，所以这里不能据元数据超时推导全部读取的失效保证。
+三个元数据超时不决定内容页缓存。原来 Open 使用默认缓存标志、各 handle 保存内容，旧 handle 可以填入新 open 随后读到的页；[跨句柄页缓存陈旧](../bug-fix/2026-09-07-prevent-cross-handle-page-cache-staleness.md)保留该缺陷记录。[实时文件句柄](./2026-09-08-live-file-handles.md)改用 directIO 与权威对象读取，元数据超时仍为 0，不能因内容路径改变就顺带提高它们。
 
 把超时调上去是一次**将来的优化**，前提是那份 note 先落地。这一版不碰。
 
@@ -252,7 +252,7 @@ local store 此后有了服务端容量、维护与持久性状态，客户端�
 
 代价直说：一次断线之后，挂载点在整个重放期间是 EIO，而不是拿旧答案顶着。这与首次同步阻塞是同一笔账——**宁可说不知道，也不说一句听起来像事实的旧话**。
 
-转入作废后，到达 replicated storage 的操作直接返回 EIO；内核文件页缓存的缺口见[跨句柄页缓存陈旧](../../proposed/bug-fix/2026-09-07-prevent-cross-handle-page-cache-staleness.md)。
+转入作废后，普通路径查询与 File 的内容、属性访问返回 EIO。FileSession 的续期、状态核对与清理仍能联系权威服务，不能把副本中没有名字解释成引用不存在。文件内容通过 directIO 到达这些检查；原有页缓存缺陷的记录由[独立 Note](../bug-fix/2026-09-07-prevent-cross-handle-page-cache-staleness.md)保留。
 
 ### 流的活性：沉默也有上界
 
@@ -300,18 +300,20 @@ server success 后，replicated storage 把 barrier 与当前 replica incarnatio
 
 ### 落到哪些包
 
-客户端的副本是一份 SQLite，也就是一份真正的 metastore。于是**挂载层一行都没改**：
+客户端的副本是一份 SQLite，也就是一份真正的 metastore。引入复制时没有改动挂载层，因为它仍消费 storage：
 
 ```go
 // packages/storage/replicated
-// 读走本地副本，其余全部走远端。
+// 路径 Stat/List 使用副本；内容和身份操作使用权威服务。
 type Storage struct {
     local  *sqlite.Replica  // 本地 SQLite 副本，由事件流喂
     remote *httprest.Storage
 }
 ```
 
-`Stat` 与 `List` 走本地；`Read`、`Write`、`Create`、`Mkdir`、`Remove`、`RemoveDir`、`Rename`、`SetAttr`、`Space` 走远端。它是一个 `storage.Storage` 装饰器，与 `packages/storage/limited` 同一个位置、同一种形状，而 `packages/fuse` 完全不知道有复制这回事。
+路径 `Stat` 与 `List` 走本地；`Read`、`Write`、`Create`、`Mkdir`、`Remove`、`RemoveDir`、`Rename`、`SetAttr`、`Space` 走远端。FileStorage capability 也传播到权威服务：FileSession.OpenNode、StatNode、SetNodeAttr 与 File 的内容、属性操作都不按副本里的名字重新寻址，已经 detached 的对象不要求本地树仍有对应 entry。普通身份 I/O 仍检查副本可用状态；续期、动作核对、取消和清理不依赖具名副本存在，失去观察不能阻止释放资源。
+
+具名节点修改沿用 mutation barrier，成功后确认本地可见性；detached 内容修改不生成具名树事件，不能等待一个永远不存在的节点事件。文件引用的退役、续期和 advisory 连续性由独立 FileSession 管理，不从日志位置或 SSE 心跳推导。
 
 它拿的是 `*httprest.Storage` 而不是 `storage.Storage`，因为它要的两半是同一份命名空间：读写走 storage 契约，而流与快照是那个传输自己的操作。R-INT-9 要求的另外两种传输出现时，才是在两者之间立一层接口的时候；现在立等于先造一个只有一个实现的抽象——与不建 `packages/observe` 是同一条理由。
 
@@ -329,7 +331,7 @@ cmd/remote-fs                 + 挂载前建立副本，+ -replica-dir
 cmd/remote-fs-server          + 把 metastore 的日志交给 handler
 ```
 
-SQLite schema 的后续结构分别有自己的决定：`0003_durable_state.sql` 增加数据库到 object store ID 的绑定、database identity/generation、node/change 高水位、全局 identity boundary indexes 与 retained-change predecessor。v2 无法证明旧 retained rows 连续，该迁移保留全局高水位、清空旧 rows 并切换 incarnation，使 replica 重建且新 position 不复用旧值；理由由[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)、[持久身份高水位](../bug-fix/2026-09-07-persistent-sqlite-identities-use-explicit-high-water-marks.md)和[保留日志完整性](./2026-09-04-retained-log-integrity-refuses-open.md)分别记录。当前 schema v4 的 `0004_lease_recovery.sql` 增加覆盖整份数据库的 Accepted / Prepared lease 时长证据，配合独立 Witness 与恢复屏障维持占有保护；它不把 grant 或管理动作历史写成复制日志，取舍见[文件锁决定](./2026-09-07-file-locks.md)。
+SQLite schema 的后续结构分别有自己的决定：`0003_durable_state.sql` 增加数据库到 object store ID 的绑定、database identity/generation、node/change 高水位、全局 identity boundary indexes 与 retained-change predecessor。v2 无法证明旧 retained rows 连续，该迁移保留全局高水位、清空旧 rows 并切换 incarnation，使 replica 重建且新 position 不复用旧值；理由由[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)、[持久身份高水位](../bug-fix/2026-09-07-persistent-sqlite-identities-use-explicit-high-water-marks.md)和[保留日志完整性](./2026-09-04-retained-log-integrity-refuses-open.md)分别记录。`0004_lease_recovery.sql` 增加 Accepted / Prepared lease 时长证据，配合独立 Witness 与恢复屏障维持强占有；取舍见[文件锁决定](./2026-09-07-file-locks.md)。`0005_retained_files.sql` 为实时文件句柄增加 detached 状态与内容 revision；它们不成为新的日志身份，也不把未命名文件塞进具名快照。
 
 **不新建 `packages/observe`。** 「观察源」作为一条独立契约，是在有两种实现（metastore 日志 vs 服务端合成）时才挣到自己位置的；这一版只有前一种，现在建等于先造一个只有一个实现的抽象。它留在这份 note 里当形状约束。
 
@@ -461,4 +463,4 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **端到端验收必须经过部署实际使用的复制路径。** 引入复制时，测试从 `localdir` 转向 metastore 后端；取消宿主目录后端后，独立二进制覆盖 localstore 与 Azure Blob。可替换 storage 仍允许没有 Log，这一能力分支由专门夹具覆盖，不能因随附后端都有日志而删除。
 
-**验收是这样验的，每一条都有对应的用例。** 一次目录改名在副本里只搬一行：改名之后子树里每个节点的编号不变、挂载点上每个 inode 号不变，且除了改名本身没有产生任何请求。快照期间持续写入，追平之后副本与服务端的 metastore 逐节点一致——那个用例会先断言「确实有写入压在扫描窗口里」，否则它判自己失败。事件通道断开时十一个操作各自失败一次，且不返回空目录、不报告文件不存在；把这条防护拆掉之后，它报出来的是「列目录成功，2 个条目」与「一个存在的名字答不存在」。日志答「无法重放」时客户端重建而不是接着走，用快照的次数是证据。一个不记日志的命名空间以 ENOSYS 拒绝复制，挂载点照常工作，而它的每一次 stat 都到达服务端。
+**验收是这样验的，每一条都有对应的用例。** 一次目录改名在副本里只搬一行：改名之后子树里每个节点的编号与 inode 号不变，只有一个具名 rename 请求；后续属性按身份核对，周期续期也独立存在。遍历用例单独要求具名 Stat/List 零请求、身份属性确实到达 authority，记录实际次数并拒绝其它数据或修改请求。快照期间持续写入，追平之后副本与服务端的 metastore 逐节点一致——那个用例会先断言「确实有写入压在扫描窗口里」，否则它判自己失败。事件通道断开时十一个操作各自失败一次，且不返回空目录、不报告文件不存在；把这条防护拆掉之后，它报出来的是「列目录成功，2 个条目」与「一个存在的名字答不存在」。日志答「无法重放」时客户端重建而不是接着走，用快照的次数是证据。一个不记日志的命名空间以 ENOSYS 拒绝复制，挂载点照常工作，而它的每一次 stat 都到达服务端。

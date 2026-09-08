@@ -526,8 +526,7 @@ func (s *Store) isEmpty(ctx context.Context, tx *sql.Tx, parent int64) (bool, er
 	return false, nil
 }
 
-// Remove takes a file out of its directory. The object it referenced becomes garbage rather
-// than being deleted, because nothing here reaches the object store.
+// Remove detaches a retained file or retires an unretained file and its object.
 func (s *Store) Remove(ctx context.Context, path string) error {
 	cleaned, err := storage.CleanPath(path)
 	if err != nil {
@@ -617,12 +616,17 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 	return nil
 }
 
-// discard drops a node that has just lost its name, retires the object it referenced, and
-// credits its bytes back to the namespace.
-//
-// A directory reaches here too: it references no object and holds no bytes, so both of
-// those are nothing to do rather than cases to keep apart.
+// Physical pins keep the current object and its charge after namespace removal.
+// The caller holds the same gate as file open and final physical release.
 func (s *Store) discard(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
+	if node.Mode.IsRegular() && s.coordinator.pins[retainedNode{s.namespace, node.ID}] > 0 {
+		_, err := tx.ExecContext(ctx, `UPDATE nodes SET detached=1 WHERE namespace=? AND id=?`, s.namespace, node.ID)
+		return err
+	}
+	return s.discardNode(ctx, tx, node)
+}
+
+func (s *Store) discardNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, node.ID); err != nil {
 		return err
 	}

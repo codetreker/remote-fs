@@ -19,9 +19,13 @@ const (
 	// DefaultMaxWaitingConfirmations bounds callers waiting to reserve an active
 	// confirmation record.
 	DefaultMaxWaitingConfirmations = 64
+
+	// DefaultMaxFileSessions bounds local session ownership, including references
+	// whose remote lifetime expired but whose cleanup has not been confirmed.
+	DefaultMaxFileSessions = 64
 )
 
-// Options bounds the resources retained while mutations wait for their replication barrier.
+// Options bounds mutation confirmation and locally owned file sessions.
 //
 // A mutation reserves one fixed-size record before its request is sent.
 // MaxWaitingConfirmations bounds callers waiting for one. Capacity saturation and closing
@@ -33,6 +37,8 @@ type Options struct {
 	ConfirmationGrace       time.Duration
 	MaxActiveConfirmations  int
 	MaxWaitingConfirmations int
+	// MaxFileSessions includes sessions being opened. Zero selects the default.
+	MaxFileSessions int
 }
 
 // DefaultOptions returns the bounded replication settings used by New.
@@ -41,6 +47,7 @@ func DefaultOptions() Options {
 		ConfirmationGrace:       DefaultConfirmationGrace,
 		MaxActiveConfirmations:  DefaultMaxActiveConfirmations,
 		MaxWaitingConfirmations: DefaultMaxWaitingConfirmations,
+		MaxFileSessions:         DefaultMaxFileSessions,
 	}
 }
 
@@ -53,6 +60,8 @@ func (o Options) Check() error {
 		return fmt.Errorf("maximum active mutation confirmations must be positive and finite, not %d: %w", o.MaxActiveConfirmations, syscall.EINVAL)
 	case o.MaxWaitingConfirmations < 0 || o.MaxWaitingConfirmations == math.MaxInt:
 		return fmt.Errorf("maximum waiting mutation confirmations must be non-negative and finite, not %d: %w", o.MaxWaitingConfirmations, syscall.EINVAL)
+	case o.MaxFileSessions < 0 || o.MaxFileSessions == math.MaxInt:
+		return fmt.Errorf("maximum file sessions must be non-negative and finite, not %d: %w", o.MaxFileSessions, syscall.EINVAL)
 	default:
 		return nil
 	}

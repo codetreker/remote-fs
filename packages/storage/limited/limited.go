@@ -1,6 +1,7 @@
 // Package limited enforces a workspace byte allowance over a bounded namespace.
-// Startup and explicit Recount walk the namespace with bounded directory and traversal
-// memory; subsequent mutations update the count without a traversal.
+// Startup and explicit Recount use authoritative native usage, including detached
+// retained files, or a bounded namespace walk when retained files are unsupported.
+// Subsequent publications and final-reference cleanup settle the count directly.
 //
 // Native publication accounting measures the actual target under the backend's final
 // ordering, reserves growth before the namespace effect, and releases shrinking bytes
@@ -115,15 +116,15 @@ type Storage struct {
 	measurement MeasurementLimits
 	accounted   bool
 
-	// gate is closed by Recount and held open by every operation, the read-only ones
-	// included. Only a mutation can spoil the walk Recount makes, but a rule with
-	// exceptions in it is one a later mutating operation gets added outside of.
+	// Recount excludes namespace requests and synchronous retained-file mutations.
+	// Autonomous retirement remains independent and is detected through revision.
 	gate sync.RWMutex
 
 	// countMu guards arithmetic and the unknown-outcome fault, never backing I/O.
-	countMu sync.Mutex
-	count   int64
-	fault   error
+	countMu  sync.Mutex
+	count    int64
+	fault    error
+	revision uint64
 
 	// Only non-native backends use sampled sizes protected by these path stripes.
 	stripes [stripeCount]sync.Mutex
@@ -134,9 +135,8 @@ var _ storage.BoundedStorage = (*Storage)(nil)
 
 // New holds the namespace in backing under an allowance of limit bytes.
 //
-// What the namespace already holds is measured here, by walking it. That walk is the only
-// unconditional traversal in the life of the storage: everything afterwards moves the
-// figure by what passes through, so asking how full the namespace is costs nothing.
+// Existing usage is measured through the native authority when available. A bounded
+// tree walk is sufficient only for namespaces without retained, detached files.
 //
 // A namespace already holding more than limit is opened, not refused. An allowance lowered
 // underneath content that is already written is an ordinary thing for an operator to do,
@@ -146,10 +146,10 @@ func New(ctx context.Context, backing storage.Storage, limit int64) (*Storage, e
 	return NewWithLimits(ctx, backing, limit, DefaultMeasurementLimits())
 }
 
-// NewWithLimits holds the namespace under limit and applies measurement to the startup
-// walk and every Recount. backing must implement storage.BoundedStorage: measuring through
-// Storage.List would allocate a complete directory before this package could enforce its
-// own bound.
+// NewWithLimits holds the namespace under limit. Measurement bounds govern a
+// fallback tree walk at startup and Recount. backing must implement BoundedStorage;
+// retained-file backends additionally require authoritative usage and publication
+// accounting before this wrapper can expose their file sessions.
 func NewWithLimits(
 	ctx context.Context,
 	backing storage.Storage,
@@ -181,7 +181,7 @@ func NewWithLimits(
 	if source, ok := bounded.(interface{ LockService() locking.Service }); ok && source.LockService() != nil && !accounted {
 		return nil, fmt.Errorf("a lock-enabled namespace requires native publication accounting for its allowance: %w", syscall.ENOSYS)
 	}
-	count, err := measure(ctx, bounded, effective)
+	count, err := measureUsage(ctx, bounded, effective)
 	if err != nil {
 		return nil, err
 	}
@@ -193,9 +193,9 @@ func NewWithLimits(
 // Uncertain native publication accounting requires reopening the namespace and cannot
 // be cleared by recounting. In-band traffic does not repair out-of-band accounting drift.
 //
-// Nothing mutates while it walks. Every caller therefore waits for the length of a tree
-// traversal, which is a price an operator may choose to pay and not one anything may
-// impose unasked — which is why nothing here schedules it.
+// Synchronous mutations wait for measurement. Autonomous file retirement can proceed;
+// a concurrent settlement causes another measurement, with EAGAIN after eight attempts.
+// Backends without authoritative usage require a bounded tree walk.
 func (s *Storage) Recount(ctx context.Context) error {
 	s.gate.Lock()
 	defer s.gate.Unlock()
@@ -203,14 +203,32 @@ func (s *Storage) Recount(ctx context.Context) error {
 		return err
 	}
 
-	count, err := measure(ctx, s.backing, s.measurement)
-	if err != nil {
-		return err
+	// Expiry cleanup runs independently of the request gate. Its accounting cannot
+	// acquire that gate under native publication ordering, which Usage also needs.
+	// A changed accounting revision requires a fresh authoritative measurement.
+	for attempt := 0; attempt < 8; attempt++ {
+		s.countMu.Lock()
+		revision := s.revision
+		s.countMu.Unlock()
+		count, err := measureUsage(ctx, s.backing, s.measurement)
+		if err != nil {
+			return err
+		}
+		s.countMu.Lock()
+		if s.fault != nil {
+			err := s.fault
+			s.countMu.Unlock()
+			return err
+		}
+		if s.revision == revision {
+			s.count = count
+			s.revision++
+			s.countMu.Unlock()
+			return nil
+		}
+		s.countMu.Unlock()
 	}
-	s.countMu.Lock()
-	defer s.countMu.Unlock()
-	s.count = count
-	return nil
+	return fmt.Errorf("retained-file cleanup changed usage during every recount attempt: %w", syscall.EAGAIN)
 }
 
 // measure walks the namespace and sums what it holds.
@@ -412,6 +430,7 @@ func (s *Storage) reserve(name string, delta int64) (int64, error) {
 	}
 	charged := max(delta, 0)
 	s.count += charged
+	s.revision++
 	return charged, nil
 }
 
@@ -421,6 +440,7 @@ func (s *Storage) release(delta int64) {
 	s.countMu.Lock()
 	defer s.countMu.Unlock()
 	s.count = floor(s.count - delta)
+	s.revision++
 }
 
 func (s *Storage) taken() (int64, error) {

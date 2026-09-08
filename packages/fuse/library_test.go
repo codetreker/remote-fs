@@ -21,7 +21,9 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 )
 
 // R-INT-2 forbids this package, linked into somebody else's process, from touching that
@@ -256,11 +258,8 @@ func TestNamespaceMode(t *testing.T) {
 	}
 }
 
-// The buffer an open file is served out of has to behave the way a file does, including
-// at its edges: a read that starts past the end returns nothing rather than failing, and
-// a write that starts past the end leaves zeroes in the gap.
-func TestTheBufferBehavesLikeAFile(t *testing.T) {
-	h := aHandle([]byte("payload"), 1<<20)
+func TestRetainedHandlePreservesReadWriteAndTruncateBoundaries(t *testing.T) {
+	h := aHandle(t, []byte("payload"), 1<<20)
 	dest := make([]byte, 16)
 
 	for _, c := range []struct {
@@ -301,7 +300,7 @@ func TestTheBufferBehavesLikeAFile(t *testing.T) {
 			t.Fatal(status)
 		}
 		if string(got) != "payload\x00\x00\x00tail" {
-			t.Fatalf("the buffer holds %q, want the gap filled with zeroes", got)
+			t.Fatalf("the file holds %q, want the gap filled with zeroes", got)
 		}
 	})
 
@@ -321,36 +320,77 @@ func TestTheBufferBehavesLikeAFile(t *testing.T) {
 			t.Fatal(status)
 		}
 		if string(got) != "pay\x00\x00" {
-			t.Fatalf("the buffer holds %q, want %q", got, "pay\x00\x00")
+			t.Fatalf("the file holds %q, want %q", got, "pay\x00\x00")
 		}
 	})
 }
 
-// aHandle is one open file with a ceiling, behind a namespace that reports no room of its
-// own. A write and a resize alike ask how much room is left before they grow the buffer,
-// and a namespace with no figure to give imposes nothing, so what these cases exercise is
-// the ceiling alone.
-func aHandle(contents []byte, maxFileSize int64) *handle {
-	n := &node{ns: &namespace{storage: unmeasured{}, maxFileSize: maxFileSize, flushTimeout: DefaultFlushTimeout}}
-	// These reach the buffer directly rather than through a mountpoint, so the node
-	// the buffer was filled from does not come into it.
-	return newHandle(n, contents, committed, 0)
+func activeTestNamespace(s storage.Storage, maxFileSize int64) *namespace {
+	return &namespace{storage: s, maxFileSize: maxFileSize, flushTimeout: DefaultFlushTimeout,
+		deadline: time.Now().Add(time.Hour), stop: make(chan struct{}), done: make(chan struct{})}
 }
 
-// unmeasured is a namespace with no room of its own to report. Nothing but Space is
-// reached through it, because a handle needs nothing else until it commits.
+func aHandle(t *testing.T, contents []byte, maxFileSize int64) *handle {
+	t.Helper()
+	return aHandleWithAllowance(t, contents, maxFileSize, 0)
+}
+
+func aHandleWithAllowance(t *testing.T, contents []byte, maxFileSize, allowance int64) *handle {
+	t.Helper()
+	_, backing := memoryfixture.New(t, "handle", allowance, locking.DefaultOptions())
+	if err := backing.Write(t.Context(), "file", contents); err != nil {
+		t.Fatal(err)
+	}
+	session, err := backing.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := session.Close(ctx); err != nil {
+			t.Errorf("close handle session: %v", err)
+		}
+	})
+	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := file.Close(ctx); err != nil {
+			t.Errorf("close retained test file: %v", err)
+		}
+	})
+	attr, err := file.Stat(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns := activeTestNamespace(unmeasured{}, maxFileSize)
+	ns.files = session
+	n := &node{ns: ns, id: rootIdentity(math.MaxUint64).child("file", syscall.S_IFREG, attr.ID)}
+	return newHandle(n, file, true, true)
+}
+
+func retainedContents(t *testing.T, h *handle) []byte {
+	t.Helper()
+	read, err := h.file.ReadAt(t.Context(), 0, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return read.Data
+}
+
+// Descriptor data goes through File; this separate namespace supplies only the
+// optional capacity estimate used before a growth request.
 type unmeasured struct{ storage.Storage }
 
 func (unmeasured) Space(context.Context) (storage.Space, error) {
 	return storage.Space{}, syscall.ENOSYS
 }
 
-// The buffer is the whole file, so its size is what one caller can ask this process to
-// allocate. Go answers an allocation it cannot satisfy with a fatal error rather than a
-// panic — nothing can recover from it and the caller's process dies — so the refusal has
-// to happen before the allocation, which is why these cases assert on the errno of a
-// request that was never carried out rather than on the buffer afterwards.
-func TestTheBufferRefusesToGrowPastTheCeiling(t *testing.T) {
+func TestRetainedHandleRefusesGrowthPastTheCeiling(t *testing.T) {
 	const ceiling = 64
 
 	for _, c := range []struct {
@@ -364,7 +404,7 @@ func TestTheBufferRefusesToGrowPastTheCeiling(t *testing.T) {
 		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			if errno := c.act(aHandle([]byte("payload"), ceiling)); errno != 0 {
+			if errno := c.act(aHandle(t, []byte("payload"), ceiling)); errno != 0 {
 				t.Fatalf("%s failed with %v; the ceiling is the largest size that fits", c.name, errno)
 			}
 		})
@@ -386,13 +426,12 @@ func TestTheBufferRefusesToGrowPastTheCeiling(t *testing.T) {
 		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			h := aHandle([]byte("payload"), ceiling)
+			h := aHandle(t, []byte("payload"), ceiling)
 			if errno := c.act(h); errno != syscall.EFBIG {
 				t.Fatalf("%s returned %v, want EFBIG", c.name, errno)
 			}
-			if len(h.contents) != len("payload") {
-				t.Fatalf("the buffer is %d bytes after a refused request, want %d untouched",
-					len(h.contents), len("payload"))
+			if got := retainedContents(t, h); string(got) != "payload" {
+				t.Fatalf("the file changed after a refused request: %q", got)
 			}
 		})
 	}
@@ -403,17 +442,17 @@ func TestTheBufferRefusesToGrowPastTheCeiling(t *testing.T) {
 	// second overflows int64 into a negative length. Neither can be allowed to run
 	// before the ceiling has been shown to hold at a harmless size.
 	t.Run("sizes that cannot safely be attempted without the ceiling", func(t *testing.T) {
-		if errno := errnoOf(aHandle(nil, ceiling).resize(t.Context(), ceiling+1)); errno != syscall.EFBIG {
+		if errno := errnoOf(aHandle(t, nil, ceiling).resize(t.Context(), ceiling+1)); errno != syscall.EFBIG {
 			t.Fatalf("the ceiling returned %v at %d bytes; the larger sizes are not attempted",
 				errno, ceiling+1)
 		}
-		if errno := errnoOf(aHandle(nil, ceiling).resize(t.Context(), 1<<40)); errno != syscall.EFBIG {
+		if errno := errnoOf(aHandle(t, nil, ceiling).resize(t.Context(), 1<<40)); errno != syscall.EFBIG {
 			t.Fatalf("a resize to 1 TiB returned %v, want EFBIG", errno)
 		}
 		// off is whatever the caller seeked to, so off+len(data) is where int64 runs out.
 		// Forming that sum before comparing it wraps to a negative number, and a negative
 		// end is below every ceiling.
-		if _, errno := aHandle(nil, ceiling).Write(t.Context(), []byte("tail"), math.MaxInt64-1); errno != syscall.EFBIG {
+		if _, errno := aHandle(t, nil, ceiling).Write(t.Context(), []byte("tail"), math.MaxInt64-1); errno != syscall.EFBIG {
 			t.Fatalf("a write at an offset that overflows int64 returned %v, want EFBIG", errno)
 		}
 	})
@@ -596,13 +635,25 @@ func describeChange(c storage.AttrChange) string {
 // left out here.
 func TestACeilingThatAdmitsNothingIsRefused(t *testing.T) {
 	m, err := New(t.TempDir(), nil, Options{MaxFileSize: -1})
+	cleanupReturnedTestMount(t, m)
 	if err == nil {
-		m.Unmount()
 		t.Fatal("mounting with a negative MaxFileSize succeeded, want an error")
 	}
 	if !strings.Contains(err.Error(), "MaxFileSize") {
 		t.Fatalf("mounting with a negative MaxFileSize failed with %v; the message does not name the option", err)
 	}
+}
+
+func cleanupReturnedTestMount(t *testing.T, m *Mount) {
+	t.Helper()
+	if m == nil {
+		return
+	}
+	t.Cleanup(func() {
+		if err := m.Unmount(); err != nil {
+			t.Errorf("close unexpectedly returned mount: %v", err)
+		}
+	})
 }
 
 // named resolves a name whose node has not changed. Every case below about the record's
@@ -626,7 +677,7 @@ func stableNode(name string) uint64 {
 // and the rename that follows it, a name that appears while a listing is in flight — are
 // races through a mountpoint and plain calls here.
 func TestOneNameKeepsOneIdentity(t *testing.T) {
-	root := rootIdentity()
+	root := rootIdentity(math.MaxUint64)
 
 	first := root.named("f", syscall.S_IFREG)
 	if again := root.named("f", syscall.S_IFREG); again != first {
@@ -643,7 +694,7 @@ func TestOneNameKeepsOneIdentity(t *testing.T) {
 // Two lookups of one name resolve it at the same time whenever two programs reach for it
 // at once, and they have to agree: a name that resolved to two numbers would be two nodes.
 func TestOneNameResolvedAtOnceKeepsOneIdentity(t *testing.T) {
-	root := rootIdentity()
+	root := rootIdentity(math.MaxUint64)
 
 	const resolvers = 32
 	resolved := make([]*identity, resolvers)
@@ -673,10 +724,10 @@ func TestOneNameResolvedAtOnceKeepsOneIdentity(t *testing.T) {
 // A name whose node has been replaced by one of another kind refers to a different node,
 // and the node that left may still be open.
 func TestANameThatChangesKindChangesIdentity(t *testing.T) {
-	root := rootIdentity()
+	root := rootIdentity(math.MaxUint64)
 
-	asFile := root.named("x", syscall.S_IFREG)
-	asDir := root.named("x", syscall.S_IFDIR)
+	asFile := root.child("x", syscall.S_IFREG, 41)
+	asDir := root.child("x", syscall.S_IFDIR, 42)
 	if asDir.ino == asFile.ino {
 		t.Fatalf("a name that became a directory kept the number %d it had as a file", asFile.ino)
 	}
@@ -686,7 +737,7 @@ func TestANameThatChangesKindChangesIdentity(t *testing.T) {
 }
 
 func TestAnIdentityIsNeverHandedOutTwice(t *testing.T) {
-	root := rootIdentity()
+	root := rootIdentity(math.MaxUint64)
 	seen := map[uint64]string{root.ino: "the root"}
 
 	record := func(what string, id *identity) {
@@ -699,13 +750,13 @@ func TestAnIdentityIsNeverHandedOutTwice(t *testing.T) {
 
 	record("f", root.named("f", syscall.S_IFREG))
 	root.forget("f")
-	record("f again", root.named("f", syscall.S_IFREG))
+	record("f again", root.child("f", syscall.S_IFREG, stableNode("replacement-f")))
 
 	d := root.named("d", syscall.S_IFDIR)
 	record("d", d)
 	record("d/x", d.named("x", syscall.S_IFREG))
 	root.move("d", root, "moved")
-	record("d again", root.named("d", syscall.S_IFDIR))
+	record("d again", root.child("d", syscall.S_IFDIR, stableNode("replacement-d")))
 }
 
 // A directory carries the identities beneath it, and leaves nothing behind at the name it
@@ -721,7 +772,7 @@ func TestMovingADirectoryCarriesWhatIsBeneathIt(t *testing.T) {
 		buried = 3 // a file beneath that
 		onto   = 4 // the directory the rename lands on top of
 	)
-	root := rootIdentity()
+	root := rootIdentity(math.MaxUint64)
 	from := root.child("from", syscall.S_IFDIR, mover)
 	deep := from.child("sub", syscall.S_IFDIR, sub).child("f", syscall.S_IFREG, buried)
 	doomed := root.child("onto", syscall.S_IFDIR, onto)
@@ -738,7 +789,7 @@ func TestMovingADirectoryCarriesWhatIsBeneathIt(t *testing.T) {
 	if carried := moved.child("sub", syscall.S_IFDIR, sub).child("f", syscall.S_IFREG, buried); carried != deep {
 		t.Fatal("a file beneath the directory did not move with it")
 	}
-	if fresh := root.child("from", syscall.S_IFDIR, mover); fresh == from {
+	if fresh := root.child("from", syscall.S_IFDIR, 5); fresh == from || fresh.ino == from.ino {
 		t.Fatal("the name the directory left still refers to it")
 	}
 }
@@ -746,12 +797,12 @@ func TestMovingADirectoryCarriesWhatIsBeneathIt(t *testing.T) {
 // A rename whose source this mount never named still clears the destination: something was
 // there, and it is gone.
 func TestMovingANameThatWasNeverResolvedStillClearsTheDestination(t *testing.T) {
-	root := rootIdentity()
+	root := rootIdentity(math.MaxUint64)
 	doomed := root.named("onto", syscall.S_IFREG)
 
 	root.move("never-resolved", root, "onto")
 
-	if fresh := root.named("onto", syscall.S_IFREG); fresh.ino == doomed.ino {
+	if fresh := root.child("onto", syscall.S_IFREG, stableNode("replacement")); fresh.ino == doomed.ino {
 		t.Fatalf("the destination still refers to %d, the node the rename replaced", doomed.ino)
 	}
 	if _, named := root.children["never-resolved"]; named {
@@ -764,7 +815,7 @@ func TestMovingANameThatWasNeverResolvedStillClearsTheDestination(t *testing.T) 
 // is in flight is not: the listing was taken before that name existed, and dropping it
 // would give the node that has it a second identity on the next lookup.
 func TestAListingDropsTheNamesTheDirectoryNoLongerHas(t *testing.T) {
-	root := rootIdentity()
+	root := rootIdentity(math.MaxUint64)
 	gone := root.named("gone", syscall.S_IFDIR)
 	gone.named("beneath", syscall.S_IFREG)
 	kept := root.named("kept", syscall.S_IFREG)
@@ -779,184 +830,42 @@ func TestAListingDropsTheNamesTheDirectoryNoLongerHas(t *testing.T) {
 	if root.named("appeared", syscall.S_IFREG) != appeared {
 		t.Fatal("a name that appeared while the listing was in flight lost its identity")
 	}
-	if again := root.named("gone", syscall.S_IFDIR); again == gone {
+	if again := root.child("gone", syscall.S_IFDIR, stableNode("replacement-gone")); again == gone {
 		t.Fatal("a name the listing does not hold kept its identity")
-	} else if again.named("beneath", syscall.S_IFREG).ino == gone.children["beneath"].ino {
+	} else if again.child("beneath", syscall.S_IFREG, stableNode("replacement-beneath")).ino == gone.children["beneath"].ino {
 		t.Fatal("a name beneath the one that went kept its identity")
 	}
 }
 
-// --- the room left in the namespace ----------------------------------------------------
-
-// answersSpace answers Space as the case requires and counts how often it was asked, which
-// is the property that matters: write(2) is a filesystem's hottest path, and a question to
-// the namespace on each one would cost far more than the refusal it pays for.
-type answersSpace struct {
-	storage.Storage
-	mu      sync.Mutex
-	asked   int
-	entered chan struct{}
-	release chan struct{}
-	space   storage.Space
-	err     error
-}
-
-func (s *answersSpace) Space(context.Context) (storage.Space, error) {
-	s.mu.Lock()
-	s.asked++
-	s.mu.Unlock()
-	if s.entered != nil {
-		s.entered <- struct{}{}
-		<-s.release
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.space, s.err
-}
-
-func (s *answersSpace) times() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.asked
-}
-
-func (s *answersSpace) answer(space storage.Space, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.space, s.err = space, err
-}
-
-func TestTheRoomLeftIsMeasuredOnceAWindow(t *testing.T) {
-	answering := &answersSpace{space: storage.Space{Total: 1000, Used: 400, Avail: 600}}
-	var g roomGauge
-
-	for range 100 {
-		avail, measured, err := g.remaining(t.Context(), answering)
-		if err != nil || !measured || avail != 600 {
-			t.Fatalf("the gauge reports %d, %v; want 600 measured", avail, measured)
-		}
-	}
-	if answering.times() != 1 {
-		t.Fatalf("the namespace was asked %d times for one window's worth of writes", answering.times())
-	}
-
-	// Aged past the window, the namespace is asked again and the new figure replaces the
-	// old one. The clock is moved rather than waited on, because a window's wait in a test
-	// is a window's wait on every run.
-	answering.answer(storage.Space{Total: 1000, Used: 900, Avail: 100}, nil)
-	g.asked = time.Now().Add(-roomWindow)
-	if avail, measured, err := g.remaining(t.Context(), answering); err != nil || !measured || avail != 100 {
-		t.Fatalf("the gauge reports %d, %v after the window passed; want 100 measured", avail, measured)
-	}
-	if answering.times() != 2 {
-		t.Fatalf("the namespace was asked %d times, want a second question once the figure aged",
-			answering.times())
+func TestIdentityFollowsNativeIDAtAPreviouslyUnseenName(t *testing.T) {
+	root := rootIdentity(math.MaxUint64)
+	before := root.child("before", syscall.S_IFREG, 42)
+	after := root.child("after", syscall.S_IFREG, 42)
+	if before.ino != 42 || after.ino != before.ino {
+		t.Fatalf("same native node at another name changed inode: %d -> %d", before.ino, after.ino)
 	}
 }
 
-// A namespace with no room of its own to report is asked once. The contract makes that a
-// standing property of the implementation rather than a condition of the call, so asking
-// again could only produce the same refusal at the price of a round trip on the write path.
-func TestANamespaceWithNoRoomToReportIsAskedOnce(t *testing.T) {
-	answering := &answersSpace{err: syscall.ENOSYS}
-	var g roomGauge
+type forbiddenCapacityProbe struct{ storage.Storage }
 
-	for range 10 {
-		if avail, measured, err := g.remaining(t.Context(), answering); err != nil || measured {
-			t.Fatalf("the gauge reports %d as measured; the namespace reports no room of its own", avail)
-		}
-		g.asked = time.Now().Add(-roomWindow)
-	}
-	if answering.times() != 1 {
-		t.Fatalf("the namespace was asked %d times after refusing once", answering.times())
-	}
+func (forbiddenCapacityProbe) Space(context.Context) (storage.Space, error) {
+	panic("descriptor mutation must use authoritative File quota enforcement")
 }
 
-// A namespace that could not be reached leaves the last figure standing. It is still the
-// last thing anybody measured, and the alternative — forgetting it — would stop weighing
-// writes at exactly the moment the commit is about to fail as well.
-func TestAFailedQuestionLeavesTheLastFigureStanding(t *testing.T) {
-	answering := &answersSpace{space: storage.Space{Total: 1000, Used: 400, Avail: 600}}
-	var g roomGauge
-
-	if avail, measured, err := g.remaining(t.Context(), answering); err != nil || !measured || avail != 600 {
-		t.Fatalf("the gauge reports %d, %v; want 600 measured", avail, measured)
+func TestDescriptorMutationsDoNotProbeNamespaceCapacity(t *testing.T) {
+	h := aHandle(t, []byte("contents"), 1<<20)
+	h.node.ns.storage = forbiddenCapacityProbe{}
+	if n, errno := h.Write(t.Context(), []byte("growth"), 8); errno != 0 || n != 6 {
+		t.Fatalf("write returned %d, %v", n, errno)
 	}
-
-	for _, c := range []struct {
-		name  string
-		space storage.Space
-		err   error
-	}{
-		{"a namespace that could not be reached", storage.Space{}, errors.New("unreachable")},
-		// An answer that cannot be true of anything is not an answer. Recording it would
-		// weigh writes against a figure nobody measured.
-		{"an answer that cannot be true", storage.Space{Total: 1000, Used: 400, Avail: 900}, nil},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			answering.answer(c.space, c.err)
-			g.asked = time.Now().Add(-roomWindow)
-			if avail, measured, err := g.remaining(t.Context(), answering); err != nil || !measured || avail != 600 {
-				t.Fatalf("the gauge reports %d, %v; want the last measured figure, 600", avail, measured)
-			}
-		})
+	if err := h.resize(t.Context(), 100); err != nil {
+		t.Fatal(err)
 	}
-}
-
-// Two programs writing two different files may not be made to wait on each other (R-CC-2),
-// so a write that arrives while the namespace is being asked uses the figure that is
-// already there instead of queueing behind the question.
-func TestAWriteDoesNotQueueBehindAQuestionAlreadyInFlight(t *testing.T) {
-	answering := &answersSpace{
-		space:   storage.Space{Total: 1000, Used: 400, Avail: 600},
-		entered: make(chan struct{}),
-		release: make(chan struct{}),
+	if err := h.resize(t.Context(), 3); err != nil {
+		t.Fatal(err)
 	}
-	var g roomGauge
-
-	asking := make(chan struct{})
-	go func() {
-		defer close(asking)
-		g.remaining(t.Context(), answering)
-	}()
-	<-answering.entered
-
-	// This one must come back rather than block; with no figure yet there is none to give,
-	// and the write it belongs to goes ahead and is weighed at the commit.
-	if avail, measured, err := g.remaining(t.Context(), answering); err != nil || measured {
-		t.Fatalf("the gauge reports %d as measured before any question has been answered", avail)
-	}
-	if answering.times() != 1 {
-		t.Fatalf("the namespace was asked %d times, want the second caller to have used what was there",
-			answering.times())
-	}
-
-	close(answering.release)
-	<-asking
-	if avail, measured, err := g.remaining(t.Context(), answering); err != nil || !measured || avail != 600 {
-		t.Fatalf("the gauge reports %d, %v once the question was answered; want 600 measured", avail, measured)
-	}
-}
-
-// A change that leaves a file no longer than the namespace already holds it needs no room,
-// so it is carried out whatever the figure says, and the namespace is not asked. A
-// workspace past its allowance has to have a way back under it (R-WS-5), and shortening a
-// file is that way.
-func TestShorteningNeedsNoRoomAndAsksForNone(t *testing.T) {
-	answering := &answersSpace{space: storage.Space{Total: 1000, Used: 1000}}
-	h := newHandle(&node{ns: &namespace{storage: answering, maxFileSize: 1 << 20, flushTimeout: DefaultFlushTimeout}},
-		make([]byte, 500), committed, 0)
-
-	if errno := errnoOf(h.resize(t.Context(), 100)); errno != 0 {
-		t.Fatalf("shortening a file of 500 bytes to 100 returned %v, in a workspace with nothing left",
-			errno)
-	}
-	if len(h.contents) != 100 {
-		t.Fatalf("the buffer is %d bytes after being shortened to 100", len(h.contents))
-	}
-	if answering.times() != 0 {
-		t.Fatalf("the namespace was asked %d times about room a shortening does not need",
-			answering.times())
+	if got := retainedContents(t, h); string(got) != "con" {
+		t.Fatalf("write and truncation left %q", got)
 	}
 }
 
@@ -970,7 +879,7 @@ func TestShorteningNeedsNoRoomAndAsksForNone(t *testing.T) {
 // namespace reports does, which is exactly what arrives from a change this mount did not
 // make.
 func TestANameWhoseNodeWasReplacedGetsANewIdentity(t *testing.T) {
-	root := rootIdentity()
+	root := rootIdentity(math.MaxUint64)
 
 	before := root.child("doc.txt", syscall.S_IFREG, 42)
 	after := root.child("doc.txt", syscall.S_IFREG, 43)
@@ -991,7 +900,7 @@ func TestANameWhoseNodeWasReplacedGetsANewIdentity(t *testing.T) {
 // the half a record that minted a fresh number every time would fail. A mount that renumbered
 // a file on every lookup would break everything that remembers an inode across two calls.
 func TestANameWhoseNodeIsUnchangedKeepsItsIdentity(t *testing.T) {
-	root := rootIdentity()
+	root := rootIdentity(math.MaxUint64)
 
 	first := root.child("f", syscall.S_IFREG, 7)
 	for range 3 {
@@ -1010,7 +919,7 @@ func TestANameWhoseNodeIsUnchangedKeepsItsIdentity(t *testing.T) {
 // the old one go with it. Keeping them would leave the children of a directory nobody can
 // reach holding numbers the kernel still has.
 func TestAReplacedDirectoryDoesNotKeepWhatWasBeneathIt(t *testing.T) {
-	root := rootIdentity()
+	root := rootIdentity(math.MaxUint64)
 
 	before := root.child("d", syscall.S_IFDIR, 10)
 	beneath := before.child("f", syscall.S_IFREG, 11)

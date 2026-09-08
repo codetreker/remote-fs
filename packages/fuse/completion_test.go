@@ -10,40 +10,38 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/hanwen/go-fuse/v2/fs"
-
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-type completionStorage struct {
-	storage.Storage
-	write func(context.Context) error
+type completionFile struct {
+	storage.File
+	finish func(context.Context) error
 }
 
-func (s completionStorage) Write(ctx context.Context, _ string, _ []byte) error {
-	return s.write(ctx)
-}
+func (f completionFile) Close(ctx context.Context) error { return f.finish(ctx) }
+func (f completionFile) Sync(ctx context.Context) error  { return f.finish(ctx) }
 
-func completionHandle(t *testing.T, opts Options, write func(context.Context) error) *handle {
+func completionHandle(t *testing.T, opts Options, finish func(context.Context) error) *handle {
 	t.Helper()
 	timeout, err := opts.flushTimeout()
 	if err != nil {
 		t.Fatal(err)
 	}
-	n := &node{
-		ns: &namespace{storage: completionStorage{write: write}, flushTimeout: timeout},
-		id: rootIdentity(),
-	}
-	fs.NewNodeFS(n, &fs.Options{})
-	return newHandle(n, []byte("pending"), uncommitted, 0)
+	ns := activeTestNamespace(nil, 1024)
+	ns.flushTimeout = timeout
+	return newHandle(&node{ns: ns}, completionFile{finish: finish}, true, true)
+}
+
+func completeHandleClose(ctx context.Context, h *handle) error {
+	completion, cancel := h.node.ns.cleanupContext(ctx)
+	defer cancel()
+	return h.closeFile(completion)
 }
 
 func TestNegativeFlushTimeoutRefusesBeforeMounting(t *testing.T) {
 	mount, err := New(t.TempDir(), nil, Options{FlushTimeout: -time.Nanosecond})
+	cleanupReturnedTestMount(t, mount)
 	if err == nil {
-		if mount != nil {
-			mount.Unmount()
-		}
 		t.Fatal("mount accepted a negative FlushTimeout")
 	}
 	if mount != nil || !strings.Contains(err.Error(), "FlushTimeout") {
@@ -53,7 +51,7 @@ func TestNegativeFlushTimeoutRefusesBeforeMounting(t *testing.T) {
 
 type completionValueKey struct{}
 
-func TestCloseCommitUsesTheConfiguredOrEarlierDeadline(t *testing.T) {
+func TestCloseCleanupUsesTheConfiguredOrEarlierDeadline(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		configured  time.Duration
@@ -84,23 +82,23 @@ func TestCloseCommitUsesTheConfiguredOrEarlierDeadline(t *testing.T) {
 					<-ctx.Done()
 					return ctx.Err()
 				})
-				err := h.flushForClose(request)
-				if !errors.Is(err, context.DeadlineExceeded) || errnoOf(err) != syscall.EIO || calls != 1 || !h.dirty {
-					t.Fatalf("expired commit returned %v, calls=%d, dirty=%v", err, calls, h.dirty)
+				err := completeHandleClose(request, h)
+				if !errors.Is(err, context.DeadlineExceeded) || errnoOf(err) != syscall.EIO || calls != 1 {
+					t.Fatalf("expired cleanup returned %v, calls=%d", err, calls)
 				}
 				deadline, bounded := attempted.Deadline()
 				if !bounded || !deadline.Equal(start.Add(test.want)) || attempted.Value(completionValueKey{}) != "request value" {
-					t.Fatalf("attempt deadline=%v bounded=%v value=%v", deadline, bounded, attempted.Value(completionValueKey{}))
+					t.Fatalf("cleanup deadline=%v bounded=%v value=%v", deadline, bounded, attempted.Value(completionValueKey{}))
 				}
 				if elapsed := time.Since(start); elapsed != max(test.want, 0) {
-					t.Fatalf("attempt used %s, want %s", elapsed, max(test.want, 0))
+					t.Fatalf("cleanup used %s, want %s", elapsed, max(test.want, 0))
 				}
 			})
 		})
 	}
 }
 
-func TestCloseCommitCompletesDespiteRequestCancellation(t *testing.T) {
+func TestCloseCleanupCompletesDespiteRequestCancellation(t *testing.T) {
 	for _, canceledBefore := range []bool{false, true} {
 		t.Run(fmt.Sprintf("already canceled %t", canceledBefore), func(t *testing.T) {
 			request, cancel := context.WithCancel(t.Context())
@@ -114,22 +112,25 @@ func TestCloseCommitCompletesDespiteRequestCancellation(t *testing.T) {
 				attempted = ctx
 				calls++
 				if err := ctx.Err(); err != nil {
-					return fmt.Errorf("commit started canceled: %w", err)
+					return fmt.Errorf("cleanup started canceled: %w", err)
 				}
 				cancel()
 				return ctx.Err()
 			})
-			if err := h.flushForClose(request); err != nil || calls != 1 || h.dirty || h.stored != int64(len("pending")) {
-				t.Fatalf("close commit returned %v, calls=%d, dirty=%v, stored=%d", err, calls, h.dirty, h.stored)
+			if err := completeHandleClose(request, h); err != nil || calls != 1 {
+				t.Fatalf("close cleanup returned %v, calls=%d", err, calls)
 			}
-			if attempted.Err() != context.Canceled {
-				t.Fatalf("completed attempt retained a live context: %v", attempted.Err())
+			if attempted.Err() != context.Canceled || h.closeDone == nil {
+				t.Fatalf("cleanup left a live completion context or reference: %v", attempted.Err())
+			}
+			if err := completeHandleClose(t.Context(), h); err != nil || calls != 1 {
+				t.Fatalf("repeated close executed cleanup again: %v, calls=%d", err, calls)
 			}
 		})
 	}
 }
 
-func TestCloseCommitKeepsSuccessAcknowledgedAfterItsDeadline(t *testing.T) {
+func TestCloseCleanupKeepsSuccessAcknowledgedAfterItsDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		calls := 0
 		h := completionHandle(t, Options{FlushTimeout: time.Second}, func(ctx context.Context) error {
@@ -137,14 +138,14 @@ func TestCloseCommitKeepsSuccessAcknowledgedAfterItsDeadline(t *testing.T) {
 			<-ctx.Done()
 			return nil
 		})
-		if err := h.flushForClose(t.Context()); err != nil || calls != 1 || h.dirty {
-			t.Fatalf("acknowledged commit returned %v, calls=%d, dirty=%v", err, calls, h.dirty)
+		if err := completeHandleClose(t.Context(), h); err != nil || calls != 1 {
+			t.Fatalf("acknowledged cleanup returned %v, calls=%d", err, calls)
 		}
 	})
 }
 
-func TestCloseCommitDoesNotRetryIndependentFailures(t *testing.T) {
-	fault := errors.New("commit response unavailable")
+func TestCloseCleanupDoesNotRetryIndependentFailures(t *testing.T) {
+	fault := errors.New("cleanup response unavailable")
 	for _, cause := range []error{fault, errors.Join(context.Canceled, fault), errors.Join(fault, context.Canceled)} {
 		request, cancel := context.WithCancel(t.Context())
 		calls := 0
@@ -153,10 +154,16 @@ func TestCloseCommitDoesNotRetryIndependentFailures(t *testing.T) {
 			cancel()
 			return cause
 		})
-		err := h.flushForClose(request)
+		err := completeHandleClose(request, h)
 		cancel()
-		if err != cause || errnoOf(err) != syscall.EIO || calls != 1 || !h.dirty {
-			t.Fatalf("failed close returned %v, want original %v; calls=%d, dirty=%v", err, cause, calls, h.dirty)
+		if err != cause || errnoOf(err) != syscall.EIO || calls != 1 {
+			t.Fatalf("failed close returned %v, want original %v; calls=%d", err, cause, calls)
+		}
+		if again := completeHandleClose(t.Context(), h); again != err || calls != 1 {
+			t.Fatalf("repeated failed cleanup returned %v, calls=%d", again, calls)
+		}
+		if errnoOf(h.node.ns.check()) != syscall.EIO {
+			t.Fatal("unknown reference cleanup did not fence the namespace")
 		}
 	}
 }
@@ -171,10 +178,7 @@ func (c observedCompletionContext) Deadline() (time.Time, bool) {
 	return c.Context.Deadline()
 }
 
-func TestCloseCommitLockWaitConsumesTheOriginalBudget(t *testing.T) {
-	// Mutex admission is not durably blocked for synctest, so this case uses a real
-	// timer. Observing Deadline proves the attempt has sampled its start time while
-	// the handle lock is still held.
+func TestCloseCleanupLockWaitConsumesTheOriginalBudget(t *testing.T) {
 	const budget = 20 * time.Millisecond
 	request := observedCompletionContext{Context: t.Context(), started: make(chan struct{})}
 	calls := 0
@@ -187,21 +191,20 @@ func TestCloseCommitLockWaitConsumesTheOriginalBudget(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err()
 	})
-	h.mu.Lock()
+	h.closeMu.Lock()
 	done := make(chan error, 1)
-	go func() { done <- h.flushForClose(request) }()
+	go func() { done <- completeHandleClose(request, h) }()
 	select {
 	case <-request.started:
 	case <-time.After(time.Second):
-		h.mu.Unlock()
+		h.closeMu.Unlock()
 		<-done
-		t.Fatal("close commit did not establish its deadline before locking")
+		t.Fatal("close cleanup did not establish its deadline before locking")
 	}
 	time.Sleep(2 * budget)
-	h.mu.Unlock()
-	err := <-done
-	if !errors.Is(err, context.DeadlineExceeded) || calls != 1 || !h.dirty {
-		t.Fatalf("lock-delayed commit returned %v, calls=%d, dirty=%v", err, calls, h.dirty)
+	h.closeMu.Unlock()
+	if err := <-done; !errors.Is(err, context.DeadlineExceeded) || calls != 1 {
+		t.Fatalf("lock-delayed cleanup returned %v, calls=%d", err, calls)
 	}
 }
 
@@ -227,10 +230,8 @@ func TestFsyncRetainsRequestCancellation(t *testing.T) {
 				go func() { done <- h.Fsync(request, 0) }()
 				<-entered
 				cancel()
-				if errno := <-done; errno != syscall.EINTR || calls != 1 || !h.dirty ||
-					h.stored != 0 || string(h.contents) != "pending" {
-					t.Fatalf("canceled Fsync returned %v, calls=%d, dirty=%v, stored=%d, contents=%q",
-						errno, calls, h.dirty, h.stored, h.contents)
+				if errno := <-done; errno != syscall.EINTR || calls != 1 || h.closeDone != nil {
+					t.Fatalf("canceled Fsync returned %v, calls=%d, retired=%v", errno, calls, h.closeDone != nil)
 				}
 				if elapsed := time.Since(start); elapsed != 0 {
 					t.Fatalf("Fsync waited %s after request cancellation", elapsed)

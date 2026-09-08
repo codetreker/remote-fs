@@ -132,16 +132,18 @@ const (
 )
 
 var ops = map[Op]opSpec{
-	OpStat:      {method: http.MethodGet, operands: []string{keyPath}},
-	OpSetAttr:   {method: http.MethodPost, operands: []string{keyPath}, body: contentJSON},
-	OpList:      {method: http.MethodGet, operands: []string{keyPath}},
-	OpRead:      {method: http.MethodGet, operands: []string{keyPath}},
-	OpWrite:     {method: http.MethodPost, operands: []string{keyPath}, body: contentOctets},
-	OpCreate:    {method: http.MethodPost, operands: []string{keyPath}},
-	OpMkdir:     {method: http.MethodPost, operands: []string{keyPath}},
-	OpRemove:    {method: http.MethodPost, operands: []string{keyPath}},
-	OpRemoveDir: {method: http.MethodPost, operands: []string{keyPath}},
-	OpRename:    {method: http.MethodPost, operands: []string{keyPath, keyTo}},
+	OpFileControl: {method: http.MethodPost, body: contentJSON},
+	OpFile:        {method: http.MethodPost, body: contentJSON},
+	OpStat:        {method: http.MethodGet, operands: []string{keyPath}},
+	OpSetAttr:     {method: http.MethodPost, operands: []string{keyPath}, body: contentJSON},
+	OpList:        {method: http.MethodGet, operands: []string{keyPath}},
+	OpRead:        {method: http.MethodGet, operands: []string{keyPath}},
+	OpWrite:       {method: http.MethodPost, operands: []string{keyPath}, body: contentOctets},
+	OpCreate:      {method: http.MethodPost, operands: []string{keyPath}},
+	OpMkdir:       {method: http.MethodPost, operands: []string{keyPath}},
+	OpRemove:      {method: http.MethodPost, operands: []string{keyPath}},
+	OpRemoveDir:   {method: http.MethodPost, operands: []string{keyPath}},
+	OpRename:      {method: http.MethodPost, operands: []string{keyPath, keyTo}},
 	// Space describes the whole namespace rather than anything under a path, so it takes
 	// no operands. A path sent beside it is refused like any operand nobody asked for.
 	OpSpace: {method: http.MethodGet},

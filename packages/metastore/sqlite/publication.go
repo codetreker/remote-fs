@@ -107,7 +107,7 @@ func (n sqliteNative) Guard(ctx context.Context, key locking.BackendKey, transit
 	}
 	return n.ordered(ctx, func(tx *sql.Tx) error {
 		node, err := scanNode(tx.QueryRowContext(ctx,
-			`SELECT `+nodeColumns+` FROM nodes n WHERE n.namespace = ? AND n.id = ?`, n.store.namespace, id))
+			`SELECT `+nodeColumns+` FROM nodes n WHERE n.namespace = ? AND n.id = ? AND n.detached = 0`, n.store.namespace, id))
 		if errors.Is(err, sql.ErrNoRows) {
 			return locking.Wrap(locking.StaleResource, "the resolved file no longer exists", err)
 		}
@@ -152,8 +152,10 @@ func (s *Store) backendNode(key locking.BackendKey) (int64, error) {
 }
 
 type namespaceIntent struct {
-	kind  locking.MutationKind
-	paths []string
+	kind    locking.MutationKind
+	paths   []string
+	node    int64
+	cleanup bool
 }
 
 type namespacePublication struct {
@@ -171,6 +173,20 @@ func (s *Store) mutateNamespace(ctx context.Context, kind locking.MutationKind, 
 
 func (s *Store) prepareNamespacePublication(ctx context.Context, tx *sql.Tx, intent namespaceIntent) (*namespacePublication, error) {
 	publication := &namespacePublication{intent: intent}
+	if intent.node != 0 {
+		state, err := s.fileState(ctx, tx, intent.node)
+		if err != nil {
+			return nil, err
+		}
+		if state.Mode.IsRegular() && !state.Detached {
+			publication.nodes = []int64{state.ID}
+			publication.targets = []locking.BackendKey{s.backendKey(state.ID)}
+		}
+		if intent.kind == locking.WriteMutation || intent.cleanup {
+			publication.previous = state.Size
+		}
+		return publication, nil
+	}
 	nodes := make([]metastore.Node, len(intent.paths))
 	seen := make(map[int64]bool, len(intent.paths))
 	for i, path := range intent.paths {
@@ -203,7 +219,13 @@ func (s *Store) prepareNamespacePublication(ctx context.Context, tx *sql.Tx, int
 
 func (s *Store) finishNamespacePublication(ctx context.Context, tx *sql.Tx, publication *namespacePublication) error {
 	if publication.intent.kind == locking.WriteMutation {
-		node, err := s.resolve(ctx, tx, publication.intent.paths[0])
+		var node metastore.Node
+		var err error
+		if publication.intent.node != 0 {
+			node, err = s.nodeByID(ctx, tx, publication.intent.node)
+		} else {
+			node, err = s.resolve(ctx, tx, publication.intent.paths[0])
+		}
 		if err != nil {
 			return err
 		}
@@ -212,12 +234,29 @@ func (s *Store) finishNamespacePublication(ctx context.Context, tx *sql.Tx, publ
 	for i, id := range publication.nodes {
 		var present bool
 		if err := tx.QueryRowContext(ctx,
-			`SELECT EXISTS(SELECT 1 FROM nodes WHERE namespace = ? AND id = ?)`, s.namespace, id).Scan(&present); err != nil {
+			`SELECT EXISTS(SELECT 1 FROM nodes WHERE namespace = ? AND id = ? AND detached = 0)`, s.namespace, id).Scan(&present); err != nil {
 			return err
 		}
 		if !present {
 			publication.retired = append(publication.retired, publication.targets[i])
 		}
+	}
+	if publication.intent.node == 0 && (publication.intent.kind == locking.RemoveMutation || publication.intent.kind == locking.RenameMutation) && publication.previous != 0 {
+		// Retaining a removed destination keeps its current bytes charged. The
+		// removal still retires the named strong resource in the same publication.
+		var retained int64
+		for _, id := range publication.nodes {
+			var size int64
+			err := tx.QueryRowContext(ctx, `SELECT size FROM nodes WHERE namespace=? AND id=? AND detached=1`, s.namespace, id).Scan(&size)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			retained += size
+		}
+		publication.next = retained
 	}
 	return nil
 }
@@ -225,6 +264,11 @@ func (s *Store) finishNamespacePublication(ctx context.Context, tx *sql.Tx, publ
 func (s *Store) publishNamespace(ctx context.Context, tx *sql.Tx, state DurableState, publication *namespacePublication) error {
 	scope := locking.ScopeFromContext(ctx)
 	commit := func() locking.PublicationOutcome {
+		if !publication.intent.cleanup {
+			if err := metastore.CheckFilePublication(ctx); err != nil {
+				return locking.PublicationOutcome{Known: true, Err: err}
+			}
+		}
 		settle, err := storage.PreparePublication(ctx, publication.previous, publication.next)
 		if err != nil {
 			if storage.IsPublicationAccountingUncertain(err) {
@@ -244,6 +288,9 @@ func (s *Store) publishNamespace(ctx context.Context, tx *sql.Tx, state DurableS
 			return locking.PublicationOutcome{Known: true, Changed: true, Retired: publication.retired, Err: err}
 		}
 		return locking.PublicationOutcome{Known: true, Changed: true, Retired: publication.retired}
+	}
+	if publication.intent.cleanup {
+		return commit().Err
 	}
 	if s.locks == nil {
 		if err := validateNativeLeaseOpening(s.databasePath, false); err != nil {

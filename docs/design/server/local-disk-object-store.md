@@ -1,8 +1,8 @@
 # 本地持久对象存储
 
-本文描述随附的本地持久 storage。它把一份 workspace 的对象、元数据、变更日志、文件占有恢复证据与所有权锁放在同一个本地目录下，对外实现顶层设计定义的 `storage.Storage`，并向 server 提供与原生提交绑定的文件占有 authority。server 如何选择并暴露它，见 [`architecture.md`](architecture.md)；占有协议见[文件占有](file-locks.md)。
+本文描述随附的本地持久 storage。它把一份 workspace 的对象、元数据、变更日志、文件占有恢复证据与所有权锁放在同一个本地目录下，对外提供路径操作和持续绑定节点的文件句柄，并向 server 提供与原生提交绑定的文件占有 authority。server 如何选择并暴露它，见 [`architecture.md`](architecture.md)；句柄与占有分别见[文件句柄](file-handles.md)和[文件占有](file-locks.md)。
 
-这份设计受 R-CC-3、R-CC-6～11、R-ERR-6～8、R-INT-3、R-INT-6、R-INT-13、R-WS-1、R-WS-3、R-WS-5、R-WS-6 与 R-SEC-3 约束。
+这份设计受 R-FS-6～8、R-CC-3、R-CC-6～13、R-ERR-6～8、R-INT-3、R-INT-6、R-INT-13、R-WS-1、R-WS-3、R-WS-5～7 与 R-SEC-3 约束。
 
 ## 一、组合与 API
 
@@ -12,22 +12,24 @@
 localstore.Store
   └─ objectstore.Storage
        ├─ localdisk.Objects       不可变对象、物理容量、恢复与独占锁
-       └─ sqlite.Store            命名空间、配额、对象状态、变更日志与最终发布
-            └─ locking.Authority  文件占有；恢复证据由组合层绑定
+       └─ sqlite.Store            命名空间、保留节点、配额、变更日志与最终发布
+            ├─ advisory          句柄与建议锁的 namespace 资源域
+            └─ locking.Authority  强 S/X 占有；恢复证据由组合层绑定
 ```
 
-`localstore.Open(ctx, Config)` 打开或初始化组合存储。`Config` 包含根目录、workspace 名、正数配额、变更日志窗口、`sqlite.ObjectLimits`、普通与 snapshot SQLite reader-connection 上限、integrity-record／name-byte 上限、`localdisk.Options`、`objectstore.Options`、`Locks *locking.Options` 与 `InitializeLocks`。根目录必须预先存在；其绝对路径不能含 SQLite file URI 会解释的 `%`、`?`、`#` 或 NUL；workspace 为 1～`localstore.MaxWorkspaceBytes`（1024）字节；配额不得低于 4096 字节。effective pending-byte threshold 必须不小于 effective local maximum object size，使每个 local-disk 接受的对象都能单独进入 pending backlog。workspace、quota、log window、local-disk、SQLite、占有上限与两者的 byte-limit 关系在根目录被修改前校验。
+`localstore.Open(ctx, Config)` 打开或初始化组合存储。`Config` 包含根目录、workspace 名、正数配额、变更日志窗口、`sqlite.ObjectLimits`、普通与 snapshot SQLite reader-connection 上限、integrity-record／name-byte 上限、`MaxRetainedFiles`、`advisory.Config`、`localdisk.Options`、`objectstore.Options`、`Locks *locking.Options` 与 `InitializeLocks`。根目录必须预先存在；其绝对路径不能含 SQLite file URI 会解释的 `%`、`?`、`#` 或 NUL；workspace 为 1～`localstore.MaxWorkspaceBytes`（1024）字节；配额不得低于 4096 字节。effective pending-byte threshold 必须不小于 effective local maximum object size，使每个 local-disk 接受的对象都能单独进入 pending backlog。workspace、quota、log window、local-disk、SQLite、句柄与占有上限，以及两者的 byte-limit 关系在根目录被修改前校验。
 
 `Locks` 启用与 SQLite namespace 成对的 authority；首次建立占有状态或继续匹配的初始化 intent 还须显式设置 `InitializeLocks`。已绑定 root 重新打开必须提供 `Locks`，省略它不能关闭保护。真正尚未绑定的组合存储仍可由库调用方按原始 storage API 使用，但没有可供 server 接受的占有 authority。
 
 组合层总会把传入的 `localdisk.Options.CompositeInitialization` 置为 true，使初始化 intent 在 local-disk lifetime lock 下创建。`localdisk.Open` 返回的 `CompositeInitializationState()` 是 `NoCompositeInitialization`、`CompositeInitializationStarted` 或 `CompositeInitializationResumed`；standalone `localdisk.Objects` 的零值 option 不创建组合层 intent。
 
-返回的 `*localstore.Store` 实现 `storage.Storage` 与 `storage.BoundedStorage`；配置 `Locks` 后，server 通过 `locked.New` 验证并使用这份 namespace 与 authority 的配对。它另外提供：
+返回的 `*localstore.Store` 实现 `storage.Storage`、`storage.BoundedStorage` 与 `storage.FileStorage`；配置 `Locks` 后，server 通过 `locked.New` 验证并使用这份 namespace 与 authority 的配对。它另外提供：
 
 | 方法 | 作用 |
 |---|---|
 | `Log()` | 返回与命名空间修改同事务提交的 durable change log |
 | `LockService()` | 返回与本 namespace 原生发布绑定的文件占有管理服务 |
+| `NewFileSession(ctx, options)` | 创建有界文件会话，打开与持续访问同一节点；过期或退役后不按路径重开 |
 | `Sweep(ctx, limit)` | 删除至多 `limit` 个已记录的未引用对象 |
 | `MaintenanceStatus()` | 返回最近一次后台清扫的时间、删除数与错误 |
 | `Status(ctx)` | 合并逻辑空间、对象记录、本地磁盘、checkpoint 与维护状态 |
@@ -167,7 +169,7 @@ schema migration `0004_lease_recovery.sql` 为整份数据库保存 database ID�
 
 这项校验阻止信任边界外的 principal 在打开期间替换路径分量。root、同 UID 进程和管理员仍能改名或替换这些分量，属于部署信任边界；部署必须在 store 的整个 lifetime 内约束它们。组合层在打开各个 pathname-based component 前后比对根目录的 device 与 inode，但这不是跨整个运行期的 rename lease。
 
-对象层同时对根目录描述符与 `OWNER.lock` 取得 non-blocking exclusive `flock`。配置 `Locks` 的 localstore 还持有数据库文件的原生 `LOCK_EX`；所有原始 SQLite opener 则持有同一 native file 上的 `LOCK_SH`，使同进程与跨进程的既存 raw handle 都不能与 authority 并存。冲突 opener 得到 `EBUSY`，这些所有权只在全部 SQLite connection 成功关闭后释放。`ConfigureLeaseRecovery` 验证实际 EX owner 与绑定的原生 `LeaseAnchor`，`EnableLocks` 只接受已配置该恢复状态且仍持有 EX 的 Store；调用方提供一个持久化接口不能代替这些条件。完整规则见[文件占有](file-locks.md)。
+对象层同时对根目录描述符与 `OWNER.lock` 取得 non-blocking exclusive `flock`。localstore 的 durable SQLite opener 还持有数据库文件的原生 `LOCK_EX`；原始非独占 SQLite opener 持有同一 native file 上的 `LOCK_SH`，使同进程与跨进程的既存 raw handle 都不能与独占 owner 并存。冲突 opener 得到 `EBUSY`，这些所有权只在全部 SQLite connection 成功关闭后释放。保留文件引用要求实际 EX ownership，只有 SH 的 Store 以 `EOPNOTSUPP` 拒绝这项能力；进程内 pin 不能保护另一写进程的回收。`ConfigureLeaseRecovery` 验证实际 EX owner 与绑定的原生 `LeaseAnchor`，`EnableLocks` 只接受已配置该恢复状态且仍持有 EX 的 Store；调用方提供一个持久化接口不能代替这些条件。完整规则见[文件占有](file-locks.md)和[文件句柄](file-handles.md)。
 
 ## 五、key、分片与对象 envelope
 
@@ -235,9 +237,19 @@ shard identity 或对象 publication 已经发生后，任何无法证明 direct
 
 零字节文件不创建对象；其内容直接由 metastore 中没有 object key 的零长度节点表示。
 
+### 保留节点与范围修改
+
+`metastore.FileStore` 在同一原生 gate 内完成路径或节点身份核对、创建／截断与引用保留。`ExpectedID` 不匹配以 `ESTALE` 失败；创建不存在的文件、排他创建判断、初始属性与返回的引用属于同一次结果。保留引用绑定 node ID，改名不改变它；unlink 或 rename 替换目的地时，仍有 pin 的普通文件成为 `detached`，其当前 object 引用、属性与配额继续保留。路径查询与 named snapshot 不暴露 detached 节点，其后修改不产生 named change event；句柄仍可读取、修改当前状态。
+
+句柄的 `ReadAt` 每次从一份 `FileState` 取得 node、size、object key 和 content revision，再在原生 gate 外读取该不可变对象。返回的属性、范围与 EOF 来自这同一状态。旧对象已被清扫且节点已指向另一对象时有界重试；节点仍指向缺失对象时以 `EIO` 失败。一次调用可以输给持续覆盖而返回 `EAGAIN`，不会拼接两份状态。
+
+`WriteAt` 与 `Truncate` 先读取当前完整对象，在有界内存中生成下一份完整内容：范围之外保留当前字节，扩展部分为零。随后按 `Reserve → Put → Commit` 发布，以读取时的 `content_revision` 做原生 CAS；revision 不符表示未提交，成功清理本次新对象后才能重新读取并尝试。真实提交、持久确认或 cleanup 结果未知时立即报错并保留失败隔离，不重放可能已生效的写入。普通重叠写入可依实际顺序各自成功；这项内部重试不是调用方显式内容版本校验的承诺。每次写入和截断成功前完成服务端确认，关闭不补交旧整文件快照。
+
+关闭或会话退役先在最终发布 gate 内撤销引用权限，再排空已接纳的 materialization 与上传，最后释放 native pin。最后一个 pin 关闭 detached 节点时，在同一事务中删除节点、按实际剩余大小释放配额，并把当前对象标为 garbage；真正对象删除由 sweeper 执行。已被逻辑退休的引用不能因为物理字节尚在而继续发布。关闭结果未知会保留 pin 并失败隔离，不宣告配额已释放；旧 epoch 的引用明确失效，不按原路径重建。会话与 advisory 锁的生命周期见[文件句柄](file-handles.md)。
+
 ## 七、容量与资源上限
 
-本地持久 store 必须带正数 workspace quota。SQLite 精确记录已经被 namespace 引用的 payload bytes，并在改变引用与大小的同一 transaction 中以 `EDQUOT` 拒绝超额写入。reserved、unresolved 与 garbage object、envelope 与 recovery state 不计入逻辑 `Used`，但占用物理磁盘。
+本地持久 store 必须带正数 workspace quota。SQLite 精确记录 named 与 retained detached 文件当前引用的 payload bytes，并在改变引用与大小的同一 transaction 中以 `EDQUOT` 拒绝超额写入。失去名字不释放仍由打开引用持有的配额；最后物理引用已知关闭后才扣除。reserved、unresolved 与 garbage object、envelope 与 recovery state 不计入逻辑 `Used`，但占用物理磁盘。
 
 `sqlite.ObjectLimits` 另行限制一份 namespace 中 reserved、unresolved 与 garbage records 合计的数量和记录 payload bytes。单个请求的 payload 大于 `MaxPendingBytes` 时 `Reserve` 以 `EFBIG` 拒绝，因为任何后台工作都无法让它单独装进阈值；请求本身能装下、但现有 backlog 使新增记录越过数量或字节阈值时返回 `EAGAIN`。拒绝与插入在同一 write transaction 中完成，不上传对象，也不留下 reservation。
 
@@ -245,13 +257,15 @@ unresolved 没有自动恢复或删除路径。重复的未知 `Put` 结果可�
 
 零值 fields 由 `ObjectLimits.Effective()` 换成默认值；负值与 `math.MaxInt64` 被拒绝，没有 unbounded 取值。commit、覆盖、删除和改名必须继续完成其权威状态转换，其中解除 live object 引用的操作可以把 garbage backlog 推到阈值之上；`Quarantine` 与 `Abandon` 也始终可用，且 reserved→unresolved 或 reserved→garbage 都保持 pending count/bytes 不变。`ObjectStatus.OverLimit` 只在 count 或 bytes 严格大于 effective threshold 时为 true；恰好等于阈值仍是 within-limit 状态，但新的 reservation 可能已经没有余量。over-limit 时新的 reservation 持续返回 `EAGAIN`，garbage 清扫与 namespace shedding 仍可进行，直到回到阈值内。limits 是 serving configuration，重新打开可以选择不同的有限值。
 
-`Reserve` 的热路径只读取 indexed pending totals；namespace 打开与 `ObjectStatus` 执行完整性验证。每个 namespace 必须是从唯一 root 可达的一棵树：root 没有 incoming entry，每个非 root 节点恰有一个同 namespace 的名字，cycle、孤儿与跨 namespace entry 都是 `EIO`。`namespaces.used` 必须是非负整数，并等于对全部 regular-file size 做 overflow-checked streaming sum 的结果；object state 与 size 同样逐项验证。SQLite storage class 也逐列验证：entry/change name 是 BLOB，identity/key 是非空 text，标量为 integer，可空 change node/from fields 必须按 kind 成组出现，mode、size、position 与纳秒范围有效。对 schema version、database identity、backing-store binding、snapshot/log header 与 append tail 等动态标量，查询先用 `typeof`／长度条件把错误类型投影成 NULL，再由 Go 拒绝 storage class，不让 driver 把超大 BLOB 或错误类型强制成可信的整数／字符串。任何会改变 cursor order 的记录也以 `EIO` 拒绝。
+`Reserve` 的热路径只读取 indexed pending totals；namespace 打开与 `ObjectStatus` 执行完整性验证。每个 namespace 的 named 节点必须是从唯一 root 可达的一棵树：root 没有 incoming entry，其余 named 节点恰有一个同 namespace 的名字。detached 节点只能是非 root 的普通文件，没有名字，也不能作为 entry 的父或子节点；其它孤儿、cycle 与跨 namespace entry 都是 `EIO`。`namespaces.used` 必须是非负整数，并等于 named 与 detached 全部 regular-file size 的 overflow-checked streaming sum；object state 与 size 同样逐项验证。SQLite storage class 也逐列验证：entry/change name 是 BLOB，identity/key 是非空 text，标量为 integer，`detached` 只能为 0 或 1，`content_revision` 必须为正，可空 change node/from fields 必须按 kind 成组出现，mode、size、position 与纳秒范围有效。对 schema version、database identity、backing-store binding、snapshot/log header 与 append tail 等动态标量，查询先用 `typeof`／长度条件把错误类型投影成 NULL，再由 Go 拒绝 storage class，不让 driver 把超大 BLOB 或错误类型强制成可信的整数／字符串。任何会改变 cursor order 的记录也以 `EIO` 拒绝。
 
 `database_state` 保存 32 ASCII 字节的小写十六进制 database identity，以及单调的 generation、node high-water 与 change high-water。节点 ID 和 change position 都由对应 high-water 显式分配，再以显式主键插入；SQLite `AUTOINCREMENT` 与 `sqlite_sequence` 继续作为冗余约束。数据库打开、checkpoint、`DurableState` 与每个 `Since` page 要求 sequence 和对应 high-water 完全相等，并通过按 storage-class discriminator／最大 identity 排序的 expression indexes 读取全数据库的类型异常与最大 surviving node/change reference；任一 namespace 的引用超过高水位都会失败，不扫描全部 rows。每次分配重新核对 sequence；change append 还要求现有 committed tail 严格小于新分配的位置，否则事务以 `EIO` 回滚。namespace 完整性查询再校验目标 namespace 的逐行关系。达到 `math.MaxInt64` 时以 `ENOSPC` 拒绝，不绕回或复用。`METASTORE` 中的外部副本还能检测 `database_state` 与 `sqlite_sequence` 被一同回退的情况。
 
 每条 retained change 保存 `previous_position`，指向同 namespace 的上一条位置；第一条 surviving change 指向 `trimmed_through`，最后一条等于 `committed_position`。全局 change position 可以因其它 namespace 的记录产生空洞，所以完整性检查沿 predecessor 链而不要求 `position + 1`。`Open`、`Snapshot` 与 `ObjectStatus` 在暴露 namespace 前验证整条 retained chain，完整工作受 `MaxIntegrityRecords` 限制。`Since` 使用索引读取 database state、sequence、log header、oldest/newest 与按需的 page anchor，再把实际 page row 数收紧到剩余 record budget；请求的 limit 很大而实际日志很小时仍只按存在的工作计费，anchor 已耗尽预算且 tail 尚未返回时以 `EFBIG` 拒绝。它逐项验证 page-local predecessor，工作量与实际页大小成正比；跨到缺口的 page 使 caller-owned result 整体失败，不暴露该页已经产生的 prefix。较早且完全位于后续缺口之前的 page 可以成功；缺口页的 stream error 使 consumer 立即作废副本，随后带同一 incarnation/position 的续订持续失败，直到持久日志被带外修复，或出现合法的 incarnation/window rebuild boundary。
 
 v1/v2 迁移在同一 transaction 内对全库执行 storage class、树、对象、用量、序列与历史格式检查，失败时 schema 与数据都不部分前进。v1 没有 retained history；v2 没有 predecessor，不能把旧 rows 升格为连续性证明。迁移保留 node/change 全局高水位，删除 v2 retained changes，把每条日志切换到新的 incarnation 并将 tail／trim 归零；迁移后的第一条 change 仍严格高于旧 change high-water，现有 replica 因 incarnation mismatch 重建。
+
+schema v5 的 `0005_retained_files.sql` 增加 `nodes.detached` 与 `nodes.content_revision`，既有节点迁移为 named、revision 为 1。每次内容发布都推进 revision，包括空内容再次发布；耗尽时以 `EOVERFLOW` 失败。revision 不复用作节点身份、S/X generation 或 change position。独占 opener 在启动事务中先按完整性和字节预算验证所有 namespace，再回收前一 serving epoch 遗留的 detached 节点：释放各自 quota，把当前对象标为 garbage，最后删除节点。任一 namespace 的损坏都使整次恢复回滚，不能先删除再验证；SH opener 不获得这项回收权限。原生 owner 隔离保证另一有效实例的 pin 不会被回收。
 
 `sqlite.Options.MaxIntegrityRecords` 在 recursive CTE 之前限制一次验证接触的 namespace seed、node、relevant entry、object、log 与 change records 合计；entry 的 label、parent 或 child 任一接触 namespace 都计费。`DefaultMaxIntegrityRecords` 为 1,000,000，`MinIntegrityRecords` 为 3，只容纳一个 namespace seed、空 root 与 mandatory log row；零值选择默认，低于 3 与 `math.MaxInt64` 在数据库或 local-store root 被接触前以 `EINVAL` 拒绝。超出 serving limit 是 `EFBIG`，并要求显式提高配置；无法完成计量是 `EIO`。legacy migration 使用全库合计，不能让另一个 namespace 的工作量或 corruption 藏在这次打开的名字之外。
 
@@ -261,7 +275,7 @@ v1/v2 迁移在同一 transaction 内对全库执行 storage class、树、对�
 
 ```
 Total = configured workspace quota
-Used  = SQLite 记录的 referenced payload bytes
+Used  = SQLite 记录的 named + retained detached payload bytes
 Avail = min(max(quota - Used, 0), localdisk.Available)
 ```
 
@@ -287,11 +301,19 @@ Avail = min(max(quota - Used, 0), localdisk.Available)
 | SQLite snapshot reader connections | 16 |
 | SQLite integrity records examined | 1,000,000 |
 | SQLite integrity name bytes examined | 64 MiB |
+| namespace 中保留的 native file references | 65536 |
+| retained-file 单个完整内容 | 1 GiB |
+| namespace materialization 的 current + next bytes | 2 GiB |
+| namespace 同时 materialization operations | 32 |
+| 一次 retained-file 内容读取／发布的尝试数 | 8 |
+| retained-file 单次操作期限 | 30 秒 |
 | 后台 sweep interval | 1 分钟 |
 | 每次后台 sweep 的对象数 | 64（最大 1,048,576） |
 | change-log floor / cap / age | 100 entries / 10000 entries / 10 分钟 |
 
 `MaxInFlightBytes` 必须至少容纳一份最大对象及其 envelope/key，recovery-record 上限不得低于 active operation 上限。`MaxWaitingOperations` 必须是小于 `math.MaxInt` 的正数；等待名额已满时新调用以 `EAGAIN` 拒绝。请求先取得 waiting ticket，再等待 per-key/per-shard token，完成 shard 初始化后才把 ticket 提升为 active operation/byte reservation，因此一个 shard 的等待者不会占满全部 active 名额并阻塞其它 shard。等待过程服从 `context.Context`；`Get` 与 `Delete` 在 active admission 被取消时会泄漏此前打开的 shard descriptor，详见[取消时关闭 shard 描述符](../../../.agents/notes/proposed/bug-fix/2026-09-07-close-shard-descriptors-on-cancel.md)。`Close` 拒绝新的 admission，并等待 waiting、active 与 control operation 离开；排空这些计数不能回收已泄漏的描述符。
+
+`MaxRetainedFiles` 统计 namespace 中的 native 引用数，同一节点的多次打开分别计费；满额以 `EAGAIN` 拒绝。`advisory.Config` 同时拥有 namespace 级 materialization operation／byte budget，句柄内容操作在读取 payload 和分配下一份内容前收费。写入收取 current + next，读取收取完整对象加返回范围；单项不能装入上限时为 `EFBIG`，容量被其它操作占用时为 `EAGAIN`。`MaxMaterializedBytes` 必须至少容纳两份 `MaxFileBytes`，共享 namespace 的 opener 必须使用相同配置。这些预算不替代 localdisk 物理 admission、pending object 阈值或 HTTP retention 上限。
 
 ## 八、维护、状态与关闭
 
@@ -322,7 +344,9 @@ Avail = min(max(quota - Used, 0), localdisk.Available)
 
 SQLite `Forget` 用 `context.WithoutCancel` 为 `BeginTx` 持有事务生命周期，准入、逐项校验、删除 SQL、日志 trim 与 generation 更新仍使用调用方 context。准备失败或取消时显式回滚，并观察回滚结果；全部准备成功后，原生 Commit / Accept 完成才返回，期间发生取消仍可能得到成功。它防止 `database/sql` 在后台自动回滚而隐藏收尾结果；真实 Commit、Accept 或 rollback 故障继续以 `EIO` 失败隔离，普通 namespace mutation 的提交规则不变。
 
-`Close` 先标记 namespace 已关闭并拒绝新操作，停止并等待后台清扫与 checkpoint worker，再排空已经进入的 namespace 操作；这段 worker 等待发生在 close context 建立之前。durable metastore 随后用 5 秒内部 context 等待 commit gate 并串行执行完整 `FULL` checkpoint；active reader 仍在使用 pool 时立即以 `EBUSY` 拒绝本轮关闭。全部 WAL frame 已复制且 checkpoint 见证已同步后，关闭流程才清除 writer connection 的 `PERSIST_WAL`，然后关闭 writer pool。所有 SQLite connection 都无错误关闭后，组合层才关闭 lease anchor、object-store descriptors、root anchor 与 lifetime locks。旧 authority 退役，持久最大租期继续约束下次接管。已经进入的 mutation 若在 sweeper 停止后才产生 garbage，其 durable record 由下一次 `Open` 安排的 startup sweep 接管。
+`Close` 先停止 file-session admission，逐个撤销会话与引用的发布权限，排空已接纳操作并关闭保留引用。失败时两半存储及其所有权继续保留，后续关闭可以重试可证明的未完成清理；不能先关闭数据库再等最后一个文件引用释放。直接关闭 SQLite 时仍有 retained file references 则以 `EBUSY` 拒绝。
+
+文件引用已排空后，组合层拒绝新的 namespace 操作，停止并等待后台清扫与 checkpoint worker，再排空已经进入的 namespace 操作；这段 worker 等待发生在 close context 建立之前。durable metastore 随后用 5 秒内部 context 等待 commit gate 并串行执行完整 `FULL` checkpoint；active reader 仍在使用 pool 时立即以 `EBUSY` 拒绝本轮关闭。全部 WAL frame 已复制且 checkpoint 见证已同步后，关闭流程才清除 writer connection 的 `PERSIST_WAL`，然后关闭 writer pool。所有 SQLite connection 都无错误关闭后，组合层才关闭 lease anchor、object-store descriptors、root anchor 与 lifetime locks。旧 authority 退役，持久最大租期继续约束下次接管。已经进入的 mutation 若在 sweeper 停止后才产生 garbage，其 durable record 由下一次 `Open` 安排的 startup sweep 接管。最后 detached close 的 commit、rollback 或 accounting 结果未知会 poison SQLite 并隔离 authority；后续关闭不能把它当作一次确定未提交的清理重新执行。
 
 `Open` 在 metastore 已建立后失败时也保持同一 ownership 顺序：先以这个 bounded graceful close 收敛；只要尚未产生 terminal pool-close result，未向调用方暴露的 SQLite store 就走 terminal `Abort`，即使 reader pools 已关也关闭剩余 writer。`Abort` 不主动清除 `PERSIST_WAL`：witnessed checkpoint 尚未完成时保留恢复证据；若本轮已经完成 checkpoint 见证、但清除 file-control 的调用报错，flag 状态不作保证，WAL 也已经不是恢复所必需。只有 Abort/Close 无错误证明 handles 已关闭后才释放 object/root locks；cleanup 自身失败时所有权保留。SQLite constructor 在 Store 建立前清理已打开 pools 时也使用同一边界：全部 close 成功的普通构造失败释放内部 coordinator 和外部 root；任一 pool close error 不能证明 native handle 已消失，错误带 ownership-retained 标记，SQLite coordinator 与 localstore root lock 都保留到进程退出。
 
@@ -339,7 +363,7 @@ remote-fs-server \
   -workspace NAME \
   -quota SIZE \
   [-initialize-lock-state] \
-  [METASTORE OPTIONS] [LOCAL OPTIONS] [LOCK OPTIONS] [HTTP OPTIONS]
+  [METASTORE OPTIONS] [LOCAL OPTIONS] [FILE OPTIONS] [LOCK OPTIONS] [HTTP OPTIONS]
 ```
 
 `-local-store` 与 `-blob-container` 二选一。`-workspace` 与 `-quota` 在 local-store 形态中必填；local-only flag 用在 Azure 形态会在 storage 被打开前拒绝。对应默认值来自上一节与 server HTTP handler 的默认值，flag 只负责把显式覆盖传给拥有该限制的 package。省略 `-http-max-write-bytes` 时继承 `-http-max-body-bytes`；显式的零值与其它非正值一样被拒绝。local-store 在打开任何磁盘资源前验证 effective write 上限不大于 effective `-local-max-object-bytes`。`-http-max-body-bytes` 仍可更大，因为 listing、错误与其它 non-write body 使用它。
@@ -362,6 +386,10 @@ remote-fs-server \
 | `-max-snapshot-reader-connections` | `sqlite.Options.MaxSnapshotReaderConnections`；Azure/local 共用 |
 | `-max-integrity-records` | `sqlite.Options.MaxIntegrityRecords`；Azure/local 共用 |
 | `-max-integrity-bytes` | `sqlite.Options.MaxIntegrityBytes`；Azure/local 共用 |
+| `-max-retained-files` | `sqlite.Options.MaxRetainedFiles`；Azure/local 共用 |
+| `-max-file-size` | `advisory.Config.MaxFileBytes`；不得超过对象和 pending-byte 上限 |
+| `-max-file-staging-bytes` | `advisory.Config.MaxMaterializedBytes`；至少两份最大文件 |
+| `-file-operation-timeout` | `advisory.Config.FileOperationTimeout`；包含内容 revision 重试 |
 | `-sweep-interval` | `objectstore.Options.SweepInterval`；Azure/local 共用 |
 | `-sweep-batch` | `objectstore.Options.SweepBatch`；Azure/local 共用 |
 

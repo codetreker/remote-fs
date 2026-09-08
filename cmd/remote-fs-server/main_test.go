@@ -31,9 +31,9 @@ import (
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-func testLockConfig(t *testing.T) lockConfig {
+func testAuthorityConfig(t *testing.T) authorityConfig {
 	t.Helper()
-	return lockConfig{options: locking.DefaultOptions(), initialize: true}
+	return authorityConfig{locks: locking.DefaultOptions(), initializeLocks: true}
 }
 
 func newTestNamespace(t *testing.T) (*objectstore.Storage, *sqlite.LockingStore) {
@@ -548,7 +548,7 @@ func TestOpenLocalExposesReplicationAndOperationalStatus(t *testing.T) {
 	const maxIntegrityBytes = 7 << 20
 	ns, err := openLocal(
 		source, 1<<20, sqlite.DefaultObjectLimits(), maxReaderConnections,
-		maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance, testLockConfig(t),
+		maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance, testAuthorityConfig(t),
 	)
 	if err != nil {
 		t.Fatalf("openLocal: %v", err)
@@ -602,7 +602,7 @@ func TestOpenBlobsExposesPendingAndMaintenanceStatus(t *testing.T) {
 		container: "container",
 		database:  filepath.Join(t.TempDir(), "metastore.sqlite"),
 		workspace: "workspace",
-	}, 0, limits, maxReaderConnections, maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance, testLockConfig(t))
+	}, 0, limits, maxReaderConnections, maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance, testAuthorityConfig(t))
 	if err != nil {
 		t.Fatalf("openBlobs: %v", err)
 	}
@@ -649,7 +649,7 @@ func TestBlobStatusFailsWhenTheObjectStoreIsUnreachable(t *testing.T) {
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
 		sqlite.DefaultMaxIntegrityBytes,
-		objectstore.DefaultOptions(), testLockConfig(t))
+		objectstore.DefaultOptions(), testAuthorityConfig(t))
 	if err != nil {
 		t.Fatalf("open blob namespace: %v", err)
 	}
@@ -674,7 +674,7 @@ func TestBlobStatusFailsWhenCredentialsAreRejected(t *testing.T) {
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
 		sqlite.DefaultMaxIntegrityBytes,
-		objectstore.DefaultOptions(), testLockConfig(t))
+		objectstore.DefaultOptions(), testAuthorityConfig(t))
 	if err != nil {
 		t.Fatalf("open blob namespace: %v", err)
 	}
@@ -701,7 +701,7 @@ func TestBlobStatusReportsUnresolvedWrites(t *testing.T) {
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
 		sqlite.DefaultMaxIntegrityBytes,
-		objectstore.DefaultOptions(), testLockConfig(t))
+		objectstore.DefaultOptions(), testAuthorityConfig(t))
 	if err != nil {
 		t.Fatalf("open blob namespace: %v", err)
 	}
@@ -805,7 +805,7 @@ func assertLegacyBlobOpenRefusedWithContext(
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, maxIntegrityRecords,
 		sqlite.DefaultMaxIntegrityBytes,
-		objectstore.DefaultOptions(), testLockConfig(t))
+		objectstore.DefaultOptions(), testAuthorityConfig(t))
 	if err == nil {
 		_ = ns.close()
 		t.Fatalf("%s was migrated and served", subject)
@@ -1285,7 +1285,7 @@ func TestSIGHUPReportsLocalStatusAndTheLockOutlivesServing(t *testing.T) {
 	maintenance := objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8}
 	ns, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
-		sqlite.DefaultMaxIntegrityBytes, maintenance, testLockConfig(t))
+		sqlite.DefaultMaxIntegrityBytes, maintenance, testAuthorityConfig(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1332,7 +1332,7 @@ func TestSIGHUPReportsLocalStatusAndTheLockOutlivesServing(t *testing.T) {
 
 	contender, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
-		sqlite.DefaultMaxIntegrityBytes, maintenance, lockConfig{options: locking.DefaultOptions()})
+		sqlite.DefaultMaxIntegrityBytes, maintenance, authorityConfig{locks: locking.DefaultOptions()})
 	if err == nil {
 		contender.close()
 		t.Fatal("a second server acquired the local-store lock while the first was serving")
@@ -1362,7 +1362,7 @@ func TestSIGHUPReportsLocalStatusAndTheLockOutlivesServing(t *testing.T) {
 	}
 	reopened, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
-		sqlite.DefaultMaxIntegrityBytes, maintenance, lockConfig{options: locking.DefaultOptions()})
+		sqlite.DefaultMaxIntegrityBytes, maintenance, authorityConfig{locks: locking.DefaultOptions()})
 	if err != nil {
 		t.Fatalf("the local-store lock remained after HTTP shutdown drained: %v", err)
 	}
@@ -1734,7 +1734,7 @@ func TestShutdownTimeoutKeepsTheLockUntilABlockedRequestLeaves(t *testing.T) {
 	maintenance := objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8}
 	ns, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
-		sqlite.DefaultMaxIntegrityBytes, maintenance, testLockConfig(t))
+		sqlite.DefaultMaxIntegrityBytes, maintenance, testAuthorityConfig(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1785,7 +1785,7 @@ func TestShutdownTimeoutKeepsTheLockUntilABlockedRequestLeaves(t *testing.T) {
 
 	contender, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
-		sqlite.DefaultMaxIntegrityBytes, maintenance, lockConfig{options: locking.DefaultOptions()})
+		sqlite.DefaultMaxIntegrityBytes, maintenance, authorityConfig{locks: locking.DefaultOptions()})
 	if err == nil {
 		contender.close()
 		t.Fatal("shutdown released the local-store lock while a handler was still running")
@@ -1809,7 +1809,7 @@ func TestShutdownTimeoutKeepsTheLockUntilABlockedRequestLeaves(t *testing.T) {
 	}
 	reopened, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
-		sqlite.DefaultMaxIntegrityBytes, maintenance, lockConfig{options: locking.DefaultOptions()})
+		sqlite.DefaultMaxIntegrityBytes, maintenance, authorityConfig{locks: locking.DefaultOptions()})
 	if err != nil {
 		t.Fatalf("the lock remained after the handler drained: %v", err)
 	}

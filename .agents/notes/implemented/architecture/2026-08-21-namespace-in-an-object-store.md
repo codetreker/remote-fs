@@ -25,17 +25,19 @@ Status: implemented
 
 本地磁盘实现的格式、持久化与组合所有权由[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)记录；[显式文件占有](./2026-09-07-file-locks.md)把 authority 绑定到 metastore 的原生最终发布。两者扩展这份两层结构，树与对象继续各自持有名字和字节。`limited` 保留为可复用的配额包装器，第三方 storage 继续按库契约接入。宿主目录形态的结束由[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)记录，下文涉及 `localdir` 的比较保留该决定发生时的理由。
 
-**写入的顺序是登记、上传、指过去。** `Reserve` 先在库里落一行「我要写这个键」并提交，然后字节被放到那个键下，最后 `Commit` 把路径指向它并在同一个事务里记账。上传不占住占有 authority；`Commit` 在原生 writer gate 内解析实际节点，发布前才对显式 proof、活动保护与期限作最终判定，匿名修改也受约束。最终许可与提交、持久确认和结果处置保持同一顺序，后继冲突权限与新的权威视图不能越过它。对象一经写入不再修改，已经捕获旧 node/object key 的读者可以在门外取得完整字节；新的读取取得提交后的完整版本。
+**写入的顺序是登记、上传、指过去。** `Reserve` 先在库里落一行「我要写这个键」并提交，然后字节被放到那个键下，最后 `Commit` 切换节点的 object 引用并在同一个事务里记账。路径操作在提交时解析实际节点，文件句柄直接使用已保留的节点身份。上传不占住强占有 authority；发布前对显式 proof、活动保护与期限作最终判定，匿名修改也受约束。最终许可与提交、持久确认和结果处置保持同一顺序，后继冲突权限与新的权威视图不能越过它。对象一经写入不再修改，已经捕获旧 node/object key 的读者可以在门外取得完整字节；后续句柄读取重新观察同一节点的当前状态。
 
 `Put` error 把 reservation 变成不可清扫的 unresolved；`Put` 成功而 `Commit` 明确拒绝时，`Abandon` 可把仍未引用的 reservation 变成 garbage。上传后 grant 过期是这种明确拒绝。未知 commit 或已被 poison 的 metastore 不允许收尾凭猜测取得删除权限，已被引用的对象同样不能 abandoned。调用方已经取消的 request 不会取消这些 storage-owned cleanup，清理本身失败则与原失败一起返回。原子切换路径引用使其它客户端看不到半份内容，而对单个 blob 的任何一串写入都给不了它。
 
 **树按 `(parent, name)` 存，不按完整路径存。** 改名一个目录改一行，而不是把子树里每一行的前缀都 UPDATE 一遍。附带的好处是行号天然就是[存储操作词汇](../../proposed/architecture/2026-08-19-storage-operation-vocabulary.md)要的那种「跨改名稳定、删除后不复用」的节点身份，将来要用时不必推翻重来。
 
+[持续文件句柄](./2026-09-08-live-file-handles.md)使用这份身份保留已打开的普通文件。unlink 或 rename 覆盖后仍被引用的节点成为 detached，保留当前内容、属性与配额，named snapshot 与路径访问不包含它，后续 detached 修改不产生 named change event。最后物理引用关闭才释放配额并授权清扫；先逻辑退休、再排空 I/O 的顺序阻止迟到上传继续发布。该机制部分替代「每次都从路径找文件」的访问方式，保留本 note 对树与不可变对象分层的决定。
+
 **名字是 `BLOB`，按字节序排。** Linux 上一个名字是任意字节序列，`README` 和 `readme` 是两个文件，而按 locale 规则排出来的目录顺序和这个系统里其它任何实现都对不上。这一点在 `packages/transport/httprest/message.go` 里已经有先例：线上 `Entry.Name` 是 `[]byte`，因为 `encoding/json` 会把非法 UTF-8 字节换成 U+FFFD。
 
 **时间是两列整数**（秒与纳秒），不是一个纳秒整数。契约测试要求 `1902-01-01` 与 `2400-06-01T12:00:00.5Z` 都完整往返，而 int64 纳秒只覆盖 1678 到 2262。
 
-**配额在提交的同一个事务里校验，`Space` 的逻辑总量与已用量是精确数。** 这份实现不被 `limited` 包起来——见下。`Objects` 能实测底层容量时，可写量还会收紧为配额余量与物理余量的较小值；测量失败按对象存储失败暴露，只有稳定的 `ENOSYS` 表示该实现没有这项能力。
+**配额在提交的同一个事务里校验，`Space` 的逻辑总量与已用量是精确数。** 用量包含 named 与仍被引用的 detached 文件；`Usage` 在没有配置 allowance 时也能报告该逻辑总量。这份实现不被 `limited` 包起来——见下。`Objects` 能实测底层容量时，可写量还会收紧为配额余量与物理余量的较小值；测量失败按对象存储失败暴露，只有稳定的 `ENOSYS` 表示该实现没有这项能力。
 
 ## 为什么先登记再上传
 
@@ -43,7 +45,7 @@ Status: implemented
 
 调查过的系统分成两类做法（每一条的出处见[对象存储后端](../../../../docs/research/object-store-backends.md)）。一类先传后提交、中间什么都不记，于是只能靠时间去猜：JuiceFS 一小时，SeaweedFS 五小时，Iceberg 三天，Delta Lake 七天——每一家的文档都带着一句「间隔太短会损坏数据」的警告，因为这个间隔实际上是在赌一次写入能有多慢。另一类不猜：s3ql 在上传**之前**就把一行意图写进元数据库，于是每个对象从诞生那一刻起就有一条已提交的记录说明它是谁的；它的清扫器因此完全不需要宽限期。Ceph RGW 从另一头解决——它从不扫描，回收项在解除引用的那个原子操作里入队。
 
-这份实现两头都取：上传前登记使每个 key 在 publication 之前已有 durable record，权威解引用 transaction 则把覆盖与删除产生的旧对象明确标成 garbage。`Garbage` 只返回这类 deletion-authorized record；reserved 不因年龄变成 garbage，`Put` error 进入不可清扫的 unresolved，只有成功 `Put` 证明归属、且 namespace 状态允许时，`Abandon` 才能把失败写入标为 garbage。清扫器因此既不列举 container，也不靠宽限期猜测对象归属。完整的 nil/error 删除权限边界见[未证实对象发布进入 unresolved](./2026-09-04-unresolved-object-publication.md)。
+这份实现两头都取：上传前登记使每个 key 在 publication 之前已有 durable record，权威解引用 transaction 则把内容替换、无 pin 的删除或 detached 最后关闭所释放的对象明确标成 garbage。删除名字本身不授权清扫仍由打开引用持有的内容。`Garbage` 只返回 deletion-authorized record；reserved 不因年龄变成 garbage，`Put` error 进入不可清扫的 unresolved，只有成功 `Put` 证明归属、且节点状态允许时，`Abandon` 才能把失败写入标为 garbage。清扫器因此既不列举 container，也不靠宽限期猜测对象归属。完整的 nil/error 删除权限边界见[未证实对象发布进入 unresolved](./2026-09-04-unresolved-object-publication.md)。
 
 s3ql 那套之所以成立，前提是它强制单挂载独占——它的清扫器会直接删掉库里不认识的对象。这里不需要那个前提，因为所有写入者共用同一个 metastore，登记行对谁都可见。
 
@@ -53,7 +55,7 @@ s3ql 那套之所以成立，前提是它强制单挂载独占——它的清扫
 
 > `unlink()` 之后的 `close()` 落在一个占位路径上。……在 `localdir` 上它响亮地失败（暂存文件要建在 `.go-fuse.…` 这个不存在的目录里，ENOENT 一路传回 `close`）；**在一个命名空间里没有真实目录的 storage 上——也就是这份契约被塑造成现在这个样子所面向的对象存储——它成功**，`close` 返回 0，数据落在一个没有人会再去读、也没有人会去清理的键上。
 
-所以 `Commit` 到一个父目录不存在的路径是 ENOENT，且**绝不创建中间层**。这不是一条可以在实现里放松的性能取舍，它是这份 note 存在的理由之一：把路径当扁平键的实现会静默地成功，而那正是上面那段话描述的丢数据。
+所以路径 `Commit` 到一个父目录不存在的位置是 ENOENT，且**绝不创建中间层**。这不是一条可以在实现里放松的性能取舍，它是这份 note 存在的理由之一：把路径当扁平键的实现会静默地成功，而那正是上面那段话描述的丢数据。持续文件句柄按保留的节点提交，失去名字后仍可访问原文件，不依赖旧父目录，也不会重建旧名字；关闭只结束引用，不补交一份按路径定位的内容。
 
 ## 版本不是内容哈希
 
@@ -65,7 +67,7 @@ s3ql 那套之所以成立，前提是它强制单挂载独占——它的清扫
 
 同一份哈希既做去重依据又做版本，等于把那个退化设计进来。所以内容哈希、节点身份与内容版本保持独立，文件占有的 GrantID／generation 也不充当其中任何一个值。
 
-事务性的 metastore 提供了把比较与写入放在同一个事务中的结构能力。显式文件占有使用原生提交处的权限判定，普通 Open 不自行取得 grant；缺少连续保护的写入仍需要内容版本／CAS，这部分由原提案继续跟踪。
+事务性的 metastore 把保留文件的 `content_revision` 比较与引用切换放在同一个事务中。范围写入以当前完整内容生成替换对象，只有明确未提交的 revision 冲突且清理成功时才重新读取和尝试；默认最多 8 次，持续竞争可返回 `EAGAIN`。重叠范围写按实际提交顺序生效，不会用旧整文件覆盖本次未触及的字节。强 S/X 与 advisory 锁分别控制自己的协议，普通 Open 不自动取得它们；调用方显式内容版本校验仍是独立工作，不能把这项内部 CAS 当作其交付。
 
 ## SQLite 的单写者
 
@@ -73,7 +75,7 @@ s3ql 那套之所以成立，前提是它强制单挂载独占——它的清扫
 
 SQLite 只有一个写者。这里选择接受它，理由是被否决的那个形状里，临界区**包住了网络往返**；这里事务只含元数据操作，字节的上传发生在事务之外，被串行掉的是一次本地提交。这个区别是这份实现成立的全部依据，也是它的上限：R-CC-2 在这份实现上只以这个口径成立，一个真正让不同文件的写互不干扰的部署需要一份 PostgreSQL 实现，而 `metastore.Store` 的接口是照着外部数据库设计的，没有任何一处假设单进程或本地文件。
 
-启用文件占有的 SQLite 部署由 native owner 独占数据库。外部对象存储使用 `sqlite.OpenLocking`：它同时持有 database inode 的 lifetime `LOCK_EX` 与进程内独占 coordinator，以数据库身份绑定占有证据，并在数据库旁固定保存 `.<database basename>.leases.intent` 和 `.witness`。所有原始 SQLite opener 持有同一 native file 的 `LOCK_SH`，既存 raw handle 与新 authority 在同进程和跨进程都互斥；配置恢复与启用 authority 必须验证真实 EX owner，恢复还要求绑定的原生 `LeaseAnchor`。
+提供 retained-file 的 SQLite opener 必须持有数据库 EX ownership，只有 SH 的原始 opener 不能发布这项能力。外部对象存储使用 `sqlite.OpenLocking`：它同时持有 database inode 的 lifetime `LOCK_EX` 与进程内独占 coordinator，以数据库身份绑定强占有证据，并在数据库旁固定保存 `.<database basename>.leases.intent` 和 `.witness`。非独占原始 SQLite opener 持有同一 native file 的 `LOCK_SH`，既存 raw handle 与独占 owner 在同进程和跨进程都互斥；配置强占有恢复与启用 authority 必须验证真实 EX owner，恢复还要求绑定的原生 `LeaseAnchor`。独占启动先验证所有 namespace 的完整性与用量，再在同一事务中回收旧 epoch 的 detached 节点；旧引用失效，不按路径恢复。
 
 Accepted／Prepared、独立 witness 与最大租期覆盖整份数据库；运行期选择的 namespace 不进入永久 anchor identity。同一数据库不能供两个 active locked server 共用，但可以重新打开其中另一份已存在的 namespace；每次接管仍从取得数据库 EX 的 monotonic 起点执行完整最大租期屏障。原始未绑定的 SQLite API 仍可独立使用；已有 native binding 或租期证据时不能借它关闭保护。localstore 的私有 root 继续永久绑定单一 workspace，并在 root lifetime lock 外持有数据库 EX。证据、所有权和恢复屏障的代价由[显式文件占有](./2026-09-07-file-locks.md)记录。
 

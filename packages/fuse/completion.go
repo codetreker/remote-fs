@@ -2,20 +2,42 @@ package fuse
 
 import (
 	"context"
+	"errors"
+	"syscall"
 	"time"
+
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// Close consumes the descriptor even when it reports an error, so a canceled request
-// cannot defer the commit to another close. The one attempt keeps its deadline while
-// waiting for h.mu; neither lock admission nor storage completion gets a fresh budget.
-// https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/os/file_unix.go#L307-L324
-func (h *handle) flushForClose(ctx context.Context) error {
-	deadline := time.Now().Add(h.node.ns.flushTimeout)
+// A close consumes the kernel descriptor even if its request was interrupted. Cleanup
+// therefore has a finite independent budget, bounded by an earlier request deadline.
+func (ns *namespace) cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline := time.Now().Add(ns.flushTimeout)
 	if requestDeadline, bounded := ctx.Deadline(); bounded && requestDeadline.Before(deadline) {
 		deadline = requestDeadline
 	}
-	completion, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	return context.WithDeadline(context.WithoutCancel(ctx), deadline)
+}
+
+func (ns *namespace) closeUnreturnedFile(ctx context.Context, file storage.File, cause error, changed bool) error {
+	completion, cancel := ns.cleanupContext(ctx)
 	defer cancel()
-	_, err := h.flush(completion)
-	return err
+	closeErr := ns.closeError(file.Close(completion))
+	if closeErr != nil {
+		return afterMutation(changed, errors.Join(cause, closeErr))
+	}
+	return afterMutation(changed, cause)
+}
+
+func (ns *namespace) closeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	// Normal session teardown retires references before draining them. Its worker
+	// already owns final cleanup, so a late release is not lost continuity.
+	if errnoOf(err) == syscall.ESTALE && errnoOf(ns.check()) == syscall.ESTALE {
+		return err
+	}
+	ns.fence(err)
+	return afterMutation(true, err)
 }

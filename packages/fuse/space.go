@@ -2,13 +2,10 @@ package fuse
 
 import (
 	"context"
-	"sync"
 	"syscall"
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
-
-	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // reportedBlockSize is the unit this mount reports space in. Nothing here holds anything
@@ -68,92 +65,4 @@ func (n *node) Statfs(ctx context.Context, out *gofuse.StatfsOut) syscall.Errno 
 	out.Files, out.Ffree = 0, 0
 	out.NameLen = maxNameLength
 	return 0
-}
-
-// roomWindow is how long one measurement of the room left in the namespace is used before
-// the namespace is asked again.
-//
-// write(2) is a filesystem's hottest path, and a round trip on each one would cost far
-// more than the refusal it pays for. One figure is therefore shared by every handle in the
-// mount and refreshed after roomWindow. A completed query or an independent failure
-// starts that window; an interrupted query can be retried immediately. A second is short
-// enough that the figure describes the workspace a caller is working in and long enough
-// that a program writing a file byte by byte usually pays for it once.
-//
-// The write that finds the figure aged is the one that waits for its replacement, for at
-// most spaceDeadline. Every other write in flight meanwhile goes through on the figure
-// that is already there.
-const roomWindow = time.Second
-
-// roomGauge is what this mount last heard about the room left in the namespace.
-//
-// Everything a write is checked against here may be that old, and both directions of the
-// staleness are accounted for. A figure larger than the truth lets through a write that
-// will not fit, which the commit refuses; the commit is the authority, and this is only
-// what makes the refusal reach the program at the write(2) that caused it. A figure
-// smaller than the truth refuses a write that would have fitted, which the next attempt
-// a moment later accepts.
-type roomGauge struct {
-	mu sync.Mutex
-
-	// asked is when the namespace last answered or failed independently of caller
-	// cancellation. A failed measurement shares the answer's cooldown; a withdrawn
-	// query leaves the previous timestamp intact so its retry can ask again.
-	asked time.Time
-
-	// asking says a question is in flight. Whoever finds one uses the figure that is
-	// already there rather than waiting behind it: two programs writing two different
-	// files may not be made to wait on each other (R-CC-2).
-	asking bool
-
-	// avail is the last figure, and measured says there is one at all. A question that
-	// failed leaves the previous figure standing rather than discarding it — it is still
-	// the last thing anybody measured — and until the first one succeeds there is no
-	// figure and nothing to check against.
-	avail    int64
-	measured bool
-
-	// absent records a namespace that has no room of its own to report. The contract
-	// makes that a standing property of the implementation rather than a condition of the
-	// call, so the question is never put again and no write is ever checked.
-	absent bool
-}
-
-// remaining reports what the namespace last said may still be written to it, and whether
-// there is such a figure at all. The namespace is asked only when the standing figure has
-// aged past roomWindow and nobody else is already asking. An honored caller interruption
-// returns its cause without changing the previous measurement or its timestamp.
-func (g *roomGauge) remaining(ctx context.Context, s storage.Storage) (int64, bool, error) {
-	g.mu.Lock()
-	due := !g.absent && !g.asking && time.Since(g.asked) >= roomWindow
-	if due {
-		g.asking = true
-	}
-	standing, measured := g.avail, g.measured
-	g.mu.Unlock()
-
-	if !due {
-		return standing, measured, nil
-	}
-
-	ask, cancel := context.WithTimeout(ctx, spaceDeadline)
-	defer cancel()
-	space, err := s.Space(ask)
-
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.asking = false
-	// A withdrawn query neither measures space nor starts the failure cooldown. Its
-	// caller must leave the buffer untouched, and an immediate retry needs a fresh query.
-	if errnoOf(err) == syscall.EINTR {
-		return g.avail, g.measured, err
-	}
-	g.asked = time.Now()
-	switch {
-	case errnoOf(err) == syscall.ENOSYS:
-		g.absent = true
-	case err == nil && space.Coherent():
-		g.avail, g.measured = space.Avail, true
-	}
-	return g.avail, g.measured, nil
 }

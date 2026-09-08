@@ -35,7 +35,7 @@ func (s *Storage) LockService() locking.Service {
 // Close method has no lifecycle resource for this wrapper to release.
 func (s *Storage) Close() error {
 	if closer, ok := s.backing.(io.Closer); ok {
-		return closer.Close()
+		return s.publicationError(closer.Close())
 	}
 	return nil
 }
