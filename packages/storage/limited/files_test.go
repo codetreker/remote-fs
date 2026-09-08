@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/locking"
@@ -80,40 +81,44 @@ func TestRetainedQuotaSurvivesUnlinkAndSettlesFinalCloseOnce(t *testing.T) {
 }
 
 func TestRetainedQuotaExpiryUsesUncancelledLifetimeAccounting(t *testing.T) {
-	s := newStorage(t, limited.MinLimit)
-	ctx, cancel := context.WithCancel(t.Context())
-	options := storage.DefaultFileSessionOptions()
-	options.Lease = 80 * time.Millisecond
-	session := retainedSession(t, s, ctx, options)
-	file := retainedFile(t, session, "file", true)
-	if _, err := file.WriteAt(t.Context(), 0, content(512)); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Remove(t.Context(), "file"); err != nil {
-		t.Fatal(err)
-	}
-	mustUse(t, s, 512)
-	cancel()
-	deadline := time.After(3 * time.Second)
-	ticker := time.NewTicker(5 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		space, err := s.Space(t.Context())
-		if err != nil {
+	synctest.Test(t, func(t *testing.T) {
+		s := newStorage(t, limited.MinLimit)
+		ctx, cancel := context.WithCancel(t.Context())
+		options := storage.DefaultFileSessionOptions()
+		options.Lease = 80 * time.Millisecond
+		session := retainedSession(t, s, ctx, options)
+		file := retainedFile(t, session, "file", true)
+		if _, err := file.WriteAt(t.Context(), 0, content(512)); err != nil {
 			t.Fatal(err)
 		}
-		if space.Used == 0 {
-			break
+		if err := s.Remove(t.Context(), "file"); err != nil {
+			t.Fatal(err)
 		}
-		select {
-		case <-deadline:
-			t.Fatalf("expired detached file retained %d charged bytes", space.Used)
-		case <-ticker.C:
+		mustUse(t, s, 512)
+		cancel()
+		synctest.Wait()
+		mustUse(t, s, 512)
+		deadline := time.After(3 * time.Second)
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			space, err := s.Space(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if space.Used == 0 {
+				break
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("expired detached file retained %d charged bytes", space.Used)
+			case <-ticker.C:
+			}
 		}
-	}
-	if _, err := file.Stat(t.Context()); !errors.Is(err, syscall.ESTALE) {
-		t.Fatalf("expired file returned %v, want ESTALE", err)
-	}
+		if _, err := file.Stat(t.Context()); !errors.Is(err, syscall.ESTALE) {
+			t.Fatalf("expired file returned %v, want ESTALE", err)
+		}
+	})
 }
 
 func TestRetainedQuotaFailedCleanupKeepsCharge(t *testing.T) {
