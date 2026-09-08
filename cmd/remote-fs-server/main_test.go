@@ -6,7 +6,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"math"
@@ -26,7 +25,6 @@ import (
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/limited"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/localdisk"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/memory"
@@ -35,21 +33,25 @@ import (
 
 func testLockConfig(t *testing.T) lockConfig {
 	t.Helper()
-	return lockConfig{options: locking.DefaultOptions(), stateRoot: emptyPrivateDirectory(t), initialize: true}
+	return lockConfig{options: locking.DefaultOptions(), initialize: true}
 }
 
-func newTestDirectory(t *testing.T, root string) (storage.Storage, error) {
+func newTestNamespace(t *testing.T) (*objectstore.Storage, *sqlite.LockingStore) {
 	t.Helper()
-	namespace, err := openDirectory(root, 0, limited.DefaultMeasurementLimits(), testLockConfig(t))
+	meta, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
+		Database: filepath.Join(t.TempDir(), "metastore.db"), Namespace: "workspace",
+		SQLite: sqlite.DefaultOptions(), Locks: locking.DefaultOptions(), Initialize: true,
+	})
 	if err != nil {
-		return nil, err
+		t.Fatal(err)
 	}
+	namespace := objectstore.New(memory.New(), meta)
 	t.Cleanup(func() {
-		if err := namespace.close(); err != nil {
-			t.Errorf("close directory namespace: %v", err)
+		if err := namespace.Close(); err != nil {
+			t.Errorf("close namespace: %v", err)
 		}
 	})
-	return namespace.namespace, nil
+	return namespace, meta
 }
 
 func TestStorageClosesAfterServingAndItsFailureIsReturned(t *testing.T) {
@@ -72,171 +74,6 @@ func TestStorageClosesAfterServingAndItsFailureIsReturned(t *testing.T) {
 	}
 	if len(events) != 2 || events[0] != "serve" || events[1] != "close" {
 		t.Fatalf("lifecycle order is %v", events)
-	}
-}
-
-func TestDirectoryRecountReportsItsMeasurementBounds(t *testing.T) {
-	ns, err := openDirectory(t.TempDir(), 1<<20, limited.MeasurementLimits{
-		MaxDirectoryBytes: 3 << 20,
-		MaxFrontierBytes:  5 << 20,
-	}, testLockConfig(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ns.close() })
-	var output bytes.Buffer
-	recount(t.Context(), ns, &output)
-	for _, phrase := range []string{
-		"directory listings were limited to 3145728 bytes",
-		"traversal frontier to 5242880 bytes",
-	} {
-		if !strings.Contains(output.String(), phrase) {
-			t.Fatalf("recount output does not contain %q: %s", phrase, output.String())
-		}
-	}
-}
-
-func TestDirectoryMeasurementOverflowFailsBeforeReadiness(t *testing.T) {
-	for _, test := range []struct {
-		name  string
-		setup func(*testing.T, string)
-		flag  string
-		value string
-	}{
-		{
-			name: "directory listing",
-			setup: func(t *testing.T, root string) {
-				if err := os.WriteFile(filepath.Join(root, "entry"), nil, 0o600); err != nil {
-					t.Fatal(err)
-				}
-			},
-			flag:  "-quota-max-directory-bytes",
-			value: "1",
-		},
-		{
-			name: "traversal frontier",
-			setup: func(t *testing.T, root string) {
-				for _, name := range []string{"a", "b"} {
-					if err := os.Mkdir(filepath.Join(root, name), 0o700); err != nil {
-						t.Fatal(err)
-					}
-				}
-			},
-			flag:  "-quota-max-frontier-bytes",
-			value: "64",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			root := t.TempDir()
-			test.setup(t, root)
-			var output bytes.Buffer
-			err := run([]string{
-				"-listen", "127.0.0.1:0",
-				"-dir", root,
-				"-lock-state-root", emptyPrivateDirectory(t),
-				"-initialize-lock-state",
-				"-quota", "8M",
-				test.flag, test.value,
-			}, &output)
-			if !errors.Is(err, syscall.EIO) {
-				t.Fatalf("measurement overflow returned %v, want EIO", err)
-			}
-			if strings.Contains(output.String(), "remote-fs-server: serving") {
-				t.Fatalf("measurement overflow announced readiness: %s", output.String())
-			}
-		})
-	}
-}
-
-func TestFailedSIGHUPMeasurementKeepsTheCountAndServerUsable(t *testing.T) {
-	root := t.TempDir()
-	ns, err := openDirectory(root, 1<<20, limited.MeasurementLimits{
-		MaxDirectoryBytes: 256,
-		MaxFrontierBytes:  limited.DefaultMaxFrontierBytes,
-	}, testLockConfig(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ns.close() })
-	if err := ns.namespace.Write(t.Context(), "held", []byte("1234567")); err != nil {
-		t.Fatal(err)
-	}
-	for i := range 10 {
-		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("outside-%02d", i)), nil, 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	handler, err := httprest.NewHandlerWithOptions(ns.namespace, nil, httprest.DefaultHandlerOptions())
-	if err != nil {
-		t.Fatal(err)
-	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := newServer(handler)
-	t.Cleanup(func() {
-		_ = server.Close()
-		_ = listener.Close()
-	})
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = reader.Close()
-		_ = writer.Close()
-	})
-	lines := make(chan string, 8)
-	go func() {
-		scanner := bufio.NewScanner(reader)
-		for scanner.Scan() {
-			lines <- scanner.Text()
-		}
-	}()
-	served := make(chan error, 1)
-	go func() { served <- serve(server, listener, ns, writer) }()
-	remote, err := httprest.Dial("http://"+listener.Addr().String(), &http.Client{Timeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := remote.Stat(t.Context(), ""); err != nil {
-		t.Fatalf("prove server readiness: %v", err)
-	}
-	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
-		t.Fatal(err)
-	}
-	line := waitForLine(t, lines, "recounting the namespace failed", time.Second)
-	if !strings.Contains(line, "count from before it stands") {
-		t.Fatalf("failed recount did not preserve its prior count: %s", line)
-	}
-	space, err := ns.held.Space(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if space.Used != 7 {
-		t.Fatalf("failed recount replaced the count with %d, want 7", space.Used)
-	}
-	if err := remote.Write(t.Context(), "after", []byte("ok")); err != nil {
-		t.Fatalf("server was unusable after failed recount: %v", err)
-	}
-	space, err = ns.held.Space(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if space.Used != 9 {
-		t.Fatalf("write after failed recount left %d bytes used, want 9", space.Used)
-	}
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-served:
-		if err != nil {
-			t.Fatalf("stop after failed recount: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("server did not stop after failed recount")
 	}
 }
 
@@ -552,10 +389,7 @@ func waitForNewConnections(t *testing.T, tracker *connectionTracker, want int, t
 
 func unreplicatedHandler(t *testing.T) *httprest.Handler {
 	t.Helper()
-	backing, err := newTestDirectory(t, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing, _ := newTestNamespace(t)
 	handler, err := httprest.NewHandler(backing, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1123,10 +957,7 @@ func TestExpectedCloseDoesNotHideAJoinedFailure(t *testing.T) {
 }
 
 func TestTerminationReturnsAFatalServeErrorThatWasAlreadyBuffered(t *testing.T) {
-	backing, err := newTestDirectory(t, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing, _ := newTestNamespace(t)
 	handler, err := httprest.NewHandler(backing, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1261,10 +1092,7 @@ func (w *blockingWrite) unblock() {
 }
 
 func TestStartingShutdownCancelsAConnectionAcceptedBeforeStartAcknowledgement(t *testing.T) {
-	backing, err := newTestDirectory(t, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing, _ := newTestNamespace(t)
 	canceling := &cancelingStatStorage{
 		boundedStorageAdapter: boundedStorageAdapter{Storage: backing},
 		entered:               make(chan struct{}),
@@ -1324,10 +1152,7 @@ func TestStartingShutdownCancelsAConnectionAcceptedBeforeStartAcknowledgement(t 
 }
 
 func TestClosedStartSignalUsesGracefulShutdownBeforeTheSelectConsumesIt(t *testing.T) {
-	backing, err := newTestDirectory(t, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing, _ := newTestNamespace(t)
 	controlled := &releaseOrCancelStatStorage{
 		boundedStorageAdapter: boundedStorageAdapter{Storage: backing},
 		entered:               make(chan struct{}),
@@ -1638,10 +1463,7 @@ func TestUncooperativeStatusWaitsOnlyAfterHTTPShutdown(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			backing, err := newTestDirectory(t, t.TempDir())
-			if err != nil {
-				t.Fatal(err)
-			}
+			backing, _ := newTestNamespace(t)
 			handler, err := httprest.NewHandlerWithOptions(backing, nil, httprest.DefaultHandlerOptions())
 			if err != nil {
 				t.Fatal(err)
@@ -1726,10 +1548,7 @@ func TestUncooperativeStatusWaitsOnlyAfterHTTPShutdown(t *testing.T) {
 }
 
 func TestFatalServeErrorCancelsStatusBeforeDrainingHandlers(t *testing.T) {
-	backing, err := newTestDirectory(t, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing, _ := newTestNamespace(t)
 	dependency := &sync.Mutex{}
 	storage := &statusGateStorage{
 		boundedStorageAdapter: boundedStorageAdapter{Storage: backing},
@@ -1821,245 +1640,6 @@ func (s *statusGateStorage) Stat(ctx context.Context, path string) (storage.Attr
 	return s.Storage.Stat(ctx, path)
 }
 
-func TestDirectoryRecountWaitingForAnActiveRequestLetsForcedShutdownReleaseIt(t *testing.T) {
-	backing, err := newTestDirectory(t, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	controlled := &cancelingStatStorage{
-		boundedStorageAdapter: boundedStorageAdapter{Storage: backing},
-		entered:               make(chan struct{}),
-		canceled:              make(chan struct{}),
-	}
-	held, err := limited.New(t.Context(), controlled, 1<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	handler, err := httprest.NewHandlerWithOptions(held, nil, httprest.DefaultHandlerOptions())
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := newServer(handler)
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = server.Close()
-		_ = listener.Close()
-	})
-	served := make(chan error, 1)
-	go func() {
-		served <- serveWithGrace(server, listener, opened{
-			namespace: held,
-			held:      held,
-			what:      "recount waiting behind an active request",
-			close:     func() error { return nil },
-		}, io.Discard, 25*time.Millisecond)
-	}()
-	remote, err := httprest.Dial("http://"+listener.Addr().String(), &http.Client{Timeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	requestDone := make(chan error, 1)
-	go func() {
-		_, err := remote.Stat(context.Background(), "")
-		requestDone <- err
-	}()
-	select {
-	case <-controlled.entered:
-	case <-time.After(time.Second):
-		t.Fatal("request did not acquire the quota gate")
-	}
-	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
-		t.Fatal(err)
-	}
-
-	// RWMutex gives a waiting writer priority over later readers. A blocked Space probe
-	// establishes that Recount is queued behind the request's read lock.
-	var spaceDone <-chan error
-	deadline := time.Now().Add(time.Second)
-	for spaceDone == nil {
-		probe := make(chan error, 1)
-		started := make(chan struct{})
-		go func() {
-			close(started)
-			_, err := held.Space(context.Background())
-			probe <- err
-		}()
-		<-started
-		runtime.Gosched()
-		select {
-		case err := <-probe:
-			if err != nil {
-				t.Fatalf("probing the quota gate: %v", err)
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("SIGHUP did not begin waiting for the quota gate")
-			}
-		case <-time.After(10 * time.Millisecond):
-			spaceDone = probe
-		}
-	}
-
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-controlled.canceled:
-	case <-time.After(time.Second):
-		t.Fatal("forced HTTP shutdown did not cancel the request holding the quota gate")
-	}
-	select {
-	case err := <-served:
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("forced shutdown returned %v, want its expired grace deadline", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("termination waited for Recount before releasing the active request")
-	}
-	if err := <-spaceDone; err != nil {
-		t.Fatalf("quota gate probe failed after shutdown: %v", err)
-	}
-	select {
-	case <-requestDone:
-	case <-time.After(time.Second):
-		t.Fatal("canceled request did not return")
-	}
-}
-
-func TestBlockedDirectoryRecountDoesNotDelayHTTPShutdown(t *testing.T) {
-	fixture := startBlockedRecountServer(t)
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	fixture.wait(t, nil)
-}
-
-func TestFatalServeErrorCancelsARecountBeforeDrainingHandlers(t *testing.T) {
-	fixture := startBlockedRecountServer(t)
-	failure := errors.New("listener accept failed")
-	fixture.listener.Fail(failure)
-	fixture.wait(t, failure)
-}
-
-type blockedRecountServer struct {
-	blocked     *blockingRecountStorage
-	listener    *failureListener
-	address     string
-	served      <-chan error
-	requestDone <-chan error
-}
-
-func startBlockedRecountServer(t *testing.T) blockedRecountServer {
-	t.Helper()
-	root := t.TempDir()
-	for _, directory := range []string{"a", "b"} {
-		if err := os.Mkdir(filepath.Join(root, directory), 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	backing, err := newTestDirectory(t, root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	blocked := &blockingRecountStorage{
-		boundedStorageAdapter: boundedStorageAdapter{Storage: backing},
-		armed:                 make(chan struct{}),
-		entered:               make(chan struct{}),
-		canceled:              make(chan struct{}),
-		release:               make(chan struct{}),
-	}
-	t.Cleanup(blocked.unblock)
-	held, err := limited.New(t.Context(), blocked, 1<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	close(blocked.armed)
-	handler, err := httprest.NewHandlerWithOptions(held, nil, httprest.DefaultHandlerOptions())
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := newServer(handler)
-	baseListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	listener := &failureListener{Listener: baseListener}
-	address := listener.Addr().String()
-	t.Cleanup(func() {
-		_ = server.Close()
-		_ = listener.Close()
-	})
-	served := make(chan error, 1)
-	go func() {
-		served <- serveWithGrace(server, listener, opened{
-			namespace: held,
-			held:      held,
-			what:      "blocked recount fixture",
-			close:     func() error { return nil },
-		}, io.Discard, 100*time.Millisecond)
-	}()
-	remote, err := httprest.Dial("http://"+address, &http.Client{Timeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := remote.Stat(t.Context(), ""); err != nil {
-		t.Fatalf("prove server readiness: %v", err)
-	}
-	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-blocked.entered:
-	case <-time.After(time.Second):
-		t.Fatal("SIGHUP did not enter the directory recount")
-	}
-	requestDone := make(chan error, 1)
-	go func() {
-		_, err := remote.Stat(context.Background(), "")
-		requestDone <- err
-	}()
-	waitForActiveHandlers(t, server.drain, 1, time.Second)
-	return blockedRecountServer{
-		blocked:     blocked,
-		listener:    listener,
-		address:     address,
-		served:      served,
-		requestDone: requestDone,
-	}
-}
-
-func (f blockedRecountServer) wait(t *testing.T, want error) {
-	t.Helper()
-	select {
-	case <-f.blocked.canceled:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("server began draining handlers before canceling the directory recount")
-	}
-	waitForListenerRefusal(t, f.address, 500*time.Millisecond)
-	f.blocked.unblock()
-	select {
-	case err := <-f.served:
-		if want == nil && err != nil {
-			t.Fatalf("termination with a blocked recount and request failed: %v", err)
-		}
-		if want != nil && !errors.Is(err, want) {
-			t.Fatalf("server returned %v, want %v", err, want)
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("server continued walking after the current directory listing returned")
-	}
-	if paths := f.blocked.paths(); len(paths) != 1 || paths[0] != "" {
-		t.Fatalf("canceled recount listed %v, want only the in-flight root listing", paths)
-	}
-	select {
-	case <-f.requestDone:
-	case <-time.After(time.Second):
-		t.Fatal("request behind the recount gate did not finish")
-	}
-}
-
 type failureListener struct {
 	net.Listener
 	mu      sync.Mutex
@@ -2122,63 +1702,9 @@ func waitForListenerRefusal(t *testing.T, address string, timeout time.Duration)
 			}
 			_ = connection.Close()
 		case <-deadline.C:
-			t.Fatalf("listener %s still admitted connections while recount was blocked", address)
+			t.Fatalf("listener %s still admitted connections while status was blocked", address)
 		}
 	}
-}
-
-type blockingRecountStorage struct {
-	boundedStorageAdapter
-	armed      chan struct{}
-	entered    chan struct{}
-	canceled   chan struct{}
-	release    chan struct{}
-	once       sync.Once
-	cancelOnce sync.Once
-
-	mu     sync.Mutex
-	listed []string
-}
-
-func (s *blockingRecountStorage) ListBounded(
-	ctx context.Context,
-	path string,
-	result *storage.ListResult,
-) error {
-	select {
-	case <-s.armed:
-		if err := s.boundedStorageAdapter.ListBounded(context.Background(), path, result); err != nil {
-			return err
-		}
-		s.mu.Lock()
-		s.listed = append(s.listed, path)
-		s.mu.Unlock()
-		s.once.Do(func() { close(s.entered) })
-		s.cancelOnce.Do(func() {
-			go func() {
-				<-ctx.Done()
-				close(s.canceled)
-			}()
-		})
-		<-s.release
-		return nil
-	default:
-		return s.boundedStorageAdapter.ListBounded(ctx, path, result)
-	}
-}
-
-func (s *blockingRecountStorage) unblock() {
-	select {
-	case <-s.release:
-	default:
-		close(s.release)
-	}
-}
-
-func (s *blockingRecountStorage) paths() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]string(nil), s.listed...)
 }
 
 func waitForLine(t *testing.T, lines <-chan string, contains string, timeout time.Duration) string {
@@ -2307,10 +1833,6 @@ func (s boundedStorageAdapter) LockService() locking.Service {
 	return s.Storage.(interface{ LockService() locking.Service }).LockService()
 }
 
-func (s boundedStorageAdapter) CheckPublicationAccounting() error {
-	return s.Storage.(interface{ CheckPublicationAccounting() error }).CheckPublicationAccounting()
-}
-
 func (s boundedStorageAdapter) CheckBounded() error {
 	return s.Storage.(storage.BoundedStorage).CheckBounded()
 }
@@ -2399,19 +1921,7 @@ func TestStoppingWithAReplicaAttachedIsPromptAndClean(t *testing.T) {
 
 func replicableNamespace(t *testing.T) (*httprest.Handler, opened) {
 	t.Helper()
-	meta, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
-		Database: filepath.Join(t.TempDir(), "metastore.db"), Namespace: "workspace",
-		SQLite: sqlite.DefaultOptions(), Locks: locking.DefaultOptions(), Initialize: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	namespace := objectstore.New(memory.New(), meta)
-	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
-			t.Errorf("close namespace: %v", err)
-		}
-	})
+	namespace, meta := newTestNamespace(t)
 	handler, err := httprest.NewHandler(namespace, meta)
 	if err != nil {
 		t.Fatal(err)

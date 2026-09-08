@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http/httptest"
-	"os"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -14,7 +13,7 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 	"github.com/codetreker/remote-fs/packages/storage/locked"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
@@ -148,22 +147,7 @@ func (s *namedInterruptionSpace) Space(context.Context) (storage.Space, error) {
 }
 
 func TestQuotaQueryHonorsWireInterruptionAndImmediatelyMeasuresAgain(t *testing.T) {
-	config := localdir.Config{Root: t.TempDir(), StateRoot: t.TempDir(), Locks: locking.DefaultOptions(), Limits: localdir.DefaultLimits()}
-	if err := os.Chmod(config.StateRoot, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := localdir.Init(t.Context(), config); err != nil {
-		t.Fatal(err)
-	}
-	local, err := localdir.Open(t.Context(), config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := local.Close(); err != nil {
-			t.Error(err)
-		}
-	})
+	_, local := memoryfixture.New(t, "quota-wire", 0, locking.DefaultOptions())
 	backend := &namedInterruptionSpace{Backend: local}
 	handler, err := httprest.NewHandler(backend, nil)
 	if err != nil {

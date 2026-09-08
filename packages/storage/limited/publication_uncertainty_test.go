@@ -132,7 +132,7 @@ func TestUnmanagedWrapperRetainsUncertainBackingFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	uncertain := settle(storage.PublicationNotApplied)
-	p := &faulty{BoundedStorage: openDir(t, t.TempDir()), write: uncertain}
+	p := &faulty{BoundedStorage: newBacking(t), write: uncertain}
 	s := newStorageOver(t, p, limited.MinLimit)
 	if err := s.Write(t.Context(), "a", content(1024)); err != uncertain {
 		t.Fatalf("unmanaged wrapper changed the uncertain backing error: %v", err)

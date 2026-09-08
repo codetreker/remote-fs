@@ -16,7 +16,7 @@ ino:    2 -> 2       size: 24 -> 3
 
 这是 R-CON-3 的字面违反——「其它客户端读到的要么是旧内容、要么是新内容，不存在两者的混合」。而原子保存是编辑器、编译器、包管理器、git 全都在用的模式，不是边角情形。
 
-**不是复制引入的。** 关掉复制（`-dir` 后端根本不建副本）逐字节复现相同，所以它在 `packages/fuse`，与 [元数据复制](../architecture/2026-08-27-metadata-replication.md) 无关：
+**不是复制引入的。** 当时关掉复制（`-dir` 后端不建副本）逐字节复现相同，所以它在 `packages/fuse`，与 [元数据复制](../architecture/2026-08-27-metadata-replication.md) 无关。下表保留当时两个后端的观测；`-dir` 已由[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)取消：
 
 ```
 dir   replica=no    -> b'VER'   ino (2,2)  size (24,3)
@@ -51,11 +51,11 @@ blob  replica=yes   -> b'VER'   ino (2,2)  size (24,3)
 
 **身份走 `storage.Attr`，但不当 inode 号用。** 这一点是这份 note 里最容易搞反的地方，最初也确实搞反过。
 
-直觉方案是「直接拿命名空间的 id 当 inode 号」，把 `identity.go` 整套发号逻辑删掉。它输在 `localdir`：那个后端能给的身份是宿主的 `st_ino`，而**宿主会在节点消失后立刻把号收回去重发**。inode 号一旦交给内核就永远不能再指向第二个节点，`st_ino` 给不了这个保证。
+当时的直觉方案是「直接拿命名空间的 id 当 inode 号」，把 `identity.go` 整套发号逻辑删掉。它输在 `localdir`：那个后端能给的身份是宿主的 `st_ino`，而**宿主会在节点消失后立刻把号收回去重发**。inode 号一旦交给内核就永远不能再指向第二个节点，`st_ino` 给不了这个保证。删除该后端不改变 namespace identity 与挂载 inode 分别负责什么。
 
 所以是分层的：**号仍然由挂载点自己发，单调递增、永不复用；命名空间的身份只用来判断「这个名字后面还是不是原来那个节点」。** 弱保证的后端因此也能接进来，而内核看到的那个强保证由挂载点独立提供。
 
-身份本身**早就存在，只是被扔在边界上**——`metastore.Node.Attr()` 用四个字段构造 `storage.Attr`，把 `n.ID` 丢了；该决定落地时，SQLite 的 no-reuse 依据是 `nodes.id` 的 `AUTOINCREMENT`。`localdir` 那边 `attrOf` 本来就在解 `Stat_t`（为了 `Atim`），`Ino` 就在旁边。两处各一行。SQLite 对 sequence 损坏与回退的持久证明由[显式身份高水位](./2026-09-07-persistent-sqlite-identities-use-explicit-high-water-marks.md)补足，不改变这里的 storage/FUSE 身份分层。
+身份本身**早就存在，只是被扔在边界上**——当时 `metastore.Node.Attr()` 用四个字段构造 `storage.Attr`，把 `n.ID` 丢了；该决定落地时，SQLite 的 no-reuse 依据是 `nodes.id` 的 `AUTOINCREMENT`。当时 `localdir` 的 `attrOf` 也已在解 `Stat_t`（为了 `Atim`），`Ino` 就在旁边，两处各一行。SQLite 对 sequence 损坏与回退的持久证明由[显式身份高水位](./2026-09-07-persistent-sqlite-identities-use-explicit-high-water-marks.md)补足，不改变这里的 storage/FUSE 身份分层。
 
 **`Getattr` 在 dirty 或路径身份变化时从 handle 报大小。** `handle` 持有打开时的内容；干净 handle 只有在 `opened` 非零且当前路径的身份与之不同时，才用缓冲区长度覆盖命名空间的大小。这保护了跨身份替换的描述符，但普通覆写保留身份时仍会把旧内容配上新长度，缺口由[缓冲内容与长度绑定](../../proposed/bug-fix/2026-09-07-bind-buffered-reads-to-their-size.md)处理。干净 handle 的时间戳仍来自命名空间。
 
@@ -79,9 +79,9 @@ blob  replica=yes   -> b'VER'   ino (2,2)  size (24,3)
 
 **目录改名后子树在另一侧全部重编号这一条没有被修掉，实测前后逐字节相同。** 而且这个改动结构上就修不了它：记录是按名字索引的，新名字下本来就没有记录，`child` 只能新发一个号；身份比对只能让**已有的**记录失效，永远不可能在一个新名字下找到什么。它仍然开着。
 
-**代价一：`Write` 在 `localdir` 上会换掉节点身份。** 于是在 localdir 挂载点上写一个文件，它的 inode 号会变——这跟本地文件系统的行为不一样。契约不要求，因此这是后端间的一处可见差异，记在这里而不是假装没有。
+**当时的代价一：`Write` 在 `localdir` 上会换掉节点身份。** 在该后端的挂载点上写一个文件，inode 号会变；这是当时契约接受的后端差异。该后端已经移除，现有对象存储通过更换内容引用保留节点身份。
 
-**代价二：删掉再立刻同名创建，在 `localdir` 上仍可能沿用旧 inode。** 宿主回收 `st_ino`，比对因此漏判。这是这一版明确没有覆盖的一格。
+**当时的代价二：删掉再立刻同名创建，在 `localdir` 上仍可能沿用旧 inode。** 宿主回收 `st_ino`，比对因此漏判。这一后端缺口随实现移除；它不能成为第三方复用身份的许可，R-INT-11 仍要求不同对象不得被呈现为同一个对象。
 
 **代价三：干净 handle 的时间戳仍来自命名空间。** 一个跨越身份变化持有的描述符，会报出「它将要交付的内容的长度」配上「替换它的那个文件的时间」。同身份覆写时的长度缺口由[缓冲内容与长度绑定](../../proposed/bug-fix/2026-09-07-bind-buffered-reads-to-their-size.md)处理，时间戳与内容仍可能属于不同版本。
 

@@ -14,7 +14,7 @@ Status: implemented
 
 具有 `CheckPublicationAccounting` 的原生 backend 在最终发布处提供实际新旧大小与效果。Applied 按实际效果结算，即使后续确认返回错误也保留已经发生的缩短；NotApplied 退回增长预留，缩短不释放。namespace 效果不明，或结算、撤销被标记为 `IsPublicationAccountingUncertain` 时保留保守账本，并使 Space、修改与 Recount 失败，直到重新打开。已知文件没有改变也不能证明不确定的计费仍可使用，主错误与清理原因一并保留。
 
-原生集成与[文件锁](../architecture/2026-09-07-file-locks.md)共用最终转换：上传和暂存不能提前释放额度，过期 proof 在最后权限判定处被拒绝，原字节与收费保持一致。没有原生能力的有界 backend 仍按底层成功结算缩短；它的祖先目录改名采样问题由[独立提案](../../proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)拥有。本决定补足[容量上限](../architecture/2026-08-21-space-limit.md)的缩短结算，不把该通用路径解释成具有原生目标协调。
+原生集成与[文件锁](../architecture/2026-09-07-file-locks.md)共用最终转换：上传和暂存不能提前释放额度，过期 proof 在最后权限判定处被拒绝，原字节与收费保持一致。随附的 local-store 与 Azure Blob 组合都由 SQLite 提供最终发布计费；[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)保留这项集成与通用 `limited` 包装。没有原生能力的有界 backend 仍按底层成功结算缩短；它的祖先目录改名采样问题由[独立提案](../../proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)拥有。本决定补足[容量上限](../architecture/2026-08-21-space-limit.md)的缩短结算，不把该通用路径解释成具有原生目标协调。
 
 ## 备选方案
 
@@ -26,11 +26,11 @@ Status: implemented
 
 ## 验证
 
-[结算回归](../../../../packages/storage/limited/write_settlement_test.go)保留原来的 4096 字节交错：缩短暂停时 Used 仍为 4096、Avail 为零，竞争的 4096 字节写入返回 `EDQUOT`；缩短失败后原内容与实测、报告用量均为 4096。成功路径随后只释放一次。取消、等长写入、失败增长的预留退回，以及超额 workspace 缩短均由 package 用例覆盖。
+[结算回归](../../../../packages/storage/limited/write_settlement_test.go)在真实 SQLite 命名空间与内存对象存储之上保留原来的 4096 字节交错：缩短暂停时 Used 仍为 4096、Avail 为零，竞争的 4096 字节写入返回 `EDQUOT`；缩短失败后原内容与实测、报告用量均为 4096。成功路径随后只释放一次。取消、等长写入、失败增长的预留退回，以及超额 workspace 缩短均由 package 用例覆盖。
 
-[真实目录与配额组合](../../../../packages/storage/localdir/lease_quota_test.go)将 4096 字节文件暂存缩短为 6 字节，暂停期间竞争增长被拒绝。租约到期后恢复上传得到 `StaleGrant`，原内容、Used 与 Recount 仍为 4096；随后一次有效缩短释放 4090 字节，恰好容纳相应增长，再多一字节仍为 `EDQUOT`。
+[过期暂存缩短回归](../../../../packages/storage/limited/lease_quota_test.go)使用 `sqlite.OpenLocking` 和可暂停 Put 的内存对象存储，将 4096 字节文件暂存缩短为 6 字节。SQLite 不设置内层额度，全部收费由外层 `limited` 负责；暂停期间一字节的竞争增长也被拒绝。租约到期后恢复上传得到 `StaleGrant`，原内容、Used 与 Recount 仍为 4096；随后一次有效缩短释放 4090 字节，恰好容纳相应增长，再多一字节仍为 `EDQUOT`。
 
-两组用例随 localdir 与 limited 的严格 race 检查通过。原生计费另外覆盖 Applied 后确认错误、NotApplied、未知效果、嵌套预留撤销与全部修改路径的结算失败，验证真实内容、保守计数、原错误及后续不可用状态，测试入口见[测试策略](../../../../docs/testing.md#最终发布与观察次序)。
+两组用例属于 `limited` package 的普通与 race 测试。原生计费另外覆盖 Applied 后确认错误、NotApplied、未知效果、嵌套预留撤销与全部修改路径的结算失败，验证真实内容、保守计数、原错误及后续不可用状态，测试入口见[测试策略](../../../../docs/testing.md#最终发布与观察次序)。
 
 ## 后果
 

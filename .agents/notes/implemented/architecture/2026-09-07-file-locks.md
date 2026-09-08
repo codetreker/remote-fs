@@ -14,7 +14,7 @@ Status: implemented
 
 ### 机制与策略分开
 
-`packages/locking` 持有有限授权、Session / Owner、生存期、动作历史与发布排序；`packages/storage/locked` 将它与支持原生发布检查的 namespace 配对。HTTP v3 发布显式控制操作与 mutation scope；三个随附 backend 都在实际修改处执行保护。完整接口与状态流见[文件锁设计](../../../../docs/design/server/file-locks.md)。
+`packages/locking` 持有有限授权、Session / Owner、生存期、动作历史与发布排序；`packages/storage/locked` 将它与支持原生发布检查的 namespace 配对。HTTP v3 发布显式控制操作与 mutation scope；保留的 localstore 与 Azure 两种形态都在实际修改处执行保护。完整接口与状态流见[文件锁设计](../../../../docs/design/server/file-locks.md)。
 
 现有普通文件可以取得 `S` 或 `X`。多个 S 相容；X 排斥其他持有者的授权与修改。S 持有者自己也不能只凭 S 修改。显式 `SetAttr` 的 mode、atime 与 mtime 受同一修改检查；普通读取的平台 atime 副作用不是稳定 atime 的承诺。匿名修改只在不冲突于已授予保护时允许，普通读取不因 X 而变成受锁访问控制的操作。
 
@@ -30,7 +30,7 @@ Session、Owner 与 Grant 是不可伪造且绑定父级的能力引用，不能
 
 原生回调只执行一次最终转换，保留已知效果与资源退休结果。namespace 效果不明，或配额结算、撤销不明时，隔离当前授权方与 namespace；即使文件明确未变，也不能继续用不确定的账本放行。普通准备失败且成功撤销不承担这项隔离，原始故障与清理原因保持可见。
 
-SQLite 使用 namespace 节点身份。普通目录维护有界的逻辑资源映射与底层固定引用，使原子内容替换保留本系统的文件资源，目的地替换或删除使旧资源退休。有效资源引用、等待、grant 与发布保留所需原生引用，终态历史可只保留退休 ID；资源引用、grant generation、续期 revision、内容版本与 change-log position 保持独立。Resolve 的引用有限期，Acquire 重新确认实际目标存在且受支持。
+SQLite 使用 namespace 节点身份。有效资源引用、等待、grant 与发布保留所需原生引用，终态历史可只保留退休 ID；资源引用、grant generation、续期 revision、内容版本与 change-log position 保持独立。Resolve 的引用有限期，Acquire 重新确认实际目标存在且受支持。宿主目录实现曾以有界逻辑映射与固定文件对象应对 inode 复用及原子替换；该实现由[移除决定](../simplification/2026-09-08-remove-the-host-directory-backend.md)退出交付，稳定身份的通用义务仍保留。
 
 ### 有界回放不依赖逐条永久保存
 
@@ -42,6 +42,8 @@ SQLite 使用 namespace 节点身份。普通目录维护有界的逻辑资源�
 
 HTTP Acquire 在立即决定或登记 Pending 后返回，等待意图有有限期限但不占着 HTTP 控制名额。控制操作有独立准入，调用方明确 Query、Cancel 或 Renew；SDK 不自动轮询或续期。当前剩余期限先求差再向下取整，并从请求发送起点计算本地提示，回放旧响应不能产生新的保护间隔。
 
+队列移除同时清空 backing slice 的多余引用；否则已结束的动作仍能固定 Owner 与历史，使逻辑容量不再代表保留量。授权方被隔离后不再让资源 worker 进入或重入，维护仍按尚存 Pending 的 Wait 到期清理；停止执行不会虚构授予或拒绝，也不会把有限等待留成无限状态。
+
 精确结果回放只属于仍有效的原授权方与活跃 Owner / Session。旧授权方被隔离后，旧意图明确返回退役或结果未知，不报告未曾授予，也不重新执行。该结果不取消已经确认的剩余保护。
 
 ### 最大时长证据换取重启保护
@@ -52,7 +54,7 @@ HTTP Acquire 在立即决定或登记 Pending 后返回，等待意图有有限�
 
 这避免逐条持久保存 grant 与动作结果，代价是即使实际剩余授权很少，恢复也要等待记录中的完整最大时长。保护区间跨重启保留，精确管理历史不跨授权方恢复，两项承诺分别成立。
 
-普通目录使用 namespace 外、当前同一 mount 上显式配置的私有 StateRoot，根 xattr 绑定 workspace、状态身份与所配置路径，根目录 lifetime flock 隔离另一授权方。Initialize 建立并持久记录绑定，Open 验证它；缺失或错配不能变成重新初始化，暂存也不出现在可见 namespace 中。不具备所需文件系统能力时明确拒绝。SQLite-backed 形态使用已有 namespace 数据库与独立 Witness 的持久确认路径保存同一证据。
+宿主目录形态曾使用 namespace 外、同一 mount 上的私有 StateRoot，以根 xattr 绑定 workspace、状态身份与路径，并以根目录 lifetime flock 隔离另一授权方；Initialize / Open 分开防止缺失证据被当作新存储，暂存不进入可见 namespace。该专属状态机制随宿主目录后端移除。保留的 SQLite-backed 形态使用数据库与独立 Witness 的持久确认路径，不具备所需文件系统能力或证据不完整时仍明确拒绝。
 
 本地持久组合沿用单 workspace 私有根的所有权与 `.leases.intent` / `.leases.witness`。外部 `sqlite.OpenLocking` 拥有整份数据库的 native flock，数据库 inode 与相邻固定名字的证据绑定数据库身份，最大 lease 时长覆盖整份数据库。运行时选择的 namespace 不成为永久绑定：后续进程可选择另一个已有 namespace，仍须等待数据库级完整恢复间隔。这保留已有多 namespace 数据，并让独立证据与唯一发布者共用生命周期；代价是同一数据库只允许一个活跃锁服务拥有者，移动证据路径需要显式迁移。已绑定的库不能通过 raw API 或关闭 Locks 配置绕过保护。
 
@@ -90,6 +92,6 @@ raw SQLite opener 持有数据库共享 flock，启用锁的拥有者取得排�
 
 文件保护对带 scope 与匿名修改都成立。S 的稳定性、X 的修改权限、迟到上传的拒绝、重试是否已经执行，以及授权方重启后能否继续信任原结果，都有分别可测试的答案。
 
-代价落在原生发布集成、有限历史的容量拒绝、普通目录的持久绑定要求与恢复屏障期间的修改不可用。较长的 lease 会增加后续恢复等待，历史容量耗尽要求持有者结束该作用域，而不是靠逐条淘汰继续接收动作。
+代价落在原生发布集成、有限历史的容量拒绝、数据库持久证据与恢复屏障期间的修改不可用。较长的 lease 会增加后续恢复等待，历史容量耗尽要求持有者结束该作用域，而不是靠逐条淘汰继续接收动作。
 
 未使用连续保护的旧内容写入、隐式 Open 策略、目录级锁、已有读缓存缺陷与失败写入的本地保留仍是各自的独立工作。锁服务的成功不能被当成这些保证已经成立的证据。

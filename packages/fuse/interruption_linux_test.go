@@ -26,7 +26,8 @@ import (
 	"github.com/codetreker/remote-fs/packages/fuse"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
+	"github.com/codetreker/remote-fs/packages/storage/locked"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
@@ -68,27 +69,14 @@ func TestSignalInterruptsARequestWithoutBreakingTheMount(t *testing.T) {
 	requireFUSE(t)
 	for _, mode := range []string{"raw", "go"} {
 		t.Run(mode, func(t *testing.T) {
-			backing := t.TempDir()
-			if err := os.WriteFile(filepath.Join(backing, "file"), []byte("still readable"), 0o644); err != nil {
+			_, backing := memoryfixture.New(t, "signal", 0, locking.DefaultOptions())
+			if err := backing.Create(t.Context(), "file"); err != nil {
 				t.Fatal(err)
 			}
-			config := localdir.Config{Root: backing, StateRoot: t.TempDir(), Locks: locking.DefaultOptions(), Limits: localdir.DefaultLimits()}
-			if err := os.Chmod(config.StateRoot, 0o700); err != nil {
+			if err := backing.Write(t.Context(), "file", []byte("still readable")); err != nil {
 				t.Fatal(err)
 			}
-			if err := localdir.Init(t.Context(), config); err != nil {
-				t.Fatal(err)
-			}
-			local, err := localdir.Open(t.Context(), config)
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() {
-				if err := local.Close(); err != nil {
-					t.Error(err)
-				}
-			})
-			handler, err := httprest.NewHandler(local, nil)
+			handler, err := httprest.NewHandler(struct{ locked.Backend }{backing}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -14,7 +14,7 @@ import (
 
 // The tests here are about the copy of the namespace's metadata each mountpoint keeps: what
 // it costs to walk a tree that has been copied, what a directory rename costs, and what a
-// namespace that keeps no change log gets instead.
+// namespace without a published change log requires.
 //
 // They are at this level rather than beside the copy because what they assert is what a
 // program on the machine sees: a real mountpoint, real system calls, and the kernel's own
@@ -138,19 +138,10 @@ func TestADirectoryRenameKeepsTheIdentitiesBeneathIt(t *testing.T) {
 	}
 }
 
-// TestANamespaceThatKeepsNoLogIsMountedWithoutACopy.
-//
-// A namespace held in a local directory has no metastore and therefore no ordered record of
-// what changed in it, so there is nothing to feed a copy from and the server says so under
-// its own errno. The mount is the one that was delivered before any of this existed: it works
-// in full, and every operation is a request.
-//
-// The distinction being kept here is between ENOSYS and EIO. One says this namespace will
-// never be replicable and the mount should get on with it; the other says the server may
-// answer in a moment. Answering either for the other gives a mount that never comes up, or a
-// mount that quietly stopped being current.
-func TestANamespaceThatKeepsNoLogIsMountedWithoutACopy(t *testing.T) {
-	s := serveDirectory(t)
+// ENOSYS selects direct remote operations when a handler does not publish replication.
+// EIO must remain a failure, since a connection problem cannot establish that policy.
+func TestANamespaceWithoutPublishedLogIsMountedWithoutACopy(t *testing.T) {
+	s := serveUnreplicatedNamespace(t)
 	a := mountpointOn(t, s)
 
 	if err := os.WriteFile(filepath.Join(a, "a.txt"), []byte("hello\n"), 0o644); err != nil {
@@ -171,13 +162,11 @@ func TestANamespaceThatKeepsNoLogIsMountedWithoutACopy(t *testing.T) {
 	}
 	arrived := s.calls.since(before)
 	if !strings.HasPrefix(arrived, "stat×") {
-		t.Fatalf("a stat on a namespace that keeps no log sent %q to the server, and with no copy behind it it has nowhere else to come from", arrived)
+		t.Fatalf("a stat without published replication sent %q to the server, and with no copy behind it it has nowhere else to come from", arrived)
 	}
 	t.Logf("one stat through the mountpoint: %s", arrived)
-	// And the bytes are in the directory the server was given, read with nothing of this
-	// system in the way.
-	if got, err := os.ReadFile(filepath.Join(s.backing, "a.txt")); err != nil || string(got) != "hello\n" {
-		t.Fatalf("the backing directory holds %q, %v", got, err)
+	if got, err := s.authoritative.Read(t.Context(), "a.txt"); err != nil || string(got) != "hello\n" {
+		t.Fatalf("the authoritative namespace holds %q, %v", got, err)
 	}
 }
 
@@ -305,10 +294,8 @@ func TestADescriptorKeepsReadingTheFileItOpened(t *testing.T) {
 // answers out of a handle reaches an ordinary stat(2) as well, from a descriptor that has
 // nothing to do with the caller.
 //
-// This is on a namespace with a metastore rather than a directory, and that is the point: a
-// directory backend stages and renames on every write, so the node changes, the mount mints
-// a new number, and a stale handle is stranded on an inode nothing looks up. Everything in
-// packages/fuse mounts a directory, which is why nothing there sees this.
+// Content replacement preserves the SQLite node identity. Path metadata must therefore
+// update even when a descriptor keeps the previously opened content for that same inode.
 func TestAStatOfAPathIsNotAnsweredFromSomebodyElsesDescriptor(t *testing.T) {
 	s := serveNamespace(t)
 	a := mountpointOn(t, s)

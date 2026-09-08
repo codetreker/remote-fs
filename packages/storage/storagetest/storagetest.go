@@ -1,11 +1,6 @@
-// Package storagetest holds the contract that every storage.Storage implementation must
-// satisfy. It is the executable form of the obligations written in the storage package's
-// documentation: an implementation is correct exactly when it passes Run.
-//
-// The point of keeping the suite here, rather than beside any one implementation, is
-// that the local-directory storage and the network-backed one run the identical cases.
-// Two implementations passing the same suite is the only evidence that the interface is
-// an abstraction rather than a description of whichever one was written first.
+// Package storagetest exercises the shared storage.Storage contract against direct
+// backends and network clients. Run applies the same behavioral assertions to each
+// implementation without depending on its persistence or transport mechanism.
 package storagetest
 
 import (

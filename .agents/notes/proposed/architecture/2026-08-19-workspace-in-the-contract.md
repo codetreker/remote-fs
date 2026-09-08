@@ -32,13 +32,13 @@ workspace 必须长期存在、能冷挂载，而且存在的数量可以远大�
 
 一个客户端只订阅它所挂载的那个 workspace，因此不会收到别人的事件，也不会因为别人的流量被挤出自己的窗口。
 
-文件锁的状态也不能跨实例混用。普通目录用树外私有 StateRoot、根 xattr 绑定及 lifetime flock 证明状态归属与独占写入所有权；SQLite-backed 模式使用数据库与独立 Witness。外部 SQLite 的证据与唯一活跃拥有者覆盖整份数据库，后续启动选择另一个已有 namespace 仍须执行数据库级恢复等待；localstore 保持单 workspace 根绑定。这些持久最大时长证据与恢复屏障不构成多个 workspace 的管理注册表，也不改变日志位置的含义。
+文件锁的状态也不能跨实例混用。SQLite-backed 模式使用数据库与独立 Witness；外部 SQLite 的证据与唯一活跃拥有者覆盖整份数据库，后续启动选择另一个已有 namespace 仍须执行数据库级恢复等待；localstore 保持单 workspace 根绑定。[移除宿主目录后端](../../implemented/simplification/2026-09-08-remove-the-host-directory-backend.md)取消了单独的 StateRoot 配置。这些持久最大时长证据与恢复屏障不构成多个 workspace 的管理注册表，也不改变日志位置的含义。
 
 ### workspace 的创建与销毁不由本系统负责
 
 本提案选择「按名字挂载一份已存在的命名空间」。创建、列举、销毁 workspace 的管理策略由部署方在自己的控制面完成，因为它们与计费、归属、保留策略绑在一起。随附 backend 的显式初始化与打开负责建立、验证一份存储，不代替这个管理控制面。
 
-配额只有取值这一半留在那里：**报出配额与执行配额是本系统的事**，见[workspace 的容量上限](../../implemented/architecture/2026-08-21-space-limit.md)。一份命名空间可以落在一个连配额概念都没有的普通目录上，那时除了本系统没有第二个地方能数它、能拒绝它。
+配额只有取值这一半留在那里：**报出配额与执行配额是本系统的事**，见[workspace 的容量上限](../../implemented/architecture/2026-08-21-space-limit.md)。workspace 的逻辑用量不等于 Blob container 或底层磁盘的剩余容量；持有命名空间的 storage 负责计量并拒绝越限修改。
 
 R-WS-1（workspace 长期存在于服务端，与是否挂载无关）在这个提案中的边界是：挂载与卸载不销毁 workspace，命名空间的存续由部署方掌握。它不限制命名空间内的文件删除操作。
 

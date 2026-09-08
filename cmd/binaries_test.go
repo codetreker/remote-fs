@@ -27,23 +27,14 @@ const startup = 30 * time.Second
 func TestTheBinariesServeAndMount(t *testing.T) {
 	requireFUSE(t)
 
-	backing := t.TempDir()
-	srv := startDirectoryServerBinary(t, backing)
+	root := privateDirectory(t)
+	srv := startLocalStoreServerBinary(t, root, "8M")
 	mountpoint := t.TempDir()
 	mnt := startMountBinary(t, "-server", srv.url, "-mountpoint", mountpoint)
 
 	shell(t, fmt.Sprintf("echo hello > %s/a.txt", mountpoint))
 	if got := shell(t, fmt.Sprintf("cat %s/a.txt", mountpoint)); got != "hello\n" {
 		t.Fatalf("cat gave %q, want %q", got, "hello\n")
-	}
-
-	// The same bytes, from the directory the server was given rather than through it.
-	onDisk, err := os.ReadFile(filepath.Join(backing, "a.txt"))
-	if err != nil {
-		t.Fatalf("the served directory has no a.txt: %v", err)
-	}
-	if string(onDisk) != "hello\n" {
-		t.Fatalf("the served directory holds %q, want %q", onDisk, "hello\n")
 	}
 
 	// Ctrl-C, and the mountpoint has to be gone afterwards. A stale mount left behind is
@@ -63,6 +54,8 @@ func TestTheBinariesServeAndMount(t *testing.T) {
 	if err := srv.wait(t); err != nil {
 		t.Fatalf("remote-fs-server exited with %v after SIGINT\n%s", err, srv.output())
 	}
+	reopened := startServerBinary(t, localStoreServerArgs(root, "8M")...)
+	assertBinaryLockRead(t, dialLockServer(t, reopened), "a.txt", "hello\n")
 }
 
 // TestTheBinariesRefuseWhatTheyCannotDo. Every one of these is a mistake somebody will
@@ -70,7 +63,7 @@ func TestTheBinariesServeAndMount(t *testing.T) {
 // and not answer with a stack trace.
 func TestTheBinariesRefuseWhatTheyCannotDo(t *testing.T) {
 	occupied, free := oneAddressInUseAndOneFree(t)
-	backing := t.TempDir()
+	root := privateDirectory(t)
 	notADirectory := filepath.Join(t.TempDir(), "a-file")
 	if err := os.WriteFile(notADirectory, nil, 0o644); err != nil {
 		t.Fatal(err)
@@ -78,7 +71,7 @@ func TestTheBinariesRefuseWhatTheyCannotDo(t *testing.T) {
 
 	// A server the mount binary can reach, so that the mountpoint failure below is
 	// reported for the mountpoint rather than for the server.
-	reachable := startDirectoryServerBinary(t, backing)
+	reachable := startLocalStoreServerBinary(t, root, "8M")
 
 	for _, c := range []struct {
 		name    string
@@ -86,19 +79,17 @@ func TestTheBinariesRefuseWhatTheyCannotDo(t *testing.T) {
 		args    []string
 		expects string
 	}{
-		{"a directory that is not there", serverBinary(t),
-			[]string{"-listen", free, "-dir", filepath.Join(backing, "absent"), "-lock-state-root", privateDirectory(t), "-initialize-lock-state"}, "no such file or directory"},
-		{"a directory that is a file", serverBinary(t),
-			[]string{"-listen", free, "-dir", notADirectory, "-lock-state-root", privateDirectory(t), "-initialize-lock-state"}, "not a directory"},
+		{"a local store that is not there", serverBinary(t),
+			[]string{"-listen", free, "-local-store", filepath.Join(t.TempDir(), "absent"), "-workspace", "workspace", "-quota", "8M", "-initialize-lock-state"}, "no such file or directory"},
+		{"a local store that is a file", serverBinary(t),
+			[]string{"-listen", free, "-local-store", notADirectory, "-workspace", "workspace", "-quota", "8M", "-initialize-lock-state"}, "not a directory"},
 		{"an address already in use", serverBinary(t),
-			[]string{"-listen", occupied, "-dir", t.TempDir(), "-lock-state-root", privateDirectory(t), "-initialize-lock-state"}, "address already in use"},
-		{"a directory without lock state configured", serverBinary(t),
-			[]string{"-listen", free, "-dir", backing}, "-lock-state-root is required"},
+			[]string{"-listen", occupied, "-local-store", privateDirectory(t), "-workspace", "workspace", "-quota", "8M", "-initialize-lock-state"}, "address already in use"},
 		{"no namespace at all", serverBinary(t),
 			[]string{"-listen", free}, "a namespace is required"},
 		{"several namespaces at once", serverBinary(t),
-			[]string{"-listen", free, "-dir", backing, "-blob-container", "somewhere"},
-			"name different namespaces"},
+			[]string{"-listen", free, "-local-store", root, "-blob-container", "somewhere"},
+			"give exactly one of"},
 		{"a blob container with nowhere to keep its tree", serverBinary(t),
 			[]string{"-listen", free, "-blob-container", "somewhere", "-workspace", "w"},
 			"-metastore is required"},
@@ -106,18 +97,20 @@ func TestTheBinariesRefuseWhatTheyCannotDo(t *testing.T) {
 			[]string{"-listen", free, "-blob-container", "somewhere", "-metastore", notADirectory},
 			"-workspace is required"},
 		{"a flag nobody defined", serverBinary(t),
-			[]string{"-listen", free, "-dir", backing, "-nonsense"}, "not defined"},
+			[]string{"-listen", free, "-local-store", root, "-nonsense"}, "not defined"},
 		{"an allowance that is not a size", serverBinary(t),
-			[]string{"-listen", free, "-dir", backing, "-lock-state-root", privateDirectory(t), "-quota", "banana"}, "is not a size"},
+			[]string{"-listen", free, "-local-store", root, "-workspace", "workspace", "-quota", "banana"}, "is not a size"},
 		{"an allowance spelled as a power of 1000", serverBinary(t),
-			[]string{"-listen", free, "-dir", backing, "-lock-state-root", privateDirectory(t), "-quota", "5MB"}, "power of 1000"},
+			[]string{"-listen", free, "-local-store", root, "-workspace", "workspace", "-quota", "5MB"}, "power of 1000"},
 		{"an allowance below the smallest there is", serverBinary(t),
-			[]string{"-listen", free, "-dir", backing, "-lock-state-root", privateDirectory(t), "-quota", "1K"}, "smallest allowance"},
+			[]string{"-listen", free, "-local-store", root, "-workspace", "workspace", "-quota", "1K"}, "smallest allowance"},
+		{"a local store without an allowance", serverBinary(t),
+			[]string{"-listen", free, "-local-store", root, "-workspace", "workspace"}, "-quota is required"},
 
 		{"a mountpoint that is not a directory", mountBinary(t),
 			[]string{"-server", reachable.url, "-mountpoint", notADirectory}, "not a directory"},
 		{"a mountpoint that is not there", mountBinary(t),
-			[]string{"-server", reachable.url, "-mountpoint", filepath.Join(backing, "absent")}, "no such file or directory"},
+			[]string{"-server", reachable.url, "-mountpoint", filepath.Join(t.TempDir(), "absent")}, "no such file or directory"},
 		{"a server that cannot be reached", mountBinary(t),
 			[]string{"-server", "http://" + free, "-mountpoint", t.TempDir()}, "cannot be reached"},
 		{"a server URL that is not a URL", mountBinary(t),

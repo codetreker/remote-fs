@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/locking"
@@ -52,39 +51,12 @@ func formatLockStatus(status locking.Status) string {
 		state, status.Sessions, status.Owners, status.Resources, status.Actions, status.Grants, status.Queued)
 }
 
-func writeLockStatus(ctx context.Context, ns opened, output io.Writer) {
-	if ns.lockStatus == nil {
-		return
-	}
-	status, err := ns.lockStatus(ctx)
-	if err != nil {
-		fmt.Fprintf(output, "remote-fs-server: file-lock status for %s failed: %v\n", ns.what, err)
-		return
-	}
-	fmt.Fprintf(output, "remote-fs-server: %s: %s\n", ns.what, formatLockStatus(status))
-}
-
 func startStatus(ns opened, timeout time.Duration, results chan<- statusReport) (context.CancelFunc, chan struct{}) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		results <- readStatus(ctx, ns)
-	}()
-	return cancel, done
-}
-
-// startRecount keeps the namespace walk out of the signal loop. A terminating server can
-// close HTTP admission before it cancels and waits for an uncooperative filesystem call.
-func startRecount(ns opened, results chan<- string) (context.CancelFunc, chan struct{}) {
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		var output strings.Builder
-		recount(ctx, ns, &output)
-		writeLockStatus(ctx, ns, &output)
-		results <- output.String()
 	}()
 	return cancel, done
 }

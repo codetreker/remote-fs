@@ -10,7 +10,7 @@ Status: proposed
 
 ## 提案
 
-[文件锁的原生发布集成](../../implemented/architecture/2026-09-07-file-locks.md)已提供 `CheckPublicationAccounting`：普通目录在实际发布处报告新旧大小，limited 的 Write、Remove 与 Rename 因而不再先按路径采样。该路径把收费与实际目标绑定，同时让暂存保持在最终转换之外。
+[文件锁的原生发布集成](../../implemented/architecture/2026-09-07-file-locks.md)已提供可选的 `CheckPublicationAccounting` 能力：SQLite 在实际发布处报告新旧大小，对象存储组合向外保留该能力，limited 的 Write、Remove 与 Rename 因而不再先按路径采样。该路径把收费与实际目标绑定，同时让暂存保持在最终转换之外。随附 local-store 与 Azure Blob 使用这条路径；[移除宿主目录后端](../../implemented/simplification/2026-09-08-remove-the-host-directory-backend.md)不改变通用包装的剩余缺口。
 
 本提案继续覆盖没有原生计费能力的有界第三方 backend。它们仍使用路径采样与直接路径的 stripe，祖先改名仍可使计量依据失效。修复须保证采样、收费与实际修改针对同一个对象，并覆盖改变路径解析结果的父目录改名；不能把可执行的普通 storage 包装误称为已经具备原生发布能力。
 
@@ -28,4 +28,4 @@ Status: proposed
 
 ## 风险
 
-延后的是通用包装路径的配额计量保证，目录改名仍可使该账本永久少算并允许后续继续超额。这类 backend 不能同时发布非空锁授权方，避免用不完整计费支撑受保护的修改。协调过粗会扩大无关操作互相阻塞的范围，锁顺序不一致会死锁。此项约束配额层的计量对象，不决定[已打开文件的写入身份钉住](../architecture/2026-08-20-nothing-pins-an-open-file.md)方案。
+延后的是通用包装路径的配额计量保证，目录改名仍可使该账本永久少算并允许后续继续超额。`limited` 拒绝包装具有非空锁授权方却没有原生发布计费的 backend，避免用不完整计费支撑受保护的修改。协调过粗会扩大无关操作互相阻塞的范围，锁顺序不一致会死锁。此项约束配额层的计量对象，不决定[已打开文件的写入身份钉住](../architecture/2026-08-20-nothing-pins-an-open-file.md)方案。

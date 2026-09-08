@@ -1,49 +1,25 @@
 package httprest_test
 
 import (
-	"os"
 	"testing"
 
 	"github.com/codetreker/remote-fs/packages/locking"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 )
 
-func pairedDirectory(t *testing.T, root string) (*localdir.Storage, error) {
+func namespaceFixture(t *testing.T) *objectstore.Storage {
 	t.Helper()
-	return pairedDirectoryWithLocks(t, root, locking.DefaultOptions())
+	return namespaceFixtureWithLocks(t, locking.DefaultOptions())
 }
 
-func pairedDirectoryWithLocks(t *testing.T, root string, options locking.Options) (*localdir.Storage, error) {
+func namespaceFixtureWithLocks(t *testing.T, options locking.Options) *objectstore.Storage {
 	t.Helper()
-	config := localdir.Config{
-		Root:      root,
-		StateRoot: t.TempDir(),
-		Locks:     options,
-		Limits:    localdir.DefaultLimits(),
-	}
-	if err := os.Chmod(config.StateRoot, 0o700); err != nil {
-		return nil, err
-	}
-	if err := localdir.Init(t.Context(), config); err != nil {
-		return nil, err
-	}
-	backend, err := localdir.Open(t.Context(), config)
-	if err != nil {
-		return nil, err
-	}
-	t.Cleanup(func() {
-		if err := backend.Close(); err != nil {
-			t.Errorf("close directory: %v", err)
-		}
-	})
-	return backend, nil
+	_, backend := memoryfixture.New(t, "transport", 1<<30, options)
+	return backend
 }
 
 func failingStorage(t *testing.T, err error) failing {
 	t.Helper()
-	backend, openErr := pairedDirectory(t, t.TempDir())
-	if openErr != nil {
-		t.Fatal(openErr)
-	}
-	return failing{Backend: backend, err: err}
+	return failing{Backend: namespaceFixture(t), err: err}
 }

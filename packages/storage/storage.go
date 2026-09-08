@@ -1,11 +1,9 @@
 // Package storage defines the contract for one namespace: a tree of directories and
 // files that the rest of the system reads and writes through a single interface.
 //
-// Two implementations exist and they sit on opposite sides of the network. The server
-// side holds real data; the client side turns every call into one request. Everything
-// above this interface — in particular the FUSE mount — works against either without
-// knowing which one it has, which is what lets the mount be exercised against a plain
-// local directory with no server in sight.
+// Direct backends, network clients, and metadata replicas implement this contract.
+// Mounts and SDK callers use the same operations regardless of where the authoritative
+// namespace is held.
 package storage
 
 import (
@@ -39,10 +37,9 @@ import (
 // Errnos enumerates the closed vocabulary, and ErrnoOf maps values outside it to EIO.
 //
 // Times cross this interface as time.Time and are neither rounded nor clamped on the way.
-// What a namespace can keep is its own: one held in a directory keeps what that directory's
-// filesystem keeps, with the range and the precision a plain file there has, so Stat
-// reports the instant that was stored rather than the instant that was asked for. That is
-// a fact about the node, not a report about the call.
+// Each backend determines the range and precision it can store. Stat reports the instant
+// actually stored rather than the instant requested; this describes the node's state,
+// not whether the earlier call succeeded.
 //
 // Every operation acts on the node that is at the name it was given, never on a node the
 // one at that name refers to. A symbolic link is described as a link, by Stat and by List

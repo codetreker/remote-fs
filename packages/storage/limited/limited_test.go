@@ -7,16 +7,16 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"unsafe"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/limited"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 	"github.com/codetreker/remote-fs/packages/storage/storagetest"
 )
 
@@ -32,7 +32,7 @@ func TestContract(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			storagetest.Run(t, func(t *testing.T) storage.Storage {
-				backing := openDir(t, t.TempDir())
+				backing := newBacking(t)
 				if !native {
 					backing = &faulty{BoundedStorage: backing}
 				}
@@ -44,12 +44,12 @@ func TestContract(t *testing.T) {
 
 func TestBoundedContract(t *testing.T) {
 	storagetest.RunBounded(t, func(t *testing.T) storage.BoundedStorage {
-		return newStorage(t, t.TempDir(), 1<<30)
+		return newStorage(t, 1<<30)
 	})
 }
 
 func TestWriteChargesWhatTheFileGains(t *testing.T) {
-	s := newStorage(t, t.TempDir(), 1<<20)
+	s := newStorage(t, 1<<20)
 
 	mustWrite(t, s, "f", 100)
 	mustUse(t, s, 100)
@@ -65,7 +65,7 @@ func TestWriteChargesWhatTheFileGains(t *testing.T) {
 }
 
 func TestRemoveCreditsWhatTheFileHeld(t *testing.T) {
-	s := newStorage(t, t.TempDir(), 1<<20)
+	s := newStorage(t, 1<<20)
 
 	mustWrite(t, s, "f", 100)
 	mustWrite(t, s, "g", 40)
@@ -80,7 +80,7 @@ func TestRemoveCreditsWhatTheFileHeld(t *testing.T) {
 // A move charges nothing for the bytes it carries — they are charged already and stay
 // charged wherever they land — and credits back only what it destroys on arrival.
 func TestRenameCreditsOnlyWhatItReplaces(t *testing.T) {
-	s := newStorage(t, t.TempDir(), 1<<20)
+	s := newStorage(t, 1<<20)
 
 	mustWrite(t, s, "a", 100)
 	mustWrite(t, s, "b", 40)
@@ -103,7 +103,7 @@ func TestRenameCreditsOnlyWhatItReplaces(t *testing.T) {
 // times as anyone cares to repeat the move, and every spelling of the name is a way to ask
 // for it.
 func TestRenameOntoItselfCreditsNothing(t *testing.T) {
-	s := newStorage(t, t.TempDir(), 1<<20)
+	s := newStorage(t, 1<<20)
 
 	mustWrite(t, s, "f", 100)
 	mustWrite(t, s, "g", 40)
@@ -127,7 +127,7 @@ func TestRenameOntoItselfCreditsNothing(t *testing.T) {
 // Create makes an empty file, which costs nothing; the bytes arrive later through Write.
 // A directory and an attribute change hold no bytes either.
 func TestTheOperationsThatCarryNoBytesChargeNothing(t *testing.T) {
-	s := newStorage(t, t.TempDir(), 1<<20)
+	s := newStorage(t, 1<<20)
 
 	if err := s.Create(t.Context(), "f"); err != nil {
 		t.Fatal(err)
@@ -146,7 +146,7 @@ func TestTheOperationsThatCarryNoBytesChargeNothing(t *testing.T) {
 }
 
 func TestAWriteBeyondTheAllowanceIsRefusedAndCostsNothing(t *testing.T) {
-	s := newStorage(t, t.TempDir(), 8192)
+	s := newStorage(t, 8192)
 
 	mustWrite(t, s, "f", 8000)
 	mustUse(t, s, 8000)
@@ -165,11 +165,11 @@ func TestAWriteBeyondTheAllowanceIsRefusedAndCostsNothing(t *testing.T) {
 // limit, and the way back under it is to write less. Refusing the write that shrinks a
 // file would close that route off.
 func TestAWriteThatShrinksIsTakenFromOverTheAllowance(t *testing.T) {
-	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "f"), content(10000), 0o600); err != nil {
+	backing := newBacking(t)
+	if err := backing.Write(t.Context(), "f", content(10000)); err != nil {
 		t.Fatal(err)
 	}
-	s := newStorage(t, root, 8192)
+	s := newStorageOver(t, backing, 8192)
 
 	space := spaceOf(t, s)
 	if space.Used != 10000 || space.Avail != 0 {
@@ -183,7 +183,7 @@ func TestAWriteThatShrinksIsTakenFromOverTheAllowance(t *testing.T) {
 // The charge is made before the write and has to come back when the write does not happen.
 // A charge left standing would take the namespace's room away a failure at a time.
 func TestAWriteTheStoreBeneathRefusesGivesTheChargeBack(t *testing.T) {
-	s := newStorageOver(t, &faulty{BoundedStorage: openDir(t, t.TempDir()), write: syscall.EIO}, 8192)
+	s := newStorageOver(t, &faulty{BoundedStorage: newBacking(t), write: syscall.EIO}, 8192)
 
 	if err := s.Write(t.Context(), "f", content(500)); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("the write failed with %v, want the EIO the store beneath gave", err)
@@ -194,12 +194,12 @@ func TestAWriteTheStoreBeneathRefusesGivesTheChargeBack(t *testing.T) {
 // Failed shrinking writes retain the original count even when an out-of-band change
 // has left it below the file's current size.
 func TestFailedShrinkPreservesTheCountAfterOutOfBandGrowth(t *testing.T) {
-	root := t.TempDir()
-	beneath := &faulty{BoundedStorage: openDir(t, root)}
+	backing := newBacking(t)
+	beneath := &faulty{BoundedStorage: backing}
 	s := newStorageOver(t, beneath, 8192)
 
 	mustWrite(t, s, "f", 5)
-	if err := os.WriteFile(filepath.Join(root, "f"), content(15), 0o600); err != nil {
+	if err := backing.Write(t.Context(), "f", content(15)); err != nil {
 		t.Fatal(err)
 	}
 	mustUse(t, s, 5)
@@ -216,7 +216,7 @@ func TestFailedShrinkPreservesTheCountAfterOutOfBandGrowth(t *testing.T) {
 // stat reported rather than charged as if the file were not there: a write that landed
 // uncharged is the one direction the count may not err in.
 func TestAWriteIsRefusedWhenWhatTheFileHoldsCannotBeRead(t *testing.T) {
-	s := newStorageOver(t, &faulty{BoundedStorage: openDir(t, t.TempDir()), stat: syscall.EIO}, 8192)
+	s := newStorageOver(t, &faulty{BoundedStorage: newBacking(t), stat: syscall.EIO}, 8192)
 
 	if err := s.Write(t.Context(), "f", content(500)); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("the write failed with %v, want the EIO the stat gave", err)
@@ -227,7 +227,7 @@ func TestAWriteIsRefusedWhenWhatTheFileHoldsCannotBeRead(t *testing.T) {
 // Bytes are credited back only once they are gone. A removal that failed released nothing,
 // and crediting it would hand out room the namespace still holds.
 func TestARemovalThatFailedCreditsNothing(t *testing.T) {
-	s := newStorageOver(t, &faulty{BoundedStorage: openDir(t, t.TempDir()), remove: syscall.EACCES}, 8192)
+	s := newStorageOver(t, &faulty{BoundedStorage: newBacking(t), remove: syscall.EACCES}, 8192)
 
 	mustWrite(t, s, "f", 500)
 	if err := s.Remove(t.Context(), "f"); !errors.Is(err, syscall.EACCES) {
@@ -240,7 +240,7 @@ func TestARemovalThatFailedCreditsNothing(t *testing.T) {
 // afterwards is that walk moved by what passes through, so an unmeasured start is an
 // invented one.
 func TestNewRefusesANamespaceItCouldNotWalk(t *testing.T) {
-	_, err := limited.New(t.Context(), &faulty{BoundedStorage: openDir(t, t.TempDir()), list: syscall.EIO}, 8192)
+	_, err := limited.New(t.Context(), &faulty{BoundedStorage: newBacking(t), list: syscall.EIO}, 8192)
 	if !errors.Is(err, syscall.EIO) {
 		t.Fatalf("opening the namespace failed with %v, want EIO", err)
 	}
@@ -272,7 +272,7 @@ func TestMeasurementLimitsHaveBoundedDefaultsAndRejectImpossibleValues(t *testin
 }
 
 func TestNewRequiresBoundedListingsBeforeItEnumeratesTheNamespace(t *testing.T) {
-	backing := &unboundedListing{Storage: openDir(t, t.TempDir())}
+	backing := &unboundedListing{Storage: newBacking(t)}
 	_, err := limited.New(t.Context(), backing, 8192)
 	if !errors.Is(err, syscall.ENOSYS) {
 		t.Fatalf("opening over storage without bounded listings failed with %v, want ENOSYS", err)
@@ -283,7 +283,7 @@ func TestNewRequiresBoundedListingsBeforeItEnumeratesTheNamespace(t *testing.T) 
 }
 
 func TestNewChecksBoundedCapabilityBeforeItEnumeratesTheNamespace(t *testing.T) {
-	backing := &boundedProbe{BoundedStorage: openDir(t, t.TempDir()), check: syscall.EIO}
+	backing := &boundedProbe{BoundedStorage: newBacking(t), check: syscall.EIO}
 	_, err := limited.New(t.Context(), backing, 8192)
 	if !errors.Is(err, syscall.EIO) {
 		t.Fatalf("opening over an unusable bounded storage failed with %v, want EIO", err)
@@ -296,7 +296,7 @@ func TestNewChecksBoundedCapabilityBeforeItEnumeratesTheNamespace(t *testing.T) 
 
 func TestMeasurementUsesBoundedListingAndStopsBeforeRetainingAHugeDirectory(t *testing.T) {
 	const entries = 100_000
-	backing := &generatedListing{BoundedStorage: openDir(t, t.TempDir()), entries: entries}
+	backing := &generatedListing{BoundedStorage: newBacking(t), entries: entries}
 	limits := limited.MeasurementLimits{
 		MaxDirectoryBytes: 1024,
 		MaxFrontierBytes:  limited.DefaultMaxFrontierBytes,
@@ -317,8 +317,8 @@ func TestMeasurementUsesBoundedListingAndStopsBeforeRetainingAHugeDirectory(t *t
 }
 
 func TestDirectoryMeasurementBoundIncludesEntryAndNameRetention(t *testing.T) {
-	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "f"), content(7), 0o600); err != nil {
+	backing := newBacking(t)
+	if err := backing.Write(t.Context(), "f", content(7)); err != nil {
 		t.Fatal(err)
 	}
 	entryBytes := int64(unsafe.Sizeof(storage.Entry{})) + 1
@@ -331,7 +331,7 @@ func TestDirectoryMeasurementBoundIncludesEntryAndNameRetention(t *testing.T) {
 		{"one byte below the charge", entryBytes - 1, syscall.EIO},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			s, err := limited.NewWithLimits(t.Context(), openDir(t, root), 8192, limited.MeasurementLimits{
+			s, err := limited.NewWithLimits(t.Context(), backing, 8192, limited.MeasurementLimits{
 				MaxDirectoryBytes: c.bound,
 				MaxFrontierBytes:  limited.DefaultMaxFrontierBytes,
 			})
@@ -350,8 +350,8 @@ func TestDirectoryMeasurementBoundIncludesEntryAndNameRetention(t *testing.T) {
 }
 
 func TestFrontierMeasurementBoundIncludesActiveAndPendingPaths(t *testing.T) {
-	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, "d"), 0o700); err != nil {
+	backing := newBacking(t)
+	if err := backing.Mkdir(t.Context(), "d"); err != nil {
 		t.Fatal(err)
 	}
 	frontierRecordBytes := int64(unsafe.Sizeof(struct {
@@ -368,7 +368,7 @@ func TestFrontierMeasurementBoundIncludesActiveAndPendingPaths(t *testing.T) {
 		{"one byte below the active and pending paths", exact - 1, syscall.EIO},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := limited.NewWithLimits(t.Context(), openDir(t, root), 8192, limited.MeasurementLimits{
+			_, err := limited.NewWithLimits(t.Context(), backing, 8192, limited.MeasurementLimits{
 				MaxDirectoryBytes: limited.DefaultMaxDirectoryBytes,
 				MaxFrontierBytes:  c.bound,
 			})
@@ -385,7 +385,7 @@ func TestFrontierMeasurementBoundIncludesActiveAndPendingPaths(t *testing.T) {
 // A walk that failed replaces nothing. The count that was there is the last measured one,
 // and a figure that could not be measured is not one to put in its place.
 func TestARecountThatCouldNotWalkKeepsTheCountItHad(t *testing.T) {
-	beneath := &faulty{BoundedStorage: openDir(t, t.TempDir())}
+	beneath := &faulty{BoundedStorage: newBacking(t)}
 	s := newStorageOver(t, beneath, 8192)
 	mustWrite(t, s, "f", 500)
 
@@ -397,24 +397,24 @@ func TestARecountThatCouldNotWalkKeepsTheCountItHad(t *testing.T) {
 }
 
 func TestAFrontierThatExceedsItsAggregateBoundInvalidatesTheRecount(t *testing.T) {
-	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "held"), content(7), 0o600); err != nil {
+	backing := newBacking(t)
+	if err := backing.Write(t.Context(), "held", content(7)); err != nil {
 		t.Fatal(err)
 	}
 	limits := limited.MeasurementLimits{
 		MaxDirectoryBytes: 1 << 20,
 		MaxFrontierBytes:  256,
 	}
-	s, err := limited.NewWithLimits(t.Context(), openDir(t, root), 8192, limits)
+	s, err := limited.NewWithLimits(t.Context(), backing, 8192, limits)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := range 100 {
-		if err := os.Mkdir(filepath.Join(root, fmt.Sprintf("directory-%03d", i)), 0o700); err != nil {
+		if err := backing.Mkdir(t.Context(), fmt.Sprintf("directory-%03d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(root, "uncharged"), content(100), 0o600); err != nil {
+	if err := backing.Write(t.Context(), "uncharged", content(100)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -433,7 +433,7 @@ func TestAFrontierThatExceedsItsAggregateBoundInvalidatesTheRecount(t *testing.T
 }
 
 func TestCancelingARecountInvalidatesItAndReleasesTheOperationGate(t *testing.T) {
-	backing := &blockingListing{BoundedStorage: openDir(t, t.TempDir()), entered: make(chan struct{})}
+	backing := &blockingListing{BoundedStorage: newBacking(t), entered: make(chan struct{})}
 	s := newStorageOver(t, backing, 8192)
 	mustWrite(t, s, "held", 7)
 	backing.block = true
@@ -454,33 +454,33 @@ func TestCancelingARecountInvalidatesItAndReleasesTheOperationGate(t *testing.T)
 }
 
 func TestCanceledRecountDoesNotDescendAfterTheCurrentListingReturns(t *testing.T) {
-	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, "child"), 0o700); err != nil {
+	backing := newBacking(t)
+	if err := backing.Mkdir(t.Context(), "child"); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "child", "held"), content(7), 0o600); err != nil {
+	if err := backing.Write(t.Context(), "child/held", content(7)); err != nil {
 		t.Fatal(err)
 	}
-	backing := &delayedReturnListing{
-		BoundedStorage: openDir(t, root),
+	delayed := &delayedReturnListing{
+		BoundedStorage: backing,
 		entered:        make(chan struct{}),
 		release:        make(chan struct{}),
 	}
-	s := newStorageOver(t, backing, 8192)
-	backing.childLists = 0
-	backing.delayRoot = true
+	s := newStorageOver(t, delayed, 8192)
+	delayed.childLists = 0
+	delayed.delayRoot = true
 
 	ctx, cancel := context.WithCancel(t.Context())
 	result := make(chan error, 1)
 	go func() { result <- s.Recount(ctx) }()
-	<-backing.entered
+	<-delayed.entered
 	cancel()
-	close(backing.release)
+	close(delayed.release)
 	if err := <-result; !errors.Is(err, context.Canceled) {
 		t.Fatalf("the canceled recount failed with %v, want context cancellation", err)
 	}
-	if backing.childLists != 0 {
-		t.Fatalf("the canceled recount listed %d child directories after the root listing returned", backing.childLists)
+	if delayed.childLists != 0 {
+		t.Fatalf("the canceled recount listed %d child directories after the root listing returned", delayed.childLists)
 	}
 	mustUse(t, s, 7)
 }
@@ -488,7 +488,7 @@ func TestCanceledRecountDoesNotDescendAfterTheCurrentListingReturns(t *testing.T
 // Below one block the mount would report a filesystem of zero blocks, which reads as a
 // disk with nothing left rather than as a workspace with a little room.
 func TestNewRefusesAnAllowanceBelowOneBlock(t *testing.T) {
-	backing := openDir(t, t.TempDir())
+	backing := newBacking(t)
 	for _, limit := range []int64{math.MinInt64, -1, 0, 1, limited.MinLimit - 1} {
 		if _, err := limited.New(t.Context(), backing, limit); !errors.Is(err, syscall.EINVAL) {
 			t.Errorf("an allowance of %d bytes was refused with %v, want EINVAL", limit, err)
@@ -503,21 +503,17 @@ func TestNewRefusesAnAllowanceBelowOneBlock(t *testing.T) {
 // symbolic link counts for the length of the target it holds; a directory counts for
 // nothing, its size being unspecified.
 func TestNewCountsWhatTheNamespaceAlreadyHolds(t *testing.T) {
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "d", "deeper"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for name, size := range map[string]int{"f": 100, "d/g": 40, "d/deeper/h": 7} {
-		if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(name)), content(size), 0o600); err != nil {
+	backing := newBacking(t)
+	for _, name := range []string{"d", "d/deeper"} {
+		if err := backing.Mkdir(t.Context(), name); err != nil {
 			t.Fatal(err)
 		}
 	}
-	const target = "d/deeper/h"
-	if err := os.Symlink(target, filepath.Join(root, "link")); err != nil {
-		t.Fatal(err)
+	for name, size := range map[string]int{"f": 100, "d/g": 40, "d/deeper/h": 7} {
+		mustWrite(t, backing, name, size)
 	}
-
-	s := newStorage(t, root, 1<<20)
+	const target = "d/deeper/h"
+	s := newStorageOver(t, symlinkListing{BoundedStorage: backing, target: target}, 1<<20)
 	mustUse(t, s, 100+40+7+int64(len(target)))
 }
 
@@ -525,7 +521,7 @@ func TestNewCountsWhatTheNamespaceAlreadyHolds(t *testing.T) {
 // they were summed: a negative size shrinks the count towards room that is not there, and a
 // sum past what a byte count holds wraps into one.
 func TestNewRefusesSizesNoNamespaceCanHold(t *testing.T) {
-	backing := openDir(t, t.TempDir())
+	backing := newBacking(t)
 	for _, c := range []struct {
 		name    string
 		entries []storage.Entry
@@ -561,11 +557,11 @@ func TestNewRefusesSizesNoNamespaceCanHold(t *testing.T) {
 // there. The room that appears free is then written, and the namespace ends up over the
 // allowance it is held under. Only a fresh measurement puts the figure back.
 func TestTheGuardBoundsWhatIsReportedAndNotWhatIsHeld(t *testing.T) {
-	root := t.TempDir()
-	s := newStorage(t, root, 8192)
+	backing := newBacking(t)
+	s := newStorageOver(t, backing, 8192)
 
 	mustWrite(t, s, "f", 500)
-	if err := os.WriteFile(filepath.Join(root, "g"), content(1000), 0o600); err != nil {
+	if err := backing.Write(t.Context(), "g", content(1000)); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Remove(t.Context(), "g"); err != nil {
@@ -590,11 +586,11 @@ func TestTheGuardBoundsWhatIsReportedAndNotWhatIsHeld(t *testing.T) {
 }
 
 func TestRecountReplacesAFigureThatDriftedOutOfBand(t *testing.T) {
-	root := t.TempDir()
-	s := newStorage(t, root, 1<<20)
+	backing := newBacking(t)
+	s := newStorageOver(t, backing, 1<<20)
 
 	mustWrite(t, s, "f", 500)
-	if err := os.WriteFile(filepath.Join(root, "g"), content(700), 0o600); err != nil {
+	if err := backing.Write(t.Context(), "g", content(700)); err != nil {
 		t.Fatal(err)
 	}
 	mustUse(t, s, 500)
@@ -609,7 +605,7 @@ func TestRecountReplacesAFigureThatDriftedOutOfBand(t *testing.T) {
 // to be one step: writers that all checked before any of them charged would all be told
 // there was room for them. Only one of these can be paid for.
 func TestTheLastBytesAreSpentOnce(t *testing.T) {
-	s := newStorage(t, t.TempDir(), limited.MinLimit)
+	s := newStorage(t, limited.MinLimit)
 
 	const writers, size = 8, 3000
 	failures := make([]error, writers)
@@ -658,7 +654,7 @@ func TestSpaceReportsTheTighterOfTheAllowanceAndTheDiskBeneath(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			beneath := storage.Space{Total: 1 << 40, Used: 0, Avail: c.beneath}
-			s := newStorageOver(t, spaceBeneath{BoundedStorage: openDir(t, t.TempDir()), space: beneath}, 8192)
+			s := newStorageOver(t, spaceBeneath{BoundedStorage: newBacking(t), space: beneath}, 8192)
 
 			mustWrite(t, s, "f", 500)
 			space := spaceOf(t, s)
@@ -672,7 +668,7 @@ func TestSpaceReportsTheTighterOfTheAllowanceAndTheDiskBeneath(t *testing.T) {
 // A store with no room of its own to report leaves the allowance as the only measured fact
 // there is, and the allowance is then reported rather than the question being refused.
 func TestSpaceLeansOnTheAllowanceAloneWhenTheStoreBeneathHasNoRoom(t *testing.T) {
-	s := newStorageOver(t, spaceBeneath{BoundedStorage: openDir(t, t.TempDir()), err: syscall.ENOSYS}, 8192)
+	s := newStorageOver(t, spaceBeneath{BoundedStorage: newBacking(t), err: syscall.ENOSYS}, 8192)
 
 	mustWrite(t, s, "f", 500)
 	if space := spaceOf(t, s); space != (storage.Space{Total: 8192, Used: 500, Avail: 7692}) {
@@ -694,7 +690,7 @@ func TestSpaceCarriesOutWhatTheStoreBeneathCouldNotAnswer(t *testing.T) {
 		{"a store that could not measure itself", storage.Space{}, syscall.EACCES, syscall.EACCES},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			s := newStorageOver(t, spaceBeneath{BoundedStorage: openDir(t, t.TempDir()), space: c.beneath, err: c.beneathErr}, 8192)
+			s := newStorageOver(t, spaceBeneath{BoundedStorage: newBacking(t), space: c.beneath, err: c.beneathErr}, 8192)
 			if _, err := s.Space(t.Context()); !errors.Is(err, c.want) {
 				t.Fatalf("space failed with %v, want %v", err, c.want)
 			}
@@ -702,25 +698,15 @@ func TestSpaceCarriesOutWhatTheStoreBeneathCouldNotAnswer(t *testing.T) {
 	}
 }
 
-func openDir(t *testing.T, root string) storage.BoundedStorage {
+func newBacking(t *testing.T) storage.BoundedStorage {
 	t.Helper()
-	backing, err := localdir.New(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if closer, ok := any(backing).(interface{ Close() error }); ok {
-		t.Cleanup(func() {
-			if err := closer.Close(); err != nil {
-				t.Errorf("closing backing directory: %v", err)
-			}
-		})
-	}
+	_, backing := memoryfixture.New(t, "limited", 0, locking.DefaultOptions())
 	return backing
 }
 
-func newStorage(t *testing.T, root string, limit int64) *limited.Storage {
+func newStorage(t *testing.T, limit int64) *limited.Storage {
 	t.Helper()
-	return newStorageOver(t, openDir(t, root), limit)
+	return newStorageOver(t, newBacking(t), limit)
 }
 
 func newStorageOver(t *testing.T, backing storage.Storage, limit int64) *limited.Storage {
@@ -734,7 +720,7 @@ func newStorageOver(t *testing.T, backing storage.Storage, limit int64) *limited
 
 func content(size int) []byte { return bytes.Repeat([]byte{'x'}, size) }
 
-func mustWrite(t *testing.T, s *limited.Storage, name string, size int) {
+func mustWrite(t *testing.T, s storage.Storage, name string, size int) {
 	t.Helper()
 	if err := s.Write(t.Context(), name, content(size)); err != nil {
 		t.Fatalf("writing %d bytes to %q: %v", size, name, err)
@@ -760,10 +746,6 @@ func mustUse(t *testing.T, s *limited.Storage, want int64) {
 		t.Fatalf("the namespace reports %d bytes used, want %d", space.Used, want)
 	}
 }
-
-// The three below each fabricate answers that a namespace held in a directory cannot be
-// made to give on demand. Each embeds a storage.Storage, so everything except the answers
-// under examination is a real namespace's.
 
 // faulty fails the operations it has been given an error for, which is how each of the
 // failures a charge has to survive is put to the storage. The errors are settable after it
@@ -843,6 +825,48 @@ func (l listing) ListBounded(ctx context.Context, name string, result *storage.L
 	}
 	for _, entry := range l.entries {
 		if err := result.Add(entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SQLite supports regular files and directories. This decorator supplies only the
+// symbolic-link metadata needed to measure the bytes occupied by a link target.
+type symlinkListing struct {
+	storage.BoundedStorage
+	target string
+}
+
+func (s symlinkListing) link() storage.Entry {
+	return storage.Entry{Name: "link", Attr: storage.Attr{Mode: os.ModeSymlink, Size: int64(len(s.target))}}
+}
+
+func (s symlinkListing) Stat(ctx context.Context, name string) (storage.Attr, error) {
+	if name == "link" {
+		return s.link().Attr, nil
+	}
+	return s.BoundedStorage.Stat(ctx, name)
+}
+
+func (s symlinkListing) List(ctx context.Context, name string) ([]storage.Entry, error) {
+	entries, err := s.BoundedStorage.List(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if name == "" {
+		entries = append(entries, s.link())
+	}
+	return entries, nil
+}
+
+func (s symlinkListing) ListBounded(ctx context.Context, name string, result *storage.ListResult) error {
+	if err := s.BoundedStorage.ListBounded(ctx, name, result); err != nil {
+		return err
+	}
+	if name == "" {
+		if err := result.Add(s.link()); err != nil {
+			result.Fail(err)
 			return err
 		}
 	}

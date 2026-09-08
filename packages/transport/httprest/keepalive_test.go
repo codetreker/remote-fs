@@ -141,10 +141,7 @@ func TestAStreamThatStopsArrivingIsReportedRatherThanWaitedOnForever(t *testing.
 func serveQuietly(t *testing.T, log metastore.Log, limits httprest.Limits, relay *blackhole, silence time.Duration) *httprest.Storage {
 	t.Helper()
 
-	backing, err := pairedDirectory(t, t.TempDir())
-	if err != nil {
-		t.Fatalf("open the namespace: %v", err)
-	}
+	backing := namespaceFixture(t)
 	var served storage.Storage = backing
 	if fake, ok := log.(*fakeLog); ok {
 		served = recording{Storage: backing, log: fake}

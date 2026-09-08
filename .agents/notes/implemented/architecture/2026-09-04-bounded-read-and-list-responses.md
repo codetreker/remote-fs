@@ -18,7 +18,7 @@ HTTP 的 wire body 上限若只在 `storage.Read` 返回完整 `[]byte`、`stora
 
 object-store namespace 在 metastore 记录的 size 超限时先拒绝，再要求 backing `Objects` 实现 `GetBounded`。localdisk 先验证 envelope、store ID、key 与 declared length，在 payload admission 和 allocation 之前检查预算；Azure 先检查 service-declared length；memory 在 map lock 下检查 retained slice 长度。listing 通过 `metastore.BoundedLister` 按 bytewise name order 枚举；SQLite 先扫描 name length 与 fixed-size attrs，取得 `ListReservation` 后才把 name BLOB 复制进 Go memory，不建立完整 child slice。
 
-localdir、limited、replicated、localstore 与 HTTP client 都传播相同 capability。wrapper 的 `CheckBounded` 必须验证下层；HTTP client 用自己的 wire 上限与调用方预算的较小值取得响应，随后把 decoded entries 逐项加入调用方的 `ListResult`。
+limited、replicated、localstore 与 HTTP client 都传播相同 capability。wrapper 的 `CheckBounded` 必须验证下层；HTTP client 用自己的 wire 上限与调用方预算的较小值取得响应，随后把 decoded entries 逐项加入调用方的 `ListResult`。[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)取消了 localdir 的 capability 实现；有界生产仍是全部可发布后端的共同义务。
 
 server 与 client 各有独立的 response admission，限制 concurrent operations、aggregate retained bytes 和 bounded waiters。server 的 Read/List 在调用 storage 前按 `4 * MaxBodyBytes` 预留，覆盖 storage result、wire conversion 与 encoded body 可能同时存在的保守峰值；其它 fixed-result non-stream operation 按 `MaxBodyBytes` 预留。client 在发出任意 non-stream request 前统一按 `4 * MaxBodyBytes` 预留，使 raw body 与 decoded representation 可以同时留存。context cancellation 会释放等待；饱和且 waiter 已满时以 `EAGAIN` 响亮失败。每个 wire body 本身仍受 `MaxBodyBytes` 限制。
 

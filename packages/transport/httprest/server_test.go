@@ -12,8 +12,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -23,24 +21,20 @@ import (
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/locked"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-// newHandler returns a handler over a fresh temporary directory, and that directory, so
-// that a test can check what actually landed on disk instead of believing the response. A
-// local directory keeps no change log, so this handler serves an unreplicable namespace.
-func newHandler(t *testing.T) (http.Handler, string) {
+// The backing namespace allows assertions independent of the HTTP response. Passing no
+// change log keeps replication unavailable for tests that exercise ordinary requests.
+func newHandler(t *testing.T) (http.Handler, *objectstore.Storage) {
 	t.Helper()
-	dir := t.TempDir()
-	s, err := pairedDirectory(t, dir)
-	if err != nil {
-		t.Fatalf("open the namespace: %v", err)
-	}
+	s := namespaceFixture(t)
 	h, err := httprest.NewHandler(s, nil)
 	if err != nil {
 		t.Fatalf("new handler: %v", err)
 	}
-	return h, dir
+	return h, s
 }
 
 func serve(t *testing.T, h http.Handler, req httprest.Request, body io.Reader) *httptest.ResponseRecorder {
@@ -160,11 +154,7 @@ func TestNewHandlerOptionsHaveBoundedDefaultsAndRejectInvalidBounds(t *testing.T
 }
 
 func TestHandlerRefusesStorageWithoutBoundedResults(t *testing.T) {
-	dir := t.TempDir()
-	bounded, err := pairedDirectory(t, dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	bounded := namespaceFixture(t)
 	unbounded := struct{ storage.Storage }{Storage: bounded}
 	if _, err := httprest.NewHandler(unbounded, nil); err == nil {
 		t.Fatal("NewHandler accepted a storage without bounded read and list capabilities")
@@ -172,10 +162,7 @@ func TestHandlerRefusesStorageWithoutBoundedResults(t *testing.T) {
 }
 
 func TestHandlerRefusesStorageWithoutABoundAuthority(t *testing.T) {
-	backing, err := pairedDirectory(t, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	unpaired := struct{ storage.BoundedStorage }{BoundedStorage: backing}
 	if _, err := httprest.NewHandler(unpaired, nil); err == nil {
 		t.Fatal("NewHandler accepted a storage with no bound file-lock authority")
@@ -254,8 +241,8 @@ func TestEveryResponseIsMarked(t *testing.T) {
 }
 
 func TestSuccessIsAlwaysStatus200(t *testing.T) {
-	h, dir := newHandler(t)
-	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("payload"), 0o644); err != nil {
+	h, backing := newHandler(t)
+	if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 		t.Fatal(err)
 	}
 	for _, req := range []httprest.Request{
@@ -288,11 +275,9 @@ func changeBody(t *testing.T, change storage.AttrChange) io.Reader {
 	return bytes.NewReader(encoded)
 }
 
-// The change reaches the storage whole, which is checked on the directory rather than in
-// the response: the response says only that it happened.
 func TestSetAttrReachesTheStorage(t *testing.T) {
-	h, dir := newHandler(t)
-	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("payload"), 0o644); err != nil {
+	h, backing := newHandler(t)
+	if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 		t.Fatal(err)
 	}
 	mode := fs.FileMode(0o600)
@@ -303,15 +288,15 @@ func TestSetAttrReachesTheStorage(t *testing.T) {
 		t.Fatalf("setattr answered %d, want 200: %s", w.Code, w.Body)
 	}
 
-	info, err := os.Stat(filepath.Join(dir, "f"))
+	info, err := backing.Stat(t.Context(), "f")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode() != mode {
-		t.Fatalf("the file on disk has mode %v, want %v", info.Mode(), mode)
+	if info.Mode != mode {
+		t.Fatalf("the stored file has mode %v, want %v", info.Mode, mode)
 	}
-	if !info.ModTime().Equal(changed) {
-		t.Fatalf("the file on disk is dated %v, want %v", info.ModTime(), changed)
+	if !info.ModTime.Equal(changed) {
+		t.Fatalf("the stored file is dated %v, want %v", info.ModTime, changed)
 	}
 }
 
@@ -328,8 +313,12 @@ func TestAMalformedChangeChangesNothing(t *testing.T) {
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
-			h, dir := newHandler(t)
-			if err := os.WriteFile(filepath.Join(dir, "f"), []byte(existing), 0o600); err != nil {
+			h, backing := newHandler(t)
+			if err := backing.Write(t.Context(), "f", []byte(existing)); err != nil {
+				t.Fatal(err)
+			}
+			mode := fs.FileMode(0o600)
+			if err := backing.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}); err != nil {
 				t.Fatal(err)
 			}
 			w := serve(t, h, httprest.Request{Op: httprest.OpSetAttr, Path: "f"}, body)
@@ -341,20 +330,20 @@ func TestAMalformedChangeChangesNothing(t *testing.T) {
 			if w.Code == httprest.StatusStorageError {
 				t.Fatal("a malformed change was reported as a storage error")
 			}
-			info, err := os.Stat(filepath.Join(dir, "f"))
+			info, err := backing.Stat(t.Context(), "f")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if info.Mode() != 0o600 {
-				t.Fatalf("the file on disk has mode %v, want the untouched %v", info.Mode(), fs.FileMode(0o600))
+			if info.Mode != mode {
+				t.Fatalf("the stored file has mode %v, want the untouched %v", info.Mode, mode)
 			}
 		})
 	}
 }
 
 func TestAStorageErrorCarriesItsErrnoByName(t *testing.T) {
-	h, dir := newHandler(t)
-	if err := os.Mkdir(filepath.Join(dir, "d"), 0o755); err != nil {
+	h, backing := newHandler(t)
+	if err := backing.Mkdir(t.Context(), "d"); err != nil {
 		t.Fatal(err)
 	}
 	cases := []struct {
@@ -526,7 +515,7 @@ func (s *boundedEntrypointProbe) ListBounded(_ context.Context, _ string, result
 }
 
 func TestReadAnswersTheExactBytesWithALength(t *testing.T) {
-	h, dir := newHandler(t)
+	h, backing := newHandler(t)
 	cases := map[string][]byte{
 		"empty":    {},
 		"binary":   {0x00, 0xff, 0xfe, 0x0a, 0x80},
@@ -534,7 +523,7 @@ func TestReadAnswersTheExactBytesWithALength(t *testing.T) {
 		"utf8-not": []byte("\xff\xfe not utf-8"),
 	}
 	for name, content := range cases {
-		if err := os.WriteFile(filepath.Join(dir, name), content, 0o644); err != nil {
+		if err := backing.Write(t.Context(), name, content); err != nil {
 			t.Fatal(err)
 		}
 		w := serve(t, h, httprest.Request{Op: httprest.OpRead, Path: name}, nil)
@@ -553,30 +542,26 @@ func TestReadAnswersTheExactBytesWithALength(t *testing.T) {
 }
 
 func TestWriteStoresTheExactBytes(t *testing.T) {
-	h, dir := newHandler(t)
+	h, backing := newHandler(t)
 	content := []byte("\x00\xff binary\n")
 	w := serve(t, h, httprest.Request{Op: httprest.OpWrite, Path: "f"}, bytes.NewReader(content))
 	if w.Code != http.StatusOK {
 		t.Fatalf("write answered %d: %s", w.Code, w.Body)
 	}
-	got, err := os.ReadFile(filepath.Join(dir, "f"))
+	got, err := backing.Read(t.Context(), "f")
 	if err != nil {
-		t.Fatalf("read back what landed on disk: %v", err)
+		t.Fatalf("read back the stored file: %v", err)
 	}
 	if string(got) != string(content) {
-		t.Fatalf("the file on disk holds %q, want %q", got, content)
+		t.Fatalf("the stored file holds %q, want %q", got, content)
 	}
 }
 
 func TestWriteBodiesAreBoundedBeforeStorage(t *testing.T) {
 	const limit = int64(1024)
-	newBoundedHandler := func(t *testing.T) (*httprest.Handler, string) {
+	newBoundedHandler := func(t *testing.T) (*httprest.Handler, *objectstore.Storage) {
 		t.Helper()
-		dir := t.TempDir()
-		s, err := pairedDirectory(t, dir)
-		if err != nil {
-			t.Fatalf("open the namespace: %v", err)
-		}
+		s := namespaceFixture(t)
 		options := httprest.DefaultHandlerOptions()
 		options.MaxBodyBytes = limit
 		options.MaxWriteBytes = limit
@@ -585,7 +570,7 @@ func TestWriteBodiesAreBoundedBeforeStorage(t *testing.T) {
 		if err != nil {
 			t.Fatalf("new handler: %v", err)
 		}
-		return h, dir
+		return h, s
 	}
 	request := func(t *testing.T, h http.Handler, body io.Reader, declared int64) *httptest.ResponseRecorder {
 		t.Helper()
@@ -603,7 +588,7 @@ func TestWriteBodiesAreBoundedBeforeStorage(t *testing.T) {
 		h.ServeHTTP(w, r)
 		return w
 	}
-	assertTooLarge := func(t *testing.T, w *httptest.ResponseRecorder, dir string) {
+	assertTooLarge := func(t *testing.T, w *httptest.ResponseRecorder, backing *objectstore.Storage) {
 		t.Helper()
 		if w.Code != httprest.StatusStorageError {
 			t.Fatalf("oversized write answered %d, want %d: %s", w.Code, httprest.StatusStorageError, w.Body)
@@ -615,33 +600,33 @@ func TestWriteBodiesAreBoundedBeforeStorage(t *testing.T) {
 		if response.Errno != "EFBIG" {
 			t.Fatalf("oversized write reported %q, want EFBIG", response.Errno)
 		}
-		if _, err := os.Stat(filepath.Join(dir, "f")); !errors.Is(err, os.ErrNotExist) {
+		if _, err := backing.Stat(t.Context(), "f"); !errors.Is(err, syscall.ENOENT) {
 			t.Fatalf("oversized write reached storage: %v", err)
 		}
 	}
 
 	t.Run("the declared length is rejected without reading", func(t *testing.T) {
-		h, dir := newBoundedHandler(t)
-		assertTooLarge(t, request(t, h, panicReader{}, limit+1), dir)
+		h, backing := newBoundedHandler(t)
+		assertTooLarge(t, request(t, h, panicReader{}, limit+1), backing)
 	})
 
 	t.Run("an unknown length is stopped after its first excess byte", func(t *testing.T) {
-		h, dir := newBoundedHandler(t)
+		h, backing := newBoundedHandler(t)
 		body := &repeatingReader{}
-		assertTooLarge(t, request(t, h, body, -1), dir)
+		assertTooLarge(t, request(t, h, body, -1), backing)
 		if body.read != limit+1 {
 			t.Fatalf("the handler read %d bytes, want the limit plus one (%d)", body.read, limit+1)
 		}
 	})
 
 	t.Run("the boundary is accepted", func(t *testing.T) {
-		h, dir := newBoundedHandler(t)
+		h, backing := newBoundedHandler(t)
 		content := bytes.Repeat([]byte("x"), int(limit))
 		w := request(t, h, bytes.NewReader(content), limit)
 		if w.Code != http.StatusOK {
 			t.Fatalf("write at the limit answered %d: %s", w.Code, w.Body)
 		}
-		got, err := os.ReadFile(filepath.Join(dir, "f"))
+		got, err := backing.Read(t.Context(), "f")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -824,12 +809,12 @@ func bodylessRequests() []httprest.Request {
 }
 
 func TestAnOversizedAttributeChangeIsAProtocolFault(t *testing.T) {
-	dir := t.TempDir()
-	s, err := pairedDirectory(t, dir)
-	if err != nil {
+	s := namespaceFixture(t)
+	if err := s.Write(t.Context(), "f", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "f"), nil, 0o600); err != nil {
+	mode := fs.FileMode(0o600)
+	if err := s.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}); err != nil {
 		t.Fatal(err)
 	}
 	options := httprest.DefaultHandlerOptions()
@@ -848,12 +833,12 @@ func TestAnOversizedAttributeChangeIsAProtocolFault(t *testing.T) {
 	if w.Code == httprest.StatusStorageError {
 		t.Fatal("an attribute document refused before decoding was reported as a storage outcome")
 	}
-	info, err := os.Stat(filepath.Join(dir, "f"))
+	info, err := s.Stat(t.Context(), "f")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode() != 0o600 {
-		t.Fatalf("the refused change altered the mode to %v", info.Mode())
+	if info.Mode != mode {
+		t.Fatalf("the refused change altered the mode to %v", info.Mode)
 	}
 }
 
@@ -871,11 +856,7 @@ func TestRequestBodyAdmissionBoundsConcurrentOperationsAndBytes(t *testing.T) {
 	}
 	for name, configure := range cases {
 		t.Run(name, func(t *testing.T) {
-			dir := t.TempDir()
-			inner, err := pairedDirectory(t, dir)
-			if err != nil {
-				t.Fatal(err)
-			}
+			inner := namespaceFixture(t)
 			blocked := &blockingWrite{
 				Storage: inner,
 				entered: make(chan struct{}),
@@ -1027,12 +1008,8 @@ func TestHandlerBoundsNonStreamingResponses(t *testing.T) {
 	}
 
 	t.Run("read", func(t *testing.T) {
-		dir := t.TempDir()
-		s, err := pairedDirectory(t, dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, "large"), bytes.Repeat([]byte("x"), int(limit+1)), 0o600); err != nil {
+		s := namespaceFixture(t)
+		if err := s.Write(t.Context(), "large", bytes.Repeat([]byte("x"), int(limit+1))); err != nil {
 			t.Fatal(err)
 		}
 		w := serve(t, newBounded(t, s), httprest.Request{Op: httprest.OpRead, Path: "large"}, nil)
@@ -1040,14 +1017,10 @@ func TestHandlerBoundsNonStreamingResponses(t *testing.T) {
 	})
 
 	t.Run("listing", func(t *testing.T) {
-		dir := t.TempDir()
-		s, err := pairedDirectory(t, dir)
-		if err != nil {
-			t.Fatal(err)
-		}
+		s := namespaceFixture(t)
 		for i := 0; i < 16; i++ {
 			name := fmt.Sprintf("%02d-%s", i, strings.Repeat("n", 96))
-			if err := os.WriteFile(filepath.Join(dir, name), nil, 0o600); err != nil {
+			if err := s.Write(t.Context(), name, nil); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -1082,8 +1055,8 @@ func TestATruncatedWriteBodyStoresNothing(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			h, dir := newHandler(t)
-			if err := os.WriteFile(filepath.Join(dir, "f"), []byte(existing), 0o644); err != nil {
+			h, backing := newHandler(t)
+			if err := backing.Write(t.Context(), "f", []byte(existing)); err != nil {
 				t.Fatal(err)
 			}
 
@@ -1102,17 +1075,17 @@ func TestATruncatedWriteBodyStoresNothing(t *testing.T) {
 			if w.Code == http.StatusOK {
 				t.Fatalf("a truncated write answered 200")
 			}
-			got, err := os.ReadFile(filepath.Join(dir, "f"))
+			got, err := backing.Read(t.Context(), "f")
 			if err != nil {
-				t.Fatalf("the file is gone: %v", err)
+				t.Fatalf("read the original file: %v", err)
 			}
 			if string(got) != existing {
-				t.Fatalf("the file on disk holds %q, want the untouched %q", got, existing)
+				t.Fatalf("the stored file holds %q, want the untouched %q", got, existing)
 			}
-			if entries, err := os.ReadDir(dir); err != nil {
+			if entries, err := backing.List(t.Context(), ""); err != nil {
 				t.Fatal(err)
-			} else if len(entries) != 1 {
-				t.Fatalf("the directory holds %d entries, want only the original file — staging was left behind", len(entries))
+			} else if len(entries) != 1 || entries[0].Name != "f" {
+				t.Fatalf("the directory holds %v, want only the original file f", entries)
 			}
 		})
 	}
@@ -1264,10 +1237,10 @@ func TestMalformedRequestsGetTheirOwnStatus(t *testing.T) {
 // A listing must carry names exactly as the namespace holds them. A name that comes back
 // altered addresses a file that is not there.
 func TestListingCarriesNamesUnaltered(t *testing.T) {
-	h, dir := newHandler(t)
+	h, backing := newHandler(t)
 	names := []string{"plain", "with space", "hash#mark", "日本語", "\xff\xfe not utf-8"}
 	for _, name := range names {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+		if err := backing.Write(t.Context(), name, []byte("x")); err != nil {
 			t.Fatalf("create %q: %v", name, err)
 		}
 	}
@@ -1292,8 +1265,8 @@ func TestListingCarriesNamesUnaltered(t *testing.T) {
 }
 
 func TestTheHandlerCanBeMountedUnderAPrefix(t *testing.T) {
-	inner, dir := newHandler(t)
-	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("payload"), 0o644); err != nil {
+	inner, backing := newHandler(t)
+	if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()

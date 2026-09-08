@@ -38,7 +38,7 @@
                 ▼                 ▼
 ```
 
-挂载呈现层只认 storage 接口，因此把一份本地 storage 交给它即可得到一个不经网络的挂载点；它同样不知道底下那份 storage 有没有副本。不记变更日志的命名空间（`localdir` 后端）没有副本可建，挂载时以 `ENOSYS` 说明这一点，此后每一次调用都是一次请求。
+挂载呈现层只认 storage 接口，因此把一份本地 storage 交给它即可得到一个不经网络的挂载点；它同样不知道底下那份 storage 有没有副本。随附的 localstore 与 Azure 服务端都提供 change log。集成方不提供日志时，复制入口以 `ENOSYS` 说明没有副本，此后每一次 metadata 查询都是一次远端请求。
 
 remote storage 的 `DialOptions.MaxBodyBytes` 缺省为 1 GiB，限制 non-write 请求与 non-streaming response；`MaxWriteBytes` 在默认 options 中保持零值，拨号时继承 settled `MaxBodyBytes`，显式值必须为正且不大于它。`Write` 在发请求之前按 `MaxWriteBytes` 以 `EFBIG` 拒绝。读取 response 时先检查 `Content-Length`，再用 limit reader 检查实际字节数，因此错误或缺失的长度也不能绕过 `MaxBodyBytes`。过大的 `Read` 以 `EFBIG` 返回；过大的 listing、attribute、space 或 error message 是无法解码的协议答案，以 `EIO` 返回。无法安全计算四倍 response reservation 的 `MaxBodyBytes`，包括 `MaxInt64`，在拨号前被拒绝。
 
@@ -221,7 +221,7 @@ storage 契约有模式与两个时间的写入口，也有整个命名空间的
 
 内核认一个节点靠一个编号，storage 契约里没有这个编号，挂载呈现层因此自己分配并保存它。**身份则相反**：`storage.Attr.ID` 是命名空间对「这个名字后面是哪个节点」的回答（R-FS-5），这一层把它翻译成编号。
 
-两件事分开的原因是保证不同。编号一旦交给内核就永远不能再指向第二个节点，而 `localdir` 能给的身份是宿主的 `st_ino`，宿主在节点消失后会立刻把它收回去重发。所以编号由这一层发、只增、永不复用；身份只用来判断一个名字后面还是不是原来那个节点。
+两件事分开的原因是归属不同。编号由这次挂载分配，一旦交给内核就不能再指向第二个节点；身份由 namespace 提供，随节点走过改名。编号只增且不复用，namespace 身份用于判断一个名字后面是否仍是原来的节点。两个随附后端都使用 SQLite 节点身份，第三方实现也必须满足 R-FS-5 与 R-INT-11。
 
 保存的形式是一棵名字树，每个被解析过的名字一条记录，记着编号、节点的类型、以及记录建立时命名空间报的身份。编号取自一个只增的计数器，用过不再发第二次：一个节点消失之后，它的编号不再指向任何东西。
 
@@ -242,13 +242,13 @@ storage 契约有模式与两个时间的写入口，也有整个命名空间的
 
 跨卸载重挂不稳定：编号是这一次挂载的，不是命名空间的。身份是命名空间的，但它不是编号，两个挂载点也不会因此报出同一个编号。
 
-**一格没有覆盖到**：`localdir` 后端上，一个名字被删掉后立刻重建，宿主可能把刚释放的 `st_ino` 原样发回来，比对因此漏判，这一层会把已经发给内核的编号继续用在另一个节点上。R-FS-5 的第三句在这种后端上不成立。
+宿主 inode 可能被操作系统复用，不能直接替代满足契约的稳定节点身份。[宿主目录后端已移除](../../../.agents/notes/implemented/simplification/2026-09-08-remove-the-host-directory-backend.md)，这个约束仍适用于第三方实现；挂载层的本地编号不能修复下层错误复用的身份。
 
 ## 九、生命周期
 
 挂载与卸载是频繁的日常操作（R-WS-2）。一次挂载把一份 storage 接到一个挂载点上，并在卸载或内核断开连接时结束。
 
-**挂载在快照灌完之前不可用**，快照失败即挂载失败，且失败说得出是哪一步失败的：没有直通模式，也没有降级模式。首次 `Subscribe` 使用 storage lifetime，`New` 的 context 取消不能终止这一步；流式请求清除 HTTP 总超时，响应头的等待上限取决于 transport 配置，详见[取消首次副本订阅](../../../.agents/notes/proposed/bug-fix/2026-09-07-cancel-initial-replica-subscription.md)。副本随挂载生灭 —— 一个只有属主进得去的专属目录里的一份 SQLite（R-SEC-3），卸载时整个删掉；`-replica-dir` 决定它落在哪里，默认的系统临时目录在很多机器上是内存。代价是冷挂载要等快照走完（R-WS-4 被知情推后）。
+**提供 change log 的命名空间在快照灌完之前不可挂载使用**，快照失败即挂载失败，且失败说得出是哪一步失败的，不把失败降为直通查询。首次 `Subscribe` 使用 storage lifetime，`New` 的 context 取消不能终止这一步；流式请求清除 HTTP 总超时，响应头的等待上限取决于 transport 配置，详见[取消首次副本订阅](../../../.agents/notes/proposed/bug-fix/2026-09-07-cancel-initial-replica-subscription.md)。副本随挂载生灭 —— 一个只有属主进得去的专属目录里的一份 SQLite（R-SEC-3），卸载时整个删掉；`-replica-dir` 决定它落在哪里，默认的系统临时目录在很多机器上是内存。代价是冷挂载要等快照走完（R-WS-4 被知情推后）。
 
 ## 十、client 不做什么
 

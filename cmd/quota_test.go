@@ -3,7 +3,7 @@
 // R-WS-5 asks for a limit given by the deployer, three measured figures reported to
 // whatever runs on the mountpoint, and a refusal that lands on the write that caused it.
 // Each layer below proves its own part — the count and its arithmetic in
-// packages/storage/limited, the reply to statfs(2) in packages/fuse — and none of them
+// packages/metastore/sqlite, the reply to statfs(2) in packages/fuse — and none of them
 // says that a server started with -quota is a workspace df reports that allowance for.
 package cmd_test
 
@@ -35,8 +35,8 @@ func TestAServerUnderAnAllowanceReportsItAndRefusesPastIt(t *testing.T) {
 	requireFUSE(t)
 
 	const allowance = 64 << 10
-	backing := t.TempDir()
-	srv := startDirectoryServerBinary(t, backing, "-quota", "64K")
+	root := privateDirectory(t)
+	srv := startLocalStoreServerBinary(t, root, "64K")
 	mountpoint := t.TempDir()
 	startMountBinary(t, "-server", srv.url, "-mountpoint", mountpoint)
 
@@ -75,38 +75,37 @@ func TestAServerUnderAnAllowanceReportsItAndRefusesPastIt(t *testing.T) {
 	}
 	t.Logf("write(2) past the allowance: %v", err)
 
-	// The name may well be there — open(2) with O_CREAT made an empty file before anything
-	// was written, and an empty file spends none of the allowance. What must not be there is
-	// bytes, and the served directory is where that is settled without this system in the way.
-	switch info, err := os.Stat(filepath.Join(backing, "big.bin")); {
-	case errors.Is(err, os.ErrNotExist):
+	// O_CREAT can publish an empty node before write(2) checks capacity.
+	switch attr, err := dial(t, srv).Stat(t.Context(), "big.bin"); {
+	case errors.Is(err, syscall.ENOENT):
 	case err != nil:
-		t.Fatalf("stat big.bin in the served directory: %v", err)
-	case info.Size() != 0:
-		t.Fatalf("the served directory holds %d bytes at big.bin, and the write that would have put them there was refused",
-			info.Size())
+		t.Fatalf("stat rejected file in the authoritative namespace: %v", err)
+	case attr.Size != 0:
+		t.Fatalf("the authoritative namespace published %d rejected bytes", attr.Size)
 	}
 	if _, used, _ = roomAt(t, mountpoint); used != half {
 		t.Fatalf("df reports %d bytes used after a refused write, want the %d that were written before it", used, half)
 	}
 }
 
-// TestAnAllowanceIsSpentAgainstWhatTheWorkspaceAlreadyHolds. The walk at startup is what
-// makes the first write into a workspace that is already half full be weighed against what
-// is left of the allowance rather than against the whole of it.
+// A restarted server must charge against the persisted workspace usage before its first
+// mounted write, including when the attempted write is smaller than the total allowance.
 func TestAnAllowanceIsSpentAgainstWhatTheWorkspaceAlreadyHolds(t *testing.T) {
 	requireFUSE(t)
 
 	const allowance = 64 << 10
 	const held = allowance / 2
 
-	backing := t.TempDir()
-	// Put there before the server starts, so that it is what the startup walk measures
-	// rather than something the count was told about.
-	if err := os.WriteFile(filepath.Join(backing, "held.bin"), make([]byte, held), 0o644); err != nil {
-		t.Fatal(err)
+	root := privateDirectory(t)
+	seed := startLocalStoreServerBinary(t, root, "64K")
+	if err := dial(t, seed).Write(t.Context(), "held.bin", make([]byte, held)); err != nil {
+		t.Fatalf("seed existing workspace usage: %v", err)
 	}
-	srv := startDirectoryServerBinary(t, backing, "-quota", "64K")
+	seed.interrupt(t)
+	if err := seed.wait(t); err != nil {
+		t.Fatalf("stop seeded server: %v", err)
+	}
+	srv := startServerBinary(t, localStoreServerArgs(root, "64K")...)
 	srv.awaitLine(t, fmt.Sprintf("allowance of %d bytes, %d of them taken", allowance, held), startup)
 
 	mountpoint := t.TempDir()
@@ -115,7 +114,7 @@ func TestAnAllowanceIsSpentAgainstWhatTheWorkspaceAlreadyHolds(t *testing.T) {
 	// Under the allowance, over what is left of it. A workspace weighing this against the
 	// allowance alone would take it and end up holding more than it may. Nothing has been
 	// written through this mount yet, so the figure it weighs the write against is the one
-	// the startup walk arrived at.
+	// the reopened metastore reports.
 	tooMuch := held + mountBlockSize
 	written, err := writeThrough(t, filepath.Join(mountpoint, "over.bin"), tooMuch)
 	if errno := errnoOf(err); errno != syscall.EDQUOT {
@@ -136,117 +135,28 @@ func TestAnAllowanceIsSpentAgainstWhatTheWorkspaceAlreadyHolds(t *testing.T) {
 	}
 }
 
-// TestHangingUpRepairsACountMadeWrongBehindTheServer.
-//
-// The count is exact for everything that passes through the server, and drifts only when
-// the served directory is modified behind its back — a use the spec does not support, and
-// one no later traffic through the server can correct. SIGHUP is the way back: the
-// namespace is measured again and the count replaced with what the walk found.
-func TestHangingUpRepairsACountMadeWrongBehindTheServer(t *testing.T) {
-	const held, planted = 5000, 3000
-
-	backing := t.TempDir()
-	if err := os.WriteFile(filepath.Join(backing, "held.bin"), make([]byte, held), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	srv := startDirectoryServerBinary(t, backing, "-quota", "64K")
+func TestHangingUpReportsLocalStoreState(t *testing.T) {
+	const held = 5000
+	srv := startLocalStoreServerBinary(t, privateDirectory(t), "64K")
 	client := dial(t, srv)
-
-	if space := spaceOf(t, client); space.Used != held {
-		t.Fatalf("the server reports %d bytes taken over a directory holding %d", space.Used, held)
+	if err := client.Write(t.Context(), "artifact", make([]byte, held)); err != nil {
+		t.Fatalf("write before SIGHUP: %v", err)
 	}
-
-	// Behind the server's back, which is the one thing that makes the count wrong.
-	if err := os.WriteFile(filepath.Join(backing, "planted.bin"), make([]byte, planted), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if space := spaceOf(t, client); space.Used != held {
-		t.Fatalf("the count moved to %d bytes without anything having been asked to measure the namespace", space.Used)
-	}
-
+	before := spaceOf(t, client)
 	srv.hangup(t)
-	line := srv.awaitLine(t, "recounted", startup)
-	// Both figures have to be in it. A repair that reports nothing leaves the operator
-	// unable to tell whether it was needed or whether it did anything.
-	for _, figure := range []string{strconv.Itoa(held + planted), strconv.Itoa(held)} {
-		if !strings.Contains(line, figure) {
-			t.Fatalf("the recount says %q, and %s is not in it", line, figure)
-		}
+	line := srv.awaitLine(t, "local-store status", startup)
+	if !strings.Contains(line, fmt.Sprintf("%d of %d workspace bytes used", held, before.Total)) {
+		t.Fatalf("status omitted the current workspace usage: %s", line)
 	}
-	t.Log(line)
-
-	if space := spaceOf(t, client); space.Used != held+planted {
-		t.Fatalf("after the recount the server reports %d bytes taken, over a directory holding %d", space.Used, held+planted)
+	if after := spaceOf(t, client); after != before {
+		t.Fatalf("SIGHUP changed workspace accounting: before=%+v, after=%+v", before, after)
 	}
-
+	if _, err := client.List(t.Context(), ""); err != nil {
+		t.Fatalf("list after SIGHUP: %v", err)
+	}
 	srv.interrupt(t)
 	if err := srv.wait(t); err != nil {
-		t.Fatalf("remote-fs-server exited with %v after SIGINT\n%s", err, srv.output())
-	}
-}
-
-// TestHangingUpWithoutAnAllowanceSaysThereIsNothingToRecount. A signal that quietly did
-// nothing would leave an operator waiting on a repair that was never going to happen.
-func TestHangingUpWithoutAnAllowanceSaysThereIsNothingToRecount(t *testing.T) {
-	srv := startDirectoryServerBinary(t, t.TempDir())
-
-	srv.hangup(t)
-	t.Log(srv.awaitLine(t, "no allowance", startup))
-
-	// Still serving afterwards: SIGHUP asks for something this server survives, whether or
-	// not it has anything to do about it.
-	if _, err := dial(t, srv).List(context.Background(), ""); err != nil {
-		t.Fatalf("listing the namespace after SIGHUP: %v", err)
-	}
-
-	srv.interrupt(t)
-	if err := srv.wait(t); err != nil {
-		t.Fatalf("remote-fs-server exited with %v after SIGINT\n%s", err, srv.output())
-	}
-}
-
-// TestAServerWithoutAnAllowanceReportsTheHostFilesystemsFigures. Both ways of starting the
-// server report measured facts and neither invents any: given -quota the figures are the
-// allowance and what has been counted against it, and given none they are what the
-// filesystem holding the served directory says about itself.
-func TestAServerWithoutAnAllowanceReportsTheHostFilesystemsFigures(t *testing.T) {
-	requireFUSE(t)
-
-	backing := t.TempDir()
-	srv := startDirectoryServerBinary(t, backing)
-	mountpoint := t.TempDir()
-	startMountBinary(t, "-server", srv.url, "-mountpoint", mountpoint)
-
-	hostTotal, _, hostAvail := roomAt(t, backing)
-	total, used, avail := roomAt(t, mountpoint)
-
-	// The mount reports space in blocks, so the filesystem's total arrives floored to a
-	// whole number of them. That is the only difference there may be: a total is a property
-	// of the filesystem and does not move while it is mounted.
-	if want := hostTotal / mountBlockSize * mountBlockSize; total != want {
-		t.Fatalf("the mount reports a total of %d bytes over a filesystem of %d", total, hostTotal)
-	}
-	if avail <= 0 || avail > total {
-		t.Fatalf("the mount reports %d bytes available of %d", avail, total)
-	}
-	// What is available moves under everything else on the machine between the two
-	// readings, so the two are required to agree rather than to be equal. A figure that
-	// came from anywhere but the filesystem would not be near this one at all.
-	if slack := hostTotal / 100; hostAvail-avail > slack || avail-hostAvail > slack {
-		t.Fatalf("the mount reports %d bytes available where the filesystem holding the served directory reports %d",
-			avail, hostAvail)
-	}
-	t.Logf("mount: %d bytes, %d used, %d available; the filesystem underneath: %d, %d available",
-		total, used, avail, hostTotal, hostAvail)
-
-	// And it is a workspace, not only a set of figures: nothing about being under no
-	// allowance stops anything being written.
-	content := []byte("hello\n")
-	if err := os.WriteFile(filepath.Join(mountpoint, "a.txt"), content, 0o644); err != nil {
-		t.Fatalf("writing through a mount that is under no allowance: %v", err)
-	}
-	if got, err := os.ReadFile(filepath.Join(backing, "a.txt")); err != nil || string(got) != string(content) {
-		t.Fatalf("the served directory holds %q (%v), want %q", got, err, content)
+		t.Fatalf("server exit after SIGHUP: %v", err)
 	}
 }
 

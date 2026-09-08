@@ -12,8 +12,6 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -21,23 +19,23 @@ import (
 	"testing"
 
 	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/storage/storagetest"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-// newPair stands a namespace up behind a real HTTP listener and returns a storage that
-// reaches it, together with the directory being served, so that a test can check what
-// actually landed on disk.
-func newPair(t *testing.T) (*httprest.Storage, string) {
-	s, dir, _ := newPairOver(t, false)
-	return s, dir
+// newPair returns both the HTTP client and its backing namespace so that committed
+// contents can be checked independently of the transport.
+func newPair(t *testing.T) (*httprest.Storage, *objectstore.Storage) {
+	s, backing, _ := newPairOver(t, false)
+	return s, backing
 }
 
 // newPairOver is newPair with the HTTP version chosen, and with every response's framing
 // recorded on the way past.
-func newPairOver(t *testing.T, http2 bool) (*httprest.Storage, string, *framing) {
+func newPairOver(t *testing.T, http2 bool) (*httprest.Storage, *objectstore.Storage, *framing) {
 	t.Helper()
-	handler, dir := newHandler(t)
+	handler, backing := newHandler(t)
 
 	srv := httptest.NewUnstartedServer(handler)
 	srv.EnableHTTP2 = http2
@@ -56,7 +54,7 @@ func newPairOver(t *testing.T, http2 bool) (*httprest.Storage, string, *framing)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	return s, dir, seen
+	return s, backing, seen
 }
 
 // framing records how each response was framed, so a test can assert what the handler
@@ -86,10 +84,6 @@ func (f *framing) RoundTrip(r *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-// The whole point of the contract suite living outside any implementation: the same
-// cases that judge a local directory judge the far end of a network hop. Two
-// implementations passing one suite is the evidence that storage.Storage is an
-// abstraction rather than a description of localdir.
 func TestContract(t *testing.T) {
 	storagetest.Run(t, func(t *testing.T) storage.Storage {
 		s, _ := newPair(t)
@@ -576,7 +570,7 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 
 // Content has to cross unchanged whatever bytes it is made of. A file is not text.
 func TestContentSurvivesTheRoundTrip(t *testing.T) {
-	s, dir := newPair(t)
+	s, backing := newPair(t)
 	cases := map[string][]byte{
 		"empty":                     {},
 		"one nul":                   {0x00},
@@ -590,14 +584,14 @@ func TestContentSurvivesTheRoundTrip(t *testing.T) {
 			if err := s.Write(t.Context(), "f", content); err != nil {
 				t.Fatalf("write: %v", err)
 			}
-			// Verified from the other side: the file on disk, not the client's own
-			// account of what it sent.
-			onDisk, err := os.ReadFile(filepath.Join(dir, "f"))
+			// The direct namespace read detects transport writes that acknowledge
+			// different contents from those committed.
+			committed, err := backing.Read(t.Context(), "f")
 			if err != nil {
-				t.Fatalf("read the file on disk: %v", err)
+				t.Fatalf("read the committed file: %v", err)
 			}
-			if !bytes.Equal(onDisk, content) {
-				t.Fatalf("the file on disk holds %d bytes, want %d", len(onDisk), len(content))
+			if !bytes.Equal(committed, content) {
+				t.Fatalf("the committed file holds %d bytes, want %d", len(committed), len(content))
 			}
 
 			got, err := s.Read(t.Context(), "f")
@@ -637,18 +631,18 @@ func TestAwkwardNamesAddressTheRightNode(t *testing.T) {
 		"\xff\xfe not utf-8",
 		"dash-and_underscore.ext",
 	}
-	s, dir := newPair(t)
+	s, backing := newPair(t)
 	for _, name := range names {
 		content := []byte("contents of " + name)
 		if err := s.Write(t.Context(), name, content); err != nil {
 			t.Fatalf("write %q: %v", name, err)
 		}
-		onDisk, err := os.ReadFile(filepath.Join(dir, name))
+		committed, err := backing.Read(t.Context(), name)
 		if err != nil {
-			t.Fatalf("the namespace has no file named %q on disk: %v", name, err)
+			t.Fatalf("the namespace has no file named %q: %v", name, err)
 		}
-		if !bytes.Equal(onDisk, content) {
-			t.Fatalf("the file named %q holds %q, want %q", name, onDisk, content)
+		if !bytes.Equal(committed, content) {
+			t.Fatalf("the file named %q holds %q, want %q", name, committed, content)
 		}
 		got, err := s.Read(t.Context(), name)
 		if err != nil {
@@ -677,7 +671,7 @@ func TestAwkwardNamesAddressTheRightNode(t *testing.T) {
 // Nested and awkward directory paths have to survive too — the separator is the one
 // character a URL is most likely to reinterpret.
 func TestNestedPathsAddressTheRightNode(t *testing.T) {
-	s, dir := newPair(t)
+	s, backing := newPair(t)
 	for _, d := range []string{"a", "a/b b", "a/b b/c#c"} {
 		if err := s.Mkdir(t.Context(), d); err != nil {
 			t.Fatalf("mkdir %q: %v", d, err)
@@ -687,17 +681,17 @@ func TestNestedPathsAddressTheRightNode(t *testing.T) {
 	if err := s.Write(t.Context(), deep, []byte("deep")); err != nil {
 		t.Fatalf("write %q: %v", deep, err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "a", "b b", "c#c", "leaf?.txt")); err != nil {
-		t.Fatalf("the nested file is not where it should be on disk: %v", err)
+	if _, err := backing.Stat(t.Context(), deep); err != nil {
+		t.Fatalf("the nested file is not at its namespace path: %v", err)
 	}
 
 	const moved = "a/b b/renamed 🙂.txt"
 	if err := s.Rename(t.Context(), deep, moved); err != nil {
 		t.Fatalf("rename: %v", err)
 	}
-	got, err := os.ReadFile(filepath.Join(dir, "a", "b b", "renamed 🙂.txt"))
+	got, err := backing.Read(t.Context(), moved)
 	if err != nil {
-		t.Fatalf("read the renamed file on disk: %v", err)
+		t.Fatalf("read the renamed file: %v", err)
 	}
 	if string(got) != "deep" {
 		t.Fatalf("the renamed file holds %q, want %q", got, "deep")

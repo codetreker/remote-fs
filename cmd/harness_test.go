@@ -1,20 +1,12 @@
-// The tests in this package stand up the whole system — a real HTTP listener over a real
-// directory, and two independent mountpoints against it — and check the claim the project
-// exists to make: what one machine writes, another reads.
-//
-// They are here rather than inside a package because there is no package to put them in.
-// Every package below has been proved in halves: the contract suite runs through client →
-// HTTP → server → localdir with no mount in sight, and the mount is compared against a
-// plain directory with no network in sight. Joining the two halves is not a fact about
-// either of them.
-//
-// These tests mount filesystems, so they need /dev/fuse and skip without it. See
-// docs/testing.md.
+// These tests join real HTTP servers, enforcing object namespaces and independent FUSE
+// mounts. They require /dev/fuse; the strict test runner rejects unavailable mount tests.
 package cmd_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -26,6 +18,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/codetreker/remote-fs/packages/fuse"
 	"github.com/codetreker/remote-fs/packages/fuse/fusetest"
@@ -33,7 +26,6 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/memory"
 	"github.com/codetreker/remote-fs/packages/storage/replicated"
@@ -57,10 +49,7 @@ func TestMain(m *testing.M) {
 type namespaceServer struct {
 	url string
 
-	// backing is the directory the namespace is served out of, and empty for one whose tree
-	// is in a metastore. Only a directory can be read from the other side without going
-	// through anything under test.
-	backing string
+	authoritative storage.Storage
 
 	// calls counts what crosses the wire, which is how "the copy answered this without
 	// asking anybody" is a number rather than an impression.
@@ -71,12 +60,22 @@ type namespaceServer struct {
 	stop func()
 }
 
-// serveNamespace starts a server over a namespace whose tree is in a metastore and whose
-// bytes are in memory, which is the arrangement a real deployment uses and the only one that
-// keeps a change log. Everything a mount of it does goes through the copy.
 func serveNamespace(t *testing.T) *namespaceServer {
 	t.Helper()
+	namespace, meta := namespaceFixture(t)
+	return serveStorage(t, namespace, meta)
+}
 
+// The handler's explicit nil log keeps the ENOSYS replication path covered over a real
+// enforcing namespace, independently of whether its backend retains a change log.
+func serveUnreplicatedNamespace(t *testing.T) *namespaceServer {
+	t.Helper()
+	namespace, _ := namespaceFixture(t)
+	return serveStorage(t, namespace, nil)
+}
+
+func namespaceFixture(t *testing.T) (*objectstore.Storage, *sqlite.LockingStore) {
+	t.Helper()
 	meta, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
 		Database: filepath.Join(privateDirectory(t), "namespace.db"), Namespace: "ws",
 		SQLite: sqlite.DefaultOptions(), Locks: locking.DefaultOptions(), Initialize: true,
@@ -90,37 +89,7 @@ func serveNamespace(t *testing.T) *namespaceServer {
 			t.Errorf("closing the namespace: %v", err)
 		}
 	})
-	return serveStorage(t, namespace, meta, "")
-}
-
-// serveDirectory starts a server over a fresh directory and returns once it is listening.
-//
-// A local directory has no metastore and therefore no change log, so this is the namespace
-// that cannot be copied: its replication endpoints answer ENOSYS and a mount of it makes a
-// request for every operation, exactly as every mount did before there was any such thing as
-// a copy. It is kept because that is a shape this system still serves, and because it is the
-// only namespace whose contents can be read from outside everything under test.
-func serveDirectory(t *testing.T) *namespaceServer {
-	t.Helper()
-
-	backing := t.TempDir()
-	config := localdir.Config{
-		Root: backing, StateRoot: privateDirectory(t),
-		Locks: locking.DefaultOptions(), Limits: localdir.DefaultLimits(),
-	}
-	if err := localdir.Init(t.Context(), config); err != nil {
-		t.Fatalf("initialize directory lock state: %v", err)
-	}
-	namespace, err := localdir.Open(t.Context(), config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
-			t.Errorf("close directory namespace: %v", err)
-		}
-	})
-	return serveStorage(t, namespace, nil, backing)
+	return namespace, meta
 }
 
 func privateDirectory(t *testing.T) string {
@@ -132,7 +101,7 @@ func privateDirectory(t *testing.T) string {
 	return directory
 }
 
-func serveStorage(t *testing.T, namespace storage.Storage, log metastore.Log, backing string) *namespaceServer {
+func serveStorage(t *testing.T, namespace storage.Storage, log metastore.Log) *namespaceServer {
 	t.Helper()
 
 	handler, err := httprest.NewHandler(namespace, log)
@@ -163,7 +132,7 @@ func serveStorage(t *testing.T, namespace storage.Storage, log metastore.Log, ba
 	}
 	t.Cleanup(stop)
 
-	return &namespaceServer{url: "http://" + listener.Addr().String(), backing: backing, calls: counted, stop: stop}
+	return &namespaceServer{url: "http://" + listener.Addr().String(), authoritative: namespace, calls: counted, stop: stop}
 }
 
 // calls counts the requests that reach the server, by operation.
@@ -307,4 +276,64 @@ func errnoOf(err error) syscall.Errno {
 		return errno
 	}
 	return 0
+}
+
+// SQLite stores regular files and directories. This metadata decorator preserves real
+// node identities and content lengths while exercising the public symbolic-link contract.
+type symlinkMetadata struct {
+	*objectstore.Storage
+	linkID uint64
+}
+
+func (s *symlinkMetadata) describe(attr storage.Attr) storage.Attr {
+	if attr.ID == s.linkID {
+		attr.Mode = fs.ModeSymlink | 0o777
+	}
+	return attr
+}
+
+func (s *symlinkMetadata) Stat(ctx context.Context, name string) (storage.Attr, error) {
+	attr, err := s.Storage.Stat(ctx, name)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	return s.describe(attr), nil
+}
+
+func (s *symlinkMetadata) List(ctx context.Context, name string) ([]storage.Entry, error) {
+	entries, err := s.Storage.List(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	for i := range entries {
+		entries[i].Attr = s.describe(entries[i].Attr)
+	}
+	return entries, nil
+}
+
+func (s *symlinkMetadata) ListBounded(ctx context.Context, name string, result *storage.ListResult) error {
+	if result == nil {
+		return s.Storage.ListBounded(ctx, name, result)
+	}
+	// Native enumeration remains bounded; the destination charges the transformed mode.
+	captured, err := storage.NewListResult(result.MaxBytes(), 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+		return nameBytes + int64(unsafe.Sizeof(storage.Entry{})), nil
+	})
+	if err != nil {
+		return result.Fail(err)
+	}
+	if err := s.Storage.ListBounded(ctx, name, captured); err != nil {
+		return result.Fail(err)
+	}
+	entries, err := captured.Entries()
+	if err != nil {
+		return result.Fail(err)
+	}
+	for _, entry := range entries {
+		entry.Attr = s.describe(entry.Attr)
+		if err := result.Add(entry); err != nil {
+			return result.Fail(err)
+		}
+	}
+	return nil
 }

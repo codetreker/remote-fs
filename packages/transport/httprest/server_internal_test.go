@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -25,8 +24,9 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore"
 	metasqlite "github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 	"github.com/codetreker/remote-fs/packages/storage/locked"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 )
 
 func TestListResponseFitCalculationMatchesTheWire(t *testing.T) {
@@ -230,10 +230,7 @@ func TestStreamSetupErrorsUseClientResponseAdmission(t *testing.T) {
 }
 
 func TestHandlerAdmissionBoundsStatWaitersAndAQueuedWrite(t *testing.T) {
-	backing, err := pairedDirectory(t, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	blocked := &blockedStatStorage{
 		BoundedStorage: backing,
 		entered:        make(chan struct{}),
@@ -279,10 +276,7 @@ func TestHandlerAdmissionBoundsStatWaitersAndAQueuedWrite(t *testing.T) {
 }
 
 func TestHandlerChargesFixedErrorResponsesAgainstAggregateBytes(t *testing.T) {
-	backing, err := pairedDirectory(t, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	blocked := &multiBlockedStatStorage{
 		BoundedStorage: backing,
 		entered:        make(chan struct{}, 5),
@@ -327,10 +321,7 @@ func TestHandlerChargesFixedErrorResponsesAgainstAggregateBytes(t *testing.T) {
 }
 
 func TestSnapshotFrameAdmissionBoundsAggregateWaitersAndCancellation(t *testing.T) {
-	backing, err := pairedDirectory(t, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	options := DefaultHandlerOptions()
 	options.Replication.Keepalive = time.Hour
 	options.MaxFrameBytes = 1024
@@ -405,10 +396,7 @@ func TestChangeDeliveryIsIndependentOfSnapshotAdmissionAndASlowSubscriber(t *tes
 	if err := log.Create(t.Context(), "changed"); err != nil {
 		t.Fatal(err)
 	}
-	backing, err := pairedDirectory(t, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	options := DefaultHandlerOptions()
 	options.MaxFrameBytes = 1024
 	options.MaxConcurrentSnapshotFrames = 1
@@ -466,10 +454,7 @@ func TestSnapshotKeepalivesContinueWhileFrameAdmissionWaits(t *testing.T) {
 	if err := log.Create(t.Context(), "entry"); err != nil {
 		t.Fatal(err)
 	}
-	backing, err := pairedDirectory(t, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	options := DefaultHandlerOptions()
 	options.MaxFrameBytes = 1024
 	options.MaxConcurrentSnapshotFrames = 1
@@ -626,10 +611,7 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 }
 
 func TestSubscriptionAdmissionReleasesOnCancelAndStop(t *testing.T) {
-	backing, err := pairedDirectory(t, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	log, err := metasqlite.Open(t.Context(), filepath.Join(t.TempDir(), "log.db"), "workspace", 0, metasqlite.DefaultWindow())
 	if err != nil {
 		t.Fatal(err)
@@ -837,28 +819,8 @@ func serveInternal(t *testing.T, handler http.Handler, request Request, body io.
 	return response
 }
 
-func pairedDirectory(t *testing.T, root string) (*localdir.Storage, error) {
+func namespaceFixture(t *testing.T) *objectstore.Storage {
 	t.Helper()
-	config := localdir.Config{
-		Root:      root,
-		StateRoot: t.TempDir(),
-		Locks:     locking.DefaultOptions(),
-		Limits:    localdir.DefaultLimits(),
-	}
-	if err := os.Chmod(config.StateRoot, 0o700); err != nil {
-		return nil, err
-	}
-	if err := localdir.Init(t.Context(), config); err != nil {
-		return nil, err
-	}
-	backend, err := localdir.Open(t.Context(), config)
-	if err != nil {
-		return nil, err
-	}
-	t.Cleanup(func() {
-		if err := backend.Close(); err != nil {
-			t.Errorf("close directory: %v", err)
-		}
-	})
-	return backend, nil
+	_, backend := memoryfixture.New(t, "transport-internal", 1<<30, locking.DefaultOptions())
+	return backend
 }

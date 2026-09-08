@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"io/fs"
-	"os"
-	"path/filepath"
 	"reflect"
 	"syscall"
 	"testing"
@@ -13,7 +11,7 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 	"github.com/codetreker/remote-fs/packages/storage/locked"
 )
 
@@ -255,32 +253,9 @@ func acquire(t *testing.T, service locking.Service, path string, mode locking.Mo
 	return owner.Ref, result.Grant.Ref
 }
 
-func pairedBackend(t *testing.T) *localdir.Storage {
+func pairedBackend(t *testing.T) locked.Backend {
 	t.Helper()
-	base := t.TempDir()
-	config := localdir.Config{
-		Root:      filepath.Join(base, "root"),
-		StateRoot: filepath.Join(base, "state"),
-		Locks:     locking.DefaultOptions(),
-		Limits:    localdir.DefaultLimits(),
-	}
-	for _, dir := range []string{config.Root, config.StateRoot} {
-		if err := os.Mkdir(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := localdir.Init(t.Context(), config); err != nil {
-		t.Fatal(err)
-	}
-	backend, err := localdir.Open(t.Context(), config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := backend.Close(); err != nil {
-			t.Errorf("close directory: %v", err)
-		}
-	})
+	_, backend := memoryfixture.New(t, "ws", 0, locking.DefaultOptions())
 	return backend
 }
 

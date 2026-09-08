@@ -30,7 +30,7 @@ Status: implemented
 |---|---|
 | 三个内核超时仍然是 0 | 名字与属性查询仍然到达这一层，只是答案来自本地 SQLite 而不是网络；文件页缓存独立存在 |
 | 没有直通模式、没有降级 | 副本没建好，挂载点就还不能用；R-WS-4 知情推后 |
-| 只支持有 metastore 的后端 | `localdir` 后端保持原来的行为 |
+| 只支持有 metastore 的后端 | 当时的 `localdir` 保持直通；该实现已由[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)取消，第三方 storage 的日志仍是独立能力 |
 | 迁移机制只到「够用」为止 | 编号的 `.sql` 文件顺序重放，没有回滚、没有校验和 |
 | 三个保留窗口参数不实测 | 用默认值交付，踩到再调 |
 
@@ -186,9 +186,11 @@ metastore 事务 {
 
 ### 日志归 metastore
 
-**日志是每个 metastore 必须提供的能力**，怎么实现由各自决定。引入复制时无需把日志并进 `storage.Storage`，第三方仍可只提供命名空间数据接口。当前从 server 发布 namespace 还须提供有界读取，并与能在原生最终转换处检查权限的锁授权方配对；这不要求普通目录因此实现元数据复制。
+**日志是每个 metastore 必须提供的能力**，怎么实现由各自决定。引入复制时无需把日志并进 `storage.Storage`，第三方仍可只提供命名空间数据接口。当前从 server 发布 namespace 还须提供有界读取，并与能在原生最终转换处检查权限的锁授权方配对；日志仍是独立的可选能力，不能从有界读取或锁服务推导出复制支持。
 
-于是这一版**只有 metastore 后端的 workspace 会被复制**，`localdir` 后端保持今天的直通行为。[观察源与通道](../../proposed/architecture/2026-08-19-observation-source-and-channels.md)论证过一件事：`mount(localdir)` 必须走与生产相同的缓存与失效路径，否则差分对拍对的是一个生产中永不出现的配置。这一版**没有满足它**，而是把它换了个地方还上：`packages/fuse` 的差分对拍仍然挂 `localdir`，对的仍然是一个不带副本的挂载点——它证明的是「挂载层像一个普通目录」，那件事与复制无关，换掉夹具也不会让它多证明什么，因为那一层根本没有服务端。带副本的那条路径改由 `cmd` 的端到端用例走：它们的夹具换成了 metastore 后端（SQLite + 内存对象），于是真实部署走的那条路正是测试走的那条，另留两个用例在 `localdir` 上盯着 `ENOSYS` 那一支。`packages/storage/localstore` 也把同一份 SQLite metastore 的日志交给 server，所以[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)走相同的快照与增量复制路径。
+引入复制时，只有 metastore 后端的 workspace 会被复制，`localdir` 保持直通。[观察源与通道](../../proposed/architecture/2026-08-19-observation-source-and-channels.md)提出的「直接挂载与生产经过相同失效路径」没有因此实现：当时 `packages/fuse` 在 `localdir` 上与普通目录对拍，`cmd` 另用 SQLite 与内存对象验证复制路径，并保留两个 `localdir` 用例覆盖 `ENOSYS`。这一取舍将挂载语义与复制行为分开验证，没有让差分对拍覆盖复制失效。
+
+[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)后，直接 FUSE 与 HTTP 夹具使用 SQLite 与内存对象，二进制测试覆盖 localstore 与 Azure Blob；不提供日志的行为由显式省略 Log 的夹具继续验证。现有两种独立服务端后端都把 SQLite 日志交给 server，其中[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)复用相同快照与增量路径。更换存储夹具不改变直接 FUSE 挂载没有副本这一验证边界。
 
 **残留的缺口写在这里，不留给读者去推**：差分对拍与复制是两组用例，没有一组同时对拍「带副本的挂载点」与「普通目录」。
 
@@ -457,6 +459,6 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **代价四：保留窗口与资源 ceiling 的默认值都需要部署校准。** 一万条挡不住一次动两千文件的分支切换，而掉出窗口的代价随树的规模增长。快照 deadline/page、single-frame bytes、subscription 数、snapshot-frame concurrency/aggregate/waiters，以及 confirmation grace/active/waiters 都以有限默认值交付；越界会响亮失败，不会扩张成无界 retention。默认值不能替代对真实 tree、change rate 与并发 mount 数的测量。
 
-**`localdir` 后端没有复制，而它曾经是全部端到端测试的夹具。** 那批测试已经换到 metastore 后端（SQLite + 内存对象），于是它们走的是真实部署走的那条路径；`localdir` 留下两个用例，因为那是这个系统仍然要服务的一种形态，也是唯一能从被测代码之外读到字节的那一种。
+**端到端验收必须经过部署实际使用的复制路径。** 引入复制时，测试从 `localdir` 转向 metastore 后端；取消宿主目录后端后，独立二进制覆盖 localstore 与 Azure Blob。可替换 storage 仍允许没有 Log，这一能力分支由专门夹具覆盖，不能因随附后端都有日志而删除。
 
 **验收是这样验的，每一条都有对应的用例。** 一次目录改名在副本里只搬一行：改名之后子树里每个节点的编号不变、挂载点上每个 inode 号不变，且除了改名本身没有产生任何请求。快照期间持续写入，追平之后副本与服务端的 metastore 逐节点一致——那个用例会先断言「确实有写入压在扫描窗口里」，否则它判自己失败。事件通道断开时十一个操作各自失败一次，且不返回空目录、不报告文件不存在；把这条防护拆掉之后，它报出来的是「列目录成功，2 个条目」与「一个存在的名字答不存在」。日志答「无法重放」时客户端重建而不是接着走，用快照的次数是证据。一个不记日志的命名空间以 ENOSYS 拒绝复制，挂载点照常工作，而它的每一次 stat 都到达服务端。

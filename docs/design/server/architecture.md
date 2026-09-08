@@ -11,7 +11,7 @@
 | **请求处理**（`packages/transport/httprest`） | 一个 `http.Handler`。解析数据与锁控制请求，使用独立的有界 admission，验证 scope 与响应，把控制操作交给配对的授权方。它不缓存 namespace 答案；订阅与快照保留各自有界的连接状态。 | R-INT-1、R-INT-3 |
 | **协议词汇**（`packages/transport/httprest`） | 请求 URL 的形状、响应体的形状；错误的名字取自 storage 契约的 errno 词汇。与 client 共用同一份。 | R-INT-9 |
 | **变更日志** | 命名空间里每一次改动的有序记录，由 storage 底下的 metastore 提供。请求处理拿到它就开出复制那三个操作；拿不到（`nil`）就以 `ENOSYS` 拒绝它们。 | R-CON-1、R-CON-2 |
-| **storage** | 原生发布集成确定实际资源并执行最终转换。普通目录可套字节配额，两个 metastore-backed 组合自己记账；第三方实现须履行同一原生集成契约。 | R-INT-6、R-INT-13 |
+| **storage** | 原生发布集成确定实际资源并执行最终转换。localstore 与 Azure 组合在 metastore 事务中记账；第三方实现须履行同一原生集成契约。 | R-INT-6、R-INT-13 |
 | **文件占有**（`packages/locking`、`packages/storage/locked`） | 有限 S/X 授予、Session / Owner、动作核对与发布顺序；与同一 namespace 绑定，重启通过持久证据恢复保护。 | R-CC-3、R-CC-6 至 R-CC-11 |
 
 ```
@@ -24,7 +24,7 @@
         │ storage 接口
         ▼
  ┌─────────────┐
- │   storage   │  localdir / localstore / objectstore / 自有实现
+ │   storage   │  localstore / objectstore / 自有实现
  └─────────────┘
 ```
 
@@ -113,7 +113,7 @@ storage 返回错误时，请求处理用 `storage.ErrnoNameOf` 取得 `422` 响
 
 ## 五、复制那三个操作
 
-一份命名空间的元数据能不能被复制，取决于它底下有没有一条变更日志。有的（metastore 后端），这三个操作开着；没有的（`localdir`），三个一律 `ENOSYS` —— 那是关于那份命名空间的一句事实，与「够不到」是两回事，两者要求的动作正好相反：`ENOSYS` 说这里永远不会有副本，别再问了；`EIO` 说过一会儿再试。**绝不能答一条空的流或一份没有行的快照** —— 那读起来是「这个命名空间存在、是空的、永不改变」，而这正是一个副本会相信的答案。
+一份命名空间的元数据能不能被复制，取决于集成方是否提供变更日志。随附的 localstore 与 Azure 形态都有日志；库调用方未提供时，三个操作一律 `ENOSYS` —— 那是关于那份命名空间的一句事实，与「够不到」是两回事，两者要求的动作正好相反：`ENOSYS` 说这里永远不会有副本，别再问了；`EIO` 说过一会儿再试。**绝不能答一条空的流或一份没有行的快照** —— 那读起来是「这个命名空间存在、是空的、永不改变」，而这正是一个副本会相信的答案。
 
 | 操作 | 答什么 |
 |---|---|
@@ -175,17 +175,16 @@ server 通过配对的 namespace 与锁服务访问命名空间。集成方注�
 
 | 形态 | 组成 | 变更日志 |
 |---|---|---|
-| 普通目录 | `packages/storage/localdir` | 无 |
 | 本地持久对象存储 | `packages/storage/localstore` 持有 `objectstore.Storage`、`localdisk.Objects`、绑定的 `sqlite.Store` 与外部提交见证 | 有 |
 | Azure 对象存储 | `objectstore.Storage` + `azblob.Objects` + `sqlite.Store` | 有 |
 
-`localdir` 需要被服务目录与树外、当前同一 mount 上的私有锁状态目录。Azure 形态依赖部署方分别提供和运维 Blob container、数据库及其相邻的 lease 证据，两类存储可以各自失败（R-INT-12、R-ERR-6）。`sqlite.OpenLocking` 对整份数据库取得 lifetime ownership，数据库及确定位置的证据保存数据库级最大 lease 时长。后续启动可以选择另一个已有 namespace，但同一时刻只有一份活跃锁服务拥有该数据库，恢复等待仍覆盖整份数据库。`localstore` 则拥有一个私有本地目录下的对象、SQLite、WAL 外部见证、恢复状态与独占锁；它的完整设计见 [`local-disk-object-store.md`](local-disk-object-store.md)。
+Azure 形态依赖部署方分别提供和运维 Blob container、数据库及其相邻的 lease 证据，两类存储可以各自失败（R-INT-12、R-ERR-6）。`sqlite.OpenLocking` 对整份数据库取得 lifetime ownership，数据库及确定位置的证据保存数据库级最大 lease 时长。后续启动可以选择另一个已有 namespace，但同一时刻只有一份活跃锁服务拥有该数据库，恢复等待仍覆盖整份数据库。`localstore` 则拥有一个私有本地目录下的对象、SQLite、WAL 外部见证、恢复状态与独占锁；它的完整设计见 [`local-disk-object-store.md`](local-disk-object-store.md)。
 
 storage 必须履行的义务、十一个操作的形状、路径规则与错误词汇，由 storage 接口定义，见顶层设计第四节。
 
 ### 配额住在 storage 这一侧
 
-配额属于 workspace，不属于它底下那块盘——一个普通目录根本没有配额这个概念——因此计数与拒绝都落在 storage 这一层，而不是在 server 里。随附实现用两种方式做到它。
+配额属于 workspace，计数与拒绝落在 storage 这一层。随附的 localstore 与 Azure 组合在 metastore 事务中记账；库另提供通用 `limited` 包装，供没有自身配额的第三方 storage 使用。
 
 **包一层：`packages/storage/limited`** 包住任意一份 `storage.BoundedStorage`（R-WS-5、R-INT-3），这是把配额加到一份本来没有配额概念的实现上的通用办法：
 
@@ -193,7 +192,7 @@ storage 必须履行的义务、十一个操作的形状、路径规则与错误
 - 原生 backend 的 `CheckPublicationAccounting` 能力把实际新旧长度与效果交给发布计费。增长在效果发生前预留，超限以 `EDQUOT` 拒绝；确定 Applied 后才释放缩短额度，即使随后返回确认错误也按实际效果结算。NotApplied 退回增长预留；namespace 效果不明，或结算、撤销带 `IsPublicationAccountingUncertain` 时保留保守账本并使 Space、修改与 Recount 报错，直到重新打开。scope 与锁服务传给同一原生 backend。原有验收由[缩短提交后释放配额](../../../.agents/notes/implemented/bug-fix/2026-09-07-release-shrunk-quota-after-commit.md)拥有。
 - 让命名空间变小的修改从不被拒绝，已经超出配额时也不拒绝 —— 否则一个超额的 workspace 没有任何回到配额之内的路。
 - 配额不得低于一个 4096 字节的块：再小的配额会被报成一个零块的文件系统，那读起来是一块没有剩余空间的盘，而不是一个空间很小的 workspace。
-- 原生普通目录从实际发布取得大小，Write、Remove 与 Rename 不再在包装层采样路径或取得 stripe 锁。没有原生计费能力的有界第三方 backend 仍用路径采样；该路径无法保护祖先目录改名，且不能向 server 提供非空锁授权方。通用边界见[目录改名中的配额记账](../../../.agents/notes/proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)。绕过 server 直接改动底下的目录仍会让计数漂移，这是规格中的非目标。回到实测值依靠使用同一组 measurement limits 的 `Recount`，随附二进制把它接在 SIGHUP 上；超限、取消或 listing 失败都保留原计数，已经不确定的账本不能靠在线重数解除隔离。
+- 实现原生计费能力时，Write、Remove 与 Rename 从实际发布取得大小，跳过包装层路径采样与 stripe。没有该能力的有界第三方 backend 仍用路径采样；祖先目录改名可能使其计量对象失效，且它不能向 server 提供非空锁授权方，见[目录改名中的配额记账](../../../.agents/notes/proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)。库的 `Recount` 使用同一组 measurement limits；超限、取消或 listing 失败保留原计数，已经不确定的账本不能靠在线重数解除隔离。随附二进制没有 recount 入口。
 
 `Space` 报出的「还能写入的量」取配额剩余与底层实现所报之中较小的那个。配额是「还允许写多少」而不是「这些字节一定放得下」：底下那块盘比配额更紧时若仍报配额，等于向先查空间再决定写不写的程序许诺机器给不出的余量。
 
@@ -223,7 +222,7 @@ v1/v2 数据库还面临 object lifecycle 证据缺失：旧实现把 reservatio
 - **不保存订阅者的复制进度。** 位置由订阅者自己携带。锁 Session、Owner、有限 grant 与动作历史由服务端持有，TCP 断开不会提前解除保护。
 - **不清洗路径。** 逐字交给 storage。
 - **不提供身份认证系统。** enrollment 的访问与 TLS 由部署方保护；不可伪造的锁能力只证明 Session / Owner / Grant 的归属。部署鉴权的范围见[范围决定](../../../.agents/notes/implemented/process/2026-08-19-mvp-scope.md)。
-- **handler package 不打印，也不记日志。** 请求失败的原因随该次响应返回；独立二进制只把 lifecycle、recount、锁状态与 metastore-backed status 写到 stderr。
+- **handler package 不打印，也不记日志。** 请求失败的原因随该次响应返回；独立二进制只把 lifecycle、锁状态与 metastore-backed status 写到 stderr。
 
 ## 九、部署形态
 
@@ -231,42 +230,39 @@ v1/v2 数据库还面临 object lifecycle 证据缺失：旧实现把 reservatio
 
 作为库时：不注册信号处理、不写 stdout/stderr、不调用进程退出、包初始化不产生副作用（R-INT-2）。`packages/transport/httprest` 暴露 `NewHandler`、`NewHandlerWithLimits` 与 `NewHandlerWithOptions`；`HandlerOptions.Check` 可在打开 storage 前验证所有 HTTP 上限，constructor 会再次验证，并要求带原生发布能力的 `locked.Backend`，内部构造 `locked.Storage`；`locked.New` 拒绝 `CheckBounded` 失败或缺少绑定锁服务的 backend。监听、TLS、超时、路由前缀与 lifecycle 都由集成方决定。调用方也可以直接组合 `localstore.Open`，并通过 `Status`、`MaintenanceStatus`、`Sweep` 与 `Close` 管理它。
 
-独立二进制接受三种互斥入口：
+独立二进制接受两种互斥入口：
 
 | storage mode | 命令行 | 配额 | 复制 |
 |---|---|---|---|
-| 普通目录 | `-listen ADDR -dir DIR -lock-state-root DIR [-quota SIZE] [DIRECTORY OPTIONS] [LOCK OPTIONS] [HTTP OPTIONS]` | 可选；给出后由 `limited.Storage` 有界计量 | 无 |
 | Azure Blob + SQLite | `-listen ADDR -blob-container NAME -metastore PATH -workspace NAME [-blob-prefix PREFIX] [-quota SIZE] [METASTORE OPTIONS] [LOCK OPTIONS] [HTTP OPTIONS]` | 可选；SQLite transaction 内计数 | 有 |
 | 本地持久对象存储 | `-listen ADDR -local-store DIR -workspace NAME -quota SIZE [METASTORE OPTIONS] [LOCAL OPTIONS] [LOCK OPTIONS] [HTTP OPTIONS]` | 必填；SQLite transaction 内计数，并受 physical availability 限制 | 有 |
 
-三个模式都在首次建立 lease 证据时显式使用 `-initialize-lock-state`，正常重开验证已有证据；该开关不能修复缺失或错配的 READY 状态。`-lock-state-root` 只用于普通目录，Azure 的证据位于数据库旁，本地对象存储的证据位于其私有根。初始化、恢复等待与数据库级所有权见[持久证据](file-locks.md#重启与持久证据)。
+两种模式都在首次建立 lease 证据时显式使用 `-initialize-lock-state`，正常重开验证已有证据；该开关不能修复缺失或错配的 READY 状态。Azure 的证据位于数据库旁，本地对象存储的证据位于其私有根。初始化、恢复等待与数据库级所有权见[持久证据](file-locks.md#重启与持久证据)。
 
 `locking.Options` 的全局容量通过 `-lock-max-sessions`、`-lock-max-tickets`、`-lock-max-owners`、`-lock-max-resources`、`-lock-max-actions`、`-lock-max-grants`、`-lock-max-queued` 暴露，默认依次为 1024、1024、4096、4096、262144、8192、4096。局部上限 `-lock-owners-per-session`、`-lock-owner-actions-per-session`、`-lock-actions-per-owner`、`-lock-grants-per-owner`、`-lock-queued-per-owner`、`-lock-queued-per-resource` 默认依次为 64、256、1024、64、64、128。`-lock-max-proofs` 默认 16，`-lock-max-request-bytes` 默认 128；HTTP 还有独立的协议上限。
 
 `-lock-max-lease`、`-lock-max-wait`、`-lock-ticket-ttl`、`-lock-resource-ttl` 默认各一分钟，`-lock-session-idle` 默认十分钟。时长至少一毫秒，session idle 必须覆盖最大 lease 与等待；降低配置不缩短已记录的恢复保护。所有状态容量都必须为有限正数。
 
-普通目录还用 `-dir-max-operations`、`-dir-max-waiters`、`-dir-max-pinned-targets` 限制活跃操作、等待与固定文件对象，默认 128、256、4096；`-dir-max-snapshot-entries`、`-dir-max-recovery-entries`、`-dir-max-path-bytes` 默认 100000、1024、4096。`-dir-max-staging-bytes` 默认 1 GiB，`-dir-max-snapshot-bytes` 默认 64 MiB，分别约束内容暂存总量与一次目录 metadata 捕获。它们只用于 `-dir`；目录快照预算不限制文件内容读取。
+`SIZE` 是一个整数字节数，可带 B、K、M、G、T、P 或 KiB 到 PiB 的后缀，每一级都是 1024 的幂；`KB`、`MB` 这类按 1000 的幂拼写的后缀被拒绝。配额一旦给出就不得小于 4096 字节；不给 `-quota` 是 Azure namespace 没有 configured allowance 的唯一方式。本地持久 mode 必须给出配额。
 
-`SIZE` 是一个整数字节数，可带 B、K、M、G、T、P 或 KiB 到 PiB 的后缀，每一级都是 1024 的幂；`KB`、`MB` 这类按 1000 的幂拼写的后缀被拒绝。配额一旦给出就不得小于 4096 字节；不给 `-quota` 是普通目录或 Azure namespace 没有 configured allowance 的唯一方式。本地持久 mode 必须给出配额。
+两种形态共用 `-max-pending-objects`、`-max-pending-bytes`、`-max-reader-connections`、`-max-snapshot-reader-connections`、`-max-integrity-records` 与 `-max-integrity-bytes`，默认分别为 4096、8 GiB、16、16、1,000,000 和 64 MiB。本地形态另以 `-local-max-waiting-operations` 限制尚在 key/shard coordination 或等待 active budget 的调用，默认 256，满额时以 `EAGAIN` 拒绝。
 
-quota-limited 普通目录以 `-quota-max-directory-bytes` 与 `-quota-max-frontier-bytes` 分别配置单目录结果和遍历 frontier，默认各为 64 MiB；只有同时给出 `-dir` 与 `-quota` 时才接受这两个 flags。metastore-backed 形态共用 `-max-pending-objects`、`-max-pending-bytes`、`-max-reader-connections`、`-max-snapshot-reader-connections`、`-max-integrity-records` 与 `-max-integrity-bytes`，默认分别为 4096、8 GiB、16、16、1,000,000 和 64 MiB；`-dir` 携带它们会被拒绝。本地形态另以 `-local-max-waiting-operations` 限制尚在 key/shard coordination 或等待 active budget 的调用，默认 256，满额时以 `EAGAIN` 拒绝。
+Azure 与 local 两种 objectstore-backed 形态还共用 `-sweep-interval` 与 `-sweep-batch`，默认 1 分钟和 64；前者必须为正，后者必须在 1 到 `objectstore.MaxSweepBatch`（1,048,576）之间。interval 决定 transient cleanup failure 无新 mutation 时的重试上界，batch 限制每轮 object/metastore 工作量。
 
-Azure 与 local 两种 objectstore-backed 形态还共用 `-sweep-interval` 与 `-sweep-batch`，默认 1 分钟和 64；前者必须为正，后者必须在 1 到 `objectstore.MaxSweepBatch`（1,048,576）之间。interval 决定 transient cleanup failure 无新 mutation 时的重试上界，batch 限制每轮 object/metastore 工作量。普通目录没有 garbage ledger，显式携带它们会被拒绝。
-
-non-streaming HTTP flags 控制单体 body/write，request body 的 operation、waiter 与 aggregate bytes，以及 response 的 operation、waiter 与 aggregate bytes：`-http-max-body-bytes`、`-http-max-write-bytes`、`-http-max-concurrent-bodies`、`-http-max-waiting-bodies`、`-http-max-in-flight-body-bytes`、`-http-max-concurrent-responses`、`-http-max-waiting-responses` 与 `-http-max-in-flight-response-bytes`。默认值见第六节。普通目录省略 write 上限时，命令选取 body 与 staging 上限的较小值；默认仍允许 1 GiB，显式 write 上限超过 staging 时拒绝。local-store 要求 effective write 上限不大于 `-local-max-object-bytes`；Blob mode 要求它不大于 `min(azblob.MaxObjectBytes, effective -max-pending-bytes)`，其中 Azure 单对象上限是 5000 MiB。这些关系都在打开 storage 前验证。
+non-streaming HTTP flags 控制单体 body/write，request body 的 operation、waiter 与 aggregate bytes，以及 response 的 operation、waiter 与 aggregate bytes：`-http-max-body-bytes`、`-http-max-write-bytes`、`-http-max-concurrent-bodies`、`-http-max-waiting-bodies`、`-http-max-in-flight-body-bytes`、`-http-max-concurrent-responses`、`-http-max-waiting-responses` 与 `-http-max-in-flight-response-bytes`。默认值见第六节。local-store 要求 effective write 上限不大于 `-local-max-object-bytes`；Blob mode 要求它不大于 `min(azblob.MaxObjectBytes, effective -max-pending-bytes)`，其中 Azure 单对象上限是 5000 MiB。这些关系都在打开 storage 前验证。
 
 锁控制使用 `-http-max-concurrent-lock-controls` 与 `-http-max-waiting-lock-controls`，默认各 16，零值选择 package 默认；它们独立于普通 body/response 与复制资源，协议单体仍固定 16 KiB。
 
-复制资源由 `-http-max-subscriptions`、`-http-max-frame-bytes`、`-http-max-concurrent-snapshot-frames`、`-http-max-in-flight-snapshot-frame-bytes` 与 `-http-max-waiting-snapshot-frames` 配置；默认分别为 64、8 MiB、16、384 MiB 与 64。subscription 已满时不排队并以 `EAGAIN` 拒绝；snapshot-frame aggregate 必须至少容纳 `3 * MaxFrameBytes`。change/start frames 的总预算由 subscription 与 frame 上限推导，不使用 snapshot admission。这些 flags 只对提供 change log 的 Azure/local 形态有效，`-dir` 显式携带任一项都会被拒绝。local-only 资源 flags、默认值与约束由 [`local-disk-object-store.md`](local-disk-object-store.md#七容量与资源上限) 定义；用在其它 storage mode 时命令行直接拒绝。
+复制资源由 `-http-max-subscriptions`、`-http-max-frame-bytes`、`-http-max-concurrent-snapshot-frames`、`-http-max-in-flight-snapshot-frame-bytes` 与 `-http-max-waiting-snapshot-frames` 配置；默认分别为 64、8 MiB、16、384 MiB 与 64。subscription 已满时不排队并以 `EAGAIN` 拒绝；snapshot-frame aggregate 必须至少容纳 `3 * MaxFrameBytes`。change/start frames 的总预算由 subscription 与 frame 上限推导，不使用 snapshot admission。两种随附形态都提供 change log。local-only 资源 flags、默认值与约束由 [`local-disk-object-store.md`](local-disk-object-store.md#七容量与资源上限) 定义；用在其它 storage mode 时命令行直接拒绝。
 
-独立二进制还在 handler 之外持有三项 HTTP server 资源配置：`-http-max-connections` 默认 256，`-http-read-header-timeout` 默认 2 秒，`-http-idle-timeout` 默认 1 分钟。listener 在 `Accept` 之前取得 connection 名额，已满时停止接受新 connection，已有 connection 关闭后释放名额。上限必须为有限正数；metastore-backed 形态至少需要 2 条连接，因为冷挂载会在保持 Subscribe 的同时打开 Snapshot，普通目录允许 1。connection、subscription 与 snapshot 是独立上限；更紧的 connection cap 可以先成为全局约束。两个 timeout 都必须为正：前者限制一份 request header 到齐所需的时间，后者限制 keep-alive connection 等待下一份 request 的空闲时间。shutdown 时 command-owned `ConnState` tracker 先进入永久 stopping 状态，关闭已经接受和尚未进入 handler 的 `StateNew` connection，也立即关闭此后到达的 late notification，再调用 `Shutdown`；安全性不依赖 header timeout 小于 shutdown grace。独立 server 不设全局 `WriteTimeout`：变更流没有自然终点，snapshot 由自己的 deadline 约束。嵌入形态的 listener、connection admission 与 HTTP timeouts 仍由调用方拥有。
+独立二进制还在 handler 之外持有三项 HTTP server 资源配置：`-http-max-connections` 默认 256，`-http-read-header-timeout` 默认 2 秒，`-http-idle-timeout` 默认 1 分钟。listener 在 `Accept` 之前取得 connection 名额，已满时停止接受新 connection，已有 connection 关闭后释放名额。上限必须为有限正数；两种随附形态至少需要 2 条连接，因为冷挂载会在保持 Subscribe 的同时打开 Snapshot。connection、subscription 与 snapshot 是独立上限；更紧的 connection cap 可以先成为全局约束。两个 timeout 都必须为正：前者限制一份 request header 到齐所需的时间，后者限制 keep-alive connection 等待下一份 request 的空闲时间。shutdown 时 command-owned `ConnState` tracker 先进入永久 stopping 状态，关闭已经接受和尚未进入 handler 的 `StateNew` connection，也立即关闭此后到达的 late notification，再调用 `Shutdown`；安全性不依赖 header timeout 小于 shutdown grace。独立 server 不设全局 `WriteTimeout`：变更流没有自然终点，snapshot 由自己的 deadline 约束。嵌入形态的 listener、connection admission 与 HTTP timeouts 仍由调用方拥有。
 
-启动先完成静态配置校验并占用 listener，再进行 storage open/recovery。这个顺序使无法取得服务地址的进程不会初始化一份新的持久 store。quota-limited 普通目录此时才按配置的 directory/frontier bounds 遍历；超限或读取失败会关闭 listener，且不会打印 READY。它与 Azure namespace 还会查询一次容量，local store 会查询一次组合状态；无配额普通目录与无配额 Azure 形态不做容量查询。所有模式查询锁状态，启动行报告 ready、recovering 或 unavailable 及安全计数，不打印能力身份。服务已开始监听不表示恢复屏障已经结束，也不是 Azure 远端对象可达性的证明；实际故障由后续操作或状态查询返回。
+启动先完成静态配置校验并占用 listener，再进行 storage open/recovery。这个顺序使无法取得服务地址的进程不会初始化一份新的持久 store。local store 查询一次组合状态，Azure 查询对象、维护与锁状态；启动行报告 ready、recovering 或 unavailable 及安全计数，不打印能力身份。服务已开始监听不表示恢复屏障已经结束，也不是 Azure 远端对象可达性的证明；实际故障由后续操作或状态查询返回。
 
 存储就绪后安装终止与 SIGHUP lifecycle。`serving ... at http://...` 是 READY announcement：这行出现时 storage、listener 与 signal ownership 都已建立；HTTP accept loop 紧接着启动，`startedListener` 使 announcement 与 `Serve` 交接期间到达的终止信号关闭 listener 并等待 server goroutine 退出。READY 之前的失败会关闭已取得的 listener，并在能证明 storage handles 已关闭时释放 storage ownership；pool cleanup 不确定时本地持久形态保留 root lock 到进程退出。cleanup failure 并入命令结果。
 
 收到 SIGINT／SIGTERM 后，外层 admission gate 先拒绝新请求，handler 向每条 change stream 发 server-stopping frame，并给在途请求 5 秒完成。deadline 到期时关闭连接，但仍等待已经进入 application handler 的调用离开，随后停止并等待后台 maintenance 与 checkpoint worker。local store 再建立独立的 5 秒 close context，用它等待 commit gate 与完整 WAL checkpoint；active reader 立即使本轮关闭返回 `EBUSY`，pool `Close` 本身不接受该 context。reader pools 已关闭后的 checkpoint busy/failure/cancellation 保留 writer/WAL 并可重试；任一 pool close error 是 terminal result，锁保留到进程退出。只有所有 pools 无错误关闭后才释放 object-store lifetime lock，关闭各层的错误合并为命令结果。
 
-SIGHUP 不经过网络控制面，它请求的工作在一个 command-owned goroutine 中运行，同一时刻至多一项。quota-limited 普通目录用启动时同一组 directory/frontier bounds 重新遍历 namespace；只有完整成功才替换可能漂移的计数，超限、取消或读取失败都会报告 recount failure 并保留原计数，服务继续运行。无配额目录说明没有可重数的 allowance。目录随后查询锁状态；两个 metastore-backed 形态将锁状态并入组合报告，均不输出能力身份。recount 自身没有 deadline，但不占住 signal loop；SIGINT／SIGTERM 先关闭 HTTP admission 并向 recount 发送取消，再关闭 listener、排空 handler，最后等待 recount 离开。已经进入的不可取消 filesystem syscall 仍可延迟进程退出，但不会让 HTTP 继续接受新请求。
+SIGHUP 不经过网络控制面，只执行带两秒 context deadline 的状态查询；一个 command-owned goroutine 同一时刻至多处理一项。SIGINT／SIGTERM 取消并等待它，已经进入的不可取消 syscall 仍须返回。
 
-两个 metastore-backed 形态执行带 2 秒 context deadline 的只读 status：它们都分别报 reserved、unresolved 与 garbage backlog、pending thresholds、SQLite ordinary/event-reader 与 snapshot-reader connection 上限、integrity record/name-byte work 上限、effective sweep interval/batch 与最近 maintenance outcome；local store 另外报逻辑/物理空间、store UUID、waiting/active resource、recovery records，以及 checkpoint 的 accepted/checkpointed generation 与 pending。SIGINT／SIGTERM 取消并等待它；已经进入的不可取消 syscall 仍须返回。checkpoint error 或任一 component 查询失败时只报告 status failure，不打印部分数字。
+两种形态都分别报告 reserved、unresolved 与 garbage backlog、pending thresholds、SQLite ordinary/event-reader 与 snapshot-reader connection 上限、integrity record/name-byte work 上限、effective sweep interval/batch 与最近 maintenance outcome；local store 另外报逻辑/物理空间、store UUID、waiting/active resource、recovery records，以及 checkpoint 的 accepted/checkpointed generation 与 pending。SIGINT／SIGTERM 取消并等待它；已经进入的不可取消 syscall 仍须返回。checkpoint error 或任一 component 查询失败时只报告 status failure，不打印部分数字。

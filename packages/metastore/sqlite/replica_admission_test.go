@@ -16,14 +16,21 @@ import (
 
 func seededAdmissionReplica(t *testing.T) *Replica {
 	t.Helper()
+	return seedAdmissionReplica(t, func(err error) {
+		if err != nil {
+			t.Errorf("closing replica: %v", err)
+		}
+	})
+}
+
+func seedAdmissionReplica(t *testing.T, checkClose func(error)) *Replica {
+	t.Helper()
 	replica, err := OpenReplica(t.Context(), filepath.Join(t.TempDir(), "replica.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := replica.Close(); err != nil {
-			t.Errorf("closing replica: %v", err)
-		}
+		checkClose(replica.Close())
 	})
 	seeding, err := replica.Reseed(t.Context())
 	if err != nil {
@@ -228,7 +235,26 @@ func TestReplicaReadersCancelBehindSeeding(t *testing.T) {
 func TestReplicaSeedingPublishesTreeAndPositionTogether(t *testing.T) {
 	for _, outcome := range []string{"complete", "rollback", "invalid row", "invalid completion"} {
 		t.Run(outcome, func(t *testing.T) {
-			replica := seededAdmissionReplica(t)
+			var commitFailure *uncertainCommitError
+			var replica *Replica
+			replica = seedAdmissionReplica(t, func(err error) {
+				if commitFailure == nil {
+					if err != nil {
+						t.Errorf("closing replica: %v", err)
+					}
+					return
+				}
+				if storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, commitFailure) {
+					t.Errorf("closing failed seeding returned %v, want its original COMMIT failure", err)
+				}
+				if again := replica.Close(); again != err {
+					t.Errorf("repeated replica Close returned %v, want the cached result %v", again, err)
+				}
+				if !replica.store.Terminal() || replica.store.write.Stats().OpenConnections != 0 ||
+					replica.store.read.Stats().OpenConnections != 0 || replica.store.snapshotRead.Stats().OpenConnections != 0 {
+					t.Error("replica Close retained SQL pools after reporting the COMMIT failure")
+				}
+			})
 			seeding, err := replica.Reseed(t.Context())
 			if err != nil {
 				t.Fatal(err)
@@ -277,7 +303,7 @@ func TestReplicaSeedingPublishesTreeAndPositionTogether(t *testing.T) {
 				if err := seeding.Add(t.Context(), rows); err != nil {
 					t.Fatal(err)
 				}
-				if err := seeding.Complete(t.Context(), 2); !errors.Is(err, syscall.EIO) {
+				if err := seeding.Complete(t.Context(), 2); !errors.Is(err, syscall.EIO) || !errors.As(err, &commitFailure) {
 					t.Fatalf("unresolved parent returned %v", err)
 				}
 			}
@@ -291,7 +317,7 @@ func TestReplicaSeedingPublishesTreeAndPositionTogether(t *testing.T) {
 			at := receiveReplica(t, position)
 			requireReplicaGateIdle(t, &replica.admission)
 			if outcome == "invalid completion" {
-				if !errors.Is(got.err, syscall.EIO) || got.children != nil || at != 1 || got.position != 1 {
+				if !errors.Is(got.err, syscall.EIO) || !errors.Is(got.err, commitFailure) || got.children != nil || at != 1 || got.position != 1 {
 					t.Fatalf("uncertain commit exposed a tree or advanced position: %+v, Position=%d", got, at)
 				}
 				return

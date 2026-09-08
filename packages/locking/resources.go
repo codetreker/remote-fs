@@ -2,6 +2,7 @@ package locking
 
 import (
 	"context"
+	"slices"
 	"time"
 )
 
@@ -107,7 +108,7 @@ func (a *Authority) finishLocked(action *actionRecord, outcome ActionOutcome, co
 		queue := action.resource.queue
 		for i, v := range queue {
 			if v == action {
-				action.resource.queue = append(queue[:i], queue[i+1:]...)
+				action.resource.queue = slices.Delete(queue, i, i+1)
 				break
 			}
 		}
@@ -119,8 +120,17 @@ func (a *Authority) finishLocked(action *actionRecord, outcome ActionOutcome, co
 	}
 }
 
+func (a *Authority) expireQueuedLocked(r *resourceRecord, now time.Time) {
+	for i := len(r.queue) - 1; i >= 0; i-- {
+		action := r.queue[i]
+		if !now.Before(action.waitUntil) {
+			a.finishLocked(action, TimedOut, "")
+		}
+	}
+}
+
 func (a *Authority) startWorkerLocked(r *resourceRecord) {
-	if r.worker || len(r.queue) == 0 || a.closed {
+	if r.worker || len(r.queue) == 0 || a.closed || a.fenced != nil {
 		return
 	}
 	r.worker = true
@@ -139,11 +149,7 @@ func (a *Authority) runResource(r *resourceRecord) {
 		}
 		now := a.clock.Now()
 		a.expireGrantsLocked(r, now)
-		for _, action := range append([]*actionRecord(nil), r.queue...) {
-			if !now.Before(action.waitUntil) {
-				a.finishLocked(action, TimedOut, "")
-			}
-		}
+		a.expireQueuedLocked(r, now)
 		if len(r.queue) == 0 {
 			a.mu.Unlock()
 			return
@@ -239,6 +245,7 @@ func (a *Authority) maintain() {
 		var forgotten []*resourceRecord
 		for _, r := range a.resources {
 			a.expireGrantsLocked(r, now)
+			a.expireQueuedLocked(r, now)
 			a.startWorkerLocked(r)
 			if r.referenceUntil.After(now) && r.referenceUntil.Before(next) {
 				next = r.referenceUntil
@@ -246,6 +253,11 @@ func (a *Authority) maintain() {
 			for _, g := range r.grants {
 				if g.deadline.After(now) && g.deadline.Before(next) {
 					next = g.deadline
+				}
+			}
+			for _, action := range r.queue {
+				if action.waitUntil.Before(next) {
+					next = action.waitUntil
 				}
 			}
 			if !r.forgetting && !now.Before(r.referenceUntil) && len(r.grants) == 0 && len(r.queue) == 0 && !r.busy && !r.worker && r.holds == 0 {

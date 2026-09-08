@@ -7,9 +7,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -22,7 +20,7 @@ import (
 )
 
 func TestServerBinariesEnforceFileLocks(t *testing.T) {
-	for _, mode := range []string{"directory", "quota-directory", "local-store", "azure-blob"} {
+	for _, mode := range []string{"local-store", "azure-blob"} {
 		t.Run(mode, func(t *testing.T) {
 			args := binaryLockNamespace(t, mode)
 			server := startServerBinary(t, append(args, "-initialize-lock-state")...)
@@ -92,7 +90,7 @@ func TestServerBinariesEnforceFileLocks(t *testing.T) {
 }
 
 func TestServerBinaryPreservesLeaseProtectionAcrossRestart(t *testing.T) {
-	for _, mode := range []string{"directory", "quota-directory", "local-store", "azure-blob"} {
+	for _, mode := range []string{"local-store", "azure-blob"} {
 		t.Run(mode, func(t *testing.T) {
 			args := binaryLockNamespace(t, mode)
 			first := startServerBinary(t, append(args, "-initialize-lock-state", "-lock-max-lease", "3s")...)
@@ -148,83 +146,10 @@ func TestServerBinaryPreservesLeaseProtectionAcrossRestart(t *testing.T) {
 	}
 }
 
-func TestDirectoryServerBinaryRefusesAlternateLockState(t *testing.T) {
-	directory, stateRoot := t.TempDir(), privateDirectory(t)
-	first := startServerBinary(t,
-		"-listen", "127.0.0.1:0", "-dir", directory,
-		"-lock-state-root", stateRoot, "-initialize-lock-state")
-	first.interrupt(t)
-	if err := first.wait(t); err != nil {
-		t.Fatalf("stop initialized directory server: %v", err)
-	}
-	copied := privateDirectory(t)
-	if err := os.CopyFS(copied, os.DirFS(stateRoot)); err != nil {
-		t.Fatalf("copy lock state fixture: %v", err)
-	}
-	// CopyFS creates writable files; preserve native modes so this reaches binding validation.
-	if err := filepath.WalkDir(stateRoot, func(name string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		relative, err := filepath.Rel(stateRoot, name)
-		if err != nil {
-			return err
-		}
-		return os.Chmod(filepath.Join(copied, relative), info.Mode().Perm())
-	}); err != nil {
-		t.Fatalf("preserve copied state permissions: %v", err)
-	}
-	for _, attempt := range []struct {
-		name string
-		args []string
-	}{
-		{"missing state root", nil},
-		{"reinitialize ready state", []string{"-lock-state-root", stateRoot, "-initialize-lock-state"}},
-		{"fresh state root", []string{"-lock-state-root", privateDirectory(t)}},
-		{"fresh initialization", []string{"-lock-state-root", privateDirectory(t), "-initialize-lock-state"}},
-		{"copied state root", []string{"-lock-state-root", copied}},
-		{"copied initialization", []string{"-lock-state-root", copied, "-initialize-lock-state"}},
-	} {
-		t.Run(attempt.name, func(t *testing.T) {
-			args := append([]string{"-listen", "127.0.0.1:0", "-dir", directory}, attempt.args...)
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-			defer cancel()
-			output, err := exec.CommandContext(ctx, serverBinary(t), args...).CombinedOutput()
-			if ctx.Err() != nil {
-				t.Fatalf("alternate lock state did not fail promptly: %v", ctx.Err())
-			}
-			var exit *exec.ExitError
-			if !errors.As(err, &exit) {
-				t.Fatalf("alternate lock state returned %v, want unsuccessful process exit", err)
-			}
-			if strings.Contains(string(output), "serving") || strings.Contains(string(output), "panic:") {
-				t.Fatalf("alternate lock state reached serving or crashed: %s", output)
-			}
-			if !strings.Contains(string(output), "lock") {
-				t.Fatalf("alternate lock state failed without identifying lock state: %s", output)
-			}
-		})
-	}
-	reopened := startServerBinary(t,
-		"-listen", "127.0.0.1:0", "-dir", directory, "-lock-state-root", stateRoot)
-	if err := dialLockServer(t, reopened).Write(t.Context(), "artifact", []byte("original state")); err != nil {
-		t.Fatalf("reopen original lock state after rejected alternatives: %v", err)
-	}
-}
-
 func binaryLockNamespace(t *testing.T, mode string) []string {
 	t.Helper()
 	args := []string{"-listen", "127.0.0.1:0"}
 	switch mode {
-	case "directory", "quota-directory":
-		args = append(args, "-dir", t.TempDir(), "-lock-state-root", privateDirectory(t))
-		if mode == "quota-directory" {
-			args = append(args, "-quota", "64K")
-		}
 	case "local-store":
 		args = append(args, "-local-store", privateDirectory(t), "-workspace", "locks", "-quota", "8M")
 	case "azure-blob":

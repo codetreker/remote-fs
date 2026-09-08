@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"math"
 	"os"
@@ -15,16 +16,16 @@ import (
 
 func TestLockDefaultsAndExplicitInitializationReachConfiguration(t *testing.T) {
 	config, help, err := parseConfig([]string{
-		"-listen", "127.0.0.1:0", "-dir", "/namespace", "-lock-state-root", "/state", "-initialize-lock-state",
+		"-listen", "127.0.0.1:0", "-local-store", "/store", "-workspace", "workspace", "-quota", "8M", "-initialize-lock-state",
 	}, io.Discard)
 	if err != nil || help {
-		t.Fatalf("parse directory locks: help=%t err=%v", help, err)
+		t.Fatalf("parse local-store locks: help=%t err=%v", help, err)
 	}
-	if config.locks != locking.DefaultOptions() || config.lockStateRoot != "/state" || !config.initializeLockState {
-		t.Fatalf("lock configuration is %+v, state=%q initialize=%t", config.locks, config.lockStateRoot, config.initializeLockState)
+	if config.locks != locking.DefaultOptions() || !config.initializeLockState {
+		t.Fatalf("lock configuration is %+v, initialize=%t", config.locks, config.initializeLockState)
 	}
 	openedConfig, _, err := parseConfig([]string{
-		"-listen", "127.0.0.1:0", "-dir", "/namespace", "-lock-state-root", "/state",
+		"-listen", "127.0.0.1:0", "-local-store", "/store", "-workspace", "workspace", "-quota", "8M",
 	}, io.Discard)
 	if err != nil || openedConfig.initializeLockState {
 		t.Fatalf("ordinary startup permits initialization: config=%+v err=%v", openedConfig, err)
@@ -33,7 +34,7 @@ func TestLockDefaultsAndExplicitInitializationReachConfiguration(t *testing.T) {
 
 func TestLockCapacityAndLifetimeFlagsReachAuthorityOptions(t *testing.T) {
 	config, _, err := parseConfig([]string{
-		"-listen", "127.0.0.1:0", "-dir", "/namespace", "-lock-state-root", "/state",
+		"-listen", "127.0.0.1:0", "-local-store", "/store", "-workspace", "workspace", "-quota", "8M",
 		"-lock-max-sessions", "11", "-lock-max-tickets", "13", "-lock-max-owners", "17",
 		"-lock-max-resources", "19", "-lock-max-actions", "23", "-lock-max-grants", "29", "-lock-max-queued", "31",
 		"-lock-owners-per-session", "3", "-lock-owner-actions-per-session", "5", "-lock-actions-per-owner", "7",
@@ -41,6 +42,7 @@ func TestLockCapacityAndLifetimeFlagsReachAuthorityOptions(t *testing.T) {
 		"-lock-max-proofs", "8", "-lock-max-request-bytes", "37",
 		"-lock-max-lease", "2s", "-lock-max-wait", "3s", "-lock-ticket-ttl", "4s",
 		"-lock-session-idle", "5s", "-lock-resource-ttl", "6s",
+		"-http-max-concurrent-lock-controls", "17", "-http-max-waiting-lock-controls", "19",
 	}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
@@ -54,6 +56,9 @@ func TestLockCapacityAndLifetimeFlagsReachAuthorityOptions(t *testing.T) {
 	}
 	if config.locks != want {
 		t.Fatalf("authority options %+v, want %+v", config.locks, want)
+	}
+	if config.http.MaxConcurrentLockControls != 17 || config.http.MaxWaitingLockControls != 19 {
+		t.Fatalf("HTTP lock admission is %d active/%d waiting", config.http.MaxConcurrentLockControls, config.http.MaxWaitingLockControls)
 	}
 }
 
@@ -69,17 +74,18 @@ func TestInvalidLockConfigurationDoesNotAcquireListenerOrInitializeState(t *test
 		{"lock-max-resources", strconv.Itoa(math.MaxInt)},
 		{"lock-max-lease", "0s"}, {"lock-max-wait", "1ns"}, {"lock-ticket-ttl", "-1s"},
 		{"lock-resource-ttl", "0s"}, {"lock-session-idle", "1s"},
+		{"http-max-concurrent-lock-controls", "0"}, {"http-max-waiting-lock-controls", "-1"},
 	} {
 		t.Run(test.name+"="+test.value, func(t *testing.T) {
-			root, state := t.TempDir(), t.TempDir()
+			root := t.TempDir()
 			err := run([]string{
-				"-listen", "invalid-address", "-dir", root, "-lock-state-root", state, "-initialize-lock-state",
+				"-listen", "invalid-address", "-local-store", root, "-workspace", "workspace", "-quota", "8M", "-initialize-lock-state",
 				"-" + test.name, test.value,
 			}, io.Discard)
 			if err == nil || !strings.Contains(err.Error(), "-"+test.name) {
 				t.Fatalf("invalid lock option reached startup: %v", err)
 			}
-			for _, directory := range []string{root, state} {
+			for _, directory := range []string{root} {
 				entries, readErr := os.ReadDir(directory)
 				if readErr != nil {
 					t.Fatal(readErr)
@@ -92,16 +98,27 @@ func TestInvalidLockConfigurationDoesNotAcquireListenerOrInitializeState(t *test
 	}
 }
 
-func TestLockStateRootRequiresDirectorySource(t *testing.T) {
-	for _, args := range [][]string{
-		{"-dir", "/namespace"},
-		{"-local-store", "/store", "-workspace", "workspace", "-quota", "8M", "-lock-state-root", "/state"},
-		{"-blob-container", "container", "-metastore", "/meta", "-workspace", "workspace", "-lock-state-root", "/state"},
+func TestUnsupportedNamespaceFlagsFailBeforeInitialization(t *testing.T) {
+	for _, name := range []string{
+		"dir", "lock-state-root", "dir-max-operations", "dir-max-waiters", "dir-max-pinned-targets",
+		"dir-max-snapshot-entries", "dir-max-recovery-entries", "dir-max-path-bytes",
+		"dir-max-staging-bytes", "dir-max-snapshot-bytes", "quota-max-directory-bytes", "quota-max-frontier-bytes",
 	} {
-		_, _, err := parseConfig(append([]string{"-listen", "127.0.0.1:0"}, args...), io.Discard)
-		if err == nil || !strings.Contains(err.Error(), "-lock-state-root") {
-			t.Fatalf("invalid state configuration returned %v", err)
-		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			var output bytes.Buffer
+			err := run([]string{
+				"-listen", "invalid-address", "-local-store", root, "-workspace", "workspace", "-quota", "8M",
+				"-initialize-lock-state", "-" + name, "1",
+			}, &output)
+			if !errors.Is(err, errUsage) || !strings.Contains(output.String(), "flag provided but not defined: -"+name) {
+				t.Fatalf("unsupported %s returned %v: %s", name, err, output.String())
+			}
+			entries, readErr := os.ReadDir(root)
+			if readErr != nil || len(entries) != 0 {
+				t.Fatalf("unsupported option changed storage: entries=%d err=%v", len(entries), readErr)
+			}
+		})
 	}
 }
 
@@ -111,7 +128,7 @@ func TestLockHelpExplainsExplicitInitializationAndRecovery(t *testing.T) {
 	if err != nil || !help {
 		t.Fatalf("help=%t err=%v", help, err)
 	}
-	for _, phrase := range []string{"-lock-state-root", "-initialize-lock-state", "-lock-max-lease", "same mount", "restart recovery", "existing state", "enrollment"} {
+	for _, phrase := range []string{"-initialize-lock-state", "-lock-max-lease", "restart recovery", "existing state", "enrollment"} {
 		if !strings.Contains(strings.ToLower(output.String()), strings.ToLower(phrase)) {
 			t.Fatalf("help omits %q: %s", phrase, output.String())
 		}

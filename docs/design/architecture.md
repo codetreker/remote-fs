@@ -137,7 +137,7 @@ server 每个 workspace 记一条有序的变更日志，位置与树的改动�
 
 于是跨机器的可见性不依赖轮询：一台机器上的提交完成之后，那条变更走事件流到达另一台机器，`stat` 就看得到（R-CON-1、R-CON-2）。对 metastore-backed namespace，成功的 mutation response 携带一次原子读取的 `(incarnation, committed position)` barrier；replicated client 等到同一代副本的位置不小于它才返回。barrier 可以因并发提交而晚于本次 mutation，但不早于它，因此写完立刻 `stat` 得到的是至少包含这次修改的大小与时间（R-CON-4）。
 
-**绕过 server 的改动不产生变更事件。** `localdir` 没有元数据副本，后续请求仍会直接观察到宿主目录的改动；套了 `limited` 时，这类旁路改动会使配额账本漂移。本地持久对象存储不支持旁路修改其私有格式；无法验证的对象或组合状态以 I/O 错误暴露。
+**绕过 server 的改动不产生变更事件。** 保留的本地持久对象存储不支持旁路修改其私有格式；无法验证的对象或组合状态以 I/O 错误暴露。第三方 backend 同样须明确自己的外部写入边界，不能让旁路改动冒充已记录的 namespace mutation。
 
 本地另外持有的两样东西不是命名空间的副本：
 
@@ -146,7 +146,7 @@ server 每个 workspace 记一条有序的变更日志，位置与树的改动�
 
 三样都见 `client/architecture.md`；这个决定的全部理由与被否的备选见[元数据复制](../../.agents/notes/implemented/architecture/2026-08-27-metadata-replication.md)。
 
-代价：挂载在副本建好之前不可用，不记变更日志的命名空间（`localdir` 后端）没有副本，它的每一次 `ls`、每一次 `stat` 仍然是一次 HTTP 往返。
+代价：提供 change log 的命名空间在副本建好之前不可用。集成方未提供日志时，复制操作以 `ENOSYS` 说明没有副本，每次 metadata 查询仍是一次远端请求；随附的两种服务端形态都提供日志。
 
 ### 读
 
@@ -187,12 +187,12 @@ remote-fs ──▶ 建立 remote storage，先访问一次根，确认 server �
 
 | 角色 | 作为库嵌入 | 作为独立二进制 |
 |---|---|---|
-| server | `packages/transport/httprest` 提供一个 `http.Handler`，链接进集成方既有的 server | `cmd/remote-fs-server`：服务普通目录、Azure Blob + SQLite，或同一私有目录中的本地对象 + SQLite |
+| server | `packages/transport/httprest` 提供一个 `http.Handler`，链接进集成方既有的 server | `cmd/remote-fs-server`：服务 Azure Blob + SQLite，或同一私有目录中的本地对象 + SQLite |
 | client | `packages/transport/httprest` 与 `packages/fuse` 链接进集成方既有的 daemon service | `cmd/remote-fs`：把一个 server 的命名空间挂到本地目录 |
 
 client 侧还有第三种用法：只使用 remote storage，不挂载（R-INT-5）。这条路径不依赖 FUSE，因此不受 Linux 限制。
 
-独立二进制的进程与挂载生命周期通过本机信号管理。一个 `remote-fs` 进程就是一个挂载点，卸载靠向它发信号；独立 server 用信号停止、重数普通目录配额或查询存储与锁状态，见 [`server/architecture.md`](server/architecture.md)。文件占有另有跨角色的网络控制接口，不承担进程管理。作为 package 使用时，调用方直接使用所组合 storage 的状态 API。
+独立二进制的进程与挂载生命周期通过本机信号管理。一个 `remote-fs` 进程就是一个挂载点，卸载靠向它发信号；独立 server 用信号停止或查询存储与锁状态，见 [`server/architecture.md`](server/architecture.md)。文件占有另有跨角色的网络控制接口，不承担进程管理。作为 package 使用时，调用方直接使用所组合 storage 的状态 API。
 
 两个角色之间没有身份认证系统，enrollment 与数据端点的访问由部署方保护。锁能力校验保证已授予保护约束所有修改，不区分调用方是否主动携带 proof；它不限制普通读取，也不替部署方建立用户权限，因此服务仍须位于可信访问边界内。
 
@@ -221,7 +221,6 @@ packages/                    可被外部与自身 import
   storage/                   接口定义、实现者义务与 errno 词汇（两个角色共用）
     locked/                  enforcing backend 与其授权方的配对，提供不可变 scope
     lockcontract/            文件保护义务的共享验收
-    localdir/                本地目录实现
     localstore/              把本地对象、SQLite、外部提交见证、锁与恢复组合成一份 storage
     objectstore/             对象存储实现：字节在对象存储里，树在 metastore 里
       azblob/                Azure Blob 的对象接口实现
@@ -249,7 +248,6 @@ docs/
 |---|---|
 | `storage` | 两个角色共用 |
 | `storage/storagetest` | 测试专用：namespace 与 bounded-server 契约的可执行形式 |
-| `storage/localdir` | server 侧（也用于挂载层不经网络的验证路径） |
 | `storage/localstore` | server 侧，持有本地对象与绑定的 SQLite metastore |
 | `storage/objectstore`、`storage/objectstore/azblob`、`storage/objectstore/localdisk` | server 侧 |
 | `storage/objectstore/objectstoretest` | 测试专用：object-store 字节接口的可执行契约 |
@@ -261,7 +259,7 @@ docs/
 
 这些拆分各自守住一条依赖或 ownership 边界：`storage` 与实现分开，使第三方实现自有存储时只需引入接口（R-INT-6）；配额自成 `storage/limited`，因为它是一层包装而不是某一个实现的性质（R-WS-5、R-INT-3）；`metastore` 与 `storage/objectstore` 分开，因为名字树不持有文件字节，而对象接口不认识路径；`storage/localstore` 负责把两个 durable half、WAL 外部见证、store identity、初始化与 lifetime lock 组合成一个资源，避免这些规则散落在二进制里；契约用例分别属于 `storage/storagetest`、`objectstore/objectstoretest` 与 `metastore/metastoretest`；每种传输自成 `transport/` 下的一个包（R-INT-9、R-INT-10）；`fuse` 与传输分开，使得不挂载的使用者不被 FUSE 与平台限制绑住（R-INT-5、R-INT-8）。
 
-带依赖的实现各自成包，使依赖跟着选择走：`localdir` 不链接 Azure SDK 或 SQLite；`localdisk` 不链接 Azure SDK；`localstore` 明确选择 SQLite 与本地对象格式；`azblob` 才选择 Azure SDK。
+带依赖的实现各自成包，使依赖跟着选择走：`localdisk` 不链接 Azure SDK；`localstore` 明确选择 SQLite 与本地对象格式；`azblob` 才选择 Azure SDK。随附实现的范围由[移除宿主目录后端](../../.agents/notes/implemented/simplification/2026-09-08-remove-the-host-directory-backend.md)记录，第三方存储仍通过同一契约接入。
 
 errno 词汇归 `storage` 而非某一种传输：一个实现可以报出哪些错误，是契约的性质。若它留在某一种传输里，第二种传输要么抄一份而后各自漂移，要么去 import 第一种。
 

@@ -54,9 +54,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// The modes a node is made with, matching what localdir's Create and Mkdir give a new file
-// and a new directory. A namespace held in a database and one held in a directory should
-// not disagree about what `touch` and `mkdir` produce.
+// Namespace creation modes are independent of the host process's umask.
 const (
 	fileMode fs.FileMode = 0o644
 	dirMode  fs.FileMode = 0o755
@@ -639,6 +637,14 @@ func (s *Store) CloseContext(ctx context.Context) error {
 		if err := s.releasePersistentWAL(ctx, s.write); err != nil {
 			return fmt.Errorf("releasing persistent SQLite WAL after witnessed checkpoint: %w", err)
 		}
+	} else {
+		// Metadata cleanup can fail after authority retirement while Close waits for the gate.
+		// Recheck after that drain before a successful pool close releases native ownership.
+		s.coordinator.health.RLock()
+		if s.coordinator.poison != nil {
+			lockErr = errors.Join(lockErr, s.coordinator.healthErrorLocked())
+		}
+		s.coordinator.health.RUnlock()
 	}
 	if s.witness != nil {
 		s.closeErr = poolCloseError("writer pool", s.closePool(s.write))
@@ -747,7 +753,11 @@ func (s *Store) mutate(ctx context.Context, f func(tx *sql.Tx) error) error {
 	return s.mutatePublication(ctx, nil, f)
 }
 
-func (s *Store) mutatePublication(ctx context.Context, intent *namespaceIntent, f func(tx *sql.Tx) error) (returnErr error) {
+func (s *Store) mutatePublication(ctx context.Context, intent *namespaceIntent, f func(tx *sql.Tx) error) error {
+	return s.mutateTransaction(ctx, ctx, intent, f)
+}
+
+func (s *Store) mutateTransaction(ctx, transactionContext context.Context, intent *namespaceIntent, f func(tx *sql.Tx) error) (returnErr error) {
 	if err := s.coordinator.commit.acquire(ctx); err != nil {
 		return err
 	}
@@ -755,7 +765,7 @@ func (s *Store) mutatePublication(ctx context.Context, intent *namespaceIntent, 
 	if err := s.coordinator.healthy(); err != nil {
 		return err
 	}
-	tx, err := s.write.BeginTx(ctx, nil)
+	tx, err := s.write.BeginTx(transactionContext, nil)
 	if err != nil {
 		return failure(err)
 	}

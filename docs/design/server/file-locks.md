@@ -26,7 +26,7 @@ Session、Owner 与 Grant 是不可伪造的 bearer capability，使用至少 12
 
 `Scope(MutationScope)` 构造一份有界、不可随调用方后续修改而变化的 proof 集合，只向修改操作携带 Owner 与明确给出的 GrantRef。`Read`、`Stat`、`List` 仍是普通读取，成功不证明某项 grant 仍然有效；需要了解占有状态的调用方使用控制查询。
 
-只有现有普通文件可以被 Resolve 和 Acquire。目录、子树与不存在的目录项作为锁目标时明确拒绝；普通目录还要求目标是 single-link 文件。ResourceRef 有明确的有限有效期，过期后拒绝使用，不转而绑定新文件。Resolve 只是发现，Acquire 在授予转换处重新确认同一个资源仍存在且类型受支持。
+只有现有普通文件可以被 Resolve 和 Acquire。目录、子树与不存在的目录项作为锁目标时明确拒绝。ResourceRef 有明确的有限有效期，过期后拒绝使用，不转而绑定新文件。Resolve 只是发现，Acquire 在授予转换处重新确认同一个资源仍存在且类型受支持。
 
 文件改名后，授权仍约束原文件的逻辑身份；同名替换不会使授权转移到新节点。目录改名不会把后代的文件授权提升为路径锁或子树锁。
 
@@ -66,6 +66,8 @@ Renew 使用 `max(原 deadline, 转换时刻 + 请求 TTL)`，不缩短已确认
 
 一份 Acquire 的排队意图最多存活其声明的有限 Wait。立即授予、拒绝或完成排队登记后，HTTP 请求就返回；Pending 不占用长期 HTTP 控制名额。请求结束与动作终止是不同事件，丢失响应不会自动产生另一个申请，也不自动取消原申请。调用方用原 Request 执行 Cancel 或 Query，SDK 不自动轮询或启动等待 goroutine。一名 Owner 在一个资源上至多持有一个当前 grant，另一个 Acquire 返回 `AlreadyHeld`；没有隐式升级、降级或递归计数。
 
+排队记录移除时同时清空 backing slice 不再使用的引用，队列不能在逻辑长度之外继续固定已经结束的动作与 Owner；仍有效的动作历史按自身规则保留。授权方被隔离后不再启动或重新进入资源 worker，已有 worker 退出；维护循环继续按尚存 Pending 的各自 Wait 期限清理排队状态。停止 worker 不虚构新的授予或拒绝，也不让有界等待变成无限保留；对外查询继续遵守既有不可用错误语义。
+
 ## 修改覆盖与冲突
 
 `S` 与 `S` 相容；`X` 与其他 Owner 的任何 grant 不相容。Owner 自己持有的 `S` 也不是修改许可。普通快照读取不受 `X` 访问控制；显式 `SetAttr` 修改支持的 mode、访问时间或修改时间属于受保护的修改。普通读取可能产生的平台 atime 副作用不构成稳定 atime 的承诺；`S` 的稳定保证覆盖内容、存在性与逻辑身份。
@@ -81,7 +83,7 @@ Renew 使用 `max(原 deadline, 转换时刻 + 请求 TTL)`，不缩短已确认
 
 ## 发布与观察的排序
 
-上传、暂存和最终发布是分开的阶段。对象存储的 Reserve 与不可变对象 Put 不持有文件发布许可；SQLite 在修改 entries/nodes 的事务内解析实际目标。普通目录先把内容写入临时 inode，再进入原子改名的最终转换。删除、改名与属性修改也进入各自原生后端的同一检查入口；`limited` 将 scope 和发布能力传到下层。
+上传、暂存和最终发布是分开的阶段。对象存储的 Reserve 与不可变对象 Put 不持有文件发布许可；SQLite 在修改 entries/nodes 的事务内解析实际目标。删除、改名与属性修改进入同一原生发布检查入口；`limited` 将 scope 和发布能力传到下层。第三方 backend 也必须在实际最终转换中确定资源与效果，不能由包装层提前推断。
 
 暂存完成且实际受影响资源已经确定后，最终转换在后端的观察排序门内检查权限、proof 相关性、冲突与单调期限，并在该位置取得授权顺序。过期后尚未取得许可的修改失败，即使没有继任持有者。文件资源解析与最终变更不能分成一次先验 `Stat` 和之后不受约束的操作。
 
@@ -91,7 +93,7 @@ Renew 使用 `max(原 deadline, 转换时刻 + 请求 TTL)`，不缩短已确认
 
 授予使用同一原生 live-target guard：先在授权状态 mutex 之外发现资源，取得后端目标排序后重新验证存在性、身份与类型，再进入授权状态转换。顺序是 backend 在前、authority mutex 在后；暂存、高水位持久准备与等待其他资源都不持有 authority mutex，回调与生命周期操作也不能反向重入。
 
-SQLite 的新视图捕获包括开始只读事务、钉住 snapshot，以及在其中取得 node / object key，之后释放观察准入再读取大块对象或产出快照页。普通目录 Read 在排序门内取得文件 FD 与属性，Stat 取得固定 metadata；List 必须取得有界的名字与属性快照，目录 FD 本身不是不可变列表。内容读取、调用方计费回调与编码在捕获之后执行。异步副本与内核缓存继续遵守各自的已有契约，不因锁控制而获得新的线性一致性保证。
+SQLite 的新视图捕获包括开始只读事务、钉住 snapshot，以及在其中取得 node / object key，之后释放观察准入再读取大块对象或产出快照页。内容读取、调用方计费回调与编码在捕获之后执行。其它 backend 同样须区分固定视图与随后读取；一个可变化的目录 FD 不构成不可变列表。异步副本与内核缓存继续遵守各自的已有契约，不因锁控制而获得新的线性一致性保证。
 
 该许可不是一段新 lease，不在上传之前取得，也不把任意长的准备工作算作尚未到期的授权。内容版本前置条件仍独立于权限检查。
 
@@ -99,9 +101,7 @@ SQLite 的新视图捕获包括开始只读事务、钉住 snapshot，以及在�
 
 SQLite-backed namespace 使用 workspace 内的节点身份作为原生资源键。覆写内容保留节点身份，改名移动该节点，删除后同名创建得到另一个节点。对外 ResourceID 同时区分授权方，不与内容修订、grant generation 或日志位置互换。
 
-普通目录的宿主 inode 会被回收，原子内容替换也会换一个 inode。backend 因此维护有界的逻辑资源映射：活跃资源固定其底层文件对象，本系统自己的原子替换把同一逻辑资源转到已暂存的新 inode；改名保留源资源，目的地被替换或删除时其旧资源退休。旧 grant 不会转而命中新文件。
-
-映射与底层固定引用均受上限约束。有效 ResourceRef、排队动作、活跃 grant 或发布需要目标时保留原生引用；终态历史可以只保留退休 ResourceID，不继续占用 FD。退休身份不重新分配给别的文件。绕开本系统直接修改被服务的目录仍是规格中的非目标，绑定与占有协议不拦截这种外部文件系统操作。
+授权方资源映射受上限约束。有效 ResourceRef、排队动作、活跃 grant 或发布需要目标时，backend 保留相应的原生引用；终态历史可以只保留退休 ResourceID。退休身份不重新分配给别的文件。第三方 backend 须保持这一映射与实际文件一致，不能直接使用可能被复用的宿主 inode 号充当稳定身份。绕开本系统直接修改其私有存储仍是规格中的非目标。
 
 ## 重启与持久证据
 
@@ -116,7 +116,7 @@ SQLite-backed namespace 使用 workspace 内的节点身份作为原生资源键
 
 Witness 不降低，时长也不按当前配置截短。这两份证据检测任一单独组件的降低或旧状态回放；所有独立证据被一起进行一致的管理员回滚，不在没有外部可信锚的检测承诺内。
 
-新的授权方先取得同一 workspace 的独占写入所有权，再读取并校验该证据。普通目录以取得根目录 flock 的时刻为起点，SQLite-backed 模式以实际取得数据库排他 flock 的时刻为起点；恢复配置从原生拥有者取得该时刻，不采信任意调用方时间戳。使用新的单调时钟等待完整的已记录时长期间，修改与授予被拒绝，普通快照读取及恢复状态查询保持可用。旧进程已由生命周期所有权隔离，旧上传不能借新授权方发布命名空间。这个等待不依赖跨重启的墙钟连续性。
+新的授权方先取得数据库的独占写入所有权，再读取并校验该证据。恢复以实际取得数据库排他 flock 的时刻为起点，配置从原生拥有者取得该时刻，不采信任意调用方时间戳。使用新的单调时钟等待完整的已记录时长期间，修改与授予被拒绝，普通快照读取及恢复状态查询保持可用。旧进程已由生命周期所有权隔离，旧上传不能借新授权方发布命名空间。这个等待不依赖跨重启的墙钟连续性。
 
 恢复之后使用新的授权方身份。旧意图、Owner 与 GrantRef 明确返回 `Retired` 或 `OutcomeUnknown`，不会被解释为未曾授予，也不会重新执行。精确动作回放只在原授权方及其活跃 Owner / Session 的历史窗口内成立；剩余保护通过恢复屏障保留，动作历史不逐条落盘。
 
@@ -126,11 +126,9 @@ Witness 不降低，时长也不按当前配置截短。这两份证据检测任
 
 raw SQLite opener 也先取得同一个原生数据库文件的共享 flock，锁服务 constructor 取得排他 flock。既存 raw handle 仍在时，接管以 `EBUSY` 失败；授权方存活时，新的 raw opener 同样失败。这个互斥覆盖同进程与跨进程，不允许两类写入口并存。ConfigureLeaseRecovery 与 EnableLocks 验证实际的排他拥有者和 native anchor，不能靠注入任意持久化对象把未受保护的 Store 变成授权方。普通 raw 路径可经过符号链接，但检查针对同一底层 inode；数据库路径中的 `%`、`?`、`#` 与 NUL 明确拒绝，避免 native 绑定检查与 SQLite file URI 打开的文件不一致。
 
-本地持久组合沿用其私有根的 lifetime ownership，lease 证据为 `.leases.intent` 与 `.leases.witness`，根 inode 带同名 xattr 绑定。intent 的 READY 状态与独立 checksummed witness 都必须有效；初始化只恢复匹配的持久 intent，缺少 READY 证据不创建新身份。证据目录迁移需要显式迁移过程，不能仅修改路径配置。SQLite 的锁拥有者只有在数据库成功关闭后才释放原生所有权；最终原生 FD 的 Close 失败只尝试一次并缓存结果。
+本地持久组合沿用其私有根的 lifetime ownership，lease 证据为 `.leases.intent` 与 `.leases.witness`，根 inode 带同名 xattr 绑定。intent 的 READY 状态与独立 checksummed witness 都必须有效；初始化只恢复匹配的持久 intent，缺少 READY 证据不创建新身份。证据目录迁移需要显式迁移过程，不能仅修改路径配置。SQLite 的锁拥有者只有在数据库成功关闭后才释放原生所有权；最终原生 FD 的 Close 失败只尝试一次并缓存结果。已启用锁且未配置数据库提交见证的直接 SQLite Store，也在退出授权方并排空 commit gate 后重新检查 coordinator poison；这一期间发生的清理提交失败保留原原因、缓存关闭错误并继续持有排他所有权，不能因 pool 已关闭就报告干净关闭。
 
-普通目录显式使用私有 `StateRoot`，位于被服务树之外并处于当前同一 mount。目录根的 create-only xattr 绑定 workspace、配置的 StateRoot 与 state UUID，独立 Accepted 状态保存在 StateRoot；根目录自身的 lifetime flock 隔离另一写入授权方。`Initialize` 建立绑定，`Open` 只验证已有绑定与 READY 状态，选择复制或不同的状态路径不能重置恢复等待。mount identity 在 Open 时检查，不跨重启持久保存。
-
-服务前验证本地 xattr、flock、同 mount 改名、文件与目录 fsync 能力；不支持的配置明确失败。暂存也放在 StateRoot，namespace 中不出现锁状态或暂存目录项。缺失、损坏、替换或归属不匹配的绑定与 READY 状态不触发自动初始化。部署方须一并保存匹配的 namespace 绑定与 StateRoot，两条路径不被隐式推导成彼此。
+服务前验证本地 xattr、flock、同 mount 改名、文件与目录 fsync 能力，不支持的配置明确失败。缺失、损坏、替换或归属不匹配的绑定与 READY 状态不触发自动初始化。证据和对象的暂存属于各自私有存储格式，不能出现在 workspace 命名空间中。
 
 ## HTTP v3 编码
 
@@ -194,7 +192,7 @@ SDK 以产生这份 GrantStatus 的请求首次发送时刻加 `remainingMillis`
 
 ## 集成与生命周期
 
-独立 server 的普通目录、Azure Blob 与本地持久对象存储三种形态都建立配对的 enforcing namespace 与锁服务，向 HTTP v3 同时发布数据操作、锁管理操作和显式 mutation scope。协议不通过忽略未知 proof、旧授权方身份或非法 scope 保持兼容；无法识别的结果保持错误。
+独立 server 的 Azure Blob 与本地持久对象存储两种形态都建立配对的 enforcing namespace 与锁服务，向 HTTP v3 同时发布数据操作、锁管理操作和显式 mutation scope。协议不通过忽略未知 proof、旧授权方身份或非法 scope 保持兼容；无法识别的结果保持错误。
 
 控制 admission、Session、Owner、grant、等待申请、动作历史及本地资源映射分别有界。授权方动作历史满额时，Release、已知 Acquire 的 Cancel 与 Owner / Session 终止仍有执行路径；控制请求本身继续服从独立的 HTTP admission。TCP 断开不解除已经确认的占有，显式生命周期结束与有限 lease / idle 到期负责释放。
 

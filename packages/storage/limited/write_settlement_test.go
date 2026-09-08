@@ -19,7 +19,7 @@ func TestShrinkingWriteReleasesQuotaOnlyAfterSuccessfulPublication(t *testing.T)
 			name = "failure"
 		}
 		t.Run(name, func(t *testing.T) {
-			backing := openDir(t, t.TempDir())
+			backing := newBacking(t)
 			original := bytes.Repeat([]byte{'a'}, limited.MinLimit)
 			if err := backing.Write(t.Context(), "a", original); err != nil {
 				t.Fatal(err)
@@ -66,7 +66,7 @@ func TestShrinkingWriteReleasesQuotaOnlyAfterSuccessfulPublication(t *testing.T)
 }
 
 func TestFailedGrowthReleasesOnlyItsOwnReservation(t *testing.T) {
-	backing := openDir(t, t.TempDir())
+	backing := newBacking(t)
 	paused := newPausedWrite(backing, "a", syscall.EIO)
 	s := newStorageOver(t, paused, limited.MinLimit)
 	result := startPausedWrite(t, s, paused, t.Context(), content(2048))
@@ -96,7 +96,7 @@ func TestFailedGrowthReleasesOnlyItsOwnReservation(t *testing.T) {
 }
 
 func TestCanceledShrinkRetainsContentAndQuota(t *testing.T) {
-	backing := openDir(t, t.TempDir())
+	backing := newBacking(t)
 	original := bytes.Repeat([]byte{'a'}, limited.MinLimit)
 	if err := backing.Write(t.Context(), "a", original); err != nil {
 		t.Fatal(err)
@@ -132,7 +132,7 @@ func TestEqualSizeWriteDoesNotReserveOrReleaseQuota(t *testing.T) {
 			name = "failure"
 		}
 		t.Run(name, func(t *testing.T) {
-			backing := openDir(t, t.TempDir())
+			backing := newBacking(t)
 			original := bytes.Repeat([]byte{'a'}, limited.MinLimit)
 			if err := backing.Write(t.Context(), "a", original); err != nil {
 				t.Fatal(err)

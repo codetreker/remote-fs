@@ -1,15 +1,5 @@
-// Command remote-fs-server serves one namespace over HTTP, optionally holding it under a
-// byte allowance.
-//
-// It parses a command line, wires packages together, reports failures, and stops when
-// asked. Every behaviour it appears to have belongs to something underneath it: the
-// namespace is packages/storage/localdir or packages/storage/objectstore, the allowance is
-// packages/storage/limited or the metastore's own accounting, the protocol is
-// packages/transport/httprest.
-//
-// R-INT-2 forbids a package from printing, installing signal handlers or exiting the
-// process. This is not a package. Those three things are exactly what a program is for,
-// and keeping them here is how the packages stay free of them.
+// Command remote-fs-server serves a metastore-backed namespace over HTTP.
+// File contents reside in Azure Blob Storage or a private local object store.
 package main
 
 import (
@@ -28,8 +18,6 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/limited"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
 	"github.com/codetreker/remote-fs/packages/storage/localstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/azblob"
@@ -45,12 +33,6 @@ const shutdownGrace = 5 * time.Second
 // path reads SQLite, operation admission and filesystem capacity; none may occupy the
 // signal loop indefinitely when termination is waiting behind it.
 const statusDeadline = 2 * time.Second
-
-// noticeableWalk is how long measuring the namespace has to take before the startup line
-// says how long it took. That walk is the one thing standing between the acquired listener
-// and serving it, so a pause an operator notices is one they are owed the cause of;
-// below this there is nothing to explain.
-const noticeableWalk = 500 * time.Millisecond
 
 func main() {
 	if err := run(os.Args[1:], os.Stderr); err != nil {
@@ -87,9 +69,6 @@ func run(args []string, errOut io.Writer) error {
 			return err
 		}
 		return withOpened(ns, func() error {
-			// The log is what a mount replicates the namespace's metadata from. A namespace with no
-			// metastore behind it has none, and is served with a nil one: its replication endpoints
-			// then answer ENOSYS, and a mount of it goes on making a request for every operation.
 			handler, err := httprest.NewHandlerWithOptions(ns.namespace, ns.log, config.http)
 			if err != nil {
 				return err
@@ -170,47 +149,25 @@ const connectionEnv = "AZURE_STORAGE_CONNECTION_STRING"
 
 // opened is a namespace ready to be served.
 type opened struct {
-	namespace storage.Storage
-
-	// log is the record of what changes in the namespace, and nil for a namespace that keeps
-	// none. Only a namespace held in a metastore has one: the log's positions are allocated
-	// inside the same transaction that changes the tree, so nothing that does not own that
-	// transaction can produce one.
-	log metastore.Log
-
-	// held is the allowance wrapped around the namespace, and nil when the namespace keeps
-	// its own count or is under no allowance at all. Only a count that can drift has
-	// anything for SIGHUP to repair, and only this layer's count can.
-	held *limited.Storage
-
-	// exact marks a namespace that keeps its own count of what it holds. Such a count
-	// cannot drift, so SIGHUP has nothing to repair on it — which is a different answer from
-	// "there is no allowance here at all", and an operator is owed the difference.
-	exact bool
-
-	// what is being served, for the line that says so.
-	what        string
-	allowance   string
-	statusName  string
-	status      func(context.Context) (string, error)
-	close       func() error
-	measurement limited.MeasurementLimits
-	lockStatus  func(context.Context) (locking.Status, error)
+	namespace  storage.Storage
+	log        metastore.Log
+	what       string
+	allowance  string
+	statusName string
+	status     func(context.Context) (string, error)
+	close      func() error
+	lockStatus func(context.Context) (locking.Status, error)
 }
 
 type lockConfig struct {
-	options         locking.Options
-	stateRoot       string
-	initialize      bool
-	directoryLimits localdir.Limits
+	options    locking.Options
+	initialize bool
 }
 
 // open builds the namespace the validated command line selected.
 func open(config commandConfig) (opened, error) {
-	locks := lockConfig{options: config.locks, stateRoot: config.lockStateRoot, initialize: config.initializeLockState, directoryLimits: config.directoryLimits}
+	locks := lockConfig{options: config.locks, initialize: config.initializeLockState}
 	switch {
-	case config.directory != "":
-		return openDirectory(config.directory, config.quota, config.measurement, locks)
 	case config.local.given():
 		return openLocal(
 			config.local, config.quota, config.objectLimits,
@@ -224,52 +181,6 @@ func open(config commandConfig) (opened, error) {
 			config.maxIntegrityRecords, config.maxIntegrityBytes, config.maintenance, locks,
 		)
 	}
-}
-
-// openDirectory owns the directory's lock evidence and optional quota accounting.
-func openDirectory(dir string, quota int64, measurement limited.MeasurementLimits, locks lockConfig) (opened, error) {
-	options := localdir.Config{Root: dir, StateRoot: locks.stateRoot, Locks: locks.options, Limits: locks.directoryLimits}
-	if locks.initialize {
-		if err := localdir.Init(context.Background(), options); err != nil {
-			return opened{}, fmt.Errorf("initializing directory file-lock state: %w", err)
-		}
-	}
-	backing, err := localdir.Open(context.Background(), options)
-	if err != nil {
-		return opened{}, fmt.Errorf("opening directory namespace and file-lock state: %w", err)
-	}
-	result := opened{namespace: backing, what: dir, close: backing.Close}
-	if quota == 0 {
-		return withLockStatus(result, backing.LockService())
-	}
-
-	started := time.Now()
-	effectiveMeasurement, err := measurement.Effective()
-	if err != nil {
-		return opened{}, errors.Join(err, closeAfterOpenFailure("directory", backing.Close()))
-	}
-	held, err := limited.NewWithLimits(context.Background(), backing, quota, effectiveMeasurement)
-	if err != nil {
-		return opened{}, errors.Join(err, closeAfterOpenFailure("directory", backing.Close()))
-	}
-	walk := time.Since(started)
-
-	// Read before anything is served, and a failure here is a failure to start. A namespace
-	// whose room cannot be read cannot be held to an allowance at all: a mount that is given
-	// no figure checks no write against one, so serving anyway would offer a workspace that
-	// claims a limit and enforces none of it.
-	space, err := held.Space(context.Background())
-	if err != nil {
-		return opened{}, errors.Join(err, closeAfterOpenFailure("directory", backing.Close()))
-	}
-	measured := ""
-	if walk >= noticeableWalk {
-		measured = fmt.Sprintf(" (measured in %v)", rounded(walk))
-	}
-	result.namespace, result.held = held, held
-	result.measurement = effectiveMeasurement
-	result.allowance = fmt.Sprintf(" under an allowance of %d bytes, %d of them taken%s,", space.Total, space.Used, measured)
-	return withLockStatus(result, backing.LockService())
 }
 
 func openLocal(
@@ -312,7 +223,6 @@ func openLocal(
 	return withLockStatus(opened{
 		namespace:  store,
 		log:        store.Log(),
-		exact:      true,
 		what:       fmt.Sprintf("%s in local store %s", source.workspace, source.root),
 		allowance:  fmt.Sprintf(" under an allowance of %d bytes, %d of them taken,", status.Space.Total, status.Space.Used),
 		statusName: "local-store",
@@ -445,9 +355,6 @@ func openBlobsContext(
 	if quota == 0 {
 		return withLockStatus(result, namespace.LockService())
 	}
-	// Under an allowance the count is kept as the bytes move, so SIGHUP has nothing to
-	// repair here. Without one there is no count at all and nothing to say that about.
-	result.exact = true
 
 	space, err := namespace.Space(ctx)
 	if err != nil {
@@ -525,7 +432,6 @@ func serveWithGrace(httpServer *drainingServer, listener net.Listener, ns opened
 		stopped <- httpServer.Serve(&startedListener{Listener: listener, started: started})
 	}()
 	statusResults := make(chan statusReport, 1)
-	recountResults := make(chan string, 1)
 	var hangupCancel context.CancelFunc
 	var hangupDone chan struct{}
 	cancelHangup := func() {
@@ -561,17 +467,10 @@ func serveWithGrace(httpServer *drainingServer, listener net.Listener, ns opened
 			if hangupCancel != nil {
 				continue
 			}
-			if ns.status == nil {
-				hangupCancel, hangupDone = startRecount(ns, recountResults)
-			} else {
-				hangupCancel, hangupDone = startStatus(ns, statusDeadline, statusResults)
-			}
+			hangupCancel, hangupDone = startStatus(ns, statusDeadline, statusResults)
 		case report := <-statusResults:
 			finishHangup()
 			writeStatus(report, ns, errOut)
-		case output := <-recountResults:
-			finishHangup()
-			fmt.Fprint(errOut, output)
 		case <-ctx.Done():
 			// Disarmed before shutting down: a second signal from an operator who has decided
 			// not to wait should kill the process the way it normally would.
@@ -587,70 +486,6 @@ func serveWithGrace(httpServer *drainingServer, listener net.Listener, ns opened
 	}
 }
 
-// handleHangup executes the requested operator action synchronously. The server loop gives
-// recount and status their owned goroutines so neither occupies signal handling.
 func handleHangup(ctx context.Context, ns opened, errOut io.Writer) {
-	if ns.status == nil {
-		recount(ctx, ns, errOut)
-		writeLockStatus(ctx, ns, errOut)
-		return
-	}
 	writeStatus(readStatus(ctx, ns), ns, errOut)
-}
-
-// recount measures the served namespace again and replaces the count of what it holds.
-//
-// It is the operator's way back from a count that drifted, which happens when the served
-// directory is modified behind this server's back — an unsupported use, and the only one
-// the count cannot follow. The walk stalls every writer for as long as it runs, which is
-// why it happens when somebody asks for it and never on a schedule.
-//
-// The count before and the count after are both reported. A repair that says nothing
-// leaves the operator with no way to tell whether it was needed, or whether it did
-// anything.
-func recount(ctx context.Context, ns opened, errOut io.Writer) {
-	held := ns.held
-	switch {
-	case held != nil:
-	case ns.exact:
-		fmt.Fprintln(errOut, "remote-fs-server: SIGHUP asks for a recount, and this namespace counts what it holds as it holds it, so there is nothing to repair")
-		return
-	default:
-		fmt.Fprintln(errOut, "remote-fs-server: SIGHUP asks for a recount, and this server holds its namespace under no allowance; -quota gives it one")
-		return
-	}
-
-	// The count as it stands is read first, because a repair that cannot be shown against
-	// what it replaced is one nobody can act on. Failing to read it therefore stops the
-	// walk from happening at all rather than producing a figure with nothing to compare.
-	before, err := held.Space(ctx)
-	if err != nil {
-		fmt.Fprintf(errOut, "remote-fs-server: what the namespace holds cannot be read, so it was not recounted and the count stands: %v\n", err)
-		return
-	}
-	started := time.Now()
-	if err := held.Recount(ctx); err != nil {
-		fmt.Fprintf(errOut, "remote-fs-server: recounting the namespace failed, and the count from before it stands: %v\n", err)
-		return
-	}
-	walk := time.Since(started)
-	after, err := held.Space(ctx)
-	if err != nil {
-		fmt.Fprintf(errOut, "remote-fs-server: the namespace was recounted, and what it now holds cannot be read: %v\n", err)
-		return
-	}
-	fmt.Fprintf(errOut, "remote-fs-server: recounted the namespace in %v: %d bytes taken, where the count said %d; "+
-		"directory listings were limited to %d bytes and the traversal frontier to %d bytes\n",
-		rounded(walk), after.Used, before.Used,
-		ns.measurement.MaxDirectoryBytes, ns.measurement.MaxFrontierBytes)
-}
-
-// rounded trims a measured interval to what is worth reading. Milliseconds are the useful
-// unit for a tree walk, and one that finished inside a millisecond is reported in the unit
-// it took rather than as no time at all.
-func rounded(d time.Duration) time.Duration {
-	if d < time.Millisecond {
-		return d.Round(time.Microsecond)
-	}
-	return d.Round(time.Millisecond)
 }

@@ -11,10 +11,7 @@ import (
 
 func TestFileLockContract(t *testing.T) {
 	lockcontract.Run(t, func(t *testing.T, options locking.Options) lockcontract.Fixture {
-		backend, err := pairedDirectoryWithLocks(t, t.TempDir(), options)
-		if err != nil {
-			t.Fatal(err)
-		}
+		backend := namespaceFixtureWithLocks(t, options)
 		handler, err := httprest.NewHandler(backend, nil)
 		if err != nil {
 			t.Fatal(err)

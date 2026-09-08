@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
 	"reflect"
 	"sync"
 	"syscall"
@@ -336,7 +334,7 @@ func TestAllowanceRejectsLockServiceWithoutNativeAccounting(t *testing.T) {
 }
 
 func TestGenericAllowanceRemainsComposableWithoutNativeCapability(t *testing.T) {
-	backing := &faulty{BoundedStorage: openDir(t, t.TempDir())}
+	backing := &faulty{BoundedStorage: newBacking(t)}
 	inner := newStorageOver(t, backing, limited.MinLimit)
 	outer := newStorageOver(t, inner, limited.MinLimit)
 	if err := outer.CheckPublicationAccounting(); err != syscall.ENOSYS {
@@ -355,11 +353,13 @@ func TestGenericAllowanceRemainsComposableWithoutNativeCapability(t *testing.T) 
 
 type probeLockService struct{ locking.Service }
 
-// The probe injects known and unknown final outcomes while retaining real directory
-// bytes. Its target mutex models the native ordering required by the hook contract.
+// The probe injects final outcomes over a real namespace. Its target mutex models
+// the native ordering required by the hook contract.
 type publicationProbe struct {
 	storage.BoundedStorage
-	root     string
+	// applyCtx excludes the incoming publication hooks: the probe prepares and settles
+	// them once, independently of the underlying namespace's own publication.
+	applyCtx context.Context
 	mu       sync.Mutex
 	stage    func(context.Context, string) error
 	outcome  storage.PublicationResult
@@ -372,8 +372,9 @@ type publicationProbe struct {
 }
 
 func newPublicationProbe(t *testing.T) *publicationProbe {
-	root := t.TempDir()
-	return &publicationProbe{BoundedStorage: openDir(t, root), root: root, outcome: storage.PublicationApplied}
+	return &publicationProbe{
+		BoundedStorage: newBacking(t), applyCtx: t.Context(), outcome: storage.PublicationApplied,
+	}
 }
 
 func (p *publicationProbe) CheckPublicationAccounting() error { return p.check }
@@ -410,7 +411,7 @@ func (p *publicationProbe) Write(ctx context.Context, name string, body []byte) 
 		return err
 	}
 	return p.publish(ctx, previous, int64(len(body)), func() error {
-		return os.WriteFile(filepath.Join(p.root, name), body, 0o600)
+		return p.BoundedStorage.Write(p.applyCtx, name, body)
 	})
 }
 
@@ -422,7 +423,7 @@ func (p *publicationProbe) Rename(ctx context.Context, from, to string) error {
 		return err
 	}
 	return p.publish(ctx, previous, 0, func() error {
-		return os.Rename(filepath.Join(p.root, from), filepath.Join(p.root, to))
+		return p.BoundedStorage.Rename(p.applyCtx, from, to)
 	})
 }
 
@@ -433,7 +434,9 @@ func (p *publicationProbe) Remove(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	return p.publish(ctx, previous, 0, func() error { return os.Remove(filepath.Join(p.root, name)) })
+	return p.publish(ctx, previous, 0, func() error {
+		return p.BoundedStorage.Remove(p.applyCtx, name)
+	})
 }
 
 func (p *publicationProbe) fileBytes(ctx context.Context, name string) (int64, error) {

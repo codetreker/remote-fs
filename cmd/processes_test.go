@@ -205,12 +205,13 @@ type runningServer struct {
 	url string
 }
 
-func startDirectoryServerBinary(t *testing.T, directory string, args ...string) *runningServer {
+func localStoreServerArgs(root, quota string) []string {
+	return []string{"-listen", "127.0.0.1:0", "-local-store", root, "-workspace", "workspace", "-quota", quota}
+}
+
+func startLocalStoreServerBinary(t *testing.T, root, quota string, args ...string) *runningServer {
 	t.Helper()
-	configured := []string{
-		"-listen", "127.0.0.1:0", "-dir", directory,
-		"-lock-state-root", privateDirectory(t), "-initialize-lock-state",
-	}
+	configured := append(localStoreServerArgs(root, quota), "-initialize-lock-state")
 	return startServerBinary(t, append(configured, args...)...)
 }
 
