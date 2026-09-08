@@ -166,9 +166,18 @@ func (h *handle) setAttr(ctx context.Context, change storage.AttrChange) (storag
 
 func (h *handle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 	if err := h.check(); err != nil {
+		if logger := h.node.ns.logger; logger != nil {
+			logger.Printf("sync node %d (handle): %v; request context: %v", h.node.id.node, err, ctx.Err())
+		}
 		return errnoOf(err)
 	}
-	return errnoOf(h.file.Sync(ctx))
+	err := h.file.Sync(ctx)
+	if err != nil {
+		if logger := h.node.ns.logger; logger != nil {
+			logger.Printf("sync node %d (file): %v; request context: %v", h.node.id.node, err, ctx.Err())
+		}
+	}
+	return errnoOf(err)
 }
 
 // Reference retirement belongs to Close even after the session is fenced. Concurrent

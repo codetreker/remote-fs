@@ -95,7 +95,10 @@ func TestBinaryRestartRetiresOldDescriptorsAndAdvisoryLocks(t *testing.T) {
 				t.Fatalf("write before restart = %d, %v", n, err)
 			}
 			if err := oldFile.Sync(); err != nil {
-				t.Fatal(err)
+				attr, attrErr := remote.Stat(t.Context(), "artifact")
+				content, readErr := remote.ReadBounded(t.Context(), "artifact", 32)
+				t.Logf("authority after failed sync: attr=%+v (%v), content=%q (%v)", attr, attrErr, content, readErr)
+				t.Fatalf("sync before server restart: %v\nmount output:\n%s\nserver output:\n%s", err, oldMount.output(), first.output())
 			}
 			if err := first.cmd.Process.Kill(); err != nil {
 				t.Fatal(err)
