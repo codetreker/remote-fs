@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/advisory"
@@ -617,68 +618,70 @@ func TestRetainedEnrollmentCanCancelWhileNativePublicationIsPaused(t *testing.T)
 }
 
 func TestRetainedSessionExpiryFencesUploadBeforeAdvisoryHandoff(t *testing.T) {
-	objects := newPausedFilePut(t)
-	namespace, _ := fileNamespace(t, objects, 4096, nil)
-	options := storage.DefaultFileSessionOptions()
-	options.Lease = 150 * time.Millisecond
-	firstSession := fileSessionFor(t, namespace, options)
-	secondSession := fileSessionFor(t, namespace, storage.DefaultFileSessionOptions())
-	t.Cleanup(objects.release)
-	first := openFileFor(t, firstSession, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
-	second := openFileFor(t, secondSession, "f", storage.FileOpenOptions{Read: true, Write: true})
-	if _, err := first.WriteAt(t.Context(), 0, []byte("old")); err != nil {
-		t.Fatal(err)
-	}
-	lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
-	firstStatus, err := firstSession.Status(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	firstID, err := storage.NewLockRequestID(firstStatus.ActionEpoch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result, err := first.SetLock(t.Context(), 7, lock, firstID); err != nil || result.State != storage.LockGranted {
-		t.Fatalf("first lock=%+v %v", result, err)
-	}
-	secondStatus, err := secondSession.Status(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondID, err := storage.NewLockRequestID(secondStatus.ActionEpoch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lock.Wait = true
-	if result, err := second.SetLock(t.Context(), 7, lock, secondID); err != nil || result.State != storage.LockPending {
-		t.Fatalf("second lock=%+v %v", result, err)
-	}
-	objects.pause.Store(true)
-	writeDone := make(chan error, 1)
-	go func() { _, err := first.WriteAt(t.Context(), 0, []byte("late")); writeDone <- err }()
-	select {
-	case <-objects.entered:
-	case <-time.After(3 * time.Second):
-		t.Fatal("write did not stage")
-	}
-	await(t, "expiry advisory handoff", func() bool {
-		result, err := second.QueryLock(t.Context(), 7, secondID)
+	synctest.Test(t, func(t *testing.T) {
+		objects := newPausedFilePut(t)
+		namespace, _ := fileNamespace(t, objects, 4096, nil)
+		options := storage.DefaultFileSessionOptions()
+		options.Lease = 150 * time.Millisecond
+		firstSession := fileSessionFor(t, namespace, options)
+		secondSession := fileSessionFor(t, namespace, storage.DefaultFileSessionOptions())
+		t.Cleanup(objects.release)
+		first := openFileFor(t, firstSession, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
+		second := openFileFor(t, secondSession, "f", storage.FileOpenOptions{Read: true, Write: true})
+		if _, err := first.WriteAt(t.Context(), 0, []byte("old")); err != nil {
+			t.Fatal(err)
+		}
+		lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
+		firstStatus, err := firstSession.Status(t.Context())
 		if err != nil {
 			t.Fatal(err)
 		}
-		return result.State == storage.LockGranted
+		firstID, err := storage.NewLockRequestID(firstStatus.ActionEpoch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result, err := first.SetLock(t.Context(), 7, lock, firstID); err != nil || result.State != storage.LockGranted {
+			t.Fatalf("first lock=%+v %v", result, err)
+		}
+		secondStatus, err := secondSession.Status(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondID, err := storage.NewLockRequestID(secondStatus.ActionEpoch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lock.Wait = true
+		if result, err := second.SetLock(t.Context(), 7, lock, secondID); err != nil || result.State != storage.LockPending {
+			t.Fatalf("second lock=%+v %v", result, err)
+		}
+		objects.pause.Store(true)
+		writeDone := make(chan error, 1)
+		go func() { _, err := first.WriteAt(t.Context(), 0, []byte("late")); writeDone <- err }()
+		select {
+		case <-objects.entered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("write did not stage")
+		}
+		await(t, "expiry advisory handoff", func() bool {
+			result, err := second.QueryLock(t.Context(), 7, secondID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return result.State == storage.LockGranted
+		})
+		if _, err := second.WriteAt(t.Context(), 0, []byte("winner")); err != nil {
+			t.Fatal(err)
+		}
+		objects.release()
+		if err := <-writeDone; !errors.Is(err, syscall.ESTALE) {
+			t.Fatalf("retired upload=%v, want ESTALE", err)
+		}
+		readFileFor(t, second, "winner")
+		if _, err := firstSession.Renew(t.Context()); !errors.Is(err, syscall.ESTALE) {
+			t.Fatalf("expired renewal=%v", err)
+		}
 	})
-	if _, err := second.WriteAt(t.Context(), 0, []byte("winner")); err != nil {
-		t.Fatal(err)
-	}
-	objects.release()
-	if err := <-writeDone; !errors.Is(err, syscall.ESTALE) {
-		t.Fatalf("retired upload=%v, want ESTALE", err)
-	}
-	readFileFor(t, second, "winner")
-	if _, err := firstSession.Renew(t.Context()); !errors.Is(err, syscall.ESTALE) {
-		t.Fatalf("expired renewal=%v", err)
-	}
 }
 
 func TestRetainedFileAdmissionAndSizeAreBounded(t *testing.T) {
