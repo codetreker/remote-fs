@@ -1617,17 +1617,19 @@ func (s *Store) Garbage(ctx context.Context, limit int) ([]metastore.Key, error)
 // have been interrupted between deleting the object and recording that it did, so running
 // it again has to converge rather than fail.
 //
-// Admission and batch staging honor cancellation. Once staging succeeds, finalization
-// completes before returning so storage shutdown can drain its admitted garbage cleanup.
+// Admission honors cancellation. An admitted batch owns its transaction through
+// finalization so storage shutdown can drain its garbage cleanup.
 func (s *Store) Forget(ctx context.Context, keys []metastore.Key) error {
 	if len(keys) == 0 {
 		return nil
 	}
-	// The transaction owns cleanup while each staging statement keeps the caller's context.
-	// database/sql's automatic rollback hides its result, so cancellation must not race our
-	// explicit rollback or final COMMIT when the maintenance lifetime ends during Close.
-	// https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/database/sql/sql.go#L2207-L2221
-	if err := s.mutateTransaction(ctx, context.WithoutCancel(ctx), nil, func(tx *sql.Tx) error {
+	// Interrupting a write statement can make SQLite roll back the entire transaction.
+	// Owning both statements and finalization preserves explicit cleanup observation when
+	// storage shutdown cancels maintenance in the middle of an admitted batch.
+	// https://www.sqlite.org/c3ref/interrupt.html
+	admission := ctx
+	ctx = context.WithoutCancel(ctx)
+	if err := s.mutateTransaction(admission, ctx, nil, func(tx *sql.Tx) error {
 		for _, key := range keys {
 			var state int
 			switch err := tx.QueryRowContext(ctx, `SELECT state FROM objects WHERE key = ? AND namespace = ?`,

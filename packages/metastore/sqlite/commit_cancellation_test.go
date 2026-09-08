@@ -2,7 +2,6 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"runtime"
@@ -226,46 +225,5 @@ func TestForgetCancellationBeforeAdmissionHasNoEffects(t *testing.T) {
 				t.Errorf("admission gate remained unusable: %v", err)
 			}
 		})
-	}
-}
-
-type cancelForgetStatementContext struct {
-	context.Context
-	cancel context.CancelFunc
-	writer *sql.DB
-	once   sync.Once
-}
-
-func (c *cancelForgetStatementContext) Done() <-chan struct{} {
-	if c.writer.Stats().InUse != 0 {
-		c.once.Do(c.cancel)
-	}
-	return c.Context.Done()
-}
-
-func TestForgetStagingCancellationRollsBackExplicitly(t *testing.T) {
-	f := newPublicationFixture(t)
-	f.put(t, t.Context(), "file", 3)
-	f.put(t, t.Context(), "file", 7)
-	keys, err := f.store.Garbage(t.Context(), 1)
-	if err != nil || len(keys) != 1 {
-		t.Fatalf("garbage=%v error=%v", keys, err)
-	}
-	request, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	observed := &cancelForgetStatementContext{Context: request, cancel: cancel, writer: f.store.write}
-	err = f.store.Forget(observed, keys)
-	if storage.ErrnoOf(err) != syscall.EINTR || !errors.Is(err, context.Canceled) || request.Err() != context.Canceled {
-		t.Errorf("staging cancellation=%v, request=%v", err, request.Err())
-	}
-	remaining, err := f.store.Garbage(t.Context(), 1)
-	if err != nil || len(remaining) != 1 || remaining[0] != keys[0] {
-		t.Errorf("staging cancellation changed garbage: %v, %v", remaining, err)
-	}
-	if f.store.write.Stats().InUse != 0 {
-		t.Error("staging cancellation retained the SQL transaction")
-	}
-	if err := f.store.Forget(t.Context(), keys); err != nil {
-		t.Errorf("explicit rollback left the store unusable: %v", err)
 	}
 }

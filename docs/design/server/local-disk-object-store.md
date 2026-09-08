@@ -342,7 +342,7 @@ Avail = min(max(quota - Used, 0), localdisk.Available)
 
 能单独装进 byte threshold 的 reservation 因 backlog 越界时以 `EAGAIN` 失败，单个 payload 自身超过 byte threshold 则是 `EFBIG`。同一时刻至多运行一次状态工作；查询运行期间已经被 signal loop 取出的 SIGHUP 不再启动一份并发查询，仍留在 signal channel 的一个信号可在本次完成后触发下一次。SIGINT／SIGTERM 会取消并等待 status goroutine，状态查询不占住 signal loop；已经进入的不可取消 filesystem syscall 仍须返回后才能完成等待。checkpoint `LastError`、任一 component 或 lock status 查询失败时只打印整次 status failure，不格式化一组看似成功的 partial figures。
 
-SQLite `Forget` 用 `context.WithoutCancel` 为 `BeginTx` 持有事务生命周期，准入、逐项校验、删除 SQL、日志 trim 与 generation 更新仍使用调用方 context。准备失败或取消时显式回滚，并观察回滚结果；全部准备成功后，原生 Commit / Accept 完成才返回，期间发生取消仍可能得到成功。它防止 `database/sql` 在后台自动回滚而隐藏收尾结果；真实 Commit、Accept 或 rollback 故障继续以 `EIO` 失败隔离，普通 namespace mutation 的提交规则不变。
+SQLite `Forget` 用调用方 context 等待 commit gate 准入。准入后，本批逐项校验、删除 SQL、日志 trim、generation 更新以及 BeginTx、Commit / Accept 和 rollback 都由 `context.WithoutCancel` 持有生命周期，存储关闭时的调用方取消不会中断已接纳的 SQL。事务取得明确的提交或显式回滚结果后才释放 gate；准备错误在回滚成功时保留原错误，真实 Commit、Accept 或 rollback 故障继续以 `EIO` 失败隔离。清扫器按既有配置限制每批记录数，关闭排空已接纳的整个批次。普通 namespace mutation 的 context 与提交规则不变。
 
 `Close` 先停止 file-session admission，逐个撤销会话与引用的发布权限，排空已接纳操作并关闭保留引用。失败时两半存储及其所有权继续保留，后续关闭可以重试可证明的未完成清理；不能先关闭数据库再等最后一个文件引用释放。直接关闭 SQLite 时仍有 retained file references 则以 `EBUSY` 拒绝。
 

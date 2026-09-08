@@ -177,7 +177,7 @@ native file reference 默认每 namespace 最多 65536 个，重复打开同一�
 
 `objectstore.New` 与 `objectstore.NewWithOptions` 都拥有启动、event-driven continuation 与 periodic retry 三种清扫触发；前者使用 `objectstore.DefaultOptions()` 的一分钟周期和 64 个对象 batch，后者接受显式配置。单轮 batch 必须在 1 到 `objectstore.MaxSweepBatch = 1 << 20` 之间，避免一次 maintenance attempt 退化为无界工作。`cmd/remote-fs-server` 用通用的 `-sweep-interval` 与 `-sweep-batch` 为 Azure 和 local-store 两种 objectstore-backed 形态配置后者；默认值同样是一分钟与 64，超过 1,048,576 在打开 storage 之前被拒绝。会产生 garbage 的成功内容替换/删除，以及 `Put` 已成功但 `Commit` 失败后的 `Abandon`，向 coalesced channel 投递非阻塞信号；一轮若删满 batch，会继续安排有界工作，直到不足一批、失败或被取消。普通 `Put` error 进入 unresolved，不触发删除。显式与自动清扫共用 context-aware permit 串行执行。garbage record 在对象删除成功之后才从 metastore 忘记；对象删除失败保留 record，`MaintenanceStatus` 公开最近一次时间、删除数与完整错误。Forget 的未知提交不能被解释为记录仍在并按确定未提交的结果继续清扫。namespace 操作不等待对象删除，关闭也不执行无界且可能失败的最终清扫；worker 停止后才完成的 operation 若留下 garbage，由 durable record 与下次打开的初始清扫接管。
 
-SQLite Forget 的事务自行持有 BeginTx 生命周期，调用方取消继续约束 admission、批次校验和准备 SQL、trim 与 generation 更新。失败时由拥有者显式回滚，全部准备成功后完成 Commit / Accept；晚到的取消不再与看不到结果的自动回滚竞争。这使关闭能排空已接纳的垃圾回收，也意味着关闭要等待这个最终阶段取得明确结果。真实提交、见证或回滚故障仍保持 `EIO` 与失败隔离，不依据 `ErrTxDone` 推断普通 mutation 没有发生。
+SQLite Forget 的事务在批次准入后拥有全部 SQL 与收尾的生命周期，调用方取消只约束 admission。逐项校验、删除、trim、generation 更新、Commit / Accept 与显式 rollback 使用同一份脱离调用方取消的 context：只让 BeginTx 独立仍会让语句执行期间的取消触发 SQLite 自动回滚，使拥有者无法确认收尾结果。关闭因此等待已接纳的整批清理完成，批次记录数仍由既有清扫配置约束。准备错误在显式回滚成功时保留原错误；真实提交、见证或回滚故障仍保持 `EIO` 与失败隔离。普通 mutation 的 context 与提交规则不变，不依据 `ErrTxDone` 推断其没有发生。
 
 直接使用已启用锁且未配置数据库提交见证的 SQLite Store 时，Close 在授权方退役并取得 commit gate 后还要检查 coordinator poison。在途 Forget 的提交可能在退役之后失败；遗漏这次检查会把 pool 的成功关闭误认为整个 Store 干净关闭。该故障的原因与关闭错误被保留，重复 Close 返回缓存错误，原生排他所有权不能释放。
 

@@ -789,12 +789,12 @@ func (s *Store) mutatePublication(ctx context.Context, intent *namespaceIntent, 
 	return s.mutateTransaction(ctx, ctx, intent, f)
 }
 
-func (s *Store) mutateTransaction(ctx, transactionContext context.Context, intent *namespaceIntent, f func(tx *sql.Tx) error) (returnErr error) {
-	if err := s.coordinator.commit.acquire(ctx); err != nil {
+func (s *Store) mutateTransaction(admissionContext, ctx context.Context, intent *namespaceIntent, f func(tx *sql.Tx) error) (returnErr error) {
+	if err := s.coordinator.commit.acquire(admissionContext); err != nil {
 		return err
 	}
 	defer s.coordinator.commit.release()
-	return s.mutateTransactionLocked(ctx, transactionContext, intent, f)
+	return s.mutateTransactionLocked(ctx, ctx, intent, f)
 }
 
 // The caller holds commit ordering across retention or retirement and publication.
