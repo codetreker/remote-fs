@@ -12,7 +12,11 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
+	"golang.org/x/sys/unix"
+
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -56,6 +60,9 @@ var metastoreAuxiliaryFilenames = [...]string{
 // The backing filesystem remains the hard physical ceiling for all bytes.
 // LocalDisk.MaintenanceReserveBytes keeps deletion and SQLite maintenance possible when that
 // ceiling is reached; removal remains available while new object publication is refused.
+// Locks enables the paired file-lease authority. Once initialized, reopening requires Locks;
+// its omission cannot disable existing protection. InitializeLocks permits the first durable
+// lease binding or completion of its matching intent; missing active evidence fails closed.
 type Config struct {
 	Root                         string
 	Workspace                    string
@@ -68,6 +75,8 @@ type Config struct {
 	MaxIntegrityBytes            int64
 	LocalDisk                    localdisk.Options
 	Maintenance                  objectstore.Options
+	Locks                        *locking.Options
+	InitializeLocks              bool
 }
 
 // Status is an operational view collected from every durable part of a Store.
@@ -144,6 +153,15 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	if config.Locks == nil {
+		_, err := unix.Fgetxattr(anchor.fd, "user.remote-fs.lease-state", nil)
+		if err == nil {
+			return nil, errors.Join(fmt.Errorf("the local store requires its configured lease authority: %w", syscall.EIO), anchor.Close())
+		}
+		if !errors.Is(err, syscall.ENODATA) && !errors.Is(err, syscall.ENOTSUP) {
+			return nil, errors.Join(fmt.Errorf("checking local store lease binding: %w", err), anchor.Close())
+		}
+	}
 
 	localDiskOptions := config.LocalDisk
 	localDiskOptions.CompositeInitialization = true
@@ -151,6 +169,7 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 	if err != nil {
 		return nil, errors.Join(err, anchor.Close())
 	}
+	recoveryStart := time.Now()
 	if err := verifyAnchoredRoot(objects, anchor); err != nil {
 		return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
 	}
@@ -263,7 +282,11 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 	openDurable := hooks.openDurable
 	if openDurable == nil {
 		openDurable = func() (*sqlite.Store, error) {
-			return sqlite.OpenBoundDurableWithOptions(
+			opener := sqlite.OpenBoundDurableWithOptions
+			if config.Locks != nil {
+				opener = sqlite.OpenBoundDurableLeaseWithOptions
+			}
+			return opener(
 				ctx,
 				databasePath,
 				config.Workspace,
@@ -288,6 +311,28 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 		return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
 	}
 	durableMeta := newDurableMetastore(meta, witness)
+	if config.Locks != nil {
+		leaseAnchor, err := sqlite.OpenLeaseAnchor(sqlite.LeaseAnchorConfig{
+			Directory: root, Name: ".leases", Identity: storeID.String() + ":" + config.Workspace,
+			BindingFD: anchor.fd, RecoveryStart: recoveryStart, Initialize: config.InitializeLocks,
+		})
+		if err != nil {
+			return nil, errors.Join(err, cleanupDurableOpen(durableMeta, objects, anchor))
+		}
+		durableMeta.leaseAnchor = leaseAnchor
+		if err := meta.ConfigureLeaseRecovery(ctx, sqlite.LeaseRecoveryConfig{
+			Witness: leaseAnchor, RecoveryStart: recoveryStart, StateID: leaseAnchor.StateID(),
+			Initialize: leaseAnchor.Initializing(),
+		}); err != nil {
+			return nil, errors.Join(err, cleanupDurableOpen(durableMeta, objects, anchor))
+		}
+		if err := leaseAnchor.Complete(); err != nil {
+			return nil, errors.Join(err, cleanupDurableOpen(durableMeta, objects, anchor))
+		}
+		if err := meta.EnableLocks(ctx, *config.Locks); err != nil {
+			return nil, errors.Join(err, cleanupDurableOpen(durableMeta, objects, anchor))
+		}
+	}
 	if hooks.afterDurableMetastore != nil {
 		if err := hooks.afterDurableMetastore(durableMeta); err != nil {
 			return nil, errors.Join(err, cleanupDurableOpen(durableMeta, objects, anchor))
@@ -359,6 +404,14 @@ func (config Config) sqliteOptions() (sqlite.Options, error) {
 }
 
 func validate(config Config) (string, error) {
+	if config.InitializeLocks && config.Locks == nil {
+		return "", fmt.Errorf("lease initialization requires lock options: %w", syscall.EINVAL)
+	}
+	if config.Locks != nil {
+		if err := config.Locks.Validate(); err != nil {
+			return "", err
+		}
+	}
 	if config.Root == "" {
 		return "", fmt.Errorf("a local store needs a root directory: %w", syscall.EINVAL)
 	}
@@ -600,6 +653,9 @@ func (s *Store) SetAttr(ctx context.Context, path string, change storage.AttrCha
 
 func (s *Store) CheckBounded() error { return s.namespace.CheckBounded() }
 
+// CheckPublicationAccounting reports native quota settlement at the publication boundary.
+func (s *Store) CheckPublicationAccounting() error { return s.namespace.CheckPublicationAccounting() }
+
 func (s *Store) List(ctx context.Context, path string) ([]storage.Entry, error) {
 	return s.namespace.List(ctx, path)
 }
@@ -710,6 +766,9 @@ func (s *Store) Close() error {
 
 // Log returns the durable change log written in the same transaction as namespace edits.
 func (s *Store) Log() metastore.Log { return s.meta }
+
+// LockService returns the authority paired with this namespace when Locks was configured.
+func (s *Store) LockService() locking.Service { return s.meta.LockService() }
 
 // Status queries every component even when one fails, then returns all failures together.
 // The returned fields therefore remain useful for diagnosis without presenting a partial

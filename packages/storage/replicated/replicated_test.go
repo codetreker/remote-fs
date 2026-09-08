@@ -15,9 +15,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
+	"github.com/codetreker/remote-fs/packages/storage/locked"
 	"github.com/codetreker/remote-fs/packages/storage/replicated"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
@@ -473,18 +475,12 @@ func TestTheMountFailsWhenTheNamespaceCannotBeWatched(t *testing.T) {
 
 // TestANamespaceThatKeepsNoLogRefusesToBeCopied, under its own errno.
 //
-// A namespace held in a local directory has no metastore and therefore no ordered record of
-// what changed in it. That is a standing property of that namespace rather than a failure to
-// reach anything, and the two call for opposite actions: ENOSYS means mount it without a copy
-// and never ask again, EIO means the server may be there in a moment. Answering one for the
-// other means either a mount that never comes up or a mount that quietly gave up on being
-// current.
+// A namespace without a change log answers ENOSYS, allowing a mount without a copy.
+// EIO instead reports a namespace that cannot currently be reached. The fixture exposes
+// only the enforcing backend interface so optional log capabilities cannot enable copying.
 func TestANamespaceThatKeepsNoLogRefusesToBeCopied(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatalf("opening a local directory: %v", err)
-	}
-	// A nil log, which is what a namespace with no metastore is served with.
+	_, namespace := memoryfixture.New(t, "ws", 0, locking.DefaultOptions())
+	backing := struct{ locked.Backend }{namespace}
 	handler, err := httprest.NewHandler(backing, nil)
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)

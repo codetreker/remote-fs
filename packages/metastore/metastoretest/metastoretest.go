@@ -199,9 +199,6 @@ var pathCases = []testCase{
 }
 
 var nodeCases = []testCase{
-	// The modes match what localdir's Create and Mkdir produce. A namespace held in a
-	// database and one held in a directory should not disagree about what touch and mkdir
-	// make.
 	{name: "a new file is empty, references nothing, and is 0644", run: func(t *testing.T, s metastore.Store) {
 		mustSucceed(t, s.Create(ctx(t), "f"))
 		node, err := s.Stat(ctx(t), "f")

@@ -205,6 +205,16 @@ type runningServer struct {
 	url string
 }
 
+func localStoreServerArgs(root, quota string) []string {
+	return []string{"-listen", "127.0.0.1:0", "-local-store", root, "-workspace", "workspace", "-quota", quota}
+}
+
+func startLocalStoreServerBinary(t *testing.T, root, quota string, args ...string) *runningServer {
+	t.Helper()
+	configured := append(localStoreServerArgs(root, quota), "-initialize-lock-state")
+	return startServerBinary(t, append(configured, args...)...)
+}
+
 func startServerBinary(t *testing.T, args ...string) *runningServer {
 	t.Helper()
 	p := start(t, "remote-fs-server", serverBinary(t), args...)

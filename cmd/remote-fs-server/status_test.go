@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/localstore"
@@ -81,6 +83,75 @@ func TestLocalStatusReportsEveryBoundedAndDurablePart(t *testing.T) {
 	} {
 		if !strings.Contains(line, phrase) {
 			t.Fatalf("status does not contain %q: %s", phrase, line)
+		}
+	}
+}
+
+func TestLockStatusReportsLifecycleWithoutCapabilityMaterial(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status locking.Status
+		want   string
+	}{
+		{"ready", locking.Status{}, "file locks ready"},
+		{"recovery", locking.Status{Recovering: true, RecoveryRemainingMillis: 1250}, "file locks recovering for 1.25s"},
+		{"unavailable", locking.Status{Unavailable: true}, "file locks unavailable"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			test.status.Authority = "private-authority-material"
+			test.status.Sessions, test.status.Owners, test.status.Resources = 1, 2, 3
+			test.status.Actions, test.status.Grants, test.status.Queued = 4, 5, 6
+			line := formatLockStatus(test.status)
+			if !strings.Contains(line, test.want) || !strings.Contains(line, "1 sessions, 2 owners, 3 resources, 4 actions, 5 grants, 6 queued") {
+				t.Fatalf("incorrect lock status: %s", line)
+			}
+			if strings.Contains(line, test.status.Authority) {
+				t.Fatalf("status exposed authority material: %s", line)
+			}
+		})
+	}
+}
+
+func TestLockStatusFailureSuppressesPartialOperationalFigures(t *testing.T) {
+	failure := errors.New("lock state unavailable")
+	ns := opened{
+		what: "workspace", statusName: "local-store",
+		status:     func(context.Context) (string, error) { return "partial capacity", nil },
+		lockStatus: func(context.Context) (locking.Status, error) { return locking.Status{}, failure },
+	}
+	var output bytes.Buffer
+	handleHangup(t.Context(), ns, &output)
+	if !strings.Contains(output.String(), failure.Error()) || strings.Contains(output.String(), "partial capacity") {
+		t.Fatalf("failed status was not isolated: %s", output.String())
+	}
+}
+
+func TestMissingLockStatusClosesNamespaceAndPreservesCloseFailure(t *testing.T) {
+	failure := errors.New("ownership close uncertain")
+	closed := false
+	_, err := withLockStatus(opened{close: func() error { closed = true; return failure }}, nil)
+	if !closed || !errors.Is(err, failure) || !strings.Contains(err.Error(), "file-lock service has no recovery status") {
+		t.Fatalf("missing status returned closed=%t error=%v", closed, err)
+	}
+}
+
+func TestUnavailableLockAuthorityCannotAnnounceReadiness(t *testing.T) {
+	for _, failure := range []error{nil, errors.New("recovery status read failed")} {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ns := opened{what: "workspace", lockStatus: func(context.Context) (locking.Status, error) {
+			return locking.Status{Unavailable: true}, failure
+		}}
+		var output bytes.Buffer
+		err = serveWithGrace(&drainingServer{}, listener, ns, &output, time.Millisecond)
+		closeErr := listener.Close()
+		if err == nil || closeErr != nil {
+			t.Fatalf("unavailable authority startup returned %v; listener close %v", err, closeErr)
+		}
+		if strings.Contains(output.String(), "serving") {
+			t.Fatalf("unavailable authority announced readiness: %s", output.String())
 		}
 	}
 }

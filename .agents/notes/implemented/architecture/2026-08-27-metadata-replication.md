@@ -16,7 +16,7 @@ Status: implemented
 
 因此**「同步元数据」与「订阅变更流」不能分开**：本地副本的可信度依赖事件通道被连续观察。没有流，本地副本只有两种诚实的用法——每次操作都回源校验（等于没缓存），或者违反 R-CON-1 与 R-CON-2。
 
-这份 note 定的是这条流与它的起点。它吸收并接续三份更早的提案：[观察源与通道](../../proposed/architecture/2026-08-19-observation-source-and-channels.md)、[定序与版本](../../proposed/architecture/2026-08-19-ordering-and-versions.md)、[变更日志的身份与作用域](../../proposed/architecture/2026-08-19-change-log-identity.md)；其中日志持久性一条与最后那份的结论相反，理由见「落盘与崩溃缺口」。
+这份 note 定的是这条流与它的起点。它吸收并接续三份更早的提案：[观察源与通道](../../proposed/architecture/2026-08-19-observation-source-and-channels.md)、[定序与版本](../../proposed/architecture/2026-08-19-ordering-and-versions.md)、[变更日志的身份与作用域](../../proposed/architecture/2026-08-19-change-log-identity.md)；其中日志持久性一条与最后那份的结论相反，理由见「落盘与崩溃缺口」。[显式文件锁](./2026-09-07-file-locks.md)已经部分扩展原有服务端状态与发布接口，本文继续拥有元数据复制与写后可见性，锁授权与内容版本各有独立含义。
 
 ## 决定
 
@@ -30,7 +30,7 @@ Status: implemented
 |---|---|
 | 三个内核超时仍然是 0 | 名字与属性查询仍然到达这一层，只是答案来自本地 SQLite 而不是网络；文件页缓存独立存在 |
 | 没有直通模式、没有降级 | 副本没建好，挂载点就还不能用；R-WS-4 知情推后 |
-| 只支持有 metastore 的后端 | `localdir` 后端保持原来的行为 |
+| 只支持有 metastore 的后端 | 当时的 `localdir` 保持直通；该实现已由[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)取消，第三方 storage 的日志仍是独立能力 |
 | 迁移机制只到「够用」为止 | 编号的 `.sql` 文件顺序重放，没有回滚、没有校验和 |
 | 三个保留窗口参数不实测 | 用默认值交付，踩到再调 |
 
@@ -88,6 +88,8 @@ t1      拿着 P 去续订
 
 SQLite 把长生命周期 snapshot transaction 放进独立 reader pool。`MaxSnapshotReaderConnections` 默认 16，与普通 `MaxReaderConnections` 默认 16 分开；慢 snapshot 可以占满自己的 pool、钉住 WAL，却不能因此夺走 bounded `Since`、event catch-up 与普通 namespace read 使用的全部 connection。`cmd/remote-fs-server -max-snapshot-reader-connections` 为 Blob/local-store 两种 metastore-backed source 暴露该上限。
 
+原生文件锁集成把新的权威视图捕获与最终发布许可排序；SQLite 在读事务中钉住所需 snapshot 后释放观察准入，再生产批量快照页。已经捕获的旧视图可以完成读取，snapshot 的网络生存期不延长文件占有。这个顺序不把客户端异步副本变成锁状态的权威来源。
+
 代价写明：**快照流断了不能续传。** 一致性切割没了就是没了。
 
 一份位置 P 的快照可以给任何**订阅开始 ≤ P** 的客户端共用；服务端做单飞合并时按这条分组。它让「所有客户端同时重建」从 N 次全树扫描变成一次，而位置正是使共用安全的那个东西。这一版不做单飞，但接口不得把它堵死。
@@ -130,7 +132,9 @@ SQLite 把长生命周期 snapshot transaction 放进独立 reader pool。`MaxSn
 
 ### 续订标识是（化身, 位置）
 
-化身属于**日志**，不属于进程：持久化日志的进程重启不该让所有人重建，两个共享同一份日志的实例应当有同一个化身。
+化身属于**日志**，不属于进程：持久化日志的进程重启不该让所有人重建，读取同一份日志的实例应当识别同一个化身。它不表示多活写入已经受支持。
+
+锁授权方的 incarnation 则随授权方恢复而改变。即使日志化身保持不变、元数据可以继续重放，旧 Session、Owner、Grant 与管理意图也不能进入新授权方；它们明确返回退役或结果未知，不重新执行。已确认保护由持久 lease 时长证据与恢复屏障维持，精确动作历史只属于仍有效的原授权方及其活跃 Owner / Session 历史窗口。
 
 ```
 连上 → 送（化身, 位置）
@@ -178,13 +182,15 @@ metastore 事务 {
 
 由此得到一条要写进契约的规则：**一个后端要么能把位置纳入自己的原子提交，要么它的日志不得持久化。**
 
-日志与树同库同事务，还顺带消掉了那份 note 记下的另一条反对意见：**server 不会因此拥有 storage 契约之外的持久状态**。那份状态属于某个存储实现，而 R-INT-12 已经说明存储实现可以依赖它自己的外部服务，并且必须说明它需要什么。
+日志与树同库同事务，还顺带消掉了那份 note 当时记下的另一条反对意见：增加复制不要求 server 在存储之外另建一份持久日志。状态属于某个存储实现，R-INT-12 允许实现依赖自己的外部服务，并要求说明这些依赖。当前文件锁还持有 workspace 绑定的持久时长证据与独立 Witness；这些证据保证重启不缩短占有，与保存日志供副本重放是两项不同责任。
 
 ### 日志归 metastore
 
-**日志是每个 metastore 必须提供的能力**，怎么实现由各自决定。`storage.Storage`（R-INT-6 那条契约）一个字不用改，第三方接自有存储照旧只需实现「一份命名空间的存取」。
+**日志是每个 metastore 必须提供的能力**，怎么实现由各自决定。引入复制时无需把日志并进 `storage.Storage`，第三方仍可只提供命名空间数据接口。当前从 server 发布 namespace 还须提供有界读取，并与能在原生最终转换处检查权限的锁授权方配对；日志仍是独立的可选能力，不能从有界读取或锁服务推导出复制支持。
 
-于是这一版**只有 metastore 后端的 workspace 会被复制**，`localdir` 后端保持今天的直通行为。[观察源与通道](../../proposed/architecture/2026-08-19-observation-source-and-channels.md)论证过一件事：`mount(localdir)` 必须走与生产相同的缓存与失效路径，否则差分对拍对的是一个生产中永不出现的配置。这一版**没有满足它**，而是把它换了个地方还上：`packages/fuse` 的差分对拍仍然挂 `localdir`，对的仍然是一个不带副本的挂载点——它证明的是「挂载层像一个普通目录」，那件事与复制无关，换掉夹具也不会让它多证明什么，因为那一层根本没有服务端。带副本的那条路径改由 `cmd` 的端到端用例走：它们的夹具换成了 metastore 后端（SQLite + 内存对象），于是真实部署走的那条路正是测试走的那条，另留两个用例在 `localdir` 上盯着 `ENOSYS` 那一支。`packages/storage/localstore` 也把同一份 SQLite metastore 的日志交给 server，所以[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)走相同的快照与增量复制路径。
+引入复制时，只有 metastore 后端的 workspace 会被复制，`localdir` 保持直通。[观察源与通道](../../proposed/architecture/2026-08-19-observation-source-and-channels.md)提出的「直接挂载与生产经过相同失效路径」没有因此实现：当时 `packages/fuse` 在 `localdir` 上与普通目录对拍，`cmd` 另用 SQLite 与内存对象验证复制路径，并保留两个 `localdir` 用例覆盖 `ENOSYS`。这一取舍将挂载语义与复制行为分开验证，没有让差分对拍覆盖复制失效。
+
+[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)后，直接 FUSE 与 HTTP 夹具使用 SQLite 与内存对象，二进制测试覆盖 localstore 与 Azure Blob；不提供日志的行为由显式省略 Log 的夹具继续验证。现有两种独立服务端后端都把 SQLite 日志交给 server，其中[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)复用相同快照与增量路径。更换存储夹具不改变直接 FUSE 挂载没有副本这一验证边界。
 
 **残留的缺口写在这里，不留给读者去推**：差分对拍与复制是两组用例，没有一组同时对拍「带副本的挂载点」与「普通目录」。
 
@@ -227,13 +233,13 @@ local store 此后有了服务端容量、维护与持久性状态，客户端�
 
 这一版走 SSE：`httprest` 加一个事件端点，与现有的请求／响应端点天然是两条 HTTP 连接，那条分离义务不需要额外机制就成立。R-INT-9 要求的另外两种传输将来各自说明它用什么机制满足它。独立二进制对 accepted connection 与 header/idle lifetime 的限制由[独立 server 的 HTTP connection 上限](./2026-09-04-standalone-http-connection-limits.md)拥有。
 
-义务写成**性质而不是拓扑**：从一次变更被记入日志，到它的事件抵达一个健康订阅者，其耗时与同一 session 上并发的批量传输无关。
+义务写成**性质而不是拓扑**：从一次变更被记入日志，到它的事件抵达一个健康订阅者，其耗时与同一挂载上并发的批量传输无关。这里的通道生存期不等于锁控制 Session / Owner 的生存期；事件流断开会使副本作废，不会据此解除已确认占有。
 
 **快照与文件传输都必须分块。** 快照是系统里最大的一次批量传输，它挤掉自己的事件通道，后果是重新拉一份快照——一个自我放大的循环，而触发它只需要一次正常的冷挂载。row count 之外的 single-frame、concurrent production、aggregate bytes 与 waiter 上限由[有界复制 frame](./2026-09-04-bounded-replication-frames.md)拥有。
 
 **流不使用 HTTP 总超时。** `http.Client.Timeout` 界的是一整次交换、读完响应体为止，用在操作上是对的，用在订阅上会周期性切断正常长连接。`httprest` 对流式操作清除调用方的 `Timeout`；是否有 response-header 上限取决于调用方配置的 transport。首次 `Subscribe` 使用 storage lifetime，未继承 `New` 的取消，因此初始化 context 到期不能终止等待响应头；[取消首次副本订阅](../../proposed/bug-fix/2026-09-07-cancel-initial-replica-subscription.md)处理初始化与存活期的交接。响应体读取的静默上限见下文。
 
-客户端的状态因此只有两个：
+客户端元数据副本的状态因此只有两个，独立于锁授权方和 grant 的状态：
 
 | 事件通道 | 本地副本 | 每一个操作 |
 |---|---|---|
@@ -268,13 +274,15 @@ R-CON-4 要求写入方自己以及同机其它进程**立即**看到已写入�
 
 只要 handler 持有非空 `Log`，每个 mutation-shaped operation 成功后都先唤醒 publisher，再从 `Log.Barrier` 原子读取 `(incarnation, committed position)` 放进 response。这也包括语义上不改变状态的 operation：它们得到的是当前 barrier，position 可以为 0。对真正产生变更的 mutation，barrier position 可以是本次提交的尾位置，也可以因并发提交而更晚，但到达它必然已经应用本次 mutation。barrier 查询或编码失败发生在 operation 已成功之后，因此 response 以 `EIO` 失败，不把已执行的 mutation 说成未发生。没有日志的 handler 可以省略 barrier；replicated client 的普通 mutation 方法会解码并忽略可选 barrier，`*WithBarrier` 方法则要求它存在且格式有效。
 
-这个 response 形状把 HTTP protocol 提升为 v2：prefix 是 `/v2/`，header 是 `Remote-Fs-Protocol: 2`。v1 的 mutation success 是空 body，无法被 v2 的严格 `MutationResponse` decoder 接受；server 不保留旧 route，client 不做双版本 fallback。这使旧新 peer 的不兼容立即表现为协议失败，不会把空或陌生 body 读成修改成功。
+引入这个 response 形状时，HTTP protocol 升为 v2：prefix 是 `/v2/`，header 是 `Remote-Fs-Protocol: 2`。v1 的 mutation success 是空 body，无法被 v2 的严格 `MutationResponse` decoder 接受，因此当时拒绝旧 route 与双版本 fallback。当前[文件锁协议](../../../../docs/design/server/file-locks.md#http-v3-编码)使用 `/v3/` 与 `Remote-Fs-Protocol: 3`，保留 mutation barrier body 并增加锁控制和显式 scope。v2 不能作为不检查权限的兼容路径，陌生或空的成功 body 仍是协议失败。
 
 replicated storage 在发送 request 前只 admission 一条 fixed-size confirmation record，不保留目标 path、direction 或 touched-name history。`replicated.Options` 默认 `ConfirmationGrace = 10s`、`MaxActiveConfirmations = 64`、`MaxWaitingConfirmations = 64`；active/waiter 的 `math.MaxInt` sentinel 被拒绝。active 名额不足时有限等待；纯调用方取消为 `EINTR`，deadline 为 `EIO`，实际容量饱和或 storage 开始关闭时为 `EAGAIN`，这些拒绝都保留原始原因且不发送 request。该分类与 [FUSE 请求中断](../bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)共用操作阶段规则。`cmd/remote-fs` 以 `-confirmation-grace`、`-max-active-mutation-confirmations` 与 `-max-waiting-mutation-confirmations` 暴露三项配置，并在连接 server 或创建 replica directory 之前验证。
 
 server success 后，replicated storage 把 barrier 与当前 replica incarnation/generation 对齐，再等待 `local position >= barrier position`。event 若早于 HTTP response 到达，当前位置已经越过 barrier，等待立即完成；另一个 writer 的 change 不能提前确认，因为 barrier position 不早于本次 commit。stream rebuild 改变 generation、barrier incarnation 不匹配、stream failure、context cancellation、storage close 或 grace 到期都以 `EIO` 失败：namespace 已改变，只是本地结果无法确认。失败只结束该调用，不把一条仍连续的 stream 判坏；调用方应读取当前事实，不能把 `EIO` 当成“修改没有发生”而盲目重试。
 
-空 attribute change 与 rename onto itself 仍然发给服务端，以取得它对 pathname 的权威答案。logged handler 会在成功 response 中附上当前 barrier；但这两种语义 no-op 没有要等待的状态变更，replicated storage 因此直接调用普通 mutation 方法，不进入 `*WithBarrier` 确认路径。其它写入在 stream 不通时失败，因为 barrier 永远无法被本地可信地满足，一个看不到自己刚写内容的挂载点不满足 R-CON-4。
+这些计数有各自的作用：log incarnation / position 标识命名空间历史，replica generation 区分本地副本重建，Grant generation 标识授予，renewal revision 表示续期状态。mutation barrier 只证明副本已看到提交；它不取得或续期 grant，也不证明调用方当前仍持有权限。显式 scope 的权限在暂存后的原生最终转换处检查，过期后尚未取得许可的上传失败；已获许可的提交可以在 grant 后来到期之后才完成副本确认。普通读取、SSE 健康与追平同样不构成 live-grant 断言。
+
+空 attribute change 与 rename onto itself 仍然发给服务端，以取得它对 pathname 的权威答案。logged handler 会在成功 response 中附上当前 barrier；但这两种语义 no-op 没有要等待的状态变更，replicated storage 因此直接调用普通 mutation 方法，不进入 `*WithBarrier` 确认路径。scoped HTTP client 的普通 mutation 与 `*WithBarrier` 方法都保留其不可变 proof 集合，no-op 也必须验证所给 scope。其它写入在 stream 不通时失败，因为 barrier 永远无法被本地可信地满足，一个看不到自己刚写内容的挂载点不满足 R-CON-4。
 
 ### 快照期间不缓冲：套接字就是缓冲区
 
@@ -321,7 +329,7 @@ cmd/remote-fs                 + 挂载前建立副本，+ -replica-dir
 cmd/remote-fs-server          + 把 metastore 的日志交给 handler
 ```
 
-当前 SQLite schema 是 v3：`0003_durable_state.sql` 增加数据库到 object store ID 的绑定、database identity/generation、node/change 高水位、全局 identity boundary indexes 与 retained-change predecessor。v2 无法证明旧 retained rows 连续，迁移保留全局高水位、清空旧 rows 并切换 incarnation，使 replica 重建且新 position 不复用旧值。这项后续结构由[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)、[持久身份高水位](../bug-fix/2026-09-07-persistent-sqlite-identities-use-explicit-high-water-marks.md)和[保留日志完整性](./2026-09-04-retained-log-integrity-refuses-open.md)分别记录。
+SQLite schema 的后续结构分别有自己的决定：`0003_durable_state.sql` 增加数据库到 object store ID 的绑定、database identity/generation、node/change 高水位、全局 identity boundary indexes 与 retained-change predecessor。v2 无法证明旧 retained rows 连续，该迁移保留全局高水位、清空旧 rows 并切换 incarnation，使 replica 重建且新 position 不复用旧值；理由由[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)、[持久身份高水位](../bug-fix/2026-09-07-persistent-sqlite-identities-use-explicit-high-water-marks.md)和[保留日志完整性](./2026-09-04-retained-log-integrity-refuses-open.md)分别记录。当前 schema v4 的 `0004_lease_recovery.sql` 增加覆盖整份数据库的 Accepted / Prepared lease 时长证据，配合独立 Witness 与恢复屏障维持占有保护；它不把 grant 或管理动作历史写成复制日志，取舍见[文件锁决定](./2026-09-07-file-locks.md)。
 
 **不新建 `packages/observe`。** 「观察源」作为一条独立契约，是在有两种实现（metastore 日志 vs 服务端合成）时才挣到自己位置的；这一版只有前一种，现在建等于先造一个只有一个实现的抽象。它留在这份 note 里当形状约束。
 
@@ -376,7 +384,7 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **最后一个迁移文件例外，而且是暂时的。** 当时最后一个文件是 `0002_replication.sql`；实测把其中的 `entries.name` 改成 `TEXT`、删掉两个索引之一、或把 `logs.trimmed_by_age` 改成 `TEXT`，两条结构比对**一条都不响**，只有可重新生成的 golden 响。最后一个文件在新库与迁移库两条路上都会运行，所以两边一起变化；它成为历史时必须取得独立见证。
 
-`0003_durable_state.sql` 落地时，`testdata/version2.sql` 与 `TestTheSecondMigrationDescribesTheVersionTwoDatabasesThatExist` 钉住了 v2，上述义务已经成为测试。当前最后一个文件是 `0003`；它在 `0004` 落地时必须以同样方式取得 v3 见证。
+`0003_durable_state.sql` 落地时，`testdata/version2.sql` 与 `TestTheSecondMigrationDescribesTheVersionTwoDatabasesThatExist` 钉住了 v2，上述义务已经成为测试。`0004_lease_recovery.sql` 使 `0003` 成为历史，v3 结构也须用独立见证固定，不能只比较两条都运行 `0004` 的路径。
 
 （顺带记下一个实测意外：`entries.name` 在 `0002` 里改成 `TEXT` 之后，**没有任何行为测试变红**。原因是 SQLite 的 TEXT 亲和性不会把 BLOB 值转成文本，存进去的字节仍按字节比较。所以那一处是 golden 独自兜住的，不是被行为测试兜住的。）
 
@@ -451,6 +459,6 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **代价四：保留窗口与资源 ceiling 的默认值都需要部署校准。** 一万条挡不住一次动两千文件的分支切换，而掉出窗口的代价随树的规模增长。快照 deadline/page、single-frame bytes、subscription 数、snapshot-frame concurrency/aggregate/waiters，以及 confirmation grace/active/waiters 都以有限默认值交付；越界会响亮失败，不会扩张成无界 retention。默认值不能替代对真实 tree、change rate 与并发 mount 数的测量。
 
-**`localdir` 后端没有复制，而它曾经是全部端到端测试的夹具。** 那批测试已经换到 metastore 后端（SQLite + 内存对象），于是它们走的是真实部署走的那条路径；`localdir` 留下两个用例，因为那是这个系统仍然要服务的一种形态，也是唯一能从被测代码之外读到字节的那一种。
+**端到端验收必须经过部署实际使用的复制路径。** 引入复制时，测试从 `localdir` 转向 metastore 后端；取消宿主目录后端后，独立二进制覆盖 localstore 与 Azure Blob。可替换 storage 仍允许没有 Log，这一能力分支由专门夹具覆盖，不能因随附后端都有日志而删除。
 
 **验收是这样验的，每一条都有对应的用例。** 一次目录改名在副本里只搬一行：改名之后子树里每个节点的编号不变、挂载点上每个 inode 号不变，且除了改名本身没有产生任何请求。快照期间持续写入，追平之后副本与服务端的 metastore 逐节点一致——那个用例会先断言「确实有写入压在扫描窗口里」，否则它判自己失败。事件通道断开时十一个操作各自失败一次，且不返回空目录、不报告文件不存在；把这条防护拆掉之后，它报出来的是「列目录成功，2 个条目」与「一个存在的名字答不存在」。日志答「无法重放」时客户端重建而不是接着走，用快照的次数是证据。一个不记日志的命名空间以 ENOSYS 拒绝复制，挂载点照常工作，而它的每一次 stat 都到达服务端。

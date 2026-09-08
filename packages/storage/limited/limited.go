@@ -1,30 +1,21 @@
-// Package limited holds a namespace under a byte allowance and refuses the write that
-// would carry it past one.
+// Package limited enforces a workspace byte allowance over a bounded namespace.
+// Startup and explicit Recount walk the namespace with bounded directory and traversal
+// memory; subsequent mutations update the count without a traversal.
 //
-// The count and the refusal are ours. They have to be: the store a namespace is held in
-// need have no notion of an allowance at all — a plain directory has none — and the
-// allowance belongs to the workspace rather than to the disk underneath it. So this wraps
-// any storage.Storage that can produce bounded results. What the namespace holds is
-// measured once, when it is opened, and moved afterwards by every mutation that passes
-// through.
+// Native publication accounting measures the actual target under the backend's final
+// ordering, reserves growth before the namespace effect, and releases shrinking bytes
+// after an applied effect. Unknown outcomes and failed accounting settlements make the
+// allowance unusable until reopening.
+// The wrapper preserves the native lock service, mutation scope, and lifecycle.
 //
-// Measurement requires storage.BoundedStorage. A complete directory obtained through
-// Storage.List has already escaped any limit by the time this package sees it; the bounded
-// interface lets the caller's measurement budget stop enumeration before that allocation.
+// Other bounded backends use per-path size sampling, which does not coordinate ancestor
+// renames. They cannot expose a lock service through this wrapper. Enumeration always
+// requires storage.BoundedStorage so measurement stops before excess allocation.
 //
-// The count is exact for everything that goes through here and for nothing else. The
-// served namespace being modified behind the server's back is a stated non-goal, and no
-// amount of in-band traffic repairs the drift it causes: a file deleted out of band keeps
-// its bytes charged for good, and one added out of band is credited when it is removed in
-// band, which drives the count down.
-//
-// The count is held at or above zero, and what that bounds is what we report and nothing
-// more. The room named to a caller never exceeds what the allowance leaves and never
-// arrives in a kernel reply's unsigned field as an enormous positive, which is the
-// fabricated fact R-ERR-2 forbids. It does not bound what is true: a count that drift has
-// left below what the namespace holds accepts writes that carry the namespace past its
-// allowance, and the refusal R-WS-5 asks for is then not made at all. Only a fresh
-// measurement repairs that, and Recount is the one way to it.
+// Out-of-band changes invalidate accounting. The zero floor only bounds reported figures;
+// it cannot prevent overspending when drift has left the count below actual usage.
+// Recount repairs a known count by measuring again; it cannot resolve uncertain native
+// publication accounting.
 package limited
 
 import (
@@ -40,6 +31,7 @@ import (
 	"syscall"
 	"unsafe"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -112,11 +104,8 @@ func (l MeasurementLimits) Validate() error {
 	return err
 }
 
-// stripeCount is how many path exclusions there are. The set is fixed rather than grown
-// per path because R-INT-3 forbids anything that accumulates without a bound, and one
-// mutex per path in a namespace is that. Two distinct paths that fall on one stripe
-// serialise with each other and with nothing else, which is a bounded cost against work
-// that is one stat and one write of the whole file.
+// The fallback path exclusions have fixed capacity. Native backends provide their own
+// final target ordering and do not hold these stripes while staging content.
 const stripeCount = 256
 
 // Storage is a namespace held under an allowance.
@@ -124,20 +113,19 @@ type Storage struct {
 	backing     storage.BoundedStorage
 	limit       int64
 	measurement MeasurementLimits
+	accounted   bool
 
 	// gate is closed by Recount and held open by every operation, the read-only ones
 	// included. Only a mutation can spoil the walk Recount makes, but a rule with
 	// exceptions in it is one a later mutating operation gets added outside of.
 	gate sync.RWMutex
 
-	// countMu guards count alone rather than the storage as a whole. R-CC-2 requires
-	// writes to different files not to interfere, and one lock held across an operation
-	// is that interference.
+	// countMu guards arithmetic and the unknown-outcome fault, never backing I/O.
 	countMu sync.Mutex
 	count   int64
+	fault   error
 
-	// stripes exclude two operations on one path, so that the size a write reads before
-	// it charges cannot change under it.
+	// Only non-native backends use sampled sizes protected by these path stripes.
 	stripes [stripeCount]sync.Mutex
 }
 
@@ -180,18 +168,30 @@ func NewWithLimits(
 	if !ok {
 		return nil, fmt.Errorf("measuring an allowance requires backing storage with bounded listings: %w", syscall.ENOSYS)
 	}
+	accounted := false
+	if native, ok := bounded.(interface{ CheckPublicationAccounting() error }); ok {
+		switch err := native.CheckPublicationAccounting(); err {
+		case nil:
+			accounted = true
+		case syscall.ENOSYS:
+		default:
+			return nil, err
+		}
+	}
+	if source, ok := bounded.(interface{ LockService() locking.Service }); ok && source.LockService() != nil && !accounted {
+		return nil, fmt.Errorf("a lock-enabled namespace requires native publication accounting for its allowance: %w", syscall.ENOSYS)
+	}
 	count, err := measure(ctx, bounded, effective)
 	if err != nil {
 		return nil, err
 	}
-	return &Storage{backing: bounded, limit: limit, measurement: effective, count: count}, nil
+	return &Storage{backing: bounded, limit: limit, measurement: effective, count: count, accounted: accounted}, nil
 }
 
 // Recount measures the namespace again and replaces the count with what it finds.
 //
-// It is the way back from drift, and the only one: everything passing through this storage
-// is counted exactly, so no amount of in-band traffic corrects a figure that out-of-band
-// work moved.
+// Uncertain native publication accounting requires reopening the namespace and cannot
+// be cleared by recounting. In-band traffic does not repair out-of-band accounting drift.
 //
 // Nothing mutates while it walks. Every caller therefore waits for the length of a tree
 // traversal, which is a price an operator may choose to pay and not one anything may
@@ -199,6 +199,9 @@ func NewWithLimits(
 func (s *Storage) Recount(ctx context.Context) error {
 	s.gate.Lock()
 	defer s.gate.Unlock()
+	if err := s.healthy(); err != nil {
+		return err
+	}
 
 	count, err := measure(ctx, s.backing, s.measurement)
 	if err != nil {
@@ -389,24 +392,15 @@ func measurementCanceled(ctx context.Context) error {
 	return nil
 }
 
-// reserve charges delta against the allowance, refusing what the allowance cannot pay for,
-// and reports how far the count actually moved.
-//
-// The check and the charge are one step, and both happen before the write that spends
-// them. Two writers to different paths that each checked before either charged would both
-// pass a check only one of them could satisfy; the caller hands the charge back if the
-// write it covered fails.
-//
-// What is handed back is the figure returned here rather than delta, because the two part
-// company where the floor bites: a count of 5 charged -10 lands at 0, having moved by 5,
-// and giving 10 back would leave the count above where the write found it. The pair has to
-// be invertible, since a write that did not happen may not move the count at all.
-//
-// A delta that shrinks the namespace is never refused, not even from over the allowance.
-// Refusing it would leave a workspace that is over its limit with no way back under it.
+// reserve atomically charges growth before publication. Shrinking writes retain their
+// previous charge until successful publication; other writers cannot spend bytes that
+// the namespace still holds. The returned reservation is released if publication fails.
 func (s *Storage) reserve(name string, delta int64) (int64, error) {
 	s.countMu.Lock()
 	defer s.countMu.Unlock()
+	if s.fault != nil {
+		return 0, s.fault
+	}
 
 	// Written as a subtraction from the allowance rather than an addition to the count,
 	// so that a namespace holding close to what a byte count holds cannot wrap the sum
@@ -416,9 +410,9 @@ func (s *Storage) reserve(name string, delta int64) (int64, error) {
 			"%d more bytes would carry the namespace past its allowance of %d bytes, of which %d are taken: %w",
 			delta, s.limit, s.count, syscall.EDQUOT)}
 	}
-	before := s.count
-	s.count = floor(s.count + delta)
-	return s.count - before, nil
+	charged := max(delta, 0)
+	s.count += charged
+	return charged, nil
 }
 
 // release gives back bytes the namespace no longer holds: a charge whose write failed, or
@@ -429,10 +423,10 @@ func (s *Storage) release(delta int64) {
 	s.count = floor(s.count - delta)
 }
 
-func (s *Storage) taken() int64 {
+func (s *Storage) taken() (int64, error) {
 	s.countMu.Lock()
 	defer s.countMu.Unlock()
-	return s.count
+	return s.count, s.fault
 }
 
 // floor holds the count at or above zero, and it is applied where the count is stored
@@ -471,8 +465,10 @@ func stripeOf(cleaned string) uint32 {
 func (s *Storage) Space(ctx context.Context) (storage.Space, error) {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
-
-	taken := s.taken()
+	taken, err := s.taken()
+	if err != nil {
+		return storage.Space{}, err
+	}
 	space := storage.Space{Total: s.limit, Used: taken, Avail: max(s.limit-taken, 0)}
 
 	beneath, err := s.backing.Space(ctx)
@@ -496,9 +492,9 @@ func (s *Storage) Space(ctx context.Context) (storage.Space, error) {
 // Write charges the difference between what the file will hold and what it holds now, and
 // refuses with EDQUOT when the allowance cannot pay for it.
 //
-// The charge happens before the write and is given back if the write fails, which is what
-// keeps two writers to different paths from both spending the same last bytes. The stripe
-// keeps the size read here from moving between the reading and the charging.
+// Native backends determine the sizes and settle the charge under final publication
+// ordering. Other backends sample the size under a path stripe, reserve growth before
+// Write, refund on failure, and release shrinking bytes only after success.
 func (s *Storage) Write(ctx context.Context, name string, content []byte) error {
 	cleaned, err := storage.CleanPath(name)
 	if err != nil {
@@ -506,6 +502,12 @@ func (s *Storage) Write(ctx context.Context, name string, content []byte) error 
 	}
 	s.gate.RLock()
 	defer s.gate.RUnlock()
+	if err := s.healthy(); err != nil {
+		return err
+	}
+	if s.accounted {
+		return s.publicationError(s.backing.Write(s.accountingContext(ctx, name), name, content))
+	}
 	stripe := &s.stripes[stripeOf(cleaned)]
 	stripe.Lock()
 	defer stripe.Unlock()
@@ -524,7 +526,7 @@ func (s *Storage) Write(ctx context.Context, name string, content []byte) error 
 		// for one and ELOOP for the other, and a directory has no size to charge against
 		// in any case. Charging first would answer EDQUOT in place of the errno that says
 		// what is actually at the name.
-		return s.backing.Write(ctx, name, content)
+		return s.publicationError(s.backing.Write(ctx, name, content))
 	default:
 		held = attr.Size
 	}
@@ -535,8 +537,14 @@ func (s *Storage) Write(ctx context.Context, name string, content []byte) error 
 		return err
 	}
 	if err := s.backing.Write(ctx, name, content); err != nil {
+		if storage.IsPublicationAccountingUncertain(err) {
+			return s.publicationError(err)
+		}
 		s.release(charged)
 		return err
+	}
+	if delta < 0 {
+		s.release(-delta)
 	}
 	return nil
 }
@@ -550,6 +558,12 @@ func (s *Storage) Remove(ctx context.Context, name string) error {
 	}
 	s.gate.RLock()
 	defer s.gate.RUnlock()
+	if err := s.healthy(); err != nil {
+		return err
+	}
+	if s.accounted {
+		return s.publicationError(s.backing.Remove(s.accountingContext(ctx, name), name))
+	}
 	stripe := &s.stripes[stripeOf(cleaned)]
 	stripe.Lock()
 	defer stripe.Unlock()
@@ -561,10 +575,10 @@ func (s *Storage) Remove(ctx context.Context, name string) error {
 	// the count is allowed to err in.
 	attr, err := s.backing.Stat(ctx, name)
 	if err != nil || attr.IsDir() {
-		return s.backing.Remove(ctx, name)
+		return s.publicationError(s.backing.Remove(ctx, name))
 	}
 	if err := s.backing.Remove(ctx, name); err != nil {
-		return err
+		return s.publicationError(err)
 	}
 	s.release(attr.Size)
 	return nil
@@ -584,6 +598,12 @@ func (s *Storage) Rename(ctx context.Context, from, to string) error {
 	}
 	s.gate.RLock()
 	defer s.gate.RUnlock()
+	if err := s.healthy(); err != nil {
+		return err
+	}
+	if s.accounted {
+		return s.publicationError(s.backing.Rename(s.accountingContext(ctx, to), from, to))
+	}
 
 	// Both stripes, in index order. Two renames in opposite directions between the same
 	// pair of paths would otherwise each hold the one the other is waiting for.
@@ -609,7 +629,7 @@ func (s *Storage) Rename(ctx context.Context, from, to string) error {
 	// ours to answer: naming the root either way is EBUSY, and a source that is not there
 	// is ENOENT.
 	if cleanFrom == cleanTo {
-		return s.backing.Rename(ctx, from, to)
+		return s.publicationError(s.backing.Rename(ctx, from, to))
 	}
 
 	// As in Remove: a destination that could not be stat-ed and a destination that is a
@@ -619,7 +639,7 @@ func (s *Storage) Rename(ctx context.Context, from, to string) error {
 		replaced = attr.Size
 	}
 	if err := s.backing.Rename(ctx, from, to); err != nil {
-		return err
+		return s.publicationError(err)
 	}
 	s.release(replaced)
 	return nil
@@ -641,7 +661,10 @@ func (s *Storage) Stat(ctx context.Context, name string) (storage.Attr, error) {
 func (s *Storage) SetAttr(ctx context.Context, name string, change storage.AttrChange) error {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
-	return s.backing.SetAttr(ctx, name, change)
+	if err := s.healthy(); err != nil {
+		return err
+	}
+	return s.publicationError(s.backing.SetAttr(s.mutationContext(ctx, name), name, change))
 }
 
 // CheckBounded refuses use as an embedded-server backend when the wrapped namespace
@@ -684,17 +707,26 @@ func (s *Storage) ReadBounded(ctx context.Context, name string, maxBytes int64) 
 func (s *Storage) Create(ctx context.Context, name string) error {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
-	return s.backing.Create(ctx, name)
+	if err := s.healthy(); err != nil {
+		return err
+	}
+	return s.publicationError(s.backing.Create(s.mutationContext(ctx, name), name))
 }
 
 func (s *Storage) Mkdir(ctx context.Context, name string) error {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
-	return s.backing.Mkdir(ctx, name)
+	if err := s.healthy(); err != nil {
+		return err
+	}
+	return s.publicationError(s.backing.Mkdir(s.mutationContext(ctx, name), name))
 }
 
 func (s *Storage) RemoveDir(ctx context.Context, name string) error {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
-	return s.backing.RemoveDir(ctx, name)
+	if err := s.healthy(); err != nil {
+		return err
+	}
+	return s.publicationError(s.backing.RemoveDir(s.mutationContext(ctx, name), name))
 }

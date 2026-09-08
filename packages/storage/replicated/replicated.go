@@ -20,7 +20,7 @@
 // So this is not a cache. Nothing here expires, nothing is revalidated, and no operation
 // checks whether what it holds is still current: either the stream is alive, in which case
 // everything here is what the server had as of a position it can name, or the stream is not,
-// in which case every operation fails with EIO (R-ERR-1, R-ERR-2). A copy that answered from
+// in which case every namespace operation fails with EIO (R-ERR-1, R-ERR-2). A copy that answered from
 // a broken stream would report "no such file" for files that are there and an empty listing
 // for directories that are not, which is the answer that makes whatever runs on top delete,
 // regenerate and overwrite.
@@ -30,6 +30,8 @@
 // Stat and List are answered here. Everything else — the bytes of a file, every change to
 // the namespace, and how much room it has — goes to the server, because none of it is
 // metadata this copy holds and none of it is a question a copy may answer.
+// Explicit lease control also goes directly to the authority. It remains available when
+// the metadata stream fails, so a caller can reconcile or release an outstanding grant.
 //
 // The kernel is told to cache nothing: packages/fuse leaves all three of its timeouts at
 // zero, so every lookup, every stat and every listing still arrives here. That is deliberate

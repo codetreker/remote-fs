@@ -662,9 +662,7 @@ func TestTerminalPoolCloseReportingFailuresAreCached(t *testing.T) {
 				}
 				return snapshot, nil
 			},
-			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64) (int64, int64, error) {
-				return 1, 1, nil
-			},
+			prepare: prepare,
 			closePool: func(db *sql.DB) error {
 				closed := db.Close()
 				switch db {

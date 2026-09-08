@@ -14,7 +14,7 @@ Status: proposed
 
 以下事项分别处理；任何一项进入实现时都要拥有自己的决定与验收证据。
 
-**namespace entry 与路径深度没有语义上限。** local-disk object key、payload 和 HTTP body 已有各自的上限，但使用者给出的 entry name 仍不受 Linux 常见的 255-byte component 限制，路径也可以任意深。metastore 的逐层解析会把深度直接变成一次调用内的查询数；`localdir` 由宿主内核拒绝的名字，object-store namespace 可能接受，两个后端因而会给出不同边界。
+**namespace entry 与路径深度没有语义上限。** local-disk object key、payload 和 HTTP body 已有各自的上限，但逻辑 entry name 与路径深度没有统一的语义限制。metastore 的逐层解析会把深度直接变成一次调用内的查询数；物理对象与传输预算不能代替命名空间的名字和深度边界。[移除宿主目录后端](../../implemented/simplification/2026-09-08-remove-the-host-directory-backend.md)取消了与宿主内核的边界差异，没有为对象命名空间补上这项限制。
 
 **用量计数损坏后没有带内修复。** metastore 在事务里维护精确的 referenced payload 用量，`Space` 发现数字不自洽时以 `EIO` 失败，不把它夹回一个看似合理的值。这保护了 R-ERR-2，代价是缺陷、部分恢复或人工修改一旦破坏账本，object-store namespace 没有与 `limited.Recount` 对应的修复操作，`Space` 会持续失败。
 
@@ -24,7 +24,7 @@ Status: proposed
 
 **Azure SDK 的版本受 Azurite 上限约束。** Azurite 接受的最高 `x-ms-version` 与 SDK 默认发送的版本必须匹配。升级 SDK 需要先证明当前 emulator 能接收它，并重新运行真实错误分类与 digest 用例；单独覆盖一个请求头会让测试配置与生产默认分叉。
 
-**SQLite 的跨进程写争用没有直接用例。** `busy_timeout` 已配置，但 metastore 并发用例使用同一进程里的连接池。local store 的 lifetime `flock` 阻止两个 owner 同时打开同一 root，不能证明 Azure Blob 模式下两个进程共享一份 SQLite metastore 时的等待、超时与错误分类。
+**未绑定锁服务的 raw SQLite API，其跨进程写争用没有直接用例。** `busy_timeout` 已配置，但该 API 的 metastore 并发用例使用同一进程里的连接池，不能证明多个进程共享数据库时的等待、超时与错误分类。随附 localstore 与 Azure Blob 服务端使用独占拥有的锁存储；它们拒绝第二个活跃拥有者，不属于这项共享数据库的待验收范围。
 
 **`Sweep` 的无错误部分完成分支不可达。** `discard` 只有在 `Delete` 失败时才会返回少于输入数量的 `gone`，而 `Sweep` 会先返回该错误，再走不到 `gone < len(keys)` 的无错误停止分支。部分删除与 `Forget` 同时失败已经有用例，未解决的是这个分支应删除，还是 `discard` 应明确允许不带错误的部分完成。
 

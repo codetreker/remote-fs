@@ -28,9 +28,10 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/fuse"
 	"github.com/codetreker/remote-fs/packages/fuse/fusetest"
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/limited"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 )
 
 // TestMain runs the tests beneath a temporary directory of this run's own, so that a
@@ -59,14 +60,10 @@ func requireFUSE(t *testing.T) {
 	}
 }
 
-// mountBacking mounts a namespace held in one directory at a fresh mountpoint.
-func mountBacking(t *testing.T, backing string) string {
+func fuseNamespace(t *testing.T) storage.Storage {
 	t.Helper()
-	s, err := localdir.New(backing)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return mountStorage(t, s, fuse.Options{Logger: testLogger(t)})
+	_, backing := memoryfixture.New(t, "fuse", 0, locking.DefaultOptions())
+	return backing
 }
 
 // mountStorage mounts s at a fresh mountpoint. The mountpoint is torn down whether or
@@ -103,11 +100,19 @@ func unmount(t *testing.T, m *fuse.Mount, mountpoint string) {
 
 // mountedPair returns a mountpoint backed by one namespace, and a plain directory. The
 // differential test applies the same operations to both.
-func mountedPair(t *testing.T) (mountpoint, plain, backing string) {
+func mountedPair(t *testing.T) (mountpoint, plain string, backing storage.Storage) {
 	t.Helper()
-	backing = t.TempDir()
+	backing = fuseNamespace(t)
 	plain = t.TempDir()
-	mountpoint = mountBacking(t, backing)
+	info, err := os.Stat(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mode := info.Mode() & storage.SettableMode
+	if err := backing.SetAttr(t.Context(), "", storage.AttrChange{Mode: &mode}); err != nil {
+		t.Fatal(err)
+	}
+	mountpoint = mountStorage(t, backing, fuse.Options{Logger: testLogger(t)})
 	return mountpoint, plain, backing
 }
 
@@ -247,10 +252,8 @@ func treeDiff(t *testing.T, mountpoint, plain string) string {
 // The sequence builds on itself, so later steps operate on what earlier ones left. Each
 // step reports what it observed; the tree is compared after every one of them.
 //
-// A statfs step does not belong here, tempting as the symmetry is. Both roots sit on the
-// same host filesystem, so the two answers would agree by construction and say nothing
-// about the conversion into blocks; and the host's own free-block counters move between
-// the two calls, so the comparison would fail at random as well.
+// Namespace allowance and host filesystem capacity describe different resources, and
+// host free-block counters move between calls, so statfs is not compared here.
 // TestSpaceIsReportedInWholeBlocks drives that conversion from figures chosen for it.
 var differentialSteps = []step{
 	{"list the empty root", func(root string) (string, error) {
@@ -573,7 +576,7 @@ var differentialSteps = []step{
 		p := filepath.Join(root, "attr.txt")
 		accessed := time.Date(1999, time.December, 31, 23, 59, 58, 1, time.UTC)
 		changed := time.Date(2004, time.July, 6, 1, 2, 3, 999_999_999, time.UTC)
-		if err := os.Chtimes(p, accessed, changed); err != nil {
+		if err := comparisonChtimes(p, accessed, changed); err != nil {
 			return "", err
 		}
 		return describeTimes(p)
@@ -581,7 +584,7 @@ var differentialSteps = []step{
 	{"set only the access time", func(root string) (string, error) {
 		p := filepath.Join(root, "attr.txt")
 		accessed := time.Date(1987, time.May, 4, 3, 2, 1, 0, time.UTC)
-		if err := os.Chtimes(p, accessed, time.Time{}); err != nil {
+		if err := comparisonChtimes(p, accessed, time.Time{}); err != nil {
 			return "", err
 		}
 		return describeTimes(p)
@@ -591,11 +594,11 @@ var differentialSteps = []step{
 		// than whichever instant the walk between two steps last read the file at.
 		p := filepath.Join(root, "attr.txt")
 		accessed := time.Date(1993, time.August, 7, 6, 5, 4, 3, time.UTC)
-		if err := os.Chtimes(p, accessed, accessed); err != nil {
+		if err := comparisonChtimes(p, accessed, accessed); err != nil {
 			return "", err
 		}
 		changed := time.Date(2038, time.January, 19, 3, 14, 8, 0, time.UTC)
-		if err := os.Chtimes(p, time.Time{}, changed); err != nil {
+		if err := comparisonChtimes(p, time.Time{}, changed); err != nil {
 			return "", err
 		}
 		return describeTimes(p)
@@ -603,7 +606,7 @@ var differentialSteps = []step{
 	{"set a directory's times", func(root string) (string, error) {
 		p := filepath.Join(root, "attrdir")
 		moment := time.Date(2011, time.November, 11, 11, 11, 11, 0, time.UTC)
-		if err := os.Chtimes(p, moment, moment); err != nil {
+		if err := comparisonChtimes(p, moment, moment); err != nil {
 			return "", err
 		}
 		return describeTimes(p)
@@ -613,7 +616,7 @@ var differentialSteps = []step{
 	}},
 	{"change the times of something that is not there", func(root string) (string, error) {
 		moment := time.Unix(1_000_000, 0)
-		return "", os.Chtimes(filepath.Join(root, "absent.txt"), moment, moment)
+		return "", comparisonChtimes(filepath.Join(root, "absent.txt"), moment, moment)
 	}},
 	{"change the mode below a file", func(root string) (string, error) {
 		return "", os.Chmod(filepath.Join(root, "attr.txt", "below"), 0o600)
@@ -638,6 +641,21 @@ var differentialSteps = []step{
 	{"make a directory with permissions of its own", func(root string) (string, error) {
 		return "", os.Mkdir(filepath.Join(root, "owndir"), 0o700)
 	}},
+}
+
+// Runtime preemption can interrupt FUSE requests, and Chtimes does not retry EINTR.
+// Repeating the exact timestamps preserves the atime/mtime values compared here;
+// ctime is outside this comparison.
+// https://github.com/hanwen/go-fuse/blob/423b377e1452ab7b3522229185a3047f72e3f966/fs/api.go#L129-L135
+func comparisonChtimes(path string, accessed, changed time.Time) error {
+	var err error
+	for range 8 {
+		err = os.Chtimes(path, accessed, changed)
+		if !errors.Is(err, syscall.EINTR) {
+			return err
+		}
+	}
+	return err
 }
 
 // describeTimes reports both of a node's times, to the nanosecond. Set explicitly, they
@@ -690,9 +708,9 @@ func pattern(n int) []byte {
 // --- crossing the boundary the other way ---------------------------------------------
 
 // The differential test can only see what the mount chooses to report back. These cases
-// act through the mountpoint and check the namespace underneath it with plain os calls,
-// and act on the namespace and check what the mountpoint reports. A mount that kept
-// everything in memory would pass the differential test and fail here.
+// act through the mountpoint and inspect the namespace through storage.Storage, and
+// mutate the namespace directly and check what the mountpoint reports. A mount that
+// kept changes only in its own buffers would pass the differential test and fail here.
 
 func TestWritesReachTheNamespaceUnderneath(t *testing.T) {
 	mountpoint, _, backing := mountedPair(t)
@@ -704,7 +722,7 @@ func TestWritesReachTheNamespaceUnderneath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	body, err := os.ReadFile(filepath.Join(backing, "d", "f"))
+	body, err := backing.Read(t.Context(), "d/f")
 	if err != nil {
 		t.Fatalf("the file never reached the namespace: %v", err)
 	}
@@ -719,14 +737,14 @@ func TestWritesReachTheNamespaceUnderneath(t *testing.T) {
 func TestChangesUnderneathAreVisibleImmediately(t *testing.T) {
 	mountpoint, _, backing := mountedPair(t)
 
-	if err := os.WriteFile(filepath.Join(backing, "f"), []byte("first"), 0o644); err != nil {
+	if err := backing.Write(t.Context(), "f", []byte("first")); err != nil {
 		t.Fatal(err)
 	}
 	if body, err := os.ReadFile(filepath.Join(mountpoint, "f")); err != nil || string(body) != "first" {
 		t.Fatalf("read %q, %v through the mount, want %q", body, err, "first")
 	}
 
-	if err := os.WriteFile(filepath.Join(backing, "f"), []byte("second value"), 0o644); err != nil {
+	if err := backing.Write(t.Context(), "f", []byte("second value")); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(filepath.Join(mountpoint, "f"))
@@ -741,7 +759,7 @@ func TestChangesUnderneathAreVisibleImmediately(t *testing.T) {
 		t.Fatalf("read %q, %v through the mount, want %q", body, err, "second value")
 	}
 
-	if err := os.Remove(filepath.Join(backing, "f")); err != nil {
+	if err := backing.Remove(t.Context(), "f"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(mountpoint, "f")); !errors.Is(err, syscall.ENOENT) {
@@ -802,7 +820,7 @@ func TestFsyncCommits(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	body, err := os.ReadFile(filepath.Join(backing, "f"))
+	body, err := backing.Read(t.Context(), "f")
 	if err != nil {
 		t.Fatalf("fsync reported success and the file is not in the namespace: %v", err)
 	}
@@ -883,14 +901,14 @@ func TestAnOpenHandleFollowsItsFileThroughARename(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	body, err := os.ReadFile(filepath.Join(backing, "after"))
+	body, err := backing.Read(t.Context(), "after")
 	if err != nil {
 		t.Fatalf("the renamed file is not in the namespace: %v", err)
 	}
 	if string(body) != "payload" {
 		t.Fatalf("the renamed file holds %q, want %q", body, "payload")
 	}
-	if _, err := os.Stat(filepath.Join(backing, "before")); !errors.Is(err, syscall.ENOENT) {
+	if _, err := backing.Stat(t.Context(), "before"); !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("the old name is still in the namespace (%v); the write went to the wrong file", err)
 	}
 }
@@ -901,7 +919,7 @@ func TestAnOpenHandleFollowsItsFileThroughARename(t *testing.T) {
 func TestListingADirectoryNothingHasLookedInsideYet(t *testing.T) {
 	mountpoint, _, backing := mountedPair(t)
 	for _, name := range []string{"a", "b", "c"} {
-		if err := os.WriteFile(filepath.Join(backing, name), []byte(name), 0o644); err != nil {
+		if err := backing.Write(t.Context(), name, []byte(name)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1053,7 +1071,7 @@ func TestAnIdentityIsNotHandedOutASecondTime(t *testing.T) {
 // against the other's.
 func TestConcurrentLookupsOfOneNameAgreeOnItsIdentity(t *testing.T) {
 	mountpoint, _, backing := mountedPair(t)
-	if err := os.WriteFile(filepath.Join(backing, "f"), []byte("payload"), 0o644); err != nil {
+	if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1093,18 +1111,18 @@ func TestConcurrentLookupsOfOneNameAgreeOnItsIdentity(t *testing.T) {
 func TestANodeReplacedUnderneathTheMountIsANewNode(t *testing.T) {
 	mountpoint, _, backing := mountedPair(t)
 
-	if err := os.WriteFile(filepath.Join(backing, "f"), []byte("first"), 0o644); err != nil {
+	if err := backing.Write(t.Context(), "f", []byte("first")); err != nil {
 		t.Fatal(err)
 	}
 	first := ino(t, filepath.Join(mountpoint, "f"))
 
-	if err := os.Remove(filepath.Join(backing, "f")); err != nil {
+	if err := backing.Remove(t.Context(), "f"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(mountpoint, "f")); !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("stat of the removed file failed with %v, want ENOENT", err)
 	}
-	if err := os.WriteFile(filepath.Join(backing, "f"), []byte("second"), 0o644); err != nil {
+	if err := backing.Write(t.Context(), "f", []byte("second")); err != nil {
 		t.Fatal(err)
 	}
 	if second := ino(t, filepath.Join(mountpoint, "f")); second == first {
@@ -1117,7 +1135,7 @@ func TestANodeReplacedUnderneathTheMountIsANewNode(t *testing.T) {
 func TestANameThatBecomesADirectoryIsADifferentNode(t *testing.T) {
 	mountpoint, _, backing := mountedPair(t)
 
-	if err := os.WriteFile(filepath.Join(backing, "x"), []byte("payload"), 0o644); err != nil {
+	if err := backing.Write(t.Context(), "x", []byte("payload")); err != nil {
 		t.Fatal(err)
 	}
 	open, err := os.Open(filepath.Join(mountpoint, "x"))
@@ -1127,10 +1145,10 @@ func TestANameThatBecomesADirectoryIsADifferentNode(t *testing.T) {
 	defer open.Close()
 	asFile := ino(t, filepath.Join(mountpoint, "x"))
 
-	if err := os.Remove(filepath.Join(backing, "x")); err != nil {
+	if err := backing.Remove(t.Context(), "x"); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(filepath.Join(backing, "x"), 0o755); err != nil {
+	if err := backing.Mkdir(t.Context(), "x"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1151,19 +1169,19 @@ func TestANameThatBecomesADirectoryIsADifferentNode(t *testing.T) {
 func TestAListingNoticesWhatTheDirectoryNoLongerHas(t *testing.T) {
 	mountpoint, _, backing := mountedPair(t)
 	for _, name := range []string{"a", "b"} {
-		if err := os.WriteFile(filepath.Join(backing, name), []byte(name), 0o644); err != nil {
+		if err := backing.Write(t.Context(), name, []byte(name)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	first := listedInodes(t, mountpoint)
 
-	if err := os.Remove(filepath.Join(backing, "a")); err != nil {
+	if err := backing.Remove(t.Context(), "a"); err != nil {
 		t.Fatal(err)
 	}
 	if listed := listedInodes(t, mountpoint); len(listed) != 1 {
 		t.Fatalf("the listing holds %v after one of the two was removed", listed)
 	}
-	if err := os.WriteFile(filepath.Join(backing, "a"), []byte("again"), 0o644); err != nil {
+	if err := backing.Write(t.Context(), "a", []byte("again")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1177,13 +1195,62 @@ func TestAListingNoticesWhatTheDirectoryNoLongerHas(t *testing.T) {
 
 // --- symbolic links --------------------------------------------------------------------
 
-// The namespace has no operation that makes a symbolic link or reads one back, so this
-// version does not provide them (R-FS-1 asks for them eventually). A directory the server
-// was given can hold one all the same, put there by whatever else reaches that directory,
-// and what the mount owes such a link is an honest report: it is a link, and where it
-// points is something this mount cannot say.
-//
-// plantLink puts one, and the file it points at, into a directory.
+// The storage interface can describe symbolic links but cannot create or resolve them.
+// The mount must preserve that type and refuse resolution. SQLite stores only files
+// and directories, so this decorator describes real sentinel nodes as links, retaining
+// their namespace identities in both Stat and List.
+type linkStorage struct {
+	storage.Storage
+	lengths map[uint64]int64
+}
+
+func (s *linkStorage) describe(attr storage.Attr) storage.Attr {
+	if length, ok := s.lengths[attr.ID]; ok {
+		attr.Mode = fs.ModeSymlink | 0o777
+		attr.Size = length
+	}
+	return attr
+}
+
+func (s *linkStorage) Stat(ctx context.Context, path string) (storage.Attr, error) {
+	attr, err := s.Storage.Stat(ctx, path)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	return s.describe(attr), nil
+}
+
+func (s *linkStorage) List(ctx context.Context, path string) ([]storage.Entry, error) {
+	entries, err := s.Storage.List(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	for i := range entries {
+		entries[i].Attr = s.describe(entries[i].Attr)
+	}
+	return entries, nil
+}
+
+func mountLinks(t *testing.T) (string, storage.Storage) {
+	t.Helper()
+	backing := fuseNamespace(t)
+	if err := backing.Write(t.Context(), "target", []byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	links := &linkStorage{Storage: backing, lengths: make(map[uint64]int64)}
+	for name, target := range map[string]string{"link": "target", "dangling": "nowhere"} {
+		if err := backing.Create(t.Context(), name); err != nil {
+			t.Fatal(err)
+		}
+		attr, err := backing.Stat(t.Context(), name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		links.lengths[attr.ID] = int64(len(target))
+	}
+	return mountStorage(t, links, fuse.Options{Logger: testLogger(t)}), backing
+}
+
 func plantLink(t *testing.T, dir string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, "target"), []byte("payload"), 0o644); err != nil {
@@ -1205,8 +1272,8 @@ func plantLink(t *testing.T, dir string) {
 //
 // The plain directory is the answer here as everywhere: a link is what lstat(2) says it is.
 func TestASymbolicLinkIsReportedAsALink(t *testing.T) {
-	mountpoint, plain, backing := mountedPair(t)
-	plantLink(t, backing)
+	mountpoint, _ := mountLinks(t)
+	plain := t.TempDir()
 	plantLink(t, plain)
 
 	for _, name := range []string{"link", "dangling"} {
@@ -1233,8 +1300,7 @@ func TestASymbolicLinkIsReportedAsALink(t *testing.T) {
 // different kinds would conclude on every alternation that the node had been replaced, and
 // hand what is in fact one live node a fresh number each time.
 func TestASymbolicLinkKeepsOneIdentity(t *testing.T) {
-	mountpoint, _, backing := mountedPair(t)
-	plantLink(t, backing)
+	mountpoint, _ := mountLinks(t)
 
 	first := listedInodes(t, mountpoint)["link"]
 	for range 3 {
@@ -1255,8 +1321,7 @@ func TestASymbolicLinkKeepsOneIdentity(t *testing.T) {
 // name. EOPNOTSUPP is the FUSE library's answer for a node that cannot be read back as a
 // link, and it is the true one: the namespace has no operation that could answer.
 func TestNothingResolvesThroughASymbolicLink(t *testing.T) {
-	mountpoint, _, backing := mountedPair(t)
-	plantLink(t, backing)
+	mountpoint, backing := mountLinks(t)
 	link := filepath.Join(mountpoint, "link")
 
 	for _, c := range []struct {
@@ -1287,7 +1352,7 @@ func TestNothingResolvesThroughASymbolicLink(t *testing.T) {
 	}
 
 	// Nothing reached the target under the link's name.
-	body, err := os.ReadFile(filepath.Join(backing, "target"))
+	body, err := backing.Read(t.Context(), "target")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1300,16 +1365,15 @@ func TestNothingResolvesThroughASymbolicLink(t *testing.T) {
 // the caller's to lose here, and a removal that followed the link would take it silently:
 // the name the caller gave would still be gone, so nothing would look wrong.
 func TestRemovingASymbolicLinkLeavesWhatItPointsAt(t *testing.T) {
-	mountpoint, _, backing := mountedPair(t)
-	plantLink(t, backing)
+	mountpoint, backing := mountLinks(t)
 
 	if err := os.Remove(filepath.Join(mountpoint, "link")); err != nil {
 		t.Fatalf("removing the link: %v", err)
 	}
-	if _, err := os.Lstat(filepath.Join(backing, "link")); !errors.Is(err, syscall.ENOENT) {
+	if _, err := backing.Stat(t.Context(), "link"); !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("the link is still in the namespace (%v)", err)
 	}
-	body, err := os.ReadFile(filepath.Join(backing, "target"))
+	body, err := backing.Read(t.Context(), "target")
 	if err != nil {
 		t.Fatalf("the file the link pointed at is gone: %v", err)
 	}
@@ -1360,15 +1424,11 @@ func (s *countingStorage) Read(ctx context.Context, path string) ([]byte, error)
 // look at the namespace reaches the namespace. A kernel allowed to remember an answer,
 // for however short a time, is a kernel that can hand out a stale one.
 func TestEveryLookAtTheNamespaceReachesIt(t *testing.T) {
-	backing := t.TempDir()
-	if err := os.WriteFile(filepath.Join(backing, "f"), []byte("payload"), 0o644); err != nil {
+	backing := fuseNamespace(t)
+	if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 		t.Fatal(err)
 	}
-	inner, err := localdir.New(backing)
-	if err != nil {
-		t.Fatal(err)
-	}
-	counted := &countingStorage{Storage: inner, counts: map[string]int{}}
+	counted := &countingStorage{Storage: backing, counts: map[string]int{}}
 	mountpoint := mountStorage(t, counted, fuse.Options{Logger: testLogger(t)})
 	path := filepath.Join(mountpoint, "f")
 
@@ -1518,26 +1578,22 @@ func afterTheLookup(path string, err error) func(string, string) error {
 }
 
 // mountFaulty mounts a namespace prepared by prepare, with fault deciding what fails.
-func mountFaulty(t *testing.T, fault func(operation, path string) error, prepare func(backing string)) string {
+func mountFaulty(t *testing.T, fault func(operation, path string) error, prepare func(storage.Storage)) string {
 	t.Helper()
-	backing := t.TempDir()
+	backing := fuseNamespace(t)
 	prepare(backing)
-	inner, err := localdir.New(backing)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := &faultyStorage{Storage: inner, fault: fault}
+	s := &faultyStorage{Storage: backing, fault: fault}
 	return mountStorage(t, s, fuse.Options{Logger: testLogger(t)})
 }
 
-func nothingIsThere(string) {}
+func nothingIsThere(storage.Storage) {}
 
 // A storage failure that carries no errno must arrive as EIO. ENOENT would say "that
 // file is not there" when the truth is "I could not find out", and whatever runs on top
 // acts on those two very differently.
 func TestAnUnreachableNamespaceIsNotFileNotFound(t *testing.T) {
-	mountpoint := mountFaulty(t, failing("Stat", unreachable), func(backing string) {
-		if err := os.WriteFile(filepath.Join(backing, "f"), []byte("payload"), 0o644); err != nil {
+	mountpoint := mountFaulty(t, failing("Stat", unreachable), func(backing storage.Storage) {
+		if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -1554,8 +1610,8 @@ func TestAnUnreachableNamespaceIsNotFileNotFound(t *testing.T) {
 // The same for a directory listing: an empty listing reads as established fact, and
 // acting on it deletes things.
 func TestAnUnreachableNamespaceIsNotAnEmptyDirectory(t *testing.T) {
-	mountpoint := mountFaulty(t, failing("List", unreachable), func(backing string) {
-		if err := os.WriteFile(filepath.Join(backing, "f"), []byte("payload"), 0o644); err != nil {
+	mountpoint := mountFaulty(t, failing("List", unreachable), func(backing storage.Storage) {
+		if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -1592,11 +1648,11 @@ func TestAnUnreachableNamespaceFailsEveryOperation(t *testing.T) {
 		{"SetAttr", func(root string) error { return os.Chmod(filepath.Join(root, "f"), 0o600) }},
 	} {
 		t.Run(c.operation, func(t *testing.T) {
-			mountpoint := mountFaulty(t, failing(c.operation, unreachable), func(backing string) {
-				if err := os.WriteFile(filepath.Join(backing, "f"), []byte("payload"), 0o644); err != nil {
+			mountpoint := mountFaulty(t, failing(c.operation, unreachable), func(backing storage.Storage) {
+				if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.Mkdir(filepath.Join(backing, "existing"), 0o755); err != nil {
+				if err := backing.Mkdir(t.Context(), "existing"); err != nil {
 					t.Fatal(err)
 				}
 			})
@@ -1731,8 +1787,8 @@ func TestAFailureShorteningAFileWithNoHandleOpenIsReported(t *testing.T) {
 		{"the contents cannot be fetched", failing("Read", unreachable)},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			mountpoint := mountFaulty(t, c.fault, func(backing string) {
-				if err := os.WriteFile(filepath.Join(backing, "f"), []byte("payload"), 0o644); err != nil {
+			mountpoint := mountFaulty(t, c.fault, func(backing storage.Storage) {
+				if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 					t.Fatal(err)
 				}
 			})
@@ -1747,8 +1803,8 @@ func TestAFailureShorteningAFileWithNoHandleOpenIsReported(t *testing.T) {
 // this mount cannot hold has to be refused rather than fetched. That question can fail on
 // its own, and a size we could not find out is not a size to guess at.
 func TestAFailureLearningTheSizeOfAFileBeingOpenedIsReported(t *testing.T) {
-	mountpoint := mountFaulty(t, afterTheLookup("f", unreachable), func(backing string) {
-		if err := os.WriteFile(filepath.Join(backing, "f"), []byte("payload"), 0o644); err != nil {
+	mountpoint := mountFaulty(t, afterTheLookup("f", unreachable), func(backing storage.Storage) {
+		if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -1775,8 +1831,8 @@ func TestAFailureStattingAnOpenFileIsReported(t *testing.T) {
 			return unreachable
 		}
 		return nil
-	}, func(backing string) {
-		if err := os.WriteFile(filepath.Join(backing, "f"), []byte("payload"), 0o644); err != nil {
+	}, func(backing storage.Storage) {
+		if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -1823,15 +1879,11 @@ func (s *oddStorage) List(ctx context.Context, path string) ([]storage.Entry, er
 // are reported as a kind that cannot be presented.
 func mountOdd(t *testing.T, odd func(path string) bool) string {
 	t.Helper()
-	backing := t.TempDir()
-	if err := os.WriteFile(filepath.Join(backing, "f"), []byte("payload"), 0o644); err != nil {
+	backing := fuseNamespace(t)
+	if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 		t.Fatal(err)
 	}
-	inner, err := localdir.New(backing)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return mountStorage(t, &oddStorage{Storage: inner, odd: odd}, fuse.Options{Logger: testLogger(t)})
+	return mountStorage(t, &oddStorage{Storage: backing, odd: odd}, fuse.Options{Logger: testLogger(t)})
 }
 
 // A node whose kind we cannot name is refused rather than presented as an ordinary file.
@@ -1902,12 +1954,12 @@ func TestAModeChangeReachesTheNamespace(t *testing.T) {
 		if err := os.Chmod(path, want); err != nil {
 			t.Fatalf("chmod to %v: %v", want, err)
 		}
-		underneath, err := os.Stat(filepath.Join(backing, "f"))
+		underneath, err := backing.Stat(t.Context(), "f")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if underneath.Mode() != want {
-			t.Fatalf("the namespace holds mode %v after a chmod to %v", underneath.Mode(), want)
+		if underneath.Mode != want {
+			t.Fatalf("the namespace holds mode %v after a chmod to %v", underneath.Mode, want)
 		}
 		through, err := os.Stat(path)
 		if err != nil {
@@ -1915,7 +1967,7 @@ func TestAModeChangeReachesTheNamespace(t *testing.T) {
 		}
 		if through.Mode() != want {
 			t.Fatalf("the mount reports mode %v where the namespace holds %v",
-				through.Mode(), underneath.Mode())
+				through.Mode(), underneath.Mode)
 		}
 	}
 
@@ -1927,13 +1979,13 @@ func TestAModeChangeReachesTheNamespace(t *testing.T) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	underneath, err := os.Stat(filepath.Join(backing, "d"))
+	underneath, err := backing.Stat(t.Context(), "d")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if underneath.Mode() != fs.ModeDir|0o700 {
+	if underneath.Mode != fs.ModeDir|0o700 {
 		t.Fatalf("the namespace holds mode %v for the directory, want %v",
-			underneath.Mode(), fs.ModeDir|0o700)
+			underneath.Mode, fs.ModeDir|0o700)
 	}
 }
 
@@ -1953,14 +2005,14 @@ func TestTimeChangesReachTheNamespace(t *testing.T) {
 		t.Fatalf("setting the times: %v", err)
 	}
 
-	underneath, err := os.Stat(filepath.Join(backing, "f"))
+	underneath, err := backing.Stat(t.Context(), "f")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !underneath.ModTime().Equal(changed) {
-		t.Fatalf("the namespace is dated %v, want %v", underneath.ModTime(), changed)
+	if !underneath.ModTime.Equal(changed) {
+		t.Fatalf("the namespace is dated %v, want %v", underneath.ModTime, changed)
 	}
-	if got := accessTimeOf(underneath); !got.Equal(accessed) {
+	if got := underneath.AccessTime; !got.Equal(accessed) {
 		t.Fatalf("the namespace was accessed %v, want %v", got, accessed)
 	}
 
@@ -2040,15 +2092,15 @@ func TestATimeSetThroughAnOpenHandleSurvivesTheCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	underneath, err := os.Stat(filepath.Join(backing, "f"))
+	underneath, err := backing.Stat(t.Context(), "f")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !underneath.ModTime().Equal(changed) {
+	if !underneath.ModTime.Equal(changed) {
 		t.Fatalf("the namespace is dated %v, want %v — the commit landed after the time was set",
-			underneath.ModTime(), changed)
+			underneath.ModTime, changed)
 	}
-	body, err := os.ReadFile(filepath.Join(backing, "f"))
+	body, err := backing.Read(t.Context(), "f")
 	if err != nil || string(body) != "payload" {
 		t.Fatalf("the namespace holds %q, %v; want the contents committed as well", body, err)
 	}
@@ -2194,11 +2246,7 @@ func TestExtendedAttributesAreRefusedAsUnsupported(t *testing.T) {
 func TestNothingIsWrittenToTheProcessOutput(t *testing.T) {
 	requireFUSE(t)
 
-	backing, mountpoint := t.TempDir(), t.TempDir()
-	s, err := localdir.New(backing)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s, mountpoint := fuseNamespace(t), t.TempDir()
 
 	restore := captureProcessOutput(t)
 	m, mountErr := fuse.New(mountpoint, s, fuse.Options{})
@@ -2221,11 +2269,7 @@ func TestNothingIsWrittenToTheProcessOutput(t *testing.T) {
 func TestDiagnosticsGoOnlyWhereTheCallerAsked(t *testing.T) {
 	requireFUSE(t)
 
-	backing, mountpoint := t.TempDir(), t.TempDir()
-	s, err := localdir.New(backing)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s, mountpoint := fuseNamespace(t), t.TempDir()
 	collected := &safeBuffer{}
 
 	restore := captureProcessOutput(t)
@@ -2250,11 +2294,7 @@ func TestDiagnosticsGoOnlyWhereTheCallerAsked(t *testing.T) {
 
 func TestMountingSomewhereItCannotBeDone(t *testing.T) {
 	requireFUSE(t)
-	backing := t.TempDir()
-	s, err := localdir.New(backing)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := fuseNamespace(t)
 
 	file := filepath.Join(t.TempDir(), "f")
 	if err := os.WriteFile(file, nil, 0o644); err != nil {
@@ -2367,15 +2407,11 @@ func (b *safeBuffer) String() string {
 // prevent, and an errno returned after it would be too late.
 func mountCeiling(t *testing.T, contents []byte, maxFileSize int64) (path string, counted *countingStorage) {
 	t.Helper()
-	backing := t.TempDir()
-	if err := os.WriteFile(filepath.Join(backing, "f"), contents, 0o644); err != nil {
+	backing := fuseNamespace(t)
+	if err := backing.Write(t.Context(), "f", contents); err != nil {
 		t.Fatal(err)
 	}
-	inner, err := localdir.New(backing)
-	if err != nil {
-		t.Fatal(err)
-	}
-	counted = &countingStorage{Storage: inner, counts: map[string]int{}}
+	counted = &countingStorage{Storage: backing, counts: map[string]int{}}
 	mountpoint := mountStorage(t, counted, fuse.Options{Logger: testLogger(t), MaxFileSize: maxFileSize})
 	return filepath.Join(mountpoint, "f"), counted
 }
@@ -2513,15 +2549,11 @@ func TestNoOperationGrowsAFilePastTheCeiling(t *testing.T) {
 // dying. The size asked for here is a gibibyte, but nothing allocates it: the refusal
 // happens before the allocation, which is the whole point of the ceiling.
 func TestAMountConfiguredWithNothingStillHasACeiling(t *testing.T) {
-	backing := t.TempDir()
-	if err := os.WriteFile(filepath.Join(backing, "f"), []byte("payload"), 0o644); err != nil {
+	backing := fuseNamespace(t)
+	if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 		t.Fatal(err)
 	}
-	s, err := localdir.New(backing)
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(mountStorage(t, s, fuse.Options{}), "f")
+	path := filepath.Join(mountStorage(t, backing, fuse.Options{}), "f")
 
 	if err := os.Truncate(path, fuse.DefaultMaxFileSize+1); !errors.Is(err, syscall.EFBIG) {
 		t.Fatalf("truncate to one byte above the default ceiling returned %v, want EFBIG", err)
@@ -2605,15 +2637,11 @@ func (s *tellsSpace) Space(context.Context) (storage.Space, error) {
 	return s.space, nil
 }
 
-// mountTelling mounts a namespace held in a fresh directory that reports the given room.
-func mountTelling(t *testing.T, space storage.Space, err error) (mountpoint, backing string) {
+// mountTelling mounts a namespace that reports the given room.
+func mountTelling(t *testing.T, space storage.Space, err error) (string, storage.Storage) {
 	t.Helper()
-	backing = t.TempDir()
-	inner, openErr := localdir.New(backing)
-	if openErr != nil {
-		t.Fatal(openErr)
-	}
-	s := &tellsSpace{Storage: inner, space: space, err: err}
+	backing := fuseNamespace(t)
+	s := &tellsSpace{Storage: backing, space: space, err: err}
 	return mountStorage(t, s, fuse.Options{Logger: testLogger(t)}), backing
 }
 
@@ -2743,7 +2771,7 @@ func TestAWriteWithNoRoomForItIsRefusedAtTheWrite(t *testing.T) {
 		if err := f.Close(); err != nil {
 			t.Fatalf("close returned %v; the refusal already reached the write", err)
 		}
-		if body, err := os.ReadFile(filepath.Join(backing, "f")); err != nil || len(body) != 0 {
+		if body, err := backing.Read(t.Context(), "f"); err != nil || len(body) != 0 {
 			t.Fatalf("the namespace holds %d bytes, %v; a refused write left something behind",
 				len(body), err)
 		}
@@ -2754,7 +2782,7 @@ func TestAWriteWithNoRoomForItIsRefusedAtTheWrite(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(mountpoint, "f"), make([]byte, room), 0o644); err != nil {
 			t.Fatalf("writing exactly the %d bytes left returned %v", room, err)
 		}
-		if body, err := os.ReadFile(filepath.Join(backing, "f")); err != nil || len(body) != room {
+		if body, err := backing.Read(t.Context(), "f"); err != nil || len(body) != room {
 			t.Fatalf("the namespace holds %d bytes, %v; want %d", len(body), err, room)
 		}
 	})
@@ -2765,7 +2793,7 @@ func TestAWriteWithNoRoomForItIsRefusedAtTheWrite(t *testing.T) {
 	t.Run("appending to a file the namespace already holds", func(t *testing.T) {
 		mountpoint, backing := mountTelling(t, full, nil)
 		const held = 1 << 16
-		if err := os.WriteFile(filepath.Join(backing, "big"), pattern(held), 0o644); err != nil {
+		if err := backing.Write(t.Context(), "big", pattern(held)); err != nil {
 			t.Fatal(err)
 		}
 
@@ -2781,8 +2809,8 @@ func TestAWriteWithNoRoomForItIsRefusedAtTheWrite(t *testing.T) {
 		if err := f.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if info, err := os.Stat(filepath.Join(backing, "big")); err != nil || info.Size() != held+4 {
-			t.Fatalf("the namespace holds %v bytes, %v; want %d", info.Size(), err, held+4)
+		if info, err := backing.Stat(t.Context(), "big"); err != nil || info.Size != held+4 {
+			t.Fatalf("the namespace holds %v bytes, %v; want %d", info.Size, err, held+4)
 		}
 	})
 }
@@ -2791,13 +2819,9 @@ func TestAWriteWithNoRoomForItIsRefusedAtTheWrite(t *testing.T) {
 // The allowance is enforced by the storage rather than described by a fixture, because the
 // cases below turn on one operation reaching the namespace by two routes and having to be
 // answered the same way on both.
-func mountLimited(t *testing.T, backing string, allowance int64) string {
+func mountLimited(t *testing.T, backing storage.Storage, allowance int64) string {
 	t.Helper()
-	inner, err := localdir.New(backing)
-	if err != nil {
-		t.Fatal(err)
-	}
-	held, err := limited.New(context.Background(), inner, allowance)
+	held, err := limited.New(t.Context(), backing, allowance)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2817,7 +2841,7 @@ func TestATruncationWithNoRoomForItIsRefusedAtTheTruncation(t *testing.T) {
 	const allowance = 64 << 10
 
 	t.Run("growing through an open descriptor", func(t *testing.T) {
-		backing := t.TempDir()
+		backing := fuseNamespace(t)
 		mountpoint := mountLimited(t, backing, allowance)
 
 		f, err := os.Create(filepath.Join(mountpoint, "f"))
@@ -2836,18 +2860,18 @@ func TestATruncationWithNoRoomForItIsRefusedAtTheTruncation(t *testing.T) {
 		if err := f.Close(); err != nil {
 			t.Fatalf("close returned %v; the refusal already reached the ftruncate", err)
 		}
-		held, err := os.Stat(filepath.Join(backing, "f"))
+		held, err := backing.Stat(t.Context(), "f")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if held.Size() != 0 {
+		if held.Size != 0 {
 			t.Fatalf("the namespace holds %d bytes; a refused truncation lengthened the file",
-				held.Size())
+				held.Size)
 		}
 	})
 
 	t.Run("growing with no descriptor", func(t *testing.T) {
-		backing := t.TempDir()
+		backing := fuseNamespace(t)
 		mountpoint := mountLimited(t, backing, allowance)
 		path := filepath.Join(mountpoint, "f")
 		if err := os.WriteFile(path, nil, 0o644); err != nil {
@@ -2858,13 +2882,13 @@ func TestATruncationWithNoRoomForItIsRefusedAtTheTruncation(t *testing.T) {
 			t.Fatalf("truncate to %d bytes under an allowance of %d returned %v, want EDQUOT",
 				allowance+1, allowance, err)
 		}
-		held, err := os.Stat(filepath.Join(backing, "f"))
+		held, err := backing.Stat(t.Context(), "f")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if held.Size() != 0 {
+		if held.Size != 0 {
 			t.Fatalf("the namespace holds %d bytes; a refused truncation lengthened the file",
-				held.Size())
+				held.Size)
 		}
 	})
 
@@ -2874,8 +2898,8 @@ func TestATruncationWithNoRoomForItIsRefusedAtTheTruncation(t *testing.T) {
 	// nothing.
 	t.Run("shrinking from over the allowance", func(t *testing.T) {
 		const stands = allowance + (16 << 10)
-		backing := t.TempDir()
-		if err := os.WriteFile(filepath.Join(backing, "f"), pattern(stands), 0o644); err != nil {
+		backing := fuseNamespace(t)
+		if err := backing.Write(t.Context(), "f", pattern(stands)); err != nil {
 			t.Fatal(err)
 		}
 		mountpoint := mountLimited(t, backing, allowance)
@@ -2898,12 +2922,12 @@ func TestATruncationWithNoRoomForItIsRefusedAtTheTruncation(t *testing.T) {
 		if err := f.Close(); err != nil {
 			t.Fatalf("committing the truncation returned %v", err)
 		}
-		held, err := os.Stat(filepath.Join(backing, "f"))
+		held, err := backing.Stat(t.Context(), "f")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if held.Size() != 1024 {
-			t.Fatalf("the namespace holds %d bytes, want 1024", held.Size())
+		if held.Size != 1024 {
+			t.Fatalf("the namespace holds %d bytes, want 1024", held.Size)
 		}
 	})
 }

@@ -95,6 +95,16 @@ CREATE TABLE entries (
 	PRIMARY KEY (namespace, parent, name)
 ) WITHOUT ROWID;
 
+CREATE TABLE lease_recovery (
+	singleton           INTEGER PRIMARY KEY CHECK (singleton = 1),
+	database_id         TEXT NOT NULL,
+	state_id            TEXT NOT NULL,
+	accepted_generation INTEGER NOT NULL,
+	accepted_nanos      INTEGER NOT NULL,
+	prepared_generation INTEGER,
+	prepared_nanos      INTEGER
+) WITHOUT ROWID;
+
 CREATE TABLE logs (
 	namespace          INTEGER PRIMARY KEY REFERENCES namespaces(id),
 	incarnation        TEXT    NOT NULL,

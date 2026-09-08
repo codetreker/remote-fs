@@ -16,7 +16,8 @@ import (
 
 // The migrations that build this package's schema. 0001_tree.sql is the tree as version 1 had
 // it; 0002_replication.sql rekeys the entry table and adds the change log;
-// 0003_durable_state.sql adds the backing-store binding and durable identity witnesses.
+// 0003_durable_state.sql adds the backing-store binding and durable identity witnesses;
+// 0004_lease_recovery.sql stores prepared and accepted lease-duration evidence.
 //
 // packages/sqliteschema documents what a numbered set of files buys and what rule they are kept
 // under: a file that has landed is never edited, and a schema change is a new file.
@@ -83,10 +84,10 @@ func prepareConfigured(
 		return 0, 0, DurableState{}, err
 	}
 	if durable != nil && durable.startup.Accepted.DatabaseID != "" {
-		if !recorded || version != schema.Version() {
+		if !recorded || version < firstOwnershipAwareSchemaVersion || version > schema.Version() {
 			return 0, 0, DurableState{}, fmt.Errorf(
-				"accepted durable state requires schema version %d, found recorded version %d: %w",
-				schema.Version(), version, syscall.EIO)
+				"accepted durable state requires a supported durable schema between %d and %d, found recorded version %d: %w",
+				firstOwnershipAwareSchemaVersion, schema.Version(), version, syscall.EIO)
 		}
 		if err := reconcileStartup(ctx, tx, durable.startup); err != nil {
 			return 0, 0, DurableState{}, err

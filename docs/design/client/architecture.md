@@ -2,13 +2,14 @@
 
 命名空间的使用者。持有一份 remote storage，把命名空间呈现为本地目录，并维持这一呈现所需的全部本地状态。
 
-本文只写 client 内部。角色边界、storage 与 RPC 两条契约的分工见 [`../architecture.md`](../architecture.md)。
+本文只写 client 内部。基础 storage、锁控制与 RPC 的边界见 [`../architecture.md`](../architecture.md)。
 
 ## 一、内部构成
 
 | 组件 | 职责 | 需求 |
 |---|---|---|
-| **remote storage** `packages/transport/httprest` | storage 接口的远端实现：每次调用一次 HTTP 请求，两次调用之间不留任何状态。旁边是复制那一半 —— 订阅变更流、取一次一致性快照 —— 与请求／响应天然分在两条连接上。超时策略随调用方给的 `http.Client` 而定；`DialOptions` 限制 stream silence、non-streaming body 与 response admission。自身不缓存。 | R-INT-3、R-INT-5、R-INT-9 |
+| **remote storage** `packages/transport/httprest` | 基础 storage 操作逐次转换为 HTTP 请求，不缓存内容。复制的订阅与快照使用独立长连接；`DialOptions` 限制 stream silence、body 与 admission，超时由调用方配置。 | R-INT-3、R-INT-5、R-INT-9 |
+| **显式锁控制** | HTTP client 实现锁 Service，调用方保留 Session / Owner 与原动作身份，以 `WithScope` 构造独立、不可变的修改 proof 集合。控制请求具有独立预算。 | R-CC-3、R-CC-6 至 R-CC-11、R-INT-3 |
 | **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：`Stat` 与 `List` 走本地那份元数据副本，其余走远端。副本是一份 SQLite（`packages/metastore/sqlite` 的 `Replica`），由变更流喂着。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
 | **挂载呈现层** `packages/fuse` | 把一份 storage 呈现为本地目录。本地只持有正在被打开的文件的内容，以及命名空间最后一次报出的剩余空间。仅 Linux。 | R-FS-1、R-CON-1~3、R-ERR-1、R-ERR-2、R-WS-5、R-INT-3、R-INT-8 |
 | **生命周期** | 挂载的建立与拆除。 | R-WS-2 |
@@ -37,15 +38,29 @@
                 ▼                 ▼
 ```
 
-挂载呈现层只认 storage 接口，因此把一份本地 storage 交给它即可得到一个不经网络的挂载点；它同样不知道底下那份 storage 有没有副本。不记变更日志的命名空间（`localdir` 后端）没有副本可建，挂载时以 `ENOSYS` 说明这一点，此后每一次调用都是一次请求。
+挂载呈现层只认 storage 接口，因此把一份本地 storage 交给它即可得到一个不经网络的挂载点；它同样不知道底下那份 storage 有没有副本。随附的 localstore 与 Azure 服务端都提供 change log。集成方不提供日志时，复制入口以 `ENOSYS` 说明没有副本，此后每一次 metadata 查询都是一次远端请求。
 
 remote storage 的 `DialOptions.MaxBodyBytes` 缺省为 1 GiB，限制 non-write 请求与 non-streaming response；`MaxWriteBytes` 在默认 options 中保持零值，拨号时继承 settled `MaxBodyBytes`，显式值必须为正且不大于它。`Write` 在发请求之前按 `MaxWriteBytes` 以 `EFBIG` 拒绝。读取 response 时先检查 `Content-Length`，再用 limit reader 检查实际字节数，因此错误或缺失的长度也不能绕过 `MaxBodyBytes`。过大的 `Read` 以 `EFBIG` 返回；过大的 listing、attribute、space 或 error message 是无法解码的协议答案，以 `EIO` 返回。无法安全计算四倍 response reservation 的 `MaxBodyBytes`，包括 `MaxInt64`，在拨号前被拒绝。
 
 SSE 不把整个 stream 保存在内存里，但每一帧仍有独立的 `DialOptions.MaxFrameBytes`，默认 8 MiB。scanner 在读取下一帧时按这个值限制自己的 buffer；server 与 client 可以选择不同的值，实际可用上限由较小者决定，超出 client 上限的帧使 stream 失败。`remote-fs -http-max-frame-bytes SIZE` 把这个 client 上限交给部署方，使提高了 server frame 上限的命名空间仍能被挂载；它与 server 的同名 flag 接受相同的 1024 进制 suffix，显式非正值在连接前被拒绝。一个 stream reader 同时只保留一帧；`httprest.Storage` 不拥有调用方建立的 stream 数量，所以调用方仍须约束自己同时打开的 subscription 与 snapshot。
 
-每个非流式调用都要先取得 client 自己的 response admission。默认同时保留 64 份响应、允许 64 个等待者，aggregate 上限为 8 GiB；每份都按 `4 * MaxBodyBytes` 预留，覆盖 raw body、decoded listing 与转换过程的同时保留。Subscribe、Resubscribe 与 Snapshot 在发出 HTTP 前也取得同一名额，用来约束 stream 尚未成功建立时可能返回的普通 error body；确认 `200 text/event-stream` 后立即释放，后续 frame 由 `MaxFrameBytes` 约束。等待者已满时，`Stat`、`Write`、`Create` 或 stream setup 都会在发出 HTTP 请求前以 `EAGAIN` 失败；context cancellation 会移除等待计数。non-stream admission 一直持有到 response 解码、mutation response/barrier 验证完成。`ReadBounded` 取 client 与调用方 byte bound 中较小者；`ListBounded` 把解码后的 entry 逐项交给调用方的 `ListResult`。普通 `Read` 与 `List` 仍返回完整 materialized value，但整个 HTTP body 及其同时表示都在上述单体与 aggregate 边界内。server 侧的 backend 预算与 response admission 见 [`../server/architecture.md`](../server/architecture.md#六请求与响应的内存边界)。
+每个基础数据调用都要先取得 client 自己的 response admission。默认同时保留 64 份响应、允许 64 个等待者，aggregate 上限为 8 GiB；每份都按 `4 * MaxBodyBytes` 预留，覆盖 raw body、decoded listing 与转换过程的同时保留。Subscribe、Resubscribe 与 Snapshot 在发出 HTTP 前也取得同一名额，用来约束 stream 尚未成功建立时可能返回的普通 error body；确认 `200 text/event-stream` 后立即释放，后续 frame 由 `MaxFrameBytes` 约束。等待者已满时，`Stat`、`Write`、`Create` 或 stream setup 都会在发出 HTTP 请求前以 `EAGAIN` 失败；context cancellation 会移除等待计数。non-stream admission 一直持有到 response 解码、mutation response/barrier 验证完成。`ReadBounded` 取 client 与调用方 byte bound 中较小者；`ListBounded` 把解码后的 entry 逐项交给调用方的 `ListResult`。普通 `Read` 与 `List` 仍返回完整 materialized value，但整个 HTTP body 及其同时表示都在上述单体与 aggregate 边界内。server 侧的 backend 预算与 response admission 见 [`../server/architecture.md`](../server/architecture.md#六请求与响应的内存边界)。
 
 **FUSE 到这一层为止。** client 侧只有挂载呈现层说 FUSE 协议，它向下只用 storage 接口 —— 一份按路径寻址的命名空间 API，不挂载的那条路径（R-INT-5）用的是同一份。内核要而命名空间没有的东西 —— 打开的文件的内容、挂载的生命周期，以及内核用来认一个节点的那个编号 —— 都建立并保存在这一层。节点身份本身不在此列：它由命名空间给（R-FS-5），这一层只是把它翻译成一个编号。
+
+### 显式占有与修改 proof
+
+remote storage 使用 HTTP v3，同时提供基础数据操作与锁 Service。调用方用 enrollment ticket 建立 Session、创建 Owner、Resolve 现有普通文件并显式 Acquire；普通 FUSE Open 没有自动获取策略。Session、Owner、管理 Request 与本地描述符、TCP 连接、复制 incarnation 分别拥有生命周期，断开连接不提前解除已确认保护。
+
+成功 Resolve 返回资源引用的有限期限、当前 tick，以及这次有效控制活动延长后的 `HistoryExpiresMillis`。后者描述 Owner / Session 的动作核对窗口，不延长 grant，也不由资源引用的有效期推导。重复 Acquire 保留原 ResourceRef 全部字段，新的 Resolve 观测不能改写已经提交的意图。
+
+`WithScope` 复制有界 proof 集合并共享 endpoint、HTTP client 与 admission；`Scope` 提供相同的有界 storage 视图。所有修改及 WithBarrier 方法携带该集合，普通读与有界读省略它。replicated storage 把 scope 传给远端修改，同时保留本地 metadata 查询及既有 confirmation barrier。锁控制继续使用显式 Owner 参数，不从 scope 推导新的控制身份。
+
+Acquire 返回立即结果或 Pending 登记；Wait 是远端等待意图的期限，不占着一条 HTTP 请求等待授予。调用方用原 Request QueryAction 或 Cancel，SDK 不自动轮询、续期或制造新身份重试。已记录的 Rejected 与 typed error 一起返回，使冲突后来消失时仍能核对原结果；未接纳与结果未知分别处理。
+
+GrantStatus 的剩余时间由服务端对未取整的 deadline 与 now 求差再向下取整。SDK 以原请求发送起点加这个间隔建立保守提示，旧 receipt 不开始新 lease，普通读取成功也不刷新提示。最终权限始终由服务端检查。原授权方退役后，旧意图返回退役或结果未知，不能在新授权方中重做；字段与取整规则见[文件锁协议](../server/file-locks.md#结果与期限)。
+
+控制请求与响应固定至多 16 KiB，独立的 `MaxConcurrentLockControls` 与 `MaxWaitingLockControls` 默认各 16，每份活跃操作预留 64 KiB。容量检查不占用数据 response 或复制 stream 的名额。state-changing control 进入 dispatch 后丢失响应时保持结果未知；Resolve、QueryAction、QueryGrant 与 Status 遵循只读取消。缺少 v3 marker、非法 scope 或不一致 receipt 都明确失败。
 
 ## 二、元数据查询来自本地副本
 
@@ -80,7 +95,7 @@ storage 的读与写以整文件为单位，内核的读与写以 128 KiB 为单
 关闭   ──▶ 未提交则整个写回
 ```
 
-缓冲区属于描述符，不属于节点。两个程序同时打开同一个文件，各写各的副本；最后提交的那个赢，先提交的内容消失（R-CC-1 不在这一版内）。干净 handle 的 `Getattr` 仅在路径身份变化时以缓冲区长度覆盖 namespace 大小；普通覆写保留身份时，旧内容可能按新长度截短，见[缓冲内容与长度绑定](../../../.agents/notes/proposed/bug-fix/2026-09-07-bind-buffered-reads-to-their-size.md)。
+缓冲区属于描述符，不属于节点。普通 Open 不自动获取锁；没有相冲突的活动保护时，未提供内容依据的两个提交仍是最后提交者覆盖，R-CC-1 的版本前置条件保持独立。显式 scope 的修改由服务端最终授权检查约束。干净 handle 的 `Getattr` 仅在路径身份变化时以缓冲区长度覆盖 namespace 大小；普通覆写保留身份时，旧内容可能按新长度截短，见[缓冲内容与长度绑定](../../../.agents/notes/proposed/bug-fix/2026-09-07-bind-buffered-reads-to-their-size.md)。
 
 三个边界：
 
@@ -206,7 +221,7 @@ storage 契约有模式与两个时间的写入口，也有整个命名空间的
 
 内核认一个节点靠一个编号，storage 契约里没有这个编号，挂载呈现层因此自己分配并保存它。**身份则相反**：`storage.Attr.ID` 是命名空间对「这个名字后面是哪个节点」的回答（R-FS-5），这一层把它翻译成编号。
 
-两件事分开的原因是保证不同。编号一旦交给内核就永远不能再指向第二个节点，而 `localdir` 能给的身份是宿主的 `st_ino`，宿主在节点消失后会立刻把它收回去重发。所以编号由这一层发、只增、永不复用；身份只用来判断一个名字后面还是不是原来那个节点。
+两件事分开的原因是归属不同。编号由这次挂载分配，一旦交给内核就不能再指向第二个节点；身份由 namespace 提供，随节点走过改名。编号只增且不复用，namespace 身份用于判断一个名字后面是否仍是原来的节点。两个随附后端都使用 SQLite 节点身份，第三方实现也必须满足 R-FS-5 与 R-INT-11。
 
 保存的形式是一棵名字树，每个被解析过的名字一条记录，记着编号、节点的类型、以及记录建立时命名空间报的身份。编号取自一个只增的计数器，用过不再发第二次：一个节点消失之后，它的编号不再指向任何东西。
 
@@ -227,13 +242,13 @@ storage 契约有模式与两个时间的写入口，也有整个命名空间的
 
 跨卸载重挂不稳定：编号是这一次挂载的，不是命名空间的。身份是命名空间的，但它不是编号，两个挂载点也不会因此报出同一个编号。
 
-**一格没有覆盖到**：`localdir` 后端上，一个名字被删掉后立刻重建，宿主可能把刚释放的 `st_ino` 原样发回来，比对因此漏判，这一层会把已经发给内核的编号继续用在另一个节点上。R-FS-5 的第三句在这种后端上不成立。
+宿主 inode 可能被操作系统复用，不能直接替代满足契约的稳定节点身份。[宿主目录后端已移除](../../../.agents/notes/implemented/simplification/2026-09-08-remove-the-host-directory-backend.md)，这个约束仍适用于第三方实现；挂载层的本地编号不能修复下层错误复用的身份。
 
 ## 九、生命周期
 
 挂载与卸载是频繁的日常操作（R-WS-2）。一次挂载把一份 storage 接到一个挂载点上，并在卸载或内核断开连接时结束。
 
-**挂载在快照灌完之前不可用**，快照失败即挂载失败，且失败说得出是哪一步失败的：没有直通模式，也没有降级模式。首次 `Subscribe` 使用 storage lifetime，`New` 的 context 取消不能终止这一步；流式请求清除 HTTP 总超时，响应头的等待上限取决于 transport 配置，详见[取消首次副本订阅](../../../.agents/notes/proposed/bug-fix/2026-09-07-cancel-initial-replica-subscription.md)。副本随挂载生灭 —— 一个只有属主进得去的专属目录里的一份 SQLite（R-SEC-3），卸载时整个删掉；`-replica-dir` 决定它落在哪里，默认的系统临时目录在很多机器上是内存。代价是冷挂载要等快照走完（R-WS-4 被知情推后）。
+**提供 change log 的命名空间在快照灌完之前不可挂载使用**，快照失败即挂载失败，且失败说得出是哪一步失败的，不把失败降为直通查询。首次 `Subscribe` 使用 storage lifetime，`New` 的 context 取消不能终止这一步；流式请求清除 HTTP 总超时，响应头的等待上限取决于 transport 配置，详见[取消首次副本订阅](../../../.agents/notes/proposed/bug-fix/2026-09-07-cancel-initial-replica-subscription.md)。副本随挂载生灭 —— 一个只有属主进得去的专属目录里的一份 SQLite（R-SEC-3），卸载时整个删掉；`-replica-dir` 决定它落在哪里，默认的系统临时目录在很多机器上是内存。代价是冷挂载要等快照走完（R-WS-4 被知情推后）。
 
 ## 十、client 不做什么
 

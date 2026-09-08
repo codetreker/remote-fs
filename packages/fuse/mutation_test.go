@@ -4,17 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
+	"io/fs"
 	"strings"
 	"syscall"
 	"testing"
 
-	"github.com/hanwen/go-fuse/v2/fs"
+	fsbridge "github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 )
 
 type mutationStorage struct {
@@ -75,17 +75,20 @@ func (s *mutationStorage) Stat(ctx context.Context, path string) (storage.Attr, 
 
 func mutationTree(t *testing.T) (*node, *node, *mutationStorage) {
 	t.Helper()
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("contents"), 0o600); err != nil {
+	_, local := memoryfixture.New(t, "mutation", 0, locking.DefaultOptions())
+	if err := local.Create(t.Context(), "f"); err != nil {
 		t.Fatal(err)
 	}
-	local, err := localdir.New(dir)
-	if err != nil {
+	if err := local.Write(t.Context(), "f", []byte("contents")); err != nil {
+		t.Fatal(err)
+	}
+	mode := fs.FileMode(0o600)
+	if err := local.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}); err != nil {
 		t.Fatal(err)
 	}
 	downstream := &mutationStorage{Storage: local}
 	root := &node{ns: &namespace{storage: downstream, maxFileSize: 1024, flushTimeout: DefaultFlushTimeout}, id: rootIdentity()}
-	fs.NewNodeFS(root, &fs.Options{})
+	fsbridge.NewNodeFS(root, &fsbridge.Options{})
 	child, errno := root.Lookup(t.Context(), "f", &gofuse.EntryOut{})
 	if errno != 0 {
 		t.Fatal(errno)
@@ -160,7 +163,7 @@ func TestSetattrCancellationAccountsForCompletedStages(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, n, downstream := mutationTree(t)
-			var file fs.FileHandle
+			var file fsbridge.FileHandle
 			if test.buffer {
 				file = newHandle(n, []byte("contents"), committed, 0)
 			}

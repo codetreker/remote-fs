@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
-	"github.com/codetreker/remote-fs/packages/storage/limited"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/localdisk"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
@@ -20,8 +19,6 @@ import (
 func TestOneNamespaceSourceIsRequired(t *testing.T) {
 	for _, args := range [][]string{
 		{"-listen", "127.0.0.1:0"},
-		{"-listen", "127.0.0.1:0", "-dir", "/one", "-blob-container", "two"},
-		{"-listen", "127.0.0.1:0", "-dir", "/one", "-local-store", "/two"},
 		{"-listen", "127.0.0.1:0", "-blob-container", "one", "-local-store", "/two"},
 	} {
 		_, _, err := parseConfig(args, &bytes.Buffer{})
@@ -40,23 +37,11 @@ func TestAFlagForAnotherSourceIsRefused(t *testing.T) {
 		args []string
 		flag string
 	}{
-		{"blob prefix on a directory", []string{"-dir", "/data", "-blob-prefix", "p"}, "-blob-prefix"},
+		{"blob prefix on a local store", []string{"-local-store", "/data", "-blob-prefix", "p"}, "-blob-prefix"},
 		{"metastore on a local store", []string{"-local-store", "/data", "-metastore", "meta.db"}, "-metastore"},
 		{"local bound on blobs", []string{"-blob-container", "container", "-local-max-object-bytes", "1M"}, "-local-max-object-bytes"},
 		{"local waiter bound on blobs", []string{"-blob-container", "container", "-local-max-waiting-operations", "8"}, "-local-max-waiting-operations"},
-		{"local recovery on a directory", []string{"-dir", "/data", "-local-max-recovery-entries", "8"}, "-local-max-recovery-entries"},
-		{"pending threshold on a directory", []string{"-dir", "/data", "-max-pending-objects", "8"}, "-max-pending-objects"},
-		{"reader limit on a directory", []string{"-dir", "/data", "-max-reader-connections", "8"}, "-max-reader-connections"},
-		{"snapshot reader limit on a directory", []string{"-dir", "/data", "-max-snapshot-reader-connections", "8"}, "-max-snapshot-reader-connections"},
-		{"integrity limit on a directory", []string{"-dir", "/data", "-max-integrity-records", "100"}, "-max-integrity-records"},
-		{"integrity byte limit on a directory", []string{"-dir", "/data", "-max-integrity-bytes", "8M"}, "-max-integrity-bytes"},
-		{"sweep interval on a directory", []string{"-dir", "/data", "-sweep-interval", "2m"}, "-sweep-interval"},
-		{"sweep batch on a directory", []string{"-dir", "/data", "-sweep-batch", "8"}, "-sweep-batch"},
-		{"subscription limit on a directory", []string{"-dir", "/data", "-http-max-subscriptions", "8"}, "-http-max-subscriptions"},
-		{"frame limit on a directory", []string{"-dir", "/data", "-http-max-frame-bytes", "2M"}, "-http-max-frame-bytes"},
-		{"directory measurement on local store", []string{"-local-store", "/data", "-quota-max-directory-bytes", "8M"}, "-quota-max-directory-bytes"},
-		{"directory measurement without quota", []string{"-dir", "/data", "-quota-max-frontier-bytes", "8M"}, "-quota"},
-		{"workspace on a directory", []string{"-dir", "/data", "-workspace", "workspace"}, "-workspace"},
+		{"local recovery on blobs", []string{"-blob-container", "container", "-local-max-recovery-entries", "8"}, "-local-max-recovery-entries"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			args := append([]string{"-listen", "127.0.0.1:0"}, c.args...)
@@ -132,32 +117,11 @@ func TestLocalDefaultsFollowThePackagesThatEnforceThem(t *testing.T) {
 	if config.standalone != defaultStandaloneHTTPOptions() {
 		t.Fatalf("standalone HTTP defaults are %+v, want %+v", config.standalone, defaultStandaloneHTTPOptions())
 	}
-	if config.measurement != limited.DefaultMeasurementLimits() {
-		t.Fatalf("measurement defaults are %+v, want %+v", config.measurement, limited.DefaultMeasurementLimits())
-	}
+
 	wantHTTP := httprest.DefaultHandlerOptions()
 	wantHTTP.MaxWriteBytes = 0
 	if config.http != wantHTTP {
 		t.Fatalf("HTTP defaults are %+v, want %+v with the write bound inherited", config.http, wantHTTP)
-	}
-}
-
-func TestDirectoryMeasurementBoundsReachTheQuotaLayer(t *testing.T) {
-	config, help, err := parseConfig([]string{
-		"-listen", "127.0.0.1:0",
-		"-dir", "/data",
-		"-quota", "8M",
-		"-quota-max-directory-bytes", "3M",
-		"-quota-max-frontier-bytes", "5M",
-	}, &bytes.Buffer{})
-	if err != nil || help {
-		t.Fatalf("parse quota-limited directory: help=%t error=%v", help, err)
-	}
-	if config.measurement != (limited.MeasurementLimits{
-		MaxDirectoryBytes: 3 << 20,
-		MaxFrontierBytes:  5 << 20,
-	}) {
-		t.Fatalf("measurement limits are %+v", config.measurement)
 	}
 }
 
@@ -379,7 +343,7 @@ func TestNonPositiveCountsAndDurationsAreRefused(t *testing.T) {
 }
 
 func TestHTTPResourceBoundsAreValidatedBeforeOpeningStorage(t *testing.T) {
-	base := []string{"-listen", "127.0.0.1:0", "-dir", "/does/not/need/to/exist"}
+	base := []string{"-listen", "127.0.0.1:0", "-local-store", "/does/not/need/to/exist", "-workspace", "workspace", "-quota", "8M"}
 	for _, test := range []struct {
 		name string
 		args []string
@@ -495,22 +459,6 @@ func TestInvalidHTTPBoundsAreRejectedBeforeAnInvalidListenAddress(t *testing.T) 
 	}
 }
 
-func TestInvalidMeasurementBoundsAreRejectedBeforeListenerAcquisition(t *testing.T) {
-	for _, flagName := range []string{"-quota-max-directory-bytes", "-quota-max-frontier-bytes"} {
-		t.Run(flagName, func(t *testing.T) {
-			_, _, err := parseConfig([]string{
-				"-listen", "127.0.0.1",
-				"-dir", t.TempDir(),
-				"-quota", "8M",
-				flagName, strconv.FormatInt(math.MaxInt64, 10),
-			}, &bytes.Buffer{})
-			if err == nil || strings.Contains(err.Error(), "listen") {
-				t.Fatalf("invalid measurement bound did not precede listener acquisition: %v", err)
-			}
-		})
-	}
-}
-
 func TestInvalidPendingObjectLimitsDoNotInitializeALocalStore(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Chmod(root, 0o700); err != nil {
@@ -595,8 +543,6 @@ func TestHelpNamesTheLocalStoreAndStatusSignal(t *testing.T) {
 		"-http-max-connections",
 		"-http-read-header-timeout",
 		"-http-idle-timeout",
-		"-quota-max-directory-bytes",
-		"-quota-max-frontier-bytes",
 		"-max-pending-objects",
 		"-max-pending-bytes",
 		"-max-reader-connections",
@@ -628,8 +574,6 @@ func TestHelpNamesTheLocalStoreAndStatusSignal(t *testing.T) {
 		"TCP connections accepted",
 		"receive one HTTP request's headers",
 		"keep-alive connection waits",
-		"directory listing retained while measuring",
-		"traversal frontier retained while measuring",
 		"handler-owned deadlines",
 		"process-wide",
 		"additional requests fail with EAGAIN",
@@ -638,7 +582,7 @@ func TestHelpNamesTheLocalStoreAndStatusSignal(t *testing.T) {
 		"reads fail with EFBIG",
 		"listings fail with EIO",
 		"SIGHUP",
-		"maintenance state",
+		"maintenance and lock state",
 	} {
 		if !strings.Contains(output.String(), phrase) {
 			t.Fatalf("help does not contain %q:\n%s", phrase, output.String())

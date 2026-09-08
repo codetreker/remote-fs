@@ -2,6 +2,7 @@ package httprest_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http/httptest"
@@ -10,8 +11,11 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/codetreker/remote-fs/packages/locking"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore/memory"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
@@ -31,7 +35,7 @@ func TestMain(m *testing.M) {
 	// From here on this process is not a test binary but the program a third party would
 	// have written: it imports these packages, uses them, and does nothing else.
 	outcome := finished
-	if err := exerciseTheLibrary(); err != nil {
+	if err := exerciseTheLibrary(filepath.Dir(os.Getenv(outcomeEnv))); err != nil {
 		outcome = err.Error()
 	}
 	os.WriteFile(os.Getenv(outcomeEnv), []byte(outcome), 0o600)
@@ -78,17 +82,17 @@ func TestNothingIsPrinted(t *testing.T) {
 // exerciseTheLibrary runs every operation across both ends of the transport. The failing
 // paths are driven alongside the successful ones because a diagnostic printed on the way
 // out is the likely form of the mistake.
-func exerciseTheLibrary() error {
-	dir, err := os.MkdirTemp("", "remote-fs-library")
+func exerciseTheLibrary(dir string) (result error) {
+	meta, err := sqlite.OpenLocking(context.Background(), sqlite.LockingConfig{
+		Database: filepath.Join(dir, "namespace.db"), Namespace: "library",
+		Allowance: 1 << 30, SQLite: sqlite.DefaultOptions(),
+		Locks: locking.DefaultOptions(), Initialize: true,
+	})
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(dir)
-
-	backing, err := localdir.New(dir)
-	if err != nil {
-		return err
-	}
+	backing := objectstore.New(memory.New(), meta)
+	defer func() { result = errors.Join(result, backing.Close()) }()
 	handler, err := httprest.NewHandler(backing, nil)
 	if err != nil {
 		return err
@@ -138,9 +142,8 @@ func exerciseTheLibrary() error {
 	s.Write(ctx, "missing/f", []byte("x"))
 	s.SetAttr(ctx, "missing", storage.AttrChange{})
 
-	// A local directory keeps no change log, so these three refuse. The refusing path is
-	// the one worth running here: a diagnostic printed on the way out is what this test
-	// exists to catch, and that is where one gets written.
+	// The handler has no replication log configured. Exercise its refusal paths to
+	// detect diagnostics printed while reporting those failures.
 	s.Subscribe(ctx)
 	s.Resubscribe(ctx, "a-log", 1)
 	s.Snapshot(ctx)

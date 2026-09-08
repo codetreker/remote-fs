@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -441,6 +442,8 @@ func (r *MutationResponse) UnmarshalJSON(data []byte) error {
 // name neither side has heard of. Message is for whoever reads the logs and carries no
 // meaning for the client.
 type ErrorResponse struct {
-	Errno   string `json:"errno,omitempty"`
-	Message string `json:"message,omitempty"`
+	Errno    string       `json:"errno,omitempty"`
+	Message  string       `json:"message,omitempty"`
+	LockCode locking.Code `json:"lockCode,omitempty"`
+	Recorded *bool        `json:"recorded,omitempty"`
 }

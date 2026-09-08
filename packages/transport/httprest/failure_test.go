@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -847,7 +848,15 @@ func TestErrorsSayWhatFailed(t *testing.T) {
 // question asked while the server is down — the exact answer that makes whatever runs on
 // top delete or regenerate. This is the case that decides how errors are wrapped here.
 func TestASocketThatIsNotThere(t *testing.T) {
-	socket := filepath.Join(t.TempDir(), "not-listening.sock")
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Relative socket addresses keep long checkout paths below the Unix address limit.
+	socket, err := filepath.Rel(cwd, filepath.Join(t.TempDir(), "not-listening.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	overUnix := &http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{

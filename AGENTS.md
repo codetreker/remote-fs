@@ -85,9 +85,10 @@ pull request and on every commit that reaches `main`, in two jobs: one for the l
 need no mountpoint, one that mounts filesystems. They are split because a mount can wedge,
 and a wedged job should not take the rest of the answer down with it. Exhaustive coverage
 is that run's job, and it starts itself. Both jobs bring up the same emulator through
-[`deployments/ci/docker-compose.yml`](deployments/ci/docker-compose.yml) — the second one
-needs it because the coverage gate runs `go test` over the whole module rather than over
-that job's packages.
+[`deployments/ci/docker-compose.yml`](deployments/ci/docker-compose.yml) before their
+Blob-dependent tests, waiting for it to answer requests. The mounted job needs it for
+the real Azure binary lock and restart tests; its later module-wide coverage gate uses
+the same running emulator.
 
 CI also enforces the following checks.
 

@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -61,6 +62,24 @@ type Storage struct {
 
 var _ storage.Storage = (*Storage)(nil)
 var _ storage.BoundedStorage = (*Storage)(nil)
+
+// LockService returns the authority bound to this metastore's native publication
+// guards. Nil means the metastore has not enabled explicit file locks.
+func (s *Storage) LockService() locking.Service {
+	if native, ok := s.meta.(interface{ LockService() locking.Service }); ok {
+		return native.LockService()
+	}
+	return nil
+}
+
+// CheckPublicationAccounting reports whether quota wrappers can settle against the
+// actual targets resolved by the final metastore publication.
+func (s *Storage) CheckPublicationAccounting() error {
+	if native, ok := s.meta.(interface{ CheckPublicationAccounting() error }); ok {
+		return native.CheckPublicationAccounting()
+	}
+	return fmt.Errorf("the metastore cannot account for final publication: %w", syscall.ENOSYS)
+}
 
 // Options configures storage-owned background maintenance.
 //

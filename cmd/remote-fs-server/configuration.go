@@ -8,8 +8,8 @@ import (
 	"math"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
-	"github.com/codetreker/remote-fs/packages/storage/limited"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/azblob"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/localdisk"
@@ -38,7 +38,6 @@ func defaultStandaloneHTTPOptions() standaloneHTTPOptions {
 
 type commandConfig struct {
 	listen                       string
-	directory                    string
 	blob                         blobSource
 	local                        localSource
 	quota                        int64
@@ -50,7 +49,8 @@ type commandConfig struct {
 	maintenance                  objectstore.Options
 	http                         httprest.HandlerOptions
 	standalone                   standaloneHTTPOptions
-	measurement                  limited.MeasurementLimits
+	locks                        locking.Options
+	initializeLockState          bool
 }
 
 type localSource struct {
@@ -74,7 +74,6 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 	flags := flag.NewFlagSet("remote-fs-server", flag.ContinueOnError)
 	flags.SetOutput(errOut)
 	listen := flags.String("listen", "", "address to accept connections on, as host:port")
-	dir := flags.String("dir", "", "existing directory whose contents are served as the namespace")
 	container := flags.String("blob-container", "", "name of the Azure Blob container holding the namespace's contents.\n"+
 		"Credentials come from AZURE_STORAGE_CONNECTION_STRING, never from a flag:\n"+
 		"a flag is visible to everyone who can list processes.")
@@ -85,12 +84,16 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 	localRoot := flags.String("local-store", "", "existing owner-only directory below a deployment-controlled parent; holds\n"+
 		"local objects, SQLite metadata and the owner lock")
 	workspace := flags.String("workspace", "", "name of the namespace in a blob container or local store")
+	initializeLockState := flags.Bool("initialize-lock-state", false, "initialize durable file-lock state explicitly; ordinary startup only opens\n"+
+		"existing state and refuses missing or mismatched evidence")
+	lockOptions := locking.DefaultOptions()
+	bindLockOptions(flags, &lockOptions)
 
 	var quota sizeFlag
 	flags.Var(&quota, "quota", "allowance the namespace is held under, as a `SIZE`: a whole number of bytes,\n"+
 		"optionally with one of the suffixes\n"+
 		suffixes+".\n"+
-		"It is required with -local-store. Without it a directory or blob namespace\n"+
+		"It is required with -local-store. Without it a blob namespace\n"+
 		"has no configured allowance.")
 
 	maxObject := positiveSizeFlag{bytes: localdisk.DefaultMaxObjectBytes}
@@ -135,6 +138,10 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 		"maximum garbage objects removed by one sweep in a blob or local-store namespace")
 
 	httpOptions := httprest.DefaultHandlerOptions()
+	maxConcurrentLockControls := flags.Int("http-max-concurrent-lock-controls", httpOptions.MaxConcurrentLockControls,
+		"maximum lock-management requests admitted independently of file-content requests")
+	maxWaitingLockControls := flags.Int("http-max-waiting-lock-controls", httpOptions.MaxWaitingLockControls,
+		"maximum lock-management requests waiting for admission; zero selects the package default")
 	maxHTTPBody := positiveSizeFlag{bytes: httpOptions.MaxBodyBytes}
 	flags.Var(&maxHTTPBody, "http-max-body-bytes", "largest non-streaming HTTP request or response body, as SIZE; larger\n"+
 		"reads fail with EFBIG, and oversized listings fail with EIO")
@@ -183,31 +190,25 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 		"maximum time allowed to receive one HTTP request's headers")
 	idleTimeout := flags.Duration("http-idle-timeout", standaloneDefaults.idleTimeout,
 		"maximum time a keep-alive connection waits for its next request")
-	measurementDefaults := limited.DefaultMeasurementLimits()
-	maxDirectoryBytes := positiveSizeFlag{bytes: measurementDefaults.MaxDirectoryBytes}
-	flags.Var(&maxDirectoryBytes, "quota-max-directory-bytes",
-		"largest directory listing retained while measuring a quota-limited -dir, as SIZE")
-	maxFrontierBytes := positiveSizeFlag{bytes: measurementDefaults.MaxFrontierBytes}
-	flags.Var(&maxFrontierBytes, "quota-max-frontier-bytes",
-		"largest traversal frontier retained while measuring a quota-limited -dir, as SIZE")
 
 	flags.Usage = func() {
-		fmt.Fprint(errOut, "usage: remote-fs-server -listen ADDR -dir DIR [-quota SIZE] [HTTP OPTIONS]\n"+
-			"       remote-fs-server -listen ADDR -blob-container NAME -metastore PATH -workspace NAME [-blob-prefix PREFIX] [-quota SIZE] [METASTORE OPTIONS] [HTTP OPTIONS]\n"+
-			"       remote-fs-server -listen ADDR -local-store DIR -workspace NAME -quota SIZE [METASTORE OPTIONS] [LOCAL OPTIONS] [HTTP OPTIONS]\n\n"+
+		fmt.Fprint(errOut, "usage: remote-fs-server -listen ADDR -local-store DIR -workspace NAME -quota SIZE [-initialize-lock-state] [LOCAL OPTIONS] [METASTORE OPTIONS] [LOCK OPTIONS] [HTTP OPTIONS]\n"+
+			"       remote-fs-server -listen ADDR -blob-container NAME -metastore PATH -workspace NAME [-initialize-lock-state] [-blob-prefix PREFIX] [-quota SIZE] [METASTORE OPTIONS] [LOCK OPTIONS] [HTTP OPTIONS]\n\n"+
 			"Serves one namespace over HTTP. Mount it with remote-fs.\n\n"+
-			"The namespace comes from exactly one of -dir, -blob-container and -local-store.\n"+
-			"A local store owns its directory exclusively for the server lifetime and keeps\n"+
-			"its objects, SQLite metadata and recovery state below that directory.\n\n"+
-			"The pending-object thresholds, SQLite reader pools and integrity work limits\n"+
-			"apply to both metastore-backed forms. SIGHUP recounts a quota-limited -dir\n"+
-			"namespace; for either metastore-backed form it reports current backlog and\n"+
-			"maintenance state without changing either.\n\n"+
-			"The standalone server bounds accepted connections and header/idle waits. Active\n"+
-			"change streams keep their handler-owned deadlines rather than a process-wide\n"+
-			"write timeout.\n\n"+
-			"There is no authentication and no authorization: anything that can connect can\n"+
-			"read and write everything in the namespace. Serve only on a trusted network.\n\n")
+			"Choose exactly one of -local-store and -blob-container. Both forms keep their\n"+
+			"namespace tree and quota accounting in SQLite and expose metadata replication.\n"+
+			"A local store owns its private directory for the server lifetime and stores its\n"+
+			"objects, database and recovery evidence below that directory.\n\n"+
+			"Initialize file-lock evidence explicitly with -initialize-lock-state. Reopen\n"+
+			"without that flag to preserve the existing evidence beside the database.\n"+
+			"During recovery the server accepts snapshot reads and status queries. Grants\n"+
+			"and mutations fail with EAGAIN until prior protection has expired.\n\n"+
+			"SIGHUP reports namespace capacity, pending objects, maintenance and lock state.\n"+
+			"It does not change quota accounting.\n\n"+
+			"Accepted connections and header/idle waits are bounded. Active change streams\n"+
+			"use handler-owned deadlines rather than a process-wide write timeout.\n\n"+
+			"File locks enforce explicit stable and exclusive grants. Enrollment has no\n"+
+			"identity-provider authentication; serve only on a trusted network.\n\n")
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
@@ -220,8 +221,7 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 	given := make(map[string]bool)
 	flags.Visit(func(f *flag.Flag) { given[f.Name] = true })
 	config := commandConfig{
-		listen:    *listen,
-		directory: *dir,
+		listen: *listen,
 		blob: blobSource{
 			container: *container,
 			prefix:    *prefix,
@@ -259,12 +259,12 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 			readHeaderTimeout:      *readHeaderTimeout,
 			idleTimeout:            *idleTimeout,
 		},
-		measurement: limited.MeasurementLimits{
-			MaxDirectoryBytes: maxDirectoryBytes.bytes,
-			MaxFrontierBytes:  maxFrontierBytes.bytes,
-		},
+		locks:               lockOptions,
+		initializeLockState: *initializeLockState,
 	}
 	config.http.MaxBodyBytes = maxHTTPBody.bytes
+	config.http.MaxConcurrentLockControls = *maxConcurrentLockControls
+	config.http.MaxWaitingLockControls = *maxWaitingLockControls
 	config.http.MaxWriteBytes = maxHTTPWrite.bytes
 	config.http.MaxConcurrentBodies = *maxConcurrentHTTPBodies
 	config.http.MaxWaitingBodies = *maxWaitingHTTPBodies
@@ -300,6 +300,12 @@ func validateConfig(config commandConfig, given map[string]bool, extra []string)
 	if config.http.MaxConcurrentBodies <= 0 {
 		return commandConfig{}, false, errors.New("-http-max-concurrent-bodies must be positive")
 	}
+	if config.http.MaxConcurrentLockControls <= 0 {
+		return commandConfig{}, false, errors.New("-http-max-concurrent-lock-controls must be positive")
+	}
+	if config.http.MaxWaitingLockControls < 0 {
+		return commandConfig{}, false, errors.New("-http-max-waiting-lock-controls must be non-negative")
+	}
 	if config.http.MaxWaitingBodies < 0 {
 		return commandConfig{}, false, errors.New("-http-max-waiting-bodies must be non-negative")
 	}
@@ -321,19 +327,12 @@ func validateConfig(config commandConfig, given map[string]bool, extra []string)
 	if err := config.http.Check(); err != nil {
 		return commandConfig{}, false, err
 	}
+	if err := validateLockOptions(config.locks); err != nil {
+		return commandConfig{}, false, err
+	}
 
-	sources := 0
-	if config.directory != "" {
-		sources++
-	}
-	if config.blob.given() {
-		sources++
-	}
-	if config.local.given() {
-		sources++
-	}
-	if sources > 1 {
-		return commandConfig{}, false, errors.New("-dir, -blob-container and -local-store name different namespaces; give exactly one of them")
+	if config.blob.given() == config.local.given() {
+		return commandConfig{}, false, errors.New("a namespace is required: give exactly one of -blob-container and -local-store")
 	}
 
 	if !config.blob.given() {
@@ -350,77 +349,40 @@ func validateConfig(config commandConfig, given map[string]bool, extra []string)
 			}
 		}
 	}
-	if !config.blob.given() && !config.local.given() {
-		for _, name := range []string{
-			"max-pending-objects", "max-pending-bytes", "max-reader-connections",
-			"max-snapshot-reader-connections", "max-integrity-records", "max-integrity-bytes",
-			"sweep-interval", "sweep-batch",
-			"http-max-subscriptions", "http-max-frame-bytes", "http-max-concurrent-snapshot-frames",
-			"http-max-in-flight-snapshot-frame-bytes", "http-max-waiting-snapshot-frames",
-		} {
-			if given[name] {
-				return commandConfig{}, false, fmt.Errorf("-%s requires -blob-container or -local-store", name)
-			}
-		}
+	if config.standalone.maxAcceptedConnections < 2 {
+		return commandConfig{}, false, errors.New(
+			"-http-max-connections must be at least 2 for a metastore-backed namespace to open its change stream and snapshot")
 	}
-	for _, name := range []string{"quota-max-directory-bytes", "quota-max-frontier-bytes"} {
-		if !given[name] {
-			continue
-		}
-		if config.directory == "" {
-			return commandConfig{}, false, fmt.Errorf("-%s requires -dir", name)
-		}
-		if config.quota == 0 {
-			return commandConfig{}, false, fmt.Errorf("-%s requires -quota", name)
-		}
+	if config.objectLimits.MaxPendingObjects <= 0 {
+		return commandConfig{}, false, errors.New("-max-pending-objects must be positive")
 	}
-	if given["workspace"] && !config.blob.given() && !config.local.given() {
-		return commandConfig{}, false, errors.New("-workspace requires -blob-container or -local-store")
+	if err := config.objectLimits.Validate(); err != nil {
+		return commandConfig{}, false, err
 	}
-	if sources == 0 {
-		return commandConfig{}, false, errors.New("a namespace is required: give exactly one of -dir, -blob-container and -local-store")
-	}
-	if config.directory != "" && config.quota != 0 {
-		if err := config.measurement.Validate(); err != nil {
-			return commandConfig{}, false, err
-		}
-	}
-	if config.blob.given() || config.local.given() {
-		if config.standalone.maxAcceptedConnections < 2 {
-			return commandConfig{}, false, errors.New(
-				"-http-max-connections must be at least 2 for a metastore-backed namespace to open its change stream and snapshot")
-		}
-		if config.objectLimits.MaxPendingObjects <= 0 {
-			return commandConfig{}, false, errors.New("-max-pending-objects must be positive")
-		}
-		if err := config.objectLimits.Validate(); err != nil {
-			return commandConfig{}, false, err
-		}
-		switch {
-		case config.maxReaderConnections <= 0:
-			return commandConfig{}, false, errors.New("-max-reader-connections must be positive")
-		case config.maxReaderConnections == math.MaxInt:
-			return commandConfig{}, false, errors.New("-max-reader-connections must be bounded below the largest integer")
-		case config.maxSnapshotReaderConnections <= 0:
-			return commandConfig{}, false, errors.New("-max-snapshot-reader-connections must be positive")
-		case config.maxSnapshotReaderConnections == math.MaxInt:
-			return commandConfig{}, false, errors.New("-max-snapshot-reader-connections must be bounded below the largest integer")
-		case config.maxIntegrityRecords < sqlite.MinIntegrityRecords:
-			return commandConfig{}, false, fmt.Errorf(
-				"-max-integrity-records must be at least %d", sqlite.MinIntegrityRecords)
-		case config.maxIntegrityRecords == math.MaxInt64:
-			return commandConfig{}, false, errors.New("-max-integrity-records must be bounded below the largest integer")
-		case config.maxIntegrityBytes <= 0:
-			return commandConfig{}, false, errors.New("-max-integrity-bytes must be positive")
-		case config.maxIntegrityBytes == math.MaxInt64:
-			return commandConfig{}, false, errors.New("-max-integrity-bytes must be bounded below the largest integer")
-		case config.maintenance.SweepInterval <= 0:
-			return commandConfig{}, false, errors.New("-sweep-interval must be positive")
-		case config.maintenance.SweepBatch <= 0:
-			return commandConfig{}, false, errors.New("-sweep-batch must be positive")
-		case config.maintenance.SweepBatch > objectstore.MaxSweepBatch:
-			return commandConfig{}, false, fmt.Errorf("-sweep-batch must be at most %d", objectstore.MaxSweepBatch)
-		}
+	switch {
+	case config.maxReaderConnections <= 0:
+		return commandConfig{}, false, errors.New("-max-reader-connections must be positive")
+	case config.maxReaderConnections == math.MaxInt:
+		return commandConfig{}, false, errors.New("-max-reader-connections must be bounded below the largest integer")
+	case config.maxSnapshotReaderConnections <= 0:
+		return commandConfig{}, false, errors.New("-max-snapshot-reader-connections must be positive")
+	case config.maxSnapshotReaderConnections == math.MaxInt:
+		return commandConfig{}, false, errors.New("-max-snapshot-reader-connections must be bounded below the largest integer")
+	case config.maxIntegrityRecords < sqlite.MinIntegrityRecords:
+		return commandConfig{}, false, fmt.Errorf(
+			"-max-integrity-records must be at least %d", sqlite.MinIntegrityRecords)
+	case config.maxIntegrityRecords == math.MaxInt64:
+		return commandConfig{}, false, errors.New("-max-integrity-records must be bounded below the largest integer")
+	case config.maxIntegrityBytes <= 0:
+		return commandConfig{}, false, errors.New("-max-integrity-bytes must be positive")
+	case config.maxIntegrityBytes == math.MaxInt64:
+		return commandConfig{}, false, errors.New("-max-integrity-bytes must be bounded below the largest integer")
+	case config.maintenance.SweepInterval <= 0:
+		return commandConfig{}, false, errors.New("-sweep-interval must be positive")
+	case config.maintenance.SweepBatch <= 0:
+		return commandConfig{}, false, errors.New("-sweep-batch must be positive")
+	case config.maintenance.SweepBatch > objectstore.MaxSweepBatch:
+		return commandConfig{}, false, fmt.Errorf("-sweep-batch must be at most %d", objectstore.MaxSweepBatch)
 	}
 
 	if config.blob.given() {

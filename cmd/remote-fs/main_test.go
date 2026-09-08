@@ -1,15 +1,6 @@
-// The copy of the namespace's metadata is made, guarded and removed here, and these tests
-// drive that from inside the command rather than through the binary.
-//
-// Through the binary it cannot be reached at all: a copy is built only for a namespace that
-// keeps a change log, and the only namespace this command can be pointed at from a shell
-// without a blob service is a local directory, which keeps none. Calling replicate reaches
-// every branch of it, and the one claim that only the whole program can make — that the copy
-// is gone once the mountpoint is detached — is driven through run, with a real mount and a
-// real signal.
-//
-// One of them mounts a filesystem, so see docs/testing.md. TestMain is what makes a mount left
-// behind attributable to this run rather than to whatever else is on the machine.
+// These tests exercise replica ownership and cleanup through the command's startup path.
+// The mount lifecycle case uses a real mount and signal; TestMain attributes any leaked
+// mount to this run.
 package main
 
 import (
@@ -31,9 +22,9 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/fuse/fusetest"
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/memory"
 	"github.com/codetreker/remote-fs/packages/storage/replicated"
@@ -167,23 +158,27 @@ func serveNamespace(t *testing.T) (url string, namespace storage.Storage) {
 	return listenOn(t, handler), namespace
 }
 
-// replicableNamespace builds a metastore for the tree and memory for the bytes, which is the
-// arrangement a deployment uses and the only one a copy can be built from. The handler is
-// returned rather than served so that a test can put something in front of it.
-func replicableNamespace(t *testing.T) (storage.Storage, *httprest.Handler) {
+func newTestNamespace(t *testing.T) (*objectstore.Storage, *sqlite.LockingStore) {
 	t.Helper()
-
-	meta, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "namespace.db"), "ws", 0, sqlite.DefaultWindow())
+	meta, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
+		Database: filepath.Join(t.TempDir(), "namespace.db"), Namespace: "ws",
+		SQLite: sqlite.DefaultOptions(), Locks: locking.DefaultOptions(), Initialize: true,
+	})
 	if err != nil {
 		t.Fatalf("opening the namespace's metastore: %v", err)
 	}
-
 	namespace := objectstore.New(memory.New(), meta)
 	t.Cleanup(func() {
 		if err := namespace.Close(); err != nil {
 			t.Errorf("closing the namespace: %v", err)
 		}
 	})
+	return namespace, meta
+}
+
+func replicableNamespace(t *testing.T) (storage.Storage, *httprest.Handler) {
+	t.Helper()
+	namespace, meta := newTestNamespace(t)
 	handler, err := httprest.NewHandler(namespace, meta)
 	if err != nil {
 		t.Fatal(err)
@@ -191,15 +186,9 @@ func replicableNamespace(t *testing.T) (storage.Storage, *httprest.Handler) {
 	return namespace, handler
 }
 
-// serveDirectory starts a server over a namespace with no change log, which is the namespace
-// no copy can be built from and which has to be mounted anyway.
-func serveDirectory(t *testing.T) string {
+func serveWithoutReplication(t *testing.T) string {
 	t.Helper()
-
-	namespace, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	namespace, _ := newTestNamespace(t)
 	handler, err := httprest.NewHandler(namespace, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -435,25 +424,22 @@ func TestNothingIsLeftBehindWhenTheCopyIsNotBuilt(t *testing.T) {
 		}
 	})
 
-	t.Run("the namespace keeps no log", func(t *testing.T) {
-		namespace := dial(t, serveDirectory(t))
+	t.Run("the server does not expose replication", func(t *testing.T) {
+		namespace := dial(t, serveWithoutReplication(t))
 		where := t.TempDir()
 		said := &transcript{}
 
 		served, release, err := replicate(t.Context(), namespace, where, said)
 		if err != nil {
-			t.Fatalf("a namespace that keeps no log failed to mount: %v", err)
+			t.Fatalf("a server without replication failed to mount: %v", err)
 		}
 		defer release()
 
-		// Mounted from the namespace itself, with every operation a request to the server —
-		// which is not a failure and not a degraded copy, but the only thing such a namespace
-		// has ever been mounted as.
 		if served != namespace {
-			t.Fatalf("a namespace that keeps no log is served from %v, want the namespace itself", served)
+			t.Fatalf("a server without replication is served from %v, want the namespace itself", served)
 		}
 		if left := entriesIn(t, where); len(left) != 0 {
-			t.Fatalf("a namespace that keeps no log left %v behind in %s", left, where)
+			t.Fatalf("a server without replication left %v behind in %s", left, where)
 		}
 		if !strings.Contains(said.String(), "keeps no record") {
 			t.Fatalf("nothing said that this namespace is not being copied, so nobody watching would know every operation is a request:\n%s", said)

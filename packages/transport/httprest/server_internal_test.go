@@ -20,10 +20,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	metasqlite "github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
+	"github.com/codetreker/remote-fs/packages/storage/locked"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 )
 
 func TestListResponseFitCalculationMatchesTheWire(t *testing.T) {
@@ -227,10 +230,7 @@ func TestStreamSetupErrorsUseClientResponseAdmission(t *testing.T) {
 }
 
 func TestHandlerAdmissionBoundsStatWaitersAndAQueuedWrite(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	blocked := &blockedStatStorage{
 		BoundedStorage: backing,
 		entered:        make(chan struct{}),
@@ -276,10 +276,7 @@ func TestHandlerAdmissionBoundsStatWaitersAndAQueuedWrite(t *testing.T) {
 }
 
 func TestHandlerChargesFixedErrorResponsesAgainstAggregateBytes(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	blocked := &multiBlockedStatStorage{
 		BoundedStorage: backing,
 		entered:        make(chan struct{}, 5),
@@ -324,10 +321,7 @@ func TestHandlerChargesFixedErrorResponsesAgainstAggregateBytes(t *testing.T) {
 }
 
 func TestSnapshotFrameAdmissionBoundsAggregateWaitersAndCancellation(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	options := DefaultHandlerOptions()
 	options.Replication.Keepalive = time.Hour
 	options.MaxFrameBytes = 1024
@@ -402,10 +396,7 @@ func TestChangeDeliveryIsIndependentOfSnapshotAdmissionAndASlowSubscriber(t *tes
 	if err := log.Create(t.Context(), "changed"); err != nil {
 		t.Fatal(err)
 	}
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	options := DefaultHandlerOptions()
 	options.MaxFrameBytes = 1024
 	options.MaxConcurrentSnapshotFrames = 1
@@ -463,10 +454,7 @@ func TestSnapshotKeepalivesContinueWhileFrameAdmissionWaits(t *testing.T) {
 	if err := log.Create(t.Context(), "entry"); err != nil {
 		t.Fatal(err)
 	}
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	options := DefaultHandlerOptions()
 	options.MaxFrameBytes = 1024
 	options.MaxConcurrentSnapshotFrames = 1
@@ -623,10 +611,7 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 }
 
 func TestSubscriptionAdmissionReleasesOnCancelAndStop(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	log, err := metasqlite.Open(t.Context(), filepath.Join(t.TempDir(), "log.db"), "workspace", 0, metasqlite.DefaultWindow())
 	if err != nil {
 		t.Fatal(err)
@@ -775,6 +760,10 @@ type multiBlockedStatStorage struct {
 	release chan struct{}
 }
 
+func (s *multiBlockedStatStorage) LockService() locking.Service {
+	return s.BoundedStorage.(locked.Backend).LockService()
+}
+
 func (s *multiBlockedStatStorage) Stat(ctx context.Context, path string) (storage.Attr, error) {
 	s.entered <- struct{}{}
 	select {
@@ -783,6 +772,10 @@ func (s *multiBlockedStatStorage) Stat(ctx context.Context, path string) (storag
 		return storage.Attr{}, ctx.Err()
 	}
 	return s.BoundedStorage.Stat(ctx, path)
+}
+
+func (s *blockedStatStorage) LockService() locking.Service {
+	return s.BoundedStorage.(locked.Backend).LockService()
 }
 
 func (s *blockedStatStorage) Stat(ctx context.Context, path string) (storage.Attr, error) {
@@ -824,4 +817,10 @@ func serveInternal(t *testing.T, handler http.Handler, request Request, body io.
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httpRequest)
 	return response
+}
+
+func namespaceFixture(t *testing.T) *objectstore.Storage {
+	t.Helper()
+	_, backend := memoryfixture.New(t, "transport-internal", 1<<30, locking.DefaultOptions())
+	return backend
 }

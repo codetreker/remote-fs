@@ -18,21 +18,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/locked"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-// fakeLog is a metastore.Log a test drives by hand.
-//
-// Everything downstream of the transport stays real — a real HTTP listener, a real client,
-// a real local directory underneath — and the log is a stand-in because the store that
-// will keep one does not have it yet. What it has to be honest about is the three answers
-// Since exists to separate: caught up, resumable, and gone. Carrying those three across
-// the wire without collapsing any of them into another is what this transport is for, so a
-// stand-in that could not tell them apart would test nothing.
+// fakeLog exposes controlled log retention and failures behind a real HTTP listener,
+// client, and SQLite/object namespace. Since preserves the distinction between caught
+// up, resumable, and gone so that the tests can detect changes lost across the wire.
 type fakeLog struct {
 	mu sync.Mutex
 
@@ -329,6 +325,10 @@ type recording struct {
 	log *fakeLog
 }
 
+func (r recording) LockService() locking.Service {
+	return r.Storage.(locked.Backend).LockService()
+}
+
 func (r recording) CheckBounded() error {
 	return r.Storage.(storage.BoundedStorage).CheckBounded()
 }
@@ -349,8 +349,8 @@ func (r recording) Mkdir(ctx context.Context, path string) error {
 	return nil
 }
 
-// serveLog stands a handler over a real local directory and log up behind a real HTTP
-// listener, and returns a storage that reaches it.
+// serveLog serves a real namespace with a separately controlled log so that stream
+// failures can be injected independently of filesystem operations.
 func serveLog(t *testing.T, log metastore.Log, limits httprest.Limits) *httprest.Storage {
 	t.Helper()
 	return serveLogWatchedFor(t, log, limits, httprest.DefaultSilence)
@@ -360,10 +360,7 @@ func serveLog(t *testing.T, log metastore.Log, limits httprest.Limits) *httprest
 // rather than defaulted, so that a case about that bound need not wait out the default.
 func serveLogWatchedFor(t *testing.T, log metastore.Log, limits httprest.Limits, silence time.Duration) *httprest.Storage {
 	t.Helper()
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatalf("open the namespace: %v", err)
-	}
+	backing := namespaceFixture(t)
 	var served storage.Storage = backing
 	if fake, ok := log.(*fakeLog); ok {
 		served = recording{Storage: backing, log: fake}
@@ -384,10 +381,7 @@ func serveLogWatchedFor(t *testing.T, log metastore.Log, limits httprest.Limits,
 
 func serveLogWithOptions(t *testing.T, log metastore.Log, handlerOptions httprest.HandlerOptions, dialOptions httprest.DialOptions) *httprest.Storage {
 	t.Helper()
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatalf("open the namespace: %v", err)
-	}
+	backing := namespaceFixture(t)
 	var served storage.Storage = backing
 	if fake, ok := log.(*fakeLog); ok {
 		served = recording{Storage: backing, log: fake}
@@ -1945,10 +1939,7 @@ func TestAFrameAChangeStreamCannotUseEndsIt(t *testing.T) {
 func TestAServerThatCannotBoundItsWritesRefusesToTakeAPicture(t *testing.T) {
 	log := newFakeLog()
 	log.pages = [][]metastore.Row{{row(0, "", metastore.Node{ID: 1, Mode: fs.ModeDir | 0o755})}}
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	h, err := httprest.NewHandler(backing, log)
 	if err != nil {
 		t.Fatal(err)
@@ -2295,13 +2286,9 @@ func TestStoppingAServerTellsItsReplicasRatherThanBreakingTheirStreams(t *testin
 	}
 }
 
-// mustHandler builds a handler over a log and a fresh directory.
 func mustHandler(t *testing.T, log metastore.Log) *httprest.Handler {
 	t.Helper()
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	h, err := httprest.NewHandler(backing, log)
 	if err != nil {
 		t.Fatal(err)
@@ -2313,10 +2300,7 @@ func mustHandler(t *testing.T, log metastore.Log) *httprest.Handler {
 // to end. A server holds one handler for its whole life and Shutdown may be called from
 // anywhere, so neither of these may be a panic.
 func TestStoppingTwiceAndStoppingAnUnreplicableNamespaceAreBothHarmless(t *testing.T) {
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	h, err := httprest.NewHandler(backing, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -2430,10 +2414,7 @@ func TestStoppingAServerReleasesAPictureBeingDelivered(t *testing.T) {
 	// Far longer than this test, so that nothing but the stop can be what released it.
 	limits.SnapshotDeadline = time.Minute
 
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	h, err := httprest.NewHandlerWithLimits(backing, log, limits)
 	if err != nil {
 		t.Fatal(err)
@@ -2494,10 +2475,7 @@ func TestAPictureEndedByAShutdownIsNotAnnouncedAsWhole(t *testing.T) {
 	limits := httprest.DefaultLimits()
 	limits.SnapshotDeadline = time.Minute
 
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	h, err := httprest.NewHandlerWithLimits(backing, log, limits)
 	if err != nil {
 		t.Fatal(err)
@@ -2505,7 +2483,7 @@ func TestAPictureEndedByAShutdownIsNotAnnouncedAsWhole(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	resp, err := srv.Client().Get(srv.URL + "/v2/snapshot")
+	resp, err := srv.Client().Get(srv.URL + "/v3/snapshot")
 	if err != nil {
 		t.Fatalf("ask for a picture: %v", err)
 	}
@@ -2542,10 +2520,7 @@ func TestAPictureEndedByAShutdownIsNotAnnouncedAsWhole(t *testing.T) {
 func TestAStreamWhoseWritesCannotBeBoundedIsRefused(t *testing.T) {
 	log := newFakeLog()
 	log.record(created("a"))
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	backing := namespaceFixture(t)
 	h, err := httprest.NewHandler(backing, log)
 	if err != nil {
 		t.Fatal(err)

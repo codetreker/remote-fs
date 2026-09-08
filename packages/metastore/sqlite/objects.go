@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -196,7 +197,7 @@ func (s *Store) Commit(ctx context.Context, path string, object metastore.Object
 		return pathError("commit", path, fmt.Errorf(
 			"an object of %d bytes is not a length: %w", object.Size, syscall.EINVAL))
 	}
-	if err := s.mutate(ctx, func(tx *sql.Tx) error {
+	if err := s.mutateNamespace(ctx, locking.WriteMutation, []string{cleaned}, func(tx *sql.Tx) error {
 		return s.commit(ctx, tx, cleaned, object)
 	}); err != nil {
 		return pathError("commit", path, failure(err))
@@ -1513,7 +1514,7 @@ func (s *Store) Garbage(ctx context.Context, limit int) ([]metastore.Key, error)
 	if limit < 0 {
 		return nil, fmt.Errorf("a limit of %d objects is not a count: %w", limit, syscall.EINVAL)
 	}
-	if err := s.coordinator.beginHealthyRead(); err != nil {
+	if err := s.beginHealthyRead(ctx); err != nil {
 		return nil, err
 	}
 	defer s.coordinator.endHealthyRead()
@@ -1546,11 +1547,18 @@ func (s *Store) Garbage(ctx context.Context, limit int) ([]metastore.Key, error)
 // A key with no record at all is not an error. Forgetting is driven by a sweeper that may
 // have been interrupted between deleting the object and recording that it did, so running
 // it again has to converge rather than fail.
+//
+// Admission and batch staging honor cancellation. Once staging succeeds, finalization
+// completes before returning so storage shutdown can drain its admitted garbage cleanup.
 func (s *Store) Forget(ctx context.Context, keys []metastore.Key) error {
 	if len(keys) == 0 {
 		return nil
 	}
-	if err := s.mutate(ctx, func(tx *sql.Tx) error {
+	// The transaction owns cleanup while each staging statement keeps the caller's context.
+	// database/sql's automatic rollback hides its result, so cancellation must not race our
+	// explicit rollback or final COMMIT when the maintenance lifetime ends during Close.
+	// https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/database/sql/sql.go#L2207-L2221
+	if err := s.mutateTransaction(ctx, context.WithoutCancel(ctx), nil, func(tx *sql.Tx) error {
 		for _, key := range keys {
 			var state int
 			switch err := tx.QueryRowContext(ctx, `SELECT state FROM objects WHERE key = ? AND namespace = ?`,

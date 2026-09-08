@@ -73,27 +73,20 @@ func TestWhatOneMountpointWritesAnotherReads(t *testing.T) {
 	t.Logf("close() returned on A → contents read on B: %v", visible)
 }
 
-// TestTheBytesReachTheBackingDirectory reads the file the server was given, with plain os
-// calls and nothing of this system in the way.
-//
-// Both mountpoints and the server could agree with each other and all be wrong. The
-// backing directory is the one path to the bytes that does not run through the code under
-// test, which is what makes it evidence.
-func TestTheBytesReachTheBackingDirectory(t *testing.T) {
-	s := serveDirectory(t)
+// Reading the authoritative storage bypasses the mount and its metadata replica.
+func TestTheBytesReachAuthoritativeStorage(t *testing.T) {
+	s := serveNamespace(t)
 	a := mountpointOn(t, s)
-
 	content := []byte("hello\n")
 	if err := os.WriteFile(filepath.Join(a, "a.txt"), content, 0o644); err != nil {
 		t.Fatalf("writing a.txt through A: %v", err)
 	}
-
-	got, err := os.ReadFile(filepath.Join(s.backing, "a.txt"))
+	got, err := s.authoritative.Read(t.Context(), "a.txt")
 	if err != nil {
-		t.Fatalf("the backing directory has no a.txt: %v", err)
+		t.Fatalf("read authoritative a.txt: %v", err)
 	}
 	if !bytes.Equal(got, content) {
-		t.Fatalf("the backing directory holds %q, A wrote %q", got, content)
+		t.Fatalf("the authoritative namespace holds %q, A wrote %q", got, content)
 	}
 }
 
@@ -228,29 +221,21 @@ func TestAnOverwriteOnOneMountpointIsSeenWhole(t *testing.T) {
 	}
 }
 
-// TestASymbolicLinkSurvivesTheWholeChain. A node's kind is the one attribute every layer
-// has to agree on, and a symbolic link is the kind that is lost by default: it is the one
-// the operating system resolves unless it is told not to, and the one whose mode bit has
-// to be carried across the wire rather than inferred.
-//
-// Both halves are proved apart — the mount against a plain directory, the transport
-// against the contract suite — and neither of them carries fs.ModeSymlink through both. A
-// chain that dropped it would present the link as an ordinary file, and everything reading
-// under that name would be reading a file nobody named.
-//
-// The namespace has no operation that makes a link (R-FS-1 asks for them eventually), so
-// the link is put into the served directory the way one gets there in practice: by
-// something else that reaches that directory.
+// A symbolic-link kind and target length must survive both HTTP and FUSE. The storage
+// interface describes links but provides no operation to resolve their targets.
 func TestASymbolicLinkSurvivesTheWholeChain(t *testing.T) {
-	s := serveDirectory(t)
+	namespace, _ := namespaceFixture(t)
+	for name, content := range map[string]string{"target": "payload\n", "link": "target"} {
+		if err := namespace.Write(t.Context(), name, []byte(content)); err != nil {
+			t.Fatalf("seed symbolic-link fixture: %v", err)
+		}
+	}
+	link, err := namespace.Stat(t.Context(), "link")
+	if err != nil {
+		t.Fatalf("stat symbolic-link fixture: %v", err)
+	}
+	s := serveStorage(t, &symlinkMetadata{Storage: namespace, linkID: link.ID}, nil)
 	a := mountpointOn(t, s)
-
-	if err := os.WriteFile(filepath.Join(s.backing, "target"), []byte("payload\n"), 0o644); err != nil {
-		t.Fatalf("writing the file the link points at: %v", err)
-	}
-	if err := os.Symlink("target", filepath.Join(s.backing, "link")); err != nil {
-		t.Fatalf("planting the link: %v", err)
-	}
 
 	got, err := os.Lstat(filepath.Join(a, "link"))
 	if err != nil {

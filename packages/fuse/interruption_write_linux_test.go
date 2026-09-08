@@ -23,10 +23,10 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/codetreker/remote-fs/packages/fuse"
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/objectstore"
-	"github.com/codetreker/remote-fs/packages/storage/objectstore/memory"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 	"github.com/codetreker/remote-fs/packages/storage/replicated"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
@@ -39,16 +39,7 @@ type signalNamespace struct {
 
 func newSignalNamespace(t *testing.T, allowance int64, files map[string][]byte) *signalNamespace {
 	t.Helper()
-	meta, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "namespace.db"), "signal", allowance, sqlite.DefaultWindow())
-	if err != nil {
-		t.Fatal(err)
-	}
-	backing := objectstore.New(memory.New(), meta)
-	t.Cleanup(func() {
-		if err := backing.Close(); err != nil {
-			t.Error(err)
-		}
-	})
+	meta, backing := memoryfixture.New(t, "signal", allowance, locking.DefaultOptions())
 	for name, body := range files {
 		if err := backing.Create(t.Context(), name); err != nil {
 			t.Fatal(err)

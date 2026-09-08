@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -29,6 +30,8 @@ type Storage struct {
 	// maxFrameBytes bounds one replication frame retained by a stream reader.
 	maxFrameBytes int64
 	responses     *bodyAdmission
+	lockControls  *bodyAdmission
+	scope         *locking.MutationScope
 
 	// silence is how long a stream may say nothing at all before this side stops believing
 	// it is being delivered.
@@ -113,7 +116,8 @@ func DialWithOptions(baseURL string, httpClient *http.Client, options DialOption
 			settled.MaxInFlightResponseBytes,
 			settled.MaxWaitingResponses,
 		),
-		silence: settled.Silence,
+		silence:      settled.Silence,
+		lockControls: configuredLockControlAdmission(settled.MaxConcurrentLockControls, settled.MaxWaitingLockControls),
 	}, nil
 }
 
@@ -376,6 +380,19 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 	if content != nil {
 		httpReq.Header.Set("Content-Type", req.ContentType())
 	}
+	if isNamespaceMutation(req.Op) {
+		scope := locking.ScopeFromContext(ctx)
+		if !locking.HasScope(ctx) && s.scope != nil {
+			scope = *s.scope
+		}
+		if scope.Owner != (locking.OwnerRef{}) || len(scope.Grants) != 0 {
+			encoded, err := encodeMutationScope(scope)
+			if err != nil {
+				return nil, err
+			}
+			httpReq.Header.Set(HeaderMutationScope, encoded)
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, operationFailure(req, err, true)
 	}
@@ -489,6 +506,19 @@ func decodeListInto(content []byte, result *storage.ListResult) error {
 // it was told — which is not the same as knowing the operation failed in a particular
 // way, and must not be reported as if it were.
 func (s *Storage) storageError(req Request, body []byte) error {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(body, &members); err != nil {
+		return unreachable(req, err)
+	}
+	_, hasCode := members["lockCode"]
+	_, hasRecorded := members["recorded"]
+	if hasCode || hasRecorded {
+		failure, err := decodeNamespaceLockFailure(body)
+		if err != nil {
+			return unreachable(req, err)
+		}
+		return failure
+	}
 	var resp ErrorResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return unreachable(req, err)

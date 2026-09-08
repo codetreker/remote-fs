@@ -11,8 +11,10 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/locked"
 )
 
 // Handler serves one namespace.
@@ -20,7 +22,9 @@ import (
 // It is a plain http.Handler, so it can be run on its own or mounted inside an existing
 // server; http.StripPrefix is how it is mounted somewhere other than the root.
 type Handler struct {
-	storage             storage.BoundedStorage
+	storage             *locked.Storage
+	locks               locking.Service
+	lockControls        *bodyAdmission
 	log                 metastore.Log
 	limits              Limits
 	maxBodyBytes        int64
@@ -44,7 +48,10 @@ type Handler struct {
 
 var _ http.Handler = (*Handler)(nil)
 
-// NewHandler builds a handler over s, publishing log to whatever replicates the namespace.
+// NewHandler serves a backend whose LockService authorizes every final mutation.
+// A backend without that paired authority is rejected before serving. Scoped namespace
+// requests and anonymous requests reach that same authority. log describes the namespace's
+// committed mutations for metadata replication.
 //
 // The log is a second input rather than something discovered through s, because not every
 // namespace has one: a local directory is a namespace with no metastore behind it and
@@ -85,12 +92,19 @@ func NewHandlerWithOptions(s storage.Storage, log metastore.Log, options Handler
 	if !ok {
 		return nil, errors.New("httprest: storage does not implement bounded read and list results")
 	}
-	if err := bounded.CheckBounded(); err != nil {
-		return nil, fmt.Errorf("httprest: storage cannot serve bounded results: %w", err)
+	backend, ok := bounded.(locked.Backend)
+	if !ok {
+		return nil, errors.New("httprest: storage has no bound file-lock authority")
+	}
+	paired, err := locked.New(backend)
+	if err != nil {
+		return nil, fmt.Errorf("httprest: invalid enforcing namespace: %w", err)
 	}
 	settled := options.settle()
 	h := &Handler{
-		storage:             bounded,
+		storage:             paired,
+		locks:               paired.LockService(),
+		lockControls:        configuredLockControlAdmission(settled.maxConcurrentLockControls, settled.maxWaitingLockControls),
 		log:                 log,
 		limits:              settled.replication,
 		maxBodyBytes:        settled.maxBodyBytes,
@@ -167,6 +181,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.writeFault(w, statusForParseError(err), err)
 		return
+	}
+	if isLockControl(req.Op) {
+		h.serveLockControl(w, r, req)
+		return
+	}
+	scope, present, err := requestMutationScope(r, req.Op)
+	if err != nil {
+		h.writeFault(w, http.StatusBadRequest, err)
+		return
+	}
+	if present || isNamespaceMutation(req.Op) {
+		r = r.WithContext(locking.WithScope(r.Context(), scope))
 	}
 	if req.ContentType() == "" {
 		if err := h.requireEmptyBody(r); err != nil {
@@ -437,10 +463,44 @@ func (h *Handler) writeJSON(w http.ResponseWriter, status int, body any) {
 // vocabulary. The error may come from storage or from a handler-owned bound whose errno
 // is already determined before storage is called.
 func (h *Handler) writeOperationError(w http.ResponseWriter, err error) {
-	h.writeJSON(w, StatusStorageError, ErrorResponse{
-		Errno:   storage.ErrnoNameOf(err),
-		Message: err.Error(),
-	})
+	response := ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error()}
+	if failure := namespaceLockFailure(err); failure != nil {
+		response.LockCode = failure.Code
+		recorded := failure.Recorded
+		response.Recorded = &recorded
+	}
+	h.writeJSON(w, StatusStorageError, response)
+}
+
+// Only a single error chain can identify one lock failure. Joined failures and an
+// enclosing classification own the whole outcome and cannot inherit a nested lock code.
+func namespaceLockFailure(err error) *locking.Error {
+	errno := storage.ErrnoOf(err)
+	for err != nil {
+		if failure, ok := err.(*locking.Error); ok {
+			if locking.Errno(failure.Code) == errno {
+				return failure
+			}
+			return nil
+		}
+		if _, classified := err.(interface{ Classification() error }); classified {
+			return nil
+		}
+		if joined, ok := err.(interface{ Unwrap() []error }); ok {
+			children := joined.Unwrap()
+			if len(children) != 1 {
+				return nil
+			}
+			err = children[0]
+			continue
+		}
+		wrapped, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return nil
+		}
+		err = wrapped.Unwrap()
+	}
+	return nil
 }
 
 // writeFault reports that the exchange itself went wrong. It never uses

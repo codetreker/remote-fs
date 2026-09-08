@@ -11,8 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
+	"github.com/codetreker/remote-fs/packages/storage/locked"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
@@ -133,7 +135,7 @@ func TestSuccessfulQuotaQueryIgnoresLateCancellation(t *testing.T) {
 }
 
 type namedInterruptionSpace struct {
-	storage.BoundedStorage
+	locked.Backend
 	calls atomic.Int32
 }
 
@@ -145,11 +147,8 @@ func (s *namedInterruptionSpace) Space(context.Context) (storage.Space, error) {
 }
 
 func TestQuotaQueryHonorsWireInterruptionAndImmediatelyMeasuresAgain(t *testing.T) {
-	local, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	backend := &namedInterruptionSpace{BoundedStorage: local}
+	_, local := memoryfixture.New(t, "quota-wire", 0, locking.DefaultOptions())
+	backend := &namedInterruptionSpace{Backend: local}
 	handler, err := httprest.NewHandler(backend, nil)
 	if err != nil {
 		t.Fatal(err)

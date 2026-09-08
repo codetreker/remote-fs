@@ -13,7 +13,6 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/localdir"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
@@ -142,10 +141,7 @@ func TestAStreamThatStopsArrivingIsReportedRatherThanWaitedOnForever(t *testing.
 func serveQuietly(t *testing.T, log metastore.Log, limits httprest.Limits, relay *blackhole, silence time.Duration) *httprest.Storage {
 	t.Helper()
 
-	backing, err := localdir.New(t.TempDir())
-	if err != nil {
-		t.Fatalf("open the namespace: %v", err)
-	}
+	backing := namespaceFixture(t)
 	var served storage.Storage = backing
 	if fake, ok := log.(*fakeLog); ok {
 		served = recording{Storage: backing, log: fake}

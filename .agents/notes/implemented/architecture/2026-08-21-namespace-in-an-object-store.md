@@ -8,7 +8,7 @@ Status: implemented
 
 `storage.Storage` 要的其余一切都得存在别处，而「别处」有两个选项。一是贴在字节旁边——每个 blob 挂一份自己的元数据。那样 `SetAttr` 是一次网络请求，`Stat` 是一次网络请求，列一个目录是一次列举加上每个条目一次请求；更要命的是改名一个目录变成 O(n) 次复制加删除，中途失败留下一棵搬了一半的树，而契约里没有任何东西能描述那个状态。二是把树放进一个本来就擅长回答树的问题、也本来就能一次改几行或者一行都不改的系统里。
 
-第二条路要求承认一件此前没有承认过的事：一份 storage 实现可以有它自己的外部依赖。`localdir` 没有——它就是一个目录。这份实现需要一个对象存储和一个数据库，两者都由部署方提供和运维，两者都能各自失败。
+第二条路要求承认一件此前没有承认过的事：一份 storage 实现可以有它自己的外部依赖。当时的 `localdir` 没有——它就是一个目录。这份实现需要一个对象存储和一个数据库，两者都由部署方提供和运维，两者都能各自失败。
 
 ## 决定
 
@@ -23,9 +23,11 @@ Status: implemented
 | `packages/metastore` | `Store`：名字的树、节点的属性、路径到对象键的指向 |
 | `packages/metastore/sqlite` | 第一份 `Store` 实现，也提供绑定到 backing store ID 的打开方式 |
 
-`localdir` 与 `limited` 仍是命名空间的合法持有方式。本地磁盘实现的格式、持久化与组合所有权由[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)记录；它扩展这份两层结构，不改变树与对象的职责划分。
+本地磁盘实现的格式、持久化与组合所有权由[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)记录；[显式文件占有](./2026-09-07-file-locks.md)把 authority 绑定到 metastore 的原生最终发布。两者扩展这份两层结构，树与对象继续各自持有名字和字节。`limited` 保留为可复用的配额包装器，第三方 storage 继续按库契约接入。宿主目录形态的结束由[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)记录，下文涉及 `localdir` 的比较保留该决定发生时的理由。
 
-**写入的顺序是登记、上传、指过去。** `Reserve` 先在库里落一行「我要写这个键」并提交，然后字节被放到那个键下，最后 `Commit` 把路径指向它并在同一个事务里记账。`Put` error 把 reservation 变成不可清扫的 unresolved；`Put` 成功而 `Commit` 失败才 `Abandon` 成 garbage。调用方已经取消的 request 不会取消这些 storage-owned cleanup，清理本身失败则与原失败一起返回。对象一经写入不再修改，所以并发的读者要么读到树当时指向的那个对象的全部，要么读到树已经指向别处——不存在读到一半被换掉的文件。这正是契约里那条原子性要求，而对单个 blob 的任何一串写入都给不了它。
+**写入的顺序是登记、上传、指过去。** `Reserve` 先在库里落一行「我要写这个键」并提交，然后字节被放到那个键下，最后 `Commit` 把路径指向它并在同一个事务里记账。上传不占住占有 authority；`Commit` 在原生 writer gate 内解析实际节点，发布前才对显式 proof、活动保护与期限作最终判定，匿名修改也受约束。最终许可与提交、持久确认和结果处置保持同一顺序，后继冲突权限与新的权威视图不能越过它。对象一经写入不再修改，已经捕获旧 node/object key 的读者可以在门外取得完整字节；新的读取取得提交后的完整版本。
+
+`Put` error 把 reservation 变成不可清扫的 unresolved；`Put` 成功而 `Commit` 明确拒绝时，`Abandon` 可把仍未引用的 reservation 变成 garbage。上传后 grant 过期是这种明确拒绝。未知 commit 或已被 poison 的 metastore 不允许收尾凭猜测取得删除权限，已被引用的对象同样不能 abandoned。调用方已经取消的 request 不会取消这些 storage-owned cleanup，清理本身失败则与原失败一起返回。原子切换路径引用使其它客户端看不到半份内容，而对单个 blob 的任何一串写入都给不了它。
 
 **树按 `(parent, name)` 存，不按完整路径存。** 改名一个目录改一行，而不是把子树里每一行的前缀都 UPDATE 一遍。附带的好处是行号天然就是[存储操作词汇](../../proposed/architecture/2026-08-19-storage-operation-vocabulary.md)要的那种「跨改名稳定、删除后不复用」的节点身份，将来要用时不必推翻重来。
 
@@ -41,7 +43,7 @@ Status: implemented
 
 调查过的系统分成两类做法（每一条的出处见[对象存储后端](../../../../docs/research/object-store-backends.md)）。一类先传后提交、中间什么都不记，于是只能靠时间去猜：JuiceFS 一小时，SeaweedFS 五小时，Iceberg 三天，Delta Lake 七天——每一家的文档都带着一句「间隔太短会损坏数据」的警告，因为这个间隔实际上是在赌一次写入能有多慢。另一类不猜：s3ql 在上传**之前**就把一行意图写进元数据库，于是每个对象从诞生那一刻起就有一条已提交的记录说明它是谁的；它的清扫器因此完全不需要宽限期。Ceph RGW 从另一头解决——它从不扫描，回收项在解除引用的那个原子操作里入队。
 
-这份实现两头都取：上传前登记使每个 key 在 publication 之前已有 durable record，权威解引用 transaction 则把覆盖与删除产生的旧对象明确标成 garbage。`Garbage` 只返回这类 deletion-authorized record；reserved 不因年龄变成 garbage，`Put` error 进入不可清扫的 unresolved，只有 `Put` 已成功而 `Commit` 失败时才由 `Abandon` 记录本次写入的归属证明。清扫器因此既不列举 container，也不靠宽限期猜测对象归属。完整的 nil/error 删除权限边界见[未证实对象发布进入 unresolved](./2026-09-04-unresolved-object-publication.md)。
+这份实现两头都取：上传前登记使每个 key 在 publication 之前已有 durable record，权威解引用 transaction 则把覆盖与删除产生的旧对象明确标成 garbage。`Garbage` 只返回这类 deletion-authorized record；reserved 不因年龄变成 garbage，`Put` error 进入不可清扫的 unresolved，只有成功 `Put` 证明归属、且 namespace 状态允许时，`Abandon` 才能把失败写入标为 garbage。清扫器因此既不列举 container，也不靠宽限期猜测对象归属。完整的 nil/error 删除权限边界见[未证实对象发布进入 unresolved](./2026-09-04-unresolved-object-publication.md)。
 
 s3ql 那套之所以成立，前提是它强制单挂载独占——它的清扫器会直接删掉库里不认识的对象。这里不需要那个前提，因为所有写入者共用同一个 metastore，登记行对谁都可见。
 
@@ -61,15 +63,19 @@ s3ql 那套之所以成立，前提是它强制单挂载独占——它的清扫
 
 > **内容派生的版本认不出两个内容相同的对象。** 版本是内容哈希时，检查退化成「这个名字上的字节还是我读到的字节」，而不是「这还是我打开的那个对象」。
 
-同一份哈希既做去重依据又做版本，等于把那个退化设计进来。所以两者是两个值。
+同一份哈希既做去重依据又做版本，等于把那个退化设计进来。所以内容哈希、节点身份与内容版本保持独立，文件占有的 GrantID／generation 也不充当其中任何一个值。
 
-那份提案还指出，`localdir` 只能用进程内的每路径互斥来兑现「比较与写入不可分割」，两个进程挂同一个目录时它就不成立。**一个事务性的 metastore 是本仓库第一个能跨进程真正兑现它的实现。**
+事务性的 metastore 提供了把比较与写入放在同一个事务中的结构能力。显式文件占有使用原生提交处的权限判定，普通 Open 不自行取得 grant；缺少连续保护的写入仍需要内容版本／CAS，这部分由原提案继续跟踪。
 
 ## SQLite 的单写者
 
 [顺序与版本](../../proposed/architecture/2026-08-19-ordering-and-versions.md)否决过「全局临界区横跨提交与取号」，理由是它把所有写入串行到一次网络/磁盘往返之后，违反 R-CC-2「写不同文件必须完全互不干扰」。
 
 SQLite 只有一个写者。这里选择接受它，理由是被否决的那个形状里，临界区**包住了网络往返**；这里事务只含元数据操作，字节的上传发生在事务之外，被串行掉的是一次本地提交。这个区别是这份实现成立的全部依据，也是它的上限：R-CC-2 在这份实现上只以这个口径成立，一个真正让不同文件的写互不干扰的部署需要一份 PostgreSQL 实现，而 `metastore.Store` 的接口是照着外部数据库设计的，没有任何一处假设单进程或本地文件。
+
+启用文件占有的 SQLite 部署由 native owner 独占数据库。外部对象存储使用 `sqlite.OpenLocking`：它同时持有 database inode 的 lifetime `LOCK_EX` 与进程内独占 coordinator，以数据库身份绑定占有证据，并在数据库旁固定保存 `.<database basename>.leases.intent` 和 `.witness`。所有原始 SQLite opener 持有同一 native file 的 `LOCK_SH`，既存 raw handle 与新 authority 在同进程和跨进程都互斥；配置恢复与启用 authority 必须验证真实 EX owner，恢复还要求绑定的原生 `LeaseAnchor`。
+
+Accepted／Prepared、独立 witness 与最大租期覆盖整份数据库；运行期选择的 namespace 不进入永久 anchor identity。同一数据库不能供两个 active locked server 共用，但可以重新打开其中另一份已存在的 namespace；每次接管仍从取得数据库 EX 的 monotonic 起点执行完整最大租期屏障。原始未绑定的 SQLite API 仍可独立使用；已有 native binding 或租期证据时不能借它关闭保护。localstore 的私有 root 继续永久绑定单一 workspace，并在 root lifetime lock 外持有数据库 EX。证据、所有权和恢复屏障的代价由[显式文件占有](./2026-09-07-file-locks.md)记录。
 
 ## 备选方案
 
@@ -83,7 +89,7 @@ SQLite 只有一个写者。这里选择接受它，理由是被否决的那个�
 
 **靠宽限期扫描回收垃圾。** 实现最简单，也是多数系统的做法。输在它的正确性是一个关于延迟的猜测——每一家采用它的系统都在文档里写着间隔太短会损坏数据。上传前登记让这个猜测完全不必要。
 
-**继续用 `limited` 包住它。** 与 `localdir` 完全一致，现有的 quota 测试不用动。输在两处：`limited` 在每次 `Write` 前多做一次 `Stat`，对网络后端就是每次写多一个往返（光是原子性那个用例就是 200 次）；而它 `New` 时要走一遍整个命名空间来播种计数器，对一个能一句话问出用量的库来说是荒谬的。更根本的是它的账会漂移——[空间上限](./2026-08-21-space-limit.md)为此才有 `SIGHUP`/`Recount`——而事务里维护的计数器不会。
+**继续用 `limited` 包住它。** 与当时 `localdir` 的组合完全一致，可以复用已有的 quota 测试。输在两处：当时的 `limited` 在每次 `Write` 前多做一次 `Stat`，对网络后端就是每次写多一个往返（光是原子性那个用例就是 200 次）；而它 `New` 时要走一遍整个命名空间来播种计数器，对一个能一句话问出用量的库来说是荒谬的。更根本的是这套路径采样的账会漂移——[空间上限](./2026-08-21-space-limit.md)为此引入了 `SIGHUP`/`Recount`——而事务里维护的计数器不会。
 
 **SQLite 驱动。** 三个候选都实测过。`mattn/go-sqlite3` 需要 cgo，与 [FUSE 库选型](../../../../docs/research/fuse-libs.md)记下的「Zero cgo」直接冲突。另外两个都是纯 Go 且都通过了同一组探针（WAL、字节序、非法 UTF-8 往返、唯一约束可判定），量出来的体积记在[对象存储后端](../../../../docs/research/object-store-backends.md)：`modernc.org/sqlite` v1.57.0 是 24 个模块、vendor 140 MB、1886 个 .go 文件；`github.com/ncruces/go-sqlite3` v0.35.3 是 15 个模块、14 MB、389 个文件。选了前者，理由是它是部署最广的纯 Go 驱动，而驱动藏在 `database/sql` 后面，换掉的代价接近零。这个取舍值得在依赖体量变成问题时重新考虑。
 
@@ -93,10 +99,10 @@ SQLite 只有一个写者。这里选择接受它，理由是被否决的那个�
 
 买到的：
 
-- **跨进程的原子改名**，包括目录。`localdir` 靠的是同一个文件系统内的 `rename(2)`，两个进程各挂一次同一个目录时它仍然成立；对象存储上没有任何等价物，而一个事务有。
+- **跨进程的原子改名**，包括目录。当时的 `localdir` 靠同一个文件系统内的 `rename(2)` 使两个进程各挂一次同一个目录时仍能原子改名；对象存储上没有任何等价物，而一个事务有。
 - **精确的用量**，不漂移，不需要遍历，也不需要一个修复它的信号。
-- **「比较与写入不可分割」第一次真的可以兑现**，跨进程。
-- **符号链接的缺口在这里是空的**：契约没有任何操作能造出一条链接，所以一个只经由契约触达的命名空间永远不会持有链接。`localdir` 要处理链接是因为它坐在一个别人也能动的目录上；metastore 没有「外面」。
+- **比较与写入有可共享的原子事务位置**；占有权限在这里判定，内容版本／CAS 仍保留独立实现空间。
+- **符号链接的缺口在这里是空的**：契约没有任何操作能造出一条链接，所以一个只经由契约触达的命名空间永远不会持有链接。当时的 `localdir` 要处理链接，是因为它坐在一个别人也能动的目录上；metastore 没有「外面」。
 
 付出的：
 
