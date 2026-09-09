@@ -2,9 +2,12 @@ package sqlite_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -27,15 +30,22 @@ import (
 // caught here. A change to a neighbour is recorded before each change to this store, so the
 // positions this suite sees have gaps in them wherever real ones would.
 func TestTheContract(t *testing.T) {
-	metastoretest.Run(t, func(t *testing.T, allowance int64) metastore.Store {
-		path := database(t)
+	metastoretest.Run(t, contractStoreFactory(database(t)))
+}
+
+// Fresh namespace pairs isolate cases while retaining one physical schema. Each
+// child still owns the complete lifetime of its database connections.
+func contractStoreFactory(path string) metastoretest.NewStore {
+	var sequence atomic.Uint64
+	return func(t *testing.T, allowance int64) metastore.Store {
+		suffix := strconv.FormatUint(sequence.Add(1), 10)
 		return withNeighbour{
-			Store:     open(t, path, "workspace", allowance),
-			neighbour: open(t, path, "neighbour", 0),
+			Store:     open(t, path, "workspace-"+suffix, allowance),
+			neighbour: open(t, path, "neighbour-"+suffix, 0),
 			gaps:      new(atomic.Int64),
 			t:         t,
 		}
-	})
+	}
 }
 
 // withNeighbour records a change to another namespace in the same database before each change
@@ -190,5 +200,157 @@ func TestNeighbourGapsKeepSparsePositionsWithoutGrowingTheTree(t *testing.T) {
 	}
 	if after, err := n.neighbour.Stat(ctx, ""); err != nil || after.ID != root.ID || after.Mode != root.Mode {
 		t.Fatalf("neighbour root changed identity or mode: %+v, %v", after, err)
+	}
+}
+
+func TestContractFactoryKeepsSequentialNamespacesIsolated(t *testing.T) {
+	path := database(t)
+	factory := contractStoreFactory(path)
+	var first, second withNeighbour
+	var savedNode metastore.Node
+	var savedSpace storage.Space
+	var savedStatus sqlite.ObjectStatus
+	var savedBarrier, savedNeighbourBarrier metastore.LogBarrier
+	t.Run("populated namespace", func(t *testing.T) {
+		first = factory(t, 128).(withNeighbour)
+		key, err := first.Reserve(t.Context(), "same", 7)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := first.Commit(t.Context(), "same", metastore.Object{Key: key, Size: 7, ModTime: time.Unix(100, 0)}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := first.Reserve(t.Context(), "reserved", 3); err != nil {
+			t.Fatal(err)
+		}
+		unresolved, err := first.Reserve(t.Context(), "unresolved", 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := first.Quarantine(t.Context(), unresolved); err != nil {
+			t.Fatal(err)
+		}
+		garbage, err := first.Reserve(t.Context(), "garbage", 5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := first.Abandon(t.Context(), garbage); err != nil {
+			t.Fatal(err)
+		}
+		savedNode, err = first.Stat(t.Context(), "same")
+		if err != nil || savedNode.Content != key || savedNode.Size != 7 {
+			t.Fatalf("first node=%+v, error=%v", savedNode, err)
+		}
+		savedSpace, err = first.Space(t.Context())
+		if err != nil || savedSpace != (storage.Space{Total: 128, Used: 7, Avail: 121}) {
+			t.Fatalf("first quota=%+v, error=%v", savedSpace, err)
+		}
+		savedStatus, err = first.ObjectStatus(t.Context())
+		want := sqlite.ObjectStatus{ReservedCount: 1, ReservedBytes: 3, UnresolvedCount: 1, UnresolvedBytes: 4, GarbageCount: 1, GarbageBytes: 5}
+		if err != nil || savedStatus != want {
+			t.Fatalf("first pending state=%+v, error=%v", savedStatus, err)
+		}
+		savedBarrier, err = first.Barrier(t.Context(), 1024)
+		if err != nil || savedBarrier.Incarnation == "" || savedBarrier.Position == 0 {
+			t.Fatalf("first barrier=%+v, error=%v", savedBarrier, err)
+		}
+		savedNeighbourBarrier, err = first.neighbour.Barrier(t.Context(), 1024)
+		if err != nil || savedNeighbourBarrier.Position == 0 {
+			t.Fatalf("first neighbour barrier=%+v, error=%v", savedNeighbourBarrier, err)
+		}
+	})
+	if t.Failed() {
+		return
+	}
+	if !first.Store.Terminal() || !first.neighbour.Terminal() {
+		t.Fatal("first child retained an open Store after cleanup")
+	}
+	before, err := sqlite.InspectDurableState(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("fresh namespace", func(t *testing.T) {
+		second = factory(t, 256).(withNeighbour)
+		if children, err := second.List(t.Context(), ""); err != nil || len(children) != 0 {
+			t.Fatalf("fresh namespace lists %+v, error=%v", children, err)
+		}
+		if _, err := second.Stat(t.Context(), "same"); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("fresh namespace inherited a name: %v", err)
+		}
+		if space, err := second.Space(t.Context()); err != nil || space != (storage.Space{Total: 256, Avail: 256}) {
+			t.Fatalf("fresh quota=%+v, error=%v", space, err)
+		}
+		if status, err := second.ObjectStatus(t.Context()); err != nil || status != (sqlite.ObjectStatus{}) {
+			t.Fatalf("fresh pending state=%+v, error=%v", status, err)
+		}
+		if garbage, err := second.Garbage(t.Context(), 16); err != nil || len(garbage) != 0 {
+			t.Fatalf("fresh garbage=%+v, error=%v", garbage, err)
+		}
+		if barrier, err := second.Barrier(t.Context(), 1024); err != nil || barrier.Position != 0 || barrier.Incarnation == "" || barrier.Incarnation == savedBarrier.Incarnation {
+			t.Fatalf("fresh barrier=%+v, error=%v", barrier, err)
+		}
+		picture, at, err := second.Snapshot(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := picture.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		result, err := metastore.NewRowResult(1024, 0, func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
+			return 128 + lengths.Name + lengths.Content, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		done, err := picture.Next(t.Context(), 16, result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := result.Rows()
+		if err != nil || at != 0 || !done || len(rows) != 1 || rows[0].Parent != 0 || rows[0].Name != nil || !rows[0].Node.IsDir() || rows[0].Node.ID <= before.NodeHighWater {
+			t.Fatalf("fresh snapshot at=%d done=%v rows=%+v, error=%v", at, done, rows, err)
+		}
+		if err := picture.Close(); err != nil {
+			t.Fatal(err)
+		}
+		key, err := second.Reserve(t.Context(), "same", 9)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := second.Commit(t.Context(), "same", metastore.Object{Key: key, Size: 9, ModTime: time.Unix(200, 0)}); err != nil {
+			t.Fatal(err)
+		}
+		if node, err := second.Stat(t.Context(), "same"); err != nil || node.Content != key || node.Content == savedNode.Content || node.Size != 9 {
+			t.Fatalf("second node=%+v, error=%v", node, err)
+		}
+	})
+	if t.Failed() {
+		return
+	}
+	if !second.Store.Terminal() || !second.neighbour.Terminal() {
+		t.Fatal("second child retained an open Store after cleanup")
+	}
+	after, err := sqlite.InspectDurableState(t.Context(), path)
+	if err != nil || after.DatabaseID != before.DatabaseID || after.Generation <= before.Generation || after.NodeHighWater <= before.NodeHighWater || after.ChangeHighWater <= before.ChangeHighWater {
+		t.Fatalf("shared database state before=%+v after=%+v, error=%v", before, after, err)
+	}
+	reopened := open(t, path, "workspace-1", 128)
+	if node, err := reopened.Stat(t.Context(), "same"); err != nil || node != savedNode {
+		t.Fatalf("second child changed first node: %+v, error=%v; want %+v", node, err, savedNode)
+	}
+	if space, err := reopened.Space(t.Context()); err != nil || space != savedSpace {
+		t.Fatalf("second child changed first quota: %+v, error=%v; want %+v", space, err, savedSpace)
+	}
+	if status, err := reopened.ObjectStatus(t.Context()); err != nil || status != savedStatus {
+		t.Fatalf("second child changed first pending state: %+v, error=%v; want %+v", status, err, savedStatus)
+	}
+	if barrier, err := reopened.Barrier(t.Context(), 1024); err != nil || barrier != savedBarrier {
+		t.Fatalf("second child changed first log: %+v, error=%v; want %+v", barrier, err, savedBarrier)
+	}
+	neighbour := open(t, path, "neighbour-1", 0)
+	if barrier, err := neighbour.Barrier(t.Context(), 1024); err != nil || barrier != savedNeighbourBarrier {
+		t.Fatalf("second child changed first neighbour log: %+v, error=%v; want %+v", barrier, err, savedNeighbourBarrier)
 	}
 }
