@@ -2,10 +2,11 @@ package sqlite_test
 
 import (
 	"context"
-	"fmt"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/metastoretest"
@@ -54,7 +55,8 @@ type withNeighbour struct {
 // one's. A neighbour that will not take it is reported rather than passed over: the gap would
 // silently not be there, and every case after it would be measuring dense positions again.
 func (n withNeighbour) gap(ctx context.Context) {
-	if err := n.neighbour.Create(ctx, fmt.Sprintf("gap-%d", n.gaps.Add(1))); err != nil {
+	modified := time.Unix(n.gaps.Add(1), 0)
+	if err := n.neighbour.SetAttr(ctx, "", storage.AttrChange{ModTime: &modified}); err != nil {
 		n.t.Errorf("consuming a position in the neighbouring namespace: %v", err)
 	}
 }
@@ -111,4 +113,82 @@ func open(t *testing.T, path, namespace string, allowance int64) *sqlite.Store {
 		}
 	})
 	return store
+}
+
+func TestNeighbourGapsKeepSparsePositionsWithoutGrowingTheTree(t *testing.T) {
+	path := database(t)
+	n := withNeighbour{
+		Store:     open(t, path, "workspace", 0),
+		neighbour: open(t, path, "neighbour", 0),
+		gaps:      new(atomic.Int64), t: t,
+	}
+	ctx := t.Context()
+	root, err := n.neighbour.Stat(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownRoot, err := n.Store.Stat(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 4 {
+		modified := time.Unix(100+int64(i), 0)
+		if err := n.SetAttr(ctx, "", storage.AttrChange{ModTime: &modified}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var callers sync.WaitGroup
+	for range 4 {
+		callers.Go(func() { n.gap(ctx) })
+	}
+	callers.Wait()
+	readChanges := func(store *sqlite.Store) []metastore.Change {
+		t.Helper()
+		result, err := metastore.NewChangeResult(64*1024, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
+			return 128 + lengths.Name + lengths.FromName + lengths.Content, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Since(ctx, 0, 16, result); err != nil {
+			t.Fatal(err)
+		}
+		changes, err := result.Changes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return changes
+	}
+	own, neighbour := readChanges(n.Store), readChanges(n.neighbour)
+	if len(own) != 4 || len(neighbour) != 8 {
+		t.Fatalf("own changes=%d, neighbour changes=%d", len(own), len(neighbour))
+	}
+	for i, change := range own {
+		if change.Kind != metastore.Modified || change.Node == nil || change.Node.ID != ownRoot.ID || !change.Node.ModTime.Equal(time.Unix(100+int64(i), 0)) || change.Position != neighbour[i].Position+1 {
+			t.Fatalf("own change %d = %+v, preceding neighbour=%+v", i, change, neighbour[i])
+		}
+		if i > 0 && change.Position <= own[i-1].Position+1 {
+			t.Fatalf("adjacent own positions: %d, %d", own[i-1].Position, change.Position)
+		}
+	}
+	seen := make(map[int64]bool)
+	for i, change := range neighbour {
+		if change.Kind != metastore.Modified || change.Node == nil || change.Node.ID != root.ID || len(change.Name) != 0 {
+			t.Fatalf("neighbour change %d did not modify the same root: %+v", i, change)
+		}
+		second := change.Node.ModTime.Unix()
+		if second < 1 || second > 8 || seen[second] || !change.Node.ModTime.Equal(time.Unix(second, 0)) {
+			t.Fatalf("neighbour change %d has nonunique counter timestamp %v", i, change.Node.ModTime)
+		}
+		seen[second] = true
+		if i > 0 && change.Position <= neighbour[i-1].Position {
+			t.Fatalf("neighbour positions did not increase: %+v", neighbour)
+		}
+	}
+	if children, err := n.neighbour.List(ctx, ""); err != nil || len(children) != 0 {
+		t.Fatalf("neighbour tree grew: %+v, %v", children, err)
+	}
+	if after, err := n.neighbour.Stat(ctx, ""); err != nil || after.ID != root.ID || after.Mode != root.Mode {
+		t.Fatalf("neighbour root changed identity or mode: %+v, %v", after, err)
+	}
 }

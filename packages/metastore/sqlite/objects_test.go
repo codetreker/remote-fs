@@ -188,19 +188,19 @@ func TestPendingAdmissionSeeksPastALargeReferencedSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	statement, err := tx.PrepareContext(t.Context(), `
+	seeded, err := tx.ExecContext(t.Context(), `
+		WITH RECURSIVE referenced(i) AS (
+			VALUES(0)
+			UNION ALL SELECT i + 1 FROM referenced WHERE i < 19999
+		)
 		INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
-		VALUES (?, ?, ?, 1, NULL, 0, 0)`)
+		SELECT printf('referenced-%05d', i), ?, ?, 1, NULL, 0, 0
+		FROM referenced ORDER BY i`, store.namespace, stateReferenced)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := range 20_000 {
-		if _, err := statement.ExecContext(t.Context(), fmt.Sprintf("referenced-%05d", i), store.namespace, stateReferenced); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := statement.Close(); err != nil {
-		t.Fatal(err)
+	if count, err := seeded.RowsAffected(); err != nil || count != 20_000 {
+		t.Fatalf("seeding referenced objects: count=%d, error=%v; want 20000", count, err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)

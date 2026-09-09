@@ -282,6 +282,18 @@ SQLite 的包内直接用例按各模块持有的边界核对结果：
 | [changes](../packages/metastore/sqlite/internal/changes) | 变长 payload 加载前预算，页边界与 predecessor 链，Record 与 tail 的事务一致性，按数量、年龄和保留下限 trim 且不影响其它 namespace。 |
 | [nativelease](../packages/metastore/sqlite/internal/nativelease) | evidence 字段边界、共享与排他 native ownership、绑定和文件身份核对；验证拒绝不释放仍持有的锁，Close 缓存结果且不重试可能已复用的 descriptor。SQLite 句柄关闭不确定时的所有权保留由根包用例验证。 |
 
+#### SQLite 测试准备与隔离
+
+根 metastore 契约仍使用真实文件数据库与同库的邻居 namespace。邻居在每次被测修改前用唯一 ModTime 更新既有根，发布真实 Modified 日志并消耗全局 position；其目录不增长。局部回归核对两边日志、稀疏的被测 position、含并发调用的唯一时间值，以及邻居根身份、模式和空目录。间隙发布失败仍使测试失败，不能把稀疏序列换成只在单 namespace 上成立的连续序列。
+
+索引准入用例在原有事务内用一条递归 CTE 准备 20,000 条 referenced object，保留精确 key、namespace、state、size、NULL digest、时间字段和插入顺序，并检查 RowsAffected。生产 EXPLAIN 与实际 Reserve 的断言继续执行，不能用减少行数缩短准备。
+
+当前 schema 的 namespace 与 detached 完整性拒绝矩阵各自建立一次健康种子，种子仍由真实 Open 和公开 mutation 产生。全部 Store 和 raw handle 成功关闭、WAL TRUNCATE checkpoint 的 busy/frames/checkpointed 均为零之后，才保存完整主库字节和 fixture 元数据。每例写入新的私有 `0600` 文件，持有独立 inode、连接与可变状态，再执行原来的 detach、损坏及 Open/ObjectStatus 顺序。
+
+复制机制同时验证健康与隔离：一份副本的公开写入可读，另一份副本通过 Open/ObjectStatus 且看不到该写入；顶层 cleanup 核对种子字节未变。种子不跨顶层测试共享，也不保留共享活句柄。迁移、WAL、恢复、lease、文件身份和跨进程用例保持原有准备路径；不能复制掉它们要验证的状态形成过程。选择与局部匹配测量见[减少 SQLite 测试准备](../.agents/notes/implemented/testing/2026-09-09-reduce-sqlite-test-preparation.md)。
+
+#### 迁移与完整性断言
+
 迁移用例从独立手写的 v1/v2 数据库开始，不用当前 migration 反向构造历史。只含 referenced object row 且结构、计数、`sqlite_sequence` 与日志 tail 一致的旧库必须前滚到当前 schema；含任何 non-referenced object row 的 v1/v2 库必须以 `EIO` 拒绝。这条用例同时防止旧的零字节 pending 记录绕过当前 byte threshold，以及旧的 time-derived garbage 被新清扫器误当作 ownership-proven 对象删除。v2 retained changes 在迁移后必须为空、incarnation 必须改变、tail／trim 必须归零，node/change 高水位必须覆盖迁移前的全部 surviving reference 与 sequence；迁移后的第一份 node/change 严格使用更大的值。已完全 trim、`committed_position = trimmed_through > 0` 且没有 surviving row 的合法 v2 日志也必须可以迁移。
 
 当前 schema 与历史迁移都要用 corruption fixtures 验证每个 namespace 的可见节点恰是一棵 rooted tree：root 无 incoming entry，其余可见节点恰有一个同 namespace parent，并且全部可达；cycle、未标记的孤儿与跨 namespace entry 都失败。v5 的 detached regular file 按保留对象验证，不进入可见树，仍计入用量与完整性工作。另用整数、负数、溢出与 mismatch fixtures 验证 `namespaces.used` 等于全部 regular-file size 的 streaming sum。storage-class fixtures 把 entry/change name 改成 TEXT、把 schema/database/binding/log scalar 或 nullable change group 改成错误的 NULL/type，并构造非法 kind、position、mode、size 与 nanoseconds；snapshot/log 不能漏行或接受 driver coercion 产生的可信零值。日志 fixtures 删除中间或尾部 retained change，并分别篡改 `previous_position`、`trimmed_through`、`committed_position`：`Open`、`Snapshot` 与 `ObjectStatus` 的完整链验证必须以 `EIO` 失败且不写入新 incarnation；`Since` 允许缺口之前的完整 page，跨到缺口的 page 必须整体失败且不暴露该页 prefix。空或较小日志在 caller 给出很大 limit 时仍按实际 anchor/row work 成功，page budget 耗尽且 tail 尚未返回时才以 `EFBIG` 拒绝。整链 record ceiling 由 `Open` 与 `ObjectStatus` 的精确边界／超限用例直接覆盖；snapshot row production 另有 caller-owned byte-budget 故障用例。`MaxIntegrityBytes` 用当前 schema 的精确边界与超大 corrupt entry name 验证 `EFBIG`；legacy migration 直接覆盖 record ceiling。ID fixtures 删除 node/change sequence、协同回退 internal high-water/sequence、把高水位压到其它 namespace 的引用之下，并覆盖 node/change exhaustion；另抬高 committed tail，断言 append 在发布新 witness 前回滚。本地 durable fixture 再用外部 accepted state 拒绝协同回退。每一种拒绝都要断言版本、schema 与数据没有部分前进；namespace 结构在 `Open` 与 `ObjectStatus` 两条入口覆盖，database-wide sequence/witness 拒绝由 durable open、page anchor 和分配路径覆盖。
