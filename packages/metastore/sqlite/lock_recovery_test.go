@@ -9,6 +9,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/codetreker/remote-fs/packages/locking"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/nativelease"
 )
 
 type testLeaseWitness struct {
@@ -215,5 +218,156 @@ func TestLeaseRecoveryCancellationDoesNotAcknowledgeAnIncrease(t *testing.T) {
 	}
 	if _, err := s.MaxLease(t.Context()); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("uncertain store stayed usable: %v", err)
+	}
+}
+
+func TestConfigureLeaseRecoveryRequiresNativeAnchor(t *testing.T) {
+	t.Run("shared owner", func(t *testing.T) {
+		config := lockingTestConfig(t)
+		store, err := OpenWithOptions(t.Context(), config.Database, config.Namespace, 0, DefaultOptions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := store.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		err = store.ConfigureLeaseRecovery(t.Context(), LeaseRecoveryConfig{
+			Witness: &testLeaseWitness{}, StateID: "0123456789abcdef0123456789abcdef",
+			RecoveryStart: time.Now(), Initialize: true,
+		})
+		if !errors.Is(err, syscall.EIO) {
+			t.Fatalf("shared owner configured lease recovery: %v", err)
+		}
+		assertNoLeaseAuthority(t, store)
+	})
+	for _, witness := range []struct {
+		name  string
+		value LeaseWitness
+	}{
+		{"generic witness", &testLeaseWitness{}},
+		{"nil witness", nil},
+		{"typed nil anchor", (*LeaseAnchor)(nil)},
+	} {
+		t.Run(witness.name, func(t *testing.T) {
+			store, _ := openNativeExclusiveTestStore(t)
+			err := store.ConfigureLeaseRecovery(t.Context(), LeaseRecoveryConfig{
+				Witness: witness.value, StateID: "0123456789abcdef0123456789abcdef",
+				RecoveryStart: time.Now(), Initialize: true,
+			})
+			if !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("unanchored witness configured lease recovery: %v", err)
+			}
+			assertNoLeaseAuthority(t, store)
+		})
+	}
+	t.Run("different binding inode", func(t *testing.T) {
+		store, owner := openNativeExclusiveTestStore(t)
+		foreign, err := nativelease.AcquireDatabase(filepath.Join(filepath.Dir(owner.Path()), "foreign.sqlite"), true, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := foreign.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		anchor := openNativeTestAnchor(t, store, foreign)
+		err = store.ConfigureLeaseRecovery(t.Context(), LeaseRecoveryConfig{
+			Witness: anchor, StateID: anchor.StateID(), RecoveryStart: owner.Acquired(), Initialize: true,
+		})
+		if !errors.Is(err, syscall.EIO) {
+			t.Fatalf("different binding inode configured lease recovery: %v", err)
+		}
+		assertNoLeaseAuthority(t, store)
+	})
+	for _, invalid := range []string{"state identity", "initialization intent"} {
+		t.Run(invalid, func(t *testing.T) {
+			store, owner := openNativeExclusiveTestStore(t)
+			anchor := openNativeTestAnchor(t, store, owner)
+			config := LeaseRecoveryConfig{
+				Witness: anchor, StateID: anchor.StateID(), RecoveryStart: owner.Acquired(), Initialize: true,
+			}
+			if invalid == "state identity" {
+				config.StateID = "invalid"
+			} else {
+				config.Initialize = false
+			}
+			if err := store.ConfigureLeaseRecovery(t.Context(), config); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("invalid %s configured lease recovery: %v", invalid, err)
+			}
+			assertNoLeaseAuthority(t, store)
+			config.StateID, config.Initialize = anchor.StateID(), true
+			if err := store.ConfigureLeaseRecovery(t.Context(), config); err != nil {
+				t.Fatalf("valid native recovery after rejected configuration: %v", err)
+			}
+			if err := anchor.Complete(); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.EnableLocks(t.Context(), locking.DefaultOptions()); err != nil {
+				t.Fatalf("valid native authority: %v", err)
+			}
+			if store.LockService() == nil {
+				t.Fatal("valid native recovery did not expose its authority")
+			}
+		})
+	}
+}
+
+func openNativeExclusiveTestStore(t *testing.T) (*Store, *nativelease.Database) {
+	t.Helper()
+	config := lockingTestConfig(t)
+	owner, err := nativelease.AcquireDatabase(config.Database, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := DefaultOptions()
+	options.leaseRecoveryOwner, options.leaseOwner = true, owner
+	store, err := OpenWithOptions(t.Context(), config.Database, config.Namespace, 0, options)
+	if err != nil {
+		owner.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Abort(); err != nil {
+			t.Error(err)
+		}
+	})
+	return store, owner
+}
+
+func openNativeTestAnchor(t *testing.T, store *Store, owner *nativelease.Database) *LeaseAnchor {
+	t.Helper()
+	anchor, err := OpenLeaseAnchor(LeaseAnchorConfig{
+		Directory: filepath.Dir(owner.Path()), Name: "." + filepath.Base(owner.Path()) + ".leases",
+		Identity: "sqlite-database-lease-recovery", BindingFD: owner.FD(),
+		RecoveryStart: owner.Acquired(), Initialize: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Abort(); err != nil {
+			t.Error(err)
+		}
+		if err := anchor.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return anchor
+}
+
+func assertNoLeaseAuthority(t *testing.T, store *Store) {
+	t.Helper()
+	if store.LockService() != nil || store.leaseRecovery != nil {
+		t.Fatal("rejected configuration attached lease authority or recovery")
+	}
+	var rows int
+	if err := store.read.QueryRow(`SELECT count(*) FROM lease_recovery`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("rejected configuration persisted %d lease recovery records", rows)
 	}
 }

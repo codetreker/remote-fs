@@ -1,18 +1,357 @@
 package integration_test
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
-	_ "modernc.org/sqlite"
-
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
+	_ "modernc.org/sqlite"
 )
+
+func readChanges(ctx context.Context, log metastore.Log, after metastore.Position, limit int) ([]metastore.Change, metastore.Retention, error) {
+	result, err := metastore.NewChangeResult(64<<20, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
+		return 256 + lengths.Name + lengths.FromName + lengths.Content, nil
+	})
+	if err != nil {
+		return nil, metastore.Retention{}, err
+	}
+	retention, err := log.Since(ctx, after, limit, result)
+	if err != nil {
+		return nil, metastore.Retention{}, err
+	}
+	changes, err := result.Changes()
+	return changes, retention, err
+}
+
+func TestSinceRefusesAnOversizedStoredNameBeforeExposingAPartialPage(t *testing.T) {
+	store := open(t, database(t), "workspace", 0)
+	if err := store.Create(t.Context(), strings.Repeat("x", 1<<20)); err != nil {
+		t.Fatal(err)
+	}
+	result, err := metastore.NewChangeResult(128, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
+		return lengths.Name + lengths.FromName + lengths.Content + 1, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Since(t.Context(), 0, 1024, result); !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("oversized stored change returned %v, want EFBIG", err)
+	}
+	if changes, err := result.Changes(); !errors.Is(err, syscall.EFBIG) || changes != nil {
+		t.Fatalf("oversized stored change exposed %+v, %v", changes, err)
+	}
+}
+
+func TestSinceRefusesLiveChangeCorruptionWithoutExposingAPartialPage(t *testing.T) {
+	tests := []struct {
+		name   string
+		damage string
+	}{
+		{"text kind", `UPDATE changes SET kind = 'created' WHERE position = (SELECT min(position) FROM changes)`},
+		{"text mode", `UPDATE changes SET mode = 'regular' WHERE position = (SELECT min(position) FROM changes)`},
+		{"text name", `UPDATE changes SET name = 'file' WHERE position = (SELECT min(position) FROM changes)`},
+		{"missing created name", `UPDATE changes SET name = NULL WHERE position = (SELECT min(position) FROM changes)`},
+		{"slash in name", `UPDATE changes SET name = CAST('bad/name' AS BLOB) WHERE position = (SELECT min(position) FROM changes)`},
+		{"invalid recorded nanoseconds", `UPDATE changes SET recorded_nsec = 1000000000 WHERE position = (SELECT min(position) FROM changes)`},
+		{"file bytes without content", `UPDATE changes SET size = 1, content = NULL WHERE position = (SELECT min(position) FROM changes)`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := database(t)
+			store := open(t, path, "workspace", 0)
+			defer store.Close()
+			if err := store.Create(t.Context(), "file"); err != nil {
+				t.Fatal(err)
+			}
+			damageDatabase(t, path, test.damage)
+
+			result, err := metastore.NewChangeResult(1<<20, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
+				return 256 + lengths.Name + lengths.FromName + lengths.Content, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Since(t.Context(), 0, 100, result); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("Since returned %v, want EIO", err)
+			}
+			if changes, err := result.Changes(); !errors.Is(err, syscall.EIO) || changes != nil {
+				t.Fatalf("corrupt change exposed %+v, %v", changes, err)
+			}
+		})
+	}
+}
+
+func TestSinceBoundsItsFullContinuityCheck(t *testing.T) {
+	path := database(t)
+	options := sqlite.DefaultOptions()
+	options.MaxIntegrityRecords = sqlite.MinIntegrityRecords
+	store, err := sqlite.OpenWithOptions(t.Context(), path, "workspace", 0, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	for _, name := range []string{"first", "second"} {
+		if err := store.Create(t.Context(), name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	changes, _, err := readChanges(t.Context(), store, 0, 100)
+	if !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("reading an over-limit continuity chain returned %v, want EFBIG", err)
+	}
+	if changes != nil {
+		t.Fatalf("an over-limit continuity check exposed changes: %+v", changes)
+	}
+}
+
+func TestSinceDoesNotHoldTheHealthGateWhileChargingAResult(t *testing.T) {
+	store := open(t, database(t), "workspace", 0)
+	if err := store.Create(t.Context(), "before"); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	result, err := metastore.NewChangeResult(1<<20, 0,
+		func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-release
+			return 256 + lengths.Name + lengths.FromName + lengths.Content, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := make(chan error, 1)
+	go func() {
+		_, err := store.Since(t.Context(), 0, 1, result)
+		read <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("Since did not reach caller-owned result accounting")
+	}
+
+	written := make(chan error, 1)
+	go func() { written <- store.Create(t.Context(), "during-read") }()
+	select {
+	case err := <-written:
+		if err != nil {
+			t.Fatalf("writer running beside a pinned Since snapshot: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("caller-owned Since accounting blocked the writer commit boundary")
+	}
+	close(release)
+	if err := <-read; err != nil {
+		t.Fatalf("Since after releasing result accounting: %v", err)
+	}
+}
+
+func TestSinceDetectsAGapWhenTheNextPageReachesIt(t *testing.T) {
+	path := database(t)
+	store := open(t, path, "workspace", 0)
+	for _, name := range []string{"first", "second", "third"} {
+		if err := store.Create(t.Context(), name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstPage, _, err := readChanges(t.Context(), store, 0, 1)
+	if err != nil || len(firstPage) != 1 {
+		t.Fatalf("reading the first page returned %d changes, %v", len(firstPage), err)
+	}
+	db := raw(t, path)
+	if _, err := db.Exec(`
+		DELETE FROM changes
+		WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+		  AND position = (
+			SELECT position FROM changes
+			WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+			  AND position > ?
+			ORDER BY position LIMIT 1
+		  )`, firstPage[0].Position); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	nextPage, _, err := readChanges(t.Context(), store, firstPage[0].Position, 1)
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("reading the page which crosses a missing change returned %v, want EIO", err)
+	}
+	if nextPage != nil {
+		t.Fatalf("the failed page exposed changes: %+v", nextPage)
+	}
+}
+
+func TestSinceCancellationDuringResultAccountingFailsTheWholePage(t *testing.T) {
+	store := open(t, database(t), "workspace", 0)
+	if err := store.Create(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	result, err := metastore.NewChangeResult(1<<20, 0,
+		func(_ int, _ metastore.Change, _ metastore.ChangePayloadLengths) (int64, error) {
+			close(entered)
+			<-release
+			return 1, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, err := store.Since(ctx, 0, 1, result)
+		done <- err
+	}()
+	<-entered
+	cancel()
+	close(release)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceling Since during result accounting returned %v", err)
+	}
+	if changes, err := result.Changes(); changes != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Since exposed %+v, %v", changes, err)
+	}
+}
+
+func TestSinceRejectsScalarStorageCorruptionOnTheCrossedPage(t *testing.T) {
+	path := database(t)
+	store := open(t, path, "workspace", 0)
+	for _, name := range []string{"first", "second", "third"} {
+		if err := store.Create(t.Context(), name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstPage, _, err := readChanges(t.Context(), store, 0, 2)
+	if err != nil || len(firstPage) != 2 {
+		t.Fatalf("reading the first page returned %d changes, %v", len(firstPage), err)
+	}
+	db := raw(t, path)
+	if _, err := db.Exec(`
+		UPDATE changes SET previous_position = 'broken'
+		WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+		  AND position = (
+			SELECT position FROM changes
+			WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+			  AND position > ? ORDER BY position LIMIT 1
+		  )`, firstPage[len(firstPage)-1].Position); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	page, _, err := readChanges(t.Context(), store, firstPage[len(firstPage)-1].Position, 2)
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("reading a text predecessor returned %v, want EIO", err)
+	}
+	if page != nil {
+		t.Fatalf("scalar-corrupt page exposed changes: %+v", page)
+	}
+}
+
+func TestLiveLogReadersRejectScalarStorageCorruption(t *testing.T) {
+	tests := []struct {
+		name   string
+		damage string
+		read   func(*sqlite.Store) error
+	}{
+		{
+			"barrier position text",
+			`UPDATE logs SET committed_position = 'broken'`,
+			func(store *sqlite.Store) error {
+				_, err := store.Barrier(t.Context(), 1024)
+				return err
+			},
+		},
+		{
+			"committed position blob",
+			`UPDATE logs SET committed_position = CAST(committed_position AS BLOB)`,
+			func(store *sqlite.Store) error {
+				_, err := store.CommittedPosition(t.Context())
+				return err
+			},
+		},
+		{
+			"barrier incarnation blob",
+			`UPDATE logs SET incarnation = CAST(incarnation AS BLOB)`,
+			func(store *sqlite.Store) error {
+				_, err := store.Barrier(t.Context(), 1024)
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := database(t)
+			store := open(t, path, "workspace", 0)
+			db := raw(t, path)
+			if _, err := db.Exec(test.damage); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.read(store); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("reading a corrupt live log returned %v, want EIO", err)
+			}
+		})
+	}
+}
+
+func TestEmptySinceAcceptsALargeRequestedLimitWithinActualWorkBound(t *testing.T) {
+	options := sqlite.DefaultOptions()
+	options.MaxIntegrityRecords = sqlite.MinIntegrityRecords
+	store, err := sqlite.OpenWithOptions(t.Context(), database(t), "workspace", 0, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	changes, retention, err := readChanges(t.Context(), store, 0, 1_000_000)
+	if err != nil {
+		t.Fatalf("reading an empty log under a large requested limit: %v", err)
+	}
+	if len(changes) != 0 || retention.Tail != 0 {
+		t.Fatalf("empty log returned %d changes and %+v", len(changes), retention)
+	}
+}
+
+func TestSmallSinceCapsALargeRequestedLimitToActualWorkBudget(t *testing.T) {
+	options := sqlite.DefaultOptions()
+	options.MaxIntegrityRecords = 5
+	store, err := sqlite.OpenWithOptions(t.Context(), database(t), "workspace", 0, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	if err := store.Create(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	changes, retention, err := readChanges(t.Context(), store, 0, 1_000_000)
+	if err != nil {
+		t.Fatalf("reading a small log under a large requested limit: %v", err)
+	}
+	if len(changes) != 2 || changes[len(changes)-1].Position != retention.Tail {
+		t.Fatalf("small bounded log returned %d changes at tail %d, retention %+v",
+			len(changes), changes[len(changes)-1].Position, retention)
+	}
+}
 
 // Trimming takes the oldest entries, so it must not disturb where the next one lands.
 //

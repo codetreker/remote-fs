@@ -1,14 +1,88 @@
 package integration_test
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"syscall"
 	"testing"
 
-	_ "modernc.org/sqlite"
-
 	"github.com/codetreker/remote-fs/packages/metastore"
+	_ "modernc.org/sqlite"
 )
+
+func readRows(ctx context.Context, snap metastore.Snap, limit int) ([]metastore.Row, bool, error) {
+	result, err := metastore.NewRowResult(64<<20, 0, func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
+		return 192 + lengths.Name + lengths.Content, nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	done, err := snap.Next(ctx, limit, result)
+	if err != nil {
+		return nil, false, err
+	}
+	rows, err := result.Rows()
+	return rows, done, err
+}
+
+func TestSnapshotBoundedMakesAProductionErrorTerminalWithoutExposingPrefixRows(t *testing.T) {
+	store := open(t, database(t), "workspace", 0)
+	if err := store.Create(t.Context(), strings.Repeat("x", 1<<20)); err != nil {
+		t.Fatal(err)
+	}
+	snap, _, err := store.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Close()
+	newResult := func(max int64) *metastore.RowResult {
+		result, err := metastore.NewRowResult(max, 0, func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
+			return lengths.Name + lengths.Content + 1, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	first := newResult(128)
+	if _, err := snap.Next(t.Context(), 1024, first); !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("oversized snapshot row returned %v, want EFBIG", err)
+	}
+	if rows, err := first.Rows(); !errors.Is(err, syscall.EFBIG) || rows != nil {
+		t.Fatalf("oversized snapshot row exposed prefix %+v, %v", rows, err)
+	}
+	second := newResult(2 << 20)
+	if _, err := snap.Next(t.Context(), 1024, second); !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("snapshot continued after its production failure with %v", err)
+	}
+	if rows, err := second.Rows(); !errors.Is(err, syscall.EFBIG) || rows != nil {
+		t.Fatalf("failed snapshot later exposed %+v, %v", rows, err)
+	}
+}
+
+func TestSnapshotRefusesLiveStorageClassCorruptionBeforeReturningAPicture(t *testing.T) {
+	path := database(t)
+	store := open(t, path, "workspace", 0)
+	defer store.Close()
+	if err := store.Create(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	damageDatabase(t, path,
+		`UPDATE entries SET name = 'text-name' WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')`)
+
+	snap, _, err := store.Snapshot(t.Context())
+	if err == nil {
+		if snap != nil {
+			snap.Close()
+		}
+		t.Fatal("Snapshot returned a picture of storage-class-corrupt entries")
+	}
+	if !errors.Is(err, syscall.EIO) || snap != nil {
+		t.Fatalf("Snapshot returned (%v, %v), want nil and EIO", snap, err)
+	}
+}
 
 // The entry table's namespace must agree with the node's. A picture must hold this
 // namespace's tree and nothing of the one beside it.

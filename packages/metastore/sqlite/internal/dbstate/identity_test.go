@@ -2,11 +2,12 @@ package dbstate
 
 import (
 	"database/sql"
-	"github.com/codetreker/remote-fs/packages/sqliteschema"
-	_ "modernc.org/sqlite"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/codetreker/remote-fs/packages/sqliteschema"
+	_ "modernc.org/sqlite"
 )
 
 func TestGlobalIdentityBoundsUseExpressionIndexSearches(t *testing.T) {

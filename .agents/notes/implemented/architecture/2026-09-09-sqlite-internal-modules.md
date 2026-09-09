@@ -30,9 +30,9 @@ schema 准备继续使用原来的一次事务。根 package 只向它传递启�
 
 迁移文件放在 `internal/schema/migrations`，已落地 SQL 内容和 schema 版本保持不变。schema golden 与独立 v2/v3 fixture 放在 `internal/integration/testdata`，只调整当前位置对应的生成命令说明。迁移不可改写的理由仍由[元数据复制](2026-08-27-metadata-replication.md)拥有。
 
-公开 metastore 契约与依赖私有状态的故障注入留在根 package。原有黑盒测试及其共享 fixture 放在 test-only 的 `internal/integration`，子进程入口与调用者仍编进同一测试二进制。原生 anchor 的局部测试跟随 nativelease，snapshot 与身份执行计划测试直接检查各自拥有者使用的生产 SQL，不增加测试专用的生产导出接口。
+测试文件按实现职责合并，`xxx.go` 的相关用例与 helper 放在 `xxx_test.go`，保留每项断言、测试名称和初始化次序。根 `contract_test.go` 拥有外部 metastore 契约，根 package 的私有故障注入按对象、持久化、发布及副本归并；跨组件黑盒用例在 test-only 的 `internal/integration` 内按职责归并。子进程入口与调用者仍属于同一测试二进制。snapshot 与身份执行计划检查位于 `snapshot_test.go` 和 `internal/dbstate/identity_test.go`，直接使用生产 SQL，不增加测试专用导出接口。
 
-测试仍递归执行，抽出的生产组件全部参与覆盖率。go-cov 只省略纯测试 integration package 的汇总行，它的测试和覆盖到的语句继续计入；匹配按 substring 进行，因此该目录及其子目录不能放生产代码。覆盖阈值、失败判据和预算不变，命令由[测试策略](../../../../docs/testing.md)维护。
+测试递归执行，覆盖率只由各包自己的测试二进制计算。其它包或 integration 的执行仍验证组合行为，但不增加被调用生产包的覆盖率；这使包内测试责任可被单独判断。go-cov 只省略纯测试 integration 的空汇总行，匹配按 substring 进行，该子树不能放生产代码。包 70%、函数 50%、全仓库合计 85% 的阈值以及执行预算保持不变，命令由[测试策略](../../../../docs/testing.md)维护。
 
 ## 备选方案
 
@@ -40,10 +40,10 @@ schema 准备继续使用原来的一次事务。根 package 只向它传递启�
 
 **把事务、发布、pin 和 replica 所有权继续拆成独立 package。** 它要求新增跨包生命周期协议，或暴露原始锁和 Store 回调来维持原子次序。已有低层职责可以独立提取，不需要为目录整理重新设计这些协议。
 
-**所有黑盒测试留在根目录。** 生产代码移出后，根目录的大部分文件仍然来自这些测试。将原有测试群及共享 helper 放进 integration 保留了测试边界，也避免为挪动测试扩大生产 API，或把它们拼成少数难以浏览的大文件。
+**所有黑盒测试留在根目录。** 它保留单个测试包，却让跨组件 fixture 与根包私有状态继续混在同一层。integration 保留公开接口的测试边界，各包内再按对应实现合并测试文件；职责归组不需要把不相关测试装进一个总集。
 
 ## 后果
 
 目录树反映了迁移、状态、日志与原生证据的责任，修改者可以沿单向依赖找到各自的实现和局部测试。代价是公开值与内部值之间的显式转换、指针转发，以及验证时必须覆盖完整子树；只运行根 package 不再代表验证整份 SQLite 实现。
 
-这项结构边界依赖两个约束：原子发布和关闭继续由原来的 coordinator 组织，integration 始终保持 test-only。未来若需要改变公开类型、schema、取消或资源预算，应作为相应行为决定处理，不能藏在目录重排里。现有持久化、lease 和文件句柄决定继续有效；完整组件归属见[SQLite 内部设计](../../../../docs/design/server/sqlite-modules.md)。
+包内统计揭示的未达标用例需要在各自的包补足，不能由 integration 的成功或跨包 profile 抵消；已测得的 SQLite 缺口见[包内覆盖提案](../../proposed/testing/2026-09-09-sqlite-package-local-coverage.md)。这项结构边界依赖两个约束：原子发布和关闭继续由原来的 coordinator 组织，integration 始终保持 test-only。未来若需要改变公开类型、schema、取消或资源预算，应作为相应行为决定处理，不能藏在目录重排里。现有持久化、lease 和文件句柄决定继续有效；完整组件归属见[SQLite 内部设计](../../../../docs/design/server/sqlite-modules.md)。

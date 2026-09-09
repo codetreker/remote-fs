@@ -39,8 +39,8 @@ SQL lease recovery 与 `LeaseRecovery` 留在根 package，原生 evidence I/O �
 
 已落地的 `0001` 至 `0005` 迁移由 [`internal/schema/migrations`](../../../packages/metastore/sqlite/internal/schema/migrations) 嵌入并重放。目录移动不改变 SQL 内容、schema 版本或升级顺序。可读的 schema golden 与独立 v2/v3 历史 fixture 放在 [`internal/integration/testdata`](../../../packages/metastore/sqlite/internal/integration/testdata)；测试数据不参与运行时初始化。
 
-公开 metastore 契约入口留在根 `sqlite_test.go`，与私有状态紧密耦合的故障注入也留在根 package。通过公开入口运行的黑盒测试集中在 `internal/integration`，共享原有的测试 helper；子进程入口与调用它的测试属于同一个测试二进制。原生 anchor 的局部测试跟随 `nativelease`。
+测试按实现职责合并到对应的 `xxx_test.go`，例如 `objects.go` 的事务与清理用例归入 `objects_test.go`，`replica.go` 的副本用例归入 `replica_test.go`。公开 metastore 契约入口是根 `contract_test.go`；依赖私有状态的故障注入留在根 package。通过公开入口运行的跨组件用例仍在 `internal/integration`，按被测职责组织并共享原有 helper；子进程入口与调用者属于同一个测试二进制，原生 anchor 测试跟随 `nativelease`。
 
-根 `snapshot_plan_test.go` 直接检查生产 snapshot query；身份高水位的执行计划用例跟随 `dbstate` 的实际 SQL。模块边界不提供仅为测试导出的生产接口。
+根 `snapshot_test.go` 直接检查生产 snapshot query；`internal/dbstate/identity_test.go` 检查身份高水位的实际 SQL。模块边界不提供仅为测试导出的生产接口。
 
-SQLite 验证递归覆盖 `./packages/metastore/sqlite/...`，生产覆盖率包含所有抽出的组件。`internal/integration` 仅从 go-cov 的结果汇总行中排除，测试仍执行且其覆盖的生产语句仍计入；这个 test-only 子树不放生产代码或生产子 package。命令与全部门禁由[测试策略](../../testing.md)拥有。
+SQLite 验证递归执行 `./packages/metastore/sqlite/...`。覆盖率使用 Go 默认的包内统计：每个生产包只由它自己的测试二进制计入覆盖，根包或 integration 对其它包的调用不为被调用包增加覆盖率。`internal/integration` 的测试继续运行，但仅省略没有生产语句的汇总行；该子树不放生产代码或生产子 package。命令与阈值由[测试策略](../../testing.md)拥有，已测得的包内测试缺口由[SQLite 覆盖提案](../../../.agents/notes/proposed/testing/2026-09-09-sqlite-package-local-coverage.md)记录。

@@ -1,7 +1,9 @@
 package integration_test
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"math"
 	"syscall"
@@ -10,6 +12,484 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 )
+
+func TestMiddleRetainedChangeDeletionIsRefusedByOpenAndSince(t *testing.T) {
+	deleteMiddle := func(t *testing.T, path string) {
+		t.Helper()
+		db := raw(t, path)
+		defer db.Close()
+		result, err := db.Exec(`
+			DELETE FROM changes
+			WHERE position = (
+				SELECT position FROM changes
+				WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+				ORDER BY position
+				LIMIT 1 OFFSET 1
+			)`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		deleted, err := result.RowsAffected()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if deleted != 1 {
+			t.Fatalf("deleted %d middle changes, want 1", deleted)
+		}
+	}
+	populate := func(t *testing.T, path string) *sqlite.Store {
+		t.Helper()
+		store := open(t, path, "workspace", 0)
+		for _, name := range []string{"first", "middle", "last"} {
+			if err := store.Create(t.Context(), name); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return store
+	}
+
+	t.Run("open", func(t *testing.T) {
+		path := database(t)
+		store := populate(t, path)
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		deleteMiddle(t, path)
+
+		reopened, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
+		if err == nil {
+			reopened.Close()
+			t.Fatal("opening a log missing a middle retained change succeeded")
+		}
+		if !errors.Is(err, syscall.EIO) {
+			t.Fatalf("opening a log missing a middle retained change: %v, want EIO", err)
+		}
+	})
+
+	t.Run("since", func(t *testing.T) {
+		path := database(t)
+		store := populate(t, path)
+		deleteMiddle(t, path)
+
+		changes, _, err := readChanges(t.Context(), store, 0, 100)
+		if !errors.Is(err, syscall.EIO) {
+			t.Fatalf("reading a log missing a middle retained change returned %v, want EIO", err)
+		}
+		if changes != nil {
+			t.Fatalf("failed Since exposed changes: %+v", changes)
+		}
+	})
+
+	t.Run("snapshot and status", func(t *testing.T) {
+		path := database(t)
+		store := populate(t, path)
+		deleteMiddle(t, path)
+
+		if snapshot, _, err := store.Snapshot(t.Context()); !errors.Is(err, syscall.EIO) {
+			if snapshot != nil {
+				snapshot.Close()
+			}
+			t.Fatalf("snapshot over a missing middle change returned %v, want EIO", err)
+		}
+		if _, err := store.ObjectStatus(t.Context()); !errors.Is(err, syscall.EIO) {
+			t.Fatalf("object status over a missing middle change returned %v, want EIO", err)
+		}
+	})
+}
+
+func TestFullIntegrityRejectsPredecessorAndTrimAnchorCorruption(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, string) *sqlite.Store
+		damage  string
+	}{
+		{
+			name: "previous position",
+			prepare: func(t *testing.T, path string) *sqlite.Store {
+				store := open(t, path, "workspace", 0)
+				for _, name := range []string{"first", "second"} {
+					if err := store.Create(t.Context(), name); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return store
+			},
+			damage: `
+				UPDATE changes SET previous_position = 0
+				WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+				  AND position = (
+					SELECT position FROM changes
+					WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+					ORDER BY position LIMIT 1 OFFSET 1
+				  )`,
+		},
+		{
+			name: "trim anchor",
+			prepare: func(t *testing.T, path string) *sqlite.Store {
+				workspace := open(t, path, "workspace", 0)
+				neighbour := open(t, path, "neighbour", 0)
+				if err := neighbour.Create(t.Context(), "gap"); err != nil {
+					t.Fatal(err)
+				}
+				if err := workspace.Create(t.Context(), "file"); err != nil {
+					t.Fatal(err)
+				}
+				return workspace
+			},
+			damage: `
+				UPDATE logs SET trimmed_through = 1
+				WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := database(t)
+			store := test.prepare(t, path)
+			db := raw(t, path)
+			if _, err := db.Exec(test.damage); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if snapshot, _, err := store.Snapshot(t.Context()); !errors.Is(err, syscall.EIO) {
+				if snapshot != nil {
+					snapshot.Close()
+				}
+				t.Fatalf("snapshot over corrupt continuity returned %v, want EIO", err)
+			}
+			if _, err := store.ObjectStatus(t.Context()); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("status over corrupt continuity returned %v, want EIO", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
+			if err == nil {
+				reopened.Close()
+				t.Fatal("opening corrupt continuity succeeded")
+			}
+			if !errors.Is(err, syscall.EIO) {
+				t.Fatalf("opening corrupt continuity returned %v, want EIO", err)
+			}
+		})
+	}
+}
+
+func TestLiveReadersRejectLargeBlobScalarsBeforeMaterializingThem(t *testing.T) {
+	tests := []struct {
+		name   string
+		damage string
+		read   func(*sqlite.Store) error
+	}{
+		{
+			"database identity",
+			`PRAGMA ignore_check_constraints = ON;
+			 UPDATE database_state SET database_id = CAST(zeroblob(4 * 1024 * 1024) AS TEXT)`,
+			func(store *sqlite.Store) error {
+				_, err := store.DurableState(t.Context())
+				return err
+			},
+		},
+		{
+			"global root identity",
+			`UPDATE namespaces SET root = zeroblob(4 * 1024 * 1024) WHERE name = 'workspace'`,
+			func(store *sqlite.Store) error {
+				_, err := store.DurableState(t.Context())
+				return err
+			},
+		},
+		{
+			"change mode",
+			`UPDATE changes SET mode = zeroblob(4 * 1024 * 1024)
+			 WHERE position = (SELECT min(position) FROM changes)`,
+			func(store *sqlite.Store) error {
+				result, err := metastore.NewChangeResult(1<<20, 0,
+					func(_ int, _ metastore.Change, _ metastore.ChangePayloadLengths) (int64, error) {
+						return 1, nil
+					})
+				if err != nil {
+					return err
+				}
+				_, err = store.Since(t.Context(), 0, 100, result)
+				if changes, resultErr := result.Changes(); changes != nil || !errors.Is(resultErr, syscall.EIO) {
+					return fmt.Errorf("failed Since exposed %+v, %v", changes, resultErr)
+				}
+				return err
+			},
+		},
+		{
+			"log age flag",
+			`UPDATE logs SET trimmed_by_age = zeroblob(4 * 1024 * 1024)`,
+			func(store *sqlite.Store) error {
+				_, err := store.Barrier(t.Context(), 1024)
+				return err
+			},
+		},
+		{
+			"snapshot committed position",
+			`UPDATE logs SET committed_position = zeroblob(4 * 1024 * 1024)`,
+			func(store *sqlite.Store) error {
+				snapshot, _, err := store.Snapshot(t.Context())
+				if snapshot != nil {
+					snapshot.Close()
+				}
+				return err
+			},
+		},
+		{
+			"append committed position",
+			`UPDATE logs SET committed_position = zeroblob(4 * 1024 * 1024)`,
+			func(store *sqlite.Store) error {
+				return store.Create(t.Context(), "after-corruption")
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := database(t)
+			store := open(t, path, "workspace", 0)
+			if err := store.Create(t.Context(), "file"); err != nil {
+				t.Fatal(err)
+			}
+			db := raw(t, path)
+			if _, err := db.Exec(test.damage); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.read(store); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("reading a large corrupt scalar returned %v, want EIO", err)
+			}
+		})
+	}
+}
+
+func integrityOptions(limit int64) sqlite.Options {
+	return sqlite.Options{Window: sqlite.DefaultWindow(), MaxIntegrityRecords: limit}
+}
+
+func integrityByteOptions(limit int64) sqlite.Options {
+	return sqlite.Options{Window: sqlite.DefaultWindow(), MaxIntegrityBytes: limit}
+}
+
+func TestIntegrityWorkLimitAcceptsItsBoundaryAndRefusesTheNextRecord(t *testing.T) {
+	path := database(t)
+	store, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(t.Context(), "one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(t.Context(), "two"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// One namespace, three nodes, two entries, one log row, and four retained changes.
+	atBoundary, err := sqlite.OpenWithOptions(t.Context(), path, "workspace", 0, integrityOptions(11))
+	if err != nil {
+		t.Fatalf("opening at the exact integrity work limit: %v", err)
+	}
+	if err := atBoundary.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	overLimit, err := sqlite.OpenWithOptions(t.Context(), path, "workspace", 0, integrityOptions(10))
+	if err == nil {
+		overLimit.Close()
+		t.Fatal("opening one integrity record above the limit succeeded")
+	}
+	if !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("opening one integrity record above the limit: %v, want EFBIG", err)
+	}
+}
+
+func TestObjectStatusRefusesIntegrityWorkAboveItsConfiguredLimit(t *testing.T) {
+	store, err := sqlite.OpenWithOptions(
+		t.Context(), database(t), "workspace", 0, integrityOptions(5),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Create(t.Context(), "one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(t.Context(), "two"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ObjectStatus(t.Context()); !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("status one integrity record above its limit: %v, want EFBIG", err)
+	}
+	if _, err := store.Stat(t.Context(), "one"); err != nil {
+		t.Fatalf("a refused status changed the namespace: %v", err)
+	}
+}
+
+func TestIntegrityWorkCountIncludesForeignLabelsTouchingTheNamespace(t *testing.T) {
+	path := database(t)
+	store, err := sqlite.OpenWithOptions(
+		t.Context(), path, "workspace", 0, integrityOptions(3),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	neighbour, err := sqlite.Open(t.Context(), path, "neighbour", 0, sqlite.DefaultWindow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := neighbour.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db := raw(t, path)
+	if _, err := db.Exec(`
+		INSERT INTO entries (namespace, parent, name, node)
+		SELECT foreign_ns.id, local_ns.root, names.name, foreign_ns.root
+		FROM namespaces local_ns, namespaces foreign_ns,
+			(SELECT CAST('hidden-one' AS BLOB) AS name UNION ALL SELECT CAST('hidden-two' AS BLOB)) names
+		WHERE local_ns.name = 'workspace' AND foreign_ns.name = 'neighbour'`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ObjectStatus(t.Context()); !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("foreign-labeled edges above the integrity limit returned %v, want EFBIG", err)
+	}
+}
+
+func TestCanceledObjectStatusDoesNotPoisonTheStore(t *testing.T) {
+	store, err := sqlite.Open(t.Context(), database(t), "workspace", 0, sqlite.DefaultWindow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := store.ObjectStatus(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled integrity status returned %v, want context.Canceled", err)
+	}
+	if _, err := store.ObjectStatus(t.Context()); err != nil {
+		t.Fatalf("status after cancellation: %v", err)
+	}
+}
+
+func TestLegacyIntegrityWorkLimitRefusesBeforeMigration(t *testing.T) {
+	versions := []struct {
+		name    string
+		version int
+		write   func(*testing.T, string)
+	}{
+		{"version 1", 1, writeVersionOne},
+		{"version 2", 2, writeVersionTwo},
+	}
+	for _, version := range versions {
+		t.Run(version.name, func(t *testing.T) {
+			path := database(t)
+			version.write(t, path)
+			before := schemaOf(t, path)
+			store, err := sqlite.OpenWithOptions(t.Context(), path, "workspace", 0, integrityOptions(5))
+			if err == nil {
+				store.Close()
+				t.Fatal("migrating one integrity record above the limit succeeded")
+			}
+			if !errors.Is(err, syscall.EFBIG) {
+				t.Fatalf("migrating one integrity record above the limit: %v, want EFBIG", err)
+			}
+			if after := schemaOf(t, path); after != before {
+				t.Fatalf("the refused integrity limit changed schema version %d", version.version)
+			}
+		})
+	}
+}
+
+func TestCanceledLegacyOpenDoesNotMigrate(t *testing.T) {
+	path := database(t)
+	writeVersionTwo(t, path)
+	before := schemaOf(t, path)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	store, err := sqlite.OpenWithOptions(ctx, path, "workspace", 0, integrityOptions(6))
+	if err == nil {
+		store.Close()
+		t.Fatal("a canceled legacy open succeeded")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a canceled legacy open returned %v, want context.Canceled", err)
+	}
+	if after := schemaOf(t, path); after != before {
+		t.Fatal("a canceled legacy open changed the schema")
+	}
+}
+
+func TestIntegrityByteLimitAcceptsItsExactBoundary(t *testing.T) {
+	path := database(t)
+	store := open(t, path, "workspace", 0)
+	for _, name := range []string{"a", "bc"} {
+		if err := store.Create(t.Context(), name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Entry names and their Created log records each retain three bytes.
+	atBoundary, err := sqlite.OpenWithOptions(t.Context(), path, "workspace", 0, integrityByteOptions(6))
+	if err != nil {
+		t.Fatalf("opening at the exact integrity byte limit: %v", err)
+	}
+	if err := atBoundary.Close(); err != nil {
+		t.Fatal(err)
+	}
+	over, err := sqlite.OpenWithOptions(t.Context(), path, "workspace", 0, integrityByteOptions(5))
+	if err == nil {
+		over.Close()
+		t.Fatal("opening one byte above the integrity limit succeeded")
+	}
+	if !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("opening one byte above the integrity limit: %v, want EFBIG", err)
+	}
+}
+
+func TestOversizedCorruptNameIsRejectedByLengthAdmission(t *testing.T) {
+	path := database(t)
+	store := open(t, path, "workspace", 0)
+	if err := store.Create(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db := raw(t, path)
+	if _, err := db.Exec(`
+		UPDATE entries
+		SET name = CAST(zeroblob(8388608) AS BLOB)
+		WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+		  AND name = CAST('file' AS BLOB)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := sqlite.OpenWithOptions(t.Context(), path, "workspace", 0, integrityByteOptions(1024))
+	if err == nil {
+		opened.Close()
+		t.Fatal("opening an oversized corrupt name succeeded")
+	}
+	if !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("opening an oversized corrupt name: %v, want EFBIG", err)
+	}
+}
 
 type objectIntegrityFixture struct {
 	path       string
@@ -406,5 +886,192 @@ func TestObjectStatusRefusesAUsedCounterMismatch(t *testing.T) {
 	damageDatabase(t, fixture.path, `UPDATE namespaces SET used = 9 WHERE id = ?`, fixture.workspace)
 	if _, err := store.ObjectStatus(t.Context()); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("reading status with a used-counter mismatch: %v, want EIO", err)
+	}
+}
+
+func detachIntegrityFile(t *testing.T, f objectIntegrityFixture) {
+	t.Helper()
+	damageDatabase(t, f.path, `UPDATE nodes SET detached = 1 WHERE content = ?`, f.live)
+	damageDatabase(t, f.path, `DELETE FROM entries WHERE node = (SELECT id FROM nodes WHERE content = ?)`, f.live)
+}
+
+func TestSharedOpenPreservesDetachedObjectsAndQuotaOutsideSnapshots(t *testing.T) {
+	f := newObjectIntegrityFixture(t)
+	detachIntegrityFile(t, f)
+	damageDatabase(t, f.path, `UPDATE nodes SET detached = 1 WHERE `+nodeNamed, f.workspace, "copy")
+	damageDatabase(t, f.path, `DELETE FROM entries WHERE namespace = ? AND name = CAST('copy' AS BLOB)`, f.workspace)
+	store, err := sqlite.Open(t.Context(), f.path, "workspace", 100, sqlite.DefaultWindow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := store.ObjectStatus(t.Context()); err != nil {
+		t.Fatalf("valid detached graph: %v", err)
+	}
+	space, err := store.Space(t.Context())
+	if err != nil || space.Used != 10 {
+		t.Fatalf("retained quota = %+v, %v; want 10 used bytes", space, err)
+	}
+	snap, _, err := store.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := snap.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	var count int
+	for {
+		rows, done, err := readRows(t.Context(), snap, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range rows {
+			if string(row.Name) == "live" || string(row.Name) == "copy" || row.Node.Content == f.live {
+				t.Fatalf("snapshot exposed a detached file: %+v", row)
+			}
+			count++
+		}
+		if done {
+			break
+		}
+	}
+	if count != 2 {
+		t.Fatalf("snapshot nodes = %d; want root and directory", count)
+	}
+	db := raw(t, f.path)
+	defer db.Close()
+	var retained int
+	if err := db.QueryRow(`SELECT count(*) FROM nodes n JOIN objects o ON o.key = n.content
+		WHERE n.detached = 1 AND n.content = ? AND o.state = 1`, f.live).Scan(&retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained != 1 {
+		t.Fatalf("shared open retained %d original objects; want 1", retained)
+	}
+}
+
+func TestRetainedNodesRemainInsideIntegrityWorkLimit(t *testing.T) {
+	f := newObjectIntegrityFixture(t)
+	detachIntegrityFile(t, f)
+	db := raw(t, f.path)
+	var records int64
+	if err := db.QueryRow(`SELECT
+		(SELECT count(*) FROM namespaces WHERE id = ?) +
+		(SELECT count(*) FROM nodes WHERE namespace = ?) +
+		(SELECT count(*) FROM objects WHERE namespace = ?) +
+		(SELECT count(*) FROM entries WHERE namespace = ?) +
+		(SELECT count(*) FROM logs WHERE namespace = ?) +
+		(SELECT count(*) FROM changes WHERE namespace = ?)`,
+		f.workspace, f.workspace, f.workspace, f.workspace, f.workspace, f.workspace).Scan(&records); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlite.OpenWithOptions(t.Context(), f.path, "workspace", 100, integrityOptions(records))
+	if err != nil {
+		t.Fatalf("exact retained record limit: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = sqlite.OpenWithOptions(t.Context(), f.path, "workspace", 100, integrityOptions(records-1))
+	if store != nil {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	}
+	if !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("retained node above work limit: %v; want EFBIG", err)
+	}
+}
+
+func TestRetainedIntegrityRefusesInvalidDetachedState(t *testing.T) {
+	for _, damage := range []struct {
+		name string
+		sql  string
+	}{
+		{"detached text", `UPDATE nodes SET detached = 'detached' WHERE content = ?`},
+		{"detached blob", `UPDATE nodes SET detached = X'01' WHERE content = ?`},
+		{"detached fractional", `UPDATE nodes SET detached = 0.5 WHERE content = ?`},
+		{"detached nonboolean", `UPDATE nodes SET detached = 2 WHERE content = ?`},
+		{"revision text", `UPDATE nodes SET content_revision = 'revision' WHERE content = ?`},
+		{"revision blob", `UPDATE nodes SET content_revision = X'01' WHERE content = ?`},
+		{"revision fractional", `UPDATE nodes SET content_revision = 1.5 WHERE content = ?`},
+		{"revision zero", `UPDATE nodes SET content_revision = 0 WHERE content = ?`},
+		{"revision negative", `UPDATE nodes SET content_revision = -1 WHERE content = ?`},
+		{"unmarked orphan", `UPDATE nodes SET detached = 0 WHERE content = ?`},
+		{"incoming entry", `INSERT INTO entries (namespace, parent, name, node)
+			SELECT n.namespace, ns.root, CAST('restored' AS BLOB), n.id FROM nodes n
+			JOIN namespaces ns ON ns.id = n.namespace WHERE n.content = ?`},
+		{"outgoing entry", `UPDATE entries SET parent = (SELECT id FROM nodes WHERE content = ?)
+			WHERE name = CAST('copy' AS BLOB)`},
+		{"missing object", `DELETE FROM objects WHERE key = ?`},
+		{"unreferenced object", `UPDATE objects SET state = 2 WHERE key = ?`},
+		{"object size mismatch", `UPDATE objects SET size = 11 WHERE key = ?`},
+		{"foreign object", `UPDATE objects SET namespace = (SELECT id FROM namespaces WHERE name = 'neighbour') WHERE key = ?`},
+		{"quota undercharge", `UPDATE namespaces SET used = 0 WHERE id = (SELECT namespace FROM nodes WHERE content = ?)`},
+		{"quota overcharge", `UPDATE namespaces SET used = 11 WHERE id = (SELECT namespace FROM nodes WHERE content = ?)`},
+	} {
+		for _, entry := range []string{"open", "status"} {
+			t.Run(fmt.Sprintf("%s/%s", damage.name, entry), func(t *testing.T) {
+				f := newObjectIntegrityFixture(t)
+				detachIntegrityFile(t, f)
+				var store *sqlite.Store
+				if entry == "status" {
+					store = open(t, f.path, "workspace", 100)
+				}
+				damageDatabase(t, f.path, damage.sql, f.live)
+				assertRetainedIntegrityFailure(t, f.path, store)
+			})
+		}
+	}
+}
+
+func TestRetainedIntegrityRefusesDetachedDirectoriesAndRoots(t *testing.T) {
+	for _, node := range []string{"directory", "root"} {
+		for _, entry := range []string{"open", "status"} {
+			t.Run(node+"/"+entry, func(t *testing.T) {
+				f := newObjectIntegrityFixture(t)
+				var store *sqlite.Store
+				if entry == "status" {
+					store = open(t, f.path, "workspace", 100)
+				}
+				if node == "root" {
+					damageDatabase(t, f.path, `UPDATE nodes SET detached = 1
+						WHERE id = (SELECT root FROM namespaces WHERE id = ?)`, f.workspace)
+				} else {
+					damageDatabase(t, f.path, `UPDATE nodes SET detached = 1 WHERE `+nodeNamed,
+						f.workspace, "directory")
+					damageDatabase(t, f.path, `DELETE FROM entries WHERE namespace = ? AND name = CAST('directory' AS BLOB)`, f.workspace)
+				}
+				assertRetainedIntegrityFailure(t, f.path, store)
+			})
+		}
+	}
+}
+
+func assertRetainedIntegrityFailure(t *testing.T, path string, store *sqlite.Store) {
+	t.Helper()
+	var err error
+	if store == nil {
+		store, err = sqlite.Open(t.Context(), path, "workspace", 100, sqlite.DefaultWindow())
+		if store != nil {
+			if closeErr := store.Close(); closeErr != nil {
+				t.Error(closeErr)
+			}
+		}
+	} else {
+		_, err = store.ObjectStatus(t.Context())
+	}
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("invalid retained graph = %v; want EIO", err)
 	}
 }

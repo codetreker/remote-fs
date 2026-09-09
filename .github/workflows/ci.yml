@@ -139,23 +139,15 @@ jobs:
           # shellcheck disable=SC2086
           .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m $MOUNTING_PACKAGES
 
-      # The newest tag predates the fix that recomputes per-package and total coverage
-      # from the profile. Under -coverpkg that version reports numbers which are simply
-      # wrong — packages/fuse as 24.4% where the figure is 100% — so this is pinned to
-      # the commit that fixed it rather than to a release or to @latest.
       - name: Install the coverage gate
         run: go install github.com/codetreker/go-cov/cmd/go-cov@v0.1.4-0.20260617124522-d6caf2759e33
 
       - name: Coverage gate
         run: |
           set -euo pipefail
-          # go-cov does not expose -coverpkg, and without it this repository measures more
-          # than thirty points low: the contract suite is one package executed by two
-          # others, so it is instrumented only in its own build, where nothing runs it.
-          # -count=1 is here because go-cov's `go test` is otherwise served from the test
-          # cache, which does not notice that /dev/fuse came or went.
-          module="$(go list -m)"
-          export GOFLAGS="-coverpkg=$module/... -count=1"
+          # Measure each package only while running its own tests. Force execution
+          # because the test cache does not track whether /dev/fuse is available.
+          export GOFLAGS="-count=1"
           go-cov --ci --skip-result-packages cmd,packages/metastore/sqlite/internal/integration
 
       # A mount that outlived the test that made it means a t.Cleanup did not do what

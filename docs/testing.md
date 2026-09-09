@@ -22,7 +22,7 @@ checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race 
 
 它只证明那些行跑过了，不证明特性按交付的样子工作。
 
-覆盖率测量包含 SQLite 根包及提取出的内部生产模块。根 [AGENTS.md](../AGENTS.md) 的 `--skip-result-packages` 仅省略路径匹配 `cmd` 或 `packages/metastore/sqlite/internal/integration` 的包汇总行；这些测试仍执行，失败仍使检查失败，所覆盖的生产代码继续计入统计。该参数按包路径子串匹配，integration 子树必须保持纯测试代码与 fixtures，不能放置生产包。
+每个 package 的覆盖率只由它自己的 Go 测试二进制计入，同目录的外部测试包也属于这份二进制。其它 package 或 `internal/integration` 的测试即使执行了该包的生产代码，也不给该包增加覆盖率。使用 Go 默认的 package-local instrumentation，阈值保持每包 70%、每函数 50%、总体 85%。根 [AGENTS.md](../AGENTS.md) 的 `--skip-result-packages` 只省略路径匹配 `cmd` 或 `packages/metastore/sqlite/internal/integration` 的结果行，测试仍执行且失败仍使检查失败；integration 自身没有生产语句，其测试不为其它包计入覆盖率。参数按包路径子串匹配，integration 子树必须保持纯测试代码与 fixtures。SQLite 的包内覆盖缺口由[package-local 覆盖率跟进项](../.agents/notes/proposed/testing/2026-09-09-sqlite-package-local-coverage.md)记录，测试通过不能替代覆盖率门禁通过。
 
 覆盖率文件本身也须有实际执行证据：mode 头之外有覆盖块、非零执行计数与真实函数记录。`assert-every-test-ran.sh` 当前会把显式 `-coverprofile` 再交给清单调用，可能将已执行的 profile 覆盖为仅有 mode 头的文件；[保留执行覆盖率的提案](../.agents/notes/proposed/bug-fix/2026-09-08-preserve-executed-coverage-in-strict-test-runs.md)单独处理这一缺陷。脚本退出成功或日志中的百分比不能替代对最终文件的核对。
 
@@ -88,7 +88,7 @@ checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race 
 
 文件大小上限用例分别收紧 FileSessionOptions.MaxFileSize 与 native MaxFileBytes：先 Stat，再从另一入口增大文件，随后即使只读一个字节，ReadAt、WriteAt、非零 Truncate 和 Sync 也必须在 GetBounded/Put 前以 `EFBIG` 拒绝。Truncate(0) 不读取或暂存被丢弃的旧内容，超限且不可读的对象仍能按权限清空，Usage 随之归零；强 S/X 的最终权限检查继续成立。测试分别计数对象读取与上传，不能只检查最后的 errno。
 
-[native 发布用例](../packages/metastore/sqlite/file_publication_test.go)分别在上传前、最终发布前和已获准的发布期间退役引用或 Session。退役必须阻止尚未取得最终许可的 WriteAt、Truncate、创建打开与身份属性修改；已取得许可的事务先完成，再交接后继权限。强 S/X proof 仍在最终发布验证，名字消失时强占有退役，普通打开引用继续保留原节点。已知 cleanup 拒绝保留 pin 以供重试，接受结果未知则保留物理所有权与错误原因。
+[native 发布用例](../packages/metastore/sqlite/files_test.go)分别在上传前、最终发布前和已获准的发布期间退役引用或 Session。退役必须阻止尚未取得最终许可的 WriteAt、Truncate、创建打开与身份属性修改；已取得许可的事务先完成，再交接后继权限。强 S/X proof 仍在最终发布验证，名字消失时强占有退役，普通打开引用继续保留原节点。已知 cleanup 拒绝保留 pin 以供重试，接受结果未知则保留物理所有权与错误原因。
 
 ### 无名字对象的用量与恢复
 
@@ -96,7 +96,7 @@ checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race 
 
 [local store 关闭用例](../packages/storage/localstore/files_test.go)在关闭 durable storage 前退役 retained 引用，重开后核对无名字对象已清理、Used 已释放且旧名字没有重建。最后引用的记账拒绝必须使 Close 保留原错误，第二个 opener 仍以 `EBUSY` 失败；移除故障后重新 Close 才能释放物理所有权。
 
-[v5 integrity 用例](../packages/metastore/sqlite/internal/integration/retained_integrity_test.go)将可见 rooted tree 与 detached regular file 分开验证：后者不进入目录快照，仍引用合法对象并计入 quota 与 integrity work；detached directory/root、非法标记、revision 或错误用量均失败。[恢复用例](../packages/metastore/sqlite/internal/integration/retained_recovery_test.go)在独占打开时清理数据库内每个 namespace 的遗留 detached 对象，即使 pending admission 已满仍完成必要清理并报告实际 OverLimit；损坏图在清理前拒绝，失败事务保持节点、对象、用量和 durable generation。[迁移用例](../packages/metastore/sqlite/internal/integration/retained_migration_test.go)从受见证保护的旧 schema 前滚，核对已有节点与 accepted state，并在旧 schema 损坏或预算不足时保持原数据。
+[v5 integrity 用例](../packages/metastore/sqlite/internal/integration/integrity_test.go)将可见 rooted tree 与 detached regular file 分开验证：后者不进入目录快照，仍引用合法对象并计入 quota 与 integrity work；detached directory/root、非法标记、revision 或错误用量均失败。[恢复用例](../packages/metastore/sqlite/internal/integration/files_test.go)在独占打开时清理数据库内每个 namespace 的遗留 detached 对象，即使 pending admission 已满仍完成必要清理并报告实际 OverLimit；损坏图在清理前拒绝，失败事务保持节点、对象、用量和 durable generation。[迁移用例](../packages/metastore/sqlite/internal/integration/schema_test.go)从受见证保护的旧 schema 前滚，核对已有节点与 accepted state，并在旧 schema 损坏或预算不足时保持原数据。
 
 ### flock 与 POSIX 记录锁
 
@@ -136,7 +136,7 @@ busy unmount 用例在真实挂载点保留打开的描述符和排他 flock，�
 
 SQLite 只读用例覆盖查询取消、预算回调取消、回调成功后才取消、`database/sql` 自动回滚产生的直接 `ErrTxDone`，以及真实查询和 cleanup 故障。SQLite code 9 只有与实际已取消的读取 context 同时出现时才按取消解释。每种情况都验证原因保存和最终 errno；未知 commit 与 poison 仍为 `EIO`。
 
-[Forget 事务用例](../packages/metastore/sqlite/commit_cancellation_test.go)分别取消尚未准入与已准入的批次：前者以 `EINTR` 退出并保留原记录，后者完成真实 Commit / Accept，不能因调用方取消捏造失败。[SQL 执行中取消用例](../packages/metastore/sqlite/forget_cancellation_test.go)在 `objects` 的 DELETE 与 `database_state` 的 UPDATE 已进入 SQLite 时取消调用方，断言没有原生 rollback、garbage 记录已删除、generation 恰推进一次，读取和 Close 仍成功且 SQL 连接已释放。真实提交、见证或回滚故障仍须保持 `EIO` 与失败隔离。[关闭交错用例](../packages/metastore/sqlite/forget_close_test.go)让已经接纳的 Forget 在授权方退役后发生真实 driver COMMIT 故障，断言 Close 保留该原因、重复 Close 返回相同缓存错误，另一原生排他 opener 仍以 `EBUSY` 失败。[组合关闭用例](../packages/metastore/sqlite/garbage_shutdown_test.go)验证已准入的整批 Forget 完成、待准入者以 `EINTR` 退出，并重开同一数据库检查 garbage 记录。
+[Forget 事务用例](../packages/metastore/sqlite/objects_test.go)分别取消尚未准入与已准入的批次：前者以 `EINTR` 退出并保留原记录，后者完成真实 Commit / Accept，不能因调用方取消捏造失败。[SQL 执行中取消用例](../packages/metastore/sqlite/objects_test.go)在 `objects` 的 DELETE 与 `database_state` 的 UPDATE 已进入 SQLite 时取消调用方，断言没有原生 rollback、garbage 记录已删除、generation 恰推进一次，读取和 Close 仍成功且 SQL 连接已释放。真实提交、见证或回滚故障仍须保持 `EIO` 与失败隔离。[关闭交错用例](../packages/metastore/sqlite/objects_test.go)让已经接纳的 Forget 在授权方退役后发生真实 driver COMMIT 故障，断言 Close 保留该原因、重复 Close 返回相同缓存错误，另一原生排他 opener 仍以 `EBUSY` 失败。[组合关闭用例](../packages/metastore/sqlite/objects_test.go)验证已准入的整批 Forget 完成、待准入者以 `EINTR` 退出，并重开同一数据库检查 garbage 记录。
 
 HTTP 用例区分 `Do` 前取消、已发出的只读请求与已发出的 mutation，断言是否到达服务端以及最终 errno。真实网络错误不能泄漏 `ENOENT` 等底层 errno；成功修改后的 barrier 取消仍为 `EIO`。FUSE 复合操作分别在任何效果之前及已有 namespace 或句柄效果之后取消，验证后者不会返回暗示整个操作未执行的 `EINTR`。
 
@@ -172,7 +172,7 @@ HTTP 用例区分 `Do` 前取消、已发出的只读请求与已发出的 mutat
 
 authority 的[发布交错用例](../packages/locking/contract_concurrency_test.go)暂停已经取得最终许可的 native 回调，要求同资源的 Release 等待，而另一资源的发布仍可前进。Grant 查询用例另推进时钟越过租约期限，查询必须等未完成发布结束后再报告 Expired。SQLite 保留自身 writer / health 串行化，其发布用例断言新 Stat 等待发布、已捕获快照仍读到旧版本，以及发布后新视图取得新大小和对象 key。objectstore 的已捕获 immutable object 读取在 Get 暂停期间允许后续授权和发布，恢复后仍返回旧的完整内容。这里验证授权与效果的次序，不要求已获准的 commit 或同步在到期时刻前物理返回。
 
-失败用例区分准备拒绝、已知效果和结果未知。SQLite 准备失败保留 reservation 与 Grant，删除与目标覆盖退役真实受影响身份；[记账收尾失败](../packages/metastore/sqlite/publication_accounting_test.go)与[持久确认失败](../packages/metastore/sqlite/publication_durability_test.go)使 namespace 和 authority 停止发布，错误原因仍可核对。复合修改的部分效果由 FUSE 阶段用例验证，已有副作用时不返回暗示整个操作未执行的 `EINTR`。Close 排空在途发布与持久水位准备，关闭失败保留原因和必要所有权，不能对可能已经复用的描述符重试 Close。
+失败用例区分准备拒绝、已知效果和结果未知。SQLite 准备失败保留 reservation 与 Grant，删除与目标覆盖退役真实受影响身份；[记账收尾失败](../packages/metastore/sqlite/publication_test.go)与[持久确认失败](../packages/metastore/sqlite/publication_test.go)使 namespace 和 authority 停止发布，错误原因仍可核对。复合修改的部分效果由 FUSE 阶段用例验证，已有副作用时不返回暗示整个操作未执行的 `EINTR`。Close 排空在途发布与持久水位准备，关闭失败保留原因和必要所有权，不能对可能已经复用的描述符重试 Close。
 
 [native quota hook 用例](../packages/storage/limited/publication_test.go)在真实 namespace 外注入最终发布结果，单独核对根据最终目标计算的旧、新大小：增长先预留，只有已知应用才返还缩减或删除释放的字节；未应用的失败返还增长预留并保留原用量。用例暂停 staging 后改名祖先目录并重建原路径，再核对两份内容、即时 Used 与 Recount，避免提前 Stat 的大小被用于另一节点。已应用但回复失败仍按实际效果结算；[未知结果或 unwind/settlement 失败](../packages/storage/limited/publication_uncertainty_test.go)保守保留预留，并使后续修改、Space 与 Recount 失败，已在 staging 的调用也不能越过该状态。嵌套 quota 另验证准备被拒绝后各层预留均已归还。只有实现 native 最终发布记账能力的包装层能同时暴露锁服务；这些断言不把 opaque 第三方 storage 的路径采样包装解释为具有同样保证。
 
@@ -184,7 +184,7 @@ authority 的[发布交错用例](../packages/locking/contract_concurrency_test.
 
 [native lease anchor](../packages/metastore/sqlite/internal/nativelease/anchor_test.go)覆盖显式初始化与重开、匹配的中断初始化 intent、数据库和状态身份绑定、缺失或损坏见证、复制或替换证据路径，以及 lifetime ownership。xattr、flock、rename、文件及目录 fsync 的能力探测在初始化和重开时验证错误与误报成功，known remote filesystem 在修改前拒绝，中断的探测与 stage 只清理可证明属于本次状态的残留。恢复期从实际取得独占所有权的单调时刻起算，较小的新配置不能缩短已记录时长；这些证据位于 SQLite-backed 存储自身的持久边界。
 
-[SQLite 拥有者用例](../packages/metastore/sqlite/locking_store_test.go)与[跨进程所有权用例](../packages/metastore/sqlite/locking_ownership_test.go)验证 raw opener 的共享 flock 与授权方的排他 flock 在同进程、跨进程中双向排斥；数据库绑定后不能通过 raw constructor、路径别名或并发拥有者绕过保护。恢复配置和启用入口必须验证真实排他拥有者与 native anchor；重开另一个已有 namespace 时仍须读取同一数据库级最大时长并等待完整恢复间隔，选择不同名字不创建新证据。local store 继续验证单 workspace 根绑定，不能省略锁配置或丢弃见证来恢复为空的 authority。真实子进程在租约已确认后遭 `SIGKILL`，由新的进程或组合 store 重开：内容仍完整，恢复期间读取和状态查询可用，修改为 `EAGAIN`，较小配置不能缩短此前水位；旧 Owner、Grant 和动作不能在新 authority 下重放执行。故障注入与真实退出分别证明具体持久边界和进程生命周期，不把它们当作断电或设备缓存验证。
+[SQLite 拥有者用例](../packages/metastore/sqlite/locking_store_test.go)与[跨进程所有权用例](../packages/metastore/sqlite/locking_store_test.go)验证 raw opener 的共享 flock 与授权方的排他 flock 在同进程、跨进程中双向排斥；数据库绑定后不能通过 raw constructor、路径别名或并发拥有者绕过保护。恢复配置和启用入口必须验证真实排他拥有者与 native anchor；重开另一个已有 namespace 时仍须读取同一数据库级最大时长并等待完整恢复间隔，选择不同名字不创建新证据。local store 继续验证单 workspace 根绑定，不能省略锁配置或丢弃见证来恢复为空的 authority。真实子进程在租约已确认后遭 `SIGKILL`，由新的进程或组合 store 重开：内容仍完整，恢复期间读取和状态查询可用，修改为 `EAGAIN`，较小配置不能缩短此前水位；旧 Owner、Grant 和动作不能在新 authority 下重放执行。故障注入与真实退出分别证明具体持久边界和进程生命周期，不把它们当作断电或设备缓存验证。
 
 ### HTTP v3 与客户端
 
@@ -206,7 +206,7 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 真实 `Replica` 用例覆盖 `Apply` 与 `Reseed` 等门取消、等待 commit gate 时释放外层名额，以及 `Stat`、`List`、`ListBounded` 在 reseed 后排队时的取消；失败的 `ListResult` 不能暴露已保留前缀。SQL 读取名额另验证与 reader pool 容量一致、名额耗尽时调用不进入阶段、交接后取消归还名额，以及 `Position` 与写者不消耗 SQL 读取名额。完整、回滚、无效 row 与提交失败的 reseed 都同时观察树和 `Position`，并验证重复 `Close`；读者批次还必须在多个真实 `Apply` 的积压之间得到执行机会。取消用例保留现有错误分类与 context 原因。
 
-压力与可见性使用不同的时间判据。[SQLite 压力用例](../packages/metastore/sqlite/replica_progress_test.go)先占满现有 reader pool，再启动 128 个公开 `List` 调用。用例在门的互斥保护下确认只有与 pool 容量相等的读者持有共享访问，其余调用仍在阶段外等待 SQL 名额；确认 `Apply` 已登记等待后才释放 reader pool。4096 文件的读取循环保持运行，直到 `Apply` 成功；race detector 下给已获准的扫描留出 30 秒死锁检测上限，这个上限不代表复制延迟。
+压力与可见性使用不同的时间判据。[SQLite 压力用例](../packages/metastore/sqlite/replica_test.go)先占满现有 reader pool，再启动 128 个公开 `List` 调用。用例在门的互斥保护下确认只有与 pool 容量相等的读者持有共享访问，其余调用仍在阶段外等待 SQL 名额；确认 `Apply` 已登记等待后才释放 reader pool。4096 文件的读取循环保持运行，直到 `Apply` 成功；race detector 下给已获准的扫描留出 30 秒死锁检测上限，这个上限不代表复制延迟。
 
 [真实 HTTP/SSE 全负载可见性用例](../packages/storage/replicated/replica_acceptance_test.go)使用 4096 文件与 128 个持续列目录的读者，以一秒为独立写者提交后另一客户端观察到新元数据的上限。用例先观察每个读者都成功完成列目录，再提交变更，并断言计时窗口内列目录继续推进；调用进入某个回调不构成负载成立的证据。
 
@@ -264,7 +264,7 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 ### SQLite metastore 迁移
 
-SQLite 的测试按实现归属组织：[根包公共契约](../packages/metastore/sqlite/sqlite_test.go)继续通过公开 metastore 接口运行；既有黑盒用例和共享测试辅助代码位于 [internal/integration](../packages/metastore/sqlite/internal/integration)，golden schema 与历史数据库 SQL 位于它的 [testdata](../packages/metastore/sqlite/internal/integration/testdata)。事务、发布、关闭与副本协调的白盒故障注入保留在根包，原生 lease anchor 测试随 `internal/nativelease`，错误分类与身份分配的局部测试随对应内部模块。[snapshot 计划用例](../packages/metastore/sqlite/snapshot_plan_test.go)留在根包，直接检查生产 `pageQuery`。验证整个 SQLite 实现时使用 `./packages/metastore/sqlite/...`，包含这些测试归属下的原有用例。
+SQLite 的测试按对应生产模块归组：[根包公共契约](../packages/metastore/sqlite/contract_test.go)继续通过公开 metastore 接口运行；既有黑盒用例和共享测试辅助代码位于 [internal/integration](../packages/metastore/sqlite/internal/integration)，golden schema 与历史数据库 SQL 位于它的 [testdata](../packages/metastore/sqlite/internal/integration/testdata)。事务、发布、关闭与副本协调的白盒故障注入保留在根包，原生 lease anchor 测试随 `internal/nativelease`，错误分类的局部测试随 `internal/sqlerr`，[身份查询计划用例](../packages/metastore/sqlite/internal/dbstate/identity_test.go)随 `internal/dbstate`。[snapshot 计划用例](../packages/metastore/sqlite/snapshot_test.go)留在根包，直接检查生产 `pageQuery`。验证整个 SQLite 实现时使用 `./packages/metastore/sqlite/...`，包含这些测试归属下的原有用例。
 
 迁移用例从独立手写的 v1/v2 数据库开始，不用当前 migration 反向构造历史。只含 referenced object row 且结构、计数、`sqlite_sequence` 与日志 tail 一致的旧库必须前滚到当前 schema；含任何 non-referenced object row 的 v1/v2 库必须以 `EIO` 拒绝。这条用例同时防止旧的零字节 pending 记录绕过当前 byte threshold，以及旧的 time-derived garbage 被新清扫器误当作 ownership-proven 对象删除。v2 retained changes 在迁移后必须为空、incarnation 必须改变、tail／trim 必须归零，node/change 高水位必须覆盖迁移前的全部 surviving reference 与 sequence；迁移后的第一份 node/change 严格使用更大的值。已完全 trim、`committed_position = trimmed_through > 0` 且没有 surviving row 的合法 v2 日志也必须可以迁移。
 

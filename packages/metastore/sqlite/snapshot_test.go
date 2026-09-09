@@ -1,12 +1,130 @@
 package sqlite
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
+
+	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/storage"
+	_ "modernc.org/sqlite"
 )
+
+func TestSnapshotAfterAutomaticRollbackReturnsCancellation(t *testing.T) {
+	store, err := Open(t.Context(), t.TempDir()+"/metastore.db", "workspace", 4096, DefaultWindow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("closing store: %v", err)
+		}
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	snap, _, err := store.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	waitForReadRollback(t, store.snapshotRead)
+	result, err := metastore.NewRowResult(1024, 0,
+		func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
+			return 192 + lengths.Name + lengths.Content, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := snap.Next(t.Context(), 1, result); storage.ErrnoOf(err) != syscall.EINTR ||
+		!errors.Is(err, context.Canceled) || !errors.Is(err, sql.ErrTxDone) || errors.Is(err, syscall.EIO) {
+		t.Fatalf("reading automatically rolled back snapshot with a new context = %v, want interruption", err)
+	}
+	if rows, err := result.Rows(); rows != nil || storage.ErrnoOf(err) != syscall.EINTR {
+		t.Fatalf("canceled snapshot exposed rows %v with error %v", rows, err)
+	}
+	if err := snap.Close(); storage.ErrnoOf(err) != syscall.EINTR || errors.Is(err, syscall.EIO) {
+		t.Fatalf("closing automatically rolled back snapshot = %v, want interruption", err)
+	}
+	if err := snap.Close(); err != nil {
+		t.Fatalf("closing snapshot twice: %v", err)
+	}
+}
+
+func TestSnapshotCancellationDoesNotHideIndependentFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	picture := &snapshot{ctx: ctx}
+	fault := errors.New("query failed")
+	for _, cause := range []error{
+		errors.Join(sql.ErrTxDone, fault),
+		errors.Join(fault, sql.ErrTxDone),
+		fmt.Errorf("query: %w", sql.ErrTxDone),
+	} {
+		err := picture.readFailure(t.Context(), cause)
+		if storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, cause) {
+			t.Fatalf("snapshot failure %v = %v, want EIO retaining original failure", cause, err)
+		}
+	}
+	activePicture := &snapshot{ctx: t.Context()}
+	err := activePicture.readFailure(ctx, sql.ErrTxDone)
+	if storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, sql.ErrTxDone) || errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled page hid an unexpectedly completed live transaction: %v", err)
+	}
+}
+
+func TestSnapshotPoolDoesNotBlockGeneralReaderPool(t *testing.T) {
+	store, err := OpenWithOptions(
+		t.Context(), t.TempDir()+"/metastore.db", "workspace", 0, Options{
+			Window:                       DefaultWindow(),
+			MaxReaderConnections:         1,
+			MaxSnapshotReaderConnections: 1,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	picture, _, err := store.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer picture.Close()
+
+	waitContext, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		blocked, _, err := store.Snapshot(waitContext)
+		if blocked != nil {
+			err = errors.Join(err, blocked.Close())
+		}
+		result <- err
+	}()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for store.snapshotRead.Stats().WaitCount == 0 {
+		select {
+		case <-deadline.C:
+			t.Fatal("a second snapshot did not wait for the dedicated snapshot pool")
+		default:
+			runtime.Gosched()
+		}
+	}
+	if _, err := store.Incarnation(t.Context(), 1024); err != nil {
+		t.Fatalf("a saturated snapshot pool blocked a general log read: %v", err)
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceling a snapshot pool waiter returned %v, want context.Canceled", err)
+	}
+}
 
 // A picture pages the tree, and what a page costs is decided entirely by the plan SQLite
 // chooses for one statement. This asserts that plan, both against a database that has been
