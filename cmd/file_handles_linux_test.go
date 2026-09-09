@@ -94,12 +94,8 @@ func TestBinaryRestartRetiresOldDescriptorsAndAdvisoryLocks(t *testing.T) {
 			if n, err := oldFile.WriteAt([]byte("durable!"), 0); err != nil || n != 8 {
 				t.Fatalf("write before restart = %d, %v", n, err)
 			}
-			if err := oldFile.Sync(); err != nil {
-				attr, attrErr := remote.Stat(t.Context(), "artifact")
-				content, readErr := remote.ReadBounded(t.Context(), "artifact", 32)
-				t.Logf("authority after failed sync: attr=%+v (%v), content=%q (%v)", attr, attrErr, content, readErr)
-				t.Fatalf("sync before server restart: %v\nmount output:\n%s\nserver output:\n%s", err, oldMount.output(), first.output())
-			}
+			// A successful WriteAt must survive an immediate restart without a later
+			// Sync concealing deferred publication.
 			if err := first.cmd.Process.Kill(); err != nil {
 				t.Fatal(err)
 			}
