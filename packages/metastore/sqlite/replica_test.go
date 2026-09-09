@@ -691,3 +691,66 @@ func TestReplicaWriterProgressUnderContinuousListings(t *testing.T) {
 	}
 	t.Logf("Apply completed in %v while 128 readers completed %d listings of 4096 files", elapsed, completed.Load())
 }
+
+func TestReplicaAppliesEveryChangeWithoutLosingIdentityOrRollback(t *testing.T) {
+	r := seededAdmissionReplica(t)
+	ctx := t.Context()
+	node := metastore.Node{ID: 12, Mode: 0o600, Size: 3, AccessTime: time.Unix(100, 0), ModTime: time.Unix(200, 0)}
+	apply := func(change metastore.Change) {
+		t.Helper()
+		changed, err := r.Apply(ctx, change)
+		if err != nil || !changed || r.Position() != change.Position {
+			t.Fatalf("apply %+v = %v, %v; position %d", change, changed, err, r.Position())
+		}
+	}
+	apply(metastore.Change{Position: 2, Kind: metastore.Created, Parent: 10, Name: []byte("new"), Node: &node})
+	if got, err := r.Stat(ctx, "new"); err != nil || got != node {
+		t.Fatalf("created node = %+v, %v", got, err)
+	}
+	node.Size, node.Mode = 9, 0o640
+	apply(metastore.Change{Position: 3, Kind: metastore.Modified, Parent: 10, Name: []byte("new"), Node: &node})
+	if got, err := r.Stat(ctx, "new"); err != nil || got != node {
+		t.Fatalf("modified node = %+v, %v", got, err)
+	}
+	node.Mode, node.ModTime = 0o660, time.Unix(300, 0)
+	apply(metastore.Change{Position: 4, Kind: metastore.Renamed, Parent: 10, Name: []byte("renamed"), From: &metastore.Location{Parent: 10, Name: []byte("new")}, Node: &node})
+	if got, err := r.Stat(ctx, "renamed"); err != nil || got != node {
+		t.Fatalf("renamed node = %+v, %v", got, err)
+	}
+	if _, err := r.Stat(ctx, "new"); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("old name = %v", err)
+	}
+	for _, change := range []metastore.Change{
+		{Kind: metastore.Created, Parent: 10, Name: []byte("missing-node")},
+		{Kind: metastore.Renamed, Parent: 10, Name: []byte("missing-from"), Node: &node},
+		{Kind: metastore.Removed, Parent: 10, Name: []byte("absent")},
+		{Kind: metastore.Renamed, Parent: 10, Name: []byte("other"), From: &metastore.Location{Parent: 10, Name: []byte("absent")}, Node: &node},
+		{Kind: metastore.Renamed, Parent: 10, Name: []byte("file"), From: &metastore.Location{Parent: 10, Name: []byte("renamed")}, Node: &node},
+		{Kind: metastore.Created, Parent: 10, Name: []byte("reused-id"), Node: &node},
+		{Kind: 99, Node: &node},
+	} {
+		change.Position = 5
+		if changed, err := r.Apply(ctx, change); changed || !errors.Is(err, syscall.EIO) {
+			t.Fatalf("invalid change %+v = %v, %v", change, changed, err)
+		}
+		if r.Position() != 4 {
+			t.Fatalf("failed change advanced position to %d", r.Position())
+		}
+		if got, err := r.Stat(ctx, "renamed"); err != nil || got != node {
+			t.Fatalf("failed change altered node: %+v, %v", got, err)
+		}
+		if children, err := r.List(ctx, ""); err != nil || len(children) != 2 {
+			t.Fatalf("failed change altered directory: %+v, %v", children, err)
+		}
+	}
+	apply(metastore.Change{Position: 5, Kind: metastore.Removed, Parent: 10, Name: []byte("renamed")})
+	if _, err := r.Stat(ctx, "renamed"); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("removed node = %v", err)
+	}
+	if changed, err := r.Apply(ctx, metastore.Change{Position: 5}); changed || err != nil {
+		t.Fatalf("replayed position = %v, %v", changed, err)
+	}
+	if children, err := r.List(ctx, ""); err != nil || len(children) != 1 || string(children[0].Name) != "file" {
+		t.Fatalf("unrelated node = %+v, %v", children, err)
+	}
+}

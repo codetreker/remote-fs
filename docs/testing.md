@@ -12,6 +12,8 @@
 
 对拍必须跑在**交付出去的那套配置**上。为了让它好过而调松的任何一处 —— 内核超时、提交时机、单文件上限 —— 都会让它去验证一条生产中不存在的路径。
 
+公共边界各有包内直接用例：[metastore 页结果](../packages/metastore/bounded_test.go)核对预留、提交、整页失效和 payload 所有权，[发布 guard](../packages/metastore/files_test.go)核对组合顺序、首个失败及父 context 不变；[storage 值类型](../packages/storage/storage_test.go)核对路径边界、明确的零值属性与容量一致性。[limited 句柄](../packages/storage/limited/files_test.go)通过 OpenNode 在改名后截断同一对象，核对内容、Used 和超额拒绝后的原状态。[HTTP CancelLock](../packages/transport/httprest/file_client_test.go)取消真实 Pending 请求并重复核对同一 Request，原持有者释放后仍为 Cancelled，不能留下迟到授予。
+
 普通对拍中的六处时间设置调用使用 [`comparisonChtimes`](../packages/fuse/fuse_test.go)：每处 `os.Chtimes` 的总尝试次数至多八次，仅在上一次返回 `EINTR` 时重做完全相同的路径、绝对 atime 与 mtime，包括明确省略某个时间的参数。挂载点和普通目录使用同一规则，只重试这一次调用；其它错误立即返回，八次仍中断则保留最后的 `EINTR` 并使对拍失败。这里比较最终的 atime / mtime，ctime 不在对拍结果中。专门验证中断的真实信号用例继续断言第一次系统调用的结果，不使用这个辅助函数。
 
 ## CI 执行预算
@@ -22,7 +24,7 @@ checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race 
 
 它只证明那些行跑过了，不证明特性按交付的样子工作。
 
-每个 package 的覆盖率只由它自己的 Go 测试二进制计入，同目录的外部测试包也属于这份二进制。其它 package 或 `internal/integration` 的测试即使执行了该包的生产代码，也不给该包增加覆盖率。使用 Go 默认的 package-local instrumentation，阈值保持每包 70%、每函数 50%、总体 85%。根 [AGENTS.md](../AGENTS.md) 的 `--skip-result-packages` 只省略路径匹配 `cmd` 或 `packages/metastore/sqlite/internal/integration` 的结果行，测试仍执行且失败仍使检查失败；integration 自身没有生产语句，其测试不为其它包计入覆盖率。参数按包路径子串匹配，integration 子树必须保持纯测试代码与 fixtures。SQLite 的包内覆盖缺口由[package-local 覆盖率跟进项](../.agents/notes/proposed/testing/2026-09-09-sqlite-package-local-coverage.md)记录，测试通过不能替代覆盖率门禁通过。
+每个 package 的覆盖率只由它自己的 Go 测试二进制计入，同目录的外部测试包也属于这份二进制。其它 package 或 `internal/integration` 的测试即使执行了该包的生产代码，也不给该包增加覆盖率。使用 Go 默认的 package-local instrumentation，阈值保持每包 70%、每函数 50%、总体 85%。根 [AGENTS.md](../AGENTS.md) 的 `--skip-result-packages` 只省略路径匹配 `cmd` 或 `packages/metastore/sqlite/internal/integration` 的结果行，测试仍执行且失败仍使检查失败；integration 自身没有生产语句，其测试不为其它包计入覆盖率。参数按包路径子串匹配，integration 子树必须保持纯测试代码与 fixtures。包内直接测试及其验证边界见[package-local 测试实施记录](../.agents/notes/implemented/testing/2026-09-09-sqlite-package-local-coverage.md)。局部测试与覆盖率 profile 的结论分别核对，不能替代最终全局 CI 的覆盖率门禁结论。
 
 覆盖率文件本身也须有实际执行证据：mode 头之外有覆盖块、非零执行计数与真实函数记录。`assert-every-test-ran.sh` 当前会把显式 `-coverprofile` 再交给清单调用，可能将已执行的 profile 覆盖为仅有 mode 头的文件；[保留执行覆盖率的提案](../.agents/notes/proposed/bug-fix/2026-09-08-preserve-executed-coverage-in-strict-test-runs.md)单独处理这一缺陷。脚本退出成功或日志中的百分比不能替代对最终文件的核对。
 
@@ -254,6 +256,8 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 ## 对象存储后端分别使用真实基底
 
+[lockcontract](../packages/storage/lockcontract/contract_test.go)与 [objectstoretest](../packages/storage/objectstore/objectstoretest/objectstoretest_test.go)在各自测试二进制中运行真实 SQLite authority 或 memory Objects，并核对非零 fixture 数与逐项清理。故障探针执行同一测试二进制中的缺陷替身，必须命中匿名修改或 create-only 的指定失败断言；子进程 profile 不导入覆盖率统计。[memory](../packages/storage/objectstore/memory/memory_test.go)另核对有界读取的精确边界、取消和返回数据不共享存储字节；[Azure Blob](../packages/storage/objectstore/azblob/azblob_test.go)核对连接字符串、读取 framing 与对象缺席的服务错误，[错误分类](../packages/storage/objectstore/azblob/errors_test.go)保留 service cause，并防止 container 缺席或独立故障被改写为对象不存在。
+
 ### Azure Blob
 
 `packages/storage/objectstore/azblob` 对一个真的 Blob 端点跑，那个端点是 Azurite。它定义在 [`deployments/azurite.yml`](../deployments/azurite.yml)：本地 `make azurite` 起、`make azurite-down` 停；CI 的两个 job 各自在依赖 Blob 的测试之前启动同一模拟器，并等待它能够回答请求。挂载 job 的真实 Azure 二进制锁与重启用例依赖该端点，因此启动步骤位于对拍和端到端测试之前；后面的全 module 覆盖率闸门继续使用这份模拟器。
@@ -265,6 +269,18 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 ### SQLite metastore 迁移
 
 SQLite 的测试按对应生产模块归组：[根包公共契约](../packages/metastore/sqlite/contract_test.go)继续通过公开 metastore 接口运行；既有黑盒用例和共享测试辅助代码位于 [internal/integration](../packages/metastore/sqlite/internal/integration)，golden schema 与历史数据库 SQL 位于它的 [testdata](../packages/metastore/sqlite/internal/integration/testdata)。事务、发布、关闭与副本协调的白盒故障注入保留在根包，原生 lease anchor 测试随 `internal/nativelease`，错误分类的局部测试随 `internal/sqlerr`，[身份查询计划用例](../packages/metastore/sqlite/internal/dbstate/identity_test.go)随 `internal/dbstate`。[snapshot 计划用例](../packages/metastore/sqlite/snapshot_test.go)留在根包，直接检查生产 `pageQuery`。验证整个 SQLite 实现时使用 `./packages/metastore/sqlite/...`，包含这些测试归属下的原有用例。
+
+SQLite 的包内直接用例按各模块持有的边界核对结果：
+
+| 包 | 主要断言 |
+|---|---|
+| [sqlite](../packages/metastore/sqlite) | 公共构造与配置传递，accepted state 的检查和 checkpoint，advisory 共享及退役，Replica 各类变更的身份与回滚。 |
+| [sqlvalue](../packages/metastore/sqlite/internal/sqlvalue) | SQL 类型与整数值一致，时间和 key 表示保真，精确影响行数及溢出边界。 |
+| [sqlerr](../packages/metastore/sqlite/internal/sqlerr) | 真实 SQLite 错误、取消与独立故障的分类，原因链及不确定持久结果的优先级。 |
+| [dbstate](../packages/metastore/sqlite/internal/dbstate) | 身份和 generation 只随调用方事务发布，拒绝 sequence／高水位损坏与耗尽，启动核对 accepted lineage 和 WAL。 |
+| [schema](../packages/metastore/sqlite/internal/schema) | 迁移、树、对象归属和用量验证，work/name-byte 精确边界，拒绝与 detached 回收失败时整笔事务回滚。 |
+| [changes](../packages/metastore/sqlite/internal/changes) | 变长 payload 加载前预算，页边界与 predecessor 链，Record 与 tail 的事务一致性，按数量、年龄和保留下限 trim 且不影响其它 namespace。 |
+| [nativelease](../packages/metastore/sqlite/internal/nativelease) | evidence 字段边界、共享与排他 native ownership、绑定和文件身份核对；验证拒绝不释放仍持有的锁，Close 缓存结果且不重试可能已复用的 descriptor。SQLite 句柄关闭不确定时的所有权保留由根包用例验证。 |
 
 迁移用例从独立手写的 v1/v2 数据库开始，不用当前 migration 反向构造历史。只含 referenced object row 且结构、计数、`sqlite_sequence` 与日志 tail 一致的旧库必须前滚到当前 schema；含任何 non-referenced object row 的 v1/v2 库必须以 `EIO` 拒绝。这条用例同时防止旧的零字节 pending 记录绕过当前 byte threshold，以及旧的 time-derived garbage 被新清扫器误当作 ownership-proven 对象删除。v2 retained changes 在迁移后必须为空、incarnation 必须改变、tail／trim 必须归零，node/change 高水位必须覆盖迁移前的全部 surviving reference 与 sequence；迁移后的第一份 node/change 严格使用更大的值。已完全 trim、`committed_position = trimmed_through > 0` 且没有 surviving row 的合法 v2 日志也必须可以迁移。
 

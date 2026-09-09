@@ -205,3 +205,76 @@ func TestCoordinatorPoisonPreservesTheFirstDurabilityFailureAsEIO(t *testing.T) 
 		t.Fatalf("second poison replaced the first durability failure: %v", second)
 	}
 }
+
+type checkpointStateWitness struct {
+	accepted, checkpointed DurableState
+	checkpointErr          error
+}
+
+func (w *checkpointStateWitness) Accept(state DurableState) error { w.accepted = state; return nil }
+func (w *checkpointStateWitness) Checkpoint(state DurableState) error {
+	if w.checkpointErr != nil {
+		return w.checkpointErr
+	}
+	w.checkpointed = state
+	return nil
+}
+
+func TestDurableInspectionAndCheckpointPublishOnlyAcceptedState(t *testing.T) {
+	path := t.TempDir() + "/durable.db"
+	witness := &checkpointStateWitness{}
+	s, err := OpenBoundDurableWithOptions(t.Context(), path, "workspace", "objects", 0, DefaultOptions(), CreateNamespaceIfMissing, DurableStartup{}, witness)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		witness.checkpointErr = nil
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := s.Create(t.Context(), "persisted"); err != nil {
+		t.Fatal(err)
+	}
+	state, err := InspectDurableState(t.Context(), path)
+	if err != nil || state != witness.accepted {
+		t.Fatalf("inspected state = %+v, %v; accepted %+v", state, err, witness.accepted)
+	}
+	if _, err := s.Checkpoint(t.Context(), CheckpointMode(99)); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("unknown checkpoint mode = %v", err)
+	}
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := s.Checkpoint(canceled, FullCheckpoint); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled checkpoint = %v", err)
+	}
+	witness.checkpointErr = errors.New("checkpoint witness offline")
+	if _, err := s.Checkpoint(t.Context(), FullCheckpoint); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("unconfirmed checkpoint = %v", err)
+	}
+	if _, err := s.Stat(t.Context(), "persisted"); err != nil {
+		t.Fatalf("checkpoint failure poisoned accepted data: %v", err)
+	}
+	witness.checkpointErr = nil
+	for _, mode := range []CheckpointMode{PassiveCheckpoint, FullCheckpoint} {
+		result, err := s.Checkpoint(t.Context(), mode)
+		if err != nil || !result.Complete || result.State != state || witness.checkpointed != state || result.LogFrames != result.CheckpointedFrames {
+			t.Fatalf("checkpoint %d = %+v, %v; witnessed %+v", mode, result, err, witness.checkpointed)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Checkpoint(t.Context(), FullCheckpoint); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("checkpoint closed store = %v", err)
+	}
+	if after, err := InspectDurableState(t.Context(), path); err != nil || after != state {
+		t.Fatalf("closed durable state = %+v, %v", after, err)
+	}
+	if _, err := InspectDurableState(t.Context(), path+".missing"); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("missing database inspection = %v", err)
+	}
+	if _, err := InspectDurableState(canceled, path); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled inspection = %v", err)
+	}
+}

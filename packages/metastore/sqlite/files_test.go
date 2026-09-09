@@ -356,3 +356,73 @@ func TestFilePublicationGuardRefusesEveryIdentityMutationAtFinalAdmission(t *tes
 		})
 	}
 }
+
+func TestAdvisoryAuthorityIsSharedAndRetiredWithItsStore(t *testing.T) {
+	s, f := openPublicationFile(t)
+	ctx := t.Context()
+	a, err := s.Advisory(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.Advisory(ctx)
+	if err != nil || a != b {
+		t.Fatalf("namespace authority changed: %p, %p, %v", a, b, err)
+	}
+	first, err := a.NewSession(storage.DefaultFileSessionOptions(), func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := first.Retire(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	second, err := b.NewSession(storage.DefaultFileSessionOptions(), func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := second.Retire(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	node, err := f.Node(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := first.Epoch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := storage.NewLockRequestID(epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, Start: 0, End: 7}
+	if attempt, err := first.Set(ctx, uint64(node.ID), 1, lock, id); err != nil || attempt.State != storage.LockGranted {
+		t.Fatalf("first lock = %+v, %v", attempt, err)
+	}
+	if conflict, err := second.Get(ctx, uint64(node.ID), 2, lock); err != nil || !conflict.Found {
+		t.Fatalf("shared conflict = %+v, %v", conflict, err)
+	}
+	if err := first.Drop(ctx, uint64(node.ID), 1, storage.POSIX); err != nil {
+		t.Fatal(err)
+	}
+	if conflict, err := second.Get(ctx, uint64(node.ID), 2, lock); err != nil || conflict.Found {
+		t.Fatalf("released conflict = %+v, %v", conflict, err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := s.Advisory(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled authority access = %v", err)
+	}
+	if err := f.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Advisory(ctx); !errors.Is(err, syscall.ESTALE) {
+		t.Fatalf("retired authority access = %v", err)
+	}
+}

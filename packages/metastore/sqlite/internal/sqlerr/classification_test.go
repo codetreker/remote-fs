@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/codetreker/remote-fs/packages/storage"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/codetreker/remote-fs/packages/storage"
+	"modernc.org/sqlite"
 )
 
 type sqliteCodeError int
@@ -85,5 +87,88 @@ func TestInterruptedReadRequiresCancellationAndPreservesFaults(t *testing.T) {
 				t.Fatalf("interrupted read lost cancellation or gained EIO: %v", err)
 			}
 		})
+	}
+}
+
+func TestUniqueViolationClassifiesRealSQLiteConstraintErrors(t *testing.T) {
+	db, err := sql.Open("sqlite", t.TempDir()+"/constraints.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := db.ExecContext(t.Context(), `CREATE TABLE items (
+		id INTEGER PRIMARY KEY, name TEXT UNIQUE, size INTEGER CHECK(size >= 0));
+		INSERT INTO items VALUES (1, 'original', 0)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		sql    string
+		code   int
+		unique bool
+	}{
+		{"primary key", `INSERT INTO items VALUES (1, 'another', 0)`, 1555, true},
+		{"unique value", `INSERT INTO items VALUES (2, 'original', 0)`, 2067, true},
+		{"check constraint", `INSERT INTO items VALUES (2, 'another', -1)`, 275, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, cause := db.ExecContext(t.Context(), test.sql)
+			var driverErr *sqlite.Error
+			if !errors.As(cause, &driverErr) || driverErr.Code() != test.code {
+				t.Fatalf("statement returned %v, want SQLite code %d", cause, test.code)
+			}
+			for _, err := range []error{cause, fmt.Errorf("mutation: %w", cause), errors.Join(context.Canceled, cause)} {
+				if got := IsUniqueViolation(err); got != test.unique {
+					t.Fatalf("IsUniqueViolation(%v) = %v, want %v", err, got, test.unique)
+				}
+			}
+		})
+	}
+	for _, err := range []error{nil, errors.New("not a driver error"), sqliteCodeError(1555)} {
+		if IsUniqueViolation(err) {
+			t.Fatalf("a non-SQLite error is a uniqueness violation: %v", err)
+		}
+	}
+}
+
+func TestReadCancellationRetainsDriverCauseAndContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	cause := sqliteCodeError(9)
+	err := ReadFailure(ctx, cause)
+	if err.Error() != cause.Error() || !errors.Is(err, cause) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("read cancellation lost a cause: %v", err)
+	}
+	var canceled *readCancellationError
+	if !errors.As(err, &canceled) || canceled.Classification() != context.Canceled {
+		t.Fatalf("read interruption lacks its cancellation classification: %v", err)
+	}
+	if storage.ErrnoOf(err) != syscall.EINTR {
+		t.Fatalf("read interruption returned %v, want EINTR", storage.ErrnoOf(err))
+	}
+	if err := ReadFailure(ctx, nil); err != nil {
+		t.Fatalf("a successful read became a failure after cancellation: %v", err)
+	}
+	if err := Failure(nil); err != nil {
+		t.Fatalf("a nil failure became %v", err)
+	}
+}
+
+type emptyErrorGroup struct{}
+
+func (emptyErrorGroup) Error() string   { return "an error group without causes" }
+func (emptyErrorGroup) Unwrap() []error { return nil }
+
+func TestEmptyErrorGroupDoesNotProveReadCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	cause := emptyErrorGroup{}
+	err := ReadFailure(ctx, cause)
+	if storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, cause) || errors.Is(err, context.Canceled) {
+		t.Fatalf("empty error group was reclassified as cancellation: %v", err)
 	}
 }

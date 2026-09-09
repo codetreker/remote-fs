@@ -3,13 +3,55 @@ package memory_test
 import (
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
+	"syscall"
 	"testing"
 
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/memory"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/objectstoretest"
 )
+
+func TestGetBounded(t *testing.T) {
+	objects := memory.New()
+	if _, err := objects.Put(t.Context(), "key", []byte("stored")); err != nil {
+		t.Fatal(err)
+	}
+	for _, limit := range []int64{-1, 0, 5, 6, 7} {
+		t.Run(fmt.Sprintf("limit_%d", limit), func(t *testing.T) {
+			got, err := objects.GetBounded(t.Context(), "key", limit)
+			if limit <= 0 {
+				if !errors.Is(err, syscall.EINVAL) || got != nil {
+					t.Fatalf("GetBounded = %q, %v; want nil, EINVAL", got, err)
+				}
+				return
+			}
+			if limit < 6 {
+				if !errors.Is(err, syscall.EFBIG) || got != nil {
+					t.Fatalf("GetBounded = %q, %v; want nil, EFBIG", got, err)
+				}
+				return
+			}
+			if err != nil || string(got) != "stored" {
+				t.Fatalf("GetBounded = %q, %v; want stored", got, err)
+			}
+			got[0] = 'X'
+		})
+	}
+	got, err := objects.GetBounded(t.Context(), "key", 6)
+	if err != nil || string(got) != "stored" {
+		t.Fatalf("caller mutated stored bytes: %q, %v", got, err)
+	}
+	if got, err := objects.GetBounded(t.Context(), "absent", 6); got != nil || !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("absent GetBounded = %q, %v", got, err)
+	}
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if got, err := objects.GetBounded(cancelled, "key", 6); got != nil || !errors.Is(err, syscall.EINTR) {
+		t.Fatalf("cancelled GetBounded = %q, %v", got, err)
+	}
+}
 
 func TestContract(t *testing.T) {
 	objectstoretest.Run(t, func(*testing.T) objectstore.Objects {

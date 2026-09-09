@@ -46,4 +46,4 @@ schema 准备继续使用原来的一次事务。根 package 只向它传递启�
 
 目录树反映了迁移、状态、日志与原生证据的责任，修改者可以沿单向依赖找到各自的实现和局部测试。代价是公开值与内部值之间的显式转换、指针转发，以及验证时必须覆盖完整子树；只运行根 package 不再代表验证整份 SQLite 实现。
 
-包内统计揭示的未达标用例需要在各自的包补足，不能由 integration 的成功或跨包 profile 抵消；已测得的 SQLite 缺口见[包内覆盖提案](../../proposed/testing/2026-09-09-sqlite-package-local-coverage.md)。这项结构边界依赖两个约束：原子发布和关闭继续由原来的 coordinator 组织，integration 始终保持 test-only。未来若需要改变公开类型、schema、取消或资源预算，应作为相应行为决定处理，不能藏在目录重排里。现有持久化、lease 和文件句柄决定继续有效；完整组件归属见[SQLite 内部设计](../../../../docs/design/server/sqlite-modules.md)。
+各组件的局部测试按其生产职责直接断言，共用契约执行器也在自身测试二进制中验证；具体取舍和分包证据由[包内补测决定](../testing/2026-09-09-sqlite-package-local-coverage.md)拥有，integration 的成功不抵消其它包的覆盖率。这项结构边界依赖两个约束：原子发布和关闭继续由原来的 coordinator 组织，integration 始终保持 test-only。未来若需要改变公开类型、schema、取消或资源预算，应作为相应行为决定处理，不能藏在目录重排里。现有持久化、lease 和文件句柄决定继续有效；完整组件归属见[SQLite 内部设计](../../../../docs/design/server/sqlite-modules.md)。

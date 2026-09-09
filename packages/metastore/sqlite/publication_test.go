@@ -47,6 +47,9 @@ func TestSQLitePublicationDistinguishesPreparationFailureFromUncertainUnwind(t *
 	for _, failedUnwind := range []bool{false, true} {
 		t.Run(fmt.Sprintf("unwind failed %t", failedUnwind), func(t *testing.T) {
 			f := newPublicationFixture(t)
+			if err := f.store.CheckPublicationAccounting(); err != nil {
+				t.Fatalf("native accounting capability: %v", err)
+			}
 			f.put(t, t.Context(), "file", 3)
 			before := f.node(t, "file")
 			object := f.stage(t, t.Context(), "file", 7)

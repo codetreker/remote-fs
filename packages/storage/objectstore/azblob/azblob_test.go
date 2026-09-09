@@ -5,7 +5,9 @@ import (
 	"crypto/md5"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -117,6 +119,108 @@ func TestContract(t *testing.T) {
 	objectstoretest.Run(t, func(t *testing.T) objectstore.Objects {
 		return objectsUnder(t)
 	})
+}
+
+func TestGetBoundedAtObjectLength(t *testing.T) {
+	objects := objectsUnder(t)
+	if _, err := objects.Put(t.Context(), "bounded", []byte("stored")); err != nil {
+		t.Fatal(err)
+	}
+	for _, limit := range []int64{5, 6, 7} {
+		got, err := objects.GetBounded(t.Context(), "bounded", limit)
+		if limit < 6 {
+			if got != nil || !errors.Is(err, syscall.EFBIG) {
+				t.Fatalf("GetBounded(%d) = %q, %v; want nil, EFBIG", limit, got, err)
+			}
+		} else if err != nil || string(got) != "stored" {
+			t.Fatalf("GetBounded(%d) = %q, %v; want stored", limit, got, err)
+		}
+	}
+}
+
+func TestGetBoundedValidatesResponseFraming(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		length    string
+		body      string
+		limit     int64
+		readErr   error
+		want      string
+		wantErr   syscall.Errno
+		wantRead  int
+		wantCalls int
+	}{
+		{name: "negative_limit", limit: -1, wantErr: syscall.EINVAL},
+		{name: "zero_limit", limit: 0, wantErr: syscall.EINVAL},
+		{name: "empty", length: "0", limit: 1, wantCalls: 1},
+		{name: "exact_limit", length: "3", body: "abc", limit: 3, want: "abc", wantRead: 3, wantCalls: 1},
+		{name: "below_limit", length: "3", body: "abc", limit: 4, want: "abc", wantRead: 3, wantCalls: 1},
+		{name: "missing_length", body: "abc", limit: 3, wantErr: syscall.EIO, wantCalls: 1},
+		{name: "declared_oversize", length: "4", body: "abcd", limit: 3, wantErr: syscall.EFBIG, wantCalls: 1},
+		{name: "truncated", length: "3", body: "ab", limit: 4, wantErr: syscall.EIO, wantRead: 2, wantCalls: 1},
+		{name: "excess_body", length: "3", body: "abcdef", limit: 3, wantErr: syscall.EIO, wantRead: 4, wantCalls: 1},
+		{name: "short_length_header", length: "2", body: "abc", limit: 4, wantErr: syscall.EIO, wantRead: 3, wantCalls: 1},
+		{name: "body_failure", length: "3", body: "ab", limit: 4, readErr: io.ErrUnexpectedEOF, wantErr: syscall.EIO, wantRead: 2, wantCalls: 1},
+		{name: "boundary_probe_failure", length: "3", body: "abc", limit: 3, readErr: io.ErrUnexpectedEOF, wantErr: syscall.EIO, wantRead: 3, wantCalls: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := &boundedResponseBody{reader: strings.NewReader(test.body), terminal: test.readErr}
+			calls := 0
+			client, err := container.NewClientWithNoCredential("https://objects.example/container", &container.ClientOptions{
+				ClientOptions: azcore.ClientOptions{Transport: boundedTransport(func(req *http.Request) (*http.Response, error) {
+					calls++
+					if req.Method != http.MethodGet || req.URL.Path != "/container/prefix/key" {
+						t.Fatalf("download request = %s %s", req.Method, req.URL.Path)
+					}
+					header := make(http.Header)
+					if test.length != "" {
+						header.Set("Content-Length", test.length)
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: header, Body: body, Request: req}, nil
+				})},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			objects := &Objects{container: client, prefix: "prefix/"}
+			got, err := objects.GetBounded(t.Context(), "key", test.limit)
+			if test.wantErr != 0 {
+				if got != nil || !errors.Is(err, test.wantErr) {
+					t.Fatalf("GetBounded = %q, %v; want nil, %v", got, err, test.wantErr)
+				}
+			} else if err != nil || string(got) != test.want {
+				t.Fatalf("GetBounded = %q, %v; want %q", got, err, test.want)
+			}
+			if calls != test.wantCalls || body.read != test.wantRead || body.closed != (calls > 0) {
+				t.Fatalf("response lifecycle: calls=%d read=%d closed=%v; want %d, %d, %v", calls, body.read, body.closed, test.wantCalls, test.wantRead, test.wantCalls > 0)
+			}
+		})
+	}
+}
+
+type boundedTransport func(*http.Request) (*http.Response, error)
+
+func (f boundedTransport) Do(req *http.Request) (*http.Response, error) { return f(req) }
+
+type boundedResponseBody struct {
+	reader   *strings.Reader
+	terminal error
+	read     int
+	closed   bool
+}
+
+func (b *boundedResponseBody) Read(p []byte) (int, error) {
+	n, err := b.reader.Read(p)
+	b.read += n
+	if errors.Is(err, io.EOF) && b.terminal != nil {
+		return n, b.terminal
+	}
+	return n, err
+}
+
+func (b *boundedResponseBody) Close() error {
+	b.closed = true
+	return nil
 }
 
 // The digest is the service's Content-MD5 for the bytes it stored. Comparing it against the

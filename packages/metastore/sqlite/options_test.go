@@ -160,3 +160,23 @@ func TestReaderConnectionOptionsAreBoundedAndValidatedBeforeOpening(t *testing.T
 		}
 	}
 }
+
+func TestObjectLimitValidationKeepsFiniteBoundsAndDefaults(t *testing.T) {
+	for _, limits := range []ObjectLimits{{}, {MaxPendingObjects: 1, MaxPendingBytes: 1}, {MaxPendingObjects: math.MaxInt64 - 1, MaxPendingBytes: math.MaxInt64 - 1}} {
+		if err := limits.Validate(); err != nil {
+			t.Fatalf("valid limits %+v: %v", limits, err)
+		}
+		effective, err := limits.Effective()
+		if err != nil || effective.MaxPendingObjects <= 0 || effective.MaxPendingBytes <= 0 {
+			t.Fatalf("effective limits %+v: %+v, %v", limits, effective, err)
+		}
+	}
+	for _, limits := range []ObjectLimits{{MaxPendingObjects: -1}, {MaxPendingBytes: -1}, {MaxPendingObjects: math.MaxInt64}, {MaxPendingBytes: math.MaxInt64}} {
+		if err := limits.Validate(); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("invalid limits %+v: %v", limits, err)
+		}
+	}
+	if effective, err := (ObjectLimits{}).Effective(); err != nil || effective != DefaultObjectLimits() {
+		t.Fatalf("zero limits = %+v, %v", effective, err)
+	}
+}

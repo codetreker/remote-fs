@@ -43,4 +43,4 @@ SQL lease recovery 与 `LeaseRecovery` 留在根 package，原生 evidence I/O �
 
 根 `snapshot_test.go` 直接检查生产 snapshot query；`internal/dbstate/identity_test.go` 检查身份高水位的实际 SQL。模块边界不提供仅为测试导出的生产接口。
 
-SQLite 验证递归执行 `./packages/metastore/sqlite/...`。覆盖率使用 Go 默认的包内统计：每个生产包只由它自己的测试二进制计入覆盖，根包或 integration 对其它包的调用不为被调用包增加覆盖率。`internal/integration` 的测试继续运行，但仅省略没有生产语句的汇总行；该子树不放生产代码或生产子 package。命令与阈值由[测试策略](../../testing.md)拥有，已测得的包内测试缺口由[SQLite 覆盖提案](../../../.agents/notes/proposed/testing/2026-09-09-sqlite-package-local-coverage.md)记录。
+SQLite 验证递归执行 `./packages/metastore/sqlite/...`。覆盖率使用 Go 默认的包内统计：每个生产包只由它自己的测试二进制计入覆盖，根包或 integration 对其它包的调用不为被调用包增加覆盖率。`internal/integration` 的测试继续运行，但仅省略没有生产语句的汇总行；该子树不放生产代码或生产子 package。命令与阈值由[测试策略](../../testing.md)拥有，各组件的局部断言与共用契约执行器的自身测试见[包内补测决定](../../../.agents/notes/implemented/testing/2026-09-09-sqlite-package-local-coverage.md)。分包验证与全仓库 CI 分别裁定，不能相互代替。

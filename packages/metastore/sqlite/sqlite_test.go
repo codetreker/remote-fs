@@ -787,3 +787,73 @@ func TestSQLiteMutationRollbackDistinguishesFinalizationFromFailure(t *testing.T
 		})
 	}
 }
+
+func TestBoundOpenersPreserveIdentityAndEnforceConfiguredBacklog(t *testing.T) {
+	for _, api := range []string{"default", "object limits", "options"} {
+		t.Run(api, func(t *testing.T) {
+			path := t.TempDir() + "/bound.db"
+			openBound := func(identity string) (*Store, error) {
+				switch api {
+				case "default":
+					return OpenBound(t.Context(), path, "workspace", identity, 100, DefaultWindow())
+				case "object limits":
+					return OpenBoundWithObjectLimits(t.Context(), path, "workspace", identity, 100, DefaultWindow(), ObjectLimits{MaxPendingObjects: 1, MaxPendingBytes: 8})
+				default:
+					options := DefaultOptions()
+					options.ObjectLimits = ObjectLimits{MaxPendingObjects: 1, MaxPendingBytes: 8}
+					options.MaxReaderConnections = 1
+					return OpenBoundWithOptions(t.Context(), path, "workspace", identity, 100, options)
+				}
+			}
+			if s, err := openBound(""); s != nil || !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("empty identity = %v, %v", s, err)
+			}
+			s, err := openBound("objects-one")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if s != nil {
+					if err := s.Close(); err != nil {
+						t.Error(err)
+					}
+				}
+			})
+			if err := s.Create(t.Context(), "kept"); err != nil {
+				t.Fatal(err)
+			}
+			before, err := s.Stat(t.Context(), "kept")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if api != "default" {
+				key, err := s.Reserve(t.Context(), "kept", 8)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := s.Reserve(t.Context(), "kept", 1); !errors.Is(err, syscall.EAGAIN) {
+					t.Fatalf("full backlog = %v", err)
+				}
+				if err := s.Abandon(t.Context(), key); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if other, err := openBound("objects-two"); other != nil || !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("different backing store = %v, %v", other, err)
+			}
+			if other, err := Open(t.Context(), path, "workspace", 100, DefaultWindow()); other != nil || !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("unbound bypass = %v, %v", other, err)
+			}
+			s, err = openBound("objects-one")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after, err := s.Stat(t.Context(), "kept"); err != nil || after != before {
+				t.Fatalf("reopened node = %+v, %v; want %+v", after, err, before)
+			}
+		})
+	}
+}

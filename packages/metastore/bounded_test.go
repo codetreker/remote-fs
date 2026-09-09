@@ -184,3 +184,140 @@ func TestReservationsDoNotRetainZeroLengthViewsOfLargeBackingStorage(t *testing.
 		t.Fatalf("row reserve: fits=%v err=%v", fits, err)
 	}
 }
+
+func TestFailedPagesDiscardCommittedAndPendingResults(t *testing.T) {
+	failure := errors.New("producer read failed")
+	replacement := errors.New("cleanup failed")
+	for _, pending := range []bool{false, true} {
+		changes, err := metastore.NewChangeResult(10, 0, func(int, metastore.Change, metastore.ChangePayloadLengths) (int64, error) { return 1, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		change, _, err := changes.Reserve(metastore.Change{}, metastore.ChangePayloadLengths{Name: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !pending {
+			if err := change.Commit([]byte("x"), nil, ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := changes.Fail(nil); err != nil {
+			t.Fatal(err)
+		}
+		if changes.Fail(failure) != failure || changes.Fail(replacement) != failure {
+			t.Fatal("change page lost original failure")
+		}
+		if got, err := changes.Changes(); got != nil || err != failure {
+			t.Fatalf("failed changes = %v, %v", got, err)
+		}
+		if got, fits, err := changes.Reserve(metastore.Change{}, metastore.ChangePayloadLengths{}); got != nil || fits || err != failure {
+			t.Fatalf("failed reserve = %v, %v, %v", got, fits, err)
+		}
+		if pending && change.Commit([]byte("x"), nil, "") != failure {
+			t.Fatal("pending change survived failure")
+		}
+
+		rows, err := metastore.NewRowResult(10, 0, func(int, metastore.Row, metastore.RowPayloadLengths) (int64, error) { return 1, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		row, _, err := rows.Reserve(metastore.Row{}, metastore.RowPayloadLengths{Name: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !pending {
+			if err := row.Commit([]byte("x"), ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := rows.Fail(nil); err != nil {
+			t.Fatal(err)
+		}
+		if rows.Fail(failure) != failure || rows.Fail(replacement) != failure {
+			t.Fatal("row page lost original failure")
+		}
+		if got, err := rows.Rows(); got != nil || err != failure {
+			t.Fatalf("failed rows = %v, %v", got, err)
+		}
+		if got, fits, err := rows.Reserve(metastore.Row{}, metastore.RowPayloadLengths{}); got != nil || fits || err != failure {
+			t.Fatalf("failed reserve = %v, %v, %v", got, fits, err)
+		}
+		if pending && row.Commit([]byte("x"), "") != failure {
+			t.Fatal("pending row survived failure")
+		}
+	}
+	var changes *metastore.ChangeResult
+	var rows *metastore.RowResult
+	if changes.Fail(failure) != failure || rows.Fail(failure) != failure {
+		t.Fatal("nil result lost producer failure")
+	}
+}
+
+func TestPageConstructorsRejectInvalidBoundsAndMissingCharges(t *testing.T) {
+	for _, tc := range []struct {
+		max, fixed int64
+		want       error
+	}{{-1, 0, syscall.EINVAL}, {1, -1, syscall.EFBIG}, {1, 2, syscall.EFBIG}} {
+		if _, err := metastore.NewChangeResult(tc.max, tc.fixed, func(int, metastore.Change, metastore.ChangePayloadLengths) (int64, error) { return 0, nil }); !errors.Is(err, tc.want) {
+			t.Errorf("change constructor = %v; want %v", err, tc.want)
+		}
+		if _, err := metastore.NewRowResult(tc.max, tc.fixed, func(int, metastore.Row, metastore.RowPayloadLengths) (int64, error) { return 0, nil }); !errors.Is(err, tc.want) {
+			t.Errorf("row constructor = %v; want %v", err, tc.want)
+		}
+	}
+	if _, err := metastore.NewChangeResult(1, 0, nil); !errors.Is(err, syscall.EINVAL) {
+		t.Fatal(err)
+	}
+	if _, err := metastore.NewRowResult(1, 0, nil); !errors.Is(err, syscall.EINVAL) {
+		t.Fatal(err)
+	}
+}
+
+func TestRowPageBoundsAndPayloadMismatch(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		second int64
+		want   error
+	}{{"next page", 2, nil}, {"oversized", 4, syscall.EFBIG}, {"negative length", -1, syscall.EIO}} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := metastore.NewRowResult(4, 1, func(_ int, _ metastore.Row, l metastore.RowPayloadLengths) (int64, error) { return l.Name, nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			first, fits, err := result.Reserve(metastore.Row{}, metastore.RowPayloadLengths{Name: 3})
+			if err != nil || !fits {
+				t.Fatalf("first reserve = %v, %v", fits, err)
+			}
+			if err := first.Commit([]byte("one"), ""); err != nil {
+				t.Fatal(err)
+			}
+			next, fits, err := result.Reserve(metastore.Row{}, metastore.RowPayloadLengths{Name: tc.second})
+			if next != nil || fits || !errors.Is(err, tc.want) {
+				t.Fatalf("next reserve = %v, %v, %v", next, fits, err)
+			}
+			rows, err := result.Rows()
+			if tc.want == nil {
+				if err != nil || len(rows) != 1 || string(rows[0].Name) != "one" {
+					t.Fatalf("page = %v, %v", rows, err)
+				}
+			} else if rows != nil || !errors.Is(err, tc.want) {
+				t.Fatalf("failed page = %v, %v", rows, err)
+			}
+		})
+	}
+	result, err := metastore.NewRowResult(4, 0, func(int, metastore.Row, metastore.RowPayloadLengths) (int64, error) { return 1, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation, _, err := result.Reserve(metastore.Row{}, metastore.RowPayloadLengths{Name: 1, Content: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reservation.Commit([]byte("too long"), "k"); !errors.Is(err, syscall.EIO) {
+		t.Fatal(err)
+	}
+	if rows, err := result.Rows(); rows != nil || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("mismatched payload exposed %v, %v", rows, err)
+	}
+}

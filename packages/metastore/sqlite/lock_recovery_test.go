@@ -371,3 +371,56 @@ func assertNoLeaseAuthority(t *testing.T, store *Store) {
 		t.Fatalf("rejected configuration persisted %d lease recovery records", rows)
 	}
 }
+
+func TestBoundDurableLeaseOpenPreservesExclusiveOwnershipAndEvidence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "durable-leases.db")
+	owner, err := nativelease.AcquireDatabase(path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := owner.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	options := DefaultOptions()
+	options.leaseOwner = owner
+	witness := &checkpointStateWitness{}
+	s, err := OpenBoundDurableLeaseWithOptions(t.Context(), path, "workspace", "objects", 0, options, CreateNamespaceIfMissing, DurableStartup{}, witness)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := s.Abort(); err != nil {
+			t.Error(err)
+		}
+	})
+	anchor := openNativeTestAnchor(t, s, owner)
+	if err := s.ConfigureLeaseRecovery(t.Context(), LeaseRecoveryConfig{Witness: anchor, RecoveryStart: owner.Acquired(), StateID: anchor.StateID(), Initialize: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := anchor.Complete(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnableLocks(t.Context(), locking.DefaultOptions()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Create(t.Context(), "acknowledged"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RaiseMaxLease(t.Context(), time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.MaxLease(t.Context()); err != nil || got != time.Second {
+		t.Fatalf("durable lease = %v, %v", got, err)
+	}
+	if state, present, err := anchor.Load(); err != nil || !present || state.MaxLease != time.Second {
+		t.Fatalf("durable lease witness = %+v, %v, %v", state, present, err)
+	}
+	if raw, err := OpenBound(t.Context(), path, "workspace", "objects", 0, DefaultWindow()); raw != nil || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("shared opener beside durable lease owner = %v, %v", raw, err)
+	}
+	if got, err := InspectDurableState(t.Context(), path); err != nil || got != witness.accepted {
+		t.Fatalf("witnessed state = %+v, %v; accepted %+v", got, err, witness.accepted)
+	}
+}
