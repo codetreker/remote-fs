@@ -16,6 +16,8 @@
 
 普通对拍中的六处时间设置调用使用 [`comparisonChtimes`](../packages/fuse/fuse_test.go)：每处 `os.Chtimes` 的总尝试次数至多八次，仅在上一次返回 `EINTR` 时重做完全相同的路径、绝对 atime 与 mtime，包括明确省略某个时间的参数。挂载点和普通目录使用同一规则，只重试这一次调用；其它错误立即返回，八次仍中断则保留最后的 `EINTR` 并使对拍失败。这里比较最终的 atime / mtime，ctime 不在对拍结果中。专门验证中断的真实信号用例继续断言第一次系统调用的结果，不使用这个辅助函数。
 
+对拍失败保留双方原错误的类型与文本。模式修改复合步骤先 WriteFile 再 Chmod，失败后才用独立五秒 context 查询 backing 属性及至多 32 字节内容；这些是失败后的额外观察，不重试原操作、不改变原来的失败判定。仍未解释的 EIO 由[独立调查](../.agents/notes/proposed/testing/2026-09-09-trace-unexplained-fuse-eio.md)记录，不能从步骤名称或未复现的批次推断原因。
+
 ## CI 执行预算
 
 checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race -count=1 -timeout 10m` 执行，每个包测试二进制的累计预算为十分钟。这是整包执行的 watchdog，单项 deadline 与行为断言各自成立。严格的 skip、无测试与缺失 verdict 检查继续执行；串行副本可见性验收仍使用三分钟进程预算和一秒可见性判据，覆盖率门禁与包划分保持原义。预算依据、较晚发现整包挂起的代价及重新调查的条件见[执行预算决定](../.agents/notes/implemented/process/2026-09-08-budget-ci-race-test-execution.md)。
@@ -208,7 +210,7 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 真实 `Replica` 用例覆盖 `Apply` 与 `Reseed` 等门取消、等待 commit gate 时释放外层名额，以及 `Stat`、`List`、`ListBounded` 在 reseed 后排队时的取消；失败的 `ListResult` 不能暴露已保留前缀。SQL 读取名额另验证与 reader pool 容量一致、名额耗尽时调用不进入阶段、交接后取消归还名额，以及 `Position` 与写者不消耗 SQL 读取名额。完整、回滚、无效 row 与提交失败的 reseed 都同时观察树和 `Position`，并验证重复 `Close`；读者批次还必须在多个真实 `Apply` 的积压之间得到执行机会。取消用例保留现有错误分类与 context 原因。
 
-压力与可见性使用不同的时间判据。[SQLite 压力用例](../packages/metastore/sqlite/replica_test.go)先占满现有 reader pool，再启动 128 个公开 `List` 调用。用例在门的互斥保护下确认只有与 pool 容量相等的读者持有共享访问，其余调用仍在阶段外等待 SQL 名额；确认 `Apply` 已登记等待后才释放 reader pool。4096 文件的读取循环保持运行，直到 `Apply` 成功；race detector 下给已获准的扫描留出 30 秒死锁检测上限，这个上限不代表复制延迟。
+压力与可见性使用不同的时间判据。[SQLite 压力用例](../packages/metastore/sqlite/replica_test.go)先占满现有 reader pool，再启动 128 个公开 `List` 调用。用例在门的互斥保护下确认只有与 pool 容量相等的读者持有共享访问，其余调用仍在阶段外等待 SQL 名额；确认 `Apply` 已登记等待后才释放 reader pool。4096 文件的读取循环保持到写者结果返回，随后停止并取消本用例拥有的读者 context，join 全部读者并检查门空闲、读取 permit 为零。只有停止标志、私有取消原因、错误链中的 `context.Canceled` 和 `EINTR` 分类同时成立，才忽略预期退出；其它错误仍失败。30 秒写者截止时间、Applied、Stat 模式与 Position 断言保持，不能提前撤掉负载。结果后的清理不属于写者延迟，局部测量见[减少无用测试工作](../.agents/notes/implemented/testing/2026-09-09-reduce-sqlite-test-work.md)；该死锁上限不代表复制延迟。
 
 [真实 HTTP/SSE 全负载可见性用例](../packages/storage/replicated/replica_acceptance_test.go)使用 4096 文件与 128 个持续列目录的读者，以一秒为独立写者提交后另一客户端观察到新元数据的上限。用例先观察每个读者都成功完成列目录，再提交变更，并断言计时窗口内列目录继续推进；调用进入某个回调不构成负载成立的证据。
 
@@ -290,7 +292,7 @@ SQLite 的包内直接用例按各模块持有的边界核对结果：
 
 当前 schema 的 namespace 与 detached 完整性拒绝矩阵各自建立一次健康种子，种子仍由真实 Open 和公开 mutation 产生。全部 Store 和 raw handle 成功关闭、WAL TRUNCATE checkpoint 的 busy/frames/checkpointed 均为零之后，才保存完整主库字节和 fixture 元数据。每例写入新的私有 `0600` 文件，持有独立 inode、连接与可变状态，再执行原来的 detach、损坏及 Open/ObjectStatus 顺序。
 
-复制机制同时验证健康与隔离：一份副本的公开写入可读，另一份副本通过 Open/ObjectStatus 且看不到该写入；顶层 cleanup 核对种子字节未变。种子不跨顶层测试共享，也不保留共享活句柄。迁移、WAL、恢复、lease、文件身份和跨进程用例保持原有准备路径；不能复制掉它们要验证的状态形成过程。选择与局部匹配测量见[减少 SQLite 测试准备](../.agents/notes/implemented/testing/2026-09-09-reduce-sqlite-test-preparation.md)。
+复制机制同时验证健康与隔离：一份副本的公开写入可读，另一份副本通过 Open/ObjectStatus 且看不到该写入；顶层 cleanup 核对种子字节未变。种子不跨顶层测试共享，也不保留共享活句柄。迁移、WAL、恢复、lease、文件身份和跨进程用例保持原有准备路径；不能复制掉它们要验证的状态形成过程。选择与局部匹配测量见[减少无用 SQLite 测试工作](../.agents/notes/implemented/testing/2026-09-09-reduce-sqlite-test-work.md)。
 
 #### 迁移与完整性断言
 

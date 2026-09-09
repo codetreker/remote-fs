@@ -152,15 +152,23 @@ type step struct {
 // what the two trees look like afterwards. Nothing here states what the answer should
 // be: the plain directory is the answer.
 func TestMountBehavesLikeAPlainDirectory(t *testing.T) {
-	mountpoint, plain, _ := mountedPair(t)
+	mountpoint, plain, backing := mountedPair(t)
 
 	for _, s := range differentialSteps {
 		gotMount, errMount := s.run(mountpoint)
 		gotPlain, errPlain := s.run(plain)
 
 		if describeError(errMount) != describeError(errPlain) {
-			t.Fatalf("%s: the mount failed with %s, the plain directory with %s",
-				s.name, describeError(errMount), describeError(errPlain))
+			if s.name == "change a file's mode" {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				attr, attrErr := backing.Stat(ctx, "attr.txt")
+				content, readErr := backing.(storage.BoundedStorage).ReadBounded(ctx, "attr.txt", 32)
+				cancel()
+				t.Logf("backing attr.txt after the failed mode step: attr=%+v (%v), content=%q (%v)",
+					attr, attrErr, content, readErr)
+			}
+			t.Fatalf("%s: the mount failed with %s, the plain directory with %s\nmount error: %T: %v\nplain error: %T: %v",
+				s.name, describeError(errMount), describeError(errPlain), errMount, errMount, errPlain, errPlain)
 		}
 		if gotMount != gotPlain {
 			t.Fatalf("%s: the mount observed %s, the plain directory observed %s",

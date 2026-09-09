@@ -557,6 +557,7 @@ func TestReplicaPositionAndWritersDoNotUseSQLReadPermits(t *testing.T) {
 }
 
 func TestReplicaWriterProgressUnderContinuousListings(t *testing.T) {
+	seedStarted := time.Now()
 	replica, err := OpenReplica(t.Context(), filepath.Join(t.TempDir(), "busy.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -585,9 +586,16 @@ func TestReplicaWriterProgressUnderContinuousListings(t *testing.T) {
 	if err := seeding.Complete(t.Context(), 1); err != nil {
 		t.Fatal(err)
 	}
+	seedElapsed := time.Since(seedStarted)
 
+	readerContext, cancelReaders := context.WithCancelCause(t.Context())
+	readerStop := errors.New("reader workload stopped")
 	var stopped atomic.Bool
-	stopReaders := func() { stopped.Store(true) }
+	stopReaders := func() {
+		stopped.Store(true)
+		cancelReaders(readerStop)
+	}
+	defer stopReaders()
 	var group sync.WaitGroup
 	var completed atomic.Int64
 	failures := make(chan error, 128)
@@ -613,11 +621,15 @@ func TestReplicaWriterProgressUnderContinuousListings(t *testing.T) {
 	}
 	waiters := make([]*replicaWaitContext, 128)
 	for i := range waiters {
-		waiters[i] = observeReplicaWait(t.Context())
+		waiters[i] = observeReplicaWait(readerContext)
 		group.Go(func() {
 			for !stopped.Load() {
 				children, err := replica.List(waiters[i], "")
 				if err != nil {
+					if stopped.Load() && context.Cause(readerContext) == readerStop &&
+						errors.Is(err, context.Canceled) && storage.ErrnoOf(err) == syscall.EINTR {
+						return
+					}
 					failures <- err
 					return
 				}
@@ -630,8 +642,8 @@ func TestReplicaWriterProgressUnderContinuousListings(t *testing.T) {
 		})
 	}
 	defer func() {
-		releaseReaders()
 		stopReaders()
+		releaseReaders()
 		group.Wait()
 	}()
 	for _, waiter := range waiters {
@@ -674,10 +686,16 @@ func TestReplicaWriterProgressUnderContinuousListings(t *testing.T) {
 	releaseReaders()
 	outcome := <-written
 	elapsed := time.Since(started)
+	shutdownStarted := time.Now()
 	applied, applyErr := outcome.applied, outcome.err
 	cancel()
 	stopReaders()
 	group.Wait()
+	shutdownElapsed := time.Since(shutdownStarted)
+	requireReplicaGateIdle(t, &replica.admission)
+	if permits := len(replica.readSlots); permits != 0 {
+		t.Fatalf("reader shutdown retained %d permits", permits)
+	}
 	close(failures)
 	for err := range failures {
 		t.Errorf("concurrent listing failed: %v", err)
@@ -689,6 +707,7 @@ func TestReplicaWriterProgressUnderContinuousListings(t *testing.T) {
 	if err != nil || got.Mode != root.Mode || replica.Position() != 2 {
 		t.Fatalf("applied change was not visible: root=%+v err=%v position=%d", got, err, replica.Position())
 	}
+	t.Logf("Seeding completed in %v; reader shutdown after Apply took %v", seedElapsed, shutdownElapsed)
 	t.Logf("Apply completed in %v while 128 readers completed %d listings of 4096 files", elapsed, completed.Load())
 }
 
