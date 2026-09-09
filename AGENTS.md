@@ -112,19 +112,31 @@ original one-second visibility case and deterministic contention/cancellation te
 remain in the default race suite. [The testing strategy](docs/testing.md#元数据副本的读写交接)
 defines the separate timing and concurrency checks.
 
-**The coverage gate.** `-coverpkg` is not optional here: the contract suite is one package
-executed by two others, so per-package measurement reports it as 0% and understates the
-module by more than thirty points.
+**The coverage gate.** Each package is measured only by its own Go test binary,
+including external tests in that package's directory. Executions from another package's
+test binary, including `internal/integration`, do not credit its production coverage.
+Use Go's default package-local instrumentation. The thresholds remain 70% per package,
+50% per function, and 85% overall.
 
 ```
-GOFLAGS="-coverpkg=$(go list -m)/... -count=1" go-cov --ci --skip-result-packages cmd
+GOFLAGS="-count=1" go-cov --ci --skip-result-packages cmd,packages/metastore/sqlite/internal/integration
 ```
 
 `--ci` is what turns a threshold breach into a non-zero exit; without it `go-cov` prints
-`CRITICAL` and exits 0. `--skip-result-packages cmd` drops the summary row for a package
-that has tests but no statements of its own; its failures still fail the run. For one
-boundary in isolation, `go test -coverpkg=<import paths> -coverprofile=/tmp/c.out` followed
-by `go tool cover -func=/tmp/c.out` still answers faster.
+`CRITICAL` and exits 0. `--skip-result-packages cmd,packages/metastore/sqlite/internal/integration`
+omits only the coverage summary rows for matching package paths. Their tests still run,
+and their failures still fail the run. The integration package has no production
+statements of its own; its executions do not credit other packages. The matcher uses
+package-path substrings, so `packages/metastore/sqlite/internal/integration` and its
+descendants must remain test-only; production packages cannot be placed below that path.
+
+To measure one package in isolation with the same attribution rule:
+
+```
+mkdir -p .tmp
+GOFLAGS="-count=1" go test -coverprofile=.tmp/c.out ./packages/metastore/sqlite
+go tool cover -func=.tmp/c.out
+```
 
 **A check that nothing stayed mounted.** Tests that mount leave the machine dirty when they
 fail badly, and the run that left one behind has usually already reported success. After a

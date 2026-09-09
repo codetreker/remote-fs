@@ -6,12 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/nativelease"
 )
 
 // LeaseEvidence binds a monotonic maximum lease duration to one database. It contains no
@@ -54,38 +53,26 @@ type leaseRecord struct {
 	prepared *LeaseEvidence
 }
 
-func validLeaseID(id string) bool {
-	return len(id) == 32 && strings.Trim(id, "0123456789abcdef") == ""
-}
-
-func (e LeaseEvidence) validate() error {
-	if !validLeaseID(e.DatabaseID) || !validLeaseID(e.StateID) ||
-		e.Generation < 0 || e.MaxLease < 0 {
-		return fmt.Errorf("lease recovery evidence has an invalid identity or counter: %w", syscall.EIO)
-	}
-	return nil
-}
-
 // ConfigureLeaseRecovery validates both independent records before exposing lease control.
 // Prepared raises are completed conservatively. Invalid or missing active evidence fails
 // closed; neither configuration changes nor a fresh process can lower the recorded duration.
 func (s *Store) ConfigureLeaseRecovery(ctx context.Context, config LeaseRecoveryConfig) error {
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
-	if err := s.verifyLeaseOwnership(); err != nil {
+	if err := nativelease.VerifyExclusiveOwnership(s.leaseOwner); err != nil {
 		return err
 	}
 	anchor, ok := config.Witness.(*LeaseAnchor)
 	if !ok || anchor == nil {
 		return fmt.Errorf("lease recovery requires a native anchored witness: %w", syscall.EINVAL)
 	}
-	if err := anchor.verifyDatabaseOwner(s.leaseOwner); err != nil {
+	if err := nativelease.VerifyDatabaseOwner((*nativelease.Anchor)(anchor), s.leaseOwner); err != nil {
 		return err
 	}
 	if config.StateID != anchor.StateID() || config.Initialize != anchor.Initializing() {
 		return fmt.Errorf("lease recovery configuration differs from its durable native intent: %w", syscall.EIO)
 	}
-	config.RecoveryStart = s.leaseOwner.acquired
+	config.RecoveryStart = s.leaseOwner.Acquired()
 	return s.configureLeaseRecoveryLocked(ctx, config)
 }
 
@@ -99,7 +86,7 @@ func (s *Store) configureLeaseRecoveryLocked(ctx context.Context, config LeaseRe
 	if s.closed || s.leaseRecovery != nil {
 		return fmt.Errorf("lease recovery requires an open, unattached namespace: %w", syscall.EINVAL)
 	}
-	if config.Witness == nil || config.RecoveryStart.IsZero() || !validLeaseID(config.StateID) {
+	if config.Witness == nil || config.RecoveryStart.IsZero() || !nativelease.ValidID(config.StateID) {
 		return fmt.Errorf("lease recovery needs native ownership and a bound witness: %w", syscall.EINVAL)
 	}
 	if err := s.coordinator.healthy(); err != nil {
@@ -133,7 +120,7 @@ func (r *LeaseRecovery) open(ctx context.Context, config LeaseRecoveryConfig) er
 			return fmt.Errorf("the database has no lease recovery state: %w", syscall.EIO)
 		}
 		err := r.store.mutate(ctx, func(tx *sql.Tx) error {
-			state, err := readDurableState(ctx, tx)
+			state, err := dbstate.Read(ctx, tx)
 			if err != nil {
 				return err
 			}
@@ -159,7 +146,7 @@ func (r *LeaseRecovery) open(ctx context.Context, config LeaseRecoveryConfig) er
 		}
 		witness = record.accepted
 	}
-	if err := witness.validate(); err != nil {
+	if err := nativelease.ValidateEvidence(nativelease.Evidence(witness)); err != nil {
 		return err
 	}
 	if record.prepared == nil {
@@ -220,10 +207,10 @@ func readLeaseRecord(ctx context.Context, tx *sql.Tx) (leaseRecord, bool, error)
 	if valid != 1 {
 		return leaseRecord{}, false, fmt.Errorf("lease recovery state has invalid storage classes: %w", syscall.EIO)
 	}
-	if err := record.accepted.validate(); err != nil {
+	if err := nativelease.ValidateEvidence(nativelease.Evidence(record.accepted)); err != nil {
 		return leaseRecord{}, false, err
 	}
-	state, err := readDurableState(ctx, tx)
+	state, err := dbstate.Read(ctx, tx)
 	if err != nil {
 		return leaseRecord{}, false, err
 	}
@@ -370,25 +357,6 @@ func validateLeaseOpening(ctx context.Context, db *sql.DB, owned bool) error {
 	}
 	if present {
 		return fmt.Errorf("this namespace requires its native lease recovery owner: %w", syscall.EIO)
-	}
-	return nil
-}
-
-func validateNativeLeaseOpening(database string, owned bool) error {
-	if strings.ContainsAny(database, "%?#\x00") {
-		return fmt.Errorf("the SQLite database must be a native pathname without URI parameters or escapes: %w", syscall.EINVAL)
-	}
-	if owned {
-		return nil
-	}
-	for _, name := range []string{database, filepath.Dir(database)} {
-		_, err := unix.Getxattr(name, leaseBindingAttribute, nil)
-		if err == nil {
-			return fmt.Errorf("the native database requires its lease recovery owner: %w", syscall.EIO)
-		}
-		if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ENODATA) && !errors.Is(err, syscall.ENOTSUP) {
-			return fmt.Errorf("checking native database lease binding: %w", err)
-		}
 	}
 	return nil
 }

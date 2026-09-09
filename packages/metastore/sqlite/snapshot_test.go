@@ -1,16 +1,130 @@
-package sqlite_test
+package sqlite
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
-
-	_ "modernc.org/sqlite"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
-	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
+	"github.com/codetreker/remote-fs/packages/storage"
+	_ "modernc.org/sqlite"
 )
+
+func TestSnapshotAfterAutomaticRollbackReturnsCancellation(t *testing.T) {
+	store, err := Open(t.Context(), t.TempDir()+"/metastore.db", "workspace", 4096, DefaultWindow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("closing store: %v", err)
+		}
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	snap, _, err := store.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	waitForReadRollback(t, store.snapshotRead)
+	result, err := metastore.NewRowResult(1024, 0,
+		func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
+			return 192 + lengths.Name + lengths.Content, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := snap.Next(t.Context(), 1, result); storage.ErrnoOf(err) != syscall.EINTR ||
+		!errors.Is(err, context.Canceled) || !errors.Is(err, sql.ErrTxDone) || errors.Is(err, syscall.EIO) {
+		t.Fatalf("reading automatically rolled back snapshot with a new context = %v, want interruption", err)
+	}
+	if rows, err := result.Rows(); rows != nil || storage.ErrnoOf(err) != syscall.EINTR {
+		t.Fatalf("canceled snapshot exposed rows %v with error %v", rows, err)
+	}
+	if err := snap.Close(); storage.ErrnoOf(err) != syscall.EINTR || errors.Is(err, syscall.EIO) {
+		t.Fatalf("closing automatically rolled back snapshot = %v, want interruption", err)
+	}
+	if err := snap.Close(); err != nil {
+		t.Fatalf("closing snapshot twice: %v", err)
+	}
+}
+
+func TestSnapshotCancellationDoesNotHideIndependentFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	picture := &snapshot{ctx: ctx}
+	fault := errors.New("query failed")
+	for _, cause := range []error{
+		errors.Join(sql.ErrTxDone, fault),
+		errors.Join(fault, sql.ErrTxDone),
+		fmt.Errorf("query: %w", sql.ErrTxDone),
+	} {
+		err := picture.readFailure(t.Context(), cause)
+		if storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, cause) {
+			t.Fatalf("snapshot failure %v = %v, want EIO retaining original failure", cause, err)
+		}
+	}
+	activePicture := &snapshot{ctx: t.Context()}
+	err := activePicture.readFailure(ctx, sql.ErrTxDone)
+	if storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, sql.ErrTxDone) || errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled page hid an unexpectedly completed live transaction: %v", err)
+	}
+}
+
+func TestSnapshotPoolDoesNotBlockGeneralReaderPool(t *testing.T) {
+	store, err := OpenWithOptions(
+		t.Context(), t.TempDir()+"/metastore.db", "workspace", 0, Options{
+			Window:                       DefaultWindow(),
+			MaxReaderConnections:         1,
+			MaxSnapshotReaderConnections: 1,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	picture, _, err := store.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer picture.Close()
+
+	waitContext, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		blocked, _, err := store.Snapshot(waitContext)
+		if blocked != nil {
+			err = errors.Join(err, blocked.Close())
+		}
+		result <- err
+	}()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for store.snapshotRead.Stats().WaitCount == 0 {
+		select {
+		case <-deadline.C:
+			t.Fatal("a second snapshot did not wait for the dedicated snapshot pool")
+		default:
+			runtime.Gosched()
+		}
+	}
+	if _, err := store.Incarnation(t.Context(), 1024); err != nil {
+		t.Fatalf("a saturated snapshot pool blocked a general log read: %v", err)
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceling a snapshot pool waiter returned %v, want context.Canceled", err)
+	}
+}
 
 // A picture pages the tree, and what a page costs is decided entirely by the plan SQLite
 // chooses for one statement. This asserts that plan, both against a database that has been
@@ -33,13 +147,13 @@ import (
 // plans. Asserting only the analysed one would leave the shipped planner unguarded, and it was
 // the statistics-dependence of the alternatives that decided this key in the first place.
 func TestAPictureIsPagedByRangeRatherThanByScanningAndSorting(t *testing.T) {
-	path := database(t)
-	store := open(t, path, "workspace", 0)
+	path := snapshotPlanDatabase(t)
+	store := snapshotPlanOpen(t, path, "workspace", 0)
 
 	// A second namespace in the same database, so the plan is chosen against a table that holds
 	// more than one namespace's entries. That is the arrangement the entry table's key exists
 	// for, and a database holding one namespace would not put the question.
-	other := open(t, path, "elsewhere", 0)
+	other := snapshotPlanOpen(t, path, "elsewhere", 0)
 	for i := range 50 {
 		if err := other.Create(t.Context(), fmt.Sprintf("theirs%d", i)); err != nil {
 			t.Fatal(err)
@@ -49,7 +163,7 @@ func TestAPictureIsPagedByRangeRatherThanByScanningAndSorting(t *testing.T) {
 		}
 	}
 
-	db := raw(t, path)
+	db := snapshotPlanRaw(t, path)
 	// Unanalysed first, because ANALYZE cannot be undone within one database and that is the
 	// order the two worlds exist in: every database starts without statistics, and the shipped
 	// store never gives it any. Each is its own verdict, so neither hides the other's answer.
@@ -90,7 +204,7 @@ func assertPagePlan(t *testing.T, db *sql.DB) {
 
 func assertPagePlanAt(t *testing.T, db *sql.DB, cursor int64) {
 	t.Helper()
-	rows, err := db.Query(`EXPLAIN QUERY PLAN `+sqlite.PageQuery, 1, cursor, []byte{}, 1024)
+	rows, err := db.Query(`EXPLAIN QUERY PLAN `+pageQuery, 1, cursor, []byte{}, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,110 +241,30 @@ func assertPagePlanAt(t *testing.T, db *sql.DB, cursor int64) {
 	}
 }
 
-// The plan above is only worth asserting if the rows it produces are still right, and the
-// entry table's key now carries a namespace that has to agree with the node's. A picture must
-// hold this namespace's tree and nothing of the one beside it.
-func TestAPictureHoldsItsOwnNamespaceOnly(t *testing.T) {
-	path := database(t)
-	store := open(t, path, "workspace", 0)
-	other := open(t, path, "elsewhere", 0)
-
-	for i := range 20 {
-		if err := other.Create(t.Context(), fmt.Sprintf("theirs%d", i)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := store.Mkdir(t.Context(), "d"); err != nil {
-		t.Fatal(err)
-	}
-	for i := range 20 {
-		if err := store.Create(t.Context(), fmt.Sprintf("d/mine%d", i)); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	snap, _, err := store.Snapshot(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer snap.Close()
-
-	held := map[string]bool{}
-	for {
-		page, done, err := readRows(t.Context(), snap, 3)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, row := range page {
-			held[string(row.Name)] = true
-		}
-		if done {
-			break
-		}
-	}
-	// The root, d, and twenty names under it.
-	if len(held) != 22 {
-		t.Fatalf("the picture holds %d names, want the root, d and the twenty under it", len(held))
-	}
-	for name := range held {
-		if strings.HasPrefix(name, "theirs") {
-			t.Fatalf("the picture holds %q, which belongs to the namespace beside it", name)
-		}
-	}
-	if !held["d"] || !held["mine19"] {
-		t.Fatalf("the picture is missing part of its own tree: %v", held)
-	}
+func snapshotPlanDatabase(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "metastore.db")
 }
 
-// Paging must not depend on the page size: a picture read one row at a time reaches exactly
-// the picture read in one page. The cursor is what decides this, and a cursor SQLite declines
-// to use as a range still returns the right rows, so only a comparison catches a mistake here.
-func TestAPictureIsTheSameHoweverItIsPaged(t *testing.T) {
-	store := open(t, database(t), "workspace", 0)
-	if err := store.Mkdir(t.Context(), "d"); err != nil {
-		t.Fatal(err)
+func snapshotPlanOpen(t *testing.T, path, namespace string, allowance int64) *Store {
+	t.Helper()
+	store, err := Open(t.Context(), path, namespace, allowance, DefaultWindow())
+	if err != nil {
+		t.Fatalf("opening %q in %s: %v", namespace, path, err)
 	}
-	for i := range 30 {
-		if err := store.Create(t.Context(), fmt.Sprintf("d/f%d", i)); err != nil {
-			t.Fatal(err)
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("closing the store: %v", err)
 		}
-	}
+	})
+	return store
+}
 
-	read := func(limit int) []metastore.Row {
-		snap, _, err := store.Snapshot(t.Context())
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer snap.Close()
-		var all []metastore.Row
-		for {
-			page, done, err := readRows(t.Context(), snap, limit)
-			if err != nil {
-				t.Fatal(err)
-			}
-			all = append(all, page...)
-			if done {
-				return all
-			}
-		}
+func snapshotPlanRaw(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("opening %s directly: %v", path, err)
 	}
-
-	whole := read(1000)
-	if len(whole) != 32 {
-		t.Fatalf("the picture holds %d rows, want the root, d and the thirty under it", len(whole))
-	}
-	for _, limit := range []int{1, 2, 7, 31} {
-		paged := read(limit)
-		if len(paged) != len(whole) {
-			t.Fatalf("pages of %d reach %d rows, want the %d one page holds", limit, len(paged), len(whole))
-		}
-		for i := range whole {
-			if paged[i].Parent != whole[i].Parent || string(paged[i].Name) != string(whole[i].Name) ||
-				paged[i].Node.ID != whole[i].Node.ID {
-				t.Fatalf("pages of %d differ at row %d: %d/%q/%d against %d/%q/%d",
-					limit, i, paged[i].Parent, paged[i].Name, paged[i].Node.ID,
-					whole[i].Parent, whole[i].Name, whole[i].Node.ID)
-			}
-		}
-	}
+	return db
 }

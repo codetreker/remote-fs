@@ -1,552 +1,756 @@
-package sqlite_test
+package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"io/fs"
-	"path"
+	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
-	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// A copy is exactly as correct as the log it is fed, and nothing behind it revalidates
-// anything: a change applied wrongly, or quietly not applied, stays wrong for as long as the
-// copy exists. These are the tests of that one obligation.
-
-// source is a namespace to be copied, and copy is the copy of it.
-func source(t *testing.T) *sqlite.Store {
+func seededAdmissionReplica(t *testing.T) *Replica {
 	t.Helper()
-
-	store, err := sqlite.Open(t.Context(), path.Join(t.TempDir(), "source.db"), "ws", 0, sqlite.DefaultWindow())
-	if err != nil {
-		t.Fatalf("opening the namespace: %v", err)
-	}
-	t.Cleanup(func() { store.Close() })
-	return store
+	return seedAdmissionReplica(t, func(err error) {
+		if err != nil {
+			t.Errorf("closing replica: %v", err)
+		}
+	})
 }
 
-func copyOf(t *testing.T) *sqlite.Replica {
+func seedAdmissionReplica(t *testing.T, checkClose func(error)) *Replica {
 	t.Helper()
-
-	replica, err := sqlite.OpenReplica(t.Context(), path.Join(t.TempDir(), "replica.db"))
+	replica, err := OpenReplica(t.Context(), filepath.Join(t.TempDir(), "replica.db"))
 	if err != nil {
-		t.Fatalf("opening the copy: %v", err)
+		t.Fatal(err)
 	}
-	t.Cleanup(func() { replica.Close() })
+	t.Cleanup(func() {
+		checkClose(replica.Close())
+	})
+	seeding, err := replica.Reseed(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer seeding.Close()
+	rows := []metastore.Row{
+		{Node: metastore.Node{ID: 10, Mode: fs.ModeDir | 0o755}},
+		{Parent: 10, Name: []byte("file"), Node: metastore.Node{ID: 11, Mode: 0o644, Size: 7}},
+	}
+	if err := seeding.Add(t.Context(), rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := seeding.Complete(t.Context(), 1); err != nil {
+		t.Fatal(err)
+	}
 	return replica
 }
 
-// fill puts one picture of the source into the copy, in pages, the way the transport delivers
-// one.
-func fill(t *testing.T, from *sqlite.Store, into *sqlite.Replica, page int) {
-	t.Helper()
+var replicaWriters = []struct {
+	name string
+	run  func(context.Context, *Replica) error
+}{
+	{"Apply", func(ctx context.Context, replica *Replica) error {
+		_, err := replica.Apply(ctx, metastore.Change{Position: 1})
+		return err
+	}},
+	{"Reseed", func(ctx context.Context, replica *Replica) error {
+		seeding, err := replica.Reseed(ctx)
+		if err != nil {
+			return err
+		}
+		return seeding.Close()
+	}},
+}
 
-	snap, at, err := from.Snapshot(t.Context())
-	if err != nil {
-		t.Fatalf("taking a picture of the namespace: %v", err)
+func TestReplicaWaitingWriterCancellationReopensReaderAdmission(t *testing.T) {
+	for _, writer := range replicaWriters {
+		t.Run(writer.name, func(t *testing.T) {
+			replica := seededAdmissionReplica(t)
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			result, err := storage.NewListResult(1024, 0,
+				func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+					close(entered)
+					<-release
+					return nameBytes + 64, nil
+				})
+			if err != nil {
+				t.Fatal(err)
+			}
+			listed := make(chan error, 1)
+			go func() { listed <- replica.ListBounded(t.Context(), "", result) }()
+			defer func() {
+				close(release)
+				if err := receiveReplica(t, listed); err != nil {
+					t.Errorf("completing the held listing: %v", err)
+				}
+			}()
+			receiveReplica(t, entered)
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			waiting := observeReplicaWait(ctx)
+			written := make(chan error, 1)
+			go func() { written <- writer.run(waiting, replica) }()
+			receiveReplica(t, waiting.entered)
+			readerContext := observeReplicaWait(t.Context())
+			read := make(chan error, 1)
+			go func() { _, err := replica.Stat(readerContext, "file"); read <- err }()
+			receiveReplica(t, readerContext.entered)
+			waitForReplicaReaders(t, &replica.admission, 1)
+			replica.admission.mu.Lock()
+			pending := replica.admission.pendingWriters
+			replica.admission.mu.Unlock()
+			if pending != 1 {
+				t.Fatalf("writer was not registered: %d", pending)
+			}
+			cancel()
+			if err := receiveReplica(t, written); !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled writer returned %v", err)
+			}
+			if err := receiveReplica(t, read); err != nil {
+				t.Fatalf("queued reader was not admitted after writer cancellation: %v", err)
+			}
+			if _, err := replica.Stat(t.Context(), "file"); err != nil {
+				t.Fatalf("new reader could not join the still-active reader: %v", err)
+			}
+			if err := replica.store.coordinator.commit.acquire(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			replica.store.coordinator.commit.release()
+		})
 	}
-	defer snap.Close()
+}
 
-	seeding, err := into.Reseed(t.Context())
+func TestReplicaWriterCancellationAtCommitGateReleasesAdmission(t *testing.T) {
+	for _, writer := range replicaWriters {
+		t.Run(writer.name, func(t *testing.T) {
+			replica := seededAdmissionReplica(t)
+			commit := replica.store.coordinator.commit
+			if err := commit.acquire(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			waiting := observeReplicaWait(ctx)
+			written := make(chan error, 1)
+			go func() { written <- writer.run(waiting, replica) }()
+			receiveReplica(t, waiting.entered)
+			replica.admission.mu.Lock()
+			owned := replica.admission.writerActive
+			replica.admission.mu.Unlock()
+			if !owned {
+				t.Fatal("writer reached commit wait without owning replica admission")
+			}
+			cancel()
+			if err := receiveReplica(t, written); !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled writer returned %v", err)
+			}
+			requireReplicaGateIdle(t, &replica.admission)
+			if len(commit) != 0 {
+				t.Fatal("canceled waiter released a commit grant it did not own")
+			}
+			commit.release()
+			if err := writer.run(t.Context(), replica); err != nil {
+				t.Fatalf("writer could not acquire both gates after cancellation: %v", err)
+			}
+			requireReplicaGateIdle(t, &replica.admission)
+		})
+	}
+}
+
+func TestReplicaReadersCancelBehindSeeding(t *testing.T) {
+	for _, method := range []string{"Stat", "List", "ListBounded"} {
+		t.Run(method, func(t *testing.T) {
+			replica := seededAdmissionReplica(t)
+			seeding, err := replica.Reseed(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer seeding.Close()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			waiting := observeReplicaWait(ctx)
+			result, err := storage.NewListResult(1024, 0,
+				func(_ int, nameBytes int64, _ storage.Attr) (int64, error) { return nameBytes + 64, nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := result.Add(storage.Entry{Name: "prefix"}); err != nil {
+				t.Fatal(err)
+			}
+			read := make(chan error, 1)
+			go func() {
+				var err error
+				switch method {
+				case "Stat":
+					_, err = replica.Stat(waiting, "file")
+				case "List":
+					_, err = replica.List(waiting, "")
+				case "ListBounded":
+					err = replica.ListBounded(waiting, "", result)
+				}
+				read <- err
+			}()
+			receiveReplica(t, waiting.entered)
+			waitForReplicaReaders(t, &replica.admission, 1)
+			cancel()
+			err = receiveReplica(t, read)
+			if len(replica.readSlots) != 0 {
+				t.Fatal("reader canceled at the phase gate retained its SQL permit")
+			}
+			var pathErr *fs.PathError
+			if !errors.Is(err, context.Canceled) || storage.ErrnoOf(err) != syscall.EINTR ||
+				errors.Is(err, syscall.EIO) || !errors.As(err, &pathErr) {
+				t.Fatalf("canceled read lost its path/error chain: %v", err)
+			}
+			wantOp, wantPath := "list", ""
+			if method == "Stat" {
+				wantOp, wantPath = "stat", "file"
+			}
+			if pathErr.Op != wantOp || pathErr.Path != wantPath {
+				t.Fatalf("unexpected path error: %+v", pathErr)
+			}
+			if method == "ListBounded" {
+				if entries, resultErr := result.Entries(); entries != nil || !errors.Is(resultErr, context.Canceled) {
+					t.Fatalf("canceled listing exposed prefix entries=%v err=%v", entries, resultErr)
+				}
+			}
+			if err := seeding.Close(); err != nil {
+				t.Fatal(err)
+			}
+			requireReplicaGateIdle(t, &replica.admission)
+			if _, err := replica.Stat(t.Context(), "file"); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestReplicaSeedingPublishesTreeAndPositionTogether(t *testing.T) {
+	for _, outcome := range []string{"complete", "rollback", "invalid row", "invalid completion"} {
+		t.Run(outcome, func(t *testing.T) {
+			var commitFailure *sqlerr.UncertainCommitError
+			var replica *Replica
+			replica = seedAdmissionReplica(t, func(err error) {
+				if commitFailure == nil {
+					if err != nil {
+						t.Errorf("closing replica: %v", err)
+					}
+					return
+				}
+				if storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, commitFailure) {
+					t.Errorf("closing failed seeding returned %v, want its original COMMIT failure", err)
+				}
+				if again := replica.Close(); again != err {
+					t.Errorf("repeated replica Close returned %v, want the cached result %v", again, err)
+				}
+				if !replica.store.Terminal() || replica.store.write.Stats().OpenConnections != 0 ||
+					replica.store.read.Stats().OpenConnections != 0 || replica.store.snapshotRead.Stats().OpenConnections != 0 {
+					t.Error("replica Close retained SQL pools after reporting the COMMIT failure")
+				}
+			})
+			seeding, err := replica.Reseed(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer seeding.Close()
+			root := metastore.Row{Node: metastore.Node{ID: 20, Mode: fs.ModeDir | 0o700}}
+			if err := seeding.Add(t.Context(), []metastore.Row{root}); err != nil {
+				t.Fatal(err)
+			}
+			readContext := observeReplicaWait(t.Context())
+			type observation struct {
+				children []metastore.Child
+				position metastore.Position
+				err      error
+			}
+			observed := make(chan observation, 1)
+			go func() {
+				children, err := replica.List(readContext, "")
+				observed <- observation{children, replica.Position(), err}
+			}()
+			receiveReplica(t, readContext.entered)
+			position := make(chan metastore.Position, 1)
+			go func() { position <- replica.Position() }()
+			waitForReplicaReaders(t, &replica.admission, 2)
+			select {
+			case at := <-position:
+				t.Fatalf("Position returned %d during an incomplete picture", at)
+			default:
+			}
+
+			switch outcome {
+			case "complete":
+				rows := []metastore.Row{{Parent: 20, Name: []byte("replacement"), Node: metastore.Node{ID: 21, Mode: 0o600, Size: 19}}}
+				if err := seeding.Add(t.Context(), rows); err != nil {
+					t.Fatal(err)
+				}
+				if err := seeding.Complete(t.Context(), 2); err != nil {
+					t.Fatal(err)
+				}
+			case "invalid row":
+				if err := seeding.Add(t.Context(), []metastore.Row{root}); !errors.Is(err, syscall.EIO) {
+					t.Fatalf("duplicate row returned %v", err)
+				}
+			case "invalid completion":
+				rows := []metastore.Row{{Parent: 999, Name: []byte("orphan"), Node: metastore.Node{ID: 21, Mode: 0o600}}}
+				if err := seeding.Add(t.Context(), rows); err != nil {
+					t.Fatal(err)
+				}
+				if err := seeding.Complete(t.Context(), 2); !errors.Is(err, syscall.EIO) || !errors.As(err, &commitFailure) {
+					t.Fatalf("unresolved parent returned %v", err)
+				}
+			}
+			if err := seeding.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := seeding.Close(); err != nil {
+				t.Fatalf("repeated Close: %v", err)
+			}
+			got := receiveReplica(t, observed)
+			at := receiveReplica(t, position)
+			requireReplicaGateIdle(t, &replica.admission)
+			if outcome == "invalid completion" {
+				if !errors.Is(got.err, syscall.EIO) || !errors.Is(got.err, commitFailure) || got.children != nil || at != 1 || got.position != 1 {
+					t.Fatalf("uncertain commit exposed a tree or advanced position: %+v, Position=%d", got, at)
+				}
+				return
+			}
+			wantName, wantSize, wantPosition := "file", int64(7), metastore.Position(1)
+			if outcome == "complete" {
+				wantName, wantSize, wantPosition = "replacement", 19, 2
+			}
+			if got.err != nil || len(got.children) != 1 || string(got.children[0].Name) != wantName || got.children[0].Node.Size != wantSize || got.position != wantPosition || at != wantPosition {
+				t.Fatalf("incoherent tree and position: %+v, Position=%d; want %s size=%d at=%d", got, at, wantName, wantSize, wantPosition)
+			}
+		})
+	}
+}
+
+func waitForReplicaReaders(t *testing.T, gate *replicaGate, count int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		gate.mu.Lock()
+		waiting := gate.waitingReaders
+		gate.mu.Unlock()
+		if waiting == count {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replica has %d waiting readers, want %d", waiting, count)
+		}
+		runtime.Gosched()
+	}
+}
+
+func TestReplicaReadBatchProgressesThroughApplyBacklog(t *testing.T) {
+	replica := seededAdmissionReplica(t)
+	if err := replica.admission.acquireRead(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	const writers = 8
+	written := make(chan error, writers)
+	node := metastore.Node{ID: 11, Mode: 0o644, Size: 19}
+	for range writers {
+		waiting := observeReplicaWait(t.Context())
+		go func() {
+			_, err := replica.Apply(waiting, metastore.Change{Position: 2, Kind: metastore.Modified, Node: &node})
+			written <- err
+		}()
+		receiveReplica(t, waiting.entered)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	result, err := storage.NewListResult(1024, 0,
+		func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+			close(entered)
+			<-release
+			return nameBytes + 64, nil
+		})
 	if err != nil {
-		t.Fatalf("emptying the copy: %v", err)
+		t.Fatal(err)
+	}
+	waiting := observeReplicaWait(t.Context())
+	listed := make(chan error, 1)
+	go func() { listed <- replica.ListBounded(waiting, "", result) }()
+	receiveReplica(t, waiting.entered)
+	waitForReplicaReaders(t, &replica.admission, 1)
+	replica.admission.releaseRead()
+	receiveReplica(t, entered)
+	replica.admission.mu.Lock()
+	pending := replica.admission.pendingWriters
+	activeReaders := replica.admission.activeReaders
+	replica.admission.mu.Unlock()
+	close(release)
+	if err := receiveReplica(t, listed); err != nil {
+		t.Fatal(err)
+	}
+	for range writers {
+		if err := receiveReplica(t, written); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if pending != writers-1 || activeReaders != 1 {
+		t.Fatalf("reader did not run between exclusive grants: pending=%d readers=%d", pending, activeReaders)
+	}
+	entries, err := result.Entries()
+	if err != nil || len(entries) != 1 || entries[0].Attr.Size != 19 {
+		t.Fatalf("reader cohort saw entries=%+v err=%v", entries, err)
+	}
+	requireReplicaGateIdle(t, &replica.admission)
+}
+
+func TestReplicaReadPermitsMatchTheReaderPool(t *testing.T) {
+	replica := seededAdmissionReplica(t)
+	capacity := replica.store.read.Stats().MaxOpenConnections
+	if capacity <= 0 || cap(replica.readSlots) != capacity {
+		t.Fatalf("read permits=%d, reader pool=%d", cap(replica.readSlots), capacity)
+	}
+	if err := replica.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := replica.Stat(t.Context(), "file"); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("reading a closed replica: %v", err)
+	}
+	if len(replica.readSlots) != 0 {
+		t.Fatal("failed read retained its permit after Close")
+	}
+	requireReplicaGateIdle(t, &replica.admission)
+}
+
+func TestReplicaReadersCancelBeforeThePhaseWhenPermitsAreFull(t *testing.T) {
+	for _, method := range []string{"Stat", "List", "ListBounded"} {
+		t.Run(method, func(t *testing.T) {
+			replica := seededAdmissionReplica(t)
+			for range cap(replica.readSlots) {
+				if err := replica.acquireRead(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			defer func() {
+				for range cap(replica.readSlots) {
+					replica.releaseRead()
+				}
+			}()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			waiting := observeReplicaWait(ctx)
+			result, err := storage.NewListResult(1024, 0,
+				func(_ int, nameBytes int64, _ storage.Attr) (int64, error) { return nameBytes + 64, nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := result.Add(storage.Entry{Name: "prefix"}); err != nil {
+				t.Fatal(err)
+			}
+			read := make(chan error, 1)
+			go func() {
+				var err error
+				switch method {
+				case "Stat":
+					_, err = replica.Stat(waiting, "file")
+				case "List":
+					_, err = replica.List(waiting, "")
+				case "ListBounded":
+					err = replica.ListBounded(waiting, "", result)
+				}
+				read <- err
+			}()
+			receiveReplica(t, waiting.entered)
+			cancel()
+			err = receiveReplica(t, read)
+			var pathErr *fs.PathError
+			if !errors.Is(err, context.Canceled) || storage.ErrnoOf(err) != syscall.EINTR ||
+				errors.Is(err, syscall.EIO) || !errors.As(err, &pathErr) {
+				t.Fatalf("canceled permit wait lost its path/error chain: %v", err)
+			}
+			replica.admission.mu.Lock()
+			active, queued := replica.admission.activeReaders, replica.admission.waitingReaders
+			replica.admission.mu.Unlock()
+			if active != cap(replica.readSlots) || queued != 0 || len(replica.readSlots) != cap(replica.readSlots) {
+				t.Fatalf("canceled permit waiter entered the phase: active=%d queued=%d permits=%d", active, queued, len(replica.readSlots))
+			}
+			if method == "ListBounded" {
+				if entries, resultErr := result.Entries(); entries != nil || !errors.Is(resultErr, context.Canceled) {
+					t.Fatalf("canceled listing exposed entries=%v err=%v", entries, resultErr)
+				}
+			}
+		})
+	}
+}
+
+func TestReplicaCancellationAfterPermitHandoffReturnsThePermit(t *testing.T) {
+	replica := &Replica{admission: newReplicaGate(), readSlots: make(chan struct{}, 1)}
+	replica.readSlots <- struct{}{}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	waiting := observeReplicaWait(ctx)
+	acquired := make(chan error, 1)
+	go func() { acquired <- replica.acquireRead(waiting) }()
+	receiveReplica(t, waiting.entered)
+	replica.admission.mu.Lock()
+	var unlockOnce sync.Once
+	unlock := func() { unlockOnce.Do(replica.admission.mu.Unlock) }
+	defer unlock()
+	<-replica.readSlots
+	deadline := time.Now().Add(5 * time.Second)
+	for len(replica.readSlots) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("waiting reader did not receive the released permit")
+		}
+		runtime.Gosched()
+	}
+	cancel()
+	unlock()
+	if err := receiveReplica(t, acquired); !errors.Is(err, context.Canceled) {
+		t.Fatalf("reader canceled after permit handoff returned %v", err)
+	}
+	if len(replica.readSlots) != 0 {
+		t.Fatal("canceled reader retained its transferred permit")
+	}
+	requireReplicaGateIdle(t, &replica.admission)
+	if err := replica.acquireRead(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	replica.releaseRead()
+	requireReplicaGateIdle(t, &replica.admission)
+}
+
+func TestReplicaPositionAndWritersDoNotUseSQLReadPermits(t *testing.T) {
+	replica := seededAdmissionReplica(t)
+	for range cap(replica.readSlots) {
+		replica.readSlots <- struct{}{}
+	}
+	defer func() {
+		for range cap(replica.readSlots) {
+			<-replica.readSlots
+		}
+	}()
+	position := make(chan uint64, 1)
+	go func() { position <- uint64(replica.Position()) }()
+	if got := receiveReplica(t, position); got != 1 {
+		t.Fatalf("Position=%d", got)
+	}
+	for _, writer := range replicaWriters {
+		written := make(chan error, 1)
+		go func() { written <- writer.run(t.Context(), replica) }()
+		if err := receiveReplica(t, written); err != nil {
+			t.Fatalf("%s: %v", writer.name, err)
+		}
+	}
+	if len(replica.readSlots) != cap(replica.readSlots) {
+		t.Fatal("Position or a writer changed SQL read permit ownership")
+	}
+	requireReplicaGateIdle(t, &replica.admission)
+}
+
+func TestReplicaWriterProgressUnderContinuousListings(t *testing.T) {
+	replica, err := OpenReplica(t.Context(), filepath.Join(t.TempDir(), "busy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := replica.Close(); err != nil {
+			t.Errorf("closing replica: %v", err)
+		}
+	}()
+	seeding, err := replica.Reseed(t.Context())
+	if err != nil {
+		t.Fatal(err)
 	}
 	defer seeding.Close()
-
-	for {
-		rows, done, err := readRows(t.Context(), snap, page)
-		if err != nil {
-			t.Fatalf("reading the picture: %v", err)
-		}
-		if err := seeding.Add(t.Context(), rows); err != nil {
-			t.Fatalf("filling the copy: %v", err)
-		}
-		if done {
-			break
-		}
-	}
-	if err := seeding.Complete(t.Context(), at); err != nil {
-		t.Fatalf("completing the copy: %v", err)
-	}
-}
-
-// replay applies everything the source recorded after a position.
-func replay(t *testing.T, from *sqlite.Store, into *sqlite.Replica) {
-	t.Helper()
-
-	changes, _, err := readChanges(t.Context(), from, into.Position(), 1000)
-	if err != nil {
-		t.Fatalf("reading the log: %v", err)
-	}
-	for _, change := range changes {
-		applied, err := into.Apply(t.Context(), change)
-		if err != nil {
-			t.Fatalf("applying the change at position %d: %v", change.Position, err)
-		}
-		if !applied {
-			t.Fatalf("the change at position %d was discarded, and the copy stands at %d", change.Position, into.Position())
-		}
-	}
-}
-
-// tree reads a whole tree out of a store or a copy of one, so that the two can be compared
-// node for node.
-func tree(t *testing.T,
-	stat func(context.Context, string) (metastore.Node, error),
-	list func(context.Context, string) ([]metastore.Child, error),
-) map[string]metastore.Node {
-	t.Helper()
-
-	root, err := stat(t.Context(), "")
-	if err != nil {
-		t.Fatalf("reading the root: %v", err)
-	}
-	nodes := map[string]metastore.Node{"": root}
-	for pending := []string{""}; len(pending) > 0; {
-		dir := pending[len(pending)-1]
-		pending = pending[:len(pending)-1]
-
-		children, err := list(t.Context(), dir)
-		if err != nil {
-			t.Fatalf("listing %q: %v", dir, err)
-		}
-		for _, child := range children {
-			at := path.Join(dir, string(child.Name))
-			nodes[at] = child.Node
-			if child.Node.IsDir() {
-				pending = append(pending, at)
-			}
-		}
-	}
-	return nodes
-}
-
-// requireSame compares a copy against its source node for node, including the ids: a copy
-// that renamed the nodes would need a translation table beside it, and every change naming a
-// directory by id would have to go through it correctly, forever.
-func requireSame(t *testing.T, from *sqlite.Store, into *sqlite.Replica) {
-	t.Helper()
-
-	want := tree(t, from.Stat, from.List)
-	got := tree(t, into.Stat, into.List)
-	if len(want) != len(got) {
-		t.Fatalf("the namespace holds %d nodes and the copy holds %d:\n namespace %v\n copy      %v",
-			len(want), len(got), names(want), names(got))
-	}
-	for at, node := range want {
-		mirrored, present := got[at]
-		if !present {
-			t.Fatalf("the copy does not hold %q, which the namespace does", at)
-		}
-		// The content key is the one thing a copy does not hold: it never reaches an object
-		// store, so a key here would name bytes nothing has.
-		if mirrored.ID != node.ID || mirrored.Mode != node.Mode || mirrored.Size != node.Size ||
-			!mirrored.ModTime.Equal(node.ModTime) || !mirrored.AccessTime.Equal(node.AccessTime) {
-			t.Fatalf("the copy holds %q as %+v, the namespace holds it as %+v", at, mirrored, node)
-		}
-		if mirrored.Content != "" {
-			t.Fatalf("the copy holds a content key for %q, and it has no object store to use one against", at)
-		}
-	}
-}
-
-func names(nodes map[string]metastore.Node) []string {
-	var all []string
-	for at := range nodes {
-		all = append(all, at)
-	}
-	return all
-}
-
-// TestACopyIsFilledFromAPictureAndHoldsTheSourcesIds.
-func TestACopyIsFilledFromAPictureAndHoldsTheSourcesIds(t *testing.T) {
-	from := source(t)
-	build(t, from)
-
-	into := copyOf(t)
-	fill(t, from, into, 1024)
-	requireSame(t, from, into)
-}
-
-func TestReplicaListBoundedPreservesCompleteResultsAndFailures(t *testing.T) {
-	from := source(t)
-	build(t, from)
-	into := copyOf(t)
-	fill(t, from, into, 1024)
-
-	newResult := func() *storage.ListResult {
-		result, err := storage.NewListResult(1<<20, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
-			return 64 + nameBytes, nil
+	root := metastore.Node{ID: 1, Mode: fs.ModeDir | 0o755}
+	rows := []metastore.Row{{Node: root}}
+	for i := range 4096 {
+		rows = append(rows, metastore.Row{
+			Parent: 1, Name: []byte(fmt.Sprintf("file-%04d", i)),
+			Node: metastore.Node{ID: int64(i + 2), Mode: 0o644},
 		})
+	}
+	if err := seeding.Add(t.Context(), rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := seeding.Complete(t.Context(), 1); err != nil {
+		t.Fatal(err)
+	}
+
+	var stopped atomic.Bool
+	stopReaders := func() { stopped.Store(true) }
+	var group sync.WaitGroup
+	var completed atomic.Int64
+	failures := make(chan error, 128)
+	var held []*sql.Conn
+	var releaseOnce sync.Once
+	releaseReaders := func() {
+		releaseOnce.Do(func() {
+			for _, connection := range held {
+				if err := connection.Close(); err != nil {
+					t.Errorf("releasing held reader connection: %v", err)
+				}
+			}
+		})
+	}
+	defer releaseReaders()
+	capacity := replica.store.read.Stats().MaxOpenConnections
+	for range capacity {
+		connection, err := replica.store.read.Conn(t.Context())
 		if err != nil {
 			t.Fatal(err)
 		}
-		return result
+		held = append(held, connection)
 	}
-	complete := newResult()
-	if err := into.ListBounded(t.Context(), "", complete); err != nil {
-		t.Fatalf("listing the replica root: %v", err)
-	}
-	entries, err := complete.Entries()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) == 0 {
-		t.Fatal("the bounded replica listing omitted every root entry")
-	}
-
-	failed := newResult()
-	if err := into.ListBounded(t.Context(), "missing", failed); !errors.Is(err, syscall.ENOENT) {
-		t.Fatalf("listing a missing replica directory: %v, want ENOENT", err)
-	}
-	if entries, err := failed.Entries(); !errors.Is(err, syscall.ENOENT) || entries != nil {
-		t.Fatalf("the failed replica listing exposed %+v, %v", entries, err)
-	}
-	if err := into.ListBounded(t.Context(), "", nil); !errors.Is(err, syscall.EINVAL) {
-		t.Fatalf("listing into a nil result: %v, want EINVAL", err)
-	}
-}
-
-// TestAPictureIsAcceptedWhateverOrderItsRowsArriveIn.
-//
-// A page of one row delivers the tree in as many frames as it has nodes, and a child may
-// reach the copy before the directory holding it. The references between the rows are checked
-// in full — they are checked at the commit rather than at each statement — so the order the
-// picture yields its rows in is the picture's business rather than an agreement the two sides
-// have to keep.
-func TestAPictureIsAcceptedWhateverOrderItsRowsArriveIn(t *testing.T) {
-	from := source(t)
-	build(t, from)
-
-	into := copyOf(t)
-	fill(t, from, into, 1)
-	requireSame(t, from, into)
-}
-
-// TestEveryKindOfChangeIsAppliedAsTheNamespaceRecordedIt replays a log against a copy of the
-// tree the log began from, and compares what comes out against the namespace itself.
-//
-// The operations below are chosen so that every kind of change is recorded at least once: a
-// creation, a modification, a removal, a rename, and a rename onto something that was already
-// there — which is the one that records a removal and a rename together.
-func TestEveryKindOfChangeIsAppliedAsTheNamespaceRecordedIt(t *testing.T) {
-	from := source(t)
-	into := copyOf(t)
-	// The copy starts from a picture of an empty namespace, so everything below reaches it as
-	// a change rather than as part of the picture.
-	fill(t, from, into, 1024)
-
-	build(t, from)
-	mode := fs.FileMode(0o600)
-	for _, done := range []struct {
-		what string
-		run  func() error
-	}{
-		{"changing a mode", func() error { return from.SetAttr(t.Context(), "d/f", storage.AttrChange{Mode: &mode}) }},
-		{"removing a file", func() error { return from.Remove(t.Context(), "g") }},
-		{"renaming a file", func() error { return from.Rename(t.Context(), "d/f", "d/moved") }},
-		{"renaming a directory", func() error { return from.Rename(t.Context(), "d", "e") }},
-		{"creating over a name that was taken", func() error {
-			if err := from.Create(t.Context(), "displaced"); err != nil {
-				return err
+	waiters := make([]*replicaWaitContext, 128)
+	for i := range waiters {
+		waiters[i] = observeReplicaWait(t.Context())
+		group.Go(func() {
+			for !stopped.Load() {
+				children, err := replica.List(waiters[i], "")
+				if err != nil {
+					failures <- err
+					return
+				}
+				if len(children) != 4096 {
+					failures <- fmt.Errorf("listing returned %d entries, want 4096", len(children))
+					return
+				}
+				completed.Add(1)
 			}
-			return from.Rename(t.Context(), "e/moved", "displaced")
-		}},
-		{"emptying a directory", func() error { return from.Remove(t.Context(), "e/inner/deep") }},
-		{"removing a directory", func() error { return from.RemoveDir(t.Context(), "e/inner") }},
-	} {
-		if err := done.run(); err != nil {
-			t.Fatalf("%s in the namespace: %v", done.what, err)
-		}
-		replay(t, from, into)
-		requireSame(t, from, into)
-	}
-}
-
-func TestReplicaRefusesAReusedNodeIdentity(t *testing.T) {
-	from := source(t)
-	into := copyOf(t)
-	fill(t, from, into, 1024)
-	root, err := into.Stat(t.Context(), "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	node := metastore.Node{
-		ID: root.ID + 1, Mode: 0o644,
-		AccessTime: time.Unix(1, 0), ModTime: time.Unix(1, 0),
-	}
-	created := metastore.Change{
-		Position: 1, Kind: metastore.Created, Parent: root.ID, Name: []byte("first"), Node: &node,
-	}
-	if applied, err := into.Apply(t.Context(), created); err != nil || !applied {
-		t.Fatalf("applying the initial creation returned applied=%v, err=%v", applied, err)
-	}
-	removed := metastore.Change{
-		Position: 2, Kind: metastore.Removed, Parent: root.ID, Name: []byte("first"),
-	}
-	if applied, err := into.Apply(t.Context(), removed); err != nil || !applied {
-		t.Fatalf("applying the removal returned applied=%v, err=%v", applied, err)
-	}
-	reused := created
-	reused.Position = 3
-	reused.Name = []byte("replacement")
-	if applied, err := into.Apply(t.Context(), reused); !errors.Is(err, syscall.EIO) || applied {
-		t.Fatalf("applying a reused node identity returned applied=%v, err=%v, want false and EIO", applied, err)
-	}
-	if into.Position() != 2 {
-		t.Fatalf("refused reuse advanced the replica to %d, want 2", into.Position())
-	}
-	if _, err := into.Stat(t.Context(), "replacement"); !errors.Is(err, syscall.ENOENT) {
-		t.Fatalf("refused reuse left a replacement node: %v, want ENOENT", err)
-	}
-}
-
-// TestARenamedDirectoryMovesInTheCopyWithoutItsSubtreeBeingTouched. One row in the log is one
-// row here: everything beneath keeps the identity it had, which is what makes a directory
-// rename cost the same in a copy as it does in the namespace.
-func TestARenamedDirectoryMovesInTheCopyWithoutItsSubtreeBeingTouched(t *testing.T) {
-	from := source(t)
-	build(t, from)
-
-	into := copyOf(t)
-	fill(t, from, into, 1024)
-	before := tree(t, into.Stat, into.List)
-
-	if err := from.Rename(t.Context(), "d", "moved"); err != nil {
-		t.Fatalf("renaming the directory: %v", err)
-	}
-	replay(t, from, into)
-
-	after := tree(t, into.Stat, into.List)
-	for _, moved := range []struct{ was, is string }{
-		{"d", "moved"}, {"d/f", "moved/f"}, {"d/inner", "moved/inner"}, {"d/inner/deep", "moved/inner/deep"},
-	} {
-		if after[moved.is].ID != before[moved.was].ID {
-			t.Fatalf("%q was node %d and %q is node %d; a rename is one row and nothing beneath it moves",
-				moved.was, before[moved.was].ID, moved.is, after[moved.is].ID)
-		}
-	}
-	if _, err := into.Stat(t.Context(), "d"); !errors.Is(err, syscall.ENOENT) {
-		t.Fatalf("the copy still answers about the old name: %v", err)
-	}
-}
-
-// TestAChangeThatDoesNotFindWhatItDescribesIsRefused.
-//
-// Every one of these is impossible against a copy that was filled from a consistent picture
-// and has applied everything since, in order — which is exactly why none of them is tolerated.
-// A rule that let a rename with no source pass quietly would be depended upon within a week of
-// existing, and the copy has no way back from having not applied something: nothing
-// revalidates it and no timeout repairs it.
-func TestAChangeThatDoesNotFindWhatItDescribesIsRefused(t *testing.T) {
-	from := source(t)
-	build(t, from)
-
-	into := copyOf(t)
-	fill(t, from, into, 1024)
-
-	root, err := into.Stat(t.Context(), "")
-	if err != nil {
-		t.Fatalf("reading the root of the copy: %v", err)
-	}
-	filled := into.Position()
-	absent := metastore.Node{ID: 9999, Mode: 0o644, ModTime: time.Now(), AccessTime: time.Now()}
-
-	// Each case carries a position of its own. A copy that wrongly applied one of them would
-	// stand at that position afterwards, and every later case would then be discarded as
-	// already held — so one defect would read as several, and the ones it hid would read as
-	// passes on the day it was fixed.
-	for at, c := range []struct {
-		name   string
-		change metastore.Change
-	}{
-		{"a rename whose source is not there", metastore.Change{
-			Position: 100, Kind: metastore.Renamed, Parent: root.ID, Name: []byte("arrived"),
-			From: &metastore.Location{Parent: root.ID, Name: []byte("never-existed")}, Node: &absent,
-		}},
-		{"a modification of a node the copy does not hold", metastore.Change{
-			Position: 100, Kind: metastore.Modified, Parent: root.ID, Name: []byte("g"), Node: &absent,
-		}},
-		{"a removal of a name that is not there", metastore.Change{
-			Position: 100, Kind: metastore.Removed, Parent: root.ID, Name: []byte("never-existed"),
-		}},
-		{"a creation at a name that is taken", metastore.Change{
-			Position: 100, Kind: metastore.Created, Parent: root.ID, Name: []byte("g"), Node: &absent,
-		}},
-		{"a change of a kind this build has no meaning for", metastore.Change{
-			Position: 100, Kind: metastore.ChangeKind(42), Parent: root.ID, Name: []byte("g"), Node: &absent,
-		}},
-		{"a change that says what a name holds and carries no node", metastore.Change{
-			Position: 100, Kind: metastore.Created, Parent: root.ID, Name: []byte("arrived"),
-		}},
-		{"a rename that does not say where the node came from", metastore.Change{
-			Position: 100, Kind: metastore.Renamed, Parent: root.ID, Name: []byte("arrived"), Node: &absent,
-		}},
-	} {
-		t.Run(c.name+" is refused", func(t *testing.T) {
-			c.change.Position = filled + metastore.Position(at) + 1
-			before := into.Position()
-			applied, err := into.Apply(t.Context(), c.change)
-			if applied {
-				t.Fatal("the change was reported as applied")
-			}
-			if err == nil {
-				t.Fatal("the change was applied, and the copy now holds something the namespace never recorded")
-			}
-			if !errors.Is(err, syscall.EIO) {
-				t.Fatalf("applying it failed with %v, want EIO", err)
-			}
-			if into.Position() != before {
-				t.Fatalf("the copy stands at position %d after a change it could not apply, and stood at %d before",
-					into.Position(), before)
-			}
-			t.Logf("%v", err)
 		})
 	}
-	// Nothing above changed the copy, which is the other half of the refusal: a change that
-	// was refused half way through would leave the copy holding a tree the namespace never had.
-	requireSame(t, from, into)
-}
-
-// TestAChangeAtAPositionTheCopyAlreadyHoldsIsDiscarded covers stream changes already included
-// in the snapshot that built the copy.
-func TestAChangeAtAPositionTheCopyAlreadyHoldsIsDiscarded(t *testing.T) {
-	from := source(t)
-	into := copyOf(t)
-	fill(t, from, into, 1024)
-
-	build(t, from)
-	changes, _, err := readChanges(t.Context(), from, 0, 1000)
-	if err != nil {
-		t.Fatalf("reading the log: %v", err)
+	defer func() {
+		releaseReaders()
+		stopReaders()
+		group.Wait()
+	}()
+	for _, waiter := range waiters {
+		receiveReplica(t, waiter.entered)
 	}
-	replay(t, from, into)
-	at := into.Position()
-
-	// Every change again, in order. A copy that applied any of them a second time would fail
-	// on the first creation, and one that took the position back would replay the rest. Each
-	// one says it was discarded, which is what keeps the caller's own account of the copy
-	// from being moved by a change the copy did not take.
-	for _, change := range changes {
-		applied, err := into.Apply(t.Context(), change)
-		if err != nil {
-			t.Fatalf("applying the change at position %d a second time: %v", change.Position, err)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		replica.admission.mu.Lock()
+		active := replica.admission.activeReaders
+		waiting := replica.admission.waitingReaders
+		replica.admission.mu.Unlock()
+		if active == capacity {
+			if waiting != 0 || len(replica.readSlots) != capacity {
+				t.Fatalf("pool waiters reached the phase gate: waiting=%d permits=%d", waiting, len(replica.readSlots))
+			}
+			break
 		}
-		if applied {
-			t.Fatalf("the change at position %d was applied a second time", change.Position)
+		if time.Now().After(deadline) {
+			t.Fatalf("%d reader calls reached replica admission, want %d", active, capacity)
 		}
+		runtime.Gosched()
 	}
-	if into.Position() != at {
-		t.Fatalf("the copy stands at position %d after being told everything a second time, and stood at %d before", into.Position(), at)
+	root.Mode = fs.ModeDir | 0o700
+	change := metastore.Change{Position: 2, Kind: metastore.Modified, Node: &root}
+	// Already admitted scans must finish before Apply can enter. The bound includes
+	// one full reader pool under the race detector; replication latency has a separate test.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	writer := observeReplicaWait(ctx)
+	type appliedChange struct {
+		applied bool
+		err     error
 	}
-	requireSame(t, from, into)
-}
-
-// TestAPictureWithNoRootIsNotATree. A picture that lost the one node with no parent would
-// leave a copy with no root, and every path resolved through it would answer about a tree
-// that has no beginning.
-func TestAPictureWithNoRootIsNotATree(t *testing.T) {
-	into := copyOf(t)
-
-	seeding, err := into.Reseed(t.Context())
-	if err != nil {
-		t.Fatalf("emptying the copy: %v", err)
-	}
-	defer seeding.Close()
-
-	if err := seeding.Complete(t.Context(), 7); err == nil {
-		t.Fatal("a picture with no root was accepted")
-	} else if !errors.Is(err, syscall.EIO) {
-		t.Fatalf("completing it failed with %v, want EIO", err)
-	} else {
-		t.Logf("%v", err)
-	}
-}
-
-// TestAFillingThatWasNotCompletedLeavesTheCopyAsItWas. A picture that stops half way through
-// is one the copy must not be left holding: what it had before is at least a tree the
-// namespace once had, and what a half-delivered picture leaves is a tree nobody ever had.
-func TestAFillingThatWasNotCompletedLeavesTheCopyAsItWas(t *testing.T) {
-	from := source(t)
-	build(t, from)
-
-	into := copyOf(t)
-	fill(t, from, into, 1024)
-	at := into.Position()
-
-	seeding, err := into.Reseed(t.Context())
-	if err != nil {
-		t.Fatalf("emptying the copy: %v", err)
-	}
-	if err := seeding.Add(t.Context(), []metastore.Row{{Node: metastore.Node{ID: 4242, Mode: fs.ModeDir | 0o755}}}); err != nil {
-		t.Fatalf("filling the copy: %v", err)
-	}
-	if err := seeding.Close(); err != nil {
-		t.Fatalf("discarding the filling: %v", err)
-	}
-
-	if into.Position() != at {
-		t.Fatalf("the copy stands at position %d after a filling that was discarded, and stood at %d before", into.Position(), at)
-	}
-	requireSame(t, from, into)
-}
-
-func TestReseedReportsAClosedReplicaAsEIO(t *testing.T) {
-	into := copyOf(t)
-	if err := into.Close(); err != nil {
-		t.Fatal(err)
-	}
-	seeding, err := into.Reseed(t.Context())
-	if seeding != nil {
-		seeding.Close()
-		t.Fatal("a closed replica returned a seeding transaction")
-	}
-	if !errors.Is(err, syscall.EIO) {
-		t.Fatalf("reseeding a closed replica returned %v, want EIO", err)
-	}
-}
-
-func TestReseedWaitingForAnotherPictureHonorsCancellation(t *testing.T) {
-	into := copyOf(t)
-	first, err := into.Reseed(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer first.Close()
-	ctx, cancel := context.WithCancel(t.Context())
+	written := make(chan appliedChange, 1)
+	go func() {
+		applied, err := replica.Apply(writer, change)
+		written <- appliedChange{applied, err}
+	}()
+	receiveReplica(t, writer.entered)
+	started := time.Now()
+	releaseReaders()
+	outcome := <-written
+	elapsed := time.Since(started)
+	applied, applyErr := outcome.applied, outcome.err
 	cancel()
-	second, err := into.Reseed(ctx)
-	if second != nil {
-		second.Close()
-		t.Fatal("a canceled reseed returned a second seeding transaction")
+	stopReaders()
+	group.Wait()
+	close(failures)
+	for err := range failures {
+		t.Errorf("concurrent listing failed: %v", err)
 	}
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceling a reseed behind an active picture returned %v", err)
+	if !applied || applyErr != nil {
+		t.Fatalf("Apply under continuous listings: applied=%v err=%v after %v", applied, applyErr, elapsed)
 	}
+	got, err := replica.Stat(t.Context(), "")
+	if err != nil || got.Mode != root.Mode || replica.Position() != 2 {
+		t.Fatalf("applied change was not visible: root=%+v err=%v position=%d", got, err, replica.Position())
+	}
+	t.Logf("Apply completed in %v while 128 readers completed %d listings of 4096 files", elapsed, completed.Load())
 }
 
-// build puts a small tree into a namespace: a directory with a file and a subtree, and a file
-// beside it.
-func build(t *testing.T, store *sqlite.Store) {
-	t.Helper()
-
-	for _, made := range []struct {
-		what string
-		run  func() error
-	}{
-		{"d", func() error { return store.Mkdir(t.Context(), "d") }},
-		{"d/f", func() error { return store.Create(t.Context(), "d/f") }},
-		{"d/inner", func() error { return store.Mkdir(t.Context(), "d/inner") }},
-		{"d/inner/deep", func() error { return store.Create(t.Context(), "d/inner/deep") }},
-		{"g", func() error { return store.Create(t.Context(), "g") }},
-	} {
-		if err := made.run(); err != nil {
-			t.Fatalf("making %s: %v", made.what, err)
+func TestReplicaAppliesEveryChangeWithoutLosingIdentityOrRollback(t *testing.T) {
+	r := seededAdmissionReplica(t)
+	ctx := t.Context()
+	node := metastore.Node{ID: 12, Mode: 0o600, Size: 3, AccessTime: time.Unix(100, 0), ModTime: time.Unix(200, 0)}
+	apply := func(change metastore.Change) {
+		t.Helper()
+		changed, err := r.Apply(ctx, change)
+		if err != nil || !changed || r.Position() != change.Position {
+			t.Fatalf("apply %+v = %v, %v; position %d", change, changed, err, r.Position())
 		}
+	}
+	apply(metastore.Change{Position: 2, Kind: metastore.Created, Parent: 10, Name: []byte("new"), Node: &node})
+	if got, err := r.Stat(ctx, "new"); err != nil || got != node {
+		t.Fatalf("created node = %+v, %v", got, err)
+	}
+	node.Size, node.Mode = 9, 0o640
+	apply(metastore.Change{Position: 3, Kind: metastore.Modified, Parent: 10, Name: []byte("new"), Node: &node})
+	if got, err := r.Stat(ctx, "new"); err != nil || got != node {
+		t.Fatalf("modified node = %+v, %v", got, err)
+	}
+	node.Mode, node.ModTime = 0o660, time.Unix(300, 0)
+	apply(metastore.Change{Position: 4, Kind: metastore.Renamed, Parent: 10, Name: []byte("renamed"), From: &metastore.Location{Parent: 10, Name: []byte("new")}, Node: &node})
+	if got, err := r.Stat(ctx, "renamed"); err != nil || got != node {
+		t.Fatalf("renamed node = %+v, %v", got, err)
+	}
+	if _, err := r.Stat(ctx, "new"); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("old name = %v", err)
+	}
+	for _, change := range []metastore.Change{
+		{Kind: metastore.Created, Parent: 10, Name: []byte("missing-node")},
+		{Kind: metastore.Renamed, Parent: 10, Name: []byte("missing-from"), Node: &node},
+		{Kind: metastore.Removed, Parent: 10, Name: []byte("absent")},
+		{Kind: metastore.Renamed, Parent: 10, Name: []byte("other"), From: &metastore.Location{Parent: 10, Name: []byte("absent")}, Node: &node},
+		{Kind: metastore.Renamed, Parent: 10, Name: []byte("file"), From: &metastore.Location{Parent: 10, Name: []byte("renamed")}, Node: &node},
+		{Kind: metastore.Created, Parent: 10, Name: []byte("reused-id"), Node: &node},
+		{Kind: 99, Node: &node},
+	} {
+		change.Position = 5
+		if changed, err := r.Apply(ctx, change); changed || !errors.Is(err, syscall.EIO) {
+			t.Fatalf("invalid change %+v = %v, %v", change, changed, err)
+		}
+		if r.Position() != 4 {
+			t.Fatalf("failed change advanced position to %d", r.Position())
+		}
+		if got, err := r.Stat(ctx, "renamed"); err != nil || got != node {
+			t.Fatalf("failed change altered node: %+v, %v", got, err)
+		}
+		if children, err := r.List(ctx, ""); err != nil || len(children) != 2 {
+			t.Fatalf("failed change altered directory: %+v, %v", children, err)
+		}
+	}
+	apply(metastore.Change{Position: 5, Kind: metastore.Removed, Parent: 10, Name: []byte("renamed")})
+	if _, err := r.Stat(ctx, "renamed"); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("removed node = %v", err)
+	}
+	if changed, err := r.Apply(ctx, metastore.Change{Position: 5}); changed || err != nil {
+		t.Fatalf("replayed position = %v, %v", changed, err)
+	}
+	if children, err := r.List(ctx, ""); err != nil || len(children) != 1 || string(children[0].Name) != "file" {
+		t.Fatalf("unrelated node = %+v, %v", children, err)
 	}
 }

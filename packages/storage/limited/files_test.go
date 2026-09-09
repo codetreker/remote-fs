@@ -305,3 +305,55 @@ type invalidRetainedUsage struct {
 }
 
 func (p *invalidRetainedUsage) Usage(context.Context) (int64, error) { return p.usage, p.err }
+
+func TestRetainedQuotaOpenNodeAndTruncatePreserveIdentityAndCharge(t *testing.T) {
+	s := newStorage(t, limited.MinLimit)
+	session := retainedSession(t, s, t.Context(), storage.DefaultFileSessionOptions())
+	original := retainedFile(t, session, "file", true)
+	attr, err := original.WriteAt(t.Context(), 0, []byte("preserve"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := session.OpenNode(t.Context(), attr.ID, storage.FileOpenOptions{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(t.Context(), "file", "renamed"); err != nil {
+		t.Fatal(err)
+	}
+	shrunk, err := opened.Truncate(t.Context(), 3)
+	if err != nil || shrunk.ID != attr.ID || shrunk.Size != 3 {
+		t.Fatalf("truncate = %+v, %v", shrunk, err)
+	}
+	mustUse(t, s, 3)
+	read, err := original.ReadAt(t.Context(), 0, 10)
+	if err != nil || string(read.Data) != "pre" {
+		t.Fatalf("other reference = %+v, %v", read, err)
+	}
+	if _, err := opened.Truncate(t.Context(), limited.MinLimit+1); !errors.Is(err, syscall.EDQUOT) {
+		t.Fatalf("over-quota truncate = %v", err)
+	}
+	mustUse(t, s, 3)
+	after, err := opened.Stat(t.Context())
+	if err != nil || after.Size != 3 {
+		t.Fatalf("rejected truncate changed size: %+v, %v", after, err)
+	}
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := session.OpenNode(cancelled, attr.ID, storage.FileOpenOptions{Read: true}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled open = %v", err)
+	}
+	if _, err := opened.Truncate(cancelled, 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled truncate = %v", err)
+	}
+	if err := opened.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := original.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	mustUse(t, s, 3)
+	if _, err := s.Stat(t.Context(), "file"); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("old name = %v", err)
+	}
+}

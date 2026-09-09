@@ -869,7 +869,7 @@ func writeVersionTwoDatabase(t *testing.T, path string) {
 		t.Fatal("locate server test source")
 	}
 	schema, err := os.ReadFile(filepath.Join(
-		filepath.Dir(source), "..", "..", "packages", "metastore", "sqlite", "testdata", "version2.sql",
+		filepath.Dir(source), "..", "..", "packages", "metastore", "sqlite", "internal", "integration", "testdata", "version2.sql",
 	))
 	if err != nil {
 		t.Fatal(err)

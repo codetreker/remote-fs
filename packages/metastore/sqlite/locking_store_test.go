@@ -2,9 +2,12 @@ package sqlite
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,10 +16,278 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/codetreker/remote-fs/packages/locking"
+	"golang.org/x/sys/unix"
 )
+
+func TestLeaseNativeOwnershipCrossProcess(t *testing.T) {
+	for _, owner := range []string{"raw", "locked"} {
+		for _, exit := range []string{"close", "kill"} {
+			t.Run(owner+"/"+exit, func(t *testing.T) {
+				config := lockingTestConfig(t)
+				child := startNativeOwnerProcess(t, config.Database, owner)
+				if owner == "raw" {
+					other, err := OpenWithOptions(t.Context(), config.Database, "other", 0, DefaultOptions())
+					if err != nil {
+						t.Fatalf("second shared owner: %v", err)
+					}
+					if err := other.Close(); err != nil {
+						t.Fatal(err)
+					}
+					if opened, err := OpenLocking(t.Context(), config); !errors.Is(err, syscall.EBUSY) {
+						if opened != nil {
+							opened.Close()
+						}
+						t.Fatalf("exclusive opener beside cross-process shared owner = %v", err)
+					}
+				} else {
+					assertNativeOwnerHeld(t, config.Database)
+					assertRawLeaseOpenRejected(t, config.Database)
+				}
+				child.stop(t, exit == "kill")
+				assertNativeOwnerReleased(t, config.Database)
+				if owner == "locked" {
+					assertRawLeaseOpenRejected(t, config.Database)
+					config.Initialize = false
+				}
+				reopened, err := OpenLocking(t.Context(), config)
+				if err != nil {
+					t.Fatalf("open after previous owner exited: %v", err)
+				}
+				defer func() {
+					if err := reopened.Close(); err != nil {
+						t.Error(err)
+					}
+				}()
+				if _, err := reopened.Stat(t.Context(), "committed"); err != nil {
+					t.Fatalf("acknowledged namespace after owner exit: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestLockingStoreCloseFailureRetainsNativeOwnership(t *testing.T) {
+	config := lockingTestConfig(t)
+	child := startNativeOwnerProcess(t, config.Database, "close-failure")
+	assertNativeOwnerHeld(t, config.Database)
+	assertRawLeaseOpenRejected(t, config.Database)
+	config.Initialize = false
+	if opened, err := OpenLocking(t.Context(), config); !errors.Is(err, syscall.EBUSY) {
+		if opened != nil {
+			opened.Close()
+		}
+		t.Fatalf("exclusive opener after uncertain pool close = %v", err)
+	}
+	child.stop(t, true)
+	assertNativeOwnerReleased(t, config.Database)
+	assertRawLeaseOpenRejected(t, config.Database)
+	reopened, err := OpenLocking(t.Context(), config)
+	if err != nil {
+		t.Fatalf("open after uncertain owner's process exited: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertNativeOwnerHeld(t *testing.T, database string) {
+	t.Helper()
+	fd, err := unix.Open(database, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	if err := unix.Flock(fd, unix.LOCK_SH|unix.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+		t.Fatalf("native shared flock beside exclusive owner = %v", err)
+	}
+}
+
+func assertNativeOwnerReleased(t *testing.T, database string) {
+	t.Helper()
+	fd, err := unix.Open(database, unix.O_RDWR|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatalf("native exclusive flock after owner exit = %v", err)
+	}
+}
+
+func assertRawLeaseOpenRejected(t *testing.T, database string) {
+	t.Helper()
+	directory := t.TempDir()
+	alias := filepath.Join(directory, "alias.sqlite")
+	if err := os.Symlink(database, alias); err != nil {
+		t.Fatal(err)
+	}
+	parentAlias := filepath.Join(directory, "parent")
+	if err := os.Symlink(filepath.Dir(database), parentAlias); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{database, alias, filepath.Join(parentAlias, filepath.Base(database))} {
+		for _, namespace := range []string{"workspace", "other"} {
+			opened, err := OpenWithOptions(t.Context(), path, namespace, 0, DefaultOptions())
+			if opened != nil {
+				opened.Close()
+			}
+			if !errors.Is(err, syscall.EIO) {
+				t.Fatalf("raw open of bound database through %q in namespace %q = %v", path, namespace, err)
+			}
+		}
+	}
+}
+
+type nativeOwnerProcess struct {
+	command *exec.Cmd
+	input   io.WriteCloser
+	stderr  bytes.Buffer
+	cancel  context.CancelFunc
+}
+
+func startNativeOwnerProcess(t *testing.T, database, mode string) *nativeOwnerProcess {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	child := &nativeOwnerProcess{
+		command: exec.CommandContext(ctx, os.Args[0], "-test.run=^TestLeaseNativeOwnershipProcess$", "-test.timeout=15s"),
+		cancel:  cancel,
+	}
+	child.command.Env = append(os.Environ(), "RFS_NATIVE_OWNER_DATABASE="+database, "RFS_NATIVE_OWNER_MODE="+mode)
+	child.command.Stderr = &child.stderr
+	stdout, err := child.command.StdoutPipe()
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	child.input, err = child.command.StdinPipe()
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	if err := child.command.Start(); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if child.command.ProcessState == nil {
+			child.command.Process.Kill()
+			child.command.Wait()
+		}
+		child.input.Close()
+		cancel()
+	})
+	ready := make(chan error, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		signaled := false
+		for scanner.Scan() {
+			if scanner.Text() == "native ownership ready" && !signaled {
+				ready <- nil
+				signaled = true
+			}
+		}
+		if !signaled {
+			ready <- fmt.Errorf("child ended before ownership confirmation: %w", scanner.Err())
+		}
+	}()
+	select {
+	case err := <-ready:
+		if err != nil {
+			child.command.Wait()
+			t.Fatalf("%v; stderr: %s", err, child.stderr.String())
+		}
+	case <-ctx.Done():
+		child.command.Wait()
+		t.Fatalf("child ownership confirmation: %v; stderr: %s", ctx.Err(), child.stderr.String())
+	}
+	return child
+}
+
+func (child *nativeOwnerProcess) stop(t *testing.T, kill bool) {
+	t.Helper()
+	if kill {
+		if err := child.command.Process.Kill(); err != nil {
+			t.Fatal(err)
+		}
+	} else if _, err := io.WriteString(child.input, "close\n"); err != nil {
+		t.Fatal(err)
+	}
+	err := child.command.Wait()
+	child.cancel()
+	if kill {
+		var exited *exec.ExitError
+		if !errors.As(err, &exited) || !exited.ProcessState.Sys().(syscall.WaitStatus).Signaled() ||
+			exited.ProcessState.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
+			t.Fatalf("owner killed: %v; stderr: %s", err, child.stderr.String())
+		}
+	} else if err != nil {
+		t.Fatalf("owner closed: %v; stderr: %s", err, child.stderr.String())
+	}
+}
+
+func TestLeaseNativeOwnershipProcess(t *testing.T) {
+	database := os.Getenv("RFS_NATIVE_OWNER_DATABASE")
+	if database == "" {
+		return
+	}
+	var store *Store
+	var closeStore func() error
+	switch os.Getenv("RFS_NATIVE_OWNER_MODE") {
+	case "raw":
+		opened, err := OpenWithOptions(t.Context(), database, "workspace", 0, DefaultOptions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, closeStore = opened, opened.Close
+	case "locked", "close-failure":
+		opened, err := OpenLocking(t.Context(), LockingConfig{
+			Database: database, Namespace: "workspace", SQLite: DefaultOptions(),
+			Locks: locking.DefaultOptions(), Initialize: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, closeStore = opened.Store, opened.Close
+	default:
+		t.Fatal("unknown native owner mode")
+	}
+	if err := store.Create(t.Context(), "committed"); err != nil {
+		t.Fatal(err)
+	}
+	if os.Getenv("RFS_NATIVE_OWNER_MODE") == "close-failure" {
+		fault := errors.Join(syscall.EIO, errors.New("injected uncertain pool closure"))
+		closePool := store.closePool
+		calls := 0
+		store.closePool = func(db *sql.DB) error {
+			calls++
+			return errors.Join(closePool(db), fault)
+		}
+		if err := closeStore(); !errors.Is(err, fault) || !errors.Is(err, syscall.EIO) {
+			t.Fatalf("uncertain close = %v", err)
+		}
+		if calls != 3 {
+			t.Fatalf("closed pools = %d, want 3", calls)
+		}
+		if err := closeStore(); !errors.Is(err, fault) || !errors.Is(err, syscall.EIO) {
+			t.Fatalf("repeated uncertain close = %v", err)
+		}
+		if calls != 3 {
+			t.Fatalf("terminal pool closures repeated: %d", calls)
+		}
+		if err := store.Create(t.Context(), "after-close"); !errors.Is(err, syscall.EIO) {
+			t.Fatalf("mutation after failed close = %v", err)
+		}
+	}
+	fmt.Println("native ownership ready")
+	scanner := bufio.NewScanner(os.Stdin)
+	if !scanner.Scan() || scanner.Text() != "close" {
+		t.Fatalf("owner close command: %v", scanner.Err())
+	}
+	if err := closeStore(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func lockingTestConfig(t *testing.T) LockingConfig {
 	t.Helper()
@@ -62,6 +333,11 @@ func TestLockingStoreRetainsOldMaximumAndRejectsRawReopen(t *testing.T) {
 			t.Error(err)
 		}
 	}()
+	if start := s.anchor.RecoveryStart(); start.IsZero() ||
+		!start.Equal(s.file.Acquired()) || !start.Equal(s.RecoveryStart()) {
+		t.Fatalf("reopened anchor starts recovery at %v, native owner at %v, store at %v",
+			start, s.file.Acquired(), s.RecoveryStart())
+	}
 	if got, err := s.MaxLease(t.Context()); err != nil || got != time.Minute {
 		t.Fatalf("maximum = %v, %v", got, err)
 	}
@@ -149,36 +425,6 @@ func TestLockingStoreMissingEvidenceDoesNotReinitialize(t *testing.T) {
 				t.Fatalf("missing %s raw reopen = %v", missing, err)
 			}
 		})
-	}
-}
-
-func TestLeaseDatabaseCloseNeverRetriesAReusedDescriptor(t *testing.T) {
-	fd, err := unix.Open(filepath.Join(t.TempDir(), "held"), unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fault := errors.New("close reported failure after descriptor release")
-	owner := &leaseDatabaseFile{fd: fd, closeFD: func(fd int) error {
-		if err := unix.Close(fd); err != nil {
-			t.Fatal(err)
-		}
-		return fault
-	}}
-	if err := owner.Close(); !errors.Is(err, fault) {
-		t.Fatal(err)
-	}
-	reused, err := unix.Open(filepath.Join(t.TempDir(), "replacement"), unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer unix.Close(reused)
-	owner.closeFD = func(int) error { t.Fatal("descriptor closure was retried"); return nil }
-	if err := owner.Close(); !errors.Is(err, fault) {
-		t.Fatal(err)
-	}
-	var stat unix.Stat_t
-	if err := unix.Fstat(reused, &stat); err != nil {
-		t.Fatalf("replacement descriptor was closed: %v", err)
 	}
 }
 

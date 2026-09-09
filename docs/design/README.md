@@ -50,6 +50,7 @@ docs/design/
     architecture.md       server 角色内部
     file-locks.md         文件占有、动作结果、发布顺序与重启恢复
     file-handles.md       保留对象、逐次修改、标准 advisory 与会话生命周期
+    sqlite-modules.md     SQLite 内部组件、依赖与原子操作归属
     local-disk-object-store.md
                           本地持久对象存储的磁盘格式、提交见证、打开与恢复协议
   client/

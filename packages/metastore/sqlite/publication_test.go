@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"path/filepath"
 	"reflect"
@@ -17,6 +18,165 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
+
+func TestRawStoreRejectsEnableLocks(t *testing.T) {
+	config := lockingTestConfig(t)
+	store, err := OpenWithOptions(t.Context(), config.Database, config.Namespace, 0, DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := store.EnableLocks(t.Context(), locking.DefaultOptions()); !errors.Is(err, syscall.EINVAL) ||
+		locking.CodeOf(err) != locking.Invalid {
+		t.Fatalf("raw store enabled lock authority: %v", err)
+	}
+	assertNoLeaseAuthority(t, store)
+	if err := store.Create(t.Context(), "ordinary"); err != nil {
+		t.Fatalf("rejected authority changed ordinary mutation behavior: %v", err)
+	}
+	if _, err := store.Stat(t.Context(), "ordinary"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSQLitePublicationDistinguishesPreparationFailureFromUncertainUnwind(t *testing.T) {
+	for _, failedUnwind := range []bool{false, true} {
+		t.Run(fmt.Sprintf("unwind failed %t", failedUnwind), func(t *testing.T) {
+			f := newPublicationFixture(t)
+			if err := f.store.CheckPublicationAccounting(); err != nil {
+				t.Fatalf("native accounting capability: %v", err)
+			}
+			f.put(t, t.Context(), "file", 3)
+			before := f.node(t, "file")
+			object := f.stage(t, t.Context(), "file", 7)
+			owner := f.owner(t)
+			grant := f.grant(t, owner, "file", locking.Exclusive)
+			primary := errors.New("quota preparation unavailable")
+			var unwind error
+			if failedUnwind {
+				unwind = errors.New("quota reservation could not be released")
+				*f.authorityFence = unwind
+			}
+			settlements := 0
+			ctx := storage.WithPublicationAccounting(publicationScope(t.Context(), owner, grant),
+				func(_, _ int64) (storage.PublicationSettlement, error) {
+					return func(result storage.PublicationResult) error {
+						settlements++
+						if result != storage.PublicationNotApplied {
+							t.Errorf("preparation rollback settled %v, want NotApplied", result)
+						}
+						return unwind
+					}, primary
+				})
+			err := f.store.Commit(ctx, "file", object)
+			if storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, primary) || settlements != 1 ||
+				storage.IsPublicationAccountingUncertain(err) != failedUnwind {
+				t.Fatalf("preparation returned %v, settlements=%d, failed unwind=%v", err, settlements, failedUnwind)
+			}
+			if failedUnwind && !errors.Is(err, unwind) {
+				t.Fatalf("preparation lost the unwind cause: %v", err)
+			}
+			status, statusErr := f.store.locks.Status(t.Context())
+			if statusErr != nil || status.Unavailable != failedUnwind {
+				t.Fatalf("preparation left authority status %+v, error %v", status, statusErr)
+			}
+			var size int64
+			var content string
+			if err := f.store.read.QueryRowContext(t.Context(),
+				`SELECT size, content FROM nodes WHERE id = ?`, before.ID).Scan(&size, &content); err != nil ||
+				size != before.Size || content != string(before.Content) {
+				t.Fatalf("preparation changed native file to %d/%q: %v", size, content, err)
+			}
+			if failedUnwind {
+				if _, err := f.store.Stat(t.Context(), "file"); storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, unwind) {
+					t.Fatalf("uncertain accounting did not fence native reads: %v", err)
+				}
+			} else if state, err := f.store.locks.QueryGrant(t.Context(), owner, grant); err != nil || state.State != locking.Active {
+				t.Fatalf("known preparation refusal displaced the grant: %+v, %v", state, err)
+			}
+		})
+	}
+}
+
+type failedPublicationWitness struct{ cause error }
+
+func (w failedPublicationWitness) Accept(DurableState) error   { return w.cause }
+func (failedPublicationWitness) Checkpoint(DurableState) error { return nil }
+
+func TestSQLitePublicationDurabilityFailureFencesBothAuthorities(t *testing.T) {
+	f := newPublicationFixture(t)
+	f.put(t, t.Context(), "file", 3)
+	object := f.stage(t, t.Context(), "file", 7)
+	owner := f.owner(t)
+	grant := f.grant(t, owner, "file", locking.Exclusive)
+	witnessFailure := context.Canceled
+	settlementFailure := errors.New("quota outcome could not be recorded")
+	*f.authorityFence = witnessFailure
+	f.store.witness = failedPublicationWitness{cause: witnessFailure}
+	defer func() { f.store.witness = nil }()
+	settlements := 0
+	ctx := storage.WithPublicationAccounting(publicationScope(t.Context(), owner, grant),
+		func(_, _ int64) (storage.PublicationSettlement, error) {
+			return func(result storage.PublicationResult) error {
+				settlements++
+				if result != storage.PublicationUnknown {
+					t.Errorf("unconfirmed durability settled as %v, want Unknown", result)
+				}
+				return settlementFailure
+			}, nil
+		})
+	err := f.store.Commit(ctx, "file", object)
+	if storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, witnessFailure) || !errors.Is(err, settlementFailure) || settlements != 1 {
+		t.Fatalf("unconfirmed commit = %v after %d settlements, want both causes and EIO", err, settlements)
+	}
+	status, err := f.store.locks.Status(t.Context())
+	if err != nil || !status.Unavailable {
+		t.Fatalf("authority accepted an unconfirmed namespace: %+v, %v", status, err)
+	}
+	if _, err := f.store.Stat(t.Context(), "file"); storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, witnessFailure) {
+		t.Fatalf("namespace read after unconfirmed durability = %v", err)
+	}
+	var size int64
+	if err := f.store.read.QueryRowContext(t.Context(),
+		`SELECT size FROM nodes WHERE namespace = ? AND content = ?`, f.store.namespace, string(object.Key)).Scan(&size); err != nil {
+		t.Fatal(err)
+	}
+	if size != object.Size {
+		t.Fatalf("SQLite stored %d bytes before the witness failed, want %d", size, object.Size)
+	}
+}
+
+func TestSQLitePublicationFenceDoesNotRetainClosedPoolBookkeeping(t *testing.T) {
+	for _, abort := range []bool{false, true} {
+		name := "close"
+		if abort {
+			name = "abort"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := newPublicationFixture(t)
+			fence := errors.New("publication outcome unavailable")
+			*fixture.authorityFence = fence
+			fixture.store.locks.Fence(fence)
+			closeStore := fixture.store.Close
+			if abort {
+				closeStore = fixture.store.Abort
+			}
+			if err := closeStore(); !errors.Is(err, fence) {
+				t.Fatalf("closing a fenced namespace returned %v, want original fence", err)
+			}
+			databaseCoordinators.Lock()
+			retained := databaseCoordinators.byPath[fixture.store.coordinator.key]
+			databaseCoordinators.Unlock()
+			if retained != nil {
+				t.Fatal("successfully closed SQL pools retained a coordinator reference")
+			}
+		})
+	}
+}
 
 type publicationClock struct {
 	mu     sync.Mutex
