@@ -90,6 +90,13 @@ Blob-dependent tests, waiting for it to answer requests. The mounted job needs i
 the real Azure binary lock and restart tests; its later module-wide coverage gate uses
 the same running emulator.
 
+Both jobs use [the shared Go setup action](.github/actions/setup-go/action.yml), which
+pins Go 1.26.8 and owns a combined module/build cache for each job, toolchain,
+dependency hash and source SHA. A same-job prefix and a verified legacy archive
+can seed new snapshots. This cache reuses compilation work; every test still runs
+with `-count=1`. [The cache decision](.agents/notes/implemented/process/2026-09-09-refresh-ci-go-build-caches.md)
+records the restore compatibility and upload/storage costs.
+
 CI also enforces the following checks.
 
 **`-count=1` on every invocation.** The test cache keys on environment variables but not on

@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/codetreker/remote-fs/packages/storage/replicated"
 )
 
 // TestWhatOneMountpointWritesAnotherReads is the claim the project exists to make:
@@ -281,7 +283,10 @@ func TestASymbolicLinkSurvivesTheWholeChain(t *testing.T) {
 // own here rather than one standing in for the rest.
 func TestAnUnreachableServerFailsRatherThanAnswering(t *testing.T) {
 	s := serveNamespace(t)
-	a := mountpointOn(t, s)
+	a, served := mountNamespaceOn(t, s)
+	if _, ok := served.(*replicated.Storage); !ok {
+		t.Fatalf("mount storage is %T, want a metadata replica", served)
+	}
 
 	if err := os.WriteFile(filepath.Join(a, "a.txt"), []byte("hello\n"), 0o644); err != nil {
 		t.Fatalf("writing a.txt through A: %v", err)
@@ -295,11 +300,11 @@ func TestAnUnreachableServerFailsRatherThanAnswering(t *testing.T) {
 
 	s.stop()
 
-	// The mountpoint learns that the server is gone when the stream it is fed by ends, which
-	// is a moment after the listener closed rather than at the instant it closed. Waiting for
-	// that is not what is being tested: what is tested is every answer given afterwards.
-	settled(t, "the mountpoint noticing that the server is gone", func() bool {
-		_, err := os.Lstat(filepath.Join(a, "a.txt"))
+	// Inode attributes use authoritative StatNode requests and can fail before the
+	// event follower invalidates the copy. Wait on the mounted replica itself so
+	// every OS assertion starts after the stream failure is observed.
+	settled(t, "the metadata replica noticing that the server is gone", func() bool {
+		_, err := served.Stat(t.Context(), "")
 		return errnoOf(err) == syscall.EIO
 	})
 

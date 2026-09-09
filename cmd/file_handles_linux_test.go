@@ -17,14 +17,31 @@ func TestBinariesRetainLiveFilesAndExclusiveAdvisoryLocks(t *testing.T) {
 	requireFUSE(t)
 	for _, mode := range []string{"local-store", "azure-blob"} {
 		t.Run(mode, func(t *testing.T) {
+			type processLog struct {
+				label   string
+				process *process
+			}
+			var logs []processLog
+			// Registered first so process cleanup finishes collecting output before
+			// we report failures, including errors from session retirement.
+			t.Cleanup(func() {
+				if t.Failed() {
+					for _, entry := range logs {
+						t.Logf("%s output:\n%s", entry.label, entry.process.output())
+					}
+				}
+			})
 			server := startServerBinary(t, append(binaryLockNamespace(t, mode), "-initialize-lock-state")...)
+			logs = append(logs, processLog{"server", server.process})
 			remote := dialLockServer(t, server)
 			if err := remote.Write(t.Context(), "artifact", []byte("original")); err != nil {
 				t.Fatal(err)
 			}
 			a, b := t.TempDir(), t.TempDir()
 			first := startMountBinary(t, "-server", server.url, "-mountpoint", a)
+			logs = append(logs, processLog{"mount A", first})
 			second := startMountBinary(t, "-server", server.url, "-mountpoint", b)
+			logs = append(logs, processLog{"mount B", second})
 			writer := openBinaryFile(t, filepath.Join(a, "artifact"), os.O_RDWR, false)
 			reader := openBinaryFile(t, filepath.Join(b, "artifact"), os.O_RDONLY, false)
 			if err := syscall.Flock(int(writer.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {

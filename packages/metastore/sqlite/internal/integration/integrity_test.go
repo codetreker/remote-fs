@@ -1,11 +1,13 @@
 package integration_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"math"
+	"os"
 	"syscall"
 	"testing"
 
@@ -560,7 +562,89 @@ func newObjectIntegrityFixture(t *testing.T) objectIntegrityFixture {
 	if err := db.QueryRow(`SELECT id FROM namespaces WHERE name = 'workspace'`).Scan(&fixture.workspace); err != nil {
 		t.Fatal(err)
 	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
 	return fixture
+}
+
+type objectIntegrityImage struct {
+	fixture objectIntegrityFixture
+	data    []byte
+}
+
+func (image objectIntegrityImage) clone(t *testing.T) objectIntegrityFixture {
+	t.Helper()
+	fixture := image.fixture
+	fixture.path = database(t)
+	if err := os.WriteFile(fixture.path, image.data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return fixture
+}
+
+// Corruption cases need independent copies of the same valid state. Checkpointing
+// after every seed handle closes makes the database file the complete fixture.
+func newObjectIntegrityImage(t *testing.T) objectIntegrityImage {
+	t.Helper()
+	fixture := newObjectIntegrityFixture(t)
+	db := raw(t, fixture.path)
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	var journal string
+	if err := db.QueryRow(`PRAGMA journal_mode`).Scan(&journal); err != nil || journal != "wal" {
+		t.Fatalf("fixture journal mode=%q, error=%v; want wal", journal, err)
+	}
+	var busy, frames, checkpointed int
+	if err := db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &frames, &checkpointed); err != nil {
+		t.Fatal(err)
+	}
+	if busy != 0 || frames != 0 || checkpointed != 0 {
+		t.Fatalf("fixture checkpoint incomplete: busy=%d frames=%d checkpointed=%d", busy, frames, checkpointed)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(fixture.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	image := objectIntegrityImage{fixture: fixture, data: data}
+	t.Cleanup(func() {
+		current, err := os.ReadFile(fixture.path)
+		if err != nil || !bytes.Equal(current, image.data) {
+			t.Errorf("integrity seed changed after cloning: %v", err)
+		}
+	})
+	image.checkClones(t)
+	return image
+}
+
+func (image objectIntegrityImage) checkClones(t *testing.T) {
+	t.Helper()
+	first := image.clone(t)
+	changed := open(t, first.path, "workspace", 0)
+	const probe = "clone-isolation-probe"
+	if err := changed.Create(t.Context(), probe); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := changed.Stat(t.Context(), probe); err != nil {
+		t.Fatalf("clone mutation was not observable: %v", err)
+	}
+	if err := changed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second := image.clone(t)
+	unchanged := open(t, second.path, "workspace", 0)
+	if _, err := unchanged.ObjectStatus(t.Context()); err != nil {
+		t.Fatalf("healthy integrity clone failed validation: %v", err)
+	}
+	if _, err := unchanged.Stat(t.Context(), probe); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("another clone observed an isolated mutation: %v", err)
+	}
+	if err := unchanged.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func damageDatabase(t *testing.T, path, statement string, args ...any) {
@@ -647,6 +731,7 @@ func makeFileSizesOverflow(t *testing.T, fixture objectIntegrityFixture) {
 const nodeNamed = `id = (SELECT node FROM entries WHERE namespace = ? AND name = CAST(? AS BLOB))`
 
 func TestOpenRefusesInconsistentNamespaceIntegrity(t *testing.T) {
+	image := newObjectIntegrityImage(t)
 	tests := []struct {
 		name   string
 		damage func(*testing.T, objectIntegrityFixture)
@@ -814,7 +899,7 @@ func TestOpenRefusesInconsistentNamespaceIntegrity(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newObjectIntegrityFixture(t)
+			fixture := image.clone(t)
 			test.damage(t, fixture)
 
 			store, err := sqlite.Open(t.Context(), fixture.path, "workspace", 0, sqlite.DefaultWindow())
@@ -994,6 +1079,7 @@ func TestRetainedNodesRemainInsideIntegrityWorkLimit(t *testing.T) {
 }
 
 func TestRetainedIntegrityRefusesInvalidDetachedState(t *testing.T) {
+	image := newObjectIntegrityImage(t)
 	for _, damage := range []struct {
 		name string
 		sql  string
@@ -1022,7 +1108,7 @@ func TestRetainedIntegrityRefusesInvalidDetachedState(t *testing.T) {
 	} {
 		for _, entry := range []string{"open", "status"} {
 			t.Run(fmt.Sprintf("%s/%s", damage.name, entry), func(t *testing.T) {
-				f := newObjectIntegrityFixture(t)
+				f := image.clone(t)
 				detachIntegrityFile(t, f)
 				var store *sqlite.Store
 				if entry == "status" {

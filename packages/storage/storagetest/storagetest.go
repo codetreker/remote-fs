@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"math"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -422,6 +423,8 @@ var cases = []testCase{
 
 		seen := make([]map[int]int, readers)
 		lost := make([]int, readers)
+		// We yield between observations to let the writer make progress while
+		// both readers continue sampling.
 		for r := range readers {
 			seen[r] = map[int]int{}
 			wg.Add(1)
@@ -444,6 +447,7 @@ var cases = []testCase{
 					// reads were fine, below.
 					case errors.Is(err, syscall.EAGAIN):
 						lost[r]++
+						runtime.Gosched()
 						continue
 					case err != nil:
 						t.Errorf("read while a write was in flight: %v", err)
@@ -458,6 +462,7 @@ var cases = []testCase{
 						return
 					}
 					seen[r][which]++
+					runtime.Gosched()
 				}
 			}()
 		}

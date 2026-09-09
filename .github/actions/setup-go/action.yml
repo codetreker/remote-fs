@@ -1,0 +1,40 @@
+name: Prepare Go
+description: Select the toolchain and restore each job's Go cache snapshot.
+
+runs:
+  using: composite
+  steps:
+    - id: go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: '1.26.8'
+        cache: false
+
+    - id: cache
+      shell: bash
+      env:
+        RFS_GO_VERSION: ${{ steps.go.outputs.go-version }}
+        RFS_DEPENDENCY_HASH: ${{ hashFiles('go.sum') }}
+      run: |
+        set -euo pipefail
+        test -n "$RFS_DEPENDENCY_HASH"
+        platform="${RUNNER_OS}-${RUNNER_ARCH,,}-${ImageOS}"
+        prefix="rfs-go-v1-${platform}-go-${RFS_GO_VERSION}-${GITHUB_JOB}-${RFS_DEPENDENCY_HASH}"
+        {
+          # The path strings and their order retain the existing archive version.
+          # https://github.com/actions/setup-go/blob/b7ad1dad31e06c5925ef5d2fc7ad053ef454303e/src/package-managers.ts#L10-L14
+          echo 'paths<<GO_CACHE_PATHS'
+          go env GOMODCACHE GOCACHE
+          echo 'GO_CACHE_PATHS'
+          echo "key=${prefix}-${GITHUB_SHA}"
+          echo "prefix=${prefix}-"
+          echo "legacy=setup-go-${platform}-go-${RFS_GO_VERSION}-${RFS_DEPENDENCY_HASH}"
+        } >> "$GITHUB_OUTPUT"
+
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.cache.outputs.paths }}
+        key: ${{ steps.cache.outputs.key }}
+        restore-keys: |
+          ${{ steps.cache.outputs.prefix }}
+          ${{ steps.cache.outputs.legacy }}
