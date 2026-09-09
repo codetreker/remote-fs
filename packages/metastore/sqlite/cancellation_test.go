@@ -11,84 +11,9 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
-
-type sqliteCodeError int
-
-func (e sqliteCodeError) Error() string { return fmt.Sprintf("SQLite code %d", e) }
-func (e sqliteCodeError) Code() int     { return int(e) }
-
-func TestFailurePreservesCancellationAndIndependentFailures(t *testing.T) {
-	fault := errors.New("database unavailable")
-	for _, test := range []struct {
-		name string
-		err  error
-		want syscall.Errno
-	}{
-		{"cancellation", context.Canceled, syscall.EINTR},
-		{"wrapped cancellation", fmt.Errorf("read: %w", context.Canceled), syscall.EINTR},
-		{"joined cancellation", errors.Join(context.Canceled, syscall.EINTR), syscall.EINTR},
-		{"deadline", context.DeadlineExceeded, syscall.EIO},
-		{"unknown", fault, syscall.EIO},
-		{"unknown write interruption", sqliteCodeError(9), syscall.EIO},
-		{"cancellation before fault", errors.Join(context.Canceled, fault), syscall.EIO},
-		{"fault before cancellation", errors.Join(fault, context.Canceled), syscall.EIO},
-		{"cancellation before errno", errors.Join(context.Canceled, syscall.ENOENT), syscall.ENOENT},
-		{"errno before cancellation", errors.Join(syscall.ENOENT, context.Canceled), syscall.ENOENT},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			err := failure(test.err)
-			if got := storage.ErrnoOf(err); got != test.want || !errors.Is(err, test.err) {
-				t.Fatalf("failure(%v) = %v (%v), want %v retaining its cause", test.err, err, got, test.want)
-			}
-			if (test.want == syscall.EIO) != errors.Is(err, syscall.EIO) {
-				t.Fatalf("failure(%v) has incorrect EIO decoration: %v", test.err, err)
-			}
-		})
-	}
-}
-
-func TestInterruptedReadRequiresCancellationAndPreservesFaults(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	deadline, finish := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
-	defer finish()
-	fault := errors.New("database corrupt")
-	interrupt := sqliteCodeError(9)
-	for _, test := range []struct {
-		name string
-		ctx  context.Context
-		err  error
-		want syscall.Errno
-	}{
-		{"active context", t.Context(), interrupt, syscall.EIO},
-		{"completed transaction with active context", t.Context(), sql.ErrTxDone, syscall.EIO},
-		{"automatically rolled back transaction", ctx, sql.ErrTxDone, syscall.EINTR},
-		{"wrapped transaction completion", ctx, fmt.Errorf("query: %w", sql.ErrTxDone), syscall.EIO},
-		{"canceled read", ctx, interrupt, syscall.EINTR},
-		{"wrapped interrupted read", ctx, fmt.Errorf("query: %w", interrupt), syscall.EINTR},
-		{"driver before cancellation", ctx, errors.Join(interrupt, context.Canceled), syscall.EINTR},
-		{"cancellation before driver", ctx, errors.Join(context.Canceled, interrupt), syscall.EINTR},
-		{"expired read", deadline, interrupt, syscall.EIO},
-		{"another SQLite error", ctx, sqliteCodeError(11), syscall.EIO},
-		{"canceled context with fault", ctx, fault, syscall.EIO},
-		{"driver before fault", ctx, errors.Join(interrupt, fault), syscall.EIO},
-		{"fault before driver", ctx, errors.Join(fault, interrupt), syscall.EIO},
-		{"uncertain commit", ctx, &uncertainCommitError{err: interrupt}, syscall.EIO},
-		{"durability failure", ctx, &durabilityFailure{err: interrupt}, syscall.EIO},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			err := readFailure(test.ctx, test.err)
-			if got := storage.ErrnoOf(err); got != test.want || !errors.Is(err, test.err) {
-				t.Fatalf("readFailure(%v) = %v (%v), want %v retaining its cause", test.err, err, got, test.want)
-			}
-			if test.want == syscall.EINTR && (!errors.Is(err, context.Canceled) || errors.Is(err, syscall.EIO)) {
-				t.Fatalf("interrupted read lost cancellation or gained EIO: %v", err)
-			}
-		})
-	}
-}
 
 func TestReadTransactionDistinguishesAutomaticRollbackFromCleanupFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
@@ -146,7 +71,7 @@ func TestReadTransactionDistinguishesAutomaticRollbackFromCleanupFailure(t *test
 func TestLabeledReadCancellationSurvivesTransactionCleanup(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	primary := fmt.Errorf("validating namespace integrity: %w", readFailure(ctx, sql.ErrTxDone))
+	primary := fmt.Errorf("validating namespace integrity: %w", sqlerr.ReadFailure(ctx, sql.ErrTxDone))
 	tx := &rollbackFailure{err: sql.ErrTxDone}
 	err := finishReadTransaction(ctx, "object status transaction", tx, primary)
 	if storage.ErrnoOf(err) != syscall.EINTR || !errors.Is(err, sql.ErrTxDone) ||

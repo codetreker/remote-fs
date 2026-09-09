@@ -8,6 +8,9 @@ import (
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/schema"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
 )
 
 // Snapshot opens a consistent picture of the whole tree and reports the position it is taken
@@ -38,19 +41,19 @@ func (s *Store) Snapshot(ctx context.Context) (metastore.Snap, metastore.Positio
 		`SELECT CASE WHEN typeof(committed_position) = 'integer' THEN committed_position END,
 		        typeof(committed_position)
 		 FROM logs WHERE namespace = ?`, s.namespace).Scan(&committedRaw, &committedType); err != nil {
-		primary := fmt.Errorf("opening a picture of the tree: %w", readFailure(ctx, err))
+		primary := fmt.Errorf("opening a picture of the tree: %w", sqlerr.ReadFailure(ctx, err))
 		return nil, 0, finishReadTransaction(ctx, "snapshot transaction", tx, primary)
 	}
-	committed, ok := storedInteger(committedRaw, committedType)
+	committed, ok := sqlvalue.StoredInteger(committedRaw, committedType)
 	if !ok || committed < 0 {
 		primary := fmt.Errorf("opening a picture of the tree: the log stores an invalid committed position: %w",
 			syscall.EIO)
 		return nil, 0, finishReadTransaction(ctx, "snapshot transaction", tx, primary)
 	}
-	if err := validateNamespaceIntegrity(
+	if err := schema.ValidateNamespaceIntegrity(
 		ctx, tx, s.namespace, s.maxIntegrityRecords, s.maxIntegrityBytes,
 	); err != nil {
-		primary := fmt.Errorf("validating the picture of the tree: %w", readFailure(ctx, err))
+		primary := fmt.Errorf("validating the picture of the tree: %w", sqlerr.ReadFailure(ctx, err))
 		return nil, 0, finishReadTransaction(ctx, "snapshot transaction", tx, primary)
 	}
 	// The cursor starts before every entry there is. The name is an empty blob rather than
@@ -164,9 +167,9 @@ func (p *snapshot) Next(ctx context.Context, limit int, result *metastore.RowRes
 
 func (p *snapshot) readFailure(ctx context.Context, err error) error {
 	if err == sql.ErrTxDone {
-		return readFailure(p.ctx, err)
+		return sqlerr.ReadFailure(p.ctx, err)
 	}
-	return readFailure(ctx, err)
+	return sqlerr.ReadFailure(ctx, err)
 }
 
 // pageQuery reads the fixed-width metadata and payload lengths of the next entry after a
@@ -232,8 +235,8 @@ func (s *nodeMetadataScan) fields() []any {
 func (s nodeMetadataScan) node() metastore.Node {
 	return metastore.Node{
 		ID: s.id, Mode: fs.FileMode(s.mode), Size: s.size,
-		AccessTime: loadedTime(s.atimeSec, s.atimeNsec),
-		ModTime:    loadedTime(s.mtimeSec, s.mtimeNsec),
+		AccessTime: sqlvalue.LoadedTime(s.atimeSec, s.atimeNsec),
+		ModTime:    sqlvalue.LoadedTime(s.mtimeSec, s.mtimeNsec),
 	}
 }
 

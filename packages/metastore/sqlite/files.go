@@ -9,8 +9,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/advisory"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/nativelease"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -126,7 +131,7 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 			return err
 		})
 		if err != nil {
-			return nil, failure(err)
+			return nil, sqlerr.Failure(err)
 		}
 	}
 	if modify {
@@ -139,10 +144,10 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 			intent.paths = []string{path}
 		}
 		if err := s.mutateTransactionLocked(ctx, ctx, intent, resolve); err != nil {
-			return nil, failure(err)
+			return nil, sqlerr.Failure(err)
 		}
 	} else if err := s.inspect(ctx, resolve); err != nil {
-		return nil, failure(err)
+		return nil, sqlerr.Failure(err)
 	}
 	f := &retainedFile{store: s, id: state.ID, read: options.Read, write: options.Write, active: true}
 	s.files[f] = struct{}{}
@@ -153,8 +158,8 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 
 func (s *Store) createOpenNode(ctx context.Context, tx *sql.Tx, parent metastore.Node, name []byte, options storage.FileOpenOptions) (metastore.Node, error) {
 	now := time.Now()
-	sec, nsec := storedTime(now)
-	id, err := allocateNodeID(ctx, tx)
+	sec, nsec := sqlvalue.StoredTime(now)
+	id, err := dbstate.AllocateNodeID(ctx, tx)
 	if err != nil {
 		return metastore.Node{}, err
 	}
@@ -215,7 +220,7 @@ func (f *retainedFile) Node(ctx context.Context) (metastore.FileState, error) {
 	}
 	var state metastore.FileState
 	err := f.store.inspect(ctx, func(tx *sql.Tx) error { var err error; state, err = f.store.fileState(ctx, tx, f.id); return err })
-	return state, failure(err)
+	return state, sqlerr.Failure(err)
 }
 
 func (f *retainedFile) Reserve(ctx context.Context, size int64) (metastore.Key, error) {
@@ -228,11 +233,11 @@ func (f *retainedFile) Reserve(ctx context.Context, size int64) (metastore.Key, 
 	if size > f.store.objectLimits.MaxPendingBytes {
 		return "", syscall.EFBIG
 	}
-	key, err := newKey()
+	key, err := sqlvalue.NewKey()
 	if err != nil {
 		return "", err
 	}
-	sec, nsec := storedTime(time.Now())
+	sec, nsec := sqlvalue.StoredTime(time.Now())
 	err = f.store.mutate(ctx, func(tx *sql.Tx) error {
 		if err := f.check(); err != nil {
 			return err
@@ -247,7 +252,7 @@ func (f *retainedFile) Reserve(ctx context.Context, size int64) (metastore.Key, 
 		return f.store.reserveObject(ctx, tx, key, size, sec, nsec)
 	})
 	if err != nil {
-		return "", failure(err)
+		return "", sqlerr.Failure(err)
 	}
 	return key, nil
 }
@@ -277,7 +282,7 @@ func (f *retainedFile) Commit(ctx context.Context, expected uint64, object metas
 		state, err = f.store.fileState(ctx, tx, f.id)
 		return err
 	})
-	return state, failure(err)
+	return state, sqlerr.Failure(err)
 }
 
 func (s *Store) advanceContentRevision(ctx context.Context, tx *sql.Tx, id int64) error {
@@ -318,8 +323,8 @@ func (s *Store) replaceNodeContent(ctx context.Context, tx *sql.Tx, node metasto
 	if err := s.account(ctx, tx, object.Size-node.Size); err != nil {
 		return err
 	}
-	sec, nsec := storedTime(object.ModTime)
-	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET size=?,mtime_sec=?,mtime_nsec=?,content=? WHERE namespace=? AND id=?`, object.Size, sec, nsec, storedKey(object.Key), s.namespace, node.ID); err != nil {
+	sec, nsec := sqlvalue.StoredTime(object.ModTime)
+	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET size=?,mtime_sec=?,mtime_nsec=?,content=? WHERE namespace=? AND id=?`, object.Size, sec, nsec, sqlvalue.StoredKey(object.Key), s.namespace, node.ID); err != nil {
 		return err
 	}
 	if object.Key != "" {
@@ -362,7 +367,7 @@ func (f *retainedFile) SetAttr(ctx context.Context, change storage.AttrChange) (
 		state, err = f.store.fileState(ctx, tx, f.id)
 		return err
 	})
-	return state, failure(err)
+	return state, sqlerr.Failure(err)
 }
 
 func (s *Store) setNodeAttr(ctx context.Context, tx *sql.Tx, id int64, change storage.AttrChange) error {
@@ -385,7 +390,7 @@ func (s *Store) StatNode(ctx context.Context, id uint64) (metastore.Node, error)
 	}
 	var node metastore.Node
 	err := s.inspect(ctx, func(tx *sql.Tx) error { var err error; node, err = s.nodeByID(ctx, tx, int64(id)); return err })
-	return node, failure(err)
+	return node, sqlerr.Failure(err)
 }
 
 func (s *Store) SetNodeAttr(ctx context.Context, id uint64, change storage.AttrChange) (metastore.Node, error) {
@@ -404,7 +409,7 @@ func (s *Store) SetNodeAttr(ctx context.Context, id uint64, change storage.AttrC
 		node, err = s.nodeByID(ctx, tx, int64(id))
 		return err
 	})
-	return node, failure(err)
+	return node, sqlerr.Failure(err)
 }
 
 func (s *Store) Usage(ctx context.Context) (int64, error) {
@@ -415,7 +420,7 @@ func (s *Store) Usage(ctx context.Context) (int64, error) {
 	if err == nil && used < 0 {
 		err = syscall.EIO
 	}
-	return used, failure(err)
+	return used, sqlerr.Failure(err)
 }
 
 func (f *retainedFile) Retire(ctx context.Context) error {
@@ -448,7 +453,7 @@ func (f *retainedFile) Close(ctx context.Context) error {
 			return tx.QueryRowContext(ctx, `SELECT detached FROM nodes WHERE namespace=? AND id=?`, s.namespace, f.id).Scan(&detached)
 		})
 		if err != nil {
-			return failure(err)
+			return sqlerr.Failure(err)
 		}
 		if detached {
 			err = s.mutateTransactionLocked(ctx, ctx, &namespaceIntent{kind: locking.RemoveMutation, node: f.id, cleanup: true}, func(tx *sql.Tx) error {
@@ -460,14 +465,14 @@ func (f *retainedFile) Close(ctx context.Context) error {
 			})
 			if err != nil {
 				if s.coordinator.healthy() != nil || storage.IsPublicationAccountingUncertain(err) {
-					f.closeErr = failure(err)
+					f.closeErr = sqlerr.Failure(err)
 					s.coordinator.poisonWith(f.closeErr)
 					if s.locks != nil {
 						s.locks.Fence(f.closeErr)
 					}
 					return f.closeErr
 				}
-				return failure(err)
+				return sqlerr.Failure(err)
 			}
 		}
 		delete(s.coordinator.pins, key)
@@ -478,4 +483,80 @@ func (f *retainedFile) Close(ctx context.Context) error {
 	s.fileDomain.files--
 	f.closed = true
 	return nil
+}
+
+type fileDomain struct {
+	config      advisory.Config
+	coordinator *advisory.Coordinator
+	stores      int
+	maxFiles    int
+	files       int
+}
+
+func (s *Store) attachFileDomain(options Options) error {
+	domain := s.coordinator.domains[s.namespace]
+	if domain == nil {
+		coordinator, err := advisory.New(options.Advisory)
+		if err != nil {
+			return err
+		}
+		domain = &fileDomain{config: options.Advisory, coordinator: coordinator, maxFiles: options.MaxRetainedFiles}
+		s.coordinator.domains[s.namespace] = domain
+	} else if domain.config != options.Advisory || domain.maxFiles != options.MaxRetainedFiles {
+		return fmt.Errorf("shared SQLite namespace file limits differ from its active owner: %w", syscall.EINVAL)
+	}
+	domain.stores++
+	s.fileDomain = domain
+	return nil
+}
+
+func (s *Store) releaseFileDomain() {
+	if s.fileDomain == nil {
+		return
+	}
+	s.fileDomain.stores--
+	if s.fileDomain.stores == 0 {
+		delete(s.coordinator.domains, s.namespace)
+	}
+	s.fileDomain = nil
+}
+
+// Advisory returns the authority shared by all Store values for this namespace.
+func (s *Store) Advisory(ctx context.Context) (*advisory.Coordinator, error) {
+	if err := s.coordinator.commit.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer s.coordinator.commit.release()
+	if s.fileDomain == nil || s.files == nil {
+		return nil, syscall.ESTALE
+	}
+	if err := s.checkFileOwnership(); err != nil {
+		return nil, err
+	}
+	if err := s.coordinator.healthy(); err != nil {
+		return nil, err
+	}
+	return s.fileDomain.coordinator, nil
+}
+
+func (s *Store) CheckFileStore() error {
+	// The owner pointer and exclusive mode are immutable after construction.
+	// Its live descriptor and namespace state are checked under publication ordering.
+	if s.leaseOwner == nil || !s.leaseOwner.Exclusive() {
+		return syscall.EOPNOTSUPP
+	}
+	return nil
+}
+
+func (s *Store) checkFileOwnership() error {
+	if s.files == nil {
+		return syscall.ESTALE
+	}
+	if s.leaseOwner == nil || !s.leaseOwner.Exclusive() {
+		return fmt.Errorf("retained files require exclusive native database ownership: %w", syscall.EOPNOTSUPP)
+	}
+	if err := s.coordinator.healthy(); err != nil {
+		return err
+	}
+	return nativelease.VerifyExclusiveOwnership(s.leaseOwner)
 }

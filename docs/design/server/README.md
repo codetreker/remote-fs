@@ -17,6 +17,7 @@ server 是命名空间、保留文件与显式占有的权威持有者：将 sto
 | [`architecture.md`](architecture.md) | server 的内部构成、组件职责、内部数据流 |
 | [`file-handles.md`](file-handles.md) | 保留对象、同步区间修改、标准 advisory owner 与文件会话协议 |
 | [`file-locks.md`](file-locks.md) | 显式 S/X 占有、有限授权与动作历史、原生发布排序、重启恢复和 backend 绑定 |
+| [`sqlite-modules.md`](sqlite-modules.md) | SQLite 公开入口、内部组件、事务所有权与测试资源归属 |
 | [`local-disk-object-store.md`](local-disk-object-store.md) | 随附本地持久 storage 的磁盘格式、身份与 WAL 见证、打开与恢复、容量和维护 |
 
 server 内部若需进一步展开，在本目录增加文档，不影响 client 目录。

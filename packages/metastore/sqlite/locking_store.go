@@ -5,16 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
-	"time"
-
-	"golang.org/x/sys/unix"
 
 	"github.com/codetreker/remote-fs/packages/locking"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/nativelease"
 )
 
 // LockingConfig opens one exclusively owned metadata database with lease enforcement.
@@ -36,7 +33,7 @@ type LockingConfig struct {
 type LockingStore struct {
 	*Store
 	ownerMu sync.Mutex
-	file    *leaseDatabaseFile
+	file    *nativelease.Database
 	anchor  *LeaseAnchor
 }
 
@@ -60,14 +57,14 @@ func OpenLocking(ctx context.Context, config LockingConfig) (*LockingStore, erro
 	if err != nil {
 		return nil, err
 	}
-	file, err := acquireLeaseDatabase(database, true, config.Initialize)
+	file, err := nativelease.AcquireDatabase(database, true, config.Initialize)
 	if err != nil {
 		return nil, err
 	}
-	start := file.acquired
+	start := file.Acquired()
 	anchor, err := OpenLeaseAnchor(LeaseAnchorConfig{
 		Directory: filepath.Dir(database), Name: "." + filepath.Base(database) + ".leases",
-		Identity: "sqlite-database-lease-recovery", BindingFD: file.fd, RecoveryStart: start, Initialize: config.Initialize,
+		Identity: "sqlite-database-lease-recovery", BindingFD: file.FD(), RecoveryStart: start, Initialize: config.Initialize,
 	})
 	if err != nil {
 		return nil, errors.Join(err, file.Close())
@@ -89,7 +86,7 @@ func OpenLocking(ctx context.Context, config LockingConfig) (*LockingStore, erro
 		}
 		return nil, errors.Join(primary, anchor.Close(), file.Close())
 	}
-	if err := verifyLeaseDatabase(file); err != nil {
+	if err := nativelease.VerifyDatabase(file); err != nil {
 		return cleanup(err)
 	}
 	if err := store.ConfigureLeaseRecovery(ctx, LeaseRecoveryConfig{
@@ -114,94 +111,6 @@ func prepareOwnedLeaseNamespace(ctx context.Context, db *sql.DB, namespace, stor
 func prepareExistingOwnedLeaseNamespace(ctx context.Context, db *sql.DB, namespace, storeID string, window Window, maxRecords, maxBytes int64) (int64, int64, error) {
 	id, root, _, err := prepareConfigured(ctx, db, namespace, storeID, window, maxRecords, maxBytes, &durableOpen{mode: RequireExistingNamespace, reapDetached: true})
 	return id, root, err
-}
-
-type leaseDatabaseFile struct {
-	fd        int
-	path      string
-	exclusive bool
-	acquired  time.Time
-	closeFD   func(int) error
-	closeErr  error
-}
-
-func acquireLeaseDatabase(database string, exclusive, create bool) (*leaseDatabaseFile, error) {
-	flags := unix.O_RDWR | unix.O_CLOEXEC | unix.O_NONBLOCK
-	if exclusive {
-		flags |= unix.O_NOFOLLOW
-	}
-	if create {
-		flags |= unix.O_CREAT
-	}
-	fd, err := unix.Open(database, flags, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("opening native metadata ownership: %w", err)
-	}
-	owner := &leaseDatabaseFile{fd: fd, path: database, exclusive: exclusive, closeFD: unix.Close}
-	mode := unix.LOCK_SH
-	if exclusive {
-		mode = unix.LOCK_EX
-	}
-	if err := unix.Flock(fd, mode|unix.LOCK_NB); err != nil {
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			err = syscall.EBUSY
-		}
-		return nil, errors.Join(fmt.Errorf("acquiring native metadata ownership: %w", err), owner.Close())
-	}
-	owner.acquired = time.Now()
-	if err := verifyLeaseDatabase(owner); err != nil {
-		return nil, errors.Join(err, owner.Close())
-	}
-	return owner, nil
-}
-
-func (s *Store) verifyLeaseOwnership() error {
-	owner := s.leaseOwner
-	if owner == nil || !owner.exclusive || owner.fd < 0 || owner.acquired.IsZero() {
-		return fmt.Errorf("lease control requires exclusive native database ownership: %w", syscall.EIO)
-	}
-	if err := verifyLeaseDatabase(owner); err != nil {
-		return err
-	}
-	if err := unix.Flock(owner.fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		return fmt.Errorf("verifying exclusive metadata ownership: %w", err)
-	}
-	probe, err := unix.Open(owner.path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return err
-	}
-	conflict := unix.Flock(probe, unix.LOCK_SH|unix.LOCK_NB)
-	closed := unix.Close(probe)
-	if !errors.Is(conflict, syscall.EWOULDBLOCK) {
-		return fmt.Errorf("native metadata ownership did not exclude a conflicting reader: %w", errors.Join(syscall.EIO, conflict, closed))
-	}
-	return closed
-}
-
-func (f *leaseDatabaseFile) Close() error {
-	if f.fd < 0 {
-		return f.closeErr
-	}
-	fd := f.fd
-	f.fd = -1
-	f.closeErr = f.closeFD(fd)
-	return f.closeErr
-}
-
-func verifyLeaseDatabase(file *leaseDatabaseFile) error {
-	var held, current unix.Stat_t
-	if err := unix.Fstat(file.fd, &held); err != nil {
-		return err
-	}
-	err := unix.Stat(file.path, &current)
-	if err != nil {
-		return errors.Join(syscall.EIO, err)
-	}
-	if held.Mode&unix.S_IFMT != unix.S_IFREG || held.Dev != current.Dev || held.Ino != current.Ino ||
-		file.exclusive && (held.Nlink != 1 || held.Uid != uint32(os.Geteuid()) || held.Mode&0o022 != 0) {
-		return fmt.Errorf("the metadata database is not the owned, single-link regular file: %w", syscall.EIO)
-	}
-	return nil
 }
 
 // Close preserves native ownership on any database-close failure, including uncertain

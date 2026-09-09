@@ -211,7 +211,7 @@ func TestRetainedCleanupUnknownAcceptanceKeepsPhysicalOwnership(t *testing.T) {
 	if again := f.Close(ctx); !errors.Is(again, acceptErr) || settlements.Load() != 1 {
 		t.Fatalf("repeated cleanup=%v settlements=%d", again, settlements.Load())
 	}
-	if s.coordinator.pins[retainedNode{s.namespace, ref.id}] != 1 || len(s.files) != 1 || s.leaseOwner.fd < 0 {
+	if s.coordinator.pins[retainedNode{s.namespace, ref.id}] != 1 || len(s.files) != 1 || s.leaseOwner.FD() < 0 {
 		t.Fatal("unknown cleanup released native retention")
 	}
 	if err := s.Close(); !errors.Is(err, syscall.EBUSY) {

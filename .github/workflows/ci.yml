@@ -156,7 +156,7 @@ jobs:
           # cache, which does not notice that /dev/fuse came or went.
           module="$(go list -m)"
           export GOFLAGS="-coverpkg=$module/... -count=1"
-          go-cov --ci --skip-result-packages cmd
+          go-cov --ci --skip-result-packages cmd,packages/metastore/sqlite/internal/integration
 
       # A mount that outlived the test that made it means a t.Cleanup did not do what
       # the test reported it did. This runner is thrown away, so nothing later is at

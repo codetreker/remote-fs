@@ -12,6 +12,9 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -61,8 +64,8 @@ func (s *nodeAttrScan) attr() storage.Attr {
 		ID:         uint64(s.id),
 		Mode:       fs.FileMode(s.mode),
 		Size:       s.size,
-		AccessTime: loadedTime(s.atimeSec, s.atimeNsec),
-		ModTime:    loadedTime(s.mtimeSec, s.mtimeNsec),
+		AccessTime: sqlvalue.LoadedTime(s.atimeSec, s.atimeNsec),
+		ModTime:    sqlvalue.LoadedTime(s.mtimeSec, s.mtimeNsec),
 	}
 }
 
@@ -79,8 +82,8 @@ func (s *nodeScan) node() metastore.Node {
 		ID:         s.id,
 		Mode:       fs.FileMode(s.mode),
 		Size:       s.size,
-		AccessTime: loadedTime(s.atimeSec, s.atimeNsec),
-		ModTime:    loadedTime(s.mtimeSec, s.mtimeNsec),
+		AccessTime: sqlvalue.LoadedTime(s.atimeSec, s.atimeNsec),
+		ModTime:    sqlvalue.LoadedTime(s.mtimeSec, s.mtimeNsec),
 		Content:    metastore.Key(s.content.String),
 	}
 }
@@ -180,7 +183,7 @@ func (s *Store) Stat(ctx context.Context, path string) (metastore.Node, error) {
 		node = found
 		return err
 	}); err != nil {
-		return metastore.Node{}, pathError("stat", path, failure(err))
+		return metastore.Node{}, pathError("stat", path, sqlerr.Failure(err))
 	}
 	return node, nil
 }
@@ -210,7 +213,7 @@ func (s *Store) List(ctx context.Context, path string) ([]metastore.Child, error
 		children, err = s.listChildren(ctx, tx, dir.ID)
 		return err
 	}); err != nil {
-		return nil, pathError("list", path, failure(err))
+		return nil, pathError("list", path, sqlerr.Failure(err))
 	}
 	return children, nil
 }
@@ -241,7 +244,7 @@ func (s *Store) ListBounded(ctx context.Context, path string, result *storage.Li
 		}
 		return s.listChildrenBounded(ctx, tx, dir.ID, result)
 	}); err != nil {
-		return pathError("list", path, failure(err))
+		return pathError("list", path, sqlerr.Failure(err))
 	}
 	return nil
 }
@@ -391,7 +394,7 @@ func (s *Store) SetAttr(ctx context.Context, path string, change storage.AttrCha
 		}
 		return s.recordChanged(ctx, tx, node.ID)
 	}); err != nil {
-		return pathError("setattr", path, failure(err))
+		return pathError("setattr", path, sqlerr.Failure(err))
 	}
 	return nil
 }
@@ -411,12 +414,12 @@ func applyChange(ctx context.Context, tx *sql.Tx, node metastore.Node, change st
 		args = append(args, int64(mode))
 	}
 	if change.AccessTime != nil {
-		sec, nsec := storedTime(*change.AccessTime)
+		sec, nsec := sqlvalue.StoredTime(*change.AccessTime)
 		columns = append(columns, "atime_sec = ?", "atime_nsec = ?")
 		args = append(args, sec, nsec)
 	}
 	if change.ModTime != nil {
-		sec, nsec := storedTime(*change.ModTime)
+		sec, nsec := sqlvalue.StoredTime(*change.ModTime)
 		columns = append(columns, "mtime_sec = ?", "mtime_nsec = ?")
 		args = append(args, sec, nsec)
 	}
@@ -452,8 +455,8 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 			return err
 		}
 		now := time.Now()
-		sec, nsec := storedTime(now)
-		id, err := allocateNodeID(ctx, tx)
+		sec, nsec := sqlvalue.StoredTime(now)
+		id, err := dbstate.AllocateNodeID(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -471,7 +474,7 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 		}
 		return s.touch(ctx, tx, parent.ID, now)
 	}); err != nil {
-		return pathError(op, path, failure(err))
+		return pathError(op, path, sqlerr.Failure(err))
 	}
 	return nil
 }
@@ -481,7 +484,7 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 func (s *Store) link(ctx context.Context, tx *sql.Tx, parent int64, name []byte, node int64) error {
 	if _, err := tx.ExecContext(ctx, `INSERT INTO entries (namespace, parent, name, node) VALUES (?, ?, ?, ?)`,
 		s.namespace, parent, name, node); err != nil {
-		if isUniqueViolation(err) {
+		if sqlerr.IsUniqueViolation(err) {
 			return syscall.EEXIST
 		}
 		return err
@@ -505,7 +508,7 @@ func (s *Store) unlink(ctx context.Context, tx *sql.Tx, parent int64, name []byt
 // caught, and a build tool comparing a directory against its contents would read a time that
 // stopped being true, with nothing behind it to correct the answer.
 func (s *Store) touch(ctx context.Context, tx *sql.Tx, id int64, at time.Time) error {
-	sec, nsec := storedTime(at)
+	sec, nsec := sqlvalue.StoredTime(at)
 	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET mtime_sec = ?, mtime_nsec = ? WHERE id = ?`,
 		sec, nsec, id); err != nil {
 		return err
@@ -562,7 +565,7 @@ func (s *Store) Remove(ctx context.Context, path string) error {
 		}
 		return s.touch(ctx, tx, parent.ID, time.Now())
 	}); err != nil {
-		return pathError("unlink", path, failure(err))
+		return pathError("unlink", path, sqlerr.Failure(err))
 	}
 	return nil
 }
@@ -611,7 +614,7 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 		}
 		return s.touch(ctx, tx, parent.ID, time.Now())
 	}); err != nil {
-		return pathError("rmdir", path, failure(err))
+		return pathError("rmdir", path, sqlerr.Failure(err))
 	}
 	return nil
 }
@@ -658,7 +661,7 @@ func (s *Store) Rename(ctx context.Context, from, to string) error {
 	if err := s.mutateNamespace(ctx, locking.RenameMutation, []string{cleanFrom, cleanTo}, func(tx *sql.Tx) error {
 		return s.rename(ctx, tx, cleanFrom, cleanTo)
 	}); err != nil {
-		return linkError(from, to, failure(err))
+		return linkError(from, to, sqlerr.Failure(err))
 	}
 	return nil
 }

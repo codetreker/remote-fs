@@ -10,6 +10,7 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/nativelease"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -22,7 +23,7 @@ func (s *Store) EnableLocks(ctx context.Context, options locking.Options) error 
 	if s.leaseRecovery == nil {
 		return locking.Wrap(locking.Invalid, "native lease recovery must be configured before attaching an authority", nil)
 	}
-	if err := s.verifyLeaseOwnership(); err != nil {
+	if err := nativelease.VerifyExclusiveOwnership(s.leaseOwner); err != nil {
 		return err
 	}
 	return s.attachLocksLocked(ctx, options, s)
@@ -276,7 +277,7 @@ func (s *Store) publishNamespace(ctx context.Context, tx *sql.Tx, state DurableS
 			}
 			return locking.PublicationOutcome{Known: true, Err: err}
 		}
-		err = s.commitPrepared(tx, state)
+		err = s.commitPrepared(tx, DurableState(state))
 		if err != nil {
 			settlementErr := settle(storage.PublicationUnknown)
 			combined := errors.Join(err, settlementErr)
@@ -293,7 +294,7 @@ func (s *Store) publishNamespace(ctx context.Context, tx *sql.Tx, state DurableS
 		return commit().Err
 	}
 	if s.locks == nil {
-		if err := validateNativeLeaseOpening(s.databasePath, false); err != nil {
+		if err := nativelease.ValidateOpening(s.databasePath, false); err != nil {
 			return err
 		}
 		if err := validateLeaseMutation(ctx, tx); err != nil {

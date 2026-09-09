@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/codetreker/remote-fs/packages/metastore"
-
 	_ "modernc.org/sqlite"
+
+	"github.com/codetreker/remote-fs/packages/metastore"
 )
 
 func TestEveryWriterConnectionUsesDurablePragmas(t *testing.T) {
@@ -821,57 +821,6 @@ func TestSinceDoesNotAllocateFromAnUnboundedRequestedLimit(t *testing.T) {
 	}
 	if changes := read(1); len(changes) != 1 {
 		t.Fatalf("one-change result returned %d changes", len(changes))
-	}
-}
-
-func TestGlobalIdentityBoundsUseExpressionIndexSearches(t *testing.T) {
-	store, err := open(t.Context(), t.TempDir()+"/metastore.db", "workspace", "", 0, DefaultOptions())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { store.Close() })
-
-	plan := func(query string) string {
-		rows, err := store.read.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+query)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer rows.Close()
-		var details []string
-		for rows.Next() {
-			var id, parent, unused int
-			var detail string
-			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
-				t.Fatal(err)
-			}
-			details = append(details, detail)
-		}
-		if err := rows.Err(); err != nil {
-			t.Fatal(err)
-		}
-		return strings.Join(details, "\n")
-	}
-
-	combined := plan(globalNodeIdentityBoundsQuery) + "\n" + plan(globalChangeIdentityBoundsQuery)
-	if strings.Contains(combined, "USE TEMP B-TREE") {
-		t.Fatalf("global identity bounds build a temporary ordering:\n%s", combined)
-	}
-	for _, index := range []string{
-		"namespaces_by_root_identity",
-		"entries_by_node_identity",
-		"changes_by_node_identity",
-		"changes_by_position_identity",
-		"logs_by_change_identity",
-	} {
-		if count := strings.Count(combined, index); count != 2 {
-			t.Fatalf("global identity bounds use %s %d times, want invalid and maximum searches:\n%s",
-				index, count, combined)
-		}
-	}
-	for _, table := range []string{"namespaces", "entries", "changes", "logs"} {
-		if strings.Contains(combined, "SCAN "+table) {
-			t.Fatalf("global identity bounds scan %s:\n%s", table, combined)
-		}
 	}
 }
 

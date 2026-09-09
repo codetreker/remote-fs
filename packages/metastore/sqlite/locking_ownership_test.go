@@ -18,6 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/codetreker/remote-fs/packages/locking"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/nativelease"
 )
 
 func TestLeaseNativeOwnershipCrossProcess(t *testing.T) {
@@ -356,7 +357,7 @@ func TestConfigureLeaseRecoveryRequiresNativeAnchor(t *testing.T) {
 	}
 	t.Run("different binding inode", func(t *testing.T) {
 		store, owner := openNativeExclusiveTestStore(t)
-		foreign, err := acquireLeaseDatabase(filepath.Join(filepath.Dir(owner.path), "foreign.sqlite"), true, true)
+		foreign, err := nativelease.AcquireDatabase(filepath.Join(filepath.Dir(owner.Path()), "foreign.sqlite"), true, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -367,7 +368,7 @@ func TestConfigureLeaseRecoveryRequiresNativeAnchor(t *testing.T) {
 		}()
 		anchor := openNativeTestAnchor(t, store, foreign)
 		err = store.ConfigureLeaseRecovery(t.Context(), LeaseRecoveryConfig{
-			Witness: anchor, StateID: anchor.StateID(), RecoveryStart: owner.acquired, Initialize: true,
+			Witness: anchor, StateID: anchor.StateID(), RecoveryStart: owner.Acquired(), Initialize: true,
 		})
 		if !errors.Is(err, syscall.EIO) {
 			t.Fatalf("different binding inode configured lease recovery: %v", err)
@@ -379,7 +380,7 @@ func TestConfigureLeaseRecoveryRequiresNativeAnchor(t *testing.T) {
 			store, owner := openNativeExclusiveTestStore(t)
 			anchor := openNativeTestAnchor(t, store, owner)
 			config := LeaseRecoveryConfig{
-				Witness: anchor, StateID: anchor.StateID(), RecoveryStart: owner.acquired, Initialize: true,
+				Witness: anchor, StateID: anchor.StateID(), RecoveryStart: owner.Acquired(), Initialize: true,
 			}
 			if invalid == "state identity" {
 				config.StateID = "invalid"
@@ -407,10 +408,10 @@ func TestConfigureLeaseRecoveryRequiresNativeAnchor(t *testing.T) {
 	}
 }
 
-func openNativeExclusiveTestStore(t *testing.T) (*Store, *leaseDatabaseFile) {
+func openNativeExclusiveTestStore(t *testing.T) (*Store, *nativelease.Database) {
 	t.Helper()
 	config := lockingTestConfig(t)
-	owner, err := acquireLeaseDatabase(config.Database, true, true)
+	owner, err := nativelease.AcquireDatabase(config.Database, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,12 +430,12 @@ func openNativeExclusiveTestStore(t *testing.T) (*Store, *leaseDatabaseFile) {
 	return store, owner
 }
 
-func openNativeTestAnchor(t *testing.T, store *Store, owner *leaseDatabaseFile) *LeaseAnchor {
+func openNativeTestAnchor(t *testing.T, store *Store, owner *nativelease.Database) *LeaseAnchor {
 	t.Helper()
 	anchor, err := OpenLeaseAnchor(LeaseAnchorConfig{
-		Directory: filepath.Dir(owner.path), Name: "." + filepath.Base(owner.path) + ".leases",
-		Identity: "sqlite-database-lease-recovery", BindingFD: owner.fd,
-		RecoveryStart: owner.acquired, Initialize: true,
+		Directory: filepath.Dir(owner.Path()), Name: "." + filepath.Base(owner.Path()) + ".leases",
+		Identity: "sqlite-database-lease-recovery", BindingFD: owner.FD(),
+		RecoveryStart: owner.Acquired(), Initialize: true,
 	})
 	if err != nil {
 		t.Fatal(err)

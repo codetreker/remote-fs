@@ -222,7 +222,7 @@ packages/                    可被外部与自身 import
     limited/                 把任意一份 storage 置于字节配额之下
     storagetest/             义务的可执行形式：每个实现都跑这一套用例
   metastore/                 名字树、保留节点、内容 revision 与对象键的指向
-    sqlite/                  SQLite 实现
+    sqlite/                  SQLite 公开入口；internal 按 schema、状态、日志与原生证据分工
     metastoretest/           metastore 义务的可执行形式
   transport/                 把 storage 契约搬到线上，一种传输一个包
     httprest/                HTTP：URL 与消息的形状、服务端、拨号端
@@ -252,6 +252,8 @@ docs/
 | `fuse` | client 侧 |
 
 这些拆分各自守住一条依赖或 ownership 边界：`storage` 与实现分开，使第三方实现自有存储时只需引入接口（R-INT-6）；配额自成 `storage/limited`，因为它是一层包装而不是某一个实现的性质（R-WS-5、R-INT-3）；`metastore` 与 `storage/objectstore` 分开，因为名字树不持有文件字节，而对象接口不认识路径；`storage/localstore` 负责把两个 durable half、WAL 外部见证、store identity、初始化与 lifetime lock 组合成一个资源，避免这些规则散落在二进制里；契约用例分别属于 `storage/storagetest`、`objectstore/objectstoretest` 与 `metastore/metastoretest`；每种传输自成 `transport/` 下的一个包（R-INT-9、R-INT-10）；`fuse` 与传输分开，使得不挂载的使用者不被 FUSE 与平台限制绑住（R-INT-5、R-INT-8）。
+
+SQLite 的公开类型、单一发布协调器与内部组件的归属见[SQLite 内部模块](server/sqlite-modules.md)。该目录划分不改变 Store、Replica 或它们的调用方角色。
 
 带依赖的实现各自成包，使依赖跟着选择走：`localdisk` 不链接 Azure SDK；`localstore` 明确选择 SQLite 与本地对象格式；`azblob` 才选择 Azure SDK。随附实现的范围由[移除宿主目录后端](../../.agents/notes/implemented/simplification/2026-09-08-remove-the-host-directory-backend.md)记录，第三方存储仍通过同一契约接入。
 

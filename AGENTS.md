@@ -117,14 +117,19 @@ executed by two others, so per-package measurement reports it as 0% and understa
 module by more than thirty points.
 
 ```
-GOFLAGS="-coverpkg=$(go list -m)/... -count=1" go-cov --ci --skip-result-packages cmd
+GOFLAGS="-coverpkg=$(go list -m)/... -count=1" go-cov --ci --skip-result-packages cmd,packages/metastore/sqlite/internal/integration
 ```
 
 `--ci` is what turns a threshold breach into a non-zero exit; without it `go-cov` prints
-`CRITICAL` and exits 0. `--skip-result-packages cmd` drops the summary row for a package
-that has tests but no statements of its own; its failures still fail the run. For one
-boundary in isolation, `go test -coverpkg=<import paths> -coverprofile=/tmp/c.out` followed
-by `go tool cover -func=/tmp/c.out` still answers faster.
+`CRITICAL` and exits 0. `--skip-result-packages cmd,packages/metastore/sqlite/internal/integration`
+omits only the coverage summary rows for matching package paths. Their tests still run,
+their failures still fail the run, and the production statements they exercise remain in
+the module-wide `-coverpkg` measurement. The matcher uses package-path substrings, so
+`packages/metastore/sqlite/internal/integration` and its descendants must remain test-only;
+production packages cannot be placed below that path.
+
+For one boundary in isolation, `go test -coverpkg=<import paths> -coverprofile=/tmp/c.out`
+followed by `go tool cover -func=/tmp/c.out` still answers faster.
 
 **A check that nothing stayed mounted.** Tests that mount leave the machine dirty when they
 fail badly, and the run that left one behind has usually already reported success. After a

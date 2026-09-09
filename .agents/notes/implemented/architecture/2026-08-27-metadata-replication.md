@@ -324,7 +324,7 @@ type Storage struct {
 ```
 packages/metastore/           + 日志能力，+ Change / Position / Incarnation 这些类型
 packages/sqliteschema/        编号 `.sql` 迁移的加载与重放，schema 的读回与比对    ← 新
-packages/metastore/sqlite/    + schema v2（`migrations/*.sql`），+ Replica / Seeding
+packages/metastore/sqlite/    + Replica / Seeding；迁移在 internal/schema/migrations/
 packages/storage/replicated/  读本地、写远端的装饰器                      ← 新
 packages/transport/httprest/  + SSE 事件端点、快照端点、客户端订阅与重放
 cmd/remote-fs                 + 挂载前建立副本，+ -replica-dir
@@ -369,13 +369,13 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 这一版给 metastore 加日志表、`incarnation` 与 `committed_position`，并把 `entries` 的主键换成 `(namespace, parent, name)`，也就是 schema 从 1 变成 2。在此之前 `schema.go` 只会拒绝：版本对不上就不启动，往前搬的那条路一行代码都没有。
 
-**迁移是 `packages/metastore/sqlite/migrations/` 下编号的 `.sql` 文件，由 `packages/sqliteschema` 按序重放。** 每个文件就是一个版本：`0001_tree.sql` 到版本 1，`0002_replication.sql` 到版本 2，数据库记下的版本号等于最后跑过的那个文件的编号。编号从 1 起连续，缺号在加载时直接 panic——这样「记录的版本」与「跑过几个文件」是同一句话。
+**迁移是 [`packages/metastore/sqlite/internal/schema/migrations/`](../../../../packages/metastore/sqlite/internal/schema/migrations) 下编号的 `.sql` 文件，由 `packages/sqliteschema` 按序重放。** 每个文件就是一个版本：`0001_tree.sql` 到版本 1，`0002_replication.sql` 到版本 2，数据库记下的版本号等于最后跑过的那个文件的编号。编号从 1 起连续，缺号在加载时直接 panic——这样「记录的版本」与「跑过几个文件」是同一句话。
 
 **已落地的迁移必须脱离当前 build 的可及范围，这是选 `.sql` 而不是 Go 的全部理由。** 它替换掉的写法是一条走向版本 2 的 Go 函数，函数体里调的是**当前 build 写的那份 DDL**。今天两者是同一串字符串，但下一个版本一改那份 DDL，「把数据库搬到版本 2」就悄悄变成了「给它版本 3 的形状」，紧接着 v2→v3 的迁移再在这个形状上跑一遍。一个文件不会这样，因为没有东西会去改它。由此得到这里唯一的纪律：**落地的文件永远不改，改 schema 就是加文件。**
 
 **从零建库也是重放全部迁移，没有第二条「当前形状」的描述。** 于是「今天新建的库」与「从版本 1 搬上来的库」是构造上的同一个 schema，而不是靠两处描述被人手动保持一致。代价是新库会先建出版本 1 的 `entries` 再重建一次——空表上是零成本，换来的是那类静默漂移根本不存在。捷径（直接建成当前形状）恰恰是会漂的那条。
 
-`testdata/schema.sql` 是这套安排的可读面：迁移分散之后「`entries` 现在长什么样」不再有单一答案，这个文件回答它，由测试从 SQLite 自己报告的 schema 生成。
+[`internal/integration/testdata/schema.sql`](../../../../packages/metastore/sqlite/internal/integration/testdata/schema.sql) 是这套安排的可读面：迁移分散之后「`entries` 现在长什么样」不再有单一答案，这个文件回答它，由测试从 SQLite 自己报告的 schema 生成。
 
 守住「落地的文件不改」需要两条，因为**它们各自都不够**：
 
@@ -386,13 +386,13 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **最后一个迁移文件例外，而且是暂时的。** 当时最后一个文件是 `0002_replication.sql`；实测把其中的 `entries.name` 改成 `TEXT`、删掉两个索引之一、或把 `logs.trimmed_by_age` 改成 `TEXT`，两条结构比对**一条都不响**，只有可重新生成的 golden 响。最后一个文件在新库与迁移库两条路上都会运行，所以两边一起变化；它成为历史时必须取得独立见证。
 
-`0003_durable_state.sql` 落地时，`testdata/version2.sql` 与 `TestTheSecondMigrationDescribesTheVersionTwoDatabasesThatExist` 钉住了 v2，上述义务已经成为测试。`0004_lease_recovery.sql` 使 `0003` 成为历史，v3 结构也须用独立见证固定，不能只比较两条都运行 `0004` 的路径。
+`0003_durable_state.sql` 落地时，[v2 fixture](../../../../packages/metastore/sqlite/internal/integration/testdata/version2.sql) 与 `TestTheSecondMigrationDescribesTheVersionTwoDatabasesThatExist` 钉住了 v2，上述义务已经成为测试。`0004_lease_recovery.sql` 使 `0003` 成为历史，v3 结构也须用独立见证固定，不能只比较两条都运行 `0004` 的路径。
 
 （顺带记下一个实测意外：`entries.name` 在 `0002` 里改成 `TEXT` 之后，**没有任何行为测试变红**。原因是 SQLite 的 TEXT 亲和性不会把 BLOB 值转成文本，存进去的字节仍按字节比较。所以那一处是 golden 独自兜住的，不是被行为测试兜住的。）
 
 **机制本身放在 `packages/sqliteschema`，不在 sqlite 后端里面。** 它今天只有一个使用者，所以这不是「按需抽象」而是一次判断：这里面没有一行是关于树、日志或命名空间的，它回答的是「把一个 SQLite 数据库搬到某个版本」，而这个问题跟谁在用它无关。边界也因此变干净了——`schema_version` 归运行器所有并由它建表，迁移文件只描述调用方自己的 schema，`0001_tree.sql` 里不再有那张表。它同时把 `Dump` 与 `Structure` 一起给出去：读回 schema 并按 token 比对，是任何用这套机制的人都要写的同一段代码，而且正是那条「已落地的迁移不许改」的守卫赖以成立的东西。
 
-其余的（回滚、校验和、并发启动的额外互斥）都不做。回滚在只能前滚的语义下没有意义；`prepare` 的那一个事务已经把并发启动、部分失败与版本拒绝三件事一起解决了。
+其余的（回滚、校验和、并发启动的额外互斥）都不做。回滚在只能前滚的语义下没有意义；准备 schema 的一个事务已经把并发启动、部分失败与版本拒绝三件事一起解决了。实现归属由[SQLite 内部模块](2026-09-09-sqlite-internal-modules.md)组织，资源移动不改写已落地的迁移和历史 fixture。
 
 降级仍然是拒绝：比数据库新的二进制往前搬，比数据库旧的二进制拒绝启动，永远不猜。版本号记在 `schema_version` 表而不是 `PRAGMA user_version`，因为后者对「没建过库」和「有人写了 0」给同一个 0，而这两者要求相反的动作。
 
@@ -442,7 +442,7 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **迁移写成 Go 函数，复用当前的 DDL。** 这一版最初就是这么写的，理由听上去很正当：同一份 DDL 只写一遍，不会有两份需要手动保持同步的副本。输在它把同步的方向弄反了——被复用的那份 DDL 是**会变的**，于是「搬到版本 2」的含义随着版本 3 的编辑一起改。少写一份副本换来的是让历史可被后来的编辑改写，而这里要的恰好是历史不可及。
 
-**新库直接建成当前形状，迁移只给旧库走。** 省掉新库重放历史那几微秒，而且「当前 schema」有一处可读的单一描述。输在这是两条独立的代码路径，通向一个本该相同的结果，中间没有任何东西保证它们真的相同——量过一次就能看到：那时新库建出的是 `CREATE TABLE entries`，搬上来的是 `CREATE TABLE "entries"`，功能等价，但没有任何东西在比对它们，所以一次真正的分叉同样不会有人发现。可读的那一半由 `testdata/schema.sql` 补上，不必用一条会漂的路径去换。
+**新库直接建成当前形状，迁移只给旧库走。** 省掉新库重放历史那几微秒，而且「当前 schema」有一处可读的单一描述。输在这是两条独立的代码路径，通向一个本该相同的结果，中间没有任何东西保证它们真的相同——量过一次就能看到：那时新库建出的是 `CREATE TABLE entries`，搬上来的是 `CREATE TABLE "entries"`，功能等价，但没有任何东西在比对它们，所以一次真正的分叉同样不会有人发现。可读的那一半由[当前 schema golden](../../../../packages/metastore/sqlite/internal/integration/testdata/schema.sql)补上，不必用一条会漂的路径去换。
 
 
 ## 后果

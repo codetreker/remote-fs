@@ -8,6 +8,9 @@ import (
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -93,7 +96,7 @@ func (r *Replica) releaseRead() {
 // Stat reports the node at path, as the namespace held it at Position.
 func (r *Replica) Stat(ctx context.Context, path string) (metastore.Node, error) {
 	if err := r.acquireRead(ctx); err != nil {
-		return metastore.Node{}, pathError("stat", path, failure(err))
+		return metastore.Node{}, pathError("stat", path, sqlerr.Failure(err))
 	}
 	defer r.releaseRead()
 	return r.store.Stat(ctx, path)
@@ -102,7 +105,7 @@ func (r *Replica) Stat(ctx context.Context, path string) (metastore.Node, error)
 // List returns the children of the directory at path, as the namespace held them at Position.
 func (r *Replica) List(ctx context.Context, path string) ([]metastore.Child, error) {
 	if err := r.acquireRead(ctx); err != nil {
-		return nil, pathError("list", path, failure(err))
+		return nil, pathError("list", path, sqlerr.Failure(err))
 	}
 	defer r.releaseRead()
 	return r.store.List(ctx, path)
@@ -120,7 +123,7 @@ func (r *Replica) ListBounded(ctx context.Context, path string, result *storage.
 		}()
 	}
 	if err := r.acquireRead(ctx); err != nil {
-		return pathError("list", path, failure(err))
+		return pathError("list", path, sqlerr.Failure(err))
 	}
 	defer r.releaseRead()
 	return r.store.ListBounded(ctx, path, result)
@@ -173,16 +176,16 @@ func (r *Replica) Apply(ctx context.Context, change metastore.Change) (bool, err
 	}
 	tx, err := r.store.write.BeginTx(ctx, nil)
 	if err != nil {
-		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, failure(err))
+		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, sqlerr.Failure(err))
 	}
 	defer tx.Rollback()
 
 	if err := r.apply(ctx, tx, change); err != nil {
-		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, failure(err))
+		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, sqlerr.Failure(err))
 	}
-	state, err := advanceGeneration(ctx, tx)
+	state, err := dbstate.AdvanceGeneration(ctx, tx)
 	if err != nil {
-		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, failure(err))
+		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, sqlerr.Failure(err))
 	}
 	r.store.coordinator.health.Lock()
 	defer r.store.coordinator.health.Unlock()
@@ -190,10 +193,10 @@ func (r *Replica) Apply(ctx context.Context, change metastore.Change) (bool, err
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
-		r.store.coordinator.poisonLocked(&uncertainCommitError{err: failure(err)})
+		r.store.coordinator.poisonLocked(sqlerr.NewUncertainCommit(sqlerr.Failure(err)))
 		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, r.store.coordinator.healthErrorLocked())
 	}
-	if err := r.store.acceptLocked(state); err != nil {
+	if err := r.store.acceptLocked(DurableState(state)); err != nil {
 		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, err)
 	}
 	r.at = change.Position
@@ -214,7 +217,7 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 
 	switch change.Kind {
 	case metastore.Created:
-		if err := observeNewNodeID(ctx, tx, change.Node.ID); err != nil {
+		if err := dbstate.ObserveNewNodeID(ctx, tx, change.Node.ID); err != nil {
 			return err
 		}
 		if err := insertNode(ctx, tx, r.store.namespace, *change.Node); err != nil {
@@ -259,8 +262,8 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 // insertNode records a node under the id it arrived with. Its content key is dropped: see
 // the type's own comment for why a copy holds no keys.
 func insertNode(ctx context.Context, tx *sql.Tx, namespace int64, node metastore.Node) error {
-	accessSec, accessNsec := storedTime(node.AccessTime)
-	changeSec, changeNsec := storedTime(node.ModTime)
+	accessSec, accessNsec := sqlvalue.StoredTime(node.AccessTime)
+	changeSec, changeNsec := sqlvalue.StoredTime(node.ModTime)
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
@@ -271,8 +274,8 @@ func insertNode(ctx context.Context, tx *sql.Tx, namespace int64, node metastore
 // updateNode replaces what a copy holds about a node it already has, and refuses to be a
 // statement about a node it does not.
 func updateNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
-	accessSec, accessNsec := storedTime(node.AccessTime)
-	changeSec, changeNsec := storedTime(node.ModTime)
+	accessSec, accessNsec := sqlvalue.StoredTime(node.AccessTime)
+	changeSec, changeNsec := sqlvalue.StoredTime(node.ModTime)
 	result, err := tx.ExecContext(ctx, `
 		UPDATE nodes SET mode = ?, size = ?, atime_sec = ?, atime_nsec = ?, mtime_sec = ?, mtime_nsec = ?
 		WHERE id = ?`,
@@ -280,13 +283,13 @@ func updateNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
 	if err != nil {
 		return err
 	}
-	return exactlyOne(result, fmt.Sprintf("node %d, which this copy does not hold", node.ID))
+	return sqlvalue.ExactlyOne(result, fmt.Sprintf("node %d, which this copy does not hold", node.ID))
 }
 
 func insertEntry(ctx context.Context, tx *sql.Tx, namespace, parent int64, name []byte, node int64) error {
 	_, err := tx.ExecContext(ctx, `INSERT INTO entries (namespace, parent, name, node) VALUES (?, ?, ?, ?)`,
 		namespace, parent, name, node)
-	if err != nil && isUniqueViolation(err) {
+	if err != nil && sqlerr.IsUniqueViolation(err) {
 		return fmt.Errorf("%w: %q under node %d is already taken in this copy", syscall.EIO, name, parent)
 	}
 	return err
@@ -298,7 +301,7 @@ func removeEntry(ctx context.Context, tx *sql.Tx, namespace, parent int64, name 
 	if err != nil {
 		return err
 	}
-	return exactlyOne(result, fmt.Sprintf("%q under node %d, which this copy does not hold", name, parent))
+	return sqlvalue.ExactlyOne(result, fmt.Sprintf("%q under node %d, which this copy does not hold", name, parent))
 }
 
 func entryNode(ctx context.Context, tx *sql.Tx, namespace, parent int64, name []byte) (int64, error) {
@@ -313,22 +316,6 @@ func entryNode(ctx context.Context, tx *sql.Tx, namespace, parent int64, name []
 		return 0, err
 	}
 	return id, nil
-}
-
-// exactlyOne refuses a statement that did not act on the one row it describes.
-//
-// The count is the whole check. A copy is exactly as correct as the changes it applies, and
-// a statement that matched nothing is the shape that failure takes here: no error from the
-// database, no difference in the tree, and nothing afterwards that would notice.
-func exactlyOne(result sql.Result, subject string) error {
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected != 1 {
-		return fmt.Errorf("%w: the change acts on %s", syscall.EIO, subject)
-	}
-	return nil
 }
 
 // --- filling a copy from a picture -------------------------------------------------------
@@ -361,14 +348,14 @@ func (r *Replica) Reseed(ctx context.Context) (*Seeding, error) {
 	if err != nil {
 		r.store.coordinator.commit.release()
 		r.admission.releaseWrite()
-		return nil, fmt.Errorf("beginning to fill the copy: %w", failure(err))
+		return nil, fmt.Errorf("beginning to fill the copy: %w", sqlerr.Failure(err))
 	}
-	state, err := validateDurableState(ctx, tx)
+	state, err := dbstate.Validate(ctx, tx)
 	if err != nil {
 		tx.Rollback()
 		r.store.coordinator.commit.release()
 		r.admission.releaseWrite()
-		return nil, fmt.Errorf("validating the copy's identity allocator: %w", failure(err))
+		return nil, fmt.Errorf("validating the copy's identity allocator: %w", sqlerr.Failure(err))
 	}
 	seeding := &Seeding{replica: r, tx: tx, nodeHighWater: state.NodeHighWater}
 	// Rows arrive in whatever order the picture yields them, and a child may therefore reach
@@ -377,7 +364,7 @@ func (r *Replica) Reseed(ctx context.Context) (*Seeding, error) {
 	// the references are still checked, in full, before this transaction is allowed to commit.
 	if _, err := tx.ExecContext(ctx, `PRAGMA defer_foreign_keys = ON`); err != nil {
 		seeding.Close()
-		return nil, fmt.Errorf("beginning to fill the copy: %w", failure(err))
+		return nil, fmt.Errorf("beginning to fill the copy: %w", sqlerr.Failure(err))
 	}
 	if err := seeding.empty(ctx); err != nil {
 		seeding.Close()
@@ -413,7 +400,7 @@ func (s *Seeding) empty(ctx context.Context) error {
 		`DELETE FROM nodes WHERE namespace = ?`,
 	} {
 		if _, err := s.tx.ExecContext(ctx, statement, s.replica.store.namespace); err != nil {
-			return fmt.Errorf("emptying the copy: %w", failure(err))
+			return fmt.Errorf("emptying the copy: %w", sqlerr.Failure(err))
 		}
 	}
 	return nil
@@ -423,7 +410,7 @@ func (s *Seeding) empty(ctx context.Context) error {
 func (s *Seeding) Add(ctx context.Context, rows []metastore.Row) error {
 	for _, row := range rows {
 		if err := s.add(ctx, row); err != nil {
-			return fmt.Errorf("filling the copy: %w", failure(err))
+			return fmt.Errorf("filling the copy: %w", sqlerr.Failure(err))
 		}
 	}
 	return nil
@@ -462,25 +449,25 @@ func (s *Seeding) Complete(ctx context.Context, at metastore.Position) error {
 	}
 	if _, err := s.tx.ExecContext(ctx, `UPDATE namespaces SET root = ? WHERE id = ?`,
 		s.root, s.replica.store.namespace); err != nil {
-		return fmt.Errorf("completing the copy: %w", failure(err))
+		return fmt.Errorf("completing the copy: %w", sqlerr.Failure(err))
 	}
 	highWater := max(s.nodeHighWater, s.maxNodeID)
 	if _, err := s.tx.ExecContext(ctx,
 		`UPDATE database_state SET node_high_water = ? WHERE singleton = 1`, highWater,
 	); err != nil {
-		return fmt.Errorf("completing the copy: %w", failure(err))
+		return fmt.Errorf("completing the copy: %w", sqlerr.Failure(err))
 	}
-	sequence, err := sequenceValue(ctx, s.tx, "nodes")
+	sequence, err := dbstate.SequenceValue(ctx, s.tx, "nodes")
 	if err != nil {
-		return fmt.Errorf("completing the copy: %w", failure(err))
+		return fmt.Errorf("completing the copy: %w", sqlerr.Failure(err))
 	}
 	if sequence != highWater {
 		return fmt.Errorf("completing the copy: SQLite node sequence %d does not match observed high-water %d: %w",
 			sequence, highWater, syscall.EIO)
 	}
-	state, err := advanceGeneration(ctx, s.tx)
+	state, err := dbstate.AdvanceGeneration(ctx, s.tx)
 	if err != nil {
-		return fmt.Errorf("completing the copy: %w", failure(err))
+		return fmt.Errorf("completing the copy: %w", sqlerr.Failure(err))
 	}
 	s.replica.store.coordinator.health.Lock()
 	if err := s.replica.store.coordinator.healthErrorLocked(); err != nil {
@@ -488,13 +475,13 @@ func (s *Seeding) Complete(ctx context.Context, at metastore.Position) error {
 		return fmt.Errorf("completing the copy: %w", err)
 	}
 	if err := s.tx.Commit(); err != nil {
-		s.replica.store.coordinator.poisonLocked(&uncertainCommitError{err: failure(err)})
+		s.replica.store.coordinator.poisonLocked(sqlerr.NewUncertainCommit(sqlerr.Failure(err)))
 		healthErr := s.replica.store.coordinator.healthErrorLocked()
 		s.replica.store.coordinator.health.Unlock()
 		s.settle()
 		return fmt.Errorf("completing the copy: %w", healthErr)
 	}
-	if err := s.replica.store.acceptLocked(state); err != nil {
+	if err := s.replica.store.acceptLocked(DurableState(state)); err != nil {
 		s.replica.store.coordinator.health.Unlock()
 		s.settle()
 		return fmt.Errorf("completing the copy: %w", err)
@@ -519,7 +506,7 @@ func (s *Seeding) Close() error {
 	err := s.tx.Rollback()
 	s.settle()
 	if err != nil {
-		return fmt.Errorf("discarding a picture that was not completed: %w", failure(err))
+		return fmt.Errorf("discarding a picture that was not completed: %w", sqlerr.Failure(err))
 	}
 	return nil
 }

@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/nativelease"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -115,10 +117,10 @@ func TestClosePreservesAFailureFromAdmittedForgetAfterAuthorityRetirement(t *tes
 	forgetConsumed = true
 	closeErr := <-closed
 	closeConsumed = true
-	if storage.ErrnoOf(forgetErr) != syscall.EIO || !isUncertainCommit(forgetErr) {
+	if storage.ErrnoOf(forgetErr) != syscall.EIO || !sqlerr.IsUncertainCommit(forgetErr) {
 		t.Fatalf("real driver COMMIT failure returned %v", forgetErr)
 	}
-	var commitFailure *uncertainCommitError
+	var commitFailure *sqlerr.UncertainCommitError
 	if !errors.As(forgetErr, &commitFailure) {
 		t.Fatalf("Forget did not retain its COMMIT failure: %v", forgetErr)
 	}
@@ -128,7 +130,7 @@ func TestClosePreservesAFailureFromAdmittedForgetAfterAuthorityRetirement(t *tes
 	if again := opened.Close(); again != closeErr {
 		t.Errorf("repeated Close = %v, want the same result %v", again, closeErr)
 	}
-	contender, err := acquireLeaseDatabase(config.Database, true, false)
+	contender, err := nativelease.AcquireDatabase(config.Database, true, false)
 	if contender != nil {
 		contender.Close()
 	}

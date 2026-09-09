@@ -33,9 +33,7 @@ package sqlite
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -47,10 +45,13 @@ import (
 	"syscall"
 	"time"
 
-	"modernc.org/sqlite"
-
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/changes"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/nativelease"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/schema"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -108,7 +109,7 @@ type Store struct {
 	coordinator          *databaseCoordinator
 	locks                *locking.Authority
 	leaseRecovery        *LeaseRecovery
-	leaseOwner           *leaseDatabaseFile
+	leaseOwner           *nativelease.Database
 	witness              CommitWitness
 	closeMu              sync.Mutex
 	closed               bool
@@ -240,7 +241,7 @@ func OpenBoundDurableWithOptions(
 	return openConfiguredWithHooks(ctx, database, namespace, storeID, allowance, options, durable, storeOpenHooks{
 		openPool:          openPool,
 		openDurableWriter: openPersistentWriterPool,
-		acquireLeaseOwner: acquireLeaseDatabase,
+		acquireLeaseOwner: nativelease.AcquireDatabase,
 		prepare:           prepare,
 		closePool: func(db *sql.DB) error {
 			return db.Close()
@@ -257,7 +258,7 @@ func open(
 	return openWithHooks(ctx, database, namespace, storeID, allowance, options, storeOpenHooks{
 		openPool:          openPool,
 		prepare:           prepare,
-		acquireLeaseOwner: acquireLeaseDatabase,
+		acquireLeaseOwner: nativelease.AcquireDatabase,
 		closePool: func(db *sql.DB) error {
 			return db.Close()
 		},
@@ -265,7 +266,7 @@ func open(
 }
 
 type storeOpenHooks struct {
-	acquireLeaseOwner func(string, bool, bool) (*leaseDatabaseFile, error)
+	acquireLeaseOwner func(string, bool, bool) (*nativelease.Database, error)
 	openPool          func(context.Context, string, bool, int) (*sql.DB, error)
 	openDurableWriter func(context.Context, string, int) (*sql.DB, error)
 	prepare           func(context.Context, *sql.DB, string, string, Window, int64, int64) (int64, int64, error)
@@ -304,7 +305,7 @@ func openConfiguredWithHooks(
 	if err != nil {
 		return nil, err
 	}
-	if err := validateNativeLeaseOpening(database, options.leaseRecoveryOwner); err != nil {
+	if err := nativelease.ValidateOpening(database, options.leaseRecoveryOwner); err != nil {
 		return nil, err
 	}
 	coordinator, err := acquireCoordinator(database, durable != nil || options.leaseRecoveryOwner)
@@ -318,17 +319,17 @@ func openConfiguredWithHooks(
 		if releaseOnFailure {
 			if acquiredHere && owner != nil {
 				if err := owner.Close(); err != nil {
-					returnErr = errors.Join(returnErr, fmt.Errorf("closing native metadata ownership after open failed: %w", &durabilityFailure{err: err}))
+					returnErr = errors.Join(returnErr, fmt.Errorf("closing native metadata ownership after open failed: %w", sqlerr.NewDurabilityFailure(err)))
 				}
 			}
 			releaseCoordinator(coordinator)
 		}
 	}()
 	if owner != nil {
-		if !options.leaseRecoveryOwner || !owner.exclusive || owner.path != database {
+		if !options.leaseRecoveryOwner || !owner.Exclusive() || owner.Path() != database {
 			return nil, fmt.Errorf("borrowed native metadata ownership does not match this open: %w", syscall.EINVAL)
 		}
-		if err := verifyLeaseDatabase(owner); err != nil {
+		if err := nativelease.VerifyDatabase(owner); err != nil {
 			return nil, err
 		}
 	} else if hooks.acquireLeaseOwner != nil {
@@ -341,7 +342,7 @@ func openConfiguredWithHooks(
 			return nil, err
 		}
 	}
-	if err := validateNativeLeaseOpening(database, options.leaseRecoveryOwner); err != nil {
+	if err := nativelease.ValidateOpening(database, options.leaseRecoveryOwner); err != nil {
 		return nil, err
 	}
 	cleanup := func(primary error, pools ...openPoolHandle) error {
@@ -394,7 +395,7 @@ func openConfiguredWithHooks(
 	}
 	var id, root int64
 	var state DurableState
-	if durable != nil && owner != nil && owner.exclusive {
+	if durable != nil && owner != nil && owner.Exclusive() {
 		owned := *durable
 		owned.reapDetached = true
 		durable = &owned
@@ -411,7 +412,7 @@ func openConfiguredWithHooks(
 			ctx, write, namespace, storeID, options.Window,
 			options.MaxIntegrityRecords, options.MaxIntegrityBytes,
 		)
-		if isUncertainCommit(err) {
+		if sqlerr.IsUncertainCommit(err) {
 			coordinator.poisonWith(err)
 		}
 	} else {
@@ -419,7 +420,7 @@ func openConfiguredWithHooks(
 			ctx, write, namespace, storeID, options.Window,
 			options.MaxIntegrityRecords, options.MaxIntegrityBytes, durable,
 		)
-		if isUncertainCommit(err) {
+		if sqlerr.IsUncertainCommit(err) {
 			coordinator.poisonWith(err)
 		}
 		if err == nil {
@@ -435,7 +436,7 @@ func openConfiguredWithHooks(
 	}
 	coordinator.commit.release()
 	if err != nil {
-		primary := fmt.Errorf("opening namespace %q in %s: %w", namespace, database, failure(err))
+		primary := fmt.Errorf("opening namespace %q in %s: %w", namespace, database, sqlerr.Failure(err))
 		return nil, cleanup(primary,
 			openPoolHandle{"snapshot reader pool", snapshotRead},
 			openPoolHandle{"reader pool", read},
@@ -573,7 +574,7 @@ func requireFullSynchronous(ctx context.Context, db *sql.DB) error {
 	const full = 2
 	var effective int
 	if err := db.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&effective); err != nil {
-		return fmt.Errorf("reading the SQLite writer's synchronous setting: %w", failure(err))
+		return fmt.Errorf("reading the SQLite writer's synchronous setting: %w", sqlerr.Failure(err))
 	}
 	if effective != full {
 		return fmt.Errorf("the SQLite writer uses synchronous level %d, want FULL (%d): %w",
@@ -724,9 +725,9 @@ func (s *Store) Abort() error {
 
 func (s *Store) finishPoolClosure(poolErr, authorityErr error) error {
 	var ownerErr error
-	if poolErr == nil && s.leaseOwner != nil && (!s.leaseOwner.exclusive || authorityErr == nil) {
+	if poolErr == nil && s.leaseOwner != nil && (!s.leaseOwner.Exclusive() || authorityErr == nil) {
 		if err := s.leaseOwner.Close(); err != nil {
-			ownerErr = fmt.Errorf("closing native metadata ownership: %w", &durabilityFailure{err: err})
+			ownerErr = fmt.Errorf("closing native metadata ownership: %w", sqlerr.NewDurabilityFailure(err))
 		}
 	}
 	if poolErr == nil {
@@ -752,7 +753,7 @@ func (s *Store) Space(ctx context.Context) (storage.Space, error) {
 	}
 	var used int64
 	if err := s.read.QueryRowContext(ctx, `SELECT used FROM namespaces WHERE id = ?`, s.namespace).Scan(&used); err != nil {
-		return storage.Space{}, fmt.Errorf("reading what the namespace holds: %w", readFailure(ctx, err))
+		return storage.Space{}, fmt.Errorf("reading what the namespace holds: %w", sqlerr.ReadFailure(ctx, err))
 	}
 	space := storage.Space{Total: s.allowance, Used: used, Avail: max(s.allowance-used, 0)}
 	// The counter is exact, so a figure that could not be true of anything is this package
@@ -802,7 +803,7 @@ func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context,
 	}
 	tx, err := s.write.BeginTx(transactionContext, nil)
 	if err != nil {
-		return failure(err)
+		return sqlerr.Failure(err)
 	}
 	observationHeld := false
 	defer func() {
@@ -824,12 +825,12 @@ func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context,
 			return err
 		}
 	}
-	if err := trim(ctx, tx, s.namespace, s.window); err != nil {
-		return failure(err)
+	if err := changes.Trim(ctx, tx, s.namespace, changes.Window(s.window)); err != nil {
+		return sqlerr.Failure(err)
 	}
-	state, err := advanceGeneration(ctx, tx)
+	state, err := dbstate.AdvanceGeneration(ctx, tx)
 	if err != nil {
-		return failure(err)
+		return sqlerr.Failure(err)
 	}
 	s.coordinator.health.Lock()
 	observationHeld = true
@@ -837,9 +838,9 @@ func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context,
 		return err
 	}
 	if publication != nil {
-		return s.publishNamespace(ctx, tx, state, publication)
+		return s.publishNamespace(ctx, tx, DurableState(state), publication)
 	}
-	return s.commitPrepared(tx, state)
+	return s.commitPrepared(tx, DurableState(state))
 }
 
 // The commit gate remains held until cleanup finishes. Fresh views wait for rollback
@@ -853,7 +854,7 @@ func (s *Store) finishMutationTransaction(tx rollbacker, primary error, observat
 	if rollbackErr == nil || rollbackErr == sql.ErrTxDone {
 		return primary
 	}
-	err := errors.Join(primary, fmt.Errorf("rolling back the SQLite mutation: %w", &durabilityFailure{err: rollbackErr}))
+	err := errors.Join(primary, fmt.Errorf("rolling back the SQLite mutation: %w", sqlerr.NewDurabilityFailure(rollbackErr)))
 	s.coordinator.poisonLocked(err)
 	if s.locks != nil {
 		s.locks.Fence(err)
@@ -863,7 +864,7 @@ func (s *Store) finishMutationTransaction(tx rollbacker, primary error, observat
 
 func (s *Store) commitPrepared(tx *sql.Tx, state DurableState) error {
 	if err := tx.Commit(); err != nil {
-		uncertain := &uncertainCommitError{err: failure(err)}
+		uncertain := sqlerr.NewUncertainCommit(sqlerr.Failure(err))
 		s.coordinator.poisonLocked(uncertain)
 		if s.locks != nil {
 			s.locks.Fence(s.coordinator.healthErrorLocked())
@@ -901,7 +902,7 @@ func (s *Store) beginReadSnapshot(ctx context.Context, pool *sql.DB) (*sql.Tx, e
 	tx, err := pool.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		s.coordinator.endHealthyRead()
-		return nil, readFailure(ctx, err)
+		return nil, sqlerr.ReadFailure(ctx, err)
 	}
 	var singleton int
 	pinErr := tx.QueryRowContext(ctx,
@@ -919,145 +920,21 @@ type rollbacker interface {
 }
 
 func finishReadTransaction(ctx context.Context, subject string, tx rollbacker, primary error) error {
-	primary = readFailure(ctx, primary)
+	primary = sqlerr.ReadFailure(ctx, primary)
 	rollbackErr := tx.Rollback()
 	// database/sql rolls back when the transaction's owning context ends. The direct
 	// ErrTxDone then reports completed cleanup, not another database failure.
 	// https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/database/sql/sql.go#L2207-L2230
 	if rollbackErr == sql.ErrTxDone && ctx.Err() != nil {
 		if primary == nil {
-			return failure(ctx.Err())
+			return sqlerr.Failure(ctx.Err())
 		}
 		return primary
 	}
 	if rollbackErr != nil {
-		rollbackErr = fmt.Errorf("releasing the SQLite %s: %w", subject, &readCleanupFailure{cause: rollbackErr})
+		rollbackErr = fmt.Errorf("releasing the SQLite %s: %w", subject, sqlerr.NewReadCleanupFailure(rollbackErr))
 	}
 	return errors.Join(primary, rollbackErr)
-}
-
-type readCleanupFailure struct{ cause error }
-
-func (e *readCleanupFailure) Error() string         { return e.cause.Error() }
-func (e *readCleanupFailure) Unwrap() error         { return e.cause }
-func (e *readCleanupFailure) Is(target error) bool  { return target == syscall.EIO }
-func (e *readCleanupFailure) Classification() error { return syscall.EIO }
-
-// failure preserves cancellation and known operation errors. An unclassified database
-// failure or an expired deadline cannot establish a filesystem result and is EIO.
-func failure(err error) error {
-	if err == nil || storage.ErrnoOf(err) != syscall.EIO || errors.Is(err, syscall.EIO) {
-		return err
-	}
-	return fmt.Errorf("%w: %w", syscall.EIO, err)
-}
-
-// SQLite can return SQLITE_INTERRUPT without the driver's ctx.Err substitution. A read
-// transaction can also return ErrTxDone when automatic rollback wins after its context
-// check. ctx must own the transaction when classifying ErrTxDone. Independent joined
-// failures and writes with an uncertain outcome retain their fault classification.
-// https://gitlab.com/cznic/sqlite/-/blob/6e86ac4a89e3f36359d1947e36355c469b18430c/rows.go#L107-120
-// https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/database/sql/sql.go#L2245-L2258
-func readFailure(ctx context.Context, err error) error {
-	if ctx.Err() != nil && (err == sql.ErrTxDone || interruptedRead(err)) {
-		return failure(&readCancellationError{cause: err, canceled: ctx.Err()})
-	}
-	return failure(err)
-}
-
-func interruptedRead(err error) bool {
-	if err == nil {
-		return false
-	}
-	if _, classified := err.(interface{ Classification() error }); classified {
-		return false
-	}
-	if coded, ok := err.(interface{ Code() int }); ok {
-		const sqliteInterrupt = 9
-		return coded.Code() == sqliteInterrupt
-	}
-	if err == context.Canceled || err == syscall.EINTR {
-		return true
-	}
-	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		causes := joined.Unwrap()
-		if len(causes) == 0 {
-			return false
-		}
-		for _, cause := range causes {
-			if !interruptedRead(cause) {
-				return false
-			}
-		}
-		return true
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		return interruptedRead(wrapped.Unwrap())
-	}
-	return false
-}
-
-type readCancellationError struct {
-	cause    error
-	canceled error
-}
-
-func (e *readCancellationError) Error() string         { return e.cause.Error() }
-func (e *readCancellationError) Unwrap() []error       { return []error{e.cause, e.canceled} }
-func (e *readCancellationError) Classification() error { return e.canceled }
-
-// isUniqueViolation reports whether err is the database refusing a duplicate name.
-//
-// Two codes, because the schema raises it through a primary key while a uniqueness
-// constraint declared any other way raises the other. Measured against modernc.org/sqlite
-// v1.57.0: a duplicate (parent, name) surfaces as *sqlite.Error with code 1555,
-// SQLITE_CONSTRAINT_PRIMARYKEY.
-func isUniqueViolation(err error) bool {
-	var e *sqlite.Error
-	if !errors.As(err, &e) {
-		return false
-	}
-	const (
-		constraintPrimaryKey = 1555
-		constraintUnique     = 2067
-	)
-	return e.Code() == constraintPrimaryKey || e.Code() == constraintUnique
-}
-
-// storedTime splits an instant into the two columns it occupies. Nanosecond is always
-// within one second, so the pair is unambiguous and spans every time.Time there is.
-func storedTime(t time.Time) (sec int64, nsec int32) {
-	return t.Unix(), int32(t.Nanosecond())
-}
-
-// loadedTime rebuilds an instant from its two columns.
-func loadedTime(sec int64, nsec int32) time.Time {
-	return time.Unix(sec, int64(nsec))
-}
-
-// newKey mints a key for an object.
-//
-// Sixteen random bytes rather than a counter or anything derived from the path. The
-// contract requires a key nothing can derive from the path and nothing may reuse once the
-// object it named is gone; a counter satisfies neither once a database is restored from a
-// backup, and a path-derived key would have two writers to one path choose the same key.
-func newKey() (metastore.Key, error) {
-	value, err := randomHex(16)
-	if err != nil {
-		return "", fmt.Errorf("%w: minting an object key: %w", syscall.EIO, err)
-	}
-	return metastore.Key(value), nil
-}
-
-// randomHex returns n random bytes rendered as hex. The values built on it — an object key
-// and a log's incarnation — have the same requirement and it is the only one they have: to
-// differ from every other value ever minted, by this process or any other.
-func randomHex(n int) (string, error) {
-	raw := make([]byte, n)
-	if _, err := rand.Read(raw); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(raw), nil
 }
 
 // pathError wraps err as a failure at a namespace path.
@@ -1081,4 +958,21 @@ func splitPath(cleaned string) (dir, name string) {
 		return cleaned[:i], cleaned[i+1:]
 	}
 	return "", cleaned
+}
+
+func prepare(ctx context.Context, db *sql.DB, namespace, storeID string, window Window, maxRecords, maxBytes int64) (int64, int64, error) {
+	return schema.Prepare(ctx, db, namespace, storeID, changes.Window(window), maxRecords, maxBytes)
+}
+func prepareConfigured(ctx context.Context, db *sql.DB, namespace, storeID string, window Window, maxRecords, maxBytes int64, durable *durableOpen) (int64, int64, DurableState, error) {
+	var config *schema.DurableOpen
+	if durable != nil {
+		config = &schema.DurableOpen{
+			ReapDetached: durable.reapDetached,
+			Mode:         schema.NamespaceOpenMode(durable.mode),
+			Startup:      durable.startup.databaseStartup(),
+			Witnessed:    durable.witness != nil,
+		}
+	}
+	id, root, state, err := schema.PrepareConfigured(ctx, db, namespace, storeID, changes.Window(window), maxRecords, maxBytes, config)
+	return id, root, DurableState(state), err
 }

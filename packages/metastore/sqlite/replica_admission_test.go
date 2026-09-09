@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -235,7 +236,7 @@ func TestReplicaReadersCancelBehindSeeding(t *testing.T) {
 func TestReplicaSeedingPublishesTreeAndPositionTogether(t *testing.T) {
 	for _, outcome := range []string{"complete", "rollback", "invalid row", "invalid completion"} {
 		t.Run(outcome, func(t *testing.T) {
-			var commitFailure *uncertainCommitError
+			var commitFailure *sqlerr.UncertainCommitError
 			var replica *Replica
 			replica = seedAdmissionReplica(t, func(err error) {
 				if commitFailure == nil {
