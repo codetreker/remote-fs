@@ -301,6 +301,12 @@ func (c *calls) sinceExcept(before map[string]int, allowed ...string) string {
 // anything.
 func mountpointOn(t *testing.T, s *namespaceServer) string {
 	t.Helper()
+	mountpoint, _ := mountNamespaceOn(t, s)
+	return mountpoint
+}
+
+func mountNamespaceOn(t *testing.T, s *namespaceServer) (string, storage.Storage) {
+	t.Helper()
 	requireFUSE(t)
 
 	namespace, err := httprest.Dial(s.url, &http.Client{Timeout: 10 * time.Second})
@@ -319,7 +325,7 @@ func mountpointOn(t *testing.T, s *namespaceServer) string {
 	if err != nil {
 		t.Fatalf("mounting %s at %s: %v", s.url, mountpoint, err)
 	}
-	return mountpoint
+	return mountpoint, served
 }
 
 // copyOf builds the local copy the mount is served from, and reports the namespace itself for
