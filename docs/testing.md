@@ -48,6 +48,8 @@ checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race 
 
 ## 失败要注入，不要制造
 
+[HTTP 选项拒绝矩阵](../packages/transport/httprest/server_test.go)各自复用原有 failingStorage，每项从完整的 options 值复制后破坏目标字段；原 Check／constructor 拒绝、可用配置与零值默认配置成功的对照都保留。夹具复用不能把原失败包装器换成会掩盖 capability 或构造顺序的替身。
+
 制造一个真实的失败 —— 把客户端指向一个没人监听的地址 —— 只证明**那个客户端**会怎么归类**那一种**错。这是客户端自己那一层的用例，在那里跑一次就够了。
 
 组合层要证的是另一件事：**不管下游报什么，都不会被改写成一个关于名字的答案**（R-ERR-2、R-ERR-6）。「不管什么」是这条保证的全部内容，而一个真实的失败只送得进一种错 —— 一个拒绝连接的地址给的是 EIO，凭证被拒、请求超时、以及一个 errno 词汇表里根本没有的错误，它一个都产生不了。所以组合层在它自己的下游接口上注入，把整套词汇送进去。
@@ -82,9 +84,9 @@ checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race 
 
 一个碰巧什么都没检查的用例，读起来和一个通过了的用例一模一样。
 
-[原子替换用例](../packages/storage/storagetest/storagetest.go)保持 200 次写入、两个读者与 128 KiB／96 KiB 两种内容。每次成功读取都必须匹配某个完整值，读者汇总未观察到两种值就失败；合法的 EAGAIN 仍按原规则计数，其它错误失败。成功核对或 EAGAIN 后使用 `runtime.Gosched` 让出调度，读取循环没有次数上限、睡眠或固定间隔。
+[原子替换用例](../packages/storage/storagetest/storagetest.go)执行 100 次写入、两个读者与 128 KiB／96 KiB 两种内容。每次成功读取都必须匹配某个完整值，读者汇总未观察到两种值就失败；合法的 EAGAIN 仍按原规则计数，其它错误失败。成功核对或 EAGAIN 后使用 `runtime.Gosched` 让出调度，读取循环没有次数上限、睡眠或固定间隔。
 
-选择调度方式时，额外测量读写 API 区间重叠，并用无额外等待的非原子发布负向对照核对检出能力。看到两种值或 API 调用重叠都不能证明覆盖了每个内部发布窗口；局部样本和限制见[测试工作决定](../.agents/notes/implemented/testing/2026-09-09-reduce-test-work.md)。凡是依赖交错、时机或前置状态才有意义的用例，都须区分已断言的条件与测量尚不能证明的条件。
+选择调度和重复次数时，额外测量每个读者的完整值观察、读写 API 区间重叠，并用无额外等待的非原子发布负向对照核对检出能力。100 次写入的采用还比较了六个包各自测试二进制的覆盖块集合和原判定名称。较少重复次数降低统计暴露；看到两种值、API 调用重叠或覆盖块相同都不能证明覆盖每个内部发布窗口，具体证据与代价见[测试工作量决定](../.agents/notes/implemented/testing/2026-09-09-scale-test-work-to-its-assertions.md)。凡是依赖交错、时机或前置状态才有意义的用例，都须区分已断言条件与测量尚不能证明的条件。
 
 ## 打开的文件对象与标准锁
 
@@ -212,6 +214,10 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 ## 元数据副本的读写交接
 
+五个副本确认、容量及 Close 用例使用[事件交付门](../packages/storage/replicated/harness_test.go)：真实 bootstrap 完成后才 arm，在转交响应字节前等待，用例先确认 entered，再执行对应取消或 Close，最后在原来的到达／完成位置释放。请求取消保留原 context 错误；两秒确认 grace、五秒／十秒容量 grace、二十毫秒 waiter 观察、一秒 Close 界限和原结果断言保持。慢 snapshot、replay 与全负载可见性继续使用各自原有条件。
+
+[确认 bookkeeping 用例](../packages/storage/replicated/bookkeeping_test.go)确定性地使发送回调返回成功 barrier、确认前已发生 follower 失败，分别覆盖 barrier 尚未到达和已经到达；核对发送回调仅调用一次、PathError 的操作／路径、EIO 及未能确认已发生修改的诊断，并要求 active／waiter 归零。原有真实 HTTP 双故障用例保留，不能把竞争中哪一条错误先返回当作稳定覆盖条件。夹具边界与取舍见[测试工作量决定](../.agents/notes/implemented/testing/2026-09-09-scale-test-work-to-its-assertions.md)。
+
 [副本读写门](../.agents/notes/implemented/bug-fix/2026-09-07-let-replica-writers-progress.md)分别验证类间次序和真实入口。门的确定性交错用例先证明写者已登记，再放开旧读者；读者批次必须在唤醒前保留名额，尚未获调度的读者也不能被下一写者越过。覆盖批次内读者的正常进入与取消、后来读者进入下一批、多写者中只撤销本次取消，以及取消最后一个等待写者后重新放行读取。
 
 真实 `Replica` 用例覆盖 `Apply` 与 `Reseed` 等门取消、等待 commit gate 时释放外层名额，以及 `Stat`、`List`、`ListBounded` 在 reseed 后排队时的取消；失败的 `ListResult` 不能暴露已保留前缀。SQL 读取名额另验证与 reader pool 容量一致、名额耗尽时调用不进入阶段、交接后取消归还名额，以及 `Position` 与写者不消耗 SQL 读取名额。完整、回滚、无效 row 与提交失败的 reseed 都同时观察树和 `Position`，并验证重复 `Close`；读者批次还必须在多个真实 `Apply` 的积压之间得到执行机会。取消用例保留现有错误分类与 context 原因。
@@ -291,6 +297,8 @@ SQLite 的包内直接用例按各模块持有的边界核对结果：
 | [nativelease](../packages/metastore/sqlite/internal/nativelease) | evidence 字段边界、共享与排他 native ownership、绑定和文件身份核对；验证拒绝不释放仍持有的锁，Close 缓存结果且不重试可能已复用的 descriptor。SQLite 句柄关闭不确定时的所有权保留由根包用例验证。 |
 
 #### SQLite 测试准备与隔离
+
+[匿名发布拒绝矩阵](../packages/metastore/sqlite/publication_test.go)按 S／X 各复用一份真实 fixture，九种操作各自保留调用前后 List、Space 与 Conflict 断言。每项开始时还对比该 fixture 的初始列表和配额，不能把前一项污染当作下一项的起点；18 个 leaf 和次序保持。复用只属于这个拒绝矩阵，不扩展到其它有状态 publication 或恢复用例。
 
 根 metastore 契约由顶层拥有一个真实文件数据库，每个子用例使用唯一的 workspace／neighbour 对，仍按原 allowance、默认选项与子用例 context 打开和关闭独立 Store。顺序隔离回归确认前一例已经关闭，新例的目录、snapshot、配额、对象队列和日志起点干净，且新例修改后前一例的元数据、配额、对象状态和双方日志不变；共享数据库 identity 与高水位保持合法。
 

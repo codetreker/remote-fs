@@ -41,7 +41,7 @@ SQL lease recovery 与 `LeaseRecovery` 留在根 package，原生 evidence I/O �
 
 当前 schema 的两个损坏矩阵在所属顶层测试中持有私有、不可变的健康数据库种子，每个子用例获得独立文件和连接。种子复制不是生产 schema 或恢复入口；完整 checkpoint、关闭与隔离检查由[测试准备规则](../../testing.md#sqlite-测试准备与隔离)约束。
 
-测试按实现职责合并到对应的 `xxx_test.go`，例如 `objects.go` 的事务与清理用例归入 `objects_test.go`，`replica.go` 的副本用例归入 `replica_test.go`。公开 metastore 契约入口是根 `contract_test.go`；它在顶层拥有一个物理数据库，每个子用例拥有唯一的 namespace 对和各自 Open／Close 生存期，跨例隔离由专门回归约束。依赖私有状态的故障注入留在根 package。通过公开入口运行的跨组件用例仍在 `internal/integration`，按被测职责组织并共享原有 helper；子进程入口与调用者属于同一个测试二进制，原生 anchor 测试跟随 `nativelease`。
+测试按实现职责合并到对应的 `xxx_test.go`，例如 `objects.go` 的事务与清理用例归入 `objects_test.go`，`replica.go` 的副本用例归入 `replica_test.go`。公开 metastore 契约入口是根 `contract_test.go`；它在顶层拥有一个物理数据库，每个子用例拥有唯一的 namespace 对和各自 Open／Close 生存期，跨例隔离由专门回归约束。匿名发布拒绝矩阵留在根 `publication_test.go`，每种占有模式复用一份 fixture，逐项验证拒绝前后及跨项状态不变；其它 publication 与恢复 fixture 的生命周期独立。依赖私有状态的故障注入留在根 package。通过公开入口运行的跨组件用例仍在 `internal/integration`，按被测职责组织并共享原有 helper；子进程入口与调用者属于同一个测试二进制，原生 anchor 测试跟随 `nativelease`。
 
 根 `snapshot_test.go` 直接检查生产 snapshot query；`internal/dbstate/identity_test.go` 检查身份高水位的实际 SQL。模块边界不提供仅为测试导出的生产接口。
 

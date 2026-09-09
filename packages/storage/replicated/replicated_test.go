@@ -636,13 +636,16 @@ func TestACallerThatCannotConfirmItsChangeLeavesTheMountWorking(t *testing.T) {
 
 	s := serve(t, httprest.DefaultLimits())
 	write(t, s, "before.txt", "here before the mount")
-	// Every frame of the change stream is held back longer than the confirmation grace, so
-	// the copy cannot reach the mutation's barrier in time.
-	s.events.slowEvents(3 * time.Second)
+	gate := s.events.gateEvents()
+	defer gate.release()
 
 	mounted, replica := mountWithGrace(t, s, grace)
+	gate.arm()
 
-	err := mounted.Write(t.Context(), "a.txt", []byte("written while the stream is slow"))
+	result := make(chan error, 1)
+	go func() { result <- mounted.Write(t.Context(), "a.txt", []byte("written while the stream is slow")) }()
+	gate.requireEntered(t)
+	err := <-result
 	if err == nil {
 		t.Fatal("the write reported success, and its change had not come back")
 	}
@@ -664,13 +667,12 @@ func TestACallerThatCannotConfirmItsChangeLeavesTheMountWorking(t *testing.T) {
 	}
 
 	// And the change it could not confirm was real, and arrives.
+	gate.release()
 	t.Logf("unconfirmed → held by the copy: %v", requireHolding(t, mounted, "a.txt"))
 	requireCaughtUp(t, s, replica)
 	requireSameTree(t, walkSource(t, s), walkCopy(t, replica))
 
-	// And a mutation on a stream that is not being held back is confirmed as usual. The delay
-	// belongs to the stream it was opened with, so this takes a new one.
-	s.events.slowEvents(0)
+	// Confirmation must also remain usable after the stream reconnects.
 	s.events.cut()
 	requireUnusable(t, mounted)
 	s.events.mend()
@@ -685,14 +687,15 @@ func TestACallerThatCannotConfirmItsChangeLeavesTheMountWorking(t *testing.T) {
 }
 
 func TestConfirmationAdmissionRefusesBeforeSendingAndReleasesCapacity(t *testing.T) {
-	const frame = 500 * time.Millisecond
 	s := serve(t, httprest.DefaultLimits())
-	s.events.slowEvents(frame)
+	gate := s.events.gateEvents()
+	defer gate.release()
 	options := replicated.DefaultOptions()
 	options.ConfirmationGrace = 5 * time.Second
 	options.MaxActiveConfirmations = 1
 	options.MaxWaitingConfirmations = 0
 	mounted, _ := mountWithOptions(t, s, options)
+	gate.arm()
 
 	at, err := s.meta.CommittedPosition(t.Context())
 	if err != nil {
@@ -701,6 +704,7 @@ func TestConfirmationAdmissionRefusesBeforeSendingAndReleasesCapacity(t *testing
 	first := make(chan error, 1)
 	go func() { first <- mounted.Create(t.Context(), "first") }()
 	requireRecordedPast(t, s, at)
+	gate.requireEntered(t)
 
 	before := s.calls.of(httprest.OpCreate)
 	if err := mounted.Create(t.Context(), "second"); !errors.Is(err, syscall.EAGAIN) {
@@ -712,6 +716,7 @@ func TestConfirmationAdmissionRefusesBeforeSendingAndReleasesCapacity(t *testing
 	if _, err := s.meta.Stat(t.Context(), "second"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the pre-send refusal changed the namespace: %v", err)
 	}
+	gate.release()
 	if err := <-first; err != nil {
 		t.Fatalf("the admitted mutation failed: %v", err)
 	}
@@ -739,14 +744,15 @@ func TestInvalidMutationPathsAreRejectedBeforeConfirmationAdmission(t *testing.T
 }
 
 func TestCancelledConfirmationAdmissionWaiterNeverSendsAMutation(t *testing.T) {
-	const frame = 500 * time.Millisecond
 	s := serve(t, httprest.DefaultLimits())
-	s.events.slowEvents(frame)
+	gate := s.events.gateEvents()
+	defer gate.release()
 	options := replicated.DefaultOptions()
 	options.ConfirmationGrace = 5 * time.Second
 	options.MaxActiveConfirmations = 1
 	options.MaxWaitingConfirmations = 1
 	mounted, _ := mountWithOptions(t, s, options)
+	gate.arm()
 
 	at, err := s.meta.CommittedPosition(t.Context())
 	if err != nil {
@@ -755,6 +761,7 @@ func TestCancelledConfirmationAdmissionWaiterNeverSendsAMutation(t *testing.T) {
 	first := make(chan error, 1)
 	go func() { first <- mounted.Create(t.Context(), "active") }()
 	requireRecordedPast(t, s, at)
+	gate.requireEntered(t)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	waiting := make(chan error, 1)
@@ -771,20 +778,22 @@ func TestCancelledConfirmationAdmissionWaiterNeverSendsAMutation(t *testing.T) {
 	if after := s.calls.of(httprest.OpCreate); after != before {
 		t.Fatalf("the cancelled waiter reached the server: create calls moved from %d to %d", before, after)
 	}
+	gate.release()
 	if err := <-first; err != nil {
 		t.Fatalf("the active mutation failed: %v", err)
 	}
 }
 
 func TestCancellationAfterServerSuccessReportsAmbiguousEIOAndReleasesCapacity(t *testing.T) {
-	const frame = 500 * time.Millisecond
 	s := serve(t, httprest.DefaultLimits())
-	s.events.slowEvents(frame)
+	gate := s.events.gateEvents()
+	defer gate.release()
 	options := replicated.DefaultOptions()
 	options.ConfirmationGrace = 5 * time.Second
 	options.MaxActiveConfirmations = 1
 	options.MaxWaitingConfirmations = 0
 	mounted, _ := mountWithOptions(t, s, options)
+	gate.arm()
 
 	at, err := s.meta.CommittedPosition(t.Context())
 	if err != nil {
@@ -794,6 +803,7 @@ func TestCancellationAfterServerSuccessReportsAmbiguousEIOAndReleasesCapacity(t 
 	done := make(chan error, 1)
 	go func() { done <- mounted.Create(ctx, "committed") }()
 	requireRecordedPast(t, s, at)
+	gate.requireEntered(t)
 	cancel()
 	if err := <-done; !errors.Is(err, syscall.EIO) {
 		t.Fatalf("cancellation after server success returned %v, want EIO", err)
@@ -802,6 +812,7 @@ func TestCancellationAfterServerSuccessReportsAmbiguousEIOAndReleasesCapacity(t 
 		t.Fatalf("the mutation reported as ambiguous did not reach the namespace: %v", err)
 	}
 
+	gate.release()
 	if err := mounted.Create(t.Context(), "after-cancel"); err != nil {
 		t.Fatalf("the cancelled confirmation did not release its capacity: %v", err)
 	}
@@ -1167,14 +1178,15 @@ func TestLosingReplicationWhileAMutationIsOutstandingNeverReportsSuccess(t *test
 }
 
 func TestClosingReleasesAServerMutationStillWaitingForItsBarrier(t *testing.T) {
-	const frame = 2 * time.Second
 	s := serve(t, httprest.DefaultLimits())
-	s.events.slowEvents(frame)
+	gate := s.events.gateEvents()
+	defer gate.release()
 	options := replicated.DefaultOptions()
 	options.ConfirmationGrace = 10 * time.Second
 	options.MaxActiveConfirmations = 1
 	options.MaxWaitingConfirmations = 1
 	mounted, _ := mountWithOptions(t, s, options)
+	gate.arm()
 
 	at, err := s.meta.CommittedPosition(t.Context())
 	if err != nil {
@@ -1183,6 +1195,7 @@ func TestClosingReleasesAServerMutationStillWaitingForItsBarrier(t *testing.T) {
 	mutation := make(chan error, 1)
 	go func() { mutation <- mounted.Create(t.Context(), "made-before-close") }()
 	requireRecordedPast(t, s, at)
+	gate.requireEntered(t)
 	waiting := make(chan error, 1)
 	go func() { waiting <- mounted.Create(t.Context(), "never-sent") }()
 	time.Sleep(20 * time.Millisecond)
