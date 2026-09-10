@@ -22,7 +22,7 @@ func (c *Coordinator) AcquireMaterialization(ctx context.Context, bytes int64) (
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if bytes > c.config.MaxMaterializedBytes {
-		return nil, fmt.Errorf("file materialization exceeds namespace byte limit: %w", syscall.EFBIG)
+		return nil, fmt.Errorf("file materialization exceeds volume byte limit: %w", syscall.EFBIG)
 	}
 	if c.materializations >= c.config.MaxMaterializations || bytes > c.config.MaxMaterializedBytes-c.materializedBytes {
 		return nil, fmt.Errorf("file materialization capacity is occupied: %w", syscall.EAGAIN)

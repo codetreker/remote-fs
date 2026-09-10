@@ -90,7 +90,7 @@ type Limits struct {
 	EventPage int
 
 	// Keepalive is how often a stream with nothing to say says so — both kinds, because
-	// both can be quiet for reasons that are nobody's fault. A namespace nobody is writing
+	// both can be quiet for reasons that are nobody's fault. A volume nobody is writing
 	// to produces no events, and a store working through a large tree produces no page for
 	// as long as it takes.
 	//

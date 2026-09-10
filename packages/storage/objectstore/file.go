@@ -271,7 +271,7 @@ func (f *openFile) publish(ctx context.Context, previous metastore.FileState, co
 			cleanupErr := f.cleanupObject(object.Key, false)
 			s.sweepAfterMutation()
 			if cleanupErr != nil {
-				if isNamespaceFact(cleanupErr) {
+				if isVolumeFact(cleanupErr) {
 					err = ambiguousCommitFailure(name, err)
 				}
 				return storage.Attr{}, false, errors.Join(err, internalFailure("abandoning", name, cleanupErr))

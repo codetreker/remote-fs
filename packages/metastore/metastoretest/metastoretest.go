@@ -26,7 +26,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// NewStore produces a fresh, empty namespace held under an allowance of allowance bytes, or
+// NewStore produces a fresh, empty volume held under an allowance of allowance bytes, or
 // under no allowance at all when allowance is zero. Run calls it once per case, so cases
 // never observe each other's writes.
 type NewStore func(t *testing.T, allowance int64) metastore.Store
@@ -42,7 +42,7 @@ func Run(t *testing.T, newStore NewStore) {
 }
 
 // testCase is one obligation. allowance is zero for every case that is not about the
-// allowance, which is also the namespace whose Space refuses to answer.
+// allowance, which is also the volume whose Space refuses to answer.
 type testCase struct {
 	name      string
 	allowance int64
@@ -74,18 +74,18 @@ var rootCases = []testCase{
 		}
 	}},
 
-	{name: "a fresh namespace is empty", run: func(t *testing.T, s metastore.Store) {
+	{name: "a fresh volume is empty", run: func(t *testing.T, s metastore.Store) {
 		children, err := s.List(ctx(t), "")
 		mustSucceed(t, err)
 		if len(children) != 0 {
-			t.Fatalf("fresh namespace lists %v, want nothing", names(children))
+			t.Fatalf("fresh volume lists %v, want nothing", names(children))
 		}
 	}},
 
 	// EBUSY rather than ENOTEMPTY or EPERM: the root is refused for what it is rather than
-	// for what it still holds. A namespace whose root is gone answers ENOENT to everything
+	// for what it still holds. A volume whose root is gone answers ENOENT to everything
 	// afterwards, which reads as "that file is not there" when the truth is that the
-	// namespace is not there.
+	// volume is not there.
 	{name: "the root cannot be removed", run: func(t *testing.T, s metastore.Store) {
 		for _, p := range rootNames {
 			mustFail(t, s.RemoveDir(ctx(t), p), syscall.EBUSY)
@@ -136,7 +136,7 @@ var rootCases = []testCase{
 
 var pathCases = []testCase{
 	// A path that leaves the root is refused before anything looks for it. These are not
-	// names the namespace could hold and then not hold.
+	// names the volume could hold and then not hold.
 	{name: "a path outside the root is refused", run: func(t *testing.T, s metastore.Store) {
 		for _, p := range []string{"/abs", "/", "..", "../x", "a/../../x"} {
 			_, err := s.Stat(ctx(t), p)
@@ -428,7 +428,7 @@ var attrCases = []testCase{
 			}
 		}},
 
-	// The range and the precision a namespace keeps are its own, but a store that keeps
+	// The range and the precision a volume keeps are its own, but a store that keeps
 	// times in a database has no filesystem underneath to inherit a range from — it chooses
 	// one. Two integers, seconds and nanoseconds, span every time.Time there is; a single
 	// count of nanoseconds in an int64 spans only 1678 to 2262, so 2400 below is the value
@@ -477,7 +477,7 @@ var attrCases = []testCase{
 	}},
 
 	// Node.Attr is how a node reaches the storage contract, and everything above this
-	// interface sees a namespace through it rather than through a Node. A node whose
+	// interface sees a volume through it rather than through a Node. A node whose
 	// attributes disagreed with the one the storage contract renders would be reported
 	// twice, differently.
 	{name: "a node renders as the attributes the storage contract describes",
@@ -635,7 +635,7 @@ var renameCases = []testCase{
 	}},
 
 	// A directory moved inside itself would hang off a node no root reaches, taking its
-	// whole subtree out of the namespace. EINVAL is what rename(2) reports for it.
+	// whole subtree out of the volume. EINVAL is what rename(2) reports for it.
 	{name: "a directory cannot be moved inside itself", run: func(t *testing.T, s metastore.Store) {
 		mustSucceed(t, s.Mkdir(ctx(t), "a"))
 		mustSucceed(t, s.Mkdir(ctx(t), "a/b"))
@@ -870,7 +870,7 @@ var objectCases = []testCase{
 	}},
 
 	// A length with no object to hold it describes bytes that are nowhere. Taking it would
-	// charge the namespace for contents no key names and no read could ever return.
+	// charge the volume for contents no key names and no read could ever return.
 	{name: "an empty key with a length is EINVAL", run: func(t *testing.T, s metastore.Store) {
 		mustFail(t, s.Commit(ctx(t), "f", metastore.Object{Size: 1, ModTime: time.Now()}), syscall.EINVAL)
 		mustHoldExactly(t, s)
@@ -1025,7 +1025,7 @@ var objectCases = []testCase{
 	}},
 
 	// A reservation knows the write it is for, so it refuses what the commit would refuse
-	// anyway. That is not the authority — the commit asks again, because the namespace may
+	// anyway. That is not the authority — the commit asks again, because the volume may
 	// change in between — but it is what stops a write that cannot land from paying to
 	// upload its bytes first.
 	{name: "a reservation refuses a write that cannot land", run: func(t *testing.T, s metastore.Store) {
@@ -1057,12 +1057,12 @@ var objectCases = []testCase{
 		mustHoldExactly(t, s, "d", "f")
 	}},
 
-	// The ordinary path is unaffected: a reservation the namespace has room for is taken,
+	// The ordinary path is unaffected: a reservation the volume has room for is taken,
 	// and the commit that follows it works.
-	{name: "a reservation the namespace has room for is committed", allowance: allowance, run: func(t *testing.T, s metastore.Store) {
+	{name: "a reservation the volume has room for is committed", allowance: allowance, run: func(t *testing.T, s metastore.Store) {
 		key, err := s.Reserve(ctx(t), "f", 500)
 		mustSucceed(t, err)
-		// The reservation itself takes no room; the bytes are the namespace's only once they
+		// The reservation itself takes no room; the bytes are the volume's only once they
 		// are committed.
 		mustUsed(t, s, 0)
 		mustSucceed(t, s.Commit(ctx(t), "f", metastore.Object{Key: key, Size: 500, ModTime: time.Now()}))
@@ -1100,16 +1100,16 @@ var objectCases = []testCase{
 	}},
 }
 
-// allowance is what the cases below hold their namespace to. It is large enough that the
+// allowance is what the cases below hold their volume to. It is large enough that the
 // sizes they commit are readable as themselves and small enough to be filled in one step.
 const allowance = 1 << 20
 
 var spaceCases = []testCase{
-	// A namespace with no allowance has no room of its own to report: an object store has no
-	// capacity to report, so a namespace held in one has no figures at all beyond an
+	// A volume with no allowance has no room of its own to report: an object store has no
+	// capacity to report, so a volume held in one has no figures at all beyond an
 	// allowance it was never given. The refusal is a standing property rather than a
 	// condition of the call — one that refuses never starts answering.
-	{name: "a namespace with no allowance reports none", run: func(t *testing.T, s metastore.Store) {
+	{name: "a volume with no allowance reports none", run: func(t *testing.T, s metastore.Store) {
 		for range 3 {
 			_, err := s.Space(ctx(t))
 			mustFail(t, err, syscall.ENOSYS)
@@ -1119,23 +1119,23 @@ var spaceCases = []testCase{
 		mustFail(t, err, syscall.ENOSYS)
 	}},
 
-	{name: "a namespace with an allowance reports it", allowance: allowance, run: func(t *testing.T, s metastore.Store) {
+	{name: "a volume with an allowance reports it", allowance: allowance, run: func(t *testing.T, s metastore.Store) {
 		space, err := s.Space(ctx(t))
 		mustSucceed(t, err)
 		if space.Total != allowance {
-			t.Fatalf("the namespace reports a total of %d bytes, want %d", space.Total, allowance)
+			t.Fatalf("the volume reports a total of %d bytes, want %d", space.Total, allowance)
 		}
 		if space.Used != 0 {
-			t.Fatalf("a fresh namespace reports %d bytes used, want none", space.Used)
+			t.Fatalf("a fresh volume reports %d bytes used, want none", space.Used)
 		}
 		if !space.Coherent() {
-			t.Fatalf("the namespace reports %+v, which cannot be true of anything", space)
+			t.Fatalf("the volume reports %+v, which cannot be true of anything", space)
 		}
 	}},
 
 	// Used is exact and is maintained by the same changes that move bytes in and out, so it
-	// is a census of what the namespace's files hold rather than a sample of anything.
-	{name: "used bytes follow what the namespace holds", allowance: allowance, run: func(t *testing.T, s metastore.Store) {
+	// is a census of what the volume's files hold rather than a sample of anything.
+	{name: "used bytes follow what the volume holds", allowance: allowance, run: func(t *testing.T, s metastore.Store) {
 		mustSucceed(t, s.Create(ctx(t), "empty"))
 		mustSucceed(t, s.Mkdir(ctx(t), "d"))
 		mustUsed(t, s, 0)
@@ -1168,7 +1168,7 @@ var spaceCases = []testCase{
 		space, err := s.Space(ctx(t))
 		mustSucceed(t, err)
 		if space.Avail != allowance {
-			t.Fatalf("an empty namespace reports %d bytes available, want the whole %d", space.Avail, allowance)
+			t.Fatalf("an empty volume reports %d bytes available, want the whole %d", space.Avail, allowance)
 		}
 	}},
 
@@ -1178,8 +1178,8 @@ var spaceCases = []testCase{
 		put(t, s, "f", allowance-100)
 		mustUsed(t, s, allowance-100)
 
-		// The reservation is for what fits; the commit then asks for more than the namespace
-		// has left. That is the arrangement a namespace which filled up between the two calls
+		// The reservation is for what fits; the commit then asks for more than the volume
+		// has left. That is the arrangement a volume which filled up between the two calls
 		// produces, and it is what makes the commit rather than the reservation the authority.
 		key, err := s.Reserve(ctx(t), "g", 100)
 		mustSucceed(t, err)
@@ -1201,7 +1201,7 @@ var spaceCases = []testCase{
 		space, err := s.Space(ctx(t))
 		mustSucceed(t, err)
 		if space.Avail != 0 {
-			t.Fatalf("a full namespace reports %d bytes available, want none", space.Avail)
+			t.Fatalf("a full volume reports %d bytes available, want none", space.Avail)
 		}
 	}},
 
@@ -1211,7 +1211,7 @@ var spaceCases = []testCase{
 		put(t, s, "f", allowance)
 		mustUsed(t, s, allowance)
 
-		// Reserving the size the file already holds costs the namespace nothing, so the
+		// Reserving the size the file already holds costs the volume nothing, so the
 		// reservation is taken; the commit then asks for one byte more than there is room for.
 		key, err := s.Reserve(ctx(t), "f", allowance)
 		mustSucceed(t, err)
@@ -1224,7 +1224,7 @@ var spaceCases = []testCase{
 		}
 		mustUsed(t, s, allowance)
 
-		// A full namespace still takes a write that shrinks it, which is the only way back
+		// A full volume still takes a write that shrinks it, which is the only way back
 		// under the allowance.
 		put(t, s, "f", 10)
 		mustUsed(t, s, 10)
@@ -1292,13 +1292,13 @@ func mustUsed(t *testing.T, s metastore.Store, want int64) {
 	t.Helper()
 	space, err := s.Space(ctx(t))
 	if err != nil {
-		t.Fatalf("asking for the room the namespace has: %v", err)
+		t.Fatalf("asking for the room the volume has: %v", err)
 	}
 	if space.Used != want {
-		t.Fatalf("the namespace reports %d bytes used, want %d", space.Used, want)
+		t.Fatalf("the volume reports %d bytes used, want %d", space.Used, want)
 	}
 	if !space.Coherent() {
-		t.Fatalf("the namespace reports %+v, which cannot be true of anything", space)
+		t.Fatalf("the volume reports %+v, which cannot be true of anything", space)
 	}
 }
 

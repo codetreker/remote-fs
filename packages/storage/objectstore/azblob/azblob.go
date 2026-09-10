@@ -1,8 +1,8 @@
 // Package azblob implements objectstore.Objects over one Azure Blob Storage container.
 //
-// Every workspace's objects live in the same container, separated by a key prefix, so the
+// Every volume's objects live in the same container, separated by a key prefix, so the
 // blob name for a key is prefix + key and nothing here ever addresses a blob outside its
-// own prefix. Sharing one container is what makes a workspace cheap to create: a container
+// own prefix. Sharing one container is what makes a volume cheap to create: a container
 // is an ARM-visible resource with its own lifecycle, and a prefix is a string.
 //
 // # Which API version we speak, and why it is not the newest
@@ -100,13 +100,13 @@ func NewFromConnectionString(connectionString, containerName, prefix string) (*O
 //
 // A non-empty prefix must end in the delimiter, because prefixes that do not are not
 // guaranteed to separate anything: "a" and "ab" both hold the blob named "abc", and the
-// workspace that reserved the key would never learn that another one had taken it. An empty
-// prefix is allowed and means the workspace owns the whole container, which is a different
+// volume that reserved the key would never learn that another one had taken it. An empty
+// prefix is allowed and means the volume owns the whole container, which is a different
 // deployment rather than a degenerate case of this one.
 func newObjects(client *container.Client, prefix string) (*Objects, error) {
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		return nil, fmt.Errorf("the key prefix %q does not end in %q, so it does not separate "+
-			"this workspace's keys from those of a workspace whose prefix it begins: %w",
+			"this volume's keys from those of a volume whose prefix it begins: %w",
 			prefix, "/", syscall.EINVAL)
 	}
 	return &Objects{container: client, prefix: prefix}, nil
@@ -233,7 +233,7 @@ func (o *Objects) Delete(ctx context.Context, key string) error {
 // Available first proves that the container still exists and accepts this client's
 // credentials, then refuses a physical-capacity figure. A blob container exposes no
 // measured writable byte count belonging to this prefix; returning ENOSYS after the probe
-// says exactly that without hiding an unreachable half of the namespace behind its quota.
+// says exactly that without hiding an unreachable half of the volume behind its quota.
 func (o *Objects) Available(ctx context.Context) (int64, error) {
 	if _, err := o.container.GetProperties(ctx, nil); err != nil {
 		return 0, failure("probe", "container", err)

@@ -84,7 +84,7 @@ func TestNothingIsPrinted(t *testing.T) {
 // out is the likely form of the mistake.
 func exerciseTheLibrary(dir string) (result error) {
 	meta, err := sqlite.OpenLocking(context.Background(), sqlite.LockingConfig{
-		Database: filepath.Join(dir, "namespace.db"), Namespace: "library",
+		Database: filepath.Join(dir, "volume.db"), Volume: "library",
 		Allowance: 1 << 30, SQLite: sqlite.DefaultOptions(),
 		Locks: locking.DefaultOptions(), Initialize: true,
 	})

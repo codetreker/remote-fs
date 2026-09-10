@@ -16,7 +16,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore"
 )
 
-// publisher wakes the open subscriptions when this server has changed the namespace.
+// publisher wakes the open subscriptions when this server has changed the volume.
 //
 // It carries no changes itself, and that is the whole design. Each subscription reads
 // metastore.Log.Since from where it last delivered, so catching up and keeping up are one
@@ -31,10 +31,10 @@ import (
 // change (R-CON-2).
 //
 // What this arrangement assumes is that this process is the only one writing the
-// namespace. A second server over the same database would record changes into the same log
+// volume. A second server over the same database would record changes into the same log
 // and reach none of these subscriptions, so its changes would sit there until something
-// this process did woke them. One server per workspace is the assumption for now, and it
-// is stated here rather than discovered later as a namespace that updates only when
+// this process did woke them. One server per volume is the assumption for now, and it
+// is stated here rather than discovered later as a volume that updates only when
 // somebody else happens to write to it.
 type publisher struct {
 	mu               sync.Mutex
@@ -209,11 +209,11 @@ func startAt(incarnation metastore.Incarnation, at, tail metastore.Position) Str
 // those two is the whole reason Retention carries both. A replica has missed nothing exactly
 // when it has already seen everything the log threw away; how far its position sits below
 // the oldest surviving entry is not the same question, because positions are dense in no
-// particular way. A store numbering every namespace in one database from a single sequence
-// leaves each namespace's positions spread by however much its neighbours were written to in
+// particular way. A store numbering every volume in one database from a single sequence
+// leaves each volume's positions spread by however much its neighbours were written to in
 // between, so a replica that had missed nothing would be sent off to walk the whole tree
 // again — and one that had applied nothing at all, sitting at position zero, would be sent
-// away by every namespace whose first change is not position 1.
+// away by every volume whose first change is not position 1.
 //
 // A replica at the tail needs no case of its own. Nothing can have been discarded above the
 // newest position ever recorded, so being at the tail already means being at or past
@@ -233,7 +233,7 @@ func rebuildFor(at metastore.Position, retention metastore.Retention) RebuildRea
 // for as long as the replica watches.
 //
 // No change waits for an interval to come round. The inner loop reads the log until it has
-// nothing more, and the outer one blocks until this server changes the namespace or the
+// nothing more, and the outer one blocks until this server changes the volume or the
 // replica goes away.
 //
 // A subscriber too slow to keep up blocks its own write, and a subscriber that has stopped
@@ -531,15 +531,15 @@ func (h *Handler) endedByStop(err error) bool {
 	return h.stopped() && errors.Is(err, os.ErrDeadlineExceeded)
 }
 
-// refuseUnreplicable answers a namespace that has no log at all.
+// refuseUnreplicable answers a volume that has no log at all.
 //
-// ENOSYS, under its own name, exactly as a namespace with no allowance answers a question
-// about its space: it is a standing property of this namespace rather than a gap in the
+// ENOSYS, under its own name, exactly as a volume with no allowance answers a question
+// about its space: it is a standing property of this volume rather than a gap in the
 // protocol or a failure worth retrying. What it must not be answered with is a stream that
-// carries nothing and a snapshot of no rows, which is a namespace that exists, is empty,
+// carries nothing and a snapshot of no rows, which is a volume that exists, is empty,
 // and never changes — an answer a replica would believe.
 func (h *Handler) refuseUnreplicable(w http.ResponseWriter) {
-	h.writeOperationError(w, fmt.Errorf("this namespace keeps no change log, so it cannot be replicated: %w", syscall.ENOSYS))
+	h.writeOperationError(w, fmt.Errorf("this volume keeps no change log, so it cannot be replicated: %w", syscall.ENOSYS))
 }
 
 func (h *Handler) acquireSnapshotFrame(ctx context.Context) (func(), error) {

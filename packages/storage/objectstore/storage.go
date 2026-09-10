@@ -40,7 +40,7 @@ const (
 // worse outcome by far.
 const readAttempts = 4
 
-// Storage is one namespace, its tree in a metastore and its bytes in an object store.
+// Storage is one volume, its tree in a metastore and its bytes in an object store.
 type Storage struct {
 	objects Objects
 	meta    metastore.Store
@@ -124,7 +124,7 @@ type MaintenanceStatus struct {
 	LastSweepError   error
 }
 
-// New assembles a namespace from the two halves that hold it and takes ownership of both.
+// New assembles a volume from the two halves that hold it and takes ownership of both.
 // It uses DefaultOptions, so committed mutations trigger prompt bounded cleanup and the
 // periodic pass retries retained garbage after transient failures or a quiet restart.
 func New(objects Objects, meta metastore.Store) *Storage {
@@ -132,7 +132,7 @@ func New(objects Objects, meta metastore.Store) *Storage {
 	return newStorage(objects, meta, options.SweepInterval, options.SweepBatch)
 }
 
-// NewWithOptions assembles a namespace whose sweeper is owned by the returned Storage. A
+// NewWithOptions assembles a volume whose sweeper is owned by the returned Storage. A
 // successful call takes ownership of objects and meta; a failed call leaves both with the
 // caller. The sweeper uses a storage-lifetime context, so cancellation of the request which
 // caused garbage does not cancel its later cleanup.
@@ -268,7 +268,7 @@ func (s *Storage) beginOperation() error {
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
 	if s.closeDone != nil {
-		return fmt.Errorf("the object-store namespace is closed: %w", syscall.EIO)
+		return fmt.Errorf("the object-store volume is closed: %w", syscall.EIO)
 	}
 	s.operations.RLock()
 	return nil
@@ -370,14 +370,14 @@ func (s *Storage) ListBounded(ctx context.Context, path string, result *storage.
 // Read returns the whole contents of the file at path.
 //
 // Nothing here answers for a symbolic link, and nothing needs to: the storage contract
-// offers no operation that makes one, so a namespace reachable only through it never comes
+// offers no operation that makes one, so a volume reachable only through it never comes
 // to hold one. A local directory is different because something outside this system can
 // make a link in it; a metastore has no outside.
 //
 // Reading is two steps — ask the tree which object, then ask for that object — and a write
 // can land between them. When it does, the object the tree named a moment ago has already
 // been swept, and the read must tell that apart from the one thing it looks exactly like:
-// a namespace that has lost bytes it still claims to hold. The difference is whether the
+// a volume that has lost bytes it still claims to hold. The difference is whether the
 // tree still names the object that is missing. If it names a different one, the file was
 // replaced and the new contents are as valid an answer as the old ones would have been. If
 // it names the same one, something that should exist does not, and that is reported rather
@@ -437,7 +437,7 @@ func (s *Storage) read(ctx context.Context, path string, maxBytes *int64) ([]byt
 		switch {
 		case err == nil:
 			if int64(len(content)) != node.Size {
-				return nil, fmt.Errorf("the contents of %s are %d bytes but the namespace records %d: %w",
+				return nil, fmt.Errorf("the contents of %s are %d bytes but the volume records %d: %w",
 					path, len(content), node.Size, syscall.EIO)
 			}
 			return content, nil
@@ -518,7 +518,7 @@ func (s *Storage) abandon(path string, key metastore.Key, operationErr error) er
 	if abandonErr == nil {
 		return operationErr
 	}
-	if isNamespaceFact(abandonErr) {
+	if isVolumeFact(abandonErr) {
 		operationErr = ambiguousCommitFailure(path, operationErr)
 	}
 	return errors.Join(operationErr,
@@ -535,20 +535,20 @@ func (s *Storage) quarantine(path string, key metastore.Key, operationErr error)
 }
 
 func objectFailure(action, path string, err error) error {
-	if isNamespaceFact(err) {
+	if isVolumeFact(err) {
 		return sanitizeFailure(
 			fmt.Sprintf("%s the contents of %s failed with an object-key result", action, path),
-			err, isNamespaceFact,
+			err, isVolumeFact,
 		)
 	}
 	return fmt.Errorf("%s the contents of %s: %w", action, path, err)
 }
 
 func internalFailure(action, path string, err error) error {
-	if isNamespaceFact(err) {
+	if isVolumeFact(err) {
 		return sanitizeFailure(
 			fmt.Sprintf("%s the object reserved for %s reached an internal state", action, path),
-			err, isNamespaceFact,
+			err, isVolumeFact,
 		)
 	}
 	return fmt.Errorf("%s the object reserved for %s: %w", action, path, err)
@@ -643,7 +643,7 @@ func classifiedSubtrees(err error, reject func(error) bool) []error {
 	return nil
 }
 
-func isNamespaceFact(err error) bool {
+func isVolumeFact(err error) bool {
 	for _, errno := range []syscall.Errno{
 		syscall.ENOENT,
 		syscall.EEXIST,
@@ -800,8 +800,8 @@ func onlyLeaves(err error, targets ...error) bool {
 // Sweep deletes objects nothing references and forgets them, until it runs out or reaches
 // limit. It returns how many it removed.
 //
-// A caller that wants a namespace tidied rather than merely kept from growing calls this;
-// the mutations clear only a batch each, so a namespace that was written to by a process
+// A caller that wants a volume tidied rather than merely kept from growing calls this;
+// the mutations clear only a batch each, so a volume that was written to by a process
 // that then died has a backlog nobody is walking.
 func (s *Storage) Sweep(ctx context.Context, limit int) (int, error) {
 	if limit < 0 {
@@ -879,7 +879,7 @@ func (s *Storage) sweep(ctx context.Context, limit int) (int, error) {
 
 // sweepAfterMutation asks the storage-owned worker to clear a bounded batch.
 //
-// It is called whenever a successful namespace edit or a failed write can have produced
+// It is called whenever a successful volume edit or a failed write can have produced
 // garbage, so neither outcome waits for unrelated object deletion. The one-place buffer
 // coalesces a burst, and a signal arriving while a sweep runs remains buffered for the next
 // batch. Failures are retained in MaintenanceStatus, while the metastore record keeps the

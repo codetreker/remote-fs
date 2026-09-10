@@ -36,33 +36,33 @@ func testAuthorityConfig(t *testing.T) authorityConfig {
 	return authorityConfig{locks: locking.DefaultOptions(), initializeLocks: true}
 }
 
-func newTestNamespace(t *testing.T) (*objectstore.Storage, *sqlite.LockingStore) {
+func newTestVolume(t *testing.T) (*objectstore.Storage, *sqlite.LockingStore) {
 	t.Helper()
 	meta, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
-		Database: filepath.Join(t.TempDir(), "metastore.db"), Namespace: "workspace",
+		Database: filepath.Join(t.TempDir(), "metastore.db"), Volume: "workspace",
 		SQLite: sqlite.DefaultOptions(), Locks: locking.DefaultOptions(), Initialize: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	namespace := objectstore.New(memory.New(), meta)
+	volume := objectstore.New(memory.New(), meta)
 	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
-			t.Errorf("close namespace: %v", err)
+		if err := volume.Close(); err != nil {
+			t.Errorf("close volume: %v", err)
 		}
 	})
-	return namespace, meta
+	return volume, meta
 }
 
 func TestStorageClosesAfterServingAndItsFailureIsReturned(t *testing.T) {
 	actionFailure := errors.New("HTTP server failed")
 	closeFailure := errors.New("storage close failed")
 	var events []string
-	ns := opened{close: func() error {
+	v := opened{close: func() error {
 		events = append(events, "close")
 		return closeFailure
 	}}
-	err := withOpened(ns, func() error {
+	err := withOpened(v, func() error {
 		if len(events) != 0 {
 			t.Fatalf("storage closed before the server action: %v", events)
 		}
@@ -83,7 +83,7 @@ func TestInvalidListenAddressDoesNotInitializeALocalStore(t *testing.T) {
 		"-listen", "127.0.0.1",
 		"-local-store", root,
 		"-initialize-lock-state",
-		"-workspace", "workspace",
+		"-volume", "workspace",
 		"-quota", "8M",
 	}, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "listen") {
@@ -104,7 +104,7 @@ func TestAddressInUseDoesNotInitializeALocalStore(t *testing.T) {
 		"-listen", held.Addr().String(),
 		"-local-store", root,
 		"-initialize-lock-state",
-		"-workspace", "workspace",
+		"-volume", "workspace",
 		"-quota", "8M",
 	}, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "listen") {
@@ -389,7 +389,7 @@ func waitForNewConnections(t *testing.T, tracker *connectionTracker, want int, t
 
 func unreplicatedHandler(t *testing.T) *httprest.Handler {
 	t.Helper()
-	backing, _ := newTestNamespace(t)
+	backing, _ := newTestVolume(t)
 	handler, err := httprest.NewHandler(backing, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -537,27 +537,27 @@ func TestOpenLocalExposesReplicationAndOperationalStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := localSource{
-		root:      root,
-		workspace: "workspace",
-		objects:   localdisk.Options{MaxWaitingOperations: 11},
+		root:    root,
+		volume:  "workspace",
+		objects: localdisk.Options{MaxWaitingOperations: 11},
 	}
 	maintenance := objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8}
 	const maxReaderConnections = 3
 	const maxSnapshotReaderConnections = 4
 	const maxIntegrityRecords = 101
 	const maxIntegrityBytes = 7 << 20
-	ns, err := openLocal(
+	v, err := openLocal(
 		source, 1<<20, sqlite.DefaultObjectLimits(), maxReaderConnections,
 		maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance, testAuthorityConfig(t),
 	)
 	if err != nil {
 		t.Fatalf("openLocal: %v", err)
 	}
-	t.Cleanup(func() { _ = ns.close() })
-	if ns.log == nil || ns.status == nil {
-		t.Fatalf("local namespace has log=%t and status=%t, want both", ns.log != nil, ns.status != nil)
+	t.Cleanup(func() { _ = v.close() })
+	if v.log == nil || v.status == nil {
+		t.Fatalf("local volume has log=%t and status=%t, want both", v.log != nil, v.status != nil)
 	}
-	status, err := ns.status(t.Context())
+	status, err := v.status(t.Context())
 	if err != nil {
 		t.Fatalf("query local status: %v", err)
 	}
@@ -581,8 +581,8 @@ func TestOpenLocalExposesReplicationAndOperationalStatus(t *testing.T) {
 		!strings.Contains(status, "checkpoint pending is false") {
 		t.Fatalf("local status does not report the healthy checkpoint state: %s", status)
 	}
-	if err := ns.close(); err != nil {
-		t.Fatalf("close local namespace: %v", err)
+	if err := v.close(); err != nil {
+		t.Fatalf("close local volume: %v", err)
 	}
 }
 
@@ -598,23 +598,23 @@ func TestOpenBlobsExposesPendingAndMaintenanceStatus(t *testing.T) {
 	const maxIntegrityRecords = 103
 	const maxIntegrityBytes = 13 << 20
 	maintenance := objectstore.Options{SweepInterval: 47 * time.Second, SweepBatch: 31}
-	ns, err := openBlobs(blobSource{
+	v, err := openBlobs(blobSource{
 		container: "container",
 		database:  filepath.Join(t.TempDir(), "metastore.sqlite"),
-		workspace: "workspace",
+		volume:    "workspace",
 	}, 0, limits, maxReaderConnections, maxSnapshotReaderConnections, maxIntegrityRecords, maxIntegrityBytes, maintenance, testAuthorityConfig(t))
 	if err != nil {
 		t.Fatalf("openBlobs: %v", err)
 	}
-	t.Cleanup(func() { _ = ns.close() })
-	if ns.status == nil || ns.statusName != "blob namespace" {
-		t.Fatalf("blob namespace has status=%t name=%q", ns.status != nil, ns.statusName)
+	t.Cleanup(func() { _ = v.close() })
+	if v.status == nil || v.statusName != "blob volume" {
+		t.Fatalf("blob volume has status=%t name=%q", v.status != nil, v.statusName)
 	}
 	var output bytes.Buffer
-	handleHangup(t.Context(), ns, &output)
+	handleHangup(t.Context(), v, &output)
 	for _, phrase := range []string{
-		"blob namespace status",
-		`workspace "workspace"`,
+		"blob volume status",
+		`volume "workspace"`,
 		"0 reserved objects",
 		"0 unresolved objects",
 		"pending reservation thresholds are 17 objects and 1048576 bytes",
@@ -642,22 +642,22 @@ func TestBlobStatusFailsWhenTheObjectStoreIsUnreachable(t *testing.T) {
 	}
 	t.Setenv(connectionEnv, blobConnectionString("http://"+address+"/devstoreaccount1"))
 
-	ns, err := openBlobs(blobSource{
+	v, err := openBlobs(blobSource{
 		container: "container",
 		database:  filepath.Join(t.TempDir(), "metastore.sqlite"),
-		workspace: "workspace",
+		volume:    "workspace",
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
 		sqlite.DefaultMaxIntegrityBytes,
 		objectstore.DefaultOptions(), testAuthorityConfig(t))
 	if err != nil {
-		t.Fatalf("open blob namespace: %v", err)
+		t.Fatalf("open blob volume: %v", err)
 	}
-	t.Cleanup(func() { _ = ns.close() })
+	t.Cleanup(func() { _ = v.close() })
 
 	ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
 	defer cancel()
-	assertBlobStatusFailure(t, readStatus(ctx, ns), ns, syscall.EIO)
+	assertBlobStatusFailure(t, readStatus(ctx, v), v, syscall.EIO)
 }
 
 func TestBlobStatusFailsWhenCredentialsAreRejected(t *testing.T) {
@@ -667,20 +667,20 @@ func TestBlobStatusFailsWhenCredentialsAreRejected(t *testing.T) {
 	t.Cleanup(service.Close)
 	t.Setenv(connectionEnv, blobConnectionString(service.URL+"/devstoreaccount1"))
 
-	ns, err := openBlobs(blobSource{
+	v, err := openBlobs(blobSource{
 		container: "container",
 		database:  filepath.Join(t.TempDir(), "metastore.sqlite"),
-		workspace: "workspace",
+		volume:    "workspace",
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
 		sqlite.DefaultMaxIntegrityBytes,
 		objectstore.DefaultOptions(), testAuthorityConfig(t))
 	if err != nil {
-		t.Fatalf("open blob namespace: %v", err)
+		t.Fatalf("open blob volume: %v", err)
 	}
-	t.Cleanup(func() { _ = ns.close() })
+	t.Cleanup(func() { _ = v.close() })
 
-	assertBlobStatusFailure(t, readStatus(t.Context(), ns), ns, syscall.EACCES)
+	assertBlobStatusFailure(t, readStatus(t.Context(), v), v, syscall.EACCES)
 }
 
 func TestBlobStatusReportsUnresolvedWrites(t *testing.T) {
@@ -694,24 +694,24 @@ func TestBlobStatusReportsUnresolvedWrites(t *testing.T) {
 	t.Cleanup(service.Close)
 	t.Setenv(connectionEnv, blobConnectionString(service.URL+"/devstoreaccount1"))
 
-	ns, err := openBlobs(blobSource{
+	v, err := openBlobs(blobSource{
 		container: "container",
 		database:  filepath.Join(t.TempDir(), "metastore.sqlite"),
-		workspace: "workspace",
+		volume:    "workspace",
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
 		sqlite.DefaultMaxIntegrityBytes,
 		objectstore.DefaultOptions(), testAuthorityConfig(t))
 	if err != nil {
-		t.Fatalf("open blob namespace: %v", err)
+		t.Fatalf("open blob volume: %v", err)
 	}
-	t.Cleanup(func() { _ = ns.close() })
+	t.Cleanup(func() { _ = v.close() })
 
-	if err := ns.namespace.Write(t.Context(), "artifact", []byte("unknown")); !errors.Is(err, syscall.EACCES) {
+	if err := v.volume.Write(t.Context(), "artifact", []byte("unknown")); !errors.Is(err, syscall.EACCES) {
 		t.Fatalf("write rejected with %v, want EACCES", err)
 	}
 	var output bytes.Buffer
-	handleHangup(t.Context(), ns, &output)
+	handleHangup(t.Context(), v, &output)
 	if !strings.Contains(output.String(), "1 unresolved objects (7 bytes)") {
 		t.Fatalf("blob status does not report the quarantined write: %s", output.String())
 	}
@@ -743,7 +743,7 @@ func TestOpenBlobsRefusesLegacyUsedAccountingMismatchBeforeStartingMaintenance(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE namespaces SET used = 1 WHERE id = 1`); err != nil {
+	if _, err := db.Exec(`UPDATE volumes SET used = 1 WHERE id = 1`); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
@@ -798,16 +798,16 @@ func assertLegacyBlobOpenRefusedWithContext(
 	t.Cleanup(service.Close)
 	t.Setenv(connectionEnv, blobConnectionString(service.URL+"/devstoreaccount1"))
 
-	ns, err := openBlobsContext(ctx, blobSource{
+	v, err := openBlobsContext(ctx, blobSource{
 		container: "container",
 		database:  database,
-		workspace: "workspace",
+		volume:    "workspace",
 	}, 0, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, maxIntegrityRecords,
 		sqlite.DefaultMaxIntegrityBytes,
 		objectstore.DefaultOptions(), testAuthorityConfig(t))
 	if err == nil {
-		_ = ns.close()
+		_ = v.close()
 		t.Fatalf("%s was migrated and served", subject)
 	}
 	if !errors.Is(err, want) {
@@ -834,7 +834,7 @@ func writeVersionTwoDatabaseWithPendingObject(t *testing.T, path string, state i
 	}
 	defer database.Close()
 	if _, err := database.Exec(`
-		INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
+		INSERT INTO objects (key, volume, state, size, digest, created_sec, created_nsec)
 		VALUES ('ambiguous', 1, ?, 0, NULL, 0, 0)`, state); err != nil {
 		t.Fatalf("add pending object to schema version 2 database: %v", err)
 	}
@@ -849,11 +849,11 @@ func writeVersionTwoDatabaseWithDisconnectedCycle(t *testing.T, path string) {
 	}
 	defer database.Close()
 	if _, err := database.Exec(`
-		INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
 		VALUES
 			(2, 1, ?, 0, 0, 0, 0, 0, NULL),
 			(3, 1, ?, 0, 0, 0, 0, 0, NULL);
-		INSERT INTO entries (namespace, parent, name, node) VALUES
+		INSERT INTO entries (volume, parent, name, node) VALUES
 			(1, 2, X'61', 3),
 			(1, 3, X'62', 2);`,
 		int64(fs.ModeDir|0o755), int64(fs.ModeDir|0o755),
@@ -884,10 +884,10 @@ func writeVersionTwoDatabase(t *testing.T, path string) {
 	}
 	const rootID = 1
 	if _, err := database.Exec(`
-		INSERT INTO namespaces (id, name, root, used) VALUES (1, 'workspace', ?, 0);
-		INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		INSERT INTO volumes (id, name, root, used) VALUES (1, 'workspace', ?, 0);
+		INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
 		VALUES (?, 1, ?, 0, 0, 0, 0, 0, NULL);
-		INSERT INTO logs (namespace, incarnation, committed_position, trimmed_through, trimmed_by_age)
+		INSERT INTO logs (volume, incarnation, committed_position, trimmed_through, trimmed_by_age)
 		VALUES (1, 'version-two-incarnation', 0, 0, 0);`,
 		rootID, rootID, int64(fs.ModeDir|0o755),
 	); err != nil {
@@ -920,13 +920,13 @@ func blobConnectionString(endpoint string) string {
 	return "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=AQ==;BlobEndpoint=" + endpoint + ";"
 }
 
-func assertBlobStatusFailure(t *testing.T, report statusReport, ns opened, want error) {
+func assertBlobStatusFailure(t *testing.T, report statusReport, v opened, want error) {
 	t.Helper()
 	if report.err == nil || !errors.Is(report.err, want) {
 		t.Fatalf("blob status returned %v, want %v", report.err, want)
 	}
 	var output bytes.Buffer
-	writeStatus(report, ns, &output)
+	writeStatus(report, v, &output)
 	if !strings.Contains(output.String(), "status") || !strings.Contains(output.String(), "failed") {
 		t.Fatalf("blob status failure was not reported: %s", output.String())
 	}
@@ -957,7 +957,7 @@ func TestExpectedCloseDoesNotHideAJoinedFailure(t *testing.T) {
 }
 
 func TestTerminationReturnsAFatalServeErrorThatWasAlreadyBuffered(t *testing.T) {
-	backing, _ := newTestNamespace(t)
+	backing, _ := newTestVolume(t)
 	handler, err := httprest.NewHandler(backing, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -989,13 +989,13 @@ func (l *acceptErrorListener) Close() error              { return nil }
 func (l *acceptErrorListener) Addr() net.Addr            { return testAddress("listener") }
 
 func TestReadinessIsPublishedAfterSignalControlIsInstalled(t *testing.T) {
-	handler, ns := replicableNamespace(t)
+	handler, v := replicableVolume(t)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	output := &signalOnFirstWrite{signal: syscall.SIGTERM}
-	if err := serveWithGrace(newServer(handler), listener, ns, output, 100*time.Millisecond); err != nil {
+	if err := serveWithGrace(newServer(handler), listener, v, output, 100*time.Millisecond); err != nil {
 		t.Fatalf("the signal published with readiness did not stop cleanly: %v", err)
 	}
 	if output.err != nil {
@@ -1012,7 +1012,7 @@ func TestReadinessIsPublishedAfterSignalControlIsInstalled(t *testing.T) {
 }
 
 func TestBlockingStoppingDiagnosticCannotHoldAdmissionOpen(t *testing.T) {
-	handler, ns := replicableNamespace(t)
+	handler, v := replicableVolume(t)
 	server := newServer(handler)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1025,7 +1025,7 @@ func TestBlockingStoppingDiagnosticCannotHoldAdmissionOpen(t *testing.T) {
 	output := &blockingWrite{blockAt: 2, blocked: make(chan struct{}), release: make(chan struct{})}
 	t.Cleanup(output.unblock)
 	served := make(chan error, 1)
-	go func() { served <- serveWithGrace(server, listener, ns, output, 100*time.Millisecond) }()
+	go func() { served <- serveWithGrace(server, listener, v, output, 100*time.Millisecond) }()
 	remote, err := httprest.Dial("http://"+listener.Addr().String(), &http.Client{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -1092,7 +1092,7 @@ func (w *blockingWrite) unblock() {
 }
 
 func TestStartingShutdownCancelsAConnectionAcceptedBeforeStartAcknowledgement(t *testing.T) {
-	backing, _ := newTestNamespace(t)
+	backing, _ := newTestVolume(t)
 	canceling := &cancelingStatStorage{
 		boundedStorageAdapter: boundedStorageAdapter{Storage: backing},
 		entered:               make(chan struct{}),
@@ -1152,7 +1152,7 @@ func TestStartingShutdownCancelsAConnectionAcceptedBeforeStartAcknowledgement(t 
 }
 
 func TestClosedStartSignalUsesGracefulShutdownBeforeTheSelectConsumesIt(t *testing.T) {
-	backing, _ := newTestNamespace(t)
+	backing, _ := newTestVolume(t)
 	controlled := &releaseOrCancelStatStorage{
 		boundedStorageAdapter: boundedStorageAdapter{Storage: backing},
 		entered:               make(chan struct{}),
@@ -1279,18 +1279,18 @@ func TestSIGHUPReportsLocalStatusAndTheLockOutlivesServing(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := localSource{
-		root:      root,
-		workspace: "workspace",
+		root:   root,
+		volume: "workspace",
 	}
 	maintenance := objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8}
-	ns, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
+	v, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
 		sqlite.DefaultMaxIntegrityBytes, maintenance, testAuthorityConfig(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = ns.close() })
-	handler, err := httprest.NewHandlerWithOptions(ns.namespace, ns.log, httprest.DefaultHandlerOptions())
+	t.Cleanup(func() { _ = v.close() })
+	handler, err := httprest.NewHandlerWithOptions(v.volume, v.log, httprest.DefaultHandlerOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1315,8 +1315,8 @@ func TestSIGHUPReportsLocalStatusAndTheLockOutlivesServing(t *testing.T) {
 	}()
 	served := make(chan error, 1)
 	go func() {
-		served <- withOpened(ns, func() error {
-			return serve(newServer(handler), listener, ns, writer)
+		served <- withOpened(v, func() error {
+			return serve(newServer(handler), listener, v, writer)
 		})
 	}()
 
@@ -1345,7 +1345,7 @@ func TestSIGHUPReportsLocalStatusAndTheLockOutlivesServing(t *testing.T) {
 	}
 	line := waitForLine(t, lines, "local-store status", 2*time.Second)
 	if !strings.Contains(line, "local-store status for workspace in local store ") ||
-		!strings.Contains(line, `workspace "workspace" in store `) || !strings.Contains(line, "workspace bytes used") {
+		!strings.Contains(line, `volume "workspace" in store `) || !strings.Contains(line, "volume bytes used") {
 		t.Fatalf("SIGHUP reported %q", line)
 	}
 
@@ -1372,14 +1372,14 @@ func TestSIGHUPReportsLocalStatusAndTheLockOutlivesServing(t *testing.T) {
 }
 
 func TestBlockedStatusDoesNotDelayTermination(t *testing.T) {
-	handler, ns := replicableNamespace(t)
+	handler, v := replicableVolume(t)
 	statusStarted := make(chan struct{})
 	statusCanceled := make(chan struct{})
 	statusBudget := make(chan time.Duration, 1)
 	var startedOnce sync.Once
 	var canceledOnce sync.Once
-	ns.what = "blocked status fixture"
-	ns.status = func(ctx context.Context) (string, error) {
+	v.what = "blocked status fixture"
+	v.status = func(ctx context.Context) (string, error) {
 		startedOnce.Do(func() { close(statusStarted) })
 		deadline, ok := ctx.Deadline()
 		if !ok {
@@ -1397,7 +1397,7 @@ func TestBlockedStatusDoesNotDelayTermination(t *testing.T) {
 	}
 	served := make(chan error, 1)
 	go func() {
-		served <- serveWithGrace(newServer(handler), listener, ns, io.Discard, 100*time.Millisecond)
+		served <- serveWithGrace(newServer(handler), listener, v, io.Discard, 100*time.Millisecond)
 	}()
 	remote, err := httprest.Dial("http://"+listener.Addr().String(), &http.Client{Timeout: time.Second})
 	if err != nil {
@@ -1463,7 +1463,7 @@ func TestUncooperativeStatusWaitsOnlyAfterHTTPShutdown(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			backing, _ := newTestNamespace(t)
+			backing, _ := newTestVolume(t)
 			handler, err := httprest.NewHandlerWithOptions(backing, nil, httprest.DefaultHandlerOptions())
 			if err != nil {
 				t.Fatal(err)
@@ -1471,8 +1471,8 @@ func TestUncooperativeStatusWaitsOnlyAfterHTTPShutdown(t *testing.T) {
 			statusStarted := make(chan struct{})
 			statusRelease := make(chan struct{})
 			statusOutcome := make(chan error, 1)
-			ns := opened{
-				namespace:  backing,
+			v := opened{
+				volume:     backing,
 				what:       "uncooperative status fixture",
 				statusName: "test",
 				status: func(ctx context.Context) (string, error) {
@@ -1500,7 +1500,7 @@ func TestUncooperativeStatusWaitsOnlyAfterHTTPShutdown(t *testing.T) {
 			})
 			served := make(chan error, 1)
 			go func() {
-				served <- serveWithGrace(server, listener, ns, io.Discard, 100*time.Millisecond)
+				served <- serveWithGrace(server, listener, v, io.Discard, 100*time.Millisecond)
 			}()
 			remote, err := httprest.Dial("http://"+listener.Addr().String(), &http.Client{Timeout: time.Second})
 			if err != nil {
@@ -1548,7 +1548,7 @@ func TestUncooperativeStatusWaitsOnlyAfterHTTPShutdown(t *testing.T) {
 }
 
 func TestFatalServeErrorCancelsStatusBeforeDrainingHandlers(t *testing.T) {
-	backing, _ := newTestNamespace(t)
+	backing, _ := newTestVolume(t)
 	dependency := &sync.Mutex{}
 	storage := &statusGateStorage{
 		boundedStorageAdapter: boundedStorageAdapter{Storage: backing},
@@ -1560,8 +1560,8 @@ func TestFatalServeErrorCancelsStatusBeforeDrainingHandlers(t *testing.T) {
 	}
 	statusStarted := make(chan struct{})
 	statusCanceled := make(chan struct{})
-	ns := opened{
-		namespace:  storage,
+	v := opened{
+		volume:     storage,
 		what:       "blocked status fixture",
 		statusName: "test",
 		status: func(ctx context.Context) (string, error) {
@@ -1585,7 +1585,7 @@ func TestFatalServeErrorCancelsStatusBeforeDrainingHandlers(t *testing.T) {
 		_ = listener.Close()
 	})
 	served := make(chan error, 1)
-	go func() { served <- serveWithGrace(server, listener, ns, io.Discard, 100*time.Millisecond) }()
+	go func() { served <- serveWithGrace(server, listener, v, io.Discard, 100*time.Millisecond) }()
 	remote, err := httprest.Dial("http://"+listener.Addr().String(), &http.Client{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -1728,24 +1728,24 @@ func TestShutdownTimeoutKeepsTheLockUntilABlockedRequestLeaves(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := localSource{
-		root:      root,
-		workspace: "workspace",
+		root:   root,
+		volume: "workspace",
 	}
 	maintenance := objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8}
-	ns, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
+	v, err := openLocal(source, 1<<20, sqlite.DefaultObjectLimits(), sqlite.DefaultMaxReaderConnections,
 		sqlite.DefaultMaxSnapshotReaderConnections, sqlite.DefaultMaxIntegrityRecords,
 		sqlite.DefaultMaxIntegrityBytes, maintenance, testAuthorityConfig(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = ns.close() })
+	t.Cleanup(func() { _ = v.close() })
 	blocked := &blockingStatStorage{
-		boundedStorageAdapter: boundedStorageAdapter{Storage: ns.namespace},
+		boundedStorageAdapter: boundedStorageAdapter{Storage: v.volume},
 		entered:               make(chan struct{}),
 		release:               make(chan struct{}),
 	}
 	t.Cleanup(blocked.unblock)
-	handler, err := httprest.NewHandlerWithOptions(blocked, ns.log, httprest.DefaultHandlerOptions())
+	handler, err := httprest.NewHandlerWithOptions(blocked, v.log, httprest.DefaultHandlerOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1756,8 +1756,8 @@ func TestShutdownTimeoutKeepsTheLockUntilABlockedRequestLeaves(t *testing.T) {
 	const grace = 25 * time.Millisecond
 	served := make(chan error, 1)
 	go func() {
-		served <- withOpened(ns, func() error {
-			return serveWithGrace(newServer(handler), listener, ns, io.Discard, grace)
+		served <- withOpened(v, func() error {
+			return serveWithGrace(newServer(handler), listener, v, io.Discard, grace)
 		})
 	}()
 	remote, err := httprest.Dial("http://"+listener.Addr().String(), &http.Client{Timeout: time.Second})
@@ -1874,14 +1874,14 @@ func (s *blockingStatStorage) unblock() {
 // The whole path is exercised: the server this command builds, the signal handling it
 // installs, the grace it allows, and the value it returns.
 func TestStoppingWithAReplicaAttachedIsPromptAndClean(t *testing.T) {
-	handler, ns := replicableNamespace(t)
+	handler, v := replicableVolume(t)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	served := make(chan error, 1)
-	go func() { served <- serve(newServer(handler), listener, ns, io.Discard) }()
+	go func() { served <- serve(newServer(handler), listener, v, io.Discard) }()
 
 	remote, err := httprest.Dial("http://"+listener.Addr().String(), &http.Client{Timeout: 10 * time.Second})
 	if err != nil {
@@ -1919,12 +1919,12 @@ func TestStoppingWithAReplicaAttachedIsPromptAndClean(t *testing.T) {
 	}
 }
 
-func replicableNamespace(t *testing.T) (*httprest.Handler, opened) {
+func replicableVolume(t *testing.T) (*httprest.Handler, opened) {
 	t.Helper()
-	namespace, meta := newTestNamespace(t)
-	handler, err := httprest.NewHandler(namespace, meta)
+	volume, meta := newTestVolume(t)
+	handler, err := httprest.NewHandler(volume, meta)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return handler, opened{namespace: namespace, log: meta, close: namespace.Close}
+	return handler, opened{volume: volume, log: meta, close: volume.Close}
 }

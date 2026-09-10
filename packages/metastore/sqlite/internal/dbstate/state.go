@@ -73,10 +73,10 @@ func Read(ctx context.Context, db sqlvalue.Queryer) (State, error) {
 const globalNodeIdentityBoundsQuery = `
 	SELECT
 		coalesce((SELECT 1
-		          FROM namespaces INDEXED BY namespaces_by_root_identity
+		          FROM volumes INDEXED BY volumes_by_root_identity
 		          WHERE CASE WHEN typeof(root) = 'integer' THEN 0 ELSE 1 END = 1 LIMIT 1), 0),
 		coalesce((SELECT CASE WHEN typeof(root) = 'integer' THEN root ELSE 0 END
-		          FROM namespaces INDEXED BY namespaces_by_root_identity
+		          FROM volumes INDEXED BY volumes_by_root_identity
 		          WHERE CASE WHEN typeof(root) = 'integer' THEN 0 ELSE 1 END = 0
 		          ORDER BY root DESC LIMIT 1), 0),
 		coalesce((SELECT 1
@@ -163,26 +163,26 @@ func Validate(ctx context.Context, db sqlvalue.Queryer) (State, error) {
 			nodeSequence, changeSequence, state.NodeHighWater, state.ChangeHighWater, syscall.EIO)
 	}
 	var (
-		invalidNamespaceRoot, invalidEntryNode, invalidChangeNode int64
-		maximumNamespaceRoot, maximumEntryNode, maximumChangeNode int64
+		invalidVolumeRoot, invalidEntryNode, invalidChangeNode int64
+		maximumVolumeRoot, maximumEntryNode, maximumChangeNode int64
 	)
 	if err := db.QueryRowContext(ctx, globalNodeIdentityBoundsQuery).Scan(
-		&invalidNamespaceRoot, &maximumNamespaceRoot,
+		&invalidVolumeRoot, &maximumVolumeRoot,
 		&invalidEntryNode, &maximumEntryNode,
 		&invalidChangeNode, &maximumChangeNode,
 	); err != nil {
 		return State{}, err
 	}
-	if invalidNamespaceRoot != 0 || invalidEntryNode != 0 || invalidChangeNode != 0 {
+	if invalidVolumeRoot != 0 || invalidEntryNode != 0 || invalidChangeNode != 0 {
 		return State{}, fmt.Errorf(
-			"global node identities contain invalid storage classes in namespaces=%d entries=%d changes=%d: %w",
-			invalidNamespaceRoot, invalidEntryNode, invalidChangeNode, syscall.EIO)
+			"global node identities contain invalid storage classes in volumes=%d entries=%d changes=%d: %w",
+			invalidVolumeRoot, invalidEntryNode, invalidChangeNode, syscall.EIO)
 	}
 	var maximumNodeID int64
 	if err := db.QueryRowContext(ctx, maximumNodeIdentityQuery).Scan(&maximumNodeID); err != nil {
 		return State{}, err
 	}
-	maximumNode := max(maximumNodeID, maximumNamespaceRoot, maximumEntryNode, maximumChangeNode)
+	maximumNode := max(maximumNodeID, maximumVolumeRoot, maximumEntryNode, maximumChangeNode)
 
 	var invalidChangePosition, invalidLogPosition, maximumRetainedPosition, maximumLogPosition int64
 	if err := db.QueryRowContext(ctx, globalChangeIdentityBoundsQuery).Scan(

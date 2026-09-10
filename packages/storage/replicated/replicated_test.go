@@ -44,7 +44,7 @@ func TestAWalkOfACopiedTreeAsksTheServerNothing(t *testing.T) {
 	before := s.calls.snapshot()
 	walked := walkThrough(t, mounted)
 	if len(walked) != 5 {
-		t.Fatalf("the walk saw %v, want the five nodes the namespace holds", walked)
+		t.Fatalf("the walk saw %v, want the five nodes the volume holds", walked)
 	}
 	// Every name that is not there is asked about too, which is the shape of a path search
 	// and the case a copy answers without the server ever hearing about it.
@@ -60,10 +60,10 @@ func TestAWalkOfACopiedTreeAsksTheServerNothing(t *testing.T) {
 	t.Logf("walked %d nodes and asked about 3 absent names: %d requests", len(walked), s.calls.total()-total(before))
 }
 
-// TestTheCopyIsTheNamespaceNodeForNode. A walk that asks nothing is worth nothing unless what
-// it answers is what the namespace holds, read from the namespace's own metastore rather than
+// TestTheCopyIsTheVolumeNodeForNode. A walk that asks nothing is worth nothing unless what
+// it answers is what the volume holds, read from the volume's own metastore rather than
 // from anything under test.
-func TestTheCopyIsTheNamespaceNodeForNode(t *testing.T) {
+func TestTheCopyIsTheVolumeNodeForNode(t *testing.T) {
 	s := serve(t, httprest.DefaultLimits())
 	mkdir(t, s, "d")
 	write(t, s, "d/f", "contents")
@@ -366,7 +366,7 @@ func TestALogThatCannotCarryOnMakesTheCopyBeBuiltAgain(t *testing.T) {
 	s.events.cut()
 	requireUnusable(t, mounted)
 
-	// The namespace moves on while the copy is not being fed, and the log then refuses to
+	// The volume moves on while the copy is not being fed, and the log then refuses to
 	// carry on from where the copy stands.
 	write(t, s, "while-away.txt", "2")
 	s.events.refuseResume(true)
@@ -380,7 +380,7 @@ func TestALogThatCannotCarryOnMakesTheCopyBeBuiltAgain(t *testing.T) {
 	requireSameTree(t, walkSource(t, s), walkCopy(t, replica))
 }
 
-// TestANamespaceWrittenToThroughoutThePictureIsCopiedExactly is the acceptance test for the
+// TestAVolumeWrittenToThroughoutThePictureIsCopiedExactly is the acceptance test for the
 // picture being a consistent cut.
 //
 // The scan takes time, and the tree changes while it runs. What makes that safe is that the
@@ -389,7 +389,7 @@ func TestALogThatCannotCarryOnMakesTheCopyBeBuiltAgain(t *testing.T) {
 // stamped with a position newer than itself — the tempting implementation — would have the
 // copy discard the very changes that would have corrected the nodes scanned early, and
 // nothing afterwards would ever correct them.
-func TestANamespaceWrittenToThroughoutThePictureIsCopiedExactly(t *testing.T) {
+func TestAVolumeWrittenToThroughoutThePictureIsCopiedExactly(t *testing.T) {
 	limits := httprest.DefaultLimits()
 	// One row per frame, and every frame held back, so that the picture takes long enough for
 	// the writer below to get a good many changes in during it.
@@ -459,9 +459,9 @@ func TestTheMountFailsWhenThePictureCannotBeTaken(t *testing.T) {
 	t.Logf("%v", err)
 }
 
-// TestTheMountFailsWhenTheNamespaceCannotBeWatched, which is the other step, and it has to be
+// TestTheMountFailsWhenTheVolumeCannotBeWatched, which is the other step, and it has to be
 // distinguishable from the one above.
-func TestTheMountFailsWhenTheNamespaceCannotBeWatched(t *testing.T) {
+func TestTheMountFailsWhenTheVolumeCannotBeWatched(t *testing.T) {
 	s := serve(t, httprest.DefaultLimits())
 	s.events.cut()
 
@@ -473,14 +473,14 @@ func TestTheMountFailsWhenTheNamespaceCannotBeWatched(t *testing.T) {
 	t.Logf("%v", err)
 }
 
-// TestANamespaceThatKeepsNoLogRefusesToBeCopied, under its own errno.
+// TestAVolumeThatKeepsNoLogRefusesToBeCopied, under its own errno.
 //
-// A namespace without a change log answers ENOSYS, allowing a mount without a copy.
-// EIO instead reports a namespace that cannot currently be reached. The fixture exposes
+// A volume without a change log answers ENOSYS, allowing a mount without a copy.
+// EIO instead reports a volume that cannot currently be reached. The fixture exposes
 // only the enforcing backend interface so optional log capabilities cannot enable copying.
-func TestANamespaceThatKeepsNoLogRefusesToBeCopied(t *testing.T) {
-	_, namespace := memoryfixture.New(t, "ws", 0, locking.DefaultOptions())
-	backing := struct{ locked.Backend }{namespace}
+func TestAVolumeThatKeepsNoLogRefusesToBeCopied(t *testing.T) {
+	_, volume := memoryfixture.New(t, "ws", 0, locking.DefaultOptions())
+	backing := struct{ locked.Backend }{volume}
 	handler, err := httprest.NewHandler(backing, nil)
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
@@ -496,18 +496,18 @@ func TestANamespaceThatKeepsNoLogRefusesToBeCopied(t *testing.T) {
 
 	remote, err := httprest.Dial(server.URL, &http.Client{Timeout: 10 * time.Second})
 	if err != nil {
-		t.Fatalf("dialling the namespace: %v", err)
+		t.Fatalf("dialling the volume: %v", err)
 	}
 	mounted, err := replicated.New(t.Context(), replica, remote)
 	if err == nil {
 		mounted.Close()
-		t.Fatal("a copy was built of a namespace that keeps no log, which is a claim that it can be kept current")
+		t.Fatal("a copy was built of a volume that keeps no log, which is a claim that it can be kept current")
 	}
 	if !errors.Is(err, syscall.ENOSYS) {
-		t.Fatalf("building a copy of a namespace with no log failed with %v, want ENOSYS", err)
+		t.Fatalf("building a copy of a volume with no log failed with %v, want ENOSYS", err)
 	}
 	if errors.Is(err, syscall.EIO) {
-		t.Fatalf("building a copy of a namespace with no log failed with %v, which reads as a server that could not be reached", err)
+		t.Fatalf("building a copy of a volume with no log failed with %v, which reads as a server that could not be reached", err)
 	}
 	t.Logf("%v", err)
 }
@@ -518,7 +518,7 @@ func TestANamespaceThatKeepsNoLogRefusesToBeCopied(t *testing.T) {
 // Everything else that goes wrong here arrives as something: a stream that ends, a status
 // that refuses, a connection that is reset. A flow that is simply no longer carried — a
 // machine that vanished, a firewall that dropped an idle connection, a partition — arrives
-// as nothing at all, and nothing at all is exactly what a namespace that nobody is writing
+// as nothing at all, and nothing at all is exactly what a volume that nobody is writing
 // to looks like. A mount that could not tell those apart would go on answering `Stat` and
 // `List` from a copy that stopped being fed, with no bound on how long: not until some probe
 // window elapsed, but for as long as the mount lived (R-ERR-1, R-ERR-2).
@@ -568,7 +568,7 @@ func TestAStreamThatStopsArrivingStopsTheCopyBeingAnsweredFrom(t *testing.T) {
 		requireErrno(t, "stat of a name that does not exist", err, syscall.EIO)
 	})
 
-	// The namespace moves on meanwhile, which is what makes the answers above wrong rather
+	// The volume moves on meanwhile, which is what makes the answers above wrong rather
 	// than merely unjustified: a copy answering from what it holds would be answering about
 	// a tree that no longer exists.
 	write(t, s, "arrived-while-cut-off.txt", "written while the mount could not hear")
@@ -714,7 +714,7 @@ func TestConfirmationAdmissionRefusesBeforeSendingAndReleasesCapacity(t *testing
 		t.Fatalf("the refused mutation reached the server: create calls moved from %d to %d", before, after)
 	}
 	if _, err := s.meta.Stat(t.Context(), "second"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("the pre-send refusal changed the namespace: %v", err)
+		t.Fatalf("the pre-send refusal changed the volume: %v", err)
 	}
 	gate.release()
 	if err := <-first; err != nil {
@@ -809,7 +809,7 @@ func TestCancellationAfterServerSuccessReportsAmbiguousEIOAndReleasesCapacity(t 
 		t.Fatalf("cancellation after server success returned %v, want EIO", err)
 	}
 	if _, err := s.meta.Stat(t.Context(), "committed"); err != nil {
-		t.Fatalf("the mutation reported as ambiguous did not reach the namespace: %v", err)
+		t.Fatalf("the mutation reported as ambiguous did not reach the volume: %v", err)
 	}
 
 	gate.release()
@@ -843,7 +843,7 @@ func TestACopyIsNotAnsweredFromWhileItIsCatchingUp(t *testing.T) {
 	s.events.cut()
 	requireUnusable(t, mounted)
 
-	// The namespace moves on, and the last thing it does is change the name being watched.
+	// The volume moves on, and the last thing it does is change the name being watched.
 	for i := range 5 {
 		write(t, s, fmt.Sprintf("during-%d.txt", i), "written during the outage")
 	}
@@ -944,7 +944,7 @@ func TestSameTargetReplayCannotConfirmBeforeTheMutationBarrier(t *testing.T) {
 	// picture is taken: nothing at that name is recorded after it, so what is replayed at
 	// that name is entirely changes the copy already holds. There are more of them than the
 	// stream carries in that time, so a good many are still on their way afterwards.
-	// Recorded straight into the namespace rather than through a request, so that how many of
+	// Recorded straight into the volume rather than through a request, so that how many of
 	// them there are does not depend on how fast requests happen to be: what has to be true is
 	// that there are more of them than the stream carries before the write below is made. The
 	// one request at the end is what tells the stream to read the log at all.
@@ -1031,7 +1031,7 @@ func TestADirectoryRemovedThroughTheCopyIsGoneFromItAtOnce(t *testing.T) {
 
 // TestAMutationThatRecordsNothingIsNotWaitedFor.
 //
-// Two operations succeed while the namespace records nothing: an attribute change that names no
+// Two operations succeed while the volume records nothing: an attribute change that names no
 // attribute, and a rename of a name onto itself, which POSIX has "return successfully and
 // perform no other action". No event is coming for either, so a copy that waited for one would
 // hold its caller for the whole grace and then report EIO for something that succeeded.
@@ -1080,7 +1080,7 @@ func TestAMutationThatRecordsNothingIsNotWaitedFor(t *testing.T) {
 // TestAMutationTheServerRefusesIsReportedAsTheServerRefusedIt.
 //
 // A refused mutation never happened, so no event is coming and there is nothing to wait for.
-// The refusal is the answer, and it has to arrive under the errno the namespace chose: a copy
+// The refusal is the answer, and it has to arrive under the errno the volume chose: a copy
 // that swallowed it and waited would turn "that name is taken" into "this copy could not
 // confirm it", which sends whoever reads it looking for a broken mount instead of for the file
 // they tried to create — and would do it after a delay as long as the grace, every time.
@@ -1106,14 +1106,14 @@ func TestAMutationTheServerRefusesIsReportedAsTheServerRefusedIt(t *testing.T) {
 		{"a name that is already taken", func() error { return mounted.Create(t.Context(), "d/f") }, syscall.EEXIST},
 		{"a name that is not there", func() error { return mounted.Remove(t.Context(), "d/gone") }, syscall.ENOENT},
 		{"a directory with something in it", func() error { return mounted.RemoveDir(t.Context(), "d") }, syscall.ENOTEMPTY},
-		{"more bytes than the namespace may hold", func() error {
+		{"more bytes than the volume may hold", func() error {
 			return mounted.Write(t.Context(), "big", make([]byte, allowance+1))
 		}, syscall.EDQUOT},
 	} {
 		t.Run(c.what, func(t *testing.T) {
 			err := c.do()
 			if errors.Is(err, syscall.EIO) {
-				t.Fatalf("%s was answered with %v: EIO would replace the namespace's definitive refusal with a confirmation failure", c.what, err)
+				t.Fatalf("%s was answered with %v: EIO would replace the volume's definitive refusal with a confirmation failure", c.what, err)
 			}
 			if !errors.Is(err, c.want) {
 				t.Fatalf("%s was answered with %v, want %v", c.what, err, c.want)
@@ -1145,13 +1145,13 @@ func TestLosingReplicationWhileAMutationIsOutstandingNeverReportsSuccess(t *test
 
 	at, err := s.meta.CommittedPosition(t.Context())
 	if err != nil {
-		t.Fatalf("reading the position the namespace stands at: %v", err)
+		t.Fatalf("reading the position the volume stands at: %v", err)
 	}
 
 	made := make(chan error, 1)
 	go func() { made <- mounted.Mkdir(t.Context(), "d") }()
 
-	// Cut only once the namespace itself holds the change. Before that the mutation has not
+	// Cut only once the volume itself holds the change. Before that the mutation has not
 	// been sent, and what would be under test is the refusal to send it at all.
 	//
 	// The connections go with it. A stream merely told to end can still deliver the frame already
@@ -1169,10 +1169,10 @@ func TestLosingReplicationWhileAMutationIsOutstandingNeverReportsSuccess(t *test
 	}
 	t.Logf("told in %v, of a grace of %v: %v", took.Round(time.Millisecond), grace, err)
 
-	// And the change is real. The namespace holds it, read from the namespace's own tree rather
+	// And the change is real. The volume holds it, read from the volume's own tree rather
 	// than through anything that just failed.
 	if _, err := s.meta.Stat(t.Context(), "d"); err != nil {
-		t.Fatalf("the namespace does not hold d, and the caller was told its change was made: %v", err)
+		t.Fatalf("the volume does not hold d, and the caller was told its change was made: %v", err)
 	}
 	requireUnusable(t, mounted)
 }
@@ -1234,7 +1234,7 @@ func TestClosingReleasesAServerMutationStillWaitingForItsBarrier(t *testing.T) {
 		t.Fatalf("the server did not retain the mutation whose confirmation became ambiguous: %v", err)
 	}
 	if _, err := s.meta.Stat(t.Context(), "never-sent"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("the admission waiter changed the namespace during Close: %v", err)
+		t.Fatalf("the admission waiter changed the volume during Close: %v", err)
 	}
 }
 

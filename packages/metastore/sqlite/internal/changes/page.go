@@ -18,14 +18,14 @@ import (
 func ReadPage(
 	ctx context.Context,
 	tx *sql.Tx,
-	namespace, maxIntegrityRecords int64,
+	volume, maxIntegrityRecords int64,
 	after metastore.Position,
 	limit int,
 	result *metastore.ChangeResult,
 ) (retention metastore.Retention, returnErr error) {
 	var expected, changeHighWater, fixedWork int64
 	var err error
-	if retention, expected, changeHighWater, fixedWork, err = logPageState(ctx, tx, namespace, after); err != nil {
+	if retention, expected, changeHighWater, fixedWork, err = logPageState(ctx, tx, volume, after); err != nil {
 		return metastore.Retention{}, err
 	}
 	if fixedWork > maxIntegrityRecords {
@@ -43,15 +43,15 @@ func ReadPage(
 	if pageLimit > 0 {
 		rows, err := tx.QueryContext(ctx, `
 				SELECT `+changeMetadataColumns+` FROM changes
-				WHERE namespace = ? AND position > ?
+				WHERE volume = ? AND position > ?
 				ORDER BY position
-				LIMIT ?`, namespace, int64(cursor), pageLimit)
+				LIMIT ?`, volume, int64(cursor), pageLimit)
 		if err != nil {
 			return metastore.Retention{}, err
 		}
 		for rows.Next() {
 			examined++
-			change, lengths, previous, err := scanChangeMetadata(rows, namespace)
+			change, lengths, previous, err := scanChangeMetadata(rows, volume)
 			if err != nil {
 				rows.Close()
 				return metastore.Retention{}, err
@@ -83,7 +83,7 @@ func ReadPage(
 			var content sql.NullString
 			if err := tx.QueryRowContext(ctx, `
 					SELECT name, from_name, content FROM changes
-					WHERE namespace = ? AND position = ?`, namespace, int64(change.Position)).Scan(
+					WHERE volume = ? AND position = ?`, volume, int64(change.Position)).Scan(
 				&name, &fromName, &content,
 			); err != nil {
 				rows.Close()
@@ -118,7 +118,7 @@ func ReadPage(
 func logPageState(
 	ctx context.Context,
 	tx *sql.Tx,
-	namespace int64,
+	volume int64,
 	after metastore.Position,
 ) (metastore.Retention, int64, int64, int64, error) {
 	state, err := dbstate.Validate(ctx, tx)
@@ -144,7 +144,7 @@ func logPageState(
 		           WHEN typeof(incarnation) = 'text' AND length(CAST(incarnation AS BLOB)) = 32
 		           THEN incarnation
 		       END
-		FROM logs WHERE namespace = ?`, namespace).Scan(
+		FROM logs WHERE volume = ?`, volume).Scan(
 		&tailRaw, &tailType, &trimmedRaw, &trimmedType, &ageRaw, &ageType,
 		&incarnationType, &incarnationBytes, &incarnationRaw,
 	); err != nil {
@@ -155,15 +155,15 @@ func logPageState(
 	age, ageOK := sqlvalue.StoredInteger(ageRaw, ageType)
 	if !tailOK || !trimmedOK || !ageOK || tail < 0 || trimmed < 0 || trimmed > tail ||
 		(age != 0 && age != 1) || incarnationType != "text" || incarnationBytes != 32 {
-		return metastore.Retention{}, 0, 0, 0, fmt.Errorf("the namespace log header is invalid: %w", syscall.EIO)
+		return metastore.Retention{}, 0, 0, 0, fmt.Errorf("the volume log header is invalid: %w", syscall.EIO)
 	}
 	incarnation, ok := incarnationRaw.(string)
 	if !ok || len(incarnation) != 32 || strings.Trim(incarnation, "0123456789abcdef") != "" {
-		return metastore.Retention{}, 0, 0, 0, fmt.Errorf("the namespace log incarnation is invalid: %w", syscall.EIO)
+		return metastore.Retention{}, 0, 0, 0, fmt.Errorf("the volume log incarnation is invalid: %w", syscall.EIO)
 	}
 	if tail > state.ChangeHighWater || trimmed > state.ChangeHighWater {
 		return metastore.Retention{}, 0, 0, 0, fmt.Errorf(
-			"the namespace log header exceeds durable change high-water %d: %w",
+			"the volume log header exceeds durable change high-water %d: %w",
 			state.ChangeHighWater, syscall.EIO)
 	}
 
@@ -171,7 +171,7 @@ func logPageState(
 		SELECT CASE WHEN typeof(position) = 'integer' THEN position END, typeof(position),
 		       CASE WHEN typeof(previous_position) = 'integer' THEN previous_position END,
 		       typeof(previous_position)
-		FROM changes WHERE namespace = ? ORDER BY position LIMIT 1`, namespace))
+		FROM changes WHERE volume = ? ORDER BY position LIMIT 1`, volume))
 	if err != nil {
 		return metastore.Retention{}, 0, 0, 0, err
 	}
@@ -195,7 +195,7 @@ func logPageState(
 	}
 	newest, err := storedPosition(tx.QueryRowContext(ctx, `
 		SELECT CASE WHEN typeof(position) = 'integer' THEN position END, typeof(position)
-		FROM changes WHERE namespace = ? ORDER BY position DESC LIMIT 1`, namespace))
+		FROM changes WHERE volume = ? ORDER BY position DESC LIMIT 1`, volume))
 	if err != nil {
 		return metastore.Retention{}, 0, 0, 0, err
 	}
@@ -210,8 +210,8 @@ func logPageState(
 	position, err := storedPosition(tx.QueryRowContext(ctx, `
 		SELECT CASE WHEN typeof(position) = 'integer' THEN position END, typeof(position)
 		FROM changes
-		WHERE namespace = ? AND position <= ?
-		ORDER BY position DESC LIMIT 1`, namespace, int64(after)))
+		WHERE volume = ? AND position <= ?
+		ORDER BY position DESC LIMIT 1`, volume, int64(after)))
 	switch {
 	case err == nil:
 		expected = position
@@ -221,7 +221,7 @@ func logPageState(
 	if oldest > state.ChangeHighWater || predecessor > state.ChangeHighWater ||
 		newest > state.ChangeHighWater || expected > state.ChangeHighWater {
 		return metastore.Retention{}, 0, 0, 0, fmt.Errorf(
-			"the namespace log anchors exceed durable change high-water %d: %w",
+			"the volume log anchors exceed durable change high-water %d: %w",
 			state.ChangeHighWater, syscall.EIO)
 	}
 	fixedWork := int64(3) // log header, oldest row, and newest row.
@@ -266,7 +266,7 @@ func storedPositionPair(row rowScanner) (position, predecessor int64, found bool
 func ReadLogBarrier(
 	ctx context.Context,
 	tx *sql.Tx,
-	namespace, maxBytes int64,
+	volume, maxBytes int64,
 	loadIncarnation bool,
 ) (metastore.LogBarrier, error) {
 	state, err := dbstate.Validate(ctx, tx)
@@ -287,7 +287,7 @@ func ReadLogBarrier(
 		       typeof(trimmed_through),
 		       CASE WHEN typeof(trimmed_by_age) = 'integer' THEN trimmed_by_age END,
 		       typeof(trimmed_by_age)
-		FROM logs WHERE namespace = ?`, namespace).Scan(
+		FROM logs WHERE volume = ?`, volume).Scan(
 		&incarnationType, &incarnationBytes,
 		&tailRaw, &tailType, &trimmedRaw, &trimmedType, &ageRaw, &ageType,
 	); err != nil {
@@ -299,7 +299,7 @@ func ReadLogBarrier(
 	if incarnationType != "text" || incarnationBytes != 32 || !tailOK || !trimmedOK || !ageOK ||
 		tail < 0 || trimmed < 0 || trimmed > tail || (age != 0 && age != 1) ||
 		tail > state.ChangeHighWater || trimmed > state.ChangeHighWater {
-		return metastore.LogBarrier{}, fmt.Errorf("the namespace log header is invalid: %w", syscall.EIO)
+		return metastore.LogBarrier{}, fmt.Errorf("the volume log header is invalid: %w", syscall.EIO)
 	}
 	barrier := metastore.LogBarrier{Position: metastore.Position(tail)}
 	if !loadIncarnation {
@@ -311,13 +311,13 @@ func ReadLogBarrier(
 	}
 	var raw any
 	if err := tx.QueryRowContext(ctx,
-		`SELECT incarnation FROM logs WHERE namespace = ?`, namespace,
+		`SELECT incarnation FROM logs WHERE volume = ?`, volume,
 	).Scan(&raw); err != nil {
 		return metastore.LogBarrier{}, err
 	}
 	incarnation, ok := raw.(string)
 	if !ok || len(incarnation) != 32 || strings.Trim(incarnation, "0123456789abcdef") != "" {
-		return metastore.LogBarrier{}, fmt.Errorf("the namespace log incarnation is invalid: %w", syscall.EIO)
+		return metastore.LogBarrier{}, fmt.Errorf("the volume log incarnation is invalid: %w", syscall.EIO)
 	}
 	barrier.Incarnation = metastore.Incarnation(incarnation)
 	return barrier, nil

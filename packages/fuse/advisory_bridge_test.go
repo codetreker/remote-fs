@@ -16,7 +16,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 )
 
-func advisoryNamespace(t *testing.T) *namespace {
+func advisoryVolume(t *testing.T) *volume {
 	t.Helper()
 	_, backing := memoryfixture.New(t, "fuse-advisory", 0, locking.DefaultOptions())
 	if err := backing.Write(t.Context(), "file", []byte("contents")); err != nil {
@@ -34,22 +34,22 @@ func advisoryNamespace(t *testing.T) *namespace {
 			t.Errorf("close advisory session: %v", err)
 		}
 	})
-	ns := &namespace{storage: backing, files: session, maxFileSize: 1 << 20,
+	v := &volume{storage: backing, files: session, maxFileSize: 1 << 20,
 		flushTimeout: time.Second, sessionOptions: options, stop: make(chan struct{}), done: make(chan struct{})}
 	start := time.Now()
 	status, err := session.Status(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ns.confirm(start, status); err != nil {
+	if err := v.confirm(start, status); err != nil {
 		t.Fatal(err)
 	}
-	return ns
+	return v
 }
 
-func advisoryHandle(t *testing.T, ns *namespace, read, write bool) *handle {
+func advisoryHandle(t *testing.T, v *volume, read, write bool) *handle {
 	t.Helper()
-	file, err := ns.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: read, Write: write})
+	file, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: read, Write: write})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,17 +57,17 @@ func advisoryHandle(t *testing.T, ns *namespace, read, write bool) *handle {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return newHandle(&node{ns: ns, id: &identity{node: attr.ID}}, file, read, write)
+	return newHandle(&node{volume: v, id: &identity{node: attr.ID}}, file, read, write)
 }
 
 func TestAdvisoryBridgePreservesCloseOwnerAndFlockRelease(t *testing.T) {
-	ns := advisoryNamespace(t)
-	rootAttr, err := ns.storage.Stat(t.Context(), "")
+	v := advisoryVolume(t)
+	rootAttr, err := v.storage.Stat(t.Context(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := &node{ns: ns, id: rootIdentity(rootAttr.ID)}
-	raw := newRawFilesystem(fs.NewNodeFS(root, &fs.Options{}), ns)
+	root := &node{volume: v, id: rootIdentity(rootAttr.ID)}
+	raw := newRawFilesystem(fs.NewNodeFS(root, &fs.Options{}), v)
 	var entry gofuse.EntryOut
 	if status := raw.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "file", &entry); status != 0 {
 		t.Fatal(status)
@@ -114,14 +114,14 @@ func TestAdvisoryBridgePreservesCloseOwnerAndFlockRelease(t *testing.T) {
 		t.Fatalf("final release retained flock: %+v, %v", conflict.Lk, status)
 	}
 	raw.Release(nil, &gofuse.ReleaseIn{InHeader: set.InHeader, Fh: second})
-	if len(ns.raw.requests) != 0 {
+	if len(v.raw.requests) != 0 {
 		t.Fatal("raw bridge retained completed owner metadata")
 	}
 }
 
 func TestAdvisoryCallbackAccessAndRanges(t *testing.T) {
-	ns := advisoryNamespace(t)
-	reader, writer := advisoryHandle(t, ns, true, false), advisoryHandle(t, ns, false, true)
+	v := advisoryVolume(t)
+	reader, writer := advisoryHandle(t, v, true, false), advisoryHandle(t, v, false, true)
 	lk := gofuse.FileLock{Start: 0, End: math.MaxInt64, Typ: syscall.F_WRLCK}
 	if errno := reader.Setlk(t.Context(), 1, &lk, 0); errno != syscall.EBADF {
 		t.Fatalf("read-only POSIX exclusive = %v", errno)
@@ -212,8 +212,8 @@ func TestAdvisoryCallbackReconcilesCancellationBeforeReturning(t *testing.T) {
 		{"unknown cancellation", true, true, true, syscall.EIO},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			ns := advisoryNamespace(t)
-			holder, waiter := advisoryHandle(t, ns, true, true), advisoryHandle(t, ns, true, true)
+			v := advisoryVolume(t)
+			holder, waiter := advisoryHandle(t, v, true, true), advisoryHandle(t, v, true, true)
 			lk := gofuse.FileLock{Start: 0, End: math.MaxInt64, Typ: syscall.F_WRLCK}
 			if test.conflict {
 				if errno := holder.Setlk(t.Context(), 1, &lk, gofuse.FUSE_LK_FLOCK); errno != 0 {
@@ -235,8 +235,8 @@ func TestAdvisoryCallbackReconcilesCancellationBeforeReturning(t *testing.T) {
 				t.Fatal("cancellation reconciliation lacked a live finite cleanup context")
 			}
 			if test.cancelFail {
-				if errnoOf(ns.check()) != syscall.EIO {
-					t.Fatal("unknown acquisition did not fence namespace I/O")
+				if errnoOf(v.check()) != syscall.EIO {
+					t.Fatal("unknown acquisition did not fence volume I/O")
 				}
 				return
 			}
@@ -256,8 +256,8 @@ func TestAdvisoryCallbackReconcilesCancellationBeforeReturning(t *testing.T) {
 }
 
 func TestAdvisoryCallbackContinuesPendingRequest(t *testing.T) {
-	ns := advisoryNamespace(t)
-	holder, waiter := advisoryHandle(t, ns, true, true), advisoryHandle(t, ns, true, true)
+	v := advisoryVolume(t)
+	holder, waiter := advisoryHandle(t, v, true, true), advisoryHandle(t, v, true, true)
 	lk := gofuse.FileLock{Start: 0, End: math.MaxInt64, Typ: syscall.F_WRLCK}
 	if errno := holder.Setlk(t.Context(), 1, &lk, gofuse.FUSE_LK_FLOCK); errno != 0 {
 		t.Fatal(errno)
@@ -335,14 +335,14 @@ func (f *failedOwnerCleanup) Close(ctx context.Context) error {
 }
 
 func TestAdvisoryReleaseClosesReferenceAfterOwnerCleanupFailure(t *testing.T) {
-	ns := advisoryNamespace(t)
-	h := advisoryHandle(t, ns, true, true)
+	v := advisoryVolume(t)
+	h := advisoryHandle(t, v, true, true)
 	injected := &failedOwnerCleanup{File: h.file, dropErr: errors.New("owner cleanup failed")}
 	h.file = injected
-	ns.raw = &rawMetadata{limit: 1, requests: make(map[<-chan struct{}]rawRequest)}
+	v.raw = &rawMetadata{limit: 1, requests: make(map[<-chan struct{}]rawRequest)}
 	cancelled := make(chan struct{})
 	close(cancelled)
-	forwarded, done, ok := ns.raw.begin(cancelled, rawRequest{kind: rawRelease, owner: 7, flockUnlock: true})
+	forwarded, done, ok := v.raw.begin(cancelled, rawRequest{kind: rawRelease, owner: 7, flockUnlock: true})
 	if !ok {
 		t.Fatal("release metadata rejected")
 	}
@@ -356,25 +356,25 @@ func TestAdvisoryReleaseClosesReferenceAfterOwnerCleanupFailure(t *testing.T) {
 	if _, err := injected.File.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("released reference remained usable: %v", err)
 	}
-	if errnoOf(ns.check()) != syscall.EIO {
-		t.Fatal("unobservable release failure did not fence namespace I/O")
+	if errnoOf(v.check()) != syscall.EIO {
+		t.Fatal("unobservable release failure did not fence volume I/O")
 	}
 }
 
 func TestAdvisoryCallbackNormalRetirementPreservesShutdownOutcome(t *testing.T) {
 	for _, cancelRace := range []bool{false, true} {
 		t.Run(map[bool]string{false: "pending", true: "cancel race"}[cancelRace], func(t *testing.T) {
-			ns := advisoryNamespace(t)
-			holder, waiter := advisoryHandle(t, ns, true, true), advisoryHandle(t, ns, true, true)
+			v := advisoryVolume(t)
+			holder, waiter := advisoryHandle(t, v, true, true), advisoryHandle(t, v, true, true)
 			lk := gofuse.FileLock{Start: 0, End: math.MaxInt64, Typ: syscall.F_WRLCK}
 			if errno := holder.Setlk(t.Context(), 1, &lk, gofuse.FUSE_LK_FLOCK); errno != 0 {
 				t.Fatal(errno)
 			}
 			stop := func() {
-				ns.mu.Lock()
-				ns.stopping = true
-				close(ns.stop)
-				ns.mu.Unlock()
+				v.mu.Lock()
+				v.stopping = true
+				close(v.stop)
+				v.mu.Unlock()
 			}
 			injected := &interruptedAdvisoryFile{File: waiter.file}
 			if cancelRace {
@@ -386,8 +386,8 @@ func TestAdvisoryCallbackNormalRetirementPreservesShutdownOutcome(t *testing.T) 
 			if errno := waiter.Setlkw(t.Context(), 2, &lk, gofuse.FUSE_LK_FLOCK); errno != syscall.ESTALE {
 				t.Fatalf("normal retirement returned %v", errno)
 			}
-			if ns.fault != nil {
-				t.Fatalf("normal retirement introduced a fault: %v", ns.fault)
+			if v.fault != nil {
+				t.Fatalf("normal retirement introduced a fault: %v", v.fault)
 			}
 		})
 	}
@@ -406,11 +406,11 @@ func (p *saturatedRawProbe) Flush(<-chan struct{}, *gofuse.FlushIn) gofuse.Statu
 func (p *saturatedRawProbe) Release(<-chan struct{}, *gofuse.ReleaseIn) { p.releases++ }
 
 func TestRawOwnerMetadataSaturationFencesAndStillDelegatesRelease(t *testing.T) {
-	ns := advisoryNamespace(t)
-	ns.sessionOptions.MaxOperations = 1
+	v := advisoryVolume(t)
+	v.sessionOptions.MaxOperations = 1
 	probe := &saturatedRawProbe{RawFileSystem: gofuse.NewDefaultRawFileSystem()}
-	raw := newRawFilesystem(probe, ns)
-	_, done, ok := ns.raw.begin(nil, rawRequest{kind: rawFlush})
+	raw := newRawFilesystem(probe, v)
+	_, done, ok := v.raw.begin(nil, rawRequest{kind: rawFlush})
 	if !ok {
 		t.Fatal("first metadata reservation failed")
 	}
@@ -419,7 +419,7 @@ func TestRawOwnerMetadataSaturationFencesAndStillDelegatesRelease(t *testing.T) 
 		t.Fatalf("saturated flush returned %v and delegated %d calls", status, probe.flushes)
 	}
 	raw.Release(nil, &gofuse.ReleaseIn{})
-	if probe.releases != 1 || errnoOf(ns.check()) != syscall.EIO {
-		t.Fatalf("saturated release: delegates=%d health=%v", probe.releases, ns.check())
+	if probe.releases != 1 || errnoOf(v.check()) != syscall.EIO {
+		t.Fatalf("saturated release: delegates=%d health=%v", probe.releases, v.check())
 	}
 }

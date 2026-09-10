@@ -12,7 +12,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-func TestRetainedHTTPNodeOperationsFollowIdentityThroughNamespaceChanges(t *testing.T) {
+func TestRetainedHTTPNodeOperationsFollowIdentityThroughVolumeChanges(t *testing.T) {
 	ctx := context.Background()
 	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
 	if err := backend.Write(ctx, "file", []byte("original")); err != nil {

@@ -1,4 +1,4 @@
-// These tests join real HTTP servers, enforcing object namespaces and independent FUSE
+// These tests join real HTTP servers, enforcing object volumes and independent FUSE
 // mounts. They require /dev/fuse; the strict test runner rejects unavailable mount tests.
 package cmd_test
 
@@ -49,8 +49,8 @@ func TestMain(m *testing.M) {
 
 // --- the system under test -----------------------------------------------------------
 
-// namespaceServer is one server over one namespace, on a real TCP listener.
-type namespaceServer struct {
+// volumeServer is one server over one volume, on a real TCP listener.
+type volumeServer struct {
 	url string
 
 	authoritative storage.Storage
@@ -65,36 +65,36 @@ type namespaceServer struct {
 	unavailable <-chan struct{}
 }
 
-func serveNamespace(t *testing.T) *namespaceServer {
+func serveVolume(t *testing.T) *volumeServer {
 	t.Helper()
-	namespace, meta := namespaceFixture(t)
-	return serveStorage(t, namespace, meta)
+	volume, meta := volumeFixture(t)
+	return serveStorage(t, volume, meta)
 }
 
 // The handler's explicit nil log keeps the ENOSYS replication path covered over a real
-// enforcing namespace, independently of whether its backend retains a change log.
-func serveUnreplicatedNamespace(t *testing.T) *namespaceServer {
+// enforcing volume, independently of whether its backend retains a change log.
+func serveUnreplicatedVolume(t *testing.T) *volumeServer {
 	t.Helper()
-	namespace, _ := namespaceFixture(t)
-	return serveStorage(t, namespace, nil)
+	volume, _ := volumeFixture(t)
+	return serveStorage(t, volume, nil)
 }
 
-func namespaceFixture(t *testing.T) (*objectstore.Storage, *sqlite.LockingStore) {
+func volumeFixture(t *testing.T) (*objectstore.Storage, *sqlite.LockingStore) {
 	t.Helper()
 	meta, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
-		Database: filepath.Join(privateDirectory(t), "namespace.db"), Namespace: "ws",
+		Database: filepath.Join(privateDirectory(t), "volume.db"), Volume: "ws",
 		SQLite: sqlite.DefaultOptions(), Locks: locking.DefaultOptions(), Initialize: true,
 	})
 	if err != nil {
-		t.Fatalf("opening the namespace's metastore: %v", err)
+		t.Fatalf("opening the volume's metastore: %v", err)
 	}
-	namespace := objectstore.New(memory.New(), meta)
+	volume := objectstore.New(memory.New(), meta)
 	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
-			t.Errorf("closing the namespace: %v", err)
+		if err := volume.Close(); err != nil {
+			t.Errorf("closing the volume: %v", err)
 		}
 	})
-	return namespace, meta
+	return volume, meta
 }
 
 func privateDirectory(t *testing.T) string {
@@ -106,10 +106,10 @@ func privateDirectory(t *testing.T) string {
 	return directory
 }
 
-func serveStorage(t *testing.T, namespace storage.Storage, log metastore.Log) *namespaceServer {
+func serveStorage(t *testing.T, volume storage.Storage, log metastore.Log) *volumeServer {
 	t.Helper()
 
-	handler, err := httprest.NewHandler(namespace, log)
+	handler, err := httprest.NewHandler(volume, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func serveStorage(t *testing.T, namespace storage.Storage, log metastore.Log) *n
 	}
 	t.Cleanup(stop)
 
-	return &namespaceServer{url: "http://" + listener.Addr().String(), authoritative: namespace, calls: counted, stop: stop, unavailable: served}
+	return &volumeServer{url: "http://" + listener.Addr().String(), authoritative: volume, calls: counted, stop: stop, unavailable: served}
 }
 
 // calls counts the requests that reach the server, by operation.
@@ -194,7 +194,7 @@ func (w *recordedCloseResponse) WriteHeader(status int) {
 }
 
 // Kernel RELEASE is asynchronous. Setup references must finish their HTTP cleanup
-// before measuring the requests caused by a subsequent namespace walk.
+// before measuring the requests caused by a subsequent volume walk.
 func (c *calls) waitFileCloses(t *testing.T, expected int) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), startup)
@@ -291,29 +291,29 @@ func (c *calls) sinceExcept(before map[string]int, allowed ...string) string {
 	return strings.Join(arrived, " ")
 }
 
-// mountpointOn mounts the server's namespace at a fresh directory, through a storage of
-// its own. Two calls produce two independent mounts of the same namespace, which is what
+// mountpointOn mounts the server's volume at a fresh directory, through a storage of
+// its own. Two calls produce two independent mounts of the same volume, which is what
 // "two machines" means here.
 //
-// The mount is given a copy of the namespace's metadata where the namespace keeps a change
-// log, and the namespace itself where it does not — which is what the binary does, decided
+// The mount is given a copy of the volume's metadata where the volume keeps a change
+// log, and the volume itself where it does not — which is what the binary does, decided
 // the way the binary decides it: by asking, and by telling ENOSYS from a failure to reach
 // anything.
-func mountpointOn(t *testing.T, s *namespaceServer) string {
+func mountpointOn(t *testing.T, s *volumeServer) string {
 	t.Helper()
-	mountpoint, _ := mountNamespaceOn(t, s)
+	mountpoint, _ := mountVolumeOn(t, s)
 	return mountpoint
 }
 
-func mountNamespaceOn(t *testing.T, s *namespaceServer) (string, storage.Storage) {
+func mountVolumeOn(t *testing.T, s *volumeServer) (string, storage.Storage) {
 	t.Helper()
 	requireFUSE(t)
 
-	namespace, err := httprest.Dial(s.url, &http.Client{Timeout: 10 * time.Second})
+	volume, err := httprest.Dial(s.url, &http.Client{Timeout: 10 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
-	served := copyOf(t, namespace, s.unavailable)
+	served := copyOf(t, volume, s.unavailable)
 	// Registered before the mount so that it is removed after the unmount: cleanups run
 	// in reverse, and removing a directory that is still mounted does not work.
 	mountpoint := t.TempDir()
@@ -328,23 +328,23 @@ func mountNamespaceOn(t *testing.T, s *namespaceServer) (string, storage.Storage
 	return mountpoint, served
 }
 
-// copyOf builds the local copy the mount is served from, and reports the namespace itself for
+// copyOf builds the local copy the mount is served from, and reports the volume itself for
 // one that keeps no log.
-func copyOf(t *testing.T, namespace *httprest.Storage, unavailable <-chan struct{}) storage.Storage {
+func copyOf(t *testing.T, volume *httprest.Storage, unavailable <-chan struct{}) storage.Storage {
 	t.Helper()
 
 	replica, err := sqlite.OpenReplica(t.Context(), filepath.Join(t.TempDir(), "replica.db"))
 	if err != nil {
 		t.Fatalf("opening the copy: %v", err)
 	}
-	served, err := replicated.New(t.Context(), replica, namespace)
+	served, err := replicated.New(t.Context(), replica, volume)
 	switch {
 	case errors.Is(err, syscall.ENOSYS):
 		replica.Close()
-		return namespace
+		return volume
 	case err != nil:
 		replica.Close()
-		t.Fatalf("copying the namespace's metadata: %v", err)
+		t.Fatalf("copying the volume's metadata: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := served.Close(); err != nil {

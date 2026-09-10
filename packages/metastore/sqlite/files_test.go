@@ -211,7 +211,7 @@ func TestRetainedCleanupUnknownAcceptanceKeepsPhysicalOwnership(t *testing.T) {
 	if again := f.Close(ctx); !errors.Is(again, acceptErr) || settlements.Load() != 1 {
 		t.Fatalf("repeated cleanup=%v settlements=%d", again, settlements.Load())
 	}
-	if s.coordinator.pins[retainedNode{s.namespace, ref.id}] != 1 || len(s.files) != 1 || s.leaseOwner.FD() < 0 {
+	if s.coordinator.pins[retainedNode{s.volume, ref.id}] != 1 || len(s.files) != 1 || s.leaseOwner.FD() < 0 {
 		t.Fatal("unknown cleanup released native retention")
 	}
 	if err := s.Close(); !errors.Is(err, syscall.EBUSY) {
@@ -280,7 +280,7 @@ func TestStrongGrantsRetireTheNameWhileOrdinaryReferencesKeepTheNode(t *testing.
 
 func TestSharedDatabaseOwnershipRefusesNativeRetentionBeforeMutation(t *testing.T) {
 	config := lockingTestConfig(t)
-	s, err := OpenWithOptions(t.Context(), config.Database, config.Namespace, 0, DefaultOptions())
+	s, err := OpenWithOptions(t.Context(), config.Database, config.Volume, 0, DefaultOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +366,7 @@ func TestAdvisoryAuthorityIsSharedAndRetiredWithItsStore(t *testing.T) {
 	}
 	b, err := s.Advisory(ctx)
 	if err != nil || a != b {
-		t.Fatalf("namespace authority changed: %p, %p, %v", a, b, err)
+		t.Fatalf("volume authority changed: %p, %p, %v", a, b, err)
 	}
 	first, err := a.NewSession(storage.DefaultFileSessionOptions(), func() error { return nil })
 	if err != nil {

@@ -120,12 +120,12 @@ func TestActionBoundsPreserveReplayAndRecover(t *testing.T) {
 }
 
 func TestWaitingBoundsRecoverAfterCancellation(t *testing.T) {
-	for _, limit := range []string{"namespace", "session", "pending"} {
+	for _, limit := range []string{"volume", "session", "pending"} {
 		t.Run(limit, func(t *testing.T) {
 			config := DefaultConfig()
 			options := storage.DefaultFileSessionOptions()
 			switch limit {
-			case "namespace":
+			case "volume":
 				config.MaxWaiters = 1
 			case "session":
 				options.MaxWaiters = 1

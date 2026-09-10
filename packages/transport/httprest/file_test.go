@@ -70,7 +70,7 @@ func openHTTPFile(t *testing.T, s storage.FileSession, path string, o storage.Fi
 
 func TestRetainedHTTPFileTracksCurrentObjectAcrossUnlinkAndReplacement(t *testing.T) {
 	ctx := context.Background()
-	backend := namespaceFixture(t)
+	backend := volumeFixture(t)
 	if err := backend.Write(ctx, "file", []byte("first")); err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestRetainedHTTPFileTracksCurrentObjectAcrossUnlinkAndReplacement(t *testin
 
 func TestRetainedHTTPAdvisoryCoordinatesAcrossHandlers(t *testing.T) {
 	ctx := context.Background()
-	backend := namespaceFixture(t)
+	backend := volumeFixture(t)
 	if err := backend.Write(ctx, "file", []byte("data")); err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func (d *dropFileReply) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func TestRetainedHTTPReplaysLostOpenWithoutAnotherReference(t *testing.T) {
 	ctx := context.Background()
-	backend := namespaceFixture(t)
+	backend := volumeFixture(t)
 	handler, err := httprest.NewHandler(backend, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -259,7 +259,7 @@ func TestRetainedHTTPReplaysLostOpenWithoutAnotherReference(t *testing.T) {
 
 func TestRetainedHTTPReplaysLostTruncateWithoutReapplyingIt(t *testing.T) {
 	ctx := context.Background()
-	backend := namespaceFixture(t)
+	backend := volumeFixture(t)
 	if err := backend.Write(ctx, "file", []byte("abcdef")); err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestRetainedHTTPReplaysLostTruncateWithoutReapplyingIt(t *testing.T) {
 
 func TestRetainedHTTPHandlerCloseRetiresOnlyOwnedSessions(t *testing.T) {
 	ctx := context.Background()
-	backend := namespaceFixture(t)
+	backend := volumeFixture(t)
 	if err := backend.Write(ctx, "file", []byte("data")); err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +326,7 @@ func TestRetainedHTTPReconcilesLostAcknowledgementAndClose(t *testing.T) {
 	for _, operation := range []string{"ack", "close"} {
 		t.Run(operation, func(t *testing.T) {
 			ctx := context.Background()
-			backend := namespaceFixture(t)
+			backend := volumeFixture(t)
 			if err := backend.Write(ctx, "file", []byte("retained")); err != nil {
 				t.Fatal(err)
 			}

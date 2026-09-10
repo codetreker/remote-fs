@@ -110,7 +110,7 @@ func TestValidateLegacySequencesRejectsLostAndMalformedHistory(t *testing.T) {
 		{"intact", "", ""},
 		{"malformed node sequence", `UPDATE sqlite_sequence SET seq='bad' WHERE name='nodes'`, "SQLite sequence"},
 		{"missing node sequence", `DELETE FROM sqlite_sequence WHERE name='nodes'`, "below existing node"},
-		{"malformed root", `UPDATE namespaces SET root='bad'`, "node identities in invalid storage classes"},
+		{"malformed root", `UPDATE volumes SET root='bad'`, "node identities in invalid storage classes"},
 		{"entry above sequence", `UPDATE entries SET node=5`, "below existing node"},
 		{"malformed retained node", `UPDATE changes SET from_parent='bad'`, "retained node identities in invalid storage classes"},
 		{"retained node above sequence", `UPDATE changes SET node=5`, "below retained log identity"},

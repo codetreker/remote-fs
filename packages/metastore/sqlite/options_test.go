@@ -57,7 +57,7 @@ func TestReaderConnectionOptionsAreBoundedAndValidatedBeforeOpening(t *testing.T
 		Options{Window: DefaultWindow(), MaxIntegrityRecords: MinIntegrityRecords},
 	)
 	if err != nil {
-		t.Fatalf("opening an empty namespace at the minimum integrity record limit: %v", err)
+		t.Fatalf("opening an empty volume at the minimum integrity record limit: %v", err)
 	}
 	if err := minimum.Close(); err != nil {
 		t.Fatal(err)
@@ -120,7 +120,7 @@ func TestReaderConnectionOptionsAreBoundedAndValidatedBeforeOpening(t *testing.T
 		limit int64
 	}{
 		{"negative integrity records", -1},
-		{"below an empty namespace", MinIntegrityRecords - 1},
+		{"below an empty volume", MinIntegrityRecords - 1},
 		{"unbounded integrity records", math.MaxInt64},
 	} {
 		t.Run(test.name, func(t *testing.T) {

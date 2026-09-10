@@ -16,11 +16,11 @@ func TestHistoryRejectsDiscontinuousOrMalformedChanges(t *testing.T) {
 		{"invalid name", `UPDATE changes SET name=X'2f'`},
 		{"removed node payload", `UPDATE changes SET node=1`},
 		{"rename without source", `UPDATE changes SET kind=3`},
-		{"change outside namespace", `UPDATE changes SET namespace=999`},
+		{"change outside volume", `UPDATE changes SET volume=999`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			db := testDatabase(t, 0)
-			id, root := testNamespace(t, db, "workspace")
+			id, root := testVolume(t, db, "workspace")
 			testChange(t, db, id, root, "old")
 			testChange(t, db, id, root, "another")
 			for _, scope := range []*int64{nil, &id} {
@@ -39,9 +39,9 @@ func TestHistoryRejectsDiscontinuousOrMalformedChanges(t *testing.T) {
 
 func TestHistoricalLogValidatesShapeWithoutPredecessorColumn(t *testing.T) {
 	db := testDatabase(t, 2)
-	execute(t, db, `INSERT INTO namespaces VALUES(1,'legacy',1,0)`)
+	execute(t, db, `INSERT INTO volumes VALUES(1,'legacy',1,0)`)
 	execute(t, db, `INSERT INTO logs VALUES(1,'old-history',4,0,0)`)
-	execute(t, db, `INSERT INTO changes (position,namespace,kind,parent,name,recorded_sec,recorded_nsec)
+	execute(t, db, `INSERT INTO changes (position,volume,kind,parent,name,recorded_sec,recorded_nsec)
 		VALUES(4,1,1,1,X'66',0,0)`)
 	id := int64(1)
 	for _, scope := range []*int64{nil, &id} {

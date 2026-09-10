@@ -17,9 +17,9 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// Storage is a namespace held by a server: its contents through the storage contract, and
+// Storage is a volume held by a server: its contents through the storage contract, and
 // beside that the replication endpoints a replica of its metadata is built and kept from.
-// One Dial is one namespace, and a replica needs both halves of it.
+// One Dial is one volume, and a replica needs both halves of it.
 type Storage struct {
 	base *url.URL
 	http *http.Client
@@ -62,7 +62,7 @@ const DefaultSilence = 30 * time.Second
 var _ storage.Storage = (*Storage)(nil)
 var _ storage.BoundedStorage = (*Storage)(nil)
 
-// Dial reaches the namespace served at baseURL, which must be absolute. A base that
+// Dial reaches the volume served at baseURL, which must be absolute. A base that
 // carries a path prefix is honoured, so a handler mounted inside a larger server is
 // reachable.
 //
@@ -287,9 +287,9 @@ func (s *Storage) RenameWithBarrier(ctx context.Context, from, to string) (Mutat
 	return requireMutationBarrier(req, barrier, err)
 }
 
-// Space reports the room the namespace behind the wire has.
+// Space reports the room the volume behind the wire has.
 //
-// A namespace with no room of its own to report says so with ENOSYS, which arrives as an
+// A volume with no room of its own to report says so with ENOSYS, which arrives as an
 // ordinary storage error under that name. This side cannot know statically what is behind
 // it, so the refusal is an answer rather than an absent method.
 func (s *Storage) Space(ctx context.Context) (storage.Space, error) {
@@ -309,8 +309,8 @@ func (s *Storage) Space(ctx context.Context) (storage.Space, error) {
 	return resp.Space.Storage(), nil
 }
 
-// change performs an operation whose answer is an exact MutationResponse. A logged namespace
-// supplies the barrier needed for read-after-write confirmation; a logless namespace supplies
+// change performs an operation whose answer is an exact MutationResponse. A logged volume
+// supplies the barrier needed for read-after-write confirmation; a logless volume supplies
 // an empty JSON object. Any other successful body is not this protocol's answer.
 func (s *Storage) change(ctx context.Context, req Request, content []byte) (*MutationBarrier, error) {
 	answer, err := s.call(ctx, req, content)
@@ -391,7 +391,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 	if content != nil {
 		httpReq.Header.Set("Content-Type", req.ContentType())
 	}
-	if isNamespaceMutation(req.Op) || req.Op == OpFile && fileScopeEnabled(ctx) {
+	if isVolumeMutation(req.Op) || req.Op == OpFile && fileScopeEnabled(ctx) {
 		scope := locking.ScopeFromContext(ctx)
 		if !locking.HasScope(ctx) && s.scope != nil {
 			scope = *s.scope
@@ -528,7 +528,7 @@ func (s *Storage) storageError(req Request, body []byte) error {
 	_, hasCode := members["lockCode"]
 	_, hasRecorded := members["recorded"]
 	if hasCode || hasRecorded {
-		failure, err := decodeNamespaceLockFailure(body)
+		failure, err := decodeVolumeLockFailure(body)
 		if err != nil {
 			return unreachable(req, err)
 		}
@@ -588,7 +588,7 @@ func readWhole(resp *http.Response, limit int64) ([]byte, error) {
 //
 // Unwrap yields the errno alone. Is preserves cancellation and deadline identity without
 // exposing the underlying cause. A cause left in the errors.Is chain would leak
-// errnos that belong to the network into answers about the namespace: dialling a Unix
+// errnos that belong to the network into answers about the volume: dialling a Unix
 // socket that is not there produces a chain containing syscall.ENOENT, and a caller
 // asking errors.Is(err, syscall.ENOENT) would be told the file does not exist when the
 // truth is that the server was never reached.
@@ -609,7 +609,7 @@ func (e *operationError) Error() string {
 }
 
 // subject names the operation and what it was aimed at. An operation taking no operands
-// names nothing further: OpSpace describes the whole namespace, and an empty path quoted
+// names nothing further: OpSpace describes the whole volume, and an empty path quoted
 // beside it would read as a report about the root.
 func (r Request) subject() string {
 	switch {

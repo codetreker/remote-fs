@@ -53,8 +53,8 @@ func TestListBoundedRefusesAStoredHugeNameBeforeLoadingItsBlob(t *testing.T) {
 	}
 	const hugeNameBytes = 8 << 20
 	if _, err := store.write.ExecContext(t.Context(),
-		`UPDATE entries SET name = zeroblob(?) WHERE namespace = ? AND parent = ? AND name = ?`,
-		hugeNameBytes, store.namespace, store.root, []byte("small")); err != nil {
+		`UPDATE entries SET name = zeroblob(?) WHERE volume = ? AND parent = ? AND name = ?`,
+		hugeNameBytes, store.volume, store.root, []byte("small")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -92,8 +92,8 @@ func TestListBoundedDoesNotLoadContentBeforeReservingAnEntry(t *testing.T) {
 	}
 	if _, err := writer.ExecContext(t.Context(), `
 		UPDATE nodes SET content = zeroblob(?) WHERE id = (
-			SELECT node FROM entries WHERE namespace = ? AND parent = ? AND name = CAST('file' AS BLOB)
-		)`, contentBytes, store.namespace, store.root); err != nil {
+			SELECT node FROM entries WHERE volume = ? AND parent = ? AND name = CAST('file' AS BLOB)
+		)`, contentBytes, store.volume, store.root); err != nil {
 		t.Fatal(err)
 	}
 	reservationFailure := errors.New("reservation refused")
@@ -130,13 +130,13 @@ func TestListBoundedRefusesTwoNamesForOneNodeWithoutExposingEither(t *testing.T)
 	}
 	var node int64
 	if err := store.write.QueryRowContext(t.Context(),
-		`SELECT node FROM entries WHERE namespace = ? AND parent = ? AND name = ?`,
-		store.namespace, store.root, []byte("aa")).Scan(&node); err != nil {
+		`SELECT node FROM entries WHERE volume = ? AND parent = ? AND name = ?`,
+		store.volume, store.root, []byte("aa")).Scan(&node); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.write.ExecContext(t.Context(),
-		`INSERT INTO entries (namespace, parent, name, node) VALUES (?, ?, ?, ?)`,
-		store.namespace, store.root, []byte("bb"), node); err != nil {
+		`INSERT INTO entries (volume, parent, name, node) VALUES (?, ?, ?, ?)`,
+		store.volume, store.root, []byte("bb"), node); err != nil {
 		t.Fatal(err)
 	}
 
@@ -165,13 +165,13 @@ func TestListBoundedRefusesDifferentLengthNamesForOneNodeWithoutExposingEither(t
 	}
 	var node int64
 	if err := store.write.QueryRowContext(t.Context(),
-		`SELECT node FROM entries WHERE namespace = ? AND parent = ? AND name = ?`,
-		store.namespace, store.root, []byte("short")).Scan(&node); err != nil {
+		`SELECT node FROM entries WHERE volume = ? AND parent = ? AND name = ?`,
+		store.volume, store.root, []byte("short")).Scan(&node); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.write.ExecContext(t.Context(),
-		`INSERT INTO entries (namespace, parent, name, node) VALUES (?, ?, ?, ?)`,
-		store.namespace, store.root, []byte("a-much-longer-alias"), node); err != nil {
+		`INSERT INTO entries (volume, parent, name, node) VALUES (?, ?, ?, ?)`,
+		store.volume, store.root, []byte("a-much-longer-alias"), node); err != nil {
 		t.Fatal(err)
 	}
 

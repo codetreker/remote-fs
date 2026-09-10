@@ -10,7 +10,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
 )
 
-func ValidateIdentityBounds(ctx context.Context, db sqlvalue.Queryer, namespace int64) error {
+func ValidateIdentityBounds(ctx context.Context, db sqlvalue.Queryer, volume int64) error {
 	state, err := Read(ctx, db)
 	if err != nil {
 		return err
@@ -18,35 +18,35 @@ func ValidateIdentityBounds(ctx context.Context, db sqlvalue.Queryer, namespace 
 	var invalidNodes, invalidChanges int64
 	if err := db.QueryRowContext(ctx, `
 		SELECT
-			(SELECT count(*) FROM namespaces WHERE id = ? AND root > ?) +
-			(SELECT count(*) FROM nodes WHERE namespace = ? AND id > ?) +
-			(SELECT count(*) FROM entries WHERE namespace = ? AND (parent > ? OR node > ?)) +
-			(SELECT count(*) FROM changes WHERE namespace = ? AND (
+			(SELECT count(*) FROM volumes WHERE id = ? AND root > ?) +
+			(SELECT count(*) FROM nodes WHERE volume = ? AND id > ?) +
+			(SELECT count(*) FROM entries WHERE volume = ? AND (parent > ? OR node > ?)) +
+			(SELECT count(*) FROM changes WHERE volume = ? AND (
 				parent > ? OR coalesce(from_parent, 0) > ? OR coalesce(node, 0) > ?
 			))`,
-		namespace, state.NodeHighWater,
-		namespace, state.NodeHighWater,
-		namespace, state.NodeHighWater, state.NodeHighWater,
-		namespace, state.NodeHighWater, state.NodeHighWater, state.NodeHighWater,
+		volume, state.NodeHighWater,
+		volume, state.NodeHighWater,
+		volume, state.NodeHighWater, state.NodeHighWater,
+		volume, state.NodeHighWater, state.NodeHighWater, state.NodeHighWater,
 	).Scan(&invalidNodes); err != nil {
 		return err
 	}
 	if err := db.QueryRowContext(ctx, `
 		SELECT
-			(SELECT count(*) FROM logs WHERE namespace = ? AND (
+			(SELECT count(*) FROM logs WHERE volume = ? AND (
 				committed_position > ? OR trimmed_through > ?
 			)) +
-			(SELECT count(*) FROM changes WHERE namespace = ? AND (
+			(SELECT count(*) FROM changes WHERE volume = ? AND (
 				position > ? OR previous_position > ?
 			))`,
-		namespace, state.ChangeHighWater, state.ChangeHighWater,
-		namespace, state.ChangeHighWater, state.ChangeHighWater,
+		volume, state.ChangeHighWater, state.ChangeHighWater,
+		volume, state.ChangeHighWater, state.ChangeHighWater,
 	).Scan(&invalidChanges); err != nil {
 		return err
 	}
 	if invalidNodes != 0 || invalidChanges != 0 {
-		return fmt.Errorf("namespace %d has %d node identities and %d change positions above durable high-water marks: %w",
-			namespace, invalidNodes, invalidChanges, syscall.EIO)
+		return fmt.Errorf("volume %d has %d node identities and %d change positions above durable high-water marks: %w",
+			volume, invalidNodes, invalidChanges, syscall.EIO)
 	}
 	return nil
 }

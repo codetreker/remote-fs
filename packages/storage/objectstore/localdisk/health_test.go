@@ -255,7 +255,7 @@ func TestShardIdentityLinkErrorsWithChangedNamesPoison(t *testing.T) {
 				t.Fatalf("publication error created final unexpectedly: %v", finalErr)
 			}
 			if _, err := objects.Get(t.Context(), "unrelated-key"); !errors.Is(err, syscall.EIO) {
-				t.Fatalf("operation after changed marker namespace returned %v, want EIO", err)
+				t.Fatalf("operation after changed marker names returned %v, want EIO", err)
 			}
 			if err := objects.Close(); err != nil {
 				t.Fatal(err)
@@ -263,7 +263,7 @@ func TestShardIdentityLinkErrorsWithChangedNamesPoison(t *testing.T) {
 
 			reopened, err := Open(t.Context(), root, Options{})
 			if err != nil {
-				t.Fatalf("Open after changed marker namespace: %v", err)
+				t.Fatalf("Open after changed marker names: %v", err)
 			}
 			if err := reopened.Close(); err != nil {
 				t.Fatal(err)

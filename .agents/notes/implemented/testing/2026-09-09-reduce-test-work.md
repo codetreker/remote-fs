@@ -4,33 +4,33 @@ Status: implemented
 
 ## 问题
 
-部分 SQLite 用例花大量时间准备相同状态：两个当前 schema 的损坏矩阵在每个子用例重建健康数据库，随后才注入它要检查的损坏；索引准入用例则用 20,000 次 Go 到 SQLite 的调用写入固定记录。前者要证明损坏被拒绝，后者要证明大集合上的索引与准入行为，重复构造本身不是这些判据。公共 metastore 契约的每个子用例需要独立 namespace 和连接生存期，却为此重复建立物理 schema；它的邻居 namespace 只需制造真实日志间隙，持续创建新节点又让后续检查面对越来越大的无关树。读写交接用例在取得写者结果后，还会等待已经排队的完整读取结束；这些读取已不属于写者能否在负载下推进的观察窗口。公共 storage 原子替换用例的读循环还会在写入期间反复复制和校验相同的大块内容，持续争夺写者需要的 CPU。
+部分 SQLite 用例花大量时间准备相同状态：两个当前 schema 的损坏矩阵在每个子用例重建健康数据库，随后才注入它要检查的损坏；索引准入用例则用 20,000 次 Go 到 SQLite 的调用写入固定记录。前者要证明损坏被拒绝，后者要证明大集合上的索引与准入行为，重复构造本身不是这些判据。公共 metastore 契约的每个子用例需要独立卷和连接生存期，却为此重复建立物理 schema；它的邻居卷只需制造真实日志间隙，持续创建新节点又让后续检查面对越来越大的无关树。读写交接用例在取得写者结果后，还会等待已经排队的完整读取结束；这些读取已不属于写者能否在负载下推进的观察窗口。公共 storage 原子替换用例的读循环还会在写入期间反复复制和校验相同的大块内容，持续争夺写者需要的 CPU。
 
 [基线 CI](https://github.com/codetreker/remote-fs/actions/runs/34327807431)的 checks 作业耗时 457 秒，mounted 作业 246 秒。它们包含并发执行的包、测试与清理，不能把用例耗时直接相加，也不能单凭作业时长断言某类 CPU 或 I/O 成本。需要在同一配置下区分准备、被测操作和结果返回后的清理，同时保持原来的测试命题。
 
 ## 决定
 
-### 契约共享物理数据库，子用例拥有独立 namespace
+### 契约共享物理数据库，子用例拥有独立卷
 
-根 [metastore 契约](../../../../packages/metastore/sqlite/contract_test.go)由顶层测试拥有一个真实文件数据库路径。工厂为每个子用例分配唯一的 `workspace-N`／`neighbour-N`，分别按原有 allowance 和默认选项打开 Store。子用例仍拥有自己的 context、连接和检查错误的 Close cleanup；下一例不借用上一例的活句柄。schema 可以复用，内容、配额、对象队列和 namespace 日志不能复用。
+根 [metastore 契约](../../../../packages/metastore/sqlite/contract_test.go)由顶层测试拥有一个真实文件数据库路径。工厂为每个子用例分配唯一的 `volume-N`／`neighbour-N`，分别按原有 allowance 和默认选项打开 Store。子用例仍拥有自己的 context、连接和检查错误的 Close cleanup；下一例不借用上一例的活句柄。schema 可以复用，内容、配额、对象队列和卷日志不能复用。
 
-顺序子用例回归先保存一份已有内容、配额、reserved／unresolved／garbage 对象和日志，再确认它的 Store 已关闭。下一对 namespace 须从空目录、仅含根的 snapshot、零 Used／pending／garbage 与自己的 allowance 开始；新日志 identity 独立，共享数据库 identity 和高水位仍合法。第二例写入后重新读取第一例，核对其元数据、配额、对象状态和双方日志未被改动。每例仍制造稀疏 position，不假定新 namespace 的全局序号从零开始。
+顺序子用例回归先保存一份已有内容、配额、reserved／unresolved／garbage 对象和日志，再确认它的 Store 已关闭。下一对卷须从空目录、仅含根的 snapshot、零 Used／pending／garbage 与自己的 allowance 开始；新日志 identity 独立，共享数据库 identity 和高水位仍合法。第二例写入后重新读取第一例，核对其元数据、配额、对象状态和双方日志未被改动。每例仍制造稀疏 position，不假定新卷的全局序号从零开始。
 
 ### 邻居产生真实日志，目录保持固定
 
-根 [metastore 契约夹具](../../../../packages/metastore/sqlite/contract_test.go)仍在同一文件数据库中打开被测 namespace 与邻居。每次被测修改之前，邻居对自己的既有根执行 SetAttr；原子计数器生成唯一的 ModTime，确保每次调用都发布真实 Modified 事件并消耗全局 position。失败仍使测试失败，不能省略间隙。
+根 [metastore 契约夹具](../../../../packages/metastore/sqlite/contract_test.go)仍在同一文件数据库中打开被测卷与邻居。每次被测修改之前，邻居对自己的既有根执行 SetAttr；原子计数器生成唯一的 ModTime，确保每次调用都发布真实 Modified 事件并消耗全局 position。失败仍使测试失败，不能省略间隙。
 
 邻居的根身份、模式和空目录保持不变。回归用例直接读取两边日志，验证被测 position 稀疏、八次邻居修改的时间值各异（含四个并发调用），并检查树没有增长。时间值唯一不要求并发调用按计数器次序提交。把旧的逐次 Create 夹具装回去会使该回归失败；未改变 metastore 契约原有的操作和结果断言。
 
 ### 固定大集合由一条 SQL 构造
 
-[`TestPendingAdmissionSeeksPastALargeReferencedSet`](../../../../packages/metastore/sqlite/objects_test.go)在原有事务内用递归 CTE 写入 20,000 条 referenced object。记录按 ordinal 插入，key、namespace、state、size、NULL digest、时间字段与原集合相同；`RowsAffected` 必须恰为 20,000。
+[`TestPendingAdmissionSeeksPastALargeReferencedSet`](../../../../packages/metastore/sqlite/objects_test.go)在原有事务内用递归 CTE 写入 20,000 条 referenced object。记录按 ordinal 插入，key、卷、state、size、NULL digest、时间字段与原集合相同；`RowsAffected` 必须恰为 20,000。
 
 用例仍对生产查询执行 EXPLAIN，并通过实际 Reserve 核对准入结果。它不缩小集合、不改成内存数据库，也不跳过真正被检查的路径；减少的是逐行跨越 Go/SQLite 调用边界的准备工作。
 
 ### 损坏矩阵复制完整、私有的健康种子
 
-[`TestOpenRefusesInconsistentNamespaceIntegrity` 与 `TestRetainedIntegrityRefusesInvalidDetachedState`](../../../../packages/metastore/sqlite/internal/integration/integrity_test.go)各自在顶层用例中建立一份种子。种子通过原有真实 Open 与公开 mutation 形成，两个 namespace 的 Store 和查询句柄均检查关闭结果；确认 journal mode 为 WAL 后执行 TRUNCATE checkpoint，要求 busy、frames、checkpointed 全为零，再关闭最后句柄，读取完整主数据库字节和对应 fixture 元数据。
+[`TestOpenRefusesInconsistentVolumeIntegrity` 与 `TestRetainedIntegrityRefusesInvalidDetachedState`](../../../../packages/metastore/sqlite/internal/integration/integrity_test.go)各自在顶层用例中建立一份种子。种子通过原有真实 Open 与公开 mutation 形成，两个卷的 Store 和查询句柄均检查关闭结果；确认 journal mode 为 WAL 后执行 TRUNCATE checkpoint，要求 busy、frames、checkpointed 全为零，再关闭最后句柄，读取完整主数据库字节和对应 fixture 元数据。
 
 每个子用例把这份不可变镜像写入新路径的 `0600` 普通文件，拥有独立 inode、连接和可变状态。ID、高水位、日志和对象 key 保持一致，原来的 detach、损坏、Open 或先打开后 ObjectStatus 的顺序与错误断言保持原样。
 
@@ -54,13 +54,13 @@ Status: implemented
 
 ## 备选方案
 
-**每个契约子用例使用新数据库文件。** 物理隔离直接，但反复建立相同 schema。独立 namespace 保留接口状态隔离，子用例保留 Open／Close；增加顺序隔离回归，是接受共享物理数据库的必要约束。专门验证数据库形成与恢复的其它用例不使用这个工厂。
+**每个契约子用例使用新数据库文件。** 物理隔离直接，但反复建立相同 schema。独立卷保留接口状态隔离，子用例保留 Open／Close；增加顺序隔离回归，是接受共享物理数据库的必要约束。专门验证数据库形成与恢复的其它用例不使用这个工厂。
 
 **每个损坏子用例重新构造完整健康数据库。** 它天然隔离，但为相同前置状态重复执行 schema 与公开 mutation。顶层只构造一次、每例复制独立数据库，保留真实来源和隔离，并通过健康对照检查复制本身。
 
 **逐行执行已准备的 INSERT。** 它保留相同数据，却仍需 20,000 次调用。集合值和顺序固定，可以由一条 SQLite 语句构造；精确行数、EXPLAIN 和实际 Reserve 继续约束结果。
 
-**邻居为每个间隙创建新节点。** 它确实产生真实日志，却同时增长被验证数据库中的另一棵树。间隙的目的在于消耗其它 namespace 的 position；修改一个既有根可以满足这个目的，并由日志与隔离断言确认。
+**邻居为每个间隙创建新节点。** 它确实产生真实日志，却同时增长被验证数据库中的另一棵树。间隙的目的在于消耗其它卷的 position；修改一个既有根可以满足这个目的，并由日志与隔离断言确认。
 
 **收到写者结果后只设置停止标志，等所有已排队读取完成。** 它让下一轮循环停止，却仍把已进入等待的读取逐批跑完。这些完整扫描没有增加写者阶段的证据；显式取消自有负载并检查 join 和空闲状态，可以保留清理保证。
 
@@ -74,7 +74,7 @@ Status: implemented
 |---|---:|---:|---:|
 | 公共 metastore 契约 | 45.30 秒 | 40.30 秒 | 11.0% |
 | 20,000 条 referenced object 准入 | 4.41 秒 | 2.48 秒 | 43.8% |
-| 当前 namespace 完整性拒绝矩阵 | 17.90 秒 | 2.97 秒 | 83.4% |
+| 当前卷完整性拒绝矩阵 | 17.90 秒 | 2.97 秒 | 83.4% |
 | detached 状态拒绝矩阵 | 16.97 秒 | 4.29 秒 | 74.7% |
 | 128 读者下的写者推进与清理 | 19.82 秒 | 7.83 秒 | 60.5% |
 
@@ -84,7 +84,7 @@ Status: implemented
 
 原子替换读循环以 Go 1.26.7、相同 race 配置作三组配对测量。limited 的 native publication 分支中位数从 10.858 秒降至 8.238 秒（24.1%），unmanaged bounded 分支从 11.672 秒降至 9.384 秒（19.6%）；这张测量不混入后续 Go 1.26.8 的执行结果。总读取次数的中位数也分别从 4933 降为 3277、从 4980 降为 3359，因此不能只用耗时更短证明选择成立。每个读者的 API 区间都与全部 200 次写入重叠，且各自看到了两种值；按每个读者统计，至少含一次完整 Read 调用的 Write 调用区间数从 193～199 次变为 197～200 次。两种实现、调度前后各十次无额外等待的非原子负向对照，合计 40 次均检出损坏。正确后端样本没有遇到 EAGAIN，因此没有动态覆盖该让出分支；它仍沿用原错误接受规则。读取样本减少的代价由这些区间分布和负向对照约束，但它们不能证明更窄内部损坏窗口的检出率等价，也不能推出净 CI 收益。
 
-共享契约数据库让前面子用例的 namespace 留到顶层结束，增加后续 Open 面对的已存状态；工厂的唯一命名和跨例不变性检查不能省略。矩阵另须保存一份种子字节，并为每个子用例复制文件、重新打开真实 SQLite。种子必须完整、不可变且只在所属顶层用例内存活；损坏或隔离检查失败就结束测试，不能回退成一份看似有效的新数据库。
+共享契约数据库让前面子用例的卷留到顶层结束，增加后续 Open 面对的已存状态；工厂的唯一命名和跨例不变性检查不能省略。矩阵另须保存一份种子字节，并为每个子用例复制文件、重新打开真实 SQLite。种子必须完整、不可变且只在所属顶层用例内存活；损坏或隔离检查失败就结束测试，不能回退成一份看似有效的新数据库。
 
 拒绝矩阵复用、确认阶段事件门及写入重复次数的后续选择见[测试工作量决定](2026-09-09-scale-test-work-to-its-assertions.md)，这里的历史测量与原取舍保持。
 

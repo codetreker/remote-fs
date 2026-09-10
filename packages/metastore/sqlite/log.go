@@ -13,23 +13,23 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 )
 
-// Window is how much of a namespace's change log is kept.
+// Window is how much of a volume's change log is kept.
 //
 // The three numbers answer three different questions and none of them subsumes the others.
-// Floor is what makes a brief disconnection resumable for a namespace that is barely written
+// Floor is what makes a brief disconnection resumable for a volume that is barely written
 // to; Cap is the resource ceiling; Age is what keeps a database from filling with the logs of
-// namespaces nobody is watching, which matters because many namespaces exist and few are
+// volumes nobody is watching, which matters because many volumes exist and few are
 // mounted at any moment. That last reason is easy to lose once the log is on disk rather than
 // in memory — "it is only disk" is exactly the argument that would remove it.
 //
-// Floor wins over Age. A namespace that has been quiet for longer than Age keeps its last
+// Floor wins over Age. A volume that has been quiet for longer than Age keeps its last
 // Floor entries anyway, because discarding them would turn every brief absence into a full
-// rebuild for a namespace where nothing had happened at all.
+// rebuild for a volume where nothing had happened at all.
 type Window struct {
-	// Floor is the fewest entries a namespace's log keeps, however old they are.
+	// Floor is the fewest entries a volume's log keeps, however old they are.
 	Floor int
 
-	// Cap is the most entries a namespace's log keeps.
+	// Cap is the most entries a volume's log keeps.
 	Cap int
 
 	// Age is how long an entry is kept, subject to Floor.
@@ -56,7 +56,7 @@ func (s *Store) recordCreated(ctx context.Context, tx *sql.Tx, at metastore.Loca
 	if err != nil {
 		return err
 	}
-	return changes.Record(ctx, tx, s.namespace, metastore.Change{
+	return changes.Record(ctx, tx, s.volume, metastore.Change{
 		Kind: metastore.Created, Parent: at.Parent, Name: at.Name, Node: &node,
 	})
 }
@@ -71,7 +71,7 @@ func (s *Store) recordChanged(ctx context.Context, tx *sql.Tx, id int64) error {
 	if err != nil {
 		return err
 	}
-	return changes.Record(ctx, tx, s.namespace, metastore.Change{
+	return changes.Record(ctx, tx, s.volume, metastore.Change{
 		Kind: metastore.Modified, Parent: at.Parent, Name: at.Name, Node: &node,
 	})
 }
@@ -79,7 +79,7 @@ func (s *Store) recordChanged(ctx context.Context, tx *sql.Tx, id int64) error {
 // recordRemoved records that a name that held a node now holds nothing. It carries no node,
 // because there is none to carry.
 func (s *Store) recordRemoved(ctx context.Context, tx *sql.Tx, at metastore.Location) error {
-	return changes.Record(ctx, tx, s.namespace, metastore.Change{Kind: metastore.Removed, Parent: at.Parent, Name: at.Name})
+	return changes.Record(ctx, tx, s.volume, metastore.Change{Kind: metastore.Removed, Parent: at.Parent, Name: at.Name})
 }
 
 // recordRenamed records a node arriving at a name from another one.
@@ -97,7 +97,7 @@ func (s *Store) recordRemoved(ctx context.Context, tx *sql.Tx, at metastore.Loca
 // the rule wrong would keep the replaced node with nothing to correct it. Every node that
 // ceases to exist has exactly one Removed.
 func (s *Store) recordRenamed(ctx context.Context, tx *sql.Tx, at, from metastore.Location, node metastore.Node) error {
-	return changes.Record(ctx, tx, s.namespace, metastore.Change{
+	return changes.Record(ctx, tx, s.volume, metastore.Change{
 		Kind: metastore.Renamed, Parent: at.Parent, Name: at.Name, From: &from, Node: &node,
 	})
 }
@@ -114,11 +114,11 @@ func (s *Store) locate(ctx context.Context, tx *sql.Tx, id int64) (metastore.Loc
 		name   []byte
 	)
 	switch err := tx.QueryRowContext(ctx,
-		`SELECT parent, name FROM entries WHERE node = ? AND namespace = ?`,
-		id, s.namespace).Scan(&parent, &name); {
+		`SELECT parent, name FROM entries WHERE node = ? AND volume = ?`,
+		id, s.volume).Scan(&parent, &name); {
 	case errors.Is(err, sql.ErrNoRows):
 		if id != s.root {
-			return metastore.Location{}, fmt.Errorf("%w: node %d holds no name in this namespace", syscall.EIO, id)
+			return metastore.Location{}, fmt.Errorf("%w: node %d holds no name in this volume", syscall.EIO, id)
 		}
 		return metastore.Location{}, nil
 	case err != nil:
@@ -165,7 +165,7 @@ func (s *Store) Since(
 	}
 	if err := s.inspect(ctx, func(tx *sql.Tx) error {
 		var err error
-		retention, err = changes.ReadPage(ctx, tx, s.namespace, s.maxIntegrityRecords, after, limit, result)
+		retention, err = changes.ReadPage(ctx, tx, s.volume, s.maxIntegrityRecords, after, limit, result)
 		return err
 	}); err != nil {
 		return metastore.Retention{}, result.Fail(fmt.Errorf("reading the changes after position %d: %w", after, sqlerr.Failure(err)))
@@ -186,7 +186,7 @@ func (s *Store) Barrier(ctx context.Context, maxBytes int64) (metastore.LogBarri
 	var barrier metastore.LogBarrier
 	if err := s.inspect(ctx, func(tx *sql.Tx) error {
 		var err error
-		barrier, err = changes.ReadLogBarrier(ctx, tx, s.namespace, maxBytes, true)
+		barrier, err = changes.ReadLogBarrier(ctx, tx, s.volume, maxBytes, true)
 		return err
 	}); err != nil {
 		return metastore.LogBarrier{}, fmt.Errorf("reading the log's barrier: %w", sqlerr.Failure(err))
@@ -201,7 +201,7 @@ func (s *Store) Barrier(ctx context.Context, maxBytes int64) (metastore.LogBarri
 func (s *Store) CommittedPosition(ctx context.Context) (metastore.Position, error) {
 	var committed metastore.Position
 	if err := s.inspect(ctx, func(tx *sql.Tx) error {
-		barrier, err := changes.ReadLogBarrier(ctx, tx, s.namespace, 0, false)
+		barrier, err := changes.ReadLogBarrier(ctx, tx, s.volume, 0, false)
 		committed = barrier.Position
 		return err
 	}); err != nil {

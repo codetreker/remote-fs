@@ -55,7 +55,7 @@ func (h *handle) Getlk(ctx context.Context, owner uint64, lk *gofuse.FileLock, f
 	if err := h.check(); err != nil {
 		return errnoOf(err)
 	}
-	call, cancel := context.WithTimeout(ctx, h.node.ns.flushTimeout)
+	call, cancel := context.WithTimeout(ctx, h.node.volume.flushTimeout)
 	defer cancel()
 	conflict, err := h.file.GetLock(call, storage.LockOwner(owner), lock)
 	if err != nil {
@@ -98,8 +98,8 @@ func (h *handle) setLock(ctx context.Context, owner storage.LockOwner, lk *gofus
 	if err := h.check(); err != nil {
 		return errnoOf(err)
 	}
-	call, cancel := context.WithTimeout(ctx, h.node.ns.flushTimeout)
-	epoch, err := h.node.ns.actionEpoch(call)
+	call, cancel := context.WithTimeout(ctx, h.node.volume.flushTimeout)
+	epoch, err := h.node.volume.actionEpoch(call)
 	cancel()
 	if err != nil {
 		return errnoOf(err)
@@ -108,7 +108,7 @@ func (h *handle) setLock(ctx context.Context, owner storage.LockOwner, lk *gofus
 	if err != nil {
 		return errnoOf(err)
 	}
-	call, cancel = context.WithTimeout(ctx, h.node.ns.flushTimeout)
+	call, cancel = context.WithTimeout(ctx, h.node.volume.flushTimeout)
 	attempt, err := h.file.SetLock(call, owner, lock, request)
 	cancel()
 	if err != nil {
@@ -117,7 +117,7 @@ func (h *handle) setLock(ctx context.Context, owner storage.LockOwner, lk *gofus
 		}
 		return h.cancelLock(ctx, owner, lock, request, err)
 	}
-	interval := max(time.Nanosecond, min(100*time.Millisecond, h.node.ns.sessionOptions.Lease/4))
+	interval := max(time.Nanosecond, min(100*time.Millisecond, h.node.volume.sessionOptions.Lease/4))
 	for {
 		if err := checkLockAttempt(attempt, request, lock); err != nil {
 			return h.unknownLock(err)
@@ -148,7 +148,7 @@ func (h *handle) setLock(ctx context.Context, owner storage.LockOwner, lk *gofus
 			return h.cancelLock(ctx, owner, lock, request, ctx.Err())
 		case <-timer.C:
 		}
-		call, cancel = context.WithTimeout(ctx, h.node.ns.flushTimeout)
+		call, cancel = context.WithTimeout(ctx, h.node.volume.flushTimeout)
 		attempt, err = h.file.QueryLock(call, owner, request)
 		cancel()
 		if err != nil {
@@ -185,7 +185,7 @@ func checkLockAttempt(attempt storage.LockAttempt, request storage.LockRequestID
 // Cancellation acknowledges a retained grant as success. Returning EINTR for that
 // outcome would permit a retry while an acquisition the caller never observed survives.
 func (h *handle) cancelLock(ctx context.Context, owner storage.LockOwner, lock storage.FileLock, request storage.LockRequestID, cause error) syscall.Errno {
-	cleanup, cancel := h.node.ns.cleanupContext(ctx)
+	cleanup, cancel := h.node.volume.cleanupContext(ctx)
 	defer cancel()
 	attempt, err := h.file.CancelLock(cleanup, owner, request)
 	if err != nil {
@@ -216,22 +216,22 @@ func (h *handle) unknownLock(cause error) syscall.Errno {
 	if h.retiredNormally(cause) {
 		return syscall.ESTALE
 	}
-	h.node.ns.fence(cause)
+	h.node.volume.fence(cause)
 	return syscall.EIO
 }
 
 func (h *handle) retiredNormally(err error) bool {
-	return errnoOf(err) == syscall.ESTALE && errnoOf(h.node.ns.check()) == syscall.ESTALE
+	return errnoOf(err) == syscall.ESTALE && errnoOf(h.node.volume.check()) == syscall.ESTALE
 }
 
 // Every descriptor close carries its POSIX owner, including closes of a descriptor
 // that never acquired a lock. The retained file supplies the object identity.
 func (h *handle) Flush(ctx context.Context) syscall.Errno {
-	metadata, ok := h.node.ns.raw.lookup(ctx.Done())
+	metadata, ok := h.node.volume.raw.lookup(ctx.Done())
 	if !ok || metadata.kind != rawFlush {
 		return h.unknownLock(fmt.Errorf("flush lacks its kernel lock owner: %w", syscall.EIO))
 	}
-	cleanup, cancel := h.node.ns.cleanupContext(ctx)
+	cleanup, cancel := h.node.volume.cleanupContext(ctx)
 	defer cancel()
 	if err := h.file.DropLocks(cleanup, metadata.owner, storage.POSIX); err != nil {
 		return h.unknownLock(err)
@@ -243,8 +243,8 @@ func (h *handle) Flush(ctx context.Context) syscall.Errno {
 // and closes the session even when the kernel cannot receive the release outcome.
 // https://github.com/hanwen/go-fuse/blob/423b377e1452ab7b3522229185a3047f72e3f966/fs/bridge.go#L905-L918
 func (h *handle) Release(ctx context.Context) syscall.Errno {
-	metadata, ok := h.node.ns.raw.lookup(ctx.Done())
-	cleanup, cancel := h.node.ns.cleanupContext(ctx)
+	metadata, ok := h.node.volume.raw.lookup(ctx.Done())
+	cleanup, cancel := h.node.volume.cleanupContext(ctx)
 	defer cancel()
 	var err error
 	if !ok || metadata.kind != rawRelease {

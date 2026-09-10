@@ -48,7 +48,7 @@ func accountURL() string {
 // Tests share one container and take a prefix of their own inside it, rather than each
 // making a container. Two reasons: a prefix costs no request where a container costs one to
 // make and one to remove, and separating by prefix is the mechanism production separates
-// workspaces with, so every test exercises it rather than only the one test named after it.
+// volumes with, so every test exercises it rather than only the one test named after it.
 var shared struct {
 	once   sync.Once
 	name   string
@@ -251,35 +251,35 @@ func TestPutReportsTheDigestTheServiceComputed(t *testing.T) {
 	}
 }
 
-func TestPrefixesSeparateTwoWorkspacesSharingAContainer(t *testing.T) {
+func TestPrefixesSeparateTwoVolumesSharingAContainer(t *testing.T) {
 	url := sharedContainer(t)
 	stamp := time.Now().UnixNano()
 
 	one, err := NewWithSharedKey(url, accountName, accountKey, fmt.Sprintf("tenant-a-%d/", stamp))
 	if err != nil {
-		t.Fatalf("opening the first workspace: %v", err)
+		t.Fatalf("opening the first volume: %v", err)
 	}
 	two, err := NewWithSharedKey(url, accountName, accountKey, fmt.Sprintf("tenant-b-%d/", stamp))
 	if err != nil {
-		t.Fatalf("opening the second workspace: %v", err)
+		t.Fatalf("opening the second volume: %v", err)
 	}
 
 	if _, err := one.Put(context.Background(), "shared-key", []byte("belongs to the first")); err != nil {
-		t.Fatalf("the first workspace's Put: %v", err)
+		t.Fatalf("the first volume's Put: %v", err)
 	}
 	if _, err := two.Get(context.Background(), "shared-key"); !errors.Is(err, syscall.ENOENT) {
-		t.Fatalf("the second workspace read the first one's key: %v", err)
+		t.Fatalf("the second volume read the first one's key: %v", err)
 	}
 	if _, err := two.Put(context.Background(), "shared-key", []byte("belongs to the second")); err != nil {
-		t.Fatalf("the second workspace's Put: %v", err)
+		t.Fatalf("the second volume's Put: %v", err)
 	}
 
 	got, err := one.Get(context.Background(), "shared-key")
 	if err != nil {
-		t.Fatalf("the first workspace's Get: %v", err)
+		t.Fatalf("the first volume's Get: %v", err)
 	}
 	if string(got) != "belongs to the first" {
-		t.Errorf("the first workspace read %q, want its own bytes", got)
+		t.Errorf("the first volume read %q, want its own bytes", got)
 	}
 }
 
@@ -398,7 +398,7 @@ func TestNewRefusesAPrefixThatWouldNotSeparate(t *testing.T) {
 	}
 }
 
-// An empty prefix is the deployment where one workspace owns the whole container.
+// An empty prefix is the deployment where one volume owns the whole container.
 func TestAnEmptyPrefixAddressesTheContainerItself(t *testing.T) {
 	objects, err := NewWithSharedKey(sharedContainer(t), accountName, accountKey, "")
 	if err != nil {

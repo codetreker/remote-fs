@@ -23,7 +23,7 @@ import (
 // about the one that ships.
 //
 // The store it hands over is not alone in its database, and that is the second half of the
-// same argument. Positions come from one sequence shared by every namespace in a file, so a
+// same argument. Positions come from one sequence shared by every volume in a file, so a
 // store that is alone in one gets consecutive positions and quietly satisfies any assumption
 // about adjacency — which is how two separate readings of "has this caller fallen behind"
 // came to be written against the distance to the oldest surviving entry, and why neither was
@@ -33,14 +33,14 @@ func TestTheContract(t *testing.T) {
 	metastoretest.Run(t, contractStoreFactory(database(t)))
 }
 
-// Fresh namespace pairs isolate cases while retaining one physical schema. Each
+// Fresh volume pairs isolate cases while retaining one physical schema. Each
 // child still owns the complete lifetime of its database connections.
 func contractStoreFactory(path string) metastoretest.NewStore {
 	var sequence atomic.Uint64
 	return func(t *testing.T, allowance int64) metastore.Store {
 		suffix := strconv.FormatUint(sequence.Add(1), 10)
 		return withNeighbour{
-			Store:     open(t, path, "workspace-"+suffix, allowance),
+			Store:     open(t, path, "volume-"+suffix, allowance),
 			neighbour: open(t, path, "neighbour-"+suffix, 0),
 			gaps:      new(atomic.Int64),
 			t:         t,
@@ -48,7 +48,7 @@ func contractStoreFactory(path string) metastoretest.NewStore {
 	}
 }
 
-// withNeighbour records a change to another namespace in the same database before each change
+// withNeighbour records a change to another volume in the same database before each change
 // to this one, so that this one's positions are never consecutive.
 //
 // Every operation that changes the tree is wrapped, because a position is allocated by each
@@ -61,13 +61,13 @@ type withNeighbour struct {
 	t         *testing.T
 }
 
-// gap consumes a position in the neighbouring namespace, which is what leaves a hole in this
+// gap consumes a position in the neighbouring volume, which is what leaves a hole in this
 // one's. A neighbour that will not take it is reported rather than passed over: the gap would
 // silently not be there, and every case after it would be measuring dense positions again.
 func (n withNeighbour) gap(ctx context.Context) {
 	modified := time.Unix(n.gaps.Add(1), 0)
 	if err := n.neighbour.SetAttr(ctx, "", storage.AttrChange{ModTime: &modified}); err != nil {
-		n.t.Errorf("consuming a position in the neighbouring namespace: %v", err)
+		n.t.Errorf("consuming a position in the neighbouring volume: %v", err)
 	}
 }
 
@@ -111,11 +111,11 @@ func database(t *testing.T) string {
 	return filepath.Join(t.TempDir(), "metastore.db")
 }
 
-func open(t *testing.T, path, namespace string, allowance int64) *sqlite.Store {
+func open(t *testing.T, path, volume string, allowance int64) *sqlite.Store {
 	t.Helper()
-	store, err := sqlite.Open(t.Context(), path, namespace, allowance, sqlite.DefaultWindow())
+	store, err := sqlite.Open(t.Context(), path, volume, allowance, sqlite.DefaultWindow())
 	if err != nil {
-		t.Fatalf("opening %q in %s: %v", namespace, path, err)
+		t.Fatalf("opening %q in %s: %v", volume, path, err)
 	}
 	t.Cleanup(func() {
 		if err := store.Close(); err != nil {
@@ -203,7 +203,7 @@ func TestNeighbourGapsKeepSparsePositionsWithoutGrowingTheTree(t *testing.T) {
 	}
 }
 
-func TestContractFactoryKeepsSequentialNamespacesIsolated(t *testing.T) {
+func TestContractFactoryKeepsSequentialVolumesIsolated(t *testing.T) {
 	path := database(t)
 	factory := contractStoreFactory(path)
 	var first, second withNeighbour
@@ -211,7 +211,7 @@ func TestContractFactoryKeepsSequentialNamespacesIsolated(t *testing.T) {
 	var savedSpace storage.Space
 	var savedStatus sqlite.ObjectStatus
 	var savedBarrier, savedNeighbourBarrier metastore.LogBarrier
-	t.Run("populated namespace", func(t *testing.T) {
+	t.Run("populated volume", func(t *testing.T) {
 		first = factory(t, 128).(withNeighbour)
 		key, err := first.Reserve(t.Context(), "same", 7)
 		if err != nil {
@@ -269,13 +269,13 @@ func TestContractFactoryKeepsSequentialNamespacesIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Run("fresh namespace", func(t *testing.T) {
+	t.Run("fresh volume", func(t *testing.T) {
 		second = factory(t, 256).(withNeighbour)
 		if children, err := second.List(t.Context(), ""); err != nil || len(children) != 0 {
-			t.Fatalf("fresh namespace lists %+v, error=%v", children, err)
+			t.Fatalf("fresh volume lists %+v, error=%v", children, err)
 		}
 		if _, err := second.Stat(t.Context(), "same"); !errors.Is(err, syscall.ENOENT) {
-			t.Fatalf("fresh namespace inherited a name: %v", err)
+			t.Fatalf("fresh volume inherited a name: %v", err)
 		}
 		if space, err := second.Space(t.Context()); err != nil || space != (storage.Space{Total: 256, Avail: 256}) {
 			t.Fatalf("fresh quota=%+v, error=%v", space, err)
@@ -336,7 +336,7 @@ func TestContractFactoryKeepsSequentialNamespacesIsolated(t *testing.T) {
 	if err != nil || after.DatabaseID != before.DatabaseID || after.Generation <= before.Generation || after.NodeHighWater <= before.NodeHighWater || after.ChangeHighWater <= before.ChangeHighWater {
 		t.Fatalf("shared database state before=%+v after=%+v, error=%v", before, after, err)
 	}
-	reopened := open(t, path, "workspace-1", 128)
+	reopened := open(t, path, "volume-1", 128)
 	if node, err := reopened.Stat(t.Context(), "same"); err != nil || node != savedNode {
 		t.Fatalf("second child changed first node: %+v, error=%v; want %+v", node, err, savedNode)
 	}

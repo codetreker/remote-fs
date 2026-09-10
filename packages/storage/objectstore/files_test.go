@@ -23,31 +23,31 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/memory"
 )
 
-func fileNamespace(t *testing.T, objects objectstore.Objects, allowance int64, configure func(*sqlite.Options)) (*objectstore.Storage, *sqlite.LockingStore) {
+func fileVolume(t *testing.T, objects objectstore.Objects, allowance int64, configure func(*sqlite.Options)) (*objectstore.Storage, *sqlite.LockingStore) {
 	t.Helper()
 	options := sqlite.DefaultOptions()
 	if configure != nil {
 		configure(&options)
 	}
 	meta, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
-		Database: filepath.Join(t.TempDir(), "files.db"), Namespace: "files", Allowance: allowance,
+		Database: filepath.Join(t.TempDir(), "files.db"), Volume: "files", Allowance: allowance,
 		SQLite: options, Locks: locking.DefaultOptions(), Initialize: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	namespace := objectstore.New(objects, meta)
+	volume := objectstore.New(objects, meta)
 	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
-			t.Errorf("close namespace: %v", err)
+		if err := volume.Close(); err != nil {
+			t.Errorf("close volume: %v", err)
 		}
 	})
-	return namespace, meta
+	return volume, meta
 }
 
-func fileSessionFor(t *testing.T, namespace storage.FileStorage, options storage.FileSessionOptions) storage.FileSession {
+func fileSessionFor(t *testing.T, volume storage.FileStorage, options storage.FileSessionOptions) storage.FileSession {
 	t.Helper()
-	session, err := namespace.NewFileSession(t.Context(), options)
+	session, err := volume.NewFileSession(t.Context(), options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,39 +91,39 @@ func readFileFor(t *testing.T, file storage.File, want string) storage.Attr {
 }
 
 func TestRetainedFileReadsCurrentObjectThroughNameChanges(t *testing.T) {
-	namespace, _ := fileNamespace(t, memory.New(), 4096, nil)
-	session := fileSessionFor(t, namespace, storage.DefaultFileSessionOptions())
+	volume, _ := fileVolume(t, memory.New(), 4096, nil)
+	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	f := openFileFor(t, session, "first", storage.FileOpenOptions{Read: true, Write: true, Create: true, Mode: 0600})
 	if _, err := f.WriteAt(t.Context(), 0, []byte("initial")); err != nil {
 		t.Fatal(err)
 	}
 	id := readFileFor(t, f, "initial").ID
 	for _, content := range []string{"replacement grows", "x", ""} {
-		if err := namespace.Write(t.Context(), "first", []byte(content)); err != nil {
+		if err := volume.Write(t.Context(), "first", []byte(content)); err != nil {
 			t.Fatal(err)
 		}
 		if attr := readFileFor(t, f, content); attr.ID != id {
 			t.Fatalf("identity changed: %+v", attr)
 		}
 	}
-	if err := namespace.Rename(t.Context(), "first", "moved"); err != nil {
+	if err := volume.Rename(t.Context(), "first", "moved"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.WriteAt(t.Context(), 2, []byte("old")); err != nil {
 		t.Fatal(err)
 	}
 	readFileFor(t, f, "\x00\x00old")
-	if err := namespace.Write(t.Context(), "replacement", []byte("new")); err != nil {
+	if err := volume.Write(t.Context(), "replacement", []byte("new")); err != nil {
 		t.Fatal(err)
 	}
-	if err := namespace.Rename(t.Context(), "replacement", "moved"); err != nil {
+	if err := volume.Rename(t.Context(), "replacement", "moved"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.Truncate(t.Context(), 3); err != nil {
 		t.Fatal(err)
 	}
 	readFileFor(t, f, "\x00\x00o")
-	if data, err := namespace.Read(t.Context(), "moved"); err != nil || string(data) != "new" {
+	if data, err := volume.Read(t.Context(), "moved"); err != nil || string(data) != "new" {
 		t.Fatalf("replacement=%q %v", data, err)
 	}
 	mode := storage.AttrChange{Mode: newMode(0640)}
@@ -171,9 +171,9 @@ func (p *pausedFilePut) Put(ctx context.Context, key string, content []byte) ([]
 
 func TestRetainedRangeWriteRetriesAgainstLatestRevision(t *testing.T) {
 	objects := newPausedFilePut(t)
-	namespace, _ := fileNamespace(t, objects, 4096, nil)
+	volume, _ := fileVolume(t, objects, 4096, nil)
 	t.Cleanup(objects.release)
-	session := fileSessionFor(t, namespace, storage.DefaultFileSessionOptions())
+	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	t.Cleanup(objects.release)
 	first := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
 	second := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true})
@@ -201,10 +201,10 @@ func TestRetainedRangeWriteRetriesAgainstLatestRevision(t *testing.T) {
 
 func TestRetainedRenewalHasAdmissionWhileTheOnlyDataSlotIsStaging(t *testing.T) {
 	objects := newPausedFilePut(t)
-	namespace, _ := fileNamespace(t, objects, 4096, nil)
+	volume, _ := fileVolume(t, objects, 4096, nil)
 	options := storage.DefaultFileSessionOptions()
 	options.MaxOperations = 1
-	session := fileSessionFor(t, namespace, options)
+	session := fileSessionFor(t, volume, options)
 	t.Cleanup(objects.release)
 	file := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
 	before, err := session.Status(t.Context())
@@ -241,11 +241,11 @@ func TestRetainedPOSIXOwnerCleanupProgressesWhileDataAdmissionIsFull(t *testing.
 	for _, cleanup := range []string{"close owner", "explicit unlock"} {
 		t.Run(cleanup, func(t *testing.T) {
 			objects := newPausedFilePut(t)
-			namespace, _ := fileNamespace(t, objects, 4096, nil)
+			volume, _ := fileVolume(t, objects, 4096, nil)
 			options := storage.DefaultFileSessionOptions()
 			options.MaxOperations = 1
-			first := fileSessionFor(t, namespace, options)
-			second := fileSessionFor(t, namespace, options)
+			first := fileSessionFor(t, volume, options)
+			second := fileSessionFor(t, volume, options)
 			t.Cleanup(objects.release)
 			writer := openFileFor(t, first, "f", storage.FileOpenOptions{Write: true, Create: true})
 			closing := openFileFor(t, first, "f", storage.FileOpenOptions{Write: true})
@@ -299,11 +299,11 @@ func TestRetainedPOSIXOwnerCleanupProgressesWhileDataAdmissionIsFull(t *testing.
 
 func TestRetainedPendingLockCancellationProgressesWhileDataAdmissionIsFull(t *testing.T) {
 	objects := newPausedFilePut(t)
-	namespace, _ := fileNamespace(t, objects, 4096, nil)
+	volume, _ := fileVolume(t, objects, 4096, nil)
 	options := storage.DefaultFileSessionOptions()
 	options.MaxOperations = 1
-	first := fileSessionFor(t, namespace, options)
-	second := fileSessionFor(t, namespace, options)
+	first := fileSessionFor(t, volume, options)
+	second := fileSessionFor(t, volume, options)
 	t.Cleanup(objects.release)
 	writer := openFileFor(t, first, "f", storage.FileOpenOptions{Write: true, Create: true})
 	closing := openFileFor(t, first, "f", storage.FileOpenOptions{Write: true})
@@ -399,17 +399,17 @@ func TestRetainedLockAdmissionPartitionsAreBoundedAndPreserveRenewal(t *testing.
 	for _, partition := range []string{"acquisition", "reconciliation"} {
 		t.Run(partition, func(t *testing.T) {
 			objects := memory.New()
-			_, meta := fileNamespace(t, objects, 4096, nil)
+			_, meta := fileVolume(t, objects, 4096, nil)
 			paused := &pausedLockNodes{LockingStore: meta, entered: make(chan struct{}, 2)}
-			namespace := objectstore.New(objects, paused)
+			volume := objectstore.New(objects, paused)
 			t.Cleanup(func() {
-				if err := namespace.Close(); err != nil {
+				if err := volume.Close(); err != nil {
 					t.Error(err)
 				}
 			})
 			options := storage.DefaultFileSessionOptions()
 			options.MaxOperations = 1
-			session := fileSessionFor(t, namespace, options)
+			session := fileSessionFor(t, volume, options)
 			file := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
 			lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, End: math.MaxInt64}
 			request := retainedLockRequest(t, session)
@@ -480,15 +480,15 @@ func (m *pausedFileControl) Usage(ctx context.Context) (int64, error) {
 
 func TestRetainedControlAdmissionIsBoundedAndCancellationReleasesIt(t *testing.T) {
 	objects := memory.New()
-	_, meta := fileNamespace(t, objects, 4096, nil)
+	_, meta := fileVolume(t, objects, 4096, nil)
 	control := &pausedFileControl{LockingStore: meta, entered: make(chan struct{}, 2)}
-	namespace := objectstore.New(objects, control)
+	volume := objectstore.New(objects, control)
 	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
+		if err := volume.Close(); err != nil {
 			t.Error(err)
 		}
 	})
-	session := fileSessionFor(t, namespace, storage.DefaultFileSessionOptions())
+	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	control.pause.Store(true)
 	firstCtx, cancelFirst := context.WithCancel(t.Context())
 	secondCtx, cancelSecond := context.WithCancel(t.Context())
@@ -544,11 +544,11 @@ func (m *observedFileAuthority) Advisory(ctx context.Context) (*advisory.Coordin
 
 func TestRetainedEnrollmentCanCancelWhileNativePublicationIsPaused(t *testing.T) {
 	objects := memory.New()
-	base, meta := fileNamespace(t, objects, 4096, nil)
+	base, meta := fileVolume(t, objects, 4096, nil)
 	observed := &observedFileAuthority{LockingStore: meta, entered: make(chan struct{})}
-	namespace := objectstore.New(objects, observed)
+	volume := objectstore.New(objects, observed)
 	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
+		if err := volume.Close(); err != nil {
 			t.Error(err)
 		}
 	})
@@ -568,7 +568,7 @@ func TestRetainedEnrollmentCanCancelWhileNativePublicationIsPaused(t *testing.T)
 		t.Fatal("native publication did not enter accounting")
 	}
 	checked := make(chan error, 1)
-	go func() { checked <- namespace.CheckFileStorage() }()
+	go func() { checked <- volume.CheckFileStorage() }()
 	select {
 	case err := <-checked:
 		if err != nil {
@@ -581,7 +581,7 @@ func TestRetainedEnrollmentCanCancelWhileNativePublicationIsPaused(t *testing.T)
 	defer cancel()
 	opened := make(chan error, 1)
 	go func() {
-		session, err := namespace.NewFileSession(ctx, storage.DefaultFileSessionOptions())
+		session, err := volume.NewFileSession(ctx, storage.DefaultFileSessionOptions())
 		if err == nil {
 			err = session.Close(context.Background())
 		}
@@ -593,7 +593,7 @@ func TestRetainedEnrollmentCanCancelWhileNativePublicationIsPaused(t *testing.T)
 		t.Fatal("enrollment did not reach native authority acquisition")
 	}
 	closed := make(chan error, 1)
-	go func() { closed <- namespace.CloseFileSessions() }()
+	go func() { closed <- volume.CloseFileSessions() }()
 	select {
 	case err := <-closed:
 		if err != nil {
@@ -620,11 +620,11 @@ func TestRetainedEnrollmentCanCancelWhileNativePublicationIsPaused(t *testing.T)
 func TestRetainedSessionExpiryFencesUploadBeforeAdvisoryHandoff(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		objects := newPausedFilePut(t)
-		namespace, _ := fileNamespace(t, objects, 4096, nil)
+		volume, _ := fileVolume(t, objects, 4096, nil)
 		options := storage.DefaultFileSessionOptions()
 		options.Lease = 150 * time.Millisecond
-		firstSession := fileSessionFor(t, namespace, options)
-		secondSession := fileSessionFor(t, namespace, storage.DefaultFileSessionOptions())
+		firstSession := fileSessionFor(t, volume, options)
+		secondSession := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 		t.Cleanup(objects.release)
 		first := openFileFor(t, firstSession, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
 		second := openFileFor(t, secondSession, "f", storage.FileOpenOptions{Read: true, Write: true})
@@ -686,7 +686,7 @@ func TestRetainedSessionExpiryFencesUploadBeforeAdvisoryHandoff(t *testing.T) {
 
 func TestRetainedFileAdmissionAndSizeAreBounded(t *testing.T) {
 	objects := newPausedFilePut(t)
-	namespace, _ := fileNamespace(t, objects, 4096, func(options *sqlite.Options) {
+	volume, _ := fileVolume(t, objects, 4096, func(options *sqlite.Options) {
 		config := advisory.DefaultConfig()
 		config.MaxMaterializedBytes = 16
 		config.MaxFileBytes = 8
@@ -695,13 +695,13 @@ func TestRetainedFileAdmissionAndSizeAreBounded(t *testing.T) {
 	})
 	options := storage.DefaultFileSessionOptions()
 	options.MaxFiles = 1
-	session := fileSessionFor(t, namespace, options)
+	session := fileSessionFor(t, volume, options)
 	t.Cleanup(objects.release)
 	f := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
 	if _, err := session.OpenFile(t.Context(), "other", storage.FileOpenOptions{Read: true, Create: true}); !errors.Is(err, syscall.EMFILE) {
 		t.Fatalf("file limit=%v", err)
 	}
-	if _, err := namespace.Stat(t.Context(), "other"); !errors.Is(err, syscall.ENOENT) {
+	if _, err := volume.Stat(t.Context(), "other"); !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("refused open created a name: %v", err)
 	}
 	if _, err := f.WriteAt(t.Context(), 0, bytes.Repeat([]byte("x"), 9)); !errors.Is(err, syscall.EFBIG) {
@@ -729,8 +729,8 @@ func TestRetainedFileAdmissionAndSizeAreBounded(t *testing.T) {
 }
 
 func TestRetainedOpenChecksIdentityAndAccess(t *testing.T) {
-	namespace, _ := fileNamespace(t, memory.New(), 4096, nil)
-	session := fileSessionFor(t, namespace, storage.DefaultFileSessionOptions())
+	volume, _ := fileVolume(t, memory.New(), 4096, nil)
+	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	f := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true, Exclusive: true, Mode: 0600})
 	attr, err := f.Stat(t.Context())
 	if err != nil || attr.Mode.Perm() != 0600 {
@@ -739,10 +739,10 @@ func TestRetainedOpenChecksIdentityAndAccess(t *testing.T) {
 	if _, err := session.OpenFile(t.Context(), "f", storage.FileOpenOptions{Read: true, Create: true, Exclusive: true}); !errors.Is(err, syscall.EEXIST) {
 		t.Fatalf("exclusive open=%v", err)
 	}
-	if err := namespace.Remove(t.Context(), "f"); err != nil {
+	if err := volume.Remove(t.Context(), "f"); err != nil {
 		t.Fatal(err)
 	}
-	if err := namespace.Create(t.Context(), "f"); err != nil {
+	if err := volume.Create(t.Context(), "f"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := session.OpenFile(t.Context(), "f", storage.FileOpenOptions{Read: true, ExpectedID: attr.ID}); !errors.Is(err, syscall.ESTALE) {
@@ -780,15 +780,15 @@ func TestRetainedWritesPreserveStrongScopeAtFinalPublication(t *testing.T) {
 	options := locking.DefaultOptions()
 	options.Clock = clock
 	objects := newPausedFilePut(t)
-	namespace, _, _ := lockingObjectNamespace(t, options, objects)
-	session := fileSessionFor(t, namespace, storage.DefaultFileSessionOptions())
+	volume, _, _ := lockingObjectVolume(t, options, objects)
+	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	t.Cleanup(objects.release)
 	f := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
 	if _, err := f.WriteAt(t.Context(), 0, []byte("original")); err != nil {
 		t.Fatal(err)
 	}
-	owner := publicationOwner(t, namespace.LockService())
-	grant := publicationGrant(t, namespace.LockService(), owner, "f", locking.Exclusive)
+	owner := publicationOwner(t, volume.LockService())
+	grant := publicationGrant(t, volume.LockService(), owner, "f", locking.Exclusive)
 	if _, err := f.WriteAt(t.Context(), 0, []byte("bad")); err == nil {
 		t.Fatal("anonymous write bypassed strong exclusive grant")
 	}
@@ -846,20 +846,20 @@ func TestRetainedCapturedRevisionHonorsSessionAndNativeFileLimits(t *testing.T) 
 	}{{"session ceiling", 4, 64}, {"native ceiling", 64, 4}} {
 		t.Run(limits.name, func(t *testing.T) {
 			objects := &measuredFileObjects{Objects: memory.New()}
-			namespace, _ := fileNamespace(t, objects, 4096, func(options *sqlite.Options) {
+			volume, _ := fileVolume(t, objects, 4096, func(options *sqlite.Options) {
 				options.Advisory.MaxFileBytes = limits.native
 			})
-			if err := namespace.Write(t.Context(), "f", []byte("ok")); err != nil {
+			if err := volume.Write(t.Context(), "f", []byte("ok")); err != nil {
 				t.Fatal(err)
 			}
 			options := storage.DefaultFileSessionOptions()
 			options.MaxFileSize = limits.session
-			session := fileSessionFor(t, namespace, options)
+			session := fileSessionFor(t, volume, options)
 			file := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true})
 			if attr, err := file.Stat(t.Context()); err != nil || attr.Size != 2 {
 				t.Fatalf("initial stat = %+v, %v", attr, err)
 			}
-			if err := namespace.Write(t.Context(), "f", []byte("too large")); err != nil {
+			if err := volume.Write(t.Context(), "f", []byte("too large")); err != nil {
 				t.Fatal(err)
 			}
 			gets, puts := objects.gets.Load(), objects.puts.Load()
@@ -884,7 +884,7 @@ func TestRetainedCapturedRevisionHonorsSessionAndNativeFileLimits(t *testing.T) 
 			if objects.gets.Load() != gets || objects.puts.Load() != puts {
 				t.Fatal("zero truncation read or staged discarded contents")
 			}
-			if used, err := namespace.Usage(t.Context()); err != nil || used != 0 {
+			if used, err := volume.Usage(t.Context()); err != nil || used != 0 {
 				t.Fatalf("zero truncation usage = %d, %v", used, err)
 			}
 		})
@@ -893,16 +893,16 @@ func TestRetainedCapturedRevisionHonorsSessionAndNativeFileLimits(t *testing.T) 
 
 func TestRetainedZeroTruncateStillChecksStrongPublicationPermission(t *testing.T) {
 	objects := &measuredFileObjects{Objects: memory.New()}
-	namespace, _ := fileNamespace(t, objects, 4096, nil)
-	if err := namespace.Write(t.Context(), "f", []byte("protected")); err != nil {
+	volume, _ := fileVolume(t, objects, 4096, nil)
+	if err := volume.Write(t.Context(), "f", []byte("protected")); err != nil {
 		t.Fatal(err)
 	}
 	options := storage.DefaultFileSessionOptions()
 	options.MaxFileSize = 4
-	session := fileSessionFor(t, namespace, options)
+	session := fileSessionFor(t, volume, options)
 	file := openFileFor(t, session, "f", storage.FileOpenOptions{Write: true})
-	owner := publicationOwner(t, namespace.LockService())
-	grant := publicationGrant(t, namespace.LockService(), owner, "f", locking.Exclusive)
+	owner := publicationOwner(t, volume.LockService())
+	grant := publicationGrant(t, volume.LockService(), owner, "f", locking.Exclusive)
 	objects.rejectReads.Store(true)
 	gets := objects.gets.Load()
 	if _, err := file.Truncate(t.Context(), 0); !errors.Is(err, syscall.EBUSY) {
@@ -926,17 +926,17 @@ func (o *changedFileGet) GetBounded(ctx context.Context, key string, maxBytes in
 
 func TestRetainedReadRetriesCollectedRevisionAndRejectsMissingCurrentObject(t *testing.T) {
 	objects := &changedFileGet{Objects: memory.New()}
-	namespace, meta := fileNamespace(t, objects, 4096, nil)
-	session := fileSessionFor(t, namespace, storage.DefaultFileSessionOptions())
+	volume, meta := fileVolume(t, objects, 4096, nil)
+	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	f := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
 	if _, err := f.WriteAt(t.Context(), 0, []byte("old")); err != nil {
 		t.Fatal(err)
 	}
 	objects.before = func() {
-		if err := namespace.Write(t.Context(), "f", []byte("new revision")); err != nil {
+		if err := volume.Write(t.Context(), "f", []byte("new revision")); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := namespace.Sweep(t.Context(), 16); err != nil {
+		if _, err := volume.Sweep(t.Context(), 16); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -957,7 +957,7 @@ func TestRetainedReadRetriesCollectedRevisionAndRejectsMissingCurrentObject(t *t
 }
 
 func TestRetainedSessionCloseCanRetryKnownAccountingRefusal(t *testing.T) {
-	namespace, _ := fileNamespace(t, memory.New(), 4096, nil)
+	volume, _ := fileVolume(t, memory.New(), 4096, nil)
 	failure := errors.New("known cleanup refusal")
 	var refuse atomic.Bool
 	refuse.Store(true)
@@ -967,7 +967,7 @@ func TestRetainedSessionCloseCanRetryKnownAccountingRefusal(t *testing.T) {
 		}
 		return func(storage.PublicationResult) error { return nil }, nil
 	})
-	session, err := namespace.NewFileSession(ctx, storage.DefaultFileSessionOptions())
+	session, err := volume.NewFileSession(ctx, storage.DefaultFileSessionOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -975,14 +975,14 @@ func TestRetainedSessionCloseCanRetryKnownAccountingRefusal(t *testing.T) {
 	if _, err := f.WriteAt(t.Context(), 0, []byte("charge")); err != nil {
 		t.Fatal(err)
 	}
-	if err := namespace.Remove(t.Context(), "f"); err != nil {
+	if err := volume.Remove(t.Context(), "f"); err != nil {
 		t.Fatal(err)
 	}
-	if err := namespace.Close(); !errors.Is(err, failure) {
+	if err := volume.Close(); !errors.Is(err, failure) {
 		t.Fatalf("first close=%v", err)
 	}
 	refuse.Store(false)
-	if err := namespace.Close(); err != nil {
+	if err := volume.Close(); err != nil {
 		t.Fatalf("retry close=%v", err)
 	}
 	if err := session.Close(context.Background()); err != nil {
@@ -1006,22 +1006,22 @@ func TestRetainedExpiredAtomicOpenCannotCreateOrTruncate(t *testing.T) {
 	for _, create := range []bool{true, false} {
 		t.Run(map[bool]string{true: "create", false: "truncate"}[create], func(t *testing.T) {
 			objects := memory.New()
-			base, meta := fileNamespace(t, objects, 4096, nil)
+			base, meta := fileVolume(t, objects, 4096, nil)
 			if !create {
 				if err := base.Write(t.Context(), "f", []byte("preserved")); err != nil {
 					t.Fatal(err)
 				}
 			}
 			delayed := &delayedNativeOpen{LockingStore: meta, entered: make(chan struct{}), release: make(chan struct{})}
-			namespace := objectstore.New(objects, delayed)
+			volume := objectstore.New(objects, delayed)
 			t.Cleanup(func() {
-				if err := namespace.Close(); err != nil {
+				if err := volume.Close(); err != nil {
 					t.Error(err)
 				}
 			})
 			options := storage.DefaultFileSessionOptions()
 			options.Lease = 60 * time.Millisecond
-			session := fileSessionFor(t, namespace, options)
+			session := fileSessionFor(t, volume, options)
 			release := sync.OnceFunc(func() { close(delayed.release) })
 			t.Cleanup(release)
 			result := make(chan error, 1)
@@ -1052,15 +1052,15 @@ func TestRetainedExpiredAtomicOpenCannotCreateOrTruncate(t *testing.T) {
 
 func TestRetainedSessionsShareAdvisoryAuthorityAcrossObjectWrappers(t *testing.T) {
 	objects := memory.New()
-	firstNamespace, meta := fileNamespace(t, objects, 4096, nil)
-	secondNamespace := objectstore.New(objects, meta)
+	firstVolume, meta := fileVolume(t, objects, 4096, nil)
+	secondVolume := objectstore.New(objects, meta)
 	t.Cleanup(func() {
-		if err := secondNamespace.Close(); err != nil {
+		if err := secondVolume.Close(); err != nil {
 			t.Error(err)
 		}
 	})
-	firstSession := fileSessionFor(t, firstNamespace, storage.DefaultFileSessionOptions())
-	secondSession := fileSessionFor(t, secondNamespace, storage.DefaultFileSessionOptions())
+	firstSession := fileSessionFor(t, firstVolume, storage.DefaultFileSessionOptions())
+	secondSession := fileSessionFor(t, secondVolume, storage.DefaultFileSessionOptions())
 	first := openFileFor(t, firstSession, "f", storage.FileOpenOptions{Read: true, Create: true})
 	second := openFileFor(t, secondSession, "f", storage.FileOpenOptions{Read: true, Write: true})
 	status, err := firstSession.Status(t.Context())
@@ -1091,8 +1091,8 @@ func TestRetainedSessionsShareAdvisoryAuthorityAcrossObjectWrappers(t *testing.T
 }
 
 func TestRetainedControlMethodsKeepIdentityAndKnownLockOutcomes(t *testing.T) {
-	namespace, _ := fileNamespace(t, memory.New(), 4096, nil)
-	session := fileSessionFor(t, namespace, storage.DefaultFileSessionOptions())
+	volume, _ := fileVolume(t, memory.New(), 4096, nil)
+	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	before, err := session.Status(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -1101,14 +1101,14 @@ func TestRetainedControlMethodsKeepIdentityAndKnownLockOutcomes(t *testing.T) {
 	if err != nil || after.Epoch != before.Epoch || after.Revision != before.Revision+1 || after.Remaining <= 0 {
 		t.Fatalf("renew before=%+v after=%+v %v", before, after, err)
 	}
-	if err := namespace.Mkdir(t.Context(), "dir"); err != nil {
+	if err := volume.Mkdir(t.Context(), "dir"); err != nil {
 		t.Fatal(err)
 	}
-	dir, err := namespace.Stat(t.Context(), "dir")
+	dir, err := volume.Stat(t.Context(), "dir")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := namespace.Rename(t.Context(), "dir", "renamed"); err != nil {
+	if err := volume.Rename(t.Context(), "dir", "renamed"); err != nil {
 		t.Fatal(err)
 	}
 	changed, err := session.SetNodeAttr(t.Context(), dir.ID, storage.AttrChange{Mode: newMode(0700)})
@@ -1148,7 +1148,7 @@ func TestRetainedControlMethodsKeepIdentityAndKnownLockOutcomes(t *testing.T) {
 	if _, err := first.WriteAt(t.Context(), 0, []byte("abc")); err != nil {
 		t.Fatal(err)
 	}
-	if used, err := namespace.Usage(t.Context()); err != nil || used != 3 {
+	if used, err := volume.Usage(t.Context()); err != nil || used != 3 {
 		t.Fatalf("usage=%d %v", used, err)
 	}
 }
@@ -1170,8 +1170,8 @@ func (o *uncertainFilePut) Put(ctx context.Context, key string, body []byte) ([]
 func TestRetainedUncertainPutPreservesOldBytesAndQuarantinesStage(t *testing.T) {
 	failure := errors.New("object result lost")
 	objects := &uncertainFilePut{Objects: memory.New(), cause: failure}
-	namespace, meta := fileNamespace(t, objects, 4096, nil)
-	session := fileSessionFor(t, namespace, storage.DefaultFileSessionOptions())
+	volume, meta := fileVolume(t, objects, 4096, nil)
+	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	f := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
 	if _, err := f.WriteAt(t.Context(), 0, []byte("old")); err != nil {
 		t.Fatal(err)
@@ -1185,7 +1185,7 @@ func TestRetainedUncertainPutPreservesOldBytesAndQuarantinesStage(t *testing.T) 
 	if err != nil || status.UnresolvedCount != 1 || status.UnresolvedBytes != 7 || status.ReservedCount != 0 {
 		t.Fatalf("uncertain stage=%+v %v", status, err)
 	}
-	if _, err := namespace.Sweep(t.Context(), 16); err != nil {
+	if _, err := volume.Sweep(t.Context(), 16); err != nil {
 		t.Fatal(err)
 	}
 	status, err = meta.ObjectStatus(t.Context())

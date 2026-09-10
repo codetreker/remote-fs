@@ -18,11 +18,11 @@ type statusReport struct {
 	err  error
 }
 
-func readStatus(ctx context.Context, ns opened) statusReport {
-	line, err := ns.status(ctx)
-	if err == nil && ns.lockStatus != nil {
+func readStatus(ctx context.Context, v opened) statusReport {
+	line, err := v.status(ctx)
+	if err == nil && v.lockStatus != nil {
 		var current locking.Status
-		current, err = ns.lockStatus(ctx)
+		current, err = v.lockStatus(ctx)
 		if err == nil {
 			line += "; " + formatLockStatus(current)
 		}
@@ -30,13 +30,13 @@ func readStatus(ctx context.Context, ns opened) statusReport {
 	return statusReport{line: line, err: err}
 }
 
-func withLockStatus(ns opened, service locking.Service) (opened, error) {
+func withLockStatus(v opened, service locking.Service) (opened, error) {
 	status, ok := service.(locking.StatusService)
 	if !ok {
-		return opened{}, errors.Join(errors.New("file-lock service has no recovery status"), ns.close())
+		return opened{}, errors.Join(errors.New("file-lock service has no recovery status"), v.close())
 	}
-	ns.lockStatus = status.Status
-	return ns, nil
+	v.lockStatus = status.Status
+	return v, nil
 }
 
 func formatLockStatus(status locking.Status) string {
@@ -51,34 +51,34 @@ func formatLockStatus(status locking.Status) string {
 		state, status.Sessions, status.Owners, status.Resources, status.Actions, status.Grants, status.Queued)
 }
 
-func startStatus(ns opened, timeout time.Duration, results chan<- statusReport) (context.CancelFunc, chan struct{}) {
+func startStatus(v opened, timeout time.Duration, results chan<- statusReport) (context.CancelFunc, chan struct{}) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		results <- readStatus(ctx, ns)
+		results <- readStatus(ctx, v)
 	}()
 	return cancel, done
 }
 
-func writeStatus(report statusReport, ns opened, output io.Writer) {
+func writeStatus(report statusReport, v opened, output io.Writer) {
 	if report.err != nil {
-		fmt.Fprintf(output, "remote-fs-server: %s status for %s failed: %v\n", ns.statusName, ns.what, report.err)
+		fmt.Fprintf(output, "remote-fs-server: %s status for %s failed: %v\n", v.statusName, v.what, report.err)
 		return
 	}
-	fmt.Fprintf(output, "remote-fs-server: %s status for %s: %s\n", ns.statusName, ns.what, report.line)
+	fmt.Fprintf(output, "remote-fs-server: %s status for %s: %s\n", v.statusName, v.what, report.line)
 }
 
 func formatLocalStatus(status localstore.Status, options objectstore.Options, maxWaitingOperations int) string {
 	pending := formatPendingStatus(status.Objects, status.ObjectLimits)
 	maintenance := formatMaintenanceStatus(status.Maintenance)
 	return fmt.Sprintf(
-		"workspace %q in store %s: %d of %d workspace bytes used, %d writable; %d physical bytes available; "+
+		"volume %q in store %s: %d of %d volume bytes used, %d writable; %d physical bytes available; "+
 			"%s; SQLite reader-connection limit is %d; snapshot reader-connection limit is %d; "+
 			"integrity record work limit is %d; integrity name-byte work limit is %d; garbage sweeps run every %v with at most %d objects per attempt; "+
 			"%d operations and %d bytes in flight; %d operations waiting under a limit of %d; %d recovery records; "+
 			"SQLite checkpoint has accepted generation %d and checkpointed generation %d; checkpoint pending is %t; %s",
-		status.Workspace,
+		status.Volume,
 		status.LocalDisk.StoreID,
 		status.Space.Used,
 		status.Space.Total,
@@ -104,7 +104,7 @@ func formatLocalStatus(status localstore.Status, options objectstore.Options, ma
 }
 
 func formatObjectStoreStatus(
-	workspace string,
+	volume string,
 	objects sqlite.ObjectStatus,
 	limits sqlite.ObjectLimits,
 	maxReaderConnections int,
@@ -115,9 +115,9 @@ func formatObjectStoreStatus(
 	options objectstore.Options,
 ) string {
 	return fmt.Sprintf(
-		"workspace %q: %s; SQLite reader-connection limit is %d; snapshot reader-connection limit is %d; "+
+		"volume %q: %s; SQLite reader-connection limit is %d; snapshot reader-connection limit is %d; "+
 			"integrity record work limit is %d; integrity name-byte work limit is %d; garbage sweeps run every %v with at most %d objects per attempt; %s",
-		workspace, formatPendingStatus(objects, limits), maxReaderConnections, maxSnapshotReaderConnections,
+		volume, formatPendingStatus(objects, limits), maxReaderConnections, maxSnapshotReaderConnections,
 		maxIntegrityRecords, maxIntegrityBytes,
 		options.SweepInterval,
 		options.SweepBatch,

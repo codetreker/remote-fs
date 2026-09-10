@@ -9,7 +9,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/locked"
 )
 
-func TestSQLiteObjectNamespaceLockContract(t *testing.T) {
+func TestSQLiteObjectVolumeLockContract(t *testing.T) {
 	lockcontract.Run(t, func(t *testing.T, options locking.Options) lockcontract.Fixture {
 		_, backing := memoryfixture.New(t, "contract", 0, options)
 		facade, err := locked.New(backing)

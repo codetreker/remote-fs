@@ -21,12 +21,12 @@ const (
 	completionHeaderBytes = 40
 	completionDigestBytes = sha256.Size
 	completionMinBytes    = completionHeaderBytes + completionDigestBytes
-	completionMaxBytes    = completionMinBytes + MaxWorkspaceBytes
+	completionMaxBytes    = completionMinBytes + MaxVolumeBytes
 )
 
 var completionMagic = [8]byte{'R', 'F', 'S', 'L', 'O', 'C', 'A', 'L'}
 
-func (a *rootAnchor) Completed(id localdisk.ID, workspace string) (bool, error) {
+func (a *rootAnchor) Completed(id localdisk.ID, volumeName string) (bool, error) {
 	if err := a.removeCompletionStage(); err != nil {
 		return false, err
 	}
@@ -63,36 +63,36 @@ func (a *rootAnchor) Completed(id localdisk.ID, workspace string) (bool, error) 
 		filepath.Join(a.path, completionFilename), closeErr)); err != nil {
 		return false, err
 	}
-	if err := validateCompletion(encoded, id, workspace); err != nil {
+	if err := validateCompletion(encoded, id, volumeName); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func encodeCompletion(id localdisk.ID, workspace string) []byte {
-	return encodeBinding(completionMagic, id, workspace)
+func encodeCompletion(id localdisk.ID, volumeName string) []byte {
+	return encodeBinding(completionMagic, id, volumeName)
 }
 
-func encodeBinding(magic [8]byte, id localdisk.ID, workspace string) []byte {
-	encoded := make([]byte, completionMinBytes+len(workspace))
+func encodeBinding(magic [8]byte, id localdisk.ID, volumeName string) []byte {
+	encoded := make([]byte, completionMinBytes+len(volumeName))
 	copy(encoded[:8], magic[:])
 	binary.BigEndian.PutUint16(encoded[8:10], completionVersion)
 	binary.BigEndian.PutUint16(encoded[10:12], completionHeaderBytes)
 	binary.BigEndian.PutUint32(encoded[12:16], uint32(len(encoded)))
-	binary.BigEndian.PutUint32(encoded[16:20], uint32(len(workspace)))
+	binary.BigEndian.PutUint32(encoded[16:20], uint32(len(volumeName)))
 	copy(encoded[24:40], id[:])
-	copy(encoded[completionHeaderBytes:], workspace)
-	digestOffset := completionHeaderBytes + len(workspace)
+	copy(encoded[completionHeaderBytes:], volumeName)
+	digestOffset := completionHeaderBytes + len(volumeName)
 	digest := sha256.Sum256(encoded[:digestOffset])
 	copy(encoded[digestOffset:], digest[:])
 	return encoded
 }
 
-func validateCompletion(encoded []byte, id localdisk.ID, workspace string) error {
-	return validateBinding(encoded, completionMagic, "completion marker", id, workspace)
+func validateCompletion(encoded []byte, id localdisk.ID, volumeName string) error {
+	return validateBinding(encoded, completionMagic, "completion marker", id, volumeName)
 }
 
-func validateBinding(encoded []byte, magic [8]byte, what string, id localdisk.ID, workspace string) error {
+func validateBinding(encoded []byte, magic [8]byte, what string, id localdisk.ID, volumeName string) error {
 	if len(encoded) < completionMinBytes || len(encoded) > completionMaxBytes {
 		return fmt.Errorf("the local store %s has an impossible length: %w", what, syscall.EIO)
 	}
@@ -103,19 +103,19 @@ func validateBinding(encoded []byte, magic [8]byte, what string, id localdisk.ID
 		binary.BigEndian.Uint32(encoded[20:24]) != 0 {
 		return fmt.Errorf("the local store %s has an unknown header: %w", what, syscall.EIO)
 	}
-	workspaceBytes := int(binary.BigEndian.Uint32(encoded[16:20]))
-	if workspaceBytes > MaxWorkspaceBytes || len(encoded) != completionMinBytes+workspaceBytes {
-		return fmt.Errorf("the local store %s has an invalid workspace length: %w", what, syscall.EIO)
+	volumeBytes := int(binary.BigEndian.Uint32(encoded[16:20]))
+	if volumeBytes > MaxVolumeBytes || len(encoded) != completionMinBytes+volumeBytes {
+		return fmt.Errorf("the local store %s has an invalid volume length: %w", what, syscall.EIO)
 	}
 	if string(encoded[24:40]) != string(id[:]) {
 		return fmt.Errorf("the local store %s belongs to another object store: %w", what, syscall.EIO)
 	}
-	storedWorkspace := string(encoded[completionHeaderBytes : completionHeaderBytes+workspaceBytes])
-	if storedWorkspace != workspace {
-		return fmt.Errorf("the local store %s binds workspace %q, not %q: %w",
-			what, storedWorkspace, workspace, syscall.EIO)
+	storedVolume := string(encoded[completionHeaderBytes : completionHeaderBytes+volumeBytes])
+	if storedVolume != volumeName {
+		return fmt.Errorf("the local store %s binds volume %q, not %q: %w",
+			what, storedVolume, volumeName, syscall.EIO)
 	}
-	digestOffset := completionHeaderBytes + workspaceBytes
+	digestOffset := completionHeaderBytes + volumeBytes
 	digest := sha256.Sum256(encoded[:digestOffset])
 	if string(encoded[digestOffset:]) != string(digest[:]) {
 		return fmt.Errorf("the local store %s checksum does not match its contents: %w", what, syscall.EIO)
@@ -155,7 +155,7 @@ func (a *rootAnchor) removeCompletionStage() error {
 	return nil
 }
 
-func (a *rootAnchor) PublishCompletion(id localdisk.ID, workspace string) error {
+func (a *rootAnchor) PublishCompletion(id localdisk.ID, volumeName string) error {
 	if err := a.removeCompletionStage(); err != nil {
 		return err
 	}
@@ -165,7 +165,7 @@ func (a *rootAnchor) PublishCompletion(id localdisk.ID, workspace string) error 
 	if err != nil {
 		return &os.PathError{Op: "create local store completion marker", Path: stagePath, Err: err}
 	}
-	encoded := encodeCompletion(id, workspace)
+	encoded := encodeCompletion(id, volumeName)
 	writeErr := unix.Fchmod(fd, 0o600)
 	if writeErr == nil {
 		writeErr = writeFull(fd, encoded)

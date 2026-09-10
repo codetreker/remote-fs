@@ -28,7 +28,7 @@ const reconnectDelay = 250 * time.Millisecond
 func (s *Storage) build(ctx context.Context) (*httprest.Subscription, error) {
 	sub, err := s.remote.Subscribe(s.lifetime)
 	if err != nil {
-		return nil, fmt.Errorf("watching the namespace for changes: %w", err)
+		return nil, fmt.Errorf("watching the volume for changes: %w", err)
 	}
 	if err := s.fill(ctx, sub); err != nil {
 		sub.Close()
@@ -54,7 +54,7 @@ func (s *Storage) build(ctx context.Context) (*httprest.Subscription, error) {
 func (s *Storage) fill(ctx context.Context, sub *httprest.Subscription) error {
 	snap, err := s.remote.Snapshot(ctx)
 	if err != nil {
-		return fmt.Errorf("taking a picture of the namespace's tree: %w", err)
+		return fmt.Errorf("taking a picture of the volume's tree: %w", err)
 	}
 	defer snap.Close()
 
@@ -70,7 +70,7 @@ func (s *Storage) fill(ctx context.Context, sub *httprest.Subscription) error {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("reading the picture of the namespace's tree: %w", err)
+			return fmt.Errorf("reading the picture of the volume's tree: %w", err)
 		}
 		if err := seeding.Add(ctx, rows); err != nil {
 			return fmt.Errorf("putting the picture into the local copy: %w", err)
@@ -251,7 +251,7 @@ func (s *Storage) watching() (metastore.Incarnation, metastore.Position) {
 // usable reports why an operation cannot be performed, and nil when it can.
 //
 // The reason travels as text rather than in the error chain, so that nothing an operation
-// against the namespace is asked about can come back carrying an errno that belongs to the
+// against the volume is asked about can come back carrying an errno that belongs to the
 // stream: EIO is what "this copy may not be believed" means to a caller, and it is the only
 // errno here.
 func (s *Storage) usable(op, path string) *os.PathError {
@@ -265,7 +265,7 @@ func (s *Storage) usable(op, path string) *os.PathError {
 		return nil
 	}
 	return &os.PathError{Op: op, Path: path, Err: fmt.Errorf(
-		"the copy of this namespace is not being kept current, so nothing about it can be answered: %s: %w",
+		"the copy of this volume is not being kept current, so nothing about it can be answered: %s: %w",
 		s.failure, syscall.EIO)}
 }
 
@@ -311,7 +311,7 @@ func (s *Storage) expect(ctx context.Context, op, path string) (*confirmation, e
 			failure := s.failure
 			s.mu.Unlock()
 			return nil, &os.PathError{Op: op, Path: path, Err: fmt.Errorf(
-				"the copy of this namespace is not being kept current, so the mutation cannot be confirmed: %s: %w",
+				"the copy of this volume is not being kept current, so the mutation cannot be confirmed: %s: %w",
 				failure, syscall.EIO)}
 		}
 		if s.activeConfirmations < s.options.MaxActiveConfirmations {

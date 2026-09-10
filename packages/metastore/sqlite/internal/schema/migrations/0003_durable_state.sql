@@ -24,7 +24,7 @@ CREATE TABLE database_state (
 
 -- The leading expression exposes invalid storage classes without returning their values;
 -- the second expression provides the largest valid identity as a bounded index lookup.
-CREATE INDEX namespaces_by_root_identity ON namespaces (
+CREATE INDEX volumes_by_root_identity ON volumes (
 	CASE WHEN typeof(root) = 'integer' THEN 0 ELSE 1 END,
 	root
 );
@@ -50,7 +50,7 @@ SELECT
 	max(
 		coalesce((SELECT max(seq) FROM sqlite_sequence WHERE name = 'nodes'), 0),
 		coalesce((SELECT max(id) FROM nodes), 0),
-		coalesce((SELECT max(root) FROM namespaces), 0),
+		coalesce((SELECT max(root) FROM volumes), 0),
 		coalesce((SELECT max(parent) FROM entries), 0),
 		coalesce((SELECT max(node) FROM entries), 0),
 		coalesce((SELECT max(parent) FROM changes), 0),
@@ -72,7 +72,7 @@ ALTER TABLE changes RENAME TO changes_v2;
 CREATE TABLE changes (
 	position          INTEGER PRIMARY KEY AUTOINCREMENT,
 	previous_position INTEGER NOT NULL,
-	namespace         INTEGER NOT NULL REFERENCES namespaces(id),
+	volume         INTEGER NOT NULL REFERENCES volumes(id),
 	kind              INTEGER NOT NULL,
 	parent            INTEGER NOT NULL,
 	name              BLOB,
@@ -92,7 +92,7 @@ CREATE TABLE changes (
 
 DROP TABLE changes_v2;
 
-CREATE INDEX changes_by_namespace ON changes (namespace, position);
+CREATE INDEX changes_by_volume ON changes (volume, position);
 CREATE INDEX changes_by_node_identity ON changes (
 	CASE
 		WHEN typeof(parent) = 'integer'

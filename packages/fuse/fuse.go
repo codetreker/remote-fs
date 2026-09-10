@@ -1,4 +1,4 @@
-// Package fuse presents a remote namespace as a Linux filesystem. Named tree
+// Package fuse presents a remote volume as a Linux filesystem. Named tree
 // operations use storage.Storage; open descriptors retain storage.File objects
 // through rename and unlink. Reads capture current contents, and writes complete
 // at the authority before the kernel receives success.
@@ -73,7 +73,7 @@ func (o Options) flushTimeout() (time.Duration, error) {
 // Mount owns one kernel connection and its dedicated file session.
 type Mount struct {
 	server interface{ Unmount() error }
-	ns     *namespace
+	volume *volume
 	done   chan struct{}
 	err    error
 }
@@ -103,27 +103,27 @@ func New(mountpoint string, s storage.Storage, opts Options) (*Mount, error) {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
-	ns, err := newNamespace(context.Background(), s, opts, logger)
+	v, err := newVolume(context.Background(), s, opts, logger)
 	if err != nil {
 		return nil, err
 	}
-	ns.owner = gofuse.Owner{Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid())}
-	ask, cancel := context.WithTimeout(context.Background(), ns.flushTimeout)
+	v.owner = gofuse.Owner{Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid())}
+	ask, cancel := context.WithTimeout(context.Background(), v.flushTimeout)
 	attr, err := s.Stat(ask, "")
 	cancel()
 	if err == nil && (attr.ID == 0 || !attr.Mode.IsDir()) {
 		err = syscall.EIO
 	}
 	if err != nil {
-		return nil, errors.Join(err, ns.stopSession())
+		return nil, errors.Join(err, v.stopSession())
 	}
-	root := &node{ns: ns, id: rootIdentity(attr.ID)}
+	root := &node{volume: v, id: rootIdentity(attr.ID)}
 	never := time.Duration(0)
 	options := &fs.Options{
 		EntryTimeout: &never, AttrTimeout: &never, NegativeTimeout: &never,
 		Logger:         logger,
 		RootStableAttr: &fs.StableAttr{Mode: syscall.S_IFDIR, Ino: root.id.ino},
-		// Zero permission bits are an actual namespace mode, not an omitted default.
+		// Zero permission bits are a valid file mode, not an omitted default.
 		NullPermissions: true,
 		MountOptions: gofuse.MountOptions{
 			FsName: "remote-fs", Name: "remote-fs", Logger: logger, Debug: opts.Debug,
@@ -131,15 +131,15 @@ func New(mountpoint string, s storage.Storage, opts Options) (*Mount, error) {
 			DisableXAttrs:     true, EnableLocks: true,
 		},
 	}
-	raw := newRawFilesystem(fs.NewNodeFS(root, options), ns)
+	raw := newRawFilesystem(fs.NewNodeFS(root, options), v)
 	server, err := gofuse.NewServer(raw, mountpoint, &options.MountOptions)
 	if err != nil {
-		return nil, errors.Join(err, ns.stopSession())
+		return nil, errors.Join(err, v.stopSession())
 	}
-	m := &Mount{server: server, ns: ns, done: make(chan struct{})}
+	m := &Mount{server: server, volume: v, done: make(chan struct{})}
 	go func() {
 		server.Serve()
-		m.err = ns.stopSession()
+		m.err = v.stopSession()
 		close(m.done)
 	}()
 	return m.ready(server.WaitMount())

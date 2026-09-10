@@ -142,7 +142,7 @@ func TestSnapshotPoolDoesNotBlockGeneralReaderPool(t *testing.T) {
 // a served database has no sqlite_stat1 at all, so the unanalysed plan is the one that ships,
 // while a database somebody has analysed by hand is one this store must still serve well. The
 // two are not the same planner. Measured against modernc.org/sqlite v1.57.0, filtering the
-// namespace on the joined node instead of on the entry gives `SCAN n` with a sort without
+// volume on the joined node instead of on the entry gives `SCAN n` with a sort without
 // statistics and a skip-scan of the entry key with a sort with them — one query, one tree, two
 // plans. Asserting only the analysed one would leave the shipped planner unguarded, and it was
 // the statistics-dependence of the alternatives that decided this key in the first place.
@@ -150,9 +150,9 @@ func TestAPictureIsPagedByRangeRatherThanByScanningAndSorting(t *testing.T) {
 	path := snapshotPlanDatabase(t)
 	store := snapshotPlanOpen(t, path, "workspace", 0)
 
-	// A second namespace in the same database, so the plan is chosen against a table that holds
-	// more than one namespace's entries. That is the arrangement the entry table's key exists
-	// for, and a database holding one namespace would not put the question.
+	// A second volume in the same database, so the plan is chosen against a table that holds
+	// more than one volume's entries. That is the arrangement the entry table's key exists
+	// for, and a database holding one volume would not put the question.
 	other := snapshotPlanOpen(t, path, "elsewhere", 0)
 	for i := range 50 {
 		if err := other.Create(t.Context(), fmt.Sprintf("theirs%d", i)); err != nil {
@@ -189,7 +189,7 @@ func TestAPictureIsPagedByRangeRatherThanByScanningAndSorting(t *testing.T) {
 // Several cursor positions rather than one, because the plan for a statement is not always the
 // plan for a whole picture. modernc.org/sqlite v1.57.0 is built with SQLITE_ENABLE_STAT4, so
 // on an analysed database SQLite plans from the bound values and re-plans when they move far
-// enough. The statement this one replaced did exactly that: over twenty namespaces of fifty
+// enough. The statement this one replaced did exactly that: over twenty volumes of fifty
 // thousand entries it planned the per-page sort near the start of the cursor and switched to
 // driving from the entry key partway along, so a plan read at one position was not the plan
 // that picture ran under. This statement gave one plan at every position tried. That is what
@@ -227,10 +227,10 @@ func assertPagePlanAt(t *testing.T, db *sql.DB, cursor int64) {
 	}
 	whole := strings.Join(plan, "; ")
 
-	// The entry table is sought into by its primary key, using both the namespace and the
+	// The entry table is sought into by its primary key, using both the volume and the
 	// cursor. Either one missing from the range is a page that reads rows it will throw away.
-	if !strings.Contains(whole, "SEARCH e USING PRIMARY KEY (namespace=? AND (parent,name)>(?,?))") {
-		t.Fatalf("at cursor %d a page does not seek the entry table by namespace and cursor together; the plan is: %s",
+	if !strings.Contains(whole, "SEARCH e USING PRIMARY KEY (volume=? AND (parent,name)>(?,?))") {
+		t.Fatalf("at cursor %d a page does not seek the entry table by volume and cursor together; the plan is: %s",
 			cursor, whole)
 	}
 	for _, refused := range []string{"SCAN", "TEMP B-TREE"} {
@@ -246,11 +246,11 @@ func snapshotPlanDatabase(t *testing.T) string {
 	return filepath.Join(t.TempDir(), "metastore.db")
 }
 
-func snapshotPlanOpen(t *testing.T, path, namespace string, allowance int64) *Store {
+func snapshotPlanOpen(t *testing.T, path, volume string, allowance int64) *Store {
 	t.Helper()
-	store, err := Open(t.Context(), path, namespace, allowance, DefaultWindow())
+	store, err := Open(t.Context(), path, volume, allowance, DefaultWindow())
 	if err != nil {
-		t.Fatalf("opening %q in %s: %v", namespace, path, err)
+		t.Fatalf("opening %q in %s: %v", volume, path, err)
 	}
 	t.Cleanup(func() {
 		if err := store.Close(); err != nil {

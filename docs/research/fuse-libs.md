@@ -6,7 +6,7 @@ Date: 2026-08-18
 ## Task context
 
 We are building a Go **library** (importable by third parties) + reference daemon that mounts a
-remote namespace as a FUSE filesystem on Linux. Server is ours, persistent connection, server
+remote volume as a FUSE filesystem on Linux. Server is ours, persistent connection, server
 pushes change events -> client MUST actively invalidate kernel caches. Semantics: cloud-drive,
 commit-on-close, weak concurrency, no atomic rename / hardlink / coherent shared mmap.
 
@@ -592,7 +592,7 @@ lock-free read of it can be stale by the time you act.
 https://github.com/hanwen/go-fuse/issues/504
 **Rule for us: never recycle inode numbers.** Allocate from a 64-bit monotonic counter (or hash a
 stable server-side object ID). Inode-number collision is the classic way to get ESTALE / wrong-file
-reads in a multi-client namespace; gcsfuse has the same class of bug open right now
+reads in a multi-client volume; gcsfuse has the same class of bug open right now
 (GoogleCloudPlatform/gcsfuse#4813, "promoteToGenerationBacked collision bug causing ESTALE errors").
 
 **G3. SIGURG makes every Go program on our mount look like it is pressing Ctrl-C.**
@@ -795,7 +795,7 @@ handle (G6). Never recycle inode numbers (G2). Do not store paths in nodes (G1).
   to persist before honouring it.
 - Whether `FUSE_WRITEBACK_CACHE` is actually right for commit-on-close, or whether we want the
   simpler unbuffered-write path. Writeback caching changes O_APPEND and mtime ownership semantics
-  (the kernel takes over both), which interacts with a multi-client namespace.
+  (the kernel takes over both), which interacts with a multi-client volume.
 - Whether to adopt the `/dev/fd/N` supervisor pattern for restart-without-unmount from day one.
   It shapes the daemon's process model, so decide early even if implemented later.
 
@@ -1006,7 +1006,7 @@ does let us do the first part per open: `NodeOpener.Open` returns `fuseFlags`, a
 them verbatim (`out.OpenFlags = flags`), so `fuse.FOPEN_KEEP_CACHE` is ours to set per open:
 https://github.com/hanwen/go-fuse/blob/423b377e1452ab7b3522229185a3047f72e3f966/fs/bridge.go#L745-L768
 
-**But something else drops those pages, and it fires constantly in a multi-client namespace.**
+**But something else drops those pages, and it fires constantly in a multi-client volume.**
 `fuse_change_attributes` runs on *every* attribute we return — from GETATTR replies and from LOOKUP
 replies:
 

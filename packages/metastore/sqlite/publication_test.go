@@ -21,7 +21,7 @@ import (
 
 func TestRawStoreRejectsEnableLocks(t *testing.T) {
 	config := lockingTestConfig(t)
-	store, err := OpenWithOptions(t.Context(), config.Database, config.Namespace, 0, DefaultOptions())
+	store, err := OpenWithOptions(t.Context(), config.Database, config.Volume, 0, DefaultOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,14 +135,14 @@ func TestSQLitePublicationDurabilityFailureFencesBothAuthorities(t *testing.T) {
 	}
 	status, err := f.store.locks.Status(t.Context())
 	if err != nil || !status.Unavailable {
-		t.Fatalf("authority accepted an unconfirmed namespace: %+v, %v", status, err)
+		t.Fatalf("authority accepted an unconfirmed volume: %+v, %v", status, err)
 	}
 	if _, err := f.store.Stat(t.Context(), "file"); storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, witnessFailure) {
-		t.Fatalf("namespace read after unconfirmed durability = %v", err)
+		t.Fatalf("volume read after unconfirmed durability = %v", err)
 	}
 	var size int64
 	if err := f.store.read.QueryRowContext(t.Context(),
-		`SELECT size FROM nodes WHERE namespace = ? AND content = ?`, f.store.namespace, string(object.Key)).Scan(&size); err != nil {
+		`SELECT size FROM nodes WHERE volume = ? AND content = ?`, f.store.volume, string(object.Key)).Scan(&size); err != nil {
 		t.Fatal(err)
 	}
 	if size != object.Size {
@@ -166,7 +166,7 @@ func TestSQLitePublicationFenceDoesNotRetainClosedPoolBookkeeping(t *testing.T) 
 				closeStore = fixture.store.Abort
 			}
 			if err := closeStore(); !errors.Is(err, fence) {
-				t.Fatalf("closing a fenced namespace returned %v, want original fence", err)
+				t.Fatalf("closing a fenced volume returned %v, want original fence", err)
 			}
 			databaseCoordinators.Lock()
 			retained := databaseCoordinators.byPath[fixture.store.coordinator.key]
@@ -389,7 +389,7 @@ func TestSQLitePublicationRejectsAnonymousMutationOfGrantedFiles(t *testing.T) {
 					t.Fatal(err)
 				}
 				if !reflect.DeepEqual(before, pristine) {
-					t.Fatal("previous rejection changed the shared namespace fixture")
+					t.Fatal("previous rejection changed the shared volume fixture")
 				}
 				space, err := f.store.Space(t.Context())
 				if err != nil {
@@ -426,7 +426,7 @@ func TestSQLitePublicationRejectsAnonymousMutationOfGrantedFiles(t *testing.T) {
 					t.Fatal(err)
 				}
 				if !reflect.DeepEqual(before, after) {
-					t.Fatal("rejected publication changed the namespace")
+					t.Fatal("rejected publication changed the volume")
 				}
 				afterSpace, err := f.store.Space(t.Context())
 				if err != nil || afterSpace != space {
@@ -610,7 +610,7 @@ func TestSQLitePublicationRenameRequiresBothTargetsAndRetiresOnlyTheDisplacedFil
 		err := f.store.Rename(publicationScope(t.Context(), owner, grant), "source", "destination")
 		requirePublicationCode(t, err, locking.Conflict)
 		if f.node(t, "source") != source || f.node(t, "destination") != destination {
-			t.Fatal("rename with a missing target proof changed the namespace")
+			t.Fatal("rename with a missing target proof changed the volume")
 		}
 	}
 	if err := f.store.Rename(publicationScope(t.Context(), owner, sourceGrant, destinationGrant), "source", "destination"); err != nil {
@@ -736,7 +736,7 @@ func TestSQLiteStagedCommitChecksTheActualPublicationTarget(t *testing.T) {
 	}
 }
 
-func TestSQLitePublicationSettlementFailureFencesNamespaceAndAuthority(t *testing.T) {
+func TestSQLitePublicationSettlementFailureFencesVolumeAndAuthority(t *testing.T) {
 	f := newPublicationFixture(t)
 	f.put(t, t.Context(), "file", 3)
 	object := f.stage(t, t.Context(), "file", 7)
@@ -772,11 +772,11 @@ func TestSQLitePublicationSettlementFailureFencesNamespaceAndAuthority(t *testin
 	}
 	_, err = f.store.Stat(t.Context(), "file")
 	if storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, cause) {
-		t.Fatalf("fenced namespace read = %v, want EIO retaining settlement failure", err)
+		t.Fatalf("fenced volume read = %v, want EIO retaining settlement failure", err)
 	}
 	err = f.store.Remove(t.Context(), "file")
 	if storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, cause) {
-		t.Fatalf("fenced namespace mutation = %v, want EIO retaining settlement failure", err)
+		t.Fatalf("fenced volume mutation = %v, want EIO retaining settlement failure", err)
 	}
 }
 

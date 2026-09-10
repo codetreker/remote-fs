@@ -63,7 +63,7 @@ func TestExpiredStagedShrinkRetainsBytesAndQuota(t *testing.T) {
 	options := locking.DefaultOptions()
 	options.Clock = clock
 	meta, err := sqlite.OpenLocking(ctx, sqlite.LockingConfig{
-		Database: filepath.Join(t.TempDir(), "namespace.db"), Namespace: "limited",
+		Database: filepath.Join(t.TempDir(), "volume.db"), Volume: "limited",
 		Allowance: 0, SQLite: sqlite.DefaultOptions(), Locks: options, Initialize: true,
 	})
 	if err != nil {
@@ -76,7 +76,7 @@ func TestExpiredStagedShrinkRetainsBytesAndQuota(t *testing.T) {
 	backing := objectstore.New(objects, meta)
 	t.Cleanup(func() {
 		if err := backing.Close(); err != nil {
-			t.Errorf("closing namespace: %v", err)
+			t.Errorf("closing volume: %v", err)
 		}
 	})
 	// A zero metadata allowance leaves the outer decorator responsible for every charge.
@@ -87,7 +87,7 @@ func TestExpiredStagedShrinkRetainsBytesAndQuota(t *testing.T) {
 	}
 	service := backing.LockService()
 	if service == nil {
-		t.Fatal("the namespace has no native lock service")
+		t.Fatal("the volume has no native lock service")
 	}
 	ticket, err := service.BeginEnrollment(ctx)
 	if err != nil {

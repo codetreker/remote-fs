@@ -192,7 +192,7 @@ func (f *frameWriter) fault(cause error) {
 // It is a server-sent event comment — a line beginning with a colon, which carries no event
 // and is discarded by whatever reads it — and it exists because a stream nobody is writing
 // to and a stream whose connection is gone are the same observation on this side of it:
-// silence. Without it the far side has nothing to distinguish "this namespace is quiet"
+// silence. Without it the far side has nothing to distinguish "this volume is quiet"
 // from "these bytes stopped arriving twenty minutes ago", and a replica fed by that stream
 // would go on answering from a copy it can no longer justify (R-ERR-1, R-ERR-2).
 //

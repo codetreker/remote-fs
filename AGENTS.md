@@ -4,7 +4,7 @@ Instructions for coding agents working in this repository.
 
 ## What this is
 
-`github.com/codetreker/remote-fs` — a Go library that exposes a remote namespace
+`github.com/codetreker/remote-fs` — a Go library that exposes a remote volume
 as a local filesystem, plus a reference server, daemon, and CLI built on it.
 
 **Read `docs/spec/` before doing anything.** It defines what the system is for

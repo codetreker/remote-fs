@@ -14,7 +14,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 )
 
-// A namespace reaches its object store only through objectstore.Objects, so every way that
+// A volume reaches its object store only through objectstore.Objects, so every way that
 // half can fail arrives as an error from one of three methods. These cases inject those
 // errors instead of provoking them.
 //
@@ -22,7 +22,7 @@ import (
 // the azblob package's own cases already prove — that a real failure is classified as a
 // failure — and it leaves this package's own obligation checked against the single error a
 // refused connection happens to carry. R-ERR-6 is not about that error. It is about every
-// error: whatever the object store reports, the namespace above it must answer for the part
+// error: whatever the object store reports, the volume above it must answer for the part
 // that failed rather than with a fact about names. Injection is what sends the whole
 // vocabulary through, including the failures that carry no errno at all and the ones no
 // address could produce.
@@ -30,7 +30,7 @@ import (
 // failingObjects answers one method with a given error and passes the rest to the store
 // underneath. Passing the rest through is what keeps a case honest: the object being read
 // was written by a real Put, so the tree names a key that genuinely exists and the injected
-// error is the only thing wrong with the namespace.
+// error is the only thing wrong with the volume.
 type failingObjects struct {
 	objectstore.Objects
 	onGet, onPut error
@@ -75,7 +75,7 @@ func (f *failingObjects) failDeletes(err error) {
 }
 
 // Close is deliberately a no-op: this wrapper borrows p's object store just as the
-// namespace returned by failing borrows p's metastore. Closing either from a failure case
+// volume returned by failing borrows p's metastore. Closing either from a failure case
 // would invalidate the fixture whose cleanup owns them.
 func (f *failingObjects) Close() error { return nil }
 
@@ -83,24 +83,24 @@ type borrowedStore struct{ metastore.Store }
 
 func (borrowedStore) Close() error { return nil }
 
-// failing returns a namespace over the same tree and the same objects as p, reached through
-// a wrapper a case switches into failing once the namespace holds what the case needs.
+// failing returns a volume over the same tree and the same objects as p, reached through
+// a wrapper a case switches into failing once the volume holds what the case needs.
 // Nothing fails while the fixture is being built, so a case exercises only the failure it
 // named.
 //
 // The tree and objects are shared with p rather than opened a second time. Their wrappers
-// make Close release only this namespace's maintenance worker; p's cleanup retains ownership
+// make Close release only this volume's maintenance worker; p's cleanup retains ownership
 // of the durable halves.
 func (p parts) failing(t *testing.T) (*objectstore.Storage, *failingObjects) {
 	t.Helper()
 	objects := &failingObjects{Objects: p.objects}
-	namespace := objectstore.New(objects, borrowedStore{Store: p.meta})
+	volume := objectstore.New(objects, borrowedStore{Store: p.meta})
 	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
-			t.Errorf("closing the borrowed failing namespace: %v", err)
+		if err := volume.Close(); err != nil {
+			t.Errorf("closing the borrowed failing volume: %v", err)
 		}
 	})
-	return namespace, objects
+	return volume, objects
 }
 
 // objectFailures are answers an Objects can give that are not "the object is not there".
@@ -151,14 +151,14 @@ func TestReadingThroughAFailingObjectStoreReportsTheFailure(t *testing.T) {
 	for _, failure := range objectFailures {
 		t.Run(failure.name, func(t *testing.T) {
 			p := newParts(t, 0)
-			namespace, objects := p.failing(t)
+			volume, objects := p.failing(t)
 			ctx := t.Context()
-			if err := namespace.Write(ctx, "f", []byte("content")); err != nil {
+			if err := volume.Write(ctx, "f", []byte("content")); err != nil {
 				t.Fatalf("write: %v", err)
 			}
 
 			objects.onGet = failure.err
-			content, err := namespace.Read(ctx, "f")
+			content, err := volume.Read(ctx, "f")
 			if err == nil {
 				t.Fatalf("read answered %q through an object store that refused it", content)
 			}
@@ -166,14 +166,14 @@ func TestReadingThroughAFailingObjectStoreReportsTheFailure(t *testing.T) {
 
 			// The tree is the half that still answers, and nothing about the failure has been
 			// written back into it: the file is there and still says how long it is.
-			if attr, err := namespace.Stat(ctx, "f"); err != nil || attr.Size == 0 {
+			if attr, err := volume.Stat(ctx, "f"); err != nil || attr.Size == 0 {
 				t.Fatalf("after the object store refused a read the file stats as %+v (%v), want it unchanged", attr, err)
 			}
 		})
 	}
 }
 
-func TestReadingDoesNotTurnObjectKeyFailuresIntoNamespaceFacts(t *testing.T) {
+func TestReadingDoesNotTurnObjectKeyFailuresIntoVolumeFacts(t *testing.T) {
 	independent := errors.New("the object service also failed independently")
 	for _, test := range []struct {
 		name     string
@@ -193,13 +193,13 @@ func TestReadingDoesNotTurnObjectKeyFailuresIntoNamespaceFacts(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			p := newParts(t, 0)
-			namespace, objects := p.failing(t)
-			if err := namespace.Write(t.Context(), "f", []byte("content")); err != nil {
+			volume, objects := p.failing(t)
+			if err := volume.Write(t.Context(), "f", []byte("content")); err != nil {
 				t.Fatalf("writing the fixture: %v", err)
 			}
 			objects.onGet = test.failure
 
-			_, err := namespace.Read(t.Context(), "f")
+			_, err := volume.Read(t.Context(), "f")
 			if !errors.Is(err, syscall.EIO) {
 				t.Fatalf("Read returned %v, want EIO", err)
 			}
@@ -208,7 +208,7 @@ func TestReadingDoesNotTurnObjectKeyFailuresIntoNamespaceFacts(t *testing.T) {
 			}
 			for _, errno := range factsAboutNames {
 				if errors.Is(err, errno) {
-					t.Fatalf("object-key failure arrived as namespace fact %v: %v", errno, err)
+					t.Fatalf("object-key failure arrived as volume fact %v: %v", errno, err)
 				}
 			}
 			if got := storage.ErrnoNameOf(err); got != "EIO" {
@@ -226,16 +226,16 @@ func TestAWriteWhoseBytesNeverLandedLeavesNothingBehind(t *testing.T) {
 	for _, failure := range objectFailures {
 		t.Run(failure.name, func(t *testing.T) {
 			p := newParts(t, allowance)
-			namespace, objects := p.failing(t)
+			volume, objects := p.failing(t)
 			ctx := t.Context()
 
 			objects.onPut = failure.err
-			requireReported(t, namespace.Write(ctx, "f", []byte("bytes that never arrive")), failure.err)
+			requireReported(t, volume.Write(ctx, "f", []byte("bytes that never arrive")), failure.err)
 
-			if _, err := namespace.Stat(ctx, "f"); !errors.Is(err, syscall.ENOENT) {
+			if _, err := volume.Stat(ctx, "f"); !errors.Is(err, syscall.ENOENT) {
 				t.Fatalf("after a write whose bytes never landed the file is %v, want ENOENT", err)
 			}
-			space, err := namespace.Space(ctx)
+			space, err := volume.Space(ctx)
 			if err != nil {
 				t.Fatalf("space: %v", err)
 			}
@@ -253,7 +253,7 @@ func TestASweepThatCannotDeleteForgetsNothing(t *testing.T) {
 	for _, failure := range objectFailures {
 		t.Run(failure.name, func(t *testing.T) {
 			p := newParts(t, 0)
-			namespace, objects := p.failing(t)
+			volume, objects := p.failing(t)
 			ctx := t.Context()
 
 			const files = 3
@@ -270,7 +270,7 @@ func TestASweepThatCannotDeleteForgetsNothing(t *testing.T) {
 			}
 
 			objects.failDeletes(failure.err)
-			removed, err := namespace.Sweep(ctx, 100)
+			removed, err := volume.Sweep(ctx, 100)
 			requireReported(t, err, failure.err)
 			if removed != 0 {
 				t.Errorf("a sweep whose deletes all failed reported %d objects removed", removed)
@@ -279,7 +279,7 @@ func TestASweepThatCannotDeleteForgetsNothing(t *testing.T) {
 			// Nothing was forgotten while its bytes were still being paid for: with the store
 			// answering again, the same backlog is still there to be cleared.
 			objects.failDeletes(nil)
-			if removed, err = namespace.Sweep(ctx, 100); err != nil || removed != files {
+			if removed, err = volume.Sweep(ctx, 100); err != nil || removed != files {
 				t.Fatalf("the sweep after the store recovered removed %d objects (%v), want %d", removed, err, files)
 			}
 		})
@@ -291,26 +291,26 @@ func TestASweepThatCannotDeleteForgetsNothing(t *testing.T) {
 // being paid for, which the record that named them offers up again on the next sweep.
 func TestAMutationSurvivesASweepItCouldNotFinish(t *testing.T) {
 	p := newParts(t, 0)
-	namespace, objects := p.failing(t)
+	volume, objects := p.failing(t)
 	ctx := t.Context()
 
-	if err := namespace.Write(ctx, "f", []byte("the first contents")); err != nil {
+	if err := volume.Write(ctx, "f", []byte("the first contents")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	objects.failDeletes(errors.New("the object store is not answering deletes"))
-	if err := namespace.Write(ctx, "f", []byte("the second contents")); err != nil {
+	if err := volume.Write(ctx, "f", []byte("the second contents")); err != nil {
 		t.Fatalf("a write failed because the object it displaced could not be deleted: %v", err)
 	}
 	// The sweep a mutation triggers reports nothing, so without this the case reads the same
 	// whether it exercised a failing sweep or no sweep at all, and a write that stopped
 	// sweeping would pass it.
 	await(t, "the mutation-triggered failing sweep", func() bool { return objects.refusedDeletes.Load() > 0 })
-	if content, err := namespace.Read(ctx, "f"); err != nil || string(content) != "the second contents" {
+	if content, err := volume.Read(ctx, "f"); err != nil || string(content) != "the second contents" {
 		t.Fatalf("the file reads as %q (%v), want the contents the write stored", content, err)
 	}
 
 	objects.failDeletes(nil)
-	if removed, err := namespace.Sweep(ctx, 100); err != nil || removed != 1 {
+	if removed, err := volume.Sweep(ctx, 100); err != nil || removed != 1 {
 		t.Fatalf("the sweep after the store recovered removed %d objects (%v), want the one the write displaced", removed, err)
 	}
 }

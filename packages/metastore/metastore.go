@@ -1,4 +1,4 @@
-// Package metastore defines the contract for the part of a namespace that is not bytes:
+// Package metastore defines the contract for the part of a volume that is not bytes:
 // the tree of names, what kind of node each name holds, the attributes it carries, and —
 // for a file — which stored object holds its contents.
 //
@@ -12,9 +12,9 @@
 // cheaply) and what a database is good at (answering questions about a tree, and changing
 // several rows or none).
 //
-// One Store is one namespace. A database may hold many, and an implementation is free to
-// separate them however it likes; nothing above this interface names a namespace, because
-// one namespace is one workspace and the storage contract carries no workspace parameter.
+// One Store is one volume. A database may hold many, and an implementation is free to
+// separate them however it likes. The storage contract carries no volume parameter;
+// callers select a volume by selecting its Store.
 //
 // The interface is deliberately not a way to run SQL. Every operation here is a complete
 // tree operation with a defined outcome, so that an implementation may make it atomic by
@@ -31,7 +31,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// Store is the tree of one namespace.
+// Store is the tree of one volume.
 //
 // Paths arrive here already cleaned by storage.CleanPath: slash-separated, no leading
 // slash, the root is the empty string. An implementation does not re-derive that.
@@ -75,7 +75,7 @@ type Store interface {
 
 	// Remove removes the file's name. Removing a directory is syscall.EISDIR.
 	// A retained File keeps its node, current object and quota until last close;
-	// otherwise the object becomes garbage and its bytes leave namespace usage.
+	// otherwise the object becomes garbage and its bytes leave volume usage.
 	Remove(ctx context.Context, path string) error
 
 	// RemoveDir removes the empty directory at path. A file is syscall.ENOTDIR, a directory
@@ -84,7 +84,7 @@ type Store interface {
 
 	// Rename moves the node at from to to, replacing an existing file there. Naming the root
 	// as either operand is syscall.EBUSY. A retained displaced file survives through its
-	// references; otherwise its object becomes garbage and its bytes leave namespace usage.
+	// references; otherwise its object becomes garbage and its bytes leave volume usage.
 	//
 	// Renaming a directory moves everything beneath it and must not cost more than moving
 	// the directory itself. That is a property of the shape the tree is stored in, not of
@@ -105,7 +105,7 @@ type Store interface {
 	// Knowing the write it is for, a reservation refuses what the commit would refuse
 	// anyway: a path whose parent directory is not there, a path holding a directory, and a
 	// size the allowance has no room for. Those refusals are not the authority — Commit is,
-	// because the namespace may change between the two — but making them here is what keeps
+	// because the volume may change between the two — but making them here is what keeps
 	// a write that cannot land from paying to upload its bytes first. Without it, a caller
 	// sitting at its allowance can put an unbounded number of objects into the store at full
 	// speed, each one billed and each one waiting on a sweep, which is the cost the
@@ -135,7 +135,7 @@ type Store interface {
 	Abandon(ctx context.Context, key Key) error
 
 	// Commit points path at an object that has been written, creating the file if it is not
-	// there, and accounts for the bytes. It fails with syscall.EDQUOT if the namespace has
+	// there, and accounts for the bytes. It fails with syscall.EDQUOT if the volume has
 	// an allowance and the new size would carry it past it — checked here, in the same
 	// change that records the size, so that no window exists between deciding there is room
 	// and taking it.
@@ -151,12 +151,12 @@ type Store interface {
 	// and there is nothing to check. An empty key with a non-zero size is syscall.EINVAL.
 	Commit(ctx context.Context, path string, object Object) error
 
-	// Space reports the room the namespace has, or syscall.ENOSYS if it has no allowance.
-	// A namespace's answer does not change over its life: one that answers answers always.
+	// Space reports the room the volume has, or syscall.ENOSYS if it has no allowance.
+	// A volume's answer does not change over its life: one that answers answers always.
 	//
 	// Used is exact and costs no traversal, because it is maintained by the same changes
 	// that move bytes in and out. Nothing here samples a filesystem: an object store has no
-	// capacity to report, so a namespace held in one has no figures at all beyond the
+	// capacity to report, so a volume held in one has no figures at all beyond the
 	// allowance it was given and the bytes it is known to hold.
 	Space(ctx context.Context) (storage.Space, error)
 
@@ -269,7 +269,7 @@ type Object struct {
 
 // --- the change log ------------------------------------------------------------------
 
-// Log is what makes a namespace replicable: an ordered record of what changed, plus a way
+// Log is what makes a volume replicable: an ordered record of what changed, plus a way
 // to take a consistent picture of the tree to start from.
 //
 // It is part of the Store contract rather than a capability beside it because the two
@@ -291,7 +291,7 @@ type Log interface {
 	// converge: the scan takes time, changes accumulate while it runs, and if enough of
 	// them accumulate to push the snapshot's position out of the retention window the
 	// caller must start over — with a cost proportional to the size of the tree, so the
-	// larger the namespace the less likely it is to ever finish. Subscribing first takes
+	// larger the volume the less likely it is to ever finish. Subscribing first takes
 	// the window off that path entirely.
 	//
 	// Consistency is required of the picture, not of the mechanism: a read transaction, a
@@ -372,7 +372,7 @@ type Snap interface {
 	Close() error
 }
 
-// Position orders the changes to one namespace. It increases with every change and is
+// Position orders the changes to one volume. It increases with every change and is
 // never reused, so a caller that has applied everything up to some position can ask for
 // what came after it. Zero is before every change there has ever been.
 //
@@ -393,7 +393,7 @@ type Retention struct {
 	// It is not how a caller decides whether it may carry on — TrimmedThrough is, and the
 	// two are not interchangeable. The distance between a caller's position and this is the
 	// distance to the oldest thing that *survived*, which in a store numbering several
-	// namespaces from one sequence is set by what the other namespaces were doing. Deciding
+	// volumes from one sequence is set by what the other volumes were doing. Deciding
 	// from it sends callers that had missed nothing away to rebuild a whole tree.
 	Oldest Position
 
@@ -410,8 +410,8 @@ type Retention struct {
 	// It is what makes resuming decidable, and Oldest is not. Positions are dense in no
 	// particular way, so the distance between a caller's position and the oldest surviving
 	// entry says nothing about whether anything in between was thrown away: an
-	// implementation numbering every namespace in one database from a single sequence
-	// leaves each namespace's positions spread by however much its neighbours were written
+	// implementation numbering every volume in one database from a single sequence
+	// leaves each volume's positions spread by however much its neighbours were written
 	// to in the meantime. Deciding from that distance rejects callers that had missed
 	// nothing, and the cost of being wrong is a full rebuild of a tree.
 	//
@@ -429,7 +429,7 @@ type Retention struct {
 	// TrimmedByAge reports whether anything was discarded for being old rather than for
 	// being too much. A caller that fell out of the window is told which dimension pushed
 	// it out, because the two say different things: age means this caller was away too
-	// long, volume means the namespace changes faster than the log was configured to hold.
+	// long, entry count means the volume changes faster than the log was configured to hold.
 	TrimmedByAge bool
 }
 

@@ -6,7 +6,7 @@ import (
 )
 
 // A compound operation cannot invite a retry after an earlier stage changed the
-// namespace or a handle buffer. The original cancellation remains available for diagnostics.
+// volume or a handle buffer. The original cancellation remains available for diagnostics.
 func afterMutation(changed bool, err error) error {
 	if changed && errnoOf(err) == syscall.EINTR {
 		return &incompleteMutation{cause: err}

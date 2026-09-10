@@ -92,7 +92,7 @@ func TestAcceptedHighWaterRefusesCoordinatedNodeSequenceRollback(t *testing.T) {
 	witness := &recordingWitness{database: path}
 	store, err := sqlite.OpenBoundDurableWithOptions(
 		t.Context(), path, "workspace", durableStoreID, 0, options,
-		sqlite.CreateNamespaceIfMissing, sqlite.DurableStartup{}, witness,
+		sqlite.CreateVolumeIfMissing, sqlite.DurableStartup{}, witness,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -144,7 +144,7 @@ func TestAcceptedHighWaterRefusesCoordinatedNodeSequenceRollback(t *testing.T) {
 	})
 }
 
-func TestGlobalHighWaterValidationIncludesOtherNamespaces(t *testing.T) {
+func TestGlobalHighWaterValidationIncludesOtherVolumes(t *testing.T) {
 	path := database(t)
 	first := open(t, path, "first", 0)
 	second := open(t, path, "second", 0)
@@ -171,7 +171,7 @@ func TestGlobalHighWaterValidationIncludesOtherNamespaces(t *testing.T) {
 	reopened, err := sqlite.Open(t.Context(), path, "first", 0, sqlite.DefaultWindow())
 	if err == nil {
 		reopened.Close()
-		t.Fatal("opening one namespace ignored identities retained by another namespace")
+		t.Fatal("opening one volume ignored identities retained by another volume")
 	}
 	if !errors.Is(err, syscall.EIO) {
 		t.Fatalf("opening after global high-water rollback returned %v, want EIO", err)

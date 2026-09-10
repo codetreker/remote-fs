@@ -15,12 +15,12 @@ import (
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-func retainedSession(t *testing.T, namespace storage.FileStorage) storage.FileSession {
+func retainedSession(t *testing.T, volume storage.FileStorage) storage.FileSession {
 	t.Helper()
-	if err := namespace.CheckFileStorage(); err != nil {
+	if err := volume.CheckFileStorage(); err != nil {
 		t.Fatal(err)
 	}
-	session, err := namespace.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	session, err := volume.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
 	if err != nil {
 		t.Fatal(err)
 	}

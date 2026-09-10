@@ -18,13 +18,13 @@ Status: implemented
 
 `WriteAt` 与 `Truncate` 同步发布并在各自调用上报告结果。普通重叠写入按实际提交顺序生效，未修改区间保留。原生 revision CAS 只解决构造替换时的并发状态变化；它不把打开时内容作为强制前置条件。显式版本工作流仍由[排序与版本](../../proposed/architecture/2026-08-19-ordering-and-versions.md)和[操作词汇](../../proposed/architecture/2026-08-19-storage-operation-vocabulary.md)拥有。
 
-Open 不 hydration 内容。objectstore 的不可变完整对象格式保持独立：区间读取和补丁仍可物化当前完整内容，替换同时预留当前与下一份内容。namespace 默认单文件 1 GiB、同时物化 2 GiB，有限尝试与操作截止时间限制竞争成本。只有确认未提交且清理成功的 revision 竞争可以重新尝试，未知结果以 `EIO` 暴露。
+Open 不 hydration 内容。objectstore 的不可变完整对象格式保持独立：区间读取和补丁仍可物化当前完整内容，替换同时预留当前与下一份内容。卷默认单文件 1 GiB、同时物化 2 GiB，有限尝试与操作截止时间限制竞争成本。只有确认未提交且清理成功的 revision 竞争可以重新尝试，未知结果以 `EIO` 暴露。
 
 ### 名字离开后仍计量与回收
 
 SQLite v5 将仍被引用的无名普通文件保存为 detached 节点。名字树和日志不包含它，fd 继续使用它，用量仍包括它。最后一个引用先在发布门处退役、排空已接纳操作，再物理释放并结算对象与配额。未知提交、记账或清理结果保留相关所有权，不提前腾出可复用名额或容量。
 
-只有原生独占数据库所有者提供 retained-file 能力。启动有界验证全部 namespace 后，原子回收旧 epoch 无主节点；共享 opener 不能误收另一活跃所有者的引用。原有[对象发布次序](2026-08-21-namespace-in-an-object-store.md)、[本地持久对象边界](2026-09-04-local-disk-object-store.md)及[未知发布的所有权](2026-09-04-unresolved-object-publication.md)继续成立。
+只有原生独占数据库所有者提供 retained-file 能力。启动有界验证全部卷后，原子回收旧 epoch 无主节点；共享 opener 不能误收另一活跃所有者的引用。原有[对象发布次序](2026-08-21-volume-in-an-object-store.md)、[本地持久对象边界](2026-09-04-local-disk-object-store.md)及[未知发布的所有权](2026-09-04-unresolved-object-publication.md)继续成立。
 
 ### 标准 advisory 与强权限分别解释
 

@@ -154,12 +154,12 @@ func TestErrnoOf(t *testing.T) {
 		{"nothing went wrong", nil, 0},
 		{"a bare errno", syscall.ENOENT, syscall.ENOENT},
 		{"an errno inside a PathError", &os.PathError{Op: "stat", Err: syscall.EACCES}, syscall.EACCES},
-		{"an errno wrapped in text", fmt.Errorf("reaching the namespace: %w", syscall.ENOSPC), syscall.ENOSPC},
+		{"an errno wrapped in text", fmt.Errorf("reaching the volume: %w", syscall.ENOSPC), syscall.ENOSPC},
 		{"a canceled request", context.Canceled, syscall.EINTR},
 		{"a wrapped canceled request", fmt.Errorf("stat: %w", context.Canceled), syscall.EINTR},
 		{"an expired deadline", context.DeadlineExceeded, syscall.EIO},
 		{"an unknown outcome with cancellation", errors.Join(syscall.EIO, context.Canceled), syscall.EIO},
-		{"an error carrying no errno", errors.New("the namespace is unreachable"), syscall.EIO},
+		{"an error carrying no errno", errors.New("the volume is unreachable"), syscall.EIO},
 		{"a wrapped error carrying no errno", fmt.Errorf("dialling: %w", errors.New("no route")), syscall.EIO},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -185,7 +185,7 @@ func isNilConversion(expr ast.Expr) bool {
 	return ok && arg.Name == "nil"
 }
 
-// The kinds a namespace can report have to reach the kernel as themselves. A kind we
+// The kinds a volume can report have to reach the kernel as themselves. A kind we
 // cannot name is refused rather than presented as an ordinary file, because presenting
 // it would invite reads and writes that cannot mean what they appear to.
 func TestSystemMode(t *testing.T) {
@@ -232,7 +232,7 @@ func TestSystemMode(t *testing.T) {
 // The way back. A mode arrives from the kernel with the node's kind still in it, and the
 // kind is dropped rather than translated: what comes back is a mode to set, and a node's
 // kind is not something a caller sets.
-func TestNamespaceMode(t *testing.T) {
+func TestStorageMode(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		mode uint32
@@ -248,11 +248,11 @@ func TestNamespaceMode(t *testing.T) {
 			iofs.ModeSetuid | iofs.ModeSetgid | iofs.ModeSticky | 0o700},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			if got := namespaceMode(c.mode); got != c.want {
-				t.Fatalf("namespaceMode(%o) = %v, want %v", c.mode, got, c.want)
+			if got := storageMode(c.mode); got != c.want {
+				t.Fatalf("storageMode(%o) = %v, want %v", c.mode, got, c.want)
 			}
-			if got := namespaceMode(c.mode); got&^storage.SettableMode != 0 {
-				t.Fatalf("namespaceMode(%o) = %v, which the contract will refuse", c.mode, got)
+			if got := storageMode(c.mode); got&^storage.SettableMode != 0 {
+				t.Fatalf("storageMode(%o) = %v, which the contract will refuse", c.mode, got)
 			}
 		})
 	}
@@ -325,8 +325,8 @@ func TestRetainedHandlePreservesReadWriteAndTruncateBoundaries(t *testing.T) {
 	})
 }
 
-func activeTestNamespace(s storage.Storage, maxFileSize int64) *namespace {
-	return &namespace{storage: s, maxFileSize: maxFileSize, flushTimeout: DefaultFlushTimeout,
+func activeTestVolume(s storage.Storage, maxFileSize int64) *volume {
+	return &volume{storage: s, maxFileSize: maxFileSize, flushTimeout: DefaultFlushTimeout,
 		deadline: time.Now().Add(time.Hour), stop: make(chan struct{}), done: make(chan struct{})}
 }
 
@@ -367,9 +367,9 @@ func aHandleWithAllowance(t *testing.T, contents []byte, maxFileSize, allowance 
 	if err != nil {
 		t.Fatal(err)
 	}
-	ns := activeTestNamespace(unmeasured{}, maxFileSize)
-	ns.files = session
-	n := &node{ns: ns, id: rootIdentity(math.MaxUint64).child("file", syscall.S_IFREG, attr.ID)}
+	v := activeTestVolume(unmeasured{}, maxFileSize)
+	v.files = session
+	n := &node{volume: v, id: rootIdentity(math.MaxUint64).child("file", syscall.S_IFREG, attr.ID)}
 	return newHandle(n, file, true, true)
 }
 
@@ -382,7 +382,7 @@ func retainedContents(t *testing.T, h *handle) []byte {
 	return read.Data
 }
 
-// Descriptor data goes through File; this separate namespace supplies only the
+// Descriptor data goes through File; this separate volume supplies only the
 // optional capacity estimate used before a growth request.
 type unmeasured struct{ storage.Storage }
 
@@ -563,8 +563,8 @@ func TestTheChangeARequestAsksFor(t *testing.T) {
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			ns := &namespace{owner: owner}
-			got, errno := ns.requestedChange(&c.in)
+			v := &volume{owner: owner}
+			got, errno := v.requestedChange(&c.in)
 			if errno != c.errno {
 				t.Fatalf("the request failed with %v, want %v", errno, c.errno)
 			}
@@ -587,8 +587,8 @@ func TestAChangeTimeIsNotARequestOfItsOwn(t *testing.T) {
 		Valid: gofuse.FATTR_SIZE | gofuse.FATTR_ATIME | gofuse.FATTR_ATIME_NOW |
 			gofuse.FATTR_MTIME | gofuse.FATTR_MTIME_NOW | gofuse.FATTR_CTIME,
 	}}
-	ns := &namespace{owner: gofuse.Owner{}}
-	got, errno := ns.requestedChange(&in)
+	v := &volume{owner: gofuse.Owner{}}
+	got, errno := v.requestedChange(&in)
 	if errno != 0 {
 		t.Fatalf("the request failed with %v", errno)
 	}
@@ -670,7 +670,7 @@ func stableNode(name string) uint64 {
 	return sum.Sum64()
 }
 
-// The record of which node each name refers to turns the namespace's identity for a node
+// The record of which node each name refers to turns the volume's identity for a node
 // into the number the kernel knows it by. These reach it directly, because several of its
 // cases — one
 // name resolved twice at the same time, a name whose identity was dropped between a lookup
@@ -852,9 +852,9 @@ func (forbiddenCapacityProbe) Space(context.Context) (storage.Space, error) {
 	panic("descriptor mutation must use authoritative File quota enforcement")
 }
 
-func TestDescriptorMutationsDoNotProbeNamespaceCapacity(t *testing.T) {
+func TestDescriptorMutationsDoNotProbeVolumeCapacity(t *testing.T) {
 	h := aHandle(t, []byte("contents"), 1<<20)
-	h.node.ns.storage = forbiddenCapacityProbe{}
+	h.node.volume.storage = forbiddenCapacityProbe{}
 	if n, errno := h.Write(t.Context(), []byte("growth"), 8); errno != 0 || n != 6 {
 		t.Fatalf("write returned %d, %v", n, errno)
 	}
@@ -876,7 +876,7 @@ func TestDescriptorMutationsDoNotProbeNamespaceCapacity(t *testing.T) {
 // mount — or by a client that is not a mount at all — reached none of them.
 //
 // Nothing about the name changes here, and neither does the kind. Only the identity the
-// namespace reports does, which is exactly what arrives from a change this mount did not
+// volume reports does, which is exactly what arrives from a change this mount did not
 // make.
 func TestANameWhoseNodeWasReplacedGetsANewIdentity(t *testing.T) {
 	root := rootIdentity(math.MaxUint64)

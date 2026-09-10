@@ -1,4 +1,4 @@
-# Backing a namespace with an object store
+# Backing a volume with an object store
 
 Evidence gathered while designing `packages/storage/objectstore`. Three questions were
 investigated, each because a design decision turned on it and the answer was not obvious
@@ -102,7 +102,7 @@ compares the returned digest against a locally computed hash to look for damage 
 fire.
 
 *It is MD5.* Chosen-prefix collisions against MD5 are practical, so anything that treats
-equal digests as equal content is forgeable by anyone who can write to the namespace. The
+equal digests as equal content is forgeable by anyone who can write to the volume. The
 alternative Azure offers, `x-ms-content-crc64`, is a checksum rather than a
 collision-resistant hash and is no better for this purpose. A dedup pass that must survive a
 hostile writer has to compute its own digest.
@@ -137,7 +137,7 @@ order requires and what a `TEXT` column under a locale collation would not give.
 The choice went to `modernc.org/sqlite` on deployment breadth rather than on any measured
 advantage — it is an order of magnitude heavier. The driver sits behind `database/sql`, so
 the decision is cheap to revisit; the reasoning is in
-[`2026-08-21-namespace-in-an-object-store.md`](../../.agents/notes/implemented/architecture/2026-08-21-namespace-in-an-object-store.md).
+[`2026-08-21-volume-in-an-object-store.md`](../../.agents/notes/implemented/architecture/2026-08-21-volume-in-an-object-store.md).
 
 ## 4. Azurite as a test dependency
 

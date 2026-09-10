@@ -39,12 +39,12 @@ type CommitWitness interface {
 	Checkpoint(DurableState) error
 }
 
-// NamespaceOpenMode decides whether opening may create the named namespace.
-type NamespaceOpenMode uint8
+// VolumeOpenMode decides whether opening may create the named volume.
+type VolumeOpenMode uint8
 
 const (
-	CreateNamespaceIfMissing NamespaceOpenMode = iota + 1
-	RequireExistingNamespace
+	CreateVolumeIfMissing VolumeOpenMode = iota + 1
+	RequireExistingVolume
 )
 
 // DurableStartup is captured before SQLite opens the database and can create or recover WAL
@@ -76,14 +76,14 @@ type CheckpointResult struct {
 
 type durableOpen struct {
 	reapDetached bool
-	mode         NamespaceOpenMode
+	mode         VolumeOpenMode
 	startup      DurableStartup
 	witness      CommitWitness
 }
 
 func (d durableOpen) check() error {
-	if d.mode != CreateNamespaceIfMissing && d.mode != RequireExistingNamespace {
-		return fmt.Errorf("namespace open mode %d is unknown: %w", d.mode, syscall.EINVAL)
+	if d.mode != CreateVolumeIfMissing && d.mode != RequireExistingVolume {
+		return fmt.Errorf("volume open mode %d is unknown: %w", d.mode, syscall.EINVAL)
 	}
 	if d.witness == nil {
 		return fmt.Errorf("durable opening needs a commit witness: %w", syscall.EINVAL)
@@ -203,7 +203,7 @@ func (c *databaseCoordinator) healthErrorLocked() error {
 }
 
 // InspectDurableState reads the database-wide state without changing schema, journal mode,
-// or namespace contents. The visible WAL, when present, is part of the returned database.
+// or volume contents. The visible WAL, when present, is part of the returned database.
 func InspectDurableState(ctx context.Context, database string) (DurableState, error) {
 	values := url.Values{}
 	values.Set("mode", "ro")

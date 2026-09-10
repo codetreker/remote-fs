@@ -5,9 +5,9 @@ import (
 	"syscall"
 )
 
-// Namespace IDs are stable through rename and are never reused. Reporting those IDs
-// directly preserves inode numbers even when another mount moves a node to a name
-// this mount has never seen. The tree records name membership for local invalidation.
+// Node IDs within a volume are stable through rename and are never reused. Reporting
+// those IDs directly preserves inode numbers even when another mount moves a node to
+// a name this mount has never seen. The tree records name membership for local invalidation.
 type identities struct {
 	mu     sync.Mutex
 	handed uint64

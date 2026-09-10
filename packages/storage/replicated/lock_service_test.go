@@ -48,7 +48,7 @@ func TestServingReplicaViewsKeepsLocksPairedWithMutations(t *testing.T) {
 				t.Fatal(err)
 			}
 			if err := authorized.Write(t.Context(), "file", []byte("authorized through replica")); err != nil {
-				t.Fatalf("the proxy's authority did not authorize its namespace mutation: %v", err)
+				t.Fatalf("the proxy's authority did not authorize its volume mutation: %v", err)
 			}
 			attr, err := replica.Stat(t.Context(), "file")
 			if err != nil || attr.Size != int64(len("authorized through replica")) {

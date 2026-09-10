@@ -59,7 +59,7 @@ func TestGlobalIdentityBoundsUseExpressionIndexSearches(t *testing.T) {
 		t.Fatalf("global identity bounds build a temporary ordering:\n%s", combined)
 	}
 	for _, index := range []string{
-		"namespaces_by_root_identity",
+		"volumes_by_root_identity",
 		"entries_by_node_identity",
 		"changes_by_node_identity",
 		"changes_by_position_identity",
@@ -70,7 +70,7 @@ func TestGlobalIdentityBoundsUseExpressionIndexSearches(t *testing.T) {
 				index, count, combined)
 		}
 	}
-	for _, table := range []string{"namespaces", "entries", "changes", "logs"} {
+	for _, table := range []string{"volumes", "entries", "changes", "logs"} {
 		if strings.Contains(combined, "SCAN "+table) {
 			t.Fatalf("global identity bounds scan %s:\n%s", table, combined)
 		}
@@ -128,15 +128,15 @@ func TestAllocatorsPublishOnlyThroughTheCallingTransaction(t *testing.T) {
 					if next != 5 || err != nil {
 						t.Fatalf("node allocation=%d, %v", next, err)
 					}
-					execState(t, tx, `INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec)
-						SELECT ?, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec FROM nodes WHERE id=1`, next)
+					execState(t, tx, `INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec)
+						SELECT ?, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec FROM nodes WHERE id=1`, next)
 				} else {
 					next, err = AllocateChangePosition(t.Context(), tx)
 					want.ChangeHighWater++
 					if next != 7 || err != nil {
 						t.Fatalf("change allocation=%d, %v", next, err)
 					}
-					execState(t, tx, `INSERT INTO changes (position, previous_position, namespace, kind, parent, recorded_sec, recorded_nsec)
+					execState(t, tx, `INSERT INTO changes (position, previous_position, volume, kind, parent, recorded_sec, recorded_nsec)
 						VALUES (?, 2, 1, 0, 1, 0, 0)`, next)
 				}
 				if commit {
@@ -236,7 +236,7 @@ func TestObserveNewNodeIDRetainsHistoricalHighWater(t *testing.T) {
 	if err := ObserveNewNodeID(t.Context(), tx, 8); err != nil {
 		t.Fatal(err)
 	}
-	execState(t, tx, `INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec)
+	execState(t, tx, `INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec)
 		VALUES (8, 1, 0, 0, 0, 0, 0, 0)`)
 	execState(t, tx, `DELETE FROM nodes WHERE id=8`)
 	if err := tx.Commit(); err != nil {
@@ -253,10 +253,10 @@ func TestObserveNewNodeIDRetainsHistoricalHighWater(t *testing.T) {
 	}
 }
 
-func TestValidateIdentityBoundsChecksEachNamespaceReference(t *testing.T) {
+func TestValidateIdentityBoundsChecksEachVolumeReference(t *testing.T) {
 	for _, mutation := range []string{
 		"",
-		`UPDATE namespaces SET root=5`,
+		`UPDATE volumes SET root=5`,
 		`UPDATE entries SET parent=5`,
 		`UPDATE changes SET from_parent=5`,
 		`UPDATE logs SET trimmed_through=7`,
@@ -272,14 +272,14 @@ func TestValidateIdentityBoundsChecksEachNamespaceReference(t *testing.T) {
 			err := ValidateIdentityBounds(t.Context(), db, 1)
 			if mutation == "" {
 				if err != nil {
-					t.Fatalf("valid namespace bounds: %v", err)
+					t.Fatalf("valid volume bounds: %v", err)
 				}
 			} else if !errors.Is(err, syscall.EIO) {
-				t.Fatalf("invalid namespace bounds accepted: %v", err)
+				t.Fatalf("invalid volume bounds accepted: %v", err)
 			}
 			if mutation != `DELETE FROM database_state` {
 				if err := ValidateIdentityBounds(t.Context(), db, 2); err != nil {
-					t.Fatalf("another namespace inherited foreign corruption: %v", err)
+					t.Fatalf("another volume inherited foreign corruption: %v", err)
 				}
 			}
 		})

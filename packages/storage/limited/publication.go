@@ -11,7 +11,7 @@ import (
 )
 
 // CheckPublicationAccounting reports whether byte accounting participates in the
-// backing namespace's final publication. A legacy backend returns ENOSYS.
+// backing volume's final publication. A legacy backend returns ENOSYS.
 func (s *Storage) CheckPublicationAccounting() error {
 	if !s.accounted {
 		return syscall.ENOSYS
@@ -22,8 +22,8 @@ func (s *Storage) CheckPublicationAccounting() error {
 	return s.backing.(interface{ CheckPublicationAccounting() error }).CheckPublicationAccounting()
 }
 
-// LockService returns the authority paired with the backing namespace, or nil
-// when that namespace has no lock authority.
+// LockService returns the authority paired with the backing volume, or nil
+// when that volume has no lock authority.
 func (s *Storage) LockService() locking.Service {
 	if source, ok := s.backing.(interface{ LockService() locking.Service }); ok {
 		return source.LockService()
@@ -31,7 +31,7 @@ func (s *Storage) LockService() locking.Service {
 	return nil
 }
 
-// Close delegates lifecycle ownership to the backing namespace. A backend with no
+// Close delegates lifecycle ownership to the backing volume. A backend with no
 // Close method has no lifecycle resource for this wrapper to release.
 func (s *Storage) Close() error {
 	if closer, ok := s.backing.(io.Closer); ok {
@@ -89,7 +89,7 @@ func (s *Storage) preparePublication(name string, previous, next int64) (storage
 			s.countMu.Lock()
 			defer s.countMu.Unlock()
 			if s.fault == nil {
-				s.fault = fmt.Errorf("publication outcome for %q is unknown; reopen the namespace before using its allowance: %w", name, syscall.EIO)
+				s.fault = fmt.Errorf("publication outcome for %q is unknown; reopen the volume before using its allowance: %w", name, syscall.EIO)
 			}
 			return s.fault
 		}

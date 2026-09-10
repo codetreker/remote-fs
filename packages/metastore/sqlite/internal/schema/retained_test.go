@@ -9,13 +9,13 @@ import (
 
 func TestPreparationReclaimsOnlyDetachedFiles(t *testing.T) {
 	db := testDatabase(t, 0)
-	id, root := testNamespace(t, db, "workspace")
+	id, root := testVolume(t, db, "workspace")
 	live, liveKey := testFile(t, db, id, root, "live", 3, false)
 	detached, detachedKey := testFile(t, db, id, root, "unlinked", 7, true)
-	other, otherRoot := testNamespace(t, db, "other")
+	other, otherRoot := testVolume(t, db, "other")
 	otherDetached, _ := testFile(t, db, other, otherRoot, "orphan", 11, true)
 	_, _, _, err := PrepareConfigured(t.Context(), db, "workspace", "", changes.DefaultWindow(), 1000, 1<<20,
-		&DurableOpen{Mode: RequireExistingNamespace, ReapDetached: true})
+		&DurableOpen{Mode: RequireExistingVolume, ReapDetached: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,7 +23,7 @@ func TestPreparationReclaimsOnlyDetachedFiles(t *testing.T) {
 	if err := db.QueryRow(`SELECT count(*) FROM nodes WHERE id IN (?,?)`, detached, otherDetached).Scan(&retained); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.QueryRow(`SELECT used FROM namespaces WHERE id=?`, id).Scan(&used); err != nil {
+	if err := db.QueryRow(`SELECT used FROM volumes WHERE id=?`, id).Scan(&used); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.QueryRow(`SELECT state FROM objects WHERE key=?`, detachedKey).Scan(&state); err != nil {
@@ -35,20 +35,20 @@ func TestPreparationReclaimsOnlyDetachedFiles(t *testing.T) {
 	if retained != 0 || used != 3 || state != StateGarbage || liveState != StateReferenced {
 		t.Fatalf("wrong recovery: retained=%d used=%d garbage-state=%d live-state=%d", retained, used, state, liveState)
 	}
-	if err := db.QueryRow(`SELECT used FROM namespaces WHERE id=?`, other).Scan(&used); err != nil || used != 0 {
-		t.Fatalf("other namespace's orphan remains charged: used=%d err=%v", used, err)
+	if err := db.QueryRow(`SELECT used FROM volumes WHERE id=?`, other).Scan(&used); err != nil || used != 0 {
+		t.Fatalf("other volume's orphan remains charged: used=%d err=%v", used, err)
 	}
 }
 
 func TestReclamationFailureRollsBackAllThreeSteps(t *testing.T) {
 	for _, target := range []struct{ name, event string }{
 		{"object retirement", "UPDATE ON objects"},
-		{"quota release", "UPDATE ON namespaces"},
+		{"quota release", "UPDATE ON volumes"},
 		{"node deletion", "DELETE ON nodes"},
 	} {
 		t.Run(target.name, func(t *testing.T) {
 			db := testDatabase(t, 0)
-			id, root := testNamespace(t, db, "workspace")
+			id, root := testVolume(t, db, "workspace")
 			node, key := testFile(t, db, id, root, "unlinked", 7, true)
 			execute(t, db, `CREATE TRIGGER refuse_reap BEFORE `+target.event+` BEGIN SELECT RAISE(ABORT,'reclamation refused'); END`)
 			tx := testTransaction(t, db)
@@ -61,7 +61,7 @@ func TestReclamationFailureRollsBackAllThreeSteps(t *testing.T) {
 			}
 			var state, size, used int64
 			if err := db.QueryRow(`SELECT o.state,n.size,ns.used FROM nodes n JOIN objects o ON o.key=n.content
-				JOIN namespaces ns ON ns.id=n.namespace WHERE n.id=? AND o.key=?`, node, key).Scan(&state, &size, &used); err != nil {
+				JOIN volumes ns ON ns.id=n.volume WHERE n.id=? AND o.key=?`, node, key).Scan(&state, &size, &used); err != nil {
 				t.Fatal(err)
 			}
 			if state != StateReferenced || size != 7 || used != 7 {

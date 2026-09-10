@@ -18,13 +18,13 @@ import (
 // anything: a change applied wrongly, or quietly not applied, stays wrong for as long as the
 // copy exists. These are the tests of that one obligation.
 
-// source is a namespace to be copied, and copy is the copy of it.
+// source is a volume to be copied, and copy is the copy of it.
 func source(t *testing.T) *sqlite.Store {
 	t.Helper()
 
 	store, err := sqlite.Open(t.Context(), path.Join(t.TempDir(), "source.db"), "ws", 0, sqlite.DefaultWindow())
 	if err != nil {
-		t.Fatalf("opening the namespace: %v", err)
+		t.Fatalf("opening the volume: %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
 	return store
@@ -48,7 +48,7 @@ func fill(t *testing.T, from *sqlite.Store, into *sqlite.Replica, page int) {
 
 	snap, at, err := from.Snapshot(t.Context())
 	if err != nil {
-		t.Fatalf("taking a picture of the namespace: %v", err)
+		t.Fatalf("taking a picture of the volume: %v", err)
 	}
 	defer snap.Close()
 
@@ -135,19 +135,19 @@ func requireSame(t *testing.T, from *sqlite.Store, into *sqlite.Replica) {
 	want := tree(t, from.Stat, from.List)
 	got := tree(t, into.Stat, into.List)
 	if len(want) != len(got) {
-		t.Fatalf("the namespace holds %d nodes and the copy holds %d:\n namespace %v\n copy      %v",
+		t.Fatalf("the volume holds %d nodes and the copy holds %d:\n volume %v\n copy      %v",
 			len(want), len(got), names(want), names(got))
 	}
 	for at, node := range want {
 		mirrored, present := got[at]
 		if !present {
-			t.Fatalf("the copy does not hold %q, which the namespace does", at)
+			t.Fatalf("the copy does not hold %q, which the volume does", at)
 		}
 		// The content key is the one thing a copy does not hold: it never reaches an object
 		// store, so a key here would name bytes nothing has.
 		if mirrored.ID != node.ID || mirrored.Mode != node.Mode || mirrored.Size != node.Size ||
 			!mirrored.ModTime.Equal(node.ModTime) || !mirrored.AccessTime.Equal(node.AccessTime) {
-			t.Fatalf("the copy holds %q as %+v, the namespace holds it as %+v", at, mirrored, node)
+			t.Fatalf("the copy holds %q as %+v, the volume holds it as %+v", at, mirrored, node)
 		}
 		if mirrored.Content != "" {
 			t.Fatalf("the copy holds a content key for %q, and it has no object store to use one against", at)
@@ -228,16 +228,16 @@ func TestAPictureIsAcceptedWhateverOrderItsRowsArriveIn(t *testing.T) {
 	requireSame(t, from, into)
 }
 
-// TestEveryKindOfChangeIsAppliedAsTheNamespaceRecordedIt replays a log against a copy of the
-// tree the log began from, and compares what comes out against the namespace itself.
+// TestEveryKindOfChangeIsAppliedAsTheVolumeRecordedIt replays a log against a copy of the
+// tree the log began from, and compares what comes out against the volume itself.
 //
 // The operations below are chosen so that every kind of change is recorded at least once: a
 // creation, a modification, a removal, a rename, and a rename onto something that was already
 // there — which is the one that records a removal and a rename together.
-func TestEveryKindOfChangeIsAppliedAsTheNamespaceRecordedIt(t *testing.T) {
+func TestEveryKindOfChangeIsAppliedAsTheVolumeRecordedIt(t *testing.T) {
 	from := source(t)
 	into := copyOf(t)
-	// The copy starts from a picture of an empty namespace, so everything below reaches it as
+	// The copy starts from a picture of an empty volume, so everything below reaches it as
 	// a change rather than as part of the picture.
 	fill(t, from, into, 1024)
 
@@ -261,7 +261,7 @@ func TestEveryKindOfChangeIsAppliedAsTheNamespaceRecordedIt(t *testing.T) {
 		{"removing a directory", func() error { return from.RemoveDir(t.Context(), "e/inner") }},
 	} {
 		if err := done.run(); err != nil {
-			t.Fatalf("%s in the namespace: %v", done.what, err)
+			t.Fatalf("%s in the volume: %v", done.what, err)
 		}
 		replay(t, from, into)
 		requireSame(t, from, into)
@@ -308,7 +308,7 @@ func TestReplicaRefusesAReusedNodeIdentity(t *testing.T) {
 
 // TestARenamedDirectoryMovesInTheCopyWithoutItsSubtreeBeingTouched. One row in the log is one
 // row here: everything beneath keeps the identity it had, which is what makes a directory
-// rename cost the same in a copy as it does in the namespace.
+// rename cost the same in a copy as it does in the volume.
 func TestARenamedDirectoryMovesInTheCopyWithoutItsSubtreeBeingTouched(t *testing.T) {
 	from := source(t)
 	build(t, from)
@@ -396,7 +396,7 @@ func TestAChangeThatDoesNotFindWhatItDescribesIsRefused(t *testing.T) {
 				t.Fatal("the change was reported as applied")
 			}
 			if err == nil {
-				t.Fatal("the change was applied, and the copy now holds something the namespace never recorded")
+				t.Fatal("the change was applied, and the copy now holds something the volume never recorded")
 			}
 			if !errors.Is(err, syscall.EIO) {
 				t.Fatalf("applying it failed with %v, want EIO", err)
@@ -409,7 +409,7 @@ func TestAChangeThatDoesNotFindWhatItDescribesIsRefused(t *testing.T) {
 		})
 	}
 	// Nothing above changed the copy, which is the other half of the refusal: a change that
-	// was refused half way through would leave the copy holding a tree the namespace never had.
+	// was refused half way through would leave the copy holding a tree the volume never had.
 	requireSame(t, from, into)
 }
 
@@ -470,7 +470,7 @@ func TestAPictureWithNoRootIsNotATree(t *testing.T) {
 
 // TestAFillingThatWasNotCompletedLeavesTheCopyAsItWas. A picture that stops half way through
 // is one the copy must not be left holding: what it had before is at least a tree the
-// namespace once had, and what a half-delivered picture leaves is a tree nobody ever had.
+// volume once had, and what a half-delivered picture leaves is a tree nobody ever had.
 func TestAFillingThatWasNotCompletedLeavesTheCopyAsItWas(t *testing.T) {
 	from := source(t)
 	build(t, from)
@@ -530,7 +530,7 @@ func TestReseedWaitingForAnotherPictureHonorsCancellation(t *testing.T) {
 	}
 }
 
-// build puts a small tree into a namespace: a directory with a file and a subtree, and a file
+// build puts a small tree into a volume: a directory with a file and a subtree, and a file
 // beside it.
 func build(t *testing.T, store *sqlite.Store) {
 	t.Helper()

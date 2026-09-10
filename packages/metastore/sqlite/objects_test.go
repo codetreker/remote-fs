@@ -193,9 +193,9 @@ func TestPendingAdmissionSeeksPastALargeReferencedSet(t *testing.T) {
 			VALUES(0)
 			UNION ALL SELECT i + 1 FROM referenced WHERE i < 19999
 		)
-		INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
+		INSERT INTO objects (key, volume, state, size, digest, created_sec, created_nsec)
 		SELECT printf('referenced-%05d', i), ?, ?, 1, NULL, 0, 0
-		FROM referenced ORDER BY i`, store.namespace, stateReferenced)
+		FROM referenced ORDER BY i`, store.volume, stateReferenced)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func TestPendingAdmissionSeeksPastALargeReferencedSet(t *testing.T) {
 	rows, err := store.write.QueryContext(t.Context(), `EXPLAIN QUERY PLAN `+pendingObjectStatusQuery,
 		stateReserved, stateReserved, stateUnresolved, stateUnresolved,
 		stateGarbage, stateGarbage,
-		store.namespace, stateReserved, stateUnresolved, stateGarbage)
+		store.volume, stateReserved, stateUnresolved, stateGarbage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestPendingAdmissionSeeksPastALargeReferencedSet(t *testing.T) {
 	}
 	whole := strings.Join(plan, "; ")
 	if strings.Contains(whole, "SCAN objects") || !strings.Contains(whole, "objects_by_state") {
-		t.Fatalf("pending admission does not seek by namespace and pending state; plan: %s", whole)
+		t.Fatalf("pending admission does not seek by volume and pending state; plan: %s", whole)
 	}
 	if _, err := store.Reserve(t.Context(), "pending", 1); err != nil {
 		t.Fatalf("reserving beside 20,000 referenced objects: %v", err)
@@ -245,7 +245,7 @@ func TestGarbageSelectionUsesTheBoundedStateIndex(t *testing.T) {
 	defer store.Close()
 
 	rows, err := store.read.QueryContext(t.Context(), `EXPLAIN QUERY PLAN `+garbageQuery,
-		store.namespace, stateGarbage, 8)
+		store.volume, stateGarbage, 8)
 	if err != nil {
 		t.Fatal(err)
 	}

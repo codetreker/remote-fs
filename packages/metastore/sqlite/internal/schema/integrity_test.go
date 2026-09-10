@@ -10,31 +10,31 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
 )
 
-func TestIntegrityAcceptsConsistentGlobalAndNamespaceGraphs(t *testing.T) {
+func TestIntegrityAcceptsConsistentGlobalAndVolumeGraphs(t *testing.T) {
 	db := testDatabase(t, 0)
-	id, root := testNamespace(t, db, "workspace")
+	id, root := testVolume(t, db, "workspace")
 	testFile(t, db, id, root, "file", 7, false)
 	testFile(t, db, id, root, "unnamed", 2, true)
 	testChange(t, db, id, root, "old")
-	other, otherRoot := testNamespace(t, db, "other")
+	other, otherRoot := testVolume(t, db, "other")
 	testFile(t, db, other, otherRoot, "other-file", 11, false)
 	for _, scope := range []*int64{nil, &id, &other} {
 		if err := validateIntegrity(t.Context(), db, scope, 1000, 1<<20, 5); err != nil {
 			t.Fatal(err)
 		}
 	}
-	execute(t, db, `UPDATE nodes SET size = -1 WHERE namespace = ? AND id != ?`, other, otherRoot)
-	if err := ValidateNamespaceIntegrity(t.Context(), db, id, 1000, 1<<20); err != nil {
-		t.Fatalf("unrelated namespace corruption crossed the scoped check: %v", err)
+	execute(t, db, `UPDATE nodes SET size = -1 WHERE volume = ? AND id != ?`, other, otherRoot)
+	if err := ValidateVolumeIntegrity(t.Context(), db, id, 1000, 1<<20); err != nil {
+		t.Fatalf("unrelated volume corruption crossed the scoped check: %v", err)
 	}
 	if err := validateIntegrity(t.Context(), db, nil, 1000, 1<<20, 5); !errors.Is(err, syscall.EIO) {
-		t.Fatalf("global check accepted another namespace's corrupt node: %v", err)
+		t.Fatalf("global check accepted another volume's corrupt node: %v", err)
 	}
 }
 
 func TestIntegrityWorkAndNameBytesHaveExactBounds(t *testing.T) {
 	db := testDatabase(t, 0)
-	id, root := testNamespace(t, db, "workspace")
+	id, root := testVolume(t, db, "workspace")
 	testFile(t, db, id, root, "name", 3, false)
 	testChange(t, db, id, root, "old")
 	for _, scope := range []*int64{nil, &id} {
@@ -73,7 +73,7 @@ func TestIntegrityRejectsInvalidStoredClassesAndMetadata(t *testing.T) {
 		name, mutation, diagnostic string
 		check                      func(context.Context, sqlvalue.Queryer, *int64) error
 	}{
-		{"namespace type", `UPDATE namespaces SET used='bad'`, "namespace rows", validateStorageClasses},
+		{"volume type", `UPDATE volumes SET used='bad'`, "volume rows", validateStorageClasses},
 		{"node type", `UPDATE nodes SET size='bad'`, "nodes rows", validateStorageClasses},
 		{"object type", `UPDATE objects SET size='bad'`, "objects rows", validateStorageClasses},
 		{"entry name", `UPDATE entries SET name=X'2e2e'`, "entries rows", validateStorageClasses},
@@ -90,7 +90,7 @@ func TestIntegrityRejectsInvalidStoredClassesAndMetadata(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			db := testDatabase(t, 0)
-			id, root := testNamespace(t, db, "workspace")
+			id, root := testVolume(t, db, "workspace")
 			testFile(t, db, id, root, "file", 3, false)
 			testChange(t, db, id, root, "old")
 			execute(t, db, test.mutation)
@@ -106,7 +106,7 @@ func TestIntegrityRejectsInvalidStoredClassesAndMetadata(t *testing.T) {
 
 func TestIntegrityCancellationPreservesTheCause(t *testing.T) {
 	db := testDatabase(t, 0)
-	id, _ := testNamespace(t, db, "workspace")
+	id, _ := testVolume(t, db, "workspace")
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	for _, check := range []struct {
@@ -128,7 +128,7 @@ func TestIntegrityCancellationPreservesTheCause(t *testing.T) {
 			}
 		})
 	}
-	if err := ValidateNamespaceIntegrity(t.Context(), db, id, 1000, 1<<20); err != nil {
-		t.Fatalf("cancelled inspections damaged the namespace: %v", err)
+	if err := ValidateVolumeIntegrity(t.Context(), db, id, 1000, 1<<20); err != nil {
+		t.Fatalf("cancelled inspections damaged the volume: %v", err)
 	}
 }

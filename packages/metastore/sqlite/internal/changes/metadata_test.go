@@ -44,7 +44,7 @@ func TestChangeMetadataDecoderNamesInvalidScalarStorage(t *testing.T) {
 
 func metadataValues() map[string]any {
 	return map[string]any{
-		"position": int64(7), "previous_position": int64(6), "namespace": int64(1), "kind": KindCreated,
+		"position": int64(7), "previous_position": int64(6), "volume": int64(1), "kind": KindCreated,
 		"parent": int64(1), "name": []byte("file"), "from_parent": nil, "from_name": nil,
 		"node": int64(2), "mode": int64(0644), "size": int64(4),
 		"atime_sec": int64(-100), "atime_nsec": int64(123), "mtime_sec": int64(100), "mtime_nsec": int64(456),
@@ -53,7 +53,7 @@ func metadataValues() map[string]any {
 }
 
 func metadataQuery(db *sql.DB, values map[string]any) *sql.Row {
-	columns := []string{"position", "previous_position", "namespace", "kind", "parent", "name", "from_parent", "from_name", "node", "mode", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content", "recorded_sec", "recorded_nsec"}
+	columns := []string{"position", "previous_position", "volume", "kind", "parent", "name", "from_parent", "from_name", "node", "mode", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content", "recorded_sec", "recorded_nsec"}
 	var aliases []string
 	var args []any
 	for _, column := range columns {
@@ -122,7 +122,7 @@ func TestMetadataDecoderRejectsStorageClassesAndInconsistentFields(t *testing.T)
 		t.Fatal(err)
 	}
 	defer db.Close()
-	for _, column := range []string{"position", "previous_position", "namespace", "kind", "parent", "from_parent", "node", "mode", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "recorded_sec", "recorded_nsec"} {
+	for _, column := range []string{"position", "previous_position", "volume", "kind", "parent", "from_parent", "node", "mode", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "recorded_sec", "recorded_nsec"} {
 		t.Run(column+" as text", func(t *testing.T) {
 			values := metadataValues()
 			values[column] = "bad"
@@ -136,7 +136,7 @@ func TestMetadataDecoderRejectsStorageClassesAndInconsistentFields(t *testing.T)
 		name    string
 		changes map[string]any
 	}{
-		{"namespace mismatch", map[string]any{"namespace": int64(2)}},
+		{"volume mismatch", map[string]any{"volume": int64(2)}},
 		{"nonpositive position", map[string]any{"position": int64(0)}},
 		{"negative parent", map[string]any{"parent": int64(-1)}},
 		{"unknown kind", map[string]any{"kind": int64(9)}},

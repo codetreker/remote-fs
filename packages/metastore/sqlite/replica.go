@@ -14,16 +14,16 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// replicaNamespace is the name a copy's namespace carries in its own database. One file
+// replicaVolume is the name a copy's volume carries in its own database. One file
 // holds one copy, so the name distinguishes nothing and is fixed rather than asked for.
-const replicaNamespace = "replica"
+const replicaVolume = "replica"
 
-// Replica is a local copy of another namespace's tree: filled from one consistent picture of
+// Replica is a local copy of another volume's tree: filled from one consistent picture of
 // it, and kept current by applying the changes recorded after that picture was taken.
 //
 // It offers the reading half of metastore.Store and nothing that changes a tree of its own
 // accord. That is the point of the type. Every difference between this copy and the
-// namespace it copies has to arrive as a change somebody else recorded, so an operation here
+// volume it copies has to arrive as a change somebody else recorded, so an operation here
 // that made a node would be a second author of this tree, and the copy would then hold
 // something the log never said.
 //
@@ -58,14 +58,14 @@ type Replica struct {
 // The database is the copy's own. Nothing else writes it, and it is expected to be a file
 // that lives and dies with whatever is holding the copy — so it is created if it is not
 // there, and what it held before is what a previous run of the same mount left, not a
-// namespace anybody is serving.
+// volume anybody is serving.
 //
 // The window and the allowance a Store is opened with mean nothing here: this copy records no
-// changes of its own, so its log stays empty, and the room the namespace has is the server's
+// changes of its own, so its log stays empty, and the room the volume has is the server's
 // answer rather than anything this database knows.
 func OpenReplica(ctx context.Context, path string) (*Replica, error) {
 	options := DefaultOptions()
-	store, err := OpenWithOptions(ctx, path, replicaNamespace, 0, options)
+	store, err := OpenWithOptions(ctx, path, replicaVolume, 0, options)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +93,7 @@ func (r *Replica) releaseRead() {
 	<-r.readSlots
 }
 
-// Stat reports the node at path, as the namespace held it at Position.
+// Stat reports the node at path, as the volume held it at Position.
 func (r *Replica) Stat(ctx context.Context, path string) (metastore.Node, error) {
 	if err := r.acquireRead(ctx); err != nil {
 		return metastore.Node{}, pathError("stat", path, sqlerr.Failure(err))
@@ -102,7 +102,7 @@ func (r *Replica) Stat(ctx context.Context, path string) (metastore.Node, error)
 	return r.store.Stat(ctx, path)
 }
 
-// List returns the children of the directory at path, as the namespace held them at Position.
+// List returns the children of the directory at path, as the volume held them at Position.
 func (r *Replica) List(ctx context.Context, path string) ([]metastore.Child, error) {
 	if err := r.acquireRead(ctx); err != nil {
 		return nil, pathError("list", path, sqlerr.Failure(err))
@@ -220,20 +220,20 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 		if err := dbstate.ObserveNewNodeID(ctx, tx, change.Node.ID); err != nil {
 			return err
 		}
-		if err := insertNode(ctx, tx, r.store.namespace, *change.Node); err != nil {
+		if err := insertNode(ctx, tx, r.store.volume, *change.Node); err != nil {
 			return err
 		}
-		return insertEntry(ctx, tx, r.store.namespace, change.Parent, change.Name, change.Node.ID)
+		return insertEntry(ctx, tx, r.store.volume, change.Parent, change.Name, change.Node.ID)
 
 	case metastore.Modified:
 		return updateNode(ctx, tx, *change.Node)
 
 	case metastore.Removed:
-		id, err := entryNode(ctx, tx, r.store.namespace, change.Parent, change.Name)
+		id, err := entryNode(ctx, tx, r.store.volume, change.Parent, change.Name)
 		if err != nil {
 			return err
 		}
-		if err := removeEntry(ctx, tx, r.store.namespace, change.Parent, change.Name); err != nil {
+		if err := removeEntry(ctx, tx, r.store.volume, change.Parent, change.Name); err != nil {
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, id)
@@ -245,10 +245,10 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 		// none of their rows is touched. That is the property that made carrying the node in the
 		// change worth its cost, and it is the one a replica would give up if it discarded the
 		// subtree and asked for it again.
-		if err := removeEntry(ctx, tx, r.store.namespace, change.From.Parent, change.From.Name); err != nil {
+		if err := removeEntry(ctx, tx, r.store.volume, change.From.Parent, change.From.Name); err != nil {
 			return err
 		}
-		if err := insertEntry(ctx, tx, r.store.namespace, change.Parent, change.Name, change.Node.ID); err != nil {
+		if err := insertEntry(ctx, tx, r.store.volume, change.Parent, change.Name, change.Node.ID); err != nil {
 			return err
 		}
 		return updateNode(ctx, tx, *change.Node)
@@ -261,13 +261,13 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 
 // insertNode records a node under the id it arrived with. Its content key is dropped: see
 // the type's own comment for why a copy holds no keys.
-func insertNode(ctx context.Context, tx *sql.Tx, namespace int64, node metastore.Node) error {
+func insertNode(ctx context.Context, tx *sql.Tx, volume int64, node metastore.Node) error {
 	accessSec, accessNsec := sqlvalue.StoredTime(node.AccessTime)
 	changeSec, changeNsec := sqlvalue.StoredTime(node.ModTime)
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-		node.ID, namespace, int64(node.Mode), node.Size, accessSec, accessNsec, changeSec, changeNsec)
+		node.ID, volume, int64(node.Mode), node.Size, accessSec, accessNsec, changeSec, changeNsec)
 	return err
 }
 
@@ -286,29 +286,29 @@ func updateNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
 	return sqlvalue.ExactlyOne(result, fmt.Sprintf("node %d, which this copy does not hold", node.ID))
 }
 
-func insertEntry(ctx context.Context, tx *sql.Tx, namespace, parent int64, name []byte, node int64) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO entries (namespace, parent, name, node) VALUES (?, ?, ?, ?)`,
-		namespace, parent, name, node)
+func insertEntry(ctx context.Context, tx *sql.Tx, volume, parent int64, name []byte, node int64) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO entries (volume, parent, name, node) VALUES (?, ?, ?, ?)`,
+		volume, parent, name, node)
 	if err != nil && sqlerr.IsUniqueViolation(err) {
 		return fmt.Errorf("%w: %q under node %d is already taken in this copy", syscall.EIO, name, parent)
 	}
 	return err
 }
 
-func removeEntry(ctx context.Context, tx *sql.Tx, namespace, parent int64, name []byte) error {
+func removeEntry(ctx context.Context, tx *sql.Tx, volume, parent int64, name []byte) error {
 	result, err := tx.ExecContext(ctx,
-		`DELETE FROM entries WHERE namespace = ? AND parent = ? AND name = ?`, namespace, parent, name)
+		`DELETE FROM entries WHERE volume = ? AND parent = ? AND name = ?`, volume, parent, name)
 	if err != nil {
 		return err
 	}
 	return sqlvalue.ExactlyOne(result, fmt.Sprintf("%q under node %d, which this copy does not hold", name, parent))
 }
 
-func entryNode(ctx context.Context, tx *sql.Tx, namespace, parent int64, name []byte) (int64, error) {
+func entryNode(ctx context.Context, tx *sql.Tx, volume, parent int64, name []byte) (int64, error) {
 	var id int64
 	switch err := tx.QueryRowContext(ctx,
-		`SELECT node FROM entries WHERE namespace = ? AND parent = ? AND name = ?`,
-		namespace, parent, name).Scan(&id); {
+		`SELECT node FROM entries WHERE volume = ? AND parent = ? AND name = ?`,
+		volume, parent, name).Scan(&id); {
 	case errors.Is(err, sql.ErrNoRows):
 		return 0, fmt.Errorf("%w: the change names %q under node %d, which this copy does not hold",
 			syscall.EIO, name, parent)
@@ -396,10 +396,10 @@ type Seeding struct {
 // deleted while it names it, and that reference is one this schema means.
 func (s *Seeding) empty(ctx context.Context) error {
 	for _, statement := range []string{
-		`DELETE FROM entries WHERE namespace = ?`,
-		`DELETE FROM nodes WHERE namespace = ?`,
+		`DELETE FROM entries WHERE volume = ?`,
+		`DELETE FROM nodes WHERE volume = ?`,
 	} {
-		if _, err := s.tx.ExecContext(ctx, statement, s.replica.store.namespace); err != nil {
+		if _, err := s.tx.ExecContext(ctx, statement, s.replica.store.volume); err != nil {
 			return fmt.Errorf("emptying the copy: %w", sqlerr.Failure(err))
 		}
 	}
@@ -421,7 +421,7 @@ func (s *Seeding) add(ctx context.Context, row metastore.Row) error {
 		return fmt.Errorf("node identity %d is not positive: %w", row.Node.ID, syscall.EIO)
 	}
 	s.maxNodeID = max(s.maxNodeID, row.Node.ID)
-	if err := insertNode(ctx, s.tx, s.replica.store.namespace, row.Node); err != nil {
+	if err := insertNode(ctx, s.tx, s.replica.store.volume, row.Node); err != nil {
 		return err
 	}
 	// Parent 0 and no name is how a picture names the one node that has neither. Nothing else
@@ -433,7 +433,7 @@ func (s *Seeding) add(ctx context.Context, row metastore.Row) error {
 		s.root = row.Node.ID
 		return nil
 	}
-	return insertEntry(ctx, s.tx, s.replica.store.namespace, row.Parent, row.Name, row.Node.ID)
+	return insertEntry(ctx, s.tx, s.replica.store.volume, row.Parent, row.Name, row.Node.ID)
 }
 
 // Complete records that the picture was whole and that the copy stands at the position it was
@@ -447,8 +447,8 @@ func (s *Seeding) Complete(ctx context.Context, at metastore.Position) error {
 	if s.root == 0 {
 		return fmt.Errorf("%w: the picture carried no node without a parent, so it is not a tree", syscall.EIO)
 	}
-	if _, err := s.tx.ExecContext(ctx, `UPDATE namespaces SET root = ? WHERE id = ?`,
-		s.root, s.replica.store.namespace); err != nil {
+	if _, err := s.tx.ExecContext(ctx, `UPDATE volumes SET root = ? WHERE id = ?`,
+		s.root, s.replica.store.volume); err != nil {
 		return fmt.Errorf("completing the copy: %w", sqlerr.Failure(err))
 	}
 	highWater := max(s.nodeHighWater, s.maxNodeID)
@@ -488,7 +488,7 @@ func (s *Seeding) Complete(ctx context.Context, at metastore.Position) error {
 	}
 	s.replica.store.coordinator.health.Unlock()
 	// The root of the copy is the source's root, arrived with the picture. It is fixed for the
-	// life of a namespace, so it is read once rather than joined for on every path resolution,
+	// life of a volume, so it is read once rather than joined for on every path resolution,
 	// and this is the one moment at which it changes. Both are written before readers are let
 	// back in, which is what the exclusion this holds is for.
 	s.replica.store.root = s.root

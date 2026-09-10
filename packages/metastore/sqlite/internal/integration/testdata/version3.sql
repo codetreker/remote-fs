@@ -1,4 +1,4 @@
--- Frozen schema version 3 with two populated namespaces.
+-- Frozen schema version 3 with two populated volumes.
 -- DDL source: https://github.com/codetreker/remote-fs/blob/134e936ce3bde78a9db7becdfbccd72d6efe7536/packages/metastore/sqlite/testdata/schema.sql
 -- Tables precede indexes for execution; SQLite creates sqlite_sequence itself.
 -- Fixed rows exercise identity, content metadata, retained history, and durability migration.
@@ -11,7 +11,7 @@ CREATE TABLE backing_store (
 CREATE TABLE changes (
 	position          INTEGER PRIMARY KEY AUTOINCREMENT,
 	previous_position INTEGER NOT NULL,
-	namespace         INTEGER NOT NULL REFERENCES namespaces(id),
+	volume         INTEGER NOT NULL REFERENCES volumes(id),
 	kind              INTEGER NOT NULL,
 	parent            INTEGER NOT NULL,
 	name              BLOB,
@@ -38,22 +38,22 @@ CREATE TABLE database_state (
 ) WITHOUT ROWID;
 
 CREATE TABLE entries (
-	namespace INTEGER NOT NULL REFERENCES namespaces(id),
+	volume INTEGER NOT NULL REFERENCES volumes(id),
 	parent    INTEGER NOT NULL REFERENCES nodes(id),
 	name      BLOB    NOT NULL,
 	node      INTEGER NOT NULL REFERENCES nodes(id),
-	PRIMARY KEY (namespace, parent, name)
+	PRIMARY KEY (volume, parent, name)
 ) WITHOUT ROWID;
 
 CREATE TABLE logs (
-	namespace          INTEGER PRIMARY KEY REFERENCES namespaces(id),
+	volume          INTEGER PRIMARY KEY REFERENCES volumes(id),
 	incarnation        TEXT    NOT NULL,
 	committed_position INTEGER NOT NULL,
 	trimmed_through    INTEGER NOT NULL,
 	trimmed_by_age     INTEGER NOT NULL
 );
 
-CREATE TABLE namespaces (
+CREATE TABLE volumes (
 	id   INTEGER PRIMARY KEY AUTOINCREMENT,
 	name TEXT    NOT NULL UNIQUE,
 	root INTEGER NOT NULL,
@@ -62,7 +62,7 @@ CREATE TABLE namespaces (
 
 CREATE TABLE nodes (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	namespace  INTEGER NOT NULL REFERENCES namespaces(id),
+	volume  INTEGER NOT NULL REFERENCES volumes(id),
 	mode       INTEGER NOT NULL,
 	size       INTEGER NOT NULL,
 	atime_sec  INTEGER NOT NULL,
@@ -74,7 +74,7 @@ CREATE TABLE nodes (
 
 CREATE TABLE objects (
 	key          TEXT PRIMARY KEY,
-	namespace    INTEGER NOT NULL REFERENCES namespaces(id),
+	volume    INTEGER NOT NULL REFERENCES volumes(id),
 	state        INTEGER NOT NULL,
 	size         INTEGER NOT NULL,
 	digest       BLOB,
@@ -84,7 +84,7 @@ CREATE TABLE objects (
 
 CREATE TABLE schema_version (version INTEGER NOT NULL);
 
-CREATE INDEX changes_by_namespace ON changes (namespace, position);
+CREATE INDEX changes_by_volume ON changes (volume, position);
 
 CREATE INDEX changes_by_node_identity ON changes (
 	CASE
@@ -119,41 +119,41 @@ CREATE INDEX logs_by_change_identity ON logs (
 	max(committed_position, trimmed_through)
 );
 
-CREATE INDEX namespaces_by_root_identity ON namespaces (
+CREATE INDEX volumes_by_root_identity ON volumes (
 	CASE WHEN typeof(root) = 'integer' THEN 0 ELSE 1 END,
 	root
 );
 
 CREATE INDEX nodes_by_content ON nodes (content);
 
-CREATE INDEX objects_by_state ON objects (namespace, state, created_sec);
+CREATE INDEX objects_by_state ON objects (volume, state, created_sec);
 
 INSERT INTO schema_version (version) VALUES (3);
 
-INSERT INTO namespaces (id, name, root, used) VALUES
+INSERT INTO volumes (id, name, root, used) VALUES
     (1, 'A', 1, 5),
     (2, 'B', 3, 7);
 
-INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content) VALUES
+INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content) VALUES
     (1, 1, 2147484141, 0, 1700000000, 101, 1700000000, 102, NULL),
     (2, 1, 416, 5, 1700000100, 201, 1700000100, 202, 'historical-alpha-object'),
     (3, 2, 2147484141, 0, 1700000200, 301, 1700000200, 302, NULL),
     (4, 2, 384, 7, 1700000300, 401, 1700000300, 402, 'historical-bravo-object');
 
-INSERT INTO entries (namespace, parent, name, node) VALUES
+INSERT INTO entries (volume, parent, name, node) VALUES
     (1, 1, X'616C7068612E747874', 2),
     (2, 3, X'627261766F2E747874', 4);
 
-INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec) VALUES
+INSERT INTO objects (key, volume, state, size, digest, created_sec, created_nsec) VALUES
     ('historical-alpha-object', 1, 1, 5, X'8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8', 1700000100, 200),
     ('historical-bravo-object', 2, 1, 7, X'6cea34dead2db6cb9d17944e3d65f359f4091c2c1c68c3a0fbaaace005cd1ad3', 1700000300, 400);
 
-INSERT INTO logs (namespace, incarnation, committed_position, trimmed_through, trimmed_by_age) VALUES
+INSERT INTO logs (volume, incarnation, committed_position, trimmed_through, trimmed_by_age) VALUES
     (1, '11111111111111111111111111111111', 3, 0, 0),
     (2, '22222222222222222222222222222222', 4, 0, 0);
 
 INSERT INTO changes (
-    position, previous_position, namespace, kind, parent, name, from_parent, from_name,
+    position, previous_position, volume, kind, parent, name, from_parent, from_name,
     node, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content, recorded_sec, recorded_nsec
 ) VALUES
     (1, 0, 1, 0, 1, X'616C7068612E747874', NULL, NULL,

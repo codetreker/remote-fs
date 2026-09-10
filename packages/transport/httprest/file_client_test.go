@@ -11,7 +11,7 @@ import (
 
 func TestRetainedHTTPCancelLockReconcilesPendingAttempt(t *testing.T) {
 	ctx := t.Context()
-	backend := namespaceFixture(t)
+	backend := volumeFixture(t)
 	if err := backend.Write(ctx, "file", []byte("contents")); err != nil {
 		t.Fatal(err)
 	}

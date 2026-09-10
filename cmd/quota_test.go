@@ -1,10 +1,10 @@
-// The workspace allowance, from the flag that sets it to the tools that see it.
+// The volume allowance, from the flag that sets it to the tools that see it.
 //
 // R-WS-5 asks for a limit given by the deployer, three measured figures reported to
 // whatever runs on the mountpoint, and a refusal that lands on the write that caused it.
 // Each layer below proves its own part — the count and its arithmetic in
 // packages/metastore/sqlite, the reply to statfs(2) in packages/fuse — and none of them
-// says that a server started with -quota is a workspace df reports that allowance for.
+// says that a server started with -quota is a volume df reports that allowance for.
 package cmd_test
 
 import (
@@ -29,7 +29,7 @@ import (
 // multiples of it so that nothing here has to allow for what a floor division drops.
 const mountBlockSize = 4096
 
-// TestAServerUnderAnAllowanceReportsItAndRefusesPastIt drives one workspace to its limit
+// TestAServerUnderAnAllowanceReportsItAndRefusesPastIt drives one volume to its limit
 // with the tools an operator uses: df to see the allowance, ordinary writes to spend it.
 func TestAServerUnderAnAllowanceReportsItAndRefusesPastIt(t *testing.T) {
 	requireFUSE(t)
@@ -42,13 +42,13 @@ func TestAServerUnderAnAllowanceReportsItAndRefusesPastIt(t *testing.T) {
 
 	total, used, avail := roomAt(t, mountpoint)
 	if total != allowance || used != 0 || avail != allowance {
-		t.Fatalf("df reports %d bytes with %d used and %d available, over an empty workspace under an allowance of %d",
+		t.Fatalf("df reports %d bytes with %d used and %d available, over an empty volume under an allowance of %d",
 			total, used, avail, allowance)
 	}
 
 	const half = allowance / 2
 	if err := os.WriteFile(filepath.Join(mountpoint, "half.bin"), make([]byte, half), 0o644); err != nil {
-		t.Fatalf("writing %d bytes into a workspace with %d free: %v", half, allowance, err)
+		t.Fatalf("writing %d bytes into a volume with %d free: %v", half, allowance, err)
 	}
 	total, used, avail = roomAt(t, mountpoint)
 	if total != allowance || used != half || avail != allowance-half {
@@ -63,14 +63,14 @@ func TestAServerUnderAnAllowanceReportsItAndRefusesPastIt(t *testing.T) {
 	// More than the whole allowance is written rather than merely more than what is left,
 	// because a mount weighs a write against a figure it may have measured up to a second
 	// earlier: one taken before half.bin would let a write of what is left through here and
-	// leave the commit to refuse it. That the figure accounts for what the workspace already
+	// leave the commit to refuse it. That the figure accounts for what the volume already
 	// holds is the next test's business.
 	written, err := writeThrough(t, filepath.Join(mountpoint, "big.bin"), allowance+mountBlockSize)
 	if err == nil {
-		t.Fatalf("write(2) took %d bytes into a workspace of %d holding %d", written, allowance, half)
+		t.Fatalf("write(2) took %d bytes into a volume of %d holding %d", written, allowance, half)
 	}
 	if errno := errnoOf(err); errno != syscall.EDQUOT {
-		t.Fatalf("write(2) failed with %v (errno %v), want EDQUOT: this workspace has spent its allowance, "+
+		t.Fatalf("write(2) failed with %v (errno %v), want EDQUOT: this volume has spent its allowance, "+
 			"and \"no space left on device\" would be a claim about the machine", err, errno)
 	}
 	t.Logf("write(2) past the allowance: %v", err)
@@ -79,18 +79,18 @@ func TestAServerUnderAnAllowanceReportsItAndRefusesPastIt(t *testing.T) {
 	switch attr, err := dial(t, srv).Stat(t.Context(), "big.bin"); {
 	case errors.Is(err, syscall.ENOENT):
 	case err != nil:
-		t.Fatalf("stat rejected file in the authoritative namespace: %v", err)
+		t.Fatalf("stat rejected file in the authoritative volume: %v", err)
 	case attr.Size != 0:
-		t.Fatalf("the authoritative namespace published %d rejected bytes", attr.Size)
+		t.Fatalf("the authoritative volume published %d rejected bytes", attr.Size)
 	}
 	if _, used, _ = roomAt(t, mountpoint); used != half {
 		t.Fatalf("df reports %d bytes used after a refused write, want the %d that were written before it", used, half)
 	}
 }
 
-// A restarted server must charge against the persisted workspace usage before its first
+// A restarted server must charge against the persisted volume usage before its first
 // mounted write, including when the attempted write is smaller than the total allowance.
-func TestAnAllowanceIsSpentAgainstWhatTheWorkspaceAlreadyHolds(t *testing.T) {
+func TestAnAllowanceIsSpentAgainstWhatTheVolumeAlreadyHolds(t *testing.T) {
 	requireFUSE(t)
 
 	const allowance = 64 << 10
@@ -99,7 +99,7 @@ func TestAnAllowanceIsSpentAgainstWhatTheWorkspaceAlreadyHolds(t *testing.T) {
 	root := privateDirectory(t)
 	seed := startLocalStoreServerBinary(t, root, "64K")
 	if err := dial(t, seed).Write(t.Context(), "held.bin", make([]byte, held)); err != nil {
-		t.Fatalf("seed existing workspace usage: %v", err)
+		t.Fatalf("seed existing volume usage: %v", err)
 	}
 	seed.interrupt(t)
 	if err := seed.wait(t); err != nil {
@@ -111,19 +111,19 @@ func TestAnAllowanceIsSpentAgainstWhatTheWorkspaceAlreadyHolds(t *testing.T) {
 	mountpoint := t.TempDir()
 	mount := startMountBinary(t, "-server", srv.url, "-mountpoint", mountpoint, "-debug")
 
-	// Under the allowance, over what is left of it. A workspace weighing this against the
+	// Under the allowance, over what is left of it. A volume weighing this against the
 	// allowance alone would take it and end up holding more than it may. Nothing has been
 	// written through this mount yet, so the figure it weighs the write against is the one
 	// the reopened metastore reports.
 	tooMuch := held + mountBlockSize
 	written, err := writeThrough(t, filepath.Join(mountpoint, "over.bin"), tooMuch)
 	if errno := errnoOf(err); errno != syscall.EDQUOT {
-		t.Fatalf("write(2) of %d bytes took %d of them and failed with %v (errno %v), into a workspace of %d holding %d already; want EDQUOT",
+		t.Fatalf("write(2) of %d bytes took %d of them and failed with %v (errno %v), into a volume of %d holding %d already; want EDQUOT",
 			tooMuch, written, err, errno, allowance, held)
 	}
 
 	// What is left is still there to be written, which is the difference between a
-	// workspace that is full and one that refuses everything.
+	// volume that is full and one that refuses everything.
 	fits := allowance - held - mountBlockSize
 	if err := os.WriteFile(filepath.Join(mountpoint, "fits.bin"), make([]byte, fits), 0o644); err != nil {
 		remote := dial(t, srv)
@@ -131,11 +131,11 @@ func TestAnAllowanceIsSpentAgainstWhatTheWorkspaceAlreadyHolds(t *testing.T) {
 		overAttr, overErr := remote.Stat(t.Context(), "over.bin")
 		space, spaceErr := remote.Space(t.Context())
 		t.Logf("authority after failed open: fits=%+v (%v), over=%+v (%v), space=%+v (%v)", fitsAttr, fitsErr, overAttr, overErr, space, spaceErr)
-		t.Fatalf("writing %d bytes into a workspace with %d left: %v\nmount output:\n%s\nserver output:\n%s", fits, allowance-held, err, mount.output(), srv.output())
+		t.Fatalf("writing %d bytes into a volume with %d left: %v\nmount output:\n%s\nserver output:\n%s", fits, allowance-held, err, mount.output(), srv.output())
 	}
 	total, used, avail := roomAt(t, mountpoint)
 	if total != allowance || used != int64(held+fits) || avail != int64(allowance-held-fits) {
-		t.Fatalf("df reports %d bytes with %d used and %d available, over a workspace of %d holding %d and %d",
+		t.Fatalf("df reports %d bytes with %d used and %d available, over a volume of %d holding %d and %d",
 			total, used, avail, allowance, held, fits)
 	}
 }
@@ -150,11 +150,11 @@ func TestHangingUpReportsLocalStoreState(t *testing.T) {
 	before := spaceOf(t, client)
 	srv.hangup(t)
 	line := srv.awaitLine(t, "local-store status", startup)
-	if !strings.Contains(line, fmt.Sprintf("%d of %d workspace bytes used", held, before.Total)) {
-		t.Fatalf("status omitted the current workspace usage: %s", line)
+	if !strings.Contains(line, fmt.Sprintf("%d of %d volume bytes used", held, before.Total)) {
+		t.Fatalf("status omitted the current volume usage: %s", line)
 	}
 	if after := spaceOf(t, client); after != before {
-		t.Fatalf("SIGHUP changed workspace accounting: before=%+v, after=%+v", before, after)
+		t.Fatalf("SIGHUP changed volume accounting: before=%+v, after=%+v", before, after)
 	}
 	if _, err := client.List(t.Context(), ""); err != nil {
 		t.Fatalf("list after SIGHUP: %v", err)
@@ -233,7 +233,7 @@ func spaceOf(t *testing.T, s storage.Storage) storage.Space {
 	t.Helper()
 	space, err := s.Space(context.Background())
 	if err != nil {
-		t.Fatalf("asking the server what the namespace holds: %v", err)
+		t.Fatalf("asking the server what the volume holds: %v", err)
 	}
 	return space
 }

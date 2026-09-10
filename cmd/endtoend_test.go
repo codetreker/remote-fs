@@ -20,14 +20,14 @@ import (
 //	machine B:   cat /mnt/ws/a.txt        →  hello      (within one second)
 //
 // Here the two machines are two mountpoints with a client each, against one server over one
-// namespace. What that arrangement leaves out is the network between two hosts; what it keeps
+// volume. What that arrangement leaves out is the network between two hosts; what it keeps
 // is every piece of this system that stands between the write and the read — including the
 // copy of the metadata each mountpoint keeps, and the stream of changes that feeds it.
 //
 // Visibility starts when Write returns. The writer remains open while another mount
 // reads the completed change, so neither Close nor Fsync can trigger its publication.
 func TestWhatOneMountpointWritesAnotherReads(t *testing.T) {
-	s := serveNamespace(t)
+	s := serveVolume(t)
 	a, b := mountpointOn(t, s), mountpointOn(t, s)
 
 	content := []byte("hello\n")
@@ -73,7 +73,7 @@ func TestWhatOneMountpointWritesAnotherReads(t *testing.T) {
 
 // Reading the authoritative storage bypasses the mount and its metadata replica.
 func TestTheBytesReachAuthoritativeStorage(t *testing.T) {
-	s := serveNamespace(t)
+	s := serveVolume(t)
 	a := mountpointOn(t, s)
 	content := []byte("hello\n")
 	if err := os.WriteFile(filepath.Join(a, "a.txt"), content, 0o644); err != nil {
@@ -84,7 +84,7 @@ func TestTheBytesReachAuthoritativeStorage(t *testing.T) {
 		t.Fatalf("read authoritative a.txt: %v", err)
 	}
 	if !bytes.Equal(got, content) {
-		t.Fatalf("the authoritative namespace holds %q, A wrote %q", got, content)
+		t.Fatalf("the authoritative volume holds %q, A wrote %q", got, content)
 	}
 }
 
@@ -92,7 +92,7 @@ func TestTheBytesReachAuthoritativeStorage(t *testing.T) {
 // test does not: reading a file by name proves the name resolves, not that the directory
 // reports it. Anything that walks a tree finds files this way.
 func TestACreationOnOneMountpointAppearsInAListingOnTheOther(t *testing.T) {
-	s := serveNamespace(t)
+	s := serveVolume(t)
 	a, b := mountpointOn(t, s), mountpointOn(t, s)
 
 	if err := os.WriteFile(filepath.Join(a, "a.txt"), []byte("hello\n"), 0o644); err != nil {
@@ -107,7 +107,7 @@ func TestACreationOnOneMountpointAppearsInAListingOnTheOther(t *testing.T) {
 // TestARemovalOnOneMountpointDisappearsFromTheOther. A deletion that does not propagate
 // is how a mount starts serving files that are gone.
 func TestARemovalOnOneMountpointDisappearsFromTheOther(t *testing.T) {
-	s := serveNamespace(t)
+	s := serveVolume(t)
 	a, b := mountpointOn(t, s), mountpointOn(t, s)
 
 	if err := os.WriteFile(filepath.Join(a, "a.txt"), []byte("hello\n"), 0o644); err != nil {
@@ -134,7 +134,7 @@ func TestARemovalOnOneMountpointDisappearsFromTheOther(t *testing.T) {
 // file is worse than one that does not arrive: everything that walks the tree stops
 // there and reports the subtree as absent.
 func TestADirectoryMadeOnOneMountpointIsADirectoryOnTheOther(t *testing.T) {
-	s := serveNamespace(t)
+	s := serveVolume(t)
 	a, b := mountpointOn(t, s), mountpointOn(t, s)
 
 	if err := os.Mkdir(filepath.Join(a, "d"), 0o755); err != nil {
@@ -162,7 +162,7 @@ func TestADirectoryMadeOnOneMountpointIsADirectoryOnTheOther(t *testing.T) {
 // the old name survive would leave whatever is watching the directory with two files
 // where the writer left one, and no way to tell which is current.
 func TestARenameOnOneMountpointIsSeenAsARename(t *testing.T) {
-	s := serveNamespace(t)
+	s := serveVolume(t)
 	a, b := mountpointOn(t, s), mountpointOn(t, s)
 
 	content := []byte("hello\n")
@@ -193,7 +193,7 @@ func TestARenameOnOneMountpointIsSeenAsARename(t *testing.T) {
 // a replacement done in place: contents written over a longer file leave the old tail
 // behind, and the result reads as a file that was never written by anyone (R-CON-3).
 func TestAnOverwriteOnOneMountpointIsSeenWhole(t *testing.T) {
-	s := serveNamespace(t)
+	s := serveVolume(t)
 	a, b := mountpointOn(t, s), mountpointOn(t, s)
 
 	path := filepath.Join(a, "a.txt")
@@ -222,17 +222,17 @@ func TestAnOverwriteOnOneMountpointIsSeenWhole(t *testing.T) {
 // A symbolic-link kind and target length must survive both HTTP and FUSE. The storage
 // interface describes links but provides no operation to resolve their targets.
 func TestASymbolicLinkSurvivesTheWholeChain(t *testing.T) {
-	namespace, _ := namespaceFixture(t)
+	volume, _ := volumeFixture(t)
 	for name, content := range map[string]string{"target": "payload\n", "link": "target"} {
-		if err := namespace.Write(t.Context(), name, []byte(content)); err != nil {
+		if err := volume.Write(t.Context(), name, []byte(content)); err != nil {
 			t.Fatalf("seed symbolic-link fixture: %v", err)
 		}
 	}
-	link, err := namespace.Stat(t.Context(), "link")
+	link, err := volume.Stat(t.Context(), "link")
 	if err != nil {
 		t.Fatalf("stat symbolic-link fixture: %v", err)
 	}
-	s := serveStorage(t, &symlinkMetadata{Storage: namespace, linkID: link.ID}, nil)
+	s := serveStorage(t, &symlinkMetadata{Storage: volume, linkID: link.ID}, nil)
 	a := mountpointOn(t, s)
 
 	got, err := os.Lstat(filepath.Join(a, "link"))
@@ -263,7 +263,7 @@ func TestASymbolicLinkSurvivesTheWholeChain(t *testing.T) {
 		t.Errorf("the listing reports the link as %v, and a lookup reports %v", listed["link"], got.Mode().Type())
 	}
 
-	// Where it points is the one thing that cannot be answered: no operation the namespace
+	// Where it points is the one thing that cannot be answered: no operation the volume
 	// offers could produce it, and EOPNOTSUPP says that rather than saying this is not a
 	// link.
 	if target, err := os.Readlink(filepath.Join(a, "link")); !errors.Is(err, syscall.EOPNOTSUPP) {
@@ -274,7 +274,7 @@ func TestASymbolicLinkSurvivesTheWholeChain(t *testing.T) {
 // TestAnUnreachableServerFailsRatherThanAnswering is the test that matters more than the
 // happy path.
 //
-// A directory listing that comes back empty says the namespace has nothing in it, and
+// A directory listing that comes back empty says the volume has nothing in it, and
 // whatever is watching acts on that: it regenerates, it propagates the deletion, it
 // overwrites. There is no way to notice afterwards and no way back. The same goes for
 // "no such file" in place of "I could not ask" (R-ERR-1, R-ERR-2).
@@ -282,8 +282,8 @@ func TestASymbolicLinkSurvivesTheWholeChain(t *testing.T) {
 // Every operation the contract offers resolves its own failure, so each gets a case of its
 // own here rather than one standing in for the rest.
 func TestAnUnreachableServerFailsRatherThanAnswering(t *testing.T) {
-	s := serveNamespace(t)
-	a, served := mountNamespaceOn(t, s)
+	s := serveVolume(t)
+	a, served := mountVolumeOn(t, s)
 	if _, ok := served.(*replicated.Storage); !ok {
 		t.Fatalf("mount storage is %T, want a metadata replica", served)
 	}
@@ -342,7 +342,7 @@ func TestAnUnreachableServerFailsRatherThanAnswering(t *testing.T) {
 				t.Fatal("the operation succeeded; the server is gone and this outcome is invented")
 			}
 			if errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("the operation failed with %v; \"no such file\" is a claim about the namespace, and the truth is that it could not be reached", err)
+				t.Fatalf("the operation failed with %v; \"no such file\" is a claim about the volume, and the truth is that it could not be reached", err)
 			}
 			if errno := errnoOf(err); errno != syscall.EIO {
 				t.Fatalf("the operation failed with %v (errno %v), want EIO", err, errno)

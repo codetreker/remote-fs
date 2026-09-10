@@ -27,13 +27,13 @@ func completionHandle(t *testing.T, opts Options, finish func(context.Context) e
 	if err != nil {
 		t.Fatal(err)
 	}
-	ns := activeTestNamespace(nil, 1024)
-	ns.flushTimeout = timeout
-	return newHandle(&node{ns: ns}, completionFile{finish: finish}, true, true)
+	v := activeTestVolume(nil, 1024)
+	v.flushTimeout = timeout
+	return newHandle(&node{volume: v}, completionFile{finish: finish}, true, true)
 }
 
 func completeHandleClose(ctx context.Context, h *handle) error {
-	completion, cancel := h.node.ns.cleanupContext(ctx)
+	completion, cancel := h.node.volume.cleanupContext(ctx)
 	defer cancel()
 	return h.closeFile(completion)
 }
@@ -162,8 +162,8 @@ func TestCloseCleanupDoesNotRetryIndependentFailures(t *testing.T) {
 		if again := completeHandleClose(t.Context(), h); again != err || calls != 1 {
 			t.Fatalf("repeated failed cleanup returned %v, calls=%d", again, calls)
 		}
-		if errnoOf(h.node.ns.check()) != syscall.EIO {
-			t.Fatal("unknown reference cleanup did not fence the namespace")
+		if errnoOf(h.node.volume.check()) != syscall.EIO {
+			t.Fatal("unknown reference cleanup did not fence the volume")
 		}
 	}
 }

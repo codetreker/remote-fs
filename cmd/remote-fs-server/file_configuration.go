@@ -24,7 +24,7 @@ func defaultFileBackendOptions() fileBackendOptions {
 
 func bindFileOptions(flags *flag.FlagSet, backend *fileBackendOptions, files *httprest.FileLimits) {
 	flags.IntVar(&backend.retained, "max-retained-files", backend.retained,
-		"maximum live native file references in the namespace, including unlinked files")
+		"maximum live native file references in the volume, including unlinked files")
 	flags.Var((*fileByteLimit)(&backend.advisory.MaxFileBytes), "max-file-size",
 		"largest retained file object, as SIZE; writes and truncation above it fail with EFBIG.\n"+
 			"The default is capped by configured object and pending-byte limits")
@@ -34,7 +34,7 @@ func bindFileOptions(flags *flag.FlagSet, backend *fileBackendOptions, files *ht
 	flags.DurationVar(&backend.advisory.FileOperationTimeout, "file-operation-timeout", backend.advisory.FileOperationTimeout,
 		"maximum native time for one retained-file operation, including content revision retries")
 	flags.IntVar(&files.MaxSessions, "http-max-file-sessions", files.MaxSessions,
-		"maximum file sessions owned by this server and admitted by its namespace")
+		"maximum file sessions owned by this server and admitted by its volume")
 	flags.IntVar(&files.MaxActions, "http-max-file-actions", files.MaxActions,
 		"maximum retained file action results in one HTTP session")
 	flags.IntVar(&files.MaxCleanupActions, "http-max-file-cleanup-actions", files.MaxCleanupActions,

@@ -37,7 +37,7 @@ func (s *Store) enableLocks(ctx context.Context, options locking.Options, persis
 
 func (s *Store) attachLocksLocked(ctx context.Context, options locking.Options, persistence locking.Persistence) error {
 	if s.closed || s.locks != nil {
-		return locking.Wrap(locking.Invalid, "lock authority is already attached or the namespace is closed", nil)
+		return locking.Wrap(locking.Invalid, "lock authority is already attached or the volume is closed", nil)
 	}
 	if err := s.coordinator.healthy(); err != nil {
 		return err
@@ -50,7 +50,7 @@ func (s *Store) attachLocksLocked(ctx context.Context, options locking.Options, 
 	return nil
 }
 
-// LockService returns this namespace's bound authority, or nil when locking is disabled.
+// LockService returns this volume's bound authority, or nil when locking is disabled.
 func (s *Store) LockService() locking.Service {
 	if s.locks == nil {
 		return nil
@@ -58,7 +58,7 @@ func (s *Store) LockService() locking.Service {
 	return s.locks
 }
 
-// CheckPublicationAccounting reports support for accounting at the final namespace transition.
+// CheckPublicationAccounting reports support for accounting at the final volume transition.
 func (s *Store) CheckPublicationAccounting() error { return nil }
 
 func (s *Store) beginHealthyRead(ctx context.Context) error {
@@ -108,7 +108,7 @@ func (n sqliteNative) Guard(ctx context.Context, key locking.BackendKey, transit
 	}
 	return n.ordered(ctx, func(tx *sql.Tx) error {
 		node, err := scanNode(tx.QueryRowContext(ctx,
-			`SELECT `+nodeColumns+` FROM nodes n WHERE n.namespace = ? AND n.id = ? AND n.detached = 0`, n.store.namespace, id))
+			`SELECT `+nodeColumns+` FROM nodes n WHERE n.volume = ? AND n.id = ? AND n.detached = 0`, n.store.volume, id))
 		if errors.Is(err, sql.ErrNoRows) {
 			return locking.Wrap(locking.StaleResource, "the resolved file no longer exists", err)
 		}
@@ -137,13 +137,13 @@ func (n sqliteNative) ordered(ctx context.Context, read func(*sql.Tx) error, tra
 }
 
 func (s *Store) backendKey(id int64) locking.BackendKey {
-	return locking.BackendKey(strconv.FormatInt(s.namespace, 10) + ":" + strconv.FormatInt(id, 10))
+	return locking.BackendKey(strconv.FormatInt(s.volume, 10) + ":" + strconv.FormatInt(id, 10))
 }
 
 func (s *Store) backendNode(key locking.BackendKey) (int64, error) {
-	prefix := strconv.FormatInt(s.namespace, 10) + ":"
+	prefix := strconv.FormatInt(s.volume, 10) + ":"
 	if !strings.HasPrefix(string(key), prefix) {
-		return 0, locking.Wrap(locking.StaleResource, "resource belongs to another namespace", nil)
+		return 0, locking.Wrap(locking.StaleResource, "resource belongs to another volume", nil)
 	}
 	id, err := strconv.ParseInt(strings.TrimPrefix(string(key), prefix), 10, 64)
 	if err != nil || id < 1 || s.backendKey(id) != key {
@@ -152,15 +152,15 @@ func (s *Store) backendNode(key locking.BackendKey) (int64, error) {
 	return id, nil
 }
 
-type namespaceIntent struct {
+type volumeIntent struct {
 	kind    locking.MutationKind
 	paths   []string
 	node    int64
 	cleanup bool
 }
 
-type namespacePublication struct {
-	intent   namespaceIntent
+type volumePublication struct {
+	intent   volumeIntent
 	targets  []locking.BackendKey
 	nodes    []int64
 	retired  []locking.BackendKey
@@ -168,12 +168,12 @@ type namespacePublication struct {
 	next     int64
 }
 
-func (s *Store) mutateNamespace(ctx context.Context, kind locking.MutationKind, paths []string, mutate func(*sql.Tx) error) error {
-	return s.mutatePublication(ctx, &namespaceIntent{kind: kind, paths: paths}, mutate)
+func (s *Store) mutateVolume(ctx context.Context, kind locking.MutationKind, paths []string, mutate func(*sql.Tx) error) error {
+	return s.mutatePublication(ctx, &volumeIntent{kind: kind, paths: paths}, mutate)
 }
 
-func (s *Store) prepareNamespacePublication(ctx context.Context, tx *sql.Tx, intent namespaceIntent) (*namespacePublication, error) {
-	publication := &namespacePublication{intent: intent}
+func (s *Store) prepareVolumePublication(ctx context.Context, tx *sql.Tx, intent volumeIntent) (*volumePublication, error) {
+	publication := &volumePublication{intent: intent}
 	if intent.node != 0 {
 		state, err := s.fileState(ctx, tx, intent.node)
 		if err != nil {
@@ -218,7 +218,7 @@ func (s *Store) prepareNamespacePublication(ctx context.Context, tx *sql.Tx, int
 	return publication, nil
 }
 
-func (s *Store) finishNamespacePublication(ctx context.Context, tx *sql.Tx, publication *namespacePublication) error {
+func (s *Store) finishVolumePublication(ctx context.Context, tx *sql.Tx, publication *volumePublication) error {
 	if publication.intent.kind == locking.WriteMutation {
 		var node metastore.Node
 		var err error
@@ -235,7 +235,7 @@ func (s *Store) finishNamespacePublication(ctx context.Context, tx *sql.Tx, publ
 	for i, id := range publication.nodes {
 		var present bool
 		if err := tx.QueryRowContext(ctx,
-			`SELECT EXISTS(SELECT 1 FROM nodes WHERE namespace = ? AND id = ? AND detached = 0)`, s.namespace, id).Scan(&present); err != nil {
+			`SELECT EXISTS(SELECT 1 FROM nodes WHERE volume = ? AND id = ? AND detached = 0)`, s.volume, id).Scan(&present); err != nil {
 			return err
 		}
 		if !present {
@@ -248,7 +248,7 @@ func (s *Store) finishNamespacePublication(ctx context.Context, tx *sql.Tx, publ
 		var retained int64
 		for _, id := range publication.nodes {
 			var size int64
-			err := tx.QueryRowContext(ctx, `SELECT size FROM nodes WHERE namespace=? AND id=? AND detached=1`, s.namespace, id).Scan(&size)
+			err := tx.QueryRowContext(ctx, `SELECT size FROM nodes WHERE volume=? AND id=? AND detached=1`, s.volume, id).Scan(&size)
 			if errors.Is(err, sql.ErrNoRows) {
 				continue
 			}
@@ -262,7 +262,7 @@ func (s *Store) finishNamespacePublication(ctx context.Context, tx *sql.Tx, publ
 	return nil
 }
 
-func (s *Store) publishNamespace(ctx context.Context, tx *sql.Tx, state DurableState, publication *namespacePublication) error {
+func (s *Store) publishVolume(ctx context.Context, tx *sql.Tx, state DurableState, publication *volumePublication) error {
 	scope := locking.ScopeFromContext(ctx)
 	commit := func() locking.PublicationOutcome {
 		if !publication.intent.cleanup {
@@ -301,7 +301,7 @@ func (s *Store) publishNamespace(ctx context.Context, tx *sql.Tx, state DurableS
 			return err
 		}
 		if scope.Owner != (locking.OwnerRef{}) || len(scope.Grants) != 0 {
-			return locking.Wrap(locking.Unavailable, "this namespace has no lock authority", nil)
+			return locking.Wrap(locking.Unavailable, "this volume has no lock authority", nil)
 		}
 		return commit().Err
 	}

@@ -70,7 +70,7 @@ func TestSnapshotRefusesLiveStorageClassCorruptionBeforeReturningAPicture(t *tes
 		t.Fatal(err)
 	}
 	damageDatabase(t, path,
-		`UPDATE entries SET name = 'text-name' WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')`)
+		`UPDATE entries SET name = 'text-name' WHERE volume = (SELECT id FROM volumes WHERE name = 'workspace')`)
 
 	snap, _, err := store.Snapshot(t.Context())
 	if err == nil {
@@ -84,9 +84,9 @@ func TestSnapshotRefusesLiveStorageClassCorruptionBeforeReturningAPicture(t *tes
 	}
 }
 
-// The entry table's namespace must agree with the node's. A picture must hold this
-// namespace's tree and nothing of the one beside it.
-func TestAPictureHoldsItsOwnNamespaceOnly(t *testing.T) {
+// The entry table's volume must agree with the node's. A picture must hold this
+// volume's tree and nothing of the one beside it.
+func TestAPictureHoldsItsOwnVolumeOnly(t *testing.T) {
 	path := database(t)
 	store := open(t, path, "workspace", 0)
 	other := open(t, path, "elsewhere", 0)
@@ -130,7 +130,7 @@ func TestAPictureHoldsItsOwnNamespaceOnly(t *testing.T) {
 	}
 	for name := range held {
 		if strings.HasPrefix(name, "theirs") {
-			t.Fatalf("the picture holds %q, which belongs to the namespace beside it", name)
+			t.Fatalf("the picture holds %q, which belongs to the volume beside it", name)
 		}
 	}
 	if !held["d"] || !held["mine19"] {

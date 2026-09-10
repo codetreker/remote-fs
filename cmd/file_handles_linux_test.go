@@ -31,7 +31,7 @@ func TestBinariesRetainLiveFilesAndExclusiveAdvisoryLocks(t *testing.T) {
 					}
 				}
 			})
-			server := startServerBinary(t, append(binaryLockNamespace(t, mode), "-initialize-lock-state")...)
+			server := startServerBinary(t, append(binaryLockVolume(t, mode), "-initialize-lock-state")...)
 			logs = append(logs, processLog{"server", server.process})
 			remote := dialLockServer(t, server)
 			if err := remote.Write(t.Context(), "artifact", []byte("original")); err != nil {
@@ -96,7 +96,7 @@ func TestBinaryRestartRetiresOldDescriptorsAndAdvisoryLocks(t *testing.T) {
 	requireFUSE(t)
 	for _, mode := range []string{"local-store", "azure-blob"} {
 		t.Run(mode, func(t *testing.T) {
-			args := append(binaryLockNamespace(t, mode), "-lock-max-lease", "200ms")
+			args := append(binaryLockVolume(t, mode), "-lock-max-lease", "200ms")
 			first := startServerBinary(t, append(args, "-initialize-lock-state")...)
 			remote := dialLockServer(t, first)
 			if err := remote.Write(t.Context(), "artifact", []byte("original")); err != nil {

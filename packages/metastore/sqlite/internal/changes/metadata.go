@@ -19,7 +19,7 @@ import (
 const changeMetadataColumns = `
 	CASE WHEN typeof(position) = 'integer' THEN position END, typeof(position),
 	CASE WHEN typeof(previous_position) = 'integer' THEN previous_position END, typeof(previous_position),
-	CASE WHEN typeof(namespace) = 'integer' THEN namespace END, typeof(namespace),
+	CASE WHEN typeof(volume) = 'integer' THEN volume END, typeof(volume),
 	CASE WHEN typeof(kind) = 'integer' THEN kind END, typeof(kind),
 	CASE WHEN typeof(parent) = 'integer' THEN parent END, typeof(parent),
 	COALESCE(length(CAST(name AS BLOB)), 0), typeof(name),
@@ -42,23 +42,23 @@ type rowScanner interface {
 
 func scanChangeMetadata(
 	row rowScanner,
-	expectedNamespace int64,
+	expectedVolume int64,
 ) (metastore.Change, metastore.ChangePayloadLengths, int64, error) {
 	var (
-		positionRaw, previousRaw, namespaceRaw, kindRaw, parentRaw      any
-		fromParentRaw, idRaw, modeRaw, sizeRaw                          any
-		atimeSecRaw, atimeNsecRaw, mtimeSecRaw, mtimeNsecRaw            any
-		recordedSecRaw, recordedNsecRaw                                 any
-		positionType, previousType, namespaceType, kindType, parentType string
-		nameType, fromParentType, fromNameType                          string
-		idType, modeType, sizeType                                      string
-		atimeSecType, atimeNsecType, mtimeSecType, mtimeNsecType        string
-		contentType, recordedSecType, recordedNsecType                  string
-		lengths                                                         metastore.ChangePayloadLengths
+		positionRaw, previousRaw, volumeRaw, kindRaw, parentRaw      any
+		fromParentRaw, idRaw, modeRaw, sizeRaw                       any
+		atimeSecRaw, atimeNsecRaw, mtimeSecRaw, mtimeNsecRaw         any
+		recordedSecRaw, recordedNsecRaw                              any
+		positionType, previousType, volumeType, kindType, parentType string
+		nameType, fromParentType, fromNameType                       string
+		idType, modeType, sizeType                                   string
+		atimeSecType, atimeNsecType, mtimeSecType, mtimeNsecType     string
+		contentType, recordedSecType, recordedNsecType               string
+		lengths                                                      metastore.ChangePayloadLengths
 	)
 	if err := row.Scan(
 		&positionRaw, &positionType, &previousRaw, &previousType,
-		&namespaceRaw, &namespaceType, &kindRaw, &kindType,
+		&volumeRaw, &volumeType, &kindRaw, &kindType,
 		&parentRaw, &parentType, &lengths.Name, &nameType,
 		&fromParentRaw, &fromParentType, &lengths.FromName, &fromNameType,
 		&idRaw, &idType, &modeRaw, &modeType, &sizeRaw, &sizeType,
@@ -77,7 +77,7 @@ func scanChangeMetadata(
 	if err != nil {
 		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
 	}
-	namespace, err := requiredStoredInteger("namespace", namespaceRaw, namespaceType)
+	volume, err := requiredStoredInteger("volume", volumeRaw, volumeType)
 	if err != nil {
 		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
 	}
@@ -152,7 +152,7 @@ func scanChangeMetadata(
 			ModTime:    sqlvalue.LoadedTime(mtimeSec.Int64, int32(mtimeNsec.Int64)),
 		}
 	}
-	if err := validateChangeMetadata(change, lengths, namespace, expectedNamespace,
+	if err := validateChangeMetadata(change, lengths, volume, expectedVolume,
 		nameType, fromNameType, contentType, id, mode, size, atimeSec, atimeNsec,
 		mtimeSec, mtimeNsec, recordedSec, recordedNsec); err != nil {
 		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
@@ -190,12 +190,12 @@ func invalidStoredChangeScalar(position int64, column, storageClass string) erro
 func validateChangeMetadata(
 	change metastore.Change,
 	lengths metastore.ChangePayloadLengths,
-	namespace, expectedNamespace int64,
+	volume, expectedVolume int64,
 	nameType, fromNameType, contentType string,
 	id, mode, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec sql.NullInt64,
 	recordedSec, recordedNsec int64,
 ) error {
-	if change.Position <= 0 || namespace <= 0 || namespace != expectedNamespace || change.Parent < 0 ||
+	if change.Position <= 0 || volume <= 0 || volume != expectedVolume || change.Parent < 0 ||
 		recordedNsec < 0 || recordedNsec >= int64(time.Second) {
 		return fmt.Errorf("%w: change position %d has invalid identity, parent, or recorded time", syscall.EIO, change.Position)
 	}

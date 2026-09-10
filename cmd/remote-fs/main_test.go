@@ -102,13 +102,13 @@ func TestMutationConfirmationLimitsAreInCommandHelp(t *testing.T) {
 }
 
 func TestHTTPFrameLimitIsForwardedToTheReplicationClient(t *testing.T) {
-	url, namespace := serveNamespace(t)
+	url, volume := serveVolume(t)
 	longName := strings.Repeat("x", 1500)
-	if err := namespace.Create(t.Context(), longName); err != nil {
+	if err := volume.Create(t.Context(), longName); err != nil {
 		t.Fatalf("creating a row larger than the minimum frame: %v", err)
 	}
 
-	small, err := dialNamespace(url, startup, 1024)
+	small, err := dialVolume(url, startup, 1024)
 	if err != nil {
 		t.Fatalf("dialling with the minimum frame bound: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestHTTPFrameLimitIsForwardedToTheReplicationClient(t *testing.T) {
 		t.Fatal("a 1024-byte client accepted the larger replication frame")
 	}
 
-	large, err := dialNamespace(url, startup, 4096)
+	large, err := dialVolume(url, startup, 4096)
 	if err != nil {
 		t.Fatalf("dialling with a larger frame bound: %v", err)
 	}
@@ -150,37 +150,37 @@ const startup = 30 * time.Second
 
 // --- what the command is pointed at ---------------------------------------------------
 
-// serveNamespace starts a server over a namespace that keeps a change log, and hands back the
-// namespace itself so that a test can put something in it without going through anything the
+// serveVolume starts a server over a volume that keeps a change log, and hands back the
+// volume itself so that a test can put something in it without going through anything the
 // mount does.
-func serveNamespace(t *testing.T) (url string, namespace storage.Storage) {
+func serveVolume(t *testing.T) (url string, volume storage.Storage) {
 	t.Helper()
-	namespace, handler := replicableNamespace(t)
-	return listenOn(t, handler), namespace
+	volume, handler := replicableVolume(t)
+	return listenOn(t, handler), volume
 }
 
-func newTestNamespace(t *testing.T) (*objectstore.Storage, *sqlite.LockingStore) {
+func newTestVolume(t *testing.T) (*objectstore.Storage, *sqlite.LockingStore) {
 	t.Helper()
 	meta, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
-		Database: filepath.Join(t.TempDir(), "namespace.db"), Namespace: "ws",
+		Database: filepath.Join(t.TempDir(), "volume.db"), Volume: "ws",
 		SQLite: sqlite.DefaultOptions(), Locks: locking.DefaultOptions(), Initialize: true,
 	})
 	if err != nil {
-		t.Fatalf("opening the namespace's metastore: %v", err)
+		t.Fatalf("opening the volume's metastore: %v", err)
 	}
-	namespace := objectstore.New(memory.New(), meta)
+	volume := objectstore.New(memory.New(), meta)
 	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
-			t.Errorf("closing the namespace: %v", err)
+		if err := volume.Close(); err != nil {
+			t.Errorf("closing the volume: %v", err)
 		}
 	})
-	return namespace, meta
+	return volume, meta
 }
 
-func replicableNamespace(t *testing.T) (storage.Storage, *httprest.Handler) {
+func replicableVolume(t *testing.T) (storage.Storage, *httprest.Handler) {
 	t.Helper()
-	namespace, meta := newTestNamespace(t)
-	handler, err := httprest.NewHandler(namespace, meta)
+	volume, meta := newTestVolume(t)
+	handler, err := httprest.NewHandler(volume, meta)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,13 +189,13 @@ func replicableNamespace(t *testing.T) (storage.Storage, *httprest.Handler) {
 			t.Errorf("closing handler file sessions: %v", err)
 		}
 	})
-	return namespace, handler
+	return volume, handler
 }
 
 func serveWithoutReplication(t *testing.T) string {
 	t.Helper()
-	namespace, _ := newTestNamespace(t)
-	handler, err := httprest.NewHandler(namespace, nil)
+	volume, _ := newTestVolume(t)
+	handler, err := httprest.NewHandler(volume, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,35 +244,35 @@ type refusing struct {
 
 func (r refusing) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.URL.Path == httprest.Prefix+string(r.op) {
-		http.Error(w, "this namespace is not answering that today", http.StatusInternalServerError)
+		http.Error(w, "this volume is not answering that today", http.StatusInternalServerError)
 		return
 	}
 	r.Handler.ServeHTTP(w, req)
 }
 
-// dial reaches the namespace exactly as run does.
+// dial reaches the volume exactly as run does.
 func dial(t *testing.T, url string) *httprest.Storage {
 	t.Helper()
-	namespace, err := httprest.Dial(url, callerClient(startup))
+	volume, err := httprest.Dial(url, callerClient(startup))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return namespace
+	return volume
 }
 
 // --- the copy is nobody else's ---------------------------------------------------------
 
 // TestTheCopyIsOutOfEverybodyElsesReach.
 //
-// The copy holds the names, the sizes and the times of a whole workspace, and R-SEC-3 says
-// those stay with the person whose workspace it is. All four paths are checked rather than the
+// The copy holds the names, the sizes and the times of a whole volume, and R-SEC-3 says
+// those stay with the person whose volume it is. All four paths are checked rather than the
 // two this command creates: SQLite makes the write-ahead log and the shared-memory file, and
 // that they come out with the mode of the database file is the whole reason deciding it once
 // is enough.
 func TestTheCopyIsOutOfEverybodyElsesReach(t *testing.T) {
-	url, namespace := serveNamespace(t)
-	if err := namespace.Write(t.Context(), "a.txt", []byte("something for the copy to hold")); err != nil {
-		t.Fatalf("putting something in the namespace: %v", err)
+	url, volume := serveVolume(t)
+	if err := volume.Write(t.Context(), "a.txt", []byte("something for the copy to hold")); err != nil {
+		t.Fatalf("putting something in the volume: %v", err)
 	}
 
 	// None of the modes below may come from the umask this process happens to have been
@@ -294,7 +294,7 @@ func TestTheCopyIsOutOfEverybodyElsesReach(t *testing.T) {
 	}
 	for _, name := range []string{"tree.db", "tree.db-wal", "tree.db-shm"} {
 		if mode := modeOf(t, filepath.Join(dir, name)); mode != 0o600 {
-			t.Fatalf("%s has mode %#o, want 0600: it holds the shape of a workspace and only its owner may read it", name, mode)
+			t.Fatalf("%s has mode %#o, want 0600: it holds the shape of a volume and only its owner may read it", name, mode)
 		}
 	}
 }
@@ -303,7 +303,7 @@ func TestTheCopyIsOutOfEverybodyElsesReach(t *testing.T) {
 //
 // The directory the copy is kept in has a name nothing could have taken first; this is the
 // other half of that guard, on the file inside it. A symbolic link is the case worth naming:
-// following one would write the shape of somebody's workspace wherever it pointed, and O_EXCL
+// following one would write the shape of somebody's volume wherever it pointed, and O_EXCL
 // refuses it without ever looking at what it points to.
 func TestAPathPreparedBySomebodyElseIsRefused(t *testing.T) {
 	t.Run("a file that is already there", func(t *testing.T) {
@@ -329,15 +329,15 @@ func TestAPathPreparedBySomebodyElseIsRefused(t *testing.T) {
 			t.Fatalf("a path a link was at was answered with %v, want it refused as taken", err)
 		}
 		if _, err := os.Lstat(elsewhere); !errors.Is(err, fs.ErrNotExist) {
-			t.Fatalf("the copy was made at %s, where a link at the path pointed (%v): following one puts a workspace's shape wherever somebody else chose", elsewhere, err)
+			t.Fatalf("the copy was made at %s, where a link at the path pointed (%v): following one puts a volume's shape wherever somebody else chose", elsewhere, err)
 		}
 	})
 }
 
 // TestTheCopyIsGoneOnceTheMountpointIsDetached.
 //
-// The copy is as large as the tree it copies and it is somebody's workspace, so leaving it
-// behind is both a disk filling up and a workspace's shape left on a machine after the mount
+// The copy is as large as the tree it copies and it is somebody's volume, so leaving it
+// behind is both a disk filling up and a volume's shape left on a machine after the mount
 // that needed it has gone. The flag's own promise is that it is removed when the mountpoint is
 // detached.
 //
@@ -346,9 +346,9 @@ func TestAPathPreparedBySomebodyElseIsRefused(t *testing.T) {
 func TestTheCopyIsGoneOnceTheMountpointIsDetached(t *testing.T) {
 	requireFUSE(t)
 
-	url, namespace := serveNamespace(t)
-	if err := namespace.Write(t.Context(), "a.txt", []byte("hello\n")); err != nil {
-		t.Fatalf("putting something in the namespace: %v", err)
+	url, volume := serveVolume(t)
+	if err := volume.Write(t.Context(), "a.txt", []byte("hello\n")); err != nil {
+		t.Fatalf("putting something in the volume: %v", err)
 	}
 	where, mountpoint := t.TempDir(), t.TempDir()
 
@@ -381,7 +381,7 @@ func TestTheCopyIsGoneOnceTheMountpointIsDetached(t *testing.T) {
 	// be the removal of whatever happened to be in the directory, which is nothing at all.
 	copied := theOnlyEntryIn(t, where)
 	if content, err := os.ReadFile(filepath.Join(mountpoint, "a.txt")); err != nil || string(content) != "hello\n" {
-		t.Fatalf("the mountpoint gives %q (%v), want what the namespace holds", content, err)
+		t.Fatalf("the mountpoint gives %q (%v), want what the volume holds", content, err)
 	}
 
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
@@ -415,8 +415,8 @@ func TestTheCopyIsGoneOnceTheMountpointIsDetached(t *testing.T) {
 // do is leave one: the next attempt would find a directory nobody is going to remove, holding
 // a tree nobody is going to finish.
 func TestNothingIsLeftBehindWhenTheCopyIsNotBuilt(t *testing.T) {
-	t.Run("the namespace will not be copied", func(t *testing.T) {
-		_, handler := replicableNamespace(t)
+	t.Run("the volume will not be copied", func(t *testing.T) {
+		_, handler := replicableVolume(t)
 		// Refused after the subscription is established, so that the copy fails with its
 		// directory, its database and its stream all already made.
 		url := listenOn(t, refusing{Handler: handler, op: httprest.OpSnapshot})
@@ -425,10 +425,10 @@ func TestNothingIsLeftBehindWhenTheCopyIsNotBuilt(t *testing.T) {
 		served, release, err := replicate(t.Context(), dial(t, url), where, io.Discard)
 		if err == nil {
 			release()
-			t.Fatalf("a namespace that would not be copied was mounted anyway, from %v", served)
+			t.Fatalf("a volume that would not be copied was mounted anyway, from %v", served)
 		}
 		if errors.Is(err, syscall.ENOSYS) {
-			t.Fatalf("a namespace that refused one request was taken for one that keeps no log: %v", err)
+			t.Fatalf("a volume that refused one request was taken for one that keeps no log: %v", err)
 		}
 		if left := entriesIn(t, where); len(left) != 0 {
 			t.Fatalf("a copy that was never built left %v behind in %s", left, where)
@@ -436,24 +436,24 @@ func TestNothingIsLeftBehindWhenTheCopyIsNotBuilt(t *testing.T) {
 	})
 
 	t.Run("the server does not expose replication", func(t *testing.T) {
-		namespace := dial(t, serveWithoutReplication(t))
+		volume := dial(t, serveWithoutReplication(t))
 		where := t.TempDir()
 		said := &transcript{}
 
-		served, release, err := replicate(t.Context(), namespace, where, said)
+		served, release, err := replicate(t.Context(), volume, where, said)
 		if err != nil {
 			t.Fatalf("a server without replication failed to mount: %v", err)
 		}
 		defer release()
 
-		if served != namespace {
-			t.Fatalf("a server without replication is served from %v, want the namespace itself", served)
+		if served != volume {
+			t.Fatalf("a server without replication is served from %v, want the volume itself", served)
 		}
 		if left := entriesIn(t, where); len(left) != 0 {
 			t.Fatalf("a server without replication left %v behind in %s", left, where)
 		}
 		if !strings.Contains(said.String(), "keeps no record") {
-			t.Fatalf("nothing said that this namespace is not being copied, so nobody watching would know every operation is a request:\n%s", said)
+			t.Fatalf("nothing said that this volume is not being copied, so nobody watching would know every operation is a request:\n%s", said)
 		}
 	})
 
@@ -462,7 +462,7 @@ func TestNothingIsLeftBehindWhenTheCopyIsNotBuilt(t *testing.T) {
 		if err := os.WriteFile(where, nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		url, _ := serveNamespace(t)
+		url, _ := serveVolume(t)
 
 		_, _, err := replicate(t.Context(), dial(t, url), where, io.Discard)
 		if err == nil {
@@ -477,7 +477,7 @@ func TestNothingIsLeftBehindWhenTheCopyIsNotBuilt(t *testing.T) {
 // TestTheCopyGoesUnderTheSystemTemporaryDirectoryByDefault, which is what the flag says and
 // what everybody who does not pass it gets.
 func TestTheCopyGoesUnderTheSystemTemporaryDirectoryByDefault(t *testing.T) {
-	url, _ := serveNamespace(t)
+	url, _ := serveVolume(t)
 	before := copiesUnderTemp(t)
 
 	_, release, err := replicate(t.Context(), dial(t, url), "", io.Discard)
@@ -538,7 +538,7 @@ func theOnlyEntryIn(t *testing.T, dir string) string {
 	t.Helper()
 	names := entriesIn(t, dir)
 	if len(names) != 1 {
-		t.Fatalf("%s holds %v, want one copy of the namespace's metadata", dir, names)
+		t.Fatalf("%s holds %v, want one copy of the volume's metadata", dir, names)
 	}
 	return filepath.Join(dir, names[0])
 }

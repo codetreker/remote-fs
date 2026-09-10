@@ -5,7 +5,7 @@ import (
 	"errors"
 )
 
-// Fence preserves uncertain backend outcomes until the workspace is reopened.
+// Fence preserves uncertain backend outcomes until the volume is reopened.
 func (a *Authority) Fence(err error) {
 	if err == nil {
 		return

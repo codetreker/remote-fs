@@ -20,7 +20,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/storagetest"
 )
 
-// The whole contract is put to a limited namespace, under an allowance no case here comes
+// The whole contract is put to a limited volume, under an allowance no case here comes
 // near. A decorator that answered anything itself — an early refusal, a rewritten errno, a
 // path it cleaned differently from the storage beneath it — shows up as one of these
 // sixty-odd cases failing, and nothing else looks for it.
@@ -99,7 +99,7 @@ func TestRenameCreditsOnlyWhatItReplaces(t *testing.T) {
 
 // A node moved onto itself destroys nothing: POSIX has such a move return successfully and
 // perform no other action, so the bytes at the name are the same bytes that are there
-// afterwards. Crediting them would hand out room the namespace never released, for as many
+// afterwards. Crediting them would hand out room the volume never released, for as many
 // times as anyone cares to repeat the move, and every spelling of the name is a way to ask
 // for it.
 func TestRenameOntoItselfCreditsNothing(t *testing.T) {
@@ -161,7 +161,7 @@ func TestAWriteBeyondTheAllowanceIsRefusedAndCostsNothing(t *testing.T) {
 	}
 }
 
-// An allowance lowered underneath content already written leaves a namespace over its
+// An allowance lowered underneath content already written leaves a volume over its
 // limit, and the way back under it is to write less. Refusing the write that shrinks a
 // file would close that route off.
 func TestAWriteThatShrinksIsTakenFromOverTheAllowance(t *testing.T) {
@@ -173,7 +173,7 @@ func TestAWriteThatShrinksIsTakenFromOverTheAllowance(t *testing.T) {
 
 	space := spaceOf(t, s)
 	if space.Used != 10000 || space.Avail != 0 {
-		t.Fatalf("a namespace holding 10000 bytes under an 8192-byte allowance reports %+v, want 10000 used and nothing available", space)
+		t.Fatalf("a volume holding 10000 bytes under an 8192-byte allowance reports %+v, want 10000 used and nothing available", space)
 	}
 
 	mustWrite(t, s, "f", 100)
@@ -181,7 +181,7 @@ func TestAWriteThatShrinksIsTakenFromOverTheAllowance(t *testing.T) {
 }
 
 // The charge is made before the write and has to come back when the write does not happen.
-// A charge left standing would take the namespace's room away a failure at a time.
+// A charge left standing would take the volume's room away a failure at a time.
 func TestAWriteTheStoreBeneathRefusesGivesTheChargeBack(t *testing.T) {
 	s := newStorageOver(t, &faulty{BoundedStorage: newBacking(t), write: syscall.EIO}, 8192)
 
@@ -225,7 +225,7 @@ func TestAWriteIsRefusedWhenWhatTheFileHoldsCannotBeRead(t *testing.T) {
 }
 
 // Bytes are credited back only once they are gone. A removal that failed released nothing,
-// and crediting it would hand out room the namespace still holds.
+// and crediting it would hand out room the volume still holds.
 func TestARemovalThatFailedCreditsNothing(t *testing.T) {
 	s := newStorageOver(t, &faulty{BoundedStorage: newBacking(t), remove: syscall.EACCES}, 8192)
 
@@ -236,13 +236,13 @@ func TestARemovalThatFailedCreditsNothing(t *testing.T) {
 	mustUse(t, s, 500)
 }
 
-// A namespace that cannot be walked cannot be held under an allowance: every figure
+// A volume that cannot be walked cannot be held under an allowance: every figure
 // afterwards is that walk moved by what passes through, so an unmeasured start is an
 // invented one.
-func TestNewRefusesANamespaceItCouldNotWalk(t *testing.T) {
+func TestNewRefusesAVolumeItCouldNotWalk(t *testing.T) {
 	_, err := limited.New(t.Context(), &faulty{BoundedStorage: newBacking(t), list: syscall.EIO}, 8192)
 	if !errors.Is(err, syscall.EIO) {
-		t.Fatalf("opening the namespace failed with %v, want EIO", err)
+		t.Fatalf("opening the volume failed with %v, want EIO", err)
 	}
 }
 
@@ -271,18 +271,18 @@ func TestMeasurementLimitsHaveBoundedDefaultsAndRejectImpossibleValues(t *testin
 	}
 }
 
-func TestNewRequiresBoundedListingsBeforeItEnumeratesTheNamespace(t *testing.T) {
+func TestNewRequiresBoundedListingsBeforeItEnumeratesTheVolume(t *testing.T) {
 	backing := &unboundedListing{Storage: newBacking(t)}
 	_, err := limited.New(t.Context(), backing, 8192)
 	if !errors.Is(err, syscall.ENOSYS) {
 		t.Fatalf("opening over storage without bounded listings failed with %v, want ENOSYS", err)
 	}
 	if backing.listed {
-		t.Fatal("opening enumerated the namespace through ordinary List")
+		t.Fatal("opening enumerated the volume through ordinary List")
 	}
 }
 
-func TestNewChecksBoundedCapabilityBeforeItEnumeratesTheNamespace(t *testing.T) {
+func TestNewChecksBoundedCapabilityBeforeItEnumeratesTheVolume(t *testing.T) {
 	backing := &boundedProbe{BoundedStorage: newBacking(t), check: syscall.EIO}
 	_, err := limited.New(t.Context(), backing, 8192)
 	if !errors.Is(err, syscall.EIO) {
@@ -486,7 +486,7 @@ func TestCanceledRecountDoesNotDescendAfterTheCurrentListingReturns(t *testing.T
 }
 
 // Below one block the mount would report a filesystem of zero blocks, which reads as a
-// disk with nothing left rather than as a workspace with a little room.
+// disk with nothing left rather than as a volume with a little room.
 func TestNewRefusesAnAllowanceBelowOneBlock(t *testing.T) {
 	backing := newBacking(t)
 	for _, limit := range []int64{math.MinInt64, -1, 0, 1, limited.MinLimit - 1} {
@@ -499,10 +499,10 @@ func TestNewRefusesAnAllowanceBelowOneBlock(t *testing.T) {
 	}
 }
 
-// The walk that opens a namespace is what makes every figure afterwards a measured one. A
+// The walk that opens a volume is what makes every figure afterwards a measured one. A
 // symbolic link counts for the length of the target it holds; a directory counts for
 // nothing, its size being unspecified.
-func TestNewCountsWhatTheNamespaceAlreadyHolds(t *testing.T) {
+func TestNewCountsWhatTheVolumeAlreadyHolds(t *testing.T) {
 	backing := newBacking(t)
 	for _, name := range []string{"d", "d/deeper"} {
 		if err := backing.Mkdir(t.Context(), name); err != nil {
@@ -520,7 +520,7 @@ func TestNewCountsWhatTheNamespaceAlreadyHolds(t *testing.T) {
 // Neither figure can come out of a directory, and both would be taken for measured fact if
 // they were summed: a negative size shrinks the count towards room that is not there, and a
 // sum past what a byte count holds wraps into one.
-func TestNewRefusesSizesNoNamespaceCanHold(t *testing.T) {
+func TestNewRefusesSizesNoVolumeCanHold(t *testing.T) {
 	backing := newBacking(t)
 	for _, c := range []struct {
 		name    string
@@ -536,13 +536,13 @@ func TestNewRefusesSizesNoNamespaceCanHold(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := limited.New(t.Context(), listing{BoundedStorage: backing, entries: c.entries}, 1<<20)
 			if !errors.Is(err, c.want) {
-				t.Fatalf("opening the namespace failed with %v, want %v", err, c.want)
+				t.Fatalf("opening the volume failed with %v, want %v", err, c.want)
 			}
 		})
 	}
 }
 
-// Modifying the served namespace behind the server's back is a non-goal, not a case that is
+// Modifying the served volume behind the server's back is a non-goal, not a case that is
 // handled. This pins what the guard on the count is worth when it is done anyway, and what
 // it is not worth.
 //
@@ -552,9 +552,9 @@ func TestNewRefusesSizesNoNamespaceCanHold(t *testing.T) {
 // offered than the allowance holds — which is all that keeps a kernel reply's unsigned
 // fields from advertising room no disk anywhere has.
 //
-// It bounds nothing about what is true. The count sitting at what the namespace holds is
+// It bounds nothing about what is true. The count sitting at what the volume holds is
 // not guaranteed, and here it is plainly false: 0 reported against the 500 bytes still
-// there. The room that appears free is then written, and the namespace ends up over the
+// there. The room that appears free is then written, and the volume ends up over the
 // allowance it is held under. Only a fresh measurement puts the figure back.
 func TestTheGuardBoundsWhatIsReportedAndNotWhatIsHeld(t *testing.T) {
 	backing := newBacking(t)
@@ -570,14 +570,14 @@ func TestTheGuardBoundsWhatIsReportedAndNotWhatIsHeld(t *testing.T) {
 
 	space := spaceOf(t, s)
 	if space.Used != 0 {
-		t.Fatalf("the namespace reports %d bytes used, want the 0 the guard holds it at", space.Used)
+		t.Fatalf("the volume reports %d bytes used, want the 0 the guard holds it at", space.Used)
 	}
 	if space.Avail > space.Total {
-		t.Fatalf("the namespace reports %d bytes available out of a total of %d", space.Avail, space.Total)
+		t.Fatalf("the volume reports %d bytes available out of a total of %d", space.Avail, space.Total)
 	}
 
 	// The consequence, pinned rather than papered over: the whole allowance is spent again
-	// on top of the 500 bytes the namespace has never stopped holding.
+	// on top of the 500 bytes the volume has never stopped holding.
 	mustWrite(t, s, "h", 8192)
 	if err := s.Recount(t.Context()); err != nil {
 		t.Fatal(err)
@@ -659,7 +659,7 @@ func TestSpaceReportsTheTighterOfTheAllowanceAndTheDiskBeneath(t *testing.T) {
 			mustWrite(t, s, "f", 500)
 			space := spaceOf(t, s)
 			if space.Total != 8192 || space.Used != 500 || space.Avail != c.want {
-				t.Fatalf("the namespace reports %+v, want 8192 total, 500 used and %d available", space, c.want)
+				t.Fatalf("the volume reports %+v, want 8192 total, 500 used and %d available", space, c.want)
 			}
 		})
 	}
@@ -672,7 +672,7 @@ func TestSpaceLeansOnTheAllowanceAloneWhenTheStoreBeneathHasNoRoom(t *testing.T)
 
 	mustWrite(t, s, "f", 500)
 	if space := spaceOf(t, s); space != (storage.Space{Total: 8192, Used: 500, Avail: 7692}) {
-		t.Fatalf("the namespace reports %+v, want 8192 total, 500 used and 7692 available", space)
+		t.Fatalf("the volume reports %+v, want 8192 total, 500 used and 7692 available", space)
 	}
 }
 
@@ -743,13 +743,13 @@ func spaceOf(t *testing.T, s *limited.Storage) storage.Space {
 func mustUse(t *testing.T, s *limited.Storage, want int64) {
 	t.Helper()
 	if space := spaceOf(t, s); space.Used != want {
-		t.Fatalf("the namespace reports %d bytes used, want %d", space.Used, want)
+		t.Fatalf("the volume reports %d bytes used, want %d", space.Used, want)
 	}
 }
 
 // faulty fails the operations it has been given an error for, which is how each of the
 // failures a charge has to survive is put to the storage. The errors are settable after it
-// is built, for the cases where the namespace has to be filled before the failure starts.
+// is built, for the cases where the volume has to be filled before the failure starts.
 type faulty struct {
 	storage.BoundedStorage
 	stat   error

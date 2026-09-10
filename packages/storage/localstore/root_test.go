@@ -63,7 +63,7 @@ func TestOpenCleansAnInterruptedCompletionStage(t *testing.T) {
 			t.Fatal(err)
 		}
 		return Config{
-			Root: root, Workspace: "workspace", Quota: 1 << 20,
+			Root: root, Volume: "workspace", Quota: 1 << 20,
 			Window: sqlite.DefaultWindow(),
 			Maintenance: objectstore.Options{
 				SweepInterval: time.Hour,
@@ -150,10 +150,10 @@ func TestInitializationIntentRecoversInterruptedFirstOpen(t *testing.T) {
 	}
 
 	store, err := Open(t.Context(), Config{
-		Root:      root,
-		Workspace: "workspace",
-		Quota:     1 << 20,
-		Window:    sqlite.DefaultWindow(),
+		Root:   root,
+		Volume: "workspace",
+		Quota:  1 << 20,
+		Window: sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{
 			SweepInterval: time.Hour,
 			SweepBatch:    8,
@@ -172,7 +172,7 @@ func TestInitializationIntentRecoversInterruptedFirstOpen(t *testing.T) {
 
 func TestBoundInitializationRecoversSchemaLessSQLiteHeader(t *testing.T) {
 	config := Config{
-		Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+		Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 		Window:      sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 	}
@@ -229,7 +229,7 @@ func TestBoundInitializationRecoversUncommittedSchemaWAL(t *testing.T) {
 		return
 	}
 	config := Config{
-		Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+		Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 		Window:      sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 	}
@@ -334,7 +334,7 @@ func prepareBoundInitialization(t *testing.T, config Config) {
 		objects.Close()
 		t.Fatal(err)
 	}
-	if err := anchor.BindInitialization(objects.ID(), config.Workspace, false); err != nil {
+	if err := anchor.BindInitialization(objects.ID(), config.Volume, false); err != nil {
 		anchor.Close()
 		objects.Close()
 		t.Fatal(err)
@@ -346,7 +346,7 @@ func prepareBoundInitialization(t *testing.T, config Config) {
 
 func TestPinnedSnapshotDefersButDoesNotBlockMetastoreCheckpoint(t *testing.T) {
 	config := Config{
-		Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+		Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 		Window:      sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 	}
@@ -410,7 +410,7 @@ func TestPinnedSnapshotDefersButDoesNotBlockMetastoreCheckpoint(t *testing.T) {
 
 func TestPinnedSnapshotCoalescesCheckpointSignals(t *testing.T) {
 	config := Config{
-		Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+		Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 		Window:      sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 	}
@@ -486,7 +486,7 @@ func waitForCheckpointRetry(t *testing.T, durable *durableMetastore) {
 
 func TestStatusSurfacesCheckpointWorkerFailure(t *testing.T) {
 	config := Config{
-		Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+		Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 		Window:      sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 	}
@@ -555,7 +555,7 @@ func TestStatusSurfacesCheckpointWorkerFailure(t *testing.T) {
 
 func TestActiveReaderCloseRetryWithoutPendingWAL(t *testing.T) {
 	config := Config{
-		Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+		Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 		Window:      sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 	}
@@ -600,7 +600,7 @@ func TestActiveReaderCloseRetryWithoutPendingWAL(t *testing.T) {
 
 func TestOpenFailureAbortsUnexposedMetastoreBeforeReleasingOwnership(t *testing.T) {
 	config := Config{
-		Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+		Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 		Window:      sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 	}
@@ -646,21 +646,21 @@ func TestOpenFailureAbortsUnexposedMetastoreBeforeReleasingOwnership(t *testing.
 	}
 }
 
-func TestOpenFailureAfterNamespaceCompositionClosesAllOwnership(t *testing.T) {
+func TestOpenFailureAfterVolumeCompositionClosesAllOwnership(t *testing.T) {
 	config := Config{
-		Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+		Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 		Window:      sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 	}
-	injected := errors.New("post-namespace composition failure")
+	injected := errors.New("post-volume composition failure")
 	store, err := open(t.Context(), config, openHooks{
-		afterNamespace: func(*objectstore.Storage, *durableMetastore) error {
+		afterVolume: func(*objectstore.Storage, *durableMetastore) error {
 			return injected
 		},
 	})
 	if store != nil {
 		store.Close()
-		t.Fatal("injected namespace-composition failure returned a Store")
+		t.Fatal("injected volume-composition failure returned a Store")
 	}
 	if !errors.Is(err, injected) {
 		t.Fatalf("Open returned %v, want injected failure", err)
@@ -670,7 +670,7 @@ func TestOpenFailureAfterNamespaceCompositionClosesAllOwnership(t *testing.T) {
 	}
 	objects, err := localdisk.Open(t.Context(), config.Root, config.LocalDisk)
 	if err != nil {
-		t.Fatalf("namespace cleanup retained root ownership: %v", err)
+		t.Fatalf("volume cleanup retained root ownership: %v", err)
 	}
 	if err := objects.Close(); err != nil {
 		t.Fatal(err)
@@ -679,7 +679,7 @@ func TestOpenFailureAfterNamespaceCompositionClosesAllOwnership(t *testing.T) {
 
 func TestDurableConstructorCleanupFailureRetainsRootOwnership(t *testing.T) {
 	config := Config{
-		Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+		Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 		Window:      sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 	}
@@ -710,7 +710,7 @@ func TestDurableConstructorCleanupFailureRetainsRootOwnership(t *testing.T) {
 func TestMetastoreWitnessStageRecoveryIsFailClosed(t *testing.T) {
 	t.Run("duplicate stage", func(t *testing.T) {
 		config := Config{
-			Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+			Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 			Window:      sqlite.DefaultWindow(),
 			Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 		}
@@ -744,7 +744,7 @@ func TestMetastoreWitnessStageRecoveryIsFailClosed(t *testing.T) {
 
 	t.Run("stage without acknowledged witness", func(t *testing.T) {
 		config := Config{
-			Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+			Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 			Window:      sqlite.DefaultWindow(),
 			Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 		}
@@ -779,7 +779,7 @@ func TestMetastoreWitnessStageRecoveryIsFailClosed(t *testing.T) {
 
 	t.Run("damaged stage", func(t *testing.T) {
 		config := Config{
-			Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+			Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 			Window:      sqlite.DefaultWindow(),
 			Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 		}
@@ -806,7 +806,7 @@ func TestMetastoreWitnessStageRecoveryIsFailClosed(t *testing.T) {
 
 func TestInterruptedWitnessStageCleanupIsIdempotentAndRefusesDirectories(t *testing.T) {
 	config := Config{
-		Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+		Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 		Window:      sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 	}
@@ -860,7 +860,7 @@ func TestBoundInitializationRejectsStageWithLostMetastore(t *testing.T) {
 			store, err := Open(t.Context(), config)
 			if err == nil {
 				store.Close()
-				t.Fatal("Open replaced committed metastore state with an empty workspace")
+				t.Fatal("Open replaced committed metastore state with an empty volume")
 			}
 			if !errors.Is(err, syscall.EIO) {
 				t.Fatalf("Open returned %v, want EIO", err)
@@ -884,7 +884,7 @@ func TestBoundInitializationRejectsStageWithLostMetastore(t *testing.T) {
 func boundInitializationWithWitnessStage(t *testing.T, leavePristine bool) Config {
 	t.Helper()
 	config := Config{
-		Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+		Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 		Window:      sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 	}
@@ -904,7 +904,7 @@ func boundInitializationWithWitnessStage(t *testing.T, leavePristine bool) Confi
 		objects.Close()
 		t.Fatal(err)
 	}
-	if err := anchor.publishInitializationBinding(objects.ID(), config.Workspace); err != nil {
+	if err := anchor.publishInitializationBinding(objects.ID(), config.Volume); err != nil {
 		anchor.Close()
 		objects.Close()
 		t.Fatal(err)
@@ -939,7 +939,7 @@ func boundInitializationWithWitnessStage(t *testing.T, leavePristine bool) Confi
 
 func TestWitnessRenameFailureCleansStageForRetry(t *testing.T) {
 	config := Config{
-		Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+		Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 		Window:      sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 	}
@@ -959,7 +959,7 @@ func TestWitnessRenameFailureCleansStageForRetry(t *testing.T) {
 		objects.Close()
 		t.Fatal(err)
 	}
-	witness, exists, stageExists, err := anchor.InspectMetastoreWitness(objects.ID(), config.Workspace)
+	witness, exists, stageExists, err := anchor.InspectMetastoreWitness(objects.ID(), config.Volume)
 	if err != nil {
 		anchor.Close()
 		objects.Close()
@@ -1012,7 +1012,7 @@ func TestWitnessRenameFailureCleansStageForRetry(t *testing.T) {
 func TestMetastoreWitnessRejectsValidChecksumIdentityMismatch(t *testing.T) {
 	tests := map[string]func(*metastoreWitnessRecord){
 		"object store": func(record *metastoreWitnessRecord) { record.StoreID[0] ^= 0xff },
-		"workspace":    func(record *metastoreWitnessRecord) { record.Workspace = "another-workspace" },
+		"volume":       func(record *metastoreWitnessRecord) { record.Volume = "another-workspace" },
 		"database": func(record *metastoreWitnessRecord) {
 			identity := []byte(record.State.DatabaseID)
 			if identity[0] == '0' {
@@ -1026,7 +1026,7 @@ func TestMetastoreWitnessRejectsValidChecksumIdentityMismatch(t *testing.T) {
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
 			config := Config{
-				Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+				Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 				Window:      sqlite.DefaultWindow(),
 				Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 			}
@@ -1046,7 +1046,7 @@ func TestMetastoreWitnessRejectsValidChecksumIdentityMismatch(t *testing.T) {
 				objects.Close()
 				t.Fatal(err)
 			}
-			witness, exists, stageExists, err := anchor.InspectMetastoreWitness(objects.ID(), config.Workspace)
+			witness, exists, stageExists, err := anchor.InspectMetastoreWitness(objects.ID(), config.Volume)
 			if err != nil {
 				anchor.Close()
 				objects.Close()
@@ -1080,9 +1080,9 @@ func TestMetastoreWitnessRejectsValidChecksumIdentityMismatch(t *testing.T) {
 	}
 }
 
-func TestBoundPreflightRejectsAdditionalWorkspace(t *testing.T) {
+func TestBoundPreflightRejectsAdditionalVolume(t *testing.T) {
 	config := Config{
-		Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+		Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 		Window:      sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 	}
@@ -1098,12 +1098,12 @@ func TestBoundPreflightRejectsAdditionalWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	var root int64
-	if err := database.QueryRowContext(t.Context(), `SELECT root FROM namespaces WHERE name = ?`, config.Workspace).Scan(&root); err != nil {
+	if err := database.QueryRowContext(t.Context(), `SELECT root FROM volumes WHERE name = ?`, config.Volume).Scan(&root); err != nil {
 		database.Close()
 		t.Fatal(err)
 	}
 	if _, err := database.ExecContext(t.Context(),
-		`INSERT INTO namespaces (name, root, used) VALUES ('additional', ?, 0)`, root); err != nil {
+		`INSERT INTO volumes (name, root, used) VALUES ('additional', ?, 0)`, root); err != nil {
 		database.Close()
 		t.Fatal(err)
 	}
@@ -1113,7 +1113,7 @@ func TestBoundPreflightRejectsAdditionalWorkspace(t *testing.T) {
 	store, err = Open(t.Context(), config)
 	if err == nil {
 		store.Close()
-		t.Fatal("Open accepted an additional workspace in the bound database")
+		t.Fatal("Open accepted an additional volume in the bound database")
 	}
 	if !errors.Is(err, syscall.EIO) {
 		t.Fatalf("Open returned %v, want EIO", err)
@@ -1123,7 +1123,7 @@ func TestBoundPreflightRejectsAdditionalWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	var count int
-	if err := database.QueryRowContext(t.Context(), `SELECT count(*) FROM namespaces`).Scan(&count); err != nil {
+	if err := database.QueryRowContext(t.Context(), `SELECT count(*) FROM volumes`).Scan(&count); err != nil {
 		database.Close()
 		t.Fatal(err)
 	}
@@ -1131,7 +1131,7 @@ func TestBoundPreflightRejectsAdditionalWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	if count != 2 {
-		t.Fatalf("failed preflight changed workspace count to %d", count)
+		t.Fatalf("failed preflight changed volume count to %d", count)
 	}
 	objects, err := localdisk.Open(t.Context(), config.Root, config.LocalDisk)
 	if err != nil {
@@ -1146,12 +1146,12 @@ func TestBoundPreflightRejectsOversizedValuesBeforeLoadingThem(t *testing.T) {
 	for name, corrupt := range map[string]string{
 		"blob store identity": `UPDATE backing_store SET store_id = zeroblob(2097152)`,
 		"text store identity": `UPDATE backing_store SET store_id = CAST(zeroblob(2097152) AS TEXT)`,
-		"blob workspace":      `UPDATE namespaces SET name = zeroblob(2097152)`,
-		"text workspace":      `UPDATE namespaces SET name = CAST(zeroblob(2097152) AS TEXT)`,
+		"blob volume":         `UPDATE volumes SET name = zeroblob(2097152)`,
+		"text volume":         `UPDATE volumes SET name = CAST(zeroblob(2097152) AS TEXT)`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			config := Config{
-				Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+				Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 				Window:      sqlite.DefaultWindow(),
 				Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 			}
@@ -1192,9 +1192,9 @@ func TestBoundPreflightRejectsOversizedValuesBeforeLoadingThem(t *testing.T) {
 	}
 }
 
-func TestBoundInitializationNeverRecreatesMissingWorkspace(t *testing.T) {
+func TestBoundInitializationNeverRecreatesMissingVolume(t *testing.T) {
 	config := Config{
-		Root: privateTestRoot(t), Workspace: "workspace", Quota: 1 << 20,
+		Root: privateTestRoot(t), Volume: "workspace", Quota: 1 << 20,
 		Window:      sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{SweepInterval: time.Hour, SweepBatch: 8},
 	}
@@ -1214,7 +1214,7 @@ func TestBoundInitializationNeverRecreatesMissingWorkspace(t *testing.T) {
 		objects.Close()
 		t.Fatal(err)
 	}
-	if err := anchor.publishInitializationBinding(objects.ID(), config.Workspace); err != nil {
+	if err := anchor.publishInitializationBinding(objects.ID(), config.Volume); err != nil {
 		anchor.Close()
 		objects.Close()
 		t.Fatal(err)
@@ -1233,7 +1233,7 @@ func TestBoundInitializationNeverRecreatesMissingWorkspace(t *testing.T) {
 		database.Close()
 		t.Fatal(err)
 	}
-	if _, err := database.ExecContext(t.Context(), `DELETE FROM namespaces`); err != nil {
+	if _, err := database.ExecContext(t.Context(), `DELETE FROM volumes`); err != nil {
 		database.Close()
 		t.Fatal(err)
 	}
@@ -1243,7 +1243,7 @@ func TestBoundInitializationNeverRecreatesMissingWorkspace(t *testing.T) {
 	store, err = Open(t.Context(), config)
 	if err == nil {
 		store.Close()
-		t.Fatal("Open recreated a missing workspace during bound initialization recovery")
+		t.Fatal("Open recreated a missing volume during bound initialization recovery")
 	}
 	if !errors.Is(err, syscall.EIO) {
 		t.Fatalf("Open returned %v, want EIO", err)
@@ -1256,7 +1256,7 @@ func TestBoundInitializationNeverRecreatesMissingWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	var count int
-	if err := database.QueryRowContext(t.Context(), `SELECT count(*) FROM namespaces`).Scan(&count); err != nil {
+	if err := database.QueryRowContext(t.Context(), `SELECT count(*) FROM volumes`).Scan(&count); err != nil {
 		database.Close()
 		t.Fatal(err)
 	}
@@ -1264,7 +1264,7 @@ func TestBoundInitializationNeverRecreatesMissingWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	if count != 0 {
-		t.Fatalf("failed recovery created %d workspaces", count)
+		t.Fatalf("failed recovery created %d volumes", count)
 	}
 	objects, err = localdisk.Open(t.Context(), config.Root, config.LocalDisk)
 	if err != nil {
@@ -1317,7 +1317,7 @@ func readWitnessRecord(t *testing.T, store *Store) metastoreWitnessRecord {
 	record, exists, err := anchor.readMetastoreWitnessEntry(
 		metastoreWitnessFilename,
 		store.objects.ID(),
-		store.workspace,
+		store.volumeName,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1328,7 +1328,7 @@ func readWitnessRecord(t *testing.T, store *Store) metastoreWitnessRecord {
 	return record
 }
 
-func TestInterruptedInitializationRejectsAnotherWorkspace(t *testing.T) {
+func TestInterruptedInitializationRejectsAnotherVolume(t *testing.T) {
 	parent := t.TempDir()
 	if err := os.Chmod(parent, 0o700); err != nil {
 		t.Fatal(err)
@@ -1356,10 +1356,10 @@ func TestInterruptedInitializationRejectsAnotherWorkspace(t *testing.T) {
 	}
 
 	store, err := Open(t.Context(), Config{
-		Root:      root,
-		Workspace: "workspaec",
-		Quota:     1 << 20,
-		Window:    sqlite.DefaultWindow(),
+		Root:   root,
+		Volume: "workspaec",
+		Quota:  1 << 20,
+		Window: sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{
 			SweepInterval: time.Hour,
 			SweepBatch:    8,
@@ -1367,13 +1367,13 @@ func TestInterruptedInitializationRejectsAnotherWorkspace(t *testing.T) {
 	})
 	if err == nil {
 		store.Close()
-		t.Fatal("Open accepted another workspace while initialization was incomplete")
+		t.Fatal("Open accepted another volume while initialization was incomplete")
 	}
 	if !errors.Is(err, syscall.EIO) {
 		t.Fatalf("Open returned %v, want EIO", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, metastoreFilename)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("the refused workspace created metadata: %v", err)
+		t.Fatalf("the refused volume created metadata: %v", err)
 	}
 }
 

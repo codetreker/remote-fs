@@ -31,7 +31,7 @@ var logCases = []testCase{
 		changes, retention, err := readChanges(ctx(t), s, 0, 10)
 		mustSucceed(t, err)
 		if len(changes) != 0 {
-			t.Fatalf("a namespace nobody has written to has recorded %d changes, want none", len(changes))
+			t.Fatalf("a volume nobody has written to has recorded %d changes, want none", len(changes))
 		}
 		if retention.Tail != 0 || retention.Oldest != 0 {
 			t.Fatalf("a fresh log holds %+v, want a tail and an oldest of 0", retention)
@@ -40,7 +40,7 @@ var logCases = []testCase{
 		at, err := s.CommittedPosition(ctx(t))
 		mustSucceed(t, err)
 		if at != 0 {
-			t.Fatalf("a fresh namespace was last changed at position %d, want 0 — the position before every change there has ever been", at)
+			t.Fatalf("a fresh volume was last changed at position %d, want 0 — the position before every change there has ever been", at)
 		}
 
 		// A log with no incarnation cannot be resumed against: the pair a caller returns with
@@ -159,7 +159,7 @@ var logCases = []testCase{
 		mustSucceed(t, s.Create(ctx(t), "first"))
 		changes := drain(t, s, 0)
 		if len(changes) == 0 {
-			t.Fatal("the first write to a namespace recorded nothing")
+			t.Fatal("the first write to a volume recorded nothing")
 		}
 		if changes[0].Position <= 0 {
 			t.Fatalf("the first change is at position %d; a caller that has applied nothing resumes at 0 and would never see it",
@@ -168,7 +168,7 @@ var logCases = []testCase{
 	}},
 
 	// It does not change because a process asked again, and it does not change because the
-	// namespace was written to. Only a log that is no longer a continuation of what a caller
+	// volume was written to. Only a log that is no longer a continuation of what a caller
 	// saw changes it.
 	{name: "the incarnation is stable across reads and writes", run: func(t *testing.T, s metastore.Store) {
 		first, err := s.Incarnation(ctx(t), 1024)
@@ -226,7 +226,7 @@ var logCases = []testCase{
 
 		changes := drain(t, s, 0)
 		if len(changes) == 0 {
-			t.Fatal("a namespace written to forty times recorded nothing")
+			t.Fatal("a volume written to forty times recorded nothing")
 		}
 		for i, c := range changes {
 			if i > 0 && c.Position <= changes[i-1].Position {
@@ -347,21 +347,21 @@ var renameLogCases = []testCase{
 }
 
 var snapshotCases = []testCase{
-	{name: "a picture of a fresh namespace is the root alone", run: func(t *testing.T, s metastore.Store) {
+	{name: "a picture of a fresh volume is the root alone", run: func(t *testing.T, s metastore.Store) {
 		snap, at, err := s.Snapshot(ctx(t))
 		mustSucceed(t, err)
 		defer func() { mustSucceed(t, snap.Close()) }()
 
 		if at != 0 {
-			t.Fatalf("a picture of a namespace nobody has written to is at position %d, want 0", at)
+			t.Fatalf("a picture of a volume nobody has written to is at position %d, want 0", at)
 		}
 		rows, done, err := readRows(ctx(t), snap, 16)
 		mustSucceed(t, err)
 		if !done {
-			t.Fatal("a picture of an empty namespace is not complete after sixteen rows")
+			t.Fatal("a picture of an empty volume is not complete after sixteen rows")
 		}
 		if len(rows) != 1 {
-			t.Fatalf("a picture of an empty namespace holds %d rows, want just the root", len(rows))
+			t.Fatalf("a picture of an empty volume holds %d rows, want just the root", len(rows))
 		}
 		// The root has no name and no parent, and it is named that way rather than left out:
 		// a replica needs the node its whole tree hangs from.
@@ -512,8 +512,8 @@ var sinceCases = []testCase{
 
 	// What separates a caller that can carry on from one that cannot is what the log threw
 	// away, and never how far the caller sits from the oldest entry that survived. Those are
-	// the same number only where a namespace's positions have no gaps in them, which this
-	// contract does not promise and an implementation numbering every namespace in one
+	// the same number only where a volume's positions have no gaps in them, which this
+	// contract does not promise and an implementation numbering every volume in one
 	// database from a single sequence does not provide. Reading resumability off that distance
 	// sends callers that had missed nothing away to rebuild a whole tree.
 	{name: "what the log discarded is what decides resuming, not what survived it",

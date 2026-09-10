@@ -36,7 +36,7 @@
 -- packages/transport/httprest/message.go, so the two agree about what an instant is.
 CREATE TABLE nodes (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	namespace  INTEGER NOT NULL REFERENCES namespaces(id),
+	volume  INTEGER NOT NULL REFERENCES volumes(id),
 	mode       INTEGER NOT NULL,
 	size       INTEGER NOT NULL,
 	atime_sec  INTEGER NOT NULL,
@@ -66,16 +66,16 @@ CREATE TABLE entries (
 -- whole table without this.
 CREATE INDEX entries_by_node ON entries (node);
 
--- used is the exact number of bytes the namespace's files hold, maintained by the same
+-- used is the exact number of bytes the volume's files hold, maintained by the same
 -- transactions that change a size. Space must not aggregate: a mount answers Statfs under a
 -- two-second deadline because df touches every mountpoint on the machine, so a
--- SELECT SUM(size) over a large namespace would stall df everywhere on the host.
+-- SELECT SUM(size) over a large volume would stall df everywhere on the host.
 --
 -- root has no REFERENCES clause, and it is the one column here that does not. The reference
--- it would carry runs the other way round the cycle nodes.namespace already closes, and
+-- it would carry runs the other way round the cycle nodes.volume already closes, and
 -- neither row can be inserted before the other. It is written once, in the transaction that
 -- creates the root node it names.
-CREATE TABLE namespaces (
+CREATE TABLE volumes (
 	id   INTEGER PRIMARY KEY AUTOINCREMENT,
 	name TEXT    NOT NULL UNIQUE,
 	root INTEGER NOT NULL,
@@ -89,7 +89,7 @@ CREATE TABLE namespaces (
 -- schema; they are named in schema.go and read in objects.go.
 CREATE TABLE objects (
 	key          TEXT PRIMARY KEY,
-	namespace    INTEGER NOT NULL REFERENCES namespaces(id),
+	volume    INTEGER NOT NULL REFERENCES volumes(id),
 	state        INTEGER NOT NULL,
 	size         INTEGER NOT NULL,
 	digest       BLOB,
@@ -99,5 +99,5 @@ CREATE TABLE objects (
 
 -- The sweep reads by state and, for reservations, by age; and dropping an object's row has
 -- SQLite check that no node still points at its key.
-CREATE INDEX objects_by_state ON objects (namespace, state, created_sec);
+CREATE INDEX objects_by_state ON objects (volume, state, created_sec);
 CREATE INDEX nodes_by_content ON nodes (content);

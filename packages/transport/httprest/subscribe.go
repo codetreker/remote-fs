@@ -13,21 +13,21 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore"
 )
 
-// The replication half of the dialling end: a way to watch what changes in a namespace,
+// The replication half of the dialling end: a way to watch what changes in a volume,
 // and a way to take the picture that watching starts from.
 //
 // Both live on Storage rather than on a type of their own, because one Dial is one
-// namespace and a replica needs both halves of it — the reads and writes that go to the
-// server, and the stream that tells it what its local copy is still worth. A namespace
+// volume and a replica needs both halves of it — the reads and writes that go to the
+// server, and the stream that tells it what its local copy is still worth. A volume
 // that keeps no log answers both of these with ENOSYS, which is a fact about that
-// namespace and arrives as an ordinary storage error under its own name.
+// volume and arrives as an ordinary storage error under its own name.
 //
 // The order these are used in is not interchangeable: subscribe first, take the snapshot
 // second, discard the changes at or before the snapshot's position, apply the rest. The
 // reverse order does not converge — the scan takes time, changes accumulate while it runs,
 // and once enough of them accumulate to push the snapshot's position out of the log's
 // window the replica starts over, at a cost proportional to the size of the tree. The
-// larger the namespace, the less likely that is ever to finish.
+// larger the volume, the less likely that is ever to finish.
 
 // RebuildError says a log cannot carry on from where the caller asked, so the replica it
 // was feeding is worth nothing and has to be built again from a snapshot.
@@ -43,7 +43,7 @@ type RebuildError struct {
 	// Reason says which dimension pushed the caller out, because the three call for
 	// different things. RebuildIncarnation is a log that is not the one the caller was
 	// watching; RebuildAge is a caller that was away too long; RebuildVolume is a
-	// namespace changing faster than the log was configured to hold, which is a setting
+	// volume changing faster than the log was configured to hold, which is a setting
 	// to revisit rather than anything the caller did.
 	Reason RebuildReason
 }
@@ -68,7 +68,7 @@ func (e *RebuildError) detail() string {
 func (e *RebuildError) Unwrap() error { return syscall.ESTALE }
 
 // ErrServerStopping ends a change stream because the server said it was going away, rather
-// than because anything happened to the namespace or to the connection.
+// than because anything happened to the volume or to the connection.
 //
 // It is worth telling apart from every other way a stream can end. A replica given this has
 // lost nothing: its position is still good, the log outlives the process that was serving
@@ -89,7 +89,7 @@ func (e *stoppingError) Error() string {
 
 func (e *stoppingError) Unwrap() error { return syscall.EAGAIN }
 
-// Subscribe watches the namespace from now on.
+// Subscribe watches the volume from now on.
 //
 // The stream begins at the log's current tail: nothing older is delivered, and every
 // change recorded after that point is. This is what a replica about to take a snapshot
@@ -105,7 +105,7 @@ func (s *Storage) Subscribe(ctx context.Context) (*Subscription, error) {
 	return s.subscribe(ctx, Request{Op: OpSubscribe})
 }
 
-// Resubscribe continues watching the namespace from a position already applied.
+// Resubscribe continues watching the volume from a position already applied.
 //
 // The pair is offered rather than the position alone, and the incarnation is what makes
 // the answer trustworthy: a log that lost its history would otherwise be asked to carry on
@@ -142,7 +142,7 @@ func (s *Storage) subscribe(ctx context.Context, req Request) (*Subscription, er
 	}, nil
 }
 
-// Subscription is an open stream of changes to one namespace.
+// Subscription is an open stream of changes to one volume.
 type Subscription struct {
 	stream *stream
 
@@ -178,12 +178,12 @@ func (sub *Subscription) Tail() metastore.Position { return sub.tail }
 //
 // Every error it reports ends the stream, and the same one is reported to every call
 // afterwards. A stream that simply stopped is one of them: a change stream has no natural
-// end, so reaching the end of one means the connection went rather than that the namespace
+// end, so reaching the end of one means the connection went rather than that the volume
 // has settled. Telling those apart is the whole difference between a replica that knows it
 // is stale and one that does not.
 //
 // A *RebuildError here means the caller fell out of the log's window while it was watching
-// — too slow, or a namespace changing faster than the log holds — and what it has applied
+// — too slow, or a volume changing faster than the log holds — and what it has applied
 // so far is no longer a copy of anything. ErrServerStopping is the opposite of that: the
 // server went away on purpose, nothing has been lost, and the position this subscription
 // reached is still the one to come back with.
@@ -275,8 +275,8 @@ func (sub *Subscription) Close() error { return sub.stream.close() }
 // the subscription was opened first and is unaffected by how long this takes.
 //
 // The server holds a resource for as long as this is open and bounds both how long that
-// may be and how many it will hold at once. A namespace already holding as many as it will
-// answers EAGAIN, which is worth retrying; the ENOSYS a namespace with no log answers is
+// may be and how many it will hold at once. A volume already holding as many as it will
+// answers EAGAIN, which is worth retrying; the ENOSYS a volume with no log answers is
 // not.
 func (s *Storage) Snapshot(ctx context.Context) (*Snapshot, error) {
 	req := Request{Op: OpSnapshot}
@@ -416,7 +416,7 @@ func (s *Storage) dialStream(ctx context.Context, req Request) (opened *stream, 
 	// The caller's client, with its timeout dropped. http.Client.Timeout bounds the whole
 	// exchange, the reading of the body included, which is the right bound for an operation
 	// and the wrong one for a stream: a change stream is meant to stay open with nothing on
-	// it, so the only thing that bound could ever report is that the namespace was quiet. A
+	// it, so the only thing that bound could ever report is that the volume was quiet. A
 	// subscription severed on a timer would also be a subscription whose replica goes
 	// unusable on that timer, which is the interval R-CON-2 exists to keep out. Everything
 	// else the caller configured is kept, and how long the far side has to answer at all

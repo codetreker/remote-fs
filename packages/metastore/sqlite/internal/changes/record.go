@@ -57,7 +57,7 @@ func loadedKind(stored int64) (metastore.ChangeKind, error) {
 // Record appends a change and its committed position inside the caller's transaction.
 // Sharing that transaction prevents a committed tree mutation from losing its event
 // while replicas continue under the same incarnation.
-func Record(ctx context.Context, tx *sql.Tx, namespace int64, change metastore.Change) error {
+func Record(ctx context.Context, tx *sql.Tx, volume int64, change metastore.Change) error {
 	kind, err := storedKind(change.Kind)
 	if err != nil {
 		return err
@@ -83,35 +83,35 @@ func Record(ctx context.Context, tx *sql.Tx, namespace int64, change metastore.C
 	if err := tx.QueryRowContext(ctx,
 		`SELECT CASE WHEN typeof(committed_position) = 'integer' THEN committed_position END,
 		        typeof(committed_position)
-		 FROM logs WHERE namespace = ?`, namespace,
+		 FROM logs WHERE volume = ?`, volume,
 	).Scan(&previousRaw, &previousType); err != nil {
 		return err
 	}
 	previous, ok := sqlvalue.StoredInteger(previousRaw, previousType)
 	if !ok || previous < 0 {
-		return fmt.Errorf("the namespace log stores an invalid committed position: %w", syscall.EIO)
+		return fmt.Errorf("the volume log stores an invalid committed position: %w", syscall.EIO)
 	}
 	position, err := dbstate.AllocateChangePosition(ctx, tx)
 	if err != nil {
 		return err
 	}
 	if previous >= position {
-		return fmt.Errorf("the namespace log tail %d does not precede allocated position %d: %w",
+		return fmt.Errorf("the volume log tail %d does not precede allocated position %d: %w",
 			previous, position, syscall.EIO)
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO changes (position, previous_position, namespace, kind, parent, name, from_parent, from_name,
+		INSERT INTO changes (position, previous_position, volume, kind, parent, name, from_parent, from_name,
 		                     node, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content,
 		                     recorded_sec, recorded_nsec)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		position, previous, namespace, kind, change.Parent, change.Name, fromParent, fromName,
+		position, previous, volume, kind, change.Parent, change.Name, fromParent, fromName,
 		node, mode, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec, content,
 		sec, nsec)
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE logs SET committed_position = ? WHERE namespace = ?`,
-		position, namespace)
+	_, err = tx.ExecContext(ctx, `UPDATE logs SET committed_position = ? WHERE volume = ?`,
+		position, volume)
 	return err
 }
 
@@ -129,15 +129,15 @@ func newIncarnation() (metastore.Incarnation, error) {
 	return metastore.Incarnation(value), nil
 }
 
-// CreateLog gives a namespace an empty log: no entries, nothing committed, and an
+// CreateLog gives a volume an empty log: no entries, nothing committed, and an
 // incarnation nothing has ever resumed against.
-func CreateLog(ctx context.Context, tx *sql.Tx, namespace int64) error {
+func CreateLog(ctx context.Context, tx *sql.Tx, volume int64) error {
 	incarnation, err := newIncarnation()
 	if err != nil {
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO logs (namespace, incarnation, committed_position, trimmed_through, trimmed_by_age)
-		VALUES (?, ?, 0, 0, 0)`, namespace, string(incarnation))
+		INSERT INTO logs (volume, incarnation, committed_position, trimmed_through, trimmed_by_age)
+		VALUES (?, ?, 0, 0, 0)`, volume, string(incarnation))
 	return err
 }

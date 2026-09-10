@@ -80,7 +80,7 @@ type File interface {
 	Truncate(context.Context, int64) (Attr, error)
 
 	// SetAttr permits mode and time changes on read-only descriptors, subject
-	// to namespace permission policy. Sync confirms reference health and any
+	// to volume permission policy. Sync confirms reference health and any
 	// durability barrier the backend requires; no dirty content awaits Close.
 	SetAttr(context.Context, AttrChange) (Attr, error)
 	Sync(context.Context) error
@@ -167,7 +167,7 @@ const DefaultFileMaxSize int64 = 1 << 30
 
 // FileSessionOptions bounds one session. The zero value is invalid; callers
 // can explicitly select DefaultFileSessionOptions and replace individual limits.
-// Namespace-wide limits additionally bound the aggregate across all sessions.
+// Volume-wide limits additionally bound the aggregate across all sessions.
 type FileSessionOptions struct {
 	Lease   time.Duration
 	History time.Duration

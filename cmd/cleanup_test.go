@@ -13,7 +13,7 @@ import (
 )
 
 func TestStoppedAuthorityCleanupKeepsLocalErrorsVisible(t *testing.T) {
-	server := serveNamespace(t)
+	server := serveVolume(t)
 	remote, err := httprest.Dial(server.url, &http.Client{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)

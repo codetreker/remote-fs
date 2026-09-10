@@ -26,7 +26,7 @@ const (
 
 func (a *rootAnchor) InspectInitializationIntent(
 	id localdisk.ID,
-	workspace string,
+	volumeName string,
 	complete bool,
 ) (initializationIntent, error) {
 	if complete {
@@ -79,14 +79,14 @@ func (a *rootAnchor) InspectInitializationIntent(
 		}
 		return initializationIntentPristine, nil
 	}
-	if err := validateBinding(encoded, initializationBindingMagic, "initialization intent", id, workspace); err != nil {
+	if err := validateBinding(encoded, initializationBindingMagic, "initialization intent", id, volumeName); err != nil {
 		return 0, err
 	}
 	return initializationIntentBound, nil
 }
 
-func (a *rootAnchor) BindInitialization(id localdisk.ID, workspace string, databaseExists bool) error {
-	intent, err := a.InspectInitializationIntent(id, workspace, false)
+func (a *rootAnchor) BindInitialization(id localdisk.ID, volumeName string, databaseExists bool) error {
+	intent, err := a.InspectInitializationIntent(id, volumeName, false)
 	if err != nil {
 		return err
 	}
@@ -99,7 +99,7 @@ func (a *rootAnchor) BindInitialization(id localdisk.ID, workspace string, datab
 	if databaseExists {
 		return fmt.Errorf("an unbound initialization intent already has a metadata database: %w", syscall.EIO)
 	}
-	if err := a.publishInitializationBinding(id, workspace); err != nil {
+	if err := a.publishInitializationBinding(id, volumeName); err != nil {
 		return err
 	}
 	return nil
@@ -119,14 +119,14 @@ func (a *rootAnchor) removeInitializationBindingStage() error {
 	return nil
 }
 
-func (a *rootAnchor) publishInitializationBinding(id localdisk.ID, workspace string) error {
+func (a *rootAnchor) publishInitializationBinding(id localdisk.ID, volumeName string) error {
 	stagePath := filepath.Join(a.path, initializationBindingStage)
 	fd, err := unix.Openat(a.fd, initializationBindingStage,
 		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		return &os.PathError{Op: "create initialization binding stage", Path: stagePath, Err: err}
 	}
-	encoded := encodeBinding(initializationBindingMagic, id, workspace)
+	encoded := encodeBinding(initializationBindingMagic, id, volumeName)
 	writeErr := unix.Fchmod(fd, 0o600)
 	if writeErr == nil {
 		writeErr = writeFull(fd, encoded)

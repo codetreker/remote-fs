@@ -209,7 +209,7 @@ func TestASpaceReportSurvivesJSON(t *testing.T) {
 	}
 }
 
-// A count that never arrived reads as zero, and zero available is a namespace that
+// A count that never arrived reads as zero, and zero available is a volume that
 // refuses every write. Neither an absent count nor figures that could not all be true of
 // anything may be delivered as a report.
 func TestABodyThatCarriesNoSpaceReport(t *testing.T) {

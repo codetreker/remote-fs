@@ -8,10 +8,10 @@ import (
 
 // Window bounds retained history. Floor takes precedence over Age; Cap is absolute.
 type Window struct {
-	// Floor is the fewest entries a namespace's log keeps, however old they are.
+	// Floor is the fewest entries a volume's log keeps, however old they are.
 	Floor int
 
-	// Cap is the most entries a namespace's log keeps.
+	// Cap is the most entries a volume's log keeps.
 	Cap int
 
 	// Age is how long an entry is kept, subject to Floor.

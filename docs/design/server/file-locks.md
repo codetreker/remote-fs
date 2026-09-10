@@ -9,12 +9,12 @@
 | 组件 | 责任 |
 |---|---|
 | `packages/locking` | 公共类型、错误分类、授权方状态、会话和持有者、有界动作历史，以及发布排序；只依赖标准库 |
-| `packages/storage/locked` | 把原生支持发布检查的 backend 与它的授权方配成一个 namespace；提供匿名操作及显式 mutation scope |
-| 原生 storage / metastore | 在实际命名空间变更中确定受影响文件，并在最终发布边界接受授权检查 |
+| `packages/storage/locked` | 把原生支持发布检查的 backend 与它的授权方配成一个卷；提供匿名操作及显式 mutation scope |
+| 原生 storage / metastore | 在实际卷变更中确定受影响文件，并在最终发布边界接受授权检查 |
 | HTTP handler / client | 传递控制动作、结果与 mutation proof；管理请求的资源预算独立于普通数据请求 |
-| 独立 server | 配置私有持久证据、取得 workspace 的独占写入所有权，并管理恢复与关闭 |
+| 独立 server | 配置私有持久证据、取得卷的独占写入所有权，并管理恢复与关闭 |
 
-handler 接受的是已配对的 namespace 与锁服务。把一个锁服务与另一份未经约束的 raw storage 并列，不能形成可发布的服务端。第三方 backend 必须提供原生发布集成；包装层不能靠一次路径 `Stat` 加一次独立 `Write` 模拟这项能力。
+handler 接受的是已配对的卷与锁服务。把一个锁服务与另一份未经约束的 raw storage 并列，不能形成可发布的服务端。第三方 backend 必须提供原生发布集成；包装层不能靠一次路径 `Stat` 加一次独立 `Write` 模拟这项能力。
 
 ## 身份与显式 scope
 
@@ -89,7 +89,7 @@ Renew 使用 `max(原 deadline, 转换时刻 + 请求 TTL)`，不缩短已确认
 
 已取得顺序的不可分割转换可在不可中断的内核或 SQL 操作中稍后完成；相冲突的新授权、解除与新的权威视图捕获必须等待它的确定结果。之前已捕获的视图可以完成读取。观察门在捕获视图之后、批量内容读取之前释放，授权方也不因排队申请或暂存上传而持有跨资源的锁。SQLite 原有 writer / health 串行化仍承担其原生事务顺序。
 
-`Publish` 只调用一次原生最终转换回调，回调不能含上传或任意调用方函数。返回结果明确区分效果是否已知、哪些资源退休、是否发生修改及原始错误。已知效果先更新资源绑定，再开放观察与授权；已知失败保留未发生效果的映射，部分 `SetAttr` 仍保留其真实结果。namespace 效果不明，或发布计费的结算、撤销结果不明时，隔离授权方与 namespace，直到显式恢复。后者即使已知文件没有改变也成立：保留正确的资源绑定不能证明配额账本仍可使用。`IsPublicationAccountingUncertain` 区分这种失败与准备失败但成功撤销的普通错误，并保留主错误与清理错误。无条件 deferred completion 不能用过时映射重新开放准入。
+`Publish` 只调用一次原生最终转换回调，回调不能含上传或任意调用方函数。返回结果明确区分效果是否已知、哪些资源退休、是否发生修改及原始错误。已知效果先更新资源绑定，再开放观察与授权；已知失败保留未发生效果的映射，部分 `SetAttr` 仍保留其真实结果。卷效果不明，或发布计费的结算、撤销结果不明时，隔离授权方与卷，直到显式恢复。后者即使已知文件没有改变也成立：保留正确的资源绑定不能证明配额账本仍可使用。`IsPublicationAccountingUncertain` 区分这种失败与准备失败但成功撤销的普通错误，并保留主错误与清理错误。无条件 deferred completion 不能用过时映射重新开放准入。
 
 授予使用同一原生 live-target guard：先在授权状态 mutex 之外发现资源，取得后端目标排序后重新验证存在性、身份与类型，再进入授权状态转换。顺序是 backend 在前、authority mutex 在后；暂存、高水位持久准备与等待其他资源都不持有 authority mutex，回调与生命周期操作也不能反向重入。
 
@@ -99,13 +99,13 @@ SQLite 的新视图捕获包括开始只读事务、钉住 snapshot，以及在�
 
 ## Backend 资源身份
 
-SQLite-backed namespace 使用 workspace 内的节点身份作为原生资源键。覆写内容保留节点身份，改名移动该节点，删除后同名创建得到另一个节点。经授权的 unlink 或覆盖令旧的命名资源退休为 `TargetGone`；已经打开的 File 与标准 advisory 随 detached 对象保留，强 S/X 不转移到同名新对象。对外 ResourceID 同时区分授权方，不与内容修订、grant generation 或日志位置互换。
+SQLite-backed 卷使用卷内的节点身份作为原生资源键。覆写内容保留节点身份，改名移动该节点，删除后同名创建得到另一个节点。经授权的 unlink 或覆盖令旧的命名资源退休为 `TargetGone`；已经打开的 File 与标准 advisory 随 detached 对象保留，强 S/X 不转移到同名新对象。对外 ResourceID 同时区分授权方，不与内容修订、grant generation 或日志位置互换。
 
 授权方资源映射受上限约束。有效 ResourceRef、排队动作、活跃 grant 或发布需要目标时，backend 保留相应的原生引用；终态历史可以只保留退休 ResourceID。退休身份不重新分配给别的文件。第三方 backend 须保持这一映射与实际文件一致，不能直接使用可能被复用的宿主 inode 号充当稳定身份。绕开本系统直接修改其私有存储仍是规格中的非目标。
 
 ## 重启与持久证据
 
-持久证据记录此前已经发放过的最大 lease 时长，由状态记录中的 Accepted / Prepared 与绑定 workspace 的独立 Witness 共同证明；UUID 相同不能单独证明没有回退。提高过程在持久 raise mutex 下串行执行：保存并同步下一代 Prepared，推进并同步 Witness，最后令 Accepted 等于 Prepared 并清空 Prepared，确认完成之后才能向调用方承诺更长期限。Prepared 的 generation 必须恰好是下一代，时长不减，workspace / state 身份一致。保存结果不明时不能继续授予依赖该提高的期限。
+持久证据记录此前已经发放过的最大 lease 时长，由状态记录中的 Accepted / Prepared 与绑定卷的独立 Witness 共同证明；UUID 相同不能单独证明没有回退。提高过程在持久 raise mutex 下串行执行：保存并同步下一代 Prepared，推进并同步 Witness，最后令 Accepted 等于 Prepared 并清空 Prepared，确认完成之后才能向调用方承诺更长期限。Prepared 的 generation 必须恰好是下一代，时长不减，卷 / state 身份一致。保存结果不明时不能继续授予依赖该提高的期限。
 
 | 打开时的状态 | 处理 |
 |---|---|
@@ -116,23 +116,23 @@ SQLite-backed namespace 使用 workspace 内的节点身份作为原生资源键
 
 Witness 不降低，时长也不按当前配置截短。这两份证据检测任一单独组件的降低或旧状态回放；所有独立证据被一起进行一致的管理员回滚，不在没有外部可信锚的检测承诺内。
 
-新的授权方先取得数据库的独占写入所有权，再读取并校验该证据。恢复以实际取得数据库排他 flock 的时刻为起点，配置从原生拥有者取得该时刻，不采信任意调用方时间戳。使用新的单调时钟等待完整的已记录时长期间，修改与授予被拒绝，普通快照读取及恢复状态查询保持可用。旧进程已由生命周期所有权隔离，旧上传不能借新授权方发布命名空间。这个等待不依赖跨重启的墙钟连续性。
+新的授权方先取得数据库的独占写入所有权，再读取并校验该证据。恢复以实际取得数据库排他 flock 的时刻为起点，配置从原生拥有者取得该时刻，不采信任意调用方时间戳。使用新的单调时钟等待完整的已记录时长期间，修改与授予被拒绝，普通快照读取及恢复状态查询保持可用。旧进程已由生命周期所有权隔离，旧上传不能借新授权方发布卷。这个等待不依赖跨重启的墙钟连续性。
 
 恢复之后使用新的授权方身份。旧意图、Owner 与 GrantRef 明确返回 `Retired` 或 `OutcomeUnknown`，不会被解释为未曾授予，也不会重新执行。精确动作回放只在原授权方及其活跃 Owner / Session 的历史窗口内成立；剩余保护通过恢复屏障保留，动作历史不逐条落盘。
 
-首次初始化有独立的持久 intent / binding 阶段，只有匹配的已记录初始化可以继续；Open 缺少状态不能被当作新 workspace。SQLite migration `0004` 的 `lease_recovery` 保存 DatabaseID、StateID 与 Accepted / Prepared；本地持久组合的两次事务还经过原有数据库提交见证，独立 lease Witness 则在中间推进。
+首次初始化有独立的持久 intent / binding 阶段，只有匹配的已记录初始化可以继续；Open 缺少状态不能被当作新卷。SQLite migration `0004` 的 `lease_recovery` 保存 DatabaseID、StateID 与 Accepted / Prepared；本地持久组合的两次事务还经过原有数据库提交见证，独立 lease Witness 则在中间推进。
 
-`sqlite.OpenLocking` 拥有整份数据库的原生 flock 与进程内独占 coordinator。数据库 inode 的 `user.remote-fs.lease-state` xattr 与相邻的 `.<数据库文件名>.leases.intent`、`.witness` 绑定数据库身份与规范化的证据目录；Accepted / Prepared 与 Witness 的最大 lease 时长覆盖整份数据库。运行时选择的 namespace 不成为永久 anchor identity。后续进程可以选择同一数据库中的另一个已有 namespace，但须取得全数据库所有权并完成数据库级恢复等待；多份活跃 server 不能同时共享它。真正未绑定的 raw SQLite API 仍有独立的库用途，已经绑定的库不能靠关闭配置或 raw API 绕过保护。
+`sqlite.OpenLocking` 拥有整份数据库的原生 flock 与进程内独占 coordinator。数据库 inode 的 `user.remote-fs.lease-state` xattr 与相邻的 `.<数据库文件名>.leases.intent`、`.witness` 绑定数据库身份与规范化的证据目录；Accepted / Prepared 与 Witness 的最大 lease 时长覆盖整份数据库。运行时选择的卷不成为永久 anchor identity。后续进程可以选择同一数据库中的另一个已有卷，但须取得全数据库所有权并完成数据库级恢复等待；多份活跃 server 不能同时共享它。真正未绑定的 raw SQLite API 仍有独立的库用途，已经绑定的库不能靠关闭配置或 raw API 绕过保护。
 
 raw SQLite opener 也先取得同一个原生数据库文件的共享 flock，锁服务 constructor 取得排他 flock。既存 raw handle 仍在时，接管以 `EBUSY` 失败；授权方存活时，新的 raw opener 同样失败。这个互斥覆盖同进程与跨进程，不允许两类写入口并存。ConfigureLeaseRecovery 与 EnableLocks 验证实际的排他拥有者和 native anchor，不能靠注入任意持久化对象把未受保护的 Store 变成授权方。普通 raw 路径可经过符号链接，但检查针对同一底层 inode；数据库路径中的 `%`、`?`、`#` 与 NUL 明确拒绝，避免 native 绑定检查与 SQLite file URI 打开的文件不一致。
 
 本地持久组合沿用其私有根的 lifetime ownership，lease 证据为 `.leases.intent` 与 `.leases.witness`，根 inode 带同名 xattr 绑定。intent 的 READY 状态与独立 checksummed witness 都必须有效；初始化只恢复匹配的持久 intent，缺少 READY 证据不创建新身份。证据目录迁移需要显式迁移过程，不能仅修改路径配置。SQLite 的锁拥有者只有在数据库成功关闭后才释放原生所有权；最终原生 FD 的 Close 失败只尝试一次并缓存结果。已启用锁且未配置数据库提交见证的直接 SQLite Store，也在退出授权方并排空 commit gate 后重新检查 coordinator poison；这一期间发生的清理提交失败保留原原因、缓存关闭错误并继续持有排他所有权，不能因 pool 已关闭就报告干净关闭。
 
-服务前验证本地 xattr、flock、同 mount 改名、文件与目录 fsync 能力，不支持的配置明确失败。缺失、损坏、替换或归属不匹配的绑定与 READY 状态不触发自动初始化。证据和对象的暂存属于各自私有存储格式，不能出现在 workspace 命名空间中。
+服务前验证本地 xattr、flock、同 mount 改名、文件与目录 fsync 能力，不支持的配置明确失败。缺失、损坏、替换或归属不匹配的绑定与 READY 状态不触发自动初始化。证据和对象的暂存属于各自私有存储格式，不能出现在卷中。
 
 ## HTTP v3 编码
 
-所有端点使用 `/v3/`，每个响应都有 `Remote-Fs-Protocol: 3` 与 `Cache-Control: no-store`。基础 namespace 操作名、octet write body 与 mutation barrier 形状保留；v2 不被 scoped client 接受。
+所有端点使用 `/v3/`，每个响应都有 `Remote-Fs-Protocol: 3` 与 `Cache-Control: no-store`。基础卷操作名、octet write body 与 mutation barrier 形状保留；v2 不被 scoped client 接受。
 
 ### 控制端点
 
@@ -194,7 +194,7 @@ SDK 以产生这份 GrantStatus 的请求首次发送时刻加 `remainingMillis`
 
 普通 `flock` 与传统 POSIX `fcntl` 是[保留文件接口](file-handles.md)的 advisory 操作，不创建强 S/X Owner 或 grant。它们允许未参与加锁者执行普通修改，阻塞等待按 FileSession 的健康续期维持，不采用这里 Acquire 的有限 Wait。普通 Open 不自动选择任何加锁策略。
 
-独立 server 的 Azure Blob 与本地持久对象存储两种形态都建立配对的 enforcing namespace 与锁服务，向 HTTP v3 同时发布数据操作、锁管理操作和显式 mutation scope。协议不通过忽略未知 proof、旧授权方身份或非法 scope 保持兼容；无法识别的结果保持错误。
+独立 server 的 Azure Blob 与本地持久对象存储两种形态都建立配对的 enforcing 卷与锁服务，向 HTTP v3 同时发布数据操作、锁管理操作和显式 mutation scope。协议不通过忽略未知 proof、旧授权方身份或非法 scope 保持兼容；无法识别的结果保持错误。
 
 控制 admission、Session、Owner、grant、等待申请、动作历史及本地资源映射分别有界。授权方动作历史满额时，Release、已知 Acquire 的 Cancel 与 Owner / Session 终止仍有执行路径；控制请求本身继续服从独立的 HTTP admission。TCP 断开不解除已经确认的占有，显式生命周期结束与有限 lease / idle 到期负责释放。
 

@@ -1,10 +1,10 @@
-// Package limited enforces a workspace byte allowance over a bounded namespace.
+// Package limited enforces a byte allowance over one bounded volume.
 // Startup and explicit Recount use authoritative native usage, including detached
-// retained files, or a bounded namespace walk when retained files are unsupported.
+// retained files, or a bounded volume walk when retained files are unsupported.
 // Subsequent publications and final-reference cleanup settle the count directly.
 //
 // Native publication accounting measures the actual target under the backend's final
-// ordering, reserves growth before the namespace effect, and releases shrinking bytes
+// ordering, reserves growth before the volume effect, and releases shrinking bytes
 // after an applied effect. Unknown outcomes and failed accounting settlements make the
 // allowance unusable until reopening.
 // The wrapper preserves the native lock service, mutation scope, and lifecycle.
@@ -36,16 +36,16 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// MinLimit is the smallest allowance a namespace may be held under. It is one block of the
+// MinLimit is the smallest allowance a volume may be held under. It is one block of the
 // 4096 bytes a mount reports space in, and an allowance below it would be reported as a
 // filesystem of zero blocks — which reads as a disk with nothing left rather than as a
-// workspace with a little room, and is exactly the fabricated fact a measured count exists
+// volume with a little room, and is exactly the fabricated fact a measured count exists
 // to avoid (R-ERR-2).
 const MinLimit = 4096
 
 const (
 	// DefaultMaxDirectoryBytes bounds the entries and names retained for one directory
-	// while the namespace is measured.
+	// while the volume is measured.
 	DefaultMaxDirectoryBytes int64 = 64 << 20
 
 	// DefaultMaxFrontierBytes bounds the directory paths still to be visited, including
@@ -53,7 +53,7 @@ const (
 	DefaultMaxFrontierBytes int64 = 64 << 20
 )
 
-// MeasurementLimits bound the two variable-size structures retained while the namespace
+// MeasurementLimits bound the two variable-size structures retained while the volume
 // is measured. They are independent of any transport limits: a measurement walks storage
 // directly, and its retained representation is storage.Entry values and directory paths.
 // A zero field selects its package default; there is no unbounded value.
@@ -109,14 +109,14 @@ func (l MeasurementLimits) Validate() error {
 // final target ordering and do not hold these stripes while staging content.
 const stripeCount = 256
 
-// Storage is a namespace held under an allowance.
+// Storage is a volume held under an allowance.
 type Storage struct {
 	backing     storage.BoundedStorage
 	limit       int64
 	measurement MeasurementLimits
 	accounted   bool
 
-	// Recount excludes namespace requests and synchronous retained-file mutations.
+	// Recount excludes volume requests and synchronous retained-file mutations.
 	// Autonomous retirement remains independent and is detected through revision.
 	gate sync.RWMutex
 
@@ -133,20 +133,20 @@ type Storage struct {
 var _ storage.Storage = (*Storage)(nil)
 var _ storage.BoundedStorage = (*Storage)(nil)
 
-// New holds the namespace in backing under an allowance of limit bytes.
+// New holds the volume in backing under an allowance of limit bytes.
 //
 // Existing usage is measured through the native authority when available. A bounded
-// tree walk is sufficient only for namespaces without retained, detached files.
+// tree walk is sufficient only for volumes without retained, detached files.
 //
-// A namespace already holding more than limit is opened, not refused. An allowance lowered
+// A volume already holding more than limit is opened, not refused. An allowance lowered
 // underneath content that is already written is an ordinary thing for an operator to do,
-// and the answer to it is a namespace that takes no new bytes until it has shed some — not
+// and the answer to it is a volume that takes no new bytes until it has shed some — not
 // one that cannot be served at all.
 func New(ctx context.Context, backing storage.Storage, limit int64) (*Storage, error) {
 	return NewWithLimits(ctx, backing, limit, DefaultMeasurementLimits())
 }
 
-// NewWithLimits holds the namespace under limit. Measurement bounds govern a
+// NewWithLimits holds the volume under limit. Measurement bounds govern a
 // fallback tree walk at startup and Recount. backing must implement BoundedStorage;
 // retained-file backends additionally require authoritative usage and publication
 // accounting before this wrapper can expose their file sessions.
@@ -157,7 +157,7 @@ func NewWithLimits(
 	measurement MeasurementLimits,
 ) (*Storage, error) {
 	if limit < MinLimit {
-		return nil, fmt.Errorf("an allowance of %d bytes is below %d, the smallest a namespace can be held under: %w",
+		return nil, fmt.Errorf("an allowance of %d bytes is below %d, the smallest a volume can be held under: %w",
 			limit, MinLimit, syscall.EINVAL)
 	}
 	effective, err := measurement.Effective()
@@ -179,7 +179,7 @@ func NewWithLimits(
 		}
 	}
 	if source, ok := bounded.(interface{ LockService() locking.Service }); ok && source.LockService() != nil && !accounted {
-		return nil, fmt.Errorf("a lock-enabled namespace requires native publication accounting for its allowance: %w", syscall.ENOSYS)
+		return nil, fmt.Errorf("a lock-enabled volume requires native publication accounting for its allowance: %w", syscall.ENOSYS)
 	}
 	count, err := measureUsage(ctx, bounded, effective)
 	if err != nil {
@@ -188,9 +188,9 @@ func NewWithLimits(
 	return &Storage{backing: bounded, limit: limit, measurement: effective, count: count, accounted: accounted}, nil
 }
 
-// Recount measures the namespace again and replaces the count with what it finds.
+// Recount measures the volume again and replaces the count with what it finds.
 //
-// Uncertain native publication accounting requires reopening the namespace and cannot
+// Uncertain native publication accounting requires reopening the volume and cannot
 // be cleared by recounting. In-band traffic does not repair out-of-band accounting drift.
 //
 // Synchronous mutations wait for measurement. Autonomous file retirement can proceed;
@@ -231,7 +231,7 @@ func (s *Storage) Recount(ctx context.Context) error {
 	return fmt.Errorf("retained-file cleanup changed usage during every recount attempt: %w", syscall.EAGAIN)
 }
 
-// measure walks the namespace and sums what it holds.
+// measure walks the volume and sums what it holds.
 //
 // A directory contributes nothing: storage.Attr.Size is unspecified for one, so there is
 // no figure there to add. A symbolic link contributes the length of the target it holds,
@@ -243,7 +243,7 @@ func (s *Storage) Recount(ctx context.Context) error {
 // slice capacity beyond the records charged to MaxFrontierBytes.
 func measure(ctx context.Context, s storage.BoundedStorage, limits MeasurementLimits) (int64, error) {
 	if err := s.CheckBounded(); err != nil {
-		return 0, fmt.Errorf("measuring the namespace requires bounded storage results: %w", err)
+		return 0, fmt.Errorf("measuring the volume requires bounded storage results: %w", err)
 	}
 	frontier, err := newMeasurementFrontier(limits.MaxFrontierBytes)
 	if err != nil {
@@ -259,17 +259,17 @@ func measure(ctx context.Context, s storage.BoundedStorage, limits MeasurementLi
 
 		result, err := storage.NewListResult(limits.MaxDirectoryBytes, 0, measurementEntryBytes)
 		if err != nil {
-			return 0, fmt.Errorf("measuring the namespace, preparing to list %q: %w", dir, err)
+			return 0, fmt.Errorf("measuring the volume, preparing to list %q: %w", dir, err)
 		}
 		if err := s.ListBounded(ctx, dir, result); err != nil {
-			return 0, fmt.Errorf("measuring the namespace, listing %q: %w", dir, err)
+			return 0, fmt.Errorf("measuring the volume, listing %q: %w", dir, err)
 		}
 		if err := measurementCanceled(ctx); err != nil {
 			return 0, err
 		}
 		entries, err := result.Entries()
 		if err != nil {
-			return 0, fmt.Errorf("measuring the namespace, completing the listing of %q: %w", dir, err)
+			return 0, fmt.Errorf("measuring the volume, completing the listing of %q: %w", dir, err)
 		}
 		if err := measurementCanceled(ctx); err != nil {
 			return 0, err
@@ -288,17 +288,17 @@ func measure(ctx context.Context, s storage.BoundedStorage, limits MeasurementLi
 				return 0, err
 			}
 			// A negative size and a sum past what a byte count holds are both answers no
-			// namespace can give. Taking either would put an allowance in front of a
+			// volume can give. Taking either would put an allowance in front of a
 			// caller as a measured fact when it is a wrapped or a nonsensical figure, so
 			// each is a failure to report rather than a number to repair (R-ERR-2).
 			if e.Attr.Size < 0 {
 				name, _ := measurementPath(dir, e.Name)
-				return 0, fmt.Errorf("measuring the namespace, %q holds %d bytes: %w",
+				return 0, fmt.Errorf("measuring the volume, %q holds %d bytes: %w",
 					name, e.Attr.Size, syscall.EIO)
 			}
 			if e.Attr.Size > math.MaxInt64-total {
 				name, _ := measurementPath(dir, e.Name)
-				return 0, fmt.Errorf("measuring the namespace, %q carries the total past what a byte count holds: %w",
+				return 0, fmt.Errorf("measuring the volume, %q carries the total past what a byte count holds: %w",
 					name, syscall.EOVERFLOW)
 			}
 			total += e.Attr.Size
@@ -356,12 +356,12 @@ func (f *measurementFrontier) add(dir, name string) error {
 		return err
 	}
 	if joinedBytes > math.MaxInt64-measurementFrontierNodeBytes {
-		return fmt.Errorf("a namespace path is too large to retain for measurement: %w", syscall.EOVERFLOW)
+		return fmt.Errorf("a volume path is too large to retain for measurement: %w", syscall.EOVERFLOW)
 	}
 	charge := measurementFrontierNodeBytes + joinedBytes
 	if charge > f.maxBytes-f.used {
 		return fmt.Errorf(
-			"measuring the namespace needs more than the configured %d-byte traversal frontier while retaining a child of %q: %w",
+			"measuring the volume needs more than the configured %d-byte traversal frontier while retaining a child of %q: %w",
 			f.maxBytes, dir, syscall.EIO)
 	}
 	joined, err := measurementPath(dir, name)
@@ -388,7 +388,7 @@ func measurementPathBytes(dir, name string) (int64, error) {
 		separator = 1
 	}
 	if int64(len(name)) > math.MaxInt64-int64(len(dir))-separator {
-		return 0, fmt.Errorf("a namespace path is too large to measure: %w", syscall.EOVERFLOW)
+		return 0, fmt.Errorf("a volume path is too large to measure: %w", syscall.EOVERFLOW)
 	}
 	return int64(len(dir)) + separator + int64(len(name)), nil
 }
@@ -405,14 +405,14 @@ func measurementPath(dir, name string) (string, error) {
 
 func measurementCanceled(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("measuring the namespace: %w", err)
+		return fmt.Errorf("measuring the volume: %w", err)
 	}
 	return nil
 }
 
 // reserve atomically charges growth before publication. Shrinking writes retain their
 // previous charge until successful publication; other writers cannot spend bytes that
-// the namespace still holds. The returned reservation is released if publication fails.
+// the volume still holds. The returned reservation is released if publication fails.
 func (s *Storage) reserve(name string, delta int64) (int64, error) {
 	s.countMu.Lock()
 	defer s.countMu.Unlock()
@@ -421,11 +421,11 @@ func (s *Storage) reserve(name string, delta int64) (int64, error) {
 	}
 
 	// Written as a subtraction from the allowance rather than an addition to the count,
-	// so that a namespace holding close to what a byte count holds cannot wrap the sum
+	// so that a volume holding close to what a byte count holds cannot wrap the sum
 	// into a figure that passes.
 	if delta > 0 && delta > s.limit-s.count {
 		return 0, &os.PathError{Op: "write", Path: name, Err: fmt.Errorf(
-			"%d more bytes would carry the namespace past its allowance of %d bytes, of which %d are taken: %w",
+			"%d more bytes would carry the volume past its allowance of %d bytes, of which %d are taken: %w",
 			delta, s.limit, s.count, syscall.EDQUOT)}
 	}
 	charged := max(delta, 0)
@@ -434,7 +434,7 @@ func (s *Storage) reserve(name string, delta int64) (int64, error) {
 	return charged, nil
 }
 
-// release gives back bytes the namespace no longer holds: a charge whose write failed, or
+// release gives back bytes the volume no longer holds: a charge whose write failed, or
 // the contents of something that has just been removed.
 func (s *Storage) release(delta int64) {
 	s.countMu.Lock()
@@ -452,15 +452,15 @@ func (s *Storage) taken() (int64, error) {
 // floor holds the count at or above zero, and it is applied where the count is stored
 // rather than only where it is read.
 //
-// Out-of-band modification of the served namespace is a non-goal, but when it happens a
+// Out-of-band modification of the served volume is a non-goal, but when it happens a
 // file added behind our back and removed in band credits bytes that were never charged,
 // which drives the count down. A negative count reports an Avail larger than Total — room
 // that exists nowhere, and an enormous positive once a kernel reply's unsigned field has
 // it — so the count is held at zero instead.
 //
 // That is a bound on what we report and on nothing else. A floored count sits below what
-// the namespace holds, and writes are taken against the room it appears to have until
-// Recount measures the namespace again.
+// the volume holds, and writes are taken against the room it appears to have until
+// Recount measures the volume again.
 func floor(count int64) int64 { return max(count, 0) }
 
 // stripeOf picks the exclusion a path falls under. The path is the cleaned one, so that
@@ -570,7 +570,7 @@ func (s *Storage) Write(ctx context.Context, name string, content []byte) error 
 }
 
 // Remove credits the file's contents back, and only once the file is gone. Crediting first
-// would hand out room the namespace has not released.
+// would hand out room the volume has not released.
 func (s *Storage) Remove(ctx context.Context, name string) error {
 	cleaned, err := storage.CleanPath(name)
 	if err != nil {
@@ -641,7 +641,7 @@ func (s *Storage) Rename(ctx context.Context, from, to string) error {
 	// A move onto the node itself replaces nothing, so there is nothing to credit: POSIX
 	// has rename(2) "return successfully and perform no other action" when both names
 	// resolve to one directory entry, and the bytes at the destination are the same bytes
-	// that are still there afterwards. Crediting them would hand out room the namespace
+	// that are still there afterwards. Crediting them would hand out room the volume
 	// never released, once for every time the move is repeated. Both names fall on one
 	// stripe here, which the ordering above already allows for.
 	//
@@ -687,7 +687,7 @@ func (s *Storage) SetAttr(ctx context.Context, name string, change storage.AttrC
 	return s.publicationError(s.backing.SetAttr(s.mutationContext(ctx, name), name, change))
 }
 
-// CheckBounded refuses use as an embedded-server backend when the wrapped namespace
+// CheckBounded refuses use as an embedded-server backend when the wrapped volume
 // cannot enforce caller-owned result bounds before allocation.
 func (s *Storage) CheckBounded() error {
 	return s.backing.CheckBounded()

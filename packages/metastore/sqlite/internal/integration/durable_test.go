@@ -130,21 +130,21 @@ func (w *recordingWitness) checkpoints() []sqlite.DurableState {
 
 func openDurable(
 	t *testing.T,
-	path, namespace string,
-	mode sqlite.NamespaceOpenMode,
+	path, volume string,
+	mode sqlite.VolumeOpenMode,
 	startup sqlite.DurableStartup,
 	witness sqlite.CommitWitness,
 ) *sqlite.Store {
 	t.Helper()
 	store, err := sqlite.OpenBoundDurableWithOptions(
-		t.Context(), path, namespace, durableStoreID, 0, sqlite.DefaultOptions(), mode, startup, witness,
+		t.Context(), path, volume, durableStoreID, 0, sqlite.DefaultOptions(), mode, startup, witness,
 	)
 	if err != nil {
-		t.Fatalf("opening durable namespace %q: %v", namespace, err)
+		t.Fatalf("opening durable volume %q: %v", volume, err)
 	}
 	t.Cleanup(func() {
 		if err := store.Close(); err != nil {
-			t.Errorf("closing durable namespace %q: %v", namespace, err)
+			t.Errorf("closing durable volume %q: %v", volume, err)
 		}
 	})
 	return store
@@ -158,10 +158,10 @@ func openDurableWithoutCleanup(
 	t.Helper()
 	store, err := sqlite.OpenBoundDurableWithOptions(
 		t.Context(), path, "workspace", durableStoreID, 0, sqlite.DefaultOptions(),
-		sqlite.CreateNamespaceIfMissing, sqlite.DurableStartup{}, witness,
+		sqlite.CreateVolumeIfMissing, sqlite.DurableStartup{}, witness,
 	)
 	if err != nil {
-		t.Fatalf("opening durable namespace: %v", err)
+		t.Fatalf("opening durable volume: %v", err)
 	}
 	return store
 }
@@ -169,7 +169,7 @@ func openDurableWithoutCleanup(
 func initializeCheckpointedDurableStore(t *testing.T, path string) sqlite.DurableState {
 	t.Helper()
 	witness := &recordingWitness{database: path}
-	store := openDurable(t, path, "workspace", sqlite.CreateNamespaceIfMissing, sqlite.DurableStartup{}, witness)
+	store := openDurable(t, path, "workspace", sqlite.CreateVolumeIfMissing, sqlite.DurableStartup{}, witness)
 	result, err := store.Checkpoint(t.Context(), sqlite.FullCheckpoint)
 	if err != nil {
 		t.Fatalf("checkpointing initialized database: %v", err)
@@ -185,13 +185,13 @@ func initializeCheckpointedDurableStore(t *testing.T, path string) sqlite.Durabl
 
 func requireOpenEIO(
 	t *testing.T,
-	path, namespace string,
+	path, volume string,
 	startup sqlite.DurableStartup,
 ) {
 	t.Helper()
 	store, err := sqlite.OpenBoundDurableWithOptions(
-		t.Context(), path, namespace, durableStoreID, 0, sqlite.DefaultOptions(),
-		sqlite.RequireExistingNamespace, startup, &recordingWitness{database: path},
+		t.Context(), path, volume, durableStoreID, 0, sqlite.DefaultOptions(),
+		sqlite.RequireExistingVolume, startup, &recordingWitness{database: path},
 	)
 	if err == nil {
 		store.Close()
@@ -202,22 +202,22 @@ func requireOpenEIO(
 	}
 }
 
-func TestRequireExistingDurableNamespaceRefusesToCreateAMissingNamespace(t *testing.T) {
+func TestRequireExistingDurableVolumeRefusesToCreateAMissingVolume(t *testing.T) {
 	path := database(t)
 	accepted := initializeCheckpointedDurableStore(t, path)
 	witness := &recordingWitness{database: path}
 	store, err := sqlite.OpenBoundDurableWithOptions(
 		t.Context(), path, "missing", durableStoreID, 0, sqlite.DefaultOptions(),
-		sqlite.RequireExistingNamespace,
+		sqlite.RequireExistingVolume,
 		sqlite.DurableStartup{Accepted: accepted, CheckpointedGeneration: accepted.Generation},
 		witness,
 	)
 	if err == nil {
 		store.Close()
-		t.Fatal("requiring a missing namespace succeeded")
+		t.Fatal("requiring a missing volume succeeded")
 	}
 	if !errors.Is(err, syscall.EIO) {
-		t.Fatalf("requiring a missing namespace: %v, want EIO", err)
+		t.Fatalf("requiring a missing volume: %v, want EIO", err)
 	}
 	if acceptedAfter, _ := witness.accepts(); len(acceptedAfter) != 0 {
 		t.Fatalf("a refused open published accepted states: %+v", acceptedAfter)
@@ -226,19 +226,19 @@ func TestRequireExistingDurableNamespaceRefusesToCreateAMissingNamespace(t *test
 	db := raw(t, path)
 	defer db.Close()
 	var count int
-	if err := db.QueryRow(`SELECT count(*) FROM namespaces WHERE name = 'missing'`).Scan(&count); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM volumes WHERE name = 'missing'`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {
-		t.Fatalf("a refused open created %d missing namespace rows", count)
+		t.Fatalf("a refused open created %d missing volume rows", count)
 	}
 }
 
-func TestRequireExistingWithoutAnAcceptedWitnessDoesNotRebuildALostNamespace(t *testing.T) {
+func TestRequireExistingWithoutAnAcceptedWitnessDoesNotRebuildALostVolume(t *testing.T) {
 	path := database(t)
 	initializeCheckpointedDurableStore(t, path)
 	db := raw(t, path)
-	if _, err := db.Exec(`DELETE FROM namespaces WHERE name = 'workspace'`); err != nil {
+	if _, err := db.Exec(`DELETE FROM volumes WHERE name = 'workspace'`); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
@@ -248,30 +248,30 @@ func TestRequireExistingWithoutAnAcceptedWitnessDoesNotRebuildALostNamespace(t *
 
 	store, err := sqlite.OpenBoundDurableWithOptions(
 		t.Context(), path, "workspace", durableStoreID, 0, sqlite.DefaultOptions(),
-		sqlite.RequireExistingNamespace, sqlite.DurableStartup{}, &recordingWitness{database: path},
+		sqlite.RequireExistingVolume, sqlite.DurableStartup{}, &recordingWitness{database: path},
 	)
 	if err == nil {
 		store.Close()
-		t.Fatal("requiring a lost unwitnessed namespace rebuilt it")
+		t.Fatal("requiring a lost unwitnessed volume rebuilt it")
 	}
 	if !errors.Is(err, syscall.EIO) {
-		t.Fatalf("requiring a lost unwitnessed namespace: %v, want EIO", err)
+		t.Fatalf("requiring a lost unwitnessed volume: %v, want EIO", err)
 	}
 	db = raw(t, path)
 	defer db.Close()
 	var count int
-	if err := db.QueryRow(`SELECT count(*) FROM namespaces WHERE name = 'workspace'`).Scan(&count); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM volumes WHERE name = 'workspace'`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {
-		t.Fatalf("refused recovery created %d replacement workspace rows", count)
+		t.Fatalf("refused recovery created %d replacement volume rows", count)
 	}
 }
 
 func TestAcceptObservesCommittedMonotonicDurableState(t *testing.T) {
 	path := database(t)
 	witness := &recordingWitness{database: path}
-	store := openDurable(t, path, "workspace", sqlite.CreateNamespaceIfMissing, sqlite.DurableStartup{}, witness)
+	store := openDurable(t, path, "workspace", sqlite.CreateVolumeIfMissing, sqlite.DurableStartup{}, witness)
 
 	for _, mutate := range []func() error{
 		func() error { return store.Create(t.Context(), "file") },
@@ -422,7 +422,7 @@ func TestCommittedStateIsNotVisibleWhileAcceptIsUnresolved(t *testing.T) {
 func TestCheckpointWitnessFailureCanBeRetried(t *testing.T) {
 	path := database(t)
 	witness := &recordingWitness{database: path}
-	store := openDurable(t, path, "workspace", sqlite.CreateNamespaceIfMissing, sqlite.DurableStartup{}, witness)
+	store := openDurable(t, path, "workspace", sqlite.CreateVolumeIfMissing, sqlite.DurableStartup{}, witness)
 	if err := store.Create(t.Context(), "file"); err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +431,7 @@ func TestCheckpointWitnessFailureCanBeRetried(t *testing.T) {
 		t.Fatalf("checkpoint witness failure returned %v, want EIO", err)
 	}
 	if _, err := store.Stat(t.Context(), "file"); err != nil {
-		t.Fatalf("checkpoint witness failure poisoned an accepted namespace: %v", err)
+		t.Fatalf("checkpoint witness failure poisoned an accepted volume: %v", err)
 	}
 	witness.failCheckpointWith(nil)
 	result, err := store.Checkpoint(t.Context(), sqlite.FullCheckpoint)
@@ -466,7 +466,7 @@ func TestDurableStartupReconciliationRefusesLostOrUnacceptedState(t *testing.T) 
 	t.Run("visible state is newer than accepted without a WAL", func(t *testing.T) {
 		path := database(t)
 		witness := &recordingWitness{database: path}
-		store := openDurable(t, path, "workspace", sqlite.CreateNamespaceIfMissing, sqlite.DurableStartup{}, witness)
+		store := openDurable(t, path, "workspace", sqlite.CreateVolumeIfMissing, sqlite.DurableStartup{}, witness)
 		if err := store.Create(t.Context(), "newer"); err != nil {
 			t.Fatal(err)
 		}
@@ -498,7 +498,7 @@ func TestDurableStartupReconciliationRefusesLostOrUnacceptedState(t *testing.T) 
 func TestOpenAcceptFailurePreservesWALForTheNextRecovery(t *testing.T) {
 	path := database(t)
 	initialWitness := &recordingWitness{database: path}
-	initial := openDurable(t, path, "workspace", sqlite.CreateNamespaceIfMissing, sqlite.DurableStartup{}, initialWitness)
+	initial := openDurable(t, path, "workspace", sqlite.CreateVolumeIfMissing, sqlite.DurableStartup{}, initialWitness)
 	if err := initial.Create(t.Context(), "file"); err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +511,7 @@ func TestOpenAcceptFailurePreservesWALForTheNextRecovery(t *testing.T) {
 	failingWitness := &recordingWitness{database: path, acceptErr: errors.New("publish failed")}
 	failed, err := sqlite.OpenBoundDurableWithOptions(
 		t.Context(), path, "workspace", durableStoreID, 0, sqlite.DefaultOptions(),
-		sqlite.RequireExistingNamespace,
+		sqlite.RequireExistingVolume,
 		sqlite.DurableStartup{Accepted: stable, CheckpointedGeneration: stable.Generation},
 		failingWitness,
 	)
@@ -531,7 +531,7 @@ func TestOpenAcceptFailurePreservesWALForTheNextRecovery(t *testing.T) {
 	}
 
 	recovered := openDurable(
-		t, path, "workspace", sqlite.RequireExistingNamespace,
+		t, path, "workspace", sqlite.RequireExistingVolume,
 		sqlite.DurableStartup{
 			Accepted: stable, CheckpointedGeneration: stable.Generation,
 			WALPresent: true, WALNonEmpty: true,
@@ -539,7 +539,7 @@ func TestOpenAcceptFailurePreservesWALForTheNextRecovery(t *testing.T) {
 		&recordingWitness{database: path},
 	)
 	if _, err := recovered.Stat(t.Context(), "file"); err != nil {
-		t.Fatalf("recovery after open-time Accept failure lost the namespace: %v", err)
+		t.Fatalf("recovery after open-time Accept failure lost the volume: %v", err)
 	}
 }
 
@@ -547,7 +547,7 @@ func TestSuccessfulDurableCloseReleasesPersistentWALAllocation(t *testing.T) {
 	path := database(t)
 	witness := &recordingWitness{database: path}
 	store := openDurable(
-		t, path, "workspace", sqlite.CreateNamespaceIfMissing, sqlite.DurableStartup{}, witness,
+		t, path, "workspace", sqlite.CreateVolumeIfMissing, sqlite.DurableStartup{}, witness,
 	)
 	snapshot, _, err := store.Snapshot(t.Context())
 	if err != nil {
@@ -588,7 +588,7 @@ func TestSuccessfulDurableCloseReleasesPersistentWALAllocation(t *testing.T) {
 	accepted, _ := witness.accepts()
 	latest := accepted[len(accepted)-1]
 	reopened := openDurable(
-		t, path, "workspace", sqlite.RequireExistingNamespace,
+		t, path, "workspace", sqlite.RequireExistingVolume,
 		sqlite.DurableStartup{
 			Accepted: latest, CheckpointedGeneration: latest.Generation,
 			WALPresent: walPresent, WALNonEmpty: walNonEmpty,
@@ -603,7 +603,7 @@ func TestSuccessfulDurableCloseReleasesPersistentWALAllocation(t *testing.T) {
 func TestCheckpointPublishesOnlyCompleteState(t *testing.T) {
 	path := database(t)
 	witness := &recordingWitness{database: path}
-	store := openDurable(t, path, "workspace", sqlite.CreateNamespaceIfMissing, sqlite.DurableStartup{}, witness)
+	store := openDurable(t, path, "workspace", sqlite.CreateVolumeIfMissing, sqlite.DurableStartup{}, witness)
 	if err := store.Create(t.Context(), "before-snapshot"); err != nil {
 		t.Fatal(err)
 	}
@@ -645,7 +645,7 @@ func TestCheckpointPublishesOnlyCompleteState(t *testing.T) {
 func TestDurableCloseKeepsTheDatabaseOpenUntilCheckpointIsWitnessed(t *testing.T) {
 	path := database(t)
 	witness := &recordingWitness{database: path}
-	store := openDurable(t, path, "workspace", sqlite.CreateNamespaceIfMissing, sqlite.DurableStartup{}, witness)
+	store := openDurable(t, path, "workspace", sqlite.CreateVolumeIfMissing, sqlite.DurableStartup{}, witness)
 	if err := store.Create(t.Context(), "before-snapshot"); err != nil {
 		t.Fatal(err)
 	}
@@ -680,7 +680,7 @@ func TestDurableCloseKeepsTheDatabaseOpenUntilCheckpointIsWitnessed(t *testing.T
 	latest := accepted[len(accepted)-1]
 	reopenedWitness := &recordingWitness{database: path}
 	reopened := openDurable(
-		t, path, "workspace", sqlite.RequireExistingNamespace,
+		t, path, "workspace", sqlite.RequireExistingVolume,
 		sqlite.DurableStartup{Accepted: latest, CheckpointedGeneration: latest.Generation},
 		reopenedWitness,
 	)
@@ -692,7 +692,7 @@ func TestDurableCloseKeepsTheDatabaseOpenUntilCheckpointIsWitnessed(t *testing.T
 func TestDurableCloseRetriesCheckpointWitnessBeforeReleasingSQLite(t *testing.T) {
 	path := database(t)
 	witness := &recordingWitness{database: path}
-	store := openDurable(t, path, "workspace", sqlite.CreateNamespaceIfMissing, sqlite.DurableStartup{}, witness)
+	store := openDurable(t, path, "workspace", sqlite.CreateVolumeIfMissing, sqlite.DurableStartup{}, witness)
 	if err := store.Create(t.Context(), "file"); err != nil {
 		t.Fatal(err)
 	}
@@ -708,12 +708,12 @@ func TestDurableCloseRetriesCheckpointWitnessBeforeReleasingSQLite(t *testing.T)
 	accepted, _ := witness.accepts()
 	latest := accepted[len(accepted)-1]
 	reopened := openDurable(
-		t, path, "workspace", sqlite.RequireExistingNamespace,
+		t, path, "workspace", sqlite.RequireExistingVolume,
 		sqlite.DurableStartup{Accepted: latest, CheckpointedGeneration: latest.Generation},
 		&recordingWitness{database: path},
 	)
 	if _, err := reopened.Stat(t.Context(), "file"); err != nil {
-		t.Fatalf("reopening after retried close lost the accepted namespace: %v", err)
+		t.Fatalf("reopening after retried close lost the accepted volume: %v", err)
 	}
 }
 
@@ -724,7 +724,7 @@ func TestDurableCloseExcludesANewerMutationThroughWriterClose(t *testing.T) {
 		entered:          make(chan struct{}),
 		release:          make(chan struct{}),
 	}
-	store := openDurable(t, path, "workspace", sqlite.CreateNamespaceIfMissing, sqlite.DurableStartup{}, witness)
+	store := openDurable(t, path, "workspace", sqlite.CreateVolumeIfMissing, sqlite.DurableStartup{}, witness)
 	if err := store.Create(t.Context(), "before-close"); err != nil {
 		t.Fatal(err)
 	}
@@ -760,7 +760,7 @@ func TestDurableCloseExcludesANewerMutationThroughWriterClose(t *testing.T) {
 func TestCommitGateAndCloseContextHonorCancellation(t *testing.T) {
 	path := database(t)
 	witness := &blockingWitness{recordingWitness: recordingWitness{database: path}}
-	store := openDurable(t, path, "workspace", sqlite.CreateNamespaceIfMissing, sqlite.DurableStartup{}, witness)
+	store := openDurable(t, path, "workspace", sqlite.CreateVolumeIfMissing, sqlite.DurableStartup{}, witness)
 	entered, release := witness.blockNextAccept(nil)
 	first := make(chan error, 1)
 	go func() { first <- store.Create(t.Context(), "holding-gate") }()

@@ -73,7 +73,7 @@ func TestReadTransactionDistinguishesAutomaticRollbackFromCleanupFailure(t *test
 func TestLabeledReadCancellationSurvivesTransactionCleanup(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	primary := fmt.Errorf("validating namespace integrity: %w", sqlerr.ReadFailure(ctx, sql.ErrTxDone))
+	primary := fmt.Errorf("validating volume integrity: %w", sqlerr.ReadFailure(ctx, sql.ErrTxDone))
 	tx := &rollbackFailure{err: sql.ErrTxDone}
 	err := finishReadTransaction(ctx, "object status transaction", tx, primary)
 	if storage.ErrnoOf(err) != syscall.EINTR || !errors.Is(err, sql.ErrTxDone) ||
@@ -556,7 +556,7 @@ func TestOpenCleanupFailureRetainsDatabaseOwnership(t *testing.T) {
 				},
 			}
 			durable := &durableOpen{
-				mode: RequireExistingNamespace, witness: acceptingCommitWitness{},
+				mode: RequireExistingVolume, witness: acceptingCommitWitness{},
 			}
 			store, err := openConfiguredWithHooks(
 				t.Context(), path, "workspace", "store", 0, DefaultOptions(), durable, hooks,

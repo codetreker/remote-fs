@@ -128,7 +128,7 @@ func lockErrorOf(err error) lockErrorResponse {
 	if len(message) > 1024 || !utf8.ValidString(message) {
 		message = "lock control diagnostic cannot be represented within the wire text bound"
 	}
-	if typed := namespaceLockFailure(err); typed != nil {
+	if typed := volumeLockFailure(err); typed != nil {
 		return lockErrorResponse{Errno: storage.ErrnoNameOf(locking.Errno(typed.Code)), Code: typed.Code, Recorded: typed.Recorded, Message: message}
 	}
 	return lockErrorResponse{Errno: "EIO", Code: locking.Unavailable, Message: message}

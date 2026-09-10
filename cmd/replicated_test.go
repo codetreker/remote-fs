@@ -14,7 +14,7 @@ import (
 // Tree lookups and directory entries use the local replica. Identity-based attributes
 // are confirmed by the authority so an existing inode cannot describe a replacement.
 func TestWalkingAMountedTreeCachesNamesAndConfirmsIdentityAttributes(t *testing.T) {
-	s := serveNamespace(t)
+	s := serveVolume(t)
 	a := mountpointOn(t, s)
 
 	// A tree with a couple of levels, made through the mountpoint so that what is walked is
@@ -81,7 +81,7 @@ func TestWalkingAMountedTreeCachesNamesAndConfirmsIdentityAttributes(t *testing.
 // The inode numbers are what a program sees of that identity. Anything holding a file open
 // across the rename, and anything that remembers what it has already visited, reads them.
 func TestADirectoryRenameKeepsTheIdentitiesBeneathIt(t *testing.T) {
-	s := serveNamespace(t)
+	s := serveVolume(t)
 	a := mountpointOn(t, s)
 
 	for _, dir := range []string{"before", "before/inner"} {
@@ -128,8 +128,8 @@ func TestADirectoryRenameKeepsTheIdentitiesBeneathIt(t *testing.T) {
 
 // ENOSYS selects direct remote operations when a handler does not publish replication.
 // EIO must remain a failure, since a connection problem cannot establish that policy.
-func TestANamespaceWithoutPublishedLogIsMountedWithoutACopy(t *testing.T) {
-	s := serveUnreplicatedNamespace(t)
+func TestAVolumeWithoutPublishedLogIsMountedWithoutACopy(t *testing.T) {
+	s := serveUnreplicatedVolume(t)
 	a := mountpointOn(t, s)
 
 	if err := os.WriteFile(filepath.Join(a, "a.txt"), []byte("hello\n"), 0o644); err != nil {
@@ -150,7 +150,7 @@ func TestANamespaceWithoutPublishedLogIsMountedWithoutACopy(t *testing.T) {
 	}
 	t.Logf("one stat through the mountpoint: %s", arrived)
 	if got, err := s.authoritative.Read(t.Context(), "a.txt"); err != nil || string(got) != "hello\n" {
-		t.Fatalf("the authoritative namespace holds %q, %v", got, err)
+		t.Fatalf("the authoritative volume holds %q, %v", got, err)
 	}
 }
 
@@ -180,12 +180,12 @@ func inodeOf(t *testing.T, at string) uint64 {
 // the node the descriptor was opened on.
 //
 // It is here rather than beside the identity record because every layer has to hold for the
-// program to be right: the namespace has to report which node is at a name, the wire has to
+// program to be right: the volume has to report which node is at a name, the wire has to
 // carry it, the record has to compare it, and an open descriptor has to describe the file it
 // holds rather than the path it came from. A case under any one of them passes with the
 // other three broken.
 func TestADescriptorKeepsReadingTheFileItOpened(t *testing.T) {
-	s := serveNamespace(t)
+	s := serveVolume(t)
 	a, b := mountpointOn(t, s), mountpointOn(t, s)
 
 	const (
@@ -281,7 +281,7 @@ func TestADescriptorKeepsReadingTheFileItOpened(t *testing.T) {
 // Content replacement preserves the SQLite node identity. Path metadata must therefore
 // update even when a descriptor keeps the previously opened content for that same inode.
 func TestAStatOfAPathIsNotAnsweredFromSomebodyElsesDescriptor(t *testing.T) {
-	s := serveNamespace(t)
+	s := serveVolume(t)
 	a := mountpointOn(t, s)
 	f := filepath.Join(a, "f")
 

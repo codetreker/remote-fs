@@ -16,7 +16,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-func TestOneNamespaceSourceIsRequired(t *testing.T) {
+func TestOneVolumeSourceIsRequired(t *testing.T) {
 	for _, args := range [][]string{
 		{"-listen", "127.0.0.1:0"},
 		{"-listen", "127.0.0.1:0", "-blob-container", "one", "-local-store", "/two"},
@@ -25,8 +25,8 @@ func TestOneNamespaceSourceIsRequired(t *testing.T) {
 		if err == nil {
 			t.Fatalf("%v was accepted", args)
 		}
-		if !strings.Contains(err.Error(), "namespace") {
-			t.Fatalf("%v was refused without identifying the namespace choice: %v", args, err)
+		if !strings.Contains(err.Error(), "volume") {
+			t.Fatalf("%v was refused without identifying the volume choice: %v", args, err)
 		}
 	}
 }
@@ -56,14 +56,14 @@ func TestAFlagForAnotherSourceIsRefused(t *testing.T) {
 	}
 }
 
-func TestALocalStoreRequiresAWorkspaceAndQuota(t *testing.T) {
+func TestALocalStoreRequiresAVolumeAndQuota(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		args []string
 		want string
 	}{
-		{"workspace", nil, "-workspace"},
-		{"quota", []string{"-workspace", "workspace"}, "-quota"},
+		{"volume", nil, "-volume"},
+		{"quota", []string{"-volume", "workspace"}, "-quota"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			args := []string{"-listen", "127.0.0.1:0", "-local-store", "/data"}
@@ -80,11 +80,14 @@ func TestLocalDefaultsFollowThePackagesThatEnforceThem(t *testing.T) {
 	config, help, err := parseConfig([]string{
 		"-listen", "127.0.0.1:0",
 		"-local-store", "/data",
-		"-workspace", "workspace",
+		"-volume", "workspace",
 		"-quota", "8M",
 	}, &bytes.Buffer{})
 	if err != nil || help {
 		t.Fatalf("parse local-store command: help=%t error=%v", help, err)
+	}
+	if config.local.volume != "workspace" {
+		t.Fatalf("-volume changed the requested name: %q", config.local.volume)
 	}
 	if got := config.local.objects; got != (localdisk.Options{
 		MaxObjectBytes:          localdisk.DefaultMaxObjectBytes,
@@ -130,7 +133,7 @@ func TestLocalBoundsAndHTTPBodyLimitReachTheirOwners(t *testing.T) {
 	config, help, err := parseConfig([]string{
 		"-listen", "127.0.0.1:0",
 		"-local-store", "/data",
-		"-workspace", "workspace",
+		"-volume", "workspace",
 		"-quota", "64M",
 		"-local-max-object-bytes", "4M",
 		"-local-max-in-flight-operations", "3",
@@ -213,7 +216,7 @@ func TestHTTPWriteLimitCannotExceedTheLocalObjectLimit(t *testing.T) {
 	base := []string{
 		"-listen", "127.0.0.1:0",
 		"-local-store", "/data",
-		"-workspace", "workspace",
+		"-volume", "workspace",
 		"-quota", "1M",
 		"-local-max-object-bytes", "4M",
 		"-http-max-body-bytes", "5M",
@@ -233,12 +236,12 @@ func TestHTTPWriteLimitCannotExceedTheLocalObjectLimit(t *testing.T) {
 	}
 }
 
-func TestMetastoreBoundsApplyToBlobNamespaces(t *testing.T) {
+func TestMetastoreBoundsApplyToBlobVolumes(t *testing.T) {
 	config, help, err := parseConfig([]string{
 		"-listen", "127.0.0.1:0",
 		"-blob-container", "container",
 		"-metastore", "/data/meta.sqlite",
-		"-workspace", "workspace",
+		"-volume", "workspace",
 		"-max-pending-objects", "29",
 		"-max-pending-bytes", "12M",
 		"-max-reader-connections", "7",
@@ -251,6 +254,9 @@ func TestMetastoreBoundsApplyToBlobNamespaces(t *testing.T) {
 	}, &bytes.Buffer{})
 	if err != nil || help {
 		t.Fatalf("parse blob command: help=%t error=%v", help, err)
+	}
+	if config.blob.volume != "workspace" {
+		t.Fatalf("-volume changed the requested name: %q", config.blob.volume)
 	}
 	if got := config.objectLimits; got.MaxPendingObjects != 29 || got.MaxPendingBytes != 12<<20 {
 		t.Fatalf("blob pending thresholds are %+v", got)
@@ -277,7 +283,7 @@ func TestHTTPWriteLimitCannotExceedBlobOrPendingObjectBounds(t *testing.T) {
 		"-listen", "127.0.0.1:0",
 		"-blob-container", "container",
 		"-metastore", "/data/meta.sqlite",
-		"-workspace", "workspace",
+		"-volume", "workspace",
 	}
 	for _, c := range []struct {
 		name string
@@ -298,7 +304,7 @@ func TestHTTPWriteLimitCannotExceedBlobOrPendingObjectBounds(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			_, _, err := parseConfig(append(append([]string{}, base...), c.args...), &bytes.Buffer{})
-			if err == nil || !strings.Contains(err.Error(), "blob namespace write bound") || !strings.Contains(err.Error(), "EFBIG") {
+			if err == nil || !strings.Contains(err.Error(), "blob volume write bound") || !strings.Contains(err.Error(), "EFBIG") {
 				t.Fatalf("oversized blob HTTP write returned %v", err)
 			}
 		})
@@ -317,7 +323,7 @@ func TestNonPositiveCountsAndDurationsAreRefused(t *testing.T) {
 	base := []string{
 		"-listen", "127.0.0.1:0",
 		"-local-store", "/data",
-		"-workspace", "workspace",
+		"-volume", "workspace",
 		"-quota", "8M",
 	}
 	for _, c := range []struct {
@@ -344,7 +350,7 @@ func TestNonPositiveCountsAndDurationsAreRefused(t *testing.T) {
 }
 
 func TestHTTPResourceBoundsAreValidatedBeforeOpeningStorage(t *testing.T) {
-	base := []string{"-listen", "127.0.0.1:0", "-local-store", "/does/not/need/to/exist", "-workspace", "workspace", "-quota", "8M"}
+	base := []string{"-listen", "127.0.0.1:0", "-local-store", "/does/not/need/to/exist", "-volume", "workspace", "-quota", "8M"}
 	for _, test := range []struct {
 		name string
 		args []string
@@ -418,7 +424,7 @@ func TestInvalidHTTPBoundsDoNotInitializeALocalStore(t *testing.T) {
 			args := []string{
 				"-listen", "127.0.0.1:0",
 				"-local-store", root,
-				"-workspace", "workspace",
+				"-volume", "workspace",
 				"-quota", "8M",
 			}
 			err := run(append(args, test.args...), io.Discard)
@@ -444,7 +450,7 @@ func TestInvalidHTTPBoundsAreRejectedBeforeAnInvalidListenAddress(t *testing.T) 
 	err := run([]string{
 		"-listen", "127.0.0.1",
 		"-local-store", root,
-		"-workspace", "workspace",
+		"-volume", "workspace",
 		"-quota", "8M",
 		"-http-max-waiting-responses", "-1",
 	}, io.Discard)
@@ -468,7 +474,7 @@ func TestInvalidPendingObjectLimitsDoNotInitializeALocalStore(t *testing.T) {
 	err := run([]string{
 		"-listen", "127.0.0.1:0",
 		"-local-store", root,
-		"-workspace", "workspace",
+		"-volume", "workspace",
 		"-quota", "8M",
 		"-max-pending-bytes", "9223372036854775807",
 	}, io.Discard)
@@ -503,7 +509,7 @@ func TestInvalidReaderLimitsDoNotInitializeALocalStore(t *testing.T) {
 			err := run([]string{
 				"-listen", "127.0.0.1:0",
 				"-local-store", root,
-				"-workspace", "workspace",
+				"-volume", "workspace",
 				"-quota", "8M",
 				test.flag, test.value,
 			}, io.Discard)
@@ -557,7 +563,7 @@ func TestHelpNamesTheLocalStoreAndStatusSignal(t *testing.T) {
 		"maximum SQLite reader connections held by concurrent snapshots",
 		"integrity record work limit",
 		"integrity name-byte work limit",
-		"larger retained namespaces",
+		"larger retained volumes",
 		"reservation-admission threshold",
 		"unresolved",
 		"a larger payload fails EFBIG",

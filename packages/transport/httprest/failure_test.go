@@ -75,7 +75,7 @@ func exerciseAll(t *testing.T, ctx context.Context, s storage.Storage) {
 		if err == nil {
 			t.Fatalf("space reported %+v instead of a failure", space)
 		}
-		// A namespace that cannot be reached is not a namespace that has no room to
+		// A volume that cannot be reached is not a volume that has no room to
 		// report: ENOSYS is a standing property, and nothing above may learn it from a
 		// server it never reached.
 		if errors.Is(err, syscall.ENOSYS) {
@@ -323,7 +323,7 @@ func TestAReadThatIsCutShort(t *testing.T) {
 
 // A space report is subject to the same framing rule as a read, and for a worse reason. A
 // report that ends early and is read anyway offers zero bytes free, which refuses every
-// write while looking like an ordinary answer from a workspace that is genuinely full.
+// write while looking like an ordinary answer from a volume that is genuinely full.
 //
 // A close-delimited answer is therefore refused whole, exactly as a read is: with no
 // length and no chunking there is nothing about the body to check afterwards, so a report
@@ -675,9 +675,9 @@ func TestAListingEntryThatCarriesNoAttributes(t *testing.T) {
 }
 
 // A count that never arrived must not read as the figure zero. All three are byte counts
-// whose zero is a legitimate answer — a namespace holding nothing has used none, a full
+// whose zero is a legitimate answer — a volume holding nothing has used none, a full
 // one has none available — so nothing in the values tells absence apart from it, and a
-// report read as zero available refuses every write on a namespace that has room.
+// report read as zero available refuses every write on a volume that has room.
 //
 // Figures that could not all be true of anything are refused for the same reason they are
 // never repaired: they end up in a kernel reply whose fields are unsigned, where a
@@ -708,7 +708,7 @@ func TestASpaceReportThatIsNotThere(t *testing.T) {
 
 		{body: `{"space":{"total":4096,"used":1024,"avail":3072}}`,
 			want: storage.Space{Total: 4096, Used: 1024, Avail: 3072}},
-		// The shapes that must still be accepted: a namespace with nothing written and one
+		// The shapes that must still be accepted: a volume with nothing written and one
 		// with nothing left both carry zeroes, and both are answers a caller may be given.
 		{body: `{"space":{"total":0,"used":0,"avail":0}}`, want: storage.Space{}},
 		{body: `{"space":{"total":4096,"used":4096,"avail":0}}`,
@@ -743,15 +743,15 @@ func TestASpaceReportThatIsNotThere(t *testing.T) {
 	}
 }
 
-// ENOSYS from Space states a property of the namespace rather than a failure to reach it,
+// ENOSYS from Space states a property of the volume rather than a failure to reach it,
 // so it has to arrive as itself, over the same machinery that carries every other errno.
 // Delivered as EIO it would read as a condition worth retrying; delivered as figures it
 // would be a quantity nobody measured.
-func TestANamespaceWithNoRoomToReport(t *testing.T) {
+func TestAVolumeWithNoRoomToReport(t *testing.T) {
 	s := dialHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(httprest.HeaderProtocol, httprest.Version)
 		w.WriteHeader(httprest.StatusStorageError)
-		w.Write([]byte(`{"errno":"ENOSYS","message":"this namespace has no room of its own to report"}`))
+		w.Write([]byte(`{"errno":"ENOSYS","message":"this volume has no room of its own to report"}`))
 	}))
 	space, err := s.Space(t.Context())
 	if !errors.Is(err, syscall.ENOSYS) {
@@ -868,11 +868,11 @@ func TestASocketThatIsNotThere(t *testing.T) {
 
 	// The dial failure itself carries ENOENT; if it did not, this test would be
 	// asserting nothing.
-	if _, err := overUnix.Get("http://namespace.local/"); !errors.Is(err, syscall.ENOENT) {
+	if _, err := overUnix.Get("http://volume.local/"); !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("dialling a missing socket gave %v, which does not carry ENOENT — this test no longer covers what it was written for", err)
 	}
 
-	s, err := httprest.Dial("http://namespace.local", overUnix)
+	s, err := httprest.Dial("http://volume.local", overUnix)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}

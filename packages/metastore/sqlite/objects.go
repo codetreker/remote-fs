@@ -26,7 +26,7 @@ import (
 // durable and bounded; a sweep never infers ownership from its age.
 //
 // The refusals below are the commit's, made early so that a write which cannot land does
-// not pay to upload its bytes first. They are advisory: the namespace may change between
+// not pay to upload its bytes first. They are advisory: the volume may change between
 // the reservation and the commit, so commit asks all of them again and is the one whose
 // answer decides. A refusal here leaves nothing behind — the reservation is inserted in the
 // same transaction that checks, so a refused reservation is not a key for a sweeper to find.
@@ -56,7 +56,7 @@ func (s *Store) Reserve(ctx context.Context, path string, size int64) (metastore
 	sec, nsec := sqlvalue.StoredTime(time.Now())
 	if err := s.mutate(ctx, func(tx *sql.Tx) error {
 		// The same questions the commit will ask, asked before the bytes are paid for. The
-		// answers are not binding — the namespace may change between the two calls, which is
+		// answers are not binding — the volume may change between the two calls, which is
 		// why commit asks them again and is the one that decides — so nothing here is
 		// recorded except the reservation itself.
 		parent, name, err := s.resolveParent(ctx, tx, cleaned)
@@ -72,7 +72,7 @@ func (s *Store) Reserve(ctx context.Context, path string, size int64) (metastore
 		}
 		// What the commit would charge: the difference against whatever the name holds now,
 		// not the whole object, so overwriting a large file with a slightly larger one is not
-		// refused by a namespace that has room for the difference.
+		// refused by a volume that has room for the difference.
 		var held int64
 		if found {
 			held = node.Size
@@ -89,9 +89,9 @@ func (s *Store) Reserve(ctx context.Context, path string, size int64) (metastore
 
 func (s *Store) reserveObject(ctx context.Context, tx *sql.Tx, key metastore.Key, size, sec int64, nsec int32) error {
 	// Admission reads only the indexed reserved, unresolved, and garbage ranges. Full
-	// validation is performed when the namespace opens and when ObjectStatus is requested;
-	// putting that scan here would make every write grow with the live namespace.
-	status, err := readPendingObjectStatus(ctx, tx, s.namespace, s.objectLimits)
+	// validation is performed when the volume opens and when ObjectStatus is requested;
+	// putting that scan here would make every write grow with the live volume.
+	status, err := readPendingObjectStatus(ctx, tx, s.volume, s.objectLimits)
 	if err != nil {
 		return err
 	}
@@ -111,9 +111,9 @@ func (s *Store) reserveObject(ctx context.Context, tx *sql.Tx, key metastore.Key
 	}
 
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
+		INSERT INTO objects (key, volume, state, size, digest, created_sec, created_nsec)
 		VALUES (?, ?, ?, ?, NULL, ?, ?)`,
-		string(key), s.namespace, stateReserved, size, sec, nsec)
+		string(key), s.volume, stateReserved, size, sec, nsec)
 	return err
 }
 
@@ -122,8 +122,8 @@ func (s *Store) Quarantine(ctx context.Context, key metastore.Key) error {
 	if err := s.mutate(ctx, func(tx *sql.Tx) error {
 		var state int
 		switch err := tx.QueryRowContext(ctx,
-			`SELECT state FROM objects WHERE key = ? AND namespace = ?`,
-			string(key), s.namespace).Scan(&state); {
+			`SELECT state FROM objects WHERE key = ? AND volume = ?`,
+			string(key), s.volume).Scan(&state); {
 		case errors.Is(err, sql.ErrNoRows):
 			return nil
 		case err != nil:
@@ -133,8 +133,8 @@ func (s *Store) Quarantine(ctx context.Context, key metastore.Key) error {
 		switch state {
 		case stateReserved:
 			_, err := tx.ExecContext(ctx,
-				`UPDATE objects SET state = ? WHERE key = ? AND namespace = ?`,
-				stateUnresolved, string(key), s.namespace)
+				`UPDATE objects SET state = ? WHERE key = ? AND volume = ?`,
+				stateUnresolved, string(key), s.volume)
 			return err
 		case stateUnresolved:
 			return nil
@@ -155,8 +155,8 @@ func (s *Store) Abandon(ctx context.Context, key metastore.Key) error {
 	if err := s.mutate(ctx, func(tx *sql.Tx) error {
 		var state int
 		switch err := tx.QueryRowContext(ctx,
-			`SELECT state FROM objects WHERE key = ? AND namespace = ?`,
-			string(key), s.namespace).Scan(&state); {
+			`SELECT state FROM objects WHERE key = ? AND volume = ?`,
+			string(key), s.volume).Scan(&state); {
 		case errors.Is(err, sql.ErrNoRows):
 			return nil
 		case err != nil:
@@ -166,8 +166,8 @@ func (s *Store) Abandon(ctx context.Context, key metastore.Key) error {
 		switch state {
 		case stateReserved:
 			_, err := tx.ExecContext(ctx,
-				`UPDATE objects SET state = ? WHERE key = ? AND namespace = ?`,
-				stateGarbage, string(key), s.namespace)
+				`UPDATE objects SET state = ? WHERE key = ? AND volume = ?`,
+				stateGarbage, string(key), s.volume)
 			return err
 		case stateGarbage:
 			return nil
@@ -203,7 +203,7 @@ func (s *Store) Commit(ctx context.Context, path string, object metastore.Object
 		return pathError("commit", path, fmt.Errorf(
 			"an object of %d bytes is not a length: %w", object.Size, syscall.EINVAL))
 	}
-	if err := s.mutateNamespace(ctx, locking.WriteMutation, []string{cleaned}, func(tx *sql.Tx) error {
+	if err := s.mutateVolume(ctx, locking.WriteMutation, []string{cleaned}, func(tx *sql.Tx) error {
 		return s.commit(ctx, tx, cleaned, object)
 	}); err != nil {
 		return pathError("commit", path, sqlerr.Failure(err))
@@ -217,12 +217,12 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 	if object.Key != "" {
 		// The key must be one we reserved and have not already pointed a name at. A key in any
 		// other state — never reserved, already referenced, or swept — is a caller committing
-		// something this namespace has no record of writing.
+		// something this volume has no record of writing.
 		var state int
-		switch err := tx.QueryRowContext(ctx, `SELECT state FROM objects WHERE key = ? AND namespace = ?`,
-			string(object.Key), s.namespace).Scan(&state); {
+		switch err := tx.QueryRowContext(ctx, `SELECT state FROM objects WHERE key = ? AND volume = ?`,
+			string(object.Key), s.volume).Scan(&state); {
 		case errors.Is(err, sql.ErrNoRows):
-			return fmt.Errorf("object %q was never reserved in this namespace: %w", object.Key, syscall.EINVAL)
+			return fmt.Errorf("object %q was never reserved in this volume: %w", object.Key, syscall.EINVAL)
 		case err != nil:
 			return err
 		case state != stateReserved:
@@ -311,9 +311,9 @@ func (s *Store) createCommitted(ctx context.Context, tx *sql.Tx, parent metastor
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, s.namespace, int64(fileMode), object.Size, accessSec, accessNsec, sec, nsec, sqlvalue.StoredKey(object.Key)); err != nil {
+		id, s.volume, int64(fileMode), object.Size, accessSec, accessNsec, sec, nsec, sqlvalue.StoredKey(object.Key)); err != nil {
 		return err
 	}
 	if err := s.link(ctx, tx, parent.ID, name, id); err != nil {
@@ -325,7 +325,7 @@ func (s *Store) createCommitted(ctx context.Context, tx *sql.Tx, parent metastor
 	return s.touch(ctx, tx, parent.ID, now)
 }
 
-// account moves the namespace's byte counter by delta, refusing what the allowance cannot
+// account moves the volume's byte counter by delta, refusing what the allowance cannot
 // pay for.
 //
 // The refusal and the charge are one step inside the caller's transaction, which is what
@@ -341,12 +341,12 @@ func (s *Store) account(ctx context.Context, tx *sql.Tx, delta int64) error {
 // counter.
 //
 // It is separate from the charge because a reservation asks the question without taking the
-// room: the bytes are not the namespace's until they are committed, and a reservation that
+// room: the bytes are not the volume's until they are committed, and a reservation that
 // charged would have to be refunded by something — nothing refunds a reservation that is
 // never committed, so the counter would drift up by every abandoned write.
 //
-// A namespace with no allowance is never refused, and neither is a change that shrinks one:
-// a workspace already over its limit would otherwise have no way back under it.
+// A volume with no allowance is never refused, and neither is a change that shrinks one:
+// a volume already over its limit would otherwise have no way back under it.
 func (s *Store) roomFor(ctx context.Context, tx *sql.Tx, delta int64) error {
 	if s.allowance == 0 || delta <= 0 {
 		return nil
@@ -356,10 +356,10 @@ func (s *Store) roomFor(ctx context.Context, tx *sql.Tx, delta int64) error {
 		return err
 	}
 	// Written as a subtraction from the allowance rather than an addition to the count, so
-	// that a namespace holding close to what a byte count holds cannot wrap the sum into a
+	// that a volume holding close to what a byte count holds cannot wrap the sum into a
 	// figure that passes.
 	if delta > s.allowance-used {
-		return fmt.Errorf("%d more bytes would carry the namespace past its allowance of %d bytes, of which %d are taken: %w",
+		return fmt.Errorf("%d more bytes would carry the volume past its allowance of %d bytes, of which %d are taken: %w",
 			delta, s.allowance, used, syscall.EDQUOT)
 	}
 	return nil
@@ -370,17 +370,17 @@ func (s *Store) charge(ctx context.Context, tx *sql.Tx, delta int64) error {
 	if delta == 0 {
 		return nil
 	}
-	_, err := tx.ExecContext(ctx, `UPDATE namespaces SET used = used + ? WHERE id = ?`, delta, s.namespace)
+	_, err := tx.ExecContext(ctx, `UPDATE volumes SET used = used + ? WHERE id = ?`, delta, s.volume)
 	return err
 }
 
 func (s *Store) used(ctx context.Context, tx *sql.Tx) (int64, error) {
 	var used int64
-	err := tx.QueryRowContext(ctx, `SELECT used FROM namespaces WHERE id = ?`, s.namespace).Scan(&used)
+	err := tx.QueryRowContext(ctx, `SELECT used FROM volumes WHERE id = ?`, s.volume).Scan(&used)
 	return used, err
 }
 
-// ObjectStatus reports the object records object-store maintenance owns for this namespace.
+// ObjectStatus reports the object records object-store maintenance owns for this volume.
 // Referenced objects are live content and are intentionally absent; Space accounts for them.
 type ObjectStatus struct {
 	// ReservedCount is the number of uploads that may still commit.
@@ -405,8 +405,8 @@ type ObjectStatus struct {
 	OverLimit bool
 }
 
-// ObjectStatus returns the current object maintenance status for this Store's namespace. It
-// validates the namespace's object relationships, rooted node tree, and used-byte accounting
+// ObjectStatus returns the current object maintenance status for this Store's volume. It
+// validates the volume's object relationships, rooted node tree, and used-byte accounting
 // before reporting a successful snapshot; Reserve performs only the indexed pending-record
 // validation required on its write path.
 func (s *Store) ObjectStatus(ctx context.Context) (ObjectStatus, error) {
@@ -414,13 +414,13 @@ func (s *Store) ObjectStatus(ctx context.Context) (ObjectStatus, error) {
 	if err != nil {
 		return ObjectStatus{}, fmt.Errorf("opening an object status snapshot: %w", err)
 	}
-	if err := schema.ValidateNamespaceIntegrity(
-		ctx, tx, s.namespace, s.maxIntegrityRecords, s.maxIntegrityBytes,
+	if err := schema.ValidateVolumeIntegrity(
+		ctx, tx, s.volume, s.maxIntegrityRecords, s.maxIntegrityBytes,
 	); err != nil {
-		primary := fmt.Errorf("validating namespace integrity: %w", sqlerr.ReadFailure(ctx, err))
+		primary := fmt.Errorf("validating volume integrity: %w", sqlerr.ReadFailure(ctx, err))
 		return ObjectStatus{}, finishReadTransaction(ctx, "object status transaction", tx, primary)
 	}
-	status, err := readPendingObjectStatus(ctx, tx, s.namespace, s.objectLimits)
+	status, err := readPendingObjectStatus(ctx, tx, s.volume, s.objectLimits)
 	if err != nil {
 		return ObjectStatus{}, finishReadTransaction(ctx, "object status transaction", tx, err)
 	}
@@ -444,12 +444,12 @@ const pendingObjectStatusQuery = `
 		coalesce(sum(CASE WHEN state = ? THEN size ELSE 0 END), 0),
 		coalesce(sum(CASE WHEN typeof(size) != 'integer' OR size < 0 THEN 1 ELSE 0 END), 0)
 	FROM objects INDEXED BY objects_by_state
-	WHERE namespace = ? AND state IN (?, ?, ?)`
+	WHERE volume = ? AND state IN (?, ?, ?)`
 
 func readPendingObjectStatus(
 	ctx context.Context,
 	db objectStatusQueryer,
-	namespace int64,
+	volume int64,
 	limits ObjectLimits,
 ) (ObjectStatus, error) {
 	var (
@@ -459,7 +459,7 @@ func readPendingObjectStatus(
 	err := db.QueryRowContext(ctx, pendingObjectStatusQuery,
 		stateReserved, stateReserved, stateUnresolved, stateUnresolved,
 		stateGarbage, stateGarbage,
-		namespace, stateReserved, stateUnresolved, stateGarbage).Scan(
+		volume, stateReserved, stateUnresolved, stateGarbage).Scan(
 		&status.ReservedCount,
 		&status.ReservedBytes,
 		&status.UnresolvedCount,
@@ -492,7 +492,7 @@ func readPendingObjectStatus(
 // returned.
 const garbageQuery = `
 	SELECT key FROM objects INDEXED BY objects_by_state
-	WHERE namespace = ? AND state = ?
+	WHERE volume = ? AND state = ?
 	ORDER BY created_sec
 	LIMIT ?`
 
@@ -504,7 +504,7 @@ func (s *Store) Garbage(ctx context.Context, limit int) ([]metastore.Key, error)
 		return nil, err
 	}
 	defer s.coordinator.endHealthyRead()
-	rows, err := s.read.QueryContext(ctx, garbageQuery, s.namespace, stateGarbage, limit)
+	rows, err := s.read.QueryContext(ctx, garbageQuery, s.volume, stateGarbage, limit)
 	if err != nil {
 		return nil, fmt.Errorf("collecting objects nothing references: %w", sqlerr.ReadFailure(ctx, err))
 	}
@@ -549,8 +549,8 @@ func (s *Store) Forget(ctx context.Context, keys []metastore.Key) error {
 	if err := s.mutateTransaction(admission, ctx, nil, func(tx *sql.Tx) error {
 		for _, key := range keys {
 			var state int
-			switch err := tx.QueryRowContext(ctx, `SELECT state FROM objects WHERE key = ? AND namespace = ?`,
-				string(key), s.namespace).Scan(&state); {
+			switch err := tx.QueryRowContext(ctx, `SELECT state FROM objects WHERE key = ? AND volume = ?`,
+				string(key), s.volume).Scan(&state); {
 			case errors.Is(err, sql.ErrNoRows):
 				continue
 			case err != nil:
@@ -560,8 +560,8 @@ func (s *Store) Forget(ctx context.Context, keys []metastore.Key) error {
 			case state != stateGarbage:
 				return fmt.Errorf("object %q has unknown state %d: %w", key, state, syscall.EIO)
 			}
-			if _, err := tx.ExecContext(ctx, `DELETE FROM objects WHERE key = ? AND namespace = ?`,
-				string(key), s.namespace); err != nil {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM objects WHERE key = ? AND volume = ?`,
+				string(key), s.volume); err != nil {
 				return err
 			}
 		}

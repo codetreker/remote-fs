@@ -1,4 +1,4 @@
-// Command remote-fs-server serves a metastore-backed namespace over HTTP.
+// Command remote-fs-server serves a metastore-backed volume over HTTP.
 // File contents reside in Azure Blob Storage or a private local object store.
 package main
 
@@ -64,17 +64,17 @@ func run(args []string, errOut io.Writer) error {
 	}
 	listener := limitAcceptedConnections(rawListener, config.standalone.maxAcceptedConnections)
 	return withListener(listener, func() error {
-		ns, err := open(config)
+		v, err := open(config)
 		if err != nil {
 			return err
 		}
-		return withOpened(ns, func() error {
-			handler, err := httprest.NewHandlerWithOptions(ns.namespace, ns.log, config.http)
+		return withOpened(v, func() error {
+			handler, err := httprest.NewHandlerWithOptions(v.volume, v.log, config.http)
 			if err != nil {
 				return err
 			}
 
-			return serve(newServerWithOptions(handler, config.standalone), listener, ns, errOut)
+			return serve(newServerWithOptions(handler, config.standalone), listener, v, errOut)
 		})
 	})
 }
@@ -98,11 +98,11 @@ func withListener(listener net.Listener, action func() error) (returned error) {
 
 // withOpened releases storage only after HTTP calls and the handler's retained file
 // sessions have drained. A failed registry close preserves the backend's ownership.
-func withOpened(ns opened, action func() error) (returned error) {
+func withOpened(v opened, action func() error) (returned error) {
 	defer func() {
 		var unfinished *fileRegistryCloseError
 		if !errors.As(returned, &unfinished) {
-			returned = errors.Join(returned, ns.close())
+			returned = errors.Join(returned, v.close())
 		}
 	}()
 	return action()
@@ -133,7 +133,7 @@ func newServerWithOptions(handler *httprest.Handler, options standaloneHTTPOptio
 	return &drainingServer{Server: server, drain: draining, connections: connections}
 }
 
-// blobSource names the parts of a namespace whose contents are in a blob container. The
+// blobSource names the parts of a volume whose contents are in a blob container. The
 // credentials are deliberately absent: they arrive through the environment, because a flag
 // is visible to every process on the machine that can read /proc, and R-SEC-4 puts
 // credentials out of reach of anything that reads like a log.
@@ -141,7 +141,7 @@ type blobSource struct {
 	container string
 	prefix    string
 	database  string
-	workspace string
+	volume    string
 }
 
 // given reports whether this form was chosen at all.
@@ -152,9 +152,9 @@ func (b blobSource) given() bool { return b.container != "" }
 // client has configured this one.
 const connectionEnv = "AZURE_STORAGE_CONNECTION_STRING"
 
-// opened is a namespace ready to be served.
+// opened is a volume ready to be served.
 type opened struct {
-	namespace  storage.Storage
+	volume     storage.Storage
 	log        metastore.Log
 	what       string
 	allowance  string
@@ -170,7 +170,7 @@ type authorityConfig struct {
 	files           fileBackendOptions
 }
 
-// open builds the namespace the validated command line selected.
+// open builds the volume the validated command line selected.
 func open(config commandConfig) (opened, error) {
 	authority := authorityConfig{locks: config.locks, initializeLocks: config.initializeLockState, files: config.files}
 	switch {
@@ -206,7 +206,7 @@ func openLocal(
 	}
 	store, err := localstore.Open(context.Background(), localstore.Config{
 		Root:                         source.root,
-		Workspace:                    source.workspace,
+		Volume:                       source.volume,
 		Quota:                        quota,
 		Window:                       sqlite.DefaultWindow(),
 		LocalDisk:                    source.objects,
@@ -229,9 +229,9 @@ func openLocal(
 		return opened{}, errors.Join(err, closeAfterOpenFailure("local store", store.Close()))
 	}
 	return withLockStatus(opened{
-		namespace:  store,
+		volume:     store,
 		log:        store.Log(),
-		what:       fmt.Sprintf("%s in local store %s", source.workspace, source.root),
+		what:       fmt.Sprintf("%s in local store %s", source.volume, source.root),
 		allowance:  fmt.Sprintf(" under an allowance of %d bytes, %d of them taken,", status.Space.Total, status.Space.Used),
 		statusName: "local-store",
 		status: func(ctx context.Context) (string, error) {
@@ -252,7 +252,7 @@ func closeAfterOpenFailure(what string, err error) error {
 	return fmt.Errorf("closing the %s after startup failed: %w", what, err)
 }
 
-// openBlobs serves a namespace whose contents are in a blob container and whose tree is in
+// openBlobs serves a volume whose contents are in a blob container and whose tree is in
 // a metastore.
 //
 // Nothing is wrapped in an allowance here. The metastore keeps the count itself, inside the
@@ -290,9 +290,9 @@ func openBlobsContext(
 ) (opened, error) {
 	switch {
 	case blob.database == "":
-		return opened{}, errors.New("-metastore is required with -blob-container: the database holding the namespace's tree")
-	case blob.workspace == "":
-		return opened{}, errors.New("-workspace is required with -blob-container: the name of the namespace within the metastore")
+		return opened{}, errors.New("-metastore is required with -blob-container: the database holding the volume's tree")
+	case blob.volume == "":
+		return opened{}, errors.New("-volume is required with -blob-container: the name of the volume within the metastore")
 	}
 	connection := os.Getenv(connectionEnv)
 	if connection == "" {
@@ -317,13 +317,13 @@ func openBlobsContext(
 		return opened{}, err
 	}
 	meta, err := sqlite.OpenLocking(ctx, sqlite.LockingConfig{
-		Database: blob.database, Namespace: blob.workspace, Allowance: quota,
+		Database: blob.database, Volume: blob.volume, Allowance: quota,
 		SQLite: options, Locks: authority.locks, Initialize: authority.initializeLocks,
 	})
 	if err != nil {
 		return opened{}, errors.Join(err, closeAfterOpenFailure("blob object store", objects.Close()))
 	}
-	namespace, err := objectstore.NewWithOptions(objects, meta, maintenance)
+	volume, err := objectstore.NewWithOptions(objects, meta, maintenance)
 	if err != nil {
 		return opened{}, errors.Join(
 			err,
@@ -332,15 +332,15 @@ func openBlobsContext(
 		)
 	}
 
-	what := fmt.Sprintf("%s in container %s", blob.workspace, blob.container)
+	what := fmt.Sprintf("%s in container %s", blob.volume, blob.container)
 	if blob.prefix != "" {
 		what = fmt.Sprintf("%s under %s", what, blob.prefix)
 	}
 	result := opened{
-		namespace:  namespace,
+		volume:     volume,
 		log:        meta,
 		what:       what,
-		statusName: "blob namespace",
+		statusName: "blob volume",
 		status: func(ctx context.Context) (string, error) {
 			status, statusErr := meta.ObjectStatus(ctx)
 			_, availabilityErr := objects.Available(ctx)
@@ -353,25 +353,25 @@ func openBlobsContext(
 				return "", err
 			}
 			return formatObjectStoreStatus(
-				blob.workspace, status, options.ObjectLimits,
+				blob.volume, status, options.ObjectLimits,
 				options.MaxReaderConnections, options.MaxSnapshotReaderConnections,
 				options.MaxIntegrityRecords, options.MaxIntegrityBytes,
-				namespace.MaintenanceStatus(),
+				volume.MaintenanceStatus(),
 				maintenance,
 			), nil
 		},
-		close: namespace.Close,
+		close: volume.Close,
 	}
 	if quota == 0 {
-		return withLockStatus(result, namespace.LockService())
+		return withLockStatus(result, volume.LockService())
 	}
 
-	space, err := namespace.Space(ctx)
+	space, err := volume.Space(ctx)
 	if err != nil {
-		return opened{}, errors.Join(err, closeAfterOpenFailure("blob namespace", namespace.Close()))
+		return opened{}, errors.Join(err, closeAfterOpenFailure("blob volume", volume.Close()))
 	}
 	result.allowance = fmt.Sprintf(" under an allowance of %d bytes, %d of them taken,", space.Total, space.Used)
-	return withLockStatus(result, namespace.LockService())
+	return withLockStatus(result, volume.LockService())
 }
 
 // onlyErrorLeaves recognizes expected errors without hiding an unexpected leaf joined to
@@ -404,11 +404,11 @@ func onlyErrorLeaves(err error, targets ...error) bool {
 }
 
 // serve runs until a request loop fails or a signal arrives.
-func serve(httpServer *drainingServer, listener net.Listener, ns opened, errOut io.Writer) error {
-	return serveWithGrace(httpServer, listener, ns, errOut, shutdownGrace)
+func serve(httpServer *drainingServer, listener net.Listener, v opened, errOut io.Writer) error {
+	return serveWithGrace(httpServer, listener, v, errOut, shutdownGrace)
 }
 
-func serveWithGrace(httpServer *drainingServer, listener net.Listener, ns opened, errOut io.Writer, grace time.Duration) (returned error) {
+func serveWithGrace(httpServer *drainingServer, listener net.Listener, v opened, errOut io.Writer, grace time.Duration) (returned error) {
 	defer func() { returned = errors.Join(returned, closeFileRegistry(httpServer, grace)) }()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -423,9 +423,9 @@ func serveWithGrace(httpServer *drainingServer, listener net.Listener, ns opened
 	// has a command-owned outcome. The address stays last because it is copied by people
 	// and parsed by launchers.
 	lockState := ""
-	if ns.lockStatus != nil {
+	if v.lockStatus != nil {
 		statusContext, cancel := context.WithTimeout(ctx, statusDeadline)
-		current, err := ns.lockStatus(statusContext)
+		current, err := v.lockStatus(statusContext)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("file-lock status before serving: %w", err)
@@ -435,7 +435,7 @@ func serveWithGrace(httpServer *drainingServer, listener net.Listener, ns opened
 		}
 		lockState = "; " + formatLockStatus(current)
 	}
-	fmt.Fprintf(errOut, "remote-fs-server: serving %s%s%s at http://%s\n", ns.what, ns.allowance, lockState, listener.Addr())
+	fmt.Fprintf(errOut, "remote-fs-server: serving %s%s%s at http://%s\n", v.what, v.allowance, lockState, listener.Addr())
 
 	stopped := make(chan error, 1)
 	started := make(chan struct{})
@@ -478,10 +478,10 @@ func serveWithGrace(httpServer *drainingServer, listener net.Listener, ns opened
 			if hangupCancel != nil {
 				continue
 			}
-			hangupCancel, hangupDone = startStatus(ns, statusDeadline, statusResults)
+			hangupCancel, hangupDone = startStatus(v, statusDeadline, statusResults)
 		case report := <-statusResults:
 			finishHangup()
-			writeStatus(report, ns, errOut)
+			writeStatus(report, v, errOut)
 		case <-ctx.Done():
 			// Disarmed before shutting down: a second signal from an operator who has decided
 			// not to wait should kill the process the way it normally would.
@@ -497,6 +497,6 @@ func serveWithGrace(httpServer *drainingServer, listener net.Listener, ns opened
 	}
 }
 
-func handleHangup(ctx context.Context, ns opened, errOut io.Writer) {
-	writeStatus(readStatus(ctx, ns), ns, errOut)
+func handleHangup(ctx context.Context, v opened, errOut io.Writer) {
+	writeStatus(readStatus(ctx, v), v, errOut)
 }
