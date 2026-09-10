@@ -253,6 +253,7 @@ type eventFaults struct {
 	// eventDelay is how long each frame of a change stream is held back, which is what a
 	// replica that is behind looks like: the stream is being delivered, and slowly.
 	eventDelay time.Duration
+	eventGate  *eventGate
 	// pictureGate holds a request for a picture until it is closed, which puts the window
 	// between a stream being attached and the picture being taken under a test's control —
 	// the window whose changes a copy is told about twice and applies once.
@@ -290,7 +291,7 @@ func (f *eventFaults) serveStream(w http.ResponseWriter, r *http.Request, resumi
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	f.open[r] = cancel
-	delay := f.eventDelay
+	delay, gate := f.eventDelay, f.eventGate
 	f.mu.Unlock()
 
 	defer func() {
@@ -299,12 +300,69 @@ func (f *eventFaults) serveStream(w http.ResponseWriter, r *http.Request, resumi
 		f.mu.Unlock()
 		cancel()
 	}()
+	if gate != nil {
+		w = &gatedEvents{ResponseWriter: w, ctx: ctx, gate: gate}
+	}
 	if delay > 0 {
 		f.handler.ServeHTTP(&heldBack{ResponseWriter: w, delay: delay}, r.WithContext(ctx))
 		return
 	}
 	f.handler.ServeHTTP(w, r.WithContext(ctx))
 }
+
+// The gate is armed after bootstrap so only delivery under test is held. Waiting
+// before Write also prevents net/http's automatic flush from exposing held bytes.
+type eventGate struct {
+	armed       atomic.Bool
+	entered     chan struct{}
+	released    chan struct{}
+	enterOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+func (f *eventFaults) gateEvents() *eventGate {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	gate := &eventGate{entered: make(chan struct{}), released: make(chan struct{})}
+	f.eventGate = gate
+	return gate
+}
+
+func (g *eventGate) arm() { g.armed.Store(true) }
+
+func (g *eventGate) release() { g.releaseOnce.Do(func() { close(g.released) }) }
+
+func (g *eventGate) requireEntered(t *testing.T) {
+	t.Helper()
+	select {
+	case <-g.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the change stream did not reach the delivery gate")
+	}
+}
+
+type gatedEvents struct {
+	http.ResponseWriter
+	ctx  context.Context
+	gate *eventGate
+}
+
+func (w *gatedEvents) Write(p []byte) (int, error) {
+	if w.gate.armed.Load() {
+		w.gate.enterOnce.Do(func() { close(w.gate.entered) })
+		select {
+		case <-w.ctx.Done():
+			return 0, w.ctx.Err()
+		case <-w.gate.released:
+		}
+		if err := w.ctx.Err(); err != nil {
+			return 0, err
+		}
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *gatedEvents) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (f *eventFaults) servePicture(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()

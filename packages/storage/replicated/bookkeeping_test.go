@@ -3,6 +3,8 @@ package replicated
 import (
 	"context"
 	"errors"
+	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -151,6 +153,49 @@ func TestBarrierIncarnationMismatchAndLaterGenerationFail(t *testing.T) {
 	s.seeded("replacement", 1)
 	if err := s.await(t.Context(), "create", "target", confirmation); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("confirmation survived incarnation change with %v", err)
+	}
+}
+
+func TestFollowerFailureRejectsAnAcknowledgedMutation(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		applied metastore.Position
+	}{
+		{name: "barrier outstanding", applied: 6},
+		{name: "barrier already applied", applied: 7},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := confirmationTestStorage(DefaultOptions())
+			defer s.stop()
+			failure := errors.New("the change stream ended before confirmation")
+			dispatched := 0
+			err := s.change(t.Context(), "create", "target", func(context.Context) (httprest.MutationBarrier, error) {
+				dispatched++
+				s.applied(metastore.Change{Position: c.applied})
+				s.fail(failure)
+				return httprest.MutationBarrier{Incarnation: "log", Position: 7}, nil
+			})
+			if dispatched != 1 {
+				t.Fatalf("mutation dispatches = %d, want one successful response", dispatched)
+			}
+			var pathErr *os.PathError
+			if !errors.As(err, &pathErr) || pathErr.Op != "create" || pathErr.Path != "target" {
+				t.Fatalf("failed confirmation lost its operation or path: %v", err)
+			}
+			if !errors.Is(err, syscall.EIO) || storage.ErrnoOf(err) != syscall.EIO {
+				t.Fatalf("failed follower confirmed an acknowledged mutation: %v", err)
+			}
+			for _, detail := range []string{"the change was made", "stopped being kept current", failure.Error()} {
+				if !strings.Contains(err.Error(), detail) {
+					t.Errorf("confirmation failure %q lost diagnostic %q", err, detail)
+				}
+			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.activeConfirmations != 0 || s.confirmationWaiters != 0 {
+				t.Fatalf("failed confirmation retained active=%d waiters=%d", s.activeConfirmations, s.confirmationWaiters)
+			}
+		})
 	}
 }
 

@@ -369,20 +369,34 @@ func publicationScope(ctx context.Context, owner locking.OwnerRef, grants ...loc
 
 func TestSQLitePublicationRejectsAnonymousMutationOfGrantedFiles(t *testing.T) {
 	for _, mode := range []locking.Mode{locking.Shared, locking.Exclusive} {
+		f := newPublicationFixture(t)
+		f.put(t, t.Context(), "locked", 3)
+		f.put(t, t.Context(), "other", 4)
+		object := f.stage(t, t.Context(), "locked", 5)
+		f.grant(t, f.owner(t), "locked", mode)
+		pristine, err := f.store.List(t.Context(), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		pristineSpace, err := f.store.Space(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
 		for _, operation := range []string{"commit", "mode", "access time", "modification time", "empty attributes", "remove", "rename source", "rename destination", "self rename"} {
 			t.Run(string(mode)+"/"+operation, func(t *testing.T) {
-				f := newPublicationFixture(t)
-				f.put(t, t.Context(), "locked", 3)
-				f.put(t, t.Context(), "other", 4)
-				object := f.stage(t, t.Context(), "locked", 5)
-				f.grant(t, f.owner(t), "locked", mode)
 				before, err := f.store.List(t.Context(), "")
 				if err != nil {
 					t.Fatal(err)
 				}
+				if !reflect.DeepEqual(before, pristine) {
+					t.Fatal("previous rejection changed the shared namespace fixture")
+				}
 				space, err := f.store.Space(t.Context())
 				if err != nil {
 					t.Fatal(err)
+				}
+				if space != pristineSpace {
+					t.Fatalf("previous rejection changed the shared quota fixture: got %+v, want %+v", space, pristineSpace)
 				}
 				permission := fs.FileMode(0o600)
 				at := time.Unix(1_800_000_000, 0)

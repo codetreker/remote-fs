@@ -48,7 +48,7 @@ Status: implemented
 
 ### 原子替换的读者在每次观察后让出调度
 
-[公共 storage 契约](../../../../packages/storage/storagetest/storagetest.go)保持 200 次写入、两个读者、128 KiB 与 96 KiB 两种内容及原来的错误／完整值断言。读循环在成功读取并核对内容后调用 `runtime.Gosched`；合法的 `EAGAIN` 仍按原规则计数，继续前也让出调度。没有睡眠、固定采样间隔、读取次数上限或缩小内容，写者也不增加暂停。
+这项调度决定以 [公共 storage 契约](../../../../packages/storage/storagetest/storagetest.go)的 200 次写入、两个读者、128 KiB 与 96 KiB 两种内容及原来的错误／完整值断言为前提。当前写入次数由后续[测试工作量决定](2026-09-09-scale-test-work-to-its-assertions.md)调整为 100；这里保留当时的理由与测量。读循环在成功读取并核对内容后调用 `runtime.Gosched`；合法的 `EAGAIN` 仍按原规则计数，继续前也让出调度。没有睡眠、固定采样间隔、读取次数上限或缩小内容，写者也不增加暂停。
 
 这是测试负载的调度选择，不是 storage 的性能保证。正确后端的每次成功读取仍只能是两个完整值之一，汇总观察必须包含两种值；其它错误仍失败。选择时另外记录读写 API 调用区间，并用先发布空内容、再发布目标内容的真实后端包装器作负向对照，包装器不插入额外等待。API 区间重叠不等于命中了发布内部的短暂窗口，有限次负向对照也不能证明所有更短窗口都有相同检出率。
 
@@ -86,4 +86,6 @@ Status: implemented
 
 共享契约数据库让前面子用例的 namespace 留到顶层结束，增加后续 Open 面对的已存状态；工厂的唯一命名和跨例不变性检查不能省略。矩阵另须保存一份种子字节，并为每个子用例复制文件、重新打开真实 SQLite。种子必须完整、不可变且只在所属顶层用例内存活；损坏或隔离检查失败就结束测试，不能回退成一份看似有效的新数据库。
 
-[包内覆盖](2026-09-09-sqlite-package-local-coverage.md)、race、`-count=1`、断言和数据规模保持不变；[执行预算](../process/2026-09-08-budget-ci-race-test-execution.md)不因优化而放宽。此决定沿用[在所属边界注入失败](2026-08-22-failures-injected-at-the-objects-boundary.md)与[资源由创建者清理](2026-08-22-a-mount-belongs-to-whoever-attached-it.md)的约束，具体准备规则与读者退出判据分别见[测试准备](../../../../docs/testing.md#sqlite-测试准备与隔离)和[读写交接](../../../../docs/testing.md#元数据副本的读写交接)。
+拒绝矩阵复用、确认阶段事件门及写入重复次数的后续选择见[测试工作量决定](2026-09-09-scale-test-work-to-its-assertions.md)，这里的历史测量与原取舍保持。
+
+这项决定保留了[包内覆盖](2026-09-09-sqlite-package-local-coverage.md)、race、`-count=1`、断言和当时的数据规模；[执行预算](../process/2026-09-08-budget-ci-race-test-execution.md)不因优化而放宽。此决定沿用[在所属边界注入失败](2026-08-22-failures-injected-at-the-objects-boundary.md)与[资源由创建者清理](2026-08-22-a-mount-belongs-to-whoever-attached-it.md)的约束，具体准备规则与读者退出判据分别见[测试准备](../../../../docs/testing.md#sqlite-测试准备与隔离)和[读写交接](../../../../docs/testing.md#元数据副本的读写交接)。

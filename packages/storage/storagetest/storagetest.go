@@ -403,7 +403,7 @@ var cases = []testCase{
 		// finding rather than a file that does not exist yet.
 		mustSucceed(t, s.Write(ctx(t), "f", contents[0]))
 
-		const writes = 200
+		const writes = 100
 		const readers = 2
 
 		done := make(chan struct{})

@@ -64,6 +64,7 @@ func TestNewHandlerRejectsAMissingStorage(t *testing.T) {
 // read the log a page of no changes at a time forever — both of which look like a working
 // server that never delivers anything.
 func TestNewHandlerRejectsBoundsWithNoRoomInThem(t *testing.T) {
+	backing := failingStorage(t, syscall.EIO)
 	usable := httprest.DefaultLimits()
 	cases := map[string]func(*httprest.Limits){
 		"no subscriptions at all":    func(l *httprest.Limits) { l.MaxSubscriptions = 0 },
@@ -81,12 +82,12 @@ func TestNewHandlerRejectsBoundsWithNoRoomInThem(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			limits := usable
 			spoil(&limits)
-			if _, err := httprest.NewHandlerWithLimits(failingStorage(t, syscall.EIO), nil, limits); err == nil {
+			if _, err := httprest.NewHandlerWithLimits(backing, nil, limits); err == nil {
 				t.Fatalf("NewHandlerWithLimits(%+v) succeeded, want an error", limits)
 			}
 		})
 	}
-	if _, err := httprest.NewHandlerWithLimits(failingStorage(t, syscall.EIO), nil, usable); err != nil {
+	if _, err := httprest.NewHandlerWithLimits(backing, nil, usable); err != nil {
 		// Without this the cases above would pass for a handler that refuses every set of
 		// bounds there is.
 		t.Fatalf("NewHandlerWithLimits with usable bounds failed: %v", err)
@@ -94,11 +95,12 @@ func TestNewHandlerRejectsBoundsWithNoRoomInThem(t *testing.T) {
 }
 
 func TestNewHandlerOptionsHaveBoundedDefaultsAndRejectInvalidBounds(t *testing.T) {
+	backing := failingStorage(t, syscall.EIO)
 	zero := httprest.HandlerOptions{}
 	if err := zero.Check(); err != nil {
 		t.Fatalf("zero HandlerOptions did not validate with bounded defaults: %v", err)
 	}
-	if _, err := httprest.NewHandlerWithOptions(failingStorage(t, syscall.EIO), nil, zero); err != nil {
+	if _, err := httprest.NewHandlerWithOptions(backing, nil, zero); err != nil {
 		t.Fatalf("zero HandlerOptions did not select bounded defaults: %v", err)
 	}
 	inheritedWrite := httprest.DefaultHandlerOptions()
@@ -146,7 +148,7 @@ func TestNewHandlerOptionsHaveBoundedDefaultsAndRejectInvalidBounds(t *testing.T
 			if err := options.Check(); err == nil {
 				t.Fatalf("HandlerOptions.Check accepted %+v", options)
 			}
-			if _, err := httprest.NewHandlerWithOptions(failingStorage(t, syscall.EIO), nil, options); err == nil {
+			if _, err := httprest.NewHandlerWithOptions(backing, nil, options); err == nil {
 				t.Fatalf("NewHandlerWithOptions(%+v) succeeded, want an error", options)
 			}
 		})
