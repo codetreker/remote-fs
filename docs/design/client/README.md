@@ -2,7 +2,7 @@
 
 本目录承载 **client 角色**的内部设计。
 
-client 是卷的使用者：持有一份 remote storage，把卷呈现为本地目录，并维持这一呈现所需的全部本地状态。角色边界与两条跨角色契约由 [`../architecture.md`](../architecture.md) 定义。
+client 是 volume 的使用者：持有一份 remote storage，把 volume 呈现为本地目录，并维持这一呈现所需的全部本地状态。角色边界与两条跨角色契约由 [`../architecture.md`](../architecture.md) 定义。
 
 ## 本目录的规则
 

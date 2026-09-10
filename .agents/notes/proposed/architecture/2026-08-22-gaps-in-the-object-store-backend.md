@@ -4,7 +4,7 @@ Status: proposed
 
 ## 问题
 
-[对象存储卷](../../implemented/architecture/2026-08-21-volume-in-an-object-store.md)与[本地磁盘对象存储](../../implemented/architecture/2026-09-04-local-disk-object-store.md)通过各自的契约与故障用例，仍有一批位于契约之外的已知缺口。它们不会让已验证的路径变成错误，但会在数据修复、Azure 行为和大规模垃圾积累时决定系统能否恢复或保持可运维。
+[对象存储 volume](../../implemented/architecture/2026-08-21-volume-in-an-object-store.md)与[本地磁盘对象存储](../../implemented/architecture/2026-09-04-local-disk-object-store.md)通过各自的契约与故障用例，仍有一批位于契约之外的已知缺口。它们不会让已验证的路径变成错误，但会在数据修复、Azure 行为和大规模垃圾积累时决定系统能否恢复或保持可运维。
 
 这些缺口共享一个范围决定：尚无证据要求把它们放进当前交付，却必须保留可搜索的名字、可观察后果与完成条件。否则一个没有记录的缺口与一项已经存在的能力在代码旁边长得相同。
 
@@ -14,9 +14,9 @@ Status: proposed
 
 以下事项分别处理；任何一项进入实现时都要拥有自己的决定与验收证据。
 
-**卷 entry 与路径深度没有语义上限。** local-disk object key、payload 和 HTTP body 已有各自的上限，但逻辑 entry name 与路径深度没有统一的语义限制。metastore 的逐层解析会把深度直接变成一次调用内的查询数；物理对象与传输预算不能代替卷的名字和深度边界。[移除宿主目录后端](../../implemented/simplification/2026-09-08-remove-the-host-directory-backend.md)取消了与宿主内核的边界差异，没有为对象卷补上这项限制。
+**volume entry 与路径深度没有语义上限。** local-disk object key、payload 和 HTTP body 已有各自的上限，但逻辑 entry name 与路径深度没有统一的语义限制。metastore 的逐层解析会把深度直接变成一次调用内的查询数；物理对象与传输预算不能代替 volume 的名字和深度边界。[移除宿主目录后端](../../implemented/simplification/2026-09-08-remove-the-host-directory-backend.md)取消了与宿主内核的边界差异，没有为对象 volume 补上这项限制。
 
-**用量计数损坏后没有带内修复。** metastore 在事务里维护精确的 referenced payload 用量，`Space` 发现数字不自洽时以 `EIO` 失败，不把它夹回一个看似合理的值。这保护了 R-ERR-2，代价是缺陷、部分恢复或人工修改一旦破坏账本，object-store 卷没有与 `limited.Recount` 对应的修复操作，`Space` 会持续失败。
+**用量计数损坏后没有带内修复。** metastore 在事务里维护精确的 referenced payload 用量，`Space` 发现数字不自洽时以 `EIO` 失败，不把它夹回一个看似合理的值。这保护了 R-ERR-2，代价是缺陷、部分恢复或人工修改一旦破坏账本，object-store volume 没有与 `limited.Recount` 对应的修复操作，`Space` 会持续失败。
 
 **Azure 的 `ResourceNotFound` 归类未定。** azblob 把它保守地归为 `EIO`，因为它既可能表示对象缺席，也可能表示账户或 container 缺席。若服务端实际上能把其中某一种证明为对象不存在，当前清扫器会对它持续重试；若贸然映射成 `ENOENT`，账户或 container 不可达又会被伪装成对象已经删除。
 
@@ -32,7 +32,7 @@ Status: proposed
 
 **把每一项拆成独立 proposed note。** 每项的完成条件会更聚焦。输在它们目前都没有被排期，拆开会复制同一个范围理由，也会把「这是对象存储后端契约之外的已知集合」分散到多处。任何一项真正进入实现时再拆出拥有者。
 
-**把已经解决的 broad claim 原样留在清单里。** 会保留原始列表的稳定性。输在 object key/payload/HTTP body 已经有界，schema migration 已经实际前滚，local-store lifetime ownership 也有实现和用例；继续保留旧概括会遮住仍然存在的卷 component/depth 与 SQLite contention 缺口。
+**把已经解决的 broad claim 原样留在清单里。** 会保留原始列表的稳定性。输在 object key/payload/HTTP body 已经有界，schema migration 已经实际前滚，local-store lifetime ownership 也有实现和用例；继续保留旧概括会遮住仍然存在的 volume component/depth 与 SQLite contention 缺口。
 
 **不记录，等故障出现再定位。** 少一份长期维护的清单。输在表现会误导诊断：损坏的用量看起来像 SQLite 故障，Azure 账户缺失可能看起来像对象垃圾永远删不掉，跨进程争用则可能只表现为一次普通超时。
 

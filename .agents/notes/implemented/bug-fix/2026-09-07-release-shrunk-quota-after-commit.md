@@ -4,15 +4,15 @@ Status: implemented
 
 ## 问题
 
-[R-WS-5](../../../../docs/spec/requirements.md) 要求拒绝会超出卷上限的写入。[limited.Write 在调用底层 Write 前就 reserve 负增量](https://github.com/codetreker/remote-fs/blob/252259f1b89682a5b2acf54004f0fe8b8677528d/packages/storage/limited/limited.go#L513-L541)，使尚未提交的缩短提前增加其它写者可用的额度。缩短失败后的回滚不能撤销已经成功的另一笔写入。
+[R-WS-5](../../../../docs/spec/requirements.md) 要求拒绝会超出 volume 上限的写入。[limited.Write 在调用底层 Write 前就 reserve 负增量](https://github.com/codetreker/remote-fs/blob/252259f1b89682a5b2acf54004f0fe8b8677528d/packages/storage/limited/limited.go#L513-L541)，使尚未提交的缩短提前增加其它写者可用的额度。缩短失败后的回滚不能撤销已经成功的另一笔写入。
 
 在该提交上，以 localdir 包装一个可阻塞并失败的 Write，配额为 4096 字节，初始 `a` 占满 4096 字节。将 `a` 缩短为零，在底层写入前阻塞；随后写入 4096 字节的 `b`，再放行 `a` 并使其返回 `EIO`。`b` 成功，`a` 保留原内容，实际用量达到 8192 字节。
 
 ## 决定
 
-增长先预留，缩短后释放。尚未确定生效的缩短继续占用原额度；确定未生效的失败或取消保留原用量，成功只释放一次。增长确定未生效时只退回它自己的预留，不改变其它已经提交的内容所占额度。等长写入不预留或释放字节，超额卷仍可缩短文件。[活文件句柄](../architecture/2026-09-08-live-file-handles.md)使 `File.WriteAt` 与 `File.Truncate` 逐次同步返回发布结果，配额拒绝由相应调用报告，关闭负责引用清理。
+增长先预留，缩短后释放。尚未确定生效的缩短继续占用原额度；确定未生效的失败或取消保留原用量，成功只释放一次。增长确定未生效时只退回它自己的预留，不改变其它已经提交的内容所占额度。等长写入不预留或释放字节，超额 volume 仍可缩短文件。[活文件句柄](../architecture/2026-09-08-live-file-handles.md)使 `File.WriteAt` 与 `File.Truncate` 逐次同步返回发布结果，配额拒绝由相应调用报告，关闭负责引用清理。
 
-具有 `CheckPublicationAccounting` 的原生 backend 在最终发布处提供实际新旧大小与效果。Applied 按实际效果结算，即使后续确认返回错误也保留已经发生的缩短；NotApplied 退回增长预留，缩短不释放。卷效果不明，或结算、撤销被标记为 `IsPublicationAccountingUncertain` 时保留保守账本，并使 Space、修改与 Recount 失败，直到重新打开。已知文件没有改变也不能证明不确定的计费仍可使用，主错误与清理原因一并保留。
+具有 `CheckPublicationAccounting` 的原生 backend 在最终发布处提供实际新旧大小与效果。Applied 按实际效果结算，即使后续确认返回错误也保留已经发生的缩短；NotApplied 退回增长预留，缩短不释放。volume 效果不明，或结算、撤销被标记为 `IsPublicationAccountingUncertain` 时保留保守账本，并使 Space、修改与 Recount 失败，直到重新打开。已知文件没有改变也不能证明不确定的计费仍可使用，主错误与清理原因一并保留。
 
 原生集成与[文件锁](../architecture/2026-09-07-file-locks.md)共用最终转换：上传和暂存不能提前释放额度，过期 proof 在最后权限判定处被拒绝，原字节与收费保持一致。保留句柄的最终发布还检查引用与会话是否有效，仍存在的物理 pin 不能延长已退役引用的写入资格。随附的 local-store 与 Azure Blob 组合都由 SQLite 提供最终发布计费；[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)保留这项集成与通用 `limited` 包装。没有原生能力的有界 backend 仍按底层成功结算缩短；它的祖先目录改名采样问题由[独立提案](../../proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)拥有。本决定补足[容量上限](../architecture/2026-08-21-space-limit.md)的缩短结算，不把该通用路径解释成具有原生目标协调。
 
@@ -22,13 +22,13 @@ unlink 或覆盖名字后仍有引用的节点成为 detached，保留内容继�
 
 **先释放，失败后加回。** 看起来使计数始终接近预期新长度，却把尚未发生的缩短当成可借出的容量。加回时可能已有其它写入成功，不能删除它们来补账。
 
-**串行执行整个卷的写入。** 可以让另一写者等到缩短结果确定，但慢上传会阻挡无关文件，违背 R-CC-2。结算规则只约束额度与最终效果，不把整个写入包进全局互斥区。
+**串行执行整个 volume 的写入。** 可以让另一写者等到缩短结果确定，但慢上传会阻挡无关文件，违背 R-CC-2。结算规则只约束额度与最终效果，不把整个写入包进全局互斥区。
 
 **对所有错误都退回预留或恢复旧账。** 对已生效后确认失败的原生修改会制造错误计数，对未知结果也会伪造可用额度。明确的效果分类允许已知结果准确结算，无法判定的状态停止继续作答。
 
 ## 验证
 
-[结算回归](../../../../packages/storage/limited/write_settlement_test.go)在真实 SQLite 卷与内存对象存储之上保留原来的 4096 字节交错：缩短暂停时 Used 仍为 4096、Avail 为零，竞争的 4096 字节写入返回 `EDQUOT`；缩短失败后原内容与实测、报告用量均为 4096。成功路径随后只释放一次。取消、等长写入、失败增长的预留退回，以及超额卷缩短均由 package 用例覆盖。
+[结算回归](../../../../packages/storage/limited/write_settlement_test.go)在真实 SQLite volume 与内存对象存储之上保留原来的 4096 字节交错：缩短暂停时 Used 仍为 4096、Avail 为零，竞争的 4096 字节写入返回 `EDQUOT`；缩短失败后原内容与实测、报告用量均为 4096。成功路径随后只释放一次。取消、等长写入、失败增长的预留退回，以及超额 volume 缩短均由 package 用例覆盖。
 
 [路径写入的过期强占有回归](../../../../packages/storage/limited/lease_quota_test.go)使用 `sqlite.OpenLocking` 和可暂停 Put 的内存对象存储，经 `Storage.Write` 将 4096 字节文件暂存缩短为 6 字节。SQLite 不设置内层额度，全部收费由外层 `limited` 负责；暂停期间一字节的竞争增长也被拒绝。强占有到期后恢复上传得到 `StaleGrant`，原内容、Used 与 Recount 仍为 4096；随后一次有效缩短释放 4090 字节，恰好容纳相应增长，再多一字节仍为 `EDQUOT`。
 

@@ -16,7 +16,7 @@ HTTP 的 wire body 上限若只在 `storage.Read` 返回完整 `[]byte`、`stora
 - `ReadBounded(ctx, path, maxBytes)` 要求正预算，在分配完整 payload 之前以 `EFBIG` 拒绝超限文件。
 - `ListBounded(ctx, path, result)` 逐 entry 向 `storage.ListResult` 预留并提交。调用方给出基于 index、name length 与 attrs 的 complete-result byte charge；实现先计费，确定可容纳后才加载或保留 name。任一步失败都会使整个 result 进入 failed 状态，`Entries()` 不暴露空结果或部分前缀，因为省略的名字不能被解释成不存在。
 
-object-store 卷在 metastore 记录的 size 超限时先拒绝，再要求 backing `Objects` 实现 `GetBounded`。localdisk 先验证 envelope、store ID、key 与 declared length，在 payload admission 和 allocation 之前检查预算；Azure 先检查 service-declared length；memory 在 map lock 下检查 retained slice 长度。listing 通过 `metastore.BoundedLister` 按 bytewise name order 枚举；SQLite 先扫描 name length 与 fixed-size attrs，取得 `ListReservation` 后才把 name BLOB 复制进 Go memory，不建立完整 child slice。
+object-store volume 在 metastore 记录的 size 超限时先拒绝，再要求 backing `Objects` 实现 `GetBounded`。localdisk 先验证 envelope、store ID、key 与 declared length，在 payload admission 和 allocation 之前检查预算；Azure 先检查 service-declared length；memory 在 map lock 下检查 retained slice 长度。listing 通过 `metastore.BoundedLister` 按 bytewise name order 枚举；SQLite 先扫描 name length 与 fixed-size attrs，取得 `ListReservation` 后才把 name BLOB 复制进 Go memory，不建立完整 child slice。
 
 [实时文件句柄](./2026-09-08-live-file-handles.md)另有 `File.ReadAt`，返回同一次内容修订捕获的属性与请求范围。范围响应不等于原生对象已支持稀疏读取：后端仍可能取回完整对象，须先取得覆盖完整 materialization 的聚合预算。范围响应、完整对象暂存与等待者分别有界，不能只按返回给调用方的几个字节计费。
 

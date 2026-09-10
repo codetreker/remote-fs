@@ -1,4 +1,4 @@
-# Agent Note: 用卷命名逻辑文件树
+# Agent Note: 用 volume 命名逻辑文件树
 
 Status: implemented
 
@@ -10,19 +10,19 @@ Status: implemented
 
 ## 决定
 
-### 当前逻辑单元称为卷
+### 当前逻辑单元称为 volume
 
-[规格](../../../../docs/spec/requirements.md)将服务端持有、可挂载或通过编程接口访问的一份逻辑文件树定义为**卷（Volume）**。卷包含自己的根目录、节点、属性和内容；节点身份属于卷内节点，不能称为卷自身的身份。一个 `storage.Storage` 实例仍表示一个卷。
+[规格](../../../../docs/spec/requirements.md)将服务端持有、可挂载或通过编程接口访问的一份逻辑文件树定义为 **volume**，中文文档也保留这一英文术语。volume 包含自己的根目录、节点、属性和内容；节点身份属于 volume 内节点，不能称为 volume 自身的身份。一个 `storage.Storage` 实例仍表示一个 volume。
 
-Go 字段、参数、辅助类型、错误信息、CLI 和必要文件名直接统一为 Volume／volume，CLI 选择器为 `-volume`。不提供旧 Go 名称或 `-workspace` 别名。HTTP v3 原有中性的操作、字段和 framing 不改变，也不新增按名字选择多个卷的协议。
+Go 字段、参数、辅助类型、错误信息、CLI 和必要文件名直接统一为 `Volume`／`volume`，CLI 选择器为 `-volume`。不提供旧 Go 名称或 `-workspace` 别名。HTTP v3 原有中性的操作、字段和 framing 不改变，也不新增按名字选择多个 volume 的协议。
 
-需求编号 `R-WS-1` 至 `R-WS-7` 作为不透明的稳定引用保留，继续承担卷的存续、挂载、冷启动、配额、持久性和打开引用生命周期。[多卷注册与生命周期提案](../../proposed/architecture/2026-08-19-volume-in-the-contract.md)仍为 proposed；改名不代表它的管理接口已经实现。[对象存储中的卷](2026-08-21-volume-in-an-object-store.md)继续拥有既有存储结构与取舍。
+需求编号 `R-WS-1` 至 `R-WS-7` 作为不透明的稳定引用保留，继续承担 volume 的存续、挂载、冷启动、配额、持久性和打开引用生命周期。[多个 volume 的注册与生命周期提案](../../proposed/architecture/2026-08-19-volume-in-the-contract.md)仍为 proposed；改名不代表它的管理接口已经实现。[对象存储中的 volume](2026-08-21-volume-in-an-object-store.md)继续拥有既有存储结构与取舍。
 
 ### 直接改名，保持原有结构和流程
 
 SQLite schema 仍为版本 5。现有 `0001` 至 `0005` SQL 文件及 v2／v3、当前 schema fixtures 直接使用 `volumes` 表、`volume` 列和对应索引名，不增加迁移文件或版本。原来的初始化、绑定核对、完整性检查、事务与恢复控制流保留；不增加旧名称读取分派、兼容辅助 API 或旧库升级入口。这是对[原迁移冻结纪律](2026-08-27-metadata-replication.md)的标识命名例外，原编号与功能迁移机制不变。
 
-localstore 保留原有的有界绑定核对，直接查询当前布局。`Config.Volume`、`Status.Volume`、`MaxVolumeBytes` 与私有变量采用统一词汇；已有 magic、二进制布局、名字长度上限与身份语义不因 Go 名称变化而改变。卷名本身仍是调用方给定的值，不是需要文本替换的术语。
+localstore 保留原有的有界绑定核对，直接查询当前布局。`Config.Volume`、`Status.Volume`、`MaxVolumeBytes` 与私有变量采用统一词汇；已有 magic、二进制布局、名字长度上限与身份语义不因 Go 名称变化而改变。volume 名称本身仍是调用方给定的值，不是需要文本替换的术语。
 
 当前文档、既有 SQL fixtures 和必要的 note 文件名同步改名，note 日期、生命周期、历史取舍与数据保留。历史研究仅机械统一本系统逻辑单元的术语与内部链接，不改研究结论。不可变外部 URL、引用的历史代码，以及 Linux 的进程／挂载／用户 namespace 和外部对象存储的 flat／hierarchical namespace，继续保留自己的含义。
 

@@ -6,7 +6,7 @@ Status: implemented
 
 挂载点今天一个字节的元数据都不留。`packages/fuse/fuse.go` 把 `EntryTimeout`、`AttrTimeout`、`NegativeTimeout` 三个内核超时全设成 0，于是每一次内核调用都落成一次 RPC——每一次 `ls`、每一次 `stat`、路径搜索里每一次「文件不存在」都是一个往返。`client/architecture.md` 第二节把这个选择写得很清楚，也写明了代价。
 
-代价在一个跑工具链的卷上是压倒性的。可执行文件查找、模块导入、链接器搜索路径产生的「不存在」远多于「存在」，在 20 ms 链路上一次这样的探测风暴要花掉约十秒。
+代价在一个跑工具链的 volume 上是压倒性的。可执行文件查找、模块导入、链接器搜索路径产生的「不存在」远多于「存在」，在 20 ms 链路上一次这样的探测风暴要花掉约十秒。
 
 但把元数据留在本地，难的不是把它取下来，而是**取下来之后它什么时候会变成谎话，以及怎么知道**。而 R-CON-2 把这个问题的答案锁死了：
 
@@ -22,7 +22,7 @@ Status: implemented
 
 ### 这一版的边界
 
-一次改动做完，刻意不追求一步到位。**做了**的是：服务端每个卷一条持久的有序变更日志，位置与树的改动同事务；一次一致性快照，加上从它之后开始的增量推送；客户端一份 SQLite 的本地元数据副本，由事件流喂着；挂载时阻塞，等副本建好之后才可用。
+一次改动做完，刻意不追求一步到位。**做了**的是：服务端每个 volume 一条持久的有序变更日志，位置与树的改动同事务；一次一致性快照，加上从它之后开始的增量推送；客户端一份 SQLite 的本地元数据副本，由事件流喂着；挂载时阻塞，等副本建好之后才可用。
 
 明确**没做**的，每一条在下文都有自己的理由：
 
@@ -80,13 +80,13 @@ t1      拿着 P 去续订
 |---|---|---|
 | SQLite（WAL） | 一个读事务 | 读事务钉住 WAL，checkpoint 过不去；事务开多久 WAL 涨多久 |
 | PostgreSQL | `REPEATABLE READ` | 长事务挡住 vacuum，表膨胀 |
-| 内存 | 加锁**只到取得引用为止**（写时复制或指针浅拷贝），拿到即放锁再流 | 锁若持有到流完，等于在一次网络传输的时长里冻住整个卷的写入 |
+| 内存 | 加锁**只到取得引用为止**（写时复制或指针浅拷贝），拿到即放锁再流 | 锁若持有到流完，等于在一次网络传输的时长里冻住整个 volume 的写入 |
 
 前两行有一个必须正面处理的共同性质：**事务的生存期被网络速度决定。** 最坏情况是 server 重启后所有客户端同时重建，读事务同时开着，谁最慢 WAL 就涨到多大。
 
 因此快照是一个**有生存期、有并发上限**的对象：每份快照有截止时间，超时即中止并放掉资源；同时打开的快照数有上限（R-INT-3）。中止之后客户端从头再来，而**从头再来之所以可以接受，正是因为订阅在前**——重试不影响日志窗口。
 
-SQLite 把长生命周期 snapshot transaction 放进独立 reader pool。`MaxSnapshotReaderConnections` 默认 16，与普通 `MaxReaderConnections` 默认 16 分开；慢 snapshot 可以占满自己的 pool、钉住 WAL，却不能因此夺走 bounded `Since`、event catch-up 与普通卷 read 使用的全部 connection。`cmd/remote-fs-server -max-snapshot-reader-connections` 为 Blob/local-store 两种 metastore-backed source 暴露该上限。
+SQLite 把长生命周期 snapshot transaction 放进独立 reader pool。`MaxSnapshotReaderConnections` 默认 16，与普通 `MaxReaderConnections` 默认 16 分开；慢 snapshot 可以占满自己的 pool、钉住 WAL，却不能因此夺走 bounded `Since`、event catch-up 与普通 volume read 使用的全部 connection。`cmd/remote-fs-server -max-snapshot-reader-connections` 为 Blob/local-store 两种 metastore-backed source 暴露该上限。
 
 原生文件锁集成把新的权威视图捕获与最终发布许可排序；SQLite 在读事务中钉住所需 snapshot 后释放观察准入，再生产批量快照页。已经捕获的旧视图可以完成读取，snapshot 的网络生存期不延长文件占有。这个顺序不把客户端异步副本变成锁状态的权威来源。
 
@@ -104,7 +104,7 @@ SQLite 把长生命周期 snapshot transaction 放进独立 reader pool。`MaxSn
 | 响应 | 携带的下界**大于等于**该节点已应用位置才接受 |
 | 快照 | 它是精确的切割而非下界，所有节点的已应用位置一律种成 P |
 
-位置是 int64，在写事务里分配，0 留作「什么都还没发生过」。**它对每个卷单调，但不连续**：SQLite 的实现让所有卷共用一张 `changes` 表的 rowid 序列，于是一个卷的位置之间有别的卷留下的空洞，而只有数据库里第一个被写入的那个才从 1 开始。契约因此只允许比较位置，不允许对它们做算术——任何一处写出 `位置+1` 的判断，都是在假设一件实现没有承诺的事。
+位置是 int64，在写事务里分配，0 留作「什么都还没发生过」。**它对每个 volume 单调，但不连续**：SQLite 的实现让所有 volume 共用一张 `changes` 表的 rowid 序列，于是一个 volume 的位置之间有别的 volume 留下的空洞，而只有数据库里第一个被写入的那个才从 1 开始。契约因此只允许比较位置，不允许对它们做算术——任何一处写出 `位置+1` 的判断，都是在假设一件实现没有承诺的事。
 
 **日志表必须是 `INTEGER PRIMARY KEY AUTOINCREMENT`。** 这一条要写进 schema 的注释，因为省掉 `AUTOINCREMENT` 看起来像是一次无害的优化：不带它时 SQLite 会**重用被删除的最大 rowid**，而我们要裁剪日志——裁到只剩下界之后再追加，位置就会**倒退**，于是客户端的「严格大于」规则会把新事件静默丢弃。当前 SQLite 实现还用 `database_state.change_high_water` 显式分配 position，并要求它与 `sqlite_sequence` 一致；本地持久形态把该值复制进 WAL 外部见证。两层损坏与回退保护由[持久身份高水位](../bug-fix/2026-09-07-persistent-sqlite-identities-use-explicit-high-water-marks.md)拥有。
 
@@ -116,19 +116,19 @@ SQLite 把长生命周期 snapshot transaction 放进独立 reader pool。`MaxSn
 
 | | 取值 | 职责 |
 |---|---|---|
-| 下界 | 至少 100 条 | 安静的卷的一次短暂抖动永远可续 |
-| 上界 | 至多一万条／卷，可配 | R-INT-3 的资源上限 |
+| 下界 | 至少 100 条 | 安静的 volume 的一次短暂抖动永远可续 |
+| 上界 | 至多一万条／volume，可配 | R-INT-3 的资源上限 |
 | 时间界 | 丢弃早于十分钟的 | 伺候 R-SCALE-2 |
 
-时间界的职责值得单独写下来，因为落盘之后它看起来像是多余的：它真正在做的是让「存在的卷很多、同时挂载的很少」（R-SCALE-2）不变成「很多份一万条的日志躺在盘上」。这个理由与内存无关，不写下来，将来会有人看着「反正在盘上」把它调没。
+时间界的职责值得单独写下来，因为落盘之后它看起来像是多余的：它真正在做的是让「存在的 volume 很多、同时挂载的很少」（R-SCALE-2）不变成「很多份一万条的日志躺在盘上」。这个理由与内存无关，不写下来，将来会有人看着「反正在盘上」把它调没。
 
-**尾位置独立于条目保留。** 否则「已追平」与「掉出窗口」区分不开：一个安静了十一分钟、日志被时间界清空的卷，客户端拿着位置 P 来，答不出它是追平了还是漏了。
+**尾位置独立于条目保留。** 否则「已追平」与「掉出窗口」区分不开：一个安静了十一分钟、日志被时间界清空的 volume，客户端拿着位置 P 来，答不出它是追平了还是漏了。
 
 客户端必须被告知自己**从哪一个维度掉出去**——时间维度说明它离线太久，容量维度说明变更率超出配置，运维处置不同。
 
-裁剪由**追加时在同一事务里做，外加 `Open` 时做一次**。另外两种拿法都更差：后台 goroutine 要为一条 `DELETE` 引入生命周期与停止路径；在 `Since` 时惰性裁剪则让**没有订阅者的卷永远不裁**，而那恰恰是时间界要治的那一种。
+裁剪由**追加时在同一事务里做，外加 `Open` 时做一次**。另外两种拿法都更差：后台 goroutine 要为一条 `DELETE` 引入生命周期与停止路径；在 `Since` 时惰性裁剪则让**没有订阅者的 volume 永远不裁**，而那恰恰是时间界要治的那一种。
 
-已知缺口，记下来不修：**一个写完就安静下来、而 server 又长期不重启的卷会停在上界不再缩。** 一万条约两兆，一千个这样的卷是两个 G。将来要么加后台裁剪，要么在挂载与卸载时顺手裁一次。
+已知缺口，记下来不修：**一个写完就安静下来、而 server 又长期不重启的 volume 会停在上界不再缩。** 一万条约两兆，一千个这样的 volume 是两个 G。将来要么加后台裁剪，要么在挂载与卸载时顺手裁一次。
 
 ### 续订标识是（化身, 位置）
 
@@ -178,17 +178,17 @@ metastore 事务 {
 向订阅者发布 Change
 ```
 
-启动时对账把 retained log 看成 predecessor chain：第一条 surviving change 指向 `trimmed_through`，每条后续 change 指向同卷的上一条，最后一条等于 `CommittedPosition`；没有 surviving row 时 committed tail 等于 trim boundary。任一缺口都说明日志 invariant 已损坏，Open 在 trim 与其它 maintenance 之前以 `EIO` 失败，不修改化身。完整决定见[保留日志不连续时拒绝打开](./2026-09-04-retained-log-integrity-refuses-open.md)。
+启动时对账把 retained log 看成 predecessor chain：第一条 surviving change 指向 `trimmed_through`，每条后续 change 指向同 volume 的上一条，最后一条等于 `CommittedPosition`；没有 surviving row 时 committed tail 等于 trim boundary。任一缺口都说明日志 invariant 已损坏，Open 在 trim 与其它 maintenance 之前以 `EIO` 失败，不修改化身。完整决定见[保留日志不连续时拒绝打开](./2026-09-04-retained-log-integrity-refuses-open.md)。
 
 由此得到一条要写进契约的规则：**一个后端要么能把位置纳入自己的原子提交，要么它的日志不得持久化。**
 
-日志与树同库同事务，还顺带消掉了那份 note 当时记下的另一条反对意见：增加复制不要求 server 在存储之外另建一份持久日志。状态属于某个存储实现，R-INT-12 允许实现依赖自己的外部服务，并要求说明这些依赖。当前文件锁还持有卷绑定的持久时长证据与独立 Witness；这些证据保证重启不缩短占有，与保存日志供副本重放是两项不同责任。
+日志与树同库同事务，还顺带消掉了那份 note 当时记下的另一条反对意见：增加复制不要求 server 在存储之外另建一份持久日志。状态属于某个存储实现，R-INT-12 允许实现依赖自己的外部服务，并要求说明这些依赖。当前文件锁还持有 volume 绑定的持久时长证据与独立 Witness；这些证据保证重启不缩短占有，与保存日志供副本重放是两项不同责任。
 
 ### 日志归 metastore
 
-**日志是每个 metastore 必须提供的能力**，怎么实现由各自决定。引入复制时无需把日志并进 `storage.Storage`，第三方仍可只提供卷数据接口。当前从 server 发布卷还须提供有界读取，并与能在原生最终转换处检查权限的锁授权方配对；日志仍是独立的可选能力，不能从有界读取或锁服务推导出复制支持。
+**日志是每个 metastore 必须提供的能力**，怎么实现由各自决定。引入复制时无需把日志并进 `storage.Storage`，第三方仍可只提供 volume 数据接口。当前从 server 发布 volume 还须提供有界读取，并与能在原生最终转换处检查权限的锁授权方配对；日志仍是独立的可选能力，不能从有界读取或锁服务推导出复制支持。
 
-引入复制时，只有 metastore 后端的卷会被复制，`localdir` 保持直通。[观察源与通道](../../proposed/architecture/2026-08-19-observation-source-and-channels.md)提出的「直接挂载与生产经过相同失效路径」没有因此实现：当时 `packages/fuse` 在 `localdir` 上与普通目录对拍，`cmd` 另用 SQLite 与内存对象验证复制路径，并保留两个 `localdir` 用例覆盖 `ENOSYS`。这一取舍将挂载语义与复制行为分开验证，没有让差分对拍覆盖复制失效。
+引入复制时，只有 metastore 后端的 volume 会被复制，`localdir` 保持直通。[观察源与通道](../../proposed/architecture/2026-08-19-observation-source-and-channels.md)提出的「直接挂载与生产经过相同失效路径」没有因此实现：当时 `packages/fuse` 在 `localdir` 上与普通目录对拍，`cmd` 另用 SQLite 与内存对象验证复制路径，并保留两个 `localdir` 用例覆盖 `ENOSYS`。这一取舍将挂载语义与复制行为分开验证，没有让差分对拍覆盖复制失效。
 
 [移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)后，直接 FUSE 与 HTTP 夹具使用 SQLite 与内存对象，二进制测试覆盖 localstore 与 Azure Blob；不提供日志的行为由显式省略 Log 的夹具继续验证。现有两种独立服务端后端都把 SQLite 日志交给 server，其中[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)复用相同快照与增量路径。更换存储夹具不改变直接 FUSE 挂载没有副本这一验证边界。
 
@@ -256,7 +256,7 @@ local store 此后有了服务端容量、维护与持久性状态，客户端�
 
 ### 流的活性：沉默也有上界
 
-「副本的可信度只取决于事件通道是否连续观察中」这句话，只有在**事件通道活着是被观测到的、而不是被假定的**时候才有意义。第一版写完时它是被假定的：服务端的推送者阻塞在一个没有 ticker 的 `select` 上，客户端的读者阻塞在一个没有截止时间的 body 上，于是**一条被切断的 TCP 与一个安静的卷是同一个观测结果——沉默**。唯一剩下的边界是传输层拨号器的 TCP keepalive，Linux 上约十一分半，而且只对恰好设了它的调用方成立。那不是一个值得让 R-ERR-1 靠着的数。
+「副本的可信度只取决于事件通道是否连续观察中」这句话，只有在**事件通道活着是被观测到的、而不是被假定的**时候才有意义。第一版写完时它是被假定的：服务端的推送者阻塞在一个没有 ticker 的 `select` 上，客户端的读者阻塞在一个没有截止时间的 body 上，于是**一条被切断的 TCP 与一个安静的 volume 是同一个观测结果——沉默**。唯一剩下的边界是传输层拨号器的 TCP keepalive，Linux 上约十一分半，而且只对恰好设了它的调用方成立。那不是一个值得让 R-ERR-1 靠着的数。
 
 所以：服务端在无话可说时每 10 秒发一行 SSE 注释，客户端把「一个字节都没来」的上限定在 30 秒——**三倍**于前者，好让丢掉一次心跳不至于被判成断流。超限走的是与其它任何流失败**完全相同**的那条路：副本作废、十一个操作全部 EIO、由重新订阅把它接回来。
 
@@ -278,9 +278,9 @@ R-CON-4 要求写入方自己以及同机其它进程**立即**看到已写入�
 
 replicated storage 在发送 request 前只 admission 一条 fixed-size confirmation record，不保留目标 path、direction 或 touched-name history。`replicated.Options` 默认 `ConfirmationGrace = 10s`、`MaxActiveConfirmations = 64`、`MaxWaitingConfirmations = 64`；active/waiter 的 `math.MaxInt` sentinel 被拒绝。active 名额不足时有限等待；纯调用方取消为 `EINTR`，deadline 为 `EIO`，实际容量饱和或 storage 开始关闭时为 `EAGAIN`，这些拒绝都保留原始原因且不发送 request。该分类与 [FUSE 请求中断](../bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)共用操作阶段规则。`cmd/remote-fs` 以 `-confirmation-grace`、`-max-active-mutation-confirmations` 与 `-max-waiting-mutation-confirmations` 暴露三项配置，并在连接 server 或创建 replica directory 之前验证。
 
-server success 后，replicated storage 把 barrier 与当前 replica incarnation/generation 对齐，再等待 `local position >= barrier position`。event 若早于 HTTP response 到达，当前位置已经越过 barrier，等待立即完成；另一个 writer 的 change 不能提前确认，因为 barrier position 不早于本次 commit。stream rebuild 改变 generation、barrier incarnation 不匹配、stream failure、context cancellation、storage close 或 grace 到期都以 `EIO` 失败：卷已改变，只是本地结果无法确认。失败只结束该调用，不把一条仍连续的 stream 判坏；调用方应读取当前事实，不能把 `EIO` 当成“修改没有发生”而盲目重试。
+server success 后，replicated storage 把 barrier 与当前 replica incarnation/generation 对齐，再等待 `local position >= barrier position`。event 若早于 HTTP response 到达，当前位置已经越过 barrier，等待立即完成；另一个 writer 的 change 不能提前确认，因为 barrier position 不早于本次 commit。stream rebuild 改变 generation、barrier incarnation 不匹配、stream failure、context cancellation、storage close 或 grace 到期都以 `EIO` 失败：volume 已改变，只是本地结果无法确认。失败只结束该调用，不把一条仍连续的 stream 判坏；调用方应读取当前事实，不能把 `EIO` 当成“修改没有发生”而盲目重试。
 
-这些计数有各自的作用：log incarnation / position 标识卷历史，replica generation 区分本地副本重建，Grant generation 标识授予，renewal revision 表示续期状态。mutation barrier 只证明副本已看到提交；它不取得或续期 grant，也不证明调用方当前仍持有权限。显式 scope 的权限在暂存后的原生最终转换处检查，过期后尚未取得许可的上传失败；已获许可的提交可以在 grant 后来到期之后才完成副本确认。普通读取、SSE 健康与追平同样不构成 live-grant 断言。
+这些计数有各自的作用：log incarnation / position 标识 volume 历史，replica generation 区分本地副本重建，Grant generation 标识授予，renewal revision 表示续期状态。mutation barrier 只证明副本已看到提交；它不取得或续期 grant，也不证明调用方当前仍持有权限。显式 scope 的权限在暂存后的原生最终转换处检查，过期后尚未取得许可的上传失败；已获许可的提交可以在 grant 后来到期之后才完成副本确认。普通读取、SSE 健康与追平同样不构成 live-grant 断言。
 
 空 attribute change 与 rename onto itself 仍然发给服务端，以取得它对 pathname 的权威答案。logged handler 会在成功 response 中附上当前 barrier；但这两种语义 no-op 没有要等待的状态变更，replicated storage 因此直接调用普通 mutation 方法，不进入 `*WithBarrier` 确认路径。scoped HTTP client 的普通 mutation 与 `*WithBarrier` 方法都保留其不可变 proof 集合，no-op 也必须验证所给 scope。其它写入在 stream 不通时失败，因为 barrier 永远无法被本地可信地满足，一个看不到自己刚写内容的挂载点不满足 R-CON-4。
 
@@ -294,7 +294,7 @@ server success 后，replicated storage 把 barrier 与当前 replica incarnatio
 
 ### 副本放在哪
 
-一份随挂载生灭的 SQLite 文件，放在一个专属目录里：`os.MkdirTemp` 建目录（只有属主进得去，且名字不可能被别人预先占位——已存在即失败），数据库文件由 `cmd/remote-fs` 以 0600 建出来再交给 SQLite（SQLite 让 -wal 与 -shm 跟随主库文件的模式，所以定一次就定了三个）。卸载时整个目录删掉。这两条是 R-SEC-3 的两半：内容是别人整个卷的名字、大小与时间。
+一份随挂载生灭的 SQLite 文件，放在一个专属目录里：`os.MkdirTemp` 建目录（只有属主进得去，且名字不可能被别人预先占位——已存在即失败），数据库文件由 `cmd/remote-fs` 以 0600 建出来再交给 SQLite（SQLite 让 -wal 与 -shm 跟随主库文件的模式，所以定一次就定了三个）。卸载时整个目录删掉。这两条是 R-SEC-3 的两半：内容是别人整个 volume 的名字、大小与时间。
 
 不用 `:memory:`：一棵大小未知的树留在内存里没有上限，而 R-INT-3 要求上限。但默认落在系统临时目录，那在很多机器上仍然是内存——所以 `-replica-dir` 让运维把它指到真正的盘上，flag 的说明里写明了这一点。跨挂载存活明确不做（需求里写着它不是需求、是优化）。
 
@@ -315,9 +315,9 @@ type Storage struct {
 
 具名节点修改沿用 mutation barrier，成功后确认本地可见性；detached 内容修改不生成具名树事件，不能等待一个永远不存在的节点事件。文件引用的退役、续期和 advisory 连续性由独立 FileSession 管理，不从日志位置或 SSE 心跳推导。
 
-它拿的是 `*httprest.Storage` 而不是 `storage.Storage`，因为它要的两半是同一个卷：读写走 storage 契约，而流与快照是那个传输自己的操作。R-INT-9 要求的另外两种传输出现时，才是在两者之间立一层接口的时候；现在立等于先造一个只有一个实现的抽象——与不建 `packages/observe` 是同一条理由。
+它拿的是 `*httprest.Storage` 而不是 `storage.Storage`，因为它要的两半是同一个 volume：读写走 storage 契约，而流与快照是那个传输自己的操作。R-INT-9 要求的另外两种传输出现时，才是在两者之间立一层接口的时候；现在立等于先造一个只有一个实现的抽象——与不建 `packages/observe` 是同一条理由。
 
-副本是 `sqlite.Replica`，不是 `sqlite.Store`：它只给出 `Store` 的读那一半，加上 `Apply` 与 `Reseed`。这个类型的意义就在这里——副本与它所复制的卷之间的每一处差异都必须以「某人记下来的一条变更」的形式到达，一个能自己造节点的方法就是这棵树的第二个作者。它抄下源端的节点编号，所以一条指名父目录编号的变更不需要任何翻译；它**不存文件的内容 key**，因为副本永远不去对象存储，那个 key 在这里指向的是本地没有的字节，而 schema 里 `nodes.content` 的外键正是这个意思。
+副本是 `sqlite.Replica`，不是 `sqlite.Store`：它只给出 `Store` 的读那一半，加上 `Apply` 与 `Reseed`。这个类型的意义就在这里——副本与它所复制的 volume 之间的每一处差异都必须以「某人记下来的一条变更」的形式到达，一个能自己造节点的方法就是这棵树的第二个作者。它抄下源端的节点编号，所以一条指名父目录编号的变更不需要任何翻译；它**不存文件的内容 key**，因为副本永远不去对象存储，那个 key 在这里指向的是本地没有的字节，而 schema 里 `nodes.content` 的外键正是这个意思。
 
 `Reseed` 在整份外部 picture 期间持有 replica 独占门和 SQLite write transaction，使读者不会观察半棵树。读写门与 commit gate 的等待都遵从调用 context；等待另一份 picture 时取消不会继续占住 commit gate。SQL 读取先取得与 reader pool 并发数一致的名额，再进入读阶段；等待 SQL 名额的调用不会增加写者必须排空的读者数量。写者登记后，新读者不能延长已在执行的读阶段；一次写入结束又为已经等待的一批读者预留共享访问，后续写者须等待它们结束或取消。读取名额、固定状态与批次交接的取舍见[副本写者推进](../bug-fix/2026-09-07-let-replica-writers-progress.md)。snapshot rows 可以任意排序，`Seeding` 只累计本轮看到的最大 node ID，在 `Complete` 时一次推进 `database_state.node_high_water` 并核对 `sqlite_sequence`，不为每个 row 重读和更新 allocator state。
 
@@ -367,7 +367,7 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 ### schema 从 1 到 2，以及迁移长什么样
 
-这一版给 metastore 加日志表、`incarnation` 与 `committed_position`，并把 `entries` 的主键换成 `(volume, parent, name)`，也就是 schema 从 1 变成 2。在此之前 `schema.go` 只会拒绝：版本对不上就不启动，往前搬的那条路一行代码都没有。本节保留当时采用编号迁移与冻结 SQL 的理由；[卷术语决定](2026-09-10-use-volume-for-the-logical-file-tree.md)只对既有标识的直接改名作限定例外，编号与功能迁移机制不变。
+这一版给 metastore 加日志表、`incarnation` 与 `committed_position`，并把 `entries` 的主键换成 `(volume, parent, name)`，也就是 schema 从 1 变成 2。在此之前 `schema.go` 只会拒绝：版本对不上就不启动，往前搬的那条路一行代码都没有。本节保留当时采用编号迁移与冻结 SQL 的理由；[volume 术语决定](2026-09-10-use-volume-for-the-logical-file-tree.md)只对既有标识的直接改名作限定例外，编号与功能迁移机制不变。
 
 **迁移是 [`packages/metastore/sqlite/internal/schema/migrations/`](../../../../packages/metastore/sqlite/internal/schema/migrations) 下编号的 `.sql` 文件，由 `packages/sqliteschema` 按序重放。** 每个文件就是一个版本：`0001_tree.sql` 到版本 1，`0002_replication.sql` 到版本 2，数据库记下的版本号等于最后跑过的那个文件的编号。编号从 1 起连续，缺号在加载时直接 panic——这样「记录的版本」与「跑过几个文件」是同一句话。
 
@@ -390,7 +390,7 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 （顺带记下一个实测意外：`entries.name` 在 `0002` 里改成 `TEXT` 之后，**没有任何行为测试变红**。原因是 SQLite 的 TEXT 亲和性不会把 BLOB 值转成文本，存进去的字节仍按字节比较。所以那一处是 golden 独自兜住的，不是被行为测试兜住的。）
 
-**机制本身放在 `packages/sqliteschema`，不在 sqlite 后端里面。** 它今天只有一个使用者，所以这不是「按需抽象」而是一次判断：这里面没有一行是关于树、日志或卷的，它回答的是「把一个 SQLite 数据库搬到某个版本」，而这个问题跟谁在用它无关。边界也因此变干净了——`schema_version` 归运行器所有并由它建表，迁移文件只描述调用方自己的 schema，`0001_tree.sql` 里不再有那张表。它同时把 `Dump` 与 `Structure` 一起给出去：读回 schema 并按 token 比对，是任何用这套机制的人都要写的同一段代码，而且正是那条「已落地的迁移不许改」的守卫赖以成立的东西。
+**机制本身放在 `packages/sqliteschema`，不在 sqlite 后端里面。** 它今天只有一个使用者，所以这不是「按需抽象」而是一次判断：这里面没有一行是关于树、日志或 volume 的，它回答的是「把一个 SQLite 数据库搬到某个版本」，而这个问题跟谁在用它无关。边界也因此变干净了——`schema_version` 归运行器所有并由它建表，迁移文件只描述调用方自己的 schema，`0001_tree.sql` 里不再有那张表。它同时把 `Dump` 与 `Structure` 一起给出去：读回 schema 并按 token 比对，是任何用这套机制的人都要写的同一段代码，而且正是那条「已落地的迁移不许改」的守卫赖以成立的东西。
 
 其余的（回滚、校验和、并发启动的额外互斥）都不做。回滚在只能前滚的语义下没有意义；准备 schema 的一个事务已经把并发启动、部分失败与版本拒绝三件事一起解决了。实现归属由[SQLite 内部模块](2026-09-09-sqlite-internal-modules.md)组织，资源移动不改写已落地的迁移和历史 fixture。
 
@@ -410,7 +410,7 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **日志留在内存里**（[变更日志的身份与作用域](../../proposed/architecture/2026-08-19-change-log-identity.md)当时的结论）。省掉持久状态与崩溃对账。输在加上快照之后，「每次重启都是全舰队事件」的价码变了：所有客户端同时重建就是同一时刻的多次全树扫描。化身规则让这件事诚实，不让它便宜。
 
-**把变更流并进 `storage` 接口。** 只有一条契约。输在抬高 R-INT-6 的门槛：接入自有存储的第三方本来只需实现「一个卷的存取」，现在还要实现一个可续订、有保留窗口、能诚实报告缺口的事件流。
+**把变更流并进 `storage` 接口。** 只有一条契约。输在抬高 R-INT-6 的门槛：接入自有存储的第三方本来只需实现「一个 volume 的存取」，现在还要实现一个可续订、有保留窗口、能诚实报告缺口的事件流。
 
 **事件只发失效通知，客户端自己回源。** 自愈——错一次顶多多一次取回，也不要求事件生成完全正确。输在目录改名：服务端一行的改动，客户端要丢掉整棵子树重走一遍，而目录改名正是工具链最常做的操作。它还买不到多少东西——每次操作仍然要回源，只省掉一次 `List`。
 
@@ -430,11 +430,11 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **按目标路径、变更种类或结果方向匹配 event。** 不需要扩展 HTTP response，也可以在本地 event 处理中完成等待。输在另一个 writer 能在同一路径产生外形一样的变更；改名到已被占用的目的地还会先产生一条「目的地被清空」。任何基于路径、种类或方向的启发式都可能在本次 commit 尚未被副本应用时被提前满足。barrier position 是由服务端在成功 commit 之后从同一日志读取的，所以不需要猜哪条 event 属于本次操作。
 
-**收到成功 response 后才取得 confirmation 名额。** 没有被使用的名额不会占用 request 的生命周期。输在卷已经改变后才能发现本地等待资源饱和；返回 `EAGAIN` 会误导调用方把 request 当成没有发送。发送前预留一条固定大小的 record，才能在无副作用的时刻以 `EAGAIN` 拒绝。
+**收到成功 response 后才取得 confirmation 名额。** 没有被使用的名额不会占用 request 的生命周期。输在 volume 已经改变后才能发现本地等待资源饱和；返回 `EAGAIN` 会误导调用方把 request 当成没有发送。发送前预留一条固定大小的 record，才能在无副作用的时刻以 `EAGAIN` 拒绝。
 
-**保留所有曾触碰路径及其最后 event。** 后登记的 waiter 可以回看 history，不怕 event 抢先。输在状态随卷 lifetime 与 mutation 数无界增长，而且历史中的同路径 event 仍然不能证明它由哪个 writer 产生。barrier 只保留 active call 的固定大小状态，也不需要 touched-path history。
+**保留所有曾触碰路径及其最后 event。** 后登记的 waiter 可以回看 history，不怕 event 抢先。输在状态随 volume lifetime 与 mutation 数无界增长，而且历史中的同路径 event 仍然不能证明它由哪个 writer 产生。barrier 只保留 active call 的固定大小状态，也不需要 touched-path history。
 
-**server 成功之后继续返回 caller cancellation。** 保留 context 的原始错误。输在它读起来与 request 从未发出相同，而卷已经改变；`EIO` 才表达“修改发生了，但本地副本结果无法确认”。
+**server 成功之后继续返回 caller cancellation。** 保留 context 的原始错误。输在它读起来与 request 从未发出相同，而 volume 已经改变；`EIO` 才表达“修改发生了，但本地副本结果无法确认”。
 
 **流断裂时读仍然直达服务端。** 原方案的状态表就是这么写的，它保住了一部分可用性：服务端还在，读它是诚实的。输在每一处调用点都得答对「这个答案该从哪来」，答错的表现是 R-ERR-1 禁止的那一类，而重连本来就是几百毫秒的事。
 
@@ -453,7 +453,7 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **代价一点五：一条被切断的流最多还会被信任三十秒。** 暴露窗口从「无界」变成「不超过静默上限」，这是真正的收获；但它不是零，而且那三十秒里副本照常作答。把它调小要么增加心跳频率，要么让一次网络抖动被判成断流——两者都有代价，而这个数和保留窗口那三个一样是猜的。
 
-**Mutation barrier 把写后可见 latency 与资源 admission 暴露给调用方。** active confirmation 名额耗尽时，新 mutation 可能在发送前以 `EAGAIN` 等待或失败；一旦 server 成功，之后无法确认只能返回 `EIO`，即使卷实际已经改变。固定大小的 active record 不随 pathname 大小或历史变更数增长；代价是高并发写入必须配置与吞吐相称的 confirmation ceiling。
+**Mutation barrier 把写后可见 latency 与资源 admission 暴露给调用方。** active confirmation 名额耗尽时，新 mutation 可能在发送前以 `EAGAIN` 等待或失败；一旦 server 成功，之后无法确认只能返回 `EIO`，即使 volume 实际已经改变。固定大小的 active record 不随 pathname 大小或历史变更数增长；代价是高并发写入必须配置与吞吐相称的 confirmation ceiling。
 
 **代价二：冷挂载会卡，卡多久没人知道。** 阻塞式首次同步加上 R-SCALE-1 仍是【未决】，意味着一棵大树上的挂载体验是未测量的。R-WS-4 被知情推后，恢复「立刻可用」的前提是客户端能查询并暴露首次同步、直通与降级状态；服务端已有的 local-store 维护状态不覆盖这些客户端模式。
 
@@ -463,4 +463,4 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **端到端验收必须经过部署实际使用的复制路径。** 引入复制时，测试从 `localdir` 转向 metastore 后端；取消宿主目录后端后，独立二进制覆盖 localstore 与 Azure Blob。可替换 storage 仍允许没有 Log，这一能力分支由专门夹具覆盖，不能因随附后端都有日志而删除。
 
-**验收是这样验的，每一条都有对应的用例。** 一次目录改名在副本里只搬一行：改名之后子树里每个节点的编号与 inode 号不变，只有一个具名 rename 请求；后续属性按身份核对，周期续期也独立存在。遍历用例单独要求具名 Stat/List 零请求、身份属性确实到达 authority，记录实际次数并拒绝其它数据或修改请求。快照期间持续写入，追平之后副本与服务端的 metastore 逐节点一致——那个用例会先断言「确实有写入压在扫描窗口里」，否则它判自己失败。事件通道断开时十一个操作各自失败一次，且不返回空目录、不报告文件不存在；把这条防护拆掉之后，它报出来的是「列目录成功，2 个条目」与「一个存在的名字答不存在」。日志答「无法重放」时客户端重建而不是接着走，用快照的次数是证据。一个不记日志的卷以 ENOSYS 拒绝复制，挂载点照常工作，而它的每一次 stat 都到达服务端。
+**验收是这样验的，每一条都有对应的用例。** 一次目录改名在副本里只搬一行：改名之后子树里每个节点的编号与 inode 号不变，只有一个具名 rename 请求；后续属性按身份核对，周期续期也独立存在。遍历用例单独要求具名 Stat/List 零请求、身份属性确实到达 authority，记录实际次数并拒绝其它数据或修改请求。快照期间持续写入，追平之后副本与服务端的 metastore 逐节点一致——那个用例会先断言「确实有写入压在扫描窗口里」，否则它判自己失败。事件通道断开时十一个操作各自失败一次，且不返回空目录、不报告文件不存在；把这条防护拆掉之后，它报出来的是「列目录成功，2 个条目」与「一个存在的名字答不存在」。日志答「无法重放」时客户端重建而不是接着走，用快照的次数是证据。一个不记日志的 volume 以 ENOSYS 拒绝复制，挂载点照常工作，而它的每一次 stat 都到达服务端。

@@ -34,13 +34,13 @@ stat "over.bin": Get "http://…/<protocol>/stat?path=over.bin": context cancele
 | 副本在请求发出前等待 mutation confirmation admission | 纯取消为 `EINTR`；deadline 为 `EIO`；实际容量饱和或 storage 正在关闭仍为 `EAGAIN` |
 | 已发出的只读 HTTP 请求 | 放弃本次读取，返回 `EINTR` |
 | mutation 已进入 HTTP `Do`，未获得权威结果 | 无法证明请求未发出或修改未发生，返回 `EIO` |
-| mutation 已成功，副本 barrier 确认被取消 | 卷已经改变，返回 `EIO` |
-| FUSE 复合操作已有本地或卷效果，后续步骤被取消 | 整个操作不能作为未执行的请求重试，返回 `EIO` |
+| mutation 已成功，副本 barrier 确认被取消 | volume 已经改变，返回 `EIO` |
+| FUSE 复合操作已有本地或 volume 效果，后续步骤被取消 | 整个操作不能作为未执行的请求重试，返回 `EIO` |
 | Open/Create、Close 或 Renew 已派发，远端结果无法核对 | 可能改变引用或生命周期，返回 `EIO`，不能据传输取消推断未发生 |
 | advisory 获取被取消 | 只有核对证明无残留授予才返回 `EINTR`；未知结果使受影响 I/O 隔离 |
 | `Flush` 收到关闭线程的取消 | 以独立且有 deadline 的 context 完成 owner 清理，不承担内容提交 |
 
-HTTP transport 的底层 errno 保持隔离：连接 Unix socket 失败时的 `ENOENT` 不能变成卷不存在。FUSE 的 Create、Mkdir、Setattr 仍保留已发生效果；创建并打开在原生结果里完成，File / FileSession 的属性操作按身份访问，没有设置时间前提交其它 handle 缓冲区的阶段。后续取消的原因可以被追溯，但外层 `EIO` 不被其覆盖。
+HTTP transport 的底层 errno 保持隔离：连接 Unix socket 失败时的 `ENOENT` 不能变成 volume 不存在。FUSE 的 Create、Mkdir、Setattr 仍保留已发生效果；创建并打开在原生结果里完成，File / FileSession 的属性操作按身份访问，没有设置时间前提交其它 handle 缓冲区的阶段。后续取消的原因可以被追溯，但外层 `EIO` 不被其覆盖。
 
 SQLite 的纯只读取消保留 context 原因并归为 `EINTR`。只读事务清理使用拥有该事务的 context 判断自动回滚：[database/sql 的 Tx.awaitDone](https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/database/sql/sql.go#L2207-L2230)在 context 取消后主动回滚，[再次 Rollback](https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/database/sql/sql.go#L2324-L2359)可直接返回 `sql.ErrTxDone`。这种收尾也可能发生在查询回调成功之后。真实查询错误与独立清理故障不会被取消覆盖；deadline、无法命名的故障、未知 commit 或 poison 仍为 `EIO`。SQLite code 9 只在确有已取消的读取 context 时解释为取消，不能仅凭 `SQLITE_INTERRUPT` 数字推断请求已撤回。
 

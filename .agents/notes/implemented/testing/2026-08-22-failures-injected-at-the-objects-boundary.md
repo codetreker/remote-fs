@@ -5,8 +5,8 @@ Status: implemented
 ## 问题
 
 R-ERR-6 说，一份由多个能各自失败的部分拼成的 storage 实现，任何一部分不可达都按 R-ERR-1 失败。
-[放进对象存储的卷](../architecture/2026-08-21-volume-in-an-object-store.md)正是这样一份实现：
-一棵树加一个对象存储，两者各自会失败。这条保证要求的是**不管对象存储那一半报什么，卷都不得
+[放进对象存储的 volume](../architecture/2026-08-21-volume-in-an-object-store.md)正是这样一份实现：
+一棵树加一个对象存储，两者各自会失败。这条保证要求的是**不管对象存储那一半报什么，volume 都不得
 把它答成一个关于名字的事实**。
 
 「不管什么」是这条保证的全部内容，而它此前的证法送不进几种错。证法是把一个真实的 blob 客户端指向
@@ -65,13 +65,13 @@ azblob 那一侧继续对着死地址跑真实客户端，那是它自己该证�
 | `packages/storage/objectstore/objectstoretest` | 每份 `Objects` 实现共同履行 create-only、不可变、错误区分、容量、取消与并发契约，并能在用例 cleanup 时成功关闭；memory、azblob 与 localdisk 都运行同一套用例，关闭的并发、幂等与排空由各实现及组合层另测 |
 | `packages/storage/objectstore` | `Get`、`Put`、`Delete` 的任意失败不被改写成名字事实；另以独立包装层覆盖物理容量测量、部分删除、`Forget` 与关闭失败 |
 | `packages/storage/objectstore/localdisk` | 在真实文件系统操作 seam 注入 `fsync`、link、unlink、`statfs`、`statx` 与 device/mount mismatch，覆盖 FORMAT/lock/probe、objects/shard identity stage/link/barrier、recovery/staging/final object；并发用例分别锁住同一 shard 与另一 shard，证明[本地磁盘对象存储](../architecture/2026-09-04-local-disk-object-store.md)在持久性、store 归属或同一文件系统身份无法证明时停止作答，同时不把全部对象 I/O 串行化 |
-| `packages/storage/localstore` | 在真实 SQLite 与本地文件系统上构造初始化中断、丢失卷、`METASTORE` stage/final 损坏、accepted/checkpointed generation 与 WAL 缺失组合、checkpoint pin/error，以及 active reader 下的关闭；只替换见证、单次 barrier 或 pool close reporting 时，证明确认失败 poison、checkpoint/取消可重试、pool close error 进入 terminal 状态、SQLite constructor cleanup 不确定时内部 coordinator 与外部 lifetime lock 都保留 |
-| 契约套件 | 这两半装在一起，行为和别的卷一样。它跑在真的 Azurite 和真的 SQLite 上，不用替身——这一层声称的正是两者合起来对不对 |
+| `packages/storage/localstore` | 在真实 SQLite 与本地文件系统上构造初始化中断、丢失 volume、`METASTORE` stage/final 损坏、accepted/checkpointed generation 与 WAL 缺失组合、checkpoint pin/error，以及 active reader 下的关闭；只替换见证、单次 barrier 或 pool close reporting 时，证明确认失败 poison、checkpoint/取消可重试、pool close error 进入 terminal 状态、SQLite constructor cleanup 不确定时内部 coordinator 与外部 lifetime lock 都保留 |
+| 契约套件 | 这两半装在一起，行为和别的 volume 一样。它跑在真的 Azurite 和真的 SQLite 上，不用替身——这一层声称的正是两者合起来对不对 |
 
 ## 备选方案
 
 **契约套件也改用一份假的 `Objects`。** 会把这个包的测试从三秒变成毫秒级。输在它把契约套件声称的东西
-换掉了：那套用例说的是「一个装在真 blob 容器加真 SQLite 里的卷，行为和别的卷一样」，
+换掉了：那套用例说的是「一个装在真 blob 容器加真 SQLite 里的 volume，行为和别的 volume 一样」，
 换成假的之后它说的变成「这个包的记账自洽」，那是一个更弱的命题，而且是别处已经覆盖的命题。
 
 **在 `azblob.New*` 上暴露重试配置，用例传一个不重试的。** 部署方将来大概真的需要这个旋钮——一个挂载
@@ -103,13 +103,13 @@ azblob 那一侧继续对着死地址跑真实客户端，那是它自己该证�
 - **组合层不再有任何用例走真实的网络失败。** 它现在依赖 azblob 那一侧证明真实失败被归成非 ENOENT，
   以及契约套件证明这一层拿到的确实是 `*azblob.Objects`。两侧都在，但它们是两个用例而不是一个。
 - **注入用的包装层仍嵌入 `objectstore.Objects`。** 接口增加 `Available` 与 `Close` 时，前者被静默继承，
-  后者必须显式改成 no-op，才能让借用夹具的卷只关闭自己的维护 worker。容量失败由
+  后者必须显式改成 no-op，才能让借用夹具的 volume 只关闭自己的维护 worker。容量失败由
   `composition_test.go` 的专用包装层覆盖；以后再加方法，嵌入仍不会用编译失败提醒需要新的故障用例。
-- **注入用的卷与夹具共享 metastore 和 objects。** 两个借用包装层的 `Close` 都是 no-op，测试
-  cleanup 因而可以关闭卷、排空后台维护，却由原夹具继续拥有持久资源。这个 ownership 由类型约定
+- **注入用的 volume 与夹具共享 metastore 和 objects。** 两个借用包装层的 `Close` 都是 no-op，测试
+  cleanup 因而可以关闭 volume、排空后台维护，却由原夹具继续拥有持久资源。这个 ownership 由类型约定
   与注释维持，编译器不证明底层只关闭一次。
 - **`metastore.Store` 仍没有覆盖全部方法的任意错误注入。** 组合用例已经直接送入 `Space` failure 与
-  `Forget` failure，SQLite 自己的用例和卷契约覆盖其余路径；还没有一个与 `failingObjects`
+  `Forget` failure，SQLite 自己的用例和 volume 契约覆盖其余路径；还没有一个与 `failingObjects`
   对称、能让每个 metastore 方法分别返回任意错误的包装层。
 - **部分删除与记录失败已经各自进入同一个用例。** 第二个 `Delete` 失败且 `Forget` 也失败时，`Sweep`
   同时返回两项失败、报告只删除一个对象，维护状态保留同一组事实。`forgetFails` 没有记录传入的 key，
