@@ -14,42 +14,42 @@ const (
 	DefaultMaxRetainedFiles = 65536
 
 	// DefaultMaxReaderConnections bounds the physical SQLite connections used by concurrent
-	// namespace reads when the caller supplies no limit of its own.
+	// volume reads when the caller supplies no limit of its own.
 	DefaultMaxReaderConnections = 16
 
 	// DefaultMaxSnapshotReaderConnections matches the default number of snapshot frames the
 	// reference HTTP server can produce concurrently.
 	DefaultMaxSnapshotReaderConnections = 16
 
-	// DefaultMaxIntegrityRecords bounds the namespace, node, object, entry, log, and change rows
+	// DefaultMaxIntegrityRecords bounds the volume, node, object, entry, log, and change rows
 	// examined by one integrity pass when the caller supplies no limit of its own.
 	DefaultMaxIntegrityRecords int64 = 1_000_000
 
-	// DefaultMaxIntegrityBytes bounds variable-length namespace and log fields examined by
+	// DefaultMaxIntegrityBytes bounds variable-length volume and log fields examined by
 	// one full integrity pass.
 	DefaultMaxIntegrityBytes int64 = 64 << 20
 
-	// MinIntegrityRecords is the namespace row, root node, and log row every usable namespace
+	// MinIntegrityRecords is the volume row, root node, and log row every usable volume
 	// contains.
 	MinIntegrityRecords int64 = 3
 )
 
 // Options configures the serving resources of one Store.
 type Options struct {
-	leaseRecoveryOwner       bool
-	leaseOwner               *nativelease.Database
-	requireExistingNamespace bool
-	Window                   Window
-	ObjectLimits             ObjectLimits
+	leaseRecoveryOwner    bool
+	leaseOwner            *nativelease.Database
+	requireExistingVolume bool
+	Window                Window
+	ObjectLimits          ObjectLimits
 
-	// MaxRetainedFiles bounds native file references across this namespace. Zero
+	// MaxRetainedFiles bounds native file references across this volume. Zero
 	// selects DefaultMaxRetainedFiles; admission exhaustion returns EAGAIN.
 	MaxRetainedFiles int
-	// Advisory bounds namespace-wide lock and materialization state. The zero
+	// Advisory bounds volume-wide lock and materialization state. The zero
 	// configuration selects advisory.DefaultConfig; shared opens must agree.
 	Advisory advisory.Config
 
-	// MaxReaderConnections bounds the physical SQLite connections used by ordinary namespace
+	// MaxReaderConnections bounds the physical SQLite connections used by ordinary volume
 	// and log reads. Zero selects DefaultMaxReaderConnections. A read waits for a connection
 	// when the pool is full and observes its context while waiting.
 	MaxReaderConnections int
@@ -58,8 +58,8 @@ type Options struct {
 	// snapshots. Zero selects DefaultMaxSnapshotReaderConnections.
 	MaxSnapshotReaderConnections int
 
-	// MaxIntegrityRecords bounds the namespace, node, object, entry, log, and change rows
-	// accepted by an integrity pass. A larger retained namespace returns syscall.EFBIG before
+	// MaxIntegrityRecords bounds the volume, node, object, entry, log, and change rows
+	// accepted by an integrity pass. A larger retained volume returns syscall.EFBIG before
 	// recursive traversal or row validation. Zero selects DefaultMaxIntegrityRecords.
 	MaxIntegrityRecords int64
 
@@ -155,7 +155,7 @@ func (o Options) Effective() (Options, error) {
 
 const (
 	// DefaultMaxPendingObjects bounds reserved, unresolved, and garbage object records retained
-	// by one namespace before new reservations wait for maintenance to make room.
+	// by one volume before new reservations wait for maintenance to make room.
 	DefaultMaxPendingObjects int64 = 4096
 	// DefaultMaxPendingBytes is the corresponding bound over their recorded payload sizes.
 	DefaultMaxPendingBytes int64 = 8 * 1024 * 1024 * 1024
@@ -165,7 +165,7 @@ const (
 // Store. Reserve returns syscall.EFBIG when one requested object can never fit under
 // MaxPendingBytes. A request that fits by itself returns syscall.EAGAIN when the existing
 // backlog leaves insufficient room; cleanup may make that request succeed. Commits and
-// namespace removal remain authoritative and may move an existing backlog over a bound; in
+// volume removal remain authoritative and may move an existing backlog over a bound; in
 // that state cleanup remains available and ObjectStatus reports OverLimit.
 //
 // The limits are serving configuration rather than database state, so reopening may choose

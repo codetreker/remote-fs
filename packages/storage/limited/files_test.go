@@ -274,7 +274,7 @@ func TestRetainedQuotaRequiresNativeAccountingAndAuthoritativeUsage(t *testing.T
 	}
 	missing := &missingRetainedUsage{BoundedStorage: backing}
 	if _, err := limited.New(t.Context(), missing, limited.MinLimit); !errors.Is(err, syscall.EOPNOTSUPP) {
-		t.Fatalf("retained namespace without authoritative usage returned %v", err)
+		t.Fatalf("retained volume without authoritative usage returned %v", err)
 	}
 	for _, result := range []struct {
 		usage int64

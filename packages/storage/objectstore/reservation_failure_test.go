@@ -167,16 +167,16 @@ func TestRepeatedPutFailuresFillTheBoundedUnresolvedBacklog(t *testing.T) {
 	}
 	failure := errors.New("the object store refused the upload")
 	objects := &putFailureObjects{Objects: memory.New(), failure: failure}
-	namespace := objectstore.New(objects, meta)
+	volume := objectstore.New(objects, meta)
 	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
-			t.Errorf("closing the namespace: %v", err)
+		if err := volume.Close(); err != nil {
+			t.Errorf("closing the volume: %v", err)
 		}
 	})
 
 	const attempts = 3
 	for range attempts {
-		if err := namespace.Write(t.Context(), "f", []byte("content that never landed")); !errors.Is(err, failure) {
+		if err := volume.Write(t.Context(), "f", []byte("content that never landed")); !errors.Is(err, failure) {
 			t.Fatalf("failed Put returned %v, want the object-store failure", err)
 		}
 	}
@@ -188,10 +188,10 @@ func TestRepeatedPutFailuresFillTheBoundedUnresolvedBacklog(t *testing.T) {
 		status.UnresolvedBytes != attempts*int64(len("content that never landed")) || status.GarbageCount != 0 {
 		t.Fatalf("failed Puts left status %+v, want three bounded unresolved reservations", status)
 	}
-	if err := namespace.Write(t.Context(), "blocked", []byte("another")); !errors.Is(err, syscall.EAGAIN) {
+	if err := volume.Write(t.Context(), "blocked", []byte("another")); !errors.Is(err, syscall.EAGAIN) {
 		t.Fatalf("writing beyond the unresolved backlog limit returned %v, want EAGAIN", err)
 	}
-	if removed, err := namespace.Sweep(t.Context(), 100); err != nil || removed != 0 {
+	if removed, err := volume.Sweep(t.Context(), 100); err != nil || removed != 0 {
 		t.Fatalf("sweeping unresolved reservations removed %d objects (%v), want none", removed, err)
 	}
 }
@@ -200,16 +200,16 @@ func TestRepeatedCommitFailuresDoNotAccumulateReservations(t *testing.T) {
 	meta := reservationMeta(t)
 	failure := errors.New("the metadata commit failed")
 	store := &writeFailureStore{Store: meta, commitErr: failure}
-	namespace := objectstore.New(memory.New(), store)
+	volume := objectstore.New(memory.New(), store)
 	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
-			t.Errorf("closing the namespace: %v", err)
+		if err := volume.Close(); err != nil {
+			t.Errorf("closing the volume: %v", err)
 		}
 	})
 
 	const attempts = 32
 	for range attempts {
-		if err := namespace.Write(t.Context(), "f", []byte("content whose commit failed")); !errors.Is(err, failure) {
+		if err := volume.Write(t.Context(), "f", []byte("content whose commit failed")); !errors.Is(err, failure) {
 			t.Fatalf("failed Commit returned %v, want the metastore failure", err)
 		}
 		requireNoReservations(t, meta)
@@ -248,10 +248,10 @@ func TestWriteFailurePreservesReservationCleanupFailure(t *testing.T) {
 			} else {
 				store.quarantineErr = cleanupFailure
 			}
-			namespace := objectstore.New(test.objects(operationFailure), store)
-			t.Cleanup(func() { _ = namespace.Close() })
+			volume := objectstore.New(test.objects(operationFailure), store)
+			t.Cleanup(func() { _ = volume.Close() })
 
-			err := namespace.Write(t.Context(), "f", []byte("reserved content"))
+			err := volume.Write(t.Context(), "f", []byte("reserved content"))
 			if !errors.Is(err, operationFailure) || !errors.Is(err, cleanupFailure) {
 				t.Fatalf("Write returned %v, want both the %s and cleanup failures", err, test.name)
 			}
@@ -270,10 +270,10 @@ func TestCanceledPutQuarantinesItsReservation(t *testing.T) {
 	meta := reservationMeta(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	objects := &cancelingPutObjects{Objects: memory.New(), cancel: cancel}
-	namespace := objectstore.New(objects, meta)
-	t.Cleanup(func() { _ = namespace.Close() })
+	volume := objectstore.New(objects, meta)
+	t.Cleanup(func() { _ = volume.Close() })
 
-	if err := namespace.Write(ctx, "f", []byte("content")); !errors.Is(err, context.Canceled) {
+	if err := volume.Write(ctx, "f", []byte("content")); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled Put returned %v, want context cancellation", err)
 	}
 	status := requireNoReservations(t, meta)
@@ -286,17 +286,17 @@ func TestPutThatLandedBeforeFailingRemainsUnresolved(t *testing.T) {
 	meta := reservationMeta(t)
 	failure := errors.New("the upload response was lost")
 	objects := &landedPutFailureObjects{Objects: memory.New(), failure: failure}
-	namespace := objectstore.New(objects, meta)
-	t.Cleanup(func() { _ = namespace.Close() })
+	volume := objectstore.New(objects, meta)
+	t.Cleanup(func() { _ = volume.Close() })
 
-	if err := namespace.Write(t.Context(), "f", []byte("ambiguously stored content")); !errors.Is(err, failure) {
+	if err := volume.Write(t.Context(), "f", []byte("ambiguously stored content")); !errors.Is(err, failure) {
 		t.Fatalf("ambiguously landed Put returned %v, want its response failure", err)
 	}
 	status := requireNoReservations(t, meta)
 	if status.UnresolvedCount != 1 || status.GarbageCount != 0 {
 		t.Fatalf("ambiguously landed Put left status %+v, want one unresolved object", status)
 	}
-	if removed, err := namespace.Sweep(t.Context(), 100); err != nil || removed != 0 {
+	if removed, err := volume.Sweep(t.Context(), 100); err != nil || removed != 0 {
 		t.Fatalf("sweeping an unresolved Put removed %d objects (%v), want none", removed, err)
 	}
 	content, err := objects.Objects.Get(t.Context(), objects.key)
@@ -317,7 +317,7 @@ func TestCommitThatLandedBeforeFailingKeepsItsReferencedObject(t *testing.T) {
 		{name: "EEXIST", failure: syscall.EEXIST},
 		{name: "ENOENT", failure: syscall.ENOENT},
 		{
-			name:     "joined namespace fact and independent failure",
+			name:     "joined volume fact and independent failure",
 			failure:  errors.Join(syscall.ENOENT, independentFailure),
 			retained: independentFailure,
 		},
@@ -325,10 +325,10 @@ func TestCommitThatLandedBeforeFailingKeepsItsReferencedObject(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			meta := reservationMeta(t)
 			store := &landedCommitFailureStore{Store: meta, failure: test.failure}
-			namespace := objectstore.New(memory.New(), store)
-			t.Cleanup(func() { _ = namespace.Close() })
+			volume := objectstore.New(memory.New(), store)
+			t.Cleanup(func() { _ = volume.Close() })
 
-			err := namespace.Write(t.Context(), "f", []byte("committed content"))
+			err := volume.Write(t.Context(), "f", []byte("committed content"))
 			if !errors.Is(err, syscall.EIO) {
 				t.Fatalf("ambiguously landed Commit returned %v, want EIO", err)
 			}
@@ -337,13 +337,13 @@ func TestCommitThatLandedBeforeFailingKeepsItsReferencedObject(t *testing.T) {
 			}
 			for _, errno := range factsAboutNames {
 				if errors.Is(err, errno) {
-					t.Fatalf("ambiguously landed Commit exposed namespace fact %v: %v", errno, err)
+					t.Fatalf("ambiguously landed Commit exposed volume fact %v: %v", errno, err)
 				}
 			}
 			if got := storage.ErrnoNameOf(err); got != "EIO" {
 				t.Fatalf("ambiguously landed Commit travels over the transport as %s, want EIO", got)
 			}
-			content, readErr := namespace.Read(t.Context(), "f")
+			content, readErr := volume.Read(t.Context(), "f")
 			if readErr != nil || string(content) != "committed content" {
 				t.Fatalf("ambiguously committed file reads as %q (%v), want its referenced content", content, readErr)
 			}
@@ -365,10 +365,10 @@ func TestExistingObjectAtReservedKeyIsNeverDeleted(t *testing.T) {
 	gated := &gatedReserveStore{
 		Store: meta, reserved: make(chan metastore.Key, 1), release: make(chan struct{}),
 	}
-	namespace := objectstore.New(objects, gated)
+	volume := objectstore.New(objects, gated)
 
 	written := make(chan error, 1)
-	go func() { written <- namespace.Write(t.Context(), "f", []byte("replacement")) }()
+	go func() { written <- volume.Write(t.Context(), "f", []byte("replacement")) }()
 	key := <-gated.reserved
 	if _, err := objects.Put(t.Context(), string(key), []byte("pre-existing")); err != nil {
 		t.Fatalf("pre-seeding the reserved key: %v", err)
@@ -380,7 +380,7 @@ func TestExistingObjectAtReservedKeyIsNeverDeleted(t *testing.T) {
 	}
 	for _, errno := range factsAboutNames {
 		if errors.Is(err, errno) {
-			t.Fatalf("the object-key collision arrived as namespace fact %v: %v", errno, err)
+			t.Fatalf("the object-key collision arrived as volume fact %v: %v", errno, err)
 		}
 	}
 	if got := storage.ErrnoNameOf(err); got != "EIO" {
@@ -393,11 +393,11 @@ func TestExistingObjectAtReservedKeyIsNeverDeleted(t *testing.T) {
 	if status.UnresolvedCount != 1 || status.GarbageCount != 0 {
 		t.Fatalf("the collision left status %+v, want one unresolved reservation", status)
 	}
-	if removed, err := namespace.Sweep(t.Context(), 100); err != nil || removed != 0 {
+	if removed, err := volume.Sweep(t.Context(), 100); err != nil || removed != 0 {
 		t.Fatalf("sweeping the collision removed %d objects (%v), want none", removed, err)
 	}
-	if err := namespace.Close(); err != nil {
-		t.Fatalf("closing the first namespace: %v", err)
+	if err := volume.Close(); err != nil {
+		t.Fatalf("closing the first volume: %v", err)
 	}
 
 	reopenedMeta, err := sqlite.Open(t.Context(), database, "workspace", limited.MinLimit, sqlite.DefaultWindow())
@@ -420,11 +420,11 @@ func TestAzurePutCollisionDoesNotExposeRawTransportDiagnostics(t *testing.T) {
 	gated := &gatedReserveStore{
 		Store: borrowedStore{Store: p.meta}, reserved: make(chan metastore.Key, 1), release: make(chan struct{}),
 	}
-	namespace := objectstore.New(&failingObjects{Objects: p.objects}, gated)
-	t.Cleanup(func() { _ = namespace.Close() })
+	volume := objectstore.New(&failingObjects{Objects: p.objects}, gated)
+	t.Cleanup(func() { _ = volume.Close() })
 
 	written := make(chan error, 1)
-	go func() { written <- namespace.Write(t.Context(), "f", []byte("replacement")) }()
+	go func() { written <- volume.Write(t.Context(), "f", []byte("replacement")) }()
 	key := <-gated.reserved
 	if _, err := p.objects.Put(t.Context(), string(key), []byte("pre-existing")); err != nil {
 		t.Fatalf("pre-seeding the Azure object: %v", err)
@@ -461,9 +461,9 @@ func TestCloseCancelsAbandonBeforeWaitingForAdmittedWrite(t *testing.T) {
 	store := &blockingAbandonStore{
 		Store: meta, commitErr: commitFailure, started: make(chan struct{}), release: make(chan struct{}),
 	}
-	namespace := objectstore.New(memory.New(), store)
+	volume := objectstore.New(memory.New(), store)
 	written := make(chan error, 1)
-	go func() { written <- namespace.Write(context.Background(), "f", []byte("content")) }()
+	go func() { written <- volume.Write(context.Background(), "f", []byte("content")) }()
 	select {
 	case <-store.started:
 	case <-time.After(2 * time.Second):
@@ -471,11 +471,11 @@ func TestCloseCancelsAbandonBeforeWaitingForAdmittedWrite(t *testing.T) {
 	}
 
 	closed := make(chan error, 1)
-	go func() { closed <- namespace.Close() }()
+	go func() { closed <- volume.Close() }()
 	select {
 	case err := <-closed:
 		if err != nil {
-			t.Fatalf("closing the namespace: %v", err)
+			t.Fatalf("closing the volume: %v", err)
 		}
 	case <-time.After(2 * time.Second):
 		close(store.release)

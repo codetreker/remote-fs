@@ -25,11 +25,11 @@ import (
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-// The backing namespace allows assertions independent of the HTTP response. Passing no
+// The backing volume allows assertions independent of the HTTP response. Passing no
 // change log keeps replication unavailable for tests that exercise ordinary requests.
 func newHandler(t *testing.T) (http.Handler, *objectstore.Storage) {
 	t.Helper()
-	s := namespaceFixture(t)
+	s := volumeFixture(t)
 	h, err := httprest.NewHandler(s, nil)
 	if err != nil {
 		t.Fatalf("new handler: %v", err)
@@ -156,7 +156,7 @@ func TestNewHandlerOptionsHaveBoundedDefaultsAndRejectInvalidBounds(t *testing.T
 }
 
 func TestHandlerRefusesStorageWithoutBoundedResults(t *testing.T) {
-	bounded := namespaceFixture(t)
+	bounded := volumeFixture(t)
 	unbounded := struct{ storage.Storage }{Storage: bounded}
 	if _, err := httprest.NewHandler(unbounded, nil); err == nil {
 		t.Fatal("NewHandler accepted a storage without bounded read and list capabilities")
@@ -164,7 +164,7 @@ func TestHandlerRefusesStorageWithoutBoundedResults(t *testing.T) {
 }
 
 func TestHandlerRefusesStorageWithoutABoundAuthority(t *testing.T) {
-	backing := namespaceFixture(t)
+	backing := volumeFixture(t)
 	unpaired := struct{ storage.BoundedStorage }{BoundedStorage: backing}
 	if _, err := httprest.NewHandler(unpaired, nil); err == nil {
 		t.Fatal("NewHandler accepted a storage with no bound file-lock authority")
@@ -328,7 +328,7 @@ func TestAMalformedChangeChangesNothing(t *testing.T) {
 				t.Fatal("a malformed change answered 200")
 			}
 			// Not the one status the client reads an errno out of: the request never
-			// reached the storage, so nothing about the namespace was established.
+			// reached the storage, so nothing about the volume was established.
 			if w.Code == httprest.StatusStorageError {
 				t.Fatal("a malformed change was reported as a storage error")
 			}
@@ -444,11 +444,11 @@ func TestAnUnnameableFailureBecomesEIO(t *testing.T) {
 	}
 }
 
-// A namespace with no room of its own to report answers ENOSYS, and this protocol has no
-// separate way to say so: the refusal is the namespace's answer, so it travels as an
+// A volume with no room of its own to report answers ENOSYS, and this protocol has no
+// separate way to say so: the refusal is the volume's answer, so it travels as an
 // ordinary storage error under its own name. Collapsing it to EIO would turn a standing
 // property into a failure worth retrying.
-func TestANamespaceWithNoRoomToReportSaysSoByName(t *testing.T) {
+func TestAVolumeWithNoRoomToReportSaysSoByName(t *testing.T) {
 	h, err := httprest.NewHandler(failingStorage(t, syscall.ENOSYS), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -563,7 +563,7 @@ func TestWriteBodiesAreBoundedBeforeStorage(t *testing.T) {
 	const limit = int64(1024)
 	newBoundedHandler := func(t *testing.T) (*httprest.Handler, *objectstore.Storage) {
 		t.Helper()
-		s := namespaceFixture(t)
+		s := volumeFixture(t)
 		options := httprest.DefaultHandlerOptions()
 		options.MaxBodyBytes = limit
 		options.MaxWriteBytes = limit
@@ -811,7 +811,7 @@ func bodylessRequests() []httprest.Request {
 }
 
 func TestAnOversizedAttributeChangeIsAProtocolFault(t *testing.T) {
-	s := namespaceFixture(t)
+	s := volumeFixture(t)
 	if err := s.Write(t.Context(), "f", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -858,7 +858,7 @@ func TestRequestBodyAdmissionBoundsConcurrentOperationsAndBytes(t *testing.T) {
 	}
 	for name, configure := range cases {
 		t.Run(name, func(t *testing.T) {
-			inner := namespaceFixture(t)
+			inner := volumeFixture(t)
 			blocked := &blockingWrite{
 				Storage: inner,
 				entered: make(chan struct{}),
@@ -1010,7 +1010,7 @@ func TestHandlerBoundsNonStreamingResponses(t *testing.T) {
 	}
 
 	t.Run("read", func(t *testing.T) {
-		s := namespaceFixture(t)
+		s := volumeFixture(t)
 		if err := s.Write(t.Context(), "large", bytes.Repeat([]byte("x"), int(limit+1))); err != nil {
 			t.Fatal(err)
 		}
@@ -1019,7 +1019,7 @@ func TestHandlerBoundsNonStreamingResponses(t *testing.T) {
 	})
 
 	t.Run("listing", func(t *testing.T) {
-		s := namespaceFixture(t)
+		s := volumeFixture(t)
 		for i := 0; i < 16; i++ {
 			name := fmt.Sprintf("%02d-%s", i, strings.Repeat("n", 96))
 			if err := s.Write(t.Context(), name, nil); err != nil {
@@ -1236,7 +1236,7 @@ func TestMalformedRequestsGetTheirOwnStatus(t *testing.T) {
 	}
 }
 
-// A listing must carry names exactly as the namespace holds them. A name that comes back
+// A listing must carry names exactly as the volume holds them. A name that comes back
 // altered addresses a file that is not there.
 func TestListingCarriesNamesUnaltered(t *testing.T) {
 	h, backing := newHandler(t)
@@ -1272,11 +1272,11 @@ func TestTheHandlerCanBeMountedUnderAPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/namespace/", http.StripPrefix("/namespace", inner))
+	mux.Handle("/volume/", http.StripPrefix("/volume", inner))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	base, err := url.Parse(srv.URL + "/namespace")
+	base, err := url.Parse(srv.URL + "/volume")
 	if err != nil {
 		t.Fatal(err)
 	}

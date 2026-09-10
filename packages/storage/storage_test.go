@@ -11,7 +11,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-func TestCleanPathNamespaceBoundary(t *testing.T) {
+func TestCleanPathVolumeBoundary(t *testing.T) {
 	for _, tc := range []struct {
 		input, want string
 		invalid     bool

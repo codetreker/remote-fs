@@ -24,7 +24,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-// newPair returns both the HTTP client and its backing namespace so that committed
+// newPair returns both the HTTP client and its backing volume so that committed
 // contents can be checked independently of the transport.
 func newPair(t *testing.T) (*httprest.Storage, *objectstore.Storage) {
 	s, backing, _ := newPairOver(t, false)
@@ -584,7 +584,7 @@ func TestContentSurvivesTheRoundTrip(t *testing.T) {
 			if err := s.Write(t.Context(), "f", content); err != nil {
 				t.Fatalf("write: %v", err)
 			}
-			// The direct namespace read detects transport writes that acknowledge
+			// The direct volume read detects transport writes that acknowledge
 			// different contents from those committed.
 			committed, err := backing.Read(t.Context(), "f")
 			if err != nil {
@@ -639,7 +639,7 @@ func TestAwkwardNamesAddressTheRightNode(t *testing.T) {
 		}
 		committed, err := backing.Read(t.Context(), name)
 		if err != nil {
-			t.Fatalf("the namespace has no file named %q: %v", name, err)
+			t.Fatalf("the volume has no file named %q: %v", name, err)
 		}
 		if !bytes.Equal(committed, content) {
 			t.Fatalf("the file named %q holds %q, want %q", name, committed, content)
@@ -682,7 +682,7 @@ func TestNestedPathsAddressTheRightNode(t *testing.T) {
 		t.Fatalf("write %q: %v", deep, err)
 	}
 	if _, err := backing.Stat(t.Context(), deep); err != nil {
-		t.Fatalf("the nested file is not at its namespace path: %v", err)
+		t.Fatalf("the nested file is not at its volume path: %v", err)
 	}
 
 	const moved = "a/b b/renamed 🙂.txt"

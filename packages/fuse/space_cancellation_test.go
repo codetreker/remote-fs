@@ -53,7 +53,7 @@ func TestRetainedMutationCancellationPreservesFailureClassificationAndFile(t *te
 		for _, truncate := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%v/truncate=%v", cause, truncate), func(t *testing.T) {
 				h := aHandle(t, []byte("unchanged"), 1<<20)
-				h.node.ns.storage = forbiddenCapacityProbe{}
+				h.node.volume.storage = forbiddenCapacityProbe{}
 				calls := 0
 				h.file = controlledMutationFile{File: h.file, before: func(context.Context) error {
 					calls++
@@ -123,7 +123,7 @@ func TestAuthoritativeQuotaRejectsTheMutationAndPermitsShrinking(t *testing.T) {
 		t.Run(fmt.Sprintf("truncate=%v", truncate), func(t *testing.T) {
 			original := bytes.Repeat([]byte("x"), allowance)
 			h := aHandleWithAllowance(t, original, 1<<20, allowance)
-			h.node.ns.storage = forbiddenCapacityProbe{}
+			h.node.volume.storage = forbiddenCapacityProbe{}
 			if truncate {
 				if err := h.resize(t.Context(), allowance+1); !errors.Is(err, syscall.EDQUOT) {
 					t.Fatalf("over-quota truncate: %v", err)

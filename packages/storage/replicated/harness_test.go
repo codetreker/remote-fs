@@ -26,7 +26,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-// The system under test here is a whole namespace and a copy of it: a metastore with its
+// The system under test here is a whole volume and a copy of it: a metastore with its
 // change log, a server over it, and a client that fills a copy from the picture and keeps it
 // current from the stream. Nothing is a double — the parts that would be expensive to stand
 // up are the object store, which is held in memory, and the network, which is a loopback
@@ -36,7 +36,7 @@ import (
 // that matter live: an event stream that ends, an event stream that cannot be opened again,
 // and a log that answers that it cannot carry on.
 
-// served is one namespace, the server in front of it, and the failures that can be arranged
+// served is one volume, the server in front of it, and the failures that can be arranged
 // between the two.
 type served struct {
 	meta    *sqlite.Store
@@ -46,8 +46,8 @@ type served struct {
 	// server is kept so that the connections a mount holds can be closed from underneath it.
 	server *httptest.Server
 
-	// elsewhere is a client of this namespace that keeps no copy: it is how a second machine
-	// changes the namespace in these tests. Changing it through the storage object directly
+	// elsewhere is a client of this volume that keeps no copy: it is how a second machine
+	// changes the volume in these tests. Changing it through the storage object directly
 	// would reach the tree without reaching the handler, and it is the handler that tells the
 	// open subscriptions to read the log — so such a change would sit there until something
 	// else happened to wake them.
@@ -56,20 +56,20 @@ type served struct {
 	events *eventFaults
 	calls  *calls
 
-	// silence is how long a mount of this namespace lets its stream say nothing before it
+	// silence is how long a mount of this volume lets its stream say nothing before it
 	// stops believing in it.
 	silence time.Duration
 }
 
-// serve stands up a namespace whose tree is in SQLite and whose bytes are in memory.
+// serve stands up a volume whose tree is in SQLite and whose bytes are in memory.
 func serve(t *testing.T, limits httprest.Limits) *served {
 	t.Helper()
 	return serveWithAllowance(t, limits, 0)
 }
 
-// serveWithAllowance is serve, with a ceiling on how many bytes the namespace may hold.
+// serveWithAllowance is serve, with a ceiling on how many bytes the volume may hold.
 //
-// It is how a mutation is refused for a reason that is nobody's mistake: a workspace that is
+// It is how a mutation is refused for a reason that is nobody's mistake: a volume that is
 // full answers EDQUOT, and that answer has to reach the caller as itself rather than as
 // anything this copy made of it.
 func serveWithAllowance(t *testing.T, limits httprest.Limits, allowance int64) *served {
@@ -92,7 +92,7 @@ func serveWithLockOptions(t *testing.T, limits httprest.Limits, allowance int64,
 
 	elsewhere, err := httprest.Dial(server.URL, &http.Client{Timeout: 10 * time.Second})
 	if err != nil {
-		t.Fatalf("dialling the namespace: %v", err)
+		t.Fatalf("dialling the volume: %v", err)
 	}
 	return &served{
 		meta: meta, storage: backing, url: server.URL, server: server,
@@ -109,7 +109,7 @@ func serveWithLockOptions(t *testing.T, limits httprest.Limits, allowance int64,
 // gone takes what was being written with it.
 func (s *served) sever() { s.server.CloseClientConnections() }
 
-// mount builds a copy of the namespace and returns the storage over it, together with the
+// mount builds a copy of the volume and returns the storage over it, together with the
 // copy itself so that a test may compare it against the source node for node.
 func mount(t *testing.T, s *served) (*replicated.Storage, *sqlite.Replica) {
 	t.Helper()
@@ -120,7 +120,7 @@ func mount(t *testing.T, s *served) (*replicated.Storage, *sqlite.Replica) {
 	}
 	remote, err := httprest.DialWithSilence(s.url, &http.Client{Timeout: 10 * time.Second}, s.silence)
 	if err != nil {
-		t.Fatalf("dialling the namespace: %v", err)
+		t.Fatalf("dialling the volume: %v", err)
 	}
 	mounted, err := replicated.New(t.Context(), replica, remote)
 	if err != nil {
@@ -144,12 +144,12 @@ func buildFailure(t *testing.T, s *served) error {
 
 	remote, err := httprest.Dial(s.url, &http.Client{Timeout: 10 * time.Second})
 	if err != nil {
-		t.Fatalf("dialling the namespace: %v", err)
+		t.Fatalf("dialling the volume: %v", err)
 	}
 	mounted, err := replicated.New(t.Context(), replica, remote)
 	if err == nil {
 		mounted.Close()
-		t.Fatal("the copy was built; this namespace cannot be replicated and building one is a claim that it can")
+		t.Fatal("the copy was built; this volume cannot be replicated and building one is a claim that it can")
 	}
 	return err
 }
@@ -247,7 +247,7 @@ type eventFaults struct {
 	stale bool
 	// refusePicture refuses a snapshot, which is the step a first mount fails at.
 	refusePicture bool
-	// pictureDelay is how long each frame of a picture is held back, so that a namespace can
+	// pictureDelay is how long each frame of a picture is held back, so that a volume can
 	// be written to throughout one.
 	pictureDelay time.Duration
 	// eventDelay is how long each frame of a change stream is held back, which is what a
@@ -280,7 +280,7 @@ func (f *eventFaults) serveStream(w http.ResponseWriter, r *http.Request, resumi
 		f.mu.Unlock()
 		// A status nobody promised, which is what a server that cannot serve looks like from
 		// the other end: the outcome is unknown, and this side must not read it as an answer
-		// about the namespace.
+		// about the volume.
 		http.Error(w, "the event channel is out of order", http.StatusServiceUnavailable)
 		return
 	}
@@ -384,7 +384,7 @@ func (f *eventFaults) servePicture(w http.ResponseWriter, r *http.Request) {
 }
 
 // heldBack delays every frame of a response, so that a picture takes long enough for the
-// namespace to be written to while it is being taken.
+// volume to be written to while it is being taken.
 type heldBack struct {
 	http.ResponseWriter
 	delay time.Duration
@@ -409,7 +409,7 @@ func mountWithGrace(t *testing.T, s *served, grace time.Duration) (*replicated.S
 	}
 	remote, err := httprest.DialWithSilence(s.url, &http.Client{Timeout: 10 * time.Second}, s.silence)
 	if err != nil {
-		t.Fatalf("dialling the namespace: %v", err)
+		t.Fatalf("dialling the volume: %v", err)
 	}
 	mounted, err := replicated.NewWithConfirmationGrace(t.Context(), replica, remote, grace)
 	if err != nil {
@@ -429,7 +429,7 @@ func mountWithOptions(t *testing.T, s *served, options replicated.Options) (*rep
 	}
 	remote, err := httprest.DialWithSilence(s.url, &http.Client{Timeout: 10 * time.Second}, s.silence)
 	if err != nil {
-		t.Fatalf("dialling the namespace: %v", err)
+		t.Fatalf("dialling the volume: %v", err)
 	}
 	mounted, err := replicated.NewWithOptions(t.Context(), replica, remote, options)
 	if err != nil {
@@ -532,7 +532,7 @@ type node struct {
 	metastore.Node
 }
 
-// walkSource reads the whole tree out of the namespace's own metastore, which is the one path
+// walkSource reads the whole tree out of the volume's own metastore, which is the one path
 // to it that does not run through anything under test.
 func walkSource(t *testing.T, s *served) []node {
 	t.Helper()
@@ -591,16 +591,16 @@ func requireSameTree(t *testing.T, source, copied []node) {
 	for _, want := range source {
 		got, present := byPath[want.Path]
 		if !present {
-			t.Fatalf("the copy does not hold %q, which the namespace does", want.Path)
+			t.Fatalf("the copy does not hold %q, which the volume does", want.Path)
 		}
 		if got.ID != want.ID || got.Mode != want.Mode || got.Size != want.Size ||
 			!got.ModTime.Equal(want.ModTime) || !got.AccessTime.Equal(want.AccessTime) {
-			t.Fatalf("the copy holds %q as %+v, the namespace holds it as %+v", want.Path, got.Node, want.Node)
+			t.Fatalf("the copy holds %q as %+v, the volume holds it as %+v", want.Path, got.Node, want.Node)
 		}
 	}
 }
 
-// requireCaughtUp waits until the copy has applied everything the namespace has recorded, so
+// requireCaughtUp waits until the copy has applied everything the volume has recorded, so
 // that a comparison afterwards is between two settled trees rather than a race.
 //
 // It is not what any assertion turns on: what is asserted is the tree, and this only decides
@@ -612,22 +612,22 @@ func requireCaughtUp(t *testing.T, s *served, r *sqlite.Replica) {
 	for {
 		committed, err := s.meta.CommittedPosition(t.Context())
 		if err != nil {
-			t.Fatalf("reading the position the namespace was last changed at: %v", err)
+			t.Fatalf("reading the position the volume was last changed at: %v", err)
 		}
 		if r.Position() == committed {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the copy stands at position %d and the namespace was last changed at %d",
+			t.Fatalf("the copy stands at position %d and the volume was last changed at %d",
 				r.Position(), committed)
 		}
 		time.Sleep(time.Millisecond)
 	}
 }
 
-// requireRecordedPast waits until the namespace itself has recorded a change later than at.
+// requireRecordedPast waits until the volume itself has recorded a change later than at.
 //
-// It is how a test knows a mutation has reached the namespace without asking the copy, which is
+// It is how a test knows a mutation has reached the volume without asking the copy, which is
 // what is under test. The waiting is not the assertion: what is asserted is what the caller is
 // told once the stream behind it goes.
 func requireRecordedPast(t *testing.T, s *served, at metastore.Position) {
@@ -637,20 +637,20 @@ func requireRecordedPast(t *testing.T, s *served, at metastore.Position) {
 	for {
 		committed, err := s.meta.CommittedPosition(t.Context())
 		if err != nil {
-			t.Fatalf("reading the position the namespace was last changed at: %v", err)
+			t.Fatalf("reading the position the volume was last changed at: %v", err)
 		}
 		if committed > at {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the namespace still stands at position %d, and the change made through the copy should have reached it", committed)
+			t.Fatalf("the volume still stands at position %d, and the change made through the copy should have reached it", committed)
 		}
 		time.Sleep(time.Millisecond)
 	}
 }
 
 // requireErrno fails unless err carries the errno wanted, and never accepts one that reads as
-// a fact about the namespace when the truth is that it could not be answered for.
+// a fact about the volume when the truth is that it could not be answered for.
 func requireErrno(t *testing.T, what string, err error, want error) {
 	t.Helper()
 
@@ -658,7 +658,7 @@ func requireErrno(t *testing.T, what string, err error, want error) {
 		t.Fatalf("%s succeeded, and the answer is one this copy cannot know", what)
 	}
 	if errors.Is(err, os.ErrNotExist) && !errors.Is(want, os.ErrNotExist) {
-		t.Fatalf("%s failed with %v; \"no such file\" is a claim about the namespace, and the truth is that this copy could not be believed", what, err)
+		t.Fatalf("%s failed with %v; \"no such file\" is a claim about the volume, and the truth is that this copy could not be believed", what, err)
 	}
 	if !errors.Is(err, want) {
 		t.Fatalf("%s failed with %v, want %v", what, err, want)
@@ -666,12 +666,12 @@ func requireErrno(t *testing.T, what string, err error, want error) {
 }
 
 // write puts content at path through a client of its own, which is how a second machine
-// changes the namespace.
+// changes the volume.
 func write(t *testing.T, s *served, at, content string) {
 	t.Helper()
 
 	if err := s.elsewhere.Write(t.Context(), at, []byte(content)); err != nil {
-		t.Fatalf("writing %q into the namespace: %v", at, err)
+		t.Fatalf("writing %q into the volume: %v", at, err)
 	}
 }
 
@@ -679,7 +679,7 @@ func mkdir(t *testing.T, s *served, at string) {
 	t.Helper()
 
 	if err := s.elsewhere.Mkdir(t.Context(), at); err != nil {
-		t.Fatalf("making %q in the namespace: %v", at, err)
+		t.Fatalf("making %q in the volume: %v", at, err)
 	}
 }
 
@@ -758,7 +758,7 @@ func requireHolding(t *testing.T, mounted *replicated.Storage, at string) time.D
 // It is the failure no other injection here produces. A server that is closed, a stream that
 // is ended, a status that is refused — all of those arrive at the mount as an event. A flow
 // that is simply no longer carried arrives as nothing at all, which is byte for byte what a
-// namespace nobody is writing to looks like. Telling those two apart is the entire basis on
+// volume nobody is writing to looks like. Telling those two apart is the entire basis on
 // which a copy may be answered from, so it is the one that has to be tested.
 type blackhole struct {
 	frozen atomic.Bool
@@ -768,7 +768,7 @@ type blackhole struct {
 }
 
 // interpose puts a relay in front of the server and points everything mounted afterwards at
-// it. What changes the namespace in these tests keeps reaching the server directly, so a
+// it. What changes the volume in these tests keeps reaching the server directly, so a
 // mount can be cut off from it while it goes on moving.
 func (s *served) interpose(t *testing.T, silence time.Duration) *blackhole {
 	t.Helper()

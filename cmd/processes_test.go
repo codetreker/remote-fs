@@ -206,7 +206,7 @@ type runningServer struct {
 }
 
 func localStoreServerArgs(root, quota string) []string {
-	return []string{"-listen", "127.0.0.1:0", "-local-store", root, "-workspace", "workspace", "-quota", quota}
+	return []string{"-listen", "127.0.0.1:0", "-local-store", root, "-volume", "workspace", "-quota", quota}
 }
 
 func startLocalStoreServerBinary(t *testing.T, root, quota string, args ...string) *runningServer {

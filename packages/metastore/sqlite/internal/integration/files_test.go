@@ -19,7 +19,7 @@ func ownedRetainedStore(t *testing.T, allowance int64, options sqlite.Options) (
 	t.Helper()
 	path := database(t)
 	owned, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
-		Database: path, Namespace: "workspace", Allowance: allowance,
+		Database: path, Volume: "workspace", Allowance: allowance,
 		SQLite: options, Locks: locking.DefaultOptions(), Initialize: true,
 	})
 	if err != nil {
@@ -348,13 +348,13 @@ func detachRecoveryFiles(t *testing.T, f objectIntegrityFixture) {
 	damageDatabase(t, f.path, `DELETE FROM entries WHERE node = (SELECT id FROM nodes WHERE content = ?)`, f.foreign)
 }
 
-func TestExclusiveOwnerReapsEveryNamespaceAtFullPendingAdmission(t *testing.T) {
+func TestExclusiveOwnerReapsEveryVolumeAtFullPendingAdmission(t *testing.T) {
 	f := newObjectIntegrityFixture(t)
 	detachRecoveryFiles(t, f)
 	options := sqlite.DefaultOptions()
 	options.ObjectLimits.MaxPendingObjects = 1
 	store, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
-		Database: f.path, Namespace: "workspace", Allowance: 100,
+		Database: f.path, Volume: "workspace", Allowance: 100,
 		SQLite: options, Locks: locking.DefaultOptions(), Initialize: true,
 	})
 	if err != nil {
@@ -374,7 +374,7 @@ func TestExclusiveOwnerReapsEveryNamespaceAtFullPendingAdmission(t *testing.T) {
 	var detached, used, retired int64
 	if err := db.QueryRow(`SELECT
 		(SELECT count(*) FROM nodes WHERE detached = 1),
-		(SELECT sum(used) FROM namespaces),
+		(SELECT sum(used) FROM volumes),
 		(SELECT count(*) FROM objects WHERE key IN (?, ?) AND state = 2)`, f.live, f.foreign).Scan(
 		&detached, &used, &retired); err != nil {
 		t.Fatal(err)
@@ -387,11 +387,11 @@ func TestExclusiveOwnerReapsEveryNamespaceAtFullPendingAdmission(t *testing.T) {
 func TestExclusiveOwnerRefusesCorruptRetainedGraphBeforeReaping(t *testing.T) {
 	f := newObjectIntegrityFixture(t)
 	detachRecoveryFiles(t, f)
-	damageDatabase(t, f.path, `UPDATE namespaces SET used = 0 WHERE name = 'neighbour'`)
+	damageDatabase(t, f.path, `UPDATE volumes SET used = 0 WHERE name = 'neighbour'`)
 	before := historicalLeaseRows(t, f.path)
 	beforeSchema := schemaOf(t, f.path)
 	store, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
-		Database: f.path, Namespace: "workspace", Allowance: 100,
+		Database: f.path, Volume: "workspace", Allowance: 100,
 		SQLite: sqlite.DefaultOptions(), Locks: locking.DefaultOptions(), Initialize: true,
 	})
 	if store != nil {
@@ -419,7 +419,7 @@ func TestExclusiveOwnerReapRollsBackObjectAndQuotaChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	store, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
-		Database: f.path, Namespace: "workspace", Allowance: 100,
+		Database: f.path, Volume: "workspace", Allowance: 100,
 		SQLite: sqlite.DefaultOptions(), Locks: locking.DefaultOptions(), Initialize: true,
 	})
 	if store != nil {

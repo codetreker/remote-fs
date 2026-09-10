@@ -60,15 +60,15 @@ func TestAbandonRefusesAnObjectInAnUnknownState(t *testing.T) {
 
 func openWithObjectLimits(
 	t *testing.T,
-	path, namespace string,
+	path, volume string,
 	limits sqlite.ObjectLimits,
 ) *sqlite.Store {
 	t.Helper()
 	store, err := sqlite.OpenWithObjectLimits(
-		t.Context(), path, namespace, 0, sqlite.DefaultWindow(), limits,
+		t.Context(), path, volume, 0, sqlite.DefaultWindow(), limits,
 	)
 	if err != nil {
-		t.Fatalf("opening %q with object limits %+v: %v", namespace, limits, err)
+		t.Fatalf("opening %q with object limits %+v: %v", volume, limits, err)
 	}
 	t.Cleanup(func() {
 		if err := store.Close(); err != nil {
@@ -264,7 +264,7 @@ func TestConcurrentReservationsCannotCrossThePendingLimits(t *testing.T) {
 	}
 }
 
-func TestNamespaceSheddingMayPushTheBacklogOverLimitAndRecoveryReopensIt(t *testing.T) {
+func TestVolumeSheddingMayPushTheBacklogOverLimitAndRecoveryReopensIt(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		prepare func(*testing.T, *sqlite.Store)
@@ -315,7 +315,7 @@ func TestNamespaceSheddingMayPushTheBacklogOverLimitAndRecoveryReopensIt(t *test
 				t.Fatal(err)
 			}
 			if !status.OverLimit || status.ReservedCount != 1 || status.GarbageCount != 1 {
-				t.Fatalf("shedding namespace data left status %+v, want one reservation, one garbage object, and over-limit", status)
+				t.Fatalf("shedding volume data left status %+v, want one reservation, one garbage object, and over-limit", status)
 			}
 			if _, err := first.Reserve(t.Context(), "blocked", 1); !errors.Is(err, syscall.EAGAIN) {
 				t.Fatalf("reserving while over-limit: %v, want EAGAIN", err)
@@ -419,7 +419,7 @@ func TestCommitMayAuthoritativelyReplaceAReservationWithLargerGarbage(t *testing
 	}
 }
 
-func TestObjectStatusAccountsForReservedAndGarbageBytesPerNamespace(t *testing.T) {
+func TestObjectStatusAccountsForReservedAndGarbageBytesPerVolume(t *testing.T) {
 	path := database(t)
 	store := open(t, path, "workspace", 0)
 	other := open(t, path, "other", 0)
@@ -520,7 +520,7 @@ func TestObjectStatusAccountsForReservedAndGarbageBytesPerNamespace(t *testing.T
 		t.Fatal(err)
 	}
 	if want := (sqlite.ObjectStatus{ReservedCount: 1, ReservedBytes: 100}); foreign != want {
-		t.Fatalf("the neighbouring namespace reports %+v, want %+v", foreign, want)
+		t.Fatalf("the neighbouring volume reports %+v, want %+v", foreign, want)
 	}
 }
 

@@ -21,11 +21,11 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// NewStorage produces a fresh, empty namespace. Run calls it once per case, so cases
+// NewStorage produces a fresh, empty volume. Run calls it once per case, so cases
 // never observe each other's writes.
 type NewStorage func(t *testing.T) storage.Storage
 
-// NewBoundedStorage produces a namespace that can be served from an embedded process
+// NewBoundedStorage produces a volume that can be served from an embedded process
 // without materialising an unbounded read or listing.
 type NewBoundedStorage func(t *testing.T) storage.BoundedStorage
 
@@ -123,7 +123,7 @@ var cases = []testCase{
 			if err != nil {
 				t.Fatalf("stat %q: %v", p, err)
 			}
-			// Zero is what a namespace that never filled this in reports, and it would
+			// Zero is what a volume that never filled this in reports, and it would
 			// compare equal for every node — a mountpoint above it would hand one node's
 			// bytes to a descriptor open on another and never say so.
 			if attr.ID == 0 {
@@ -150,10 +150,10 @@ var cases = []testCase{
 		}
 	}},
 
-	// A rename is the case R-FS-5 turns on, and it is the one every namespace can answer:
+	// A rename is the case R-FS-5 turns on, and it is the one every volume can answer:
 	// a name changes and a node does not.
 	//
-	// Whether a *write* keeps a node's identity is deliberately not asked here. A namespace
+	// Whether a *write* keeps a node's identity is deliberately not asked here. A volume
 	// that keeps its tree separately from its bytes repoints the node and keeps it; one over
 	// a host filesystem stages the new contents beside the old and renames them into place,
 	// which is the only way to make the replacement atomic there and gives the host's own
@@ -169,14 +169,14 @@ var cases = []testCase{
 	}},
 
 	// A name removed and then created again is deliberately not asked about either. A
-	// namespace with its own numbering never reuses one; a host filesystem hands the number
+	// volume with its own numbering never reuses one; a host filesystem hands the number
 	// back as soon as the node holding it is gone, so a name recreated at once can come back
 	// with the number that just left.
 	//
 	// That is a gap rather than a bounded cost, and it is written down as one. A recycled
 	// identity makes the comparison above a mount miss, so the mount keeps the number it
 	// already gave the kernel for a node that is gone — which is R-FS-5's third clause
-	// failing, on a namespace over a host filesystem. Minting never reusing a number does
+	// failing, on a volume over a host filesystem. Minting never reusing a number does
 	// not repair it: the harm is an already-minted number naming a second node.
 	{"a name that holds a new node holds a new identity", func(t *testing.T, s storage.Storage) {
 		mustSucceed(t, s.Write(ctx(t), "doc", []byte("one")))
@@ -223,18 +223,18 @@ var cases = []testCase{
 		}
 	}},
 
-	{"a fresh namespace is empty", func(t *testing.T, s storage.Storage) {
+	{"a fresh volume is empty", func(t *testing.T, s storage.Storage) {
 		entries, err := s.List(ctx(t), "")
 		mustSucceed(t, err)
 		if len(entries) != 0 {
-			t.Fatalf("fresh namespace lists %v, want nothing", entries)
+			t.Fatalf("fresh volume lists %v, want nothing", entries)
 		}
 	}},
 
 	// The root is not a node the caller put there, so removing it, moving it, or putting
-	// something else in its place are not operations the namespace offers. A namespace
+	// something else in its place are not operations the volume offers. A volume
 	// whose root is gone answers ENOENT to everything afterwards — "that file is not
-	// there" when the truth is that the namespace is not there, which is the one lie this
+	// there" when the truth is that the volume is not there, which is the one lie this
 	// contract exists to prevent.
 	//
 	// EBUSY is what the kernel answers for the equivalent. rmdir("/") and rename with "/"
@@ -265,7 +265,7 @@ var cases = []testCase{
 	// These four need no rule of their own — the root is a directory that is already
 	// there, and each operation's rule for such a node settles it. They are here because
 	// the empty path arrives at them by a route no other case takes, and because on a
-	// namespace backed by a directory the answers come from the operating system, which
+	// volume backed by a directory the answers come from the operating system, which
 	// answers these the same way: unlink("/") is EISDIR, mkdir("/") is EEXIST.
 	{"making a node at the root fails as it would for any directory that is already there", func(t *testing.T, s storage.Storage) {
 		mustFail(t, s.Create(ctx(t), ""), syscall.EEXIST)
@@ -675,7 +675,7 @@ var cases = []testCase{
 	// Replacing a file's contents is not a request to change its permissions. Somebody
 	// who sets a file to 0600 would otherwise find it back at whatever a new file gets
 	// after the next write. Every settable bit, not only the nine permission bits: a
-	// namespace that keeps Perm() alone drops a setuid bit with nothing said.
+	// volume that keeps Perm() alone drops a setuid bit with nothing said.
 	{"a write keeps the mode the file already had", func(t *testing.T, s storage.Storage) {
 		for _, want := range []fs.FileMode{
 			0o600,
@@ -719,7 +719,7 @@ var cases = []testCase{
 
 	// The root is a directory that is already there, and the rule for such a node settles
 	// this: rsync -a and tar -x both set the mode and the times of the directory they are
-	// filling, and that directory is the root when the destination is the whole namespace.
+	// filling, and that directory is the root when the destination is the whole volume.
 	{"setattr changes the root like any other directory", func(t *testing.T, s storage.Storage) {
 		changed := time.Date(2004, time.July, 6, 1, 2, 3, 0, time.UTC)
 		mustSucceed(t, s.Create(ctx(t), "f"))
@@ -733,7 +733,7 @@ var cases = []testCase{
 				attr.Mode, attr.ModTime.UTC(), fs.FileMode(0o750), changed)
 		}
 		mustHoldExactly(t, s, "f")
-		// Left usable for whatever runs next, which a namespace whose root cannot be
+		// Left usable for whatever runs next, which a volume whose root cannot be
 		// entered would not be.
 		mustSucceed(t, s.SetAttr(ctx(t), "", storage.AttrChange{Mode: mode(0o755)}))
 	}},
@@ -974,7 +974,7 @@ var cases = []testCase{
 	// the same existing directory entry or different directory entries for the same
 	// existing file, rename() shall return successfully and perform no other action". The
 	// node keeps its place and its contents however either name is spelled. Nothing is
-	// destroyed, which is what an implementation counting what the namespace holds has to
+	// destroyed, which is what an implementation counting what the volume holds has to
 	// see — there is no removal here for it to credit anyone for.
 	// https://pubs.opengroup.org/onlinepubs/9799919799/functions/rename.html
 	{"rename onto itself succeeds and changes nothing", func(t *testing.T, s storage.Storage) {
@@ -1028,7 +1028,7 @@ var cases = []testCase{
 	// --- space --------------------------------------------------------------------
 
 	// Space has two permitted outcomes and no third. Any other error would leave whatever
-	// asked unable to tell "this namespace has no room of its own to report" from "the
+	// asked unable to tell "this volume has no room of its own to report" from "the
 	// room could not be measured this time", and those call for opposite reactions: the
 	// first is settled for good, the second is worth asking again.
 	//
@@ -1039,24 +1039,24 @@ var cases = []testCase{
 		spaceOf(t, s)
 	}},
 
-	// Whether a namespace has room of its own to report is a property of what it is, not
+	// Whether a volume has room of its own to report is a property of what it is, not
 	// of what it currently holds. An implementation that answered only once it had
 	// something to count would have a caller reading its refusal as a transient failure —
-	// and an empty namespace is the state anything asks about first.
-	{"whether space answers does not change over a namespace's life", func(t *testing.T, s storage.Storage) {
+	// and an empty volume is the state anything asks about first.
+	{"whether space answers does not change over a volume's life", func(t *testing.T, s storage.Storage) {
 		_, answered := spaceOf(t, s)
 
 		mustSucceed(t, s.Mkdir(ctx(t), "d"))
 		mustSucceed(t, s.Write(ctx(t), "d/f", bytes.Repeat([]byte{'x'}, 64<<10)))
 		if _, again := spaceOf(t, s); again != answered {
-			t.Fatalf("space %s for an empty namespace and %s once it held a file",
+			t.Fatalf("space %s for an empty volume and %s once it held a file",
 				answerKind(answered), answerKind(again))
 		}
 
 		mustSucceed(t, s.Remove(ctx(t), "d/f"))
 		mustSucceed(t, s.RemoveDir(ctx(t), "d"))
 		if _, again := spaceOf(t, s); again != answered {
-			t.Fatalf("space %s for an empty namespace and %s once it was empty again",
+			t.Fatalf("space %s for an empty volume and %s once it was empty again",
 				answerKind(answered), answerKind(again))
 		}
 	}},
@@ -1077,7 +1077,7 @@ var cases = []testCase{
 	}},
 
 	// Checking this on one operation is not enough. Each operation resolves the path
-	// itself, so each one is a separate chance to follow it out of the namespace.
+	// itself, so each one is a separate chance to follow it out of the volume.
 	{"every operation refuses a path outside the root", func(t *testing.T, s storage.Storage) {
 		const outside = "../outside"
 
@@ -1113,7 +1113,7 @@ var cases = []testCase{
 	}},
 }
 
-// statID is the identity the namespace reports for one name.
+// statID is the identity the volume reports for one name.
 func statID(t *testing.T, s storage.Storage, path string) uint64 {
 	t.Helper()
 	attr, err := s.Stat(ctx(t), path)
@@ -1153,10 +1153,10 @@ func summarize(b []byte) string {
 	return fmt.Sprintf("%d bytes, %s", len(b), strings.Join(runs, " then "))
 }
 
-// spaceOf asks for the room the namespace has and refuses everything the contract does
+// spaceOf asks for the room the volume has and refuses everything the contract does
 // not allow: a refusal other than ENOSYS, and an answer that could not be true of
 // anything. The second result says whether figures came back, so that a case which goes
-// on to read them says so rather than passing quietly on a namespace that refused —
+// on to read them says so rather than passing quietly on a volume that refused —
 // silence there would let an implementation satisfy the whole section by answering ENOSYS
 // to all of it.
 func spaceOf(t *testing.T, s storage.Storage) (storage.Space, bool) {

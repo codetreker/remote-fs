@@ -34,7 +34,7 @@ func TestLocalStorePersistsThroughABinaryRestartAndRefusesASecondOwner(t *testin
 	args := []string{
 		"-listen", "127.0.0.1:0",
 		"-local-store", storeRoot,
-		"-workspace", "workspace",
+		"-volume", "workspace",
 		"-quota", "8M",
 		"-max-pending-objects", "32",
 		"-max-pending-bytes", "2G",

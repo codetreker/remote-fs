@@ -65,13 +65,13 @@ func composedStore(t *testing.T, allowance int64, objects objectstore.Objects) (
 	if err != nil {
 		t.Fatalf("opening the metastore: %v", err)
 	}
-	namespace := objectstore.New(objects, meta)
+	volume := objectstore.New(objects, meta)
 	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
-			t.Errorf("closing the namespace: %v", err)
+		if err := volume.Close(); err != nil {
+			t.Errorf("closing the volume: %v", err)
 		}
 	})
-	return namespace, meta
+	return volume, meta
 }
 
 func await(t *testing.T, description string, ready func() bool) {
@@ -100,7 +100,7 @@ func TestSpaceUsesTheTighterMeasuredAvailability(t *testing.T) {
 		wantAvailable int64
 	}{
 		{name: "physical storage is tighter", available: 25, wantAvailable: 25},
-		{name: "workspace quota is tighter", available: 10000, wantAvailable: limited.MinLimit - 30},
+		{name: "volume quota is tighter", available: 10000, wantAvailable: limited.MinLimit - 30},
 		{name: "object store has no figure", availableErr: syscall.ENOSYS, wantAvailable: limited.MinLimit - 30},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -109,12 +109,12 @@ func TestSpaceUsesTheTighterMeasuredAvailability(t *testing.T) {
 				available:    test.available,
 				availableErr: test.availableErr,
 			}
-			namespace, _ := composedStore(t, limited.MinLimit, objects)
-			if err := namespace.Write(t.Context(), "f", make([]byte, 30)); err != nil {
+			volume, _ := composedStore(t, limited.MinLimit, objects)
+			if err := volume.Write(t.Context(), "f", make([]byte, 30)); err != nil {
 				t.Fatalf("writing the measured content: %v", err)
 			}
 
-			space, err := namespace.Space(t.Context())
+			space, err := volume.Space(t.Context())
 			if err != nil {
 				t.Fatalf("space: %v", err)
 			}
@@ -134,9 +134,9 @@ func TestSpacePropagatesMeasurementFailures(t *testing.T) {
 			measurementErr = errors.Join(syscall.ENOSYS, physicalFailure)
 		}
 		objects := &measuredObjects{Objects: memory.New(), availableErr: measurementErr}
-		namespace, _ := composedStore(t, limited.MinLimit, objects)
+		volume, _ := composedStore(t, limited.MinLimit, objects)
 
-		if _, err := namespace.Space(t.Context()); !errors.Is(err, physicalFailure) {
+		if _, err := volume.Space(t.Context()); !errors.Is(err, physicalFailure) {
 			t.Fatalf("space failed with %v, want the physical measurement failure", err)
 		}
 	}
@@ -144,9 +144,9 @@ func TestSpacePropagatesMeasurementFailures(t *testing.T) {
 
 func TestSpaceRejectsAnImpossiblePhysicalMeasurement(t *testing.T) {
 	objects := &measuredObjects{Objects: memory.New(), available: -1}
-	namespace, _ := composedStore(t, limited.MinLimit, objects)
+	volume, _ := composedStore(t, limited.MinLimit, objects)
 
-	if _, err := namespace.Space(t.Context()); !errors.Is(err, syscall.EIO) {
+	if _, err := volume.Space(t.Context()); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("space failed with %v, want EIO", err)
 	}
 }
@@ -159,10 +159,10 @@ func TestSpaceDoesNotHideAMetastoreFailureBehindPhysicalCapacity(t *testing.T) {
 	metaFailure := errors.New("the quota ledger is unavailable")
 	store := &wrappedStore{Store: meta, spaceErr: metaFailure}
 	objects := &measuredObjects{Objects: memory.New(), available: 100}
-	namespace := objectstore.New(objects, store)
-	t.Cleanup(func() { _ = namespace.Close() })
+	volume := objectstore.New(objects, store)
+	t.Cleanup(func() { _ = volume.Close() })
 
-	if _, err := namespace.Space(t.Context()); !errors.Is(err, metaFailure) {
+	if _, err := volume.Space(t.Context()); !errors.Is(err, metaFailure) {
 		t.Fatalf("space failed with %v, want the metastore failure", err)
 	}
 	if calls := objects.availableAsk.Load(); calls != 0 {
@@ -205,12 +205,12 @@ func TestCloseReleasesBothHalvesInOrderAndReturnsBothFailures(t *testing.T) {
 		closeErr: objectsFailure,
 		closed:   func() { trace.add("objects") },
 	}
-	namespace := objectstore.New(objects, store)
+	volume := objectstore.New(objects, store)
 
 	const callers = 8
 	results := make(chan error, callers)
 	for range callers {
-		go func() { results <- namespace.Close() }()
+		go func() { results <- volume.Close() }()
 	}
 	for range callers {
 		err := <-results
@@ -289,20 +289,20 @@ func TestAnotherStorageCannotCollectALiveReservation(t *testing.T) {
 	}
 }
 
-func TestCloseDrainsAnAdmittedNamespaceOperation(t *testing.T) {
+func TestCloseDrainsAnAdmittedVolumeOperation(t *testing.T) {
 	objects := &blockedPutObjects{
 		Objects: memory.New(),
 		started: make(chan struct{}),
 		release: make(chan struct{}),
 		closed:  make(chan struct{}),
 	}
-	namespace, _ := composedStore(t, limited.MinLimit, objects)
+	volume, _ := composedStore(t, limited.MinLimit, objects)
 	written := make(chan error, 1)
-	go func() { written <- namespace.Write(t.Context(), "f", []byte("content")) }()
+	go func() { written <- volume.Write(t.Context(), "f", []byte("content")) }()
 	<-objects.started
 
 	closed := make(chan error, 1)
-	go func() { closed <- namespace.Close() }()
+	go func() { closed <- volume.Close() }()
 	select {
 	case <-objects.closed:
 		t.Fatal("the object store closed while an admitted write was still in progress")
@@ -313,7 +313,7 @@ func TestCloseDrainsAnAdmittedNamespaceOperation(t *testing.T) {
 	for !refused {
 		late := make(chan error, 1)
 		go func() {
-			_, err := namespace.Space(t.Context())
+			_, err := volume.Space(t.Context())
 			late <- err
 		}()
 		select {
@@ -326,10 +326,10 @@ func TestCloseDrainsAnAdmittedNamespaceOperation(t *testing.T) {
 				t.Fatalf("late operation failed with %v before close ownership was visible", err)
 			}
 			if time.Now().After(deadline) {
-				t.Fatal("close never began refusing new namespace operations")
+				t.Fatal("close never began refusing new volume operations")
 			}
 		case <-time.After(100 * time.Millisecond):
-			t.Fatal("a namespace operation arriving during close blocked behind the close gate")
+			t.Fatal("a volume operation arriving during close blocked behind the close gate")
 		}
 	}
 	close(objects.release)
@@ -346,9 +346,9 @@ func TestCloseDrainsAnAdmittedNamespaceOperation(t *testing.T) {
 	}
 }
 
-func TestClosedNamespaceOperationsFailWithEIO(t *testing.T) {
-	namespace, _ := composedStore(t, limited.MinLimit, memory.New())
-	if err := namespace.Close(); err != nil {
+func TestClosedVolumeOperationsFailWithEIO(t *testing.T) {
+	volume, _ := composedStore(t, limited.MinLimit, memory.New())
+	if err := volume.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 	mode := storage.Attr{}.Mode
@@ -356,18 +356,18 @@ func TestClosedNamespaceOperationsFailWithEIO(t *testing.T) {
 		name string
 		run  func() error
 	}{
-		{name: "stat", run: func() error { _, err := namespace.Stat(t.Context(), "f"); return err }},
-		{name: "setattr", run: func() error { return namespace.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}) }},
-		{name: "list", run: func() error { _, err := namespace.List(t.Context(), ""); return err }},
-		{name: "read", run: func() error { _, err := namespace.Read(t.Context(), "f"); return err }},
-		{name: "write", run: func() error { return namespace.Write(t.Context(), "f", nil) }},
-		{name: "create", run: func() error { return namespace.Create(t.Context(), "f") }},
-		{name: "mkdir", run: func() error { return namespace.Mkdir(t.Context(), "d") }},
-		{name: "remove", run: func() error { return namespace.Remove(t.Context(), "f") }},
-		{name: "removedir", run: func() error { return namespace.RemoveDir(t.Context(), "d") }},
-		{name: "rename", run: func() error { return namespace.Rename(t.Context(), "from", "to") }},
-		{name: "space", run: func() error { _, err := namespace.Space(t.Context()); return err }},
-		{name: "sweep", run: func() error { _, err := namespace.Sweep(t.Context(), 1); return err }},
+		{name: "stat", run: func() error { _, err := volume.Stat(t.Context(), "f"); return err }},
+		{name: "setattr", run: func() error { return volume.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}) }},
+		{name: "list", run: func() error { _, err := volume.List(t.Context(), ""); return err }},
+		{name: "read", run: func() error { _, err := volume.Read(t.Context(), "f"); return err }},
+		{name: "write", run: func() error { return volume.Write(t.Context(), "f", nil) }},
+		{name: "create", run: func() error { return volume.Create(t.Context(), "f") }},
+		{name: "mkdir", run: func() error { return volume.Mkdir(t.Context(), "d") }},
+		{name: "remove", run: func() error { return volume.Remove(t.Context(), "f") }},
+		{name: "removedir", run: func() error { return volume.RemoveDir(t.Context(), "d") }},
+		{name: "rename", run: func() error { return volume.Rename(t.Context(), "from", "to") }},
+		{name: "space", run: func() error { _, err := volume.Space(t.Context()); return err }},
+		{name: "sweep", run: func() error { _, err := volume.Sweep(t.Context(), 1); return err }},
 	} {
 		t.Run(operation.name, func(t *testing.T) {
 			if err := operation.run(); !errors.Is(err, syscall.EIO) {
@@ -476,7 +476,7 @@ func (s *blockedMetastore) Garbage(ctx context.Context, limit int) ([]metastore.
 	return s.Store.Garbage(ctx, limit)
 }
 
-func TestCloseDrainsEveryAdmittedNamespaceMethod(t *testing.T) {
+func TestCloseDrainsEveryAdmittedVolumeMethod(t *testing.T) {
 	mode := storage.Attr{}.Mode
 	for _, operation := range []struct {
 		name   string
@@ -511,30 +511,30 @@ func TestCloseDrainsEveryAdmittedNamespaceMethod(t *testing.T) {
 			}
 			objectClosed := make(chan struct{})
 			objects := &measuredObjects{Objects: memory.New(), closed: func() { close(objectClosed) }}
-			namespace := objectstore.New(objects, blocked)
+			volume := objectstore.New(objects, blocked)
 			await(t, "the initial maintenance probe", func() bool {
-				return !namespace.MaintenanceStatus().LastSweepTime.IsZero()
+				return !volume.MaintenanceStatus().LastSweepTime.IsZero()
 			})
 			blocked.enabled.Store(true)
 			var releaseOnce sync.Once
 			release := func() { releaseOnce.Do(func() { close(blocked.release) }) }
 			t.Cleanup(func() {
 				release()
-				_ = namespace.Close()
+				_ = volume.Close()
 			})
 
 			finished := make(chan error, 1)
-			go func() { finished <- operation.run(namespace) }()
+			go func() { finished <- operation.run(volume) }()
 			select {
 			case <-blocked.started:
 			case <-time.After(2 * time.Second):
-				t.Fatal("the namespace operation never reached its dependency")
+				t.Fatal("the volume operation never reached its dependency")
 			}
 			closed := make(chan error, 1)
-			go func() { closed <- namespace.Close() }()
+			go func() { closed <- volume.Close() }()
 			select {
 			case <-objectClosed:
-				t.Fatal("the object store closed while the namespace operation was admitted")
+				t.Fatal("the object store closed while the volume operation was admitted")
 			case <-time.After(10 * time.Millisecond):
 			}
 			release()
@@ -572,39 +572,39 @@ func (o *maintenanceObjects) failDeletes(err error) {
 
 func TestMaintenanceStatusRetainsAndClearsSweepFailures(t *testing.T) {
 	objects := &maintenanceObjects{Objects: memory.New()}
-	namespace, _ := composedStore(t, limited.MinLimit, objects)
+	volume, _ := composedStore(t, limited.MinLimit, objects)
 	ctx := t.Context()
 
-	if err := namespace.Write(ctx, "f", []byte("first")); err != nil {
+	if err := volume.Write(ctx, "f", []byte("first")); err != nil {
 		t.Fatalf("writing the first contents: %v", err)
 	}
 	failure := errors.New("garbage deletion failed")
 	objects.failDeletes(failure)
-	if err := namespace.Write(ctx, "f", []byte("second")); err != nil {
+	if err := volume.Write(ctx, "f", []byte("second")); err != nil {
 		t.Fatalf("the committed replacement was changed by maintenance failure: %v", err)
 	}
 
 	var failed objectstore.MaintenanceStatus
 	await(t, "the failed mutation-triggered sweep", func() bool {
-		failed = namespace.MaintenanceStatus()
+		failed = volume.MaintenanceStatus()
 		return errors.Is(failed.LastSweepError, failure)
 	})
 	if failed.LastSweepTime.IsZero() || failed.LastSweepRemoved != 0 || !errors.Is(failed.LastSweepError, failure) {
 		t.Fatalf("failed maintenance status is %+v, want the retained delete failure", failed)
 	}
-	if removed, err := namespace.Sweep(ctx, 0); err != nil || removed != 0 {
+	if removed, err := volume.Sweep(ctx, 0); err != nil || removed != 0 {
 		t.Fatalf("zero-limit sweep removed %d objects (%v), want a no-op", removed, err)
 	}
-	if afterNoop := namespace.MaintenanceStatus(); afterNoop != failed {
+	if afterNoop := volume.MaintenanceStatus(); afterNoop != failed {
 		t.Fatalf("zero-limit sweep changed status from %+v to %+v", failed, afterNoop)
 	}
 
 	objects.failDeletes(nil)
-	removed, err := namespace.Sweep(ctx, 10)
+	removed, err := volume.Sweep(ctx, 10)
 	if err != nil || removed != 1 {
 		t.Fatalf("recovered sweep removed %d objects (%v), want one", removed, err)
 	}
-	recovered := namespace.MaintenanceStatus()
+	recovered := volume.MaintenanceStatus()
 	if recovered.LastSweepTime.Before(failed.LastSweepTime) || recovered.LastSweepRemoved != 1 || recovered.LastSweepError != nil {
 		t.Fatalf("recovered maintenance status is %+v, want one removal and no failure", recovered)
 	}
@@ -616,7 +616,7 @@ func TestPeriodicMaintenanceRetriesATransientFailureWithoutAnotherMutation(t *te
 	if err != nil {
 		t.Fatalf("opening the metastore: %v", err)
 	}
-	namespace, err := objectstore.NewWithOptions(objects, meta, objectstore.Options{
+	volume, err := objectstore.NewWithOptions(objects, meta, objectstore.Options{
 		SweepInterval: 10 * time.Millisecond,
 		SweepBatch:    1,
 	})
@@ -624,15 +624,15 @@ func TestPeriodicMaintenanceRetriesATransientFailureWithoutAnotherMutation(t *te
 		t.Fatalf("creating background maintenance: %v", err)
 	}
 	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
-			t.Errorf("closing the namespace: %v", err)
+		if err := volume.Close(); err != nil {
+			t.Errorf("closing the volume: %v", err)
 		}
 	})
 	await(t, "the initial maintenance pass", func() bool {
-		return !namespace.MaintenanceStatus().LastSweepTime.IsZero()
+		return !volume.MaintenanceStatus().LastSweepTime.IsZero()
 	})
 
-	if err := namespace.Write(t.Context(), "f", []byte("first")); err != nil {
+	if err := volume.Write(t.Context(), "f", []byte("first")); err != nil {
 		t.Fatalf("writing initial contents: %v", err)
 	}
 	first, err := meta.Stat(t.Context(), "f")
@@ -641,12 +641,12 @@ func TestPeriodicMaintenanceRetriesATransientFailureWithoutAnotherMutation(t *te
 	}
 	failure := errors.New("transient delete failure")
 	objects.failDeletes(failure)
-	if err := namespace.Write(t.Context(), "f", []byte("replacement")); err != nil {
+	if err := volume.Write(t.Context(), "f", []byte("replacement")); err != nil {
 		t.Fatalf("writing replacement contents: %v", err)
 	}
 	var failedAt time.Time
 	await(t, "the transient maintenance failure", func() bool {
-		status := namespace.MaintenanceStatus()
+		status := volume.MaintenanceStatus()
 		if errors.Is(status.LastSweepError, failure) {
 			failedAt = status.LastSweepTime
 			return true
@@ -656,13 +656,13 @@ func TestPeriodicMaintenanceRetriesATransientFailureWithoutAnotherMutation(t *te
 
 	objects.failDeletes(nil)
 	await(t, "the periodic retry after backend recovery", func() bool {
-		status := namespace.MaintenanceStatus()
+		status := volume.MaintenanceStatus()
 		_, getErr := objects.Get(t.Context(), string(first.Content))
 		return status.LastSweepTime.After(failedAt) && status.LastSweepError == nil && errors.Is(getErr, syscall.ENOENT)
 	})
-	content, err := namespace.Read(t.Context(), "f")
+	content, err := volume.Read(t.Context(), "f")
 	if err != nil || string(content) != "replacement" {
-		t.Fatalf("the recovered namespace reads %q (%v), want replacement", content, err)
+		t.Fatalf("the recovered volume reads %q (%v), want replacement", content, err)
 	}
 }
 
@@ -712,8 +712,8 @@ func TestSweepPreservesObjectAndMetastoreFailures(t *testing.T) {
 	deleteFailure := errors.New("the second object could not be deleted")
 	forgetFailure := errors.New("the first deletion could not be recorded")
 	objects := &secondDeleteFails{Objects: memory.New(), failure: deleteFailure}
-	namespace := objectstore.New(objects, &forgetFails{Store: meta, failure: forgetFailure})
-	t.Cleanup(func() { _ = namespace.Close() })
+	volume := objectstore.New(objects, &forgetFails{Store: meta, failure: forgetFailure})
+	t.Cleanup(func() { _ = volume.Close() })
 	ctx := t.Context()
 
 	for _, name := range []string{"first", "second"} {
@@ -725,11 +725,11 @@ func TestSweepPreservesObjectAndMetastoreFailures(t *testing.T) {
 		}
 	}
 
-	removed, err := namespace.Sweep(ctx, 10)
+	removed, err := volume.Sweep(ctx, 10)
 	if removed != 1 || !errors.Is(err, deleteFailure) || !errors.Is(err, forgetFailure) {
 		t.Fatalf("sweep removed %d objects with %v, want one removal and both failures", removed, err)
 	}
-	status := namespace.MaintenanceStatus()
+	status := volume.MaintenanceStatus()
 	if status.LastSweepRemoved != 1 || !errors.Is(status.LastSweepError, deleteFailure) ||
 		!errors.Is(status.LastSweepError, forgetFailure) {
 		t.Fatalf("maintenance status is %+v, want one removal and both failures", status)
@@ -742,7 +742,7 @@ func TestBackgroundMaintenanceOwnsItsLifetime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("opening the metastore: %v", err)
 	}
-	namespace, err := objectstore.NewWithOptions(objects, meta, objectstore.Options{
+	volume, err := objectstore.NewWithOptions(objects, meta, objectstore.Options{
 		SweepInterval: 25 * time.Millisecond,
 		SweepBatch:    4,
 	})
@@ -750,13 +750,13 @@ func TestBackgroundMaintenanceOwnsItsLifetime(t *testing.T) {
 		t.Fatalf("creating background maintenance: %v", err)
 	}
 	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
-			t.Errorf("closing the namespace: %v", err)
+		if err := volume.Close(); err != nil {
+			t.Errorf("closing the volume: %v", err)
 		}
 	})
 
 	ctx := t.Context()
-	if err := namespace.Write(ctx, "f", []byte("garbage after removal")); err != nil {
+	if err := volume.Write(ctx, "f", []byte("garbage after removal")); err != nil {
 		t.Fatalf("writing the file: %v", err)
 	}
 	node, err := meta.Stat(ctx, "f")
@@ -770,7 +770,7 @@ func TestBackgroundMaintenanceOwnsItsLifetime(t *testing.T) {
 	deadline := time.NewTimer(2 * time.Second)
 	defer deadline.Stop()
 	for {
-		status := namespace.MaintenanceStatus()
+		status := volume.MaintenanceStatus()
 		_, getErr := objects.Get(ctx, string(node.Content))
 		if errors.Is(getErr, syscall.ENOENT) && !status.LastSweepTime.IsZero() && status.LastSweepError == nil {
 			break
@@ -813,21 +813,21 @@ func TestExplicitSweepsAreSerialized(t *testing.T) {
 		entered: make(chan struct{}, 2),
 		release: make(chan struct{}),
 	}
-	namespace := objectstore.New(memory.New(), gated)
-	t.Cleanup(func() { _ = namespace.Close() })
+	volume := objectstore.New(memory.New(), gated)
+	t.Cleanup(func() { _ = volume.Close() })
 	await(t, "the initial maintenance probe", func() bool {
-		return !namespace.MaintenanceStatus().LastSweepTime.IsZero()
+		return !volume.MaintenanceStatus().LastSweepTime.IsZero()
 	})
 	gated.enabled.Store(true)
 
 	results := make(chan error, 2)
 	go func() {
-		_, err := namespace.Sweep(t.Context(), 1)
+		_, err := volume.Sweep(t.Context(), 1)
 		results <- err
 	}()
 	<-gated.entered
 	go func() {
-		_, err := namespace.Sweep(t.Context(), 1)
+		_, err := volume.Sweep(t.Context(), 1)
 		results <- err
 	}()
 
@@ -876,17 +876,17 @@ func TestConcurrentMutationsDoNotLoseAnEventDrivenSweep(t *testing.T) {
 		started: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	namespace, meta := composedStore(t, limited.MinLimit, objects)
+	volume, meta := composedStore(t, limited.MinLimit, objects)
 	ctx := t.Context()
-	if err := namespace.Write(ctx, "f", []byte("initial")); err != nil {
+	if err := volume.Write(ctx, "f", []byte("initial")); err != nil {
 		t.Fatalf("writing initial contents: %v", err)
 	}
 
 	first := make(chan error, 1)
-	go func() { first <- namespace.Write(ctx, "f", []byte("first replacement")) }()
+	go func() { first <- volume.Write(ctx, "f", []byte("first replacement")) }()
 	<-objects.started
 	second := make(chan error, 1)
-	go func() { second <- namespace.Write(ctx, "f", []byte("second replacement")) }()
+	go func() { second <- volume.Write(ctx, "f", []byte("second replacement")) }()
 	select {
 	case err := <-second:
 		if err != nil {
@@ -907,9 +907,9 @@ func TestConcurrentMutationsDoNotLoseAnEventDrivenSweep(t *testing.T) {
 
 func TestEventDrivenMaintenanceDrainsMoreThanOneBatch(t *testing.T) {
 	objects := memory.New()
-	namespace, meta := composedStore(t, 4*limited.MinLimit, objects)
+	volume, meta := composedStore(t, 4*limited.MinLimit, objects)
 	await(t, "the initial maintenance probe", func() bool {
-		return !namespace.MaintenanceStatus().LastSweepTime.IsZero()
+		return !volume.MaintenanceStatus().LastSweepTime.IsZero()
 	})
 
 	const files = 20
@@ -920,7 +920,7 @@ func TestEventDrivenMaintenanceDrainsMoreThanOneBatch(t *testing.T) {
 			t.Fatalf("removing %q directly from the tree: %v", name, err)
 		}
 	}
-	if err := namespace.Write(t.Context(), "trigger", nil); err != nil {
+	if err := volume.Write(t.Context(), "trigger", nil); err != nil {
 		t.Fatalf("signaling event-driven maintenance: %v", err)
 	}
 	await(t, "every full maintenance batch to requeue its remainder", func() bool {
@@ -967,7 +967,7 @@ func TestCloseCancelsAndWaitsForBackgroundMaintenance(t *testing.T) {
 	blocking := &cancellationGarbageStore{
 		Store: meta, started: make(chan struct{}), failure: errors.Join(syscall.EIO, context.Canceled),
 	}
-	namespace, err := objectstore.NewWithOptions(memory.New(), blocking, objectstore.Options{
+	volume, err := objectstore.NewWithOptions(memory.New(), blocking, objectstore.Options{
 		SweepInterval: time.Millisecond,
 		SweepBatch:    1,
 	})
@@ -981,7 +981,7 @@ func TestCloseCancelsAndWaitsForBackgroundMaintenance(t *testing.T) {
 	}
 
 	closed := make(chan error, 1)
-	go func() { closed <- namespace.Close() }()
+	go func() { closed <- volume.Close() }()
 	select {
 	case err := <-closed:
 		if err != nil {
@@ -990,10 +990,10 @@ func TestCloseCancelsAndWaitsForBackgroundMaintenance(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("close did not cancel the background sweep")
 	}
-	if _, err := namespace.Sweep(t.Context(), 1); !errors.Is(err, syscall.EIO) {
+	if _, err := volume.Sweep(t.Context(), 1); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("sweep after close returned %v, want EIO", err)
 	}
-	if status := namespace.MaintenanceStatus(); status.LastSweepTime.IsZero() || !errors.Is(status.LastSweepError, syscall.EIO) {
+	if status := volume.MaintenanceStatus(); status.LastSweepTime.IsZero() || !errors.Is(status.LastSweepError, syscall.EIO) {
 		t.Fatalf("shutdown cancellation was not retained honestly: %+v", status)
 	}
 }
@@ -1006,8 +1006,8 @@ func TestCloseCancelsAndWaitsForEventDrivenMaintenance(t *testing.T) {
 	blocking := &cancellationGarbageStore{
 		Store: meta, started: make(chan struct{}), failure: errors.Join(syscall.EIO, context.Canceled),
 	}
-	namespace := objectstore.New(memory.New(), blocking)
-	if err := namespace.Write(t.Context(), "f", []byte("content")); err != nil {
+	volume := objectstore.New(memory.New(), blocking)
+	if err := volume.Write(t.Context(), "f", []byte("content")); err != nil {
 		t.Fatalf("writing the event-driven trigger: %v", err)
 	}
 	select {
@@ -1017,7 +1017,7 @@ func TestCloseCancelsAndWaitsForEventDrivenMaintenance(t *testing.T) {
 	}
 
 	closed := make(chan error, 1)
-	go func() { closed <- namespace.Close() }()
+	go func() { closed <- volume.Close() }()
 	select {
 	case err := <-closed:
 		if err != nil {
@@ -1026,7 +1026,7 @@ func TestCloseCancelsAndWaitsForEventDrivenMaintenance(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("close did not cancel the event-driven sweep")
 	}
-	if status := namespace.MaintenanceStatus(); status.LastSweepTime.IsZero() || !errors.Is(status.LastSweepError, syscall.EIO) {
+	if status := volume.MaintenanceStatus(); status.LastSweepTime.IsZero() || !errors.Is(status.LastSweepError, syscall.EIO) {
 		t.Fatalf("event-worker shutdown cancellation was not retained honestly: %+v", status)
 	}
 }
@@ -1038,7 +1038,7 @@ func TestCloseRetainsAnIndependentBackgroundFailure(t *testing.T) {
 	}
 	failure := errors.New("the maintenance store failed while shutdown began")
 	blocking := &cancellationGarbageStore{Store: meta, started: make(chan struct{}), failure: failure}
-	namespace, err := objectstore.NewWithOptions(memory.New(), blocking, objectstore.Options{
+	volume, err := objectstore.NewWithOptions(memory.New(), blocking, objectstore.Options{
 		SweepInterval: time.Millisecond,
 		SweepBatch:    1,
 	})
@@ -1050,10 +1050,10 @@ func TestCloseRetainsAnIndependentBackgroundFailure(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("background maintenance never started")
 	}
-	if err := namespace.Close(); err != nil {
+	if err := volume.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	status := namespace.MaintenanceStatus()
+	status := volume.MaintenanceStatus()
 	if status.LastSweepTime.IsZero() || !errors.Is(status.LastSweepError, failure) {
 		t.Fatalf("shutdown lost the independent maintenance failure: %+v", status)
 	}
@@ -1067,7 +1067,7 @@ func TestCloseRetainsFailuresBeyondSQLiteShapedCancellation(t *testing.T) {
 	independent := errors.New("the object service also failed")
 	failure := errors.Join(context.Canceled, syscall.EIO, independent)
 	blocking := &cancellationGarbageStore{Store: meta, started: make(chan struct{}), failure: failure}
-	namespace, err := objectstore.NewWithOptions(memory.New(), blocking, objectstore.Options{
+	volume, err := objectstore.NewWithOptions(memory.New(), blocking, objectstore.Options{
 		SweepInterval: time.Millisecond,
 		SweepBatch:    1,
 	})
@@ -1079,10 +1079,10 @@ func TestCloseRetainsFailuresBeyondSQLiteShapedCancellation(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("background maintenance never started")
 	}
-	if err := namespace.Close(); err != nil {
+	if err := volume.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	status := namespace.MaintenanceStatus()
+	status := volume.MaintenanceStatus()
 	if status.LastSweepTime.IsZero() || !errors.Is(status.LastSweepError, independent) {
 		t.Fatalf("shutdown hid the failure beyond SQLite-shaped cancellation: %+v", status)
 	}
@@ -1110,14 +1110,14 @@ func TestClosePreservesAQueuedMutationForStartupMaintenance(t *testing.T) {
 	observed := &closeObservedGarbageStore{
 		Store: meta, started: make(chan struct{}), stopped: make(chan struct{}),
 	}
-	namespace := objectstore.New(blocked, observed)
+	volume := objectstore.New(blocked, observed)
 	<-observed.started
 
 	written := make(chan error, 1)
-	go func() { written <- namespace.Write(t.Context(), "f", []byte("replacement")) }()
+	go func() { written <- volume.Write(t.Context(), "f", []byte("replacement")) }()
 	<-blocked.started
 	closed := make(chan error, 1)
-	go func() { closed <- namespace.Close() }()
+	go func() { closed <- volume.Close() }()
 	select {
 	case <-observed.stopped:
 	case <-time.After(2 * time.Second):
@@ -1128,7 +1128,7 @@ func TestClosePreservesAQueuedMutationForStartupMaintenance(t *testing.T) {
 		t.Fatalf("admitted replacement: %v", err)
 	}
 	if err := <-closed; err != nil {
-		t.Fatalf("closing the first namespace: %v", err)
+		t.Fatalf("closing the first volume: %v", err)
 	}
 
 	reopenedMeta, err := sqlite.Open(t.Context(), database, "workspace", limited.MinLimit, sqlite.DefaultWindow())

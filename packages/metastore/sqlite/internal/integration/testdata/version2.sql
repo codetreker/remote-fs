@@ -3,7 +3,7 @@
 
 CREATE TABLE nodes (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	namespace  INTEGER NOT NULL REFERENCES namespaces(id),
+	volume  INTEGER NOT NULL REFERENCES volumes(id),
 	mode       INTEGER NOT NULL,
 	size       INTEGER NOT NULL,
 	atime_sec  INTEGER NOT NULL,
@@ -14,16 +14,16 @@ CREATE TABLE nodes (
 );
 
 CREATE TABLE entries (
-	namespace INTEGER NOT NULL REFERENCES namespaces(id),
+	volume INTEGER NOT NULL REFERENCES volumes(id),
 	parent    INTEGER NOT NULL REFERENCES nodes(id),
 	name      BLOB    NOT NULL,
 	node      INTEGER NOT NULL REFERENCES nodes(id),
-	PRIMARY KEY (namespace, parent, name)
+	PRIMARY KEY (volume, parent, name)
 ) WITHOUT ROWID;
 
 CREATE INDEX entries_by_node ON entries (node);
 
-CREATE TABLE namespaces (
+CREATE TABLE volumes (
 	id   INTEGER PRIMARY KEY AUTOINCREMENT,
 	name TEXT    NOT NULL UNIQUE,
 	root INTEGER NOT NULL,
@@ -32,7 +32,7 @@ CREATE TABLE namespaces (
 
 CREATE TABLE objects (
 	key          TEXT PRIMARY KEY,
-	namespace    INTEGER NOT NULL REFERENCES namespaces(id),
+	volume    INTEGER NOT NULL REFERENCES volumes(id),
 	state        INTEGER NOT NULL,
 	size         INTEGER NOT NULL,
 	digest       BLOB,
@@ -40,12 +40,12 @@ CREATE TABLE objects (
 	created_nsec INTEGER NOT NULL
 );
 
-CREATE INDEX objects_by_state ON objects (namespace, state, created_sec);
+CREATE INDEX objects_by_state ON objects (volume, state, created_sec);
 CREATE INDEX nodes_by_content ON nodes (content);
 
 CREATE TABLE changes (
 	position      INTEGER PRIMARY KEY AUTOINCREMENT,
-	namespace     INTEGER NOT NULL REFERENCES namespaces(id),
+	volume     INTEGER NOT NULL REFERENCES volumes(id),
 	kind          INTEGER NOT NULL,
 	parent        INTEGER NOT NULL,
 	name          BLOB,
@@ -63,10 +63,10 @@ CREATE TABLE changes (
 	recorded_nsec INTEGER NOT NULL
 );
 
-CREATE INDEX changes_by_namespace ON changes (namespace, position);
+CREATE INDEX changes_by_volume ON changes (volume, position);
 
 CREATE TABLE logs (
-	namespace          INTEGER PRIMARY KEY REFERENCES namespaces(id),
+	volume          INTEGER PRIMARY KEY REFERENCES volumes(id),
 	incarnation        TEXT    NOT NULL,
 	committed_position INTEGER NOT NULL,
 	trimmed_through    INTEGER NOT NULL,

@@ -148,7 +148,7 @@ func TestMutationScopeHeaderRejectsMalformedAndMisplacedProofs(t *testing.T) {
 		t.Fatalf("duplicate header status = %d", answer.Code)
 	}
 	if _, err := h.storage.Stat(context.Background(), "f"); !errors.Is(err, syscall.ENOENT) {
-		t.Fatalf("malformed scope changed namespace: %v", err)
+		t.Fatalf("malformed scope changed volume: %v", err)
 	}
 }
 
@@ -413,7 +413,7 @@ func TestHTTPDelayedAcquisitionPreservesUnseenCancellation(t *testing.T) {
 	}
 }
 
-func TestHTTPObjectNamespaceLockContract(t *testing.T) {
+func TestHTTPObjectVolumeLockContract(t *testing.T) {
 	lockcontract.Run(t, func(t *testing.T, options locking.Options) lockcontract.Fixture {
 		_, client := lockServerFixtureWithOptions(t, options)
 		return lockcontract.Fixture{Storage: client, Locks: client, Scope: client.Scope}

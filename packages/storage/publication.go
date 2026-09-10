@@ -8,7 +8,7 @@ import (
 	"syscall"
 )
 
-// PublicationResult describes the namespace effect, independently of the operation's
+// PublicationResult describes the volume effect, independently of the operation's
 // returned error. An applied mutation may still fail while confirming durability.
 type PublicationResult uint8
 
@@ -18,7 +18,7 @@ const (
 	PublicationUnknown
 )
 
-// PublicationAccounting prepares a charge for an atomic namespace transition using
+// PublicationAccounting prepares a charge for an atomic volume transition using
 // its actual previous and next byte counts. Hooks run under publication ordering and
 // must perform only bounded internal accounting, without external I/O or callbacks.
 // Growth is reserved before publication; shrinking bytes remain charged until Applied.
@@ -46,7 +46,7 @@ func (e *publicationAccountingUncertain) Is(target error) bool  { return target 
 
 // IsPublicationAccountingUncertain identifies failed settlement, including a failed
 // NotApplied unwind, or an Unknown publication. Such failures require fencing further
-// accounting and publication until recovery, even when the namespace effect is known.
+// accounting and publication until recovery, even when the volume effect is known.
 // Preparation refusal with a successful unwind remains an ordinary operation error.
 // Wrapped and joined errors retain this distinction and all underlying causes.
 func IsPublicationAccountingUncertain(err error) bool {

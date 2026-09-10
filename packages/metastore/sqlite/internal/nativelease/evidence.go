@@ -16,7 +16,7 @@ type Evidence struct {
 	MaxLease   time.Duration
 }
 
-// Witness stores independent, workspace-anchored evidence. Advance must durably publish
+// Witness stores independent, volume-anchored evidence. Advance must durably publish
 // the exact next generation before returning. Repeating the same record is idempotent.
 type Witness interface {
 	Load() (Evidence, bool, error)

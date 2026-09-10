@@ -21,8 +21,8 @@ import (
 func TestLocalStatusReportsEveryBoundedAndDurablePart(t *testing.T) {
 	failed := errors.New("disk still busy")
 	status := localstore.Status{
-		Workspace: "workspace",
-		Space:     storage.Space{Total: 1000, Used: 250, Avail: 700},
+		Volume: "workspace",
+		Space:  storage.Space{Total: 1000, Used: 250, Avail: 700},
 		Objects: sqlite.ObjectStatus{
 			ReservedCount:   2,
 			ReservedBytes:   30,
@@ -58,8 +58,8 @@ func TestLocalStatusReportsEveryBoundedAndDurablePart(t *testing.T) {
 	}
 	line := formatLocalStatus(status, objectstore.Options{SweepInterval: 45 * time.Second, SweepBatch: 17}, 19)
 	for _, phrase := range []string{
-		`workspace "workspace" in store`,
-		"250 of 1000 workspace bytes used, 700 writable",
+		`volume "workspace" in store`,
+		"250 of 1000 volume bytes used, 700 writable",
 		"800 physical bytes available",
 		"2 reserved objects (30 bytes)",
 		"4 unresolved objects (60 bytes)",
@@ -115,19 +115,19 @@ func TestLockStatusReportsLifecycleWithoutCapabilityMaterial(t *testing.T) {
 
 func TestLockStatusFailureSuppressesPartialOperationalFigures(t *testing.T) {
 	failure := errors.New("lock state unavailable")
-	ns := opened{
+	v := opened{
 		what: "workspace", statusName: "local-store",
 		status:     func(context.Context) (string, error) { return "partial capacity", nil },
 		lockStatus: func(context.Context) (locking.Status, error) { return locking.Status{}, failure },
 	}
 	var output bytes.Buffer
-	handleHangup(t.Context(), ns, &output)
+	handleHangup(t.Context(), v, &output)
 	if !strings.Contains(output.String(), failure.Error()) || strings.Contains(output.String(), "partial capacity") {
 		t.Fatalf("failed status was not isolated: %s", output.String())
 	}
 }
 
-func TestMissingLockStatusClosesNamespaceAndPreservesCloseFailure(t *testing.T) {
+func TestMissingLockStatusClosesVolumeAndPreservesCloseFailure(t *testing.T) {
 	failure := errors.New("ownership close uncertain")
 	closed := false
 	_, err := withLockStatus(opened{close: func() error { closed = true; return failure }}, nil)
@@ -138,8 +138,8 @@ func TestMissingLockStatusClosesNamespaceAndPreservesCloseFailure(t *testing.T) 
 
 func TestUnavailableLockAuthorityCannotAnnounceReadiness(t *testing.T) {
 	for _, failure := range []error{nil, errors.New("recovery status read failed")} {
-		namespace, metadata := newTestNamespace(t)
-		handler, err := httprest.NewHandler(namespace, metadata)
+		volume, metadata := newTestVolume(t)
+		handler, err := httprest.NewHandler(volume, metadata)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -147,11 +147,11 @@ func TestUnavailableLockAuthorityCannotAnnounceReadiness(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ns := opened{what: "workspace", lockStatus: func(context.Context) (locking.Status, error) {
+		v := opened{what: "workspace", lockStatus: func(context.Context) (locking.Status, error) {
 			return locking.Status{Unavailable: true}, failure
 		}}
 		var output bytes.Buffer
-		err = serveWithGrace(newServer(handler), listener, ns, &output, time.Millisecond)
+		err = serveWithGrace(newServer(handler), listener, v, &output, time.Millisecond)
 		closeErr := listener.Close()
 		if err == nil || closeErr != nil {
 			t.Fatalf("unavailable authority startup returned %v; listener close %v", err, closeErr)
@@ -164,11 +164,11 @@ func TestUnavailableLockAuthorityCannotAnnounceReadiness(t *testing.T) {
 
 func TestLocalStatusFailureDoesNotPrintPartialFigures(t *testing.T) {
 	failure := errors.New("cannot read physical capacity")
-	ns := opened{what: "workspace in local store /data", statusName: "local-store", status: func(context.Context) (string, error) {
+	v := opened{what: "workspace in local store /data", statusName: "local-store", status: func(context.Context) (string, error) {
 		return "plausible but incomplete figures", failure
 	}}
 	var output bytes.Buffer
-	handleHangup(t.Context(), ns, &output)
+	handleHangup(t.Context(), v, &output)
 	if !strings.Contains(output.String(), failure.Error()) {
 		t.Fatalf("status failure was not reported: %s", output.String())
 	}

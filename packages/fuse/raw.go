@@ -71,18 +71,18 @@ func (m *rawMetadata) begin(cancel <-chan struct{}, request rawRequest) (<-chan 
 
 type rawFilesystem struct {
 	gofuse.RawFileSystem
-	ns *namespace
+	volume *volume
 }
 
-func newRawFilesystem(raw gofuse.RawFileSystem, ns *namespace) gofuse.RawFileSystem {
-	ns.raw = &rawMetadata{limit: ns.sessionOptions.MaxOperations, requests: make(map[<-chan struct{}]rawRequest)}
-	return &rawFilesystem{RawFileSystem: raw, ns: ns}
+func newRawFilesystem(raw gofuse.RawFileSystem, v *volume) gofuse.RawFileSystem {
+	v.raw = &rawMetadata{limit: v.sessionOptions.MaxOperations, requests: make(map[<-chan struct{}]rawRequest)}
+	return &rawFilesystem{RawFileSystem: raw, volume: v}
 }
 
 func (r *rawFilesystem) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.Status {
-	forwarded, done, ok := r.ns.raw.begin(cancel, rawRequest{kind: rawFlush, owner: storage.LockOwner(input.LockOwner)})
+	forwarded, done, ok := r.volume.raw.begin(cancel, rawRequest{kind: rawFlush, owner: storage.LockOwner(input.LockOwner)})
 	if !ok {
-		r.ns.fence(fmt.Errorf("flush owner metadata capacity exhausted: %w", syscall.EIO))
+		r.volume.fence(fmt.Errorf("flush owner metadata capacity exhausted: %w", syscall.EIO))
 		return gofuse.EIO
 	}
 	defer done()
@@ -90,12 +90,12 @@ func (r *rawFilesystem) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gof
 }
 
 func (r *rawFilesystem) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
-	forwarded, done, ok := r.ns.raw.begin(cancel, rawRequest{
+	forwarded, done, ok := r.volume.raw.begin(cancel, rawRequest{
 		kind: rawRelease, owner: storage.LockOwner(input.LockOwner),
 		flockUnlock: input.ReleaseFlags&gofuse.FUSE_RELEASE_FLOCK_UNLOCK != 0,
 	})
 	if !ok {
-		r.ns.fence(fmt.Errorf("release owner metadata capacity exhausted: %w", syscall.EIO))
+		r.volume.fence(fmt.Errorf("release owner metadata capacity exhausted: %w", syscall.EIO))
 		// Release must still retire the retained file if owner cleanup cannot be
 		// associated with this call. The session fence retires all its owners.
 		r.RawFileSystem.Release(nil, input)

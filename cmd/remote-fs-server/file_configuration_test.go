@@ -17,7 +17,7 @@ import (
 )
 
 func fileConfigArgs(root string) []string {
-	return []string{"-listen", "127.0.0.1:0", "-local-store", root, "-workspace", "workspace", "-quota", "1M"}
+	return []string{"-listen", "127.0.0.1:0", "-local-store", root, "-volume", "workspace", "-quota", "1M"}
 }
 
 func TestFileDefaultsPreserveTheOneGiBFileCeiling(t *testing.T) {
@@ -98,16 +98,16 @@ func TestNativeFileLimitsReachTheLocalStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ns, err := open(config)
+	v, err := open(config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := ns.close(); err != nil {
-			t.Errorf("close native file namespace: %v", err)
+		if err := v.close(); err != nil {
+			t.Errorf("close native file volume: %v", err)
 		}
 	})
-	files := ns.namespace.(storage.FileStorage)
+	files := v.volume.(storage.FileStorage)
 	session, err := files.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
 	if err != nil {
 		t.Fatal(err)
@@ -134,8 +134,8 @@ func TestNativeFileLimitsReachTheLocalStore(t *testing.T) {
 		}
 		t.Fatalf("second native reference returned %v, want EAGAIN", err)
 	}
-	if _, err := ns.namespace.Stat(t.Context(), "second"); !errors.Is(err, syscall.ENOENT) {
-		t.Fatalf("refused open created a namespace entry: %v", err)
+	if _, err := v.volume.Stat(t.Context(), "second"); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("refused open created a volume entry: %v", err)
 	}
 	if _, err := first.WriteAt(t.Context(), 4096, []byte("x")); !errors.Is(err, syscall.EFBIG) {
 		t.Fatalf("write beyond configured file size returned %v, want EFBIG", err)

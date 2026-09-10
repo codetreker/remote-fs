@@ -11,16 +11,16 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
 )
 
-func validateNodeValues(ctx context.Context, db sqlvalue.Queryer, namespace *int64) error {
-	return validateNodeValuesVersion(ctx, db, namespace, schema.Version())
+func validateNodeValues(ctx context.Context, db sqlvalue.Queryer, volume *int64) error {
+	return validateNodeValuesVersion(ctx, db, volume, schema.Version())
 }
 
-func validateNodeValuesVersion(ctx context.Context, db sqlvalue.Queryer, namespace *int64, version int) error {
+func validateNodeValuesVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, version int) error {
 	where := ""
 	var args []any
-	if namespace != nil {
-		where = "WHERE namespace = ? AND "
-		args = []any{*namespace}
+	if volume != nil {
+		where = "WHERE volume = ? AND "
+		args = []any{*volume}
 	} else {
 		where = "WHERE "
 	}
@@ -50,8 +50,8 @@ func validateNodeValuesVersion(ctx context.Context, db sqlvalue.Queryer, namespa
 }
 
 // validateVersionOneNodeRelationships checks the entry table before migration 0002 replaces
-// it. Version 1 has no entry namespace column, so the parent and child nodes are the only proof
-// that an entry stays within one namespace. Running this before the rebuild prevents its inner
+// it. Version 1 has no entry volume column, so the parent and child nodes are the only proof
+// that an entry stays within one volume. Running this before the rebuild prevents its inner
 // join from silently discarding an entry whose endpoint is missing.
 func validateVersionOneNodeRelationships(ctx context.Context, db sqlvalue.Queryer) error {
 	var invalidRoots int64
@@ -59,12 +59,12 @@ func validateVersionOneNodeRelationships(ctx context.Context, db sqlvalue.Querye
 		SELECT coalesce(sum(CASE
 			WHEN typeof(ns.root) != 'integer'
 				OR root.id IS NULL
-				OR root.namespace != ns.id
+				OR root.volume != ns.id
 				OR typeof(root.mode) != 'integer'
 				OR (root.mode & ?) = 0
 			THEN 1 ELSE 0
 		END), 0)
-		FROM namespaces ns
+		FROM volumes ns
 		LEFT JOIN nodes root ON root.id = ns.root`, int64(fs.ModeDir)).Scan(&invalidRoots); err != nil {
 		return err
 	}
@@ -80,9 +80,9 @@ func validateVersionOneNodeRelationships(ctx context.Context, db sqlvalue.Querye
 				ELSE 0
 			END AS invalid
 			FROM nodes n
-			LEFT JOIN namespaces ns ON ns.id = n.namespace
+			LEFT JOIN volumes ns ON ns.id = n.volume
 			LEFT JOIN entries e ON e.node = n.id
-			GROUP BY n.id, n.namespace, ns.id, ns.root
+			GROUP BY n.id, n.volume, ns.id, ns.root
 		)`).Scan(&invalidNodes); err != nil {
 		return err
 	}
@@ -92,7 +92,7 @@ func validateVersionOneNodeRelationships(ctx context.Context, db sqlvalue.Querye
 		SELECT coalesce(sum(CASE
 			WHEN parent.id IS NULL
 				OR child.id IS NULL
-				OR parent.namespace != child.namespace
+				OR parent.volume != child.volume
 				OR typeof(parent.mode) != 'integer'
 				OR (parent.mode & ?) = 0
 			THEN 1 ELSE 0
@@ -104,62 +104,62 @@ func validateVersionOneNodeRelationships(ctx context.Context, db sqlvalue.Querye
 	}
 	if invalidRoots != 0 || invalidNodes != 0 || invalidEntries != 0 {
 		return fmt.Errorf(
-			"schema version 1 holds %d invalid namespace roots, %d nodes with invalid entry cardinality, and %d entries with invalid endpoints: %w",
+			"schema version 1 holds %d invalid volume roots, %d nodes with invalid entry cardinality, and %d entries with invalid endpoints: %w",
 			invalidRoots, invalidNodes, invalidEntries, syscall.EIO)
 	}
 
 	var unreachableNodes int64
 	if err := db.QueryRowContext(ctx, `
-		WITH RECURSIVE reachable(namespace, node) AS (
-			SELECT id, root FROM namespaces
+		WITH RECURSIVE reachable(volume, node) AS (
+			SELECT id, root FROM volumes
 			UNION
-			SELECT reachable.namespace, e.node
+			SELECT reachable.volume, e.node
 			FROM reachable
 			JOIN entries e ON e.parent = reachable.node
 			JOIN nodes child
 				ON child.id = e.node
-				AND child.namespace = reachable.namespace
+				AND child.volume = reachable.volume
 		)
 		SELECT count(*)
 		FROM nodes n
 		LEFT JOIN reachable
-			ON reachable.namespace = n.namespace
+			ON reachable.volume = n.volume
 			AND reachable.node = n.id
 		WHERE reachable.node IS NULL`).Scan(&unreachableNodes); err != nil {
 		return err
 	}
 	if unreachableNodes != 0 {
-		return fmt.Errorf("schema version 1 holds %d nodes outside their namespace root's tree: %w",
+		return fmt.Errorf("schema version 1 holds %d nodes outside their volume root's tree: %w",
 			unreachableNodes, syscall.EIO)
 	}
 	return nil
 }
 
-// Linked nodes form one tree per namespace. Detached nodes are regular non-root files with no
-// incoming or outgoing entries. A nil namespace validates every namespace.
+// Linked nodes form one tree per volume. Detached nodes are regular non-root files with no
+// incoming or outgoing entries. A nil volume validates every volume.
 func validateNodeRelationships(
 	ctx context.Context,
 	db sqlvalue.Queryer,
-	namespace *int64,
+	volume *int64,
 ) error {
-	return validateNodeRelationshipsVersion(ctx, db, namespace, schema.Version())
+	return validateNodeRelationshipsVersion(ctx, db, volume, schema.Version())
 }
 
 func validateNodeRelationshipsVersion(
 	ctx context.Context,
 	db sqlvalue.Queryer,
-	namespace *int64,
+	volume *int64,
 	version int,
 ) error {
-	namespaceWhere := ""
+	volumeWhere := ""
 	nodeWhere := ""
 	entryWhere := ""
 	var scopeArgs []any
-	if namespace != nil {
-		namespaceWhere = "WHERE ns.id = ?"
-		nodeWhere = "WHERE n.namespace = ?"
-		entryWhere = "WHERE e.namespace = ? OR parent.namespace = ? OR child.namespace = ?"
-		scopeArgs = []any{*namespace}
+	if volume != nil {
+		volumeWhere = "WHERE ns.id = ?"
+		nodeWhere = "WHERE n.volume = ?"
+		entryWhere = "WHERE e.volume = ? OR parent.volume = ? OR child.volume = ?"
+		scopeArgs = []any{*volume}
 	}
 
 	retainedRoot := ""
@@ -182,14 +182,14 @@ func validateNodeRelationshipsVersion(
 		SELECT coalesce(sum(CASE
 			WHEN typeof(ns.root) != 'integer'
 				OR root.id IS NULL
-				OR root.namespace != ns.id
+				OR root.volume != ns.id
 				OR typeof(root.mode) != 'integer'
 				OR (root.mode & ?) = 0`+retainedRoot+`
 			THEN 1 ELSE 0
 		END), 0)
-		FROM namespaces ns
+		FROM volumes ns
 		LEFT JOIN nodes root ON root.id = ns.root
-		`+namespaceWhere, rootArgs...).Scan(&invalidRoots); err != nil {
+		`+volumeWhere, rootArgs...).Scan(&invalidRoots); err != nil {
 		return err
 	}
 
@@ -202,31 +202,31 @@ func validateNodeRelationshipsVersion(
 				WHEN n.id = ns.root AND count(e.node) != 0 THEN 1
 				WHEN n.id != ns.root AND (
 					count(e.node) != 1
-					OR count(CASE WHEN e.namespace = n.namespace THEN 1 END) != 1
+					OR count(CASE WHEN e.volume = n.volume THEN 1 END) != 1
 				) THEN 1
 				ELSE 0
 			END AS invalid
 			FROM nodes n
-			LEFT JOIN namespaces ns ON ns.id = n.namespace
+			LEFT JOIN volumes ns ON ns.id = n.volume
 			LEFT JOIN entries e ON e.node = n.id
 			`+nodeWhere+`
-			GROUP BY n.id, n.namespace, ns.id, ns.root
+			GROUP BY n.id, n.volume, ns.id, ns.root
 		)`, nodeArgs...).Scan(&invalidNodes); err != nil {
 		return err
 	}
 
 	entryArgs := append([]any{int64(fs.ModeDir)}, scopeArgs...)
-	if namespace != nil {
-		entryArgs = append(entryArgs, *namespace, *namespace)
+	if volume != nil {
+		entryArgs = append(entryArgs, *volume, *volume)
 	}
 	var invalidEntries int64
 	if err := db.QueryRowContext(ctx, `
 		SELECT coalesce(sum(CASE
-			WHEN typeof(e.namespace) != 'integer'
+			WHEN typeof(e.volume) != 'integer'
 				OR parent.id IS NULL
 				OR child.id IS NULL
-				OR e.namespace != parent.namespace
-				OR e.namespace != child.namespace
+				OR e.volume != parent.volume
+				OR e.volume != child.volume
 				OR typeof(parent.mode) != 'integer'
 				OR (parent.mode & ?) = 0`+retainedEntry+`
 			THEN 1 ELSE 0
@@ -240,28 +240,28 @@ func validateNodeRelationshipsVersion(
 
 	if invalidRoots != 0 || invalidNodes != 0 || invalidEntries != 0 {
 		return fmt.Errorf(
-			"the database holds %d invalid namespace roots, %d nodes with invalid entry cardinality, and %d entries crossing an invalid relationship: %w",
+			"the database holds %d invalid volume roots, %d nodes with invalid entry cardinality, and %d entries crossing an invalid relationship: %w",
 			invalidRoots, invalidNodes, invalidEntries, syscall.EIO)
 	}
-	return validateNodeReachability(ctx, db, namespace, version)
+	return validateNodeReachability(ctx, db, volume, version)
 }
 
 // validateNodeReachability proves that the cardinality-checked entry graph is one tree rooted
-// at each namespace root. UNION, rather than UNION ALL, admits each stored namespace/node pair
+// at each volume root. UNION, rather than UNION ALL, admits each stored volume/node pair
 // once, so a disconnected cycle terminates and the query's work is bounded by stored state.
 func validateNodeReachability(
 	ctx context.Context,
 	db sqlvalue.Queryer,
-	namespace *int64,
+	volume *int64,
 	version int,
 ) error {
 	seedWhere := ""
 	nodeWhere := ""
 	var args []any
-	if namespace != nil {
+	if volume != nil {
 		seedWhere = "WHERE id = ?"
-		nodeWhere = " AND n.namespace = ?"
-		args = []any{*namespace, *namespace}
+		nodeWhere = " AND n.volume = ?"
+		args = []any{*volume, *volume}
 	}
 	if version >= firstRetainedFileSchemaVersion {
 		nodeWhere += " AND n.detached = 0"
@@ -269,50 +269,50 @@ func validateNodeReachability(
 
 	var unreachableNodes int64
 	if err := db.QueryRowContext(ctx, `
-		WITH RECURSIVE reachable(namespace, node) AS (
-			SELECT id, root FROM namespaces `+seedWhere+`
+		WITH RECURSIVE reachable(volume, node) AS (
+			SELECT id, root FROM volumes `+seedWhere+`
 			UNION
-			SELECT reachable.namespace, e.node
+			SELECT reachable.volume, e.node
 			FROM reachable
 			JOIN entries e
-				ON e.namespace = reachable.namespace
+				ON e.volume = reachable.volume
 				AND e.parent = reachable.node
 		)
 		SELECT count(*)
 		FROM nodes n
 		LEFT JOIN reachable
-			ON reachable.namespace = n.namespace
+			ON reachable.volume = n.volume
 			AND reachable.node = n.id
 		WHERE reachable.node IS NULL`+nodeWhere, args...).Scan(&unreachableNodes); err != nil {
 		return err
 	}
 	if unreachableNodes != 0 {
-		return fmt.Errorf("the database holds %d nodes outside their namespace root's tree: %w",
+		return fmt.Errorf("the database holds %d nodes outside their volume root's tree: %w",
 			unreachableNodes, syscall.EIO)
 	}
 	return nil
 }
 
-// validateUsedAccounting streams each namespace and its nodes in key order. File sizes are
+// validateUsedAccounting streams each volume and its nodes in key order. File sizes are
 // added only after checking that the next addition fits in int64, so a corrupt database cannot
 // wrap an aggregate into a plausible counter.
 func validateUsedAccounting(
 	ctx context.Context,
 	db sqlvalue.Queryer,
-	namespace *int64,
+	volume *int64,
 ) error {
 	where := ""
 	var args []any
-	if namespace != nil {
+	if volume != nil {
 		where = "WHERE ns.id = ?"
-		args = []any{*namespace}
+		args = []any{*volume}
 	}
 	rows, err := db.QueryContext(ctx, `
 		SELECT
 			ns.id, ns.used, typeof(ns.used),
 			n.id, n.mode, typeof(n.mode), n.size, typeof(n.size)
-		FROM namespaces ns
-		LEFT JOIN nodes n ON n.namespace = ns.id
+		FROM volumes ns
+		LEFT JOIN nodes n ON n.volume = ns.id
 		`+where+`
 		ORDER BY ns.id, n.id`, args...)
 	if err != nil {
@@ -321,8 +321,8 @@ func validateUsedAccounting(
 	defer rows.Close()
 
 	var (
-		haveNamespace      bool
-		currentNamespace   int64
+		haveVolume         bool
+		currentVolume      int64
 		recordedUsed       int64
 		recordedUsedValid  bool
 		calculatedUsed     int64
@@ -332,8 +332,8 @@ func validateUsedAccounting(
 		overflowed         int64
 		mismatched         int64
 	)
-	finishNamespace := func() {
-		if !haveNamespace {
+	finishVolume := func() {
+		if !haveVolume {
 			return
 		}
 		if calculatedOverflow {
@@ -347,25 +347,25 @@ func validateUsedAccounting(
 
 	for rows.Next() {
 		var (
-			namespaceID int64
-			usedRaw     any
-			usedType    string
-			nodeID      sql.NullInt64
-			modeRaw     any
-			modeType    string
-			sizeRaw     any
-			sizeType    string
+			volumeID int64
+			usedRaw  any
+			usedType string
+			nodeID   sql.NullInt64
+			modeRaw  any
+			modeType string
+			sizeRaw  any
+			sizeType string
 		)
 		if err := rows.Scan(
-			&namespaceID, &usedRaw, &usedType,
+			&volumeID, &usedRaw, &usedType,
 			&nodeID, &modeRaw, &modeType, &sizeRaw, &sizeType,
 		); err != nil {
 			return err
 		}
-		if !haveNamespace || namespaceID != currentNamespace {
-			finishNamespace()
-			haveNamespace = true
-			currentNamespace = namespaceID
+		if !haveVolume || volumeID != currentVolume {
+			finishVolume()
+			haveVolume = true
+			currentVolume = volumeID
 			calculatedUsed = 0
 			calculatedOverflow = false
 			recordedUsed, recordedUsedValid = sqlvalue.StoredInteger(usedRaw, usedType)
@@ -395,10 +395,10 @@ func validateUsedAccounting(
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	finishNamespace()
+	finishVolume()
 	if invalidUsed != 0 || invalidNodeValues != 0 || overflowed != 0 || mismatched != 0 {
 		return fmt.Errorf(
-			"the database holds %d namespaces with an invalid used counter, %d nodes with invalid accounting values, %d namespaces whose file sizes overflow, and %d namespaces whose used counter disagrees with their files: %w",
+			"the database holds %d volumes with an invalid used counter, %d nodes with invalid accounting values, %d volumes whose file sizes overflow, and %d volumes whose used counter disagrees with their files: %w",
 			invalidUsed, invalidNodeValues, overflowed, mismatched, syscall.EIO)
 	}
 	return nil

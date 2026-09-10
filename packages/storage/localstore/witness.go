@@ -27,14 +27,14 @@ const (
 	metastoreWitnessDigestBytes = sha256.Size
 	durableDatabaseIDBytes      = 32
 	metastoreWitnessMinBytes    = metastoreWitnessHeaderBytes + metastoreWitnessDigestBytes
-	metastoreWitnessMaxBytes    = metastoreWitnessMinBytes + MaxWorkspaceBytes + durableDatabaseIDBytes
+	metastoreWitnessMaxBytes    = metastoreWitnessMinBytes + MaxVolumeBytes + durableDatabaseIDBytes
 )
 
 var metastoreWitnessMagic = [8]byte{'R', 'F', 'S', 'M', 'E', 'T', 'A', 0}
 
 type metastoreWitnessRecord struct {
 	StoreID                localdisk.ID
-	Workspace              string
+	Volume                 string
 	State                  sqlite.DurableState
 	CheckpointedGeneration int64
 }
@@ -51,18 +51,18 @@ var _ sqlite.CommitWitness = (*metastoreWitness)(nil)
 
 func (a *rootAnchor) InspectMetastoreWitness(
 	id localdisk.ID,
-	workspace string,
+	volumeName string,
 ) (*metastoreWitness, bool, bool, error) {
-	final, finalExists, err := a.readMetastoreWitnessEntry(metastoreWitnessFilename, id, workspace)
+	final, finalExists, err := a.readMetastoreWitnessEntry(metastoreWitnessFilename, id, volumeName)
 	if err != nil {
 		return nil, false, false, err
 	}
-	stage, stageExists, err := a.readMetastoreWitnessEntry(metastoreWitnessStage, id, workspace)
+	stage, stageExists, err := a.readMetastoreWitnessEntry(metastoreWitnessStage, id, volumeName)
 	if err != nil {
 		return nil, false, false, err
 	}
 	if stageExists {
-		if finalExists && (final.StoreID != stage.StoreID || final.Workspace != stage.Workspace ||
+		if finalExists && (final.StoreID != stage.StoreID || final.Volume != stage.Volume ||
 			final.State.DatabaseID != stage.State.DatabaseID) {
 			return nil, false, false, fmt.Errorf(
 				"the local store metastore witness stage does not belong to the published witness: %w",
@@ -71,7 +71,7 @@ func (a *rootAnchor) InspectMetastoreWitness(
 		}
 	}
 	if !finalExists {
-		final = metastoreWitnessRecord{StoreID: id, Workspace: workspace}
+		final = metastoreWitnessRecord{StoreID: id, Volume: volumeName}
 	}
 	return &metastoreWitness{
 		anchor: a, record: final, exists: finalExists, checkpoint: make(chan struct{}, 1),
@@ -102,7 +102,7 @@ func (w *metastoreWitness) RemoveInterruptedStage() error {
 func (a *rootAnchor) readMetastoreWitnessEntry(
 	name string,
 	id localdisk.ID,
-	workspace string,
+	volumeName string,
 ) (metastoreWitnessRecord, bool, error) {
 	path := filepath.Join(a.path, name)
 	fd, err := unix.Openat(a.fd, name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
@@ -131,7 +131,7 @@ func (a *rootAnchor) readMetastoreWitnessEntry(
 	if err := errors.Join(validateErr, readErr, pathFailure("close local store metastore witness", path, closeErr)); err != nil {
 		return metastoreWitnessRecord{}, false, err
 	}
-	record, err := decodeMetastoreWitness(encoded, id, workspace)
+	record, err := decodeMetastoreWitness(encoded, id, volumeName)
 	if err != nil {
 		return metastoreWitnessRecord{}, false, err
 	}
@@ -141,7 +141,7 @@ func (a *rootAnchor) readMetastoreWitnessEntry(
 func decodeMetastoreWitness(
 	encoded []byte,
 	id localdisk.ID,
-	workspace string,
+	volumeName string,
 ) (metastoreWitnessRecord, error) {
 	if len(encoded) < metastoreWitnessMinBytes || len(encoded) > metastoreWitnessMaxBytes {
 		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness has an impossible length: %w", syscall.EIO)
@@ -154,27 +154,27 @@ func decodeMetastoreWitness(
 		binary.BigEndian.Uint32(encoded[60:64]) != 0 {
 		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness has an unknown header: %w", syscall.EIO)
 	}
-	workspaceBytes := int(binary.BigEndian.Uint32(encoded[16:20]))
+	volumeBytes := int(binary.BigEndian.Uint32(encoded[16:20]))
 	databaseIDBytes := int(binary.BigEndian.Uint32(encoded[20:24]))
-	if workspaceBytes > MaxWorkspaceBytes || databaseIDBytes != durableDatabaseIDBytes ||
-		len(encoded) != metastoreWitnessMinBytes+workspaceBytes+databaseIDBytes {
+	if volumeBytes > MaxVolumeBytes || databaseIDBytes != durableDatabaseIDBytes ||
+		len(encoded) != metastoreWitnessMinBytes+volumeBytes+databaseIDBytes {
 		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness has invalid identity lengths: %w", syscall.EIO)
 	}
 	if !bytes.Equal(encoded[64:80], id[:]) {
 		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness belongs to another object store: %w", syscall.EIO)
 	}
 	variableOffset := metastoreWitnessHeaderBytes
-	storedWorkspace := string(encoded[variableOffset : variableOffset+workspaceBytes])
-	databaseOffset := variableOffset + workspaceBytes
+	storedVolume := string(encoded[variableOffset : variableOffset+volumeBytes])
+	databaseOffset := variableOffset + volumeBytes
 	databaseID := string(encoded[databaseOffset : databaseOffset+databaseIDBytes])
 	digestOffset := databaseOffset + databaseIDBytes
 	digest := sha256.Sum256(encoded[:digestOffset])
 	if !bytes.Equal(encoded[digestOffset:], digest[:]) {
 		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness checksum does not match its contents: %w", syscall.EIO)
 	}
-	if storedWorkspace != workspace {
-		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness binds workspace %q, not %q: %w",
-			storedWorkspace, workspace, syscall.EIO)
+	if storedVolume != volumeName {
+		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness binds volume %q, not %q: %w",
+			storedVolume, volumeName, syscall.EIO)
 	}
 	if !validDatabaseID(databaseID) {
 		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness has an invalid database identity: %w", syscall.EIO)
@@ -191,7 +191,7 @@ func decodeMetastoreWitness(
 		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness has impossible durability counters: %w", syscall.EIO)
 	}
 	return metastoreWitnessRecord{
-		StoreID: id, Workspace: workspace, State: state, CheckpointedGeneration: checkpointed,
+		StoreID: id, Volume: volumeName, State: state, CheckpointedGeneration: checkpointed,
 	}, nil
 }
 
@@ -204,19 +204,19 @@ func checkedInt64(encoded []byte) int64 {
 }
 
 func encodeMetastoreWitness(record metastoreWitnessRecord) ([]byte, error) {
-	if record.StoreID == (localdisk.ID{}) || record.Workspace == "" ||
-		len(record.Workspace) > MaxWorkspaceBytes || !validDatabaseID(record.State.DatabaseID) ||
+	if record.StoreID == (localdisk.ID{}) || record.Volume == "" ||
+		len(record.Volume) > MaxVolumeBytes || !validDatabaseID(record.State.DatabaseID) ||
 		record.State.Generation < 0 ||
 		record.State.NodeHighWater < 0 || record.State.ChangeHighWater < 0 ||
 		record.CheckpointedGeneration < 0 || record.CheckpointedGeneration > record.State.Generation {
 		return nil, fmt.Errorf("the local store metastore witness state is invalid: %w", syscall.EIO)
 	}
-	encoded := make([]byte, metastoreWitnessMinBytes+len(record.Workspace)+len(record.State.DatabaseID))
+	encoded := make([]byte, metastoreWitnessMinBytes+len(record.Volume)+len(record.State.DatabaseID))
 	copy(encoded[:8], metastoreWitnessMagic[:])
 	binary.BigEndian.PutUint16(encoded[8:10], metastoreWitnessVersion)
 	binary.BigEndian.PutUint16(encoded[10:12], metastoreWitnessHeaderBytes)
 	binary.BigEndian.PutUint32(encoded[12:16], uint32(len(encoded)))
-	binary.BigEndian.PutUint32(encoded[16:20], uint32(len(record.Workspace)))
+	binary.BigEndian.PutUint32(encoded[16:20], uint32(len(record.Volume)))
 	binary.BigEndian.PutUint32(encoded[20:24], uint32(len(record.State.DatabaseID)))
 	binary.BigEndian.PutUint64(encoded[24:32], uint64(record.State.Generation))
 	binary.BigEndian.PutUint64(encoded[32:40], uint64(record.CheckpointedGeneration))
@@ -224,8 +224,8 @@ func encodeMetastoreWitness(record metastoreWitnessRecord) ([]byte, error) {
 	binary.BigEndian.PutUint64(encoded[48:56], uint64(record.State.ChangeHighWater))
 	copy(encoded[64:80], record.StoreID[:])
 	variableOffset := metastoreWitnessHeaderBytes
-	copy(encoded[variableOffset:], record.Workspace)
-	databaseOffset := variableOffset + len(record.Workspace)
+	copy(encoded[variableOffset:], record.Volume)
+	databaseOffset := variableOffset + len(record.Volume)
 	copy(encoded[databaseOffset:], record.State.DatabaseID)
 	digestOffset := databaseOffset + len(record.State.DatabaseID)
 	digest := sha256.Sum256(encoded[:digestOffset])
@@ -320,7 +320,7 @@ func (w *metastoreWitness) publish(record metastoreWitnessRecord) error {
 		return err
 	}
 	staged, stageExists, err := w.anchor.readMetastoreWitnessEntry(
-		metastoreWitnessStage, record.StoreID, record.Workspace,
+		metastoreWitnessStage, record.StoreID, record.Volume,
 	)
 	if err != nil {
 		return err

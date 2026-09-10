@@ -24,7 +24,7 @@ func TestMiddleRetainedChangeDeletionIsRefusedByOpenAndSince(t *testing.T) {
 			DELETE FROM changes
 			WHERE position = (
 				SELECT position FROM changes
-				WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+				WHERE volume = (SELECT id FROM volumes WHERE name = 'workspace')
 				ORDER BY position
 				LIMIT 1 OFFSET 1
 			)`)
@@ -118,29 +118,29 @@ func TestFullIntegrityRejectsPredecessorAndTrimAnchorCorruption(t *testing.T) {
 			},
 			damage: `
 				UPDATE changes SET previous_position = 0
-				WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+				WHERE volume = (SELECT id FROM volumes WHERE name = 'workspace')
 				  AND position = (
 					SELECT position FROM changes
-					WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+					WHERE volume = (SELECT id FROM volumes WHERE name = 'workspace')
 					ORDER BY position LIMIT 1 OFFSET 1
 				  )`,
 		},
 		{
 			name: "trim anchor",
 			prepare: func(t *testing.T, path string) *sqlite.Store {
-				workspace := open(t, path, "workspace", 0)
+				volume := open(t, path, "workspace", 0)
 				neighbour := open(t, path, "neighbour", 0)
 				if err := neighbour.Create(t.Context(), "gap"); err != nil {
 					t.Fatal(err)
 				}
-				if err := workspace.Create(t.Context(), "file"); err != nil {
+				if err := volume.Create(t.Context(), "file"); err != nil {
 					t.Fatal(err)
 				}
-				return workspace
+				return volume
 			},
 			damage: `
 				UPDATE logs SET trimmed_through = 1
-				WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')`,
+				WHERE volume = (SELECT id FROM volumes WHERE name = 'workspace')`,
 		},
 	}
 	for _, test := range tests {
@@ -196,7 +196,7 @@ func TestLiveReadersRejectLargeBlobScalarsBeforeMaterializingThem(t *testing.T) 
 		},
 		{
 			"global root identity",
-			`UPDATE namespaces SET root = zeroblob(4 * 1024 * 1024) WHERE name = 'workspace'`,
+			`UPDATE volumes SET root = zeroblob(4 * 1024 * 1024) WHERE name = 'workspace'`,
 			func(store *sqlite.Store) error {
 				_, err := store.DurableState(t.Context())
 				return err
@@ -294,7 +294,7 @@ func TestIntegrityWorkLimitAcceptsItsBoundaryAndRefusesTheNextRecord(t *testing.
 		t.Fatal(err)
 	}
 
-	// One namespace, three nodes, two entries, one log row, and four retained changes.
+	// One volume, three nodes, two entries, one log row, and four retained changes.
 	atBoundary, err := sqlite.OpenWithOptions(t.Context(), path, "workspace", 0, integrityOptions(11))
 	if err != nil {
 		t.Fatalf("opening at the exact integrity work limit: %v", err)
@@ -331,11 +331,11 @@ func TestObjectStatusRefusesIntegrityWorkAboveItsConfiguredLimit(t *testing.T) {
 		t.Fatalf("status one integrity record above its limit: %v, want EFBIG", err)
 	}
 	if _, err := store.Stat(t.Context(), "one"); err != nil {
-		t.Fatalf("a refused status changed the namespace: %v", err)
+		t.Fatalf("a refused status changed the volume: %v", err)
 	}
 }
 
-func TestIntegrityWorkCountIncludesForeignLabelsTouchingTheNamespace(t *testing.T) {
+func TestIntegrityWorkCountIncludesForeignLabelsTouchingTheVolume(t *testing.T) {
 	path := database(t)
 	store, err := sqlite.OpenWithOptions(
 		t.Context(), path, "workspace", 0, integrityOptions(3),
@@ -353,9 +353,9 @@ func TestIntegrityWorkCountIncludesForeignLabelsTouchingTheNamespace(t *testing.
 	}
 	db := raw(t, path)
 	if _, err := db.Exec(`
-		INSERT INTO entries (namespace, parent, name, node)
+		INSERT INTO entries (volume, parent, name, node)
 		SELECT foreign_ns.id, local_ns.root, names.name, foreign_ns.root
-		FROM namespaces local_ns, namespaces foreign_ns,
+		FROM volumes local_ns, volumes foreign_ns,
 			(SELECT CAST('hidden-one' AS BLOB) AS name UNION ALL SELECT CAST('hidden-two' AS BLOB)) names
 		WHERE local_ns.name = 'workspace' AND foreign_ns.name = 'neighbour'`); err != nil {
 		db.Close()
@@ -475,7 +475,7 @@ func TestOversizedCorruptNameIsRejectedByLengthAdmission(t *testing.T) {
 	if _, err := db.Exec(`
 		UPDATE entries
 		SET name = CAST(zeroblob(8388608) AS BLOB)
-		WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+		WHERE volume = (SELECT id FROM volumes WHERE name = 'workspace')
 		  AND name = CAST('file' AS BLOB)`); err != nil {
 		db.Close()
 		t.Fatal(err)
@@ -500,50 +500,50 @@ type objectIntegrityFixture struct {
 	reserved   metastore.Key
 	unresolved metastore.Key
 	garbage    metastore.Key
-	workspace  int64
+	volume     int64
 }
 
 func newObjectIntegrityFixture(t *testing.T) objectIntegrityFixture {
 	t.Helper()
 	path := database(t)
-	workspace, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
+	volume, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
 	if err != nil {
 		t.Fatal(err)
 	}
 	neighbour, err := sqlite.Open(t.Context(), path, "neighbour", 0, sqlite.DefaultWindow())
 	if err != nil {
-		workspace.Close()
+		volume.Close()
 		t.Fatal(err)
 	}
 
-	live := commit(t, workspace, "live", 10)
-	if err := workspace.Create(t.Context(), "copy"); err != nil {
+	live := commit(t, volume, "live", 10)
+	if err := volume.Create(t.Context(), "copy"); err != nil {
 		t.Fatal(err)
 	}
-	if err := workspace.Mkdir(t.Context(), "directory"); err != nil {
+	if err := volume.Mkdir(t.Context(), "directory"); err != nil {
 		t.Fatal(err)
 	}
-	reserved, err := workspace.Reserve(t.Context(), "reserved", 20)
+	reserved, err := volume.Reserve(t.Context(), "reserved", 20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	unresolved, err := workspace.Reserve(t.Context(), "unresolved", 25)
+	unresolved, err := volume.Reserve(t.Context(), "unresolved", 25)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := workspace.Quarantine(t.Context(), unresolved); err != nil {
+	if err := volume.Quarantine(t.Context(), unresolved); err != nil {
 		t.Fatal(err)
 	}
-	garbage, err := workspace.Reserve(t.Context(), "garbage", 30)
+	garbage, err := volume.Reserve(t.Context(), "garbage", 30)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := workspace.Abandon(t.Context(), garbage); err != nil {
+	if err := volume.Abandon(t.Context(), garbage); err != nil {
 		t.Fatal(err)
 	}
 	foreign := commit(t, neighbour, "foreign", 40)
 
-	if err := workspace.Close(); err != nil {
+	if err := volume.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := neighbour.Close(); err != nil {
@@ -559,7 +559,7 @@ func newObjectIntegrityFixture(t *testing.T) objectIntegrityFixture {
 	fixture.reserved = reserved
 	fixture.unresolved = unresolved
 	fixture.garbage = garbage
-	if err := db.QueryRow(`SELECT id FROM namespaces WHERE name = 'workspace'`).Scan(&fixture.workspace); err != nil {
+	if err := db.QueryRow(`SELECT id FROM volumes WHERE name = 'workspace'`).Scan(&fixture.volume); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -667,10 +667,10 @@ func addDisconnectedDirectories(t *testing.T, fixture objectIntegrityFixture, cy
 	defer tx.Rollback()
 	insertNode := func() int64 {
 		result, err := tx.Exec(`
-			INSERT INTO nodes (namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+			INSERT INTO nodes (volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
 			SELECT ns.id, root.mode, 0, 0, 0, 0, 0, NULL
-			FROM namespaces ns JOIN nodes root ON root.id = ns.root
-			WHERE ns.id = ?`, fixture.workspace)
+			FROM volumes ns JOIN nodes root ON root.id = ns.root
+			WHERE ns.id = ?`, fixture.volume)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -682,14 +682,14 @@ func addDisconnectedDirectories(t *testing.T, fixture objectIntegrityFixture, cy
 	}
 	first, second := insertNode(), insertNode()
 	if _, err := tx.Exec(`
-		INSERT INTO entries (namespace, parent, name, node)
-		VALUES (?, ?, CAST('child' AS BLOB), ?)`, fixture.workspace, first, second); err != nil {
+		INSERT INTO entries (volume, parent, name, node)
+		VALUES (?, ?, CAST('child' AS BLOB), ?)`, fixture.volume, first, second); err != nil {
 		t.Fatal(err)
 	}
 	if cycle {
 		if _, err := tx.Exec(`
-			INSERT INTO entries (namespace, parent, name, node)
-			VALUES (?, ?, CAST('parent' AS BLOB), ?)`, fixture.workspace, second, first); err != nil {
+			INSERT INTO entries (volume, parent, name, node)
+			VALUES (?, ?, CAST('parent' AS BLOB), ?)`, fixture.volume, second, first); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -713,11 +713,11 @@ func makeFileSizesOverflow(t *testing.T, fixture objectIntegrityFixture) {
 	}{
 		{`UPDATE objects SET size = ? WHERE key = ?`, []any{int64(math.MaxInt64), fixture.live}},
 		{`UPDATE nodes SET size = ? WHERE content = ?`, []any{int64(math.MaxInt64), fixture.live}},
-		{`INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
-		  VALUES ('overflow-byte', ?, 1, 1, NULL, 0, 0)`, []any{fixture.workspace}},
+		{`INSERT INTO objects (key, volume, state, size, digest, created_sec, created_nsec)
+		  VALUES ('overflow-byte', ?, 1, 1, NULL, 0, 0)`, []any{fixture.volume}},
 		{`UPDATE nodes SET size = 1, content = 'overflow-byte' WHERE ` + nodeNamed,
-			[]any{fixture.workspace, "copy"}},
-		{`UPDATE namespaces SET used = ? WHERE id = ?`, []any{int64(math.MaxInt64), fixture.workspace}},
+			[]any{fixture.volume, "copy"}},
+		{`UPDATE volumes SET used = ? WHERE id = ?`, []any{int64(math.MaxInt64), fixture.volume}},
 	} {
 		if _, err := tx.Exec(statement.query, statement.args...); err != nil {
 			t.Fatal(err)
@@ -728,9 +728,9 @@ func makeFileSizesOverflow(t *testing.T, fixture objectIntegrityFixture) {
 	}
 }
 
-const nodeNamed = `id = (SELECT node FROM entries WHERE namespace = ? AND name = CAST(? AS BLOB))`
+const nodeNamed = `id = (SELECT node FROM entries WHERE volume = ? AND name = CAST(? AS BLOB))`
 
-func TestOpenRefusesInconsistentNamespaceIntegrity(t *testing.T) {
+func TestOpenRefusesInconsistentVolumeIntegrity(t *testing.T) {
 	image := newObjectIntegrityImage(t)
 	tests := []struct {
 		name   string
@@ -739,7 +739,7 @@ func TestOpenRefusesInconsistentNamespaceIntegrity(t *testing.T) {
 		{"a node names a missing object", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `DELETE FROM objects WHERE key = ?`, f.live)
 		}},
-		{"a node names another namespace's object", func(t *testing.T, f objectIntegrityFixture) {
+		{"a node names another volume's object", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE nodes SET content = ?, size = 40 WHERE content = ?`, f.foreign, f.live)
 		}},
 		{"a node names a reserved object", func(t *testing.T, f objectIntegrityFixture) {
@@ -754,11 +754,11 @@ func TestOpenRefusesInconsistentNamespaceIntegrity(t *testing.T) {
 		{"a referenced object has no node", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE nodes SET content = NULL, size = 0 WHERE content = ?`, f.live)
 		}},
-		{"a referenced object has two nodes in its namespace", func(t *testing.T, f objectIntegrityFixture) {
+		{"a referenced object has two nodes in its volume", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE nodes SET content = ?, size = 10 WHERE `+nodeNamed,
-				f.live, f.workspace, "copy")
+				f.live, f.volume, "copy")
 		}},
-		{"a referenced object also has a node in another namespace", func(t *testing.T, f objectIntegrityFixture) {
+		{"a referenced object also has a node in another volume", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE nodes SET content = ?, size = 10 WHERE content = ?`, f.live, f.foreign)
 		}},
 		{"a node and its object disagree about size", func(t *testing.T, f objectIntegrityFixture) {
@@ -772,53 +772,53 @@ func TestOpenRefusesInconsistentNamespaceIntegrity(t *testing.T) {
 		}},
 		{"a directory names an object", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE nodes SET content = ?, size = 10 WHERE `+nodeNamed,
-				f.live, f.workspace, "directory")
+				f.live, f.volume, "directory")
 		}},
 		{"a non-root node has two entries", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `
-				INSERT INTO entries (namespace, parent, name, node)
+				INSERT INTO entries (volume, parent, name, node)
 				SELECT ?, root, CAST('alias' AS BLOB),
-					(SELECT node FROM entries WHERE namespace = ? AND name = CAST('live' AS BLOB))
-				FROM namespaces WHERE id = ?`, f.workspace, f.workspace, f.workspace)
+					(SELECT node FROM entries WHERE volume = ? AND name = CAST('live' AS BLOB))
+				FROM volumes WHERE id = ?`, f.volume, f.volume, f.volume)
 		}},
 		{"a non-root node has no entry", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path,
-				`DELETE FROM entries WHERE namespace = ? AND name = CAST('live' AS BLOB)`, f.workspace)
+				`DELETE FROM entries WHERE volume = ? AND name = CAST('live' AS BLOB)`, f.volume)
 		}},
 		{"the root has an entry", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `
-				INSERT INTO entries (namespace, parent, name, node)
-				SELECT id, root, CAST('root-alias' AS BLOB), root FROM namespaces WHERE id = ?`, f.workspace)
+				INSERT INTO entries (volume, parent, name, node)
+				SELECT id, root, CAST('root-alias' AS BLOB), root FROM volumes WHERE id = ?`, f.volume)
 		}},
-		{"the namespace root belongs to another namespace", func(t *testing.T, f objectIntegrityFixture) {
+		{"the volume root belongs to another volume", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `
-				UPDATE namespaces SET root = (SELECT root FROM namespaces WHERE name = 'neighbour')
-				WHERE id = ?`, f.workspace)
+				UPDATE volumes SET root = (SELECT root FROM volumes WHERE name = 'neighbour')
+				WHERE id = ?`, f.volume)
 		}},
-		{"an entry claims another namespace", func(t *testing.T, f objectIntegrityFixture) {
+		{"an entry claims another volume", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `
-				UPDATE entries SET namespace = (SELECT id FROM namespaces WHERE name = 'neighbour')
-				WHERE namespace = ? AND name = CAST('live' AS BLOB)`, f.workspace)
+				UPDATE entries SET volume = (SELECT id FROM volumes WHERE name = 'neighbour')
+				WHERE volume = ? AND name = CAST('live' AS BLOB)`, f.volume)
 		}},
-		{"a foreign entry uses this namespace as its parent", func(t *testing.T, f objectIntegrityFixture) {
+		{"a foreign entry uses this volume as its parent", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `
-				INSERT INTO entries (namespace, parent, name, node)
+				INSERT INTO entries (volume, parent, name, node)
 				SELECT foreign_ns.id, local_ns.root, CAST('hidden-parent' AS BLOB), foreign_ns.root
-				FROM namespaces local_ns, namespaces foreign_ns
-				WHERE local_ns.id = ? AND foreign_ns.name = 'neighbour'`, f.workspace)
+				FROM volumes local_ns, volumes foreign_ns
+				WHERE local_ns.id = ? AND foreign_ns.name = 'neighbour'`, f.volume)
 		}},
-		{"a foreign entry claims this namespace's child", func(t *testing.T, f objectIntegrityFixture) {
+		{"a foreign entry claims this volume's child", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `
 				UPDATE entries
-				SET namespace = (SELECT id FROM namespaces WHERE name = 'neighbour'),
-					parent = (SELECT root FROM namespaces WHERE name = 'neighbour')
-				WHERE namespace = ? AND name = CAST('copy' AS BLOB)`, f.workspace)
+				SET volume = (SELECT id FROM volumes WHERE name = 'neighbour'),
+					parent = (SELECT root FROM volumes WHERE name = 'neighbour')
+				WHERE volume = ? AND name = CAST('copy' AS BLOB)`, f.volume)
 		}},
 		{"an entry has a regular-file parent", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `
 				UPDATE entries
-				SET parent = (SELECT node FROM entries WHERE namespace = ? AND name = CAST('live' AS BLOB))
-				WHERE namespace = ? AND name = CAST('copy' AS BLOB)`, f.workspace, f.workspace)
+				SET parent = (SELECT node FROM entries WHERE volume = ? AND name = CAST('live' AS BLOB))
+				WHERE volume = ? AND name = CAST('copy' AS BLOB)`, f.volume, f.volume)
 		}},
 		{"two directories form a disconnected cycle", func(t *testing.T, f objectIntegrityFixture) {
 			addDisconnectedDirectories(t, f, true)
@@ -826,73 +826,73 @@ func TestOpenRefusesInconsistentNamespaceIntegrity(t *testing.T) {
 		{"an orphan directory heads a disconnected subtree", func(t *testing.T, f objectIntegrityFixture) {
 			addDisconnectedDirectories(t, f, false)
 		}},
-		{"the namespace used counter undercounts files", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE namespaces SET used = 9 WHERE id = ?`, f.workspace)
+		{"the volume used counter undercounts files", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE volumes SET used = 9 WHERE id = ?`, f.volume)
 		}},
-		{"the namespace used counter overcounts files", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE namespaces SET used = 11 WHERE id = ?`, f.workspace)
+		{"the volume used counter overcounts files", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE volumes SET used = 11 WHERE id = ?`, f.volume)
 		}},
-		{"the namespace used counter is not an integer", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE namespaces SET used = 'ten' WHERE id = ?`, f.workspace)
+		{"the volume used counter is not an integer", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE volumes SET used = 'ten' WHERE id = ?`, f.volume)
 		}},
 		{"an empty leaf has an invalid stored mode", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE nodes SET mode = -1 WHERE `+nodeNamed, f.workspace, "copy")
+			damageDatabase(t, f.path, `UPDATE nodes SET mode = -1 WHERE `+nodeNamed, f.volume, "copy")
 		}},
 		{"a node has an unsupported type", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE nodes SET mode = ? WHERE `+nodeNamed,
-				int64(fs.ModeSymlink|0o777), f.workspace, "copy")
+				int64(fs.ModeSymlink|0o777), f.volume, "copy")
 		}},
 		{"a node has invalid access nanoseconds", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE nodes SET atime_nsec = 1000000000 WHERE `+nodeNamed,
-				f.workspace, "copy")
+				f.volume, "copy")
 		}},
 		{"a node has a negative id", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `
 				UPDATE nodes SET id = -1 WHERE `+nodeNamed+`;
-				UPDATE entries SET node = -1 WHERE namespace = ? AND name = CAST('copy' AS BLOB)`,
-				f.workspace, "copy", f.workspace)
+				UPDATE entries SET node = -1 WHERE volume = ? AND name = CAST('copy' AS BLOB)`,
+				f.volume, "copy", f.volume)
 		}},
-		{"the namespace has a zero root id", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE namespaces SET root = 0 WHERE id = ?`, f.workspace)
+		{"the volume has a zero root id", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE volumes SET root = 0 WHERE id = ?`, f.volume)
 		}},
 		{"an entry name is text", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE entries SET name = 'text-name' WHERE namespace = ? AND name = CAST('copy' AS BLOB)`, f.workspace)
+			damageDatabase(t, f.path, `UPDATE entries SET name = 'text-name' WHERE volume = ? AND name = CAST('copy' AS BLOB)`, f.volume)
 		}},
 		{"an entry name is empty", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE entries SET name = X'' WHERE namespace = ? AND name = CAST('copy' AS BLOB)`, f.workspace)
+			damageDatabase(t, f.path, `UPDATE entries SET name = X'' WHERE volume = ? AND name = CAST('copy' AS BLOB)`, f.volume)
 		}},
 		{"an entry name is dot", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE entries SET name = X'2e' WHERE namespace = ? AND name = CAST('copy' AS BLOB)`, f.workspace)
+			damageDatabase(t, f.path, `UPDATE entries SET name = X'2e' WHERE volume = ? AND name = CAST('copy' AS BLOB)`, f.volume)
 		}},
 		{"an entry name contains a slash", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE entries SET name = CAST('bad/name' AS BLOB) WHERE namespace = ? AND name = CAST('copy' AS BLOB)`, f.workspace)
+			damageDatabase(t, f.path, `UPDATE entries SET name = CAST('bad/name' AS BLOB) WHERE volume = ? AND name = CAST('copy' AS BLOB)`, f.volume)
 		}},
 		{"an entry name contains a nul", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE entries SET name = X'626164006e616d65' WHERE namespace = ? AND name = CAST('copy' AS BLOB)`, f.workspace)
+			damageDatabase(t, f.path, `UPDATE entries SET name = X'626164006e616d65' WHERE volume = ? AND name = CAST('copy' AS BLOB)`, f.volume)
 		}},
 		{"a log has an empty incarnation", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE logs SET incarnation = '' WHERE namespace = ?`, f.workspace)
+			damageDatabase(t, f.path, `UPDATE logs SET incarnation = '' WHERE volume = ?`, f.volume)
 		}},
 		{"a committed log tail is behind its newest change", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE logs SET committed_position = 0 WHERE namespace = ?`, f.workspace)
+			damageDatabase(t, f.path, `UPDATE logs SET committed_position = 0 WHERE volume = ?`, f.volume)
 		}},
 		{"a change kind is text", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE changes SET kind = 'created' WHERE namespace = ? AND position = (SELECT min(position) FROM changes WHERE namespace = ?)`, f.workspace, f.workspace)
+			damageDatabase(t, f.path, `UPDATE changes SET kind = 'created' WHERE volume = ? AND position = (SELECT min(position) FROM changes WHERE volume = ?)`, f.volume, f.volume)
 		}},
 		{"a change carries an unsupported node type", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE changes SET mode = ? WHERE position = (
-				SELECT min(position) FROM changes WHERE namespace = ? AND node IS NOT NULL)`,
-				int64(fs.ModeSymlink|0o777), f.workspace)
+				SELECT min(position) FROM changes WHERE volume = ? AND node IS NOT NULL)`,
+				int64(fs.ModeSymlink|0o777), f.volume)
 		}},
 		{"a change carries file bytes without a content key", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE changes SET content = NULL WHERE position = (
-				SELECT min(position) FROM changes WHERE namespace = ? AND (mode & ?) = 0 AND size > 0)`,
-				f.workspace, int64(fs.ModeType))
+				SELECT min(position) FROM changes WHERE volume = ? AND (mode & ?) = 0 AND size > 0)`,
+				f.volume, int64(fs.ModeType))
 		}},
 		{"a created change has no name", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE changes SET name = NULL WHERE namespace = ? AND kind = 0`, f.workspace)
+			damageDatabase(t, f.path, `UPDATE changes SET name = NULL WHERE volume = ? AND kind = 0`, f.volume)
 		}},
-		{"the namespace file sizes overflow its counter", func(t *testing.T, f objectIntegrityFixture) {
+		{"the volume file sizes overflow its counter", func(t *testing.T, f objectIntegrityFixture) {
 			makeFileSizesOverflow(t, f)
 		}},
 	}
@@ -937,10 +937,10 @@ func TestObjectStatusRefusesInconsistentNodeRelationships(t *testing.T) {
 	defer store.Close()
 
 	damageDatabase(t, fixture.path, `
-		INSERT INTO entries (namespace, parent, name, node)
+		INSERT INTO entries (volume, parent, name, node)
 		SELECT ?, root, CAST('alias' AS BLOB),
-			(SELECT node FROM entries WHERE namespace = ? AND name = CAST('live' AS BLOB))
-		FROM namespaces WHERE id = ?`, fixture.workspace, fixture.workspace, fixture.workspace)
+			(SELECT node FROM entries WHERE volume = ? AND name = CAST('live' AS BLOB))
+		FROM volumes WHERE id = ?`, fixture.volume, fixture.volume, fixture.volume)
 	if _, err := store.ObjectStatus(t.Context()); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("reading status with a multiply-linked node: %v, want EIO", err)
 	}
@@ -968,7 +968,7 @@ func TestObjectStatusRefusesAUsedCounterMismatch(t *testing.T) {
 	}
 	defer store.Close()
 
-	damageDatabase(t, fixture.path, `UPDATE namespaces SET used = 9 WHERE id = ?`, fixture.workspace)
+	damageDatabase(t, fixture.path, `UPDATE volumes SET used = 9 WHERE id = ?`, fixture.volume)
 	if _, err := store.ObjectStatus(t.Context()); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("reading status with a used-counter mismatch: %v, want EIO", err)
 	}
@@ -983,8 +983,8 @@ func detachIntegrityFile(t *testing.T, f objectIntegrityFixture) {
 func TestSharedOpenPreservesDetachedObjectsAndQuotaOutsideSnapshots(t *testing.T) {
 	f := newObjectIntegrityFixture(t)
 	detachIntegrityFile(t, f)
-	damageDatabase(t, f.path, `UPDATE nodes SET detached = 1 WHERE `+nodeNamed, f.workspace, "copy")
-	damageDatabase(t, f.path, `DELETE FROM entries WHERE namespace = ? AND name = CAST('copy' AS BLOB)`, f.workspace)
+	damageDatabase(t, f.path, `UPDATE nodes SET detached = 1 WHERE `+nodeNamed, f.volume, "copy")
+	damageDatabase(t, f.path, `DELETE FROM entries WHERE volume = ? AND name = CAST('copy' AS BLOB)`, f.volume)
 	store, err := sqlite.Open(t.Context(), f.path, "workspace", 100, sqlite.DefaultWindow())
 	if err != nil {
 		t.Fatal(err)
@@ -1047,13 +1047,13 @@ func TestRetainedNodesRemainInsideIntegrityWorkLimit(t *testing.T) {
 	db := raw(t, f.path)
 	var records int64
 	if err := db.QueryRow(`SELECT
-		(SELECT count(*) FROM namespaces WHERE id = ?) +
-		(SELECT count(*) FROM nodes WHERE namespace = ?) +
-		(SELECT count(*) FROM objects WHERE namespace = ?) +
-		(SELECT count(*) FROM entries WHERE namespace = ?) +
-		(SELECT count(*) FROM logs WHERE namespace = ?) +
-		(SELECT count(*) FROM changes WHERE namespace = ?)`,
-		f.workspace, f.workspace, f.workspace, f.workspace, f.workspace, f.workspace).Scan(&records); err != nil {
+		(SELECT count(*) FROM volumes WHERE id = ?) +
+		(SELECT count(*) FROM nodes WHERE volume = ?) +
+		(SELECT count(*) FROM objects WHERE volume = ?) +
+		(SELECT count(*) FROM entries WHERE volume = ?) +
+		(SELECT count(*) FROM logs WHERE volume = ?) +
+		(SELECT count(*) FROM changes WHERE volume = ?)`,
+		f.volume, f.volume, f.volume, f.volume, f.volume, f.volume).Scan(&records); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
@@ -1094,17 +1094,17 @@ func TestRetainedIntegrityRefusesInvalidDetachedState(t *testing.T) {
 		{"revision zero", `UPDATE nodes SET content_revision = 0 WHERE content = ?`},
 		{"revision negative", `UPDATE nodes SET content_revision = -1 WHERE content = ?`},
 		{"unmarked orphan", `UPDATE nodes SET detached = 0 WHERE content = ?`},
-		{"incoming entry", `INSERT INTO entries (namespace, parent, name, node)
-			SELECT n.namespace, ns.root, CAST('restored' AS BLOB), n.id FROM nodes n
-			JOIN namespaces ns ON ns.id = n.namespace WHERE n.content = ?`},
+		{"incoming entry", `INSERT INTO entries (volume, parent, name, node)
+			SELECT n.volume, ns.root, CAST('restored' AS BLOB), n.id FROM nodes n
+			JOIN volumes ns ON ns.id = n.volume WHERE n.content = ?`},
 		{"outgoing entry", `UPDATE entries SET parent = (SELECT id FROM nodes WHERE content = ?)
 			WHERE name = CAST('copy' AS BLOB)`},
 		{"missing object", `DELETE FROM objects WHERE key = ?`},
 		{"unreferenced object", `UPDATE objects SET state = 2 WHERE key = ?`},
 		{"object size mismatch", `UPDATE objects SET size = 11 WHERE key = ?`},
-		{"foreign object", `UPDATE objects SET namespace = (SELECT id FROM namespaces WHERE name = 'neighbour') WHERE key = ?`},
-		{"quota undercharge", `UPDATE namespaces SET used = 0 WHERE id = (SELECT namespace FROM nodes WHERE content = ?)`},
-		{"quota overcharge", `UPDATE namespaces SET used = 11 WHERE id = (SELECT namespace FROM nodes WHERE content = ?)`},
+		{"foreign object", `UPDATE objects SET volume = (SELECT id FROM volumes WHERE name = 'neighbour') WHERE key = ?`},
+		{"quota undercharge", `UPDATE volumes SET used = 0 WHERE id = (SELECT volume FROM nodes WHERE content = ?)`},
+		{"quota overcharge", `UPDATE volumes SET used = 11 WHERE id = (SELECT volume FROM nodes WHERE content = ?)`},
 	} {
 		for _, entry := range []string{"open", "status"} {
 			t.Run(fmt.Sprintf("%s/%s", damage.name, entry), func(t *testing.T) {
@@ -1132,11 +1132,11 @@ func TestRetainedIntegrityRefusesDetachedDirectoriesAndRoots(t *testing.T) {
 				}
 				if node == "root" {
 					damageDatabase(t, f.path, `UPDATE nodes SET detached = 1
-						WHERE id = (SELECT root FROM namespaces WHERE id = ?)`, f.workspace)
+						WHERE id = (SELECT root FROM volumes WHERE id = ?)`, f.volume)
 				} else {
 					damageDatabase(t, f.path, `UPDATE nodes SET detached = 1 WHERE `+nodeNamed,
-						f.workspace, "directory")
-					damageDatabase(t, f.path, `DELETE FROM entries WHERE namespace = ? AND name = CAST('directory' AS BLOB)`, f.workspace)
+						f.volume, "directory")
+					damageDatabase(t, f.path, `DELETE FROM entries WHERE volume = ? AND name = CAST('directory' AS BLOB)`, f.volume)
 				}
 				assertRetainedIntegrityFailure(t, f.path, store)
 			})

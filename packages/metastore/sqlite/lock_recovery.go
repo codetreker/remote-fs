@@ -22,14 +22,14 @@ type LeaseEvidence struct {
 	MaxLease   time.Duration
 }
 
-// LeaseWitness stores independent, workspace-anchored evidence. Advance must durably publish
+// LeaseWitness stores independent, volume-anchored evidence. Advance must durably publish
 // the exact next generation before returning. Repeating the same record is idempotent.
 type LeaseWitness interface {
 	Load() (LeaseEvidence, bool, error)
 	Advance(LeaseEvidence) error
 }
 
-// LeaseRecoveryConfig is supplied by the holder of exclusive native workspace ownership.
+// LeaseRecoveryConfig is supplied by the holder of exclusive native volume ownership.
 // Initialize requires a matching durable initialization intent; a flag supplied by an
 // ordinary reopen is insufficient. RecoveryStart is captured after ownership acquisition.
 type LeaseRecoveryConfig struct {
@@ -84,7 +84,7 @@ func (s *Store) configureLeaseRecovery(ctx context.Context, config LeaseRecovery
 
 func (s *Store) configureLeaseRecoveryLocked(ctx context.Context, config LeaseRecoveryConfig) error {
 	if s.closed || s.leaseRecovery != nil {
-		return fmt.Errorf("lease recovery requires an open, unattached namespace: %w", syscall.EINVAL)
+		return fmt.Errorf("lease recovery requires an open, unattached volume: %w", syscall.EINVAL)
 	}
 	if config.Witness == nil || config.RecoveryStart.IsZero() || !nativelease.ValidID(config.StateID) {
 		return fmt.Errorf("lease recovery needs native ownership and a bound witness: %w", syscall.EINVAL)
@@ -337,7 +337,7 @@ func (s *Store) RaiseMaxLease(ctx context.Context, ttl time.Duration) error {
 
 func (s *Store) configuredLeaseRecovery() (*LeaseRecovery, error) {
 	if s.leaseRecovery == nil {
-		return nil, fmt.Errorf("the namespace has no active lease recovery owner: %w", syscall.EIO)
+		return nil, fmt.Errorf("the volume has no active lease recovery owner: %w", syscall.EIO)
 	}
 	return s.leaseRecovery, nil
 }
@@ -356,7 +356,7 @@ func validateLeaseOpening(ctx context.Context, db *sql.DB, owned bool) error {
 		return err
 	}
 	if present {
-		return fmt.Errorf("this namespace requires its native lease recovery owner: %w", syscall.EIO)
+		return fmt.Errorf("this volume requires its native lease recovery owner: %w", syscall.EIO)
 	}
 	return nil
 }
@@ -367,18 +367,18 @@ func validateLeaseMutation(ctx context.Context, tx *sql.Tx) error {
 		return err
 	}
 	if present {
-		return fmt.Errorf("namespace mutation requires its lease authority: %w", syscall.EIO)
+		return fmt.Errorf("volume mutation requires its lease authority: %w", syscall.EIO)
 	}
 	return nil
 }
 
 // OpenBoundDurableLeaseWithOptions reserves opening for a caller which holds native lease
 // ownership and configures recovery before exposing this Store. Ordinary durable opens
-// reject namespaces that already carry lease evidence.
+// reject volumes that already carry lease evidence.
 func OpenBoundDurableLeaseWithOptions(
-	ctx context.Context, database, namespace, storeID string, allowance int64, options Options,
-	mode NamespaceOpenMode, startup DurableStartup, witness CommitWitness,
+	ctx context.Context, database, volume, storeID string, allowance int64, options Options,
+	mode VolumeOpenMode, startup DurableStartup, witness CommitWitness,
 ) (*Store, error) {
 	options.leaseRecoveryOwner = true
-	return OpenBoundDurableWithOptions(ctx, database, namespace, storeID, allowance, options, mode, startup, witness)
+	return OpenBoundDurableWithOptions(ctx, database, volume, storeID, allowance, options, mode, startup, witness)
 }

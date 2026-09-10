@@ -26,7 +26,7 @@ func TestLegacyMigrationRejectsLargeBlobIdentityScalars(t *testing.T) {
 		{
 			"version one root",
 			writeVersionOne,
-			`UPDATE namespaces SET root = zeroblob(4 * 1024 * 1024)`,
+			`UPDATE volumes SET root = zeroblob(4 * 1024 * 1024)`,
 		},
 		{
 			"version two committed position",
@@ -98,7 +98,7 @@ func TestWitnessedRetainedMigrationPreservesNodesAndAcceptedState(t *testing.T) 
 	before := historicalLeaseRows(t, path)
 	witness := &recordingWitness{database: path}
 	store, err := sqlite.OpenBoundDurableWithOptions(t.Context(), path, "A", durableStoreID, 1024,
-		sqlite.DefaultOptions(), sqlite.RequireExistingNamespace, sqlite.DurableStartup{
+		sqlite.DefaultOptions(), sqlite.RequireExistingVolume, sqlite.DurableStartup{
 			Accepted: historicalLeaseDurableState, CheckpointedGeneration: historicalLeaseDurableState.Generation,
 		}, witness)
 	if err != nil {
@@ -109,7 +109,7 @@ func TestWitnessedRetainedMigrationPreservesNodesAndAcceptedState(t *testing.T) 
 			t.Error(err)
 		}
 	})
-	assertHistoricalLeaseNamespace(t, store, "A")
+	assertHistoricalLeaseVolume(t, store, "A")
 	assertHistoricalLeaseRows(t, path, before)
 	assertHistoricalLeaseSchemaVersion(t, path, 5)
 	db := raw(t, path)
@@ -137,8 +137,8 @@ func TestWitnessedRetainedMigrationRefusesOldSchemaCorruptionWithoutChanges(t *t
 			sql  string
 		}{
 			{"unmarked orphan", `DELETE FROM entries WHERE node = 2`},
-			{"foreign namespace orphan", `DELETE FROM entries WHERE node = 4`},
-			{"foreign namespace undercharge", `UPDATE namespaces SET used = 0 WHERE id = 2`},
+			{"foreign volume orphan", `DELETE FROM entries WHERE node = 4`},
+			{"foreign volume undercharge", `UPDATE volumes SET used = 0 WHERE id = 2`},
 			{"invalid node scalar", `UPDATE nodes SET atime_nsec = 'damaged' WHERE id = 2`},
 			{"missing object", `DELETE FROM objects WHERE key = 'historical-alpha-object'`},
 			{"invalid log predecessor", `UPDATE changes SET previous_position = 2 WHERE position = 3`},
@@ -173,7 +173,7 @@ func assertRetainedMigrationRefused(t *testing.T, path string, version int, opti
 	before := historicalLeaseRows(t, path)
 	witness := &recordingWitness{database: path}
 	store, err := sqlite.OpenBoundDurableWithOptions(t.Context(), path, "A", durableStoreID, 1024,
-		options, sqlite.RequireExistingNamespace, sqlite.DurableStartup{
+		options, sqlite.RequireExistingVolume, sqlite.DurableStartup{
 			Accepted: historicalLeaseDurableState, CheckpointedGeneration: historicalLeaseDurableState.Generation,
 		}, witness)
 	if store != nil {
@@ -382,7 +382,7 @@ func TestTheSecondMigrationDescribesTheVersionTwoDatabasesThatExist(t *testing.T
 }
 
 // writeVersionTwo builds the independent historical schema witness with the same referenced
-// file used by the version 1 fixture and the log row version 2 required for that namespace.
+// file used by the version 1 fixture and the log row version 2 required for that volume.
 func writeVersionTwo(t *testing.T, path string) {
 	t.Helper()
 	statements, err := os.ReadFile(filepath.Join("testdata", "version2.sql"))
@@ -403,18 +403,18 @@ func writeVersionTwo(t *testing.T, path string) {
 		sql  string
 		args []any
 	}{
-		{`INSERT INTO namespaces (id, name, root, used) VALUES (1, 'workspace', 1, 700)`, nil},
-		{`INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		{`INSERT INTO volumes (id, name, root, used) VALUES (1, 'workspace', 1, 700)`, nil},
+		{`INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
 		  VALUES (1, 1, ?, 0, ?, 0, ?, 0, NULL)`, []any{directory, at, at}},
-		{`INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		{`INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
 		  VALUES (2, 1, ?, 0, ?, 0, ?, 0, NULL)`, []any{directory, at, at}},
-		{`INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
+		{`INSERT INTO objects (key, volume, state, size, digest, created_sec, created_nsec)
 		  VALUES ('carried', 1, 1, 700, NULL, ?, 0)`, []any{at}},
-		{`INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		{`INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
 		  VALUES (3, 1, ?, 700, ?, 0, ?, 0, 'carried')`, []any{file, at, at}},
-		{`INSERT INTO entries (namespace, parent, name, node) VALUES (1, 1, ?, 2)`, []any{[]byte("d")}},
-		{`INSERT INTO entries (namespace, parent, name, node) VALUES (1, 2, ?, 3)`, []any{[]byte("f")}},
-		{`INSERT INTO logs (namespace, incarnation, committed_position, trimmed_through, trimmed_by_age)
+		{`INSERT INTO entries (volume, parent, name, node) VALUES (1, 1, ?, 2)`, []any{[]byte("d")}},
+		{`INSERT INTO entries (volume, parent, name, node) VALUES (1, 2, ?, 3)`, []any{[]byte("f")}},
+		{`INSERT INTO logs (volume, incarnation, committed_position, trimmed_through, trimmed_by_age)
 		  VALUES (1, 'version-two-incarnation', 0, 0, 0)`, nil},
 	} {
 		if _, err := db.Exec(statement.sql, statement.args...); err != nil {
@@ -454,7 +454,7 @@ func TestLegacyNonReferencedObjectsAreRefusedWithoutMigrating(t *testing.T) {
 				version.write(t, path)
 				db := raw(t, path)
 				if _, err := db.Exec(`
-					INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
+					INSERT INTO objects (key, volume, state, size, digest, created_sec, created_nsec)
 					VALUES ('ambiguous', 1, ?, 0, NULL, 0, 0)`, state.state); err != nil {
 					db.Close()
 					t.Fatal(err)
@@ -545,7 +545,7 @@ func TestLegacyNodeEntryRelationshipsMustBeConsistentBeforeMigrating(t *testing.
 		{
 			name: "duplicate node entry",
 			v1:   `INSERT INTO entries (parent, name, node) VALUES (1, CAST('alias' AS BLOB), 3)`,
-			v2:   `INSERT INTO entries (namespace, parent, name, node) VALUES (1, 1, CAST('alias' AS BLOB), 3)`,
+			v2:   `INSERT INTO entries (volume, parent, name, node) VALUES (1, 1, CAST('alias' AS BLOB), 3)`,
 		},
 		{
 			name: "orphan node",
@@ -555,7 +555,7 @@ func TestLegacyNodeEntryRelationshipsMustBeConsistentBeforeMigrating(t *testing.
 		{
 			name: "root entry",
 			v1:   `INSERT INTO entries (parent, name, node) VALUES (1, CAST('root-alias' AS BLOB), 1)`,
-			v2:   `INSERT INTO entries (namespace, parent, name, node) VALUES (1, 1, CAST('root-alias' AS BLOB), 1)`,
+			v2:   `INSERT INTO entries (volume, parent, name, node) VALUES (1, 1, CAST('root-alias' AS BLOB), 1)`,
 		},
 		{
 			name: "missing child endpoint",
@@ -637,18 +637,18 @@ func TestVersionTwoLogIntegrityMustHoldBeforeMigration(t *testing.T) {
 		name   string
 		damage string
 	}{
-		{"missing log", `DELETE FROM logs WHERE namespace = 1`},
-		{"empty incarnation", `UPDATE logs SET incarnation = '' WHERE namespace = 1`},
-		{"missing committed tail", `UPDATE logs SET committed_position = 1 WHERE namespace = 1`},
+		{"missing log", `DELETE FROM logs WHERE volume = 1`},
+		{"empty incarnation", `UPDATE logs SET incarnation = '' WHERE volume = 1`},
+		{"missing committed tail", `UPDATE logs SET committed_position = 1 WHERE volume = 1`},
 		{"text change name", `
 			INSERT INTO changes (
-				position, namespace, kind, parent, name, node, mode, size,
+				position, volume, kind, parent, name, node, mode, size,
 				atime_sec, atime_nsec, mtime_sec, mtime_nsec, content, recorded_sec, recorded_nsec
 			)
 			SELECT 1, 1, 0, 2, 'text-name', id, mode, size,
 				atime_sec, atime_nsec, mtime_sec, mtime_nsec, content, 0, 0
 			FROM nodes WHERE id = 3;
-			UPDATE logs SET committed_position = 1 WHERE namespace = 1`},
+			UPDATE logs SET committed_position = 1 WHERE volume = 1`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -678,9 +678,9 @@ func addLegacyDisconnectedDirectories(t *testing.T, path string, version int, cy
 	}
 	insertNode := func() int64 {
 		result, err := tx.Exec(`
-			INSERT INTO nodes (namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+			INSERT INTO nodes (volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
 			SELECT ns.id, root.mode, 0, 0, 0, 0, 0, NULL
-			FROM namespaces ns JOIN nodes root ON root.id = ns.root
+			FROM volumes ns JOIN nodes root ON root.id = ns.root
 			WHERE ns.id = 1`)
 		if err != nil {
 			t.Fatal(err)
@@ -696,7 +696,7 @@ func addLegacyDisconnectedDirectories(t *testing.T, path string, version int, cy
 		statement := `INSERT INTO entries (parent, name, node) VALUES (?, CAST(? AS BLOB), ?)`
 		args := []any{parent, name, node}
 		if version == 2 {
-			statement = `INSERT INTO entries (namespace, parent, name, node) VALUES (1, ?, CAST(? AS BLOB), ?)`
+			statement = `INSERT INTO entries (volume, parent, name, node) VALUES (1, ?, CAST(? AS BLOB), ?)`
 		}
 		if _, err := tx.Exec(statement, args...); err != nil {
 			t.Fatal(err)
@@ -715,7 +715,7 @@ func addLegacyDisconnectedDirectories(t *testing.T, path string, version int, cy
 	}
 }
 
-func TestLegacyNodesMustBeReachableFromTheirNamespaceRoot(t *testing.T) {
+func TestLegacyNodesMustBeReachableFromTheirVolumeRoot(t *testing.T) {
 	versions := []struct {
 		name    string
 		version int
@@ -759,17 +759,17 @@ func makeLegacyFileSizesOverflow(t *testing.T, path string, version int) {
 	}{
 		{`UPDATE objects SET size = ? WHERE key = 'carried'`, []any{int64(math.MaxInt64)}},
 		{`UPDATE nodes SET size = ? WHERE content = 'carried'`, []any{int64(math.MaxInt64)}},
-		{`INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
+		{`INSERT INTO objects (key, volume, state, size, digest, created_sec, created_nsec)
 		  VALUES ('overflow-byte', 1, 1, 1, NULL, 0, 0)`, nil},
-		{`UPDATE namespaces SET used = ? WHERE id = 1`, []any{int64(math.MaxInt64)}},
+		{`UPDATE volumes SET used = ? WHERE id = 1`, []any{int64(math.MaxInt64)}},
 	} {
 		if _, err := tx.Exec(statement.query, statement.args...); err != nil {
 			t.Fatal(err)
 		}
 	}
 	result, err := tx.Exec(`
-		INSERT INTO nodes (namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-		SELECT namespace, mode, 1, 0, 0, 0, 0, 'overflow-byte' FROM nodes WHERE id = 3`)
+		INSERT INTO nodes (volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		SELECT volume, mode, 1, 0, 0, 0, 0, 'overflow-byte' FROM nodes WHERE id = 3`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -779,7 +779,7 @@ func makeLegacyFileSizesOverflow(t *testing.T, path string, version int) {
 	}
 	statement := `INSERT INTO entries (parent, name, node) VALUES (1, CAST('overflow' AS BLOB), ?)`
 	if version == 2 {
-		statement = `INSERT INTO entries (namespace, parent, name, node) VALUES (1, 1, CAST('overflow' AS BLOB), ?)`
+		statement = `INSERT INTO entries (volume, parent, name, node) VALUES (1, 1, CAST('overflow' AS BLOB), ?)`
 	}
 	if _, err := tx.Exec(statement, node); err != nil {
 		t.Fatal(err)
@@ -807,9 +807,9 @@ func TestLegacyUsedAccountingMustBeExactBeforeMigrating(t *testing.T) {
 		statement string
 		overflow  bool
 	}{
-		{name: "undercount", statement: `UPDATE namespaces SET used = 699 WHERE id = 1`},
-		{name: "overcount", statement: `UPDATE namespaces SET used = 701 WHERE id = 1`},
-		{name: "non-integer", statement: `UPDATE namespaces SET used = 'seven hundred' WHERE id = 1`},
+		{name: "undercount", statement: `UPDATE volumes SET used = 699 WHERE id = 1`},
+		{name: "overcount", statement: `UPDATE volumes SET used = 701 WHERE id = 1`},
+		{name: "non-integer", statement: `UPDATE volumes SET used = 'seven hundred' WHERE id = 1`},
 		{name: "overflow", overflow: true},
 	}
 	for _, version := range versions {
@@ -836,7 +836,7 @@ func TestLegacyUsedAccountingMustBeExactBeforeMigrating(t *testing.T) {
 	}
 }
 
-func TestLegacyMigrationValidatesEveryNamespaceUsedCounter(t *testing.T) {
+func TestLegacyMigrationValidatesEveryVolumeUsedCounter(t *testing.T) {
 	versions := []struct {
 		name    string
 		version int
@@ -855,21 +855,21 @@ func TestLegacyMigrationValidatesEveryNamespaceUsedCounter(t *testing.T) {
 				db.Close()
 				t.Fatal(err)
 			}
-			result, err := tx.Exec(`INSERT INTO namespaces (name, root, used) VALUES ('neighbour', 0, 1)`)
+			result, err := tx.Exec(`INSERT INTO volumes (name, root, used) VALUES ('neighbour', 0, 1)`)
 			if err != nil {
 				tx.Rollback()
 				db.Close()
 				t.Fatal(err)
 			}
-			namespace, err := result.LastInsertId()
+			volume, err := result.LastInsertId()
 			if err != nil {
 				tx.Rollback()
 				db.Close()
 				t.Fatal(err)
 			}
 			result, err = tx.Exec(`
-				INSERT INTO nodes (namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-				SELECT ?, mode, 0, 0, 0, 0, 0, NULL FROM nodes WHERE id = 1`, namespace)
+				INSERT INTO nodes (volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+				SELECT ?, mode, 0, 0, 0, 0, 0, NULL FROM nodes WHERE id = 1`, volume)
 			if err != nil {
 				tx.Rollback()
 				db.Close()
@@ -881,15 +881,15 @@ func TestLegacyMigrationValidatesEveryNamespaceUsedCounter(t *testing.T) {
 				db.Close()
 				t.Fatal(err)
 			}
-			if _, err := tx.Exec(`UPDATE namespaces SET root = ? WHERE id = ?`, root, namespace); err != nil {
+			if _, err := tx.Exec(`UPDATE volumes SET root = ? WHERE id = ?`, root, volume); err != nil {
 				tx.Rollback()
 				db.Close()
 				t.Fatal(err)
 			}
 			if version.version == 2 {
 				if _, err := tx.Exec(`
-					INSERT INTO logs (namespace, incarnation, committed_position, trimmed_through, trimmed_by_age)
-					VALUES (?, 'neighbour-incarnation', 0, 0, 0)`, namespace); err != nil {
+					INSERT INTO logs (volume, incarnation, committed_position, trimmed_through, trimmed_by_age)
+					VALUES (?, 'neighbour-incarnation', 0, 0, 0)`, volume); err != nil {
 					tx.Rollback()
 					db.Close()
 					t.Fatal(err)
@@ -950,19 +950,19 @@ func TestVersionTwoMigrationStartsAVerifiableLogAboveItsOldHighWater(t *testing.
 	writeVersionTwo(t, path)
 	db := raw(t, path)
 	var before string
-	if err := db.QueryRow(`SELECT incarnation FROM logs WHERE namespace = 1`).Scan(&before); err != nil {
+	if err := db.QueryRow(`SELECT incarnation FROM logs WHERE volume = 1`).Scan(&before); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`
 		INSERT INTO changes (
-			position, namespace, kind, parent, name, node, mode, size,
+			position, volume, kind, parent, name, node, mode, size,
 			atime_sec, atime_nsec, mtime_sec, mtime_nsec, content, recorded_sec, recorded_nsec
 		)
 		SELECT 50, 1, 0, 2, CAST('old' AS BLOB), id, mode, size,
 			atime_sec, atime_nsec, mtime_sec, mtime_nsec, content, 0, 0
 		FROM nodes WHERE id = 3;
-		UPDATE logs SET committed_position = 50 WHERE namespace = 1;
+		UPDATE logs SET committed_position = 50 WHERE volume = 1;
 		UPDATE sqlite_sequence SET seq = 80 WHERE name = 'changes'`); err != nil {
 		db.Close()
 		t.Fatal(err)
@@ -1012,7 +1012,7 @@ func TestVersionTwoMigrationAcceptsAFullyTrimmedLog(t *testing.T) {
 	if _, err := db.Exec(`
 		UPDATE logs
 		SET committed_position = 50, trimmed_through = 50
-		WHERE namespace = 1;
+		WHERE volume = 1;
 		DELETE FROM sqlite_sequence WHERE name = 'changes';
 		INSERT INTO sqlite_sequence (name, seq) VALUES ('changes', 50)`); err != nil {
 		db.Close()
@@ -1213,7 +1213,7 @@ func TestAVersionOneDatabaseIsCarriedForwardIntact(t *testing.T) {
 		t.Fatal(err)
 	}
 	if space.Used != 700 {
-		t.Fatalf("the migrated namespace reports %d bytes used, want the 700 it held", space.Used)
+		t.Fatalf("the migrated volume reports %d bytes used, want the 700 it held", space.Used)
 	}
 
 	// The log is there, and it is empty. That is the truthful state: nothing recorded the
@@ -1269,7 +1269,7 @@ func TestAVersionOneDatabaseIsCarriedForwardIntact(t *testing.T) {
 }
 
 // writeVersionOne builds a database in the layout schema version 1 produced, holding one
-// namespace with a directory, a file of 700 bytes and the object those bytes are under.
+// volume with a directory, a file of 700 bytes and the object those bytes are under.
 func writeVersionOne(t *testing.T, path string) {
 	t.Helper()
 	db := raw(t, path)
@@ -1283,7 +1283,7 @@ func writeVersionOne(t *testing.T, path string) {
 		`CREATE TABLE schema_version (version INTEGER NOT NULL)`,
 		`CREATE TABLE nodes (
 			id         INTEGER PRIMARY KEY AUTOINCREMENT,
-			namespace  INTEGER NOT NULL REFERENCES namespaces(id),
+			volume  INTEGER NOT NULL REFERENCES volumes(id),
 			mode       INTEGER NOT NULL,
 			size       INTEGER NOT NULL,
 			atime_sec  INTEGER NOT NULL,
@@ -1299,7 +1299,7 @@ func writeVersionOne(t *testing.T, path string) {
 			PRIMARY KEY (parent, name)
 		) WITHOUT ROWID`,
 		`CREATE INDEX entries_by_node ON entries (node)`,
-		`CREATE TABLE namespaces (
+		`CREATE TABLE volumes (
 			id   INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT    NOT NULL UNIQUE,
 			root INTEGER NOT NULL,
@@ -1307,14 +1307,14 @@ func writeVersionOne(t *testing.T, path string) {
 		)`,
 		`CREATE TABLE objects (
 			key          TEXT PRIMARY KEY,
-			namespace    INTEGER NOT NULL REFERENCES namespaces(id),
+			volume    INTEGER NOT NULL REFERENCES volumes(id),
 			state        INTEGER NOT NULL,
 			size         INTEGER NOT NULL,
 			digest       BLOB,
 			created_sec  INTEGER NOT NULL,
 			created_nsec INTEGER NOT NULL
 		)`,
-		`CREATE INDEX objects_by_state ON objects (namespace, state, created_sec)`,
+		`CREATE INDEX objects_by_state ON objects (volume, state, created_sec)`,
 		`CREATE INDEX nodes_by_content ON nodes (content)`,
 		`INSERT INTO schema_version (version) VALUES (1)`,
 	} {
@@ -1333,14 +1333,14 @@ func writeVersionOne(t *testing.T, path string) {
 		sql  string
 		args []any
 	}{
-		{`INSERT INTO namespaces (id, name, root, used) VALUES (1, 'workspace', 1, 700)`, nil},
-		{`INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		{`INSERT INTO volumes (id, name, root, used) VALUES (1, 'workspace', 1, 700)`, nil},
+		{`INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
 		  VALUES (1, 1, ?, 0, ?, 0, ?, 0, NULL)`, []any{directory, at, at}},
-		{`INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		{`INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
 		  VALUES (2, 1, ?, 0, ?, 0, ?, 0, NULL)`, []any{directory, at, at}},
-		{`INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
+		{`INSERT INTO objects (key, volume, state, size, digest, created_sec, created_nsec)
 		  VALUES ('carried', 1, 1, 700, NULL, ?, 0)`, []any{at}},
-		{`INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		{`INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
 		  VALUES (3, 1, ?, 700, ?, 0, ?, 0, 'carried')`, []any{file, at, at}},
 		// The names go in as bytes, which is what the BLOB column holds and what version 1
 		// wrote: a string literal here would be stored as TEXT and would never compare equal to

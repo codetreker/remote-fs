@@ -1,4 +1,4 @@
-// Package schema prepares and validates SQLite metadata in caller-selected namespaces.
+// Package schema prepares and validates SQLite metadata in caller-selected volumes.
 // Schema migration and startup recovery share one transaction.
 package schema
 
@@ -40,19 +40,19 @@ const firstOwnershipAwareSchemaVersion = 3
 
 const firstRetainedFileSchemaVersion = 5
 
-// NamespaceOpenMode decides whether preparation may create the named namespace.
-type NamespaceOpenMode uint8
+// VolumeOpenMode decides whether preparation may create the named volume.
+type VolumeOpenMode uint8
 
 const (
-	CreateNamespaceIfMissing NamespaceOpenMode = iota + 1
-	RequireExistingNamespace
+	CreateVolumeIfMissing VolumeOpenMode = iota + 1
+	RequireExistingVolume
 )
 
 // DurableOpen contains startup evidence captured before the database was opened.
 // Witnessed records witness presence; preparation never publishes that witness.
 type DurableOpen struct {
 	ReapDetached bool
-	Mode         NamespaceOpenMode
+	Mode         VolumeOpenMode
 	Startup      dbstate.Startup
 	Witnessed    bool
 }
@@ -60,7 +60,7 @@ type DurableOpen struct {
 const rootDirectoryMode fs.FileMode = 0o755
 
 // Prepare brings the database to the layout this build writes, and returns the id of the
-// named namespace and of its root directory, creating both when the namespace is new.
+// named volume and of its root directory, creating both when the volume is new.
 //
 // All of it happens in one transaction, so two processes opening the same new database cannot
 // both decide they are the one to create it, a migration that fails part way leaves the
@@ -69,12 +69,12 @@ const rootDirectoryMode fs.FileMode = 0o755
 func Prepare(
 	ctx context.Context,
 	db *sql.DB,
-	namespace, storeID string,
+	volume, storeID string,
 	window changes.Window,
 	maxIntegrityRecords, maxIntegrityBytes int64,
 ) (id, root int64, err error) {
 	id, root, _, err = PrepareConfigured(
-		ctx, db, namespace, storeID, window, maxIntegrityRecords, maxIntegrityBytes, nil,
+		ctx, db, volume, storeID, window, maxIntegrityRecords, maxIntegrityBytes, nil,
 	)
 	return id, root, err
 }
@@ -85,7 +85,7 @@ func Prepare(
 func PrepareConfigured(
 	ctx context.Context,
 	db *sql.DB,
-	namespace, storeID string,
+	volume, storeID string,
 	window changes.Window,
 	maxIntegrityRecords, maxIntegrityBytes int64,
 	durable *DurableOpen,
@@ -111,9 +111,9 @@ func PrepareConfigured(
 		}
 	}
 	if durable != nil && durable.Witnessed && durable.Startup.Accepted.DatabaseID == "" &&
-		durable.Mode == CreateNamespaceIfMissing && recorded && version > 0 {
+		durable.Mode == CreateVolumeIfMissing && recorded && version > 0 {
 		return 0, 0, dbstate.State{}, fmt.Errorf(
-			"creating an unwitnessed namespace requires a pristine database, found schema version %d: %w",
+			"creating an unwitnessed volume requires a pristine database, found schema version %d: %w",
 			version, syscall.EIO)
 	}
 	legacy := recorded && version > 0 && version < firstOwnershipAwareSchemaVersion
@@ -157,7 +157,7 @@ func PrepareConfigured(
 	if err := schema.Reach(ctx, tx); err != nil {
 		return 0, 0, dbstate.State{}, err
 	}
-	// Version 1 did not carry namespace on entries. Validate the global rooted tree and used
+	// Version 1 did not carry volume on entries. Validate the global rooted tree and used
 	// accounting after the migrations normalize that table, while the same transaction can
 	// still roll every schema change back on refusal.
 	if legacy {
@@ -185,19 +185,19 @@ func PrepareConfigured(
 	}
 
 	switch err := tx.QueryRowContext(ctx,
-		`SELECT id, root FROM namespaces WHERE name = ?`, namespace).Scan(&id, &root); {
+		`SELECT id, root FROM volumes WHERE name = ?`, volume).Scan(&id, &root); {
 	case errors.Is(err, sql.ErrNoRows):
-		if durable != nil && durable.Mode == RequireExistingNamespace {
-			return 0, 0, dbstate.State{}, fmt.Errorf("namespace %q is missing from the bound database: %w",
-				namespace, syscall.EIO)
+		if durable != nil && durable.Mode == RequireExistingVolume {
+			return 0, 0, dbstate.State{}, fmt.Errorf("volume %q is missing from the bound database: %w",
+				volume, syscall.EIO)
 		}
-		if id, root, err = createNamespace(ctx, tx, namespace); err != nil {
+		if id, root, err = createVolume(ctx, tx, volume); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 	case err != nil:
 		return 0, 0, dbstate.State{}, err
 	}
-	if err := ValidateNamespaceIntegrity(ctx, tx, id, maxIntegrityRecords, maxIntegrityBytes); err != nil {
+	if err := ValidateVolumeIntegrity(ctx, tx, id, maxIntegrityRecords, maxIntegrityBytes); err != nil {
 		return 0, 0, dbstate.State{}, err
 	}
 	if durable != nil && durable.ReapDetached {
@@ -209,7 +209,7 @@ func PrepareConfigured(
 		}
 	}
 
-	// A namespace that has been quiet since the last process was here gets the trim that no
+	// A volume that has been quiet since the last process was here gets the trim that no
 	// append arrived to perform.
 	if err := changes.Trim(ctx, tx, id, window); err != nil {
 		return 0, 0, dbstate.State{}, err
@@ -255,7 +255,7 @@ func recordedSchemaVersion(ctx context.Context, tx *sql.Tx) (version int, record
 
 // bindBackingStore checks the database-level object-store binding requested by an opener.
 // An empty storeID is the unbound Open API. A non-empty storeID either proves an existing
-// binding or establishes one while the database holds no namespace.
+// binding or establishes one while the database holds no volume.
 func bindBackingStore(ctx context.Context, tx *sql.Tx, storeID string) error {
 	var rows, valid, matching int64
 	if err := tx.QueryRowContext(ctx, `
@@ -292,11 +292,11 @@ func bindBackingStore(ctx context.Context, tx *sql.Tx, storeID string) error {
 	}
 
 	var populated int
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM namespaces)`).Scan(&populated); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM volumes)`).Scan(&populated); err != nil {
 		return err
 	}
 	if populated != 0 {
-		return fmt.Errorf("the database already holds unbound namespaces and cannot be bound to backing store %q: %w",
+		return fmt.Errorf("the database already holds unbound volumes and cannot be bound to backing store %q: %w",
 			storeID, syscall.EINVAL)
 	}
 	_, err := tx.ExecContext(ctx,
@@ -304,13 +304,13 @@ func bindBackingStore(ctx context.Context, tx *sql.Tx, storeID string) error {
 	return err
 }
 
-// createNamespace makes a namespace, the root directory it starts life with, and the log it
+// createVolume makes a volume, the root directory it starts life with, and the log it
 // will record its changes in.
 //
-// The root is inserted first because namespaces.root names it, and the placeholder that
+// The root is inserted first because volumes.root names it, and the placeholder that
 // stands in for the id until it is known never outlives this transaction.
-func createNamespace(ctx context.Context, tx *sql.Tx, namespace string) (id, root int64, err error) {
-	result, err := tx.ExecContext(ctx, `INSERT INTO namespaces (name, root, used) VALUES (?, 0, 0)`, namespace)
+func createVolume(ctx context.Context, tx *sql.Tx, volume string) (id, root int64, err error) {
+	result, err := tx.ExecContext(ctx, `INSERT INTO volumes (name, root, used) VALUES (?, 0, 0)`, volume)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -319,7 +319,7 @@ func createNamespace(ctx context.Context, tx *sql.Tx, namespace string) (id, roo
 	}
 
 	// The root is a directory nobody made, so it gets the mode a directory is made with and
-	// the moment the namespace came into being.
+	// the moment the volume came into being.
 	now := time.Now()
 	sec, nsec := sqlvalue.StoredTime(now)
 	root, err = dbstate.AllocateNodeID(ctx, tx)
@@ -327,13 +327,13 @@ func createNamespace(ctx context.Context, tx *sql.Tx, namespace string) (id, roo
 		return 0, 0, err
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
 		VALUES (?, ?, ?, 0, ?, ?, ?, ?, NULL)`,
 		root, id, int64(fs.ModeDir|rootDirectoryMode), sec, nsec, sec, nsec)
 	if err != nil {
 		return 0, 0, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE namespaces SET root = ? WHERE id = ?`, root, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE volumes SET root = ? WHERE id = ?`, root, id); err != nil {
 		return 0, 0, err
 	}
 	if err := changes.CreateLog(ctx, tx, id); err != nil {

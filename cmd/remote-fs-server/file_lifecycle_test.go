@@ -27,30 +27,30 @@ func TestRegistryCleanupFailureKeepsOwnedStorageOpen(t *testing.T) {
 	}
 }
 
-func openFileLifecycleNamespace(t *testing.T) (opened, commandConfig) {
+func openFileLifecycleVolume(t *testing.T) (opened, commandConfig) {
 	t.Helper()
 	config, _, err := parseConfig([]string{
 		"-listen", "127.0.0.1:0", "-local-store", emptyPrivateDirectory(t),
-		"-workspace", "workspace", "-quota", "1M", "-initialize-lock-state",
+		"-volume", "workspace", "-quota", "1M", "-initialize-lock-state",
 	}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ns, err := open(config)
+	v, err := open(config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return ns, config
+	return v, config
 }
 
 func TestHandlerRetirementReclaimsDetachedFilesBeforeStorageClose(t *testing.T) {
-	ns, _ := openFileLifecycleNamespace(t)
+	v, _ := openFileLifecycleVolume(t)
 	t.Cleanup(func() {
-		if err := ns.close(); err != nil {
+		if err := v.close(); err != nil {
 			t.Errorf("close native storage: %v", err)
 		}
 	})
-	handler, err := httprest.NewHandler(ns.namespace, ns.log)
+	handler, err := httprest.NewHandler(v.volume, v.log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,19 +75,19 @@ func TestHandlerRetirementReclaimsDetachedFilesBeforeStorageClose(t *testing.T) 
 	if _, err := file.WriteAt(t.Context(), 0, []byte("retained")); err != nil {
 		t.Fatal(err)
 	}
-	if err := ns.namespace.Remove(t.Context(), "held"); err != nil {
+	if err := v.volume.Remove(t.Context(), "held"); err != nil {
 		t.Fatal(err)
 	}
-	before, err := ns.namespace.Space(t.Context())
+	before, err := v.volume.Space(t.Context())
 	if err != nil || before.Used != int64(len("retained")) {
 		t.Fatalf("detached file quota=%d err=%v", before.Used, err)
 	}
 	httpServer.Close()
-	err = withOpened(ns, func() error {
+	err = withOpened(v, func() error {
 		if err := closeFileRegistry(server, time.Second); err != nil {
 			return err
 		}
-		after, err := ns.namespace.Space(t.Context())
+		after, err := v.volume.Space(t.Context())
 		if err != nil || after.Used != 0 {
 			t.Fatalf("handler retirement left quota=%d err=%v", after.Used, err)
 		}
@@ -125,13 +125,13 @@ func (s *delayedFileSession) Close(ctx context.Context) error {
 }
 
 func TestRegistryTimeoutRetainsNativeOwnershipUntilCleanupIsKnown(t *testing.T) {
-	ns, config := openFileLifecycleNamespace(t)
+	v, config := openFileLifecycleVolume(t)
 	backing := &delayedFileSessionStorage{
-		Store: ns.namespace.(*localstore.Store), entered: make(chan struct{}), release: make(chan struct{}),
+		Store: v.volume.(*localstore.Store), entered: make(chan struct{}), release: make(chan struct{}),
 	}
-	handler, err := httprest.NewHandler(backing, ns.log)
+	handler, err := httprest.NewHandler(backing, v.log)
 	if err != nil {
-		_ = ns.close()
+		_ = v.close()
 		t.Fatal(err)
 	}
 	var release sync.Once
@@ -159,9 +159,9 @@ func TestRegistryTimeoutRetainsNativeOwnershipUntilCleanupIsKnown(t *testing.T) 
 	}
 	httpServer.Close()
 	closed := false
-	nativeClose := ns.close
-	ns.close = func() error { closed = true; return nativeClose() }
-	err = withOpened(ns, func() error { return closeFileRegistry(server, 20*time.Millisecond) })
+	nativeClose := v.close
+	v.close = func() error { closed = true; return nativeClose() }
+	err = withOpened(v, func() error { return closeFileRegistry(server, 20*time.Millisecond) })
 	if !errors.Is(err, context.DeadlineExceeded) || closed {
 		t.Fatalf("registry timeout returned closed=%t err=%v", closed, err)
 	}

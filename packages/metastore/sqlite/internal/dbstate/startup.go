@@ -91,12 +91,12 @@ func ValidateLegacySequences(ctx context.Context, db sqlvalue.Queryer, version i
 	if err := db.QueryRowContext(ctx, `
 		SELECT
 			(SELECT count(*) FROM nodes WHERE typeof(id) != 'integer') +
-			(SELECT count(*) FROM namespaces WHERE typeof(root) != 'integer') +
+			(SELECT count(*) FROM volumes WHERE typeof(root) != 'integer') +
 			(SELECT count(*) FROM entries
 			 WHERE typeof(parent) != 'integer' OR typeof(node) != 'integer'),
 			max(
 				coalesce((SELECT max(CASE WHEN typeof(id) = 'integer' THEN id ELSE 0 END) FROM nodes), 0),
-				coalesce((SELECT max(CASE WHEN typeof(root) = 'integer' THEN root ELSE 0 END) FROM namespaces), 0),
+				coalesce((SELECT max(CASE WHEN typeof(root) = 'integer' THEN root ELSE 0 END) FROM volumes), 0),
 				coalesce((SELECT max(CASE WHEN typeof(parent) = 'integer' THEN parent ELSE 0 END) FROM entries), 0),
 				coalesce((SELECT max(CASE WHEN typeof(node) = 'integer' THEN node ELSE 0 END) FROM entries), 0)
 			)

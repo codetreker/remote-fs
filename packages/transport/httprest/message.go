@@ -41,7 +41,7 @@ func (t Time) Time() time.Time { return time.Unix(t.UnixSec, int64(t.Nanos)) }
 //
 // Mode carries io/fs.FileMode's own bit layout rather than a POSIX st_mode, because both
 // ends of this protocol are Go and the translation to what a kernel wants belongs to
-// whatever presents the namespace as a filesystem.
+// whatever presents the volume as a filesystem.
 type Attr struct {
 	ID         uint64 `json:"id"`
 	Mode       uint32 `json:"mode"`
@@ -158,7 +158,7 @@ func (c AttrChange) Storage() storage.AttrChange {
 // The change travels in a body rather than as query operands because its fields are
 // optional and the operands are not: a request is refused unless it carries exactly the
 // operands its operation takes, which is what keeps a damaged query from reading as a
-// request against the whole namespace.
+// request against the whole volume.
 type SetAttrRequest struct {
 	Change *AttrChange `json:"change"`
 }
@@ -268,10 +268,10 @@ func (r ListResponse) Storage() []storage.Entry {
 // Space is storage.Space on the wire.
 //
 // Each count travels by pointer and the decoding below refuses an absent one. They are
-// byte counts whose zero is a legitimate figure — a namespace holding nothing has used
+// byte counts whose zero is a legitimate figure — a volume holding nothing has used
 // none, and a full one has none available — so once a field has been read there is no
 // telling absence from zero. As plain fields, a report that lost one would describe a
-// namespace with no room left, which reads as an ordinary answer and stops every write.
+// volume with no room left, which reads as an ordinary answer and stops every write.
 type Space struct {
 	Total *int64 `json:"total"`
 	Used  *int64 `json:"used"`
@@ -397,7 +397,7 @@ func (b *MutationBarrier) UnmarshalJSON(data []byte) error {
 }
 
 // MutationResponse is the successful response to an operation that may change the
-// namespace. Barrier is absent only when the served namespace has no change log.
+// volume. Barrier is absent only when the served volume has no change log.
 type MutationResponse struct {
 	Barrier *MutationBarrier `json:"barrier,omitempty"`
 }

@@ -8,14 +8,14 @@
 // Neither end needs anything beyond net/http, so taking one of them links nothing that
 // was not asked for.
 //
-// Namespace calls, explicit lock controls, and replication share one protocol version.
+// Volume calls, explicit lock controls, and replication share one protocol version.
 // Lock controls retain authoritative owner and action state in the paired backend. Bulk
 // bodies and replication streams have admission separate from the short lock controls.
 // Replication endpoints use separate connections so snapshot delivery does not consume
 // the connection carrying changes.
 //
 // The obligation the dialling end exists to meet is that a failure to reach the far side
-// must never arrive as an answer about the namespace. Anything that is not an outcome the
+// must never arrive as an answer about the volume. Anything that is not an outcome the
 // far side stated in this protocol's own terms — a connection that never opened, a
 // deadline, a body that will not parse, a body framed so that it cannot report having been
 // cut short, a status nobody promised, an errno name this side does not know — is
@@ -106,7 +106,7 @@ const (
 )
 
 // Query keys for the operands. Operands travel in the query string rather than in the
-// URL path because the query string is the only part of a URL that survives a namespace
+// URL path because the query string is the only part of a URL that survives a volume
 // path intact: http.ServeMux collapses "a//f" to "a/f" and resolves "a/b/../f" before a
 // handler sees it, and an encoded slash in a path segment cannot be told apart from a
 // separator. url.Values escaping round-trips any byte sequence, valid UTF-8 or not.
@@ -144,12 +144,12 @@ var ops = map[Op]opSpec{
 	OpRemove:      {method: http.MethodPost, operands: []string{keyPath}},
 	OpRemoveDir:   {method: http.MethodPost, operands: []string{keyPath}},
 	OpRename:      {method: http.MethodPost, operands: []string{keyPath, keyTo}},
-	// Space describes the whole namespace rather than anything under a path, so it takes
+	// Space describes the whole volume rather than anything under a path, so it takes
 	// no operands. A path sent beside it is refused like any operand nobody asked for.
 	OpSpace: {method: http.MethodGet},
 
 	// The replication endpoints read; none of them changes anything. Subscribe and
-	// Snapshot both mean "as the namespace is now", which is a question with no operands.
+	// Snapshot both mean "as the volume is now", which is a question with no operands.
 	OpSubscribe:   {method: http.MethodGet},
 	OpResubscribe: {method: http.MethodGet, operands: []string{keyIncarnation, keyPosition}},
 	OpSnapshot:    {method: http.MethodGet},
@@ -173,7 +173,7 @@ type Request struct {
 
 // Method reports the HTTP method the operation is sent with. Operations that only read
 // use GET so that they can be retried and traced as such; every operation that changes
-// the namespace uses POST.
+// the volume uses POST.
 func (r Request) Method() string {
 	spec, ok := ops[r.Op]
 	if !ok {
@@ -219,7 +219,7 @@ func (r Request) URL(base *url.URL) (*url.URL, error) {
 // that arrives twice, or one nobody asked for is an error rather than something to work
 // around: url.Values reports all four as an empty string, and an empty path names the
 // root — so the lenient reading of a damaged request is a request against the whole
-// namespace.
+// volume.
 func ParseRequest(method string, u *url.URL) (Request, error) {
 	rest, ok := strings.CutPrefix(u.Path, Prefix)
 	if !ok {

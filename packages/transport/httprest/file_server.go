@@ -96,7 +96,7 @@ func (r *fileRegistry) stop() {
 	}
 }
 
-// Close retires and drains sessions created by this handler. The namespace
+// Close retires and drains sessions created by this handler. The volume
 // backend remains owned by the caller. Drain the HTTP server before closing
 // that backend; a failed Close can retain native references and cleanup work.
 func (h *Handler) Close(ctx context.Context) error {
@@ -201,7 +201,7 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 	}
 	writeError := func(err error) {
 		response := ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error()}
-		if failure := namespaceLockFailure(err); failure != nil {
+		if failure := volumeLockFailure(err); failure != nil {
 			response.LockCode = failure.Code
 			recorded := failure.Recorded
 			response.Recorded = &recorded
@@ -660,7 +660,7 @@ func retainFileError(err error) error {
 	if len(detail) > 4096 {
 		detail = strings.Clone(detail[:4096])
 	}
-	if failure := namespaceLockFailure(err); failure != nil {
+	if failure := volumeLockFailure(err); failure != nil {
 		return &locking.Error{Code: failure.Code, Recorded: failure.Recorded, Message: detail}
 	}
 	return &operationError{req: Request{Op: OpFile}, errno: storage.ErrnoOf(err), detail: detail, canceled: errors.Is(err, context.Canceled), deadline: errors.Is(err, context.DeadlineExceeded)}

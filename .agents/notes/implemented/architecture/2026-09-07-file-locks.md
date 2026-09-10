@@ -14,7 +14,7 @@ Status: implemented
 
 ### 机制与策略分开
 
-`packages/locking` 持有有限授权、Session / Owner、生存期、动作历史与发布排序；`packages/storage/locked` 将它与支持原生发布检查的 namespace 配对。HTTP v3 发布显式控制操作与 mutation scope；保留的 localstore 与 Azure 两种形态都在实际修改处执行保护。完整接口与状态流见[文件锁设计](../../../../docs/design/server/file-locks.md)。
+`packages/locking` 持有有限授权、Session / Owner、生存期、动作历史与发布排序；`packages/storage/locked` 将它与支持原生发布检查的 volume 配对。HTTP v3 发布显式控制操作与 mutation scope；保留的 localstore 与 Azure 两种形态都在实际修改处执行保护。完整接口与状态流见[文件锁设计](../../../../docs/design/server/file-locks.md)。
 
 现有普通文件可以取得 `S` 或 `X`。多个 S 相容；X 排斥其他持有者的授权与修改。S 持有者自己也不能只凭 S 修改。显式 `SetAttr` 的 mode、atime 与 mtime 受同一修改检查；普通读取的平台 atime 副作用不是稳定 atime 的承诺。匿名修改只在不冲突于已授予保护时允许，普通读取不因 X 而变成受锁访问控制的操作。
 
@@ -24,13 +24,13 @@ Session、Owner 与 Grant 是不可伪造且绑定父级的能力引用，不能
 
 ### 最终转换才取得发布许可
 
-上传与暂存先完成。原生 backend 在实际资源已经确定后，将权限判断与最终命名空间转换放进同一个有序操作。过期或失效的 proof 不会因为没有竞争者而退回匿名执行，无关 proof 也不能充当额外授权。
+上传与暂存先完成。原生 backend 在实际资源已经确定后，将权限判断与最终 volume 转换放进同一个有序操作。过期或失效的 proof 不会因为没有竞争者而退回匿名执行，无关 proof 也不能充当额外授权。
 
 许可的线性化发生在最终转换入口；已经获得顺序的不可分割内核或 SQL 转换可以稍后完成，但相冲突的后继权限与新的权威视图捕获不能越过它。旧视图可以完成读取，批量读写不持有这个门。它保证操作次序，不承诺不可中断系统调用的完成时延，也不允许上传提前占住 lease。
 
-原生回调只执行一次最终转换，保留已知效果与资源退休结果。namespace 效果不明，或配额结算、撤销不明时，隔离当前授权方与 namespace；即使文件明确未变，也不能继续用不确定的账本放行。普通准备失败且成功撤销不承担这项隔离，原始故障与清理原因保持可见。
+原生回调只执行一次最终转换，保留已知效果与资源退休结果。volume 效果不明，或配额结算、撤销不明时，隔离当前授权方与 volume；即使文件明确未变，也不能继续用不确定的账本放行。普通准备失败且成功撤销不承担这项隔离，原始故障与清理原因保持可见。
 
-SQLite 使用 namespace 节点身份。有效资源引用、等待、grant 与发布保留所需原生引用，终态历史可只保留退休 ID；资源引用、grant generation、续期 revision、内容版本与 change-log position 保持独立。Resolve 的引用有限期，Acquire 重新确认实际目标存在且受支持。宿主目录实现曾以有界逻辑映射与固定文件对象应对 inode 复用及原子替换；该实现由[移除决定](../simplification/2026-09-08-remove-the-host-directory-backend.md)退出交付，稳定身份的通用义务仍保留。
+SQLite 使用 volume 节点身份。有效资源引用、等待、grant 与发布保留所需原生引用，终态历史可只保留退休 ID；资源引用、grant generation、续期 revision、内容版本与 change-log position 保持独立。Resolve 的引用有限期，Acquire 重新确认实际目标存在且受支持。宿主目录实现曾以有界逻辑映射与固定文件对象应对 inode 复用及原子替换；该实现由[移除决定](../simplification/2026-09-08-remove-the-host-directory-backend.md)退出交付，稳定身份的通用义务仍保留。
 
 ### 有界回放不依赖逐条永久保存
 
@@ -48,19 +48,19 @@ HTTP Acquire 在立即决定或登记 Pending 后返回，等待意图有有限�
 
 ### 最大时长证据换取重启保护
 
-授予与续期在确认更长的期限之前，先持久提高此前已发放 lease 时长的高水位。Accepted / Prepared 状态与 workspace 独立 Witness 共同证明它：先同步下一代 Prepared，再同步 Witness，最后完成 Accepted，之后才确认。单独的 UUID 只证明归属，不能证明某份较低时长的旧状态不是回放。
+授予与续期在确认更长的期限之前，先持久提高此前已发放 lease 时长的高水位。Accepted / Prepared 状态与 volume 独立 Witness 共同证明它：先同步下一代 Prepared，再同步 Witness，最后完成 Accepted，之后才确认。单独的 UUID 只证明归属，不能证明某份较低时长的旧状态不是回放。
 
-新授权方取得 workspace 独占写入所有权后，按记录的完整时长执行恢复屏障；普通读取与状态查询可用，授予与修改等待恢复。记录不因配置下调而降低，因此重启不能缩短旧配置下已经确认的保护。
+新授权方取得 volume 独占写入所有权后，按记录的完整时长执行恢复屏障；普通读取与状态查询可用，授予与修改等待恢复。记录不因配置下调而降低，因此重启不能缩短旧配置下已经确认的保护。
 
 这避免逐条持久保存 grant 与动作结果，代价是即使实际剩余授权很少，恢复也要等待记录中的完整最大时长。保护区间跨重启保留，精确管理历史不跨授权方恢复，两项承诺分别成立。
 
-宿主目录形态曾使用 namespace 外、同一 mount 上的私有 StateRoot，以根 xattr 绑定 workspace、状态身份与路径，并以根目录 lifetime flock 隔离另一授权方；Initialize / Open 分开防止缺失证据被当作新存储，暂存不进入可见 namespace。该专属状态机制随宿主目录后端移除。保留的 SQLite-backed 形态使用数据库与独立 Witness 的持久确认路径，不具备所需文件系统能力或证据不完整时仍明确拒绝。
+宿主目录形态曾使用 volume 外、同一 mount 上的私有 StateRoot，以根 xattr 绑定 volume、状态身份与路径，并以根目录 lifetime flock 隔离另一授权方；Initialize / Open 分开防止缺失证据被当作新存储，暂存不进入可见 volume。该专属状态机制随宿主目录后端移除。保留的 SQLite-backed 形态使用数据库与独立 Witness 的持久确认路径，不具备所需文件系统能力或证据不完整时仍明确拒绝。
 
-本地持久组合沿用单 workspace 私有根的所有权与 `.leases.intent` / `.leases.witness`。外部 `sqlite.OpenLocking` 拥有整份数据库的 native flock，数据库 inode 与相邻固定名字的证据绑定数据库身份，最大 lease 时长覆盖整份数据库。运行时选择的 namespace 不成为永久绑定：后续进程可选择另一个已有 namespace，仍须等待数据库级完整恢复间隔。这保留已有多 namespace 数据，并让独立证据与唯一发布者共用生命周期；代价是同一数据库只允许一个活跃锁服务拥有者，移动证据路径需要显式迁移。已绑定的库不能通过 raw API 或关闭 Locks 配置绕过保护。
+本地持久组合沿用单个 volume 的私有根的所有权与 `.leases.intent` / `.leases.witness`。外部 `sqlite.OpenLocking` 拥有整份数据库的 native flock，数据库 inode 与相邻固定名字的证据绑定数据库身份，最大 lease 时长覆盖整份数据库。运行时选择的 volume 不成为永久绑定：后续进程可选择另一个已有 volume，仍须等待数据库级完整恢复间隔。这保留已有多个 volume 的数据，并让独立证据与唯一发布者共用生命周期；代价是同一数据库只允许一个活跃锁服务拥有者，移动证据路径需要显式迁移。已绑定的库不能通过 raw API 或关闭 Locks 配置绕过保护。
 
 raw SQLite opener 持有数据库共享 flock，启用锁的拥有者取得排他 flock，防止另一进程或另一条库调用保留绕过权限检查的写入口。公开的恢复配置与启用入口也验证真实排他所有权和 native anchor；持久证据与写入所有权必须成对成立。
 
-[本地磁盘对象存储](2026-09-04-local-disk-object-store.md)继续拥有对象与数据库提交见证的持久格式；[对象存储中的命名空间](2026-08-21-namespace-in-an-object-store.md)的 Reserve / Put / Commit 在最终 Commit 接受授权检查；[未决对象发布](2026-09-04-unresolved-object-publication.md)继续区分 Put 未知与 Commit 未知的回收证据。lease Witness 与对象归属证明不互相替代。
+[本地磁盘对象存储](2026-09-04-local-disk-object-store.md)继续拥有对象与数据库提交见证的持久格式；[对象存储中的 volume](2026-08-21-volume-in-an-object-store.md)的 Reserve / Put / Commit 在最终 Commit 接受授权检查；[未决对象发布](2026-09-04-unresolved-object-publication.md)继续区分 Put 未知与 Commit 未知的回收证据。lease Witness 与对象归属证明不互相替代。
 
 [容量上限](2026-08-21-space-limit.md)把原生目标的最终大小与效果用于 limited 计费，[缩短结算](../bug-fix/2026-09-07-release-shrunk-quota-after-commit.md)只在确定生效后释放额度。这部分替代[目录改名中的配额采样](../../proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)的前提；不透明第三方 backend 的祖先改名协调仍由该提案拥有。
 
@@ -74,7 +74,7 @@ raw SQLite opener 持有数据库共享 flock，启用锁的拥有者取得排�
 | 目录、子树、未存在名字的锁 | 不由文件资源模式承诺，命中时明确拒绝；不能用路径字符串模拟逻辑文件身份 |
 | 升降级与递归获取 | 不提供隐式转换，重复持有明确失败；不得为它们引入隐藏的引用计数 |
 
-[活跃文件句柄](2026-09-08-live-file-handles.md)拥有普通 fd 的同对象读取、rename/unlink 保留、同步区间修改与标准 advisory；它不改变本决定的显式权限。经授权的名字移除使强资源成为 `TargetGone`，保留 File 与 advisory 继续指向旧对象。[打开文件身份](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)保留目录父身份与显式内容依据问题；[定序与版本](../../proposed/architecture/2026-08-19-ordering-and-versions.md)继续区分内容版本与日志位置。[操作词汇](../../proposed/architecture/2026-08-19-storage-operation-vocabulary.md)的分页及显式版本化提交仍独立。被否决的[写会话与暂存](../../rejected/architecture/2026-08-19-write-session-and-staging.md)保留延迟提交的理由与代价，它的本地 dirty 生命周期不等同于远端占有 Session。[workspace 契约](../../proposed/architecture/2026-08-19-workspace-in-the-contract.md)的注册与名字路由也没有由配对授权方完成。
+[活跃文件句柄](2026-09-08-live-file-handles.md)拥有普通 fd 的同对象读取、rename/unlink 保留、同步区间修改与标准 advisory；它不改变本决定的显式权限。经授权的名字移除使强资源成为 `TargetGone`，保留 File 与 advisory 继续指向旧对象。[打开文件身份](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)保留目录父身份与显式内容依据问题；[定序与版本](../../proposed/architecture/2026-08-19-ordering-and-versions.md)继续区分内容版本与日志位置。[操作词汇](../../proposed/architecture/2026-08-19-storage-operation-vocabulary.md)的分页及显式版本化提交仍独立。被否决的[写会话与暂存](../../rejected/architecture/2026-08-19-write-session-and-staging.md)保留延迟提交的理由与代价，它的本地 dirty 生命周期不等同于远端占有 Session。[volume 契约](../../proposed/architecture/2026-08-19-volume-in-the-contract.md)的注册与名字路由也没有由配对授权方完成。
 
 ## 备选方案
 
@@ -84,7 +84,7 @@ raw SQLite opener 持有数据库共享 flock，启用锁的拥有者取得排�
 
 **逐条持久恢复所有 grant 与动作结果。** 可在重启后继续回放精确结果，减少保守等待；但每个状态转换都进入持久格式与确认协议。已有要求允许以恢复屏障维持剩余保护，并将退役授权方的结果明确报为未知，因此只保存最大时长证据。
 
-**只用 UUID 绑定一份可覆盖的时长记录。** 它能发现状态来自另一份 workspace，不能发现同一身份下较低时长的旧记录。独立 Witness 与 Prepared/Accepted 次序保留单组件回退的证据；所有证明一起被一致回滚仍需要外部可信锚才能检测。
+**只用 UUID 绑定一份可覆盖的时长记录。** 它能发现状态来自另一个 volume，不能发现同一身份下较低时长的旧记录。独立 Witness 与 Prepared/Accepted 次序保留单组件回退的证据；所有证明一起被一致回滚仍需要外部可信锚才能检测。
 
 **同一变更中自动给 Open 加锁并完成内容 CAS。** 可以让调用方少做显式控制，但还要选择每种打开模式、持有者归属、续期和失败后的本地写入政策，并改变读取与提交携带的内容依据。把这些未确定的策略混入锁机制，会使权限与内容版本相互冒充；显式接口让它们保持可独立实现。
 

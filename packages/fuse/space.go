@@ -9,17 +9,17 @@ import (
 )
 
 // reportedBlockSize is the unit this mount reports space in. Nothing here holds anything
-// in blocks — the namespace charges bytes — so it is a denomination rather than a
+// in blocks — the volume charges bytes — so it is a denomination rather than a
 // property of any storage, and 4096 is what the filesystems a caller compares against use.
 const reportedBlockSize = 4096
 
 // maxNameLength is the longest name this mount will say a directory can hold. It is the
-// shortest limit any Linux filesystem a namespace can be held in imposes, and understating
+// shortest limit any Linux filesystem a volume can be held in imposes, and understating
 // it is the safe direction: a caller checking whether a name will fit is told no about a
 // name that would have fitted, rather than yes about one that will not.
 const maxNameLength = 255
 
-// spaceDeadline bounds one question to the namespace about its room, instead of letting
+// spaceDeadline bounds one question to the volume about its room, instead of letting
 // that question run for as long as the mount's own operation timeout allows.
 //
 // df touches every mount on the machine, so a server that is unreachable would otherwise
@@ -29,19 +29,19 @@ const maxNameLength = 255
 // is merely slow still answers, and one that is not there costs a pause rather than a hang.
 const spaceDeadline = 2 * time.Second
 
-// Statfs describes the room the namespace has, in the blocks the kernel asks for.
+// Statfs describes the room the volume has, in the blocks the kernel asks for.
 //
-// The figures are the namespace's own, and there is no other source for them: the FUSE
+// The figures are the volume's own, and there is no other source for them: the FUSE
 // library's default for a filesystem that does not answer is a zeroed reply, which reads
 // as a disk with no space left, and a program that checks for room before writing acts on
-// it (R-ERR-2). A namespace with no room of its own to report therefore answers ENOSYS and
+// it (R-ERR-2). A volume with no room of its own to report therefore answers ENOSYS and
 // that reaches the caller as it stands — df says "Function not implemented", which is true
 // — rather than being turned into numbers nobody measured.
 func (n *node) Statfs(ctx context.Context, out *gofuse.StatfsOut) syscall.Errno {
 	ask, cancel := context.WithTimeout(ctx, spaceDeadline)
 	defer cancel()
 
-	space, err := n.ns.storage.Space(ask)
+	space, err := n.volume.storage.Space(ask)
 	if err != nil {
 		return errnoOf(err)
 	}
@@ -59,7 +59,7 @@ func (n *node) Statfs(ctx context.Context, out *gofuse.StatfsOut) syscall.Errno 
 	out.Blocks = uint64(space.Total) / reportedBlockSize
 	out.Bfree = uint64(max(space.Total-space.Used, 0)) / reportedBlockSize
 	out.Bavail = uint64(space.Avail) / reportedBlockSize
-	// Nothing here counts inodes: the namespace charges bytes, and a figure in these
+	// Nothing here counts inodes: the volume charges bytes, and a figure in these
 	// fields would have to be invented. Zero is how a filesystem with no inode table
 	// reports having none, and df prints it as no figure rather than as none left.
 	out.Files, out.Ffree = 0, 0

@@ -162,16 +162,16 @@ func TestRetainedSessionAdmissionAndStorageCleanup(t *testing.T) {
 	}
 }
 
-type namespaceWithoutFiles struct {
+type volumeWithoutFiles struct {
 	storage.BoundedStorage
 	locking.Service
 }
 
-func (s namespaceWithoutFiles) LockService() locking.Service { return s.Service }
+func (s volumeWithoutFiles) LockService() locking.Service { return s.Service }
 
 func TestRetainedSessionsRejectAnAuthorityWithoutFileCapabilities(t *testing.T) {
 	s := serve(t, httprest.DefaultLimits())
-	plain := namespaceWithoutFiles{BoundedStorage: s.storage, Service: s.storage.LockService()}
+	plain := volumeWithoutFiles{BoundedStorage: s.storage, Service: s.storage.LockService()}
 	handler, err := httprest.NewHandler(plain, s.meta)
 	if err != nil {
 		t.Fatal(err)

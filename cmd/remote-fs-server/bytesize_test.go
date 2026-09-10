@@ -114,7 +114,7 @@ func TestTheAllowanceFlagRefusesWhatTheStorageWouldRefuse(t *testing.T) {
 	}
 
 	// The zero value reports nothing, which is how the flag package tells that this flag has
-	// no default to print — and there is none: without it the namespace is under no
+	// no default to print — and there is none: without it the volume is under no
 	// allowance at all.
 	var unset sizeFlag
 	if unset.String() != "" {

@@ -4,20 +4,20 @@ Status: implemented
 
 ## 问题
 
-SQLite metastore 的 node ID 是 namespace 对外暴露的持久身份，change position 是 replica 判断事件新旧与是否追上的依据。两者一旦分配就不能在删除原 row 后指向另一件事；否则旧 inode reference 会指到新节点，或 replica 会把新 mutation 当作已经见过的位置跳过。
+SQLite metastore 的 node ID 是 volume 对外暴露的持久身份，change position 是 replica 判断事件新旧与是否追上的依据。两者一旦分配就不能在删除原 row 后指向另一件事；否则旧 inode reference 会指到新节点，或 replica 会把新 mutation 当作已经见过的位置跳过。
 
 `INTEGER PRIMARY KEY AUTOINCREMENT` 通过 `sqlite_sequence` 避免正常删除后的 rowid 重用，但 `sqlite_sequence` 本身是普通可修改状态。若最高 row 已被删除，sequence row 又被删除或调低，剩余数据的最大值无法证明历史上曾经分配到哪里；下一次插入可以复用已消失的身份。只核对当前最大 row 因此不足以在服务前判断数据库是否仍保持持久身份语义。
 
 ## 决定
 
-schema v3 的 singleton `database_state` 保存 `node_high_water` 与 `change_high_water`，与 database identity 和 generation 一起提交。迁移从 `sqlite_sequence`、现存 node、namespace root、entry、retained change 中的 node reference，以及 log/change position 与 trim boundary 中取最大值，建立不会低于任何可见证据的初始高水位。
+schema v3 的 singleton `database_state` 保存 `node_high_water` 与 `change_high_water`，与 database identity 和 generation 一起提交。迁移从 `sqlite_sequence`、现存 node、volume root、entry、retained change 中的 node reference，以及 log/change position 与 trim boundary 中取最大值，建立不会低于任何可见证据的初始高水位。
 
-节点创建和 change append 使用显式 ID，不依赖隐式 rowid。写事务先要求 `sqlite_sequence` 与对应高水位完全相等，检查尚未到达 `math.MaxInt64`，将高水位增加一，再用这个显式值插入 `AUTOINCREMENT` 表；SQLite 在同一事务内把冗余 sequence 推进到相同值。change append 还要求当前 namespace 的 committed tail 严格小于新位置，避免运行中抬高的 tail 被写成新记录的 predecessor。任一项失败使整个 transaction 回滚。身份空间耗尽以 `ENOSPC` 拒绝，不绕回。
+节点创建和 change append 使用显式 ID，不依赖隐式 rowid。写事务先要求 `sqlite_sequence` 与对应高水位完全相等，检查尚未到达 `math.MaxInt64`，将高水位增加一，再用这个显式值插入 `AUTOINCREMENT` 表；SQLite 在同一事务内把冗余 sequence 推进到相同值。change append 还要求当前 volume 的 committed tail 严格小于新位置，避免运行中抬高的 tail 被写成新记录的 predecessor。任一项失败使整个 transaction 回滚。身份空间耗尽以 `ENOSPC` 拒绝，不绕回。
 
-数据库打开、checkpoint、`DurableState`、每次身份分配与每个 `Since` page 要求 `sqlite_sequence.nodes == node_high_water`、`sqlite_sequence.changes == change_high_water`。durable-state validation 还通过按 storage-class discriminator 与最大 identity 排序的 expression indexes 检查整个数据库：类型异常或任一 namespace 的 surviving reference 超过高水位都以有界 edge lookup 失败。打开、`ObjectStatus` 与其它 namespace 完整性入口继续逐行要求：
+数据库打开、checkpoint、`DurableState`、每次身份分配与每个 `Since` page 要求 `sqlite_sequence.nodes == node_high_water`、`sqlite_sequence.changes == change_high_water`。durable-state validation 还通过按 storage-class discriminator 与最大 identity 排序的 expression indexes 检查整个数据库：类型异常或任一 volume 的 surviving reference 超过高水位都以有界 edge lookup 失败。打开、`ObjectStatus` 与其它 volume 完整性入口继续逐行要求：
 
 - `database_state` 恰有一条、database identity 与所有 counter 的 storage class 和范围有效；
-- namespace root、node、entry parent/child、change parent/from/node 都不超过 node high-water；
+- volume root、node、entry parent/child、change parent/from/node 都不超过 node high-water；
 - log committed/trimmed position、change position 与 `previous_position` 都不超过 change high-water。
 
 replica snapshot 可以按任意 row 顺序观察已有正 ID；`Seeding` 累计本轮最大值，在 `Complete` 时一次把 node high-water 推进到原值与最大 observed ID 的较大者并核对 `sqlite_sequence`。增量 `Created` change 必须带严格大于当前 high-water 的 ID。这样 source identity 原样复制，不引入另一套本地编号，也不接受一个旧 ID 再次成为新节点，同时避免每个 snapshot row 重读和更新 allocator state。

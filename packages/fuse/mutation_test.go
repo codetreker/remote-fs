@@ -181,9 +181,9 @@ func mutationTree(t *testing.T) (*node, *node, *mutationStorage) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ns := activeTestNamespace(downstream, 1024)
-	ns.files = session
-	root := &node{ns: ns, id: rootIdentity(attr.ID)}
+	v := activeTestVolume(downstream, 1024)
+	v.files = session
+	root := &node{volume: v, id: rootIdentity(attr.ID)}
 	fsbridge.NewNodeFS(root, &fsbridge.Options{})
 	child, errno := root.Lookup(t.Context(), "f", &gofuse.EntryOut{})
 	if errno != 0 {
@@ -197,7 +197,7 @@ func mutationTree(t *testing.T) (*node, *node, *mutationStorage) {
 
 func mutationHandle(t *testing.T, n *node) *handle {
 	t.Helper()
-	file, err := n.ns.files.OpenNode(t.Context(), n.id.node, storage.FileOpenOptions{Read: true, Write: true})
+	file, err := n.volume.files.OpenNode(t.Context(), n.id.node, storage.FileOpenOptions{Read: true, Write: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestCreationCancellationAccountsForCompletedStages(t *testing.T) {
 			}
 			attr, err := downstream.FileStorage.Stat(t.Context(), "new")
 			if test.changed && err != nil || !test.changed && !errors.Is(err, syscall.ENOENT) {
-				t.Fatalf("namespace after interrupted creation: %v", err)
+				t.Fatalf("volume after interrupted creation: %v", err)
 			}
 			if test.changed && !test.directory && attr.Mode.Perm() != 0600 {
 				t.Fatalf("atomic create left mode %v instead of requested 0600", attr.Mode)
@@ -364,7 +364,7 @@ func TestWriteFailureIsReportedBeforeAnAttributeChange(t *testing.T) {
 }
 
 func TestMutationClassificationPreservesIndependentFailures(t *testing.T) {
-	fault := errors.New("namespace unavailable")
+	fault := errors.New("volume unavailable")
 	for _, cause := range []error{syscall.EACCES, fault, errors.Join(context.Canceled, fault), errors.Join(fault, context.Canceled), context.DeadlineExceeded} {
 		if got := afterMutation(true, cause); got != cause {
 			t.Errorf("mutation changed independent failure %v to %v", cause, got)

@@ -7,9 +7,9 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// FileStore retains regular-file identities independently of namespace entries.
+// FileStore retains regular-file identities independently of volume entries.
 // Opens and requested creation/truncation are atomic with retention. Usage includes
-// detached files and remains available when the namespace has no allowance.
+// detached files and remains available when the volume has no allowance.
 type FileStore interface {
 	// CheckFileStore reports the constructor-selected retention capability without
 	// waiting for I/O or publication. Operations verify current exclusive ownership.
@@ -24,7 +24,7 @@ type FileStore interface {
 
 // FileState captures attributes and content identity from one committed revision.
 // Revision changes on every content publication, including empty-to-empty writes.
-// Detached files have no namespace entry and produce no namespace change events.
+// Detached files have no volume entry and produce no volume change events.
 type FileState struct {
 	Node
 	Revision uint64

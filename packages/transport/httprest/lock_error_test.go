@@ -20,14 +20,14 @@ func (e classifiedPublicationFailure) Error() string {
 func (e classifiedPublicationFailure) Unwrap() error         { return e.cause }
 func (e classifiedPublicationFailure) Classification() error { return syscall.EIO }
 
-func TestNamespaceJoinedLockFailurePreservesWholeOutcome(t *testing.T) {
+func TestVolumeJoinedLockFailurePreservesWholeOutcome(t *testing.T) {
 	conflict := &locking.Error{Code: locking.Conflict, Message: "file occupied"}
 	cleanup := fmt.Errorf("rollback evidence failed: %w", syscall.EIO)
 	for name, failure := range map[string]error{
 		"conflict then cleanup":  errors.Join(conflict, cleanup),
 		"cleanup then conflict":  errors.Join(cleanup, conflict),
 		"classified uncertainty": classifiedPublicationFailure{cause: errors.Join(conflict, cleanup)},
-		"wrapped join":           fmt.Errorf("namespace commit: %w", errors.Join(conflict, cleanup)),
+		"wrapped join":           fmt.Errorf("volume commit: %w", errors.Join(conflict, cleanup)),
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := &Handler{maxBodyBytes: 1024}
@@ -51,7 +51,7 @@ func TestNamespaceJoinedLockFailurePreservesWholeOutcome(t *testing.T) {
 	}
 }
 
-func TestNamespaceWrappedLockFailureRetainsItsDiagnostic(t *testing.T) {
+func TestVolumeWrappedLockFailureRetainsItsDiagnostic(t *testing.T) {
 	original := fmt.Errorf("replace file: %w", &locking.Error{Code: locking.StaleGrant, Message: "grant expired"})
 	h := &Handler{maxBodyBytes: 1024}
 	answer := httptest.NewRecorder()
@@ -66,7 +66,7 @@ func TestNamespaceWrappedLockFailureRetainsItsDiagnostic(t *testing.T) {
 	}
 }
 
-func TestNamespaceLockDiagnosticUsesTheNamespaceBodyBound(t *testing.T) {
+func TestVolumeLockDiagnosticUsesTheVolumeBodyBound(t *testing.T) {
 	diagnostic := strings.Repeat("path-segment/", 100) + ": grant expired"
 	h := &Handler{maxBodyBytes: 1 << 20}
 	answer := httptest.NewRecorder()
@@ -75,11 +75,11 @@ func TestNamespaceLockDiagnosticUsesTheNamespaceBodyBound(t *testing.T) {
 	err := (&Storage{}).storageError(Request{Op: OpWrite, Path: "f"}, answer.Body.Bytes())
 	var failure *locking.Error
 	if !errors.As(err, &failure) || failure.Code != locking.StaleGrant || failure.Message != original.Error() {
-		t.Fatalf("bounded namespace diagnostic lost its exact outcome: %v", err)
+		t.Fatalf("bounded volume diagnostic lost its exact outcome: %v", err)
 	}
 }
 
-func TestNamespaceLockFailureRejectsDamagedClassifications(t *testing.T) {
+func TestVolumeLockFailureRejectsDamagedClassifications(t *testing.T) {
 	for _, body := range []string{
 		`{"errno":"ESTALE","message":"expired","lockCode":"staleGrant"}`,
 		`{"errno":"ESTALE","message":"expired","lockCode":"staleGrant","recorded":null}`,
@@ -90,12 +90,12 @@ func TestNamespaceLockFailureRejectsDamagedClassifications(t *testing.T) {
 		err := (&Storage{}).storageError(Request{Op: OpWrite, Path: "f"}, []byte(body))
 		var failure *locking.Error
 		if storage.ErrnoOf(err) != syscall.EIO || errors.As(err, &failure) {
-			t.Fatalf("malformed namespace lock error accepted: %v", err)
+			t.Fatalf("malformed volume lock error accepted: %v", err)
 		}
 	}
 }
 
-func TestNamespaceSingletonJoinedLockFailureRetainsItsCode(t *testing.T) {
+func TestVolumeSingletonJoinedLockFailureRetainsItsCode(t *testing.T) {
 	original := &locking.Error{Code: locking.Conflict, Message: "file occupied"}
 	for _, err := range []error{
 		errors.Join(original, nil),

@@ -230,7 +230,7 @@ func TestStreamSetupErrorsUseClientResponseAdmission(t *testing.T) {
 }
 
 func TestHandlerAdmissionBoundsStatWaitersAndAQueuedWrite(t *testing.T) {
-	backing := namespaceFixture(t)
+	backing := volumeFixture(t)
 	blocked := &blockedStatStorage{
 		BoundedStorage: backing,
 		entered:        make(chan struct{}),
@@ -276,7 +276,7 @@ func TestHandlerAdmissionBoundsStatWaitersAndAQueuedWrite(t *testing.T) {
 }
 
 func TestHandlerChargesFixedErrorResponsesAgainstAggregateBytes(t *testing.T) {
-	backing := namespaceFixture(t)
+	backing := volumeFixture(t)
 	blocked := &multiBlockedStatStorage{
 		BoundedStorage: backing,
 		entered:        make(chan struct{}, 5),
@@ -321,7 +321,7 @@ func TestHandlerChargesFixedErrorResponsesAgainstAggregateBytes(t *testing.T) {
 }
 
 func TestSnapshotFrameAdmissionBoundsAggregateWaitersAndCancellation(t *testing.T) {
-	backing := namespaceFixture(t)
+	backing := volumeFixture(t)
 	options := DefaultHandlerOptions()
 	options.Replication.Keepalive = time.Hour
 	options.MaxFrameBytes = 1024
@@ -388,7 +388,7 @@ func TestDerivedStreamFrameBoundsUseCheckedProducts(t *testing.T) {
 }
 
 func TestChangeDeliveryIsIndependentOfSnapshotAdmissionAndASlowSubscriber(t *testing.T) {
-	log, err := metasqlite.Open(t.Context(), filepath.Join(t.TempDir(), "log.db"), "workspace", 0, metasqlite.DefaultWindow())
+	log, err := metasqlite.Open(t.Context(), filepath.Join(t.TempDir(), "log.db"), "volume", 0, metasqlite.DefaultWindow())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +396,7 @@ func TestChangeDeliveryIsIndependentOfSnapshotAdmissionAndASlowSubscriber(t *tes
 	if err := log.Create(t.Context(), "changed"); err != nil {
 		t.Fatal(err)
 	}
-	backing := namespaceFixture(t)
+	backing := volumeFixture(t)
 	options := DefaultHandlerOptions()
 	options.MaxFrameBytes = 1024
 	options.MaxConcurrentSnapshotFrames = 1
@@ -446,7 +446,7 @@ func TestChangeDeliveryIsIndependentOfSnapshotAdmissionAndASlowSubscriber(t *tes
 }
 
 func TestSnapshotKeepalivesContinueWhileFrameAdmissionWaits(t *testing.T) {
-	log, err := metasqlite.Open(t.Context(), filepath.Join(t.TempDir(), "log.db"), "workspace", 0, metasqlite.DefaultWindow())
+	log, err := metasqlite.Open(t.Context(), filepath.Join(t.TempDir(), "log.db"), "volume", 0, metasqlite.DefaultWindow())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,7 +454,7 @@ func TestSnapshotKeepalivesContinueWhileFrameAdmissionWaits(t *testing.T) {
 	if err := log.Create(t.Context(), "entry"); err != nil {
 		t.Fatal(err)
 	}
-	backing := namespaceFixture(t)
+	backing := volumeFixture(t)
 	options := DefaultHandlerOptions()
 	options.MaxFrameBytes = 1024
 	options.MaxConcurrentSnapshotFrames = 1
@@ -611,8 +611,8 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 }
 
 func TestSubscriptionAdmissionReleasesOnCancelAndStop(t *testing.T) {
-	backing := namespaceFixture(t)
-	log, err := metasqlite.Open(t.Context(), filepath.Join(t.TempDir(), "log.db"), "workspace", 0, metasqlite.DefaultWindow())
+	backing := volumeFixture(t)
+	log, err := metasqlite.Open(t.Context(), filepath.Join(t.TempDir(), "log.db"), "volume", 0, metasqlite.DefaultWindow())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -819,7 +819,7 @@ func serveInternal(t *testing.T, handler http.Handler, request Request, body io.
 	return response
 }
 
-func namespaceFixture(t *testing.T) *objectstore.Storage {
+func volumeFixture(t *testing.T) *objectstore.Storage {
 	t.Helper()
 	_, backend := memoryfixture.New(t, "transport-internal", 1<<30, locking.DefaultOptions())
 	return backend

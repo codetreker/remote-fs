@@ -11,7 +11,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore"
 )
 
-func TestTrimHonorsVolumeAgeFloorAndNamespace(t *testing.T) {
+func TestTrimHonorsVolumeAgeFloorAndVolume(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		window Window
@@ -36,11 +36,11 @@ func TestTrimHonorsVolumeAgeFloorAndNamespace(t *testing.T) {
 			if err := Record(t.Context(), tx, 2, foreignChange); err != nil {
 				t.Fatal(err)
 			}
-			execLogSQL(t, tx, `UPDATE changes SET recorded_sec=?, recorded_nsec=0 WHERE namespace=1 AND position<=?`, time.Now().Add(-48*time.Hour).Unix(), test.old)
+			execLogSQL(t, tx, `UPDATE changes SET recorded_sec=?, recorded_nsec=0 WHERE volume=1 AND position<=?`, time.Now().Add(-48*time.Hour).Unix(), test.old)
 			if err := Trim(t.Context(), tx, 1, test.window); err != nil {
 				t.Fatal(err)
 			}
-			rows, err := tx.QueryContext(t.Context(), `SELECT position FROM changes WHERE namespace=1 ORDER BY position`)
+			rows, err := tx.QueryContext(t.Context(), `SELECT position FROM changes WHERE volume=1 ORDER BY position`)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -57,10 +57,10 @@ func TestTrimHonorsVolumeAgeFloorAndNamespace(t *testing.T) {
 			}
 			var cut, tail, foreign int64
 			var age bool
-			if err := tx.QueryRowContext(t.Context(), `SELECT trimmed_through,trimmed_by_age,committed_position FROM logs WHERE namespace=1`).Scan(&cut, &age, &tail); err != nil {
+			if err := tx.QueryRowContext(t.Context(), `SELECT trimmed_through,trimmed_by_age,committed_position FROM logs WHERE volume=1`).Scan(&cut, &age, &tail); err != nil {
 				t.Fatal(err)
 			}
-			if err := tx.QueryRowContext(t.Context(), `SELECT count(*) FROM changes WHERE namespace=2`).Scan(&foreign); err != nil {
+			if err := tx.QueryRowContext(t.Context(), `SELECT count(*) FROM changes WHERE volume=2`).Scan(&foreign); err != nil {
 				t.Fatal(err)
 			}
 			if !reflect.DeepEqual(got, test.want) || cut != test.cut || age != test.age || tail != 5 || foreign != 1 {

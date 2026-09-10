@@ -60,7 +60,7 @@ func TestLeaseNativeOwnershipCrossProcess(t *testing.T) {
 					}
 				}()
 				if _, err := reopened.Stat(t.Context(), "committed"); err != nil {
-					t.Fatalf("acknowledged namespace after owner exit: %v", err)
+					t.Fatalf("acknowledged volume after owner exit: %v", err)
 				}
 			})
 		}
@@ -127,13 +127,13 @@ func assertRawLeaseOpenRejected(t *testing.T, database string) {
 		t.Fatal(err)
 	}
 	for _, path := range []string{database, alias, filepath.Join(parentAlias, filepath.Base(database))} {
-		for _, namespace := range []string{"workspace", "other"} {
-			opened, err := OpenWithOptions(t.Context(), path, namespace, 0, DefaultOptions())
+		for _, volume := range []string{"workspace", "other"} {
+			opened, err := OpenWithOptions(t.Context(), path, volume, 0, DefaultOptions())
 			if opened != nil {
 				opened.Close()
 			}
 			if !errors.Is(err, syscall.EIO) {
-				t.Fatalf("raw open of bound database through %q in namespace %q = %v", path, namespace, err)
+				t.Fatalf("raw open of bound database through %q in volume %q = %v", path, volume, err)
 			}
 		}
 	}
@@ -242,7 +242,7 @@ func TestLeaseNativeOwnershipProcess(t *testing.T) {
 		store, closeStore = opened, opened.Close
 	case "locked", "close-failure":
 		opened, err := OpenLocking(t.Context(), LockingConfig{
-			Database: database, Namespace: "workspace", SQLite: DefaultOptions(),
+			Database: database, Volume: "workspace", SQLite: DefaultOptions(),
 			Locks: locking.DefaultOptions(), Initialize: true,
 		})
 		if err != nil {
@@ -296,7 +296,7 @@ func lockingTestConfig(t *testing.T) LockingConfig {
 		t.Fatal(err)
 	}
 	return LockingConfig{
-		Database: filepath.Join(directory, "namespace.sqlite"), Namespace: "workspace",
+		Database: filepath.Join(directory, "volume.sqlite"), Volume: "workspace",
 		SQLite: DefaultOptions(), Locks: locking.DefaultOptions(), Initialize: true,
 	}
 }
@@ -316,7 +316,7 @@ func TestLockingStoreRetainsOldMaximumAndRejectsRawReopen(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if raw, err := OpenWithOptions(t.Context(), config.Database, config.Namespace, 0, DefaultOptions()); !errors.Is(err, syscall.EIO) {
+	if raw, err := OpenWithOptions(t.Context(), config.Database, config.Volume, 0, DefaultOptions()); !errors.Is(err, syscall.EIO) {
 		if raw != nil {
 			raw.Close()
 		}
@@ -355,7 +355,7 @@ func TestLockingStoreRetainsOldMaximumAndRejectsRawReopen(t *testing.T) {
 
 func TestLockingStoreExclusiveOwnerRejectsExistingRawAndLockedOpeners(t *testing.T) {
 	config := lockingTestConfig(t)
-	raw, err := OpenWithOptions(t.Context(), config.Database, config.Namespace, 0, DefaultOptions())
+	raw, err := OpenWithOptions(t.Context(), config.Database, config.Volume, 0, DefaultOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +405,7 @@ func TestLockingStoreMissingEvidenceDoesNotReinitialize(t *testing.T) {
 				t.Fatal(err)
 			}
 			if missing != "row" {
-				if err := os.Remove(filepath.Join(filepath.Dir(config.Database), ".namespace.sqlite.leases."+missing)); err != nil {
+				if err := os.Remove(filepath.Join(filepath.Dir(config.Database), ".volume.sqlite.leases."+missing)); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -418,7 +418,7 @@ func TestLockingStoreMissingEvidenceDoesNotReinitialize(t *testing.T) {
 					t.Fatalf("missing %s initialize=%v returned %v", missing, initialize, err)
 				}
 			}
-			if raw, err := OpenWithOptions(t.Context(), config.Database, config.Namespace, 0, DefaultOptions()); !errors.Is(err, syscall.EIO) {
+			if raw, err := OpenWithOptions(t.Context(), config.Database, config.Volume, 0, DefaultOptions()); !errors.Is(err, syscall.EIO) {
 				if raw != nil {
 					raw.Close()
 				}
@@ -431,7 +431,7 @@ func TestLockingStoreMissingEvidenceDoesNotReinitialize(t *testing.T) {
 func TestLockingStoreAcknowledgedLeaseSurvivesSIGKILL(t *testing.T) {
 	if database := os.Getenv("RFS_LEASE_CRASH_DATABASE"); database != "" {
 		config := LockingConfig{
-			Database: database, Namespace: "workspace", SQLite: DefaultOptions(),
+			Database: database, Volume: "workspace", SQLite: DefaultOptions(),
 			Locks: locking.DefaultOptions(), Initialize: true,
 		}
 		s, err := OpenLocking(context.Background(), config)
@@ -593,14 +593,14 @@ func TestLockingStoreRawAliasCannotBypassNativeBinding(t *testing.T) {
 	if err := os.Symlink(config.Database, alias); err != nil {
 		t.Fatal(err)
 	}
-	if raw, err := OpenWithOptions(t.Context(), alias, config.Namespace, 0, DefaultOptions()); !errors.Is(err, syscall.EIO) {
+	if raw, err := OpenWithOptions(t.Context(), alias, config.Volume, 0, DefaultOptions()); !errors.Is(err, syscall.EIO) {
 		if raw != nil {
 			raw.Close()
 		}
 		t.Fatalf("raw alias bypassed missing SQL evidence: %v", err)
 	}
 	for _, suffix := range []string{"?mode=rw", "#fragment", "%00"} {
-		if raw, err := OpenWithOptions(t.Context(), config.Database+suffix, config.Namespace, 0, DefaultOptions()); !errors.Is(err, syscall.EINVAL) {
+		if raw, err := OpenWithOptions(t.Context(), config.Database+suffix, config.Volume, 0, DefaultOptions()); !errors.Is(err, syscall.EINVAL) {
 			if raw != nil {
 				raw.Close()
 			}

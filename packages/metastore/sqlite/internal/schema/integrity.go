@@ -14,12 +14,12 @@ import (
 
 // validateIntegrityWork counts the retained graph with scalar aggregates before any recursive
 // traversal. sqlvalue.WouldExceed performs the addition without overflow. A scoped count includes every
-// entry whose label, parent, or child touches the namespace, so a corrupt label cannot hide
+// entry whose label, parent, or child touches the volume, so a corrupt label cannot hide
 // work from the configured bound.
 func validateIntegrityWork(
 	ctx context.Context,
 	db sqlvalue.Queryer,
-	namespace *int64,
+	volume *int64,
 	maxIntegrityRecords int64,
 ) error {
 	var logTables int64
@@ -32,59 +32,59 @@ func validateIntegrityWork(
 		return fmt.Errorf("the database has %d of the 2 required log tables: %w", logTables, syscall.EIO)
 	}
 
-	var namespaces, nodes, objects, entries, logs, changes int64
+	var volumes, nodes, objects, entries, logs, changes int64
 	var err error
-	if namespace == nil {
+	if volume == nil {
 		if logTables == 0 {
 			err = db.QueryRowContext(ctx, `
 				SELECT
-					(SELECT count(*) FROM namespaces),
+					(SELECT count(*) FROM volumes),
 					(SELECT count(*) FROM nodes),
 					(SELECT count(*) FROM objects),
-					(SELECT count(*) FROM entries)`).Scan(&namespaces, &nodes, &objects, &entries)
+					(SELECT count(*) FROM entries)`).Scan(&volumes, &nodes, &objects, &entries)
 		} else {
 			err = db.QueryRowContext(ctx, `
 				SELECT
-					(SELECT count(*) FROM namespaces),
+					(SELECT count(*) FROM volumes),
 					(SELECT count(*) FROM nodes),
 					(SELECT count(*) FROM objects),
 					(SELECT count(*) FROM entries),
 					(SELECT count(*) FROM logs),
 					(SELECT count(*) FROM changes)`).Scan(
-				&namespaces, &nodes, &objects, &entries, &logs, &changes,
+				&volumes, &nodes, &objects, &entries, &logs, &changes,
 			)
 		}
 	} else {
 		err = db.QueryRowContext(ctx, `
 			SELECT
-				(SELECT count(*) FROM namespaces WHERE id = ?),
-				(SELECT count(*) FROM nodes WHERE namespace = ?),
+				(SELECT count(*) FROM volumes WHERE id = ?),
+				(SELECT count(*) FROM nodes WHERE volume = ?),
 				(SELECT count(*) FROM objects o
-				 WHERE o.namespace = ? OR EXISTS (
-					 SELECT 1 FROM nodes n WHERE n.namespace = ? AND n.content = o.key
+				 WHERE o.volume = ? OR EXISTS (
+					 SELECT 1 FROM nodes n WHERE n.volume = ? AND n.content = o.key
 				 )),
 				(SELECT count(*)
 				 FROM entries e
 				 LEFT JOIN nodes parent ON parent.id = e.parent
 				 LEFT JOIN nodes child ON child.id = e.node
-				 WHERE e.namespace = ? OR parent.namespace = ? OR child.namespace = ?),
-				(SELECT count(*) FROM logs WHERE namespace = ?),
-				(SELECT count(*) FROM changes WHERE namespace = ?)`,
-			*namespace, *namespace, *namespace, *namespace,
-			*namespace, *namespace, *namespace, *namespace, *namespace).Scan(
-			&namespaces, &nodes, &objects, &entries, &logs, &changes,
+				 WHERE e.volume = ? OR parent.volume = ? OR child.volume = ?),
+				(SELECT count(*) FROM logs WHERE volume = ?),
+				(SELECT count(*) FROM changes WHERE volume = ?)`,
+			*volume, *volume, *volume, *volume,
+			*volume, *volume, *volume, *volume, *volume).Scan(
+			&volumes, &nodes, &objects, &entries, &logs, &changes,
 		)
 	}
 	if err != nil {
-		return fmt.Errorf("counting namespace integrity work: %w", sqlerr.ReadFailure(ctx, err))
+		return fmt.Errorf("counting volume integrity work: %w", sqlerr.ReadFailure(ctx, err))
 	}
-	if namespaces < 0 || nodes < 0 || objects < 0 || entries < 0 || logs < 0 || changes < 0 {
-		return fmt.Errorf("the database returned a negative namespace integrity count: %w", syscall.EIO)
+	if volumes < 0 || nodes < 0 || objects < 0 || entries < 0 || logs < 0 || changes < 0 {
+		return fmt.Errorf("the database returned a negative volume integrity count: %w", syscall.EIO)
 	}
-	if sqlvalue.WouldExceed(maxIntegrityRecords, namespaces, nodes, objects, entries, logs, changes) {
+	if sqlvalue.WouldExceed(maxIntegrityRecords, volumes, nodes, objects, entries, logs, changes) {
 		return fmt.Errorf(
-			"namespace integrity requires %d namespaces, %d nodes, %d objects, %d entries, %d logs, and %d changes, above the configured work limit of %d; raise MaxIntegrityRecords to open it: %w",
-			namespaces, nodes, objects, entries, logs, changes, maxIntegrityRecords, syscall.EFBIG)
+			"volume integrity requires %d volumes, %d nodes, %d objects, %d entries, %d logs, and %d changes, above the configured work limit of %d; raise MaxIntegrityRecords to open it: %w",
+			volumes, nodes, objects, entries, logs, changes, maxIntegrityRecords, syscall.EFBIG)
 	}
 	return nil
 }
@@ -95,7 +95,7 @@ func validateIntegrityWork(
 func validateIntegrityBytes(
 	ctx context.Context,
 	db sqlvalue.Queryer,
-	namespace *int64,
+	volume *int64,
 	maxIntegrityBytes int64,
 	version int,
 ) error {
@@ -104,14 +104,14 @@ func validateIntegrityBytes(
 	changeWhere := ""
 	entryArgs := []any{}
 	changeArgs := []any{}
-	if namespace != nil {
+	if volume != nil {
 		entryWhere = `
 			LEFT JOIN nodes parent ON parent.id = e.parent
 			LEFT JOIN nodes child ON child.id = e.node
-			WHERE e.namespace = ? OR parent.namespace = ? OR child.namespace = ?`
-		changeWhere = "WHERE namespace = ?"
-		entryArgs = []any{*namespace, *namespace, *namespace}
-		changeArgs = []any{*namespace}
+			WHERE e.volume = ? OR parent.volume = ? OR child.volume = ?`
+		changeWhere = "WHERE volume = ?"
+		entryArgs = []any{*volume, *volume, *volume}
+		changeArgs = []any{*volume}
 	}
 	rows, err := db.QueryContext(ctx, `
 		SELECT typeof(e.name), CASE WHEN typeof(e.name) = 'blob' THEN length(e.name) END
@@ -188,32 +188,32 @@ func validateIntegrityBytes(
 
 // validateStorageClasses rejects SQLite's dynamically typed values before any cursor or
 // payload reader can coerce them into a plausible row or order them in another storage class.
-func validateStorageClasses(ctx context.Context, db sqlvalue.Queryer, namespace *int64) error {
-	return validateStorageClassesVersion(ctx, db, namespace, schema.Version())
+func validateStorageClasses(ctx context.Context, db sqlvalue.Queryer, volume *int64) error {
+	return validateStorageClassesVersion(ctx, db, volume, schema.Version())
 }
 
-func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, namespace *int64, version int) error {
-	namespaceWhere := ""
+func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, version int) error {
+	volumeWhere := ""
 	nodeWhere := ""
 	objectWhere := ""
 	entryWhere := ""
 	logWhere := ""
 	changeWhere := ""
 	var scopeArgs []any
-	if namespace != nil {
-		namespaceWhere = "WHERE id = ?"
-		nodeWhere = "WHERE namespace = ?"
-		objectWhere = `WHERE (o.namespace = ? OR EXISTS (
-			SELECT 1 FROM nodes n WHERE n.namespace = ? AND n.content = o.key))`
-		entryWhere = `WHERE (e.namespace = ? OR parent.namespace = ? OR child.namespace = ?)`
-		logWhere = "WHERE namespace = ?"
-		changeWhere = "WHERE namespace = ?"
-		scopeArgs = []any{*namespace}
+	if volume != nil {
+		volumeWhere = "WHERE id = ?"
+		nodeWhere = "WHERE volume = ?"
+		objectWhere = `WHERE (o.volume = ? OR EXISTS (
+			SELECT 1 FROM nodes n WHERE n.volume = ? AND n.content = o.key))`
+		entryWhere = `WHERE (e.volume = ? OR parent.volume = ? OR child.volume = ?)`
+		logWhere = "WHERE volume = ?"
+		changeWhere = "WHERE volume = ?"
+		scopeArgs = []any{*volume}
 	}
 
-	var invalidNamespaces int64
-	query := `SELECT count(*) FROM namespaces ` + namespaceWhere
-	if namespaceWhere == "" {
+	var invalidVolumes int64
+	query := `SELECT count(*) FROM volumes ` + volumeWhere
+	if volumeWhere == "" {
 		query += " WHERE "
 	} else {
 		query += " AND "
@@ -221,15 +221,15 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, nam
 	query += `(
 		typeof(id) != 'integer' OR id <= 0 OR typeof(name) != 'text' OR name = '' OR
 		typeof(root) != 'integer' OR root <= 0 OR typeof(used) != 'integer')`
-	if err := db.QueryRowContext(ctx, query, scopeArgs...).Scan(&invalidNamespaces); err != nil {
+	if err := db.QueryRowContext(ctx, query, scopeArgs...).Scan(&invalidVolumes); err != nil {
 		return err
 	}
 
 	objectArgs := []any{}
 	entryArgs := []any{}
-	if namespace != nil {
-		objectArgs = []any{*namespace, *namespace}
-		entryArgs = []any{*namespace, *namespace, *namespace}
+	if volume != nil {
+		objectArgs = []any{*volume, *volume}
+		entryArgs = []any{*volume, *volume, *volume}
 	}
 	retainedNodeClasses := ""
 	if version >= firstRetainedFileSchemaVersion {
@@ -242,14 +242,14 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, nam
 	}{
 		{"nodes", `SELECT count(*) FROM nodes ` + nodeWhere + predicateJoin(nodeWhere) + `(
 			typeof(id) != 'integer' OR id <= 0 OR
-			typeof(namespace) != 'integer' OR namespace <= 0 OR
+			typeof(volume) != 'integer' OR volume <= 0 OR
 			typeof(mode) != 'integer' OR typeof(size) != 'integer' OR
 			typeof(atime_sec) != 'integer' OR typeof(atime_nsec) != 'integer' OR
 			typeof(mtime_sec) != 'integer' OR typeof(mtime_nsec) != 'integer' OR
 			typeof(content) NOT IN ('text', 'null')` + retainedNodeClasses + `)`, scopeArgs},
 		{"objects", `SELECT count(*) FROM objects o ` + objectWhere + predicateJoin(objectWhere) + `(
 			typeof(o.key) != 'text' OR o.key = '' OR
-			typeof(o.namespace) != 'integer' OR o.namespace <= 0 OR
+			typeof(o.volume) != 'integer' OR o.volume <= 0 OR
 			typeof(o.state) != 'integer' OR typeof(o.size) != 'integer' OR
 			typeof(o.digest) NOT IN ('blob', 'null') OR
 			typeof(o.created_sec) != 'integer' OR typeof(o.created_nsec) != 'integer')`,
@@ -257,21 +257,21 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, nam
 		{"entries", `SELECT count(*) FROM entries e
 		 LEFT JOIN nodes parent ON parent.id = e.parent
 		 LEFT JOIN nodes child ON child.id = e.node ` + entryWhere + predicateJoin(entryWhere) + `(
-			typeof(e.namespace) != 'integer' OR e.namespace <= 0 OR
+			typeof(e.volume) != 'integer' OR e.volume <= 0 OR
 			typeof(e.parent) != 'integer' OR e.parent <= 0 OR
 			typeof(e.name) != 'blob' OR length(e.name) = 0 OR
 			e.name IN (X'2e', X'2e2e') OR instr(e.name, X'2f') != 0 OR instr(e.name, X'00') != 0 OR
 			typeof(e.node) != 'integer' OR e.node <= 0)`,
 			entryArgs},
 		{"logs", `SELECT count(*) FROM logs ` + logWhere + predicateJoin(logWhere) + `(
-			typeof(namespace) != 'integer' OR namespace <= 0 OR
+			typeof(volume) != 'integer' OR volume <= 0 OR
 			typeof(incarnation) != 'text' OR incarnation = '' OR
 			typeof(committed_position) != 'integer' OR typeof(trimmed_through) != 'integer' OR
 			typeof(trimmed_by_age) != 'integer')`, scopeArgs},
 		{"changes", `SELECT count(*) FROM changes ` + changeWhere + predicateJoin(changeWhere) + `(
 			typeof(position) != 'integer' OR position <= 0 OR
 			typeof(previous_position) != 'integer' OR previous_position < 0 OR
-			typeof(namespace) != 'integer' OR namespace <= 0 OR
+			typeof(volume) != 'integer' OR volume <= 0 OR
 			typeof(kind) != 'integer' OR typeof(parent) != 'integer' OR
 			typeof(name) NOT IN ('blob', 'null') OR
 			typeof(from_parent) NOT IN ('integer', 'null') OR
@@ -291,9 +291,9 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, nam
 			typeof(node_high_water) != 'integer' OR node_high_water < 0 OR
 			typeof(change_high_water) != 'integer' OR change_high_water < 0`, nil},
 	}
-	if invalidNamespaces != 0 {
-		return fmt.Errorf("the database holds %d namespace rows in an invalid SQLite storage class: %w",
-			invalidNamespaces, syscall.EIO)
+	if invalidVolumes != 0 {
+		return fmt.Errorf("the database holds %d volume rows in an invalid SQLite storage class: %w",
+			invalidVolumes, syscall.EIO)
 	}
 	for _, check := range queries {
 		var count int64
@@ -315,53 +315,53 @@ func predicateJoin(where string) string {
 	return " AND "
 }
 
-// ValidateNamespaceIntegrity is the full namespace pass run at open and by ObjectStatus.
+// ValidateVolumeIntegrity is the full volume pass run at open and by ObjectStatus.
 // The state field is a promise to the sweeper: only an object referenced by exactly one file
-// in its own namespace may be protected from deletion, and every other state must be
+// in its own volume may be protected from deletion, and every other state must be
 // unreferenced. Both directions are checked because either half can be damaged while the
 // foreign-key constraints are disabled by an external writer.
-func ValidateNamespaceIntegrity(
+func ValidateVolumeIntegrity(
 	ctx context.Context,
 	db sqlvalue.Queryer,
-	namespace int64,
+	volume int64,
 	maxIntegrityRecords, maxIntegrityBytes int64,
 ) error {
-	return validateIntegrity(ctx, db, &namespace, maxIntegrityRecords, maxIntegrityBytes, schema.Version())
+	return validateIntegrity(ctx, db, &volume, maxIntegrityRecords, maxIntegrityBytes, schema.Version())
 }
 
-// A nil namespace validates the complete database for migration or exclusive-owner recovery.
+// A nil volume validates the complete database for migration or exclusive-owner recovery.
 // Version selects the stored layout explicitly; ordinary readers validate the current schema.
 func validateIntegrity(
 	ctx context.Context,
 	db sqlvalue.Queryer,
-	namespace *int64,
+	volume *int64,
 	maxIntegrityRecords, maxIntegrityBytes int64,
 	version int,
 ) error {
-	if err := validateIntegrityWork(ctx, db, namespace, maxIntegrityRecords); err != nil {
+	if err := validateIntegrityWork(ctx, db, volume, maxIntegrityRecords); err != nil {
 		return err
 	}
-	if err := validateIntegrityBytes(ctx, db, namespace, maxIntegrityBytes, version); err != nil {
+	if err := validateIntegrityBytes(ctx, db, volume, maxIntegrityBytes, version); err != nil {
 		return err
 	}
-	if err := validateStorageClassesVersion(ctx, db, namespace, version); err != nil {
+	if err := validateStorageClassesVersion(ctx, db, volume, version); err != nil {
 		return err
 	}
-	if namespace == nil {
+	if volume == nil {
 		if _, err := dbstate.Validate(ctx, db); err != nil {
 			return err
 		}
-	} else if err := dbstate.ValidateIdentityBounds(ctx, db, *namespace); err != nil {
+	} else if err := dbstate.ValidateIdentityBounds(ctx, db, *volume); err != nil {
 		return err
 	}
-	if err := validateNodeValuesVersion(ctx, db, namespace, version); err != nil {
+	if err := validateNodeValuesVersion(ctx, db, volume, version); err != nil {
 		return err
 	}
 	where := ""
 	args := []any{StateReserved, StateReferenced, StateGarbage, StateUnresolved}
-	if namespace != nil {
-		where = "WHERE namespace = ?"
-		args = append(args, *namespace)
+	if volume != nil {
+		where = "WHERE volume = ?"
+		args = append(args, *volume)
 	}
 	var invalidStates, invalidSizes int64
 	if err := db.QueryRowContext(ctx, `
@@ -377,14 +377,14 @@ func validateIntegrity(
 		return fmt.Errorf("the database holds %d objects in an unknown state and %d objects with an invalid size: %w",
 			invalidStates, invalidSizes, syscall.EIO)
 	}
-	if err := validateObjectRelationships(ctx, db, namespace); err != nil {
+	if err := validateObjectRelationships(ctx, db, volume); err != nil {
 		return err
 	}
-	if err := validateNodeRelationshipsVersion(ctx, db, namespace, version); err != nil {
+	if err := validateNodeRelationshipsVersion(ctx, db, volume, version); err != nil {
 		return err
 	}
-	if err := validateUsedAccounting(ctx, db, namespace); err != nil {
+	if err := validateUsedAccounting(ctx, db, volume); err != nil {
 		return err
 	}
-	return validateLogIntegrity(ctx, db, namespace)
+	return validateLogIntegrity(ctx, db, volume)
 }

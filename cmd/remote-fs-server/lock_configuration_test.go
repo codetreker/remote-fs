@@ -16,7 +16,7 @@ import (
 
 func TestLockDefaultsAndExplicitInitializationReachConfiguration(t *testing.T) {
 	config, help, err := parseConfig([]string{
-		"-listen", "127.0.0.1:0", "-local-store", "/store", "-workspace", "workspace", "-quota", "8M", "-initialize-lock-state",
+		"-listen", "127.0.0.1:0", "-local-store", "/store", "-volume", "workspace", "-quota", "8M", "-initialize-lock-state",
 	}, io.Discard)
 	if err != nil || help {
 		t.Fatalf("parse local-store locks: help=%t err=%v", help, err)
@@ -25,7 +25,7 @@ func TestLockDefaultsAndExplicitInitializationReachConfiguration(t *testing.T) {
 		t.Fatalf("lock configuration is %+v, initialize=%t", config.locks, config.initializeLockState)
 	}
 	openedConfig, _, err := parseConfig([]string{
-		"-listen", "127.0.0.1:0", "-local-store", "/store", "-workspace", "workspace", "-quota", "8M",
+		"-listen", "127.0.0.1:0", "-local-store", "/store", "-volume", "workspace", "-quota", "8M",
 	}, io.Discard)
 	if err != nil || openedConfig.initializeLockState {
 		t.Fatalf("ordinary startup permits initialization: config=%+v err=%v", openedConfig, err)
@@ -34,7 +34,7 @@ func TestLockDefaultsAndExplicitInitializationReachConfiguration(t *testing.T) {
 
 func TestLockCapacityAndLifetimeFlagsReachAuthorityOptions(t *testing.T) {
 	config, _, err := parseConfig([]string{
-		"-listen", "127.0.0.1:0", "-local-store", "/store", "-workspace", "workspace", "-quota", "8M",
+		"-listen", "127.0.0.1:0", "-local-store", "/store", "-volume", "workspace", "-quota", "8M",
 		"-lock-max-sessions", "11", "-lock-max-tickets", "13", "-lock-max-owners", "17",
 		"-lock-max-resources", "19", "-lock-max-actions", "23", "-lock-max-grants", "29", "-lock-max-queued", "31",
 		"-lock-owners-per-session", "3", "-lock-owner-actions-per-session", "5", "-lock-actions-per-owner", "7",
@@ -79,7 +79,7 @@ func TestInvalidLockConfigurationDoesNotAcquireListenerOrInitializeState(t *test
 		t.Run(test.name+"="+test.value, func(t *testing.T) {
 			root := t.TempDir()
 			err := run([]string{
-				"-listen", "invalid-address", "-local-store", root, "-workspace", "workspace", "-quota", "8M", "-initialize-lock-state",
+				"-listen", "invalid-address", "-local-store", root, "-volume", "workspace", "-quota", "8M", "-initialize-lock-state",
 				"-" + test.name, test.value,
 			}, io.Discard)
 			if err == nil || !strings.Contains(err.Error(), "-"+test.name) {
@@ -98,8 +98,9 @@ func TestInvalidLockConfigurationDoesNotAcquireListenerOrInitializeState(t *test
 	}
 }
 
-func TestUnsupportedNamespaceFlagsFailBeforeInitialization(t *testing.T) {
+func TestUnsupportedVolumeFlagsFailBeforeInitialization(t *testing.T) {
 	for _, name := range []string{
+		"workspace",
 		"dir", "lock-state-root", "dir-max-operations", "dir-max-waiters", "dir-max-pinned-targets",
 		"dir-max-snapshot-entries", "dir-max-recovery-entries", "dir-max-path-bytes",
 		"dir-max-staging-bytes", "dir-max-snapshot-bytes", "quota-max-directory-bytes", "quota-max-frontier-bytes",
@@ -108,7 +109,7 @@ func TestUnsupportedNamespaceFlagsFailBeforeInitialization(t *testing.T) {
 			root := t.TempDir()
 			var output bytes.Buffer
 			err := run([]string{
-				"-listen", "invalid-address", "-local-store", root, "-workspace", "workspace", "-quota", "8M",
+				"-listen", "invalid-address", "-local-store", root, "-volume", "workspace", "-quota", "8M",
 				"-initialize-lock-state", "-" + name, "1",
 			}, &output)
 			if !errors.Is(err, errUsage) || !strings.Contains(output.String(), "flag provided but not defined: -"+name) {
@@ -128,7 +129,7 @@ func TestLockHelpExplainsExplicitInitializationAndRecovery(t *testing.T) {
 	if err != nil || !help {
 		t.Fatalf("help=%t err=%v", help, err)
 	}
-	for _, phrase := range []string{"-initialize-lock-state", "-lock-max-lease", "restart recovery", "existing state", "enrollment"} {
+	for _, phrase := range []string{"-volume", "-initialize-lock-state", "-lock-max-lease", "restart recovery", "existing state", "enrollment"} {
 		if !strings.Contains(strings.ToLower(output.String()), strings.ToLower(phrase)) {
 			t.Fatalf("help omits %q: %s", phrase, output.String())
 		}

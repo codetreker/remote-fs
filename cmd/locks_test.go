@@ -22,7 +22,7 @@ import (
 func TestServerBinariesEnforceFileLocks(t *testing.T) {
 	for _, mode := range []string{"local-store", "azure-blob"} {
 		t.Run(mode, func(t *testing.T) {
-			args := binaryLockNamespace(t, mode)
+			args := binaryLockVolume(t, mode)
 			server := startServerBinary(t, append(args, "-initialize-lock-state")...)
 			remote := dialLockServer(t, server)
 			for name, content := range map[string]string{"artifact": "original", "other": "unrelated"} {
@@ -92,7 +92,7 @@ func TestServerBinariesEnforceFileLocks(t *testing.T) {
 func TestServerBinaryPreservesLeaseProtectionAcrossRestart(t *testing.T) {
 	for _, mode := range []string{"local-store", "azure-blob"} {
 		t.Run(mode, func(t *testing.T) {
-			args := binaryLockNamespace(t, mode)
+			args := binaryLockVolume(t, mode)
 			first := startServerBinary(t, append(args, "-initialize-lock-state", "-lock-max-lease", "3s")...)
 			remote := dialLockServer(t, first)
 			if err := remote.Write(t.Context(), "artifact", []byte("protected")); err != nil {
@@ -146,15 +146,15 @@ func TestServerBinaryPreservesLeaseProtectionAcrossRestart(t *testing.T) {
 	}
 }
 
-func binaryLockNamespace(t *testing.T, mode string) []string {
+func binaryLockVolume(t *testing.T, mode string) []string {
 	t.Helper()
 	args := []string{"-listen", "127.0.0.1:0"}
 	switch mode {
 	case "local-store":
-		args = append(args, "-local-store", privateDirectory(t), "-workspace", "locks", "-quota", "8M")
+		args = append(args, "-local-store", privateDirectory(t), "-volume", "locks", "-quota", "8M")
 	case "azure-blob":
 		args = append(args, "-blob-container", binaryLockContainer(t),
-			"-metastore", filepath.Join(privateDirectory(t), "namespace.db"), "-workspace", "locks")
+			"-metastore", filepath.Join(privateDirectory(t), "volume.db"), "-volume", "locks")
 	default:
 		t.Fatalf("unknown server mode %q", mode)
 	}

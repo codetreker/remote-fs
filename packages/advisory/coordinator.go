@@ -1,5 +1,5 @@
 // Package advisory coordinates Linux flock and POSIX record locks within one
-// native namespace. It owns bounded lock state; its caller owns session leases
+// native volume. It owns bounded lock state; its caller owns session leases
 // and must retire native publication rights before releasing expired grants.
 package advisory
 
@@ -14,7 +14,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// Config bounds aggregate state across all sessions in one namespace.
+// Config bounds aggregate state across all sessions in one volume.
 // MaxMaterializedBytes must accommodate both the current and replacement body
 // of a file at MaxFileBytes; each file must also fit the platform slice size.
 type Config struct {
@@ -47,12 +47,12 @@ func (c Config) Check() error {
 		return fmt.Errorf("file limit exceeds the platform slice size: %w", syscall.EINVAL)
 	}
 	if c.MaxFileBytes > c.MaxMaterializedBytes/2 {
-		return fmt.Errorf("namespace materialization limit must cover two maximum-size file buffers: %w", syscall.EINVAL)
+		return fmt.Errorf("volume materialization limit must cover two maximum-size file buffers: %w", syscall.EINVAL)
 	}
 	return nil
 }
 
-// Coordinator must be shared by every access path to the same native namespace.
+// Coordinator must be shared by every access path to the same native volume.
 // It performs no I/O and starts no workers. Session lease management is external.
 type Coordinator struct {
 	mu                sync.Mutex

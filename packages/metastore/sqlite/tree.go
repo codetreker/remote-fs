@@ -97,7 +97,7 @@ func scanNode(row scanner) (metastore.Node, error) {
 	return node.node(), nil
 }
 
-// rootNode reads the directory the namespace starts from. It is a node nobody made, and
+// rootNode reads the directory the volume starts from. It is a node nobody made, and
 // nothing removes or replaces it.
 func (s *Store) rootNode(ctx context.Context, tx *sql.Tx) (metastore.Node, error) {
 	return scanNode(tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes n WHERE n.id = ?`, s.root))
@@ -107,8 +107,8 @@ func (s *Store) rootNode(ctx context.Context, tx *sql.Tx) (metastore.Node, error
 func (s *Store) lookup(ctx context.Context, tx *sql.Tx, parent int64, name []byte) (metastore.Node, bool, error) {
 	node, err := scanNode(tx.QueryRowContext(ctx,
 		`SELECT `+nodeColumns+` FROM entries e JOIN nodes n ON n.id = e.node
-		 WHERE e.namespace = ? AND e.parent = ? AND e.name = ?`,
-		s.namespace, parent, name))
+		 WHERE e.volume = ? AND e.parent = ? AND e.name = ?`,
+		s.volume, parent, name))
 	if errors.Is(err, sql.ErrNoRows) {
 		return metastore.Node{}, false, nil
 	}
@@ -258,8 +258,8 @@ type reservedChild struct {
 func (s *Store) listChildrenBounded(ctx context.Context, tx *sql.Tx, parent int64, result *storage.ListResult) error {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT length(CAST(e.name AS BLOB)), `+nodeAttrColumns+` FROM entries e JOIN nodes n ON n.id = e.node
-		 WHERE e.namespace = ? AND e.parent = ? ORDER BY e.name`,
-		s.namespace, parent)
+		 WHERE e.volume = ? AND e.parent = ? ORDER BY e.name`,
+		s.volume, parent)
 	if err != nil {
 		return err
 	}
@@ -308,8 +308,8 @@ func (s *Store) reservedName(ctx context.Context, tx *sql.Tx, parent int64, chil
 			length(name) > 0 AND name NOT IN (X'2e', X'2e2e') AND
 			instr(name, X'2f') = 0 AND instr(name, X'00') = 0
 		), 0)
-		FROM entries WHERE namespace = ? AND node = ?`,
-		parent, child.nameBytes, s.namespace, child.node).Scan(&total, &matching); err != nil {
+		FROM entries WHERE volume = ? AND node = ?`,
+		parent, child.nameBytes, s.volume, child.node).Scan(&total, &matching); err != nil {
 		return "", err
 	}
 	if total != 1 || matching != 1 {
@@ -320,8 +320,8 @@ func (s *Store) reservedName(ctx context.Context, tx *sql.Tx, parent int64, chil
 	}
 	var name []byte
 	if err := tx.QueryRowContext(ctx,
-		`SELECT name FROM entries WHERE namespace = ? AND node = ?`,
-		s.namespace, child.node).Scan(&name); err != nil {
+		`SELECT name FROM entries WHERE volume = ? AND node = ?`,
+		s.volume, child.node).Scan(&name); err != nil {
 		return "", err
 	}
 	return string(name), nil
@@ -341,8 +341,8 @@ func (s *Store) listChildren(ctx context.Context, tx *sql.Tx, parent int64) ([]m
 func (s *Store) visitChildren(ctx context.Context, tx *sql.Tx, parent int64, add func(metastore.Child) error) error {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT e.name, `+nodeColumns+` FROM entries e JOIN nodes n ON n.id = e.node
-		 WHERE e.namespace = ? AND e.parent = ? ORDER BY e.name`,
-		s.namespace, parent)
+		 WHERE e.volume = ? AND e.parent = ? ORDER BY e.name`,
+		s.volume, parent)
 	if err != nil {
 		return err
 	}
@@ -376,7 +376,7 @@ func (s *Store) SetAttr(ctx context.Context, path string, change storage.AttrCha
 	if err != nil {
 		return pathError("setattr", path, err)
 	}
-	if err := s.mutateNamespace(ctx, locking.SetAttrMutation, []string{cleaned}, func(tx *sql.Tx) error {
+	if err := s.mutateVolume(ctx, locking.SetAttrMutation, []string{cleaned}, func(tx *sql.Tx) error {
 		// A change that names nothing still answers for the node it names, and resolving the
 		// path is what answers for it.
 		node, err := s.resolve(ctx, tx, cleaned)
@@ -449,7 +449,7 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 	if cleaned == "" {
 		return pathError(op, path, syscall.EEXIST)
 	}
-	if err := s.mutateNamespace(ctx, locking.CreateMutation, []string{cleaned}, func(tx *sql.Tx) error {
+	if err := s.mutateVolume(ctx, locking.CreateMutation, []string{cleaned}, func(tx *sql.Tx) error {
 		parent, name, err := s.resolveParent(ctx, tx, cleaned)
 		if err != nil {
 			return err
@@ -461,9 +461,9 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO nodes (id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+			INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
 			VALUES (?, ?, ?, 0, ?, ?, ?, ?, NULL)`,
-			id, s.namespace, int64(mode), sec, nsec, sec, nsec); err != nil {
+			id, s.volume, int64(mode), sec, nsec, sec, nsec); err != nil {
 			return err
 		}
 		if err := s.link(ctx, tx, parent.ID, name, id); err != nil {
@@ -482,8 +482,8 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 // link puts a name in a directory. A name already there is EEXIST, which the primary key is
 // what decides — so two writers racing for one name cannot both be told they made it.
 func (s *Store) link(ctx context.Context, tx *sql.Tx, parent int64, name []byte, node int64) error {
-	if _, err := tx.ExecContext(ctx, `INSERT INTO entries (namespace, parent, name, node) VALUES (?, ?, ?, ?)`,
-		s.namespace, parent, name, node); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO entries (volume, parent, name, node) VALUES (?, ?, ?, ?)`,
+		s.volume, parent, name, node); err != nil {
 		if sqlerr.IsUniqueViolation(err) {
 			return syscall.EEXIST
 		}
@@ -493,8 +493,8 @@ func (s *Store) link(ctx context.Context, tx *sql.Tx, parent int64, name []byte,
 }
 
 func (s *Store) unlink(ctx context.Context, tx *sql.Tx, parent int64, name []byte) error {
-	_, err := tx.ExecContext(ctx, `DELETE FROM entries WHERE namespace = ? AND parent = ? AND name = ?`,
-		s.namespace, parent, name)
+	_, err := tx.ExecContext(ctx, `DELETE FROM entries WHERE volume = ? AND parent = ? AND name = ?`,
+		s.volume, parent, name)
 	return err
 }
 
@@ -520,7 +520,7 @@ func (s *Store) touch(ctx context.Context, tx *sql.Tx, id int64, at time.Time) e
 func (s *Store) isEmpty(ctx context.Context, tx *sql.Tx, parent int64) (bool, error) {
 	var one int
 	switch err := tx.QueryRowContext(ctx,
-		`SELECT 1 FROM entries WHERE namespace = ? AND parent = ? LIMIT 1`, s.namespace, parent).Scan(&one); {
+		`SELECT 1 FROM entries WHERE volume = ? AND parent = ? LIMIT 1`, s.volume, parent).Scan(&one); {
 	case errors.Is(err, sql.ErrNoRows):
 		return true, nil
 	case err != nil:
@@ -539,7 +539,7 @@ func (s *Store) Remove(ctx context.Context, path string) error {
 	if cleaned == "" {
 		return pathError("unlink", path, syscall.EISDIR)
 	}
-	if err := s.mutateNamespace(ctx, locking.RemoveMutation, []string{cleaned}, func(tx *sql.Tx) error {
+	if err := s.mutateVolume(ctx, locking.RemoveMutation, []string{cleaned}, func(tx *sql.Tx) error {
 		parent, name, err := s.resolveParent(ctx, tx, cleaned)
 		if err != nil {
 			return err
@@ -575,13 +575,13 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 	if err != nil {
 		return pathError("rmdir", path, err)
 	}
-	// The root is not a node any caller made. Removing it would empty the namespace out of
+	// The root is not a node any caller made. Removing it would empty the volume out of
 	// existence and leave everything afterwards answering ENOENT — a missing file where the
-	// truth is a missing namespace.
+	// truth is a missing volume.
 	if cleaned == "" {
 		return pathError("rmdir", path, syscall.EBUSY)
 	}
-	if err := s.mutateNamespace(ctx, locking.RemoveMutation, []string{cleaned}, func(tx *sql.Tx) error {
+	if err := s.mutateVolume(ctx, locking.RemoveMutation, []string{cleaned}, func(tx *sql.Tx) error {
 		parent, name, err := s.resolveParent(ctx, tx, cleaned)
 		if err != nil {
 			return err
@@ -619,11 +619,11 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 	return nil
 }
 
-// Physical pins keep the current object and its charge after namespace removal.
+// Physical pins keep the current object and its charge after volume removal.
 // The caller holds the same gate as file open and final physical release.
 func (s *Store) discard(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
-	if node.Mode.IsRegular() && s.coordinator.pins[retainedNode{s.namespace, node.ID}] > 0 {
-		_, err := tx.ExecContext(ctx, `UPDATE nodes SET detached=1 WHERE namespace=? AND id=?`, s.namespace, node.ID)
+	if node.Mode.IsRegular() && s.coordinator.pins[retainedNode{s.volume, node.ID}] > 0 {
+		_, err := tx.ExecContext(ctx, `UPDATE nodes SET detached=1 WHERE volume=? AND id=?`, s.volume, node.ID)
 		return err
 	}
 	return s.discardNode(ctx, tx, node)
@@ -658,7 +658,7 @@ func (s *Store) Rename(ctx context.Context, from, to string) error {
 	if cleanFrom == "" || cleanTo == "" {
 		return linkError(from, to, syscall.EBUSY)
 	}
-	if err := s.mutateNamespace(ctx, locking.RenameMutation, []string{cleanFrom, cleanTo}, func(tx *sql.Tx) error {
+	if err := s.mutateVolume(ctx, locking.RenameMutation, []string{cleanFrom, cleanTo}, func(tx *sql.Tx) error {
 		return s.rename(ctx, tx, cleanFrom, cleanTo)
 	}); err != nil {
 		return linkError(from, to, sqlerr.Failure(err))
@@ -730,8 +730,8 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 	}
 
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE entries SET parent = ?, name = ? WHERE namespace = ? AND parent = ? AND name = ?`,
-		toParent.ID, toName, s.namespace, fromParent.ID, fromName); err != nil {
+		`UPDATE entries SET parent = ?, name = ? WHERE volume = ? AND parent = ? AND name = ?`,
+		toParent.ID, toName, s.volume, fromParent.ID, fromName); err != nil {
 		return err
 	}
 	// The node itself is untouched by the move — only the entry naming it was rewritten — so

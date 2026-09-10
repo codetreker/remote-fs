@@ -16,7 +16,7 @@ import (
 // mount reports space in, the numbers df prints for the filesystem underneath, the reply
 // statfs(2) hands back. A limit denominated the other way would be up to a tenth smaller
 // than the one the operator believes they set, and the way they would find out is a
-// workspace that filled early.
+// volume that filled early.
 const (
 	kibi = 1 << 10
 	mebi = 1 << 20
@@ -107,7 +107,7 @@ func (f *sizeFlag) Set(text string) error {
 		return err
 	}
 	if size < limited.MinLimit {
-		return fmt.Errorf("%q is %d bytes, and %d is the smallest allowance a namespace can be held under",
+		return fmt.Errorf("%q is %d bytes, and %d is the smallest allowance a volume can be held under",
 			text, size, limited.MinLimit)
 	}
 	f.bytes = size

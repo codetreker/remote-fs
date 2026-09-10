@@ -16,7 +16,7 @@ type Native interface {
 	Forget(context.Context, BackendKey) error
 }
 
-// Persistence is opened only after exclusive workspace ownership is acquired.
+// Persistence is opened only after exclusive volume ownership is acquired.
 // RaiseMaxLease durably advances validated paired evidence and never decreases it.
 // RecoveryStart is that ownership acquisition's monotonic timestamp.
 type Persistence interface {

@@ -1,12 +1,12 @@
 // Package sqlite implements metastore.Store in a SQLite database.
 //
-// It is the metastore the object-store namespace is built on: the bytes of every file live
+// It is the metastore the object-store volume is built on: the bytes of every file live
 // under an opaque key in a container of blobs, and everything that makes those bytes a
 // filesystem — the tree, the modes, the times, the sizes, and which key holds which file's
 // contents — lives here. The division and what it buys are described in
 // packages/storage/objectstore.
 //
-// SQLite rather than a server database because a namespace's metadata is small, is read and
+// SQLite rather than a server database because a volume's metadata is small, is read and
 // written by one process, and needs transactions more than it needs a network. The driver
 // is modernc.org/sqlite, which is a translation of SQLite into Go rather than a binding, so
 // this package builds with cgo off. Native lease ownership and recovery use Linux
@@ -55,7 +55,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// Namespace creation modes are independent of the host process's umask.
+// Volume creation modes are independent of the host process's umask.
 const (
 	fileMode fs.FileMode = 0o644
 	dirMode  fs.FileMode = 0o755
@@ -67,40 +67,40 @@ const (
 // one transaction here takes, and every one of them is a handful of indexed statements.
 const busyTimeout = 5 * time.Second
 
-// Store is one namespace held in a SQLite database.
+// Store is one volume held in a SQLite database.
 type Store struct {
 	write        *sql.DB
 	read         *sql.DB
 	snapshotRead *sql.DB
 
-	namespace    int64
+	volume       int64
 	databasePath string
 
-	// root is the id of the directory the namespace starts from. It is fixed for the life of
-	// the namespace — nothing removes or replaces the root — so it is read once rather than
+	// root is the id of the directory the volume starts from. It is fixed for the life of
+	// the volume — nothing removes or replaces the root — so it is read once rather than
 	// joined for on every path resolution, and it is what tells the one node with no name from
 	// a node that has lost the one it had.
 	root int64
 
-	// allowance is the namespace's ceiling in bytes, or zero for a namespace that has none.
+	// allowance is the volume's ceiling in bytes, or zero for a volume that has none.
 	// It belongs to the Store rather than to the database because it is a property of how
-	// the namespace is being served, and because the contract makes it unchanging for the
+	// the volume is being served, and because the contract makes it unchanging for the
 	// life of the value: one that answers Space answers always, and one that refuses never
 	// starts.
 	allowance int64
 
 	// window is how much of the change log this Store keeps. It belongs here for the same
-	// reason the allowance does: it says how the namespace is being served rather than what it
+	// reason the allowance does: it says how the volume is being served rather than what it
 	// holds, and two processes serving one database may reasonably differ about it.
 	window Window
 
-	// objectLimits bound maintenance state accumulated for this namespace. They belong to the
+	// objectLimits bound maintenance state accumulated for this volume. They belong to the
 	// serving Store for the same reason as allowance and window: reopening may choose a tighter
 	// bound, observe the existing backlog as over-limit, and recover by sweeping it.
 	objectLimits ObjectLimits
 
 	// maxIntegrityRecords bounds retained graph and history rows examined before this Store
-	// accepts the namespace or reports a successful integrity-checked result.
+	// accepts the volume or reports a successful integrity-checked result.
 	maxIntegrityRecords int64
 	maxIntegrityBytes   int64
 	files               map[*retainedFile]struct{}
@@ -121,42 +121,42 @@ type Store struct {
 
 var _ metastore.Store = (*Store)(nil)
 
-// Open holds the namespace called namespace in the SQLite database at database, under an
+// Open holds the volume called volume in the SQLite database at database, under an
 // allowance of allowance bytes and a change log held to window.
 //
 // database is a native filesystem path; URI parameters and percent escapes are rejected.
 //
-// An allowance of zero is a namespace with none, whose Space reports syscall.ENOSYS for as
+// An allowance of zero is a volume with none, whose Space reports syscall.ENOSYS for as
 // long as the Store exists. A window is required rather than defaulted, because every number
 // in it is a value a log could plausibly be held to and none of them has a zero that means
 // "unset"; DefaultWindow is the answer for a caller with no reason of its own.
 //
-// The database is created if it is not there, as is the namespace: a namespace with no
-// tree yet is one holding an empty root directory, not an error. Several namespaces may
+// The database is created if it is not there, as is the volume: a volume with no
+// tree yet is one holding an empty root directory, not an error. Several volumes may
 // share one database, and one Store is bound to exactly one of them. A database written
 // against an older schema is carried forward here; one written against a newer schema is
 // refused, because nothing in this build can know what a later version did to the columns it
 // addresses. Open serves only an unbound database; a database whose metadata is bound to a
 // backing store must be opened through OpenBound with that store's identity. Schema versions 1
-// and 2 are carried forward only when every object is referenced by exactly one same-namespace
+// and 2 are carried forward only when every object is referenced by exactly one same-volume
 // file with the same size, every non-root node is reachable from its root through exactly one
 // entry while the root has none, and the recorded used-byte count is the overflow-safe sum of
 // regular-file sizes. A non-referenced legacy object is refused with syscall.EIO because those
 // schemas do not prove which bytes the reservation owns or whether its size is exact.
-func Open(ctx context.Context, database, namespace string, allowance int64, window Window) (*Store, error) {
-	return OpenWithOptions(ctx, database, namespace, allowance, Options{Window: window})
+func Open(ctx context.Context, database, volume string, allowance int64, window Window) (*Store, error) {
+	return OpenWithOptions(ctx, database, volume, allowance, Options{Window: window})
 }
 
 // OpenWithObjectLimits is Open with explicit bounds on reserved, unresolved, and garbage objects. Zero
 // fields in limits select the defaults returned by DefaultObjectLimits.
 func OpenWithObjectLimits(
 	ctx context.Context,
-	database, namespace string,
+	database, volume string,
 	allowance int64,
 	window Window,
 	limits ObjectLimits,
 ) (*Store, error) {
-	return OpenWithOptions(ctx, database, namespace, allowance, Options{
+	return OpenWithOptions(ctx, database, volume, allowance, Options{
 		Window:       window,
 		ObjectLimits: limits,
 	})
@@ -166,40 +166,40 @@ func OpenWithObjectLimits(
 // reader limits, and integrity-work limit select the defaults returned by DefaultOptions.
 func OpenWithOptions(
 	ctx context.Context,
-	database, namespace string,
+	database, volume string,
 	allowance int64,
 	options Options,
 ) (*Store, error) {
-	return open(ctx, database, namespace, "", allowance, options)
+	return open(ctx, database, volume, "", allowance, options)
 }
 
 // OpenBound is Open for a database whose metadata names objects in the backing store
 // identified by storeID.
 //
-// The binding belongs to the database, not to one namespace: every namespace in a database
-// names objects in the same store. A new or empty database is bound before its first namespace
+// The binding belongs to the database, not to one volume: every volume in a database
+// names objects in the same store. A new or empty database is bound before its first volume
 // is created. Once bound, it can only be reopened with the same storeID; Open cannot bypass
-// the binding. A database that already holds an unbound namespace is refused, because there is
+// the binding. A database that already holds an unbound volume is refused, because there is
 // no evidence that its existing object keys belong to the proposed store.
 func OpenBound(
 	ctx context.Context,
-	database, namespace, storeID string,
+	database, volume, storeID string,
 	allowance int64,
 	window Window,
 ) (*Store, error) {
-	return OpenBoundWithOptions(ctx, database, namespace, storeID, allowance, Options{Window: window})
+	return OpenBoundWithOptions(ctx, database, volume, storeID, allowance, Options{Window: window})
 }
 
 // OpenBoundWithObjectLimits is OpenBound with explicit bounds on reserved, unresolved, and
 // garbage objects. Zero fields in limits select the defaults returned by DefaultObjectLimits.
 func OpenBoundWithObjectLimits(
 	ctx context.Context,
-	database, namespace, storeID string,
+	database, volume, storeID string,
 	allowance int64,
 	window Window,
 	limits ObjectLimits,
 ) (*Store, error) {
-	return OpenBoundWithOptions(ctx, database, namespace, storeID, allowance, Options{
+	return OpenBoundWithOptions(ctx, database, volume, storeID, allowance, Options{
 		Window:       window,
 		ObjectLimits: limits,
 	})
@@ -209,25 +209,25 @@ func OpenBoundWithObjectLimits(
 // fields, reader limits, and integrity-work limit select the defaults returned by DefaultOptions.
 func OpenBoundWithOptions(
 	ctx context.Context,
-	database, namespace, storeID string,
+	database, volume, storeID string,
 	allowance int64,
 	options Options,
 ) (*Store, error) {
 	if storeID == "" {
 		return nil, fmt.Errorf("a backing store needs an identity: %w", syscall.EINVAL)
 	}
-	return open(ctx, database, namespace, storeID, allowance, options)
+	return open(ctx, database, volume, storeID, allowance, options)
 }
 
-// OpenBoundDurableWithOptions opens a backing-store-bound namespace with an external commit
-// witness. The namespace creation policy is enforced inside the same transaction that binds,
+// OpenBoundDurableWithOptions opens a backing-store-bound volume with an external commit
+// witness. The volume creation policy is enforced inside the same transaction that binds,
 // validates, and prepares the database.
 func OpenBoundDurableWithOptions(
 	ctx context.Context,
-	database, namespace, storeID string,
+	database, volume, storeID string,
 	allowance int64,
 	options Options,
-	mode NamespaceOpenMode,
+	mode VolumeOpenMode,
 	startup DurableStartup,
 	witness CommitWitness,
 ) (*Store, error) {
@@ -238,7 +238,7 @@ func OpenBoundDurableWithOptions(
 	if err := durable.check(); err != nil {
 		return nil, err
 	}
-	return openConfiguredWithHooks(ctx, database, namespace, storeID, allowance, options, durable, storeOpenHooks{
+	return openConfiguredWithHooks(ctx, database, volume, storeID, allowance, options, durable, storeOpenHooks{
 		openPool:          openPool,
 		openDurableWriter: openPersistentWriterPool,
 		acquireLeaseOwner: nativelease.AcquireDatabase,
@@ -251,11 +251,11 @@ func OpenBoundDurableWithOptions(
 
 func open(
 	ctx context.Context,
-	database, namespace, storeID string,
+	database, volume, storeID string,
 	allowance int64,
 	options Options,
 ) (*Store, error) {
-	return openWithHooks(ctx, database, namespace, storeID, allowance, options, storeOpenHooks{
+	return openWithHooks(ctx, database, volume, storeID, allowance, options, storeOpenHooks{
 		openPool:          openPool,
 		prepare:           prepare,
 		acquireLeaseOwner: nativelease.AcquireDatabase,
@@ -275,24 +275,24 @@ type storeOpenHooks struct {
 
 func openWithHooks(
 	ctx context.Context,
-	database, namespace, storeID string,
+	database, volume, storeID string,
 	allowance int64,
 	options Options,
 	hooks storeOpenHooks,
 ) (*Store, error) {
-	return openConfiguredWithHooks(ctx, database, namespace, storeID, allowance, options, nil, hooks)
+	return openConfiguredWithHooks(ctx, database, volume, storeID, allowance, options, nil, hooks)
 }
 
 func openConfiguredWithHooks(
 	ctx context.Context,
-	database, namespace, storeID string,
+	database, volume, storeID string,
 	allowance int64,
 	options Options,
 	durable *durableOpen,
 	hooks storeOpenHooks,
 ) (opened *Store, returnErr error) {
-	if namespace == "" {
-		return nil, fmt.Errorf("a namespace needs a name: %w", syscall.EINVAL)
+	if volume == "" {
+		return nil, fmt.Errorf("a volume needs a name: %w", syscall.EINVAL)
 	}
 	if allowance < 0 {
 		return nil, fmt.Errorf("an allowance of %d bytes is not a quantity of bytes: %w", allowance, syscall.EINVAL)
@@ -333,7 +333,7 @@ func openConfiguredWithHooks(
 			return nil, err
 		}
 	} else if hooks.acquireLeaseOwner != nil {
-		create := durable == nil || durable.mode != RequireExistingNamespace
+		create := durable == nil || durable.mode != RequireExistingVolume
 		owner, err = hooks.acquireLeaseOwner(database, options.leaseRecoveryOwner || durable != nil, create)
 		if err != nil {
 			if OpenFailureRetainsOwnership(err) {
@@ -401,15 +401,15 @@ func openConfiguredWithHooks(
 		durable = &owned
 	}
 	if durable == nil {
-		prepareNamespace := hooks.prepare
+		prepareVolume := hooks.prepare
 		if options.leaseRecoveryOwner {
-			prepareNamespace = prepareOwnedLeaseNamespace
+			prepareVolume = prepareOwnedLeaseVolume
 		}
-		if options.leaseRecoveryOwner && options.requireExistingNamespace {
-			prepareNamespace = prepareExistingOwnedLeaseNamespace
+		if options.leaseRecoveryOwner && options.requireExistingVolume {
+			prepareVolume = prepareExistingOwnedLeaseVolume
 		}
-		id, root, err = prepareNamespace(
-			ctx, write, namespace, storeID, options.Window,
+		id, root, err = prepareVolume(
+			ctx, write, volume, storeID, options.Window,
 			options.MaxIntegrityRecords, options.MaxIntegrityBytes,
 		)
 		if sqlerr.IsUncertainCommit(err) {
@@ -417,7 +417,7 @@ func openConfiguredWithHooks(
 		}
 	} else {
 		id, root, state, err = prepareConfigured(
-			ctx, write, namespace, storeID, options.Window,
+			ctx, write, volume, storeID, options.Window,
 			options.MaxIntegrityRecords, options.MaxIntegrityBytes, durable,
 		)
 		if sqlerr.IsUncertainCommit(err) {
@@ -436,7 +436,7 @@ func openConfiguredWithHooks(
 	}
 	coordinator.commit.release()
 	if err != nil {
-		primary := fmt.Errorf("opening namespace %q in %s: %w", namespace, database, sqlerr.Failure(err))
+		primary := fmt.Errorf("opening volume %q in %s: %w", volume, database, sqlerr.Failure(err))
 		return nil, cleanup(primary,
 			openPoolHandle{"snapshot reader pool", snapshotRead},
 			openPoolHandle{"reader pool", read},
@@ -445,7 +445,7 @@ func openConfiguredWithHooks(
 	}
 	store := &Store{
 		write: write, read: read, snapshotRead: snapshotRead,
-		namespace: id, root: root,
+		volume: id, root: root,
 		databasePath: database,
 		leaseOwner:   owner,
 		allowance:    allowance, window: options.Window, objectLimits: options.ObjectLimits,
@@ -749,18 +749,18 @@ func (s *Store) Space(ctx context.Context) (storage.Space, error) {
 	}
 	defer s.coordinator.endHealthyRead()
 	if s.allowance == 0 {
-		return storage.Space{}, fmt.Errorf("this namespace is held under no allowance: %w", syscall.ENOSYS)
+		return storage.Space{}, fmt.Errorf("this volume is held under no allowance: %w", syscall.ENOSYS)
 	}
 	var used int64
-	if err := s.read.QueryRowContext(ctx, `SELECT used FROM namespaces WHERE id = ?`, s.namespace).Scan(&used); err != nil {
-		return storage.Space{}, fmt.Errorf("reading what the namespace holds: %w", sqlerr.ReadFailure(ctx, err))
+	if err := s.read.QueryRowContext(ctx, `SELECT used FROM volumes WHERE id = ?`, s.volume).Scan(&used); err != nil {
+		return storage.Space{}, fmt.Errorf("reading what the volume holds: %w", sqlerr.ReadFailure(ctx, err))
 	}
 	space := storage.Space{Total: s.allowance, Used: used, Avail: max(s.allowance-used, 0)}
 	// The counter is exact, so a figure that could not be true of anything is this package
 	// having lost count rather than a number to repair. Reporting it anyway would put a
 	// fabricated quantity in front of a caller as measured fact (R-ERR-2).
 	if !space.Coherent() {
-		return storage.Space{}, fmt.Errorf("the namespace is recorded as holding %d bytes of its %d byte allowance, which cannot be true: %w",
+		return storage.Space{}, fmt.Errorf("the volume is recorded as holding %d bytes of its %d byte allowance, which cannot be true: %w",
 			used, s.allowance, syscall.EIO)
 	}
 	return space, nil
@@ -778,17 +778,17 @@ func (s *Store) Space(ctx context.Context) (storage.Space, error) {
 // The trim rides here rather than beside each append. A write transaction is the only moment
 // this package is guaranteed to have one to ride on, and running it on every one of them
 // rather than only on the ones that recorded something is what lets an object sweep keep an
-// otherwise quiet namespace's log inside its age bound. A transaction with nothing to discard
+// otherwise quiet volume's log inside its age bound. A transaction with nothing to discard
 // pays two indexed lookups for the answer.
 func (s *Store) mutate(ctx context.Context, f func(tx *sql.Tx) error) error {
 	return s.mutatePublication(ctx, nil, f)
 }
 
-func (s *Store) mutatePublication(ctx context.Context, intent *namespaceIntent, f func(tx *sql.Tx) error) error {
+func (s *Store) mutatePublication(ctx context.Context, intent *volumeIntent, f func(tx *sql.Tx) error) error {
 	return s.mutateTransaction(ctx, ctx, intent, f)
 }
 
-func (s *Store) mutateTransaction(admissionContext, ctx context.Context, intent *namespaceIntent, f func(tx *sql.Tx) error) (returnErr error) {
+func (s *Store) mutateTransaction(admissionContext, ctx context.Context, intent *volumeIntent, f func(tx *sql.Tx) error) (returnErr error) {
 	if err := s.coordinator.commit.acquire(admissionContext); err != nil {
 		return err
 	}
@@ -797,7 +797,7 @@ func (s *Store) mutateTransaction(admissionContext, ctx context.Context, intent 
 }
 
 // The caller holds commit ordering across retention or retirement and publication.
-func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context, intent *namespaceIntent, f func(tx *sql.Tx) error) (returnErr error) {
+func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context, intent *volumeIntent, f func(tx *sql.Tx) error) (returnErr error) {
 	if err := s.coordinator.healthy(); err != nil {
 		return err
 	}
@@ -810,9 +810,9 @@ func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context,
 		returnErr = s.finishMutationTransaction(tx, returnErr, observationHeld)
 	}()
 
-	var publication *namespacePublication
+	var publication *volumePublication
 	if intent != nil {
-		publication, err = s.prepareNamespacePublication(ctx, tx, *intent)
+		publication, err = s.prepareVolumePublication(ctx, tx, *intent)
 		if err != nil {
 			return err
 		}
@@ -821,11 +821,11 @@ func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context,
 		return err
 	}
 	if publication != nil {
-		if err := s.finishNamespacePublication(ctx, tx, publication); err != nil {
+		if err := s.finishVolumePublication(ctx, tx, publication); err != nil {
 			return err
 		}
 	}
-	if err := changes.Trim(ctx, tx, s.namespace, changes.Window(s.window)); err != nil {
+	if err := changes.Trim(ctx, tx, s.volume, changes.Window(s.window)); err != nil {
 		return sqlerr.Failure(err)
 	}
 	state, err := dbstate.AdvanceGeneration(ctx, tx)
@@ -838,7 +838,7 @@ func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context,
 		return err
 	}
 	if publication != nil {
-		return s.publishNamespace(ctx, tx, DurableState(state), publication)
+		return s.publishVolume(ctx, tx, DurableState(state), publication)
 	}
 	return s.commitPrepared(tx, DurableState(state))
 }
@@ -937,10 +937,10 @@ func finishReadTransaction(ctx context.Context, subject string, tx rollbacker, p
 	return errors.Join(primary, rollbackErr)
 }
 
-// pathError wraps err as a failure at a namespace path.
+// pathError wraps err as a failure at a volume path.
 //
 // The path is the one the caller named, never a host path and never anything about the
-// database file. A caller of this contract knows only namespace paths, and an error naming
+// database file. A caller of this contract knows only volume paths, and an error naming
 // something else describes a filesystem it cannot see.
 func pathError(op, path string, err error) error {
 	return &os.PathError{Op: op, Path: path, Err: err}
@@ -960,19 +960,19 @@ func splitPath(cleaned string) (dir, name string) {
 	return "", cleaned
 }
 
-func prepare(ctx context.Context, db *sql.DB, namespace, storeID string, window Window, maxRecords, maxBytes int64) (int64, int64, error) {
-	return schema.Prepare(ctx, db, namespace, storeID, changes.Window(window), maxRecords, maxBytes)
+func prepare(ctx context.Context, db *sql.DB, volume, storeID string, window Window, maxRecords, maxBytes int64) (int64, int64, error) {
+	return schema.Prepare(ctx, db, volume, storeID, changes.Window(window), maxRecords, maxBytes)
 }
-func prepareConfigured(ctx context.Context, db *sql.DB, namespace, storeID string, window Window, maxRecords, maxBytes int64, durable *durableOpen) (int64, int64, DurableState, error) {
+func prepareConfigured(ctx context.Context, db *sql.DB, volume, storeID string, window Window, maxRecords, maxBytes int64, durable *durableOpen) (int64, int64, DurableState, error) {
 	var config *schema.DurableOpen
 	if durable != nil {
 		config = &schema.DurableOpen{
 			ReapDetached: durable.reapDetached,
-			Mode:         schema.NamespaceOpenMode(durable.mode),
+			Mode:         schema.VolumeOpenMode(durable.mode),
 			Startup:      durable.startup.databaseStartup(),
 			Witnessed:    durable.witness != nil,
 		}
 	}
-	id, root, state, err := schema.PrepareConfigured(ctx, db, namespace, storeID, changes.Window(window), maxRecords, maxBytes, config)
+	id, root, state, err := schema.PrepareConfigured(ctx, db, volume, storeID, changes.Window(window), maxRecords, maxBytes, config)
 	return id, root, DurableState(state), err
 }

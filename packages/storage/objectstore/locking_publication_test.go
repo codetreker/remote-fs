@@ -79,32 +79,32 @@ func (o *heldLockObjects) Get(ctx context.Context, key string) ([]byte, error) {
 	return content, nil
 }
 
-func lockingObjectNamespace(t *testing.T, options locking.Options, objects objectstore.Objects) (*objectstore.Storage, *sqlite.LockingStore, *locked.Storage) {
+func lockingObjectVolume(t *testing.T, options locking.Options, objects objectstore.Objects) (*objectstore.Storage, *sqlite.LockingStore, *locked.Storage) {
 	t.Helper()
 	meta, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
-		Database: filepath.Join(t.TempDir(), "meta.db"), Namespace: "workspace",
+		Database: filepath.Join(t.TempDir(), "meta.db"), Volume: "workspace",
 		SQLite: sqlite.DefaultOptions(), Locks: options, Initialize: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	namespace := objectstore.New(objects, meta)
+	volume := objectstore.New(objects, meta)
 	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
-			t.Errorf("closing the locked namespace: %v", err)
+		if err := volume.Close(); err != nil {
+			t.Errorf("closing the locked volume: %v", err)
 		}
 	})
-	if namespace.LockService() == nil || namespace.LockService() != meta.LockService() {
+	if volume.LockService() == nil || volume.LockService() != meta.LockService() {
 		t.Fatal("object storage did not preserve its native metastore authority")
 	}
-	if err := namespace.CheckPublicationAccounting(); err != nil {
+	if err := volume.CheckPublicationAccounting(); err != nil {
 		t.Fatalf("native publication accounting was not forwarded: %v", err)
 	}
-	paired, err := locked.New(namespace)
+	paired, err := locked.New(volume)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return namespace, meta, paired
+	return volume, meta, paired
 }
 
 func publicationOwner(t *testing.T, service locking.Service) locking.OwnerRef {
@@ -155,7 +155,7 @@ func awaitPublication[T any](t *testing.T, result <-chan T) T {
 	case value := <-result:
 		return value
 	case <-time.After(5 * time.Second):
-		t.Fatal("the namespace operation did not finish")
+		t.Fatal("the volume operation did not finish")
 		var zero T
 		return zero
 	}
@@ -169,18 +169,18 @@ func TestObjectUploadDoesNotReservePublicationOrExtendAnExpiredGrant(t *testing.
 		Objects: memory.New(), putPayload: []byte("staged replacement"),
 		entered: make(chan struct{}), release: make(chan struct{}),
 	}
-	namespace, meta, paired := lockingObjectNamespace(t, options, objects)
+	volume, meta, paired := lockingObjectVolume(t, options, objects)
 	release := sync.OnceFunc(func() { close(objects.release) })
 	defer release()
-	if err := namespace.Write(t.Context(), "f", []byte("original")); err != nil {
+	if err := volume.Write(t.Context(), "f", []byte("original")); err != nil {
 		t.Fatal(err)
 	}
 	before, err := meta.Stat(t.Context(), "f")
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner := publicationOwner(t, namespace.LockService())
-	grant := publicationGrant(t, namespace.LockService(), owner, "f", locking.Exclusive)
+	owner := publicationOwner(t, volume.LockService())
+	grant := publicationGrant(t, volume.LockService(), owner, "f", locking.Exclusive)
 	scoped, err := paired.Scope(locking.MutationScope{Owner: owner, Grants: []locking.GrantRef{grant}})
 	if err != nil {
 		t.Fatal(err)
@@ -189,11 +189,11 @@ func TestObjectUploadDoesNotReservePublicationOrExtendAnExpiredGrant(t *testing.
 	go func() { written <- scoped.Write(t.Context(), "f", objects.putPayload) }()
 	awaitPublication(t, objects.entered)
 	other := make(chan error, 1)
-	go func() { other <- namespace.Write(t.Context(), "unrelated", []byte("other file")) }()
+	go func() { other <- volume.Write(t.Context(), "unrelated", []byte("other file")) }()
 	if err := awaitPublication(t, other); err != nil {
 		t.Fatalf("uploading one file blocked another publication: %v", err)
 	}
-	if body, err := namespace.Read(t.Context(), "f"); err != nil || string(body) != "original" {
+	if body, err := volume.Read(t.Context(), "f"); err != nil || string(body) != "original" {
 		t.Fatalf("staging became visible before publication: body=%q err=%v", body, err)
 	}
 	clock.advance(11 * time.Second)
@@ -208,7 +208,7 @@ func TestObjectUploadDoesNotReservePublicationOrExtendAnExpiredGrant(t *testing.
 	if before.ID != after.ID || before.Content != after.Content || before.Size != after.Size {
 		t.Fatal("rejected publication changed the file identity or content reference")
 	}
-	if body, err := namespace.Read(t.Context(), "f"); err != nil || string(body) != "original" {
+	if body, err := volume.Read(t.Context(), "f"); err != nil || string(body) != "original" {
 		t.Fatalf("rejected staged bytes replaced the file: body=%q err=%v", body, err)
 	}
 }
@@ -218,22 +218,22 @@ func TestAnAnonymousUploadIsCheckedAgainstGrantsAcquiredDuringStaging(t *testing
 		Objects: memory.New(), putPayload: []byte("anonymous replacement"),
 		entered: make(chan struct{}), release: make(chan struct{}),
 	}
-	namespace, _, _ := lockingObjectNamespace(t, locking.DefaultOptions(), objects)
+	volume, _, _ := lockingObjectVolume(t, locking.DefaultOptions(), objects)
 	release := sync.OnceFunc(func() { close(objects.release) })
 	defer release()
-	if err := namespace.Write(t.Context(), "f", []byte("original")); err != nil {
+	if err := volume.Write(t.Context(), "f", []byte("original")); err != nil {
 		t.Fatal(err)
 	}
 	written := make(chan error, 1)
-	go func() { written <- namespace.Write(t.Context(), "f", objects.putPayload) }()
+	go func() { written <- volume.Write(t.Context(), "f", objects.putPayload) }()
 	awaitPublication(t, objects.entered)
-	owner := publicationOwner(t, namespace.LockService())
-	publicationGrant(t, namespace.LockService(), owner, "f", locking.Shared)
+	owner := publicationOwner(t, volume.LockService())
+	publicationGrant(t, volume.LockService(), owner, "f", locking.Shared)
 	release()
 	if err := awaitPublication(t, written); !errors.Is(err, &locking.Error{Code: locking.Conflict}) {
 		t.Fatalf("anonymous upload ignored the newly acquired shared grant: %v", err)
 	}
-	if body, err := namespace.Read(t.Context(), "f"); err != nil || string(body) != "original" {
+	if body, err := volume.Read(t.Context(), "f"); err != nil || string(body) != "original" {
 		t.Fatalf("shared-protected file changed: body=%q err=%v", body, err)
 	}
 }
@@ -243,10 +243,10 @@ func TestCapturedImmutableReadDoesNotHoldGrantOrPublicationAdmission(t *testing.
 		Objects: memory.New(), getPayload: []byte("captured version"),
 		entered: make(chan struct{}), release: make(chan struct{}),
 	}
-	namespace, _, paired := lockingObjectNamespace(t, locking.DefaultOptions(), objects)
+	volume, _, paired := lockingObjectVolume(t, locking.DefaultOptions(), objects)
 	release := sync.OnceFunc(func() { close(objects.release) })
 	defer release()
-	if err := namespace.Write(t.Context(), "f", objects.getPayload); err != nil {
+	if err := volume.Write(t.Context(), "f", objects.getPayload); err != nil {
 		t.Fatal(err)
 	}
 	type readResult struct {
@@ -255,12 +255,12 @@ func TestCapturedImmutableReadDoesNotHoldGrantOrPublicationAdmission(t *testing.
 	}
 	read := make(chan readResult, 1)
 	go func() {
-		body, err := namespace.Read(t.Context(), "f")
+		body, err := volume.Read(t.Context(), "f")
 		read <- readResult{body, err}
 	}()
 	awaitPublication(t, objects.entered)
-	owner := publicationOwner(t, namespace.LockService())
-	grant := publicationGrant(t, namespace.LockService(), owner, "f", locking.Exclusive)
+	owner := publicationOwner(t, volume.LockService())
+	grant := publicationGrant(t, volume.LockService(), owner, "f", locking.Exclusive)
 	scoped, err := paired.Scope(locking.MutationScope{Owner: owner, Grants: []locking.GrantRef{grant}})
 	if err != nil {
 		t.Fatal(err)
@@ -275,7 +275,7 @@ func TestCapturedImmutableReadDoesNotHoldGrantOrPublicationAdmission(t *testing.
 	if result.err != nil || string(result.body) != "captured version" {
 		t.Fatalf("captured read returned %q, %v", result.body, result.err)
 	}
-	if body, err := namespace.Read(t.Context(), "f"); err != nil || string(body) != "new version" {
+	if body, err := volume.Read(t.Context(), "f"); err != nil || string(body) != "new version" {
 		t.Fatalf("fresh read did not capture the published version: %q, %v", body, err)
 	}
 }
@@ -284,12 +284,12 @@ func TestAzureObjectStoreLockContract(t *testing.T) {
 	lockcontract.Run(t, func(t *testing.T, options locking.Options) lockcontract.Fixture {
 		objects, err := azblob.NewWithSharedKey(
 			serviceURL()+"/"+containerFor(t), accountName, accountKey,
-			fmt.Sprintf("locks/%d/", namespaces.Add(1)),
+			fmt.Sprintf("locks/%d/", volumes.Add(1)),
 		)
 		if err != nil {
 			t.Fatal(err)
 		}
-		namespace, _, paired := lockingObjectNamespace(t, options, objects)
-		return lockcontract.Fixture{Storage: namespace, Locks: namespace.LockService(), Scope: paired.Scope}
+		volume, _, paired := lockingObjectVolume(t, options, objects)
+		return lockcontract.Fixture{Storage: volume, Locks: volume.LockService(), Scope: paired.Scope}
 	})
 }

@@ -75,7 +75,7 @@ func TestPageAnchorsRejectBrokenRetainedChains(t *testing.T) {
 		{"missing middle", `DELETE FROM changes WHERE position=2`, "follows position"},
 		{"missing tail", `DELETE FROM changes WHERE position=3`, "committed tail"},
 		{"wrong oldest predecessor", `UPDATE changes SET previous_position=1 WHERE position=1`, "invalid position/predecessor"},
-		{"wrong trim anchor", `UPDATE logs SET trimmed_through=1 WHERE namespace=1`, "trim anchor"},
+		{"wrong trim anchor", `UPDATE logs SET trimmed_through=1 WHERE volume=1`, "trim anchor"},
 		{"untrimmed empty", `DELETE FROM changes`, "empty retained log"},
 		{"invalid metadata", `UPDATE changes SET mode=-1 WHERE position=2`, "invalid node metadata"},
 		{"invalid payload", `UPDATE changes SET name=x'2e2e' WHERE position=2`, "invalid destination"},
@@ -98,13 +98,13 @@ func TestPageAnchorsRejectBrokenRetainedChains(t *testing.T) {
 	_, tx := logFixture(t)
 	appendLog(t, tx, 3)
 	execLogSQL(t, tx, `DELETE FROM changes WHERE position<=2`)
-	execLogSQL(t, tx, `UPDATE logs SET trimmed_through=2 WHERE namespace=1`)
+	execLogSQL(t, tx, `UPDATE logs SET trimmed_through=2 WHERE volume=1`)
 	retention, err := ReadPage(t.Context(), tx, 1, 100, 0, 10, changeResult(t, 10))
 	if err != nil || retention.TrimmedThrough != 2 || retention.Oldest != 3 || retention.Tail != 3 {
 		t.Fatalf("trimmed page=%+v %v", retention, err)
 	}
 	execLogSQL(t, tx, `DELETE FROM changes`)
-	execLogSQL(t, tx, `UPDATE logs SET trimmed_through=3 WHERE namespace=1`)
+	execLogSQL(t, tx, `UPDATE logs SET trimmed_through=3 WHERE volume=1`)
 	retention, err = ReadPage(t.Context(), tx, 1, 2, 0, 10, changeResult(t, 10))
 	if err != nil || retention.Oldest != 0 || retention.Tail != 3 || retention.TrimmedThrough != 3 {
 		t.Fatalf("fully trimmed page=%+v %v", retention, err)
@@ -185,7 +185,7 @@ func TestBarrierValidatesIncarnationAndDurablePosition(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			_, tx := logFixture(t)
 			appendLog(t, tx, 2)
-			execLogSQL(t, tx, `UPDATE logs SET `+test.mutation+` WHERE namespace=1`)
+			execLogSQL(t, tx, `UPDATE logs SET `+test.mutation+` WHERE volume=1`)
 			if _, err := ReadLogBarrier(t.Context(), tx, 1, 32, true); !errors.Is(err, syscall.EIO) {
 				t.Errorf("invalid barrier = %v", err)
 			}

@@ -37,8 +37,8 @@ func TestTheReadingEndWaitsLongerThanTheServerIsSilentFor(t *testing.T) {
 	t.Logf("kept alive every %v, given up on after %v", httprest.DefaultLimits().Keepalive, httprest.DefaultSilence)
 }
 
-// TestAStreamWithNothingToSayIsKeptAlive. A namespace nobody is writing to is the ordinary
-// case — most workspaces are idle most of the time — and a bound on silence would end every
+// TestAStreamWithNothingToSayIsKeptAlive. A volume nobody is writing to is the ordinary
+// case — most volumes are idle most of the time — and a bound on silence would end every
 // one of those subscriptions if the server did not say anything at all.
 //
 // Waiting is not by itself evidence: a stream that is merely blocked looks the same as one
@@ -141,7 +141,7 @@ func TestAStreamThatStopsArrivingIsReportedRatherThanWaitedOnForever(t *testing.
 func serveQuietly(t *testing.T, log metastore.Log, limits httprest.Limits, relay *blackhole, silence time.Duration) *httprest.Storage {
 	t.Helper()
 
-	backing := namespaceFixture(t)
+	backing := volumeFixture(t)
 	var served storage.Storage = backing
 	if fake, ok := log.(*fakeLog); ok {
 		served = recording{Storage: backing, log: fake}

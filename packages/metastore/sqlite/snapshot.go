@@ -40,7 +40,7 @@ func (s *Store) Snapshot(ctx context.Context) (metastore.Snap, metastore.Positio
 	if err := tx.QueryRowContext(ctx,
 		`SELECT CASE WHEN typeof(committed_position) = 'integer' THEN committed_position END,
 		        typeof(committed_position)
-		 FROM logs WHERE namespace = ?`, s.namespace).Scan(&committedRaw, &committedType); err != nil {
+		 FROM logs WHERE volume = ?`, s.volume).Scan(&committedRaw, &committedType); err != nil {
 		primary := fmt.Errorf("opening a picture of the tree: %w", sqlerr.ReadFailure(ctx, err))
 		return nil, 0, finishReadTransaction(ctx, "snapshot transaction", tx, primary)
 	}
@@ -50,8 +50,8 @@ func (s *Store) Snapshot(ctx context.Context) (metastore.Snap, metastore.Positio
 			syscall.EIO)
 		return nil, 0, finishReadTransaction(ctx, "snapshot transaction", tx, primary)
 	}
-	if err := schema.ValidateNamespaceIntegrity(
-		ctx, tx, s.namespace, s.maxIntegrityRecords, s.maxIntegrityBytes,
+	if err := schema.ValidateVolumeIntegrity(
+		ctx, tx, s.volume, s.maxIntegrityRecords, s.maxIntegrityBytes,
 	); err != nil {
 		primary := fmt.Errorf("validating the picture of the tree: %w", sqlerr.ReadFailure(ctx, err))
 		return nil, 0, finishReadTransaction(ctx, "snapshot transaction", tx, primary)
@@ -180,8 +180,8 @@ func (p *snapshot) readFailure(ctx context.Context, err error) error {
 // test rather than the rows — what went wrong here before was never the rows this returns,
 // only what it cost to return them.
 //
-// The namespace equality and the cursor range both address the entry table's primary key, so
-// a page is a seek to the cursor and a read forward over this namespace's rows and no
+// The volume equality and the cursor range both address the entry table's primary key, so
+// a page is a seek to the cursor and a read forward over this volume's rows and no
 // others. The ordering falls out of the same key, so no page sorts anything.
 //
 // The cursor is a row value rather than the `parent > ? OR (parent = ? AND name > ?)` that
@@ -193,13 +193,13 @@ func (p *snapshot) readFailure(ctx context.Context, err error) error {
 // eighty entries and one of four hundred thousand, with and without table statistics, the
 // four spellings give three different plans:
 //
-//	(parent, name) > (?, ?)                      PRIMARY KEY (namespace=? AND (parent,name)>(?,?))
-//	parent > ?  OR (parent = ?  AND name > ?)    PRIMARY KEY (namespace=?)
-//	parent > ?2 OR (parent = ?2 AND name > ?3)   PRIMARY KEY (namespace=? AND parent>?)
-//	parent > ?2 OR (parent = ?3 AND name > ?4)   PRIMARY KEY (namespace=?)
+//	(parent, name) > (?, ?)                      PRIMARY KEY (volume=? AND (parent,name)>(?,?))
+//	parent > ?  OR (parent = ?  AND name > ?)    PRIMARY KEY (volume=?)
+//	parent > ?2 OR (parent = ?2 AND name > ?3)   PRIMARY KEY (volume=? AND parent>?)
+//	parent > ?2 OR (parent = ?3 AND name > ?4)   PRIMARY KEY (volume=?)
 //
-// The second line is what a page costs without the row value: the namespace still bounds the
-// search, so no foreign row is read, but every page starts at this namespace's first entry
+// The second line is what a page costs without the row value: the volume still bounds the
+// search, so no foreign row is read, but every page starts at this volume's first entry
 // and tests the cursor row by row. The fourth line is the control that says which thing is
 // doing the work — numbering the parameters changes nothing on its own.
 //
@@ -214,7 +214,7 @@ const pageQuery = `
 	       n.atime_sec, n.atime_nsec, n.mtime_sec, n.mtime_nsec,
 	       COALESCE(length(CAST(n.content AS BLOB)), 0)
 	FROM entries e JOIN nodes n ON n.id = e.node
-	WHERE e.namespace = ? AND (e.parent, e.name) > (?, ?)
+	WHERE e.volume = ? AND (e.parent, e.name) > (?, ?)
 	ORDER BY e.parent, e.name
 	LIMIT ?`
 
@@ -261,7 +261,7 @@ func (p *snapshot) nextMetadata(ctx context.Context) (metastore.Row, metastore.R
 		nameBytes int64
 		node      nodeMetadataScan
 	)
-	err := p.tx.QueryRowContext(ctx, pageQuery, p.store.namespace, p.parent, p.name, 1).Scan(
+	err := p.tx.QueryRowContext(ctx, pageQuery, p.store.volume, p.parent, p.name, 1).Scan(
 		append([]any{&parent, &nameBytes}, node.fields()...)...,
 	)
 	if err == sql.ErrNoRows {
@@ -283,8 +283,8 @@ func (p *snapshot) payload(ctx context.Context, parent, node int64) ([]byte, met
 	err := p.tx.QueryRowContext(ctx, `
 		SELECT e.name, n.content
 		FROM entries e JOIN nodes n ON n.id = e.node
-		WHERE e.namespace = ? AND e.parent = ? AND e.node = ?`,
-		p.store.namespace, parent, node).Scan(&name, &content)
+		WHERE e.volume = ? AND e.parent = ? AND e.node = ?`,
+		p.store.volume, parent, node).Scan(&name, &content)
 	return name, metastore.Key(content.String), err
 }
 

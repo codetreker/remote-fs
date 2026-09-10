@@ -1,9 +1,9 @@
-// Package storage defines the contract for one namespace: a tree of directories and
+// Package storage defines the contract for one volume: a tree of directories and
 // files that the rest of the system reads and writes through a single interface.
 //
 // Direct backends, network clients, and metadata replicas implement this contract.
 // Mounts and SDK callers use the same operations regardless of where the authoritative
-// namespace is held.
+// volume is held.
 package storage
 
 import (
@@ -17,16 +17,16 @@ import (
 	"time"
 )
 
-// Storage is one namespace.
+// Storage is one volume.
 //
 // Paths are slash-separated and relative to the root, with no leading slash; the root
 // itself is the empty string. A path that is absolute, or that climbs out of the root,
 // is rejected with syscall.EINVAL.
 //
 // The root is not a node any caller made, so removing it, moving it, or putting something
-// else in its place are not operations offered here; each is syscall.EBUSY. A namespace
+// else in its place are not operations offered here; each is syscall.EBUSY. A volume
 // whose root has been removed answers syscall.ENOENT to everything afterwards, which
-// reads as "that file is not there" when the truth is that the namespace is not there.
+// reads as "that file is not there" when the truth is that the volume is not there.
 //
 // Named failures use syscall.Errno values, reachable with errors.Is through wrappers.
 // An honored request cancellation may retain context.Canceled; callers use ErrnoOf to
@@ -83,7 +83,7 @@ type Storage interface {
 	// them, and one facing a writer that never pauses can lose every time it tries. That
 	// is a report about this attempt rather than about the file, and it is distinct from
 	// both syscall.ENOENT, which says the name is gone, and syscall.EIO, which says the
-	// namespace no longer has bytes it still claims to hold. A caller that wants the
+	// volume no longer has bytes it still claims to hold. A caller that wants the
 	// contents tries again; a caller that cannot has learned that it did not read them,
 	// which is the one thing it must not be left guessing about.
 	Read(ctx context.Context, path string) ([]byte, error)
@@ -112,11 +112,10 @@ type Storage interface {
 	// the root as either operand is syscall.EBUSY.
 	Rename(ctx context.Context, from, to string) error
 
-	// Space reports the room the namespace has. It describes the whole namespace rather
-	// than the part of it under any one path, because one namespace is one workspace
-	// under one limit, and asking about a subtree is a question nothing here can answer.
+	// Space reports the room the whole volume has under its capacity limit. This
+	// interface cannot report separate capacity for the part beneath one path.
 	//
-	// A namespace that has no room of its own to report answers syscall.ENOSYS. That is
+	// A volume that has no room of its own to report answers syscall.ENOSYS. That is
 	// a standing property of the implementation rather than a condition of the call: one
 	// that answers answers for as long as it exists, and one that refuses never starts.
 	// Nothing above may therefore treat a refusal as a transient failure to retry, and
@@ -126,7 +125,7 @@ type Storage interface {
 
 // BoundedStorage produces the two variable-size results under a caller-owned bound.
 //
-// Storage remains the general namespace contract because callers such as a local mount
+// Storage remains the general volume contract because callers such as a local mount
 // already own their limits. A server embedded in another process must require this
 // additional contract before it starts serving: checking a completed []byte or []Entry is
 // too late, because the oversized allocation has already happened.
@@ -296,21 +295,21 @@ func (r *ListReservation) Commit(name string) error {
 	return nil
 }
 
-// Space is the room a namespace has, in bytes.
+// Space is the room a volume has, in bytes.
 //
 // The three are separately measured rather than derived from one another, because for a
-// namespace held in a directory they genuinely differ: a filesystem keeps a reserve only
+// volume held in a directory they genuinely differ: a filesystem keeps a reserve only
 // the superuser may spend, which makes Avail smaller than Total-Used. Reporting either as
 // the other would state a quantity nobody measured.
 type Space struct {
-	// Total is what the namespace may hold in all.
+	// Total is what the volume may hold in all.
 	Total int64
 
-	// Used is how much of Total is gone. What that counts is the namespace's own
+	// Used is how much of Total is gone. What that counts is the volume's own
 	// business: one holding its own allowance counts the content it holds, while one
 	// held in a directory reports what that whole filesystem has consumed, other
 	// people's files included. Both answer the question Total asks — how much of the
-	// room reported here is left — and neither is a census of this namespace's files.
+	// room reported here is left — and neither is a census of this volume's files.
 	//
 	// It may exceed Total, which is what an allowance lowered underneath content already
 	// written looks like. Avail is then zero.
@@ -347,13 +346,13 @@ type Attr struct {
 	// survives a rename, because a rename changes a name and not a node.
 	//
 	// It is opaque: compare it for equality, and do nothing else with it. Neither its
-	// magnitude nor its ordering means anything, and two namespaces may use the same
+	// magnitude nor its ordering means anything, and two volumes may use the same
 	// value for unrelated nodes.
 	//
 	// Zero is not a value. R-FS-5 is the whole reason this field exists, and an
 	// implementation that left it unset would satisfy every equality comparison above it
 	// — which is to say it would report every node as the same node, silently. A
-	// namespace that cannot tell one node from another cannot serve a mountpoint, and
+	// volume that cannot tell one node from another cannot serve a mountpoint, and
 	// the contract suite refuses one that tries.
 	ID uint64
 
@@ -423,7 +422,7 @@ type Entry struct {
 	Attr Attr
 }
 
-// CleanPath normalizes a namespace path and rejects anything outside the root. The
+// CleanPath normalizes a volume path and rejects anything outside the root. The
 // returned path has no leading, trailing, or repeated slashes, and the root is "".
 func CleanPath(p string) (string, error) {
 	if strings.HasPrefix(p, "/") {

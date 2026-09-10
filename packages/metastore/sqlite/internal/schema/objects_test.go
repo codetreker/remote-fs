@@ -7,10 +7,10 @@ import (
 	"testing"
 )
 
-func TestObjectRelationshipsRequireUniqueSameNamespaceOwnership(t *testing.T) {
+func TestObjectRelationshipsRequireUniqueSameVolumeOwnership(t *testing.T) {
 	for _, mutation := range []string{
 		`DELETE FROM objects`,
-		`UPDATE objects SET namespace=99`,
+		`UPDATE objects SET volume=99`,
 		`UPDATE objects SET state=2`,
 		`UPDATE objects SET size=9`,
 		`UPDATE nodes SET content=NULL WHERE id=2`,
@@ -18,7 +18,7 @@ func TestObjectRelationshipsRequireUniqueSameNamespaceOwnership(t *testing.T) {
 	} {
 		t.Run(mutation, func(t *testing.T) {
 			db := testDatabase(t, 0)
-			id, root := testNamespace(t, db, "workspace")
+			id, root := testVolume(t, db, "workspace")
 			testFile(t, db, id, root, "file", 3, false)
 			execute(t, db, mutation)
 			for _, scope := range []*int64{nil, &id} {
@@ -39,7 +39,7 @@ func TestLegacyObjectsCannotInventDeletionAuthority(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			db := testDatabase(t, 0)
-			id, root := testNamespace(t, db, "workspace")
+			id, root := testVolume(t, db, "workspace")
 			testFile(t, db, id, root, "file", 3, false)
 			if err := validateLegacyObjectIntegrity(t.Context(), db, 2); err != nil {
 				t.Fatal(err)

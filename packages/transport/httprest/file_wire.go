@@ -68,7 +68,7 @@ func fileActionRequired(op string) bool {
 }
 
 // FileWithBarrier exposes authority progress without requiring a directory entry
-// for detached files. A nil barrier means the namespace has no change log.
+// for detached files. A nil barrier means the volume has no change log.
 type FileWithBarrier interface {
 	storage.File
 	WriteAtWithBarrier(context.Context, int64, []byte) (storage.Attr, *MutationBarrier, error)

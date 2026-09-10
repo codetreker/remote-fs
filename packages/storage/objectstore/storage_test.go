@@ -23,7 +23,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/storagetest"
 )
 
-// The namespaces these tests build are held in a real blob service and a real database.
+// The volumes these tests build are held in a real blob service and a real database.
 // Nothing here stands in for either: the whole claim this package makes is about how those
 // two behave together, and a substitute for one of them would be a test of the substitute.
 //
@@ -44,12 +44,12 @@ func serviceURL() string {
 	return defaultURL
 }
 
-// namespaces counts the namespaces this run has built, so that each gets a key prefix of
-// its own. The contract suite asks for a fresh, empty namespace per case, and a prefix is
+// volumes counts the volumes this run has built, so that each gets a key prefix of
+// its own. The contract suite asks for a fresh, empty volume per case, and a prefix is
 // what makes one fresh without paying for a container each time.
-var namespaces atomic.Int64
+var volumes atomic.Int64
 
-// parts is one namespace with its two halves still in reach. Some of what this package
+// parts is one volume with its two halves still in reach. Some of what this package
 // promises is only observable from underneath — that a swept object is really gone, that a
 // read reports an object the store has lost — and checking it from above would be checking
 // the claim against itself.
@@ -59,7 +59,7 @@ type parts struct {
 	*objectstore.Storage
 }
 
-// newStorage builds one empty namespace: its own database file, and its own prefix in a
+// newStorage builds one empty volume: its own database file, and its own prefix in a
 // container shared by the whole run.
 func newStorage(t *testing.T) storage.Storage {
 	t.Helper()
@@ -74,7 +74,7 @@ func newStorageWithAllowance(t *testing.T, allowance int64) storage.Storage {
 func newParts(t *testing.T, allowance int64) parts {
 	t.Helper()
 	name := containerFor(t)
-	prefix := fmt.Sprintf("n%d/", namespaces.Add(1))
+	prefix := fmt.Sprintf("n%d/", volumes.Add(1))
 	database := filepath.Join(t.TempDir(), "meta.db")
 
 	objects, err := azblob.NewWithSharedKey(serviceURL()+"/"+name, accountName, accountKey, prefix)
@@ -85,13 +85,13 @@ func newParts(t *testing.T, allowance int64) parts {
 	if err != nil {
 		t.Fatalf("opening the metastore: %v", err)
 	}
-	namespace := objectstore.New(objects, meta)
+	volume := objectstore.New(objects, meta)
 	t.Cleanup(func() {
-		if err := namespace.Close(); err != nil {
-			t.Errorf("closing the namespace: %v", err)
+		if err := volume.Close(); err != nil {
+			t.Errorf("closing the volume: %v", err)
 		}
 	})
-	return parts{objects: objects, meta: meta, Storage: namespace}
+	return parts{objects: objects, meta: meta, Storage: volume}
 }
 
 // contentOf reports which object holds a file's bytes, asked of the tree directly.
@@ -108,7 +108,7 @@ func contentOf(t *testing.T, p parts, path string) metastore.Key {
 }
 
 // containerFor makes the container these tests share, once. Creating a container is a
-// deployment's act rather than a namespace's, which is why nothing in the package under
+// deployment's act rather than a volume's, which is why nothing in the package under
 // test does it.
 const sharedContainer = "remote-fs-test"
 
@@ -143,8 +143,8 @@ func makeContainer(ctx context.Context, name string) error {
 	return nil
 }
 
-// TestContract is the whole obligation: a namespace in a blob container behaves the way
-// every other namespace does.
+// TestContract is the whole obligation: a volume in a blob container behaves the way
+// every other volume does.
 func TestContract(t *testing.T) {
 	storagetest.Run(t, newStorage)
 }
@@ -156,70 +156,70 @@ func TestBoundedContract(t *testing.T) {
 }
 
 // TestSpaceRefusesWithoutAnAllowance holds the one thing the contract suite checks only for
-// consistency: a namespace in a blob container has no capacity of its own to report, so
+// consistency: a volume in a blob container has no capacity of its own to report, so
 // without an allowance it has no figures at all rather than invented ones.
 func TestSpaceRefusesWithoutAnAllowance(t *testing.T) {
-	namespace := newStorage(t)
-	if _, err := namespace.Space(t.Context()); !errors.Is(err, syscall.ENOSYS) {
+	volume := newStorage(t)
+	if _, err := volume.Space(t.Context()); !errors.Is(err, syscall.ENOSYS) {
 		t.Fatalf("space answered %v, want ENOSYS: a blob container has no capacity to report", err)
 	}
 }
 
-// TestSpaceCountsWhatTheNamespaceHolds checks that the count is the namespace's own content
+// TestSpaceCountsWhatTheVolumeHolds checks that the count is the volume's own content
 // rather than anything about the machine underneath it, and that it follows every direction
 // a size can move.
-func TestSpaceCountsWhatTheNamespaceHolds(t *testing.T) {
+func TestSpaceCountsWhatTheVolumeHolds(t *testing.T) {
 	const allowance = 1 << 20
-	namespace := newStorageWithAllowance(t, allowance)
+	volume := newStorageWithAllowance(t, allowance)
 	ctx := t.Context()
 
-	space, err := namespace.Space(ctx)
+	space, err := volume.Space(ctx)
 	if err != nil {
 		t.Fatalf("space: %v", err)
 	}
 	if space.Total != allowance || space.Used != 0 || space.Avail != allowance {
-		t.Fatalf("an empty namespace reports %+v, want the whole allowance free", space)
+		t.Fatalf("an empty volume reports %+v, want the whole allowance free", space)
 	}
 
-	if err := namespace.Write(ctx, "f", make([]byte, 1000)); err != nil {
+	if err := volume.Write(ctx, "f", make([]byte, 1000)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if space, err = namespace.Space(ctx); err != nil || space.Used != 1000 {
+	if space, err = volume.Space(ctx); err != nil || space.Used != 1000 {
 		t.Fatalf("after writing 1000 bytes space is %+v (%v), want 1000 taken", space, err)
 	}
 
 	// Shrinking a file gives the bytes back, and replacing it does not charge for both
-	// versions: the old object is no longer part of the namespace the moment the new one is.
-	if err := namespace.Write(ctx, "f", make([]byte, 10)); err != nil {
+	// versions: the old object is no longer part of the volume the moment the new one is.
+	if err := volume.Write(ctx, "f", make([]byte, 10)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if space, err = namespace.Space(ctx); err != nil || space.Used != 10 {
+	if space, err = volume.Space(ctx); err != nil || space.Used != 10 {
 		t.Fatalf("after shrinking to 10 bytes space is %+v (%v), want 10 taken", space, err)
 	}
 
-	if err := namespace.Remove(ctx, "f"); err != nil {
+	if err := volume.Remove(ctx, "f"); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
-	if space, err = namespace.Space(ctx); err != nil || space.Used != 0 {
+	if space, err = volume.Space(ctx); err != nil || space.Used != 0 {
 		t.Fatalf("after removing the file space is %+v (%v), want nothing taken", space, err)
 	}
 }
 
 // TestWriteBeyondTheAllowanceIsRefused checks that the refusal lands on the write that
-// caused it, and that it says the workspace is full rather than that the machine is.
+// caused it, and that it says the volume is full rather than that the machine is.
 func TestWriteBeyondTheAllowanceIsRefused(t *testing.T) {
 	const allowance = 4096
-	namespace := newStorageWithAllowance(t, allowance)
+	volume := newStorageWithAllowance(t, allowance)
 	ctx := t.Context()
 
-	if err := namespace.Write(ctx, "f", make([]byte, allowance+1)); !errors.Is(err, syscall.EDQUOT) {
+	if err := volume.Write(ctx, "f", make([]byte, allowance+1)); !errors.Is(err, syscall.EDQUOT) {
 		t.Fatalf("writing past the allowance failed with %v, want EDQUOT", err)
 	}
 	// The refused write left nothing behind: neither a file nor a charge.
-	if _, err := namespace.Stat(ctx, "f"); !errors.Is(err, syscall.ENOENT) {
+	if _, err := volume.Stat(ctx, "f"); !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("after a refused write the file is %v, want ENOENT", err)
 	}
-	space, err := namespace.Space(ctx)
+	space, err := volume.Space(ctx)
 	if err != nil {
 		t.Fatalf("space: %v", err)
 	}
@@ -228,10 +228,10 @@ func TestWriteBeyondTheAllowanceIsRefused(t *testing.T) {
 	}
 }
 
-// TestSweepClearsABacklog checks the drain a caller runs when a namespace has accumulated
+// TestSweepClearsABacklog checks the drain a caller runs when a volume has accumulated
 // more unreferenced objects than the mutations passing through it clear on their own.
 //
-// The backlog is made through the tree directly, because going through the namespace would
+// The backlog is made through the tree directly, because going through the volume would
 // let each removal clear the one before it and there would never be a backlog to find.
 func TestSweepClearsABacklog(t *testing.T) {
 	p := newParts(t, 0)

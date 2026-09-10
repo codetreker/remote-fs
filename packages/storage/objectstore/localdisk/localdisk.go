@@ -32,7 +32,7 @@ import (
 const (
 	// InitializationMarkerName is reserved for a composite store's durable initialization
 	// intent. Open creates the bootstrap marker when CompositeInitialization requests it.
-	// The marker survives FORMAT so the composite can bind it to the store and workspace;
+	// The marker survives FORMAT so the composite can bind it to the store and volume;
 	// the composite removes it only after its own READY state is durable.
 	InitializationMarkerName = "LOCALSTORE.init"
 

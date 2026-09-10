@@ -86,7 +86,7 @@ func TestHistoricalLeaseMigrationPreservesAcceptedDurableProof(t *testing.T) {
 	before := historicalLeaseRows(t, path)
 	witness := &recordingWitness{database: path}
 	store, err := sqlite.OpenBoundDurableWithOptions(t.Context(), path, "A", durableStoreID, 1024,
-		sqlite.DefaultOptions(), sqlite.RequireExistingNamespace, sqlite.DurableStartup{
+		sqlite.DefaultOptions(), sqlite.RequireExistingVolume, sqlite.DurableStartup{
 			Accepted: historicalLeaseDurableState, CheckpointedGeneration: historicalLeaseDurableState.Generation,
 		}, witness)
 	if err != nil {
@@ -97,7 +97,7 @@ func TestHistoricalLeaseMigrationPreservesAcceptedDurableProof(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	assertHistoricalLeaseNamespace(t, store, "A")
+	assertHistoricalLeaseVolume(t, store, "A")
 	assertHistoricalLeaseRows(t, path, before)
 	accepted, visible := witness.accepts()
 	want := historicalLeaseDurableState
@@ -127,7 +127,7 @@ func TestHistoricalLeaseMigrationRefusesRollbackBeforeChangingSchema(t *testing.
 			}
 			witness := &recordingWitness{database: path}
 			store, err := sqlite.OpenBoundDurableWithOptions(t.Context(), path, "A", durableStoreID, 1024,
-				sqlite.DefaultOptions(), sqlite.RequireExistingNamespace,
+				sqlite.DefaultOptions(), sqlite.RequireExistingVolume,
 				sqlite.DurableStartup{Accepted: accepted, CheckpointedGeneration: accepted.Generation}, witness)
 			if store != nil {
 				if closeErr := store.Close(); closeErr != nil {
@@ -153,23 +153,23 @@ func TestHistoricalLeaseMigrationRefusesRollbackBeforeChangingSchema(t *testing.
 	}
 }
 
-func TestHistoricalLeaseMigrationProtectsEveryNamespaceAcrossReopen(t *testing.T) {
+func TestHistoricalLeaseMigrationProtectsEveryVolumeAcrossReopen(t *testing.T) {
 	path := writeHistoricalLeaseDatabase(t, false)
 	before := historicalLeaseRows(t, path)
 	config := sqlite.LockingConfig{
-		Database: path, Namespace: "A", Allowance: 1024, SQLite: sqlite.DefaultOptions(),
+		Database: path, Volume: "A", Allowance: 1024, SQLite: sqlite.DefaultOptions(),
 		Locks: locking.DefaultOptions(), Initialize: true,
 	}
 	first, err := sqlite.OpenLocking(t.Context(), config)
 	if err != nil {
-		t.Fatalf("enable locks while migrating historical namespace A: %v", err)
+		t.Fatalf("enable locks while migrating historical volume A: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := first.Close(); err != nil {
 			t.Error(err)
 		}
 	})
-	assertHistoricalLeaseNamespace(t, first.Store, "A")
+	assertHistoricalLeaseVolume(t, first.Store, "A")
 	assertHistoricalLeaseRows(t, path, before)
 	assertHistoricalLeaseSchemaVersion(t, path, 5)
 	acquireHistoricalLease(t, first.LockService(), "alpha.txt")
@@ -182,38 +182,38 @@ func TestHistoricalLeaseMigrationProtectsEveryNamespaceAcrossReopen(t *testing.T
 				t.Error(closeErr)
 			}
 		}
-		t.Fatalf("raw namespace B bypassed migrated database protection: %v", err)
+		t.Fatalf("raw volume B bypassed migrated database protection: %v", err)
 	}
 	config.Initialize = false
 	config.Locks.MaxLease = time.Second
-	for _, namespace := range []string{"B", "A"} {
-		config.Namespace = namespace
+	for _, volume := range []string{"B", "A"} {
+		config.Volume = volume
 		reopened, err := sqlite.OpenLocking(t.Context(), config)
 		if err != nil {
-			t.Fatalf("reopen historical namespace %s under database-wide recovery: %v", namespace, err)
+			t.Fatalf("reopen historical volume %s under database-wide recovery: %v", volume, err)
 		}
 		t.Cleanup(func() {
 			if err := reopened.Close(); err != nil {
 				t.Error(err)
 			}
 		})
-		assertHistoricalLeaseNamespace(t, reopened.Store, namespace)
+		assertHistoricalLeaseVolume(t, reopened.Store, volume)
 		if maximum, err := reopened.MaxLease(t.Context()); err != nil || maximum != time.Minute {
-			t.Fatalf("namespace %s maximum = %v, %v", namespace, maximum, err)
+			t.Fatalf("volume %s maximum = %v, %v", volume, maximum, err)
 		}
 		if err := reopened.Create(t.Context(), "unsafe"); !errors.Is(err, syscall.EAGAIN) {
-			t.Fatalf("namespace %s mutation during recovery = %v", namespace, err)
+			t.Fatalf("volume %s mutation during recovery = %v", volume, err)
 		}
 		status, err := reopened.LockService().(locking.StatusService).Status(t.Context())
 		if err != nil || !status.Recovering || status.RecoveryRemainingMillis <= time.Second.Milliseconds() {
-			t.Fatalf("namespace %s lost historical protection: recovering=%v, remaining_ms=%d, err=%v",
-				namespace, status.Recovering, status.RecoveryRemainingMillis, err)
+			t.Fatalf("volume %s lost historical protection: recovering=%v, remaining_ms=%d, err=%v",
+				volume, status.Recovering, status.RecoveryRemainingMillis, err)
 		}
 		assertHistoricalLeaseRows(t, path, before)
 		state, err := reopened.DurableState(t.Context())
 		if err != nil || state.DatabaseID != historicalLeaseDurableState.DatabaseID ||
 			state.Generation <= historicalLeaseDurableState.Generation || state.NodeHighWater != 4 || state.ChangeHighWater != 4 {
-			t.Fatalf("namespace %s changed historical lineage: %+v, %v", namespace, state, err)
+			t.Fatalf("volume %s changed historical lineage: %+v, %v", volume, state, err)
 		}
 		if err := reopened.Close(); err != nil {
 			t.Fatal(err)
@@ -243,18 +243,18 @@ func acquireHistoricalLease(t *testing.T, service locking.Service, path string) 
 		Owner: owner.Ref, Request: "historical-grant", Resource: resource, Mode: locking.Exclusive, TTL: time.Minute,
 	})
 	if err != nil || grant.Receipt.Outcome != locking.Granted {
-		t.Fatalf("acquire historical namespace lease: outcome=%v, err=%v", grant.Receipt.Outcome, err)
+		t.Fatalf("acquire historical volume lease: outcome=%v, err=%v", grant.Receipt.Outcome, err)
 	}
 }
 
-func assertHistoricalLeaseNamespace(t *testing.T, store *sqlite.Store, namespace string) {
+func assertHistoricalLeaseVolume(t *testing.T, store *sqlite.Store, volume string) {
 	t.Helper()
 	name, id, root, size, mode := "alpha.txt", int64(2), int64(1), int64(5), os.FileMode(0o640)
 	content := metastore.Key("historical-alpha-object")
 	seconds, accessNanos, modifiedNanos := int64(1700000100), int64(201), int64(202)
 	incarnation := metastore.Incarnation("11111111111111111111111111111111")
 	positions := []metastore.Position{1, 3}
-	if namespace == "B" {
+	if volume == "B" {
 		name, id, root, size, mode = "bravo.txt", 4, 3, 7, 0o600
 		content = "historical-bravo-object"
 		seconds, accessNanos, modifiedNanos = 1700000300, 401, 402
@@ -264,19 +264,19 @@ func assertHistoricalLeaseNamespace(t *testing.T, store *sqlite.Store, namespace
 	node, err := store.Stat(t.Context(), name)
 	if err != nil || node.ID != id || node.Size != size || node.Mode != mode || node.Content != content ||
 		!node.AccessTime.Equal(time.Unix(seconds, accessNanos)) || !node.ModTime.Equal(time.Unix(seconds, modifiedNanos)) {
-		t.Fatalf("namespace %s historical node changed: %+v, %v", namespace, node, err)
+		t.Fatalf("volume %s historical node changed: %+v, %v", volume, node, err)
 	}
 	children, err := store.List(t.Context(), "")
 	if err != nil || len(children) != 1 || string(children[0].Name) != name || children[0].Node.ID != id {
-		t.Fatalf("namespace %s historical directory changed: %+v, %v", namespace, children, err)
+		t.Fatalf("volume %s historical directory changed: %+v, %v", volume, children, err)
 	}
 	gotIncarnation, err := store.Incarnation(t.Context(), 64)
 	if err != nil || gotIncarnation != incarnation {
-		t.Fatalf("namespace %s historical log incarnation changed: %q, %v", namespace, gotIncarnation, err)
+		t.Fatalf("volume %s historical log incarnation changed: %q, %v", volume, gotIncarnation, err)
 	}
 	changes, retained, err := readChanges(t.Context(), store, 0, 10)
 	if err != nil || len(changes) != 2 || retained.Oldest != positions[0] || retained.Tail != positions[1] || retained.TrimmedThrough != 0 {
-		t.Fatalf("namespace %s historical retention changed: %d changes, %+v, %v", namespace, len(changes), retained, err)
+		t.Fatalf("volume %s historical retention changed: %d changes, %+v, %v", volume, len(changes), retained, err)
 	}
 	for i, change := range changes {
 		kind := metastore.Created
@@ -285,7 +285,7 @@ func assertHistoricalLeaseNamespace(t *testing.T, store *sqlite.Store, namespace
 		}
 		if change.Position != positions[i] || change.Kind != kind || change.Parent != root || string(change.Name) != name ||
 			change.From != nil || change.Node == nil || change.Node.ID != id || change.Node.Content != content || change.Node.Size != size {
-			t.Fatalf("namespace %s historical change %d was not preserved", namespace, i)
+			t.Fatalf("volume %s historical change %d was not preserved", volume, i)
 		}
 	}
 }
@@ -310,12 +310,12 @@ func historicalLeaseRows(t *testing.T, path string) map[string][][]any {
 	result := make(map[string][][]any)
 	for table, query := range map[string]string{
 		"backing_store": `SELECT * FROM backing_store ORDER BY singleton`,
-		"namespaces":    `SELECT * FROM namespaces ORDER BY id`,
-		"nodes": `SELECT id, namespace, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content
+		"volumes":       `SELECT * FROM volumes ORDER BY id`,
+		"nodes": `SELECT id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content
 			FROM nodes ORDER BY id`,
-		"entries":         `SELECT * FROM entries ORDER BY namespace, parent, name`,
+		"entries":         `SELECT * FROM entries ORDER BY volume, parent, name`,
 		"objects":         `SELECT * FROM objects ORDER BY key`,
-		"logs":            `SELECT * FROM logs ORDER BY namespace`,
+		"logs":            `SELECT * FROM logs ORDER BY volume`,
 		"changes":         `SELECT * FROM changes ORDER BY position`,
 		"sqlite_sequence": `SELECT * FROM sqlite_sequence ORDER BY name`,
 	} {

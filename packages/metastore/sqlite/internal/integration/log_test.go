@@ -173,10 +173,10 @@ func TestSinceDetectsAGapWhenTheNextPageReachesIt(t *testing.T) {
 	db := raw(t, path)
 	if _, err := db.Exec(`
 		DELETE FROM changes
-		WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+		WHERE volume = (SELECT id FROM volumes WHERE name = 'workspace')
 		  AND position = (
 			SELECT position FROM changes
-			WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+			WHERE volume = (SELECT id FROM volumes WHERE name = 'workspace')
 			  AND position > ?
 			ORDER BY position LIMIT 1
 		  )`, firstPage[0].Position); err != nil {
@@ -244,10 +244,10 @@ func TestSinceRejectsScalarStorageCorruptionOnTheCrossedPage(t *testing.T) {
 	db := raw(t, path)
 	if _, err := db.Exec(`
 		UPDATE changes SET previous_position = 'broken'
-		WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+		WHERE volume = (SELECT id FROM volumes WHERE name = 'workspace')
 		  AND position = (
 			SELECT position FROM changes
-			WHERE namespace = (SELECT id FROM namespaces WHERE name = 'workspace')
+			WHERE volume = (SELECT id FROM volumes WHERE name = 'workspace')
 			  AND position > ? ORDER BY position LIMIT 1
 		  )`, firstPage[len(firstPage)-1].Position); err != nil {
 		db.Close()
@@ -431,8 +431,8 @@ func TestPositionsAreNeverReusedAfterTheLogIsEmptied(t *testing.T) {
 
 	emptied := raw(t, path)
 	if _, err := emptied.Exec(`
-		UPDATE logs SET trimmed_through = committed_position WHERE namespace = 1;
-		DELETE FROM changes WHERE namespace = 1`); err != nil {
+		UPDATE logs SET trimmed_through = committed_position WHERE volume = 1;
+		DELETE FROM changes WHERE volume = 1`); err != nil {
 		t.Fatal(err)
 	}
 	if err := emptied.Close(); err != nil {
@@ -454,7 +454,7 @@ func TestPositionsAreNeverReusedAfterTheLogIsEmptied(t *testing.T) {
 
 // A caller that fell out of the window is told which dimension pushed it out, because the two
 // call for different actions: age says that caller was away too long, volume says the
-// namespace changes faster than the log was configured to hold.
+// volume changes faster than the log was configured to hold.
 func TestFallingOutOfTheWindowNamesTheDimension(t *testing.T) {
 	t.Run("volume", func(t *testing.T) {
 		store := openUnder(t, database(t), "workspace", 0, sqlite.Window{Floor: 1, Cap: 2, Age: time.Hour})
@@ -498,8 +498,8 @@ func TestFallingOutOfTheWindowNamesTheDimension(t *testing.T) {
 	})
 }
 
-// The floor wins over the age rule. A namespace that has been quiet for longer than the age
-// bound keeps its last entries anyway, so that a brief absence from a namespace where nothing
+// The floor wins over the age rule. A volume that has been quiet for longer than the age
+// bound keeps its last entries anyway, so that a brief absence from a volume where nothing
 // happened does not cost a full rebuild.
 func TestTheFloorSurvivesAnAgeBoundNothingOutlives(t *testing.T) {
 	const floor = 6
@@ -525,7 +525,7 @@ func TestTheFloorSurvivesAnAgeBoundNothingOutlives(t *testing.T) {
 
 // The tail is read from what the tree recorded, not from the entries the log still holds, and
 // that separation is what keeps "you are caught up" and "you missed everything" apart. A caller
-// arriving at position 0 against a log that holds nothing must be able to tell a namespace
+// arriving at position 0 against a log that holds nothing must be able to tell a volume
 // nobody has written to from one whose entries are gone.
 //
 // The configured trim cannot reach this state because its floor keeps the newest entry. The
@@ -535,14 +535,14 @@ func TestTheTailOutlivesTheEntriesItCounted(t *testing.T) {
 	path := database(t)
 	store := open(t, path, "workspace", 0)
 
-	// A namespace nobody has written to: nothing held, nothing recorded, and a caller at 0 is
+	// A volume nobody has written to: nothing held, nothing recorded, and a caller at 0 is
 	// caught up rather than behind.
 	_, fresh, err := readChanges(t.Context(), store, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fresh.Oldest != 0 || fresh.Tail != 0 {
-		t.Fatalf("a namespace nobody has written to holds %+v, want an oldest and a tail of 0", fresh)
+		t.Fatalf("a volume nobody has written to holds %+v, want an oldest and a tail of 0", fresh)
 	}
 
 	for i := range 5 {
@@ -560,8 +560,8 @@ func TestTheTailOutlivesTheEntriesItCounted(t *testing.T) {
 
 	emptied := raw(t, path)
 	if _, err := emptied.Exec(`
-		UPDATE logs SET trimmed_through = committed_position WHERE namespace = 1;
-		DELETE FROM changes WHERE namespace = 1`); err != nil {
+		UPDATE logs SET trimmed_through = committed_position WHERE volume = 1;
+		DELETE FROM changes WHERE volume = 1`); err != nil {
 		t.Fatal(err)
 	}
 	if err := emptied.Close(); err != nil {
@@ -731,10 +731,10 @@ func TestRenamingADirectoryIsTwoRows(t *testing.T) {
 	}
 }
 
-// A database holds several namespaces and the log rows carry which one they belong to. The
-// sequence is shared, so a namespace's positions have gaps in them — nothing above compares
+// A database holds several volumes and the log rows carry which one they belong to. The
+// sequence is shared, so a volume's positions have gaps in them — nothing above compares
 // positions for adjacency, only for order.
-func TestEachNamespaceHasItsOwnLog(t *testing.T) {
+func TestEachVolumeHasItsOwnLog(t *testing.T) {
 	path := database(t)
 	first := open(t, path, "first", 0)
 	second := open(t, path, "second", 0)
@@ -758,20 +758,20 @@ func TestEachNamespaceHasItsOwnLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(mine) != 4 {
-		t.Fatalf("the first namespace recorded %d changes for two files, want four", len(mine))
+		t.Fatalf("the first volume recorded %d changes for two files, want four", len(mine))
 	}
 	if len(theirs) != 2 {
-		t.Fatalf("the second namespace recorded %d changes for one file, want two", len(theirs))
+		t.Fatalf("the second volume recorded %d changes for one file, want two", len(theirs))
 	}
-	// The second namespace's writes are in between the first's, so the first's positions are
+	// The second volume's writes are in between the first's, so the first's positions are
 	// not consecutive. A caller may only compare them.
 	if mine[len(mine)-1].Position-mine[0].Position < 4 {
-		t.Fatalf("the first namespace's positions run %d..%d with no room for the other namespace's",
+		t.Fatalf("the first volume's positions run %d..%d with no room for the other volume's",
 			mine[0].Position, mine[len(mine)-1].Position)
 	}
 
 	// Two logs, two incarnations. A replica that mistook one for the other would be told it
-	// could resume against history belonging to a namespace it has never read.
+	// could resume against history belonging to a volume it has never read.
 	one, err := first.Incarnation(t.Context(), 1024)
 	if err != nil {
 		t.Fatal(err)
@@ -781,7 +781,7 @@ func TestEachNamespaceHasItsOwnLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	if one == other {
-		t.Fatalf("both namespaces call their history %q", one)
+		t.Fatalf("both volumes call their history %q", one)
 	}
 }
 

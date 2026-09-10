@@ -14,7 +14,7 @@ import (
 //
 // Everything here follows the rules message.go established, for the same reasons. An
 // instant is a seconds-and-nanoseconds pair, because a nanosecond count spans only 1678 to
-// 2262 and a namespace is asked to hold instants outside that. A name is a byte sequence,
+// 2262 and a volume is asked to hold instants outside that. A name is a byte sequence,
 // because encoding/json substitutes U+FFFD for any byte that is not valid UTF-8 when it
 // writes a string, and a replica that recorded such a name would address a node that is
 // not there. Anything whose absence is indistinguishable from its zero value travels by
@@ -334,7 +334,7 @@ const (
 	RebuildAge RebuildReason = "age"
 
 	// RebuildVolume: the changes the replica is missing were discarded for being too
-	// many. The namespace changes faster than the log was configured to hold, which is a
+	// many. The volume changes faster than the log was configured to hold, which is a
 	// setting to revisit rather than something the replica did.
 	RebuildVolume RebuildReason = "volume"
 )
@@ -427,7 +427,7 @@ type SnapshotOpen struct {
 	// the rows that follow, and every row reflects the same instant.
 	//
 	// By pointer, and refused when absent, because zero is a legitimate position — a
-	// namespace nothing has yet changed is at zero — so a lost figure would arrive as an
+	// volume nothing has yet changed is at zero — so a lost figure would arrive as an
 	// ordinary answer, and a replica that seeded itself at zero would replay changes it
 	// already holds.
 	Position *int64 `json:"position"`

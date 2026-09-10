@@ -59,7 +59,7 @@ func TestCleanAccountingPreparationFailureDoesNotFenceAllowance(t *testing.T) {
 	mustUse(t, s, 1024)
 }
 
-func TestFailedSettlementPreservesTheActualNamespaceEffect(t *testing.T) {
+func TestFailedSettlementPreservesTheActualVolumeEffect(t *testing.T) {
 	for _, scenario := range []struct {
 		name    string
 		outcome storage.PublicationResult

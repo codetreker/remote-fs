@@ -61,7 +61,7 @@ func abortLeaseTestStore(t *testing.T, s *Store) {
 
 func TestLeaseRecoveryConcurrentRaisesNeverDecrease(t *testing.T) {
 	witness := &testLeaseWitness{}
-	path := filepath.Join(t.TempDir(), "namespace.sqlite")
+	path := filepath.Join(t.TempDir(), "volume.sqlite")
 	s := openLeaseTestStore(t, path, witness, true)
 	var wg sync.WaitGroup
 	for i := 64; i > 0; i-- {
@@ -92,7 +92,7 @@ func TestLeaseRecoveryFinishesEveryDurableInterruption(t *testing.T) {
 	for _, phase := range []string{"prepare", "witness before", "witness after", "finalize"} {
 		t.Run(phase, func(t *testing.T) {
 			witness := &testLeaseWitness{}
-			path := filepath.Join(t.TempDir(), "namespace.sqlite")
+			path := filepath.Join(t.TempDir(), "volume.sqlite")
 			s := openLeaseTestStore(t, path, witness, true)
 			fault := errors.New("injected durable lease failure")
 			switch phase {
@@ -167,7 +167,7 @@ func TestLeaseRecoveryRefusesLostReplayedOrMalformedEvidence(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			witness := &testLeaseWitness{}
-			path := filepath.Join(t.TempDir(), "namespace.sqlite")
+			path := filepath.Join(t.TempDir(), "volume.sqlite")
 			s := openLeaseTestStore(t, path, witness, true)
 			if err := s.RaiseMaxLease(t.Context(), time.Minute); err != nil {
 				t.Fatal(err)
@@ -200,7 +200,7 @@ func TestLeaseRecoveryRefusesLostReplayedOrMalformedEvidence(t *testing.T) {
 
 func TestLeaseRecoveryCancellationDoesNotAcknowledgeAnIncrease(t *testing.T) {
 	witness := &testLeaseWitness{}
-	s := openLeaseTestStore(t, filepath.Join(t.TempDir(), "namespace.sqlite"), witness, true)
+	s := openLeaseTestStore(t, filepath.Join(t.TempDir(), "volume.sqlite"), witness, true)
 	defer abortLeaseTestStore(t, s)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -224,7 +224,7 @@ func TestLeaseRecoveryCancellationDoesNotAcknowledgeAnIncrease(t *testing.T) {
 func TestConfigureLeaseRecoveryRequiresNativeAnchor(t *testing.T) {
 	t.Run("shared owner", func(t *testing.T) {
 		config := lockingTestConfig(t)
-		store, err := OpenWithOptions(t.Context(), config.Database, config.Namespace, 0, DefaultOptions())
+		store, err := OpenWithOptions(t.Context(), config.Database, config.Volume, 0, DefaultOptions())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -324,7 +324,7 @@ func openNativeExclusiveTestStore(t *testing.T) (*Store, *nativelease.Database) 
 	}
 	options := DefaultOptions()
 	options.leaseRecoveryOwner, options.leaseOwner = true, owner
-	store, err := OpenWithOptions(t.Context(), config.Database, config.Namespace, 0, options)
+	store, err := OpenWithOptions(t.Context(), config.Database, config.Volume, 0, options)
 	if err != nil {
 		owner.Close()
 		t.Fatal(err)
@@ -386,7 +386,7 @@ func TestBoundDurableLeaseOpenPreservesExclusiveOwnershipAndEvidence(t *testing.
 	options := DefaultOptions()
 	options.leaseOwner = owner
 	witness := &checkpointStateWitness{}
-	s, err := OpenBoundDurableLeaseWithOptions(t.Context(), path, "workspace", "objects", 0, options, CreateNamespaceIfMissing, DurableStartup{}, witness)
+	s, err := OpenBoundDurableLeaseWithOptions(t.Context(), path, "workspace", "objects", 0, options, CreateVolumeIfMissing, DurableStartup{}, witness)
 	if err != nil {
 		t.Fatal(err)
 	}

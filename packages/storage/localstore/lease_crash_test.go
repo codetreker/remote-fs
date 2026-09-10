@@ -33,7 +33,7 @@ func TestLocalstoreLeaseSurvivesSIGKILL(t *testing.T) {
 		if unsafe != nil {
 			closeStore(t, unsafe)
 		}
-		t.Fatalf("open crashed lease workspace without protection = %v", err)
+		t.Fatalf("open crashed lease volume without protection = %v", err)
 	}
 	options := locking.DefaultOptions()
 	options.MaxLease = time.Second

@@ -5,8 +5,6 @@
 -- record what they now produce. A diff here without a new migration beside it means a landed
 -- migration was edited, which is the one thing the numbering forbids.
 
-CREATE INDEX changes_by_namespace ON changes (namespace, position);
-
 CREATE INDEX changes_by_node_identity ON changes (
 	CASE
 	WHEN typeof(parent) = 'integer'
@@ -25,6 +23,8 @@ CREATE INDEX changes_by_position_identity ON changes (
 	max(position, previous_position)
 );
 
+CREATE INDEX changes_by_volume ON changes (volume, position);
+
 CREATE INDEX entries_by_node ON entries (node);
 
 CREATE INDEX entries_by_node_identity ON entries (
@@ -40,18 +40,18 @@ CREATE INDEX logs_by_change_identity ON logs (
 	max(committed_position, trimmed_through)
 );
 
-CREATE INDEX namespaces_by_root_identity ON namespaces (
+CREATE INDEX nodes_by_content ON nodes (content);
+
+CREATE INDEX objects_by_state ON objects (volume, state, created_sec);
+
+-- index sqlite_autoindex_objects_1, which SQLite maintains itself
+
+-- index sqlite_autoindex_volumes_1, which SQLite maintains itself
+
+CREATE INDEX volumes_by_root_identity ON volumes (
 	CASE WHEN typeof(root) = 'integer' THEN 0 ELSE 1 END,
 	root
 );
-
-CREATE INDEX nodes_by_content ON nodes (content);
-
-CREATE INDEX objects_by_state ON objects (namespace, state, created_sec);
-
--- index sqlite_autoindex_namespaces_1, which SQLite maintains itself
-
--- index sqlite_autoindex_objects_1, which SQLite maintains itself
 
 CREATE TABLE backing_store (
 	singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -61,7 +61,7 @@ CREATE TABLE backing_store (
 CREATE TABLE changes (
 	position          INTEGER PRIMARY KEY AUTOINCREMENT,
 	previous_position INTEGER NOT NULL,
-	namespace         INTEGER NOT NULL REFERENCES namespaces(id),
+	volume         INTEGER NOT NULL REFERENCES volumes(id),
 	kind              INTEGER NOT NULL,
 	parent            INTEGER NOT NULL,
 	name              BLOB,
@@ -88,11 +88,11 @@ CREATE TABLE database_state (
 ) WITHOUT ROWID;
 
 CREATE TABLE entries (
-	namespace INTEGER NOT NULL REFERENCES namespaces(id),
+	volume INTEGER NOT NULL REFERENCES volumes(id),
 	parent    INTEGER NOT NULL REFERENCES nodes(id),
 	name      BLOB    NOT NULL,
 	node      INTEGER NOT NULL REFERENCES nodes(id),
-	PRIMARY KEY (namespace, parent, name)
+	PRIMARY KEY (volume, parent, name)
 ) WITHOUT ROWID;
 
 CREATE TABLE lease_recovery (
@@ -106,23 +106,16 @@ CREATE TABLE lease_recovery (
 ) WITHOUT ROWID;
 
 CREATE TABLE logs (
-	namespace          INTEGER PRIMARY KEY REFERENCES namespaces(id),
+	volume          INTEGER PRIMARY KEY REFERENCES volumes(id),
 	incarnation        TEXT    NOT NULL,
 	committed_position INTEGER NOT NULL,
 	trimmed_through    INTEGER NOT NULL,
 	trimmed_by_age     INTEGER NOT NULL
 );
 
-CREATE TABLE namespaces (
-	id   INTEGER PRIMARY KEY AUTOINCREMENT,
-	name TEXT    NOT NULL UNIQUE,
-	root INTEGER NOT NULL,
-	used INTEGER NOT NULL
-);
-
 CREATE TABLE nodes (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	namespace  INTEGER NOT NULL REFERENCES namespaces(id),
+	volume  INTEGER NOT NULL REFERENCES volumes(id),
 	mode       INTEGER NOT NULL,
 	size       INTEGER NOT NULL,
 	atime_sec  INTEGER NOT NULL,
@@ -134,7 +127,7 @@ CREATE TABLE nodes (
 
 CREATE TABLE objects (
 	key          TEXT PRIMARY KEY,
-	namespace    INTEGER NOT NULL REFERENCES namespaces(id),
+	volume    INTEGER NOT NULL REFERENCES volumes(id),
 	state        INTEGER NOT NULL,
 	size         INTEGER NOT NULL,
 	digest       BLOB,
@@ -145,4 +138,11 @@ CREATE TABLE objects (
 CREATE TABLE schema_version (version INTEGER NOT NULL);
 
 CREATE TABLE sqlite_sequence(name,seq);
+
+CREATE TABLE volumes (
+	id   INTEGER PRIMARY KEY AUTOINCREMENT,
+	name TEXT    NOT NULL UNIQUE,
+	root INTEGER NOT NULL,
+	used INTEGER NOT NULL
+);
 

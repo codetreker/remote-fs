@@ -19,7 +19,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-type retainedNode struct{ namespace, id int64 }
+type retainedNode struct{ volume, id int64 }
 
 // All fields are protected by the database commit gate. Physical retention is
 // distinct from active publication authority, which is revoked before I/O drains.
@@ -139,7 +139,7 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 		if options.Truncate {
 			kind = locking.WriteMutation
 		}
-		intent := &namespaceIntent{kind: kind, node: id}
+		intent := &volumeIntent{kind: kind, node: id}
 		if id == 0 {
 			intent.paths = []string{path}
 		}
@@ -152,7 +152,7 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 	f := &retainedFile{store: s, id: state.ID, read: options.Read, write: options.Write, active: true}
 	s.files[f] = struct{}{}
 	s.fileDomain.files++
-	s.coordinator.pins[retainedNode{s.namespace, f.id}]++
+	s.coordinator.pins[retainedNode{s.volume, f.id}]++
 	return f, nil
 }
 
@@ -163,7 +163,7 @@ func (s *Store) createOpenNode(ctx context.Context, tx *sql.Tx, parent metastore
 	if err != nil {
 		return metastore.Node{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO nodes (id,namespace,mode,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content) VALUES (?,?,?,0,?,?,?,?,NULL)`, id, s.namespace, int64(options.Mode), sec, nsec, sec, nsec); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO nodes (id,volume,mode,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content) VALUES (?,?,?,0,?,?,?,?,NULL)`, id, s.volume, int64(options.Mode), sec, nsec, sec, nsec); err != nil {
 		return metastore.Node{}, err
 	}
 	if err := s.link(ctx, tx, parent.ID, name, id); err != nil {
@@ -179,7 +179,7 @@ func (s *Store) createOpenNode(ctx context.Context, tx *sql.Tx, parent metastore
 }
 
 func (s *Store) nodeByID(ctx context.Context, tx *sql.Tx, id int64) (metastore.Node, error) {
-	node, err := scanNode(tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes n WHERE n.namespace=? AND n.id=?`, s.namespace, id))
+	node, err := scanNode(tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes n WHERE n.volume=? AND n.id=?`, s.volume, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return metastore.Node{}, syscall.ESTALE
 	}
@@ -190,7 +190,7 @@ func (s *Store) fileState(ctx context.Context, tx *sql.Tx, id int64) (metastore.
 	var scan nodeScan
 	var revision int64
 	var detached bool
-	err := tx.QueryRowContext(ctx, `SELECT `+nodeColumns+`,n.content_revision,n.detached FROM nodes n WHERE n.namespace=? AND n.id=?`, s.namespace, id).Scan(append(scan.fields(), &revision, &detached)...)
+	err := tx.QueryRowContext(ctx, `SELECT `+nodeColumns+`,n.content_revision,n.detached FROM nodes n WHERE n.volume=? AND n.id=?`, s.volume, id).Scan(append(scan.fields(), &revision, &detached)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return metastore.FileState{}, syscall.ESTALE
 	}
@@ -265,7 +265,7 @@ func (f *retainedFile) Commit(ctx context.Context, expected uint64, object metas
 		return metastore.FileState{}, syscall.EINVAL
 	}
 	var state metastore.FileState
-	err := f.store.mutatePublication(ctx, &namespaceIntent{kind: locking.WriteMutation, node: f.id}, func(tx *sql.Tx) error {
+	err := f.store.mutatePublication(ctx, &volumeIntent{kind: locking.WriteMutation, node: f.id}, func(tx *sql.Tx) error {
 		if err := f.check(); err != nil {
 			return err
 		}
@@ -286,7 +286,7 @@ func (f *retainedFile) Commit(ctx context.Context, expected uint64, object metas
 }
 
 func (s *Store) advanceContentRevision(ctx context.Context, tx *sql.Tx, id int64) error {
-	result, err := tx.ExecContext(ctx, `UPDATE nodes SET content_revision=content_revision+1 WHERE id=? AND namespace=? AND content_revision < ?`, id, s.namespace, int64(math.MaxInt64))
+	result, err := tx.ExecContext(ctx, `UPDATE nodes SET content_revision=content_revision+1 WHERE id=? AND volume=? AND content_revision < ?`, id, s.volume, int64(math.MaxInt64))
 	if err != nil {
 		return err
 	}
@@ -307,7 +307,7 @@ func (s *Store) replaceNodeContent(ctx context.Context, tx *sql.Tx, node metasto
 		}
 	} else {
 		var state int
-		if err := tx.QueryRowContext(ctx, `SELECT state FROM objects WHERE key=? AND namespace=?`, string(object.Key), s.namespace).Scan(&state); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM objects WHERE key=? AND volume=?`, string(object.Key), s.volume).Scan(&state); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return syscall.EINVAL
 			}
@@ -324,16 +324,16 @@ func (s *Store) replaceNodeContent(ctx context.Context, tx *sql.Tx, node metasto
 		return err
 	}
 	sec, nsec := sqlvalue.StoredTime(object.ModTime)
-	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET size=?,mtime_sec=?,mtime_nsec=?,content=? WHERE namespace=? AND id=?`, object.Size, sec, nsec, sqlvalue.StoredKey(object.Key), s.namespace, node.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET size=?,mtime_sec=?,mtime_nsec=?,content=? WHERE volume=? AND id=?`, object.Size, sec, nsec, sqlvalue.StoredKey(object.Key), s.volume, node.ID); err != nil {
 		return err
 	}
 	if object.Key != "" {
-		if _, err := tx.ExecContext(ctx, `UPDATE objects SET state=?,size=?,digest=? WHERE key=? AND namespace=?`, stateReferenced, object.Size, object.Digest, string(object.Key), s.namespace); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE objects SET state=?,size=?,digest=? WHERE key=? AND volume=?`, stateReferenced, object.Size, object.Digest, string(object.Key), s.volume); err != nil {
 			return err
 		}
 	}
 	if node.Content != "" {
-		if _, err := tx.ExecContext(ctx, `UPDATE objects SET state=? WHERE key=? AND namespace=?`, stateGarbage, string(node.Content), s.namespace); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE objects SET state=? WHERE key=? AND volume=?`, stateGarbage, string(node.Content), s.volume); err != nil {
 			return err
 		}
 	}
@@ -342,7 +342,7 @@ func (s *Store) replaceNodeContent(ctx context.Context, tx *sql.Tx, node metasto
 
 func (s *Store) recordNamedChanged(ctx context.Context, tx *sql.Tx, id int64) error {
 	var detached bool
-	if err := tx.QueryRowContext(ctx, `SELECT detached FROM nodes WHERE namespace=? AND id=?`, s.namespace, id).Scan(&detached); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT detached FROM nodes WHERE volume=? AND id=?`, s.volume, id).Scan(&detached); err != nil {
 		return err
 	}
 	if detached {
@@ -356,7 +356,7 @@ func (f *retainedFile) SetAttr(ctx context.Context, change storage.AttrChange) (
 		return metastore.FileState{}, err
 	}
 	var state metastore.FileState
-	err := f.store.mutatePublication(ctx, &namespaceIntent{kind: locking.SetAttrMutation, node: f.id}, func(tx *sql.Tx) error {
+	err := f.store.mutatePublication(ctx, &volumeIntent{kind: locking.SetAttrMutation, node: f.id}, func(tx *sql.Tx) error {
 		if err := f.check(); err != nil {
 			return err
 		}
@@ -401,7 +401,7 @@ func (s *Store) SetNodeAttr(ctx context.Context, id uint64, change storage.AttrC
 		return metastore.Node{}, err
 	}
 	var node metastore.Node
-	err := s.mutatePublication(ctx, &namespaceIntent{kind: locking.SetAttrMutation, node: int64(id)}, func(tx *sql.Tx) error {
+	err := s.mutatePublication(ctx, &volumeIntent{kind: locking.SetAttrMutation, node: int64(id)}, func(tx *sql.Tx) error {
 		if err := s.setNodeAttr(ctx, tx, int64(id), change); err != nil {
 			return err
 		}
@@ -415,7 +415,7 @@ func (s *Store) SetNodeAttr(ctx context.Context, id uint64, change storage.AttrC
 func (s *Store) Usage(ctx context.Context) (int64, error) {
 	var used int64
 	err := s.inspect(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT used FROM namespaces WHERE id=?`, s.namespace).Scan(&used)
+		return tx.QueryRowContext(ctx, `SELECT used FROM volumes WHERE id=?`, s.volume).Scan(&used)
 	})
 	if err == nil && used < 0 {
 		err = syscall.EIO
@@ -442,7 +442,7 @@ func (f *retainedFile) Close(ctx context.Context) error {
 		return f.closeErr
 	}
 	s := f.store
-	key := retainedNode{s.namespace, f.id}
+	key := retainedNode{s.volume, f.id}
 	count := s.coordinator.pins[key]
 	if count < 1 {
 		return syscall.EIO
@@ -450,13 +450,13 @@ func (f *retainedFile) Close(ctx context.Context) error {
 	if count == 1 {
 		var detached bool
 		err := s.inspect(ctx, func(tx *sql.Tx) error {
-			return tx.QueryRowContext(ctx, `SELECT detached FROM nodes WHERE namespace=? AND id=?`, s.namespace, f.id).Scan(&detached)
+			return tx.QueryRowContext(ctx, `SELECT detached FROM nodes WHERE volume=? AND id=?`, s.volume, f.id).Scan(&detached)
 		})
 		if err != nil {
 			return sqlerr.Failure(err)
 		}
 		if detached {
-			err = s.mutateTransactionLocked(ctx, ctx, &namespaceIntent{kind: locking.RemoveMutation, node: f.id, cleanup: true}, func(tx *sql.Tx) error {
+			err = s.mutateTransactionLocked(ctx, ctx, &volumeIntent{kind: locking.RemoveMutation, node: f.id, cleanup: true}, func(tx *sql.Tx) error {
 				node, err := s.nodeByID(ctx, tx, f.id)
 				if err != nil {
 					return err
@@ -494,16 +494,16 @@ type fileDomain struct {
 }
 
 func (s *Store) attachFileDomain(options Options) error {
-	domain := s.coordinator.domains[s.namespace]
+	domain := s.coordinator.domains[s.volume]
 	if domain == nil {
 		coordinator, err := advisory.New(options.Advisory)
 		if err != nil {
 			return err
 		}
 		domain = &fileDomain{config: options.Advisory, coordinator: coordinator, maxFiles: options.MaxRetainedFiles}
-		s.coordinator.domains[s.namespace] = domain
+		s.coordinator.domains[s.volume] = domain
 	} else if domain.config != options.Advisory || domain.maxFiles != options.MaxRetainedFiles {
-		return fmt.Errorf("shared SQLite namespace file limits differ from its active owner: %w", syscall.EINVAL)
+		return fmt.Errorf("shared SQLite volume file limits differ from its active owner: %w", syscall.EINVAL)
 	}
 	domain.stores++
 	s.fileDomain = domain
@@ -516,12 +516,12 @@ func (s *Store) releaseFileDomain() {
 	}
 	s.fileDomain.stores--
 	if s.fileDomain.stores == 0 {
-		delete(s.coordinator.domains, s.namespace)
+		delete(s.coordinator.domains, s.volume)
 	}
 	s.fileDomain = nil
 }
 
-// Advisory returns the authority shared by all Store values for this namespace.
+// Advisory returns the authority shared by all Store values for this volume.
 func (s *Store) Advisory(ctx context.Context) (*advisory.Coordinator, error) {
 	if err := s.coordinator.commit.acquire(ctx); err != nil {
 		return nil, err
@@ -541,7 +541,7 @@ func (s *Store) Advisory(ctx context.Context) (*advisory.Coordinator, error) {
 
 func (s *Store) CheckFileStore() error {
 	// The owner pointer and exclusive mode are immutable after construction.
-	// Its live descriptor and namespace state are checked under publication ordering.
+	// Its live descriptor and volume state are checked under publication ordering.
 	if s.leaseOwner == nil || !s.leaseOwner.Exclusive() {
 		return syscall.EOPNOTSUPP
 	}

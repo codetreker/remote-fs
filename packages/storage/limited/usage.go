@@ -37,7 +37,7 @@ func measureUsage(ctx context.Context, backing storage.BoundedStorage, limits Me
 	return measure(ctx, backing, limits)
 }
 
-// Usage returns the namespace's committed byte count, including detached retained
+// Usage returns the volume's committed byte count, including detached retained
 // files. Pending object staging consumes its backend's separate bounded budget.
 func (s *Storage) Usage(ctx context.Context) (int64, error) {
 	s.gate.RLock()

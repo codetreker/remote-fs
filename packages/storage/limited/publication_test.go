@@ -299,7 +299,7 @@ func TestNativeAllowancePreservesScopeAndDelegatesLifecycle(t *testing.T) {
 	p.service = &probeLockService{}
 	s := newStorageOver(t, p, limited.MinLimit)
 	if s.LockService() != p.service {
-		t.Fatal("allowance changed the namespace's paired lock service")
+		t.Fatal("allowance changed the volume's paired lock service")
 	}
 	if err := s.CheckPublicationAccounting(); err != nil {
 		t.Fatal(err)
@@ -353,12 +353,12 @@ func TestGenericAllowanceRemainsComposableWithoutNativeCapability(t *testing.T) 
 
 type probeLockService struct{ locking.Service }
 
-// The probe injects final outcomes over a real namespace. Its target mutex models
+// The probe injects final outcomes over a real volume. Its target mutex models
 // the native ordering required by the hook contract.
 type publicationProbe struct {
 	storage.BoundedStorage
 	// applyCtx excludes the incoming publication hooks: the probe prepares and settles
-	// them once, independently of the underlying namespace's own publication.
+	// them once, independently of the underlying volume's own publication.
 	applyCtx context.Context
 	mu       sync.Mutex
 	stage    func(context.Context, string) error

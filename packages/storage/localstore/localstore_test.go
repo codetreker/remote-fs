@@ -46,7 +46,7 @@ func TestBoundedStorageContract(t *testing.T) {
 	})
 }
 
-func TestOpenCreatesAndReopensABoundNamespace(t *testing.T) {
+func TestOpenCreatesAndReopensABoundVolume(t *testing.T) {
 	config := testConfig(privateRoot(t))
 	first := open(t, config)
 	if err := first.Create(t.Context(), "held"); err != nil {
@@ -63,7 +63,7 @@ func TestOpenCreatesAndReopensABoundNamespace(t *testing.T) {
 	second := open(t, config)
 	t.Cleanup(func() { closeStore(t, second) })
 	if _, err := second.Stat(t.Context(), "held"); err != nil {
-		t.Fatalf("the reopened namespace lost its file: %v", err)
+		t.Fatalf("the reopened volume lost its file: %v", err)
 	}
 	reopenedIncarnation, err := second.Log().Incarnation(t.Context(), 1024)
 	if err != nil {
@@ -79,16 +79,16 @@ func TestOpenCreatesAndReopensABoundNamespace(t *testing.T) {
 	}
 }
 
-func TestRootIsBoundToExactlyOneWorkspace(t *testing.T) {
+func TestRootIsBoundToExactlyOneVolume(t *testing.T) {
 	config := testConfig(privateRoot(t))
 	closeStore(t, open(t, config))
 
 	wrong := config
-	wrong.Workspace = "workspaec"
+	wrong.Volume = "workspaec"
 	store, err := localstore.Open(t.Context(), wrong)
 	if err == nil {
 		store.Close()
-		t.Fatal("Open accepted a different workspace in the same root")
+		t.Fatal("Open accepted a different volume in the same root")
 	}
 	if !errors.Is(err, syscall.EIO) {
 		t.Fatalf("Open returned %v, want EIO", err)
@@ -98,11 +98,11 @@ func TestRootIsBoundToExactlyOneWorkspace(t *testing.T) {
 	t.Cleanup(func() { closeStore(t, database) })
 	var created int
 	if err := database.QueryRowContext(t.Context(),
-		`SELECT count(*) FROM namespaces WHERE name = ?`, wrong.Workspace).Scan(&created); err != nil {
+		`SELECT count(*) FROM volumes WHERE name = ?`, wrong.Volume).Scan(&created); err != nil {
 		t.Fatal(err)
 	}
 	if created != 0 {
-		t.Fatal("the rejected workspace was created in SQLite")
+		t.Fatal("the rejected volume was created in SQLite")
 	}
 
 	reopened := open(t, config)
@@ -166,7 +166,7 @@ func TestUnboundInitializationIntentCannotAdoptAPreexistingDatabase(t *testing.T
 		store, err := localstore.Open(t.Context(), testConfig(root))
 		if err == nil {
 			store.Close()
-			t.Fatalf("Open attempt %d adopted a database that predates its workspace-bound initialization intent", attempt)
+			t.Fatalf("Open attempt %d adopted a database that predates its volume-bound initialization intent", attempt)
 		}
 		if !errors.Is(err, syscall.EIO) {
 			t.Fatalf("Open attempt %d returned %v, want EIO", attempt, err)
@@ -427,14 +427,14 @@ func TestRootIsRequired(t *testing.T) {
 	}
 }
 
-func TestWorkspaceNameIsLengthBoundedBeforeTheRootIsTouched(t *testing.T) {
+func TestVolumeNameIsLengthBoundedBeforeTheRootIsTouched(t *testing.T) {
 	root := privateRoot(t)
 	config := testConfig(root)
-	config.Workspace = string(make([]byte, localstore.MaxWorkspaceBytes+1))
+	config.Volume = string(make([]byte, localstore.MaxVolumeBytes+1))
 	store, err := localstore.Open(t.Context(), config)
 	if err == nil {
 		store.Close()
-		t.Fatal("Open accepted an oversized workspace name")
+		t.Fatal("Open accepted an oversized volume name")
 	}
 	if !errors.Is(err, syscall.ENAMETOOLONG) {
 		t.Fatalf("Open returned %v, want ENAMETOOLONG", err)
@@ -444,20 +444,20 @@ func TestWorkspaceNameIsLengthBoundedBeforeTheRootIsTouched(t *testing.T) {
 		t.Fatal(readErr)
 	}
 	if len(entries) != 0 {
-		t.Fatalf("invalid workspace name created %d root entries", len(entries))
+		t.Fatalf("invalid volume name created %d root entries", len(entries))
 	}
 }
 
-func TestLargestWorkspaceNameCanReopen(t *testing.T) {
+func TestLargestVolumeNameCanReopen(t *testing.T) {
 	config := testConfig(privateRoot(t))
-	config.Workspace = strings.Repeat("w", localstore.MaxWorkspaceBytes)
+	config.Volume = strings.Repeat("w", localstore.MaxVolumeBytes)
 	closeStore(t, open(t, config))
 	closeStore(t, open(t, config))
 }
 
 func TestConfigurationIsValidatedBeforeTheRootIsTouched(t *testing.T) {
 	tests := map[string]func(*localstore.Config){
-		"workspace": func(config *localstore.Config) { config.Workspace = "" },
+		"volume":    func(config *localstore.Config) { config.Volume = "" },
 		"log floor": func(config *localstore.Config) { config.Window.Floor = 0 },
 		"log cap":   func(config *localstore.Config) { config.Window.Cap = config.Window.Floor - 1 },
 		"log age":   func(config *localstore.Config) { config.Window.Age = 0 },
@@ -491,7 +491,7 @@ func TestConfigurationIsValidatedBeforeTheRootIsTouched(t *testing.T) {
 		"integrity node limit": func(config *localstore.Config) {
 			config.MaxIntegrityRecords = -1
 		},
-		"integrity nodes below an empty namespace": func(config *localstore.Config) {
+		"integrity nodes below an empty volume": func(config *localstore.Config) {
 			config.MaxIntegrityRecords = sqlite.MinIntegrityRecords - 1
 		},
 		"unbounded integrity nodes": func(config *localstore.Config) {
@@ -576,8 +576,8 @@ func TestStatusCombinesLogicalObjectAndPhysicalState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.Workspace != config.Workspace {
-		t.Fatalf("Status.Workspace = %q, want %q", status.Workspace, config.Workspace)
+	if status.Volume != config.Volume {
+		t.Fatalf("Status.Volume = %q, want %q", status.Volume, config.Volume)
 	}
 	if status.Space.Total != config.Quota || status.Space.Used != int64(len(content)) {
 		t.Fatalf("Status.Space = %+v, want total %d and used %d", status.Space, config.Quota, len(content))
@@ -670,16 +670,16 @@ func TestObjectBacklogLimitsRemainObservableWithoutBlockingShrinkOperations(t *t
 	closeStore(t, store)
 
 	database := rawDatabase(t, filepath.Join(config.Root, databaseName), false)
-	var namespace int64
+	var volume int64
 	if err := database.QueryRowContext(t.Context(),
-		`SELECT id FROM namespaces WHERE name = ?`, config.Workspace).Scan(&namespace); err != nil {
+		`SELECT id FROM volumes WHERE name = ?`, config.Volume).Scan(&volume); err != nil {
 		t.Fatal(err)
 	}
 	for index := range 2 {
 		key := strings.Repeat("x", localdisk.MaxKeyBytes+1) + string(rune('a'+index))
 		if _, err := database.ExecContext(t.Context(), `
-			INSERT INTO objects (key, namespace, state, size, digest, created_sec, created_nsec)
-			VALUES (?, ?, 2, 10, NULL, 0, ?)`, key, namespace, index); err != nil {
+			INSERT INTO objects (key, volume, state, size, digest, created_sec, created_nsec)
+			VALUES (?, ?, 2, 10, NULL, 0, ?)`, key, volume, index); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -844,7 +844,7 @@ func TestStatusUsesControlAdmissionWhileTheDataPlaneIsSaturated(t *testing.T) {
 	}
 }
 
-func TestSpaceClampsTheWorkspaceAllowanceToPhysicalAvailability(t *testing.T) {
+func TestSpaceClampsTheVolumeAllowanceToPhysicalAvailability(t *testing.T) {
 	config := testConfig(privateRoot(t))
 	config.LocalDisk.MaintenanceReserveBytes = math.MaxInt64
 	store := open(t, config)
@@ -925,8 +925,8 @@ func TestMalformedCompletionMarkerFailsClosed(t *testing.T) {
 			binary.BigEndian.PutUint32(marker[12:16], uint32(len(marker)+1))
 			return marker
 		},
-		"workspace length": func(marker []byte) []byte {
-			binary.BigEndian.PutUint32(marker[16:20], localstore.MaxWorkspaceBytes+1)
+		"volume length": func(marker []byte) []byte {
+			binary.BigEndian.PutUint32(marker[16:20], localstore.MaxVolumeBytes+1)
 			return marker
 		},
 		"checksum": func(marker []byte) []byte {
@@ -959,7 +959,7 @@ func TestMalformedCompletionMarkerFailsClosed(t *testing.T) {
 	}
 }
 
-func TestMissingMetadataNeverReopensAsAnEmptyNamespace(t *testing.T) {
+func TestMissingMetadataNeverReopensAsAnEmptyVolume(t *testing.T) {
 	config := testConfig(privateRoot(t))
 	store := open(t, config)
 	if err := store.Write(t.Context(), "artifact", []byte("content")); err != nil {
@@ -973,7 +973,7 @@ func TestMissingMetadataNeverReopensAsAnEmptyNamespace(t *testing.T) {
 	reopened, err := localstore.Open(t.Context(), config)
 	if err == nil {
 		reopened.Close()
-		t.Fatal("Open recreated missing metadata and exposed an empty namespace")
+		t.Fatal("Open recreated missing metadata and exposed an empty volume")
 	}
 	if !errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("Open returned %v, want EIO without ENOENT", err)
@@ -985,7 +985,7 @@ func TestMissingMetadataNeverReopensAsAnEmptyNamespace(t *testing.T) {
 	closeStore(t, objects)
 }
 
-func TestEmptyReplacementMetadataNeverReopensAsAnEmptyNamespace(t *testing.T) {
+func TestEmptyReplacementMetadataNeverReopensAsAnEmptyVolume(t *testing.T) {
 	config := testConfig(privateRoot(t))
 	store := open(t, config)
 	if err := store.Write(t.Context(), "artifact", []byte("content")); err != nil {
@@ -1006,7 +1006,7 @@ func TestEmptyReplacementMetadataNeverReopensAsAnEmptyNamespace(t *testing.T) {
 	}
 }
 
-func TestLosingCompletionAndMetadataNeverReopensAsAnEmptyNamespace(t *testing.T) {
+func TestLosingCompletionAndMetadataNeverReopensAsAnEmptyVolume(t *testing.T) {
 	config := testConfig(privateRoot(t))
 	store := open(t, config)
 	if err := store.Write(t.Context(), "artifact", []byte("content")); err != nil {
@@ -1022,14 +1022,14 @@ func TestLosingCompletionAndMetadataNeverReopensAsAnEmptyNamespace(t *testing.T)
 	reopened, err := localstore.Open(t.Context(), config)
 	if err == nil {
 		reopened.Close()
-		t.Fatal("Open recreated both completion and metadata as an empty namespace")
+		t.Fatal("Open recreated both completion and metadata as an empty volume")
 	}
 	if !errors.Is(err, syscall.EIO) {
 		t.Fatalf("Open returned %v, want EIO", err)
 	}
 }
 
-func TestLosingTheBoundWorkspaceRowNeverRecreatesAnEmptyNamespace(t *testing.T) {
+func TestLosingTheBoundVolumeRowNeverRecreatesAnEmptyVolume(t *testing.T) {
 	config := testConfig(privateRoot(t))
 	store := open(t, config)
 	if err := store.Write(t.Context(), "artifact", []byte("content")); err != nil {
@@ -1046,7 +1046,7 @@ func TestLosingTheBoundWorkspaceRowNeverRecreatesAnEmptyNamespace(t *testing.T) 
 	if _, err := connection.ExecContext(t.Context(), `PRAGMA foreign_keys = OFF`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := connection.ExecContext(t.Context(), `DELETE FROM namespaces`); err != nil {
+	if _, err := connection.ExecContext(t.Context(), `DELETE FROM volumes`); err != nil {
 		t.Fatal(err)
 	}
 	if err := connection.Close(); err != nil {
@@ -1059,19 +1059,19 @@ func TestLosingTheBoundWorkspaceRowNeverRecreatesAnEmptyNamespace(t *testing.T) 
 	reopened, err := localstore.Open(t.Context(), config)
 	if err == nil {
 		reopened.Close()
-		t.Fatal("Open recreated the missing bound workspace")
+		t.Fatal("Open recreated the missing bound volume")
 	}
 	if !errors.Is(err, syscall.EIO) {
 		t.Fatalf("Open returned %v, want EIO", err)
 	}
 	database = rawDatabase(t, filepath.Join(config.Root, databaseName), true)
 	t.Cleanup(func() { closeStore(t, database) })
-	var namespaces int
-	if err := database.QueryRowContext(t.Context(), `SELECT count(*) FROM namespaces`).Scan(&namespaces); err != nil {
+	var volumes int
+	if err := database.QueryRowContext(t.Context(), `SELECT count(*) FROM volumes`).Scan(&volumes); err != nil {
 		t.Fatal(err)
 	}
-	if namespaces != 0 {
-		t.Fatalf("the refused reopen created %d workspaces", namespaces)
+	if volumes != 0 {
+		t.Fatalf("the refused reopen created %d volumes", volumes)
 	}
 }
 
@@ -1253,10 +1253,10 @@ func TestCloseIsConcurrentIdempotentAndAllowsReopen(t *testing.T) {
 
 func testConfig(root string) localstore.Config {
 	return localstore.Config{
-		Root:      root,
-		Workspace: "workspace",
-		Quota:     1 << 20,
-		Window:    sqlite.DefaultWindow(),
+		Root:   root,
+		Volume: "workspace",
+		Quota:  1 << 20,
+		Window: sqlite.DefaultWindow(),
 		Maintenance: objectstore.Options{
 			SweepInterval: time.Hour,
 			SweepBatch:    8,

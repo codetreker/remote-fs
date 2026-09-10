@@ -13,7 +13,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-// awkwardPaths are the namespace paths that URL construction is most likely to damage:
+// awkwardPaths are the volume paths that URL construction is most likely to damage:
 // characters with a meaning in a URL, characters the path cleaner has an opinion about,
 // non-ASCII text, and bytes that are not valid UTF-8 at all.
 var awkwardPaths = []string{
@@ -172,7 +172,7 @@ func TestRequestURLKeepsTheBasePrefix(t *testing.T) {
 
 // An operation that takes no operands is addressed by its name alone. The refusal of an
 // empty query for every other operation is what keeps a damaged request from reading as a
-// request against the whole namespace, so the one operation that legitimately carries no
+// request against the whole volume, so the one operation that legitimately carries no
 // query is asserted here.
 func TestSpaceIsAddressedWithNoOperands(t *testing.T) {
 	u, err := httprest.Request{Op: httprest.OpSpace}.URL(mustBase(t, "http://example.invalid/"))
@@ -239,7 +239,7 @@ func TestParseRequestRejectsMalformedRequests(t *testing.T) {
 		want   error
 	}{
 		// url.Values.Get reports a query it could not parse as an absent key, and an
-		// absent path reads as the root — so the whole namespace would answer for a
+		// absent path reads as the root — so the whole volume would answer for a
 		// request nobody could decode.
 		{"a query that does not parse", http.MethodGet, "/v3/stat?path=%zz", httprest.ErrOperands},
 		{"no path at all", http.MethodGet, "/v3/stat", httprest.ErrOperands},
@@ -248,7 +248,7 @@ func TestParseRequestRejectsMalformedRequests(t *testing.T) {
 		{"an operand nobody asked for", http.MethodGet, "/v3/stat?path=a&to=b", httprest.ErrOperands},
 		{"rename without a destination", http.MethodPost, "/v3/rename?path=a", httprest.ErrOperands},
 		{"rename with the destination twice", http.MethodPost, "/v3/rename?path=a&to=b&to=c", httprest.ErrOperands},
-		// Space describes the whole namespace, so a path beside it is a question nothing
+		// Space describes the whole volume, so a path beside it is a question nothing
 		// can answer rather than one to answer about the root.
 		{"space with a path", http.MethodGet, "/v3/space?path=a", httprest.ErrOperands},
 		{"space with an empty path", http.MethodGet, "/v3/space?path=", httprest.ErrOperands},
@@ -290,7 +290,7 @@ func TestParseRequestRejectsMalformedRequests(t *testing.T) {
 
 // The root is named by an empty path, which is a present operand rather than a missing
 // one. Losing that distinction turns every request with a damaged query into a request
-// against the whole namespace.
+// against the whole volume.
 func TestParseRequestAcceptsTheRoot(t *testing.T) {
 	u, err := url.ParseRequestURI("/v3/list?path=")
 	if err != nil {

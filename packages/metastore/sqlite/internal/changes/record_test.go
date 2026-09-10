@@ -39,14 +39,14 @@ func logFixture(t *testing.T) (*sql.DB, *sql.Tx) {
 	if err := sqliteschema.MustLoad(os.DirFS("../schema"), "migrations").Reach(t.Context(), tx); err != nil {
 		t.Fatal(err)
 	}
-	execLogSQL(t, tx, `INSERT INTO namespaces(id,name,root,used) VALUES(1,'one',1,0),(2,'two',3,0)`)
-	execLogSQL(t, tx, `INSERT INTO nodes(id,namespace,mode,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec)
+	execLogSQL(t, tx, `INSERT INTO volumes(id,name,root,used) VALUES(1,'one',1,0),(2,'two',3,0)`)
+	execLogSQL(t, tx, `INSERT INTO nodes(id,volume,mode,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec)
 		VALUES(1,1,?,0,0,0,0,0),(2,1,420,0,0,0,0,0),(3,2,?,0,0,0,0,0),(4,2,420,0,0,0,0,0)`,
 		int64(fs.ModeDir|0755), int64(fs.ModeDir|0755))
-	execLogSQL(t, tx, `INSERT INTO entries(namespace,parent,name,node) VALUES(1,1,x'66696c65',2),(2,3,x'66696c65',4)`)
+	execLogSQL(t, tx, `INSERT INTO entries(volume,parent,name,node) VALUES(1,1,x'66696c65',2),(2,3,x'66696c65',4)`)
 	execLogSQL(t, tx, `UPDATE database_state SET node_high_water=4`)
-	for _, namespace := range []int64{1, 2} {
-		if err := CreateLog(t.Context(), tx, namespace); err != nil {
+	for _, volume := range []int64{1, 2} {
+		if err := CreateLog(t.Context(), tx, volume); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -138,7 +138,7 @@ func TestRecordStoresChangesAndTailInTheCallerTransaction(t *testing.T) {
 	}
 	var count, tail, highWater int
 	if err := db.QueryRow(`SELECT (SELECT count(*) FROM changes),
-		(SELECT committed_position FROM logs WHERE namespace=1), change_high_water FROM database_state`).Scan(&count, &tail, &highWater); err != nil {
+		(SELECT committed_position FROM logs WHERE volume=1), change_high_water FROM database_state`).Scan(&count, &tail, &highWater); err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 || tail != 0 || highWater != 0 {
@@ -148,10 +148,10 @@ func TestRecordStoresChangesAndTailInTheCallerTransaction(t *testing.T) {
 
 func TestRecordRefusesInvalidTailAndPreservesSQLFailures(t *testing.T) {
 	for _, test := range []struct{ name, setup, want string }{
-		{"missing log", `DELETE FROM logs WHERE namespace=1`, "no rows"},
-		{"text tail", `UPDATE logs SET committed_position='bad' WHERE namespace=1`, "invalid committed position"},
-		{"negative tail", `UPDATE logs SET committed_position=-1 WHERE namespace=1`, "invalid committed position"},
-		{"future tail", `UPDATE logs SET committed_position=9 WHERE namespace=1`, "does not precede"},
+		{"missing log", `DELETE FROM logs WHERE volume=1`, "no rows"},
+		{"text tail", `UPDATE logs SET committed_position='bad' WHERE volume=1`, "invalid committed position"},
+		{"negative tail", `UPDATE logs SET committed_position=-1 WHERE volume=1`, "invalid committed position"},
+		{"future tail", `UPDATE logs SET committed_position=9 WHERE volume=1`, "does not precede"},
 		{"missing state", `DELETE FROM database_state`, "durable-state rows"},
 		{"insert failure", `CREATE TRIGGER fail_insert BEFORE INSERT ON changes BEGIN SELECT RAISE(ABORT,'record insert failed'); END`, "record insert failed"},
 		{"tail failure", `CREATE TRIGGER fail_tail BEFORE UPDATE ON logs BEGIN SELECT RAISE(ABORT,'record tail failed'); END`, "record tail failed"},

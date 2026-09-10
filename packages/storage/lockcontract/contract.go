@@ -1,4 +1,4 @@
-// Package lockcontract exercises explicit lease behavior against complete namespaces.
+// Package lockcontract exercises explicit lease behavior against complete volumes.
 // Builders own backend initialization and register all lifecycle cleanup with testing.T.
 package lockcontract
 
@@ -22,7 +22,7 @@ type Fixture struct {
 type Builder func(*testing.T, locking.Options) Fixture
 
 // Run applies the same protection, identity, replay and cleanup obligations to
-// native, wrapped and remote namespaces. Each subtest receives a fresh authority.
+// native, wrapped and remote volumes. Each subtest receives a fresh authority.
 func Run(t *testing.T, build Builder) {
 	t.Helper()
 	for _, test := range []struct {

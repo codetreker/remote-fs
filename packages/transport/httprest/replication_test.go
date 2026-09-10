@@ -27,7 +27,7 @@ import (
 )
 
 // fakeLog exposes controlled log retention and failures behind a real HTTP listener,
-// client, and SQLite/object namespace. Since preserves the distinction between caught
+// client, and SQLite/object volume. Since preserves the distinction between caught
 // up, resumable, and gone so that the tests can detect changes lost across the wire.
 type fakeLog struct {
 	mu sync.Mutex
@@ -317,7 +317,7 @@ func (s *fakeSnap) Close() error {
 }
 
 // recording is a storage that appends to a log whatever changes it made, the way a store
-// that owned both would. The transport learns that the namespace moved from the mutating
+// that owned both would. The transport learns that the volume moved from the mutating
 // request it has just answered, so a test that drives a real request has to leave the log
 // looking as a real one would.
 type recording struct {
@@ -349,7 +349,7 @@ func (r recording) Mkdir(ctx context.Context, path string) error {
 	return nil
 }
 
-// serveLog serves a real namespace with a separately controlled log so that stream
+// serveLog serves a real volume with a separately controlled log so that stream
 // failures can be injected independently of filesystem operations.
 func serveLog(t *testing.T, log metastore.Log, limits httprest.Limits) *httprest.Storage {
 	t.Helper()
@@ -360,7 +360,7 @@ func serveLog(t *testing.T, log metastore.Log, limits httprest.Limits) *httprest
 // rather than defaulted, so that a case about that bound need not wait out the default.
 func serveLogWatchedFor(t *testing.T, log metastore.Log, limits httprest.Limits, silence time.Duration) *httprest.Storage {
 	t.Helper()
-	backing := namespaceFixture(t)
+	backing := volumeFixture(t)
 	var served storage.Storage = backing
 	if fake, ok := log.(*fakeLog); ok {
 		served = recording{Storage: backing, log: fake}
@@ -381,7 +381,7 @@ func serveLogWatchedFor(t *testing.T, log metastore.Log, limits httprest.Limits,
 
 func serveLogWithOptions(t *testing.T, log metastore.Log, handlerOptions httprest.HandlerOptions, dialOptions httprest.DialOptions) *httprest.Storage {
 	t.Helper()
-	backing := namespaceFixture(t)
+	backing := volumeFixture(t)
 	var served storage.Storage = backing
 	if fake, ok := log.(*fakeLog); ok {
 		served = recording{Storage: backing, log: fake}
@@ -524,7 +524,7 @@ func TestAByteBoundedLogCannotReturnNoChangesWhileItsTailIsAhead(t *testing.T) {
 }
 
 // A replica that fell out of the log's window has to be told to start over, and told which
-// dimension pushed it out: age says it was away too long, volume says the namespace changes
+// dimension pushed it out: age says it was away too long, volume says the volume changes
 // faster than the log was configured to hold. Those are different things for an operator to
 // do, and a transport that carried only "start over" would have thrown that away.
 func TestAReplicaOutsideTheWindowIsToldToRebuildAndWhy(t *testing.T) {
@@ -701,7 +701,7 @@ func waitFor(t *testing.T, complaint string, done func() bool) {
 
 // R-CON-2: visibility must not wait for an interval to elapse. The two halves of that are
 // asserted together, because either one alone would pass for an implementation that polls
-// quickly: nothing reads the log while the namespace is still, and a change recorded by an
+// quickly: nothing reads the log while the volume is still, and a change recorded by an
 // ordinary request reaches a watching replica anyway.
 func TestAChangeReachesAWatcherWithoutAnyIntervalElapsing(t *testing.T) {
 	log := newFakeLog()
@@ -714,7 +714,7 @@ func TestAChangeReachesAWatcherWithoutAnyIntervalElapsing(t *testing.T) {
 	settled := log.reads()
 	time.Sleep(300 * time.Millisecond)
 	if got := log.reads(); got != settled {
-		t.Fatalf("the log was read %d times while the namespace was still, and %d before that: something reads it on a schedule", got, settled)
+		t.Fatalf("the log was read %d times while the volume was still, and %d before that: something reads it on a schedule", got, settled)
 	}
 
 	arrived := make(chan metastore.Change, 1)
@@ -728,7 +728,7 @@ func TestAChangeReachesAWatcherWithoutAnyIntervalElapsing(t *testing.T) {
 		arrived <- change
 	}()
 
-	// One ordinary mutating request. Nothing else tells the server that the namespace
+	// One ordinary mutating request. Nothing else tells the server that the volume
 	// moved, and nothing else is meant to.
 	started := time.Now()
 	if err := s.Mkdir(t.Context(), "d"); err != nil {
@@ -750,7 +750,7 @@ func TestAChangeReachesAWatcherWithoutAnyIntervalElapsing(t *testing.T) {
 }
 
 // A replica can fall out of the window while it is attached, not only while it is away —
-// a slow reader, or a namespace changing faster than the log holds. The answer is the same
+// a slow reader, or a volume changing faster than the log holds. The answer is the same
 // one, given the same way, because delivering what follows the gap would leave the replica
 // silently wrong about everything inside it.
 func TestFallingOutOfTheWindowWhileWatchingIsSaidSoToo(t *testing.T) {
@@ -1004,7 +1004,7 @@ func replicationCalls() map[string]func(*testing.T, *httprest.Storage) error {
 	}
 }
 
-// A namespace that keeps no log and a server that cannot be reached are opposite facts,
+// A volume that keeps no log and a server that cannot be reached are opposite facts,
 // and what a caller does about them is opposite too: the first will never be replicable and
 // the mount goes on without a local copy, the second will answer in a moment and the mount
 // waits. They must not arrive as the same error, and neither may be read as the other.
@@ -1034,10 +1034,10 @@ func TestNotReplicableIsNotTheSameFailureAsNotReachable(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			permanent := reach(t, unreplicable)
 			if !errors.Is(permanent, syscall.ENOSYS) {
-				t.Fatalf("a namespace that keeps no log gave %v, want ENOSYS", permanent)
+				t.Fatalf("a volume that keeps no log gave %v, want ENOSYS", permanent)
 			}
 			if errors.Is(permanent, syscall.EIO) {
-				t.Fatalf("a namespace that keeps no log reads as a server that could not be reached: %v", permanent)
+				t.Fatalf("a volume that keeps no log reads as a server that could not be reached: %v", permanent)
 			}
 
 			transient := reach(t, unreachable)
@@ -1045,27 +1045,27 @@ func TestNotReplicableIsNotTheSameFailureAsNotReachable(t *testing.T) {
 				t.Fatalf("a server that is not there gave %v, want EIO", transient)
 			}
 			if errors.Is(transient, syscall.ENOSYS) {
-				t.Fatalf("a server that could not be reached reads as a namespace that keeps no log: %v", transient)
+				t.Fatalf("a server that could not be reached reads as a volume that keeps no log: %v", transient)
 			}
 		})
 	}
 }
 
-// A namespace with no change log cannot be replicated, and has to say so. An empty stream
-// and a picture of no rows are the shape of a namespace that exists, holds nothing and
+// A volume with no change log cannot be replicated, and has to say so. An empty stream
+// and a picture of no rows are the shape of a volume that exists, holds nothing and
 // never changes — which a replica would believe, and go on believing (R-ERR-1, R-ERR-2).
-func TestANamespaceWithNoLogRefusesRatherThanLookingEmpty(t *testing.T) {
+func TestAVolumeWithNoLogRefusesRatherThanLookingEmpty(t *testing.T) {
 	s := serveLog(t, nil, httprest.DefaultLimits())
 	for name, reach := range replicationCalls() {
 		t.Run(name, func(t *testing.T) {
 			err := reach(t, s)
 			if err == nil {
-				t.Fatal("an unreplicable namespace answered as though it could be replicated")
+				t.Fatal("an unreplicable volume answered as though it could be replicated")
 			}
 			if !errors.Is(err, syscall.ENOSYS) {
 				t.Fatalf("gave %v, want ENOSYS", err)
 			}
-			// ENOSYS is a standing property of this namespace, so it must not be reported
+			// ENOSYS is a standing property of this volume, so it must not be reported
 			// as a rebuild — which would send a replica off to take a snapshot that will
 			// be refused in exactly the same way, forever.
 			var rebuild *httprest.RebuildError
@@ -1158,7 +1158,7 @@ func TestASnapshotThatStopsIsNotACompletePicture(t *testing.T) {
 }
 
 // A change stream has no natural end, so reaching the end of one means the connection went
-// rather than that the namespace has settled. A replica that read the second as the first
+// rather than that the volume has settled. A replica that read the second as the first
 // would sit on a copy it believes is current, indefinitely.
 func TestAChangeStreamThatEndsIsAFailure(t *testing.T) {
 	start := frame("start", `{"incarnation":"a-log","position":4,"tail":4}`)
@@ -1187,7 +1187,7 @@ func TestAChangeStreamThatEndsIsAFailure(t *testing.T) {
 			if errors.Is(err2, io.EOF) {
 				t.Fatalf("the end of a change stream was reported as an ordinary end: %v", err2)
 			}
-			// It is not an answer about the namespace either: nothing here established
+			// It is not an answer about the volume either: nothing here established
 			// anything about a file.
 			for _, errno := range []syscall.Errno{syscall.ENOENT, syscall.ENOTDIR, syscall.EISDIR} {
 				if errors.Is(err2, errno) {
@@ -1466,7 +1466,7 @@ func TestAFrameMissingWhatItCarriesIsRefused(t *testing.T) {
 		}
 	})
 
-	// Position zero is a legitimate cut — a namespace nothing has yet changed is at zero —
+	// Position zero is a legitimate cut — a volume nothing has yet changed is at zero —
 	// so an absent one arrives as an ordinary answer, and a replica seeded at zero would
 	// replay changes it already holds.
 	t.Run("a picture that does not say when it was taken", func(t *testing.T) {
@@ -1519,7 +1519,7 @@ func describeChange(c metastore.Change) string {
 }
 
 // A change has to come back exactly as it went, or a replica records something the
-// namespace does not hold.
+// volume does not hold.
 func TestAChangeSurvivesTheRoundTrip(t *testing.T) {
 	node := metastore.Node{
 		ID: 7, Mode: fs.ModeDir | 0o750, Size: 4096,
@@ -1650,7 +1650,7 @@ func TestAMalformedFrameIsRefused(t *testing.T) {
 }
 
 // A stream that says why it failed and a stream that says nothing are both failures, and
-// neither may be reported as an outcome about the namespace.
+// neither may be reported as an outcome about the volume.
 //
 // The wording is the assertion for the second one, because the wording is all it produces:
 // a diagnostic that presents an empty reason reads as one that was cut short on the way
@@ -1752,9 +1752,9 @@ func TestAFailedResumeNamesThePositionRatherThanAPath(t *testing.T) {
 }
 
 // A log that cannot answer must not have its silence turned into an answer about the
-// namespace. Each of these is a failure the server meets before a stream is committed to,
+// volume. Each of these is a failure the server meets before a stream is committed to,
 // so it still has a status to say so with.
-func TestALogThatCannotAnswerIsNotAnEmptyNamespace(t *testing.T) {
+func TestALogThatCannotAnswerIsNotAnEmptyVolume(t *testing.T) {
 	t.Run("a log that will not say what it is", func(t *testing.T) {
 		log := newFakeLog()
 		// A log matching every position every replica ever held is the worst answer this
@@ -1801,7 +1801,7 @@ func TestALogThatCannotAnswerIsNotAnEmptyNamespace(t *testing.T) {
 }
 
 // A log that stops answering part way through a stream has to say so, because the
-// alternative is a stream that goes quiet — which is what a namespace nothing is changing
+// alternative is a stream that goes quiet — which is what a volume nothing is changing
 // also looks like.
 func TestALogThatStopsAnsweringMidStreamSaysSo(t *testing.T) {
 	log := newFakeLog()
@@ -1939,7 +1939,7 @@ func TestAFrameAChangeStreamCannotUseEndsIt(t *testing.T) {
 func TestAServerThatCannotBoundItsWritesRefusesToTakeAPicture(t *testing.T) {
 	log := newFakeLog()
 	log.pages = [][]metastore.Row{{row(0, "", metastore.Node{ID: 1, Mode: fs.ModeDir | 0o755})}}
-	backing := namespaceFixture(t)
+	backing := volumeFixture(t)
 	h, err := httprest.NewHandler(backing, log)
 	if err != nil {
 		t.Fatal(err)
@@ -1956,17 +1956,17 @@ func TestAServerThatCannotBoundItsWritesRefusesToTakeAPicture(t *testing.T) {
 	}
 }
 
-// interleaved opens two namespaces in one database and writes to them in turn, so that the
+// interleaved opens two volumes in one database and writes to them in turn, so that the
 // positions of each have real gaps in them.
 //
-// The gaps are the point. A position comes from one sequence shared by every namespace in
-// the database, so a namespace's own positions are consecutive only when nothing else was
+// The gaps are the point. A position comes from one sequence shared by every volume in
+// the database, so a volume's own positions are consecutive only when nothing else was
 // written in between — which is to say almost never. A stand-in that handed out 1, 2, 3
 // would agree with any amount of arithmetic about adjacency, and adjacency is exactly what
 // must not be assumed.
 func interleaved(t *testing.T, rounds int, window sqlite.Window) (quiet *sqlite.Store, everGiven []metastore.Position) {
 	t.Helper()
-	database := filepath.Join(t.TempDir(), "namespaces.db")
+	database := filepath.Join(t.TempDir(), "volumes.db")
 	open := func(name string) *sqlite.Store {
 		s, err := sqlite.Open(t.Context(), database, name, 0, window)
 		if err != nil {
@@ -1978,22 +1978,22 @@ func interleaved(t *testing.T, rounds int, window sqlite.Window) (quiet *sqlite.
 	quiet, busy := open("quiet"), open("busy")
 
 	// Read after every round rather than at the end, so that the positions the quiet
-	// namespace was given are known even where the window has since discarded them.
+	// volume was given are known even where the window has since discarded them.
 	seen := metastore.Position(0)
 	for round := range rounds {
-		// Several changes to the busy namespace for each one to the quiet namespace, so the
+		// Several changes to the busy volume for each one to the quiet volume, so the
 		// quiet one's positions are spread far apart rather than merely not adjacent.
 		for other := range 3 {
 			if err := busy.Create(t.Context(), fmt.Sprintf("busy-%d-%d", round, other)); err != nil {
-				t.Fatalf("create in the busy namespace: %v", err)
+				t.Fatalf("create in the busy volume: %v", err)
 			}
 		}
 		if err := quiet.Create(t.Context(), fmt.Sprintf("quiet-%d", round)); err != nil {
-			t.Fatalf("create in the quiet namespace: %v", err)
+			t.Fatalf("create in the quiet volume: %v", err)
 		}
 		changes, _, err := readLogChanges(t, quiet, seen, 1000)
 		if err != nil {
-			t.Fatalf("read the quiet namespace's log: %v", err)
+			t.Fatalf("read the quiet volume's log: %v", err)
 		}
 		for _, change := range changes {
 			everGiven = append(everGiven, change.Position)
@@ -2003,7 +2003,7 @@ func interleaved(t *testing.T, rounds int, window sqlite.Window) (quiet *sqlite.
 	return quiet, everGiven
 }
 
-// positionsOf reports the positions a namespace's log still holds.
+// positionsOf reports the positions a volume's log still holds.
 func positionsOf(t *testing.T, log metastore.Log) []metastore.Position {
 	t.Helper()
 	changes, _, err := readLogChanges(t, log, 0, 1000)
@@ -2045,17 +2045,17 @@ func retentionOf(t *testing.T, log metastore.Log) metastore.Retention {
 
 // A replica is resumable when the log still holds everything it has not seen. Whether the
 // next position happens to be the next integer says nothing about that: positions come from
-// a sequence shared by every namespace in the database, so a quiet namespace's positions are
+// a sequence shared by every volume in the database, so a quiet volume's positions are
 // spread out by however much its neighbours were written to in between.
 //
 // Getting this wrong sends a replica off to walk the whole tree again for no reason, which
-// is expensive and honest rather than silent — but it is triggered by a namespace simply
+// is expensive and honest rather than silent — but it is triggered by a volume simply
 // not being the only one in its database, which is the ordinary case.
 func TestAReplicaResumesAcrossTheGapsInItsPositions(t *testing.T) {
 	quiet, _ := interleaved(t, 4, sqlite.DefaultWindow())
 	positions := positionsOf(t, quiet)
 	if len(positions) < 3 {
-		t.Fatalf("the quiet namespace recorded %d changes, want at least 3", len(positions))
+		t.Fatalf("the quiet volume recorded %d changes, want at least 3", len(positions))
 	}
 	// Without this the whole test would pass against dense positions and prove nothing.
 	gaps := 0
@@ -2065,7 +2065,7 @@ func TestAReplicaResumesAcrossTheGapsInItsPositions(t *testing.T) {
 		}
 	}
 	if gaps == 0 {
-		t.Fatalf("the quiet namespace's positions are %v, every one of them next to the last: the interleaving did not produce the gaps this is about", positions)
+		t.Fatalf("the quiet volume's positions are %v, every one of them next to the last: the interleaving did not produce the gaps this is about", positions)
 	}
 
 	s := serveLog(t, quiet, httprest.DefaultLimits())
@@ -2082,14 +2082,14 @@ func TestAReplicaResumesAcrossTheGapsInItsPositions(t *testing.T) {
 	}
 }
 
-// A replica that has applied nothing resumes from position zero, and a namespace that is not
+// A replica that has applied nothing resumes from position zero, and a volume that is not
 // the first one written in its database has no change at position 1 — so nothing about zero
 // being far below the oldest entry means anything was discarded.
 func TestAReplicaThatHasAppliedNothingResumesFromZero(t *testing.T) {
 	quiet, _ := interleaved(t, 2, sqlite.DefaultWindow())
 	positions := positionsOf(t, quiet)
 	if positions[0] <= 1 {
-		t.Fatalf("the quiet namespace's first change is at position %d; this is about one that does not start at 1", positions[0])
+		t.Fatalf("the quiet volume's first change is at position %d; this is about one that does not start at 1", positions[0])
 	}
 
 	s := serveLog(t, quiet, httprest.DefaultLimits())
@@ -2122,7 +2122,7 @@ func incarnationOf(t *testing.T, log metastore.Log) metastore.Incarnation {
 
 // A replica sitting on the newest position a trim discarded has missed nothing: everything
 // it still needs is on the far side of the cut. Whether the cut and the oldest surviving
-// entry are consecutive integers is a fact about what the other namespaces in the database
+// entry are consecutive integers is a fact about what the other volumes in the database
 // were doing at the time, and says nothing about whether this replica can carry on.
 func TestAReplicaOnTheNewestDiscardedPositionResumes(t *testing.T) {
 	window := sqlite.DefaultWindow()
@@ -2131,7 +2131,7 @@ func TestAReplicaOnTheNewestDiscardedPositionResumes(t *testing.T) {
 
 	retention := retentionOf(t, quiet)
 	if retention.Oldest == 0 {
-		t.Fatal("the quiet namespace's log holds nothing, so there is no cut to resume across")
+		t.Fatal("the quiet volume's log holds nothing, so there is no cut to resume across")
 	}
 	var cut metastore.Position
 	for _, position := range everGiven {
@@ -2288,7 +2288,7 @@ func TestStoppingAServerTellsItsReplicasRatherThanBreakingTheirStreams(t *testin
 
 func mustHandler(t *testing.T, log metastore.Log) *httprest.Handler {
 	t.Helper()
-	backing := namespaceFixture(t)
+	backing := volumeFixture(t)
 	h, err := httprest.NewHandler(backing, log)
 	if err != nil {
 		t.Fatal(err)
@@ -2296,11 +2296,11 @@ func mustHandler(t *testing.T, log metastore.Log) *httprest.Handler {
 	return h
 }
 
-// Stopping is safe to ask for twice, and means nothing to a namespace that has no streams
+// Stopping is safe to ask for twice, and means nothing to a volume that has no streams
 // to end. A server holds one handler for its whole life and Shutdown may be called from
 // anywhere, so neither of these may be a panic.
-func TestStoppingTwiceAndStoppingAnUnreplicableNamespaceAreBothHarmless(t *testing.T) {
-	backing := namespaceFixture(t)
+func TestStoppingTwiceAndStoppingAnUnreplicableVolumeAreBothHarmless(t *testing.T) {
+	backing := volumeFixture(t)
 	h, err := httprest.NewHandler(backing, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -2414,7 +2414,7 @@ func TestStoppingAServerReleasesAPictureBeingDelivered(t *testing.T) {
 	// Far longer than this test, so that nothing but the stop can be what released it.
 	limits.SnapshotDeadline = time.Minute
 
-	backing := namespaceFixture(t)
+	backing := volumeFixture(t)
 	h, err := httprest.NewHandlerWithLimits(backing, log, limits)
 	if err != nil {
 		t.Fatal(err)
@@ -2475,7 +2475,7 @@ func TestAPictureEndedByAShutdownIsNotAnnouncedAsWhole(t *testing.T) {
 	limits := httprest.DefaultLimits()
 	limits.SnapshotDeadline = time.Minute
 
-	backing := namespaceFixture(t)
+	backing := volumeFixture(t)
 	h, err := httprest.NewHandlerWithLimits(backing, log, limits)
 	if err != nil {
 		t.Fatal(err)
@@ -2520,7 +2520,7 @@ func TestAPictureEndedByAShutdownIsNotAnnouncedAsWhole(t *testing.T) {
 func TestAStreamWhoseWritesCannotBeBoundedIsRefused(t *testing.T) {
 	log := newFakeLog()
 	log.record(created("a"))
-	backing := namespaceFixture(t)
+	backing := volumeFixture(t)
 	h, err := httprest.NewHandler(backing, log)
 	if err != nil {
 		t.Fatal(err)

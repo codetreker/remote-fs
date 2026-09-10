@@ -5,7 +5,7 @@ import (
 	"sync"
 )
 
-// keyLocker serializes the staging namespace of exactly one key. Entries are reference
+// keyLocker serializes the staging names of exactly one key. Entries are reference
 // counted, so the map is bounded by the active and waiting operation limits. Unrelated
 // keys never share a lock merely because their hashes happen to collide.
 type keyLocker struct {

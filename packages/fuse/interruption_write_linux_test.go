@@ -30,13 +30,13 @@ import (
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-type signalNamespace struct {
+type signalVolume struct {
 	served storage.FileStorage
 	remote *httprest.Storage
 	writes atomic.Int32
 }
 
-func newSignalNamespace(t *testing.T, allowance int64, files map[string][]byte) *signalNamespace {
+func newSignalVolume(t *testing.T, allowance int64, files map[string][]byte) *signalVolume {
 	t.Helper()
 	meta, backing := memoryfixture.New(t, "signal", allowance, locking.DefaultOptions())
 	for name, body := range files {
@@ -51,7 +51,7 @@ func newSignalNamespace(t *testing.T, allowance int64, files map[string][]byte) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	namespace := &signalNamespace{}
+	volume := &signalVolume{}
 	server := httptest.NewServer(handler)
 	t.Cleanup(func() {
 		handler.Stop()
@@ -62,7 +62,7 @@ func newSignalNamespace(t *testing.T, allowance int64, files map[string][]byte) 
 			t.Errorf("close signal handler: %v", err)
 		}
 	})
-	namespace.remote, err = httprest.Dial(server.URL, server.Client())
+	volume.remote, err = httprest.Dial(server.URL, server.Client())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func newSignalNamespace(t *testing.T, allowance int64, files map[string][]byte) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	served, err := replicated.New(t.Context(), replica, namespace.remote)
+	served, err := replicated.New(t.Context(), replica, volume.remote)
 	if err != nil {
 		replica.Close()
 		t.Fatal(err)
@@ -80,10 +80,10 @@ func newSignalNamespace(t *testing.T, allowance int64, files map[string][]byte) 
 			t.Error(err)
 		}
 	})
-	namespace.served = &signalFileStorage{FileStorage: served, wrap: func(file storage.File) storage.File {
-		return &countedSignalFile{File: file, writes: &namespace.writes}
+	volume.served = &signalFileStorage{FileStorage: served, wrap: func(file storage.File) storage.File {
+		return &countedSignalFile{File: file, writes: &volume.writes}
 	}}
-	return namespace
+	return volume
 }
 
 type signalFileStorage struct {
@@ -176,9 +176,9 @@ func TestSignalDuringClosePreservesOwnerCleanup(t *testing.T) {
 		return
 	}
 	requireFUSE(t)
-	namespace := newSignalNamespace(t, 0, map[string][]byte{"file": []byte("old body")})
+	volume := newSignalVolume(t, 0, map[string][]byte{"file": []byte("old body")})
 	held := &heldCloseCleanup{entered: make(chan context.Context, 1), release: make(chan struct{})}
-	wrapped := &signalFileStorage{FileStorage: namespace.served, wrap: func(file storage.File) storage.File {
+	wrapped := &signalFileStorage{FileStorage: volume.served, wrap: func(file storage.File) storage.File {
 		held.File = file
 		return held
 	}}
@@ -216,10 +216,10 @@ func TestSignalDuringClosePreservesOwnerCleanup(t *testing.T) {
 		}
 		release.Do(func() { close(held.release) })
 	})
-	if got := namespace.writes.Load(); got != 1 {
+	if got := volume.writes.Load(); got != 1 {
 		t.Fatalf("write followed by Close sent %d writes, want exactly one", got)
 	}
-	body, err := namespace.remote.Read(t.Context(), "file")
+	body, err := volume.remote.Read(t.Context(), "file")
 	if err != nil || string(body) != "new body" {
 		t.Fatalf("close cleanup changed completed write contents %q, %v", body, err)
 	}
@@ -258,12 +258,12 @@ func TestSignalDuringWritePreservesTheAuthoritativeQuotaLimit(t *testing.T) {
 	requireFUSE(t)
 	for _, mode := range []string{"quota-raw", "quota-go"} {
 		t.Run(mode, func(t *testing.T) {
-			namespace := newSignalNamespace(t, 64<<10, map[string][]byte{
+			volume := newSignalVolume(t, 64<<10, map[string][]byte{
 				"used": bytes.Repeat([]byte("x"), 32<<10),
 				"file": {},
 			})
 			held := &interruptedFileWrite{entered: make(chan context.Context, 1), returned: make(chan error, 1), release: make(chan struct{})}
-			wrapped := &signalFileStorage{FileStorage: namespace.served, wrap: func(file storage.File) storage.File {
+			wrapped := &signalFileStorage{FileStorage: volume.served, wrap: func(file storage.File) storage.File {
 				held.File = file
 				return held
 			}}
@@ -298,10 +298,10 @@ func TestSignalDuringWritePreservesTheAuthoritativeQuotaLimit(t *testing.T) {
 			if calls := held.calls.Load(); calls != wantCalls {
 				t.Fatalf("retained WriteAt was called %d times, want %d", calls, wantCalls)
 			}
-			if writes := namespace.writes.Load(); writes != wantCalls-1 {
+			if writes := volume.writes.Load(); writes != wantCalls-1 {
 				t.Fatalf("the interrupted write sent %d authority requests, want %d", writes, wantCalls-1)
 			}
-			body, err := namespace.remote.Read(t.Context(), "file")
+			body, err := volume.remote.Read(t.Context(), "file")
 			if err != nil || len(body) != 0 {
 				t.Fatalf("the rejected write saved %d bytes: %v", len(body), err)
 			}

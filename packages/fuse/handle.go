@@ -11,7 +11,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// A handle retains one object across namespace changes. No contents or pathname are
+// A handle retains one object across volume changes. No contents or pathname are
 // retained here; every operation observes the authoritative object state.
 type handle struct {
 	node     *node
@@ -35,7 +35,7 @@ func newHandle(n *node, file storage.File, readable, writable bool) *handle {
 }
 
 func (h *handle) check() error {
-	if err := h.node.ns.check(); err != nil {
+	if err := h.node.volume.check(); err != nil {
 		return err
 	}
 	h.closeMu.Lock()
@@ -78,7 +78,7 @@ func (h *handle) Read(ctx context.Context, dest []byte, off int64) (gofuse.ReadR
 	if err := h.node.checkAttr(read.Attr); err != nil {
 		return nil, errnoOf(err)
 	}
-	if !h.node.ns.holds(read.Attr.Size) {
+	if !h.node.volume.holds(read.Attr.Size) {
 		return nil, syscall.EFBIG
 	}
 	if len(read.Data) > len(dest) || int64(len(read.Data)) > max(read.Attr.Size-off, 0) {
@@ -101,14 +101,14 @@ func (h *handle) Write(ctx context.Context, data []byte, off int64) (uint32, sys
 		return 0, syscall.EINVAL
 	}
 	// Subtraction avoids overflowing a caller-controlled offset near MaxInt64.
-	if off > h.node.ns.maxFileSize-int64(len(data)) {
+	if off > h.node.volume.maxFileSize-int64(len(data)) {
 		return 0, syscall.EFBIG
 	}
 	current, err := h.stat(ctx)
 	if err != nil {
 		return 0, errnoOf(err)
 	}
-	if !h.node.ns.holds(current.Size) {
+	if !h.node.volume.holds(current.Size) {
 		return 0, syscall.EFBIG
 	}
 	attr, err := h.file.WriteAt(ctx, off, data)
@@ -131,7 +131,7 @@ func (h *handle) resize(ctx context.Context, size int64) error {
 	if size < 0 {
 		return syscall.EINVAL
 	}
-	if !h.node.ns.holds(size) {
+	if !h.node.volume.holds(size) {
 		return syscall.EFBIG
 	}
 	if size != 0 {
@@ -139,7 +139,7 @@ func (h *handle) resize(ctx context.Context, size int64) error {
 		if err != nil {
 			return err
 		}
-		if !h.node.ns.holds(current.Size) {
+		if !h.node.volume.holds(current.Size) {
 			return syscall.EFBIG
 		}
 	}
@@ -166,14 +166,14 @@ func (h *handle) setAttr(ctx context.Context, change storage.AttrChange) (storag
 
 func (h *handle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 	if err := h.check(); err != nil {
-		if logger := h.node.ns.logger; logger != nil {
+		if logger := h.node.volume.logger; logger != nil {
 			logger.Printf("sync node %d (handle): %v; request context: %v", h.node.id.node, err, ctx.Err())
 		}
 		return errnoOf(err)
 	}
 	err := h.file.Sync(ctx)
 	if err != nil {
-		if logger := h.node.ns.logger; logger != nil {
+		if logger := h.node.volume.logger; logger != nil {
 			logger.Printf("sync node %d (file): %v; request context: %v", h.node.id.node, err, ctx.Err())
 		}
 	}
@@ -199,7 +199,7 @@ func (h *handle) closeFile(ctx context.Context) error {
 	h.closeDone = make(chan struct{})
 	h.closeMu.Unlock()
 
-	err := h.node.ns.closeError(h.file.Close(ctx))
+	err := h.node.volume.closeError(h.file.Close(ctx))
 	h.closeMu.Lock()
 	h.closeErr = err
 	close(h.closeDone)

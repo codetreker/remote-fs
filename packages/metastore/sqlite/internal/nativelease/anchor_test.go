@@ -29,7 +29,7 @@ func leaseAnchorFixture(t *testing.T) Config {
 	}
 	t.Cleanup(func() { _ = unix.Close(fd) })
 	return Config{
-		Directory: root, Name: ".leases", Identity: "workspace/objects",
+		Directory: root, Name: ".leases", Identity: "volume/objects",
 		BindingFD: fd, RecoveryStart: time.Now(), Initialize: true,
 	}
 }
@@ -122,7 +122,7 @@ func TestLeaseAnchorRefusesLostOrForeignEvidence(t *testing.T) {
 					t.Fatal(err)
 				}
 			case "identity":
-				config.Identity = "another-workspace"
+				config.Identity = "another-volume"
 			case "state-slot":
 				config.Name = ".other-leases"
 			case "state-location":

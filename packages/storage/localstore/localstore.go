@@ -1,4 +1,4 @@
-// Package localstore holds a durable object-store namespace entirely under one local
+// Package localstore holds a durable object-store volume entirely under one local
 // directory. File contents are immutable local-disk objects and filesystem metadata is a
 // SQLite database bound to that object store's durable identity.
 package localstore
@@ -29,8 +29,8 @@ import (
 const (
 	metastoreFilename = "metastore.sqlite"
 
-	// MaxWorkspaceBytes is the largest workspace name the durable root binding can hold.
-	MaxWorkspaceBytes = 1024
+	// MaxVolumeBytes is the largest volume name the durable root binding can hold.
+	MaxVolumeBytes = 1024
 )
 
 var metastoreAuxiliaryFilenames = [...]string{
@@ -39,18 +39,18 @@ var metastoreAuxiliaryFilenames = [...]string{
 	metastoreFilename + "-wal",
 }
 
-// Config describes one workspace held beneath Root.
+// Config describes one volume held beneath Root.
 //
 // Root must already exist as a private directory. Every ancestor of its pathname remains
 // protected from replacement for the Store's lifetime; administrative processes and other
 // processes running as the serving user are part of the deployment trust boundary. The
 // object store owns its format and lifetime lock, while this package fixes the metadata
-// database at metastore.sqlite inside it. Completion binds Root to Workspace permanently;
-// a different workspace name is a different store root, not another namespace in this one.
+// database at metastore.sqlite inside it. Completion binds Root to Volume permanently;
+// a different volume name is a different store root, not another volume in this one.
 //
 // ObjectLimits bounds reserved, unresolved, and garbage object records before new uploads are
 // admitted.
-// MaxReaderConnections bounds SQLite's ordinary namespace and log reads; zero uses
+// MaxReaderConnections bounds SQLite's ordinary volume and log reads; zero uses
 // sqlite.DefaultMaxReaderConnections.
 // MaxSnapshotReaderConnections bounds SQLite connections held by long-lived snapshots; zero
 // uses sqlite.DefaultMaxSnapshotReaderConnections.
@@ -66,7 +66,7 @@ var metastoreAuxiliaryFilenames = [...]string{
 // lease binding or completion of its matching intent; missing active evidence fails closed.
 type Config struct {
 	Root                         string
-	Workspace                    string
+	Volume                       string
 	Quota                        int64
 	Window                       sqlite.Window
 	ObjectLimits                 sqlite.ObjectLimits
@@ -85,7 +85,7 @@ type Config struct {
 
 // Status is an operational view collected from every durable part of a Store.
 type Status struct {
-	Workspace                    string
+	Volume                       string
 	Space                        storage.Space
 	Objects                      sqlite.ObjectStatus
 	ObjectLimits                 sqlite.ObjectLimits
@@ -107,9 +107,9 @@ type CheckpointStatus struct {
 	LastError              error
 }
 
-// Store is one workspace backed by a local object store and its bound SQLite metadata.
+// Store is one volume backed by a local object store and its bound SQLite metadata.
 type Store struct {
-	namespace                    *objectstore.Storage
+	volume                       *objectstore.Storage
 	meta                         *sqlite.Store
 	durable                      *durableMetastore
 	objects                      *localdisk.Objects
@@ -119,10 +119,10 @@ type Store struct {
 	maxSnapshotReaderConnections int
 	maxIntegrityRecords          int64
 	maxIntegrityBytes            int64
-	workspace                    string
+	volumeName                   string
 	closeMu                      sync.Mutex
 	closeRunning                 *closeAttempt
-	namespaceCloseAttempted      bool
+	volumeCloseAttempted         bool
 	closed                       bool
 	lastCloseErr                 error
 }
@@ -139,7 +139,7 @@ func Open(ctx context.Context, config Config) (*Store, error) {
 
 type openHooks struct {
 	afterDurableMetastore func(*durableMetastore) error
-	afterNamespace        func(*objectstore.Storage, *durableMetastore) error
+	afterVolume           func(*objectstore.Storage, *durableMetastore) error
 	openDurable           func() (*sqlite.Store, error)
 	retainsOwnership      func(error) bool
 }
@@ -179,7 +179,7 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 	}
 	storeID := objects.ID()
 	initialization := objects.CompositeInitializationState()
-	complete, err := anchor.Completed(storeID, config.Workspace)
+	complete, err := anchor.Completed(storeID, config.Volume)
 	if err != nil {
 		return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
 	}
@@ -197,7 +197,7 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 			anchor.Close(),
 		)
 	}
-	intent, err := anchor.InspectInitializationIntent(storeID, config.Workspace, complete)
+	intent, err := anchor.InspectInitializationIntent(storeID, config.Volume, complete)
 	if err != nil {
 		return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
 	}
@@ -215,7 +215,7 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 	if err != nil {
 		return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
 	}
-	witness, witnessExists, witnessStageExists, err := anchor.InspectMetastoreWitness(storeID, config.Workspace)
+	witness, witnessExists, witnessStageExists, err := anchor.InspectMetastoreWitness(storeID, config.Volume)
 	if err != nil {
 		return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
 	}
@@ -254,7 +254,7 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 	if !complete && intent == initializationIntentPristine {
 		if err := anchor.BindInitialization(
 			storeID,
-			config.Workspace,
+			config.Volume,
 			metastoreRoot.State != metastoreMissing,
 		); err != nil {
 			return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
@@ -262,7 +262,7 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 	}
 	if complete && metastoreRoot.State != metastoreInitialized {
 		return nil, errors.Join(
-			fmt.Errorf("the completed local store does not have an initialized %s and cannot prove its namespace metadata: %w",
+			fmt.Errorf("the completed local store does not have an initialized %s and cannot prove its volume metadata: %w",
 				metastoreFilename, syscall.EIO),
 			closeFailure("local object store", objects.Close()),
 			anchor.Close(),
@@ -270,7 +270,7 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 	}
 	databasePath := filepath.Join(root, metastoreFilename)
 	if metastoreRoot.State == metastoreInitialized {
-		if err := requireBoundDatabase(ctx, databasePath, storeID.String(), config.Workspace); err != nil {
+		if err := requireBoundDatabase(ctx, databasePath, storeID.String(), config.Volume); err != nil {
 			return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
 		}
 	} else if metastoreRoot.State == metastoreMissing {
@@ -278,9 +278,9 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 			return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
 		}
 	}
-	openMode := sqlite.CreateNamespaceIfMissing
+	openMode := sqlite.CreateVolumeIfMissing
 	if metastoreRoot.State == metastoreInitialized {
-		openMode = sqlite.RequireExistingNamespace
+		openMode = sqlite.RequireExistingVolume
 	}
 
 	openDurable := hooks.openDurable
@@ -293,7 +293,7 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 			return opener(
 				ctx,
 				databasePath,
-				config.Workspace,
+				config.Volume,
 				storeID.String(),
 				config.Quota,
 				sqliteOptions,
@@ -317,7 +317,7 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 	durableMeta := newDurableMetastore(meta, witness)
 	if config.Locks != nil {
 		leaseAnchor, err := sqlite.OpenLeaseAnchor(sqlite.LeaseAnchorConfig{
-			Directory: root, Name: ".leases", Identity: storeID.String() + ":" + config.Workspace,
+			Directory: root, Name: ".leases", Identity: storeID.String() + ":" + config.Volume,
 			BindingFD: anchor.fd, RecoveryStart: recoveryStart, Initialize: config.InitializeLocks,
 		})
 		if err != nil {
@@ -361,34 +361,34 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 			cleanupDurableOpen(durableMeta, objects, anchor),
 		)
 	}
-	if err := requireBoundDatabase(ctx, databasePath, storeID.String(), config.Workspace); err != nil {
+	if err := requireBoundDatabase(ctx, databasePath, storeID.String(), config.Volume); err != nil {
 		return nil, errors.Join(err, cleanupDurableOpen(durableMeta, objects, anchor))
 	}
 
 	heldObjects := &durabilityHeldObjects{Objects: objects, durable: durableMeta}
-	namespace, err := objectstore.NewWithOptions(heldObjects, durableMeta, config.Maintenance)
+	volume, err := objectstore.NewWithOptions(heldObjects, durableMeta, config.Maintenance)
 	if err != nil {
 		return nil, errors.Join(err, cleanupDurableOpen(durableMeta, objects, anchor))
 	}
-	if hooks.afterNamespace != nil {
-		if err := hooks.afterNamespace(namespace, durableMeta); err != nil {
-			return nil, errors.Join(err, cleanupNamespaceOpen(namespace, durableMeta, objects, anchor))
+	if hooks.afterVolume != nil {
+		if err := hooks.afterVolume(volume, durableMeta); err != nil {
+			return nil, errors.Join(err, cleanupVolumeOpen(volume, durableMeta, objects, anchor))
 		}
 	}
 	if !complete {
-		if err := anchor.PublishCompletion(storeID, config.Workspace); err != nil {
-			return nil, errors.Join(err, cleanupNamespaceOpen(namespace, durableMeta, objects, anchor))
+		if err := anchor.PublishCompletion(storeID, config.Volume); err != nil {
+			return nil, errors.Join(err, cleanupVolumeOpen(volume, durableMeta, objects, anchor))
 		}
 	}
 	if err := anchor.RemoveInitializationIntent(); err != nil {
-		return nil, errors.Join(err, cleanupNamespaceOpen(namespace, durableMeta, objects, anchor))
+		return nil, errors.Join(err, cleanupVolumeOpen(volume, durableMeta, objects, anchor))
 	}
 	if err := verifyAnchoredRoot(objects, anchor); err != nil {
-		return nil, errors.Join(err, cleanupNamespaceOpen(namespace, durableMeta, objects, anchor))
+		return nil, errors.Join(err, cleanupVolumeOpen(volume, durableMeta, objects, anchor))
 	}
 	return &Store{
-		namespace: namespace, meta: meta, durable: durableMeta, objects: objects, anchor: anchor,
-		workspace: config.Workspace, objectLimits: sqliteOptions.ObjectLimits,
+		volume: volume, meta: meta, durable: durableMeta, objects: objects, anchor: anchor,
+		volumeName: config.Volume, objectLimits: sqliteOptions.ObjectLimits,
 		maxReaderConnections:         sqliteOptions.MaxReaderConnections,
 		maxSnapshotReaderConnections: sqliteOptions.MaxSnapshotReaderConnections,
 		maxIntegrityRecords:          sqliteOptions.MaxIntegrityRecords,
@@ -421,12 +421,12 @@ func validate(config Config) (string, error) {
 	if config.Root == "" {
 		return "", fmt.Errorf("a local store needs a root directory: %w", syscall.EINVAL)
 	}
-	if config.Workspace == "" {
-		return "", fmt.Errorf("a local store needs a workspace name: %w", syscall.EINVAL)
+	if config.Volume == "" {
+		return "", fmt.Errorf("a local store needs a volume name: %w", syscall.EINVAL)
 	}
-	if len(config.Workspace) > MaxWorkspaceBytes {
-		return "", fmt.Errorf("the local store workspace name is %d bytes; the largest is %d: %w",
-			len(config.Workspace), MaxWorkspaceBytes, syscall.ENAMETOOLONG)
+	if len(config.Volume) > MaxVolumeBytes {
+		return "", fmt.Errorf("the local store volume name is %d bytes; the largest is %d: %w",
+			len(config.Volume), MaxVolumeBytes, syscall.ENAMETOOLONG)
 	}
 	if config.Quota < limited.MinLimit {
 		return "", fmt.Errorf("a local store quota of %d bytes is below the minimum of %d: %w",
@@ -478,7 +478,7 @@ func validate(config Config) (string, error) {
 	return root, nil
 }
 
-func requireBoundDatabase(ctx context.Context, path, storeID, workspace string) (returned error) {
+func requireBoundDatabase(ctx context.Context, path, storeID, volumeName string) (returned error) {
 	database, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
 	if err != nil {
 		return fmt.Errorf("open the existing local store binding: %v: %w", err, syscall.EIO)
@@ -539,42 +539,42 @@ func requireBoundDatabase(ctx context.Context, path, storeID, workspace string) 
 		SELECT typeof(id),
 		       CASE WHEN typeof(id) = 'integer' THEN id ELSE 0 END,
 		       typeof(name), length(CAST(name AS BLOB))
-		FROM namespaces
+		FROM volumes
 		LIMIT 2`)
 	if err != nil {
-		return fmt.Errorf("read the existing local store workspace metadata: %v: %w", err, syscall.EIO)
+		return fmt.Errorf("read the existing local store volume metadata: %v: %w", err, syscall.EIO)
 	}
-	type workspaceMetadata struct {
+	type volumeMetadata struct {
 		idClass   string
 		id        int64
 		nameClass string
 		nameBytes int64
 	}
-	var workspaces []workspaceMetadata
+	var volumes []volumeMetadata
 	for rows.Next() {
-		var candidate workspaceMetadata
+		var candidate volumeMetadata
 		if err := rows.Scan(&candidate.idClass, &candidate.id, &candidate.nameClass, &candidate.nameBytes); err != nil {
 			rows.Close()
-			return fmt.Errorf("decode the existing local store workspace metadata: %v: %w", err, syscall.EIO)
+			return fmt.Errorf("decode the existing local store volume metadata: %v: %w", err, syscall.EIO)
 		}
-		workspaces = append(workspaces, candidate)
+		volumes = append(volumes, candidate)
 	}
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-		return fmt.Errorf("finish the existing local store workspace metadata: %v: %w", err, syscall.EIO)
+		return fmt.Errorf("finish the existing local store volume metadata: %v: %w", err, syscall.EIO)
 	}
-	if len(workspaces) != 1 || workspaces[0].idClass != "integer" || workspaces[0].id < 1 ||
-		workspaces[0].nameClass != "text" || workspaces[0].nameBytes < 1 ||
-		workspaces[0].nameBytes > MaxWorkspaceBytes || workspaces[0].nameBytes != int64(len(workspace)) {
-		return fmt.Errorf("the local store database does not hold exactly workspace %q: %w",
-			workspace, syscall.EIO)
+	if len(volumes) != 1 || volumes[0].idClass != "integer" || volumes[0].id < 1 ||
+		volumes[0].nameClass != "text" || volumes[0].nameBytes < 1 ||
+		volumes[0].nameBytes > MaxVolumeBytes || volumes[0].nameBytes != int64(len(volumeName)) {
+		return fmt.Errorf("the local store database does not hold exactly volume %q: %w",
+			volumeName, syscall.EIO)
 	}
 	var name string
-	if err := tx.QueryRowContext(ctx, `SELECT name FROM namespaces WHERE id = ?`, workspaces[0].id).Scan(&name); err != nil {
-		return fmt.Errorf("read the existing local store workspace: %v: %w", err, syscall.EIO)
+	if err := tx.QueryRowContext(ctx, `SELECT name FROM volumes WHERE id = ?`, volumes[0].id).Scan(&name); err != nil {
+		return fmt.Errorf("read the existing local store volume: %v: %w", err, syscall.EIO)
 	}
-	if name != workspace {
-		return fmt.Errorf("the local store database binds workspace %q, not %q: %w",
-			name, workspace, syscall.EIO)
+	if name != volumeName {
+		return fmt.Errorf("the local store database binds volume %q, not %q: %w",
+			name, volumeName, syscall.EIO)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("finish the existing local store binding probe: %v: %w", err, syscall.EIO)
@@ -629,41 +629,41 @@ func cleanupDurableOpen(
 	)
 }
 
-func cleanupNamespaceOpen(
-	namespace *objectstore.Storage,
+func cleanupVolumeOpen(
+	volume *objectstore.Storage,
 	durable *durableMetastore,
 	objects *localdisk.Objects,
 	anchor *rootAnchor,
 ) error {
-	namespaceErr := namespace.Close()
+	volumeErr := volume.Close()
 	if !durable.terminallyClosed() {
-		namespaceErr = errors.Join(namespaceErr, durable.abortUnexposed())
+		volumeErr = errors.Join(volumeErr, durable.abortUnexposed())
 	}
 	if !durable.closedSuccessfully() {
-		return closeFailure("namespace", namespaceErr)
+		return closeFailure("volume", volumeErr)
 	}
 	return errors.Join(
-		closeFailure("namespace", namespaceErr),
+		closeFailure("volume", volumeErr),
 		closeFailure("local object store", objects.Close()),
 		anchor.Close(),
 	)
 }
 
 func (s *Store) Stat(ctx context.Context, path string) (storage.Attr, error) {
-	return s.namespace.Stat(ctx, path)
+	return s.volume.Stat(ctx, path)
 }
 
 func (s *Store) SetAttr(ctx context.Context, path string, change storage.AttrChange) error {
-	return s.namespace.SetAttr(ctx, path, change)
+	return s.volume.SetAttr(ctx, path, change)
 }
 
-func (s *Store) CheckBounded() error { return s.namespace.CheckBounded() }
+func (s *Store) CheckBounded() error { return s.volume.CheckBounded() }
 
 // CheckPublicationAccounting reports native quota settlement at the publication boundary.
-func (s *Store) CheckPublicationAccounting() error { return s.namespace.CheckPublicationAccounting() }
+func (s *Store) CheckPublicationAccounting() error { return s.volume.CheckPublicationAccounting() }
 
 func (s *Store) List(ctx context.Context, path string) ([]storage.Entry, error) {
-	return s.namespace.List(ctx, path)
+	return s.volume.List(ctx, path)
 }
 
 func (s *Store) ListBounded(ctx context.Context, path string, result *storage.ListResult) (returned error) {
@@ -674,53 +674,53 @@ func (s *Store) ListBounded(ctx context.Context, path string, result *storage.Li
 			}
 		}()
 	}
-	return s.namespace.ListBounded(ctx, path, result)
+	return s.volume.ListBounded(ctx, path, result)
 }
 
 func (s *Store) Read(ctx context.Context, path string) ([]byte, error) {
-	return s.namespace.Read(ctx, path)
+	return s.volume.Read(ctx, path)
 }
 
 func (s *Store) ReadBounded(ctx context.Context, path string, maxBytes int64) ([]byte, error) {
-	return s.namespace.ReadBounded(ctx, path, maxBytes)
+	return s.volume.ReadBounded(ctx, path, maxBytes)
 }
 
 func (s *Store) Write(ctx context.Context, path string, content []byte) error {
-	return s.namespace.Write(ctx, path, content)
+	return s.volume.Write(ctx, path, content)
 }
 
 func (s *Store) Create(ctx context.Context, path string) error {
-	return s.namespace.Create(ctx, path)
+	return s.volume.Create(ctx, path)
 }
 
 func (s *Store) Mkdir(ctx context.Context, path string) error {
-	return s.namespace.Mkdir(ctx, path)
+	return s.volume.Mkdir(ctx, path)
 }
 
 func (s *Store) Remove(ctx context.Context, path string) error {
-	return s.namespace.Remove(ctx, path)
+	return s.volume.Remove(ctx, path)
 }
 
 func (s *Store) RemoveDir(ctx context.Context, path string) error {
-	return s.namespace.RemoveDir(ctx, path)
+	return s.volume.RemoveDir(ctx, path)
 }
 
 func (s *Store) Rename(ctx context.Context, from, to string) error {
-	return s.namespace.Rename(ctx, from, to)
+	return s.volume.Rename(ctx, from, to)
 }
 
 func (s *Store) Space(ctx context.Context) (storage.Space, error) {
-	return s.namespace.Space(ctx)
+	return s.volume.Space(ctx)
 }
 
 // Sweep removes at most limit unreferenced objects.
 func (s *Store) Sweep(ctx context.Context, limit int) (int, error) {
-	return s.namespace.Sweep(ctx, limit)
+	return s.volume.Sweep(ctx, limit)
 }
 
 // MaintenanceStatus returns the most recent sweep outcome.
 func (s *Store) MaintenanceStatus() objectstore.MaintenanceStatus {
-	return s.namespace.MaintenanceStatus()
+	return s.volume.MaintenanceStatus()
 }
 
 // Close stops maintenance, closes SQLite before releasing the local-disk lifetime lock,
@@ -742,7 +742,7 @@ func (s *Store) Close() error {
 	s.closeRunning = attempt
 	s.closeMu.Unlock()
 
-	if err := s.namespace.CloseFileSessions(); err != nil {
+	if err := s.volume.CloseFileSessions(); err != nil {
 		s.closeMu.Lock()
 		s.lastCloseErr = err
 		attempt.err = err
@@ -752,13 +752,13 @@ func (s *Store) Close() error {
 		return err
 	}
 	s.closeMu.Lock()
-	firstAttempt := !s.namespaceCloseAttempted
-	s.namespaceCloseAttempted = true
+	firstAttempt := !s.volumeCloseAttempted
+	s.volumeCloseAttempted = true
 	s.closeMu.Unlock()
 
 	err := error(nil)
 	if firstAttempt {
-		err = s.namespace.Close()
+		err = s.volume.Close()
 	} else {
 		err = s.durable.Close()
 	}
@@ -782,10 +782,10 @@ func (s *Store) Close() error {
 	return err
 }
 
-// Log returns the durable change log written in the same transaction as namespace edits.
+// Log returns the durable change log written in the same transaction as volume edits.
 func (s *Store) Log() metastore.Log { return s.meta }
 
-// LockService returns the authority paired with this namespace when Locks was configured.
+// LockService returns the authority paired with this volume when Locks was configured.
 func (s *Store) LockService() locking.Service { return s.meta.LockService() }
 
 // Status queries every component even when one fails, then returns all failures together.
@@ -801,7 +801,7 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 	objects, objectsErr := s.meta.ObjectStatus(ctx)
 	checkpoint := s.durable.status()
 	return Status{
-			Workspace:                    s.workspace,
+			Volume:                       s.volumeName,
 			Space:                        space,
 			Objects:                      objects,
 			ObjectLimits:                 s.objectLimits,

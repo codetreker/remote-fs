@@ -1,4 +1,4 @@
-// Package objectstore holds a namespace in an object store: the bytes of every file live
+// Package objectstore holds a volume in an object store: the bytes of every file live
 // under an opaque key in a container of blobs, and the tree that gives those bytes names —
 // with the permissions, the times, and the shape of the directories — lives in a metastore.
 //
@@ -21,7 +21,7 @@
 //
 // A crash between the put and the commit leaves an object nothing references. That costs
 // storage until it is swept and it costs nothing else: no name points at it, so nothing can
-// read it, and the namespace is exactly what it was before the write started.
+// read it, and the volume is exactly what it was before the write started.
 package objectstore
 
 import "context"
@@ -54,7 +54,7 @@ type Objects interface {
 	Delete(ctx context.Context, key string) error
 
 	// Available reports how many more bytes the storage beneath this container currently
-	// offers, independently of any workspace allowance. A store that has no finite physical
+	// offers, independently of any volume allowance. A store that has no finite physical
 	// capacity it can measure answers syscall.ENOSYS; that is a standing property of the
 	// implementation, not a transient measurement failure. Every other error is a failure to
 	// determine whether bytes fit and must be preserved as such by callers.

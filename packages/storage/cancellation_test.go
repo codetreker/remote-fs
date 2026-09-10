@@ -21,7 +21,7 @@ func (e classifiedFailure) Unwrap() []error       { return e.causes }
 func (e classifiedFailure) Classification() error { return e.classification }
 
 func TestErrorClassificationPreservesFailureProvenance(t *testing.T) {
-	fault := errors.New("namespace unavailable")
+	fault := errors.New("volume unavailable")
 	unknown := classifiedFailure{classification: syscall.EIO, causes: []error{context.Canceled}}
 	mapped := classifiedFailure{classification: syscall.ENOENT, causes: []error{fault, syscall.ENOENT}}
 	interrupted := classifiedFailure{classification: syscall.EINTR, causes: []error{context.Canceled, fault}}
@@ -44,7 +44,7 @@ func TestErrorClassificationPreservesFailureProvenance(t *testing.T) {
 		{"classified interruption", interrupted, syscall.EINTR},
 		{"missing classification", classifiedFailure{causes: []error{syscall.ENOENT}}, syscall.EIO},
 		{"same joined errno", errors.Join(syscall.ENOENT, syscall.ENOENT), syscall.ENOENT},
-		{"conflicting namespace facts", errors.Join(syscall.ENOENT, syscall.EEXIST), syscall.EIO},
+		{"conflicting volume facts", errors.Join(syscall.ENOENT, syscall.EEXIST), syscall.EIO},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := storage.ErrnoOf(test.err); got != test.want {

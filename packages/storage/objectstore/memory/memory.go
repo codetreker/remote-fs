@@ -1,5 +1,5 @@
 // Package memory implements objectstore.Objects in the process's own heap, so that a
-// metastore-backed namespace can be assembled and tested without a blob service.
+// metastore-backed volume can be assembled and tested without a blob service.
 //
 // The layers above the object store — the tree, the change log, replication, the mount —
 // are not testing blob storage when they run. Making each of them stand up a container to
@@ -8,7 +8,7 @@
 //
 // It holds every object it is given for as long as it is alive: no bound, no way to
 // configure one, no eviction, and nothing that outlives the process. That is why it is not
-// something to serve a namespace from — R-INT-3 requires a configurable ceiling on
+// something to serve a volume from — R-INT-3 requires a configurable ceiling on
 // anything that accumulates, and there is none here.
 //
 // It is not a way to run azblob's tests without a blob endpoint, and nothing here should be

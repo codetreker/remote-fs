@@ -1,9 +1,9 @@
-// Package replicated answers what a namespace's tree looks like from a copy held here, and
-// sends everything else to the server that holds the namespace itself.
+// Package replicated answers what a volume's tree looks like from a copy held here, and
+// sends everything else to the server that holds the volume itself.
 //
 // A mount that keeps nothing locally turns every kernel call into a request. That is one
 // round trip per stat, per lookup, and per name a path search asks about and does not find —
-// and a toolchain asks about far more names than exist, so a workspace on a 20 ms link
+// and a toolchain asks about far more names than exist, so a volume on a 20 ms link
 // spends its time almost entirely on being told that files are not there. The copy here is
 // what makes those answers local: a stat becomes a query against a SQLite database in the
 // same process, microseconds rather than milliseconds.
@@ -20,7 +20,7 @@
 // So this is not a cache. Nothing here expires, nothing is revalidated, and no operation
 // checks whether what it holds is still current: either the stream is alive, in which case
 // everything here is what the server had as of a position it can name, or the stream is not,
-// in which case every namespace operation fails with EIO (R-ERR-1, R-ERR-2). A copy that answered from
+// in which case every volume operation fails with EIO (R-ERR-1, R-ERR-2). A copy that answered from
 // a broken stream would report "no such file" for files that are there and an empty listing
 // for directories that are not, which is the answer that makes whatever runs on top delete,
 // regenerate and overwrite.
@@ -28,7 +28,7 @@
 // # What is answered from where
 //
 // Path-based Stat and List are answered here. Everything else — the bytes of a file, every change to
-// the namespace, and how much room it has — goes to the server, because none of it is
+// the volume, and how much room it has — goes to the server, because none of it is
 // metadata this copy holds and none of it is a question a copy may answer.
 // Retained file and node-identity queries also go to the authority: detached objects have
 // no entry in this tree. Their mutations confirm the authority's returned log position,
@@ -57,10 +57,10 @@ import (
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-// Storage is one namespace: a copy of its tree, and the server that holds it.
+// Storage is one volume: a copy of its tree, and the server that holds it.
 //
 // It takes the transport's own client rather than a storage.Storage, because the two halves
-// it needs are one namespace. Reads and writes travel over the storage contract, and the
+// it needs are one volume. Reads and writes travel over the storage contract, and the
 // stream and the picture the copy is built from are that transport's own operations; a
 // second transport (R-INT-9 asks for two more) is when an interface between them earns
 // itself, and building one now would be an abstraction with a single implementation.
@@ -120,7 +120,7 @@ type Storage struct {
 var _ storage.Storage = (*Storage)(nil)
 var _ storage.BoundedStorage = (*Storage)(nil)
 
-// New builds a copy of the namespace at remote in local, and returns once it is usable.
+// New builds a copy of the volume at remote in local, and returns once it is usable.
 //
 // It blocks. There is no pass-through mode here and no degraded one: until the copy has been
 // filled there is nothing to answer from, and a mount that answered anyway would be
@@ -131,7 +131,7 @@ var _ storage.BoundedStorage = (*Storage)(nil)
 // — take the picture, then subscribe from the position it was taken at — does not converge:
 // the scan takes time, changes accumulate while it runs, and once enough of them accumulate
 // to push that position out of the server's retention window the copy has to be built again,
-// at a cost proportional to the size of the tree. The larger the namespace, the less likely
+// at a cost proportional to the size of the tree. The larger the volume, the less likely
 // it is ever to finish, which is the worst direction that coupling can run in. Subscribing
 // first takes the window off this path entirely: the stream is already attached at a
 // position no later than the picture's, so however long the picture takes, nothing that
@@ -168,7 +168,7 @@ func NewWithOptions(ctx context.Context, local *sqlite.Replica, remote *httprest
 		notify:               make(chan struct{}),
 		confirmationCapacity: make(chan struct{}),
 		options:              options,
-		failure:              errors.New("the copy of this namespace has not been built yet"),
+		failure:              errors.New("the copy of this volume has not been built yet"),
 	}
 
 	sub, err := s.build(ctx)
@@ -180,7 +180,7 @@ func NewWithOptions(ctx context.Context, local *sqlite.Replica, remote *httprest
 	return s, nil
 }
 
-// Close stops following the namespace, closes owned file sessions, and releases
+// Close stops following the volume, closes owned file sessions, and releases
 // the copy. The remote client's lifetime remains owned by its caller.
 func (s *Storage) Close() error {
 	s.closeMu.Lock()
@@ -267,8 +267,8 @@ func (s *Storage) ReadBounded(ctx context.Context, path string, maxBytes int64) 
 	return s.remote.ReadBounded(ctx, path, maxBytes)
 }
 
-// Space reports the room the namespace has, from the server. A namespace's allowance and
-// what is taken of it are facts about the namespace rather than about its tree, and nothing
+// Space reports the room the volume has, from the server. A volume's allowance and
+// what is taken of it are facts about the volume rather than about its tree, and nothing
 // in the change log carries them.
 func (s *Storage) Space(ctx context.Context) (storage.Space, error) {
 	if err := s.usable("space", ""); err != nil {
@@ -277,7 +277,7 @@ func (s *Storage) Space(ctx context.Context) (storage.Space, error) {
 	return s.remote.Space(ctx)
 }
 
-// --- changing the namespace --------------------------------------------------------------
+// --- changing the volume --------------------------------------------------------------
 
 // The mutations. Each is performed by the server and returns only once the copy has applied
 // through the atomic log barrier returned with the successful response.

@@ -1,4 +1,4 @@
-// Command remote-fs mounts a server's namespace at a local directory.
+// Command remote-fs mounts a server's volume at a local directory.
 //
 // It parses a command line, wires two packages together, reports failures, and detaches
 // the mountpoint when asked. Everything a user of the mountpoint experiences belongs to
@@ -56,8 +56,8 @@ var errUsage = errors.New("the command line was rejected")
 func run(args []string, errOut io.Writer) error {
 	flags := flag.NewFlagSet("remote-fs", flag.ContinueOnError)
 	flags.SetOutput(errOut)
-	serverURL := flags.String("server", "", "base URL of the server holding the namespace, as http://host:port")
-	mountpoint := flags.String("mountpoint", "", "existing directory to present the namespace at")
+	serverURL := flags.String("server", "", "base URL of the server holding the volume, as http://host:port")
+	mountpoint := flags.String("mountpoint", "", "existing directory to present the volume at")
 	// The transport refuses to invent a timeout because it cannot know how long the
 	// caller is willing to wait. Deciding that is this program's job, and the decision has
 	// to be a number: with no timeout anywhere, an operation against a server that has
@@ -70,11 +70,11 @@ func run(args []string, errOut io.Writer) error {
 	fileSession := storage.DefaultFileSessionOptions()
 	fileLease := flags.Duration("file-session-lease", fileSession.Lease, "renewable lifetime requested for this mount's open files and advisory locks")
 	fileHistory := flags.Duration("file-session-history", fileSession.History, "action history interval requested for file and advisory-lock reconciliation")
-	replicaDir := flags.String("replica-dir", "", "directory to keep the local copy of the namespace's metadata under.\n"+
+	replicaDir := flags.String("replica-dir", "", "directory to keep the local copy of the volume's metadata under.\n"+
 		"A directory of its own is made inside it, readable only by this user, and\n"+
 		"removed when the mountpoint is detached. The default is the system\n"+
 		"temporary directory, which on many systems is held in memory — give a path\n"+
-		"on disk for a workspace whose tree is large.")
+		"on disk for a volume whose tree is large.")
 	confirmationDefaults := replicated.DefaultOptions()
 	confirmationGrace := flags.Duration("confirmation-grace", confirmationDefaults.ConfirmationGrace,
 		"maximum time a successful mutation waits for its replication barrier before failing with EIO")
@@ -89,14 +89,14 @@ func run(args []string, errOut io.Writer) error {
 	debug := flags.Bool("debug", false, "trace every kernel request and reply to standard error")
 	flags.Usage = func() {
 		fmt.Fprint(errOut, "usage: remote-fs -server URL -mountpoint DIR\n\n"+
-			"Presents the namespace served at URL as an ordinary directory tree at DIR.\n"+
+			"Presents the volume served at URL as an ordinary directory tree at DIR.\n"+
 			"Runs until interrupted, then detaches DIR.\n\n"+
-			"A copy of the namespace's tree is kept locally and fed by a stream of the\n"+
+			"A copy of the volume's tree is kept locally and fed by a stream of the\n"+
 			"changes the server records. Named lookups and directory lists use that copy;\n"+
 			"inode attributes and open-file operations are confirmed by the server.\n"+
 			"The copy is answered from only while that stream is being read: if\n"+
 			"it breaks, every operation fails until it is back, and nothing stale is served.\n"+
-			"Mounting waits for the copy to be built. A namespace that keeps no change log is\n"+
+			"Mounting waits for the copy to be built. A volume that keeps no change log is\n"+
 			"mounted without one, and every operation on it is a request to the server.\n\n"+
 			"Open file descriptors retain their file object through rename and unlink.\n"+
 			"Writes and truncation are confirmed by the server before returning success.\n"+
@@ -114,7 +114,7 @@ func run(args []string, errOut io.Writer) error {
 		return fmt.Errorf("%q is not an argument this command takes; everything is a flag", extra[0])
 	}
 	if *serverURL == "" {
-		return errors.New("-server is required: the URL of the server holding the namespace")
+		return errors.New("-server is required: the URL of the server holding the volume")
 	}
 	if *mountpoint == "" {
 		return errors.New("-mountpoint is required: the directory to mount at")
@@ -135,7 +135,7 @@ func run(args []string, errOut io.Writer) error {
 		return fmt.Errorf("invalid mutation confirmation limits: %w", err)
 	}
 
-	namespace, err := dialNamespace(*serverURL, *timeout, maxHTTPFrameBytes.bytes)
+	volume, err := dialVolume(*serverURL, *timeout, maxHTTPFrameBytes.bytes)
 	if err != nil {
 		return err
 	}
@@ -146,16 +146,16 @@ func run(args []string, errOut io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Reaching the namespace once before mounting turns "that server is not there" into
+	// Reaching the volume once before mounting turns "that server is not there" into
 	// a message at the moment the operator is looking at the terminal. Skipping it would
 	// still be safe — every operation would fail with an I/O error rather than inventing
 	// an answer — but it would present as a mounted filesystem that is somehow broken,
 	// rather than as a server that was never reached.
-	if err := reach(ctx, namespace, *timeout); err != nil {
-		return fmt.Errorf("the namespace at %s cannot be reached: %w", *serverURL, err)
+	if err := reach(ctx, volume, *timeout); err != nil {
+		return fmt.Errorf("the volume at %s cannot be reached: %w", *serverURL, err)
 	}
 
-	served, release, err := replicateWithOptions(ctx, namespace, *replicaDir, errOut, confirmationOptions)
+	served, release, err := replicateWithOptions(ctx, volume, *replicaDir, errOut, confirmationOptions)
 	if err != nil {
 		return err
 	}
@@ -207,30 +207,30 @@ func callerClient(timeout time.Duration) *http.Client {
 	return &http.Client{Timeout: timeout, Transport: transport}
 }
 
-func dialNamespace(baseURL string, timeout time.Duration, maxFrameBytes int64) (*httprest.Storage, error) {
+func dialVolume(baseURL string, timeout time.Duration, maxFrameBytes int64) (*httprest.Storage, error) {
 	options := httprest.DefaultDialOptions()
 	options.MaxFrameBytes = maxFrameBytes
 	return httprest.DialWithOptions(baseURL, callerClient(timeout), options)
 }
 
-// replicate builds the local copy of the namespace's metadata, and returns the storage the
+// replicate builds the local copy of the volume's metadata, and returns the storage the
 // mountpoint is served from together with what releases it.
 //
 // It blocks until the copy has been built. There is no mode in which the mountpoint comes up
 // first and the copy catches up behind it: until the copy is there, an operation answered
-// from it would be answered from an empty tree, and a mount that reported a namespace as
+// from it would be answered from an empty tree, and a mount that reported a volume as
 // empty is the failure this whole system is arranged to avoid.
 //
-// A namespace that does not publish a change log answers ENOSYS and is mounted with
+// A volume that does not publish a change log answers ENOSYS and is mounted with
 // direct remote metadata access. Transport failures remain errors rather than selecting
 // that mode.
-func replicate(ctx context.Context, namespace *httprest.Storage, where string, errOut io.Writer) (storage.Storage, func() error, error) {
-	return replicateWithOptions(ctx, namespace, where, errOut, replicated.DefaultOptions())
+func replicate(ctx context.Context, volume *httprest.Storage, where string, errOut io.Writer) (storage.Storage, func() error, error) {
+	return replicateWithOptions(ctx, volume, where, errOut, replicated.DefaultOptions())
 }
 
 func replicateWithOptions(
 	ctx context.Context,
-	namespace *httprest.Storage,
+	volume *httprest.Storage,
 	where string,
 	errOut io.Writer,
 	options replicated.Options,
@@ -244,18 +244,18 @@ func replicateWithOptions(
 	}
 	discard := func() error {
 		if err := os.RemoveAll(dir); err != nil {
-			return fmt.Errorf("the copy of the namespace's metadata is still at %s: %w", dir, err)
+			return fmt.Errorf("the copy of the volume's metadata is still at %s: %w", dir, err)
 		}
 		return nil
 	}
 
 	replica, err := sqlite.OpenReplica(ctx, database)
 	if err != nil {
-		return nil, nil, errors.Join(fmt.Errorf("making room for a copy of the namespace's metadata: %w", err), discard())
+		return nil, nil, errors.Join(fmt.Errorf("making room for a copy of the volume's metadata: %w", err), discard())
 	}
 
 	started := time.Now()
-	served, err := replicated.NewWithOptions(ctx, replica, namespace, options)
+	served, err := replicated.NewWithOptions(ctx, replica, volume, options)
 	switch {
 	case errors.Is(err, syscall.ENOSYS):
 		if closeErr := replica.Close(); closeErr != nil {
@@ -264,19 +264,19 @@ func replicateWithOptions(
 		if discardErr := discard(); discardErr != nil {
 			return nil, nil, discardErr
 		}
-		fmt.Fprintln(errOut, "remote-fs: this namespace keeps no record of what changes in it, so every operation is a request to the server")
-		return namespace, func() error { return nil }, nil
+		fmt.Fprintln(errOut, "remote-fs: this volume keeps no record of what changes in it, so every operation is a request to the server")
+		return volume, func() error { return nil }, nil
 	case err != nil:
 		if closeErr := replica.Close(); closeErr != nil {
 			return nil, nil, errors.Join(err, closeErr)
 		}
-		return nil, nil, errors.Join(fmt.Errorf("copying the namespace's metadata: %w", err), discard())
+		return nil, nil, errors.Join(fmt.Errorf("copying the volume's metadata: %w", err), discard())
 	}
-	fmt.Fprintf(errOut, "remote-fs: copied the namespace's metadata in %v\n", time.Since(started).Round(time.Millisecond))
+	fmt.Fprintf(errOut, "remote-fs: copied the volume's metadata in %v\n", time.Since(started).Round(time.Millisecond))
 
 	return served, func() error {
 		if err := served.Close(); err != nil {
-			return fmt.Errorf("releasing the copy of the namespace's metadata: %w", err)
+			return fmt.Errorf("releasing the copy of the volume's metadata: %w", err)
 		}
 		return discard()
 	}, nil
@@ -286,19 +286,19 @@ func replicateWithOptions(
 // out of everybody else's reach.
 //
 // R-SEC-3 asks for both halves of that, and the contents are what make it worth asking: the
-// names, the sizes and the times of somebody's whole workspace. The directory is created with
+// names, the sizes and the times of somebody's whole volume. The directory is created with
 // only its owner able to enter it, and with a name nothing could have taken first — os.MkdirTemp
 // fails rather than opening one that is already there, so a path somebody planted is a failure
 // to mount rather than somewhere this writes into.
 func privateDatabase(where string) (dir, database string, err error) {
 	dir, err = os.MkdirTemp(where, "remote-fs-replica-")
 	if err != nil {
-		return "", "", fmt.Errorf("making a directory for the copy of the namespace's metadata: %w", err)
+		return "", "", fmt.Errorf("making a directory for the copy of the volume's metadata: %w", err)
 	}
 	database = filepath.Join(dir, "tree.db")
 	if err := createPrivately(database); err != nil {
 		os.RemoveAll(dir)
-		return "", "", fmt.Errorf("making a file for the copy of the namespace's metadata: %w", err)
+		return "", "", fmt.Errorf("making a file for the copy of the volume's metadata: %w", err)
 	}
 	return dir, database, nil
 }
@@ -311,7 +311,7 @@ func privateDatabase(where string) (dir, database string, err error) {
 // log and the shared-memory file beside it the mode of the database file, so deciding it once
 // decides it for all three. O_EXCL is what makes "already there" a refusal, and it refuses a
 // symbolic link without following it — the case that matters most, because following one
-// would write the shape of somebody's workspace wherever it pointed.
+// would write the shape of somebody's volume wherever it pointed.
 func createPrivately(path string) error {
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -320,12 +320,12 @@ func createPrivately(path string) error {
 	return file.Close()
 }
 
-// reach asks the namespace for its root once, so that a server nobody is listening on is
+// reach asks the volume for its root once, so that a server nobody is listening on is
 // reported now rather than as an unexplained failure on the first `ls`.
-func reach(ctx context.Context, namespace storage.Storage, timeout time.Duration) error {
+func reach(ctx context.Context, volume storage.Storage, timeout time.Duration) error {
 	probe, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	_, err := namespace.Stat(probe, "")
+	_, err := volume.Stat(probe, "")
 	return err
 }
 

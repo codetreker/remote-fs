@@ -17,11 +17,11 @@ import (
 // LockingConfig opens one exclusively owned metadata database with lease enforcement.
 // Its parent directory must be deployment-owned and protected from other writers. Lease
 // evidence stays beside Database and is bound to its native inode. The recovery duration
-// covers every namespace in the database. Initialize
+// covers every volume in the database. Initialize
 // permits an explicit first binding or completion of its recorded initialization intent.
 type LockingConfig struct {
 	Database   string
-	Namespace  string
+	Volume     string
 	Allowance  int64
 	SQLite     Options
 	Locks      locking.Options
@@ -29,7 +29,7 @@ type LockingConfig struct {
 }
 
 // LockingStore retains native database ownership through successful closure of every pool.
-// The embedded Store supplies the namespace, publication hooks, and paired lock authority.
+// The embedded Store supplies the volume, publication hooks, and paired lock authority.
 type LockingStore struct {
 	*Store
 	ownerMu sync.Mutex
@@ -38,10 +38,10 @@ type LockingStore struct {
 }
 
 // OpenLocking validates native lifetime ownership and both lease evidence components before
-// exposing the namespace. An ordinary reopen never creates a missing database or lease state.
+// exposing the volume. An ordinary reopen never creates a missing database or lease state.
 func OpenLocking(ctx context.Context, config LockingConfig) (*LockingStore, error) {
-	if config.Database == "" || config.Namespace == "" || strings.ContainsAny(config.Database, "%?#\x00") {
-		return nil, fmt.Errorf("locking SQLite needs a native database path and namespace: %w", syscall.EINVAL)
+	if config.Database == "" || config.Volume == "" || strings.ContainsAny(config.Database, "%?#\x00") {
+		return nil, fmt.Errorf("locking SQLite needs a native database path and volume: %w", syscall.EINVAL)
 	}
 	if config.Allowance < 0 {
 		return nil, fmt.Errorf("a metadata allowance must not be negative: %w", syscall.EINVAL)
@@ -71,8 +71,8 @@ func OpenLocking(ctx context.Context, config LockingConfig) (*LockingStore, erro
 	}
 	options.leaseRecoveryOwner = true
 	options.leaseOwner = file
-	options.requireExistingNamespace = !anchor.Initializing()
-	store, err := OpenWithOptions(ctx, database, config.Namespace, config.Allowance, options)
+	options.requireExistingVolume = !anchor.Initializing()
+	store, err := OpenWithOptions(ctx, database, config.Volume, config.Allowance, options)
 	if err != nil {
 		if OpenFailureRetainsOwnership(err) {
 			return nil, err
@@ -103,13 +103,13 @@ func OpenLocking(ctx context.Context, config LockingConfig) (*LockingStore, erro
 	return opened, nil
 }
 
-func prepareOwnedLeaseNamespace(ctx context.Context, db *sql.DB, namespace, storeID string, window Window, maxRecords, maxBytes int64) (int64, int64, error) {
-	id, root, _, err := prepareConfigured(ctx, db, namespace, storeID, window, maxRecords, maxBytes, &durableOpen{mode: CreateNamespaceIfMissing, reapDetached: true})
+func prepareOwnedLeaseVolume(ctx context.Context, db *sql.DB, volume, storeID string, window Window, maxRecords, maxBytes int64) (int64, int64, error) {
+	id, root, _, err := prepareConfigured(ctx, db, volume, storeID, window, maxRecords, maxBytes, &durableOpen{mode: CreateVolumeIfMissing, reapDetached: true})
 	return id, root, err
 }
 
-func prepareExistingOwnedLeaseNamespace(ctx context.Context, db *sql.DB, namespace, storeID string, window Window, maxRecords, maxBytes int64) (int64, int64, error) {
-	id, root, _, err := prepareConfigured(ctx, db, namespace, storeID, window, maxRecords, maxBytes, &durableOpen{mode: RequireExistingNamespace, reapDetached: true})
+func prepareExistingOwnedLeaseVolume(ctx context.Context, db *sql.DB, volume, storeID string, window Window, maxRecords, maxBytes int64) (int64, int64, error) {
+	id, root, _, err := prepareConfigured(ctx, db, volume, storeID, window, maxRecords, maxBytes, &durableOpen{mode: RequireExistingVolume, reapDetached: true})
 	return id, root, err
 }
 
@@ -128,7 +128,7 @@ func (s *LockingStore) CloseContext(ctx context.Context) error {
 	return s.closeOwnership()
 }
 
-// Abort closes an unexposed namespace and releases ownership only when every database pool
+// Abort closes an unexposed volume and releases ownership only when every database pool
 // has closed successfully. Failed native database cleanup retains the lifetime lock.
 func (s *LockingStore) Abort() error {
 	s.ownerMu.Lock()

@@ -58,20 +58,20 @@ func validateLegacyObjectIntegrity(
 }
 
 // validateObjectRelationships checks both directions of the node/object relation. A nil
-// namespace validates the whole database during a legacy migration; a non-nil namespace keeps
+// volume validates the whole database during a legacy migration; a non-nil volume keeps
 // ordinary reopen and status checks scoped to the Store being served.
 func validateObjectRelationships(
 	ctx context.Context,
 	db sqlvalue.Queryer,
-	namespace *int64,
+	volume *int64,
 ) error {
 	nodeWhere := ""
 	objectWhere := ""
 	var scopeArgs []any
-	if namespace != nil {
-		nodeWhere = "WHERE n.namespace = ?"
-		objectWhere = "WHERE o.namespace = ?"
-		scopeArgs = []any{*namespace}
+	if volume != nil {
+		nodeWhere = "WHERE n.volume = ?"
+		objectWhere = "WHERE o.volume = ?"
+		scopeArgs = []any{*volume}
 	}
 	var invalidNodes int64
 	nodeArgs := append([]any{int64(fs.ModeType), StateReferenced}, scopeArgs...)
@@ -86,7 +86,7 @@ func validateObjectRelationships(
 				OR n.size < 0
 				OR (n.mode & ?) != 0
 				OR o.key IS NULL
-				OR o.namespace != n.namespace
+				OR o.volume != n.volume
 				OR o.state != ?
 				OR o.size != n.size
 			THEN 1
@@ -105,7 +105,7 @@ func validateObjectRelationships(
 	if err := db.QueryRowContext(ctx, `
 		SELECT
 			coalesce(sum(CASE
-				WHEN state = ? AND (reference_count != 1 OR same_namespace_count != 1)
+				WHEN state = ? AND (reference_count != 1 OR same_volume_count != 1)
 				THEN 1 ELSE 0 END), 0),
 			coalesce(sum(CASE
 				WHEN state IN (?, ?, ?) AND reference_count != 0
@@ -114,11 +114,11 @@ func validateObjectRelationships(
 			SELECT
 				o.state,
 				count(n.id) AS reference_count,
-				count(CASE WHEN n.namespace = o.namespace THEN 1 END) AS same_namespace_count
+				count(CASE WHEN n.volume = o.volume THEN 1 END) AS same_volume_count
 			FROM objects o
 			LEFT JOIN nodes n ON n.content = o.key
 			`+objectWhere+`
-			GROUP BY o.key, o.namespace, o.state
+			GROUP BY o.key, o.volume, o.state
 		)`, objectArgs...).Scan(
 		&invalidReferenced, &referencedPending,
 	); err != nil {
@@ -126,7 +126,7 @@ func validateObjectRelationships(
 	}
 	if invalidNodes != 0 || invalidReferenced != 0 || referencedPending != 0 {
 		return fmt.Errorf(
-			"the database holds %d nodes with invalid object relationships, %d referenced objects without exactly one same-namespace file, and %d pending objects still referenced: %w",
+			"the database holds %d nodes with invalid object relationships, %d referenced objects without exactly one same-volume file, and %d pending objects still referenced: %w",
 			invalidNodes, invalidReferenced, referencedPending, syscall.EIO)
 	}
 	return nil

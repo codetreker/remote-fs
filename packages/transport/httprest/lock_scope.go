@@ -21,7 +21,7 @@ const (
 	MaxMutationScopeBytes  = 16 << 10
 )
 
-func isNamespaceMutation(op Op) bool {
+func isVolumeMutation(op Op) bool {
 	switch op {
 	case OpSetAttr, OpWrite, OpCreate, OpMkdir, OpRemove, OpRemoveDir, OpRename:
 		return true
@@ -70,8 +70,8 @@ func requestMutationScope(r *http.Request, op Op) (locking.MutationScope, bool, 
 	if len(values) == 0 {
 		return locking.MutationScope{}, false, nil
 	}
-	if !isNamespaceMutation(op) {
-		return locking.MutationScope{}, false, errors.New("mutation scope is only valid on namespace mutations")
+	if !isVolumeMutation(op) {
+		return locking.MutationScope{}, false, errors.New("mutation scope is only valid on volume mutations")
 	}
 	if len(values) != 1 || values[0] == "" || len(values[0]) > base64.RawURLEncoding.EncodedLen(MaxMutationScopeBytes) {
 		return locking.MutationScope{}, false, errors.New("mutation scope header violates its single-value size bound")
@@ -110,9 +110,9 @@ func (s *Storage) Scope(scope locking.MutationScope) (storage.BoundedStorage, er
 
 func (s *Storage) LockService() locking.Service { return s }
 
-// Namespace diagnostics use the namespace response reservation, including long pathname
+// Volume diagnostics use the volume response reservation, including long pathname
 // wrappers. Their typed outcome fields obey the same strict shape as lock controls.
-func decodeNamespaceLockFailure(body []byte) (*locking.Error, error) {
+func decodeVolumeLockFailure(body []byte) (*locking.Error, error) {
 	var response struct {
 		Errno    string       `json:"errno"`
 		Message  string       `json:"message"`

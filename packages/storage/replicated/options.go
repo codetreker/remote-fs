@@ -32,7 +32,7 @@ const (
 // before dispatch return EAGAIN. Caller cancellation before dispatch returns EINTR; a
 // deadline returns EIO. Once the server reports success, the operation returns success
 // only after the local replica reaches its barrier; cancellation and timeout are then
-// EIO because the namespace has changed.
+// EIO because the volume has changed.
 type Options struct {
 	ConfirmationGrace       time.Duration
 	MaxActiveConfirmations  int

@@ -142,7 +142,7 @@ func TestDurableCloseRetriesPersistentWALReleaseFailure(t *testing.T) {
 	path := t.TempDir() + "/metastore.db"
 	store, err := OpenBoundDurableWithOptions(
 		t.Context(), path, "workspace", "store", 0, DefaultOptions(),
-		CreateNamespaceIfMissing, DurableStartup{}, acceptingCommitWitness{},
+		CreateVolumeIfMissing, DurableStartup{}, acceptingCommitWitness{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -223,7 +223,7 @@ func (w *checkpointStateWitness) Checkpoint(state DurableState) error {
 func TestDurableInspectionAndCheckpointPublishOnlyAcceptedState(t *testing.T) {
 	path := t.TempDir() + "/durable.db"
 	witness := &checkpointStateWitness{}
-	s, err := OpenBoundDurableWithOptions(t.Context(), path, "workspace", "objects", 0, DefaultOptions(), CreateNamespaceIfMissing, DurableStartup{}, witness)
+	s, err := OpenBoundDurableWithOptions(t.Context(), path, "workspace", "objects", 0, DefaultOptions(), CreateVolumeIfMissing, DurableStartup{}, witness)
 	if err != nil {
 		t.Fatal(err)
 	}

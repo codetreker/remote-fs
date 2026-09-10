@@ -17,7 +17,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/locked"
 )
 
-// Handler serves one namespace.
+// Handler serves one volume.
 //
 // It is a plain http.Handler, so it can be run on its own or mounted inside an existing
 // server; http.StripPrefix is how it is mounted somewhere other than the root.
@@ -50,20 +50,20 @@ type Handler struct {
 var _ http.Handler = (*Handler)(nil)
 
 // NewHandler serves a backend whose LockService authorizes every final mutation.
-// A backend without that paired authority is rejected before serving. Scoped namespace
-// requests and anonymous requests reach that same authority. log describes the namespace's
+// A backend without that paired authority is rejected before serving. Scoped volume
+// requests and anonymous requests reach that same authority. log describes the volume's
 // committed mutations for metadata replication.
 //
 // The log is a second input rather than something discovered through s, because not every
-// namespace has one: a local directory is a namespace with no metastore behind it and
-// therefore no ordered record of what changed. Such a namespace is served whole here, and
+// volume has one: a local directory is a volume with no metastore behind it and
+// therefore no ordered record of what changed. Such a volume is served whole here, and
 // the two replication endpoints answer ENOSYS — a nil log passed in on purpose, rather
 // than an absence this package could infer, so that a caller that has a log and forgets to
-// pass it is making a visible choice instead of silently serving a namespace nothing can
+// pass it is making a visible choice instead of silently serving a volume nothing can
 // replicate.
 //
-// A non-nil log must describe the same namespace as s. Every successful mutation that changes
-// that namespace must record its change atomically before the storage method returns. The handler
+// A non-nil log must describe the same volume as s. Every successful mutation that changes
+// that volume must record its change atomically before the storage method returns. The handler
 // uses the log's barrier as proof that the mutation can become visible to a replica; violating the
 // pairing can acknowledge a mutation before its change is present in the log.
 func NewHandler(s storage.Storage, log metastore.Log) (*Handler, error) {
@@ -99,7 +99,7 @@ func NewHandlerWithOptions(s storage.Storage, log metastore.Log, options Handler
 	}
 	paired, err := locked.New(backend)
 	if err != nil {
-		return nil, fmt.Errorf("httprest: invalid enforcing namespace: %w", err)
+		return nil, fmt.Errorf("httprest: invalid enforcing volume: %w", err)
 	}
 	settled := options.settle()
 	h := &Handler{
@@ -165,7 +165,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Marking every response, including the failures, is what lets the far side tell an
 	// answer from this handler apart from one an intermediary made up.
 	w.Header().Set(HeaderProtocol, Version)
-	// A cached answer from a namespace is a stale answer that reads exactly like a
+	// A cached answer from a volume is a stale answer that reads exactly like a
 	// current one, which is the failure this system is least able to survive.
 	w.Header().Set("Cache-Control", "no-store")
 
@@ -187,7 +187,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeFault(w, http.StatusBadRequest, err)
 		return
 	}
-	if present || isNamespaceMutation(req.Op) {
+	if present || isVolumeMutation(req.Op) {
 		r = r.WithContext(locking.WithScope(r.Context(), scope))
 	}
 	if req.ContentType() == "" {
@@ -308,8 +308,8 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) 
 		h.report(ctx, w, h.storage.Rename(ctx, req.Path, req.To))
 
 	case OpSpace:
-		// ENOSYS from a namespace with no room of its own to report is an answer about
-		// that namespace rather than a gap in this protocol, so it travels under its own
+		// ENOSYS from a volume with no room of its own to report is an answer about
+		// that volume rather than a gap in this protocol, so it travels under its own
 		// name like every other errno.
 		space, err := h.storage.Space(ctx)
 		if err != nil {
@@ -333,8 +333,8 @@ func (h *Handler) report(ctx context.Context, w http.ResponseWriter, err error) 
 		h.writeOperationError(w, err)
 		return
 	}
-	// Every operation that changes the namespace is answered here, so this is the one
-	// place that knows the namespace has just moved — and the moment it knows is the
+	// Every operation that changes the volume is answered here, so this is the one
+	// place that knows the volume has just moved — and the moment it knows is the
 	// moment the subscriptions are told to read the log again. Nothing is handed to them:
 	// what they read is the log itself, which is the only record of what changed.
 	if h.publisher != nil {
@@ -344,7 +344,7 @@ func (h *Handler) report(ctx context.Context, w http.ResponseWriter, err error) 
 	if h.log != nil {
 		barrier, err := h.mutationBarrier(ctx)
 		if err != nil {
-			h.writeOperationError(w, fmt.Errorf("the namespace changed but its replication barrier could not be read: %v: %w", err, syscall.EIO))
+			h.writeOperationError(w, fmt.Errorf("the volume changed but its replication barrier could not be read: %v: %w", err, syscall.EIO))
 			return
 		}
 		response.Barrier = barrier
@@ -460,7 +460,7 @@ func (h *Handler) writeJSON(w http.ResponseWriter, status int, body any) {
 // is already determined before storage is called.
 func (h *Handler) writeOperationError(w http.ResponseWriter, err error) {
 	response := ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error()}
-	if failure := namespaceLockFailure(err); failure != nil {
+	if failure := volumeLockFailure(err); failure != nil {
 		response.LockCode = failure.Code
 		recorded := failure.Recorded
 		response.Recorded = &recorded
@@ -470,7 +470,7 @@ func (h *Handler) writeOperationError(w http.ResponseWriter, err error) {
 
 // Only a single error chain can identify one lock failure. Joined failures and an
 // enclosing classification own the whole outcome and cannot inherit a nested lock code.
-func namespaceLockFailure(err error) *locking.Error {
+func volumeLockFailure(err error) *locking.Error {
 	errno := storage.ErrnoOf(err)
 	for err != nil {
 		if failure, ok := err.(*locking.Error); ok {

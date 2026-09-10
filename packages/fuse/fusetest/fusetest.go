@@ -81,7 +81,7 @@ func (r *TempRoot) Leaks() ([]string, error) {
 //
 // Only once Leaks reports nothing. Removing a tree walks into a mountpoint that is still
 // attached and deletes what is served through it, so a run that did this while a leak was
-// live would destroy both the evidence and the namespace behind it.
+// live would destroy both the evidence and the volume behind it.
 func (r *TempRoot) Remove() error { return os.RemoveAll(r.path) }
 
 // Mounted reports whether anything is attached at path.
