@@ -352,7 +352,7 @@ func aHandleWithAllowance(t *testing.T, contents []byte, maxFileSize, allowance 
 			t.Errorf("close handle session: %v", err)
 		}
 	})
-	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true, Write: true})
+	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	if err != nil {
 		t.Fatal(err)
 	}

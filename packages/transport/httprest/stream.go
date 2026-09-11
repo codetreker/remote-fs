@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -40,6 +41,8 @@ type frameWriter struct {
 	to            io.Writer
 	control       *http.ResponseController
 	maxFrameBytes int64
+	authorize     func() error
+	ending        func()
 }
 
 // openStream begins a stream: it commits the response to a success and to this framing, so
@@ -48,6 +51,7 @@ func openStream(w http.ResponseWriter, maxFrameBytes int64) (*frameWriter, error
 	w.Header().Set("Content-Type", contentEventStream)
 	w.WriteHeader(http.StatusOK)
 	f := &frameWriter{to: w, control: http.NewResponseController(w), maxFrameBytes: maxFrameBytes}
+	f.ending = func() { f.control.SetWriteDeadline(time.Now().Add(departureGrace)) }
 	// The headers are of no use to the far side until they arrive: a client that has not
 	// seen them is still waiting for a response, and cannot tell that from a server that
 	// has not answered.
@@ -64,8 +68,9 @@ func openStream(w http.ResponseWriter, maxFrameBytes int64) (*frameWriter, error
 // by a shutdown, concurrently by every stream, and only by the streams that are stuck.
 const departureGrace = 100 * time.Millisecond
 
-// endWritesWhen makes whatever this stream is in the middle of writing fail shortly after
-// done is closed, and returns the function that takes the arrangement down again.
+// watchStreamWrites bounds termination from Stop, request cancellation, or a
+// terminal fault. It must be armed before the initial response Flush. The first
+// termination signal starts one departureGrace window; later signals cannot extend it.
 //
 // Between frames a stream can be told to stop through an ordinary channel, and both loops
 // that drive one do exactly that. Inside a write there is no such moment. A reader that has
@@ -83,24 +88,28 @@ const departureGrace = 100 * time.Millisecond
 // Once the deadline is set it stays set, so nothing further can be written to this stream.
 // That is the honest end of it: a reader that is not reading cannot be told anything, and
 // what it will find when it looks is a stream that stopped.
-func (f *frameWriter) endWritesWhen(done <-chan struct{}) (release func()) {
+func watchStreamWrites(w http.ResponseWriter, stopping, canceled <-chan struct{}) (end, release func()) {
+	terminal := make(chan struct{})
 	released, watched := make(chan struct{}), make(chan struct{})
+	control := http.NewResponseController(w)
 	go func() {
 		defer close(watched)
 		select {
 		case <-released:
 			return
-		case <-done:
+		case <-stopping:
+		case <-canceled:
+		case <-terminal:
 		}
 		select {
 		case <-released:
 		case <-time.After(departureGrace):
 			// Its failure would mean the connection is already gone, in which case the
 			// write this exists to interrupt is failing of its own accord.
-			f.control.SetWriteDeadline(time.Now())
+			control.SetWriteDeadline(time.Now())
 		}
 	}()
-	return func() {
+	return sync.OnceFunc(func() { close(terminal) }), func() {
 		close(released)
 		<-watched
 	}
@@ -133,6 +142,11 @@ func marshalFrame(event string, payload any, maxFrameBytes int64) ([]byte, error
 }
 
 func (f *frameWriter) sendEncoded(event string, encoded []byte) error {
+	if event != eventFault && event != eventGone && f.authorize != nil {
+		if err := f.authorize(); err != nil {
+			return err
+		}
+	}
 	for _, part := range []string{fieldEvent, event, "\n", fieldData} {
 		if err := writeFrameString(f.to, part); err != nil {
 			return err
@@ -175,16 +189,22 @@ func encodedFrameBytes(event string, payloadBytes int64) (int64, error) {
 // Its own failure to reach the far side changes nothing: the stream is over either way,
 // and the far side treats a stream that stopped as a failure whether or not it was told.
 func (f *frameWriter) fault(cause error) {
-	message := cause.Error()
+	f.ending()
+	fault := StreamFault{}
+	if response, authorized := authorizationResponse(cause); authorized {
+		fault.Message, fault.Errno = response.Message, &response.Errno
+	} else {
+		fault.Message = cause.Error()
+	}
 	const faultEnvelopeBytes int64 = 128
 	maxMessage := (f.maxFrameBytes - faultEnvelopeBytes) / 6
 	if maxMessage < 0 {
 		maxMessage = 0
 	}
-	if int64(len(message)) > maxMessage {
-		message = "the stream failed and its detail exceeds the configured frame bound"
+	if int64(len(fault.Message)) > maxMessage {
+		fault.Message = "the stream failed and its detail exceeds the configured frame bound"
 	}
-	f.send(eventFault, StreamFault{Message: message})
+	f.send(eventFault, fault)
 }
 
 // alive says that the stream is still there, on a stream that has nothing else to say.
@@ -200,6 +220,11 @@ func (f *frameWriter) fault(cause error) {
 // thing the other way round: without it a replica that vanished without closing its
 // connection holds a goroutine here until something else happens to be published.
 func (f *frameWriter) alive() error {
+	if f.authorize != nil {
+		if err := f.authorize(); err != nil {
+			return err
+		}
+	}
 	if _, err := fmt.Fprint(f.to, ": alive\n"); err != nil {
 		return err
 	}
@@ -348,10 +373,30 @@ func decodeFrame(event string, data []byte, payload any) error {
 func faultOf(data []byte) error {
 	var fault StreamFault
 	if err := json.Unmarshal(data, &fault); err != nil {
-		return fmt.Errorf("the stream failed, and its reason does not decode: %w", err)
+		return fmt.Errorf("the stream failed, and its reason does not decode: %w", errors.Join(err, syscall.EIO))
 	}
 	if fault.Message == "" {
-		return errors.New("the stream failed, and the server gave no reason")
+		return fmt.Errorf("the stream failed, and the server gave no reason: %w", syscall.EIO)
 	}
-	return fmt.Errorf("the stream failed: %s", fault.Message)
+	errno := syscall.EIO
+	if fault.Errno != nil && *fault.Errno == "EACCES" {
+		errno = syscall.EACCES
+	}
+	return &streamFaultError{message: fault.Message, errno: errno}
+}
+
+type streamFaultError struct {
+	message string
+	errno   syscall.Errno
+}
+
+func (e *streamFaultError) Error() string { return "the stream failed: " + e.message }
+func (e *streamFaultError) Unwrap() error { return e.errno }
+
+func streamFaultErrno(err error) (syscall.Errno, bool) {
+	var fault *streamFaultError
+	if errors.As(err, &fault) {
+		return fault.errno, true
+	}
+	return 0, false
 }

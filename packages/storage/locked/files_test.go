@@ -38,7 +38,7 @@ func TestScopedRetainedFilesKeepStrongProofsOnlyForMutations(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true, Write: true})
+	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestScopedRetainedFilesKeepStrongProofsOnlyForMutations(t *testing.T) {
 	if _, err := session.SetNodeAttr(t.Context(), attr.ID, storage.AttrChange{Mode: &mode}); !errors.Is(err, syscall.ESTALE) {
 		t.Fatalf("identity mutation ignored a stale strong proof: %v", err)
 	}
-	if _, err := session.OpenNode(t.Context(), attr.ID, storage.FileOpenOptions{Read: true, Write: true, Truncate: true}); !errors.Is(err, syscall.ESTALE) {
+	if _, err := session.OpenNode(t.Context(), attr.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Truncate: true}}); !errors.Is(err, syscall.ESTALE) {
 		t.Fatalf("truncating open ignored a stale strong proof: %v", err)
 	}
 	status, err := session.Status(t.Context())
@@ -156,7 +156,7 @@ func TestRetainedFacadeForwardsQuotaCapabilityAndDetachedUsage(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true, Write: true, Create: true})
+	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
 	if err != nil {
 		t.Fatal(err)
 	}

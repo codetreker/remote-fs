@@ -16,7 +16,7 @@
 | `Truncate` | 需要写权限；截断与返回的身份属于同一次有序打开结果 |
 | 普通文件引用用于目录或符号链接 | 分别为 `EISDIR`、`ELOOP` |
 
-`FileOpenOptions` 至少要求读取或写入一种访问方式；排他创建必须同时指定创建。权限模式只用于新建节点。只读引用可以修改契约支持的 mode、atime、mtime；内容写入、截断和 POSIX 排他锁仍检查写访问。
+`FileOpenOptions` 嵌入 `storage.OpenAccess`，共享 Read、Write、Create、Truncate、Exclusive 五项打开意图；ExpectedID 与 Mode 仍是文件打开自己的参数。Check／CheckNode 连同身份和 mode 验证它们，至少要求读取或写入一种访问方式；排他创建必须同时指定创建。权限模式只用于新建节点。只读引用可以修改契约支持的 mode、atime、mtime；内容写入、截断和 POSIX 排他锁仍检查写访问。
 
 `FileSessionOptions` 要显式选择有效值，调用方可从 `DefaultFileSessionOptions` 开始。默认 lease 为 30 秒、动作历史为 1 分钟、单文件大小为 1 GiB，每会话最多 4096 个引用、64 个活跃操作、256 个操作等待者、4096 个锁 owner、65536 个范围、1024 个 pending lock 与 16384 个锁动作。会话上限还受 volume 与 HTTP registry 的共享上限约束。
 
@@ -73,7 +73,9 @@ objectstore 仍以不可变完整对象保存内容。读取先捕获节点状�
 
 ## 五、HTTP、复制与资源
 
-HTTP v3 增加 `file` 与 `file-control` 操作入口，保留基础 volume 与强 S/X 协议。请求以 operation 区分打开、身份查询、区间读写与锁控制；二进制路径和内容使用 JSON 的 base64 byte 字段。协议对未知、重复、缺席、null 或无关字段进行验证，所有结果仍携带 v3 标记与封闭 errno 词汇。FileSession 的时间间隔使用 Go duration 的整数纳秒表示，不能按强 S/X 的毫秒字段解释。
+HTTP 文件请求先执行[业务授权](authorization.md)，再读取／触碰 Session、File 与动作历史。Open 的完整读写、创建、截断意图由一次 callback 决定，解锁与申请分别可控；已有 bearer 引用不绑定业务身份，也不能绕过检查。被拒绝的 ack、renew、核对或 close 不产生对应副作用，服务器自主 expiry／shutdown 回收仍由原拥有者执行。
+
+HTTP v3 增加 `file` 与 `file-control` 操作入口，保留基础 volume 与强 S/X 协议。请求的 `op` 直接使用 storage.Operation 的规范值，例如 file.open、file.read、file.unlock，分发与业务授权共享标识；二进制路径和内容使用 JSON 的 base64 byte 字段。协议对未知、重复、缺席、null 或无关字段进行验证，所有结果仍携带 v3 标记与封闭 errno 词汇。FileSession 的时间间隔使用 Go duration 的整数纳秒表示，不能按强 S/X 的毫秒字段解释。
 
 随机能力标识会话与文件引用。Open 结果在有限 PendingAck 时间内保留，client 收到能力后单独确认；无确认的引用被回收。数据修改、打开和改变锁状态的请求使用有界动作记录核对，过期历史不能让旧请求变成新执行。响应丢失后不能单凭请求 context 取消推断打开未发生或锁未取得。控制通道使用固定 16 KiB 上限与独立 admission，阻塞锁通过短的 Set/Query/Cancel 交换维持，不长期占用 HTTP worker。数据 JSON 在编码前核对 envelope 与 base64 后的总长度；区间读取在调用 backend 前为返回 envelope 扣除预算，不能只按原始字节数推断 body 大小。
 

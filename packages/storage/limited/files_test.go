@@ -33,7 +33,7 @@ func retainedSession(t *testing.T, backing storage.FileStorage, ctx context.Cont
 
 func retainedFile(t *testing.T, session storage.FileSession, name string, create bool) storage.File {
 	t.Helper()
-	file, err := session.OpenFile(t.Context(), name, storage.FileOpenOptions{Read: true, Write: true, Create: create, Mode: 0o600})
+	file, err := session.OpenFile(t.Context(), name, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: create}, Mode: 0o600})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +314,7 @@ func TestRetainedQuotaOpenNodeAndTruncatePreserveIdentityAndCharge(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	opened, err := session.OpenNode(t.Context(), attr.ID, storage.FileOpenOptions{Read: true, Write: true})
+	opened, err := session.OpenNode(t.Context(), attr.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +340,7 @@ func TestRetainedQuotaOpenNodeAndTruncatePreserveIdentityAndCharge(t *testing.T)
 	}
 	cancelled, cancel := context.WithCancel(t.Context())
 	cancel()
-	if _, err := session.OpenNode(cancelled, attr.ID, storage.FileOpenOptions{Read: true}); !errors.Is(err, context.Canceled) {
+	if _, err := session.OpenNode(cancelled, attr.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled open = %v", err)
 	}
 	if _, err := opened.Truncate(cancelled, 0); !errors.Is(err, context.Canceled) {

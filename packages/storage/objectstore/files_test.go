@@ -93,7 +93,7 @@ func readFileFor(t *testing.T, file storage.File, want string) storage.Attr {
 func TestRetainedFileReadsCurrentObjectThroughNameChanges(t *testing.T) {
 	volume, _ := fileVolume(t, memory.New(), 4096, nil)
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
-	f := openFileFor(t, session, "first", storage.FileOpenOptions{Read: true, Write: true, Create: true, Mode: 0600})
+	f := openFileFor(t, session, "first", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0600})
 	if _, err := f.WriteAt(t.Context(), 0, []byte("initial")); err != nil {
 		t.Fatal(err)
 	}
@@ -175,8 +175,8 @@ func TestRetainedRangeWriteRetriesAgainstLatestRevision(t *testing.T) {
 	t.Cleanup(objects.release)
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	t.Cleanup(objects.release)
-	first := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
-	second := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true})
+	first := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
+	second := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	if _, err := first.WriteAt(t.Context(), 0, []byte("abcdefgh")); err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +206,7 @@ func TestRetainedRenewalHasAdmissionWhileTheOnlyDataSlotIsStaging(t *testing.T) 
 	options.MaxOperations = 1
 	session := fileSessionFor(t, volume, options)
 	t.Cleanup(objects.release)
-	file := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
+	file := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
 	before, err := session.Status(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -247,9 +247,9 @@ func TestRetainedPOSIXOwnerCleanupProgressesWhileDataAdmissionIsFull(t *testing.
 			first := fileSessionFor(t, volume, options)
 			second := fileSessionFor(t, volume, options)
 			t.Cleanup(objects.release)
-			writer := openFileFor(t, first, "f", storage.FileOpenOptions{Write: true, Create: true})
-			closing := openFileFor(t, first, "f", storage.FileOpenOptions{Write: true})
-			waiter := openFileFor(t, second, "f", storage.FileOpenOptions{Write: true})
+			writer := openFileFor(t, first, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Create: true}})
+			closing := openFileFor(t, first, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true}})
+			waiter := openFileFor(t, second, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true}})
 			lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, End: math.MaxInt64}
 			if result, err := closing.SetLock(t.Context(), 41, lock, retainedLockRequest(t, first)); err != nil || result.State != storage.LockGranted {
 				t.Fatalf("owner grant = %+v, %v", result, err)
@@ -305,9 +305,9 @@ func TestRetainedPendingLockCancellationProgressesWhileDataAdmissionIsFull(t *te
 	first := fileSessionFor(t, volume, options)
 	second := fileSessionFor(t, volume, options)
 	t.Cleanup(objects.release)
-	writer := openFileFor(t, first, "f", storage.FileOpenOptions{Write: true, Create: true})
-	closing := openFileFor(t, first, "f", storage.FileOpenOptions{Write: true})
-	holder := openFileFor(t, second, "f", storage.FileOpenOptions{Write: true})
+	writer := openFileFor(t, first, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Create: true}})
+	closing := openFileFor(t, first, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true}})
+	holder := openFileFor(t, second, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true}})
 	lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, End: math.MaxInt64}
 	if result, err := holder.SetLock(t.Context(), 72, lock, retainedLockRequest(t, second)); err != nil || result.State != storage.LockGranted {
 		t.Fatalf("blocking holder = %+v, %v", result, err)
@@ -410,7 +410,7 @@ func TestRetainedLockAdmissionPartitionsAreBoundedAndPreserveRenewal(t *testing.
 			options := storage.DefaultFileSessionOptions()
 			options.MaxOperations = 1
 			session := fileSessionFor(t, volume, options)
-			file := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
+			file := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
 			lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, End: math.MaxInt64}
 			request := retainedLockRequest(t, session)
 			if result, err := file.SetLock(t.Context(), 41, lock, request); err != nil || result.State != storage.LockGranted {
@@ -626,8 +626,8 @@ func TestRetainedSessionExpiryFencesUploadBeforeAdvisoryHandoff(t *testing.T) {
 		firstSession := fileSessionFor(t, volume, options)
 		secondSession := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 		t.Cleanup(objects.release)
-		first := openFileFor(t, firstSession, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
-		second := openFileFor(t, secondSession, "f", storage.FileOpenOptions{Read: true, Write: true})
+		first := openFileFor(t, firstSession, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
+		second := openFileFor(t, secondSession, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 		if _, err := first.WriteAt(t.Context(), 0, []byte("old")); err != nil {
 			t.Fatal(err)
 		}
@@ -697,8 +697,8 @@ func TestRetainedFileAdmissionAndSizeAreBounded(t *testing.T) {
 	options.MaxFiles = 1
 	session := fileSessionFor(t, volume, options)
 	t.Cleanup(objects.release)
-	f := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
-	if _, err := session.OpenFile(t.Context(), "other", storage.FileOpenOptions{Read: true, Create: true}); !errors.Is(err, syscall.EMFILE) {
+	f := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
+	if _, err := session.OpenFile(t.Context(), "other", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true}}); !errors.Is(err, syscall.EMFILE) {
 		t.Fatalf("file limit=%v", err)
 	}
 	if _, err := volume.Stat(t.Context(), "other"); !errors.Is(err, syscall.ENOENT) {
@@ -731,12 +731,12 @@ func TestRetainedFileAdmissionAndSizeAreBounded(t *testing.T) {
 func TestRetainedOpenChecksIdentityAndAccess(t *testing.T) {
 	volume, _ := fileVolume(t, memory.New(), 4096, nil)
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
-	f := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true, Exclusive: true, Mode: 0600})
+	f := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Exclusive: true}, Mode: 0600})
 	attr, err := f.Stat(t.Context())
 	if err != nil || attr.Mode.Perm() != 0600 {
 		t.Fatalf("created attr=%+v %v", attr, err)
 	}
-	if _, err := session.OpenFile(t.Context(), "f", storage.FileOpenOptions{Read: true, Create: true, Exclusive: true}); !errors.Is(err, syscall.EEXIST) {
+	if _, err := session.OpenFile(t.Context(), "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true, Exclusive: true}}); !errors.Is(err, syscall.EEXIST) {
 		t.Fatalf("exclusive open=%v", err)
 	}
 	if err := volume.Remove(t.Context(), "f"); err != nil {
@@ -745,10 +745,10 @@ func TestRetainedOpenChecksIdentityAndAccess(t *testing.T) {
 	if err := volume.Create(t.Context(), "f"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := session.OpenFile(t.Context(), "f", storage.FileOpenOptions{Read: true, ExpectedID: attr.ID}); !errors.Is(err, syscall.ESTALE) {
+	if _, err := session.OpenFile(t.Context(), "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}, ExpectedID: attr.ID}); !errors.Is(err, syscall.ESTALE) {
 		t.Fatalf("replacement open=%v", err)
 	}
-	byID, err := session.OpenNode(t.Context(), attr.ID, storage.FileOpenOptions{Read: true})
+	byID, err := session.OpenNode(t.Context(), attr.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -783,7 +783,7 @@ func TestRetainedWritesPreserveStrongScopeAtFinalPublication(t *testing.T) {
 	volume, _, _ := lockingObjectVolume(t, options, objects)
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	t.Cleanup(objects.release)
-	f := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
+	f := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
 	if _, err := f.WriteAt(t.Context(), 0, []byte("original")); err != nil {
 		t.Fatal(err)
 	}
@@ -855,7 +855,7 @@ func TestRetainedCapturedRevisionHonorsSessionAndNativeFileLimits(t *testing.T) 
 			options := storage.DefaultFileSessionOptions()
 			options.MaxFileSize = limits.session
 			session := fileSessionFor(t, volume, options)
-			file := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true})
+			file := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 			if attr, err := file.Stat(t.Context()); err != nil || attr.Size != 2 {
 				t.Fatalf("initial stat = %+v, %v", attr, err)
 			}
@@ -900,7 +900,7 @@ func TestRetainedZeroTruncateStillChecksStrongPublicationPermission(t *testing.T
 	options := storage.DefaultFileSessionOptions()
 	options.MaxFileSize = 4
 	session := fileSessionFor(t, volume, options)
-	file := openFileFor(t, session, "f", storage.FileOpenOptions{Write: true})
+	file := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true}})
 	owner := publicationOwner(t, volume.LockService())
 	grant := publicationGrant(t, volume.LockService(), owner, "f", locking.Exclusive)
 	objects.rejectReads.Store(true)
@@ -928,7 +928,7 @@ func TestRetainedReadRetriesCollectedRevisionAndRejectsMissingCurrentObject(t *t
 	objects := &changedFileGet{Objects: memory.New()}
 	volume, meta := fileVolume(t, objects, 4096, nil)
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
-	f := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
+	f := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
 	if _, err := f.WriteAt(t.Context(), 0, []byte("old")); err != nil {
 		t.Fatal(err)
 	}
@@ -971,7 +971,7 @@ func TestRetainedSessionCloseCanRetryKnownAccountingRefusal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
+	f := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
 	if _, err := f.WriteAt(t.Context(), 0, []byte("charge")); err != nil {
 		t.Fatal(err)
 	}
@@ -1026,7 +1026,7 @@ func TestRetainedExpiredAtomicOpenCannotCreateOrTruncate(t *testing.T) {
 			t.Cleanup(release)
 			result := make(chan error, 1)
 			go func() {
-				_, err := session.OpenFile(t.Context(), "f", storage.FileOpenOptions{Read: true, Write: true, Create: create, Truncate: !create})
+				_, err := session.OpenFile(t.Context(), "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: create, Truncate: !create}})
 				result <- err
 			}()
 			select {
@@ -1061,8 +1061,8 @@ func TestRetainedSessionsShareAdvisoryAuthorityAcrossObjectWrappers(t *testing.T
 	})
 	firstSession := fileSessionFor(t, firstVolume, storage.DefaultFileSessionOptions())
 	secondSession := fileSessionFor(t, secondVolume, storage.DefaultFileSessionOptions())
-	first := openFileFor(t, firstSession, "f", storage.FileOpenOptions{Read: true, Create: true})
-	second := openFileFor(t, secondSession, "f", storage.FileOpenOptions{Read: true, Write: true})
+	first := openFileFor(t, firstSession, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true}})
+	second := openFileFor(t, secondSession, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	status, err := firstSession.Status(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -1118,8 +1118,8 @@ func TestRetainedControlMethodsKeepIdentityAndKnownLockOutcomes(t *testing.T) {
 	if got, err := session.StatNode(t.Context(), dir.ID); err != nil || got.ID != dir.ID || got.Mode.Perm() != 0700 {
 		t.Fatalf("node stat=%+v %v", got, err)
 	}
-	first := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
-	second := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true})
+	first := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
+	second := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	request := func() storage.LockRequestID {
 		id, err := storage.NewLockRequestID(after.ActionEpoch)
 		if err != nil {
@@ -1172,7 +1172,7 @@ func TestRetainedUncertainPutPreservesOldBytesAndQuarantinesStage(t *testing.T) 
 	objects := &uncertainFilePut{Objects: memory.New(), cause: failure}
 	volume, meta := fileVolume(t, objects, 4096, nil)
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
-	f := openFileFor(t, session, "f", storage.FileOpenOptions{Read: true, Write: true, Create: true})
+	f := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
 	if _, err := f.WriteAt(t.Context(), 0, []byte("old")); err != nil {
 		t.Fatal(err)
 	}

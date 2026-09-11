@@ -11,16 +11,16 @@ import (
 const OpFile Op = "file"
 const OpFileControl Op = "file-control"
 
-func fileControl(op string) bool {
+func fileControl(op storage.Operation) bool {
 	switch op {
-	case "status", "renew", "session-close", "close", "ack", "get-lock", "set-lock", "query-lock", "cancel-lock", "drop-locks":
+	case storage.OpFileStatus, storage.OpFileRenew, storage.OpFileSessionClose, storage.OpFileClose, storage.OpFileAck, storage.OpFileGetLock, storage.OpFileSetLock, storage.OpFileUnlock, storage.OpFileQueryLock, storage.OpFileCancelLock, storage.OpFileDropLocks:
 		return true
 	}
 	return false
 }
 
 type fileRequest struct {
-	Op      string                     `json:"op"`
+	Op      storage.Operation          `json:"op"`
 	Session string                     `json:"session"`
 	File    string                     `json:"file"`
 	Action  storage.LockRequestID      `json:"action"`
@@ -51,17 +51,17 @@ type fileResponse struct {
 	Barrier  *MutationBarrier           `json:"barrier,omitempty"`
 }
 
-func fileMutation(op string) bool {
+func fileMutation(op storage.Operation) bool {
 	switch op {
-	case "open", "open-node", "set-node-attr", "write", "truncate", "set-attr", "sync":
+	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileSetNodeAttr, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSync:
 		return true
 	}
 	return false
 }
 
-func fileActionRequired(op string) bool {
+func fileActionRequired(op storage.Operation) bool {
 	switch op {
-	case "open", "open-node", "set-node-attr", "write", "truncate", "set-attr", "sync", "drop-locks":
+	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileSetNodeAttr, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSync, storage.OpFileDropLocks:
 		return true
 	}
 	return false

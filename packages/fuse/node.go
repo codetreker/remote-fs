@@ -221,7 +221,7 @@ func (n *node) resize(ctx context.Context, f fs.FileHandle, size int64) error {
 	if h, ok := f.(*handle); ok {
 		return h.resize(ctx, size)
 	}
-	file, err := n.volume.files.OpenNode(ctx, n.id.node, storage.FileOpenOptions{Write: true})
+	file, err := n.volume.files.OpenNode(ctx, n.id.node, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true}})
 	if err != nil {
 		return err
 	}

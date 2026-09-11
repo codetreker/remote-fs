@@ -1,9 +1,11 @@
 package storage_test
 
 import (
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"math"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -12,25 +14,52 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
+func TestFileOpenOptionsJSONPreservesSharedAccessFields(t *testing.T) {
+	options := storage.FileOpenOptions{
+		OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Truncate: true, Exclusive: true},
+		ExpectedID: 42, Mode: 0o600,
+	}
+	encoded, err := json.Marshal(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"Read": true, "Write": true, "Create": true, "Truncate": true, "Exclusive": true,
+		"ExpectedID": float64(42), "Mode": float64(0o600)}
+	if !reflect.DeepEqual(fields, want) {
+		t.Fatalf("file open JSON changed field names or shape: %s", encoded)
+	}
+	var decoded storage.FileOpenOptions
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded != options {
+		t.Fatalf("shared open access changed on round trip: %+v", decoded)
+	}
+}
+
 func TestFileOpenOptionsRequireExplicitAccessAndValidCreation(t *testing.T) {
 	for _, options := range []storage.FileOpenOptions{
 		{},
-		{Read: true, Exclusive: true},
-		{Read: true, Truncate: true},
-		{Write: true, Mode: fs.ModeDir},
-		{Read: true, Create: true, Mode: fs.ModeSymlink},
+		{OpenAccess: storage.OpenAccess{Read: true, Exclusive: true}},
+		{OpenAccess: storage.OpenAccess{Read: true, Truncate: true}},
+		{OpenAccess: storage.OpenAccess{Write: true}, Mode: fs.ModeDir},
+		{OpenAccess: storage.OpenAccess{Read: true, Create: true}, Mode: fs.ModeSymlink},
 	} {
 		if err := options.Check(); !errors.Is(err, syscall.EINVAL) {
 			t.Errorf("options %+v returned %v, want EINVAL", options, err)
 		}
 	}
 	for _, options := range []storage.FileOpenOptions{
-		{Read: true},
-		{Write: true},
-		{Read: true, Write: true},
-		{Read: true, Create: true, Exclusive: true, Mode: 0600},
-		{Write: true, Create: true, Truncate: true, Mode: storage.SettableMode},
-		{Read: true, ExpectedID: 42},
+		{OpenAccess: storage.OpenAccess{Read: true}},
+		{OpenAccess: storage.OpenAccess{Write: true}},
+		{OpenAccess: storage.OpenAccess{Read: true, Write: true}},
+		{OpenAccess: storage.OpenAccess{Read: true, Create: true, Exclusive: true}, Mode: 0600},
+		{OpenAccess: storage.OpenAccess{Write: true, Create: true, Truncate: true}, Mode: storage.SettableMode},
+		{OpenAccess: storage.OpenAccess{Read: true}, ExpectedID: 42},
 	} {
 		if err := options.Check(); err != nil {
 			t.Errorf("options %+v returned %v", options, err)
@@ -44,18 +73,18 @@ func TestFileNodeOpenCannotCreateOrChangeItsRequestedIdentity(t *testing.T) {
 		options storage.FileOpenOptions
 	}{
 		{42, storage.FileOpenOptions{}},
-		{0, storage.FileOpenOptions{Read: true}},
-		{42, storage.FileOpenOptions{Read: true, ExpectedID: 43}},
-		{42, storage.FileOpenOptions{Read: true, Create: true}},
-		{42, storage.FileOpenOptions{Read: true, Create: true, Exclusive: true}},
+		{0, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}},
+		{42, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}, ExpectedID: 43}},
+		{42, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true}}},
+		{42, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true, Exclusive: true}}},
 	} {
 		if err := test.options.CheckNode(test.id); !errors.Is(err, syscall.EINVAL) {
 			t.Errorf("node %d options %+v returned %v, want EINVAL", test.id, test.options, err)
 		}
 	}
 	for _, options := range []storage.FileOpenOptions{
-		{Read: true},
-		{Write: true, Truncate: true, ExpectedID: 42},
+		{OpenAccess: storage.OpenAccess{Read: true}},
+		{OpenAccess: storage.OpenAccess{Write: true, Truncate: true}, ExpectedID: 42},
 	} {
 		if err := options.CheckNode(42); err != nil {
 			t.Errorf("node 42 options %+v returned %v", options, err)

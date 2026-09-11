@@ -32,6 +32,7 @@ flowchart LR
             volume --> Files
             Backend -. 最终转换检查 .-> Authority
         end
+        HTTP -. 语义授权 .-> Policy[嵌入方 Authorizer]
         HTTP --> volume
         HTTP --> Authority
         Backend --> Log[变更日志]
@@ -40,6 +41,8 @@ flowchart LR
     SDK --> HTTP
     Log -. 变更流 .-> Replica
 ```
+
+嵌入方在自己的认证 middleware 中提供稳定访问身份，并可配置 Authorizer 按可信 volume 与语义操作作准入决定。数据、文件控制、强占有和复制共用这项业务策略，锁能力的原生检查保持独立。
 
 普通数据操作与显式锁控制使用各自有界的 HTTP 请求；复制的订阅与快照另有长连接。锁控制的 admission 不被大块数据传输占满，变更流也与批量快照分离。
 
@@ -120,13 +123,15 @@ client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storag
 | 每个答案都带有本协议自己的标记，认不出标记的答案一律按结果未知处理 | 中途的代理或认证网关自己回的 `200` 被当成一次成功的修改 |
 | 锁管理的已确定动作结果与 grant 当前生命周期分别传递；过期、退役、未知与未授予不混为一谈 | 响应丢失后重复授予，或把已经确认的保护误认为不存在 |
 | mutation scope 完整且有界地到达同一授权方的原生发布检查，非法或失效 proof 不退回匿名执行 | 一次没有权限的修改因中间层丢掉 scope 而成功 |
-| 只有可命名的操作结果携带 errno：storage 报错、handler 在调用 storage 前依据资源边界以 `EFBIG`/`EAGAIN` 拒绝，或 mutation 已成功而 handler 无法读取 replication barrier 时以 `EIO` 报告无法确认；其余每一种非成功答案都意味着结果未知 | 一次够不到 server 被读成一句关于 volume 的事实，或一次已经发生的修改被误报成未发生（R-ERR-1、R-ERR-2） |
+| 只有可命名的操作结果携带 errno：storage 报错、handler 在调用 storage 前依据资源边界以 `EFBIG`/`EAGAIN` 拒绝、业务授权明确拒绝为 `EACCES` 或无法决定为 `EIO`，以及 mutation 已成功而 handler 无法读取 replication barrier 时以 `EIO` 报告无法确认；其余每一种非成功答案都意味着结果未知 | 一次够不到 server 被读成一句关于 volume 的事实，或一次已经发生的修改被误报成未发生（R-ERR-1、R-ERR-2） |
 | errno 以符号名传递，取自双方共有的封闭词汇表；名字不在其中即结果未知 | 一个这一侧不认识的名字被当成某个具体的失败 |
 | 响应体的分帧必须能报告自己提前结束 | 被截断的文件与一个恰好这么大的文件无从分辨 |
 | 复制帧在 metastore 载入变长字段前取得单帧预算；change/start 与 snapshot cursor 的总量分别由 stream 数推导，snapshot page 另有限制 operation、aggregate retained bytes 与等待者的 admission | wire 端的晚检查挡不住 backend 已经建立的超限 page，多条流还能把各自有界的结果累积成无界总量（R-INT-3） |
 | 每种答案的形状是确定的：缺席的属性、缺席的列表、不是 object 的 mutation response、以及 null/畸形/未知字段的 barrier 都不是这个协议的答案 | 一个零值的属性读起来是「1970 年的空文件」，一个缺席的列表读起来是「这个目录是空的」，一个假的 barrier 会让副本过早确认已经发生的修改 |
 | 复制那三个操作与请求／响应分在不同的连接上，且一次变更抵达一个健康订阅者的耗时与并发的批量传输无关 | 一次快照 —— 系统里最大的一次批量传输 —— 挤掉自己的事件通道，后果是重新拉一份快照，而触发它只需要一次正常的冷挂载 |
-| 不记变更日志的 volume 以 `ENOSYS` 拒绝这三个操作，而不是回一条空的流或一份没有行的快照 | 一份「存在、是空的、永不改变」的 volume，而这是一个副本会相信的答案 |
+| 不记变更日志的 volume 在通过已启用的授权后以 `ENOSYS` 拒绝这三个操作，不回空流或无行快照 | 一份「存在、是空的、永不改变」的 volume，而这是一个副本会相信的答案 |
+
+授权在受控数据、capability 与动作历史被访问前执行；通用传输容量限制仍可先拒绝请求。持续输出在开始、续订和每个数据／控制／保活单元前检查当前策略。拒绝只说明本次未准入，不说明此前结果未知的动作未执行；策略变化不能回滚已准入修改或撤回已交付数据。完整映射与协议由[业务授权](server/authorization.md)拥有。
 
 client 侧的 remote storage 实现 storage 接口，凡是不满足上述任何一条的答案，它一律以 `EIO` 报告，绝不把它变成一句关于 volume 的话。
 
@@ -185,7 +190,7 @@ client 侧还有第三种用法：只使用 remote storage，不挂载（R-INT-5
 
 独立二进制的进程与挂载生命周期通过本机信号管理。一个 `remote-fs` 进程就是一个挂载点，卸载靠向它发信号；独立 server 用信号停止或查询存储与锁状态，见 [`server/architecture.md`](server/architecture.md)。文件占有另有跨角色的网络控制接口，不承担进程管理。作为 package 使用时，调用方直接使用所组合 storage 的状态 API。
 
-两个角色之间没有身份认证系统，enrollment 与数据端点的访问由部署方保护。锁能力校验保证已授予保护约束所有修改，不区分调用方是否主动携带 proof；它不限制普通读取，也不替部署方建立用户权限，因此服务仍须位于可信访问边界内。
+身份认证、凭据签发与轮换、角色和 TLS 由业务方管理。嵌入式 handler 可配置可信 volume 与 Authorizer；不配置时保留外层访问控制，独立二进制没有认证配置入口。锁能力校验约束修改的原生占有顺序，业务授权控制哪些语义请求能够进入，两者不能互相替代。同一 mount／replica 固定属于同一访问身份；凭据轮换可保持身份与连接，切换身份则建立新的客户端状态。
 
 ## 七、第二层
 
@@ -195,6 +200,7 @@ client 侧还有第三种用法：只使用 remote storage，不挂载（R-INT-5
 - `server/local-disk-object-store.md` —— 本地持久 storage 的格式、打开与恢复、容量和维护
 - `server/file-locks.md` —— 显式占有、有限授予、最终发布顺序、重启保护与 HTTP 控制协议
 - `server/file-handles.md` —— 保留对象、同步区间修改、advisory owner 与文件会话协议
+- `server/authorization.md` —— 嵌入方策略、语义操作、请求与流的授权和安全错误
 - `client/architecture.md` —— remote storage、挂载呈现层、打开的文件、节点身份、生命周期
 
 第二层只写角色内部，不重讲系统全貌，跨角色只通过本文定义的接口与契约来引用。
@@ -211,7 +217,8 @@ go.mod
 packages/                    可被外部与自身 import
   locking/                   强 S/X 权限状态、有限历史与原生发布协调
   advisory/                  标准 flock/POSIX owner、范围、等待与有限历史
-  storage/                   接口定义、实现者义务与 errno 词汇（两个角色共用）
+  authz/                     嵌入方授权接口与请求，复用 storage 的操作和打开意图
+  storage/                   接口、volume 服务操作、实现者义务与 errno 词汇（两个角色共用）
     locked/                  enforcing backend 与其授权方的配对，提供不可变 scope
     lockcontract/            文件保护义务的共享验收
     localstore/              把本地对象、SQLite、外部提交见证、锁与恢复组合成一份 storage
@@ -239,7 +246,8 @@ docs/
 
 | 包 | 归属 |
 |---|---|
-| `storage` | 两个角色共用 |
+| `storage` | 两个角色共用：接口、volume 服务的语义操作与错误词汇 |
+| `authz` | 传输中性的业务授权类型；由嵌入方与 server adapter 使用 |
 | `advisory` | server 侧，按 volume 共享标准锁状态 |
 | `storage/storagetest` | 测试专用：volume 与 bounded-server 契约的可执行形式 |
 | `storage/localstore` | server 侧，持有本地对象与绑定的 SQLite metastore |

@@ -1,18 +1,93 @@
 package httprest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
-	"net/http/httptest"
-	"syscall"
-	"testing"
-	"time"
-
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
+	"net/http/httptest"
+	"reflect"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
 )
+
+func TestRetainedOpenAccessKeepsFlatStrictJSONFields(t *testing.T) {
+	action, err := storage.NewLockRequestID(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := fileRequest{
+		Op: storage.OpFileOpen, Session: strings.Repeat("a", 64), Action: action,
+		Path: []byte("file"), Data: []byte{},
+		Open: storage.FileOpenOptions{
+			OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Truncate: true, Exclusive: true},
+			ExpectedID: 9, Mode: 0o640,
+		},
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"op":"file.open"`)) || !bytes.Contains(encoded, []byte(`"open":{`)) {
+		t.Fatalf("file operation or open member changed shape: %s", encoded)
+	}
+	var decoded fileRequest
+	if err := decodeFileJSON(encoded, &decoded); err != nil || !reflect.DeepEqual(decoded, request) {
+		t.Fatalf("flattened open round trip = %+v, %v", decoded, err)
+	}
+	if err := validateFileRequest(decoded); err != nil {
+		t.Fatal(err)
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	var open map[string]json.RawMessage
+	if err := json.Unmarshal(envelope["open"], &open); err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 7 {
+		t.Fatalf("flattened open fields = %v", open)
+	}
+	for _, name := range []string{"Read", "Write", "Create", "Truncate", "Exclusive", "ExpectedID", "Mode"} {
+		if _, exists := open[name]; !exists {
+			t.Fatalf("open field %q is missing", name)
+		}
+	}
+	for _, name := range []string{"Read", "Write", "Create", "Truncate", "Exclusive"} {
+		t.Run("missing "+name, func(t *testing.T) {
+			var changed map[string]json.RawMessage
+			if err := json.Unmarshal(envelope["open"], &changed); err != nil {
+				t.Fatal(err)
+			}
+			delete(changed, name)
+			body, err := json.Marshal(changed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var options storage.FileOpenOptions
+			if err := decodeFileJSON(body, &options); err == nil {
+				t.Fatalf("missing flattened flag %q was accepted", name)
+			}
+		})
+	}
+	for _, body := range [][]byte{
+		bytes.Replace(envelope["open"], []byte(`"Read":true`), []byte(`"Read":true,"Read":false`), 1),
+		bytes.Replace(envelope["open"], []byte(`"Read":true`), []byte(`"read":true`), 1),
+		[]byte(`{"OpenAccess":{"Read":true,"Write":true,"Create":true,"Truncate":true,"Exclusive":true},"ExpectedID":9,"Mode":416}`),
+	} {
+		var options storage.FileOpenOptions
+		if err := decodeFileJSON(body, &options); err == nil {
+			t.Fatalf("noncanonical embedded flags were accepted: %s", body)
+		}
+	}
+}
 
 func retainedHTTPFixture(t *testing.T, limits FileLimits) (*Storage, *Handler, *objectstore.Storage) {
 	t.Helper()
@@ -53,7 +128,7 @@ func TestRetainedHTTPUnacknowledgedOpenExpiresDuringRenewal(t *testing.T) {
 	if err := backend.Write(ctx, "file", []byte("retained")); err != nil {
 		t.Fatal(err)
 	}
-	response, err := remote.call(ctx, fileRequest{Op: "open", Path: []byte("file"), Open: storage.FileOpenOptions{Read: true}})
+	response, err := remote.call(ctx, fileRequest{Op: storage.OpFileOpen, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}})
 	if err != nil || response.File == "" {
 		t.Fatalf("pending open = %+v, %v", response, err)
 	}
@@ -77,7 +152,7 @@ func TestRetainedHTTPUnacknowledgedOpenExpiresDuringRenewal(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if _, err := remote.call(ctx, fileRequest{Op: "ack", File: response.File}); !errors.Is(err, syscall.ESTALE) {
+	if _, err := remote.call(ctx, fileRequest{Op: storage.OpFileAck, File: response.File}); !errors.Is(err, syscall.ESTALE) {
 		t.Fatalf("expired reference acknowledgement = %v", err)
 	}
 }
@@ -98,7 +173,7 @@ func TestRetainedHTTPActionEvictionCannotRepeatAnOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := fileRequest{Op: "open", Session: remote.id, Action: id, Path: []byte("file"), Open: storage.FileOpenOptions{Read: true}}
+	request := fileRequest{Op: storage.OpFileOpen, Session: remote.id, Action: id, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}}
 	original, err := client.fileCall(ctx, request)
 	if err != nil {
 		t.Fatal(err)
@@ -143,7 +218,7 @@ func TestRetainedHTTPActionWindowRolloverRequiresNonexecutionReceipt(t *testing.
 	serverSession.mu.Lock()
 	serverSession.started = serverSession.started.Add(-serverSession.options.History)
 	serverSession.mu.Unlock()
-	file, err := remote.OpenFile(ctx, "file", storage.FileOpenOptions{Read: true})
+	file, err := remote.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
 	if err != nil {
 		t.Fatalf("new action did not advance through an exact nonexecution receipt: %v", err)
 	}
@@ -170,11 +245,11 @@ func TestRetainedHTTPRegistryLimitsFailBeforeAnotherNativeReference(t *testing.T
 	if _, err := client.NewFileSession(ctx, storage.DefaultFileSessionOptions()); !errors.Is(err, syscall.EAGAIN) {
 		t.Fatalf("session admission = %v", err)
 	}
-	response, err := remote.call(ctx, fileRequest{Op: "open", Path: []byte("file"), Open: storage.FileOpenOptions{Read: true}})
+	response, err := remote.call(ctx, fileRequest{Op: storage.OpFileOpen, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}})
 	if err != nil || response.File == "" {
 		t.Fatalf("first action = %+v, %v", response, err)
 	}
-	if _, err := remote.call(ctx, fileRequest{Op: "open", Path: []byte("file"), Open: storage.FileOpenOptions{Read: true}}); !errors.Is(err, syscall.EAGAIN) {
+	if _, err := remote.call(ctx, fileRequest{Op: storage.OpFileOpen, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}}); !errors.Is(err, syscall.EAGAIN) {
 		t.Fatalf("action admission = %v", err)
 	}
 	if _, err := remote.Renew(ctx); err != nil {

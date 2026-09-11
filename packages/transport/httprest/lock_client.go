@@ -3,11 +3,13 @@ package httprest
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/locking"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 var _ locking.Service = (*Storage)(nil)
@@ -195,6 +197,26 @@ func (s *Storage) lockControl(ctx context.Context, op Op, request, result any) e
 		return lockControlFailure(op, err, isReadOnlyLockControl(op))
 	}
 	if response.StatusCode == StatusStorageError {
+		var members map[string]json.RawMessage
+		if err := json.Unmarshal(content, &members); err != nil {
+			return lockControlFailure(op, err, false)
+		}
+		_, hasCode := members["lockCode"]
+		_, hasRecorded := members["recorded"]
+		if !hasCode && !hasRecorded {
+			var failure struct {
+				Errno   string `json:"errno"`
+				Message string `json:"message"`
+			}
+			if err := decodeLockJSON(content, &failure); err != nil {
+				return lockControlFailure(op, err, false)
+			}
+			errno, known := storage.ErrnoByName(failure.Errno)
+			if !known || errno != syscall.EACCES && errno != syscall.EIO {
+				return lockControlFailure(op, errors.New("lock authorization response errno is invalid"), false)
+			}
+			return &operationError{req: Request{Op: op}, errno: errno, detail: failure.Message}
+		}
 		var failure lockErrorResponse
 		if err := decodeLockJSON(content, &failure); err != nil {
 			return lockControlFailure(op, err, false)

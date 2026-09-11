@@ -1,6 +1,7 @@
 package httprest
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -480,4 +481,58 @@ func (p *SnapshotPage) UnmarshalJSON(data []byte) error {
 // so this frame decides only whether anyone can say afterwards what went wrong.
 type StreamFault struct {
 	Message string `json:"message"`
+	// Errno is absent for generic faults. Authorization faults carry only EACCES
+	// or EIO; a present null, empty, or unknown value is a protocol failure.
+	Errno *string `json:"errno,omitempty"`
+}
+
+func (f *StreamFault) UnmarshalJSON(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token != json.Delim('{') {
+		return errors.New("the stream fault must be an object")
+	}
+	var decoded StreamFault
+	var hasMessage, hasErrno bool
+	for decoder.More() {
+		field, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return err
+		}
+		switch field {
+		case "message":
+			if hasMessage {
+				return errors.New("the stream fault repeats its message")
+			}
+			hasMessage = true
+			if err := json.Unmarshal(raw, &decoded.Message); err != nil {
+				return err
+			}
+		case "errno":
+			if hasErrno {
+				return errors.New("the stream fault repeats its errno")
+			}
+			hasErrno = true
+			var name string
+			if err := json.Unmarshal(raw, &name); err != nil {
+				return fmt.Errorf("the stream fault errno does not decode: %w", err)
+			}
+			if name != "EACCES" && name != "EIO" {
+				return errors.New("the stream fault carries an unsupported errno")
+			}
+			decoded.Errno = &name
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return err
+	}
+	*f = decoded
+	return nil
 }

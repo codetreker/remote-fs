@@ -5,6 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/codetreker/remote-fs/packages/locking"
+	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"io"
 	"math"
 	"net/http"
@@ -15,11 +19,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/codetreker/remote-fs/packages/locking"
-	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
-	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 )
 
 func openRetainedFixture(t *testing.T, client *Storage) (*remoteFileSession, *remoteFile) {
@@ -33,7 +32,7 @@ func openRetainedFixture(t *testing.T, client *Storage) (*remoteFileSession, *re
 			t.Error(err)
 		}
 	})
-	f, err := s.OpenFile(context.Background(), "file", storage.FileOpenOptions{Read: true, Write: true})
+	f, err := s.OpenFile(context.Background(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +50,7 @@ func TestRetainedHTTPRejectsMissingZeroValuedRequestMembers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	complete := fileRequest{Op: "truncate", Session: session.id, File: file.id, Action: action, Offset: 3, Path: []byte{}, Data: []byte{}}
+	complete := fileRequest{Op: storage.OpFileTruncate, Session: session.id, File: file.id, Action: action, Offset: 3, Path: []byte{}, Data: []byte{}}
 	encoded, err := json.Marshal(complete)
 	if err != nil {
 		t.Fatal(err)
@@ -179,7 +178,7 @@ func TestRetainedHTTPCleanupAndAcknowledgementSurviveDataHistoryCapacity(t *test
 		t.Fatal(err)
 	}
 	defer other.Close(ctx)
-	observer, err := other.OpenFile(ctx, "file", storage.FileOpenOptions{Read: true, Write: true})
+	observer, err := other.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +303,7 @@ func TestRetainedHTTPCancellationAfterOpenEffectIsEIOAndCleansReference(t *testi
 	original := client.http.Transport
 	client.http.Transport = fileRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		var operation struct {
-			Op string `json:"op"`
+			Op storage.Operation `json:"op"`
 		}
 		body, err := io.ReadAll(req.Body)
 		if err != nil {
@@ -318,7 +317,7 @@ func TestRetainedHTTPCancellationAfterOpenEffectIsEIOAndCleansReference(t *testi
 		if err != nil {
 			return nil, err
 		}
-		if operation.Op == "open" {
+		if operation.Op == storage.OpFileOpen {
 			body, err = io.ReadAll(response.Body)
 			response.Body.Close()
 			if err != nil {
@@ -329,7 +328,7 @@ func TestRetainedHTTPCancellationAfterOpenEffectIsEIOAndCleansReference(t *testi
 		}
 		return response, nil
 	})
-	_, err = session.OpenFile(ctx, "created", storage.FileOpenOptions{Read: true, Write: true, Create: true, Exclusive: true, Mode: 0600})
+	_, err = session.OpenFile(ctx, "created", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Exclusive: true}, Mode: 0600})
 	client.http.Transport = original
 	if !errors.Is(err, syscall.EIO) || storage.ErrnoOf(err) == syscall.EINTR || !errors.Is(err, context.Canceled) {
 		t.Fatalf("post-create interruption = %v", err)
@@ -431,7 +430,7 @@ func TestRetainedHTTPCleanupHistoryExhaustionRetiresOwnedLocks(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer observerSession.Close(ctx)
-	observer, err := observerSession.OpenFile(ctx, "file", storage.FileOpenOptions{Read: true, Write: true})
+	observer, err := observerSession.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +478,7 @@ func TestRetainedHTTPAcceptedSmallBodyLimitSupportsSessionAndFileCalls(t *testin
 	if _, err := session.Renew(ctx); err != nil {
 		t.Fatal(err)
 	}
-	file, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{Read: true, Write: true})
+	file, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +538,7 @@ func TestRetainedHTTPFileScopeIsFrozenAndReadDoesNotCarryProof(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close(ctx)
-	file, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{Read: true, Write: true})
+	file, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -582,7 +581,7 @@ func TestRetainedHTTPEnrollmentEnforcesTheServerFileSizeCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close(ctx)
-	file, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{Read: true, Write: true})
+	file, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -702,7 +701,7 @@ func TestRetainedHTTPQueuedCloseDuringStopCannotAcknowledgeUndrainedCleanup(t *t
 			if err != nil {
 				t.Fatal(err)
 			}
-			file, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{Read: true})
+			file, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -822,10 +821,29 @@ func TestRetainedHTTPUnlockReceiptDistinguishesReleaseFromAcquisition(t *testing
 				}
 				return id
 			}
+			original := client.http.Transport
+			defer func() { client.http.Transport = original }()
+			var sent atomic.Value
+			client.http.Transport = fileRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				body, err := io.ReadAll(request.Body)
+				if err != nil {
+					return nil, err
+				}
+				request.Body = io.NopCloser(bytes.NewReader(body))
+				var wire fileRequest
+				if err := json.Unmarshal(body, &wire); err != nil {
+					return nil, err
+				}
+				sent.Store(wire.Op)
+				return original.RoundTrip(request)
+			})
 			lock := storage.FileLock{Family: family, Type: storage.Exclusive, End: math.MaxInt64}
 			acquisition := nextID()
 			if result, err := file.SetLock(ctx, 0, lock, acquisition); err != nil || result.State != storage.LockGranted || !result.EverGranted {
 				t.Fatalf("acquisition = %+v, %v", result, err)
+			}
+			if op := sent.Load(); op != storage.OpFileSetLock {
+				t.Fatalf("acquisition wire operation = %v; want %s", op, storage.OpFileSetLock)
 			}
 			unlock := lock
 			unlock.Type = storage.Unlock
@@ -833,6 +851,9 @@ func TestRetainedHTTPUnlockReceiptDistinguishesReleaseFromAcquisition(t *testing
 			result, err := file.SetLock(ctx, 0, unlock, release)
 			if err != nil || result.State != storage.LockReleased || result.EverGranted || result.Lock != unlock {
 				t.Fatalf("explicit unlock receipt = %+v, %v", result, err)
+			}
+			if op := sent.Load(); op != storage.OpFileUnlock {
+				t.Fatalf("unlock wire operation = %v; want %s", op, storage.OpFileUnlock)
 			}
 			result, err = file.QueryLock(ctx, 0, release)
 			if err != nil || result.State != storage.LockReleased || result.EverGranted || result.Lock != unlock {
@@ -930,7 +951,7 @@ func TestRetainedHTTPPendingExpiryRetainsCapabilityAndChargeUntilNativeClose(t *
 		t.Fatal(err)
 	}
 	remote := session.(*remoteFileSession)
-	opened, err := remote.call(ctx, fileRequest{Op: "open", Path: []byte("file"), Open: storage.FileOpenOptions{Read: true}})
+	opened, err := remote.call(ctx, fileRequest{Op: storage.OpFileOpen, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -958,7 +979,7 @@ func TestRetainedHTTPPendingExpiryRetainsCapabilityAndChargeUntilNativeClose(t *
 	}
 	outcome := make(chan error, 1)
 	go func() {
-		_, err := client.fileCall(ctx, fileRequest{Op: "close", Session: remote.id, File: opened.File})
+		_, err := client.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: remote.id, File: opened.File})
 		outcome <- err
 	}()
 	select {

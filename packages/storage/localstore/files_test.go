@@ -23,7 +23,7 @@ func TestStoreCloseRetiresRetainedFilesBeforeClosingDurableStorage(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true, Write: true, Create: true})
+	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestStoreCloseKeepsOwnershipUntilRetainedCleanupSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true, Write: true, Create: true})
+	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
 	if err != nil {
 		t.Fatal(err)
 	}

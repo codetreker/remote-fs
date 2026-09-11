@@ -60,10 +60,10 @@ func TestWalkingAMountedTreeCachesNamesAndConfirmsIdentityAttributes(t *testing.
 		}
 	}
 
-	if arrived := s.calls.sinceExcept(before, "file:stat-node", "file-control:renew"); arrived != "" {
+	if arrived := s.calls.sinceExcept(before, fileStatNodeCall, fileRenewCall); arrived != "" {
 		t.Fatalf("walking a copied tree sent unexpected named/data requests: %s", arrived)
 	}
-	identityStats := s.calls.snapshot()["file:stat-node"] - before["file:stat-node"]
+	identityStats := s.calls.snapshot()[fileStatNodeCall] - before[fileStatNodeCall]
 	if identityStats == 0 {
 		t.Fatal("inode attributes were never confirmed by identity")
 	}
@@ -120,10 +120,10 @@ func TestADirectoryRenameKeepsTheIdentitiesBeneathIt(t *testing.T) {
 	}
 
 	// The rename is the only named mutation; inode attributes still use identity queries.
-	if arrived := s.calls.sinceExcept(before, "file:stat-node", "file-control:renew"); arrived != "rename×1" {
+	if arrived := s.calls.sinceExcept(before, fileStatNodeCall, fileRenewCall); arrived != "rename×1" {
 		t.Fatalf("renaming a directory and reading its copied subtree sent %q, want only one named rename", arrived)
 	}
-	t.Logf("renamed and inspected the subtree with %d authoritative identity stats", s.calls.snapshot()["file:stat-node"]-before["file:stat-node"])
+	t.Logf("renamed and inspected the subtree with %d authoritative identity stats", s.calls.snapshot()[fileStatNodeCall]-before[fileStatNodeCall])
 }
 
 // ENOSYS selects direct remote operations when a handler does not publish replication.

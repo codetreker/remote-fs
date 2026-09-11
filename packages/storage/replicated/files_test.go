@@ -34,7 +34,7 @@ func retainedSession(t *testing.T, volume storage.FileStorage) storage.FileSessi
 
 func retainedOpen(t *testing.T, session storage.FileSession, path string, create bool) storage.File {
 	t.Helper()
-	file, err := session.OpenFile(t.Context(), path, storage.FileOpenOptions{Read: true, Write: true, Create: create, Mode: 0600})
+	file, err := session.OpenFile(t.Context(), path, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: create}, Mode: 0600})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestRetainedFileQueriesTheAuthorityAfterRenameAndUnlink(t *testing.T) {
 	if attr, err := session.StatNode(t.Context(), created.ID); err != nil || attr.ID != created.ID {
 		t.Fatalf("detached node stat: %+v, %v", attr, err)
 	}
-	byID, err := session.OpenNode(t.Context(), created.ID, storage.FileOpenOptions{Read: true, ExpectedID: created.ID})
+	byID, err := session.OpenNode(t.Context(), created.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}, ExpectedID: created.ID})
 	if err != nil {
 		t.Fatal("opening the retained identity required its former name:", err)
 	}

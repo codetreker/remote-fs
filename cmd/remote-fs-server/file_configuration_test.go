@@ -123,7 +123,7 @@ func TestNativeFileLimitsReachTheLocalStore(t *testing.T) {
 		}
 		t.Fatalf("second native file session returned %v, want ENOLCK", err)
 	}
-	options := storage.FileOpenOptions{Read: true, Write: true, Create: true, Mode: 0o600}
+	options := storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0o600}
 	first, err := session.OpenFile(t.Context(), "first", options)
 	if err != nil {
 		t.Fatal(err)

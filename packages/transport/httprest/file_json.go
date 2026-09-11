@@ -5,12 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/codetreker/remote-fs/packages/storage"
 	"io"
 	"math"
 	"reflect"
 	"unicode/utf8"
-
-	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func decodeFileJSON(data []byte, target any) error {
@@ -42,14 +41,14 @@ func validFileCapability(cap string) bool {
 
 func validateFileRequest(r fileRequest) error {
 	expected := fileRequest{Op: r.Op, Session: r.Session, Action: r.Action, Path: []byte{}, Data: []byte{}}
-	if r.Op == "new" {
+	if r.Op == storage.OpFileSessionOpen {
 		if r.Session != "" {
 			return errors.New("new file session cannot name a previous session")
 		}
 	} else if !validFileCapability(r.Session) {
 		return errors.New("invalid file session capability")
 	}
-	if fileActionRequired(r.Op) || r.Action != "" && (r.Op == "close" || r.Op == "session-close") {
+	if fileActionRequired(r.Op) || r.Action != "" && (r.Op == storage.OpFileClose || r.Op == storage.OpFileSessionClose) {
 		if _, err := r.Action.Epoch(); err != nil {
 			return err
 		}
@@ -57,50 +56,50 @@ func validateFileRequest(r fileRequest) error {
 		return errors.New("file operation does not accept an action identity")
 	}
 	switch r.Op {
-	case "new":
+	case storage.OpFileSessionOpen:
 		expected.Options = r.Options
-	case "status", "renew", "session-close":
-	case "open":
+	case storage.OpFileStatus, storage.OpFileRenew, storage.OpFileSessionClose:
+	case storage.OpFileOpen:
 		expected.Path = r.Path
 		expected.Open = r.Open
-	case "open-node":
+	case storage.OpFileOpenNode:
 		expected.Node = r.Node
 		expected.Open = r.Open
-	case "stat-node":
+	case storage.OpFileStatNode:
 		expected.Node = r.Node
-	case "set-node-attr":
+	case storage.OpFileSetNodeAttr:
 		expected.Node = r.Node
 		expected.Change = r.Change
-	case "stat", "sync", "close", "ack":
+	case storage.OpFileStat, storage.OpFileSync, storage.OpFileClose, storage.OpFileAck:
 		expected.File = r.File
-	case "read":
+	case storage.OpFileRead:
 		expected.File = r.File
 		expected.Offset = r.Offset
 		expected.Length = r.Length
-	case "write":
+	case storage.OpFileWrite:
 		expected.File = r.File
 		expected.Offset = r.Offset
 		expected.Data = r.Data
-	case "truncate":
+	case storage.OpFileTruncate:
 		expected.File = r.File
 		expected.Offset = r.Offset
-	case "set-attr":
+	case storage.OpFileSetAttr:
 		expected.File = r.File
 		expected.Change = r.Change
-	case "get-lock":
+	case storage.OpFileGetLock:
 		expected.File = r.File
 		expected.Owner = r.Owner
 		expected.Lock = r.Lock
-	case "set-lock":
+	case storage.OpFileSetLock, storage.OpFileUnlock:
 		expected.File = r.File
 		expected.Owner = r.Owner
 		expected.Lock = r.Lock
 		expected.LockID = r.LockID
-	case "query-lock", "cancel-lock":
+	case storage.OpFileQueryLock, storage.OpFileCancelLock:
 		expected.File = r.File
 		expected.Owner = r.Owner
 		expected.LockID = r.LockID
-	case "drop-locks":
+	case storage.OpFileDropLocks:
 		expected.File = r.File
 		expected.Owner = r.Owner
 		expected.Family = r.Family
@@ -114,12 +113,12 @@ func validateFileRequest(r fileRequest) error {
 		return errors.New("invalid file reference capability")
 	}
 	switch r.Op {
-	case "stat", "sync", "close", "ack", "read", "write", "truncate", "set-attr", "get-lock", "set-lock", "query-lock", "cancel-lock", "drop-locks":
+	case storage.OpFileStat, storage.OpFileSync, storage.OpFileClose, storage.OpFileAck, storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileGetLock, storage.OpFileSetLock, storage.OpFileUnlock, storage.OpFileQueryLock, storage.OpFileCancelLock, storage.OpFileDropLocks:
 		if !validFileCapability(r.File) {
 			return errors.New("file operation has no reference capability")
 		}
 	}
-	if (r.Op == "set-attr" || r.Op == "set-node-attr") && r.Change == nil {
+	if (r.Op == storage.OpFileSetAttr || r.Op == storage.OpFileSetNodeAttr) && r.Change == nil {
 		return errors.New("file attribute operation carries no change")
 	}
 	return nil
@@ -137,29 +136,29 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		expected.Retry = true
 	} else {
 		switch req.Op {
-		case "new":
+		case storage.OpFileSessionOpen:
 			expected.Session = r.Session
 			expected.Status = r.Status
-		case "status", "renew":
+		case storage.OpFileStatus, storage.OpFileRenew:
 			expected.Status = r.Status
-		case "open", "open-node":
+		case storage.OpFileOpen, storage.OpFileOpenNode:
 			expected.File = r.File
 			expected.Barrier = r.Barrier
-		case "stat", "stat-node":
+		case storage.OpFileStat, storage.OpFileStatNode:
 			expected.Attr = r.Attr
-		case "read":
+		case storage.OpFileRead:
 			expected.Attr = r.Attr
 			expected.Data = r.Data
-		case "write", "truncate", "set-attr", "set-node-attr":
+		case storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetNodeAttr:
 			expected.Attr = r.Attr
 			expected.Barrier = r.Barrier
-		case "sync":
+		case storage.OpFileSync:
 			expected.Barrier = r.Barrier
-		case "get-lock":
+		case storage.OpFileGetLock:
 			expected.Conflict = r.Conflict
-		case "set-lock", "query-lock", "cancel-lock":
+		case storage.OpFileSetLock, storage.OpFileUnlock, storage.OpFileQueryLock, storage.OpFileCancelLock:
 			expected.Attempt = r.Attempt
-		case "ack", "close", "session-close", "drop-locks":
+		case storage.OpFileAck, storage.OpFileClose, storage.OpFileSessionClose, storage.OpFileDropLocks:
 		default:
 			return errors.New("unknown file response variant")
 		}
@@ -171,27 +170,27 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		return nil
 	}
 	switch req.Op {
-	case "new":
+	case storage.OpFileSessionOpen:
 		if !validFileCapability(r.Session) || r.Status == nil {
 			return errors.New("file session response has no valid capability or status")
 		}
-	case "status", "renew":
+	case storage.OpFileStatus, storage.OpFileRenew:
 		if r.Status == nil {
 			return errors.New("file response carries no status")
 		}
-	case "open", "open-node":
+	case storage.OpFileOpen, storage.OpFileOpenNode:
 		if !validFileCapability(r.File) {
 			return errors.New("file open response carries no reference capability")
 		}
-	case "read", "stat", "stat-node", "write", "truncate", "set-attr", "set-node-attr":
+	case storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetNodeAttr:
 		if r.Attr == nil {
 			return errors.New("file response carries no attributes")
 		}
-	case "get-lock":
+	case storage.OpFileGetLock:
 		if r.Conflict == nil {
 			return errors.New("file response carries no conflict result")
 		}
-	case "set-lock", "query-lock", "cancel-lock":
+	case storage.OpFileSetLock, storage.OpFileUnlock, storage.OpFileQueryLock, storage.OpFileCancelLock:
 		if r.Attempt == nil {
 			return errors.New("file response carries no lock action result")
 		}
@@ -206,7 +205,7 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if r.Attr.ID == 0 || r.Attr.AccessTime.Nanos < 0 || r.Attr.AccessTime.Nanos >= 1e9 || r.Attr.ModTime.Nanos < 0 || r.Attr.ModTime.Nanos >= 1e9 {
 			return errors.New("invalid captured file attributes")
 		}
-		if req.Op != "stat-node" && req.Op != "set-node-attr" && (r.Attr.Size < 0 || !r.Attr.Storage().Mode.IsRegular()) {
+		if req.Op != storage.OpFileStatNode && req.Op != storage.OpFileSetNodeAttr && (r.Attr.Size < 0 || !r.Attr.Storage().Mode.IsRegular()) {
 			return errors.New("file reference returned nonregular attributes")
 		}
 	}
@@ -256,7 +255,7 @@ func validateFileAttempt(req fileRequest, a storage.LockAttempt) error {
 	if a.HistoryRemaining < 0 {
 		return errors.New("lock history lifetime is negative")
 	}
-	if req.Op == "set-lock" && a.Lock != req.Lock {
+	if (req.Op == storage.OpFileSetLock || req.Op == storage.OpFileUnlock) && a.Lock != req.Lock {
 		return errors.New("lock result identifies a different intent")
 	}
 	switch a.State {

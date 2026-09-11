@@ -20,7 +20,7 @@ handler 接受的是已配对的 volume 与锁服务。把一个锁服务与另�
 
 Session、Owner、Resource、Grant 与 Request 各有独立身份。Owner 属于一个 Session；资源身份指向该授权方认识的一个 backend 文件；Grant 指向一次授予；Request 指向同一持有者的一次管理意图。身份不复用，旧授权方的身份不能指向新授权方里的对象。
 
-Session、Owner 与 Grant 是不可伪造的 bearer capability，使用至少 128 bit 的密码学不可预测性，或认证其授权方及父级绑定的 MAC；单调编号本身不能充当权限。验证同时检查 Session / Owner / Grant 的归属关系。能力值不进入错误、日志、全局状态或 URL。部署方控制 enrollment 入口的访问，这套所有权证明不引入身份提供者。
+Session、Owner 与 Grant 是不可伪造的 bearer capability，使用至少 128 bit 的密码学不可预测性，或认证其授权方及父级绑定的 MAC；单调编号本身不能充当权限。验证同时检查 Session / Owner / Grant 的归属关系。能力值不进入错误、日志、全局状态或 URL。enrollment 与其它控制入口可通过[业务授权](authorization.md)独立决定准入；身份认证仍在业务方。这套所有权证明不绑定业务身份，已有 capability 和重放请求也不能跳过已启用的授权。拒绝 Query／Cancel 只描述本次准入，不说明此前未知动作未发生。
 
 `GrantRef` 包含授予身份、资源身份与 generation。它不表示文件内容版本，也不表示 change-log position。续期 revision 与剩余保护间隔描述授予当前的状态，不能用作内容比较前置条件。
 

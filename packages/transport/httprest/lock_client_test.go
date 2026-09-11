@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/locking"
 )
 
@@ -810,5 +811,197 @@ func TestLockControlErrorDiagnosticBoundPreservesClassification(t *testing.T) {
 	}
 	if _, err := marshalLockJSON(failure); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLockClientAuthorizationErrorsHaveNoNativeOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		errno      syscall.Errno
+	}{
+		{"denied", `{"errno":"EACCES","message":"access denied"}`, syscall.EACCES},
+		{"failed", `{"errno":"EIO","message":"authorization failed"}`, syscall.EIO},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for name, call := range map[string]func(*Storage) error{
+				"enroll": func(s *Storage) error { _, err := s.BeginEnrollment(t.Context()); return err },
+				"acquire": func(s *Storage) error {
+					got, err := s.Acquire(t.Context(), lockTestAcquire())
+					if !reflect.DeepEqual(got, locking.ActionResult{}) {
+						t.Fatalf("invented acquisition: %+v", got)
+					}
+					return err
+				},
+				"query": func(s *Storage) error {
+					got, err := s.QueryAction(t.Context(), lockTestOwner, "acquisition")
+					if !reflect.DeepEqual(got, locking.ActionResult{}) {
+						t.Fatalf("invented query: %+v", got)
+					}
+					return err
+				},
+				"cancel": func(s *Storage) error {
+					got, err := s.Cancel(t.Context(), lockTestOwner, "acquisition")
+					if got != (locking.CancelResult{}) {
+						t.Fatalf("invented cancellation: %+v", got)
+					}
+					return err
+				},
+			} {
+				t.Run(name, func(t *testing.T) {
+					client := lockTestClient(t, func(*http.Request) (*http.Response, error) {
+						r := lockTestResponse(tc.body)
+						r.StatusCode = StatusStorageError
+						return r, nil
+					})
+					err := call(client)
+					var ordinary *operationError
+					var native *locking.Error
+					if !errors.Is(err, tc.errno) || !errors.As(err, &ordinary) || ordinary.unknown || errors.As(err, &native) {
+						t.Fatalf("authorization outcome = %#v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestLockClientAuthorizationEnvelopeIsAnExactUnion(t *testing.T) {
+	for name, body := range map[string]string{
+		"recorded without code":  `{"errno":"EACCES","message":"access denied","recorded":false}`,
+		"code without recorded":  `{"errno":"EACCES","message":"access denied","lockCode":"conflict"}`,
+		"null code":              `{"errno":"EACCES","message":"access denied","lockCode":null}`,
+		"null recorded":          `{"errno":"EACCES","message":"access denied","recorded":null}`,
+		"inconsistent native":    `{"errno":"EACCES","message":"access denied","lockCode":"conflict","recorded":false}`,
+		"native code wrong type": `{"errno":"EACCES","message":"access denied","lockCode":3,"recorded":false}`,
+		"missing errno":          `{"message":"access denied"}`,
+		"missing message":        `{"errno":"EACCES"}`,
+		"null errno":             `{"errno":null,"message":"access denied"}`,
+		"null message":           `{"errno":"EACCES","message":null}`,
+		"nonstring errno":        `{"errno":13,"message":"access denied"}`,
+		"nonstring message":      `{"errno":"EACCES","message":false}`,
+		"unknown errno":          `{"errno":"NEW_ERRNO","message":"access denied"}`,
+		"ordinary native errno":  `{"errno":"EBUSY","message":"access denied"}`,
+		"extra":                  `{"errno":"EACCES","message":"access denied","action":{}}`,
+		"duplicate":              `{"errno":"EIO","errno":"EACCES","message":"access denied"}`,
+		"case mismatch":          `{"Errno":"EACCES","message":"access denied"}`,
+		"trailing":               `{"errno":"EACCES","message":"access denied"}{}`,
+		"array":                  `[]`, "null": `null`, "invalid": `not json`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := lockTestClient(t, func(*http.Request) (*http.Response, error) {
+				r := lockTestResponse(body)
+				r.StatusCode = StatusStorageError
+				return r, nil
+			})
+			result, err := client.Acquire(t.Context(), lockTestAcquire())
+			var ordinary *operationError
+			var native *locking.Error
+			if !errors.Is(err, syscall.EIO) || errors.Is(err, syscall.EACCES) || !errors.As(err, &ordinary) || !ordinary.unknown || errors.As(err, &native) || !reflect.DeepEqual(result, locking.ActionResult{}) {
+				t.Fatalf("malformed authorization response = %+v, %#v", result, err)
+			}
+		})
+	}
+}
+
+func TestLockClientAuthorizationEnvelopeRequiresProtocolAndCompleteBoundedBody(t *testing.T) {
+	for name, damage := range map[string]func(*http.Response){
+		"missing protocol": func(r *http.Response) { r.Header.Del(HeaderProtocol) },
+		"wrong protocol":   func(r *http.Response) { r.Header.Set(HeaderProtocol, "0") },
+		"wrong status":     func(r *http.Response) { r.StatusCode = http.StatusForbidden },
+		"oversized":        func(r *http.Response) { r.ContentLength = DefaultMaxLockControlBytes + 1 },
+		"truncated":        func(r *http.Response) { r.ContentLength++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := lockTestClient(t, func(*http.Request) (*http.Response, error) {
+				r := lockTestResponse(`{"errno":"EACCES","message":"access denied"}`)
+				r.StatusCode = StatusStorageError
+				damage(r)
+				return r, nil
+			})
+			_, err := client.BeginEnrollment(t.Context())
+			if !errors.Is(err, syscall.EIO) || errors.Is(err, syscall.EACCES) {
+				t.Fatalf("invalid transport authorization = %v", err)
+			}
+		})
+	}
+}
+
+func TestLockClientDeniedReconciliationPreservesUnknownAcquisition(t *testing.T) {
+	first := true
+	client := lockTestClient(t, func(*http.Request) (*http.Response, error) {
+		if first {
+			first = false
+			return nil, errors.New("lost acquisition response")
+		}
+		r := lockTestResponse(`{"errno":"EACCES","message":"access denied"}`)
+		r.StatusCode = StatusStorageError
+		return r, nil
+	})
+	result, original := client.Acquire(t.Context(), lockTestAcquire())
+	var unknown *operationError
+	if !errors.As(original, &unknown) || !unknown.unknown || !reflect.DeepEqual(result, locking.ActionResult{}) {
+		t.Fatalf("lost reply = %+v, %v", result, original)
+	}
+	queried, err := client.QueryAction(t.Context(), lockTestOwner, "acquisition")
+	if !errors.Is(err, syscall.EACCES) || !reflect.DeepEqual(queried, locking.ActionResult{}) {
+		t.Fatalf("denied query = %+v, %v", queried, err)
+	}
+	cancelled, err := client.Cancel(t.Context(), lockTestOwner, "acquisition")
+	if !errors.Is(err, syscall.EACCES) || cancelled != (locking.CancelResult{}) {
+		t.Fatalf("denied cancel = %+v, %v", cancelled, err)
+	}
+	if !unknown.unknown || !errors.Is(original, syscall.EIO) {
+		t.Fatalf("reconciliation changed original unknown result: %v", original)
+	}
+}
+
+func TestLockClientDecodesRealHandlerAuthorizationRefusals(t *testing.T) {
+	backing := volumeFixture(t)
+	for _, tc := range []struct {
+		name    string
+		cause   error
+		errno   syscall.Errno
+		message string
+	}{
+		{"denied", errors.Join(authz.ErrDenied, errors.New("private authorization detail"), syscall.ENOENT), syscall.EACCES, "access denied"},
+		{"failed", fmt.Errorf("private policy detail: %w", syscall.EACCES), syscall.EIO, "authorization failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			options := DefaultHandlerOptions()
+			options.Volume = "client-authorization"
+			options.Authorizer = authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return tc.cause })
+			handler, err := NewHandlerWithOptions(backing, nil, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(handler)
+			t.Cleanup(func() {
+				server.Close()
+				if err := handler.Close(context.Background()); err != nil {
+					t.Error(err)
+				}
+			})
+			client, err := Dial(server.URL, server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, call := range map[string]func() error{
+				"enroll":      func() error { _, err := client.BeginEnrollment(t.Context()); return err },
+				"acquire":     func() error { _, err := client.Acquire(t.Context(), lockTestAcquire()); return err },
+				"query":       func() error { _, err := client.QueryAction(t.Context(), lockTestOwner, "acquisition"); return err },
+				"cancel":      func() error { _, err := client.Cancel(t.Context(), lockTestOwner, "acquisition"); return err },
+				"subscribe":   func() error { _, err := client.Subscribe(t.Context()); return err },
+				"resubscribe": func() error { _, err := client.Resubscribe(t.Context(), "log", 3); return err },
+				"snapshot":    func() error { _, err := client.Snapshot(t.Context()); return err },
+			} {
+				t.Run(name, func(t *testing.T) {
+					err := call()
+					var native *locking.Error
+					if !errors.Is(err, tc.errno) || errors.Is(err, syscall.ENOENT) || errors.As(err, &native) || !strings.Contains(err.Error(), tc.message) || strings.Contains(err.Error(), "private") {
+						t.Fatalf("authorization response = %v", err)
+					}
+				})
+			}
+		})
 	}
 }

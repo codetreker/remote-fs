@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/transport/httprest"
 	"io"
 	"math"
 	"net/http"
@@ -13,9 +15,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
 func filePair(t *testing.T, backend storage.Storage) (*httprest.Storage, *httprest.Handler) {
@@ -80,7 +79,7 @@ func TestRetainedHTTPFileTracksCurrentObjectAcrossUnlinkAndReplacement(t *testin
 	}
 	client, _ := filePair(t, backend)
 	session := fileSession(t, client)
-	file := openHTTPFile(t, session, "file", storage.FileOpenOptions{ExpectedID: original.ID, Read: true, Write: true})
+	file := openHTTPFile(t, session, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}, ExpectedID: original.ID})
 	if err := backend.Write(ctx, "file", []byte("newer content")); err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +107,7 @@ func TestRetainedHTTPFileTracksCurrentObjectAcrossUnlinkAndReplacement(t *testin
 	if err != nil || string(current) != "replacement" {
 		t.Fatalf("replacement = %q, %v", current, err)
 	}
-	if _, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{ExpectedID: original.ID, Read: true}); !errors.Is(err, syscall.ESTALE) {
+	if _, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}, ExpectedID: original.ID}); !errors.Is(err, syscall.ESTALE) {
 		t.Fatalf("identity mismatch = %v", err)
 	}
 }
@@ -123,8 +122,8 @@ func TestRetainedHTTPAdvisoryCoordinatesAcrossHandlers(t *testing.T) {
 	b, _ := filePair(t, backend)
 	sa := fileSession(t, a)
 	sb := fileSession(t, b)
-	fa := openHTTPFile(t, sa, "file", storage.FileOpenOptions{Read: true, Write: true})
-	fb := openHTTPFile(t, sb, "file", storage.FileOpenOptions{Read: true, Write: true})
+	fa := openHTTPFile(t, sa, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
+	fb := openHTTPFile(t, sb, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	status, err := sa.Status(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -169,14 +168,14 @@ func TestRetainedHTTPAdvisoryCoordinatesAcrossHandlers(t *testing.T) {
 type dropFileReply struct {
 	next      http.RoundTripper
 	mu        sync.Mutex
-	operation string
+	operation storage.Operation
 	dropped   bool
 	after     func() error
 }
 
 func (d *dropFileReply) RoundTrip(req *http.Request) (*http.Response, error) {
 	var op struct {
-		Op string `json:"op"`
+		Op storage.Operation `json:"op"`
 	}
 	if req.Body != nil {
 		content, err := io.ReadAll(req.Body)
@@ -226,7 +225,7 @@ func TestRetainedHTTPReplaysLostOpenWithoutAnotherReference(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	transport := &dropFileReply{next: server.Client().Transport, operation: "open"}
+	transport := &dropFileReply{next: server.Client().Transport, operation: storage.OpFileOpen}
 	client, err := httprest.Dial(server.URL, &http.Client{Transport: transport})
 	if err != nil {
 		t.Fatal(err)
@@ -238,7 +237,7 @@ func TestRetainedHTTPReplaysLostOpenWithoutAnotherReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close(ctx)
-	first, err := session.OpenFile(ctx, "created", storage.FileOpenOptions{Read: true, Write: true, Create: true, Exclusive: true, Mode: 0600})
+	first, err := session.OpenFile(ctx, "created", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Exclusive: true}, Mode: 0600})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +247,7 @@ func TestRetainedHTTPReplaysLostOpenWithoutAnotherReference(t *testing.T) {
 	if err := first.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	second, err := session.OpenFile(ctx, "created", storage.FileOpenOptions{Read: true})
+	second, err := session.OpenFile(ctx, "created", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
 	if err != nil {
 		t.Fatalf("the repeated open retained an extra reference: %v", err)
 	}
@@ -274,13 +273,13 @@ func TestRetainedHTTPReplaysLostTruncateWithoutReapplyingIt(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	transport := &dropFileReply{next: server.Client().Transport, operation: "truncate", after: func() error { return backend.Write(ctx, "file", []byte("later update")) }}
+	transport := &dropFileReply{next: server.Client().Transport, operation: storage.OpFileTruncate, after: func() error { return backend.Write(ctx, "file", []byte("later update")) }}
 	client, err := httprest.Dial(server.URL, &http.Client{Transport: transport})
 	if err != nil {
 		t.Fatal(err)
 	}
 	session := fileSession(t, client)
-	file := openHTTPFile(t, session, "file", storage.FileOpenOptions{Read: true, Write: true})
+	file := openHTTPFile(t, session, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	attr, err := file.Truncate(ctx, 1)
 	if err != nil || attr.Size != 1 {
 		t.Fatalf("truncate receipt = %+v, %v", attr, err)
@@ -304,11 +303,11 @@ func TestRetainedHTTPHandlerCloseRetiresOnlyOwnedSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	sb := fileSession(t, b)
-	fa, err := sa.OpenFile(ctx, "file", storage.FileOpenOptions{Read: true})
+	fa, err := sa.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	fb := openHTTPFile(t, sb, "file", storage.FileOpenOptions{Read: true})
+	fb := openHTTPFile(t, sb, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
 	if err := ha.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -323,8 +322,8 @@ func TestRetainedHTTPHandlerCloseRetiresOnlyOwnedSessions(t *testing.T) {
 }
 
 func TestRetainedHTTPReconcilesLostAcknowledgementAndClose(t *testing.T) {
-	for _, operation := range []string{"ack", "close"} {
-		t.Run(operation, func(t *testing.T) {
+	for _, operation := range []storage.Operation{storage.OpFileAck, storage.OpFileClose} {
+		t.Run(string(operation), func(t *testing.T) {
 			ctx := context.Background()
 			backend := volumeFixture(t)
 			if err := backend.Write(ctx, "file", []byte("retained")); err != nil {
@@ -354,7 +353,7 @@ func TestRetainedHTTPReconcilesLostAcknowledgementAndClose(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer session.Close(ctx)
-			file, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{Read: true})
+			file, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
 			if err != nil {
 				t.Fatal(err)
 			}

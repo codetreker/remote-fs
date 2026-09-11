@@ -27,12 +27,12 @@ package httprest
 import (
 	"errors"
 	"fmt"
+	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/storage"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
-
-	"github.com/codetreker/remote-fs/packages/metastore"
 )
 
 const (
@@ -118,8 +118,9 @@ const (
 )
 
 type opSpec struct {
-	method   string
-	operands []string
+	operation storage.Operation
+	method    string
+	operands  []string
 	// body is the media type of the request body, and empty for an operation that requires
 	// an empty body. Two operations send one, and they send different things: the contents
 	// of a file are bytes nobody may reinterpret, an attribute change is a document.
@@ -134,25 +135,38 @@ const (
 var ops = map[Op]opSpec{
 	OpFileControl: {method: http.MethodPost, body: contentJSON},
 	OpFile:        {method: http.MethodPost, body: contentJSON},
-	OpStat:        {method: http.MethodGet, operands: []string{keyPath}},
-	OpSetAttr:     {method: http.MethodPost, operands: []string{keyPath}, body: contentJSON},
-	OpList:        {method: http.MethodGet, operands: []string{keyPath}},
-	OpRead:        {method: http.MethodGet, operands: []string{keyPath}},
-	OpWrite:       {method: http.MethodPost, operands: []string{keyPath}, body: contentOctets},
-	OpCreate:      {method: http.MethodPost, operands: []string{keyPath}},
-	OpMkdir:       {method: http.MethodPost, operands: []string{keyPath}},
-	OpRemove:      {method: http.MethodPost, operands: []string{keyPath}},
-	OpRemoveDir:   {method: http.MethodPost, operands: []string{keyPath}},
-	OpRename:      {method: http.MethodPost, operands: []string{keyPath, keyTo}},
+	OpStat:        {operation: storage.OpVolumeStat, method: http.MethodGet, operands: []string{keyPath}},
+	OpSetAttr:     {operation: storage.OpVolumeSetAttr, method: http.MethodPost, operands: []string{keyPath}, body: contentJSON},
+	OpList:        {operation: storage.OpVolumeList, method: http.MethodGet, operands: []string{keyPath}},
+	OpRead:        {operation: storage.OpVolumeRead, method: http.MethodGet, operands: []string{keyPath}},
+	OpWrite:       {operation: storage.OpVolumeWrite, method: http.MethodPost, operands: []string{keyPath}, body: contentOctets},
+	OpCreate:      {operation: storage.OpVolumeCreate, method: http.MethodPost, operands: []string{keyPath}},
+	OpMkdir:       {operation: storage.OpVolumeMkdir, method: http.MethodPost, operands: []string{keyPath}},
+	OpRemove:      {operation: storage.OpVolumeRemove, method: http.MethodPost, operands: []string{keyPath}},
+	OpRemoveDir:   {operation: storage.OpVolumeRemoveDir, method: http.MethodPost, operands: []string{keyPath}},
+	OpRename:      {operation: storage.OpVolumeRename, method: http.MethodPost, operands: []string{keyPath, keyTo}},
 	// Space describes the whole volume rather than anything under a path, so it takes
 	// no operands. A path sent beside it is refused like any operand nobody asked for.
-	OpSpace: {method: http.MethodGet},
+	OpSpace: {operation: storage.OpVolumeSpace, method: http.MethodGet},
 
 	// The replication endpoints read; none of them changes anything. Subscribe and
 	// Snapshot both mean "as the volume is now", which is a question with no operands.
-	OpSubscribe:   {method: http.MethodGet},
-	OpResubscribe: {method: http.MethodGet, operands: []string{keyIncarnation, keyPosition}},
-	OpSnapshot:    {method: http.MethodGet},
+	OpSubscribe:         {operation: storage.OpReplicationSubscribe, method: http.MethodGet},
+	OpResubscribe:       {operation: storage.OpReplicationResubscribe, method: http.MethodGet, operands: []string{keyIncarnation, keyPosition}},
+	OpSnapshot:          {operation: storage.OpReplicationSnapshot, method: http.MethodGet},
+	OpSessionEnrollment: {operation: storage.OpLockSessionEnrollment, method: http.MethodPost, body: contentJSON},
+	OpSessionOpen:       {operation: storage.OpLockSessionOpen, method: http.MethodPost, body: contentJSON},
+	OpSessionClose:      {operation: storage.OpLockSessionClose, method: http.MethodPost, body: contentJSON},
+	OpOwnerCreate:       {operation: storage.OpLockOwnerCreate, method: http.MethodPost, body: contentJSON},
+	OpOwnerRetire:       {operation: storage.OpLockOwnerRetire, method: http.MethodPost, body: contentJSON},
+	OpLockResolve:       {operation: storage.OpLockResolve, method: http.MethodPost, body: contentJSON},
+	OpLockAcquire:       {operation: storage.OpLockAcquire, method: http.MethodPost, body: contentJSON},
+	OpLockRenew:         {operation: storage.OpLockRenew, method: http.MethodPost, body: contentJSON},
+	OpLockRelease:       {operation: storage.OpLockRelease, method: http.MethodPost, body: contentJSON},
+	OpLockCancel:        {operation: storage.OpLockCancel, method: http.MethodPost, body: contentJSON},
+	OpLockQueryAction:   {operation: storage.OpLockQueryAction, method: http.MethodPost, body: contentJSON},
+	OpLockQueryGrant:    {operation: storage.OpLockQueryGrant, method: http.MethodPost, body: contentJSON},
+	OpLockStatus:        {operation: storage.OpLockStatus, method: http.MethodPost, body: contentJSON},
 }
 
 // Request is one operation and its operands.

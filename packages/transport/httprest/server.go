@@ -11,6 +11,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -22,6 +23,10 @@ import (
 // It is a plain http.Handler, so it can be run on its own or mounted inside an existing
 // server; http.StripPrefix is how it is mounted somewhere other than the root.
 type Handler struct {
+	authorizer          authz.Authorizer
+	volume              string
+	lifetime            context.Context
+	cancelLifetime      context.CancelCauseFunc
 	files               *fileRegistry
 	storage             *locked.Storage
 	locks               locking.Service
@@ -102,7 +107,12 @@ func NewHandlerWithOptions(s storage.Storage, log metastore.Log, options Handler
 		return nil, fmt.Errorf("httprest: invalid enforcing volume: %w", err)
 	}
 	settled := options.settle()
+	lifetime, cancelLifetime := context.WithCancelCause(context.Background())
 	h := &Handler{
+		authorizer:          options.Authorizer,
+		volume:              options.Volume,
+		lifetime:            lifetime,
+		cancelLifetime:      cancelLifetime,
 		storage:             paired,
 		locks:               paired.LockService(),
 		lockControls:        configuredLockControlAdmission(settled.maxConcurrentLockControls, settled.maxWaitingLockControls),
@@ -145,6 +155,9 @@ func NewHandlerWithOptions(s storage.Storage, log metastore.Log, options Handler
 func (h *Handler) Stop() {
 	h.stopsOnce.Do(func() {
 		close(h.stopping)
+		if h.cancelLifetime != nil {
+			h.cancelLifetime(errHandlerStopped)
+		}
 		if h.files != nil {
 			h.files.stop()
 		}
@@ -162,6 +175,9 @@ func (h *Handler) stopped() bool {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	ctx, finish := h.authorizationContext(r.Context())
+	defer finish()
+	r = r.WithContext(ctx)
 	// Marking every response, including the failures, is what lets the far side tell an
 	// answer from this handler apart from one an intermediary made up.
 	w.Header().Set(HeaderProtocol, Version)
@@ -221,6 +237,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) {
 	ctx := r.Context()
+	if req.Op != OpSetAttr && req.Op != OpWrite && req.Op != OpSubscribe && req.Op != OpResubscribe && req.Op != OpSnapshot {
+		if operation := ops[req.Op].operation; operation != "" {
+			if err := h.authorize(ctx, authz.AccessRequest{Operation: operation}); err != nil {
+				h.writeOperationError(w, err)
+				return
+			}
+		}
+	}
 	switch req.Op {
 	case OpStat:
 		attr, err := h.storage.Stat(ctx, req.Path)
@@ -247,6 +271,10 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) 
 		change, err := decodeChange(body)
 		if err != nil {
 			h.writeFault(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: ops[req.Op].operation}); err != nil {
+			h.writeOperationError(w, err)
 			return
 		}
 		h.report(ctx, w, h.storage.SetAttr(ctx, req.Path, change))
@@ -294,6 +322,10 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) 
 			return
 		}
 		defer release()
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: ops[req.Op].operation}); err != nil {
+			h.writeOperationError(w, err)
+			return
+		}
 		h.report(ctx, w, h.storage.Write(ctx, req.Path, content))
 
 	case OpCreate:
@@ -459,6 +491,10 @@ func (h *Handler) writeJSON(w http.ResponseWriter, status int, body any) {
 // vocabulary. The error may come from storage or from a handler-owned bound whose errno
 // is already determined before storage is called.
 func (h *Handler) writeOperationError(w http.ResponseWriter, err error) {
+	if response, ok := authorizationResponse(err); ok {
+		h.writeJSON(w, StatusStorageError, response)
+		return
+	}
 	response := ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error()}
 	if failure := volumeLockFailure(err); failure != nil {
 		response.LockCode = failure.Code

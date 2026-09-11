@@ -68,7 +68,7 @@ func TestHandlerRetirementReclaimsDetachedFilesBeforeStorageClose(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	file, err := session.OpenFile(t.Context(), "held", storage.FileOpenOptions{Read: true, Write: true, Create: true, Mode: 0o600})
+	file, err := session.OpenFile(t.Context(), "held", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0o600})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -197,7 +197,7 @@ func mutationTree(t *testing.T) (*node, *node, *mutationStorage) {
 
 func mutationHandle(t *testing.T, n *node) *handle {
 	t.Helper()
-	file, err := n.volume.files.OpenNode(t.Context(), n.id.node, storage.FileOpenOptions{Read: true, Write: true})
+	file, err := n.volume.files.OpenNode(t.Context(), n.id.node, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -85,7 +85,7 @@ func TestFileSessionRenewalKeepsReferencesLiveAndRetiresThem(t *testing.T) {
 			return status, err
 		}}
 	})
-	file, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true})
+	file, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestFileSessionContinuityLossFencesAndRetiresTheAuthority(t *testing.T) {
 			return storage.FileSessionStatus{}, syscall.ESTALE
 		}}
 	})
-	file, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true, Write: true})
+	file, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestFileSessionFailedRenewalCannotExtendItsConfirmedLifetime(t *testing.T) 
 	if errnoOf(v.check()) != syscall.EIO {
 		t.Fatalf("expired renewal accepted I/O: %v", v.check())
 	}
-	if _, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true}); errnoOf(err) != syscall.ESTALE {
+	if _, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}); errnoOf(err) != syscall.ESTALE {
 		t.Fatalf("expired authority accepted a new reference: %v", err)
 	}
 }
@@ -273,7 +273,7 @@ func TestFailedMountHandshakeDetachesBeforeWaitingForSessionCleanup(t *testing.T
 	default:
 		t.Fatal("failed mount returned before session cleanup")
 	}
-	if _, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true}); errnoOf(err) != syscall.ESTALE {
+	if _, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}); errnoOf(err) != syscall.ESTALE {
 		t.Fatalf("failed mount retained active session: %v", err)
 	}
 	if _, err := backing.Read(t.Context(), "file"); err != nil {

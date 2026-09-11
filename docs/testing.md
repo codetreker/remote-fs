@@ -88,6 +88,26 @@ checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race 
 
 选择调度和重复次数时，额外测量每个读者的完整值观察、读写 API 区间重叠，并用无额外等待的非原子发布负向对照核对检出能力。100 次写入的采用还比较了六个包各自测试二进制的覆盖块集合和原判定名称。较少重复次数降低统计暴露；看到两种值、API 调用重叠或覆盖块相同都不能证明覆盖每个内部发布窗口，具体证据与代价见[测试工作量决定](../.agents/notes/implemented/testing/2026-09-09-scale-test-work-to-its-assertions.md)。凡是依赖交错、时机或前置状态才有意义的用例，都须区分已断言条件与测量尚不能证明的条件。
 
+## 业务方提供的操作授权
+
+[授权设计](design/server/authorization.md)拥有语义操作表；测试按该表核对映射，普通、bounded 与 barrier 入口保持同一语义。[操作词汇用例](../packages/storage/operations_test.go)核对 storage.Operation 常量；[authz 值类型用例](../packages/authz/authz_test.go)核对函数适配器保留原 context 与错误，以及策略修改 AccessRequest 副本不会改变调用方的值。身份来自 host 自己的 context key，Volume 来自 handler 的可信配置，已有 capability 保持 bearer 语义。
+
+[入口授权用例](../packages/transport/httprest/authorization_test.go)验证 Authorizer 与 Volume 同时缺省、成对配置、typed-nil 和 nil 函数拒绝，以及不改写不透明 Volume。普通操作先拒绝再允许，分别核对拒绝时 backend／barrier 未被调用、允许后原 backend 错误仍返回，成功修改只在授权之后读取 barrier。非法请求不触发策略；并发请求保留各自的 host 值，请求结束解除派生 context，未启用 hook 的路径保持原行为。
+
+[文件授权用例](../packages/transport/httprest/authorization_file_test.go)在 capability 查询、引用创建和动作记录之前核对每种 file 操作。合法打开的全部意图经共享的 storage.OpenAccess 值和一次 callback 传入，wire 分发与授权共用规范操作值，显式 file.unlock 与申请／转换分别核对；非法参数在策略之前拒绝。用例先取得真实引用和动作回执，再拒绝 ack、renew、status、重放、修改与 close，核对原回执、期限、pending ack、引用和内容均未改变，拒绝的新动作没有记录。允许后重放仍返回原引用，原动作才可继续执行。
+
+[强占有授权用例](../packages/transport/httprest/authorization_lock_test.go)逐项检查控制操作在 native service 或 status capability 访问前授权，并重新检查曾经成功的相同请求。拒绝只描述本次入口结果，不能泄漏已有动作回执或捏造 lockCode、recorded、Cancelled、Released 等 native 结果。文件侧另用只读描述符取得真实 EX flock，拒绝显式解锁、取消、DropLocks 与查询后，再从允许的控制路径核对原 Grant 和历史仍存在。调用方 cleanup 可以被拒绝；内部 lease 到期仍释放 retained 字节，且不会再次替调用方请求授权。
+
+授权错误用例区分明确的 ErrDenied 标记与无法完成策略查询的故障，包括包装、join 和带 native 分类的底层错误。本地保留 cause，普通 HTTP、file、lock 与 stream writer 只输出可信的固定 EACCES／EIO 和消息；不把 callback 的原始文本或 native 回执写出。原请求生命周期先于策略分类：volume/file 可证明尚未 dispatch 的调用方取消沿用 `EINTR`，deadline 或策略自身超时保持相应 `EIO`；强锁服务端的生命周期和非 native 服务错误保持 `Unavailable/EIO`、`recorded=false` 且无 action。策略拒绝或故障使用独立的普通 EACCES／EIO envelope。
+
+入口 callback 使用既有有界 response admission，满额时可在调用策略之前返回 `EAGAIN`。Stop 先取消并返回，ServeHTTP 仍须等待 callback 排空，期间不能继续调用 backend；请求结束也不得取消 host 原始 context。流的初始授权仅在启用 hook 时使用该 admission，拒绝响应写完后才归还，允许后在进入 Log、订阅与 snapshot 资源之前归还，不把名额占到流结束。
+
+[流授权用例](../packages/transport/httprest/stream_authorization_test.go)分别验证 subscribe、resubscribe、snapshot 在初始 Log 与受控资源准入前检查，nil Log 和已满的订阅／snapshot 名额不能越过拒绝。start／rebuild、change、snapshot open／rows／done 与 keepalive 前再次使用原操作和 host context 检查；拒绝或策略故障后，队列中的页面、保活与成功 done 均不出站，terminal fault 只携带固定错误。用例同时确认页面确实已预取，以及最终 frame、snapshot 和订阅名额已归还。
+
+背压用例让初始 Flush 或活跃 frame 的写入阻塞，再取消 host context 或 Stop，核对写入被结束机制打断，健康流不被附加默认 write deadline。terminal fault 的写入同样受结束预算约束；snapshot producer 收到取消后必须先退出，原拥有者再关闭 snapshot，不能在 Next 仍执行时强制关闭或提前宣布清理完成。授权约束每次准入，已准入单元可以完成，已经交付的数据不被当作可撤回。
+
+[强锁 SDK 用例](../packages/transport/httprest/lock_client_test.go)仅接受带完整协议标记和有界 body 的普通 `{errno,message}` 授权错误；一旦出现 lockCode 或 recorded，就走完整 native envelope 校验，残缺字段不能回退猜测。丢失 Acquire 回复后，拒绝的 query／cancel 保留此前未知结果。[stream fault 用例](../packages/transport/httprest/stream_fault_test.go)拒绝重复字段、null、空值和未知 errno，旧的无 errno fault 保持 `EIO`；[SDK 发送边界用例](../packages/transport/httprest/subscribe_test.go)在初始帧与各个 Next 位置保留 typed `EACCES/EIO`。直接 SDK 的授权拒绝与 replica 观察 follower 故障后的统一 `EIO` 分别核对，都不能返回空目录或虚构的不存在。
+
 ## 打开的文件对象与标准锁
 
 [文件句柄设计](design/server/file-handles.md)按对象身份、逐次发布、会话生存期和 advisory 锁分别验证。[公开类型用例](../packages/storage/files_test.go)拒绝无访问权限、非法创建/截断组合、不一致的 OpenNode 身份、无界会话配置、非法锁范围和 action epoch/nonce。实现缺少 FileStorage 能力时必须明确拒绝，不能重新按路径打开来模拟保留的对象。普通 Open 不获取 advisory 锁或强 S/X；FileSession 与强占有 Session 的生存期分别成立。
@@ -245,7 +265,7 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 [文件句柄二进制用例](../cmd/file_handles_linux_test.go)分别在 localstore 与 Azure 中验证已打开 fd 的当前读取、同步修改，以及 rename、unlink、同名替换后的原对象保留；排他 advisory 通过真实挂载协调。重启用例紧接 WriteAt 的成功返回终止服务端，以这次写入本身的确认验证持久性；Sync 的健康与持久性检查由独立场景验证。重启后旧引用明确失败，已确认字节保留，新挂载可以建立新的引用与取得 EX，不能按旧能力重新执行。
 
-[元数据缓存用例](../cmd/replicated_test.go)的 `TestWalkingAMountedTreeCachesNamesAndConfirmsIdentityAttributes` 遍历具名节点并检查缺失名字，要求没有具名 Stat/List 请求，同时必须观察到权威 `file:stat-node` 并记录实际次数；周期 `file-control:renew` 可交错，其它数据或修改请求均失败。目录改名只允许一个 rename 请求，加上身份属性和续期，子树 inode 保持不变。计数起点等待已完成的文件关闭确认，避免此前异步 Release 混入遍历操作。
+[元数据缓存用例](../cmd/replicated_test.go)的 `TestWalkingAMountedTreeCachesNamesAndConfirmsIdentityAttributes` 遍历具名节点并检查缺失名字，要求没有具名 Stat/List 请求，同时必须观察到权威身份属性请求并记录实际次数；周期文件会话续期可交错，其它数据或修改请求均失败。目录改名只允许一个 rename 请求，加上身份属性和续期，子树 inode 保持不变。计数起点等待已完成的文件关闭确认，避免此前异步 Release 混入遍历操作。
 
 [锁配置用例](../cmd/remote-fs-server/lock_configuration_test.go)验证容量和期限逐项传入 authority，`-initialize-lock-state` 是显式动作，非法配置在 listener 或状态初始化之前拒绝。`-dir`、`-lock-state-root`、目录预算与 CLI quota measurement 参数作为未知 flag 拒绝，目标 local store 保持空目录。[状态用例](../cmd/remote-fs-server/status_test.go)检查 ready、recovering、unavailable 和各项计数，不输出 Authority 能力材料；状态失败不拼接部分容量数字，不可用的 authority 不宣布就绪，缺失 status 能力的 volume 被关闭且关闭错误保留。这些包内断言验证参数与 lifecycle wiring，跨进程结论仍由二进制用例提供。
 
