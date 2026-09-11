@@ -10,9 +10,6 @@ import (
 var _ storage.FileStorage = (*Storage)(nil)
 
 func (s *Storage) CheckFileStorage() error {
-	if !s.accounted {
-		return syscall.EOPNOTSUPP
-	}
 	if err := s.healthy(); err != nil {
 		return err
 	}

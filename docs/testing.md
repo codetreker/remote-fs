@@ -210,7 +210,9 @@ authority 的[发布交错用例](../packages/locking/contract_concurrency_test.
 
 失败用例区分准备拒绝、已知效果和结果未知。SQLite 准备失败保留 reservation 与 Grant，删除与目标覆盖退役真实受影响身份；[记账收尾失败](../packages/metastore/sqlite/publication_test.go)与[持久确认失败](../packages/metastore/sqlite/publication_test.go)使 volume 和 authority 停止发布，错误原因仍可核对。复合修改的部分效果由 FUSE 阶段用例验证，已有副作用时不返回暗示整个操作未执行的 `EINTR`。Close 排空在途发布与持久水位准备，关闭失败保留原因和必要所有权，不能对可能已经复用的描述符重试 Close。
 
-[native quota hook 用例](../packages/storage/limited/publication_test.go)在真实 volume 外注入最终发布结果，单独核对根据最终目标计算的旧、新大小：增长先预留，只有已知应用才返还缩减或删除释放的字节；未应用的失败返还增长预留并保留原用量。用例暂停 staging 后改名祖先目录并重建原路径，再核对两份内容、即时 Used 与 Recount，避免提前 Stat 的大小被用于另一节点。已应用但回复失败仍按实际效果结算；[未知结果或 unwind/settlement 失败](../packages/storage/limited/publication_uncertainty_test.go)保守保留预留，并使后续修改、Space 与 Recount 失败，已在 staging 的调用也不能越过该状态。嵌套 quota 另验证准备被拒绝后各层预留均已归还。只有实现 native 最终发布记账能力的包装层能同时暴露锁服务；这些断言不把 opaque 第三方 storage 的路径采样包装解释为具有同样保证。
+[limited 构造与通用契约用例](../packages/storage/limited/limited_test.go)分别使用原生组合、委托原生计费但不暴露 retained 文件的 wrapper；两者都执行完整 storage 契约。缺少 native 计费能力在任何用量测量前以 `ENOSYS` 拒绝；[能力检查失败](../packages/storage/limited/publication_test.go)逐一保留原始错误，不因是否提供锁服务而改变。非 retained wrapper 继续验证有界初始化与 Recount：目录和 frontier 预算、取消、listing 失败均不发布部分计数，等待中的操作可在测量结束后推进。
+
+[native quota hook 用例](../packages/storage/limited/publication_test.go)以真实 SQLite 与内存对象保留 3072／1024 字节的目录改名交错：外层额度为 4096，内层分别不设额度或设为 8192；暂停 Put 时无关文件的等长覆盖须完成，再依次把 d 改名为 old、e 改名为 d。恢复后，针对较小新目标的增长以 `EDQUOT` 拒绝，反向大小组合的缩短按最终目标结算；两份内容、元数据权威 Usage、即时 Used 与 Recount 必须一致。最终效果注入另外验证增长先预留、Applied 后才返还缩减或删除的字节、NotApplied 退回增长；已应用但回复失败仍按实际效果结算。[未知结果或 unwind／settlement 失败](../packages/storage/limited/publication_uncertainty_test.go)保守保留预留，并使后续修改、Space 与 Recount 失败，已在 staging 的调用也不能越过该状态。嵌套 quota 验证准备被拒绝后各层预留归还；scope、锁服务与 Close 继续配对透传。
 
 [到期缩减用例](../packages/storage/limited/lease_quota_test.go)使用真实 SQLite、objectstore、内存 Objects 与外层 limited，metadata allowance 设为零以使外层独立承担记账。在 Objects.Put 暂停缩减写入后，立即核对旧字节仍占满配额且另一写入为 `EDQUOT`；推进时钟使 proof 到期，恢复后要求 `StaleGrant`、原内容不变，Space 和 Recount 都仍报告原用量。随后有效的匿名缩减才释放差额，另一文件必须能够恰好用完该差额，再由 Recount 核对总用量。
 
