@@ -138,6 +138,7 @@ func Open(ctx context.Context, config Config) (*Store, error) {
 }
 
 type openHooks struct {
+	witnessOps            func(*witnessOperations)
 	afterDurableMetastore func(*durableMetastore) error
 	afterVolume           func(*objectstore.Storage, *durableMetastore) error
 	openDurable           func() (*sqlite.Store, error)
@@ -156,6 +157,9 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 	anchor, err := openRootAnchor(root)
 	if err != nil {
 		return nil, err
+	}
+	if hooks.witnessOps != nil {
+		hooks.witnessOps(&anchor.witnessOps)
 	}
 	if config.Locks == nil {
 		_, err := unix.Fgetxattr(anchor.fd, "user.remote-fs.lease-state", nil)
@@ -242,14 +246,6 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 			closeFailure("local object store", objects.Close()),
 			anchor.Close(),
 		)
-	}
-	if witnessStageExists {
-		// The final witness is the acknowledgement boundary. A stage proves that a
-		// SQLite commit happened, so it must be considered before an absent database
-		// can be classified as bootstrap state, but it is not promoted as authority.
-		if err := witness.RemoveInterruptedStage(); err != nil {
-			return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
-		}
 	}
 	if !complete && intent == initializationIntentPristine {
 		if err := anchor.BindInitialization(
