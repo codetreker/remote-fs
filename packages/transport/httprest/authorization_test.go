@@ -119,7 +119,7 @@ func authorizationAnswer(t *testing.T, response *httptest.ResponseRecorder, errn
 func TestVolumeAuthorizationMapsEveryOperationBeforeBackendAndBarrier(t *testing.T) {
 	backend := &authorizationBackend{Backend: volumeFixture(t), err: syscall.EROFS}
 	log := &authorizationLog{}
-	operations := map[Op]authz.Operation{OpStat: authz.VolumeStat, OpList: authz.VolumeList, OpRead: authz.VolumeRead, OpSpace: authz.VolumeSpace, OpSetAttr: authz.VolumeSetAttr, OpWrite: authz.VolumeWrite, OpCreate: authz.VolumeCreate, OpMkdir: authz.VolumeMkdir, OpRemove: authz.VolumeRemove, OpRemoveDir: authz.VolumeRemoveDir, OpRename: authz.VolumeRename}
+	operations := map[Op]storage.Operation{OpStat: storage.OpVolumeStat, OpList: storage.OpVolumeList, OpRead: storage.OpVolumeRead, OpSpace: storage.OpVolumeSpace, OpSetAttr: storage.OpVolumeSetAttr, OpWrite: storage.OpVolumeWrite, OpCreate: storage.OpVolumeCreate, OpMkdir: storage.OpVolumeMkdir, OpRemove: storage.OpVolumeRemove, OpRemoveDir: storage.OpVolumeRemoveDir, OpRename: storage.OpVolumeRename}
 	for operation, semantic := range operations {
 		t.Run(string(operation), func(t *testing.T) {
 			var requests []authz.AccessRequest
@@ -232,7 +232,7 @@ func TestAuthorizationOptionsRequireAnExplicitUsablePair(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	request := authz.AccessRequest{Volume: "request-selected-volume", Operation: authz.FileOpen, Open: storage.OpenAccess{Read: true, Create: true}}
+	request := authz.AccessRequest{Volume: "request-selected-volume", Operation: storage.OpFileOpen, Open: storage.OpenAccess{Read: true, Create: true}}
 	if err := h.authorize(t.Context(), request); err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +258,7 @@ func TestAuthorizationErrorsExposeOnlyTrustedFixedFields(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := &Handler{stopping: make(chan struct{}), volume: "trusted", authorizer: authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return test.cause })}
-			err := h.authorize(t.Context(), authz.AccessRequest{Operation: authz.VolumeRead})
+			err := h.authorize(t.Context(), authz.AccessRequest{Operation: storage.OpVolumeRead})
 			if !errors.Is(err, test.cause) || storage.ErrnoOf(err) != test.errno || err.Error() != test.message {
 				t.Fatalf("local authorization error lost classification/cause: %v", err)
 			}
@@ -317,7 +317,7 @@ func TestAuthorizationCallerCancellationPrecedesPolicyClassification(t *testing.
 			if before {
 				cancel(cause)
 			}
-			err := h.authorize(ctx, authz.AccessRequest{Operation: authz.VolumeRead})
+			err := h.authorize(ctx, authz.AccessRequest{Operation: storage.OpVolumeRead})
 			if storage.ErrnoOf(err) != syscall.EINTR || !errors.Is(err, context.Canceled) || !errors.Is(err, cause) {
 				t.Fatalf("caller cancellation lost classification/cause: %v", err)
 			}
@@ -332,7 +332,7 @@ func TestAuthorizationCallerCancellationPrecedesPolicyClassification(t *testing.
 	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
 	defer cancel()
 	h := &Handler{stopping: make(chan struct{}), volume: "trusted", authorizer: authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { t.Fatal("expired caller invoked policy"); return nil })}
-	if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.VolumeRead}); storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, context.DeadlineExceeded) {
+	if err := h.authorize(ctx, authz.AccessRequest{Operation: storage.OpVolumeRead}); storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("caller deadline classification: %v", err)
 	}
 }

@@ -4,7 +4,7 @@
 
 ## 一、组件与配置
 
-[`packages/authz`](../../../packages/authz/authz.go) 定义 `Authorizer`、`AuthorizerFunc`、`AccessRequest`、`Operation` 和 `ErrDenied`，并复用 [`storage.OpenAccess`](../../../packages/storage/files.go) 表达打开意图。它依赖基础 storage 类型，不依赖具体存储或 HTTP。HTTP handler 从严格解码的动作构造 AccessRequest；嵌入业务负责认证、身份 context、当前策略与审计。
+[`packages/authz`](../../../packages/authz/authz.go) 定义 `Authorizer`、`AuthorizerFunc`、`AccessRequest` 和 `ErrDenied`，并复用 [`storage.Operation`](../../../packages/storage/operations.go) 与 [`storage.OpenAccess`](../../../packages/storage/files.go) 表达操作和打开意图。它依赖基础 storage 类型，不依赖具体存储或 HTTP。HTTP handler 从严格解码的动作构造 AccessRequest；嵌入业务负责认证、身份 context、当前策略与审计。
 
 ```go
 type Authorizer interface {
@@ -13,7 +13,7 @@ type Authorizer interface {
 
 type AccessRequest struct {
     Volume    string
-    Operation Operation
+    Operation storage.Operation
     Open      storage.OpenAccess
 }
 ```
@@ -26,7 +26,7 @@ Authorizer 用业务自己的 context key 取得稳定访问身份，读取当�
 
 ## 二、操作映射
 
-Operation 是 transport-neutral 字符串。[Operation 常量](../../../packages/authz/operations.go)在文件请求中直接作为 JSON `op` 的值，wire dispatch 与 AccessRequest.Operation 使用同一标识；普通 volume、复制与强锁的 URL 保留传输名称，在路由 opSpec 中登记对应语义。下表是这些入口的完整对应，file 行第二项是 body 的规范操作值。普通、bounded 与 confirmation barrier 变体使用同一语义，HTTP 方法本身不划分读写权限。业务策略对未知操作默认拒绝。
+storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transport-neutral 字符串。[Op 前缀常量](../../../packages/storage/operations.go)在文件请求中直接作为 JSON `op` 的值，wire dispatch 与 AccessRequest.Operation 使用同一标识；普通 volume、复制与强锁的 URL 保留传输名称，在路由 opSpec 中登记对应语义。下表是这些入口的完整对应，file 行第二项是 body 的规范操作值。普通、bounded 与 confirmation barrier 变体使用同一语义，HTTP 方法本身不划分读写权限。业务策略对未知操作默认拒绝。
 
 | Operation | HTTP wire 入口／动作 | 被授权的语义 |
 |---|---|---|
@@ -148,7 +148,7 @@ import (
 type identityKey struct{}
 
 type permission struct {
-    Allowed  map[authz.Operation]bool
+    Allowed  map[storage.Operation]bool
     CanRead  bool
     CanWrite bool
 }
@@ -166,7 +166,7 @@ func newAuthorizedHandler(
         access, err := lookup(ctx, identity, r.Volume)
         if err != nil { return err }
         if !access.Allowed[r.Operation] { return authz.ErrDenied }
-        if r.Operation == authz.FileOpen || r.Operation == authz.FileOpenNode {
+        if r.Operation == storage.OpFileOpen || r.Operation == storage.OpFileOpenNode {
             if r.Open.Read && !access.CanRead { return authz.ErrDenied }
             if (r.Open.Write || r.Open.Create || r.Open.Truncate) && !access.CanWrite {
                 return authz.ErrDenied

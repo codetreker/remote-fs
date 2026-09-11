@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/codetreker/remote-fs/packages/storage"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -277,14 +278,14 @@ func streamAuthorizationCheckAccess(t *testing.T, ctx context.Context, access au
 	}
 }
 
-func streamAuthorizationOperation(op Op) authz.Operation {
+func streamAuthorizationOperation(op Op) storage.Operation {
 	switch op {
 	case OpSubscribe:
-		return authz.ReplicationSubscribe
+		return storage.OpReplicationSubscribe
 	case OpResubscribe:
-		return authz.ReplicationResubscribe
+		return storage.OpReplicationResubscribe
 	case OpSnapshot:
-		return authz.ReplicationSnapshot
+		return storage.OpReplicationSnapshot
 	default:
 		panic("unexpected stream operation")
 	}

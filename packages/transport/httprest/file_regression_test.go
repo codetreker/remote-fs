@@ -5,6 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/codetreker/remote-fs/packages/locking"
+	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"io"
 	"math"
 	"net/http"
@@ -15,12 +19,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/codetreker/remote-fs/packages/authz"
-	"github.com/codetreker/remote-fs/packages/locking"
-	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
-	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 )
 
 func openRetainedFixture(t *testing.T, client *Storage) (*remoteFileSession, *remoteFile) {
@@ -52,7 +50,7 @@ func TestRetainedHTTPRejectsMissingZeroValuedRequestMembers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	complete := fileRequest{Op: authz.FileTruncate, Session: session.id, File: file.id, Action: action, Offset: 3, Path: []byte{}, Data: []byte{}}
+	complete := fileRequest{Op: storage.OpFileTruncate, Session: session.id, File: file.id, Action: action, Offset: 3, Path: []byte{}, Data: []byte{}}
 	encoded, err := json.Marshal(complete)
 	if err != nil {
 		t.Fatal(err)
@@ -305,7 +303,7 @@ func TestRetainedHTTPCancellationAfterOpenEffectIsEIOAndCleansReference(t *testi
 	original := client.http.Transport
 	client.http.Transport = fileRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		var operation struct {
-			Op authz.Operation `json:"op"`
+			Op storage.Operation `json:"op"`
 		}
 		body, err := io.ReadAll(req.Body)
 		if err != nil {
@@ -319,7 +317,7 @@ func TestRetainedHTTPCancellationAfterOpenEffectIsEIOAndCleansReference(t *testi
 		if err != nil {
 			return nil, err
 		}
-		if operation.Op == authz.FileOpen {
+		if operation.Op == storage.OpFileOpen {
 			body, err = io.ReadAll(response.Body)
 			response.Body.Close()
 			if err != nil {
@@ -844,8 +842,8 @@ func TestRetainedHTTPUnlockReceiptDistinguishesReleaseFromAcquisition(t *testing
 			if result, err := file.SetLock(ctx, 0, lock, acquisition); err != nil || result.State != storage.LockGranted || !result.EverGranted {
 				t.Fatalf("acquisition = %+v, %v", result, err)
 			}
-			if op := sent.Load(); op != authz.FileSetLock {
-				t.Fatalf("acquisition wire operation = %v; want %s", op, authz.FileSetLock)
+			if op := sent.Load(); op != storage.OpFileSetLock {
+				t.Fatalf("acquisition wire operation = %v; want %s", op, storage.OpFileSetLock)
 			}
 			unlock := lock
 			unlock.Type = storage.Unlock
@@ -854,8 +852,8 @@ func TestRetainedHTTPUnlockReceiptDistinguishesReleaseFromAcquisition(t *testing
 			if err != nil || result.State != storage.LockReleased || result.EverGranted || result.Lock != unlock {
 				t.Fatalf("explicit unlock receipt = %+v, %v", result, err)
 			}
-			if op := sent.Load(); op != authz.FileUnlock {
-				t.Fatalf("unlock wire operation = %v; want %s", op, authz.FileUnlock)
+			if op := sent.Load(); op != storage.OpFileUnlock {
+				t.Fatalf("unlock wire operation = %v; want %s", op, storage.OpFileUnlock)
 			}
 			result, err = file.QueryLock(ctx, 0, release)
 			if err != nil || result.State != storage.LockReleased || result.EverGranted || result.Lock != unlock {
@@ -953,7 +951,7 @@ func TestRetainedHTTPPendingExpiryRetainsCapabilityAndChargeUntilNativeClose(t *
 		t.Fatal(err)
 	}
 	remote := session.(*remoteFileSession)
-	opened, err := remote.call(ctx, fileRequest{Op: authz.FileOpen, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}})
+	opened, err := remote.call(ctx, fileRequest{Op: storage.OpFileOpen, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -981,7 +979,7 @@ func TestRetainedHTTPPendingExpiryRetainsCapabilityAndChargeUntilNativeClose(t *
 	}
 	outcome := make(chan error, 1)
 	go func() {
-		_, err := client.fileCall(ctx, fileRequest{Op: authz.FileClose, Session: remote.id, File: opened.File})
+		_, err := client.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: remote.id, File: opened.File})
 		outcome <- err
 	}()
 	select {

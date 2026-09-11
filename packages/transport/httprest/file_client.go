@@ -6,20 +6,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/codetreker/remote-fs/packages/storage"
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/codetreker/remote-fs/packages/authz"
-	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 type fileScopeKey struct{}
 type fileReadOnlyKey struct{}
 
-func fileReadOnly(op authz.Operation) bool {
+func fileReadOnly(op storage.Operation) bool {
 	switch op {
-	case authz.FileRead, authz.FileStat, authz.FileStatNode, authz.FileGetLock, authz.FileQueryLock, authz.FileStatus:
+	case storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileGetLock, storage.OpFileQueryLock, storage.OpFileStatus:
 		return true
 	}
 	return false
@@ -62,7 +60,7 @@ func (s *Storage) fileCall(ctx context.Context, req fileRequest) (fileResponse, 
 	if int64(len(req.Path)) > s.maxBodyBytes || int64(len(req.Data)) > s.maxWriteBytes {
 		return fileResponse{}, syscall.EFBIG
 	}
-	if req.Op == authz.FileRead && (req.Length < 0 || int64(req.Length) > fileReadLimit(s.maxBodyBytes)) {
+	if req.Op == storage.OpFileRead && (req.Length < 0 || int64(req.Length) > fileReadLimit(s.maxBodyBytes)) {
 		return fileResponse{}, syscall.EFBIG
 	}
 	op := OpFile
@@ -135,7 +133,7 @@ func (s *Storage) NewFileSession(ctx context.Context, options storage.FileSessio
 	if err := options.Check(); err != nil {
 		return nil, err
 	}
-	response, err := s.fileCall(ctx, fileRequest{Op: authz.FileSessionOpen, Options: options})
+	response, err := s.fileCall(ctx, fileRequest{Op: storage.OpFileSessionOpen, Options: options})
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +145,7 @@ func (s *Storage) NewFileSession(ctx context.Context, options storage.FileSessio
 
 func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResponse, error) {
 	s.mu.Lock()
-	if s.failed != nil && req.Op != authz.FileSessionClose {
+	if s.failed != nil && req.Op != storage.OpFileSessionClose {
 		err := s.failed
 		s.mu.Unlock()
 		return fileResponse{}, err
@@ -180,7 +178,7 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 		}
 	}
 	var failure *operationError
-	if err != nil && errors.As(err, &failure) && failure.unknown && (req.Action != "" || req.Op == authz.FileAck) {
+	if err != nil && errors.As(err, &failure) && failure.unknown && (req.Action != "" || req.Op == storage.OpFileAck) {
 		recovery, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		recovered, recoveryErr := s.storage.fileCall(recovery, req)
 		cancel()
@@ -213,10 +211,10 @@ func (s *remoteFileSession) open(ctx context.Context, req fileRequest) (storage.
 	if response.File == "" {
 		return nil, nil, unreachable(Request{Op: OpFile}, errors.New("file open returned no capability"))
 	}
-	_, err = s.call(ctx, fileRequest{Op: authz.FileAck, File: response.File})
+	_, err = s.call(ctx, fileRequest{Op: storage.OpFileAck, File: response.File})
 	if err != nil {
 		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, cleanupErr := s.storage.fileCall(cleanup, fileRequest{Op: authz.FileClose, Session: s.id, File: response.File})
+		_, cleanupErr := s.storage.fileCall(cleanup, fileRequest{Op: storage.OpFileClose, Session: s.id, File: response.File})
 		cancel()
 		if cleanupErr != nil && !errors.Is(cleanupErr, syscall.ESTALE) {
 			err = errors.Join(err, cleanupErr)
@@ -234,7 +232,7 @@ func (s *remoteFileSession) OpenFileWithBarrier(ctx context.Context, path string
 	if err := o.Check(); err != nil {
 		return nil, nil, err
 	}
-	return s.open(ctx, fileRequest{Op: authz.FileOpen, Path: []byte(path), Open: o})
+	return s.open(ctx, fileRequest{Op: storage.OpFileOpen, Path: []byte(path), Open: o})
 }
 func (s *remoteFileSession) OpenNode(ctx context.Context, id uint64, o storage.FileOpenOptions) (storage.File, error) {
 	f, _, err := s.OpenNodeWithBarrier(ctx, id, o)
@@ -244,7 +242,7 @@ func (s *remoteFileSession) OpenNodeWithBarrier(ctx context.Context, id uint64, 
 	if err := o.CheckNode(id); err != nil {
 		return nil, nil, err
 	}
-	return s.open(ctx, fileRequest{Op: authz.FileOpenNode, Node: id, Open: o})
+	return s.open(ctx, fileRequest{Op: storage.OpFileOpenNode, Node: id, Open: o})
 }
 func responseFileAttr(response fileResponse, err error) (storage.Attr, error) {
 	if err != nil {
@@ -256,7 +254,7 @@ func responseFileAttr(response fileResponse, err error) (storage.Attr, error) {
 	return response.Attr.Storage(), nil
 }
 func (s *remoteFileSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
-	r, e := s.call(ctx, fileRequest{Op: authz.FileStatNode, Node: id})
+	r, e := s.call(ctx, fileRequest{Op: storage.OpFileStatNode, Node: id})
 	return responseFileAttr(r, e)
 }
 func (s *remoteFileSession) SetNodeAttr(ctx context.Context, id uint64, c storage.AttrChange) (storage.Attr, error) {
@@ -265,11 +263,11 @@ func (s *remoteFileSession) SetNodeAttr(ctx context.Context, id uint64, c storag
 }
 func (s *remoteFileSession) SetNodeAttrWithBarrier(ctx context.Context, id uint64, c storage.AttrChange) (storage.Attr, *MutationBarrier, error) {
 	change := AttrChangeOf(c)
-	r, e := s.call(ctx, fileRequest{Op: authz.FileSetNodeAttr, Node: id, Change: change})
+	r, e := s.call(ctx, fileRequest{Op: storage.OpFileSetNodeAttr, Node: id, Change: change})
 	a, e := responseFileAttr(r, e)
 	return a, r.Barrier, e
 }
-func (s *remoteFileSession) status(ctx context.Context, op authz.Operation) (storage.FileSessionStatus, error) {
+func (s *remoteFileSession) status(ctx context.Context, op storage.Operation) (storage.FileSessionStatus, error) {
 	r, e := s.call(ctx, fileRequest{Op: op})
 	if e != nil {
 		return storage.FileSessionStatus{}, e
@@ -280,10 +278,10 @@ func (s *remoteFileSession) status(ctx context.Context, op authz.Operation) (sto
 	return *r.Status, nil
 }
 func (s *remoteFileSession) Status(ctx context.Context) (storage.FileSessionStatus, error) {
-	return s.status(ctx, authz.FileStatus)
+	return s.status(ctx, storage.OpFileStatus)
 }
 func (s *remoteFileSession) Renew(ctx context.Context) (storage.FileSessionStatus, error) {
-	return s.status(ctx, authz.FileRenew)
+	return s.status(ctx, storage.OpFileRenew)
 }
 func (s *remoteFileSession) Close(ctx context.Context) error {
 	s.mu.Lock()
@@ -301,7 +299,7 @@ func (s *remoteFileSession) Close(ctx context.Context) error {
 	}
 	action := s.closeAction
 	s.mu.Unlock()
-	r, e := s.storage.fileCall(ctx, fileRequest{Op: authz.FileSessionClose, Session: s.id, Action: action})
+	r, e := s.storage.fileCall(ctx, fileRequest{Op: storage.OpFileSessionClose, Session: s.id, Action: action})
 	_ = r
 	if e == nil || errors.Is(e, syscall.ESTALE) {
 		s.mu.Lock()
@@ -323,14 +321,14 @@ func (f *remoteFile) call(ctx context.Context, r fileRequest) (fileResponse, err
 	return f.session.call(ctx, r)
 }
 func (f *remoteFile) Stat(ctx context.Context) (storage.Attr, error) {
-	r, e := f.call(ctx, fileRequest{Op: authz.FileStat})
+	r, e := f.call(ctx, fileRequest{Op: storage.OpFileStat})
 	return responseFileAttr(r, e)
 }
 func (f *remoteFile) ReadAt(ctx context.Context, offset int64, length int) (storage.FileRead, error) {
 	if offset < 0 || length < 0 {
 		return storage.FileRead{}, syscall.EINVAL
 	}
-	r, e := f.call(ctx, fileRequest{Op: authz.FileRead, Offset: offset, Length: length})
+	r, e := f.call(ctx, fileRequest{Op: storage.OpFileRead, Offset: offset, Length: length})
 	a, e := responseFileAttr(r, e)
 	if e != nil {
 		return storage.FileRead{}, e
@@ -354,7 +352,7 @@ func (f *remoteFile) WriteAtWithBarrier(ctx context.Context, offset int64, data 
 	if offset < 0 {
 		return storage.Attr{}, nil, syscall.EINVAL
 	}
-	r, e := f.call(ctx, fileRequest{Op: authz.FileWrite, Offset: offset, Data: data})
+	r, e := f.call(ctx, fileRequest{Op: storage.OpFileWrite, Offset: offset, Data: data})
 	a, e := responseFileAttr(r, e)
 	return a, r.Barrier, e
 }
@@ -366,7 +364,7 @@ func (f *remoteFile) TruncateWithBarrier(ctx context.Context, size int64) (stora
 	if size < 0 {
 		return storage.Attr{}, nil, syscall.EINVAL
 	}
-	r, e := f.call(ctx, fileRequest{Op: authz.FileTruncate, Offset: size})
+	r, e := f.call(ctx, fileRequest{Op: storage.OpFileTruncate, Offset: size})
 	a, e := responseFileAttr(r, e)
 	return a, r.Barrier, e
 }
@@ -376,19 +374,19 @@ func (f *remoteFile) SetAttr(ctx context.Context, c storage.AttrChange) (storage
 }
 func (f *remoteFile) SetAttrWithBarrier(ctx context.Context, c storage.AttrChange) (storage.Attr, *MutationBarrier, error) {
 	change := AttrChangeOf(c)
-	r, e := f.call(ctx, fileRequest{Op: authz.FileSetAttr, Change: change})
+	r, e := f.call(ctx, fileRequest{Op: storage.OpFileSetAttr, Change: change})
 	a, e := responseFileAttr(r, e)
 	return a, r.Barrier, e
 }
 func (f *remoteFile) Sync(ctx context.Context) error {
-	_, e := f.call(ctx, fileRequest{Op: authz.FileSync})
+	_, e := f.call(ctx, fileRequest{Op: storage.OpFileSync})
 	return e
 }
 func (f *remoteFile) GetLock(ctx context.Context, owner storage.LockOwner, lock storage.FileLock) (storage.LockConflict, error) {
 	if err := lock.Check(); err != nil {
 		return storage.LockConflict{}, err
 	}
-	r, e := f.call(ctx, fileRequest{Op: authz.FileGetLock, Owner: owner, Lock: lock})
+	r, e := f.call(ctx, fileRequest{Op: storage.OpFileGetLock, Owner: owner, Lock: lock})
 	if e != nil {
 		return storage.LockConflict{}, e
 	}
@@ -414,20 +412,20 @@ func (f *remoteFile) SetLock(ctx context.Context, o storage.LockOwner, l storage
 	if e := l.Check(); e != nil {
 		return storage.LockAttempt{}, e
 	}
-	op := authz.FileSetLock
+	op := storage.OpFileSetLock
 	if l.Type == storage.Unlock {
-		op = authz.FileUnlock
+		op = storage.OpFileUnlock
 	}
 	return f.lockCall(ctx, fileRequest{Op: op, Owner: o, Lock: l, LockID: id})
 }
 func (f *remoteFile) QueryLock(ctx context.Context, o storage.LockOwner, id storage.LockRequestID) (storage.LockAttempt, error) {
-	return f.lockCall(ctx, fileRequest{Op: authz.FileQueryLock, Owner: o, LockID: id})
+	return f.lockCall(ctx, fileRequest{Op: storage.OpFileQueryLock, Owner: o, LockID: id})
 }
 func (f *remoteFile) CancelLock(ctx context.Context, o storage.LockOwner, id storage.LockRequestID) (storage.LockAttempt, error) {
-	return f.lockCall(ctx, fileRequest{Op: authz.FileCancelLock, Owner: o, LockID: id})
+	return f.lockCall(ctx, fileRequest{Op: storage.OpFileCancelLock, Owner: o, LockID: id})
 }
 func (f *remoteFile) DropLocks(ctx context.Context, o storage.LockOwner, family storage.LockFamily) error {
-	_, e := f.call(ctx, fileRequest{Op: authz.FileDropLocks, Owner: o, Family: family})
+	_, e := f.call(ctx, fileRequest{Op: storage.OpFileDropLocks, Owner: o, Family: family})
 	return e
 }
 func (f *remoteFile) Close(ctx context.Context) error {
@@ -449,7 +447,7 @@ func (f *remoteFile) Close(ctx context.Context) error {
 	}
 	action := f.closeAction
 	f.mu.Unlock()
-	_, e := f.session.call(ctx, fileRequest{Op: authz.FileClose, File: f.id, Action: action})
+	_, e := f.session.call(ctx, fileRequest{Op: storage.OpFileClose, File: f.id, Action: action})
 	if e == nil || errors.Is(e, syscall.ESTALE) {
 		f.mu.Lock()
 		f.closed = true

@@ -217,8 +217,8 @@ go.mod
 packages/                    可被外部与自身 import
   locking/                   强 S/X 权限状态、有限历史与原生发布协调
   advisory/                  标准 flock/POSIX owner、范围、等待与有限历史
-  authz/                     嵌入方授权接口与语义操作，复用 storage 的打开意图
-  storage/                   接口定义、实现者义务与 errno 词汇（两个角色共用）
+  authz/                     嵌入方授权接口与请求，复用 storage 的操作和打开意图
+  storage/                   接口、volume 服务操作、实现者义务与 errno 词汇（两个角色共用）
     locked/                  enforcing backend 与其授权方的配对，提供不可变 scope
     lockcontract/            文件保护义务的共享验收
     localstore/              把本地对象、SQLite、外部提交见证、锁与恢复组合成一份 storage
@@ -246,7 +246,7 @@ docs/
 
 | 包 | 归属 |
 |---|---|
-| `storage` | 两个角色共用 |
+| `storage` | 两个角色共用：接口、volume 服务的语义操作与错误词汇 |
 | `authz` | 传输中性的业务授权类型；由嵌入方与 server adapter 使用 |
 | `advisory` | server 侧，按 volume 共享标准锁状态 |
 | `storage/storagetest` | 测试专用：volume 与 bounded-server 契约的可执行形式 |

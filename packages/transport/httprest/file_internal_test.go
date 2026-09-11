@@ -5,18 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/codetreker/remote-fs/packages/locking"
+	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/codetreker/remote-fs/packages/authz"
-	"github.com/codetreker/remote-fs/packages/locking"
-	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
-	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 )
 
 func TestRetainedOpenAccessKeepsFlatStrictJSONFields(t *testing.T) {
@@ -25,7 +23,7 @@ func TestRetainedOpenAccessKeepsFlatStrictJSONFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := fileRequest{
-		Op: authz.FileOpen, Session: strings.Repeat("a", 64), Action: action,
+		Op: storage.OpFileOpen, Session: strings.Repeat("a", 64), Action: action,
 		Path: []byte("file"), Data: []byte{},
 		Open: storage.FileOpenOptions{
 			OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Truncate: true, Exclusive: true},
@@ -130,7 +128,7 @@ func TestRetainedHTTPUnacknowledgedOpenExpiresDuringRenewal(t *testing.T) {
 	if err := backend.Write(ctx, "file", []byte("retained")); err != nil {
 		t.Fatal(err)
 	}
-	response, err := remote.call(ctx, fileRequest{Op: authz.FileOpen, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}})
+	response, err := remote.call(ctx, fileRequest{Op: storage.OpFileOpen, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}})
 	if err != nil || response.File == "" {
 		t.Fatalf("pending open = %+v, %v", response, err)
 	}
@@ -154,7 +152,7 @@ func TestRetainedHTTPUnacknowledgedOpenExpiresDuringRenewal(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if _, err := remote.call(ctx, fileRequest{Op: authz.FileAck, File: response.File}); !errors.Is(err, syscall.ESTALE) {
+	if _, err := remote.call(ctx, fileRequest{Op: storage.OpFileAck, File: response.File}); !errors.Is(err, syscall.ESTALE) {
 		t.Fatalf("expired reference acknowledgement = %v", err)
 	}
 }
@@ -175,7 +173,7 @@ func TestRetainedHTTPActionEvictionCannotRepeatAnOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := fileRequest{Op: authz.FileOpen, Session: remote.id, Action: id, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}}
+	request := fileRequest{Op: storage.OpFileOpen, Session: remote.id, Action: id, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}}
 	original, err := client.fileCall(ctx, request)
 	if err != nil {
 		t.Fatal(err)
@@ -247,11 +245,11 @@ func TestRetainedHTTPRegistryLimitsFailBeforeAnotherNativeReference(t *testing.T
 	if _, err := client.NewFileSession(ctx, storage.DefaultFileSessionOptions()); !errors.Is(err, syscall.EAGAIN) {
 		t.Fatalf("session admission = %v", err)
 	}
-	response, err := remote.call(ctx, fileRequest{Op: authz.FileOpen, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}})
+	response, err := remote.call(ctx, fileRequest{Op: storage.OpFileOpen, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}})
 	if err != nil || response.File == "" {
 		t.Fatalf("first action = %+v, %v", response, err)
 	}
-	if _, err := remote.call(ctx, fileRequest{Op: authz.FileOpen, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}}); !errors.Is(err, syscall.EAGAIN) {
+	if _, err := remote.call(ctx, fileRequest{Op: storage.OpFileOpen, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}}); !errors.Is(err, syscall.EAGAIN) {
 		t.Fatalf("action admission = %v", err)
 	}
 	if _, err := remote.Renew(ctx); err != nil {

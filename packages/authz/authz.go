@@ -10,17 +10,13 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// Operation identifies one semantic action independently of its transport method.
-// Policies should deny operations they do not recognize.
-type Operation string
-
 // AccessRequest identifies the host-configured volume and an operation on it.
 // Volume is trusted configuration, not a name selected by the remote request.
 type AccessRequest struct {
 	Volume    string
-	Operation Operation
-	// Open preserves the validated FileOpen or FileOpenNode intent. Other
-	// operations carry its zero value.
+	Operation storage.Operation
+	// Open preserves the validated storage.OpFileOpen or storage.OpFileOpenNode
+	// intent. Other operations carry its zero value.
 	Open storage.OpenAccess
 }
 

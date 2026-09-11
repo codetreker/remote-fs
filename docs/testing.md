@@ -90,7 +90,7 @@ checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race 
 
 ## 业务方提供的操作授权
 
-[授权设计](design/server/authorization.md)拥有语义操作表；测试按该表核对映射，普通、bounded 与 barrier 入口保持同一语义。[authz 值类型用例](../packages/authz/authz_test.go)核对操作常量、函数适配器保留原 context 与错误，以及策略修改 AccessRequest 副本不会改变调用方的值。身份来自 host 自己的 context key，Volume 来自 handler 的可信配置，已有 capability 保持 bearer 语义。
+[授权设计](design/server/authorization.md)拥有语义操作表；测试按该表核对映射，普通、bounded 与 barrier 入口保持同一语义。[操作词汇用例](../packages/storage/operations_test.go)核对 storage.Operation 常量；[authz 值类型用例](../packages/authz/authz_test.go)核对函数适配器保留原 context 与错误，以及策略修改 AccessRequest 副本不会改变调用方的值。身份来自 host 自己的 context key，Volume 来自 handler 的可信配置，已有 capability 保持 bearer 语义。
 
 [入口授权用例](../packages/transport/httprest/authorization_test.go)验证 Authorizer 与 Volume 同时缺省、成对配置、typed-nil 和 nil 函数拒绝，以及不改写不透明 Volume。普通操作先拒绝再允许，分别核对拒绝时 backend／barrier 未被调用、允许后原 backend 错误仍返回，成功修改只在授权之后读取 barrier。非法请求不触发策略；并发请求保留各自的 host 值，请求结束解除派生 context，未启用 hook 的路径保持原行为。
 

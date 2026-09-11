@@ -8,6 +8,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/codetreker/remote-fs/packages/fuse"
+	"github.com/codetreker/remote-fs/packages/fuse/fusetest"
+	"github.com/codetreker/remote-fs/packages/locking"
+	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
+	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore/memory"
+	"github.com/codetreker/remote-fs/packages/storage/replicated"
+	"github.com/codetreker/remote-fs/packages/transport/httprest"
 	"io"
 	"io/fs"
 	"log"
@@ -23,18 +33,6 @@ import (
 	"testing"
 	"time"
 	"unsafe"
-
-	"github.com/codetreker/remote-fs/packages/authz"
-	"github.com/codetreker/remote-fs/packages/fuse"
-	"github.com/codetreker/remote-fs/packages/fuse/fusetest"
-	"github.com/codetreker/remote-fs/packages/locking"
-	"github.com/codetreker/remote-fs/packages/metastore"
-	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
-	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/objectstore"
-	"github.com/codetreker/remote-fs/packages/storage/objectstore/memory"
-	"github.com/codetreker/remote-fs/packages/storage/replicated"
-	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
 // TestMain runs the tests beneath a temporary directory of this run's own, so that a
@@ -147,9 +145,9 @@ func serveStorage(t *testing.T, volume storage.Storage, log metastore.Log) *volu
 }
 
 const (
-	fileStatNodeCall = string(httprest.OpFile) + ":" + string(authz.FileStatNode)
-	fileRenewCall    = string(httprest.OpFileControl) + ":" + string(authz.FileRenew)
-	fileCloseCall    = string(httprest.OpFileControl) + ":" + string(authz.FileClose)
+	fileStatNodeCall = string(httprest.OpFile) + ":" + string(storage.OpFileStatNode)
+	fileRenewCall    = string(httprest.OpFileControl) + ":" + string(storage.OpFileRenew)
+	fileCloseCall    = string(httprest.OpFileControl) + ":" + string(storage.OpFileClose)
 )
 
 // calls counts the requests that reach the server, by operation.
@@ -229,7 +227,7 @@ func (c *calls) waitFileCloses(t *testing.T, expected int) {
 
 // Only the bounded operation prefix is inspected; replay preserves the handler's body
 // parsing, content length and admission behavior.
-func recordedFileOperation(r *http.Request) authz.Operation {
+func recordedFileOperation(r *http.Request) storage.Operation {
 	var prefix bytes.Buffer
 	body := r.Body
 	defer func() { r.Body = &recordedRequestBody{Reader: io.MultiReader(&prefix, body), Closer: body} }()
@@ -244,7 +242,7 @@ func recordedFileOperation(r *http.Request) authz.Operation {
 			return ""
 		}
 		if key == "op" {
-			var op authz.Operation
+			var op storage.Operation
 			if err := decoder.Decode(&op); err == nil {
 				return op
 			}

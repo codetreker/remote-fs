@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/codetreker/remote-fs/packages/storage"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -52,7 +53,7 @@ func (p *lockAuthorizationPolicy) check(t *testing.T, operation string, count in
 		t.Fatalf("authorization calls = %d; want %d", len(p.requests), count)
 	}
 	for i, request := range p.requests {
-		want := authz.AccessRequest{Volume: "trusted-policy-volume", Operation: authz.Operation(operation)}
+		want := authz.AccessRequest{Volume: "trusted-policy-volume", Operation: storage.Operation(operation)}
 		if request != want || p.identity[i] != "host-identity" {
 			t.Fatalf("authorization request = %+v, identity = %v; want %+v and host identity", request, p.identity[i], want)
 		}

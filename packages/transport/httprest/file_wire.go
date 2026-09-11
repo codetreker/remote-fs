@@ -3,26 +3,24 @@ package httprest
 import (
 	"context"
 	"fmt"
+	"github.com/codetreker/remote-fs/packages/storage"
 	"syscall"
 	"time"
-
-	"github.com/codetreker/remote-fs/packages/authz"
-	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 const OpFile Op = "file"
 const OpFileControl Op = "file-control"
 
-func fileControl(op authz.Operation) bool {
+func fileControl(op storage.Operation) bool {
 	switch op {
-	case authz.FileStatus, authz.FileRenew, authz.FileSessionClose, authz.FileClose, authz.FileAck, authz.FileGetLock, authz.FileSetLock, authz.FileUnlock, authz.FileQueryLock, authz.FileCancelLock, authz.FileDropLocks:
+	case storage.OpFileStatus, storage.OpFileRenew, storage.OpFileSessionClose, storage.OpFileClose, storage.OpFileAck, storage.OpFileGetLock, storage.OpFileSetLock, storage.OpFileUnlock, storage.OpFileQueryLock, storage.OpFileCancelLock, storage.OpFileDropLocks:
 		return true
 	}
 	return false
 }
 
 type fileRequest struct {
-	Op      authz.Operation            `json:"op"`
+	Op      storage.Operation          `json:"op"`
 	Session string                     `json:"session"`
 	File    string                     `json:"file"`
 	Action  storage.LockRequestID      `json:"action"`
@@ -53,17 +51,17 @@ type fileResponse struct {
 	Barrier  *MutationBarrier           `json:"barrier,omitempty"`
 }
 
-func fileMutation(op authz.Operation) bool {
+func fileMutation(op storage.Operation) bool {
 	switch op {
-	case authz.FileOpen, authz.FileOpenNode, authz.FileSetNodeAttr, authz.FileWrite, authz.FileTruncate, authz.FileSetAttr, authz.FileSync:
+	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileSetNodeAttr, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSync:
 		return true
 	}
 	return false
 }
 
-func fileActionRequired(op authz.Operation) bool {
+func fileActionRequired(op storage.Operation) bool {
 	switch op {
-	case authz.FileOpen, authz.FileOpenNode, authz.FileSetNodeAttr, authz.FileWrite, authz.FileTruncate, authz.FileSetAttr, authz.FileSync, authz.FileDropLocks:
+	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileSetNodeAttr, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSync, storage.OpFileDropLocks:
 		return true
 	}
 	return false

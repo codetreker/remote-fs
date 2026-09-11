@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/transport/httprest"
 	"io"
 	"math"
 	"net/http"
@@ -13,10 +15,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/codetreker/remote-fs/packages/authz"
-	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
 func filePair(t *testing.T, backend storage.Storage) (*httprest.Storage, *httprest.Handler) {
@@ -170,14 +168,14 @@ func TestRetainedHTTPAdvisoryCoordinatesAcrossHandlers(t *testing.T) {
 type dropFileReply struct {
 	next      http.RoundTripper
 	mu        sync.Mutex
-	operation authz.Operation
+	operation storage.Operation
 	dropped   bool
 	after     func() error
 }
 
 func (d *dropFileReply) RoundTrip(req *http.Request) (*http.Response, error) {
 	var op struct {
-		Op authz.Operation `json:"op"`
+		Op storage.Operation `json:"op"`
 	}
 	if req.Body != nil {
 		content, err := io.ReadAll(req.Body)
@@ -227,7 +225,7 @@ func TestRetainedHTTPReplaysLostOpenWithoutAnotherReference(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	transport := &dropFileReply{next: server.Client().Transport, operation: authz.FileOpen}
+	transport := &dropFileReply{next: server.Client().Transport, operation: storage.OpFileOpen}
 	client, err := httprest.Dial(server.URL, &http.Client{Transport: transport})
 	if err != nil {
 		t.Fatal(err)
@@ -275,7 +273,7 @@ func TestRetainedHTTPReplaysLostTruncateWithoutReapplyingIt(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	transport := &dropFileReply{next: server.Client().Transport, operation: authz.FileTruncate, after: func() error { return backend.Write(ctx, "file", []byte("later update")) }}
+	transport := &dropFileReply{next: server.Client().Transport, operation: storage.OpFileTruncate, after: func() error { return backend.Write(ctx, "file", []byte("later update")) }}
 	client, err := httprest.Dial(server.URL, &http.Client{Transport: transport})
 	if err != nil {
 		t.Fatal(err)
@@ -324,7 +322,7 @@ func TestRetainedHTTPHandlerCloseRetiresOnlyOwnedSessions(t *testing.T) {
 }
 
 func TestRetainedHTTPReconcilesLostAcknowledgementAndClose(t *testing.T) {
-	for _, operation := range []authz.Operation{authz.FileAck, authz.FileClose} {
+	for _, operation := range []storage.Operation{storage.OpFileAck, storage.OpFileClose} {
 		t.Run(string(operation), func(t *testing.T) {
 			ctx := context.Background()
 			backend := volumeFixture(t)
