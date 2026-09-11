@@ -498,6 +498,9 @@ func (o *Objects) get(ctx context.Context, key string, maxBytes int64, bounded b
 	if err != nil {
 		return nil, fmt.Errorf("get %q: %w", key, err)
 	}
+	if !absent {
+		defer unix.Close(shardFD)
+	}
 	ticket, err = waiting.promote(ctx, 0)
 	if err != nil {
 		return nil, fmt.Errorf("get %q: %w", key, err)
@@ -508,7 +511,6 @@ func (o *Objects) get(ctx context.Context, key string, maxBytes int64, bounded b
 	if absent {
 		return nil, fmt.Errorf("get %q: nothing is stored under this key: %w", key, syscall.ENOENT)
 	}
-	defer unix.Close(shardFD)
 	fd, st, err := openPrivateObject(shardFD, location.final, o.filesystem, o.ops)
 	if err != nil {
 		if errors.Is(err, syscall.ENOENT) {
@@ -582,6 +584,9 @@ func (o *Objects) Delete(ctx context.Context, key string) (returned error) {
 	if err != nil {
 		return fmt.Errorf("delete %q: %w", key, err)
 	}
+	if !absent {
+		defer unix.Close(shardFD)
+	}
 	ticket, err = waiting.promote(ctx, 0)
 	if err != nil {
 		return fmt.Errorf("delete %q: %w", key, err)
@@ -592,7 +597,6 @@ func (o *Objects) Delete(ctx context.Context, key string) (returned error) {
 	if absent {
 		return nil
 	}
-	defer unix.Close(shardFD)
 	_, finalExists, err := inspectObject(
 		ctx, shardFD, location, o.id, key, o.limits.maxObjectBytes, o.filesystem, o.ops,
 	)

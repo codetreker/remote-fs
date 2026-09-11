@@ -346,6 +346,8 @@ SQLite 的包内直接用例按各模块持有的边界核对结果：
 
 ### 本地持久对象存储
 
+[shard 描述符用例](../packages/storage/objectstore/localdisk/objects_test.go)在真实私有对象目录中分别驱动 Get、GetBounded 与 Delete：占住唯一 active 名额，确认 shard 已打开且调用到达饱和的提升等待分支后取消，重复操作结束时按 device／inode 识别的 `/proc/self/fd` 目标 shard 描述符数恢复基线。单纯取消保持 EINTR，waiting／active、byte 预留与 key／shard 协调资源释放，归还名额后正常操作仍可完成；另在打开 shard 后注入健康失败，核对 EIO 与 FD 基线。[既有对象用例](../packages/storage/objectstore/localdisk/localdisk_test.go)继续核对缺席、打开及身份校验失败的错误语义；缺席判断仍位于 admission 与健康检查之后。
+
 `packages/storage/objectstore/localdisk` 与 `packages/storage/localstore` 在测试专用的真实本地目录里运行，验证的不只是 `Objects` 契约，还包括磁盘格式与 reopen 行为：
 
 - `FORMAT`、`LOCALSTORE` READY marker、初始化 intent、`METASTORE`、SQLite binding／database identity／generation／高水位、directory marker、recovery record 与 object envelope 的版本、UUID、volume、key、长度和 checksum；
