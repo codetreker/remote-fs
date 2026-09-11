@@ -335,6 +335,23 @@ func requireMutationBarrier(req Request, barrier *MutationBarrier, err error) (M
 	return *barrier, nil
 }
 
+// Checkpoint reads one atomic log incarnation and committed position without changing
+// the volume. ENOSYS means the volume has no change log. A malformed or unreachable
+// response is EIO; a cancelled read preserves the ordinary read cancellation semantics.
+func (s *Storage) Checkpoint(ctx context.Context) (MutationBarrier, error) {
+	req := Request{Op: OpCheckpoint}
+	answer, err := s.call(ctx, req, nil)
+	if err != nil {
+		return MutationBarrier{}, err
+	}
+	defer answer.release()
+	var barrier MutationBarrier
+	if err := json.Unmarshal(answer.content, &barrier); err != nil {
+		return MutationBarrier{}, unreachable(req, err)
+	}
+	return barrier, nil
+}
+
 // call performs one operation and returns the response body. content is the request
 // payload, and nil for the operations that send none.
 func (s *Storage) call(ctx context.Context, req Request, content []byte) (*retainedBody, error) {

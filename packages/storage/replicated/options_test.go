@@ -17,6 +17,8 @@ func TestConfirmationOptionsRejectUnboundedOrImpossibleValues(t *testing.T) {
 		name   string
 		change func(*replicated.Options)
 	}{
+		{"zero replay timeout", func(options *replicated.Options) { options.ReplayTimeout = 0 }},
+		{"negative replay timeout", func(options *replicated.Options) { options.ReplayTimeout = -time.Second }},
 		{"zero grace", func(options *replicated.Options) { options.ConfirmationGrace = 0 }},
 		{"negative grace", func(options *replicated.Options) { options.ConfirmationGrace = -time.Second }},
 		{"zero active confirmations", func(options *replicated.Options) { options.MaxActiveConfirmations = 0 }},
@@ -47,6 +49,7 @@ func TestDefaultConfirmationOptionsAreFinite(t *testing.T) {
 	}
 	if options != (replicated.Options{
 		ConfirmationGrace:       replicated.DefaultConfirmationGrace,
+		ReplayTimeout:           replicated.DefaultReplayTimeout,
 		MaxActiveConfirmations:  replicated.DefaultMaxActiveConfirmations,
 		MaxWaitingConfirmations: replicated.DefaultMaxWaitingConfirmations,
 		MaxFileSessions:         replicated.DefaultMaxFileSessions,

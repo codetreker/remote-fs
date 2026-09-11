@@ -8,6 +8,10 @@ import (
 )
 
 const (
+	// DefaultReplayTimeout bounds the checkpoint and replay after a snapshot
+	// arrives whole. Subscription setup and snapshot transfer precede this bound.
+	DefaultReplayTimeout = 10 * time.Second
+
 	// DefaultConfirmationGrace is how long a caller waits for the server's barrier to be
 	// applied locally. Expiry fails that mutation; it does not invalidate a current replica.
 	DefaultConfirmationGrace = 10 * time.Second
@@ -25,7 +29,7 @@ const (
 	DefaultMaxFileSessions = 64
 )
 
-// Options bounds mutation confirmation and locally owned file sessions.
+// Options bounds snapshot replay, mutation confirmation and locally owned file sessions.
 //
 // A mutation reserves one fixed-size record before its request is sent.
 // MaxWaitingConfirmations bounds callers waiting for one. Capacity saturation and closing
@@ -34,6 +38,7 @@ const (
 // only after the local replica reaches its barrier; cancellation and timeout are then
 // EIO because the volume has changed.
 type Options struct {
+	ReplayTimeout           time.Duration
 	ConfirmationGrace       time.Duration
 	MaxActiveConfirmations  int
 	MaxWaitingConfirmations int
@@ -44,6 +49,7 @@ type Options struct {
 // DefaultOptions returns the bounded replication settings used by New.
 func DefaultOptions() Options {
 	return Options{
+		ReplayTimeout:           DefaultReplayTimeout,
 		ConfirmationGrace:       DefaultConfirmationGrace,
 		MaxActiveConfirmations:  DefaultMaxActiveConfirmations,
 		MaxWaitingConfirmations: DefaultMaxWaitingConfirmations,
@@ -54,6 +60,8 @@ func DefaultOptions() Options {
 // Check reports invalid bounds without opening a subscription or touching the replica.
 func (o Options) Check() error {
 	switch {
+	case o.ReplayTimeout <= 0:
+		return fmt.Errorf("snapshot replay timeout must be positive, not %v: %w", o.ReplayTimeout, syscall.EINVAL)
 	case o.ConfirmationGrace <= 0:
 		return fmt.Errorf("confirmation grace must be positive, not %v: %w", o.ConfirmationGrace, syscall.EINVAL)
 	case o.MaxActiveConfirmations <= 0 || o.MaxActiveConfirmations == math.MaxInt:

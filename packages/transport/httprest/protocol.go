@@ -88,7 +88,7 @@ const (
 	OpSpace     Op = "space"
 )
 
-// The three operations of the replication contract.
+// The operations of the replication contract.
 //
 // Beginning a stream at the log's tail and continuing one from a recorded position are
 // two operations rather than one with an optional resume point, and the reason is the
@@ -103,6 +103,7 @@ const (
 	OpSubscribe   Op = "subscribe"
 	OpResubscribe Op = "resubscribe"
 	OpSnapshot    Op = "snapshot"
+	OpCheckpoint  Op = "checkpoint"
 )
 
 // Query keys for the operands. Operands travel in the query string rather than in the
@@ -154,6 +155,7 @@ var ops = map[Op]opSpec{
 	OpSubscribe:         {operation: storage.OpReplicationSubscribe, method: http.MethodGet},
 	OpResubscribe:       {operation: storage.OpReplicationResubscribe, method: http.MethodGet, operands: []string{keyIncarnation, keyPosition}},
 	OpSnapshot:          {operation: storage.OpReplicationSnapshot, method: http.MethodGet},
+	OpCheckpoint:        {operation: storage.OpReplicationCheckpoint, method: http.MethodGet},
 	OpSessionEnrollment: {operation: storage.OpLockSessionEnrollment, method: http.MethodPost, body: contentJSON},
 	OpSessionOpen:       {operation: storage.OpLockSessionOpen, method: http.MethodPost, body: contentJSON},
 	OpSessionClose:      {operation: storage.OpLockSessionClose, method: http.MethodPost, body: contentJSON},

@@ -126,11 +126,10 @@ func run(args []string, errOut io.Writer) error {
 	if err := fileSession.Check(); err != nil {
 		return fmt.Errorf("invalid file session limits: %w", err)
 	}
-	confirmationOptions := replicated.Options{
-		ConfirmationGrace:       *confirmationGrace,
-		MaxActiveConfirmations:  *maxActiveConfirmations,
-		MaxWaitingConfirmations: *maxWaitingConfirmations,
-	}
+	confirmationOptions := replicated.DefaultOptions()
+	confirmationOptions.ConfirmationGrace = *confirmationGrace
+	confirmationOptions.MaxActiveConfirmations = *maxActiveConfirmations
+	confirmationOptions.MaxWaitingConfirmations = *maxWaitingConfirmations
 	if err := confirmationOptions.Check(); err != nil {
 		return fmt.Errorf("invalid mutation confirmation limits: %w", err)
 	}
@@ -257,7 +256,7 @@ func replicateWithOptions(
 	started := time.Now()
 	served, err := replicated.NewWithOptions(ctx, replica, volume, options)
 	switch {
-	case errors.Is(err, syscall.ENOSYS):
+	case storage.ErrnoOf(err) == syscall.ENOSYS:
 		if closeErr := replica.Close(); closeErr != nil {
 			return nil, nil, errors.Join(err, closeErr)
 		}

@@ -234,6 +234,14 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 ## 元数据副本的读写交接
 
+[重建回放用例](../packages/storage/replicated/build_test.go)使用真实 SQLite 与 HTTP，分别控制 snapshot 的 done frame 和后续 change frame。在快照捕获后由独立客户端创建、覆盖、改名和删除；done 交付前不得请求新的 checkpoint，回放仍被阻塞时，副本的 Stat／List 必须返回 `EIO`。释放变更后核对完整树，并在 `MaxSubscriptions=1`、每主机两条 HTTP connection 的限制下检查 Subscribe、Snapshot 和 Checkpoint 次数，确保就绪交接使用原订阅。
+
+固定目标用例在 checkpoint 捕获后再提交并阻塞另一条 change，要求构建达到原目标即可返回；随后取消构建调用方的 context，再释放该 change，持续跟随仍须应用它。空树用例把 snapshot HTTP body 保持到 client Close，验证释放连接后 checkpoint 才能完成，零位置无需等待事件。另覆盖合法的非连续 position、checkpoint 与订阅 incarnation 不同、checkpoint 落后于快照、权威端不可达、日志保留丢失和无法应用的 change。重建部分回放后断流时，公开读取继续失败，下一次 Resubscribe 必须从实际安装并应用到的位置恢复，最终树与权威端一致。
+
+取消用例分别停在初次订阅的 start frame 和回放读取入口，要求构建返回 `EIO` 并保留 context 及自定义原因；订阅取消还须等待 handler 退出、不发送 Snapshot，并证明唯一订阅名额可复用。snapshot Close 故障保留原错误且不发送 Checkpoint；host context value 须到达 Snapshot 和 Checkpoint。[选项用例](../packages/storage/replicated/options_test.go)验证 `ReplayTimeout` 的十秒默认值及非正值拒绝；构建用例分别阻塞 Checkpoint 请求和回放读取，验证快照 EOF 后的期限以保留 `DeadlineExceeded` 的 `EIO` 结束构建，不能交付可用副本。
+
+[checkpoint HTTP 用例](../packages/transport/httprest/checkpoint_test.go)验证 `GET /v3/checkpoint` 返回当前 `MutationBarrier`，重复读取不改变节点、目录、容量或日志位置。授权以可信 volume、host context 和 `OpReplicationCheckpoint` 先于 Log 读取执行；拒绝和策略故障只返回固定 `EACCES`／`EIO`，缺少 Log 在授权后返回 `ENOSYS`。非法权威 barrier、字段缺失或类型错误、额外字段、错误嵌套、尾随 JSON、协议不符、截断或超限响应都须失败且不暴露部分 checkpoint。直接调用 Checkpoint 的发送后取消保留 `EINTR` 和 context 原因；构建期间无法完成回放门则由上述构建用例要求 `EIO`。
+
 五个副本确认、容量及 Close 用例使用[事件交付门](../packages/storage/replicated/harness_test.go)：真实 bootstrap 完成后才 arm，在转交响应字节前等待，用例先确认 entered，再执行对应取消或 Close，最后在原来的到达／完成位置释放。请求取消保留原 context 错误；两秒确认 grace、五秒／十秒容量 grace、二十毫秒 waiter 观察、一秒 Close 界限和原结果断言保持。慢 snapshot、replay 与全负载可见性继续使用各自原有条件。
 
 [确认 bookkeeping 用例](../packages/storage/replicated/bookkeeping_test.go)确定性地使发送回调返回成功 barrier、确认前已发生 follower 失败，分别覆盖 barrier 尚未到达和已经到达；核对发送回调仅调用一次、PathError 的操作／路径、EIO 及未能确认已发生修改的诊断，并要求 active／waiter 归零。原有真实 HTTP 双故障用例保留，不能把竞争中哪一条错误先返回当作稳定覆盖条件。夹具边界与取舍见[测试工作量决定](../.agents/notes/implemented/testing/2026-09-09-scale-test-work-to-its-assertions.md)。
@@ -271,7 +279,7 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 其余聚焦的 server 入口行为在 `cmd/remote-fs-server` 包内验证：配置解析与默认值、两种 storage mode 的打开路径、READY 与 signal ownership 的顺序、SIGHUP 的 metastore-backed status、SIGINT／SIGTERM 的 admission 停止与 handler 排空，以及 partial-open 或 shutdown failure 后的资源释放。pending、reader、integrity、sweep、snapshot-frame 与 subscription 参数到达各自组件，local waiting-operation 参数仅用于 local store，invalid bounds 在 listener/root mutation 前拒绝。sweep 用例拒绝非正 interval/batch 与超过 `MaxSweepBatch` 的 batch；write-bound 用例分别验证 local object 上限、Blob 5000 MiB 上限与 pending-byte threshold 的精确边界和超限拒绝。两种 status 都断言打印 effective reader/integrity-record/name-byte limits，local status 另打印 waiting/active operations。status 阻塞时，终止仍先停止 HTTP admission 并取消 status，handler 排空期间保持 native 所有权；不响应取消的 status 只能在 HTTP shutdown 后参与等待。这些用例直接调用命令内部的 opener 与 lifecycle helper；它们验证同一条命令代码路径，不构成已构建二进制的进程边界证据。
 
-`cmd/remote-fs` 包内测试同样区分入口层次：mutation-confirmation 与 client frame flags 的默认、help、invalid-before-network 和 forwarding 直接驱动 `run`、dial/replica helper 及真实 HTTP stream；构建出的 mount 二进制端到端用例仍走默认配置。前者证明 command wiring 与复制路径，后者证明交付程序的进程、信号与挂载边界，结论不能互换。
+`cmd/remote-fs` 包内测试同样区分入口层次：mutation-confirmation 与 client frame flags 的默认、help、invalid-before-network 和 forwarding 直接驱动 `run`、dial/replica helper 及真实 HTTP stream；[副本构建失败用例](../cmd/remote-fs/main_test.go)要求 Snapshot 后 Checkpoint 返回 `ENOSYS` 时，以保留原原因的 `EIO` 结束并清理副本目录，不进入初次 Subscribe 不支持复制时的无副本模式。构建出的 mount 二进制端到端用例仍走默认配置。包内用例证明 command wiring 与复制路径，二进制用例证明交付程序的进程、信号与挂载边界，结论不能互换。
 
 独立 HTTP server 的资源用例使用真实 TCP listener：占满 accepted-connection 名额后底层 `Accept` 不再前进，connection 的单次与重复 `Close` 只释放一份名额，关闭饱和的 listener 会唤醒正在等待的 `Accept`。两种 mode 都要求至少两条 connection，并在取得 listener 前拒绝非正 timeout。只发一部分 header 的连接在 `ReadHeaderTimeout` 内被关闭，keep-alive connection 超过 `IdleTimeout` 后被关闭；同一用例断言 request-wide `ReadTimeout` 与 `WriteTimeout` 保持为零。shutdown 用例覆盖已经存在和尚未被 tracker 观察到的 `StateNew` connection，确保 stopping state 会关闭 late notification，不把退出安全性押在 header timeout 上。
 
