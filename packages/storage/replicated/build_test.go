@@ -39,7 +39,7 @@ func TestRebuildWaitsForChangesCommittedAfterSnapshot(t *testing.T) {
 	s.events.handler = gates
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxConnsPerHost = 2
-	reader := &replayReadTransport{base: transport, entered: make(chan struct{})}
+	reader := &replayReadTransport{base: transport, entered: make(chan struct{}), beforeSubscribe: gates.waitForResubscribe}
 	remote, err := httprest.Dial(s.url, &http.Client{Transport: reader, Timeout: 10 * time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -158,6 +158,7 @@ type replayFrameGates struct {
 	active               sync.WaitGroup
 	resumesMu            sync.Mutex
 	resumes              []metastore.Position
+	lastResumeDone       <-chan struct{}
 }
 
 func newReplayFrameGates(handler http.Handler) *replayFrameGates {
@@ -187,9 +188,12 @@ func (g *replayFrameGates) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		finished := make(chan struct{})
 		g.resumesMu.Lock()
 		g.resumes = append(g.resumes, metastore.Position(at))
+		g.lastResumeDone = finished
 		g.resumesMu.Unlock()
+		defer close(finished)
 		g.handler.ServeHTTP(w, r)
 		return
 	default:
@@ -200,6 +204,21 @@ func (g *replayFrameGates) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if event == "done" && g.holdSnapshotBody {
 		<-r.Context().Done()
 		close(g.snapshotBodyReleased)
+	}
+}
+
+func (g *replayFrameGates) waitForResubscribe(ctx context.Context) error {
+	g.resumesMu.Lock()
+	finished := g.lastResumeDone
+	g.resumesMu.Unlock()
+	if finished == nil {
+		return nil
+	}
+	select {
+	case <-finished:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -252,13 +271,19 @@ func (w *replayFrameWriter) Write(p []byte) (int, error) {
 func (w *replayFrameWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 type replayReadTransport struct {
-	base    http.RoundTripper
-	armed   atomic.Bool
-	entered chan struct{}
-	once    sync.Once
+	beforeSubscribe func(context.Context) error
+	base            http.RoundTripper
+	armed           atomic.Bool
+	entered         chan struct{}
+	once            sync.Once
 }
 
 func (r *replayReadTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if r.beforeSubscribe != nil && strings.TrimPrefix(request.URL.Path, httprest.Prefix) == string(httprest.OpSubscribe) {
+		if err := r.beforeSubscribe(request.Context()); err != nil {
+			return nil, err
+		}
+	}
 	response, err := r.base.RoundTrip(request)
 	if err == nil && strings.TrimPrefix(request.URL.Path, httprest.Prefix) == string(httprest.OpSubscribe) {
 		response.Body = &replayReadBody{ReadCloser: response.Body, observer: r}
