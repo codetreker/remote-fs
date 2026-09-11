@@ -172,11 +172,15 @@ SQLite 只读用例覆盖查询取消、预算回调取消、回调成功后才�
 
 HTTP 用例区分 `Do` 前取消、已发出的只读请求与已发出的 mutation，断言是否到达服务端以及最终 errno。真实网络错误不能泄漏 `ENOENT` 等底层 errno；成功修改后的 barrier 取消仍为 `EIO`。FUSE 复合操作分别在任何效果之前及已有 volume 或句柄效果之后取消，验证后者不会返回暗示整个操作未执行的 `EINTR`。
 
+[打开 ACK 用例](../packages/transport/httprest/file_client_test.go)在真实 Open 返回引用后取消 ACK，覆盖按路径只读、读写以及按节点读写的普通已有文件打开；要求没有返回 File、原取消原因和规范 EINTR 保留、ACK 发出零次，同一 Session／File 的清理确认一次，native open／close 各一次，属性与字节不变，unlink 后无残留引用用量。创建、截断、报告 DeadlineExceeded 的 context、已发送但丢失且核对失败的 ACK、会话关闭，以及清理 EIO／ESTALE 仍为无 File 的 EIO；创建和截断效果如实保留，未成功清理的引用仍占用实际用量。该 deadline 用例验证 ACK 前的错误分类，既有真实计时器超时用例继续覆盖时间到期。清理必须原始返回 nil，不能把 ESTALE 的后续抑制当作成功；既有丢失 ACK 后成功核对的用例保留。
+
 [关闭清理用例](../packages/fuse/completion_test.go)覆盖请求值保存、关闭线程取消被隔离、默认 30 秒与显式 FlushTimeout、负值拒绝和较早请求 deadline 保留。预算在等 close mutex 之前起算，等待后只剩原 deadline 的余额；一次引用关闭只调用一次底层 Close，并发或重复关闭共享原结果，真实失败不重试，晚于预算返回的已确认成功不被改写成失败。Flush 清理 POSIX owner，Release 清理最后的 flock owner 并关闭引用；它们不发布文件内容。Fsync 调用 File.Sync 验证已发布内容的健康与持久屏障，继续响应请求取消，不能顺带退役引用。FlushTimeout 不构成内核 Unmount 或 Mount.Wait 的耗时上限。
 
 [范围写与截断用例](../packages/fuse/space_cancellation_test.go)在 retained File 边界注入直接和包裹的取消、deadline、`EINTR` 与独立故障，核对原内容不变，下一次调用仍得到新的权威 `EDQUOT`。Space 被调用即让测试失败，确保普通写入直接依赖 native quota。真实配额已满时增长和扩展失败，缩短成功后能立即使用释放的空间；已确认成功之后才到达的取消保持成功。已有副作用或结果未知不能伪装成可安全重试的 `EINTR`，与取消合并的独立故障也不能被较轻的分类覆盖。Statfs 独立调用 Space 报告容量。
 
 [读取信号探针](../packages/fuse/interruption_linux_test.go)在实际 HTTP 读取已进入服务端后，向执行系统调用的子进程线程发送 `SIGUSR1`，同时观察原 FUSE 与 HTTP 请求 context 被取消。原始 `Fstatat` 必须得到 `EINTR`，普通 `os.Stat` 依靠标准库处理中断后成功，两个调用方随后都须读到完整内容。[关闭与写入探针](../packages/fuse/interruption_write_linux_test.go)分别暂停 owner 清理与 retained WriteAt。Close 收到中断后清理 context 仍有效，普通关闭成功，Write 加 Close 总计只发出一次 WriteAt，随后重新读到已确认内容；不重试已经消耗的描述符。原始 Write 在进入下游前得到 `EINTR`，Go Write 重试后由实际 quota 以 `EDQUOT` 拒绝；两条路径分别核对调用次数和目标仍为空。
+
+[打开信号探针](../packages/fuse/interruption_open_linux_test.go)暂停真实 HTTP Open 的完整成功响应，在 ACK 前向执行打开的子进程线程发送 SIGURG，并关联原始 FUSE OPEN／INTERRUPT 及 FUSE、HTTP context 的取消。原始 unix.Open 一次调用得到 EINTR；普通 os.OpenFile 依靠标准库重试后成功，没有应用层重试循环。两条路径都确认首个引用已经清理：raw 模式一次 Open、零次 ACK，Go 模式两次 Open、一次 ACK，全部引用最终关闭，原属性与内容不变。
 
 信号探针独立于纯映射测试，也不把 SIGURG 当作所有历史失败已经证实的原因。四项历史 `cmd` 用例曾分别以 `-race` 固定采样 100 次，共 400 次；其失败记录和结果只对应当时实现，不能充当当前文件句柄路径的验收。当前验证同样不增加应用层 `EIO` 重试，不关闭异步抢占，不预热被测操作；每条阶段断言取得自己的执行证据，不以重跑整个无关命令套件代替它。
 

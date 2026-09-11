@@ -216,10 +216,12 @@ func (s *remoteFileSession) open(ctx context.Context, req fileRequest) (storage.
 		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_, cleanupErr := s.storage.fileCall(cleanup, fileRequest{Op: storage.OpFileClose, Session: s.id, File: response.File})
 		cancel()
+		interruptible := !req.Open.Create && !req.Open.Truncate &&
+			errors.Is(err, context.Canceled) && storage.ErrnoOf(err) == syscall.EINTR && cleanupErr == nil
 		if cleanupErr != nil && !errors.Is(cleanupErr, syscall.ESTALE) {
 			err = errors.Join(err, cleanupErr)
 		}
-		return nil, nil, operationFailure(Request{Op: OpFile}, err, false)
+		return nil, nil, operationFailure(Request{Op: OpFile}, err, interruptible)
 	}
 	return &remoteFile{session: s, id: response.File}, response.Barrier, nil
 }
