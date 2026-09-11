@@ -38,9 +38,9 @@ func TestBinariesRetainLiveFilesAndExclusiveAdvisoryLocks(t *testing.T) {
 				t.Fatal(err)
 			}
 			a, b := t.TempDir(), t.TempDir()
-			first := startMountBinary(t, "-server", server.url, "-mountpoint", a)
+			first := startMountBinary(t, "-server", server.url, "-mountpoint", a, "-debug")
 			logs = append(logs, processLog{"mount A", first})
-			second := startMountBinary(t, "-server", server.url, "-mountpoint", b)
+			second := startMountBinary(t, "-server", server.url, "-mountpoint", b, "-debug")
 			logs = append(logs, processLog{"mount B", second})
 			writer := openBinaryFile(t, filepath.Join(a, "artifact"), os.O_RDWR, false)
 			reader := openBinaryFile(t, filepath.Join(b, "artifact"), os.O_RDONLY, false)

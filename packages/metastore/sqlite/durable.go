@@ -287,8 +287,8 @@ func (s *Store) checkpointLocked(ctx context.Context, mode CheckpointMode) (Chec
 		return result, nil
 	}
 	if err := s.witness.Checkpoint(DurableState(state)); err != nil {
-		return CheckpointResult{}, fmt.Errorf("publishing checkpointed SQLite state at generation %d: %v: %w",
-			state.Generation, err, syscall.EIO)
+		return CheckpointResult{}, fmt.Errorf("publishing checkpointed SQLite state at generation %d: %w",
+			state.Generation, errors.Join(err, syscall.EIO))
 	}
 	return result, nil
 }

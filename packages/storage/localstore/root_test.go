@@ -794,12 +794,14 @@ func TestMetastoreWitnessStageRecoveryIsFailClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 		store, err = Open(t.Context(), config)
-		if err == nil {
-			store.Close()
-			t.Fatal("Open accepted a damaged metastore witness stage")
+		if err != nil {
+			t.Fatalf("Open rejected a bounded unfinished stage beside a valid final witness: %v", err)
 		}
-		if !errors.Is(err, syscall.EIO) {
-			t.Fatalf("Open returned %v, want EIO", err)
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(filepath.Join(config.Root, metastoreWitnessStage)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("unfinished witness stage remained after recovery: %v", err)
 		}
 	})
 }

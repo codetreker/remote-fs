@@ -77,7 +77,11 @@ HTTP 文件请求先执行[业务授权](authorization.md)，再读取／触碰 
 
 HTTP v3 增加 `file` 与 `file-control` 操作入口，保留基础 volume 与强 S/X 协议。请求的 `op` 直接使用 storage.Operation 的规范值，例如 file.open、file.read、file.unlock，分发与业务授权共享标识；二进制路径和内容使用 JSON 的 base64 byte 字段。协议对未知、重复、缺席、null 或无关字段进行验证，所有结果仍携带 v3 标记与封闭 errno 词汇。FileSession 的时间间隔使用 Go duration 的整数纳秒表示，不能按强 S/X 的毫秒字段解释。
 
-随机能力标识会话与文件引用。Open 结果在有限 PendingAck 时间内保留，client 收到能力后单独确认；无确认的引用被回收。数据修改、打开和改变锁状态的请求使用有界动作记录核对，过期历史不能让旧请求变成新执行。响应丢失后不能单凭请求 context 取消推断打开未发生或锁未取得。控制通道使用固定 16 KiB 上限与独立 admission，阻塞锁通过短的 Set/Query/Cancel 交换维持，不长期占用 HTTP worker。数据 JSON 在编码前核对 envelope 与 base64 后的总长度；区间读取在调用 backend 前为返回 envelope 扣除预算，不能只按原始字节数推断 body 大小。
+随机能力标识会话与文件引用。Open 结果在有限 PendingAck 时间内保留，client 收到能力后单独确认；无确认的引用被回收。数据修改、打开和改变锁状态的请求使用有界动作记录核对，过期历史不能让旧请求变成新执行。响应丢失后不能单凭请求 context 取消推断打开未发生或锁未取得，已有的 ACK 丢失核对路径继续执行。
+
+普通已有文件的 Open 已返回能力、但 ACK 失败时，client 先用返回的同一 Session／File 能力执行 Close 清理。只有 Create 与 Truncate 均为 false、原 ACK 错误同时满足 `errors.Is(err, context.Canceled)` 与 `storage.ErrnoOf(err) == EINTR`，且该次清理的原始 error 为 nil，才不返回 File 并保留 EINTR。清理的 ESTALE 不能当作成功，判定发生在既有 ESTALE 抑制之前。带创建／截断意图、deadline、未知 ACK 或会话故障，以及清理 EIO／ESTALE 或独立错误，仍返回无 File 的 EIO；原有创建或截断效果不被解释成未发生。已终止的 native 引用不会由迟到 ACK 或原打开动作的重放重新创建。这项分类不增加重试。
+
+控制通道使用固定 16 KiB 上限与独立 admission，阻塞锁通过短的 Set/Query/Cancel 交换维持，不长期占用 HTTP worker。数据 JSON 在编码前核对 envelope 与 base64 后的总长度；区间读取在调用 backend 前为返回 envelope 扣除预算，不能只按原始字节数推断 body 大小。
 
 `HandlerOptions.Files` 默认在整个 registry 内允许 64 个会话，每个会话分别最多保留 16384 个数据动作与 16384 个清理动作，PendingAck 为 5 秒；可接纳的会话 options 受 handler 上限约束。`Handler.Close(ctx)` 停止 admission，退役并排空它创建的 registry；backend 仍归调用方。独立 server 先排空 HTTP 请求，再完成 handler 清理，最后关闭自己拥有的 backend；清理失败不释放 backend 所有权。
 

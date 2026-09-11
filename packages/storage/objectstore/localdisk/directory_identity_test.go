@@ -252,7 +252,13 @@ func TestOpenPreservesDamagedShardIdentityStage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := file.WriteAt([]byte{0xff}, 32); err != nil {
+	var checksumByte [1]byte
+	if _, err := file.ReadAt(checksumByte[:], 32); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	checksumByte[0] ^= 1
+	if _, err := file.WriteAt(checksumByte[:], 32); err != nil {
 		_ = file.Close()
 		t.Fatal(err)
 	}

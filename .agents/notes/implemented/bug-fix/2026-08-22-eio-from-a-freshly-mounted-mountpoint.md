@@ -36,9 +36,12 @@ stat "over.bin": Get "http://…/<protocol>/stat?path=over.bin": context cancele
 | mutation 已进入 HTTP `Do`，未获得权威结果 | 无法证明请求未发出或修改未发生，返回 `EIO` |
 | mutation 已成功，副本 barrier 确认被取消 | volume 已经改变，返回 `EIO` |
 | FUSE 复合操作已有本地或 volume 效果，后续步骤被取消 | 整个操作不能作为未执行的请求重试，返回 `EIO` |
+| 已有文件 Open 完成，ACK 已知取消，且同一引用清理成功 | 仅 Create／Truncate 都为 false、ACK 同时含 context.Canceled 且规范分类为 EINTR、原始清理 error 为 nil 时返回无 File 的 EINTR |
 | Open/Create、Close 或 Renew 已派发，远端结果无法核对 | 可能改变引用或生命周期，返回 `EIO`，不能据传输取消推断未发生 |
 | advisory 获取被取消 | 只有核对证明无残留授予才返回 `EINTR`；未知结果使受影响 I/O 隔离 |
 | `Flush` 收到关闭线程的取消 | 以独立且有 deadline 的 context 完成 owner 清理，不承担内容提交 |
+
+已有文件打开的 ACK 取消由[文件确认协议](../../../../docs/design/server/file-handles.md#五http复制与资源)核对最终状态：不带创建／截断意图，且确切 Session／File 已成功清理时，没有内容修改或遗留引用需要把这次已知中断改为 EIO。清理原始 error 必须为 nil，ESTALE 不能充当确认成功；deadline、未知 ACK、会话或独立故障仍维持 EIO。已关闭引用不因迟到 ACK 或动作重放复活；既有丢失 ACK 的核对和调用方对 EINTR 的处理保留，不添加库内重试。
 
 HTTP transport 的底层 errno 保持隔离：连接 Unix socket 失败时的 `ENOENT` 不能变成 volume 不存在。FUSE 的 Create、Mkdir、Setattr 仍保留已发生效果；创建并打开在原生结果里完成，File / FileSession 的属性操作按身份访问，没有设置时间前提交其它 handle 缓冲区的阶段。后续取消的原因可以被追溯，但外层 `EIO` 不被其覆盖。
 

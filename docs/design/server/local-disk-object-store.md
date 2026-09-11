@@ -134,7 +134,11 @@ SQLite writer 使用 WAL、单 writer connection、`BEGIN IMMEDIATE`、`synchron
 
 只读 transaction 使用其拥有的 context 解释查询与回滚结果。纯取消保留原因并返回 `EINTR`；该 context 已取消时，直接的 `sql.ErrTxDone` 可表示 `database/sql` 已自动回滚，包括回调成功后才发生的取消。SQLite `SQLITE_INTERRUPT` 只在读取 context 确已取消时映射为取消；deadline、真实查询或独立 cleanup 故障仍是错误。未知 commit 与 poison 拥有 `EIO` 分类，不因保留的 context 原因改成 `EINTR`。该规则也用于 client 的 SQLite replica，取舍见[请求中断](../../../.agents/notes/implemented/bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)。
 
-`METASTORE` 是 SQLite WAL 之外的确认边界。它记录完整的已接受状态 A：数据库 identity、generation、node high-water 与 change high-water，并另记已经完整进入主数据库的 checkpoint generation C，始终满足 `0 <= C <= A.generation`。每次 durable open 或 mutation 先提交 SQLite，再用 `.METASTORE.stage` 写入并同步下一份 A，以 rename 原子替换 `METASTORE`，最后同步 root；见证发布完成后调用才可返回成功。stage 不是确认记录，重开时只把 final name 当作 A，但还要求残留 stage 通过完整内容校验。checkpoint 在创建 stage 后、写完前中断，会让已有完整 final 与恢复证据的 volume 也以 `EIO` 拒绝打开；缺口见[恢复中断的见证 stage](../../../.agents/notes/proposed/bug-fix/2026-09-07-recover-interrupted-witness-stages.md)。确认发布失败会 poison SQLite，后续读、写与 checkpoint 均以 `EIO` 拒绝。
+`METASTORE` 是 SQLite WAL 之外的确认边界。它记录完整的已接受状态 A：数据库 identity、generation、node high-water 与 change high-water，并另记已经完整进入主数据库的 checkpoint generation C，始终满足 `0 <= C <= A.generation`。每次 durable open 或 mutation 先提交 SQLite，再用 `.METASTORE.stage` 写入并同步下一份 A，以 rename 原子替换 `METASTORE`，最后同步 root；见证发布完成后调用才可返回成功。A/C 只来自完整验证的 final；stage 不补充确认记录，也不被提升为已接受状态。确认发布失败会 poison SQLite，后续读、写与 checkpoint 均以 `EIO` 拒绝。
+
+有效 final 旁的 `.METASTORE.stage` 必须先通过仅属主可访问的普通文件、单链接、root device／mount 与 0～1168 字节长度验证，并成功完成有界读取。其内容可为空、部分记录或完整长度的撕裂字节；解码失败不否定 final 的 A/C。内部有效指 header、身份长度、checksum、非零 store ID、合法 database ID 与计数均成立，尚不包含与当前 root 的身份匹配；这样的 stage 若带另一 store、volume 或 database 身份，则以 `EIO` 拒绝并保留。结构和打开／读取／关闭错误保持失败，不作为可丢弃的内容错误。没有 final 时，stage-only 初始化继续完整解析与身份检查；必要 final 缺失或损坏不能由 stage 弥补。
+
+Open 早期只检查，不清理 stage。SQLite 的数据库 identity、generation、高水位及所需 WAL 按原规则对账后，启动 Accept 的 publish 路径才用同一判据重新检查 stage、删除并同步 root，再发布下一份见证；后续 publication 重试使用相同规则。stage-only 在实际数据库身份可核对时仍拒绝异库记录。删除或同步失败保留原始错误，调用不报告恢复成功。取舍见[恢复中断的见证 stage](../../../.agents/notes/implemented/bug-fix/2026-09-07-recover-interrupted-witness-stages.md)。
 
 rename 本身失败时，publisher 删除未接受的 stage 并同步 root；清理失败则保留错误与现场。`Checkpoint` publication 失败不会 poison accepted state，清理成功后后台 worker 或关闭可以重试；这也包括 rename 已发生、最终 root barrier 失败的 checkpoint 尝试。`Accept` publication 的任何失败都会 poison 当前 SQLite，因为已提交状态没有完成 acknowledgment；rename 已发生而 root barrier 失败时，重开再以 final witness、WAL 与 visible state 对账。
 

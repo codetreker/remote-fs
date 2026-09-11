@@ -15,13 +15,14 @@ import (
 )
 
 type rootAnchor struct {
-	fd     int
-	path   string
-	device uint64
-	mount  uint64
-	inode  uint64
-	closed bool
-	statx  func(int, string, int, int, *unix.Statx_t) error
+	fd         int
+	path       string
+	device     uint64
+	mount      uint64
+	inode      uint64
+	closed     bool
+	statx      func(int, string, int, int, *unix.Statx_t) error
+	witnessOps witnessOperations
 }
 
 type metastoreRootState uint8
@@ -70,6 +71,7 @@ func openRootAnchor(root string) (*rootAnchor, error) {
 	}
 	return &rootAnchor{
 		fd: fd, path: root, device: uint64(stat.Dev), mount: mount, inode: stat.Ino, statx: unix.Statx,
+		witnessOps: defaultWitnessOperations(),
 	}, nil
 }
 

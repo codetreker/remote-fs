@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -57,18 +56,9 @@ func (a *rootAnchor) InspectMetastoreWitness(
 	if err != nil {
 		return nil, false, false, err
 	}
-	stage, stageExists, err := a.readMetastoreWitnessEntry(metastoreWitnessStage, id, volumeName)
+	stageExists, err := a.inspectMetastoreWitnessStage(id, volumeName, final.State.DatabaseID, finalExists)
 	if err != nil {
 		return nil, false, false, err
-	}
-	if stageExists {
-		if finalExists && (final.StoreID != stage.StoreID || final.Volume != stage.Volume ||
-			final.State.DatabaseID != stage.State.DatabaseID) {
-			return nil, false, false, fmt.Errorf(
-				"the local store metastore witness stage does not belong to the published witness: %w",
-				syscall.EIO,
-			)
-		}
 	}
 	if !finalExists {
 		final = metastoreWitnessRecord{StoreID: id, Volume: volumeName}
@@ -79,22 +69,14 @@ func (a *rootAnchor) InspectMetastoreWitness(
 }
 
 func (w *metastoreWitness) RemoveInterruptedStage() error {
-	if err := unix.Unlinkat(w.anchor.fd, metastoreWitnessStage, 0); err != nil {
+	if err := w.anchor.witnessOps.unlinkat(w.anchor.fd, metastoreWitnessStage, 0); err != nil {
 		if errors.Is(err, syscall.ENOENT) {
 			return nil
 		}
-		return &os.PathError{
-			Op:   "remove interrupted local store metastore witness stage",
-			Path: filepath.Join(w.anchor.path, metastoreWitnessStage),
-			Err:  err,
-		}
+		return witnessPathFailure("remove interrupted local store metastore witness stage", filepath.Join(w.anchor.path, metastoreWitnessStage), err)
 	}
-	if err := unix.Fsync(w.anchor.fd); err != nil {
-		return &os.PathError{
-			Op:   "sync interrupted local store metastore witness cleanup",
-			Path: w.anchor.path,
-			Err:  err,
-		}
+	if err := w.anchor.witnessOps.fsync(w.anchor.fd); err != nil {
+		return witnessPathFailure("sync interrupted local store metastore witness cleanup", w.anchor.path, err)
 	}
 	return nil
 }
@@ -104,38 +86,47 @@ func (a *rootAnchor) readMetastoreWitnessEntry(
 	id localdisk.ID,
 	volumeName string,
 ) (metastoreWitnessRecord, bool, error) {
+	encoded, exists, err := a.readMetastoreWitnessBytes(name)
+	if err != nil || !exists {
+		return metastoreWitnessRecord{}, exists, err
+	}
+	record, err := decodeMetastoreWitness(encoded, id, volumeName)
+	return record, true, err
+}
+
+// File structure and read/close outcomes must be known before stage contents
+// can be classified as an interrupted write. Only the byte parser is relaxable.
+func (a *rootAnchor) readMetastoreWitnessBytes(name string) ([]byte, bool, error) {
 	path := filepath.Join(a.path, name)
-	fd, err := unix.Openat(a.fd, name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := a.witnessOps.openat(a.fd, name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ENOENT) {
-			return metastoreWitnessRecord{}, false, nil
+			return nil, false, nil
 		}
 		if errors.Is(err, syscall.ELOOP) {
-			err = fmt.Errorf("the entry is a symbolic link: %w", syscall.EIO)
+			err = fmt.Errorf("the entry is a symbolic link: %w", err)
 		}
-		return metastoreWitnessRecord{}, false, &os.PathError{Op: "open local store metastore witness", Path: path, Err: err}
+		return nil, false, witnessPathFailure("open local store metastore witness", path, err)
 	}
 	stat, validateErr := validatePrivateFile(fd, path, a.device, a.mount, false, a.statx)
 	var encoded []byte
 	readErr := error(nil)
 	if validateErr == nil {
-		if stat.Size < metastoreWitnessMinBytes || stat.Size > metastoreWitnessMaxBytes {
-			validateErr = fmt.Errorf("the metastore witness is %d bytes, want between %d and %d: %w",
-				stat.Size, metastoreWitnessMinBytes, metastoreWitnessMaxBytes, syscall.EIO)
+		if stat.Size < 0 || stat.Size > metastoreWitnessMaxBytes {
+			validateErr = fmt.Errorf("the metastore witness is %d bytes, want at most %d: %w",
+				stat.Size, metastoreWitnessMaxBytes, syscall.EIO)
 		} else {
 			encoded = make([]byte, int(stat.Size))
-			readErr = preadFull(fd, encoded)
+			readErr = a.witnessOps.readFull(fd, encoded)
 		}
 	}
-	closeErr := unix.Close(fd)
-	if err := errors.Join(validateErr, readErr, pathFailure("close local store metastore witness", path, closeErr)); err != nil {
-		return metastoreWitnessRecord{}, false, err
+	closeErr := a.witnessOps.close(fd)
+	if err := errors.Join(validateErr,
+		witnessPathFailure("read local store metastore witness", path, readErr),
+		witnessPathFailure("close local store metastore witness", path, closeErr)); err != nil {
+		return nil, false, errors.Join(err, syscall.EIO)
 	}
-	record, err := decodeMetastoreWitness(encoded, id, volumeName)
-	if err != nil {
-		return metastoreWitnessRecord{}, false, err
-	}
-	return record, true, nil
+	return encoded, true, nil
 }
 
 func decodeMetastoreWitness(
@@ -143,6 +134,17 @@ func decodeMetastoreWitness(
 	id localdisk.ID,
 	volumeName string,
 ) (metastoreWitnessRecord, error) {
+	record, err := parseMetastoreWitness(encoded)
+	if err != nil {
+		return metastoreWitnessRecord{}, err
+	}
+	if err := validateWitnessBinding(record, id, volumeName, ""); err != nil {
+		return metastoreWitnessRecord{}, err
+	}
+	return record, nil
+}
+
+func parseMetastoreWitness(encoded []byte) (metastoreWitnessRecord, error) {
 	if len(encoded) < metastoreWitnessMinBytes || len(encoded) > metastoreWitnessMaxBytes {
 		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness has an impossible length: %w", syscall.EIO)
 	}
@@ -154,15 +156,15 @@ func decodeMetastoreWitness(
 		binary.BigEndian.Uint32(encoded[60:64]) != 0 {
 		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness has an unknown header: %w", syscall.EIO)
 	}
-	volumeBytes := int(binary.BigEndian.Uint32(encoded[16:20]))
-	databaseIDBytes := int(binary.BigEndian.Uint32(encoded[20:24]))
-	if volumeBytes > MaxVolumeBytes || databaseIDBytes != durableDatabaseIDBytes ||
-		len(encoded) != metastoreWitnessMinBytes+volumeBytes+databaseIDBytes {
+	volumeLength := binary.BigEndian.Uint32(encoded[16:20])
+	databaseIDLength := binary.BigEndian.Uint32(encoded[20:24])
+	if volumeLength == 0 || volumeLength > MaxVolumeBytes || databaseIDLength != durableDatabaseIDBytes ||
+		len(encoded) != metastoreWitnessMinBytes+int(volumeLength)+int(databaseIDLength) {
 		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness has invalid identity lengths: %w", syscall.EIO)
 	}
-	if !bytes.Equal(encoded[64:80], id[:]) {
-		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness belongs to another object store: %w", syscall.EIO)
-	}
+	volumeBytes, databaseIDBytes := int(volumeLength), int(databaseIDLength)
+	var id localdisk.ID
+	copy(id[:], encoded[64:80])
 	variableOffset := metastoreWitnessHeaderBytes
 	storedVolume := string(encoded[variableOffset : variableOffset+volumeBytes])
 	databaseOffset := variableOffset + volumeBytes
@@ -172,9 +174,8 @@ func decodeMetastoreWitness(
 	if !bytes.Equal(encoded[digestOffset:], digest[:]) {
 		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness checksum does not match its contents: %w", syscall.EIO)
 	}
-	if storedVolume != volumeName {
-		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness binds volume %q, not %q: %w",
-			storedVolume, volumeName, syscall.EIO)
+	if id == (localdisk.ID{}) {
+		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness has an invalid object-store identity: %w", syscall.EIO)
 	}
 	if !validDatabaseID(databaseID) {
 		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness has an invalid database identity: %w", syscall.EIO)
@@ -191,8 +192,39 @@ func decodeMetastoreWitness(
 		return metastoreWitnessRecord{}, fmt.Errorf("the local store metastore witness has impossible durability counters: %w", syscall.EIO)
 	}
 	return metastoreWitnessRecord{
-		StoreID: id, Volume: volumeName, State: state, CheckpointedGeneration: checkpointed,
+		StoreID: id, Volume: storedVolume, State: state, CheckpointedGeneration: checkpointed,
 	}, nil
+}
+
+func validateWitnessBinding(record metastoreWitnessRecord, id localdisk.ID, volumeName, databaseID string) error {
+	if record.StoreID != id {
+		return fmt.Errorf("the local store metastore witness belongs to another object store: %w", syscall.EIO)
+	}
+	if record.Volume != volumeName {
+		return fmt.Errorf("the local store metastore witness binds volume %q, not %q: %w", record.Volume, volumeName, syscall.EIO)
+	}
+	if databaseID != "" && record.State.DatabaseID != databaseID {
+		return fmt.Errorf("the interrupted metastore witness stage belongs to another database: %w", syscall.EIO)
+	}
+	return nil
+}
+
+// A validated final is the accepted/checkpointed authority. Torn bytes in a
+// private stage carry no authority; a complete foreign record remains conflicting
+// evidence and cannot be discarded as an interrupted write.
+func (a *rootAnchor) inspectMetastoreWitnessStage(id localdisk.ID, volumeName, databaseID string, finalExists bool) (bool, error) {
+	encoded, exists, err := a.readMetastoreWitnessBytes(metastoreWitnessStage)
+	if err != nil || !exists {
+		return exists, err
+	}
+	record, err := parseMetastoreWitness(encoded)
+	if err != nil {
+		if finalExists {
+			return true, nil
+		}
+		return true, err
+	}
+	return true, validateWitnessBinding(record, id, volumeName, databaseID)
 }
 
 func checkedInt64(encoded []byte) int64 {
@@ -269,7 +301,7 @@ func (w *metastoreWitness) Accept(state sqlite.DurableState) error {
 	next := w.record
 	next.State = state
 	if err := w.publish(next); err != nil {
-		return fmt.Errorf("publish accepted metastore state: %v: %w", err, syscall.EIO)
+		return fmt.Errorf("publish accepted metastore state: %w", errors.Join(err, syscall.EIO))
 	}
 	w.record = next
 	w.exists = true
@@ -309,7 +341,7 @@ func (w *metastoreWitness) Checkpoint(state sqlite.DurableState) error {
 	next := w.record
 	next.CheckpointedGeneration = state.Generation
 	if err := w.publish(next); err != nil {
-		return fmt.Errorf("publish checkpointed metastore state: %v: %w", err, syscall.EIO)
+		return fmt.Errorf("publish checkpointed metastore state: %w", errors.Join(err, syscall.EIO))
 	}
 	w.record = next
 	return nil
@@ -319,16 +351,13 @@ func (w *metastoreWitness) publish(record metastoreWitnessRecord) error {
 	if err := w.anchor.VerifyPath(); err != nil {
 		return err
 	}
-	staged, stageExists, err := w.anchor.readMetastoreWitnessEntry(
-		metastoreWitnessStage, record.StoreID, record.Volume,
+	stageExists, err := w.anchor.inspectMetastoreWitnessStage(
+		record.StoreID, record.Volume, record.State.DatabaseID, w.exists,
 	)
 	if err != nil {
 		return err
 	}
 	if stageExists {
-		if staged.State.DatabaseID != record.State.DatabaseID {
-			return fmt.Errorf("the interrupted metastore witness stage belongs to another database: %w", syscall.EIO)
-		}
 		if err := w.RemoveInterruptedStage(); err != nil {
 			return err
 		}
@@ -338,49 +367,47 @@ func (w *metastoreWitness) publish(record metastoreWitnessRecord) error {
 		return err
 	}
 	stagePath := filepath.Join(w.anchor.path, metastoreWitnessStage)
-	fd, err := unix.Openat(w.anchor.fd, metastoreWitnessStage,
+	fd, err := w.anchor.witnessOps.openat(w.anchor.fd, metastoreWitnessStage,
 		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
-		return &os.PathError{Op: "create local store metastore witness stage", Path: stagePath, Err: err}
+		return witnessPathFailure("create local store metastore witness stage", stagePath, err)
 	}
 	writeErr := unix.Fchmod(fd, 0o600)
 	if writeErr == nil {
-		writeErr = writeFull(fd, encoded)
+		writeErr = w.anchor.witnessOps.writeFull(fd, encoded)
 	}
 	if writeErr == nil {
-		writeErr = unix.Fsync(fd)
+		writeErr = w.anchor.witnessOps.fsync(fd)
 	}
-	closeErr := unix.Close(fd)
+	closeErr := w.anchor.witnessOps.close(fd)
 	if writeErr != nil || closeErr != nil {
-		cleanupErr := unix.Unlinkat(w.anchor.fd, metastoreWitnessStage, 0)
+		cleanupErr := w.anchor.witnessOps.unlinkat(w.anchor.fd, metastoreWitnessStage, 0)
 		if errors.Is(cleanupErr, syscall.ENOENT) {
 			cleanupErr = nil
 		}
 		if cleanupErr == nil {
-			cleanupErr = unix.Fsync(w.anchor.fd)
+			cleanupErr = w.anchor.witnessOps.fsync(w.anchor.fd)
 		}
 		return errors.Join(
-			pathFailure("write local store metastore witness stage", stagePath, writeErr),
-			pathFailure("close local store metastore witness stage", stagePath, closeErr),
-			pathFailure("clean failed local store metastore witness stage", stagePath, cleanupErr),
+			witnessPathFailure("write local store metastore witness stage", stagePath, writeErr),
+			witnessPathFailure("close local store metastore witness stage", stagePath, closeErr),
+			witnessPathFailure("clean failed local store metastore witness stage", stagePath, cleanupErr),
 		)
 	}
-	if err := unix.Renameat(w.anchor.fd, metastoreWitnessStage, w.anchor.fd, metastoreWitnessFilename); err != nil {
-		renameErr := &os.PathError{
-			Op: "publish local store metastore witness", Path: filepath.Join(w.anchor.path, metastoreWitnessFilename), Err: err,
-		}
-		cleanupErr := unix.Unlinkat(w.anchor.fd, metastoreWitnessStage, 0)
+	if err := w.anchor.witnessOps.renameat(w.anchor.fd, metastoreWitnessStage, w.anchor.fd, metastoreWitnessFilename); err != nil {
+		renameErr := witnessPathFailure("publish local store metastore witness", filepath.Join(w.anchor.path, metastoreWitnessFilename), err)
+		cleanupErr := w.anchor.witnessOps.unlinkat(w.anchor.fd, metastoreWitnessStage, 0)
 		if errors.Is(cleanupErr, syscall.ENOENT) {
 			cleanupErr = nil
 		}
 		if cleanupErr == nil {
-			cleanupErr = unix.Fsync(w.anchor.fd)
+			cleanupErr = w.anchor.witnessOps.fsync(w.anchor.fd)
 		}
 		return errors.Join(renameErr,
-			pathFailure("clean failed local store metastore witness stage", stagePath, cleanupErr))
+			witnessPathFailure("clean failed local store metastore witness stage", stagePath, cleanupErr))
 	}
-	if err := unix.Fsync(w.anchor.fd); err != nil {
-		return &os.PathError{Op: "sync local store metastore witness", Path: w.anchor.path, Err: err}
+	if err := w.anchor.witnessOps.fsync(w.anchor.fd); err != nil {
+		return witnessPathFailure("sync local store metastore witness", w.anchor.path, err)
 	}
 	return w.anchor.VerifyPath()
 }
