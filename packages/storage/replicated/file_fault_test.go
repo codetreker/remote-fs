@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -24,7 +25,7 @@ import (
 type fileReplyFault struct {
 	underlying http.Handler
 	mu         sync.Mutex
-	op         string
+	op         authz.Operation
 	corrupt    bool
 	actions    []string
 }
@@ -40,7 +41,10 @@ func (f *fileReplyFault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
-	var request struct{ Op, Action string }
+	var request struct {
+		Op     authz.Operation
+		Action string
+	}
 	if err := json.Unmarshal(body, &request); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -75,7 +79,7 @@ func (f *fileReplyFault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(answer)
 }
 
-func (f *fileReplyFault) arm(op string, corrupt bool) {
+func (f *fileReplyFault) arm(op authz.Operation, corrupt bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.op, f.corrupt, f.actions = op, corrupt, nil
@@ -93,8 +97,8 @@ func TestRetainedOpenFailureReclaimsItsUnreturnedReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = session.Close(context.Background()) })
-	fault.arm("open", false)
-	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true, Write: true, Create: true, Mode: 0600})
+	fault.arm(authz.FileOpen, false)
+	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0600})
 	if file != nil || !errors.Is(err, syscall.EIO) {
 		t.Fatalf("open accepted a missing barrier: %v, %v", file, err)
 	}
@@ -111,11 +115,11 @@ func TestRetainedUnknownResponseDoesNotRecommitTheMutation(t *testing.T) {
 	s.server.Config.Handler = fault
 	mounted, _ := mount(t, s)
 	session := retainedSession(t, mounted)
-	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true, Write: true, Create: true, Mode: 0600})
+	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0600})
 	if err != nil {
 		t.Fatal(err)
 	}
-	fault.arm("write", true)
+	fault.arm(authz.FileWrite, true)
 	if attr, err := file.WriteAt(t.Context(), 0, []byte("committed")); !errors.Is(err, syscall.EIO) || attr != (storage.Attr{}) {
 		t.Fatalf("unknown retained mutation returned a confirmed answer: %+v, %v", attr, err)
 	}
@@ -195,7 +199,7 @@ type completedSessionResponse struct {
 }
 
 func (p *completedSessionResponse) RoundTrip(request *http.Request) (*http.Response, error) {
-	var call struct{ Op string }
+	var call struct{ Op authz.Operation }
 	if request.Body != nil {
 		body, err := io.ReadAll(request.Body)
 		if err != nil {
@@ -204,11 +208,11 @@ func (p *completedSessionResponse) RoundTrip(request *http.Request) (*http.Respo
 		request.Body = io.NopCloser(bytes.NewReader(body))
 		_ = json.Unmarshal(body, &call)
 	}
-	if call.Op == "session-close" {
+	if call.Op == authz.FileSessionClose {
 		p.closes.Add(1)
 	}
 	response, err := http.DefaultTransport.RoundTrip(request)
-	if err != nil || call.Op != "new" {
+	if err != nil || call.Op != authz.FileSessionOpen {
 		return response, err
 	}
 	pause := false

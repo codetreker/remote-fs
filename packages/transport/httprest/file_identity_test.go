@@ -33,7 +33,7 @@ func TestRetainedHTTPNodeOperationsFollowIdentityThroughVolumeChanges(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	file, err := session.OpenNode(ctx, original.ID, storage.FileOpenOptions{ExpectedID: original.ID, Read: true, Write: true})
+	file, err := session.OpenNode(ctx, original.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}, ExpectedID: original.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestRetainedHTTPNodeOperationsFollowIdentityThroughVolumeChanges(t *testing
 	if err := file.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := session.OpenNode(ctx, original.ID, storage.FileOpenOptions{Read: true}); !errors.Is(err, syscall.ESTALE) {
+	if _, err := session.OpenNode(ctx, original.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}); !errors.Is(err, syscall.ESTALE) {
 		t.Fatalf("reclaimed identity open=%v", err)
 	}
 	if _, err := session.SetNodeAttr(ctx, original.ID, storage.AttrChange{Mode: &mode}); !errors.Is(err, syscall.ESTALE) {
@@ -101,10 +101,10 @@ func TestRetainedHTTPNodeOperationsPreserveValidationAndCancellationErrors(t *te
 		open storage.FileOpenOptions
 		want syscall.Errno
 	}{
-		{"zero identity", 0, storage.FileOpenOptions{Read: true}, syscall.EINVAL},
-		{"inconsistent identity", before.ID, storage.FileOpenOptions{Read: true, ExpectedID: before.ID + 1}, syscall.EINVAL},
-		{"creation by identity", before.ID, storage.FileOpenOptions{Write: true, Create: true}, syscall.EINVAL},
-		{"unknown identity", math.MaxUint64, storage.FileOpenOptions{Read: true}, syscall.ESTALE},
+		{"zero identity", 0, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}, syscall.EINVAL},
+		{"inconsistent identity", before.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}, ExpectedID: before.ID + 1}, syscall.EINVAL},
+		{"creation by identity", before.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Create: true}}, syscall.EINVAL},
+		{"unknown identity", math.MaxUint64, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}, syscall.ESTALE},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			opened, err := session.OpenNode(ctx, test.id, test.open)
@@ -119,7 +119,7 @@ func TestRetainedHTTPNodeOperationsPreserveValidationAndCancellationErrors(t *te
 	}
 	request, cancel := context.WithCancel(ctx)
 	cancel()
-	if opened, err := session.OpenNode(request, before.ID, storage.FileOpenOptions{Write: true, Truncate: true}); storage.ErrnoOf(err) != syscall.EINTR || !errors.Is(err, context.Canceled) || opened != nil {
+	if opened, err := session.OpenNode(request, before.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Truncate: true}}); storage.ErrnoOf(err) != syscall.EINTR || !errors.Is(err, context.Canceled) || opened != nil {
 		t.Fatalf("cancelled identity truncate open=%v, error=%v", opened, err)
 	}
 	mode := fs.FileMode(0600)

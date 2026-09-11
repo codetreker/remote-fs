@@ -4,7 +4,7 @@
 
 ## 一、组件与配置
 
-[`packages/authz`](../../../packages/authz/authz.go) 只依赖标准库，定义 `Authorizer`、`AuthorizerFunc`、`AccessRequest`、`Operation`、`OpenAccess` 和 `ErrDenied`。HTTP handler 负责将严格解码后的动作转换成 AccessRequest；嵌入业务负责认证、身份 context、当前策略与审计。
+[`packages/authz`](../../../packages/authz/authz.go) 定义 `Authorizer`、`AuthorizerFunc`、`AccessRequest`、`Operation` 和 `ErrDenied`，并复用 [`storage.OpenAccess`](../../../packages/storage/files.go) 表达打开意图。它依赖基础 storage 类型，不依赖具体存储或 HTTP。HTTP handler 从严格解码的动作构造 AccessRequest；嵌入业务负责认证、身份 context、当前策略与审计。
 
 ```go
 type Authorizer interface {
@@ -14,11 +14,7 @@ type Authorizer interface {
 type AccessRequest struct {
     Volume    string
     Operation Operation
-    Open      OpenAccess
-}
-
-type OpenAccess struct {
-    Read, Write, Create, Truncate, Exclusive bool
+    Open      storage.OpenAccess
 }
 ```
 
@@ -30,7 +26,7 @@ Authorizer 用业务自己的 context key 取得稳定访问身份，读取当�
 
 ## 二、操作映射
 
-Operation 是 transport-neutral 字符串。[Operation 常量](../../../packages/authz/operations.go)与下表构成 wire 到语义操作的完整映射；file 行的第二项是 JSON body 动作。普通、bounded 与 confirmation barrier 变体使用同一映射，HTTP 方法本身不划分读写权限。业务策略对未知操作默认拒绝。
+Operation 是 transport-neutral 字符串。[Operation 常量](../../../packages/authz/operations.go)在文件请求中直接作为 JSON `op` 的值，wire dispatch 与 AccessRequest.Operation 使用同一标识；普通 volume、复制与强锁的 URL 保留传输名称，在路由 opSpec 中登记对应语义。下表是这些入口的完整对应，file 行第二项是 body 的规范操作值。普通、bounded 与 confirmation barrier 变体使用同一语义，HTTP 方法本身不划分读写权限。业务策略对未知操作默认拒绝。
 
 | Operation | HTTP wire 入口／动作 | 被授权的语义 |
 |---|---|---|
@@ -48,28 +44,28 @@ Operation 是 transport-neutral 字符串。[Operation 常量](../../../packages
 | `replication.subscribe` | `/v3/subscribe` | 开始订阅及该订阅后续输出 |
 | `replication.resubscribe` | `/v3/resubscribe` | 按游标续订及其后续输出 |
 | `replication.snapshot` | `/v3/snapshot` | 捕获快照及发送整份快照 |
-| `file.session-open` | `/v3/file`，`new` | 建立 FileSession |
-| `file.status` | `/v3/file-control`，`status` | 查询 FileSession 状态与历史边界 |
-| `file.renew` | `/v3/file-control`，`renew` | 续期 FileSession |
-| `file.session-close` | `/v3/file-control`，`session-close` | 关闭 FileSession |
-| `file.stat-node` | `/v3/file`，`stat-node` | 按节点身份读取属性 |
-| `file.set-node-attr` | `/v3/file`，`set-node-attr` | 按节点身份修改属性 |
-| `file.open` | `/v3/file`，`open` | 按路径打开，携带 OpenAccess |
-| `file.open-node` | `/v3/file`，`open-node` | 按节点身份打开，携带 OpenAccess |
-| `file.ack` | `/v3/file-control`，`ack` | 确认已交付的打开引用 |
-| `file.stat` | `/v3/file`，`stat` | 查询保留引用的属性 |
-| `file.read` | `/v3/file`，`read` | 按保留引用读取范围 |
-| `file.write` | `/v3/file`，`write` | 按保留引用修改范围 |
-| `file.truncate` | `/v3/file`，`truncate` | 改变保留文件长度 |
-| `file.set-attr` | `/v3/file`，`set-attr` | 修改保留文件属性 |
-| `file.sync` | `/v3/file`，`sync` | 同步检查已发布文件状态 |
-| `file.get-lock` | `/v3/file-control`，`get-lock` | 查询 advisory 冲突 |
-| `file.set-lock` | `/v3/file-control`，`set-lock`（共享／排他） | 申请或转换共享／排他 advisory 锁 |
-| `file.unlock` | `/v3/file-control`，`set-lock`（解锁） | 显式解除 advisory 锁或范围 |
-| `file.query-lock` | `/v3/file-control`，`query-lock` | 核对 advisory 请求结果 |
-| `file.cancel-lock` | `/v3/file-control`，`cancel-lock` | 取消／核对原 advisory 请求 |
-| `file.drop-locks` | `/v3/file-control`，`drop-locks` | 清理指定 owner／family 的锁 |
-| `file.close` | `/v3/file-control`，`close` | 关闭一个保留文件引用 |
+| `file.session-open` | `/v3/file`，`file.session-open` | 建立 FileSession |
+| `file.status` | `/v3/file-control`，`file.status` | 查询 FileSession 状态与历史边界 |
+| `file.renew` | `/v3/file-control`，`file.renew` | 续期 FileSession |
+| `file.session-close` | `/v3/file-control`，`file.session-close` | 关闭 FileSession |
+| `file.stat-node` | `/v3/file`，`file.stat-node` | 按节点身份读取属性 |
+| `file.set-node-attr` | `/v3/file`，`file.set-node-attr` | 按节点身份修改属性 |
+| `file.open` | `/v3/file`，`file.open` | 按路径打开，携带 OpenAccess |
+| `file.open-node` | `/v3/file`，`file.open-node` | 按节点身份打开，携带 OpenAccess |
+| `file.ack` | `/v3/file-control`，`file.ack` | 确认已交付的打开引用 |
+| `file.stat` | `/v3/file`，`file.stat` | 查询保留引用的属性 |
+| `file.read` | `/v3/file`，`file.read` | 按保留引用读取范围 |
+| `file.write` | `/v3/file`，`file.write` | 按保留引用修改范围 |
+| `file.truncate` | `/v3/file`，`file.truncate` | 改变保留文件长度 |
+| `file.set-attr` | `/v3/file`，`file.set-attr` | 修改保留文件属性 |
+| `file.sync` | `/v3/file`，`file.sync` | 同步检查已发布文件状态 |
+| `file.get-lock` | `/v3/file-control`，`file.get-lock` | 查询 advisory 冲突 |
+| `file.set-lock` | `/v3/file-control`，`file.set-lock` | 申请或转换共享／排他 advisory 锁 |
+| `file.unlock` | `/v3/file-control`，`file.unlock` | 显式解除 advisory 锁或范围 |
+| `file.query-lock` | `/v3/file-control`，`file.query-lock` | 核对 advisory 请求结果 |
+| `file.cancel-lock` | `/v3/file-control`，`file.cancel-lock` | 取消／核对原 advisory 请求 |
+| `file.drop-locks` | `/v3/file-control`，`file.drop-locks` | 清理指定 owner／family 的锁 |
+| `file.close` | `/v3/file-control`，`file.close` | 关闭一个保留文件引用 |
 | `lock.session-enrollment` | `/v3/session-enrollment` | 申请强占有会话 enrollment ticket |
 | `lock.session-open` | `/v3/session-open` | 使用 ticket 建立强占有会话 |
 | `lock.session-close` | `/v3/session-close` | 关闭强占有会话 |
@@ -85,9 +81,9 @@ Operation 是 transport-neutral 字符串。[Operation 常量](../../../packages
 | `lock.status` | `/v3/lock-status` | 查询授权方状态 |
 
 
-`Open` 仅在 file.open／file.open-node 携带合法参数的值拷贝，其它操作为零值；open-node 不接受 Create／Exclusive。带 Create 的打开即使最终打开已有文件，也报告创建意图。一次入口 callback 同时决定全部打开意图，允许之后才创建、截断或分配文件引用。
+`FileOpenOptions` 嵌入共享的 `storage.OpenAccess`，其 Read、Write、Create、Truncate、Exclusive 与 AccessRequest.Open 是同一类型。Open 的合法性仍由 FileOpenOptions.Check／CheckNode 连同 mode、节点身份验证。AccessRequest.Open 仅在 file.open／file.open-node 携带这份已验证的值，其它操作为零值；open-node 不接受 Create／Exclusive。带 Create 的打开即使最终打开已有文件，也报告创建意图。一次入口 callback 同时决定全部打开意图，允许之后才创建、截断或分配文件引用。
 
-`volume.write` 可以创建缺失文件，单独拒绝 volume.create 不能禁止创建。file.set-lock 的共享／排他申请与转换，和 wire 中同一动作的解锁意图分别映射为 file.set-lock、file.unlock。EX flock 可用于只读 fd，锁模式不代替内容写权限；后续内容修改仍检查 file.write 等操作。
+`volume.write` 可以创建缺失文件，单独拒绝 volume.create 不能禁止创建。file.set-lock 表达共享／排他申请与转换；file.unlock 是独立的 wire 操作与策略操作，必须携带 Unlock 类型；file.set-lock 不能携带 Unlock。EX flock 可用于只读 fd，锁模式不代替内容写权限；后续内容修改仍检查 file.write 等操作。
 
 ## 三、请求、capability 与关闭
 

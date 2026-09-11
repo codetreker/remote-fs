@@ -3,24 +3,26 @@ package httprest
 import (
 	"context"
 	"fmt"
-	"github.com/codetreker/remote-fs/packages/storage"
 	"syscall"
 	"time"
+
+	"github.com/codetreker/remote-fs/packages/authz"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 const OpFile Op = "file"
 const OpFileControl Op = "file-control"
 
-func fileControl(op string) bool {
+func fileControl(op authz.Operation) bool {
 	switch op {
-	case "status", "renew", "session-close", "close", "ack", "get-lock", "set-lock", "query-lock", "cancel-lock", "drop-locks":
+	case authz.FileStatus, authz.FileRenew, authz.FileSessionClose, authz.FileClose, authz.FileAck, authz.FileGetLock, authz.FileSetLock, authz.FileUnlock, authz.FileQueryLock, authz.FileCancelLock, authz.FileDropLocks:
 		return true
 	}
 	return false
 }
 
 type fileRequest struct {
-	Op      string                     `json:"op"`
+	Op      authz.Operation            `json:"op"`
 	Session string                     `json:"session"`
 	File    string                     `json:"file"`
 	Action  storage.LockRequestID      `json:"action"`
@@ -51,17 +53,17 @@ type fileResponse struct {
 	Barrier  *MutationBarrier           `json:"barrier,omitempty"`
 }
 
-func fileMutation(op string) bool {
+func fileMutation(op authz.Operation) bool {
 	switch op {
-	case "open", "open-node", "set-node-attr", "write", "truncate", "set-attr", "sync":
+	case authz.FileOpen, authz.FileOpenNode, authz.FileSetNodeAttr, authz.FileWrite, authz.FileTruncate, authz.FileSetAttr, authz.FileSync:
 		return true
 	}
 	return false
 }
 
-func fileActionRequired(op string) bool {
+func fileActionRequired(op authz.Operation) bool {
 	switch op {
-	case "open", "open-node", "set-node-attr", "write", "truncate", "set-attr", "sync", "drop-locks":
+	case authz.FileOpen, authz.FileOpenNode, authz.FileSetNodeAttr, authz.FileWrite, authz.FileTruncate, authz.FileSetAttr, authz.FileSync, authz.FileDropLocks:
 		return true
 	}
 	return false

@@ -89,7 +89,7 @@ func assertRetainedUsage(t *testing.T, store *sqlite.Store, want int64) {
 func TestNativeRetainedIdentitySurvivesRenameUnlinkAndNameReuse(t *testing.T) {
 	store, _ := ownedRetainedStore(t, 100, sqlite.DefaultOptions())
 	commit(t, store, "original", 5)
-	file := retainedOpen(t, store, "original", storage.FileOpenOptions{Read: true, Write: true})
+	file := retainedOpen(t, store, "original", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	initial := retainedState(t, file)
 	if err := store.Rename(t.Context(), "original", "moved"); err != nil {
 		t.Fatal(err)
@@ -128,8 +128,8 @@ func TestNativeRetainedRenameReplacementKeepsBothIdentities(t *testing.T) {
 	store, _ := ownedRetainedStore(t, 100, sqlite.DefaultOptions())
 	commit(t, store, "target", 5)
 	commit(t, store, "source", 7)
-	displaced := retainedOpen(t, store, "target", storage.FileOpenOptions{Read: true, Write: true})
-	moved := retainedOpen(t, store, "source", storage.FileOpenOptions{Read: true})
+	displaced := retainedOpen(t, store, "target", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
+	moved := retainedOpen(t, store, "source", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
 	displacedID, movedID := retainedState(t, displaced).ID, retainedState(t, moved).ID
 	if err := store.Rename(t.Context(), "source", "target"); err != nil {
 		t.Fatal(err)
@@ -155,8 +155,8 @@ func TestNativeRetainedRenameReplacementKeepsBothIdentities(t *testing.T) {
 func TestNativeRetainedLastPinUsesCurrentDetachedSize(t *testing.T) {
 	store, _ := ownedRetainedStore(t, 20, sqlite.DefaultOptions())
 	commit(t, store, "file", 5)
-	first := retainedOpen(t, store, "file", storage.FileOpenOptions{Read: true, Write: true})
-	second := retainedOpen(t, store, "file", storage.FileOpenOptions{Read: true, Write: true})
+	first := retainedOpen(t, store, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
+	second := retainedOpen(t, store, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	if err := store.Remove(t.Context(), "file"); err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +186,7 @@ func TestNativeRetainedLastPinUsesCurrentDetachedSize(t *testing.T) {
 
 func TestNativeRetainedRevisionIsPerNodeAndRejectsEmptyABA(t *testing.T) {
 	store, _ := ownedRetainedStore(t, 100, sqlite.DefaultOptions())
-	file := retainedOpen(t, store, "file", storage.FileOpenOptions{Read: true, Write: true, Create: true, Mode: 0o600})
+	file := retainedOpen(t, store, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0o600})
 	initial := retainedState(t, file)
 	empty := retainedPublish(t, file, 0)
 	if empty.Revision != initial.Revision+1 || empty.Content != "" || empty.Size != 0 {
@@ -211,7 +211,7 @@ func TestNativeRetainedRevisionIsPerNodeAndRejectsEmptyABA(t *testing.T) {
 
 func TestNativeRetainedRevisionExhaustionPreservesState(t *testing.T) {
 	store, path := ownedRetainedStore(t, 100, sqlite.DefaultOptions())
-	file := retainedOpen(t, store, "file", storage.FileOpenOptions{Read: true, Write: true, Create: true, Mode: 0o600})
+	file := retainedOpen(t, store, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0o600})
 	before := retainedPublish(t, file, 5)
 	damageDatabase(t, path, `UPDATE nodes SET content_revision = ? WHERE id = ?`, int64(math.MaxInt64), before.ID)
 	exhausted := retainedState(t, file)
@@ -226,13 +226,13 @@ func TestNativeRetainedRevisionExhaustionPreservesState(t *testing.T) {
 
 func TestNativeRetainedCreateOpenChecksIdentityModeAccessAndTruncate(t *testing.T) {
 	store, _ := ownedRetainedStore(t, 100, sqlite.DefaultOptions())
-	file := retainedOpen(t, store, "file", storage.FileOpenOptions{Read: true, Write: true, Create: true, Exclusive: true, Mode: 0o600})
+	file := retainedOpen(t, store, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Exclusive: true}, Mode: 0o600})
 	created := retainedState(t, file)
 	if created.Mode.Perm() != 0o600 || created.Size != 0 || created.Revision != 1 {
 		t.Fatalf("create/open initial state = %+v", created)
 	}
 	before := retainedPublish(t, file, 5)
-	readOnly := retainedOpen(t, store, "file", storage.FileOpenOptions{Read: true, Create: true, Mode: 0o777})
+	readOnly := retainedOpen(t, store, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true}, Mode: 0o777})
 	if opened := retainedState(t, readOnly); opened.ID != before.ID || opened.Mode.Perm() != 0o600 || opened.Revision != before.Revision {
 		t.Fatalf("nonexclusive existing open = %+v; before %+v", opened, before)
 	}
@@ -247,10 +247,10 @@ func TestNativeRetainedCreateOpenChecksIdentityModeAccessAndTruncate(t *testing.
 		options storage.FileOpenOptions
 		want    error
 	}{
-		{"exclusive exists", storage.FileOpenOptions{Read: true, Create: true, Exclusive: true}, syscall.EEXIST},
-		{"wrong identity", storage.FileOpenOptions{Read: true, ExpectedID: uint64(before.ID + 1)}, syscall.ESTALE},
+		{"exclusive exists", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true, Exclusive: true}}, syscall.EEXIST},
+		{"wrong identity", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}, ExpectedID: uint64(before.ID + 1)}, syscall.ESTALE},
 		{"no access", storage.FileOpenOptions{}, syscall.EINVAL},
-		{"read-only truncate", storage.FileOpenOptions{Read: true, Truncate: true}, syscall.EINVAL},
+		{"read-only truncate", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Truncate: true}}, syscall.EINVAL},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			opened, err := store.OpenFile(t.Context(), "file", test.options)
@@ -264,9 +264,7 @@ func TestNativeRetainedCreateOpenChecksIdentityModeAccessAndTruncate(t *testing.
 			}
 		})
 	}
-	truncated := retainedOpen(t, store, "file", storage.FileOpenOptions{
-		Read: true, Write: true, Create: true, Truncate: true, ExpectedID: uint64(before.ID), Mode: 0o777,
-	})
+	truncated := retainedOpen(t, store, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Truncate: true}, ExpectedID: uint64(before.ID), Mode: 0o777})
 	if after := retainedState(t, truncated); after.ID != before.ID || after.Mode.Perm() != 0o600 || after.Size != 0 || after.Revision != before.Revision+1 {
 		t.Fatalf("atomic open/truncate state = %+v; before %+v", after, before)
 	}
@@ -274,7 +272,7 @@ func TestNativeRetainedCreateOpenChecksIdentityModeAccessAndTruncate(t *testing.
 	if err := store.Mkdir(t.Context(), "directory"); err != nil {
 		t.Fatal(err)
 	}
-	if opened, err := store.OpenFile(t.Context(), "directory", storage.FileOpenOptions{Read: true}); !errors.Is(err, syscall.EISDIR) {
+	if opened, err := store.OpenFile(t.Context(), "directory", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}); !errors.Is(err, syscall.EISDIR) {
 		if opened != nil {
 			if closeErr := opened.Close(t.Context()); closeErr != nil {
 				t.Error(closeErr)
@@ -288,7 +286,7 @@ func TestNativeRetainedFinalCloseIgnoresPendingAdmission(t *testing.T) {
 	options := sqlite.DefaultOptions()
 	options.ObjectLimits.MaxPendingObjects = 1
 	store, _ := ownedRetainedStore(t, 100, options)
-	file := retainedOpen(t, store, "file", storage.FileOpenOptions{Read: true, Write: true, Create: true, Mode: 0o600})
+	file := retainedOpen(t, store, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0o600})
 	retainedPublish(t, file, 5)
 	if _, err := store.Reserve(t.Context(), "pending", 1); err != nil {
 		t.Fatal(err)
@@ -311,7 +309,7 @@ func TestNativeRetainedAdmissionRequiresPhysicalRelease(t *testing.T) {
 	options := sqlite.DefaultOptions()
 	options.MaxRetainedFiles = 1
 	store, _ := ownedRetainedStore(t, 100, options)
-	file := retainedOpen(t, store, "file", storage.FileOpenOptions{Read: true, Create: true, Mode: 0o600})
+	file := retainedOpen(t, store, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true}, Mode: 0o600})
 	id := retainedState(t, file).ID
 	for _, retired := range []bool{false, true} {
 		if retired {
@@ -319,7 +317,7 @@ func TestNativeRetainedAdmissionRequiresPhysicalRelease(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		opened, err := store.OpenFile(t.Context(), "overflow", storage.FileOpenOptions{Read: true, Create: true, Mode: 0o600})
+		opened, err := store.OpenFile(t.Context(), "overflow", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true}, Mode: 0o600})
 		if opened != nil {
 			if closeErr := opened.Close(t.Context()); closeErr != nil {
 				t.Error(closeErr)
@@ -335,7 +333,7 @@ func TestNativeRetainedAdmissionRequiresPhysicalRelease(t *testing.T) {
 	if err := file.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	reopened := retainedOpen(t, store, "file", storage.FileOpenOptions{Read: true, ExpectedID: uint64(id)})
+	reopened := retainedOpen(t, store, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}, ExpectedID: uint64(id)})
 	if got := retainedState(t, reopened); got.ID != id {
 		t.Fatalf("admission after release returned %+v; want identity %d", got, id)
 	}

@@ -94,7 +94,7 @@ checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race 
 
 [入口授权用例](../packages/transport/httprest/authorization_test.go)验证 Authorizer 与 Volume 同时缺省、成对配置、typed-nil 和 nil 函数拒绝，以及不改写不透明 Volume。普通操作先拒绝再允许，分别核对拒绝时 backend／barrier 未被调用、允许后原 backend 错误仍返回，成功修改只在授权之后读取 barrier。非法请求不触发策略；并发请求保留各自的 host 值，请求结束解除派生 context，未启用 hook 的路径保持原行为。
 
-[文件授权用例](../packages/transport/httprest/authorization_file_test.go)在 capability 查询、引用创建和动作记录之前核对每种 file 操作。合法打开的全部意图经一个 OpenAccess 值和一次 callback 传入，显式 unlock 与申请／转换分别映射；非法参数在策略之前拒绝。用例先取得真实引用和动作回执，再拒绝 ack、renew、status、重放、修改与 close，核对原回执、期限、pending ack、引用和内容均未改变，拒绝的新动作没有记录。允许后重放仍返回原引用，原动作才可继续执行。
+[文件授权用例](../packages/transport/httprest/authorization_file_test.go)在 capability 查询、引用创建和动作记录之前核对每种 file 操作。合法打开的全部意图经共享的 storage.OpenAccess 值和一次 callback 传入，wire 分发与授权共用规范操作值，显式 file.unlock 与申请／转换分别核对；非法参数在策略之前拒绝。用例先取得真实引用和动作回执，再拒绝 ack、renew、status、重放、修改与 close，核对原回执、期限、pending ack、引用和内容均未改变，拒绝的新动作没有记录。允许后重放仍返回原引用，原动作才可继续执行。
 
 [强占有授权用例](../packages/transport/httprest/authorization_lock_test.go)逐项检查控制操作在 native service 或 status capability 访问前授权，并重新检查曾经成功的相同请求。拒绝只描述本次入口结果，不能泄漏已有动作回执或捏造 lockCode、recorded、Cancelled、Released 等 native 结果。文件侧另用只读描述符取得真实 EX flock，拒绝显式解锁、取消、DropLocks 与查询后，再从允许的控制路径核对原 Grant 和历史仍存在。调用方 cleanup 可以被拒绝；内部 lease 到期仍释放 retained 字节，且不会再次替调用方请求授权。
 
@@ -265,7 +265,7 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 [文件句柄二进制用例](../cmd/file_handles_linux_test.go)分别在 localstore 与 Azure 中验证已打开 fd 的当前读取、同步修改，以及 rename、unlink、同名替换后的原对象保留；排他 advisory 通过真实挂载协调。重启用例紧接 WriteAt 的成功返回终止服务端，以这次写入本身的确认验证持久性；Sync 的健康与持久性检查由独立场景验证。重启后旧引用明确失败，已确认字节保留，新挂载可以建立新的引用与取得 EX，不能按旧能力重新执行。
 
-[元数据缓存用例](../cmd/replicated_test.go)的 `TestWalkingAMountedTreeCachesNamesAndConfirmsIdentityAttributes` 遍历具名节点并检查缺失名字，要求没有具名 Stat/List 请求，同时必须观察到权威 `file:stat-node` 并记录实际次数；周期 `file-control:renew` 可交错，其它数据或修改请求均失败。目录改名只允许一个 rename 请求，加上身份属性和续期，子树 inode 保持不变。计数起点等待已完成的文件关闭确认，避免此前异步 Release 混入遍历操作。
+[元数据缓存用例](../cmd/replicated_test.go)的 `TestWalkingAMountedTreeCachesNamesAndConfirmsIdentityAttributes` 遍历具名节点并检查缺失名字，要求没有具名 Stat/List 请求，同时必须观察到权威身份属性请求并记录实际次数；周期文件会话续期可交错，其它数据或修改请求均失败。目录改名只允许一个 rename 请求，加上身份属性和续期，子树 inode 保持不变。计数起点等待已完成的文件关闭确认，避免此前异步 Release 混入遍历操作。
 
 [锁配置用例](../cmd/remote-fs-server/lock_configuration_test.go)验证容量和期限逐项传入 authority，`-initialize-lock-state` 是显式动作，非法配置在 listener 或状态初始化之前拒绝。`-dir`、`-lock-state-root`、目录预算与 CLI quota measurement 参数作为未知 flag 拒绝，目标 local store 保持空目录。[状态用例](../cmd/remote-fs-server/status_test.go)检查 ready、recovering、unavailable 和各项计数，不输出 Authority 能力材料；状态失败不拼接部分容量数字，不可用的 authority 不宣布就绪，缺失 status 能力的 volume 被关闭且关闭错误保留。这些包内断言验证参数与 lifecycle wiring，跨进程结论仍由二进制用例提供。
 

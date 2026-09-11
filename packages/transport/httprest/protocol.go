@@ -32,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/metastore"
 )
 
@@ -118,8 +119,9 @@ const (
 )
 
 type opSpec struct {
-	method   string
-	operands []string
+	operation authz.Operation
+	method    string
+	operands  []string
 	// body is the media type of the request body, and empty for an operation that requires
 	// an empty body. Two operations send one, and they send different things: the contents
 	// of a file are bytes nobody may reinterpret, an attribute change is a document.
@@ -134,25 +136,38 @@ const (
 var ops = map[Op]opSpec{
 	OpFileControl: {method: http.MethodPost, body: contentJSON},
 	OpFile:        {method: http.MethodPost, body: contentJSON},
-	OpStat:        {method: http.MethodGet, operands: []string{keyPath}},
-	OpSetAttr:     {method: http.MethodPost, operands: []string{keyPath}, body: contentJSON},
-	OpList:        {method: http.MethodGet, operands: []string{keyPath}},
-	OpRead:        {method: http.MethodGet, operands: []string{keyPath}},
-	OpWrite:       {method: http.MethodPost, operands: []string{keyPath}, body: contentOctets},
-	OpCreate:      {method: http.MethodPost, operands: []string{keyPath}},
-	OpMkdir:       {method: http.MethodPost, operands: []string{keyPath}},
-	OpRemove:      {method: http.MethodPost, operands: []string{keyPath}},
-	OpRemoveDir:   {method: http.MethodPost, operands: []string{keyPath}},
-	OpRename:      {method: http.MethodPost, operands: []string{keyPath, keyTo}},
+	OpStat:        {operation: authz.VolumeStat, method: http.MethodGet, operands: []string{keyPath}},
+	OpSetAttr:     {operation: authz.VolumeSetAttr, method: http.MethodPost, operands: []string{keyPath}, body: contentJSON},
+	OpList:        {operation: authz.VolumeList, method: http.MethodGet, operands: []string{keyPath}},
+	OpRead:        {operation: authz.VolumeRead, method: http.MethodGet, operands: []string{keyPath}},
+	OpWrite:       {operation: authz.VolumeWrite, method: http.MethodPost, operands: []string{keyPath}, body: contentOctets},
+	OpCreate:      {operation: authz.VolumeCreate, method: http.MethodPost, operands: []string{keyPath}},
+	OpMkdir:       {operation: authz.VolumeMkdir, method: http.MethodPost, operands: []string{keyPath}},
+	OpRemove:      {operation: authz.VolumeRemove, method: http.MethodPost, operands: []string{keyPath}},
+	OpRemoveDir:   {operation: authz.VolumeRemoveDir, method: http.MethodPost, operands: []string{keyPath}},
+	OpRename:      {operation: authz.VolumeRename, method: http.MethodPost, operands: []string{keyPath, keyTo}},
 	// Space describes the whole volume rather than anything under a path, so it takes
 	// no operands. A path sent beside it is refused like any operand nobody asked for.
-	OpSpace: {method: http.MethodGet},
+	OpSpace: {operation: authz.VolumeSpace, method: http.MethodGet},
 
 	// The replication endpoints read; none of them changes anything. Subscribe and
 	// Snapshot both mean "as the volume is now", which is a question with no operands.
-	OpSubscribe:   {method: http.MethodGet},
-	OpResubscribe: {method: http.MethodGet, operands: []string{keyIncarnation, keyPosition}},
-	OpSnapshot:    {method: http.MethodGet},
+	OpSubscribe:         {operation: authz.ReplicationSubscribe, method: http.MethodGet},
+	OpResubscribe:       {operation: authz.ReplicationResubscribe, method: http.MethodGet, operands: []string{keyIncarnation, keyPosition}},
+	OpSnapshot:          {operation: authz.ReplicationSnapshot, method: http.MethodGet},
+	OpSessionEnrollment: {operation: authz.LockSessionEnrollment, method: http.MethodPost, body: contentJSON},
+	OpSessionOpen:       {operation: authz.LockSessionOpen, method: http.MethodPost, body: contentJSON},
+	OpSessionClose:      {operation: authz.LockSessionClose, method: http.MethodPost, body: contentJSON},
+	OpOwnerCreate:       {operation: authz.LockOwnerCreate, method: http.MethodPost, body: contentJSON},
+	OpOwnerRetire:       {operation: authz.LockOwnerRetire, method: http.MethodPost, body: contentJSON},
+	OpLockResolve:       {operation: authz.LockResolve, method: http.MethodPost, body: contentJSON},
+	OpLockAcquire:       {operation: authz.LockAcquire, method: http.MethodPost, body: contentJSON},
+	OpLockRenew:         {operation: authz.LockRenew, method: http.MethodPost, body: contentJSON},
+	OpLockRelease:       {operation: authz.LockRelease, method: http.MethodPost, body: contentJSON},
+	OpLockCancel:        {operation: authz.LockCancel, method: http.MethodPost, body: contentJSON},
+	OpLockQueryAction:   {operation: authz.LockQueryAction, method: http.MethodPost, body: contentJSON},
+	OpLockQueryGrant:    {operation: authz.LockQueryGrant, method: http.MethodPost, body: contentJSON},
+	OpLockStatus:        {operation: authz.LockStatus, method: http.MethodPost, body: contentJSON},
 }
 
 // Request is one operation and its operands.

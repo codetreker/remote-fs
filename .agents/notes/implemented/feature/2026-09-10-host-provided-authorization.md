@@ -10,9 +10,9 @@ Status: implemented
 
 ## 决定
 
-`packages/authz` 定义 transport-neutral 的 Authorizer、AccessRequest、Operation 和 OpenAccess。handler 将可信配置的 volume 与完整语义意图交给业务 callback；身份由业务 context 提供，用户、角色、凭据签发和验证不进入文件系统。配置缺省保持已有嵌入方式；启用时 Authorizer 与 volume 必须同时提供，不能让远端字段选择策略资源。
+`packages/authz` 定义 transport-neutral 的 Authorizer、AccessRequest 和 Operation，AccessRequest.Open 复用 `storage.OpenAccess`。FileOpenOptions 嵌入同一类型，打开验证与策略输入不维护两份布尔字段。handler 将可信配置的 volume 与完整语义意图交给业务 callback；身份由业务 context 提供，用户、角色、凭据签发和验证不进入文件系统。配置缺省保持已有嵌入方式；启用时 Authorizer 与 volume 必须同时提供，不能让远端字段选择策略资源。
 
-每个请求一次入口回调，具体操作由业务方归组为角色。OpenAccess 同时表达读、写、创建、截断、排他创建，避免把复合打开拆成多个时刻的策略决定。锁模式不充当内容权限：只读 fd 的 EX flock 是合法操作，解锁和其它 cleanup 独立可控。volume.write 自身可能创建文件，不能只拒绝 create 就宣称禁止创建。
+文件 wire 的 op 与授权输入直接共用 authz.Operation，解锁有独立的 FileUnlock；普通与强锁 URL 则在路由规格中声明语义操作，传输名称不承担角色含义。每个请求一次入口回调，具体操作由业务方归组为角色。共享的 OpenAccess 同时表达读、写、创建、截断、排他创建，避免把复合打开拆成多个时刻的策略决定。锁模式不充当内容权限：只读 fd 的 EX flock 是合法操作，解锁和其它 cleanup 独立可控。volume.write 自身可能创建文件，不能只拒绝 create 就宣称禁止创建。
 
 通用的有界传输 admission 可先限制策略调用与错误响应占用；授权先于受控 capability、动作回执、Log、订阅与 snapshot 捕获。已有 capability 仍是 bearer，重复请求也要检查；拒绝核对只说明本次尝试未获准，不抹去原动作的未知结果。服务器自己的 expiry 和 shutdown 回收独立于调用者的 cleanup 权限。
 
@@ -23,6 +23,8 @@ Status: implemented
 完整 API、操作表、执行顺序、错误格式与业务接入例子由[授权设计](../../../../docs/design/server/authorization.md)拥有；[测试策略](../../../../docs/testing.md)记录真实 handler／SDK／副本的验证分工。
 
 ## 备选方案
+
+**为授权单独定义打开意图和动作映射。** 可使 authz 只依赖标准库，但 FileOpenOptions、wire dispatch 与授权输入会各自保存同一份事实。新增字段或动作时，逐字段复制与分支映射容易漏掉同步。共享基础 storage.OpenAccess 和语义操作值，使验证、执行与策略读取同一定义，不引入具体 backend 或 HTTP 依赖。
 
 **只使用外层认证 middleware。** 它继续是合法的认证与部署入口，但通用 method/path 检查不能直接表达 Open 意图、锁动作历史或流内发送边界。可选语义 callback 把这些入口交给同一份业务策略。
 

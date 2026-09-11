@@ -22,7 +22,7 @@ func openPublicationFile(t *testing.T) (*LockingStore, metastore.File) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true, Write: true, Create: true, Mode: 0o600})
+	f, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0o600})
 	if err != nil {
 		s.Close()
 		t.Fatal(err)
@@ -183,7 +183,7 @@ func TestRetainedCleanupUnknownAcceptanceKeepsPhysicalOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true, Write: true, Create: true})
+	f, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
 	if err != nil {
 		s.Close()
 		t.Fatal(err)
@@ -235,7 +235,7 @@ func TestStrongGrantsRetireTheNameWhileOrdinaryReferencesKeepTheNode(t *testing.
 	f.put(t, t.Context(), "file", 5)
 	owner := f.owner(t)
 	grant := f.grant(t, owner, "file", locking.Exclusive)
-	opened, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true, Create: true, Mode: 0o777})
+	opened, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true}, Mode: 0o777})
 	if err != nil {
 		t.Fatalf("ordinary open while strongly protected: %v", err)
 	}
@@ -292,7 +292,7 @@ func TestSharedDatabaseOwnershipRefusesNativeRetentionBeforeMutation(t *testing.
 	if err := s.CheckFileStore(); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("shared capability=%v", err)
 	}
-	if _, err := s.OpenFile(t.Context(), "forbidden", storage.FileOpenOptions{Write: true, Create: true}); !errors.Is(err, syscall.EOPNOTSUPP) {
+	if _, err := s.OpenFile(t.Context(), "forbidden", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Create: true}}); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("shared create/open=%v", err)
 	}
 	if _, err := s.Stat(t.Context(), "forbidden"); !errors.Is(err, syscall.ENOENT) {
@@ -319,11 +319,11 @@ func TestFilePublicationGuardRefusesEveryIdentityMutationAtFinalAdmission(t *tes
 			at := time.Now()
 			switch operation {
 			case "create":
-				_, err = s.OpenFile(ctx, "new", storage.FileOpenOptions{Write: true, Create: true})
+				_, err = s.OpenFile(ctx, "new", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Create: true}})
 			case "truncate-open":
-				_, err = s.OpenFile(ctx, "file", storage.FileOpenOptions{Write: true, Truncate: true})
+				_, err = s.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Truncate: true}})
 			case "truncate-node":
-				_, err = s.OpenNode(ctx, uint64(before.ID), storage.FileOpenOptions{Write: true, Truncate: true})
+				_, err = s.OpenNode(ctx, uint64(before.ID), storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Truncate: true}})
 			case "commit":
 				_, err = file.Commit(ctx, before.Revision, metastore.Object{ModTime: at})
 			case "file-attributes":

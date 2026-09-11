@@ -292,15 +292,8 @@ func checkLockJSON(decoder *json.Decoder, typ reflect.Type) error {
 			return errors.New("lock JSON requires an object")
 		}
 		fields := make(map[string]reflect.StructField, typ.NumField())
-		for i := 0; i < typ.NumField(); i++ {
-			field := typ.Field(i)
-			name := strings.Split(field.Tag.Get("json"), ",")[0]
-			if name == "" {
-				name = field.Name
-			}
-			if name != "-" && field.IsExported() {
-				fields[name] = field
-			}
+		if err := collectLockJSONFields(typ, fields); err != nil {
+			return err
 		}
 		seen := make(map[string]bool, len(fields))
 		for decoder.More() {
@@ -358,6 +351,30 @@ func checkLockJSON(decoder *json.Decoder, typ reflect.Type) error {
 		if _, nested := token.(json.Delim); nested {
 			return errors.New("lock JSON scalar has an invalid type")
 		}
+	}
+	return nil
+}
+
+func collectLockJSONFields(typ reflect.Type, fields map[string]reflect.StructField) error {
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		name := strings.Split(field.Tag.Get("json"), ",")[0]
+		if name == "-" || !field.IsExported() {
+			continue
+		}
+		if field.Anonymous && field.Type.Kind() == reflect.Struct && name == "" {
+			if err := collectLockJSONFields(field.Type, fields); err != nil {
+				return err
+			}
+			continue
+		}
+		if name == "" {
+			name = field.Name
+		}
+		if _, exists := fields[name]; exists {
+			return errors.New("lock JSON schema has ambiguous members")
+		}
+		fields[name] = field
 	}
 	return nil
 }

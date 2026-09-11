@@ -237,8 +237,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) {
 	ctx := r.Context()
-	if req.Op != OpSetAttr && req.Op != OpWrite {
-		if operation := volumeAuthorizationOperation(req.Op); operation != "" {
+	if req.Op != OpSetAttr && req.Op != OpWrite && req.Op != OpSubscribe && req.Op != OpResubscribe && req.Op != OpSnapshot {
+		if operation := ops[req.Op].operation; operation != "" {
 			if err := h.authorize(ctx, authz.AccessRequest{Operation: operation}); err != nil {
 				h.writeOperationError(w, err)
 				return
@@ -273,7 +273,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) 
 			h.writeFault(w, http.StatusBadRequest, err)
 			return
 		}
-		if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.VolumeSetAttr}); err != nil {
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: ops[req.Op].operation}); err != nil {
 			h.writeOperationError(w, err)
 			return
 		}
@@ -322,7 +322,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) 
 			return
 		}
 		defer release()
-		if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.VolumeWrite}); err != nil {
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: ops[req.Op].operation}); err != nil {
 			h.writeOperationError(w, err)
 			return
 		}

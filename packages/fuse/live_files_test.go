@@ -420,7 +420,7 @@ func (s *observedLifetimeStorage) NewFileSession(ctx context.Context, options st
 		return nil, err
 	}
 	if s.hold != "" {
-		s.retained, err = session.OpenFile(ctx, s.hold, storage.FileOpenOptions{Read: true, Write: true})
+		s.retained, err = session.OpenFile(ctx, s.hold, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 		if err != nil {
 			return nil, errors.Join(err, session.Close(ctx))
 		}

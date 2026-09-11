@@ -118,32 +118,3 @@ func authorizationResponse(err error) (ErrorResponse, bool) {
 	}
 	return ErrorResponse{}, false
 }
-
-func volumeAuthorizationOperation(op Op) authz.Operation {
-	switch op {
-	case OpStat:
-		return authz.VolumeStat
-	case OpList:
-		return authz.VolumeList
-	case OpRead:
-		return authz.VolumeRead
-	case OpSpace:
-		return authz.VolumeSpace
-	case OpSetAttr:
-		return authz.VolumeSetAttr
-	case OpWrite:
-		return authz.VolumeWrite
-	case OpCreate:
-		return authz.VolumeCreate
-	case OpMkdir:
-		return authz.VolumeMkdir
-	case OpRemove:
-		return authz.VolumeRemove
-	case OpRemoveDir:
-		return authz.VolumeRemoveDir
-	case OpRename:
-		return authz.VolumeRename
-	default:
-		return ""
-	}
-}

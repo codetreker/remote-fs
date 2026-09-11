@@ -112,10 +112,11 @@ func (h *Handler) admitStream(w http.ResponseWriter, ctx context.Context, access
 // serveEvents answers a subscription with a stream of changes.
 func (h *Handler) serveEvents(w http.ResponseWriter, r *http.Request, from *resumeFrom) {
 	ctx := r.Context()
-	access := authz.AccessRequest{Operation: authz.ReplicationSubscribe}
+	op := OpSubscribe
 	if from != nil {
-		access.Operation = authz.ReplicationResubscribe
+		op = OpResubscribe
 	}
+	access := authz.AccessRequest{Operation: ops[op].operation}
 	if !h.admitStream(w, ctx, access) {
 		return
 	}
@@ -358,7 +359,7 @@ func (h *Handler) publish(ctx context.Context, out *frameWriter, at metastore.Po
 
 // serveSnapshot answers with one consistent picture of the tree, in pages.
 func (h *Handler) serveSnapshot(w http.ResponseWriter, r *http.Request) {
-	access := authz.AccessRequest{Operation: authz.ReplicationSnapshot}
+	access := authz.AccessRequest{Operation: ops[OpSnapshot].operation}
 	if !h.admitStream(w, r.Context(), access) {
 		return
 	}

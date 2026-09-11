@@ -7,13 +7,17 @@ import (
 	"testing"
 
 	"github.com/codetreker/remote-fs/packages/authz"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func TestAuthorizerFuncPreservesHostContextIntentAndError(t *testing.T) {
 	type identityKey struct{}
 	ctx := context.WithValue(t.Context(), identityKey{}, "host-owned-identity")
-	request := authz.AccessRequest{Volume: "configured-volume", Operation: authz.FileOpen,
-		Open: authz.OpenAccess{Read: true, Write: true, Create: true, Truncate: true, Exclusive: true}}
+	options := storage.FileOpenOptions{
+		OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Truncate: true, Exclusive: true},
+		ExpectedID: 42, Mode: 0o600,
+	}
+	request := authz.AccessRequest{Volume: "configured-volume", Operation: authz.FileOpen, Open: options.OpenAccess}
 	cause := errors.New("policy lookup failed")
 	calls := 0
 	policy := authz.AuthorizerFunc(func(got context.Context, copied authz.AccessRequest) error {

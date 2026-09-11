@@ -114,14 +114,24 @@ type File interface {
 	Close(context.Context) error
 }
 
+// OpenAccess describes the access and atomic creation intent of a file open.
+// Opening a retained node cannot carry Create or Exclusive. Validation belongs
+// to FileOpenOptions, which also supplies creation mode and expected identity.
+type OpenAccess struct {
+	Read      bool
+	Write     bool
+	Create    bool
+	Truncate  bool
+	Exclusive bool
+}
+
 // FileOpenOptions selects access and atomic creation behavior. ExpectedID zero
 // accepts the node resolved by path; nonzero requires that exact identity.
 // Mode is the initial creation mode and never changes an existing file's mode.
 type FileOpenOptions struct {
-	ExpectedID                  uint64
-	Read, Write                 bool
-	Create, Exclusive, Truncate bool
-	Mode                        fs.FileMode
+	OpenAccess
+	ExpectedID uint64
+	Mode       fs.FileMode
 }
 
 // Check rejects invalid access, creation, and mode combinations with EINVAL.

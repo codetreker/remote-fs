@@ -6,28 +6,22 @@ package authz
 import (
 	"context"
 	"errors"
+
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // Operation identifies one semantic action independently of its transport method.
 // Policies should deny operations they do not recognize.
 type Operation string
 
-// OpenAccess preserves the complete validated intent of FileOpen or FileOpenNode.
-// Other operations carry its zero value. FileOpenNode never carries Create or Exclusive.
-type OpenAccess struct {
-	Read      bool
-	Write     bool
-	Create    bool
-	Truncate  bool
-	Exclusive bool
-}
-
 // AccessRequest identifies the host-configured volume and an operation on it.
 // Volume is trusted configuration, not a name selected by the remote request.
 type AccessRequest struct {
 	Volume    string
 	Operation Operation
-	Open      OpenAccess
+	// Open preserves the validated FileOpen or FileOpenNode intent. Other
+	// operations carry its zero value.
+	Open storage.OpenAccess
 }
 
 // Authorizer reads the host's current policy using identity from ctx. It must

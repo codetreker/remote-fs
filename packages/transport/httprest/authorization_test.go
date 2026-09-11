@@ -232,7 +232,7 @@ func TestAuthorizationOptionsRequireAnExplicitUsablePair(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	request := authz.AccessRequest{Volume: "request-selected-volume", Operation: authz.FileOpen, Open: authz.OpenAccess{Read: true, Create: true}}
+	request := authz.AccessRequest{Volume: "request-selected-volume", Operation: authz.FileOpen, Open: storage.OpenAccess{Read: true, Create: true}}
 	if err := h.authorize(t.Context(), request); err != nil {
 		t.Fatal(err)
 	}

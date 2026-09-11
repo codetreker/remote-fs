@@ -186,7 +186,7 @@ func TestRetainedOpenClosesTheReferenceWhenConfirmationFails(t *testing.T) {
 	session := retainedTestSession(t, &fileSessionStub{open: func(context.Context) (storage.File, *httprest.MutationBarrier, error) {
 		return remoteFile, nil, nil
 	}})
-	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: true})
+	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
 	if file != nil || !errors.Is(err, syscall.EIO) || !errors.Is(err, closeCause) || closes != 1 {
 		t.Fatalf("unconfirmed open lost reference cleanup: %v, %v, closes %d", file, err, closes)
 	}

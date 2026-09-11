@@ -52,8 +52,8 @@ volume、保留文件与显式占有的权威持有者。将原生 storage 与�
 | `Subscribe` | `GET /v3/subscribe` | 无 | — |
 | `Resubscribe` | `GET /v3/resubscribe` | `incarnation`、`position` | — |
 | `Snapshot` | `GET /v3/snapshot` | 无 | — |
-| 保留文件数据 | `POST /v3/file` | 无 | 严格 JSON，携带 operation、session/file 能力与该操作的参数 |
-| 文件会话与 advisory 控制 | `POST /v3/file-control` | 无 | 严格 JSON，携带原动作身份及 owner |
+| 保留文件数据 | `POST /v3/file` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带 session/file 能力与参数 |
+| 文件会话与 advisory 控制 | `POST /v3/file-control` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带原动作身份及 owner |
 
 volume 路径以 `url.Values` 的转义走 query string，任意字节序列都逐字往返。根是 `path=`：一个存在且为空的操作数。`Space` 描述整个 volume 而不是某个路径底下的东西，因此它一个操作数都不带；带了 `path=` 的 `Space` 请求与多带了任何操作数的请求一样，是请求错误。
 

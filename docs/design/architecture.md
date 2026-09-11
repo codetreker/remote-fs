@@ -217,7 +217,7 @@ go.mod
 packages/                    可被外部与自身 import
   locking/                   强 S/X 权限状态、有限历史与原生发布协调
   advisory/                  标准 flock/POSIX owner、范围、等待与有限历史
-  authz/                     嵌入方授权接口、语义操作与完整打开意图
+  authz/                     嵌入方授权接口与语义操作，复用 storage 的打开意图
   storage/                   接口定义、实现者义务与 errno 词汇（两个角色共用）
     locked/                  enforcing backend 与其授权方的配对，提供不可变 scope
     lockcontract/            文件保护义务的共享验收

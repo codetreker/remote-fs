@@ -269,11 +269,11 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 		writeError(err)
 		return
 	}
-	if req.Op == "read" && int64(req.Length) > fileReadLimit(h.maxBodyBytes) {
+	if req.Op == authz.FileRead && int64(req.Length) > fileReadLimit(h.maxBodyBytes) {
 		writeError(syscall.EFBIG)
 		return
 	}
-	if req.Op == "write" && int64(len(req.Data)) > h.maxWriteBytes {
+	if req.Op == authz.FileWrite && int64(len(req.Data)) > h.maxWriteBytes {
 		writeError(syscall.EFBIG)
 		return
 	}
@@ -289,10 +289,9 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 	if present || fileMutation(req.Op) {
 		r = r.WithContext(locking.WithScope(r.Context(), scope))
 	}
-	access, err := fileAccessRequest(req)
-	if err != nil {
-		writeFault(http.StatusBadRequest, err)
-		return
+	access := authz.AccessRequest{Operation: req.Op}
+	if req.Op == authz.FileOpen || req.Op == authz.FileOpenNode {
+		access.Open = req.Open.OpenAccess
 	}
 	if err := h.authorize(r.Context(), access); err != nil {
 		writeError(err)
@@ -307,109 +306,54 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 	h.writeFileResponse(w, http.StatusOK, response, control)
 }
 
-func fileAccessRequest(req fileRequest) (authz.AccessRequest, error) {
-	var operation authz.Operation
-	switch req.Op {
-	case "new":
-		operation = authz.FileSessionOpen
-	case "status":
-		operation = authz.FileStatus
-	case "renew":
-		operation = authz.FileRenew
-	case "session-close":
-		operation = authz.FileSessionClose
-	case "stat-node":
-		operation = authz.FileStatNode
-	case "set-node-attr":
-		operation = authz.FileSetNodeAttr
-	case "open":
-		operation = authz.FileOpen
-	case "open-node":
-		operation = authz.FileOpenNode
-	case "ack":
-		operation = authz.FileAck
-	case "stat":
-		operation = authz.FileStat
-	case "read":
-		operation = authz.FileRead
-	case "write":
-		operation = authz.FileWrite
-	case "truncate":
-		operation = authz.FileTruncate
-	case "set-attr":
-		operation = authz.FileSetAttr
-	case "sync":
-		operation = authz.FileSync
-	case "get-lock":
-		operation = authz.FileGetLock
-	case "set-lock":
-		operation = authz.FileSetLock
-		if req.Lock.Type == storage.Unlock {
-			operation = authz.FileUnlock
-		}
-	case "query-lock":
-		operation = authz.FileQueryLock
-	case "cancel-lock":
-		operation = authz.FileCancelLock
-	case "drop-locks":
-		operation = authz.FileDropLocks
-	case "close":
-		operation = authz.FileClose
-	default:
-		return authz.AccessRequest{}, errors.New("unknown retained file operation")
-	}
-	access := authz.AccessRequest{Operation: operation}
-	if req.Op == "open" || req.Op == "open-node" {
-		access.Open = authz.OpenAccess{Read: req.Open.Read, Write: req.Open.Write, Create: req.Open.Create, Truncate: req.Open.Truncate, Exclusive: req.Open.Exclusive}
-	}
-	return access, nil
-}
-
 func validateFileArguments(req fileRequest, maximum storage.FileSessionOptions) error {
 	switch req.Op {
-	case "new":
+	case authz.FileSessionOpen:
 		return checkFileSessionOptions(req.Options, maximum)
-	case "open":
+	case authz.FileOpen:
 		if err := req.Open.Check(); err != nil {
 			return err
 		}
 		_, err := storage.CleanPath(string(req.Path))
 		return err
-	case "open-node":
+	case authz.FileOpenNode:
 		return req.Open.CheckNode(req.Node)
-	case "read":
+	case authz.FileRead:
 		if req.Offset < 0 || req.Length < 0 {
 			return syscall.EINVAL
 		}
-	case "write":
+	case authz.FileWrite:
 		if req.Offset < 0 {
 			return syscall.EINVAL
 		}
 		if int64(len(req.Data)) > math.MaxInt64-req.Offset {
 			return syscall.EFBIG
 		}
-	case "truncate":
+	case authz.FileTruncate:
 		if req.Offset < 0 {
 			return syscall.EINVAL
 		}
-	case "set-attr", "set-node-attr":
+	case authz.FileSetAttr, authz.FileSetNodeAttr:
 		return req.Change.Storage().Check()
-	case "get-lock", "set-lock":
+	case authz.FileGetLock, authz.FileSetLock, authz.FileUnlock:
 		if err := req.Lock.Check(); err != nil {
 			return err
 		}
-		if req.Op == "get-lock" {
+		if req.Op == authz.FileGetLock {
 			if req.Lock.Type == storage.Unlock {
 				return syscall.EINVAL
 			}
 			return nil
 		}
+		if (req.Op == authz.FileUnlock) != (req.Lock.Type == storage.Unlock) {
+			return syscall.EINVAL
+		}
 		_, err := req.LockID.Epoch()
 		return err
-	case "query-lock", "cancel-lock":
+	case authz.FileQueryLock, authz.FileCancelLock:
 		_, err := req.LockID.Epoch()
 		return err
-	case "drop-locks":
+	case authz.FileDropLocks:
 		if req.Family != storage.Flock && req.Family != storage.POSIX {
 			return syscall.EINVAL
 		}
@@ -419,7 +363,7 @@ func validateFileArguments(req fileRequest, maximum storage.FileSessionOptions) 
 
 func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte) (fileResponse, error) {
 	registry := h.files
-	if req.Op == "new" {
+	if req.Op == authz.FileSessionOpen {
 		return registry.enroll(ctx, req.Options)
 	}
 
@@ -468,7 +412,7 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 			session.mu.Unlock()
 			return fileResponse{}, syscall.ESTALE
 		}
-		cleanup := req.Op == "drop-locks"
+		cleanup := req.Op == authz.FileDropLocks
 		if cleanup && session.cleanupActions >= registry.limits.MaxCleanupActions {
 			session.retired = true
 			session.mu.Unlock()
@@ -496,7 +440,7 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 		session.mu.Unlock()
 		return response, err
 	}
-	if req.Op != "session-close" && req.Op != "close" && (session.retired || !now.Before(session.expires)) {
+	if req.Op != authz.FileSessionClose && req.Op != authz.FileClose && (session.retired || !now.Before(session.expires)) {
 		session.mu.Unlock()
 		return fileResponse{}, syscall.ESTALE
 	}
@@ -517,10 +461,10 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 	response := fileResponse{}
 	var err error
 	switch req.Op {
-	case "status", "renew":
+	case authz.FileStatus, authz.FileRenew:
 		start := time.Now()
 		var status storage.FileSessionStatus
-		if req.Op == "renew" {
+		if req.Op == authz.FileRenew {
 			status, err = s.native.Renew(ctx)
 		} else {
 			status, err = s.native.Status(ctx)
@@ -533,7 +477,7 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 			s.mu.Unlock()
 			return response, syscall.ESTALE
 		}
-		if req.Op == "renew" && status.Revision > s.revision {
+		if req.Op == authz.FileRenew && status.Revision > s.revision {
 			s.revision = status.Revision
 			candidate := start.Add(status.Remaining)
 			if candidate.After(s.expires) {
@@ -546,17 +490,17 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		status.HistoryRemaining = maxDuration(status.HistoryRemaining - time.Since(start))
 		response.Status = &status
 		return response, nil
-	case "session-close":
+	case authz.FileSessionClose:
 		s.mu.Lock()
 		s.retired = true
 		s.mu.Unlock()
 		return response, s.native.Close(ctx)
-	case "stat-node":
+	case authz.FileStatNode:
 		attr, err := s.native.StatNode(ctx, req.Node)
 		wire := AttrOf(attr)
 		response.Attr = wire
 		return response, err
-	case "set-node-attr":
+	case authz.FileSetNodeAttr:
 		if req.Change == nil {
 			return response, syscall.EINVAL
 		}
@@ -564,7 +508,7 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		err = e
 		wire := AttrOf(attr)
 		response.Attr = wire
-	case "open", "open-node":
+	case authz.FileOpen, authz.FileOpenNode:
 		s.mu.Lock()
 		if len(s.files) >= s.options.MaxFiles {
 			s.mu.Unlock()
@@ -575,7 +519,7 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		s.files[cap] = entry
 		s.mu.Unlock()
 		var file storage.File
-		if req.Op == "open" {
+		if req.Op == authz.FileOpen {
 			file, err = s.native.OpenFile(ctx, string(req.Path), req.Open)
 		} else {
 			file, err = s.native.OpenNode(ctx, req.Node, req.Open)
@@ -592,7 +536,7 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		if err == nil {
 			response.File = cap
 		}
-	case "ack":
+	case authz.FileAck:
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		file := s.files[req.File]
@@ -607,67 +551,67 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 	default:
 		s.mu.Lock()
 		file := s.files[req.File]
-		if file == nil && req.Op == "close" {
+		if file == nil && req.Op == authz.FileClose {
 			s.mu.Unlock()
 			return response, nil
 		}
-		if file == nil || file.native == nil || file.closing && req.Op != "close" {
+		if file == nil || file.native == nil || file.closing && req.Op != authz.FileClose {
 			s.mu.Unlock()
 			return response, syscall.ESTALE
 		}
-		if !file.pending.IsZero() && req.Op != "close" {
+		if !file.pending.IsZero() && req.Op != authz.FileClose {
 			s.mu.Unlock()
 			return response, syscall.ESTALE
 		}
-		if req.Op == "close" {
+		if req.Op == authz.FileClose {
 			file.closing = true
 		}
 		s.mu.Unlock()
 		var attr storage.Attr
 		switch req.Op {
-		case "stat":
+		case authz.FileStat:
 			attr, err = file.native.Stat(ctx)
-		case "read":
+		case authz.FileRead:
 			value, e := file.native.ReadAt(ctx, req.Offset, req.Length)
 			err = e
 			attr = value.Attr
 			response.Data = value.Data
-		case "write":
+		case authz.FileWrite:
 			attr, err = file.native.WriteAt(ctx, req.Offset, req.Data)
-		case "truncate":
+		case authz.FileTruncate:
 			attr, err = file.native.Truncate(ctx, req.Offset)
-		case "set-attr":
+		case authz.FileSetAttr:
 			if req.Change == nil {
 				return response, syscall.EINVAL
 			}
 			attr, err = file.native.SetAttr(ctx, req.Change.Storage())
-		case "sync":
+		case authz.FileSync:
 			err = file.native.Sync(ctx)
-		case "get-lock":
+		case authz.FileGetLock:
 			value, e := file.native.GetLock(ctx, req.Owner, req.Lock)
 			response.Conflict = &value
 			err = e
-		case "set-lock":
+		case authz.FileSetLock, authz.FileUnlock:
 			value, e := file.native.SetLock(ctx, req.Owner, req.Lock, req.LockID)
 			err = e
 			if err == nil {
 				response.Attempt, err = fileAttemptOf(value)
 			}
-		case "query-lock":
+		case authz.FileQueryLock:
 			value, e := file.native.QueryLock(ctx, req.Owner, req.LockID)
 			err = e
 			if err == nil {
 				response.Attempt, err = fileAttemptOf(value)
 			}
-		case "cancel-lock":
+		case authz.FileCancelLock:
 			value, e := file.native.CancelLock(ctx, req.Owner, req.LockID)
 			err = e
 			if err == nil {
 				response.Attempt, err = fileAttemptOf(value)
 			}
-		case "drop-locks":
+		case authz.FileDropLocks:
 			err = file.native.DropLocks(ctx, req.Owner, req.Family)
-		case "close":
+		case authz.FileClose:
 			err = file.native.Close(ctx)
 			if err == nil {
 				s.mu.Lock()
@@ -678,7 +622,7 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 			return response, syscall.EINVAL
 		}
 		switch req.Op {
-		case "stat", "read", "write", "truncate", "set-attr":
+		case authz.FileStat, authz.FileRead, authz.FileWrite, authz.FileTruncate, authz.FileSetAttr:
 			wire := AttrOf(attr)
 			response.Attr = wire
 		}

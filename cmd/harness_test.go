@@ -24,6 +24,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/fuse"
 	"github.com/codetreker/remote-fs/packages/fuse/fusetest"
 	"github.com/codetreker/remote-fs/packages/locking"
@@ -145,6 +146,12 @@ func serveStorage(t *testing.T, volume storage.Storage, log metastore.Log) *volu
 	return &volumeServer{url: "http://" + listener.Addr().String(), authoritative: volume, calls: counted, stop: stop, unavailable: served}
 }
 
+const (
+	fileStatNodeCall = string(httprest.OpFile) + ":" + string(authz.FileStatNode)
+	fileRenewCall    = string(httprest.OpFileControl) + ":" + string(authz.FileRenew)
+	fileCloseCall    = string(httprest.OpFileControl) + ":" + string(authz.FileClose)
+)
+
 // calls counts the requests that reach the server, by operation.
 type calls struct {
 	handler http.Handler
@@ -160,13 +167,13 @@ func (c *calls) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	op := strings.TrimPrefix(r.URL.Path, httprest.Prefix)
 	if op == string(httprest.OpFile) || op == string(httprest.OpFileControl) {
 		if fileOp := recordedFileOperation(r); fileOp != "" {
-			op += ":" + fileOp
+			op += ":" + string(fileOp)
 		}
 	}
 	c.mu.Lock()
 	c.counts[op]++
 	c.mu.Unlock()
-	if op == "file-control:close" {
+	if op == fileCloseCall {
 		response := &recordedCloseResponse{ResponseWriter: w, status: http.StatusOK}
 		c.handler.ServeHTTP(response, r)
 		c.mu.Lock()
@@ -222,7 +229,7 @@ func (c *calls) waitFileCloses(t *testing.T, expected int) {
 
 // Only the bounded operation prefix is inspected; replay preserves the handler's body
 // parsing, content length and admission behavior.
-func recordedFileOperation(r *http.Request) string {
+func recordedFileOperation(r *http.Request) authz.Operation {
 	var prefix bytes.Buffer
 	body := r.Body
 	defer func() { r.Body = &recordedRequestBody{Reader: io.MultiReader(&prefix, body), Closer: body} }()
@@ -237,7 +244,7 @@ func recordedFileOperation(r *http.Request) string {
 			return ""
 		}
 		if key == "op" {
-			var op string
+			var op authz.Operation
 			if err := decoder.Decode(&op); err == nil {
 				return op
 			}

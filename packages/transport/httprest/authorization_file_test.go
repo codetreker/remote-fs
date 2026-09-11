@@ -128,53 +128,49 @@ func TestEveryFileOperationAuthorizesBeforeCapabilityLookup(t *testing.T) {
 		t.Fatal(err)
 	}
 	lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
-	fullOpen := storage.FileOpenOptions{Read: true, Write: true, Create: true, Truncate: true, Exclusive: true, Mode: 0o600}
-	for _, test := range []struct {
-		request   fileRequest
-		operation authz.Operation
-	}{
-		{fileRequest{Op: "new", Options: storage.DefaultFileSessionOptions()}, authz.FileSessionOpen},
-		{fileRequest{Op: "status"}, authz.FileStatus},
-		{fileRequest{Op: "renew"}, authz.FileRenew},
-		{fileRequest{Op: "session-close"}, authz.FileSessionClose},
-		{fileRequest{Op: "stat-node", Node: 71}, authz.FileStatNode},
-		{fileRequest{Op: "set-node-attr", Node: 71, Change: &AttrChange{}}, authz.FileSetNodeAttr},
-		{fileRequest{Op: "open", Path: []byte("file"), Open: fullOpen}, authz.FileOpen},
-		{fileRequest{Op: "open-node", Node: 71, Open: storage.FileOpenOptions{Read: true, Write: true, Truncate: true}}, authz.FileOpenNode},
-		{fileRequest{Op: "ack"}, authz.FileAck},
-		{fileRequest{Op: "stat"}, authz.FileStat},
-		{fileRequest{Op: "read", Length: 8}, authz.FileRead},
-		{fileRequest{Op: "write", Data: []byte("patch")}, authz.FileWrite},
-		{fileRequest{Op: "truncate", Offset: 2}, authz.FileTruncate},
-		{fileRequest{Op: "set-attr", Change: &AttrChange{}}, authz.FileSetAttr},
-		{fileRequest{Op: "sync"}, authz.FileSync},
-		{fileRequest{Op: "get-lock", Owner: 13, Lock: lock}, authz.FileGetLock},
-		{fileRequest{Op: "set-lock", Owner: 13, Lock: lock, LockID: action}, authz.FileSetLock},
-		{fileRequest{Op: "set-lock", Owner: 13, Lock: storage.FileLock{Family: storage.Flock, Type: storage.Unlock, End: math.MaxInt64}, LockID: action}, authz.FileUnlock},
-		{fileRequest{Op: "query-lock", Owner: 13, LockID: action}, authz.FileQueryLock},
-		{fileRequest{Op: "cancel-lock", Owner: 13, LockID: action}, authz.FileCancelLock},
-		{fileRequest{Op: "drop-locks", Owner: 13, Family: storage.Flock}, authz.FileDropLocks},
-		{fileRequest{Op: "close"}, authz.FileClose},
+	fullOpen := storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Truncate: true, Exclusive: true}, Mode: 0o600}
+	for _, req := range []fileRequest{
+		{Op: authz.FileSessionOpen, Options: storage.DefaultFileSessionOptions()},
+		{Op: authz.FileStatus},
+		{Op: authz.FileRenew},
+		{Op: authz.FileSessionClose},
+		{Op: authz.FileStatNode, Node: 71},
+		{Op: authz.FileSetNodeAttr, Node: 71, Change: &AttrChange{}},
+		{Op: authz.FileOpen, Path: []byte("file"), Open: fullOpen},
+		{Op: authz.FileOpenNode, Node: 71, Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Truncate: true}}},
+		{Op: authz.FileAck},
+		{Op: authz.FileStat},
+		{Op: authz.FileRead, Length: 8},
+		{Op: authz.FileWrite, Data: []byte("patch")},
+		{Op: authz.FileTruncate, Offset: 2},
+		{Op: authz.FileSetAttr, Change: &AttrChange{}},
+		{Op: authz.FileSync},
+		{Op: authz.FileGetLock, Owner: 13, Lock: lock},
+		{Op: authz.FileSetLock, Owner: 13, Lock: lock, LockID: action},
+		{Op: authz.FileUnlock, Owner: 13, Lock: storage.FileLock{Family: storage.Flock, Type: storage.Unlock, End: math.MaxInt64}, LockID: action},
+		{Op: authz.FileQueryLock, Owner: 13, LockID: action},
+		{Op: authz.FileCancelLock, Owner: 13, LockID: action},
+		{Op: authz.FileDropLocks, Owner: 13, Family: storage.Flock},
+		{Op: authz.FileClose},
 	} {
-		t.Run(string(test.operation), func(t *testing.T) {
+		t.Run(string(req.Op), func(t *testing.T) {
 			policy.reset(authz.ErrDenied)
-			req := test.request
-			if req.Op != "new" {
+			if req.Op != authz.FileSessionOpen {
 				req.Session = strings.Repeat("a", 64)
 			}
 			if fileActionRequired(req.Op) {
 				req.Action = action
 			}
 			switch req.Op {
-			case "stat", "read", "write", "truncate", "set-attr", "sync", "ack", "close", "get-lock", "set-lock", "query-lock", "cancel-lock", "drop-locks":
+			case authz.FileStat, authz.FileRead, authz.FileWrite, authz.FileTruncate, authz.FileSetAttr, authz.FileSync, authz.FileAck, authz.FileClose, authz.FileGetLock, authz.FileSetLock, authz.FileUnlock, authz.FileQueryLock, authz.FileCancelLock, authz.FileDropLocks:
 				req.File = strings.Repeat("b", 64)
 			}
 			fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, req), "EACCES", "access denied")
 			policy.mu.Lock()
 			defer policy.mu.Unlock()
-			want := authz.AccessRequest{Volume: "trusted-volume", Operation: test.operation}
-			if req.Op == "open" || req.Op == "open-node" {
-				want.Open = authz.OpenAccess{Read: req.Open.Read, Write: req.Open.Write, Create: req.Open.Create, Truncate: req.Open.Truncate, Exclusive: req.Open.Exclusive}
+			want := authz.AccessRequest{Volume: "trusted-volume", Operation: req.Op}
+			if req.Op == authz.FileOpen || req.Op == authz.FileOpenNode {
+				want.Open = req.Open.OpenAccess
 			}
 			if len(policy.requests) != 1 || policy.requests[0] != want || policy.identities[0] != "member" {
 				t.Fatalf("authorization=%+v identities=%v; want %+v", policy.requests, policy.identities, want)
@@ -199,31 +195,34 @@ func TestInvalidFileArgumentsDoNotReachAuthorization(t *testing.T) {
 	tooLarge := storage.DefaultFileSessionOptions()
 	tooLarge.MaxFiles++
 	for _, req := range []fileRequest{
-		{Op: "new"},
-		{Op: "new", Options: tooLarge},
-		{Op: "open", Path: []byte("file")},
-		{Op: "open", Path: []byte("file"), Open: storage.FileOpenOptions{Read: true, Truncate: true}},
-		{Op: "open", Path: []byte("../outside"), Open: storage.FileOpenOptions{Read: true}},
-		{Op: "open-node", Node: 1, Open: storage.FileOpenOptions{Write: true, Create: true}},
-		{Op: "open-node", Open: storage.FileOpenOptions{Read: true}},
-		{Op: "read", Offset: -1, Length: 1},
-		{Op: "write", Offset: math.MaxInt64, Data: []byte("x")},
-		{Op: "truncate", Offset: -1},
-		{Op: "set-attr", Change: &AttrChange{Mode: &mode}},
-		{Op: "get-lock", Lock: storage.FileLock{Family: storage.Flock, Type: storage.Unlock, End: math.MaxInt64}},
-		{Op: "set-lock", Lock: storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}, LockID: "invalid"},
-		{Op: "query-lock", LockID: "invalid"},
-		{Op: "drop-locks", Family: 99},
+		{Op: authz.FileSessionOpen},
+		{Op: authz.FileSessionOpen, Options: tooLarge},
+		{Op: authz.FileOpen, Path: []byte("file")},
+		{Op: authz.FileOpen, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Truncate: true}}},
+		{Op: authz.FileOpen, Path: []byte("../outside"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}},
+		{Op: authz.FileOpenNode, Node: 1, Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Create: true}}},
+		{Op: authz.FileOpenNode, Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}},
+		{Op: authz.FileRead, Offset: -1, Length: 1},
+		{Op: authz.FileWrite, Offset: math.MaxInt64, Data: []byte("x")},
+		{Op: authz.FileTruncate, Offset: -1},
+		{Op: authz.FileSetAttr, Change: &AttrChange{Mode: &mode}},
+		{Op: authz.FileGetLock, Lock: storage.FileLock{Family: storage.Flock, Type: storage.Unlock, End: math.MaxInt64}},
+		{Op: authz.FileSetLock, Lock: storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}, LockID: "invalid"},
+		{Op: authz.FileSetLock, Lock: storage.FileLock{Family: storage.Flock, Type: storage.Unlock, End: math.MaxInt64}, LockID: action},
+		{Op: authz.FileUnlock, Lock: storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}, LockID: action},
+		{Op: authz.FileQueryLock, LockID: "invalid"},
+		{Op: authz.FileDropLocks, Family: 99},
 		{Op: "unknown"},
+		{Op: "open", Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}},
 	} {
-		if req.Op != "new" {
+		if req.Op != authz.FileSessionOpen {
 			req.Session = strings.Repeat("a", 64)
 		}
 		if fileActionRequired(req.Op) {
 			req.Action = action
 		}
 		switch req.Op {
-		case "read", "write", "truncate", "set-attr", "get-lock", "set-lock", "query-lock", "drop-locks":
+		case authz.FileRead, authz.FileWrite, authz.FileTruncate, authz.FileSetAttr, authz.FileGetLock, authz.FileSetLock, authz.FileUnlock, authz.FileQueryLock, authz.FileDropLocks:
 			req.File = strings.Repeat("b", 64)
 		}
 		answer := fileAuthorizationRequest(t, h, req)
@@ -249,9 +248,9 @@ func TestFileAuthorizationUsesTrustedFailureFieldsWithoutNativeReceipts(t *testi
 	} {
 		policy := &fileAuthorizationPolicy{err: test.cause}
 		h, _ := fileAuthorizationFixture(t, policy, DefaultFileLimits())
-		for _, op := range []string{"new", "status"} {
+		for _, op := range []authz.Operation{authz.FileSessionOpen, authz.FileStatus} {
 			req := fileRequest{Op: op}
-			if op == "new" {
+			if op == authz.FileSessionOpen {
 				req.Options = storage.DefaultFileSessionOptions()
 			} else {
 				req.Session = strings.Repeat("a", 64)
@@ -267,12 +266,12 @@ func TestDeniedFileActionsDoNotMutateOrExposeRetainedReceipts(t *testing.T) {
 	if err := backend.Write(t.Context(), "file", []byte("original")); err != nil {
 		t.Fatal(err)
 	}
-	session := fileAuthorizationSuccess(t, h, fileRequest{Op: "new", Options: storage.DefaultFileSessionOptions()})
+	session := fileAuthorizationSuccess(t, h, fileRequest{Op: authz.FileSessionOpen, Options: storage.DefaultFileSessionOptions()})
 	action, err := storage.NewLockRequestID(session.Epoch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := fileRequest{Op: "open", Session: session.Session, Action: action, Path: []byte("file"), Open: storage.FileOpenOptions{Read: true, Write: true, Create: true, Mode: 0o777}}
+	req := fileRequest{Op: authz.FileOpen, Session: session.Session, Action: action, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0o777}}
 	opened := fileAuthorizationSuccess(t, h, req)
 	h.files.mu.Lock()
 	served := h.files.sessions[session.Session]
@@ -285,11 +284,11 @@ func TestDeniedFileActionsDoNotMutateOrExposeRetainedReceipts(t *testing.T) {
 	policy.reset(authz.ErrDenied)
 	for _, denied := range []fileRequest{
 		req,
-		{Op: "ack", Session: session.Session, File: opened.File},
-		{Op: "renew", Session: session.Session},
-		{Op: "status", Session: session.Session},
-		{Op: "close", Session: session.Session, File: opened.File},
-		{Op: "session-close", Session: session.Session},
+		{Op: authz.FileAck, Session: session.Session, File: opened.File},
+		{Op: authz.FileRenew, Session: session.Session},
+		{Op: authz.FileStatus, Session: session.Session},
+		{Op: authz.FileClose, Session: session.Session, File: opened.File},
+		{Op: authz.FileSessionClose, Session: session.Session},
 	} {
 		fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, denied), "EACCES", "access denied")
 	}
@@ -305,12 +304,12 @@ func TestDeniedFileActionsDoNotMutateOrExposeRetainedReceipts(t *testing.T) {
 	if replayed.File != opened.File {
 		t.Fatalf("allowed replay allocated a replacement: %+v; want %+v", replayed, opened)
 	}
-	fileAuthorizationSuccess(t, h, fileRequest{Op: "ack", Session: session.Session, File: opened.File})
+	fileAuthorizationSuccess(t, h, fileRequest{Op: authz.FileAck, Session: session.Session, File: opened.File})
 	writeAction, err := storage.NewLockRequestID(session.Epoch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	write := fileRequest{Op: "write", Session: session.Session, File: opened.File, Action: writeAction, Data: []byte("altered!")}
+	write := fileRequest{Op: authz.FileWrite, Session: session.Session, File: opened.File, Action: writeAction, Data: []byte("altered!")}
 	policy.reset(authz.ErrDenied)
 	fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, write), "EACCES", "access denied")
 	served.mu.Lock()
@@ -337,19 +336,19 @@ func TestDeniedAdvisoryCleanupPreservesTheActualGrantAndActionHistory(t *testing
 	if err := backend.Create(t.Context(), "file"); err != nil {
 		t.Fatal(err)
 	}
-	session := fileAuthorizationSuccess(t, h, fileRequest{Op: "new", Options: storage.DefaultFileSessionOptions()})
+	session := fileAuthorizationSuccess(t, h, fileRequest{Op: authz.FileSessionOpen, Options: storage.DefaultFileSessionOptions()})
 	openAction, err := storage.NewLockRequestID(session.Epoch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	opened := fileAuthorizationSuccess(t, h, fileRequest{Op: "open", Session: session.Session, Action: openAction, Path: []byte("file"), Open: storage.FileOpenOptions{Read: true}})
-	fileAuthorizationSuccess(t, h, fileRequest{Op: "ack", Session: session.Session, File: opened.File})
+	opened := fileAuthorizationSuccess(t, h, fileRequest{Op: authz.FileOpen, Session: session.Session, Action: openAction, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}})
+	fileAuthorizationSuccess(t, h, fileRequest{Op: authz.FileAck, Session: session.Session, File: opened.File})
 	grantID, err := storage.NewLockRequestID(session.Status.ActionEpoch)
 	if err != nil {
 		t.Fatal(err)
 	}
 	lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
-	acquire := fileRequest{Op: "set-lock", Session: session.Session, File: opened.File, Owner: 17, Lock: lock, LockID: grantID}
+	acquire := fileRequest{Op: authz.FileSetLock, Session: session.Session, File: opened.File, Owner: 17, Lock: lock, LockID: grantID}
 	granted := fileAuthorizationSuccess(t, h, acquire)
 	if granted.Attempt == nil || granted.Attempt.State != storage.LockGranted {
 		t.Fatalf("readonly descriptor failed exclusive flock: %+v", granted)
@@ -365,23 +364,23 @@ func TestDeniedAdvisoryCleanupPreservesTheActualGrantAndActionHistory(t *testing
 	policy.reset(authz.ErrDenied)
 	for _, request := range []fileRequest{
 		acquire,
-		{Op: "query-lock", Session: session.Session, File: opened.File, Owner: 17, LockID: grantID},
-		{Op: "cancel-lock", Session: session.Session, File: opened.File, Owner: 17, LockID: grantID},
-		{Op: "set-lock", Session: session.Session, File: opened.File, Owner: 17, LockID: unlockID, Lock: storage.FileLock{Family: storage.Flock, Type: storage.Unlock, End: math.MaxInt64}},
-		{Op: "drop-locks", Session: session.Session, File: opened.File, Owner: 17, Family: storage.Flock, Action: dropAction},
+		{Op: authz.FileQueryLock, Session: session.Session, File: opened.File, Owner: 17, LockID: grantID},
+		{Op: authz.FileCancelLock, Session: session.Session, File: opened.File, Owner: 17, LockID: grantID},
+		{Op: authz.FileUnlock, Session: session.Session, File: opened.File, Owner: 17, LockID: unlockID, Lock: storage.FileLock{Family: storage.Flock, Type: storage.Unlock, End: math.MaxInt64}},
+		{Op: authz.FileDropLocks, Session: session.Session, File: opened.File, Owner: 17, Family: storage.Flock, Action: dropAction},
 	} {
 		fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, request), "EACCES", "access denied")
 	}
 	policy.reset(nil)
-	conflict := fileAuthorizationSuccess(t, h, fileRequest{Op: "get-lock", Session: session.Session, File: opened.File, Owner: 18, Lock: lock})
+	conflict := fileAuthorizationSuccess(t, h, fileRequest{Op: authz.FileGetLock, Session: session.Session, File: opened.File, Owner: 18, Lock: lock})
 	if conflict.Conflict == nil || !conflict.Conflict.Found {
 		t.Fatalf("denied cleanup released the native grant: %+v", conflict)
 	}
-	query := fileAuthorizationSuccess(t, h, fileRequest{Op: "query-lock", Session: session.Session, File: opened.File, Owner: 17, LockID: grantID})
+	query := fileAuthorizationSuccess(t, h, fileRequest{Op: authz.FileQueryLock, Session: session.Session, File: opened.File, Owner: 17, LockID: grantID})
 	if query.Attempt == nil || query.Attempt.State != storage.LockGranted || !query.Attempt.EverGranted {
 		t.Fatalf("denial rewrote original grant history: %+v", query)
 	}
-	unknown := fileAuthorizationRequest(t, h, fileRequest{Op: "query-lock", Session: session.Session, File: opened.File, Owner: 17, LockID: unlockID})
+	unknown := fileAuthorizationRequest(t, h, fileRequest{Op: authz.FileQueryLock, Session: session.Session, File: opened.File, Owner: 17, LockID: unlockID})
 	var failure ErrorResponse
 	if err := json.Unmarshal(unknown.Body.Bytes(), &failure); err != nil {
 		t.Fatal(err)
@@ -409,18 +408,18 @@ func TestDeniedFileCloseStillAllowsInternalLeaseCleanup(t *testing.T) {
 	if err := backend.Write(t.Context(), "file", []byte("retained")); err != nil {
 		t.Fatal(err)
 	}
-	session := fileAuthorizationSuccess(t, h, fileRequest{Op: "new", Options: limits.Session})
+	session := fileAuthorizationSuccess(t, h, fileRequest{Op: authz.FileSessionOpen, Options: limits.Session})
 	action, err := storage.NewLockRequestID(session.Epoch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	opened := fileAuthorizationSuccess(t, h, fileRequest{Op: "open", Session: session.Session, Action: action, Path: []byte("file"), Open: storage.FileOpenOptions{Read: true}})
-	fileAuthorizationSuccess(t, h, fileRequest{Op: "ack", Session: session.Session, File: opened.File})
+	opened := fileAuthorizationSuccess(t, h, fileRequest{Op: authz.FileOpen, Session: session.Session, Action: action, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}})
+	fileAuthorizationSuccess(t, h, fileRequest{Op: authz.FileAck, Session: session.Session, File: opened.File})
 	if err := backend.Remove(t.Context(), "file"); err != nil {
 		t.Fatal(err)
 	}
 	policy.reset(authz.ErrDenied)
-	fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, fileRequest{Op: "close", Session: session.Session, File: opened.File}), "EACCES", "access denied")
+	fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, fileRequest{Op: authz.FileClose, Session: session.Session, File: opened.File}), "EACCES", "access denied")
 	if used, err := backend.Usage(t.Context()); err != nil || used != 8 {
 		t.Fatalf("denied close released retained bytes: %d, %v", used, err)
 	}

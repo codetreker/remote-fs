@@ -49,7 +49,7 @@ func advisoryVolume(t *testing.T) *volume {
 
 func advisoryHandle(t *testing.T, v *volume, read, write bool) *handle {
 	t.Helper()
-	file, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{Read: read, Write: write})
+	file, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: read, Write: write}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -21,8 +21,8 @@ func TestRetainedHTTPCancelLockReconcilesPendingAttempt(t *testing.T) {
 	}
 	firstSession := fileSession(t, client)
 	secondSession := fileSession(t, client)
-	first := openHTTPFile(t, firstSession, "file", storage.FileOpenOptions{Read: true, Write: true})
-	second := openHTTPFile(t, secondSession, "file", storage.FileOpenOptions{Read: true, Write: true})
+	first := openHTTPFile(t, firstSession, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
+	second := openHTTPFile(t, secondSession, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	newID := func(session storage.FileSession) storage.LockRequestID {
 		t.Helper()
 		status, err := session.Status(ctx)
