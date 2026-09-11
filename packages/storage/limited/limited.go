@@ -1,4 +1,5 @@
-// Package limited enforces a byte allowance over one bounded volume.
+// Package limited enforces a byte allowance through native publication accounting
+// over one bounded volume.
 // Startup and explicit Recount use authoritative native usage, including detached
 // retained files, or a bounded volume walk when retained files are unsupported.
 // Subsequent publications and final-reference cleanup settle the count directly.
@@ -8,10 +9,6 @@
 // after an applied effect. Unknown outcomes and failed accounting settlements make the
 // allowance unusable until reopening.
 // The wrapper preserves the native lock service, mutation scope, and lifecycle.
-//
-// Other bounded backends use per-path size sampling, which does not coordinate ancestor
-// renames. They cannot expose a lock service through this wrapper. Enumeration always
-// requires storage.BoundedStorage so measurement stops before excess allocation.
 //
 // Out-of-band changes invalidate accounting. The zero floor only bounds reported figures;
 // it cannot prevent overspending when drift has left the count below actual usage.
@@ -23,8 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
-	"io/fs"
 	"math"
 	"os"
 	"strings"
@@ -32,7 +27,6 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -105,16 +99,16 @@ func (l MeasurementLimits) Validate() error {
 	return err
 }
 
-// The fallback path exclusions have fixed capacity. Native backends provide their own
-// final target ordering and do not hold these stripes while staging content.
-const stripeCount = 256
+type publicationBackend interface {
+	storage.BoundedStorage
+	CheckPublicationAccounting() error
+}
 
 // Storage is a volume held under an allowance.
 type Storage struct {
-	backing     storage.BoundedStorage
+	backing     publicationBackend
 	limit       int64
 	measurement MeasurementLimits
-	accounted   bool
 
 	// Recount excludes volume requests and synchronous retained-file mutations.
 	// Autonomous retirement remains independent and is detected through revision.
@@ -125,15 +119,15 @@ type Storage struct {
 	count    int64
 	fault    error
 	revision uint64
-
-	// Only non-native backends use sampled sizes protected by these path stripes.
-	stripes [stripeCount]sync.Mutex
 }
 
 var _ storage.Storage = (*Storage)(nil)
 var _ storage.BoundedStorage = (*Storage)(nil)
 
 // New holds the volume in backing under an allowance of limit bytes.
+//
+// backing must provide bounded storage and native final-publication accounting;
+// an unsupported backend returns ENOSYS before usage is measured.
 //
 // Existing usage is measured through the native authority when available. A bounded
 // tree walk is sufficient only for volumes without retained, detached files.
@@ -147,9 +141,10 @@ func New(ctx context.Context, backing storage.Storage, limit int64) (*Storage, e
 }
 
 // NewWithLimits holds the volume under limit. Measurement bounds govern a
-// fallback tree walk at startup and Recount. backing must implement BoundedStorage;
-// retained-file backends additionally require authoritative usage and publication
-// accounting before this wrapper can expose their file sessions.
+// tree walk at startup and Recount. backing must implement BoundedStorage and native
+// publication accounting. Missing capabilities return ENOSYS; a failed accounting
+// check is returned before usage is measured. Retained-file backends additionally
+// require authoritative usage before this wrapper can expose their file sessions.
 func NewWithLimits(
 	ctx context.Context,
 	backing storage.Storage,
@@ -164,28 +159,18 @@ func NewWithLimits(
 	if err != nil {
 		return nil, err
 	}
-	bounded, ok := backing.(storage.BoundedStorage)
+	native, ok := backing.(publicationBackend)
 	if !ok {
-		return nil, fmt.Errorf("measuring an allowance requires backing storage with bounded listings: %w", syscall.ENOSYS)
+		return nil, fmt.Errorf("an allowance requires native publication accounting and bounded storage: %w", syscall.ENOSYS)
 	}
-	accounted := false
-	if native, ok := bounded.(interface{ CheckPublicationAccounting() error }); ok {
-		switch err := native.CheckPublicationAccounting(); err {
-		case nil:
-			accounted = true
-		case syscall.ENOSYS:
-		default:
-			return nil, err
-		}
+	if err := native.CheckPublicationAccounting(); err != nil {
+		return nil, err
 	}
-	if source, ok := bounded.(interface{ LockService() locking.Service }); ok && source.LockService() != nil && !accounted {
-		return nil, fmt.Errorf("a lock-enabled volume requires native publication accounting for its allowance: %w", syscall.ENOSYS)
-	}
-	count, err := measureUsage(ctx, bounded, effective)
+	count, err := measureUsage(ctx, native, effective)
 	if err != nil {
 		return nil, err
 	}
-	return &Storage{backing: bounded, limit: limit, measurement: effective, count: count, accounted: accounted}, nil
+	return &Storage{backing: native, limit: limit, measurement: effective, count: count}, nil
 }
 
 // Recount measures the volume again and replaces the count with what it finds.
@@ -463,15 +448,6 @@ func (s *Storage) taken() (int64, error) {
 // Recount measures the volume again.
 func floor(count int64) int64 { return max(count, 0) }
 
-// stripeOf picks the exclusion a path falls under. The path is the cleaned one, so that
-// the several ways of naming one node all arrive at one stripe.
-func stripeOf(cleaned string) uint32 {
-	h := fnv.New32a()
-	// hash.Hash's Write never returns an error.
-	_, _ = h.Write([]byte(cleaned))
-	return h.Sum32() % stripeCount
-}
-
 // Space reports the allowance, what is taken of it, and what may still be written.
 //
 // Avail is the smaller of what the allowance leaves and what the store underneath says is
@@ -509,15 +485,10 @@ func (s *Storage) Space(ctx context.Context) (storage.Space, error) {
 	return space, nil
 }
 
-// Write charges the difference between what the file will hold and what it holds now, and
-// refuses with EDQUOT when the allowance cannot pay for it.
-//
-// Native backends determine the sizes and settle the charge under final publication
-// ordering. Other backends sample the size under a path stripe, reserve growth before
-// Write, refund on failure, and release shrinking bytes only after success.
+// Write reserves growth from the actual sizes resolved under native publication
+// ordering. The backend must reject an unpaid increase before changing the volume.
 func (s *Storage) Write(ctx context.Context, name string, content []byte) error {
-	cleaned, err := storage.CleanPath(name)
-	if err != nil {
+	if _, err := storage.CleanPath(name); err != nil {
 		return &os.PathError{Op: "write", Path: name, Err: err}
 	}
 	s.gate.RLock()
@@ -525,55 +496,13 @@ func (s *Storage) Write(ctx context.Context, name string, content []byte) error 
 	if err := s.healthy(); err != nil {
 		return err
 	}
-	if s.accounted {
-		return s.publicationError(s.backing.Write(s.accountingContext(ctx, name), name, content))
-	}
-	stripe := &s.stripes[stripeOf(cleaned)]
-	stripe.Lock()
-	defer stripe.Unlock()
-
-	var held int64
-	switch attr, err := s.backing.Stat(ctx, name); {
-	case errors.Is(err, syscall.ENOENT):
-		// The write makes the file, so nothing is charged for the name yet. Whether it can
-		// be made where it was asked for is the write's own question.
-	case err != nil:
-		// The bytes cannot be charged against a size nobody could read, and a write that
-		// landed uncharged is the one direction the count may not err in.
-		return err
-	case attr.IsDir() || attr.Mode.Type() == fs.ModeSymlink:
-		// Neither is a node whose contents a write replaces — the contract answers EISDIR
-		// for one and ELOOP for the other, and a directory has no size to charge against
-		// in any case. Charging first would answer EDQUOT in place of the errno that says
-		// what is actually at the name.
-		return s.publicationError(s.backing.Write(ctx, name, content))
-	default:
-		held = attr.Size
-	}
-
-	delta := int64(len(content)) - held
-	charged, err := s.reserve(name, delta)
-	if err != nil {
-		return err
-	}
-	if err := s.backing.Write(ctx, name, content); err != nil {
-		if storage.IsPublicationAccountingUncertain(err) {
-			return s.publicationError(err)
-		}
-		s.release(charged)
-		return err
-	}
-	if delta < 0 {
-		s.release(-delta)
-	}
-	return nil
+	return s.publicationError(s.backing.Write(s.accountingContext(ctx, name), name, content))
 }
 
-// Remove credits the file's contents back, and only once the file is gone. Crediting first
-// would hand out room the volume has not released.
+// Remove credits bytes only when native publication releases their retention.
+// An unlinked file with live references remains charged until final cleanup.
 func (s *Storage) Remove(ctx context.Context, name string) error {
-	cleaned, err := storage.CleanPath(name)
-	if err != nil {
+	if _, err := storage.CleanPath(name); err != nil {
 		return &os.PathError{Op: "unlink", Path: name, Err: err}
 	}
 	s.gate.RLock()
@@ -581,39 +510,16 @@ func (s *Storage) Remove(ctx context.Context, name string) error {
 	if err := s.healthy(); err != nil {
 		return err
 	}
-	if s.accounted {
-		return s.publicationError(s.backing.Remove(s.accountingContext(ctx, name), name))
-	}
-	stripe := &s.stripes[stripeOf(cleaned)]
-	stripe.Lock()
-	defer stripe.Unlock()
-
-	// A node that could not be stat-ed, and a directory whose size means nothing, are both
-	// removed without a credit. Nothing is destroyed uncounted by that: removing a
-	// directory is EISDIR, and a removal that fails releases nothing. Where it does leave
-	// the count high — a file whose size the store could not report — high is the direction
-	// the count is allowed to err in.
-	attr, err := s.backing.Stat(ctx, name)
-	if err != nil || attr.IsDir() {
-		return s.publicationError(s.backing.Remove(ctx, name))
-	}
-	if err := s.backing.Remove(ctx, name); err != nil {
-		return s.publicationError(err)
-	}
-	s.release(attr.Size)
-	return nil
+	return s.publicationError(s.backing.Remove(s.accountingContext(ctx, name), name))
 }
 
-// Rename credits back whatever the move destroys. The bytes moved are charged already and
-// stay charged wherever they land, so a move over nothing, and a move onto the node
-// itself, both cost nothing.
+// Rename settles content reclaimed by replacement. A retained displaced file
+// keeps its charge until the native owner completes final-reference cleanup.
 func (s *Storage) Rename(ctx context.Context, from, to string) error {
-	cleanFrom, err := storage.CleanPath(from)
-	if err != nil {
+	if _, err := storage.CleanPath(from); err != nil {
 		return &os.LinkError{Op: "rename", Old: from, New: to, Err: err}
 	}
-	cleanTo, err := storage.CleanPath(to)
-	if err != nil {
+	if _, err := storage.CleanPath(to); err != nil {
 		return &os.LinkError{Op: "rename", Old: from, New: to, Err: err}
 	}
 	s.gate.RLock()
@@ -621,56 +527,8 @@ func (s *Storage) Rename(ctx context.Context, from, to string) error {
 	if err := s.healthy(); err != nil {
 		return err
 	}
-	if s.accounted {
-		return s.publicationError(s.backing.Rename(s.accountingContext(ctx, to), from, to))
-	}
-
-	// Both stripes, in index order. Two renames in opposite directions between the same
-	// pair of paths would otherwise each hold the one the other is waiting for.
-	first, second := stripeOf(cleanFrom), stripeOf(cleanTo)
-	if first > second {
-		first, second = second, first
-	}
-	s.stripes[first].Lock()
-	defer s.stripes[first].Unlock()
-	if second != first {
-		s.stripes[second].Lock()
-		defer s.stripes[second].Unlock()
-	}
-
-	// A move onto the node itself replaces nothing, so there is nothing to credit: POSIX
-	// has rename(2) "return successfully and perform no other action" when both names
-	// resolve to one directory entry, and the bytes at the destination are the same bytes
-	// that are still there afterwards. Crediting them would hand out room the volume
-	// never released, once for every time the move is repeated. Both names fall on one
-	// stripe here, which the ordering above already allows for.
-	//
-	// The move is still carried out beneath, because whether it is permitted at all is not
-	// ours to answer: naming the root either way is EBUSY, and a source that is not there
-	// is ENOENT.
-	if cleanFrom == cleanTo {
-		return s.publicationError(s.backing.Rename(ctx, from, to))
-	}
-
-	// As in Remove: a destination that could not be stat-ed and a destination that is a
-	// directory are both replaced without a credit, which can only leave the count high.
-	var replaced int64
-	if attr, err := s.backing.Stat(ctx, to); err == nil && !attr.IsDir() {
-		replaced = attr.Size
-	}
-	if err := s.backing.Rename(ctx, from, to); err != nil {
-		return s.publicationError(err)
-	}
-	s.release(replaced)
-	return nil
+	return s.publicationError(s.backing.Rename(s.accountingContext(ctx, to), from, to))
 }
-
-// The operations below move the count by nothing, and Create is the one worth saying so
-// about: it makes an empty file, which costs no bytes and is therefore never refused. The
-// bytes arrive later, through Write, and are charged there.
-//
-// They hold the gate for the reason every operation does, and they need no stripe, because
-// none of them reads a size and then charges against it.
 
 func (s *Storage) Stat(ctx context.Context, name string) (storage.Attr, error) {
 	s.gate.RLock()
@@ -684,7 +542,7 @@ func (s *Storage) SetAttr(ctx context.Context, name string, change storage.AttrC
 	if err := s.healthy(); err != nil {
 		return err
 	}
-	return s.publicationError(s.backing.SetAttr(s.mutationContext(ctx, name), name, change))
+	return s.publicationError(s.backing.SetAttr(s.accountingContext(ctx, name), name, change))
 }
 
 // CheckBounded refuses use as an embedded-server backend when the wrapped volume
@@ -730,7 +588,7 @@ func (s *Storage) Create(ctx context.Context, name string) error {
 	if err := s.healthy(); err != nil {
 		return err
 	}
-	return s.publicationError(s.backing.Create(s.mutationContext(ctx, name), name))
+	return s.publicationError(s.backing.Create(s.accountingContext(ctx, name), name))
 }
 
 func (s *Storage) Mkdir(ctx context.Context, name string) error {
@@ -739,7 +597,7 @@ func (s *Storage) Mkdir(ctx context.Context, name string) error {
 	if err := s.healthy(); err != nil {
 		return err
 	}
-	return s.publicationError(s.backing.Mkdir(s.mutationContext(ctx, name), name))
+	return s.publicationError(s.backing.Mkdir(s.accountingContext(ctx, name), name))
 }
 
 func (s *Storage) RemoveDir(ctx context.Context, name string) error {
@@ -748,5 +606,5 @@ func (s *Storage) RemoveDir(ctx context.Context, name string) error {
 	if err := s.healthy(); err != nil {
 		return err
 	}
-	return s.publicationError(s.backing.RemoveDir(s.mutationContext(ctx, name), name))
+	return s.publicationError(s.backing.RemoveDir(s.accountingContext(ctx, name), name))
 }

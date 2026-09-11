@@ -65,19 +65,16 @@ func TestShrinkingWriteReleasesQuotaOnlyAfterSuccessfulPublication(t *testing.T)
 	}
 }
 
-func TestFailedGrowthReleasesOnlyItsOwnReservation(t *testing.T) {
+func TestFailedNativePreparationReleasesOnlyItsOwnReservation(t *testing.T) {
 	backing := newBacking(t)
-	paused := newPausedWrite(backing, "a", syscall.EIO)
-	s := newStorageOver(t, paused, limited.MinLimit)
-	result := startPausedWrite(t, s, paused, t.Context(), content(2048))
+	refused := &refusedPreparation{BoundedStorage: backing, failure: syscall.EIO}
+	s := newStorageOver(t, refused, limited.MinLimit)
 	mustWrite(t, s, "b", 2048)
-	mustUse(t, s, limited.MinLimit)
-	if err := s.Write(t.Context(), "c", []byte{1}); !errors.Is(err, syscall.EDQUOT) {
-		t.Fatalf("growth beyond outstanding reservations returned %v, want EDQUOT", err)
+	if err := s.Write(t.Context(), "a", content(2048)); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("failed native preparation returned %v, want EIO", err)
 	}
-	paused.resume()
-	if err := <-result; !errors.Is(err, syscall.EIO) {
-		t.Fatalf("failed growth returned %v, want EIO", err)
+	if refused.prepares != 1 || refused.previous != 0 || refused.next != 2048 || refused.settlements != 1 || refused.result != storage.PublicationNotApplied {
+		t.Fatalf("native preparation/settlement = %+v, want one 0->2048 preparation unwound once as NotApplied", refused)
 	}
 	if _, err := backing.Stat(t.Context(), "a"); !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("failed growth left a target: %v", err)
@@ -89,6 +86,9 @@ func TestFailedGrowthReleasesOnlyItsOwnReservation(t *testing.T) {
 	mustUse(t, s, 2048)
 	mustWrite(t, s, "c", 2048)
 	mustUse(t, s, limited.MinLimit)
+	if err := s.Write(t.Context(), "d", []byte{1}); !errors.Is(err, syscall.EDQUOT) {
+		t.Fatalf("failed preparation released another file's charge: %v", err)
+	}
 	if err := s.Recount(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -212,4 +212,35 @@ func (s *pausedWrite) Write(ctx context.Context, name string, content []byte) er
 		}
 	}
 	return s.BoundedStorage.Write(ctx, name, content)
+}
+
+func (s *pausedWrite) CheckPublicationAccounting() error {
+	return checkDelegatedAccounting(s.BoundedStorage)
+}
+
+type refusedPreparation struct {
+	storage.BoundedStorage
+	failure               error
+	prepares, settlements int
+	previous, next        int64
+	result                storage.PublicationResult
+}
+
+func (s *refusedPreparation) CheckPublicationAccounting() error {
+	return checkDelegatedAccounting(s.BoundedStorage)
+}
+
+func (s *refusedPreparation) Write(ctx context.Context, name string, body []byte) error {
+	if name == "a" {
+		ctx = storage.WithPublicationAccounting(ctx, func(previous, next int64) (storage.PublicationSettlement, error) {
+			s.prepares++
+			s.previous, s.next = previous, next
+			return func(result storage.PublicationResult) error {
+				s.settlements++
+				s.result = result
+				return nil
+			}, s.failure
+		})
+	}
+	return s.BoundedStorage.Write(ctx, name, body)
 }

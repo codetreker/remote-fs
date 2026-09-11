@@ -25,7 +25,7 @@ Status: implemented
 | `packages/metastore` | `Store`：名字的树、节点的属性、路径到对象键的指向 |
 | `packages/metastore/sqlite` | 第一份 `Store` 实现，也提供绑定到 backing store ID 的打开方式 |
 
-本地磁盘实现的格式、持久化与组合所有权由[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)记录；[显式文件占有](./2026-09-07-file-locks.md)把 authority 绑定到 metastore 的原生最终发布。两者扩展这份两层结构，树与对象继续各自持有名字和字节。`limited` 保留为可复用的配额包装器，第三方 storage 继续按库契约接入。宿主目录形态的结束由[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)记录，下文涉及 `localdir` 的比较保留该决定发生时的理由。
+本地磁盘实现的格式、持久化与组合所有权由[本地磁盘对象存储](./2026-09-04-local-disk-object-store.md)记录；[显式文件占有](./2026-09-07-file-locks.md)把 authority 绑定到 metastore 的原生最终发布。两者扩展这份两层结构，树与对象继续各自持有名字和字节。`limited` 保留为可复用的配额包装器，第三方 storage 须提供有界结果与[原生最终发布计费](../bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)才能被包装。宿主目录形态的结束由[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)记录，下文涉及 `localdir` 的比较保留该决定发生时的理由。
 
 **写入的顺序是登记、上传、指过去。** `Reserve` 先在库里落一行「我要写这个键」并提交，然后字节被放到那个键下，最后 `Commit` 切换节点的 object 引用并在同一个事务里记账。路径操作在提交时解析实际节点，文件句柄直接使用已保留的节点身份。上传不占住强占有 authority；发布前对显式 proof、活动保护与期限作最终判定，匿名修改也受约束。最终许可与提交、持久确认和结果处置保持同一顺序，后继冲突权限与新的权威视图不能越过它。对象一经写入不再修改，已经捕获旧 node/object key 的读者可以在门外取得完整字节；后续句柄读取重新观察同一节点的当前状态。
 

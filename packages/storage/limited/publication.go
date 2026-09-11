@@ -10,16 +10,13 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// CheckPublicationAccounting reports whether byte accounting participates in the
-// backing volume's final publication. A legacy backend returns ENOSYS.
+// CheckPublicationAccounting checks this allowance's health and the backing
+// volume's native publication accounting.
 func (s *Storage) CheckPublicationAccounting() error {
-	if !s.accounted {
-		return syscall.ENOSYS
-	}
 	if err := s.healthy(); err != nil {
 		return err
 	}
-	return s.backing.(interface{ CheckPublicationAccounting() error }).CheckPublicationAccounting()
+	return s.backing.CheckPublicationAccounting()
 }
 
 // LockService returns the authority paired with the backing volume, or nil
@@ -56,13 +53,6 @@ func (s *Storage) publicationError(err error) error {
 		s.fault = err
 	}
 	return err
-}
-
-func (s *Storage) mutationContext(ctx context.Context, name string) context.Context {
-	if s.accounted {
-		return s.accountingContext(ctx, name)
-	}
-	return ctx
 }
 
 func (s *Storage) accountingContext(ctx context.Context, name string) context.Context {
