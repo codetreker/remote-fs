@@ -116,7 +116,7 @@ client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storag
 
 **强 S/X 控制接口**：显式创建 Session / Owner，解析现有普通文件，取得、续期、解除与核对 S/X 授予。修改只使用调用方给出的有界不可变 proof 集合，普通读取不声称 grant 有效。所有修改，包括匿名调用，都在原生最终转换处遵守占有顺序；重启通过持久最大时长证据与恢复屏障保留已确认保护。身份、动作结果、当前 grant 状态与内容版本分别定义，完整契约见 [文件锁设计](server/file-locks.md)。
 
-**HTTP 接口**：跨角色的实际边界。v3 转发基础 storage、保留文件、advisory 与显式 S/X 控制及复制的订阅、续订、快照，并必须满足：
+**HTTP 接口**：跨角色的实际边界。v3 转发基础 storage、保留文件、advisory 与显式 S/X 控制及复制的订阅、续订、快照和 checkpoint，并必须满足：
 
 | 义务 | 违反的后果 |
 |---|---|
@@ -129,9 +129,11 @@ client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storag
 | 复制帧在 metastore 载入变长字段前取得单帧预算；change/start 与 snapshot cursor 的总量分别由 stream 数推导，snapshot page 另有限制 operation、aggregate retained bytes 与等待者的 admission | wire 端的晚检查挡不住 backend 已经建立的超限 page，多条流还能把各自有界的结果累积成无界总量（R-INT-3） |
 | 每种答案的形状是确定的：缺席的属性、缺席的列表、不是 object 的 mutation response、以及 null/畸形/未知字段的 barrier 都不是这个协议的答案 | 一个零值的属性读起来是「1970 年的空文件」，一个缺席的列表读起来是「这个目录是空的」，一个假的 barrier 会让副本过早确认已经发生的修改 |
 | 复制那三个操作与请求／响应分在不同的连接上，且一次变更抵达一个健康订阅者的耗时与并发的批量传输无关 | 一次快照 —— 系统里最大的一次批量传输 —— 挤掉自己的事件通道，后果是重新拉一份快照，而触发它只需要一次正常的冷挂载 |
-| 不记变更日志的 volume 在通过已启用的授权后以 `ENOSYS` 拒绝这三个操作，不回空流或无行快照 | 一份「存在、是空的、永不改变」的 volume，而这是一个副本会相信的答案 |
+| 不记变更日志的 volume 在通过已启用的授权后以 `ENOSYS` 拒绝三个流操作和 checkpoint，不回空流、无行快照或虚构位置 | 一份「存在、是空的、永不改变」的 volume，而这是一个副本会相信的答案 |
 
 授权在受控数据、capability 与动作历史被访问前执行；通用传输容量限制仍可先拒绝请求。持续输出在开始、续订和每个数据／控制／保活单元前检查当前策略。拒绝只说明本次未准入，不说明此前结果未知的动作未执行；策略变化不能回滚已准入修改或撤回已交付数据。完整映射与协议由[业务授权](server/authorization.md)拥有。
+
+Checkpoint 是普通有界读取：原子返回日志 incarnation 与已提交位置，不创建订阅、不修改 volume。它与 mutation response 复用 `httprest.MutationBarrier`；构建从快照之后捕获这一固定目标，后续写入仍由原事件流传播。
 
 client 侧的 remote storage 实现 storage 接口，凡是不满足上述任何一条的答案，它一律以 `EIO` 报告，绝不把它变成一句关于 volume 的话。
 
@@ -143,7 +145,7 @@ client 侧的 remote storage 实现 storage 接口，凡是不满足上述任何
 
 副本只有名字、类型、属性和大小，不复制文件内容。打开只取得对象引用，字节在每次 ReadAt 时读取。
 
-server 每个 volume 记一条有序的变更日志，位置与树的改动在同一个事务里分配；client 先订阅、再取一次一致性快照，此后由流喂着。副本在观测到流断开时整份作废，到达 replicated storage 的操作以 EIO 失败，没有过期时间或基于间隔的刷新。本地副本在读写阶段之间交接，持续查询不能让已登记的更新一直等待读者空闲；快照重建过早恢复作答的缺口仍会使健康连接上的查询返回旧元数据，见 [client 设计](client/architecture.md#二元数据查询来自本地副本)。
+server 每个 volume 记一条有序的变更日志，位置与树的改动在同一个事务里分配；client 先订阅、再取一次一致性快照，此后由流喂着。副本在观测到流断开时整份作废，到达 replicated storage 的操作以 EIO 失败，没有过期时间或基于间隔的刷新。本地副本在读写阶段之间交接，持续查询不能让已登记的更新一直等待读者空闲；首次构建与重建在快照 EOF 后读取固定 checkpoint，并用原订阅回放到该位置才恢复作答，见 [client 设计](client/architecture.md#二元数据查询来自本地副本)。
 
 于是跨机器的可见性不依赖轮询：一台机器上的提交完成之后，那条变更走事件流到达另一台机器，`stat` 就看得到（R-CON-1、R-CON-2）。对 metastore-backed volume，成功的 mutation response 携带一次原子读取的 `(incarnation, committed position)` barrier；replicated client 等到同一代副本的位置不小于它才返回。barrier 可以因并发提交而晚于本次 mutation，但不早于它，因此写完立刻 `stat` 得到的是至少包含这次修改的大小与时间（R-CON-4）。
 
@@ -175,7 +177,7 @@ remote-fs ──▶ 建立 remote storage，先访问一次根，确认 server �
           ──▶ 收到 SIGINT／SIGTERM ──▶ 拆除挂载
 ```
 
-挂载与卸载是频繁的日常操作（R-WS-2）。冷挂载时本地**无任何既有状态**（R-WS-3）——但它要建立一份：一个私有目录、一个 SQLite 副本、一条订阅，以及一份灌满整棵树的快照，**灌完之前挂载点不可用**。R-WS-4（冷挂载后必须迅速可用）因此被知情推后，理由与代价见[元数据复制](../../.agents/notes/implemented/architecture/2026-08-27-metadata-replication.md)。内核退出后先排空 FileSession，再关闭副本并删除其目录；失败保留清理错误与未释放资源。失败的 Unmount 不停止文件会话续期。
+挂载与卸载是频繁的日常操作（R-WS-2）。冷挂载时本地**无任何既有状态**（R-WS-3）——但它要建立一份：一个私有目录、一个 SQLite 副本、一条订阅，以及一份灌满整棵树的快照；快照结束后还需用原订阅追到新捕获的固定 checkpoint，**完成这个门槛之前挂载点不可用**。R-WS-4（冷挂载后必须迅速可用）因此被知情推后，理由与代价见[元数据复制](../../.agents/notes/implemented/architecture/2026-08-27-metadata-replication.md)。内核退出后先排空 FileSession，再关闭副本并删除其目录；失败保留清理错误与未释放资源。失败的 Unmount 不停止文件会话续期。
 
 ## 六、部署形态
 

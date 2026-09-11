@@ -76,7 +76,15 @@ GrantStatus 的剩余时间由服务端对未取整的 deadline 与 now 求差�
 
 普通文件的 Open 与 Create 返回 `FOPEN_DIRECT_IO`。文件读取经过挂载层的健康检查与 `File.ReadAt`，不让同一 inode 的页缓存把旧 handle 内容交给新 handle。属性与返回区间来自同一次权威读取；direct I/O 不承诺共享 mmap 的完整行为。
 
-副本以变更流的连续观察状态决定是否作答：流被观测为断开时作废，需要连续副本视图的操作以 EIO 失败（R-ERR-1、R-ERR-2）。没有过期时间或回源校验。续订在追到 opening tail 后恢复可用；快照重建却在灌完快照后立即恢复可用，积压仍未追上，详见[重建副本等待重放](../../../.agents/notes/proposed/bug-fix/2026-09-07-gate-rebuilt-replicas-on-replay.md)。
+副本以变更流的连续观察状态决定是否作答：流被观测为断开时作废，需要连续副本视图的操作以 EIO 失败（R-ERR-1、R-ERR-2）。没有过期时间或逐查询回源校验。普通续订在追到 opening tail 后恢复可用；首次构建与全量重建使用[快照后的固定回放目标](../../../.agents/notes/implemented/bug-fix/2026-09-07-gate-rebuilt-replicas-on-replay.md)。
+
+构建先保留原订阅，再逐页写入快照。客户端读到 snapshot 的语义 EOF 后，先关闭该 HTTP 响应释放连接，再调用 Checkpoint 取得新鲜的 `(incarnation, committed position)`。快照位置不得早于原订阅的 opening tail；checkpoint 不得早于快照，且其 incarnation 必须与原订阅一致。snapshot 只报告捕获位置；incarnation 一致性由 checkpoint 与原订阅核对。
+
+本地 Seeding.Complete 成功后记录已安装的快照位置，唯一的 reader 随后沿原订阅丢弃已包含的事件、应用快照之后的事件，直到达到或超过固定 checkpoint。位置允许跳跃，不要求逐整数相邻；零位置且已达到目标时不等待一条不存在的事件。Complete 与每次 Apply 的成功位置都会在内部推进，即使副本仍以 EIO 拒绝查询；中途失败后的续订以已提交树的位置继续，而不是沿用更早的公开状态。最终追平前不清除失败状态。
+
+`Options.ReplayTimeout` 必须为正，DefaultOptions 取十秒，从客户端观察到 snapshot EOF 时起覆盖响应关闭、Checkpoint、Complete 和目标回放。订阅握手与快照传输在这段预算之前，仍受各自 context 与既有边界约束。独立 CLI 继承此默认值；mutation 的 ConfirmationGrace 保持独立。超时、取消、流错误、化身不符或位置不相容使 gate 以 EIO 失败并保留原因；Checkpoint 的 ENOSYS 也不能被当作“不提供复制”而降级为直接模式。
+
+构建的 Snapshot 与 Checkpoint 保留调用方 context 值；原订阅属于 storage lifetime 的子 context，构建期间临时关联调用方取消。失败由 reader 关闭订阅，取消回调只发出取消，不与 reader 并发 Close。成功前解除并等待临时取消关联，再确认构建与 lifetime 仍有效，最后恢复查询；成功返回后取消原构建 context 不切断订阅。固定目标之后的修改由正常 follower 接续，不移动目标追逐每个未来提交，也不把这一门槛描述为全局即时新鲜度证明。
 
 SQLite replica 的 `Stat`、`List`、`ListBounded` 先取得 SQL 读取名额，再进入共享读阶段。名额数与 reader pool 使用同一份 `Options.MaxReaderConnections`，默认 16；等待名额的调用不持有读阶段。两次等待都接受调用 context，等阶段失败时归还名额；查询结束时先退出阶段，再归还名额。`Position` 不查询 SQLite，使用无取消的共享阶段，不占 SQL 名额。
 
@@ -84,7 +92,7 @@ SQLite replica 的 `Stat`、`List`、`ListBounded` 先取得 SQL 读取名额，
 
 **「流一断」是被观测到的，不是被假定的。** 服务端在无话可说时按固定间隔发一行心跳，这一层给「一个字节都没来」设一个数倍于心跳的上限，超限与流上任何一次失败走同一条路。没有这条，一条被切断的 TCP 与一个安静的 volume 是同一个观测结果 —— 沉默 —— 而副本会一直答下去，且没有时间上界。上限压在**正在等的那次读**上而不是压在连接上，因为首次同步期间没有人读变更流；计时由**字节**重置而不是由帧重置，因为一个快照分页可以是一整行一兆字节。
 
-这份副本因此不是缓存。server 提供 change log 时，每个会产生日志的 mutation 在发出请求前先 admission 一条 fixed-size confirmation record，不保留 target path、direction 或 touched-name history。`ConfirmationGrace`、`MaxActiveConfirmations` 与 `MaxWaitingConfirmations` 默认分别为 10 秒、64 与 64；`remote-fs` 用 `-confirmation-grace`、`-max-active-mutation-confirmations` 与 `-max-waiting-mutation-confirmations` 暴露同一组设置。active 名额不足时有限等待；请求尚未发出时，纯调用方取消为 `EINTR`、deadline 为 `EIO`，实际容量饱和或 storage 开始关闭则以 `EAGAIN` 拒绝，原始原因被保留。server 以 `ENOSYS` 表明没有 change log 时不建立副本，也不保留 confirmation state。
+这份副本因此不是缓存。server 提供 change log 时，每个会产生日志的 mutation 在发出请求前先 admission 一条 fixed-size confirmation record，不保留 target path、direction 或 touched-name history。`ConfirmationGrace`、`MaxActiveConfirmations` 与 `MaxWaitingConfirmations` 默认分别为 10 秒、64 与 64；`remote-fs` 用 `-confirmation-grace`、`-max-active-mutation-confirmations` 与 `-max-waiting-mutation-confirmations` 暴露同一组设置。active 名额不足时有限等待；请求尚未发出时，纯调用方取消为 `EINTR`、deadline 为 `EIO`，实际容量饱和或 storage 开始关闭则以 `EAGAIN` 拒绝，原始原因被保留。规范的 `ENOSYS` 表明不提供复制时不建立副本，也不保留 confirmation state。snapshot EOF 后的 checkpoint／回放门错误统一为 EIO，即使原因链包含 ENOSYS，也不能触发无副本模式。
 
 mutation 成功后，replicated client 从严格验证过的 response 取得 `(incarnation, position)` barrier，把它与当前 replica incarnation/generation 对齐，再等待本地 position 达到或越过它。event 先于 HTTP response 到达时当前位置已经足够，立即完成；另一个 writer 的较早 change 不能误确认本次 mutation，因为 barrier 不早于本次 commit。stream rebuild 改变 generation、barrier incarnation 不匹配、stream failure、调用方取消、storage 关闭或 grace 到期都以 `EIO` 报告「volume 已改变但本地副本无法确认」。失败只结束该调用，不把仍连续的 stream 单独判坏；迟到事件仍按 change-log 顺序应用。空 attribute change 与 rename onto itself 不产生日志，仍发送给 server 取得 pathname 的权威结果，但不预留或等待 barrier。
 

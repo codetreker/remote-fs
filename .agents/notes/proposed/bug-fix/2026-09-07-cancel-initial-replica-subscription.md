@@ -12,7 +12,7 @@ Status: proposed
 
 在构建成功前，让首次订阅的建连和握手响应调用方取消；构建成功后，持续订阅由 storage 生命周期持有。明确交接点，保证调用方在 `New` 成功后取消原 context 不会切断正常订阅。
 
-本项补足[元数据复制](../../implemented/architecture/2026-08-27-metadata-replication.md)的初始化生命周期；[重建回放条件](2026-09-07-gate-rebuilt-replicas-on-replay.md)独立验收。
+本项补足[元数据复制](../../implemented/architecture/2026-08-27-metadata-replication.md)的初始化生命周期；[重建回放条件](../../implemented/bug-fix/2026-09-07-gate-rebuilt-replicas-on-replay.md)独立验收。
 
 ## 备选方案
 

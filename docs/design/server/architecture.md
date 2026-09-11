@@ -52,6 +52,7 @@ volume、保留文件与显式占有的权威持有者。将原生 storage 与�
 | `Subscribe` | `GET /v3/subscribe` | 无 | — |
 | `Resubscribe` | `GET /v3/resubscribe` | `incarnation`、`position` | — |
 | `Snapshot` | `GET /v3/snapshot` | 无 | — |
+| `Checkpoint` | `GET /v3/checkpoint` | 无 | — |
 | 保留文件数据 | `POST /v3/file` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带 session/file 能力与参数 |
 | 文件会话与 advisory 控制 | `POST /v3/file-control` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带原动作身份及 owner |
 
@@ -150,6 +151,12 @@ client 的 `DialOptions.MaxFrameBytes` 默认也是 8 MiB，逐 stream 限制 sc
 SQLite metastore 把普通 volume/log read 与长期 snapshot 放进两个 reader pool，避免慢 snapshot 占完普通操作与 event catch-up 能用的 connection。`MaxReaderConnections` 与 `MaxSnapshotReaderConnections` 默认各为 16；各自池满时读取等待 connection，并遵从对应 request/snapshot context 取消。snapshot 并发上限限制打开的读事务数，snapshot reader pool 限制数据库为它们持有的物理 connection 数，两者保持独立。普通读取只在启动 transaction 并以对 `database_state` 的常量查询钉住 SQLite snapshot 时持有 database health gate，page 扫描和 caller-owned result accounting 不继续占着 mutation commit/Accept 所需的 gate。
 
 **订阅者是被唤醒的，不是被投喂的。** 每一次改动了 volume 的请求在答复之前唤醒所有订阅，被唤醒的订阅自己去读日志。于是「追上」与「跟上」是同一条代码路径，不可能对「一条变更是什么」有两种说法；也没有任何一处等待间隔（R-CON-2）。mutation 成功后，handler 再用 `Log.Barrier` 在 mutation response 的 incarnation budget 下原子读取 log incarnation 与 committed position；并发 mutation 可以让 position 更晚，但同一事务记录本次修改保证它不会更早。barrier 读取失败发生在 volume 已改变之后，以 `EIO` 返回且不伪装成未修改。两种随附 server 都通过数据库原生 EX 所有权维持单一活跃写入方；另一个绕过该所有权的 server 无法提供保留文件能力。detached 文件修改不产生路径日志，但文件操作的成功 response 仍可读取当前 barrier，确认不依赖虚构一个名字。
+
+### 快照后的 checkpoint
+
+`httprest.Storage.Checkpoint(ctx)` 通过 `GET /v3/checkpoint` 取得原子日志水位。响应是现有 MutationBarrier 的裸 `{incarnation,position}` object，和成功修改回复里的 barrier 使用同一 identity／position 验证；它不代表某个特定修改。请求不带操作数或 body，client／server 都使用普通请求响应预算、协议标记与封闭 errno 检查。
+
+handler 先按 `storage.OpReplicationCheckpoint` 授权，再调用纯 `Log.Barrier`；缺少 Log 在允许之后返回 ENOSYS。该读取不调用 storage mutation，不唤醒 publisher，不分配订阅、snapshot 或 page 名额。快照响应先关闭再发出 checkpoint，构建因此只需要原订阅和另一条普通 HTTP 连接。client 持续使用原订阅追到固定水位，构建状态由[client 设计](../client/architecture.md#二元数据查询来自本地副本)拥有。
 
 ## 六、请求与响应的内存边界
 

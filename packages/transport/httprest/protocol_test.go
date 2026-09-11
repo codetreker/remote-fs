@@ -45,7 +45,7 @@ func allOps() []httprest.Op {
 		httprest.OpStat, httprest.OpSetAttr, httprest.OpList, httprest.OpRead,
 		httprest.OpWrite, httprest.OpCreate, httprest.OpMkdir, httprest.OpRemove,
 		httprest.OpRemoveDir, httprest.OpRename, httprest.OpSpace,
-		httprest.OpSubscribe, httprest.OpResubscribe, httprest.OpSnapshot,
+		httprest.OpSubscribe, httprest.OpResubscribe, httprest.OpSnapshot, httprest.OpCheckpoint,
 	}
 }
 
@@ -68,7 +68,7 @@ func TestRequestSurvivesURLRoundTrip(t *testing.T) {
 			for _, to := range awkwardPaths {
 				want := httprest.Request{Op: op}
 				switch op {
-				case httprest.OpSpace, httprest.OpSubscribe, httprest.OpSnapshot:
+				case httprest.OpSpace, httprest.OpSubscribe, httprest.OpSnapshot, httprest.OpCheckpoint:
 					// These take no operands, so they have nothing a URL could damage.
 				case httprest.OpResubscribe:
 					// A resume point rather than a path: an incarnation is opaque and may
@@ -194,7 +194,7 @@ func TestSpaceIsAddressedWithNoOperands(t *testing.T) {
 func TestMethods(t *testing.T) {
 	reads := map[httprest.Op]bool{
 		httprest.OpStat: true, httprest.OpList: true, httprest.OpRead: true, httprest.OpSpace: true,
-		httprest.OpSubscribe: true, httprest.OpResubscribe: true, httprest.OpSnapshot: true,
+		httprest.OpSubscribe: true, httprest.OpResubscribe: true, httprest.OpSnapshot: true, httprest.OpCheckpoint: true,
 	}
 	for _, op := range allOps() {
 		want := http.MethodPost

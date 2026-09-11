@@ -338,9 +338,10 @@ func (r *SpaceResponse) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// MutationBarrier identifies a log position at or after a successful mutation. Waiting
-// until a replica of the same incarnation has applied through Position establishes
-// read-after-write visibility without guessing which change record the mutation produced.
+// MutationBarrier is an atomic log incarnation and committed position. Mutation replies
+// capture it at or after the successful change; Checkpoint captures it without a change.
+// Waiting until a replica of the same incarnation has applied through Position establishes
+// visibility through that point without identifying any particular change record.
 type MutationBarrier struct {
 	Incarnation string `json:"incarnation"`
 	Position    int64  `json:"position"`

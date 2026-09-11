@@ -44,6 +44,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `replication.subscribe` | `/v3/subscribe` | 开始订阅及该订阅后续输出 |
 | `replication.resubscribe` | `/v3/resubscribe` | 按游标续订及其后续输出 |
 | `replication.snapshot` | `/v3/snapshot` | 捕获快照及发送整份快照 |
+| `replication.checkpoint` | `/v3/checkpoint` | 读取日志化身与已提交位置 |
 | `file.session-open` | `/v3/file`，`file.session-open` | 建立 FileSession |
 | `file.status` | `/v3/file-control`，`file.status` | 查询 FileSession 状态与历史边界 |
 | `file.renew` | `/v3/file-control`，`file.renew` | 续期 FileSession |
@@ -80,6 +81,8 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `lock.query-grant` | `/v3/lock-query-grant` | 查询 grant 当前状态 |
 | `lock.status` | `/v3/lock-status` | 查询授权方状态 |
 
+
+副本构建还需要 replication.checkpoint 的明确许可；允许订阅或快照不隐含这项权限。Checkpoint 是一次普通读取，遵循入口授权、通用传输预算和安全错误规则，不建立持续输出。
 
 `FileOpenOptions` 嵌入共享的 `storage.OpenAccess`，其 Read、Write、Create、Truncate、Exclusive 与 AccessRequest.Open 是同一类型。Open 的合法性仍由 FileOpenOptions.Check／CheckNode 连同 mode、节点身份验证。AccessRequest.Open 仅在 file.open／file.open-node 携带这份已验证的值，其它操作为零值；open-node 不接受 Create／Exclusive。带 Create 的打开即使最终打开已有文件，也报告创建意图。一次入口 callback 同时决定全部打开意图，允许之后才创建、截断或分配文件引用。
 

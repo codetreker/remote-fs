@@ -807,6 +807,7 @@ func bodylessRequests() []httprest.Request {
 		{Op: httprest.OpSubscribe},
 		{Op: httprest.OpResubscribe, Incarnation: "log", Position: 1},
 		{Op: httprest.OpSnapshot},
+		{Op: httprest.OpCheckpoint},
 	}
 }
 

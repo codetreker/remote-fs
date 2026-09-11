@@ -20,6 +20,7 @@ const (
 	OpReplicationSubscribe   Operation = "replication.subscribe"
 	OpReplicationResubscribe Operation = "replication.resubscribe"
 	OpReplicationSnapshot    Operation = "replication.snapshot"
+	OpReplicationCheckpoint  Operation = "replication.checkpoint"
 	OpFileSessionOpen        Operation = "file.session-open"
 	OpFileStatus             Operation = "file.status"
 	OpFileRenew              Operation = "file.renew"

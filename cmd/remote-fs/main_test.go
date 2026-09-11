@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -454,6 +456,44 @@ func TestNothingIsLeftBehindWhenTheCopyIsNotBuilt(t *testing.T) {
 		}
 		if !strings.Contains(said.String(), "keeps no record") {
 			t.Fatalf("nothing said that this volume is not being copied, so nobody watching would know every operation is a request:\n%s", said)
+		}
+	})
+
+	t.Run("checkpoint unsupported after snapshot is not a logless server", func(t *testing.T) {
+		_, handler := replicableVolume(t)
+		var snapshots, checkpoints atomic.Int32
+		url := listenOn(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case httprest.Prefix + string(httprest.OpSnapshot):
+				snapshots.Add(1)
+			case httprest.Prefix + string(httprest.OpCheckpoint):
+				checkpoints.Add(1)
+				w.Header().Set(httprest.HeaderProtocol, httprest.Version)
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				if err := json.NewEncoder(w).Encode(httprest.ErrorResponse{Errno: "ENOSYS", Message: "checkpoint is unavailable"}); err != nil {
+					t.Error(err)
+				}
+				return
+			}
+			handler.ServeHTTP(w, r)
+		}))
+		where := t.TempDir()
+		said := &transcript{}
+		served, release, err := replicate(t.Context(), dial(t, url), where, said)
+		if release != nil {
+			defer release()
+		}
+		if served != nil || release != nil || storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, syscall.ENOSYS) {
+			t.Fatalf("checkpoint failure returned served=%v release=%v err=%v, want failed setup with EIO and original ENOSYS", served, release != nil, err)
+		}
+		if snapshots.Load() != 1 || checkpoints.Load() != 1 {
+			t.Fatalf("snapshot/checkpoint requests = %d/%d, want 1/1", snapshots.Load(), checkpoints.Load())
+		}
+		if strings.Contains(said.String(), "keeps no record") {
+			t.Fatalf("failed replay gate was described as a logless server: %s", said)
+		}
+		if left := entriesIn(t, where); len(left) != 0 {
+			t.Fatalf("failed checkpoint left replica files behind: %v", left)
 		}
 	})
 

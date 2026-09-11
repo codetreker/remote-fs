@@ -21,6 +21,7 @@ func TestOperationConstantsIdentifyDistinctSemanticActions(t *testing.T) {
 		storage.OpReplicationSubscribe:   "replication.subscribe",
 		storage.OpReplicationResubscribe: "replication.resubscribe",
 		storage.OpReplicationSnapshot:    "replication.snapshot",
+		storage.OpReplicationCheckpoint:  "replication.checkpoint",
 		storage.OpFileSessionOpen:        "file.session-open",
 		storage.OpFileStatus:             "file.status",
 		storage.OpFileRenew:              "file.renew",
@@ -57,8 +58,8 @@ func TestOperationConstantsIdentifyDistinctSemanticActions(t *testing.T) {
 		storage.OpLockQueryGrant:         "lock.query-grant",
 		storage.OpLockStatus:             "lock.status",
 	}
-	if len(cases) != 49 {
-		t.Fatalf("operation vocabulary has %d entries, want49", len(cases))
+	if len(cases) != 50 {
+		t.Fatalf("operation vocabulary has %d entries, want 50", len(cases))
 	}
 	for operation, want := range cases {
 		if string(operation) != want {

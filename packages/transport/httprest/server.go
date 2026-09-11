@@ -350,6 +350,18 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) 
 		}
 		h.writeJSON(w, http.StatusOK, SpaceResponse{Space: SpaceOf(space)})
 
+	case OpCheckpoint:
+		if h.log == nil {
+			h.writeOperationError(w, syscall.ENOSYS)
+			return
+		}
+		barrier, err := h.mutationBarrier(ctx)
+		if err != nil {
+			h.writeOperationError(w, err)
+			return
+		}
+		h.writeJSON(w, http.StatusOK, barrier)
+
 	case OpSubscribe:
 		h.serveEvents(w, r, nil)
 	case OpResubscribe:

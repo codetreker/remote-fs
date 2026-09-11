@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"syscall"
 	"time"
@@ -20,88 +19,31 @@ import (
 // What it bounds is how fast a server that is not there is dialled.
 const reconnectDelay = 250 * time.Millisecond
 
-// build attaches to the stream and fills the copy from one picture of the tree.
-//
-// The subscription is opened against the lifetime rather than against the caller's context.
-// It outlives the call that opened it — the mount is what it belongs to — and a caller whose
-// context is cancelled a moment later would otherwise sever the stream the copy is fed by.
-func (s *Storage) build(ctx context.Context) (*httprest.Subscription, error) {
-	sub, err := s.remote.Subscribe(s.lifetime)
-	if err != nil {
-		return nil, fmt.Errorf("watching the volume for changes: %w", err)
-	}
-	if err := s.fill(ctx, sub); err != nil {
-		sub.Close()
-		return nil, err
-	}
-	return sub, nil
-}
-
-// fill empties the copy and puts one consistent picture of the tree into it.
-//
-// Nothing reads the stream while the picture is taken, and nothing needs to. The changes
-// recorded meanwhile queue on the connection the subscription is already holding, in the
-// order the log recorded them, and they are read once the picture is in place: the ones at or
-// before its position are discarded, the ones after it are applied. Holding them in a buffer
-// here instead would be a second queue in front of that one, with a size to choose and a
-// failure of its own on the day it was reached.
-//
-// Because the picture is a cut at a single position, no bookkeeping per node is needed to
-// tell which changes it already contains: at or before that position is in the picture, after
-// it is not. That is also what makes a rename in the stream certain to find its source — so
-// there is deliberately no rule here that treats a rename with a missing source as nothing to
-// do. A rule like that would be relied upon within a week of existing.
-func (s *Storage) fill(ctx context.Context, sub *httprest.Subscription) error {
-	snap, err := s.remote.Snapshot(ctx)
-	if err != nil {
-		return fmt.Errorf("taking a picture of the volume's tree: %w", err)
-	}
-	defer snap.Close()
-
-	seeding, err := s.local.Reseed(ctx)
-	if err != nil {
-		return fmt.Errorf("emptying the local copy: %w", err)
-	}
-	defer seeding.Close()
-
-	for {
-		rows, err := snap.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("reading the picture of the volume's tree: %w", err)
-		}
-		if err := seeding.Add(ctx, rows); err != nil {
-			return fmt.Errorf("putting the picture into the local copy: %w", err)
-		}
-	}
-	if err := seeding.Complete(ctx, snap.Position()); err != nil {
-		return fmt.Errorf("putting the picture into the local copy: %w", err)
-	}
-	s.seeded(sub.Incarnation(), snap.Position())
-	return nil
-}
-
 // follow keeps the copy current for as long as the mount lasts.
-func (s *Storage) follow(sub *httprest.Subscription) {
+func (s *Storage) follow(sub *httprest.Subscription, release context.CancelFunc) {
 	defer close(s.stopped)
 	for {
-		s.fail(s.attend(sub))
+		s.fail(s.attend(sub, release))
 		if s.lifetime.Err() != nil {
 			return
 		}
-		next := s.reattach()
+		next, nextRelease := s.reattach()
 		if next == nil {
 			return
 		}
 		sub = next
+		release = nextRelease
 	}
 }
 
 // attend applies what arrives until nothing does, and reports what ended it.
-func (s *Storage) attend(sub *httprest.Subscription) error {
-	defer sub.Close()
+func (s *Storage) attend(sub *httprest.Subscription, release context.CancelFunc) error {
+	defer func() {
+		if release != nil {
+			release()
+		}
+		sub.Close()
+	}()
 	for {
 		change, err := sub.Next()
 		if err != nil {
@@ -130,22 +72,22 @@ func (s *Storage) attend(sub *httprest.Subscription) error {
 // is here is not a copy of anything any more, because the changes between what it holds and
 // what the log can supply are gone. It is replaced by a fresh picture, exactly as at the
 // first mount.
-func (s *Storage) reattach() *httprest.Subscription {
+func (s *Storage) reattach() (*httprest.Subscription, context.CancelFunc) {
 	for {
 		if !s.pause() {
-			return nil
+			return nil, nil
 		}
 		incarnation, at := s.watching()
 		sub, err := s.remote.Resubscribe(s.lifetime, incarnation, at)
 		if err == nil {
 			s.resumed(sub.Incarnation(), sub.Tail())
-			return sub
+			return sub, nil
 		}
 		var rebuild *httprest.RebuildError
 		if errors.As(err, &rebuild) {
-			rebuilt, buildErr := s.build(s.lifetime)
+			rebuilt, release, buildErr := s.build(s.lifetime)
 			if buildErr == nil {
-				return rebuilt
+				return rebuilt, release
 			}
 			err = fmt.Errorf("%w, and building it again failed: %w", rebuild, buildErr)
 		}
@@ -170,8 +112,31 @@ func (s *Storage) pause() bool {
 
 // --- what the copy is worth right now ------------------------------------------------------
 
-// seeded records a copy that has just been filled from a picture: it stands at that position,
-// in that run of history, and may be answered from.
+// installed keeps the cursor aligned with a committed snapshot while its replay
+// gate remains closed. The fixed target can equal at, including zero; successful
+// cancellation handoff still precedes making the copy available.
+func (s *Storage) installed(incarnation metastore.Incarnation, at, target metastore.Position) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.incarnation != incarnation {
+		s.generation++
+	}
+	s.incarnation, s.at, s.behind = incarnation, at, target
+	s.failure = fmt.Errorf("the snapshot at %d is being replayed through checkpoint %d", at, target)
+	s.wake()
+}
+
+// replayed records an applied gate change without opening the gate. Ordinary
+// resumed streams use applied, whose final replay change can restore availability.
+func (s *Storage) replayed(change metastore.Change) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.at = change.Position
+	s.wake()
+}
+
+// seeded makes a completely installed and replayed snapshot available after its
+// temporary cancellation links have been detached and joined.
 func (s *Storage) seeded(incarnation metastore.Incarnation, at metastore.Position) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

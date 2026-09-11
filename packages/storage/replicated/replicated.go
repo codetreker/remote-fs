@@ -84,19 +84,17 @@ type Storage struct {
 
 	mu sync.Mutex
 
-	// failure is what ended the stream, and is nil for as long as the stream is alive. While
-	// it is set the copy may not be answered from at all.
+	// failure remains set through snapshot replay or resumption, and whenever the
+	// stream stops. While it is set the copy may not be answered from at all.
 	failure error
 
 	// at is how far the copy has been brought, mirrored here so mutation confirmation reads
 	// it in the same critical section that records what has arrived.
 	at metastore.Position
 
-	// behind is the position a resumed stream said the log had reached, while the copy has
-	// not reached it yet. It is zero when the copy is current. Between the two the copy is
-	// knowingly missing changes and may not be answered from, which is what separates being
-	// behind by what is in flight — ordinary, and true at every moment — from being behind
-	// by an outage the log has just described.
+	// behind is the fixed replay target for a snapshot gate or resumed stream.
+	// failure also covers a snapshot gate at zero and its cancellation handoff;
+	// reaching behind alone cannot make a newly installed snapshot usable.
 	behind metastore.Position
 
 	// notify is closed and replaced whenever a waiter's answer may have changed: a change
@@ -122,10 +120,10 @@ var _ storage.BoundedStorage = (*Storage)(nil)
 
 // New builds a copy of the volume at remote in local, and returns once it is usable.
 //
-// It blocks. There is no pass-through mode here and no degraded one: until the copy has been
-// filled there is nothing to answer from, and a mount that answered anyway would be
-// answering from an empty tree. A failure names the step that failed, because "the mount did
-// not come up" is not something an operator can act on.
+// It blocks until the captured tree has been installed and replayed through a checkpoint
+// obtained after snapshot delivery. The copy cannot answer queries before that point.
+// A failure names the step that failed, because "the mount did not come up" is not something
+// an operator can act on.
 //
 // The order is subscribe, then take the picture, and it is not interchangeable. The reverse
 // — take the picture, then subscribe from the position it was taken at — does not converge:
@@ -150,7 +148,8 @@ func NewWithConfirmationGrace(ctx context.Context, local *sqlite.Replica, remote
 	return NewWithOptions(ctx, local, remote, options)
 }
 
-// NewWithOptions is New with explicit bounds for mutation confirmation resources.
+// NewWithOptions is New with explicit bounds for snapshot replay, mutation
+// confirmation resources and file-session ownership.
 func NewWithOptions(ctx context.Context, local *sqlite.Replica, remote *httprest.Storage, options Options) (*Storage, error) {
 	if err := options.Check(); err != nil {
 		return nil, err
@@ -171,12 +170,12 @@ func NewWithOptions(ctx context.Context, local *sqlite.Replica, remote *httprest
 		failure:              errors.New("the copy of this volume has not been built yet"),
 	}
 
-	sub, err := s.build(ctx)
+	sub, release, err := s.build(ctx)
 	if err != nil {
 		stop()
 		return nil, err
 	}
-	go s.follow(sub)
+	go s.follow(sub, release)
 	return s, nil
 }
 
