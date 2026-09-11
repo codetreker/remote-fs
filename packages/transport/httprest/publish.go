@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/metastore"
 )
 
@@ -85,13 +86,43 @@ type resumeFrom struct {
 	position    metastore.Position
 }
 
+// Initial policy calls share ordinary response admission. Successful streams
+// release that permit before retaining their own subscription or snapshot slot.
+func (h *Handler) admitStream(w http.ResponseWriter, ctx context.Context, access authz.AccessRequest) bool {
+	if h.authorizer == nil {
+		return true
+	}
+	release, err := h.responses.acquire(ctx, h.maxBodyBytes)
+	if err != nil {
+		if lifecycle := h.authorizationLifecycleError(ctx); lifecycle != nil {
+			h.writeOperationError(w, lifecycle)
+			return false
+		}
+		h.writeOperationError(w, fmt.Errorf("stream authorization admission: %w", err))
+		return false
+	}
+	defer release()
+	if err := h.authorize(ctx, access); err != nil {
+		h.writeOperationError(w, err)
+		return false
+	}
+	return true
+}
+
 // serveEvents answers a subscription with a stream of changes.
 func (h *Handler) serveEvents(w http.ResponseWriter, r *http.Request, from *resumeFrom) {
+	ctx := r.Context()
+	access := authz.AccessRequest{Operation: authz.ReplicationSubscribe}
+	if from != nil {
+		access.Operation = authz.ReplicationResubscribe
+	}
+	if !h.admitStream(w, ctx, access) {
+		return
+	}
 	if h.publisher == nil {
 		h.refuseUnreplicable(w)
 		return
 	}
-	ctx := r.Context()
 
 	// Attached before the log is read, and before a single frame is written. A change
 	// recorded in between would otherwise wake nothing, and this subscription would sit
@@ -140,12 +171,18 @@ func (h *Handler) serveEvents(w http.ResponseWriter, r *http.Request, from *resu
 
 	// Past here the response is a success and a stream, so nothing below can report a
 	// status and everything that goes wrong travels as a fault frame.
+	end, releaseWatch := watchStreamWrites(w, h.stopping, ctx.Done())
+	defer releaseWatch()
 	out, err := openStream(w, h.maxFrameBytes)
 	if err != nil {
 		return
 	}
-	defer out.endWritesWhen(h.stopping)()
+	out.ending = end
+	out.authorize = func() error { return h.authorize(ctx, access) }
 	if err := out.sendEncoded(eventStart, encodedStart); err != nil {
+		if !h.endedByStop(err) {
+			out.fault(err)
+		}
 		return
 	}
 	if start.Rebuild != "" {
@@ -321,6 +358,10 @@ func (h *Handler) publish(ctx context.Context, out *frameWriter, at metastore.Po
 
 // serveSnapshot answers with one consistent picture of the tree, in pages.
 func (h *Handler) serveSnapshot(w http.ResponseWriter, r *http.Request) {
+	access := authz.AccessRequest{Operation: authz.ReplicationSnapshot}
+	if !h.admitStream(w, r.Context(), access) {
+		return
+	}
 	if h.log == nil {
 		h.refuseUnreplicable(w)
 		return
@@ -355,16 +396,22 @@ func (h *Handler) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	end, releaseWatch := watchStreamWrites(w, h.stopping, ctx.Done())
+	defer releaseWatch()
 	out, err := openStream(w, h.maxFrameBytes)
 	if err != nil {
 		snap.Close()
 		return
 	}
-	defer out.endWritesWhen(h.stopping)()
+	out.ending = end
+	out.authorize = func() error { return h.authorize(ctx, access) }
 
 	position := int64(at)
 	if err := out.send(eventOpen, SnapshotOpen{Position: &position}); err != nil {
-		snap.Close()
+		err = errors.Join(err, snap.Close())
+		if !h.endedByStop(err) {
+			out.fault(err)
+		}
 		return
 	}
 
@@ -392,7 +439,9 @@ func (h *Handler) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	// The last frame, and the only one that makes the picture usable. A failure to write it
 	// leaves the replica with a stream that stopped, which it treats as one cut short — the
 	// right answer, and the only one left once there is nothing further to write.
-	out.send(eventDone, struct{}{})
+	if err := out.send(eventDone, struct{}{}); err != nil && !h.endedByStop(err) {
+		out.fault(err)
+	}
 }
 
 // pages streams the whole picture, and reports whether it ended because this server is

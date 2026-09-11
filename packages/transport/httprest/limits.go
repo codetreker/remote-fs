@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"time"
+
+	"github.com/codetreker/remote-fs/packages/authz"
 )
 
 const (
@@ -147,6 +149,12 @@ func (l Limits) check() error {
 // HandlerOptions configure request-body, non-streaming response, and replication resources
 // retained by a Handler.
 type HandlerOptions struct {
+	// Authorizer and Volume are configured together. With neither set, existing
+	// embedding and middleware behavior is unchanged. Volume is an opaque trusted
+	// host name; callbacks read authenticated identity from the request context.
+	Authorizer authz.Authorizer
+	Volume     string
+
 	// Files bounds retained sessions, references, and replay records. Zero selects DefaultFileLimits.
 	Files FileLimits
 
@@ -324,6 +332,9 @@ func (o HandlerOptions) settle() handlerOptions {
 // Check reports whether the options resolve to usable bounded settings. Callers may use
 // it before opening the storage that will be handed to NewHandlerWithOptions.
 func (o HandlerOptions) Check() error {
+	if err := checkAuthorizationOptions(o.Authorizer, o.Volume); err != nil {
+		return err
+	}
 	if err := o.Files.Check(); err != nil {
 		return err
 	}

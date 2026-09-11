@@ -8,7 +8,9 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/locking"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 const (
@@ -81,6 +83,10 @@ func (h *Handler) serveLockControl(w http.ResponseWriter, r *http.Request, req R
 	}
 	response, err := h.dispatchLockControl(r.Context(), req.Op, body)
 	if err != nil {
+		if response, ok := authorizationResponse(err); ok {
+			h.writeLockJSON(w, StatusStorageError, response)
+			return
+		}
 		if errors.Is(err, errInvalidLockRequest) {
 			h.writeLockFault(w, http.StatusBadRequest, "invalid lock control request")
 			return
@@ -107,11 +113,17 @@ func (h *Handler) dispatchLockControl(ctx context.Context, op Op, body []byte) (
 		if err := decode(&struct{}{}); err != nil {
 			return nil, err
 		}
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.LockSessionEnrollment}); err != nil {
+			return nil, err
+		}
 		value, err := h.locks.BeginEnrollment(ctx)
 		return lockTicketMessage{Ticket: value}, err
 	case OpSessionOpen:
 		var request lockTicketMessage
 		if err := decode(&request); err != nil {
+			return nil, err
+		}
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.LockSessionOpen}); err != nil {
 			return nil, err
 		}
 		value, err := h.locks.OpenSession(ctx, request.Ticket)
@@ -121,10 +133,16 @@ func (h *Handler) dispatchLockControl(ctx context.Context, op Op, body []byte) (
 		if err := decode(&request); err != nil {
 			return nil, err
 		}
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.LockSessionClose}); err != nil {
+			return nil, err
+		}
 		return struct{}{}, h.locks.CloseSession(ctx, request.Session)
 	case OpOwnerCreate:
 		var request lockCreateOwnerRequest
 		if err := decode(&request); err != nil {
+			return nil, err
+		}
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.LockOwnerCreate}); err != nil {
 			return nil, err
 		}
 		value, err := h.locks.CreateOwner(ctx, request.Session, request.Request)
@@ -134,13 +152,23 @@ func (h *Handler) dispatchLockControl(ctx context.Context, op Op, body []byte) (
 		if err := decode(&request); err != nil {
 			return nil, err
 		}
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.LockOwnerRetire}); err != nil {
+			return nil, err
+		}
 		return struct{}{}, h.locks.RetireOwner(ctx, request.Owner)
 	case OpLockResolve:
 		var request lockResolveRequest
 		if err := decode(&request); err != nil {
 			return nil, err
 		}
-		value, err := h.locks.Resolve(ctx, request.Owner, string(request.Path))
+		path, err := storage.CleanPath(string(request.Path))
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", errInvalidLockRequest, err)
+		}
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.LockResolve}); err != nil {
+			return nil, err
+		}
+		value, err := h.locks.Resolve(ctx, request.Owner, path)
 		return lockResourceResponse{Resource: value}, err
 	case OpLockAcquire:
 		var request lockAcquireRequest
@@ -150,6 +178,9 @@ func (h *Handler) dispatchLockControl(ctx context.Context, op Op, body []byte) (
 		intent, err := request.locking()
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", errInvalidLockRequest, err)
+		}
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.LockAcquire}); err != nil {
+			return nil, err
 		}
 		value, actionErr := h.locks.Acquire(ctx, intent)
 		if actionErr != nil && !value.Recorded {
@@ -169,6 +200,9 @@ func (h *Handler) dispatchLockControl(ctx context.Context, op Op, body []byte) (
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", errInvalidLockRequest, err)
 		}
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.LockRenew}); err != nil {
+			return nil, err
+		}
 		value, actionErr := h.locks.Renew(ctx, intent)
 		if actionErr != nil && !value.Recorded {
 			return nil, actionErr
@@ -183,6 +217,9 @@ func (h *Handler) dispatchLockControl(ctx context.Context, op Op, body []byte) (
 		if err := decode(&request); err != nil {
 			return nil, err
 		}
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.LockRelease}); err != nil {
+			return nil, err
+		}
 		value, err := h.locks.Release(ctx, request.Owner, request.Grant)
 		return lockReleaseResponse{Release: value}, err
 	case OpLockCancel:
@@ -190,11 +227,17 @@ func (h *Handler) dispatchLockControl(ctx context.Context, op Op, body []byte) (
 		if err := decode(&request); err != nil {
 			return nil, err
 		}
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.LockCancel}); err != nil {
+			return nil, err
+		}
 		value, err := h.locks.Cancel(ctx, request.Owner, request.Request)
 		return lockCancelResponse{Cancel: value}, err
 	case OpLockQueryAction:
 		var request lockActionRequest
 		if err := decode(&request); err != nil {
+			return nil, err
+		}
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.LockQueryAction}); err != nil {
 			return nil, err
 		}
 		value, actionErr := h.locks.QueryAction(ctx, request.Owner, request.Request)
@@ -211,10 +254,16 @@ func (h *Handler) dispatchLockControl(ctx context.Context, op Op, body []byte) (
 		if err := decode(&request); err != nil {
 			return nil, err
 		}
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.LockQueryGrant}); err != nil {
+			return nil, err
+		}
 		value, err := h.locks.QueryGrant(ctx, request.Owner, request.Grant)
 		return lockGrantResponse{Grant: value}, err
 	case OpLockStatus:
 		if err := decode(&struct{}{}); err != nil {
+			return nil, err
+		}
+		if err := h.authorize(ctx, authz.AccessRequest{Operation: authz.LockStatus}); err != nil {
 			return nil, err
 		}
 		service, ok := h.locks.(interface {

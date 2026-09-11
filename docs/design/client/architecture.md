@@ -48,6 +48,14 @@ SSE 不把整个 stream 保存在内存里，但每一帧仍有独立的 `DialOp
 
 **FUSE 到这一层为止。** 挂载层把内核请求翻译为基础 volume 与 `FileStorage` 调用。按名字查询与目录操作使用路径；普通 fd 使用 `File`，无 fd 的身份属性使用 `StatNode`、`SetNodeAttr`。FileSession 拥有服务端保留对象，挂载层拥有内核编号与 owner 映射，两者不依赖旧路径重新绑定。
 
+### 业务身份与授权结果
+
+HTTP client 的凭据附加和轮换由嵌入方提供；server 使用业务 context 中的稳定身份执行[volume 操作授权](../server/authorization.md)。一份 mount／replica 及其 Session、File、Owner、Grant 固定用于同一身份。同一身份轮换凭据可保持连接，切换身份须创建新的客户端状态，不能带走前一身份的缓存。
+
+直接 SDK 保留普通 422 和 stream fault 中的授权 EACCES／EIO。强锁响应包含 lockCode 或 recorded 任一字段时必须完整通过 native 校验，不能用半份 native envelope 冒充普通授权错误；拒绝核对不把原未知动作改为未执行。初始 frame 与所有 Next 包装保留有效 errno，缺省 errno 的 generic fault、null／畸形／未知 errno 均为 EIO。
+
+副本观察到任一 follower 失败后仍统一为 EIO；这个状态与直接 SDK 收到 EACCES 不同。服务端逐次出站检查权限，但已交付的元数据和字节无法收回；下一次检查或业务 context 取消被观察前，副本仍可能回答已同步内容。撤权不是客户端缓存擦除协议。
+
 ### 显式占有与修改 proof
 
 remote storage 使用 HTTP v3，同时提供基础数据操作与锁 Service。调用方用 enrollment ticket 建立 Session、创建 Owner、Resolve 现有普通文件并显式 Acquire；普通 FUSE Open 没有自动获取策略。Session、Owner、管理 Request 与本地描述符、TCP 连接、复制 incarnation 分别拥有生命周期，断开连接不提前解除已确认保护。
@@ -60,7 +68,7 @@ Acquire 返回立即结果或 Pending 登记；Wait 是远端等待意图的期�
 
 GrantStatus 的剩余时间由服务端对未取整的 deadline 与 now 求差再向下取整。SDK 以原请求发送起点加这个间隔建立保守提示，旧 receipt 不开始新 lease，普通读取成功也不刷新提示。最终权限始终由服务端检查。原授权方退役后，旧意图返回退役或结果未知，不能在新授权方中重做；字段与取整规则见[文件锁协议](../server/file-locks.md#结果与期限)。
 
-控制请求与响应固定至多 16 KiB，独立的 `MaxConcurrentLockControls` 与 `MaxWaitingLockControls` 默认各 16，每份活跃操作预留 64 KiB。容量检查不占用数据 response 或复制 stream 的名额。state-changing control 进入 dispatch 后丢失响应时保持结果未知；Resolve、QueryAction、QueryGrant 与 Status 遵循只读取消。缺少 v3 marker、非法 scope 或不一致 receipt 都明确失败。
+控制请求与响应固定至多 16 KiB，独立的 `MaxConcurrentLockControls` 与 `MaxWaitingLockControls` 默认各 16，每份活跃操作预留 64 KiB。容量检查不占用数据 response 或复制 stream 的名额。state-changing control 进入 dispatch 后丢失响应时保持结果未知；Resolve、QueryAction、QueryGrant 与 Status 遵循只读取消。缺少 v3 marker、非法 scope 或不一致 receipt 都明确失败。服务端强锁 callback／native 生命周期的失败响应保持 native Unavailable／EIO、recorded=false 且无动作回执；该 wire 协议没有 EINTR code。SDK 本地在 HTTP Do 前接受的取消，以及只读控制在 client 侧接受的取消，仍可返回 EINTR，不经过 native wire 编码。业务策略拒绝另走普通 EACCES／EIO envelope。
 
 ## 二、元数据查询来自本地副本
 

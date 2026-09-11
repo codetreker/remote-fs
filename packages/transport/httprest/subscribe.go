@@ -128,7 +128,7 @@ func (s *Storage) subscribe(ctx context.Context, req Request) (*Subscription, er
 	var start StreamStart
 	if err := stream.frames.decode(eventStart, &start); err != nil {
 		stream.close()
-		return nil, unreachable(req, err)
+		return nil, streamError(req, err)
 	}
 	if start.Rebuild != "" {
 		stream.close()
@@ -227,7 +227,7 @@ func (sub *Subscription) Next() (metastore.Change, error) {
 		}
 		return metastore.Change{}, sub.stream.fail(ErrServerStopping)
 	case eventFault:
-		return metastore.Change{}, sub.stream.fail(unreachable(sub.stream.req, faultOf(data)))
+		return metastore.Change{}, sub.stream.fail(streamError(sub.stream.req, faultOf(data)))
 	default:
 		return metastore.Change{}, sub.stream.fail(unreachable(sub.stream.req,
 			fmt.Errorf("a %s frame arrived on a change stream", event)))
@@ -287,7 +287,7 @@ func (s *Storage) Snapshot(ctx context.Context) (*Snapshot, error) {
 	var open SnapshotOpen
 	if err := stream.frames.decode(eventOpen, &open); err != nil {
 		stream.close()
-		return nil, unreachable(req, err)
+		return nil, streamError(req, err)
 	}
 	return &Snapshot{stream: stream, at: metastore.Position(*open.Position)}, nil
 }
@@ -353,7 +353,7 @@ func (snap *Snapshot) Next() ([]metastore.Row, error) {
 		// EAGAIN says so where a cut-short picture would say the outcome is unknown.
 		return nil, snap.stream.fail(ErrServerStopping)
 	case eventFault:
-		return nil, snap.stream.fail(unreachable(snap.stream.req, faultOf(data)))
+		return nil, snap.stream.fail(streamError(snap.stream.req, faultOf(data)))
 	default:
 		return nil, snap.stream.fail(unreachable(snap.stream.req,
 			fmt.Errorf("a %s frame arrived on a snapshot stream", event)))
@@ -482,6 +482,13 @@ func (s *stream) close() error {
 func errorEndingTheStream(req Request, cause error, ended string) error {
 	if errors.Is(cause, io.EOF) {
 		return unreachable(req, fmt.Errorf("the stream ended: %s", ended))
+	}
+	return unreachable(req, cause)
+}
+
+func streamError(req Request, cause error) error {
+	if errno, ok := streamFaultErrno(cause); ok {
+		return &operationError{req: req, errno: errno, detail: cause.Error()}
 	}
 	return unreachable(req, cause)
 }

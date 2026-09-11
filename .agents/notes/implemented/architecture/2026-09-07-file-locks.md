@@ -20,7 +20,7 @@ Status: implemented
 
 Owner 在一个资源上至多有一个当前 grant，没有隐式升级或递归计数。调用方显式 Resolve、Acquire，再用一份不可变的 proof 集合构造 mutation scope。普通 `Open` 不自动取得权限，scope 也不把 Read 的成功变成 grant 仍然有效的证明。
 
-Session、Owner 与 Grant 是不可伪造且绑定父级的能力引用，不能由顺序编号猜出权限。能力值不进入日志、错误、全局状态或 URL；enrollment 的访问仍由部署方控制。这是所有权证明，不代替身份提供者或部署鉴权。
+Session、Owner 与 Grant 是不可伪造且绑定父级的能力引用，不能由顺序编号猜出权限。能力值不进入日志、错误、全局状态或 URL；enrollment 的业务策略仍由部署方提供，并可通过[操作授权](../feature/2026-09-10-host-provided-authorization.md)与每个控制请求一同检查。这是原生所有权证明，不绑定业务身份，也不代替身份认证或操作准入。
 
 ### 最终转换才取得发布许可
 

@@ -9,8 +9,9 @@ volume、保留文件与显式占有的权威持有者。将原生 storage 与�
 | 组件 | 职责 | 需求 |
 |---|---|---|
 | **请求处理**（`packages/transport/httprest`） | 一个 `http.Handler`。解析数据与锁控制请求，使用独立的有界 admission，验证 scope 与响应，把控制操作交给配对的授权方。它不缓存 volume 答案；文件 registry、订阅与快照保留各自有界的状态。 | R-INT-1、R-INT-3 |
+| **业务授权**（`packages/authz` 与 handler adapter） | 把可信 volume、语义操作与完整 Open 意图交给嵌入方策略；请求入口和流出站分别检查，原生占有检查保持独立。 | R-INT-7、R-SEC-4 至 R-SEC-6 |
 | **协议词汇**（`packages/transport/httprest`） | 请求 URL 的形状、响应体的形状；错误的名字取自 storage 契约的 errno 词汇。与 client 共用同一份。 | R-INT-9 |
-| **变更日志** | volume 里每一次改动的有序记录，由 storage 底下的 metastore 提供。请求处理拿到它就开出复制那三个操作；拿不到（`nil`）就以 `ENOSYS` 拒绝它们。 | R-CON-1、R-CON-2 |
+| **变更日志** | volume 里每一次改动的有序记录，由 storage 底下的 metastore 提供。请求处理拿到它就开出复制那三个操作；拿不到（`nil`）时，在已启用的操作授权通过后以 `ENOSYS` 拒绝它们。 | R-CON-1、R-CON-2 |
 | **storage** | 原生发布集成确定实际资源并执行最终转换。localstore 与 Azure 组合在 metastore 事务中记账；第三方实现须履行同一原生集成契约。 | R-INT-6、R-INT-13 |
 | **保留文件与 advisory** | FileSession 拥有当前对象引用，原生节点保留无名内容；独立 advisory coordinator 管理 flock/POSIX owner 与范围。 | R-FS-6 至 R-FS-8、R-CC-12、R-CC-13、R-WS-7 |
 | **文件占有**（`packages/locking`、`packages/storage/locked`） | 有限 S/X 授予、Session / Owner、动作核对与发布顺序；与同一 volume 绑定，重启通过持久证据恢复保护。 | R-CC-3、R-CC-6 至 R-CC-11 |
@@ -29,7 +30,7 @@ volume、保留文件与显式占有的权威持有者。将原生 storage 与�
  └─────────────┘
 ```
 
-基础数据操作各自完成一次请求；FileSession 保留对象与标准 advisory 状态，显式 S/X 另有 Session、Owner、grant 与动作历史。handler 只接受 `locked.New` 验证过的配对 backend，其 `LockService()` 就是绑定原生发布检查的授权方，不能从另一份 storage 单独提供控制服务。控制状态、恢复与拒绝规则见[文件锁设计](file-locks.md)。
+基础数据操作各自完成一次请求；FileSession 保留对象与标准 advisory 状态，显式 S/X 另有 Session、Owner、grant 与动作历史。handler 只接受 `locked.New` 验证过的配对 backend，其 `LockService()` 就是绑定原生发布检查的授权方，不能从另一份 storage 单独提供控制服务。控制状态、恢复与拒绝规则见[文件锁设计](file-locks.md)。可选 Authorizer 先按业务身份和语义决定准入，再访问 capability、Log 与 backend；通用有界请求／响应容量可先返回 EAGAIN。操作映射、策略错误与 context 生命周期由[业务授权](authorization.md)定义。
 
 ## 二、请求的形状
 
@@ -108,9 +109,9 @@ handler 用 `MaxBodyBytes` 限制基础 volume 的 non-write 请求与 non-strea
 
 `packages/storage` 持有一张 errno 与符号名之间的双向表，它同时是一个 storage 实现允许报出的 errno 的全集。它归契约而不归某一种传输：一个实现可以报出哪些错误，是契约的性质。
 
-storage 返回错误时，请求处理用 `storage.ErrnoNameOf` 取得 `422` 响应里的符号名。它与 FUSE 共用 `storage.ErrnoOf` 的错误树分类：已接受的纯取消为 `EINTR`，deadline 与未知错误为 `EIO`，词汇表内的已命名错误保留。当前节点的 `Classification() error` 对其子树具有权威性；独立故障分支不会被深层取消覆盖，join 顺序不改变这一点。`message` 保留原错误文本；没有失败对象可编码时 `ErrnoNameOf(nil)` 仍为 `EIO`。
+storage 返回错误时，请求处理用 `storage.ErrnoNameOf` 取得 `422` 响应里的符号名。它与 FUSE 共用 `storage.ErrnoOf` 的错误树分类：已接受的纯取消为 `EINTR`，deadline 与未知错误为 `EIO`，词汇表内的已命名错误保留。当前节点的 `Classification() error` 对其子树具有权威性；独立故障分支不会被深层取消覆盖，join 顺序不改变这一点。普通存储错误的 `message` 保留原文本；策略错误使用内部可信 errno 与固定消息，Unwrap 仅供本地保留 cause，不能把 callback 文本交给 wire writer。没有失败对象可编码时 `ErrnoNameOf(nil)` 仍为 `EIO`。
 
-锁控制的 typed code 与 `recorded` 额外区分冲突、未接纳、退役与结果未知，不能只用 errno 推断 Acquire 是否曾经成功。管理动作一旦 dispatch，取消或丢失响应不证明它未执行；Resolve、QueryAction、QueryGrant 与 Status 虽用 POST，仍按只读取消处理。身份能力不进入 message。
+锁控制的 typed code 与 `recorded` 额外区分冲突、未接纳、退役与结果未知，不能只用 errno 推断 Acquire 是否曾经成功。管理动作一旦 dispatch，取消或丢失响应不证明它未执行；Resolve、QueryAction、QueryGrant 与 Status 虽用 POST，仍按只读取消处理。身份能力不进入 message。授权失败以普通 422 EACCES／EIO 返回，不制造 native lockCode／recorded；decoder 只要看到任一 native 字段就要求完整 native envelope，详见[授权错误](authorization.md#五错误与-wire)。
 
 **无法命名的失败一律是 `EIO`。** 挑一个最接近的名字，等于把一个不确定的失败说成一个确定的事实；而 `ENOENT` 一旦被这样说出去，上层会据以删除、重新生成或覆盖（R-ERR-1、R-ERR-2）。
 
@@ -118,7 +119,7 @@ storage 返回错误时，请求处理用 `storage.ErrnoNameOf` 取得 `422` 响
 
 ## 五、复制那三个操作
 
-一个 volume 的元数据能不能被复制，取决于集成方是否提供变更日志。随附的 localstore 与 Azure 形态都有日志；库调用方未提供时，三个操作一律 `ENOSYS` —— 那是关于那份 volume 的一句事实，与「够不到」是两回事，两者要求的动作正好相反：`ENOSYS` 说这里永远不会有副本，别再问了；`EIO` 说过一会儿再试。**绝不能答一条空的流或一份没有行的快照** —— 那读起来是「这个 volume 存在、是空的、永不改变」，而这正是一个副本会相信的答案。
+一个 volume 的元数据能不能被复制，取决于集成方是否提供变更日志。随附的 localstore 与 Azure 形态都有日志；库调用方未提供时，三个操作在已启用的授权通过后返回 `ENOSYS` —— 那是关于那份 volume 的一句事实，与「够不到」是两回事，两者要求的动作正好相反：`ENOSYS` 说这里永远不会有副本，别再问了；`EIO` 说过一会儿再试。**绝不能答一条空的流或一份没有行的快照** —— 那读起来是「这个 volume 存在、是空的、永不改变」，而这正是一个副本会相信的答案。
 
 | 操作 | 答什么 |
 |---|---|
@@ -132,7 +133,7 @@ storage 返回错误时，请求处理用 `storage.ErrnoNameOf` 取得 `422` 响
 
 **这三个流与请求／响应天生在不同的连接上。** 快照是系统里最大的一次批量传输；它若与事件挤在一条连接上，就会挤掉喂着副本的那条流，后果是重新拉一份快照 —— 一个自我放大的循环，而触发它只需要一次正常的冷挂载。走 SSE（`text/event-stream`）因此不需要额外机制：每个流是一次独立的 HTTP 请求。义务写成性质而不是拓扑 —— 从一次变更被记入日志，到它的事件抵达一个健康订阅者，其耗时与并发的批量传输无关 —— 将来的其它传输各自说明它用什么机制满足它。
 
-**流的失败没有状态码可用。** 状态与响应头在第一帧之前就发走了，因此此后出的错以一个 `fault` 帧代替本该跟在后面的一切。收到它与流直接断掉在 client 那边是同一个判定（都算失败），这个帧只决定事后有没有人说得清出了什么事。
+**流的失败没有状态码可用。** 状态与响应头在第一帧之前就发走了，因此此后出的错以一个 `fault` 帧代替本该跟在后面的一切。generic fault 与断流都使副本失效；授权 fault 的可选 errno 还让直接 SDK 保留 EACCES／EIO。缺省 errno 仍为 EIO，null、畸形或未知值作为协议 EIO。每个数据、控制和 keepalive 出站前重新检查当前策略，拒绝后的固定 fault 不再次授权，不发送后续页面或成功 done，详见[持续输出](authorization.md#四持续输出与撤权)。
 
 server 为这几个操作持有的资源都有上限：同时开着的订阅与快照数、一份快照最长可以送多久、单个 encoded frame、跨页保留的 snapshot cursor bytes、同时产生的 snapshot page 数与总 retained bytes、等待 snapshot-page admission 的 goroutine，以及一次读日志或快照最多处理多少行（R-INT-3）。change frame 的 aggregate 由 subscription 数与单帧预算共同给出，不与 snapshot bulk transfer 共用 gate。还有一个不是上限而是下限：**无话可说时多久也要说一句**——心跳的间隔。读的那一侧据此给「一个字节都没来」定上界，于是「流还活着」是被观测到的而不是被假定的；没有它，一条被切断的 TCP 与一个安静的 volume 是同一个观测结果。
 
@@ -159,6 +160,8 @@ handler 在读取 body 前取得 request operation 与 byte admission。`Write` 
 HTTP handler 只接受实现 `storage.BoundedStorage` 的 volume。constructor 在服务请求前调用 `CheckBounded`；任一依赖无法在实际产生结果时接受预算，启动就直接失败。`ReadBounded` 在完整 payload 分配前知道 byte bound，超限以 `EFBIG` 失败。`ListBounded` 按顺序把 entry 加入调用方的 `ListResult`；`ListResult` 用 HTTP 表示的精确逐条 charge 计数，并在保留那条超限 entry 之前以 `EIO` 失败。backend 不得先建立完整的超限 `[]byte` 或 `[]Entry` 中间结果。
 
 `Read` 与 `List` 的 wire format 仍是一份 non-streaming response，在发出前保留一份配置内的完整结果。每个非流式操作在调用 storage 前都取得 response operation 与 byte admission；`Read` 与 `List` 按 `4 * MaxBodyBytes` 预留，覆盖 storage entries、wire conversion、encoded body 与它们同时存在的保守峰值，其余固定结果操作按 `MaxBodyBytes` 预留，使得同时产生的最大错误 JSON 也在 aggregate 上限内。response 等待者已满时，`Stat`、`Write`、`Create` 等操作也会在到达 storage 前以 `EAGAIN` 失败；`Write` 与 `SetAttr` 还不会读取 request body。context cancellation 会退出等待并释放计数。
+
+启用业务授权时，stream 入口的 callback 与拒绝响应也取得通用 response admission；允许后释放，再取得 Log、订阅与 snapshot 资源，长连接不持续占用该名额。未配置 hook 的 stream 不增加这项占用。授权和生命周期顺序见[业务授权](authorization.md)。
 
 默认资源上限为：
 
@@ -226,16 +229,16 @@ v1/v2 数据库还面临 object lifecycle 证据缺失：旧实现把 reservatio
 - **不缓存。** volume 的事实就在 storage 里，变更的事实就在日志里。
 - **不保存订阅者的复制进度。** 位置由订阅者自己携带。锁 Session、Owner、有限 grant 与动作历史由服务端持有，TCP 断开不会提前解除保护。
 - **不清洗路径。** 逐字交给 storage。
-- **不提供身份认证系统。** enrollment 的访问与 TLS 由部署方保护；不可伪造的锁能力只证明 Session / Owner / Grant 的归属。部署鉴权的范围见[范围决定](../../../.agents/notes/implemented/process/2026-08-19-mvp-scope.md)。
-- **handler package 不打印，也不记日志。** 请求失败的原因随该次响应返回；独立二进制只把 lifecycle、锁状态与 metastore-backed status 写到 stderr。
+- **身份与策略归业务方。** handler 的可选 Authorizer 提供语义操作准入；认证、角色、凭据与 TLS 仍由嵌入方管理，锁 capability 不代替业务访问控制。接入方式见[业务授权](authorization.md)。
+- **handler package 不打印，也不记日志。** 普通请求失败随响应返回；策略错误只发送固定安全消息，原 cause 留在本地错误链，审计由业务方包装 callback 完成。独立二进制只把 lifecycle、锁状态与 metastore-backed status 写到 stderr。
 
 ## 九、部署形态
 
 作为库嵌入集成方既有的 server，或作为独立二进制运行（R-INT-1、R-INT-4）。
 
-作为库时：不注册信号处理、不写 stdout/stderr、不调用进程退出、包初始化不产生副作用（R-INT-2）。`packages/transport/httprest` 暴露 `NewHandler`、`NewHandlerWithLimits` 与 `NewHandlerWithOptions`；`HandlerOptions.Check` 可在打开 storage 前验证所有 HTTP 上限，constructor 会再次验证，并要求带原生发布能力的 `locked.Backend`，内部构造 `locked.Storage`；`locked.New` 拒绝 `CheckBounded` 失败或缺少绑定锁服务的 backend。监听、TLS、超时、路由前缀与 lifecycle 都由集成方决定。调用方也可以直接组合 `localstore.Open`，并通过 `Status`、`MaintenanceStatus`、`Sweep` 与 `Close` 管理它。
+作为库时：不注册信号处理、不写 stdout/stderr、不调用进程退出、包初始化不产生副作用（R-INT-2）。`packages/transport/httprest` 暴露 `NewHandler`、`NewHandlerWithLimits` 与 `NewHandlerWithOptions`；`HandlerOptions.Check` 可在打开 storage 前验证 HTTP 上限及 Authorizer／Volume 配置，constructor 会再次验证，并要求带原生发布能力的 `locked.Backend`，内部构造 `locked.Storage`；`locked.New` 拒绝 `CheckBounded` 失败或缺少绑定锁服务的 backend。可信 volume 与 backing、Log 的配对由集成方负责；认证 middleware 的 context 为 Authorizer 提供身份。监听、TLS、超时、路由前缀与 lifecycle 都由集成方决定。调用方也可以直接组合 `localstore.Open`，并通过 `Status`、`MaintenanceStatus`、`Sweep` 与 `Close` 管理它。
 
-独立二进制接受两种互斥入口：
+独立二进制没有业务认证与授权配置，部署方继续保护访问边界。它接受两种互斥存储入口：
 
 | storage mode | 命令行 | 配额 | 复制 |
 |---|---|---|---|
@@ -266,7 +269,7 @@ non-streaming HTTP flags 控制单体 body/write，request body 的 operation、
 
 存储就绪后安装终止与 SIGHUP lifecycle。`serving ... at http://...` 是 READY announcement：这行出现时 storage、listener 与 signal ownership 都已建立；HTTP accept loop 紧接着启动，`startedListener` 使 announcement 与 `Serve` 交接期间到达的终止信号关闭 listener 并等待 server goroutine 退出。READY 之前的失败会关闭已取得的 listener，并在能证明 storage handles 已关闭时释放 storage ownership；pool cleanup 不确定时本地持久形态保留 root lock 到进程退出。cleanup failure 并入命令结果。
 
-收到 SIGINT／SIGTERM 后，外层 admission gate 先拒绝新请求，handler 向每条 change stream 发 server-stopping frame，并给在途请求 5 秒完成。deadline 到期时关闭连接，但仍等待已经进入 application handler 的调用离开，随后调用 `Handler.Close` 退役并排空该 handler 的 FileSession registry。registry 清理失败保留 backend 所有权并返回错误；成功后才停止并等待后台 maintenance 与 checkpoint worker。local store 再建立独立的 5 秒 close context，用它等待 commit gate 与完整 WAL checkpoint；active reader 立即使本轮关闭返回 `EBUSY`，pool `Close` 本身不接受该 context。reader pools 已关闭后的 checkpoint busy/failure/cancellation 保留 writer/WAL 并可重试；任一 pool close error 是 terminal result，锁保留到进程退出。只有所有 pools 无错误关闭后才释放 object-store lifetime lock，关闭各层的错误合并为命令结果。
+收到 SIGINT／SIGTERM 后，外层 admission gate 先拒绝新请求，handler 的非阻塞 Stop 取消授权 context 并触发 stream 结束机制，外层给在途请求 5 秒完成。deadline 到期时关闭连接，但仍等待已经进入 application handler 的调用、授权 callback 与 stream producer／资源清理离开，随后调用 `Handler.Close` 退役并排空该 handler 的 FileSession registry。registry 清理失败保留 backend 所有权并返回错误；成功后才停止并等待后台 maintenance 与 checkpoint worker。local store 再建立独立的 5 秒 close context，用它等待 commit gate 与完整 WAL checkpoint；active reader 立即使本轮关闭返回 `EBUSY`，pool `Close` 本身不接受该 context。reader pools 已关闭后的 checkpoint busy/failure/cancellation 保留 writer/WAL 并可重试；任一 pool close error 是 terminal result，锁保留到进程退出。只有所有 pools 无错误关闭后才释放 object-store lifetime lock，关闭各层的错误合并为命令结果。
 
 SIGHUP 不经过网络控制面，只执行带两秒 context deadline 的状态查询；一个 command-owned goroutine 同一时刻至多处理一项。SIGINT／SIGTERM 取消并等待它，已经进入的不可取消 syscall 仍须返回。
 
