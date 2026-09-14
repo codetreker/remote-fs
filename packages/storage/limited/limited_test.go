@@ -28,7 +28,7 @@ func TestContract(t *testing.T) {
 	for _, native := range []bool{true, false} {
 		name := "native publication"
 		if !native {
-			name = "unmanaged bounded storage"
+			name = "native accounting without retained files"
 		}
 		t.Run(name, func(t *testing.T) {
 			storagetest.Run(t, func(t *testing.T) storage.Storage {
@@ -180,9 +180,7 @@ func TestAWriteThatShrinksIsTakenFromOverTheAllowance(t *testing.T) {
 	mustUse(t, s, 100)
 }
 
-// The charge is made before the write and has to come back when the write does not happen.
-// A charge left standing would take the volume's room away a failure at a time.
-func TestAWriteTheStoreBeneathRefusesGivesTheChargeBack(t *testing.T) {
+func TestAWriteRejectedBeforePublicationLeavesUsageUnchanged(t *testing.T) {
 	s := newStorageOver(t, &faulty{BoundedStorage: newBacking(t), write: syscall.EIO}, 8192)
 
 	if err := s.Write(t.Context(), "f", content(500)); !errors.Is(err, syscall.EIO) {
@@ -211,17 +209,18 @@ func TestFailedShrinkPreservesTheCountAfterOutOfBandGrowth(t *testing.T) {
 	mustUse(t, s, 5)
 }
 
-// What a write charges is the difference from what the file holds now, so a size that
-// could not be read leaves nothing to charge against. The write is refused with what the
-// stat reported rather than charged as if the file were not there: a write that landed
-// uncharged is the one direction the count may not err in.
-func TestAWriteIsRefusedWhenWhatTheFileHoldsCannotBeRead(t *testing.T) {
-	s := newStorageOver(t, &faulty{BoundedStorage: newBacking(t), stat: syscall.EIO}, 8192)
-
+func TestAWriteIsRefusedWhenTheNativeTargetCannotBeMeasured(t *testing.T) {
+	probe := newPublicationProbe(t)
+	probe.BoundedStorage = &faulty{BoundedStorage: probe.BoundedStorage, stat: syscall.EIO}
+	s := newStorageOver(t, probe, 8192)
 	if err := s.Write(t.Context(), "f", content(500)); !errors.Is(err, syscall.EIO) {
-		t.Fatalf("the write failed with %v, want the EIO the stat gave", err)
+		t.Fatalf("the final target measurement failed with %v, want EIO", err)
 	}
 	mustUse(t, s, 0)
+	probe.BoundedStorage.(*faulty).stat = nil
+	if _, err := probe.Stat(t.Context(), "f"); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("failed native target measurement published a file: %v", err)
+	}
 }
 
 // Bytes are credited back only once they are gone. A removal that failed released nothing,
@@ -1008,3 +1007,87 @@ type spaceBeneath struct {
 }
 
 func (s spaceBeneath) Space(context.Context) (storage.Space, error) { return s.space, s.err }
+
+func checkDelegatedAccounting(backing storage.Storage) error {
+	accounting, ok := backing.(interface{ CheckPublicationAccounting() error })
+	if !ok {
+		return syscall.ENOSYS
+	}
+	return accounting.CheckPublicationAccounting()
+}
+
+func (f *faulty) CheckPublicationAccounting() error {
+	return checkDelegatedAccounting(f.BoundedStorage)
+}
+func (l listing) CheckPublicationAccounting() error {
+	return checkDelegatedAccounting(l.BoundedStorage)
+}
+func (s symlinkListing) CheckPublicationAccounting() error {
+	return checkDelegatedAccounting(s.BoundedStorage)
+}
+func (s *unboundedListing) CheckPublicationAccounting() error {
+	return checkDelegatedAccounting(s.Storage)
+}
+func (s *boundedProbe) CheckPublicationAccounting() error {
+	return checkDelegatedAccounting(s.BoundedStorage)
+}
+func (s *generatedListing) CheckPublicationAccounting() error {
+	return checkDelegatedAccounting(s.BoundedStorage)
+}
+func (s *blockingListing) CheckPublicationAccounting() error {
+	return checkDelegatedAccounting(s.BoundedStorage)
+}
+func (s *delayedReturnListing) CheckPublicationAccounting() error {
+	return checkDelegatedAccounting(s.BoundedStorage)
+}
+func (s spaceBeneath) CheckPublicationAccounting() error {
+	return checkDelegatedAccounting(s.BoundedStorage)
+}
+
+func TestNewRejectsMissingNativeAccountingBeforeMeasurement(t *testing.T) {
+	backing := &missingAccounting{BoundedStorage: newBacking(t)}
+	value, err := limited.New(t.Context(), backing, limited.MinLimit)
+	if value != nil || !errors.Is(err, syscall.ENOSYS) {
+		t.Fatalf("missing native accounting returned storage=%v err=%v, want nil and ENOSYS", value != nil, err)
+	}
+	if backing.calls != 0 {
+		t.Fatalf("missing native accounting performed %d capability/measurement calls", backing.calls)
+	}
+}
+
+type missingAccounting struct {
+	storage.BoundedStorage
+	calls int
+}
+
+func (s *missingAccounting) CheckBounded() error                  { s.calls++; return s.BoundedStorage.CheckBounded() }
+func (s *missingAccounting) Usage(context.Context) (int64, error) { s.calls++; return 0, nil }
+func (s *missingAccounting) List(ctx context.Context, name string) ([]storage.Entry, error) {
+	s.calls++
+	return s.BoundedStorage.List(ctx, name)
+}
+func (s *missingAccounting) ListBounded(ctx context.Context, name string, result *storage.ListResult) error {
+	s.calls++
+	return s.BoundedStorage.ListBounded(ctx, name, result)
+}
+
+func TestNewRejectsNativeAccountingErrorsBeforeMeasurement(t *testing.T) {
+	for _, failure := range []error{syscall.ENOSYS, syscall.EOPNOTSUPP, syscall.EIO, errors.Join(syscall.ENOSYS, syscall.EIO)} {
+		backing := &failedAccountingCheck{missingAccounting: &missingAccounting{BoundedStorage: newBacking(t)}, failure: failure}
+		value, err := limited.New(t.Context(), backing, limited.MinLimit)
+		if value != nil || err != failure || backing.checked != 1 || backing.calls != 0 {
+			t.Errorf("failed native check: storage=%v err=%v checks=%d measurements=%d; want original %v before measurement", value != nil, err, backing.checked, backing.calls, failure)
+		}
+	}
+}
+
+type failedAccountingCheck struct {
+	*missingAccounting
+	failure error
+	checked int
+}
+
+func (s *failedAccountingCheck) CheckPublicationAccounting() error {
+	s.checked++
+	return s.failure
+}

@@ -199,15 +199,17 @@ Azure 形态依赖部署方分别提供和运维 Blob container、数据库及�
 
 ### 配额住在 storage 这一侧
 
-配额属于 volume，计数与拒绝落在 storage 这一层。随附的 localstore 与 Azure 组合在 metastore 事务中记账；库另提供通用 `limited` 包装，供没有自身配额的第三方 storage 使用。
+配额属于 volume，计数与拒绝落在 storage 这一层。随附的 localstore 与 Azure 组合在 metastore 事务中记账；库另提供 `limited` 包装，供具有原生发布计费能力、需要外层额度的第三方 storage 使用。
 
-**包一层：`packages/storage/limited`** 包住任意一份 `storage.BoundedStorage`（R-WS-5、R-INT-3），这是把配额加到一份本来没有配额概念的实现上的通用办法：
+**包一层：`packages/storage/limited`** 的 `New` 与 `NewWithLimits` 接收 `storage.Storage`，内部要求同时实现 `storage.BoundedStorage` 与 `CheckPublicationAccounting`（R-WS-5、R-INT-3）。配额和 measurement 参数先验证；能力缺失返回 `ENOSYS`，计费能力检查失败原样返回，均在用量测量之前：
 
 - 支持保留文件的 backend 以权威 `Usage` 报告已命名与 detached 的合计用量；只有路径 API 的 backend 在打开时遍历计量。遍历前先调用 `CheckBounded`，每个目录经 `ListBounded` 逐项计量；当前目录的 `Entry` 与名字、尚待访问的完整目录路径分别受独立 byte bound 约束，默认各为 64 MiB。目录预算在保留越界 entry 前拒绝，frontier 预算包含当前正在访问的目录；任一上限不足都以 `EIO` 使整次计量失败，不提交部分结果。HTTP body 上限不参与 volume measurement。
 - 原生 backend 的 `CheckPublicationAccounting` 能力把实际新旧长度与效果交给发布计费。增长在效果发生前预留，超限以 `EDQUOT` 拒绝；确定 Applied 后才释放缩短额度，即使随后返回确认错误也按实际效果结算。NotApplied 退回增长预留；volume 效果不明，或结算、撤销带 `IsPublicationAccountingUncertain` 时保留保守账本并使 Space、修改与 Recount 报错，直到重新打开。scope、FileStorage 与锁服务传给同一原生 backend，最后一个 detached 引用的释放同样结算实际效果。原有验收由[缩短提交后释放配额](../../../.agents/notes/implemented/bug-fix/2026-09-07-release-shrunk-quota-after-commit.md)拥有。
 - 让 volume 变小的修改从不被拒绝，已经超出配额时也不拒绝 —— 否则一个超额的 volume 没有任何回到配额之内的路。
 - 配额不得低于一个 4096 字节的块：再小的配额会被报成一个零块的文件系统，那读起来是一块没有剩余空间的盘，而不是一个空间很小的 volume。
-- 实现原生计费能力时，Write、Remove 与 Rename 从实际发布取得大小，跳过包装层路径采样与 stripe。没有该能力的有界第三方 backend 仍用路径采样；祖先目录改名可能使其计量对象失效，且它不能向 server 提供非空锁授权方，见[目录改名中的配额记账](../../../.agents/notes/proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)。库的 `Recount` 使用同一组 measurement limits，并与自主引用回收的记账 revision 核对；并发变化可有界重数，耗尽尝试为 `EAGAIN`。超限、取消或 listing 失败保留原计数，已经不确定的账本不能靠在线重数解除隔离。随附二进制没有 recount 入口。
+- 所有路径修改携带原生计费 hook，在最终发布处取得实际大小与效果；wrapper 不通过路径 Stat 或 stripe 协调修改。`Recount` 使用相同 measurement limits，并与自主引用回收的计费 revision 核对；最多八次重测后仍有交错则返回 `EAGAIN`。超限、取消或 listing 失败保留原计数，已经不确定的账本不能靠在线重数解除隔离。随附二进制没有 recount 入口。
+
+HTTP 与 replicated 不把 Go context 中的计费 hook 传到远端发布，`limited` 不能包在这些客户端外执行远端配额；配额在服务端原生 backend 一侧配置。对象暂存可先于最终额度判定，`EDQUOT` 不撤销此前的上传成本，暂存与回收继续受已有对象资源预算约束。构造范围见[原生发布计费](../../../.agents/notes/implemented/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)。
 
 `Space` 报出的「还能写入的量」取配额剩余与底层实现所报之中较小的那个。配额是「还允许写多少」而不是「这些字节一定放得下」：底下那块盘比配额更紧时若仍报配额，等于向先查空间再决定写不写的程序许诺机器给不出的余量。
 

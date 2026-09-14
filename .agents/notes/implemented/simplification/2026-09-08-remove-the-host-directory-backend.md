@@ -14,7 +14,7 @@ Status: implemented
 
 本地持久 volume 的确认后持久性、完整性、重启保护与跨客户端可见性要求不变。`localdisk` 是保留的对象实现，与被删除的宿主目录 storage 不是同一组件。两种服务端形态继续提供显式 S/X、有限历史、最终发布检查与变更日志。
 
-库的边界继续保持可替换：`Storage`、有界结果、原生发布与配对锁服务的义务不变，`limited` 仍能为履行其契约的第三方 backend 执行配额。调用方没有提供 change log 时，复制操作仍明确返回 `ENOSYS`；不能用删除一个随附实现来把可选日志改成接口的隐含必需项。
+库的边界继续保持可替换：`Storage`、有界结果、原生发布与配对锁服务的义务不变，`limited` 为提供有界结果与原生发布计费的第三方 backend 执行配额，未提供计费能力时在构造阶段拒绝，范围由[目录改名中的配额记账](../bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)拥有。调用方没有提供 change log 时，复制操作仍明确返回 `ENOSYS`；不能用删除一个随附实现来把可选日志改成接口的隐含必需项。
 
 库测试复用真实 SQLite 与内存对象组成的 [memoryfixture](../../../../packages/storage/lockcontract/memoryfixture/memory.go)，二进制与持久恢复测试使用保留的 localstore 和 Azure。需要表达特定身份、符号链接属性或错误的测试在对应接口装饰结果；当时迁移保留了真实信号、Close 与配额边界的原断言。后续[实时文件句柄](../architecture/2026-09-08-live-file-handles.md)改变提交与关闭职责，验证须按同步修改、引用和 advisory 清理分别表达，不能沿用旧缓冲路径的通过记录。过期暂存缩短的配额用例迁到 `limited`，删除旧 fixture 没有删除该保证。
 
@@ -22,7 +22,7 @@ Status: implemented
 
 [元数据复制](../architecture/2026-08-27-metadata-replication.md)与[有界读取](../architecture/2026-09-04-bounded-read-and-list-responses.md)保持原契约；[读取可能输给写者](../architecture/2026-09-01-a-read-may-lose-to-a-writer.md)、[名字与身份](../bug-fix/2026-09-01-a-name-is-not-an-identity.md)、[标准库错误](../bug-fix/2026-08-21-the-standard-library-answers-for-the-kernel.md)和[请求中断](../bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)中的旧宿主目录证据保留为历史，当前测试使用保留的组合与接口装饰。已完成的[缩短结算](../bug-fix/2026-09-07-release-shrunk-quota-after-commit.md)继续约束 `limited`。
 
-[观察源与通道](../../proposed/architecture/2026-08-19-observation-source-and-channels.md)、[volume 契约](../../proposed/architecture/2026-08-19-volume-in-the-contract.md)、[打开文件的内容依据](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)、[对象存储缺口](../../proposed/architecture/2026-08-22-gaps-in-the-object-store-backend.md)和[通用目录改名计费](../../proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)仍包含不依赖宿主目录后端的未完成内容，保持 proposed。
+[观察源与通道](../../proposed/architecture/2026-08-19-observation-source-and-channels.md)、[volume 契约](../../proposed/architecture/2026-08-19-volume-in-the-contract.md)、[打开文件的内容依据](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)和[对象存储缺口](../../proposed/architecture/2026-08-22-gaps-in-the-object-store-backend.md)仍包含不依赖宿主目录后端的未完成内容，保持 proposed。
 
 ## 备选方案
 
@@ -34,4 +34,4 @@ Status: implemented
 
 调用方不能再用随附二进制直接发布已有宿主目录，需要选择受管理的本地持久存储、Azure，或自行接入满足契约的 backend。本决定不提供旧目录的迁移工具，也不把既有目录内容当作新存储格式自动接受。
 
-以后若增加另一种 backend，仍须满足稳定逻辑身份、完整内容读取、有界资源、所有修改的最终授权与已确认租期的恢复保护；提供 FileStorage 时还须原生保留对象及其生命周期，不能通过重开原路径或另一份不配对的协调服务模拟。第三方 `limited` 的路径采样缺口、显式内容版本工作流与目录父身份约束保持各自范围。普通 Open 不自动取得 advisory 或强 S/X，宿主目录实现的删除不改变这个选择。
+以后若增加另一种 backend，仍须满足稳定逻辑身份、完整内容读取、有界资源、所有修改的最终授权与已确认租期的恢复保护；提供 FileStorage 时还须原生保留对象及其生命周期，不能通过重开原路径或另一份不配对的协调服务模拟。`limited` 的原生计费接入、显式内容版本工作流与目录父身份约束保持各自范围。普通 Open 不自动取得 advisory 或强 S/X，宿主目录实现的删除不改变这个选择。

@@ -62,7 +62,7 @@ raw SQLite opener 持有数据库共享 flock，启用锁的拥有者取得排�
 
 [本地磁盘对象存储](2026-09-04-local-disk-object-store.md)继续拥有对象与数据库提交见证的持久格式；[对象存储中的 volume](2026-08-21-volume-in-an-object-store.md)的 Reserve / Put / Commit 在最终 Commit 接受授权检查；[未决对象发布](2026-09-04-unresolved-object-publication.md)继续区分 Put 未知与 Commit 未知的回收证据。lease Witness 与对象归属证明不互相替代。
 
-[容量上限](2026-08-21-space-limit.md)把原生目标的最终大小与效果用于 limited 计费，[缩短结算](../bug-fix/2026-09-07-release-shrunk-quota-after-commit.md)只在确定生效后释放额度。这部分替代[目录改名中的配额采样](../../proposed/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)的前提；不透明第三方 backend 的祖先改名协调仍由该提案拥有。
+[容量上限](2026-08-21-space-limit.md)把原生目标的最终大小与效果用于 limited 计费，[缩短结算](../bug-fix/2026-09-07-release-shrunk-quota-after-commit.md)只在确定生效后释放额度。[目录改名中的配额记账](../bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)将这项原生能力作为全部 limited backend 的构造条件，未提供能力时明确拒绝；本决定的最终权限与效果顺序保留。
 
 ### 范围与仍然开放的保证
 

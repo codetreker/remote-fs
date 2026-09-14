@@ -122,7 +122,7 @@ func TestSettlementFailureFencesEveryNativeMutation(t *testing.T) {
 	}
 }
 
-func TestUnmanagedWrapperRetainsUncertainBackingFailure(t *testing.T) {
+func TestNativeDelegatingWrapperRetainsUncertainBackingFailure(t *testing.T) {
 	failure := errors.New("injected hidden backing settlement failure")
 	ctx := storage.WithPublicationAccounting(t.Context(), func(int64, int64) (storage.PublicationSettlement, error) {
 		return func(storage.PublicationResult) error { return failure }, nil
@@ -135,10 +135,10 @@ func TestUnmanagedWrapperRetainsUncertainBackingFailure(t *testing.T) {
 	p := &faulty{BoundedStorage: newBacking(t), write: uncertain}
 	s := newStorageOver(t, p, limited.MinLimit)
 	if err := s.Write(t.Context(), "a", content(1024)); err != uncertain {
-		t.Fatalf("unmanaged wrapper changed the uncertain backing error: %v", err)
+		t.Fatalf("native wrapper changed the uncertain backing error: %v", err)
 	}
 	if _, err := s.Space(t.Context()); !errors.Is(err, failure) || !errors.Is(err, syscall.EIO) {
-		t.Fatalf("unmanaged wrapper left quota usable after uncertainty: %v", err)
+		t.Fatalf("native wrapper left quota usable after uncertainty: %v", err)
 	}
 	if _, err := p.Stat(t.Context(), "a"); !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("failed backing write left a file: %v", err)

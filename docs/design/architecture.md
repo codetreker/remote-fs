@@ -228,7 +228,7 @@ packages/                    可被外部与自身 import
       azblob/                Azure Blob 的对象接口实现
       localdisk/             本地不可变文件的对象接口实现
       objectstoretest/       对象接口义务的可执行形式
-    limited/                 把任意一份 storage 置于字节配额之下
+    limited/                 用原生最终发布计费执行 volume 字节配额
     storagetest/             义务的可执行形式：每个实现都跑这一套用例
   metastore/                 名字树、保留节点、内容 revision 与对象键的指向
     sqlite/                  SQLite 公开入口；internal 按 schema、状态、日志与原生证据分工

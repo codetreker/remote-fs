@@ -268,9 +268,13 @@ func (p *pausedUsage) Usage(ctx context.Context) (int64, error) {
 
 func TestRetainedQuotaRequiresNativeAccountingAndAuthoritativeUsage(t *testing.T) {
 	backing := newBacking(t)
-	unaccounted := newStorageOver(t, &faulty{BoundedStorage: backing}, limited.MinLimit)
-	if _, err := unaccounted.NewFileSession(t.Context(), storage.DefaultFileSessionOptions()); err != syscall.EOPNOTSUPP {
-		t.Fatalf("unaccounted retained file capability returned %v", err)
+	missingAccounting := &missingAccounting{BoundedStorage: backing}
+	if value, err := limited.New(t.Context(), missingAccounting, limited.MinLimit); value != nil || !errors.Is(err, syscall.ENOSYS) || missingAccounting.calls != 0 {
+		t.Fatalf("missing accounting capability returned storage=%v calls=%d err=%v", value != nil, missingAccounting.calls, err)
+	}
+	withoutFiles := newStorageOver(t, &faulty{BoundedStorage: backing}, limited.MinLimit)
+	if _, err := withoutFiles.NewFileSession(t.Context(), storage.DefaultFileSessionOptions()); err != syscall.EOPNOTSUPP {
+		t.Fatalf("native accounting without retained-file capability returned %v", err)
 	}
 	missing := &missingRetainedUsage{BoundedStorage: backing}
 	if _, err := limited.New(t.Context(), missing, limited.MinLimit); !errors.Is(err, syscall.EOPNOTSUPP) {
@@ -292,8 +296,10 @@ type missingRetainedUsage struct {
 	storage.BoundedStorage
 }
 
-func (*missingRetainedUsage) CheckFileStorage() error           { return nil }
-func (*missingRetainedUsage) CheckPublicationAccounting() error { return nil }
+func (*missingRetainedUsage) CheckFileStorage() error { return nil }
+func (s *missingRetainedUsage) CheckPublicationAccounting() error {
+	return checkDelegatedAccounting(s.BoundedStorage)
+}
 func (*missingRetainedUsage) NewFileSession(context.Context, storage.FileSessionOptions) (storage.FileSession, error) {
 	panic("measurement must precede file session creation")
 }
