@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"unicode/utf16"
 )
 
 type nativeWireObservation struct {
@@ -18,6 +19,14 @@ type nativeWireObservation struct {
 	writtenBytes atomic.Uint64
 	mu           sync.Mutex
 	headers      []nativeHeaderObservation
+	trees        []nativeTreeObservation
+}
+
+type nativeTreeObservation struct {
+	MessageID      uint64
+	Path           string
+	Offset, Length uint16
+	Truncated      bool
 }
 
 func TestNativeWireObservationKeepsBoundedProtocolEvidence(t *testing.T) {
@@ -77,8 +86,8 @@ func (l nativeObservedListener) Accept() (net.Conn, error) {
 		sent:     nativeFrameObserver{observation: l.observation, response: true}}, nil
 }
 
-// Only transport and SMB headers are observed. Authentication tokens and file
-// payloads are never accumulated or logged by the observer.
+// Transport and SMB headers plus bounded TREE_CONNECT names are observed.
+// Authentication tokens and file payloads are never accumulated or logged.
 type nativeObservedConnection struct {
 	net.Conn
 	received nativeFrameObserver
@@ -94,6 +103,9 @@ type nativeFrameObserver struct {
 	remaining   int
 	header      [64]byte
 	headerBytes int
+	frameBytes  int
+	tree        [1032]byte
+	treeBytes   int
 }
 
 func (c *nativeObservedConnection) Read(buffer []byte) (int, error) {
@@ -122,6 +134,7 @@ func (c *nativeFrameObserver) observe(data []byte) {
 			c.remaining = int(binary.BigEndian.Uint32(c.prefix[:]))
 			c.prefixBytes = 0
 			c.headerBytes = 0
+			c.frameBytes, c.treeBytes = 0, 0
 			if c.remaining == 0 {
 				continue
 			}
@@ -158,7 +171,74 @@ func (c *nativeFrameObserver) observe(data []byte) {
 				}
 			}
 		}
+		if !c.response && c.headerBytes == len(c.header) && binary.BigEndian.Uint32(c.header[:4]) == 0xfe534d42 && binary.LittleEndian.Uint16(c.header[12:14]) == 3 {
+			start, end := max(c.frameBytes, 64), min(c.frameBytes+n, 64+len(c.tree))
+			if start < end {
+				copy(c.tree[start-64:end-64], data[start-c.frameBytes:end-c.frameBytes])
+				c.treeBytes = end - 64
+			}
+		}
+		c.frameBytes += n
 		data = data[n:]
 		c.remaining -= n
+		if c.remaining == 0 && c.treeBytes >= 8 {
+			h := nativeTreeObservation{MessageID: binary.LittleEndian.Uint64(c.header[24:32]), Offset: binary.LittleEndian.Uint16(c.tree[4:6]), Length: binary.LittleEndian.Uint16(c.tree[6:8])}
+			start, end := int(h.Offset)-64, int(h.Offset)-64+int(h.Length)
+			if start < 8 || end > c.treeBytes || h.Length%2 != 0 {
+				h.Truncated = true
+			} else {
+				words := make([]uint16, h.Length/2)
+				for i := range words {
+					words[i] = binary.LittleEndian.Uint16(c.tree[start+2*i:])
+				}
+				h.Path = string(utf16.Decode(words))
+			}
+			c.observation.mu.Lock()
+			if len(c.observation.trees) < 8 {
+				c.observation.trees = append(c.observation.trees, h)
+			}
+			c.observation.mu.Unlock()
+		}
+	}
+}
+
+func TestNativeWireObservationCapturesOnlyBoundedTreePaths(t *testing.T) {
+	var observation nativeWireObservation
+	observer := nativeFrameObserver{observation: &observation}
+	path := `\\127.0.0.1\rfs-native-123`
+	words := utf16.Encode([]rune(path))
+	frame := make([]byte, 4+72+2*len(words))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(frame)-4))
+	copy(frame[4:8], []byte{0xfe, 'S', 'M', 'B'})
+	binary.LittleEndian.PutUint16(frame[16:18], 3)
+	binary.LittleEndian.PutUint64(frame[28:36], 17)
+	binary.LittleEndian.PutUint16(frame[68:70], 9)
+	binary.LittleEndian.PutUint16(frame[72:74], 72)
+	binary.LittleEndian.PutUint16(frame[74:76], uint16(2*len(words)))
+	for i, word := range words {
+		binary.LittleEndian.PutUint16(frame[76+2*i:], word)
+	}
+	for _, b := range frame {
+		observer.observe([]byte{b})
+	}
+	if len(observation.trees) != 1 || observation.trees[0].Path != path || observation.trees[0].MessageID != 17 || observation.trees[0].Truncated {
+		t.Fatalf("fragmented TREE_CONNECT path: %+v", observation.trees)
+	}
+	binary.LittleEndian.PutUint16(frame[16:18], 1)
+	observer.observe(frame)
+	if len(observation.trees) != 1 {
+		t.Fatal("session payload was interpreted as a tree path")
+	}
+	binary.LittleEndian.PutUint16(frame[16:18], 3)
+	binary.LittleEndian.PutUint16(frame[74:76], 65534)
+	observer.observe(frame)
+	if len(observation.trees) != 2 || !observation.trees[1].Truncated || observation.trees[1].Path != "" {
+		t.Fatalf("out-of-bound path: %+v", observation.trees)
+	}
+	for range 16 {
+		observer.observe(frame)
+	}
+	if len(observation.trees) != 8 {
+		t.Fatalf("retained %d paths", len(observation.trees))
 	}
 }

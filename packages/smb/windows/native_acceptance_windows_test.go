@@ -245,12 +245,16 @@ func (b *nativeBridge) mapDrive(t *testing.T) error {
 	defer cancel()
 	b.mapping, err = Map(ctx, MappingOptions{LocalPath: b.path, Share: b.share, TCPPort: b.port})
 	if err != nil {
+		t.Logf("advertised share=%q requested UNC=%q server=%+v", b.share, (MappingOptions{Share: b.share}).remotePath(), b.smb.Status())
 		b.serveMu.Lock()
 		t.Logf("Map error=%v TCP port=%d accepted=%d readBytes=%d writtenBytes=%d Serve returned=%v error=%v", err, b.port, b.wire.connections.Load(), b.wire.readBytes.Load(), b.wire.writtenBytes.Load(), b.serveReturned, b.serveErr)
 		b.serveMu.Unlock()
 		b.wire.mu.Lock()
 		for i, h := range b.wire.headers {
 			t.Logf("SMB header[%d] response=%v protocol=0x%08x command=0x%04x messageID=%d creditCharge=%d flags=0x%08x status=0x%08x", i, h.Response, h.Protocol, h.Command, h.MessageID, h.CreditCharge, h.Flags, h.Status)
+		}
+		for i, tree := range b.wire.trees {
+			t.Logf("TREE_CONNECT[%d] messageID=%d path=%q offset=%d length=%d truncated=%v", i, tree.MessageID, tree.Path, tree.Offset, tree.Length, tree.Truncated)
 		}
 		b.wire.mu.Unlock()
 	}
