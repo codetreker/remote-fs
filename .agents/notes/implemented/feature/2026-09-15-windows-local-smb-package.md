@@ -38,7 +38,7 @@ SMB 核心依赖 storage、metastore 和 authz，不导入 HTTP、SQLite、FUSE 
 
 `Map` 只在显式调用时改变当前用户的系统映射。helper 检查 Windows client edition、build 和必要的 typed 参数，将 `TcpPort`、TCP transport、`UseWriteThrough`、`RequireIntegrity` 与关闭持久／全局／凭据保存的选项交给 `New-SmbMapping`。程序固定，值通过 JSON stdin 传入，不拼入 PowerShell 语法；它不请求提权，也不修改注册表、安全策略或系统 445 服务。系统拒绝权限或不支持的参数时，错误保留给宿主。[Microsoft 的端口说明](https://learn.microsoft.com/en-us/windows-server/storage/file-server/smb-ports)与[映射参数](https://learn.microsoft.com/en-us/powershell/module/smbshare/new-smbmapping?view=windowsserver2025-ps)定义系统能力，实际 loopback 认证仍须原生验收。
 
-`MappingStatus` 区分参数已被接受与实际观察到的盘符、UNC、连接状态、DOS-device target；它不声称系统查询返回了端口、缓存标志或 generation。Mapping 保存 SID、AuthenticationID、SessionID，并在移除前核对实际映射。宿主必须独占管理选定盘符，因为同一登录中的外部替换若恢复为相同 tuple，系统观察无法证明其代际。创建结果未知不取得删除权；已确认创建但核验或回滚失败可以返回 Mapping 与 error，调用方保留该对象继续清理。
+`MappingStatus` 区分参数已被接受与实际观察到的盘符、UNC、连接状态、DOS-device target。provider 可以暴露端口或策略属性；helper 不依赖或验证这些 provider 属性，不假定跨 provider 一致的查询保证，也不依赖 provider-specific generation。Mapping 保存 SID、AuthenticationID、SessionID，并在移除前核对实际映射。宿主必须独占管理选定盘符，因为同一登录中的外部替换若恢复为相同 tuple，系统观察无法证明其代际。创建结果未知不取得删除权；已确认创建但核验或回滚失败可以返回 Mapping 与 error，调用方保留该对象继续清理。
 
 普通 `Unmount` 使用非强制移除，有打开文件时保留映射并返回 busy。`ForceUnmount` 是明确的破坏性断开，不保证在途 I/O 成功或远端结果已确认。二者都不关闭 Export／Server。[WNetCancelConnection2W](https://learn.microsoft.com/en-us/windows/win32/api/winnetwk/nf-winnetwk-wnetcancelconnection2w)的按登录映射与 force 行为，是这些所有权限制的依据。
 
@@ -98,7 +98,7 @@ Windows 使用系统自带客户端，业务能够在同一 Go 进程掌握本�
 
 ### 原生验证仍待完成
 
-Windows 11 ARM64 CI 已配置普通 Go build 下的真实 SSPI、系统 Map 和 Win32 文件操作测试，并检查实际 client edition、build 与架构。`TestNativeWindowsHTTPBridge` 使用真实 HTTP／SMB／SSPI 链路和有界内存 authority，观察自定义端口、签名 WRITE、暂停 HTTP 确认时的 WriteFile 行为，以及持续打开、negative lookup、目录变化、断线和 busy Unmount；它不证明 Windows SQLite 持久实现。原生 CI 结果仍待执行，Linux 测试与交叉编译不提供这些结论。
+Windows 11 ARM64 CI 已配置普通 Go build 下的真实 SSPI、系统 Map 和 Win32 文件操作测试，并检查实际 client edition、build 与架构。`TestNativeWindowsHTTPBridge` 使用真实 HTTP／SMB／SSPI 链路和有界内存 authority，观察自定义端口、签名 WRITE、暂停 HTTP 确认时的 WriteFile 行为，以及持续打开、negative lookup、目录变化、断线和 busy Unmount；它不证明 Windows SQLite 持久实现。独立 SSPI 认证与取消用例已在真实 Windows 11 Enterprise build 26200 上通过；完整 Map 与原生接入验收仍未完成，Linux 测试与交叉编译也不提供这些结论。
 
 完整接入保留以下验收义务；现有测试的具体对应关系由[测试策略](../../../../docs/testing.md)维护，未执行或尚未覆盖的场景不能记作已通过：
 

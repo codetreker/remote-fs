@@ -7,16 +7,58 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
 	"syscall"
+	"testing"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
+
+func TestNativeAuthoritySubscriptionStartsAtRetention(t *testing.T) {
+	a := newNativeAuthority()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	handler, err := httprest.NewHandler(a, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	defer func() {
+		handler.Stop()
+		server.Close()
+		if err := handler.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	}()
+	client, err := httprest.Dial(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, populated := range []bool{false, true} {
+		if populated {
+			a.mu.Lock()
+			a.record(a.nodes[1], metastore.Modified, metastore.ChangeModTime, nil)
+			a.mu.Unlock()
+		}
+		sub, err := client.Subscribe(ctx)
+		if err != nil {
+			t.Fatalf("subscribe populated=%v: %v", populated, err)
+		}
+		if sub.Incarnation() != metastore.Incarnation(a.identity) || sub.Position() != a.position() || sub.Tail() != a.position() || !sub.CaughtUp() {
+			t.Errorf("subscription populated=%v: incarnation=%q position=%d tail=%d caughtUp=%v", populated, sub.Incarnation(), sub.Position(), sub.Tail(), sub.CaughtUp())
+		}
+		if err := sub.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 // This bounded in-memory authority lets native acceptance exercise HTTP, SMB,
 // SSPI and Windows mapping without depending on a Linux-only database driver.
@@ -904,7 +946,7 @@ func (a *nativeAuthority) Since(ctx context.Context, after metastore.Position, l
 	if err := ctx.Err(); err != nil {
 		return retention, result.Fail(err)
 	}
-	if limit <= 0 || after < 0 {
+	if limit < 0 || after < 0 {
 		return retention, result.Fail(syscall.EINVAL)
 	}
 	count := 0

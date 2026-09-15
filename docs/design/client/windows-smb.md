@@ -80,7 +80,7 @@ HTTP Windows 数据与控制入口分别为 `/v3/windows` 和 `/v3/windows-contr
 
 创建使用系统明确支持的 typed 参数：指定 TcpPort、TCP transport、UseWriteThrough、RequireIntegrity，并关闭 Persistent、GlobalMapping 和 SaveCredentials。参数缺失或类型不相容会失败。固定 PowerShell 程序通过 stdin 接收 JSON 值，share 名不拼入命令语法。
 
-创建参数被接受与 OS 身份被观察是两件事。`MappingStatus.ParametersAccepted` 表示创建成功接受了请求参数；另记录实际观察到的 LocalPath、RemotePath、DOS-device target 和 connection status。Windows 的 documented mapping query 不提供可核验的端口、策略标志或 generation，因此 Status 不声称查询过这些事实，也不进行一次新的 OS 查询。
+创建参数被接受与 OS 身份被观察是两件事。`MappingStatus.ParametersAccepted` 表示创建成功接受了请求参数；另记录实际观察到的 LocalPath、RemotePath、DOS-device target 和 connection status。provider 可以暴露 TcpPort、RequireIntegrity、UseWriteThrough 或 TransportType 等属性；helper 的公共契约不依赖或验证这些 provider 属性，也不假定它们有跨 provider 一致的查询保证。Status 不把这些字段报告为已查询或已验证，不依赖 provider-specific generation，且不进行一次新的 OS 查询。
 
 Mapping 记录 SID、AuthenticationID 和 SessionID。Unmount 再次核对登录身份、盘符、UNC 与 DOS-device target，只移除自己创建并仍能识别的映射。宿主必须独占管理这个盘符，禁止在 Mapping 存活时由外部替换它，包括替换为 OS 无法区分的相同映射。这里没有跨进程或全局盘符注册表。
 

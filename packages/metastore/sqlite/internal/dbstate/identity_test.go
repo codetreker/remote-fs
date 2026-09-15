@@ -136,8 +136,12 @@ func TestAllocatorsPublishOnlyThroughTheCallingTransaction(t *testing.T) {
 					if next != 7 || err != nil {
 						t.Fatalf("change allocation=%d, %v", next, err)
 					}
-					execState(t, tx, `INSERT INTO changes (position, previous_position, volume, kind, parent, recorded_sec, recorded_nsec)
-						VALUES (?, 2, 1, 0, 1, 0, 0)`, next)
+					execState(t, tx, `INSERT INTO changes
+						(position, previous_position, volume, kind, parent, name, node, mode, size,
+						 atime_sec, atime_nsec, mtime_sec, mtime_nsec, recorded_sec, recorded_nsec, notification)
+						SELECT ?, position, volume, kind, parent, name, node, mode, size,
+						 atime_sec, atime_nsec, mtime_sec, mtime_nsec, recorded_sec, recorded_nsec, notification
+						FROM changes WHERE position=2`, next)
 				}
 				if commit {
 					err = tx.Commit()

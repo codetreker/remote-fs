@@ -68,8 +68,8 @@ func (r mappingRecord) sameMapping(other mappingRecord) bool {
 }
 
 // MappingStatus distinguishes accepted creation parameters from the most recent
-// observed mapping identity. Windows does not expose the port and policy flags
-// through the documented mapping query; this is not a claim to have queried them.
+// observed mapping identity. The helper does not read or verify provider-specific
+// port or policy properties; it does not assume a cross-provider query contract.
 type MappingStatus struct {
 	ParametersAccepted                                  bool
 	Options                                             MappingOptions
@@ -90,8 +90,8 @@ type mappingSystem interface {
 
 // Mapping owns only the OS mapping created by Map, never an SMB Server or Export.
 // Operations verify the recorded login, drive/UNC and DOS-device target.
-// Windows exposes no mapping generation: callers must not externally replace an
-// owned drive, including replacing it with an indistinguishable identical mapping.
+// Ownership does not rely on a provider-specific mapping generation. Callers must
+// not externally replace an owned drive, including an indistinguishable mapping.
 // A zero Mapping owns nothing; callers obtain a valid instance from Map.
 type Mapping struct {
 	mu       sync.Mutex

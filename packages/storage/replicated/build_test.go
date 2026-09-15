@@ -736,7 +736,14 @@ func (l unappliableReplayLog) Since(ctx context.Context, after metastore.Positio
 		return retention, err
 	}
 	for i := range changes {
+		if changes[i].Kind != metastore.Created {
+			continue
+		}
+		// Keep the event valid for transport so rejection tests snapshot application.
+		notification := *changes[i].Notification
+		notification.Before, notification.After = notification.After, nil
 		changes[i].Kind, changes[i].Node = metastore.Removed, nil
+		changes[i].Notification = &notification
 	}
 	return retention, nil
 }
