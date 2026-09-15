@@ -137,7 +137,9 @@ FUSE 不保存全文件缓冲区，objectstore 仍可能完整读取、重建不
 
 挂载层通过 `storage.ErrnoOf` 分类错误，`nil` 为成功。已接受的请求取消返回 `EINTR`；deadline、未知错误与无法证明修改结果的失败返回 `EIO`。go-fuse 的请求 context 被取消后，原 FUSE 请求仍得到回复。
 
-文件创建使用原子的 open/create 结果；Mkdir 和同时修改大小、模式或时间的 Setattr 仍可能含多个阶段。某阶段已经产生效果后，后续取消通过拥有最终分类的 `EIO` 保留原始原因，不能把整个操作报告成未发生。效果开始前接受的取消仍为 `EINTR`。
+文件创建使用原子的 open/create 结果；Mkdir 和同时修改大小、模式或时间的 Setattr 仍可能含多个阶段。某阶段已经产生效果后，仍需执行的后续阶段被取消时，以 `EIO` 保留原始原因，不能把整个操作报告成未发生。效果开始前接受的取消仍为 `EINTR`。
+
+Setattr 含模式或时间修改时，使用 File.SetAttr 或 FileSession.SetNodeAttr 成功返回的权威属性，经节点身份与属性表示校验后直接填充回复，不再查询一次 Getattr。全部修改已经确认后到达的请求取消不推翻这份结果；真实修改错误、未知结果或无效返回属性仍失败。只有大小变化或空 AttrChange 的路径保留原有 Getattr；先完成截断、再执行模式／时间阶段之前被取消时仍为 `EIO`。
 
 remote storage 在 HTTP `Do` 前接受取消时返回 `EINTR`，已发出的只读操作也可放弃读取。修改进入 dispatch 后，请求取消不能证明未执行；文件动作通过有界历史核对，仍不能确定的结果以 `EIO` 报告。打开的响应与确认失败必须清理或退役相应引用，不能留下调用方未知的无限引用。没有 Create／Truncate 的已有文件打开，在 ACK 为带 context.Canceled 的规范 EINTR、且同一能力的 Close 清理原始结果为 nil 时，返回无 File 的 EINTR；其余 ACK 失败保持 EIO，完整条件见[文件确认协议](../server/file-handles.md#五http复制与资源)。这不把任意打开变成可重试操作，也不改变丢失 ACK 的既有核对。成功修改未取得副本 barrier 确认时同样为 `EIO`。网络 errno 不进入 volume 错误链。
 

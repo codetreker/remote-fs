@@ -259,7 +259,6 @@ func TestSetattrCancellationAccountsForCompletedStages(t *testing.T) {
 			{"truncate then attributes", "stat", gofuse.FATTR_SIZE, syscall.EIO, 1},
 			{"truncate then mode", "setattr", gofuse.FATTR_SIZE | gofuse.FATTR_MODE, syscall.EIO, 1},
 			{"mode refused", "setattr", gofuse.FATTR_MODE, syscall.EIO, 0},
-			{"mode then attributes", "stat", gofuse.FATTR_MODE, syscall.EIO, 0},
 		} {
 			t.Run(fmt.Sprintf("%s/handle=%v", test.name, withHandle), func(t *testing.T) {
 				_, n, downstream := mutationTree(t)
@@ -298,6 +297,34 @@ func TestSetattrCancellationAccountsForCompletedStages(t *testing.T) {
 	}
 }
 
+func TestSetattrReplyUsesConfirmedAttributes(t *testing.T) {
+	for _, withHandle := range []bool{false, true} {
+		t.Run(fmt.Sprintf("handle=%v", withHandle), func(t *testing.T) {
+			_, n, downstream := mutationTree(t)
+			var file fsbridge.FileHandle
+			if withHandle {
+				file = mutationHandle(t, n)
+			}
+			downstream.before = func(_ context.Context, op string) error {
+				if op == "stat" {
+					t.Error("confirmed attribute mutation made an additional read")
+					return context.Canceled
+				}
+				return nil
+			}
+			var out gofuse.AttrOut
+			if errno := n.Setattr(t.Context(), file, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+				Valid: gofuse.FATTR_MODE, Mode: 0640,
+			}}, &out); errno != 0 {
+				t.Fatal(errno)
+			}
+			if out.Mode&0777 != 0640 || out.Size != uint64(len("contents")) {
+				t.Fatalf("confirmed attributes: mode=%o size=%d", out.Mode, out.Size)
+			}
+		})
+	}
+}
+
 func TestSetattrCancellationBetweenSuccessfulMutationStages(t *testing.T) {
 	for _, stage := range []string{"truncate", "setattr"} {
 		t.Run(stage, func(t *testing.T) {
@@ -319,8 +346,16 @@ func TestSetattrCancellationBetweenSuccessfulMutationStages(t *testing.T) {
 			in := &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
 				Valid: gofuse.FATTR_SIZE | gofuse.FATTR_MODE, Size: 3, Mode: 0640,
 			}}
-			if errno := n.Setattr(ctx, nil, in, &gofuse.AttrOut{}); errno != syscall.EIO {
-				t.Fatalf("setattr canceled after %s returned %v, want EIO", stage, errno)
+			var want syscall.Errno
+			if stage == "truncate" {
+				want = syscall.EIO
+			}
+			var out gofuse.AttrOut
+			if errno := n.Setattr(ctx, nil, in, &out); errno != want {
+				t.Fatalf("setattr canceled after %s returned %v, want %v", stage, errno, want)
+			}
+			if stage == "setattr" && (out.Mode&0777 != 0640 || out.Size != 3) {
+				t.Fatalf("confirmed attributes: mode=%o size=%d", out.Mode, out.Size)
 			}
 			if stage == "truncate" && setters != 0 || stage == "setattr" && setters != 1 {
 				t.Fatalf("setattr canceled after %s attempted %d attribute changes", stage, setters)
@@ -389,7 +424,7 @@ func TestMutationSuccessIgnoresLateCancellation(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			downstream.after = func(op string) {
-				if op == "stat" {
+				if operation == "setattr" && op == "setattr" || operation != "setattr" && op == "stat" {
 					cancel()
 				}
 			}

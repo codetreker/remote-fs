@@ -147,7 +147,10 @@ func (n *node) setattr(ctx context.Context, f fs.FileHandle, in *gofuse.SetAttrI
 		if err := n.checkAttr(attr); err != nil {
 			return err
 		}
-		changed = true
+		if errno := n.volume.fillAttr(&out.Attr, attr); errno != 0 {
+			return errno
+		}
+		return nil
 	}
 	return afterMutation(changed, n.getattr(ctx, f, out))
 }
