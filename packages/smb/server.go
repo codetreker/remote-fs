@@ -14,12 +14,14 @@ import (
 )
 
 type Server struct {
+	leases                     *leaseTable
 	shutdownCleanupMu          sync.Mutex
 	shutdownCleanup            *exportCleanup
 	config                     Config
 	mu                         sync.Mutex
 	exports                    map[string]*Export
 	connections                map[*connection]struct{}
+	sessions                   *sessionRegistry
 	listener                   net.Listener
 	started, stopping, stopped bool
 	done                       chan struct{}
@@ -32,16 +34,17 @@ type Server struct {
 }
 
 type Export struct {
-	server    *Server
-	share     Share
-	key       string
-	refs      int
-	opens     int
-	active    int
-	stopping  bool
-	changes   *notificationManager
-	cleanupMu sync.Mutex
-	cleanup   *exportCleanup
+	volumeIdentity string
+	server         *Server
+	share          Share
+	key            string
+	refs           int
+	opens          int
+	active         int
+	stopping       bool
+	changes        *notificationManager
+	cleanupMu      sync.Mutex
+	cleanup        *exportCleanup
 }
 
 func New(config Config) (*Server, error) {
@@ -51,7 +54,7 @@ func New(config Config) (*Server, error) {
 	if err := config.Limits.check(); err != nil {
 		return nil, fmt.Errorf("SMB limits: %w", err)
 	}
-	s := &Server{config: config, exports: make(map[string]*Export), connections: make(map[*connection]struct{}), done: make(chan struct{})}
+	s := &Server{config: config, exports: make(map[string]*Export), connections: make(map[*connection]struct{}), sessions: newSessionRegistry(), leases: newLeaseTable(config.Limits), done: make(chan struct{})}
 	rand.Read(s.guid[:])
 	return s, nil
 }
@@ -77,7 +80,7 @@ func (s *Server) Publish(share Share) (*Export, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !state.Enabled || state.MaxEventBytes <= 0 || state.MaxEventBytes > s.config.Limits.MaxDirectoryBytes || s.config.Limits.MaxNotifyEvents < 2 || state.MaxEventBytes > (s.config.Limits.MaxNotifyBytes-4*metastore.MaxNotificationAncestors-64)/2 {
+	if !state.Enabled || state.VolumeIdentity == "" || state.MaxEventBytes <= 0 || state.MaxEventBytes > s.config.Limits.MaxDirectoryBytes || s.config.Limits.MaxNotifyEvents < 2 || state.MaxEventBytes > (s.config.Limits.MaxNotifyBytes-4*metastore.MaxNotificationAncestors-64)/2 {
 		return nil, ErrConfig
 	}
 	changes, err := newNotificationManager(ctx, share.Changes, s.config.Limits)
@@ -98,7 +101,7 @@ func (s *Server) Publish(share Share) (*Export, error) {
 	if _, ok := s.exports[key]; ok {
 		return nil, ErrBusy
 	}
-	e := &Export{server: s, share: share, key: key, changes: changes}
+	e := &Export{server: s, share: share, key: key, changes: changes, volumeIdentity: state.VolumeIdentity}
 	s.exports[key] = e
 	keep = true
 	return e, nil
@@ -230,6 +233,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	err := s.cleanupErr
 	s.mu.Unlock()
+	if s.leases != nil {
+		if slots, bytes := s.leases.counts(); slots != 0 || bytes != 0 {
+			return errors.Join(err, retryErr, ErrBusy)
+		}
+	}
 	return errors.Join(err, retryErr)
 }
 
@@ -336,6 +344,9 @@ func (s *Server) Status() Status {
 			status.DegradedExports++
 		}
 		e.changes.mu.Unlock()
+	}
+	if s.leases != nil {
+		status.LeaseSlots, status.LeaseBytes = s.leases.counts()
 	}
 	return status
 }

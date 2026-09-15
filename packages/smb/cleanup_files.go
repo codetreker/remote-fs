@@ -27,6 +27,7 @@ func (d *fileDispatcher) closeAll(ctx context.Context) error {
 		_, existed := d.handles[id]
 		delete(d.handles, id)
 		d.mu.Unlock()
+		d.leases.release(h.lease)
 		if existed && d.onOpen != nil {
 			d.onOpen(-1)
 		}

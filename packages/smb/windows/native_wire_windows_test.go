@@ -12,16 +12,38 @@ import (
 )
 
 type nativeWireObservation struct {
-	connections  atomic.Uint64
-	writes       atomic.Uint64
-	signedWrites atomic.Uint64
-	readBytes    atomic.Uint64
-	writtenBytes atomic.Uint64
-	mu           sync.Mutex
-	headers      []nativeHeaderObservation
-	trees        []nativeTreeObservation
-	creates      []nativeCreateObservation
-	operations   []nativeOperationObservation
+	connections    atomic.Uint64
+	writes         atomic.Uint64
+	signedWrites   atomic.Uint64
+	readBytes      atomic.Uint64
+	writtenBytes   atomic.Uint64
+	mu             sync.Mutex
+	headers        []nativeHeaderObservation
+	trees          []nativeTreeObservation
+	creates        []nativeCreateObservation
+	operations     []nativeOperationObservation
+	negotiations   []nativeNegotiateObservation
+	createReplies  []nativeCreateReplyObservation
+	createSequence atomic.Uint64
+	leaseResponses atomic.Uint64
+	unsafeCaching  atomic.Bool
+}
+
+type nativeNegotiateObservation struct {
+	Dialect      uint16
+	Capabilities uint32
+}
+type nativeLeaseObservation struct {
+	Version  int
+	State    uint32
+	Epoch    uint16
+	Duration uint64
+}
+type nativeCreateReplyObservation struct {
+	MessageID uint64
+	Oplock    byte
+	Leases    []nativeLeaseObservation
+	Truncated bool
 }
 
 type nativeOperationObservation struct {
@@ -37,6 +59,8 @@ type nativeOperationObservation struct {
 }
 
 type nativeCreateObservation struct {
+	Sequence                                                             uint64
+	Name                                                                 string
 	MessageID                                                            uint64
 	SecurityFlags, Oplock                                                byte
 	Impersonation, Access, Attributes, ShareAccess, Disposition, Options uint32
@@ -117,8 +141,9 @@ func (l nativeObservedListener) Accept() (net.Conn, error) {
 		sent:     nativeFrameObserver{observation: l.observation, response: true}}, nil
 }
 
-// Only bounded protocol metadata is logged. Body capture stays within the first
-// TREE_CONNECT or CREATE compound member; context values are not logged.
+// Only bounded protocol metadata is logged. Variable body capture stays within
+// the first TREE_CONNECT or CREATE member; context output is limited to names
+// and fixed lease grant fields.
 type nativeObservedConnection struct {
 	net.Conn
 	received nativeFrameObserver
@@ -141,6 +166,8 @@ type nativeFrameObserver struct {
 	createBytes    int
 	operation      [24]byte
 	operationBytes int
+	negotiate      [28]byte
+	negotiateBytes int
 }
 
 func (c *nativeObservedConnection) Read(buffer []byte) (int, error) {
@@ -171,6 +198,7 @@ func (c *nativeFrameObserver) observe(data []byte) {
 			c.headerBytes = 0
 			c.frameBytes, c.treeBytes, c.createBytes = 0, 0, 0
 			c.operationBytes = 0
+			c.negotiateBytes = 0
 			if c.remaining == 0 {
 				continue
 			}
@@ -215,7 +243,7 @@ func (c *nativeFrameObserver) observe(data []byte) {
 				c.treeBytes = end - 64
 			}
 		}
-		if !c.response && c.headerBytes == len(c.header) && binary.BigEndian.Uint32(c.header[:4]) == 0xfe534d42 && binary.LittleEndian.Uint16(c.header[12:14]) == 5 {
+		if c.headerBytes == len(c.header) && binary.BigEndian.Uint32(c.header[:4]) == 0xfe534d42 && binary.LittleEndian.Uint16(c.header[12:14]) == 5 && (!c.response || binary.LittleEndian.Uint32(c.header[8:12]) == 0) {
 			start, end := max(c.frameBytes, 64), min(c.frameBytes+n, 64+len(c.create))
 			if next := int(binary.LittleEndian.Uint32(c.header[20:24])); next != 0 {
 				end = min(end, next)
@@ -240,6 +268,16 @@ func (c *nativeFrameObserver) observe(data []byte) {
 					copy(c.operation[start-64:end-64], data[start-c.frameBytes:end-c.frameBytes])
 					c.operationBytes = end - 64
 				}
+			}
+		}
+		if c.response && c.headerBytes == 64 && binary.BigEndian.Uint32(c.header[:4]) == 0xfe534d42 && binary.LittleEndian.Uint16(c.header[12:14]) == 0 && binary.LittleEndian.Uint32(c.header[8:12]) == 0 {
+			start, end := max(c.frameBytes, 64), min(c.frameBytes+n, 92)
+			if next := int(binary.LittleEndian.Uint32(c.header[20:24])); next != 0 {
+				end = min(end, next)
+			}
+			if start < end {
+				copy(c.negotiate[start-64:end-64], data[start-c.frameBytes:end-c.frameBytes])
+				c.negotiateBytes = end - 64
 			}
 		}
 		c.frameBytes += n
@@ -280,8 +318,18 @@ func (c *nativeFrameObserver) observe(data []byte) {
 			c.observation.operations = nativeRetainLast(c.observation.operations, h, 16)
 			c.observation.mu.Unlock()
 		}
+		if c.remaining == 0 && c.negotiateBytes == 28 {
+			h := nativeNegotiateObservation{Dialect: binary.LittleEndian.Uint16(c.negotiate[4:6]), Capabilities: binary.LittleEndian.Uint32(c.negotiate[24:28])}
+			c.observation.mu.Lock()
+			c.observation.negotiations = nativeRetainLast(c.observation.negotiations, h, 8)
+			c.observation.mu.Unlock()
+		}
 		if c.remaining == 0 && c.createBytes >= 56 {
-			c.recordCreate()
+			if c.response {
+				c.recordCreateReply()
+			} else {
+				c.recordCreate()
+			}
 		}
 		if c.remaining == 0 && c.treeBytes >= 8 {
 			h := nativeTreeObservation{MessageID: binary.LittleEndian.Uint64(c.header[24:32]), Offset: binary.LittleEndian.Uint16(c.tree[4:6]), Length: binary.LittleEndian.Uint16(c.tree[6:8])}
@@ -345,9 +393,20 @@ func TestNativeWireObservationCapturesOnlyBoundedTreePaths(t *testing.T) {
 
 func (c *nativeFrameObserver) recordCreate() {
 	b := c.create[:c.createBytes]
-	h := nativeCreateObservation{MessageID: binary.LittleEndian.Uint64(c.header[24:32]), SecurityFlags: b[2], Oplock: b[3], Impersonation: binary.LittleEndian.Uint32(b[4:8]), Access: binary.LittleEndian.Uint32(b[24:28]), Attributes: binary.LittleEndian.Uint32(b[28:32]), ShareAccess: binary.LittleEndian.Uint32(b[32:36]), Disposition: binary.LittleEndian.Uint32(b[36:40]), Options: binary.LittleEndian.Uint32(b[40:44])}
+	h := nativeCreateObservation{Sequence: c.observation.createSequence.Add(1), MessageID: binary.LittleEndian.Uint64(c.header[24:32]), SecurityFlags: b[2], Oplock: b[3], Impersonation: binary.LittleEndian.Uint32(b[4:8]), Access: binary.LittleEndian.Uint32(b[24:28]), Attributes: binary.LittleEndian.Uint32(b[28:32]), ShareAccess: binary.LittleEndian.Uint32(b[32:36]), Disposition: binary.LittleEndian.Uint32(b[36:40]), Options: binary.LittleEndian.Uint32(b[40:44])}
 	offset, length := uint64(binary.LittleEndian.Uint32(b[48:52])), uint64(binary.LittleEndian.Uint32(b[52:56]))
 	nameOffset, nameLength := uint64(binary.LittleEndian.Uint16(b[44:46])), uint64(binary.LittleEndian.Uint16(b[46:48]))
+	if nameLength != 0 {
+		if nameOffset < 120 || nameLength > 1024 || nameLength%2 != 0 || nameOffset+nameLength > uint64(64+len(b)) {
+			h.Truncated = true
+		} else {
+			words := make([]uint16, nameLength/2)
+			for i := range words {
+				words[i] = binary.LittleEndian.Uint16(b[nameOffset-64+uint64(2*i):])
+			}
+			h.Name = string(utf16.Decode(words))
+		}
+	}
 	if length != 0 {
 		if offset < 120 || offset+length > uint64(64+len(b)) || nameLength != 0 && (nameOffset < 120 || nameOffset+nameLength > uint64(64+len(b)) || nameOffset < offset+length && offset < nameOffset+nameLength) {
 			h.Truncated = true
@@ -383,6 +442,7 @@ func (c *nativeFrameObserver) recordCreate() {
 	}
 	if h.Truncated {
 		h.Contexts = nil
+		h.Name = ""
 	}
 	clear(c.create[:])
 	c.observation.mu.Lock()
@@ -529,5 +589,178 @@ func TestNativeSessionSetupObservationRejectsTokenOverlap(t *testing.T) {
 				t.Fatalf("invalid token span retained session scalars: %+v", observation.operations)
 			}
 		})
+	}
+}
+
+func (c *nativeFrameObserver) recordCreateReply() {
+	b := c.create[:c.createBytes]
+	h := nativeCreateReplyObservation{MessageID: binary.LittleEndian.Uint64(c.header[24:32])}
+	if len(b) < 88 {
+		h.Truncated = true
+	} else {
+		h.Oplock = b[2]
+		offset, length := uint64(binary.LittleEndian.Uint32(b[80:84])), uint64(binary.LittleEndian.Uint32(b[84:88]))
+		if length != 0 {
+			if offset < 152 || offset+length > uint64(64+len(b)) {
+				h.Truncated = true
+			} else {
+				contexts := b[offset-64 : offset-64+length]
+				for count := 0; len(contexts) > 0; count++ {
+					if len(contexts) < 16 || count == 16 {
+						h.Truncated = true
+						break
+					}
+					next := int(binary.LittleEndian.Uint32(contexts[:4]))
+					end := len(contexts)
+					if next != 0 {
+						if next < 16 || next > end {
+							h.Truncated = true
+							break
+						}
+						end = next
+					}
+					name, size := int(binary.LittleEndian.Uint16(contexts[4:6])), int(binary.LittleEndian.Uint16(contexts[6:8]))
+					data, dataSize := uint64(binary.LittleEndian.Uint16(contexts[10:12])), uint64(binary.LittleEndian.Uint32(contexts[12:16]))
+					if name < 16 || size == 0 || size > 32 || name+size > end || dataSize != 0 && (data < 16 || data+dataSize > uint64(end) || uint64(name) < data+dataSize && data < uint64(name+size)) {
+						h.Truncated = true
+						break
+					}
+					if string(contexts[name:name+size]) == "RqLs" {
+						if dataSize != 32 && dataSize != 52 {
+							h.Truncated = true
+							break
+						}
+						v := contexts[data : data+dataSize]
+						lease := nativeLeaseObservation{Version: 1, State: binary.LittleEndian.Uint32(v[16:20]), Duration: binary.LittleEndian.Uint64(v[24:32])}
+						if dataSize == 52 {
+							lease.Version = 2
+							lease.Epoch = binary.LittleEndian.Uint16(v[48:50])
+						}
+						h.Leases = append(h.Leases, lease)
+					}
+					if next == 0 {
+						break
+					}
+					contexts = contexts[next:]
+				}
+			}
+		}
+	}
+	clear(c.create[:])
+	if h.Truncated || h.Oplock != 0 && h.Oplock != 0xff || h.Oplock == 0xff && len(h.Leases) == 0 {
+		c.observation.unsafeCaching.Store(true)
+	}
+	for _, lease := range h.Leases {
+		c.observation.leaseResponses.Add(1)
+		if lease.State != 0 || lease.Duration != 0 || h.Oplock != 0xff {
+			c.observation.unsafeCaching.Store(true)
+		}
+	}
+	c.observation.mu.Lock()
+	c.observation.createReplies = nativeRetainLast(c.observation.createReplies, h, 8)
+	c.observation.mu.Unlock()
+}
+
+func TestNativeWireObservationDecodesZeroRightsLeaseResponses(t *testing.T) {
+	for _, size := range []int{32, 52} {
+		t.Run(map[int]string{32: "v1", 52: "v2"}[size], func(t *testing.T) {
+			var observation nativeWireObservation
+			observer := nativeFrameObserver{observation: &observation, response: true}
+			frame := make([]byte, 4+152+24+size)
+			binary.BigEndian.PutUint32(frame[:4], uint32(len(frame)-4))
+			copy(frame[4:8], []byte{0xfe, 'S', 'M', 'B'})
+			binary.LittleEndian.PutUint16(frame[16:18], 5)
+			b := frame[68:]
+			b[2] = 0xff
+			binary.LittleEndian.PutUint32(b[80:84], 152)
+			binary.LittleEndian.PutUint32(b[84:88], uint32(24+size))
+			ctx := b[88:]
+			binary.LittleEndian.PutUint16(ctx[4:6], 16)
+			binary.LittleEndian.PutUint16(ctx[6:8], 4)
+			binary.LittleEndian.PutUint16(ctx[10:12], 24)
+			binary.LittleEndian.PutUint32(ctx[12:16], uint32(size))
+			copy(ctx[16:20], "RqLs")
+			if size == 52 {
+				binary.LittleEndian.PutUint16(ctx[72:74], 19)
+			}
+			for _, v := range frame {
+				observer.observe([]byte{v})
+			}
+			if observation.leaseResponses.Load() != 1 || observation.unsafeCaching.Load() || len(observation.createReplies) != 1 {
+				t.Fatalf("lease evidence=%+v unsafe=%v", observation.createReplies, observation.unsafeCaching.Load())
+			}
+			lease := observation.createReplies[0].Leases[0]
+			version := 1
+			epoch := uint16(0)
+			if size == 52 {
+				version = 2
+				epoch = 19
+			}
+			if lease.Version != version || lease.State != 0 || lease.Duration != 0 || lease.Epoch != epoch {
+				t.Fatalf("lease=%+v", lease)
+			}
+			binary.LittleEndian.PutUint32(ctx[40:44], 1)
+			observer.observe(frame)
+			if !observation.unsafeCaching.Load() {
+				t.Fatal("nonzero caching grant was ignored")
+			}
+		})
+	}
+}
+
+func TestNativeWireObservationBoundsLeaseRepliesAndNegotiation(t *testing.T) {
+	var observation nativeWireObservation
+	observer := nativeFrameObserver{observation: &observation, response: true}
+	frame := make([]byte, 4+92)
+	binary.BigEndian.PutUint32(frame[:4], 92)
+	copy(frame[4:8], []byte{0xfe, 'S', 'M', 'B'})
+	binary.LittleEndian.PutUint16(frame[72:74], 0x311)
+	binary.LittleEndian.PutUint32(frame[92:96], 0x26)
+	observer.observe(frame)
+	if len(observation.negotiations) != 1 || observation.negotiations[0].Dialect != 0x311 || observation.negotiations[0].Capabilities != 0x26 {
+		t.Fatalf("negotiation=%+v", observation.negotiations)
+	}
+	observer.createBytes = 88
+	observer.create[2] = 0xff
+	binary.LittleEndian.PutUint32(observer.create[80:84], 152)
+	binary.LittleEndian.PutUint32(observer.create[84:88], 65535)
+	observer.recordCreateReply()
+	if !observation.unsafeCaching.Load() || len(observation.createReplies) != 1 || !observation.createReplies[0].Truncated || len(observation.createReplies[0].Leases) != 0 {
+		t.Fatalf("invalidlease=%+v", observation.createReplies)
+	}
+}
+
+func TestNativeWireObservationCorrelatesFreshCreateName(t *testing.T) {
+	var observation nativeWireObservation
+	observer := nativeFrameObserver{observation: &observation, createBytes: 70}
+	b := observer.create[:]
+	binary.LittleEndian.PutUint16(b[44:46], 120)
+	binary.LittleEndian.PutUint16(b[46:48], 14)
+	for i, r := range "new.bin" {
+		binary.LittleEndian.PutUint16(b[56+2*i:], uint16(r))
+	}
+	before := observation.createSequence.Load()
+	observer.recordCreate()
+	if len(observation.creates) != 1 || observation.creates[0].Sequence <= before || observation.creates[0].Name != "new.bin" {
+		t.Fatalf("freshCREATE=%+v", observation.creates)
+	}
+}
+
+func TestNativeLeaseResponseObservationRejectsContextDataOverlap(t *testing.T) {
+	var observation nativeWireObservation
+	observer := nativeFrameObserver{observation: &observation, response: true, createBytes: 144}
+	b := observer.create[:]
+	b[2] = 0xff
+	binary.LittleEndian.PutUint32(b[80:84], 152)
+	binary.LittleEndian.PutUint32(b[84:88], 56)
+	ctx := b[88:]
+	binary.LittleEndian.PutUint16(ctx[4:6], 24)
+	binary.LittleEndian.PutUint16(ctx[6:8], 4)
+	binary.LittleEndian.PutUint16(ctx[10:12], 24)
+	binary.LittleEndian.PutUint32(ctx[12:16], 32)
+	copy(ctx[24:], "RqLs")
+	observer.recordCreateReply()
+	if !observation.unsafeCaching.Load() || observation.leaseResponses.Load() != 0 || len(observation.createReplies[0].Leases) != 0 {
+		t.Fatalf("overlapped lease payload decoded: %+v", observation.createReplies)
 	}
 }

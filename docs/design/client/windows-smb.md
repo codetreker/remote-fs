@@ -32,6 +32,8 @@ Windows 的 `NewAuthenticator` 在每次 Begin 时取得独立的 inbound Negoti
 
 正式协商仍只接受 SMB 3.1.1、SHA-512 preauthentication integrity 与 AES-CMAC signing；preauthentication hash 从真正的 3.1.1 协商开始，正常 session 的签名不能关闭。这项 bootstrap 不扩张旧版 Windows 支持范围。针对已发布 volume 的操作、完整 Windows open intent 和对应的关闭／续期控制仍经过业务授权。远端 HTTP handler 继续按它自己的可信身份与同一语义词汇授权，SMB 本机授权不替代远端授权。
 
+SMB SessionID 由 Server 实例统一分配，在该实例内跨连接唯一且不复用；它与 MappingStatus 中的 OS 登录 SessionID 是不同身份。SESSION_SETUP 的保留字段 Channel 被忽略，不代表接受 multichannel binding。PreviousSessionId 只在新认证成功并完成认证 context 收尾后处理，使用最终成功请求中的值：零、当前候选 session、已不存在或属于其它 SID 的旧 ID 被忽略；同 SID 的旧 session 通过其原拥有者退役并清理。旧状态清理失败阻止新身份激活，保留清理所有权；这条路径不恢复旧 tree、FileId 或 durable handle。
+
 ## 保留对象与远端结果
 
 `WindowsSession` 持有有限期、动作历史、保留引用、共享模式与范围锁。`WindowsFile` 可以指向普通文件、目录或仅请求 metadata 的打开；操作以保留身份寻址，rename、unlink 与同名替换不把原引用转向新节点。
@@ -43,6 +45,18 @@ READ 返回同一捕获状态的属性与范围字节；WRITE、截断及属性�
 每个有副作用的 Windows 动作使用会话 epoch 与原 nonce。已知 receipt 保留成功、拒绝、取消及 lock batch 的 Applied 数量；有错误不代表此前元素已经回滚。未知结果以原 ID QueryAction／CancelAction 核对，不能换新 ID 重做。无法核对时，受影响的 tree 与引用失败并保留未确认计数，不把它包装为一次成功写入。
 
 共享冲突、范围冲突、delete-pending、未持有范围及非 reparse point 使用独立 WindowsFailure，避免只凭 errno 混淆 SMB status。业务拒绝为 access denied；未知结果与不可达保持 I/O failure，不产生空目录、虚构的不存在或旧内容。应用大读写被拆成多个请求时的保证单位仍由 R-CON-5【未决】约束，单个协议请求的验证不等于整个应用调用的证明。
+
+## 零缓存权利的 SMB lease
+
+NEGOTIATE 保留 ClientGUID，并宣告 lease 与 directory-lease 协议能力。CREATE 在请求 OplockLevel=LEASE 且携带一个有效 RqLs 时，支持 32 字节 V1 与 52 字节 V2 context；成功响应使用 OplockLevel=LEASE 和 LeaseState=NONE（零）。普通打开、未携带 RqLs 的请求以及非 lease 打开仍返回 oplock NONE。编码器不复制请求中的缓存位，不授予 read、write 或 handle caching 权利，也不发送 lease break。
+
+Server 的有界表以 `(ClientGUID, LeaseKey)` 关联记录；ClientGUID 是协议关联键，不代替认证身份。每个打开关联自己的权威 `(VolumeIdentity, NodeID)` 和有界名字信息。重复 key 在有副作用的打开前通过 Access=0 的身份探测核对对象，对已解析的非根目标把 ExpectedID 带到最终打开；根目录保持契约要求的全零 lookup 形状，并继续验证不可替换的根身份。任一成功关联打开使记录的 DeleteOnClose 置位后，该标志在记录存活期间保持，可容纳额外的独立对象关联；这不会重绑定既有打开。
+
+V1／V2 响应格式由本次请求决定，记录中的 epoch、parent-key 元数据保持自己的生命周期；V1 回复省略 V2 字段，不清空已有元数据。普通 oplock 请求与 durable 请求仍可以被拒授而不使普通打开失败，durable context 不返回授予，跨连接恢复旧文件也不因此成立。
+
+pending admission、已关联引用和 fenced 结果各有清理所有者。已确认的 Close 释放对应关联；tree 退役不足以证明尚未核对的原生打开已经结束。未决 token 由原 tree 或共享 Windows authority 会话的 orphan 记录持有，只有对应引用与在途操作确认清理后才归还预算。关闭失败保留这些有界状态，不以遗忘记录制造可用容量。
+
+零权利 lease 不改变 backend API、通知来源或同步确认。它对真实 Windows 负查询、目录缓存和一秒可见性的效果仍须原生验证；协商字段或本地协议测试不能代替这项证据。
 
 ## 目录观察与符号链接
 
@@ -69,6 +83,8 @@ Linux FUSE 可观察这个节点的真实链接类型，并在类型转换后保
 | directory result | 8 MiB |
 | notify events / notify bytes | 1024 / 8 MiB |
 | handshake / request / cleanup timeout | 30 秒 / 1 分钟 / 30 秒 |
+
+Server 的 lease 表在所有连接之间共享 `MaxOpens` 个 slot 和 `MaxDirectoryBytes` 元数据字节上限，分别默认 1024 与 8 MiB；它复用配置值，但与普通打开及单次目录结果分别计费。每次打开先预留两个最大 WindowsNameInfo 路径、固定结构和 volume identity 的预算，安装成功后转为实际记录与逐打开关联的费用。`Status.LeaseSlots` 和 `Status.LeaseBytes` 报告包括 pending／fenced 所有权在内的占用。
 
 文件会话使用 `storage.DefaultFileSessionOptions` 的独立上限与有限历史，见[文件句柄](../server/file-handles.md#一身份与会话)。请求输入在解码与分配前检查长度、credit、compound 和 context 数量；目录结果与通知有各自的总量边界。提高某项上限仍须通过 Limits 的关系校验。
 
@@ -98,6 +114,6 @@ Mapping 记录 SID、AuthenticationID 和 SessionID。Unmount 再次核对登录
 
 Export.Unpublish 在仍有 opens 或活跃请求时返回 `ErrBusy`。宿主按映射、export、server 及外部 backend 的各自 ownership 收尾；Server.Shutdown 停止接纳并清理自己拥有的连接、tree 与会话，失败通过返回值和有限 Status 计数暴露。renew 使用会话 lease 的三分之一作为节奏；授权或续期失败关闭受影响的 tree。没有依赖 import 副作用建立的 listener、信号处理或系统映射。
 
-核心不授予 SMB leases/oplocks、durable handles、跨连接恢复旧引用或 encryption 能力。CREATE 可以识别可选的 oplock、`RqLs`、`DHnQ` 与 `DH2Q` 请求，并在不授予这些能力的情况下返回成功的普通打开；响应保持 oplock NONE，不返回对应的 lease／durable 授予 context。`FILE_DISALLOW_EXCLUSIVE` 按 SMB2 规则忽略。本库将 `FILE_OPEN_FOR_BACKUP_INTENT` 按普通打开处理，保留原 DesiredAccess／ShareAccess 与业务授权，不据此授予 SeBackupPrivilege／SeRestorePrivilege 或绕过权威访问检查；`FILE_NO_INTERMEDIATE_BUFFERING` 仍明确拒绝。未知 create context、未支持的信息类别和控制请求继续失败；这些处理不声明完整 NTFS 兼容，alternate data streams、Windows ACL 管理与共享 mmap 一致性仍在需求非目标内。
+SMB lease 只按上述 NONE 状态协商；普通打开保持 oplock NONE，不授予缓存权利或传统 oplock，也不提供 durable handles、multichannel、跨连接恢复旧引用或 encryption。`DHnQ`／`DH2Q` 可以被拒授而保留成功的普通打开，不返回 durable 授予 context。`FILE_DISALLOW_EXCLUSIVE` 按 SMB2 规则忽略。本库将 `FILE_OPEN_FOR_BACKUP_INTENT` 按普通打开处理，保留原 DesiredAccess／ShareAccess 与业务授权，不据此授予 SeBackupPrivilege／SeRestorePrivilege 或绕过权威访问检查；`FILE_NO_INTERMEDIATE_BUFFERING` 仍明确拒绝。未知 create context、未支持的信息类别和控制请求继续失败；这些处理不声明完整 NTFS 兼容，alternate data streams、Windows ACL 管理与共享 mmap 一致性仍在需求非目标内。
 
 实现的协议检查、真实 authority 集成与 Windows 原生验收分别见[测试策略](../../testing.md)。源码或非 Windows 上的测试通过不能替代 Windows 11 ARM64 上真实 SSPI、系统映射与应用文件操作的执行结果。

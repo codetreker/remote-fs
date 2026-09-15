@@ -66,5 +66,7 @@ type Status struct {
 	Serving, Stopping, Stopped                                         bool
 	Exports, StoppingExports, Connections, CleanupFailures             int
 	RetainedConnections, PendingRequests, FencedTrees, DegradedExports int
+	LeaseSlots                                                         int
+	LeaseBytes                                                         int64
 	UnconfirmedMutations                                               uint64
 }

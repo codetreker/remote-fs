@@ -16,6 +16,7 @@ import (
 )
 
 type fileHandle struct {
+	lease      *leaseReference
 	identity   notificationIdentity
 	file       storage.WindowsFile
 	lookup     storage.WindowsLookup
@@ -31,6 +32,8 @@ type fileHandle struct {
 }
 
 type fileDispatcher struct {
+	authority   *authoritySession
+	leases      *leaseOwner
 	backend     storage.WindowsStorage
 	session     storage.WindowsSession
 	epoch       uint64
@@ -194,39 +197,45 @@ func windowsIntent(r wire.CreateRequest) (storage.WindowsOpenIntent, error) {
 }
 
 func (d *fileDispatcher) open(ctx context.Context, request storage.WindowsOpenRequest, id storage.WindowsActionID) (storage.WindowsOpenResult, error) {
+	result, _, err := d.openOutcome(ctx, request, id)
+	return result, err
+}
+
+func (d *fileDispatcher) openOutcome(ctx context.Context, request storage.WindowsOpenRequest, id storage.WindowsActionID) (storage.WindowsOpenResult, bool, error) {
 	result, err := d.session.Open(ctx, request, id)
 	if err == nil {
 		if result.File == nil || result.Attr.ID == 0 {
 			d.fence()
-			return storage.WindowsOpenResult{}, syscall.EIO
+			return result, false, syscall.EIO
 		}
-		return result, nil
+		return result, true, nil
 	}
 	if storage.ErrnoOf(err) != syscall.EIO && storage.ErrnoOf(err) != syscall.EINTR {
-		return result, err
+		return result, true, err
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d.limits.CleanupTimeout)
 	defer cancel()
 	known, queryErr := d.session.QueryAction(cleanupCtx, id)
 	if knownAction(known, queryErr, id) && known.State != storage.WindowsActionPending {
+		resolved := storage.WindowsOpenResult{File: known.File, Attr: known.Attr, CreateAction: known.CreateAction}
 		if known.Errno != 0 {
 			if known.Errno == syscall.ELOOP && known.Symlink != nil {
-				return storage.WindowsOpenResult{}, &storage.WindowsSymlinkError{WindowsSymlinkInfo: *known.Symlink, Err: queryErr}
+				return resolved, true, &storage.WindowsSymlinkError{WindowsSymlinkInfo: *known.Symlink, Err: queryErr}
 			}
-			return storage.WindowsOpenResult{}, queryErr
+			return resolved, true, queryErr
 		}
 		if known.State == storage.WindowsActionCompleted && known.File != nil && known.Attr.ID != 0 {
-			return storage.WindowsOpenResult{File: known.File, Attr: known.Attr, CreateAction: known.CreateAction}, nil
+			return resolved, true, nil
 		}
 		if known.State == storage.WindowsActionCancelled {
-			return storage.WindowsOpenResult{}, syscall.EINTR
+			return resolved, true, syscall.EINTR
 		}
 	}
 	if request.Disposition != storage.WindowsOpen && d.onUncertain != nil {
 		d.onUncertain()
 	}
 	d.fence()
-	return storage.WindowsOpenResult{}, syscall.EIO
+	return result, false, syscall.EIO
 }
 
 // Each intermediate directory stays retained through final admission. Expected
@@ -299,7 +308,7 @@ func (d *fileDispatcher) handle(ctx context.Context, r wire.Request) ([]byte, ui
 	d.mu.Lock()
 	failed := d.failed
 	d.mu.Unlock()
-	if failed {
+	if failed || d.authority != nil && d.authority.isStopping() {
 		return nil, fileIOError
 	}
 	switch r.Header.Command {
@@ -330,6 +339,10 @@ func (d *fileDispatcher) handle(ctx context.Context, r wire.Request) ([]byte, ui
 func (d *fileDispatcher) create(ctx context.Context, r wire.Request) ([]byte, uint32) {
 	request, err := r.Create()
 	if err != nil {
+		return nil, fileInvalidParameter
+	}
+	leaseRequest, hasLease, leaseErr := wire.ParseLease(request)
+	if leaseErr != nil {
 		return nil, fileInvalidParameter
 	}
 	if request.SecurityFlags != 0 || request.Impersonation > 3 {
@@ -374,23 +387,69 @@ func (d *fileDispatcher) create(ctx context.Context, r wire.Request) ([]byte, ui
 	d.opening++
 	d.mu.Unlock()
 	defer func() { d.mu.Lock(); d.opening--; d.mu.Unlock() }()
+	var lease *leaseOpen
+	if hasLease {
+		if d.leases == nil {
+			return nil, fileNotSupported
+		}
+		lease, err = d.leases.begin(ctx, leaseRequest, request.Name)
+		if err != nil {
+			return createFailure(err)
+		}
+		defer lease.abort()
+	}
 	lookup, cleanup, err := d.resolve(ctx, request.Name)
 	if err != nil {
+		if lease != nil {
+			d.mu.Lock()
+			unconfirmedCleanup := d.fenced || d.cleanupErr != nil
+			d.mu.Unlock()
+			if unconfirmedCleanup {
+				lease.retain()
+			}
+		}
 		return createFailure(err)
+	}
+	if lease != nil {
+		lookup, err = d.leaseLookup(ctx, lease, lookup, intent)
+		if err != nil {
+			if cleanupErr := cleanup(); cleanupErr != nil {
+				lease.retain()
+				return nil, fileIOError
+			}
+			return createFailure(err)
+		}
 	}
 	id, err := d.actionID()
 	if err != nil {
-		_ = cleanup()
+		if cleanupErr := cleanup(); cleanupErr != nil && lease != nil {
+			lease.retain()
+			return nil, fileIOError
+		}
 		return createFailure(err)
 	}
-	opened, err := d.open(ctx, storage.WindowsOpenRequest{Lookup: lookup, WindowsOpenIntent: intent, Mode: 0666, DOSAttributes: request.Attributes &^ uint32(0x10)}, id)
+	if lease != nil {
+		if err := lease.beforeAction(id, false); err != nil {
+			if cleanupErr := cleanup(); cleanupErr != nil {
+				lease.retain()
+			}
+			return createFailure(err)
+		}
+	}
+	opened, known, err := d.openOutcome(ctx, storage.WindowsOpenRequest{Lookup: lookup, WindowsOpenIntent: intent, Mode: 0666, DOSAttributes: request.Attributes &^ uint32(0x10)}, id)
+	if lease != nil {
+		lease.outcome(opened.File, known, false)
+	}
 	closeErr := cleanup()
-	if err != nil {
-		return createFailure(err)
-	}
 	if closeErr != nil {
+		if lease != nil {
+			lease.retain()
+		}
 		d.fence()
 		return nil, fileIOError
+	}
+	if err != nil {
+		return createFailure(err)
 	}
 	if opened.File == nil || opened.Attr.ID == 0 {
 		d.fence()
@@ -404,19 +463,52 @@ func (d *fileDispatcher) create(ctx context.Context, r wire.Request) ([]byte, ui
 	lookup.ParentReference = ""
 	lookup.ExpectedID = opened.Attr.ID
 	h := &fileHandle{identity: notificationIdentity{ID: opened.Attr.ID, Directory: opened.Attr.IsDir()}, file: opened.File, lookup: lookup, name: request.Name, access: expandAccess(request.DesiredAccess)}
+	installationHeld := false
+	releaseInstallation := func() {
+		if installationHeld {
+			installationHeld = false
+			d.authority.installMu.RUnlock()
+		}
+	}
+	if d.authority != nil {
+		d.authority.installMu.RLock()
+		installationHeld = true
+		defer releaseInstallation()
+		if d.authority.stopping {
+			return nil, fileIOError
+		}
+	}
 	d.mu.Lock()
 	if d.failed {
 		d.mu.Unlock()
+		releaseInstallation()
 		d.fence()
 		return nil, fileIOError
 	}
+	var leaseResponse *wire.LeaseResponse
+	if lease != nil {
+		identity, identityErr := d.leases.identity(opened.Attr)
+		if identityErr == nil {
+			h.lease, leaseResponse, identityErr = lease.install(identity, intent.DeleteOnClose)
+		}
+		if identityErr != nil {
+			d.mu.Unlock()
+			releaseInstallation()
+			d.fence()
+			return nil, fileIOError
+		}
+	}
 	d.handles[fid] = h
 	d.mu.Unlock()
+	releaseInstallation()
 	if d.onOpen != nil {
 		d.onOpen(1)
 	}
 	b := make([]byte, 88)
 	smbLE.PutUint16(b, 89)
+	if leaseResponse != nil {
+		b[2] = wire.OplockLease
+	}
 	action := uint32(1)
 	switch opened.CreateAction {
 	case storage.WindowsCreated:
@@ -434,7 +526,11 @@ func (d *fileDispatcher) create(ctx context.Context, r wire.Request) ([]byte, ui
 	}
 	smbLE.PutUint32(b[56:], fileAttributes(opened.Attr))
 	copy(b[64:80], fid[:])
-	contexts := createContexts(ctx, request, opened.Attr, volumeSerial)
+	contexts, encodeErr := createContexts(ctx, request, opened.Attr, volumeSerial, leaseResponse)
+	if encodeErr != nil {
+		d.fence()
+		return nil, fileIOError
+	}
 	if len(contexts) != 0 {
 		smbLE.PutUint32(b[80:], 152)
 		smbLE.PutUint32(b[84:], uint32(len(contexts)))
@@ -457,7 +553,12 @@ func (d *fileDispatcher) fence() {
 	d.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), d.limits.CleanupTimeout)
 	defer cancel()
-	err := d.session.Close(ctx)
+	var err error
+	if d.authority != nil {
+		err = d.authority.close(ctx)
+	} else {
+		err = d.session.Close(ctx)
+	}
 	d.mu.Lock()
 	d.cleanupErr = err
 	d.mu.Unlock()
@@ -585,6 +686,7 @@ func (d *fileDispatcher) closeOrFlush(ctx context.Context, r wire.Request) ([]by
 	_, existed := d.handles[id]
 	delete(d.handles, id)
 	d.mu.Unlock()
+	d.leases.release(h.lease)
 	if existed && d.onOpen != nil {
 		d.onOpen(-1)
 	}
@@ -982,6 +1084,9 @@ func (d *fileDispatcher) setInfo(ctx context.Context, r wire.Request) ([]byte, u
 		h.lookup = destination
 		h.name = name
 		h.mu.Unlock()
+		if d.leases != nil {
+			d.leases.table.markDirty(d.leases.volume)
+		}
 		return []byte{2, 0}, fileSuccess
 	default:
 		return nil, fileNotSupported

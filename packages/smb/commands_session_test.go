@@ -94,8 +94,11 @@ func testConnection(t *testing.T) (*connection, *session, *tree, *sessionFile, *
 	if err != nil {
 		t.Fatal(err)
 	}
-	ss := &session{id: 1, principal: Principal{SID: "S-1-5-21-1"}, signer: key, trees: make(map[uint32]*tree)}
-	c.sessions[1] = ss
+	ss := &session{principal: Principal{SID: "S-1-5-21-1"}, signer: key, trees: make(map[uint32]*tree)}
+	if err := s.sessions.add(c, ss); err != nil {
+		t.Fatal(err)
+	}
+	c.sessions[ss.id] = ss
 	c.nextTree = 1
 	e.refs = 1
 	e.opens = 1

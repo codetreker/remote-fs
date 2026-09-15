@@ -102,7 +102,11 @@ func decode(r Request) error {
 	case TreeConnect:
 		_, err = r.TreePath()
 	case Create:
-		_, err = r.Create()
+		var create CreateRequest
+		create, err = r.Create()
+		if err == nil {
+			_, _, err = ParseLease(create)
+		}
 	case Read:
 		_, err = r.Read()
 	case Write:
@@ -121,6 +125,8 @@ func decode(r Request) error {
 		_, err = r.IOCTL()
 	case ChangeNotify:
 		_, err = r.Notify()
+	case OplockBreak:
+		_, err = r.LeaseAck()
 	default:
 		err = r.Empty()
 	}

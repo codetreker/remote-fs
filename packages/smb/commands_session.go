@@ -75,6 +75,13 @@ func (c *connection) dispatch(ctx context.Context, r, original wire.Request, h *
 	if t == nil {
 		return nil, statusNetworkDeleted, signer
 	}
+	if r.Header.Command == wire.OplockBreak {
+		ack, err := r.LeaseAck()
+		if err != nil {
+			return nil, statusInvalid, signer
+		}
+		return nil, c.server.leases.ack(c.clientGUID, ack.Key), signer
+	}
 	if t.kind == controlTree {
 		body, status := c.control(s, t, r)
 		return body, status, signer
@@ -233,7 +240,7 @@ func (c *connection) bootstrap() error {
 	limits := c.server.config.Limits
 	body, err := wire.NegotiateResponseBody(wire.Negotiation{
 		SecurityMode: 3, Dialect: wire.DialectWildcard, ServerGUID: c.server.guid,
-		Capabilities: 4, MaxTransactSize: uint32(limits.MaxIOBytes),
+		Capabilities: 6, MaxTransactSize: uint32(limits.MaxIOBytes),
 		MaxReadSize: uint32(limits.MaxIOBytes), MaxWriteSize: uint32(limits.MaxIOBytes),
 		SystemTime: uint64(time.Now().UnixNano()/100 + 116444736000000000),
 	})
@@ -300,10 +307,11 @@ func (c *connection) negotiate(r wire.Request) ([]byte, uint32) {
 	binary.LittleEndian.PutUint16(preauth[4:], 1)
 	rand.Read(preauth[6:])
 	limits := c.server.config.Limits
-	b, err := wire.NegotiateResponseBody(wire.Negotiation{SecurityMode: 3, Dialect: wire.Dialect311, ServerGUID: c.server.guid, Capabilities: 4, MaxTransactSize: uint32(limits.MaxIOBytes), MaxReadSize: uint32(limits.MaxIOBytes), MaxWriteSize: uint32(limits.MaxIOBytes), SystemTime: uint64(time.Now().UnixNano()/100 + 116444736000000000), Contexts: []wire.Context{{Type: 1, Data: preauth}, {Type: 8, Data: []byte{1, 0, 1, 0}}}})
+	b, err := wire.NegotiateResponseBody(wire.Negotiation{SecurityMode: 3, Dialect: wire.Dialect311, ServerGUID: c.server.guid, Capabilities: 0x26, MaxTransactSize: uint32(limits.MaxIOBytes), MaxReadSize: uint32(limits.MaxIOBytes), MaxWriteSize: uint32(limits.MaxIOBytes), SystemTime: uint64(time.Now().UnixNano()/100 + 116444736000000000), Contexts: []wire.Context{{Type: 1, Data: preauth}, {Type: 8, Data: []byte{1, 0, 1, 0}}}})
 	if err != nil {
 		return nil, statusIO
 	}
+	c.clientGUID = n.ClientGUID
 	c.preauth = signing.Preauth(c.preauth, r.Packet)
 	c.negotiated = true
 	return b, 0
@@ -311,19 +319,37 @@ func (c *connection) negotiate(r wire.Request) ([]byte, uint32) {
 
 func (c *connection) sessionSetup(ctx context.Context, r wire.Request, h *wire.Header) (body []byte, status uint32, key *signing.Session) {
 	setup, err := r.SessionSetup()
-	if err != nil || setup.Flags != 0 || setup.Channel != 0 || setup.PreviousSessionID != 0 || len(setup.Token) > c.server.config.Limits.MaxTokenBytes {
+	// Channel is reserved and must be ignored by the receiver; it does not
+	// request multichannel binding, which has its own Flags bit.
+	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/5a3c2c28-d6b0-48ed-b917-a86b2ca4575f
+	if err != nil || setup.Flags & ^byte(1) != 0 || len(setup.Token) > c.server.config.Limits.MaxTokenBytes {
 		return nil, statusInvalid, nil
 	}
+	if setup.Flags&1 != 0 {
+		return nil, statusRequestNotAccepted, nil
+	}
 	c.mu.Lock()
+	if c.disconnected || c.ctx.Err() != nil {
+		c.mu.Unlock()
+		return nil, statusSessionDeleted, nil
+	}
 	s := c.sessions[r.Header.SessionID]
 	if r.Header.SessionID == 0 {
 		if len(c.sessions) >= c.server.config.Limits.MaxSessions {
 			c.mu.Unlock()
 			return nil, statusResources, nil
 		}
-		c.nextSession++
-		s = &session{id: c.nextSession, preauth: c.preauth, trees: make(map[uint32]*tree), deadline: time.Now().Add(c.server.config.Limits.HandshakeTimeout)}
+		s = &session{preauth: c.preauth, trees: make(map[uint32]*tree), deadline: time.Now().Add(c.server.config.Limits.HandshakeTimeout)}
+		if err := c.server.sessions.add(c, s); err != nil {
+			c.mu.Unlock()
+			return nil, statusResources, nil
+		}
 		c.sessions[s.id] = s
+	}
+	if s != nil {
+		if pending := c.pending[r.Header.MessageID]; pending != nil {
+			pending.sessionID = s.id
+		}
 	}
 	c.mu.Unlock()
 	if s == nil {
@@ -333,9 +359,13 @@ func (c *connection) sessionSetup(ctx context.Context, r wire.Request, h *wire.H
 	defer s.authMu.Unlock()
 	s.mu.Lock()
 	retired := s.retired
+	finalizing := s.finalizing
 	s.mu.Unlock()
 	if retired {
 		return nil, statusSessionDeleted, nil
+	}
+	if finalizing {
+		return nil, statusRequestNotAccepted, nil
 	}
 	h.SessionID = s.id
 	s.identityMu.RLock()
@@ -353,12 +383,18 @@ func (c *connection) sessionSetup(ctx context.Context, r wire.Request, h *wire.H
 	defer func() {
 		if status != 0 && status != statusMoreProcessing {
 			if s.auth != nil {
-				c.server.cleanupFailure(s.auth.Close())
-				s.auth = nil
+				if err := s.auth.Close(); err != nil {
+					c.server.cleanupFailure(err)
+					s.mu.Lock()
+					s.retired = true
+					s.mu.Unlock()
+				} else {
+					s.auth = nil
+				}
 			}
-			if existing == nil {
+			if existing == nil && s.auth == nil {
 				c.mu.Lock()
-				delete(c.sessions, s.id)
+				c.removeSessionLocked(s)
 				c.mu.Unlock()
 			}
 		}
@@ -416,6 +452,32 @@ func (c *connection) sessionSetup(ctx context.Context, r wire.Request, h *wire.H
 		return nil, statusIO, existing
 	}
 	s.auth = nil
+	s.mu.Lock()
+	s.finalizing = true
+	s.mu.Unlock()
+	// Previous-session cleanup acquires the other session's auth lock. The
+	// transition flag keeps this exchange exclusive while neither auth lock
+	// nests inside another one.
+	err = func() error {
+		s.authMu.Unlock()
+		defer s.authMu.Lock()
+		return c.retirePreviousSession(ctx, s, setup.PreviousSessionID, result.Principal)
+	}()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finalizing = false
+	c.mu.Lock()
+	unavailable := s.retired || c.disconnected || c.ctx.Err() != nil || c.sessions[s.id] != s
+	c.mu.Unlock()
+	if err != nil || ctx.Err() != nil || unavailable {
+		if existing == nil {
+			key.Destroy()
+		}
+		if err != nil {
+			return nil, statusError(err), existing
+		}
+		return nil, statusSessionDeleted, existing
+	}
 	s.identityMu.Lock()
 	s.signer = key
 	s.principal = result.Principal
@@ -478,13 +540,17 @@ func (c *connection) treeConnect(ctx context.Context, s *session, r wire.Request
 	}
 	if a != nil {
 		a.mu.Lock()
-		closed := a.closed
-		if !closed {
+		a.pruneLeaseOrphans()
+		closed := a.isClosed()
+		stopping := a.isStopping()
+		if !closed && !stopping {
 			a.refs++
 		}
 		a.mu.Unlock()
 		if closed {
 			a = nil
+		} else if stopping {
+			return nil, statusIO
 		}
 	}
 	if a != nil {
@@ -527,6 +593,9 @@ func (c *connection) treeConnect(ctx context.Context, s *session, r wire.Request
 	id := c.nextTree
 	c.mu.Unlock()
 	t := &tree{id: id, sessionID: s.id, done: make(chan struct{}), export: e, session: a.session, authority: a, files: newFileDispatcher(e.share.Backend, a.session, a.epoch, c.server.config.Limits)}
+	t.files.authority = a
+	t.files.leases = newLeaseOwner(c.server.leases, c.clientGUID, e.volumeIdentity)
+	t.files.leases.authority = a
 	t.files.onCleanup = c.server.cleanupFailure
 	t.files.onUncertain = c.server.unconfirmedMutation
 	t.files.onFence = func(delta int) { c.server.mu.Lock(); c.server.fencedTrees += delta; c.server.mu.Unlock() }

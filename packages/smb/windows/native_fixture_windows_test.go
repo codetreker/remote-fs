@@ -1225,3 +1225,55 @@ func TestNativeAuthorityDeliversHTTPEventsAndBoundedSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestNativeAuthorityOpenRequiresExpectedIdentity(t *testing.T) {
+	a := newNativeAuthority()
+	ctx := t.Context()
+	s, err := a.NewWindowsSession(ctx, storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := s.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	}()
+	action := func() storage.WindowsActionID {
+		status, err := s.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := storage.NewLockRequestID(status.ActionEpoch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	r := storage.WindowsOpenRequest{WindowsOpenIntent: storage.WindowsOpenIntent{Access: storage.WindowsAllAccess, Share: storage.WindowsShareAll, Disposition: storage.WindowsCreate, Kind: storage.WindowsRegularFile}, Lookup: storage.WindowsLookup{ParentID: 1, Name: "identity.bin"}, Mode: 0644}
+	created, err := s.Open(ctx, r, action())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Disposition = storage.WindowsOpen
+	r.Lookup.ExpectedID = created.Attr.ID
+	matched, err := s.Open(ctx, r, action())
+	if err != nil || matched.Attr.ID != created.Attr.ID {
+		t.Fatalf("matching identity open=%+v %v", matched, err)
+	}
+	before := a.openReferences()
+	for _, missing := range []bool{false, true} {
+		r.Lookup.Name = "identity.bin"
+		r.Lookup.ExpectedID = created.Attr.ID + 1
+		if missing {
+			r.Lookup.Name = "absent.bin"
+			r.Lookup.ExpectedID = created.Attr.ID
+			r.Disposition = storage.WindowsOpenIf
+		}
+		if result, err := s.Open(ctx, r, action()); !errors.Is(err, syscall.ESTALE) || result.File != nil || a.openReferences() != before {
+			t.Fatalf("mismatched identity missing=%v: %+v %v", missing, result, err)
+		}
+	}
+	if _, err := a.Stat(ctx, "absent.bin"); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("identity refusal created absent name: %v", err)
+	}
+}

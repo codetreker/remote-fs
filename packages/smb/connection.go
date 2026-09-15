@@ -18,21 +18,23 @@ import (
 )
 
 const (
-	statusOK             uint32 = 0
-	statusPending        uint32 = 0x103
-	statusMoreProcessing uint32 = 0xc0000016
-	statusInvalid        uint32 = 0xc000000d
-	statusDenied         uint32 = 0xc0000022
-	statusUnsupported    uint32 = 0xc00000bb
-	statusIO             uint32 = 0xc0000185
-	statusResources      uint32 = 0xc000009a
-	statusSessionDeleted uint32 = 0xc0000203
-	statusNetworkDeleted uint32 = 0xc00000c9
-	statusBadNetworkName uint32 = 0xc00000cc
-	statusCancelled      uint32 = 0xc0000120
+	statusOK                 uint32 = 0
+	statusPending            uint32 = 0x103
+	statusMoreProcessing     uint32 = 0xc0000016
+	statusInvalid            uint32 = 0xc000000d
+	statusDenied             uint32 = 0xc0000022
+	statusUnsupported        uint32 = 0xc00000bb
+	statusIO                 uint32 = 0xc0000185
+	statusResources          uint32 = 0xc000009a
+	statusSessionDeleted     uint32 = 0xc0000203
+	statusNetworkDeleted     uint32 = 0xc00000c9
+	statusBadNetworkName     uint32 = 0xc00000cc
+	statusCancelled          uint32 = 0xc0000120
+	statusRequestNotAccepted uint32 = 0xc00000d0
 )
 
 type connection struct {
+	clientGUID   [16]byte
 	cleanupMu    sync.Mutex
 	disconnected bool
 	pendingWake  chan struct{}
@@ -45,7 +47,6 @@ type connection struct {
 	wg           sync.WaitGroup
 	sessions     map[uint64]*session
 	pending      map[uint64]*pendingRequest
-	nextSession  uint64
 	nextTree     uint32
 	credits      map[uint64]struct{}
 	nextCredit   uint64
@@ -69,11 +70,17 @@ type pendingRequest struct {
 type pendingKey struct{}
 type pendingFrameKey struct{}
 
+type requestFrame struct {
+	connection *connection
+	id         uint64
+}
+
 type session struct {
 	retirementMu    sync.Mutex
 	retiringFrames  map[uint64]struct{}
 	resourcesClosed bool
 	retired         bool
+	finalizing      bool
 	logoffMu        sync.Mutex
 	cleaned         bool
 	mu              sync.Mutex
@@ -90,12 +97,15 @@ type session struct {
 }
 
 type authoritySession struct {
-	orphan  bool
-	mu      sync.Mutex
-	session storage.WindowsSession
-	epoch   uint64
-	refs    int
-	closed  bool
+	leaseOrphans *leaseOwner
+	installMu    sync.RWMutex
+	orphan       bool
+	mu           sync.Mutex
+	session      storage.WindowsSession
+	epoch        uint64
+	refs         int
+	stopping     bool
+	closed       bool
 }
 
 type treeKind uint8
@@ -260,14 +270,14 @@ func (c *connection) cleanup() {
 		s.retired = true
 		for _, a := range s.authorities {
 			a.mu.Lock()
-			if !a.closed {
+			if !a.isClosed() {
 				ctx, cancel := context.WithTimeout(context.Background(), c.server.config.Limits.CleanupTimeout)
-				err := a.session.Close(ctx)
+				err := a.close(ctx)
 				cancel()
-				if err == nil {
-					a.closed = true
-				}
 				c.server.cleanupFailure(err)
+			}
+			if a.isClosed() {
+				a.releaseLeaseOrphans()
 			}
 			a.mu.Unlock()
 		}
@@ -297,7 +307,7 @@ func (c *connection) cleanup() {
 		if clean {
 			c.mu.Lock()
 			if c.sessions[s.id] == s {
-				delete(c.sessions, s.id)
+				c.removeSessionLocked(s)
 			}
 			c.mu.Unlock()
 		}
@@ -343,32 +353,45 @@ func (c *connection) closeTree(t *tree) error {
 		t.export.changes.remove(c.notifyKey(id))
 	}
 	t.files.failed = true
+	t.files.leases.retire()
 	t.files.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), c.server.config.Limits.CleanupTimeout)
 	defer cancel()
 	var err error
+	authorityClosed := false
 	if t.authority == nil {
 		err = t.session.Close(ctx)
+		authorityClosed = err == nil
 	} else {
 		a := t.authority
 		a.mu.Lock()
-		if a.closed {
+		if a.isClosed() {
 			a.refs--
 		} else if a.refs > 1 {
 			err = t.files.closeAll(ctx)
+			if err != nil && a.isStopping() {
+				err = a.close(ctx)
+			}
 			if err == nil {
 				a.refs--
+				a.retainLeaseOrphan(t.files.leases)
 			}
 		} else {
-			err = a.session.Close(ctx)
+			err = a.close(ctx)
 			if err == nil {
-				a.closed = true
 				a.refs = 0
 			}
+		}
+		if a.isClosed() {
+			a.releaseLeaseOrphans()
+			authorityClosed = true
 		}
 		a.mu.Unlock()
 	}
 	if err == nil {
+		if authorityClosed {
+			t.files.leases.releaseAll()
+		}
 		t.closed = true
 		t.files.mu.Lock()
 		n := len(t.files.handles)
@@ -509,7 +532,7 @@ func (c *connection) process(requests []wire.Request) error {
 		pending.treeID = r.Header.TreeID
 		pending.fileID, _ = relatedFile(r)
 		c.mu.Unlock()
-		ctx := context.WithValue(pending.ctx, pendingFrameKey{}, pending.frame)
+		ctx := context.WithValue(pending.ctx, pendingFrameKey{}, requestFrame{connection: c, id: pending.frame})
 		cancel := pending.cancel
 		h := r.Header
 		h.Flags = 0
@@ -827,7 +850,7 @@ func (c *connection) closeExport(e *Export) error {
 		if clean {
 			c.mu.Lock()
 			if c.disconnected && c.sessions[s.id] == s {
-				delete(c.sessions, s.id)
+				c.removeSessionLocked(s)
 			}
 			c.mu.Unlock()
 		}

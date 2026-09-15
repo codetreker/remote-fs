@@ -16,7 +16,7 @@ func (c *connection) logoff(ctx context.Context, s *session) error {
 	}
 	s.retired = true
 	s.mu.Unlock()
-	frame, _ := ctx.Value(pendingFrameKey{}).(uint64)
+	frame, hasFrame := ctx.Value(pendingFrameKey{}).(requestFrame)
 	c.mu.Lock()
 	s.retirementMu.Lock()
 	if s.retiringFrames == nil {
@@ -25,7 +25,7 @@ func (c *connection) logoff(ctx context.Context, s *session) error {
 	for _, p := range c.pending {
 		if p.sessionID == s.id {
 			s.retiringFrames[p.frame] = struct{}{}
-			if p.frame != frame && p.command != wire.Logoff {
+			if (!hasFrame || frame.connection != c || p.frame != frame.id) && p.command != wire.Logoff {
 				p.cancel()
 			}
 		}
@@ -72,21 +72,23 @@ func (c *connection) closeOrphansLocked(ctx context.Context, s *session, export 
 		a.mu.Lock()
 		if a.orphan {
 			var err error
-			if !a.closed {
-				err = a.session.Close(ctx)
+			if !a.isClosed() {
+				err = a.close(ctx)
 			}
 			if err != nil {
 				a.mu.Unlock()
 				return err
 			}
-			a.closed = true
 			a.orphan = false
 			a.refs = 0
 			c.server.mu.Lock()
 			e.refs--
 			c.server.mu.Unlock()
 		}
-		closed := a.closed && a.refs == 0
+		if a.isClosed() {
+			a.releaseLeaseOrphans()
+		}
+		closed := a.isClosed() && a.refs == 0
 		a.mu.Unlock()
 		if closed {
 			delete(s.authorities, e)
@@ -96,12 +98,12 @@ func (c *connection) closeOrphansLocked(ctx context.Context, s *session, export 
 }
 
 func (c *connection) pruneRetiredSessionsLocked() {
-	for id, s := range c.sessions {
+	for _, s := range c.sessions {
 		s.retirementMu.Lock()
 		done := s.resourcesClosed && len(s.retiringFrames) == 0
 		s.retirementMu.Unlock()
 		if done {
-			delete(c.sessions, id)
+			c.removeSessionLocked(s)
 			s.identityMu.Lock()
 			if s.signer != nil {
 				s.signer.Destroy()

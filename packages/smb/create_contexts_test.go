@@ -70,13 +70,19 @@ func TestMaximalAccessContextDistinguishesUnchangedFromUnknown(t *testing.T) {
 	timestamp := make([]byte, 8)
 	smbLE.PutUint64(timestamp, windowsTime(a.ChangeTime))
 	r := wire.CreateRequest{Contexts: []wire.CreateContext{{Name: []byte("MxAc"), Data: timestamp}}}
-	b := createContexts(context.Background(), r, a, 0)
+	b, err := createContexts(context.Background(), r, a, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if smbLE.Uint32(b[24:]) != 0xc0000073 || smbLE.Uint32(b[28:]) != 0 {
 		t.Fatal("unchanged maximal access was invented")
 	}
 	r.Contexts[0].Data = nil
 	ctx := context.WithValue(context.Background(), maximalAccessKey{}, func(storage.WindowsAttr) (uint32, error) { return 0, syscall.EIO })
-	b = createContexts(ctx, r, a, 0)
+	b, err = createContexts(ctx, r, a, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if smbLE.Uint32(b[24:]) != statusIO || smbLE.Uint32(b[28:]) != 0 {
 		t.Fatal("unknown maximal access became success")
 	}
@@ -84,5 +90,27 @@ func TestMaximalAccessContextDistinguishesUnchangedFromUnknown(t *testing.T) {
 	mask, err := c.maximalAccess(context.Background(), tr, a)
 	if err != nil || mask != encodeAccess(storage.WindowsAllAccess) {
 		t.Fatalf("maximal %x %v", mask, err)
+	}
+}
+
+func TestCreateContextsEncodeOnlyZeroLeaseRights(t *testing.T) {
+	for _, version := range []uint16{wire.LeaseVersion1, wire.LeaseVersion2} {
+		request := wire.CreateRequest{Contexts: []wire.CreateContext{{Name: []byte("RqLs")}, {Name: []byte("QFid")}}}
+		lease := &wire.LeaseResponse{Version: version, Key: [16]byte{9}, HasParent: true, ParentKey: [16]byte{7}, Epoch: 65535}
+		contexts, err := createContexts(context.Background(), request, storage.WindowsAttr{}, 1, lease)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(contexts[16:20]) != "RqLs" || contexts[24] != 9 || smbLE.Uint32(contexts[40:44]) != 0 {
+			t.Fatal("lease response lost identity or granted caching rights")
+		}
+		next := int(smbLE.Uint32(contexts))
+		if next == 0 || string(contexts[next+16:next+20]) != "QFid" {
+			t.Fatal("lease context broke response context chaining")
+		}
+	}
+	_, err := createContexts(context.Background(), wire.CreateRequest{Contexts: []wire.CreateContext{{Name: []byte("RqLs")}}}, storage.WindowsAttr{}, 0, &wire.LeaseResponse{})
+	if err == nil {
+		t.Fatal("invalid internal lease response was silently omitted")
 	}
 }

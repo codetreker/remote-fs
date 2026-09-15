@@ -18,12 +18,21 @@ func (c *connection) maximalAccess(ctx context.Context, t *tree, attr storage.Wi
 	return encodeAccess(access), err
 }
 
-func createContexts(ctx context.Context, request wire.CreateRequest, attr storage.WindowsAttr, volumeSerial uint64) []byte {
+func createContexts(ctx context.Context, request wire.CreateRequest, attr storage.WindowsAttr, volumeSerial uint64, lease *wire.LeaseResponse) ([]byte, error) {
 	var encoded []byte
 	previous := -1
 	for _, item := range request.Contexts {
 		var data []byte
 		switch string(item.Name) {
+		case "RqLs":
+			if lease == nil {
+				continue
+			}
+			var err error
+			data, err = wire.LeaseResponseData(*lease)
+			if err != nil {
+				return nil, err
+			}
 		case "MxAc":
 			data = make([]byte, 8)
 			if len(item.Data) == 8 && smbLE.Uint64(item.Data) == windowsTime(attr.ChangeTime) {
@@ -61,5 +70,5 @@ func createContexts(ctx context.Context, request wire.CreateRequest, attr storag
 		copy(entry[24:], data)
 		encoded = append(encoded, entry...)
 	}
-	return encoded
+	return encoded, nil
 }

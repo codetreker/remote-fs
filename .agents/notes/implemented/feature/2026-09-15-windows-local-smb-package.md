@@ -38,6 +38,8 @@ SMB 核心依赖 storage、metastore 和 authz，不导入 HTTP、SQLite、FUSE 
 
 本机 Authenticator 与 Authorizer 是必填配置。`CurrentUserSID` 和 `AllowSID` 提供明确的挂载者 SID 策略；业务也可以注入自己的策略。可信 `Share.Volume` 由宿主配置，对已发布 volume 的访问在本机身份放入请求 context 后逐次授权，WindowsOpenIntent 保留数据、metadata、delete 与共享意图。远端 HTTP 身份由业务 transport 管理，两端授权各自执行；令牌和签名密钥不进入日志。凭据轮换不能替换既有会话的已验证身份，重新认证必须保持同一 SID。
 
+SMB SessionID 在每个 Server 实例内跨连接统一分配且不复用；它不是 OS 的登录 SessionID。SESSION_SETUP.Channel 按保留字段忽略，binding flag 仍不受支持。只有新认证成功且认证 context 完成收尾后，才使用最终成功请求的 PreviousSessionId：不存在、属于其它 SID 或指向当前候选 session 的值被忽略；同 SID 的旧 session 由原拥有者退役、排空并清理。清理失败阻止新身份激活并保留旧所有权。这支持会话替换的协议顺序，不恢复旧 tree、FileId、durable handle 或 multichannel。
+
 `Map` 只在显式调用时改变当前用户的系统映射。helper 检查 Windows client edition、build 和必要的 typed 参数，将 `TcpPort`、TCP transport、`UseWriteThrough`、`RequireIntegrity` 与关闭持久／全局／凭据保存的选项交给 `New-SmbMapping`。程序固定，值通过 JSON stdin 传入，不拼入 PowerShell 语法；它不请求提权，也不修改注册表、安全策略或系统 445 服务。系统拒绝权限或不支持的参数时，错误保留给宿主。[Microsoft 的端口说明](https://learn.microsoft.com/en-us/windows-server/storage/file-server/smb-ports)与[映射参数](https://learn.microsoft.com/en-us/powershell/module/smbshare/new-smbmapping?view=windowsserver2025-ps)定义系统能力，实际 loopback 认证仍须原生验收。
 
 Windows 的同一 server／transport 映射共用一个端口，宿主为各 Export 复用同一 Server／listener。share 名不同或先移除旧映射，不保证 redirector 已经忘记这个端口关联；端口不一致可在新认证之前被明确拒绝，不能作为身份策略拒绝的证据。本机 adapter 保留该错误，不使用全局断开连接或重试来清除它。端口复用只解决连接条件，不证明 negative lookup 或目录缓存的一致性。
@@ -72,13 +74,21 @@ Export 建立订阅并追到固定 checkpoint 后才可健康服务。首次 CHA
 
 宿主显式选择 `DefaultLimits` 或完整有效的 Limits。连接、会话、tree/open、请求、compound、create context、frame/I/O、枚举、通知和各阶段期限都有边界；文件会话另有有限历史与存续期。HTTP 数据与 Windows control 使用独立 admission，后者按完整属性路径、symlink 观察和错误 receipt 的最坏 JSON 编码计费。各池的 byte 设置不是一个合并的进程总额，宿主必须计入并存池的额外 retention；公式归[server 内存边界](../../../../docs/design/server/architecture.md#六请求与响应的内存边界)所有。
 
-映射请求 UseWriteThrough，SMB 不授予缓存 lease/oplock，并声明禁止离线缓存；不提供 durable/persistent handles、multichannel、跨连接恢复或 encryption。已知的可选 oplock、`RqLs`、`DHnQ` 与 `DH2Q` 请求不必使普通打开失败：authority 允许打开后，响应保持 oplock NONE 且不附带 lease／durable 授予 context。未知 create context 仍被拒绝。`FILE_DISALLOW_EXCLUSIVE` 按 SMB2 规则忽略；本库对 `FILE_OPEN_FOR_BACKUP_INTENT` 明确选择普通打开策略，原 DesiredAccess／ShareAccess 与业务授权仍适用，不授予 SeBackupPrivilege／SeRestorePrivilege，也不绕过访问检查。这不放宽 `FILE_NO_INTERMEDIATE_BUFFERING` 的不支持结果。UseWriteThrough 的 forced-unit-access 语义与 `FILE_NO_INTERMEDIATE_BUFFERING` 不同，前者不能证明关闭了所有属性、negative 或目录缓存。系统全局缓存设置保持宿主环境原状；真实程序的同步确认、可见性与断线读取仍须验收。[SMB 客户端缓存设置](https://learn.microsoft.com/en-us/powershell/module/smbshare/set-smbclientconfiguration?view=windowsserver2025-ps)不能作为库私自改变机器策略的理由。
+映射请求 UseWriteThrough，并禁止离线缓存。SMB 处理真正的 V1／V2 lease 协商：有效 lease CREATE 返回 OplockLevel=LEASE 与 RqLs，编码器把 LeaseState 固定为 NONE；普通打开仍返回 oplock NONE。请求的 read、write 和 handle caching 位不被授予，也不发送 break。`DHnQ`／`DH2Q` 仍可被拒授而使普通打开成功，不返回 durable 授予 context；不提供 durable/persistent handles、multichannel、旧文件跨连接恢复或 encryption。未知 create context 继续拒绝。
+
+Server 保留 NEGOTIATE 的 ClientGUID，用 ClientGUID／LeaseKey 关联有界记录，并为每个打开保留权威 VolumeIdentity／NodeID。重复 key 在副作用前以 Access=0 探测身份，已解析的非根目标再由最终 ExpectedID 核对；不可替换的根保留全零 lookup 形状。成功关联打开设置的 DeleteOnClose 在记录存活期间保持，允许附加的独立对象关联而不重绑定旧打开。响应采用本次请求的 V1／V2 格式，既有 epoch 与 parent 元数据不会被 V1 回复清空。
+
+lease 表在所有连接之间使用 MaxOpens slot 和 MaxDirectoryBytes 元数据上限；这是独立预算，不能与普通打开或单次枚举误算成一个合并总额。准入先预留两个最大路径及固定结构，状态计入 LeaseSlots／LeaseBytes。未知结果和清理失败不能提前归还预算：pending／fenced token 由原 tree 或共享 authority 的 orphan 记录持续持有，只有引用与在途操作确认结束才释放。具体协议与身份规则见[Windows 接入设计](../../../../docs/design/client/windows-smb.md#零缓存权利的-smb-lease)。
+
+`FILE_DISALLOW_EXCLUSIVE` 按 SMB2 规则忽略；本库对 `FILE_OPEN_FOR_BACKUP_INTENT` 明确选择普通打开策略，原 DesiredAccess／ShareAccess 与业务授权仍适用，不授予 SeBackupPrivilege／SeRestorePrivilege，也不绕过访问检查。这不放宽 `FILE_NO_INTERMEDIATE_BUFFERING` 的不支持结果。UseWriteThrough 的 forced-unit-access 语义与 `FILE_NO_INTERMEDIATE_BUFFERING` 不同，前者不能证明关闭了所有属性、negative 或目录缓存。系统全局缓存设置保持宿主环境原状；真实程序的同步确认、可见性与断线读取仍须验收。[SMB 客户端缓存设置](https://learn.microsoft.com/en-us/powershell/module/smbshare/set-smbclientconfiguration?view=windowsserver2025-ps)不能作为库私自改变机器策略的理由。
 
 ## 备选方案
 
 **远端直接提供 SMB。** 减少本机协议转换，但改变远端暴露和业务认证接入方式，不能直接复用现有 HTTP 网络路径。本机 adapter 保留独立远端 transport；公共 WindowsStorage 仍可供其它入口使用。
 
 **WinFsp／Dokany 挂载。** 更接近 Windows 文件系统回调，但增加驱动安装、分发和生命周期。完整跨客户端范围锁还必须证明锁参数与取消／晚到授予之间的原子关系，不能只增加回调便声称兼容。这些成本不符合无需额外驱动的部署目标。
+
+**识别 lease 请求后只返回普通 oplock NONE。** 这保留了不授予缓存权利的边界，却没有建立以 lease key 关联 epoch 与逐打开身份的协议记录，也不能由这个回复推出 Windows 负查询在一秒内可见。零权利 lease 明确处理这些协议状态；它对真实 Windows 缓存行为的效果仍须原生验证，不以字段正确代替可见性证明。
 
 **本机目录索引或 metadata replica。** 一致快照加日志能够维护类型和祖先关系，但带来初始化、缺口重建和空间预算。权威提交已经持有旧／新状态，直接记录通知事实可以保留 HTTP 读取路径。本机 replica 仍可单独评估；它必须从读取副本的实际 apply 顺序产生通知，并与 Linux nativelease 依赖分离，不能用空实现伪造 Windows 支持。
 
@@ -98,7 +108,7 @@ Windows 使用系统自带客户端，业务能够在同一 Go 进程掌握本�
 
 独立 package 不消除跨层成本。共享访问与锁必须进入 metastore、存储包装层、HTTP 和所有既有访问路径；命名 policy 持久限制已启用 volume，卸载不恢复宽松名字规则。事件保存祖先事实增加每次修改的 CPU、日志和网络字节，完整路径及事件边界会拒绝无法表示的修改。HTTP control 独立池占用额外 retention，不能只计算 ordinary response 的上限。
 
-直接 HTTP 查询避免让 Windows 依赖 Linux SQLite replica，但元数据往返承担远端 RTT。未来的 replica 优化须保留健康门控和与 apply 同序的通知，不能让缓存命中代替权威可用性。同步确认、签名和不授予缓存权限也有吞吐成本；性能改进不放宽错误、身份或确认语义。UAC 的映射可见性属于按用户部署约束，helper 不通过全局映射或弱化系统安全绕开它。
+直接 HTTP 查询避免让 Windows 依赖 Linux SQLite replica，但元数据往返承担远端 RTT。未来的 replica 优化须保留健康门控和与 apply 同序的通知，不能让缓存命中代替权威可用性。零权利 lease 对真实 Windows 一秒可见性的作用尚未验证；它不修改 backend API，也不构成 cache grant／break 方案。同步确认、签名和不授予缓存权限也有吞吐成本；性能改进不放宽错误、身份或确认语义。UAC 的映射可见性属于按用户部署约束，helper 不通过全局映射或弱化系统安全绕开它。
 
 ### 原生验证仍待完成
 

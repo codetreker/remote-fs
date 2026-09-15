@@ -170,6 +170,10 @@ busy unmount 用例在真实挂载点保留打开的描述符和排他 flock，�
 
 wire 测试覆盖命令长度、偏移、compound、contexts、签名与认证状态；SMB 核心覆盖 CREATE、目录、范围操作、已知动作错误、部分 lock batch、异步取消、通知队列和清理。WindowsStorage 在真实 SQLite、objectstore、localstore、locked、limited 与 HTTP 路径上核对命名启用、目录身份、共享模式、delete-pending、范围访问、原动作重放与配额。错误路径不能只证明返回了某个非零状态，还要检查原身份、内容、Applied 数量、容量和清理所有权。
 
+SMB lease 的[wire 测试](../packages/smb/internal/wire/lease_test.go)分别覆盖 V1／V2、重复 RqLs、保留字段与固定零 LeaseState；[记录测试](../packages/smb/lease_table_test.go)验证 ClientGUID／key 隔离、epoch／parent 保留、逐打开身份、sticky DeleteOnClose、预算预留与最后关闭。[打开测试](../packages/smb/lease_files_test.go)核对副作用前身份探测、最终 ExpectedID、根 lookup、未知打开与 probe-close 失败的所有权；[生命周期测试](../packages/smb/lease_lifetime_test.go)验证 orphan 转移及确认清理后才释放。协议成功回复必须区分 lease open 的 OplockLevel=LEASE／State=NONE 与普通 open 的 NONE，不能复制请求的缓存位或返回 durable 授予。
+
+[会话 registry 测试](../packages/smb/session_registry_test.go)验证跨连接唯一 SessionID、Channel 保留字段、binding 拒绝，以及最终认证成功后才处理 PreviousSessionId；不存在／其它 SID 的 ID 不退役别人的状态，同 SID 的旧清理失败不能激活新身份。取消、断线与并发 finalization 分别核对清理所有权和迟到激活。它们不恢复旧文件；本地协议、race 或编译通过也不证明零权利 lease 已改善 Windows 的一秒可见性，原生断言保持不变。
+
 Notification 的测试分别验证不可变前后路径、目录符号链接所需的 Directory 标志、精确 ChangeMask、重命名分组、断续历史和全部 volume 共同执行的原始字段上限；超限修改不得先提交。WindowsNameInfo 的完整路径与 root／detached 状态、符号链接目标及 suffix 也进入 JSON 边界与结果核对；65792 字节和 32767 UTF-16 code units 两项界限覆盖启用、写入及目录移动后的后代路径。授权 SetLink 的回归还检查 NodeID、既有 S/X 保护、既有 grant 的 renew／release 与原 ResourceRef 的 reacquire，以及 fresh Resolve 对 reparse point 的拒绝。SMB 显式 ChangeTime=-1 和 FILE_NO_INTERMEDIATE_BUFFERING 在修改前返回不支持，不能用自动更新时间或 write-through 代替它们。HTTP Windows control 在 data admission 饱和后仍须能核对、取消与关闭；最坏路径和 symlink 结果不能超过控制响应的预算。Linux [类型转换回归](../packages/fuse/windows_type_linux_test.go)核对 Windows SetLink 后的链接类型与稳定 inode，同时保留 Linux Readlink／Symlinker 的 `EOPNOTSUPP`。
 
 ### Windows 11 ARM64 原生入口

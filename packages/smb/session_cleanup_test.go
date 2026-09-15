@@ -314,7 +314,9 @@ func TestConcurrentLogoffRetainsSignerUntilBothFramesRetire(t *testing.T) {
 	c.pending[201] = &pendingRequest{frame: 200, command: wire.Logoff, ctx: ctx, cancel: func() {}, sessionID: s.id}
 	c.mu.Unlock()
 	first := make(chan error, 1)
-	go func() { first <- c.logoff(context.WithValue(ctx, pendingFrameKey{}, uint64(100)), s) }()
+	go func() {
+		first <- c.logoff(context.WithValue(ctx, pendingFrameKey{}, requestFrame{connection: c, id: 100}), s)
+	}()
 	select {
 	case <-backend.entered:
 	case <-ctx.Done():
@@ -328,7 +330,7 @@ func TestConcurrentLogoffRetainsSignerUntilBothFramesRetire(t *testing.T) {
 	second, started := make(chan error, 1), make(chan struct{})
 	go func() {
 		close(started)
-		second <- c.logoff(context.WithValue(ctx, pendingFrameKey{}, uint64(200)), s)
+		second <- c.logoff(context.WithValue(ctx, pendingFrameKey{}, requestFrame{connection: c, id: 200}), s)
 	}()
 	<-started
 	unblock()
@@ -375,7 +377,7 @@ func TestConcurrentLogoffRetainsSignerUntilBothFramesRetire(t *testing.T) {
 }
 
 func TestShutdownRetriesDisconnectedAuthorityOwnership(t *testing.T) {
-	c, s, tr, _, _, _ := testConnection(t)
+	c, s, tr, _, _, stream := testConnection(t)
 	if _, status := cleanupDispatch(t, t.Context(), c, s, wire.TreeDisconnect, tr.id, wire.EmptyResponseBody()); status != statusOK {
 		t.Fatalf("initial disconnect = %x", status)
 	}
@@ -417,5 +419,10 @@ func TestShutdownRetriesDisconnectedAuthorityOwnership(t *testing.T) {
 	c.server.mu.Unlock()
 	if remaining != 0 || refs != 0 {
 		t.Fatalf("shutdown retry retained sessions=%d refs=%d", remaining, refs)
+	}
+	select {
+	case <-stream.done:
+	default:
+		t.Fatal("shutdown retry retained the export notification stream")
 	}
 }

@@ -135,6 +135,9 @@ func nativeBridgeFixture(t *testing.T, authorize authz.Authorizer) *nativeBridge
 		if t.Failed() && b.smb != nil {
 			b.logFailure(t)
 		}
+		if b.wire.unsafeCaching.Load() {
+			t.Error("SMB granted caching rights or returned malformed lease metadata")
+		}
 		if b.gate != nil {
 			b.gate.down.Store(false)
 			b.gate.mu.Lock()
@@ -153,6 +156,9 @@ func nativeBridgeFixture(t *testing.T, authorize authz.Authorizer) *nativeBridge
 		if b.smb != nil {
 			if err := b.smb.Shutdown(ctx); err != nil {
 				t.Errorf("SMB shutdown: %v", err)
+			}
+			if status := b.smb.Status(); status.LeaseSlots != 0 || status.LeaseBytes != 0 {
+				t.Errorf("SMB cleanup retained leases: %+v", status)
 			}
 		}
 		if handler != nil {
@@ -272,7 +278,7 @@ func (b *nativeBridge) logFailure(t *testing.T) {
 		t.Logf("TREE_CONNECT[%d] messageID=%d path=%q offset=%d length=%d truncated=%v", i, tree.MessageID, tree.Path, tree.Offset, tree.Length, tree.Truncated)
 	}
 	for i, c := range b.wire.creates {
-		t.Logf("CREATE[%d] messageID=%d security=%d oplock=0x%x impersonation=%d access=0x%x attributes=0x%x share=0x%x disposition=%d options=0x%x contexts=%q truncated=%v", i, c.MessageID, c.SecurityFlags, c.Oplock, c.Impersonation, c.Access, c.Attributes, c.ShareAccess, c.Disposition, c.Options, c.Contexts, c.Truncated)
+		t.Logf("CREATE[%d] sequence=%d name=%q messageID=%d security=%d oplock=0x%x impersonation=%d access=0x%x attributes=0x%x share=0x%x disposition=%d options=0x%x contexts=%q truncated=%v", i, c.Sequence, c.Name, c.MessageID, c.SecurityFlags, c.Oplock, c.Impersonation, c.Access, c.Attributes, c.ShareAccess, c.Disposition, c.Options, c.Contexts, c.Truncated)
 	}
 	for i, o := range b.wire.operations {
 		if o.Command == 1 {
@@ -280,6 +286,12 @@ func (b *nativeBridge) logFailure(t *testing.T) {
 			continue
 		}
 		t.Logf("operation[%d] messageID=%d command=0x%x infoType=%d class=%d controlCode=0x%x", i, o.MessageID, o.Command, o.InfoType, o.Class, o.ControlCode)
+	}
+	for _, n := range b.wire.negotiations {
+		t.Logf("NEGOTIATE dialect=0x%x capabilities=0x%x", n.Dialect, n.Capabilities)
+	}
+	for _, r := range b.wire.createReplies {
+		t.Logf("CREATE response messageID=%d oplock=0x%x leases=%+v truncated=%v", r.MessageID, r.Oplock, r.Leases, r.Truncated)
 	}
 	b.wire.mu.Unlock()
 }
@@ -482,6 +494,8 @@ func TestNativeWindowsHTTPBridge(t *testing.T) {
 		t.Fatalf("ReadFile returned %q/%d,error=%v", buffer, n, err)
 	}
 
+	b.assertCacheContract(t)
+
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	if err := b.mapping.Unmount(ctx); !errors.Is(err, ErrMappingBusy) {
 		cancel()
@@ -511,6 +525,7 @@ func TestNativeWindowsHTTPBridge(t *testing.T) {
 	if _, err := newRemote.Stat(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	beforeFreshLookup := b.wire.createSequence.Load()
 	nativeEventually(t, "remote creation after a negative lookup", func() bool {
 		_, err := os.Stat(missing)
 		if err != nil && !os.IsNotExist(err) {
@@ -518,6 +533,18 @@ func TestNativeWindowsHTTPBridge(t *testing.T) {
 		}
 		return err == nil
 	})
+
+	b.wire.mu.Lock()
+	freshLookup := false
+	for _, request := range b.wire.creates {
+		if request.Sequence > beforeFreshLookup && strings.EqualFold(strings.TrimPrefix(request.Name, `\`), "new.bin") {
+			freshLookup = true
+		}
+	}
+	b.wire.mu.Unlock()
+	if !freshLookup {
+		t.Fatal("successful lookup after remote creation had no fresh SMB CREATE for new.bin")
+	}
 
 	directorySession, directory := nativeRemoteOpen(t, b.remote, "directory", storage.WindowsDirectory, true)
 	directoryPath := filepath.Join(b.path+`\`, "directory")
@@ -539,6 +566,8 @@ func TestNativeWindowsHTTPBridge(t *testing.T) {
 		}
 		return len(entries) == 1 && entries[0].Name() == "child.bin"
 	})
+
+	b.assertCacheContract(t)
 
 	b.gate.down.Store(true)
 	b.http.CloseClientConnections()
@@ -608,5 +637,34 @@ func TestNativeWindowsRejectsAnotherSID(t *testing.T) {
 		}
 	default:
 		t.Fatal("mapping failed before the real SSPI identity reached authorization")
+	}
+}
+
+func (b *nativeBridge) assertCacheContract(t *testing.T) {
+	t.Helper()
+	if b.wire.unsafeCaching.Load() {
+		t.Fatal("SMB granted caching rights or returned malformed lease metadata")
+	}
+	if b.wire.leaseResponses.Load() == 0 {
+		t.Fatal("native client did not exercise an RqLs response")
+	}
+	b.wire.mu.Lock()
+	defer b.wire.mu.Unlock()
+	formal := false
+	for _, n := range b.wire.negotiations {
+		switch n.Dialect {
+		case 0x311:
+			formal = true
+			if n.Capabilities != 0x26 {
+				t.Fatalf("formal negotiation capabilities=0x%x", n.Capabilities)
+			}
+		case 0x2ff:
+			if n.Capabilities != 0x6 {
+				t.Fatalf("wildcard negotiation capabilities=0x%x", n.Capabilities)
+			}
+		}
+	}
+	if !formal {
+		t.Fatal("native client did not negotiate observed SMB3.1.1 capabilities")
 	}
 }
