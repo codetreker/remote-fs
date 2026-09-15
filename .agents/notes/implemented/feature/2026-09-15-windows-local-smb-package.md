@@ -30,11 +30,13 @@ SMB 核心依赖 storage、metastore 和 authz，不导入 HTTP、SQLite、FUSE 
 
 `New` 校验显式配置；`Serve` 接受宿主交付的 loopback TCP listener。`Publish` 检查 backend 的 Windows 能力、已启用状态及观察预算，并拥有该 Export 的观察器。映射、Export、Server 与外部 backend 分别关闭：普通 `Unpublish` 在仍有打开对象或活跃请求时返回 busy，清理失败保留停止中的所有权；`Shutdown` 停止接纳并等待自己拥有的资源。调用方拥有的 backend 不随某个 share 停止而关闭。
 
+系统客户端的保留 `IPC$` 连接由独立控制树表示，不能把它配置成一个业务 volume Export。它只接受已认证、通过签名校验的 session，计入同一 MaxTrees 预算并遵守 session/tree 清理。pipe-share 响应不代表实现了管道对象；控制树没有 volume backend、WindowsSession、通知或发现接口，不制造一个 volume 身份来请求业务授权。它正常处理 TREE_DISCONNECT，session 的 ECHO／LOGOFF 保持原义；未支持的 pipe、RPC 与控制命令明确失败。已发布 volume 的授权和后端访问保持原有路径。
+
 ### 本机身份与显式映射
 
 [`packages/smb/windows`](../../../../packages/smb/windows/auth.go) 使用真实 SSPI Negotiate 交换取得 token 身份和 session key，每次 Begin 持有独立的 native credentials/context。匿名、guest、无可用签名密钥的交换被拒绝。连接允许一次严格限定的 SMB1 帧形状 multi-protocol NEGOTIATE 前导：必须包含 `SMB 2.???`，wildcard `0x02ff` 响应之后仍须进入真正的 SMB2 格式协商，期间不建立认证会话或接纳文件操作。正式 dialect 只接受 SMB 3.1.1、SHA-512 preauthentication integrity 与 AES-CMAC signing，hash 从正式协商开始，正常会话要求签名。这个入口只处理系统客户端的协商前导，不提供 SMB1 文件操作或旧版 Windows 支持；重复前导被拒绝。同步 SSPI 调用返回后仍检查取消，Close 与已进入的原生调用串行收尾，不把取消解释成原生工作已经停止。
 
-本机 Authenticator 与 Authorizer 是必填配置。`CurrentUserSID` 和 `AllowSID` 提供明确的挂载者 SID 策略；业务也可以注入自己的策略。可信 `Share.Volume` 由宿主配置，本机身份放入请求 context 后逐次授权，WindowsOpenIntent 保留数据、metadata、delete 与共享意图。远端 HTTP 身份由业务 transport 管理，两端授权各自执行；令牌和签名密钥不进入日志。凭据轮换不能替换既有会话的已验证身份，重新认证必须保持同一 SID。
+本机 Authenticator 与 Authorizer 是必填配置。`CurrentUserSID` 和 `AllowSID` 提供明确的挂载者 SID 策略；业务也可以注入自己的策略。可信 `Share.Volume` 由宿主配置，对已发布 volume 的访问在本机身份放入请求 context 后逐次授权，WindowsOpenIntent 保留数据、metadata、delete 与共享意图。远端 HTTP 身份由业务 transport 管理，两端授权各自执行；令牌和签名密钥不进入日志。凭据轮换不能替换既有会话的已验证身份，重新认证必须保持同一 SID。
 
 `Map` 只在显式调用时改变当前用户的系统映射。helper 检查 Windows client edition、build 和必要的 typed 参数，将 `TcpPort`、TCP transport、`UseWriteThrough`、`RequireIntegrity` 与关闭持久／全局／凭据保存的选项交给 `New-SmbMapping`。程序固定，值通过 JSON stdin 传入，不拼入 PowerShell 语法；它不请求提权，也不修改注册表、安全策略或系统 445 服务。系统拒绝权限或不支持的参数时，错误保留给宿主。[Microsoft 的端口说明](https://learn.microsoft.com/en-us/windows-server/storage/file-server/smb-ports)与[映射参数](https://learn.microsoft.com/en-us/powershell/module/smbshare/new-smbmapping?view=windowsserver2025-ps)定义系统能力，实际 loopback 认证仍须原生验收。
 

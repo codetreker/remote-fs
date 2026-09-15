@@ -65,7 +65,7 @@ func shareKey(name string) (string, error) {
 
 func (s *Server) Publish(share Share) (*Export, error) {
 	key, err := shareKey(share.Name)
-	if err != nil || share.Volume == "" || share.Backend == nil {
+	if err != nil || key == "IPC$" || share.Volume == "" || share.Backend == nil {
 		return nil, ErrConfig
 	}
 	if err := share.Backend.CheckWindowsStorage(); err != nil {

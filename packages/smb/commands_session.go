@@ -75,6 +75,10 @@ func (c *connection) dispatch(ctx context.Context, r, original wire.Request, h *
 	if t == nil {
 		return nil, statusNetworkDeleted, signer
 	}
+	if t.kind == controlTree {
+		body, status := c.control(s, t, r)
+		return body, status, signer
+	}
 	c.server.mu.Lock()
 	if t.export.stopping {
 		c.server.mu.Unlock()
@@ -432,6 +436,9 @@ func (c *connection) treeConnect(ctx context.Context, s *session, r wire.Request
 	key, err := shareKey(parts[3])
 	if err != nil {
 		return nil, statusBadNetworkName
+	}
+	if key == "IPC$" {
+		return c.connectControl(s, h)
 	}
 	c.server.mu.Lock()
 	e := c.server.exports[key]

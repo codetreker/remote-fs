@@ -98,7 +98,15 @@ type authoritySession struct {
 	closed  bool
 }
 
+type treeKind uint8
+
+const (
+	volumeTree treeKind = iota
+	controlTree
+)
+
 type tree struct {
+	kind      treeKind
 	id        uint32
 	sessionID uint64
 	export    *Export
@@ -326,6 +334,10 @@ func (c *connection) closeTree(t *tree) error {
 		}
 	}
 	c.mu.Unlock()
+	if t.kind == controlTree {
+		t.closed = true
+		return nil
+	}
 	t.files.mu.Lock()
 	for id := range t.files.handles {
 		t.export.changes.remove(c.notifyKey(id))
