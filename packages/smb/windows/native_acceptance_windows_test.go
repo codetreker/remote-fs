@@ -248,6 +248,7 @@ func (b *nativeBridge) mapDrive(t *testing.T) error {
 	defer cancel()
 	b.mapping, err = Map(ctx, MappingOptions{LocalPath: b.path, Share: b.share, TCPPort: b.port})
 	if err != nil {
+		t.Logf("native Map failed: %v", err)
 		b.logFailure(t)
 	}
 	return err
