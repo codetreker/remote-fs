@@ -1307,6 +1307,10 @@ func waitForWitness(
 
 func readWitnessRecord(t *testing.T, store *Store) metastoreWitnessRecord {
 	t.Helper()
+	// A checkpoint replaces METASTORE atomically. Hold its publisher's mutex so
+	// the descriptor remains linked while the independent disk read validates it.
+	store.durable.witness.mu.Lock()
+	defer store.durable.witness.mu.Unlock()
 	anchor, err := openRootAnchor(store.anchor.path)
 	if err != nil {
 		t.Fatal(err)

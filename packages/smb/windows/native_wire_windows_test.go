@@ -25,10 +25,15 @@ type nativeWireObservation struct {
 }
 
 type nativeOperationObservation struct {
-	MessageID       uint64
-	Command         uint16
-	InfoType, Class byte
-	ControlCode     uint32
+	MessageID                          uint64
+	Command                            uint16
+	InfoType, Class                    byte
+	ControlCode                        uint32
+	Flags, SecurityMode                byte
+	Capabilities, Channel              uint32
+	PreviousSessionID, HeaderSessionID uint64
+	TokenOffset, TokenLength           uint16
+	BodyLength                         int
 }
 
 type nativeCreateObservation struct {
@@ -134,7 +139,7 @@ type nativeFrameObserver struct {
 	treeBytes      int
 	create         [4096]byte
 	createBytes    int
-	operation      [8]byte
+	operation      [24]byte
 	operationBytes int
 }
 
@@ -222,8 +227,12 @@ func (c *nativeFrameObserver) observe(data []byte) {
 		}
 		if !c.response && c.headerBytes == len(c.header) && binary.BigEndian.Uint32(c.header[:4]) == 0xfe534d42 {
 			command := binary.LittleEndian.Uint16(c.header[12:14])
-			if command == 14 || command == 16 || command == 11 {
-				start, end := max(c.frameBytes, 64), min(c.frameBytes+n, 72)
+			if command == 14 || command == 16 || command == 11 || command == 1 {
+				fixedEnd := 72
+				if command == 1 {
+					fixedEnd = 88
+				}
+				start, end := max(c.frameBytes, 64), min(c.frameBytes+n, fixedEnd)
 				if next := int(binary.LittleEndian.Uint32(c.header[20:24])); next != 0 {
 					end = min(end, next)
 				}
@@ -236,9 +245,30 @@ func (c *nativeFrameObserver) observe(data []byte) {
 		c.frameBytes += n
 		data = data[n:]
 		c.remaining -= n
-		if c.remaining == 0 && c.operationBytes == 8 {
+		if c.remaining == 0 && (c.operationBytes == 8 || c.operationBytes == 24) {
 			h := nativeOperationObservation{MessageID: binary.LittleEndian.Uint64(c.header[24:32]), Command: binary.LittleEndian.Uint16(c.header[12:14])}
 			switch h.Command {
+			case 1:
+				if c.operationBytes != 24 {
+					continue
+				}
+				commandEnd := c.frameBytes
+				if next := int(binary.LittleEndian.Uint32(c.header[20:24])); next != 0 {
+					commandEnd = min(commandEnd, next)
+				}
+				tokenOffset, tokenLength := binary.LittleEndian.Uint16(c.operation[12:14]), binary.LittleEndian.Uint16(c.operation[14:16])
+				if tokenLength != 0 && (tokenOffset < 88 || int(tokenOffset)+int(tokenLength) > commandEnd) {
+					clear(c.operation[:])
+					continue
+				}
+				h.Flags, h.SecurityMode = c.operation[2], c.operation[3]
+				h.Capabilities, h.Channel = binary.LittleEndian.Uint32(c.operation[4:8]), binary.LittleEndian.Uint32(c.operation[8:12])
+				h.TokenOffset, h.TokenLength = binary.LittleEndian.Uint16(c.operation[12:14]), binary.LittleEndian.Uint16(c.operation[14:16])
+				h.PreviousSessionID, h.HeaderSessionID = binary.LittleEndian.Uint64(c.operation[16:24]), binary.LittleEndian.Uint64(c.header[40:48])
+				h.BodyLength = c.frameBytes - 64
+				if next := int(binary.LittleEndian.Uint32(c.header[20:24])); next != 0 {
+					h.BodyLength = min(h.BodyLength, next-64)
+				}
 			case 14:
 				h.Class = c.operation[2]
 			case 16:
@@ -437,6 +467,66 @@ func TestNativeCreateObservationRejectsOverlappingContextValues(t *testing.T) {
 			observer.recordCreate()
 			if len(observation.creates) != 1 || !observation.creates[0].Truncated || len(observation.creates[0].Contexts) != 0 {
 				t.Fatalf("overlapping data logged as metadata: %+v", observation.creates)
+			}
+		})
+	}
+}
+
+func TestNativeWireObservationKeepsSessionSetupScalarsOnly(t *testing.T) {
+	var observation nativeWireObservation
+	observer := nativeFrameObserver{observation: &observation}
+	frame := make([]byte, 4+88+32)
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(frame)-4))
+	copy(frame[4:8], []byte{0xfe, 'S', 'M', 'B'})
+	binary.LittleEndian.PutUint16(frame[16:18], 1)
+	binary.LittleEndian.PutUint64(frame[44:52], 99)
+	b := frame[68:92]
+	b[2], b[3] = 1, 3
+	binary.LittleEndian.PutUint32(b[4:8], 5)
+	binary.LittleEndian.PutUint32(b[8:12], 7)
+	binary.LittleEndian.PutUint16(b[12:14], 88)
+	binary.LittleEndian.PutUint16(b[14:16], 32)
+	binary.LittleEndian.PutUint64(b[16:24], 42)
+	for i := 92; i < len(frame); i++ {
+		frame[i] = 0xcc
+	}
+	for _, v := range frame {
+		observer.observe([]byte{v})
+	}
+	if len(observation.operations) != 1 {
+		t.Fatalf("session evidence=%+v", observation.operations)
+	}
+	o := observation.operations[0]
+	if o.Flags != 1 || o.SecurityMode != 3 || o.Capabilities != 5 || o.Channel != 7 || o.PreviousSessionID != 42 || o.HeaderSessionID != 99 || o.TokenOffset != 88 || o.TokenLength != 32 || o.BodyLength != 56 {
+		t.Fatalf("session scalars=%+v", o)
+	}
+	if observer.operationBytes != 24 || observer.operation != [24]byte(b) {
+		t.Fatal("session capture includes token payload")
+	}
+}
+
+func TestNativeSessionSetupObservationRejectsTokenOverlap(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		offset, length uint16
+		next           uint32
+	}{
+		{"overlap previous session", 80, 32, 0}, {"past frame", 88, 33, 0}, {"past compound member", 88, 32, 96},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var observation nativeWireObservation
+			observer := nativeFrameObserver{observation: &observation}
+			frame := make([]byte, 4+120)
+			binary.BigEndian.PutUint32(frame[:4], 120)
+			copy(frame[4:8], []byte{0xfe, 'S', 'M', 'B'})
+			binary.LittleEndian.PutUint16(frame[16:18], 1)
+			binary.LittleEndian.PutUint32(frame[24:28], tc.next)
+			binary.LittleEndian.PutUint16(frame[80:82], tc.offset)
+			binary.LittleEndian.PutUint16(frame[82:84], tc.length)
+			copy(frame[84:], "token-private-material")
+			observer.observe(frame)
+			if len(observation.operations) != 0 || observer.operation != [24]byte{} {
+				t.Fatalf("invalid token span retained session scalars: %+v", observation.operations)
 			}
 		})
 	}

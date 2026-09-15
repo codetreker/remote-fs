@@ -275,6 +275,10 @@ func (b *nativeBridge) logFailure(t *testing.T) {
 		t.Logf("CREATE[%d] messageID=%d security=%d oplock=0x%x impersonation=%d access=0x%x attributes=0x%x share=0x%x disposition=%d options=0x%x contexts=%q truncated=%v", i, c.MessageID, c.SecurityFlags, c.Oplock, c.Impersonation, c.Access, c.Attributes, c.ShareAccess, c.Disposition, c.Options, c.Contexts, c.Truncated)
 	}
 	for i, o := range b.wire.operations {
+		if o.Command == 1 {
+			t.Logf("SESSION_SETUP[%d] messageID=%d flags=0x%x securityMode=0x%x capabilities=0x%x channel=%d previousSessionID=%d headerSessionID=%d tokenOffset=%d tokenLength=%d bodyLength=%d", i, o.MessageID, o.Flags, o.SecurityMode, o.Capabilities, o.Channel, o.PreviousSessionID, o.HeaderSessionID, o.TokenOffset, o.TokenLength, o.BodyLength)
+			continue
+		}
 		t.Logf("operation[%d] messageID=%d command=0x%x infoType=%d class=%d controlCode=0x%x", i, o.MessageID, o.Command, o.InfoType, o.Class, o.ControlCode)
 	}
 	b.wire.mu.Unlock()
