@@ -165,6 +165,10 @@ func windowsIntent(r wire.CreateRequest) (storage.WindowsOpenIntent, error) {
 	// FILE_DISALLOW_EXCLUSIVE has no server-side meaning in SMB2 CREATE.
 	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/e8fb45c1-a03d-44ca-b7ae-47385cfd7997
 	r.Options &^= 0x00020000
+	// Backup intent grants no additional access: this adapter supplies no backup
+	// or restore privileges, and every open retains ordinary host authorization.
+	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/8ada5fbe-db4e-49fd-aef6-20d54b748e40
+	r.Options &^= 0x00004000
 	if r.Options&0x8 != 0 {
 		return storage.WindowsOpenIntent{}, syscall.EOPNOTSUPP
 	}

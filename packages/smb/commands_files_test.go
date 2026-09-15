@@ -3,11 +3,13 @@ package smb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -707,5 +709,52 @@ func TestProtocolNativeCreateDeclinesOptionalCaching(t *testing.T) {
 	h, err = wire.ParseHeader(response)
 	if err != nil || h.Status != 0 || signer.Verify(response) != nil || file.closes.Load() != 1 {
 		t.Fatalf("native CREATE handle did not close: %+v %v", h, err)
+	}
+}
+
+func TestNativeBackupMetadataOpenPreservesAuthorizationAndAbsence(t *testing.T) {
+	for _, pattern := range []struct {
+		options, access, share uint32
+		identity               bool
+	}{{0x204042, 0x100080, 7, false}, {0x204002, 0x80, 7, true}, {0x224022, 0x100080, 0, true}} {
+		t.Run(fmt.Sprintf("options_%x", pattern.options), func(t *testing.T) {
+			c, session, _, _, backend, _ := testConnection(t)
+			var opened []storage.WindowsOpenRequest
+			backend.open = func(request storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
+				opened = append(opened, request)
+				if request.Lookup.Name == "" {
+					root := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 1, Mode: fs.ModeDir}}}}
+					return storage.WindowsOpenResult{File: root, Attr: root.attr}, nil
+				}
+				return storage.WindowsOpenResult{}, syscall.ENOENT
+			}
+			request := createCommand("missing", pattern.access, 1)
+			smbLE.PutUint32(request.Body[4:], 2)
+			smbLE.PutUint32(request.Body[32:], pattern.share)
+			smbLE.PutUint32(request.Body[40:], pattern.options)
+			if pattern.identity {
+				request = requestContexts(t, request, []wire.CreateContext{{Name: []byte("QFid")}})
+			}
+			request = signedRequest(t, session, request)
+			header := request.Header
+			var authorized *storage.WindowsOpenIntent
+			c.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, access authz.AccessRequest) error {
+				authorized = &access.WindowsOpen
+				return nil
+			})
+			_, status, _ := c.dispatch(t.Context(), request, request, &header)
+			if status != 0xc0000034 || len(opened) != 2 || authorized == nil {
+				t.Fatalf("absent metadata open status=%x backendCalls=%d intent=%+v", status, len(opened), authorized)
+			}
+			got := opened[1].WindowsOpenIntent
+			if got != *authorized || got.Share != storage.WindowsShare(pattern.share) || !got.OpenReparsePoint || got.Disposition != storage.WindowsOpen || got.Access&storage.WindowsReadAttributes == 0 || got.Access&^(storage.WindowsReadAttributes|storage.WindowsSynchronize) != 0 {
+				t.Fatalf("backup hint changed granted authority: %+v authorized=%+v", got, authorized)
+			}
+			opened = nil
+			c.server.config.Authorize = authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return authz.ErrDenied })
+			if _, status, _ := c.dispatch(t.Context(), request, request, &header); status != statusDenied || len(opened) != 0 {
+				t.Fatal("backup hint bypassed business authorization")
+			}
+		})
 	}
 }

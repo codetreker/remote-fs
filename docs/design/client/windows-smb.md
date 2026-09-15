@@ -96,6 +96,6 @@ Mapping 记录 SID、AuthenticationID 和 SessionID。Unmount 再次核对登录
 
 Export.Unpublish 在仍有 opens 或活跃请求时返回 `ErrBusy`。宿主按映射、export、server 及外部 backend 的各自 ownership 收尾；Server.Shutdown 停止接纳并清理自己拥有的连接、tree 与会话，失败通过返回值和有限 Status 计数暴露。renew 使用会话 lease 的三分之一作为节奏；授权或续期失败关闭受影响的 tree。没有依赖 import 副作用建立的 listener、信号处理或系统映射。
 
-核心不授予 SMB leases/oplocks、durable handles、跨连接恢复旧引用或 encryption 能力。CREATE 可以识别可选的 oplock、`RqLs`、`DHnQ` 与 `DH2Q` 请求，并在不授予这些能力的情况下返回成功的普通打开；响应保持 oplock NONE，不返回对应的 lease／durable 授予 context。`FILE_DISALLOW_EXCLUSIVE` 按 SMB2 规则忽略，不改变 DesiredAccess／ShareAccess 的权威检查；`FILE_NO_INTERMEDIATE_BUFFERING` 仍明确拒绝。未知 create context、未支持的信息类别和控制请求继续失败；这些处理不声明完整 NTFS 兼容，alternate data streams、Windows ACL 管理与共享 mmap 一致性仍在需求非目标内。
+核心不授予 SMB leases/oplocks、durable handles、跨连接恢复旧引用或 encryption 能力。CREATE 可以识别可选的 oplock、`RqLs`、`DHnQ` 与 `DH2Q` 请求，并在不授予这些能力的情况下返回成功的普通打开；响应保持 oplock NONE，不返回对应的 lease／durable 授予 context。`FILE_DISALLOW_EXCLUSIVE` 按 SMB2 规则忽略。本库将 `FILE_OPEN_FOR_BACKUP_INTENT` 按普通打开处理，保留原 DesiredAccess／ShareAccess 与业务授权，不据此授予 SeBackupPrivilege／SeRestorePrivilege 或绕过权威访问检查；`FILE_NO_INTERMEDIATE_BUFFERING` 仍明确拒绝。未知 create context、未支持的信息类别和控制请求继续失败；这些处理不声明完整 NTFS 兼容，alternate data streams、Windows ACL 管理与共享 mmap 一致性仍在需求非目标内。
 
 实现的协议检查、真实 authority 集成与 Windows 原生验收分别见[测试策略](../../testing.md)。源码或非 Windows 上的测试通过不能替代 Windows 11 ARM64 上真实 SSPI、系统映射与应用文件操作的执行结果。
