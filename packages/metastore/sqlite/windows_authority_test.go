@@ -379,15 +379,16 @@ func TestWindowsAuthorityRestartFencesPreviousLease(t *testing.T) {
 	if _, err := s.EnableWindows(t.Context(), id); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Create(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
 	options := storage.DefaultFileSessionOptions()
 	options.Lease = 200 * time.Millisecond
 	inner, err := s.NewWindowsSession(t.Context(), options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ws := inner.(*windowsSession)
-	windowsOpen(t, ws, "file", storage.WindowsAllAccess, storage.WindowsShareAll)
-	if err := ws.Close(t.Context()); err != nil {
+	if err := inner.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -403,19 +404,59 @@ func TestWindowsAuthorityRestartFencesPreviousLease(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	if _, err := reopened.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}); !errors.Is(err, syscall.EAGAIN) {
-		t.Fatalf("recoveryopen=%v", err)
-	}
-	if _, err := reopened.Stat(metastore.WithFileIO(t.Context(), metastore.WindowsIO{Length: 1}), "file"); !errors.Is(err, syscall.EAGAIN) {
-		t.Fatalf("recoveryread=%v", err)
-	}
-	<-time.After(time.Until(reopened.fileDomain.windows.recoveryUntil) + time.Millisecond)
-	file, err := reopened.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
+	persisted, err := reopened.MaxLease(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := file.Close(t.Context()); err != nil {
-		t.Fatal(err)
+	originalDeadline := reopened.fileDomain.windows.recoveryUntil
+	if persisted != options.Lease || !originalDeadline.Equal(reopened.RecoveryStart().Add(persisted)) {
+		t.Fatalf("recovery watermark=%s deadline=%s start=%s; want lease=%s and start+lease", persisted, originalDeadline, reopened.RecoveryStart(), options.Lease)
+	}
+	t.Cleanup(func() {
+		if err := reopened.coordinator.commit.acquire(context.Background()); err != nil {
+			t.Error(err)
+			return
+		}
+		reopened.fileDomain.windows.recoveryUntil = originalDeadline
+		reopened.coordinator.commit.release()
+	})
+
+	// Reopen validation can consume the entire short quarantine. Test its
+	// persisted derivation separately from admission in each deadline state.
+	for _, phase := range []struct {
+		name  string
+		delta time.Duration
+		want  error
+	}{{"unexpired", time.Hour, syscall.EAGAIN}, {"expired", -time.Hour, nil}} {
+		t.Run(phase.name, func(t *testing.T) {
+			if err := reopened.coordinator.commit.acquire(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			reopened.fileDomain.windows.recoveryUntil = time.Now().Add(phase.delta)
+			reopened.coordinator.commit.release()
+
+			file, err := reopened.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
+			if file != nil {
+				t.Cleanup(func() {
+					if err := file.Close(context.Background()); err != nil {
+						t.Error(err)
+					}
+				})
+			}
+			if !errors.Is(err, phase.want) {
+				t.Fatalf("recovery open=%v; want %v", err, phase.want)
+			}
+			if err == nil && file == nil {
+				t.Fatal("expired recovery returned no file reference")
+			}
+			attr, err := reopened.Stat(metastore.WithFileIO(t.Context(), metastore.WindowsIO{Length: 1}), "file")
+			if !errors.Is(err, phase.want) {
+				t.Fatalf("recovery read=%v; want %v", err, phase.want)
+			}
+			if err == nil && (attr.ID == 0 || !attr.Mode.IsRegular()) {
+				t.Fatalf("expired recovery returned invalid file metadata: %+v", attr)
+			}
+		})
 	}
 }
 

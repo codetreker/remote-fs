@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"unicode/utf16"
 )
@@ -193,5 +195,96 @@ func TestMappingCommandEncodingPreservesTheFixedPowerShellProgram(t *testing.T) 
 	}
 	if decoded := string(utf16.Decode(words)); decoded != mappingScript {
 		t.Fatal("mapping command does not preserve the complete fixed PowerShell program")
+	}
+}
+
+func TestMappingDiagnosticPreservesNativeCauses(t *testing.T) {
+	reply, err := decodeMappingReply([]byte(`{"found":false,"created":false,"error":"native","code":2148734208,"diagnostic":{"phase":"create","line":123,"category":13,"errorID":"NewSmbMappingFailed","detail":"mapping rejected","truncated":true,"exceptions":[{"type":"CimException","code":2148734208,"message":"outer message","miResult":5,"cimStatusCode":2},{"type":"Win32Exception","code":2147942405,"message":"Access denied","win32Code":5}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := mappingCommandFailure(reply)
+	if failure == nil {
+		t.Fatal("native failure became success")
+	}
+	for _, text := range []string{"phase=create", "line=123", "category=13", `error_id="NewSmbMappingFailed"`, `detail="mapping rejected"`, "truncated=true", "HRESULT 0x80131500", "CimException", "outer message", "MI result=5", "CIM status=2", "Win32Exception", "HRESULT 0x80070005", "Access denied", "Win32 code=5"} {
+		if !strings.Contains(failure.Error(), text) {
+			t.Errorf("missing diagnostic %q in %v", text, failure)
+		}
+	}
+	var outer *mappingExceptionCause
+	if !errors.As(failure, &outer) || outer.value.Type != "CimException" {
+		t.Fatalf("missing outer exception: %v", failure)
+	}
+	inner, ok := errors.Unwrap(outer).(*mappingExceptionCause)
+	if !ok || inner.value.Type != "Win32Exception" || inner.value.Win32Code == nil || *inner.value.Win32Code != 5 || errors.Unwrap(inner) != nil || !errors.Is(failure, inner) {
+		t.Fatalf("native inner cause not preserved: %#v", inner)
+	}
+}
+
+func TestMappingDiagnosticKeepsOutcomeSentinels(t *testing.T) {
+	for _, tc := range []struct {
+		kind string
+		want error
+	}{{"owner", ErrMappingOwnership}, {"busy", ErrMappingBusy}, {"verification", ErrMappingVerification}, {"unknown", ErrMappingVerification}} {
+		for _, diagnostic := range []*mappingDiagnostic{nil, {Phase: "verify"}} {
+			failure := mappingCommandFailure(mappingReply{Error: tc.kind, Diagnostic: diagnostic})
+			if !errors.Is(failure, tc.want) {
+				t.Errorf("%s diagnostic=%v: %v, want %v", tc.kind, diagnostic != nil, failure, tc.want)
+			}
+		}
+	}
+	if err := mappingCommandFailure(mappingReply{Diagnostic: &mappingDiagnostic{Phase: "complete"}}); err != nil {
+		t.Fatalf("successful reply became error: %v", err)
+	}
+	if err := mappingCommandFailure(mappingReply{Error: "native", Code: 5}); err == nil || !strings.Contains(err.Error(), "0x00000005") {
+		t.Fatalf("native failure without diagnostic lost its code: %v", err)
+	}
+}
+
+func TestMappingDiagnosticDecoderEnforcesBoundsAndTypes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		limit int
+		set   func(*mappingDiagnostic, string)
+	}{
+		{"phase", 64, func(d *mappingDiagnostic, s string) { d.Phase = s }},
+		{"error ID", 256, func(d *mappingDiagnostic, s string) { d.ErrorID = s }},
+		{"detail", 1024, func(d *mappingDiagnostic, s string) { d.Detail = s }},
+		{"exception type", 256, func(d *mappingDiagnostic, s string) { d.Exceptions[0].Type = s }},
+		{"exception message", 1024, func(d *mappingDiagnostic, s string) { d.Exceptions[0].Message = s }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, extra := range []int{0, 1} {
+				d := &mappingDiagnostic{Exceptions: []mappingException{{}}}
+				tc.set(d, strings.Repeat("é", tc.limit/2)+strings.Repeat("x", extra))
+				body, err := json.Marshal(mappingReply{Found: ptr(false), Created: ptr(false), Diagnostic: d})
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = decodeMappingReply(body)
+				if (err != nil) != (extra == 1) {
+					t.Errorf("%d UTF8 bytes: %v", tc.limit+extra, err)
+				}
+			}
+		})
+	}
+	for _, count := range []int{4, 5} {
+		body, err := json.Marshal(mappingReply{Found: ptr(false), Created: ptr(false), Diagnostic: &mappingDiagnostic{Exceptions: make([]mappingException, count)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := decodeMappingReply(body); (err != nil) != (count == 5) {
+			t.Errorf("%d exceptions: %v", count, err)
+		}
+	}
+	for _, diagnostic := range []string{
+		`{"phase":7}`, `{"line":-1}`, `{"category":4294967296}`, `{"truncated":"true"}`, `{"unknown":1}`,
+		`{"exceptions":[{"code":-1}]}`, `{"exceptions":[{"miResult":"5"}]}`, `{"exceptions":[{"cimStatusCode":4294967296}]}`,
+		`{"exceptions":[{"win32Code":2147483648}]}`, `{"exceptions":[{"unknown":1}]}`,
+	} {
+		if _, err := decodeMappingReply([]byte(`{"found":false,"created":false,"diagnostic":` + diagnostic + `}`)); err == nil {
+			t.Errorf("accepted malformed diagnostic %s", diagnostic)
+		}
 	}
 }

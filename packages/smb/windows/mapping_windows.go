@@ -228,8 +228,8 @@ func runMappingCommand(ctx context.Context, request mappingCommand) (mappingRepl
 	command.Stdin = bytes.NewReader(input)
 	var output boundedCommandOutput
 	command.Stdout = &output
-	// Native failures are returned as numeric structured status. PowerShell error
-	// rendering can include caller values, so it never enters returned diagnostics.
+	// Structured failures retain bounded native messages and codes. PowerShell's
+	// rendered stderr can include script/input dumps outside that diagnostic bound.
 	command.Stderr = io.Discard
 	if err := command.Start(); err != nil {
 		return reply, err
@@ -245,19 +245,5 @@ func runMappingCommand(ctx context.Context, request mappingCommand) (mappingRepl
 		}
 		return mappingReply{}, errors.Join(ErrMappingVerification, commandErr, bounded.Err(), decodeErr)
 	}
-	var operationErr error
-	switch reply.Error {
-	case "":
-	case "owner":
-		operationErr = ErrMappingOwnership
-	case "busy":
-		operationErr = ErrMappingBusy
-	case "verification":
-		operationErr = ErrMappingVerification
-	case "native":
-		operationErr = fmt.Errorf("Windows SMB mapping command failed with HRESULT 0x%08x", reply.Code)
-	default:
-		operationErr = ErrMappingVerification
-	}
-	return reply, errors.Join(operationErr, commandErr, bounded.Err())
+	return reply, errors.Join(mappingCommandFailure(reply), commandErr, bounded.Err())
 }
