@@ -96,6 +96,10 @@ func (g *nativeHTTPGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(response.Body.Bytes())
 }
 
+// The Windows redirector retains a server's transport port across mappings and
+// test processes. Every native case uses this same test-owned endpoint.
+const nativeSMBTestAddress = "127.0.0.1:51445"
+
 type nativeBridge struct {
 	backend       *nativeAuthority
 	remote        *httprest.Storage
@@ -212,9 +216,9 @@ func nativeBridgeFixture(t *testing.T, authorize authz.Authorizer) *nativeBridge
 	if _, err := b.smb.Publish(smb.Share{Name: b.share, Volume: "native-acceptance", Backend: b.remote, Changes: changes}); err != nil {
 		t.Fatal(err)
 	}
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	listener, err := net.Listen("tcp4", nativeSMBTestAddress)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("bind shared native SMB test endpoint %s: %v", nativeSMBTestAddress, err)
 	}
 	b.port = uint16(listener.Addr().(*net.TCPAddr).Port)
 	done = make(chan error, 1)

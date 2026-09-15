@@ -82,6 +82,8 @@ HTTP Windows 数据与控制入口分别为 `/v3/windows` 和 `/v3/windows-contr
 
 `windows.Map(ctx, MappingOptions{LocalPath, Share, TCPPort})` 仅连接 `\\127.0.0.1\share`。helper 要求 Windows 11 24H2 或以上，接受单个盘符、有效 share 名与非零 TCP port；不提权、不占用已有盘符、不修改机器策略，也不接收密码。
 
+Windows SMB 客户端要求同一 server、同一 transport 的映射共用一个端口；不同 share 名不隔离这项连接状态。宿主应让各 Export 的映射复用一个 Server 和 listener 端口。Unmount 只结束所拥有的映射，不保证 Windows 立即清除该 server 的端口关联；端口冲突可以在认证前被系统拒绝，不能据此判定身份或业务授权失败。helper 不通过全局断开连接或重试隐藏这项拒绝。
+
 创建使用系统明确支持的 typed 参数：指定 TcpPort、TCP transport、UseWriteThrough、RequireIntegrity，并关闭 Persistent、GlobalMapping 和 SaveCredentials。参数缺失或类型不相容会失败。固定 PowerShell 程序通过 stdin 接收 JSON 值，share 名不拼入命令语法。
 
 创建参数被接受与 OS 身份被观察是两件事。`MappingStatus.ParametersAccepted` 表示创建成功接受了请求参数；另记录实际观察到的 LocalPath、RemotePath、DOS-device target 和 connection status。provider 可以暴露 TcpPort、RequireIntegrity、UseWriteThrough 或 TransportType 等属性；helper 的公共契约不依赖或验证这些 provider 属性，也不假定它们有跨 provider 一致的查询保证。Status 不把这些字段报告为已查询或已验证，不依赖 provider-specific generation，且不进行一次新的 OS 查询。

@@ -184,6 +184,8 @@ Notification 的测试分别验证不可变前后路径、目录符号链接所�
 
 Windows portable storage／SMB 用例通过严格脚本以 `-count=1 -p=1 -timeout 5m` 运行，原生 helper 以 `-count=1 -p=1 -timeout 10m` 运行。Windows helper 子树的 go-cov 使用 `--ci --race=false` 与该子树的 module-prefix，保留仓库配置阈值；不设置 `-coverpkg`，不把其它包的执行算入 helper 覆盖率。
 
+原生映射用例统一使用测试自有的 `127.0.0.1:51445`；串行用例及后续 go-test／coverage 进程复用同一端口，每例的 Server、share、身份和 authority 状态仍独立。Windows 会保留同一 server／transport 的端口关联，不能为第二个身份用例换一个随机端口再把系统的端口拒绝当成认证失败。端口不可用时测试明确失败，不回退端口、不全局断开连接、不重试到成功；这项 fixture 约束不改变 negative cache 的可见性断言。
+
 映射测试保存运行前的 drive/UNC 集合，运行后拒绝新增残留。helper 自身另核对创建身份与 DOS-device target；这些是不同的检查，不把全机映射清空作为清理。失败返回的非 nil Mapping 必须留给调用方继续收尾，未知创建不授权删除观察到的盘符。一次 Windows 运行只有在原生用例、覆盖率及映射收尾真实执行并通过后才可报告验收成功。
 
 ## 请求中断与修改结果
