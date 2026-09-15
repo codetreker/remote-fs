@@ -222,6 +222,26 @@ func operationFor(command uint16) storage.Operation {
 	return ""
 }
 
+// The wildcard exchange selects SMB2 framing; the subsequent SMB 3.1.1
+// NEGOTIATE alone starts the preauthentication transcript.
+// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/bcd6d594-017b-47fc-8742-b7d847791783
+func (c *connection) bootstrap() error {
+	limits := c.server.config.Limits
+	body, err := wire.NegotiateResponseBody(wire.Negotiation{
+		SecurityMode: 3, Dialect: wire.DialectWildcard, ServerGUID: c.server.guid,
+		Capabilities: 4, MaxTransactSize: uint32(limits.MaxIOBytes),
+		MaxReadSize: uint32(limits.MaxIOBytes), MaxWriteSize: uint32(limits.MaxIOBytes),
+		SystemTime: uint64(time.Now().UnixNano()/100 + 116444736000000000),
+	})
+	if err != nil {
+		return err
+	}
+	binary.LittleEndian.PutUint16(body[56:], 128)
+	c.credits = map[uint64]struct{}{1: {}}
+	c.nextCredit = 2
+	return c.write(wire.EncodeResponse(wire.Header{Command: wire.Negotiate, Credits: 1}, body))
+}
+
 func (c *connection) negotiate(r wire.Request) ([]byte, uint32) {
 	if c.negotiated || r.Header.SessionID != 0 {
 		return nil, statusInvalid

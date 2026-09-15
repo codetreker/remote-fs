@@ -121,6 +121,8 @@ func newConnection(s *Server, n net.Conn) *connection {
 func (c *connection) run() error {
 	defer c.cleanup()
 	_ = c.net.SetReadDeadline(time.Now().Add(c.server.config.Limits.HandshakeTimeout))
+	firstPacket := true
+	bootstrap := false
 	for {
 		var prefix [4]byte
 		if _, err := io.ReadFull(c.net, prefix[:]); err != nil {
@@ -128,16 +130,34 @@ func (c *connection) run() error {
 		}
 		length := int(binary.BigEndian.Uint32(prefix[:]))
 		limits := c.server.config.Limits
-		if prefix[0] != 0 || length < 66 || length > limits.MaxFrameBytes {
+		if prefix[0] != 0 || length < 35 || length > limits.MaxFrameBytes {
 			return wire.ErrMalformed
 		}
 		packet := make([]byte, length)
 		if _, err := io.ReadFull(c.net, packet); err != nil {
 			return err
 		}
+		initial := firstPacket
+		firstPacket = false
+		if string(packet[:4]) == "\xffSMB" {
+			if !initial || wire.ParseMultiProtocolNegotiate(packet) != nil {
+				return wire.ErrMalformed
+			}
+			if err := c.bootstrap(); err != nil {
+				return err
+			}
+			bootstrap = true
+			continue
+		}
 		requests, err := wire.ParseFrame(packet, wire.Limits{MaxBytes: limits.MaxFrameBytes, MaxCommands: limits.MaxCompound, MaxContexts: limits.MaxContexts})
 		if err != nil {
 			return err
+		}
+		if bootstrap {
+			if len(requests) != 1 || requests[0].Header.Command != wire.Negotiate {
+				return wire.ErrMalformed
+			}
+			bootstrap = false
 		}
 		c.mu.Lock()
 		reject := len(c.pending)+len(requests) > limits.MaxRequests

@@ -26,7 +26,9 @@ Windows 的 `NewAuthenticator` 在每次 Begin 时取得独立的 inbound Negoti
 
 `CurrentUserSID` 取得当前进程用户的 SID，`AllowSID` 只接受 SMB context 中由 SSPI 验证的同一 SID。宿主显式选择这项策略或自己的 Authorizer，并继续决定访问远端所用的身份。loopback 地址本身不授予另一个本机用户访问权限；elevated 与非 elevated 登录会话也不由 helper 合并。
 
-SMB 协商只接受 3.1.1、SHA-512 preauthentication integrity 与 AES-CMAC signing；正常 session 的签名不能关闭。请求的 volume 操作、完整 Windows open intent 和关闭／续期控制都经过业务授权。远端 HTTP handler 继续按它自己的可信身份与同一语义词汇授权，SMB 本机授权不替代远端授权。
+初始连接可先发送 SMB1 帧形状的 multi-protocol NEGOTIATE 前导。核心只接受严格校验、包含 `SMB 2.???` 的 NEGOTIATE，返回 SMB2 wildcard `0x02ff` 响应；下一步必须是真正的 SMB2 格式 NEGOTIATE。前导不建立认证会话，不开放 SMB1 文件操作；重复前导、其它 SMB1 命令或跳过正式协商的 SESSION_SETUP 均被拒绝。
+
+正式协商仍只接受 SMB 3.1.1、SHA-512 preauthentication integrity 与 AES-CMAC signing；preauthentication hash 从真正的 3.1.1 协商开始，正常 session 的签名不能关闭。这项 bootstrap 不扩张旧版 Windows 支持范围。请求的 volume 操作、完整 Windows open intent 和关闭／续期控制都经过业务授权。远端 HTTP handler 继续按它自己的可信身份与同一语义词汇授权，SMB 本机授权不替代远端授权。
 
 ## 保留对象与远端结果
 

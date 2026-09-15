@@ -170,16 +170,22 @@ func setupPacket(id, session uint64, token string) []byte {
 
 func authenticateProtocol(t *testing.T, c net.Conn) (uint64, *signing.Session) {
 	t.Helper()
+	return authenticateProtocolAt(t, c, 0)
+}
+
+func authenticateProtocolAt(t *testing.T, c net.Conn, firstMessage uint64) (uint64, *signing.Session) {
+	t.Helper()
 	p := negotiatePacket()
+	binary.LittleEndian.PutUint64(p[24:], firstMessage)
 	sendFrame(t, c, p)
 	response := readFrame(t, c)
 	h, err := wire.ParseHeader(response)
-	if err != nil || h.Status != 0 {
+	if err != nil || h.Status != 0 || len(response) < 70 || binary.LittleEndian.Uint16(response[68:]) != wire.Dialect311 || binary.LittleEndian.Uint16(response[66:]) != 3 {
 		t.Fatalf("negotiate: %x %v", h.Status, err)
 	}
 	hash := signing.Preauth([64]byte{}, p)
 	hash = signing.Preauth(hash, response)
-	p = setupPacket(1, 0, "initial")
+	p = setupPacket(firstMessage+1, 0, "initial")
 	hash = signing.Preauth(hash, p)
 	sendFrame(t, c, p)
 	response = readFrame(t, c)
@@ -189,7 +195,7 @@ func authenticateProtocol(t *testing.T, c net.Conn) (uint64, *signing.Session) {
 		t.Fatalf("challenge: %+v", h)
 	}
 	id := h.SessionID
-	p = setupPacket(2, id, "proof")
+	p = setupPacket(firstMessage+2, id, "proof")
 	hash = signing.Preauth(hash, p)
 	key, err := signing.NewSession(hash, []byte("0123456789abcdef"))
 	if err != nil {
@@ -255,5 +261,82 @@ func TestProtocolRejectsOversizeBeforeAllocation(t *testing.T) {
 	var b [1]byte
 	if _, err := c.Read(b[:]); err == nil {
 		t.Fatal("oversize remained open")
+	}
+}
+
+func multiProtocolPacket() []byte {
+	dialects := []byte("\x02NT LM 0.12\x00\x02SMB 2.002\x00\x02SMB 2.???\x00")
+	packet := make([]byte, 35+len(dialects))
+	copy(packet, "\xffSMB")
+	packet[4] = 0x72
+	packet[9] = 0x18
+	binary.LittleEndian.PutUint16(packet[10:], 0xc853)
+	binary.LittleEndian.PutUint16(packet[33:], uint16(len(dialects)))
+	copy(packet[35:], dialects)
+	return packet
+}
+
+func TestProtocolMultiProtocolBootstrapSignsOnlyFinalTranscript(t *testing.T) {
+	_, c := startProtocolServer(t)
+	packet := multiProtocolPacket()
+	if len(packet)+4 != 73 {
+		t.Fatal("unexpected Windows multi-protocol preface size")
+	}
+	sendFrame(t, c, packet)
+	response := readFrame(t, c)
+	h, err := wire.ParseHeader(response)
+	if err != nil || h.Command != wire.Negotiate || h.Status != 0 || h.MessageID != 0 || h.Credits != 1 || h.Flags != wire.FlagResponse || len(response) != 128 {
+		t.Fatalf("bootstrap header=%+v length=%d error=%v", h, len(response), err)
+	}
+	if binary.LittleEndian.Uint16(response[68:]) != 0x02ff || binary.LittleEndian.Uint16(response[66:]) != 3 || binary.LittleEndian.Uint16(response[120:]) != 128 || binary.LittleEndian.Uint16(response[122:]) != 0 {
+		t.Fatal("wildcard response changed the dialect, signing, or empty-token contract")
+	}
+	id, key := authenticateProtocolAt(t, c, 1)
+	p := requestPacket(wire.Header{Command: wire.Echo, MessageID: 4, SessionID: id, Credits: 1}, wire.EmptyResponseBody())
+	if err := key.Sign(p); err != nil {
+		t.Fatal(err)
+	}
+	sendFrame(t, c, p)
+	response = readFrame(t, c)
+	h, _ = wire.ParseHeader(response)
+	if h.Status != 0 || key.Verify(response) != nil {
+		t.Fatalf("post-bootstrap signed echo=%+v", h)
+	}
+}
+
+func TestProtocolMultiProtocolBootstrapRejectsInvalidTransitions(t *testing.T) {
+	for _, name := range []string{"other SMB1 command", "repeated bootstrap", "session before real negotiate", "old final dialect", "bootstrap after authenticated SMB2"} {
+		t.Run(name, func(t *testing.T) {
+			_, c := startProtocolServer(t)
+			p := multiProtocolPacket()
+			switch name {
+			case "other SMB1 command":
+				p[4] = 0x75
+			case "bootstrap after authenticated SMB2":
+				_, _ = authenticateProtocol(t, c)
+			default:
+				sendFrame(t, c, p)
+				_ = readFrame(t, c)
+				if name == "session before real negotiate" {
+					p = setupPacket(1, 0, "initial")
+				} else if name == "old final dialect" {
+					p = negotiatePacket()
+					binary.LittleEndian.PutUint64(p[24:], 1)
+					binary.LittleEndian.PutUint16(p[100:], wire.Dialect302)
+				}
+			}
+			sendFrame(t, c, p)
+			if name == "old final dialect" {
+				h, err := wire.ParseHeader(readFrame(t, c))
+				if err != nil || h.Status != statusUnsupported {
+					t.Fatalf("older final dialect accepted: %+v %v", h, err)
+				}
+				return
+			}
+			var prefix [4]byte
+			if _, err := io.ReadFull(c, prefix[:]); err == nil {
+				t.Fatal("invalid bootstrap transition returned a response")
+			}
+		})
 	}
 }

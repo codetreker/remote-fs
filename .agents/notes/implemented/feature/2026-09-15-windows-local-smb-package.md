@@ -32,7 +32,7 @@ SMB 核心依赖 storage、metastore 和 authz，不导入 HTTP、SQLite、FUSE 
 
 ### 本机身份与显式映射
 
-[`packages/smb/windows`](../../../../packages/smb/windows/auth.go) 使用真实 SSPI Negotiate 交换取得 token 身份和 session key，每次 Begin 持有独立的 native credentials/context。匿名、guest、无可用签名密钥的交换被拒绝。核心只接受 SMB 3.1.1、SHA-512 preauthentication integrity 与 AES-CMAC signing；正常会话要求签名。同步 SSPI 调用返回后仍检查取消，Close 与已进入的原生调用串行收尾，不把取消解释成原生工作已经停止。
+[`packages/smb/windows`](../../../../packages/smb/windows/auth.go) 使用真实 SSPI Negotiate 交换取得 token 身份和 session key，每次 Begin 持有独立的 native credentials/context。匿名、guest、无可用签名密钥的交换被拒绝。连接允许一次严格限定的 SMB1 帧形状 multi-protocol NEGOTIATE 前导：必须包含 `SMB 2.???`，wildcard `0x02ff` 响应之后仍须进入真正的 SMB2 格式协商，期间不建立认证会话或接纳文件操作。正式 dialect 只接受 SMB 3.1.1、SHA-512 preauthentication integrity 与 AES-CMAC signing，hash 从正式协商开始，正常会话要求签名。这个入口只处理系统客户端的协商前导，不提供 SMB1 文件操作或旧版 Windows 支持；重复前导被拒绝。同步 SSPI 调用返回后仍检查取消，Close 与已进入的原生调用串行收尾，不把取消解释成原生工作已经停止。
 
 本机 Authenticator 与 Authorizer 是必填配置。`CurrentUserSID` 和 `AllowSID` 提供明确的挂载者 SID 策略；业务也可以注入自己的策略。可信 `Share.Volume` 由宿主配置，本机身份放入请求 context 后逐次授权，WindowsOpenIntent 保留数据、metadata、delete 与共享意图。远端 HTTP 身份由业务 transport 管理，两端授权各自执行；令牌和签名密钥不进入日志。凭据轮换不能替换既有会话的已验证身份，重新认证必须保持同一 SID。
 
