@@ -88,7 +88,7 @@ lease 表在所有连接之间使用 MaxOpens slot 和 MaxDirectoryBytes 元数�
 
 **WinFsp／Dokany 挂载。** 更接近 Windows 文件系统回调，但增加驱动安装、分发和生命周期。完整跨客户端范围锁还必须证明锁参数与取消／晚到授予之间的原子关系，不能只增加回调便声称兼容。这些成本不符合无需额外驱动的部署目标。
 
-**识别 lease 请求后只返回普通 oplock NONE。** 这保留了不授予缓存权利的边界，却没有建立以 lease key 关联 epoch 与逐打开身份的协议记录，也不能由这个回复推出 Windows 负查询在一秒内可见。零权利 lease 明确处理这些协议状态；它对真实 Windows 缓存行为的效果仍须原生验证，不以字段正确代替可见性证明。
+**识别 lease 请求后只返回普通 oplock NONE。** 这保留了不授予缓存权利的边界，却没有建立以 lease key 关联 epoch 与逐打开身份的协议记录，也不能由这个回复推出 Windows 负查询在一秒内可见。零权利 lease 明确处理这些协议状态，但实际原生负查询可见性验收仍失败；live-file 的合法零权利回复不能代替这一秒断言，也不能证明未执行到的目录阶段。
 
 **本机目录索引或 metadata replica。** 一致快照加日志能够维护类型和祖先关系，但带来初始化、缺口重建和空间预算。权威提交已经持有旧／新状态，直接记录通知事实可以保留 HTTP 读取路径。本机 replica 仍可单独评估；它必须从读取副本的实际 apply 顺序产生通知，并与 Linux nativelease 依赖分离，不能用空实现伪造 Windows 支持。
 
@@ -108,11 +108,13 @@ Windows 使用系统自带客户端，业务能够在同一 Go 进程掌握本�
 
 独立 package 不消除跨层成本。共享访问与锁必须进入 metastore、存储包装层、HTTP 和所有既有访问路径；命名 policy 持久限制已启用 volume，卸载不恢复宽松名字规则。事件保存祖先事实增加每次修改的 CPU、日志和网络字节，完整路径及事件边界会拒绝无法表示的修改。HTTP control 独立池占用额外 retention，不能只计算 ordinary response 的上限。
 
-直接 HTTP 查询避免让 Windows 依赖 Linux SQLite replica，但元数据往返承担远端 RTT。未来的 replica 优化须保留健康门控和与 apply 同序的通知，不能让缓存命中代替权威可用性。零权利 lease 对真实 Windows 一秒可见性的作用尚未验证；它不修改 backend API，也不构成 cache grant／break 方案。同步确认、签名和不授予缓存权限也有吞吐成本；性能改进不放宽错误、身份或确认语义。UAC 的映射可见性属于按用户部署约束，helper 不通过全局映射或弱化系统安全绕开它。
+直接 HTTP 查询避免让 Windows 依赖 Linux SQLite replica，但元数据往返承担远端 RTT。未来的 replica 优化须保留健康门控和与 apply 同序的通知，不能让缓存命中代替权威可用性。零权利 lease 已经历真实 Windows 的一秒负查询验收并失败；该运行未进入专用目录阶段。它不修改 backend API，也不构成 cache grant／break 方案。同步确认、签名和不授予缓存权限也有吞吐成本；性能改进不放宽错误、身份或确认语义。UAC 的映射可见性属于按用户部署约束，helper 不通过全局映射或弱化系统安全绕开它。
 
-### 原生验证仍待完成
+### 原生可见性验收失败
 
-Windows 11 ARM64 CI 已配置普通 Go build 下的真实 SSPI、系统 Map 和 Win32 文件操作测试，并检查实际 client edition、build 与架构。`TestNativeWindowsHTTPBridge` 使用真实 HTTP／SMB／SSPI 链路和有界内存 authority，观察自定义端口、签名 WRITE、暂停 HTTP 确认时的 WriteFile 行为，以及持续打开、negative lookup、目录变化、断线和 busy Unmount；它不证明 Windows SQLite 持久实现。独立 SSPI 认证与取消用例已在真实 Windows 11 Enterprise build 26200 上通过；完整 Map 与原生接入验收仍未完成，Linux 测试与交叉编译也不提供这些结论。
+[030e07a 的 CI](https://github.com/codetreker/remote-fs/actions/runs/34982701023)中两个 Linux 作业通过；服务端重建后的真实认证与不同 SID 策略拒绝通过。`TestNativeWindowsHTTPBridge` 已观察到 live.bin 的有效 V2 RqLs／State=NONE，但在负查询后一秒可见性断言失败。后续专用目录与断线阶段未执行；四条 CREATE 观察及记录边界见[测试策略](../../../../docs/testing.md#windows-11-arm64-原生入口)。
+
+这条原生链路使用有界内存 authority，不证明 Windows SQLite 持久实现。独立 SSPI 认证与取消已有真实 Windows 执行证据；这些通过项与本次可见性失败分别成立，完整 Windows 接入仍未通过验收。
 
 完整接入保留以下验收义务；现有测试的具体对应关系由[测试策略](../../../../docs/testing.md)维护，未执行或尚未覆盖的场景不能记作已通过：
 
@@ -130,4 +132,4 @@ Windows 11 ARM64 CI 已配置普通 Go build 下的真实 SSPI、系统 Map 和 
 
 [R-CON-5【未决】](../../../../docs/spec/requirements.md) 同时适用于 Linux 和 Windows：应用调用超过 SMB MaxReadSize／MaxWriteSize 或 FUSE 请求上限时，会被拆成多个请求。单个协议／storage 请求的捕获、提交与确认不能证明整次应用调用只观察一个修订，也不自动赋予失败的大写入全量回滚。[SMB READ](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/ff304074-293b-4106-a5ea-c19c35ca736a)与[WRITE](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/49dce94d-71fd-4fdf-b730-a60d6b27fbba)的请求边界需要与实际系统调用对照。
 
-这里没有选择应用调用、协议请求或存储操作作为该保证单位，也没有增加跨片段 snapshot／transaction。仍需用超过两种请求上限的读写，在片段之间插入并发覆盖和提交失败，关联实际完成字节、应用错误、读取修订与权威提交。这个契约决定和真实 Windows 验收尚未完成，因此完整 Windows 符合性尚未确认；既有单次操作义务不因此缩减。若原生行为不能满足已定保证，保留失败证据并重新讨论实现，不静默改成最终一致或断线可读。
+这里没有选择应用调用、协议请求或存储操作作为该保证单位，也没有增加跨片段 snapshot／transaction。仍需用超过两种请求上限的读写，在片段之间插入并发覆盖和提交失败，关联实际完成字节、应用错误、读取修订与权威提交。这个契约决定仍未完成，真实 Windows 可见性验收已经失败，因此完整 Windows 符合性尚未确认；既有单次操作义务不因此缩减。若原生行为不能满足已定保证，保留失败证据并重新讨论实现，不静默改成最终一致或断线可读。

@@ -56,7 +56,7 @@ V1／V2 响应格式由本次请求决定，记录中的 epoch、parent-key 元�
 
 pending admission、已关联引用和 fenced 结果各有清理所有者。已确认的 Close 释放对应关联；tree 退役不足以证明尚未核对的原生打开已经结束。未决 token 由原 tree 或共享 Windows authority 会话的 orphan 记录持有，只有对应引用与在途操作确认清理后才归还预算。关闭失败保留这些有界状态，不以遗忘记录制造可用容量。
 
-零权利 lease 不改变 backend API、通知来源或同步确认。它对真实 Windows 负查询、目录缓存和一秒可见性的效果仍须原生验证；协商字段或本地协议测试不能代替这项证据。
+零权利 lease 不改变 backend API、通知来源或同步确认。原生验收已观察到 live.bin 的有效 V2 RqLs／State=NONE，但负查询后一秒可见性失败，后续专用目录阶段未执行；具体记录和边界见[测试策略](../../testing.md#windows-11-arm64-原生入口)。
 
 ## 目录观察与符号链接
 

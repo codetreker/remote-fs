@@ -182,6 +182,17 @@ Notification 的测试分别验证不可变前后路径、目录符号链接所�
 
 `TestNativeWindowsHTTPBridge` 经过真实 HTTP、SMB、SSPI 和系统 Map，观察创建参数被接受、实际盘符／UNC／DOS-device target，并检查所有观察到的 WRITE 都签名。阻塞 HTTP 确认期间，Win32 WriteFile 不得先返回成功；释放确认后检查实际字节。用例还检查打开句柄读取远端后续修改、负查询后的远端创建、目录项变化均在一秒内可见，HTTP 故障不变成旧数据或不存在，以及 busy unmount 保留服务、关闭句柄后的正常移除只结束映射。另一用例让当前已认证 SID 遇到不同 SID 策略，检查拒绝。
 
+[030e07a 的实际 CI](https://github.com/codetreker/remote-fs/actions/runs/34982701023)中，两个 Linux 作业成功；服务端重建后的真实认证及 `TestNativeWindowsRejectsAnotherSID` 通过。`TestNativeWindowsHTTPBridge` 在负查询后的远端创建未于一秒内可见时失败，不能因已收到合法 lease 回复而判通过。该用例记录的四条 CREATE 如下：
+
+| 查询对象／用途 | RqLs 与结果 |
+|---|---|
+| 根目录 | 未请求 RqLs，普通 NONE 回复 |
+| live.bin 数据打开 | V2 RqLs，OplockLevel=LEASE、State=NONE |
+| live.bin metadata 打开 | 未请求 RqLs，普通 NONE 回复 |
+| new.bin 初始不存在查询 | 未请求 RqLs，返回不存在 |
+
+远端创建 new.bin 后，一秒观察窗口的记录中未出现新的 new.bin CREATE。CREATE 记录器只检查 compound packet 的首个成员，因此“未出现”仅描述这份记录，不能排除未记录成员中的请求。后续专用目录可见性与断线阶段没有执行，不能把它们记成已验证。一秒时限、数据隔离与错误要求继续作为验收条件。
+
 这些原生用例的 backend 是[有界内存 authority](../packages/smb/windows/native_fixture_windows_test.go)，并非 Windows 上的 SQLite driver；它验证接入链路，不测持久提交与断电恢复。SQLite 的对应状态与恢复继续由 Linux 真实存储测试负责。R-CON-5 仍未决定跨请求应用大 I/O 的保证单位，不能把单个请求或小 payload 的成功扩大为这项保证。
 
 ### 执行与收尾
