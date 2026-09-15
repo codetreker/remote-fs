@@ -139,9 +139,9 @@ Windows 范围锁对其它所有者的冲突 I/O 生效，包括 HTTP/FUSE 访�
 
 ### 名称、属性与目录
 
-文件名查找保持后端的身份与大小写规则。Windows 的名称兼容策略作为 share 的必需能力校验：后端必须在统一的命名规则下提供 Windows 可访问的名字和大小写比较，不可只在 SMB 创建时检查而让 HTTP 写入制造冲突。Windows 不可表示的既存名字、大小写冲突或非法编码使该 share 明确不可用；枚举不能隐藏冲突项、替换名字或把两个对象合成一个。实现前固定比较算法和版本，并覆盖所有命名写入及冷打开扫描；扫描须有界、可取消并暴露耗时。
+Windows share 的访问资格遵守 [R-FS-9](../../../../docs/spec/requirements.md)：业务显式为目标 volume 启用 Windows 命名能力，Publish 只检查已启用状态，不隐式修改 volume 策略。不兼容既存名字、非法 UTF-8 或同目录内按 Windows 比较规则发生的冲突使启用失败；不能自动改名、隐藏条目或把两个对象合并。未启用 volume 保留原有按字节区分名字的行为。
 
-这是 Windows 接入对目标 volume 的准入要求，不修改未启用该能力的 Linux volume。启用必须在权威端验证并原子地标记命名策略；扫描与并发命名写入不能出现空档。该策略不意味着给旧数据增加运行时迁移或自动改名。
+实现固定名称比较算法和版本，并在权威端对所有 HTTP/FUSE/SDK 命名写入使用同一判定。启用扫描与并发命名写入具有同一原子边界：成功后不存在绕过新规则的已准入写入；能够确认未生效的失败或取消保持旧策略，结果未知明确报告并核对。扫描按数量、字节和时间有界，可取消并报告进度。该策略属于 volume，不随某个 share 卸载而放宽；本方案不增加自动修复名字或自动退出此策略的流程。
 
 SMB 文件属性只报告真实存储值或协议允许的、已声明的派生值。创建时间、change time、DOS readonly 等经支持的可写字段需要持久保存，并参与同一文件修改顺序。合成的 security descriptor 只表达当前 share 访问模型，不声称已有完整 Windows ACL 管理；设置不支持的安全信息、ADS、EA 或其它信息类返回对应不支持状态。协议必须提供的标准查询不能用统一 NOT_SUPPORTED 代替。
 
@@ -164,11 +164,50 @@ New-SmbMapping -LocalPath R: -RemotePath \\127.0.0.1\work -TcpPort 1445 `
 
 远端逐次确认后才返回 SMB WRITE/SET_INFO 成功；FLUSH 校验真实引用健康及持久屏障，CLOSE 不是首次提交时机。不缓存未确认的成功写入，结果未知时返回 I/O 类失败并保留动作状态。
 
-查询与读取首先取得 backend 的健康结论。默认 Windows 集成的元数据和内容操作都直接访问 HTTP 权威；有序 Subscribe/Resubscribe 提供通知与连续性状态，不在本机保存目录副本。初次接入或恢复需建立订阅并确认其覆盖权威 checkpoint，才能提供正常通知；流失联、缺口与重建期间暴露不可用状态，要求已有枚举/通知重新取得权威状态，不将旧队列当作连续历史。
+查询与读取首先取得 backend 的健康结论。默认 Windows 集成的元数据和内容操作都直接访问 HTTP 权威；扩充后的同一 Subscribe/Resubscribe 有序流提供完整通知事实与连续性状态，本机不保存目录副本。backend 的 Windows 能力检查必须包含下述通知载荷、历史和传输能力；仅支持现有 metastore.Change 的实现不通过检查。
 
 直接 HTTP 路径需要通过冷挂载、目录性能与故障门控验收。只有实测表明元数据往返无法满足目标时，才另行评估 replica 优化；本次不把 SQLite 的跨平台拆分设为 SMB package 的必要改动。若将来接入现有 replicated 客户端，必须把 replica 与 Linux 原生持久权威的依赖分开，从 replica 完成 apply 后输出有界事件，不能旁开一个与读取副本顺序无关的通知流，也不能使用 nativelease 的空实现。
 
-CHANGE_NOTIFY 挂在保留的目录引用下，记录过滤器和递归范围。队列溢出返回要求重新枚举的真实状态；流失联或重建使查询遵循不可用门控，不能把缺口后的事件当作连续历史。通知只是程序的变更提示，不能代替系统缓存一致性；持续打开句柄、属性缓存、负缓存以及断线读取都需要独立验证。
+### 权威通知事实与有序传输
+
+在现有 changes 日志行中增加语义独立的 `Notification` 载荷，使用同一 Position、流 incarnation、保留窗口和 SSE 顺序，不另建独立通知日志。保留 `Removed.Node=nil` 的 replica 含义；被删除对象的信息由 Notification 提供。载荷的拟定结构为：
+
+```text
+Notification {
+    SubjectID
+    SubjectKind
+    ChangeMask
+    Before?: LocationFacts
+    After?: LocationFacts
+}
+
+LocationFacts {
+    Ancestors: [{ DirectoryID, NameWithinParent }, ...]
+    LeafName
+}
+```
+
+SubjectID/SubjectKind 包含删除前的真实对象身份和类型；ChangeMask 由权威操作确定实际发生的名字、大小、时间、属性等变化，不能把普通 Modified 当成所有过滤类别。Ancestors 按 root 到直接父目录排列，root 的名字为空，其余名字属于链中的前一目录。Before 与 After 是各自事件位置的不可变事实：创建只有 After，删除只有 Before，修改记录其所在位置，改名同时保存两侧。失去名字的 retained file 后续写入不产生旧名字的目录通知；无目录成员关系的事实明确表示为两侧均无位置。
+
+权威修改在同一事务/有序提交中捕获旧身份、类型、位置和需要比较的属性，执行修改，捕获新位置及真实变化类别，再将完整 facts、changes 行与 committed position 一起提交。所有 HTTP/FUSE/SDK 入口复用这条生成路径。不能在提交之后通过当前目录查询补写历史路径，也不能允许内容修改成功而对应的必需事实未记录。父目录 touch 只记录该父目录实际发生的时间/属性变化，不冒充又一次子项创建或删除。
+
+改名的 Before/After 随同一个 Renamed 记录传输，其 Position 就是两侧的关联身份；覆盖目标的删除仍作为此前独立 Removed 记录，携带被替换对象的旧事实。不为目录的每个后代展开一条改名事件。按监视目录 ID 在 Before/After 的祖先链中判断归属：非递归只匹配直接父目录，递归匹配链中的祖先；从匹配位置之后的名字得到相对路径。仅旧侧命中时产生离开作用域的记录，仅新侧命中时产生进入记录，两侧命中时按协议产生关联的改名前后通知。监视目录自身的改名不被冒充成其内部条目变化。
+
+HTTP 直接序列化并校验完整 facts。日志分页、previous-position 链与截断位置继续以整行推进；缺少必需 facts、身份/类型矛盾或损坏的祖先链均为错误。不能将缺失的历史字段当成“没有变化”，也不能用当前 Stat/List 或要求普通重新枚举来掩盖载荷缺失。
+
+祖先深度、祖先名字总字节和事件编码长度均有上限。新增字节必须进入 ChangePayloadLengths、ChangeResult.Reserve、SQL 读取前的长度检查、日志完整性校验和 HTTP MaxFrameBytes；订阅/观察队列同时计数和计字节。无法完整记录所需 facts 的修改在逻辑提交前失败，不截断路径或丢弃事件。Windows backend 声明最大合法事件，发布时核对传输帧和消费预算能够容纳它；不能成功接纳必然无法传输的事件。日志保留与 facts 同行删除，容量上限计入新增载荷。
+
+Export 先建立订阅，再取得一个固定权威 checkpoint；同 incarnation 的流确认覆盖该点后才进入健康状态，不需要目录 Snapshot。第一次 CHANGE_NOTIFY 在保留的目录 open 上固定 CompletionFilter 和 WatchTree：先注册有界暂存观察者，再取得权威 checkpoint B 作为生效点，丢弃 <=B 的旧事件并保留 >B 的事件；只有确认建立完成才报告监视已经生效。暂存注册有容量和时间上限，失败明确结束注册，不无限重试等待安静窗口。
+
+同一 open 后续 notify 沿用首次过滤器、递归标志与队列，不重取起点、不丢弃两次调用之间的变化；匹配的等待请求按 FIFO 完成。每个日志记录与其映射出的多个 SMB 通知作为一个接纳单位，全部排入有界队列后才推进消费位置，避免改名只保留一侧。断流、保留窗口缺口或队列溢出使观察者明确失去连续性；重新建立流及 checkpoint 后，原观察者必须先收到对应的失败/要求重新枚举结果，再恢复正常通知。损坏或缺失 facts 报 I/O 类错误；真实缓冲溢出或历史丢失按协议要求重新枚举，不能向所有目录广播重扫来代替普通过滤。
+
+目录范围、过滤器和相对路径遵循 [MS-SMB2 CHANGE_NOTIFY](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/05869c32-39f0-4726-afc9-671b76ae5ca7) 与 [FILE_NOTIFY_INFORMATION](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-file_notify_information)。通知只是程序的变更提示，不能代替系统缓存一致性；持续打开句柄、属性缓存、负缓存以及断线读取都需要独立验证。
+
+### 大请求的保证单位
+
+[R-CON-5【未决】](../../../../docs/spec/requirements.md) 要求先明确“一次读取/写入”的保证单位。Windows 客户端会按协商的 MaxReadSize/MaxWriteSize 拆分大的应用调用，Linux FUSE 也存在同类边界；逐个 SMB/storage 请求满足一致性和远端确认，不能直接证明整个应用系统调用只观察一个修订。[MS-SMB2 READ](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/ff304074-293b-4106-a5ea-c19c35ca736a)、[WRITE](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/49dce94d-71fd-4fdf-b730-a60d6b27fbba)
+
+本方案不选择应用系统调用或协议请求为单位，也不默认为失败的大写入提供全量回滚。现有单次操作保证继续成立，完整 Windows 接入的符合性结论须等待该契约决定。验收先保留超过协商上限、跨片段并发覆盖、部分写入已确认后失败的场景，同时观察应用结果、SMB/FUSE 请求边界和权威提交；不得只用小请求的通过结果代替这一判断。跨片段 snapshot/transaction 实现不在本次设计修正中引入。
 
 ### 请求、取消与错误
 
@@ -204,6 +243,10 @@ CANCEL 自身不发送响应，目标请求只产生一个最终结果。等待�
 
 **WinFsp/Dokany 挂载。** 提供更直接的 Windows 文件系统回调，但引入额外驱动安装、分发与生命周期，偏离已确定的客户端部署目标。
 
+**在本机维护目录索引以补齐通知。** 可以从一致快照开始按日志更新类型和祖先关系，但需要重新引入树副本的初始化、缺口重建和空间预算。权威提交时已经拥有旧/新节点状态，记录这些事实即可保持直接 HTTP 路径，因此不把目录副本作为通知的必要依赖。
+
+**权威端新增独立的按目录通知订阅。** 可以在服务端完成过滤并直接返回相对路径，但需要新增监视注册、作用域、游标与恢复的传输契约。扩充同一日志行和现有有序流能共享提交位置、保留窗口及完整性检查，当前选择这一方式。独立通知日志还会增加双日志提交和同步裁剪的一致性义务，未提供本方案需要的额外能力。
+
 **Samba VFS 或 SMBLibrary helper。** Samba 提供成熟协议与 VFS，但官方部署面向 Unix/Linux，Windows 需要额外运行环境。SMBLibrary 有较完整的 Windows 文件接口，但带来 C# helper/runtime 与 IPC，锁等待/取消仍需扩展。两者不作为当前独立 Go package 的默认实现。[Samba](https://www.samba.org/samba/what_is_samba.html)、[SMBLibrary 文件接口](https://github.com/TalAloni/SMBLibrary/blob/2edbcf3161084b51dbe11b8a960b0bc7c224b851/SMBLibrary/NTFileStore/INTFileStore.cs)
 
 **直接嵌入现成 Go SMB 服务端。** 调查的 `macos-fuse-t/go-smb2` 具有自定义 VFS 和 listener，但当前 LOCK 无条件成功、CANCEL 不支持、变更通知未接入真实事件源，且认证接口不能由外部包实现，不能原样采用。[LOCK/CANCEL/notify 实现](https://github.com/macos-fuse-t/go-smb2/blob/c0e6b139796e67ce8da148aa5942c55a7dff2fe8/server/file_tree.go)、[认证接口](https://github.com/macos-fuse-t/go-smb2/blob/c0e6b139796e67ce8da148aa5942c55a7dff2fe8/server/authenticator.go)。其 README 列明 AGPL/商业授权；本仓库使用 MIT，引入之前需要明确许可选择，不能因它使用 Go 就当作可直接嵌入的依赖。
@@ -233,15 +276,17 @@ CANCEL 自身不发送响应，目标请求只产生一个最终结果。等待�
 
 1. **本机接入与引擎门槛。** 真实 Windows 11 24H2+、系统 445 服务保持运行、自定义回环端口、签名开启、非 guest、本机身份交换、默认私有 share。分别验证普通/提升用户会话中的映射和资源管理器访问；其它本机用户访问被拒绝。明确要验收的 edition 与系统 build。
 2. **操作时点。** 对普通 Win32 WriteFile、SetEndOfFile、FlushFileBuffers 人工暂停远端确认，证明应用不会先成功；确认前后读取、大小和 EOF 一致。断线后对已缓存内容、属性、负查找和目录枚举测试真实 I/O 失败。
-3. **跨客户端一致性。** 两个 Windows 客户端，以及 Windows+现有 Linux FUSE+HTTP，覆盖持续打开下写入/增长/缩短、一秒内可见、创建/改名/删除通知。没有依赖定时重扫获得正确性。
-4. **对象与目录身份。** 打开后改名、unlink、同名替换、目录改名后相对操作、枚举中替换；旧句柄不访问替代对象。真实 Windows 使用 GetFileInformationByHandleEx(FileIdInfo) 记录文件和 volume 标识：重复打开、连接重建后的重新打开、跨客户端和改名保持同一对象标识；原名字替换与删除后重建必须得到新标识，旧有效句柄仍报告原标识。连接重建不恢复旧 FileId。身份竞态测试必须在查找与最终操作之间插入替换。名称冲突、符号链接与非法信息类均明确响应。
+3. **跨客户端一致性与通知。** 两个 Windows 客户端，以及 Windows+现有 Linux FUSE+HTTP，覆盖持续打开下写入/增长/缩短、一秒内可见。分别删除同名普通文件与空目录，验证 FILE_NAME/DIR_NAME 过滤；递归目录改名/删除、跨监视范围移动、替换目标以及延迟消费到当前路径已不存在时，仍使用事件时的身份、类型与相对路径。暂停首次监视的 checkpoint 往返并插入事件，验证 >B 的变化不丢失；连续 notify 调用间的事件仍交付。没有依赖定时重扫获得正确性。
+4. **对象、目录身份与命名准入。** 打开后改名、unlink、同名替换、目录改名后相对操作、枚举中替换；旧句柄不访问替代对象。真实 Windows 使用 GetFileInformationByHandleEx(FileIdInfo) 记录文件和 volume 标识：重复打开、连接重建后的重新打开、跨客户端和改名保持同一对象标识；原名字替换与删除后重建必须得到新标识，旧有效句柄仍报告原标识。连接重建不恢复旧 FileId。身份竞态测试必须在查找与最终操作之间插入替换。未启用 volume 可保留 README/readme 与非法字节名；启用面对这些名字明确失败且不改数据；合法 volume 启用时的并发创建/改名只能按确定顺序完成，启用后 HTTP/FUSE/SDK 都拒绝新冲突。确认取消与结果未知分开报告，卸载 share 不解除规则。符号链接与非法信息类均明确响应。
 5. **Windows 访问语义。** 六种 disposition、metadata-only、目录打开、双向 ShareAccess、delete-on-close/pending、范围锁共享/排他/等待/取消、批量加锁冲突回滚和批量解锁部分成功、与各类 Linux 锁的独立及交互规则。至少覆盖“先解锁已持有 A、再解锁未持有 C”失败后 A 仍已解锁，以及非法后项不应撤销的先前授予。分别从 HTTP 和 FUSE 尝试绕过已授予的限制。
-6. **故障与关闭。** 远端已执行但响应丢失、重复 MessageId/action、取消赢/授予赢/无法核对、gateway/server 重启、期限到达、notify 缺口/溢出、断线重建、busy 卸载、映射创建失败、清理超时。没有重复 mutation、假成功或悬空无限资源。
+6. **故障与关闭。** 远端已执行但响应丢失、重复 MessageId/action、取消赢/授予赢/无法核对、gateway/server 重启、期限到达、notify 缺口/溢出、断线重建、busy 卸载、映射创建失败、清理超时。覆盖 facts 缺失/损坏、祖先链过长、帧能力不足、预算与序列化边界、日志保留窗口越界，以及改名前后通知只排入一半时的拒绝/重扫行为。拒绝生成 facts 的修改未提交；损坏不冒充普通溢出；缺口恢复后原观察者收到显式结果才能恢复。没有重复 mutation、假成功或悬空无限资源。
 7. **package 验收。** 最小业务程序只通过公共 API 注入 backend/security/logger/listener 即可运行；New 无后台/系统副作用；不导入 SMB 的 Linux 程序无需其依赖；Windows 不依赖 Unix nativelease。两个 share 同时工作时独立 Publish/Unpublish，busy/超时/映射失败不影响另一个 share。持有句柄与锁时轮换本机及远端凭据，既有访问身份保持、新连接采用新凭据、刷新失败不伪装成功。示例保留真实凭据提供边界，不内置账号。
 8. **资源与协议。** 畸形包、compound、credits、长度溢出、签名失败与重放 fuzz；慢读写客户端、耗尽 open/锁/notify/枚举预算；关闭后的 goroutine/socket/映射回收。未支持的 capability 不在协商中宣告。
 9. **验证与性能。** Go 单测按 `xxx.go`/`xxx_test.go` 合并组织；正常和 race 覆盖真实错误路径，覆盖率按包统计，禁止 `-coverpkg`。Windows CI 使用固定系统版本并拒绝 skip。记录冷挂载、源码树列目录、小文件读写和远端 RTT；不以关闭同步写入或降低一致性换取吞吐。
 
-Windows 系统缺失、引擎缺少必需行为或许可未决时，设计可以继续审查，不能把实现状态标为完成。实施时同步现有 `docs/design/`、测试说明与 package 示例；这份提案与实现一起移入 implemented 并按实际方案重写。
+另有 R-CON-5 的跨平台分片验收：应用读写长度超过 SMB MaxReadSize/MaxWriteSize 和 FUSE 请求上限，在片段之间插入并发覆盖或提交失败，记录实际完成字节、错误、读到的修订组合及对应权威提交。保证单位未决定前只能记录行为证据，不能宣称该项符合性已通过，也不能仅以每个片段正确来替代应用层判断。
+
+Windows 系统缺失、引擎缺少必需行为、许可或 R-CON-5 的保证单位未决时，设计可以继续审查，不能把完整 Windows 符合性标为完成。实施时同步现有 `docs/design/`、测试说明与 package 示例；这份提案与实现一起移入 implemented 并按实际方案重写。
 
 ## 风险
 
@@ -251,4 +296,4 @@ Windows 系统缺失、引擎缺少必需行为或许可未决时，设计可以
 
 SMB 引擎维护范围显著大于普通 HTTP handler，现有候选的协议版本标签不代表符合行为。引擎许可和采用维护分支还是自有实现仍待确定；商业授权也不自动补足锁与取消等缺陷。不得在这些结论未定时估计只有少量适配工作。
 
-Windows 命名策略会限制启用该能力的 volume；不兼容既存目录不能自动修复。UAC 映射可见性可能需要明确的按用户部署与提权步骤，但不能以全局映射暴露业务凭据。同步确认和禁用缓存会放大远端 RTT 的影响，性能改进必须保持同样的可观察保证。
+Windows 命名策略按 R-FS-9 限制显式启用的 volume；不兼容既存目录不能自动修复，卸载不会恢复原来的宽松命名规则。权威日志保存历史祖先链会增加每次修改的 CPU、日志和网络字节成本，深路径可能触及已声明的事件预算；这些成本必须测量并保持有界。UAC 映射可见性可能需要明确的按用户部署与提权步骤，但不能以全局映射暴露业务凭据。同步确认和禁用缓存会放大远端 RTT 的影响，性能改进必须保持同样的可观察保证。
