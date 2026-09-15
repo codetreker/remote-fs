@@ -68,7 +68,7 @@ func (s *Server) Status() Status
 
 `storage.WindowsStorage` 是待增加的必需能力组合，不是现有接口。它包含普通树访问、可保留的文件和目录引用、Windows 访问约束，以及有界且可报告健康状态的变更观察。仅实现当前 `storage.Storage` 或 `FileStorage` 不足以通过构造检查；不得使用按路径重新打开的替代实现。
 
-当前可复用与需要扩展的位置：[`FileStorage/FileSession/File`](../../../../packages/storage/files.go) 已持有身份引用和同步范围写入，但 OpenAccess 只有 `Read/Write/Create/Truncate/Exclusive`，且 OpenFile 拒绝目录；[`authz.AccessRequest`](../../../../packages/authz/authz.go) 已直接复用 storage 操作与打开意图；[`HTTP file client`](../../../../packages/transport/httprest/file_client.go) 已承载远端会话与结果核对；[`replicated.Storage`](../../../../packages/storage/replicated/replicated.go) 仍具体依赖 SQLite replica，需拆开 Windows 无法使用的权威持久存储依赖。
+当前可复用与需要扩展的位置：[`FileStorage/FileSession/File`](../../../../packages/storage/files.go) 已持有身份引用和同步范围写入，但 OpenAccess 只有 `Read/Write/Create/Truncate/Exclusive`，且 OpenFile 拒绝目录；[`authz.AccessRequest`](../../../../packages/authz/authz.go) 已直接复用 storage 操作与打开意图；[`HTTP file client`](../../../../packages/transport/httprest/file_client.go) 已承载远端会话与结果核对。默认集成直接使用 HTTP backend 与有序订阅，不依赖 SQLite replica。
 
 `New` 只校验配置，不监听、不连接远端、不启动后台任务。Publish 校验已准备的 backend 能力，并在短锁内发布 share；share 名称按 SMB 规则比较，重复名拒绝。backend 由调用方准备并保持可用，server 不关闭调用方拥有的 backend。认证/资源配置在服务期间不可变；share 独立发布和停止，不影响其它 volume。
 
@@ -164,9 +164,9 @@ New-SmbMapping -LocalPath R: -RemotePath \\127.0.0.1\work -TcpPort 1445 `
 
 远端逐次确认后才返回 SMB WRITE/SET_INFO 成功；FLUSH 校验真实引用健康及持久屏障，CLOSE 不是首次提交时机。不缓存未确认的成功写入，结果未知时返回 I/O 类失败并保留动作状态。
 
-查询与读取首先取得 backend 的健康结论。使用现有 replicated 客户端时，必须将 SQLite replica 与 Linux 原生持久权威的依赖分开，并从 replica 完成 apply 后输出有界事件，包含失联、缺口和重建状态；不能旁开一个与读取副本顺序无关的通知流。
+查询与读取首先取得 backend 的健康结论。默认 Windows 集成的元数据和内容操作都直接访问 HTTP 权威；有序 Subscribe/Resubscribe 提供通知与连续性状态，不在本机保存目录副本。初次接入或恢复需建立订阅并确认其覆盖权威 checkpoint，才能提供正常通知；流失联、缺口与重建期间暴露不可用状态，要求已有枚举/通知重新取得权威状态，不将旧队列当作连续历史。
 
-最终交付保留现有 metadata replica 的低延迟路径；Windows 使用可移植的 replica 包和共享 SQL primitives，不使用 nativelease 的空实现。直接 HTTP backend 可用于隔离验证 SMB 与远端操作，但不代替冷挂载、目录性能和故障门控验收。SMB package 本身不依赖采用哪一种 backend。
+直接 HTTP 路径需要通过冷挂载、目录性能与故障门控验收。只有实测表明元数据往返无法满足目标时，才另行评估 replica 优化；本次不把 SQLite 的跨平台拆分设为 SMB package 的必要改动。若将来接入现有 replicated 客户端，必须把 replica 与 Linux 原生持久权威的依赖分开，从 replica 完成 apply 后输出有界事件，不能旁开一个与读取副本顺序无关的通知流，也不能使用 nativelease 的空实现。
 
 CHANGE_NOTIFY 挂在保留的目录引用下，记录过滤器和递归范围。队列溢出返回要求重新枚举的真实状态；流失联或重建使查询遵循不可用门控，不能把缺口后的事件当作连续历史。通知只是程序的变更提示，不能代替系统缓存一致性；持续打开句柄、属性缓存、负缓存以及断线读取都需要独立验证。
 
@@ -222,6 +222,7 @@ CANCEL 自身不发送响应，目标请求只产生一个最终结果。等待�
 | 形态 | 一个 listener 可独立发布和停止多个 share | 不交付网络管理 API 或跨进程 daemon 控制；以后可封装同一 Export 生命周期，不把唯一全局 volume 写死在引擎 |
 | 形态 | 失联后旧引用明确失效 | durable handles、multichannel、透明重连延后；不声明能力，不按路径恢复；以后增加须另做会话恢复设计 |
 | 形态 | 业务提供 transport/backend 和认证 provider | 不把 HTTP、SQLite 或用户体系写进 SMB API；将来替换无需重写协议 |
+| 形态 | 默认集成使用 HTTP 权威读取和有序通知 | 本机 metadata replica 延后，代价是元数据操作承担远端 RTT；backend/观察接口保持独立，性能证据决定是否增加可移植 replica |
 | 保证 | Windows 实机与跨协议验收 | 交叉编译和 Linux 模拟客户端不替代真实 Windows 缓存/UAC/认证测试 |
 
 较小的范围只做本机可读 share，会放弃既定写入与文件语义，不能作为目标的完成。较大的范围同时提供 LAN SMB、NTFS 扩展与透明恢复，会引入不同的部署、安全和持久会话合同，独立决策后才能扩展。
@@ -246,7 +247,7 @@ Windows 系统缺失、引擎缺少必需行为或许可未决时，设计可以
 
 最大风险是 Windows 内核缓存及本机认证行为尚未实测。UseWriteThrough、无 lease/oplock、禁止离线缓存必须一起通过真实程序验收；若仍无法满足既有保证，须带失败证据重新讨论，不静默改成最终一致或断线可读。
 
-独立 package 并不意味着只改客户端。Windows 访问约束需要扩展共享 storage 契约、权威后端、wrappers、HTTP 与 authz 意图；可移植 replica 也需要依赖拆分。公共接口隔离限制了耦合，但不能消除这些必要成本。
+独立 package 并不意味着只改客户端。Windows 访问约束需要扩展共享 storage 契约、权威后端、wrappers、HTTP 与 authz 意图。公共接口隔离限制了耦合，但不能消除这些必要成本。默认 HTTP backend 避免引入本机 metadata replica 的跨平台改造，其网络往返成本由性能验收约束。
 
 SMB 引擎维护范围显著大于普通 HTTP handler，现有候选的协议版本标签不代表符合行为。引擎许可和采用维护分支还是自有实现仍待确定；商业授权也不自动补足锁与取消等缺陷。不得在这些结论未定时估计只有少量适配工作。
 
