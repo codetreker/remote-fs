@@ -128,6 +128,9 @@ func nativeBridgeFixture(t *testing.T, authorize authz.Authorizer) *nativeBridge
 	var transport *http.Transport
 	var done chan error
 	t.Cleanup(func() {
+		if t.Failed() && b.smb != nil {
+			b.logFailure(t)
+		}
 		if b.gate != nil {
 			b.gate.down.Store(false)
 			b.gate.mu.Lock()
@@ -245,20 +248,31 @@ func (b *nativeBridge) mapDrive(t *testing.T) error {
 	defer cancel()
 	b.mapping, err = Map(ctx, MappingOptions{LocalPath: b.path, Share: b.share, TCPPort: b.port})
 	if err != nil {
-		t.Logf("advertised share=%q requested UNC=%q server=%+v", b.share, (MappingOptions{Share: b.share}).remotePath(), b.smb.Status())
-		b.serveMu.Lock()
-		t.Logf("Map error=%v TCP port=%d accepted=%d readBytes=%d writtenBytes=%d Serve returned=%v error=%v", err, b.port, b.wire.connections.Load(), b.wire.readBytes.Load(), b.wire.writtenBytes.Load(), b.serveReturned, b.serveErr)
-		b.serveMu.Unlock()
-		b.wire.mu.Lock()
-		for i, h := range b.wire.headers {
-			t.Logf("SMB header[%d] response=%v protocol=0x%08x command=0x%04x messageID=%d creditCharge=%d flags=0x%08x status=0x%08x", i, h.Response, h.Protocol, h.Command, h.MessageID, h.CreditCharge, h.Flags, h.Status)
-		}
-		for i, tree := range b.wire.trees {
-			t.Logf("TREE_CONNECT[%d] messageID=%d path=%q offset=%d length=%d truncated=%v", i, tree.MessageID, tree.Path, tree.Offset, tree.Length, tree.Truncated)
-		}
-		b.wire.mu.Unlock()
+		b.logFailure(t)
 	}
 	return err
+}
+
+func (b *nativeBridge) logFailure(t *testing.T) {
+	t.Helper()
+	t.Logf("advertised share=%q requested UNC=%q server=%+v", b.share, (MappingOptions{Share: b.share}).remotePath(), b.smb.Status())
+	b.serveMu.Lock()
+	t.Logf("TCP port=%d accepted=%d readBytes=%d writtenBytes=%d Serve returned=%v error=%v", b.port, b.wire.connections.Load(), b.wire.readBytes.Load(), b.wire.writtenBytes.Load(), b.serveReturned, b.serveErr)
+	b.serveMu.Unlock()
+	b.wire.mu.Lock()
+	for i, h := range b.wire.headers {
+		t.Logf("SMB header[%d] response=%v protocol=0x%08x command=0x%04x messageID=%d creditCharge=%d flags=0x%08x status=0x%08x", i, h.Response, h.Protocol, h.Command, h.MessageID, h.CreditCharge, h.Flags, h.Status)
+	}
+	for i, tree := range b.wire.trees {
+		t.Logf("TREE_CONNECT[%d] messageID=%d path=%q offset=%d length=%d truncated=%v", i, tree.MessageID, tree.Path, tree.Offset, tree.Length, tree.Truncated)
+	}
+	for i, c := range b.wire.creates {
+		t.Logf("CREATE[%d] messageID=%d security=%d oplock=0x%x impersonation=%d access=0x%x attributes=0x%x share=0x%x disposition=%d options=0x%x contexts=%q truncated=%v", i, c.MessageID, c.SecurityFlags, c.Oplock, c.Impersonation, c.Access, c.Attributes, c.ShareAccess, c.Disposition, c.Options, c.Contexts, c.Truncated)
+	}
+	for i, o := range b.wire.operations {
+		t.Logf("operation[%d] messageID=%d command=0x%x infoType=%d class=%d controlCode=0x%x", i, o.MessageID, o.Command, o.InfoType, o.Class, o.ControlCode)
+	}
+	b.wire.mu.Unlock()
 }
 
 type nativeHandle struct{ value win.Handle }
