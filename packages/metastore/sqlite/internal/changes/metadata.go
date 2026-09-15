@@ -34,7 +34,8 @@ const changeMetadataColumns = `
 	CASE WHEN typeof(mtime_nsec) IN ('integer', 'null') THEN mtime_nsec END, typeof(mtime_nsec),
 	COALESCE(length(CAST(content AS BLOB)), 0), typeof(content),
 	CASE WHEN typeof(recorded_sec) = 'integer' THEN recorded_sec END, typeof(recorded_sec),
-	CASE WHEN typeof(recorded_nsec) = 'integer' THEN recorded_nsec END, typeof(recorded_nsec)`
+	CASE WHEN typeof(recorded_nsec) = 'integer' THEN recorded_nsec END, typeof(recorded_nsec),
+ COALESCE(length(notification),0), typeof(notification)`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -45,6 +46,7 @@ func scanChangeMetadata(
 	expectedVolume int64,
 ) (metastore.Change, metastore.ChangePayloadLengths, int64, error) {
 	var (
+		notificationType                                             string
 		positionRaw, previousRaw, volumeRaw, kindRaw, parentRaw      any
 		fromParentRaw, idRaw, modeRaw, sizeRaw                       any
 		atimeSecRaw, atimeNsecRaw, mtimeSecRaw, mtimeNsecRaw         any
@@ -66,7 +68,17 @@ func scanChangeMetadata(
 		&mtimeSecRaw, &mtimeSecType, &mtimeNsecRaw, &mtimeNsecType,
 		&lengths.Content, &contentType,
 		&recordedSecRaw, &recordedSecType, &recordedNsecRaw, &recordedNsecType,
+		&lengths.Notification, &notificationType,
 	); err != nil {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
+	}
+	if notificationType != "blob" || lengths.Notification <= 0 {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, fmt.Errorf("invalid notification storage: %w", syscall.EIO)
+	}
+	if lengths.Notification > metastore.MaxNotificationBytes {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, fmt.Errorf("notification exceeds byte bound: %w", syscall.EFBIG)
+	}
+	if err := lengths.Check(); err != nil {
 		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
 	}
 	position, err := requiredStoredInteger("position", positionRaw, positionType)
@@ -235,8 +247,11 @@ func validateChangeMetadata(
 			mtimeNsec.Int64 < 0 || mtimeNsec.Int64 >= int64(time.Second) {
 			return fmt.Errorf("%w: change %d carries invalid node metadata", syscall.EIO, change.Position)
 		}
-		if nodeType := fs.FileMode(mode.Int64).Type(); nodeType != 0 && nodeType != fs.ModeDir {
+		if nodeType := fs.FileMode(mode.Int64).Type(); nodeType != 0 && nodeType != fs.ModeDir && nodeType != fs.ModeSymlink {
 			return fmt.Errorf("%w: change %d carries unsupported node type %v", syscall.EIO, change.Position, fs.FileMode(mode.Int64).Type())
+		}
+		if fs.FileMode(mode.Int64).Type() == fs.ModeSymlink && contentType != "null" {
+			return fmt.Errorf("%w: change %d carries object content for a symlink", syscall.EIO, change.Position)
 		}
 		if fs.FileMode(mode.Int64).IsDir() && (size.Int64 != 0 || contentType != "null") {
 			return fmt.Errorf("%w: change %d carries bytes for a directory", syscall.EIO, change.Position)

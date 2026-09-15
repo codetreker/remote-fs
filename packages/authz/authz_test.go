@@ -51,3 +51,23 @@ func TestDeniedMarkerSurvivesHostErrorWrappingAndJoining(t *testing.T) {
 		t.Fatal("matching text invented an explicit policy decision")
 	}
 }
+
+func TestWindowsOpenIntentPreservesAllAccessDecisions(t *testing.T) {
+	intent := storage.WindowsOpenIntent{Access: storage.WindowsReadAttributes | storage.WindowsDelete, Share: storage.WindowsShareRead, Disposition: storage.WindowsOpenIf, Kind: storage.WindowsDirectory, DeleteOnClose: true, OpenReparsePoint: true}
+	request := authz.AccessRequest{Volume: "configured-volume", Operation: storage.OpWindowsOpen, WindowsOpen: intent}
+	calls := 0
+	policy := authz.AuthorizerFunc(func(_ context.Context, got authz.AccessRequest) error {
+		calls++
+		if got != request {
+			t.Fatalf("changed Windows authorization intent: %+v", got)
+		}
+		got.WindowsOpen.Access = storage.WindowsAllAccess
+		return authz.ErrDenied
+	})
+	if err := policy.Authorize(t.Context(), request); !errors.Is(err, authz.ErrDenied) || calls != 1 {
+		t.Fatalf("calls=%d error=%v", calls, err)
+	}
+	if request.WindowsOpen != intent {
+		t.Fatal("policy changed caller's intent")
+	}
+}

@@ -177,10 +177,20 @@ func (s *Store) Stat(ctx context.Context, path string) (metastore.Node, error) {
 	if err != nil {
 		return metastore.Node{}, pathError("stat", path, err)
 	}
+	operation, checkingIO := metastore.FileIOFromContext(ctx)
+	if checkingIO {
+		if err := s.coordinator.commit.acquire(ctx); err != nil {
+			return metastore.Node{}, err
+		}
+		defer s.coordinator.commit.release()
+	}
 	var node metastore.Node
 	if err := s.inspect(ctx, func(tx *sql.Tx) error {
 		found, err := s.resolve(ctx, tx, cleaned)
 		node = found
+		if err == nil && checkingIO {
+			return s.checkWindowsIOLocked(node.ID, 0, node.Size, operation)
+		}
 		return err
 	}); err != nil {
 		return metastore.Node{}, pathError("stat", path, sqlerr.Failure(err))
@@ -392,7 +402,7 @@ func (s *Store) SetAttr(ctx context.Context, path string, change storage.AttrCha
 		if err := applyChange(ctx, tx, node, change); err != nil {
 			return err
 		}
-		return s.recordChanged(ctx, tx, node.ID)
+		return s.recordChanged(ctx, tx, node)
 	}); err != nil {
 		return pathError("setattr", path, sqlerr.Failure(err))
 	}
@@ -482,6 +492,12 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 // link puts a name in a directory. A name already there is EEXIST, which the primary key is
 // what decides — so two writers racing for one name cannot both be told they made it.
 func (s *Store) link(ctx context.Context, tx *sql.Tx, parent int64, name []byte, node int64) error {
+	if err := s.checkWindowsParentLocked(parent); err != nil {
+		return err
+	}
+	if err := s.windowsNameAllowed(ctx, tx, parent, name, 0); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO entries (volume, parent, name, node) VALUES (?, ?, ?, ?)`,
 		s.volume, parent, name, node); err != nil {
 		if sqlerr.IsUniqueViolation(err) {
@@ -489,7 +505,9 @@ func (s *Store) link(ctx context.Context, tx *sql.Tx, parent int64, name []byte,
 		}
 		return err
 	}
-	return nil
+	sec, nsec := sqlvalue.StoredTime(time.Now())
+	_, err := tx.ExecContext(ctx, `UPDATE nodes SET windows_creation_sec=?,windows_creation_nsec=?,windows_change_sec=?,windows_change_nsec=? WHERE volume=? AND id=?`, sec, nsec, sec, nsec, s.volume, node)
+	return err
 }
 
 func (s *Store) unlink(ctx context.Context, tx *sql.Tx, parent int64, name []byte) error {
@@ -508,12 +526,16 @@ func (s *Store) unlink(ctx context.Context, tx *sql.Tx, parent int64, name []byt
 // caught, and a build tool comparing a directory against its contents would read a time that
 // stopped being true, with nothing behind it to correct the answer.
 func (s *Store) touch(ctx context.Context, tx *sql.Tx, id int64, at time.Time) error {
+	before, err := nodeByID(ctx, tx, id)
+	if err != nil {
+		return err
+	}
 	sec, nsec := sqlvalue.StoredTime(at)
 	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET mtime_sec = ?, mtime_nsec = ? WHERE id = ?`,
 		sec, nsec, id); err != nil {
 		return err
 	}
-	return s.recordChanged(ctx, tx, id)
+	return s.recordChanged(ctx, tx, before)
 }
 
 // isEmpty reports whether a directory holds no names.
@@ -554,13 +576,13 @@ func (s *Store) Remove(ctx context.Context, path string) error {
 		if node.IsDir() {
 			return syscall.EISDIR
 		}
+		if err := s.recordRemoved(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, node); err != nil {
+			return err
+		}
 		if err := s.unlink(ctx, tx, parent.ID, name); err != nil {
 			return err
 		}
 		if err := s.discard(ctx, tx, node); err != nil {
-			return err
-		}
-		if err := s.recordRemoved(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}); err != nil {
 			return err
 		}
 		return s.touch(ctx, tx, parent.ID, time.Now())
@@ -603,13 +625,13 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 		if !empty {
 			return syscall.ENOTEMPTY
 		}
+		if err := s.recordRemoved(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, node); err != nil {
+			return err
+		}
 		if err := s.unlink(ctx, tx, parent.ID, name); err != nil {
 			return err
 		}
 		if err := s.discard(ctx, tx, node); err != nil {
-			return err
-		}
-		if err := s.recordRemoved(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}); err != nil {
 			return err
 		}
 		return s.touch(ctx, tx, parent.ID, time.Now())
@@ -622,7 +644,7 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 // Physical pins keep the current object and its charge after volume removal.
 // The caller holds the same gate as file open and final physical release.
 func (s *Store) discard(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
-	if node.Mode.IsRegular() && s.coordinator.pins[retainedNode{s.volume, node.ID}] > 0 {
+	if s.coordinator.pins[retainedNode{s.volume, node.ID}] > 0 {
 		_, err := tx.ExecContext(ctx, `UPDATE nodes SET detached=1 WHERE volume=? AND id=?`, s.volume, node.ID)
 		return err
 	}
@@ -683,6 +705,9 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 	if err != nil {
 		return err
 	}
+	if err := s.checkWindowsParentLocked(toParent.ID); err != nil {
+		return err
+	}
 	displaced, occupied, err := s.lookup(ctx, tx, toParent.ID, toName)
 	if err != nil {
 		return err
@@ -718,27 +743,30 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 				return syscall.ENOTEMPTY
 			}
 		}
+		if err := s.recordRemoved(ctx, tx, metastore.Location{Parent: toParent.ID, Name: toName}, displaced); err != nil {
+			return err
+		}
 		if err := s.unlink(ctx, tx, toParent.ID, toName); err != nil {
 			return err
 		}
 		if err := s.discard(ctx, tx, displaced); err != nil {
 			return err
 		}
-		if err := s.recordRemoved(ctx, tx, metastore.Location{Parent: toParent.ID, Name: toName}); err != nil {
-			return err
-		}
+	}
+
+	if err := s.windowsNameAllowed(ctx, tx, toParent.ID, toName, moving.ID); err != nil {
+		return err
+	}
+
+	if err := s.recordRenamed(ctx, tx,
+		metastore.Location{Parent: toParent.ID, Name: toName},
+		metastore.Location{Parent: fromParent.ID, Name: fromName}, moving); err != nil {
+		return err
 	}
 
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE entries SET parent = ?, name = ? WHERE volume = ? AND parent = ? AND name = ?`,
 		toParent.ID, toName, s.volume, fromParent.ID, fromName); err != nil {
-		return err
-	}
-	// The node itself is untouched by the move — only the entry naming it was rewritten — so
-	// the one read before the move is what the destination holds now.
-	if err := s.recordRenamed(ctx, tx,
-		metastore.Location{Parent: toParent.ID, Name: toName},
-		metastore.Location{Parent: fromParent.ID, Name: fromName}, moving); err != nil {
 		return err
 	}
 

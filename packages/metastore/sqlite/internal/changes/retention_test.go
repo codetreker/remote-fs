@@ -33,6 +33,8 @@ func TestTrimHonorsVolumeAgeFloorAndVolume(t *testing.T) {
 			foreignChange := fileChange(metastore.Created)
 			foreignChange.Parent = 3
 			foreignChange.Node.ID = 4
+			foreignChange.Notification.SubjectID = 4
+			foreignChange.Notification.After.Ancestors[0].DirectoryID = 3
 			if err := Record(t.Context(), tx, 2, foreignChange); err != nil {
 				t.Fatal(err)
 			}

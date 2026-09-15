@@ -110,9 +110,10 @@ func testChange(t *testing.T, db *sql.DB, volume, parent int64, name string) {
 	t.Helper()
 	tx := testTransaction(t, db)
 	if err := changes.Record(t.Context(), tx, volume, metastore.Change{
-		Kind:   metastore.Removed,
-		Parent: parent,
-		Name:   []byte(name),
+		Notification: &metastore.Notification{SubjectID: parent + 1, ChangeMask: metastore.ChangeName, Before: &metastore.LocationFacts{Ancestors: []metastore.DirectoryAncestor{{DirectoryID: parent}}, LeafName: []byte(name)}},
+		Kind:         metastore.Removed,
+		Parent:       parent,
+		Name:         []byte(name),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +240,7 @@ func TestBackingStoreBindingRejectsDifferentOrPopulatedStores(t *testing.T) {
 		{"matching", `INSERT INTO backing_store VALUES(1,'store-a')`, "store-a", nil},
 		{"unbound opener", `INSERT INTO backing_store VALUES(1,'store-a')`, "", syscall.EINVAL},
 		{"different store", `INSERT INTO backing_store VALUES(1,'store-a')`, "store-b", syscall.EINVAL},
-		{"populated unbound", `INSERT INTO volumes VALUES(1,'existing',1,0)`, "store-a", syscall.EINVAL},
+		{"populated unbound", `INSERT INTO volumes(id,name,root,used) VALUES(1,'existing',1,0)`, "store-a", syscall.EINVAL},
 		{"invalid binding", `PRAGMA ignore_check_constraints=ON; INSERT INTO backing_store VALUES(1,'')`, "store-a", syscall.EIO},
 	} {
 		t.Run(test.name, func(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -83,7 +84,7 @@ func (l *fakeLog) record(change metastore.Change) metastore.Position {
 
 // created is one ordinary change, for the tests that care only that a change happened.
 func created(name string) metastore.Change {
-	return metastore.Change{
+	return withNotification(metastore.Change{
 		Kind:   metastore.Created,
 		Parent: 1,
 		Name:   []byte(name),
@@ -94,7 +95,39 @@ func created(name string) metastore.Change {
 			AccessTime: time.Unix(1755000000, 1),
 			ModTime:    time.Unix(1755000001, 2),
 		},
+	})
+}
+
+func withNotification(change metastore.Change) metastore.Change {
+	location := func(parent int64, name []byte) *metastore.LocationFacts {
+		ancestors := []metastore.DirectoryAncestor{{DirectoryID: 1}}
+		if parent != 1 {
+			ancestors = append(ancestors, metastore.DirectoryAncestor{DirectoryID: parent, Name: []byte("parent")})
+		}
+		return &metastore.LocationFacts{Ancestors: ancestors, LeafName: name}
 	}
+	n := &metastore.Notification{SubjectID: 42, Directory: false, ChangeMask: metastore.ChangeName}
+	if change.Node != nil {
+		n.SubjectID, n.SubjectKind = change.Node.ID, change.Node.Mode.Type()
+		n.Directory = change.Node.IsDir()
+	}
+	switch change.Kind {
+	case metastore.Created:
+		n.After = location(change.Parent, change.Name)
+	case metastore.Removed:
+		n.Before = location(change.Parent, change.Name)
+	case metastore.Renamed:
+		n.Before = location(change.From.Parent, change.From.Name)
+		n.After = location(change.Parent, change.Name)
+	case metastore.Modified:
+		n.ChangeMask = metastore.ChangeAttributes
+		if change.Parent != 0 {
+			n.Before = location(change.Parent, change.Name)
+			n.After = location(change.Parent, change.Name)
+		}
+	}
+	change.Notification = n
+	return change
 }
 
 // discard drops the n oldest changes, the way trimming a log does, recording the newest
@@ -161,7 +194,12 @@ func (l *fakeLog) Since(ctx context.Context, after metastore.Position, limit int
 		return retention, nil
 	}
 	for _, change := range changes {
+		notification, err := metastore.EncodeNotification(change)
+		if err != nil {
+			return metastore.Retention{}, result.Fail(err)
+		}
 		meta := change
+		meta.Notification = nil
 		name := meta.Name
 		if name == nil {
 			meta.Name = nil
@@ -187,7 +225,7 @@ func (l *fakeLog) Since(ctx context.Context, after metastore.Position, limit int
 			meta.Node = &node
 		}
 		reservation, fits, err := result.Reserve(meta, metastore.ChangePayloadLengths{
-			Name: int64(len(name)), FromName: int64(len(fromName)), Content: int64(len(content)),
+			Name: int64(len(name)), FromName: int64(len(fromName)), Content: int64(len(content)), Notification: int64(len(notification)),
 		})
 		if err != nil {
 			return metastore.Retention{}, err
@@ -195,7 +233,7 @@ func (l *fakeLog) Since(ctx context.Context, after metastore.Position, limit int
 		if !fits {
 			return retention, nil
 		}
-		if err := reservation.Commit(name, fromName, content); err != nil {
+		if err := reservation.Commit(name, fromName, content, notification); err != nil {
 			return metastore.Retention{}, err
 		}
 	}
@@ -467,7 +505,7 @@ func TestClientAndServerFrameBoundsAreIndependentAndCompatible(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			log := newFakeLog()
-			log.record(created(strings.Repeat("x", 1200)))
+			log.record(created(strings.Repeat("x", 1000)))
 			handlerOptions := httprest.DefaultHandlerOptions()
 			handlerOptions.MaxFrameBytes = 4096
 			dialOptions := httprest.DefaultDialOptions()
@@ -480,7 +518,7 @@ func TestClientAndServerFrameBoundsAreIndependentAndCompatible(t *testing.T) {
 			defer sub.Close()
 			change, err := sub.Next()
 			if c.wantChange {
-				if err != nil || len(change.Name) != 1200 {
+				if err != nil || len(change.Name) != 1000 {
 					t.Fatalf("compatible frame returned name=%d, err=%v", len(change.Name), err)
 				}
 				return
@@ -1100,6 +1138,19 @@ func TestAPositionPastTheTailIsRefusedRatherThanRebuilt(t *testing.T) {
 }
 
 // frame renders one frame of a stream, byte for byte as it travels.
+func removedFrame(t *testing.T, position metastore.Position, name string) string {
+	t.Helper()
+	wire, err := httprest.ChangeOf(withNotification(metastore.Change{Position: position, Kind: metastore.Removed, Parent: 1, Name: []byte(name)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return frame("change", string(encoded))
+}
+
 func frame(event, data string) string {
 	return "event: " + event + "\ndata: " + data + "\n\n"
 }
@@ -1128,7 +1179,7 @@ func TestASnapshotThatStopsIsNotACompletePicture(t *testing.T) {
 	cases := map[string]string{
 		"the stream ends on a frame boundary": frame("open", `{"position":7}`) + frame("rows", aRow),
 		"the stream ends inside a frame":      frame("open", `{"position":7}`) + "event: rows\ndata: {\"rows\":[",
-		"a frame nobody asked for":            frame("open", `{"position":7}`) + frame("change", `{"position":8,"kind":"removed","parent":1,"name":"YQ=="}`),
+		"a frame nobody asked for":            frame("open", `{"position":7}`) + removedFrame(t, 8, "a"),
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1164,7 +1215,7 @@ func TestAChangeStreamThatEndsIsAFailure(t *testing.T) {
 	start := frame("start", `{"incarnation":"a-log","position":4,"tail":4}`)
 	cases := map[string]string{
 		"nothing follows the start":      start,
-		"a change and then nothing":      start + frame("change", `{"position":5,"kind":"removed","parent":1,"name":"YQ=="}`),
+		"a change and then nothing":      start + removedFrame(t, 5, "a"),
 		"the stream ends inside a frame": start + "event: change\ndata: {\"posi",
 	}
 	for name, body := range cases {
@@ -1338,6 +1389,19 @@ func TestAChangeThatDoesNotSayWhatHappenedIsRefused(t *testing.T) {
 	}
 	for name, fields := range accepted {
 		t.Run(name, func(t *testing.T) {
+			kind := map[string]metastore.ChangeKind{"created": metastore.Created, "modified": metastore.Modified, "removed": metastore.Removed, "renamed": metastore.Renamed}[fields["kind"].(string)]
+			native := metastore.Change{Kind: kind, Parent: 1, Name: []byte("a")}
+			if kind != metastore.Removed {
+				native.Node = &metastore.Node{ID: 2, Mode: 0o644}
+			}
+			if kind == metastore.Renamed {
+				native.From = &metastore.Location{Parent: 1, Name: []byte("before")}
+			}
+			notification, err := metastore.EncodeNotification(withNotification(native))
+			if err != nil {
+				t.Fatal(err)
+			}
+			fields["notification"] = notification
 			var change httprest.Change
 			if err := decodesInto(t, fields, &change); err != nil {
 				t.Fatalf("refused %+v: %v", fields, err)
@@ -1384,8 +1448,8 @@ func TestAChangeStreamRejectsRepeatedAndBackwardPositions(t *testing.T) {
 	for name, next := range map[string]int64{"repeated": 5, "backward": 4} {
 		t.Run(name, func(t *testing.T) {
 			body := frame("start", `{"incarnation":"a-log","position":4,"tail":6}`) +
-				frame("change", `{"position":5,"kind":"removed","parent":1,"name":"YQ=="}`) +
-				frame("change", fmt.Sprintf(`{"position":%d,"kind":"removed","parent":1,"name":"Yg=="}`, next))
+				removedFrame(t, 5, "a") +
+				removedFrame(t, metastore.Position(next), "b")
 			s := streamOf(t, body)
 			sub, err := s.Subscribe(t.Context())
 			if err != nil {
@@ -1404,7 +1468,7 @@ func TestAChangeStreamRejectsRepeatedAndBackwardPositions(t *testing.T) {
 
 func TestCaughtUpRemainsTrueAfterALiveChangePastTheOpeningTail(t *testing.T) {
 	body := frame("start", `{"incarnation":"a-log","position":4,"tail":4}`) +
-		frame("change", `{"position":5,"kind":"removed","parent":1,"name":"YQ=="}`)
+		removedFrame(t, 5, "a")
 	s := streamOf(t, body)
 	sub, err := s.Subscribe(t.Context())
 	if err != nil {
@@ -1532,8 +1596,9 @@ func TestAChangeSurvivesTheRoundTrip(t *testing.T) {
 		{Position: 9007199254740993, Kind: metastore.Modified, Parent: 5, Name: []byte("日本語"), Node: &node},
 		{Position: 3, Kind: metastore.Removed, Parent: 1, Name: []byte("gone")},
 		{Position: 4, Kind: metastore.Renamed, Parent: 2, Name: []byte("after"),
-			From: &metastore.Location{Parent: 1, Name: []byte("\x00before")}, Node: &node},
+			From: &metastore.Location{Parent: 1, Name: []byte("\xffbefore")}, Node: &node},
 	} {
+		want = withNotification(want)
 		wire, err := httprest.ChangeOf(want)
 		if err != nil {
 			t.Fatalf("render %s: %v", describeChange(want), err)
@@ -1546,8 +1611,15 @@ func TestAChangeSurvivesTheRoundTrip(t *testing.T) {
 		if err := json.Unmarshal(encoded, &decoded); err != nil {
 			t.Fatalf("%s does not decode from %s: %v", describeChange(want), encoded, err)
 		}
-		if got := decoded.Metastore(); describeChange(got) != describeChange(want) {
+		got, err := decoded.Metastore()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if describeChange(got) != describeChange(want) {
 			t.Fatalf("round trip through %s gave\n\t%s\nwant\n\t%s", encoded, describeChange(got), describeChange(want))
+		}
+		if !reflect.DeepEqual(got.Notification, want.Notification) {
+			t.Fatalf("notification facts changed through the wire: got %+v, want %+v", got.Notification, want.Notification)
 		}
 	}
 }
@@ -1902,7 +1974,7 @@ func TestAChangeThatCannotBeNamedEndsTheStreamRatherThanBeingGuessedAt(t *testin
 	}
 	if _, err := sub.Next(); err == nil {
 		t.Fatal("a change of an unnameable kind was delivered")
-	} else if !strings.Contains(err.Error(), "cannot name") {
+	} else if !strings.Contains(err.Error(), "kind") {
 		t.Fatalf("the failure reads %q, and does not say the kind could not be named", err)
 	}
 }
@@ -2020,7 +2092,7 @@ func positionsOf(t *testing.T, log metastore.Log) []metastore.Position {
 func readLogChanges(t *testing.T, log metastore.Log, after metastore.Position, limit int) ([]metastore.Change, metastore.Retention, error) {
 	t.Helper()
 	result, err := metastore.NewChangeResult(64<<20, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
-		return 256 + lengths.Name + lengths.FromName + lengths.Content, nil
+		return 256 + lengths.Name + lengths.FromName + lengths.Content + lengths.Notification, nil
 	})
 	if err != nil {
 		return nil, metastore.Retention{}, err
@@ -2532,5 +2604,181 @@ func TestAStreamWhoseWritesCannotBeBoundedIsRefused(t *testing.T) {
 		if w.Code == 200 {
 			t.Fatalf("%s was answered with a stream by a server that cannot bound a write to one", op)
 		}
+	}
+}
+
+func TestNotificationFactsSurviveStreamAndResume(t *testing.T) {
+	log := newFakeLog()
+	renamed := withNotification(metastore.Change{
+		Kind: metastore.Renamed, Parent: 2, Name: []byte{0xfe, 'n'},
+		From: &metastore.Location{Parent: 1, Name: []byte{0xff, 'o'}},
+		Node: &metastore.Node{ID: 42, Mode: fs.ModeDir | 0o755},
+	})
+	removed := withNotification(metastore.Change{Kind: metastore.Removed, Parent: 2, Name: renamed.Name})
+	removed.Notification.SubjectKind = fs.ModeDir
+	removed.Notification.Directory = true
+	first := log.record(renamed)
+	last := log.record(removed)
+	client := serveLog(t, log, httprest.DefaultLimits())
+	sub, err := client.Resubscribe(t.Context(), log.incarnation, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := sub.Next()
+	if err != nil || got.Position != first || !reflect.DeepEqual(got.Notification, renamed.Notification) {
+		t.Fatalf("rename facts = %+v, %v; want %+v", got, err, renamed.Notification)
+	}
+	if err := sub.Close(); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := client.Resubscribe(t.Context(), sub.Incarnation(), sub.Position())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resumed.Close()
+	got, err = resumed.Next()
+	if err != nil || got.Position != last || got.Node != nil || !reflect.DeepEqual(got.Notification, removed.Notification) {
+		t.Fatalf("resumed removal = %+v, %v; want no node and %+v", got, err, removed.Notification)
+	}
+	if resumed.Position() != last || !resumed.CaughtUp() {
+		t.Fatalf("resume cursor = %d, caught up = %v", resumed.Position(), resumed.CaughtUp())
+	}
+}
+
+func TestCorruptNotificationEndsStreamWithoutAdvancingCursor(t *testing.T) {
+	change := withNotification(metastore.Change{Position: 5, Kind: metastore.Removed, Parent: 1, Name: []byte("gone")})
+	valid, err := httprest.ChangeOf(change)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongSubject := *change.Notification
+	wrongSubject.SubjectID = 1
+	wrongBytes, err := json.Marshal(wrongSubject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, facts := range map[string][]byte{
+		"missing_directory": []byte(strings.Replace(string(valid.Notification), `,"Directory":false`, "", 1)),
+		"missing":           nil,
+		"null":              []byte("null"),
+		"malformed":         []byte("{"),
+		"noncanonical":      append([]byte(" "), valid.Notification...),
+		"invalid_ancestry":  wrongBytes,
+		"encoded_limit":     []byte(strings.Repeat("x", metastore.MaxNotificationBytes+1)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			wire := *valid
+			wire.Notification = facts
+			encoded, err := json.Marshal(wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if name == "missing" {
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(encoded, &fields); err != nil {
+					t.Fatal(err)
+				}
+				delete(fields, "notification")
+				encoded, err = json.Marshal(fields)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			body := frame("start", `{"incarnation":"a-log","position":4,"tail":5}`) + frame("change", string(encoded))
+			client := streamOf(t, body)
+			sub, err := client.Subscribe(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sub.Close()
+			got, err := sub.Next()
+			if err == nil || got.Position != 0 || storage.ErrnoOf(err) != syscall.EIO || errors.Is(err, syscall.ENOENT) || sub.Position() != 4 {
+				t.Fatalf("corrupt notification: change=%+v cursor=%d err=%v", got, sub.Position(), err)
+			}
+			if _, again := sub.Next(); again != err {
+				t.Fatalf("terminal stream verdict changed: %v, then %v", err, again)
+			}
+		})
+	}
+}
+
+type notificationAdmissionLog struct {
+	*fakeLog
+	length int64
+	loaded chan struct{}
+}
+
+func (l *notificationAdmissionLog) Since(_ context.Context, _ metastore.Position, limit int, result *metastore.ChangeResult) (metastore.Retention, error) {
+	retention := metastore.Retention{Tail: 1, Oldest: 1}
+	if limit == 0 {
+		return retention, nil
+	}
+	_, fits, err := result.Reserve(metastore.Change{
+		Position: 1, Kind: metastore.Removed, Parent: 1, Name: []byte{},
+	}, metastore.ChangePayloadLengths{Name: 4, Notification: l.length})
+	if err != nil {
+		return metastore.Retention{}, err
+	}
+	if fits {
+		close(l.loaded)
+	}
+	return metastore.Retention{}, result.Fail(errors.New("notification payload was admitted unexpectedly"))
+}
+
+func TestNotificationBudgetRejectsBeforeLoadingPayload(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		length     int64
+		diagnostic string
+	}{
+		{"missing", 0, "no notification facts"},
+		{"exceeds_frame", 1024, "result bound"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			log := &notificationAdmissionLog{fakeLog: newFakeLog(), length: test.length, loaded: make(chan struct{})}
+			handlerOptions := httprest.DefaultHandlerOptions()
+			handlerOptions.MaxFrameBytes = 1024
+			client := serveLogWithOptions(t, log, handlerOptions, httprest.DefaultDialOptions())
+			sub, err := client.Resubscribe(t.Context(), log.incarnation, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sub.Close()
+			got, err := sub.Next()
+			if storage.ErrnoOf(err) != syscall.EIO || !strings.Contains(err.Error(), test.diagnostic) || got.Position != 0 || sub.Position() != 0 {
+				t.Fatalf("unadmitted notification: change=%+v cursor=%d err=%v", got, sub.Position(), err)
+			}
+			select {
+			case <-log.loaded:
+				t.Fatal("notification bytes were loaded before frame admission rejected them")
+			default:
+			}
+		})
+	}
+}
+
+func TestWireChangeConversionValidatesFactsWithoutDecoderState(t *testing.T) {
+	change := withNotification(metastore.Change{Position: 8, Kind: metastore.Removed, Parent: 1, Name: []byte("gone")})
+	missing := change
+	missing.Notification = nil
+	if wire, err := httprest.ChangeOf(missing); wire != nil || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("source without notification facts was encoded: %+v, %v", wire, err)
+	}
+	encoded, err := metastore.EncodeNotification(change)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := httprest.Change{Position: 8, Kind: "removed", Parent: 1, Name: []byte("gone"), Notification: encoded}
+	got, err := wire.Metastore()
+	if err != nil || got.Node != nil || !reflect.DeepEqual(got.Notification, change.Notification) {
+		t.Fatalf("literal wire conversion = %+v, %v", got, err)
+	}
+	wire.Name = []byte("different")
+	if got, err := wire.Metastore(); err == nil || got.Notification != nil || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("mismatched row accepted: %+v, %v", got, err)
+	}
+	wire.Notification = nil
+	if got, err := wire.Metastore(); err == nil || got.Notification != nil || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("missing facts accepted: %+v, %v", got, err)
 	}
 }

@@ -28,9 +28,11 @@ type Handler struct {
 	lifetime            context.Context
 	cancelLifetime      context.CancelCauseFunc
 	files               *fileRegistry
+	windows             *windowsRegistry
 	storage             *locked.Storage
 	locks               locking.Service
 	lockControls        *bodyAdmission
+	windowsControls     *bodyAdmission
 	log                 metastore.Log
 	limits              Limits
 	maxBodyBytes        int64
@@ -116,6 +118,7 @@ func NewHandlerWithOptions(s storage.Storage, log metastore.Log, options Handler
 		storage:             paired,
 		locks:               paired.LockService(),
 		lockControls:        configuredLockControlAdmission(settled.maxConcurrentLockControls, settled.maxWaitingLockControls),
+		windowsControls:     newBodyAdmission(settled.maxConcurrentLockControls, settled.maxInFlightResponseBytes, settled.maxWaitingLockControls),
 		log:                 log,
 		limits:              settled.replication,
 		maxBodyBytes:        settled.maxBodyBytes,
@@ -141,6 +144,7 @@ func NewHandlerWithOptions(s storage.Storage, log metastore.Log, options Handler
 		stopping:  make(chan struct{}),
 	}
 	h.files = newFileRegistry(s, options.Files.settled())
+	h.windows = newWindowsRegistry(s, options.Files.settled())
 	if log != nil {
 		h.publisher = newPublisher(settled.replication.MaxSubscriptions)
 	}
@@ -160,6 +164,9 @@ func (h *Handler) Stop() {
 		}
 		if h.files != nil {
 			h.files.stop()
+		}
+		if h.windows != nil {
+			h.windows.stop()
 		}
 	})
 }
@@ -192,6 +199,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Op == OpFile || req.Op == OpFileControl {
 		h.serveFile(w, r)
+		return
+	}
+	if req.Op == OpWindows || req.Op == OpWindowsControl {
+		h.serveWindows(w, r)
 		return
 	}
 	if isLockControl(req.Op) {

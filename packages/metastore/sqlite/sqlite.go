@@ -615,8 +615,16 @@ func (s *Store) CloseContext(ctx context.Context) error {
 	if err := s.coordinator.commit.acquire(ctx); err != nil {
 		return err
 	}
-	if len(s.files) != 0 {
-		count := len(s.files)
+	windowsSessions := 0
+	if s.fileDomain != nil {
+		for session := range s.fileDomain.windows.sessions {
+			if session.store == s {
+				windowsSessions++
+			}
+		}
+	}
+	if len(s.files) != 0 || windowsSessions != 0 {
+		count := len(s.files) + windowsSessions
 		s.coordinator.commit.release()
 		return fmt.Errorf("the SQLite store still owns %d retained file references: %w", count, syscall.EBUSY)
 	}

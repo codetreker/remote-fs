@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math"
 	"syscall"
 	"time"
@@ -29,6 +30,7 @@ type retainedFile struct {
 	read, write    bool
 	active, closed bool
 	closeErr       error
+	windowsHandle  uint64
 }
 
 var _ metastore.FileStore = (*Store)(nil)
@@ -73,6 +75,16 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 		return nil, syscall.EAGAIN
 	}
 	var state metastore.FileState
+	handle, err := s.fileDomain.windows.allocateHandle()
+	if err != nil {
+		return nil, err
+	}
+	registered := false
+	defer func() {
+		if registered {
+			_, _ = s.fileDomain.windows.access.Close(handle)
+		}
+	}()
 	resolve := func(tx *sql.Tx) error {
 		var node metastore.Node
 		var err error
@@ -106,16 +118,38 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 			if options.ExpectedID != 0 && options.ExpectedID != uint64(node.ID) {
 				return syscall.ESTALE
 			}
+			if node.Mode&fs.ModeSymlink != 0 {
+				return syscall.ELOOP
+			}
 			if !node.Mode.IsRegular() {
 				return syscall.EISDIR
 			}
+			if options.Write {
+				if err := s.checkWindowsReadonly(ctx, tx, node.ID); err != nil {
+					return err
+				}
+			}
 			if options.Truncate {
-				if err := s.replaceNodeContent(ctx, tx, node, metastore.Object{ModTime: time.Now()}); err != nil {
+				if err := s.replaceNodeContent(ctx, tx, node, metastore.Object{ModTime: time.Now()}, nil); err != nil {
 					return err
 				}
 			}
 		}
 		state, err = s.fileState(ctx, tx, node.ID)
+		if err != nil {
+			return err
+		}
+		var access storage.WindowsAccess
+		if options.Read {
+			access |= storage.WindowsReadData
+		}
+		if options.Write {
+			access |= storage.WindowsWriteData
+		}
+		if err := s.registerWindowsOpenLocked(ctx, handle, node.ID, access, storage.WindowsShareAll); err != nil {
+			return err
+		}
+		registered = true
 		return err
 	}
 	modify := options.Create || options.Truncate
@@ -149,10 +183,11 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 	} else if err := s.inspect(ctx, resolve); err != nil {
 		return nil, sqlerr.Failure(err)
 	}
-	f := &retainedFile{store: s, id: state.ID, read: options.Read, write: options.Write, active: true}
+	f := &retainedFile{store: s, id: state.ID, read: options.Read, write: options.Write, active: true, windowsHandle: handle}
 	s.files[f] = struct{}{}
 	s.fileDomain.files++
 	s.coordinator.pins[retainedNode{s.volume, f.id}]++
+	registered = false
 	return f, nil
 }
 
@@ -219,7 +254,17 @@ func (f *retainedFile) Node(ctx context.Context) (metastore.FileState, error) {
 		return metastore.FileState{}, err
 	}
 	var state metastore.FileState
-	err := f.store.inspect(ctx, func(tx *sql.Tx) error { var err error; state, err = f.store.fileState(ctx, tx, f.id); return err })
+	err := f.store.inspect(ctx, func(tx *sql.Tx) error {
+		var err error
+		state, err = f.store.fileState(ctx, tx, f.id)
+		if err != nil {
+			return err
+		}
+		if operation, ok := metastore.FileIOFromContext(ctx); ok {
+			return f.store.checkWindowsIOLocked(f.id, f.windowsHandle, state.Size, operation)
+		}
+		return nil
+	})
 	return state, sqlerr.Failure(err)
 }
 
@@ -265,6 +310,7 @@ func (f *retainedFile) Commit(ctx context.Context, expected uint64, object metas
 		return metastore.FileState{}, syscall.EINVAL
 	}
 	var state metastore.FileState
+	ctx = withWindowsActor(ctx, f.windowsHandle)
 	err := f.store.mutatePublication(ctx, &volumeIntent{kind: locking.WriteMutation, node: f.id}, func(tx *sql.Tx) error {
 		if err := f.check(); err != nil {
 			return err
@@ -276,7 +322,7 @@ func (f *retainedFile) Commit(ctx context.Context, expected uint64, object metas
 		if before.Revision != expected {
 			return syscall.EAGAIN
 		}
-		if err := f.store.replaceNodeContent(ctx, tx, before.Node, object); err != nil {
+		if err := f.store.replaceNodeContent(ctx, tx, before.Node, object, nil); err != nil {
 			return err
 		}
 		state, err = f.store.fileState(ctx, tx, f.id)
@@ -300,7 +346,7 @@ func (s *Store) advanceContentRevision(ctx context.Context, tx *sql.Tx, id int64
 	return nil
 }
 
-func (s *Store) replaceNodeContent(ctx context.Context, tx *sql.Tx, node metastore.Node, object metastore.Object) error {
+func (s *Store) replaceNodeContent(ctx context.Context, tx *sql.Tx, node metastore.Node, object metastore.Object, attributes *uint32) error {
 	if object.Key == "" {
 		if object.Size != 0 {
 			return syscall.EINVAL
@@ -337,18 +383,41 @@ func (s *Store) replaceNodeContent(ctx context.Context, tx *sql.Tx, node metasto
 			return err
 		}
 	}
-	return s.recordNamedChanged(ctx, tx, node.ID)
+	var mask metastore.ChangeMask
+	if attributes != nil {
+		var before uint32
+		if err := tx.QueryRowContext(ctx, `SELECT windows_attributes FROM nodes WHERE volume=? AND id=?`, s.volume, node.ID).Scan(&before); err != nil {
+			return err
+		}
+		if before != *attributes {
+			mask |= metastore.ChangeAttributes
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE nodes SET windows_attributes=? WHERE volume=? AND id=?`, *attributes, s.volume, node.ID); err != nil {
+			return err
+		}
+	}
+	return s.recordNamedChangedMask(ctx, tx, node, mask)
 }
 
-func (s *Store) recordNamedChanged(ctx context.Context, tx *sql.Tx, id int64) error {
+func (s *Store) recordNamedChanged(ctx context.Context, tx *sql.Tx, before metastore.Node) error {
+	return s.recordNamedChangedMask(ctx, tx, before, 0)
+}
+
+func (s *Store) recordNamedChangedMask(ctx context.Context, tx *sql.Tx, before metastore.Node, extra metastore.ChangeMask) error {
+	id := before.ID
 	var detached bool
 	if err := tx.QueryRowContext(ctx, `SELECT detached FROM nodes WHERE volume=? AND id=?`, s.volume, id).Scan(&detached); err != nil {
 		return err
 	}
 	if detached {
-		return nil
+		_, err := s.updateChangeTime(ctx, tx, before.ID)
+		return err
 	}
-	return s.recordChanged(ctx, tx, id)
+	changed, err := s.updateChangeTime(ctx, tx, before.ID)
+	if err != nil {
+		return err
+	}
+	return s.recordChangedMask(ctx, tx, before, extra|changed)
 }
 
 func (f *retainedFile) SetAttr(ctx context.Context, change storage.AttrChange) (metastore.FileState, error) {
@@ -381,7 +450,7 @@ func (s *Store) setNodeAttr(ctx context.Context, tx *sql.Tx, id int64, change st
 	if err := applyChange(ctx, tx, node, change); err != nil {
 		return err
 	}
-	return s.recordNamedChanged(ctx, tx, id)
+	return s.recordNamedChanged(ctx, tx, node)
 }
 
 func (s *Store) StatNode(ctx context.Context, id uint64) (metastore.Node, error) {
@@ -442,6 +511,9 @@ func (f *retainedFile) Close(ctx context.Context) error {
 		return f.closeErr
 	}
 	s := f.store
+	if err := s.finishPendingWindowsDeleteLocked(ctx, f.id, f.windowsHandle); err != nil {
+		return err
+	}
 	key := retainedNode{s.volume, f.id}
 	count := s.coordinator.pins[key]
 	if count < 1 {
@@ -480,6 +552,9 @@ func (f *retainedFile) Close(ctx context.Context) error {
 		s.coordinator.pins[key] = count - 1
 	}
 	delete(s.files, f)
+	if _, err := s.fileDomain.windows.access.Close(f.windowsHandle); err != nil {
+		return windowsError(err)
+	}
 	s.fileDomain.files--
 	f.closed = true
 	return nil
@@ -491,6 +566,7 @@ type fileDomain struct {
 	stores      int
 	maxFiles    int
 	files       int
+	windows     *windowsDomain
 }
 
 func (s *Store) attachFileDomain(options Options) error {
@@ -500,7 +576,11 @@ func (s *Store) attachFileDomain(options Options) error {
 		if err != nil {
 			return err
 		}
-		domain = &fileDomain{config: options.Advisory, coordinator: coordinator, maxFiles: options.MaxRetainedFiles}
+		windows, err := newWindowsDomain(options.MaxRetainedFiles, options.Advisory.MaxRanges)
+		if err != nil {
+			return err
+		}
+		domain = &fileDomain{config: options.Advisory, coordinator: coordinator, maxFiles: options.MaxRetainedFiles, windows: windows}
 		s.coordinator.domains[s.volume] = domain
 	} else if domain.config != options.Advisory || domain.maxFiles != options.MaxRetainedFiles {
 		return fmt.Errorf("shared SQLite volume file limits differ from its active owner: %w", syscall.EINVAL)

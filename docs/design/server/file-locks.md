@@ -26,7 +26,7 @@ Session、Owner 与 Grant 是不可伪造的 bearer capability，使用至少 12
 
 `Scope(MutationScope)` 构造一份有界、不可随调用方后续修改而变化的 proof 集合，只向修改操作携带 Owner 与明确给出的 GrantRef。`Read`、`Stat`、`List` 仍是普通读取，成功不证明某项 grant 仍然有效；需要了解占有状态的调用方使用控制查询。
 
-只有现有普通文件可以被 Resolve 和 Acquire。目录、子树与不存在的目录项作为锁目标时明确拒绝。ResourceRef 有明确的有限有效期，过期后拒绝使用，不转而绑定新文件。Resolve 只是发现，Acquire 在授予转换处重新确认同一个资源仍存在且类型受支持。
+新的 Resolve 只发现现有普通文件，目录、子树、不存在的目录项和符号链接均被拒绝。ResourceRef 有明确的有限有效期，过期后拒绝使用，不转而绑定新文件；Acquire 在授予转换处重新确认这份引用指向的同一节点仍存在。已经解析的普通节点经授权 SetLink 转换为 reparse point 时保留 NodeID 与既有 S/X 保护；既有 grant 可以继续续期和释放，仍有效的原 ResourceRef 可以重新取得该身份上的占有。类型转换不让未携带所需 proof 的修改绕过保护，也不使新的 Resolve 接受符号链接。
 
 文件改名后，授权仍约束原文件的逻辑身份；同名替换不会使授权转移到新节点。目录改名不会把后代的文件授权提升为路径锁或子树锁。
 
@@ -80,6 +80,8 @@ Renew 使用 `max(原 deadline, 转换时刻 + 请求 TTL)`，不缩短已确认
 | 目录创建、删除或改名 | 不能借此绕过实际受影响普通文件的保护；不把整个子树当作文件资源 |
 
 匿名修改只在不冲突于当前 grant 时允许。显式 scope 中的每一份 proof 必须属于当前授权方、Session、Owner 与 generation，仍在有效期内，并且与这次修改的实际文件集合相交。实际受保护的每个文件都必须由调用方有效的 `X` 覆盖。任何过期、失效或无关 proof 都使操作失败，不能退回匿名执行；空 `SetAttr` 与 self-Rename 也验证提供的 scope。
+
+Windows 的 share/access、delete-pending 与字节范围访问是独立的原生约束。WindowsFile 修改仍携带显式 S/X scope，并在同一次最终转换处核对；基础路径与普通 File 入口也检查相冲突的 Windows 状态。Windows lock batch 的顺序与部分结果不借用强 S/X grant 或 Linux advisory receipt，见[文件句柄](file-handles.md#windows-保留目录访问意图与动作)。
 
 ## 发布与观察的排序
 

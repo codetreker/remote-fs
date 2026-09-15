@@ -81,6 +81,23 @@ func fileChange(kind metastore.ChangeKind) metastore.Change {
 	if kind == metastore.Renamed {
 		change.From = &metastore.Location{Parent: 1, Name: []byte("old")}
 	}
+
+	at := &metastore.LocationFacts{Ancestors: []metastore.DirectoryAncestor{{DirectoryID: 1}}, LeafName: []byte("file")}
+	n := &metastore.Notification{SubjectID: 2, ChangeMask: metastore.ChangeName}
+	switch kind {
+	case metastore.Created:
+		n.After = at
+	case metastore.Removed:
+		n.Before = at
+	case metastore.Modified:
+		n.Before = at
+		n.After = at
+		n.ChangeMask = metastore.ChangeSize
+	case metastore.Renamed:
+		n.Before = &metastore.LocationFacts{Ancestors: at.Ancestors, LeafName: []byte("old")}
+		n.After = at
+	}
+	change.Notification = n
 	return change
 }
 

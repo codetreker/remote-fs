@@ -28,11 +28,12 @@ type Storage struct {
 	// maxWriteBytes bounds file-content requests before they are sent.
 	maxWriteBytes int64
 	// maxFrameBytes bounds one replication frame retained by a stream reader.
-	maxFrameBytes int64
-	responses     *bodyAdmission
-	fileRequests  *bodyAdmission
-	lockControls  *bodyAdmission
-	scope         *locking.MutationScope
+	maxFrameBytes   int64
+	responses       *bodyAdmission
+	fileRequests    *bodyAdmission
+	lockControls    *bodyAdmission
+	windowsControls *bodyAdmission
+	scope           *locking.MutationScope
 
 	// silence is how long a stream may say nothing at all before this side stops believing
 	// it is being delivered.
@@ -117,9 +118,10 @@ func DialWithOptions(baseURL string, httpClient *http.Client, options DialOption
 			settled.MaxInFlightResponseBytes,
 			settled.MaxWaitingResponses,
 		),
-		fileRequests: newBodyAdmission(settled.MaxConcurrentResponses, settled.MaxInFlightResponseBytes, settled.MaxWaitingResponses),
-		silence:      settled.Silence,
-		lockControls: configuredLockControlAdmission(settled.MaxConcurrentLockControls, settled.MaxWaitingLockControls),
+		fileRequests:    newBodyAdmission(settled.MaxConcurrentResponses, settled.MaxInFlightResponseBytes, settled.MaxWaitingResponses),
+		silence:         settled.Silence,
+		lockControls:    configuredLockControlAdmission(settled.MaxConcurrentLockControls, settled.MaxWaitingLockControls),
+		windowsControls: newBodyAdmission(settled.MaxConcurrentLockControls, settled.MaxInFlightResponseBytes, settled.MaxWaitingLockControls),
 	}, nil
 }
 

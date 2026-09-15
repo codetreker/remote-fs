@@ -41,7 +41,7 @@ func TestVersionOneGraphRejectsDamageBeforeEntryRebuild(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			db := testDatabase(t, 1)
-			execute(t, db, `INSERT INTO volumes VALUES(1,'legacy',1,0)`)
+			execute(t, db, `INSERT INTO volumes(id,name,root,used) VALUES(1,'legacy',1,0)`)
 			execute(t, db, `INSERT INTO nodes (id,volume,mode,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec)
 				VALUES(1,1,?,0,0,0,0,0),(2,1,420,0,0,0,0,0)`, int64(fs.ModeDir|0o755))
 			execute(t, db, `INSERT INTO entries VALUES(1,X'66',2)`)

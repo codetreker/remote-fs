@@ -59,7 +59,10 @@ func validateVersionTwoLogStorageClasses(ctx context.Context, db sqlvalue.Querye
 // validateLogIntegrity checks the durable tail, predecessor chain, and operation-dependent
 // shape of every retained change before Snapshot or Since may expose it as history.
 func validateLogIntegrity(ctx context.Context, db sqlvalue.Queryer, volume *int64) error {
-	return validateLogIntegrityVersion(ctx, db, volume, true)
+	if err := validateLogIntegrityVersion(ctx, db, volume, true); err != nil {
+		return err
+	}
+	return changes.ValidateNotifications(ctx, db, volume)
 }
 
 func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, predecessors bool) error {
@@ -126,8 +129,8 @@ func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volum
 		changes.KindCreated, changes.KindRemoved, changes.KindRenamed, changes.KindModified,
 		changes.KindRenamed, changes.KindRenamed,
 		changes.KindRemoved, changes.KindRemoved,
-		int64(math.MaxUint32), int64(fs.ModeType), int64(fs.ModeDir),
-		int64(fs.ModeType), int64(fs.ModeDir), int64(fs.ModeType),
+		int64(math.MaxUint32), int64(fs.ModeType), int64(fs.ModeDir), int64(fs.ModeSymlink),
+		int64(fs.ModeType), int64(fs.ModeDir), int64(fs.ModeType), int64(fs.ModeSymlink), int64(fs.ModeType),
 	)
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*)
@@ -163,8 +166,9 @@ func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volum
 				c.node <= 0 OR c.mode < 0 OR c.mode > ? OR c.size < 0 OR
 				c.atime_nsec < 0 OR c.atime_nsec >= 1000000000 OR
 				c.mtime_nsec < 0 OR c.mtime_nsec >= 1000000000 OR
-				(c.mode & ?) NOT IN (0, ?) OR
+				(c.mode & ?) NOT IN (0, ?, ?) OR
 				((c.mode & ?) = ? AND (c.size != 0 OR c.content IS NOT NULL)) OR
+				((c.mode & ?) = ? AND c.content IS NOT NULL) OR
 				((c.mode & ?) = 0 AND c.content IS NULL AND c.size != 0) OR
 				(c.content IS NOT NULL AND c.content = '')
 			)) OR

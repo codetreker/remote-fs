@@ -1,5 +1,5 @@
--- An independent witness of the schema version 2 databases already hold.
--- It is executable test data, not a migration and not a description of today's schema.
+-- Independent schema version 2 fixture for the current prerelease migration set.
+-- It is executable test data, not a runtime migration.
 
 CREATE TABLE nodes (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -10,6 +10,12 @@ CREATE TABLE nodes (
 	atime_nsec INTEGER NOT NULL,
 	mtime_sec  INTEGER NOT NULL,
 	mtime_nsec INTEGER NOT NULL,
+	windows_creation_sec INTEGER NOT NULL DEFAULT 0,
+	windows_creation_nsec INTEGER NOT NULL DEFAULT 0,
+	windows_change_sec INTEGER NOT NULL DEFAULT 0,
+	windows_change_nsec INTEGER NOT NULL DEFAULT 0,
+	windows_attributes INTEGER NOT NULL DEFAULT 0,
+	windows_link_target BLOB NOT NULL DEFAULT X'',
 	content    TEXT REFERENCES objects(key)
 );
 
@@ -27,7 +33,8 @@ CREATE TABLE volumes (
 	id   INTEGER PRIMARY KEY AUTOINCREMENT,
 	name TEXT    NOT NULL UNIQUE,
 	root INTEGER NOT NULL,
-	used INTEGER NOT NULL
+	used INTEGER NOT NULL,
+	windows_name_version INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE objects (

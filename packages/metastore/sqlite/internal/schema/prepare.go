@@ -327,9 +327,9 @@ func createVolume(ctx context.Context, tx *sql.Tx, volume string) (id, root int6
 		return 0, 0, err
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-		VALUES (?, ?, ?, 0, ?, ?, ?, ?, NULL)`,
-		root, id, int64(fs.ModeDir|rootDirectoryMode), sec, nsec, sec, nsec)
+		INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, windows_creation_sec,windows_creation_nsec,windows_change_sec,windows_change_nsec,content)
+		VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?,?,?,?,NULL)`,
+		root, id, int64(fs.ModeDir|rootDirectoryMode), sec, nsec, sec, nsec, sec, nsec, sec, nsec)
 	if err != nil {
 		return 0, 0, err
 	}

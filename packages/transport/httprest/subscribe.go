@@ -202,7 +202,10 @@ func (sub *Subscription) Next() (metastore.Change, error) {
 		if err := decodeFrame(event, data, &change); err != nil {
 			return metastore.Change{}, sub.stream.fail(unreachable(sub.stream.req, err))
 		}
-		got := change.Metastore()
+		got, err := change.Metastore()
+		if err != nil {
+			return metastore.Change{}, sub.stream.fail(unreachable(sub.stream.req, err))
+		}
 		if got.Position <= sub.at {
 			return metastore.Change{}, sub.stream.fail(unreachable(sub.stream.req,
 				fmt.Errorf("change position %d does not follow position %d", got.Position, sub.at)))

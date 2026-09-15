@@ -29,7 +29,7 @@ func readRows(ctx context.Context, snap metastore.Snap, limit int) ([]metastore.
 
 func TestSnapshotBoundedMakesAProductionErrorTerminalWithoutExposingPrefixRows(t *testing.T) {
 	store := open(t, database(t), "workspace", 0)
-	if err := store.Create(t.Context(), strings.Repeat("x", 1<<20)); err != nil {
+	if err := store.Create(t.Context(), strings.Repeat("x", 1024)); err != nil {
 		t.Fatal(err)
 	}
 	snap, _, err := store.Snapshot(t.Context())

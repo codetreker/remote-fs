@@ -107,8 +107,12 @@ func (h *Handler) Close(ctx context.Context) error {
 	select {
 	case <-h.files.done:
 		h.files.mu.Lock()
-		defer h.files.mu.Unlock()
-		return h.files.err
+		err := h.files.err
+		h.files.mu.Unlock()
+		if h.windows != nil {
+			err = errors.Join(err, h.windows.wait(ctx))
+		}
+		return err
 	case <-ctx.Done():
 		return ctx.Err()
 	}

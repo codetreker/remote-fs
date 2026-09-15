@@ -1,6 +1,6 @@
 # 打开的文件与 advisory locks
 
-本文描述 `storage.FileStorage`、服务端保留的文件身份和标准 advisory locks。按路径的基础 volume API 见[顶层设计](../architecture.md)，显式 S/X 扩展见[文件占有](file-locks.md)，FUSE 的内核映射见[client 设计](../client/architecture.md)。决定与代价见[活跃文件句柄](../../../.agents/notes/implemented/architecture/2026-09-08-live-file-handles.md)。
+本文描述 `storage.FileStorage`、服务端保留的文件身份和标准 advisory locks。按路径的基础 volume API 见[顶层设计](../architecture.md)，显式 S/X 扩展见[文件占有](file-locks.md)，FUSE 的内核映射见[client 设计](../client/architecture.md)，Windows 的协议与本机映射见 [SMB 接入](../client/windows-smb.md)。决定与代价见[活跃文件句柄](../../../.agents/notes/implemented/architecture/2026-09-08-live-file-handles.md)。
 
 ## 一、身份与会话
 
@@ -22,9 +22,19 @@
 
 `Renew` 确认会话继续有效；`Status` 只观察，不续期。返回的 epoch、revision、剩余 lease 与 history 时间用于核对同一会话。client 从请求开始时刻计算保守的本地截止时间；旧响应、普通 I/O 成功、TCP 存活均不延长已确认期限。过期或旧 server epoch 的能力返回 `ESTALE`，未知结果返回 `EIO`，不会恢复到旧路径。底层发布检查仍是权限的最终判定者。
 
+### Windows 保留目录、访问意图与动作
+
+[`storage.WindowsStorage`](../../../packages/storage/windows_contract.go) 是独立能力，提供 WindowsState、显式 EnableWindows／QueryWindowsActivation 与 NewWindowsSession。objectstore、localstore、locked、limited 和 HTTP 保持同一原生 authority 与 action receipt；不以路径重开或本机锁表替代此能力。limited 仍要求原生发布记账。
+
+WindowsFile 允许目录与 metadata-only 引用。WindowsLookup 以 ParentID、可选的同会话 ParentReference 和单个 leaf name 寻址；ExpectedID 防止同名替换。WindowsOpenIntent 保留 Access、Share、Disposition、Kind、DeleteOnClose 与 OpenReparsePoint，完整意图同时用于授权和原生打开。WindowsRenameRequest 对来源、目的父身份与预期目标作最终核对。
+
+WindowsBasicAttr 包含实际创建时间、change time、DOS attributes 和 delete-pending；WindowsNameInfo 区分 root、linked 与 detached，在同一权威观察中返回当前名字，不能由旧路径推导。ReadLink／SetLink 处理有界、受 volume confinement 检查的符号链接；SetLink 保留节点 ID 与目录链接标志；已解析普通节点上的 S/X 保护随授权转换继续绑定同一身份，既有 grant 的控制与原 ResourceRef 的再次取得遵循[文件占有](file-locks.md#身份与显式-scope)。普通 FileStorage 的文件引用仍拒绝符号链接，Linux FUSE 的 Readlink／Symlinker 能力不由此增加。
+
+WindowsSession 的 epoch-and-nonce 动作 ID 贯穿 open、修改、关闭、取消与结果查询。receipt 保留 Applied 数量、原错误与 symlink 观察；有错误不等于全部回滚。已知终态按声明的历史保留，未知结果只能以原动作核对。会话失效禁止旧引用继续发布，清理排空后再回收 pin、内容和访问状态。
+
 ## 二、保留节点与回收
 
-SQLite schema v5 在节点上保存 `detached` 与内容 revision。`Remove` 或覆盖目标的 `Rename` 移除名字；仍有引用的普通文件保留原节点及内容。原 fd 可继续读取、修改与查询这个对象，新路径指向的对象独立存在。volume 日志、快照与目录遍历只包含仍有名字的节点，脱离名字后的修改不制造虚构路径事件。
+SQLite 在节点上保存 `detached`、内容 revision、Windows 时间／DOS attributes 与链接目标。`Remove` 或覆盖目标的 `Rename` 移除名字；仍有引用的普通文件保留原节点及内容。原 fd 可继续读取、修改与查询这个对象，新路径指向的对象独立存在。volume 日志、快照与目录遍历只包含仍有名字的节点，脱离名字后的修改不制造虚构路径事件。
 
 保留节点的内容仍属于 volume 的实际用量。最后一个引用先退役，在最终发布门处禁止新的修改授权；已经接纳的 I/O 排空之后才物理释放。最后释放在事务内处理用量、当前对象与待回收对象。已知未生效的容量拒绝保留引用供清理重试；结果不明时保留所有权并封锁后续使用，不能提前归还配额。
 
@@ -40,7 +50,7 @@ objectstore 仍以不可变完整对象保存内容。读取先捕获节点状�
 
 `WriteAt` 只替换指定区间；`Truncate` 保留前缀，增长部分为零。一次修改读取当前完整状态，预留旧内容与下一份内容，构造替换对象，经 Reserve、不可变 Put 和原生 revision CAS 发布。对象上传不持有最终发布门。只有已知没有提交且暂存清理成功的 CAS 竞争才能重新基于当前状态尝试；真实故障或未知提交结果不会被重试掩盖。
 
-最终事务同时核对内容 revision、节点身份、会话或引用的有效期、显式 S/X proof 和发布记账。检查与修改按同一次最终转换排序。上传开始时有效不代表上传结束时仍可发布；引用退役、会话失效或授权过期后，尚未取得最终授权的修改失败。原生 Commit/Accept 的未知结果继续为 `EIO` 并保留故障原因。
+最终事务同时核对内容 revision、节点身份、会话或引用的有效期、显式 S/X proof、Windows 共享／范围访问约束和发布记账。检查与修改按同一次最终转换排序。上传开始时有效不代表上传结束时仍可发布；引用退役、会话失效或授权过期后，尚未取得最终授权的修改失败。原生 Commit/Accept 的未知结果继续为 `EIO` 并保留故障原因。
 
 两个普通 fd 对重叠区间的修改可按实际提交顺序都成功，未被后一次修改触及的区间被保留。内部 revision CAS 负责拼接当前状态，不是对「打开时内容版本」的承诺；[显式内容版本工作流](../../../.agents/notes/proposed/architecture/2026-08-19-ordering-and-versions.md)仍有独立的调用方依据与冲突报告问题。
 
@@ -48,7 +58,7 @@ objectstore 仍以不可变完整对象保存内容。读取先捕获节点状�
 
 ## 四、advisory 范围与 owner
 
-[`packages/advisory`](../../../packages/advisory/coordinator.go) 在同一 volume 内协调两种独立的冲突域。advisory lock 只约束自愿参与的加锁者；不持锁的写入、截断、改名和删除照常遵守基础文件语义及显式 S/X 检查。
+[`packages/advisory`](../../../packages/advisory/coordinator.go) 在同一 volume 内协调两种独立的冲突域。advisory lock 只约束自愿参与的加锁者；不持 advisory lock 的写入、截断、改名和删除仍遵守基础文件语义、显式 S/X 检查及已经生效的 Windows 共享／范围限制。Windows 约束由原生 windowsaccess 状态与受控操作共同排序，不能通过改用 Linux 或路径 API 绕过；它不把 Linux advisory 改造成强制锁。
 
 | 规则 | `flock` | 传统 POSIX `fcntl` |
 |---|---|---|

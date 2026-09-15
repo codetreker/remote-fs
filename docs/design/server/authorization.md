@@ -12,9 +12,10 @@ type Authorizer interface {
 }
 
 type AccessRequest struct {
-    Volume    string
-    Operation storage.Operation
-    Open      storage.OpenAccess
+    Volume      string
+    Operation   storage.Operation
+    Open        storage.OpenAccess
+    WindowsOpen storage.WindowsOpenIntent
 }
 ```
 
@@ -80,11 +81,23 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `lock.query-action` | `/v3/lock-query-action` | 查询动作历史 |
 | `lock.query-grant` | `/v3/lock-query-grant` | 查询 grant 当前状态 |
 | `lock.status` | `/v3/lock-status` | 查询授权方状态 |
-
+| `windows.state`、`windows.enable`、`windows.query-activation` | `/v3/windows-control` | 查询、显式启用或核对 volume 的 Windows 命名能力 |
+| `windows.session-open`、`windows.session-close` | `/v3/windows-control` | 建立或关闭 Windows 会话 |
+| `windows.renew`、`windows.status` | `/v3/windows-control` | 续期或观察 Windows 会话 |
+| `windows.query-action`、`windows.cancel-action` | `/v3/windows-control` | 核对或取消原 Windows 动作，不制造新结果 |
+| `windows.close` | `/v3/windows-control` | 关闭保留 Windows 引用 |
+| `windows.open` | `/v3/windows` | 按父身份和 leaf 打开，携带完整 WindowsOpenIntent |
+| `windows.stat`、`windows.read`、`windows.list` | `/v3/windows` | 读取保留对象属性、范围字节或有界目录 |
+| `windows.write`、`windows.truncate`、`windows.set-attr` | `/v3/windows` | 修改范围、长度或 Windows 属性 |
+| `windows.read-link`、`windows.set-link` | `/v3/windows` | 读取链接或转换受控对象为符号链接 |
+| `windows.rename`、`windows.set-delete-pending` | `/v3/windows` | 按身份改名或设置删除状态 |
+| `windows.lock-batch`、`windows.sync` | `/v3/windows` | Windows 范围批次或已发布状态检查 |
 
 副本构建还需要 replication.checkpoint 的明确许可；允许订阅或快照不隐含这项权限。Checkpoint 是一次普通读取，遵循入口授权、通用传输预算和安全错误规则，不建立持续输出。
 
 `FileOpenOptions` 嵌入共享的 `storage.OpenAccess`，其 Read、Write、Create、Truncate、Exclusive 与 AccessRequest.Open 是同一类型。Open 的合法性仍由 FileOpenOptions.Check／CheckNode 连同 mode、节点身份验证。AccessRequest.Open 仅在 file.open／file.open-node 携带这份已验证的值，其它操作为零值；open-node 不接受 Create／Exclusive。带 Create 的打开即使最终打开已有文件，也报告创建意图。一次入口 callback 同时决定全部打开意图，允许之后才创建、截断或分配文件引用。
+
+`AccessRequest.WindowsOpen` 仅在 windows.open 携带经过验证的完整意图，包括 Access、Share、Disposition、Kind、DeleteOnClose 与 OpenReparsePoint。metadata-only 和 delete 意图不压缩成普通 OpenAccess；允许之后才触碰对应能力与原生状态。Windows activate、action replay 和 cleanup 也按自己的 Operation 授权，已经成功过的 receipt 不构成后续核对许可。
 
 `volume.write` 可以创建缺失文件，单独拒绝 volume.create 不能禁止创建。file.set-lock 表达共享／排他申请与转换；file.unlock 是独立的 wire 操作与策略操作，必须携带 Unlock 类型；file.set-lock 不能携带 Unlock。EX flock 可用于只读 fd，锁模式不代替内容写权限；后续内容修改仍检查 file.write 等操作。
 
@@ -200,5 +213,7 @@ func newAuthorizedHandler(
 业务策略分别列出允许的语义操作，并对 Open 检查 CanRead／CanWrite；只读角色可以显式允许它需要的查询、订阅、只读打开、锁与清理。返回的 handler 由宿主按第三节关闭，mux 由宿主 HTTP server 使用。不同 volume 使用各自配好的 handler，这个示例不提供实例注册表。
 
 host 包装 Authorizer 记录策略版本、耗时、允许／拒绝／故障，使用请求 context 中自己的 request／trace ID 关联 `component=authz`、`phase=authorize`、volume、operation 和 decision。同一长连接的重查保留同一关联值；可通过宿主现有查询 `request_id=X component=authz` 核对请求与输出结果。身份脱敏、凭据、策略错误审计和资源预算属于业务方；库不增加日志目的地、exporter、查询栈或脱离请求的审计任务。
+
+SMB 的本机入口复用这份 Authorizer 契约，但由 SSPI 产生的 Principal 与 HTTP middleware 的身份分别由各自宿主绑定。`smb.Config.Authorize` 不可省略；`windows.AllowSID` 是只允许已验证 SID 的显式适配，不是路径 ACL 或远端凭据管理。CHANGE_NOTIFY 使用 replication.subscribe 的当前许可。其部署与所有权见 [Windows 本机 SMB](../client/windows-smb.md)。
 
 可执行的断言分层与故障用例见[测试策略](../../testing.md)。

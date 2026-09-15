@@ -8,7 +8,7 @@
 
 **server** —— volume 与文件占有的权威持有者。它将原生支持发布检查的 **storage** 与对应锁服务配对，经 HTTP 暴露出去。volume 的事实、有效授权和修改顺序以这里为准。
 
-**client** —— volume 的使用者。它通过 remote storage 的路径接口与保留文件接口访问数据，通过标准 advisory 协调参与者，并通过显式 S/X 控制取得与核对强权限；client 侧还负责把 volume 呈现为本地目录。普通文件打开不自动执行占有策略。
+**client** —— volume 的使用者。它通过 remote storage 的路径接口与保留文件接口访问数据，通过标准 advisory 协调参与者，并通过显式 S/X 控制取得与核对强权限；client 侧通过 Linux FUSE 或 Windows 本机 SMB 把 volume 呈现给操作系统。普通文件打开不自动执行显式 S/X 占有策略。Windows 共享模式与范围访问限制由 authority 按独立语义执行。
 
 一个 server 面对多个 client（R-CON-1）。client 之间不直接通信。
 
@@ -17,7 +17,9 @@
 ```mermaid
 flowchart LR
     subgraph client[client]
-        App[普通文件操作] --> Fuse[挂载呈现层]
+        App[Linux 文件操作] --> Fuse[FUSE 呈现层]
+        WinApp[Windows 文件操作] --> SMB[本机 SMB 呈现层]
+        SMB --> Remote
         Fuse --> Replica[本地元数据副本]
         Replica --> Remote[remote storage]
         SDK[显式 S/X 控制]
@@ -40,6 +42,7 @@ flowchart LR
     Remote --> HTTP
     SDK --> HTTP
     Log -. 变更流 .-> Replica
+    Log -. 宿主注入的变更观察 .-> SMB
 ```
 
 嵌入方在自己的认证 middleware 中提供稳定访问身份，并可配置 Authorizer 按可信 volume 与语义操作作准入决定。数据、文件控制、强占有和复制共用这项业务策略，锁能力的原生检查保持独立。
@@ -50,20 +53,20 @@ flowchart LR
 
 ## 三、同一个接口，两个模块
 
-client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storage.Storage` 基础接口**，并提供有界结果扩展 `storage.BoundedStorage`。`FileStorage` 提供保留文件与 advisory 能力；强 S/X 控制与 mutation scope 是另外的成对能力。
+client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storage.Storage` 基础接口**，并提供有界结果扩展 `storage.BoundedStorage`。`FileStorage` 提供普通保留文件与 advisory 能力；`WindowsStorage`、`WindowsSession` 与 `WindowsFile` 提供 Windows 命名启用、目录引用、共享模式和范围访问。强 S/X 控制与 mutation scope 是另外的成对能力。
 
 它们**不是同一个模块**，也不在同一个角色里：server 侧的那个真正持有数据；client 侧的那个不保存权威内容，它把调用翻译为 HTTP 交换，并保存完成核对所需的有限能力与动作状态。
 
 接口相同带来两个直接后果，都不需要额外设计：
 
-- 挂载呈现层要求其中的 `FileStorage` 能力，因此**可以直接挂载一份具有保留文件能力的本地 storage，完全不经过网络**。挂载点于是能与一个普通目录逐操作对拍（见 [`../testing.md`](../testing.md)）。
+- Linux FUSE 呈现层要求其中的 `FileStorage` 能力，因此**可以直接挂载一份具有保留文件能力的本地 storage，完全不经过网络**。挂载点于是能与一个普通目录逐操作对拍（见 [`../testing.md`](../testing.md)）。
 - HTTP 服务端要求 volume 与锁服务属于同一授权方。代理必须共同转发原有控制身份、动作与 scope，不能在一份不透明的远端 `Write` 外另建本地授权方。
 
 ## 四、跨角色契约
 
 基础 storage 描述 volume 操作，锁控制描述跨请求的占有与核对，HTTP 同时承载它们和复制。各自的义务不能由另一层猜测补齐。
 
-**FUSE 到挂载呈现层为止。** 底层提供独立于内核的两组接口：按路径寻址的基础 volume，以及 `FileStorage` 的会话、对象引用、身份属性与 advisory 操作。挂载层只保存内核编号和 owner 的映射；对象在 rename、unlink 或覆盖后的存活由服务端保留引用保证，不由旧路径重建。
+**操作系统适配到呈现层为止。** 底层提供独立于内核的接口：按路径寻址的基础 volume、`FileStorage` 的普通文件与 advisory，以及 `WindowsStorage` 的 Windows 访问、目录引用与动作结果。FUSE 保存内核编号和 owner 的映射，SMB 保存 session/tree/open 映射；对象在 rename、unlink 或覆盖后的存活由服务端保留引用保证，不由旧路径重建。Windows 的 lookup 与 rename 还携带父目录身份和 leaf name，WindowsBasicAttr 与当前名字信息来自 authority。
 
 **节点身份在契约里**（R-FS-5）。属性带一个 `ID`，说的是「这个名字后面是哪个节点」，与它此刻叫什么无关。挂载呈现层分不出这件事就会把两个活着的节点报成一个：一个描述符会读到别人的字节，而 mmap 了它的程序拿到 SIGBUS。而挂载点只直接观测到自己执行的操作，别的客户端做的改名不经过它的任何一条路径，所以这个答案只能由 volume 给。
 
@@ -137,6 +140,10 @@ Checkpoint 是普通有界读取：原子返回日志 incarnation 与已提交�
 
 client 侧的 remote storage 实现 storage 接口，凡是不满足上述任何一条的答案，它一律以 `EIO` 报告，绝不把它变成一句关于 volume 的话。
 
+Windows 命名兼容是显式启用并持久保存的 volume 状态；发布 share 只检查状态，不执行隐式启用。Windows share/access 与范围锁检查在原生受控操作处排序，Linux 与编程入口不能通过协议差异绕过它们。变更记录同时携带有界、不可变的通知事实；SMB 的变更来源由宿主注入，与其数据 backend 保持同源。具体接口与呈现行为见 [Windows 本机 SMB](client/windows-smb.md)。
+
+一次应用大读写跨多个协议请求时的保证单位仍是 R-CON-5【未决】；本文的接口与数据流不替这项需求选择答案。
+
 ## 五、跨角色的数据流
 
 ### 元数据有副本，内容没有
@@ -177,16 +184,17 @@ remote-fs ──▶ 建立 remote storage，先访问一次根，确认 server �
           ──▶ 收到 SIGINT／SIGTERM ──▶ 拆除挂载
 ```
 
-挂载与卸载是频繁的日常操作（R-WS-2）。冷挂载时本地**无任何既有状态**（R-WS-3）——但它要建立一份：一个私有目录、一个 SQLite 副本、一条订阅，以及一份灌满整棵树的快照；快照结束后还需用原订阅追到新捕获的固定 checkpoint，**完成这个门槛之前挂载点不可用**。R-WS-4（冷挂载后必须迅速可用）因此被知情推后，理由与代价见[元数据复制](../../.agents/notes/implemented/architecture/2026-08-27-metadata-replication.md)。内核退出后先排空 FileSession，再关闭副本并删除其目录；失败保留清理错误与未释放资源。失败的 Unmount 不停止文件会话续期。
+Linux FUSE 挂载与卸载是频繁的日常操作（R-WS-2）。冷挂载时本地**无任何既有状态**（R-WS-3）——但它要建立一份：一个私有目录、一个 SQLite 副本、一条订阅，以及一份灌满整棵树的快照；快照结束后还需用原订阅追到新捕获的固定 checkpoint，**完成这个门槛之前挂载点不可用**。R-WS-4（冷挂载后必须迅速可用）因此被知情推后，理由与代价见[元数据复制](../../.agents/notes/implemented/architecture/2026-08-27-metadata-replication.md)。内核退出后先排空 FileSession，再关闭副本并删除其目录；失败保留清理错误与未释放资源。失败的 Unmount 不停止文件会话续期。
 
 ## 六、部署形态
 
-两个角色各有两种存在方式（R-INT-1、R-INT-4）：
+server 与 Linux client 提供库和独立二进制；Windows client 通过独立 package 嵌入（R-INT-1、R-INT-4、R-INT-14）：
 
 | 角色 | 作为库嵌入 | 作为独立二进制 |
 |---|---|---|
 | server | `packages/transport/httprest` 提供一个 `http.Handler`，链接进集成方既有的 server | `cmd/remote-fs-server`：服务 Azure Blob + SQLite，或同一私有目录中的本地对象 + SQLite |
-| client | `packages/transport/httprest` 与 `packages/fuse` 链接进集成方既有的 daemon service | `cmd/remote-fs`：把一个 server 的 volume 挂到本地目录 |
+| Linux client | `packages/transport/httprest` 与 `packages/fuse` 链接进集成方既有的 daemon service | `cmd/remote-fs`：把一个 server 的 volume 挂到本地目录 |
+| Windows client | `packages/smb` 与 `packages/smb/windows` 链接进宿主，由宿主配置远端、loopback listener 和用户映射 | 由嵌入方管理进程与映射 |
 
 client 侧还有第三种用法：只使用 remote storage，不挂载（R-INT-5）。这条路径不依赖 FUSE，因此不受 Linux 限制。
 
@@ -203,7 +211,8 @@ client 侧还有第三种用法：只使用 remote storage，不挂载（R-INT-5
 - `server/file-locks.md` —— 显式占有、有限授予、最终发布顺序、重启保护与 HTTP 控制协议
 - `server/file-handles.md` —— 保留对象、同步区间修改、advisory owner 与文件会话协议
 - `server/authorization.md` —— 嵌入方策略、语义操作、请求与流的授权和安全错误
-- `client/architecture.md` —— remote storage、挂载呈现层、打开的文件、节点身份、生命周期
+- `client/architecture.md` —— remote storage、Linux 挂载呈现层、打开的文件、节点身份、生命周期
+- `client/windows-smb.md` —— Windows 本机 SMB、SSPI、系统映射与目录通知
 
 第二层只写角色内部，不重讲系统全貌，跨角色只通过本文定义的接口与契约来引用。
 
@@ -236,6 +245,8 @@ packages/                    可被外部与自身 import
   transport/                 把 storage 契约搬到线上，一种传输一个包
     httprest/                HTTP：URL 与消息的形状、服务端、拨号端
   fuse/                      挂载呈现层：FUSE 适配；仅 Linux
+  smb/                       可嵌入的 SMB 3.1.1 核心与有界协议状态
+    windows/                 Windows SSPI 与当前用户盘符映射
 
 cmd/                         二进制，不被 import
   remote-fs/                 把一个 server 的 volume 挂到本地目录

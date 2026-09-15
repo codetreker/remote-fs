@@ -18,6 +18,8 @@ type AccessRequest struct {
 	// Open preserves the validated storage.OpFileOpen or storage.OpFileOpenNode
 	// intent. Other operations carry its zero value.
 	Open storage.OpenAccess
+	// WindowsOpen preserves the complete validated Windows open intent.
+	WindowsOpen storage.WindowsOpenIntent
 }
 
 // Authorizer reads the host's current policy using identity from ctx. It must

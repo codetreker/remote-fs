@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"sync"
 	"syscall"
@@ -60,6 +61,7 @@ type Storage struct {
 	closeErr           error
 	fileMu             sync.Mutex
 	fileSessions       map[*fileSession]struct{}
+	windowsSessions    map[*windowsSession]struct{}
 	filesClosing       bool
 	fileCloseMu        sync.Mutex
 	fileCloseRetry     bool
@@ -369,10 +371,8 @@ func (s *Storage) ListBounded(ctx context.Context, path string, result *storage.
 
 // Read returns the whole contents of the file at path.
 //
-// Nothing here answers for a symbolic link, and nothing needs to: the storage contract
-// offers no operation that makes one, so a volume reachable only through it never comes
-// to hold one. A local directory is different because something outside this system can
-// make a link in it; a metastore has no outside.
+// Symlink targets are held in native metadata. Reading a link through this
+// content API reports ELOOP.
 //
 // Reading is two steps — ask the tree which object, then ask for that object — and a write
 // can land between them. When it does, the object the tree named a moment ago has already
@@ -397,6 +397,7 @@ func (s *Storage) ReadBounded(ctx context.Context, path string, maxBytes int64) 
 }
 
 func (s *Storage) read(ctx context.Context, path string, maxBytes *int64) ([]byte, error) {
+	ctx = metastore.WithFileIO(ctx, metastore.WindowsIO{Length: math.MaxInt64})
 	cleaned, err := storage.CleanPath(path)
 	if err != nil {
 		return nil, &os.PathError{Op: "read", Path: path, Err: err}
@@ -414,6 +415,8 @@ func (s *Storage) read(ctx context.Context, path string, maxBytes *int64) ([]byt
 		switch {
 		case node.IsDir():
 			return nil, &os.PathError{Op: "read", Path: path, Err: syscall.EISDIR}
+		case node.Mode&os.ModeSymlink != 0:
+			return nil, &os.PathError{Op: "read", Path: path, Err: syscall.ELOOP}
 		case node.Content == "":
 			if node.Size != 0 {
 				return nil, fmt.Errorf("the contents of %s have size %d but no object: %w", path, node.Size, syscall.EIO)

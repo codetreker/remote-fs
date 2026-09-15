@@ -16,11 +16,135 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  # The layers that mount a filesystem, named once. The two jobs below divide the suite
-  # on exactly this line: the second runs these, the first runs everything else.
+  # The layers that mount a filesystem, named once. The Linux jobs divide the suite
+  # on exactly this line: the mounted job runs these, the checks job runs everything else.
   MOUNTING_PACKAGES: ./packages/fuse/... ./cmd/...
 
 jobs:
+  windows:
+    name: Windows 11 ARM64 SMB
+    runs-on: windows-11-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare Go directories in the workspace
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $workRoot = Join-Path $env:GITHUB_WORKSPACE '.tmp/windows-ci'
+          $paths = @{
+            GOCACHE = 'go-build'
+            GOMODCACHE = 'go-mod'
+            GOPATH = 'go-path'
+            TMPDIR = 'tmp'
+            TMP = 'tmp'
+            TEMP = 'tmp'
+          }
+          foreach ($name in $paths.Keys) {
+            $path = Join-Path $workRoot $paths[$name]
+            New-Item -ItemType Directory -Force -Path $path | Out-Null
+            $value = $path.Replace('\', '/')
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "$name=$value" -Encoding utf8
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'GOTOOLCHAIN=local' -Encoding utf8
+      - uses: ./.github/actions/setup-go
+
+      - name: Assert native Windows 11 ARM64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $os = Get-CimInstance Win32_OperatingSystem
+          $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          [ordered]@{
+            Caption = $os.Caption
+            Version = $os.Version
+            BuildNumber = $os.BuildNumber
+            ProductType = $os.ProductType
+            Architecture = $architecture
+            ImageOS = $env:ImageOS
+            ImageVersion = $env:ImageVersion
+          } | ConvertTo-Json | Write-Output
+          if ($os.ProductType -ne 1 -or ([version]$os.Version).Major -ne 10 -or [int]$os.BuildNumber -lt 26100) {
+            throw 'SMB acceptance requires Windows 11 24H2 or later, client edition.'
+          }
+          if ($architecture -ne 'Arm64') {
+            throw 'The Windows 11 runner must use ARM64.'
+          }
+          $target = go env GOOS GOARCH
+          if ($LASTEXITCODE -ne 0 -or ($target -join '/') -ne 'windows/arm64') {
+            throw 'Go must compile and execute natively for windows/arm64.'
+          }
+          go version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Record native SMB mapping capabilities
+        id: mapping-baseline
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $mapping = Get-CimClass -Namespace 'ROOT/Microsoft/Windows/SMB' -ClassName 'MSFT_SmbMapping'
+          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+          try {
+            $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
+            [ordered]@{
+              MappingProperties = @($mapping.CimClassProperties | ForEach-Object {
+                @{ Name = $_.Name; Type = $_.CimType.ToString() }
+              })
+              GetMappingParameters = @((Get-Command Get-SmbMapping).Parameters.Keys | Sort-Object)
+              NewMappingParameters = @((Get-Command New-SmbMapping).Parameters.Keys | Sort-Object)
+              UserSID = $identity.User.Value
+              IsAuthenticated = $identity.IsAuthenticated
+              AuthenticationType = $identity.AuthenticationType
+              ImpersonationLevel = $identity.ImpersonationLevel.ToString()
+              IsAdministrator = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+            } | ConvertTo-Json -Depth 5 | Write-Output
+          } finally {
+            $identity.Dispose()
+          }
+          $mappingKeys = @(Get-SmbMapping | ForEach-Object { "$($_.LocalPath)|$($_.RemotePath)" })
+          $baseline = Join-Path $env:GITHUB_WORKSPACE '.tmp/windows-ci/smb-mappings-before.json'
+          ConvertTo-Json -InputObject $mappingKeys | Set-Content -LiteralPath $baseline -Encoding utf8
+
+      - name: Portable storage and SMB tests
+        shell: bash
+        run: |
+          .github/scripts/assert-every-test-ran.sh -count=1 -p=1 -timeout 5m \
+            ./packages/storage ./packages/smb ./packages/smb/internal/...
+
+      - name: Native SSPI and SMB mapping tests
+        shell: bash
+        run: |
+          .github/scripts/assert-every-test-ran.sh -count=1 -p=1 -timeout 10m \
+            ./packages/smb/windows
+
+      - name: Install the coverage gate
+        shell: bash
+        run: go install github.com/codetreker/go-cov/cmd/go-cov@v0.1.4-0.20260617124522-d6caf2759e33
+
+      - name: Windows helper subtree coverage
+        shell: bash
+        working-directory: packages/smb/windows
+        run: |
+          set -euo pipefail
+          export GOFLAGS="-count=1"
+          go-cov --ci --race=false --config ../../../.go-cov.toml \
+            --module-prefix github.com/codetreker/remote-fs/packages/smb/windows
+
+      - name: No SMB mapping left behind
+        if: ${{ !cancelled() && steps.mapping-baseline.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $baseline = Join-Path $env:GITHUB_WORKSPACE '.tmp/windows-ci/smb-mappings-before.json'
+          $before = @(Get-Content -LiteralPath $baseline -Raw | ConvertFrom-Json)
+          $after = @(Get-SmbMapping | ForEach-Object { "$($_.LocalPath)|$($_.RemotePath)" })
+          $remaining = @($after | Where-Object { $_ -notin $before })
+          if ($remaining.Count -ne 0) {
+            throw "SMB mappings outlived the tests: $($remaining -join ', ')"
+          }
+
   checks:
     name: build, format, links, contract and unit tests
     runs-on: ubuntu-24.04

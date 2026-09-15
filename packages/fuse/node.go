@@ -427,7 +427,7 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 // the same file.
 func (n *node) child(ctx context.Context, name string, mode uint32, nodeID uint64) *fs.Inode {
 	id := n.id.child(name, mode, nodeID)
-	if existing := n.GetChild(name); existing != nil && existing.StableAttr().Ino == id.ino {
+	if existing := n.GetChild(name); existing != nil && existing.StableAttr().Ino == id.ino && existing.StableAttr().Mode == mode&syscall.S_IFMT {
 		return existing
 	}
 	return n.NewInode(ctx, &node{volume: n.volume, id: id}, fs.StableAttr{Mode: mode, Ino: id.ino})

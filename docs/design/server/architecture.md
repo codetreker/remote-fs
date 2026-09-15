@@ -13,6 +13,7 @@ volume、保留文件与显式占有的权威持有者。将原生 storage 与�
 | **协议词汇**（`packages/transport/httprest`） | 请求 URL 的形状、响应体的形状；错误的名字取自 storage 契约的 errno 词汇。与 client 共用同一份。 | R-INT-9 |
 | **变更日志** | volume 里每一次改动的有序记录，由 storage 底下的 metastore 提供。请求处理拿到它就开出复制那三个操作；拿不到（`nil`）时，在已启用的操作授权通过后以 `ENOSYS` 拒绝它们。 | R-CON-1、R-CON-2 |
 | **storage** | 原生发布集成确定实际资源并执行最终转换。localstore 与 Azure 组合在 metastore 事务中记账；第三方实现须履行同一原生集成契约。 | R-INT-6、R-INT-13 |
+| **Windows 访问** | 显式命名启用、目录与 metadata-only 引用、共享模式、delete-pending、范围访问及原动作核对，由原生 authority 排序；HTTP 只传递完整结果。 | R-FS-9、R-CC-14、R-INT-14 |
 | **保留文件与 advisory** | FileSession 拥有当前对象引用，原生节点保留无名内容；独立 advisory coordinator 管理 flock/POSIX owner 与范围。 | R-FS-6 至 R-FS-8、R-CC-12、R-CC-13、R-WS-7 |
 | **文件占有**（`packages/locking`、`packages/storage/locked`） | 有限 S/X 授予、Session / Owner、动作核对与发布顺序；与同一 volume 绑定，重启通过持久证据恢复保护。 | R-CC-3、R-CC-6 至 R-CC-11 |
 
@@ -62,7 +63,7 @@ volume 路径以 `url.Values` 的转义走 query string，任意字节序列都�
 
 解析是严格的：query 解析不了、操作数缺失、同一个操作数出现两次、出现了这个操作不要的操作数，都是请求错误。这几种情况在 `url.Values` 里读出来都是空字符串，而空字符串是根。
 
-`Prefix` 为 `/v3/`，相对于 handler 被挂载的位置，挂到别处用 `http.StripPrefix`。v3 在既有 mutation barrier JSON 之外要求配对的锁授权方，并增加严格的控制消息与 mutation scope。server 不提供旧协议路由，client 同时验证路径版本与响应标记；旧服务端不能通过忽略 proof 接受受保护的修改。十三个 JSON POST 控制端点与 scope 编码见[文件锁协议](file-locks.md#http-v3-编码)，它们不把 capability 放入 query string。保留文件能力、Open 确认、动作历史、会话续期与 advisory 控制见[打开的文件](file-handles.md#五http复制与资源)。
+`Prefix` 为 `/v3/`，相对于 handler 被挂载的位置，挂到别处用 `http.StripPrefix`。v3 在既有 mutation barrier JSON 之外要求配对的锁授权方，并增加严格的控制消息与 mutation scope。server 不提供旧协议路由，client 同时验证路径版本与响应标记；旧服务端不能通过忽略 proof 接受受保护的修改。强 S/X 的十三个 JSON POST 控制端点与 scope 编码见[文件锁协议](file-locks.md#http-v3-编码)，它们不把 capability 放入 query string。保留文件能力、Open 确认、动作历史、会话续期与 advisory 控制见[打开的文件](file-handles.md#五http复制与资源)。Windows 能力使用严格 JSON POST `/v3/windows` 与 `/v3/windows-control`，保留 WindowsOpenIntent、动作 ID、已知 receipt 和独立 WindowsFailure；backend 缺少能力或未启用时明确失败，不用普通路径接口模拟。
 
 ## 三、响应的形状
 
@@ -182,7 +183,11 @@ HTTP handler 只接受实现 `storage.BoundedStorage` 的 volume。constructor �
 
 `MaxBodyBytes` 至少为 1024 字节，且必须小到可以计算四倍 response reservation；`MaxWriteBytes` 必须为正且不大于 `MaxBodyBytes`。request aggregate 至少容纳一份 `MaxBodyBytes`，response aggregate 至少容纳一份四倍 reservation。effective operation 与 waiter 上限都为正；option 的零值选择有界默认值。client 对所有 non-streaming operation 持有独立的 response operation、waiter 与 aggregate byte admission，见 [`../client/architecture.md`](../client/architecture.md)。
 
-内容替换的原子性由 storage 保证（R-CON-3），请求处理不参与。
+Windows 数据请求继续使用数据预算；会话、动作核对和清理走 client 与 server 各自独立的 `windowsControls` 池。每个池使用现有 `MaxConcurrentLockControls`、`MaxWaitingLockControls` 与 `MaxInFlightResponseBytes` 设置，实例与普通 response、lock-control 池分开。Windows 控制因此可以在普通响应占用之外保留额外数据；这些池不是一个合并的全局 byte cap。
+
+Windows control request 仍受 16 KiB 控制 body 限制，response 使用独立的 `windowsControlResponseLimit()`。该函数取最坏 receipt envelope 与状态 envelope 编码长度的较大者；receipt 的固定 metadata／reference 结构之外，加上 `6 * (3 * WindowsMaxNameInfoBytes + 4 * WindowsMaxLinkTargetBytes + 1024)`，覆盖三个名字路径、两组 target／suffix 和诊断的 JSON 转义。每次操作预留该 response ceiling 的四倍，直到解码和验证完成。`MaxBodyBytes` 小于完整控制结果上限时，Windows 能力检查、EnableWindows 与 NewWindowsSession 拒绝；不能先打开引用，再让结果因为 ordinary body 设置过小而无法核对。
+
+内容替换的原子性由 storage 保证（R-CON-3），请求处理不参与；跨多个请求的应用调用保证单位仍按 R-CON-5【未决】处理。
 
 ## 七、storage 的位置
 

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"syscall"
 	"time"
 
@@ -66,6 +67,9 @@ func (s *Store) Reserve(ctx context.Context, path string, size int64) (metastore
 		node, found, err := s.lookup(ctx, tx, parent.ID, name)
 		if err != nil {
 			return err
+		}
+		if found && node.Mode&fs.ModeSymlink != 0 {
+			return syscall.ELOOP
 		}
 		if found && node.IsDir() {
 			return syscall.EISDIR
@@ -246,6 +250,9 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 	if err != nil {
 		return err
 	}
+	if found && node.Mode&fs.ModeSymlink != 0 {
+		return syscall.ELOOP
+	}
 	if found && node.IsDir() {
 		return syscall.EISDIR
 	}
@@ -276,7 +283,7 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 		// Modified rather than Created, because the name held this node before the commit. The
 		// commit that makes the file records Created instead: a replica told that a name it has
 		// never held was modified would have to invent the entry the event describes.
-		if err := s.recordChanged(ctx, tx, node.ID); err != nil {
+		if err := s.recordChanged(ctx, tx, node); err != nil {
 			return err
 		}
 	} else if err := s.createCommitted(ctx, tx, parent, name, object); err != nil {

@@ -72,8 +72,9 @@ func (f *openFile) Stat(ctx context.Context) (storage.Attr, error) {
 }
 
 func (f *openFile) ReadAt(ctx context.Context, offset int64, length int) (storage.FileRead, error) {
-	if offset < 0 || length < 0 {
-		return storage.FileRead{}, syscall.EINVAL
+	ctx = metastore.WithFileIO(ctx, metastore.WindowsIO{Offset: offset, Length: int64(length)})
+	if err := storage.CheckWindowsRange(offset, int64(length)); err != nil {
+		return storage.FileRead{}, err
 	}
 	if !f.options.Read {
 		return storage.FileRead{}, syscall.EBADF
@@ -102,7 +103,7 @@ func (f *openFile) ReadAt(ctx context.Context, offset int64, length int) (storag
 		if err != nil {
 			return storage.FileRead{}, err
 		}
-		body, err := f.body(ctx, node, missing)
+		body, err := f.session.storage.fileBody(ctx, node, missing)
 		if isOnly(err, syscall.ENOENT) {
 			release()
 			missing = node.Content
@@ -122,7 +123,7 @@ func (f *openFile) ReadAt(ctx context.Context, offset int64, length int) (storag
 	return storage.FileRead{}, fmt.Errorf("retained file changed during every content read: %w", syscall.EAGAIN)
 }
 
-func (f *openFile) body(ctx context.Context, node metastore.FileState, missing metastore.Key) ([]byte, error) {
+func (s *Storage) fileBody(ctx context.Context, node metastore.FileState, missing metastore.Key) ([]byte, error) {
 	if node.Content == "" {
 		if node.Size != 0 {
 			return nil, fmt.Errorf("retained file has bytes without an object: %w", syscall.EIO)
@@ -132,7 +133,7 @@ func (f *openFile) body(ctx context.Context, node metastore.FileState, missing m
 	if node.Content == missing {
 		return nil, fmt.Errorf("retained file names a missing object: %w", syscall.EIO)
 	}
-	body, err := f.session.storage.objects.(BoundedObjects).GetBounded(ctx, string(node.Content), max(node.Size, 1))
+	body, err := s.objects.(BoundedObjects).GetBounded(ctx, string(node.Content), max(node.Size, 1))
 	if err != nil {
 		if isOnly(err, syscall.ENOENT) {
 			return nil, err
@@ -149,6 +150,7 @@ func (f *openFile) body(ctx context.Context, node metastore.FileState, missing m
 }
 
 func (f *openFile) WriteAt(ctx context.Context, offset int64, data []byte) (storage.Attr, error) {
+	ctx = metastore.WithFileIO(ctx, metastore.WindowsIO{Offset: offset, Length: int64(len(data)), Write: true})
 	if offset < 0 {
 		return storage.Attr{}, syscall.EINVAL
 	}
@@ -174,6 +176,7 @@ func (f *openFile) WriteAt(ctx context.Context, offset int64, data []byte) (stor
 }
 
 func (f *openFile) Truncate(ctx context.Context, size int64) (storage.Attr, error) {
+	ctx = metastore.WithFileIO(ctx, metastore.WindowsIO{Write: true, Truncate: true, Size: size})
 	if size < 0 {
 		return storage.Attr{}, syscall.EINVAL
 	}
@@ -223,7 +226,7 @@ func (f *openFile) mutate(ctx context.Context, size func(int64) int64, patch fun
 		if err != nil {
 			return storage.Attr{}, err
 		}
-		body, err := f.body(ctx, node, missing)
+		body, err := f.session.storage.fileBody(ctx, node, missing)
 		if isOnly(err, syscall.ENOENT) {
 			release()
 			missing = node.Content
@@ -330,7 +333,7 @@ func (f *openFile) Sync(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		_, err = f.body(ctx, node, missing)
+		_, err = f.session.storage.fileBody(ctx, node, missing)
 		release()
 		if !isOnly(err, syscall.ENOENT) {
 			return err

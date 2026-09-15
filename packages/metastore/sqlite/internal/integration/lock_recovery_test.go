@@ -311,7 +311,9 @@ func historicalLeaseRows(t *testing.T, path string) map[string][][]any {
 	for table, query := range map[string]string{
 		"backing_store": `SELECT * FROM backing_store ORDER BY singleton`,
 		"volumes":       `SELECT * FROM volumes ORDER BY id`,
-		"nodes": `SELECT id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content
+		"nodes": `SELECT id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec,
+			windows_creation_sec, windows_creation_nsec, windows_change_sec, windows_change_nsec,
+			windows_attributes, windows_link_target, content
 			FROM nodes ORDER BY id`,
 		"entries":         `SELECT * FROM entries ORDER BY volume, parent, name`,
 		"objects":         `SELECT * FROM objects ORDER BY key`,

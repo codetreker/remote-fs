@@ -7,12 +7,34 @@ import (
 	"syscall"
 )
 
+// MaxChangePayloadBytes bounds the sum of all variable-length fields in one change.
+const MaxChangePayloadBytes = 512 << 10
+
 // ChangePayloadLengths declares the variable-length fields of one change before those
-// fields are retained in a result.
+// fields are retained in a result. Notification counts its canonical encoded bytes.
 type ChangePayloadLengths struct {
-	Name     int64
-	FromName int64
-	Content  int64
+	Name         int64
+	FromName     int64
+	Content      int64
+	Notification int64
+}
+
+// Check enforces the producer bound before any payload is loaded or committed.
+func (l ChangePayloadLengths) Check() error {
+	remaining := int64(MaxChangePayloadBytes)
+	for _, length := range []int64{l.Name, l.FromName, l.Content, l.Notification} {
+		if length < 0 {
+			return fmt.Errorf("negative change payload length: %w", syscall.EIO)
+		}
+		if length > remaining {
+			return fmt.Errorf("change payload exceeds the %d-byte bound: %w", MaxChangePayloadBytes, syscall.EFBIG)
+		}
+		remaining -= length
+	}
+	if l.Notification > MaxNotificationBytes {
+		return fmt.Errorf("notification exceeds encoded byte bound: %w", syscall.EFBIG)
+	}
+	return nil
 }
 
 // ChangeResult retains one page of changes under a caller-defined byte charge. The charge
@@ -20,7 +42,7 @@ type ChangePayloadLengths struct {
 // a transport format.
 //
 // A producer reserves each change from its scalar fields and payload lengths before loading
-// or copying Name, From.Name, or Node.Content. A result that cannot fit the next change may
+// or copying Name, From.Name, Node.Content, or Notification. A result that cannot fit the next change may
 // end a non-empty page before it; a change that cannot fit an otherwise empty result fails
 // the whole result with EFBIG. Any producer error must be passed to Fail, because a partial
 // sequence of changes cannot be presented as the complete answer to Since.
@@ -105,10 +127,10 @@ func (r *ChangeResult) Reserve(meta Change, lengths ChangePayloadLengths) (*Chan
 }
 
 func validateChangeMeta(meta Change, lengths ChangePayloadLengths) error {
-	if lengths.Name < 0 || lengths.FromName < 0 || lengths.Content < 0 {
-		return fmt.Errorf("a change carries a negative payload length: %w", syscall.EIO)
+	if err := lengths.Check(); err != nil {
+		return err
 	}
-	if len(meta.Name) != 0 || (meta.From != nil && len(meta.From.Name) != 0) || (meta.Node != nil && len(meta.Node.Content) != 0) {
+	if meta.Notification != nil || len(meta.Name) != 0 || (meta.From != nil && len(meta.From.Name) != 0) || (meta.Node != nil && len(meta.Node.Content) != 0) {
 		return fmt.Errorf("a change reservation already retains variable-length payload: %w", syscall.EINVAL)
 	}
 	if meta.From == nil && lengths.FromName != 0 {
@@ -164,14 +186,14 @@ type ChangeReservation struct {
 }
 
 // Commit supplies the fields whose lengths were charged by Reserve.
-func (r *ChangeReservation) Commit(name, fromName []byte, content Key) error {
+func (r *ChangeReservation) Commit(name, fromName []byte, content Key, notification []byte) error {
 	if r == nil || r.result == nil || r.committed {
 		return fmt.Errorf("a change reservation can be committed exactly once: %w", syscall.EINVAL)
 	}
-	if int64(len(name)) != r.lengths.Name || int64(len(fromName)) != r.lengths.FromName || int64(len(content)) != r.lengths.Content {
+	if int64(len(name)) != r.lengths.Name || int64(len(fromName)) != r.lengths.FromName || int64(len(content)) != r.lengths.Content || int64(len(notification)) != r.lengths.Notification {
 		return r.result.fail(fmt.Errorf(
-			"a change payload has lengths (%d, %d, %d) after (%d, %d, %d) were reserved: %w",
-			len(name), len(fromName), len(content), r.lengths.Name, r.lengths.FromName, r.lengths.Content, syscall.EIO,
+			"a change payload has lengths (%d, %d, %d, %d) after (%d, %d, %d, %d) were reserved: %w",
+			len(name), len(fromName), len(content), len(notification), r.lengths.Name, r.lengths.FromName, r.lengths.Content, r.lengths.Notification, syscall.EIO,
 		))
 	}
 	if r.result.failure != nil {
@@ -184,6 +206,13 @@ func (r *ChangeReservation) Commit(name, fromName []byte, content Key) error {
 	}
 	if change.Node != nil {
 		change.Node.Content = Key(strings.Clone(string(content)))
+	}
+	if len(notification) != 0 {
+		n, err := DecodeNotification(change, notification)
+		if err != nil {
+			return r.result.fail(err)
+		}
+		change.Notification = n
 	}
 	r.committed = true
 	r.result.pending = false

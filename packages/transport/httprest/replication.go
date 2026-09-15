@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"syscall"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
@@ -154,6 +155,10 @@ type Change struct {
 
 	// Node is what the name holds afterwards, and absent for a removal.
 	Node *Node `json:"node,omitempty"`
+
+	// Notification carries canonical historical facts, including the subject and
+	// former ancestry of a removal whose Node is absent.
+	Notification []byte `json:"notification"`
 }
 
 // ChangeOf renders c for the wire. A kind outside the vocabulary is refused rather than
@@ -162,6 +167,10 @@ func ChangeOf(c metastore.Change) (*Change, error) {
 	wire, err := changeShapeOf(c)
 	if err != nil {
 		return nil, err
+	}
+	wire.Notification, err = metastore.EncodeNotification(c)
+	if err != nil {
+		return nil, fmt.Errorf("the change at position %d has invalid notification facts: %w", c.Position, err)
 	}
 	if err := wire.check(); err != nil {
 		return nil, fmt.Errorf("the change at position %d cannot be sent: %w", c.Position, err)
@@ -184,15 +193,8 @@ func changeShapeOf(c metastore.Change) (*Change, error) {
 	return wire, nil
 }
 
-// UnmarshalJSON decodes a change and refuses one that does not describe an outcome.
-//
-// The three refusals are what stands between a damaged message and a replica that records
-// it as fact. A kind this side does not know cannot be applied at all. A change that lost
-// its node decodes into a zero Node — mode 0 has no type bits, so it reads as a regular
-// file of length zero dated the epoch — and a replica would then report a directory as an
-// empty file and never learn otherwise. A rename that lost its source leaves the node
-// behind at its old name for good, because the change that would have emptied it has
-// already been consumed.
+// UnmarshalJSON rejects invalid row shapes and bounds the notification payload.
+// Metastore validates its canonical facts before a caller can advance the replica cursor.
 func (c *Change) UnmarshalJSON(data []byte) error {
 	type change Change
 	var decoded change
@@ -238,13 +240,21 @@ func (c Change) check() error {
 			return err
 		}
 	}
+	if len(c.Notification) == 0 {
+		return fmt.Errorf("the change at position %d has no notification facts: %w", c.Position, syscall.EIO)
+	}
+	if len(c.Notification) > metastore.MaxNotificationBytes {
+		return fmt.Errorf("the change at position %d exceeds the notification byte bound: %w", c.Position, syscall.EFBIG)
+	}
 	return nil
 }
 
-// Metastore returns the change c carries. Every Change this package produces has passed
-// check, so the kind is in the vocabulary and the optional members are the ones its kind
-// takes.
-func (c Change) Metastore() metastore.Change {
+// Metastore validates the historical facts against the replication row before returning
+// either as committed metadata.
+func (c Change) Metastore() (metastore.Change, error) {
+	if err := c.check(); err != nil {
+		return metastore.Change{}, err
+	}
 	change := metastore.Change{
 		Position: metastore.Position(c.Position),
 		Kind:     kindsByName[c.Kind],
@@ -258,7 +268,12 @@ func (c Change) Metastore() metastore.Change {
 		node := c.Node.Metastore()
 		change.Node = &node
 	}
-	return change
+	notification, err := metastore.DecodeNotification(change, c.Notification)
+	if err != nil {
+		return metastore.Change{}, fmt.Errorf("the change at position %d has invalid notification facts: %w", c.Position, err)
+	}
+	change.Notification = notification
+	return change, nil
 }
 
 // Row is metastore.Row on the wire. The root carries parent 0 and no name.

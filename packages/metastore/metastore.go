@@ -477,6 +477,9 @@ type Change struct {
 
 	// Node is what the name holds afterwards, and nil for Removed.
 	Node *Node
+
+	// Notification preserves the facts needed to observe historical directory changes.
+	Notification *Notification
 }
 
 // Location is a name in a directory.

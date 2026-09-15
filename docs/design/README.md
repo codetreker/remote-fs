@@ -57,6 +57,7 @@ docs/design/
   client/
     README.md             client 目录的规则
     architecture.md       client 角色内部
+    windows-smb.md         Windows 本机 SMB 与盘符映射
 ```
 
 第二层按**角色**切分，不按包切分。一个角色一个目录；该角色内部若需要进一步展开，在自己的目录里增加文档，不影响另一个角色。

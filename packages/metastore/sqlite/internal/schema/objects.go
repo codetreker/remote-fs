@@ -74,11 +74,12 @@ func validateObjectRelationships(
 		scopeArgs = []any{*volume}
 	}
 	var invalidNodes int64
-	nodeArgs := append([]any{int64(fs.ModeType), StateReferenced}, scopeArgs...)
+	nodeArgs := append([]any{int64(fs.ModeType), int64(fs.ModeSymlink), int64(fs.ModeType), StateReferenced}, scopeArgs...)
 	if err := db.QueryRowContext(ctx, `
 		SELECT coalesce(sum(CASE
 			WHEN n.content IS NULL THEN
-				CASE WHEN typeof(n.size) != 'integer' OR n.size != 0 THEN 1 ELSE 0 END
+				CASE WHEN typeof(n.size) != 'integer' OR n.size < 0 OR
+ (n.size != 0 AND (n.mode & ?) != ?) THEN 1 ELSE 0 END
 			WHEN typeof(n.content) != 'text'
 				OR n.content = ''
 				OR typeof(n.mode) != 'integer'

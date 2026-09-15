@@ -20,7 +20,7 @@
 
 ## CI 工具链与缓存
 
-两个作业使用[共享 setup action](../.github/actions/setup-go/action.yml)固定 Go 1.26.8，并按作业、工具链、依赖和源码 SHA 保存 module／编译缓存；同作业前缀及经校验的旧快照可作为种子。缓存复用编译工作，`-count=1` 仍使每次调用实际执行测试。包分配、race、覆盖率和严格 verdict 门禁不变。缓存上传也消耗时间与空间，净收益须看完整作业；原因与兼容边界见[缓存决定](../.agents/notes/implemented/process/2026-09-09-refresh-ci-go-build-caches.md)。
+Linux 的 checks 与 mounted 作业使用[共享 setup action](../.github/actions/setup-go/action.yml)固定 Go 1.26.8，并按作业、工具链、依赖和源码 SHA 保存 module／编译缓存；同作业前缀及经校验的旧快照可作为种子。Windows 11 ARM64 作业使用同一工具链配置，把 Go cache、module 和临时目录放在仓库的 `.tmp/windows-ci` 内。缓存复用编译工作，`-count=1` 仍使每次调用实际执行测试。Linux race、包内覆盖率和严格 verdict 门禁保持独立；缓存净收益须看完整作业，原因与兼容边界见[缓存决定](../.agents/notes/implemented/process/2026-09-09-refresh-ci-go-build-caches.md)。
 
 ## CI 执行预算
 
@@ -161,6 +161,30 @@ native admission 用例用一个暂停的 Put 占满 Session 唯一的 data slot
 busy unmount 用例在真实挂载点保留打开的描述符和排他 flock，使 Unmount 失败；Done 仍未关闭，越过原始租期后续租继续、引用可读写、另一挂载点仍被 flock 拒绝。关闭描述符后实际 Unmount 与 Wait 成功，Session 只关闭一次，另一持有者才可取得锁。这个用例分别核对内核卸载结果和 native 会话状态，不能用一个模拟的关闭回调代替挂载生命周期。
 
 外部 kernel teardown 用例在挂载 Session 中额外打开一个未交给内核的真实 HTTP File，unlink 后先确认其字节仍被计费。通过外部 fusermount 拆掉本用例拥有的挂载，随后等待 Done/Wait，核对 Session 关闭一次、额外引用失效、detached 字节归还。这个引用从未进入内核，因此它的释放确实依赖整个 Session 清理，不能碰巧由逐文件 RELEASE 完成。
+
+## Windows 本机 SMB 与 authority
+
+[SMB 核心](../packages/smb)、[Windows helper](../packages/smb/windows)与[原生 WindowsStorage](../packages/metastore/sqlite/windows_authority_test.go)分别验证。协议与本机映射的运行结果不替代存储持久性；Linux 上的编译或测试也不构成 Windows 系统 SMB 客户端的验收。
+
+### 可移植协议与真实存储
+
+wire 测试覆盖命令长度、偏移、compound、contexts、签名与认证状态；SMB 核心覆盖 CREATE、目录、范围操作、已知动作错误、部分 lock batch、异步取消、通知队列和清理。WindowsStorage 在真实 SQLite、objectstore、localstore、locked、limited 与 HTTP 路径上核对命名启用、目录身份、共享模式、delete-pending、范围访问、原动作重放与配额。错误路径不能只证明返回了某个非零状态，还要检查原身份、内容、Applied 数量、容量和清理所有权。
+
+Notification 的测试分别验证不可变前后路径、目录符号链接所需的 Directory 标志、精确 ChangeMask、重命名分组、断续历史和全部 volume 共同执行的原始字段上限；超限修改不得先提交。WindowsNameInfo 的完整路径与 root／detached 状态、符号链接目标及 suffix 也进入 JSON 边界与结果核对；65792 字节和 32767 UTF-16 code units 两项界限覆盖启用、写入及目录移动后的后代路径。授权 SetLink 的回归还检查 NodeID、既有 S/X 保护、既有 grant 的 renew／release 与原 ResourceRef 的 reacquire，以及 fresh Resolve 对 reparse point 的拒绝。SMB 显式 ChangeTime=-1 和 FILE_NO_INTERMEDIATE_BUFFERING 在修改前返回不支持，不能用自动更新时间或 write-through 代替它们。HTTP Windows control 在 data admission 饱和后仍须能核对、取消与关闭；最坏路径和 symlink 结果不能超过控制响应的预算。Linux [类型转换回归](../packages/fuse/windows_type_linux_test.go)核对 Windows SetLink 后的链接类型与稳定 inode，同时保留 Linux Readlink／Symlinker 的 `EOPNOTSUPP`。
+
+### Windows 11 ARM64 原生入口
+
+[CI](../.github/workflows/ci.yml) 的 `windows-11-arm` 作业先检查 client edition、build 至少 26100、ARM64 OS，以及实际 `GOOS/GOARCH=windows/arm64`。它记录原生 SSPI 身份环境、mapping 的 documented properties 和 New/Get-SmbMapping 参数，不能用 runner 标签代替这些检查。测试使用原生普通 Go 构建；Windows ARM64 不运行 race，Linux 既有 race 作业继续运行。
+
+`TestNativeWindowsHTTPBridge` 经过真实 HTTP、SMB、SSPI 和系统 Map，观察创建参数被接受、实际盘符／UNC／DOS-device target，并检查所有观察到的 WRITE 都签名。阻塞 HTTP 确认期间，Win32 WriteFile 不得先返回成功；释放确认后检查实际字节。用例还检查打开句柄读取远端后续修改、负查询后的远端创建、目录项变化均在一秒内可见，HTTP 故障不变成旧数据或不存在，以及 busy unmount 保留服务、关闭句柄后的正常移除只结束映射。另一用例让当前已认证 SID 遇到不同 SID 策略，检查拒绝。
+
+这些原生用例的 backend 是[有界内存 authority](../packages/smb/windows/native_fixture_windows_test.go)，并非 Windows 上的 SQLite driver；它验证接入链路，不测持久提交与断电恢复。SQLite 的对应状态与恢复继续由 Linux 真实存储测试负责。R-CON-5 仍未决定跨请求应用大 I/O 的保证单位，不能把单个请求或小 payload 的成功扩大为这项保证。
+
+### 执行与收尾
+
+Windows portable storage／SMB 用例通过严格脚本以 `-count=1 -p=1 -timeout 5m` 运行，原生 helper 以 `-count=1 -p=1 -timeout 10m` 运行。Windows helper 子树的 go-cov 使用 `--ci --race=false` 与该子树的 module-prefix，保留仓库配置阈值；不设置 `-coverpkg`，不把其它包的执行算入 helper 覆盖率。
+
+映射测试保存运行前的 drive/UNC 集合，运行后拒绝新增残留。helper 自身另核对创建身份与 DOS-device target；这些是不同的检查，不把全机映射清空作为清理。失败返回的非 nil Mapping 必须留给调用方继续收尾，未知创建不授权删除观察到的盘符。一次 Windows 运行只有在原生用例、覆盖率及映射收尾真实执行并通过后才可报告验收成功。
 
 ## 请求中断与修改结果
 
@@ -374,9 +398,9 @@ durability 用例在修改操作返回成功后关闭并重新打开组合 store
 
 仓库内的 crash 验证区分 barrier fault injection、人工构造的 recovery residue 与真实子进程终止。已有用例在 mutation 返回成功、WAL 仍被 snapshot pin 住时发送 `SIGKILL`，覆盖未执行正常 Close 的整体恢复；同一文件中的真实发布用例分别在 Accept／Checkpoint 的 stage 创建、部分写入、完整写入、文件 fsync、rename 和 root fsync 六个位置终止进程，观察 final／stage、原 A/C 与重开的数据。构造零字节 stage 的历史回归不冒充在运行中的 checkpoint 系统调用之间杀进程，未返回成功的 Accept 也不被称为已确认修改。这些用例均不宣称模拟电源中断、设备写缓存或文件系统掉电恢复；真实 filesystem 与硬件是否兑现 crash-time `fsync` 语义仍是部署前提。
 
-## 挂载相关的测试是独立的一套
+## Linux 挂载相关的测试是独立的一套
 
-它们需要 `/dev/fuse`，且卸载不总是第一次就成功；CI 因此把这一层单独放进一个 job，并给 `go test` 一个比 job 更短的 `-timeout` —— 卡住的卸载要留下 goroutine 栈，而不是被超时静默杀掉。单元测试必须在任何地方都能跑 —— 那是它们真的会被跑的前提。
+它们需要 `/dev/fuse`，且卸载不总是第一次就成功；CI 因此把这一层单独放进一个 job，并给 `go test` 一个比 job 更短的 `-timeout` —— 卡住的卸载要留下 goroutine 栈，而不是被超时静默杀掉。不依赖挂载的逻辑测试在各自支持的平台独立运行；Windows 原生映射由上面的专用作业验证。
 
 **每一个挂载都在 `t.Cleanup` 里拆掉，拆不掉就让这一轮失败。** 留在机器上的挂载点或 FUSE 连接会拖垮之后的每一次运行，而留下它的那一轮通常已经报告成功了。会挂载的两个包的 `TestMain` 因此都走 `fusetest.Run`：它在跑用例之前把 `TMPDIR` 指到一个本次运行专用的目录，跑完只报告那个目录下面还挂着的东西。
 

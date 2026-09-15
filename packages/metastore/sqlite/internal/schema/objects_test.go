@@ -2,6 +2,7 @@ package schema
 
 import (
 	"errors"
+	"io/fs"
 	"strings"
 	"syscall"
 	"testing"
@@ -50,5 +51,20 @@ func TestLegacyObjectsCannotInventDeletionAuthority(t *testing.T) {
 				t.Fatalf("got %v, want EIO describing %q", err, test.diagnostic)
 			}
 		})
+	}
+}
+
+func TestObjectRelationshipsAllowInlineSymlinkBytes(t *testing.T) {
+	db := testDatabase(t, 0)
+	volume, root := testVolume(t, db, "links")
+	node, key := testFile(t, db, volume, root, "link", 0, false)
+	execute(t, db, `UPDATE nodes SET mode=?,size=6,content=NULL WHERE id=?`, int64(fs.ModeSymlink|0777), node)
+	execute(t, db, `DELETE FROM objects WHERE key=?`, key)
+	if err := validateObjectRelationships(t.Context(), db, &volume); err != nil {
+		t.Fatalf("symlink has no object: %v", err)
+	}
+	execute(t, db, `UPDATE nodes SET mode=420 WHERE id=?`, node)
+	if err := validateObjectRelationships(t.Context(), db, &volume); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("regular file bytes have no object: %v", err)
 	}
 }

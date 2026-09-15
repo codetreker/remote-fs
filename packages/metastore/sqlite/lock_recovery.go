@@ -97,7 +97,7 @@ func (s *Store) configureLeaseRecoveryLocked(ctx context.Context, config LeaseRe
 		return err
 	}
 	s.leaseRecovery = recovery
-	return nil
+	return s.configureWindowsRecovery(ctx, recovery)
 }
 
 func (r *LeaseRecovery) open(ctx context.Context, config LeaseRecoveryConfig) error {

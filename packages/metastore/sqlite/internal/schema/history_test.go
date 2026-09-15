@@ -2,6 +2,9 @@ package schema
 
 import (
 	"errors"
+	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/changes"
+	"io/fs"
 	"strings"
 	"syscall"
 	"testing"
@@ -39,7 +42,7 @@ func TestHistoryRejectsDiscontinuousOrMalformedChanges(t *testing.T) {
 
 func TestHistoricalLogValidatesShapeWithoutPredecessorColumn(t *testing.T) {
 	db := testDatabase(t, 2)
-	execute(t, db, `INSERT INTO volumes VALUES(1,'legacy',1,0)`)
+	execute(t, db, `INSERT INTO volumes(id,name,root,used) VALUES(1,'legacy',1,0)`)
 	execute(t, db, `INSERT INTO logs VALUES(1,'old-history',4,0,0)`)
 	execute(t, db, `INSERT INTO changes (position,volume,kind,parent,name,recorded_sec,recorded_nsec)
 		VALUES(4,1,1,1,X'66',0,0)`)
@@ -52,5 +55,26 @@ func TestHistoricalLogValidatesShapeWithoutPredecessorColumn(t *testing.T) {
 	execute(t, db, `UPDATE changes SET recorded_nsec='bad'`)
 	if err := validateVersionTwoLogIntegrity(t.Context(), db, &id); !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), "invalid SQLite storage classes") {
 		t.Fatalf("historical scalar was coerced: %v", err)
+	}
+}
+
+func TestHistoryAcceptsSymlinkFactsAndRejectsObjectContent(t *testing.T) {
+	db := testDatabase(t, 0)
+	volume, root := testVolume(t, db, "links")
+	node, _ := testFile(t, db, volume, root, "link", 0, false)
+	tx := testTransaction(t, db)
+	change := metastore.Change{Kind: metastore.Created, Parent: root, Name: []byte("link"), Node: &metastore.Node{ID: node, Mode: fs.ModeSymlink | 0777, Size: 6}, Notification: &metastore.Notification{SubjectID: node, SubjectKind: fs.ModeSymlink, ChangeMask: metastore.ChangeName, After: &metastore.LocationFacts{Ancestors: []metastore.DirectoryAncestor{{DirectoryID: root}}, LeafName: []byte("link")}}}
+	if err := changes.Record(t.Context(), tx, volume, change); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateLogIntegrity(t.Context(), db, &volume); err != nil {
+		t.Fatalf("valid symlink history: %v", err)
+	}
+	execute(t, db, `UPDATE changes SET content='object'`)
+	if err := validateLogIntegrity(t.Context(), db, &volume); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("symlink with object: %v", err)
 	}
 }

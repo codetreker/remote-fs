@@ -509,9 +509,14 @@ func TestSnapshotKeepalivesContinueWhileFrameAdmissionWaits(t *testing.T) {
 
 func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 	change := metastore.Change{
-		Position: 7, Kind: metastore.Renamed, Parent: 1, Name: []byte{0xff, 0x00, 'n'},
+		Position: 7, Kind: metastore.Renamed, Parent: 1, Name: []byte{0xff, 'n'},
 		From: &metastore.Location{Parent: 2, Name: []byte("from")},
 		Node: &metastore.Node{ID: 3, Mode: 0o644, Size: 5, Content: "object"},
+		Notification: &metastore.Notification{
+			SubjectID: 3, Directory: false, ChangeMask: metastore.ChangeName,
+			Before: &metastore.LocationFacts{Ancestors: []metastore.DirectoryAncestor{{DirectoryID: 1}, {DirectoryID: 2, Name: []byte("directory")}}, LeafName: []byte("from")},
+			After:  &metastore.LocationFacts{Ancestors: []metastore.DirectoryAncestor{{DirectoryID: 1}}, LeafName: []byte{0xff, 'n'}},
+		},
 	}
 	wireChange, err := ChangeOf(change)
 	if err != nil {
@@ -531,13 +536,18 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 			t.Fatal(err)
 		}
 		meta := change
+		notification, err := metastore.EncodeNotification(change)
+		if err != nil {
+			t.Fatal(err)
+		}
+		meta.Notification = nil
 		name, fromName, content := meta.Name, meta.From.Name, meta.Node.Content
 		meta.Name = []byte{}
 		from, node := *meta.From, *meta.Node
 		from.Name, node.Content = []byte{}, ""
 		meta.From, meta.Node = &from, &node
 		reservation, fits, reserveErr := result.Reserve(meta, metastore.ChangePayloadLengths{
-			Name: int64(len(name)), FromName: int64(len(fromName)), Content: int64(len(content)),
+			Name: int64(len(name)), FromName: int64(len(fromName)), Content: int64(len(content)), Notification: int64(len(notification)),
 		})
 		if delta == -1 {
 			if !errors.Is(reserveErr, syscall.EFBIG) || fits || reservation != nil {
@@ -548,7 +558,7 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 		if reserveErr != nil || !fits {
 			t.Fatalf("change under exact bound: fits=%v err=%v", fits, reserveErr)
 		}
-		if err := reservation.Commit(name, fromName, content); err != nil {
+		if err := reservation.Commit(name, fromName, content, notification); err != nil {
 			t.Fatal(err)
 		}
 	}

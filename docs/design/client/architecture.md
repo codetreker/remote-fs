@@ -1,8 +1,8 @@
 # client 角色
 
-volume 的使用者。持有一份 remote storage，把 volume 呈现为本地目录，并维持这一呈现所需的全部本地状态。
+volume 的使用者。持有 remote storage，通过 Linux FUSE 呈现为本地目录，或通过独立的 Windows 本机 SMB package 呈现为网络驱动器。宿主持有远端身份与各呈现入口的生命周期。
 
-本文只写 client 内部。基础 storage、保留文件、锁控制与 RPC 的边界见 [`../architecture.md`](../architecture.md)。
+本文只写 client 内部。基础 storage、保留文件、锁控制与 RPC 的边界见 [`../architecture.md`](../architecture.md)。Windows 的 SSPI、SMB、盘符映射与 authority 接口见 [Windows 本机 SMB](windows-smb.md)；下文的副本、内核 inode 与 FUSE 生命周期描述 Linux 路径。
 
 ## 一、内部构成
 
@@ -12,7 +12,8 @@ volume 的使用者。持有一份 remote storage，把 volume 呈现为本地�
 | **显式锁控制** | HTTP client 实现锁 Service，调用方保留 Session / Owner 与原动作身份，以 `WithScope` 构造独立、不可变的修改 proof 集合。控制请求具有独立预算。 | R-CC-3、R-CC-6 至 R-CC-11、R-INT-3 |
 | **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：`Stat` 与 `List` 走本地那份元数据副本，其余走远端。副本是一份 SQLite（`packages/metastore/sqlite` 的 `Replica`），由变更流喂着。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
 | **挂载呈现层** `packages/fuse` | 把一份 storage 呈现为本地目录。持有 FileSession、对象引用与内核 owner 的映射；文件以 direct I/O 逐次读写。仅 Linux。 | R-FS-1、R-CON-1~3、R-ERR-1、R-ERR-2、R-WS-5、R-INT-3、R-INT-8 |
-| **生命周期** | 挂载的建立与拆除。 | R-WS-2 |
+| **Windows 呈现层** `packages/smb`、`packages/smb/windows` | 通过 loopback SMB 3.1.1、SSPI 与当前用户盘符映射访问 WindowsStorage；变更来源由宿主注入。 | R-FS-9、R-CC-14、R-INT-8、R-INT-14 |
+| **生命周期** | 宿主分别拥有挂载、SMB export、server 与系统映射的建立和拆除。 | R-WS-2 |
 
 ```
    程序 ──▶ 内核 VFS
@@ -162,7 +163,7 @@ storage 契约有模式与两个时间的写入口，也有整个 volume 的容�
 
 ### 符号链接
 
-基础 volume 不创建符号链接，也不提供 readlink。第三方实现可以报告已有链接，挂载层按属性如实呈现：
+基础 volume 的路径 API 不创建符号链接，也不提供 readlink。WindowsFile.SetLink 可以在 authority 内把受控对象转换为链接；第三方实现也可以报告已有链接。FUSE 按属性呈现链接类型，类型转换后同一节点仍保留稳定 inode：
 
 | 对一个符号链接做 | 结果 |
 |---|---|
@@ -172,7 +173,7 @@ storage 契约有模式与两个时间的写入口，也有整个 volume 的容�
 | `rm` | 删掉链接本身，它指向的文件不动 |
 | 改名 | 搬动链接本身 |
 
-于是**不存在「以链接的名字拿到它指向的那个文件」这条路径**。答不出指向哪里就报 EOPNOTSUPP，不报 EINVAL —— 后者的意思是「这不是一个链接」。
+上述限制属于 Linux FUSE 入口：Readlink 与 Symlinker 仍返回 EOPNOTSUPP，不能从正确的 lstat 类型推导出链接解析或创建已经实现。Windows 的 reparse 行为由 [SMB 接入](windows-smb.md#目录观察与符号链接)单独描述。
 
 ## 七、容量
 
@@ -233,7 +234,7 @@ volume 报出自己的容量，挂载呈现层把它换算成内核要的块数�
 
 ## 十一、部署形态
 
-作为库嵌入集成方既有的 daemon service，或作为独立二进制运行（R-INT-1、R-INT-4）。作为库时不注册信号处理、不写标准输出、不调用进程退出、不修改进程级设置、包加载时不产生副作用（R-INT-2）；日志只写入调用方给定的目的地，未给定则丢弃。
+Linux client 作为库嵌入集成方既有的 daemon service，或作为独立二进制运行（R-INT-1、R-INT-4）。Windows SMB 接入由独立 package 嵌入宿主，系统映射只在显式调用 Map／Unmount 时改变。作为库时不注册信号处理、不写标准输出、不调用进程退出、不修改进程级设置、包加载时不产生副作用（R-INT-2）；日志只写入调用方给定的目的地，未给定则丢弃。
 
 独立 client 用 `-max-file-size`、`-file-session-lease` 与 `-file-session-history` 配置文件会话，默认分别为 1 GiB、30 秒与 1 分钟。`-timeout` 默认 30 秒，约束单次远端交换或文件清理尝试；健康会话中的阻塞 advisory 等待可以跨多次交换。
 

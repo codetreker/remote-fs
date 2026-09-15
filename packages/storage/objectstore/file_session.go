@@ -448,6 +448,10 @@ func (s *Storage) CloseFileSessions() error {
 	for fs := range s.fileSessions {
 		sessions = append(sessions, fs)
 	}
+	windows := make([]*windowsSession, 0, len(s.windowsSessions))
+	for ws := range s.windowsSessions {
+		windows = append(windows, ws)
+	}
 	s.fileMu.Unlock()
 	for _, fs := range sessions {
 		fs.startClose()
@@ -455,6 +459,11 @@ func (s *Storage) CloseFileSessions() error {
 	var errs []error
 	for _, fs := range sessions {
 		errs = append(errs, fs.Close(context.Background()))
+	}
+	for _, ws := range windows {
+		ctx, cancel := ws.operationContext(ws.cleanup)
+		errs = append(errs, ws.Close(ctx))
+		cancel()
 	}
 	if err := errors.Join(errs...); err != nil {
 		return fmt.Errorf("closing retained file sessions: %w", err)

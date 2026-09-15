@@ -63,6 +63,22 @@ func Record(ctx context.Context, tx *sql.Tx, volume int64, change metastore.Chan
 		return err
 	}
 
+	notification, err := metastore.EncodeNotification(change)
+	if err != nil {
+		return err
+	}
+
+	lengths := metastore.ChangePayloadLengths{Name: int64(len(change.Name)), Notification: int64(len(notification))}
+	if change.From != nil {
+		lengths.FromName = int64(len(change.From.Name))
+	}
+	if change.Node != nil {
+		lengths.Content = int64(len(change.Node.Content))
+	}
+	if err := lengths.Check(); err != nil {
+		return err
+	}
+
 	var fromParent, fromName any
 	if change.From != nil {
 		fromParent, fromName = change.From.Parent, change.From.Name
@@ -102,11 +118,11 @@ func Record(ctx context.Context, tx *sql.Tx, volume int64, change metastore.Chan
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO changes (position, previous_position, volume, kind, parent, name, from_parent, from_name,
 		                     node, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content,
-		                     recorded_sec, recorded_nsec)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                     recorded_sec, recorded_nsec, notification)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		position, previous, volume, kind, change.Parent, change.Name, fromParent, fromName,
 		node, mode, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec, content,
-		sec, nsec)
+		sec, nsec, notification)
 	if err != nil {
 		return err
 	}

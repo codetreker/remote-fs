@@ -79,12 +79,12 @@ func ReadPage(
 				stoppedAtCapacity = true
 				break
 			}
-			var name, fromName []byte
+			var name, fromName, notification []byte
 			var content sql.NullString
 			if err := tx.QueryRowContext(ctx, `
-					SELECT name, from_name, content FROM changes
+					SELECT name, from_name, content, notification FROM changes
 					WHERE volume = ? AND position = ?`, volume, int64(change.Position)).Scan(
-				&name, &fromName, &content,
+				&name, &fromName, &content, &notification,
 			); err != nil {
 				rows.Close()
 				return metastore.Retention{}, err
@@ -93,7 +93,7 @@ func ReadPage(
 				rows.Close()
 				return metastore.Retention{}, err
 			}
-			if err := reservation.Commit(name, fromName, metastore.Key(content.String)); err != nil {
+			if err := reservation.Commit(name, fromName, metastore.Key(content.String), notification); err != nil {
 				rows.Close()
 				return metastore.Retention{}, err
 			}

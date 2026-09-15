@@ -3,6 +3,7 @@ package schema
 import (
 	"context"
 	"errors"
+	"github.com/codetreker/remote-fs/packages/metastore"
 	"strings"
 	"syscall"
 	"testing"
@@ -37,6 +38,10 @@ func TestIntegrityWorkAndNameBytesHaveExactBounds(t *testing.T) {
 	id, root := testVolume(t, db, "workspace")
 	testFile(t, db, id, root, "name", 3, false)
 	testChange(t, db, id, root, "old")
+	var notificationBytes int64
+	if err := db.QueryRow(`SELECT length(notification) FROM changes`).Scan(&notificationBytes); err != nil {
+		t.Fatal(err)
+	}
 	for _, scope := range []*int64{nil, &id} {
 		if err := validateIntegrityWork(t.Context(), db, scope, 7); err != nil {
 			t.Fatalf("exact seven-row graph refused: %v", err)
@@ -44,10 +49,10 @@ func TestIntegrityWorkAndNameBytesHaveExactBounds(t *testing.T) {
 		if err := validateIntegrityWork(t.Context(), db, scope, 6); !errors.Is(err, syscall.EFBIG) {
 			t.Fatalf("work limit accepted seven rows: %v", err)
 		}
-		if err := validateIntegrityBytes(t.Context(), db, scope, 7, 5); err != nil {
+		if err := validateIntegrityBytes(t.Context(), db, scope, 7+notificationBytes, 5); err != nil {
 			t.Fatalf("exact seven-byte names refused: %v", err)
 		}
-		if err := validateIntegrityBytes(t.Context(), db, scope, 6, 5); !errors.Is(err, syscall.EFBIG) {
+		if err := validateIntegrityBytes(t.Context(), db, scope, 6+notificationBytes, 5); !errors.Is(err, syscall.EFBIG) {
 			t.Fatalf("change name escaped byte limit: %v", err)
 		}
 		if err := validateIntegrityBytes(t.Context(), db, scope, 3, 5); !errors.Is(err, syscall.EFBIG) {
@@ -55,15 +60,15 @@ func TestIntegrityWorkAndNameBytesHaveExactBounds(t *testing.T) {
 		}
 	}
 	execute(t, db, `UPDATE changes SET from_name=X'6d6f766564'`)
-	if err := validateIntegrityBytes(t.Context(), db, &id, 11, 5); !errors.Is(err, syscall.EFBIG) {
+	if err := validateIntegrityBytes(t.Context(), db, &id, 11+notificationBytes, 5); !errors.Is(err, syscall.EFBIG) {
 		t.Fatalf("from_name escaped byte accounting: %v", err)
 	}
 	execute(t, db, `UPDATE changes SET from_name='text'`)
-	if err := validateIntegrityBytes(t.Context(), db, &id, 100, 5); !errors.Is(err, syscall.EIO) {
+	if err := validateIntegrityBytes(t.Context(), db, &id, 100+notificationBytes, 5); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("text from_name coerced to bytes: %v", err)
 	}
 	execute(t, db, `UPDATE entries SET name='text'`)
-	if err := validateIntegrityBytes(t.Context(), db, &id, 100, 5); !errors.Is(err, syscall.EIO) {
+	if err := validateIntegrityBytes(t.Context(), db, &id, 100+notificationBytes, 5); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("text entry name coerced to bytes: %v", err)
 	}
 }
@@ -130,5 +135,15 @@ func TestIntegrityCancellationPreservesTheCause(t *testing.T) {
 	}
 	if err := ValidateVolumeIntegrity(t.Context(), db, id, 1000, 1<<20); err != nil {
 		t.Fatalf("cancelled inspections damaged the volume: %v", err)
+	}
+}
+
+func TestIntegrityRejectsAggregateChangePayloadOverflow(t *testing.T) {
+	db := testDatabase(t, 0)
+	volume, root := testVolume(t, db, "payload")
+	testChange(t, db, volume, root, "removed")
+	execute(t, db, `UPDATE changes SET content=?`, strings.Repeat("x", metastore.MaxChangePayloadBytes))
+	if err := validateIntegrityBytes(t.Context(), db, &volume, 8<<20, 5); !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("aggregate payload overflow: %v", err)
 	}
 }

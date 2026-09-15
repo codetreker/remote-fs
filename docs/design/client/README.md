@@ -2,7 +2,7 @@
 
 本目录承载 **client 角色**的内部设计。
 
-client 是 volume 的使用者：持有一份 remote storage，把 volume 呈现为本地目录，并维持这一呈现所需的全部本地状态。角色边界与两条跨角色契约由 [`../architecture.md`](../architecture.md) 定义。
+client 是 volume 的使用者：持有一份 remote storage，把 volume 呈现为 Linux 本地目录或 Windows 网络驱动器，并维持这一呈现所需的全部本地状态。角色边界与两条跨角色契约由 [`../architecture.md`](../architecture.md) 定义。
 
 ## 本目录的规则
 
@@ -15,6 +15,7 @@ client 是 volume 的使用者：持有一份 remote storage，把 volume 呈现
 
 | 文件 | 内容 |
 |---|---|
-| `architecture.md` | client 的内部构成、组件职责、内部数据流 |
+| [`architecture.md`](architecture.md) | client 的内部构成、组件职责、内部数据流 |
+| [`windows-smb.md`](windows-smb.md) | Windows 本机 SMB、SSPI、盘符映射、保留对象与目录通知 |
 
 client 内部若需进一步展开，在本目录增加文档，不影响 server 目录。

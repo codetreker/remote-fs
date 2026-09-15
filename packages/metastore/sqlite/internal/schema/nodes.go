@@ -25,7 +25,7 @@ func validateNodeValuesVersion(ctx context.Context, db sqlvalue.Queryer, volume 
 		where = "WHERE "
 	}
 	args = append(args,
-		int64(math.MaxUint32), int64(fs.ModeType), int64(fs.ModeDir),
+		int64(math.MaxUint32), int64(fs.ModeType), int64(fs.ModeDir), int64(fs.ModeSymlink),
 		int64(fs.ModeType), int64(fs.ModeDir), int64(fs.ModeType),
 	)
 	retainedNodeValues := ""
@@ -35,7 +35,7 @@ func validateNodeValuesVersion(ctx context.Context, db sqlvalue.Queryer, volume 
 	var invalid int64
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*) FROM nodes `+where+`(
-			mode < 0 OR mode > ? OR (mode & ?) NOT IN (0, ?) OR size < 0 OR
+			mode < 0 OR mode > ? OR (mode & ?) NOT IN (0, ?, ?) OR size < 0 OR
 			atime_nsec < 0 OR atime_nsec >= 1000000000 OR
 			mtime_nsec < 0 OR mtime_nsec >= 1000000000 OR
 			((mode & ?) = ? AND (size != 0 OR content IS NOT NULL)) OR
@@ -45,6 +45,9 @@ func validateNodeValuesVersion(ctx context.Context, db sqlvalue.Queryer, volume 
 	}
 	if invalid != 0 {
 		return fmt.Errorf("the database holds %d nodes with invalid metadata values: %w", invalid, syscall.EIO)
+	}
+	if version == schema.Version() {
+		return validateWindowsNodes(ctx, db, volume)
 	}
 	return nil
 }
@@ -135,7 +138,7 @@ func validateVersionOneNodeRelationships(ctx context.Context, db sqlvalue.Querye
 	return nil
 }
 
-// Linked nodes form one tree per volume. Detached nodes are regular non-root files with no
+// Linked nodes form one tree per volume. Detached nodes are non-root regular files or empty directories with no
 // incoming or outgoing entries. A nil volume validates every volume.
 func validateNodeRelationships(
 	ctx context.Context,
@@ -173,7 +176,7 @@ func validateNodeRelationshipsVersion(
 					WHEN n.id = ns.root OR (n.mode & ?) != 0 OR count(e.node) != 0
 					THEN 1 ELSE 0 END`
 		retainedEntry = ` OR parent.detached != 0 OR child.detached != 0`
-		nodeArgs = append(nodeArgs, int64(fs.ModeType))
+		nodeArgs = append(nodeArgs, int64(fs.ModeType&^(fs.ModeDir|fs.ModeSymlink)))
 	}
 	nodeArgs = append(nodeArgs, scopeArgs...)
 	rootArgs := append([]any{int64(fs.ModeDir)}, scopeArgs...)
@@ -383,7 +386,7 @@ func validateUsedAccounting(
 			invalidNodeValues++
 			continue
 		}
-		if fs.FileMode(mode).Type() != 0 || calculatedOverflow {
+		if (fs.FileMode(mode).Type() != 0 && fs.FileMode(mode).Type() != fs.ModeSymlink) || calculatedOverflow {
 			continue
 		}
 		if size > math.MaxInt64-calculatedUsed {

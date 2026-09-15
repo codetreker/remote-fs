@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io/fs"
 	"strconv"
 	"strings"
 	"syscall"
@@ -101,6 +102,8 @@ func (n sqliteNative) Discover(ctx context.Context, path string, adopt func(lock
 	})
 }
 
+// Issued capabilities keep their node identity through authorized reparse conversion.
+// Discovery admits only regular files.
 func (n sqliteNative) Guard(ctx context.Context, key locking.BackendKey, transition func() error) error {
 	id, err := n.store.backendNode(key)
 	if err != nil {
@@ -115,8 +118,8 @@ func (n sqliteNative) Guard(ctx context.Context, key locking.BackendKey, transit
 		if err != nil {
 			return err
 		}
-		if !node.Mode.IsRegular() {
-			return locking.Wrap(locking.UnsupportedTarget, "the resolved node is not a regular file", nil)
+		if !node.Mode.IsRegular() && node.Mode&fs.ModeSymlink == 0 {
+			return locking.Wrap(locking.UnsupportedTarget, "the resolved node is not a supported file identity", nil)
 		}
 		return nil
 	}, transition)
@@ -153,10 +156,12 @@ func (s *Store) backendNode(key locking.BackendKey) (int64, error) {
 }
 
 type volumeIntent struct {
-	kind    locking.MutationKind
-	paths   []string
-	node    int64
-	cleanup bool
+	kind       locking.MutationKind
+	paths      []string
+	node       int64
+	cleanup    bool
+	nodes      []int64
+	totalUsage bool
 }
 
 type volumePublication struct {
@@ -173,13 +178,34 @@ func (s *Store) mutateVolume(ctx context.Context, kind locking.MutationKind, pat
 }
 
 func (s *Store) prepareVolumePublication(ctx context.Context, tx *sql.Tx, intent volumeIntent) (*volumePublication, error) {
+	if err := s.checkWindowsMutationLocked(ctx, tx, intent); err != nil {
+		return nil, err
+	}
 	publication := &volumePublication{intent: intent}
+	if intent.totalUsage {
+		previous, err := s.used(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+		publication.previous = previous
+		for _, id := range intent.nodes {
+			node, err := s.nodeByID(ctx, tx, id)
+			if err != nil {
+				return nil, err
+			}
+			if !node.IsDir() {
+				publication.nodes = append(publication.nodes, id)
+				publication.targets = append(publication.targets, s.backendKey(id))
+			}
+		}
+		return publication, nil
+	}
 	if intent.node != 0 {
 		state, err := s.fileState(ctx, tx, intent.node)
 		if err != nil {
 			return nil, err
 		}
-		if state.Mode.IsRegular() && !state.Detached {
+		if !state.IsDir() && !state.Detached {
 			publication.nodes = []int64{state.ID}
 			publication.targets = []locking.BackendKey{s.backendKey(state.ID)}
 		}
@@ -199,19 +225,21 @@ func (s *Store) prepareVolumePublication(ctx context.Context, tx *sql.Tx, intent
 			return nil, err
 		}
 		nodes[i] = node
-		if node.Mode.IsRegular() && !seen[node.ID] {
+		if !seen[node.ID] {
 			seen[node.ID] = true
-			publication.nodes = append(publication.nodes, node.ID)
-			publication.targets = append(publication.targets, s.backendKey(node.ID))
+			if !node.IsDir() {
+				publication.nodes = append(publication.nodes, node.ID)
+				publication.targets = append(publication.targets, s.backendKey(node.ID))
+			}
 		}
 	}
 	switch intent.kind {
 	case locking.WriteMutation, locking.RemoveMutation:
-		if nodes[0].ID != 0 && nodes[0].Mode.IsRegular() {
+		if nodes[0].ID != 0 && !nodes[0].IsDir() {
 			publication.previous = nodes[0].Size
 		}
 	case locking.RenameMutation:
-		if nodes[1].ID != 0 && nodes[1].ID != nodes[0].ID && nodes[1].Mode.IsRegular() {
+		if nodes[1].ID != 0 && nodes[1].ID != nodes[0].ID && !nodes[1].IsDir() {
 			publication.previous = nodes[1].Size
 		}
 	}
@@ -219,7 +247,14 @@ func (s *Store) prepareVolumePublication(ctx context.Context, tx *sql.Tx, intent
 }
 
 func (s *Store) finishVolumePublication(ctx context.Context, tx *sql.Tx, publication *volumePublication) error {
-	if publication.intent.kind == locking.WriteMutation {
+	if publication.intent.totalUsage {
+		next, err := s.used(ctx, tx)
+		if err != nil {
+			return err
+		}
+		publication.next = next
+	}
+	if !publication.intent.totalUsage && publication.intent.kind == locking.WriteMutation {
 		var node metastore.Node
 		var err error
 		if publication.intent.node != 0 {
@@ -232,6 +267,15 @@ func (s *Store) finishVolumePublication(ctx context.Context, tx *sql.Tx, publica
 		}
 		publication.next = node.Size
 	}
+	if !publication.intent.totalUsage && publication.intent.kind == locking.WriteMutation {
+		if _, ok := metastore.FileIOFromContext(ctx); !ok {
+			for _, id := range publication.nodes {
+				if err := s.checkWindowsIOLocked(id, windowsActor(ctx), publication.previous, metastore.WindowsIO{Write: true, Length: max(publication.previous, publication.next)}); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	for i, id := range publication.nodes {
 		var present bool
 		if err := tx.QueryRowContext(ctx,
@@ -242,7 +286,7 @@ func (s *Store) finishVolumePublication(ctx context.Context, tx *sql.Tx, publica
 			publication.retired = append(publication.retired, publication.targets[i])
 		}
 	}
-	if publication.intent.node == 0 && (publication.intent.kind == locking.RemoveMutation || publication.intent.kind == locking.RenameMutation) && publication.previous != 0 {
+	if !publication.intent.totalUsage && publication.intent.node == 0 && (publication.intent.kind == locking.RemoveMutation || publication.intent.kind == locking.RenameMutation) && publication.previous != 0 {
 		// Retaining a removed destination keeps its current bytes charged. The
 		// removal still retires the named strong resource in the same publication.
 		var retained int64

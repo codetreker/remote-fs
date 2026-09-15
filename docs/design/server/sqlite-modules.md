@@ -6,11 +6,12 @@
 
 | 位置 | 拥有的职责 |
 |---|---|
-| `sqlite` 根 package | 公开类型与构造器、Store/Replica/Seeding、数据库 coordinator、事务发布与结果、文件 pin/domain、snapshot 与 reseed 生命周期、Close/Abort |
-| [`internal/schema`](../../../packages/metastore/sqlite/internal/schema) | 迁移资源、schema 准备和绑定、volume 完整性与 detached 恢复 SQL |
+| `sqlite` 根 package | 公开类型与构造器、Store/Replica/Seeding、数据库 coordinator、事务发布与结果、文件 pin/domain、Windows 会话与动作、命名启用、snapshot 与 reseed 生命周期、Close/Abort |
+| [`internal/schema`](../../../packages/metastore/sqlite/internal/schema) | 迁移资源、schema 准备和绑定、volume 完整性、Windows 持久字段与 detached 恢复 SQL |
 | [`internal/dbstate`](../../../packages/metastore/sqlite/internal/dbstate) | 数据库持久状态与启动证据、generation 和身份高水位的分配、校验及对账 |
 | [`internal/nativelease`](../../../packages/metastore/sqlite/internal/nativelease) | 原生文件所有权、lease anchor、持久证据编码和文件系统操作 |
-| [`internal/changes`](../../../packages/metastore/sqlite/internal/changes) | 日志窗口、记录、裁剪，以及有界 page/row 解码 |
+| [`internal/changes`](../../../packages/metastore/sqlite/internal/changes) | 日志窗口、记录、裁剪、不可变通知事实，以及有界 page/row 解码 |
+| [`internal/windowsaccess`](../../../packages/metastore/sqlite/internal/windowsaccess) | Windows 共享访问、delete-pending、范围批次与冲突状态，不拥有 SQL 事务 |
 | [`internal/sqlvalue`](../../../packages/metastore/sqlite/internal/sqlvalue) | SQL scalar、key、time 约定和所需的最小 query 接口 |
 | [`internal/sqlerr`](../../../packages/metastore/sqlite/internal/sqlerr) | 数据库错误的既有包装和分类 |
 | [`internal/integration`](../../../packages/metastore/sqlite/internal/integration) | 通过公开入口运行的测试与测试 fixture，无生产实现 |
@@ -19,11 +20,13 @@
 
 ## 原子操作的所有者
 
-根 package 的单一 `databaseCoordinator` 持有 commit admission、health fence、文件 pin 与 domain。运行期修改的顺序由这一处保持：准入、准备 SQL、trim/generation、健康与权限检查、Commit/见证、结果与 rollback/fencing。`dbstate` 与 `changes` 的 SQL 函数使用调用方交给它的 transaction 或 queryer，不取得另一份发布或关闭所有权。
+根 package 的单一 `databaseCoordinator` 持有 commit admission、health fence、文件 pin 与 domain。Windows domain 也由这份原生所有权约束；其访问检查在根 package 的有序操作中调用 windowsaccess，不能在 transport 另建互不相知的共享模式表。运行期修改的顺序由这一处保持：准入、准备 SQL、trim/generation、健康与权限检查、Commit/见证、结果与 rollback/fencing。`dbstate` 与 `changes` 的 SQL 函数使用调用方交给它的 transaction 或 queryer，不取得另一份发布或关闭所有权。
 
 `schema.Prepare` 的 schema 迁移、绑定、验证与恢复继续使用原来的一个事务。根 package 把 `durableOpen` 投影成普通准备数据，包含是否存在见证；`CommitWitness` 本身不进入 schema 组件，见证发布仍由根 package 在提交后执行。
 
-根 `log.go` 用节点查询组装完整的 `metastore.Change`，再交给 `changes.Record`。日志组件不回调 Store 来补充身份。snapshot 的取得、事务结果与资源释放仍由根 package 拥有；`Seeding` 在原有生命周期内持有 commit admission，不因目录拆分提前释放。
+根 `log.go` 与通知捕获代码在修改的权威状态下组装完整的 `metastore.Change`，再交给 `changes.Record`。Notification 的前后位置、祖先身份、Directory 标志与 ChangeMask 和相应修改一起提交；Record 与 decoder 对全部 volume 执行同一 Change 的 512 KiB 原始变长字段总量界限，独立于 Windows 命名 policy；Notification 另有自己的编码上限。日志组件不在发送时反查当前 Store 来补历史身份。snapshot 的取得、事务结果与资源释放仍由根 package 拥有；`Seeding` 在原有生命周期内持有 commit admission，不因目录拆分提前释放。
+
+Windows 命名 policy 版本随 volume 持久保存；启用在原生发布门内扫描与验证既有名字，再提交状态和动作结果。policy 1 使用固定 Unicode 15.0 simple uppercase，拒绝无效 UTF-8、不可表示字符、保留设备名、超长 component 与同目录比较键冲突；完整路径同时受 65792 原始字节和 32767 UTF-16 code units 界限，启用、后续写入及目录改名在提交前校验，移动目录时检查后代路径。未启用的 volume 保留字节名字行为。Windows 时间、DOS attributes 和符号链接目标进入节点持久状态，旧 Windows 会话不能借 reopen 重新取得原引用。
 
 SQL lease recovery 与 `LeaseRecovery` 留在根 package，原生 evidence I/O 在 `nativelease`。保留文件仍先退役再排空、回收；后端与 authority 的锁顺序、各阶段 context 和关闭失败时的所有权规则继续由原来的拥有者执行。
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"syscall"
 
+	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
@@ -100,6 +101,25 @@ func validateIntegrityBytes(
 	version int,
 ) error {
 	remaining := maxIntegrityBytes
+	if version == schema.Version() {
+		where := ""
+		args := []any{}
+		if volume != nil {
+			where = " WHERE volume=?"
+			args = append(args, *volume)
+		}
+		var bytes, invalid int64
+		if err := db.QueryRowContext(ctx, `SELECT coalesce(sum(CASE WHEN typeof(windows_link_target)='blob' THEN length(windows_link_target) ELSE 0 END),0),count(CASE WHEN typeof(windows_link_target)!='blob' THEN 1 END) FROM nodes`+where, args...).Scan(&bytes, &invalid); err != nil {
+			return err
+		}
+		if invalid != 0 || bytes < 0 {
+			return fmt.Errorf("invalid Windows link target payload: %w", syscall.EIO)
+		}
+		if bytes > remaining {
+			return fmt.Errorf("Windows link targets exceed the integrity byte limit: %w", syscall.EFBIG)
+		}
+		remaining -= bytes
+	}
 	entryWhere := ""
 	changeWhere := ""
 	entryArgs := []any{}
@@ -144,10 +164,14 @@ func validateIntegrityBytes(
 		return nil
 	}
 
+	notificationColumns := ""
+	if version >= 3 {
+		notificationColumns = ", typeof(notification), length(notification), COALESCE(length(CAST(content AS BLOB)),0)"
+	}
 	rows, err = db.QueryContext(ctx, `
 		SELECT
 			typeof(name), CASE WHEN typeof(name) = 'blob' THEN length(name) END,
-			typeof(from_name), CASE WHEN typeof(from_name) = 'blob' THEN length(from_name) END
+			typeof(from_name), CASE WHEN typeof(from_name) = 'blob' THEN length(from_name) END`+notificationColumns+`
 		FROM changes `+changeWhere, changeArgs...)
 	if err != nil {
 		return err
@@ -155,9 +179,36 @@ func validateIntegrityBytes(
 	for rows.Next() {
 		var nameType, fromNameType string
 		var nameLength, fromNameLength sql.NullInt64
-		if err := rows.Scan(&nameType, &nameLength, &fromNameType, &fromNameLength); err != nil {
+		var notificationType string
+		var notificationLength, contentLength int64
+		fields := []any{&nameType, &nameLength, &fromNameType, &fromNameLength}
+		if version >= 3 {
+			fields = append(fields, &notificationType, &notificationLength, &contentLength)
+		}
+		if err := rows.Scan(fields...); err != nil {
 			rows.Close()
 			return err
+		}
+
+		if version >= 3 {
+			if notificationType != "blob" || notificationLength <= 0 {
+				rows.Close()
+				return fmt.Errorf("invalid notification storage: %w", syscall.EIO)
+			}
+			if notificationLength > metastore.MaxNotificationBytes || notificationLength > remaining {
+				rows.Close()
+				return fmt.Errorf("notification exceeds integrity byte limit: %w", syscall.EFBIG)
+			}
+			if err := (metastore.ChangePayloadLengths{Name: nameLength.Int64, FromName: fromNameLength.Int64, Content: contentLength, Notification: notificationLength}).Check(); err != nil {
+				rows.Close()
+				return err
+			}
+			if contentLength > remaining-notificationLength {
+				rows.Close()
+				return fmt.Errorf("change payload exceeds integrity byte limit: %w", syscall.EFBIG)
+			}
+			remaining -= contentLength
+			remaining -= notificationLength
 		}
 		for _, field := range []struct {
 			name         string

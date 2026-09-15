@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 )
@@ -444,15 +445,30 @@ func TestIntegrityByteLimitAcceptsItsExactBoundary(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// Entry names and their Created log records each retain three bytes.
-	atBoundary, err := sqlite.OpenWithOptions(t.Context(), path, "workspace", 0, integrityByteOptions(6))
+	db := raw(t, path)
+	var boundary int64
+	if err := db.QueryRow(`SELECT
+		(SELECT coalesce(sum(length(name)), 0) FROM entries) +
+		(SELECT coalesce(sum(coalesce(length(name), 0) + coalesce(length(from_name), 0) +
+			coalesce(length(CAST(content AS BLOB)), 0) + length(notification)), 0) FROM changes) +
+		(SELECT coalesce(sum(length(windows_link_target)), 0) FROM nodes)`).Scan(&boundary); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if boundary <= 6 {
+		t.Fatalf("integrity byte total %d omitted notification payloads", boundary)
+	}
+	atBoundary, err := sqlite.OpenWithOptions(t.Context(), path, "workspace", 0, integrityByteOptions(boundary))
 	if err != nil {
 		t.Fatalf("opening at the exact integrity byte limit: %v", err)
 	}
 	if err := atBoundary.Close(); err != nil {
 		t.Fatal(err)
 	}
-	over, err := sqlite.OpenWithOptions(t.Context(), path, "workspace", 0, integrityByteOptions(5))
+	over, err := sqlite.OpenWithOptions(t.Context(), path, "workspace", 0, integrityByteOptions(boundary-1))
 	if err == nil {
 		over.Close()
 		t.Fatal("opening one byte above the integrity limit succeeded")
@@ -1122,7 +1138,7 @@ func TestRetainedIntegrityRefusesInvalidDetachedState(t *testing.T) {
 }
 
 func TestRetainedIntegrityRefusesDetachedDirectoriesAndRoots(t *testing.T) {
-	for _, node := range []string{"directory", "root"} {
+	for _, node := range []string{"nonempty directory", "named directory", "root"} {
 		for _, entry := range []string{"open", "status"} {
 			t.Run(node+"/"+entry, func(t *testing.T) {
 				f := newObjectIntegrityFixture(t)
@@ -1134,13 +1150,107 @@ func TestRetainedIntegrityRefusesDetachedDirectoriesAndRoots(t *testing.T) {
 					damageDatabase(t, f.path, `UPDATE nodes SET detached = 1
 						WHERE id = (SELECT root FROM volumes WHERE id = ?)`, f.volume)
 				} else {
+					if node == "nonempty directory" {
+						damageDatabase(t, f.path, `UPDATE entries SET parent =
+							(SELECT node FROM entries WHERE volume = ? AND name = CAST('directory' AS BLOB))
+							WHERE volume = ? AND name = CAST('copy' AS BLOB)`, f.volume, f.volume)
+					}
 					damageDatabase(t, f.path, `UPDATE nodes SET detached = 1 WHERE `+nodeNamed,
 						f.volume, "directory")
-					damageDatabase(t, f.path, `DELETE FROM entries WHERE volume = ? AND name = CAST('directory' AS BLOB)`, f.volume)
+					if node != "named directory" {
+						damageDatabase(t, f.path, `DELETE FROM entries WHERE volume = ? AND name = CAST('directory' AS BLOB)`, f.volume)
+					}
 				}
 				assertRetainedIntegrityFailure(t, f.path, store)
 			})
 		}
+	}
+}
+
+func TestSharedOpenPreservesDetachedEmptyDirectoryUntilExclusiveRecovery(t *testing.T) {
+	f := newObjectIntegrityFixture(t)
+	db := raw(t, f.path)
+	var directory int64
+	if err := db.QueryRow(`SELECT node FROM entries WHERE volume = ? AND name = CAST('directory' AS BLOB)`, f.volume).Scan(&directory); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	damageDatabase(t, f.path, `UPDATE nodes SET detached = 1 WHERE id = ?`, directory)
+	damageDatabase(t, f.path, `DELETE FROM entries WHERE node = ?`, directory)
+	store := open(t, f.path, "workspace", 100)
+	if _, err := store.ObjectStatus(t.Context()); err != nil {
+		t.Fatalf("empty retained directory failed integrity: %v", err)
+	}
+	space, err := store.Space(t.Context())
+	if err != nil || space.Used != 10 {
+		t.Fatalf("empty retained directory changed quota: %+v, %v", space, err)
+	}
+	snap, _, err := store.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	visible := 0
+	for {
+		rows, done, err := readRows(t.Context(), snap, 10)
+		if err != nil {
+			snap.Close()
+			t.Fatal(err)
+		}
+		for _, row := range rows {
+			visible++
+			if row.Node.ID == directory {
+				snap.Close()
+				t.Fatalf("snapshot exposed retained directory: %+v", row)
+			}
+		}
+		if done {
+			break
+		}
+	}
+	if err := snap.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if visible != 3 {
+		t.Fatalf("snapshot contained %d nodes, want root and two files", visible)
+	}
+	db = raw(t, f.path)
+	var retained int
+	if err := db.QueryRow(`SELECT count(*) FROM nodes WHERE id = ? AND detached = 1`, directory).Scan(&retained); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if retained != 1 {
+		t.Fatalf("shared open retained %d empty directories, want 1", retained)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
+		Database: f.path, Volume: "workspace", Allowance: 100,
+		SQLite: sqlite.DefaultOptions(), Locks: locking.DefaultOptions(), Initialize: true,
+	})
+	if err != nil {
+		t.Fatalf("exclusive empty-directory recovery: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := recovered.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	db = raw(t, f.path)
+	defer db.Close()
+	if err := db.QueryRow(`SELECT count(*) FROM nodes WHERE id = ?`, directory).Scan(&retained); err != nil {
+		t.Fatal(err)
+	}
+	space, err = recovered.Space(t.Context())
+	if retained != 0 || err != nil || space.Used != 10 {
+		t.Fatalf("recovered retained=%d space=%+v error=%v; want directory reaped and 10 used bytes", retained, space, err)
 	}
 }
 

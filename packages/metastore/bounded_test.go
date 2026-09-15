@@ -22,7 +22,7 @@ func TestChangeResultStopsBeforeAChangeThatBelongsInTheNextPage(t *testing.T) {
 	if err != nil || !fits {
 		t.Fatalf("reserve first change: fits=%v err=%v", fits, err)
 	}
-	if err := first.Commit([]byte("four"), nil, ""); err != nil {
+	if err := first.Commit([]byte("four"), nil, "", nil); err != nil {
 		t.Fatal(err)
 	}
 	if reservation, fits, err := result.Reserve(metastore.Change{}, metastore.ChangePayloadLengths{Name: 2}); err != nil || fits || reservation != nil {
@@ -42,7 +42,7 @@ func TestOversizedChangeInvalidatesEveryRetainedChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	reservation, _, err := result.Reserve(metastore.Change{}, metastore.ChangePayloadLengths{Name: 1})
-	if err != nil || reservation.Commit([]byte("a"), nil, "") != nil {
+	if err != nil || reservation.Commit([]byte("a"), nil, "", nil) != nil {
 		t.Fatalf("retain first change: %v", err)
 	}
 	if _, _, err := result.Reserve(metastore.Change{}, metastore.ChangePayloadLengths{Name: 5}); !errors.Is(err, syscall.EFBIG) {
@@ -72,7 +72,7 @@ func TestChangeResultOwnsChargedPayloadAndTimeInstants(t *testing.T) {
 	name, fromName := large[len(large)-3:len(large)-2], large[len(large)-2:len(large)-1]
 	contentBacking := strings.Repeat("unretained", 1<<17) + "c"
 	content := metastore.Key(contentBacking[len(contentBacking)-1:])
-	if err := reservation.Commit(name, fromName, content); err != nil {
+	if err := reservation.Commit(name, fromName, content, nil); err != nil {
 		t.Fatal(err)
 	}
 	changes, err := result.Changes()
@@ -198,7 +198,7 @@ func TestFailedPagesDiscardCommittedAndPendingResults(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !pending {
-			if err := change.Commit([]byte("x"), nil, ""); err != nil {
+			if err := change.Commit([]byte("x"), nil, "", nil); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -214,7 +214,7 @@ func TestFailedPagesDiscardCommittedAndPendingResults(t *testing.T) {
 		if got, fits, err := changes.Reserve(metastore.Change{}, metastore.ChangePayloadLengths{}); got != nil || fits || err != failure {
 			t.Fatalf("failed reserve = %v, %v, %v", got, fits, err)
 		}
-		if pending && change.Commit([]byte("x"), nil, "") != failure {
+		if pending && change.Commit([]byte("x"), nil, "", nil) != failure {
 			t.Fatal("pending change survived failure")
 		}
 

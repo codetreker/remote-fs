@@ -76,7 +76,8 @@ CREATE TABLE changes (
 	mtime_nsec        INTEGER,
 	content           TEXT,
 	recorded_sec      INTEGER NOT NULL,
-	recorded_nsec     INTEGER NOT NULL
+	recorded_nsec     INTEGER NOT NULL,
+	notification      BLOB NOT NULL
 );
 
 CREATE TABLE database_state (
@@ -122,6 +123,12 @@ CREATE TABLE nodes (
 	atime_nsec INTEGER NOT NULL,
 	mtime_sec  INTEGER NOT NULL,
 	mtime_nsec INTEGER NOT NULL,
+	windows_creation_sec INTEGER NOT NULL DEFAULT 0,
+	windows_creation_nsec INTEGER NOT NULL DEFAULT 0,
+	windows_change_sec INTEGER NOT NULL DEFAULT 0,
+	windows_change_nsec INTEGER NOT NULL DEFAULT 0,
+	windows_attributes INTEGER NOT NULL DEFAULT 0,
+	windows_link_target BLOB NOT NULL DEFAULT X'',
 	content    TEXT REFERENCES objects(key)
 	, detached INTEGER NOT NULL DEFAULT 0, content_revision INTEGER NOT NULL DEFAULT 1);
 
@@ -143,6 +150,7 @@ CREATE TABLE volumes (
 	id   INTEGER PRIMARY KEY AUTOINCREMENT,
 	name TEXT    NOT NULL UNIQUE,
 	root INTEGER NOT NULL,
-	used INTEGER NOT NULL
+	used INTEGER NOT NULL,
+	windows_name_version INTEGER NOT NULL DEFAULT 0
 );
 

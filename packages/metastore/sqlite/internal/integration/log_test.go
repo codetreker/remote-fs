@@ -17,7 +17,7 @@ import (
 
 func readChanges(ctx context.Context, log metastore.Log, after metastore.Position, limit int) ([]metastore.Change, metastore.Retention, error) {
 	result, err := metastore.NewChangeResult(64<<20, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
-		return 256 + lengths.Name + lengths.FromName + lengths.Content, nil
+		return 256 + lengths.Name + lengths.FromName + lengths.Content + lengths.Notification, nil
 	})
 	if err != nil {
 		return nil, metastore.Retention{}, err
@@ -32,11 +32,11 @@ func readChanges(ctx context.Context, log metastore.Log, after metastore.Positio
 
 func TestSinceRefusesAnOversizedStoredNameBeforeExposingAPartialPage(t *testing.T) {
 	store := open(t, database(t), "workspace", 0)
-	if err := store.Create(t.Context(), strings.Repeat("x", 1<<20)); err != nil {
+	if err := store.Create(t.Context(), strings.Repeat("x", 1024)); err != nil {
 		t.Fatal(err)
 	}
 	result, err := metastore.NewChangeResult(128, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
-		return lengths.Name + lengths.FromName + lengths.Content + 1, nil
+		return lengths.Name + lengths.FromName + lengths.Content + lengths.Notification + 1, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -73,7 +73,7 @@ func TestSinceRefusesLiveChangeCorruptionWithoutExposingAPartialPage(t *testing.
 			damageDatabase(t, path, test.damage)
 
 			result, err := metastore.NewChangeResult(1<<20, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
-				return 256 + lengths.Name + lengths.FromName + lengths.Content, nil
+				return 256 + lengths.Name + lengths.FromName + lengths.Content + lengths.Notification, nil
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -126,7 +126,7 @@ func TestSinceDoesNotHoldTheHealthGateWhileChargingAResult(t *testing.T) {
 				close(entered)
 			}
 			<-release
-			return 256 + lengths.Name + lengths.FromName + lengths.Content, nil
+			return 256 + lengths.Name + lengths.FromName + lengths.Content + lengths.Notification, nil
 		})
 	if err != nil {
 		t.Fatal(err)
