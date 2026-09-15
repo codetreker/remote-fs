@@ -162,6 +162,9 @@ func statusAction(r storage.WindowsActionResult, err error) uint32 {
 }
 
 func windowsIntent(r wire.CreateRequest) (storage.WindowsOpenIntent, error) {
+	// FILE_DISALLOW_EXCLUSIVE has no server-side meaning in SMB2 CREATE.
+	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/e8fb45c1-a03d-44ca-b7ae-47385cfd7997
+	r.Options &^= 0x00020000
 	if r.Options&0x8 != 0 {
 		return storage.WindowsOpenIntent{}, syscall.EOPNOTSUPP
 	}

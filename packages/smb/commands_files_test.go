@@ -649,3 +649,63 @@ func TestStorageFailuresKeepDistinctProtocolMeaning(t *testing.T) {
 		}
 	}
 }
+
+func TestProtocolNativeCreateDeclinesOptionalCaching(t *testing.T) {
+	c, session, tree, signer, file := compoundProtocol(t, false)
+	r := createCommand("file", 0x0012019f, 5)
+	r.Body[3] = 9
+	smbLE.PutUint32(r.Body[4:], 2)
+	smbLE.PutUint32(r.Body[28:], storage.WindowsDOSNormal)
+	smbLE.PutUint32(r.Body[32:], 7)
+	smbLE.PutUint32(r.Body[40:], 0x00020042)
+	r = requestContexts(t, r, []wire.CreateContext{{Name: []byte("DH2Q"), Data: make([]byte, 32)}, {Name: []byte("QFid")}})
+	decoded, err := r.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	withHint, err := windowsIntent(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded.Options &^= 0x00020000
+	withoutHint, err := windowsIntent(decoded)
+	if err != nil || withHint != withoutHint || withHint.Share != storage.WindowsShareAll || withHint.Kind != storage.WindowsRegularFile || withHint.Disposition != storage.WindowsOverwriteIf {
+		t.Fatalf("ignored option changed open intent: %+v %+v %v", withHint, withoutHint, err)
+	}
+	decoded.Options |= 0x00020008
+	if _, err := windowsIntent(decoded); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatal("ignored hint masked unsupported unbuffered access")
+	}
+	packet := requestPacket(wire.Header{Command: wire.Create, MessageID: 4, SessionID: session, TreeID: tree, Credits: 1}, r.Body)
+	if err := signer.Sign(packet); err != nil {
+		t.Fatal(err)
+	}
+	sendFrame(t, c, packet)
+	response := readFrame(t, c)
+	h, err := wire.ParseHeader(response)
+	if err != nil || h.Status != 0 || signer.Verify(response) != nil || len(response) < 152 || response[66] != 0 {
+		t.Fatalf("native CREATE response=%+v length=%d error=%v", h, len(response), err)
+	}
+	contextOffset := int(smbLE.Uint32(response[144:]))
+	contextLength := int(smbLE.Uint32(response[148:]))
+	if contextOffset != 152 || contextLength != 56 || len(response) != contextOffset+contextLength {
+		t.Fatalf("native CREATE contexts offset=%d length=%d", contextOffset, contextLength)
+	}
+	identity := response[contextOffset:]
+	if smbLE.Uint32(identity) != 0 || string(identity[16:20]) != "QFid" || smbLE.Uint64(identity[24:]) != file.attr.ID {
+		t.Fatal("CREATE granted durability or omitted authoritative file identity")
+	}
+	var id wire.FileID
+	copy(id[:], response[128:144])
+	closeBody := make([]byte, 24)
+	smbLE.PutUint16(closeBody, 24)
+	copy(closeBody[8:], id[:])
+	packet = requestPacket(wire.Header{Command: wire.Close, MessageID: 5, SessionID: session, TreeID: tree, Credits: 1}, closeBody)
+	_ = signer.Sign(packet)
+	sendFrame(t, c, packet)
+	response = readFrame(t, c)
+	h, err = wire.ParseHeader(response)
+	if err != nil || h.Status != 0 || signer.Verify(response) != nil || file.closes.Load() != 1 {
+		t.Fatalf("native CREATE handle did not close: %+v %v", h, err)
+	}
+}

@@ -70,7 +70,7 @@ Export 建立订阅并追到固定 checkpoint 后才可健康服务。首次 CHA
 
 宿主显式选择 `DefaultLimits` 或完整有效的 Limits。连接、会话、tree/open、请求、compound、create context、frame/I/O、枚举、通知和各阶段期限都有边界；文件会话另有有限历史与存续期。HTTP 数据与 Windows control 使用独立 admission，后者按完整属性路径、symlink 观察和错误 receipt 的最坏 JSON 编码计费。各池的 byte 设置不是一个合并的进程总额，宿主必须计入并存池的额外 retention；公式归[server 内存边界](../../../../docs/design/server/architecture.md#六请求与响应的内存边界)所有。
 
-映射请求 UseWriteThrough，SMB 不授予缓存 lease/oplock，并声明禁止离线缓存；不提供 durable/persistent handles、multichannel、跨连接恢复或 encryption。UseWriteThrough 的 forced-unit-access 语义与 `FILE_NO_INTERMEDIATE_BUFFERING` 不同，前者不能证明关闭了所有属性、negative 或目录缓存。系统全局缓存设置保持宿主环境原状；真实程序的同步确认、可见性与断线读取仍须验收。[SMB 客户端缓存设置](https://learn.microsoft.com/en-us/powershell/module/smbshare/set-smbclientconfiguration?view=windowsserver2025-ps)不能作为库私自改变机器策略的理由。
+映射请求 UseWriteThrough，SMB 不授予缓存 lease/oplock，并声明禁止离线缓存；不提供 durable/persistent handles、multichannel、跨连接恢复或 encryption。已知的可选 oplock、`RqLs`、`DHnQ` 与 `DH2Q` 请求不必使普通打开失败：authority 允许打开后，响应保持 oplock NONE 且不附带 lease／durable 授予 context。未知 create context 仍被拒绝。`FILE_DISALLOW_EXCLUSIVE` 按 SMB2 规则忽略，实际共享与访问检查保持不变；这不放宽 `FILE_NO_INTERMEDIATE_BUFFERING` 的不支持结果。UseWriteThrough 的 forced-unit-access 语义与 `FILE_NO_INTERMEDIATE_BUFFERING` 不同，前者不能证明关闭了所有属性、negative 或目录缓存。系统全局缓存设置保持宿主环境原状；真实程序的同步确认、可见性与断线读取仍须验收。[SMB 客户端缓存设置](https://learn.microsoft.com/en-us/powershell/module/smbshare/set-smbclientconfiguration?view=windowsserver2025-ps)不能作为库私自改变机器策略的理由。
 
 ## 备选方案
 
