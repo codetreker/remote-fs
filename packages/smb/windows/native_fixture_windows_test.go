@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http/httptest"
@@ -972,7 +973,19 @@ func (a *nativeAuthority) Since(ctx context.Context, after metastore.Position, l
 			content = c.Node.Content
 			lengths.Content = int64(len(content))
 		}
-		reservation, fits, err := result.Reserve(c, lengths)
+		meta := c
+		meta.Name, meta.Notification = nil, nil
+		if c.From != nil {
+			fromMeta := *c.From
+			fromMeta.Name = nil
+			meta.From = &fromMeta
+		}
+		if c.Node != nil {
+			nodeMeta := *c.Node
+			nodeMeta.Content = ""
+			meta.Node = &nodeMeta
+		}
+		reservation, fits, err := result.Reserve(meta, lengths)
 		if err != nil {
 			return retention, result.Fail(err)
 		}
@@ -1031,7 +1044,9 @@ func (s *nativeSnapshot) Next(ctx context.Context, limit int, result *metastore.
 	}
 	for count := 0; s.index < len(s.rows) && count < limit; count++ {
 		row := s.rows[s.index]
-		reservation, fits, err := result.Reserve(row, metastore.RowPayloadLengths{Name: int64(len(row.Name)), Content: int64(len(row.Node.Content))})
+		meta := row
+		meta.Name, meta.Node.Content = nil, ""
+		reservation, fits, err := result.Reserve(meta, metastore.RowPayloadLengths{Name: int64(len(row.Name)), Content: int64(len(row.Node.Content))})
 		if err != nil {
 			return false, result.Fail(err)
 		}
@@ -1091,4 +1106,122 @@ func (nativeUnsupportedLocks) QueryAction(context.Context, locking.OwnerRef, loc
 }
 func (nativeUnsupportedLocks) QueryGrant(context.Context, locking.OwnerRef, locking.GrantRef) (locking.GrantStatus, error) {
 	return locking.GrantStatus{}, syscall.EOPNOTSUPP
+}
+
+func TestNativeAuthorityDeliversHTTPEventsAndBoundedSnapshot(t *testing.T) {
+	a := newNativeAuthority()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	h, err := httprest.NewHandler(a, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(h)
+	defer func() {
+		h.Stop()
+		server.Close()
+		if err := h.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	}()
+	client, err := httprest.Dial(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := client.Subscribe(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	session, err := client.NewWindowsSession(ctx, storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := session.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	}()
+	action := func() storage.WindowsActionID {
+		status, err := session.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := storage.NewLockRequestID(status.ActionEpoch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	opened, err := session.Open(ctx, storage.WindowsOpenRequest{WindowsOpenIntent: storage.WindowsOpenIntent{Access: storage.WindowsAllAccess, Share: storage.WindowsShareAll, Disposition: storage.WindowsOverwriteIf, Kind: storage.WindowsRegularFile}, Lookup: storage.WindowsLookup{ParentID: 1, Name: "live.bin"}, Mode: 0644, DOSAttributes: storage.WindowsDOSNormal}, action())
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := sub.Next()
+	if err != nil {
+		t.Fatalf("create delivery: %v", err)
+	}
+	if created.Kind != metastore.Created || created.Node == nil || created.Node.ID != int64(opened.Attr.ID) || string(created.Name) != "live.bin" || created.Notification == nil || created.Notification.After == nil || string(created.Notification.After.LeafName) != "live.bin" {
+		t.Fatalf("created event: %+v", created)
+	}
+	if _, err := opened.File.WriteAt(ctx, 0, []byte("payload"), action()); err != nil {
+		t.Fatal(err)
+	}
+	modified, err := sub.Next()
+	if err != nil {
+		t.Fatalf("write delivery: %v", err)
+	}
+	if modified.Kind != metastore.Modified || modified.Position <= created.Position || modified.Node == nil || modified.Node.Size != 7 || modified.Notification.ChangeMask&metastore.ChangeContent == 0 {
+		t.Fatalf("modified event: %+v", modified)
+	}
+	if _, err := opened.File.Rename(ctx, storage.WindowsRenameRequest{Source: storage.WindowsLookup{ParentID: 1, Name: "live.bin", ExpectedID: opened.Attr.ID}, Destination: storage.WindowsLookup{ParentID: 1, Name: "renamed.bin"}}, action()); err != nil {
+		t.Fatal(err)
+	}
+	renamed, err := sub.Next()
+	if err != nil {
+		t.Fatalf("rename delivery: %v", err)
+	}
+	if renamed.Kind != metastore.Renamed || renamed.Position <= modified.Position || renamed.From == nil || string(renamed.From.Name) != "live.bin" || string(renamed.Name) != "renamed.bin" || string(renamed.Notification.Before.LeafName) != "live.bin" || string(renamed.Notification.After.LeafName) != "renamed.bin" {
+		t.Fatalf("renamed event: %+v", renamed)
+	}
+	for _, change := range []metastore.Change{created, modified, renamed} {
+		if err := metastore.ValidateNotification(change); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, bound := range []int64{int64(2 + len("renamed.bin")), int64(len("renamed.bin"))} {
+		snap, position, err := a.Snapshot(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if position != renamed.Position {
+			t.Fatalf("snapshot position=%d want%d", position, renamed.Position)
+		}
+		result, err := metastore.NewRowResult(bound, 0, func(_ int, row metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
+			if len(row.Name) != 0 || row.Node.Content != "" {
+				t.Fatal("snapshot charged retained payload")
+			}
+			return 1 + lengths.Name + lengths.Content, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		done, readErr := snap.Next(ctx, 8, result)
+		rows, resultErr := result.Rows()
+		if err := snap.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if bound == int64(len("renamed.bin")) {
+			if !errors.Is(readErr, syscall.EFBIG) || !errors.Is(resultErr, syscall.EFBIG) || len(rows) != 0 {
+				t.Fatalf("undersized snapshot: rows=%v errors=%v,%v", rows, readErr, resultErr)
+			}
+			continue
+		}
+		if readErr != nil || resultErr != nil || !done || len(rows) != 2 || string(rows[1].Name) != "renamed.bin" || rows[1].Node.ID != int64(opened.Attr.ID) || rows[1].Node.Size != 7 {
+			t.Fatalf("snapshot: done=%v rows=%+v errors=%v,%v", done, rows, readErr, resultErr)
+		}
+	}
+	if _, err := opened.File.Close(ctx, action()); err != nil {
+		t.Fatal(err)
+	}
 }
