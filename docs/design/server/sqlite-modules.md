@@ -6,8 +6,8 @@
 
 | 位置 | 拥有的职责 |
 |---|---|
-| `sqlite` 根 package | 公开类型与构造器、Store/Replica/Seeding、数据库 coordinator、事务发布与结果、文件 pin/domain、snapshot 与 reseed 生命周期、Close/Abort |
-| [`internal/schema`](../../../packages/metastore/sqlite/internal/schema) | 迁移资源、schema 准备和绑定、volume 完整性与 detached 恢复 SQL |
+| `sqlite` 根 package | 公开类型与构造器、Store/Replica/Seeding、数据库 coordinator、事务发布与结果、文件 pin/domain、原子 namespace、metadata、pending unlink、snapshot 与 reseed 生命周期、Close/Abort |
+| [`internal/schema`](../../../packages/metastore/sqlite/internal/schema) | 迁移资源、schema 准备和绑定、volume/metadata 完整性与已 detached 恢复 SQL |
 | [`internal/dbstate`](../../../packages/metastore/sqlite/internal/dbstate) | 数据库持久状态与启动证据、generation 和身份高水位的分配、校验及对账 |
 | [`internal/nativelease`](../../../packages/metastore/sqlite/internal/nativelease) | 原生文件所有权、lease anchor、持久证据编码和文件系统操作 |
 | [`internal/changes`](../../../packages/metastore/sqlite/internal/changes) | 日志窗口、记录、裁剪，以及有界 page/row 解码 |
@@ -25,6 +25,10 @@
 
 根 `log.go` 用节点查询组装完整的 `metastore.Change`，再交给 `changes.Record`。日志组件不回调 Store 来补充身份。snapshot 的取得、事务结果与资源释放仍由根 package 拥有；`Seeding` 在原有生命周期内持有 commit admission，不因目录拆分提前释放。
 
+中立能力继续位于根 package：atomic_open/node_references 把名字条件、初值、UseClaim、intent 与 retainedFile 创建放在同一有序操作；namespace/namespace_guards/namespace_revision 处理原始叶名、观察与 rename 输出槽位。reference_scope/reference_order 将 Scope 和控制转换绑定 native gate，metadata/timestamps 维护共同事实与指定 namespace。它们不建立第二套文件、owner 或发布 coordinator。
+
+pending_unlink 拥有 armed/pending 转换及有名删除；maintenance_accounting 在既有 gate 内绑定当前维护 chain 和初始化实际 Usage。活引用继续使用捕获的 cleanup hooks，恢复扫描跳过当前 incarnation；旧引用恢复才使用当前 chain。schema 只可在 Strong 初始化前回收已 detached 对象，有名 pending 的正常 Strong gate 由运行期恢复处理。
+
 SQL lease recovery 与 `LeaseRecovery` 留在根 package，原生 evidence I/O 在 `nativelease`。保留文件仍先退役再排空、回收；后端与 authority 的锁顺序、各阶段 context 和关闭失败时的所有权规则继续由原来的拥有者执行。
 
 ## 公开类型与内部值
@@ -37,7 +41,9 @@ SQL lease recovery 与 `LeaseRecovery` 留在根 package，原生 evidence I/O �
 
 ## 资源与测试归属
 
-当前 schema 版本为 5。[`internal/schema/migrations`](../../../packages/metastore/sqlite/internal/schema/migrations) 的 `0001` 至 `0005` 按序嵌入并重放，表、列与索引统一使用 volume 术语。可读的 schema golden 与 v2／v3 布局 fixture 位于 [`internal/integration/testdata`](../../../packages/metastore/sqlite/internal/integration/testdata)，使用相同标识；测试数据不参与运行时初始化。
+当前 schema 版本为 6。[`internal/schema/migrations`](../../../packages/metastore/sqlite/internal/schema/migrations) 的 `0001` 至 `0006` 按序嵌入并重放；1–5 保持既有内容，6 在旧布局 preflight 后转换 NodeKind、POSIX payload、可选时间、directory revision、pending 状态与历史属性。可读的 schema golden 与 v2／v3 布局 fixture 位于 [`internal/integration/testdata`](../../../packages/metastore/sqlite/internal/integration/testdata)，使用相同标识；测试数据不参与运行时初始化。
+
+节点与 retained changes 的 metadata/link-target 长度由 SQL triggers 同步计入 volumes.metadata_used，覆盖 detached 节点与历史副本；完整性检查验证 trigger/计数与实际合计，不靠读取当前节点补历史。Options.MaxMetadataBytes 默认每 volume 64 MiB，独立于内容 quota 和 integrity name-byte 工作预算；载入 payload 前先核对大小，增长越界失败，replica ingest 与裁剪/物理删除使用同一记账。
 
 当前 schema 的两个损坏矩阵在所属顶层测试中持有私有、不可变的健康数据库种子，每个子用例获得独立文件和连接。种子复制不是生产 schema 或恢复入口；完整 checkpoint、关闭与隔离检查由[测试准备规则](../../testing.md#sqlite-测试准备与隔离)约束。
 

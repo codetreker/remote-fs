@@ -14,7 +14,7 @@ import (
 
 func readRows(ctx context.Context, snap metastore.Snap, limit int) ([]metastore.Row, bool, error) {
 	result, err := metastore.NewRowResult(64<<20, 0, func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
-		return 192 + lengths.Name + lengths.Content, nil
+		return 192 + lengths.Name + lengths.Content + lengths.Metadata + lengths.Target, nil
 	})
 	if err != nil {
 		return nil, false, err
@@ -39,7 +39,7 @@ func TestSnapshotBoundedMakesAProductionErrorTerminalWithoutExposingPrefixRows(t
 	defer snap.Close()
 	newResult := func(max int64) *metastore.RowResult {
 		result, err := metastore.NewRowResult(max, 0, func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
-			return lengths.Name + lengths.Content + 1, nil
+			return lengths.Name + lengths.Content + lengths.Metadata + lengths.Target + 1, nil
 		})
 		if err != nil {
 			t.Fatal(err)

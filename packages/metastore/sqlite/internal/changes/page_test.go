@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func changeResult(t *testing.T, capacity int64) *metastore.ChangeResult {
@@ -77,7 +79,7 @@ func TestPageAnchorsRejectBrokenRetainedChains(t *testing.T) {
 		{"wrong oldest predecessor", `UPDATE changes SET previous_position=1 WHERE position=1`, "invalid position/predecessor"},
 		{"wrong trim anchor", `UPDATE logs SET trimmed_through=1 WHERE volume=1`, "trim anchor"},
 		{"untrimmed empty", `DELETE FROM changes`, "empty retained log"},
-		{"invalid metadata", `UPDATE changes SET mode=-1 WHERE position=2`, "invalid node metadata"},
+		{"invalid metadata", `UPDATE changes SET node_kind=-1 WHERE position=2`, "invalid node metadata"},
 		{"invalid payload", `UPDATE changes SET name=x'2e2e' WHERE position=2`, "invalid destination"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -242,5 +244,76 @@ func TestStoredPositionsRejectInvalidScalarsAndOrdering(t *testing.T) {
 	}
 	if _, _, _, err := storedPositionPair(db.QueryRow(`SELECT 1,'integer',0,'integer'`)); err == nil {
 		t.Fatal("closed database returned position pair")
+	}
+}
+
+func TestReadPageReservesMetadataBeforeDecodingItsEnvelope(t *testing.T) {
+	_, tx := logFixture(t)
+	appendLog(t, tx, 1)
+	execLogSQL(t, tx, `UPDATE changes SET metadata=zeroblob(128) WHERE position=1`)
+	for _, capacity := range []int64{127, 128} {
+		calls := 0
+		page, err := metastore.NewChangeResult(capacity, 0, func(_ int, change metastore.Change, l metastore.ChangePayloadLengths) (int64, error) {
+			calls++
+			if l.Metadata != 128 || change.Node == nil || len(change.Node.Metadata) != 0 {
+				t.Fatalf("uncharged metadata was exposed: %+v %+v", change, l)
+			}
+			return l.Metadata, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = ReadPage(t.Context(), tx, 1, 100, 0, 1, page)
+		want := syscall.EIO
+		if capacity == 127 {
+			want = syscall.EFBIG
+		}
+		if !errors.Is(err, want) || calls != 1 {
+			t.Fatalf("capacity=%d calls=%d error=%v want=%v", capacity, calls, err, want)
+		}
+		page.Fail(err)
+		if changes, gotErr := page.Changes(); changes != nil || !errors.Is(gotErr, want) {
+			t.Fatalf("invalid page exposed prefix=%+v error=%v", changes, gotErr)
+		}
+	}
+}
+
+func TestReadPageChargesMetadataAndLinkTargetTogether(t *testing.T) {
+	_, tx := logFixture(t)
+	value := fileChange(metastore.Created)
+	value.Node.Kind = storage.NodeSymlink
+	value.Node.Content = ""
+	value.Node.LinkTarget = []byte("target/path")
+	value.Node.Size = int64(len(value.Node.LinkTarget))
+	value.Node.Metadata = map[string]storage.OpaquePayload{"index.v1": {Version: []byte{1}, Data: []byte("retained")}}
+	encoded, err := storage.EncodeMetadata(value.Node.Metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Record(t.Context(), tx, 1, value); err != nil {
+		t.Fatal(err)
+	}
+	charge := int64(len(encoded) + len(value.Node.LinkTarget))
+	for _, capacity := range []int64{charge - 1, charge} {
+		page, err := metastore.NewChangeResult(capacity, 0, func(_ int, _ metastore.Change, l metastore.ChangePayloadLengths) (int64, error) {
+			return l.Metadata + l.Target, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = ReadPage(t.Context(), tx, 1, 100, 0, 1, page)
+		if capacity < charge {
+			if !errors.Is(err, syscall.EFBIG) {
+				t.Fatalf("under-budget page=%v", err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := page.Changes()
+		if err != nil || len(got) != 1 || string(got[0].Node.LinkTarget) != "target/path" || !reflect.DeepEqual(got[0].Node.Metadata, value.Node.Metadata) {
+			t.Fatalf("bounded event payload=%+v error=%v", got, err)
+		}
 	}
 }

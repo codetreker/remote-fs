@@ -21,6 +21,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/codetreker/remote-fs/packages/fuse/posix"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
@@ -251,7 +252,7 @@ func TestStorageMode(t *testing.T) {
 			if got := storageMode(c.mode); got != c.want {
 				t.Fatalf("storageMode(%o) = %v, want %v", c.mode, got, c.want)
 			}
-			if got := storageMode(c.mode); got&^storage.SettableMode != 0 {
+			if got := storageMode(c.mode); got&^posix.Settable != 0 {
 				t.Fatalf("storageMode(%o) = %v, which the contract will refuse", c.mode, got)
 			}
 		})
@@ -479,7 +480,7 @@ func TestTheChangeARequestAsksFor(t *testing.T) {
 	for _, c := range []struct {
 		name  string
 		in    gofuse.SetAttrIn
-		want  storage.AttrChange
+		want  attributeChange
 		errno syscall.Errno
 	}{
 		{
@@ -495,7 +496,7 @@ func TestTheChangeARequestAsksFor(t *testing.T) {
 			name: "chmod",
 			in: gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
 				Valid: gofuse.FATTR_MODE, Mode: syscall.S_IFREG | 0o640}},
-			want: storage.AttrChange{Mode: aMode(0o640)},
+			want: attributeChange{Mode: aMode(0o640)},
 		},
 		{
 			// The kernel keeps these three in the mode word beside the permission bits, and
@@ -505,7 +506,7 @@ func TestTheChangeARequestAsksFor(t *testing.T) {
 			in: gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
 				Valid: gofuse.FATTR_MODE,
 				Mode:  syscall.S_IFREG | syscall.S_ISUID | syscall.S_ISGID | syscall.S_ISVTX | 0o755}},
-			want: storage.AttrChange{
+			want: attributeChange{
 				Mode: aMode(0o755 | iofs.ModeSetuid | iofs.ModeSetgid | iofs.ModeSticky)},
 		},
 		{
@@ -516,7 +517,7 @@ func TestTheChangeARequestAsksFor(t *testing.T) {
 				Atimensec: uint32(chosen.Nanosecond()),
 				Mtime:     uint64(chosen.Unix()),
 				Mtimensec: uint32(chosen.Nanosecond())}},
-			want: storage.AttrChange{AccessTime: &chosen, ModTime: &chosen},
+			want: attributeChange{AttrChange: storage.AttrChange{AccessTime: &chosen, ModTime: &chosen}},
 		},
 		{
 			name: "utimensat with only the modification time",
@@ -524,7 +525,7 @@ func TestTheChangeARequestAsksFor(t *testing.T) {
 				Valid:     gofuse.FATTR_MTIME,
 				Mtime:     uint64(chosen.Unix()),
 				Mtimensec: uint32(chosen.Nanosecond())}},
-			want: storage.AttrChange{ModTime: &chosen},
+			want: attributeChange{AttrChange: storage.AttrChange{ModTime: &chosen}},
 		},
 		{
 			// The mount reports every node as belonging to whoever made the mount, so this
@@ -604,7 +605,7 @@ func TestAChangeTimeIsNotARequestOfItsOwn(t *testing.T) {
 
 func aMode(m iofs.FileMode) *iofs.FileMode { return &m }
 
-func sameChange(got, want storage.AttrChange) bool {
+func sameChange(got, want attributeChange) bool {
 	sameTime := func(a, b *time.Time) bool {
 		return (a == nil) == (b == nil) && (a == nil || a.Equal(*b))
 	}
@@ -612,7 +613,7 @@ func sameChange(got, want storage.AttrChange) bool {
 	return sameMode && sameTime(got.AccessTime, want.AccessTime) && sameTime(got.ModTime, want.ModTime)
 }
 
-func describeChange(c storage.AttrChange) string {
+func describeChange(c attributeChange) string {
 	parts := []string{}
 	if c.Mode != nil {
 		parts = append(parts, fmt.Sprintf("mode %v", *c.Mode))

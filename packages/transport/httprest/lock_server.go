@@ -20,7 +20,7 @@ const (
 )
 
 func configuredLockControlAdmission(active, waiting int) *bodyAdmission {
-	return newBodyAdmission(active, retainedResponseMultiplier*int64(active)*DefaultMaxLockControlBytes, waiting)
+	return newBodyAdmission(active, retainedResponseMultiplier*int64(active)*MaxFileControlBytes, waiting)
 }
 
 func checkLockControlLimits(active, waiting int) error {

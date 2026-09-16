@@ -19,7 +19,6 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/replicated"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 	"io"
-	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -32,7 +31,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-	"unsafe"
 )
 
 // TestMain runs the tests beneath a temporary directory of this run's own, so that a
@@ -145,9 +143,15 @@ func serveStorage(t *testing.T, volume storage.Storage, log metastore.Log) *volu
 }
 
 const (
-	fileStatNodeCall = string(httprest.OpFile) + ":" + string(storage.OpFileStatNode)
-	fileRenewCall    = string(httprest.OpFileControl) + ":" + string(storage.OpFileRenew)
-	fileCloseCall    = string(httprest.OpFileControl) + ":" + string(storage.OpFileClose)
+	fileStatNodeCall      = string(httprest.OpFile) + ":" + string(storage.OpFileStatNode)
+	fileRenewCall         = string(httprest.OpFileControl) + ":" + string(storage.OpFileRenew)
+	fileCloseCall         = string(httprest.OpFileControl) + ":" + string(storage.OpFileClose)
+	fileLookupCall        = string(httprest.OpFile) + ":" + string(storage.OpFileLookupAt)
+	fileReadDirectoryCall = string(httprest.OpFile) + ":" + string(storage.OpFileReadDirNode)
+	fileOpenNodeRefCall   = string(httprest.OpFile) + ":" + string(storage.OpFileOpenNodeRef)
+	fileScopeCall         = string(httprest.OpFileControl) + ":" + string(storage.OpFileScope)
+	fileAckCall           = string(httprest.OpFileControl) + ":" + string(storage.OpFileAck)
+	fileMutateNameCall    = string(httprest.OpFile) + ":" + string(storage.OpFileMutateName)
 )
 
 // calls counts the requests that reach the server, by operation.
@@ -455,115 +459,4 @@ func errnoOf(err error) syscall.Errno {
 		return errno
 	}
 	return 0
-}
-
-// SQLite stores regular files and directories. This metadata decorator preserves real
-// node identities and content lengths while exercising the public symbolic-link contract.
-type symlinkMetadata struct {
-	*objectstore.Storage
-	linkID uint64
-}
-
-func (s *symlinkMetadata) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
-	session, err := s.Storage.NewFileSession(ctx, options)
-	if err != nil {
-		return nil, err
-	}
-	return &symlinkFileSession{FileSession: session, metadata: s}, nil
-}
-
-type symlinkFileSession struct {
-	storage.FileSession
-	metadata *symlinkMetadata
-}
-
-func (s *symlinkFileSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
-	attr, err := s.FileSession.StatNode(ctx, id)
-	if err != nil {
-		return storage.Attr{}, err
-	}
-	return s.metadata.describe(attr), nil
-}
-
-func (s *symlinkFileSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
-	if err := options.CheckNode(id); err != nil {
-		return nil, err
-	}
-	if id == s.metadata.linkID {
-		return nil, syscall.ELOOP
-	}
-	return s.FileSession.OpenNode(ctx, id, options)
-}
-
-func (s *symlinkFileSession) OpenFile(ctx context.Context, name string, options storage.FileOpenOptions) (storage.File, error) {
-	if err := options.Check(); err != nil {
-		return nil, err
-	}
-	attr, err := s.metadata.Stat(ctx, name)
-	if err == nil && attr.ID == s.metadata.linkID {
-		if options.ExpectedID != 0 && options.ExpectedID != attr.ID {
-			return nil, syscall.ESTALE
-		}
-		if options.Create && options.Exclusive {
-			return nil, syscall.EEXIST
-		}
-		return nil, syscall.ELOOP
-	}
-	if err != nil && !errors.Is(err, syscall.ENOENT) {
-		return nil, err
-	}
-	return s.FileSession.OpenFile(ctx, name, options)
-}
-
-func (s *symlinkMetadata) describe(attr storage.Attr) storage.Attr {
-	if attr.ID == s.linkID {
-		attr.Mode = fs.ModeSymlink | 0o777
-	}
-	return attr
-}
-
-func (s *symlinkMetadata) Stat(ctx context.Context, name string) (storage.Attr, error) {
-	attr, err := s.Storage.Stat(ctx, name)
-	if err != nil {
-		return storage.Attr{}, err
-	}
-	return s.describe(attr), nil
-}
-
-func (s *symlinkMetadata) List(ctx context.Context, name string) ([]storage.Entry, error) {
-	entries, err := s.Storage.List(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-	for i := range entries {
-		entries[i].Attr = s.describe(entries[i].Attr)
-	}
-	return entries, nil
-}
-
-func (s *symlinkMetadata) ListBounded(ctx context.Context, name string, result *storage.ListResult) error {
-	if result == nil {
-		return s.Storage.ListBounded(ctx, name, result)
-	}
-	// Native enumeration remains bounded; the destination charges the transformed mode.
-	captured, err := storage.NewListResult(result.MaxBytes(), 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
-		return nameBytes + int64(unsafe.Sizeof(storage.Entry{})), nil
-	})
-	if err != nil {
-		return result.Fail(err)
-	}
-	if err := s.Storage.ListBounded(ctx, name, captured); err != nil {
-		return result.Fail(err)
-	}
-	entries, err := captured.Entries()
-	if err != nil {
-		return result.Fail(err)
-	}
-	for _, entry := range entries {
-		entry.Attr = s.describe(entry.Attr)
-		if err := result.Add(entry); err != nil {
-			return result.Fail(err)
-		}
-	}
-	return nil
 }

@@ -8,7 +8,6 @@ import (
 	"embed"
 	"errors"
 	"fmt"
-	"io/fs"
 	"math"
 	"syscall"
 	"time"
@@ -40,6 +39,8 @@ const firstOwnershipAwareSchemaVersion = 3
 
 const firstRetainedFileSchemaVersion = 5
 
+const firstClientCapabilitySchemaVersion = 6
+
 // VolumeOpenMode decides whether preparation may create the named volume.
 type VolumeOpenMode uint8
 
@@ -57,8 +58,6 @@ type DurableOpen struct {
 	Witnessed    bool
 }
 
-const rootDirectoryMode fs.FileMode = 0o755
-
 // Prepare brings the database to the layout this build writes, and returns the id of the
 // named volume and of its root directory, creating both when the volume is new.
 //
@@ -71,10 +70,10 @@ func Prepare(
 	db *sql.DB,
 	volume, storeID string,
 	window changes.Window,
-	maxIntegrityRecords, maxIntegrityBytes int64,
+	maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes int64,
 ) (id, root int64, err error) {
 	id, root, _, err = PrepareConfigured(
-		ctx, db, volume, storeID, window, maxIntegrityRecords, maxIntegrityBytes, nil,
+		ctx, db, volume, storeID, window, maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes, nil,
 	)
 	return id, root, err
 }
@@ -87,7 +86,7 @@ func PrepareConfigured(
 	db *sql.DB,
 	volume, storeID string,
 	window changes.Window,
-	maxIntegrityRecords, maxIntegrityBytes int64,
+	maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes int64,
 	durable *DurableOpen,
 ) (id, root int64, state dbstate.State, err error) {
 	tx, err := db.BeginTx(ctx, nil)
@@ -117,16 +116,19 @@ func PrepareConfigured(
 			version, syscall.EIO)
 	}
 	legacy := recorded && version > 0 && version < firstOwnershipAwareSchemaVersion
-	if recorded && version >= firstOwnershipAwareSchemaVersion && version < firstRetainedFileSchemaVersion {
-		if err := validateIntegrity(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes, version); err != nil {
+	if recorded && version >= firstOwnershipAwareSchemaVersion && version < firstClientCapabilitySchemaVersion {
+		if err := validateIntegrity(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes, version); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 	}
 	if legacy {
-		if err := validateIntegrityWork(ctx, tx, nil, maxIntegrityRecords); err != nil {
+		if err := validateIntegrityWorkVersion(ctx, tx, nil, maxIntegrityRecords, version); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 		if err := validateIntegrityBytes(ctx, tx, nil, maxIntegrityBytes, version); err != nil {
+			return 0, 0, dbstate.State{}, err
+		}
+		if err := validateNodeValuesVersion(ctx, tx, nil, version); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 		if err := validateLegacyObjectIntegrity(ctx, tx, version); err != nil {
@@ -142,7 +144,7 @@ func PrepareConfigured(
 		} else if err := validateNodeRelationshipsVersion(ctx, tx, nil, version); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
-		if err := validateUsedAccounting(ctx, tx, nil); err != nil {
+		if err := validateUsedAccountingVersion(ctx, tx, nil, version); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 		// Version 1 predates the log tables. Version 2's rows and recorded tail are
@@ -154,26 +156,16 @@ func PrepareConfigured(
 			}
 		}
 	}
+	if recorded && version >= 1 && version < firstClientCapabilitySchemaVersion {
+		if err := validateLegacyModeMapping(ctx, tx, version); err != nil {
+			return 0, 0, dbstate.State{}, err
+		}
+	}
 	if err := schema.Reach(ctx, tx); err != nil {
 		return 0, 0, dbstate.State{}, err
 	}
-	// Version 1 did not carry volume on entries. Validate the global rooted tree and used
-	// accounting after the migrations normalize that table, while the same transaction can
-	// still roll every schema change back on refusal.
-	if legacy {
-		if err := validateStorageClasses(ctx, tx, nil); err != nil {
-			return 0, 0, dbstate.State{}, err
-		}
-		if err := validateNodeValues(ctx, tx, nil); err != nil {
-			return 0, 0, dbstate.State{}, err
-		}
-		if err := validateNodeRelationships(ctx, tx, nil); err != nil {
-			return 0, 0, dbstate.State{}, err
-		}
-		if err := validateUsedAccounting(ctx, tx, nil); err != nil {
-			return 0, 0, dbstate.State{}, err
-		}
-		if err := validateLogIntegrity(ctx, tx, nil); err != nil {
+	if !recorded || version < firstClientCapabilitySchemaVersion {
+		if err := validateIntegrity(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes, schema.Version()); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 	}
@@ -197,11 +189,11 @@ func PrepareConfigured(
 	case err != nil:
 		return 0, 0, dbstate.State{}, err
 	}
-	if err := ValidateVolumeIntegrity(ctx, tx, id, maxIntegrityRecords, maxIntegrityBytes); err != nil {
+	if err := ValidateVolumeIntegrity(ctx, tx, id, maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes); err != nil {
 		return 0, 0, dbstate.State{}, err
 	}
 	if durable != nil && durable.ReapDetached {
-		if err := validateIntegrity(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes, schema.Version()); err != nil {
+		if err := validateIntegrity(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes, schema.Version()); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 		if err := reapDetachedFiles(ctx, tx); err != nil {
@@ -327,9 +319,9 @@ func createVolume(ctx context.Context, tx *sql.Tx, volume string) (id, root int6
 		return 0, 0, err
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-		VALUES (?, ?, ?, 0, ?, ?, ?, ?, NULL)`,
-		root, id, int64(fs.ModeDir|rootDirectoryMode), sec, nsec, sec, nsec)
+		INSERT INTO nodes (id, volume, kind, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content, birth_sec, birth_nsec, change_sec, change_nsec, directory_revision)
+		VALUES (?, ?, 2, 0, ?, ?, ?, ?, NULL, ?, ?, ?, ?, X'0000000000000001')`,
+		root, id, sec, nsec, sec, nsec, sec, nsec, sec, nsec)
 	if err != nil {
 		return 0, 0, err
 	}

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/changes"
 	"github.com/codetreker/remote-fs/packages/storage"
 	_ "modernc.org/sqlite"
 )
@@ -37,7 +38,7 @@ func TestSnapshotAfterAutomaticRollbackReturnsCancellation(t *testing.T) {
 	waitForReadRollback(t, store.snapshotRead)
 	result, err := metastore.NewRowResult(1024, 0,
 		func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
-			return 192 + lengths.Name + lengths.Content, nil
+			return 192 + lengths.Name + lengths.Content + lengths.Metadata + lengths.Target, nil
 		})
 	if err != nil {
 		t.Fatal(err)
@@ -267,4 +268,88 @@ func snapshotPlanRaw(t *testing.T, path string) *sql.DB {
 		t.Fatalf("opening %s directly: %v", path, err)
 	}
 	return db
+}
+
+func TestSnapshotReservesAndPreservesGenericNodePayload(t *testing.T) {
+	store := snapshotPlanOpen(t, snapshotPlanDatabase(t), "workspace", 0)
+	if err := store.Create(t.Context(), "link"); err != nil {
+		t.Fatal(err)
+	}
+	node, err := store.Stat(t.Context(), "link")
+	if err != nil {
+		t.Fatal(err)
+	}
+	birth := time.Date(10000, 2, 3, 4, 5, 6, 123456789, time.UTC)
+	changed := time.Time{}
+	node.Kind = storage.NodeSymlink
+	node.LinkTarget = []byte("../target")
+	node.Size = int64(len(node.LinkTarget))
+	node.BirthTime, node.ChangeTime = &birth, &changed
+	node.Metadata = map[string]storage.OpaquePayload{"business.v1": {Version: []byte{0, 0, 0, 0, 0, 0, 0, 1}, Data: []byte{0, 255, 3}}}
+	encoded, err := storage.EncodeMetadata(node.Metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.mutate(t.Context(), func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(t.Context(), `UPDATE nodes SET kind=?,size=?,birth_sec=?,birth_nsec=?,change_sec=?,change_nsec=?,metadata=?,link_target=? WHERE id=?`, int64(node.Kind), node.Size, birth.Unix(), birth.Nanosecond(), changed.Unix(), changed.Nanosecond(), encoded, node.LinkTarget, node.ID); err != nil {
+			return err
+		}
+		if err := store.charge(t.Context(), tx, node.Size); err != nil {
+			return err
+		}
+		return changes.Record(t.Context(), tx, store.volume, metastore.Change{Kind: metastore.Modified, Parent: store.root, Name: []byte("link"), Node: &node})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	charge := int64(len("link") + len(encoded) + len(node.LinkTarget))
+	makePage := func(capacity int64) *metastore.RowResult {
+		t.Helper()
+		page, err := metastore.NewRowResult(capacity, 0, func(_ int, row metastore.Row, l metastore.RowPayloadLengths) (int64, error) {
+			if len(row.Node.Metadata) != 0 || len(row.Node.LinkTarget) != 0 || len(row.Node.Content) != 0 {
+				t.Fatal("snapshot exposed payload before reservation")
+			}
+			if row.Node.ID == node.ID && (l.Metadata != int64(len(encoded)) || l.Target != int64(len(node.LinkTarget))) {
+				t.Fatalf("snapshot declared payload lengths=%+v", l)
+			}
+			return l.Name + l.Content + l.Metadata + l.Target, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return page
+	}
+	picture, position, err := store.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer picture.Close()
+	if _, err := picture.Next(t.Context(), 1, makePage(6)); err != nil {
+		t.Fatal(err)
+	}
+	under := makePage(charge - 1)
+	if _, err := picture.Next(t.Context(), 1, under); !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("metadata/target under-budget=%v", err)
+	}
+	if rows, err := under.Rows(); rows != nil || !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("failed snapshot exposed prefix=%+v error=%v", rows, err)
+	}
+	if err := picture.Close(); err != nil {
+		t.Fatal(err)
+	}
+	picture, again, err := store.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer picture.Close()
+	if again != position {
+		t.Fatalf("read-only snapshot changed log position=%d want=%d", again, position)
+	}
+	page := makePage(6 + charge)
+	if done, err := picture.Next(t.Context(), 3, page); err != nil || !done {
+		t.Fatalf("exact snapshot page done=%v error=%v", done, err)
+	}
+	rows, err := page.Rows()
+	if err != nil || len(rows) != 2 || !replicaNodesEqual(rows[1].Node, node) || string(rows[1].Name) != "link" {
+		t.Fatalf("snapshot source facts=%+v error=%v", rows, err)
+	}
 }

@@ -148,21 +148,25 @@ func TestAdvisoryCallbackAccessAndRanges(t *testing.T) {
 	}
 }
 
-type interruptedAdvisoryFile struct {
-	storage.File
-	afterSet      func(storage.LockAttempt)
+type interruptedAdvisorySession struct {
+	storage.FileSession
+	storage.UseOwners
+	storage.RangeControl
+	afterSet      func(storage.RangeAttempt)
 	beforeQuery   func()
 	beforeCancel  func()
 	loseSetReply  bool
 	cancelFailure error
 	request       storage.LockRequestID
+	owner         storage.UseOwner
 	queries       int
 	cleanContext  bool
 }
 
-func (f *interruptedAdvisoryFile) SetLock(ctx context.Context, owner storage.LockOwner, lock storage.FileLock, request storage.LockRequestID) (storage.LockAttempt, error) {
+func (f *interruptedAdvisorySession) Apply(ctx context.Context, owner storage.UseOwner, commands []storage.RangeCommand, request storage.LockRequestID) (storage.RangeAttempt, error) {
 	f.request = request
-	attempt, err := f.File.SetLock(ctx, owner, lock, request)
+	f.owner = owner
+	attempt, err := f.RangeControl.Apply(ctx, owner, commands, request)
 	if err != nil {
 		return attempt, err
 	}
@@ -170,32 +174,32 @@ func (f *interruptedAdvisoryFile) SetLock(ctx context.Context, owner storage.Loc
 		f.afterSet(attempt)
 	}
 	if f.loseSetReply {
-		return storage.LockAttempt{}, context.Canceled
+		return storage.RangeAttempt{}, context.Canceled
 	}
 	return attempt, nil
 }
 
-func (f *interruptedAdvisoryFile) QueryLock(ctx context.Context, owner storage.LockOwner, request storage.LockRequestID) (storage.LockAttempt, error) {
+func (f *interruptedAdvisorySession) Query(ctx context.Context, owner storage.UseOwner, request storage.LockRequestID) (storage.RangeAttempt, error) {
 	f.queries++
 	if request != f.request {
-		return storage.LockAttempt{}, errors.New("query changed its request identity")
+		return storage.RangeAttempt{}, errors.New("query changed its request identity")
 	}
 	if f.beforeQuery != nil {
 		f.beforeQuery()
 	}
-	return f.File.QueryLock(ctx, owner, request)
+	return f.RangeControl.Query(ctx, owner, request)
 }
 
-func (f *interruptedAdvisoryFile) CancelLock(ctx context.Context, owner storage.LockOwner, request storage.LockRequestID) (storage.LockAttempt, error) {
+func (f *interruptedAdvisorySession) Cancel(ctx context.Context, owner storage.UseOwner, request storage.LockRequestID) (storage.RangeAttempt, error) {
 	_, hasDeadline := ctx.Deadline()
 	f.cleanContext = ctx.Err() == nil && hasDeadline
 	if f.beforeCancel != nil {
 		f.beforeCancel()
 	}
 	if f.cancelFailure != nil {
-		return storage.LockAttempt{}, f.cancelFailure
+		return storage.RangeAttempt{}, f.cancelFailure
 	}
-	return f.File.CancelLock(ctx, owner, request)
+	return f.RangeControl.Cancel(ctx, owner, request)
 }
 
 func TestAdvisoryCallbackReconcilesCancellationBeforeReturning(t *testing.T) {
@@ -222,12 +226,12 @@ func TestAdvisoryCallbackReconcilesCancellationBeforeReturning(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			injected := &interruptedAdvisoryFile{File: waiter.file, loseSetReply: test.lostReply,
-				afterSet: func(storage.LockAttempt) { cancel() }}
+			injected := &interruptedAdvisorySession{FileSession: v.files, UseOwners: v.files.(storage.UseOwners), RangeControl: v.files.(storage.RangeControl), loseSetReply: test.lostReply,
+				afterSet: func(storage.RangeAttempt) { cancel() }}
 			if test.cancelFail {
 				injected.cancelFailure = errors.New("lost cancellation reply")
 			}
-			waiter.file = injected
+			v.files = injected
 			if errno := waiter.Setlkw(ctx, 2, &lk, gofuse.FUSE_LK_FLOCK); errno != test.want {
 				t.Fatalf("cancelled lock returned %v, want %v", errno, test.want)
 			}
@@ -240,13 +244,13 @@ func TestAdvisoryCallbackReconcilesCancellationBeforeReturning(t *testing.T) {
 				}
 				return
 			}
-			attempt, err := injected.File.QueryLock(t.Context(), 2, injected.request)
+			attempt, err := injected.RangeControl.Query(t.Context(), injected.owner, injected.request)
 			if err != nil {
 				t.Fatal(err)
 			}
-			wantState := storage.LockCancelled
+			wantState := storage.Cancelled
 			if !test.conflict {
-				wantState = storage.LockGranted
+				wantState = storage.Granted
 			}
 			if attempt.State != wantState {
 				t.Fatalf("server action state = %v, want %v", attempt.State, wantState)
@@ -262,12 +266,12 @@ func TestAdvisoryCallbackContinuesPendingRequest(t *testing.T) {
 	if errno := holder.Setlk(t.Context(), 1, &lk, gofuse.FUSE_LK_FLOCK); errno != 0 {
 		t.Fatal(errno)
 	}
-	injected := &interruptedAdvisoryFile{File: waiter.file, beforeQuery: func() {
-		if err := holder.file.DropLocks(t.Context(), 1, storage.Flock); err != nil {
+	injected := &interruptedAdvisorySession{FileSession: v.files, UseOwners: v.files.(storage.UseOwners), RangeControl: v.files.(storage.RangeControl), beforeQuery: func() {
+		if err := holder.retireDescriptionOwners(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 	}}
-	waiter.file = injected
+	v.files = injected
 	if errno := waiter.Setlkw(t.Context(), 2, &lk, gofuse.FUSE_LK_FLOCK); errno != 0 {
 		t.Fatal(errno)
 	}
@@ -290,7 +294,7 @@ func TestRawOwnerMetadataBoundsCancellationAndCleanup(t *testing.T) {
 	if _, _, ok := m.begin(nil, rawRequest{owner: 3}); ok {
 		t.Fatal("metadata exceeded its configured capacity")
 	}
-	for channel, owner := range map[<-chan struct{}]storage.LockOwner{first: 0, second: 2} {
+	for channel, owner := range map[<-chan struct{}]uint64{first: 0, second: 2} {
 		request, ok := m.lookup(channel)
 		if !ok || request.owner != owner {
 			t.Fatalf("metadata owner = %d, %v; want %d", request.owner, ok, owner)
@@ -317,28 +321,29 @@ func TestRawOwnerMetadataBoundsCancellationAndCleanup(t *testing.T) {
 }
 
 type failedOwnerCleanup struct {
-	storage.File
+	storage.FileSession
+	storage.UseOwners
+	storage.RangeControl
 	dropErr       error
 	closed        bool
 	finiteCleanup bool
 }
 
-func (f *failedOwnerCleanup) DropLocks(ctx context.Context, owner storage.LockOwner, family storage.LockFamily) error {
+func (f *failedOwnerCleanup) RetireUseOwner(ctx context.Context, owner storage.UseOwner) error {
 	_, hasDeadline := ctx.Deadline()
 	f.finiteCleanup = ctx.Err() == nil && hasDeadline
 	return f.dropErr
 }
 
-func (f *failedOwnerCleanup) Close(ctx context.Context) error {
-	f.closed = true
-	return f.File.Close(ctx)
-}
-
 func TestAdvisoryReleaseClosesReferenceAfterOwnerCleanupFailure(t *testing.T) {
 	v := advisoryVolume(t)
 	h := advisoryHandle(t, v, true, true)
-	injected := &failedOwnerCleanup{File: h.file, dropErr: errors.New("owner cleanup failed")}
-	h.file = injected
+	lk := gofuse.FileLock{Start: 0, End: math.MaxInt64, Typ: syscall.F_WRLCK}
+	if errno := h.Setlk(t.Context(), 7, &lk, gofuse.FUSE_LK_FLOCK); errno != 0 {
+		t.Fatal(errno)
+	}
+	injected := &failedOwnerCleanup{FileSession: v.files, UseOwners: v.files.(storage.UseOwners), RangeControl: v.files.(storage.RangeControl), dropErr: errors.New("owner cleanup failed")}
+	v.files = injected
 	v.raw = &rawMetadata{limit: 1, requests: make(map[<-chan struct{}]rawRequest)}
 	cancelled := make(chan struct{})
 	close(cancelled)
@@ -350,10 +355,10 @@ func TestAdvisoryReleaseClosesReferenceAfterOwnerCleanupFailure(t *testing.T) {
 	if errno := h.Release(&gofuse.Context{Cancel: forwarded}); errno != syscall.EIO {
 		t.Fatalf("failed owner cleanup returned %v", errno)
 	}
-	if !injected.closed || !injected.finiteCleanup {
-		t.Fatalf("release cleanup: closed=%v finite=%v", injected.closed, injected.finiteCleanup)
+	if !injected.finiteCleanup {
+		t.Fatal("owner retirement lacked finite clean context")
 	}
-	if _, err := injected.File.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
+	if _, err := h.file.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("released reference remained usable: %v", err)
 	}
 	if errnoOf(v.check()) != syscall.EIO {
@@ -376,13 +381,13 @@ func TestAdvisoryCallbackNormalRetirementPreservesShutdownOutcome(t *testing.T) 
 				close(v.stop)
 				v.mu.Unlock()
 			}
-			injected := &interruptedAdvisoryFile{File: waiter.file}
+			injected := &interruptedAdvisorySession{FileSession: v.files, UseOwners: v.files.(storage.UseOwners), RangeControl: v.files.(storage.RangeControl)}
 			if cancelRace {
 				injected.loseSetReply, injected.cancelFailure, injected.beforeCancel = true, syscall.ESTALE, stop
 			} else {
-				injected.afterSet = func(storage.LockAttempt) { stop() }
+				injected.afterSet = func(storage.RangeAttempt) { stop() }
 			}
-			waiter.file = injected
+			v.files = injected
 			if errno := waiter.Setlkw(t.Context(), 2, &lk, gofuse.FUSE_LK_FLOCK); errno != syscall.ESTALE {
 				t.Fatalf("normal retirement returned %v", errno)
 			}

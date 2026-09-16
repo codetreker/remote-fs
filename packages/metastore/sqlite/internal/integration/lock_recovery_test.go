@@ -3,6 +3,7 @@ package integration_test
 import (
 	"bytes"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/sqliteschema"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 var historicalLeaseDurableState = sqlite.DurableState{
@@ -105,7 +107,7 @@ func TestHistoricalLeaseMigrationPreservesAcceptedDurableProof(t *testing.T) {
 	if len(accepted) != 1 || len(visible) != 1 || accepted[0] != want || visible[0] != want {
 		t.Fatalf("migration witness acceptance = %+v, visible = %+v; want %+v", accepted, visible, want)
 	}
-	assertHistoricalLeaseSchemaVersion(t, path, 5)
+	assertHistoricalLeaseSchemaVersion(t, path, 6)
 }
 
 func TestHistoricalLeaseMigrationRefusesRollbackBeforeChangingSchema(t *testing.T) {
@@ -171,7 +173,7 @@ func TestHistoricalLeaseMigrationProtectsEveryVolumeAcrossReopen(t *testing.T) {
 	})
 	assertHistoricalLeaseVolume(t, first.Store, "A")
 	assertHistoricalLeaseRows(t, path, before)
-	assertHistoricalLeaseSchemaVersion(t, path, 5)
+	assertHistoricalLeaseSchemaVersion(t, path, 6)
 	acquireHistoricalLease(t, first.LockService(), "alpha.txt")
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
@@ -247,6 +249,36 @@ func acquireHistoricalLease(t *testing.T, service locking.Service, path string) 
 	}
 }
 
+func historicalNodeMode(t *testing.T, node metastore.Node) os.FileMode {
+	t.Helper()
+	value, ok := node.Metadata["posix.permissions.v1"]
+	if !ok || len(value.Data) != 4 || len(value.Version) != 8 || binary.BigEndian.Uint64(value.Version) == 0 {
+		t.Fatalf("missing migrated permission facts: %+v", node)
+	}
+	raw := binary.LittleEndian.Uint32(value.Data)
+	if raw & ^uint32(07777) != 0 {
+		t.Fatalf("invalid migrated permissions: %x", value.Data)
+	}
+	mode := os.FileMode(raw & 0777)
+	if raw&01000 != 0 {
+		mode |= os.ModeSticky
+	}
+	if raw&02000 != 0 {
+		mode |= os.ModeSetgid
+	}
+	if raw&04000 != 0 {
+		mode |= os.ModeSetuid
+	}
+	switch node.Kind {
+	case storage.NodeRegular:
+	case storage.NodeDirectory:
+		mode |= os.ModeDir
+	default:
+		t.Fatalf("invalid historical kind: %v", node.Kind)
+	}
+	return mode
+}
+
 func assertHistoricalLeaseVolume(t *testing.T, store *sqlite.Store, volume string) {
 	t.Helper()
 	name, id, root, size, mode := "alpha.txt", int64(2), int64(1), int64(5), os.FileMode(0o640)
@@ -262,7 +294,7 @@ func assertHistoricalLeaseVolume(t *testing.T, store *sqlite.Store, volume strin
 		positions = []metastore.Position{2, 4}
 	}
 	node, err := store.Stat(t.Context(), name)
-	if err != nil || node.ID != id || node.Size != size || node.Mode != mode || node.Content != content ||
+	if err != nil || node.ID != id || node.Size != size || historicalNodeMode(t, node) != mode || node.Content != content ||
 		!node.AccessTime.Equal(time.Unix(seconds, accessNanos)) || !node.ModTime.Equal(time.Unix(seconds, modifiedNanos)) {
 		t.Fatalf("volume %s historical node changed: %+v, %v", volume, node, err)
 	}
@@ -308,9 +340,13 @@ func historicalLeaseRows(t *testing.T, path string) map[string][][]any {
 	t.Helper()
 	db := historicalLeaseReadOnly(t, path)
 	result := make(map[string][][]any)
-	for table, query := range map[string]string{
+	var version int
+	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	queries := map[string]string{
 		"backing_store": `SELECT * FROM backing_store ORDER BY singleton`,
-		"volumes":       `SELECT * FROM volumes ORDER BY id`,
+		"volumes":       `SELECT id,name,root,used FROM volumes ORDER BY id`,
 		"nodes": `SELECT id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content
 			FROM nodes ORDER BY id`,
 		"entries":         `SELECT * FROM entries ORDER BY volume, parent, name`,
@@ -318,7 +354,12 @@ func historicalLeaseRows(t *testing.T, path string) map[string][][]any {
 		"logs":            `SELECT * FROM logs ORDER BY volume`,
 		"changes":         `SELECT * FROM changes ORDER BY position`,
 		"sqlite_sequence": `SELECT * FROM sqlite_sequence ORDER BY name`,
-	} {
+	}
+	if version >= 6 {
+		queries["nodes"] = `SELECT id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,metadata FROM nodes ORDER BY id`
+		queries["changes"] = `SELECT position,previous_position,volume,kind,parent,name,from_parent,from_name,node,node_kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,recorded_sec,recorded_nsec,metadata FROM changes ORDER BY position`
+	}
+	for table, query := range queries {
 		result[table] = nil
 		rows, err := db.QueryContext(t.Context(), query)
 		if err != nil {
@@ -342,6 +383,28 @@ func historicalLeaseRows(t *testing.T, path string) map[string][][]any {
 				if blob, ok := value.([]byte); ok {
 					values[i] = bytes.Clone(blob)
 				}
+			}
+			if version >= 6 && (table == "nodes" || table == "changes") {
+				kindIndex, metadataIndex := 2, 9
+				if table == "changes" {
+					kindIndex, metadataIndex = 9, 18
+				}
+				if values[kindIndex] != nil {
+					kind, ok := values[kindIndex].(int64)
+					if !ok {
+						t.Fatalf("invalid historical kind scalar: %T", values[kindIndex])
+					}
+					encoded, ok := values[metadataIndex].([]byte)
+					if !ok {
+						t.Fatalf("invalid migrated metadata scalar: %T", values[metadataIndex])
+					}
+					metadata, err := storage.DecodeMetadata(encoded)
+					if err != nil {
+						t.Fatal(err)
+					}
+					values[kindIndex] = int64(historicalNodeMode(t, metastore.Node{Kind: storage.NodeKind(kind), Metadata: metadata}))
+				}
+				values = values[:metadataIndex]
 			}
 			result[table] = append(result[table], values)
 		}

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -96,7 +97,7 @@ func TestRetainedOpenFailureReclaimsItsUnreturnedReference(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = session.Close(context.Background()) })
 	fault.arm(storage.OpFileOpen, false)
-	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0600})
+	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, InitialMetadata: map[string][]byte{"test.initial": {0, 0xff, 1}}})
 	if file != nil || !errors.Is(err, syscall.EIO) {
 		t.Fatalf("open accepted a missing barrier: %v, %v", file, err)
 	}
@@ -113,12 +114,12 @@ func TestRetainedUnknownResponseDoesNotRecommitTheMutation(t *testing.T) {
 	s.server.Config.Handler = fault
 	mounted, _ := mount(t, s)
 	session := retainedSession(t, mounted)
-	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0600})
+	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, InitialMetadata: map[string][]byte{"test.initial": {0, 0xff, 1}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	fault.arm(storage.OpFileWrite, true)
-	if attr, err := file.WriteAt(t.Context(), 0, []byte("committed")); !errors.Is(err, syscall.EIO) || attr != (storage.Attr{}) {
+	if attr, err := file.WriteAt(t.Context(), 0, []byte("committed")); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(attr, storage.Attr{}) {
 		t.Fatalf("unknown retained mutation returned a confirmed answer: %+v, %v", attr, err)
 	}
 	fault.mu.Lock()

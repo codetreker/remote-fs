@@ -1,0 +1,83 @@
+package sqlite
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"errors"
+	"math"
+	"syscall"
+
+	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/storage"
+)
+
+func (s *Store) guardedDirectory(ctx context.Context, tx *sql.Tx, id uint64) (metastore.FileState, error) {
+	if id == 0 || id > math.MaxInt64 {
+		return metastore.FileState{}, storage.ErrConditionConflict
+	}
+	node, err := s.fileState(ctx, tx, int64(id))
+	if errors.Is(err, syscall.ESTALE) {
+		return metastore.FileState{}, storage.ErrConditionConflict
+	}
+	if err != nil {
+		return metastore.FileState{}, err
+	}
+	if !node.IsDir() || node.Detached {
+		return metastore.FileState{}, storage.ErrConditionConflict
+	}
+	return node, nil
+}
+
+func (s *Store) checkNamespaceGuards(ctx context.Context, tx *sql.Tx, guards *storage.NamespaceGuards) error {
+	if err := guards.Check(); err != nil {
+		return err
+	}
+	if guards == nil {
+		return nil
+	}
+	if guards.RootID != 0 {
+		if _, err := s.guardedDirectory(ctx, tx, guards.RootID); err != nil {
+			return err
+		}
+	}
+	for _, observed := range guards.Directories {
+		node, err := s.guardedDirectory(ctx, tx, observed.ParentID)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(node.DirectoryRevision, observed.Revision) {
+			return storage.ErrConditionConflict
+		}
+	}
+	for _, edge := range guards.Edges {
+		if _, err := s.guardedDirectory(ctx, tx, edge.ParentID); err != nil {
+			return err
+		}
+		node, found, err := s.lookup(ctx, tx, int64(edge.ParentID), edge.RawLeaf)
+		if err != nil {
+			return err
+		}
+		if !found || uint64(node.ID) != edge.ChildID {
+			return storage.ErrConditionConflict
+		}
+	}
+	return nil
+}
+
+func checkChildCondition(condition storage.ChildCondition, node metastore.Node, found bool) error {
+	if err := condition.Check(); err != nil {
+		return err
+	}
+	switch condition.State {
+	case storage.Absent:
+		if found {
+			return storage.ErrConditionConflict
+		}
+	case storage.SameNode:
+		if !found || uint64(node.ID) != condition.NodeID {
+			return storage.ErrConditionConflict
+		}
+	}
+	return nil
+}

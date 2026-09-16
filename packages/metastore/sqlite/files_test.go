@@ -1,9 +1,11 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -22,7 +24,7 @@ func openPublicationFile(t *testing.T) (*LockingStore, metastore.File) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0o600})
+	f, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, InitialMetadata: map[string][]byte{"test.state": {0, 255, 6}}})
 	if err != nil {
 		s.Close()
 		t.Fatal(err)
@@ -235,9 +237,13 @@ func TestStrongGrantsRetireTheNameWhileOrdinaryReferencesKeepTheNode(t *testing.
 	f.put(t, t.Context(), "file", 5)
 	owner := f.owner(t)
 	grant := f.grant(t, owner, "file", locking.Exclusive)
-	opened, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true}, Mode: 0o777})
+	opened, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true}, InitialMetadata: map[string][]byte{"test.state": {0, 255, 7}}})
 	if err != nil {
 		t.Fatalf("ordinary open while strongly protected: %v", err)
+	}
+	stateAfterOpen, err := opened.Node(t.Context())
+	if err != nil || !bytes.Equal(stateAfterOpen.Metadata["test.state"].Data, []byte{0, 255, 6}) || len(stateAfterOpen.Metadata["test.state"].Version) == 0 {
+		t.Fatalf("opening an existing strongly protected node changed its initial metadata: %+v, %v", stateAfterOpen, err)
 	}
 	if err := opened.Close(t.Context()); err != nil {
 		t.Fatal(err)
@@ -335,7 +341,7 @@ func TestFilePublicationGuardRefusesEveryIdentityMutationAtFinalAdmission(t *tes
 				t.Fatalf("guard result=%v calls=%d", err, calls)
 			}
 			after, err := file.Node(t.Context())
-			if err != nil || after != before {
+			if err != nil || !reflect.DeepEqual(after, before) {
 				t.Fatalf("guarded mutation changed state=%+v error=%v; before=%+v", after, err, before)
 			}
 			afterPosition, err := s.CommittedPosition(t.Context())
@@ -398,17 +404,31 @@ func TestAdvisoryAuthorityIsSharedAndRetiredWithItsStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, Start: 0, End: 7}
-	if attempt, err := first.Set(ctx, uint64(node.ID), 1, lock, id); err != nil || attempt.State != storage.LockGranted {
-		t.Fatalf("first lock = %+v, %v", attempt, err)
-	}
-	if conflict, err := second.Get(ctx, uint64(node.ID), 2, lock); err != nil || !conflict.Found {
-		t.Fatalf("shared conflict = %+v, %v", conflict, err)
-	}
-	if err := first.Drop(ctx, uint64(node.ID), 1, storage.POSIX); err != nil {
+	native := f.(*retainedFile)
+	scope, err := native.Scope(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if conflict, err := second.Get(ctx, uint64(node.ID), 2, lock); err != nil || conflict.Found {
+	firstOwner, err := first.NewOwner(ctx, uint64(node.ID), scope, storage.OwnerOptions{Lifetime: storage.OwnerExplicit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondOwner, err := second.NewOwner(ctx, uint64(node.ID), scope, storage.OwnerOptions{Lifetime: storage.OwnerExplicit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock := storage.RangeCommand{Domain: storage.DomainRecord, Mode: storage.RangeExclusive,
+		Range: storage.Range{Kind: storage.Bytes, Start: 0, Length: 8}, Edit: storage.Replace}
+	if attempt, err := first.Apply(ctx, uint64(node.ID), firstOwner, []storage.RangeCommand{lock}, id, native.Order); err != nil || attempt.State != storage.Granted {
+		t.Fatalf("first lock = %+v, %v", attempt, err)
+	}
+	if conflict, err := second.GetConflict(ctx, uint64(node.ID), secondOwner, lock, native.Order); err != nil || !conflict.Found {
+		t.Fatalf("shared conflict = %+v, %v", conflict, err)
+	}
+	if err := first.Drop(ctx, uint64(node.ID), firstOwner, storage.DomainRecord); err != nil {
+		t.Fatal(err)
+	}
+	if conflict, err := second.GetConflict(ctx, uint64(node.ID), secondOwner, lock, native.Order); err != nil || conflict.Found {
 		t.Fatalf("released conflict = %+v, %v", conflict, err)
 	}
 	canceled, cancel := context.WithCancel(ctx)

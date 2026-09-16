@@ -123,7 +123,9 @@ func TestRetainedHTTPAdvisoryCoordinatesAcrossHandlers(t *testing.T) {
 	sa := fileSession(t, a)
 	sb := fileSession(t, b)
 	fa := openHTTPFile(t, sa, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
+	faRanges, faOwners := rangeControlFixture(t, sa, fa, 1)
 	fb := openHTTPFile(t, sb, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
+	fbRanges, fbOwners := rangeControlFixture(t, sb, fb, 1)
 	status, err := sa.Status(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -132,12 +134,12 @@ func TestRetainedHTTPAdvisoryCoordinatesAcrossHandlers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
-	result, err := fa.SetLock(ctx, 17, lock, id)
-	if err != nil || result.State != storage.LockGranted {
+	lock := storage.RangeCommand{Domain: storage.DomainWholeFile, Edit: storage.Replace, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}
+	result, err := faRanges.Apply(ctx, faOwners[0], []storage.RangeCommand{lock}, id)
+	if err != nil || result.State != storage.Granted {
 		t.Fatalf("grant = %+v, %v", result, err)
 	}
-	conflict, err := fb.GetLock(ctx, 17, lock)
+	conflict, err := fbRanges.GetConflict(ctx, fbOwners[0], lock)
 	if err != nil || !conflict.Found {
 		t.Fatalf("cross-session conflict = %+v, %v", conflict, err)
 	}
@@ -149,17 +151,17 @@ func TestRetainedHTTPAdvisoryCoordinatesAcrossHandlers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err = fb.SetLock(ctx, 17, lock, id)
-	if err == nil && (result.State != storage.LockRejected || result.Errno != syscall.EAGAIN) || err != nil && !errors.Is(err, syscall.EAGAIN) {
+	result, err = fbRanges.Apply(ctx, fbOwners[0], []storage.RangeCommand{lock}, id)
+	if err == nil && (result.State != storage.Rejected || result.Rejection != storage.RangeBlocked) || err != nil && !errors.Is(err, syscall.EAGAIN) {
 		t.Fatalf("nonblocking conflict = %+v, %v", result, err)
 	}
 	if _, err := fb.WriteAt(ctx, 0, []byte("OPEN")); err != nil {
 		t.Fatalf("advisory blocked ordinary I/O: %v", err)
 	}
-	if err := fa.DropLocks(ctx, 17, storage.Flock); err != nil {
+	if err := faRanges.Drop(ctx, faOwners[0], storage.DomainWholeFile); err != nil {
 		t.Fatal(err)
 	}
-	conflict, err = fb.GetLock(ctx, 17, lock)
+	conflict, err = fbRanges.GetConflict(ctx, fbOwners[0], lock)
 	if err != nil || conflict.Found {
 		t.Fatalf("released conflict = %+v, %v", conflict, err)
 	}
@@ -237,7 +239,7 @@ func TestRetainedHTTPReplaysLostOpenWithoutAnotherReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close(ctx)
-	first, err := session.OpenFile(ctx, "created", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Exclusive: true}, Mode: 0600})
+	first, err := session.OpenFile(ctx, "created", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Exclusive: true}, InitialMetadata: map[string][]byte{"test": {1, 2}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,4 +374,37 @@ func TestRetainedHTTPReconcilesLostAcknowledgementAndClose(t *testing.T) {
 			}
 		})
 	}
+}
+
+func rangeControlFixture(t *testing.T, session storage.FileSession, file storage.File, count int) (storage.RangeControl, []storage.UseOwner) {
+	t.Helper()
+	ctx := context.Background()
+	attr, err := file.Stat(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped, ok := file.(storage.ScopedReference)
+	if !ok {
+		t.Fatal("file does not expose a use scope")
+	}
+	scope, err := scoped.Scope(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, ok := session.(storage.RangeControl)
+	if !ok {
+		t.Fatal("session does not expose range control")
+	}
+	factory, ok := session.(storage.UseOwners)
+	if !ok {
+		t.Fatal("session does not expose use owners")
+	}
+	owners := make([]storage.UseOwner, count)
+	for i := range owners {
+		owners[i], err = factory.NewUseOwner(ctx, attr.ID, scope, storage.OwnerOptions{Lifetime: storage.OwnerExplicit})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return control, owners
 }

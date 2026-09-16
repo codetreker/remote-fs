@@ -48,7 +48,7 @@ Session、Owner 与 Grant 是不可伪造的 bearer capability，使用至少 12
 
 Acquire 的结果为 `Pending`、`Granted`、`Cancelled`、`TimedOut` 或带分类的 `Rejected`；Renew 成功为 `Renewed`。Pending 尚未决定最终结果，只能前进到一个终态。立即冲突、AlreadyHeld、排队目标消失及已接纳的 Renew 失败都保留为原动作结果，条件后来改变也不会重新执行。授予当前状态可从 `Active` 前进到 `Released`、`Expired`、`TargetGone` 或 `OwnerRetired`；Query 可以同时报告原 Acquire 已获准与该 grant 现已到期。
 
-响应以授权方单调时钟表达期限与当前状态。SDK 的本地有效期只是保守提示，不能代替服务端最终权限判定；编码与取整规则见下文「HTTP v3 编码」。
+响应以授权方单调时钟表达期限与当前状态。SDK 的本地有效期只是保守提示，不能代替服务端最终权限判定；编码与取整规则见下文「HTTP v4 编码」。
 
 控制错误区分 `Invalid`、`UnsupportedTarget`、`Conflict`、`AlreadyHeld`、`RequestMismatch`、`Capacity`、`Retired`、`OutcomeUnknown`、`StaleResource`、`StaleGrant`、`UnrelatedProof`、`Recovering` 与 `Unavailable`。输入错误映射 `EINVAL`，不支持的目标为 `EOPNOTSUPP`，占有冲突为 `EBUSY`，容量或恢复中为 `EAGAIN`，退役、失效与 proof 相关性失败为 `ESTALE`，未知或不可用为 `EIO`。管理响应仍保留 typed code 与是否已记录的区别，不能从 errno 反推生命周期。响应丢失后核对原授权方、持有者与 Request，不能在新的授权方里悄悄创建另一份意图。
 
@@ -70,7 +70,7 @@ Renew 使用 `max(原 deadline, 转换时刻 + 请求 TTL)`，不缩短已确认
 
 ## 修改覆盖与冲突
 
-`S` 与 `S` 相容；`X` 与其他 Owner 的任何 grant 不相容。Owner 自己持有的 `S` 也不是修改许可。普通快照读取不受 `X` 访问控制；显式 `SetAttr` 修改支持的 mode、访问时间或修改时间属于受保护的修改。普通读取可能产生的平台 atime 副作用不构成稳定 atime 的承诺；`S` 的稳定保证覆盖内容、存在性与逻辑身份。
+`S` 与 `S` 相容；`X` 与其他 Owner 的任何 grant 不相容。Owner 自己持有的 `S` 也不是修改许可。普通快照读取不受 `X` 访问控制；显式共同时间修改和 opaque metadata 更新属于受保护的修改。普通读取可能产生的平台 atime 副作用不构成稳定 atime 的承诺；`S` 的稳定保证覆盖内容、存在性与逻辑身份。
 
 | 修改 | 实际受影响的普通文件 |
 |---|---|
@@ -130,15 +130,15 @@ raw SQLite opener 也先取得同一个原生数据库文件的共享 flock，�
 
 服务前验证本地 xattr、flock、同 mount 改名、文件与目录 fsync 能力，不支持的配置明确失败。缺失、损坏、替换或归属不匹配的绑定与 READY 状态不触发自动初始化。证据和对象的暂存属于各自私有存储格式，不能出现在 volume 中。
 
-## HTTP v3 编码
+## HTTP v4 编码
 
-所有端点使用 `/v3/`，每个响应都有 `Remote-Fs-Protocol: 3` 与 `Cache-Control: no-store`。基础 volume 操作名、octet write body 与 mutation barrier 形状保留；v2 不被 scoped client 接受。
+所有端点使用 `/v4/`，每个响应都有 `Remote-Fs-Protocol: 4` 与 `Cache-Control: no-store`。基础 volume 操作名、octet write body 与 mutation barrier 形状保留；v2 不被 scoped client 接受。
 
 ### 控制端点
 
 控制请求都是有界的 JSON POST。能力不放入 URL；表中对象使用公共 locking 类型的 JSON 字段，未知或重复成员无效，所有列出的字段均须存在。
 
-| `/v3/` 下的端点 | 请求体 | 成功响应 |
+| `/v4/` 下的端点 | 请求体 | 成功响应 |
 |---|---|---|
 | `session-enrollment` | `{}` | `{"ticket": EnrollmentTicket}` |
 | `session-open` | `{"ticket": EnrollmentTicket}` | `{"session": Session}` |
@@ -190,11 +190,19 @@ SDK 以产生这份 GrantStatus 的请求首次发送时刻加 `remainingMillis`
 
 控制端点虽统一使用 POST，Resolve、QueryAction、QueryGrant 与 Status 仍是只读操作，已发出的请求可以接受取消。其余操作进入 HTTP dispatch 后，响应丢失、截断或取消只能说明结果未知；原请求身份与错误原因保留，调用方必须核对或终止该意图。dispatch 前接受的取消遵守普通 `EINTR` 分类。SDK 不在失败后制造新的 Session、Owner 或 Request 重做管理动作。
 
+## 与中立引用能力的组合
+
+Uses/Deny 和 DomainEnforced 的 Policy 由原生访问执行，Strong proof 不豁免这些限制；它们也不替代 S/X。共同时间、指定 namespace 更新、原子名字与条件文件修改进入原有最终 mutation gate。需要多个实际目标时分别核对源与被替换对象，不能从相同路径或 owner 推导授权。
+
+PendingUnlink 的最终有名删除是固定、预先授权的系统清理效果，仍按匿名修改通过正常 Strong gate；有效 grant 可以延迟它，过期 proof 不被重用。只有已 detached 的物理回收走既有 cleanup 路径。schema 准备不能在 Strong 恢复屏障建立前删除仍有名字的 pending 节点。
+
+获准名字移除继续使强资源 TargetGone；保留 File/NodeReference 与其 share/enforced 状态按原引用生命周期存活，不恢复已经退役的 grant。具体引用、历史与恢复拥有者见[文件能力](file-handles.md)。
+
 ## 集成与生命周期
 
-普通 `flock` 与传统 POSIX `fcntl` 是[保留文件接口](file-handles.md)的 advisory 操作，不创建强 S/X Owner 或 grant。它们允许未参与加锁者执行普通修改，阻塞等待按 FileSession 的健康续期维持，不采用这里 Acquire 的有限 Wait。普通 Open 不自动选择任何加锁策略。
+Linux 的 `flock` 与传统 POSIX `fcntl` 通过[中立 RangeControl](file-handles.md)表达 advisory 操作，不创建强 S/X Owner 或 grant。它们允许未参与加锁者执行普通修改，阻塞等待按 FileSession 的健康续期维持，不采用这里 Acquire 的有限 Wait。普通 Open 不自动选择任何加锁策略。
 
-独立 server 的 Azure Blob 与本地持久对象存储两种形态都建立配对的 enforcing volume 与锁服务，向 HTTP v3 同时发布数据操作、锁管理操作和显式 mutation scope。协议不通过忽略未知 proof、旧授权方身份或非法 scope 保持兼容；无法识别的结果保持错误。
+独立 server 的 Azure Blob 与本地持久对象存储两种形态都建立配对的 enforcing volume 与锁服务，向 HTTP v4 同时发布数据操作、锁管理操作和显式 mutation scope。协议不通过忽略未知 proof、旧授权方身份或非法 scope 保持兼容；无法识别的结果保持错误。
 
 控制 admission、Session、Owner、grant、等待申请、动作历史及本地资源映射分别有界。授权方动作历史满额时，Release、已知 Acquire 的 Cancel 与 Owner / Session 终止仍有执行路径；控制请求本身继续服从独立的 HTTP admission。TCP 断开不解除已经确认的占有，显式生命周期结束与有限 lease / idle 到期负责释放。
 

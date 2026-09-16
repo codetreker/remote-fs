@@ -34,14 +34,14 @@ func stateFixture(t *testing.T) (*sql.DB, State) {
 	}
 	execState(t, db, `INSERT INTO volumes (id, name, root, used) VALUES (1, 'workspace', 1, 0)`)
 	execState(t, db, `INSERT INTO nodes
-		(id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec)
-		VALUES (1, 1, 2147483648, 0, 0, 0, 0, 0), (2, 1, 0, 0, 0, 0, 0, 0)`)
+		(id, volume, kind, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, directory_revision)
+		VALUES (1, 1, 2, 0, 0, 0, 0, 0, X'0000000000000001'), (2, 1, 1, 0, 0, 0, 0, 0, X'')`)
 	execState(t, db, `INSERT INTO entries (volume, parent, name, node) VALUES (1, 1, x'66', 2)`)
 	execState(t, db, `INSERT INTO logs VALUES (1, '0123456789abcdef0123456789abcdef', 2, 0, 0)`)
 	execState(t, db, `INSERT INTO changes
 		(position, previous_position, volume, kind, parent, name, node,
-		 mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, recorded_sec, recorded_nsec)
-		VALUES (2, 0, 1, 0, 1, x'66', 2, 0, 0, 0, 0, 0, 0, 0, 0)`)
+		 node_kind, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, recorded_sec, recorded_nsec, metadata, link_target)
+		VALUES (2, 0, 1, 0, 1, x'66', 2, 1, 0, 0, 0, 0, 0, 0, 0, X'52464d010000', X'')`)
 	state := State{DatabaseID: "0123456789abcdef0123456789abcdef", Generation: 7, NodeHighWater: 4, ChangeHighWater: 6}
 	setFixtureState(t, db, state)
 	return db, state

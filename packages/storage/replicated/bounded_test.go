@@ -30,7 +30,7 @@ func TestBoundedEntrypointsPreserveReplicaAndDependencyFailures(t *testing.T) {
 		t.Fatalf("ReadBounded hid the remote dependency's ENOENT: %v", err)
 	}
 
-	result := listResult(t, 64)
+	result := listResult(t, 4096)
 	if err := mounted.ListBounded(t.Context(), "", result); err != nil {
 		t.Fatalf("ListBounded: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestBoundedEntrypointsPreserveReplicaAndDependencyFailures(t *testing.T) {
 
 	notDirectory := listResult(t, 64)
 	if err := mounted.ListBounded(t.Context(), "small", notDirectory); !errors.Is(err, syscall.ENOTDIR) {
-		t.Fatalf("ListBounded hid the replica dependency's ENOTDIR: %v", err)
+		t.Fatalf("ListBounded hid the authority's ENOTDIR: %v", err)
 	}
 	assertInvalidListResult(t, notDirectory)
 
@@ -68,8 +68,8 @@ func TestBoundedEntrypointsPreserveReplicaAndDependencyFailures(t *testing.T) {
 
 func listResult(t *testing.T, maxBytes int64) *storage.ListResult {
 	t.Helper()
-	result, err := storage.NewListResult(maxBytes, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
-		return nameBytes, nil
+	result, err := storage.NewListResult(maxBytes, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		return nameBytes + metadataBytes, nil
 	})
 	if err != nil {
 		t.Fatalf("constructing a bounded listing: %v", err)

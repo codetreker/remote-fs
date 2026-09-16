@@ -14,8 +14,7 @@ func TestPreparationReclaimsOnlyDetachedFiles(t *testing.T) {
 	detached, detachedKey := testFile(t, db, id, root, "unlinked", 7, true)
 	other, otherRoot := testVolume(t, db, "other")
 	otherDetached, _ := testFile(t, db, other, otherRoot, "orphan", 11, true)
-	_, _, _, err := PrepareConfigured(t.Context(), db, "workspace", "", changes.DefaultWindow(), 1000, 1<<20,
-		&DurableOpen{Mode: RequireExistingVolume, ReapDetached: true})
+	_, _, _, err := PrepareConfigured(t.Context(), db, "workspace", "", changes.DefaultWindow(), 1000, 1<<20, 64<<20, &DurableOpen{Mode: RequireExistingVolume, ReapDetached: true})
 	if err != nil {
 		t.Fatal(err)
 	}

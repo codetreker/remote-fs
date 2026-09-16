@@ -3,6 +3,8 @@ package replicated
 import (
 	"context"
 	"errors"
+	"reflect"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -32,6 +34,9 @@ func (f *fileAuthorityStub) ReadAt(ctx context.Context, _ int64, _ int) (storage
 	return f.read(ctx)
 }
 func (f *fileAuthorityStub) Close(ctx context.Context) error { return f.close(ctx) }
+func (f *fileAuthorityStub) CloseWithBarrier(ctx context.Context) (*httprest.MutationBarrier, error) {
+	return &httprest.MutationBarrier{Incarnation: "log"}, f.close(ctx)
+}
 
 type fileSessionStub struct {
 	httprest.FileSessionWithBarrier
@@ -40,6 +45,9 @@ type fileSessionStub struct {
 }
 
 func (s *fileSessionStub) Close(ctx context.Context) error { return s.close(ctx) }
+func (s *fileSessionStub) CloseWithBarrier(ctx context.Context) (*httprest.MutationBarrier, error) {
+	return &httprest.MutationBarrier{Incarnation: "log"}, s.close(ctx)
+}
 func (s *fileSessionStub) OpenFileWithBarrier(ctx context.Context, _ string, _ storage.FileOpenOptions) (storage.File, *httprest.MutationBarrier, error) {
 	return s.open(ctx)
 }
@@ -74,7 +82,7 @@ func TestRetainedFileRequiresAnAtomicReplicationBarrier(t *testing.T) {
 				return storage.Attr{ID: 5, Size: 1}, test.barrier, test.failure
 			}}}
 			attr, err := file.WriteAt(t.Context(), 0, []byte{'x'})
-			if !errors.Is(err, syscall.EIO) || attr != (storage.Attr{}) || calls != 1 {
+			if !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(attr, storage.Attr{}) || calls != 1 {
 				t.Fatalf("unconfirmed publication returned %+v, %v after %d dispatches", attr, err, calls)
 			}
 			if session.base.activeConfirmations != 0 {
@@ -210,5 +218,62 @@ func TestRetainedFileUsesTheBoundedConfirmationPool(t *testing.T) {
 	}}}
 	if _, err := file.WriteAt(t.Context(), 0, nil); !errors.Is(err, syscall.EAGAIN) {
 		t.Fatal("retained mutation bypassed confirmation admission:", err)
+	}
+}
+
+func TestRetainedCloseCleansAuthorityBeforeFailedVisibilityConfirmation(t *testing.T) {
+	session := retainedTestSession(t, nil)
+	session.base.failure = errors.New("stream disconnected")
+	closes := 0
+	file := &retainedFile{session: session, remote: &fileAuthorityStub{close: func(context.Context) error {
+		closes++
+		return nil
+	}}}
+	err := file.Close(t.Context())
+	if storage.ErrnoOf(err) != syscall.EIO || closes != 1 {
+		t.Fatalf("failed stream prevented cleanup or reported visibility: %v; closes %d", err, closes)
+	}
+	var confirmationFailure *cleanupConfirmationFailure
+	if !errors.As(err, &confirmationFailure) || !errors.Is(err, confirmationFailure.cause) {
+		t.Fatalf("cleanup confirmation lost its underlying failure: %v", err)
+	}
+	if message := err.Error(); !strings.Contains(message, "authority cleanup completed") || !strings.Contains(message, "stream disconnected") {
+		t.Fatalf("cleanup diagnostic obscured the completed effect or visibility failure: %q", message)
+	}
+	if file.closed {
+		t.Fatal("unconfirmed close discarded its retry state")
+	}
+	session.base.failure = nil
+	if err := file.Close(t.Context()); err != nil || closes != 2 || !file.closed {
+		t.Fatalf("close retry did not confirm the authority barrier: %v; closes %d", err, closes)
+	}
+}
+
+func TestCleanupConfirmationRetainsPublicationErrorClassification(t *testing.T) {
+	session := retainedTestSession(t, nil)
+	session.base.options.MaxActiveConfirmations = 1
+	session.base.options.MaxWaitingConfirmations = 0
+	admitted, err := session.base.expect(t.Context(), "other", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.base.forget(admitted)
+	err = session.confirmCleanup(t.Context(), "close-file", &httprest.MutationBarrier{Incarnation: "log", Position: 1})
+	if storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("post-cleanup admission failure was reported as an unapplied request: %v", err)
+	}
+}
+
+func TestPermanentReplicaCloseNeedsValidBarrierWithoutVisibilityWait(t *testing.T) {
+	session := retainedTestSession(t, nil)
+	session.base.closing = true
+	session.base.failure = errors.New("replica stopped")
+	if err := session.confirmCleanup(t.Context(), "close-file", &httprest.MutationBarrier{Incarnation: "log", Position: 100}); err != nil {
+		t.Fatal("permanent replica close waited for an inaccessible future read:", err)
+	}
+	for _, barrier := range []*httprest.MutationBarrier{nil, {Incarnation: "elsewhere"}, {Incarnation: "log", Position: -1}} {
+		if err := session.confirmCleanup(t.Context(), "close-file", barrier); !errors.Is(err, syscall.EIO) {
+			t.Fatalf("permanent replica close accepted invalid barrier %+v: %v", barrier, err)
+		}
 	}
 }

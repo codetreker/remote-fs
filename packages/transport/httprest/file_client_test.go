@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -33,7 +34,9 @@ func TestRetainedHTTPCancelLockReconcilesPendingAttempt(t *testing.T) {
 	firstSession := fileSession(t, client)
 	secondSession := fileSession(t, client)
 	first := openHTTPFile(t, firstSession, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
+	firstRanges, firstOwners := rangeControlFixture(t, firstSession, first, 1)
 	second := openHTTPFile(t, secondSession, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
+	secondRanges, secondOwners := rangeControlFixture(t, secondSession, second, 1)
 	newID := func(session storage.FileSession) storage.LockRequestID {
 		t.Helper()
 		status, err := session.Status(ctx)
@@ -46,35 +49,35 @@ func TestRetainedHTTPCancelLockReconcilesPendingAttempt(t *testing.T) {
 		}
 		return id
 	}
-	lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
-	held, err := first.SetLock(ctx, 1, lock, newID(firstSession))
-	if err != nil || held.State != storage.LockGranted {
+	lock := storage.RangeCommand{Domain: storage.DomainWholeFile, Edit: storage.Replace, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}
+	held, err := firstRanges.Apply(ctx, firstOwners[0], []storage.RangeCommand{lock}, newID(firstSession))
+	if err != nil || held.State != storage.Granted {
 		t.Fatalf("held = %+v, %v", held, err)
 	}
 	lock.Wait = true
 	id := newID(secondSession)
-	pending, err := second.SetLock(ctx, 2, lock, id)
-	if err != nil || pending.State != storage.LockPending {
+	pending, err := secondRanges.Apply(ctx, secondOwners[0], []storage.RangeCommand{lock}, id)
+	if err != nil || pending.State != storage.Pending {
 		t.Fatalf("pending = %+v, %v", pending, err)
 	}
 	for i := 0; i < 2; i++ {
-		cancelled, err := second.CancelLock(ctx, 2, id)
-		if err != nil || cancelled.Request != id || cancelled.State != storage.LockCancelled {
+		cancelled, err := secondRanges.Cancel(ctx, secondOwners[0], id)
+		if err != nil || cancelled.Request != id || cancelled.State != storage.Cancelled {
 			t.Fatalf("cancel %d = %+v, %v", i, cancelled, err)
 		}
 	}
-	if err := first.DropLocks(ctx, 1, storage.Flock); err != nil {
+	if err := firstRanges.Drop(ctx, firstOwners[0], storage.DomainWholeFile); err != nil {
 		t.Fatal(err)
 	}
-	observed, err := second.QueryLock(ctx, 2, id)
-	if err != nil || observed.State != storage.LockCancelled {
+	observed, err := secondRanges.Query(ctx, secondOwners[0], id)
+	if err != nil || observed.State != storage.Cancelled {
 		t.Fatalf("cancelled request was granted after release: %+v, %v", observed, err)
 	}
-	conflict, err := first.GetLock(ctx, 1, lock)
+	conflict, err := firstRanges.GetConflict(ctx, firstOwners[0], lock)
 	if err != nil || conflict.Found {
 		t.Fatalf("cancel left a grant: %+v, %v", conflict, err)
 	}
-	if _, err := second.CancelLock(ctx, 2, "invalid"); !errors.Is(err, syscall.EINVAL) {
+	if _, err := secondRanges.Cancel(ctx, secondOwners[0], "invalid"); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("invalid cancellation = %v", err)
 	}
 }
@@ -117,7 +120,7 @@ func TestRetainedHTTPPlainOpenACKCancellationClosesExactReference(t *testing.T) 
 				t.Fatalf("native open/close calls = %d/%d, want 1/1", backend.opened.Load(), backend.closed.Load())
 			}
 			after, err := backend.Storage.Stat(t.Context(), "file")
-			if err != nil || before != after {
+			if err != nil || !reflect.DeepEqual(before, after) {
 				t.Fatalf("plain cancelled open changed attributes: before=%+v after=%+v err=%v", before, after, err)
 			}
 			if content, err := backend.Storage.Read(t.Context(), "file"); err != nil || string(content) != "original bytes" {
@@ -140,7 +143,8 @@ func TestRetainedHTTPOpenACKFailuresRemainEIO(t *testing.T) {
 			defer backend.closeError.Store(0)
 			options := storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}}
 			if name == "create" {
-				options.Create, options.Exclusive, options.Mode = true, true, 0600
+				options.Create, options.Exclusive = true, true
+				options.InitialMetadata = map[string][]byte{"test": {1, 2}}
 			} else if err := backend.Storage.Write(t.Context(), "file", []byte("original bytes")); err != nil {
 				t.Fatal(err)
 			}

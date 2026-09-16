@@ -38,7 +38,7 @@ import (
 const MinLimit = 4096
 
 const (
-	// DefaultMaxDirectoryBytes bounds the entries and names retained for one directory
+	// DefaultMaxDirectoryBytes bounds the entries, names, and metadata retained for one directory
 	// while the volume is measured.
 	DefaultMaxDirectoryBytes int64 = 64 << 20
 
@@ -166,11 +166,30 @@ func NewWithLimits(
 	if err := native.CheckPublicationAccounting(); err != nil {
 		return nil, err
 	}
+	s := &Storage{backing: native, limit: limit, measurement: effective}
+	if maintenance, ok := native.(storage.MaintenanceAccounting); ok {
+		err := maintenance.CheckMaintenanceAccounting()
+		if err == nil {
+			chain := storage.PublicationAccountingFrom(ctx).With(s.maintenanceAccounting)
+			if err := maintenance.BindMaintenanceAccounting(ctx, chain, func(used int64) {
+				s.countMu.Lock()
+				s.count = used
+				s.countMu.Unlock()
+			}); err != nil {
+				return nil, err
+			}
+			return s, nil
+		}
+		if err != syscall.EOPNOTSUPP {
+			return nil, err
+		}
+	}
 	count, err := measureUsage(ctx, native, effective)
 	if err != nil {
 		return nil, err
 	}
-	return &Storage{backing: native, limit: limit, measurement: effective, count: count}, nil
+	s.count = count
+	return s, nil
 }
 
 // Recount measures the volume again and replaces the count with what it finds.
@@ -293,8 +312,12 @@ func measure(ctx context.Context, s storage.BoundedStorage, limits MeasurementLi
 	return total, nil
 }
 
-func measurementEntryBytes(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
-	fixed := int64(unsafe.Sizeof(storage.Entry{}))
+func measurementEntryBytes(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+	retained, err := storage.MetadataRetentionBytes(metadataBytes)
+	if err != nil {
+		return 0, err
+	}
+	fixed := int64(unsafe.Sizeof(storage.Entry{})) + retained
 	if nameBytes > math.MaxInt64-fixed {
 		return 0, fmt.Errorf("a directory entry is too large to measure: %w", syscall.EOVERFLOW)
 	}

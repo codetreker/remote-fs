@@ -3,6 +3,7 @@ package limited_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -33,7 +34,7 @@ func retainedSession(t *testing.T, backing storage.FileStorage, ctx context.Cont
 
 func retainedFile(t *testing.T, session storage.FileSession, name string, create bool) storage.File {
 	t.Helper()
-	file, err := session.OpenFile(t.Context(), name, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: create}, Mode: 0o600})
+	file, err := session.OpenFile(t.Context(), name, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: create}, InitialMetadata: map[string][]byte{"app.test": []byte("retained")}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,29 +57,28 @@ func TestRetainedQuotaSurvivesUnlinkAndSettlesFinalCloseOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustUse(t, s, 2048)
-	mode := storage.SettableMode & 0o640
 	modified := time.Unix(1_700_000_000, 123)
-	changed, err := first.SetAttr(t.Context(), storage.AttrChange{Mode: &mode, ModTime: &modified})
-	if err != nil || changed.Size != 2048 || changed.Mode.Perm() != mode || !changed.ModTime.Equal(modified) {
+	changed, err := first.SetAttr(t.Context(), storage.AttrChange{ModTime: &modified})
+	if err != nil || changed.Size != 2048 || string(changed.Metadata["app.test"].Data) != "retained" || !changed.ModTime.Equal(modified) {
 		t.Fatalf("detached descriptor attributes = %+v, %v", changed, err)
 	}
 	accessed := modified.Add(-time.Hour)
 	byID, err := session.SetNodeAttr(t.Context(), changed.ID, storage.AttrChange{AccessTime: &accessed})
-	if err != nil || byID.ID != changed.ID || byID.Size != 2048 || byID.Mode.Perm() != mode ||
+	if err != nil || byID.ID != changed.ID || byID.Size != 2048 || !reflect.DeepEqual(byID.Metadata, changed.Metadata) ||
 		!byID.ModTime.Equal(modified) || !byID.AccessTime.Equal(accessed) {
 		t.Fatalf("detached identity attributes = %+v, %v", byID, err)
 	}
 	cancelled, cancel := context.WithCancel(t.Context())
 	cancel()
-	unapplied := storage.SettableMode & 0o600
-	if _, err := first.SetAttr(cancelled, storage.AttrChange{Mode: &unapplied}); !errors.Is(err, context.Canceled) {
+	unapplied := modified.Add(time.Hour)
+	if _, err := first.SetAttr(cancelled, storage.AttrChange{ModTime: &unapplied}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled descriptor attributes lost their cause: %v", err)
 	}
-	if _, err := session.SetNodeAttr(cancelled, changed.ID, storage.AttrChange{Mode: &unapplied}); !errors.Is(err, context.Canceled) {
+	if _, err := session.SetNodeAttr(cancelled, changed.ID, storage.AttrChange{ModTime: &unapplied}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled identity attributes lost their cause: %v", err)
 	}
 	observed, err := second.Stat(t.Context())
-	if err != nil || observed != byID {
+	if err != nil || !reflect.DeepEqual(observed, byID) {
 		t.Fatalf("second retained reference observed attributes %+v, %v; want %+v", observed, err, byID)
 	}
 	mustUse(t, s, 2048)

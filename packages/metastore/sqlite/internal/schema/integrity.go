@@ -22,6 +22,10 @@ func validateIntegrityWork(
 	volume *int64,
 	maxIntegrityRecords int64,
 ) error {
+	return validateIntegrityWorkVersion(ctx, db, volume, maxIntegrityRecords, schema.Version())
+}
+
+func validateIntegrityWorkVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, maxIntegrityRecords int64, version int) error {
 	var logTables int64
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*) FROM sqlite_schema
@@ -81,7 +85,19 @@ func validateIntegrityWork(
 	if volumes < 0 || nodes < 0 || objects < 0 || entries < 0 || logs < 0 || changes < 0 {
 		return fmt.Errorf("the database returned a negative volume integrity count: %w", syscall.EIO)
 	}
-	if sqlvalue.WouldExceed(maxIntegrityRecords, volumes, nodes, objects, entries, logs, changes) {
+	var intentions int64
+	if version >= firstClientCapabilitySchemaVersion {
+		where := ""
+		var args []any
+		if volume != nil {
+			where = " WHERE i.volume=? OR n.volume=?"
+			args = []any{*volume, *volume}
+		}
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM close_intents i LEFT JOIN nodes n ON n.id=i.node`+where, args...).Scan(&intentions); err != nil {
+			return err
+		}
+	}
+	if sqlvalue.WouldExceed(maxIntegrityRecords, volumes, nodes, objects, entries, logs, changes, intentions) {
 		return fmt.Errorf(
 			"volume integrity requires %d volumes, %d nodes, %d objects, %d entries, %d logs, and %d changes, above the configured work limit of %d; raise MaxIntegrityRecords to open it: %w",
 			volumes, nodes, objects, entries, logs, changes, maxIntegrityRecords, syscall.EFBIG)
@@ -231,6 +247,19 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 		objectArgs = []any{*volume, *volume}
 		entryArgs = []any{*volume, *volume, *volume}
 	}
+	nodeKindColumn, changeKindColumn := "mode", "mode"
+	clientNodeClasses, clientChangeClasses := "", ""
+	if version >= firstClientCapabilitySchemaVersion {
+		nodeKindColumn, changeKindColumn = "kind", "node_kind"
+		clientNodeClasses = ` OR typeof(birth_sec) NOT IN ('integer','null') OR typeof(birth_nsec) NOT IN ('integer','null')
+		OR typeof(change_sec) NOT IN ('integer','null') OR typeof(change_nsec) NOT IN ('integer','null')
+		OR typeof(metadata)!='blob' OR typeof(link_target)!='blob' OR typeof(directory_revision)!='blob'
+		OR typeof(pending_unlink)!='integer' OR typeof(pending_generation)!='integer'`
+		clientChangeClasses = ` OR typeof(birth_sec) NOT IN ('integer','null') OR typeof(birth_nsec) NOT IN ('integer','null')
+		OR typeof(change_sec) NOT IN ('integer','null') OR typeof(change_nsec) NOT IN ('integer','null')
+		OR typeof(metadata) NOT IN ('blob','null') OR typeof(link_target) NOT IN ('blob','null')
+		OR typeof(directory_revision) NOT IN ('blob','null')`
+	}
 	retainedNodeClasses := ""
 	if version >= firstRetainedFileSchemaVersion {
 		retainedNodeClasses = ` OR typeof(detached) != 'integer' OR typeof(content_revision) != 'integer'`
@@ -243,10 +272,10 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 		{"nodes", `SELECT count(*) FROM nodes ` + nodeWhere + predicateJoin(nodeWhere) + `(
 			typeof(id) != 'integer' OR id <= 0 OR
 			typeof(volume) != 'integer' OR volume <= 0 OR
-			typeof(mode) != 'integer' OR typeof(size) != 'integer' OR
+			typeof(` + nodeKindColumn + `) != 'integer' OR typeof(size) != 'integer' OR
 			typeof(atime_sec) != 'integer' OR typeof(atime_nsec) != 'integer' OR
 			typeof(mtime_sec) != 'integer' OR typeof(mtime_nsec) != 'integer' OR
-			typeof(content) NOT IN ('text', 'null')` + retainedNodeClasses + `)`, scopeArgs},
+			typeof(content) NOT IN ('text', 'null')` + retainedNodeClasses + clientNodeClasses + `)`, scopeArgs},
 		{"objects", `SELECT count(*) FROM objects o ` + objectWhere + predicateJoin(objectWhere) + `(
 			typeof(o.key) != 'text' OR o.key = '' OR
 			typeof(o.volume) != 'integer' OR o.volume <= 0 OR
@@ -276,11 +305,11 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 			typeof(name) NOT IN ('blob', 'null') OR
 			typeof(from_parent) NOT IN ('integer', 'null') OR
 			typeof(from_name) NOT IN ('blob', 'null') OR
-			typeof(node) NOT IN ('integer', 'null') OR typeof(mode) NOT IN ('integer', 'null') OR
+			typeof(node) NOT IN ('integer', 'null') OR typeof(` + changeKindColumn + `) NOT IN ('integer', 'null') OR
 			typeof(size) NOT IN ('integer', 'null') OR typeof(atime_sec) NOT IN ('integer', 'null') OR
 			typeof(atime_nsec) NOT IN ('integer', 'null') OR typeof(mtime_sec) NOT IN ('integer', 'null') OR
 			typeof(mtime_nsec) NOT IN ('integer', 'null') OR typeof(content) NOT IN ('text', 'null') OR
-			typeof(recorded_sec) != 'integer' OR typeof(recorded_nsec) != 'integer')`, scopeArgs},
+			typeof(recorded_sec) != 'integer' OR typeof(recorded_nsec) != 'integer'` + clientChangeClasses + `)`, scopeArgs},
 		{"backing store", `SELECT count(*) FROM backing_store WHERE
 			typeof(singleton) != 'integer' OR singleton != 1 OR
 			typeof(store_id) != 'text' OR store_id = ''`, nil},
@@ -324,9 +353,9 @@ func ValidateVolumeIntegrity(
 	ctx context.Context,
 	db sqlvalue.Queryer,
 	volume int64,
-	maxIntegrityRecords, maxIntegrityBytes int64,
+	maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes int64,
 ) error {
-	return validateIntegrity(ctx, db, &volume, maxIntegrityRecords, maxIntegrityBytes, schema.Version())
+	return validateIntegrity(ctx, db, &volume, maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes, schema.Version())
 }
 
 // A nil volume validates the complete database for migration or exclusive-owner recovery.
@@ -335,14 +364,19 @@ func validateIntegrity(
 	ctx context.Context,
 	db sqlvalue.Queryer,
 	volume *int64,
-	maxIntegrityRecords, maxIntegrityBytes int64,
+	maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes int64,
 	version int,
 ) error {
-	if err := validateIntegrityWork(ctx, db, volume, maxIntegrityRecords); err != nil {
+	if err := validateIntegrityWorkVersion(ctx, db, volume, maxIntegrityRecords, version); err != nil {
 		return err
 	}
 	if err := validateIntegrityBytes(ctx, db, volume, maxIntegrityBytes, version); err != nil {
 		return err
+	}
+	if version >= firstClientCapabilitySchemaVersion {
+		if err := validateMetadataIntegrity(ctx, db, volume, maxMetadataBytes); err != nil {
+			return err
+		}
 	}
 	if err := validateStorageClassesVersion(ctx, db, volume, version); err != nil {
 		return err
@@ -377,14 +411,19 @@ func validateIntegrity(
 		return fmt.Errorf("the database holds %d objects in an unknown state and %d objects with an invalid size: %w",
 			invalidStates, invalidSizes, syscall.EIO)
 	}
-	if err := validateObjectRelationships(ctx, db, volume); err != nil {
+	if err := validateObjectRelationshipsVersion(ctx, db, volume, version); err != nil {
 		return err
 	}
 	if err := validateNodeRelationshipsVersion(ctx, db, volume, version); err != nil {
 		return err
 	}
-	if err := validateUsedAccounting(ctx, db, volume); err != nil {
+	if err := validateUsedAccountingVersion(ctx, db, volume, version); err != nil {
 		return err
 	}
-	return validateLogIntegrity(ctx, db, volume)
+	if version >= firstClientCapabilitySchemaVersion {
+		if err := validateCloseIntents(ctx, db, volume); err != nil {
+			return err
+		}
+	}
+	return validateLogIntegrityVersion(ctx, db, volume, version, true)
 }

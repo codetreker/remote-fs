@@ -77,7 +77,7 @@ func execute(t *testing.T, db interface {
 
 func testVolume(t *testing.T, db *sql.DB, name string) (int64, int64) {
 	t.Helper()
-	id, root, err := Prepare(t.Context(), db, name, "", changes.DefaultWindow(), 1000, 1<<20)
+	id, root, err := Prepare(t.Context(), db, name, "", changes.DefaultWindow(), 1000, 1<<20, 64<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,8 +94,8 @@ func testFile(t *testing.T, db *sql.DB, volume, parent int64, name string, size 
 	key := fmt.Sprintf("content-%d", id)
 	execute(t, tx, `INSERT INTO objects (key, volume, state, size, created_sec, created_nsec)
 		VALUES (?, ?, ?, ?, 0, 0)`, key, volume, StateReferenced, size)
-	execute(t, tx, `INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content, detached)
-		VALUES (?, ?, 420, ?, 0, 0, 0, 0, ?, ?)`, id, volume, size, key, detached)
+	execute(t, tx, `INSERT INTO nodes (id, volume, kind, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content, detached)
+		VALUES (?, ?, 1, ?, 0, 0, 0, 0, ?, ?)`, id, volume, size, key, detached)
 	if !detached {
 		execute(t, tx, `INSERT INTO entries (volume, parent, name, node) VALUES (?, ?, ?, ?)`, volume, parent, []byte(name), id)
 	}
@@ -123,28 +123,26 @@ func testChange(t *testing.T, db *sql.DB, volume, parent int64, name string) {
 
 func TestPreparePreservesVolumeAndAdvancesDurableState(t *testing.T) {
 	db := testDatabase(t, 0)
-	id, root, state, err := PrepareConfigured(t.Context(), db, "workspace", "store-a", changes.DefaultWindow(), 1000, 1<<20,
-		&DurableOpen{Mode: CreateVolumeIfMissing, Witnessed: true})
+	id, root, state, err := PrepareConfigured(t.Context(), db, "workspace", "store-a", changes.DefaultWindow(), 1000, 1<<20, 64<<20, &DurableOpen{Mode: CreateVolumeIfMissing, Witnessed: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if id <= 0 || root <= 0 || state.Generation != 1 || state.NodeHighWater != root || len(state.DatabaseID) != 32 {
 		t.Fatalf("unexpected prepared identity: volume=%d root=%d state=%+v", id, root, state)
 	}
-	var mode, size, used int64
+	var kind, size, used int64
 	var incarnation string
-	if err := db.QueryRow(`SELECT n.mode, n.size, ns.used, l.incarnation FROM volumes ns
+	if err := db.QueryRow(`SELECT n.kind, n.size, ns.used, l.incarnation FROM volumes ns
 		JOIN nodes n ON n.id = ns.root JOIN logs l ON l.volume = ns.id WHERE ns.id = ?`, id).
-		Scan(&mode, &size, &used, &incarnation); err != nil {
+		Scan(&kind, &size, &used, &incarnation); err != nil {
 		t.Fatal(err)
 	}
-	if mode != int64(fs.ModeDir|0o755) || size != 0 || used != 0 || incarnation == "" {
-		t.Fatalf("invalid root: mode=%o size=%d used=%d log=%q", mode, size, used, incarnation)
+	if kind != 2 || size != 0 || used != 0 || incarnation == "" {
+		t.Fatalf("invalid root: kind=%d size=%d used=%d log=%q", kind, size, used, incarnation)
 	}
-	gotID, gotRoot, next, err := PrepareConfigured(t.Context(), db, "workspace", "store-a", changes.DefaultWindow(), 1000, 1<<20,
-		&DurableOpen{Mode: RequireExistingVolume, Witnessed: true, Startup: dbstate.Startup{
-			Accepted: state, CheckpointedGeneration: state.Generation,
-		}})
+	gotID, gotRoot, next, err := PrepareConfigured(t.Context(), db, "workspace", "store-a", changes.DefaultWindow(), 1000, 1<<20, 64<<20, &DurableOpen{Mode: RequireExistingVolume, Witnessed: true, Startup: dbstate.Startup{
+		Accepted: state, CheckpointedGeneration: state.Generation,
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +166,7 @@ func TestPrepareRefusalRollsBackMigrationAndVolumeCreation(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			db := testDatabase(t, test.version)
-			_, _, _, err := PrepareConfigured(t.Context(), db, "missing", "store", changes.DefaultWindow(), test.maxRecords, 1<<20, test.mode)
+			_, _, _, err := PrepareConfigured(t.Context(), db, "missing", "store", changes.DefaultWindow(), test.maxRecords, 1<<20, 64<<20, test.mode)
 			if !errors.Is(err, test.want) {
 				t.Fatalf("got %v, want %v", err, test.want)
 			}
@@ -189,14 +187,14 @@ func TestPrepareRefusalRollsBackMigrationAndVolumeCreation(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, _, err := Prepare(ctx, testDatabase(t, 0), "x", "", changes.DefaultWindow(), 1000, 1<<20)
+	_, _, err := Prepare(ctx, testDatabase(t, 0), "x", "", changes.DefaultWindow(), 1000, 1<<20, 64<<20)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled preparation lost its cause: %v", err)
 	}
 }
 
 func TestPrepareMigratesPopulatedHistoricalVolumes(t *testing.T) {
-	for _, version := range []int{1, 2, 3, 4} {
+	for _, version := range []int{1, 2, 3, 4, 5} {
 		t.Run(fmt.Sprint(version), func(t *testing.T) {
 			db := testDatabase(t, version)
 			execute(t, db, `INSERT INTO volumes (id,name,root,used) VALUES (1,'legacy',1,3)`)
@@ -213,7 +211,7 @@ func TestPrepareMigratesPopulatedHistoricalVolumes(t *testing.T) {
 			if version >= 3 {
 				execute(t, db, `UPDATE database_state SET node_high_water=2`)
 			}
-			id, root, err := Prepare(t.Context(), db, "legacy", "", changes.DefaultWindow(), 1000, 1<<20)
+			id, root, err := Prepare(t.Context(), db, "legacy", "", changes.DefaultWindow(), 1000, 1<<20, 64<<20)
 			if err != nil || id != 1 || root != 1 {
 				t.Fatalf("migrating version %d: id=%d root=%d error=%v", version, id, root, err)
 			}
@@ -222,7 +220,7 @@ func TestPrepareMigratesPopulatedHistoricalVolumes(t *testing.T) {
 			if err := db.QueryRow(`SELECT (SELECT version FROM schema_version),content_revision,size FROM nodes WHERE id=2`).Scan(&stored, &revision, &size); err != nil {
 				t.Fatal(err)
 			}
-			if stored != 5 || revision != 1 || size != 3 {
+			if stored != 6 || revision != 1 || size != 3 {
 				t.Fatalf("migration changed data: version=%d revision=%d size=%d", stored, revision, size)
 			}
 		})

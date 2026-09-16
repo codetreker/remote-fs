@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"sync"
 	"syscall"
@@ -251,7 +252,14 @@ func (s *Storage) maintain(ctx context.Context, interval time.Duration, batch in
 }
 
 func (s *Storage) maintainBatch(ctx context.Context, batch int) {
+	cleanupErr := s.retryReferenceCleanup(ctx, batch)
+	cleanupErr = errors.Join(cleanupErr, s.retryPendingUnlinks(ctx, batch))
 	removed, err := s.runBackgroundSweep(ctx, batch)
+	if cleanupErr != nil {
+		s.statusMu.Lock()
+		s.maintenanceStatus.LastSweepError = errors.Join(s.maintenanceStatus.LastSweepError, cleanupErr)
+		s.statusMu.Unlock()
+	}
 	if err == nil && removed == batch {
 		s.sweepAfterMutation()
 	}
@@ -369,10 +377,8 @@ func (s *Storage) ListBounded(ctx context.Context, path string, result *storage.
 
 // Read returns the whole contents of the file at path.
 //
-// Nothing here answers for a symbolic link, and nothing needs to: the storage contract
-// offers no operation that makes one, so a volume reachable only through it never comes
-// to hold one. A local directory is different because something outside this system can
-// make a link in it; a metastore has no outside.
+// Symlink targets belong to native reference state. Reading a link through
+// this regular-file content API reports ELOOP.
 //
 // Reading is two steps — ask the tree which object, then ask for that object — and a write
 // can land between them. When it does, the object the tree named a moment ago has already
@@ -397,6 +403,7 @@ func (s *Storage) ReadBounded(ctx context.Context, path string, maxBytes int64) 
 }
 
 func (s *Storage) read(ctx context.Context, path string, maxBytes *int64) ([]byte, error) {
+	ctx = metastore.WithFileAccess(ctx, metastore.FileAccess{Uses: storage.ReadData, Length: math.MaxInt64})
 	cleaned, err := storage.CleanPath(path)
 	if err != nil {
 		return nil, &os.PathError{Op: "read", Path: path, Err: err}
@@ -414,6 +421,8 @@ func (s *Storage) read(ctx context.Context, path string, maxBytes *int64) ([]byt
 		switch {
 		case node.IsDir():
 			return nil, &os.PathError{Op: "read", Path: path, Err: syscall.EISDIR}
+		case node.Kind == storage.NodeSymlink:
+			return nil, &os.PathError{Op: "read", Path: path, Err: syscall.ELOOP}
 		case node.Content == "":
 			if node.Size != 0 {
 				return nil, fmt.Errorf("the contents of %s have size %d but no object: %w", path, node.Size, syscall.EIO)

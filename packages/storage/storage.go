@@ -9,7 +9,6 @@ package storage
 import (
 	"context"
 	"fmt"
-	"io/fs"
 	"path"
 	"slices"
 	"strings"
@@ -51,17 +50,14 @@ import (
 //
 // The operations that could otherwise resolve a link therefore refuse one. Read and Write
 // report syscall.ELOOP, which is what open(2) answers when it is told not to follow. A
-// mode cannot be put on a link at all, since no Unix offers a way to set one, so a SetAttr
-// naming a mode reports syscall.EOPNOTSUPP; times can be, and a SetAttr naming times
-// succeeds and changes the link's own. A change naming both is thus one more change that
-// may be applied in part.
+// link's common times and opaque client metadata describe the link itself.
 //
 // An implementation that cannot determine an outcome must report that failure. It must
 // never substitute an empty listing or syscall.ENOENT, because both of those read as
 // established fact to whatever runs on top, and acting on them destroys data.
 type Storage interface {
 	// Stat reports the attributes of the node at path. A symbolic link is described as a
-	// link — its own mode and its own length — rather than as whatever it points at.
+	// link — its own kind and its own length — rather than as whatever it points at.
 	Stat(ctx context.Context, path string) (Attr, error)
 
 	// SetAttr applies change to the node at path. An attribute the change does not name
@@ -69,8 +65,7 @@ type Storage interface {
 	//
 	// A change naming more than one attribute is not applied atomically: an
 	// implementation may have applied part of it when it reports a failure. Nothing
-	// above this interface depends on it being otherwise, because a kernel sends a mode
-	// change and a time change as separate requests.
+	// above this interface depends on it being otherwise, because callers can apply separate common-time requests.
 	SetAttr(ctx context.Context, path string, change AttrChange) error
 
 	// List returns the entries of the directory at path, sorted by name.
@@ -163,7 +158,7 @@ type BoundedStorage interface {
 type ListResult struct {
 	maxBytes   int64
 	usedBytes  int64
-	entryBytes func(index int, nameBytes int64, attr Attr) (int64, error)
+	entryBytes func(index int, nameBytes, metadataBytes int64, attr Attr) (int64, error)
 	entries    []Entry
 	pending    int
 	failure    error
@@ -171,7 +166,7 @@ type ListResult struct {
 
 // NewListResult constructs an empty bounded listing. Every bound and charge must be
 // non-negative, and maxBytes must leave room for the empty representation.
-func NewListResult(maxBytes, fixedBytes int64, entryBytes func(index int, nameBytes int64, attr Attr) (int64, error)) (*ListResult, error) {
+func NewListResult(maxBytes, fixedBytes int64, entryBytes func(index int, nameBytes, metadataBytes int64, attr Attr) (int64, error)) (*ListResult, error) {
 	if maxBytes < 0 {
 		return nil, fmt.Errorf("a listing byte bound cannot be negative: %w", syscall.EINVAL)
 	}
@@ -188,19 +183,26 @@ func NewListResult(maxBytes, fixedBytes int64, entryBytes func(index int, nameBy
 // entry is appended, which is the ordering that makes the bound useful to an implementation
 // enumerating a directory one row or one readdir batch at a time.
 func (r *ListResult) Add(entry Entry) error {
-	reservation, err := r.Reserve(int64(len(entry.Name)), entry.Attr)
+	size, err := metadataSize(entry.Attr.Metadata)
+	if err != nil {
+		return r.Fail(err)
+	}
+	attr := entry.Attr
+	attr.Metadata = nil
+	reservation, err := r.Reserve(int64(len(entry.Name)), int64(size), attr)
 	if err != nil {
 		return err
 	}
-	return reservation.Commit(entry.Name)
+	return reservation.Commit(entry.Name, entry.Attr.Metadata)
 }
 
-// Reserve charges one entry before its name is loaded. A database-backed implementation
+// Reserve charges the raw name and canonical metadata envelope before either is loaded.
+// Attr.Metadata must be absent until Commit; an empty envelope is six bytes. A database-backed implementation
 // uses the length stored in SQLite to refuse an oversized BLOB before scanning it into a Go
 // allocation. It retains attributes with times normalized to UTC, so the reservation itself
 // cannot keep caller-owned Location data alive. Every successful reservation must be
 // committed exactly once before Entries.
-func (r *ListResult) Reserve(nameBytes int64, attr Attr) (*ListReservation, error) {
+func (r *ListResult) Reserve(nameBytes, metadataBytes int64, attr Attr) (*ListReservation, error) {
 	if r == nil {
 		return nil, fmt.Errorf("a nil listing result cannot retain an entry: %w", syscall.EINVAL)
 	}
@@ -210,10 +212,16 @@ func (r *ListResult) Reserve(nameBytes int64, attr Attr) (*ListReservation, erro
 	if nameBytes < 0 {
 		return nil, r.fail(fmt.Errorf("a listing name cannot have negative length: %w", syscall.EIO))
 	}
+	if len(attr.Metadata) != 0 {
+		return nil, r.fail(syscall.EINVAL)
+	}
+	if metadataBytes < 6 || metadataBytes > MaxMetadataBytes {
+		return nil, r.fail(syscall.EIO)
+	}
 	attr.AccessTime = attr.AccessTime.UTC()
 	attr.ModTime = attr.ModTime.UTC()
 	index := len(r.entries) + r.pending
-	bytes, err := r.entryBytes(index, nameBytes, attr)
+	bytes, err := r.entryBytes(index, nameBytes, metadataBytes, attr)
 	if err != nil {
 		return nil, r.fail(err)
 	}
@@ -225,7 +233,7 @@ func (r *ListResult) Reserve(nameBytes int64, attr Attr) (*ListReservation, erro
 	}
 	r.usedBytes += bytes
 	r.pending++
-	return &ListReservation{result: r, nameBytes: nameBytes, attr: attr}, nil
+	return &ListReservation{result: r, nameBytes: nameBytes, metadataBytes: metadataBytes, attr: attr.Clone()}, nil
 }
 
 // Entries returns the completed listing sorted by bytewise name. The returned slice is
@@ -272,14 +280,15 @@ func (r *ListResult) MaxBytes() int64 {
 
 // ListReservation is one charged entry whose name has not yet been loaded.
 type ListReservation struct {
-	result    *ListResult
-	nameBytes int64
-	attr      Attr
-	committed bool
+	result        *ListResult
+	nameBytes     int64
+	metadataBytes int64
+	attr          Attr
+	committed     bool
 }
 
 // Commit supplies the name whose length was charged by Reserve and retains an owned copy.
-func (r *ListReservation) Commit(name string) error {
+func (r *ListReservation) Commit(name string, metadata map[string]OpaquePayload) error {
 	if r == nil || r.result == nil || r.committed {
 		return fmt.Errorf("a listing reservation can be committed exactly once: %w", syscall.EINVAL)
 	}
@@ -289,6 +298,14 @@ func (r *ListReservation) Commit(name string) error {
 	if r.result.failure != nil {
 		return r.result.failure
 	}
+	size, err := metadataSize(metadata)
+	if err != nil {
+		return r.result.fail(err)
+	}
+	if int64(size) != r.metadataBytes {
+		return r.result.fail(fmt.Errorf("listing metadata length differs from reservation: %w", syscall.EIO))
+	}
+	r.attr.Metadata = CloneMetadata(metadata)
 	r.committed = true
 	r.result.pending--
 	r.result.entries = append(r.result.entries, Entry{Name: strings.Clone(name), Attr: r.attr})
@@ -356,9 +373,10 @@ type Attr struct {
 	// the contract suite refuses one that tries.
 	ID uint64
 
-	// Mode carries the type bits and the permission bits. The type bits say what kind of
-	// node is at the name, so a symbolic link reads as fs.ModeSymlink.
-	Mode fs.FileMode
+	Kind       NodeKind
+	BirthTime  *time.Time
+	ChangeTime *time.Time
+	Metadata   map[string]OpaquePayload
 
 	// Size is the length of a file's contents in bytes, or of the name a symbolic link
 	// holds. It is unspecified for a directory.
@@ -372,17 +390,7 @@ type Attr struct {
 }
 
 // IsDir reports whether the node is a directory.
-func (a Attr) IsDir() bool { return a.Mode.IsDir() }
-
-// SettableMode is every bit of a Mode a caller may set: the permission bits, and the
-// three bits that change how they are applied.
-//
-// The rest of an fs.FileMode says what kind of node this is, and a node's kind is not a
-// property a caller changes — a directory does not become a file by being chmod-ed. The
-// bits no Linux filesystem has, fs.ModeAppend and fs.ModeExclusive among them, are
-// outside it for a second reason: an implementation cannot store what its host has no
-// place for, so accepting them would report a change that did not happen.
-const SettableMode = fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky
+func (a Attr) IsDir() bool { return a.Kind == NodeDirectory }
 
 // AttrChange names the attributes to set on a node.
 //
@@ -392,7 +400,8 @@ const SettableMode = fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky
 // kernel sends a mode change and a time change as separate requests, and neither may
 // clear what the other set.
 type AttrChange struct {
-	Mode       *fs.FileMode
+	BirthTime  *time.Time
+	ChangeTime *time.Time
 	AccessTime *time.Time
 	ModTime    *time.Time
 }
@@ -400,19 +409,13 @@ type AttrChange struct {
 // Empty reports whether the change names no attribute at all. Such a change is still a
 // statement about one node, and applying it still fails if that node is not there.
 func (c AttrChange) Empty() bool {
-	return c.Mode == nil && c.AccessTime == nil && c.ModTime == nil
+	return c.BirthTime == nil && c.ChangeTime == nil && c.AccessTime == nil && c.ModTime == nil
 }
 
 // Check rejects a change no implementation may carry out, with syscall.EINVAL. Every
 // implementation owes its callers this refusal, so it lives here rather than being
 // written out again in each of them.
-func (c AttrChange) Check() error {
-	if c.Mode != nil && *c.Mode&^SettableMode != 0 {
-		return fmt.Errorf("mode %v sets bits outside %v, which name a node's kind rather than its permissions: %w",
-			*c.Mode, SettableMode, syscall.EINVAL)
-	}
-	return nil
-}
+func (c AttrChange) Check() error { return nil }
 
 // Entry is one member of a directory listing. Attributes travel alongside the name so
 // that listing a directory of n entries costs one call rather than n+1 — the difference

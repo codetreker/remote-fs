@@ -38,6 +38,14 @@ func TestStorageContract(t *testing.T) {
 	})
 }
 
+func TestMetadataContract(t *testing.T) {
+	storagetest.RunMetadata(t, func(t *testing.T) storage.Storage {
+		store := open(t, testConfig(privateRoot(t)))
+		t.Cleanup(func() { closeStore(t, store) })
+		return store
+	})
+}
+
 func TestBoundedStorageContract(t *testing.T) {
 	storagetest.RunBounded(t, func(t *testing.T) storage.BoundedStorage {
 		store := open(t, testConfig(privateRoot(t)))

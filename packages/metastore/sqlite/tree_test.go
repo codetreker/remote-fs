@@ -20,7 +20,7 @@ func TestListBoundedLoadsANameOnlyAfterItsReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	reserved := false
-	result, err := storage.NewListResult(1024, 0, func(_ int, nameBytes int64, attr storage.Attr) (int64, error) {
+	result, err := storage.NewListResult(1024, 0, func(_ int, nameBytes int64, _ int64, attr storage.Attr) (int64, error) {
 		reserved = true
 		if nameBytes != int64(len("entry")) || attr.ID == 0 {
 			t.Fatalf("reservation received name length %d and attributes %+v", nameBytes, attr)
@@ -58,7 +58,7 @@ func TestListBoundedRefusesAStoredHugeNameBeforeLoadingItsBlob(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := storage.NewListResult(1, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+	result, err := storage.NewListResult(1, 0, func(_ int, nameBytes int64, _ int64, _ storage.Attr) (int64, error) {
 		return nameBytes, nil
 	})
 	if err != nil {
@@ -91,13 +91,13 @@ func TestListBoundedDoesNotLoadContentBeforeReservingAnEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := writer.ExecContext(t.Context(), `
-		UPDATE nodes SET content = zeroblob(?) WHERE id = (
+		UPDATE nodes SET content = CAST(zeroblob(?) AS TEXT) WHERE id = (
 			SELECT node FROM entries WHERE volume = ? AND parent = ? AND name = CAST('file' AS BLOB)
 		)`, contentBytes, store.volume, store.root); err != nil {
 		t.Fatal(err)
 	}
 	reservationFailure := errors.New("reservation refused")
-	result, err := storage.NewListResult(1024, 0, func(_ int, _ int64, _ storage.Attr) (int64, error) {
+	result, err := storage.NewListResult(1024, 0, func(_ int, _ int64, _ int64, _ storage.Attr) (int64, error) {
 		return 0, reservationFailure
 	})
 	if err != nil {
@@ -140,7 +140,7 @@ func TestListBoundedRefusesTwoNamesForOneNodeWithoutExposingEither(t *testing.T)
 		t.Fatal(err)
 	}
 
-	result, err := storage.NewListResult(100, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+	result, err := storage.NewListResult(100, 0, func(_ int, nameBytes int64, _ int64, _ storage.Attr) (int64, error) {
 		return nameBytes + 1, nil
 	})
 	if err != nil {
@@ -175,7 +175,7 @@ func TestListBoundedRefusesDifferentLengthNamesForOneNodeWithoutExposingEither(t
 		t.Fatal(err)
 	}
 
-	result, err := storage.NewListResult(1024, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+	result, err := storage.NewListResult(1024, 0, func(_ int, nameBytes int64, _ int64, _ storage.Attr) (int64, error) {
 		return nameBytes + 1, nil
 	})
 	if err != nil {

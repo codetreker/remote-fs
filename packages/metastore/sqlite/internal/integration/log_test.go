@@ -17,7 +17,7 @@ import (
 
 func readChanges(ctx context.Context, log metastore.Log, after metastore.Position, limit int) ([]metastore.Change, metastore.Retention, error) {
 	result, err := metastore.NewChangeResult(64<<20, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
-		return 256 + lengths.Name + lengths.FromName + lengths.Content, nil
+		return 256 + lengths.Name + lengths.FromName + lengths.Content + lengths.Metadata + lengths.Target, nil
 	})
 	if err != nil {
 		return nil, metastore.Retention{}, err
@@ -36,7 +36,7 @@ func TestSinceRefusesAnOversizedStoredNameBeforeExposingAPartialPage(t *testing.
 		t.Fatal(err)
 	}
 	result, err := metastore.NewChangeResult(128, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
-		return lengths.Name + lengths.FromName + lengths.Content + 1, nil
+		return lengths.Name + lengths.FromName + lengths.Content + lengths.Metadata + lengths.Target + 1, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -55,7 +55,7 @@ func TestSinceRefusesLiveChangeCorruptionWithoutExposingAPartialPage(t *testing.
 		damage string
 	}{
 		{"text kind", `UPDATE changes SET kind = 'created' WHERE position = (SELECT min(position) FROM changes)`},
-		{"text mode", `UPDATE changes SET mode = 'regular' WHERE position = (SELECT min(position) FROM changes)`},
+		{"text node kind", `UPDATE changes SET node_kind = 'regular' WHERE position = (SELECT min(position) FROM changes)`},
 		{"text name", `UPDATE changes SET name = 'file' WHERE position = (SELECT min(position) FROM changes)`},
 		{"missing created name", `UPDATE changes SET name = NULL WHERE position = (SELECT min(position) FROM changes)`},
 		{"slash in name", `UPDATE changes SET name = CAST('bad/name' AS BLOB) WHERE position = (SELECT min(position) FROM changes)`},
@@ -73,7 +73,7 @@ func TestSinceRefusesLiveChangeCorruptionWithoutExposingAPartialPage(t *testing.
 			damageDatabase(t, path, test.damage)
 
 			result, err := metastore.NewChangeResult(1<<20, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
-				return 256 + lengths.Name + lengths.FromName + lengths.Content, nil
+				return 256 + lengths.Name + lengths.FromName + lengths.Content + lengths.Metadata + lengths.Target, nil
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -126,7 +126,7 @@ func TestSinceDoesNotHoldTheHealthGateWhileChargingAResult(t *testing.T) {
 				close(entered)
 			}
 			<-release
-			return 256 + lengths.Name + lengths.FromName + lengths.Content, nil
+			return 256 + lengths.Name + lengths.FromName + lengths.Content + lengths.Metadata + lengths.Target, nil
 		})
 	if err != nil {
 		t.Fatal(err)

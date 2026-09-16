@@ -12,7 +12,9 @@ import (
 // detached files and remains available when the volume has no allowance.
 type FileStore interface {
 	// CheckFileStore reports the constructor-selected retention capability without
-	// waiting for I/O or publication. Operations verify current exclusive ownership.
+	// waiting for I/O or publication. It includes request-local attribute-result
+	// admission before payload loading and before effects that return attributes.
+	// Operations verify current exclusive ownership.
 	CheckFileStore() error
 	Advisory(context.Context) (*advisory.Coordinator, error)
 	OpenFile(context.Context, string, storage.FileOpenOptions) (File, error)

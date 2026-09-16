@@ -62,7 +62,11 @@ Windows 原生重定向器可以在远端创建已经完成后继续复用此前
 
 四个冲突的 SMB 目录第二次打开均没有发出新的 CREATE，原生 API 已在重定向器侧返回共享冲突；只修改第二次打开的服务端检查，不能改变这组在发送前已被拒绝的请求。这个结论限于已测的访问/share masks 和打开顺序，不是关于所有目录或 root 的概括。八个作业的缓存策略保持不变、映射和 backend 引用清理完成，通知回归均通过且没有 skip。[原生运行 35087653528](https://github.com/codetreker/remote-fs/actions/runs/35087653528)对 FindFirstChangeNotification 的共存性返回失败，探针 SHA 为 `70beddac497daf1962df36a7827d99a0174d3d44`。NTFS root 两个顺序均冲突；SMB watcher-first 已有 Pending，后续应用打开仍冲突；SMB application-first 的无监听基线失败，因而该行不能作为其后打开顺序的有效对照。没有由此得到可见性、重新监听或故障验收。
 
-该次只读 RTL 实测为 0xc000000f→2、0xc0000034→2、0xc000003a→3，wire status 未改变；返回同一 Win32 错误不证明缓存行为相同。新 missing_final_status 才单独改变已核对的最终缺失状态，其原生结果尚未取得，不能把这次只读观察说成替代状态已经可行。
+该次只读 RTL 实测为 0xc000000f→2、0xc0000034→2、0xc000003a→3，wire status 未改变；返回同一 Win32 错误不证明缓存行为相同。missing_final_status 单独改变已核对的最终缺失状态，其结果不能从这次只读映射推导。
+
+[原生运行 35088586249](https://github.com/codetreker/remote-fs/actions/runs/35088586249)随后验证了这个独立对照，探针 SHA 为 `6e7a0cf098b04c369754bf3ee81e8da20ceea097`。第一阶段没有监听或显式父目录句柄，wire 最终缺失为 0xc000000f、Win32 为 FILE_NOT_FOUND，远端创建在 ACK 后约 7.55 ms 可见；第二阶段持有根 LIST/share=0，另一个名字约 7.49 ms 可见。两次各有新权威 CREATE，并早于五秒缓存到期；整个轨迹没有 CHANGE_NOTIFY。
+
+该次最终缺失 overlay 的 Windows SHA256 为 `263fd82b00308514e994de690351f5add58fe13bff3ddbf07c0853ea7c19ea1b`，与 LF 补丁 `a53e64d479138497e99f96ded82af01ec69be8434eac4cf0952f9c534dfc8d8a` 的 LF→CRLF 转换一致，连续性 overlay 仍单独记录。通知与最终缺失的专用回归均通过且无 skip；缓存策略未变，映射为空，backend 引用与 cleanup failure 为零。这个结果只证明指定基底/补丁下的两项负名字与独占根对照，不代替实际 Windows 集成、其它缓存类型、内部名字观察或当前绑定 API 的验收。
 
 每次诊断的结果绑定基底 commit、各 overlay SHA256、探针 commit、variant、OS/build 和缓存设置；没有 overlay 的历史运行分别保留其原始执行来源。JSON 轨迹、Go verdict、映射前后状态及最终引用数作为产物保留十四天；轨迹溢出、编码失败、改变缓存策略或映射残留都会使结果失败。取消 overlapped 通知时保留其结构与缓冲直到完成，除明确的丢明细结果外，意外的异步完成/事件关闭错误仍报告失败，进程卡住由测试超时显式暴露。
 

@@ -10,7 +10,6 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
-	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/schema"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
@@ -69,6 +68,9 @@ func (s *Store) Reserve(ctx context.Context, path string, size int64) (metastore
 		}
 		if found && node.IsDir() {
 			return syscall.EISDIR
+		}
+		if found && node.Kind == storage.NodeSymlink {
+			return syscall.ELOOP
 		}
 		// What the commit would charge: the difference against whatever the name holds now,
 		// not the whole object, so overwriting a large file with a slightly larger one is not
@@ -249,6 +251,9 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 	if found && node.IsDir() {
 		return syscall.EISDIR
 	}
+	if found && node.Kind == storage.NodeSymlink {
+		return syscall.ELOOP
+	}
 
 	var (
 		held      int64
@@ -262,15 +267,14 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 	}
 
 	sec, nsec := sqlvalue.StoredTime(object.ModTime)
+	at := time.Now()
 	if found {
 		if err := s.advanceContentRevision(ctx, tx, node.ID); err != nil {
 			return err
 		}
-		// The mode the file already had stands: replacing the contents is not a request to
-		// change it, and the access time belongs to whoever last read the file.
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE nodes SET size = ?, mtime_sec = ?, mtime_nsec = ?, content = ? WHERE id = ?`,
-			object.Size, sec, nsec, sqlvalue.StoredKey(object.Key), node.ID); err != nil {
+			`UPDATE nodes SET size = ?, mtime_sec = ?, mtime_nsec = ?, content = ?, change_sec = ?, change_nsec = ? WHERE id = ?`,
+			object.Size, sec, nsec, sqlvalue.StoredKey(object.Key), at.Unix(), at.Nanosecond(), node.ID); err != nil {
 			return err
 		}
 		// Modified rather than Created, because the name held this node before the commit. The
@@ -279,7 +283,7 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 		if err := s.recordChanged(ctx, tx, node.ID); err != nil {
 			return err
 		}
-	} else if err := s.createCommitted(ctx, tx, parent, name, object); err != nil {
+	} else if err := s.createCommitted(ctx, tx, parent, name, object, at); err != nil {
 		return err
 	}
 
@@ -299,37 +303,24 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 	return err
 }
 
-// createCommitted makes the file a commit is pointing at when nothing is at the name yet.
-// It gets the mode a new file is made with, and the directory holding it records that its
-// contents changed.
-func (s *Store) createCommitted(ctx context.Context, tx *sql.Tx, parent metastore.Node, name []byte, object metastore.Object) error {
-	now := time.Now()
-	accessSec, accessNsec := sqlvalue.StoredTime(now)
-	sec, nsec := sqlvalue.StoredTime(object.ModTime)
-	id, err := dbstate.AllocateNodeID(ctx, tx)
+// createCommitted links the newly published content to a fresh node identity.
+func (s *Store) createCommitted(ctx context.Context, tx *sql.Tx, parent metastore.Node, name []byte, object metastore.Object, at time.Time) error {
+	node, err := s.insertNode(ctx, tx, storage.NodeRegular, storage.InitialFields{Attr: storage.AttrChange{ModTime: &object.ModTime}}, at)
 	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, s.volume, int64(fileMode), object.Size, accessSec, accessNsec, sec, nsec, sqlvalue.StoredKey(object.Key)); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET size=?,content=? WHERE id=?`, object.Size, sqlvalue.StoredKey(object.Key), node.ID); err != nil {
 		return err
 	}
-	if err := s.link(ctx, tx, parent.ID, name, id); err != nil {
+	if err := s.link(ctx, tx, parent.ID, name, node.ID); err != nil {
 		return err
 	}
-	if err := s.recordCreated(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, id); err != nil {
+	if err := s.recordCreated(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, node.ID); err != nil {
 		return err
 	}
-	return s.touch(ctx, tx, parent.ID, now)
+	return s.touch(ctx, tx, parent.ID, at)
 }
 
-// account moves the volume's byte counter by delta, refusing what the allowance cannot
-// pay for.
-//
-// The refusal and the charge are one step inside the caller's transaction, which is what
-// leaves no window between deciding there is room and taking it.
 func (s *Store) account(ctx context.Context, tx *sql.Tx, delta int64) error {
 	if err := s.roomFor(ctx, tx, delta); err != nil {
 		return err
@@ -415,7 +406,7 @@ func (s *Store) ObjectStatus(ctx context.Context) (ObjectStatus, error) {
 		return ObjectStatus{}, fmt.Errorf("opening an object status snapshot: %w", err)
 	}
 	if err := schema.ValidateVolumeIntegrity(
-		ctx, tx, s.volume, s.maxIntegrityRecords, s.maxIntegrityBytes,
+		ctx, tx, s.volume, s.maxIntegrityRecords, s.maxIntegrityBytes, s.maxMetadataBytes,
 	); err != nil {
 		primary := fmt.Errorf("validating volume integrity: %w", sqlerr.ReadFailure(ctx, err))
 		return ObjectStatus{}, finishReadTransaction(ctx, "object status transaction", tx, primary)

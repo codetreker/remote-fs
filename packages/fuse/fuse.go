@@ -111,8 +111,11 @@ func New(mountpoint string, s storage.Storage, opts Options) (*Mount, error) {
 	ask, cancel := context.WithTimeout(context.Background(), v.flushTimeout)
 	attr, err := s.Stat(ask, "")
 	cancel()
-	if err == nil && (attr.ID == 0 || !attr.Mode.IsDir()) {
+	if err == nil && (attr.ID == 0 || !attr.IsDir()) {
 		err = syscall.EIO
+	}
+	if err == nil {
+		_, err = permissions(attr)
 	}
 	if err != nil {
 		return nil, errors.Join(err, v.stopSession())

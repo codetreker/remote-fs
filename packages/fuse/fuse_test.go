@@ -28,6 +28,7 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/fuse"
 	"github.com/codetreker/remote-fs/packages/fuse/fusetest"
+	"github.com/codetreker/remote-fs/packages/fuse/posix"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/limited"
@@ -118,10 +119,7 @@ func mountedPair(t *testing.T) (mountpoint, plain string, backing storage.Storag
 	if err != nil {
 		t.Fatal(err)
 	}
-	mode := info.Mode() & storage.SettableMode
-	if err := backing.SetAttr(t.Context(), "", storage.AttrChange{Mode: &mode}); err != nil {
-		t.Fatal(err)
-	}
+	setBackingMode(t, backing, "", info.Mode()&posix.Settable)
 	mountpoint = mountStorage(t, backing, fuse.Options{Logger: testLogger(t)})
 	return mountpoint, plain, backing
 }
@@ -1226,7 +1224,7 @@ type linkStorage struct {
 
 func (s *linkStorage) describe(attr storage.Attr) storage.Attr {
 	if length, ok := s.lengths[attr.ID]; ok {
-		attr.Mode = fs.ModeSymlink | 0o777
+		attr.Kind = storage.NodeSymlink
 		attr.Size = length
 	}
 	return attr
@@ -1633,11 +1631,18 @@ func decorateSession(ctx context.Context, backing storage.FileStorage, options s
 	if err != nil {
 		return nil, err
 	}
-	return &decoratedSession{FileSession: session, hooks: hooks}, nil
+	root, err := backing.Stat(ctx, "")
+	if err != nil {
+		return nil, errors.Join(err, session.Close(ctx))
+	}
+	wrapped := &decoratedSession{capableTestSession: testSessionCapabilities(session), hooks: hooks}
+	wrapped.paths.Store(root.ID, "")
+	return wrapped, nil
 }
 
 type decoratedSession struct {
-	storage.FileSession
+	capableTestSession
+	paths sync.Map
 	hooks retainedHooks
 }
 
@@ -1658,7 +1663,7 @@ func (s *decoratedSession) OpenFile(ctx context.Context, path string, options st
 }
 
 func (s *decoratedSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
-	path := s.hooks.nodePath(id)
+	path := s.pathFor(id)
 	if err := s.hooks.check("OpenNode", path); err != nil {
 		return nil, err
 	}
@@ -1670,7 +1675,7 @@ func (s *decoratedSession) OpenNode(ctx context.Context, id uint64, options stor
 }
 
 func (s *decoratedSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
-	path := s.hooks.nodePath(id)
+	path := s.pathFor(id)
 	if err := s.hooks.check("Stat", path); err != nil {
 		return storage.Attr{}, err
 	}
@@ -1682,7 +1687,7 @@ func (s *decoratedSession) StatNode(ctx context.Context, id uint64) (storage.Att
 }
 
 func (s *decoratedSession) SetNodeAttr(ctx context.Context, id uint64, change storage.AttrChange) (storage.Attr, error) {
-	path := s.hooks.nodePath(id)
+	path := s.pathFor(id)
 	if err := s.hooks.check("SetAttr", path); err != nil {
 		return storage.Attr{}, err
 	}
@@ -1968,8 +1973,8 @@ func TestAFailureReadingBackWhatWasJustMadeIsReported(t *testing.T) {
 	}
 }
 
-// File creation includes its initial mode atomically; directory initialization still
-// has a separate metadata mutation. Failure at either boundary must reach the caller.
+// File and directory creation publish their requested initial permissions
+// atomically. A failure of that mutation must reach the caller.
 func TestAFailureCreatingANodeWithItsModeIsReported(t *testing.T) {
 	for _, c := range []struct {
 		name      string
@@ -1983,7 +1988,7 @@ func TestAFailureCreatingANodeWithItsModeIsReported(t *testing.T) {
 			}
 			return f.Close()
 		}},
-		{"a created directory", "SetAttr", func(root string) error {
+		{"a created directory", "Mkdir", func(root string) error {
 			return os.Mkdir(filepath.Join(root, "new"), 0o700)
 		}},
 	} {
@@ -2091,7 +2096,7 @@ func (s *oddStorage) List(ctx context.Context, path string) ([]storage.Entry, er
 	entries, err := s.FileStorage.List(ctx, path)
 	for i := range entries {
 		if s.odd(path + "/" + entries[i].Name) {
-			entries[i].Attr.Mode |= fs.ModeIrregular
+			entries[i].Attr.Kind = 255
 		}
 	}
 	return entries, err
@@ -2099,7 +2104,7 @@ func (s *oddStorage) List(ctx context.Context, path string) ([]storage.Entry, er
 
 func (s *oddStorage) describe(path string, attr storage.Attr) storage.Attr {
 	if s.odd(path) {
-		attr.Mode |= fs.ModeIrregular
+		attr.Kind = 255
 	}
 	return attr
 }
@@ -2194,8 +2199,8 @@ func TestAModeChangeReachesTheVolume(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if underneath.Mode != want {
-			t.Fatalf("the volume holds mode %v after a chmod to %v", underneath.Mode, want)
+		if backingMode(t, underneath) != want {
+			t.Fatalf("the volume holds mode %v after a chmod to %v", backingMode(t, underneath), want)
 		}
 		through, err := os.Stat(path)
 		if err != nil {
@@ -2203,7 +2208,7 @@ func TestAModeChangeReachesTheVolume(t *testing.T) {
 		}
 		if through.Mode() != want {
 			t.Fatalf("the mount reports mode %v where the volume holds %v",
-				through.Mode(), underneath.Mode)
+				through.Mode(), backingMode(t, underneath))
 		}
 	}
 
@@ -2219,9 +2224,9 @@ func TestAModeChangeReachesTheVolume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if underneath.Mode != fs.ModeDir|0o700 {
+	if backingMode(t, underneath) != fs.ModeDir|0o700 {
 		t.Fatalf("the volume holds mode %v for the directory, want %v",
-			underneath.Mode, fs.ModeDir|0o700)
+			backingMode(t, underneath), fs.ModeDir|0o700)
 	}
 }
 
@@ -3169,4 +3174,234 @@ func TestATruncationWithNoRoomForItIsRefusedAtTheTruncation(t *testing.T) {
 			t.Fatalf("the volume holds %d bytes, want 1024", held.Size)
 		}
 	})
+}
+
+func backingMode(t *testing.T, attr storage.Attr) fs.FileMode {
+	t.Helper()
+	var mode fs.FileMode
+	switch attr.Kind {
+	case storage.NodeRegular:
+		mode = 0644
+	case storage.NodeDirectory:
+		mode = fs.ModeDir | 0755
+	case storage.NodeSymlink:
+		mode = fs.ModeSymlink | 0777
+	default:
+		t.Fatalf("unknown node kind %d", attr.Kind)
+	}
+	if payload, ok := attr.Metadata[posix.Namespace]; ok {
+		permissions, err := posix.Decode(payload.Data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mode = mode.Type() | permissions
+	}
+	return mode
+}
+
+func setBackingMode(t *testing.T, backing storage.Storage, path string, mode fs.FileMode) {
+	t.Helper()
+	attr, err := backing.Stat(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := posix.Encode(mode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := backing.(storage.FileStorage).NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := session.Close(t.Context()); err != nil {
+			t.Error(err)
+		}
+	}()
+	if _, err := session.(storage.MetadataAccess).SetMetadata(t.Context(), attr.ID, posix.Namespace, attr.Metadata[posix.Namespace].Version, data); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (s *decoratedSession) pathFor(id uint64) string {
+	if path, ok := s.paths.Load(id); ok {
+		return path.(string)
+	}
+	return s.hooks.nodePath(id)
+}
+func (s *decoratedSession) childPath(name storage.ChildName) string {
+	parent := s.pathFor(name.Parent.NodeID)
+	if parent == "" {
+		return string(name.RawLeaf)
+	}
+	return parent + "/" + string(name.RawLeaf)
+}
+func (s *decoratedSession) LookupAt(ctx context.Context, name storage.ChildName) (storage.Attr, error) {
+	path := s.childPath(name)
+	if err := s.hooks.check("Stat", path); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := s.NamespaceAccess.LookupAt(ctx, name)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	s.paths.Store(attr.ID, path)
+	return s.hooks.describe(path, attr), nil
+}
+func (s *decoratedSession) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	path := s.pathFor(target.NodeID)
+	if err := s.hooks.check("List", path); err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	result, err := s.NamespaceAccess.ReadDirNode(ctx, target)
+	if err != nil {
+		return result, err
+	}
+	for i := range result.Entries {
+		entry := &result.Entries[i]
+		child := s.childPath(storage.ChildName{Parent: target, RawLeaf: entry.RawLeaf})
+		s.paths.Store(entry.Attr.ID, child)
+		entry.Attr = s.hooks.describe(child, entry.Attr)
+	}
+	return result, nil
+}
+func (s *decoratedSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
+	path := s.childPath(name)
+	if err := s.hooks.check("OpenFile", path); err != nil {
+		return storage.OpenResult{}, err
+	}
+	if options.Create {
+		if err := s.hooks.check("Create", path); err != nil {
+			return storage.OpenResult{}, err
+		}
+	}
+	result, err := s.AtomicFileOpener.OpenAt(ctx, name, options)
+	if result.File != nil {
+		result.File = &decoratedFile{File: result.File, hooks: s.hooks, path: path}
+	}
+	if err != nil {
+		return result, err
+	}
+	s.paths.Store(result.Attr.ID, path)
+	if err := s.hooks.check("Stat", path); err != nil {
+		return result, err
+	}
+	result.Attr = s.hooks.describe(path, result.Attr)
+	return result, nil
+}
+func (s *decoratedSession) MutateName(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
+	operation := map[storage.NameOperation]string{storage.NameMkdir: "Mkdir", storage.NameRemove: "Remove", storage.NameRemoveDir: "RemoveDir", storage.NameRename: "Rename"}[command.Kind]
+	path := s.childPath(command.Name)
+	if err := s.hooks.check(operation, path); err != nil {
+		return storage.NameResult{}, err
+	}
+	result, err := s.NamespaceAccess.MutateName(ctx, command)
+	if err != nil {
+		return result, err
+	}
+	if result.Attr != nil {
+		s.paths.Store(result.Attr.ID, path)
+		if err := s.hooks.check("Stat", path); err != nil {
+			return result, err
+		}
+		attr := s.hooks.describe(path, *result.Attr)
+		result.Attr = &attr
+	}
+	return result, nil
+}
+func (s *decoratedSession) SetMetadata(ctx context.Context, id uint64, namespace string, version, data []byte) (storage.OpaquePayload, error) {
+	if err := s.hooks.check("SetAttr", s.pathFor(id)); err != nil {
+		return storage.OpaquePayload{}, err
+	}
+	return s.MetadataAccess.SetMetadata(ctx, id, namespace, version, data)
+}
+func (f *decoratedFile) CheckScopedReference() error {
+	return f.File.(storage.ScopedReference).CheckScopedReference()
+}
+func (f *decoratedFile) Scope(ctx context.Context) (storage.UseScope, error) {
+	return f.File.(storage.ScopedReference).Scope(ctx)
+}
+func (f *decoratedFile) CheckMetadataAccess() error {
+	return f.File.(storage.ReferenceMetadataAccess).CheckMetadataAccess()
+}
+func (f *decoratedFile) SetMetadata(ctx context.Context, namespace string, version, data []byte) (storage.OpaquePayload, error) {
+	if err := f.hooks.check("SetAttr", f.path); err != nil {
+		return storage.OpaquePayload{}, err
+	}
+	return f.File.(storage.ReferenceMetadataAccess).SetMetadata(ctx, namespace, version, data)
+}
+
+type capableTestSession struct {
+	storage.FileSession
+	storage.UseOwners
+	storage.RangeControl
+	storage.AtomicFileOpener
+	storage.NamespaceAccess
+	storage.MetadataAccess
+	storage.NodeReferences
+}
+
+func testSessionCapabilities(session storage.FileSession) capableTestSession {
+	return capableTestSession{FileSession: session, UseOwners: session.(storage.UseOwners), RangeControl: session.(storage.RangeControl), AtomicFileOpener: session.(storage.AtomicFileOpener), NamespaceAccess: session.(storage.NamespaceAccess), MetadataAccess: session.(storage.MetadataAccess), NodeReferences: session.(storage.NodeReferences)}
+}
+
+func (s *decoratedSession) OpenNodeRef(ctx context.Context, id uint64, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	path := s.pathFor(id)
+	if err := s.hooks.check("OpenNode", path); err != nil {
+		return storage.NodeOpenResult{}, err
+	}
+	result, err := s.NodeReferences.OpenNodeRef(ctx, id, options)
+	if result.Reference != nil {
+		result.Reference = &decoratedNodeReference{NodeReference: result.Reference, hooks: s.hooks, path: path}
+	}
+	if err != nil {
+		return result, err
+	}
+	if err := s.hooks.check("Stat", path); err != nil {
+		return result, err
+	}
+	result.Attr = s.hooks.describe(path, result.Attr)
+	return result, nil
+}
+
+type decoratedNodeReference struct {
+	storage.NodeReference
+	hooks retainedHooks
+	path  string
+}
+
+func (r *decoratedNodeReference) Stat(ctx context.Context) (storage.Attr, error) {
+	if err := r.hooks.check("Stat", r.path); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := r.NodeReference.Stat(ctx)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	return r.hooks.describe(r.path, attr), nil
+}
+func (r *decoratedNodeReference) SetAttr(ctx context.Context, c storage.AttrChange) (storage.Attr, error) {
+	if err := r.hooks.check("SetAttr", r.path); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := r.NodeReference.SetAttr(ctx, c)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	return r.hooks.describe(r.path, attr), nil
+}
+func (r *decoratedNodeReference) CheckScopedReference() error {
+	return r.NodeReference.(storage.ScopedReference).CheckScopedReference()
+}
+func (r *decoratedNodeReference) Scope(ctx context.Context) (storage.UseScope, error) {
+	return r.NodeReference.(storage.ScopedReference).Scope(ctx)
+}
+func (r *decoratedNodeReference) CheckMetadataAccess() error {
+	return r.NodeReference.(storage.ReferenceMetadataAccess).CheckMetadataAccess()
+}
+func (r *decoratedNodeReference) SetMetadata(ctx context.Context, namespace string, version, data []byte) (storage.OpaquePayload, error) {
+	if err := r.hooks.check("SetAttr", r.path); err != nil {
+		return storage.OpaquePayload{}, err
+	}
+	return r.NodeReference.(storage.ReferenceMetadataAccess).SetMetadata(ctx, namespace, version, data)
 }

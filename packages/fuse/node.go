@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	iofs "io/fs"
 	"syscall"
 
@@ -11,8 +12,8 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// Paths are used only for operations on names. Descriptor and inode attribute
-// operations use the retained file or node identity, including after unlink.
+// Names are addressed by parent identity and raw leaf. Descriptor and inode
+// attributes use the retained file or node identity, including after unlink.
 type node struct {
 	fs.Inode
 	volume *volume
@@ -23,7 +24,7 @@ func (n *node) checkAttr(attr storage.Attr) error {
 	if attr.ID == 0 || attr.ID != n.id.node || !attr.IsDir() && attr.Size < 0 {
 		return syscall.EIO
 	}
-	mode, errno := systemMode(attr.Mode)
+	mode, errno := attributeMode(attr)
 	if errno != 0 || mode&syscall.S_IFMT != n.id.kind {
 		return syscall.EIO
 	}
@@ -34,7 +35,6 @@ var (
 	_ fs.NodeLookuper  = (*node)(nil)
 	_ fs.NodeGetattrer = (*node)(nil)
 	_ fs.NodeSetattrer = (*node)(nil)
-	_ fs.NodeReaddirer = (*node)(nil)
 	_ fs.NodeOpener    = (*node)(nil)
 	_ fs.NodeCreater   = (*node)(nil)
 	_ fs.NodeMkdirer   = (*node)(nil)
@@ -44,20 +44,36 @@ var (
 	_ fs.NodeStatfser  = (*node)(nil)
 )
 
-func (n *node) path() string { return n.Path(n.Root()) }
+func (n *node) childName(name string) storage.ChildName {
+	return storage.ChildName{Parent: storage.DirectoryTarget{NodeID: n.id.node}, RawLeaf: []byte(name)}
+}
 
-func (n *node) childPath(name string) string {
-	if parent := n.path(); parent != "" {
-		return parent + "/" + name
+func (v *volume) namespace() (storage.NamespaceAccess, error) {
+	access, ok := v.files.(storage.NamespaceAccess)
+	if !ok {
+		return nil, syscall.EOPNOTSUPP
 	}
-	return name
+	if err := access.CheckNamespaceAccess(); err != nil {
+		return nil, err
+	}
+	return access, nil
 }
 
 func (n *node) Lookup(ctx context.Context, name string, out *gofuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	return n.lookup(ctx, name, out, nil)
+}
+
+func (n *node) lookup(ctx context.Context, name string, out *gofuse.EntryOut, scope *storage.UseScope) (*fs.Inode, syscall.Errno) {
 	if err := n.volume.check(); err != nil {
 		return nil, errnoOf(err)
 	}
-	attr, err := n.volume.storage.Stat(ctx, n.childPath(name))
+	access, err := n.volume.namespace()
+	if err != nil {
+		return nil, errnoOf(err)
+	}
+	target := n.childName(name)
+	target.Parent.Scope = scope
+	attr, err := access.LookupAt(ctx, target)
 	if err != nil {
 		errno := errnoOf(err)
 		if errno == syscall.ENOENT {
@@ -85,7 +101,7 @@ func (n *node) getattr(ctx context.Context, f fs.FileHandle, out *gofuse.AttrOut
 	}
 	var attr storage.Attr
 	var err error
-	if h, ok := f.(*handle); ok {
+	if h, ok := f.(attributeHandle); ok {
 		attr, err = h.stat(ctx)
 	} else {
 		attr, err = n.volume.files.StatNode(ctx, n.id.node)
@@ -130,22 +146,31 @@ func (n *node) setattr(ctx context.Context, f fs.FileHandle, in *gofuse.SetAttrI
 		}
 		changed = true
 	}
-	if !change.Empty() {
+	if !change.AttrChange.Empty() {
 		if err := ctx.Err(); err != nil {
 			return afterMutation(changed, err)
 		}
 		var attr storage.Attr
 		var err error
-		if h, ok := f.(*handle); ok {
-			attr, err = h.setAttr(ctx, change)
+		if h, ok := f.(attributeHandle); ok {
+			attr, err = h.setAttr(ctx, change.AttrChange)
 		} else {
-			attr, err = n.volume.files.SetNodeAttr(ctx, n.id.node, change)
+			attr, err = n.volume.files.SetNodeAttr(ctx, n.id.node, change.AttrChange)
 		}
 		if err != nil {
 			return afterMutation(true, err)
 		}
 		if err := n.checkAttr(attr); err != nil {
 			return err
+		}
+		changed = true
+	}
+	if change.Mode != nil {
+		if err := ctx.Err(); err != nil {
+			return afterMutation(changed, err)
+		}
+		if err := n.setPermissions(ctx, f, *change.Mode); err != nil {
+			return afterMutation(changed, err)
 		}
 		changed = true
 	}
@@ -166,7 +191,7 @@ func (n *node) setattr(ctx context.Context, f fs.FileHandle, in *gofuse.SetAttrI
 // FATTR_CTIME does too: no system call sets a change time, and a kernel that attaches one
 // is stating what follows from the change it is already asking for. Size is the caller's
 // to apply, so it is not part of the change reported here.
-func (v *volume) requestedChange(in *gofuse.SetAttrIn) (storage.AttrChange, syscall.Errno) {
+func (v *volume) requestedChange(in *gofuse.SetAttrIn) (attributeChange, syscall.Errno) {
 	// Everything this filesystem knows what to do with. FATTR_KILL_SUIDGID is deliberately
 	// outside it: it asks for the setuid and setgid bits to be cleared, which is a change,
 	// and dropping it would leave those bits on a file the kernel had decided should lose
@@ -177,7 +202,7 @@ func (v *volume) requestedChange(in *gofuse.SetAttrIn) (storage.AttrChange, sysc
 		gofuse.FATTR_ATIME | gofuse.FATTR_MTIME | gofuse.FATTR_ATIME_NOW | gofuse.FATTR_MTIME_NOW |
 		gofuse.FATTR_CTIME | gofuse.FATTR_FH | gofuse.FATTR_LOCKOWNER
 
-	var change storage.AttrChange
+	var change attributeChange
 	if in.Valid&^understood != 0 {
 		return change, syscall.EPERM
 	}
@@ -230,7 +255,7 @@ func (n *node) resize(ctx context.Context, f fs.FileHandle, size int64) error {
 	return n.volume.closeUnreturnedFile(ctx, file, err, err == nil)
 }
 
-func (n *node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+func (n *node) readdir(ctx context.Context, scope storage.UseScope) (fs.DirStream, syscall.Errno) {
 	if err := n.volume.check(); err != nil {
 		return nil, errnoOf(err)
 	}
@@ -238,25 +263,40 @@ func (n *node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	// the listing is in flight is not one this listing goes on to call gone.
 	before := n.id.given()
 
-	entries, err := n.volume.storage.List(ctx, n.path())
+	access, err := n.volume.namespace()
+	if err != nil {
+		return nil, errnoOf(err)
+	}
+	observed, err := access.ReadDirNode(ctx, storage.DirectoryTarget{NodeID: n.id.node, Scope: &scope})
 	if err != nil {
 		return nil, errnoOf(err)
 	}
 
+	if observed.Observation.ParentID != n.id.node || len(observed.Observation.Revision) == 0 {
+		return nil, syscall.EIO
+	}
+	entries := observed.Entries
 	listing := make([]gofuse.DirEntry, 0, len(entries))
 	present := make(map[string]struct{}, len(entries))
 	for _, e := range entries {
 		if e.Attr.ID == 0 || !e.Attr.IsDir() && e.Attr.Size < 0 {
 			return nil, syscall.EIO
 		}
-		mode, errno := systemMode(e.Attr.Mode)
+		mode, errno := attributeMode(e.Attr)
 		if errno != 0 {
 			return nil, errno
 		}
-		present[e.Name] = struct{}{}
+		name := string(e.RawLeaf)
+		if err := storage.CheckLeaf(e.RawLeaf); err != nil {
+			return nil, syscall.EIO
+		}
+		if _, duplicate := present[name]; duplicate {
+			return nil, syscall.EIO
+		}
+		present[name] = struct{}{}
 		// The number a listing reports has to be the number a stat of the same name
 		// reports, or programs that pair the two see two different files.
-		listing = append(listing, gofuse.DirEntry{Name: e.Name, Mode: mode, Ino: n.id.child(e.Name, mode, e.Attr.ID).ino})
+		listing = append(listing, gofuse.DirEntry{Name: name, Mode: mode, Ino: n.id.child(name, mode, e.Attr.ID).ino})
 	}
 	n.id.keepOnly(present, before)
 
@@ -291,33 +331,78 @@ func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	if options.ExpectedID == 0 {
 		return nil, 0, syscall.EIO
 	}
-	file, _, err := n.openFile(ctx, n.path(), options)
+	name, parent := n.Parent()
+	if parent == nil {
+		return nil, 0, syscall.ESTALE
+	}
+	parentNode, ok := parent.Operations().(*node)
+	if !ok {
+		return nil, 0, syscall.EIO
+	}
+	file, _, err := n.openFile(ctx, parentNode.childName(name), options)
 	if err != nil {
 		return nil, 0, errnoOf(err)
 	}
 	return newHandle(n, file, options.Read, options.Write), gofuse.FOPEN_DIRECT_IO, 0
 }
 
-func (n *node) openFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, storage.Attr, error) {
-	file, err := n.volume.files.OpenFile(ctx, path, options)
-	if err != nil {
+func (n *node) openFile(ctx context.Context, name storage.ChildName, options storage.FileOpenOptions) (storage.File, storage.Attr, error) {
+	opener, ok := n.volume.files.(storage.AtomicFileOpener)
+	if !ok {
+		return nil, storage.Attr{}, syscall.EOPNOTSUPP
+	}
+	if err := opener.CheckAtomicFileOpen(); err != nil {
 		return nil, storage.Attr{}, err
 	}
-	attr, err := file.Stat(ctx)
+	target := storage.ChildCondition{State: storage.Any}
+	if options.ExpectedID != 0 {
+		target = storage.ChildCondition{State: storage.SameNode, NodeID: options.ExpectedID}
+	}
+	effect := storage.Keep
+	if options.Truncate {
+		effect = storage.ResetContent
+	}
+	var uses storage.Uses
+	if options.Read {
+		uses |= storage.ReadData
+	}
+	if options.Write {
+		uses |= storage.WriteData
+	}
+	result, err := opener.OpenAt(ctx, name, storage.OpenAtOptions{
+		Read: options.Read, Write: options.Write, Create: options.Create, Exclusive: options.Exclusive,
+		Target: target, Existing: effect, Use: storage.UseClaim{Uses: uses},
+		Initial: storage.InitialState{OnCreate: storage.InitialFields{Metadata: options.InitialMetadata}},
+	})
+	changed := result.Outcome == storage.Created || result.Outcome == storage.Reset || result.Outcome == storage.Replaced
+	if result.File == nil {
+		if err == nil {
+			err = syscall.EIO
+		}
+		return nil, storage.Attr{}, afterMutation(changed, err)
+	}
+	if result.Outcome != storage.Opened && result.Outcome != storage.Created && result.Outcome != storage.Reset {
+		err = errors.Join(syscall.EIO, err)
+	}
 	if err == nil {
+		attr := result.Attr
 		switch {
-		case attr.ID == 0 || attr.Size < 0 || attr.Mode.Type() != 0:
+		case result.Outcome != storage.Opened && result.Outcome != storage.Created && result.Outcome != storage.Reset:
+			err = syscall.EIO
+		case attr.ID == 0 || attr.Size < 0 || attr.Kind != storage.NodeRegular:
 			err = syscall.EIO
 		case options.ExpectedID != 0 && attr.ID != options.ExpectedID:
 			err = syscall.EIO
 		case !n.volume.holds(attr.Size):
 			err = syscall.EFBIG
+		default:
+			_, err = permissions(attr)
 		}
 	}
 	if err != nil {
-		return nil, storage.Attr{}, n.volume.closeUnreturnedFile(ctx, file, err, options.Create || options.Truncate)
+		return nil, storage.Attr{}, n.volume.closeUnreturnedFile(ctx, result.File, err, changed)
 	}
-	return file, attr, nil
+	return result.File, result.Attr, nil
 }
 
 // Creation, exclusive existence checks, mode initialization, truncation and retention
@@ -332,8 +417,12 @@ func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	}
 	options.Create = true
 	options.Exclusive = flags&syscall.O_EXCL != 0
-	options.Mode = storageMode(mode)
-	file, attr, err := n.openFile(ctx, n.childPath(name), options)
+	var err error
+	options.InitialMetadata, err = initialPermissions(storageMode(mode))
+	if err != nil {
+		return nil, nil, 0, errnoOf(err)
+	}
+	file, attr, err := n.openFile(ctx, n.childName(name), options)
 	if err != nil {
 		return nil, nil, 0, errnoOf(err)
 	}
@@ -350,36 +439,38 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *gofuse.
 	if err := n.volume.check(); err != nil {
 		return nil, errnoOf(err)
 	}
-	path := n.childPath(name)
-	if err := n.volume.storage.Mkdir(ctx, path); err != nil {
+	access, err := n.volume.namespace()
+	if err != nil {
 		return nil, errnoOf(err)
 	}
-	if err := n.volume.wearMode(ctx, path, mode); err != nil {
-		return nil, errnoOf(afterMutation(true, err))
-	}
-	attr, err := n.volume.storage.Stat(ctx, path)
+	metadata, err := initialPermissions(storageMode(mode))
 	if err != nil {
-		return nil, errnoOf(afterMutation(true, err))
+		return nil, errnoOf(err)
 	}
+	result, err := access.MutateName(ctx, storage.NameCommand{Kind: storage.NameMkdir, Name: n.childName(name), Target: storage.ChildCondition{State: storage.Absent}, Initial: storage.InitialFields{Metadata: metadata}})
+	if err != nil {
+		return nil, errnoOf(afterMutation(result.Attr != nil, err))
+	}
+	if result.Attr == nil || result.Attr.Kind != storage.NodeDirectory {
+		return nil, syscall.EIO
+	}
+	attr := *result.Attr
 	if errno := n.volume.fillAttr(&out.Attr, attr); errno != 0 {
 		return nil, errno
 	}
 	return n.child(ctx, name, out.Attr.Mode, attr.ID), 0
 }
 
-// Directory creation and its requested permissions are separate volume operations.
-// A failure after Mkdir therefore reports the partial mutation to the caller.
-func (v *volume) wearMode(ctx context.Context, path string, mode uint32) error {
-	requested := storageMode(mode)
-	return v.storage.SetAttr(ctx, path, storage.AttrChange{Mode: &requested})
-}
-
 func (n *node) Unlink(ctx context.Context, name string) syscall.Errno {
 	if err := n.volume.check(); err != nil {
 		return errnoOf(err)
 	}
-	if err := n.volume.storage.Remove(ctx, n.childPath(name)); err != nil {
+	access, err := n.volume.namespace()
+	if err != nil {
 		return errnoOf(err)
+	}
+	if result, err := access.MutateName(ctx, storage.NameCommand{Kind: storage.NameRemove, Name: n.childName(name), Target: storage.ChildCondition{State: storage.Any}}); err != nil {
+		return errnoOf(afterMutation(result.Attr != nil, err))
 	}
 	n.id.forget(name)
 	return 0
@@ -389,8 +480,12 @@ func (n *node) Rmdir(ctx context.Context, name string) syscall.Errno {
 	if err := n.volume.check(); err != nil {
 		return errnoOf(err)
 	}
-	if err := n.volume.storage.RemoveDir(ctx, n.childPath(name)); err != nil {
+	access, err := n.volume.namespace()
+	if err != nil {
 		return errnoOf(err)
+	}
+	if result, err := access.MutateName(ctx, storage.NameCommand{Kind: storage.NameRemoveDir, Name: n.childName(name), Target: storage.ChildCondition{State: storage.Any}}); err != nil {
+		return errnoOf(afterMutation(result.Attr != nil, err))
 	}
 	n.id.forget(name)
 	return 0
@@ -407,8 +502,12 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 		return syscall.EINVAL
 	}
 	target := newParent.(*node)
-	if err := n.volume.storage.Rename(ctx, n.childPath(name), target.childPath(newName)); err != nil {
+	access, err := n.volume.namespace()
+	if err != nil {
 		return errnoOf(err)
+	}
+	if result, err := access.MutateName(ctx, storage.NameCommand{Kind: storage.NameRename, Name: n.childName(name), Target: storage.ChildCondition{State: storage.Any}, Destination: &storage.RenameTarget{Parent: storage.DirectoryTarget{NodeID: target.id.node}, ObservedLeaf: []byte(newName), OutputLeaf: []byte(newName), Expected: storage.ChildCondition{State: storage.Any}}}); err != nil {
+		return errnoOf(afterMutation(result.Attr != nil, err))
 	}
 	// The FUSE library is about to move the existing inode to the new name, carrying the
 	// number this mount gave it. The name it leaves has to stop referring to that number
@@ -439,7 +538,7 @@ func (v *volume) fillAttr(out *gofuse.Attr, attr storage.Attr) syscall.Errno {
 	if attr.ID == 0 || !attr.IsDir() && attr.Size < 0 {
 		return syscall.EIO
 	}
-	mode, errno := systemMode(attr.Mode)
+	mode, errno := attributeMode(attr)
 	if errno != 0 {
 		return errno
 	}
@@ -449,11 +548,14 @@ func (v *volume) fillAttr(out *gofuse.Attr, attr storage.Attr) syscall.Errno {
 	}
 	accessed, changed := attr.AccessTime, attr.ModTime
 	out.Atime, out.Atimensec = uint64(accessed.Unix()), uint32(accessed.Nanosecond())
-	// The volume has no change time. The modification time is reported in its place
-	// rather than an invented one, and it is the closest true thing there is: every change
-	// the volume can record is a change to the contents.
-	out.Mtime, out.Ctime = uint64(changed.Unix()), uint64(changed.Unix())
-	out.Mtimensec, out.Ctimensec = uint32(changed.Nanosecond()), uint32(changed.Nanosecond())
+	out.Mtime, out.Mtimensec = uint64(changed.Unix()), uint32(changed.Nanosecond())
+	// Linux presentation retains the modification time when historical change
+	// time is unknown. The fallback is not written into authority metadata.
+	changeTime := changed
+	if attr.ChangeTime != nil {
+		changeTime = *attr.ChangeTime
+	}
+	out.Ctime, out.Ctimensec = uint64(changeTime.Unix()), uint32(changeTime.Nanosecond())
 	out.Owner = v.owner
 	// Hard links do not exist here (R-FS-4). One is the honest count, and it is also the
 	// count that keeps tools which walk a tree from concluding, from a directory's link
@@ -486,11 +588,11 @@ func systemMode(mode iofs.FileMode) (uint32, syscall.Errno) {
 	return 0, syscall.EIO
 }
 
-// storageMode renders a mode the kernel sent as a storage mode.
+// storageMode decodes the permission and special bits sent by the kernel.
 //
 // The kernel keeps a node's kind in the same word, and it is dropped rather than
 // translated: what comes back is a mode to set, and a node's kind is not something a
-// caller sets. storage.SettableMode is the set this produces.
+// caller sets.
 func storageMode(mode uint32) iofs.FileMode {
 	requested := iofs.FileMode(mode) & iofs.ModePerm
 	for _, bit := range specialModeBits {

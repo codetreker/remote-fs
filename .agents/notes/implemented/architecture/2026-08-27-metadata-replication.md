@@ -28,7 +28,7 @@ Status: implemented
 
 | 没做 | 后果 |
 |---|---|
-| 三个内核超时仍然是 0 | 名字 Lookup 与 List 使用本地 SQLite；保留文件的节点属性向 authority 核对，内容使用 direct I/O |
+| 三个内核超时仍然是 0 | 路径 Stat 保留本地副本；中立能力接续后，FUSE Lookup/目录读取与 public List 向 authority 核对，内容使用 direct I/O |
 | 没有直通模式、没有降级 | 副本没建好，挂载点就还不能用；R-WS-4 知情推后 |
 | 只支持有 metastore 的后端 | 当时的 `localdir` 保持直通；该实现已由[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)取消，第三方 storage 的日志仍是独立能力 |
 | 迁移机制只到「够用」为止 | 编号的 `.sql` 文件顺序重放，没有回滚、没有校验和 |
@@ -40,7 +40,7 @@ Status: implemented
 
 本地副本的直觉用法是把超时调上去、让内核自己作答。那样买到的是**零次调用**，代价是[内核缓存与不可达](../../proposed/architecture/2026-08-19-kernel-cache-and-unreachable.md)整份 note 立刻进入关键路径：缓存时长必须绑到失活探测窗口、负项时长是挂载级常量、客户端必须自己记住答过哪些名字不存在并在驱逐前先向内核发失效、转入断裂时要主动令内核失效、关掉内核自动失效之后不再自愈、失效队列溢出要升级而不是丢弃。六条各自都能单独出错，而**内核不发请求给我们就直接作答**——出错的表现是我们看不见的那一侧在替我们撒谎。
 
-当时保持为 0，把名字与属性查询的一次网络往返换成本地 SQLite 查询，微秒对毫秒；那场十秒的探测风暴变成十毫秒级。保留文件接口按对象身份取得属性后，缓存边界按操作划分：路径 Stat、Lookup 与 List 仍使用副本，File.Stat 与 StatNode 向 authority 核对，FileSession 还独立续期。遍历一棵已复制的树不为名字查询或目录列表回源，但仍可产生身份属性与续期请求。三个元数据超时继续为 0，副本不可用时普通查询明确失败。
+当时保持为 0，把名字与属性查询的一次网络往返换成本地 SQLite 查询，微秒对毫秒；那场十秒的探测风暴变成十毫秒级。[中立文件能力](2026-09-16-neutral-file-capabilities.md)把当前边界按访问语义划分：路径 Stat/负名字 Stat 可用副本，公共 List/ListBounded 与 FUSE Lookup/目录能力向 authority 核对，File/NodeReference 同样按身份访问。内部 metastore.Replica.List 仍是本地读操作；公开列目录不能借副本绕过 ReadEntries。FileSession 续期保持独立。三个元数据超时继续为 0，副本不可用时普通查询明确失败。
 
 三个元数据超时不决定内容页缓存。原来 Open 使用默认缓存标志、各 handle 保存内容，旧 handle 可以填入新 open 随后读到的页；[跨句柄页缓存陈旧](../bug-fix/2026-09-07-prevent-cross-handle-page-cache-staleness.md)保留该缺陷记录。[实时文件句柄](./2026-09-08-live-file-handles.md)改用 directIO 与权威对象读取，元数据超时仍为 0，不能因内容路径改变就顺带提高它们。
 
@@ -274,7 +274,7 @@ R-CON-4 要求写入方自己以及同机其它进程**立即**看到已写入�
 
 只要 handler 持有非空 `Log`，每个 mutation-shaped operation 成功后都先唤醒 publisher，再从 `Log.Barrier` 原子读取 `(incarnation, committed position)` 放进 response。这也包括语义上不改变状态的 operation：它们得到的是当前 barrier，position 可以为 0。对真正产生变更的 mutation，barrier position 可以是本次提交的尾位置，也可以因并发提交而更晚，但到达它必然已经应用本次 mutation。barrier 查询或编码失败发生在 operation 已成功之后，因此 response 以 `EIO` 失败，不把已执行的 mutation 说成未发生。没有日志的 handler 可以省略 barrier；replicated client 的普通 mutation 方法会解码并忽略可选 barrier，`*WithBarrier` 方法则要求它存在且格式有效。
 
-引入这个 response 形状时，HTTP protocol 升为 v2：prefix 是 `/v2/`，header 是 `Remote-Fs-Protocol: 2`。v1 的 mutation success 是空 body，无法被 v2 的严格 `MutationResponse` decoder 接受，因此当时拒绝旧 route 与双版本 fallback。当前[文件锁协议](../../../../docs/design/server/file-locks.md#http-v3-编码)使用 `/v3/` 与 `Remote-Fs-Protocol: 3`，保留 mutation barrier body 并增加锁控制和显式 scope。v2 不能作为不检查权限的兼容路径，陌生或空的成功 body 仍是协议失败。
+引入这个 response 形状时，HTTP protocol 升为 v2：prefix 是 `/v2/`，header 是 `Remote-Fs-Protocol: 2`。v1 的 mutation success 是空 body，无法被 v2 的严格 `MutationResponse` decoder 接受，因此当时拒绝旧 route 与双版本 fallback。当前[文件锁协议](../../../../docs/design/server/file-locks.md#http-v4-编码)使用 `/v4/` 与 `Remote-Fs-Protocol: 4`，保留 mutation barrier、锁控制和 scope，并使用中立 Attr/metadata/范围 DTO。v2 不能作为不检查权限的兼容路径，陌生或空的成功 body 仍是协议失败。
 
 replicated storage 在发送 request 前只 admission 一条 fixed-size confirmation record，不保留目标 path、direction 或 touched-name history。`replicated.Options` 默认 `ConfirmationGrace = 10s`、`MaxActiveConfirmations = 64`、`MaxWaitingConfirmations = 64`；active/waiter 的 `math.MaxInt` sentinel 被拒绝。active 名额不足时有限等待；纯调用方取消为 `EINTR`，deadline 为 `EIO`，实际容量饱和或 storage 开始关闭时为 `EAGAIN`，这些拒绝都保留原始原因且不发送 request。该分类与 [FUSE 请求中断](../bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)共用操作阶段规则。`cmd/remote-fs` 以 `-confirmation-grace`、`-max-active-mutation-confirmations` 与 `-max-waiting-mutation-confirmations` 暴露三项配置，并在连接 server 或创建 replica directory 之前验证。
 
@@ -304,14 +304,14 @@ server success 后，replicated storage 把 barrier 与当前 replica incarnatio
 
 ```go
 // packages/storage/replicated
-// 路径 Stat/List 使用副本；内容和身份操作使用权威服务。
+// 路径 Stat 使用副本；公开 List、内容与身份能力使用权威服务。
 type Storage struct {
     local  *sqlite.Replica  // 本地 SQLite 副本，由事件流喂
     remote *httprest.Storage
 }
 ```
 
-路径 `Stat` 与 `List` 走本地；`Read`、`Write`、`Create`、`Mkdir`、`Remove`、`RemoveDir`、`Rename`、`SetAttr`、`Space` 走远端。FileStorage capability 也传播到权威服务：FileSession.OpenNode、StatNode、SetNodeAttr 与 File 的内容、属性操作都不按副本里的名字重新寻址，已经 detached 的对象不要求本地树仍有对应 entry。普通身份 I/O 仍检查副本可用状态；续期、动作核对、取消和清理不依赖具名副本存在，失去观察不能阻止释放资源。
+路径 Stat 走本地，公共 List/ListBounded 经过可用性检查后访问 authority；`Read`、`Write`、`Create`、`Mkdir`、`Remove`、`RemoveDir`、`Rename`、`SetAttr`、`Space` 走远端。FileStorage capability 也传播到权威服务：FileSession.OpenNode、StatNode、SetNodeAttr 与 File 的内容、属性操作都不按副本里的名字重新寻址，已经 detached 的对象不要求本地树仍有对应 entry。普通身份 I/O 仍检查副本可用状态；续期、动作核对、取消和清理不依赖具名副本存在，失去观察不能阻止释放资源。
 
 具名节点修改沿用 mutation barrier，成功后确认本地可见性；detached 内容修改不生成具名树事件，不能等待一个永远不存在的节点事件。文件引用的退役、续期和 advisory 连续性由独立 FileSession 管理，不从日志位置或 SSE 心跳推导。
 
@@ -447,7 +447,7 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 ## 后果
 
-**买到的是那场探测风暴。** 冷挂载一棵树之后，走完整棵树再问一批不存在的名字，服务端**一个请求都收不到**——量出来的，不是推断的：一次 8 个节点的 `filepath.Walk` 加 4 个不存在的名字，把 `Stat` 与 `List` 改回走服务端时是 43 次 stat 与 4 次 list，走副本时是 0。三个内核超时仍然是 0，所以这些调用一个不少地到达了这一层，只是答案来自本地 SQLite。
+**引入复制时买到的是那场探测风暴。** 当时冷挂载一棵树之后，走完整棵树再问一批不存在的名字，服务端**一个请求都收不到**——量出来的，不是推断的：一次 8 个节点的 `filepath.Walk` 加 4 个不存在的名字，把 `Stat` 与 `List` 改回走服务端时是 43 次 stat 与 4 次 list，走副本时是 0。三个内核超时仍然是 0，所以这些调用一个不少地到达了这一层，只是答案来自本地 SQLite。
 
 **代价一：正确性的赌注全部押在事件生成上，而且是永久的。** 这是 delta 换性能要付的账。日志落盘之后，一次漏发或错发不会被任何超时纠正，系统里也没有任何东西能在事后察觉它。唯一的防守是正确性论证与故障注入，不是自愈——所以副本这一侧对「描述的东西找不到」零容忍：改名的源不在、要改的节点不在、要删的名字不在，一律报错并判流断裂，绝不当作无事发生。那条容忍规则不写出来，就永远不会有人依赖它。
 
@@ -463,4 +463,4 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **端到端验收必须经过部署实际使用的复制路径。** 引入复制时，测试从 `localdir` 转向 metastore 后端；取消宿主目录后端后，独立二进制覆盖 localstore 与 Azure Blob。可替换 storage 仍允许没有 Log，这一能力分支由专门夹具覆盖，不能因随附后端都有日志而删除。
 
-**验收是这样验的，每一条都有对应的用例。** 一次目录改名在副本里只搬一行：改名之后子树里每个节点的编号与 inode 号不变，只有一个具名 rename 请求；后续属性按身份核对，周期续期也独立存在。遍历用例单独要求具名 Stat/List 零请求、身份属性确实到达 authority，记录实际次数并拒绝其它数据或修改请求。快照期间持续写入，追平之后副本与服务端的 metastore 逐节点一致——那个用例会先断言「确实有写入压在扫描窗口里」，否则它判自己失败。事件通道断开时十一个操作各自失败一次，且不返回空目录、不报告文件不存在；把这条防护拆掉之后，它报出来的是「列目录成功，2 个条目」与「一个存在的名字答不存在」。日志答「无法重放」时客户端重建而不是接着走，用快照的次数是证据。一个不记日志的 volume 以 ENOSYS 拒绝复制，挂载点照常工作，而它的每一次 stat 都到达服务端。
+**验收是这样验的，每一条都有对应的用例。** 一次目录改名在副本里只搬一行：改名之后子树里每个节点的编号与 inode 号不变，只有一个具名 rename 请求；后续属性按身份核对，周期续期也独立存在。当前挂载遍历用例分别计数目录 OpenNodeRef、ACK、Scope、ReadDirNode 和 Close，并要求 LookupAt/身份属性到达 authority；直接路径 Stat 的缓存用例独立要求不回源。公共 SDK 树遍历则按目录数核对 List 往返，不能继续使用零 List 请求作为验收条件。快照期间持续写入，追平之后副本与服务端的 metastore 逐节点一致——那个用例会先断言「确实有写入压在扫描窗口里」，否则它判自己失败。事件通道断开时十一个操作各自失败一次，且不返回空目录、不报告文件不存在；把这条防护拆掉之后，它报出来的是「列目录成功，2 个条目」与「一个存在的名字答不存在」。日志答「无法重放」时客户端重建而不是接着走，用快照的次数是证据。一个不记日志的 volume 以 ENOSYS 拒绝复制，挂载点照常工作，而它的每一次 stat 都到达服务端。

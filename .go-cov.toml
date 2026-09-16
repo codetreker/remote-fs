@@ -21,13 +21,14 @@ packages = [
 # package keeps `cmd` in the test run, so a compile break in them still fails.
 #
 # storagetest and metastoretest are test code that happens not to live in a _test.go file:
-# each imports `testing`, each has Run(t *testing.T, …) as its only export, each is imported
-# only by _test.go files, and neither is linked into any binary. Measuring how well the
+# they import `testing`, expose contract runners, are imported only by _test.go files,
+# and are not linked into any binary. Measuring how well the
 # tests test themselves answers nothing.
 files = [
   "cmd/remote-fs/main.go",
   "cmd/remote-fs-server/main.go",
   "packages/storage/storagetest/storagetest.go",
+  "packages/storage/storagetest/metadata.go",
   "packages/metastore/metastoretest/metastoretest.go",
   "packages/metastore/metastoretest/log.go",
 ]

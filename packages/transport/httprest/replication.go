@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // The messages of the replication half, and the frames they travel in.
@@ -25,25 +25,30 @@ import (
 
 // Node is metastore.Node on the wire.
 type Node struct {
-	ID         int64  `json:"id"`
-	Mode       uint32 `json:"mode"`
-	Size       int64  `json:"size"`
-	AccessTime Time   `json:"access_time"`
-	ModTime    Time   `json:"mod_time"`
+	ID         int64                    `json:"id"`
+	Kind       storage.NodeKind         `json:"kind"`
+	BirthTime  *Time                    `json:"birth_time,omitempty"`
+	ChangeTime *Time                    `json:"change_time,omitempty"`
+	Metadata   map[string]OpaquePayload `json:"metadata,omitempty"`
+	Size       int64                    `json:"size"`
+	AccessTime Time                     `json:"access_time"`
+	ModTime    Time                     `json:"mod_time"`
 
 	// Content is the key of the object holding a file's bytes, and empty for a directory
 	// and for a file that has never been written. It travels as bytes rather than as a
 	// string for the same reason a name does: a key is opaque to everything above the
 	// store that allocated it, so this side may not assume it is text, and a key that came
 	// back altered names bytes that are not there.
-	Content []byte `json:"content"`
+	Content           []byte `json:"content"`
+	LinkTarget        []byte `json:"link_target,omitempty"`
+	DirectoryRevision []byte `json:"directory_revision,omitempty"`
 }
 
 // UnmarshalJSON refuses node values a replica could persist as plausible metadata.
 func (n *Node) UnmarshalJSON(data []byte) error {
 	type node Node
 	var decoded node
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	got := Node(decoded)
@@ -67,11 +72,27 @@ func (n Node) check() error {
 	if err := checkWireTime("modification", n.ModTime); err != nil {
 		return fmt.Errorf("node %d: %w", n.ID, err)
 	}
-	mode := fs.FileMode(n.Mode)
-	switch mode.Type() {
-	case 0, fs.ModeDir, fs.ModeSymlink:
-	default:
-		return fmt.Errorf("node %d carries unsupported type bits %v", n.ID, mode.Type())
+	if err := n.Kind.Check(); err != nil {
+		return fmt.Errorf("node %d carries an invalid kind: %w", n.ID, err)
+	}
+	for _, value := range []struct {
+		name    string
+		instant *Time
+	}{{"birth", n.BirthTime}, {"change", n.ChangeTime}} {
+		if value.instant != nil {
+			if err := checkWireTime(value.name, *value.instant); err != nil {
+				return err
+			}
+		}
+	}
+	if err := checkLinkTarget(n.Kind, n.Size, n.LinkTarget); err != nil {
+		return err
+	}
+	if len(n.DirectoryRevision) > storage.MaxObservationTokenBytes || n.Kind != storage.NodeDirectory && len(n.DirectoryRevision) != 0 {
+		return errors.New("node carries an invalid directory observation token")
+	}
+	if err := storage.CheckMetadata(metadataStorage(n.Metadata)); err != nil {
+		return fmt.Errorf("node %d carries invalid metadata: %w", n.ID, err)
 	}
 	return nil
 }
@@ -86,24 +107,34 @@ func checkWireTime(name string, instant Time) error {
 // NodeOf renders n for the wire.
 func NodeOf(n metastore.Node) *Node {
 	return &Node{
-		ID:         n.ID,
-		Mode:       uint32(n.Mode),
-		Size:       n.Size,
-		AccessTime: TimeOf(n.AccessTime),
-		ModTime:    TimeOf(n.ModTime),
-		Content:    []byte(n.Content),
+		ID:                n.ID,
+		Kind:              n.Kind,
+		BirthTime:         optionalTimeOf(n.BirthTime),
+		ChangeTime:        optionalTimeOf(n.ChangeTime),
+		Metadata:          metadataOf(n.Metadata),
+		Size:              n.Size,
+		AccessTime:        TimeOf(n.AccessTime),
+		ModTime:           TimeOf(n.ModTime),
+		Content:           []byte(n.Content),
+		LinkTarget:        bytes.Clone(n.LinkTarget),
+		DirectoryRevision: bytes.Clone(n.DirectoryRevision),
 	}
 }
 
 // Metastore returns the node n carries.
 func (n Node) Metastore() metastore.Node {
 	return metastore.Node{
-		ID:         n.ID,
-		Mode:       fs.FileMode(n.Mode),
-		Size:       n.Size,
-		AccessTime: n.AccessTime.Time(),
-		ModTime:    n.ModTime.Time(),
-		Content:    metastore.Key(n.Content),
+		ID:                n.ID,
+		Kind:              n.Kind,
+		BirthTime:         optionalTimeStorage(n.BirthTime),
+		ChangeTime:        optionalTimeStorage(n.ChangeTime),
+		Metadata:          metadataStorage(n.Metadata),
+		Size:              n.Size,
+		AccessTime:        n.AccessTime.Time(),
+		ModTime:           n.ModTime.Time(),
+		Content:           metastore.Key(n.Content),
+		LinkTarget:        bytes.Clone(n.LinkTarget),
+		DirectoryRevision: bytes.Clone(n.DirectoryRevision),
 	}
 }
 
@@ -188,11 +219,8 @@ func changeShapeOf(c metastore.Change) (*Change, error) {
 //
 // The three refusals are what stands between a damaged message and a replica that records
 // it as fact. A kind this side does not know cannot be applied at all. A change that lost
-// its node decodes into a zero Node — mode 0 has no type bits, so it reads as a regular
-// file of length zero dated the epoch — and a replica would then report a directory as an
-// empty file and never learn otherwise. A rename that lost its source leaves the node
-// behind at its old name for good, because the change that would have emptied it has
-// already been consumed.
+// its node cannot establish the metadata to persist. A rename that lost its source
+// leaves the old name intact after the replica consumes the change.
 func (c *Change) UnmarshalJSON(data []byte) error {
 	type change Change
 	var decoded change

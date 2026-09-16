@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -71,6 +70,9 @@ func fileAuthorizationFixture(t *testing.T, policy *fileAuthorizationPolicy, lim
 
 func fileAuthorizationRequest(t *testing.T, h *Handler, request fileRequest) *httptest.ResponseRecorder {
 	t.Helper()
+	if fileAttrResult(request.Op) && request.ResultBytes == 0 {
+		request.ResultBytes = h.maxBodyBytes
+	}
 	if request.Path == nil {
 		request.Path = []byte{}
 	}
@@ -127,8 +129,8 @@ func TestEveryFileOperationAuthorizesBeforeCapabilityLookup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
-	fullOpen := storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Truncate: true, Exclusive: true}, Mode: 0o600}
+	lock := storage.RangeCommand{Domain: storage.DomainWholeFile, Edit: storage.Replace, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}
+	fullOpen := storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Truncate: true, Exclusive: true}, InitialMetadata: map[string][]byte{"test": {1, 2}}}
 	for _, req := range []fileRequest{
 		{Op: storage.OpFileSessionOpen, Options: storage.DefaultFileSessionOptions()},
 		{Op: storage.OpFileStatus},
@@ -145,12 +147,15 @@ func TestEveryFileOperationAuthorizesBeforeCapabilityLookup(t *testing.T) {
 		{Op: storage.OpFileTruncate, Offset: 2},
 		{Op: storage.OpFileSetAttr, Change: &AttrChange{}},
 		{Op: storage.OpFileSync},
-		{Op: storage.OpFileGetLock, Owner: 13, Lock: lock},
-		{Op: storage.OpFileSetLock, Owner: 13, Lock: lock, LockID: action},
-		{Op: storage.OpFileUnlock, Owner: 13, Lock: storage.FileLock{Family: storage.Flock, Type: storage.Unlock, End: math.MaxInt64}, LockID: action},
-		{Op: storage.OpFileQueryLock, Owner: 13, LockID: action},
-		{Op: storage.OpFileCancelLock, Owner: 13, LockID: action},
-		{Op: storage.OpFileDropLocks, Owner: 13, Family: storage.Flock},
+		{Op: storage.OpFileScope},
+		{Op: storage.OpFileNewUseOwner, Node: 71, Scope: &storage.UseScope{Token: strings.Repeat("c", 64)}, OwnerOptions: storage.OwnerOptions{Lifetime: storage.OwnerExplicit}},
+		{Op: storage.OpFileRetireUseOwner, Owner: 13},
+		{Op: storage.OpFileRangeGetConflict, Owner: 13, Commands: []storage.RangeCommand{lock}},
+		{Op: storage.OpFileRangeApply, Owner: 13, Commands: []storage.RangeCommand{lock}, LockID: action},
+		{Op: storage.OpFileRangeApply, Owner: 13, Commands: []storage.RangeCommand{{Domain: storage.DomainWholeFile, Edit: storage.Subtract, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}}, LockID: action},
+		{Op: storage.OpFileRangeQuery, Owner: 13, LockID: action},
+		{Op: storage.OpFileRangeCancel, Owner: 13, LockID: action},
+		{Op: storage.OpFileRangeDrop, Owner: 13, Domain: storage.DomainWholeFile},
 		{Op: storage.OpFileClose},
 	} {
 		t.Run(string(req.Op), func(t *testing.T) {
@@ -162,7 +167,7 @@ func TestEveryFileOperationAuthorizesBeforeCapabilityLookup(t *testing.T) {
 				req.Action = action
 			}
 			switch req.Op {
-			case storage.OpFileStat, storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSync, storage.OpFileAck, storage.OpFileClose, storage.OpFileGetLock, storage.OpFileSetLock, storage.OpFileUnlock, storage.OpFileQueryLock, storage.OpFileCancelLock, storage.OpFileDropLocks:
+			case storage.OpFileStat, storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSync, storage.OpFileAck, storage.OpFileClose, storage.OpFileScope:
 				req.File = strings.Repeat("b", 64)
 			}
 			fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, req), "EACCES", "access denied")
@@ -191,7 +196,6 @@ func TestInvalidFileArgumentsDoNotReachAuthorization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mode := uint32(fs.ModeDir | 0o600)
 	tooLarge := storage.DefaultFileSessionOptions()
 	tooLarge.MaxFiles++
 	for _, req := range []fileRequest{
@@ -205,13 +209,13 @@ func TestInvalidFileArgumentsDoNotReachAuthorization(t *testing.T) {
 		{Op: storage.OpFileRead, Offset: -1, Length: 1},
 		{Op: storage.OpFileWrite, Offset: math.MaxInt64, Data: []byte("x")},
 		{Op: storage.OpFileTruncate, Offset: -1},
-		{Op: storage.OpFileSetAttr, Change: &AttrChange{Mode: &mode}},
-		{Op: storage.OpFileGetLock, Lock: storage.FileLock{Family: storage.Flock, Type: storage.Unlock, End: math.MaxInt64}},
-		{Op: storage.OpFileSetLock, Lock: storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}, LockID: "invalid"},
-		{Op: storage.OpFileSetLock, Lock: storage.FileLock{Family: storage.Flock, Type: storage.Unlock, End: math.MaxInt64}, LockID: action},
-		{Op: storage.OpFileUnlock, Lock: storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}, LockID: action},
-		{Op: storage.OpFileQueryLock, LockID: "invalid"},
-		{Op: storage.OpFileDropLocks, Family: 99},
+		{Op: storage.OpFileSetAttr, Change: &AttrChange{ModTime: &Time{Nanos: -1}}},
+		{Op: storage.OpFileRangeGetConflict, Owner: 13, Commands: []storage.RangeCommand{{Domain: storage.DomainWholeFile, Edit: storage.Subtract, Wait: true, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}}},
+		{Op: storage.OpFileRangeApply, Owner: 13, Commands: []storage.RangeCommand{{Domain: storage.DomainWholeFile, Edit: storage.Replace, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}}, LockID: "invalid"},
+		{Op: storage.OpFileRangeApply, Owner: 13, Commands: []storage.RangeCommand{{Domain: storage.DomainWholeFile, Edit: storage.Subtract, Wait: true, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}}, LockID: action},
+		{Op: storage.OpFileRangeApply, Owner: 13, Commands: []storage.RangeCommand{{Domain: storage.DomainWholeFile, Edit: storage.Replace, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: 0}}}, LockID: action},
+		{Op: storage.OpFileRangeQuery, LockID: "invalid"},
+		{Op: storage.OpFileRangeDrop, Domain: 99},
 		{Op: "unknown"},
 		{Op: "open", Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}},
 	} {
@@ -222,7 +226,7 @@ func TestInvalidFileArgumentsDoNotReachAuthorization(t *testing.T) {
 			req.Action = action
 		}
 		switch req.Op {
-		case storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileGetLock, storage.OpFileSetLock, storage.OpFileUnlock, storage.OpFileQueryLock, storage.OpFileDropLocks:
+		case storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr:
 			req.File = strings.Repeat("b", 64)
 		}
 		answer := fileAuthorizationRequest(t, h, req)
@@ -271,7 +275,7 @@ func TestDeniedFileActionsDoNotMutateOrExposeRetainedReceipts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := fileRequest{Op: storage.OpFileOpen, Session: session.Session, Action: action, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0o777}}
+	req := fileRequest{Op: storage.OpFileOpen, Session: session.Session, Action: action, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, InitialMetadata: map[string][]byte{"test": {7, 7}}}}
 	opened := fileAuthorizationSuccess(t, h, req)
 	h.files.mu.Lock()
 	served := h.files.sessions[session.Session]
@@ -343,15 +347,30 @@ func TestDeniedAdvisoryCleanupPreservesTheActualGrantAndActionHistory(t *testing
 	}
 	opened := fileAuthorizationSuccess(t, h, fileRequest{Op: storage.OpFileOpen, Session: session.Session, Action: openAction, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}})
 	fileAuthorizationSuccess(t, h, fileRequest{Op: storage.OpFileAck, Session: session.Session, File: opened.File})
+	attr, err := backend.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := fileAuthorizationSuccess(t, h, fileRequest{Op: storage.OpFileScope, Session: session.Session, File: opened.File})
+	newOwner := func() storage.UseOwner {
+		t.Helper()
+		action, err := storage.NewLockRequestID(session.Epoch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := fileAuthorizationSuccess(t, h, fileRequest{Op: storage.OpFileNewUseOwner, Session: session.Session, Action: action, Node: attr.ID, Scope: scope.Scope, OwnerOptions: storage.OwnerOptions{Lifetime: storage.OwnerExplicit}})
+		return response.Owner
+	}
+	holder, observer := newOwner(), newOwner()
 	grantID, err := storage.NewLockRequestID(session.Status.ActionEpoch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
-	acquire := fileRequest{Op: storage.OpFileSetLock, Session: session.Session, File: opened.File, Owner: 17, Lock: lock, LockID: grantID}
+	lock := storage.RangeCommand{Domain: storage.DomainWholeFile, Edit: storage.Replace, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}
+	acquire := fileRequest{Op: storage.OpFileRangeApply, Session: session.Session, Owner: holder, Commands: []storage.RangeCommand{lock}, LockID: grantID}
 	granted := fileAuthorizationSuccess(t, h, acquire)
-	if granted.Attempt == nil || granted.Attempt.State != storage.LockGranted {
-		t.Fatalf("readonly descriptor failed exclusive flock: %+v", granted)
+	if granted.Attempt == nil || granted.Attempt.State != storage.Granted {
+		t.Fatalf("readonly descriptor failed whole-file range acquisition: %+v", granted)
 	}
 	unlockID, err := storage.NewLockRequestID(session.Status.ActionEpoch)
 	if err != nil {
@@ -364,23 +383,23 @@ func TestDeniedAdvisoryCleanupPreservesTheActualGrantAndActionHistory(t *testing
 	policy.reset(authz.ErrDenied)
 	for _, request := range []fileRequest{
 		acquire,
-		{Op: storage.OpFileQueryLock, Session: session.Session, File: opened.File, Owner: 17, LockID: grantID},
-		{Op: storage.OpFileCancelLock, Session: session.Session, File: opened.File, Owner: 17, LockID: grantID},
-		{Op: storage.OpFileUnlock, Session: session.Session, File: opened.File, Owner: 17, LockID: unlockID, Lock: storage.FileLock{Family: storage.Flock, Type: storage.Unlock, End: math.MaxInt64}},
-		{Op: storage.OpFileDropLocks, Session: session.Session, File: opened.File, Owner: 17, Family: storage.Flock, Action: dropAction},
+		{Op: storage.OpFileRangeQuery, Session: session.Session, Owner: holder, LockID: grantID},
+		{Op: storage.OpFileRangeCancel, Session: session.Session, Owner: holder, LockID: grantID},
+		{Op: storage.OpFileRangeApply, Session: session.Session, Owner: holder, LockID: unlockID, Commands: []storage.RangeCommand{{Domain: storage.DomainWholeFile, Edit: storage.Subtract, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}}},
+		{Op: storage.OpFileRangeDrop, Session: session.Session, Owner: holder, Domain: storage.DomainWholeFile, Action: dropAction},
 	} {
 		fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, request), "EACCES", "access denied")
 	}
 	policy.reset(nil)
-	conflict := fileAuthorizationSuccess(t, h, fileRequest{Op: storage.OpFileGetLock, Session: session.Session, File: opened.File, Owner: 18, Lock: lock})
+	conflict := fileAuthorizationSuccess(t, h, fileRequest{Op: storage.OpFileRangeGetConflict, Session: session.Session, Owner: observer, Commands: []storage.RangeCommand{lock}})
 	if conflict.Conflict == nil || !conflict.Conflict.Found {
 		t.Fatalf("denied cleanup released the native grant: %+v", conflict)
 	}
-	query := fileAuthorizationSuccess(t, h, fileRequest{Op: storage.OpFileQueryLock, Session: session.Session, File: opened.File, Owner: 17, LockID: grantID})
-	if query.Attempt == nil || query.Attempt.State != storage.LockGranted || !query.Attempt.EverGranted {
+	query := fileAuthorizationSuccess(t, h, fileRequest{Op: storage.OpFileRangeQuery, Session: session.Session, Owner: holder, LockID: grantID})
+	if query.Attempt == nil || query.Attempt.State != storage.Granted || !query.Attempt.EverGranted {
 		t.Fatalf("denial rewrote original grant history: %+v", query)
 	}
-	unknown := fileAuthorizationRequest(t, h, fileRequest{Op: storage.OpFileQueryLock, Session: session.Session, File: opened.File, Owner: 17, LockID: unlockID})
+	unknown := fileAuthorizationRequest(t, h, fileRequest{Op: storage.OpFileRangeQuery, Session: session.Session, Owner: holder, LockID: unlockID})
 	var failure ErrorResponse
 	if err := json.Unmarshal(unknown.Body.Bytes(), &failure); err != nil {
 		t.Fatal(err)
