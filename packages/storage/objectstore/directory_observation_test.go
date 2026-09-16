@@ -6,12 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"reflect"
 	"syscall"
 	"testing"
 
-	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -282,6 +280,9 @@ type objectDirectoryObservationProbe struct {
 	seenResult           *storage.ListResult
 }
 
+// Authority ownership stays with the parent fixture.
+func (*objectDirectoryObservationProbe) Close() error { return nil }
+
 func (p *objectDirectoryObservationProbe) CheckDirectoryMetadataObservation() error {
 	return p.checkErr
 }
@@ -309,6 +310,21 @@ func (p *objectDirectoryObservationProbe) ObserveDirectoryMetadata(ctx context.C
 }
 
 func TestObjectDirectoryMetadataObservationRejectsUnsupportedAndMalformedBackends(t *testing.T) {
+	fixture, native := fileVolume(t, memory.New(), 0, nil)
+	if err := fixture.Mkdir(t.Context(), "d\xff"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.Create(t.Context(), "d\xff/c\xfe"); err != nil {
+		t.Fatal(err)
+	}
+	root, err := fixture.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := fixture.Stat(t.Context(), "d\xff")
+	if err != nil {
+		t.Fatal(err)
+	}
 	checkFailure, nativeFailure := errors.New("directory metadata check failed"), errors.New("directory metadata capture failed")
 	for _, test := range []struct {
 		name                string
@@ -326,13 +342,6 @@ func TestObjectDirectoryMetadataObservationRejectsUnsupportedAndMalformedBackend
 		{name: "owned observation"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			native, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
-				Database: filepath.Join(t.TempDir(), "directory.db"), Volume: "directory", SQLite: sqlite.DefaultOptions(),
-				Locks: locking.DefaultOptions(), Initialize: true,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
 			probe := &objectDirectoryObservationProbe{LockingStore: native, checkErr: test.checkErr, observeErr: test.nativeErr, malformed: test.malformed}
 			var backend metastore.Store = probe
 			if test.missing {
@@ -340,7 +349,7 @@ func TestObjectDirectoryMetadataObservationRejectsUnsupportedAndMalformedBackend
 					metastore.Store
 					metastore.FileStore
 					metastore.BoundedLister
-				}{Store: native, FileStore: native, BoundedLister: native}
+				}{Store: probe, FileStore: native, BoundedLister: native}
 			}
 			volume := objectstore.New(memory.New(), backend)
 			t.Cleanup(func() {
@@ -348,20 +357,6 @@ func TestObjectDirectoryMetadataObservationRejectsUnsupportedAndMalformedBackend
 					t.Errorf("close directory observation probe: %v", err)
 				}
 			})
-			if err := volume.Mkdir(t.Context(), "d\xff"); err != nil {
-				t.Fatal(err)
-			}
-			if err := volume.Create(t.Context(), "d\xff/c\xfe"); err != nil {
-				t.Fatal(err)
-			}
-			root, err := volume.Stat(t.Context(), "")
-			if err != nil {
-				t.Fatal(err)
-			}
-			directory, err := volume.Stat(t.Context(), "d\xff")
-			if err != nil {
-				t.Fatal(err)
-			}
 			session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 			observer := objectCapability[storage.DirectoryMetadataObserver](t, session)
 			checkWant := test.checkErr

@@ -3,12 +3,15 @@ package sqlite
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/schema"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -285,14 +288,36 @@ func TestDirectoryMetadataObservationHardBytesSurviveZeroCallerCharges(t *testin
 		t.Fatal(err)
 	}
 	fit := storage.MaxDirectoryBytes / entryBytes
-	for i := int64(0); i <= fit; i++ {
-		_, err := s.MutateName(t.Context(), storage.NameCommand{
-			Kind: storage.NameCreate, Name: namespaceName(int64(directory.ID), fmt.Sprintf("n%03d", i)),
-			Target: storage.ChildCondition{State: storage.Absent}, Initial: storage.InitialFields{Metadata: map[string][]byte{"test.payload": payload}},
-		})
-		if err != nil {
-			t.Fatal(err)
+	if err := s.mutate(t.Context(), func(tx *sql.Tx) error {
+		for i := int64(0); i <= fit; i++ {
+			command := storage.NameCommand{
+				Kind: storage.NameCreate, Name: namespaceName(int64(directory.ID), fmt.Sprintf("n%03d", i)),
+				Target: storage.ChildCondition{State: storage.Absent}, Initial: storage.InitialFields{Metadata: map[string][]byte{"test.payload": payload}},
+			}
+			mutation, err := s.prepareNamespaceMutation(t.Context(), tx, command)
+			if err != nil {
+				return err
+			}
+			if _, err := s.applyNamespaceMutation(t.Context(), tx, command, mutation, time.Now()); err != nil {
+				return err
+			}
 		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var count, matching int64
+	if err := s.read.QueryRowContext(t.Context(), `SELECT count(*),
+		coalesce(sum(length(e.name)=4 AND n.metadata=?),0)
+		FROM entries e JOIN nodes n ON n.id=e.node
+		WHERE e.volume=? AND e.parent=?`, encoded, s.volume, directory.ID).Scan(&count, &matching); err != nil {
+		t.Fatal(err)
+	}
+	if count != fit+1 || matching != count {
+		t.Fatalf("hard-byte fixture contains %d entries, %d with complete payloads; want %d", count, matching, fit+1)
+	}
+	if err := schema.ValidateVolumeIntegrity(t.Context(), s.read, s.volume, s.maxIntegrityRecords, s.maxIntegrityBytes, s.maxMetadataBytes); err != nil {
+		t.Fatalf("hard-byte fixture integrity: %v", err)
 	}
 	reservations := int64(0)
 	result := directoryMetadataResult(t, 2*storage.MaxDirectoryBytes, 0, func(_ int, _, _ int64, attr storage.Attr) (int64, error) {

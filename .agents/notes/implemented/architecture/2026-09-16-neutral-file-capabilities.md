@@ -48,6 +48,8 @@ DirectoryMetadataObserver 在原 FileSession 下按父身份、可选 Scope 和 
 
 这些只读能力复用原 native gate、引用准入、HTTP 数据通道和包装器，replicated 回源，不新建身份、日志、schema、lease 或动作历史。成本是显式远端观察及客户端最终 guard 核对；它提供当前绑定事实，Windows 的名字投影、祖先组合和请求映射仍由平台接入完成。
 
+观察能力的回归保留真实原生后端，同时把昂贵准备限制在判据需要的范围。objectstore 两个只读拒绝矩阵各建立一次不变的节点内容，每个子例仍独立创建并检查关闭 proxy、session、引用与 worker；底层 authority 由父 fixture 唯一关闭。native 目录字节边界在一个真实 mutation 中逐项准备，再检查精确 payload/count 和 volume 完整性；超长名字仍远超硬上限，并用比例分配界线及实际提前载入负向对照验证拒绝发生在物化前。它们不减少子例、改用虚假后端或放宽生产预算。
+
 ### Uses 与范围保持独立语义
 
 UseClaim 的 Uses/Deny 双向比较。native Scope token 绑定实际引用，即使直接调用 metastore、没有 FileSession，也不能绕过已经生效的限制。FileSession 中注册的 UseOwner 指定 OwnerReference 或 OwnerExplicit；Group 只合并死锁参与者，不合并锁、引用或权限。
@@ -89,6 +91,8 @@ HTTP/v4 使用中立 Attr、metadata、范围及能力 DTO，旧 v3 路由明确
 中立能力可以由 Linux 和编程入口使用，所有包装器保留引用、预算、scope、原始错误和后续清理所有权。代价是 native 原子操作、v6 数据转换、更多有界控制状态以及逐次权威目录读取；本地副本仍保存名称与属性，但公共 List/ListBounded 不以缓存绕过 ReadEntries 限制。
 
 较宽的 metadata 使大量扫描排队也可能阻挡已更新副本上的短 Stat。内部 Replica 的 List/ListBounded 因此先取最多 N-1 个 listing 名额，再共享原 N 个 SQL 名额与公平读写门；默认仍是总量 16，扫描最多 15，不通过扩大连接数改变负载。Stat 不越过写者阶段，扫描也不在等待 quota 时持有阶段；[写者推进](../bug-fix/2026-09-07-let-replica-writers-progress.md)的原理由保留。
+
+四个观察测试文件的局部配对中，两个 SQLite 根普通/race 包耗时分别从 1.447/17.660 秒变为 0.296/5.144 秒；objectstore 两个根、十八个 verdict 分别从 0.635/11.634 秒变为 0.099/2.651 秒。观察代码的已覆盖块未减少，原子例与 oracle 保留；1 MiB 名字的提前物化对照分配 2,108,088–2,108,200 字节，超过保留的 256 KiB 上限并在指定断言失败。这是相同 flags 的单次局部前后观察，不是隔离 benchmark 或整条 CI 的加速保证；目标 profile 也不代表整包覆盖门禁通过。
 
 本决定部分接续[平台客户端提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)的通用核心和[文件目标提案](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)的目录父身份。它保留 live-file、Strong、quota 与未知对象发布的既有理由；显式内容版本、R-CON-5 的应用调用单位和其它独立提案不因能力名称相近而完成。
 

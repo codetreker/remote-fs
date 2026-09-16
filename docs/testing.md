@@ -172,6 +172,8 @@ native admission 用例用一个暂停的 Put 占满 Session 唯一的 data slot
 
 [HTTP 观察用例](../packages/transport/httprest/file_name_observation_test.go)核对两个固定 OpReplicationSnapshot 映射、context、严格字段组合与实际名字 JSON/base64 预算。server/client/ListResult 上限不同、空目录、caller prefix 拒绝都不得保留部分结果；本地 callback 只在远端有界解码后执行，不能当作已序列化的远端限额。旧式打开丢回复时沿原 action 恢复同一 node scalar，getter/捕获身份不符保留 pending-open 清理义务；纯观察不增加 history/ACK/barrier。[真实 native HTTP 用例](../packages/transport/httprest/file_name_observation_http_test.go)核对属性、目录枚举和内部披露的权限分离。
 
+objectstore 的两个畸形/不支持观察矩阵各建一份真实 SQLite fixture，只共享不变的空文件或原始字节目录/子项；九项引用与七项目录子例仍各有新的 proxy、计数器、session、引用和 result。每例按引用/session 到 volume worker 的顺序检查关闭，父 fixture 最后关闭 authority；不在子例间共享活引用或可变结果。
+
 [objectstore](../packages/storage/objectstore/directory_observation_test.go)、[limited](../packages/storage/limited/name_observation_test.go)、[locked](../packages/storage/locked/name_observation_test.go)与[replicated](../packages/storage/replicated/name_observation_test.go)分别验证整链能力拒绝、原 context/身份/错误、一次 prefix 与原数据准入。replicated 的观察回源，失效时不使用名字缓存；所有包各自取得 normal/race 和包内覆盖收据，不能把 wrapper 调用计入 native 的覆盖。Windows resolver 的祖先组合、最终 guard 与真实 QUERY_INFO/rename 行为仍需平台验收。
 
 ### 使用声明、精确范围与删除恢复
@@ -450,6 +452,8 @@ SQLite 的包内直接用例按各模块持有的边界核对结果：
 当前 schema 的 volume 与 detached 完整性拒绝矩阵各自建立一次健康种子，种子仍由真实 Open 和公开 mutation 产生。全部 Store 和 raw handle 成功关闭、WAL TRUNCATE checkpoint 的 busy/frames/checkpointed 均为零之后，才保存完整主库字节和 fixture 元数据。每例写入新的私有 `0600` 文件，持有独立 inode、连接与可变状态，再执行原来的 detach、损坏及 Open/ObjectStatus 顺序。
 
 复制机制同时验证健康与隔离：一份副本的公开写入可读，另一份副本通过 Open/ObjectStatus 且看不到该写入；顶层 cleanup 核对种子字节未变。种子不跨顶层测试共享，也不保留共享活句柄。迁移、WAL、恢复、lease、文件身份和跨进程用例保持原有准备路径；不能复制掉它们要验证的状态形成过程。选择与局部匹配测量见[减少无用 SQLite 测试工作](../.agents/notes/implemented/testing/2026-09-09-reduce-test-work.md)。
+
+观察结果预算的昂贵准备与被测读取分开。[目录硬字节用例](../packages/metastore/sqlite/directory_metadata_test.go)仍用 32 KiB metadata 准备原 8 MiB 边界可容纳数量加一项，在一个真实 s.mutate 中逐项调用原 namespace prepare/apply，随后核对实际行数、完整 payload 和 volume 完整性；被测零收费 callback、硬上限与失败后整份结果不可读的断言不变。[超长名字用例](../packages/metastore/sqlite/name_observation_test.go)使用 1 MiB BLOB，仍为 4096 字节上限的 256 倍，并保持分配少于 payload 四分之一、budget callback 未调用及纯 State 可用的判据。实际提前载入的负向对照必须触发分配断言，不能只靠减小输入使测试变快。
 
 #### 迁移与完整性断言
 

@@ -205,6 +205,11 @@ type nameProbeStore struct {
 	wrap func(metastore.File) metastore.File
 }
 
+type borrowedNameProbeStore struct{ *nameProbeStore }
+
+// The parent fixture owns the authority; subcases drain their own volumes and references.
+func (*borrowedNameProbeStore) Close() error { return nil }
+
 func (s *nameProbeStore) OpenFile(ctx context.Context, name string, options storage.FileOpenOptions) (metastore.File, error) {
 	file, err := s.LockingStore.OpenFile(ctx, name, options)
 	if err != nil {
@@ -372,6 +377,10 @@ func (*nameWithoutIdentity) ObserveName(context.Context, *storage.NamespaceGuard
 }
 
 func TestObjectReferenceNameObservationRejectsUnsupportedAndMalformedBackends(t *testing.T) {
+	fixture, native := fileVolume(t, memory.New(), 0, nil)
+	if err := fixture.Create(t.Context(), "f"); err != nil {
+		t.Fatal(err)
+	}
 	failure := errors.New("name authority failure")
 	for _, test := range []struct {
 		name      string
@@ -392,7 +401,7 @@ func TestObjectReferenceNameObservationRejectsUnsupportedAndMalformedBackends(t 
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var probe *nameProbeFile
-			volume := newNameProbeVolume(t, func(file metastore.File) metastore.File {
+			backend := &nameProbeStore{LockingStore: native, wrap: func(file metastore.File) metastore.File {
 				id, err := storage.ReferenceNodeID(file)
 				if err != nil {
 					t.Fatal(err)
@@ -409,10 +418,13 @@ func TestObjectReferenceNameObservationRejectsUnsupportedAndMalformedBackends(t 
 				default:
 					return probe
 				}
+			}}
+			volume := objectstore.New(memory.New(), &borrowedNameProbeStore{backend})
+			t.Cleanup(func() {
+				if err := volume.Close(); err != nil {
+					t.Errorf("close name-probe volume: %v", err)
+				}
 			})
-			if err := volume.Create(t.Context(), "f"); err != nil {
-				t.Fatal(err)
-			}
 			session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 			file := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
 			observer := objectCapability[storage.ReferenceNameObserver](t, file)

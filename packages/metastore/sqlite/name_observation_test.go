@@ -220,7 +220,7 @@ func TestReferenceNameObservationRejectsOversizedLeafBeforeLoading(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const payloadBytes = 32 << 20
+	const payloadBytes = 1 << 20
 	if _, err := s.write.ExecContext(t.Context(), `UPDATE entries SET name=zeroblob(?) WHERE volume=? AND node=?`, payloadBytes, s.volume, f.id); err != nil {
 		t.Fatal(err)
 	}
