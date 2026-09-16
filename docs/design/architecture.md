@@ -252,7 +252,7 @@ packages/                    可被外部与自身 import
     metastoretest/           metastore 义务的可执行形式
   transport/                 把 storage 契约搬到线上，一种传输一个包
     httprest/                HTTP：URL 与消息的形状、服务端、拨号端
-  smb/                       SMB 认证契约与内部协议/签名基础组件
+  smb/                       本机 SMB 端点、认证会话与内部协议/签名组件
     windows/                 native SSPI 与 SID policy；尚无映射入口
   fuse/                      挂载呈现层：FUSE 与 Linux owner/属性政策
     posix/                   POSIX 权限 payload codec
@@ -271,7 +271,7 @@ docs/
 | `storage` | 两个角色共用：接口、volume 服务的语义操作与错误词汇 |
 | `authz` | 传输中性的业务授权类型；由嵌入方与 server adapter 使用 |
 | `advisory` | server 侧，按 volume 共享中立 owner、范围及历史；平台政策由客户端选择 |
-| `smb`、`smb/windows` | client 平台接入的协议/身份基础组件，不提供已交付的 serving/mapping |
+| `smb`、`smb/windows` | 本机协议端点、身份/会话与保留引用的安装清理；文件命令和映射仍待接入 |
 | `storage/storagetest` | 测试专用：volume 与 bounded-server 契约的可执行形式 |
 | `storage/localstore` | server 侧，持有本地对象与绑定的 SQLite metastore |
 | `storage/objectstore`、`storage/objectstore/azblob`、`storage/objectstore/localdisk` | server 侧 |

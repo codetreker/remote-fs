@@ -355,6 +355,16 @@ go vet ./packages/smb ./packages/smb/internal/wire ./packages/smb/internal/signi
 
 普通与 race 收据各为 70 pass、无 fail/skip，Windows ARM64/AMD64 构建也通过。[当前源码原生运行 35095465239](https://github.com/codetreker/remote-fs/actions/runs/35095465239)另在 Windows 11 Enterprise 26200 ARM64 执行 42 个根、71 个 verdict，两项 native SSPI 根通过且无 fail/skip；其 source/profile 对应 checkout 328d5f64，不能用来替代随后改变的实现。它们只证明[协议基础组件](../.agents/notes/implemented/architecture/2026-09-16-smb-protocol-primitives.md)，不证明端点、映射、文件适配或 Windows 可用性；固定原型诊断另按下节的来源核对。
 
+### SMB 本机会话端点
+
+[端点配置/拥有权](../packages/smb/server_test.go)验证显式配置、loopback listener 接纳与拒绝的关闭归属、Publish 预留及同名 Export 身份、busy Unpublish 和失败后重试。Shutdown 用例区分当前尝试错误与历史诊断；旧失败不能覆盖后来成功，同次等待者也不能被下一次重试改写。[会话 registry](../packages/smb/session_registry_test.go)核对全局 ID/限额、previous-session 的新 principal 授权、重认证和跨连接生命周期，错误身份不得触发 raw Close。
+
+[协议 TCP](../packages/smb/server_protocol_test.go)与[连接用例](../packages/smb/connection_test.go)验证 bootstrap/3.1.1、签名、实际 credit/payload 边界、related compound、资源拒绝、AsyncID CANCEL 与 LOGOFF 等待；不能以未签名或虚构成功响应绕过资源错误。[authority session](../packages/smb/authority_session_test.go)验证共享 tree 的单份 FileSession/续期、旧回复不延长期限、失效 fencing 及不带每次 I/O Status 的拥有权路径。
+
+[handle 用例](../packages/smb/handle_test.go)直接提供 neutral fixture 引用，核对 File/NodeReference 别名只关闭一次、返回错误的非 nil 引用仍保留名额、退役后晚到安装拒绝、borrow 排空和 cleanup attempt 结果不被覆盖；[authority 清理用例](../packages/smb/authority_session_test.go)核对失败关闭继续占连接/session/tree/open/export 额度，确认重试后才归还。fixture 安装不证明 wire CREATE 或真实 SQLite 文件操作，尚未接入的命令须按协议明确不支持。
+
+这一批 packages/smb 自身普通/race 各为 54 根、87 个通过 verdict，覆盖 86.2%、最低函数 50%，vet 与 ARM64/AMD64 交叉构建通过；previous-principal 负向对照在预期授权断言失败。这些是 Linux 端点协议/拥有权与构建证据；旧原生 SSPI 的 71 verdict 只属于其记录的 checkout，新增端点的 Windows 运行和完整文件/映射/缓存验收仍需实际执行。
+
 ### Windows 原生 SMB 缓存诊断
 
 [诊断工作流](../.github/workflows/native-smb-gate.yml)在原生 Windows 11 24H2+ ARM64 上，以固定的 [SMB 原型](https://github.com/codetreker/remote-fs/tree/1cb9ad7f49d998de4daa4d562d766b18cf06ce16/packages/smb/windows)为基底验证系统重定向器的名字、属性和已打开文件缓存行为。基底只检出到 `.tmp/native-cache-gate/fixture`；[运行脚本](../.github/scripts/native-smb-cache-gate.ps1)核对 commit，检查并应用[通知连续性补丁](../.github/scripts/native-smb-notify-continuity.patch)，再注入[聚焦探针](../.github/scripts/native-smb-cache-gate_test.go.txt)和[通知回归用例](../.github/scripts/native-smb-notify-continuity_test.go.txt)。实际执行对象由基底 SHA、补丁 SHA256 与探针 SHA 共同确定，不与纯基底混称，也不编译工作分支正在实现的 SMB/backend。已观察结果与取舍见[诊断决定](../.agents/notes/implemented/testing/2026-09-16-native-smb-cache-diagnostic.md)。

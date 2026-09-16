@@ -50,13 +50,27 @@ SSE 不把整个 stream 保存在内存里，但每一帧仍有独立的 `DialOp
 
 **FUSE 到这一层为止。** 挂载层将 Lookup、Create、Mkdir、Unlink、Rmdir、Rename 与目录读取转换为父 NodeID/原始叶名的能力调用。普通 fd 使用 File，无 fd 的身份属性使用 StatNode/SetNodeAttr；目录 handle 保留 NodeReference 及其 Scope。FileSession 拥有服务端引用，挂载层拥有内核编号、POSIX codec 与 owner 映射，不以过时父路径重新定位对象。
 
-### SMB 协议基础组件
+### SMB 协议与会话端点
 
-packages/smb 定义认证交换与 Principal context；internal/wire 提供有界报文编解码，internal/signing 提供 preauth/KDF/AES-CMAC 及签名会话销毁。Request slice 借用输入帧，签名 key 的生命周期由明确的 Destroy 结束；这些内部包不拥有 volume 或文件引用。
+packages/smb 提供本机端点和认证会话，internal/wire 负责有界报文，internal/signing 负责 preauth/KDF/AES-CMAC 及签名会话销毁。Request slice 借用输入帧，拥有者在处理结束前保留帧；旧协议代码的复用范围与 NOTICE 见[协议与会话决定](../../../.agents/notes/implemented/architecture/2026-09-16-smb-protocol-primitives.md)。
 
-packages/smb/windows 提供 SSPI Negotiate authenticator 和 SID policy。构造器不取凭据，Begin/Step/Close 拥有单次 native context；同步 native 调用结束后才完成取消/关闭交接。只有认证完成的 Principal 才能由集成方写入 context，显示名不用于授权。非 Windows native 调用明确拒绝。
+[Config](../../../packages/smb/config.go) 必须显式提供 Authenticator、Authorize 和有效 Limits；调用方可选择 DefaultLimits 后调整，零值不被自动补齐。Share{Name, Volume, Backend} 把名称绑定到可信业务 volume 和原 storage.FileStorage，配置使用 keyed literal。host 保留 authenticator、logger 和 backend 的所有权；每次 Begin 返回的 Authentication 由端点关闭。
 
-这些是尚未接入 serving/mapping 的协议组件，未提供 Windows 网络驱动器入口；其独立验证和保留的 NOTICE 见[协议组件决定](../../../.agents/notes/implemented/architecture/2026-09-16-smb-protocol-primitives.md)。实际 Windows 集成仍沿[平台提案](../../../.agents/notes/proposed/architecture/2026-09-16-platform-client-capabilities.md)完成，不复制另一套 File/NodeReference backend。
+New 创建端点，Publish 在检查 backend 前预留 export 名额、验证 share 名并拒绝大小写重复及 IPC$ 保留名；不扫描 volume 或打开根引用。Serve 只接受 loopback TCP listener/peer，且仅能启动一次；成功接纳的 listener 由端点在取消或 Shutdown 时关闭，拒绝的 listener 仍由 host 拥有。Unpublish 在活动请求或打开引用存在时返回 ErrBusy；开始退役后拒绝新 tree，失败清理继续由原 Export 保留到重试成功。
+
+SMB 3.1.1 支持直接及 SMB1 形状的 negotiate bootstrap，要求签名；bootstrap 不表示支持旧 dialect。packages/smb/windows 的 SSPI Begin/Step/Close 持有单次 native context，Principal.SID 用于身份判断，Name 不授予访问。每个受支持语义操作用当前 principal context 和可信 Volume 重新调用业务授权；先验证的新 principal 才能退役对应 previous session，不能借旧身份上下文通过授权。
+
+一个 SMB session 与 Export 共享一份直接 FileSession，多 tree 只增加引用计数和一份续期 worker。初次 Status 建立保守期限；旧 revision 回复不能延长新期限，Renew/epoch 异常 fencing 所有共享 tree，旧 handle 不重绑。IPC$ 是独立控制 tree，没有 volume、FileSession、root 或文件引用。TREE_CONNECT 不 pin 根，也不为后续每次 I/O 增加 Status。
+
+handle 的 NodeReference 是唯一关闭拥有者；普通文件的可选 File 只是同一对象的接口别名。open reservation 在安装前拥有原 Attr/Outcome、返回字节和一个名额；错误与非 nil 引用同返仍进入 cleanup 注册表。安装与退役有序，退役后到达的 open 不能成功安装；借用者和 native 清理完成前，引用与 charge 均不释放。关闭不补做 Stat 或名字查询。
+
+Shutdown 和 Unpublish 的并发调用共享当前 cleanup attempt 的不可变结果；后续调用才能重试。Shutdown 返回本轮清理结果，历史失败保留在 Status/日志诊断中，不把已经恢复的资源继续报告成本轮错误；未知关闭仍保留原 connection/session/tree/open/export 额度，不因协议句柄已移除而归还。取消等待者不取消或遗弃正在进行的尝试。
+
+默认 server-wide exports/connections/sessions 为 32/16/16；每 session 最多 32 tree，每 tree 和每 export 的 opens 各受 1024 上限约束。每连接 128 request 包含 pending async；compound/context 上限为 32/16，frame 为 2 MiB，I/O 为 1 MiB，token 为 65535 字节，handshake/request/cleanup 为 30/60/30 秒。FileSession 另有自己的限制。分配、捕获结果及 compound 回复在效果前收费，删除 map entry 不返还仍保留的 backing 容量。目录/通知限额保留配置位置，当前不分配相应资源。
+
+credits 核对长度和读写范围，重复/越界拒绝；资源拒绝仍产生签名响应。related compound 保持顺序及继承身份，async 以唯一 AsyncID 核对 CANCEL 和当前 session，pending/terminal 的 credit 归还各一次。LOGOFF/断线分别等待真实借用与响应/签名用户，注册表锁不跨授权、storage I/O 或等待。
+
+当前实现包含会话/控制及不带 postquery 的 CLOSE 清理路径；CREATE、名字解析、文件/属性、范围、通知与映射仍未接入，相关请求在 session/tree 检查后明确拒绝。它不是可用的 Windows 网络驱动器。[测试策略](../../testing.md#smb-本机会话端点)区分真实 TCP、引用安装 fixture、交叉构建和原生运行；旧 SSPI 收据不覆盖新增端点。剩余接入、历史时间和缓存决策仍由[平台提案](../../../.agents/notes/proposed/architecture/2026-09-16-platform-client-capabilities.md)承接。
 
 ### 业务身份与授权结果
 

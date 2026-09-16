@@ -12,13 +12,13 @@ Linux 和编程入口可以创建 Windows 无法表示或存在大小写歧义�
 
 ## 提案
 
-[SMB 协议基础组件](../../implemented/architecture/2026-09-16-smb-protocol-primitives.md)部分交付本提案的报文/签名/认证依赖，Windows SSPI helper 也有独立实现；原生 SSPI 组件已有自己的实测，仍不代表 endpoint、映射、文件适配或组合后的认证/缓存验收完成。下述平台接入与剩余能力仍是同一目标。
+[SMB 协议与会话端点](../../implemented/architecture/2026-09-16-smb-protocol-primitives.md)已交付报文/签名/认证依赖、本机 listener/export、会话和直接 FileSession 引用管理。原生 SSPI 组件已有旧源码的独立实测，新增端点目前只有 Linux 协议/拥有权测试与 Windows 交叉构建；CREATE、文件/名字/属性、范围、通知及映射仍待接入，组合后的原生验收未完成。下述剩余工作保持同一目标。
 
 ### 接入形态与现有依赖
 
-Windows 11 24H2+ 使用系统 SMB 重定向器；独立、可嵌入的 Go 客户端 package 负责本机 listener、身份隔离、share 发布/停止和 SMB 解释。远端继续使用中立接口，不部署 Windows 专有服务、不为 volume 切换名字模式，也不要求第三方文件系统驱动。业务方控制远端身份、凭据轮换与每个语义操作授权，默认仅创建者能访问本机映射。
+Windows 11 24H2+ 使用系统 SMB 重定向器；独立、可嵌入的 Go 客户端 package 已提供本机 loopback listener、显式认证/授权、share 发布/停止及会话管理。Windows 映射及文件命令的 SMB 解释仍须接入这些拥有者。远端继续使用中立接口，不部署 Windows 专有服务、不为 volume 切换名字模式，也不要求第三方文件系统驱动。业务方控制远端身份、凭据轮换与每个语义操作授权，默认仅创建者能访问本机映射。
 
-接入复用现有 FileSession/File、NodeID 与同步内容管线，普通 Windows 打开随同一 incarnation 有效，断线未知时 fencing，authority 退役后旧 handle 明确失败。短暂 HTTP 超时不代表权限已解除，也不按路径重新创建引用或静默重获锁。Strong 的有限期限、恢复保护与 TargetGone 保持独立；不在此引入 durable/persistent handles、第二份 File lease 或通用动作 receipt。
+已实现的端点把同一 SMB session/Export 的 tree 绑定到一份 FileSession，NodeReference/可选 File 是同一关闭拥有者；后续文件命令继续复用现有 FileSession/File、NodeID 与同步内容管线，普通 Windows 打开随同一 incarnation 有效，断线未知时 fencing，authority 退役后旧 handle 明确失败。短暂 HTTP 超时不代表权限已解除，也不按路径重新创建引用或静默重获锁。Strong 的有限期限、恢复保护与 TargetGone 保持独立；不在此引入 durable/persistent handles、第二份 File lease 或通用动作 receipt。
 
 | Windows 操作 | 已有中立能力 | Windows 客户端仍须完成的工作 |
 |---|---|---|
@@ -74,6 +74,8 @@ FILE_DELETE_ON_CLOSE 对应 armed OnReferenceClose，指定引用结束时触发
 [固定诊断入口](../../implemented/testing/2026-09-16-native-smb-cache-diagnostic.md)已经提供可考的原生观察，结论按基底、overlay、variant 和实际系统分别成立。带连续性 overlay 的监听可以跨越被测的通知间隔，但目录共享对照也显示 LIST/share-deny 与内部监听可能在重定向器侧冲突；不能只靠服务端特殊放行解决尚未发出的请求。
 
 接入必须选择一个既满足一秒、非 TTL 可见性，又不改变应用共享行为的实际路径。FindFirstChangeNotification 共存性与最终缺失状态的独立诊断不等于产品选择；缺失状态只可由成功的 guarded metadata 观察确定最终/中间组件，未知、权限或父身份失败仍报错。相同 Win32 映射也不能证明重定向器缓存相同。
+
+原 capability 和 NoLeasing 两种被测策略都已有合格的超过一秒旧路径属性结果；这些结果分别属于固定原型及其精确补丁，不能推断新增端点的文件行为。下一项缓存处理决定仍未确定，一秒要求保持原样，不在此选择新的缓存策略。
 
 生产验证使用实际 package、HTTP/v4 与新 backend，不使用诊断原型代替。需要覆盖文件内容、属性、名字不存在、目录结果、改名/删除及已打开引用，断线时不能让缓存报空或不存在。全局 cache lifetime、安装驱动、放宽系统安全设置和完整 lease-break 协议不因一个失败的探针自动进入范围。
 
