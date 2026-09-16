@@ -256,6 +256,10 @@ func cacheGateAwaitMissingName(t *testing.T, trace *cacheGateTrace, after uint64
 
 func TestNativeNegativeNameCacheGate(t *testing.T) {
 	variant := os.Getenv("RFS_GATE_VARIANT")
+	if variant == "directory_sharing" {
+		cacheGateSharingScenario(t)
+		return
+	}
 	if variant == "owned_nested" || variant == "owned_lifecycle" || variant == "owned_outage" || variant == "owned_rescan" {
 		cacheGateOwnedScenario(t, variant)
 		return
@@ -1123,4 +1127,247 @@ func cacheGateAwaitEnum(t *testing.T, trace *cacheGateTrace, after int) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+type cacheGateShareCase struct {
+	Name              string
+	Directory         bool
+	ApplicationFirst  bool
+	ApplicationAccess uint32
+	ApplicationShare  uint32
+	WatchAccess       uint32
+}
+type cacheGateShareResult struct {
+	Platform         string
+	Case             cacheGateShareCase
+	SharingViolation bool
+	SecondOpen       string
+}
+
+func cacheGateSharingOpen(t *testing.T, path string, access, share uint32, directory bool) (*nativeHandle, error) {
+	t.Helper()
+	name, err := win.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flags := uint32(win.FILE_FLAG_OVERLAPPED)
+	if directory {
+		flags |= win.FILE_FLAG_BACKUP_SEMANTICS
+	}
+	handle, err := win.CreateFile(name, access, share, nil, win.OPEN_EXISTING, flags, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := &nativeHandle{value: handle}
+	t.Cleanup(func() {
+		if err := file.close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return file, nil
+}
+
+func cacheGateSharingAttempt(t *testing.T, trace *cacheGateTrace, platform, path string, test cacheGateShareCase) cacheGateShareResult {
+	t.Helper()
+	all := uint32(win.FILE_SHARE_READ | win.FILE_SHARE_WRITE | win.FILE_SHARE_DELETE)
+	firstAccess, firstShare, secondAccess, secondShare := test.WatchAccess, all, test.ApplicationAccess, test.ApplicationShare
+	secondName := "application"
+	if test.ApplicationFirst {
+		firstAccess, firstShare, secondAccess, secondShare = test.ApplicationAccess, test.ApplicationShare, test.WatchAccess, all
+		secondName = "watcher"
+	}
+	cacheGateObserve("directory_sharing_open_attempt", map[string]any{"platform": platform, "case": test.Name, "stage": "first", "access": firstAccess, "share": firstShare})
+	first, err := cacheGateSharingOpen(t, path, firstAccess, firstShare, test.Directory)
+	if err != nil {
+		t.Fatalf("first %s open: %v", platform, err)
+	}
+	if test.Directory && !test.ApplicationFirst {
+		cacheGateSharingArm(t, trace, platform, first)
+	}
+	cacheGateObserve("directory_sharing_open_attempt", map[string]any{"platform": platform, "case": test.Name, "stage": "second", "access": secondAccess, "share": secondShare})
+	second, err := cacheGateSharingOpen(t, path, secondAccess, secondShare, test.Directory)
+	if err != nil && !errors.Is(err, win.ERROR_SHARING_VIOLATION) {
+		t.Fatalf("second %s open: %v", platform, err)
+	}
+	result := cacheGateShareResult{Platform: platform, Case: test, SharingViolation: errors.Is(err, win.ERROR_SHARING_VIOLATION), SecondOpen: secondName}
+	cacheGateObserve("directory_sharing_result", result)
+	if err == nil && test.Directory && test.ApplicationFirst {
+		cacheGateSharingArm(t, trace, platform, second)
+	}
+	return result
+}
+
+func cacheGateSharingArm(t *testing.T, trace *cacheGateTrace, platform string, file *nativeHandle) {
+	t.Helper()
+	before := cacheGatePendingCount(t, trace)
+	_ = cacheGateStartWatch(t, file)
+	if !strings.HasPrefix(platform, "smb_") {
+		return
+	}
+	deadline := time.Now().Add(time.Second)
+	for cacheGatePendingCount(t, trace) <= before {
+		if time.Now().After(deadline) {
+			t.Fatal("SMB directory sharing control had no admitted native watch")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func cacheGateRequireNTFS(t *testing.T, path string) {
+	t.Helper()
+	file, err := cacheGateSharingOpen(t, path, win.FILE_READ_ATTRIBUTES, win.FILE_SHARE_READ|win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := make([]uint16, 64)
+	var serial, maxName, flags uint32
+	if err := win.GetVolumeInformationByHandle(file.value, nil, 0, &serial, &maxName, &flags, &name[0], uint32(len(name))); err != nil {
+		t.Fatal(err)
+	}
+	filesystem := win.UTF16ToString(name)
+	cacheGateObserve("local_filesystem_control", map[string]string{"filesystem": filesystem})
+	if filesystem != "NTFS" {
+		t.Fatalf("local control requires NTFS, got %q", filesystem)
+	}
+	if err := file.close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func cacheGateSharingScenario(t *testing.T) {
+	output := os.Getenv("RFS_GATE_OUTPUT_ROOT")
+	if output == "" {
+		t.Fatal("receipt output directory is required")
+	}
+	trace := &cacheGateTrace{}
+	cacheGateActive.Store(trace)
+	var bridge *nativeBridge
+	var results []cacheGateShareResult
+	t.Cleanup(func() {
+		cacheGateActive.Store(nil)
+		trace.mu.Lock()
+		events := append([]cacheGateEvent(nil), trace.events...)
+		overflow, encodeErr := trace.overflow, trace.encodingError
+		trace.mu.Unlock()
+		if overflow || encodeErr != nil {
+			t.Errorf("incomplete sharing trace: overflow=%v error=%v", overflow, encodeErr)
+		}
+		report := map[string]any{"evidence_kind": "pinned prototype diagnostic; not PR implementation acceptance", "variant": "directory_sharing", "fixture_sha": os.Getenv("RFS_GATE_FIXTURE_SHA"), "gate_sha": os.Getenv("GITHUB_SHA"), "overlay_sha": os.Getenv("RFS_GATE_OVERLAY_SHA"), "test_failed": t.Failed(), "results": results, "events": events}
+		if bridge != nil {
+			report["final_server_status"] = bridge.smb.Status()
+			report["final_backend_references"] = bridge.backend.openReferences()
+		}
+		encoded, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.WriteFile(filepath.Join(output, "receipt.json"), encoded, 0600); err != nil {
+			t.Error(err)
+		}
+	})
+	parent := t.TempDir()
+	directory := filepath.Join(parent, "sharing")
+	if err := os.Mkdir(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "parent-write-proof.bin"), []byte{1}, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cacheGateObserve("local_parent_write_proven", nil)
+	cacheGateRequireNTFS(t, directory)
+	raw, err := win.UTF16PtrFromString(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	volume := make([]uint16, 32768)
+	if err := win.GetVolumePathName(raw, &volume[0], uint32(len(volume))); err != nil {
+		t.Fatal(err)
+	}
+	volumeRoot := win.UTF16ToString(volume)
+	sid, err := CurrentUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := AllowSID(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge = nativeBridgeFixture(t, policy)
+	if err := bridge.mapDrive(t); err != nil {
+		t.Fatal(err)
+	}
+	proof := nativeOpen(t, filepath.Join(bridge.path+`\`, "parent-write-proof.bin"), win.CREATE_ALWAYS)
+	if n, err := nativeTransfer(proof, []byte{1}, true); err != nil || n != 1 {
+		t.Fatalf("SMB parent write proof: count=%d error=%v", n, err)
+	}
+	if err := proof.close(); err != nil {
+		t.Fatal(err)
+	}
+	cacheGateObserve("smb_parent_write_proven", nil)
+	_, _ = nativeRemoteOpen(t, bridge.remote, "sharing", storage.NodeDirectory, true)
+	list := uint32(win.FILE_LIST_DIRECTORY)
+	metadata := uint32(win.FILE_READ_ATTRIBUTES)
+	watchAccess := uint32(win.FILE_LIST_DIRECTORY | win.FILE_READ_ATTRIBUTES | win.READ_CONTROL | win.SYNCHRONIZE)
+	denyRead := uint32(win.FILE_SHARE_WRITE | win.FILE_SHARE_DELETE)
+	cases := []cacheGateShareCase{
+		{Name: "list_watcher_first", Directory: true, ApplicationAccess: list, ApplicationShare: denyRead, WatchAccess: watchAccess},
+		{Name: "list_application_first", Directory: true, ApplicationFirst: true, ApplicationAccess: list, ApplicationShare: denyRead, WatchAccess: watchAccess},
+		{Name: "metadata_watcher_first", Directory: true, ApplicationAccess: metadata, ApplicationShare: denyRead, WatchAccess: watchAccess},
+		{Name: "metadata_application_first", Directory: true, ApplicationFirst: true, ApplicationAccess: metadata, ApplicationShare: denyRead, WatchAccess: watchAccess},
+	}
+	locations := []struct{ name, path string }{
+		{"ntfs_directory", directory}, {"ntfs_volume_root", volumeRoot},
+		{"smb_directory", `\\127.0.0.1\` + bridge.share + `\sharing`}, {"smb_export_root", `\\127.0.0.1\` + bridge.share},
+	}
+	subdirectories := make(map[string]map[string]bool)
+	for _, location := range locations {
+		subdirectories[location.name] = make(map[string]bool)
+		for _, test := range cases {
+			t.Run(location.name+"/"+test.Name, func(t *testing.T) {
+				cacheGateObserve("directory_sharing_open_attempt", map[string]any{"platform": location.name, "case": test.Name, "stage": "baseline", "access": test.ApplicationAccess, "share": test.ApplicationShare})
+				baseline, err := cacheGateSharingOpen(t, location.path, test.ApplicationAccess, test.ApplicationShare, true)
+				if err != nil && !errors.Is(err, win.ERROR_SHARING_VIOLATION) {
+					t.Fatal(err)
+				}
+				baselineBlocked := errors.Is(err, win.ERROR_SHARING_VIOLATION)
+				if baseline != nil {
+					if err := baseline.close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				cacheGateObserve("directory_sharing_baseline", map[string]any{"platform": location.name, "case": test.Name, "sharing_violation": baselineBlocked})
+				if baselineBlocked {
+					cacheGateObserve("directory_sharing_preexisting_conflict", map[string]string{"platform": location.name, "case": test.Name})
+					t.Error("preexisting directory sharing conflict makes this control inconclusive")
+					return
+				}
+				result := cacheGateSharingAttempt(t, trace, location.name, location.path, test)
+				results = append(results, result)
+				subdirectories[location.name][test.Name] = result.SharingViolation
+			})
+		}
+	}
+	for _, test := range cases {
+		local, localOK := subdirectories["ntfs_directory"][test.Name]
+		remote, remoteOK := subdirectories["smb_directory"][test.Name]
+		if !localOK || !remoteOK {
+			t.Errorf("directory sharing comparison is incomplete for %s", test.Name)
+			continue
+		}
+		if local != remote {
+			t.Errorf("SMB directory sharing differs from writable-parent NTFS for %s", test.Name)
+		}
+	}
+	fileCase := cacheGateShareCase{Name: "regular_read_control", ApplicationAccess: win.GENERIC_READ, ApplicationShare: denyRead, WatchAccess: win.GENERIC_READ}
+	for _, location := range []struct{ name, path string }{{"ntfs_regular", filepath.Join(parent, "parent-write-proof.bin")}, {"smb_regular", filepath.Join(bridge.path+`\`, "parent-write-proof.bin")}} {
+		t.Run(location.name, func(t *testing.T) {
+			result := cacheGateSharingAttempt(t, trace, location.name, location.path, fileCase)
+			results = append(results, result)
+			if !result.SharingViolation {
+				t.Fatal("regular-file read-sharing control did not reject the conflicting open")
+			}
+		})
+	}
+	bridge.assertCacheContract(t)
 }
