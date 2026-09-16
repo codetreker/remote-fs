@@ -344,3 +344,55 @@ func TestGatePositiveWireIncompleteSelectedBufferResults(t *testing.T) {
 		}
 	}
 }
+
+func TestGatePositiveWireNetworkOpenInformation(t *testing.T) {
+	// FILE_NETWORK_OPEN_INFORMATION has six 64-bit values followed by attributes.
+	// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_file_network_open_information
+	for _, test := range []struct {
+		name   string
+		length int
+	}{
+		{"truncated", 55}, {"complete", 56}, {"overlong", 57},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := cacheGatePositiveTestObserver()
+			id := wire.FileID{3, 4}
+			o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestQuery(t, 34, 34, id, 0)), false)
+			data := make([]byte, test.length)
+			const mtime uint64 = 0x0123456789abcdef
+			const eof uint64 = 0x0000000123456789
+			binary.LittleEndian.PutUint64(data[8:16], 111)
+			binary.LittleEndian.PutUint64(data[16:24], mtime)
+			binary.LittleEndian.PutUint64(data[24:32], 222)
+			binary.LittleEndian.PutUint64(data[32:40], 333)
+			binary.LittleEndian.PutUint64(data[40:48], eof)
+			o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.QueryInfo, 34, wire.FlagResponse, 0, wire.BufferResponseBody(data))), true)
+			if len(o.records) != 2 {
+				t.Fatalf("records=%+v", o.records)
+			}
+			r := o.records[1]
+			if test.length != 56 {
+				if !o.incomplete || r.Incomplete == "" {
+					t.Fatalf("invalid network information length accepted: %+v", r)
+				}
+				return
+			}
+			if o.incomplete || r.QueryClass != 34 || r.QueryType != 1 || r.FileID != hex.EncodeToString(id[:]) || r.MTime != mtime || r.EOF != eof {
+				t.Fatalf("network information decode or correlation lost: %+v", r)
+			}
+		})
+	}
+}
+
+func TestGatePositiveWireIncompleteNetworkOpenBufferResults(t *testing.T) {
+	for _, status := range []uint32{0x80000005, 0xc0000023} {
+		o := cacheGatePositiveTestObserver()
+		o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestQuery(t, 34, 34, wire.FileID{3, 4}, 0)), false)
+		body := make([]byte, 8)
+		binary.LittleEndian.PutUint16(body, 9)
+		o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.QueryInfo, 34, wire.FlagResponse, status, body)), true)
+		if !o.incomplete || len(o.records) != 2 || o.records[1].Incomplete == "" || o.records[1].Status != status {
+			t.Fatalf("partial network metadata accepted: %+v", o.records)
+		}
+	}
+}

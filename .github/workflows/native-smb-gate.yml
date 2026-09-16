@@ -54,13 +54,13 @@ jobs:
           if-no-files-found: error
           retention-days: 14
   cache:
-    name: Native cache / ${{ matrix.variant }}
+    name: ${{ startsWith(matrix.variant, 'positive_postdeadline_') && 'Post-deadline witness (not SLO acceptance)' || 'Native cache' }} / ${{ matrix.variant }}
     runs-on: windows-11-arm
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        variant: [baseline, held_parent, notify_parent, owned_nested, owned_lifecycle, owned_outage, owned_rescan, directory_sharing, find_notification, missing_final_status, positive_unheld, positive_exclusive]
+        variant: [baseline, held_parent, notify_parent, owned_nested, owned_lifecycle, owned_outage, owned_rescan, directory_sharing, find_notification, missing_final_status, positive_unheld, positive_exclusive, positive_postdeadline_unheld, positive_postdeadline_exclusive]
     env:
       RFS_GATE_VARIANT: ${{ matrix.variant }}
       RFS_GATE_FIXTURE_SHA: 1cb9ad7f49d998de4daa4d562d766b18cf06ce16

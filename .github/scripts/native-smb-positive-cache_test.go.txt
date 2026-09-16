@@ -53,6 +53,8 @@ type cacheGatePositiveFirst struct {
 }
 
 type cacheGatePositiveCell struct {
+	postDeadline            bool
+	PostDeadline            *cacheGatePostDeadlineResult
 	ExposureSource          cacheGatePositiveWireRecord
 	IOModel                 string
 	First                   []cacheGatePositiveFirst
@@ -382,9 +384,9 @@ func cacheGatePositiveFresh(t *testing.T, v cacheGatePositiveValue, observe, nam
 				case "absent":
 					match = request.Command == 5 && request.Name == name && response.Status == 0xc000000f
 				case "basic":
-					match = request.Command == 16 && (request.QueryClass == 4 || request.QueryClass == 18) && response.Status == 0 && response.MTime == cacheGatePositiveTime(attr.ModTime)
+					match = request.Command == 16 && (request.QueryClass == 4 || request.QueryClass == 18 || request.QueryClass == 34) && response.Status == 0 && response.MTime == cacheGatePositiveTime(attr.ModTime)
 				case "standard":
-					match = request.Command == 16 && (request.QueryClass == 5 || request.QueryClass == 18) && response.Status == 0 && response.EOF == uint64(attr.Size)
+					match = request.Command == 16 && (request.QueryClass == 5 || request.QueryClass == 18 || request.QueryClass == 34) && response.Status == 0 && response.EOF == uint64(attr.Size)
 				case "read", "sync":
 					match = request.Command == 8 && request.Offset == 0 && response.Status == 0 && response.Count == uint32(len(want)) && response.Digest == cacheGatePositiveDigest(want)
 				}
@@ -448,6 +450,9 @@ func cacheGatePositiveSizeCell(t *testing.T, p *cacheGatePositiveCell, bridge *n
 	if observe == "sync" {
 		cacheGatePositiveSeek(t, h, 0)
 	}
+	if p.postDeadline {
+		cacheGatePostDeadlineIdle(t)
+	}
 	action := nativeAction(t, session)
 	var expected storage.Attr
 	if change == "grow" {
@@ -462,6 +467,10 @@ func cacheGatePositiveSizeCell(t *testing.T, p *cacheGatePositiveCell, bridge *n
 	ack := p.Mutations[len(p.Mutations)-1].Acknowledged
 	if cacheGatePositiveTime(expected.ModTime) == cacheGatePositiveTime(initial.ModTime) {
 		t.Fatal("measured mutation did not change the timestamp at native precision")
+	}
+	if p.postDeadline {
+		cacheGatePostDeadlineObserve(t, p, path, file, initial, expected, after, ack)
+		return
 	}
 	var first cacheGatePositiveValue
 	if observe == "sync" {
@@ -668,14 +677,26 @@ func cacheGatePositiveNamespaceCell(t *testing.T, p *cacheGatePositiveCell, brid
 }
 
 func cacheGatePositiveScenario(t *testing.T, variant string) {
+	postDeadline := strings.HasPrefix(variant, "positive_postdeadline_")
 	mode := strings.TrimPrefix(variant, "positive_")
+	if postDeadline {
+		mode = strings.TrimPrefix(variant, "positive_postdeadline_")
+	}
 	if mode != "unheld" && mode != "exclusive" {
 		t.Fatal("invalid positive-cache mode")
 	}
 	cells := []string{"path_grow", "path_shrink", "basic_grow", "basic_shrink", "standard_grow", "standard_shrink", "read_grow", "read_shrink", "sync_grow", "sync_shrink", "rename_path", "replace_path", "replace_open", "recreate_path", "recreate_open"}
+	if postDeadline {
+		cells = []string{"postdeadline_path_growth_witness"}
+	}
 	verdicts := map[string]bool{}
 	t.Cleanup(func() {
 		report := map[string]any{"evidence_kind": "pinned prototype diagnostic; not PR implementation acceptance", "variant": variant, "fixture_sha": os.Getenv("RFS_GATE_FIXTURE_SHA"), "gate_sha": os.Getenv("GITHUB_SHA"), "overlay_sha": os.Getenv("RFS_GATE_OVERLAY_SHA"), "missing_status_overlay_sha": os.Getenv("RFS_GATE_MISSING_STATUS_SHA"), "cells": verdicts, "test_failed": t.Failed()}
+		if postDeadline {
+			report["evidence_kind"] = "post-deadline witness collection; not one-second SLO acceptance"
+			report["within_one_second_proven"] = false
+			report["contract_result"] = "see witness classification; a current late sample is inconclusive"
+		}
 		data, err := json.MarshalIndent(report, "", "  ")
 		if err != nil {
 			t.Error(err)
@@ -690,7 +711,10 @@ func cacheGatePositiveScenario(t *testing.T, variant string) {
 			trace := &cacheGateTrace{}
 			cacheGateActive.Store(trace)
 			cacheGateResetPositiveWire()
-			cell := &cacheGatePositiveCell{Name: name, Mode: mode, IOModel: "synchronous"}
+			cell := &cacheGatePositiveCell{Name: name, Mode: mode, IOModel: "synchronous", postDeadline: postDeadline}
+			if postDeadline {
+				cell.IOModel = "path-only"
+			}
 			if strings.HasPrefix(name, "read_") {
 				cell.IOModel = "overlapped"
 			}
@@ -704,11 +728,14 @@ func cacheGatePositiveScenario(t *testing.T, variant string) {
 			t.Cleanup(func() {
 				cacheGateActive.Store(nil)
 				records, incomplete := cacheGatePositiveWireSnapshot()
+				evidenceValid := !incomplete
 				for _, r := range records {
 					if r.Command == 15 {
+						evidenceValid = false
 						t.Error("positive no-watcher probe issued CHANGE_NOTIFY")
 					}
 					if r.Response && r.Command == 5 && (r.Oplock != 0 && !(r.Oplock == 0xff && r.LeasePresent && r.LeaseState == 0) || r.LeaseState != 0) {
+						evidenceValid = false
 						t.Error("positive probe received caching rights")
 					}
 				}
@@ -717,6 +744,7 @@ func cacheGatePositiveScenario(t *testing.T, variant string) {
 				overflow, encodingError := trace.overflow, trace.encodingError
 				trace.mu.Unlock()
 				if incomplete || overflow || encodingError != nil {
+					evidenceValid = false
 					t.Errorf("positive evidence incomplete: wire=%v events=%v encoding=%v", incomplete, overflow, encodingError)
 				}
 				report := map[string]any{"evidence_kind": "pinned prototype diagnostic; not PR implementation acceptance", "variant": variant, "cell": cell, "test_failed": t.Failed(), "wire_incomplete": incomplete, "trace_overflow": overflow, "events": events, "wire": records}
@@ -726,7 +754,22 @@ func cacheGatePositiveScenario(t *testing.T, variant string) {
 					report["final_server_status"] = status
 					report["final_backend_references"] = refs
 					if refs != 0 || status.Connections != 0 || status.RetainedConnections != 0 || status.PendingRequests != 0 || status.UnconfirmedMutations != 0 || status.CleanupFailures != 0 {
+						evidenceValid = false
 						t.Error("positive cell cleanup retained resources or unknown effects")
+					}
+				}
+				if postDeadline {
+					report["within_one_second_proven"] = false
+					report["contract_result"] = "inconclusive"
+					if cell.PostDeadline != nil {
+						if !evidenceValid || t.Failed() {
+							cell.PostDeadline.Classification = "invalid_or_inconclusive"
+							cell.PostDeadline.ContractResult = "inconclusive"
+						}
+						report["contract_result"] = cell.PostDeadline.ContractResult
+						if cell.PostDeadline.ContractResult == "violated" {
+							t.Errorf("path attributes remained stale after one second: %+v", cell.PostDeadline.Native)
+						}
 					}
 				}
 				report["test_failed"] = t.Failed()
@@ -769,6 +812,10 @@ func cacheGatePositiveScenario(t *testing.T, variant string) {
 				}
 			}
 			cacheGatePositiveExposure(t, cell)
+			if postDeadline {
+				cacheGatePositiveSizeCell(t, cell, bridge, "path", "grow")
+				return
+			}
 			parts := strings.SplitN(name, "_", 2)
 			if parts[1] == "grow" || parts[1] == "shrink" {
 				cacheGatePositiveSizeCell(t, cell, bridge, parts[0], parts[1])
@@ -872,4 +919,111 @@ func cacheGatePositiveExposure(t *testing.T, p *cacheGatePositiveCell) {
 	if !time.Now().Before(p.EarliestExpiry) {
 		t.Fatal("setup crossed earliest possible directory-cache expiry")
 	}
+}
+
+type cacheGatePostDeadlineResult struct {
+	Classification        string                 `json:"classification"`
+	ContractResult        string                 `json:"contract_result"`
+	WithinOneSecondProven bool                   `json:"within_one_second_proven"`
+	PlannedStartDelayNS   int64                  `json:"planned_start_delay_ns"`
+	StartMinusAckNS       int64                  `json:"start_minus_ack_ns"`
+	CompletionMinusAckNS  int64                  `json:"completion_minus_ack_ns"`
+	Native                cacheGatePositiveValue `json:"native"`
+	Warmed, Expected      storage.Attr
+	QuietViolations       []cacheGatePositiveWireRecord `json:"quiet_violations"`
+	NativeInterval        []cacheGatePositiveWireRecord `json:"native_interval"`
+	MatchesWarmTuple      bool                          `json:"matches_warm_tuple"`
+}
+
+func cacheGatePostDeadlineIdle(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for {
+		records, incomplete := cacheGatePositiveWireSnapshot()
+		if incomplete {
+			t.Fatal("post-deadline witness has incomplete setup trace")
+		}
+		pending := map[[2]uint64]bool{}
+		for _, record := range records {
+			if record.Bootstrap || record.Command == 12 || record.Command == 13 {
+				continue
+			}
+			key := [2]uint64{record.Connection, record.MessageID}
+			if record.Response {
+				if record.Status != 0x103 {
+					delete(pending, key)
+				}
+			} else {
+				pending[key] = true
+			}
+		}
+		if len(pending) == 0 {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatal("native warm-up still has outstanding SMB operations")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func cacheGatePostDeadlineObserve(t *testing.T, p *cacheGatePositiveCell, path string, file storage.File, warmed, expected storage.Attr, data []byte, ack time.Time) {
+	t.Helper()
+	result := &cacheGatePostDeadlineResult{Classification: "invalid_or_inconclusive", ContractResult: "inconclusive", PlannedStartDelayNS: int64(1100 * time.Millisecond), Warmed: warmed, Expected: expected}
+	p.PostDeadline = result
+	due := ack.Add(1100 * time.Millisecond)
+	if !due.Before(p.EarliestExpiry) {
+		t.Fatal("post-deadline witness has no pre-expiry observation window")
+	}
+	timer := time.NewTimer(time.Until(due))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-t.Context().Done():
+		t.Fatal(t.Context().Err())
+	}
+	first := p.record(cacheGatePositivePath(path))
+	result.Native = first
+	result.StartMinusAckNS = int64(first.Started.Sub(ack))
+	result.CompletionMinusAckNS = int64(first.Completed.Sub(ack))
+	if !first.Started.After(ack.Add(time.Second)) || !first.Started.Before(p.EarliestExpiry) || !first.Completed.Before(p.EarliestExpiry) {
+		t.Fatal("post-deadline query did not remain strictly between one second and cache expiry")
+	}
+	if first.Error != "" {
+		t.Fatalf("post-deadline native query failed: %+v", first)
+	}
+	// Waiting on recorded completions does not issue another native observation.
+	cacheGatePostDeadlineIdle(t)
+	records, incomplete := cacheGatePositiveWireSnapshot()
+	if incomplete {
+		t.Fatal("post-deadline witness trace is incomplete")
+	}
+	for _, record := range records {
+		if record.Command == 13 {
+			continue
+		}
+		if record.At.After(ack) && record.At.Before(first.Started) {
+			result.QuietViolations = append(result.QuietViolations, record)
+		}
+		if !record.At.Before(first.Started) {
+			result.NativeInterval = append(result.NativeInterval, record)
+		}
+	}
+	if len(result.QuietViolations) != 0 {
+		t.Fatal("an SMB operation interrupted the untouched post-ACK interval")
+	}
+	oracle, err := file.ReadAt(t.Context(), storage.FileReadRequest{Length: 1024})
+	cacheGateObserve("postdeadline_http_oracle", map[string]any{"attr": oracle.Attr, "count": len(oracle.Data), "digest": cacheGatePositiveDigest(oracle.Data), "error": fmt.Sprint(err)})
+	if err != nil || oracle.Attr.ID != expected.ID || oracle.Attr.MetadataRevision != expected.MetadataRevision || oracle.Attr.Size != expected.Size || !oracle.Attr.ModTime.Equal(expected.ModTime) || !bytes.Equal(oracle.Data, data) {
+		t.Fatal("post-deadline authority oracle changed or failed")
+	}
+	result.MatchesWarmTuple = first.Size == warmed.Size && first.MTime == cacheGatePositiveTime(warmed.ModTime)
+	if first.Size != expected.Size || first.MTime != cacheGatePositiveTime(expected.ModTime) {
+		result.Classification = "stale_after_one_second"
+		result.ContractResult = "violated"
+		return
+	}
+	result.Classification = "current_at_post_deadline_probe"
+	// A current late sample cannot establish when it first became current.
+	result.ContractResult = "inconclusive"
 }

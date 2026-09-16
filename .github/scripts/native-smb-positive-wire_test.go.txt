@@ -248,7 +248,7 @@ func (o *cacheGatePositiveFrameObserver) frame(packet []byte, response bool) {
 					valid = false
 				}
 				selectedQuery := r.Command == wire.QueryInfo && r.QueryType == 1 &&
-					(r.QueryClass == 4 || r.QueryClass == 5 || r.QueryClass == 6 || r.QueryClass == 18)
+					(r.QueryClass == 4 || r.QueryClass == 5 || r.QueryClass == 6 || r.QueryClass == 18 || r.QueryClass == 34)
 				if (selectedQuery || r.Command == wire.Read) && (h.Status == 0x80000005 || h.Status == 0xc0000023) {
 					valid = false
 				}
@@ -400,6 +400,12 @@ func (o *cacheGatePositiveFrameObserver) response(packet []byte, r *cacheGatePos
 			r.MTime = le.Uint64(data[16:24])
 			r.EOF = le.Uint64(data[48:56])
 			r.InternalID = le.Uint64(data[64:72])
+		case 34: // FILE_NETWORK_OPEN_INFORMATION
+			if len(data) != 56 {
+				return false
+			}
+			r.MTime = le.Uint64(data[16:24])
+			r.EOF = le.Uint64(data[40:48])
 		}
 	case wire.Read:
 		if !cacheGatePositiveFixed(body, 17, 16) {
