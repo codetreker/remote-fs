@@ -289,6 +289,18 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 独立 HTTP server 的资源用例使用真实 TCP listener：占满 accepted-connection 名额后底层 `Accept` 不再前进，connection 的单次与重复 `Close` 只释放一份名额，关闭饱和的 listener 会唤醒正在等待的 `Accept`。两种 mode 都要求至少两条 connection，并在取得 listener 前拒绝非正 timeout。只发一部分 header 的连接在 `ReadHeaderTimeout` 内被关闭，keep-alive connection 超过 `IdleTimeout` 后被关闭；同一用例断言 request-wide `ReadTimeout` 与 `WriteTimeout` 保持为零。shutdown 用例覆盖已经存在和尚未被 tracker 观察到的 `StateNew` connection，确保 stopping state 会关闭 late notification，不把退出安全性押在 header timeout 上。
 
+### Windows 原生 SMB 负缓存诊断
+
+[诊断工作流](../.github/workflows/native-smb-gate.yml)在原生 Windows 11 24H2+ ARM64 上运行固定的 [SMB 原型](https://github.com/codetreker/remote-fs/tree/1cb9ad7f49d998de4daa4d562d766b18cf06ce16/packages/smb/windows)，用于定位系统重定向器的负名字缓存行为。原型只检出到 `.tmp/native-cache-gate/fixture`；[运行脚本](../.github/scripts/native-smb-cache-gate.ps1)核对 commit 后注入[聚焦探针](../.github/scripts/native-smb-cache-gate_test.go.txt)，不编译工作分支正在实现的 SMB/backend。固定原型的通过结果只能作为可行性证据，不能作为新实现的验收，取舍见[诊断决定](../.agents/notes/implemented/testing/2026-09-16-native-smb-cache-diagnostic.md)。
+
+三个独立作业分别执行 `baseline`、`held_parent` 与 `notify_parent`：不显式保留父目录句柄、保留父目录句柄，以及保留父目录并先确认 SMB CHANGE_NOTIFY 已被接纳。各作业只运行 `TestNativeNegativeNameCacheGate`，使用 `-count=1`、三分钟测试超时及十五分钟作业上限，并要求精确的测试 verdict 为 pass；skip、缺失 verdict 和失败均不能算通过。
+
+探针先确认暖文件的远端修改可读，再让原生负查找真正取得 authority 的 CREATE/NAME_NOT_FOUND 响应，然后从独立远端入口创建该名字。成功需要在写者确认后一秒内、且在最早可能的缓存到期之前观察到文件，并取得该名字的一次新权威 SMB CREATE；通知 variant 还必须收到匹配的创建通知。重复 Stat 是测量观察点，不是产品同步机制。环境中三个 SMB 缓存 lifetime 都须大于一秒，创建已越过可能到期时间时判为不能据此证明；不得靠全局 TTL 设置消除失败。
+
+产物记录 OS/build/架构、原型及探针 commit、缓存策略、操作时间、SMB/authority 事件、映射和最终引用状态。轨迹最多保留 2048 项，溢出或编码失败使该次证据失败；Windows overlapped 通知在取消完成前保留其缓冲和结构。工作流始终保存诊断产物，并在环境准备成功后核对缓存策略未变且没有新增 SMB 映射残留。一次诊断只对自己的原型、variant 和实际运行环境下结论。
+
+新实现的 Windows 验收仍须在实际交付的 package、transport 与 backend 上重新运行，覆盖目录、属性、改名、删除、已打开引用和故障；此诊断的固定内存 authority 不证明 SQLite 持久性、全部 Windows 行为或历史时间投影。原生负缓存的可行路径是广泛实现前的门禁，尚无实际通过证据时继续明确报告未解决，不能用交叉编译或原型结果宣称 Windows 已可交付。
+
 ## 每次改动必须带什么
 
 **任何非平凡改动都要在同一次改动里新增或更新测试。** 判据与 Agent Note 相同。

@@ -1,0 +1,62 @@
+name: Native SMB cache gate (diagnostic)
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/native-smb-gate.yml
+      - .github/scripts/native-smb-cache-gate.ps1
+      - .github/scripts/native-smb-cache-gate_test.go.txt
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-smb-cache-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cache:
+    name: Native cache / ${{ matrix.variant }}
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, held_parent, notify_parent]
+    env:
+      RFS_GATE_VARIANT: ${{ matrix.variant }}
+      RFS_GATE_FIXTURE_SHA: 1cb9ad7f49d998de4daa4d562d766b18cf06ce16
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out the diagnostic prototype
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 1cb9ad7f49d998de4daa4d562d766b18cf06ce16
+          path: .tmp/native-cache-gate/fixture
+          persist-credentials: false
+      - name: Prepare and record the native environment
+        id: baseline
+        shell: pwsh
+        run: ./.github/scripts/native-smb-cache-gate.ps1 -Phase Prepare
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - name: Run the focused native probe
+        shell: pwsh
+        run: ./.github/scripts/native-smb-cache-gate.ps1 -Phase Run
+      - name: Check settings and mapping cleanup
+        if: ${{ always() && steps.baseline.outcome == 'success' }}
+        shell: pwsh
+        run: ./.github/scripts/native-smb-cache-gate.ps1 -Phase Verify
+      - name: Preserve diagnostic receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-cache-${{ matrix.variant }}-${{ github.run_attempt }}
+          path: .tmp/native-cache-gate/results
+          if-no-files-found: error
+          retention-days: 14
