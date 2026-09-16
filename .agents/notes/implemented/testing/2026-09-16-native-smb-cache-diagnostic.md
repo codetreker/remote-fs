@@ -24,9 +24,9 @@ positive 的 compound/wire 观察与 authority metadata、digest 逐项关联，
 
 positive_postdeadline_unheld/positive_postdeadline_exclusive 各增加一个独立的路径增长观察。真实 CREATE/WRITE/协议无缓存授权证明先在独立 setup fixture 完成；句柄、映射、SMB/HTTP 和全部保留资源确认结束后，才新建没有 proof file 的测量 share。测量使用自己的 trace、协商检查与曝光起点。真实写入 ACK 后，直到计划 1.1 秒的第一次 GetFileAttributesExW，不触碰目标或相关目录；实际开始严格超过一秒且开始/结束都在原始缓存到期之前。测量间隔仍严格检查额外请求，fixture 退役不被当作 Windows 后台流量永远不会出现的保证。原协商能力 0x26/State NONE 和即时一秒 validator 保持原样。
 
-延迟首值及其与暖 tuple 的相等性立即保存；时间、原生错误或安静间隔失败也继续尝试 post-query oracle 和普通清理。旧值只有在原生观察完整、严格安静、时间合法且 oracle 未变化时才是候选，经过全部本体、句柄和卸载清理后，没有其它错误才成为 violated；清理失败后计数归零也不修复证据资格。延迟当前值只说明在该次查询时已更新，记录 within_one_second_proven=false、contract_result=inconclusive。作业名明确非 SLO 验收，证据收集通过不把一秒期限改成 1.1 秒。包含独立 setup 退役及完整无效样本记录的延迟探针尚未原生运行；观察器合成回归普通/race 各 31 pass，基线和 NoLeasing 两种 ARM64 组合构建通过，只证明局部逻辑与可构建性。
+延迟首值及其与暖 tuple 的相等性立即保存；时间、原生错误或安静间隔失败也继续尝试 post-query oracle 和普通清理。旧值只有在原生观察完整、严格安静、时间合法且 oracle 未变化时才是候选，经过全部本体、句柄和卸载清理后，没有其它错误才成为 violated；清理失败后计数归零也不修复证据资格。延迟当前值只说明在该次查询时已更新，记录 within_one_second_proven=false、contract_result=inconclusive。作业名明确非 SLO 验收，证据收集通过不把一秒期限改成 1.1 秒。包含独立 setup 退役及完整无效样本记录的原能力延迟探针已有下述合格违约结果；NoLeasing 原生测量仍未开始。观察器合成回归普通/race 各 31 pass，基线和 NoLeasing 两种 ARM64 组合构建通过；这些局部检查与原生结果分别归属。
 
-NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github/scripts/native-smb-no-leasing.patch)仅进入四个显式 noleasing 变体，在原通知/最终缺失 overlay 后逐层检查和记录；它声明 leasing 与 directory leasing 不受支持，只保留 LARGE_MTU=0x4，最终仍为 SMB 3.1.1。保留 signing/preauthentication 和 CREATE 外层结构验证，忽略不支持的 RqLs 内部字段，不建立 lease table/owner 或 lease-key 关联；所有成功 CREATE 都不授予 oplock/cache，未请求的 ACK 不伪装成功。原 lease 身份检查文件不变，也不改变 authority、NodeID 或引用生命周期。
+NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github/scripts/native-smb-no-leasing.patch)仅进入四个显式 noleasing 变体，在原通知/最终缺失 overlay 后逐层检查和记录；它声明 leasing 与 directory leasing 不受支持，只保留 LARGE_MTU=0x4，最终仍为 SMB 3.1.1。保留 signing/preauthentication 和 CREATE 外层结构验证，忽略不支持的 RqLs 内部字段，不建立 lease table/owner 或 lease-key 关联；所有成功 CREATE 都不授予 oplock/cache，未请求的 ACK 不伪装成功。原 lease 身份检查文件不变，也不改变 authority、NodeID 或引用生命周期。 运行脚本在基线 overlay 完成后，只把 NoLeasing 的三份目标 Go 文件和补丁规范为无 BOM 的 LF，记录 raw/canonical input、patch 和 output hash，并核对已审查值。git apply 仅本次关闭 autocrlf，先检查再应用；LF 与 Windows CRLF 输入必须得到逐字节相同的已审查代码，任何偏差都失败，不用宽松 hunk 匹配改变执行对象。
 
 两种根模式分别运行十五项即时 cell，再各用全新 fixture 运行一项独立延迟观察。原 0x26/0x6 基线及其 State NONE 保持原判据，实验 trace 必须实际显示 capability=4、最终 3.1.1；即时 fixture 或已完全退役的延迟 setup fixture 单独证明 proof-file CREATE 为 NONE 且无 lease response，测量连接仍检查自己的策略。旧 H 仍返回 A，新打开必须取得替换后的 B；一次重开成功不能代替属性或名字缓存验收，1.1 秒的新值也仍不证明一秒可见性。
 
@@ -98,7 +98,11 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 [原生运行 35107398671](https://github.com/codetreker/remote-fs/actions/runs/35107398671)执行原 capability 的两个延迟变体，探针 checkout 为 `70ef46b918def8a7be7b62fa438a41d9c9d9ca12`。unheld/exclusive 首个查询分别约在 ACK 后 1.100264/1.100449 秒，原始值均为暖的 257 字节和 2001 年 mtime，而 mutation 确认的是 769 字节与新时间。
 
-两个样本都为 inconclusive：安静间隔实际出现 lease-proof.bin 的第二次 CREATE、QUERY_INFO class 48 与 CLOSE，原探针在该检查失败后没有取得 post-query oracle。该后台操作的具体发起者未确定，不能把旧 tuple 单独升级成合格的一秒反例。缓存策略仍为 5/10/10 秒、最终引用与连接/pending/cleanup 归零也不能补回缺失证据。分离并完全退役 setup fixture、保留所有原始样本并继续收集 oracle，是后续测量的前置条件，尚无修正后原生结果。
+两个样本都为 inconclusive：安静间隔实际出现 lease-proof.bin 的第二次 CREATE、QUERY_INFO class 48 与 CLOSE，原探针在该检查失败后没有取得 post-query oracle。该后台操作的具体发起者未确定，不能把旧 tuple 单独升级成合格的一秒反例。缓存策略仍为 5/10/10 秒、最终引用与连接/pending/cleanup 归零也不能补回缺失证据。这个结论属于该次不完整样本；分离并完全退役 setup fixture、保留所有原始样本并继续收集 oracle，是后续测量的前置条件。
+
+[原生运行 35111447579](https://github.com/codetreker/remote-fs/actions/runs/35111447579)以探针 checkout `7f2168c32d4a3b89e7b395cbaa81f59838e20004` 执行已分离 setup 的原能力延迟对照。exclusive/unheld 首次查询分别在 ACK 后约 1.100140/1.100189 秒，仍返回 257 字节和 2001 年 mtime，且早于原始缓存到期。两份 post-query oracle 均确认同一 NodeID=2、769 字节、metadata revision=4 和预期内容；安静间隔无违规，trace 完整，最终引用、连接、pending 与 cleanup failure 均为零。
+
+这两项被记录为 stale_after_one_second/violated，是固定原型原 capability 策略下的合格一秒反例，不证明其它策略同样失败。NoLeasing 作业在测量前因 Windows CRLF/autocrlf 组合导致补丁上下文不匹配而退出，没有产生原生样本。该准备故障已在相同换行配置下重现；规范化 LF 并逐一核对输入/输出 hash 后，实际 git apply 成功，三个输出与原审查代码完全一致。该修复只恢复确定的实验输入，不构成 NoLeasing 有效或无效的证据。
 
 每次诊断的结果绑定基底 commit、各 overlay SHA256、探针 commit、variant、OS/build 和缓存设置；没有 overlay 的历史运行分别保留其原始执行来源。JSON 轨迹、Go verdict、映射前后状态及最终引用数作为产物保留十四天；轨迹溢出、编码失败、改变缓存策略或映射残留都会使结果失败。取消 overlapped 通知时保留其结构与缓冲直到完成，除明确的丢明细结果外，意外的异步完成/事件关闭错误仍报告失败，进程卡住由测试超时显式暴露。
 

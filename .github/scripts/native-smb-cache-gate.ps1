@@ -121,13 +121,34 @@ if ($Phase -eq 'Run') {
     $noLeasing = $env:RFS_GATE_VARIANT -match '^positive_(postdeadline_)?noleasing_(unheld|exclusive)$'
     if ($noLeasing) {
         $noLeasingOverlay = Join-Path $PSScriptRoot 'native-smb-no-leasing.patch'
-        & git -C $fixture apply --check $noLeasingOverlay
+        $rawOverlaySHA = (Get-FileHash $noLeasingOverlay -Algorithm SHA256).Hash.ToLowerInvariant()
+        $appliedOverlay = Join-Path $results 'no-leasing.applied.patch'
+        [IO.File]::WriteAllText($appliedOverlay, [IO.File]::ReadAllText($noLeasingOverlay).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+        $expectedNoLeasingSources = @{
+            'packages/smb/server.go' = @{ Input = 'e2fd4f9e6bf6ed458862ee59e2c0f6b9c53b32a1580d71a70651c02c81039325'; Output = '3dcfe03a8c9c8b9dc2b2840e52be0e290d1a973bd2edd367b1f21fdec185d406' }
+            'packages/smb/commands_session.go' = @{ Input = '6228ca6e9813d7915d8f01d34ca15cba517f1450a9463f6ed70f4f10661ee26d'; Output = 'c7e12376dd9b8100a8b224ffa1732b05bbd29096f006fdbe7960beddeb6d78df' }
+            'packages/smb/commands_files.go' = @{ Input = 'ff4394ec0f6396610288253da131cfe5bd3329affac3c3e82266fcd0fa117b07'; Output = '88570edf50156ea4b275a33722bc1a90aca88cbcd427f1b0cc148e68bc9ef199' }
+        }
+        $normalizedSources = @('server.go', 'commands_session.go', 'commands_files.go') | ForEach-Object {
+            $sourcePath = Join-Path $fixture "packages/smb/$_"
+            $rawSHA = (Get-FileHash $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            [IO.File]::WriteAllText($sourcePath, [IO.File]::ReadAllText($sourcePath).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+            $inputSHA = (Get-FileHash $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($inputSHA -ne $expectedNoLeasingSources["packages/smb/$_"].Input) { throw 'Canonical NoLeasing input differs from reviewed source.' }
+            [ordered]@{ Path = "packages/smb/$_"; RawSHA256 = $rawSHA; InputLF_SHA256 = $inputSHA }
+        }
+        $env:RFS_GATE_NO_LEASING_SHA = (Get-FileHash $appliedOverlay -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($env:RFS_GATE_NO_LEASING_SHA -ne '62538e9c1eb5b2b12a4d6fed71937fdd675b378d253c8f1c6c9d875a84f06734') { throw 'Canonical NoLeasing patch differs from the reviewed overlay.' }
+        & git -c core.autocrlf=false -C $fixture apply --check $appliedOverlay
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        & git -C $fixture apply $noLeasingOverlay
+        & git -c core.autocrlf=false -C $fixture apply $appliedOverlay
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        $env:RFS_GATE_NO_LEASING_SHA = (Get-FileHash $noLeasingOverlay -Algorithm SHA256).Hash.ToLowerInvariant()
-        [ordered]@{ Kind = 'Unsupported-leasing protocol experiment'; SHA256 = $env:RFS_GATE_NO_LEASING_SHA } |
-            ConvertTo-Json | Set-Content (Join-Path $results 'no-leasing-overlay.json') -Encoding utf8
+        foreach ($source in $normalizedSources) {
+            $source.OutputLF_SHA256 = (Get-FileHash (Join-Path $fixture $source.Path) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($source.OutputLF_SHA256 -ne $expectedNoLeasingSources[$source.Path].Output) { throw 'Canonical NoLeasing output differs from reviewed source.' }
+        }
+        [ordered]@{ Kind = 'Unsupported-leasing protocol experiment'; RawPatchSHA256 = $rawOverlaySHA; SHA256 = $env:RFS_GATE_NO_LEASING_SHA; Sources = @($normalizedSources) } |
+            ConvertTo-Json -Depth 4 | Set-Content (Join-Path $results 'no-leasing-overlay.json') -Encoding utf8
         Copy-Item (Join-Path $PSScriptRoot 'native-smb-no-leasing_test.go.txt') (Join-Path $fixture 'packages/smb/gate_no_leasing_test.go')
     }
     $testRoot = Join-Path $fixture 'packages/smb/windows'
