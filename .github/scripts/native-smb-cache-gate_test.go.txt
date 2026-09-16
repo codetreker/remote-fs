@@ -242,13 +242,17 @@ func cacheGateAwaitMissingName(t *testing.T, trace *cacheGateTrace, after uint64
 			if err := json.Unmarshal(event.Fields, &header); err != nil {
 				t.Fatal(err)
 			}
-			if header.Response && header.Command == 5 && header.Status == 0xc0000034 && requests[header.MessageID] {
+			want := uint32(0xc0000034)
+			if os.Getenv("RFS_GATE_VARIANT") == "missing_final_status" {
+				want = 0xc000000f
+			}
+			if header.Response && header.Command == 5 && header.Status == want && requests[header.MessageID] {
 				cacheGateObserve("authoritative_negative_confirmed", map[string]uint64{"message_id": header.MessageID})
 				return
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("initial absence had no observed authoritative CREATE/NAME_NOT_FOUND response")
+			t.Fatal("initial absence had no observed authoritative missing-file CREATE response")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -264,7 +268,7 @@ func TestNativeNegativeNameCacheGate(t *testing.T) {
 		cacheGateOwnedScenario(t, variant)
 		return
 	}
-	if variant != "baseline" && variant != "held_parent" && variant != "notify_parent" {
+	if variant != "baseline" && variant != "held_parent" && variant != "notify_parent" && variant != "missing_final_status" {
 		t.Fatalf("invalid gate variant %q", variant)
 	}
 	output := os.Getenv("RFS_GATE_OUTPUT_ROOT")
@@ -281,6 +285,7 @@ func TestNativeNegativeNameCacheGate(t *testing.T) {
 	var negativeStarted, earliestExpiry, writerAcknowledged, visibleAt time.Time
 	var attempts, freshQueries int
 	var watch *cacheGateWatch
+	var exclusiveCheck *cacheGateOwnedCheck
 	t.Cleanup(func() {
 		cacheGateActive.Store(nil)
 		trace.mu.Lock()
@@ -290,12 +295,27 @@ func TestNativeNegativeNameCacheGate(t *testing.T) {
 		if overflow || encodingError != nil {
 			t.Errorf("bounded trace incomplete: overflow=%v error=%v", overflow, encodingError)
 		}
+		if variant == "missing_final_status" {
+			for _, event := range events {
+				if event.Kind != "smb_headers" {
+					continue
+				}
+				var h nativeHeaderObservation
+				if err := json.Unmarshal(event.Fields, &h); err != nil {
+					t.Error(err)
+				}
+				if h.Command == 15 {
+					t.Error("no-watcher status probe issued CHANGE_NOTIFY")
+				}
+			}
+		}
 		report := map[string]any{
 			"evidence_kind": "pinned prototype diagnostic; not PR implementation acceptance",
 			"overlay_sha":   os.Getenv("RFS_GATE_OVERLAY_SHA"), "fixture_sha": os.Getenv("RFS_GATE_FIXTURE_SHA"), "gate_sha": os.Getenv("GITHUB_SHA"), "variant": variant,
 			"negative_lookup_started_at": negativeStarted, "earliest_possible_cache_expiry": earliestExpiry,
 			"writer_acknowledged_at": writerAcknowledged, "visible_at": visibleAt, "attempts": attempts, "fresh_queries": freshQueries,
 			"test_failed": t.Failed(), "trace_overflow": overflow, "events": events,
+			"missing_status_overlay_sha": os.Getenv("RFS_GATE_MISSING_STATUS_SHA"), "exclusive_check": exclusiveCheck,
 		}
 		if watch != nil {
 			report["matching_notification_received"] = watch.observed
@@ -341,7 +361,7 @@ func TestNativeNegativeNameCacheGate(t *testing.T) {
 		t.Fatalf("warm remote read: count=%d error=%v", n, err)
 	}
 	bridge.assertCacheContract(t)
-	if variant != "baseline" {
+	if variant == "held_parent" || variant == "notify_parent" {
 		parent := cacheGateDirectory(t, bridge.path+`\`)
 		if variant == "notify_parent" {
 			watch = cacheGateStartWatch(t, parent)
@@ -353,8 +373,16 @@ func TestNativeNegativeNameCacheGate(t *testing.T) {
 	negativeStarted = time.Now()
 	earliestExpiry = negativeStarted.Add(time.Duration(ttl) * time.Second)
 	cacheGateObserve("negative_lookup_started", nil)
-	if _, err := os.Stat(missing); !os.IsNotExist(err) {
-		t.Fatalf("initial negative lookup: %v", err)
+	_, missingErr := os.Stat(missing)
+	if !os.IsNotExist(missingErr) {
+		t.Fatalf("initial negative lookup: %v", missingErr)
+	}
+	if variant == "missing_final_status" {
+		cacheGateStatusMappings(t)
+		cacheGateObserve("missing_status_win32_result", map[string]any{"file_not_found": errors.Is(missingErr, win.ERROR_FILE_NOT_FOUND), "path_not_found": errors.Is(missingErr, win.ERROR_PATH_NOT_FOUND), "error": missingErr.Error()})
+		if !errors.Is(missingErr, win.ERROR_FILE_NOT_FOUND) {
+			t.Fatalf("final absence did not return Win32 FILE_NOT_FOUND: %v", missingErr)
+		}
 	}
 	cacheGateObserve("negative_lookup_completed", nil)
 	cacheGateAwaitMissingName(t, trace, beforeNegative, "new.bin")
@@ -418,6 +446,21 @@ func TestNativeNegativeNameCacheGate(t *testing.T) {
 	}
 	if watch != nil && !watch.observed {
 		t.Fatal("the admitted directory watcher delivered no matching creation notification")
+	}
+	if variant == "missing_final_status" {
+		holder, err := cacheGateSharingOpen(t, `\\127.0.0.1\`+bridge.share, win.FILE_LIST_DIRECTORY, 0, true)
+		if err != nil {
+			t.Fatalf("root exclusive LIST open: %v", err)
+		}
+		cacheGateObserve("missing_status_root_exclusive_open", map[string]uint32{"access": win.FILE_LIST_DIRECTORY, "share": 0})
+		probe := &cacheGateOwnedProbe{bridge: bridge, trace: trace, ttl: time.Duration(ttl) * time.Second}
+		exclusiveCheck = probe.prime(t, "exclusive.bin")
+		_, _ = nativeRemoteOpen(t, bridge.remote, "exclusive.bin", storage.NodeRegular, true)
+		probe.acknowledged(t, exclusiveCheck)
+		probe.visible(t, exclusiveCheck)
+		if err := holder.close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -674,8 +717,12 @@ func (p *cacheGateOwnedProbe) prime(t *testing.T, name string) *cacheGateOwnedCh
 	p.checks = append(p.checks, check)
 	before := p.bridge.wire.createSequence.Load()
 	cacheGateObserve("negative_lookup_started", map[string]string{"name": name})
-	if _, err := os.Stat(filepath.Join(p.bridge.path+`\`, name)); !os.IsNotExist(err) {
-		t.Fatalf("initial negative lookup %s: %v", name, err)
+	_, missingErr := os.Stat(filepath.Join(p.bridge.path+`\`, name))
+	if !os.IsNotExist(missingErr) {
+		t.Fatalf("initial negative lookup %s: %v", name, missingErr)
+	}
+	if os.Getenv("RFS_GATE_VARIANT") == "missing_final_status" && !errors.Is(missingErr, win.ERROR_FILE_NOT_FOUND) {
+		t.Fatalf("exclusive-root final absence: %v", missingErr)
 	}
 	cacheGateAwaitMissingName(t, p.trace, before, name)
 	check.BeforeFresh = p.bridge.wire.createSequence.Load()

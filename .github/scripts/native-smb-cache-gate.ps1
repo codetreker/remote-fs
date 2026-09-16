@@ -107,6 +107,17 @@ if ($Phase -eq 'Run') {
     [ordered]@{ Kind = 'Platform notification continuity overlay'; SHA256 = $env:RFS_GATE_OVERLAY_SHA } |
         ConvertTo-Json | Set-Content (Join-Path $results 'overlay.json') -Encoding utf8
     Copy-Item (Join-Path $PSScriptRoot 'native-smb-notify-continuity_test.go.txt') (Join-Path $fixture 'packages/smb/gate_notify_continuity_test.go')
+    if ($env:RFS_GATE_VARIANT -eq 'missing_final_status') {
+        $missingOverlay = Join-Path $PSScriptRoot 'native-smb-missing-status.patch'
+        & git -C $fixture apply --unidiff-zero --check $missingOverlay
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        & git -C $fixture apply --unidiff-zero $missingOverlay
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $env:RFS_GATE_MISSING_STATUS_SHA = (Get-FileHash $missingOverlay -Algorithm SHA256).Hash.ToLowerInvariant()
+        [ordered]@{ Kind = 'Verified final-name absence status overlay'; SHA256 = $env:RFS_GATE_MISSING_STATUS_SHA } |
+            ConvertTo-Json | Set-Content (Join-Path $results 'missing-status-overlay.json') -Encoding utf8
+        Copy-Item (Join-Path $PSScriptRoot 'native-smb-missing-status_test.go.txt') (Join-Path $fixture 'packages/smb/gate_missing_status_test.go')
+    }
     $testRoot = Join-Path $fixture 'packages/smb/windows'
     Copy-Item (Join-Path $PSScriptRoot 'native-smb-cache-gate_test.go.txt') (Join-Path $testRoot 'native_cache_gate_windows_test.go')
     $wire = Join-Path $testRoot 'native_wire_windows_test.go'
@@ -130,6 +141,9 @@ if len(a.changes) == 1024 {
     Push-Location $fixture
     try {
         Invoke-DiagnosticTests './packages/smb' '^Test(Notification|GateNotify)' @('TestGateNotifyRescanRetainsGapEvents', 'TestGateNotifyRescanRejectsReplacedSource') 'notify-unit-test.jsonl'
+        if ($env:RFS_GATE_VARIANT -eq 'missing_final_status') {
+            Invoke-DiagnosticTests './packages/smb' '^TestGateMissingStatus' @('TestGateMissingStatusRequiresVerifiedParent', 'TestGateMissingStatusOnlyChangesFinalCreate') 'missing-status-unit-test.jsonl'
+        }
         Invoke-DiagnosticTests './packages/smb/windows' '^TestNativeNegativeNameCacheGate$' @('TestNativeNegativeNameCacheGate') 'go-test.jsonl'
     } finally {
         Pop-Location

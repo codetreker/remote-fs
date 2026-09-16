@@ -1,0 +1,21 @@
+--- a/packages/smb/client_open.go
++++ b/packages/smb/client_open.go
+@@ -38,0 +39,6 @@
++
++type verifiedMissingNameError struct{}
++
++func (*verifiedMissingNameError) Error() string { return syscall.ENOENT.Error() }
++func (*verifiedMissingNameError) Unwrap() error { return syscall.ENOENT }
++
+@@ -108 +114 @@
+-		return windowsOpenResult{}, syscall.ENOENT
++		return windowsOpenResult{}, &verifiedMissingNameError{}
+--- a/packages/smb/commands_files.go
++++ b/packages/smb/commands_files.go
+@@ -456,0 +457,6 @@
++		// Only this final-component path follows successful parent resolution.
++		// Earlier resolution failures and uncertain/joined errors keep their status.
++		// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/8c61e928-9242-44ed-96a0-98d1032d0d39
++		if _, absent := err.(*verifiedMissingNameError); absent {
++			return nil, 0xc000000f
++		}
