@@ -28,6 +28,8 @@ SP800-108 派生实现保留原[NOTICE](../../../../packages/smb/internal/signin
 
 协议基础组件已经能够单独编译与测试。该批普通/race 验证各有 70 个 pass、无 fail/skip，输入在运行期间保持不变；vet 与 Windows ARM64/AMD64 测试二进制构建通过。普通测试中的 fuzz 函数只执行现有 seeds，不等于持续 fuzz；Linux 选择的 Windows helper 测试与交叉构建都不证明 native SSPI 交换/清理已经运行。具体命令和分层由[测试策略](../../../../docs/testing.md#smb-协议基础组件)拥有。
 
-原生 SSPI 另由[当前 checkout 作业](../../../../.github/workflows/native-smb-gate.yml)执行四个 package 的完整测试，列举并要求两项真实 SSPI 根，使用独立的 Windows 包内覆盖门槛。它记录当前源码/环境/profile，不使用固定原型或 overlay；作业存在不表示原生结果已经通过。诊断原型与当前源码验证分别保留来源。
+原生 SSPI 另由[当前 checkout 作业](../../../../.github/workflows/native-smb-gate.yml)执行四个 package 的完整测试，列举并要求两项真实 SSPI 根，使用独立的 Windows 包内覆盖门槛。它记录当前源码/环境/profile，不使用固定原型或 overlay；诊断原型与当前源码验证分别保留来源。
 
-这些包尚不提供连接服务、share 发布、映射或已验证的 Windows 网络驱动器。接入仍须实现 endpoint/会话处理和中立文件适配，并完成 native SSPI 与真实平台验收。内部 metadata 观察、当前引用名字绑定、历史时间显示和缓存透明性继续由[Windows 提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)承接；本决定只部分交付其协议依赖，不缩减目标或把诊断原型成功当成交付实现。
+[原生运行 35095465239](https://github.com/codetreker/remote-fs/actions/runs/35095465239)以当前源码 checkout `328d5f64e22f9392816c69dca9a3c7707a0662ad`（PR head `8451a2ee2080323be8bb9ab171260701fa77342f`）在 Windows 11 Enterprise build 26200 ARM64 完成 42 个根、71 个 verdict，两项 native SSPI 根均通过且无 fail/skip。Windows package 自身覆盖为 135/171（78.9%），全部四包合计 762/805（94.66%），最低函数为 66.7%；来源校验无意外差异。该结果证明这批实际协议/认证组件，不能替代尚未接入的 endpoint、文件适配或映射。
+
+这些包尚不提供连接服务、share 发布、映射或已验证的 Windows 网络驱动器。接入仍须实现 endpoint/会话处理和中立文件适配，并对组合后的鉴权与文件行为完成真实平台验收。内部 metadata 观察、当前引用名字绑定、历史时间显示和缓存透明性继续由[Windows 提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)承接；本决定只部分交付其协议依赖，不缩减目标或把诊断原型成功当成交付实现。

@@ -333,15 +333,15 @@ go vet ./packages/smb ./packages/smb/internal/wire ./packages/smb/internal/signi
 
 [Native protocol and SSPI 作业](../.github/workflows/native-smb-gate.yml)通过[原生认证脚本](../.github/scripts/native-smb-auth.ps1)直接执行当前 checkout 的这四个 package，不检出原型或施加 overlay。环境须为 Windows 11 24H2+ ARM64，记录 checkout、workflow 与 PR head SHA、OS/build，以及 SMB 源文件前后 hash。先列出全部测试，再无 -run 过滤地执行；每个 package 和已列出的 Test/Fuzz 根须有 pass，任何 fail/skip、缺失 verdict 或缺少两项 native SSPI 根均失败。
 
-作业的十分钟上限与单次测试的三分钟上限分开；临时目录和 Go 缓存位于工作区 `.tmp/native-smb-auth`。Windows 原生 profile 只按各 package 自己的测试 binary 计覆盖，要求每包 70%、每函数 50%、合计 85%，无 profile/执行块同样失败。源码、环境、列表/执行 verdict、profile 和逐函数结果作为当前源码证据保存；这个新增执行入口不代表已取得原生通过结果。
+作业的十分钟上限与单次测试的三分钟上限分开；临时目录和 Go 缓存位于工作区 `.tmp/native-smb-auth`。Windows 原生 profile 只按各 package 自己的测试 binary 计覆盖，要求每包 70%、每函数 50%、合计 85%，无 profile/执行块同样失败。源码、环境、列表/执行 verdict、profile 和逐函数结果作为当前源码证据保存，结果只绑定实际 checkout。
 
-实际普通与 race 收据各为 70 pass、无 fail/skip；Windows ARM64/AMD64 的 `go test -c` 构建也通过，但 native SSPI 仍待运行。它们只证明[协议基础组件](../.agents/notes/implemented/architecture/2026-09-16-smb-protocol-primitives.md)，不证明端点、映射、文件适配或 Windows 可用性；固定原型诊断另按下节的来源核对。
+普通与 race 收据各为 70 pass、无 fail/skip，Windows ARM64/AMD64 构建也通过。[当前源码原生运行 35095465239](https://github.com/codetreker/remote-fs/actions/runs/35095465239)另在 Windows 11 Enterprise 26200 ARM64 执行 42 个根、71 个 verdict，两项 native SSPI 根通过且无 fail/skip；其 source/profile 对应 checkout 328d5f64，不能用来替代随后改变的实现。它们只证明[协议基础组件](../.agents/notes/implemented/architecture/2026-09-16-smb-protocol-primitives.md)，不证明端点、映射、文件适配或 Windows 可用性；固定原型诊断另按下节的来源核对。
 
-### Windows 原生 SMB 负缓存诊断
+### Windows 原生 SMB 缓存诊断
 
-[诊断工作流](../.github/workflows/native-smb-gate.yml)在原生 Windows 11 24H2+ ARM64 上，以固定的 [SMB 原型](https://github.com/codetreker/remote-fs/tree/1cb9ad7f49d998de4daa4d562d766b18cf06ce16/packages/smb/windows)为基底验证系统重定向器的负名字缓存行为。基底只检出到 `.tmp/native-cache-gate/fixture`；[运行脚本](../.github/scripts/native-smb-cache-gate.ps1)核对 commit，检查并应用[通知连续性补丁](../.github/scripts/native-smb-notify-continuity.patch)，再注入[聚焦探针](../.github/scripts/native-smb-cache-gate_test.go.txt)和[通知回归用例](../.github/scripts/native-smb-notify-continuity_test.go.txt)。实际执行对象由基底 SHA、补丁 SHA256 与探针 SHA 共同确定，不与纯基底混称，也不编译工作分支正在实现的 SMB/backend。已观察结果与取舍见[诊断决定](../.agents/notes/implemented/testing/2026-09-16-native-smb-cache-diagnostic.md)。
+[诊断工作流](../.github/workflows/native-smb-gate.yml)在原生 Windows 11 24H2+ ARM64 上，以固定的 [SMB 原型](https://github.com/codetreker/remote-fs/tree/1cb9ad7f49d998de4daa4d562d766b18cf06ce16/packages/smb/windows)为基底验证系统重定向器的名字、属性和已打开文件缓存行为。基底只检出到 `.tmp/native-cache-gate/fixture`；[运行脚本](../.github/scripts/native-smb-cache-gate.ps1)核对 commit，检查并应用[通知连续性补丁](../.github/scripts/native-smb-notify-continuity.patch)，再注入[聚焦探针](../.github/scripts/native-smb-cache-gate_test.go.txt)和[通知回归用例](../.github/scripts/native-smb-notify-continuity_test.go.txt)。实际执行对象由基底 SHA、补丁 SHA256 与探针 SHA 共同确定，不与纯基底混称，也不编译工作分支正在实现的 SMB/backend。已观察结果与取舍见[诊断决定](../.agents/notes/implemented/testing/2026-09-16-native-smb-cache-diagnostic.md)。
 
-十个独立作业先运行基底的 Notification 测试及两项通知连续性回归，再运行 `TestNativeNegativeNameCacheGate`。测试使用 `-count=1`、三分钟超时，作业上限十五分钟。两项新增回归分别验证 rescan 交付后、重挂前的事件保留，以及底层来源更换后旧监听不能继续信任原来的注册；missing_final_status 还先运行两项专用回归，分别验证父目录已核对和仅最终 CREATE 分支可改变状态。每项具名回归及原生测试必须取得精确 pass verdict，任何 fail、skip 或缺失预期 verdict 都不能算通过。
+十二个独立作业先运行基底的 Notification 测试及两项通知连续性回归，再运行 `TestNativeNegativeNameCacheGate`。测试使用 `-count=1`、三分钟超时，作业上限十五分钟。两项新增回归分别验证 rescan 交付后、重挂前的事件保留，以及底层来源更换后旧监听不能继续信任原来的注册；missing_final_status 与 positive 两种模式还先运行两项专用回归，分别验证父目录已核对和仅最终 CREATE 分支可改变状态；positive 另须取得读取完成分类用例的通过 verdict。每项具名回归及原生测试必须取得精确 pass verdict，任何 fail、skip 或缺失预期 verdict 都不能算通过。
 
 补丁只在健康且 generation 未变的底层 stream 上保留已建立的目录监听，在 rescan 响应交付之后继续积累有界事件，避免下一次请求以新 checkpoint 跳过间隔。来源更换、来源失败或关闭仍使旧注册失效。它是平台通知逻辑的诊断 overlay，不改变通用 File 生命周期或当前生产包；unit 回归通过也不能代替相同原生场景。
 
@@ -357,6 +357,7 @@ go vet ./packages/smb ./packages/smb/internal/wire ./packages/smb/internal/signi
 | directory_sharing | 以实际核对为 NTFS 且父目录可写的本地子目录，对比 SMB 子目录；分别记录 NTFS volume 根与导出 share 根。覆盖 LIST/READ_ATTRIBUTES-only 及双方打开顺序，先排除无监听者时已有的共享冲突，并要求普通文件的读共享拒绝对照成立 |
 | find_notification | 在实际 NTFS volume 根与 SMB share 根先确认 LIST/share=6 的无冲突基线，再分别以双方打开顺序检查 FindFirstChangeNotification 与该打开能否共存；成功的 SMB 通知句柄须有新的 Pending 响应，不兼容则失败 |
 | missing_final_status | 单独施加最终缺失状态补丁；无监听、无显式父目录句柄时核对 wire 0xc000000f 与 Win32 FILE_NOT_FOUND，验证新查询及一秒/到期前可见性；通过后再持有根 LIST/share=0 重复另一名字，全程任何 CHANGE_NOTIFY 都失败 |
+| positive_unheld / positive_exclusive | 分别无根句柄或持有根 LIST/share=0；每种模式运行十五个隔离 cell，检查路径/BasicInfo/StandardInfo/overlapped ReadFile/同步 ReadFile 的首次增长与缩短观察，以及 rename、replace、recreate 的路径或新打开结果 |
 
 创建可见性检查先取得 authority 的 CREATE/NAME_NOT_FOUND 响应，再由独立远端入口创建该名字。成功需要在写者确认后一秒内、且在最早可能的缓存到期之前观察到文件，并取得该名字的一次新权威 SMB CREATE；要求逐名字通知的情形还必须有匹配事件，不能用 rescan 替代 owned_nested 的初次创建和普通间隔创建通知。重复 Stat 是测量观察点，不是产品同步机制。环境中三个 SMB 缓存 lifetime 都须大于一秒；写者确认或观察越过可能到期时间时，不能据此证明非 TTL 可见性。故障情形单独检查缓存到期前的错误，不以创建成功代替断线诚实性。
 
@@ -364,7 +365,13 @@ directory_sharing 记录传给每次 CreateFile 的 access/share mask 及实际 
 
 find_notification 只检查替代通知入口的共存性；即使通过，也还需要独立证明可见性、重新监听和断线行为。它只读调用 RtlNtStatusToDosError 并记录 `0xc000000f`、`0xc0000034`、`0xc000003a` 的系统映射，明确记录 wire status 未变。Win32 映射不能证明 SMB 缓存行为，也不等于执行了缺失状态码替换实验。
 
-[最终缺失状态补丁](../.github/scripts/native-smb-missing-status.patch)只用于 missing_final_status，并与通知连续性 overlay 分别记录 SHA256。它在父目录检查已成功、确定最终叶名不存在的 CREATE 错误分支，把 0xc0000034 改为 0xc000000f；中间组件失败、权限拒绝、普通 ENOENT、清理失败及未知/合并错误保持原处理。[专用回归](../.github/scripts/native-smb-missing-status_test.go.txt)验证这个边界。该实验没有把未知改成缺失，也不修改 authority API；新状态在原生重定向器上的行为只由自己的运行判定，不能由只读 RTL 映射相同推导。
+[最终缺失状态补丁](../.github/scripts/native-smb-missing-status.patch)用于 missing_final_status 和 positive 两种模式，并与通知连续性 overlay 分别记录 SHA256。它在父目录检查已成功、确定最终叶名不存在的 CREATE 错误分支，把 0xc0000034 改为 0xc000000f；中间组件失败、权限拒绝、普通 ENOENT、清理失败及未知/合并错误保持原处理。[专用回归](../.github/scripts/native-smb-missing-status_test.go.txt)验证这个边界。该实验没有把未知改成缺失，也不修改 authority API；新状态在原生重定向器上的行为只由自己的运行判定，不能由只读 RTL 映射相同推导。
+
+[positive cache 探针](../.github/scripts/native-smb-positive-cache_test.go.txt)每个 cell 新建 fixture，不共用先前 cell 的缓存。通过真实 HTTP 准备内容及过去的 mtime：A 为 2001 年，预先准备的替换 B 为 2002 年；实际 mutation 的 ACK/Attr 为期望。被测 API 在 ACK 后的第一次结果独立保存在 First[]，后面的 HTTP oracle、其它 API 或诊断等待不能覆盖它。namespace 的打开和读取对照使用同步句柄，overlapped ReadFile 由独立 cell 检验；recreate_open 的名字缺失与重建两阶段均以 CreateFile 为首次观察，并先暖对应的负查找。每次测量都在 ACK 后一秒内，且早于准备目标前最早一次实际 root/CREATE 所确定的缓存期限，时间比较保留单调时钟。增长尾部、缩短后的 EOF、旧/新身份分别核对；同步 EOF 要求成功且读取零字节，异步 EOF 仅接受纯完成结果，合并的等待、取消或清理错误不能变成成功。recreate 是 rename-away 后复用名字，不增加 Remove shim，也不冒充独立 unlink 验收。
+
+[有界 wire 观察器](../.github/scripts/native-smb-positive-wire_test.go.txt)解析完整 compound 链，按连接和 MessageID 关联实际 CREATE/QUERY_INFO/READ 与固定 metadata、字节摘要；[合成回归](../.github/scripts/native-smb-positive-wire-checks_test.go.txt)检验分片、related CREATE、跨连接隔离、迟到响应、字段不完整与敏感内容排除。认证 token 和文件原字节不进入产物。positive cell 必须无 CHANGE_NOTIFY、无授予缓存权限，证据缺失/溢出及清理残留都失败；合成测试或 ARM64 构建通过不代表原生 positive cell 通过。
+
+映射拥有权在 Map 前写入并同步临时记录，再原子改名。测试进程异常退出后，Verify 只清理与该记录精确匹配、且不在运行前基线中的 Local/Remote 映射；发生恢复仍将该次测试判为清理失败，不把管理员清扫变成成功。每个 positive cell 单独保留首结果、完整关联记录、authority metadata/digest 与最终资源状态。
 
 产物记录 OS/build/架构、基底及探针 commit、实际通知/缺失状态 overlay SHA256、缓存策略、逐名字操作时间、SMB/authority 事件、映射和最终引用状态。轨迹最多保留 2048 项，溢出或编码失败使该次证据失败；递归监听由单独的测试拥有者驱动，不依靠应用调用推进。Windows overlapped 通知在取消完成前保留其缓冲和结构。零字节成功或 ERROR_NOTIFY_ENUM_DIR 被明确记录为丢失明细并重新监听，不代表空目录或没有变化；其余异步完成或事件关闭的异常清理错误同样失败。工作流保存诊断产物，并在环境准备成功后核对缓存策略未变且没有新增 SMB 映射残留。
 

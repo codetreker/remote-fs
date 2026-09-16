@@ -107,7 +107,7 @@ if ($Phase -eq 'Run') {
     [ordered]@{ Kind = 'Platform notification continuity overlay'; SHA256 = $env:RFS_GATE_OVERLAY_SHA } |
         ConvertTo-Json | Set-Content (Join-Path $results 'overlay.json') -Encoding utf8
     Copy-Item (Join-Path $PSScriptRoot 'native-smb-notify-continuity_test.go.txt') (Join-Path $fixture 'packages/smb/gate_notify_continuity_test.go')
-    if ($env:RFS_GATE_VARIANT -eq 'missing_final_status') {
+    if ($env:RFS_GATE_VARIANT -eq 'missing_final_status' -or $env:RFS_GATE_VARIANT.StartsWith('positive_')) {
         $missingOverlay = Join-Path $PSScriptRoot 'native-smb-missing-status.patch'
         & git -C $fixture apply --unidiff-zero --check $missingOverlay
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -120,12 +120,39 @@ if ($Phase -eq 'Run') {
     }
     $testRoot = Join-Path $fixture 'packages/smb/windows'
     Copy-Item (Join-Path $PSScriptRoot 'native-smb-cache-gate_test.go.txt') (Join-Path $testRoot 'native_cache_gate_windows_test.go')
+    foreach ($name in @('cache', 'wire', 'wire-checks')) {
+        Copy-Item (Join-Path $PSScriptRoot "native-smb-positive-$($name)_test.go.txt") (Join-Path $testRoot "gate_positive_$($name.Replace('-', '_'))_windows_test.go")
+    }
     $wire = Join-Path $testRoot 'native_wire_windows_test.go'
     foreach ($field in @('headers', 'creates', 'createReplies')) {
         $limit = if ($field -eq 'headers') { 16 } else { 8 }
         $anchor = "c.observation.$field = nativeRetainLast(c.observation.$field, h, $limit)"
         $replacement = $anchor + "`n" + ('cacheGateObserve("smb_' + $field + '", h)')
         Replace-ExactlyOnce $wire $anchor $replacement
+    }
+    Replace-ExactlyOnce $wire 'received nativeFrameObserver' "received nativeFrameObserver`npositive *cacheGatePositiveFrameObserver"
+    Replace-ExactlyOnce $wire 'return &nativeObservedConnection{Conn: connection,' 'return &nativeObservedConnection{Conn: connection, positive: cacheGateOptionalPositiveObserver(),'
+    Replace-ExactlyOnce $wire 'c.received.observe(buffer[:n])' "c.received.observe(buffer[:n])`nif c.positive != nil { c.positive.observe(buffer[:n], false) }"
+    Replace-ExactlyOnce $wire 'c.sent.observe(buffer[:n])' "c.sent.observe(buffer[:n])`nif c.positive != nil { c.positive.observe(buffer[:n], true) }"
+    if ($env:RFS_GATE_VARIANT.StartsWith('positive_')) {
+        $files = Join-Path $testRoot 'native_files_windows_test.go'
+        Replace-ExactlyOnce $files "result.Removal = f.removal()`n`treturn result, nil" @'
+result.Removal = f.removal()
+cacheGatePositiveCapture("stat", f.session.id, f.reference, result.Attr, 0, nil)
+return result, nil
+'@
+        Replace-ExactlyOnce $files 'return storage.FileRead{Attr: nativeAttr(f.node), Data: bytes.Clone(f.node.data[start:end])}, nil' @'
+result := storage.FileRead{Attr: nativeAttr(f.node), Data: bytes.Clone(f.node.data[start:end])}
+cacheGatePositiveCapture("read", f.session.id, f.reference, result.Attr, r.Offset, result.Data)
+return result, nil
+'@
+        $positiveSources = @('cache', 'wire', 'wire-checks') | ForEach-Object {
+            $path = Join-Path $PSScriptRoot "native-smb-positive-$($_)_test.go.txt"
+            [ordered]@{ Name = [IO.Path]::GetFileName($path); SHA256 = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() }
+        }
+        ConvertTo-Json -InputObject @($positiveSources) | Set-Content (Join-Path $results 'positive-source.json') -Encoding utf8
+        & gofmt -w $files
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
     $authority = Join-Path $testRoot 'native_fixture_windows_test.go'
     Replace-ExactlyOnce $authority 'if len(a.changes) == 1024 {' @'
@@ -134,6 +161,11 @@ if len(a.changes) == 1024 {
 '@
     $bridge = Join-Path $testRoot 'native_acceptance_windows_test.go'
     Replace-ExactlyOnce $bridge 'Limits: smb.DefaultLimits()' 'Limits: cacheGateLimits()'
+    Replace-ExactlyOnce $bridge 'b.mapping, err = Map(ctx, MappingOptions{LocalPath: b.path, Share: b.share, TCPPort: b.port})' @'
+if err := cacheGatePositiveOwnMapping(b.path, b.share); err != nil { return err }
+b.mapping, err = Map(ctx, MappingOptions{LocalPath: b.path, Share: b.share, TCPPort: b.port})
+'@
+
     & gofmt -w $wire $authority $bridge (Join-Path $testRoot 'native_cache_gate_windows_test.go')
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & git -C $fixture diff --stat | Write-Output
@@ -141,8 +173,11 @@ if len(a.changes) == 1024 {
     Push-Location $fixture
     try {
         Invoke-DiagnosticTests './packages/smb' '^Test(Notification|GateNotify)' @('TestGateNotifyRescanRetainsGapEvents', 'TestGateNotifyRescanRejectsReplacedSource') 'notify-unit-test.jsonl'
-        if ($env:RFS_GATE_VARIANT -eq 'missing_final_status') {
+        if ($env:RFS_GATE_VARIANT -eq 'missing_final_status' -or $env:RFS_GATE_VARIANT.StartsWith('positive_')) {
             Invoke-DiagnosticTests './packages/smb' '^TestGateMissingStatus' @('TestGateMissingStatusRequiresVerifiedParent', 'TestGateMissingStatusOnlyChangesFinalCreate') 'missing-status-unit-test.jsonl'
+        }
+        if ($env:RFS_GATE_VARIANT.StartsWith('positive_')) {
+            Invoke-DiagnosticTests './packages/smb/windows' '^TestGatePositive(Wire|Read)' @('TestGatePositiveReadCompletion', 'TestGatePositiveWireSplitCompoundResponses', 'TestGatePositiveWireReadDigestExcludesPayload', 'TestGatePositiveWireRelatedCreateAndQuery', 'TestGatePositiveWireErrorsPendingAndSecrets', 'TestGatePositiveWireMalformedAndBounds', 'TestGatePositiveWireBootstrapAndContextBounds', 'TestGatePositiveWireConnectionIsolationAndReset', 'TestGatePositiveWireSensitiveCreateContextExcluded', 'TestGatePositiveWireDelayedResponseJoinsRequestInterval', 'TestGatePositiveWireIncompleteSelectedBufferResults') 'positive-wire-test.jsonl'
         }
         Invoke-DiagnosticTests './packages/smb/windows' '^TestNativeNegativeNameCacheGate$' @('TestNativeNegativeNameCacheGate') 'go-test.jsonl'
     } finally {
@@ -151,6 +186,22 @@ if len(a.changes) == 1024 {
     exit 0
 }
 
+$recoveredMappings = @()
+$baselineMappings = @(Get-Content (Join-Path $results 'mappings-before.json') -Raw | ConvertFrom-Json)
+$ownedLedgers = @(Get-ChildItem $results -Filter 'owned-mapping-*.json' -File)
+if ($ownedLedgers.Count -gt 0) {
+    $owned = @($ownedLedgers | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json })
+    foreach ($mapping in @(Get-SmbMapping)) {
+        $key = "$($mapping.LocalPath)|$($mapping.RemotePath)"
+        if ($key -in $baselineMappings) { continue }
+        $match = @($owned | Where-Object { $_.Local -eq $mapping.LocalPath -and $_.Remote -eq $mapping.RemotePath })
+        if ($match.Count -gt 0) {
+            Remove-SmbMapping -LocalPath $mapping.LocalPath -RemotePath $mapping.RemotePath -Force -Confirm:$false
+            $recoveredMappings += $key
+        }
+    }
+}
+ConvertTo-Json -InputObject $recoveredMappings | Set-Content (Join-Path $results 'recovered-owned-mappings.json') -Encoding utf8
 $before = Get-Content (Join-Path $results 'environment.json') -Raw | ConvertFrom-Json
 $afterPolicy = Get-CachePolicy
 $afterMappings = Get-MappingKeys
@@ -163,4 +214,8 @@ $beforeMappings = @(Get-Content (Join-Path $results 'mappings-before.json') -Raw
 $remaining = @($afterMappings | Where-Object { $_ -notin $beforeMappings })
 if ($remaining.Count -ne 0) {
     throw "Mappings outlived the diagnostic: $($remaining -join ', ')"
+}
+
+if ($recoveredMappings.Count -ne 0) {
+    throw 'Recorded test-owned mappings required recovery after the test process exited.'
 }

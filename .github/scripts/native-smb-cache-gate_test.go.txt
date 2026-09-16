@@ -260,6 +260,10 @@ func cacheGateAwaitMissingName(t *testing.T, trace *cacheGateTrace, after uint64
 
 func TestNativeNegativeNameCacheGate(t *testing.T) {
 	variant := os.Getenv("RFS_GATE_VARIANT")
+	if strings.HasPrefix(variant, "positive_") {
+		cacheGatePositiveScenario(t, variant)
+		return
+	}
 	if variant == "directory_sharing" {
 		cacheGateSharingScenario(t)
 		return

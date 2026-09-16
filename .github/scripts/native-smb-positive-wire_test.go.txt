@@ -1,0 +1,473 @@
+package windows
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"sync"
+	"time"
+
+	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+)
+
+const cacheGatePositiveMaxFrame = 1 << 20
+const cacheGatePositiveMaxPending = 256
+const cacheGatePositiveMaxRecords = 8192
+
+// Records contain protocol identity and selected fixed fields; authentication
+// tokens and file bytes never enter the diagnostic output.
+type cacheGatePositiveWireRecord struct {
+	At            time.Time `json:"at"`
+	Connection    uint64    `json:"connection"`
+	Response      bool      `json:"response"`
+	MessageID     uint64    `json:"message_id"`
+	Command       uint16    `json:"command"`
+	Status        uint32    `json:"status"`
+	Flags         uint32    `json:"flags"`
+	SessionID     uint64    `json:"session_id"`
+	QueryType     byte      `json:"query_type,omitempty"`
+	QueryClass    byte      `json:"query_class,omitempty"`
+	FileID        string    `json:"file_id,omitempty"`
+	Name          string    `json:"name,omitempty"`
+	Offset        uint64    `json:"offset,omitempty"`
+	Requested     uint32    `json:"requested,omitempty"`
+	Count         uint32    `json:"count,omitempty"`
+	Digest        string    `json:"digest,omitempty"`
+	EOF           uint64    `json:"eof,omitempty"`
+	MTime         uint64    `json:"mtime,omitempty"`
+	InternalID    uint64    `json:"internal_id,omitempty"`
+	Oplock        byte      `json:"oplock"`
+	LeasePresent  bool      `json:"lease_present"`
+	LeaseState    uint32    `json:"lease_state"`
+	Incomplete    string    `json:"incomplete,omitempty"`
+	Bootstrap     bool      `json:"bootstrap,omitempty"`
+	RelatedCreate uint64    `json:"related_create,omitempty"`
+	related       bool
+}
+
+type cacheGatePositiveStream struct {
+	prefix [4]byte
+	used   int
+	frame  []byte
+	length int
+	failed bool
+}
+type cacheGatePositiveFrameObserver struct {
+	mu         sync.Mutex
+	id         uint64
+	streams    [2]cacheGatePositiveStream
+	pending    map[uint64]cacheGatePositiveWireRecord
+	records    []cacheGatePositiveWireRecord
+	incomplete bool
+	bootstrap  bool
+	emit       func(cacheGatePositiveWireRecord)
+}
+
+var cacheGatePositiveRegistry struct {
+	sync.Mutex
+	observers []*cacheGatePositiveFrameObserver
+	overflow  bool
+}
+
+func cacheGateNewPositiveFrameObserver() *cacheGatePositiveFrameObserver {
+	cacheGatePositiveRegistry.Lock()
+	defer cacheGatePositiveRegistry.Unlock()
+	o := &cacheGatePositiveFrameObserver{pending: make(map[uint64]cacheGatePositiveWireRecord)}
+	if len(cacheGatePositiveRegistry.observers) >= 16 {
+		cacheGatePositiveRegistry.overflow = true
+		o.incomplete = true
+		return o
+	}
+	o.id = uint64(len(cacheGatePositiveRegistry.observers) + 1)
+	cacheGatePositiveRegistry.observers = append(cacheGatePositiveRegistry.observers, o)
+	return o
+}
+
+func cacheGatePositiveWireSnapshot() ([]cacheGatePositiveWireRecord, bool) {
+	cacheGatePositiveRegistry.Lock()
+	observers := append([]*cacheGatePositiveFrameObserver(nil), cacheGatePositiveRegistry.observers...)
+	incomplete := cacheGatePositiveRegistry.overflow
+	cacheGatePositiveRegistry.Unlock()
+	var records []cacheGatePositiveWireRecord
+	for _, o := range observers {
+		o.mu.Lock()
+		records = append(records, o.records...)
+		incomplete = incomplete || o.incomplete
+		o.mu.Unlock()
+	}
+	return records, incomplete
+}
+
+func (o *cacheGatePositiveFrameObserver) record(r cacheGatePositiveWireRecord) {
+	r.At = time.Now()
+	r.Connection = o.id
+	if len(o.records) >= cacheGatePositiveMaxRecords {
+		o.incomplete = true
+		return
+	}
+	o.records = append(o.records, r)
+	if o.emit != nil {
+		o.emit(r)
+	} else {
+		cacheGateObserve("positive_wire", r)
+	}
+}
+func (o *cacheGatePositiveFrameObserver) fail(response bool, reason string) {
+	o.incomplete = true
+	o.record(cacheGatePositiveWireRecord{Response: response, Incomplete: reason})
+}
+func (o *cacheGatePositiveFrameObserver) finish() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for i := range o.streams {
+		s := &o.streams[i]
+		if s.used != 0 || len(s.frame) != 0 {
+			o.fail(i == 1, "truncated TCP frame")
+		}
+		clear(s.frame)
+		s.frame = nil
+		s.used = 0
+	}
+}
+func (o *cacheGatePositiveFrameObserver) observe(data []byte, response bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	index := 0
+	if response {
+		index = 1
+	}
+	s := &o.streams[index]
+	if s.failed {
+		return
+	}
+	for len(data) > 0 {
+		if s.used < 4 {
+			n := copy(s.prefix[s.used:], data)
+			s.used += n
+			data = data[n:]
+			if s.used < 4 {
+				return
+			}
+			s.length = int(s.prefix[1])<<16 | int(s.prefix[2])<<8 | int(s.prefix[3])
+			if s.prefix[0] != 0 || s.length < 4 || s.length > cacheGatePositiveMaxFrame {
+				o.fail(response, "invalid TCP frame length or type")
+				s.failed = true
+				return
+			}
+			s.frame = make([]byte, 0, s.length)
+		}
+		n := min(len(data), s.length-len(s.frame))
+		s.frame = append(s.frame, data[:n]...)
+		data = data[n:]
+		if len(s.frame) == s.length {
+			o.frame(s.frame, response)
+			clear(s.frame)
+			s.frame = nil
+			s.used = 0
+		}
+	}
+}
+
+func cacheGatePositiveField(packet []byte, offset, length uint32, minimum int) ([]byte, bool) {
+	if length == 0 {
+		return nil, offset == 0 || uint64(offset) >= uint64(minimum) && uint64(offset) <= uint64(len(packet))
+	}
+	end := uint64(offset) + uint64(length)
+	if uint64(offset) < uint64(minimum) || end > uint64(len(packet)) {
+		return nil, false
+	}
+	return packet[int(offset):int(end)], true
+}
+func cacheGatePositiveFixed(body []byte, size uint16, minimum int) bool {
+	return len(body) >= minimum && binary.LittleEndian.Uint16(body[:2]) == size
+}
+func cacheGatePositiveRelatedID(id string) bool { return id == "ffffffffffffffffffffffffffffffff" }
+
+func (o *cacheGatePositiveFrameObserver) frame(packet []byte, response bool) {
+	if string(packet[:4]) == "\xffSMB" && !response {
+		if wire.ParseMultiProtocolNegotiate(packet) != nil {
+			o.fail(response, "invalid SMB1 negotiate bootstrap")
+			return
+		}
+		o.bootstrap = true
+		o.record(cacheGatePositiveWireRecord{Bootstrap: true, Command: wire.Negotiate})
+		return
+	}
+	var createMID uint64
+	hasCreate := false
+	for commands := 0; ; commands++ {
+		if commands >= 64 {
+			o.fail(response, "compound command bound exceeded")
+			return
+		}
+		h, err := wire.ParseHeader(packet)
+		if err != nil || (h.Flags&wire.FlagResponse != 0) != response {
+			o.fail(response, "malformed or transformed SMB header")
+			return
+		}
+		end := len(packet)
+		if h.NextCommand != 0 {
+			if h.NextCommand < wire.HeaderSize+8 || h.NextCommand&7 != 0 || uint64(h.NextCommand)+wire.HeaderSize > uint64(len(packet)) {
+				o.fail(response, "invalid NextCommand")
+				return
+			}
+			end = int(h.NextCommand)
+		}
+		member := packet[:end]
+		body := member[wire.HeaderSize:]
+		r := cacheGatePositiveWireRecord{Response: response, MessageID: h.MessageID, Command: h.Command, Status: h.Status, Flags: h.Flags, SessionID: h.SessionID}
+		valid := true
+		if response {
+			req, ok := o.pending[h.MessageID]
+			if !ok && h.Command == wire.Negotiate && o.bootstrap {
+				o.bootstrap = false
+				ok = true
+				req.Command = wire.Negotiate
+			}
+			// Unsolicited lease/oplock notifications have no request MessageID.
+			if !ok && h.Command == wire.OplockBreak && h.MessageID == ^uint64(0) {
+				ok = true
+				req.Command = h.Command
+			}
+			if !ok || req.Command != h.Command {
+				o.fail(response, "response has no matching request")
+				valid = false
+			} else {
+				r.QueryType, r.QueryClass, r.FileID, r.Name = req.QueryType, req.QueryClass, req.FileID, req.Name
+				r.Offset, r.Requested = req.Offset, req.Requested
+				r.RelatedCreate, r.related = req.RelatedCreate, req.related
+			}
+			if h.Status != 0x00000103 {
+				delete(o.pending, h.MessageID)
+			}
+			if h.Status == 0 {
+				valid = o.response(member, &r) && valid
+			} else {
+				// Error payloads may contain opaque contexts; record only the NTSTATUS.
+				if !cacheGatePositiveFixed(body, 9, 8) {
+					valid = false
+				}
+				selectedQuery := r.Command == wire.QueryInfo && r.QueryType == 1 &&
+					(r.QueryClass == 4 || r.QueryClass == 5 || r.QueryClass == 6 || r.QueryClass == 18)
+				if (selectedQuery || r.Command == wire.Read) && (h.Status == 0x80000005 || h.Status == 0xc0000023) {
+					valid = false
+				}
+			}
+			if valid && h.Command == wire.Create && h.Status == 0 {
+				for mid, p := range o.pending {
+					if p.related && p.RelatedCreate == h.MessageID {
+						p.FileID = r.FileID
+						p.Name = r.Name
+						p.related = false
+						o.pending[mid] = p
+					}
+				}
+			}
+		} else {
+			valid = o.request(member, &r)
+			if h.Command == wire.Create {
+				createMID = h.MessageID
+				hasCreate = true
+			}
+			if cacheGatePositiveRelatedID(r.FileID) {
+				if h.Flags&wire.FlagRelated == 0 || !hasCreate {
+					valid = false
+				} else {
+					r.RelatedCreate = createMID
+					r.related = true
+				}
+			}
+			if h.Command != wire.Cancel {
+				if _, exists := o.pending[h.MessageID]; exists {
+					valid = false
+					o.fail(response, "duplicate pending MessageID")
+				}
+				if len(o.pending) >= cacheGatePositiveMaxPending {
+					valid = false
+					o.fail(response, "request correlation bound exceeded")
+				} else {
+					o.pending[h.MessageID] = r
+				}
+			}
+		}
+		if !valid {
+			r.Incomplete = "invalid selected command or correlation"
+			o.incomplete = true
+		}
+		o.record(r)
+		if h.NextCommand == 0 {
+			return
+		}
+		packet = packet[end:]
+	}
+}
+
+func (o *cacheGatePositiveFrameObserver) request(packet []byte, r *cacheGatePositiveWireRecord) bool {
+	body := packet[wire.HeaderSize:]
+	if len(body) < 2 {
+		return false
+	}
+	le := binary.LittleEndian
+	switch r.Command {
+	case wire.QueryInfo:
+		if !cacheGatePositiveFixed(body, 41, 40) {
+			return false
+		}
+		r.QueryType, r.QueryClass = body[2], body[3]
+		r.FileID = hex.EncodeToString(body[24:40])
+		_, ok := cacheGatePositiveField(packet, uint32(le.Uint16(body[8:10])), le.Uint32(body[12:16]), 104)
+		return ok
+	case wire.Read:
+		if !cacheGatePositiveFixed(body, 49, 48) {
+			return false
+		}
+		r.Requested = le.Uint32(body[4:8])
+		r.Offset = le.Uint64(body[8:16])
+		r.FileID = hex.EncodeToString(body[16:32])
+		_, ok := cacheGatePositiveField(packet, uint32(le.Uint16(body[44:46])), uint32(le.Uint16(body[46:48])), 112)
+		return ok
+	case wire.Create:
+		if !cacheGatePositiveFixed(body, 57, 56) {
+			return false
+		}
+		r.Oplock = body[3]
+		name, ok := cacheGatePositiveField(packet, uint32(le.Uint16(body[44:46])), uint32(le.Uint16(body[46:48])), 120)
+		if !ok || len(name) > 4096 {
+			return false
+		}
+		var err error
+		r.Name, err = wire.DecodeUTF16(name)
+		if err != nil {
+			return false
+		}
+		return cacheGatePositiveContexts(packet, le.Uint32(body[48:52]), le.Uint32(body[52:56]), 120, r)
+	case wire.Close, wire.Flush:
+		if !cacheGatePositiveFixed(body, 24, 24) {
+			return false
+		}
+		r.FileID = hex.EncodeToString(body[8:24])
+	}
+	return true
+}
+
+func (o *cacheGatePositiveFrameObserver) response(packet []byte, r *cacheGatePositiveWireRecord) bool {
+	body := packet[wire.HeaderSize:]
+	if len(body) < 2 {
+		return false
+	}
+	le := binary.LittleEndian
+	switch r.Command {
+	case wire.Create:
+		if !cacheGatePositiveFixed(body, 89, 88) {
+			return false
+		}
+		r.Oplock = body[2]
+		r.MTime = le.Uint64(body[24:32])
+		r.EOF = le.Uint64(body[48:56])
+		r.FileID = hex.EncodeToString(body[64:80])
+		return cacheGatePositiveContexts(packet, le.Uint32(body[80:84]), le.Uint32(body[84:88]), 152, r)
+	case wire.QueryInfo:
+		if !cacheGatePositiveFixed(body, 9, 8) {
+			return false
+		}
+		data, ok := cacheGatePositiveField(packet, uint32(le.Uint16(body[2:4])), le.Uint32(body[4:8]), 72)
+		if !ok {
+			return false
+		}
+		if r.QueryType != 1 {
+			return true
+		}
+		switch r.QueryClass {
+		case 4: // FILE_BASIC_INFORMATION
+			if len(data) != 40 {
+				return false
+			}
+			r.MTime = le.Uint64(data[16:24])
+		case 5: // FILE_STANDARD_INFORMATION
+			if len(data) != 24 {
+				return false
+			}
+			r.EOF = le.Uint64(data[8:16])
+		case 6: // FILE_INTERNAL_INFORMATION
+			if len(data) != 8 {
+				return false
+			}
+			r.InternalID = le.Uint64(data)
+		case 18: // FILE_ALL_INFORMATION, with bounded trailing name.
+			if len(data) < 100 || uint64(le.Uint32(data[96:100])) > uint64(len(data)-100) {
+				return false
+			}
+			r.MTime = le.Uint64(data[16:24])
+			r.EOF = le.Uint64(data[48:56])
+			r.InternalID = le.Uint64(data[64:72])
+		}
+	case wire.Read:
+		if !cacheGatePositiveFixed(body, 17, 16) {
+			return false
+		}
+		r.Count = le.Uint32(body[4:8])
+		if r.Count > r.Requested {
+			return false
+		}
+		data, ok := cacheGatePositiveField(packet, uint32(body[2]), r.Count, 80)
+		if !ok {
+			return false
+		}
+		digest := sha256.Sum256(data)
+		r.Digest = hex.EncodeToString(digest[:])
+	}
+	return true
+}
+
+func cacheGatePositiveContexts(packet []byte, offset, length uint32, minimum int, r *cacheGatePositiveWireRecord) bool {
+	data, ok := cacheGatePositiveField(packet, offset, length, minimum)
+	if !ok || len(data) > 0 && offset&7 != 0 {
+		return false
+	}
+	le := binary.LittleEndian
+	for count := 0; len(data) > 0; count++ {
+		if count >= 32 || len(data) < 16 {
+			return false
+		}
+		next := le.Uint32(data[:4])
+		end := len(data)
+		if next != 0 {
+			if next < 16 || next&7 != 0 || uint64(next)+16 > uint64(len(data)) {
+				return false
+			}
+			end = int(next)
+		}
+		name, ok := cacheGatePositiveField(data[:end], uint32(le.Uint16(data[4:6])), uint32(le.Uint16(data[6:8])), 16)
+		if !ok || len(name) == 0 {
+			return false
+		}
+		value, ok := cacheGatePositiveField(data[:end], uint32(le.Uint16(data[10:12])), le.Uint32(data[12:16]), 16)
+		if !ok {
+			return false
+		}
+		if string(name) == "RqLs" {
+			if r.LeasePresent || len(value) != 32 && len(value) != 52 {
+				return false
+			}
+			r.LeasePresent = true
+			r.LeaseState = le.Uint32(value[16:20])
+			if r.LeaseState & ^uint32(7) != 0 {
+				return false
+			}
+		}
+		if next == 0 {
+			return true
+		}
+		data = data[end:]
+	}
+	return true
+}
+
+// Reset is called only after the previous bridge has closed every connection.
+func cacheGateResetPositiveWire() {
+	cacheGatePositiveRegistry.Lock()
+	defer cacheGatePositiveRegistry.Unlock()
+	clear(cacheGatePositiveRegistry.observers)
+	cacheGatePositiveRegistry.observers = nil
+	cacheGatePositiveRegistry.overflow = false
+}

@@ -1,4 +1,4 @@
-# Agent Note: 原生 SMB 负缓存诊断固定执行对象
+# Agent Note: 原生 SMB 缓存诊断固定执行对象
 
 Status: implemented
 
@@ -6,7 +6,7 @@ Status: implemented
 
 Windows 原生重定向器可以在远端创建已经完成后继续复用此前的名字不存在结果。单个 SMB 请求正确、暖文件读取新内容或没有授予数据缓存权限，都不能证明后续按名访问满足一秒、非 TTL 的可见性。单次监听收到通知，还不足以证明重新监听的间隔、深层名字、卸载与故障期间的行为。
 
-[平台客户端提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)把这项可行性放在广泛实现之前。诊断需要一个能够实际运行、版本确定的 SMB 接入对象；正在变化的通用接口不能成为每次重现时额外变化的因素。旧原型的成功也不能被当作新实现的验收。
+[平台客户端提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)把这项可行性放在广泛实现之前。诊断需要一个能够实际运行、版本确定的 SMB 接入对象；负查找通过还不能说明已经缓存的属性、长度、内容或名字替换会及时更新。正在变化的通用接口不能成为每次重现时额外变化的因素。旧原型的成功也不能被当作新实现的验收。
 
 ## 决定
 
@@ -14,11 +14,15 @@ Windows 原生重定向器可以在远端创建已经完成后继续复用此前
 
 平台 overlay 在已建立目录监听的底层 stream 仍健康、generation 未变时，保留 rescan 交付后的注册与有界事件队列；重新请求不再用新 checkpoint 丢弃交付后的间隔。底层来源更换或失败仍使旧注册失效。两项[回归用例](../../../../.github/scripts/native-smb-notify-continuity_test.go.txt)分别检查间隔事件保留与来源替换隔离，和基底现有 Notification 测试一起先于原生场景执行。
 
-工作流由其 workflow、运行脚本、原生探针、连续性/最终缺失状态补丁及对应回归用例的 Pull Request 变更或手动触发，以十个独立的 Windows 11 24H2+ ARM64 作业运行。`baseline`、`held_parent`、`notify_parent` 分别比较没有显式父目录句柄、保留父目录句柄及已有 CHANGE_NOTIFY 的情形。`owned_nested`、`owned_lifecycle`、`owned_outage` 使用测试夹具拥有的递归 UNC 监听，检查多层目录、100 ms 重新监听间隔与八名字突发、busy/正常卸载及 HTTP/SSE 故障。owned_rescan 仅把 fixture 的 MaxNotifyEvents 缩小为 2，在实际请求对应的 wire ENUM 响应后暂停，再在重新监听前建立一个新的负查找与远端创建。它继续要求一秒、缓存到期前的新权威查询和后续健康监听，不用本地零字节代替 wire 证据。directory_sharing 以实际 NTFS、可写父目录下的子目录对比 SMB 子目录，另行记录本地 volume 根与导出 share 根；它比较 LIST/READ_ATTRIBUTES-only、双方打开顺序和普通文件读共享拒绝对照，并先排除已有的共享冲突。root 与非 root 分别测量，目录是否受某种 share mask 约束须由真实结果回答。find_notification 进一步比较 FindFirstChangeNotification 与 LIST/share=6 根目录打开的双方顺序，并要求成功的 SMB 通知句柄有新 Pending；它只验证共存性，不包含可见性、重新监听或故障验收。该用例还只读记录三个 NTSTATUS 的系统 Win32 映射，不改线上状态码，不据此推断缓存策略。missing_final_status 是另一个独立对照：只在该 variant 施加[最终缺失状态补丁](../../../../.github/scripts/native-smb-missing-status.patch)，先无监听/父目录句柄运行，再在第一阶段通过后持有根 LIST/share=0 重复创建可见性；任意 CHANGE_NOTIFY 都使该对照失败。这些测试拥有者不构成生产 ManagedShare API 的选择。
+工作流由其 workflow、运行脚本、原生探针、连续性/最终缺失状态补丁及对应回归、positive cache/wire 观察用例的 Pull Request 变更或手动触发，以十二个独立的 Windows 11 24H2+ ARM64 作业运行。`baseline`、`held_parent`、`notify_parent` 分别比较没有显式父目录句柄、保留父目录句柄及已有 CHANGE_NOTIFY 的情形。`owned_nested`、`owned_lifecycle`、`owned_outage` 使用测试夹具拥有的递归 UNC 监听，检查多层目录、100 ms 重新监听间隔与八名字突发、busy/正常卸载及 HTTP/SSE 故障。owned_rescan 仅把 fixture 的 MaxNotifyEvents 缩小为 2，在实际请求对应的 wire ENUM 响应后暂停，再在重新监听前建立一个新的负查找与远端创建。它继续要求一秒、缓存到期前的新权威查询和后续健康监听，不用本地零字节代替 wire 证据。directory_sharing 以实际 NTFS、可写父目录下的子目录对比 SMB 子目录，另行记录本地 volume 根与导出 share 根；它比较 LIST/READ_ATTRIBUTES-only、双方打开顺序和普通文件读共享拒绝对照，并先排除已有的共享冲突。root 与非 root 分别测量，目录是否受某种 share mask 约束须由真实结果回答。find_notification 进一步比较 FindFirstChangeNotification 与 LIST/share=6 根目录打开的双方顺序，并要求成功的 SMB 通知句柄有新 Pending；它只验证共存性，不包含可见性、重新监听或故障验收。该用例还只读记录三个 NTSTATUS 的系统 Win32 映射，不改线上状态码，不据此推断缓存策略。missing_final_status 是另一个独立对照：施加[最终缺失状态补丁](../../../../.github/scripts/native-smb-missing-status.patch)，先无监听/父目录句柄运行，再在第一阶段通过后持有根 LIST/share=0 重复创建可见性；任意 CHANGE_NOTIFY 都使该对照失败。这些测试拥有者不构成生产 ManagedShare API 的选择。
 
 缺失状态补丁的标记仅在父目录检查成功后产生，最终 CREATE 且清理成功才选择 0xc000000f；中间组件、权限、普通 ENOENT 和未知错误没有因此改类。它有独立的 SHA256 和两项[回归](../../../../.github/scripts/native-smb-missing-status_test.go.txt)，不与连续性补丁或只读 RTL 观察混称。该诊断检验一个真实最终缺失结果的另一种平台表示，不给错误未知的情况增加默认值。
 
-固定 Go 版本为 1.26.8，测试三分钟、作业十五分钟；编译缓存、模块缓存和临时状态放在工作区 `.tmp` 下。创建的成功判据同时约束 authority 结果、时间与新请求：初次负查找有匹配的 NAME_NOT_FOUND，远端创建确认后的一秒内出现新权威 CREATE 与可见文件，且观察早于最早可能的缓存到期。通知与故障情形各自核对匹配事件或不可用错误，零字节成功或 ERROR_NOTIFY_ENUM_DIR 明确表示丢失明细，测试拥有者记录后重新监听；它不维护目录快照，不能把重挂监听说成枚举恢复。owned_nested 的初次/普通间隔通知仍必需，只有突发明确丢明细时允许不具备每个名字的 ADDED，所有可见性检查保留。三个系统缓存 lifetime 必须大于一秒且诊断不得修改设置。完整可执行规则由[测试策略](../../../../docs/testing.md#windows-原生-smb-负缓存诊断)拥有。
+positive_unheld/positive_exclusive 同样施加最终缺失状态补丁，在无根句柄和根 LIST/share=0 两种条件下，各运行十五个隔离 cell。路径属性、BasicInfo、StandardInfo、异步/同步 ReadFile 分别以自己的第一次增长/缩短观察判定；rename、replace、rename-away 后重建分别比较路径、新打开及原引用。真实 HTTP 准备过去 mtime，ACK 后 First[] 的结果不可被随后诊断覆盖。namespace 对照使用同步句柄，异步读取独立检验；recreate_open 在缺失和重建阶段都先调用 CreateFile。这个拆分防止一个查询先刷新缓存，让另一个本来会失败的 API 看起来成功。
+
+positive 的 compound/wire 观察与 authority metadata、digest 逐项关联，读取原字节和认证 token 不进入结果。每个 cell 继续要求一秒、到期前、没有 CHANGE_NOTIFY 与缓存权限；缓存期限从目标准备前最早的实际 root/CREATE 计起。异步 EOF 不容纳合并的等待、取消或清理错误；映射先记录拥有权，异常退出后的精确恢复仍判为清理失败。合成观察器测试有普通/race 各 24 个 pass，ARM64 构建通过；positive 原生执行尚未发生，不能用这些局部检查提前宣布可见性成立。
+
+固定 Go 版本为 1.26.8，测试三分钟、作业十五分钟；编译缓存、模块缓存和临时状态放在工作区 `.tmp` 下。创建的成功判据同时约束 authority 结果、时间与新请求：初次负查找有匹配的 NAME_NOT_FOUND，远端创建确认后的一秒内出现新权威 CREATE 与可见文件，且观察早于最早可能的缓存到期。通知与故障情形各自核对匹配事件或不可用错误，零字节成功或 ERROR_NOTIFY_ENUM_DIR 明确表示丢失明细，测试拥有者记录后重新监听；它不维护目录快照，不能把重挂监听说成枚举恢复。owned_nested 的初次/普通间隔通知仍必需，只有突发明确丢明细时允许不具备每个名字的 ADDED，所有可见性检查保留。三个系统缓存 lifetime 必须大于一秒且诊断不得修改设置。完整可执行规则由[测试策略](../../../../docs/testing.md#windows-原生-smb-缓存诊断)拥有。
 
 ## 备选方案
 
@@ -70,4 +74,4 @@ Windows 原生重定向器可以在远端创建已经完成后继续复用此前
 
 每次诊断的结果绑定基底 commit、各 overlay SHA256、探针 commit、variant、OS/build 和缓存设置；没有 overlay 的历史运行分别保留其原始执行来源。JSON 轨迹、Go verdict、映射前后状态及最终引用数作为产物保留十四天；轨迹溢出、编码失败、改变缓存策略或映射残留都会使结果失败。取消 overlapped 通知时保留其结构与缓冲直到完成，除明确的丢明细结果外，意外的异步完成/事件关闭错误仍报告失败，进程卡住由测试超时显式暴露。
 
-代价是维护固定基底的补丁、注入锚点、回归用例与十个原生作业，诊断输入不自动跟随生产代码变化。此入口交付可行性或失败的证据，不证明新实现通过、SQLite 持久性、所有 Windows 操作或历史时间显示策略。实际交付的 package、transport 和 backend 仍须接受自己的原生验收，平台能力提案的状态不因诊断入口存在而改变。
+代价是维护固定基底的补丁、注入锚点、回归用例与十二个原生作业，诊断输入不自动跟随生产代码变化。此入口交付可行性或失败的证据，不证明新实现通过、SQLite 持久性、所有 Windows 操作或历史时间显示策略。实际交付的 package、transport 和 backend 仍须接受自己的原生验收，平台能力提案的状态不因诊断入口存在而改变。
