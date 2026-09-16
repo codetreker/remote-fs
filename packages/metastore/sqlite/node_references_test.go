@@ -486,3 +486,84 @@ func TestNodeReferenceNativeCapabilityDiscoveryAndOrderedOwnershipLifetime(t *te
 		})
 	}
 }
+
+func TestNodeReferenceMetadataConditionsRejectConcurrentChangeBeforeClaimsAndIntent(t *testing.T) {
+	for _, observation := range []struct {
+		name    string
+		present bool
+	}{{"version", true}, {"absence", false}} {
+		for _, route := range []string{"child", "identity"} {
+			t.Run(observation.name+"/"+route, func(t *testing.T) {
+				runStaleMetadataOpen(t, observation.present, func(ctx context.Context, s *Store, name storage.ChildName, capture metadataOpenObservation) (metadataConditionOpenResult, error) {
+					options := storage.NodeRefOptions{
+						Kind: storage.NodeRegular, Target: storage.ChildCondition{State: storage.SameNode, NodeID: capture.attr.ID},
+						ExpectedMetadata: capture.expected, Guards: &storage.NamespaceGuards{Directories: []storage.DirectoryObservation{capture.directory}},
+						MetadataAccess: storage.ReadMetadata, Use: storage.UseClaim{Uses: storage.DeleteName, Deny: storage.DeleteName},
+						CloseIntent: &storage.CloseIntent{Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
+					}
+					var result metastore.NodeOpenResult
+					var err error
+					if route == "child" {
+						options.Create = true
+						result, err = s.OpenChildRef(ctx, name, options)
+					} else {
+						options.MetadataAccess = 0
+						result, err = s.OpenNodeRef(ctx, capture.attr.ID, options)
+					}
+					return metadataConditionOpenResult{reference: result.Reference, state: result.State, outcome: result.Outcome}, err
+				})
+			})
+		}
+	}
+}
+
+func TestNodeReferenceCurrentMetadataConditionsAllowUnrelatedChanges(t *testing.T) {
+	for _, route := range []string{"child", "identity"} {
+		t.Run(route, func(t *testing.T) {
+			s := pendingUnlinkStore(t)
+			node := namespaceCreate(t, s.Store, s.root, "file", storage.NameCreate)
+			version, err := s.SetMetadata(t.Context(), node.ID, "test.attributes", nil, []byte{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			view, err := s.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: uint64(s.root)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			options := storage.NodeRefOptions{
+				Kind: storage.NodeRegular, Target: storage.ChildCondition{State: storage.SameNode, NodeID: node.ID},
+				ExpectedMetadata: map[string][]byte{"test.attributes": bytes.Clone(version.Version), "test.absent": nil},
+				Guards:           &storage.NamespaceGuards{Directories: []storage.DirectoryObservation{view.Observation}}, MetadataAccess: storage.ReadMetadata,
+			}
+			if _, err := s.SetMetadata(t.Context(), node.ID, "test.unrelated", nil, []byte("allowed")); err != nil {
+				t.Fatal(err)
+			}
+			var result metastore.NodeOpenResult
+			if route == "child" {
+				result, err = s.OpenChildRef(t.Context(), namespaceName(s.root, "file"), options)
+			} else {
+				options.MetadataAccess = 0
+				result, err = s.OpenNodeRef(t.Context(), node.ID, options)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Reference == nil {
+				t.Fatal("current metadata condition returned no reference")
+			}
+			t.Cleanup(func() {
+				if err := result.Reference.Close(context.Background()); err != nil {
+					t.Error(err)
+				}
+			})
+			if result.Outcome != storage.Opened || uint64(result.State.ID) != node.ID || !bytes.Equal(result.State.Metadata["test.attributes"].Version, version.Version) || len(result.State.Metadata["test.attributes"].Data) != 0 || !bytes.Equal(result.State.Metadata["test.unrelated"].Data, []byte("allowed")) {
+				t.Fatalf("current metadata reference=%+v", result)
+			}
+			if route == "identity" {
+				if _, err := result.Reference.Node(t.Context()); !errors.Is(err, syscall.EBADF) {
+					t.Fatalf("metadata condition granted attribute-read access=%v", err)
+				}
+			}
+		})
+	}
+}

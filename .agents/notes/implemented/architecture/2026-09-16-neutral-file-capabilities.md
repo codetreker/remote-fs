@@ -34,7 +34,7 @@ Linux 的 `posix.permissions.v1` 是四字节 little-endian uint32，范围为 0
 
 可选 NamespaceGuards 核对实际观察的目录 revision、父子边与 root anchor，预算有界；FUSE 精确叶名操作不默认带全目录条件。rename 分开表达观察到的替换槽位和 OutputLeaf，最终事务验证源、替换对象与输出第三占位者。创建/改名返回捕获 Attr，Remove/RemoveDir 的已知成功可返回空 NameResult；不能为删除补做一次 Stat 或把空成功改成 EIO。
 
-OpenAt 的创建、保留身份清空或新身份替换、初始 metadata、UseClaim、armed CloseIntent 与返回 Attr/Outcome 在一个原生有序操作内完成。ConditionalFileMutation 的显式大小/namespace 条件与效果同在最终发布检查；Append 根据当前 EOF 构造候选，已知 revision 竞争才重建，普通 WriteAt 不增加外部版本前置条件。
+OpenAt 的创建、保留身份清空或新身份替换、初始 metadata、UseClaim、armed CloseIntent 与返回 Attr/Outcome 在一个原生有序操作内完成。OpenAtOptions/NodeRefOptions 复用 ExpectedMetadata 的版本/缺席条件，非空条件只绑定 SameNode。目录 token 不证明该目标 payload 未变化；最终事务必须在 Keep claim/intent、Reset 或 Replace 效果前比较旧对象，初值仍按成功分支独立应用。已知条件不符返回零结果的 ErrConditionConflict，不取得引用、用途或删除义务；未知效果沿原清理规则失败。ConditionalFileMutation 的显式大小/namespace 条件与效果同在最终发布检查；Append 根据当前 EOF 构造候选，已知 revision 竞争才重建，普通 WriteAt 不增加外部版本前置条件。
 
 ### metadata 披露与当前绑定独立观察
 
@@ -81,6 +81,8 @@ HTTP/v4 使用中立 Attr、metadata、范围及能力 DTO，旧 v3 路由明确
 **重写文件核心，统一 EntryID、全操作 receipt 和独立 lease。** 当前 NodeID、同步 File、revision CAS 与回收已经承担这些职责；替换它们会重做对象身份和未知发布证明，却没有对应需求。新增控制请求使用原 journal，新增引用种类使用原 retainedFile。
 
 **每次发送完整锁快照。** 快照覆盖会把独立区间的变化变成整体竞争，还须重新定义等待、转换和取消。命令式增删保留已有历史与顺序，独立 claim 只增加实际需要的 multiplicity。
+
+**先判断 metadata，再打开并补做条件修改。** 目标 payload 可在目录 revision 不变时更新，后置检查无法撤销已经清空的内容或已经接纳的删除义务。复用同一只读条件比较并放入原子打开，保留实际返回对象与效果的一致性；不把平台属性解释放入 authority。
 
 **内部解析复用公开枚举或记住的打开路径。** 前者增加应用 ReadEntries 前提，后者在跨客户端改名后过时。独立 snapshot-authorized 观察保留权限分工，并提供最终修改可以再次核对的事实；不为一个当前名字查询维护整份 volume 缓存。
 

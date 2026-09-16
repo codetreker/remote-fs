@@ -3,6 +3,7 @@ package httprest
 import (
 	"context"
 	"github.com/codetreker/remote-fs/packages/storage"
+	"strings"
 )
 
 type AtomicFileOpenerWithBarrier interface {
@@ -61,7 +62,7 @@ func initialMetadataOf(values map[string][]byte) map[string][]byte {
 	}
 	result := make(map[string][]byte, len(values))
 	for key, value := range values {
-		result[key] = append([]byte{}, value...)
+		result[strings.Clone(key)] = append([]byte{}, value...)
 	}
 	return result
 }
@@ -76,42 +77,44 @@ func (v initialState) storage() storage.InitialState {
 }
 
 type openAtOptions struct {
-	Read        bool                     `json:"read"`
-	Write       bool                     `json:"write"`
-	Create      bool                     `json:"create"`
-	Exclusive   bool                     `json:"exclusive"`
-	Target      storage.ChildCondition   `json:"target"`
-	Guards      *storage.NamespaceGuards `json:"guards,omitempty"`
-	Use         storage.UseClaim         `json:"use"`
-	Existing    storage.ExistingEffect   `json:"existing"`
-	Initial     initialState             `json:"initial"`
-	CloseIntent *storage.CloseIntent     `json:"closeIntent,omitempty"`
+	ExpectedMetadata map[string][]byte        `json:"expectedMetadata,omitempty"`
+	Read             bool                     `json:"read"`
+	Write            bool                     `json:"write"`
+	Create           bool                     `json:"create"`
+	Exclusive        bool                     `json:"exclusive"`
+	Target           storage.ChildCondition   `json:"target"`
+	Guards           *storage.NamespaceGuards `json:"guards,omitempty"`
+	Use              storage.UseClaim         `json:"use"`
+	Existing         storage.ExistingEffect   `json:"existing"`
+	Initial          initialState             `json:"initial"`
+	CloseIntent      *storage.CloseIntent     `json:"closeIntent,omitempty"`
 }
 
 func openAtOptionsOf(v storage.OpenAtOptions) *openAtOptions {
-	return &openAtOptions{Read: v.Read, Write: v.Write, Create: v.Create, Exclusive: v.Exclusive, Target: v.Target, Guards: v.Guards, Use: v.Use, Existing: v.Existing, Initial: initialStateOf(v.Initial), CloseIntent: v.CloseIntent}
+	return &openAtOptions{ExpectedMetadata: initialMetadataOf(v.ExpectedMetadata), Read: v.Read, Write: v.Write, Create: v.Create, Exclusive: v.Exclusive, Target: v.Target, Guards: v.Guards, Use: v.Use, Existing: v.Existing, Initial: initialStateOf(v.Initial), CloseIntent: v.CloseIntent}
 }
 func (v openAtOptions) storage() storage.OpenAtOptions {
-	return storage.OpenAtOptions{Read: v.Read, Write: v.Write, Create: v.Create, Exclusive: v.Exclusive, Target: v.Target, Guards: v.Guards, Use: v.Use, Existing: v.Existing, Initial: v.Initial.storage(), CloseIntent: v.CloseIntent}
+	return storage.OpenAtOptions{ExpectedMetadata: v.ExpectedMetadata, Read: v.Read, Write: v.Write, Create: v.Create, Exclusive: v.Exclusive, Target: v.Target, Guards: v.Guards, Use: v.Use, Existing: v.Existing, Initial: v.Initial.storage(), CloseIntent: v.CloseIntent}
 }
 
 type nodeRefOptions struct {
-	Kind           storage.NodeKind            `json:"kind"`
-	Target         storage.ChildCondition      `json:"target"`
-	Guards         *storage.NamespaceGuards    `json:"guards,omitempty"`
-	Use            storage.UseClaim            `json:"use"`
-	MetadataAccess storage.MetadataPermissions `json:"metadataAccess"`
-	Create         bool                        `json:"create"`
-	Exclusive      bool                        `json:"exclusive"`
-	Initial        initialState                `json:"initial"`
-	CloseIntent    *storage.CloseIntent        `json:"closeIntent,omitempty"`
+	ExpectedMetadata map[string][]byte           `json:"expectedMetadata,omitempty"`
+	Kind             storage.NodeKind            `json:"kind"`
+	Target           storage.ChildCondition      `json:"target"`
+	Guards           *storage.NamespaceGuards    `json:"guards,omitempty"`
+	Use              storage.UseClaim            `json:"use"`
+	MetadataAccess   storage.MetadataPermissions `json:"metadataAccess"`
+	Create           bool                        `json:"create"`
+	Exclusive        bool                        `json:"exclusive"`
+	Initial          initialState                `json:"initial"`
+	CloseIntent      *storage.CloseIntent        `json:"closeIntent,omitempty"`
 }
 
 func nodeRefOptionsOf(v storage.NodeRefOptions) *nodeRefOptions {
-	return &nodeRefOptions{Kind: v.Kind, Target: v.Target, Guards: v.Guards, Use: v.Use, MetadataAccess: v.MetadataAccess, Create: v.Create, Exclusive: v.Exclusive, Initial: initialStateOf(v.InitialState), CloseIntent: v.CloseIntent}
+	return &nodeRefOptions{ExpectedMetadata: initialMetadataOf(v.ExpectedMetadata), Kind: v.Kind, Target: v.Target, Guards: v.Guards, Use: v.Use, MetadataAccess: v.MetadataAccess, Create: v.Create, Exclusive: v.Exclusive, Initial: initialStateOf(v.InitialState), CloseIntent: v.CloseIntent}
 }
 func (v nodeRefOptions) storage() storage.NodeRefOptions {
-	return storage.NodeRefOptions{Kind: v.Kind, Target: v.Target, Guards: v.Guards, Use: v.Use, MetadataAccess: v.MetadataAccess, Create: v.Create, Exclusive: v.Exclusive, InitialState: v.Initial.storage(), CloseIntent: v.CloseIntent}
+	return storage.NodeRefOptions{ExpectedMetadata: v.ExpectedMetadata, Kind: v.Kind, Target: v.Target, Guards: v.Guards, Use: v.Use, MetadataAccess: v.MetadataAccess, Create: v.Create, Exclusive: v.Exclusive, InitialState: v.Initial.storage(), CloseIntent: v.CloseIntent}
 }
 
 type nameCommand struct {

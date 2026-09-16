@@ -1,6 +1,7 @@
 package httprest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 )
 
 type capabilityTestBackend struct {
@@ -614,5 +617,342 @@ func TestMetadataReferenceFacetsRoundTripWithoutByteMethods(t *testing.T) {
 	}
 	if _, err := ref.CloseWithBarrier(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+type metadataConditionSession struct {
+	*capabilityTestSession
+	conditionCalls atomic.Int32
+	conditionMu    sync.Mutex
+	conditions     map[string][]byte
+}
+
+func (s *metadataConditionSession) checkConditions(conditions map[string][]byte) error {
+	s.conditionCalls.Add(1)
+	s.conditionMu.Lock()
+	s.conditions = storage.CloneInitialMetadata(conditions)
+	s.conditionMu.Unlock()
+	for namespace, expected := range conditions {
+		current, exists := s.node.attr.Metadata[namespace]
+		if len(expected) == 0 && exists || len(expected) != 0 && (!exists || !bytes.Equal(current.Version, expected)) {
+			return storage.ErrConditionConflict
+		}
+	}
+	return nil
+}
+func (s *metadataConditionSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
+	if err := s.checkConditions(options.ExpectedMetadata); err != nil {
+		return storage.OpenResult{}, err
+	}
+	return s.capabilityTestSession.OpenAt(ctx, name, options)
+}
+func (s *metadataConditionSession) OpenNodeRef(ctx context.Context, id uint64, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	if err := s.checkConditions(options.ExpectedMetadata); err != nil {
+		return storage.NodeOpenResult{}, err
+	}
+	return s.capabilityTestSession.OpenNodeRef(ctx, id, options)
+}
+func (s *metadataConditionSession) OpenChildRef(ctx context.Context, name storage.ChildName, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	if err := s.checkConditions(options.ExpectedMetadata); err != nil {
+		return storage.NodeOpenResult{}, err
+	}
+	result, err := s.capabilityTestSession.OpenChildRef(ctx, name, options)
+	result.Outcome = storage.Opened
+	return result, err
+}
+
+type metadataConditionBackend struct {
+	storage.FileStorage
+	session *metadataConditionSession
+}
+
+func (b metadataConditionBackend) CheckFileStorage() error { return nil }
+func (b metadataConditionBackend) NewFileSession(_ context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+	b.session.options = options
+	return b.session, nil
+}
+func metadataConditionHTTPFixture(t *testing.T) (*Storage, *Handler, *remoteFileSession, *metadataConditionSession) {
+	t.Helper()
+	base := &capabilityTestSession{node: &capabilityTestReference{attr: storage.Attr{ID: 41, Kind: storage.NodeRegular, Size: 7, Metadata: map[string]storage.OpaquePayload{"test.attributes": {Version: []byte{1, 0, 0xff}, Data: []byte("payload")}}}}}
+	client, handler := capabilityHTTPFixture(t, base)
+	native := &metadataConditionSession{capabilityTestSession: base}
+	handler.files.backend = metadataConditionBackend{session: native}
+	opened, err := client.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, handler, opened.(*remoteFileSession), native
+}
+
+func TestOpenMetadataConditionsHTTPRoundTripAndKnownConflict(t *testing.T) {
+	for _, operation := range []storage.Operation{storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef} {
+		t.Run(string(operation), func(t *testing.T) {
+			client, handler, session, native := metadataConditionHTTPFixture(t)
+			request := openMetadataRequest(t, operation, session.id)
+			requestMetadataConditions(request)["test.attributes"] = []byte("stale")
+			response, err := client.fileCall(t.Context(), request)
+			if !errors.Is(err, storage.ErrConditionConflict) || !errors.Is(err, syscall.EAGAIN) || response.File != "" || response.Attr != nil || native.opens.Load() != 0 {
+				t.Fatalf("known conflict changed outcome/effects: %+v %v opens=%d", response, err, native.opens.Load())
+			}
+			handler.files.mu.Lock()
+			registered := handler.files.sessions[session.id]
+			handler.files.mu.Unlock()
+			registered.mu.Lock()
+			files := len(registered.files)
+			registered.mu.Unlock()
+			if files != 0 {
+				t.Fatalf("conflict retained %d references", files)
+			}
+			request = openMetadataRequest(t, operation, session.id)
+			response, err = client.fileCall(t.Context(), request)
+			if err != nil || response.File == "" || response.Outcome != storage.Opened || response.Attr == nil || response.Attr.ID != 41 || native.opens.Load() != 1 {
+				t.Fatalf("matching conditions: %+v %v opens=%d", response, err, native.opens.Load())
+			}
+			native.conditionMu.Lock()
+			captured := storage.CloneInitialMetadata(native.conditions)
+			native.conditionMu.Unlock()
+			absent, present := captured["test.absent"]
+			if len(captured) != 2 || !present || len(absent) != 0 || !bytes.Equal(captured["test.attributes"], []byte{1, 0, 0xff}) {
+				t.Fatalf("condition map changed before execution: %#v", captured)
+			}
+		})
+	}
+}
+
+func TestOpenMetadataConditionsBindExistingActionDigest(t *testing.T) {
+	for _, operation := range []storage.Operation{storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef} {
+		t.Run(string(operation), func(t *testing.T) {
+			client, _, session, native := metadataConditionHTTPFixture(t)
+			request := openMetadataRequest(t, operation, session.id)
+			original, err := client.fileCall(t.Context(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replayed, err := client.fileCall(t.Context(), request)
+			if err != nil || replayed.File != original.File || native.conditionCalls.Load() != 1 || native.opens.Load() != 1 {
+				t.Fatalf("unchanged replay reexecuted conditions/open: %v calls=%d opens=%d", err, native.conditionCalls.Load(), native.opens.Load())
+			}
+			requestMetadataConditions(request)["test.attributes"] = []byte("different")
+			if _, err := client.fileCall(t.Context(), request); !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("changed token on same action: %v", err)
+			}
+			requestMetadataConditions(request)["test.attributes"] = []byte{1, 0, 0xff}
+			delete(requestMetadataConditions(request), "test.absent")
+			if _, err := client.fileCall(t.Context(), request); !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("removed absence condition on same action: %v", err)
+			}
+			if native.conditionCalls.Load() != 1 || native.opens.Load() != 1 {
+				t.Fatal("changed replay reached native execution")
+			}
+		})
+	}
+}
+
+func TestOpenMetadataConditionsMalformedWireStopsBeforeExecution(t *testing.T) {
+	for _, operation := range []storage.Operation{storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef} {
+		t.Run(string(operation), func(t *testing.T) {
+			_, handler, session, native := metadataConditionHTTPFixture(t)
+			tooMany := map[string][]byte{}
+			for i := range storage.MaxMetadataNamespaces + 1 {
+				tooMany[fmt.Sprintf("test.namespace.%d", i)] = []byte{1}
+			}
+			many, _ := json.Marshal(tooMany)
+			large, _ := json.Marshal(map[string][]byte{"test.attributes": bytes.Repeat([]byte{1}, storage.MaxObservationTokenBytes+1)})
+			for _, malformed := range []struct {
+				name, raw string
+				anyTarget bool
+			}{
+				{"null map", "null", false}, {"null token", `{"test.attributes":null}`, false}, {"duplicate namespace", `{"test.attributes":"AQ==","test.attributes":"Ag=="}`, false},
+				{"invalid namespace", `{"":"AQ=="}`, false}, {"invalid base64", `{"test.attributes":"%%%"}`, false}, {"too many namespaces", string(many), false}, {"oversized token", string(large), false},
+				{"unbound target", `{"test.absent":""}`, true},
+			} {
+				t.Run(malformed.name, func(t *testing.T) {
+					request := openMetadataRequest(t, operation, session.id)
+					if malformed.anyTarget {
+						if request.OpenAt != nil {
+							request.OpenAt.Target = storage.ChildCondition{State: storage.Any}
+						} else {
+							request.NodeRef.Target = storage.ChildCondition{State: storage.Any}
+						}
+					}
+					body, err := json.Marshal(request)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var envelope map[string]json.RawMessage
+					if err := json.Unmarshal(body, &envelope); err != nil {
+						t.Fatal(err)
+					}
+					field := "nodeRef"
+					if request.OpenAt != nil {
+						field = "openAt"
+					}
+					var options map[string]json.RawMessage
+					if err := json.Unmarshal(envelope[field], &options); err != nil {
+						t.Fatal(err)
+					}
+					options["expectedMetadata"] = json.RawMessage(malformed.raw)
+					envelope[field], err = json.Marshal(options)
+					if err != nil {
+						t.Fatal(err)
+					}
+					body, err = json.Marshal(envelope)
+					if err != nil {
+						t.Fatal(err)
+					}
+					r := httptest.NewRequest(http.MethodPost, Prefix+string(OpFile), bytes.NewReader(body))
+					r.Header.Set("Content-Type", contentJSON)
+					w := httptest.NewRecorder()
+					handler.ServeHTTP(w, r)
+					if w.Code < 400 || native.conditionCalls.Load() != 0 || native.opens.Load() != 0 {
+						t.Fatalf("malformed conditions executed: status=%d calls=%d opens=%d", w.Code, native.conditionCalls.Load(), native.opens.Load())
+					}
+				})
+			}
+			body, err := json.Marshal(openMetadataRequest(t, operation, session.id))
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := httptest.NewRequest(http.MethodPost, Prefix+string(OpFile), bytes.NewReader(body))
+			r.Header.Set("Content-Type", contentJSON)
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, r)
+			if w.Code != http.StatusOK || native.conditionCalls.Load() != 1 || native.opens.Load() != 1 {
+				t.Fatalf("valid control failed: status=%d calls=%d opens=%d", w.Code, native.conditionCalls.Load(), native.opens.Load())
+			}
+		})
+	}
+}
+
+func TestOpenMetadataConditionsNativeHTTPKeepEffectsAtomic(t *testing.T) {
+	for _, operation := range []storage.Operation{storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef} {
+		t.Run(string(operation), func(t *testing.T) {
+			meta, backend := memoryfixture.New(t, "open-metadata", 1<<20, locking.DefaultOptions())
+			if err := backend.Write(t.Context(), "file", []byte("keep")); err != nil {
+				t.Fatal(err)
+			}
+			initial, err := backend.Stat(t.Context(), "file")
+			if err != nil {
+				t.Fatal(err)
+			}
+			root, err := backend.Stat(t.Context(), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler, err := NewHandler(backend, meta)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(handler)
+			t.Cleanup(func() {
+				server.Close()
+				if err := handler.Close(context.Background()); err != nil {
+					t.Error(err)
+				}
+			})
+			client, err := Dial(server.URL, server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			opened, err := client.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+			if err != nil {
+				t.Fatal(err)
+			}
+			session := opened.(*remoteFileSession)
+			first, err := session.SetMetadata(t.Context(), initial.ID, "test.attributes", nil, []byte("first"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			current, err := session.SetMetadata(t.Context(), initial.ID, "test.attributes", first.Version, []byte("current"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			name := storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("file")}
+			target := storage.ChildCondition{State: storage.SameNode, NodeID: initial.ID}
+			fileOptions := storage.OpenAtOptions{Read: true, Write: true, Target: target, Existing: storage.ResetContent, Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData}}
+			nodeOptions := storage.NodeRefOptions{Kind: storage.NodeRegular, Target: target, MetadataAccess: storage.ReadMetadata}
+			open := func(version []byte) (storage.NodeOpenResult, error) {
+				conditions := map[string][]byte{"test.attributes": version, "test.absent": nil}
+				if operation == storage.OpFileOpenAt {
+					options := fileOptions
+					options.ExpectedMetadata = conditions
+					result, err := session.OpenAt(t.Context(), name, options)
+					return storage.NodeOpenResult{Reference: result.File, Attr: result.Attr, Outcome: result.Outcome}, err
+				}
+				options := nodeOptions
+				options.ExpectedMetadata = conditions
+				if operation == storage.OpFileOpenNodeRef {
+					return session.OpenNodeRef(t.Context(), initial.ID, options)
+				}
+				return session.OpenChildRef(t.Context(), name, options)
+			}
+			before, err := meta.Barrier(t.Context(), MaxIncarnationBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			failed, err := open(first.Version)
+			if !errors.Is(err, storage.ErrConditionConflict) || !errors.Is(err, syscall.EAGAIN) || failed.Reference != nil || failed.Attr.ID != 0 || failed.Outcome != 0 {
+				t.Fatalf("stale metadata did not fail without a result: %+v %v", failed, err)
+			}
+			after, err := meta.Barrier(t.Context(), MaxIncarnationBytes)
+			if err != nil || after.Position != before.Position {
+				t.Fatalf("stale condition published: before=%+v after=%+v err=%v", before, after, err)
+			}
+			data, err := backend.Read(t.Context(), "file")
+			if err != nil || string(data) != "keep" {
+				t.Fatalf("stale condition changed bytes: %q %v", data, err)
+			}
+			unchanged, err := backend.Stat(t.Context(), "file")
+			if err != nil || unchanged.ID != initial.ID || !bytes.Equal(unchanged.Metadata["test.attributes"].Version, current.Version) || string(unchanged.Metadata["test.attributes"].Data) != "current" {
+				t.Fatalf("stale condition changed identity/metadata: %+v %v", unchanged, err)
+			}
+			if _, err := session.SetMetadata(t.Context(), initial.ID, "test.large", nil, bytes.Repeat([]byte{1}, 32<<10)); err != nil {
+				t.Fatal(err)
+			}
+			before, err = meta.Barrier(t.Context(), MaxIncarnationBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := openMetadataRequest(t, operation, session.id)
+			request.ResultBytes = 1024
+			if operation == storage.OpFileOpenAt {
+				options := fileOptions
+				options.ExpectedMetadata = map[string][]byte{"test.attributes": current.Version}
+				request.OpenAt = openAtOptionsOf(options)
+				request.Child = &name
+			} else {
+				options := nodeOptions
+				options.ExpectedMetadata = map[string][]byte{"test.attributes": current.Version}
+				request.NodeRef = nodeRefOptionsOf(options)
+				if operation == storage.OpFileOpenNodeRef {
+					request.Node = initial.ID
+				} else {
+					request.Child = &name
+				}
+			}
+			response, err := session.call(t.Context(), request)
+			if !errors.Is(err, syscall.EFBIG) || response.File != "" || response.Attr != nil {
+				t.Fatalf("small returned-attribute budget admitted open: %+v %v", response, err)
+			}
+			after, err = meta.Barrier(t.Context(), MaxIncarnationBytes)
+			if err != nil || after.Position != before.Position {
+				t.Fatalf("budget failure published: before=%+v after=%+v err=%v", before, after, err)
+			}
+			data, err = backend.Read(t.Context(), "file")
+			if err != nil || string(data) != "keep" {
+				t.Fatalf("budget refusal changed bytes: %q %v", data, err)
+			}
+			result, err := open(current.Version)
+			outcome, size := storage.Opened, int64(4)
+			if operation == storage.OpFileOpenAt {
+				outcome, size = storage.Reset, 0
+			}
+			if err != nil || result.Reference == nil || result.Attr.ID != initial.ID || result.Attr.Size != size || result.Outcome != outcome || !bytes.Equal(result.Attr.Metadata["test.attributes"].Version, current.Version) {
+				t.Fatalf("current conditions changed capture: %+v %v", result, err)
+			}
+			if err := result.Reference.Close(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

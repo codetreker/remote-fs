@@ -59,6 +59,8 @@ handle rename 以观察到的父/叶名、SameNode 和实际引用 Scope 构造�
 
 ### 打开、共享与删除的映射
 
+Windows 依据观察到的 payload 决定允许的访问、破坏性 disposition 或 CloseIntent 时，须把实际依赖的 namespace 版本/缺席条件放入已有 OpenAtOptions/NodeRefOptions.ExpectedMetadata，并绑定 SameNode。只有最终旧目标仍满足条件才能打开；已知无效果条件冲突可在原请求预算内重新观察。缺席目标使用 Absent 和空条件，不能把新节点的缺席 payload 当作对旧对象的确认。平台的只读/hidden/system 等解释仍在客户端，中立核心只比较版本。
+
 OPEN/CREATE/OPEN_IF 分别选择已有、缺席或任一存在性；OVERWRITE/OVERWRITE_IF 使用保留身份的 ResetContent，SUPERSEDE 使用 ReplaceNode 并保留被 pin 的旧对象。创建/清空/替换的共同时间与 Windows payload 进入对应 InitialState，同一次成功返回捕获 Attr/Outcome；不能先 Stat、改内容再补初始属性。
 
 共享模式映射成中立 Uses/Deny，所有入口继续接受 native 冲突检查。应用的 metadata-only 不虚构字节读取，普通目录枚举必须具有 ReadEntries。内部系统资源不能悄然增加一个会阻止本来合法应用打开的 share claim；也不能为内部监听而忽略应用明确的共享限制。

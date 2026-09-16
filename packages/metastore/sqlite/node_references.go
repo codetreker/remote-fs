@@ -25,7 +25,7 @@ func (s *Store) OpenChildRef(ctx context.Context, name storage.ChildName, option
 		return metastore.NodeOpenResult{}, err
 	}
 	file, state, outcome, err := s.openAtomicChild(ctx, name, options.Kind, false, false, options.MetadataAccess,
-		options.Create, options.Exclusive, options.Target, options.Guards, options.Use, storage.Keep,
+		options.Create, options.Exclusive, options.Target, options.Guards, options.ExpectedMetadata, options.Use, storage.Keep,
 		options.InitialState, options.CloseIntent)
 	if file == nil {
 		return metastore.NodeOpenResult{}, err
@@ -84,6 +84,9 @@ func (s *Store) OpenNodeRef(ctx context.Context, id uint64, options storage.Node
 		}
 		if pending {
 			return storage.ErrPendingDelete
+		}
+		if err := checkExpectedMetadata(state.Metadata, options.ExpectedMetadata); err != nil {
+			return err
 		}
 		if err := s.fileDomain.coordinator.AddUse(ctx, id, scope, options.Use); err != nil {
 			return err

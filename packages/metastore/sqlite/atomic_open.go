@@ -28,7 +28,7 @@ func (s *Store) OpenAt(ctx context.Context, name storage.ChildName, options stor
 	}
 	file, state, outcome, err := s.openAtomicChild(ctx, name, storage.NodeRegular, options.Read, options.Write,
 		storage.ReadMetadata|storage.WriteMetadata, options.Create, options.Exclusive, options.Target,
-		options.Guards, options.Use, options.Existing, options.Initial, options.CloseIntent)
+		options.Guards, options.ExpectedMetadata, options.Use, options.Existing, options.Initial, options.CloseIntent)
 	if file == nil {
 		return metastore.OpenResult{}, err
 	}
@@ -37,7 +37,7 @@ func (s *Store) OpenAt(ctx context.Context, name storage.ChildName, options stor
 
 func (s *Store) openAtomicChild(ctx context.Context, name storage.ChildName, kind storage.NodeKind, read, write bool,
 	metadata storage.MetadataPermissions, create, exclusive bool, target storage.ChildCondition,
-	guards *storage.NamespaceGuards, use storage.UseClaim, existing storage.ExistingEffect,
+	guards *storage.NamespaceGuards, expectedMetadata map[string][]byte, use storage.UseClaim, existing storage.ExistingEffect,
 	initial storage.InitialState, closeIntent *storage.CloseIntent,
 ) (*retainedFile, metastore.FileState, storage.OpenOutcome, error) {
 	scope, err := newReferenceScope()
@@ -113,7 +113,7 @@ func (s *Store) openAtomicChild(ctx context.Context, name storage.ChildName, kin
 		if pending {
 			return storage.ErrPendingDelete
 		}
-		return nil
+		return checkExpectedMetadata(before.Metadata, expectedMetadata)
 	}
 	if err := s.inspect(ctx, inspect); err != nil {
 		return nil, metastore.FileState{}, 0, sqlerr.Failure(err)

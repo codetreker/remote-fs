@@ -93,7 +93,7 @@ metadata 键按规范编码排序，每节点最多 16 个 namespace、编码总
 
 | 能力 | 跨角色契约 |
 |---|---|
-| AtomicFileOpener | OpenAt 把父身份、槽位条件、可选观察、创建/清空/替换、初值、Uses 与保留引用作为同一结果 |
+| AtomicFileOpener | OpenAt 把父身份、槽位条件、可选观察、SameNode 的 metadata 版本/缺席条件、创建/清空/替换、初值、Uses 与保留引用作为同一结果 |
 | NamespaceAccess | LookupAt、ReadDirNode/Bounded、MutateName 使用 NodeID 与原始叶名字节；可选 Scope 失效不降成裸身份操作 |
 | NodeReferences、ReferenceStateAccess | 目录/元数据引用没有字节接口，沿同一生命周期；一次捕获返回 Attr、LinkTarget、Detached 与 PendingUnlink |
 | DirectoryMetadataObserver | 在固定 snapshot metadata 权限下捕获完整目录，可选自身名字；不改变公开 ReadEntries |

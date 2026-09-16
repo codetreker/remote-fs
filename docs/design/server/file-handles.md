@@ -67,7 +67,9 @@ ChildName 使用 DirectoryTarget 加 RawLeaf。Scope 存在时核对 exact live 
 
 NamespaceGuards 同时验证实际观察的目录 revision、边与可选 root；精确 FUSE 操作不默认带它。每类 directories/edges 至多 256 项，总 guard 64 KiB；RawLeaf 至多 4096 字节，Scope token 至多 128 字节，TargetUses 至多 16 项。完整目录至多 65536 项及 8 MiB，调用方预算可以更紧；ReadDirNodeBounded 先 Reserve 名字/metadata，再载入变长值，错误使 ListResult.Fail，不返回 prefix。
 
-OpenAt 的 Keep/ResetContent/ReplaceNode 分别保留状态、同身份清空和新身份替换；InitialState 按实际分支应用。原子效果还包括 UseClaim、intent、返回引用与捕获 Attr/Outcome。rename 的 ObservedLeaf/Expected 与 OutputLeaf 分别验证，不能覆盖第三占位者。Remove/RemoveDir 可成功返回空 NameResult；其余命令成功须有捕获 Attr。
+OpenAt 的 Keep/ResetContent/ReplaceNode 分别保留状态、同身份清空和新身份替换；InitialState 按实际分支应用。OpenAtOptions 和 NodeRefOptions 的 ExpectedMetadata 是既有对象上的只读条件：每个 namespace 的空 token 要求缺席，非空 token 要求版本逐字节相等，省略 key 不检查它。非空 map 必须与 SameNode 绑定；Any/Absent 加条件在准入前以 EINVAL 拒绝，按 ID 的 OpenNodeRef 还要求显式 ID 与 SameNode 相符。最多 16 个 namespace，名字至多 128 字节、token 至多 64 字节，沿 FileMutation 的相同校验。原子效果还包括 UseClaim、intent、返回引用与捕获 Attr/Outcome。rename 的 ObservedLeaf/Expected 与 OutputLeaf 分别验证，不能覆盖第三占位者。Remove/RemoveDir 可成功返回空 NameResult；其余命令成功须有捕获 Attr。
+
+原子打开先核对旧目标的条件，最终事务再次核对，然后才改变内容/metadata、登记 Uses、arm CloseIntent 或保留引用。Reset 比较并保留旧 NodeID；Replace 比较被替换的旧对象，新对象的 OnReplace 初值不是条件输入。Keep 和 metadata-only 打开同样不能用过时条件取得 claim/intent。已知版本或缺席不符返回 ErrConditionConflict（EAGAIN）及零结果，没有上述效果；普通打开可以省略条件，目录 revision 也不替代目标 metadata 版本。未知发布和清理失败仍保留原错误/拥有者，不能改类成可重试条件冲突。
 
 OpenResult/NodeOpenResult 在错误时仍可带非 nil 引用，调用方必须关闭它；replicated/HTTP 包装器可以只暴露 cleanup 能力，不能丢掉引用。NameResult.Attr 与错误同返表示效果可能已经发生，取消不能改成可安全重试；已知回滚返回零结果。
 
@@ -123,6 +125,8 @@ HTTP/v4 使用原 file/file-control registry，servedFile 可持有 File 或 Nod
 | Stat/State/Scope/LookupAt/ReadDirNode/metadata 与名字观察等只读 | 当前真实结果，失败不填默认值；不为读取新建通用 receipt |
 | Close/Session.Close | capability 幂等及原 registry cleanup；清理成功后再捕获 barrier；缺失已关闭引用仍保留幂等成功 |
 | 基础路径 Storage API | 原本的单次请求/错误规则，不改造成所有 native 调用都有 RequestID |
+
+打开条件的 namespace/key/token 在 HTTP 保留前按原 owned-copy 规则复制，JSON expectedMetadata 用 base64 字符串表示 token，空字符串表示缺席条件；null、重复键或超界输入拒绝。条件进入原 action 的完整 input digest，同一动作更换版本条件以既有 EINVAL 拒绝；不增加结果字段、独立 receipt 或新授权操作。
 
 直接 Go 调用不隐藏重投未知操作。HTTP 对丢失动作响应使用原请求在有界 recovery context 中核对，未完成恢复时 fence 并退役 session。没有 Create/Truncate 的已有普通文件打开，若 ACK 为带 context.Canceled 的规范 EINTR，且同一能力原始 Close 结果为 nil，才保留无 File 的 EINTR；其余 ACK 不明或清理失败保持 EIO，不撤销已经发生的创建/截断效果。
 

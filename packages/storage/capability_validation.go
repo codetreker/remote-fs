@@ -185,6 +185,12 @@ func (o OpenAtOptions) Check() error {
 	if err := o.Target.Check(); err != nil {
 		return err
 	}
+	if len(o.ExpectedMetadata) != 0 && o.Target.State != SameNode {
+		return syscall.EINVAL
+	}
+	if err := checkMetadataConditions(o.ExpectedMetadata); err != nil {
+		return err
+	}
 	if err := o.Guards.Check(); err != nil {
 		return err
 	}
@@ -213,6 +219,12 @@ func (o NodeRefOptions) Check() error {
 		return err
 	}
 	if err := o.Target.Check(); err != nil {
+		return err
+	}
+	if len(o.ExpectedMetadata) != 0 && o.Target.State != SameNode {
+		return syscall.EINVAL
+	}
+	if err := checkMetadataConditions(o.ExpectedMetadata); err != nil {
 		return err
 	}
 	if err := o.Guards.Check(); err != nil {
@@ -349,13 +361,11 @@ func (c FileMutation) Check() error {
 	if c.ExpectedSize != nil && *c.ExpectedSize < 0 {
 		return syscall.EINVAL
 	}
-	if len(c.ExpectedMetadata) > MaxMetadataNamespaces || len(c.Metadata) > MaxMetadataNamespaces {
-		return syscall.EFBIG
+	if err := checkMetadataConditions(c.ExpectedMetadata); err != nil {
+		return err
 	}
-	for namespace, version := range c.ExpectedMetadata {
-		if err := CheckMetadataUpdate(namespace, version, nil); err != nil {
-			return err
-		}
+	if len(c.Metadata) > MaxMetadataNamespaces {
+		return syscall.EFBIG
 	}
 	initial := make(map[string][]byte, len(c.Metadata))
 	for namespace, value := range c.Metadata {
@@ -428,6 +438,18 @@ func (o OwnerOptions) Check() error {
 	}
 	return nil
 }
+func checkMetadataConditions(expected map[string][]byte) error {
+	if len(expected) > MaxMetadataNamespaces {
+		return syscall.EFBIG
+	}
+	for namespace, version := range expected {
+		if err := CheckMetadataUpdate(namespace, version, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func CheckMetadataUpdate(namespace string, expectedVersion, payload []byte) error {
 	if err := CheckMetadataNamespace(namespace); err != nil {
 		return err

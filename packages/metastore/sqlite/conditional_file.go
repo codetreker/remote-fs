@@ -18,6 +18,23 @@ var _ metastore.ConditionalFileMutation = (*retainedFile)(nil)
 
 func (f *retainedFile) CheckConditionalFileMutation() error { return f.store.CheckFileStore() }
 
+func checkMetadataVersion(metadata map[string]storage.OpaquePayload, namespace string, expected []byte) error {
+	actual, present := metadata[namespace]
+	if present != (len(expected) != 0) || present && !bytes.Equal(actual.Version, expected) {
+		return storage.ErrConditionConflict
+	}
+	return nil
+}
+
+func checkExpectedMetadata(metadata map[string]storage.OpaquePayload, expected map[string][]byte) error {
+	for namespace, version := range expected {
+		if err := checkMetadataVersion(metadata, namespace, version); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (f *retainedFile) checkMutationConditions(ctx context.Context, tx *sql.Tx, state metastore.FileState, command storage.FileMutation) error {
 	if err := f.store.checkNamespaceGuards(ctx, tx, command.Guards); err != nil {
 		return err
@@ -33,20 +50,11 @@ func (f *retainedFile) checkMutationConditions(ctx context.Context, tx *sql.Tx, 
 	if command.ExpectedSize != nil && *command.ExpectedSize != state.Size {
 		return storage.ErrConditionConflict
 	}
-	check := func(namespace string, expected []byte) error {
-		actual, present := state.Metadata[namespace]
-		if present != (len(expected) != 0) || present && !bytes.Equal(actual.Version, expected) {
-			return storage.ErrConditionConflict
-		}
-		return nil
-	}
-	for namespace, expected := range command.ExpectedMetadata {
-		if err := check(namespace, expected); err != nil {
-			return err
-		}
+	if err := checkExpectedMetadata(state.Metadata, command.ExpectedMetadata); err != nil {
+		return err
 	}
 	for namespace, update := range command.Metadata {
-		if err := check(namespace, update.Version); err != nil {
+		if err := checkMetadataVersion(state.Metadata, namespace, update.Version); err != nil {
 			return err
 		}
 	}

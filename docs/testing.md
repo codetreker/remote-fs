@@ -158,6 +158,10 @@ native admission 用例用一个暂停的 Put 占满 Session 唯一的 data slot
 
 [NodeReference 用例](../packages/metastore/sqlite/node_references_test.go)分别验证 metadata 权限、raw leaf 字节、外来/关闭 Scope、真实 DeleteName 自我豁免与原生顺序。FUSE 的[目录/权限用例](../packages/fuse/directory_test.go)和[metadata 用例](../packages/fuse/metadata_test.go)核对目录引用及 posix.permissions.v1；缺席显示默认值不写回，present malformed 不回退，已知 ChangeTime 优先于 Linux 的历史显示投影。
 
+[共享打开条件](../packages/storage/capability_validation_test.go)验证 ExpectedMetadata 的 SameNode 绑定、缺席/二进制 token、16 项与名字/token 边界，并与原 FileMutation 保持同一比较语义。[原子打开](../packages/metastore/sqlite/atomic_open_test.go)和[节点引用](../packages/metastore/sqlite/node_references_test.go)用例暂停客户端观察，在另一会话完成 metadata CAS 后继续打开，核对 stale/absent 条件在内容、metadata、身份、日志、quota、claim/intent 和 pin 生效前拒绝；当前条件则验证 Reset 保留身份、Replace 以旧目标比较且保留旧引用字节。该运行交错发生在客户端观察与打开之间；初步检查和最终事务复用同一比较由源码顺序保证，不宣称在持续持有的 native gate 内插入了并发修改。
+
+[HTTP 条件回归](../packages/transport/httprest/file_capability_http_test.go)通过真实 SQLite 验证 OpenAt/OpenNodeRef/OpenChildRef 的零效果 EAGAIN、紧结果预算拒绝及原子成功。二进制/空 token、重复/null/过大输入和 SameNode 约束分别检查；相同 action 改变条件须返回原 EINVAL，不能按新输入重放。省略 DTO 条件的隔离负向对照必须让三种 stale 打开在预期断言失败，纯 wire 往返不能代替最终 native 拒绝。
+
 [HTTP 能力用例](../packages/transport/httprest/file_capability_http_test.go)将 lost Open/ACK/retryable Close、零/部分结果、最大范围回执和原生输出预算放到真实 httptest 交换中。客户端和服务端上限不同时必须将较小值传到 producer，在 metadata 载入、引用保留或修改之前拒绝；只给真正返回目标收费，不给内部父观察错收费。每个范围的 Commands/Claims/Effects 上限及整个 envelope 在授予前判断。fixture 验证的交换和真实 SQLite-backed 的数据效果分别记录，不能互相冒充。
 
 [能力 decoder](../packages/transport/httprest/file_capabilities_test.go)拒绝不完整观察、丢失 LinkTarget/DirectoryRevision 和错误 capability advertisement；五类中立错误经 wire/journal 仍可由 errors.Is 区分。[部分打开用例](../packages/transport/httprest/file_capability_client_test.go)确保后置 capability/barrier 失败不遗弃可关闭引用，不把发生过效果的取消改成安全重试。

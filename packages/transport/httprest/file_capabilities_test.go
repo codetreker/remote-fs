@@ -278,3 +278,76 @@ func TestWireNodePreservesOpaqueDirectoryTokensAndRequiresLinkFacts(t *testing.T
 		t.Fatal("reference state accepted missing link target")
 	}
 }
+
+func openMetadataRequest(t *testing.T, operation storage.Operation, session string) fileRequest {
+	t.Helper()
+	action, err := storage.NewLockRequestID(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := storage.ChildCondition{State: storage.SameNode, NodeID: 41}
+	conditions := map[string][]byte{"test.attributes": {1, 0, 0xff}, "test.absent": nil}
+	request := fileRequest{Op: operation, Session: session, Action: action, Path: []byte{}, Data: []byte{}, ResultBytes: 1 << 20}
+	if operation == storage.OpFileOpenAt {
+		request.Child = &storage.ChildName{Parent: storage.DirectoryTarget{NodeID: 1}, RawLeaf: []byte("file")}
+		request.OpenAt = openAtOptionsOf(storage.OpenAtOptions{Read: true, Target: target, ExpectedMetadata: conditions, Existing: storage.Keep, Use: storage.UseClaim{Uses: storage.ReadData}})
+	} else {
+		request.NodeRef = nodeRefOptionsOf(storage.NodeRefOptions{Kind: storage.NodeRegular, Target: target, ExpectedMetadata: conditions, MetadataAccess: storage.ReadMetadata})
+		if operation == storage.OpFileOpenNodeRef {
+			request.Node = 41
+		} else {
+			request.Child = &storage.ChildName{Parent: storage.DirectoryTarget{NodeID: 1}, RawLeaf: []byte("file")}
+		}
+	}
+	return request
+}
+
+func requestMetadataConditions(request fileRequest) map[string][]byte {
+	if request.OpenAt != nil {
+		return request.OpenAt.storage().ExpectedMetadata
+	}
+	return request.NodeRef.storage().ExpectedMetadata
+}
+
+func TestOpenMetadataConditionsWirePreservesTokensAndOwnership(t *testing.T) {
+	for _, operation := range []storage.Operation{storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef} {
+		t.Run(string(operation), func(t *testing.T) {
+			request := openMetadataRequest(t, operation, strings.Repeat("a", 64))
+			body, err := json.Marshal(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Contains(body, []byte(`"test.absent":""`)) || bytes.Contains(body, []byte(`"test.absent":null`)) {
+				t.Fatalf("absence token changed: %s", body)
+			}
+			var decoded fileRequest
+			if err := decodeFileJSON(body, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateFileRequest(decoded); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateFileArguments(decoded, storage.DefaultFileSessionOptions()); err != nil {
+				t.Fatal(err)
+			}
+			conditions := requestMetadataConditions(decoded)
+			absent, exists := conditions["test.absent"]
+			if len(conditions) != 2 || !exists || len(absent) != 0 || !bytes.Equal(conditions["test.attributes"], []byte{1, 0, 0xff}) {
+				t.Fatalf("conditions changed: %#v", conditions)
+			}
+		})
+	}
+	original := map[string][]byte{"test.attributes": {1, 2}, "test.absent": nil}
+	file := openAtOptionsOf(storage.OpenAtOptions{ExpectedMetadata: original})
+	node := nodeRefOptionsOf(storage.NodeRefOptions{ExpectedMetadata: original})
+	original["test.attributes"][0] = 9
+	delete(original, "test.absent")
+	for _, copied := range []map[string][]byte{file.ExpectedMetadata, node.ExpectedMetadata} {
+		if !bytes.Equal(copied["test.attributes"], []byte{1, 2}) {
+			t.Fatalf("caller mutation changed copied condition: %#v", copied)
+		}
+		if value, exists := copied["test.absent"]; !exists || value == nil {
+			t.Fatalf("copied absence lost its canonical empty value: %#v", copied)
+		}
+	}
+}

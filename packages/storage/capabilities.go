@@ -211,11 +211,16 @@ type OpenAtOptions struct {
 	Read, Write       bool
 	Create, Exclusive bool
 	Target            ChildCondition
-	Guards            *NamespaceGuards `json:",omitempty"`
-	Use               UseClaim
-	Existing          ExistingEffect
-	Initial           InitialState
-	CloseIntent       *CloseIntent `json:",omitempty"`
+	// ExpectedMetadata checks the existing SameNode target before any open effect
+	// or use admission. Empty tokens require namespace absence; nonempty tokens
+	// require exact version equality. Conflicts return ErrConditionConflict with
+	// no effect. Initial assigns updates independently of these conditions.
+	ExpectedMetadata map[string][]byte `json:",omitempty"`
+	Guards           *NamespaceGuards  `json:",omitempty"`
+	Use              UseClaim
+	Existing         ExistingEffect
+	Initial          InitialState
+	CloseIntent      *CloseIntent `json:",omitempty"`
 }
 
 // A nonnil File transfers cleanup ownership even when OpenAt returns an error.
@@ -233,9 +238,12 @@ const (
 )
 
 type NodeRefOptions struct {
-	Kind              NodeKind
-	Target            ChildCondition
-	Guards            *NamespaceGuards `json:",omitempty"`
+	Kind   NodeKind
+	Target ChildCondition
+	// ExpectedMetadata has the same existing-target, zero-effect conflict
+	// semantics as OpenAtOptions.ExpectedMetadata, including use and intent admission.
+	ExpectedMetadata  map[string][]byte `json:",omitempty"`
+	Guards            *NamespaceGuards  `json:",omitempty"`
 	Use               UseClaim
 	MetadataAccess    MetadataPermissions
 	Create, Exclusive bool

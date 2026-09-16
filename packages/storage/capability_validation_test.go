@@ -280,3 +280,95 @@ func TestConditionalContentCommandsSeparatePredicatesFromEffects(t *testing.T) {
 		t.Fatal("predicate count unbounded")
 	}
 }
+
+func TestOpenMetadataConditionsRequireObservedIdentity(t *testing.T) {
+	for _, target := range []ChildCondition{{State: Any}, {State: Absent}, {State: SameNode, NodeID: 7}} {
+		for _, expected := range []map[string][]byte{nil, {}, {"test.attributes": nil}, {"test.attributes": {0, 0xff, 1}}} {
+			open := OpenAtOptions{Read: true, Create: true, Existing: Keep, Target: target,
+				Use: UseClaim{Uses: ReadData}, ExpectedMetadata: expected}
+			node := NodeRefOptions{Kind: NodeRegular, Create: true, Target: target, ExpectedMetadata: expected}
+			var want error
+			if len(expected) != 0 && target.State != SameNode {
+				want = syscall.EINVAL
+			}
+			for kind, err := range map[string]error{"file": open.Check(), "node": node.Check()} {
+				if !errors.Is(err, want) {
+					t.Fatalf("%s target %+v conditions %v: got %v, want %v", kind, target, expected, err, want)
+				}
+			}
+		}
+	}
+}
+
+func TestMetadataConditionBoundsMatchAcrossAdmissions(t *testing.T) {
+	maximum := make(map[string][]byte, MaxMetadataNamespaces)
+	for i := 0; i < MaxMetadataNamespaces; i++ {
+		maximum[strings.Repeat("x", MaxMetadataNamespaceBytes-i)] = bytes.Repeat([]byte{0xff}, MaxObservationTokenBytes)
+	}
+	tooMany := CloneInitialMetadata(maximum)
+	tooMany["extra"] = nil
+	for _, test := range []struct {
+		name     string
+		expected map[string][]byte
+		want     error
+	}{
+		{name: "maximum", expected: maximum},
+		{name: "absent", expected: map[string][]byte{"test.attributes": nil}},
+		{name: "empty token", expected: map[string][]byte{"test.attributes": {}}},
+		{name: "count", expected: tooMany, want: syscall.EFBIG},
+		{name: "empty namespace", expected: map[string][]byte{"": nil}, want: syscall.EINVAL},
+		{name: "invalid namespace", expected: map[string][]byte{"bad key": nil}, want: syscall.EINVAL},
+		{name: "long namespace", expected: map[string][]byte{strings.Repeat("x", MaxMetadataNamespaceBytes+1): nil}, want: syscall.EINVAL},
+		{name: "long version", expected: map[string][]byte{"test.attributes": make([]byte, MaxObservationTokenBytes+1)}, want: syscall.EINVAL},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			target := ChildCondition{State: SameNode, NodeID: 7}
+			open := OpenAtOptions{Read: true, Existing: Keep, Target: target, Use: UseClaim{Uses: ReadData}, ExpectedMetadata: test.expected}
+			node := NodeRefOptions{Kind: NodeRegular, Target: target, ExpectedMetadata: test.expected}
+			mutation := FileMutation{Kind: MutateAttributes, ExpectedMetadata: test.expected}
+			for kind, err := range map[string]error{"file": open.Check(), "node": node.Check(), "mutation": mutation.Check()} {
+				if !errors.Is(err, test.want) {
+					t.Fatalf("%s: got %v, want %v", kind, err, test.want)
+				}
+			}
+		})
+	}
+}
+
+func TestOpenMetadataConditionsRemainIndependentOfEffects(t *testing.T) {
+	expected := map[string][]byte{"test.attributes": {0, 0xff, 1}, "test.absent": nil}
+	for _, effect := range []ExistingEffect{Keep, ResetContent, ReplaceNode} {
+		open := OpenAtOptions{Read: true, Write: true, Create: true, Existing: effect,
+			Target: ChildCondition{State: SameNode, NodeID: 7}, Use: UseClaim{Uses: ReadData | WriteData | DeleteName},
+			ExpectedMetadata: CloneInitialMetadata(expected), CloseIntent: &CloseIntent{Trigger: OnReferenceClose, Condition: UnlinkFile}}
+		fields := InitialFields{Metadata: map[string][]byte{"test.attributes": []byte("new payload"), "test.absent": []byte("created namespace")}}
+		switch effect {
+		case Keep:
+			open.Initial.OnCreate = fields
+		case ResetContent:
+			open.Initial.OnReset = fields
+		case ReplaceNode:
+			open.Initial.OnReplace = fields
+		}
+		if err := open.Check(); err != nil {
+			t.Fatalf("effect %v: %v", effect, err)
+		}
+		if !bytes.Equal(open.ExpectedMetadata["test.attributes"], expected["test.attributes"]) {
+			t.Fatal("validation rewrote an expected token using initial metadata")
+		}
+		if value, ok := open.ExpectedMetadata["test.absent"]; !ok || value != nil {
+			t.Fatal("validation lost the namespace-absence condition")
+		}
+		open.ExpectedMetadata["test.attributes"][0] = 9
+		delete(open.ExpectedMetadata, "test.absent")
+		if expected["test.attributes"][0] != 0 || len(expected) != 2 {
+			t.Fatal("owned option conditions alias the observed metadata")
+		}
+	}
+	node := NodeRefOptions{Kind: NodeRegular, Target: ChildCondition{State: SameNode, NodeID: 7},
+		ExpectedMetadata: expected, Use: UseClaim{Uses: DeleteName},
+		CloseIntent: &CloseIntent{Trigger: OnReferenceClose, Condition: UnlinkFile}}
+	if err := node.Check(); err != nil {
+		t.Fatalf("metadata-only close-intent admission: %v", err)
+	}
+}
