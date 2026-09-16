@@ -360,7 +360,7 @@ func (s *fileSession) QueryAction(ctx context.Context, id storage.FileActionID) 
 func (s *fileSession) CancelAction(ctx context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
 	ctx, done, err := s.begin(ctx, fileCleanupOperation)
 	if err != nil {
-		return storage.FileActionReceipt{}, err
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
 	}
 	defer done()
 	return s.native.CancelAction(ctx, id)

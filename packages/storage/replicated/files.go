@@ -69,17 +69,12 @@ func (s *Storage) newFileSession(ctx context.Context, options storage.FileSessio
 	stop := context.AfterFunc(s.lifetime, cancel)
 	defer func() { stop(); cancel() }()
 	remoteSession, status, err := remote.NewFileSession(sendCtx, options)
-	if err != nil {
-		return nil, storage.FileSessionStatus{}, err
+	if remoteSession == nil {
+		return nil, status, err
 	}
-	barriers, ok := remoteSession.(httprest.FileSessionWithBarrier)
-	if !ok {
-		cleanup, done := s.fileCleanupContext()
-		defer done()
-		return nil, storage.FileSessionStatus{}, errors.Join(fmt.Errorf("file session has no replication barriers: %w", syscall.EOPNOTSUPP), closeRemoteSession(cleanup, remoteSession, status))
-	}
+	barriers := remoteSession.(httprest.FileSessionWithBarrier)
 	lifetime, stopSession := context.WithCancel(context.Background())
-	session := &fileSession{actionEpoch: status.ActionEpoch, base: s, remote: barriers, lifetime: lifetime, stop: stopSession, changed: make(chan struct{})}
+	session := &fileSession{actionEpoch: status.ActionEpoch, base: s, remote: barriers, lifetime: lifetime, stop: stopSession, changed: make(chan struct{}), closing: err != nil}
 	s.mu.Lock()
 	if s.fileSessions == nil {
 		s.fileSessions = make(map[*fileSession]struct{})
@@ -93,9 +88,13 @@ func (s *Storage) newFileSession(ctx context.Context, options storage.FileSessio
 	if closing {
 		cleanup, done := s.fileCleanupContext()
 		defer done()
-		return nil, storage.FileSessionStatus{}, errors.Join(fmt.Errorf("replicated storage closed while opening a file session: %w", syscall.EIO), session.cleanup(cleanup))
+		failure := errors.Join(err, fmt.Errorf("replicated storage closed while opening a file session: %w", syscall.EIO))
+		if cleanupErr := session.cleanup(cleanup); cleanupErr != nil {
+			return session, status, errors.Join(failure, cleanupErr)
+		}
+		return nil, status, failure
 	}
-	return session, status, nil
+	return session, status, err
 }
 
 func (s *Storage) fileCleanupContext() (context.Context, context.CancelFunc) {
@@ -168,15 +167,6 @@ func (s *Storage) FileState(ctx context.Context) (storage.FileVolumeState, error
 }
 func (s *scopedStorage) FileState(ctx context.Context) (storage.FileVolumeState, error) {
 	return s.base.remote.FileState(ctx)
-}
-
-func closeRemoteSession(ctx context.Context, remote storage.FileSession, status storage.FileSessionStatus) error {
-	action, err := storage.NewFileActionID(status.ActionEpoch)
-	if err != nil {
-		return err
-	}
-	_, err = remote.Close(ctx, action)
-	return err
 }
 
 func (s *fileSession) cleanup(ctx context.Context) error {

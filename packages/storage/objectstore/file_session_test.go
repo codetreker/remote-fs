@@ -405,3 +405,58 @@ func TestTerminalReferenceHistoryPreservesCleanupWithoutConsumingLiveCapacity(t 
 		t.Fatalf("closed-session write=%v", err)
 	}
 }
+
+type cleanupAdmissionProbe struct {
+	metastore.FileSession
+	entered     chan struct{}
+	release     chan struct{}
+	cancelCalls atomic.Int32
+}
+
+func (p *cleanupAdmissionProbe) QueryAction(ctx context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	p.entered <- struct{}{}
+	select {
+	case <-p.release:
+		return storage.FileActionReceipt{Action: id, Operation: storage.OpFileWrite, State: storage.FileActionPending}, nil
+	case <-ctx.Done():
+		return storage.FileActionReceipt{}, ctx.Err()
+	}
+}
+
+func (p *cleanupAdmissionProbe) CancelAction(_ context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	p.cancelCalls.Add(1)
+	return storage.FileActionReceipt{Action: id, Operation: storage.OpFileWrite, State: storage.FileActionNotApplied, Errno: syscall.EINTR}, syscall.EINTR
+}
+
+func TestFileCancellationAdmissionPreservesTheTargetActionState(t *testing.T) {
+	probe := &cleanupAdmissionProbe{entered: make(chan struct{}, 2), release: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(probe.release) })
+	defer release()
+	_, session := sessionFixture(t, &sessionFixtureNative{FileSession: probe, retired: make(chan struct{})})
+	action, err := storage.NewFileActionID(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, err := session.QueryAction(t.Context(), action)
+			finished <- err
+		}()
+		<-probe.entered
+	}
+	receipt, err := session.CancelAction(t.Context(), action)
+	if !errors.Is(err, syscall.EAGAIN) || !storage.IsFileCallNotAdmitted(err) || receipt.State != 0 || receipt.Action != "" || probe.cancelCalls.Load() != 0 {
+		t.Errorf("capacity refusal changed target action: %+v, %v; calls=%d", receipt, err, probe.cancelCalls.Load())
+	}
+	release()
+	for range 2 {
+		if err := <-finished; err != nil {
+			t.Fatal(err)
+		}
+	}
+	receipt, err = session.CancelAction(t.Context(), action)
+	if !errors.Is(err, syscall.EINTR) || storage.IsFileCallNotAdmitted(err) || receipt.Action != action || receipt.State != storage.FileActionNotApplied || receipt.Effects != 0 || probe.cancelCalls.Load() != 1 {
+		t.Fatalf("admitted cancellation lost target result: %+v, %v; calls=%d", receipt, err, probe.cancelCalls.Load())
+	}
+}

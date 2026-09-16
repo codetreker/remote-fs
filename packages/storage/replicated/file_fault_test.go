@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
@@ -26,11 +27,11 @@ type fileReplyFault struct {
 	mu         sync.Mutex
 	op         storage.Operation
 	corrupt    bool
-	actions    []string
+	actions    map[storage.Operation][]string
 }
 
 func (f *fileReplyFault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != httprest.Prefix+string(httprest.OpFile) {
+	if r.URL.Path != httprest.Prefix+string(httprest.OpFile) && r.URL.Path != httprest.Prefix+string(httprest.OpFileControl) {
 		f.underlying.ServeHTTP(w, r)
 		return
 	}
@@ -50,9 +51,10 @@ func (f *fileReplyFault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Lock()
 	intercept, corrupt := request.Op == f.op, f.corrupt
-	if intercept {
-		f.actions = append(f.actions, request.Action)
+	if f.actions == nil {
+		f.actions = make(map[storage.Operation][]string)
 	}
+	f.actions[request.Op] = append(f.actions[request.Op], request.Action)
 	f.mu.Unlock()
 	if !intercept {
 		f.underlying.ServeHTTP(w, r)
@@ -82,6 +84,12 @@ func (f *fileReplyFault) arm(op storage.Operation, corrupt bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.op, f.corrupt, f.actions = op, corrupt, nil
+}
+
+func (f *fileReplyFault) actionsFor(op storage.Operation) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.actions[op]...)
 }
 
 func TestRetainedFailedConfirmationPreservesReferenceOwnership(t *testing.T) {
@@ -141,16 +149,23 @@ func TestRetainedUnknownResponseDoesNotRecommitTheMutation(t *testing.T) {
 	if !errors.Is(err, syscall.EIO) || receipt.State != storage.FileActionUnknown {
 		t.Fatalf("unknown retained mutation returned a confirmed answer: %+v, %v", receipt, err)
 	}
-	fault.mu.Lock()
-	actions := append([]string(nil), fault.actions...)
-	fault.mu.Unlock()
-	if len(actions) != 2 || actions[0] != string(action) || actions[1] != string(action) {
-		t.Fatalf("unknown mutation did not retain one action identity during reconciliation: %v", actions)
+	actions := fault.actionsFor(storage.OpFileWrite)
+	if len(actions) != 1 || actions[0] != string(action) {
+		t.Fatalf("unknown mutation was redispatched: %v", actions)
+	}
+	if queries := fault.actionsFor(storage.OpFileQueryAction); len(queries) != 0 {
+		t.Fatalf("unknown mutation was reconciled implicitly: %v", queries)
 	}
 	fault.arm("", false)
 	recorded, err := session.QueryAction(t.Context(), action)
 	if err != nil || recorded.State != storage.FileActionCompleted || recorded.Effects&storage.EffectContentChanged == 0 || recorded.Observation.Attr.Size != 9 {
 		t.Fatalf("committed action did not preserve its observed effects: %+v, %v", recorded, err)
+	}
+	if queries := fault.actionsFor(storage.OpFileQueryAction); len(queries) != 1 || queries[0] != string(action) {
+		t.Fatalf("explicit reconciliation changed action identity: %v", queries)
+	}
+	if writes := fault.actionsFor(storage.OpFileWrite); len(writes) != 0 {
+		t.Fatalf("explicit reconciliation redispatched the mutation: %v", writes)
 	}
 	if content, err := s.elsewhere.Read(t.Context(), "file"); err != nil || string(content) != "committed" {
 		t.Fatalf("unknown result hid the actual authoritative content: %q, %v", content, err)
@@ -159,16 +174,20 @@ func TestRetainedUnknownResponseDoesNotRecommitTheMutation(t *testing.T) {
 
 func TestRetainedSessionAdmissionAndStorageCleanup(t *testing.T) {
 	s := serve(t, httprest.DefaultLimits())
+	fault := &fileReplyFault{underlying: s.server.Config.Handler}
+	s.server.Config.Handler = fault
 	options := replicated.DefaultOptions()
 	options.MaxFileSessions = 1
 	mounted, _ := mountWithOptions(t, s, options)
 	first, firstEpoch := retainedSession(t, mounted)
-	before := s.calls.of(httprest.OpFile)
+	if opened := fault.actionsFor(storage.OpFileSessionOpen); len(opened) != 1 {
+		t.Fatalf("first session enrollment count = %d", len(opened))
+	}
 	if _, _, err := mounted.NewFileSession(t.Context(), storage.DefaultFileSessionOptions()); !errors.Is(err, syscall.EAGAIN) {
 		t.Fatal("session ownership exceeded its local bound:", err)
 	}
-	if s.calls.of(httprest.OpFile) != before {
-		t.Fatal("a rejected session reached the authority")
+	if opened := fault.actionsFor(storage.OpFileSessionOpen); len(opened) != 1 {
+		t.Fatalf("a rejected session reached authority enrollment: %d opens", len(opened))
 	}
 	if _, err := first.Close(t.Context(), retainedAction(t, firstEpoch)); err != nil {
 		t.Fatal(err)
@@ -310,6 +329,128 @@ func TestRetainedClosingStorageReclaimsAnAlreadyCreatedSession(t *testing.T) {
 		t.Fatal("replica close consumed the shared remote client:", err)
 	}
 	if _, err := shared.Close(t.Context(), retainedAction(t, status.ActionEpoch)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRetainedScopedVolumeStateUsesAuthoritativeFacts(t *testing.T) {
+	s := serve(t, httprest.DefaultLimits())
+	fault := &fileReplyFault{underlying: s.server.Config.Handler}
+	s.server.Config.Handler = fault
+	mounted, _ := mount(t, s)
+	view, err := mounted.Scope(locking.MutationScope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, ok := view.(storage.FileStorage)
+	if !ok {
+		t.Fatal("scoped view lost retained file capability")
+	}
+	want, err := mounted.FileState(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := files.FileState(t.Context())
+	if err != nil || got != want {
+		t.Fatalf("scoped volume state = %+v, %v; want %+v", got, err, want)
+	}
+	fault.arm(storage.OpFileState, true)
+	if state, err := files.FileState(t.Context()); !errors.Is(err, syscall.EIO) || state != (storage.FileVolumeState{}) {
+		t.Fatalf("failed authority returned invented volume facts: %+v, %v", state, err)
+	}
+	if calls := fault.actionsFor(storage.OpFileState); len(calls) != 1 {
+		t.Fatalf("scoped observation did not use authority: %v", calls)
+	}
+	fault.arm("", false)
+	if state, err := files.FileState(t.Context()); err != nil || state != want {
+		t.Fatalf("restored authority = %+v, %v", state, err)
+	}
+}
+
+func TestRetainedExpiredEnrollmentPreservesCleanupOwnership(t *testing.T) {
+	s := serve(t, httprest.DefaultLimits())
+	underlying := s.server.Config.Handler
+	reported := make(chan storage.FileSessionStatus, 1)
+	var delay atomic.Bool
+	delay.Store(true)
+	delayed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != httprest.Prefix+string(httprest.OpFile) {
+			underlying.ServeHTTP(w, r)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		var request struct{ Op storage.Operation }
+		if err := json.Unmarshal(body, &request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if request.Op != storage.OpFileSessionOpen || !delay.CompareAndSwap(true, false) {
+			underlying.ServeHTTP(w, r)
+			return
+		}
+		response := httptest.NewRecorder()
+		underlying.ServeHTTP(response, r)
+		var answer struct{ Status storage.FileSessionStatus }
+		if err := json.Unmarshal(response.Body.Bytes(), &answer); err != nil || answer.Status.Remaining <= 0 {
+			http.Error(w, "enrollment did not return a live session", http.StatusBadGateway)
+			return
+		}
+		reported <- answer.Status
+		timer := time.NewTimer(answer.Status.Remaining + time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-r.Context().Done():
+			return
+		}
+		for name, values := range response.Header() {
+			w.Header()[name] = append([]string(nil), values...)
+		}
+		w.WriteHeader(response.Code)
+		_, _ = w.Write(response.Body.Bytes())
+	})
+	fault := &fileReplyFault{underlying: delayed}
+	s.server.Config.Handler = fault
+	limits := replicated.DefaultOptions()
+	limits.MaxFileSessions = 1
+	mounted, _ := mountWithOptions(t, s, limits)
+	options := storage.DefaultFileSessionOptions()
+	options.Lease = 100 * time.Millisecond
+	session, status, err := mounted.NewFileSession(t.Context(), options)
+	if !errors.Is(err, syscall.EIO) || session == nil || status.ActionEpoch == 0 || status.Remaining != 0 {
+		t.Fatalf("elapsed enrollment lost cleanup ownership: %v, %+v, %v", session, status, err)
+	}
+	original := <-reported
+	if status.ActionEpoch != original.ActionEpoch || status.Epoch != original.Epoch || status.HistoryRemaining <= 0 {
+		t.Fatalf("elapsed enrollment changed ownership status: %+v; original %+v", status, original)
+	}
+	if _, err := session.StatNode(t.Context(), 1, storage.ObservationOptions{}); !errors.Is(err, syscall.ESTALE) || len(fault.actionsFor(storage.OpFileStatNode)) != 0 {
+		t.Fatalf("partial enrollment admitted data access: %v", err)
+	}
+	if _, _, err := mounted.NewFileSession(t.Context(), storage.DefaultFileSessionOptions()); !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("partial session was not counted in local ownership: %v", err)
+	}
+	action := retainedAction(t, status.ActionEpoch)
+	first, err := session.Close(t.Context(), action)
+	if err != nil || first.State != storage.FileActionCompleted && first.State != storage.FileActionRetired {
+		t.Fatalf("partial enrollment cleanup = %+v, %v", first, err)
+	}
+	if _, err := session.Close(t.Context(), action); err != nil {
+		t.Fatalf("cleanup replay = %v", err)
+	}
+	if calls := fault.actionsFor(storage.OpFileSessionClose); len(calls) != 1 || calls[0] != string(action) {
+		t.Fatalf("cleanup did not preserve exactly one action: %v", calls)
+	}
+	next, nextStatus, err := mounted.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil || next == nil {
+		t.Fatalf("cleanup did not release local enrollment capacity: %v", err)
+	}
+	if _, err := next.Close(t.Context(), retainedAction(t, nextStatus.ActionEpoch)); err != nil {
 		t.Fatal(err)
 	}
 }
