@@ -4,6 +4,7 @@ package windows
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -212,7 +213,7 @@ func cacheGateAwaitNotify(t *testing.T, trace *cacheGateTrace) {
 	}
 }
 
-func cacheGateAwaitMissing(t *testing.T, trace *cacheGateTrace, after uint64) {
+func cacheGateAwaitMissingName(t *testing.T, trace *cacheGateTrace, after uint64, name string) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for {
@@ -228,7 +229,7 @@ func cacheGateAwaitMissing(t *testing.T, trace *cacheGateTrace, after uint64) {
 			if err := json.Unmarshal(event.Fields, &request); err != nil {
 				t.Fatal(err)
 			}
-			if request.Sequence > after && strings.EqualFold(strings.TrimPrefix(request.Name, `\`), "new.bin") {
+			if request.Sequence > after && strings.EqualFold(strings.TrimPrefix(request.Name, `\`), name) {
 				requests[request.MessageID] = true
 			}
 		}
@@ -254,6 +255,10 @@ func cacheGateAwaitMissing(t *testing.T, trace *cacheGateTrace, after uint64) {
 
 func TestNativeNegativeNameCacheGate(t *testing.T) {
 	variant := os.Getenv("RFS_GATE_VARIANT")
+	if variant == "owned_nested" || variant == "owned_lifecycle" || variant == "owned_outage" {
+		cacheGateOwnedScenario(t, variant)
+		return
+	}
 	if variant != "baseline" && variant != "held_parent" && variant != "notify_parent" {
 		t.Fatalf("invalid gate variant %q", variant)
 	}
@@ -347,7 +352,7 @@ func TestNativeNegativeNameCacheGate(t *testing.T) {
 		t.Fatalf("initial negative lookup: %v", err)
 	}
 	cacheGateObserve("negative_lookup_completed", nil)
-	cacheGateAwaitMissing(t, trace, beforeNegative)
+	cacheGateAwaitMissingName(t, trace, beforeNegative, "new.bin")
 	beforeFresh := bridge.wire.createSequence.Load()
 	cacheGateObserve("remote_create_started", nil)
 	_, _ = nativeRemoteOpen(t, bridge.remote, "new.bin", storage.NodeRegular, true)
@@ -408,5 +413,503 @@ func TestNativeNegativeNameCacheGate(t *testing.T) {
 	}
 	if watch != nil && !watch.observed {
 		t.Fatal("the admitted directory watcher delivered no matching creation notification")
+	}
+}
+
+type cacheGatePause struct {
+	reached chan struct{}
+	resume  chan struct{}
+	once    sync.Once
+}
+
+func (p *cacheGatePause) release() { p.once.Do(func() { close(p.resume) }) }
+
+type cacheGateOwnedIO struct {
+	event   win.Handle
+	overlap win.Overlapped
+	buffer  []byte
+}
+
+// The client owner drives notifications independently of application Stat calls.
+// The injected pause models a slow rearm without closing the directory handle.
+type cacheGateOwnedWatcher struct {
+	file         *nativeHandle
+	mu           sync.Mutex
+	current      *cacheGateOwnedIO
+	closing      bool
+	failure      error
+	cleanupError error
+	pause        *cacheGatePause
+	stop         chan struct{}
+	done         chan struct{}
+}
+
+func cacheGateStartOwned(t *testing.T, bridge *nativeBridge, trace *cacheGateTrace) *cacheGateOwnedWatcher {
+	t.Helper()
+	file := cacheGateDirectory(t, `\\127.0.0.1\`+bridge.share)
+	w := &cacheGateOwnedWatcher{file: file, stop: make(chan struct{}), done: make(chan struct{})}
+	go w.run()
+	t.Cleanup(func() {
+		if err := w.close(); err != nil {
+			t.Error(err)
+		}
+		if err := file.close(); err != nil {
+			t.Error(err)
+		}
+	})
+	cacheGateAwaitNotify(t, trace)
+	cacheGateObserve("owned_client_ready", nil)
+	return w
+}
+
+func (w *cacheGateOwnedWatcher) close() error {
+	w.mu.Lock()
+	if !w.closing {
+		w.closing = true
+		close(w.stop)
+		if w.current != nil {
+			if err := win.CancelIoEx(w.file.value, &w.current.overlap); err != nil && !errors.Is(err, win.ERROR_NOT_FOUND) {
+				w.cleanupError = err
+				cacheGateObserve("owned_cancel_error", map[string]string{"error": err.Error()})
+			}
+		}
+	}
+	w.mu.Unlock()
+	<-w.done
+	cacheGateObserve("owned_client_stopped", nil)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.cleanupError
+}
+
+func (w *cacheGateOwnedWatcher) fail(err error) {
+	w.mu.Lock()
+	if !w.closing {
+		w.failure = err
+		cacheGateObserve("owned_watch_failed", map[string]string{"error": err.Error()})
+	}
+	w.mu.Unlock()
+}
+
+func (w *cacheGateOwnedWatcher) closeEvent(event win.Handle) error {
+	err := win.CloseHandle(event)
+	if err != nil {
+		w.mu.Lock()
+		w.cleanupError = errors.Join(w.cleanupError, err)
+		w.mu.Unlock()
+	}
+	return err
+}
+
+func (w *cacheGateOwnedWatcher) pauseAfterNext(t *testing.T) *cacheGatePause {
+	t.Helper()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.pause != nil || w.closing || w.failure != nil {
+		t.Fatal("watcher cannot accept the rearm pause")
+	}
+	p := &cacheGatePause{reached: make(chan struct{}), resume: make(chan struct{})}
+	w.pause = p
+	t.Cleanup(p.release)
+	return p
+}
+
+func (w *cacheGateOwnedWatcher) run() {
+	defer close(w.done)
+	for {
+		event, err := win.CreateEvent(nil, 1, 0, nil)
+		if err != nil {
+			w.fail(err)
+			return
+		}
+		op := &cacheGateOwnedIO{event: event, buffer: make([]byte, 64<<10)}
+		op.overlap.HEvent = event
+		w.mu.Lock()
+		if w.closing {
+			w.mu.Unlock()
+			_ = w.closeEvent(event)
+			return
+		}
+		w.current = op
+		err = win.ReadDirectoryChanges(w.file.value, &op.buffer[0], uint32(len(op.buffer)), true, win.FILE_NOTIFY_CHANGE_FILE_NAME|win.FILE_NOTIFY_CHANGE_DIR_NAME, nil, &op.overlap, 0)
+		w.mu.Unlock()
+		if err != nil && !errors.Is(err, win.ERROR_IO_PENDING) {
+			w.mu.Lock()
+			w.current = nil
+			w.mu.Unlock()
+			_ = w.closeEvent(event)
+			w.fail(err)
+			return
+		}
+		cacheGateObserve("owned_notify_issued", nil)
+		var count uint32
+		err = win.GetOverlappedResult(w.file.value, &op.overlap, &count, true)
+		w.mu.Lock()
+		w.current = nil
+		closing := w.closing
+		pause := w.pause
+		w.pause = nil
+		w.mu.Unlock()
+		closeErr := w.closeEvent(event)
+		if closing {
+			w.mu.Lock()
+			if err != nil && !errors.Is(err, win.ERROR_OPERATION_ABORTED) {
+				w.cleanupError = errors.Join(w.cleanupError, err)
+			}
+			w.mu.Unlock()
+			runtime.KeepAlive(op)
+			return
+		}
+		if err != nil || closeErr != nil {
+			w.fail(errors.Join(err, closeErr))
+			return
+		}
+		if count == 0 || count > uint32(len(op.buffer)) {
+			w.fail(errors.New("native watcher lost event detail"))
+			return
+		}
+		if err := cacheGateDecodeOwned(op.buffer[:count]); err != nil {
+			w.fail(err)
+			return
+		}
+		runtime.KeepAlive(op)
+		if pause != nil {
+			cacheGateObserve("owned_rearm_paused", nil)
+			close(pause.reached)
+			select {
+			case <-pause.resume:
+			case <-w.stop:
+				return
+			}
+			cacheGateObserve("owned_rearm_resumed", nil)
+		}
+	}
+}
+
+func cacheGateDecodeOwned(data []byte) error {
+	for len(data) > 0 {
+		if len(data) < 12 {
+			return errors.New("short native notification")
+		}
+		next := binary.LittleEndian.Uint32(data)
+		action := binary.LittleEndian.Uint32(data[4:8])
+		length := binary.LittleEndian.Uint32(data[8:12])
+		if length&1 != 0 || uint64(length)+12 > uint64(len(data)) {
+			return errors.New("invalid native notification name")
+		}
+		words := make([]uint16, length/2)
+		for i := range words {
+			words[i] = binary.LittleEndian.Uint16(data[12+2*i:])
+		}
+		cacheGateObserve("owned_notify_completed", map[string]any{"action": action, "name": string(utf16.Decode(words))})
+		if next == 0 {
+			return nil
+		}
+		if next < 12 || next&3 != 0 || uint64(next) > uint64(len(data)) {
+			return errors.New("invalid native notification chain")
+		}
+		data = data[next:]
+	}
+	return nil
+}
+
+type cacheGateOwnedCheck struct {
+	Name               string
+	NegativeStarted    time.Time
+	EarliestExpiry     time.Time
+	WriterAcknowledged time.Time
+	VisibleAt          time.Time
+	BeforeFresh        uint64
+	Attempts           int
+	FreshQueries       int
+}
+
+type cacheGateOwnedProbe struct {
+	bridge *nativeBridge
+	trace  *cacheGateTrace
+	ttl    time.Duration
+	checks []*cacheGateOwnedCheck
+}
+
+func (p *cacheGateOwnedProbe) prime(t *testing.T, name string) *cacheGateOwnedCheck {
+	t.Helper()
+	check := &cacheGateOwnedCheck{Name: name, NegativeStarted: time.Now()}
+	check.EarliestExpiry = check.NegativeStarted.Add(p.ttl)
+	p.checks = append(p.checks, check)
+	before := p.bridge.wire.createSequence.Load()
+	cacheGateObserve("negative_lookup_started", map[string]string{"name": name})
+	if _, err := os.Stat(filepath.Join(p.bridge.path+`\`, name)); !os.IsNotExist(err) {
+		t.Fatalf("initial negative lookup %s: %v", name, err)
+	}
+	cacheGateAwaitMissingName(t, p.trace, before, name)
+	check.BeforeFresh = p.bridge.wire.createSequence.Load()
+	return check
+}
+
+func (p *cacheGateOwnedProbe) acknowledged(t *testing.T, check *cacheGateOwnedCheck) {
+	t.Helper()
+	check.WriterAcknowledged = time.Now()
+	cacheGateObserve("remote_create_acknowledged", map[string]string{"name": check.Name})
+	if !check.WriterAcknowledged.Before(check.EarliestExpiry) {
+		t.Fatal("writer ACK exceeded earliest cache expiry; diagnostic inconclusive")
+	}
+}
+
+func (p *cacheGateOwnedProbe) visible(t *testing.T, check *cacheGateOwnedCheck) {
+	t.Helper()
+	deadline := check.WriterAcknowledged.Add(time.Second)
+	for {
+		check.Attempts++
+		_, err := os.Stat(filepath.Join(p.bridge.path+`\`, check.Name))
+		completed := time.Now()
+		cacheGateObserve("lookup_completed", map[string]any{"name": check.Name, "attempt": check.Attempts, "exists": err == nil, "missing": os.IsNotExist(err)})
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("lookup %s: %v", check.Name, err)
+		}
+		if err == nil {
+			check.VisibleAt = completed
+			break
+		}
+		if !completed.Before(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	p.trace.mu.Lock()
+	events := append([]cacheGateEvent(nil), p.trace.events...)
+	p.trace.mu.Unlock()
+	for _, event := range events {
+		if event.Kind != "smb_creates" {
+			continue
+		}
+		var request nativeCreateObservation
+		if err := json.Unmarshal(event.Fields, &request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Sequence > check.BeforeFresh && strings.EqualFold(strings.TrimPrefix(request.Name, `\`), check.Name) {
+			check.FreshQueries++
+		}
+	}
+	if check.VisibleAt.IsZero() || check.VisibleAt.After(deadline) {
+		t.Fatalf("%s was not visible within one second of writer ACK", check.Name)
+	}
+	if !check.VisibleAt.Before(check.EarliestExpiry) {
+		t.Fatalf("%s visibility did not precede possible cache expiry", check.Name)
+	}
+	if check.FreshQueries == 0 {
+		t.Fatalf("%s had no fresh authoritative CREATE", check.Name)
+	}
+}
+
+func cacheGateOwnedScenario(t *testing.T, variant string) {
+	output := os.Getenv("RFS_GATE_OUTPUT_ROOT")
+	ttl, err := strconv.ParseUint(os.Getenv("RFS_GATE_MIN_CACHE_TTL"), 10, 32)
+	if output == "" || err != nil || ttl <= 1 {
+		t.Fatal("receipt directory and verified cache TTL above one second are required")
+	}
+	p := &cacheGateOwnedProbe{trace: &cacheGateTrace{}, ttl: time.Duration(ttl) * time.Second}
+	cacheGateActive.Store(p.trace)
+	t.Cleanup(func() {
+		cacheGateActive.Store(nil)
+		p.trace.mu.Lock()
+		events := append([]cacheGateEvent(nil), p.trace.events...)
+		overflow, encodingErr := p.trace.overflow, p.trace.encodingError
+		p.trace.mu.Unlock()
+		if overflow || encodingErr != nil {
+			t.Errorf("incomplete bounded trace: overflow=%v error=%v", overflow, encodingErr)
+		}
+		report := map[string]any{"evidence_kind": "pinned prototype diagnostic; not PR implementation acceptance", "fixture_sha": os.Getenv("RFS_GATE_FIXTURE_SHA"), "gate_sha": os.Getenv("GITHUB_SHA"), "variant": variant, "checks": p.checks, "test_failed": t.Failed(), "trace_overflow": overflow, "events": events}
+		if p.bridge != nil {
+			report["final_server_status"] = p.bridge.smb.Status()
+			report["final_backend_references"] = p.bridge.backend.openReferences()
+			report["owned_mapping"] = map[string]string{"local": p.bridge.path, "remote": `\\127.0.0.1\` + p.bridge.share}
+		}
+		encoded, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.WriteFile(filepath.Join(output, "receipt.json"), encoded, 0600); err != nil {
+			t.Error(err)
+		}
+		t.Logf("GATE_RESULT variant=%s failed=%v checks=%d", variant, t.Failed(), len(p.checks))
+	})
+	sid, err := CurrentUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := AllowSID(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.bridge = nativeBridgeFixture(t, policy)
+	if err := p.bridge.mapDrive(t); err != nil {
+		t.Fatal(err)
+	}
+	cacheGateObserve("mapping_ready", map[string]any{"variant": variant, "port": p.bridge.port})
+	warm := nativeOpen(t, filepath.Join(p.bridge.path+`\`, "live.bin"), win.CREATE_ALWAYS)
+	if _, err := nativeTransfer(warm, []byte("warm"), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := warm.close(); err != nil {
+		t.Fatal(err)
+	}
+	p.bridge.assertCacheContract(t)
+	session, root := nativeRemoteOpen(t, p.bridge.remote, "", storage.NodeDirectory, false)
+	nested := nativeRemoteCreateAt(t, session, root, "nested", storage.NodeDirectory)
+	deep := nativeRemoteCreateAt(t, session, nested, "deep", storage.NodeDirectory)
+	w := cacheGateStartOwned(t, p.bridge, p.trace)
+	switch variant {
+	case "owned_nested":
+		cacheGateOwnedNested(t, p, w, session, deep)
+	case "owned_lifecycle":
+		cacheGateOwnedLifecycle(t, p, w, session, root)
+	case "owned_outage":
+		cacheGateOwnedOutage(t, p, w)
+	default:
+		t.Fatal("invalid owned variant")
+	}
+	p.bridge.assertCacheContract(t)
+}
+
+func cacheGateOwnedNested(t *testing.T, p *cacheGateOwnedProbe, w *cacheGateOwnedWatcher, session storage.FileSession, parent storage.File) {
+	first := p.prime(t, `nested\deep\first.bin`)
+	pause := w.pauseAfterNext(t)
+	_ = nativeRemoteCreateAt(t, session, parent, "first.bin", storage.NodeRegular)
+	p.acknowledged(t, first)
+	p.visible(t, first)
+	select {
+	case <-pause.reached:
+	case <-time.After(time.Second):
+		t.Fatal("watcher did not enter controlled rearm gap")
+	}
+	gap := p.prime(t, `nested\deep\gap.bin`)
+	_ = nativeRemoteCreateAt(t, session, parent, "gap.bin", storage.NodeRegular)
+	p.acknowledged(t, gap)
+	time.Sleep(100 * time.Millisecond)
+	pause.release()
+	p.visible(t, gap)
+	burst := make([]*cacheGateOwnedCheck, 8)
+	for i := range burst {
+		burst[i] = p.prime(t, fmt.Sprintf(`nested\deep\burst-%d.bin`, i))
+	}
+	for i, check := range burst {
+		_ = nativeRemoteCreateAt(t, session, parent, fmt.Sprintf("burst-%d.bin", i), storage.NodeRegular)
+		p.acknowledged(t, check)
+	}
+	for _, check := range burst {
+		p.visible(t, check)
+	}
+	p.notifications(t)
+	w.mu.Lock()
+	failure := w.failure
+	w.mu.Unlock()
+	if failure != nil {
+		t.Fatalf("owned recursive watcher failed: %v", failure)
+	}
+}
+
+func cacheGateOwnedLifecycle(t *testing.T, p *cacheGateOwnedProbe, w *cacheGateOwnedWatcher, session storage.FileSession, parent storage.File) {
+	app := nativeOpen(t, filepath.Join(p.bridge.path+`\`, "app.bin"), win.CREATE_ALWAYS)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err := p.bridge.mapping.Unmount(ctx)
+	cacheGateObserve("owned_busy_unmount", map[string]any{"busy": errors.Is(err, ErrMappingBusy), "error": fmt.Sprint(err)})
+	if !errors.Is(err, ErrMappingBusy) {
+		t.Fatalf("unmount with application handle: %v", err)
+	}
+	check := p.prime(t, "after-busy.bin")
+	_ = nativeRemoteCreateAt(t, session, parent, "after-busy.bin", storage.NodeRegular)
+	p.acknowledged(t, check)
+	p.visible(t, check)
+	p.notifications(t)
+	w.mu.Lock()
+	failure := w.failure
+	w.mu.Unlock()
+	if failure != nil {
+		t.Fatalf("owned watcher failed across busy unmount: %v", failure)
+	}
+	if err := app.close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx2, cancel2 := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel2()
+	err = p.bridge.mapping.Unmount(ctx2)
+	cacheGateObserve("owned_internal_watch_unmount", map[string]any{"success": err == nil, "error": fmt.Sprint(err)})
+	if err != nil {
+		t.Fatalf("normal unmount with only client-owned UNC watcher: %v", err)
+	}
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.file.close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func cacheGateOwnedOutage(t *testing.T, p *cacheGateOwnedProbe, w *cacheGateOwnedWatcher) {
+	check := p.prime(t, "outage-missing.bin")
+	p.bridge.gate.down.Store(true)
+	p.bridge.http.CloseClientConnections()
+	t.Cleanup(func() { p.bridge.gate.down.Store(false) })
+	cacheGateObserve("authority_outage_started", nil)
+	select {
+	case <-w.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("owned watcher did not report the HTTP/SSE outage")
+	}
+	w.mu.Lock()
+	failure := w.failure
+	w.mu.Unlock()
+	if failure == nil {
+		t.Fatal("watcher stopped without surfacing the outage")
+	}
+	_, err := os.Stat(filepath.Join(p.bridge.path+`\`, check.Name))
+	observed := time.Now()
+	cacheGateObserve("outage_negative_lookup", map[string]any{"missing": os.IsNotExist(err), "error": fmt.Sprint(err), "before_cache_expiry": observed.Before(check.EarliestExpiry)})
+	if !observed.Before(check.EarliestExpiry) {
+		t.Fatal("outage probe reached possible cache expiry; diagnostic inconclusive")
+	}
+	if err == nil || os.IsNotExist(err) {
+		t.Fatalf("outage returned plausible cached absence instead of an unavailable error: %v", err)
+	}
+}
+
+func (p *cacheGateOwnedProbe) notifications(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		seen := make(map[string]bool)
+		p.trace.mu.Lock()
+		events := append([]cacheGateEvent(nil), p.trace.events...)
+		p.trace.mu.Unlock()
+		for _, event := range events {
+			if event.Kind != "owned_notify_completed" {
+				continue
+			}
+			var notice struct {
+				Action uint32
+				Name   string
+			}
+			if err := json.Unmarshal(event.Fields, &notice); err != nil {
+				t.Fatal(err)
+			}
+			if notice.Action == win.FILE_ACTION_ADDED {
+				seen[strings.ToLower(notice.Name)] = true
+			}
+		}
+		missing := make([]string, 0)
+		for _, check := range p.checks {
+			if !seen[strings.ToLower(check.Name)] {
+				missing = append(missing, check.Name)
+			}
+		}
+		if len(missing) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("owned recursive watcher omitted creation notifications: %v", missing)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
