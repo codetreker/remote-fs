@@ -396,3 +396,27 @@ func TestGatePositiveWireIncompleteNetworkOpenBufferResults(t *testing.T) {
 		}
 	}
 }
+
+func cacheGateCompleteProofFixture(t *testing.T, proof func(*testing.T)) bool {
+	t.Helper()
+	return t.Run("completed_protocol_proof_fixture", proof)
+}
+
+func TestGateProofCleanupPrecedesMeasuredFixture(t *testing.T) {
+	active := false
+	closed := false
+	if !cacheGateCompleteProofFixture(t, func(t *testing.T) {
+		active = true
+		t.Cleanup(func() { active = false; closed = true })
+	}) {
+		t.Fatal("proof setup failed")
+	}
+	if active || !closed {
+		t.Fatal("measured fixture could overlap proof ownership")
+	}
+	active = true
+	if !closed {
+		t.Fatal("proof cleanup was deferred into measurement")
+	}
+	active = false
+}

@@ -54,6 +54,7 @@ type cacheGatePositiveFirst struct {
 
 type cacheGatePositiveCell struct {
 	postDeadline            bool
+	noLeasing               bool
 	PostDeadline            *cacheGatePostDeadlineResult
 	ExposureSource          cacheGatePositiveWireRecord
 	IOModel                 string
@@ -451,6 +452,8 @@ func cacheGatePositiveSizeCell(t *testing.T, p *cacheGatePositiveCell, bridge *n
 		cacheGatePositiveSeek(t, h, 0)
 	}
 	if p.postDeadline {
+		cacheGatePositiveExposure(t, p)
+		cacheGateWitnessNegotiation(t, bridge, p.noLeasing)
 		cacheGatePostDeadlineIdle(t)
 	}
 	action := nativeAction(t, session)
@@ -682,6 +685,10 @@ func cacheGatePositiveScenario(t *testing.T, variant string) {
 	if postDeadline {
 		mode = strings.TrimPrefix(variant, "positive_postdeadline_")
 	}
+	noLeasing := strings.HasPrefix(mode, "noleasing_")
+	if noLeasing {
+		mode = strings.TrimPrefix(mode, "noleasing_")
+	}
 	if mode != "unheld" && mode != "exclusive" {
 		t.Fatal("invalid positive-cache mode")
 	}
@@ -697,6 +704,10 @@ func cacheGatePositiveScenario(t *testing.T, variant string) {
 			report["within_one_second_proven"] = false
 			report["contract_result"] = "see witness classification; a current late sample is inconclusive"
 		}
+		if noLeasing {
+			report["negotiation_policy"] = "unsupported leasing; no cache grants"
+			report["no_leasing_overlay_sha"] = os.Getenv("RFS_GATE_NO_LEASING_SHA")
+		}
 		data, err := json.MarshalIndent(report, "", "  ")
 		if err != nil {
 			t.Error(err)
@@ -706,12 +717,15 @@ func cacheGatePositiveScenario(t *testing.T, variant string) {
 			t.Error(err)
 		}
 	})
+	if postDeadline && !cacheGateRunProtocolProof(t, noLeasing) {
+		t.Fatal("protocol proof fixture did not complete cleanly")
+	}
 	for _, name := range cells {
 		verdicts[name] = t.Run(name, func(t *testing.T) {
 			trace := &cacheGateTrace{}
 			cacheGateActive.Store(trace)
 			cacheGateResetPositiveWire()
-			cell := &cacheGatePositiveCell{Name: name, Mode: mode, IOModel: "synchronous", postDeadline: postDeadline}
+			cell := &cacheGatePositiveCell{Name: name, Mode: mode, IOModel: "synchronous", postDeadline: postDeadline, noLeasing: noLeasing}
 			if postDeadline {
 				cell.IOModel = "path-only"
 			}
@@ -730,6 +744,10 @@ func cacheGatePositiveScenario(t *testing.T, variant string) {
 				records, incomplete := cacheGatePositiveWireSnapshot()
 				evidenceValid := !incomplete
 				for _, r := range records {
+					if noLeasing && r.Response && r.Command == 5 && (r.Oplock != 0 || r.LeasePresent || r.LeaseState != 0) {
+						evidenceValid = false
+						t.Error("unsupported-leasing experiment returned an oplock or lease context")
+					}
 					if r.Command == 15 {
 						evidenceValid = false
 						t.Error("positive no-watcher probe issued CHANGE_NOTIFY")
@@ -794,14 +812,21 @@ func cacheGatePositiveScenario(t *testing.T, variant string) {
 			if err := bridge.mapDrive(t); err != nil {
 				t.Fatal(err)
 			}
-			proof := nativeOpen(t, filepath.Join(bridge.path+`\`, "lease-proof.bin"), win.CREATE_ALWAYS)
-			if n, err := nativeTransfer(proof, []byte{1}, true); err != nil || n != 1 {
-				t.Fatalf("exercise zero-rights lease: n=%d error=%v", n, err)
+			if !postDeadline {
+				proof := nativeOpen(t, filepath.Join(bridge.path+`\`, "lease-proof.bin"), win.CREATE_ALWAYS)
+				if n, err := nativeTransfer(proof, []byte{1}, true); err != nil || n != 1 {
+					t.Fatalf("exercise zero-rights lease: n=%d error=%v", n, err)
+				}
+				if noLeasing {
+					cacheGateAssertNoLeasing(t, bridge)
+				} else {
+					bridge.assertCacheContract(t)
+				}
+				if err := proof.close(); err != nil {
+					t.Fatal(err)
+				}
 			}
-			bridge.assertCacheContract(t)
-			if err := proof.close(); err != nil {
-				t.Fatal(err)
-			}
+
 			if mode == "exclusive" {
 				root, err := cacheGateSharingOpen(t, bridge.path+`\`, win.FILE_LIST_DIRECTORY, 0, true)
 				if err != nil {
@@ -811,7 +836,9 @@ func cacheGatePositiveScenario(t *testing.T, variant string) {
 					t.Fatal("exclusive root handle absent")
 				}
 			}
-			cacheGatePositiveExposure(t, cell)
+			if !postDeadline {
+				cacheGatePositiveExposure(t, cell)
+			}
 			if postDeadline {
 				cacheGatePositiveSizeCell(t, cell, bridge, "path", "grow")
 				return
@@ -922,6 +949,7 @@ func cacheGatePositiveExposure(t *testing.T, p *cacheGatePositiveCell) {
 }
 
 type cacheGatePostDeadlineResult struct {
+	InvalidationReasons   []string               `json:"invalidation_reasons"`
 	Classification        string                 `json:"classification"`
 	ContractResult        string                 `json:"contract_result"`
 	WithinOneSecondProven bool                   `json:"within_one_second_proven"`
@@ -937,11 +965,17 @@ type cacheGatePostDeadlineResult struct {
 
 func cacheGatePostDeadlineIdle(t *testing.T) {
 	t.Helper()
+	if err := cacheGatePostDeadlineWaitIdle(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func cacheGatePostDeadlineWaitIdle() error {
 	deadline := time.Now().Add(200 * time.Millisecond)
 	for {
 		records, incomplete := cacheGatePositiveWireSnapshot()
 		if incomplete {
-			t.Fatal("post-deadline witness has incomplete setup trace")
+			return errors.New("post-deadline witness has incomplete trace")
 		}
 		pending := map[[2]uint64]bool{}
 		for _, record := range records {
@@ -958,10 +992,10 @@ func cacheGatePostDeadlineIdle(t *testing.T) {
 			}
 		}
 		if len(pending) == 0 {
-			return
+			return nil
 		}
 		if !time.Now().Before(deadline) {
-			t.Fatal("native warm-up still has outstanding SMB operations")
+			return errors.New("native SMB operations remained outstanding")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -973,7 +1007,7 @@ func cacheGatePostDeadlineObserve(t *testing.T, p *cacheGatePositiveCell, path s
 	p.PostDeadline = result
 	due := ack.Add(1100 * time.Millisecond)
 	if !due.Before(p.EarliestExpiry) {
-		t.Fatal("post-deadline witness has no pre-expiry observation window")
+		result.InvalidationReasons = append(result.InvalidationReasons, "no pre-expiry observation window")
 	}
 	timer := time.NewTimer(time.Until(due))
 	defer timer.Stop()
@@ -984,19 +1018,22 @@ func cacheGatePostDeadlineObserve(t *testing.T, p *cacheGatePositiveCell, path s
 	}
 	first := p.record(cacheGatePositivePath(path))
 	result.Native = first
+	result.MatchesWarmTuple = first.Size == warmed.Size && first.MTime == cacheGatePositiveTime(warmed.ModTime)
 	result.StartMinusAckNS = int64(first.Started.Sub(ack))
 	result.CompletionMinusAckNS = int64(first.Completed.Sub(ack))
 	if !first.Started.After(ack.Add(time.Second)) || !first.Started.Before(p.EarliestExpiry) || !first.Completed.Before(p.EarliestExpiry) {
-		t.Fatal("post-deadline query did not remain strictly between one second and cache expiry")
+		result.InvalidationReasons = append(result.InvalidationReasons, "query outside strict post-one-second/pre-TTL window")
 	}
 	if first.Error != "" {
-		t.Fatalf("post-deadline native query failed: %+v", first)
+		result.InvalidationReasons = append(result.InvalidationReasons, "native query failed: "+first.Error)
 	}
 	// Waiting on recorded completions does not issue another native observation.
-	cacheGatePostDeadlineIdle(t)
+	if err := cacheGatePostDeadlineWaitIdle(); err != nil {
+		result.InvalidationReasons = append(result.InvalidationReasons, err.Error())
+	}
 	records, incomplete := cacheGatePositiveWireSnapshot()
 	if incomplete {
-		t.Fatal("post-deadline witness trace is incomplete")
+		result.InvalidationReasons = append(result.InvalidationReasons, "wire trace incomplete")
 	}
 	for _, record := range records {
 		if record.Command == 13 {
@@ -1010,14 +1047,17 @@ func cacheGatePostDeadlineObserve(t *testing.T, p *cacheGatePositiveCell, path s
 		}
 	}
 	if len(result.QuietViolations) != 0 {
-		t.Fatal("an SMB operation interrupted the untouched post-ACK interval")
+		result.InvalidationReasons = append(result.InvalidationReasons, "SMB activity interrupted the untouched interval")
 	}
 	oracle, err := file.ReadAt(t.Context(), storage.FileReadRequest{Length: 1024})
 	cacheGateObserve("postdeadline_http_oracle", map[string]any{"attr": oracle.Attr, "count": len(oracle.Data), "digest": cacheGatePositiveDigest(oracle.Data), "error": fmt.Sprint(err)})
 	if err != nil || oracle.Attr.ID != expected.ID || oracle.Attr.MetadataRevision != expected.MetadataRevision || oracle.Attr.Size != expected.Size || !oracle.Attr.ModTime.Equal(expected.ModTime) || !bytes.Equal(oracle.Data, data) {
-		t.Fatal("post-deadline authority oracle changed or failed")
+		result.InvalidationReasons = append(result.InvalidationReasons, "authority oracle changed or failed")
 	}
-	result.MatchesWarmTuple = first.Size == warmed.Size && first.MTime == cacheGatePositiveTime(warmed.ModTime)
+	if len(result.InvalidationReasons) != 0 {
+		t.Errorf("post-deadline witness invalid: %v", result.InvalidationReasons)
+		return
+	}
 	if first.Size != expected.Size || first.MTime != cacheGatePositiveTime(expected.ModTime) {
 		result.Classification = "stale_after_one_second"
 		result.ContractResult = "violated"
@@ -1026,4 +1066,142 @@ func cacheGatePostDeadlineObserve(t *testing.T, p *cacheGatePositiveCell, path s
 	result.Classification = "current_at_post_deadline_probe"
 	// A current late sample cannot establish when it first became current.
 	result.ContractResult = "inconclusive"
+}
+
+func cacheGateAssertNoLeasing(t *testing.T, bridge *nativeBridge) {
+	t.Helper()
+	if bridge.wire.unsafeCaching.Load() || bridge.wire.leaseResponses.Load() != 0 {
+		t.Fatal("no-leasing experiment received lease or oplock cache rights")
+	}
+	bridge.wire.mu.Lock()
+	defer bridge.wire.mu.Unlock()
+	formal := false
+	for _, negotiation := range bridge.wire.negotiations {
+		if negotiation.Dialect != 0x311 && negotiation.Dialect != 0x2ff {
+			t.Fatalf("unexpected experimental dialect: %+v", negotiation)
+		}
+		if negotiation.Capabilities != 4 {
+			t.Fatalf("no-leasing experiment advertised unsupported capabilities: %+v", negotiation)
+		}
+		if negotiation.Dialect == 0x311 {
+			formal = true
+		}
+	}
+	if !formal {
+		t.Fatal("no-leasing experiment did not observe final SMB3.1.1 negotiation")
+	}
+	proved := false
+	for _, request := range bridge.wire.creates {
+		if request.Name != "lease-proof.bin" {
+			continue
+		}
+		for _, response := range bridge.wire.createReplies {
+			if response.MessageID != request.MessageID {
+				continue
+			}
+			if response.Truncated || response.Oplock != 0 || len(response.Leases) != 0 {
+				t.Fatalf("ordinary experimental CREATE granted caching: %+v", response)
+			}
+			proved = true
+		}
+	}
+	if !proved {
+		t.Fatal("no-leasing experiment did not observe its ordinary proof-file CREATE response")
+	}
+}
+
+func cacheGateRunProtocolProof(t *testing.T, noLeasing bool) bool {
+	return cacheGateCompleteProofFixture(t, func(t *testing.T) {
+		trace := &cacheGateTrace{}
+		cacheGateActive.Store(trace)
+		cacheGateResetPositiveWire()
+		var bridge *nativeBridge
+		t.Cleanup(func() {
+			cacheGateActive.Store(nil)
+			records, incomplete := cacheGatePositiveWireSnapshot()
+			trace.mu.Lock()
+			events := append([]cacheGateEvent(nil), trace.events...)
+			overflow, encodingError := trace.overflow, trace.encodingError
+			trace.mu.Unlock()
+			if incomplete || overflow || encodingError != nil {
+				t.Error("protocol proof fixture trace is incomplete")
+			}
+			report := map[string]any{"evidence_kind": "completed setup protocol proof; separate from measured pathname fixture", "wire": records, "events": events, "wire_incomplete": incomplete, "trace_overflow": overflow}
+			if bridge != nil {
+				status := bridge.smb.Status()
+				refs := bridge.backend.openReferences()
+				report["server_status"] = status
+				report["backend_references"] = refs
+				if refs != 0 || status.Connections != 0 || status.RetainedConnections != 0 || status.PendingRequests != 0 || status.UnconfirmedMutations != 0 || status.CleanupFailures != 0 {
+					t.Error("protocol proof fixture retained resources or unconfirmed effects")
+				}
+			}
+			report["test_failed"] = t.Failed()
+			data, err := json.MarshalIndent(report, "", "  ")
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if err := os.WriteFile(filepath.Join(os.Getenv("RFS_GATE_OUTPUT_ROOT"), "protocol-proof.json"), data, 0600); err != nil {
+				t.Error(err)
+			}
+		})
+		sid, err := CurrentUserSID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		policy, err := AllowSID(sid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bridge = nativeBridgeFixture(t, policy)
+		if err := bridge.mapDrive(t); err != nil {
+			t.Fatal(err)
+		}
+		proof := nativeOpen(t, filepath.Join(bridge.path+`\`, "lease-proof.bin"), win.CREATE_ALWAYS)
+		if n, err := nativeTransfer(proof, []byte{1}, true); err != nil || n != 1 {
+			t.Fatalf("protocol proof WRITE failed: n=%d error=%v", n, err)
+		}
+		if noLeasing {
+			cacheGateAssertNoLeasing(t, bridge)
+		} else {
+			bridge.assertCacheContract(t)
+		}
+		if err := proof.close(); err != nil {
+			t.Fatal(err)
+		}
+		cacheGatePostDeadlineIdle(t)
+	})
+}
+
+func cacheGateWitnessNegotiation(t *testing.T, bridge *nativeBridge, noLeasing bool) {
+	t.Helper()
+	cacheGatePostDeadlineIdle(t)
+	if bridge.wire.unsafeCaching.Load() || noLeasing && bridge.wire.leaseResponses.Load() != 0 {
+		t.Fatal("measured fixture received unsupported caching rights or contexts")
+	}
+	bridge.wire.mu.Lock()
+	defer bridge.wire.mu.Unlock()
+	formal := false
+	for _, negotiation := range bridge.wire.negotiations {
+		var expected uint32
+		switch negotiation.Dialect {
+		case 0x311:
+			expected = 0x26
+			formal = true
+		case 0x2ff:
+			expected = 0x6
+		default:
+			t.Fatalf("unexpected measured dialect: %+v", negotiation)
+		}
+		if noLeasing {
+			expected = 4
+		}
+		if negotiation.Capabilities != expected {
+			t.Fatalf("measured fixture capabilities=%x expected=%x", negotiation.Capabilities, expected)
+		}
+	}
+	if !formal {
+		t.Fatal("measured fixture has no observed SMB3.1.1 negotiation")
+	}
 }

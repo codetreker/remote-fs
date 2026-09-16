@@ -355,7 +355,7 @@ go vet ./packages/smb ./packages/smb/internal/wire ./packages/smb/internal/signi
 
 [诊断工作流](../.github/workflows/native-smb-gate.yml)在原生 Windows 11 24H2+ ARM64 上，以固定的 [SMB 原型](https://github.com/codetreker/remote-fs/tree/1cb9ad7f49d998de4daa4d562d766b18cf06ce16/packages/smb/windows)为基底验证系统重定向器的名字、属性和已打开文件缓存行为。基底只检出到 `.tmp/native-cache-gate/fixture`；[运行脚本](../.github/scripts/native-smb-cache-gate.ps1)核对 commit，检查并应用[通知连续性补丁](../.github/scripts/native-smb-notify-continuity.patch)，再注入[聚焦探针](../.github/scripts/native-smb-cache-gate_test.go.txt)和[通知回归用例](../.github/scripts/native-smb-notify-continuity_test.go.txt)。实际执行对象由基底 SHA、补丁 SHA256 与探针 SHA 共同确定，不与纯基底混称，也不编译工作分支正在实现的 SMB/backend。已观察结果与取舍见[诊断决定](../.agents/notes/implemented/testing/2026-09-16-native-smb-cache-diagnostic.md)。
 
-十四个独立作业先运行基底的 Notification 测试及两项通知连续性回归，再运行 `TestNativeNegativeNameCacheGate`。测试使用 `-count=1`、三分钟超时，作业上限十五分钟。两项新增回归分别验证 rescan 交付后、重挂前的事件保留，以及底层来源更换后旧监听不能继续信任原来的注册；missing_final_status 与 positive 两种模式还先运行两项专用回归，分别验证父目录已核对和仅最终 CREATE 分支可改变状态；positive 另须取得读取完成分类用例的通过 verdict。每项具名回归及原生测试必须取得精确 pass verdict，任何 fail、skip 或缺失预期 verdict 都不能算通过。
+十八个独立作业先运行基底的 Notification 测试及两项通知连续性回归，再运行 `TestNativeNegativeNameCacheGate`。测试使用 `-count=1`、三分钟超时，作业上限十五分钟。两项新增回归分别验证 rescan 交付后、重挂前的事件保留，以及底层来源更换后旧监听不能继续信任原来的注册；missing_final_status 与 positive 两种模式还先运行两项专用回归，分别验证父目录已核对和仅最终 CREATE 分支可改变状态；positive 另须取得读取完成分类用例的通过 verdict。每项具名回归及原生测试必须取得精确 pass verdict，任何 fail、skip 或缺失预期 verdict 都不能算通过。
 
 补丁只在健康且 generation 未变的底层 stream 上保留已建立的目录监听，在 rescan 响应交付之后继续积累有界事件，避免下一次请求以新 checkpoint 跳过间隔。来源更换、来源失败或关闭仍使旧注册失效。它是平台通知逻辑的诊断 overlay，不改变通用 File 生命周期或当前生产包；unit 回归通过也不能代替相同原生场景。
 
@@ -373,6 +373,8 @@ go vet ./packages/smb ./packages/smb/internal/wire ./packages/smb/internal/signi
 | missing_final_status | 单独施加最终缺失状态补丁；无监听、无显式父目录句柄时核对 wire 0xc000000f 与 Win32 FILE_NOT_FOUND，验证新查询及一秒/到期前可见性；通过后再持有根 LIST/share=0 重复另一名字，全程任何 CHANGE_NOTIFY 都失败 |
 | positive_unheld / positive_exclusive | 分别无根句柄或持有根 LIST/share=0；每种模式运行十五个隔离 cell，检查路径/BasicInfo/StandardInfo/overlapped ReadFile/同步 ReadFile 的首次增长与缩短观察，以及 rename、replace、recreate 的路径或新打开结果 |
 | positive_postdeadline_unheld / positive_postdeadline_exclusive | 各一个新的路径增长 cell，首个 ACK 后 GetFileAttributesExW 计划在 1.1 秒开始；只收集超过一秒的单向违约证据，作业通过也不代表一秒可见性验收 |
+| positive_noleasing_unheld / positive_noleasing_exclusive | 实验协商不支持 leasing，分别执行原十五项即时 cell；保留旧引用 A 与新打开 B 的身份/字节断言 |
+| positive_postdeadline_noleasing_unheld / positive_postdeadline_noleasing_exclusive | 不支持 leasing 的两个全新路径增长延迟观察；保持晚新值 inconclusive，与原能力基线分开记录 |
 
 创建可见性检查先取得 authority 的 CREATE/NAME_NOT_FOUND 响应，再由独立远端入口创建该名字。成功需要在写者确认后一秒内、且在最早可能的缓存到期之前观察到文件，并取得该名字的一次新权威 SMB CREATE；要求逐名字通知的情形还必须有匹配事件，不能用 rescan 替代 owned_nested 的初次创建和普通间隔创建通知。重复 Stat 是测量观察点，不是产品同步机制。环境中三个 SMB 缓存 lifetime 都须大于一秒；写者确认或观察越过可能到期时间时，不能据此证明非 TTL 可见性。故障情形单独检查缓存到期前的错误，不以创建成功代替断线诚实性。
 
@@ -386,9 +388,13 @@ find_notification 只检查替代通知入口的共存性；即使通过，也�
 
 [有界 wire 观察器](../.github/scripts/native-smb-positive-wire_test.go.txt)解析完整 compound 链，按连接和 MessageID 关联实际 CREATE/QUERY_INFO/READ 与固定 metadata、字节摘要；QUERY_INFO class 34 的 FILE_NETWORK_OPEN_INFORMATION 同时解出时间和长度，以覆盖 Basic/Standard 原生 API 实际选择的线格式；[合成回归](../.github/scripts/native-smb-positive-wire-checks_test.go.txt)检验分片、related CREATE、跨连接隔离、迟到响应、字段不完整与敏感内容排除。认证 token 和文件原字节不进入产物。positive cell 必须无 CHANGE_NOTIFY、无授予缓存权限，证据缺失/溢出及清理残留都失败；合成测试或 ARM64 构建通过不代表原生 positive cell 通过。
 
-延迟观察的两个新 cell 保留原型的协商能力 0x26 与 lease State NONE，不改变原有一秒 validator。路径属性先暖旧值，真实 HTTP 增长确认后，在首个查询前不调用目标或相关目录的任何原生文件 API；开始写者前须无未完成的 warm-up 请求，ACK 到查询开始之间也不能有目标/目录 SMB 请求或响应。首个 GetFileAttributesExW 的实际开始必须严格晚于 ACK+1 秒，开始和完成都严格早于原始最早缓存到期；单调时间差和 UTC 时间戳分别记录。调度超窗、错误或轨迹不完整使样本无效，不重试同一缓存样本。
+基线延迟观察的两个 cell 保留原型的协商能力 0x26 与 lease State NONE；独立 NoLeasing 变体使用下述无 leasing 策略，两者都不改变原有一秒 validator。 每个延迟变体先在独立 setup fixture 完成真实 CREATE/WRITE/无缓存授权证明，检查原生句柄关闭、移除映射、SMB/HTTP 停止及引用/连接/pending/cleanup 归零后，才新建测量 fixture/share。测量 share 没有 proof file、不执行原生数据写入，使用自己的空 trace、曝光起点与实际协商检查；即时矩阵保持原来的证明顺序。路径属性先暖旧值，真实 HTTP 增长确认后，在首个查询前不调用目标或相关目录的任何原生文件 API；开始写者前须无未完成的 warm-up 请求，ACK 到查询开始之间也不能有目标/目录 SMB 请求或响应。首个 GetFileAttributesExW 的实际开始必须严格晚于 ACK+1 秒，开始和完成都严格早于原始最早缓存到期；单调时间差和 UTC 时间戳分别记录。调度超窗、错误或轨迹不完整使样本无效，不重试同一缓存样本。独立 fixture 完全退役是拥有权边界，不是后台永远无请求的假设；测量安静间隔仍不豁免任何因名字不同而出现的额外流量。
 
-查询之后才执行 HTTP oracle，核对身份、revision、大小、mtime 和内容未再改变。旧 tuple 或任一旧分量只是待核实的违约候选，必须等本体、句柄及最终卸载/资源清理全部成功后才记录 violated；其它失败使结论 inconclusive，即使资源计数后来归零。当前 tuple 只证明这次较晚观察已新鲜，必须记 `within_one_second_proven:false`、`contract_result:inconclusive`；新 SMB 请求也不能证明一秒内已可见。工作流把这两个作业标为非 SLO 验收，绿色的证据收集不能关闭一秒门禁。即时十五项与延迟单项保持独立，不推断缩短、改名或其它 API 的延迟结果。
+首个查询返回后立即保存原始 tuple 和 matches_warm_tuple；无效时间、原生错误、pending/quiet 或证据失败记录为 invalidation，仍尝试 HTTP oracle 和普通清理。HTTP oracle 核对身份、revision、大小、mtime 和内容未再改变，不覆盖原生首值。旧 tuple 或任一旧分量只是待核实的违约候选，必须等本体、句柄及最终卸载/资源清理全部成功后才记录 violated；其它失败使结论 inconclusive，即使资源计数后来归零。当前 tuple 只证明这次较晚观察已新鲜，必须记 `within_one_second_proven:false`、`contract_result:inconclusive`；新 SMB 请求也不能证明一秒内已可见。工作流把这两个作业标为非 SLO 验收，绿色的证据收集不能关闭一秒门禁。即时十五项与延迟单项保持独立，不推断缩短、改名或其它 API 的延迟结果。
+
+[NoLeasing 补丁](../.github/scripts/native-smb-no-leasing.patch)只用于名字中带 noleasing 的四个变体，依次在通知连续性和最终缺失补丁之后检查并应用，分别记录 SHA256。它将正式/通配协商均设为 LARGE_MTU=0x4，最终 dialect 仍为 SMB 3.1.1，保留签名与 preauthentication；不分配 lease table/owner，不调用 lease-key preflight/commit。原 lease 身份检查源码保持原样。RqLs 内部字段在不支持 leasing 时忽略，CREATE/context 外层长度、offset 和 alignment 仍验证；成功 CREATE 的 oplock 为 NONE 且没有 RqLs response，未经请求的 ACK 明确拒绝。
+
+[七项专用测试根](../.github/scripts/native-smb-no-leasing_test.go.txt)在原生场景前必须各有 pass；它们覆盖协商/签名、仅忽略内部 lease 字段、外层边界、替换前后引用身份、打开拒绝和已完成动作核对、授权/无请求 ACK 以及清理。QueryAction 恢复到 Completed 的成功不代表仍未知的结果已被清理。实际 native trace 还须核对每次协商的 capability=4、最终 3.1.1，以及全程没有缓存授权；即时场景的普通 proof-file CREATE 为 NONE/无 lease response，延迟场景由完全退役的 setup fixture 单独提供该证明，测量连接仍核对自己的协商与响应；旧变体的 0x26/0x6 与 State NONE 检查不放宽。即时和延迟使用独立 share/target，不把实验结果与基线合并。当前源码的原生 SSPI 作业仍不使用任何原型 overlay。
 
 映射拥有权在 Map 前写入并同步临时记录，再原子改名。测试进程异常退出后，Verify 只清理与该记录精确匹配、且不在运行前基线中的 Local/Remote 映射；发生恢复仍将该次测试判为清理失败，不把管理员清扫变成成功。每个 positive cell 单独保留首结果、完整关联记录、authority metadata/digest 与最终资源状态。
 

@@ -1,0 +1,422 @@
+package smb
+
+import (
+	"context"
+	"errors"
+	"net"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"testing"
+
+	"github.com/codetreker/remote-fs/packages/authz"
+	"github.com/codetreker/remote-fs/packages/smb/internal/signing"
+	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+	"github.com/codetreker/remote-fs/packages/storage"
+)
+
+func gateNoLeaseRequest(t *testing.T, name string, level byte, inner []byte) wire.Request {
+	t.Helper()
+	r := createCommand(name, 1, 1)
+	r.Body[3] = level
+	if inner != nil {
+		return requestContexts(t, r, []wire.CreateContext{{Name: []byte("RqLs"), Data: inner}})
+	}
+	return r
+}
+func gateNoLeaseContext(t *testing.T, version uint16) []byte {
+	t.Helper()
+	data, err := wire.LeaseResponseData(wire.LeaseResponse{Version: version, Key: [16]byte{17}, Epoch: 19})
+	if err != nil {
+		t.Fatal(err)
+	}
+	smbLE.PutUint32(data[16:], 7)
+	return data
+}
+func gateNoLeaseID(t *testing.T, p []byte) wire.FileID {
+	t.Helper()
+	h, err := wire.ParseHeader(p)
+	if err != nil || h.Status != 0 || len(p) < 152 || p[66] != 0 || smbLE.Uint32(p[144:]) != 0 || smbLE.Uint32(p[148:]) != 0 {
+		t.Fatalf("CREATE must return NONE without contexts: %+v %v %x", h, err, p)
+	}
+	var id wire.FileID
+	copy(id[:], p[128:144])
+	return id
+}
+func gateNoLeaseClose(id wire.FileID) wire.Request {
+	b := make([]byte, 24)
+	smbLE.PutUint16(b, 24)
+	copy(b[8:], id[:])
+	return fileRequest(wire.Close, b)
+}
+
+type gateNoLeasePeer struct {
+	server  *Server
+	network net.Conn
+	sid     uint64
+	tree    uint32
+	key     *signing.Session
+	next    uint64
+}
+
+func (p *gateNoLeasePeer) call(t *testing.T, r wire.Request) []byte {
+	t.Helper()
+	h := wire.Header{Command: r.Header.Command, MessageID: p.next, SessionID: p.sid, TreeID: p.tree, Credits: 1}
+	p.next++
+	packet := requestPacket(h, r.Body)
+	if err := p.key.Sign(packet); err != nil {
+		t.Fatal(err)
+	}
+	sendFrame(t, p.network, packet)
+	reply := readFrame(t, p.network)
+	rh, err := wire.ParseHeader(reply)
+	if err != nil || rh.Command != h.Command || rh.MessageID != h.MessageID || p.key.Verify(reply) != nil {
+		t.Fatalf("signed response %+v %v", rh, err)
+	}
+	return reply
+}
+func gateNoLeaseConnect(t *testing.T, open func(windowsOpenRequest) (windowsOpenResult, error)) (*gateNoLeasePeer, *backendSession) {
+	return gateNoLeaseConnectWithAuthorizer(t, open, testConfig().Authorize)
+}
+func gateNoLeaseConnectWithAuthorizer(t *testing.T, open func(windowsOpenRequest) (windowsOpenResult, error), authorizer authz.Authorizer) (*gateNoLeasePeer, *backendSession) {
+	t.Helper()
+	config := testConfig()
+	config.Authorize = authorizer
+	server, network := startConfiguredServer(t, config)
+	backend := &backendSession{commandSession: &commandSession{open: open}}
+	_, err := server.publish(Share{Name: "work", Volume: "trusted", Changes: testNotifySource(testNotifyStream())}, &sessionBackend{session: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid, key := authenticateProtocol(t, network)
+	peer := &gateNoLeasePeer{server: server, network: network, sid: sid, key: key, next: 3}
+	name := wire.EncodeUTF16("\\\\127.0.0.1\\work")
+	body := make([]byte, 8+len(name))
+	smbLE.PutUint16(body, 9)
+	smbLE.PutUint16(body[4:], 72)
+	smbLE.PutUint16(body[6:], uint16(len(name)))
+	copy(body[8:], name)
+	response := peer.call(t, fileRequest(wire.TreeConnect, body))
+	header, _ := wire.ParseHeader(response)
+	if header.Status != 0 {
+		t.Fatal(header)
+	}
+	peer.tree = header.TreeID
+	if server.leases != nil {
+		t.Fatal("unsupported leasing allocated a lease table")
+	}
+	server.mu.Lock()
+	var connections []*connection
+	for c := range server.connections {
+		connections = append(connections, c)
+	}
+	server.mu.Unlock()
+	for _, c := range connections {
+		c.mu.Lock()
+		s := c.sessions[sid]
+		c.mu.Unlock()
+		if s != nil {
+			s.mu.Lock()
+			tree := s.trees[peer.tree]
+			if tree == nil || tree.files.leases != nil {
+				s.mu.Unlock()
+				t.Fatal("unsupported leasing allocated a tree lease owner")
+			}
+			s.mu.Unlock()
+		}
+	}
+	return peer, backend
+}
+
+func TestGateNoLeasingNegotiationAndSigning(t *testing.T) {
+	for _, bootstrap := range []bool{false, true} {
+		t.Run(map[bool]string{false: "direct", true: "bootstrap"}[bootstrap], func(t *testing.T) {
+			server, c := startProtocolServer(t)
+			if server.leases != nil {
+				t.Fatal("lease table allocated")
+			}
+			if bootstrap {
+				sendFrame(t, c, multiProtocolPacket())
+				p := readFrame(t, c)
+				if smbLE.Uint32(p[88:]) != 4 || smbLE.Uint16(p[68:]) != wire.DialectWildcard || smbLE.Uint16(p[66:]) != 3 {
+					t.Fatalf("wildcard caps/signing %x", p)
+				}
+				sid, key := authenticateProtocolAt(t, c, 1)
+				packet := requestPacket(wire.Header{Command: wire.Echo, MessageID: 4, SessionID: sid, Credits: 1}, wire.EmptyResponseBody())
+				if err := key.Sign(packet); err != nil {
+					t.Fatal(err)
+				}
+				sendFrame(t, c, packet)
+				reply := readFrame(t, c)
+				h, _ := wire.ParseHeader(reply)
+				if h.Status != 0 || key.Verify(reply) != nil {
+					t.Fatal(h)
+				}
+			} else {
+				sendFrame(t, c, negotiatePacket())
+				p := readFrame(t, c)
+				if smbLE.Uint32(p[88:]) != 4 || smbLE.Uint16(p[68:]) != wire.Dialect311 || smbLE.Uint16(p[66:]) != 3 {
+					t.Fatalf("formal caps/signing %x", p)
+				}
+			}
+		})
+	}
+}
+
+func TestGateNoLeasingIgnoresOnlyInnerLeaseContext(t *testing.T) {
+	cases := []struct {
+		name  string
+		level byte
+		inner []byte
+	}{{"v1", wire.OplockLease, gateNoLeaseContext(t, wire.LeaseVersion1)}, {"v2", wire.OplockLease, gateNoLeaseContext(t, wire.LeaseVersion2)}, {"short inner", wire.OplockLease, []byte{1, 2, 3}}, {"missing context", wire.OplockLease, nil}, {"batch", 9, nil}}
+	bad := gateNoLeaseContext(t, wire.LeaseVersion2)
+	smbLE.PutUint32(bad[16:], 0xffffffff)
+	cases = append(cases, struct {
+		name  string
+		level byte
+		inner []byte
+	}{"invalid inner state", wire.OplockLease, bad})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			d, file, session, _ := commandDispatcher()
+			d.handles = make(map[wire.FileID]*fileHandle)
+			session.open = func(r windowsOpenRequest) (windowsOpenResult, error) {
+				calls++
+				if r.Lookup.Name == "" {
+					root := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}}}
+					return windowsOpenResult{File: root, Attr: root.attr}, nil
+				}
+				if r.Lookup.ExpectedID != 0 {
+					t.Fatal("lease preflight pinned stale object")
+				}
+				return windowsOpenResult{File: file, Attr: file.attr, CreateAction: windowsOpened}, nil
+			}
+			body, status := d.create(t.Context(), gateNoLeaseRequest(t, "file", tc.level, tc.inner))
+			if status != 0 || len(body) < 88 || body[2] != 0 || smbLE.Uint32(body[80:]) != 0 || smbLE.Uint32(body[84:]) != 0 || calls != 2 || d.leases != nil {
+				t.Fatalf("status=%x calls=%d body=%x", status, calls, body)
+			}
+			var id wire.FileID
+			copy(id[:], body[64:80])
+			if _, status = d.closeOrFlush(t.Context(), gateNoLeaseClose(id)); status != 0 {
+				t.Fatal(status)
+			}
+		})
+	}
+}
+func TestGateNoLeasingKeepsOuterBounds(t *testing.T) {
+	d, _, session, _ := commandDispatcher()
+	calls := 0
+	session.open = func(windowsOpenRequest) (windowsOpenResult, error) { calls++; return windowsOpenResult{}, nil }
+	request := gateNoLeaseRequest(t, "file", wire.OplockLease, []byte{1, 2, 3})
+	smbLE.PutUint32(request.Body[48:], 0xfffffff0)
+	if _, status := d.create(t.Context(), request); status != fileInvalidParameter || calls != 0 {
+		t.Fatal(status, calls)
+	}
+}
+
+func TestGateNoLeasingReplacementKeepsSeparateOpenIdentities(t *testing.T) {
+	a := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular, Size: 3}}}, data: []byte("AAA")}
+	b := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 8, Kind: storage.NodeRegular, Size: 5}}}, data: []byte("BBBBB")}
+	var mu sync.Mutex
+	current := a
+	leafCalls := 0
+	peer, _ := gateNoLeaseConnect(t, func(r windowsOpenRequest) (windowsOpenResult, error) {
+		if r.Lookup.Name == "" {
+			root := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}}}
+			return windowsOpenResult{File: root, Attr: root.attr}, nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		leafCalls++
+		if r.Lookup.ExpectedID != 0 {
+			t.Fatal("lease-key object preflight still active")
+		}
+		if current == nil {
+			return windowsOpenResult{}, &verifiedMissingNameError{}
+		}
+		return windowsOpenResult{File: current, Attr: current.attr, CreateAction: windowsOpened}, nil
+	})
+	request := gateNoLeaseRequest(t, "target.bin", wire.OplockLease, gateNoLeaseContext(t, wire.LeaseVersion2))
+	oldID := gateNoLeaseID(t, peer.call(t, request))
+	mu.Lock()
+	current = b
+	mu.Unlock()
+	newID := gateNoLeaseID(t, peer.call(t, request))
+	if oldID == newID {
+		t.Fatal("different opens reused SMB FileID")
+	}
+	for _, test := range []struct {
+		id   wire.FileID
+		node uint64
+		data string
+	}{{oldID, 7, "AAA"}, {newID, 8, "BBBBB"}} {
+		reply := peer.call(t, readCommand(test.id, 0, 32))
+		header, _ := wire.ParseHeader(reply)
+		if header.Status != 0 || string(reply[80:]) != test.data {
+			t.Fatalf("read %+v %q", header, reply[80:])
+		}
+		reply = peer.call(t, queryCommand(test.id, 1, 6, 64))
+		header, _ = wire.ParseHeader(reply)
+		if header.Status != 0 || smbLE.Uint64(reply[72:]) != test.node {
+			t.Fatalf("identity %+v %x", header, reply)
+		}
+	}
+	mu.Lock()
+	current = nil
+	mu.Unlock()
+	reply := peer.call(t, request)
+	header, _ := wire.ParseHeader(reply)
+	if header.Status != 0xc000000f {
+		t.Fatalf("final missing mapping was bypassed: %x", header.Status)
+	}
+	c := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 9, Kind: storage.NodeRegular, Size: 2}}}, data: []byte("CC")}
+	mu.Lock()
+	current = c
+	mu.Unlock()
+	recreated := gateNoLeaseID(t, peer.call(t, request))
+	reply = peer.call(t, queryCommand(recreated, 1, 6, 64))
+	if smbLE.Uint64(reply[72:]) != 9 {
+		t.Fatal("recreated name retained old node identity")
+	}
+	reply = peer.call(t, readCommand(oldID, 0, 32))
+	if string(reply[80:]) != "AAA" {
+		t.Fatal("old handle was rebound after recreation")
+	}
+	for _, id := range []wire.FileID{oldID, newID, recreated} {
+		reply = peer.call(t, gateNoLeaseClose(id))
+		header, _ = wire.ParseHeader(reply)
+		if header.Status != 0 {
+			t.Fatal(header)
+		}
+	}
+	mu.Lock()
+	count := leafCalls
+	mu.Unlock()
+	if count != 4 {
+		t.Fatalf("unexpected lease-only preflight calls: %d", count)
+	}
+	reply = peer.call(t, fileRequest(wire.TreeDisconnect, wire.EmptyResponseBody()))
+	header, _ = wire.ParseHeader(reply)
+	if header.Status != 0 {
+		t.Fatal(header)
+	}
+	reply = peer.call(t, fileRequest(wire.Logoff, wire.EmptyResponseBody()))
+	header, _ = wire.ParseHeader(reply)
+	if header.Status != 0 {
+		t.Fatal(header)
+	}
+	status := peer.server.Status()
+	if status.LeaseSlots != 0 || status.LeaseBytes != 0 || status.UnconfirmedMutations != 0 {
+		t.Fatal(status)
+	}
+}
+
+func TestGateNoLeasingPreservesOpenFailuresAndReconciliation(t *testing.T) {
+	for _, unknown := range []bool{false, true} {
+		t.Run(map[bool]string{false: "share denial", true: "unknown result"}[unknown], func(t *testing.T) {
+			d, file, session, _ := commandDispatcher()
+			d.handles = make(map[wire.FileID]*fileHandle)
+			session.open = func(r windowsOpenRequest) (windowsOpenResult, error) {
+				if r.Lookup.Name == "" {
+					root := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}}}
+					return windowsOpenResult{File: root, Attr: root.attr}, nil
+				}
+				if unknown {
+					return windowsOpenResult{}, syscall.EIO
+				}
+				return windowsOpenResult{}, &windowsError{Failure: windowsSharingViolation, Err: syscall.EACCES}
+			}
+			session.result = windowsActionResult{State: windowsActionCompleted, File: file, Attr: file.attr, CreateAction: windowsOpened, GrantedAccess: windowsReadData}
+			body, status := d.create(t.Context(), gateNoLeaseRequest(t, "file", wire.OplockLease, gateNoLeaseContext(t, wire.LeaseVersion2)))
+			if unknown {
+				if status != 0 || body[2] != 0 || d.failed || len(d.handles) != 1 {
+					t.Fatal(status, d.failed)
+				}
+				var id wire.FileID
+				copy(id[:], body[64:80])
+				if _, status = d.closeOrFlush(t.Context(), gateNoLeaseClose(id)); status != 0 {
+					t.Fatal(status)
+				}
+			} else if status != 0xc0000043 || len(d.handles) != 0 {
+				t.Fatal(status, len(d.handles))
+			}
+		})
+	}
+}
+func TestGateNoLeasingRetainsAuthorizationAndRejectsUnsolicitedAck(t *testing.T) {
+	file := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular, Size: 3}}}, data: []byte("abc")}
+	var deny atomic.Bool
+	policy := authz.AuthorizerFunc(func(ctx context.Context, r authz.AccessRequest) error {
+		p, ok := PrincipalFromContext(ctx)
+		if !ok || p.SID != "S-1-5-21-1" || r.Volume != "trusted" {
+			return errors.New("identity/volume binding changed")
+		}
+		if deny.Load() {
+			return authz.ErrDenied
+		}
+		return nil
+	})
+	peer, _ := gateNoLeaseConnectWithAuthorizer(t, func(r windowsOpenRequest) (windowsOpenResult, error) {
+		if r.Lookup.Name == "" {
+			root := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}}}
+			return windowsOpenResult{File: root, Attr: root.attr}, nil
+		}
+		return windowsOpenResult{File: file, Attr: file.attr, CreateAction: windowsOpened}, nil
+	}, policy)
+	id := gateNoLeaseID(t, peer.call(t, gateNoLeaseRequest(t, "file", wire.OplockLease, gateNoLeaseContext(t, wire.LeaseVersion2))))
+	deny.Store(true)
+	reply := peer.call(t, readCommand(id, 0, 1))
+	header, _ := wire.ParseHeader(reply)
+	if header.Status != statusDenied {
+		t.Fatal(header)
+	}
+	deny.Store(false)
+	ack := make([]byte, 36)
+	smbLE.PutUint16(ack, 36)
+	reply = peer.call(t, fileRequest(wire.OplockBreak, ack))
+	header, _ = wire.ParseHeader(reply)
+	if header.Status != statusUnsupported {
+		t.Fatal(header)
+	}
+	tree := peer.tree
+	peer.tree = 999
+	reply = peer.call(t, fileRequest(wire.OplockBreak, ack))
+	header, _ = wire.ParseHeader(reply)
+	if header.Status != statusNetworkDeleted {
+		t.Fatal(header)
+	}
+	peer.tree = tree
+	unsigned := readCommand(id, 0, 1)
+	packet := requestPacket(wire.Header{Command: wire.Read, MessageID: peer.next, SessionID: peer.sid, TreeID: peer.tree, Credits: 1}, unsigned.Body)
+	peer.next++
+	sendFrame(t, peer.network, packet)
+	reply = readFrame(t, peer.network)
+	header, _ = wire.ParseHeader(reply)
+	if header.Status != statusDenied {
+		t.Fatal("unsigned read accepted", header)
+	}
+	reply = peer.call(t, gateNoLeaseClose(id))
+	header, _ = wire.ParseHeader(reply)
+	if header.Status != 0 {
+		t.Fatal(header)
+	}
+}
+func TestGateNoLeasingIdleLifecycle(t *testing.T) {
+	s, err := New(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.leases != nil {
+		t.Fatal("lease table allocated")
+	}
+	if err = s.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if s.Status().LeaseSlots != 0 || s.Status().LeaseBytes != 0 || !s.Status().Stopped {
+		t.Fatal(s.Status())
+	}
+	if err = s.Shutdown(t.Context()); err != nil && !errors.Is(err, ErrStopped) {
+		t.Fatal(err)
+	}
+}

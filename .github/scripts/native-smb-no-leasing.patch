@@ -1,0 +1,71 @@
+--- a/packages/smb/server.go
++++ b/packages/smb/server.go
+@@ -55,7 +55,7 @@
+ 	if err := config.Limits.check(); err != nil {
+ 		return nil, fmt.Errorf("SMB limits: %w", err)
+ 	}
+-	s := &Server{config: config, exports: make(map[string]*Export), connections: make(map[*connection]struct{}), sessions: newSessionRegistry(), leases: newLeaseTable(config.Limits), done: make(chan struct{})}
++	s := &Server{config: config, exports: make(map[string]*Export), connections: make(map[*connection]struct{}), sessions: newSessionRegistry(), done: make(chan struct{})}
+ 	rand.Read(s.guid[:])
+ 	return s, nil
+ }
+--- a/packages/smb/commands_session.go
++++ b/packages/smb/commands_session.go
+@@ -76,11 +76,7 @@
+ 		return nil, statusNetworkDeleted, signer
+ 	}
+ 	if r.Header.Command == wire.OplockBreak {
+-		ack, err := r.LeaseAck()
+-		if err != nil {
+-			return nil, statusInvalid, signer
+-		}
+-		return nil, c.server.leases.ack(c.clientGUID, ack.Key), signer
++		return nil, statusUnsupported, signer
+ 	}
+ 	if t.kind == controlTree {
+ 		body, status := c.control(s, t, r)
+@@ -239,7 +235,7 @@
+ 	limits := c.server.config.Limits
+ 	body, err := wire.NegotiateResponseBody(wire.Negotiation{
+ 		SecurityMode: 3, Dialect: wire.DialectWildcard, ServerGUID: c.server.guid,
+-		Capabilities: 6, MaxTransactSize: uint32(limits.MaxIOBytes),
++		Capabilities: 4, MaxTransactSize: uint32(limits.MaxIOBytes),
+ 		MaxReadSize: uint32(limits.MaxIOBytes), MaxWriteSize: uint32(limits.MaxIOBytes),
+ 		SystemTime: uint64(time.Now().UnixNano()/100 + 116444736000000000),
+ 	})
+@@ -306,7 +302,7 @@
+ 	binary.LittleEndian.PutUint16(preauth[4:], 1)
+ 	rand.Read(preauth[6:])
+ 	limits := c.server.config.Limits
+-	b, err := wire.NegotiateResponseBody(wire.Negotiation{SecurityMode: 3, Dialect: wire.Dialect311, ServerGUID: c.server.guid, Capabilities: 0x26, MaxTransactSize: uint32(limits.MaxIOBytes), MaxReadSize: uint32(limits.MaxIOBytes), MaxWriteSize: uint32(limits.MaxIOBytes), SystemTime: uint64(time.Now().UnixNano()/100 + 116444736000000000), Contexts: []wire.Context{{Type: 1, Data: preauth}, {Type: 8, Data: []byte{1, 0, 1, 0}}}})
++	b, err := wire.NegotiateResponseBody(wire.Negotiation{SecurityMode: 3, Dialect: wire.Dialect311, ServerGUID: c.server.guid, Capabilities: 4, MaxTransactSize: uint32(limits.MaxIOBytes), MaxReadSize: uint32(limits.MaxIOBytes), MaxWriteSize: uint32(limits.MaxIOBytes), SystemTime: uint64(time.Now().UnixNano()/100 + 116444736000000000), Contexts: []wire.Context{{Type: 1, Data: preauth}, {Type: 8, Data: []byte{1, 0, 1, 0}}}})
+ 	if err != nil {
+ 		return nil, statusIO
+ 	}
+@@ -598,8 +594,6 @@
+ 	c.mu.Unlock()
+ 	t := &tree{id: id, sessionID: s.id, done: make(chan struct{}), export: e, session: a.session, authority: a, files: newFileDispatcher(e.backend, a.session, a.epoch, c.server.config.Limits)}
+ 	t.files.authority = a
+-	t.files.leases = newLeaseOwner(c.server.leases, c.clientGUID, e.volumeIdentity)
+-	t.files.leases.authority = a
+ 	t.files.onCleanup = c.server.cleanupFailure
+ 	t.files.onUncertain = c.server.unconfirmedMutation
+ 	t.files.onFence = func(delta int) { c.server.mu.Lock(); c.server.fencedTrees += delta; c.server.mu.Unlock() }
+--- a/packages/smb/commands_files.go
++++ b/packages/smb/commands_files.go
+@@ -346,10 +346,11 @@
+ 	if err != nil {
+ 		return nil, fileInvalidParameter
+ 	}
+-	leaseRequest, hasLease, leaseErr := wire.ParseLease(request)
+-	if leaseErr != nil {
+-		return nil, fileInvalidParameter
+-	}
++	// Unsupported leasing ignores the inner RqLs body; outer CREATE bounds
++	// remain validated by Request.Create.
++	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/8c61e928-9242-44ed-96a0-98d1032d0d39
++	var leaseRequest wire.LeaseRequest
++	hasLease := false
+ 	if request.SecurityFlags != 0 || request.Impersonation > 3 {
+ 		return nil, fileInvalidParameter
+ 	}

@@ -118,6 +118,18 @@ if ($Phase -eq 'Run') {
             ConvertTo-Json | Set-Content (Join-Path $results 'missing-status-overlay.json') -Encoding utf8
         Copy-Item (Join-Path $PSScriptRoot 'native-smb-missing-status_test.go.txt') (Join-Path $fixture 'packages/smb/gate_missing_status_test.go')
     }
+    $noLeasing = $env:RFS_GATE_VARIANT -match '^positive_(postdeadline_)?noleasing_(unheld|exclusive)$'
+    if ($noLeasing) {
+        $noLeasingOverlay = Join-Path $PSScriptRoot 'native-smb-no-leasing.patch'
+        & git -C $fixture apply --check $noLeasingOverlay
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        & git -C $fixture apply $noLeasingOverlay
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $env:RFS_GATE_NO_LEASING_SHA = (Get-FileHash $noLeasingOverlay -Algorithm SHA256).Hash.ToLowerInvariant()
+        [ordered]@{ Kind = 'Unsupported-leasing protocol experiment'; SHA256 = $env:RFS_GATE_NO_LEASING_SHA } |
+            ConvertTo-Json | Set-Content (Join-Path $results 'no-leasing-overlay.json') -Encoding utf8
+        Copy-Item (Join-Path $PSScriptRoot 'native-smb-no-leasing_test.go.txt') (Join-Path $fixture 'packages/smb/gate_no_leasing_test.go')
+    }
     $testRoot = Join-Path $fixture 'packages/smb/windows'
     Copy-Item (Join-Path $PSScriptRoot 'native-smb-cache-gate_test.go.txt') (Join-Path $testRoot 'native_cache_gate_windows_test.go')
     foreach ($name in @('cache', 'wire', 'wire-checks')) {
@@ -172,12 +184,15 @@ b.mapping, err = Map(ctx, MappingOptions{LocalPath: b.path, Share: b.share, TCPP
     $PSNativeCommandUseErrorActionPreference = $false
     Push-Location $fixture
     try {
+        if ($noLeasing) {
+            Invoke-DiagnosticTests './packages/smb' '^TestGateNoLeasing' @('TestGateNoLeasingNegotiationAndSigning', 'TestGateNoLeasingIgnoresOnlyInnerLeaseContext', 'TestGateNoLeasingKeepsOuterBounds', 'TestGateNoLeasingReplacementKeepsSeparateOpenIdentities', 'TestGateNoLeasingPreservesOpenFailuresAndReconciliation', 'TestGateNoLeasingRetainsAuthorizationAndRejectsUnsolicitedAck', 'TestGateNoLeasingIdleLifecycle') 'no-leasing-unit-test.jsonl'
+        }
         Invoke-DiagnosticTests './packages/smb' '^Test(Notification|GateNotify)' @('TestGateNotifyRescanRetainsGapEvents', 'TestGateNotifyRescanRejectsReplacedSource') 'notify-unit-test.jsonl'
         if ($env:RFS_GATE_VARIANT -eq 'missing_final_status' -or $env:RFS_GATE_VARIANT.StartsWith('positive_')) {
             Invoke-DiagnosticTests './packages/smb' '^TestGateMissingStatus' @('TestGateMissingStatusRequiresVerifiedParent', 'TestGateMissingStatusOnlyChangesFinalCreate') 'missing-status-unit-test.jsonl'
         }
         if ($env:RFS_GATE_VARIANT.StartsWith('positive_')) {
-            Invoke-DiagnosticTests './packages/smb/windows' '^TestGatePositive(Wire|Read)' @('TestGatePositiveReadCompletion','TestGatePositiveWireSplitCompoundResponses','TestGatePositiveWireReadDigestExcludesPayload','TestGatePositiveWireRelatedCreateAndQuery','TestGatePositiveWireErrorsPendingAndSecrets','TestGatePositiveWireMalformedAndBounds','TestGatePositiveWireBootstrapAndContextBounds','TestGatePositiveWireConnectionIsolationAndReset','TestGatePositiveWireSensitiveCreateContextExcluded','TestGatePositiveWireDelayedResponseJoinsRequestInterval','TestGatePositiveWireIncompleteSelectedBufferResults','TestGatePositiveWireNetworkOpenInformation','TestGatePositiveWireIncompleteNetworkOpenBufferResults') 'positive-wire-test.jsonl'
+            Invoke-DiagnosticTests './packages/smb/windows' '^TestGatePositive(Wire|Read)|^TestGateProof' @('TestGateProofCleanupPrecedesMeasuredFixture', 'TestGatePositiveReadCompletion','TestGatePositiveWireSplitCompoundResponses','TestGatePositiveWireReadDigestExcludesPayload','TestGatePositiveWireRelatedCreateAndQuery','TestGatePositiveWireErrorsPendingAndSecrets','TestGatePositiveWireMalformedAndBounds','TestGatePositiveWireBootstrapAndContextBounds','TestGatePositiveWireConnectionIsolationAndReset','TestGatePositiveWireSensitiveCreateContextExcluded','TestGatePositiveWireDelayedResponseJoinsRequestInterval','TestGatePositiveWireIncompleteSelectedBufferResults','TestGatePositiveWireNetworkOpenInformation','TestGatePositiveWireIncompleteNetworkOpenBufferResults') 'positive-wire-test.jsonl'
         }
         Invoke-DiagnosticTests './packages/smb/windows' '^TestNativeNegativeNameCacheGate$' @('TestNativeNegativeNameCacheGate') 'go-test.jsonl'
     } finally {
