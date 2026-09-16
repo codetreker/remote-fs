@@ -12,19 +12,19 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-func (s *Store) guardedDirectory(ctx context.Context, tx *sql.Tx, id uint64) (metastore.FileState, error) {
+func (s *Store) guardedDirectory(ctx context.Context, tx *sql.Tx, id uint64) (namespaceIdentity, error) {
 	if id == 0 || id > math.MaxInt64 {
-		return metastore.FileState{}, storage.ErrConditionConflict
+		return namespaceIdentity{}, storage.ErrConditionConflict
 	}
-	node, err := s.fileState(ctx, tx, int64(id))
+	node, err := s.namespaceIdentity(ctx, tx, int64(id))
 	if errors.Is(err, syscall.ESTALE) {
-		return metastore.FileState{}, storage.ErrConditionConflict
+		return namespaceIdentity{}, storage.ErrConditionConflict
 	}
 	if err != nil {
-		return metastore.FileState{}, err
+		return namespaceIdentity{}, err
 	}
-	if !node.IsDir() || node.Detached {
-		return metastore.FileState{}, storage.ErrConditionConflict
+	if node.Kind != storage.NodeDirectory || node.Detached {
+		return namespaceIdentity{}, storage.ErrConditionConflict
 	}
 	return node, nil
 }
@@ -54,7 +54,7 @@ func (s *Store) checkNamespaceGuards(ctx context.Context, tx *sql.Tx, guards *st
 		if _, err := s.guardedDirectory(ctx, tx, edge.ParentID); err != nil {
 			return err
 		}
-		node, found, err := s.lookup(ctx, tx, int64(edge.ParentID), edge.RawLeaf)
+		node, found, err := s.lookupNamespaceIdentity(ctx, tx, int64(edge.ParentID), edge.RawLeaf)
 		if err != nil {
 			return err
 		}

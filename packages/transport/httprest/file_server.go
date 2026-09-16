@@ -305,6 +305,9 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 	if fileAttrResult(req.Op) {
 		r = r.WithContext(storage.WithAttrResultBudget(r.Context(), h.attrResultBudget(req)))
 	}
+	if req.Op == fileObserveName || req.Op == fileObserveDirectoryMetadata && req.DirectoryMetadata.IncludeName {
+		r = r.WithContext(storage.WithNameObservationBudget(r.Context(), nameObservationWireBudget(min(req.ResultBytes, h.maxBodyBytes), req.Op == fileObserveDirectoryMetadata)))
+	}
 	digest := sha256.Sum256(append(body, []byte(r.Header.Get(HeaderMutationScope))...))
 	response, err := h.fileCall(r.Context(), req, digest)
 	if err != nil {
@@ -502,7 +505,7 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		response.Attr = wire
 	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
 		return h.openReference(ctx, s, req)
-	case storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileMutateName, storage.OpFileSetNodeMetadata, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop:
+	case fileObserveDirectoryMetadata, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileMutateName, storage.OpFileSetNodeMetadata, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop:
 		response, err = h.performSessionCapability(ctx, s.native, req)
 	case storage.OpFileAck:
 		s.mu.Lock()
@@ -571,7 +574,7 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 				return response, syscall.EBADF
 			}
 			err = data.Sync(ctx)
-		case storage.OpFileState, storage.OpFileScope, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink, storage.OpFileMutate:
+		case fileObserveName, storage.OpFileState, storage.OpFileScope, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink, storage.OpFileMutate:
 			response, err = performReferenceCapability(ctx, file.native, req)
 		case storage.OpFileClose:
 			err = file.native.Close(ctx)

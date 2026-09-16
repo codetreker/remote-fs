@@ -46,6 +46,8 @@ SSE 不把整个 stream 保存在内存里，但每一帧仍有独立的 `DialOp
 
 每个基础数据调用都要先取得 client 自己的 response admission。默认同时保留 64 份响应、允许 64 个等待者，aggregate 上限为 8 GiB；每份都按 `4 * MaxBodyBytes` 预留，覆盖 raw body、decoded listing 与转换过程的同时保留。Subscribe、Resubscribe 与 Snapshot 在发出 HTTP 前也取得同一名额，用来约束 stream 尚未成功建立时可能返回的普通 error body；确认 `200 text/event-stream` 后立即释放，后续 frame 由 `MaxFrameBytes` 约束。等待者已满时，`Stat`、`Write`、`Create` 或 stream setup 都会在发出 HTTP 请求前以 `EAGAIN` 失败；context cancellation 会移除等待计数。non-stream admission 一直持有到 response 解码、mutation response/barrier 验证完成。`ReadBounded` 取 client 与调用方 byte bound 中较小者；`ListBounded` 把解码后的 entry 逐项交给调用方的 `ListResult`。普通 `Read` 与 `List` 仍返回完整 materialized value，但整个 HTTP body 及其同时表示都在上述单体与 aggregate 边界内。server 侧的 backend 预算与 response admission 见 [`../server/architecture.md`](../server/architecture.md#六请求与响应的内存边界)。
 
+目录 metadata 与引用名字观察是独立可选能力，FUSE 不要求它们或 ReferenceIdentity。支持时，包装器将 guards、IncludeName、ListResult 与引用身份交给 authority，名字不从副本重建；失败不回退到旧路径。原 File 字节方法及 State/Stat 保持自己的捕获，完整接口见[文件能力设计](../server/file-handles.md#显式-metadata-与名字观察)。
+
 **FUSE 到这一层为止。** 挂载层将 Lookup、Create、Mkdir、Unlink、Rmdir、Rename 与目录读取转换为父 NodeID/原始叶名的能力调用。普通 fd 使用 File，无 fd 的身份属性使用 StatNode/SetNodeAttr；目录 handle 保留 NodeReference 及其 Scope。FileSession 拥有服务端引用，挂载层拥有内核编号、POSIX codec 与 owner 映射，不以过时父路径重新定位对象。
 
 ### SMB 协议基础组件

@@ -156,12 +156,13 @@ type BoundedStorage interface {
 // prefix: treating the entries accumulated before the bound as success would state that
 // every omitted name does not exist.
 type ListResult struct {
-	maxBytes   int64
-	usedBytes  int64
-	entryBytes func(index int, nameBytes, metadataBytes int64, attr Attr) (int64, error)
-	entries    []Entry
-	pending    int
-	failure    error
+	maxBytes       int64
+	usedBytes      int64
+	entryBytes     func(index int, nameBytes, metadataBytes int64, attr Attr) (int64, error)
+	entries        []Entry
+	pending        int
+	prefixReserved bool
+	failure        error
 }
 
 // NewListResult constructs an empty bounded listing. Every bound and charge must be
@@ -234,6 +235,31 @@ func (r *ListResult) Reserve(nameBytes, metadataBytes int64, attr Attr) (*ListRe
 	r.usedBytes += bytes
 	r.pending++
 	return &ListReservation{result: r, nameBytes: nameBytes, metadataBytes: metadataBytes, attr: attr.Clone()}, nil
+}
+
+// ReservePrefix charges one non-entry output prefix before any entry reservation.
+// It adds to the constructor's fixed charge without creating an Entry. Repeated,
+// late, negative or oversized reservations invalidate the whole result; the first
+// failure remains authoritative. Existing collectors need not reserve a prefix.
+func (r *ListResult) ReservePrefix(charge int64) error {
+	if r == nil {
+		return fmt.Errorf("nil listing cannot reserve a prefix: %w", syscall.EINVAL)
+	}
+	if r.failure != nil {
+		return r.failure
+	}
+	if r.prefixReserved || r.pending != 0 || len(r.entries) != 0 {
+		return r.fail(fmt.Errorf("listing prefix must precede entries and be reserved once: %w", syscall.EINVAL))
+	}
+	if charge < 0 {
+		return r.fail(fmt.Errorf("listing prefix charge cannot be negative: %w", syscall.EINVAL))
+	}
+	if charge > r.maxBytes-r.usedBytes {
+		return r.fail(fmt.Errorf("listing prefix exceeds its result bound: %w", syscall.EFBIG))
+	}
+	r.usedBytes += charge
+	r.prefixReserved = true
+	return nil
 }
 
 // Entries returns the completed listing sorted by bytewise name. The returned slice is

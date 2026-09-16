@@ -26,7 +26,7 @@ Authorizer 用业务自己的 context key 取得稳定访问身份，读取当�
 
 ## 二、操作映射
 
-storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transport-neutral 字符串。[Op 前缀常量](../../../packages/storage/operations.go)在文件请求中直接作为 JSON `op` 的值，wire dispatch 与 AccessRequest.Operation 使用同一标识；普通 volume、复制与强锁的 URL 保留传输名称，在路由 opSpec 中登记对应语义。下表是这些入口的完整对应，file 行第二项是 body 的规范操作值。普通、bounded 与 confirmation barrier 变体使用同一语义，HTTP 方法本身不划分读写权限。业务策略对未知操作默认拒绝。
+storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transport-neutral 字符串。[Op 前缀常量](../../../packages/storage/operations.go)通常直接作为文件 JSON `op` 的值；目录 metadata 与引用名字观察使用 HTTP 自己的 discriminator，固定映射到既有 replication.snapshot，NameCommand 则映射实际名字效果。普通 volume、复制与强锁的 URL 保留传输名称，在路由 opSpec 中登记对应语义。下表是这些入口的完整对应，file 行第二项是 body 的规范操作值。普通、bounded 与 confirmation barrier 变体使用同一语义，HTTP 方法本身不划分读写权限。业务策略对未知操作默认拒绝。
 
 | Operation | HTTP wire 入口／动作 | 被授权的语义 |
 |---|---|---|
@@ -43,7 +43,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `volume.rename` | `/v4/rename` | 在同一 volume 内改名或覆盖目标 |
 | `replication.subscribe` | `/v4/subscribe` | 开始订阅及该订阅后续输出 |
 | `replication.resubscribe` | `/v4/resubscribe` | 按游标续订及其后续输出 |
-| `replication.snapshot` | `/v4/snapshot` | 捕获快照及发送整份快照 |
+| `replication.snapshot` | `/v4/snapshot`；`/v4/file` 的 `file-observe-directory-metadata`、`file-observe-name` | 整份快照，或有界目录 metadata/当前绑定披露；两个观察请求的 OpenAccess 为零 |
 | `replication.checkpoint` | `/v4/checkpoint` | 读取日志化身与已提交位置 |
 | `file.session-open` | `/v4/file`，`file.session-open` | 建立 FileSession |
 | `file.status` | `/v4/file-control`，`file.status` | 查询 FileSession 状态与历史边界 |
@@ -100,6 +100,8 @@ NameCommand 不以包装名称逃避基础语义：Create/Symlink 使用 volume.
 volume.write 本来可以创建缺失节点，单独拒绝 volume.create 不禁止它。Range Apply 授权整个中立编辑请求，Range Drop 是独立清理操作；平台锁模式与 owner 归属不替代字节 I/O 的 file.read/file.write 准入。
 
 “无 Scope”不是匿名业务身份。ReadDirNode 仍绑定 FileSession/store 的可信 volume 和现有 request context；handler 固定授权 file.read-dir-node，native 派生 ReadEntries，调用者不能用空 Uses 跳过检查。无 Scope 时检查全部适用 claims，不豁免同 session；有效 Scope 只给确切引用自我豁免。公开路径 List 走 volume.list 并同样在 authority 检查用途；内部复制 metadata 的权限与公开目录枚举不是可互换的入口。
+
+目录 metadata 与引用名字观察固定使用当前认证 context、选定 volume 的 OpReplicationSnapshot。持有引用、允许 ReadMetadata/ReadEntries 或允许 rename，都不隐含这项披露授权；snapshot 权限也不授予应用枚举、读属性、修改或监听。有效 DeleteName-only 引用可以在该权限允许下观察名字，但 State/Stat 仍执行自己的属性权限，实际 rename 仍检查独立授权及 DeleteName。外来、失效或关闭的 Scope/引用在授权后也必须失败，不降级成裸身份读取。直接 Go 嵌入沿原 host 授权边界。
 
 ## 三、请求、capability 与关闭
 

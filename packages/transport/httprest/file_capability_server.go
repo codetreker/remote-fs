@@ -21,6 +21,18 @@ func capabilitiesOf(value any) (*fileCapabilities, error) {
 			failure = errors.Join(failure, err)
 		}
 	}
+	if v, ok := value.(storage.DirectoryMetadataObserver); ok {
+		check(&caps.DirectoryMetadata, v.CheckDirectoryMetadataObservation)
+	}
+	if v, ok := value.(storage.ReferenceNameObserver); ok {
+		check(&caps.ReferenceName, func() error {
+			if err := v.CheckReferenceNameObservation(); err != nil {
+				return err
+			}
+			_, err := storage.ReferenceNodeID(value)
+			return err
+		})
+	}
 	if v, ok := value.(storage.AtomicFileOpener); ok {
 		check(&caps.AtomicOpen, v.CheckAtomicFileOpen)
 	}
@@ -145,12 +157,39 @@ func (h *Handler) openReference(ctx context.Context, s *servedFileSession, req f
 	if err != nil {
 		return response, uncertainFileEffect(err)
 	}
+	if response.Capabilities.ReferenceName {
+		node, identityErr := storage.ReferenceNodeID(native)
+		if identityErr != nil {
+			return response, uncertainFileEffect(identityErr)
+		}
+		switch req.Op {
+		case storage.OpFileOpen:
+			response.Node = node
+			if req.Open.ExpectedID != 0 && node != req.Open.ExpectedID {
+				err = errors.New("opened reference substituted its expected node identity")
+			}
+		case storage.OpFileOpenNode:
+			response.Node = node
+			if node != req.Node {
+				err = errors.New("opened reference substituted its requested node identity")
+			}
+		default:
+			if response.Attr == nil || response.Attr.ID != node {
+				err = errors.New("opened reference disagrees with its captured attributes")
+			}
+		}
+		if err != nil {
+			return response, uncertainFileEffect(err)
+		}
+	}
 	return h.finishFileMutation(ctx, response, nil)
 }
 
 func (h *Handler) performSessionCapability(ctx context.Context, s storage.FileSession, req fileRequest) (fileResponse, error) {
 	out := fileResponse{}
 	switch req.Op {
+	case fileObserveDirectoryMetadata:
+		return h.observeDirectoryMetadata(ctx, s, req)
 	case storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileMutateName:
 		v, ok := s.(storage.NamespaceAccess)
 		if !ok {
@@ -262,6 +301,8 @@ func (h *Handler) performSessionCapability(ctx context.Context, s storage.FileSe
 func performReferenceCapability(ctx context.Context, ref storage.NodeReference, req fileRequest) (fileResponse, error) {
 	out := fileResponse{}
 	switch req.Op {
+	case fileObserveName:
+		return observeReferenceName(ctx, ref, req)
 	case storage.OpFileState:
 		v, ok := ref.(storage.ReferenceStateAccess)
 		if !ok {

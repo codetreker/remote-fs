@@ -162,6 +162,18 @@ native admission 用例用一个暂停的 Put 占满 Session 唯一的 data slot
 
 [能力 decoder](../packages/transport/httprest/file_capabilities_test.go)拒绝不完整观察、丢失 LinkTarget/DirectoryRevision 和错误 capability advertisement；五类中立错误经 wire/journal 仍可由 errors.Is 区分。[部分打开用例](../packages/transport/httprest/file_capability_client_test.go)确保后置 capability/barrier 失败不遗弃可关闭引用，不把发生过效果的取消改成安全重试。
 
+### 目录 metadata 与引用名字观察
+
+[共享值和预算用例](../packages/storage/name_observation_test.go)区分 Root/Linked/Detached、保留原始字节、拒绝矛盾字段和 NodeID 替换；无 I/O ReferenceIdentity 只读取已持有身份，不通过 Stat/Node 猜测。[目录结果](../packages/storage/directory_metadata_test.go)核对 IncludeName 与目标一致；[ListResult](../packages/storage/bounded_test.go)验证实际 prefix 不产生 entry，重复、迟调用、负 charge 和溢出使整体失败。非法 header 必须在 sizing callback 前拒绝，callback 不能少收最低驻留量。
+
+[native 目录观察](../packages/metastore/sqlite/directory_metadata_test.go)使用真实 Scope/guard/目录修订，验证允许 metadata 披露仍不授予应用 ReadEntries 或 ReadMetadata；外来、关闭及 detached 目录目标均失败。IncludeName 的实际 prefix 先于子项收费，空目录/短名字可以通过紧预算，prefix 加子项越界使 token、Name 和列表全部失效；调用者低报 charge 不能绕过 native 硬上限。仅内部父/guard 的大 opaque metadata 不应被加载或占返回 payload 预算。
+
+[native 引用观察](../packages/metastore/sqlite/name_observation_test.go)让另一客户端改名并复用旧名字，确认原引用仍观察原 NodeID 的新绑定，且不要求额外 ReadMetadata。Root、detached 文件/目录/链接、重复绑定、缺失节点、超长或非 BLOB 名字分别核对；损坏 header 在 payload 和预算 callback 前失败。持有 native gate 时 identity getter 仍完成；guards、关闭、取消和原 session 失效保持错误，不重新按路径打开。名字和 State/Stat 分别检查，不能把两次观察当作共同快照。
+
+[HTTP 观察用例](../packages/transport/httprest/file_name_observation_test.go)核对两个固定 OpReplicationSnapshot 映射、context、严格字段组合与实际名字 JSON/base64 预算。server/client/ListResult 上限不同、空目录、caller prefix 拒绝都不得保留部分结果；本地 callback 只在远端有界解码后执行，不能当作已序列化的远端限额。旧式打开丢回复时沿原 action 恢复同一 node scalar，getter/捕获身份不符保留 pending-open 清理义务；纯观察不增加 history/ACK/barrier。[真实 native HTTP 用例](../packages/transport/httprest/file_name_observation_http_test.go)核对属性、目录枚举和内部披露的权限分离。
+
+[objectstore](../packages/storage/objectstore/directory_observation_test.go)、[limited](../packages/storage/limited/name_observation_test.go)、[locked](../packages/storage/locked/name_observation_test.go)与[replicated](../packages/storage/replicated/name_observation_test.go)分别验证整链能力拒绝、原 context/身份/错误、一次 prefix 与原数据准入。replicated 的观察回源，失效时不使用名字缓存；所有包各自取得 normal/race 和包内覆盖收据，不能把 wrapper 调用计入 native 的覆盖。Windows resolver 的祖先组合、最终 guard 与真实 QUERY_INFO/rename 行为仍需平台验收。
+
 ### 使用声明、精确范围与删除恢复
 
 native 使用声明测试覆盖旧/新打开的双向 Uses/Deny、匿名路径操作与确切引用 Scope；public ReadDirNode 和 replicated.List 都不能绕过 ReadEntries。metadata Lookup 与显式目录枚举分别测试，不能把同 session 当自我豁免。FUSE 的[owner 用例](../packages/fuse/lock_owners_test.go)验证引用/显式 owner 生命周期、仅用于死锁图的 Group 和本地 PID 映射。

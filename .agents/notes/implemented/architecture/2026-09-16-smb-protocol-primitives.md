@@ -32,4 +32,4 @@ SP800-108 派生实现保留原[NOTICE](../../../../packages/smb/internal/signin
 
 [原生运行 35095465239](https://github.com/codetreker/remote-fs/actions/runs/35095465239)以当前源码 checkout `328d5f64e22f9392816c69dca9a3c7707a0662ad`（PR head `8451a2ee2080323be8bb9ab171260701fa77342f`）在 Windows 11 Enterprise build 26200 ARM64 完成 42 个根、71 个 verdict，两项 native SSPI 根均通过且无 fail/skip。Windows package 自身覆盖为 135/171（78.9%），全部四包合计 762/805（94.66%），最低函数为 66.7%；来源校验无意外差异。该结果证明这批实际协议/认证组件，不能替代尚未接入的 endpoint、文件适配或映射。
 
-这些包尚不提供连接服务、share 发布、映射或已验证的 Windows 网络驱动器。接入仍须实现 endpoint/会话处理和中立文件适配，并对组合后的鉴权与文件行为完成真实平台验收。内部 metadata 观察、当前引用名字绑定、历史时间显示和缓存透明性继续由[Windows 提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)承接；本决定只部分交付其协议依赖，不缩减目标或把诊断原型成功当成交付实现。
+这些包尚不提供连接服务、share 发布、映射或已验证的 Windows 网络驱动器。接入仍须实现 endpoint/会话处理和中立文件适配，并对组合后的鉴权与文件行为完成真实平台验收。[中立观察能力](2026-09-16-neutral-file-capabilities.md)的 Windows 接入、历史时间显示和缓存透明性继续由[Windows 提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)承接；本决定只部分交付其协议依赖，不缩减目标或把诊断原型成功当成交付实现。

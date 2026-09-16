@@ -98,6 +98,14 @@ func validateFileRequest(r fileRequest) error {
 		expected.NodeRef = r.NodeRef
 	case storage.OpFileLookupAt:
 		expected.Child = r.Child
+	case fileObserveName:
+		reference = true
+		expected.Guards = r.Guards
+		expected.ResultBytes = r.ResultBytes
+	case fileObserveDirectoryMetadata:
+		expected.Directory = r.Directory
+		expected.DirectoryMetadata = r.DirectoryMetadata
+		expected.ResultBytes = r.ResultBytes
 	case storage.OpFileReadDirNode:
 		expected.Directory = r.Directory
 		expected.ResultBytes = r.ResultBytes
@@ -177,6 +185,10 @@ func validateFileRequest(r fileRequest) error {
 		if r.Child == nil {
 			return errors.New("lookup carries no child")
 		}
+	case fileObserveDirectoryMetadata:
+		if r.Directory == nil || r.DirectoryMetadata == nil {
+			return errors.New("directory metadata observation carries no target or options")
+		}
 	case storage.OpFileReadDirNode:
 		if r.Directory == nil {
 			return errors.New("directory read carries no target")
@@ -224,6 +236,7 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		case storage.OpFileStatus, storage.OpFileRenew:
 			expected.Status = r.Status
 		case storage.OpFileOpen, storage.OpFileOpenNode:
+			expected.Node = r.Node
 			expected.File = r.File
 			expected.Barrier = r.Barrier
 			expected.Capabilities = r.Capabilities
@@ -246,7 +259,9 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			expected.Barrier = r.Barrier
 		case storage.OpFileSync, storage.OpFileClose, storage.OpFileSessionClose:
 			expected.Barrier = r.Barrier
-		case storage.OpFileReadDirNode:
+		case fileObserveName:
+			expected.NameObservation = r.NameObservation
+		case storage.OpFileReadDirNode, fileObserveDirectoryMetadata:
 			expected.Directory = r.Directory
 		case storage.OpFileState:
 			expected.State = r.State
@@ -288,6 +303,15 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if !validFileCapability(r.File) || r.Capabilities == nil {
 			return errors.New("open response carries no reference capability")
 		}
+		if r.Capabilities.ReferenceName != (r.Node != 0) {
+			return errors.New("legacy open identity does not match name observation capability")
+		}
+		if req.Op == storage.OpFileOpenNode && r.Capabilities.ReferenceName && r.Node != req.Node {
+			return errors.New("identity open substituted its target")
+		}
+		if req.Op == storage.OpFileOpen && r.Capabilities.ReferenceName && req.Open.ExpectedID != 0 && r.Node != req.Open.ExpectedID {
+			return errors.New("path open substituted its expected identity")
+		}
 	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
 		if !validFileCapability(r.File) || r.Attr == nil || r.Capabilities == nil || r.Outcome < storage.Opened || r.Outcome > storage.Replaced {
 			return errors.New("atomic open response is incomplete")
@@ -300,7 +324,14 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if req.Name == nil || nameResultNeedsAttr(req.Name.Kind) && r.Attr == nil {
 			return errors.New("name response carries no required attributes")
 		}
-	case storage.OpFileReadDirNode:
+	case fileObserveName:
+		if r.NameObservation == nil {
+			return errors.New("reference name observation is absent")
+		}
+		if err := r.NameObservation.Check(); err != nil {
+			return err
+		}
+	case storage.OpFileReadDirNode, fileObserveDirectoryMetadata:
 		if r.Directory == nil || r.Directory.Entries == nil {
 			return errors.New("directory response carries no listing")
 		}
@@ -350,6 +381,20 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		}
 	}
 	if r.Directory != nil {
+		if req.Op == fileObserveDirectoryMetadata {
+			if req.Directory == nil || req.DirectoryMetadata == nil {
+				return errors.New("directory metadata response has no request target or options")
+			}
+			value := storage.DirectoryMetadataObservation{Observation: r.Directory.Observation, Name: r.Directory.Name}
+			if err := value.Check(*req.Directory, *req.DirectoryMetadata); err != nil {
+				return err
+			}
+			if len(r.Directory.Entries) > storage.MaxDirectoryEntries {
+				return errors.New("directory metadata response exceeds entry bound")
+			}
+		} else if r.Directory.Name != nil {
+			return errors.New("directory enumeration carries an unrequested name observation")
+		}
 		if err := r.Directory.Observation.Check(); err != nil {
 			return err
 		}

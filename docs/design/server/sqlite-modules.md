@@ -25,7 +25,7 @@
 
 根 `log.go` 用节点查询组装完整的 `metastore.Change`，再交给 `changes.Record`。日志组件不回调 Store 来补充身份。snapshot 的取得、事务结果与资源释放仍由根 package 拥有；`Seeding` 在原有生命周期内持有 commit admission，不因目录拆分提前释放。
 
-中立能力继续位于根 package：atomic_open/node_references 把名字条件、初值、UseClaim、intent 与 retainedFile 创建放在同一有序操作；namespace/namespace_guards/namespace_revision 处理原始叶名、观察与 rename 输出槽位。reference_scope/reference_order 将 Scope 和控制转换绑定 native gate，metadata/timestamps 维护共同事实与指定 namespace。它们不建立第二套文件、owner 或发布 coordinator。
+中立能力继续位于根 package：atomic_open/node_references 把名字条件、初值、UseClaim、intent 与 retainedFile 创建放在同一有序操作；namespace/namespace_guards/namespace_revision 处理原始叶名、观察与 rename 输出槽位。reference_scope/reference_order 将 Scope 和控制转换绑定 native gate，metadata/timestamps 维护共同事实与指定 namespace。它们不建立第二套文件、owner 或发布 coordinator。 directory_listing 共享先预留后载入的完整子项 producer；directory_metadata 在同一读取中核对目标、guards 和可选自身名字，name_observation 通过 entries_by_node 的固定 header 和唯一绑定取得引用当前名字。它们不载入未返回父/guard 的 opaque metadata，header 验证和实际长度预算先于叶名载入；结果不写日志、不推进 revision，也不修改 schema。
 
 pending_unlink 拥有 armed/pending 转换及有名删除；maintenance_accounting 在既有 gate 内绑定当前维护 chain 和初始化实际 Usage。活引用继续使用捕获的 cleanup hooks，恢复扫描跳过当前 incarnation；旧引用恢复才使用当前 chain。schema 只可在 Strong 初始化前回收已 detached 对象，有名 pending 的正常 Strong gate 由运行期恢复处理。
 

@@ -25,6 +25,19 @@ func validateCapabilityArguments(req fileRequest) error {
 		return req.NodeRef.storage().Check()
 	case storage.OpFileLookupAt:
 		return req.Child.Check()
+	case fileObserveName:
+		if req.ResultBytes <= 0 {
+			return syscall.EINVAL
+		}
+		return req.Guards.Check()
+	case fileObserveDirectoryMetadata:
+		if req.ResultBytes <= 0 {
+			return syscall.EINVAL
+		}
+		if err := req.Directory.Check(); err != nil {
+			return err
+		}
+		return req.DirectoryMetadata.Check()
 	case storage.OpFileReadDirNode:
 		if req.ResultBytes <= 0 {
 			return syscall.EINVAL

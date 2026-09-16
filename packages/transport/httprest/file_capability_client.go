@@ -55,7 +55,7 @@ func (s *remoteFileSession) openCapability(ctx context.Context, req fileRequest)
 		}
 		return nil, r, operationFailure(Request{Op: OpFile}, err, interruptible)
 	}
-	return &remoteFile{session: s, id: r.File, capabilities: *r.Capabilities}, r, nil
+	return &remoteFile{session: s, id: r.File, node: r.Attr.ID, capabilities: *r.Capabilities}, r, nil
 }
 func (s *remoteFileSession) OpenAt(ctx context.Context, name storage.ChildName, o storage.OpenAtOptions) (storage.OpenResult, error) {
 	r, _, e := s.OpenAtWithBarrier(ctx, name, o)
@@ -399,7 +399,7 @@ func (s *remoteFileSession) ReadDirNodeBounded(ctx context.Context, target stora
 	return response.Directory.Observation, nil
 }
 func fileResponseLimit(req fileRequest, limit int64) int64 {
-	if req.Op == storage.OpFileReadDirNode || fileAttrResult(req.Op) {
+	if req.Op == storage.OpFileReadDirNode || req.Op == fileObserveDirectoryMetadata || req.Op == fileObserveName || fileAttrResult(req.Op) {
 		return min(limit, req.ResultBytes)
 	}
 	return limit

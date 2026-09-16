@@ -6,6 +6,8 @@ Status: implemented
 
 平台客户端需要表达原子创建/替换、按目录身份访问、只查元数据的打开、共享限制、强制范围保护及删除意图。只在客户端保存这些状态，会让同一 volume 的其它入口绕过限制；把平台名字、mode 或锁协议下传，又会使所有远端部署承担某个平台的规则。
 
+按名访问还需要完整的目录 metadata 和已打开对象的当前名字。公开枚举正确执行 ReadEntries，不能承担只有 snapshot metadata 权限的内部解析；保存打开时的路径也无法跟随另一客户端的改名。
+
 已有 FileSession/File 已经承担保留对象、当前修订读取、同步修改、有限期限、动作核对与回收。扩展平台接入需要新的受控操作，但不需要再建立一套文件身份、内容提交和引用生命周期。
 
 ## 决定
@@ -33,6 +35,18 @@ Linux 的 `posix.permissions.v1` 是四字节 little-endian uint32，范围为 0
 可选 NamespaceGuards 核对实际观察的目录 revision、父子边与 root anchor，预算有界；FUSE 精确叶名操作不默认带全目录条件。rename 分开表达观察到的替换槽位和 OutputLeaf，最终事务验证源、替换对象与输出第三占位者。创建/改名返回捕获 Attr，Remove/RemoveDir 的已知成功可返回空 NameResult；不能为删除补做一次 Stat 或把空成功改成 EIO。
 
 OpenAt 的创建、保留身份清空或新身份替换、初始 metadata、UseClaim、armed CloseIntent 与返回 Attr/Outcome 在一个原生有序操作内完成。ConditionalFileMutation 的显式大小/namespace 条件与效果同在最终发布检查；Append 根据当前 EOF 构造候选，已知 revision 竞争才重建，普通 WriteAt 不增加外部版本前置条件。
+
+### metadata 披露与当前绑定独立观察
+
+DirectoryMetadataObserver 在原 FileSession 下按父身份、可选 Scope 和 NamespaceGuards 捕获完整子项；IncludeName 选择同时取得目录自身绑定。ReferenceNameObserver 在原 File/NodeReference 下返回固定 NodeID 的 Root、Linked 或 Detached，Linked 带当前 ParentID/RawLeaf。Root 不是缺失的默认值，Detached 不重建旧名字。名字与另一次 State/Stat 各有自己的捕获，不承诺额外的属性/名字事务。
+
+两种观察的 HTTP discriminator 固定授权为既有 OpReplicationSnapshot，不能由 caller 传任意 Uses 选择豁免。它们披露已有 snapshot 权限覆盖的有界 metadata，不授予应用 ReadEntries/ReadMetadata 或名字修改。引用仍须属于当前 session 且有效；允许 DeleteName 的引用不必增加 ReadMetadata 才能发现自己的绑定，后续 rename 仍受独立授权和最终 Scope/Uses/guards 约束。
+
+可选 ReferenceIdentity 只读取原引用已有的非零 NodeID，不执行 I/O；关闭后身份可保留，操作的存活检查不变。名字能力依赖这个 getter，基础 File/NodeReference 和 FUSE 不新增要求。HTTP 支持名字能力时把旧式打开的标量身份留在原 action receipt，全部打开核对 getter 与请求/捕获身份；失败继续交给原 pending-open 清理拥有者。
+
+原生观察先验证固定 SQL header，再按实际叶长检查名字驻留和边界编码预算，最后载入名字；不加载未返回父/guard 的 opaque metadata。IncludeName 通过 ListResult.ReservePrefix 在子项前计入自身名字，不伪造目录 entry，不按最大叶长浪费短名字预算。任何 header、prefix、entry 或取消错误使整份结果不可用；没有半份名字/列表成功。context sizing callback 是边界内部接合点，不序列化成远端 per-call 限额。
+
+这些只读能力复用原 native gate、引用准入、HTTP 数据通道和包装器，replicated 回源，不新建身份、日志、schema、lease 或动作历史。成本是显式远端观察及客户端最终 guard 核对；它提供当前绑定事实，Windows 的名字投影、祖先组合和请求映射仍由平台接入完成。
 
 ### Uses 与范围保持独立语义
 
@@ -66,6 +80,8 @@ HTTP/v4 使用中立 Attr、metadata、范围及能力 DTO，旧 v3 路由明确
 
 **每次发送完整锁快照。** 快照覆盖会把独立区间的变化变成整体竞争，还须重新定义等待、转换和取消。命令式增删保留已有历史与顺序，独立 claim 只增加实际需要的 multiplicity。
 
+**内部解析复用公开枚举或记住的打开路径。** 前者增加应用 ReadEntries 前提，后者在跨客户端改名后过时。独立 snapshot-authorized 观察保留权限分工，并提供最终修改可以再次核对的事实；不为一个当前名字查询维护整份 volume 缓存。
+
 **远端解释 Windows 或 POSIX 属性与名字。** 会让某个平台改变所有入口的规则。NodeKind、共同时间与 opaque namespace 保持事实中立，平台 codec/错误映射在客户端。
 
 ## 后果
@@ -76,4 +92,4 @@ HTTP/v4 使用中立 Attr、metadata、范围及能力 DTO，旧 v3 路由明确
 
 本决定部分接续[平台客户端提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)的通用核心和[文件目标提案](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)的目录父身份。它保留 live-file、Strong、quota 与未知对象发布的既有理由；显式内容版本、R-CON-5 的应用调用单位和其它独立提案不因能力名称相近而完成。
 
-Windows 本机 SMB 的实际接入与缓存透明性继续由平台提案承接。诊断原型的结果不替代交付实现，内部名字观察、共享模式/通知共存与历史时间显示也不能由通用能力自动推导。本决定不宣称 Windows 已交付，不缩减规格中的 Windows 目标。
+Windows 本机 SMB 的实际接入与缓存透明性继续由平台提案承接。诊断原型的结果不替代交付实现；已交付的观察能力仍需接入 Windows 名字解释，共享模式/通知共存与历史时间显示不能由通用能力自动推导。本决定不宣称 Windows 已交付，不缩减规格中的 Windows 目标。

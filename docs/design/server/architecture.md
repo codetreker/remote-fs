@@ -108,7 +108,11 @@ metadata 是原始 namespace payload 及 authority version 的映射，不含 Go
 
 保留文件的响应 envelope 按操作携带 FileSession 状态、引用能力、属性、字节、中立范围结果与可选 barrier，不能套用基础 mutation 的空 object 规则。Data 与 Path 使用 base64 字节字段；时间间隔以整数纳秒编码。Open 先返回有期限的待确认能力，client 完成确认才交给调用方；未确认引用与关闭的动作记录受 registry 上限约束。完整形状与核对边界见[文件协议](file-handles.md#五http复制与资源)。
 
-文件能力的 opcode 仍在 file/file-control 下分发：OpenAt、NodeReference、LookupAt、ReadDirNode、MutateName、metadata、pending 和条件文件修改走 `/v4/file`；session-open 同样走 `/v4/file`；其余 session 控制、ACK/Close、Scope、UseOwner 与 RangeControl 走 `/v4/file-control`。文件控制完整 envelope 至多 256 KiB，不能沿用 Strong 的 16 KiB 限额。接口能力在会话建立时逐项报告，底层缺失不由 handler 用多次路径操作补全。
+文件能力的 opcode 仍在 file/file-control 下分发：OpenAt、NodeReference、LookupAt、ReadDirNode、MutateName、metadata、pending 和条件文件修改走 `/v4/file`；session-open 同样走 `/v4/file`；其余 session 控制、ACK/Close、Scope、UseOwner 与 RangeControl 走 `/v4/file-control`。文件控制完整 envelope 至多 256 KiB，不能沿用 Strong 的 16 KiB 限额。接口能力在会话建立时逐项报告，底层缺失不由 handler 用多次路径操作补全。 directoryMetadata/referenceName 两项可选标志分别广告目录 metadata 与引用名字观察；HTTP 自有 `file-observe-directory-metadata`、`file-observe-name` 仍走 `/v4/file` 的只读数据准入，固定授权为 replication.snapshot，不产生 action、ACK 或 barrier。
+
+目录观察请求的 directoryMetadata 携带 Guards/IncludeName，引用名字请求使用 guards；结果分别为 directory 的可选 Name 和 standalone nameObservation。Root/Linked/Detached 的字段组合、目标 NodeID、请求的 IncludeName 均严格核对，错误丢弃整份观察。名字前缀按实际原始叶长、驻留及 JSON/base64 编码在加载前计量；本地 sizing callback 不序列化为远端 per-call 限额，数值边界由 ResultBytes/MaxBody 与目录 ListResult 传递。
+
+名字能力支持时，旧 OpenFile/OpenNode 在原打开回执增加已捕获 node scalar，支持标志缺席时保持旧形状。server 用无 I/O ReferenceIdentity 核对全部打开的 ExpectedID/NodeID 或原子结果 Attr.ID，client 再核对请求；getter/身份失败按已打开结果的 EIO/cleanup 所有权处理，不补做属性或名字查询。
 
 五类中立错误还带经过严格校验的 capabilityCode：use/range conflict、pending delete、condition conflict 与 invalid scope；errno 与 errors.Is 分类保持一致，journal 回放不丢该类别。未知分类或与 errno 不一致的 envelope 为协议错误，业务授权失败仍使用可信的普通 EACCES/EIO，不泄露底层控制状态。
 

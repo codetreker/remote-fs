@@ -16,7 +16,7 @@ type fileReadOnlyKey struct{}
 
 func fileReadOnly(op storage.Operation) bool {
 	switch op {
-	case storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileRangeGetConflict, storage.OpFileRangeQuery, storage.OpFileReadDirNode, storage.OpFileLookupAt, storage.OpFileState, storage.OpFileScope, storage.OpFileStatus:
+	case fileObserveDirectoryMetadata, fileObserveName, storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileRangeGetConflict, storage.OpFileRangeQuery, storage.OpFileReadDirNode, storage.OpFileLookupAt, storage.OpFileState, storage.OpFileScope, storage.OpFileStatus:
 		return true
 	}
 	return false
@@ -44,6 +44,7 @@ type remoteFileSession struct {
 }
 
 type remoteFile struct {
+	node         uint64
 	session      *remoteFileSession
 	id           string
 	mu           sync.Mutex
@@ -238,7 +239,7 @@ func (s *remoteFileSession) open(ctx context.Context, req fileRequest) (storage.
 		}
 		return nil, nil, operationFailure(Request{Op: OpFile}, err, interruptible)
 	}
-	return &remoteFile{session: s, id: response.File, capabilities: *response.Capabilities}, response.Barrier, nil
+	return &remoteFile{session: s, id: response.File, node: response.Node, capabilities: *response.Capabilities}, response.Barrier, nil
 }
 
 func (s *remoteFileSession) OpenFile(ctx context.Context, path string, o storage.FileOpenOptions) (storage.File, error) {

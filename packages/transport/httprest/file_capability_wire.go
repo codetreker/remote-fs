@@ -152,6 +152,7 @@ func (v fileMutationOptions) storage() storage.FileMutation {
 }
 
 type observedDirectory struct {
+	Name        *storage.NameObservation     `json:"name,omitempty"`
 	Observation storage.DirectoryObservation `json:"observation"`
 	Entries     []observedEntry              `json:"entries"`
 }
@@ -191,14 +192,16 @@ func (v referenceState) storage() storage.ReferenceState {
 }
 
 type fileCapabilities struct {
-	AtomicOpen  bool `json:"atomicOpen"`
-	Namespace   bool `json:"namespace"`
-	References  bool `json:"references"`
-	Metadata    bool `json:"metadata"`
-	Owners      bool `json:"owners"`
-	Ranges      bool `json:"ranges"`
-	State       bool `json:"state"`
-	Scope       bool `json:"scope"`
-	Delete      bool `json:"delete"`
-	Conditional bool `json:"conditional"`
+	DirectoryMetadata bool `json:"directoryMetadata"`
+	ReferenceName     bool `json:"referenceName"`
+	AtomicOpen        bool `json:"atomicOpen"`
+	Namespace         bool `json:"namespace"`
+	References        bool `json:"references"`
+	Metadata          bool `json:"metadata"`
+	Owners            bool `json:"owners"`
+	Ranges            bool `json:"ranges"`
+	State             bool `json:"state"`
+	Scope             bool `json:"scope"`
+	Delete            bool `json:"delete"`
+	Conditional       bool `json:"conditional"`
 }

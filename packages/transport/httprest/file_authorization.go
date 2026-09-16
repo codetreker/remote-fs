@@ -10,6 +10,8 @@ func (h *Handler) authorizeFile(ctx context.Context, req fileRequest) error {
 	access := authz.AccessRequest{Operation: req.Op}
 	var additional []storage.Operation
 	switch req.Op {
+	case fileObserveDirectoryMetadata, fileObserveName:
+		access.Operation = storage.OpReplicationSnapshot
 	case storage.OpFileOpen, storage.OpFileOpenNode:
 		access.Open = req.Open.OpenAccess
 	case storage.OpFileOpenAt:

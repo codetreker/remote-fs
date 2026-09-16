@@ -24,6 +24,8 @@ Renew 返回确认的 epoch、revision、保守剩余 lease/history；Status 只
 | NamespaceAccess | LookupAt、ReadDirNode/Bounded、MutateName |
 | NodeReferences | OpenNodeRef/OpenChildRef，返回无字节方法的 NodeReference |
 | ReferenceStateAccess、ScopedReference | 同次捕获 Attr/LinkTarget/Detached/PendingUnlink；取得确切引用 Scope |
+| DirectoryMetadataObserver | 按父身份捕获完整 metadata 列表，可选同时取得该目录的名字绑定 |
+| ReferenceIdentity、ReferenceNameObserver | 不作 I/O 的固定 NodeID；显式捕获 Root/Linked/Detached 当前绑定 |
 | MetadataAccess、ReferenceMetadataAccess | 按 NodeID 或保留引用替换一个 namespace |
 | UseOwners、RangeControl | owner 注册/退役、冲突查询、批量编辑、动作核对和解除 |
 | DeleteIntent | SetPendingUnlink/ClearPendingUnlink |
@@ -69,6 +71,22 @@ OpenAt 的 Keep/ResetContent/ReplaceNode 分别保留状态、同身份清空和
 
 OpenResult/NodeOpenResult 在错误时仍可带非 nil 引用，调用方必须关闭它；replicated/HTTP 包装器可以只暴露 cleanup 能力，不能丢掉引用。NameResult.Attr 与错误同返表示效果可能已经发生，取消不能改成可安全重试；已知回滚返回零结果。
 
+### 显式 metadata 与名字观察
+
+[DirectoryMetadataObserver](../../../packages/storage/directory_metadata.go) 是 FileSession 的可选能力。ObserveDirectoryMetadata 接受 DirectoryTarget、DirectoryMetadataOptions{Guards, IncludeName} 和空 ListResult，返回 DirectoryMetadataObservation{Observation, Name}。native 在同一 gate/读取事务中核对 guards、目录种类、linkedness 和可选确切 Scope，捕获 DirectoryRevision 与完整子项。它披露 snapshot 已授权的 metadata；不派生应用 ReadEntries，也不扩大应用 ReadMetadata。失效 Scope 仍失败，不能回退到裸 NodeID。ReadDirNode 与 public List 保持各自授权和 share 检查。
+
+IncludeName 为 false 时没有 Name 字段或名字前缀预算；为 true 时，目录自身的 NameObservation 与列表属于同一次捕获，只能是 Root 或 Linked。所有错误使 ListResult.Fail，返回零 observation；只有方法与 result.Entries 都成功后，列表才可使用。成功完整观察可供客户端判断缺失组件；普通 ENOENT 不能证明错误发生在哪一段。
+
+[ReferenceNameObserver](../../../packages/storage/name_observation.go) 可选地附在 File/NodeReference 上。ObserveName(ctx, guards) 使用原引用准入，返回固定 NodeID 及 NameRoot、NameLinked 或 NameDetached。Linked 具有当前 ParentID 和原始 RawLeaf；Root 确认选定 volume 的根，Detached 明确没有当前名字，两者均不带 parent/leaf。它不取得属性、不授予 rename/delete，不把重复绑定、缺失节点或损坏事实解释成 detached。Name 与另一次 State/Stat 是各自的捕获，不承诺共同快照。
+
+ReferenceIdentity.ReferenceNodeID 只返回引用已拥有的非零 NodeID，不作 I/O、不取得 gate 或延长期限，关闭后仍可返回该身份；实际观察继续检查存活。它不是 File/NodeReference 或 FUSE 的必需接口。名字能力的检查要求 getter 成功，每次观察的 NodeID 必须与它一致；不支持为 EOPNOTSUPP，零身份或矛盾响应为错误。
+
+native 先用固定 SQL header 核对节点/父种类、volume、detached、唯一绑定、名字存储类型和实际长度，再调用 NameObservationBudget，随后才载入叶名字节。未返回的父/guard 节点不加载 opaque metadata。默认名字驻留 charge 为 512+4×实际叶长；callback 只能以复制 scalar 和长度做有界尺寸计算，至少保留该 charge，不能 I/O、重入或保留输入。畸形 header 在 callback 前失败，短名字不按最大叶长预收费。
+
+IncludeName 先将完整名字 charge 交给 ListResult.ReservePrefix，再为每个子项预留；prefix 不占 entry 数量。ReservePrefix 只允许在 entry 预留前调用一次，负数、溢出、重复或迟调用使整份结果失败。原有目录项/字节硬上限同时包含这个前缀。HTTP 还计入精确 JSON scalar、envelope 与实际长度的 base64，server 取 ResultBytes 与 MaxBody 较小值。目录请求再受调用方 ListResult 限制；本地 context callback 不被序列化，不能据此承诺远端 per-call 限额，client 在有界解码后执行自己的 callback。
+
+名字观察没有 action、ACK、barrier、日志或新引用，失败返回零值并保留原因。objectstore 通过原 session/引用准入转发，limited/locked 保持上下文，replicated 回源；不能用本地副本或记住的路径重建当前绑定。后续名字修改仍需原 NameCommand 的 SameNode、Scope、Uses 与 guards 在最终事务核对，观察本身不证明稍后的操作成功。
+
 ## 四、advisory 范围与 owner
 
 UseClaim 以 `(new.Uses & old.Deny) != 0` 或反向交集判冲突。实际操作派生用途，不能通过空声明绕过已生效限制；Reference Scope 只豁免自身的 claim，不豁免同 session 的其它引用。业务授权、读写权限和 claims 分别验证。
@@ -102,11 +120,13 @@ HTTP/v4 使用原 file/file-control registry，servedFile 可持有 File 或 Nod
 | OpenFile/OpenNode/OpenAt/OpenNodeRef/OpenChildRef | 原 action journal/input digest；成功引用先 pending，ACK 后交给 caller；相同动作不重复引用或 armed intent |
 | namespace/metadata/条件修改/pending 控制 | /v4/file 交换，按操作分类使用原 journal；同 ID 不同 body、budget 或 scope 拒绝 |
 | Range Apply/Query/Cancel | coordinator 的原请求 epoch/nonce/历史；取消不证明未授予 |
-| Stat/State/Scope/LookupAt/ReadDirNode 等只读 | 当前真实结果，失败不填默认值；不为读取新建通用 receipt |
+| Stat/State/Scope/LookupAt/ReadDirNode/metadata 与名字观察等只读 | 当前真实结果，失败不填默认值；不为读取新建通用 receipt |
 | Close/Session.Close | capability 幂等及原 registry cleanup；清理成功后再捕获 barrier；缺失已关闭引用仍保留幂等成功 |
 | 基础路径 Storage API | 原本的单次请求/错误规则，不改造成所有 native 调用都有 RequestID |
 
 直接 Go 调用不隐藏重投未知操作。HTTP 对丢失动作响应使用原请求在有界 recovery context 中核对，未完成恢复时 fence 并退役 session。没有 Create/Truncate 的已有普通文件打开，若 ACK 为带 context.Canceled 的规范 EINTR，且同一能力原始 Close 结果为 nil，才保留无 File 的 EINTR；其余 ACK 不明或清理失败保持 EIO，不撤销已经发生的创建/截断效果。
+
+支持名字观察的打开核对 ReferenceNodeID：OpenAt/NodeReference 与捕获 Attr.ID 一致，旧 OpenFile/OpenNode 与指定 ExpectedID/NodeID 一致。旧式打开只在名字能力存在时把 node scalar 加入原 action receipt，client 再核对请求身份；不支持该能力保持原回复形状。getter 或身份校验在打开后失败仍归原 pending-open 清理拥有者，不能补做 Stat。
 
 原生 Open/Name 后置检查失败保留发生效果的 EIO 分类和原因；返回的可关闭引用不因 replica barrier 不可用而丢失。replicated wrapper 先执行 Close 与 authority 清理，再确认 progress；broken live stream 使确认失败，而不是阻止清理。detached 内容修改无路径事件，但仍可返回真实当前 barrier。
 

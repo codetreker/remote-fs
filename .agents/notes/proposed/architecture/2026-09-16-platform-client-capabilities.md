@@ -8,11 +8,11 @@ Windows 程序通过系统自带 SMB 客户端访问 volume 时，名字解释�
 
 Linux 和编程入口可以创建 Windows 无法表示或存在大小写歧义的名字。Windows 必须拒绝受影响的名字观察，却不能让无关名字变化使已有 File 的身份访问失效。metadata-only 打开又不等于公开列目录权限，内部名字解析需要的数据不能借一个被分享限制拒绝的用户列表调用取得。
 
-[中立文件能力](../../implemented/architecture/2026-09-16-neutral-file-capabilities.md)已经接续本提案的通用核心：NodeKind/metadata、原子 namespace、保留引用、Uses/ranges、删除意图、v6 与 HTTP/v4。本文保留 Windows 本机接入及其尚需验证的组合，规格中的 Windows 目标保持完整，不因拆清已经交付的部分而缩减。
+[中立文件能力](../../implemented/architecture/2026-09-16-neutral-file-capabilities.md)已经接续本提案的通用核心：NodeKind/metadata、原子 namespace、保留引用、Uses/ranges、删除意图、v6、HTTP/v4，以及有界目录 metadata/引用名字观察。本文保留 Windows 本机接入及其尚需验证的组合，规格中的 Windows 目标保持完整，不因拆清已经交付的部分而缩减。
 
 ## 提案
 
-[SMB 协议基础组件](../../implemented/architecture/2026-09-16-smb-protocol-primitives.md)部分交付本提案的报文/签名/认证依赖，Windows SSPI helper 也有独立实现；这不代表 endpoint、映射、文件适配或 native 认证/缓存验收完成。下述平台接入与剩余能力仍是同一目标。
+[SMB 协议基础组件](../../implemented/architecture/2026-09-16-smb-protocol-primitives.md)部分交付本提案的报文/签名/认证依赖，Windows SSPI helper 也有独立实现；原生 SSPI 组件已有自己的实测，仍不代表 endpoint、映射、文件适配或组合后的认证/缓存验收完成。下述平台接入与剩余能力仍是同一目标。
 
 ### 接入形态与现有依赖
 
@@ -41,30 +41,21 @@ Open/create、错误非 nil 的部分引用、Remove/RemoveDir 空成功结果�
 
 公开 ReadDirNode 的 ReadEntries 检查已经生效，不能为 Windows 内部 resolver 而削弱它。当前通知 manager 没有一份可直接承担名字解析的静态缓存；把 Linux SQLite Replica 直接带到 Windows 还涉及现有 nativelease 依赖及打开路径的可移植性，不能把交叉编译一个 HTTP 包说成完整复制栈可用。
 
-补充方案采用有界、按父目录取得 replication metadata 的独立能力，复用现有 DirectoryTarget、NamespaceGuards 与 ListResult：
+已交付的 DirectoryMetadataObserver 复用 DirectoryTarget、DirectoryMetadataOptions{Guards, IncludeName} 与 ListResult，在原 FileSession/原生读取顺序中核对父 Scope/linkedness 和前缀 guards，返回完整子项与 DirectoryObservation。IncludeName 可同时取得父目录自身的 Root/Linked 绑定；名字前缀与子项在载入前按实际大小计费，任何错误使整个结果不可读。接口与预算由[文件能力设计](../../../../docs/design/server/file-handles.md#显式-metadata-与名字观察)拥有。
 
-```go
-type DirectoryMetadataObserver interface {
-    CheckDirectoryMetadataObservation() error
-    ObserveDirectoryMetadata(
-        context.Context, DirectoryTarget, *NamespaceGuards, *ListResult,
-    ) (DirectoryObservation, error)
-}
-```
-
-这个接口尚未进入已交付核心。它在原 FileSession/原生读取顺序中核对当前父 Scope/linkedness 和所有前缀 guards，然后捕获 token 与完整子项；名字和 metadata 在加载前接受已有 entry、byte 与驻留预算，失败使 ListResult 不可读，不保留半份 token/列表。它没有游标、open ACK、动作历史、引用分配或 TTL。
-
-HTTP 只增加传输自己的只读 discriminator，固定映射到既有 OpReplicationSnapshot 和可信 volume/context，不创建第二个共享 storage.Operation。它披露的是 snapshot 已授权的 metadata 子集；允许公开枚举不隐含该权限，允许该权限也不能把被 ReadEntries 拒绝的显式 QUERY_DIRECTORY 改走此入口。客户端不能传任意 Uses 来选择绕过行为。Windows 直接使用 portable HTTP，不因此引入 SQLite/replicated 的未完成移植工作。
+Windows resolver 仍须把这份能力接入名字投影与逐组件选择。HTTP 的只读 discriminator 固定映射既有 OpReplicationSnapshot，披露 snapshot 已授权的 metadata 子集；允许公开枚举不隐含该权限，也不能把被 ReadEntries 拒绝的显式 QUERY_DIRECTORY 改走此入口。客户端不能传任意 Uses 选择绕过行为。Windows 直接使用 portable HTTP，不因此引入 SQLite/replicated 的未完成移植工作。
 
 只有这种成功、完整且 guards 相符的观察才能判定哪个名字组件缺失。普通 Open/Lookup 返回的 ENOENT 可能来自父身份或其它阶段，不是“已证明最终叶名不存在”的凭据；不能用临时打开引用进行无副作用的缺失探测。
 
 ### 已打开对象的当前名字绑定
 
-当前 ReferenceState 只有身份、属性、LinkTarget 与 detached/pending，不返回当前 ParentID/RawLeaf。另一客户端改名后，Windows 不能靠打开时的旧名字回答当前名字的 QUERY_INFO 或实现按 handle 的 rename，也不能扫描整棵树猜测这个 NodeID 在哪里。
+ReferenceNameObserver 已能在有效引用上捕获当前 NodeID、ParentID/RawLeaf 或明确的 Root/Detached。ReferenceIdentity 是无 I/O 的可选标量 getter，不能授予观察或延长期限；State/Stat 仍不返回名字。Windows 按 handle 的 rename 和当前名字 QUERY_INFO 需要使用这份观察，不能继续依赖打开时的旧路径。
 
-补充方向是显式、可选且有界的引用名字观察：复用既有[原生按 NodeID 索引的 locate](../../../../packages/metastore/sqlite/log.go)，在有效引用的 native 顺序中取得当前父身份/原始叶名，或明确的无名字状态。它不扩大纯 State/Stat 的返回或依赖，不增加 EntryID、完整名字缓存或另一生命周期；具体 API 仍需确定，未进入已交付核心。
+handle rename 以观察到的父/叶名、SameNode 和实际引用 Scope 构造既有 NameCommand，最终原子检查 source、Uses 与 guards；期间再次改名返回已知条件冲突后可在原请求预算内刷新。Root/Detached 不能伪造源名字；未知修改不重新提交。
 
-观察不授予名字修改权限。后续 rename/delete 仍携带捕获的精确槽位条件、所需 guards 和实际引用 Uses，最后原子核对；期间再次改名则已知拒绝并有界刷新。无名字、引用失效或无法核对时明确失败，不重建旧路径或把旧名字上的替代节点当目标。
+当前路径查询从引用 ObserveName 开始，逐父调用 IncludeName 的完整目录观察。每层检查 Windows 表示和歧义，保留有界边/目录 token 后释放完整子项；到达选定 root 后，再对最初引用调用带全部 guards 的 ObserveName，核对其存活和整条链。只有最终核对成功才返回组合路径。循环、深度/guard/输出上限、断线和失效引用均明确失败，不扫描全 volume 或复用旧路径。
+
+这段平台遍历和结果映射仍待接入。名字观察与另一次属性查询不是同一快照；不为 QUERY_INFO 虚构已实现的 Attr-plus-name 原子事务。公开目录枚举、属性、rename/delete 各自仍按自己的权限执行，snapshot-authorized 内部观察不替代这些操作。
 
 ### 打开、共享与删除的映射
 
@@ -115,7 +106,7 @@ FILE_DELETE_ON_CLOSE 对应 armed OnReferenceClose，指定引用结束时触发
 
 ## 风险
 
-内部 metadata 观察与公开枚举使用不同既有权限，映射错误会造成越权或把合法查找误拒绝；它必须是固定语义的新 facet，不能给通用接口增加可由调用者选择的豁免。
+内部 metadata 观察与公开枚举使用不同既有权限，映射错误会造成越权或把合法查找误拒绝；已交付 facet 的固定语义须在 Windows 适配中保持，不能给调用者选择豁免或将公开 QUERY_DIRECTORY 改走内部入口。
 
 原生缓存和共享模式的组合仍可能让某条方案不可交付。出现失败要明确其实际条件并继续处理既定目标，不能通过降低一秒保证、忽略 deny 或把诊断源码当生产实现掩盖。
 
