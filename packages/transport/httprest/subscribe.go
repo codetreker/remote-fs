@@ -337,7 +337,11 @@ func (snap *Snapshot) Next() ([]metastore.Row, error) {
 		}
 		rows := make([]metastore.Row, 0, len(page.Rows))
 		for _, row := range page.Rows {
-			rows = append(rows, row.Metastore())
+			native, err := row.Metastore()
+			if err != nil {
+				return nil, snap.stream.fail(unreachable(snap.stream.req, err))
+			}
+			rows = append(rows, native)
 		}
 		return rows, nil
 	case eventDone:

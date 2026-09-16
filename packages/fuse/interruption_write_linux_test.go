@@ -91,12 +91,12 @@ type signalFileStorage struct {
 	wrap func(storage.File) storage.File
 }
 
-func (s *signalFileStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
-	session, err := s.FileStorage.NewFileSession(ctx, options)
+func (s *signalFileStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
+	session, status, err := s.FileStorage.NewFileSession(ctx, options)
 	if err != nil {
-		return nil, err
+		return nil, status, err
 	}
-	return &signalFileSession{FileSession: session, wrap: s.wrap}, nil
+	return &signalFileSession{FileSession: session, wrap: s.wrap}, status, nil
 }
 
 type signalFileSession struct {
@@ -104,16 +104,8 @@ type signalFileSession struct {
 	wrap func(storage.File) storage.File
 }
 
-func (s *signalFileSession) OpenFile(ctx context.Context, name string, options storage.FileOpenOptions) (storage.File, error) {
-	file, err := s.FileSession.OpenFile(ctx, name, options)
-	if err != nil {
-		return nil, err
-	}
-	return s.wrap(file), nil
-}
-
-func (s *signalFileSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
-	file, err := s.FileSession.OpenNode(ctx, id, options)
+func (s *signalFileSession) Reference(ctx context.Context, id storage.FileReferenceID) (storage.File, error) {
+	file, err := s.FileSession.Reference(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -125,9 +117,9 @@ type countedSignalFile struct {
 	writes *atomic.Int32
 }
 
-func (f *countedSignalFile) WriteAt(ctx context.Context, offset int64, data []byte) (storage.Attr, error) {
+func (f *countedSignalFile) WriteAt(ctx context.Context, request storage.FileWriteRequest, action storage.FileActionID) (storage.FileActionReceipt, error) {
 	f.writes.Add(1)
-	return f.File.WriteAt(ctx, offset, data)
+	return f.File.WriteAt(ctx, request, action)
 }
 
 type heldCloseCleanup struct {
@@ -136,16 +128,16 @@ type heldCloseCleanup struct {
 	release chan struct{}
 }
 
-func (s *heldCloseCleanup) DropLocks(ctx context.Context, owner storage.LockOwner, family storage.LockFamily) error {
-	if family != storage.POSIX {
-		return s.File.DropLocks(ctx, owner, family)
+func (s *heldCloseCleanup) RetireRangeOwner(ctx context.Context, owner storage.RangeOwnerID, scope storage.RangeScope, action storage.FileActionID) (storage.FileActionReceipt, error) {
+	if scope.Domain != 0x504f534958 || scope.Enforced {
+		return s.File.RetireRangeOwner(ctx, owner, scope, action)
 	}
 	s.entered <- ctx
 	select {
 	case <-s.release:
 	case <-ctx.Done():
 	}
-	return s.File.DropLocks(ctx, owner, family)
+	return s.File.RetireRangeOwner(ctx, owner, scope, action)
 }
 
 type flushInterruptTrace struct {
@@ -233,9 +225,9 @@ type interruptedFileWrite struct {
 	calls    atomic.Int32
 }
 
-func (s *interruptedFileWrite) WriteAt(ctx context.Context, offset int64, data []byte) (storage.Attr, error) {
+func (s *interruptedFileWrite) WriteAt(ctx context.Context, request storage.FileWriteRequest, action storage.FileActionID) (storage.FileActionReceipt, error) {
 	if s.calls.Add(1) != 1 {
-		return s.File.WriteAt(ctx, offset, data)
+		return s.File.WriteAt(ctx, request, action)
 	}
 	s.entered <- ctx
 	select {
@@ -247,7 +239,7 @@ func (s *interruptedFileWrite) WriteAt(ctx context.Context, offset int64, data [
 		err = syscall.EIO
 	}
 	s.returned <- err
-	return storage.Attr{}, err
+	return storage.FileActionReceipt{Action: action, Operation: storage.OpFileWrite, State: storage.FileActionNotApplied, Errno: storage.ErrnoOf(err)}, err
 }
 
 func TestSignalDuringWritePreservesTheAuthoritativeQuotaLimit(t *testing.T) {
@@ -324,6 +316,10 @@ func runWriteSignalChild(t *testing.T, mode string) {
 	defer file.Close()
 	fd := file.Fd()
 	if mode == "close" {
+		lock := unix.Flock_t{Type: unix.F_WRLCK, Whence: 0, Start: 0, Len: 0}
+		if err := unix.FcntlFlock(fd, unix.F_SETLK, &lock); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := file.Write([]byte("new body")); err != nil {
 			t.Fatal(err)
 		}

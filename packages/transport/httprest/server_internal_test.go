@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"io/fs"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -34,9 +33,9 @@ func TestListResponseFitCalculationMatchesTheWire(t *testing.T) {
 		{
 			Name: "plain",
 			Attr: storage.Attr{
-				ID:         1,
-				Mode:       0o640,
-				Size:       7,
+				ID:   1,
+				Kind: storage.NodeRegular, MetadataRevision: 1,
+				Size:       math.MaxInt64,
 				AccessTime: time.Unix(-1, 999_999_999),
 				ModTime:    time.Unix(1<<40, 1),
 			},
@@ -44,15 +43,19 @@ func TestListResponseFitCalculationMatchesTheWire(t *testing.T) {
 		{
 			Name: "\x00\xff not utf-8",
 			Attr: storage.Attr{
-				ID:         ^uint64(0),
-				Mode:       fs.ModeDir | 0o755,
-				Size:       -1 << 63,
+				ID:   ^uint64(0),
+				Kind: storage.NodeDirectory, MetadataRevision: 1, DirectoryRevision: 1,
+				Size:       0,
 				AccessTime: time.Unix(1<<62, 0),
 				ModTime:    time.Unix(-1<<62, 123_456_789),
 			},
 		},
 	}
-	encoded, err := json.Marshal(ListResponse{Entries: EntriesOf(entries)})
+	wire, err := EntriesOf(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(ListResponse{Entries: wire})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,18 +396,56 @@ func TestChangeDeliveryIsIndependentOfSnapshotAdmissionAndASlowSubscriber(t *tes
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = log.Close() })
+	after, err := log.CommittedPosition(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := log.Create(t.Context(), "changed"); err != nil {
 		t.Fatal(err)
 	}
+	result, err := newChangeFrameResult(DefaultMaxFrameBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retention, err := log.Since(t.Context(), after, DefaultLimits().EventPage, result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes, err := result.Changes()
+	if err != nil || len(changes) == 0 {
+		t.Fatalf("fixture changes=%d: %v", len(changes), err)
+	}
+	if changes[len(changes)-1].Position != retention.Tail {
+		t.Fatal("fixture change page did not reach its committed tail")
+	}
+	var frameBytes int64
+	for _, native := range changes {
+		change, err := ChangeOf(native)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := marshalFrame(eventChange, change, DefaultMaxFrameBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		size, err := encodedFrameBytes(eventChange, int64(len(encoded)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		frameBytes = max(frameBytes, size)
+	}
+
 	backing := volumeFixture(t)
 	options := DefaultHandlerOptions()
-	options.MaxFrameBytes = 1024
+	// One complete committed event must fit while the snapshot pool holds exactly one frame.
+	options.MaxFrameBytes = frameBytes
 	options.MaxConcurrentSnapshotFrames = 1
 	options.MaxInFlightSnapshotFrameBytes = retainedFrameMultiplier * options.MaxFrameBytes
 	handler, err := NewHandlerWithOptions(backing, log, options)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer handler.Stop()
 	releaseSnapshot, err := handler.acquireSnapshotFrame(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -417,9 +458,29 @@ func TestChangeDeliveryIsIndependentOfSnapshotAdmissionAndASlowSubscriber(t *tes
 		t.Fatal(err)
 	}
 	blockedContext, cancelBlocked := context.WithCancel(t.Context())
-	blockedDone := make(chan error, 1)
-	go func() { blockedDone <- handler.publish(blockedContext, blockedOut, 0, make(chan struct{})) }()
-	<-blocked.entered
+	releaseBlocked := sync.OnceFunc(func() { close(blocked.release) })
+	blockedDone := make(chan struct{})
+	var blockedErr error
+	go func() {
+		blockedErr = handler.publish(blockedContext, blockedOut, after, make(chan struct{}))
+		close(blockedDone)
+	}()
+	defer func() {
+		cancelBlocked()
+		releaseBlocked()
+		select {
+		case <-blockedDone:
+		case <-time.After(time.Second):
+			t.Error("blocked publisher did not stop")
+		}
+	}()
+	select {
+	case <-blocked.entered:
+	case <-blockedDone:
+		t.Fatalf("publisher ended before reaching the slow writer: %v", blockedErr)
+	case <-time.After(time.Second):
+		t.Fatal("publisher did not reach the slow writer")
+	}
 
 	healthy := newFrameTestWriter(false)
 	healthyOut, err := openStream(healthy, options.MaxFrameBytes)
@@ -427,21 +488,45 @@ func TestChangeDeliveryIsIndependentOfSnapshotAdmissionAndASlowSubscriber(t *tes
 		t.Fatal(err)
 	}
 	healthyContext, cancelHealthy := context.WithCancel(t.Context())
-	healthyDone := make(chan error, 1)
-	go func() { healthyDone <- handler.publish(healthyContext, healthyOut, 0, make(chan struct{})) }()
+	healthyDone := make(chan struct{})
+	var healthyErr error
+	go func() {
+		healthyErr = handler.publish(healthyContext, healthyOut, after, make(chan struct{}))
+		close(healthyDone)
+	}()
+	defer func() {
+		cancelHealthy()
+		select {
+		case <-healthyDone:
+		case <-time.After(time.Second):
+			t.Error("healthy publisher did not stop")
+		}
+	}()
 	select {
 	case <-healthy.change:
+	case <-healthyDone:
+		t.Fatalf("healthy publisher ended before change delivery: %v", healthyErr)
 	case <-time.After(time.Second):
 		t.Fatal("a saturated snapshot gate and slow subscriber blocked healthy change delivery")
 	}
 	cancelHealthy()
-	if err := <-healthyDone; !errors.Is(err, context.Canceled) {
-		t.Fatalf("healthy publisher ended with %v", err)
+	select {
+	case <-healthyDone:
+	case <-time.After(time.Second):
+		t.Fatal("healthy publisher did not stop")
+	}
+	if !errors.Is(healthyErr, context.Canceled) {
+		t.Fatalf("healthy publisher ended with %v", healthyErr)
 	}
 	cancelBlocked()
-	close(blocked.release)
-	if err := <-blockedDone; err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("blocked publisher ended with %v", err)
+	releaseBlocked()
+	select {
+	case <-blockedDone:
+	case <-time.After(time.Second):
+		t.Fatal("blocked publisher did not stop")
+	}
+	if blockedErr != nil && !errors.Is(blockedErr, context.Canceled) {
+		t.Fatalf("blocked publisher ended with %v", blockedErr)
 	}
 }
 
@@ -511,12 +596,16 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 	change := metastore.Change{
 		Position: 7, Kind: metastore.Renamed, Parent: 1, Name: []byte{0xff, 'n'},
 		From: &metastore.Location{Parent: 2, Name: []byte("from")},
-		Node: &metastore.Node{ID: 3, Mode: 0o644, Size: 5, Content: "object"},
-		Notification: &metastore.Notification{
-			SubjectID: 3, Directory: false, ChangeMask: metastore.ChangeName,
-			Before: &metastore.LocationFacts{Ancestors: []metastore.DirectoryAncestor{{DirectoryID: 1}, {DirectoryID: 2, Name: []byte("directory")}}, LeafName: []byte("from")},
-			After:  &metastore.LocationFacts{Ancestors: []metastore.DirectoryAncestor{{DirectoryID: 1}}, LeafName: []byte{0xff, 'n'}},
-		},
+		Node: &metastore.Node{ID: 3, Kind: storage.NodeSymlink, MetadataRevision: 1, Size: 3, LinkTarget: []byte{0xfe, '/', 'x'}, Metadata: storage.Metadata{{Key: "client.opaque", Version: 3, Data: []byte{0xff, 0, 1, 2}}}},
+	}
+	change.Notification = &metastore.Notification{SubjectID: 3, SubjectKind: storage.NodeSymlink, ChangeMask: metastore.ChangeName,
+		Before: &metastore.EventImage{Attr: change.Node.Attr(), LinkTarget: change.Node.LinkTarget, Location: storage.EntryLocation{State: storage.LocationLinked, RootNodeID: 1, NodeID: 3, Ancestors: []storage.EntryCondition{
+			{ParentID: 1, DirectoryRevision: 1, EntryID: 2, NodeID: 2, Name: []byte("directory")},
+			{ParentID: 2, DirectoryRevision: 1, EntryID: 3, NodeID: 3, Name: []byte("from")},
+		}}},
+		After: &metastore.EventImage{Attr: change.Node.Attr(), LinkTarget: change.Node.LinkTarget, Location: storage.EntryLocation{State: storage.LocationLinked, RootNodeID: 1, NodeID: 3, Ancestors: []storage.EntryCondition{
+			{ParentID: 1, DirectoryRevision: 1, EntryID: 3, NodeID: 3, Name: []byte{0xff, 'n'}},
+		}}},
 	}
 	wireChange, err := ChangeOf(change)
 	if err != nil {
@@ -541,13 +630,20 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 			t.Fatal(err)
 		}
 		meta.Notification = nil
+		metadata, err := storage.EncodeMetadata(meta.Node.Metadata)
+		if err != nil {
+			t.Fatal(err)
+		}
+		target := meta.Node.LinkTarget
 		name, fromName, content := meta.Name, meta.From.Name, meta.Node.Content
 		meta.Name = []byte{}
 		from, node := *meta.From, *meta.Node
 		from.Name, node.Content = []byte{}, ""
+		node.Metadata = nil
+		node.LinkTarget = nil
 		meta.From, meta.Node = &from, &node
 		reservation, fits, reserveErr := result.Reserve(meta, metastore.ChangePayloadLengths{
-			Name: int64(len(name)), FromName: int64(len(fromName)), Content: int64(len(content)), Notification: int64(len(notification)),
+			Name: int64(len(name)), FromName: int64(len(fromName)), Content: int64(len(content)), Metadata: int64(len(metadata)), Target: int64(len(target)), Notification: int64(len(notification)),
 		})
 		if delta == -1 {
 			if !errors.Is(reserveErr, syscall.EFBIG) || fits || reservation != nil {
@@ -558,16 +654,16 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 		if reserveErr != nil || !fits {
 			t.Fatalf("change under exact bound: fits=%v err=%v", fits, reserveErr)
 		}
-		if err := reservation.Commit(name, fromName, content, notification); err != nil {
+		if err := reservation.Commit(name, fromName, content, metadata, target, notification); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	rows := []metastore.Row{
-		{Node: metastore.Node{ID: 1, Mode: fs.ModeDir | 0o755}},
-		{Parent: 1, Name: []byte{0xff, 'x'}, Node: metastore.Node{ID: 2, Mode: 0o644, Content: "key"}},
+		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory, MetadataRevision: 1, DirectoryRevision: 1}},
+		{EntryID: 4002, Parent: 1, Name: []byte{0xff, 'x'}, Node: metastore.Node{ID: 2, Kind: storage.NodeRegular, MetadataRevision: 1, Content: "key", Metadata: storage.Metadata{{Key: "future", Version: 21, Data: []byte{0xff, 0, 9}}}}},
 	}
-	wireRows := SnapshotPage{Rows: []Row{RowOf(rows[0]), RowOf(rows[1])}}
+	wireRows := SnapshotPage{Rows: []Row{mustWireRow(t, rows[0]), mustWireRow(t, rows[1])}}
 	encodedRows, err := json.Marshal(wireRows)
 	if err != nil {
 		t.Fatal(err)
@@ -585,6 +681,13 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 		pageFull := false
 		for _, row := range rows {
 			meta, name, content := row, row.Name, row.Node.Content
+			metadata, err := storage.EncodeMetadata(meta.Node.Metadata)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := meta.Node.LinkTarget
+			meta.Node.Metadata = nil
+			meta.Node.LinkTarget = nil
 			if name == nil {
 				meta.Name = nil
 			} else {
@@ -592,14 +695,14 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 			}
 			meta.Node.Content = ""
 			reservation, fits, err := result.Reserve(meta, metastore.RowPayloadLengths{
-				Name: int64(len(name)), Content: int64(len(content)),
+				Name: int64(len(name)), Content: int64(len(content)), Metadata: int64(len(metadata)), Target: int64(len(target)),
 			})
 			if err != nil || !fits {
 				reserveErr = err
 				pageFull = !fits && err == nil
 				break
 			}
-			reserveErr = reservation.Commit(name, content)
+			reserveErr = reservation.Commit(name, content, metadata, target)
 			if reserveErr != nil {
 				break
 			}
@@ -607,8 +710,8 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 		if delta == -1 {
 			if reserveErr != nil || !pageFull {
 				empty, _ := json.Marshal(SnapshotPage{Rows: []Row{}})
-				one0, _ := json.Marshal(SnapshotPage{Rows: []Row{RowOf(rows[0])}})
-				one1, _ := json.Marshal(SnapshotPage{Rows: []Row{RowOf(rows[1])}})
+				one0, _ := json.Marshal(SnapshotPage{Rows: []Row{mustWireRow(t, rows[0])}})
+				one1, _ := json.Marshal(SnapshotPage{Rows: []Row{mustWireRow(t, rows[1])}})
 				t.Fatalf("snapshot page under exact-1 bound returned full=%v err=%v; actual=%d empty=%d one=(%d,%d)",
 					pageFull, reserveErr, rowBytes, len(empty), len(one0), len(one1))
 			}
@@ -833,4 +936,13 @@ func volumeFixture(t *testing.T) *objectstore.Storage {
 	t.Helper()
 	_, backend := memoryfixture.New(t, "transport-internal", 1<<30, locking.DefaultOptions())
 	return backend
+}
+
+func mustWireRow(t *testing.T, row metastore.Row) Row {
+	t.Helper()
+	wire, err := RowOf(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
 }

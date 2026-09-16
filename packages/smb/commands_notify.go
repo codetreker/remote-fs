@@ -31,7 +31,7 @@ func (c *connection) notify(ctx context.Context, t *tree, r wire.Request, key *s
 		}
 		return nil
 	}
-	events, err := t.export.changes.watchRegistered(ctx, c.notifyKey(n.FileID), h.identity, n.Filter, n.Flags&1 != 0, n.OutputLength, registered)
+	events, err := t.export.changes.watchRegistered(ctx, c.notifyKey(n.FileID), h.identity, n.Filter, n.Flags&1 != 0, n.OutputLength, registered, h.file.ValidateNotificationLocation)
 	if errors.Is(err, ErrNotifyRescan) {
 		return nil, 0x10c
 	}

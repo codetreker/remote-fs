@@ -293,12 +293,12 @@ func measure(ctx context.Context, s storage.BoundedStorage, limits MeasurementLi
 	return total, nil
 }
 
-func measurementEntryBytes(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
-	fixed := int64(unsafe.Sizeof(storage.Entry{}))
-	if nameBytes > math.MaxInt64-fixed {
+func measurementEntryBytes(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+	const fixed int64 = 256
+	if nameBytes > math.MaxInt64-fixed || metadataBytes > (math.MaxInt64-fixed-nameBytes)/4 {
 		return 0, fmt.Errorf("a directory entry is too large to measure: %w", syscall.EOVERFLOW)
 	}
-	return fixed + nameBytes, nil
+	return fixed + nameBytes + 4*metadataBytes, nil
 }
 
 type measurementFrontierNode struct {

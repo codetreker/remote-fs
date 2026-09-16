@@ -1,108 +1,85 @@
-# 打开的文件与 advisory locks
+# 保留对象、访问声明与范围状态
 
-本文描述当前 `storage.FileStorage`、服务端保留的文件身份和标准 advisory locks。按路径的基础 volume API 见[顶层设计](../architecture.md)，显式 S/X 扩展见[文件占有](file-locks.md)，FUSE 映射见[client 设计](../client/architecture.md)，Windows 接入见 [SMB 接入](../client/windows-smb.md)。决定与代价见[活跃文件句柄](../../../.agents/notes/implemented/architecture/2026-09-08-live-file-handles.md)。[平台客户端隔离提案](../../../.agents/notes/proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)将平台 owner、mode 与 Windows 意图从这些接口移出，演进为通用保留对象、条件操作和纯值 receipt；下文仍是实际接口，身份与有限生命周期保证保持。
+本文描述 [`storage.FileStorage`](../../../packages/storage/files.go) 的对象身份、固定原子操作、会话与资源所有权。按路径的基础接口见[顶层设计](../architecture.md)，显式 S/X 见[文件占有](file-locks.md)，平台规则分别见 [FUSE](../client/architecture.md) 与 [Windows SMB](../client/windows-smb.md)。边界与取舍由[平台客户端隔离决定](../../../.agents/notes/implemented/architecture/2026-09-16-isolate-platform-filesystem-clients.md)记录。
 
-## 一、身份与会话
+## 身份、属性与会话
 
-[`storage.FileStorage`](../../../packages/storage/files.go) 在 `BoundedStorage` 之外提供 `CheckFileStorage` 与 `NewFileSession`。检查必须在挂载或提供能力前完成；不能用按旧路径重新打开来替代保留身份。随附实现通过 objectstore 与具有原生独占所有权的 SQLite metastore 提供此能力。只有共享数据库所有权的基础 SQLite API 继续提供路径操作，文件能力检查以 `EOPNOTSUPP` 拒绝。
+FileStorage 在 BoundedStorage 上提供 CheckFileStorage、FileState 与 NewFileSession。FileState 返回 VolumeIdentity、RootID 和 MaxEventBytes；NewFileSession 同时返回初始 status，使调用方在取得会话时便知道 action epoch。objectstore、localstore、locked、limited 与 HTTP 使用同一原生权威，不用路径重开模拟引用。
 
-`FileSession` 拥有有限时长、文件引用、在途操作和 advisory 状态。`OpenFile` 以路径解析目标，`OpenNode` 直接使用节点 ID；`StatNode` 与 `SetNodeAttr` 为目录及未持有普通文件引用的属性调用保留身份。`File` 是一个已打开普通文件的引用，路径变化不改变它的目标。打开不读取完整内容，也不自动取得 advisory lock 或 S/X grant。
+File 可保留普通文件、目录或符号链接。NodeID 绑定节点，EntryID 绑定目录项，FileReferenceID 属于会话内的一次保留；rename 不改变前两者，unlink 后旧引用不转向同名的新节点。Reference 只解析已有 ID，不新增 pin，不重开名字，也不复活已终止引用。根目录具有节点身份，没有可删除的普通 entry。
 
-| 打开条件 | 权威结果 |
+Attr 的 Kind、Size、时间与 revision 是通用事实；Metadata 是有序、版本化的 opaque envelope。metadata 至多 16 项、总编码 32 KiB、key 至多 64 字节；空 envelope 为 6 字节。客户端保留其它 key，通过 ExpectedRevision 更新完整 envelope，避免覆盖其它入口的字段。CreationTime／ChangeTime 缺失表示没有记录，不用 ModTime 或本机时钟补造。POSIX mode／UID／GID 和 DOS 属性的解释属于客户端。
+
+FileSessionOptions 必须有效，可从 DefaultFileSessionOptions 开始。默认 lease 30 秒、history 1 分钟、单文件 1 GiB；每会话最多 4096 个引用、64 个活跃操作、256 个操作等待者、4096 个 range owner、65536 个 ranges、1024 个 pending actions 和 16384 个 actions。volume 的 FileServiceOptions 与 HTTP enrollment 上限另行约束总量。
+
+Renew 确认并延长会话，Status 只观察。Epoch、Revision、Remaining、ActionEpoch、HistoryRemaining、Retired 与 Fenced 描述连续性；transport 扣除请求耗时，旧响应不重新启动租期或历史窗口。普通 I/O 成功与 TCP 存活不续期。会话失效后旧引用不能发布；尚有清理责任的 fenced 状态仍可被核对和清理。
+
+## 条件操作与一致观察
+
+| 调用 | 权威效果 |
 |---|---|
-| `ExpectedID` 与实际目标不符，或 `OpenNode` 的身份已不存在 | `ESTALE`，不改用同名新节点 |
-| `Create` 且 `Exclusive`，目标已存在 | `EEXIST` |
-| 非排他创建遇到并发创建者 | 打开已经存在的那个对象，保留它的创建模式 |
-| `Truncate` | 需要写权限；截断与返回的身份属于同一次有序打开结果 |
-| 普通文件引用用于目录或符号链接 | 分别为 `EISDIR`、`ELOOP` |
+| Retain | 按 NodeID 保留对象，可同时检查 metadata revision、claim、位置 witness 并安装 Prepared 意图 |
+| RetainAt | 按精确父引用、名字、EntryID／NodeID 与 DirectoryRevision 保留已观察的对象 |
+| CreateAndRetainAt | 在预期为空的 slot 创建节点，将初始 metadata／target、claim、引用和可选 Prepared 一并提交 |
+| ResetAndRetainAt | 对同一预期节点原子重置内容、更新指定属性并取得引用；保留 NodeID |
+| ReplaceAndRetainAt | 原子替换明确的目的 entry，创建新节点并保留；不能删掉另一个并发替代物 |
+| Rename | 检查来源及目的 slot；NewName 独立指定输出字节拼写，只能占空 slot 或来源自身，只移除预期目的 |
+| SetKind | 对唯一引用持有的空节点原子修改种类、target 和完整 metadata，同时检查 revision 与可选 witness |
 
-`FileOpenOptions` 嵌入 `storage.OpenAccess`，共享 Read、Write、Create、Truncate、Exclusive 五项打开意图；ExpectedID 与 Mode 仍是文件打开自己的参数。Check／CheckNode 连同身份和 mode 验证它们，至少要求读取或写入一种访问方式；排他创建必须同时指定创建。权限模式只用于新建节点。只读引用可以修改契约支持的 mode、atime、mtime；内容写入、截断和 POSIX 排他锁仍检查写访问。
+EntryTarget 的零 ExpectedEntryID／ExpectedNodeID 表示明确要求缺席，非零表示精确身份。ExpectedMetadataRevision 与 DirectoryRevision 分别约束节点和目录观察。名字是精确字节；remote 不做大小写折叠、Windows 路径比较或 Unix 权限判定。
 
-`FileSessionOptions` 要显式选择有效值，调用方可从 `DefaultFileSessionOptions` 开始。默认 lease 为 30 秒、动作历史为 1 分钟、单文件大小为 1 GiB，每会话最多 4096 个引用、64 个活跃操作、256 个操作等待者、4096 个锁 owner、65536 个范围、1024 个 pending lock 与 16384 个锁动作。会话上限还受 volume 与 HTTP registry 的共享上限约束。
+LookupAt 返回同一父目录版本下的精确名字结果；Found=false 是确认缺席，不附带虚构 Attr。ListAt 的 cursor 绑定 ParentID、Revision 和上次返回的名字，跨页不能混用目录版本。单页至多 1024 项、1 MiB，每项在加载名字与 metadata 前按 `256 + nameBytes + 4*metadataBytes` 计费。任何错误使结果失效，不能返回缺失尾部的成功列表。
 
-`Renew` 确认会话继续有效；`Status` 只观察，不续期。返回的 epoch、revision、剩余 lease 与 history 时间用于核对同一会话。client 从请求开始时刻计算保守的本地截止时间；旧响应、普通 I/O 成功、TCP 存活均不延长已确认期限。过期或旧 server epoch 的能力返回 `ESTALE`，未知结果返回 `EIO`，不会恢复到旧路径。底层发布检查仍是权限的最终判定者。
+IncludeLocation 与 IncludeLinkTarget 明确选择观察。EntryLocation 区分 Root、Linked 和 Detached，和 metadata／target 在同一观察中返回；祖先链至多 256 层、名字总量 64 KiB，单项名字至多 4096 字节。携带 witness 的名字操作在最终转换处验证每段身份及父 DirectoryRevision；CheckObservation 核对多次读取组成的观察。祖先移动或其同级目录出现新名字会使旧条件失效。纯身份 I/O 不要求位置，不用旧路径恢复 detached 名字。
 
-### Windows 保留目录、访问意图与动作
+## 访问声明与范围
 
-[`storage.WindowsStorage`](../../../packages/storage/windows_contract.go) 是独立能力，提供 WindowsState、显式 EnableWindows／QueryWindowsActivation 与 NewWindowsSession。objectstore、localstore、locked、limited 和 HTTP 保持同一原生 authority 与 action receipt；不以路径重开或本机锁表替代此能力。limited 仍要求原生发布记账。
+AccessClaim 的 Uses／Excludes 使用 ReadContent、WriteContent、RemoveEntry。新旧声明在任一方向的 Uses 与 Excludes 相交时冲突。普通引用登记自身实际用途；路径和短暂操作也在同一权威中取得 admission，最终发布再次按 claims、范围与寿命排序。metadata 访问及父目录内创建名字不自动变成父节点的 WriteContent。
 
-WindowsFile 允许目录与 metadata-only 引用。WindowsLookup 以 ParentID、可选的同会话 ParentReference 和单个 leaf name 寻址；ExpectedID 防止同名替换。WindowsOpenIntent 保留 Access、Share、Disposition、Kind、DeleteOnClose 与 OpenReparsePoint，完整意图同时用于授权和原生打开。WindowsRenameRequest 对来源、目的父身份与预期目标作最终核对。
+RangeOwnerID、RangeDomainID 与 RangeAcquisitionID 都是不透明身份。RangeScope 区分 advisory 冲突域与 Enforced 范围，remote 不解释 PID、flock 或 Windows batch。不同 acquisition 即使区间相同也保留独立身份；解除一个 shared acquisition 不解除另一个。普通闭区间可以覆盖未来 EOF；Boundary 标记表示切点 N，只与满足 `start < N <= end` 的区间相交，两个切点不相交。
 
-WindowsBasicAttr 包含实际创建时间、change time、DOS attributes 和 delete-pending；WindowsNameInfo 区分 root、linked 与 detached，在同一权威观察中返回当前名字，不能由旧路径推导。ReadLink／SetLink 处理有界、受 volume confinement 检查的符号链接；SetLink 保留节点 ID 与目录链接标志；已解析普通节点上的 S/X 保护随授权转换继续绑定同一身份，既有 grant 的控制与原 ResourceRef 的再次取得遵循[文件占有](file-locks.md#身份与显式-scope)。普通 FileStorage 的文件引用仍拒绝符号链接，Linux FUSE 的 Readlink／Symlinker 能力不由此增加。
+RangeSnapshot 返回同一 Revision 的 Own、Other 与容量事实。ReplaceRanges 只替换调用方自有集合，并验证覆盖冲突、容量及生命周期的 revision。客户端从快照计算平台转换，不能修改其它 owner。强制范围参与相关 I/O；advisory 只约束同一域的参与者。平台错误与部分批次效果由 SMB／FUSE 保留，通用回执确认最终范围 revision 和效果。
 
-WindowsSession 的 epoch-and-nonce 动作 ID 贯穿 open、修改、关闭、取消与结果查询。receipt 保留 Applied 数量、原错误与 symlink 观察；有错误不等于全部回滚。已知终态按声明的历史保留，未知结果只能以原动作核对。会话失效禁止旧引用继续发布，清理排空后再回收 pin、内容和访问状态。
+WaitRanges 等待 guard 改变，不授予范围。新动作阻塞，已接纳 Pending 动作的重放可立即返回 Pending；调用方先核对原动作，不能忙轮询或重新规划未知结果。DetectDeadlock 使用通用 owner／resource 依赖进行有界环检测；登记、取消、授予与过期清理有序，容量或搜索不能完成时明确失败。R-CC-13 的有效会话阻塞等待不受任意快速重试次数截断。POSIX／flock 的转换、PID 诊断和描述符关闭由 FUSE 执行。
 
-## 二、保留节点与回收
+## 预备删除、drain 与回收
 
-SQLite 在节点上保存 `detached`、内容 revision、Windows 时间／DOS attributes 与链接目标。`Remove` 或覆盖目标的 `Rename` 移除名字；仍有引用的普通文件保留原节点及内容。原 fd 可继续读取、修改与查询这个对象，新路径指向的对象独立存在。volume 日志、快照与目录遍历只包含仍有名字的节点，脱离名字后的修改不制造虚构路径事件。
+Prepared 是绑定引用和 EntryID 的持久退役意图；它不禁止相容的新引用，也不阻止目录增加子项。PrepareRemoval 可与创建／保留一起原子接纳。引用 Close 或有限 expiry 激活意图并退役；RemovalIfEmpty 在激活时发现目录非空，则消耗意图而不进入删除状态。
 
-保留节点的内容仍属于 volume 的实际用量。最后一个引用先退役，在最终发布门处禁止新的修改授权；已经接纳的 I/O 排空之后才物理释放。最后释放在事务内处理用量、当前对象与待回收对象。已知未生效的容量拒绝保留引用供清理重试；结果不明时保留所有权并封锁后续使用，不能提前归还配额。
+DrainEntry 将 entry 从 Active 转入 Draining，阻止新引用；目录还阻止经已有父引用的插入与 rename-in。最后引用退役后执行 detach，目录最终重检 IfEmpty。意图随 EntryID 改名，不删除占用旧名字的新 entry。CancelPrepared 操作所属 intent，CancelDrain 按当前 generation 取消单个 entry drain；它们不能互相替代，旧 generation 不能取消新 drain。
 
-`SQLiteOptions.MaxRetainedFiles` 默认 65536，按 volume 共享。退役引用仍占物理名额，直到最后释放完成。满额时创建并打开必须在产生 volume 副作用之前拒绝。多个 objectstore 包装同一 volume 时使用同一份引用与 advisory 预算，不能借另建包装器绕过上限。
+Prepared 是已经授权接纳的固定动作。新的 Prepare、Drain、Cancel 请求各自授权，退役执行已有意图的剩余效果；不保存凭据或授予任意新删除权限。最终效果仍检查 S/X、claims、完整性和用量。请求后来被拒绝，不证明先前意图不存在。未知清理保留责任和状态，不提前归还容量。
 
-拥有数据库原生 EX 锁的启动过程先有界验证所有 volume，包括 detached 节点、对象关系和配额，再原子回收旧 epoch 遗留的无主节点。使用量、垃圾记录和提交代际通过同一个 Commit/Accept 结果生效。验证失败不先回收一部分；普通共享 opener 不执行这条回收路径。持久见证、数据库所有权和关闭失败的处理见[本地持久对象存储](local-disk-object-store.md)。
+unlink 或替换去掉名字后，有引用的节点及内容仍保留。引用终止先 fencing，再排空已接纳操作，最后释放 pin 与物理内容；已知未生效的拒绝和未知清理分别处理。detached 内容仍计入实际用量，日志和目录只呈现仍有名字的节点。File 的数据库级恢复记录区分 Active 与已全库排空的 Quiescent：干净关闭后的重开跳过 File 等待，异常退出保留旧持久最大租期，下一次 session 先持久 Active。旧引用不恢复；与独立 Strong 的顺序见[本地持久存储](local-disk-object-store.md)。
 
-## 三、一次读取与一次修改
+## 内容操作与动作结果
 
-`File.ReadAt` 在同一份 `FileState` 下返回属性与区间字节，EOF 返回该状态的属性与空字节。多次读取可以看见同一对象后续已经完成的修改；一个成功返回的区间不会混合两份 revision。文件引用钉住节点，不钉住某个内容 revision。
+ReadAt 返回同一捕获内容状态的 Attr 和区间字节。EOF 可返回空字节；EOF 前的正长度请求不能以空结果成功。引用钉住节点，不钉住内容 revision。objectstore 以不可变完整对象保存内容；读取在分配前预留完整对象和返回区间，旧对象被并发回收时仅在已知竞争路径重新捕获，当前对象缺失为 EIO。
 
-objectstore 仍以不可变完整对象保存内容。读取先捕获节点状态，在分配前预留当前对象与返回区间的内存，再通过 `GetBounded` 取对象并切片。捕获的旧对象被并发替换并回收时重新读取状态；当前仍引用的对象缺失是 `EIO`，持续竞争耗尽有限尝试是 `EAGAIN`。节点引用没有消除[读取与清扫之间的竞争](../../../.agents/notes/proposed/architecture/2026-08-21-readers-in-flight-and-the-sweeper.md)。
+WriteAt 只替换指定区间，Truncate 保留前缀并把增长部分置零。修改捕获当前完整内容、预留旧／新对象、构造不可变对象，再以原生 revision CAS 发布。上传不持有最终发布门；只有已知未提交且暂存清理成功的竞争才可重新尝试。ExpectedSize 同时检查捕获与最终发布大小，使客户端能表达依赖已观察 EOF 的写入；不匹配不改字节。
 
-`WriteAt` 只替换指定区间；`Truncate` 保留前缀，增长部分为零。一次修改读取当前完整状态，预留旧内容与下一份内容，构造替换对象，经 Reserve、不可变 Put 和原生 revision CAS 发布。对象上传不持有最终发布门。只有已知没有提交且暂存清理成功的 CAS 竞争才能重新基于当前状态尝试；真实故障或未知提交结果不会被重试掩盖。
+最终转换同时检查节点与内容 revision、引用／session 有效性、访问声明、强制范围、S/X proof 和记账。开始上传时有效不代表发布时仍有效。两个普通范围写可按实际顺序都成功；内部 CAS 拼接当前内容，不承诺打开时的内容依据仍新鲜。显式版本工作流见[独立决定](../../../.agents/notes/proposed/architecture/2026-08-19-ordering-and-versions.md)。Sync 验证已发布内容的健康与持久边界，Close 不提交本地 dirty 副本。
 
-最终事务同时核对内容 revision、节点身份、会话或引用的有效期、显式 S/X proof、Windows 共享／范围访问约束和发布记账。检查与修改按同一次最终转换排序。上传开始时有效不代表上传结束时仍可发布；引用退役、会话失效或授权过期后，尚未取得最终授权的修改失败。原生 Commit/Accept 的未知结果继续为 `EIO` 并保留故障原因。
+FileActionID 由服务端 action epoch 和随机 nonce 组成。相同 ID 保留原请求；不同参数不能重用同一动作。FileActionReceipt 只含值：Action、Operation、State、Effects、Reference、Observation、RangeRevision、Removal、Errno、Conflict 与 HistoryRemaining。metastore 不持有 storage.File；各层按自己拥有的 reference ID 解析引用。
 
-两个普通 fd 对重叠区间的修改可按实际提交顺序都成功，未被后一次修改触及的区间被保留。内部 revision CAS 负责拼接当前状态，不是对「打开时内容版本」的承诺；[显式内容版本工作流](../../../.agents/notes/proposed/architecture/2026-08-19-ordering-and-versions.md)仍有独立的调用方依据与冲突报告问题。
+Pending、Completed、NotApplied、Unknown 表达动作状态，Effects 在有错误时仍有意义。FileActionRetired 是当前引用／会话已终止的事实，不是所给动作已执行的历史回执：Action 为空，Effects、Errno 与 HistoryRemaining 为零，Operation／Reference 只标识清理范围。FileError.NotAdmitted 只证明本次调用在动作准入前被拒绝，不能证明同 ID 的较早调用未执行。
 
-`Sync` 检查已完成修改的健康与持久性边界。直接 `File.Close` 退役引用并清理它记录的 flock，不推断 POSIX 进程 owner，也不提交本地 dirty 内容。每次 `WriteAt`、`Truncate` 的错误都落在对应调用上；之后的 `Close` 不能把已经返回成功的修改丢弃。
+QueryAction／CancelAction 使用原 ID。Unknown 保持 EIO 和原错误链，不允许提交替代动作；是否以及何时核对由拥有原意图的调用方决定。有效 session 与声明的历史窗口内保留核对结果；旧 epoch 的未知动作不会重新执行，退役、重启或窗口结束不承诺永久历史。取消只在确认结果允许时报告中断，不能把 context cancellation 当成回滚证明。
 
-## 四、advisory 范围与 owner
+## HTTP、复制与预算
 
-[`packages/advisory`](../../../packages/advisory/coordinator.go) 在同一 volume 内协调两种独立的冲突域。advisory lock 只约束自愿参与的加锁者；不持 advisory lock 的写入、截断、改名和删除仍遵守基础文件语义、显式 S/X 检查及已经生效的 Windows 共享／范围限制。Windows 约束由原生 windowsaccess 状态与受控操作共同排序，不能通过改用 Linux 或路径 API 绕过；它不把 Linux advisory 改造成强制锁。
+HTTP 使用既有 file／file-control 动作入口、一份 session registry 与 storage.Operation 词汇。Session 能力是随机凭证，reference 与动作历史由 native session 持有。路径、名字、target 与内容用 byte 字段无损传输，平台错误和名字比较不进入 codec。请求先接受[业务授权](authorization.md)，再访问会话、引用或动作结果；已有 ID 不绕过策略。
 
-| 规则 | `flock` | 传统 POSIX `fcntl` |
-|---|---|---|
-| 范围 | 整个对象，SH / EX / UNLOCK | 包含端点的字节范围，读锁 / 写锁 / 解锁 |
-| owner | open file description；dup、fork 共享，另一次 open 独立 | 同一 FileSession 内内核给出的进程 owner 与文件身份 |
-| 关闭 | 最后一个共享描述符释放 | 该 owner 关闭同一文件的任一 fd 即释放其全部 POSIX 范围 |
-| fork | 继承共享的 OFD 占有 | 子进程不继承父进程的 POSIX 占有 |
-| EX 访问条件 | 只读 fd 也可取得 | 写锁要求可写 fd，读锁要求可读 fd |
-| 转换 | 先解除旧占有，再尝试新模式 | 失败保留旧范围；成功后分割、合并和替换相关区间 |
+transport 对丢失或无法验证的修改响应返回 Unknown／EIO，不自动 QueryAction，也不推断 NotApplied。SMB、FUSE 或 SDK 若持有原计划，可明确核对同一个动作；迟到答复和取消通过原 receipt 处理。HTTP 没有另一份 open ACK、引用恢复或历史状态机。HandlerOptions.Files 限制 registry 会话数与可申请的 FileSessionOptions，默认 64 个会话。Handler.Close 退役并排空自己创建的 registry，backend 仍由宿主持有。
 
-表中的关闭是 Linux 描述符事件的语义。直接使用 File API 的调用方须对该进程关闭事件显式执行 `DropLocks(owner, POSIX)`；`File.Close` 没有 owner 参数，不能替调用方解除该进程在同一对象上的 POSIX 范围。FUSE Flush 负责携带本次内核 owner 执行这项清理，最终 Release 关闭引用与 flock。`FileSession.Close` 则退役该会话的全部状态。
+replicated storage 转发同一个原生 session、引用、动作与 owner。按名 metadata 可来自副本；保留对象的属性与内容直接走权威。提供日志时，修改结果携带权威 barrier，replica 等待同 incarnation 的位置达到它；detached 修改没有虚构路径事件，仍可核对已有 volume 进度。没有日志的直接 HTTP 不制造 barrier，需要复制确认却缺少 barrier 时明确 EIO。
 
-`LockOwner` 是会话内的不透明数，零值有效；PID 只用于 `F_GETLK` 的诊断结果。两个挂载会话中相同 PID 不会合并 owner。范围终点可以是 `MaxInt64`，表示延续到以后增长的 EOF；负范围已由内核规范化后进入 FUSE bridge。无冲突查询明确返回未发现，不能编造一个 owner。
+FileServiceOptions 限制每个 volume 的 session、动作、Prepared、drain、claims、owner、ranges、等待依赖及完整内容物化。默认单文件 1 GiB、同时物化 2 GiB、32 次 materialization、8 次状态竞争尝试、单次内容操作 30 秒。读预留完整对象与返回区间，写预留旧／新内容；不能只按 patch 长度计费。MaxRetainedFiles 默认 65536，退役引用在实际释放前仍占名额；包装同一 volume 不能建立独立预算。
 
-完整 `F_OFD_*` 语义不在兼容承诺内。内核交给 FUSE 的命令已经规范化，daemon 不能靠此接口可靠区分所有 OFD 请求，因此也不承诺逐命令辨识并拒绝它们。
+CLI 暴露 max-retained-files、max-file-size、max-file-staging-bytes、file-operation-timeout、http-max-file-sessions，以及 file-session-lease、file-session-history、file-session-max-actions、file-session-max-pending-actions。动作和 pending 默认分别为 16384、1024；staging 至少容纳两份最大文件。其它共同上限通过库的 FileServiceOptions 配置。
 
-`SetLock` 立即返回终态或 `Pending`；`QueryLock`、`CancelLock` 使用相同 owner、对象与 `LockRequestID` 核对。Request ID 由服务端动作 epoch 与随机 128-bit nonce 组成，重试保留原意图。相同 ID 的不同参数以 `EINVAL` 拒绝；已退役历史中的未知 ID 为 `ESTALE`，不重新执行。终态至少保留所声明的 History 时间，当前 epoch 的记录不能为接纳新动作而驱逐。
+## 显式 S/X 与平台规则
 
-非阻塞冲突为 `EAGAIN`，容量不足为 `ENOLCK`，已经判定的 POSIX 死锁为 `EDEADLK`。阻塞等待的存活由健康且持续续期的 FileSession 决定，不采用强 S/X `Wait` 的有限等待意图。等待记录、owner、范围、动作历史与死锁图都有独立上限。取消只有在确认未授予或已经释放后才能成为 `EINTR`；若授予已经获胜，核对结果保留该事实。原生 advisory 层无法确定的锁结果封锁受影响持有者的 I/O，显式解除或关闭后才清除，不能静默重获锁继续执行。FUSE 对未知锁结果采用更大的终止范围：整个挂载停止续期、退役会话并持续报错，需要重新挂载；原 owner 的清理不使该挂载恢复。
+强 S/X 保护资源的内容、存在和身份；普通 Retain 不自动取得强占有或 advisory。只持 S 不能修改，有活动保护时最终发布核对 proof；没有保护冲突时普通匿名修改可成功。经授权 unlink／替换使旧的命名资源成为 TargetGone，原 grant 不转移到同名新对象。已保留节点仍保持自身身份。
 
-默认 volume 上限为 1024 个会话、32768 个 owner、262144 个范围、262144 个动作、8192 个等待者和 65536 条死锁图边。所有访问同一原生 volume 的包装器共享这份 coordinator；配置不一致拒绝组合。会话 admission 分为四类：数据操作使用 `MaxOperations`，心跳、advisory 获取、核对与释放三个分区各允许 2 个活跃调用。各自满额以 `EAGAIN` 拒绝，新加锁与大文件 staging 都不能耗尽续期或释放名额。
-
-## 五、HTTP、复制与资源
-
-HTTP 文件请求先执行[业务授权](authorization.md)，再读取／触碰 Session、File 与动作历史。Open 的完整读写、创建、截断意图由一次 callback 决定，解锁与申请分别可控；已有 bearer 引用不绑定业务身份，也不能绕过检查。被拒绝的 ack、renew、核对或 close 不产生对应副作用，服务器自主 expiry／shutdown 回收仍由原拥有者执行。
-
-HTTP v3 增加 `file` 与 `file-control` 操作入口，保留基础 volume 与强 S/X 协议。请求的 `op` 直接使用 storage.Operation 的规范值，例如 file.open、file.read、file.unlock，分发与业务授权共享标识；二进制路径和内容使用 JSON 的 base64 byte 字段。协议对未知、重复、缺席、null 或无关字段进行验证，所有结果仍携带 v3 标记与封闭 errno 词汇。FileSession 的时间间隔使用 Go duration 的整数纳秒表示，不能按强 S/X 的毫秒字段解释。
-
-随机能力标识会话与文件引用。Open 结果在有限 PendingAck 时间内保留，client 收到能力后单独确认；无确认的引用被回收。数据修改、打开和改变锁状态的请求使用有界动作记录核对，过期历史不能让旧请求变成新执行。响应丢失后不能单凭请求 context 取消推断打开未发生或锁未取得，已有的 ACK 丢失核对路径继续执行。
-
-普通已有文件的 Open 已返回能力、但 ACK 失败时，client 先用返回的同一 Session／File 能力执行 Close 清理。只有 Create 与 Truncate 均为 false、原 ACK 错误同时满足 `errors.Is(err, context.Canceled)` 与 `storage.ErrnoOf(err) == EINTR`，且该次清理的原始 error 为 nil，才不返回 File 并保留 EINTR。清理的 ESTALE 不能当作成功，判定发生在既有 ESTALE 抑制之前。带创建／截断意图、deadline、未知 ACK 或会话故障，以及清理 EIO／ESTALE 或独立错误，仍返回无 File 的 EIO；原有创建或截断效果不被解释成未发生。已终止的 native 引用不会由迟到 ACK 或原打开动作的重放重新创建。这项分类不增加重试。
-
-控制通道使用固定 16 KiB 上限与独立 admission，阻塞锁通过短的 Set/Query/Cancel 交换维持，不长期占用 HTTP worker。数据 JSON 在编码前核对 envelope 与 base64 后的总长度；区间读取在调用 backend 前为返回 envelope 扣除预算，不能只按原始字节数推断 body 大小。
-
-`HandlerOptions.Files` 默认在整个 registry 内允许 64 个会话，每个会话分别最多保留 16384 个数据动作与 16384 个清理动作，PendingAck 为 5 秒；可接纳的会话 options 受 handler 上限约束。`Handler.Close(ctx)` 停止 admission，退役并排空它创建的 registry；backend 仍归调用方。独立 server 先排空 HTTP 请求，再完成 handler 清理，最后关闭自己拥有的 backend；清理失败不释放 backend 所有权。
-
-replicated storage 同时转发基础与 scoped 文件能力，并保留原 remote session、对象和锁 owner。元数据查名字仍可使用副本；打开文件的属性与字节直接查询服务端保留对象。文件修改成功后，提供日志的 server 返回当时的权威 barrier，replica 等待同一 incarnation 的位置达到该值； detached 修改没有路径事件，barrier 仍可证明现有 volume 进度。没有日志的直接 HTTP client 不制造 barrier；需要复制确认却缺少 barrier 时以 `EIO` 失败。
-
-volume 默认单文件上限 1 GiB，同时物化内容上限 2 GiB，最多 32 次 materialization、8 次状态竞争尝试，每次数据操作预算 30 秒。替换预留当前与下一份内容，读取预留完整对象与返回区间；不能只按 patch 的长度收费。单会话、transport body、backend 对象与配额可施加更紧的边界。有限预算在保留超限内容之前拒绝，已经持有的 reservation 在取消或已知失败清理后释放；未知发布或记账结果保留相应所有权并封锁。
-
-独立 server 暴露 `-max-retained-files`、`-max-file-size`、`-max-file-staging-bytes`、`-file-operation-timeout`、`-http-max-file-sessions`、`-http-max-file-actions`、`-http-max-file-cleanup-actions`、`-http-file-open-ack-timeout` 与 `-file-session-lease/history`。其中 staging 预算覆盖同时物化的完整旧、新内容，至少容纳两份最大文件。其它上限由库 options 配置；部署形态仍为 localstore 或 Azure Blob + SQLite。
-
-## 六、与显式 S/X 的关系
-
-强 S/X 保护 volume 资源的内容、存在和身份，所有修改在原生发布处检查 proof。它不由 `Open`、`flock` 或 `fcntl` 自动取得。只拥有 S 的调用方也不能修改受保护内容；没有活动保护冲突时，普通匿名修改不必先取得 X。
-
-经授权的 unlink 或覆盖会使旧的命名资源成为 `TargetGone`，原 S/X grant 不转移到同名新对象。已打开文件的保留身份与 advisory owner 随旧对象继续存在。S/X 的有限 lease、恢复 grace、管理动作核对与 FileSession 的存活和 advisory 等待分别计时；任何一者的成功都不能延长另一者。
+Windows share/disposition、DOS 与精确 lock batch 在 SMB 解释，POSIX mode、flock／fcntl owner 和关闭转换在 FUSE 解释。它们把已解释的通用 claims、range sets、条件操作与删除意图交给同一权威。平台转换不改变显式 S/X 的有限期限，也不让任何平台入口绕过共同发布检查。

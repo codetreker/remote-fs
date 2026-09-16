@@ -95,15 +95,16 @@ func (d durableOpen) check() error {
 }
 
 type databaseCoordinator struct {
-	commit  commitGate
-	health  sync.RWMutex
-	poison  error
-	refs    int
-	key     string
-	durable bool
-	closing bool
-	pins    map[retainedNode]int
-	domains map[int64]*fileDomain
+	fileAdmission commitGate
+	commit        commitGate
+	health        sync.RWMutex
+	poison        error
+	refs          int
+	key           string
+	durable       bool
+	closing       bool
+	pins          map[retainedNode]int
+	domains       map[int64]*fileDomain
 }
 
 type commitGate chan struct{}
@@ -143,7 +144,7 @@ func acquireCoordinator(database string, durable bool) (*databaseCoordinator, er
 	defer databaseCoordinators.Unlock()
 	coordinator := databaseCoordinators.byPath[key]
 	if coordinator == nil {
-		coordinator = &databaseCoordinator{key: key, durable: durable, commit: newCommitGate(), pins: make(map[retainedNode]int), domains: make(map[int64]*fileDomain)}
+		coordinator = &databaseCoordinator{key: key, durable: durable, commit: newCommitGate(), fileAdmission: newCommitGate(), pins: make(map[retainedNode]int), domains: make(map[int64]*fileDomain)}
 		databaseCoordinators.byPath[key] = coordinator
 	} else if coordinator.durable || durable {
 		return nil, fmt.Errorf("a durably witnessed SQLite database cannot share its process with another opener: %w",
@@ -213,7 +214,7 @@ func InspectDurableState(ctx context.Context, database string) (DurableState, er
 		return DurableState{}, fmt.Errorf("opening SQLite state for inspection: %w", sqlerr.Failure(err))
 	}
 	defer db.Close()
-	state, err := dbstate.Validate(ctx, db)
+	state, err := dbstate.Inspect(ctx, db)
 	if err != nil {
 		return DurableState{}, fmt.Errorf("inspecting SQLite durable state: %w", sqlerr.Failure(err))
 	}

@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -33,8 +34,8 @@ import (
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-// Holding the complete authoritative reply exposes cancellation between an open
-// reference being returned and its ACK. SIGURG keeps Go's normal signal handler.
+// Holding the authoritative retain receipt exposes cancellation before FUSE can
+// deliver the reference. SIGURG keeps Go's normal signal handler.
 func TestSignalDuringPlainOpenPreservesRetryableCancellation(t *testing.T) {
 	if mode := os.Getenv(signalChildMode); mode != "" {
 		runOpenSignalChild(t, mode)
@@ -64,8 +65,8 @@ func TestSignalDuringPlainOpenPreservesRetryableCancellation(t *testing.T) {
 				if unique == 0 || count != 1 || original.Err() != nil || exchange.Err() != nil {
 					t.Fatalf("open entry: unique=%d count=%d caller=%v HTTP=%v", unique, count, original.Err(), exchange.Err())
 				}
-				if gate.acks.Load() != 0 || gate.opens.Load() != 1 {
-					t.Fatalf("open reply gate: opens=%d ACKs=%d", gate.opens.Load(), gate.acks.Load())
+				if gate.opens.Load() != 1 {
+					t.Fatalf("open reply gate: retains=%d", gate.opens.Load())
 				}
 				if err := unix.Tgkill(pid, tid, syscall.SIGURG); err != nil {
 					t.Fatal(err)
@@ -87,16 +88,9 @@ func TestSignalDuringPlainOpenPreservesRetryableCancellation(t *testing.T) {
 				}
 				gate.unblock()
 			})
-			first := receiveOpenResult(t, observed.results)
-			if storage.ErrnoOf(first.err) != syscall.EINTR || !errors.Is(first.err, context.Canceled) || first.acks != 0 || first.closed != 1 {
-				t.Fatalf("interrupted open: err=%v ACKs=%d confirmed closes=%d", first.err, first.acks, first.closed)
-			}
-			wantOpens, wantAcks := int32(1), int32(0)
+			wantOpens := int32(1)
 			if mode == "go" {
-				wantOpens, wantAcks = 2, 1
-				if second := receiveOpenResult(t, observed.results); second.err != nil {
-					t.Fatalf("Go's retried open: %v", second.err)
-				}
+				wantOpens = 2
 			}
 			for range wantOpens {
 				select {
@@ -106,8 +100,8 @@ func TestSignalDuringPlainOpenPreservesRetryableCancellation(t *testing.T) {
 				}
 			}
 			_, kernelOpens, _ := trace.snapshot()
-			if gate.opens.Load() != wantOpens || gate.acks.Load() != wantAcks || gate.closes.Load() != wantOpens || gate.closed.Load() != wantOpens || kernelOpens != int(wantOpens) {
-				t.Fatalf("mode %s: kernel opens=%d HTTP opens=%d ACKs=%d closes=%d confirmed closes=%d", mode, kernelOpens, gate.opens.Load(), gate.acks.Load(), gate.closes.Load(), gate.closed.Load())
+			if gate.opens.Load() != wantOpens || gate.closes.Load() != wantOpens || gate.closed.Load() != wantOpens || kernelOpens != int(wantOpens) {
+				t.Fatalf("mode %s: kernel opens=%d HTTP retains=%d closes=%d confirmed closes=%d", mode, kernelOpens, gate.opens.Load(), gate.closes.Load(), gate.closed.Load())
 			}
 			after, err := backing.Stat(t.Context(), "artifact")
 			if err != nil {
@@ -117,7 +111,7 @@ func TestSignalDuringPlainOpenPreservesRetryableCancellation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if after != before || string(body) != "original" {
+			if !reflect.DeepEqual(after, before) || string(body) != "original" {
 				t.Fatalf("plain open changed file: before=%+v after=%+v body=%q", before, after, body)
 			}
 			if err := backing.Remove(t.Context(), "artifact"); err != nil {
@@ -173,16 +167,6 @@ func receiveOpenContext(t *testing.T, ctx context.Context, source <-chan context
 		return nil
 	}
 }
-func receiveOpenResult(t *testing.T, source <-chan openSignalResult) openSignalResult {
-	t.Helper()
-	select {
-	case result := <-source:
-		return result
-	case <-time.After(5 * time.Second):
-		t.Fatal("open result was not observed")
-		return openSignalResult{}
-	}
-}
 
 type openInterruptTrace struct {
 	mu          sync.Mutex
@@ -216,23 +200,18 @@ func (p *openInterruptTrace) snapshot() (uint64, int, string) {
 	return p.first, p.count, p.output.String()
 }
 
-type openSignalResult struct {
-	err          error
-	acks, closed int32
-}
 type interruptedOpenStorage struct {
 	storage.FileStorage
 	gate    *openReplyGate
 	entered chan context.Context
-	results chan openSignalResult
 }
 
-func (s *interruptedOpenStorage) NewFileSession(ctx context.Context, o storage.FileSessionOptions) (storage.FileSession, error) {
-	session, err := s.FileStorage.NewFileSession(ctx, o)
+func (s *interruptedOpenStorage) NewFileSession(ctx context.Context, o storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
+	session, status, err := s.FileStorage.NewFileSession(ctx, o)
 	if err != nil {
-		return nil, err
+		return nil, status, err
 	}
-	return &interruptedOpenSession{FileSession: session, observe: s}, nil
+	return &interruptedOpenSession{FileSession: session, observe: s}, status, nil
 }
 
 type interruptedOpenSession struct {
@@ -240,26 +219,26 @@ type interruptedOpenSession struct {
 	observe *interruptedOpenStorage
 }
 
-func (s *interruptedOpenSession) OpenFile(ctx context.Context, path string, o storage.FileOpenOptions) (storage.File, error) {
+func (s *interruptedOpenSession) RetainAt(ctx context.Context, r storage.RetainAtRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
 	s.observe.entered <- ctx
-	file, err := s.FileSession.OpenFile(ctx, path, o)
-	s.observe.results <- openSignalResult{err: err, acks: s.observe.gate.acks.Load(), closed: s.observe.gate.closed.Load()}
-	return file, err
+	return s.FileSession.RetainAt(ctx, r, id)
 }
 
 type openReplyGate struct {
-	next                        http.RoundTripper
-	held                        chan context.Context
-	release                     chan struct{}
-	holdOnce, releaseOnce       sync.Once
-	opens, acks, closes, closed atomic.Int32
-	closedEvents                chan struct{}
+	next                  http.RoundTripper
+	held                  chan context.Context
+	release               chan struct{}
+	holdOnce, releaseOnce sync.Once
+	opens, closes, closed atomic.Int32
+	references            sync.Map
+	closedEvents          chan struct{}
 }
 
 func (g *openReplyGate) unblock() { g.releaseOnce.Do(func() { close(g.release) }) }
 func (g *openReplyGate) RoundTrip(r *http.Request) (*http.Response, error) {
 	var request struct {
-		Op storage.Operation `json:"op"`
+		Op        storage.Operation       `json:"op"`
+		Reference storage.FileReferenceID `json:"reference"`
 	}
 	if r.GetBody != nil {
 		body, err := r.GetBody()
@@ -276,27 +255,23 @@ func (g *openReplyGate) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 	}
 	switch request.Op {
-	case storage.OpFileOpen:
+	case storage.OpFileRetainAt:
 		g.opens.Add(1)
-	case storage.OpFileAck:
-		g.acks.Add(1)
 	case storage.OpFileClose:
-		g.closes.Add(1)
+		if _, found := g.references.Load(request.Reference); found {
+			g.closes.Add(1)
+		}
 	}
 	response, err := g.next.RoundTrip(r)
 	if err != nil {
 		return nil, err
 	}
-	if request.Op == storage.OpFileClose && response.StatusCode == http.StatusOK && response.Header.Get(httprest.HeaderProtocol) == httprest.Version {
+	_, targetReference := g.references.Load(request.Reference)
+	if request.Op == storage.OpFileClose && targetReference && response.StatusCode == http.StatusOK && response.Header.Get(httprest.HeaderProtocol) == httprest.Version {
 		g.closed.Add(1)
 		g.closedEvents <- struct{}{}
 	}
-	if request.Op != storage.OpFileOpen {
-		return response, nil
-	}
-	hold := false
-	g.holdOnce.Do(func() { hold = true })
-	if !hold {
+	if request.Op != storage.OpFileRetainAt {
 		return response, nil
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, 4097))
@@ -311,16 +286,27 @@ func (g *openReplyGate) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, errors.New("open reply exceeds the test fixture bound")
 	}
 	var shape struct {
-		File    string                    `json:"file"`
+		Receipt *struct {
+			Reference storage.FileReferenceID `json:"reference"`
+			Effects   storage.FileEffects     `json:"effects"`
+			State     storage.FileActionState `json:"state"`
+		} `json:"receipt"`
 		Barrier *httprest.MutationBarrier `json:"barrier"`
 	}
 	if err := json.Unmarshal(body, &shape); err != nil {
 		return nil, err
 	}
-	if response.StatusCode != http.StatusOK || shape.File == "" || shape.Barrier == nil {
+	if response.StatusCode != http.StatusOK || shape.Receipt == nil || shape.Receipt.Reference == 0 || shape.Receipt.Effects&storage.EffectRetained == 0 || shape.Receipt.State != storage.FileActionCompleted || shape.Barrier == nil {
 		return nil, errors.New("open reply did not establish a file reference and barrier")
 	}
 	response.Body = io.NopCloser(bytes.NewReader(body))
+	g.references.Store(shape.Receipt.Reference, struct{}{})
+	hold := false
+	g.holdOnce.Do(func() { hold = true })
+	if !hold {
+		return response, nil
+	}
+
 	g.held <- r.Context()
 	<-g.release
 	return response, nil
@@ -380,6 +366,6 @@ func openSignalVolume(t *testing.T) (*openReplyGate, *interruptedOpenStorage, *l
 			t.Error(err)
 		}
 	})
-	observed := &interruptedOpenStorage{FileStorage: replica, gate: gate, entered: make(chan context.Context, 4), results: make(chan openSignalResult, 4)}
+	observed := &interruptedOpenStorage{FileStorage: replica, gate: gate, entered: make(chan context.Context, 4)}
 	return gate, observed, backing
 }

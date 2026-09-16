@@ -1,10 +1,8 @@
 package httprest
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
-	"io"
 	"math"
 	"reflect"
 	"strings"
@@ -237,25 +235,20 @@ func (r lockActionResult) locking() (locking.ActionResult, error) {
 // The reflected field set requires every non-optional member, including false and zero.
 // Decoder.DisallowUnknownFields alone accepts duplicate, absent, and null members.
 func decodeLockJSON(data []byte, target any) error {
-	if !utf8.Valid(data) {
-		return errors.New("lock JSON must be UTF-8")
-	}
-	t := reflect.TypeOf(target)
-	if t == nil || t.Kind() != reflect.Pointer || reflect.ValueOf(target).IsNil() {
-		return errors.New("lock JSON destination must be a non-nil pointer")
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	if err := checkLockJSON(decoder, t.Elem()); err != nil {
+	if err := decodeCheckedMessageJSON(data, target, MaxLockProofs, validateLockJSONScalar); err != nil {
 		return err
 	}
-	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		return errors.New("lock JSON contains trailing content")
-	}
-	if err := json.Unmarshal(data, target); err != nil {
-		return errors.New("lock JSON contains an invalid field value")
-	}
 	return validateLockValue(reflect.ValueOf(target).Elem())
+}
+
+func validateLockJSONScalar(typ reflect.Type, token any) error {
+	if typ == reflect.TypeOf(locking.Code("")) {
+		code, ok := token.(string)
+		if !ok || !validLockCode(locking.Code(code)) {
+			return errors.New("lock error code is unknown")
+		}
+	}
+	return nil
 }
 
 func marshalLockJSON(value any) ([]byte, error) {
@@ -267,116 +260,6 @@ func marshalLockJSON(value any) ([]byte, error) {
 		return nil, errors.New("lock control cannot be encoded")
 	}
 	return data, nil
-}
-
-func checkLockJSON(decoder *json.Decoder, typ reflect.Type) error {
-	for typ.Kind() == reflect.Pointer {
-		typ = typ.Elem()
-	}
-	token, err := decoder.Token()
-	if err != nil {
-		return errors.New("lock JSON is incomplete or invalid")
-	}
-	if token == nil {
-		return errors.New("lock JSON members cannot be null")
-	}
-	if typ == reflect.TypeOf(locking.Code("")) {
-		code, ok := token.(string)
-		if !ok || !validLockCode(locking.Code(code)) {
-			return errors.New("lock error code is unknown")
-		}
-	}
-	switch typ.Kind() {
-	case reflect.Struct:
-		if token != json.Delim('{') {
-			return errors.New("lock JSON requires an object")
-		}
-		fields := make(map[string]reflect.StructField, typ.NumField())
-		if err := collectLockJSONFields(typ, fields); err != nil {
-			return err
-		}
-		seen := make(map[string]bool, len(fields))
-		for decoder.More() {
-			key, err := decoder.Token()
-			if err != nil {
-				return errors.New("lock JSON member name is invalid")
-			}
-			name, ok := key.(string)
-			if !ok {
-				return errors.New("lock JSON member name is invalid")
-			}
-			field, ok := fields[name]
-			if !ok || seen[name] {
-				return errors.New("lock JSON contains an unknown or duplicate member")
-			}
-			seen[name] = true
-			if err := checkLockJSON(decoder, field.Type); err != nil {
-				return err
-			}
-		}
-		for name, field := range fields {
-			if !seen[name] && !strings.Contains(field.Tag.Get("json"), ",omitempty") {
-				return errors.New("lock JSON is missing a required member")
-			}
-		}
-		end, err := decoder.Token()
-		if err != nil || end != json.Delim('}') {
-			return errors.New("lock JSON object is incomplete")
-		}
-	case reflect.Slice:
-		if typ.Elem().Kind() == reflect.Uint8 {
-			if _, ok := token.(string); !ok {
-				return errors.New("lock JSON byte strings require base64 text")
-			}
-			return nil
-		}
-		if token != json.Delim('[') {
-			return errors.New("lock JSON requires an array")
-		}
-		count := 0
-		for decoder.More() {
-			count++
-			if count > 16 {
-				return errors.New("lock JSON array exceeds its element limit")
-			}
-			if err := checkLockJSON(decoder, typ.Elem()); err != nil {
-				return err
-			}
-		}
-		end, err := decoder.Token()
-		if err != nil || end != json.Delim(']') {
-			return errors.New("lock JSON array is incomplete")
-		}
-	default:
-		if _, nested := token.(json.Delim); nested {
-			return errors.New("lock JSON scalar has an invalid type")
-		}
-	}
-	return nil
-}
-
-func collectLockJSONFields(typ reflect.Type, fields map[string]reflect.StructField) error {
-	for i := 0; i < typ.NumField(); i++ {
-		field := typ.Field(i)
-		name := strings.Split(field.Tag.Get("json"), ",")[0]
-		if name == "-" || !field.IsExported() {
-			continue
-		}
-		if field.Anonymous && field.Type.Kind() == reflect.Struct && name == "" {
-			if err := collectLockJSONFields(field.Type, fields); err != nil {
-				return err
-			}
-			continue
-		}
-		if name == "" {
-			name = field.Name
-		}
-		if _, exists := fields[name]; exists {
-			return errors.New("lock JSON schema has ambiguous members")
-		}
-		fields[name] = field
-	}
-	return nil
 }
 
 func validLockCode(code locking.Code) bool {

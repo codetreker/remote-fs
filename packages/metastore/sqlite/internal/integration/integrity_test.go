@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"math"
 	"os"
 	"syscall"
@@ -14,6 +13,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
 )
 
 func TestMiddleRetainedChangeDeletionIsRefusedByOpenAndSince(t *testing.T) {
@@ -204,8 +204,8 @@ func TestLiveReadersRejectLargeBlobScalarsBeforeMaterializingThem(t *testing.T) 
 			},
 		},
 		{
-			"change mode",
-			`UPDATE changes SET mode = zeroblob(4 * 1024 * 1024)
+			"change node kind",
+			`UPDATE changes SET node_kind = zeroblob(4 * 1024 * 1024)
 			 WHERE position = (SELECT min(position) FROM changes)`,
 			func(store *sqlite.Store) error {
 				result, err := metastore.NewChangeResult(1<<20, 0,
@@ -352,18 +352,12 @@ func TestIntegrityWorkCountIncludesForeignLabelsTouchingTheVolume(t *testing.T) 
 	if err := neighbour.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db := raw(t, path)
-	if _, err := db.Exec(`
-		INSERT INTO entries (volume, parent, name, node)
-		SELECT foreign_ns.id, local_ns.root, names.name, foreign_ns.root
-		FROM volumes local_ns, volumes foreign_ns,
-			(SELECT CAST('hidden-one' AS BLOB) AS name UNION ALL SELECT CAST('hidden-two' AS BLOB)) names
-		WHERE local_ns.name = 'workspace' AND foreign_ns.name = 'neighbour'`); err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"hidden-one", "hidden-two"} {
+		insertIntegrityEntry(t, path, `
+			INSERT INTO entries (id, volume, parent, name, node)
+			SELECT ?, foreign_ns.id, local_ns.root, CAST(? AS BLOB), foreign_ns.root
+			FROM volumes local_ns, volumes foreign_ns
+			WHERE local_ns.name = 'workspace' AND foreign_ns.name = 'neighbour'`, name)
 	}
 	if _, err := store.ObjectStatus(t.Context()); !errors.Is(err, syscall.EFBIG) {
 		t.Fatalf("foreign-labeled edges above the integrity limit returned %v, want EFBIG", err)
@@ -450,8 +444,12 @@ func TestIntegrityByteLimitAcceptsItsExactBoundary(t *testing.T) {
 	if err := db.QueryRow(`SELECT
 		(SELECT coalesce(sum(length(name)), 0) FROM entries) +
 		(SELECT coalesce(sum(coalesce(length(name), 0) + coalesce(length(from_name), 0) +
-			coalesce(length(CAST(content AS BLOB)), 0) + length(notification)), 0) FROM changes) +
-		(SELECT coalesce(sum(length(windows_link_target)), 0) FROM nodes)`).Scan(&boundary); err != nil {
+			coalesce(length(CAST(content AS BLOB)), 0) + coalesce(length(metadata), 0) +
+			coalesce(length(link_target), 0) + length(notification)), 0) FROM changes) +
+		(SELECT coalesce(sum(length(metadata) + length(link_target)), 0) FROM nodes) +
+		(SELECT coalesce(sum(length(CAST(drain_authority AS BLOB))), 0) FROM entries) +
+		(SELECT coalesce(sum(length(CAST(reference AS BLOB)) + length(CAST(token AS BLOB)) +
+			length(CAST(authority AS BLOB))), 0) FROM removal_intents)`).Scan(&boundary); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
@@ -672,42 +670,68 @@ func damageDatabase(t *testing.T, path, statement string, args ...any) {
 	}
 }
 
+func insertIntegrityEntry(t *testing.T, path, statement string, args ...any) {
+	t.Helper()
+	db := raw(t, path)
+	defer db.Close()
+	tx, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	id, err := dbstate.AllocateEntryID(t.Context(), tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := tx.ExecContext(t.Context(), statement, append([]any{id}, args...)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count, err := result.RowsAffected(); err != nil || count != 1 {
+		t.Fatalf("inserted integrity entry count=%d, error=%v; want one row", count, err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func addDisconnectedDirectories(t *testing.T, fixture objectIntegrityFixture, cycle bool) {
 	t.Helper()
 	db := raw(t, fixture.path)
 	defer db.Close()
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
 	insertNode := func() int64 {
-		result, err := tx.Exec(`
-			INSERT INTO nodes (volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-			SELECT ns.id, root.mode, 0, 0, 0, 0, 0, NULL
-			FROM volumes ns JOIN nodes root ON root.id = ns.root
-			WHERE ns.id = ?`, fixture.volume)
+		id, err := dbstate.AllocateNodeID(t.Context(), tx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		id, err := result.LastInsertId()
-		if err != nil {
+		if _, err := tx.Exec(`
+			INSERT INTO nodes (id, volume, kind, directory_revision, metadata_revision, metadata,
+				size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+			VALUES (?, ?, 2, 1, 1, X'52464d010000', 0, 0, 0, 0, 0, NULL)`, id, fixture.volume); err != nil {
 			t.Fatal(err)
 		}
 		return id
 	}
 	first, second := insertNode(), insertNode()
-	if _, err := tx.Exec(`
-		INSERT INTO entries (volume, parent, name, node)
-		VALUES (?, ?, CAST('child' AS BLOB), ?)`, fixture.volume, first, second); err != nil {
-		t.Fatal(err)
-	}
-	if cycle {
-		if _, err := tx.Exec(`
-			INSERT INTO entries (volume, parent, name, node)
-			VALUES (?, ?, CAST('parent' AS BLOB), ?)`, fixture.volume, second, first); err != nil {
+	insertEntry := func(parent, child int64, name string) {
+		id, err := dbstate.AllocateEntryID(t.Context(), tx)
+		if err != nil {
 			t.Fatal(err)
 		}
+		if _, err := tx.Exec(`
+			INSERT INTO entries (id, volume, parent, name, node)
+			VALUES (?, ?, ?, CAST(? AS BLOB), ?)`, id, fixture.volume, parent, name, child); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertEntry(first, second, "child")
+	if cycle {
+		insertEntry(second, first, "parent")
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
@@ -780,8 +804,8 @@ func TestOpenRefusesInconsistentVolumeIntegrity(t *testing.T) {
 		{"a node and its object disagree about size", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE nodes SET size = 11 WHERE content = ?`, f.live)
 		}},
-		{"a node holding content has a non-integer mode", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE nodes SET mode = 'regular' WHERE content = ?`, f.live)
+		{"a node holding content has a non-integer kind", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE nodes SET kind = 'regular' WHERE content = ?`, f.live)
 		}},
 		{"a node claims bytes without an object", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE nodes SET content = NULL, size = 10 WHERE content = ?`, f.live)
@@ -791,9 +815,9 @@ func TestOpenRefusesInconsistentVolumeIntegrity(t *testing.T) {
 				f.live, f.volume, "directory")
 		}},
 		{"a non-root node has two entries", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `
-				INSERT INTO entries (volume, parent, name, node)
-				SELECT ?, root, CAST('alias' AS BLOB),
+			insertIntegrityEntry(t, f.path, `
+				INSERT INTO entries (id, volume, parent, name, node)
+				SELECT ?, ?, root, CAST('alias' AS BLOB),
 					(SELECT node FROM entries WHERE volume = ? AND name = CAST('live' AS BLOB))
 				FROM volumes WHERE id = ?`, f.volume, f.volume, f.volume)
 		}},
@@ -802,9 +826,9 @@ func TestOpenRefusesInconsistentVolumeIntegrity(t *testing.T) {
 				`DELETE FROM entries WHERE volume = ? AND name = CAST('live' AS BLOB)`, f.volume)
 		}},
 		{"the root has an entry", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `
-				INSERT INTO entries (volume, parent, name, node)
-				SELECT id, root, CAST('root-alias' AS BLOB), root FROM volumes WHERE id = ?`, f.volume)
+			insertIntegrityEntry(t, f.path, `
+				INSERT INTO entries (id, volume, parent, name, node)
+				SELECT ?, id, root, CAST('root-alias' AS BLOB), root FROM volumes WHERE id = ?`, f.volume)
 		}},
 		{"the volume root belongs to another volume", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `
@@ -817,9 +841,9 @@ func TestOpenRefusesInconsistentVolumeIntegrity(t *testing.T) {
 				WHERE volume = ? AND name = CAST('live' AS BLOB)`, f.volume)
 		}},
 		{"a foreign entry uses this volume as its parent", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `
-				INSERT INTO entries (volume, parent, name, node)
-				SELECT foreign_ns.id, local_ns.root, CAST('hidden-parent' AS BLOB), foreign_ns.root
+			insertIntegrityEntry(t, f.path, `
+				INSERT INTO entries (id, volume, parent, name, node)
+				SELECT ?, foreign_ns.id, local_ns.root, CAST('hidden-parent' AS BLOB), foreign_ns.root
 				FROM volumes local_ns, volumes foreign_ns
 				WHERE local_ns.id = ? AND foreign_ns.name = 'neighbour'`, f.volume)
 		}},
@@ -851,12 +875,56 @@ func TestOpenRefusesInconsistentVolumeIntegrity(t *testing.T) {
 		{"the volume used counter is not an integer", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE volumes SET used = 'ten' WHERE id = ?`, f.volume)
 		}},
-		{"an empty leaf has an invalid stored mode", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE nodes SET mode = -1 WHERE `+nodeNamed, f.volume, "copy")
+		{"an empty leaf has an invalid stored kind", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE nodes SET kind = -1 WHERE `+nodeNamed, f.volume, "copy")
 		}},
 		{"a node has an unsupported type", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE nodes SET mode = ? WHERE `+nodeNamed,
-				int64(fs.ModeSymlink|0o777), f.volume, "copy")
+			damageDatabase(t, f.path, `UPDATE nodes SET kind = 4 WHERE `+nodeNamed,
+				f.volume, "copy")
+		}},
+		{"node metadata is text", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE nodes SET metadata = 'RFM1' WHERE `+nodeNamed, f.volume, "copy")
+		}},
+		{"node metadata has an unsupported envelope", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE nodes SET metadata = X'52464d020000' WHERE `+nodeNamed, f.volume, "copy")
+		}},
+		{"node metadata has a truncated entry", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE nodes SET metadata = X'52464d010100' WHERE `+nodeNamed, f.volume, "copy")
+		}},
+		{"node metadata revision is zero", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE nodes SET metadata_revision = 0 WHERE `+nodeNamed, f.volume, "copy")
+		}},
+		{"node metadata revision is not an integer", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE nodes SET metadata_revision = X'01' WHERE `+nodeNamed, f.volume, "copy")
+		}},
+		{"directory revision is zero", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE nodes SET directory_revision = 0 WHERE `+nodeNamed, f.volume, "directory")
+		}},
+		{"regular file has a directory revision", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE nodes SET directory_revision = 1 WHERE `+nodeNamed, f.volume, "copy")
+		}},
+		{"node creation time has only seconds", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE nodes SET creation_sec = 1, creation_nsec = NULL WHERE `+nodeNamed, f.volume, "copy")
+		}},
+		{"node change time has invalid nanoseconds", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE nodes SET change_sec = 1, change_nsec = 1000000000 WHERE `+nodeNamed, f.volume, "copy")
+		}},
+		{"regular file has a link target", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE nodes SET link_target = X'61' WHERE `+nodeNamed, f.volume, "copy")
+		}},
+		{"entry identity collides with a node", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE entries SET id = node WHERE volume = ? AND name = CAST('copy' AS BLOB)`, f.volume)
+		}},
+		{"entry drain has no generation", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE entries SET draining = 1, drain_generation = 0, drain_authority = 'owner'
+				WHERE volume = ? AND name = CAST('copy' AS BLOB)`, f.volume)
+		}},
+		{"entry drain has no authority", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE entries SET draining = 1, drain_generation = 1, drain_authority = ''
+				WHERE volume = ? AND name = CAST('copy' AS BLOB)`, f.volume)
+		}},
+		{"inactive entry drain retains an empty-directory condition", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE entries SET drain_if_empty = 1 WHERE volume = ? AND name = CAST('copy' AS BLOB)`, f.volume)
 		}},
 		{"a node has invalid access nanoseconds", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE nodes SET atime_nsec = 1000000000 WHERE `+nodeNamed,
@@ -896,14 +964,14 @@ func TestOpenRefusesInconsistentVolumeIntegrity(t *testing.T) {
 			damageDatabase(t, f.path, `UPDATE changes SET kind = 'created' WHERE volume = ? AND position = (SELECT min(position) FROM changes WHERE volume = ?)`, f.volume, f.volume)
 		}},
 		{"a change carries an unsupported node type", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE changes SET mode = ? WHERE position = (
+			damageDatabase(t, f.path, `UPDATE changes SET node_kind = 4 WHERE position = (
 				SELECT min(position) FROM changes WHERE volume = ? AND node IS NOT NULL)`,
-				int64(fs.ModeSymlink|0o777), f.volume)
+				f.volume)
 		}},
 		{"a change carries file bytes without a content key", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE changes SET content = NULL WHERE position = (
-				SELECT min(position) FROM changes WHERE volume = ? AND (mode & ?) = 0 AND size > 0)`,
-				f.volume, int64(fs.ModeType))
+				SELECT min(position) FROM changes WHERE volume = ? AND node_kind = 1 AND size > 0)`,
+				f.volume)
 		}},
 		{"a created change has no name", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE changes SET name = NULL WHERE volume = ? AND kind = 0`, f.volume)
@@ -952,9 +1020,9 @@ func TestObjectStatusRefusesInconsistentNodeRelationships(t *testing.T) {
 	}
 	defer store.Close()
 
-	damageDatabase(t, fixture.path, `
-		INSERT INTO entries (volume, parent, name, node)
-		SELECT ?, root, CAST('alias' AS BLOB),
+	insertIntegrityEntry(t, fixture.path, `
+		INSERT INTO entries (id, volume, parent, name, node)
+		SELECT ?, ?, root, CAST('alias' AS BLOB),
 			(SELECT node FROM entries WHERE volume = ? AND name = CAST('live' AS BLOB))
 		FROM volumes WHERE id = ?`, fixture.volume, fixture.volume, fixture.volume)
 	if _, err := store.ObjectStatus(t.Context()); !errors.Is(err, syscall.EIO) {
@@ -1110,8 +1178,8 @@ func TestRetainedIntegrityRefusesInvalidDetachedState(t *testing.T) {
 		{"revision zero", `UPDATE nodes SET content_revision = 0 WHERE content = ?`},
 		{"revision negative", `UPDATE nodes SET content_revision = -1 WHERE content = ?`},
 		{"unmarked orphan", `UPDATE nodes SET detached = 0 WHERE content = ?`},
-		{"incoming entry", `INSERT INTO entries (volume, parent, name, node)
-			SELECT n.volume, ns.root, CAST('restored' AS BLOB), n.id FROM nodes n
+		{"incoming entry", `INSERT INTO entries (id, volume, parent, name, node)
+			SELECT ?, n.volume, ns.root, CAST('restored' AS BLOB), n.id FROM nodes n
 			JOIN volumes ns ON ns.id = n.volume WHERE n.content = ?`},
 		{"outgoing entry", `UPDATE entries SET parent = (SELECT id FROM nodes WHERE content = ?)
 			WHERE name = CAST('copy' AS BLOB)`},
@@ -1130,7 +1198,11 @@ func TestRetainedIntegrityRefusesInvalidDetachedState(t *testing.T) {
 				if entry == "status" {
 					store = open(t, f.path, "workspace", 100)
 				}
-				damageDatabase(t, f.path, damage.sql, f.live)
+				if damage.name == "incoming entry" {
+					insertIntegrityEntry(t, f.path, damage.sql, f.live)
+				} else {
+					damageDatabase(t, f.path, damage.sql, f.live)
+				}
 				assertRetainedIntegrityFailure(t, f.path, store)
 			})
 		}

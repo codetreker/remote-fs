@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
-	"io/fs"
 	"math"
 	"strings"
 	"sync"
@@ -18,12 +17,10 @@ import (
 type fileHandle struct {
 	lease      *leaseReference
 	identity   notificationIdentity
-	file       storage.WindowsFile
-	lookup     storage.WindowsLookup
-	name       string
+	file       windowsFile
 	access     uint32
 	mu         sync.Mutex
-	entries    []storage.WindowsEntry
+	entries    []windowsEntry
 	cursor     int
 	pattern    string
 	class      byte
@@ -34,8 +31,8 @@ type fileHandle struct {
 type fileDispatcher struct {
 	authority   *authoritySession
 	leases      *leaseOwner
-	backend     storage.WindowsStorage
-	session     storage.WindowsSession
+	backend     windowsBackend
+	session     windowsSession
 	epoch       uint64
 	limits      Limits
 	mu          sync.Mutex
@@ -51,7 +48,7 @@ type fileDispatcher struct {
 	retired     bool
 }
 
-func newFileDispatcher(backend storage.WindowsStorage, session storage.WindowsSession, epoch uint64, limits Limits) *fileDispatcher {
+func newFileDispatcher(backend windowsBackend, session windowsSession, epoch uint64, limits Limits) *fileDispatcher {
 	return &fileDispatcher{backend: backend, session: session, epoch: epoch, limits: limits, handles: make(map[wire.FileID]*fileHandle)}
 }
 func (d *fileDispatcher) handleCount() int {
@@ -59,7 +56,7 @@ func (d *fileDispatcher) handleCount() int {
 	defer d.mu.Unlock()
 	return len(d.handles) + d.opening
 }
-func (d *fileDispatcher) file(id wire.FileID) (storage.WindowsFile, bool) {
+func (d *fileDispatcher) file(id wire.FileID) (windowsFile, bool) {
 	h := d.get(id)
 	if h == nil {
 		return nil, false
@@ -74,8 +71,8 @@ func (d *fileDispatcher) get(id wire.FileID) *fileHandle {
 	}
 	return d.handles[id]
 }
-func (d *fileDispatcher) actionID() (storage.WindowsActionID, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), d.limits.CleanupTimeout)
+func (d *fileDispatcher) actionID(parent context.Context) (windowsActionID, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), d.limits.CleanupTimeout)
 	defer cancel()
 	status, err := d.session.Status(ctx)
 	if err != nil {
@@ -84,7 +81,7 @@ func (d *fileDispatcher) actionID() (storage.WindowsActionID, error) {
 	if status.Retired || status.Fenced {
 		return "", syscall.EIO
 	}
-	return storage.NewLockRequestID(status.ActionEpoch)
+	return storage.NewFileActionID(status.ActionEpoch)
 }
 func statusError(err error) uint32 {
 	if err == nil {
@@ -93,16 +90,16 @@ func statusError(err error) uint32 {
 	if errors.Is(err, authz.ErrDenied) {
 		return 0xc0000022
 	}
-	switch storage.WindowsFailureOf(err) {
-	case storage.WindowsSharingViolation:
+	switch windowsFailureOf(err) {
+	case windowsSharingViolation:
 		return 0xc0000043
-	case storage.WindowsLockConflict:
+	case windowsLockConflict:
 		return 0xc0000054
-	case storage.WindowsDeletePending:
+	case windowsDeletePending:
 		return 0xc0000056
-	case storage.WindowsRangeNotLocked:
+	case windowsRangeNotLocked:
 		return 0xc000007e
-	case storage.WindowsNotReparsePoint:
+	case windowsNotReparsePoint:
 		return 0xc0000275
 	}
 	switch storage.ErrnoOf(err) {
@@ -142,29 +139,29 @@ func statusError(err error) uint32 {
 		return fileIOError
 	}
 }
-func statusAction(r storage.WindowsActionResult, err error) uint32 {
+func statusAction(r windowsActionResult, err error) uint32 {
 	if err != nil {
 		if r.Failure != "" && r.Errno != 0 && storage.ErrnoOf(err) == r.Errno {
-			return statusError(&storage.WindowsError{Failure: r.Failure, Err: err})
+			return statusError(&windowsError{Failure: r.Failure, Err: err})
 		}
 		return statusError(err)
 	}
-	if r.State == storage.WindowsActionCancelled {
+	if r.State == windowsActionCancelled {
 		return statusCancelled
 	}
 	if r.Errno != 0 {
-		return statusError(&storage.WindowsError{Failure: r.Failure, Err: r.Errno})
+		return statusError(&windowsError{Failure: r.Failure, Err: r.Errno})
 	}
-	if r.State == storage.WindowsActionCancelled {
+	if r.State == windowsActionCancelled {
 		return 0xc0000120
 	}
-	if r.State != storage.WindowsActionCompleted {
+	if r.State != windowsActionCompleted {
 		return fileIOError
 	}
 	return fileSuccess
 }
 
-func windowsIntent(r wire.CreateRequest) (storage.WindowsOpenIntent, error) {
+func windowsIntent(r wire.CreateRequest) (windowsOpenIntent, error) {
 	// FILE_DISALLOW_EXCLUSIVE has no server-side meaning in SMB2 CREATE.
 	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/e8fb45c1-a03d-44ca-b7ae-47385cfd7997
 	r.Options &^= 0x00020000
@@ -173,36 +170,44 @@ func windowsIntent(r wire.CreateRequest) (storage.WindowsOpenIntent, error) {
 	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/8ada5fbe-db4e-49fd-aef6-20d54b748e40
 	r.Options &^= 0x00004000
 	if r.Options&0x8 != 0 {
-		return storage.WindowsOpenIntent{}, syscall.EOPNOTSUPP
+		return windowsOpenIntent{}, syscall.EOPNOTSUPP
 	}
-	access, status := decodeAccess(r.DesiredAccess)
+	access, status := decodeAccess(r.DesiredAccess &^ uint32(0x02000000))
 	if status != 0 {
-		return storage.WindowsOpenIntent{}, syscall.EOPNOTSUPP
+		return windowsOpenIntent{}, syscall.EOPNOTSUPP
 	}
 	if r.Disposition > 5 || r.ShareAccess > 7 || r.Options&^uint32(0x0020186f) != 0 {
-		return storage.WindowsOpenIntent{}, syscall.EOPNOTSUPP
+		return windowsOpenIntent{}, syscall.EOPNOTSUPP
 	}
-	kind := storage.WindowsAny
+	kind := windowsAny
 	if r.Options&1 != 0 {
-		kind = storage.WindowsDirectory
+		kind = windowsDirectory
 	}
 	if r.Options&0x40 != 0 {
-		if kind != storage.WindowsAny {
-			return storage.WindowsOpenIntent{}, syscall.EINVAL
+		if kind != windowsAny {
+			return windowsOpenIntent{}, syscall.EINVAL
 		}
-		kind = storage.WindowsRegularFile
+		kind = windowsRegularFile
 	}
-	i := storage.WindowsOpenIntent{Access: access, Share: storage.WindowsShare(r.ShareAccess), Disposition: storage.WindowsDisposition(r.Disposition + 1), Kind: kind, DeleteOnClose: r.Options&0x1000 != 0, OpenReparsePoint: r.Options&0x200000 != 0}
+	i := windowsOpenIntent{MaximumAllowed: r.DesiredAccess&0x02000000 != 0, Access: access, Share: windowsShare(r.ShareAccess), Disposition: windowsDisposition(r.Disposition + 1), Kind: kind, DeleteOnClose: r.Options&0x1000 != 0, OpenReparsePoint: r.Options&0x200000 != 0}
 	return i, i.Check()
 }
 
-func (d *fileDispatcher) open(ctx context.Context, request storage.WindowsOpenRequest, id storage.WindowsActionID) (storage.WindowsOpenResult, error) {
+func (d *fileDispatcher) open(ctx context.Context, request windowsOpenRequest, id windowsActionID) (windowsOpenResult, error) {
 	result, _, err := d.openOutcome(ctx, request, id)
 	return result, err
 }
 
-func (d *fileDispatcher) openOutcome(ctx context.Context, request storage.WindowsOpenRequest, id storage.WindowsActionID) (storage.WindowsOpenResult, bool, error) {
+func (d *fileDispatcher) openOutcome(ctx context.Context, request windowsOpenRequest, id windowsActionID) (windowsOpenResult, bool, error) {
 	result, err := d.session.Open(ctx, request, id)
+	var cleanupError *clientCleanupError
+	if errors.As(err, &cleanupError) {
+		d.fence()
+		return result, false, err
+	}
+	if result.notAdmitted && storage.IsFileCallNotAdmitted(err) {
+		return result, true, err
+	}
 	if err == nil {
 		if result.File == nil || result.Attr.ID == 0 {
 			d.fence()
@@ -216,22 +221,22 @@ func (d *fileDispatcher) openOutcome(ctx context.Context, request storage.Window
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d.limits.CleanupTimeout)
 	defer cancel()
 	known, queryErr := d.session.QueryAction(cleanupCtx, id)
-	if knownAction(known, queryErr, id) && known.State != storage.WindowsActionPending {
-		resolved := storage.WindowsOpenResult{File: known.File, Attr: known.Attr, CreateAction: known.CreateAction}
+	if knownAction(known, queryErr, id) && known.State != windowsActionPending {
+		resolved := windowsOpenResult{GrantedAccess: known.GrantedAccess, proof: known.proof, File: known.File, Attr: known.Attr, CreateAction: known.CreateAction}
 		if known.Errno != 0 {
 			if known.Errno == syscall.ELOOP && known.Symlink != nil {
-				return resolved, true, &storage.WindowsSymlinkError{WindowsSymlinkInfo: *known.Symlink, Err: queryErr}
+				return resolved, true, &windowsSymlinkError{windowsSymlinkInfo: *known.Symlink, Err: queryErr}
 			}
 			return resolved, true, queryErr
 		}
-		if known.State == storage.WindowsActionCompleted && known.File != nil && known.Attr.ID != 0 {
+		if known.State == windowsActionCompleted && known.File != nil && known.Attr.ID != 0 {
 			return resolved, true, nil
 		}
-		if known.State == storage.WindowsActionCancelled {
+		if known.State == windowsActionCancelled {
 			return resolved, true, syscall.EINTR
 		}
 	}
-	if request.Disposition != storage.WindowsOpen && d.onUncertain != nil {
+	if request.Disposition != windowsOpen && d.onUncertain != nil {
 		d.onUncertain()
 	}
 	d.fence()
@@ -240,29 +245,29 @@ func (d *fileDispatcher) openOutcome(ctx context.Context, request storage.Window
 
 // Each intermediate directory stays retained through final admission. Expected
 // identities prevent a concurrently replaced name from redirecting an operation.
-func (d *fileDispatcher) resolve(ctx context.Context, name string) (storage.WindowsLookup, func() error, error) {
+func (d *fileDispatcher) resolve(ctx context.Context, name string) (windowsLookup, func() error, error) {
 	if strings.Contains(name, ":") {
-		return storage.WindowsLookup{}, nil, syscall.EOPNOTSUPP
+		return windowsLookup{}, nil, syscall.EOPNOTSUPP
 	}
 	if strings.HasPrefix(name, "\\") || strings.ContainsAny(name, "/\x00") {
-		return storage.WindowsLookup{}, nil, syscall.EINVAL
+		return windowsLookup{}, nil, syscall.EINVAL
 	}
 	if name == "" {
-		return storage.WindowsLookup{}, func() error { return nil }, nil
+		return windowsLookup{}, func() error { return nil }, nil
 	}
 	parts := strings.Split(name, "\\")
 	for _, p := range parts {
 		if p == "" || p == "." || p == ".." {
-			return storage.WindowsLookup{}, nil, syscall.EINVAL
+			return windowsLookup{}, nil, syscall.EINVAL
 		}
 	}
-	var parents []storage.WindowsFile
+	var parents []windowsFile
 	cleanup := func() error {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d.limits.CleanupTimeout)
 		defer cancel()
 		var errs []error
 		for i := len(parents) - 1; i >= 0; i-- {
-			id, e := d.actionID()
+			id, e := d.actionID(ctx)
 			if e != nil {
 				errs = append(errs, e)
 				continue
@@ -278,28 +283,28 @@ func (d *fileDispatcher) resolve(ctx context.Context, name string) (storage.Wind
 		}
 		return err
 	}
-	lookup := storage.WindowsLookup{}
+	lookup := windowsLookup{}
 	for i := 0; i < len(parts); i++ {
-		id, err := d.actionID()
+		id, err := d.actionID(ctx)
 		if err != nil {
 			_ = cleanup()
-			return storage.WindowsLookup{}, nil, err
+			return windowsLookup{}, nil, err
 		}
-		r, err := d.open(ctx, storage.WindowsOpenRequest{Lookup: lookup, WindowsOpenIntent: storage.WindowsOpenIntent{Share: storage.WindowsShareAll, Disposition: storage.WindowsOpen, Kind: storage.WindowsDirectory}}, id)
+		r, err := d.open(ctx, windowsOpenRequest{Lookup: lookup, windowsOpenIntent: windowsOpenIntent{Share: windowsShareAll, Disposition: windowsOpen, Kind: windowsDirectory}}, id)
 		if err != nil {
-			var link *storage.WindowsSymlinkError
+			var link *windowsSymlinkError
 			if errors.As(err, &link) {
 				copy := *link
 				copy.Unparsed += "/" + strings.Join(parts[i:], "/")
 				err = &copy
 			}
 			if cleanupErr := cleanup(); cleanupErr != nil {
-				return storage.WindowsLookup{}, nil, cleanupErr
+				return windowsLookup{}, nil, cleanupErr
 			}
-			return storage.WindowsLookup{}, nil, err
+			return windowsLookup{}, nil, err
 		}
 		parents = append(parents, r.File)
-		lookup = storage.WindowsLookup{ParentID: r.Attr.ID, ParentReference: r.File.Reference(), Name: parts[i]}
+		lookup = windowsLookup{ParentID: r.Attr.ID, ParentReference: r.File.Reference(), Name: parts[i], proof: r.proof}
 	}
 	return lookup, cleanup, nil
 }
@@ -352,7 +357,7 @@ func (d *fileDispatcher) create(ctx context.Context, r wire.Request) ([]byte, ui
 	if err != nil {
 		return createFailure(err)
 	}
-	if request.Attributes & ^uint32(storage.WindowsSettableDOSAttributes|0x10) != 0 {
+	if request.Attributes & ^uint32(dosSettableAttributes|0x10) != 0 {
 		return nil, fileNotSupported
 	}
 	var volumeSerial uint64
@@ -366,11 +371,11 @@ func (d *fileDispatcher) create(ctx context.Context, r wire.Request) ([]byte, ui
 			if len(c.Data) != 0 {
 				return nil, fileInvalidParameter
 			}
-			state, err := d.backend.WindowsState(ctx)
+			state, err := d.backend.State(ctx)
 			if err != nil {
 				return nil, statusError(err)
 			}
-			if !state.Enabled || state.VolumeIdentity == "" {
+			if state.VolumeIdentity == "" {
 				return nil, fileIOError
 			}
 			volumeSerial = state.VolumeSerial
@@ -420,7 +425,7 @@ func (d *fileDispatcher) create(ctx context.Context, r wire.Request) ([]byte, ui
 			return createFailure(err)
 		}
 	}
-	id, err := d.actionID()
+	id, err := d.actionID(ctx)
 	if err != nil {
 		if cleanupErr := cleanup(); cleanupErr != nil && lease != nil {
 			lease.retain()
@@ -436,7 +441,7 @@ func (d *fileDispatcher) create(ctx context.Context, r wire.Request) ([]byte, ui
 			return createFailure(err)
 		}
 	}
-	opened, known, err := d.openOutcome(ctx, storage.WindowsOpenRequest{Lookup: lookup, WindowsOpenIntent: intent, Mode: 0666, DOSAttributes: request.Attributes &^ uint32(0x10)}, id)
+	opened, known, err := d.openOutcome(ctx, windowsOpenRequest{Lookup: lookup, windowsOpenIntent: intent, DOSAttributes: request.Attributes &^ uint32(0x10)}, id)
 	if lease != nil {
 		lease.outcome(opened.File, known, false)
 	}
@@ -460,9 +465,7 @@ func (d *fileDispatcher) create(ctx context.Context, r wire.Request) ([]byte, ui
 		d.fence()
 		return nil, fileIOError
 	}
-	lookup.ParentReference = ""
-	lookup.ExpectedID = opened.Attr.ID
-	h := &fileHandle{identity: notificationIdentity{ID: opened.Attr.ID, Directory: opened.Attr.IsDir()}, file: opened.File, lookup: lookup, name: request.Name, access: expandAccess(request.DesiredAccess)}
+	h := &fileHandle{identity: notificationIdentity{ID: opened.Attr.ID, Directory: opened.Attr.IsDir()}, file: opened.File, access: encodeAccess(opened.GrantedAccess)}
 	installationHeld := false
 	releaseInstallation := func() {
 		if installationHeld {
@@ -511,17 +514,17 @@ func (d *fileDispatcher) create(ctx context.Context, r wire.Request) ([]byte, ui
 	}
 	action := uint32(1)
 	switch opened.CreateAction {
-	case storage.WindowsCreated:
+	case windowsCreated:
 		action = 2
-	case storage.WindowsOverwritten:
+	case windowsOverwritten:
 		action = 3
-	case storage.WindowsSuperseded:
+	case windowsSuperseded:
 		action = 0
 	}
 	smbLE.PutUint32(b[4:], action)
 	copy(b[8:40], encodeBasicInfo(opened.Attr)[:32])
 	smbLE.PutUint64(b[40:], allocationSize(opened.Attr.Attr))
-	if !opened.Attr.IsDir() && opened.Attr.Mode&fs.ModeSymlink == 0 {
+	if !opened.Attr.IsDir() && opened.Attr.Kind != storage.NodeSymlink {
 		smbLE.PutUint64(b[48:], uint64(opened.Attr.Size))
 	}
 	smbLE.PutUint32(b[56:], fileAttributes(opened.Attr))
@@ -609,12 +612,12 @@ func (d *fileDispatcher) write(ctx context.Context, r wire.Request) ([]byte, uin
 	if h == nil {
 		return nil, fileClosed
 	}
-	id, err := d.actionID()
+	id, err := d.actionID(ctx)
 	if err != nil {
 		return nil, statusError(err)
 	}
 	result, err := h.file.WriteAt(ctx, int64(q.Offset), q.Data, id)
-	if status := d.mutationResult(id, result, err); status != 0 {
+	if status := d.mutationResult(ctx, id, result, err); status != 0 {
 		return nil, status
 	}
 	b := make([]byte, 16)
@@ -623,9 +626,17 @@ func (d *fileDispatcher) write(ctx context.Context, r wire.Request) ([]byte, uin
 	return b, fileSuccess
 }
 
-func (d *fileDispatcher) mutationResult(id storage.WindowsActionID, result storage.WindowsActionResult, err error) uint32 {
+func (d *fileDispatcher) mutationResult(parent context.Context, id windowsActionID, result windowsActionResult, err error) uint32 {
+	var cleanupError *clientCleanupError
+	if errors.As(err, &cleanupError) {
+		d.fence()
+		return fileIOError
+	}
+	if result.notAdmitted && storage.IsFileCallNotAdmitted(err) {
+		return statusError(err)
+	}
 	if err == nil {
-		if result.Action != id || result.State == storage.WindowsActionPending {
+		if result.Action != id || result.State == windowsActionPending {
 			if d.onUncertain != nil {
 				d.onUncertain()
 			}
@@ -637,10 +648,10 @@ func (d *fileDispatcher) mutationResult(id storage.WindowsActionID, result stora
 	if storage.ErrnoOf(err) != syscall.EIO && storage.ErrnoOf(err) != syscall.EINTR {
 		return statusError(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), d.limits.CleanupTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), d.limits.CleanupTimeout)
 	defer cancel()
 	known, queryErr := d.session.QueryAction(ctx, id)
-	if knownAction(known, queryErr, id) && known.State != storage.WindowsActionPending {
+	if knownAction(known, queryErr, id) && known.State != windowsActionPending {
 		return statusAction(known, queryErr)
 	}
 	if d.onUncertain != nil {
@@ -666,7 +677,7 @@ func (d *fileDispatcher) closeOrFlush(ctx context.Context, r wire.Request) ([]by
 		return []byte{4, 0, 0, 0}, fileSuccess
 	}
 	postQuery := smbLE.Uint16(r.Body[2:])&1 != 0
-	var attr storage.WindowsAttr
+	var attr windowsAttr
 	if postQuery {
 		// A failed optional attribute query must not retain the open. The response
 		// clears POSTQUERY so the zero fields do not claim observed metadata.
@@ -674,12 +685,12 @@ func (d *fileDispatcher) closeOrFlush(ctx context.Context, r wire.Request) ([]by
 		attr, err = h.file.Stat(ctx)
 		postQuery = err == nil
 	}
-	action, err := d.actionID()
+	action, err := d.actionID(ctx)
 	if err != nil {
 		return nil, statusError(err)
 	}
 	result, err := h.file.Close(ctx, action)
-	if s := d.mutationResult(action, result, err); s != 0 {
+	if s := d.mutationResult(ctx, action, result, err); s != 0 {
 		return nil, s
 	}
 	d.mu.Lock()
@@ -696,7 +707,7 @@ func (d *fileDispatcher) closeOrFlush(ctx context.Context, r wire.Request) ([]by
 		smbLE.PutUint16(b[2:], 1)
 		copy(b[8:40], encodeBasicInfo(attr)[:32])
 		smbLE.PutUint64(b[40:], allocationSize(attr.Attr))
-		if !attr.IsDir() && attr.Mode&fs.ModeSymlink == 0 {
+		if !attr.IsDir() && attr.Kind != storage.NodeSymlink {
 			smbLE.PutUint64(b[48:], uint64(attr.Size))
 		}
 		smbLE.PutUint32(b[56:], fileAttributes(attr))
@@ -709,7 +720,7 @@ func (d *fileDispatcher) queryDirectory(ctx context.Context, r wire.Request) ([]
 	if err != nil || q.OutputLength > uint32(d.limits.MaxIOBytes) || q.Flags&^byte(0x17) != 0 {
 		return nil, fileInvalidParameter
 	}
-	if _, s := directoryEntry(q.Class, "", storage.WindowsAttr{}, 0); s != 0 {
+	if _, s := directoryEntry(q.Class, "", windowsAttr{}, 0); s != 0 {
 		return nil, s
 	}
 	h := d.get(q.FileID)
@@ -734,7 +745,7 @@ func (d *fileDispatcher) queryDirectory(ctx context.Context, r wire.Request) ([]
 		if strings.ContainsAny(pattern, "/\\\x00") {
 			return nil, fileInvalidParameter
 		}
-		list, err := storage.NewWindowsListResult(d.limits.MaxDirectoryBytes, 0, func(_ int, n int64, _ storage.WindowsBasicAttr) (int64, error) { return 256 + n*2, nil })
+		list, err := newWindowsListResult(d.limits.MaxDirectoryBytes, 0, func(_ int, n int64, _ windowsBasicAttr) (int64, error) { return 256 + n*2, nil })
 		if err != nil {
 			return nil, statusError(err)
 		}
@@ -768,7 +779,7 @@ func (d *fileDispatcher) queryDirectory(ctx context.Context, r wire.Request) ([]
 			cursor++
 			continue
 		}
-		b, status := directoryEntry(q.Class, e.Name, storage.WindowsAttr{WindowsBasicAttr: e.Attr}, uint32(cursor))
+		b, status := directoryEntry(q.Class, e.Name, windowsAttr{windowsBasicAttr: e.Attr}, uint32(cursor))
 		if status != 0 {
 			return nil, status
 		}
@@ -856,7 +867,10 @@ func (d *fileDispatcher) queryInfo(ctx context.Context, r wire.Request) ([]byte,
 	if h == nil {
 		return nil, fileClosed
 	}
-	var attr storage.WindowsAttr
+	if q.Type == 1 && (q.Class == 4 || q.Class == 18 || q.Class == 34 || q.Class == 35) && h.access&0x80 == 0 {
+		return nil, statusDenied
+	}
+	var attr windowsAttr
 	identityOnly := q.Type == 1 && (q.Class == 6 || q.Class == 8 || q.Class == 14 || q.Class == 16 || q.Class == 59)
 	if q.Type == 1 && q.Class == 14 && h.access&3 == 0 {
 		return nil, statusDenied
@@ -867,7 +881,11 @@ func (d *fileDispatcher) queryInfo(ctx context.Context, r wire.Request) ([]byte,
 		}
 		attr.ID = h.identity.ID
 	} else {
-		attr, err = h.file.Stat(ctx)
+		if q.Type == 1 && (q.Class == 9 || q.Class == 18) {
+			attr, err = h.file.ObserveName(ctx)
+		} else {
+			attr, err = h.file.Stat(ctx)
+		}
 		if err != nil {
 			return nil, statusError(err)
 		}
@@ -878,10 +896,10 @@ func (d *fileDispatcher) queryInfo(ctx context.Context, r wire.Request) ([]byte,
 	case 1:
 		h.mu.Lock()
 		if q.Class == 59 {
-			state, err := d.backend.WindowsState(ctx)
+			state, err := d.backend.State(ctx)
 			if err != nil {
 				status = statusError(err)
-			} else if !state.Enabled || state.VolumeIdentity == "" {
+			} else if state.VolumeIdentity == "" {
 				status = fileIOError
 			} else {
 				data = make([]byte, 24)
@@ -909,11 +927,11 @@ func (d *fileDispatcher) queryInfo(ctx context.Context, r wire.Request) ([]byte,
 func (d *fileDispatcher) filesystemInfo(ctx context.Context, class byte) ([]byte, uint32) {
 	switch class {
 	case 1:
-		state, err := d.backend.WindowsState(ctx)
+		state, err := d.backend.State(ctx)
 		if err != nil {
 			return nil, statusError(err)
 		}
-		if !state.Enabled || state.VolumeIdentity == "" {
+		if state.VolumeIdentity == "" {
 			return nil, fileIOError
 		}
 		label := wire.EncodeUTF16("volume")
@@ -979,11 +997,11 @@ func (d *fileDispatcher) setInfo(ctx context.Context, r wire.Request) ([]byte, u
 	if h == nil {
 		return nil, fileClosed
 	}
-	id, err := d.actionID()
+	id, err := d.actionID(ctx)
 	if err != nil {
 		return nil, statusError(err)
 	}
-	var result storage.WindowsActionResult
+	var result windowsActionResult
 	switch q.Class {
 	case 4:
 		if len(q.Input) != 40 {
@@ -992,7 +1010,7 @@ func (d *fileDispatcher) setInfo(ctx context.Context, r wire.Request) ([]byte, u
 		if smbLE.Uint64(q.Input[24:]) == math.MaxUint64 {
 			return nil, fileNotSupported
 		}
-		change := storage.WindowsAttrChange{CreationTime: decodeWindowsTime(smbLE.Uint64(q.Input)), ChangeTime: decodeWindowsTime(smbLE.Uint64(q.Input[24:])), AttrChange: storage.AttrChange{AccessTime: decodeWindowsTime(smbLE.Uint64(q.Input[8:])), ModTime: decodeWindowsTime(smbLE.Uint64(q.Input[16:]))}}
+		change := windowsAttrChange{CreationTime: decodeWindowsTime(smbLE.Uint64(q.Input)), ChangeTime: decodeWindowsTime(smbLE.Uint64(q.Input[24:])), AttrChange: storage.AttrChange{AccessTime: decodeWindowsTime(smbLE.Uint64(q.Input[8:])), ModTime: decodeWindowsTime(smbLE.Uint64(q.Input[16:]))}}
 		mask := smbLE.Uint32(q.Input[32:])
 		if mask != 0 {
 			change.DOSAttributes = &mask
@@ -1035,55 +1053,16 @@ func (d *fileDispatcher) setInfo(ctx context.Context, r wire.Request) ([]byte, u
 			_ = cleanup()
 			return nil, fileInvalidParameter
 		}
-		// Destination identities are resolved explicitly. The final rename rejects a
-		// replacement admitted between this observation and its ordered mutation.
-		probeID, probeErr := d.actionID()
-		if probeErr != nil {
-			_ = cleanup()
-			return nil, statusError(probeErr)
-		}
-		existing, probeErr := d.open(ctx, storage.WindowsOpenRequest{Lookup: destination, WindowsOpenIntent: storage.WindowsOpenIntent{Share: storage.WindowsShareAll, Disposition: storage.WindowsOpen, OpenReparsePoint: true}}, probeID)
-		if probeErr == nil {
-			destination.ExpectedID = existing.Attr.ID
-			closeID, e := d.actionID()
-			if e != nil {
-				_ = cleanup()
-				d.fence()
-				return nil, fileIOError
-			}
-			closed, e := existing.File.Close(ctx, closeID)
-			if d.mutationResult(closeID, closed, e) != 0 {
-				_ = cleanup()
-				return nil, fileIOError
-			}
-		} else if storage.ErrnoOf(probeErr) != syscall.ENOENT {
-			_ = cleanup()
-			return nil, statusError(probeErr)
-		}
-		if destination.ExpectedID != 0 && q.Input[0] == 0 {
-			if cleanupErr := cleanup(); cleanupErr != nil {
-				return nil, fileIOError
-			}
-			return nil, statusError(syscall.EEXIST)
-		}
-		h.mu.Lock()
-		source := h.lookup
-		h.mu.Unlock()
-		result, err = h.file.Rename(ctx, storage.WindowsRenameRequest{Source: source, Destination: destination, Replace: q.Input[0] != 0}, id)
+		result, err = h.file.Rename(ctx, windowsRenameRequest{Destination: destination, Replace: q.Input[0] != 0}, id)
 		cleanupErr := cleanup()
 		if cleanupErr != nil {
 			d.fence()
 			return nil, fileIOError
 		}
-		if status := d.mutationResult(id, result, err); status != 0 {
+		if status := d.mutationResult(ctx, id, result, err); status != 0 {
 			return nil, status
 		}
-		destination.ParentReference = ""
-		destination.ExpectedID = source.ExpectedID
-		h.mu.Lock()
-		h.lookup = destination
-		h.name = name
-		h.mu.Unlock()
+
 		if d.leases != nil {
 			d.leases.table.markDirty(d.leases.volume)
 		}
@@ -1091,18 +1070,18 @@ func (d *fileDispatcher) setInfo(ctx context.Context, r wire.Request) ([]byte, u
 	default:
 		return nil, fileNotSupported
 	}
-	if status := d.mutationResult(id, result, err); status != 0 {
+	if status := d.mutationResult(ctx, id, result, err); status != 0 {
 		return nil, status
 	}
 	return []byte{2, 0}, fileSuccess
 }
 
-func knownAction(r storage.WindowsActionResult, err error, id storage.WindowsActionID) bool {
-	if r.Action != id || r.State < storage.WindowsActionPending || r.State > storage.WindowsActionCancelled {
+func knownAction(r windowsActionResult, err error, id windowsActionID) bool {
+	if r.Action != id || r.State < windowsActionPending || r.State > windowsActionCancelled {
 		return false
 	}
 	if r.Errno == 0 {
 		return err == nil
 	}
-	return r.State != storage.WindowsActionPending && err != nil && storage.ErrnoOf(err) == r.Errno
+	return r.State != windowsActionPending && err != nil && storage.ErrnoOf(err) == r.Errno
 }

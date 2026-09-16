@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -89,8 +88,8 @@ func created(name string) metastore.Change {
 		Parent: 1,
 		Name:   []byte(name),
 		Node: &metastore.Node{
-			ID:         42,
-			Mode:       0o644,
+			ID:   42,
+			Kind: storage.NodeRegular, MetadataRevision: 1,
 			Size:       int64(len(name)),
 			AccessTime: time.Unix(1755000000, 1),
 			ModTime:    time.Unix(1755000001, 2),
@@ -99,32 +98,50 @@ func created(name string) metastore.Change {
 }
 
 func withNotification(change metastore.Change) metastore.Change {
-	location := func(parent int64, name []byte) *metastore.LocationFacts {
-		ancestors := []metastore.DirectoryAncestor{{DirectoryID: 1}}
-		if parent != 1 {
-			ancestors = append(ancestors, metastore.DirectoryAncestor{DirectoryID: parent, Name: []byte("parent")})
-		}
-		return &metastore.LocationFacts{Ancestors: ancestors, LeafName: name}
-	}
-	n := &metastore.Notification{SubjectID: 42, Directory: false, ChangeMask: metastore.ChangeName}
+	attr := storage.Attr{ID: 42, Kind: storage.NodeRegular, MetadataRevision: 1}
+	var target []byte
 	if change.Node != nil {
-		n.SubjectID, n.SubjectKind = change.Node.ID, change.Node.Mode.Type()
-		n.Directory = change.Node.IsDir()
+		attr = change.Node.Attr()
+		target = change.Node.LinkTarget
 	}
+	attr.AccessTime = attr.AccessTime.UTC()
+	attr.ModTime = attr.ModTime.UTC()
+	if attr.CreationTime != nil {
+		instant := attr.CreationTime.UTC()
+		attr.CreationTime = &instant
+	}
+	if attr.ChangeTime != nil {
+		instant := attr.ChangeTime.UTC()
+		attr.ChangeTime = &instant
+	}
+	image := func(parent int64, name []byte) *metastore.EventImage {
+		location := storage.EntryLocation{State: storage.LocationLinked, RootNodeID: 1, NodeID: attr.ID}
+		if parent == 0 {
+			location.State = storage.LocationDetached
+			if attr.ID == 1 {
+				location.State = storage.LocationRoot
+			}
+		} else {
+			if parent != 1 {
+				location.Ancestors = append(location.Ancestors, storage.EntryCondition{ParentID: 1, DirectoryRevision: 1, EntryID: storage.EntryID(parent), NodeID: uint64(parent), Name: []byte("parent")})
+			}
+			location.Ancestors = append(location.Ancestors, storage.EntryCondition{ParentID: uint64(parent), DirectoryRevision: 1, EntryID: storage.EntryID(attr.ID + 100), NodeID: attr.ID, Name: name})
+		}
+		return &metastore.EventImage{Attr: attr, Location: location, LinkTarget: target}
+	}
+	n := &metastore.Notification{SubjectID: int64(attr.ID), SubjectKind: attr.Kind, ChangeMask: metastore.ChangeName}
 	switch change.Kind {
 	case metastore.Created:
-		n.After = location(change.Parent, change.Name)
+		n.After = image(change.Parent, change.Name)
 	case metastore.Removed:
-		n.Before = location(change.Parent, change.Name)
+		n.Before = image(change.Parent, change.Name)
 	case metastore.Renamed:
-		n.Before = location(change.From.Parent, change.From.Name)
-		n.After = location(change.Parent, change.Name)
+		n.Before = image(change.From.Parent, change.From.Name)
+		n.After = image(change.Parent, change.Name)
 	case metastore.Modified:
-		n.ChangeMask = metastore.ChangeAttributes
-		if change.Parent != 0 {
-			n.Before = location(change.Parent, change.Name)
-			n.After = location(change.Parent, change.Name)
-		}
+		n.ChangeMask = 0
+		n.Before = image(change.Parent, change.Name)
+		n.After = image(change.Parent, change.Name)
 	}
 	change.Notification = n
 	return change
@@ -218,14 +235,22 @@ func (l *fakeLog) Since(ctx context.Context, after metastore.Position, limit int
 			meta.From = &from
 		}
 		var content metastore.Key
+		var metadata, target []byte
 		if meta.Node != nil {
 			node := *meta.Node
 			content = node.Content
+			metadata, err = storage.EncodeMetadata(node.Metadata)
+			if err != nil {
+				return metastore.Retention{}, result.Fail(err)
+			}
+			target = node.LinkTarget
+			node.Metadata = nil
+			node.LinkTarget = nil
 			node.Content = ""
 			meta.Node = &node
 		}
 		reservation, fits, err := result.Reserve(meta, metastore.ChangePayloadLengths{
-			Name: int64(len(name)), FromName: int64(len(fromName)), Content: int64(len(content)), Notification: int64(len(notification)),
+			Name: int64(len(name)), FromName: int64(len(fromName)), Content: int64(len(content)), Metadata: int64(len(metadata)), Target: int64(len(target)), Notification: int64(len(notification)),
 		})
 		if err != nil {
 			return metastore.Retention{}, err
@@ -233,7 +258,7 @@ func (l *fakeLog) Since(ctx context.Context, after metastore.Position, limit int
 		if !fits {
 			return retention, nil
 		}
-		if err := reservation.Commit(name, fromName, content, notification); err != nil {
+		if err := reservation.Commit(name, fromName, content, metadata, target, notification); err != nil {
 			return metastore.Retention{}, err
 		}
 	}
@@ -321,6 +346,13 @@ func (s *fakeSnap) Next(ctx context.Context, limit int, result *metastore.RowRes
 	for _, row := range rows {
 		meta := row
 		name, content := meta.Name, meta.Node.Content
+		metadata, err := storage.EncodeMetadata(meta.Node.Metadata)
+		if err != nil {
+			return false, result.Fail(err)
+		}
+		target := meta.Node.LinkTarget
+		meta.Node.Metadata = nil
+		meta.Node.LinkTarget = nil
 		if name == nil {
 			meta.Name = nil
 		} else {
@@ -328,7 +360,7 @@ func (s *fakeSnap) Next(ctx context.Context, limit int, result *metastore.RowRes
 		}
 		meta.Node.Content = ""
 		reservation, fits, err := result.Reserve(meta, metastore.RowPayloadLengths{
-			Name: int64(len(name)), Content: int64(len(content)),
+			Name: int64(len(name)), Content: int64(len(content)), Metadata: int64(len(metadata)), Target: int64(len(target)),
 		})
 		if err != nil {
 			return false, err
@@ -336,7 +368,7 @@ func (s *fakeSnap) Next(ctx context.Context, limit int, result *metastore.RowRes
 		if !fits {
 			return false, result.Fail(errors.New("the fake snapshot page exceeded its result bound"))
 		}
-		if err := reservation.Commit(name, content); err != nil {
+		if err := reservation.Commit(name, content, metadata, target); err != nil {
 			return false, err
 		}
 	}
@@ -473,8 +505,8 @@ func TestOversizedSnapshotRowInvalidatesTheWholeProducedPage(t *testing.T) {
 	log := newFakeLog()
 	log.closeErr = errors.New("snapshot release also failed")
 	log.pages = [][]metastore.Row{{
-		{Node: metastore.Node{ID: 1, Mode: fs.ModeDir | 0o755}},
-		{Parent: 1, Name: []byte(strings.Repeat("x", 1024)), Node: metastore.Node{ID: 2, Mode: 0o644}},
+		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory, MetadataRevision: 1, DirectoryRevision: 1}},
+		{EntryID: 4002, Parent: 1, Name: []byte(strings.Repeat("x", 1024)), Node: metastore.Node{ID: 2, Kind: storage.NodeRegular, MetadataRevision: 1}},
 	}}
 	handlerOptions := httprest.DefaultHandlerOptions()
 	handlerOptions.MaxFrameBytes = 1024
@@ -823,15 +855,19 @@ func TestFallingOutOfTheWindowWhileWatchingIsSaidSoToo(t *testing.T) {
 
 // row builds one snapshot row.
 func row(parent int64, name string, node metastore.Node) metastore.Row {
-	return metastore.Row{Parent: parent, Name: []byte(name), Node: node}
+	var entry storage.EntryID
+	if parent != 0 {
+		entry = storage.EntryID(node.ID) + 1000
+	}
+	return metastore.Row{EntryID: entry, Parent: parent, Name: []byte(name), Node: node}
 }
 
 // describe renders a row so that two can be compared exactly, instants included. The
 // seconds and the nanoseconds are printed apart because that is how they travel, and a
 // comparison that folded them back together would not notice one of the two going missing.
 func describe(r metastore.Row) string {
-	return fmt.Sprintf("parent=%d name=%q id=%d mode=%v size=%d accessed=%d.%09d changed=%d.%09d content=%q",
-		r.Parent, r.Name, r.Node.ID, r.Node.Mode, r.Node.Size,
+	return fmt.Sprintf("entry=%d parent=%d name=%q id=%d kind=%v size=%d accessed=%d.%09d changed=%d.%09d content=%q",
+		r.EntryID, r.Parent, r.Name, r.Node.ID, r.Node.Kind, r.Node.Size,
 		r.Node.AccessTime.Unix(), r.Node.AccessTime.Nanosecond(),
 		r.Node.ModTime.Unix(), r.Node.ModTime.Nanosecond(), r.Node.Content)
 }
@@ -846,9 +882,9 @@ func TestASnapshotDeliversItsPositionAndItsRowsUnaltered(t *testing.T) {
 	}
 	want := []metastore.Row{
 		// The root: no parent and no name.
-		{Parent: 0, Name: nil, Node: metastore.Node{ID: 1, Mode: fs.ModeDir | 0o755}},
+		{Parent: 0, Name: nil, Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory, MetadataRevision: 1, DirectoryRevision: 1}},
 		row(1, "plain", metastore.Node{
-			ID: 2, Mode: 0o644, Size: 7,
+			ID: 2, Kind: storage.NodeRegular, MetadataRevision: 1, Size: 7,
 			AccessTime: time.Unix(1755000000, 123456789),
 			ModTime:    time.Unix(1755000001, 987654321),
 			Content:    metastore.Key("object-key-1"),
@@ -857,18 +893,18 @@ func TestASnapshotDeliversItsPositionAndItsRowsUnaltered(t *testing.T) {
 		// replace each of those bytes with U+FFFD in a string field, and a replica holding
 		// the result would address a node and an object that are not there.
 		row(1, "\xff\xfe not utf-8", metastore.Node{
-			ID: 3, Mode: 0o600, Size: 1,
+			ID: 3, Kind: storage.NodeRegular, MetadataRevision: 1, Size: 1,
 			Content: metastore.Key("\x00\xff key"),
 		}),
 		// Instants either side of what a nanosecond count spans. Carried as a count, each
 		// of these comes back as a different and entirely plausible date.
 		row(1, "ancient", metastore.Node{
-			ID: 4, Mode: 0o644,
+			ID: 4, Kind: storage.NodeRegular, MetadataRevision: 1,
 			AccessTime: time.Date(1600, 3, 4, 5, 6, 7, 8, time.UTC),
 			ModTime:    time.Date(2400, 9, 10, 11, 12, 13, 14, time.UTC),
 		}),
 		// A directory, which must not come back as a file of length zero.
-		row(1, "sub", metastore.Node{ID: 5, Mode: fs.ModeDir | 0o750}),
+		row(1, "sub", metastore.Node{ID: 5, Kind: storage.NodeDirectory, MetadataRevision: 1, DirectoryRevision: 1}),
 	}
 	// Delivered in more than one page, because a picture that fits in one frame never
 	// exercises the assembly of one that does not.
@@ -928,8 +964,8 @@ func stalledSnapshot(t *testing.T, s *httprest.Storage, log *fakeLog) *httprest.
 // is whatever the test does.
 func twoStalledPages(log *fakeLog) {
 	log.pages = [][]metastore.Row{
-		{row(0, "", metastore.Node{ID: 1, Mode: fs.ModeDir | 0o755})},
-		{row(1, "never sent", metastore.Node{ID: 2, Mode: 0o644})},
+		{row(0, "", metastore.Node{ID: 1, Kind: storage.NodeDirectory, MetadataRevision: 1, DirectoryRevision: 1})},
+		{row(1, "never sent", metastore.Node{ID: 2, Kind: storage.NodeRegular, MetadataRevision: 1})},
 	}
 	log.stall = true
 }
@@ -1168,8 +1204,8 @@ func streamOf(t *testing.T, body string) *httprest.Storage {
 	}))
 }
 
-const aRow = `{"rows":[{"parent":0,"name":null,"node":{"id":1,"mode":2147484096,"size":0,` +
-	`"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0},"content":null}}]}`
+const aRow = `{"rows":[{"parent":0,"name":"","node":{"id":1,"kind":2,"size":0,"metadata_revision":1,"directory_revision":1,"metadata":"UkZNAQAA","link_target":"",` +
+	`"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0},"content":""}}]}`
 
 // A picture that stopped is a tree with nodes missing from it, and a replica built from one
 // answers "no such file" for every one of them. It must never be reported as complete —
@@ -1337,7 +1373,7 @@ func TestAStreamThatIsNotThisProtocolIsRefused(t *testing.T) {
 // aNode is a well-formed node on the wire, for the message cases that vary everything else.
 func aNode() map[string]any {
 	return map[string]any{
-		"id": 2, "mode": 0o644, "size": 3,
+		"id": 2, "kind": storage.NodeRegular, "size": 3, "metadata_revision": 1, "directory_revision": 0, "metadata": []byte{'R', 'F', 'M', 1, 0, 0}, "link_target": []byte{},
 		"access_time": map[string]any{"unix_sec": 1755000000, "nanos": 1},
 		"mod_time":    map[string]any{"unix_sec": 1755000001, "nanos": 2},
 		"content":     []byte("key"),
@@ -1392,7 +1428,7 @@ func TestAChangeThatDoesNotSayWhatHappenedIsRefused(t *testing.T) {
 			kind := map[string]metastore.ChangeKind{"created": metastore.Created, "modified": metastore.Modified, "removed": metastore.Removed, "renamed": metastore.Renamed}[fields["kind"].(string)]
 			native := metastore.Change{Kind: kind, Parent: 1, Name: []byte("a")}
 			if kind != metastore.Removed {
-				native.Node = &metastore.Node{ID: 2, Mode: 0o644}
+				native.Node = &metastore.Node{ID: 2, Kind: storage.NodeRegular, MetadataRevision: 1}
 			}
 			if kind == metastore.Renamed {
 				native.From = &metastore.Location{Parent: 1, Name: []byte("before")}
@@ -1412,11 +1448,11 @@ func TestAChangeThatDoesNotSayWhatHappenedIsRefused(t *testing.T) {
 
 func TestReplicationNodesAndPositionsRejectValuesAReplicaCannotPersist(t *testing.T) {
 	badNodes := map[string]func(map[string]any){
-		"missing identity":        func(node map[string]any) { node["id"] = 0 },
-		"negative size":           func(node map[string]any) { node["size"] = -1 },
-		"negative access nanos":   func(node map[string]any) { node["access_time"].(map[string]any)["nanos"] = -1 },
-		"overflowing mod nanos":   func(node map[string]any) { node["mod_time"].(map[string]any)["nanos"] = 1_000_000_000 },
-		"unsupported socket type": func(node map[string]any) { node["mode"] = uint32(fs.ModeSocket | 0o600) },
+		"missing identity":      func(node map[string]any) { node["id"] = 0 },
+		"negative size":         func(node map[string]any) { node["size"] = -1 },
+		"negative access nanos": func(node map[string]any) { node["access_time"].(map[string]any)["nanos"] = -1 },
+		"overflowing mod nanos": func(node map[string]any) { node["mod_time"].(map[string]any)["nanos"] = 1_000_000_000 },
+		"unsupported node kind": func(node map[string]any) { node["kind"] = 4 },
 	}
 	for name, spoil := range badNodes {
 		t.Run(name, func(t *testing.T) {
@@ -1586,7 +1622,7 @@ func describeChange(c metastore.Change) string {
 // volume does not hold.
 func TestAChangeSurvivesTheRoundTrip(t *testing.T) {
 	node := metastore.Node{
-		ID: 7, Mode: fs.ModeDir | 0o750, Size: 4096,
+		ID: 7, Kind: storage.NodeRegular, MetadataRevision: 1, Size: 4096,
 		AccessTime: time.Date(1600, 1, 2, 3, 4, 5, 6, time.UTC),
 		ModTime:    time.Date(2400, 7, 8, 9, 10, 11, 12, time.UTC),
 		Content:    metastore.Key("\x00\xff opaque"),
@@ -1638,9 +1674,9 @@ func TestAChangeOfAnUnnameableKindIsNotSent(t *testing.T) {
 func TestAPictureThatYieldsNothingAndIsNotDoneFails(t *testing.T) {
 	log := newFakeLog()
 	log.pages = [][]metastore.Row{
-		{row(0, "", metastore.Node{ID: 1, Mode: fs.ModeDir | 0o755})},
+		{row(0, "", metastore.Node{ID: 1, Kind: storage.NodeDirectory, MetadataRevision: 1, DirectoryRevision: 1})},
 		nil,
-		{row(1, "never reached", metastore.Node{ID: 2, Mode: 0o644})},
+		{row(1, "never reached", metastore.Node{ID: 2, Kind: storage.NodeRegular, MetadataRevision: 1})},
 	}
 	s := serveLog(t, log, httprest.DefaultLimits())
 
@@ -1663,7 +1699,7 @@ func TestAPictureThatYieldsNothingAndIsNotDoneFails(t *testing.T) {
 // hand the caller a fresh verdict about a stream that is over.
 func TestAFinishedStreamKeepsItsVerdict(t *testing.T) {
 	log := newFakeLog()
-	log.pages = [][]metastore.Row{{row(0, "", metastore.Node{ID: 1, Mode: fs.ModeDir | 0o755})}}
+	log.pages = [][]metastore.Row{{row(0, "", metastore.Node{ID: 1, Kind: storage.NodeDirectory, MetadataRevision: 1, DirectoryRevision: 1})}}
 	s := serveLog(t, log, httprest.DefaultLimits())
 
 	snap, err := s.Snapshot(t.Context())
@@ -2010,7 +2046,7 @@ func TestAFrameAChangeStreamCannotUseEndsIt(t *testing.T) {
 // before anything is taken.
 func TestAServerThatCannotBoundItsWritesRefusesToTakeAPicture(t *testing.T) {
 	log := newFakeLog()
-	log.pages = [][]metastore.Row{{row(0, "", metastore.Node{ID: 1, Mode: fs.ModeDir | 0o755})}}
+	log.pages = [][]metastore.Row{{row(0, "", metastore.Node{ID: 1, Kind: storage.NodeDirectory, MetadataRevision: 1, DirectoryRevision: 1})}}
 	backing := volumeFixture(t)
 	h, err := httprest.NewHandler(backing, log)
 	if err != nil {
@@ -2092,7 +2128,7 @@ func positionsOf(t *testing.T, log metastore.Log) []metastore.Position {
 func readLogChanges(t *testing.T, log metastore.Log, after metastore.Position, limit int) ([]metastore.Change, metastore.Retention, error) {
 	t.Helper()
 	result, err := metastore.NewChangeResult(64<<20, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
-		return 256 + lengths.Name + lengths.FromName + lengths.Content + lengths.Notification, nil
+		return 256 + lengths.Name + lengths.FromName + lengths.Content + lengths.Metadata + lengths.Target + lengths.Notification, nil
 	})
 	if err != nil {
 		return nil, metastore.Retention{}, err
@@ -2435,9 +2471,9 @@ func TestAStreamSaysHowFarTheLogHadGot(t *testing.T) {
 func TestAPictureSlowToProduceIsNotJudgedDead(t *testing.T) {
 	log := newFakeLog()
 	want := []metastore.Row{
-		{Parent: 0, Name: nil, Node: metastore.Node{ID: 1, Mode: fs.ModeDir | 0o755}},
-		row(1, "first", metastore.Node{ID: 2, Mode: 0o644}),
-		row(1, "second", metastore.Node{ID: 3, Mode: 0o644}),
+		{Parent: 0, Name: nil, Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory, MetadataRevision: 1, DirectoryRevision: 1}},
+		row(1, "first", metastore.Node{ID: 2, Kind: storage.NodeRegular, MetadataRevision: 1}),
+		row(1, "second", metastore.Node{ID: 3, Kind: storage.NodeRegular, MetadataRevision: 1}),
 	}
 	log.pages = [][]metastore.Row{want[:1], want[1:2], want[2:]}
 	limits := httprest.DefaultLimits()
@@ -2612,11 +2648,12 @@ func TestNotificationFactsSurviveStreamAndResume(t *testing.T) {
 	renamed := withNotification(metastore.Change{
 		Kind: metastore.Renamed, Parent: 2, Name: []byte{0xfe, 'n'},
 		From: &metastore.Location{Parent: 1, Name: []byte{0xff, 'o'}},
-		Node: &metastore.Node{ID: 42, Mode: fs.ModeDir | 0o755},
+		Node: &metastore.Node{ID: 42, Kind: storage.NodeDirectory, MetadataRevision: 1, DirectoryRevision: 1},
 	})
 	removed := withNotification(metastore.Change{Kind: metastore.Removed, Parent: 2, Name: renamed.Name})
-	removed.Notification.SubjectKind = fs.ModeDir
-	removed.Notification.Directory = true
+	removed.Notification.SubjectKind = storage.NodeDirectory
+	removed.Notification.Before.Attr.Kind = storage.NodeDirectory
+	removed.Notification.Before.Attr.DirectoryRevision = 1
 	first := log.record(renamed)
 	last := log.record(removed)
 	client := serveLog(t, log, httprest.DefaultLimits())
@@ -2658,13 +2695,13 @@ func TestCorruptNotificationEndsStreamWithoutAdvancingCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, facts := range map[string][]byte{
-		"missing_directory": []byte(strings.Replace(string(valid.Notification), `,"Directory":false`, "", 1)),
-		"missing":           nil,
-		"null":              []byte("null"),
-		"malformed":         []byte("{"),
-		"noncanonical":      append([]byte(" "), valid.Notification...),
-		"invalid_ancestry":  wrongBytes,
-		"encoded_limit":     []byte(strings.Repeat("x", metastore.MaxNotificationBytes+1)),
+		"missing_kind":     []byte(strings.Replace(string(valid.Notification), `,"SubjectKind":1`, "", 1)),
+		"missing":          nil,
+		"null":             []byte("null"),
+		"malformed":        []byte("{"),
+		"noncanonical":     append([]byte(" "), valid.Notification...),
+		"invalid_ancestry": wrongBytes,
+		"encoded_limit":    []byte(strings.Repeat("x", metastore.MaxNotificationBytes+1)),
 	} {
 		t.Run(name, func(t *testing.T) {
 			wire := *valid
@@ -2780,5 +2817,224 @@ func TestWireChangeConversionValidatesFactsWithoutDecoderState(t *testing.T) {
 	wire.Notification = nil
 	if got, err := wire.Metastore(); err == nil || got.Notification != nil || !errors.Is(err, syscall.EIO) {
 		t.Fatalf("missing facts accepted: %+v, %v", got, err)
+	}
+}
+
+func TestGenericNodeOpaqueMetadataAndTargetsSurviveWire(t *testing.T) {
+	created := time.Date(1600, 1, 2, 3, 4, 5, 6, time.UTC)
+	changed := time.Date(2400, 6, 5, 4, 3, 2, 1, time.UTC)
+	target := []byte{0xff, '/', 0xfe}
+	node := metastore.Node{ID: 8, Kind: storage.NodeSymlink, Size: int64(len(target)), MetadataRevision: 9007199254740993,
+		CreationTime: &created, ChangeTime: &changed, AccessTime: created, ModTime: changed, LinkTarget: target,
+		Metadata: storage.Metadata{{Key: "linux.posix", Version: 7, Data: []byte{0xff, 0, 1}}, {Key: "windows.file", Version: 9, Data: []byte{0, 0xfe}}},
+	}
+	wire, err := httprest.NodeOf(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded httprest.Node
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	got, err := decoded.Metastore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, node) {
+		t.Fatalf("opaque node changed: got %+v want %+v", got, node)
+	}
+	got.Metadata[0].Data[0] = 1
+	got.LinkTarget[0] = 1
+	if wire.Metadata[0] != 'R' || node.Metadata[0].Data[0] != 0xff || node.LinkTarget[0] != 0xff {
+		t.Fatal("decoded node aliases source bytes")
+	}
+	row, err := httprest.RowOf(metastore.Row{EntryID: 4002, Parent: 1, Name: []byte{0xff}, Node: node})
+	if err != nil {
+		t.Fatal(err)
+	}
+	round, err := row.Metastore()
+	if err != nil || round.EntryID != 4002 || !reflect.DeepEqual(round.Node, node) || !reflect.DeepEqual(round.Name, []byte{0xff}) {
+		t.Fatalf("row: %+v %v", round, err)
+	}
+}
+
+func TestReplicationRejectsMalformedGenericNodeMetadata(t *testing.T) {
+	base := metastore.Node{ID: 2, Kind: storage.NodeRegular, MetadataRevision: 1}
+	valid, err := httprest.NodeOf(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := map[string]func(*httprest.Node){
+		"metadata header":            func(n *httprest.Node) { n.Metadata = []byte("broken") },
+		"missing revision":           func(n *httprest.Node) { n.MetadataRevision = 0 },
+		"regular directory revision": func(n *httprest.Node) { n.DirectoryRevision = 1 },
+		"directory missing revision": func(n *httprest.Node) { n.Kind = uint8(storage.NodeDirectory) },
+		"directory size":             func(n *httprest.Node) { n.Kind = uint8(storage.NodeDirectory); n.DirectoryRevision = 1; n.Size = 1 },
+		"link size":                  func(n *httprest.Node) { n.Kind = uint8(storage.NodeSymlink); n.LinkTarget = []byte("x") },
+		"regular target":             func(n *httprest.Node) { n.LinkTarget = []byte("x") },
+		"target bound":               func(n *httprest.Node) { n.LinkTarget = make([]byte, storage.MaxLinkTargetBytes+1) },
+		"creation nanos":             func(n *httprest.Node) { n.CreationTime = &httprest.Time{Nanos: -1} },
+		"change nanos":               func(n *httprest.Node) { n.ChangeTime = &httprest.Time{Nanos: 1000000000} },
+	}
+	for name, spoil := range corrupt {
+		t.Run(name, func(t *testing.T) {
+			wire := *valid
+			spoil(&wire)
+			encoded, err := json.Marshal(wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded httprest.Node
+			if err := json.Unmarshal(encoded, &decoded); err == nil {
+				t.Fatal("malformed node decoded")
+			}
+			if _, err := wire.Metastore(); err == nil {
+				t.Fatal("direct malformed node accepted")
+			}
+		})
+	}
+	malformed := base
+	malformed.Metadata = storage.Metadata{{Key: "bad key", Version: 1}}
+	if _, err := httprest.NodeOf(malformed); err == nil {
+		t.Fatal("invalid metadata encoded")
+	}
+	if _, err := httprest.RowOf(metastore.Row{Node: malformed}); err == nil {
+		t.Fatal("invalid snapshot node encoded")
+	}
+	if _, err := (httprest.Row{}).Metastore(); err == nil {
+		t.Fatal("missing snapshot node accepted")
+	}
+}
+
+func TestMalformedSnapshotMetadataCannotReturnPartialPage(t *testing.T) {
+	good, err := httprest.RowOf(metastore.Row{EntryID: 4002, Parent: 1, Name: []byte("first"), Node: metastore.Node{ID: 2, Kind: storage.NodeRegular, MetadataRevision: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := good
+	copyNode := *good.Node
+	bad.Node = &copyNode
+	bad.Name = []byte("bad")
+	bad.Node.Metadata = []byte("corrupt")
+	encoded, err := json.Marshal(httprest.SnapshotPage{Rows: []httprest.Row{good, bad}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := streamOf(t, frame("open", `{"position":7}`)+frame("rows", string(encoded))+frame("done", `{}`))
+	snap, err := client.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Close()
+	rows, first := snap.Next()
+	if first == nil || rows != nil || snap.Position() != 7 || storage.ErrnoOf(first) != syscall.EIO {
+		t.Fatalf("partial snapshot rows=%+v err=%v position=%d", rows, first, snap.Position())
+	}
+	if _, err := snap.Next(); err != first {
+		t.Fatalf("terminal failure changed: %v -> %v", first, err)
+	}
+}
+
+func TestSnapshotRowRejectsImpossibleEntryShapes(t *testing.T) {
+	regular, err := httprest.NodeOf(metastore.Node{ID: 2, Kind: storage.NodeRegular, MetadataRevision: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := httprest.NodeOf(metastore.Node{ID: 1, Kind: storage.NodeDirectory, MetadataRevision: 1, DirectoryRevision: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []httprest.Row{
+		{}, {Parent: -1, Name: []byte("a"), Node: regular}, {Parent: 0, Name: []byte("root"), Node: directory}, {Parent: 0, Name: []byte{}, Node: regular},
+		{EntryID: 4002, Parent: 1, Name: []byte{}, Node: regular}, {EntryID: 4002, Parent: 1, Name: []byte("."), Node: regular}, {EntryID: 4002, Parent: 1, Name: []byte(".."), Node: regular},
+		{EntryID: 4002, Parent: 1, Name: []byte("a/b"), Node: regular}, {EntryID: 4002, Parent: 1, Name: []byte{'a', 0}, Node: regular}, {EntryID: 4002, Parent: 2, Name: []byte("self"), Node: regular},
+		{Parent: 1, Name: []byte("missing-entry-id"), Node: regular}, {EntryID: 4002, Parent: 0, Name: []byte{}, Node: directory},
+	} {
+		if _, err := row.Metastore(); err == nil {
+			t.Fatalf("impossible row accepted: %+v", row)
+		}
+		encoded, err := json.Marshal(row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded httprest.Row
+		if err := json.Unmarshal(encoded, &decoded); err == nil {
+			t.Fatalf("impossible row decoded: %s", encoded)
+		}
+	}
+	if _, err := httprest.RowOf(metastore.Row{Node: metastore.Node{ID: 2, Kind: storage.NodeRegular, MetadataRevision: 1}}); err == nil {
+		t.Fatal("non-directory root published")
+	}
+}
+
+func TestHTTPSnapshotRetainsNativeRootAndEntryFactsWhenSeedingSQLite(t *testing.T) {
+	instant := time.Unix(17, 23).UTC()
+	root := metastore.Row{Node: metastore.Node{ID: 10, Kind: storage.NodeDirectory, MetadataRevision: 5, DirectoryRevision: 2,
+		AccessTime: instant, ModTime: instant, CreationTime: &instant, ChangeTime: &instant, LinkTarget: []byte{},
+		Metadata: storage.Metadata{{Key: "root.opaque", Version: 9, Data: []byte{0, 255}}}}}
+	child := metastore.Row{EntryID: 701, Parent: 10, Name: []byte{255, 'f'}, Node: metastore.Node{ID: 11, Kind: storage.NodeRegular, Size: 3, MetadataRevision: 7,
+		AccessTime: instant, ModTime: instant, CreationTime: &instant, ChangeTime: &instant, LinkTarget: []byte{},
+		Metadata: storage.Metadata{{Key: "client.future", Version: 71, Data: []byte{255, 0, 3}}}}}
+	log := newFakeLog()
+	log.tail = 19
+	log.pages = [][]metastore.Row{{root}, {child}}
+	client := serveLog(t, log, httprest.DefaultLimits())
+	snapshot, err := client.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	replica, err := sqlite.OpenReplica(t.Context(), filepath.Join(t.TempDir(), "copy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replica.Close()
+	seed, err := replica.Reseed(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer seed.Close()
+	var received []metastore.Row
+	for {
+		rows, err := snapshot.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := seed.Add(t.Context(), rows); err != nil {
+			t.Fatalf("HTTP snapshot cannot seed its native root and entries: %v", err)
+		}
+		received = append(received, rows...)
+	}
+	if len(received) != 2 || received[0].Parent != 0 || received[0].EntryID != 0 || received[0].Name != nil {
+		t.Fatalf("native root representation changed: %+v", received)
+	}
+	if !reflect.DeepEqual(received[0], root) || !reflect.DeepEqual(received[1], child) {
+		t.Fatalf("source snapshot facts changed: got %+v want %+v", received, []metastore.Row{root, child})
+	}
+	if err := seed.Complete(t.Context(), snapshot.Position()); err != nil {
+		t.Fatal(err)
+	}
+	if replica.Position() != 19 {
+		t.Fatalf("snapshot position=%d", replica.Position())
+	}
+	gotRoot, err := replica.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotChild, err := replica.Stat(t.Context(), string(child.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotRoot.AccessTime, gotRoot.ModTime = gotRoot.AccessTime.UTC(), gotRoot.ModTime.UTC()
+	gotChild.AccessTime, gotChild.ModTime = gotChild.AccessTime.UTC(), gotChild.ModTime.UTC()
+	if !reflect.DeepEqual(gotRoot.Attr(), root.Node.Attr()) || !reflect.DeepEqual(gotChild.Attr(), child.Node.Attr()) {
+		t.Fatalf("replica attributes changed: root=%+v child=%+v", gotRoot, gotChild)
 	}
 }

@@ -94,7 +94,7 @@ func TestControlTreeAdmissionIsolationAndQuota(t *testing.T) {
 	if _, status, _ = c.dispatch(t.Context(), r, r, &h); status != statusDenied || authorized.Load() != 1 {
 		t.Fatal("data share authorization changed")
 	}
-	if _, err := c.server.Publish(Share{Name: "iPc$", Volume: "v", Backend: &sessionBackend{stateErr: errors.New("backend must not be reached")}}); !errors.Is(err, ErrConfig) {
+	if _, err := c.server.publish(Share{Name: "iPc$", Volume: "v"}, &sessionBackend{stateErr: errors.New("backend must not be reached")}); !errors.Is(err, ErrConfig) {
 		t.Fatalf("reserved control share could be published: %v", err)
 	}
 }

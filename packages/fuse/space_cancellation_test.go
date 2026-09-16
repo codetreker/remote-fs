@@ -17,26 +17,26 @@ type controlledMutationFile struct {
 	after  func()
 }
 
-func (f controlledMutationFile) WriteAt(ctx context.Context, offset int64, data []byte) (storage.Attr, error) {
+func (f controlledMutationFile) WriteAt(ctx context.Context, request storage.FileWriteRequest, action storage.FileActionID) (storage.FileActionReceipt, error) {
 	if f.before != nil {
 		if err := f.before(ctx); err != nil {
-			return storage.Attr{}, err
+			return storage.FileActionReceipt{Action: action, Operation: storage.OpFileWrite, State: storage.FileActionNotApplied, Errno: storage.ErrnoOf(err)}, err
 		}
 	}
-	attr, err := f.File.WriteAt(ctx, offset, data)
+	attr, err := f.File.WriteAt(ctx, request, action)
 	if err == nil && f.after != nil {
 		f.after()
 	}
 	return attr, err
 }
 
-func (f controlledMutationFile) Truncate(ctx context.Context, size int64) (storage.Attr, error) {
+func (f controlledMutationFile) Truncate(ctx context.Context, request storage.FileTruncateRequest, action storage.FileActionID) (storage.FileActionReceipt, error) {
 	if f.before != nil {
 		if err := f.before(ctx); err != nil {
-			return storage.Attr{}, err
+			return storage.FileActionReceipt{Action: action, Operation: storage.OpFileTruncate, State: storage.FileActionNotApplied, Errno: storage.ErrnoOf(err)}, err
 		}
 	}
-	attr, err := f.File.Truncate(ctx, size)
+	attr, err := f.File.Truncate(ctx, request, action)
 	if err == nil && f.after != nil {
 		f.after()
 	}

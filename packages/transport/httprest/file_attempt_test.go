@@ -5,49 +5,54 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/codetreker/remote-fs/packages/storage"
 	"io"
 	"net/http"
 	"strconv"
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-func TestRetainedHTTPRejectsInconsistentAdvisoryActionReceipts(t *testing.T) {
+func TestRetainedHTTPRejectsInconsistentActionReceipts(t *testing.T) {
 	ctx := context.Background()
 	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
 	if err := backend.Write(ctx, "file", []byte("data")); err != nil {
 		t.Fatal(err)
 	}
 	session, file := openRetainedFixture(t, client)
-	id, err := storage.NewLockRequestID(session.epoch)
+	attr, err := file.Stat(ctx, storage.ObservationOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, End: 9}
-	grant, err := file.SetLock(ctx, 1, lock, id)
-	if err != nil || grant.State != storage.LockGranted {
-		t.Fatalf("authoritative grant=%+v, error=%v", grant, err)
+	id := retainedAction(t, session)
+	intent := storage.RetainRequest{NodeID: attr.Attr.ID}
+	grant, err := session.Retain(ctx, intent, id)
+	if err != nil || grant.State != storage.FileActionCompleted {
+		t.Fatalf("authoritative retain=%+v,%v", grant, err)
 	}
 	original := client.http.Transport
 	for _, test := range []struct {
 		name   string
-		set    bool
-		change func(*fileLockAttempt)
+		change func(*fileReceipt)
 	}{
-		{"different action", false, func(a *fileLockAttempt) { a.Request = "1:00000000000000000000000000000000" }},
-		{"invalid range", false, func(a *fileLockAttempt) { a.Lock.Start = a.Lock.End + 1 }},
-		{"hidden conflict owner", false, func(a *fileLockAttempt) { a.Conflict = storage.LockConflict{Owner: 7} }},
-		{"negative history", false, func(a *fileLockAttempt) { a.HistoryRemaining = -time.Second }},
-		{"different set intent", true, func(a *fileLockAttempt) { a.Lock.Type = storage.Shared }},
-		{"pending without wait", false, func(a *fileLockAttempt) { a.State, a.EverGranted = storage.LockPending, false }},
-		{"grant without acquisition", false, func(a *fileLockAttempt) { a.EverGranted = false }},
-		{"release without prior acquisition", false, func(a *fileLockAttempt) { a.State, a.EverGranted = storage.LockReleased, false }},
-		{"cancellation after grant", false, func(a *fileLockAttempt) { a.State = storage.LockCancelled }},
-		{"rejection without errno", false, func(a *fileLockAttempt) { a.State, a.EverGranted = storage.LockRejected, false }},
-		{"unknown state", false, func(a *fileLockAttempt) { a.State = 255 }},
+		{"different action", func(r *fileReceipt) { r.Action = "1:00000000000000000000000000000000" }},
+		{"different operation", func(r *fileReceipt) { r.Operation = storage.OpFileQueryAction }},
+		{"negative history", func(r *fileReceipt) { r.HistoryRemaining = -int64(time.Second) }},
+		{"pending with effects", func(r *fileReceipt) { r.State = storage.FileActionPending }},
+		{"not applied with effects", func(r *fileReceipt) { r.State = storage.FileActionNotApplied }},
+		{"unknown with effects", func(r *fileReceipt) { r.State = storage.FileActionUnknown }},
+		{"unknown state", func(r *fileReceipt) { r.State = 255 }},
+		{"unknown effects", func(r *fileReceipt) { r.Effects = 1 << 31 }},
+		{"missing retained reference", func(r *fileReceipt) { r.Reference = 0 }},
+		{"missing retained observation", func(r *fileReceipt) { r.Observation = nil }},
+		{"invalid conflict range", func(r *fileReceipt) {
+			r.Conflict = &fileConflict{Kind: storage.ConflictRange, Range: &storage.HeldRange{Range: storage.RangeAcquisition{ID: 1, Start: 9, End: 1}}}
+		}},
+		{"invalid conflict claim", func(r *fileReceipt) {
+			r.Conflict = &fileConflict{Kind: storage.ConflictClaim, Claim: storage.AccessClaim{Uses: 1 << 63}}
+		}},
+		{"success with errno", func(r *fileReceipt) { r.Errno = "EAGAIN" }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			defer func() { client.http.Transport = original }()
@@ -61,15 +66,15 @@ func TestRetainedHTTPRejectsInconsistentAdvisoryActionReceipts(t *testing.T) {
 				if err != nil {
 					return nil, err
 				}
-				var result fileResponse
-				if err := json.Unmarshal(body, &result); err != nil {
+				var value fileResponse
+				if err = json.Unmarshal(body, &value); err != nil {
 					return nil, err
 				}
-				if result.Attempt == nil {
-					return nil, errors.New("authoritative response carries no lock receipt")
+				if value.Receipt == nil {
+					return nil, errors.New("authoritative response has no receipt")
 				}
-				test.change(result.Attempt)
-				body, err = json.Marshal(result)
+				test.change(value.Receipt)
+				body, err = marshalFileJSON(value)
 				if err != nil {
 					return nil, err
 				}
@@ -78,19 +83,14 @@ func TestRetainedHTTPRejectsInconsistentAdvisoryActionReceipts(t *testing.T) {
 				response.Header.Set("Content-Length", strconv.Itoa(len(body)))
 				return response, nil
 			})
-			var result storage.LockAttempt
-			if test.set {
-				result, err = file.SetLock(ctx, 1, lock, id)
-			} else {
-				result, err = file.QueryLock(ctx, 1, id)
-			}
-			if storage.ErrnoOf(err) != syscall.EIO || result != (storage.LockAttempt{}) {
-				t.Fatalf("inconsistent receipt returned result=%+v, error=%v", result, err)
+			result, err := session.QueryAction(ctx, id)
+			if storage.ErrnoOf(err) != syscall.EIO || result.Effects != 0 || result.Reference != 0 {
+				t.Fatalf("malformed receipt=%+v,%v", result, err)
 			}
 			client.http.Transport = original
-			confirmed, err := file.QueryLock(ctx, 1, id)
-			if err != nil || confirmed.Request != id || confirmed.State != storage.LockGranted || !confirmed.EverGranted || confirmed.Lock != lock {
-				t.Fatalf("authoritative acquisition changed after malformed reply=%+v, error=%v", confirmed, err)
+			confirmed, err := session.QueryAction(ctx, id)
+			if err != nil || confirmed.Action != id || confirmed.Reference != grant.Reference || confirmed.Effects != grant.Effects {
+				t.Fatalf("native ownership changed=%+v,%v", confirmed, err)
 			}
 		})
 	}

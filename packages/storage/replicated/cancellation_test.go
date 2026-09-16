@@ -3,7 +3,6 @@ package replicated_test
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"strings"
 	"syscall"
 	"testing"
@@ -51,7 +50,7 @@ func TestEndedMutationContextDoesNotReachHTTP(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			ctx, cancel := test.context()
 			defer cancel()
-			mode := fs.FileMode(0o600)
+			metadata := storage.Metadata{{Key: "test.value", Version: 1, Data: []byte("updated")}}
 			for _, operation := range []struct {
 				name string
 				op   string
@@ -60,7 +59,9 @@ func TestEndedMutationContextDoesNotReachHTTP(t *testing.T) {
 			}{
 				{"create", "create", "f", func() error { return mounted.Create(ctx, "f") }},
 				{"write", "write", "f", func() error { return mounted.Write(ctx, "f", []byte("content")) }},
-				{"setattr", "setattr", "f", func() error { return mounted.SetAttr(ctx, "f", storage.AttrChange{Mode: &mode}) }},
+				{"setattr", "setattr", "f", func() error {
+					return mounted.SetAttr(ctx, "f", storage.AttrChange{ExpectedRevision: 1, Metadata: &metadata})
+				}},
 				{"mkdir", "mkdir", "d", func() error { return mounted.Mkdir(ctx, "d") }},
 				{"remove", "unlink", "f", func() error { return mounted.Remove(ctx, "f") }},
 				{"removedir", "rmdir", "d", func() error { return mounted.RemoveDir(ctx, "d") }},

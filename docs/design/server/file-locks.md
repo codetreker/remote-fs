@@ -2,7 +2,7 @@
 
 文件锁保护现有普通文件的逻辑身份。稳定权限 `S` 允许多个持有者并存，排他权限 `X` 允许一个持有者修改；稳定权限本身不能用于修改。服务端对显式携带授权的修改与匿名修改执行同一套冲突检查。
 
-本文描述当前锁机制。普通文件的内容版本前置条件与 FUSE `Open` 自动取得哪种权限是独立事项；锁没有替调用方选择这两项策略。保证由 [R-CC-3、R-CC-6 至 R-CC-11](../../spec/requirements.md)定义，取舍由[实现决定](../../../.agents/notes/implemented/architecture/2026-09-07-file-locks.md)记录。[平台客户端隔离提案](../../../.agents/notes/proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)另行定义通用访问声明和范围状态，以承接现有 Windows／Linux 规则；它们不替代本页显式 S/X，也不取消所有入口的最终发布检查。
+本文描述当前锁机制。普通文件的内容版本前置条件与 FUSE `Open` 自动取得哪种权限是独立事项；锁没有替调用方选择这两项策略。保证由 [R-CC-3、R-CC-6 至 R-CC-11](../../spec/requirements.md)定义，取舍由[实现决定](../../../.agents/notes/implemented/architecture/2026-09-07-file-locks.md)记录。[平台客户端隔离决定](../../../.agents/notes/implemented/architecture/2026-09-16-isolate-platform-filesystem-clients.md)以通用访问声明和范围状态承载客户端解释后的操作；它们不替代本页显式 S/X，也不取消所有入口的最终发布检查。
 
 ## 组件与所有权
 
@@ -70,7 +70,7 @@ Renew 使用 `max(原 deadline, 转换时刻 + 请求 TTL)`，不缩短已确认
 
 ## 修改覆盖与冲突
 
-`S` 与 `S` 相容；`X` 与其他 Owner 的任何 grant 不相容。Owner 自己持有的 `S` 也不是修改许可。普通快照读取不受 `X` 访问控制；显式 `SetAttr` 修改支持的 mode、访问时间或修改时间属于受保护的修改。普通读取可能产生的平台 atime 副作用不构成稳定 atime 的承诺；`S` 的稳定保证覆盖内容、存在性与逻辑身份。
+`S` 与 `S` 相容；`X` 与其他 Owner 的任何 grant 不相容。Owner 自己持有的 `S` 也不是修改许可。普通快照读取不受 `X` 访问控制；显式 SetAttr 修改通用时间或 opaque metadata 属于受保护的修改。普通读取可能产生的平台 atime 副作用不构成稳定 atime 的承诺；`S` 的稳定保证覆盖内容、存在性与逻辑身份。
 
 | 修改 | 实际受影响的普通文件 |
 |---|---|
@@ -81,7 +81,7 @@ Renew 使用 `max(原 deadline, 转换时刻 + 请求 TTL)`，不缩短已确认
 
 匿名修改只在不冲突于当前 grant 时允许。显式 scope 中的每一份 proof 必须属于当前授权方、Session、Owner 与 generation，仍在有效期内，并且与这次修改的实际文件集合相交。实际受保护的每个文件都必须由调用方有效的 `X` 覆盖。任何过期、失效或无关 proof 都使操作失败，不能退回匿名执行；空 `SetAttr` 与 self-Rename 也验证提供的 scope。
 
-Windows 的 share/access、delete-pending 与字节范围访问是独立的原生约束。WindowsFile 修改仍携带显式 S/X scope，并在同一次最终转换处核对；基础路径与普通 File 入口也检查相冲突的 Windows 状态。Windows lock batch 的顺序与部分结果不借用强 S/X grant 或 Linux advisory receipt，见[文件句柄](file-handles.md#windows-保留目录访问意图与动作)。
+SMB 将 share/access、删除与范围规则映射为共同 claims、Prepared／drain 和 ranges；FUSE 本地解释 POSIX／flock。File 修改携带独立 S/X scope，在同一次最终转换处核对，基础路径与其它入口也遵守共同访问状态。平台 batch 的部分效果由客户端计划保留，不借用强 S/X grant，见[共同访问状态](file-handles.md#访问声明与范围)。
 
 ## 发布与观察的排序
 
@@ -124,7 +124,7 @@ Witness 不降低，时长也不按当前配置截短。这两份证据检测任
 
 首次初始化有独立的持久 intent / binding 阶段，只有匹配的已记录初始化可以继续；Open 缺少状态不能被当作新 volume。SQLite migration `0004` 的 `lease_recovery` 保存 DatabaseID、StateID 与 Accepted / Prepared；本地持久组合的两次事务还经过原有数据库提交见证，独立 lease Witness 则在中间推进。
 
-`sqlite.OpenLocking` 拥有整份数据库的原生 flock 与进程内独占 coordinator。数据库 inode 的 `user.remote-fs.lease-state` xattr 与相邻的 `.<数据库文件名>.leases.intent`、`.witness` 绑定数据库身份与规范化的证据目录；Accepted / Prepared 与 Witness 的最大 lease 时长覆盖整份数据库。运行时选择的 volume 不成为永久 anchor identity。后续进程可以选择同一数据库中的另一个已有 volume，但须取得全数据库所有权并完成数据库级恢复等待；多份活跃 server 不能同时共享它。真正未绑定的 raw SQLite API 仍有独立的库用途，已经绑定的库不能靠关闭配置或 raw API 绕过保护。
+sqlite.OpenLocking 拥有整份数据库的原生 EX flock 与 coordinator。Strong 绑定继续使用 user.remote-fs.lease-state 和数据库旁 .<数据库文件名>.leases.intent／.witness，旧格式与最大租期规则保持。File 另有 .<数据库文件名>.file-leases 与独立 domain、xattr 和 Quiescent 状态，不能借 File-only opener 绕过 Strong binding；完整组合见[持久恢复](local-disk-object-store.md#强占有与文件引用的持久恢复)。后续进程可选择另一个已有 volume，但数据库级保护不能通过换 volume 缩短，同一时刻只有一个原生拥有者。
 
 raw SQLite opener 也先取得同一个原生数据库文件的共享 flock，锁服务 constructor 取得排他 flock。既存 raw handle 仍在时，接管以 `EBUSY` 失败；授权方存活时，新的 raw opener 同样失败。这个互斥覆盖同进程与跨进程，不允许两类写入口并存。ConfigureLeaseRecovery 与 EnableLocks 验证实际的排他拥有者和 native anchor，不能靠注入任意持久化对象把未受保护的 Store 变成授权方。普通 raw 路径可经过符号链接，但检查针对同一底层 inode；数据库路径中的 `%`、`?`、`#` 与 NUL 明确拒绝，避免 native 绑定检查与 SQLite file URI 打开的文件不一致。
 
@@ -194,7 +194,7 @@ SDK 以产生这份 GrantStatus 的请求首次发送时刻加 `remainingMillis`
 
 ## 集成与生命周期
 
-普通 `flock` 与传统 POSIX `fcntl` 是[保留文件接口](file-handles.md)的 advisory 操作，不创建强 S/X Owner 或 grant。它们允许未参与加锁者执行普通修改，阻塞等待按 FileSession 的健康续期维持，不采用这里 Acquire 的有限 Wait。普通 Open 不自动选择任何加锁策略。
+普通 flock／传统 POSIX fcntl 由 FUSE 本地映射到[通用范围接口](file-handles.md#访问声明与范围)，不创建强 S/X Owner 或 grant。advisory 非参与者仍可普通修改；阻塞等待按 FileSession 健康续期维持，不使用本页 Acquire 的有限 Wait。普通打开不自动选择持锁策略。
 
 独立 server 的 Azure Blob 与本地持久对象存储两种形态都建立配对的 enforcing volume 与锁服务，向 HTTP v3 同时发布数据操作、锁管理操作和显式 mutation scope。协议不通过忽略未知 proof、旧授权方身份或非法 scope 保持兼容；无法识别的结果保持错误。
 

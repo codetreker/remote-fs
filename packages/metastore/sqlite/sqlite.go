@@ -36,7 +36,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -56,10 +55,6 @@ import (
 )
 
 // Volume creation modes are independent of the host process's umask.
-const (
-	fileMode fs.FileMode = 0o644
-	dirMode  fs.FileMode = 0o755
-)
 
 // busyTimeout is how long a statement waits for a lock another connection holds before
 // giving up. Within one process the single writer connection makes contention impossible;
@@ -103,12 +98,14 @@ type Store struct {
 	// accepts the volume or reports a successful integrity-checked result.
 	maxIntegrityRecords int64
 	maxIntegrityBytes   int64
-	files               map[*retainedFile]struct{}
+	files               map[*fileReference]struct{}
 	fileDomain          *fileDomain
 
 	coordinator          *databaseCoordinator
 	locks                *locking.Authority
 	leaseRecovery        *LeaseRecovery
+	fileLeaseRecovery    *LeaseRecovery
+	fileClosePrepared    bool
 	leaseOwner           *nativelease.Database
 	witness              CommitWitness
 	closeMu              sync.Mutex
@@ -305,7 +302,7 @@ func openConfiguredWithHooks(
 	if err != nil {
 		return nil, err
 	}
-	if err := nativelease.ValidateOpening(database, options.leaseRecoveryOwner); err != nil {
+	if err := nativelease.ValidateOpening(database, nativelease.Opening{Strong: options.leaseRecoveryOwner, File: options.fileLeaseRecoveryOwner}); err != nil {
 		return nil, err
 	}
 	coordinator, err := acquireCoordinator(database, durable != nil || options.leaseRecoveryOwner)
@@ -342,7 +339,7 @@ func openConfiguredWithHooks(
 			return nil, err
 		}
 	}
-	if err := nativelease.ValidateOpening(database, options.leaseRecoveryOwner); err != nil {
+	if err := nativelease.ValidateOpening(database, nativelease.Opening{Strong: options.leaseRecoveryOwner, File: options.fileLeaseRecoveryOwner}); err != nil {
 		return nil, err
 	}
 	cleanup := func(primary error, pools ...openPoolHandle) error {
@@ -433,6 +430,9 @@ func openConfiguredWithHooks(
 	}
 	if err == nil {
 		err = validateLeaseOpening(ctx, write, options.leaseRecoveryOwner)
+		if err == nil {
+			err = validateFileLeaseOpening(ctx, write, options.fileLeaseRecoveryOwner)
+		}
 	}
 	coordinator.commit.release()
 	if err != nil {
@@ -451,7 +451,7 @@ func openConfiguredWithHooks(
 		allowance:    allowance, window: options.Window, objectLimits: options.ObjectLimits,
 		maxIntegrityRecords: options.MaxIntegrityRecords,
 		maxIntegrityBytes:   options.MaxIntegrityBytes,
-		files:               make(map[*retainedFile]struct{}),
+		files:               make(map[*fileReference]struct{}),
 		coordinator:         coordinator,
 		closePool:           hooks.closePool,
 	}
@@ -612,24 +612,55 @@ func (s *Store) CloseContext(ctx context.Context) error {
 	if s.closed {
 		return s.closeErr
 	}
+	if err := s.coordinator.fileAdmission.acquire(ctx); err != nil {
+		return err
+	}
+	defer s.coordinator.fileAdmission.release()
 	if err := s.coordinator.commit.acquire(ctx); err != nil {
 		return err
 	}
-	windowsSessions := 0
+	if s.fileDomain != nil && s.fileDomain.recoveryPending && s.fileDomain.recoveryStore == s {
+		s.coordinator.commit.release()
+		return syscall.EBUSY
+	}
+	if err := s.shutdownFileHistoryLocked(); err != nil {
+		s.coordinator.commit.release()
+		return err
+	}
+	fileSessions := 0
 	if s.fileDomain != nil {
-		for session := range s.fileDomain.windows.sessions {
+		if s.fileDomain.recoveryStore == s {
+			s.fileDomain.recoveryStopped.Store(true)
+			if s.fileDomain.recoveryTimer != nil {
+				s.fileDomain.recoveryTimer.Stop()
+			}
+		}
+		for session := range s.fileDomain.sessions {
 			if session.store == s {
-				windowsSessions++
+				fileSessions++
 			}
 		}
 	}
-	if len(s.files) != 0 || windowsSessions != 0 {
-		count := len(s.files) + windowsSessions
+	if len(s.files) != 0 || fileSessions != 0 {
+		count := len(s.files) + fileSessions
 		s.coordinator.commit.release()
 		return fmt.Errorf("the SQLite store still owns %d retained file references: %w", count, syscall.EBUSY)
 	}
 	s.files = nil
+	s.coordinator.health.RLock()
+	retainFileEvidence := s.witness == nil && s.coordinator.poison != nil
+	s.coordinator.health.RUnlock()
 	s.coordinator.commit.release()
+	if !s.fileClosePrepared {
+		// A fenced native close retains its evidence and lets terminal pool cleanup
+		// cache the original failure. Witnessed stores must preserve their WAL owner.
+		if !retainFileEvidence {
+			if err := s.markFileQuiescent(ctx); err != nil {
+				return err
+			}
+		}
+		s.fileClosePrepared = true
+	}
 	var lockErr error
 	if s.locks != nil {
 		lockErr = s.locks.Close()
@@ -717,6 +748,35 @@ func (s *Store) Abort() error {
 		return errors.Join(lockErr, err)
 	}
 	defer s.coordinator.commit.release()
+	if err := s.reapFinishedIOLocked(); err != nil {
+		return err
+	}
+	for f := range s.files {
+		if f.ioUsers != 0 {
+			return syscall.EBUSY
+		}
+	}
+	if s.fileDomain != nil {
+		if s.fileDomain.recoveryStore == s {
+			s.fileDomain.recoveryStopped.Store(true)
+			if s.fileDomain.recoveryTimer != nil {
+				s.fileDomain.recoveryTimer.Stop()
+			}
+		}
+		for session := range s.fileDomain.sessions {
+			if session.store == s {
+				session.active = false
+				session.shutdown.Store(true)
+				if session.timer != nil {
+					session.timer.Stop()
+				}
+				for _, file := range session.files {
+					file.active = false
+				}
+			}
+		}
+	}
+	s.files = nil
 	s.coordinator.health.Lock()
 	s.coordinator.closing = true
 	s.coordinator.health.Unlock()

@@ -4,29 +4,29 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 type commandFile struct {
-	storage.WindowsFile
-	attr     storage.WindowsAttr
+	rename func(windowsRenameRequest) error
+	windowsFile
+	attr     windowsAttr
 	data     []byte
 	readErr  error
 	writeErr error
-	result   storage.WindowsActionResult
+	result   windowsActionResult
 	closed   int
 	writes   int
 }
 
-func (f *commandFile) Reference() string                                 { return "retained" }
-func (f *commandFile) Stat(context.Context) (storage.WindowsAttr, error) { return f.attr, nil }
+func (f *commandFile) Reference() storage.FileReferenceID                   { return 1 }
+func (f *commandFile) Stat(context.Context) (windowsAttr, error)            { return f.attr, nil }
+func (f *commandFile) ObserveName(ctx context.Context) (windowsAttr, error) { return f.Stat(ctx) }
 func (f *commandFile) ReadAt(_ context.Context, offset int64, size int) (storage.FileRead, error) {
 	if f.readErr != nil {
 		return storage.FileRead{}, f.readErr
@@ -35,37 +35,41 @@ func (f *commandFile) ReadAt(_ context.Context, offset int64, size int) (storage
 	end := min(start+int64(size), int64(len(f.data)))
 	return storage.FileRead{Attr: f.attr.Attr, Data: f.data[start:end]}, nil
 }
-func (f *commandFile) WriteAt(_ context.Context, _ int64, _ []byte, id storage.WindowsActionID) (storage.WindowsActionResult, error) {
+func (f *commandFile) WriteAt(_ context.Context, _ int64, _ []byte, id windowsActionID) (windowsActionResult, error) {
 	f.writes++
 	r := f.result
 	r.Action = id
 	return r, f.writeErr
 }
-func (f *commandFile) Close(_ context.Context, id storage.WindowsActionID) (storage.WindowsActionResult, error) {
+func (f *commandFile) Close(_ context.Context, id windowsActionID) (windowsActionResult, error) {
 	f.closed++
-	return storage.WindowsActionResult{Action: id, State: storage.WindowsActionCompleted, Attr: f.attr}, nil
+	return windowsActionResult{Action: id, State: windowsActionCompleted, Attr: f.attr}, nil
 }
 func (f *commandFile) Sync(context.Context) error { return f.readErr }
 
 type commandSession struct {
-	storage.WindowsSession
-	result   storage.WindowsActionResult
+	windowsSession
+	result   windowsActionResult
 	queryErr error
 	closed   int
-	open     func(storage.WindowsOpenRequest) (storage.WindowsOpenResult, error)
+	open     func(windowsOpenRequest) (windowsOpenResult, error)
 }
 
 func (s *commandSession) Status(context.Context) (storage.FileSessionStatus, error) {
 	return storage.FileSessionStatus{ActionEpoch: 1}, nil
 }
-func (s *commandSession) QueryAction(_ context.Context, id storage.WindowsActionID) (storage.WindowsActionResult, error) {
+func (s *commandSession) QueryAction(_ context.Context, id windowsActionID) (windowsActionResult, error) {
 	result := s.result
 	result.Action = id
 	return result, s.queryErr
 }
 func (s *commandSession) Close(context.Context) error { s.closed++; return nil }
-func (s *commandSession) Open(_ context.Context, r storage.WindowsOpenRequest, _ storage.WindowsActionID) (storage.WindowsOpenResult, error) {
-	return s.open(r)
+func (s *commandSession) Open(_ context.Context, r windowsOpenRequest, _ windowsActionID) (windowsOpenResult, error) {
+	result, err := s.open(r)
+	if err == nil {
+		result.GrantedAccess = r.Access
+	}
+	return result, err
 }
 
 func fileRequest(command uint16, b []byte) wire.Request {
@@ -74,7 +78,7 @@ func fileRequest(command uint16, b []byte) wire.Request {
 	return wire.Request{Header: wire.Header{Command: command}, Body: p[64:], Packet: p}
 }
 func commandDispatcher() (*fileDispatcher, *commandFile, *commandSession, wire.FileID) {
-	f := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 7, Size: 3}}}, data: []byte("abc"), result: storage.WindowsActionResult{State: storage.WindowsActionCompleted}}
+	f := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{Kind: storage.NodeRegular, ID: 7, Size: 3}}}, data: []byte("abc"), result: windowsActionResult{State: windowsActionCompleted}}
 	s := &commandSession{}
 	d := newFileDispatcher(nil, s, 1, DefaultLimits())
 	id := wire.FileID{1}
@@ -123,7 +127,7 @@ func TestCommandReadBoundsAndFailure(t *testing.T) {
 func TestCommandWriteReconcilesWithoutRepeating(t *testing.T) {
 	d, f, s, id := commandDispatcher()
 	f.writeErr = syscall.EIO
-	s.result = storage.WindowsActionResult{State: storage.WindowsActionCompleted}
+	s.result = windowsActionResult{State: windowsActionCompleted}
 	b, status := d.handle(context.Background(), writeCommand(id, []byte("test")))
 	if status != 0 || smbLE.Uint32(b[4:]) != 4 || f.writes != 1 || s.closed != 0 {
 		t.Fatalf("known write = %x, writes %d closed %d", status, f.writes, s.closed)
@@ -164,9 +168,9 @@ type deniedStatFile struct {
 	statCalls int
 }
 
-func (f *deniedStatFile) Stat(context.Context) (storage.WindowsAttr, error) {
+func (f *deniedStatFile) Stat(context.Context) (windowsAttr, error) {
 	f.statCalls++
-	return storage.WindowsAttr{}, syscall.EACCES
+	return windowsAttr{}, syscall.EACCES
 }
 
 func TestCloseDoesNotRequireMetadataAccess(t *testing.T) {
@@ -199,11 +203,11 @@ type changeTimeFile struct {
 	sets, stats int
 }
 
-func (f *changeTimeFile) Stat(context.Context) (storage.WindowsAttr, error) {
+func (f *changeTimeFile) Stat(context.Context) (windowsAttr, error) {
 	f.stats++
-	return storage.WindowsAttr{}, syscall.EACCES
+	return windowsAttr{}, syscall.EACCES
 }
-func (f *changeTimeFile) SetAttr(_ context.Context, c storage.WindowsAttrChange, id storage.WindowsActionID) (storage.WindowsActionResult, error) {
+func (f *changeTimeFile) SetAttr(_ context.Context, c windowsAttrChange, id windowsActionID) (windowsActionResult, error) {
 	f.sets++
 	if c.ChangeTime == nil {
 		f.attr.ChangeTime = time.Unix(100, 0)
@@ -213,19 +217,19 @@ func (f *changeTimeFile) SetAttr(_ context.Context, c storage.WindowsAttrChange,
 	if c.DOSAttributes != nil {
 		f.attr.DOSAttributes = *c.DOSAttributes
 	}
-	return storage.WindowsActionResult{Action: id, State: storage.WindowsActionCompleted}, nil
+	return windowsActionResult{Action: id, State: windowsActionCompleted}, nil
 }
 
 func TestUnbufferedCreateIsRejectedBeforeBackendAdmission(t *testing.T) {
 	d, f, s, _ := commandDispatcher()
 	opens := 0
-	s.open = func(r storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
+	s.open = func(r windowsOpenRequest) (windowsOpenResult, error) {
 		opens++
 		if r.Lookup.Name == "" {
-			root := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 1, Mode: fs.ModeDir}}}}
-			return storage.WindowsOpenResult{File: root, Attr: root.attr, CreateAction: storage.WindowsOpened}, nil
+			root := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}}}
+			return windowsOpenResult{File: root, Attr: root.attr, CreateAction: windowsOpened}, nil
 		}
-		return storage.WindowsOpenResult{File: f, Attr: f.attr, CreateAction: storage.WindowsOpened}, nil
+		return windowsOpenResult{File: f, Attr: f.attr, CreateAction: windowsOpened}, nil
 	}
 	r := createCommand("file", 3, 1)
 	smbLE.PutUint32(r.Body[40:], 0x8)
@@ -245,7 +249,7 @@ func TestChangeTimePreserveSentinelCannotSilentlyBecomeAutomaticTime(t *testing.
 	d.handles[id].file = file
 	data := make([]byte, 40)
 	smbLE.PutUint64(data[24:], ^uint64(0))
-	smbLE.PutUint32(data[32:], storage.WindowsDOSHidden)
+	smbLE.PutUint32(data[32:], dosHidden)
 	if _, status := d.setInfo(context.Background(), setCommand(id, 4, data)); status != fileNotSupported || file.sets != 0 || file.stats != 0 || !f.attr.ChangeTime.Equal(time.Unix(10, 0)) || f.attr.DOSAttributes != 0 {
 		t.Fatalf("preserve sentinel status%x sets%d stats%d attr%+v", status, file.sets, file.stats, f.attr)
 	}
@@ -267,7 +271,7 @@ func TestFileInformationAndTimeEncoding(t *testing.T) {
 	if decodeWindowsTime(0) != nil || decodeWindowsTime(^uint64(0)) != nil {
 		t.Fatal("timestamp preserve values changed")
 	}
-	a := storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 42, Size: 123, Mode: 0644}, CreationTime: instant, DeletePending: true, DOSAttributes: storage.WindowsDOSHidden}}
+	a := windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 42, Size: 123, Kind: storage.NodeRegular}, CreationTime: instant, DeletePending: true, DOSAttributes: dosHidden}}
 	b, s := encodeFileInfo(5, a, 0, 0)
 	if s != 0 || smbLE.Uint64(b) != 123 || b[20] != 1 {
 		t.Fatalf("standard = %x %x", s, b)
@@ -279,7 +283,7 @@ func TestFileInformationAndTimeEncoding(t *testing.T) {
 	if _, s = directoryEntry(255, "", a, 0); s != fileInvalidInfoClass {
 		t.Fatalf("unknown class = %x", s)
 	}
-	a.Mode = fs.ModeDir
+	a.Kind = storage.NodeDirectory
 	if fileAttributes(a)&0x10 == 0 {
 		t.Fatal("directory bit missing")
 	}
@@ -296,53 +300,58 @@ func TestSMBPatternMatching(t *testing.T) {
 }
 func TestWindowsAccessAndStatusMapping(t *testing.T) {
 	i, err := windowsIntent(wire.CreateRequest{DesiredAccess: 0x80000000, ShareAccess: 7, Disposition: 1})
-	if err != nil || i.Access&storage.WindowsReadData == 0 || i.Disposition != storage.WindowsOpen {
+	if err != nil || i.Access&windowsReadData == 0 || i.Disposition != windowsOpen {
 		t.Fatalf("intent = %+v %v", i, err)
 	}
 	_, err = windowsIntent(wire.CreateRequest{DesiredAccess: 1, Disposition: 1, Options: 0x1000})
 	if !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("delete access = %v", err)
 	}
-	if got := statusError(&storage.WindowsError{Failure: storage.WindowsSharingViolation, Err: syscall.EACCES}); got != 0xc0000043 {
+	if got := statusError(&windowsError{Failure: windowsSharingViolation, Err: syscall.EACCES}); got != 0xc0000043 {
 		t.Fatalf("sharing = %x", got)
 	}
-	if got := statusAction(storage.WindowsActionResult{State: storage.WindowsActionPending}, nil); got != fileIOError {
+	if got := statusAction(windowsActionResult{State: windowsActionPending}, nil); got != fileIOError {
 		t.Fatalf("pending = %x", got)
 	}
 }
 
 type commandBackend struct {
-	storage.WindowsStorage
+	windowsBackend
 	space storage.Space
 	err   error
 }
 
 func (b *commandBackend) Space(context.Context) (storage.Space, error) { return b.space, b.err }
-func (f *commandFile) ListBounded(_ context.Context, r *storage.WindowsListResult) error {
+func (f *commandFile) ListBounded(_ context.Context, r *windowsListResult) error {
 	if f.readErr != nil {
 		return r.Fail(f.readErr)
 	}
-	return r.Add(storage.WindowsEntry{Name: "a.txt", Attr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 8, Size: 1}, DOSAttributes: storage.WindowsDOSHidden}})
+	return r.Add(windowsEntry{Name: "a.txt", Attr: windowsBasicAttr{Attr: storage.Attr{Kind: storage.NodeRegular, ID: 8, Size: 1}, DOSAttributes: dosHidden}})
 }
-func (f *commandFile) Truncate(_ context.Context, size int64, id storage.WindowsActionID) (storage.WindowsActionResult, error) {
+func (f *commandFile) Truncate(_ context.Context, size int64, id windowsActionID) (windowsActionResult, error) {
 	f.attr.Size = size
-	return storage.WindowsActionResult{Action: id, State: storage.WindowsActionCompleted}, nil
+	return windowsActionResult{Action: id, State: windowsActionCompleted}, nil
 }
-func (f *commandFile) SetAttr(_ context.Context, c storage.WindowsAttrChange, id storage.WindowsActionID) (storage.WindowsActionResult, error) {
+func (f *commandFile) SetAttr(_ context.Context, c windowsAttrChange, id windowsActionID) (windowsActionResult, error) {
 	if c.DOSAttributes != nil {
 		f.attr.DOSAttributes = *c.DOSAttributes
 	}
-	return storage.WindowsActionResult{Action: id, State: storage.WindowsActionCompleted}, nil
+	return windowsActionResult{Action: id, State: windowsActionCompleted}, nil
 }
-func (f *commandFile) SetDeletePending(_ context.Context, value bool, id storage.WindowsActionID) (storage.WindowsActionResult, error) {
+func (f *commandFile) SetDeletePending(_ context.Context, value bool, id windowsActionID) (windowsActionResult, error) {
 	f.attr.DeletePending = value
-	return storage.WindowsActionResult{Action: id, State: storage.WindowsActionCompleted}, nil
+	return windowsActionResult{Action: id, State: windowsActionCompleted}, nil
 }
-func (f *commandFile) Rename(_ context.Context, r storage.WindowsRenameRequest, id storage.WindowsActionID) (storage.WindowsActionResult, error) {
+func (f *commandFile) Rename(_ context.Context, r windowsRenameRequest, id windowsActionID) (windowsActionResult, error) {
 	if err := r.Check(); err != nil {
-		return storage.WindowsActionResult{}, err
+		return windowsActionResult{}, err
 	}
-	return storage.WindowsActionResult{Action: id, State: storage.WindowsActionCompleted}, nil
+	if f.rename != nil {
+		if err := f.rename(r); err != nil {
+			return windowsActionResult{}, err
+		}
+	}
+	return windowsActionResult{Action: id, State: windowsActionCompleted}, nil
 }
 
 func createCommand(name string, access uint32, disposition uint32) wire.Request {
@@ -394,24 +403,24 @@ func dirCommand(id wire.FileID, flags byte, limit uint32) wire.Request {
 
 func TestCreateRetainsExactParentAndBoundsHandles(t *testing.T) {
 	d, f, s, _ := commandDispatcher()
-	var requests []storage.WindowsOpenRequest
-	root := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 1, Mode: fs.ModeDir}}}}
-	parent := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 2, Mode: fs.ModeDir}}}}
-	s.open = func(r storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
+	var requests []windowsOpenRequest
+	root := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}}}
+	parent := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 2, Kind: storage.NodeDirectory}}}}
+	s.open = func(r windowsOpenRequest) (windowsOpenResult, error) {
 		requests = append(requests, r)
 		if r.Lookup.Name == "" {
-			return storage.WindowsOpenResult{File: root, Attr: root.attr}, nil
+			return windowsOpenResult{File: root, Attr: root.attr}, nil
 		}
 		if r.Lookup.Name == "dir" {
-			return storage.WindowsOpenResult{File: parent, Attr: parent.attr}, nil
+			return windowsOpenResult{File: parent, Attr: parent.attr}, nil
 		}
-		return storage.WindowsOpenResult{File: f, Attr: f.attr, CreateAction: storage.WindowsCreated}, nil
+		return windowsOpenResult{File: f, Attr: f.attr, CreateAction: windowsCreated}, nil
 	}
 	body, status := d.handle(context.Background(), createCommand("dir\\name", 3, 2))
 	if status != 0 || smbLE.Uint32(body[4:]) != 2 {
 		t.Fatalf("create %x", status)
 	}
-	if len(requests) != 3 || requests[2].Lookup.ParentID != 2 || requests[2].Lookup.ParentReference != "retained" || root.closed != 1 || parent.closed != 1 {
+	if len(requests) != 3 || requests[2].Lookup.ParentID != 2 || requests[2].Lookup.ParentReference != 1 || root.closed != 1 || parent.closed != 1 {
 		t.Fatalf("path admission %+v root closed %d parent closed %d", requests, root.closed, parent.closed)
 	}
 	d.limits.MaxOpens = d.handleCount()
@@ -427,34 +436,34 @@ func TestCreateRetainsExactParentAndBoundsHandles(t *testing.T) {
 }
 func TestOpenUnknownReconcilesAndFences(t *testing.T) {
 	d, f, s, _ := commandDispatcher()
-	s.open = func(storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
-		return storage.WindowsOpenResult{}, syscall.EIO
+	s.open = func(windowsOpenRequest) (windowsOpenResult, error) {
+		return windowsOpenResult{}, syscall.EIO
 	}
-	id, _ := d.actionID()
-	s.result = storage.WindowsActionResult{State: storage.WindowsActionCompleted, File: f, Attr: f.attr, CreateAction: storage.WindowsOpened}
-	got, err := d.open(context.Background(), storage.WindowsOpenRequest{}, id)
+	id, _ := d.actionID(context.Background())
+	s.result = windowsActionResult{State: windowsActionCompleted, File: f, Attr: f.attr, CreateAction: windowsOpened}
+	got, err := d.open(context.Background(), windowsOpenRequest{}, id)
 	if err != nil || got.File != f {
 		t.Fatalf("reconciled %v %v", got, err)
 	}
-	s.result = storage.WindowsActionResult{State: storage.WindowsActionPending}
-	_, err = d.open(context.Background(), storage.WindowsOpenRequest{}, id)
+	s.result = windowsActionResult{State: windowsActionPending}
+	_, err = d.open(context.Background(), windowsOpenRequest{}, id)
 	if !errors.Is(err, syscall.EIO) || s.closed != 1 {
 		t.Fatalf("pending %v close %d", err, s.closed)
 	}
 }
 func TestQueryDirectoryCursorSurvivesSmallBuffer(t *testing.T) {
 	d, f, s, id := commandDispatcher()
-	f.attr.Mode = fs.ModeDir
-	s.open = func(r storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
+	f.attr.Kind = storage.NodeDirectory
+	s.open = func(r windowsOpenRequest) (windowsOpenResult, error) {
 		t.Fatal("enumeration reopened an entry")
-		return storage.WindowsOpenResult{}, nil
+		return windowsOpenResult{}, nil
 	}
 	_, status := d.handle(context.Background(), dirCommand(id, 0, 1))
 	if status != fileBufferTooSmall {
 		t.Fatalf("small %x", status)
 	}
 	body, status := d.handle(context.Background(), dirCommand(id, 0, 1024))
-	if status != 0 || smbLE.Uint64(body[8+96:]) != 8 || smbLE.Uint32(body[8+56:]) != storage.WindowsDOSHidden {
+	if status != 0 || smbLE.Uint64(body[8+96:]) != 8 || smbLE.Uint32(body[8+56:]) != dosHidden {
 		t.Fatalf("entry %x %x", status, body)
 	}
 	_, status = d.handle(context.Background(), dirCommand(id, 0, 1024))
@@ -483,11 +492,11 @@ func TestSetInformationMutatesOnlySelectedFields(t *testing.T) {
 		}
 	}
 	basic := make([]byte, 40)
-	smbLE.PutUint32(basic[32:], storage.WindowsDOSHidden)
+	smbLE.PutUint32(basic[32:], dosHidden)
 	if _, status := d.handle(ctx, setCommand(id, 4, basic)); status != 0 {
 		t.Fatalf("basic %x", status)
 	}
-	if !f.attr.DeletePending || f.attr.Size != 9 || f.attr.DOSAttributes != storage.WindowsDOSHidden || d.get(id).position != 3 {
+	if !f.attr.DeletePending || f.attr.Size != 9 || f.attr.DOSAttributes != dosHidden || d.get(id).position != 3 {
 		t.Fatalf("attributes %+v", f.attr)
 	}
 	if _, status := d.handle(ctx, setCommand(id, 13, []byte{2})); status != fileInvalidParameter {
@@ -499,7 +508,7 @@ func TestSetInformationMutatesOnlySelectedFields(t *testing.T) {
 }
 func TestFileAndFilesystemQueryShapes(t *testing.T) {
 	d, f, _, id := commandDispatcher()
-	d.handles[id].access = 1
+	d.handles[id].access = 0x81
 	d.backend = &commandBackend{space: storage.Space{Total: 100, Used: 60, Avail: 30}}
 	for _, class := range []byte{4, 5, 6, 7, 8, 14, 16, 17, 22, 35} {
 		b, status := d.handle(context.Background(), queryCommand(id, 1, class, 1024))
@@ -516,7 +525,7 @@ func TestFileAndFilesystemQueryShapes(t *testing.T) {
 	if status != fileBufferTooSmall {
 		t.Fatalf("short buffer %x", status)
 	}
-	f.attr.Mode = fs.ModeDir
+	f.attr.Kind = storage.NodeDirectory
 	b, status := d.handle(context.Background(), queryCommand(id, 1, 22, 1024))
 	if status != 0 || len(b) != 8 {
 		t.Fatalf("directory streams %x %x", status, b)
@@ -565,12 +574,12 @@ func TestIdentityQueriesDoNotRequireReadAttributes(t *testing.T) {
 
 func TestWriteOpenAndRenameIdentityProbesRequestNoExtraRights(t *testing.T) {
 	d, f, s, _ := commandDispatcher()
-	root := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 1, Mode: fs.ModeDir}}}}
-	target := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 99}}}}
+	root := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}}}
+	target := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{Kind: storage.NodeRegular, ID: 99}}}}
 	parents, probes := 0, 0
-	s.open = func(r storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
-		if r.Access&storage.WindowsReadAttributes != 0 {
-			return storage.WindowsOpenResult{}, syscall.EACCES
+	s.open = func(r windowsOpenRequest) (windowsOpenResult, error) {
+		if r.Access&windowsReadAttributes != 0 {
+			return windowsOpenResult{}, syscall.EACCES
 		}
 		switch r.Lookup.Name {
 		case "":
@@ -578,20 +587,20 @@ func TestWriteOpenAndRenameIdentityProbesRequestNoExtraRights(t *testing.T) {
 			if r.Access != 0 {
 				t.Fatalf("parent access %+v", r)
 			}
-			return storage.WindowsOpenResult{File: root, Attr: root.attr, CreateAction: storage.WindowsOpened}, nil
+			return windowsOpenResult{File: root, Attr: root.attr, CreateAction: windowsOpened}, nil
 		case "file":
-			if r.Access != storage.WindowsWriteData {
+			if r.Access != windowsWriteData {
 				t.Fatalf("final access %+v", r)
 			}
-			return storage.WindowsOpenResult{File: f, Attr: f.attr, CreateAction: storage.WindowsOpened}, nil
+			return windowsOpenResult{File: f, Attr: f.attr, CreateAction: windowsOpened}, nil
 		case "target":
 			probes++
 			if r.Access != 0 {
 				t.Fatalf("destination probe access %+v", r)
 			}
-			return storage.WindowsOpenResult{File: target, Attr: target.attr, CreateAction: storage.WindowsOpened}, nil
+			return windowsOpenResult{File: target, Attr: target.attr, CreateAction: windowsOpened}, nil
 		}
-		return storage.WindowsOpenResult{}, syscall.ENOENT
+		return windowsOpenResult{}, syscall.ENOENT
 	}
 	body, status := d.create(context.Background(), createCommand("file", 2, 1))
 	if status != 0 {
@@ -605,22 +614,29 @@ func TestWriteOpenAndRenameIdentityProbesRequestNoExtraRights(t *testing.T) {
 	rename[0] = 1
 	smbLE.PutUint32(rename[16:], uint32(len(name)))
 	copy(rename[20:], name)
-	if _, status := d.setInfo(context.Background(), setCommand(id, 10, rename)); status != 0 || parents != 2 || probes != 1 {
+	if _, status := d.setInfo(context.Background(), setCommand(id, 10, rename)); status != 0 || parents != 2 || probes != 0 {
 		t.Fatalf("rename status%x parents%d probes%d", status, parents, probes)
 	}
 }
 
-func TestRenameUsesExpectedSourceAndDestination(t *testing.T) {
+func TestRenameDelegatesCurrentIdentityAndRetainsDestinationParent(t *testing.T) {
 	d, f, s, id := commandDispatcher()
-	h := d.get(id)
-	h.lookup = storage.WindowsLookup{ParentID: 1, Name: "old", ExpectedID: f.attr.ID}
-	root := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 1, Mode: fs.ModeDir}}}}
-	target := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 99}}}}
-	s.open = func(r storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
+	root := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}}}
+	target := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{Kind: storage.NodeRegular, ID: 99}}}}
+	s.open = func(r windowsOpenRequest) (windowsOpenResult, error) {
 		if r.Lookup.Name == "" {
-			return storage.WindowsOpenResult{File: root, Attr: root.attr}, nil
+			return windowsOpenResult{File: root, Attr: root.attr}, nil
 		}
-		return storage.WindowsOpenResult{File: target, Attr: target.attr}, nil
+		return windowsOpenResult{File: target, Attr: target.attr}, nil
+	}
+	f.rename = func(r windowsRenameRequest) error {
+		if r.Destination.Name != "new" || r.Destination.ParentID != 1 || r.Destination.ParentReference != 1 {
+			t.Fatal(r)
+		}
+		if !r.Replace {
+			return syscall.EEXIST
+		}
+		return nil
 	}
 	name := wire.EncodeUTF16("new")
 	data := make([]byte, 20+len(name))
@@ -631,8 +647,8 @@ func TestRenameUsesExpectedSourceAndDestination(t *testing.T) {
 	if status != 0 {
 		t.Fatalf("rename %x", status)
 	}
-	if h.lookup.Name != "new" || h.lookup.ExpectedID != 7 || h.lookup.ParentReference != "" || root.closed != 1 || target.closed != 1 {
-		t.Fatalf("rename identity %+v root/target %d/%d", h.lookup, root.closed, target.closed)
+	if root.closed != 1 || target.closed != 0 {
+		t.Fatalf("root/target cleanup %d/%d", root.closed, target.closed)
 	}
 	data[0] = 0
 	_, status = d.handle(context.Background(), setCommand(id, 10, data))
@@ -657,7 +673,7 @@ func TestProtocolNativeCreateDeclinesOptionalCaching(t *testing.T) {
 	r := createCommand("file", 0x0012019f, 5)
 	r.Body[3] = 9
 	smbLE.PutUint32(r.Body[4:], 2)
-	smbLE.PutUint32(r.Body[28:], storage.WindowsDOSNormal)
+	smbLE.PutUint32(r.Body[28:], dosNormal)
 	smbLE.PutUint32(r.Body[32:], 7)
 	smbLE.PutUint32(r.Body[40:], 0x00020042)
 	r = requestContexts(t, r, []wire.CreateContext{{Name: []byte("DH2Q"), Data: make([]byte, 32)}, {Name: []byte("QFid")}})
@@ -671,7 +687,7 @@ func TestProtocolNativeCreateDeclinesOptionalCaching(t *testing.T) {
 	}
 	decoded.Options &^= 0x00020000
 	withoutHint, err := windowsIntent(decoded)
-	if err != nil || withHint != withoutHint || withHint.Share != storage.WindowsShareAll || withHint.Kind != storage.WindowsRegularFile || withHint.Disposition != storage.WindowsOverwriteIf {
+	if err != nil || withHint != withoutHint || withHint.Share != windowsShareAll || withHint.Kind != windowsRegularFile || withHint.Disposition != windowsOverwriteIf {
 		t.Fatalf("ignored option changed open intent: %+v %+v %v", withHint, withoutHint, err)
 	}
 	decoded.Options |= 0x00020008
@@ -712,21 +728,21 @@ func TestProtocolNativeCreateDeclinesOptionalCaching(t *testing.T) {
 	}
 }
 
-func TestNativeBackupMetadataOpenPreservesAuthorizationAndAbsence(t *testing.T) {
+func TestNativeBackupMetadataOpenPreservesIntentAndAbsence(t *testing.T) {
 	for _, pattern := range []struct {
 		options, access, share uint32
 		identity               bool
 	}{{0x204042, 0x100080, 7, false}, {0x204002, 0x80, 7, true}, {0x224022, 0x100080, 0, true}} {
 		t.Run(fmt.Sprintf("options_%x", pattern.options), func(t *testing.T) {
 			c, session, _, _, backend, _ := testConnection(t)
-			var opened []storage.WindowsOpenRequest
-			backend.open = func(request storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
+			var opened []windowsOpenRequest
+			backend.open = func(request windowsOpenRequest) (windowsOpenResult, error) {
 				opened = append(opened, request)
 				if request.Lookup.Name == "" {
-					root := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 1, Mode: fs.ModeDir}}}}
-					return storage.WindowsOpenResult{File: root, Attr: root.attr}, nil
+					root := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}}}
+					return windowsOpenResult{File: root, Attr: root.attr}, nil
 				}
-				return storage.WindowsOpenResult{}, syscall.ENOENT
+				return windowsOpenResult{}, syscall.ENOENT
 			}
 			request := createCommand("missing", pattern.access, 1)
 			smbLE.PutUint32(request.Body[4:], 2)
@@ -737,24 +753,19 @@ func TestNativeBackupMetadataOpenPreservesAuthorizationAndAbsence(t *testing.T) 
 			}
 			request = signedRequest(t, session, request)
 			header := request.Header
-			var authorized *storage.WindowsOpenIntent
-			c.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, access authz.AccessRequest) error {
-				authorized = &access.WindowsOpen
-				return nil
-			})
 			_, status, _ := c.dispatch(t.Context(), request, request, &header)
-			if status != 0xc0000034 || len(opened) != 2 || authorized == nil {
-				t.Fatalf("absent metadata open status=%x backendCalls=%d intent=%+v", status, len(opened), authorized)
+			if status != 0xc0000034 || len(opened) != 2 {
+				t.Fatalf("absent metadata open status=%x backendCalls=%d", status, len(opened))
 			}
-			got := opened[1].WindowsOpenIntent
-			if got != *authorized || got.Share != storage.WindowsShare(pattern.share) || !got.OpenReparsePoint || got.Disposition != storage.WindowsOpen || got.Access&storage.WindowsReadAttributes == 0 || got.Access&^(storage.WindowsReadAttributes|storage.WindowsSynchronize) != 0 {
-				t.Fatalf("backup hint changed granted authority: %+v authorized=%+v", got, authorized)
+			got := opened[1].windowsOpenIntent
+			if got.Share != windowsShare(pattern.share) || !got.OpenReparsePoint || got.Disposition != windowsOpen || got.Access&windowsReadAttributes == 0 || got.Access&^(windowsReadAttributes|windowsSynchronize) != 0 {
+				t.Fatalf("backup hint changed open intent: %+v", got)
 			}
-			opened = nil
-			c.server.config.Authorize = authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return authz.ErrDenied })
-			if _, status, _ := c.dispatch(t.Context(), request, request, &header); status != statusDenied || len(opened) != 0 {
-				t.Fatal("backup hint bypassed business authorization")
-			}
+
 		})
 	}
+}
+
+func (f *commandFile) ValidateNotificationLocation(_ context.Context, location storage.EntryLocation) error {
+	return location.Check()
 }

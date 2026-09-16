@@ -2,10 +2,6 @@ package objectstore
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"math"
-	"sync"
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
@@ -13,27 +9,22 @@ import (
 )
 
 type openFile struct {
-	session    *fileSession
-	native     metastore.File
-	options    storage.FileOpenOptions
-	active     bool
-	operations sync.WaitGroup
-	flock      map[storage.LockOwner]uint64
-	retireMu   sync.Mutex
-	retired    bool
-	closeMu    sync.Mutex
-	closeDone  chan struct{}
-	closeErr   error
+	session     *fileSession
+	native      metastore.File
+	active      bool
+	closed      bool
+	operations  int
+	idle        chan struct{}
+	closePermit chan struct{}
 }
 
 var _ storage.File = (*openFile)(nil)
 
-func (f *openFile) begin(ctx context.Context) (context.Context, func(), error) {
-	return f.admit(ctx, fileDataOperation)
-}
+func (f *openFile) Reference() storage.FileReferenceID { return f.native.Reference() }
+func (f *openFile) NodeID() uint64                     { return f.native.NodeID() }
 
-func (f *openFile) admit(ctx context.Context, class fileOperationClass) (context.Context, func(), error) {
-	done, err := f.session.admit(ctx, false, class)
+func (f *openFile) begin(ctx context.Context, class fileOperationClass) (context.Context, func(), error) {
+	ctx, done, err := f.session.begin(ctx, class)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -43,381 +34,222 @@ func (f *openFile) admit(ctx context.Context, class fileOperationClass) (context
 		done()
 		return nil, nil, syscall.EBADF
 	}
-	f.operations.Add(1)
+	if f.operations == 0 {
+		f.idle = make(chan struct{})
+	}
+	f.operations++
 	f.session.mu.Unlock()
-	_, _, timeout := f.session.domain.FileOperationLimits()
-	operation, cancel := context.WithTimeout(ctx, timeout)
-	return metastore.WithFilePublicationGuard(operation, f.session.publicationAllowed), func() { cancel(); f.operations.Done(); done() }, nil
-}
-
-func (f *openFile) state(ctx context.Context) (metastore.FileState, error) {
-	node, err := f.native.Node(ctx)
-	if err != nil {
-		return metastore.FileState{}, err
-	}
-	if err := f.session.locks.IOHealth(ctx, uint64(node.ID)); err != nil {
-		return metastore.FileState{}, err
-	}
-	return node, nil
-}
-
-func (f *openFile) Stat(ctx context.Context) (storage.Attr, error) {
-	ctx, done, err := f.begin(ctx)
-	if err != nil {
-		return storage.Attr{}, err
-	}
-	defer done()
-	node, err := f.state(ctx)
-	return node.Attr(), err
-}
-
-func (f *openFile) ReadAt(ctx context.Context, offset int64, length int) (storage.FileRead, error) {
-	ctx = metastore.WithFileIO(ctx, metastore.WindowsIO{Offset: offset, Length: int64(length)})
-	if err := storage.CheckWindowsRange(offset, int64(length)); err != nil {
-		return storage.FileRead{}, err
-	}
-	if !f.options.Read {
-		return storage.FileRead{}, syscall.EBADF
-	}
-	ctx, done, err := f.begin(ctx)
-	if err != nil {
-		return storage.FileRead{}, err
-	}
-	defer done()
-	_, attempts, _ := f.session.domain.FileOperationLimits()
-	maxBytes := f.session.options.MaxFileSize
-	var missing metastore.Key
-	for range attempts {
-		node, err := f.state(ctx)
-		if err != nil {
-			return storage.FileRead{}, err
-		}
-		if node.Size < 0 || node.Size > maxBytes {
-			return storage.FileRead{}, syscall.EFBIG
-		}
-		count := min(int64(length), max(node.Size-offset, 0))
-		if node.Size > math.MaxInt64-count {
-			return storage.FileRead{}, syscall.EFBIG
-		}
-		release, err := f.session.domain.AcquireMaterialization(ctx, node.Size+count)
-		if err != nil {
-			return storage.FileRead{}, err
-		}
-		body, err := f.session.storage.fileBody(ctx, node, missing)
-		if isOnly(err, syscall.ENOENT) {
-			release()
-			missing = node.Content
-			continue
-		}
-		if err != nil {
-			release()
-			return storage.FileRead{}, err
-		}
-		data := make([]byte, int(count))
-		if count != 0 {
-			copy(data, body[offset:offset+count])
-		}
-		release()
-		return storage.FileRead{Attr: node.Attr(), Data: data}, nil
-	}
-	return storage.FileRead{}, fmt.Errorf("retained file changed during every content read: %w", syscall.EAGAIN)
-}
-
-func (s *Storage) fileBody(ctx context.Context, node metastore.FileState, missing metastore.Key) ([]byte, error) {
-	if node.Content == "" {
-		if node.Size != 0 {
-			return nil, fmt.Errorf("retained file has bytes without an object: %w", syscall.EIO)
-		}
-		return nil, nil
-	}
-	if node.Content == missing {
-		return nil, fmt.Errorf("retained file names a missing object: %w", syscall.EIO)
-	}
-	body, err := s.objects.(BoundedObjects).GetBounded(ctx, string(node.Content), max(node.Size, 1))
-	if err != nil {
-		if isOnly(err, syscall.ENOENT) {
-			return nil, err
-		}
-		if errors.Is(err, syscall.EFBIG) {
-			return nil, sanitizeFailure("retained file object exceeds its recorded size", err, func(e error) bool { return errors.Is(e, syscall.EFBIG) })
-		}
-		return nil, objectFailure("reading", fmt.Sprintf("node %d", node.ID), err)
-	}
-	if int64(len(body)) != node.Size {
-		return nil, fmt.Errorf("retained file object size differs from metadata: %w", syscall.EIO)
-	}
-	return body, nil
-}
-
-func (f *openFile) WriteAt(ctx context.Context, offset int64, data []byte) (storage.Attr, error) {
-	ctx = metastore.WithFileIO(ctx, metastore.WindowsIO{Offset: offset, Length: int64(len(data)), Write: true})
-	if offset < 0 {
-		return storage.Attr{}, syscall.EINVAL
-	}
-	if int64(len(data)) > math.MaxInt64-offset {
-		return storage.Attr{}, syscall.EFBIG
-	}
-	if !f.options.Write {
-		return storage.Attr{}, syscall.EBADF
-	}
-	if len(data) == 0 {
-		return f.Stat(ctx)
-	}
-	return f.mutate(ctx, func(previous int64) int64 {
-		if len(data) == 0 {
-			return previous
-		}
-		return max(previous, offset+int64(len(data)))
-	}, func(body []byte) {
-		if len(data) != 0 {
-			copy(body[offset:], data)
-		}
-	})
-}
-
-func (f *openFile) Truncate(ctx context.Context, size int64) (storage.Attr, error) {
-	ctx = metastore.WithFileIO(ctx, metastore.WindowsIO{Write: true, Truncate: true, Size: size})
-	if size < 0 {
-		return storage.Attr{}, syscall.EINVAL
-	}
-	return f.mutate(ctx, func(int64) int64 { return size }, func([]byte) {})
-}
-
-func (f *openFile) mutate(ctx context.Context, size func(int64) int64, patch func([]byte)) (storage.Attr, error) {
-	if !f.options.Write {
-		return storage.Attr{}, syscall.EBADF
-	}
-	ctx, done, err := f.begin(ctx)
-	if err != nil {
-		return storage.Attr{}, err
-	}
-	defer done()
-	_, attempts, _ := f.session.domain.FileOperationLimits()
-	maxBytes := f.session.options.MaxFileSize
-	var missing metastore.Key
-	for range attempts {
-		node, err := f.state(ctx)
-		if err != nil {
-			return storage.Attr{}, err
-		}
-		next := size(node.Size)
-		if node.Size < 0 {
-			return storage.Attr{}, syscall.EIO
-		}
-		if next < 0 || next > maxBytes {
-			return storage.Attr{}, syscall.EFBIG
-		}
-		// Emptying a retained object preserves no old bytes. The revision-CAS
-		// publication still validates strong permissions and the reference lifetime.
-		if next == 0 {
-			result, retry, err := f.publish(ctx, node, nil)
-			if retry {
-				continue
-			}
-			return result, err
-		}
-		if node.Size > maxBytes {
-			return storage.Attr{}, syscall.EFBIG
-		}
-		if node.Size > math.MaxInt64-next {
-			return storage.Attr{}, syscall.EFBIG
-		}
-		release, err := f.session.domain.AcquireMaterialization(ctx, node.Size+next)
-		if err != nil {
-			return storage.Attr{}, err
-		}
-		body, err := f.session.storage.fileBody(ctx, node, missing)
-		if isOnly(err, syscall.ENOENT) {
-			release()
-			missing = node.Content
-			continue
-		}
-		if err != nil {
-			release()
-			return storage.Attr{}, err
-		}
-		content := make([]byte, int(next))
-		copy(content, body)
-		patch(content)
-		result, retry, err := f.publish(ctx, node, content)
-		release()
-		if retry {
-			continue
-		}
-		return result, err
-	}
-	return storage.Attr{}, fmt.Errorf("retained file changed during every publication attempt: %w", syscall.EAGAIN)
-}
-
-func (f *openFile) publish(ctx context.Context, previous metastore.FileState, content []byte) (storage.Attr, bool, error) {
-	s := f.session.storage
-	name := fmt.Sprintf("node %d", previous.ID)
-	object := metastore.Object{Size: int64(len(content)), ModTime: s.now()}
-	if len(content) > 0 {
-		key, err := f.native.Reserve(ctx, object.Size)
-		if err != nil {
-			return storage.Attr{}, false, err
-		}
-		digest, err := s.objects.Put(ctx, string(key), content)
-		if err != nil {
-			operationErr := objectFailure("storing", name, err)
-			if cleanupErr := f.cleanupObject(key, true); cleanupErr != nil {
-				operationErr = errors.Join(operationErr, internalFailure("quarantining", name, cleanupErr))
-			}
-			return storage.Attr{}, false, operationErr
-		}
-		object.Key, object.Digest = key, digest
-	}
-	node, err := f.native.Commit(ctx, previous.Revision, object)
-	if err != nil {
-		if object.Key != "" {
-			cleanupErr := f.cleanupObject(object.Key, false)
-			s.sweepAfterMutation()
-			if cleanupErr != nil {
-				if isVolumeFact(cleanupErr) {
-					err = ambiguousCommitFailure(name, err)
-				}
-				return storage.Attr{}, false, errors.Join(err, internalFailure("abandoning", name, cleanupErr))
-			}
-		}
-		return storage.Attr{}, isOnly(err, syscall.EAGAIN), err
-	}
-	s.sweepAfterMutation()
-	return node.Attr(), false, nil
-}
-
-func (f *openFile) cleanupObject(key metastore.Key, quarantine bool) error {
-	_, _, timeout := f.session.domain.FileOperationLimits()
-	ctx, cancel := context.WithTimeout(f.session.storage.cleanupContext, timeout)
-	defer cancel()
-	if quarantine {
-		return f.session.storage.meta.Quarantine(ctx, key)
-	}
-	return f.session.storage.meta.Abandon(ctx, key)
-}
-
-func (f *openFile) SetAttr(ctx context.Context, change storage.AttrChange) (storage.Attr, error) {
-	if err := change.Check(); err != nil {
-		return storage.Attr{}, err
-	}
-	ctx, done, err := f.begin(ctx)
-	if err != nil {
-		return storage.Attr{}, err
-	}
-	defer done()
-	if _, err := f.state(ctx); err != nil {
-		return storage.Attr{}, err
-	}
-	node, err := f.native.SetAttr(ctx, change)
-	return node.Attr(), err
-}
-
-func (f *openFile) Sync(ctx context.Context) error {
-	ctx, done, err := f.begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer done()
-	_, attempts, _ := f.session.domain.FileOperationLimits()
-	maxBytes := f.session.options.MaxFileSize
-	var missing metastore.Key
-	for range attempts {
-		node, err := f.state(ctx)
-		if err != nil {
-			return err
-		}
-		if node.Size < 0 || node.Size > maxBytes {
-			return syscall.EFBIG
-		}
-		release, err := f.session.domain.AcquireMaterialization(ctx, node.Size)
-		if err != nil {
-			return err
-		}
-		_, err = f.session.storage.fileBody(ctx, node, missing)
-		release()
-		if !isOnly(err, syscall.ENOENT) {
-			return err
-		}
-		missing = node.Content
-	}
-	return syscall.EAGAIN
-}
-
-func (f *openFile) retire() error {
-	f.session.mu.Lock()
-	f.active = false
-	f.session.mu.Unlock()
-	f.retireMu.Lock()
-	defer f.retireMu.Unlock()
-	if f.retired {
-		return nil
-	}
-	ctx, cancel := f.session.operationContext(f.session.cleanup)
-	defer cancel()
-	if err := f.native.Retire(ctx); err != nil {
-		return err
-	}
-	f.retired = true
-	return nil
-}
-
-func (f *openFile) startClose() <-chan struct{} {
-	f.closeMu.Lock()
-	defer f.closeMu.Unlock()
-	if f.closeDone != nil {
-		select {
-		case <-f.closeDone:
-			if f.closeErr == nil {
-				return f.closeDone
-			}
-		default:
-			return f.closeDone
-		}
-	}
-	f.closeDone = make(chan struct{})
-	go f.finishClose()
-	return f.closeDone
-}
-
-func (f *openFile) finishClose() {
-	err := f.retire()
-	if err == nil {
-		f.operations.Wait()
+	return ctx, func() {
 		f.session.mu.Lock()
-		owners := make(map[storage.LockOwner]uint64, len(f.flock))
-		for owner, node := range f.flock {
-			owners[owner] = node
+		f.operations--
+		if f.operations == 0 {
+			close(f.idle)
 		}
 		f.session.mu.Unlock()
-		for owner, node := range owners {
-			err = errors.Join(err, f.dropClosedFlock(node, owner))
-		}
-		// Cleanup keeps the creation-time accounting hooks. Attaching Close's
-		// context again would reserve and settle the same outer quota twice.
-		ctx, cancel := f.session.operationContext(f.session.cleanup)
-		err = errors.Join(err, f.native.Close(ctx))
-		cancel()
+		done()
+	}, nil
+}
+
+func (f *openFile) Stat(ctx context.Context, options storage.ObservationOptions) (storage.FileObservation, error) {
+	ctx, done, err := f.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.FileObservation{}, err
 	}
-	if err == nil {
+	defer done()
+	return f.native.Stat(ctx, options)
+}
+
+func (f *openFile) ListAt(ctx context.Context, request storage.DirectoryPageRequest) (storage.DirectoryPage, error) {
+	ctx, done, err := f.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.DirectoryPage{}, err
+	}
+	defer done()
+	return f.native.ListAt(ctx, request)
+}
+
+func (f *openFile) SetAttr(ctx context.Context, request storage.AttrChange, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := f.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	return f.native.SetAttr(ctx, request, id)
+}
+
+func (f *openFile) SetKind(ctx context.Context, request storage.SetKindRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := f.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	return f.native.SetKind(ctx, request, id)
+}
+
+func (f *openFile) Rename(ctx context.Context, request storage.RenameRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := f.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	result, err := f.native.Rename(ctx, request, id)
+	f.session.storage.sweepAfterMutation()
+	return result, err
+}
+
+func (f *openFile) ReplaceClaim(ctx context.Context, claim storage.AccessClaim, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := f.begin(ctx, fileControlOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	return f.native.ReplaceClaim(ctx, claim, id)
+}
+
+func (f *openFile) PrepareRemoval(ctx context.Context, request storage.PrepareRemovalRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := f.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	return f.native.PrepareRemoval(ctx, request, id)
+}
+
+func (f *openFile) DrainEntry(ctx context.Context, request storage.DrainEntryRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := f.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	return f.native.DrainEntry(ctx, request, id)
+}
+
+func (f *openFile) CancelDrain(ctx context.Context, request storage.CancelDrainRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := f.begin(ctx, fileCleanupOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	return f.native.CancelDrain(ctx, request, id)
+}
+
+func (f *openFile) ReplaceRanges(ctx context.Context, request storage.RangeReplaceRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := f.begin(ctx, fileRangeOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	return f.native.ReplaceRanges(ctx, request, id)
+}
+
+func (f *openFile) WaitRanges(ctx context.Context, request storage.RangeWaitRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := f.begin(ctx, fileWaitOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	return f.native.WaitRanges(ctx, request, id)
+}
+
+func (f *openFile) RangeSnapshot(ctx context.Context, owner storage.RangeOwnerID, scope storage.RangeScope) (storage.RangeSnapshot, error) {
+	ctx, done, err := f.begin(ctx, fileRangeOperation)
+	if err != nil {
+		return storage.RangeSnapshot{}, err
+	}
+	defer done()
+	return f.native.RangeSnapshot(ctx, owner, scope)
+}
+
+func (f *openFile) Close(ctx context.Context, id storage.FileActionID) (receipt storage.FileActionReceipt, err error) {
+	if _, err := id.Epoch(); err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	f.session.mu.Lock()
+	closed := f.closed || f.session.closed
+	f.session.mu.Unlock()
+	if closed {
+		return storage.FileActionReceipt{Operation: storage.OpFileClose, State: storage.FileActionRetired, Reference: f.Reference()}, nil
+	}
+	ctx, done, err := f.session.begin(ctx, fileCleanupOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	select {
+	case <-f.closePermit:
+		defer func() { f.closePermit <- struct{}{} }()
+	case <-ctx.Done():
+		return storage.FileActionReceipt{}, beforeFileAdmission(ctx.Err())
+	}
+	admitted, proceed, err := f.native.BeginClose(ctx, id)
+	if !proceed || err != nil {
+		if err == nil && admitted.Reference == f.Reference() && admitted.Errno == 0 && (admitted.State == storage.FileActionRetired || admitted.State == storage.FileActionCompleted && admitted.Effects&storage.EffectReferenceRetired != 0) {
+			f.session.mu.Lock()
+			if !f.active {
+				f.closed = true
+				delete(f.session.files, f.Reference())
+			}
+			f.session.mu.Unlock()
+		}
+		return admitted, err
+	}
+	defer func() { err = afterFileAdmission(err) }()
+	f.session.mu.Lock()
+	f.active = false
+	idle := f.idle
+	f.session.mu.Unlock()
+	select {
+	case <-idle:
+	case <-ctx.Done():
+		return admitted, ctx.Err()
+	}
+	cleanup, cancel := f.session.cleanupOperation(ctx)
+	stop := context.AfterFunc(ctx, cancel)
+	result, err := f.native.Close(cleanup, id)
+	stop()
+	cancel()
+	if (result.State == storage.FileActionCompleted || result.State == storage.FileActionRetired) && result.Errno == 0 {
 		f.session.mu.Lock()
-		delete(f.session.files, f)
+		f.closed = true
+		delete(f.session.files, f.Reference())
 		f.session.mu.Unlock()
 		f.session.storage.sweepAfterMutation()
 	}
-	f.closeMu.Lock()
-	f.closeErr = err
-	close(f.closeDone)
-	f.closeMu.Unlock()
+	return result, err
 }
 
-func (f *openFile) Close(ctx context.Context) error {
-	done := f.startClose()
-	select {
-	case <-done:
-		f.closeMu.Lock()
-		defer f.closeMu.Unlock()
-		return f.closeErr
-	case <-ctx.Done():
-		return ctx.Err()
+func (f *openFile) CheckObservation(ctx context.Context, condition storage.ObservationCondition) (storage.FileObservation, error) {
+	ctx, done, err := f.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.FileObservation{}, err
 	}
+	defer done()
+	return f.native.CheckObservation(ctx, condition)
+}
+
+func (f *openFile) CancelPrepared(ctx context.Context, intent storage.RemovalIntentID, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := f.begin(ctx, fileCleanupOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	return f.native.CancelPrepared(ctx, intent, id)
+}
+
+func (f *openFile) RetireRangeOwner(ctx context.Context, owner storage.RangeOwnerID, scope storage.RangeScope, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := f.begin(ctx, fileCleanupOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	return f.native.RetireRangeOwner(ctx, owner, scope, id)
+}
+
+func (f *openFile) LookupAt(ctx context.Context, name []byte) (storage.EntryLookup, error) {
+	ctx, done, err := f.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.EntryLookup{}, err
+	}
+	defer done()
+	return f.native.LookupAt(ctx, name)
 }

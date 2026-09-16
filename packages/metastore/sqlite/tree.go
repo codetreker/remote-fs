@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io/fs"
+	"math"
 	"strings"
 	"syscall"
 	"time"
@@ -17,85 +17,6 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
-
-// nodeColumns is every column of a node, in the order nodeScan reads them. Queries that
-// join entries to nodes alias the node table `n`.
-const nodeColumns = `n.id, n.mode, n.size, n.atime_sec, n.atime_nsec, n.mtime_sec, n.mtime_nsec, n.content`
-
-// nodeAttrColumns omits content for bounded directory enumeration. A listing exposes Attr,
-// and loading a content key before the caller reserves an entry would defeat its byte bound.
-const nodeAttrColumns = `n.id, n.mode, n.size, n.atime_sec, n.atime_nsec, n.mtime_sec, n.mtime_nsec`
-
-// scanner is what a *sql.Row and a *sql.Rows have in common, so that one node reader serves
-// both the single lookups and the listing.
-type scanner interface{ Scan(dest ...any) error }
-
-// nodeScan holds a node's columns as the database spells them.
-//
-// It exists because Scan takes a whole row at once: a query that puts the name or the parent
-// in front of a node's columns cannot delegate to a reader that only knows about the node,
-// and three copies of the same eight-column scan are three places for the column order to
-// drift away from nodeColumns.
-type nodeScan struct {
-	id                 int64
-	mode               int64
-	size               int64
-	atimeSec, mtimeSec int64
-	atimeNsec          int32
-	mtimeNsec          int32
-	content            sql.NullString
-}
-
-type nodeAttrScan struct {
-	id                 int64
-	mode               int64
-	size               int64
-	atimeSec, mtimeSec int64
-	atimeNsec          int32
-	mtimeNsec          int32
-}
-
-func (s *nodeAttrScan) fields() []any {
-	return []any{&s.id, &s.mode, &s.size, &s.atimeSec, &s.atimeNsec, &s.mtimeSec, &s.mtimeNsec}
-}
-
-func (s *nodeAttrScan) attr() storage.Attr {
-	return storage.Attr{
-		ID:         uint64(s.id),
-		Mode:       fs.FileMode(s.mode),
-		Size:       s.size,
-		AccessTime: sqlvalue.LoadedTime(s.atimeSec, s.atimeNsec),
-		ModTime:    sqlvalue.LoadedTime(s.mtimeSec, s.mtimeNsec),
-	}
-}
-
-// fields are the destinations for nodeColumns, in that order.
-func (s *nodeScan) fields() []any {
-	return []any{&s.id, &s.mode, &s.size, &s.atimeSec, &s.atimeNsec, &s.mtimeSec, &s.mtimeNsec, &s.content}
-}
-
-// node renders what was scanned. content is NULL for a directory and for a file that has
-// never been written, and both of those are the empty Key: the contract has one absence, not
-// two.
-func (s *nodeScan) node() metastore.Node {
-	return metastore.Node{
-		ID:         s.id,
-		Mode:       fs.FileMode(s.mode),
-		Size:       s.size,
-		AccessTime: sqlvalue.LoadedTime(s.atimeSec, s.atimeNsec),
-		ModTime:    sqlvalue.LoadedTime(s.mtimeSec, s.mtimeNsec),
-		Content:    metastore.Key(s.content.String),
-	}
-}
-
-// scanNode reads one node's columns.
-func scanNode(row scanner) (metastore.Node, error) {
-	var node nodeScan
-	if err := row.Scan(node.fields()...); err != nil {
-		return metastore.Node{}, err
-	}
-	return node.node(), nil
-}
 
 // rootNode reads the directory the volume starts from. It is a node nobody made, and
 // nothing removes or replaces it.
@@ -189,7 +110,7 @@ func (s *Store) Stat(ctx context.Context, path string) (metastore.Node, error) {
 		found, err := s.resolve(ctx, tx, cleaned)
 		node = found
 		if err == nil && checkingIO {
-			return s.checkWindowsIOLocked(node.ID, 0, node.Size, operation)
+			return s.checkFileIOLocked(ctx, tx, node.ID, node.Size, operation)
 		}
 		return err
 	}); err != nil {
@@ -260,14 +181,15 @@ func (s *Store) ListBounded(ctx context.Context, path string, result *storage.Li
 }
 
 type reservedChild struct {
-	node        int64
-	nameBytes   int64
-	reservation *storage.ListReservation
+	node          int64
+	nameBytes     int64
+	metadataBytes int64
+	reservation   *storage.ListReservation
 }
 
 func (s *Store) listChildrenBounded(ctx context.Context, tx *sql.Tx, parent int64, result *storage.ListResult) error {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT length(CAST(e.name AS BLOB)), `+nodeAttrColumns+` FROM entries e JOIN nodes n ON n.id = e.node
+		`SELECT length(CAST(e.name AS BLOB)), `+nodeMetadataColumns+`,`+nodePayloadLengths+` FROM entries e JOIN nodes n ON n.id = e.node
 		 WHERE e.volume = ? AND e.parent = ? ORDER BY e.name`,
 		s.volume, parent)
 	if err != nil {
@@ -277,18 +199,24 @@ func (s *Store) listChildrenBounded(ctx context.Context, tx *sql.Tx, parent int6
 	for rows.Next() {
 		var (
 			nameBytes int64
-			node      nodeAttrScan
+			node      nodeMetadataScan
 		)
 		if err := rows.Scan(append([]any{&nameBytes}, node.fields()...)...); err != nil {
 			rows.Close()
 			return err
 		}
-		reservation, err := result.Reserve(nameBytes, node.attr())
+		value, err := node.node()
+		attr := value.Attr()
 		if err != nil {
 			rows.Close()
 			return err
 		}
-		reserved = append(reserved, reservedChild{node: node.id, nameBytes: nameBytes, reservation: reservation})
+		reservation, err := result.Reserve(nameBytes, node.metadataBytes, attr)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		reserved = append(reserved, reservedChild{node: node.id, nameBytes: nameBytes, metadataBytes: node.metadataBytes, reservation: reservation})
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -303,7 +231,15 @@ func (s *Store) listChildrenBounded(ctx context.Context, tx *sql.Tx, parent int6
 		if err != nil {
 			return err
 		}
-		if err := child.reservation.Commit(name); err != nil {
+		var encoded []byte
+		if err := tx.QueryRowContext(ctx, `SELECT metadata FROM nodes WHERE volume=? AND id=? AND length(metadata)=?`, s.volume, child.node, child.metadataBytes).Scan(&encoded); err != nil {
+			return err
+		}
+		metadata, err := storage.DecodeMetadata(encoded)
+		if err != nil {
+			return err
+		}
+		if err := child.reservation.Commit(name, metadata); err != nil {
 			return err
 		}
 	}
@@ -366,7 +302,11 @@ func (s *Store) visitChildren(ctx context.Context, tx *sql.Tx, parent int64, add
 		if err := rows.Scan(append([]any{&name}, node.fields()...)...); err != nil {
 			return err
 		}
-		if err := add(metastore.Child{Name: name, Node: node.node()}); err != nil {
+		value, err := node.node()
+		if err != nil {
+			return err
+		}
+		if err := add(metastore.Child{Name: name, Node: value}); err != nil {
 			return err
 		}
 	}
@@ -375,9 +315,8 @@ func (s *Store) visitChildren(ctx context.Context, tx *sql.Tx, parent int64, add
 
 // SetAttr applies the attributes a change names and leaves the rest alone.
 //
-// Only the named columns are written, which is what keeps a mode change from disturbing the
-// times and a time change from disturbing the mode. A kernel sends the two as separate
-// requests, and neither may clear what the other set.
+// Metadata replacement checks its observed revision. Time-only changes preserve
+// every opaque value and advance the same metadata revision.
 func (s *Store) SetAttr(ctx context.Context, path string, change storage.AttrChange) error {
 	if err := change.Check(); err != nil {
 		return pathError("setattr", path, err)
@@ -396,6 +335,9 @@ func (s *Store) SetAttr(ctx context.Context, path string, change storage.AttrCha
 		// Nothing was written, so nothing is recorded. An event carrying a node identical to
 		// the one every replica already holds would still cost a position and a slot in the
 		// retention window, and a caller sending empty changes would push real events out of it.
+		if change.ExpectedRevision != 0 && change.ExpectedRevision != node.MetadataRevision {
+			return syscall.EAGAIN
+		}
 		if change.Empty() {
 			return nil
 		}
@@ -410,47 +352,71 @@ func (s *Store) SetAttr(ctx context.Context, path string, change storage.AttrCha
 }
 
 func applyChange(ctx context.Context, tx *sql.Tx, node metastore.Node, change storage.AttrChange) error {
-	var (
-		columns []string
-		args    []any
-	)
-	if change.Mode != nil {
-		// The type bits are kept and the settable ones replaced: a directory does not become
-		// a file by being chmod-ed, and Check has already refused a change naming a kind.
-		// The three special bits travel in storage.SettableMode with the permission bits, so
-		// setuid, setgid and sticky are set and cleared here like any other bit.
-		mode := node.Mode&^storage.SettableMode | *change.Mode&storage.SettableMode
-		columns = append(columns, "mode = ?")
-		args = append(args, int64(mode))
+	if err := change.Check(); err != nil {
+		return err
 	}
-	if change.AccessTime != nil {
-		sec, nsec := sqlvalue.StoredTime(*change.AccessTime)
-		columns = append(columns, "atime_sec = ?", "atime_nsec = ?")
-		args = append(args, sec, nsec)
+	if change.ExpectedRevision != 0 && change.ExpectedRevision != node.MetadataRevision {
+		return syscall.EAGAIN
 	}
-	if change.ModTime != nil {
-		sec, nsec := sqlvalue.StoredTime(*change.ModTime)
-		columns = append(columns, "mtime_sec = ?", "mtime_nsec = ?")
-		args = append(args, sec, nsec)
+	if change.Empty() {
+		return nil
 	}
-	args = append(args, node.ID)
-	_, err := tx.ExecContext(ctx, `UPDATE nodes SET `+strings.Join(columns, ", ")+` WHERE id = ?`, args...)
-	return err
+	if node.MetadataRevision >= math.MaxInt64 {
+		return syscall.EOVERFLOW
+	}
+	columns := []string{"metadata_revision=metadata_revision+1"}
+	args := []any{}
+	if change.Metadata != nil {
+		metadata, err := storage.EncodeMetadata(*change.Metadata)
+		if err != nil {
+			return err
+		}
+		columns = append(columns, "metadata=?")
+		args = append(args, metadata)
+	}
+	changed := time.Now()
+	if change.ChangeTime != nil {
+		changed = *change.ChangeTime
+	}
+	times := []struct {
+		prefix string
+		value  *time.Time
+	}{{"atime", change.AccessTime}, {"mtime", change.ModTime}, {"creation", change.CreationTime}, {"change", &changed}}
+	for _, field := range times {
+		if field.value != nil {
+			sec, nsec := sqlvalue.StoredTime(*field.value)
+			columns = append(columns, field.prefix+"_sec=?", field.prefix+"_nsec=?")
+			args = append(args, sec, nsec)
+		}
+	}
+	args = append(args, node.ID, int64(node.MetadataRevision))
+	result, err := tx.ExecContext(ctx, `UPDATE nodes SET `+strings.Join(columns, ",")+` WHERE id=? AND metadata_revision=?`, args...)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return syscall.ESTALE
+	}
+	return nil
 }
 
 // Create records an empty file. It references no object, because zero bytes are worth no
 // round trip to an object store.
 func (s *Store) Create(ctx context.Context, path string) error {
-	return s.makeNode(ctx, "create", path, fileMode)
+	return s.makeNode(ctx, "create", path, storage.NodeRegular)
 }
 
 func (s *Store) Mkdir(ctx context.Context, path string) error {
-	return s.makeNode(ctx, "mkdir", path, fs.ModeDir|dirMode)
+	return s.makeNode(ctx, "mkdir", path, storage.NodeDirectory)
 }
 
-// makeNode records a new node of the given mode, failing with EEXIST if anything is already
+// makeNode records a new node of the given kind, failing with EEXIST if anything is already
 // at the name.
-func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode) error {
+func (s *Store) makeNode(ctx context.Context, op, path string, kind storage.NodeKind) error {
 	cleaned, err := storage.CleanPath(path)
 	if err != nil {
 		return pathError(op, path, err)
@@ -471,9 +437,9 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-			VALUES (?, ?, ?, 0, ?, ?, ?, ?, NULL)`,
-			id, s.volume, int64(mode), sec, nsec, sec, nsec); err != nil {
+			INSERT INTO nodes (id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,creation_sec,creation_nsec,change_sec,change_nsec,metadata_revision,directory_revision,metadata,link_target,content)
+ VALUES (?,?,?,0,?,?,?,?,?,?,?,?,1,?,X'52464d010000',X'',NULL)`,
+			id, s.volume, int64(kind), sec, nsec, sec, nsec, sec, nsec, sec, nsec, directoryInitialRevision(kind)); err != nil {
 			return err
 		}
 		if err := s.link(ctx, tx, parent.ID, name, id); err != nil {
@@ -482,7 +448,7 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 		if err := s.recordCreated(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, id); err != nil {
 			return err
 		}
-		return s.touch(ctx, tx, parent.ID, now)
+		return s.touch(ctx, tx, parent.ID, now, parent)
 	}); err != nil {
 		return pathError(op, path, sqlerr.Failure(err))
 	}
@@ -491,29 +457,57 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 
 // link puts a name in a directory. A name already there is EEXIST, which the primary key is
 // what decides — so two writers racing for one name cannot both be told they made it.
+func directoryInitialRevision(kind storage.NodeKind) int64 {
+	if kind == storage.NodeDirectory {
+		return 1
+	}
+	return 0
+}
+
+func (s *Store) bumpDirectoryRevision(ctx context.Context, tx *sql.Tx, id int64) error {
+	result, err := tx.ExecContext(ctx, `UPDATE nodes SET directory_revision=directory_revision+1 WHERE volume=? AND id=? AND kind=? AND directory_revision<?`, s.volume, id, int64(storage.NodeDirectory), int64(math.MaxInt64))
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return syscall.EOVERFLOW
+	}
+	return nil
+}
+
 func (s *Store) link(ctx context.Context, tx *sql.Tx, parent int64, name []byte, node int64) error {
-	if err := s.checkWindowsParentLocked(parent); err != nil {
+	if err := s.checkParentEntriesActive(ctx, tx, parent); err != nil {
 		return err
 	}
-	if err := s.windowsNameAllowed(ctx, tx, parent, name, 0); err != nil {
+	entry, err := dbstate.AllocateEntryID(ctx, tx)
+	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO entries (volume, parent, name, node) VALUES (?, ?, ?, ?)`,
-		s.volume, parent, name, node); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO entries(volume,parent,name,node,id) VALUES(?,?,?,?,?)`, s.volume, parent, name, node, entry); err != nil {
 		if sqlerr.IsUniqueViolation(err) {
 			return syscall.EEXIST
 		}
 		return err
 	}
-	sec, nsec := sqlvalue.StoredTime(time.Now())
-	_, err := tx.ExecContext(ctx, `UPDATE nodes SET windows_creation_sec=?,windows_creation_nsec=?,windows_change_sec=?,windows_change_nsec=? WHERE volume=? AND id=?`, sec, nsec, sec, nsec, s.volume, node)
-	return err
+	return s.bumpDirectoryRevision(ctx, tx, parent)
 }
-
 func (s *Store) unlink(ctx context.Context, tx *sql.Tx, parent int64, name []byte) error {
-	_, err := tx.ExecContext(ctx, `DELETE FROM entries WHERE volume = ? AND parent = ? AND name = ?`,
-		s.volume, parent, name)
-	return err
+	result, err := tx.ExecContext(ctx, `DELETE FROM entries WHERE volume=? AND parent=? AND name=?`, s.volume, parent, name)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return syscall.ENOENT
+	}
+	return s.bumpDirectoryRevision(ctx, tx, parent)
 }
 
 // touch records that a directory's contents changed. A directory's modification time is the
@@ -525,10 +519,13 @@ func (s *Store) unlink(ctx context.Context, tx *sql.Tx, parent int64, name []byt
 // it: a modification time that moved without an event stays frozen at whatever the snapshot
 // caught, and a build tool comparing a directory against its contents would read a time that
 // stopped being true, with nothing behind it to correct the answer.
-func (s *Store) touch(ctx context.Context, tx *sql.Tx, id int64, at time.Time) error {
+func (s *Store) touch(ctx context.Context, tx *sql.Tx, id int64, at time.Time, observed ...metastore.Node) error {
 	before, err := nodeByID(ctx, tx, id)
 	if err != nil {
 		return err
+	}
+	if len(observed) > 0 {
+		before = observed[0]
 	}
 	sec, nsec := sqlvalue.StoredTime(at)
 	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET mtime_sec = ?, mtime_nsec = ? WHERE id = ?`,
@@ -585,7 +582,7 @@ func (s *Store) Remove(ctx context.Context, path string) error {
 		if err := s.discard(ctx, tx, node); err != nil {
 			return err
 		}
-		return s.touch(ctx, tx, parent.ID, time.Now())
+		return s.touch(ctx, tx, parent.ID, time.Now(), parent)
 	}); err != nil {
 		return pathError("unlink", path, sqlerr.Failure(err))
 	}
@@ -634,7 +631,7 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 		if err := s.discard(ctx, tx, node); err != nil {
 			return err
 		}
-		return s.touch(ctx, tx, parent.ID, time.Now())
+		return s.touch(ctx, tx, parent.ID, time.Now(), parent)
 	}); err != nil {
 		return pathError("rmdir", path, sqlerr.Failure(err))
 	}
@@ -705,7 +702,7 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 	if err != nil {
 		return err
 	}
-	if err := s.checkWindowsParentLocked(toParent.ID); err != nil {
+	if err := s.checkParentEntriesActive(ctx, tx, toParent.ID); err != nil {
 		return err
 	}
 	displaced, occupied, err := s.lookup(ctx, tx, toParent.ID, toName)
@@ -754,13 +751,8 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 		}
 	}
 
-	if err := s.windowsNameAllowed(ctx, tx, toParent.ID, toName, moving.ID); err != nil {
-		return err
-	}
-
-	if err := s.recordRenamed(ctx, tx,
-		metastore.Location{Parent: toParent.ID, Name: toName},
-		metastore.Location{Parent: fromParent.ID, Name: fromName}, moving); err != nil {
+	before, err := s.captureEventImage(ctx, tx, moving)
+	if err != nil {
 		return err
 	}
 
@@ -770,12 +762,23 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 		return err
 	}
 
+	if err := s.bumpDirectoryRevision(ctx, tx, fromParent.ID); err != nil {
+		return err
+	}
+	if toParent.ID != fromParent.ID {
+		if err := s.bumpDirectoryRevision(ctx, tx, toParent.ID); err != nil {
+			return err
+		}
+	}
+	if err := s.recordRenamed(ctx, tx, before, moving.ID); err != nil {
+		return err
+	}
 	now := time.Now()
-	if err := s.touch(ctx, tx, fromParent.ID, now); err != nil {
+	if err := s.touch(ctx, tx, fromParent.ID, now, fromParent); err != nil {
 		return err
 	}
 	if toParent.ID == fromParent.ID {
 		return nil
 	}
-	return s.touch(ctx, tx, toParent.ID, now)
+	return s.touch(ctx, tx, toParent.ID, now, toParent)
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -382,7 +381,7 @@ func TestSQLitePublicationRejectsAnonymousMutationOfGrantedFiles(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, operation := range []string{"commit", "mode", "access time", "modification time", "empty attributes", "remove", "rename source", "rename destination", "self rename"} {
+		for _, operation := range []string{"commit", "metadata", "access time", "modification time", "empty attributes", "remove", "rename source", "rename destination", "self rename"} {
 			t.Run(string(mode)+"/"+operation, func(t *testing.T) {
 				before, err := f.store.List(t.Context(), "")
 				if err != nil {
@@ -398,13 +397,13 @@ func TestSQLitePublicationRejectsAnonymousMutationOfGrantedFiles(t *testing.T) {
 				if space != pristineSpace {
 					t.Fatalf("previous rejection changed the shared quota fixture: got %+v, want %+v", space, pristineSpace)
 				}
-				permission := fs.FileMode(0o600)
+				metadata := storage.Metadata{{Key: "application", Version: 1, Data: []byte("private")}}
 				at := time.Unix(1_800_000_000, 0)
 				switch operation {
 				case "commit":
 					err = f.store.Commit(t.Context(), "locked", object)
-				case "mode":
-					err = f.store.SetAttr(t.Context(), "locked", storage.AttrChange{Mode: &permission})
+				case "metadata":
+					err = f.store.SetAttr(t.Context(), "locked", storage.AttrChange{ExpectedRevision: f.node(t, "locked").MetadataRevision, Metadata: &metadata})
 				case "access time":
 					err = f.store.SetAttr(t.Context(), "locked", storage.AttrChange{AccessTime: &at})
 				case "modification time":
@@ -541,7 +540,7 @@ func TestSQLitePublicationChecksProofsEvenForNoOpMutations(t *testing.T) {
 					}
 				} else {
 					requirePublicationCode(t, err, want)
-					if after := f.node(t, "file"); after != before {
+					if after := f.node(t, "file"); !reflect.DeepEqual(after, before) {
 						t.Fatal("a denied proof changed the file")
 					}
 				}
@@ -555,15 +554,15 @@ func TestSQLitePublicationAuthorizesExplicitAttributes(t *testing.T) {
 	f.put(t, t.Context(), "file", 3)
 	owner := f.owner(t)
 	grant := f.grant(t, owner, "file", locking.Exclusive)
-	mode := fs.FileMode(0o600)
+	metadata := storage.Metadata{{Key: "application", Version: 1, Data: []byte("private")}}
 	atime, mtime := time.Unix(1_800_000_000, 3), time.Unix(1_800_000_001, 4)
 	if err := f.store.SetAttr(publicationScope(t.Context(), owner, grant), "file", storage.AttrChange{
-		Mode: &mode, AccessTime: &atime, ModTime: &mtime,
+		ExpectedRevision: f.node(t, "file").MetadataRevision, Metadata: &metadata, AccessTime: &atime, ModTime: &mtime,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	node := f.node(t, "file")
-	if node.Mode != mode || !node.AccessTime.Equal(atime) || !node.ModTime.Equal(mtime) {
+	if !reflect.DeepEqual(node.Metadata, metadata) || !node.AccessTime.Equal(atime) || !node.ModTime.Equal(mtime) {
 		t.Fatal("authorized attribute mutation did not preserve its supplied values")
 	}
 }
@@ -609,7 +608,7 @@ func TestSQLitePublicationRenameRequiresBothTargetsAndRetiresOnlyTheDisplacedFil
 	for _, grant := range []locking.GrantRef{sourceGrant, destinationGrant} {
 		err := f.store.Rename(publicationScope(t.Context(), owner, grant), "source", "destination")
 		requirePublicationCode(t, err, locking.Conflict)
-		if f.node(t, "source") != source || f.node(t, "destination") != destination {
+		if !reflect.DeepEqual(f.node(t, "source"), source) || !reflect.DeepEqual(f.node(t, "destination"), destination) {
 			t.Fatal("rename with a missing target proof changed the volume")
 		}
 	}
@@ -644,11 +643,11 @@ func TestSQLiteReservationLeavesGrantEnforcementAtCommit(t *testing.T) {
 	grant := f.grant(t, owner, "file", locking.Exclusive)
 	before := f.node(t, "file")
 	object := f.stage(t, t.Context(), "file", 7)
-	if f.node(t, "file") != before {
+	if !reflect.DeepEqual(f.node(t, "file"), before) {
 		t.Fatal("reservation published the staged version")
 	}
 	requirePublicationCode(t, f.store.Commit(t.Context(), "file", object), locking.Conflict)
-	if f.node(t, "file") != before {
+	if !reflect.DeepEqual(f.node(t, "file"), before) {
 		t.Fatal("refused staged commit changed the file")
 	}
 	if _, err := f.service.Release(t.Context(), owner, grant); err != nil {
@@ -672,7 +671,7 @@ func TestSQLiteStagingDoesNotExtendAnExclusiveGrant(t *testing.T) {
 	before := f.node(t, "file")
 	f.clock.advance(11 * time.Second)
 	requirePublicationCode(t, f.store.Commit(scoped, "file", object), locking.StaleGrant)
-	if f.node(t, "file") != before {
+	if !reflect.DeepEqual(f.node(t, "file"), before) {
 		t.Fatal("a grant that expired during staging still published its object")
 	}
 	if err := f.store.Commit(t.Context(), "file", object); err != nil {
@@ -717,12 +716,17 @@ func TestSQLiteStagedCommitChecksTheActualPublicationTarget(t *testing.T) {
 	if err := f.store.Rename(t.Context(), "file", "moved"); err != nil {
 		t.Fatal(err)
 	}
+	moved := f.node(t, "moved")
+	if moved.ID != original.ID {
+		t.Fatal("rename changed node identity")
+	}
+	original = moved
 	f.put(t, t.Context(), "file", 5)
 	owner := f.owner(t)
 	grant := f.grant(t, owner, "file", locking.Exclusive)
 	replacement := f.node(t, "file")
 	requirePublicationCode(t, f.store.Commit(t.Context(), "file", object), locking.Conflict)
-	if f.node(t, "file") != replacement || f.node(t, "moved") != original {
+	if !reflect.DeepEqual(f.node(t, "file"), replacement) || !reflect.DeepEqual(f.node(t, "moved"), original) {
 		t.Fatal("staged commit affected a file before acquiring final target authorization")
 	}
 	if err := f.store.Commit(publicationScope(t.Context(), owner, grant), "file", object); err != nil {
@@ -731,7 +735,7 @@ func TestSQLiteStagedCommitChecksTheActualPublicationTarget(t *testing.T) {
 	if got := f.node(t, "file"); got.ID != replacement.ID || got.Content != object.Key || got.Size != 7 {
 		t.Fatal("commit did not publish through the actual target's exclusive grant")
 	}
-	if f.node(t, "moved") != original {
+	if !reflect.DeepEqual(f.node(t, "moved"), original) {
 		t.Fatal("staged commit followed the old target to its new name")
 	}
 }
@@ -892,7 +896,7 @@ func TestSQLitePublicationPreparationFailurePreservesReservationAndGrant(t *test
 	if prepared != 1 {
 		t.Fatalf("accounting preparation ran %d times, want once", prepared)
 	}
-	if f.node(t, "file") != before {
+	if !reflect.DeepEqual(f.node(t, "file"), before) {
 		t.Fatal("refused preparation changed the node or its object binding")
 	}
 	afterObjects, err := f.store.ObjectStatus(t.Context())
@@ -934,7 +938,7 @@ func TestSQLitePublicationRejectsConflictBeforeAccounting(t *testing.T) {
 	if prepared != 0 || settled != 0 {
 		t.Fatalf("conflicting mutation reached accounting: prepared=%d settled=%d", prepared, settled)
 	}
-	if f.node(t, "file") != before {
+	if !reflect.DeepEqual(f.node(t, "file"), before) {
 		t.Fatal("conflicting mutation changed the node or its object binding")
 	}
 }

@@ -283,12 +283,12 @@ type observedFlockStorage struct {
 	gate *flockReleaseGate
 }
 
-func (s *observedFlockStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
-	session, err := s.FileStorage.NewFileSession(ctx, options)
+func (s *observedFlockStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
+	session, status, err := s.FileStorage.NewFileSession(ctx, options)
 	if err != nil {
-		return nil, err
+		return nil, status, err
 	}
-	return &observedFlockSession{FileSession: session, gate: s.gate}, nil
+	return &observedFlockSession{FileSession: session, gate: s.gate}, status, nil
 }
 
 type observedFlockSession struct {
@@ -296,16 +296,8 @@ type observedFlockSession struct {
 	gate *flockReleaseGate
 }
 
-func (s *observedFlockSession) OpenFile(ctx context.Context, name string, options storage.FileOpenOptions) (storage.File, error) {
-	file, err := s.FileSession.OpenFile(ctx, name, options)
-	if err != nil {
-		return nil, err
-	}
-	return &observedFlockFile{File: file, gate: s.gate}, nil
-}
-
-func (s *observedFlockSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
-	file, err := s.FileSession.OpenNode(ctx, id, options)
+func (s *observedFlockSession) Reference(ctx context.Context, id storage.FileReferenceID) (storage.File, error) {
+	file, err := s.FileSession.Reference(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -317,19 +309,18 @@ type observedFlockFile struct {
 	gate *flockReleaseGate
 }
 
-func (f *observedFlockFile) SetLock(ctx context.Context, owner storage.LockOwner, lock storage.FileLock, request storage.LockRequestID) (storage.LockAttempt, error) {
-	attempt, err := f.File.SetLock(ctx, owner, lock, request)
-	if err == nil && lock.Family == storage.Flock && lock.Wait && attempt.State == storage.LockPending {
+func (f *observedFlockFile) WaitRanges(ctx context.Context, request storage.RangeWaitRequest, action storage.FileActionID) (storage.FileActionReceipt, error) {
+	if request.Scope.Domain == 0x464c4f434b && !request.Scope.Enforced {
 		select {
 		case f.gate.pending <- struct{}{}:
 		default:
 		}
 	}
-	return attempt, err
+	return f.File.WaitRanges(ctx, request, action)
 }
 
-func (f *observedFlockFile) DropLocks(ctx context.Context, owner storage.LockOwner, family storage.LockFamily) error {
-	if family == storage.Flock {
+func (f *observedFlockFile) RetireRangeOwner(ctx context.Context, owner storage.RangeOwnerID, scope storage.RangeScope, action storage.FileActionID) (storage.FileActionReceipt, error) {
+	if scope.Domain == 0x464c4f434b && !scope.Enforced {
 		select {
 		case f.gate.entered <- struct{}{}:
 		default:
@@ -337,10 +328,10 @@ func (f *observedFlockFile) DropLocks(ctx context.Context, owner storage.LockOwn
 		select {
 		case <-f.gate.release:
 		case <-ctx.Done():
-			return ctx.Err()
+			return storage.FileActionReceipt{}, ctx.Err()
 		}
 	}
-	return f.File.DropLocks(ctx, owner, family)
+	return f.File.RetireRangeOwner(ctx, owner, scope, action)
 }
 
 func TestAdvisoryFlockLastDuplicateAcrossForkControlsRelease(t *testing.T) {

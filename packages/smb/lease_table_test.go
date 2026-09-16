@@ -12,7 +12,6 @@ import (
 	"unsafe"
 
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
-	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func leaseTableRequest(version uint16, key byte) wire.LeaseRequest {
@@ -159,7 +158,7 @@ func TestLeaseTableReservesBeforeCopyAndTrimsOnlyAfterAssociation(t *testing.T) 
 	limits.MaxOpens = 2
 	identity := leaseIdentity{Volume: "volume", NodeID: 7, Name: "f"}
 	req := leaseTableRequest(wire.LeaseVersion2, 1)
-	full := 2*int64(storage.WindowsMaxNameInfoBytes) + int64(len(identity.Volume)) + leaseReservationFixed
+	full := 2*int64(windowsMaxPathBytes) + int64(len(identity.Volume)) + leaseReservationFixed
 	limits.MaxDirectoryBytes = full - 1
 	table := newLeaseTable(limits)
 	if _, err := table.begin(t.Context(), [16]byte{}, req, identity.Volume, identity.Name); !errors.Is(err, syscall.ENOMEM) {
@@ -341,7 +340,7 @@ func TestLeaseTableOversizedCanonicalResultRetainsItsCleanupOwner(t *testing.T) 
 	identity := leaseIdentity{Volume: "volume", NodeID: 7, Name: "file"}
 	a := leaseTableBegin(t, table, leaseTableRequest(wire.LeaseVersion2, 1), identity)
 	slots, bytes := table.counts()
-	identity.Name = strings.Repeat("x", storage.WindowsMaxNameInfoBytes+1)
+	identity.Name = strings.Repeat("x", windowsMaxPathBytes+1)
 	if ref, _, err := a.commit(identity, false); !errors.Is(err, syscall.EIO) || ref != nil {
 		t.Fatalf("oversized result accepted: %v", err)
 	}

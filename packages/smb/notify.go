@@ -7,10 +7,10 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"unicode/utf8"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // ChangeStream delivers an ordered, gap-checked history. Close must unblock Next.
@@ -40,27 +40,73 @@ type notificationIdentity struct {
 }
 
 type notifyGroup struct {
-	position metastore.Position
-	events   []wire.Notification
-	bytes    int64
+	position  metastore.Position
+	events    []wire.Notification
+	proofs    []storage.EntryLocation
+	wireBytes int64
+	bytes     int64
 }
 
 type directoryWatcher struct {
-	id        int64
-	filter    uint32
-	recursive bool
-	ready     bool
-	barrier   metastore.Position
-	groups    []notifyGroup
-	bytes     int64
-	events    int
-	failure   error
-	waiters   []*notifyWaiter
+	id         int64
+	filter     uint32
+	recursive  bool
+	ready      bool
+	barrier    metastore.Position
+	groups     []notifyGroup
+	bytes      int64
+	events     int
+	failure    error
+	waiters    []*notifyWaiter
+	generation uint64
+	validating bool
+	removed    bool
 }
 
 type notifyWaiter struct {
 	wake    chan struct{}
 	failure error
+}
+
+func (w *directoryWatcher) clearGroups() {
+	clear(w.groups)
+	w.groups = nil
+	w.bytes = 0
+	w.events = 0
+}
+
+func (w *directoryWatcher) fail(err error) {
+	w.failure = err
+	w.ready = false
+	w.generation++
+	// Validation borrows these immutable groups outside the manager lock. Their
+	// storage remains charged until the validator releases its references.
+	if !w.validating {
+		w.clearGroups()
+	}
+}
+
+func (w *directoryWatcher) deliverFailure() error {
+	err := w.failure
+	w.failure = nil
+	w.ready = false
+	w.clearGroups()
+	for _, waiter := range w.waiters[1:] {
+		waiter.failure = err
+	}
+	return err
+}
+
+func notificationImageRelevant(image *metastore.EventImage, id int64, recursive bool) bool {
+	if image == nil || image.Location.State != storage.LocationLinked {
+		return false
+	}
+	for i, entry := range image.Location.Ancestors {
+		if entry.ParentID == uint64(id) {
+			return recursive || i == len(image.Location.Ancestors)-1
+		}
+	}
+	return false
 }
 
 type notificationManager struct {
@@ -195,45 +241,54 @@ func (m *notificationManager) consume(stream ChangeStream) {
 		if err != nil {
 			m.failure = err
 			for _, w := range m.watchers {
-				clear(w.groups)
-				w.groups = nil
-				w.bytes = 0
-				w.events = 0
-				w.ready = false
+				failure := err
 				if errors.Is(err, syscall.ESTALE) {
-					w.failure = ErrNotifyRescan
-				} else {
-					w.failure = err
+					failure = ErrNotifyRescan
 				}
+				w.fail(failure)
 			}
 			m.signalLocked()
 			m.mu.Unlock()
 			return
 		}
 		for _, w := range m.watchers {
-			if w.failure != nil || (w.ready && change.Position <= w.barrier) {
+			if w.removed || w.failure != nil || (w.ready && change.Position <= w.barrier) {
 				continue
 			}
 			events, mapErr := mapNotifications(change, w.id, w.filter, w.recursive)
 			if mapErr != nil {
-				w.failure = mapErr
+				w.fail(mapErr)
 				continue
 			}
 			if len(events) == 0 {
 				continue
 			}
-			size := int64(len(wire.NotifyInformation(events)))
-			if w.events+len(events) > m.limits.MaxNotifyEvents || size > m.limits.MaxNotifyBytes-w.bytes {
-				clear(w.groups)
-				w.groups = nil
-				w.bytes = 0
-				w.events = 0
-				w.failure = ErrNotifyRescan
+			wireBytes := int64(len(wire.NotifyInformation(events)))
+			charge := wireBytes + 96 + 32*int64(len(events))
+			for _, event := range events {
+				charge += int64(len(event.Name))
+			}
+			for _, image := range []*metastore.EventImage{change.Notification.Before, change.Notification.After} {
+				if notificationImageRelevant(image, w.id, w.recursive) {
+					charge += 64 + 64*int64(len(image.Location.Ancestors))
+					for _, entry := range image.Location.Ancestors {
+						charge += int64(len(entry.Name))
+					}
+				}
+			}
+			if w.events+len(events) > m.limits.MaxNotifyEvents || charge > m.limits.MaxNotifyBytes-w.bytes {
+				w.fail(ErrNotifyRescan)
 				continue
 			}
-			w.groups = append(w.groups, notifyGroup{change.Position, events, size})
-			w.bytes += size
+			w.bytes += charge
 			w.events += len(events)
+			group := notifyGroup{position: change.Position, events: events, wireBytes: wireBytes, bytes: charge}
+			for _, image := range []*metastore.EventImage{change.Notification.Before, change.Notification.After} {
+				if notificationImageRelevant(image, w.id, w.recursive) {
+					group.proofs = append(group.proofs, image.Location.Clone())
+				}
+			}
+			w.groups = append(w.groups, group)
 		}
 		m.position = change.Position
 		m.signalLocked()
@@ -305,23 +360,22 @@ func (m *notificationManager) remove(reference string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if w := m.watchers[reference]; w != nil {
-		w.failure = ErrStopped
+		w.removed = true
+		w.fail(ErrStopped)
 		for _, q := range w.waiters {
 			select {
 			case q.wake <- struct{}{}:
 			default:
 			}
 		}
-		delete(m.watchers, reference)
+		if !w.validating {
+			delete(m.watchers, reference)
+		}
 	}
 }
 
-func (m *notificationManager) watch(ctx context.Context, key string, identity notificationIdentity, filter uint32, recursive bool, maxOutput uint32) ([]wire.Notification, error) {
-	return m.watchRegistered(ctx, key, identity, filter, recursive, maxOutput, nil)
-}
-
-func (m *notificationManager) watchRegistered(ctx context.Context, key string, identity notificationIdentity, filter uint32, recursive bool, maxOutput uint32, registered func() error) ([]wire.Notification, error) {
-	if filter == 0 || filter & ^uint32(0xfff) != 0 || maxOutput == 0 {
+func (m *notificationManager) watchRegistered(ctx context.Context, key string, identity notificationIdentity, filter uint32, recursive bool, maxOutput uint32, registered func() error, validate func(context.Context, storage.EntryLocation) error) ([]wire.Notification, error) {
+	if validate == nil || filter == 0 || filter & ^uint32(0xfff) != 0 || maxOutput == 0 {
 		return nil, syscall.EINVAL
 	}
 	m.setup.Lock()
@@ -332,6 +386,11 @@ func (m *notificationManager) watchRegistered(ctx context.Context, key string, i
 		return nil, ErrStopped
 	}
 	w := m.watchers[key]
+	if w != nil && w.removed {
+		m.mu.Unlock()
+		m.setup.Unlock()
+		return nil, ErrStopped
+	}
 	if w == nil && len(m.watchers) >= m.limits.MaxOpens {
 		m.mu.Unlock()
 		m.setup.Unlock()
@@ -370,7 +429,7 @@ func (m *notificationManager) watchRegistered(ctx context.Context, key string, i
 	}
 	waiter := &notifyWaiter{wake: make(chan struct{}, 1)}
 	w.waiters = append(w.waiters, waiter)
-	initialize := !w.ready && w.failure == nil
+	initialize := !w.ready && w.failure == nil && !w.validating
 	m.mu.Unlock()
 	if initialize {
 		err := m.start(ctx)
@@ -426,7 +485,7 @@ func (m *notificationManager) watchRegistered(ctx context.Context, key string, i
 	}
 	for {
 		m.mu.Lock()
-		if m.closed || m.watchers[key] != w {
+		if m.closed || w.removed || m.watchers[key] != w {
 			m.mu.Unlock()
 			return nil, ErrStopped
 		}
@@ -436,18 +495,7 @@ func (m *notificationManager) watchRegistered(ctx context.Context, key string, i
 		}
 		if w.waiters[0] == waiter {
 			if w.failure != nil {
-				err := w.failure
-				w.failure = nil
-				w.ready = false
-				clear(w.groups)
-				w.groups = nil
-				w.bytes = 0
-				w.events = 0
-				// Every request already waiting at the lost boundary receives the same
-				// failure; none can silently establish a replacement watch in its place.
-				for _, q := range w.waiters[1:] {
-					q.failure = err
-				}
+				err := w.deliverFailure()
 				m.mu.Unlock()
 				return nil, err
 			}
@@ -461,7 +509,7 @@ func (m *notificationManager) watchRegistered(ctx context.Context, key string, i
 				var outputBytes int64
 				n := 0
 				for _, g := range w.groups {
-					candidateBytes := ((outputBytes + 3) &^ 3) + g.bytes
+					candidateBytes := ((outputBytes + 3) &^ 3) + g.wireBytes
 					if uint64(candidateBytes) > uint64(maxOutput) {
 						break
 					}
@@ -470,13 +518,48 @@ func (m *notificationManager) watchRegistered(ctx context.Context, key string, i
 					n++
 				}
 				if n == 0 {
-					clear(w.groups)
-					w.groups = nil
-					w.bytes = 0
-					w.events = 0
-					w.ready = false
+					w.fail(ErrNotifyRescan)
+					err := w.deliverFailure()
 					m.mu.Unlock()
-					return nil, ErrNotifyRescan
+					return nil, err
+				}
+				generation := w.generation
+				selected := w.groups[:n]
+				w.validating = true
+				m.mu.Unlock()
+				var validationErr error
+				for _, group := range selected {
+					for _, proof := range group.proofs {
+						if validationErr = validate(ctx, proof); validationErr != nil {
+							break
+						}
+					}
+					if validationErr != nil {
+						break
+					}
+				}
+				selected = nil
+				m.mu.Lock()
+				w.validating = false
+				if m.closed || w.removed || m.watchers[key] != w {
+					w.fail(ErrStopped)
+					if m.watchers[key] == w && w.removed {
+						delete(m.watchers, key)
+					}
+				} else if w.generation != generation && w.failure == nil {
+					w.fail(ErrNotifyRescan)
+				} else if w.failure == nil {
+					if ctx.Err() != nil {
+						m.mu.Unlock()
+						return nil, ctx.Err()
+					} else if validationErr != nil {
+						w.fail(validationErr)
+					}
+				}
+				if w.failure != nil {
+					err := w.deliverFailure()
+					m.mu.Unlock()
+					return nil, err
 				}
 				for _, g := range w.groups[:n] {
 					w.bytes -= g.bytes
@@ -511,8 +594,21 @@ func mapNotifications(change metastore.Change, id int64, filter uint32, recursiv
 	if err != nil {
 		return nil, err
 	}
+	if before == "" && after == "" {
+		return nil, nil
+	}
+	var attr windowsAttr
+	for _, image := range []*metastore.EventImage{n.Before, n.After} {
+		if image == nil {
+			continue
+		}
+		attr, err = projectWindowsAttr(storage.FileObservation{Attr: image.Attr, Location: &image.Location}, windowsMetadata{})
+		if err != nil {
+			return nil, fmt.Errorf("invalid notification metadata: %w", err)
+		}
+	}
 	nameFilter := uint32(1)
-	if n.Directory {
+	if attr.DOSAttributes&dosDirectory != 0 {
 		nameFilter = 2
 	}
 	if n.ChangeMask&metastore.ChangeName != 0 {
@@ -551,29 +647,30 @@ func mapNotifications(change metastore.Change, id int64, filter uint32, recursiv
 	return nil, nil
 }
 
-func notificationPath(at *metastore.LocationFacts, id int64, recursive bool) (string, error) {
-	if at == nil {
+func notificationPath(image *metastore.EventImage, id int64, recursive bool) (string, error) {
+	if image == nil || image.Location.State != storage.LocationLinked {
 		return "", nil
 	}
+	entries := image.Location.Ancestors
 	found := -1
-	for i, ancestor := range at.Ancestors {
-		if ancestor.DirectoryID == id {
+	for i, entry := range entries {
+		if entry.ParentID == uint64(id) {
 			found = i
 			break
 		}
 	}
-	if found < 0 || (!recursive && found != len(at.Ancestors)-1) {
+	if found < 0 || (!recursive && found != len(entries)-1) {
 		return "", nil
 	}
-	names := make([]string, 0, len(at.Ancestors)-found)
-	for _, a := range at.Ancestors[found+1:] {
-		names = append(names, string(a.Name))
-	}
-	names = append(names, string(at.LeafName))
-	for _, name := range names {
-		if !utf8.ValidString(name) || strings.ContainsAny(name, "\\\x00") {
-			return "", syscall.EIO
+	parts := make([]string, len(entries))
+	for i, entry := range entries {
+		if _, err := nameKey(entry.Name); err != nil {
+			return "", fmt.Errorf("unrepresentable notification name: %w", errors.Join(syscall.EIO, err))
 		}
+		parts[i] = string(entry.Name)
 	}
-	return strings.Join(names, "\\"), nil
+	if err := validateWindowsPath(strings.Join(parts, "/")); err != nil {
+		return "", fmt.Errorf("unrepresentable notification path: %w", errors.Join(syscall.EIO, err))
+	}
+	return strings.Join(parts[found:], "\\"), nil
 }

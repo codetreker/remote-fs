@@ -19,7 +19,6 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/replicated"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 	"io"
-	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -32,7 +31,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-	"unsafe"
 )
 
 // TestMain runs the tests beneath a temporary directory of this run's own, so that a
@@ -457,113 +455,60 @@ func errnoOf(err error) syscall.Errno {
 	return 0
 }
 
-// SQLite stores regular files and directories. This metadata decorator preserves real
-// node identities and content lengths while exercising the public symbolic-link contract.
-type symlinkMetadata struct {
-	*objectstore.Storage
-	linkID uint64
-}
-
-func (s *symlinkMetadata) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
-	session, err := s.Storage.NewFileSession(ctx, options)
+func createSymlinkFixture(t *testing.T, volume storage.FileStorage, name, target string) {
+	t.Helper()
+	ctx := t.Context()
+	state, err := volume.FileState(ctx)
 	if err != nil {
-		return nil, err
+		t.Fatal(err)
 	}
-	return &symlinkFileSession{FileSession: session, metadata: s}, nil
-}
-
-type symlinkFileSession struct {
-	storage.FileSession
-	metadata *symlinkMetadata
-}
-
-func (s *symlinkFileSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
-	attr, err := s.FileSession.StatNode(ctx, id)
+	session, status, err := volume.NewFileSession(ctx, storage.DefaultFileSessionOptions())
 	if err != nil {
-		return storage.Attr{}, err
+		t.Fatal(err)
 	}
-	return s.metadata.describe(attr), nil
-}
-
-func (s *symlinkFileSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
-	if err := options.CheckNode(id); err != nil {
-		return nil, err
-	}
-	if id == s.metadata.linkID {
-		return nil, syscall.ELOOP
-	}
-	return s.FileSession.OpenNode(ctx, id, options)
-}
-
-func (s *symlinkFileSession) OpenFile(ctx context.Context, name string, options storage.FileOpenOptions) (storage.File, error) {
-	if err := options.Check(); err != nil {
-		return nil, err
-	}
-	attr, err := s.metadata.Stat(ctx, name)
-	if err == nil && attr.ID == s.metadata.linkID {
-		if options.ExpectedID != 0 && options.ExpectedID != attr.ID {
-			return nil, syscall.ESTALE
+	action := func() storage.FileActionID {
+		t.Helper()
+		id, err := storage.NewFileActionID(status.ActionEpoch)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if options.Create && options.Exclusive {
-			return nil, syscall.EEXIST
+		return id
+	}
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if _, err := session.Close(cleanup, action()); err != nil {
+			t.Errorf("close symlink fixture session: %v", err)
 		}
-		return nil, syscall.ELOOP
-	}
-	if err != nil && !errors.Is(err, syscall.ENOENT) {
-		return nil, err
-	}
-	return s.FileSession.OpenFile(ctx, name, options)
-}
-
-func (s *symlinkMetadata) describe(attr storage.Attr) storage.Attr {
-	if attr.ID == s.linkID {
-		attr.Mode = fs.ModeSymlink | 0o777
-	}
-	return attr
-}
-
-func (s *symlinkMetadata) Stat(ctx context.Context, name string) (storage.Attr, error) {
-	attr, err := s.Storage.Stat(ctx, name)
+	}()
+	retained, err := session.Retain(ctx, storage.RetainRequest{NodeID: state.RootID}, action())
 	if err != nil {
-		return storage.Attr{}, err
+		t.Fatal(err)
 	}
-	return s.describe(attr), nil
-}
-
-func (s *symlinkMetadata) List(ctx context.Context, name string) ([]storage.Entry, error) {
-	entries, err := s.Storage.List(ctx, name)
+	root, err := session.Reference(ctx, retained.Reference)
 	if err != nil {
-		return nil, err
+		t.Fatal(err)
 	}
-	for i := range entries {
-		entries[i].Attr = s.describe(entries[i].Attr)
-	}
-	return entries, nil
-}
-
-func (s *symlinkMetadata) ListBounded(ctx context.Context, name string, result *storage.ListResult) error {
-	if result == nil {
-		return s.Storage.ListBounded(ctx, name, result)
-	}
-	// Native enumeration remains bounded; the destination charges the transformed mode.
-	captured, err := storage.NewListResult(result.MaxBytes(), 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
-		return nameBytes + int64(unsafe.Sizeof(storage.Entry{})), nil
-	})
+	parent, err := root.Stat(ctx, storage.ObservationOptions{IncludeLocation: true})
 	if err != nil {
-		return result.Fail(err)
+		t.Fatal(err)
 	}
-	if err := s.Storage.ListBounded(ctx, name, captured); err != nil {
-		return result.Fail(err)
+	if parent.Location == nil {
+		t.Fatal("parent observation omitted the requested location witness")
 	}
-	entries, err := captured.Entries()
+	metadata, err := fuse.WithPermissions(nil, 0o777)
 	if err != nil {
-		return result.Fail(err)
+		t.Fatal(err)
 	}
-	for _, entry := range entries {
-		entry.Attr = s.describe(entry.Attr)
-		if err := result.Add(entry); err != nil {
-			return result.Fail(err)
-		}
+	created, err := session.CreateAndRetainAt(ctx, storage.CreateAndRetainRequest{
+		Target: storage.EntryTarget{Parent: root.Reference(), ParentID: parent.Attr.ID, Name: []byte(name),
+			DirectoryRevision: parent.Attr.DirectoryRevision, Witness: parent.Location},
+		Initial: storage.NodeInitial{Kind: storage.NodeSymlink, Metadata: metadata, LinkTarget: []byte(target)},
+	}, action())
+	if err != nil {
+		t.Fatal(err)
 	}
-	return nil
+	if created.State != storage.FileActionCompleted || created.Reference == 0 {
+		t.Fatalf("symlink creation did not complete: state=%d reference=%d", created.State, created.Reference)
+	}
 }

@@ -136,7 +136,7 @@ func TestVolumeAuthorizationMapsEveryOperationBeforeBackendAndBarrier(t *testing
 			}))
 			body := ""
 			if operation == OpSetAttr {
-				body = `{"change":{}}`
+				body = `{"change":{"expected_revision":0}}`
 			}
 			if operation == OpWrite {
 				body = "contents"
@@ -220,7 +220,13 @@ func TestAuthorizationOptionsRequireAnExplicitUsablePair(t *testing.T) {
 	options := DefaultHandlerOptions()
 	options.Volume = " "
 	var observed authz.AccessRequest
-	options.Authorizer = authz.AuthorizerFunc(func(_ context.Context, r authz.AccessRequest) error { observed = r; r.Open.Read = false; return nil })
+	options.Authorizer = authz.AuthorizerFunc(func(_ context.Context, r authz.AccessRequest) error {
+		observed = r
+		r.Claim.Uses = 0
+		r.Effects = 0
+		r.Node = 0
+		return nil
+	})
 	h, err := NewHandlerWithOptions(backend, nil, options)
 	if err != nil {
 		t.Fatal(err)
@@ -232,11 +238,11 @@ func TestAuthorizationOptionsRequireAnExplicitUsablePair(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	request := authz.AccessRequest{Volume: "request-selected-volume", Operation: storage.OpFileOpen, Open: storage.OpenAccess{Read: true, Create: true}}
+	request := authz.AccessRequest{Volume: "request-selected-volume", Operation: storage.OpFileRetain, Node: 7, Claim: storage.AccessClaim{Uses: storage.ReadContent, Excludes: storage.RemoveEntry}, Effects: storage.EffectRetained | storage.EffectClaimChanged}
 	if err := h.authorize(t.Context(), request); err != nil {
 		t.Fatal(err)
 	}
-	if observed.Volume != " " || observed.Open != request.Open || request.Volume != "request-selected-volume" {
+	if observed.Volume != " " || observed.Claim != request.Claim || observed.Effects != request.Effects || observed.Node != request.Node || request.Node != 7 || request.Claim.Uses != storage.ReadContent || request.Effects != storage.EffectRetained|storage.EffectClaimChanged || request.Volume != "request-selected-volume" {
 		t.Fatalf("trusted opaque volume or intent copy changed: %+v / %+v", observed, request)
 	}
 }

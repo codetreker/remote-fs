@@ -22,7 +22,7 @@ func (v *volume) cleanupContext(ctx context.Context) (context.Context, context.C
 func (v *volume) closeUnreturnedFile(ctx context.Context, file storage.File, cause error, changed bool) error {
 	completion, cancel := v.cleanupContext(ctx)
 	defer cancel()
-	closeErr := v.closeError(file.Close(completion))
+	closeErr := v.closeError(v.closeReference(completion, file))
 	if closeErr != nil {
 		return afterMutation(changed, errors.Join(cause, closeErr))
 	}

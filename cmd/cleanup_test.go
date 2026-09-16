@@ -18,12 +18,16 @@ func TestStoppedAuthorityCleanupKeepsLocalErrorsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := remote.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	session, status, err := remote.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := storage.NewFileActionID(status.ActionEpoch)
 	if err != nil {
 		t.Fatal(err)
 	}
 	server.stop()
-	remoteErr := session.Close(t.Context())
+	_, remoteErr := session.Close(t.Context(), action)
 	if !errors.Is(remoteErr, syscall.EIO) {
 		t.Fatalf("close against stopped authority = %v, want EIO", remoteErr)
 	}

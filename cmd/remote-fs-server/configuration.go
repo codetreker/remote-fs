@@ -283,13 +283,13 @@ func parseConfig(args []string, errOut io.Writer) (commandConfig, bool, error) {
 	config.http.MaxConcurrentSnapshotFrames = *maxConcurrentHTTPSnapshotFrames
 	config.http.MaxInFlightSnapshotFrameBytes = maxInFlightHTTPSnapshotFrameBytes.bytes
 	config.http.MaxWaitingSnapshotFrames = *maxWaitingHTTPSnapshotFrames
-	config.files.advisory.MaxSessions = config.http.Files.MaxSessions
+	config.files.service.MaxSessions = config.http.Files.MaxSessions
 	if !given["max-file-size"] {
 		if config.local.given() {
-			config.files.advisory.MaxFileBytes = min(config.files.advisory.MaxFileBytes, config.local.objects.MaxObjectBytes)
+			config.files.service.MaxFileBytes = min(config.files.service.MaxFileBytes, config.local.objects.MaxObjectBytes)
 		}
 		if config.blob.given() {
-			config.files.advisory.MaxFileBytes = min(config.files.advisory.MaxFileBytes, config.objectLimits.MaxPendingBytes)
+			config.files.service.MaxFileBytes = min(config.files.service.MaxFileBytes, config.objectLimits.MaxPendingBytes)
 		}
 	}
 	return validateConfig(config, given, flags.Args())

@@ -5,11 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/codetreker/remote-fs/packages/locking"
-	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
-	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/replicated"
-	"github.com/codetreker/remote-fs/packages/transport/httprest"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +13,12 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+
+	"github.com/codetreker/remote-fs/packages/locking"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
+	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/replicated"
+	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
 type fileReplyFault struct {
@@ -83,27 +84,47 @@ func (f *fileReplyFault) arm(op storage.Operation, corrupt bool) {
 	f.op, f.corrupt, f.actions = op, corrupt, nil
 }
 
-func TestRetainedOpenFailureReclaimsItsUnreturnedReference(t *testing.T) {
+func TestRetainedFailedConfirmationPreservesReferenceOwnership(t *testing.T) {
 	s := serve(t, httprest.DefaultLimits())
 	fault := &fileReplyFault{underlying: s.server.Config.Handler}
 	s.server.Config.Handler = fault
 	mounted, _ := mount(t, s)
 	options := storage.DefaultFileSessionOptions()
-	options.MaxFiles = 1
-	session, err := mounted.NewFileSession(t.Context(), options)
+	options.MaxFiles = 2
+	session, status, err := mounted.NewFileSession(t.Context(), options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = session.Close(context.Background()) })
-	fault.arm(storage.OpFileOpen, false)
-	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0600})
-	if file != nil || !errors.Is(err, syscall.EIO) {
-		t.Fatalf("open accepted a missing barrier: %v, %v", file, err)
+	epoch := status.ActionEpoch
+	closeAction := retainedAction(t, epoch)
+	t.Cleanup(func() {
+		if _, err := session.Close(context.Background(), closeAction); err != nil {
+			t.Error(err)
+		}
+	})
+	target, closeParent := retainedTarget(t, mounted, session, epoch, "file")
+	action := retainedAction(t, epoch)
+	fault.arm(storage.OpFileCreateAndRetainAt, false)
+	receipt, err := session.CreateAndRetainAt(t.Context(), storage.CreateAndRetainRequest{Target: target, Initial: storage.NodeInitial{Kind: storage.NodeRegular}, Claim: storage.AccessClaim{Uses: storage.ReadContent | storage.WriteContent}}, action)
+	if !errors.Is(err, syscall.EIO) || receipt.Reference == 0 || receipt.Effects&storage.EffectRetained == 0 || receipt.Effects&storage.EffectCreated == 0 {
+		t.Fatalf("missing barrier discarded confirmed reference ownership: %+v, %v", receipt, err)
 	}
 	fault.arm("", false)
-	file = retainedOpen(t, session, "file", false)
-	if _, err := file.Stat(t.Context()); err != nil {
-		t.Fatal("failed open retained the only native file slot:", err)
+	recorded, err := session.QueryAction(t.Context(), action)
+	if err != nil || recorded.Reference != receipt.Reference || recorded.Effects != receipt.Effects {
+		t.Fatalf("retained action cannot be reconciled: %+v, %v", recorded, err)
+	}
+	file, err := session.Reference(t.Context(), receipt.Reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Close(t.Context(), retainedAction(t, epoch)); err != nil {
+		t.Fatal(err)
+	}
+	closeParent()
+	file = retainedOpen(t, mounted, session, epoch, "file", false)
+	if _, err := file.Stat(t.Context(), storage.ObservationOptions{}); err != nil {
+		t.Fatal("closing the retained receipt did not release its native slot:", err)
 	}
 }
 
@@ -112,20 +133,24 @@ func TestRetainedUnknownResponseDoesNotRecommitTheMutation(t *testing.T) {
 	fault := &fileReplyFault{underlying: s.server.Config.Handler}
 	s.server.Config.Handler = fault
 	mounted, _ := mount(t, s)
-	session := retainedSession(t, mounted)
-	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0600})
-	if err != nil {
-		t.Fatal(err)
-	}
+	session, epoch := retainedSession(t, mounted)
+	file := retainedOpen(t, mounted, session, epoch, "file", true)
 	fault.arm(storage.OpFileWrite, true)
-	if attr, err := file.WriteAt(t.Context(), 0, []byte("committed")); !errors.Is(err, syscall.EIO) || attr != (storage.Attr{}) {
-		t.Fatalf("unknown retained mutation returned a confirmed answer: %+v, %v", attr, err)
+	action := retainedAction(t, epoch)
+	receipt, err := file.WriteAt(t.Context(), storage.FileWriteRequest{Data: []byte("committed")}, action)
+	if !errors.Is(err, syscall.EIO) || receipt.State != storage.FileActionUnknown {
+		t.Fatalf("unknown retained mutation returned a confirmed answer: %+v, %v", receipt, err)
 	}
 	fault.mu.Lock()
 	actions := append([]string(nil), fault.actions...)
 	fault.mu.Unlock()
-	if len(actions) != 2 || actions[0] == "" || actions[0] != actions[1] {
-		t.Fatalf("unknown mutation did not use exactly one action identity for transport reconciliation: %v", actions)
+	if len(actions) != 2 || actions[0] != string(action) || actions[1] != string(action) {
+		t.Fatalf("unknown mutation did not retain one action identity during reconciliation: %v", actions)
+	}
+	fault.arm("", false)
+	recorded, err := session.QueryAction(t.Context(), action)
+	if err != nil || recorded.State != storage.FileActionCompleted || recorded.Effects&storage.EffectContentChanged == 0 || recorded.Observation.Attr.Size != 9 {
+		t.Fatalf("committed action did not preserve its observed effects: %+v, %v", recorded, err)
 	}
 	if content, err := s.elsewhere.Read(t.Context(), "file"); err != nil || string(content) != "committed" {
 		t.Fatalf("unknown result hid the actual authoritative content: %q, %v", content, err)
@@ -137,24 +162,25 @@ func TestRetainedSessionAdmissionAndStorageCleanup(t *testing.T) {
 	options := replicated.DefaultOptions()
 	options.MaxFileSessions = 1
 	mounted, _ := mountWithOptions(t, s, options)
-	first := retainedSession(t, mounted)
+	first, firstEpoch := retainedSession(t, mounted)
 	before := s.calls.of(httprest.OpFile)
-	if _, err := mounted.NewFileSession(t.Context(), storage.DefaultFileSessionOptions()); !errors.Is(err, syscall.EAGAIN) {
+	if _, _, err := mounted.NewFileSession(t.Context(), storage.DefaultFileSessionOptions()); !errors.Is(err, syscall.EAGAIN) {
 		t.Fatal("session ownership exceeded its local bound:", err)
 	}
 	if s.calls.of(httprest.OpFile) != before {
 		t.Fatal("a rejected session reached the authority")
 	}
-	if err := first.Close(t.Context()); err != nil {
+	if _, err := first.Close(t.Context(), retainedAction(t, firstEpoch)); err != nil {
 		t.Fatal(err)
 	}
-	second := retainedSession(t, mounted)
-	file := retainedOpen(t, second, "retained", true)
+	second, secondEpoch := retainedSession(t, mounted)
+	file := retainedOpen(t, mounted, second, secondEpoch, "retained", true)
+	closeAction := retainedAction(t, secondEpoch)
 	if err := mounted.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := file.Close(t.Context()); err != nil {
-		t.Fatal("storage close did not reclaim its file sessions:", err)
+	if receipt, err := file.Close(t.Context(), closeAction); err != nil || receipt.State != storage.FileActionRetired {
+		t.Fatalf("storage close did not confirm the terminal reference: %+v, %v", receipt, err)
 	}
 	if _, err := second.Status(t.Context()); !errors.Is(err, syscall.ESTALE) {
 		t.Fatal("closed storage left a live session:", err)
@@ -180,7 +206,7 @@ func TestRetainedSessionsRejectAnAuthorityWithoutFileCapabilities(t *testing.T) 
 	}
 	s.events.handler = handler
 	mounted, _ := mount(t, s)
-	if session, err := mounted.NewFileSession(t.Context(), storage.DefaultFileSessionOptions()); session != nil || !errors.Is(err, syscall.EOPNOTSUPP) {
+	if session, _, err := mounted.NewFileSession(t.Context(), storage.DefaultFileSessionOptions()); session != nil || !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("missing retained capability was emulated through names: %v, %v", session, err)
 	}
 	if err := mounted.Write(t.Context(), "ordinary", []byte("named operations remain supported")); err != nil {
@@ -252,9 +278,14 @@ func TestRetainedClosingStorageReclaimsAnAlreadyCreatedSession(t *testing.T) {
 	t.Cleanup(resume)
 	created := make(chan error, 1)
 	go func() {
-		session, err := mounted.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+		session, status, err := mounted.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
 		if session != nil {
-			err = errors.Join(err, errors.New("closing storage returned a new session"), session.Close(context.Background()))
+			action, actionErr := storage.NewFileActionID(status.ActionEpoch)
+			var closeErr error
+			if actionErr == nil {
+				_, closeErr = session.Close(context.Background(), action)
+			}
+			err = errors.Join(err, errors.New("closing storage returned a new session"), actionErr, closeErr)
 		}
 		created <- err
 	}()
@@ -274,11 +305,11 @@ func TestRetainedClosingStorageReclaimsAnAlreadyCreatedSession(t *testing.T) {
 	if err := <-closed; err != nil || paused.closes.Load() != 1 {
 		t.Fatalf("late capability was not reclaimed: %v; closes %d", err, paused.closes.Load())
 	}
-	shared, err := remote.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	shared, status, err := remote.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
 	if err != nil {
 		t.Fatal("replica close consumed the shared remote client:", err)
 	}
-	if err := shared.Close(t.Context()); err != nil {
+	if _, err := shared.Close(t.Context(), retainedAction(t, status.ActionEpoch)); err != nil {
 		t.Fatal(err)
 	}
 }

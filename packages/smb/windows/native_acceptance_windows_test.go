@@ -60,7 +60,7 @@ func (g *nativeHTTPGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var held *nativeAck
-	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/windows") {
+	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/file") {
 		body, err := io.ReadAll(io.LimitReader(r.Body, (2<<20)+1))
 		_ = r.Body.Close()
 		if err != nil || len(body) > 2<<20 {
@@ -71,7 +71,7 @@ func (g *nativeHTTPGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var command struct {
 			Op storage.Operation `json:"op"`
 		}
-		if json.Unmarshal(body, &command) == nil && command.Op == storage.OpWindowsWrite {
+		if json.Unmarshal(body, &command) == nil && command.Op == storage.OpFileWrite {
 			g.mu.Lock()
 			held, g.ack = g.ack, nil
 			g.mu.Unlock()
@@ -359,50 +359,87 @@ func nativeTransfer(file *nativeHandle, data []byte, write bool) (uint32, error)
 	return count, err
 }
 
-func nativeAction(t *testing.T, session storage.WindowsSession) storage.WindowsActionID {
+func nativeAction(t *testing.T, session storage.FileSession) storage.FileActionID {
 	t.Helper()
 	status, err := session.Status(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, err := storage.NewLockRequestID(status.ActionEpoch)
+	id, err := storage.NewFileActionID(status.ActionEpoch)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return id
 }
-func nativeRemoteOpen(t *testing.T, client *httprest.Storage, name string, kind storage.WindowsKind, create bool) (storage.WindowsSession, storage.WindowsFile) {
+func nativeRemoteCreateAt(t *testing.T, session storage.FileSession, parent storage.File, name string, kind storage.NodeKind) storage.File {
 	t.Helper()
-	session, err := client.NewWindowsSession(t.Context(), storage.DefaultFileSessionOptions())
+	target := nativeTestTarget(t, parent, name)
+	claim := storage.AccessClaim{Uses: storage.AllAccessUses}
+	if kind == storage.NodeDirectory {
+		claim.Uses = storage.RemoveEntry
+	}
+	receipt, err := session.CreateAndRetainAt(t.Context(), storage.CreateAndRetainRequest{Target: target, Initial: storage.NodeInitial{Kind: kind}, Claim: claim}, nativeAction(t, session))
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := session.Reference(t.Context(), receipt.Reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return file
+}
+func nativeRemoteOpen(t *testing.T, client *httprest.Storage, name string, kind storage.NodeKind, create bool) (storage.FileSession, storage.File) {
+	t.Helper()
+	session, status, err := client.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := session.Close(ctx); err != nil {
+		id, err := storage.NewFileActionID(status.ActionEpoch)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := session.Close(ctx, id); err != nil {
 			t.Error(err)
 		}
 	})
-	disposition := storage.WindowsOpen
-	if create {
-		disposition = storage.WindowsOpenIf
-	}
-	lookup := storage.WindowsLookup{}
-	if name != "" {
-		lookup = storage.WindowsLookup{ParentID: 1, Name: name}
-	}
-	opened, err := session.Open(t.Context(), storage.WindowsOpenRequest{WindowsOpenIntent: storage.WindowsOpenIntent{Access: storage.WindowsAllAccess, Share: storage.WindowsShareAll, Disposition: disposition, Kind: kind}, Lookup: lookup, Mode: 0644}, nativeAction(t, session))
+	rootReceipt, err := session.Retain(t.Context(), storage.RetainRequest{NodeID: 1}, nativeAction(t, session))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return session, opened.File
+	root, err := session.Reference(t.Context(), rootReceipt.Reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name == "" {
+		return session, root
+	}
+	target := nativeTestTarget(t, root, name)
+	if create && target.ExpectedNodeID == 0 {
+		return session, nativeRemoteCreateAt(t, session, root, name, kind)
+	}
+	claim := storage.AccessClaim{Uses: storage.AllAccessUses}
+	if kind == storage.NodeDirectory {
+		claim.Uses = storage.RemoveEntry
+	}
+	receipt, err := session.RetainAt(t.Context(), storage.RetainAtRequest{Target: target, Claim: claim}, nativeAction(t, session))
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := session.Reference(t.Context(), receipt.Reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session, file
 }
-func nativeRemoteWrite(t *testing.T, session storage.WindowsSession, file storage.WindowsFile, content []byte) {
+func nativeRemoteWrite(t *testing.T, session storage.FileSession, file storage.File, content []byte) {
 	t.Helper()
-	r, err := file.WriteAt(t.Context(), 0, content, nativeAction(t, session))
-	if err != nil || r.State != storage.WindowsActionCompleted {
-		t.Fatalf("HTTP write=%+v, error=%v", r, err)
+	receipt, err := file.WriteAt(t.Context(), storage.FileWriteRequest{Data: content}, nativeAction(t, session))
+	if err != nil || receipt.State != storage.FileActionCompleted {
+		t.Fatalf("HTTP write=%+v, error=%v", receipt, err)
 	}
 }
 func nativeEventually(t *testing.T, description string, check func() bool) {
@@ -505,7 +542,7 @@ func TestNativeWindowsHTTPBridge(t *testing.T) {
 	if !b.smb.Status().Serving {
 		t.Fatal("busy unmount stopped the SMB endpoint")
 	}
-	session, remoteFile := nativeRemoteOpen(t, b.remote, "live.bin", storage.WindowsRegularFile, false)
+	session, remoteFile := nativeRemoteOpen(t, b.remote, "live.bin", storage.NodeRegular, false)
 	updated := []byte("after--remote")
 	nativeRemoteWrite(t, session, remoteFile, updated)
 	nativeEventually(t, "remote write through an already open Win32 handle", func() bool {
@@ -521,8 +558,8 @@ func TestNativeWindowsHTTPBridge(t *testing.T) {
 	if _, err := os.Stat(missing); !os.IsNotExist(err) {
 		t.Fatalf("initial absent-file lookup=%v", err)
 	}
-	_, newRemote := nativeRemoteOpen(t, b.remote, "new.bin", storage.WindowsRegularFile, true)
-	if _, err := newRemote.Stat(t.Context()); err != nil {
+	_, newRemote := nativeRemoteOpen(t, b.remote, "new.bin", storage.NodeRegular, true)
+	if _, err := newRemote.Stat(t.Context(), storage.ObservationOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	beforeFreshLookup := b.wire.createSequence.Load()
@@ -546,19 +583,12 @@ func TestNativeWindowsHTTPBridge(t *testing.T) {
 		t.Fatal("successful lookup after remote creation had no fresh SMB CREATE for new.bin")
 	}
 
-	directorySession, directory := nativeRemoteOpen(t, b.remote, "directory", storage.WindowsDirectory, true)
+	directorySession, directory := nativeRemoteOpen(t, b.remote, "directory", storage.NodeDirectory, true)
 	directoryPath := filepath.Join(b.path+`\`, "directory")
 	if entries, err := os.ReadDir(directoryPath); err != nil || len(entries) != 0 {
 		t.Fatalf("initial directory=%v,error=%v", entries, err)
 	}
-	parent, err := directory.Stat(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = directorySession.Open(t.Context(), storage.WindowsOpenRequest{WindowsOpenIntent: storage.WindowsOpenIntent{Access: storage.WindowsAllAccess, Share: storage.WindowsShareAll, Disposition: storage.WindowsCreate, Kind: storage.WindowsRegularFile}, Lookup: storage.WindowsLookup{ParentID: parent.ID, ParentReference: directory.Reference(), Name: "child.bin"}, Mode: 0644}, nativeAction(t, directorySession))
-	if err != nil {
-		t.Fatal(err)
-	}
+	_ = nativeRemoteCreateAt(t, directorySession, directory, "child.bin", storage.NodeRegular)
 	nativeEventually(t, "remote directory entry", func() bool {
 		entries, err := os.ReadDir(directoryPath)
 		if err != nil {

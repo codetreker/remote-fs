@@ -5,23 +5,23 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore"
+	"github.com/codetreker/remote-fs/packages/transport/httprest"
 	"io"
-	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/objectstore"
-	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-func TestRetainedHTTPCancelLockReconcilesPendingAttempt(t *testing.T) {
-	ctx := t.Context()
+func TestRetainedHTTPCancelWaitReconcilesPendingAction(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
 	backend := volumeFixture(t)
 	if err := backend.Write(ctx, "file", []byte("contents")); err != nil {
 		t.Fatal(err)
@@ -30,380 +30,328 @@ func TestRetainedHTTPCancelLockReconcilesPendingAttempt(t *testing.T) {
 	if err := client.CheckFileStorage(); err != nil {
 		t.Fatal(err)
 	}
-	firstSession := fileSession(t, client)
-	secondSession := fileSession(t, client)
-	first := openHTTPFile(t, firstSession, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
-	second := openHTTPFile(t, secondSession, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
-	newID := func(session storage.FileSession) storage.LockRequestID {
-		t.Helper()
-		status, err := session.Status(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		id, err := storage.NewLockRequestID(status.ActionEpoch)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return id
-	}
-	lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
-	held, err := first.SetLock(ctx, 1, lock, newID(firstSession))
-	if err != nil || held.State != storage.LockGranted {
-		t.Fatalf("held = %+v, %v", held, err)
-	}
-	lock.Wait = true
-	id := newID(secondSession)
-	pending, err := second.SetLock(ctx, 2, lock, id)
-	if err != nil || pending.State != storage.LockPending {
-		t.Fatalf("pending = %+v, %v", pending, err)
-	}
-	for i := 0; i < 2; i++ {
-		cancelled, err := second.CancelLock(ctx, 2, id)
-		if err != nil || cancelled.Request != id || cancelled.State != storage.LockCancelled {
-			t.Fatalf("cancel %d = %+v, %v", i, cancelled, err)
-		}
-	}
-	if err := first.DropLocks(ctx, 1, storage.Flock); err != nil {
+	sa := fileSession(t, client)
+	sb := fileSession(t, client)
+	claim := storage.AccessClaim{Uses: storage.ReadContent | storage.WriteContent}
+	first := retainHTTPFile(t, sa, httpNode(t, backend, "file"), claim)
+	second := retainHTTPFile(t, sb, httpNode(t, backend, "file"), claim)
+	scope := storage.RangeScope{Domain: 1}
+	held := storage.RangeAcquisition{ID: 1, End: 99, Exclusive: true}
+	snap, err := first.RangeSnapshot(ctx, 1, scope)
+	if err != nil {
 		t.Fatal(err)
 	}
-	observed, err := second.QueryLock(ctx, 2, id)
-	if err != nil || observed.State != storage.LockCancelled {
-		t.Fatalf("cancelled request was granted after release: %+v, %v", observed, err)
+	if _, err := first.ReplaceRanges(ctx, storage.RangeReplaceRequest{Owner: 1, Scope: scope, ExpectedRevision: snap.Revision, Ranges: []storage.RangeAcquisition{held}}, fileAction(t, sa)); err != nil {
+		t.Fatal(err)
 	}
-	conflict, err := first.GetLock(ctx, 1, lock)
-	if err != nil || conflict.Found {
-		t.Fatalf("cancel left a grant: %+v, %v", conflict, err)
+	snap, err = second.RangeSnapshot(ctx, 2, scope)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := second.CancelLock(ctx, 2, "invalid"); !errors.Is(err, syscall.EINVAL) {
-		t.Fatalf("invalid cancellation = %v", err)
+	id := fileAction(t, sb)
+	type result struct {
+		receipt storage.FileActionReceipt
+		err     error
+	}
+	finished := make(chan result, 1)
+	go func() {
+		r, e := second.WaitRanges(ctx, storage.RangeWaitRequest{Owner: 2, Scope: scope, ExpectedRevision: snap.Revision, Ranges: []storage.RangeAcquisition{held}}, id)
+		finished <- result{r, e}
+	}()
+	for {
+		r, e := sb.QueryAction(ctx, id)
+		if e == nil && r.State == storage.FileActionPending {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("wait never became pending: %+v,%v", r, e)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for i := 0; i < 2; i++ {
+		r, e := sb.CancelAction(ctx, id)
+		if !errors.Is(e, syscall.EINTR) || r.Action != id || r.State != storage.FileActionNotApplied || r.Effects != 0 {
+			t.Fatalf("cancel %d=%+v,%v", i, r, e)
+		}
+	}
+	select {
+	case done := <-finished:
+		if !errors.Is(done.err, syscall.EINTR) || done.receipt.State != storage.FileActionNotApplied {
+			t.Fatalf("wait result=%+v", done)
+		}
+	case <-ctx.Done():
+		t.Fatal("cancel did not complete pending wait")
+	}
+	if _, err := first.RetireRangeOwner(ctx, 1, scope, fileAction(t, sa)); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := sb.QueryAction(ctx, id)
+	if !errors.Is(err, syscall.EINTR) || observed.State != storage.FileActionNotApplied || observed.Effects != 0 {
+		t.Fatalf("cancelled wait changed after release=%+v,%v", observed, err)
+	}
+	snap, err = first.RangeSnapshot(ctx, 1, scope)
+	if err != nil || len(snap.Other) != 0 || len(snap.Own) != 0 {
+		t.Fatalf("cancel left ranges=%+v,%v", snap, err)
+	}
+	if _, err := sb.CancelAction(ctx, "invalid"); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("invalid cancellation=%v", err)
 	}
 }
 
-func TestRetainedHTTPPlainOpenACKCancellationClosesExactReference(t *testing.T) {
-	for _, test := range []struct {
-		name        string
-		node, write bool
-	}{
-		{"path read", false, false}, {"path read write", false, true}, {"node read write", true, true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			backend, client, wire := openACKFixture(t)
-			if err := backend.Storage.Write(t.Context(), "file", []byte("original bytes")); err != nil {
+func TestRetainedHTTPCancelledRetainReplyReconcilesExactNativeReference(t *testing.T) {
+	for _, uses := range []storage.AccessUse{0, storage.ReadContent, storage.ReadContent | storage.WriteContent} {
+		t.Run(string(rune('a'+uses)), func(t *testing.T) {
+			backend, client, wire := retainedReplyFixture(t)
+			ctx := t.Context()
+			if err := backend.Storage.Write(ctx, "file", []byte("original bytes")); err != nil {
 				t.Fatal(err)
 			}
-			before, err := backend.Storage.Stat(t.Context(), "file")
+			before, err := backend.Storage.Stat(ctx, "file")
 			if err != nil {
 				t.Fatal(err)
 			}
 			session := fileSession(t, client)
-			ctx, cancel := context.WithCancel(t.Context())
+			id := fileAction(t, session)
+			request, cancel := context.WithCancel(ctx)
 			defer cancel()
-			wire.afterOpen = func() error { cancel(); return nil }
-			options := storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: test.write}}
-			var file storage.File
-			if test.node {
-				file, err = session.OpenNode(ctx, before.ID, options)
-			} else {
-				file, err = session.OpenFile(ctx, "file", options)
+			wire.after = cancel
+			receipt, err := session.Retain(request, storage.RetainRequest{NodeID: before.ID, Claim: storage.AccessClaim{Uses: uses}}, id)
+			requireUnknownFileAction(t, receipt, id, storage.OpFileRetain, err)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancelled call lost cancellation cause:%v", err)
 			}
-			if file != nil {
-				file.Close(context.Background())
+			wire.requireReconciliation(t, id, 0)
+			if backend.closed.Load() != 0 {
+				t.Fatal("uncertain retain auto-closed native reference")
 			}
-			if file != nil || storage.ErrnoOf(err) != syscall.EINTR || !errors.Is(err, context.Canceled) {
-				t.Fatalf("plain open ACK cancellation returned file=%v err=%v", file != nil, err)
+			receipt, err = session.QueryAction(ctx, id)
+			if err != nil || receipt.State != storage.FileActionCompleted || receipt.Reference == 0 {
+				t.Fatalf("explicit query=%+v,%v", receipt, err)
 			}
-			wire.requireExactCleanup(t, 0)
-			if backend.opened.Load() != 1 || backend.closed.Load() != 1 {
-				t.Fatalf("native open/close calls = %d/%d, want 1/1", backend.opened.Load(), backend.closed.Load())
+			wire.requireReconciliation(t, id, 1)
+			if backend.retains.Load() != 1 {
+				t.Fatalf("native retain calls=%d", backend.retains.Load())
 			}
-			after, err := backend.Storage.Stat(t.Context(), "file")
-			if err != nil || before != after {
-				t.Fatalf("plain cancelled open changed attributes: before=%+v after=%+v err=%v", before, after, err)
-			}
-			if content, err := backend.Storage.Read(t.Context(), "file"); err != nil || string(content) != "original bytes" {
-				t.Fatalf("plain cancelled open changed content: %q, %v", content, err)
-			}
-			if err := backend.Storage.Remove(t.Context(), "file"); err != nil {
+			file, err := session.Reference(ctx, receipt.Reference)
+			if err != nil {
 				t.Fatal(err)
 			}
-			if used, err := backend.Storage.Usage(t.Context()); err != nil || used != 0 {
-				t.Fatalf("confirmed exact Close left a retained native reference: usage=%d err=%v", used, err)
+			if _, err := file.Close(ctx, fileAction(t, session)); err != nil {
+				t.Fatal(err)
+			}
+			if backend.closed.Load() != 1 {
+				t.Fatalf("native close calls=%d", backend.closed.Load())
+			}
+			after, err := backend.Storage.Stat(ctx, "file")
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatalf("retain changed metadata=%+v,%v", after, err)
+			}
+			if content, err := backend.Storage.Read(ctx, "file"); err != nil || string(content) != "original bytes" {
+				t.Fatalf("retain changed content=%q,%v", content, err)
+			}
+			if err := backend.Storage.Remove(ctx, "file"); err != nil {
+				t.Fatal(err)
+			}
+			if used, err := backend.Storage.Usage(ctx); err != nil || used != 0 {
+				t.Fatalf("exact close leaked reference=%d,%v", used, err)
 			}
 		})
 	}
 }
 
-func TestRetainedHTTPOpenACKFailuresRemainEIO(t *testing.T) {
-	for _, name := range []string{"create", "truncate node", "reported deadline", "cleanup EIO", "cleanup ESTALE", "unknown ACK and failed reconciliation", "closed session"} {
+func TestRetainedHTTPUnknownRetainAndFailedClosePreserveOwnership(t *testing.T) {
+	for _, name := range []string{"query unavailable", "close EIO", "close ESTALE"} {
 		t.Run(name, func(t *testing.T) {
-			backend, client, wire := openACKFixture(t)
-			defer backend.closeError.Store(0)
-			options := storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}}
-			if name == "create" {
-				options.Create, options.Exclusive, options.Mode = true, true, 0600
-			} else if err := backend.Storage.Write(t.Context(), "file", []byte("original bytes")); err != nil {
+			backend, client, wire := retainedReplyFixture(t)
+			ctx := t.Context()
+			if err := backend.Storage.Write(ctx, "file", []byte("original bytes")); err != nil {
 				t.Fatal(err)
 			}
-			var id uint64
-			if name == "truncate node" {
-				options.Truncate = true
-				attr, err := backend.Storage.Stat(t.Context(), "file")
-				if err != nil {
-					t.Fatal(err)
-				}
-				id = attr.ID
-			}
+			node := httpNode(t, backend.Storage, "file")
 			session := fileSession(t, client)
-			ctx, cancel := context.WithCancel(t.Context())
-			var deadline *reportedACKDeadline
-			if name == "reported deadline" {
-				cancel()
-				deadline = &reportedACKDeadline{Context: context.WithoutCancel(t.Context()), done: make(chan struct{})}
-				ctx, cancel = deadline, deadline.expire
+			id := fileAction(t, session)
+			wire.failQuery = name == "query unavailable"
+			receipt, err := session.Retain(ctx, storage.RetainRequest{NodeID: node, Claim: storage.AccessClaim{Uses: storage.ReadContent}}, id)
+			requireUnknownFileAction(t, receipt, id, storage.OpFileRetain, err)
+			wire.requireReconciliation(t, id, 0)
+			if backend.closed.Load() != 0 {
+				t.Fatal("uncertain retain auto-closed native reference")
 			}
-			defer cancel()
-			wire.afterOpen = func() error {
-				if name == "reported deadline" {
-					deadline.expire()
-					if ctx.Err() != context.DeadlineExceeded {
-						t.Fatalf("reported deadline did not precede ACK: %v", ctx.Err())
-					}
-					return nil
+			if wire.failQuery {
+				failed, queryErr := session.QueryAction(ctx, id)
+				if storage.ErrnoOf(queryErr) != syscall.EIO || failed.Effects != 0 || failed.Reference != 0 {
+					t.Fatalf("failed explicit query invented result=%+v,%v", failed, queryErr)
 				}
-				if name == "closed session" {
-					if err := session.Close(context.Background()); err != nil {
-						return err
-					}
-				}
-				cancel()
-				return nil
+				wire.requireReconciliation(t, id, 1)
+				wire.failQuery = false
 			}
-			switch name {
-			case "cleanup EIO":
-				backend.closeError.Store(int64(syscall.EIO))
-			case "cleanup ESTALE":
-				backend.closeError.Store(int64(syscall.ESTALE))
-			case "unknown ACK and failed reconciliation":
-				wire.afterOpen, wire.loseACK, wire.afterLostACK = nil, true, cancel
+			receipt, err = session.QueryAction(ctx, id)
+			wantQueries := 1
+			if name == "query unavailable" {
+				wantQueries = 2
 			}
-			var file storage.File
-			var err error
-			if id != 0 {
-				file, err = session.OpenNode(ctx, id, options)
-			} else {
-				file, err = session.OpenFile(ctx, "file", options)
+			wire.requireReconciliation(t, id, wantQueries)
+			if err != nil || receipt.State != storage.FileActionCompleted || receipt.Reference == 0 {
+				t.Fatalf("native receipt=%+v,%v", receipt, err)
 			}
-			if file != nil {
-				file.Close(context.Background())
+			if backend.retains.Load() != 1 {
+				t.Fatalf("unknown result repeated native retain %d times", backend.retains.Load())
 			}
-			if file != nil || storage.ErrnoOf(err) != syscall.EIO {
-				t.Fatalf("%s returned file=%v err=%v, want EIO", name, file != nil, err)
-			}
-			if name == "reported deadline" && !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("ACK deadline identity lost: %v", err)
-			}
-			acks := 0
-			if name == "unknown ACK and failed reconciliation" {
-				acks = 2
-			}
-			wire.requireExactCleanup(t, acks)
-			if name == "unknown ACK and failed reconciliation" && wire.sentACK.Load() != 1 {
-				t.Fatalf("real ACK dispatches=%d, want 1 before failed reconciliation", wire.sentACK.Load())
-			}
-			content, err := backend.Storage.Read(t.Context(), "file")
-			want := "original bytes"
-			if options.Create || options.Truncate {
-				want = ""
-			}
-			if err != nil || string(content) != want {
-				t.Fatalf("open effect = %q, %v, want %q", content, err, want)
-			}
-			if err := backend.Storage.Write(t.Context(), "file", []byte("reference probe")); err != nil {
-				t.Fatal(err)
-			}
-			if err := backend.Storage.Remove(t.Context(), "file"); err != nil {
-				t.Fatal(err)
-			}
-			used, err := backend.Storage.Usage(t.Context())
+			file, err := session.Reference(ctx, receipt.Reference)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if name == "cleanup EIO" || name == "cleanup ESTALE" {
-				if used != int64(len("reference probe")) {
-					t.Fatalf("failed native Close did not retain its reference: %d", used)
+			if name == "close EIO" {
+				backend.closeError.Store(int64(syscall.EIO))
+			}
+			if name == "close ESTALE" {
+				backend.closeError.Store(int64(syscall.ESTALE))
+			}
+			if err := backend.Storage.Remove(ctx, "file"); err != nil {
+				t.Fatal(err)
+			}
+			closeID := fileAction(t, session)
+			closed, closeErr := file.Close(ctx, closeID)
+			if name != "query unavailable" {
+				if storage.ErrnoOf(closeErr) != syscall.Errno(backend.closeError.Load()) || !storage.IsFileCallNotAdmitted(closeErr) || closed.State != 0 || closed.Action != "" || closed.Reference != 0 || closed.Effects != 0 {
+					t.Fatalf("failed close=%+v,%v", closed, closeErr)
+				}
+				if used, err := backend.Storage.Usage(ctx); err != nil || used != int64(len("original bytes")) {
+					t.Fatalf("failed close lost ownership=%d,%v", used, err)
 				}
 				backend.closeError.Store(0)
-				if err := session.Close(context.Background()); err != nil {
+				if _, err := session.Close(ctx, fileAction(t, session)); err != nil {
 					t.Fatal(err)
 				}
-				used, err = backend.Storage.Usage(t.Context())
+			} else if closeErr != nil {
+				t.Fatal(closeErr)
 			}
-			if err != nil || used != 0 {
-				t.Fatalf("open failure left native reference after cleanup: usage=%d err=%v", used, err)
+			if used, err := backend.Storage.Usage(ctx); err != nil || used != 0 {
+				t.Fatalf("cleanup leaked ownership=%d,%v", used, err)
 			}
 		})
 	}
 }
 
-type openACKBackend struct {
+type retainedReplyBackend struct {
 	*objectstore.Storage
-	closeError atomic.Int64
-	opened     atomic.Int64
-	closed     atomic.Int64
+	retains, closed, closeError atomic.Int64
 }
-
-func (b *openACKBackend) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
-	session, err := b.Storage.NewFileSession(ctx, options)
-	if err != nil {
-		return nil, err
-	}
-	return &openACKSession{FileSession: session, backend: b}, nil
-}
-
-type openACKSession struct {
+type retainedReplySession struct {
 	storage.FileSession
-	backend *openACKBackend
+	backend *retainedReplyBackend
+}
+type retainedReplyFile struct {
+	storage.File
+	backend *retainedReplyBackend
 }
 
-func (s *openACKSession) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, error) {
-	file, err := s.FileSession.OpenFile(ctx, path, options)
-	return s.wrap(file, err)
+func (b *retainedReplyBackend) NewFileSession(ctx context.Context, o storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
+	s, status, err := b.Storage.NewFileSession(ctx, o)
+	if err != nil {
+		return nil, status, err
+	}
+	return &retainedReplySession{FileSession: s, backend: b}, status, nil
 }
-
-func (s *openACKSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
-	file, err := s.FileSession.OpenNode(ctx, id, options)
-	return s.wrap(file, err)
+func (s *retainedReplySession) Retain(ctx context.Context, r storage.RetainRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	s.backend.retains.Add(1)
+	return s.FileSession.Retain(ctx, r, id)
 }
-
-func (s *openACKSession) wrap(file storage.File, err error) (storage.File, error) {
+func (s *retainedReplySession) Reference(ctx context.Context, id storage.FileReferenceID) (storage.File, error) {
+	f, err := s.FileSession.Reference(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	s.backend.opened.Add(1)
-	return &openACKFile{File: file, backend: s.backend}, nil
+	return &retainedReplyFile{File: f, backend: s.backend}, nil
 }
-
-type openACKFile struct {
-	storage.File
-	backend *openACKBackend
-}
-
-func (f *openACKFile) Close(ctx context.Context) error {
+func (f *retainedReplyFile) Close(ctx context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
 	f.backend.closed.Add(1)
-	if errno := f.backend.closeError.Load(); errno != 0 {
-		return syscall.Errno(errno)
+	if code := f.backend.closeError.Load(); code != 0 {
+		return storage.FileActionReceipt{}, &storage.FileError{Code: syscall.Errno(code), NotAdmitted: true, Cause: syscall.Errno(code)}
 	}
-	return f.File.Close(ctx)
+	return f.File.Close(ctx, id)
 }
 
-type openACKRequest struct {
-	Op      storage.Operation `json:"op"`
-	Session string            `json:"session"`
-	File    string            `json:"file"`
+type retainedReplyRequest struct {
+	Op        storage.Operation       `json:"op"`
+	Session   string                  `json:"session"`
+	Reference storage.FileReferenceID `json:"reference"`
+	Action    storage.FileActionID    `json:"action"`
+}
+type retainedReplyTransport struct {
+	base      http.RoundTripper
+	mu        sync.Mutex
+	requests  []retainedReplyRequest
+	dropped   bool
+	after     func()
+	failQuery bool
 }
 
-type openACKTransport struct {
-	base                      http.RoundTripper
-	afterOpen                 func() error
-	loseACK                   bool
-	afterLostACK              func()
-	sentACK                   atomic.Int64
-	mu                        sync.Mutex
-	requests                  []openACKRequest
-	openedFile, openedSession string
-	ackAttempts               int
-}
-
-func (w *openACKTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+func (w *retainedReplyTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	body, err := io.ReadAll(request.Body)
 	if err != nil {
 		return nil, err
 	}
 	request.Body = io.NopCloser(bytes.NewReader(body))
-	var operation openACKRequest
+	var operation retainedReplyRequest
 	if err := json.Unmarshal(body, &operation); err != nil {
 		return nil, err
 	}
 	w.mu.Lock()
 	w.requests = append(w.requests, operation)
-	attempt := 0
-	if operation.Op == storage.OpFileAck {
-		w.ackAttempts++
-		attempt = w.ackAttempts
+	drop := operation.Op == storage.OpFileRetain && !w.dropped
+	if drop {
+		w.dropped = true
 	}
 	w.mu.Unlock()
-	if operation.Op == storage.OpFileAck && w.loseACK && attempt > 1 {
+	if operation.Op == storage.OpFileQueryAction && w.failQuery {
 		return nil, io.ErrUnexpectedEOF
-	}
-	if operation.Op == storage.OpFileAck {
-		w.sentACK.Add(1)
 	}
 	response, err := w.base.RoundTrip(request)
 	if err != nil {
 		return nil, err
 	}
-	if operation.Op == storage.OpFileAck && w.loseACK {
+	if drop && response.StatusCode == http.StatusOK {
 		_, readErr := io.Copy(io.Discard, response.Body)
 		closeErr := response.Body.Close()
 		if err := errors.Join(readErr, closeErr); err != nil {
 			return nil, err
 		}
-		if w.afterLostACK != nil {
-			w.afterLostACK()
+		if w.after != nil {
+			w.after()
 		}
-		return nil, io.ErrUnexpectedEOF
-	}
-	if operation.Op == storage.OpFileOpen || operation.Op == storage.OpFileOpenNode {
-		encoded, readErr := io.ReadAll(response.Body)
-		closeErr := response.Body.Close()
-		if err := errors.Join(readErr, closeErr); err != nil {
-			return nil, err
-		}
-		var opened struct {
-			File string `json:"file"`
-		}
-		if err := json.Unmarshal(encoded, &opened); err != nil {
-			return nil, err
-		}
-		w.mu.Lock()
-		w.openedFile, w.openedSession = opened.File, operation.Session
-		w.mu.Unlock()
-		response.Body = io.NopCloser(bytes.NewReader(encoded))
-		if w.afterOpen != nil {
-			if err := w.afterOpen(); err != nil {
-				return nil, err
-			}
-		}
+		return nil, errors.Join(io.ErrUnexpectedEOF, request.Context().Err())
 	}
 	return response, nil
 }
-
-func (w *openACKTransport) requireExactCleanup(t *testing.T, wantACK int) {
+func (w *retainedReplyTransport) requireReconciliation(t *testing.T, id storage.FileActionID, wantQueries int) {
 	t.Helper()
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	opens, closes, acks := 0, 0, 0
-	for _, req := range w.requests {
-		switch req.Op {
-		case storage.OpFileOpen, storage.OpFileOpenNode:
-			opens++
-		case storage.OpFileAck:
-			acks++
-		case storage.OpFileClose:
-			closes++
-			if req.File != w.openedFile || req.Session != w.openedSession {
-				t.Fatalf("cleanup targeted another capability: %+v, opened=%s/%s", req, w.openedSession, w.openedFile)
+	retains, queries := 0, 0
+	session := ""
+	for _, r := range w.requests {
+		if r.Op == storage.OpFileRetain {
+			retains++
+			session = r.Session
+			if r.Action != id {
+				t.Fatalf("retain action changed: %+v", r)
+			}
+		}
+		if r.Op == storage.OpFileQueryAction {
+			queries++
+			if r.Action != id || r.Session != session {
+				t.Fatalf("query targeted other action/session: %+v", r)
 			}
 		}
 	}
-	if w.openedFile == "" || w.openedSession == "" || opens != 1 || closes != 1 || acks != wantACK {
-		t.Fatalf("open/ACK/exact-Close requests=%d/%d/%d, want 1/%d/1 with a real opened capability", opens, acks, closes, wantACK)
+	if retains != 1 || queries != wantQueries {
+		t.Fatalf("retain/query dispatches=%d/%d", retains, queries)
 	}
 }
-
-func openACKFixture(t *testing.T) (*openACKBackend, *httprest.Storage, *openACKTransport) {
+func retainedReplyFixture(t *testing.T) (*retainedReplyBackend, *httprest.Storage, *retainedReplyTransport) {
 	t.Helper()
-	backend := &openACKBackend{Storage: volumeFixture(t)}
+	backend := &retainedReplyBackend{Storage: volumeFixture(t)}
 	handler, err := httprest.NewHandler(backend, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -416,33 +364,14 @@ func openACKFixture(t *testing.T) (*openACKBackend, *httprest.Storage, *openACKT
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := handler.Close(ctx); err != nil {
-			t.Errorf("closing ACK fixture: %v", err)
+			t.Error(err)
 		}
 		base.CloseIdleConnections()
 	})
-	wire := &openACKTransport{base: base}
+	wire := &retainedReplyTransport{base: base}
 	client, err := httprest.Dial(server.URL, &http.Client{Transport: wire, Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return backend, client, wire
 }
-
-type reportedACKDeadline struct {
-	context.Context
-	done chan struct{}
-	once sync.Once
-}
-
-func (c *reportedACKDeadline) Done() <-chan struct{} { return c.done }
-
-func (c *reportedACKDeadline) Err() error {
-	select {
-	case <-c.done:
-		return context.DeadlineExceeded
-	default:
-		return nil
-	}
-}
-
-func (c *reportedACKDeadline) expire() { c.once.Do(func() { close(c.done) }) }

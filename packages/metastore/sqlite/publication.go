@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"io/fs"
 	"strconv"
 	"strings"
 	"syscall"
@@ -91,7 +90,7 @@ func (n sqliteNative) Discover(ctx context.Context, path string, adopt func(lock
 		if err != nil {
 			return err
 		}
-		if !node.Mode.IsRegular() {
+		if node.Kind != storage.NodeRegular {
 			return locking.Wrap(locking.UnsupportedTarget, "only an existing regular file can be locked", nil)
 		}
 		key = n.store.backendKey(node.ID)
@@ -118,7 +117,7 @@ func (n sqliteNative) Guard(ctx context.Context, key locking.BackendKey, transit
 		if err != nil {
 			return err
 		}
-		if !node.Mode.IsRegular() && node.Mode&fs.ModeSymlink == 0 {
+		if node.Kind != storage.NodeRegular && node.Kind != storage.NodeSymlink {
 			return locking.Wrap(locking.UnsupportedTarget, "the resolved node is not a supported file identity", nil)
 		}
 		return nil
@@ -133,6 +132,9 @@ func (n sqliteNative) ordered(ctx context.Context, read func(*sql.Tx) error, tra
 		return err
 	}
 	defer n.store.coordinator.commit.release()
+	if n.store.fileDomain != nil && n.store.fileDomain.recoveryPending {
+		return syscall.EAGAIN
+	}
 	if err := n.store.inspect(ctx, read); err != nil {
 		return err
 	}
@@ -178,7 +180,7 @@ func (s *Store) mutateVolume(ctx context.Context, kind locking.MutationKind, pat
 }
 
 func (s *Store) prepareVolumePublication(ctx context.Context, tx *sql.Tx, intent volumeIntent) (*volumePublication, error) {
-	if err := s.checkWindowsMutationLocked(ctx, tx, intent); err != nil {
+	if err := s.checkFileMutationLocked(ctx, tx, intent); err != nil {
 		return nil, err
 	}
 	publication := &volumePublication{intent: intent}
@@ -270,7 +272,7 @@ func (s *Store) finishVolumePublication(ctx context.Context, tx *sql.Tx, publica
 	if !publication.intent.totalUsage && publication.intent.kind == locking.WriteMutation {
 		if _, ok := metastore.FileIOFromContext(ctx); !ok {
 			for _, id := range publication.nodes {
-				if err := s.checkWindowsIOLocked(id, windowsActor(ctx), publication.previous, metastore.WindowsIO{Write: true, Length: max(publication.previous, publication.next)}); err != nil {
+				if err := s.checkFileIOLocked(ctx, tx, id, publication.previous, storage.FileIO{Write: true, Length: max(publication.previous, publication.next)}); err != nil {
 					return err
 				}
 			}
@@ -337,8 +339,13 @@ func (s *Store) publishVolume(ctx context.Context, tx *sql.Tx, state DurableStat
 	if publication.intent.cleanup {
 		return commit().Err
 	}
+	if s.fileLeaseRecovery == nil {
+		if err := validateFileLeaseMutation(ctx, tx); err != nil {
+			return err
+		}
+	}
 	if s.locks == nil {
-		if err := nativelease.ValidateOpening(s.databasePath, false); err != nil {
+		if err := nativelease.ValidateOpening(s.databasePath, nativelease.Opening{File: s.fileLeaseRecovery != nil}); err != nil {
 			return err
 		}
 		if err := validateLeaseMutation(ctx, tx); err != nil {

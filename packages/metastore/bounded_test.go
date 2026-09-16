@@ -9,6 +9,7 @@ import (
 	"unsafe"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func TestChangeResultStopsBeforeAChangeThatBelongsInTheNextPage(t *testing.T) {
@@ -22,7 +23,7 @@ func TestChangeResultStopsBeforeAChangeThatBelongsInTheNextPage(t *testing.T) {
 	if err != nil || !fits {
 		t.Fatalf("reserve first change: fits=%v err=%v", fits, err)
 	}
-	if err := first.Commit([]byte("four"), nil, "", nil); err != nil {
+	if err := first.Commit([]byte("four"), nil, "", nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if reservation, fits, err := result.Reserve(metastore.Change{}, metastore.ChangePayloadLengths{Name: 2}); err != nil || fits || reservation != nil {
@@ -42,7 +43,7 @@ func TestOversizedChangeInvalidatesEveryRetainedChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	reservation, _, err := result.Reserve(metastore.Change{}, metastore.ChangePayloadLengths{Name: 1})
-	if err != nil || reservation.Commit([]byte("a"), nil, "", nil) != nil {
+	if err != nil || reservation.Commit([]byte("a"), nil, "", nil, nil, nil) != nil {
 		t.Fatalf("retain first change: %v", err)
 	}
 	if _, _, err := result.Reserve(metastore.Change{}, metastore.ChangePayloadLengths{Name: 5}); !errors.Is(err, syscall.EFBIG) {
@@ -63,7 +64,7 @@ func TestChangeResultOwnsChargedPayloadAndTimeInstants(t *testing.T) {
 	location := time.FixedZone(strings.Repeat("location", 1<<17), 3600)
 	instant := time.Date(2026, time.September, 4, 12, 34, 56, 789, location)
 	meta := metastore.Change{From: &metastore.Location{}, Node: &metastore.Node{AccessTime: instant, ModTime: instant}}
-	reservation, fits, err := result.Reserve(meta, metastore.ChangePayloadLengths{Name: 1, FromName: 1, Content: 1})
+	reservation, fits, err := result.Reserve(meta, metastore.ChangePayloadLengths{Name: 1, FromName: 1, Content: 1, Metadata: 6})
 	if err != nil || !fits {
 		t.Fatalf("reserve: fits=%v err=%v", fits, err)
 	}
@@ -72,7 +73,7 @@ func TestChangeResultOwnsChargedPayloadAndTimeInstants(t *testing.T) {
 	name, fromName := large[len(large)-3:len(large)-2], large[len(large)-2:len(large)-1]
 	contentBacking := strings.Repeat("unretained", 1<<17) + "c"
 	content := metastore.Key(contentBacking[len(contentBacking)-1:])
-	if err := reservation.Commit(name, fromName, content, nil); err != nil {
+	if err := reservation.Commit(name, fromName, content, emptyMetadata(t), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	changes, err := result.Changes()
@@ -105,7 +106,7 @@ func TestRowResultRequiresCommitAndOwnsChargedPayload(t *testing.T) {
 	instant := time.Date(2026, time.September, 4, 1, 2, 3, 4, location)
 	reservation, fits, err := result.Reserve(
 		metastore.Row{Node: metastore.Node{AccessTime: instant, ModTime: instant}},
-		metastore.RowPayloadLengths{Name: 1, Content: 1},
+		metastore.RowPayloadLengths{Metadata: 6, Name: 1, Content: 1},
 	)
 	if err != nil || !fits {
 		t.Fatalf("reserve: fits=%v err=%v", fits, err)
@@ -118,7 +119,7 @@ func TestRowResultRequiresCommitAndOwnsChargedPayload(t *testing.T) {
 	name := backing[len(backing)-2 : len(backing)-1]
 	contentBacking := strings.Repeat("unretained", 1<<17) + "c"
 	content := metastore.Key(contentBacking[len(contentBacking)-1:])
-	if err := reservation.Commit(name, content); err != nil {
+	if err := reservation.Commit(name, content, emptyMetadata(t), nil); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := result.Rows()
@@ -180,7 +181,7 @@ func TestReservationsDoNotRetainZeroLengthViewsOfLargeBackingStorage(t *testing.
 	}
 	if _, fits, err := rowResult.Reserve(metastore.Row{
 		Name: zeroBytes, Node: metastore.Node{Content: zeroString},
-	}, metastore.RowPayloadLengths{}); err != nil || !fits {
+	}, metastore.RowPayloadLengths{Metadata: 6}); err != nil || !fits {
 		t.Fatalf("row reserve: fits=%v err=%v", fits, err)
 	}
 }
@@ -198,7 +199,7 @@ func TestFailedPagesDiscardCommittedAndPendingResults(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !pending {
-			if err := change.Commit([]byte("x"), nil, "", nil); err != nil {
+			if err := change.Commit([]byte("x"), nil, "", nil, nil, nil); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -214,7 +215,7 @@ func TestFailedPagesDiscardCommittedAndPendingResults(t *testing.T) {
 		if got, fits, err := changes.Reserve(metastore.Change{}, metastore.ChangePayloadLengths{}); got != nil || fits || err != failure {
 			t.Fatalf("failed reserve = %v, %v, %v", got, fits, err)
 		}
-		if pending && change.Commit([]byte("x"), nil, "", nil) != failure {
+		if pending && change.Commit([]byte("x"), nil, "", nil, nil, nil) != failure {
 			t.Fatal("pending change survived failure")
 		}
 
@@ -222,12 +223,12 @@ func TestFailedPagesDiscardCommittedAndPendingResults(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		row, _, err := rows.Reserve(metastore.Row{}, metastore.RowPayloadLengths{Name: 1})
+		row, _, err := rows.Reserve(metastore.Row{}, metastore.RowPayloadLengths{Metadata: 6, Name: 1})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if !pending {
-			if err := row.Commit([]byte("x"), ""); err != nil {
+			if err := row.Commit([]byte("x"), "", emptyMetadata(t), nil); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -240,10 +241,10 @@ func TestFailedPagesDiscardCommittedAndPendingResults(t *testing.T) {
 		if got, err := rows.Rows(); got != nil || err != failure {
 			t.Fatalf("failed rows = %v, %v", got, err)
 		}
-		if got, fits, err := rows.Reserve(metastore.Row{}, metastore.RowPayloadLengths{}); got != nil || fits || err != failure {
+		if got, fits, err := rows.Reserve(metastore.Row{}, metastore.RowPayloadLengths{Metadata: 6}); got != nil || fits || err != failure {
 			t.Fatalf("failed reserve = %v, %v, %v", got, fits, err)
 		}
-		if pending && row.Commit([]byte("x"), "") != failure {
+		if pending && row.Commit([]byte("x"), "", emptyMetadata(t), nil) != failure {
 			t.Fatal("pending row survived failure")
 		}
 	}
@@ -285,14 +286,14 @@ func TestRowPageBoundsAndPayloadMismatch(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			first, fits, err := result.Reserve(metastore.Row{}, metastore.RowPayloadLengths{Name: 3})
+			first, fits, err := result.Reserve(metastore.Row{}, metastore.RowPayloadLengths{Metadata: 6, Name: 3})
 			if err != nil || !fits {
 				t.Fatalf("first reserve = %v, %v", fits, err)
 			}
-			if err := first.Commit([]byte("one"), ""); err != nil {
+			if err := first.Commit([]byte("one"), "", emptyMetadata(t), nil); err != nil {
 				t.Fatal(err)
 			}
-			next, fits, err := result.Reserve(metastore.Row{}, metastore.RowPayloadLengths{Name: tc.second})
+			next, fits, err := result.Reserve(metastore.Row{}, metastore.RowPayloadLengths{Metadata: 6, Name: tc.second})
 			if next != nil || fits || !errors.Is(err, tc.want) {
 				t.Fatalf("next reserve = %v, %v, %v", next, fits, err)
 			}
@@ -310,14 +311,109 @@ func TestRowPageBoundsAndPayloadMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reservation, _, err := result.Reserve(metastore.Row{}, metastore.RowPayloadLengths{Name: 1, Content: 1})
+	reservation, _, err := result.Reserve(metastore.Row{}, metastore.RowPayloadLengths{Metadata: 6, Name: 1, Content: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reservation.Commit([]byte("too long"), "k"); !errors.Is(err, syscall.EIO) {
+	if err := reservation.Commit([]byte("too long"), "k", emptyMetadata(t), nil); !errors.Is(err, syscall.EIO) {
 		t.Fatal(err)
 	}
 	if rows, err := result.Rows(); rows != nil || !errors.Is(err, syscall.EIO) {
 		t.Fatalf("mismatched payload exposed %v, %v", rows, err)
+	}
+}
+
+func emptyMetadata(t *testing.T) []byte {
+	t.Helper()
+	data, err := storage.EncodeMetadata(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestReservedNodePayloadsAreBoundedAndOwned(t *testing.T) {
+	opaque := storage.Metadata{{Key: "client", Version: 1, Data: []byte{0xff, 1}}}
+	encoded, err := storage.EncodeMetadata(opaque)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := []byte{0xff, 'x'}
+	instant := time.Unix(1, 0)
+	node := metastore.Node{CreationTime: &instant, ChangeTime: &instant}
+	result, err := metastore.NewRowResult(100, 0, func(_ int, _ metastore.Row, l metastore.RowPayloadLengths) (int64, error) {
+		return l.Metadata + l.Target, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation, fits, err := result.Reserve(metastore.Row{Node: node}, metastore.RowPayloadLengths{Metadata: int64(len(encoded)), Target: int64(len(target))})
+	if err != nil || !fits {
+		t.Fatalf("reserve %v %v", fits, err)
+	}
+	instant = instant.Add(time.Second)
+	if err := reservation.Commit(nil, "", encoded, target); err != nil {
+		t.Fatal(err)
+	}
+	encoded[len(encoded)-1] = 9
+	target[0] = 1
+	rows, err := result.Rows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].Node.Metadata[0].Data[1] != 1 || rows[0].Node.LinkTarget[0] != 0xff || !rows[0].Node.CreationTime.Equal(time.Unix(1, 0)) || !rows[0].Node.ChangeTime.Equal(time.Unix(1, 0)) {
+		t.Fatal("retained node aliases producer")
+	}
+	for _, lengths := range []metastore.RowPayloadLengths{{Metadata: storage.MaxMetadataBytes + 1}, {Target: storage.MaxLinkTargetBytes + 1}, {Metadata: -1}, {Target: -1}} {
+		next, err := metastore.NewRowResult(1<<20, 0, func(int, metastore.Row, metastore.RowPayloadLengths) (int64, error) {
+			t.Fatal("invalid bytes reached charge")
+			return 0, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := next.Reserve(metastore.Row{}, lengths); err == nil {
+			t.Fatalf("invalid lengths %+v", lengths)
+		}
+	}
+}
+
+func TestNodePayloadFailuresInvalidateReservedPages(t *testing.T) {
+	for _, bad := range [][]byte{nil, []byte("broken")} {
+		rows, err := metastore.NewRowResult(100, 0, func(int, metastore.Row, metastore.RowPayloadLengths) (int64, error) { return 1, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		reserved, _, err := rows.Reserve(metastore.Row{}, metastore.RowPayloadLengths{Metadata: int64(len(bad))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := reserved.Commit(nil, "", bad, nil); !errors.Is(err, syscall.EIO) {
+			t.Fatalf("corrupt row payload: %v", err)
+		}
+		if got, err := rows.Rows(); got != nil || !errors.Is(err, syscall.EIO) {
+			t.Fatalf("corrupt rows exposed: %+v %v", got, err)
+		}
+		changes, err := metastore.NewChangeResult(100, 0, func(int, metastore.Change, metastore.ChangePayloadLengths) (int64, error) { return 1, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending, _, err := changes.Reserve(metastore.Change{Node: &metastore.Node{}}, metastore.ChangePayloadLengths{Metadata: int64(len(bad))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pending.Commit(nil, nil, "", bad, nil, nil); !errors.Is(err, syscall.EIO) {
+			t.Fatalf("corrupt change payload: %v", err)
+		}
+	}
+	for _, node := range []metastore.Node{{Metadata: storage.Metadata{{Key: "client", Version: 1}}}, {LinkTarget: []byte("target")}} {
+		rows, _ := metastore.NewRowResult(100, 0, func(int, metastore.Row, metastore.RowPayloadLengths) (int64, error) { return 1, nil })
+		if _, _, err := rows.Reserve(metastore.Row{Node: node}, metastore.RowPayloadLengths{}); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("preloaded row admitted: %v", err)
+		}
+		changes, _ := metastore.NewChangeResult(100, 0, func(int, metastore.Change, metastore.ChangePayloadLengths) (int64, error) { return 1, nil })
+		if _, _, err := changes.Reserve(metastore.Change{Node: &node}, metastore.ChangePayloadLengths{}); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("preloaded change admitted: %v", err)
+		}
 	}
 }

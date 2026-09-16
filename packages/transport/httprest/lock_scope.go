@@ -1,14 +1,9 @@
 package httprest
 
 import (
-	"bytes"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
-	"reflect"
-	"unicode/utf8"
 
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -119,19 +114,10 @@ func decodeVolumeLockFailure(body []byte) (*locking.Error, error) {
 		LockCode locking.Code `json:"lockCode"`
 		Recorded bool         `json:"recorded"`
 	}
-	if !utf8.Valid(body) {
-		return nil, errors.New("invalid lock error response encoding")
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	if err := checkLockJSON(decoder, reflect.TypeOf(response)); err != nil {
+	if err := decodeCheckedMessageJSON(body, &response, MaxLockProofs, validateLockJSONScalar); err != nil {
 		return nil, errors.New("invalid lock error response")
 	}
-	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		return nil, errors.New("trailing lock error response content")
-	}
-	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, errors.New("invalid lock error response")
-	}
+
 	errno, ok := storage.ErrnoByName(response.Errno)
 	if !ok || !validLockCode(response.LockCode) || errno != locking.Errno(response.LockCode) {
 		return nil, errors.New("inconsistent lock error classification")

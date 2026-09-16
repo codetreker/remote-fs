@@ -1,4 +1,5 @@
--- Independent schema version 3 fixture for the current prerelease migration set.
+-- Frozen schema version 3 with two populated volumes.
+-- DDL source: https://github.com/codetreker/remote-fs/blob/134e936ce3bde78a9db7becdfbccd72d6efe7536/packages/metastore/sqlite/testdata/schema.sql
 -- Tables precede indexes for execution; SQLite creates sqlite_sequence itself.
 -- Fixed rows exercise identity, content metadata, retained history, and durability migration.
 
@@ -25,8 +26,7 @@ CREATE TABLE changes (
 	mtime_nsec        INTEGER,
 	content           TEXT,
 	recorded_sec      INTEGER NOT NULL,
-	recorded_nsec     INTEGER NOT NULL,
-	notification      BLOB NOT NULL
+	recorded_nsec     INTEGER NOT NULL
 );
 
 CREATE TABLE database_state (
@@ -57,8 +57,7 @@ CREATE TABLE volumes (
 	id   INTEGER PRIMARY KEY AUTOINCREMENT,
 	name TEXT    NOT NULL UNIQUE,
 	root INTEGER NOT NULL,
-	used INTEGER NOT NULL,
-	windows_name_version INTEGER NOT NULL DEFAULT 0
+	used INTEGER NOT NULL
 );
 
 CREATE TABLE nodes (
@@ -70,12 +69,6 @@ CREATE TABLE nodes (
 	atime_nsec INTEGER NOT NULL,
 	mtime_sec  INTEGER NOT NULL,
 	mtime_nsec INTEGER NOT NULL,
-	windows_creation_sec INTEGER NOT NULL DEFAULT 0,
-	windows_creation_nsec INTEGER NOT NULL DEFAULT 0,
-	windows_change_sec INTEGER NOT NULL DEFAULT 0,
-	windows_change_nsec INTEGER NOT NULL DEFAULT 0,
-	windows_attributes INTEGER NOT NULL DEFAULT 0,
-	windows_link_target BLOB NOT NULL DEFAULT X'',
 	content    TEXT REFERENCES objects(key)
 );
 
@@ -161,20 +154,16 @@ INSERT INTO logs (volume, incarnation, committed_position, trimmed_through, trim
 
 INSERT INTO changes (
     position, previous_position, volume, kind, parent, name, from_parent, from_name,
-    node, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content, recorded_sec, recorded_nsec, notification
+    node, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content, recorded_sec, recorded_nsec
 ) VALUES
     (1, 0, 1, 0, 1, X'616C7068612E747874', NULL, NULL,
-     2, 416, 5, 1700000100, 201, 1700000100, 202, 'historical-alpha-object', 1700000100, 203,
-     CAST('{"SubjectID":2,"SubjectKind":0,"Directory":false,"ChangeMask":1,"Before":null,"After":{"Ancestors":[{"DirectoryID":1,"Name":null}],"LeafName":"YWxwaGEudHh0"}}' AS BLOB)),
+     2, 416, 5, 1700000100, 201, 1700000100, 202, 'historical-alpha-object', 1700000100, 203),
     (2, 0, 2, 0, 3, X'627261766F2E747874', NULL, NULL,
-     4, 384, 7, 1700000300, 401, 1700000300, 402, 'historical-bravo-object', 1700000300, 403,
-     CAST('{"SubjectID":4,"SubjectKind":0,"Directory":false,"ChangeMask":1,"Before":null,"After":{"Ancestors":[{"DirectoryID":3,"Name":null}],"LeafName":"YnJhdm8udHh0"}}' AS BLOB)),
+     4, 384, 7, 1700000300, 401, 1700000300, 402, 'historical-bravo-object', 1700000300, 403),
     (3, 1, 1, 2, 1, X'616C7068612E747874', NULL, NULL,
-     2, 416, 5, 1700000100, 201, 1700000100, 202, 'historical-alpha-object', 1700000400, 501,
-     CAST('{"SubjectID":2,"SubjectKind":0,"Directory":false,"ChangeMask":0,"Before":{"Ancestors":[{"DirectoryID":1,"Name":null}],"LeafName":"YWxwaGEudHh0"},"After":{"Ancestors":[{"DirectoryID":1,"Name":null}],"LeafName":"YWxwaGEudHh0"}}' AS BLOB)),
+     2, 416, 5, 1700000100, 201, 1700000100, 202, 'historical-alpha-object', 1700000400, 501),
     (4, 2, 2, 2, 3, X'627261766F2E747874', NULL, NULL,
-     4, 384, 7, 1700000300, 401, 1700000300, 402, 'historical-bravo-object', 1700000400, 502,
-     CAST('{"SubjectID":4,"SubjectKind":0,"Directory":false,"ChangeMask":0,"Before":{"Ancestors":[{"DirectoryID":3,"Name":null}],"LeafName":"YnJhdm8udHh0"},"After":{"Ancestors":[{"DirectoryID":3,"Name":null}],"LeafName":"YnJhdm8udHh0"}}' AS BLOB));
+     4, 384, 7, 1700000300, 401, 1700000300, 402, 'historical-bravo-object', 1700000400, 502);
 
 INSERT INTO database_state (singleton, database_id, generation, node_high_water, change_high_water)
 VALUES (1, '33333333333333333333333333333333', 9, 4, 4);

@@ -8,7 +8,6 @@ import (
 	"unsafe"
 
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
-	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 type leaseIdentity struct {
@@ -101,10 +100,10 @@ func newLeaseTable(limits Limits) *leaseTable {
 }
 
 func (t *leaseTable) begin(ctx context.Context, clientGUID [16]byte, request wire.LeaseRequest, volumeIdentity, requestName string) (*leaseAdmission, error) {
-	if request.Version != wire.LeaseVersion1 && request.Version != wire.LeaseVersion2 || request.State&^uint32(7) != 0 || volumeIdentity == "" || len(requestName) > storage.WindowsMaxNameInfoBytes {
+	if request.Version != wire.LeaseVersion1 && request.Version != wire.LeaseVersion2 || request.State&^uint32(7) != 0 || volumeIdentity == "" || len(requestName) > windowsMaxPathBytes {
 		return nil, syscall.EINVAL
 	}
-	fixed := 2*int64(storage.WindowsMaxNameInfoBytes) + leaseReservationFixed
+	fixed := 2*int64(windowsMaxPathBytes) + leaseReservationFixed
 	if int64(len(volumeIdentity)) > t.maxBytes-fixed {
 		return nil, syscall.ENOMEM
 	}
@@ -178,15 +177,15 @@ func (a *leaseAdmission) commit(identity leaseIdentity, deleteOnClose bool) (*le
 	if a.state != leaseReserved || entry == nil || entry.admission != a {
 		return nil, wire.LeaseResponse{}, syscall.EIO
 	}
-	if identity.Volume != a.volume || identity.NodeID == 0 || len(identity.Name) > storage.WindowsMaxNameInfoBytes {
+	if identity.Volume != a.volume || identity.NodeID == 0 || len(identity.Name) > windowsMaxPathBytes {
 		a.fenceLocked()
 		return nil, wire.LeaseResponse{}, syscall.EIO
 	}
-	state := storage.WindowsNameLinked
+	state := windowsNameLinked
 	if identity.Root {
-		state = storage.WindowsNameRoot
+		state = windowsNameRoot
 	}
-	if err := (storage.WindowsNameInfo{State: state, Path: identity.Name}).Check(); err != nil {
+	if err := (windowsNameInfo{State: state, Path: identity.Name}).Check(); err != nil {
 		a.fenceLocked()
 		return nil, wire.LeaseResponse{}, err
 	}

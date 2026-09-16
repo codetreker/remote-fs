@@ -12,11 +12,11 @@ import (
 func TestNodeRelationshipsRejectBrokenRootsAndCycles(t *testing.T) {
 	for _, test := range []struct{ name, mutation, diagnostic string }{
 		{"missing root", `UPDATE volumes SET root=900`, "invalid volume roots"},
-		{"two names", `INSERT INTO entries VALUES(1,1,X'616c696173',2)`, "entry cardinality"},
-		{"file parent", `UPDATE entries SET parent=2`, "invalid relationship"},
+		{"two names", `INSERT INTO entries(id,volume,parent,name,node) VALUES(4,1,1,X'616c696173',2)`, "entry cardinality"},
+		{"file parent", `UPDATE entries SET parent=2`, "invalid endpoints"},
 		{"detached with name", `UPDATE nodes SET detached=1 WHERE id=2`, "entry cardinality"},
-		{"cross volume", `UPDATE entries SET volume=20`, "invalid relationship"},
-		{"unreachable cycle", fmt.Sprintf(`UPDATE nodes SET mode=%d,size=0,content=NULL WHERE id=2; UPDATE entries SET parent=2`, fs.ModeDir|0o755), "outside their volume root"},
+		{"cross volume", `UPDATE entries SET volume=20`, "invalid endpoints"},
+		{"unreachable cycle", `UPDATE nodes SET kind=2,directory_revision=1,size=0,content=NULL WHERE id=2; UPDATE entries SET parent=2`, "outside their volume root"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			db := testDatabase(t, 0)
@@ -62,7 +62,7 @@ func TestUsedAccountingRejectsOverflowAndInvalidScalars(t *testing.T) {
 		{"counter text", `UPDATE volumes SET used='bad'`, "1 volumes with an invalid used counter"},
 		{"negative counter", `UPDATE volumes SET used=-1`, "1 volumes with an invalid used counter"},
 		{"size text", `UPDATE nodes SET size='bad' WHERE id=2`, "1 nodes with invalid accounting values"},
-		{"mode text", `UPDATE nodes SET mode='bad' WHERE id=2`, "1 nodes with invalid accounting values"},
+		{"kind text", `UPDATE nodes SET kind='bad' WHERE id=2`, "1 nodes with invalid accounting values"},
 		{"mismatched total", `UPDATE volumes SET used=0`, "1 volumes whose used counter disagrees"},
 		{"overflow", `UPDATE nodes SET size=9223372036854775807 WHERE id=2`, "1 volumes whose file sizes overflow"},
 	} {

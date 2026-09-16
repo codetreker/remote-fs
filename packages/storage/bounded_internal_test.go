@@ -7,7 +7,7 @@ import (
 )
 
 func TestListReservationOwnsOnlyTimeInstantsBeforeCommit(t *testing.T) {
-	result, err := NewListResult(1024, 0, func(_ int, nameBytes int64, _ Attr) (int64, error) {
+	result, err := NewListResult(1024, 0, func(_ int, nameBytes, metadataBytes int64, _ Attr) (int64, error) {
 		return nameBytes + 1, nil
 	})
 	if err != nil {
@@ -16,7 +16,7 @@ func TestListReservationOwnsOnlyTimeInstantsBeforeCommit(t *testing.T) {
 	location := time.FixedZone(strings.Repeat("location", 1<<17), 3600)
 	access := time.Date(2026, time.September, 4, 12, 34, 56, 789, location)
 	modified := access.Add(time.Hour)
-	reservation, err := result.Reserve(1, Attr{AccessTime: access, ModTime: modified})
+	reservation, err := result.Reserve(1, 6, Attr{AccessTime: access, ModTime: modified})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,7 +3,6 @@ package smb
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"syscall"
 	"testing"
 
@@ -20,7 +19,7 @@ func countLeaseOrphans(a *authoritySession) int {
 }
 
 type leaseClosingSession struct {
-	storage.WindowsSession
+	windowsSession
 	failures, closes int
 	retired          bool
 }
@@ -31,7 +30,7 @@ func (s *leaseClosingSession) Close(ctx context.Context) error {
 		s.failures--
 		return syscall.EIO
 	}
-	if err := s.WindowsSession.Close(ctx); err != nil {
+	if err := s.windowsSession.Close(ctx); err != nil {
 		return err
 	}
 	s.retired = true
@@ -42,12 +41,12 @@ func (s *leaseClosingSession) Status(ctx context.Context) (storage.FileSessionSt
 	if s.retired {
 		return storage.FileSessionStatus{}, syscall.ESTALE
 	}
-	return s.WindowsSession.Status(ctx)
+	return s.windowsSession.Status(ctx)
 }
 
 func TestLeaseUnknownOwnerTransfersToSharedAuthorityUntilConfirmedClose(t *testing.T) {
 	c, session, first, _, backend, _ := testConnection(t)
-	closing := &leaseClosingSession{WindowsSession: backend, failures: 2}
+	closing := &leaseClosingSession{windowsSession: backend, failures: 2}
 	authority := &authoritySession{session: closing, refs: 2, epoch: 1}
 	session.authorities = map[*Export]*authoritySession{first.export: authority}
 	first.authority = authority
@@ -56,15 +55,15 @@ func TestLeaseUnknownOwnerTransfersToSharedAuthorityUntilConfirmedClose(t *testi
 	first.files.session = closing
 	first.files.leases = newLeaseOwner(c.server.leases, c.clientGUID, first.export.volumeIdentity)
 	first.files.leases.authority = authority
-	second := &tree{id: 2, sessionID: session.id, export: first.export, session: closing, authority: authority, done: make(chan struct{}), files: newFileDispatcher(first.export.share.Backend, closing, 1, c.server.config.Limits)}
+	second := &tree{id: 2, sessionID: session.id, export: first.export, session: closing, authority: authority, done: make(chan struct{}), files: newFileDispatcher(first.export.backend, closing, 1, c.server.config.Limits)}
 	second.files.authority = authority
 	second.files.leases = newLeaseOwner(c.server.leases, c.clientGUID, first.export.volumeIdentity)
 	second.files.leases.authority = authority
 	session.trees[2] = second
 	first.export.refs++
 	backend.queryErr = syscall.EIO
-	backend.open = func(storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
-		return storage.WindowsOpenResult{}, syscall.EIO
+	backend.open = func(windowsOpenRequest) (windowsOpenResult, error) {
+		return windowsOpenResult{}, syscall.EIO
 	}
 	if _, status := first.files.create(t.Context(), leaseCreate(t, "", 9, 1)); status != fileIOError {
 		t.Fatalf("unknown create status=%x", status)
@@ -194,7 +193,7 @@ type leaseDelayedCloseReply struct {
 	resume    chan struct{}
 }
 
-func (f *leaseDelayedCloseReply) Close(ctx context.Context, id storage.WindowsActionID) (storage.WindowsActionResult, error) {
+func (f *leaseDelayedCloseReply) Close(ctx context.Context, id windowsActionID) (windowsActionResult, error) {
 	result, err := f.commandFile.Close(ctx, id)
 	close(f.completed)
 	<-f.resume
@@ -205,17 +204,17 @@ func TestSharedAuthorityCloseLinearizesBeforeLateLeaseInstall(t *testing.T) {
 	for _, failures := range []int{0, 1} {
 		t.Run(map[int]string{0: "confirmed", 1: "unknown"}[failures], func(t *testing.T) {
 			d, file, base, table := leaseTestDispatcher(t)
-			closing := &leaseClosingSession{WindowsSession: base, failures: failures}
+			closing := &leaseClosingSession{windowsSession: base, failures: failures}
 			authority := &authoritySession{session: closing, refs: 2, epoch: 1}
 			d.authority = authority
 			d.leases.authority = authority
 			d.session = closing
-			root := &leaseDelayedCloseReply{commandFile: &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 1, Mode: fs.ModeDir}}, NameInfo: storage.WindowsNameInfo{State: storage.WindowsNameRoot}}}, completed: make(chan struct{}), resume: make(chan struct{})}
-			base.open = func(request storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
+			root := &leaseDelayedCloseReply{commandFile: &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}, NameInfo: windowsNameInfo{State: windowsNameRoot}}}, completed: make(chan struct{}), resume: make(chan struct{})}
+			base.open = func(request windowsOpenRequest) (windowsOpenResult, error) {
 				if request.Lookup.Name == "" {
-					return storage.WindowsOpenResult{File: root, Attr: root.attr}, nil
+					return windowsOpenResult{File: root, Attr: root.attr}, nil
 				}
-				return storage.WindowsOpenResult{File: file, Attr: file.attr}, nil
+				return windowsOpenResult{File: file, Attr: file.attr}, nil
 			}
 			request := leaseCreate(t, "file", byte(20+failures), 1)
 			done := make(chan uint32, 1)
@@ -247,15 +246,15 @@ func TestSharedAuthorityCloseLinearizesBeforeLateLeaseInstall(t *testing.T) {
 
 func TestSharedConfirmedFenceDrainsTreesWithoutRetiredActions(t *testing.T) {
 	c, session, first, _, backend, _ := testConnection(t)
-	closing := &leaseClosingSession{WindowsSession: backend}
+	closing := &leaseClosingSession{windowsSession: backend}
 	authority := &authoritySession{session: closing, refs: 2, epoch: 1}
 	session.authorities = map[*Export]*authoritySession{first.export: authority}
 	first.authority = authority
 	first.files.authority = authority
 	first.files.session = closing
-	second := &tree{id: 2, sessionID: session.id, export: first.export, session: closing, authority: authority, files: newFileDispatcher(first.export.share.Backend, closing, 1, DefaultLimits())}
+	second := &tree{id: 2, sessionID: session.id, export: first.export, session: closing, authority: authority, files: newFileDispatcher(first.export.backend, closing, 1, DefaultLimits())}
 	second.files.authority = authority
-	file := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 9}}}}
+	file := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{Kind: storage.NodeRegular, ID: 9}}}}
 	second.files.handles[wire.FileID{2}] = &fileHandle{file: file}
 	session.trees[2] = second
 	first.export.refs++

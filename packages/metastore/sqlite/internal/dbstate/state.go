@@ -14,8 +14,10 @@ import (
 )
 
 type State struct {
-	DatabaseID      string
-	Generation      int64
+	DatabaseID string
+	Generation int64
+	// NodeHighWater also reserves entry identities from schema version 6 onward.
+	// Keeping this counter preserves the external durable-witness representation.
 	NodeHighWater   int64
 	ChangeHighWater int64
 }
@@ -145,6 +147,12 @@ const globalChangeIdentityBoundsQuery = `
 		          ORDER BY max(committed_position, trimmed_through) DESC LIMIT 1), 0)`
 
 func Validate(ctx context.Context, db sqlvalue.Queryer) (State, error) {
+	return ValidateVersion(ctx, db, 6)
+}
+
+// ValidateVersion is used for explicit source-format preflight during migration.
+// Serving operations always use Validate and require the current schema.
+func ValidateVersion(ctx context.Context, db sqlvalue.Queryer, version int) (State, error) {
 	state, err := Read(ctx, db)
 	if err != nil {
 		return State{}, err
@@ -202,8 +210,30 @@ func Validate(ctx context.Context, db sqlvalue.Queryer) (State, error) {
 			"durable high-water marks nodes=%d and changes=%d are below surviving identities nodes=%d and changes=%d: %w",
 			state.NodeHighWater, state.ChangeHighWater, maximumNode, maximumChange, syscall.EIO)
 	}
+	if version >= 6 {
+		if err := validateSharedIdentityBounds(ctx, db, state.NodeHighWater); err != nil {
+			return State{}, err
+		}
+	}
 
 	return state, nil
+}
+
+// Inspect validates a recorded source format without treating it as a serving
+// database. This is used to obtain startup evidence before schema preparation.
+func Inspect(ctx context.Context, db sqlvalue.Queryer) (State, error) {
+	var raw any
+	var storageClass string
+	if err := db.QueryRowContext(ctx, `SELECT
+		CASE WHEN typeof(version) = 'integer' THEN version END, typeof(version)
+		FROM schema_version`).Scan(&raw, &storageClass); err != nil {
+		return State{}, err
+	}
+	version, ok := sqlvalue.StoredInteger(raw, storageClass)
+	if !ok || version < 3 || version > 6 {
+		return State{}, fmt.Errorf("cannot inspect durable state for schema version %v: %w", raw, syscall.EIO)
+	}
+	return ValidateVersion(ctx, db, int(version))
 }
 
 func AdvanceGeneration(ctx context.Context, tx *sql.Tx) (State, error) {

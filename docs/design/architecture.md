@@ -1,6 +1,6 @@
 # 顶层设计
 
-本文描述实际实现中的角色、所有权、交互和数据流，角色内部见 `server/` 与 `client/`。当前公共层仍包含 Windows 专用访问、持久命名启用及 Linux advisory 规则，尚不满足 R-FS-9、R-INT-8、R-INT-14 的平台边界；[平台客户端隔离提案](../../.agents/notes/proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)定义待实施的共同原语和迁移，不代表下文接口已改变。
+本文描述角色、所有权、交互和数据流，内部设计见 `server/` 与 `client/`。客户端解释所在平台的文件系统语义；远端通过共同身份、版本、claims 和原子操作维护跨入口事实。取舍见[平台客户端隔离决定](../../.agents/notes/implemented/architecture/2026-09-16-isolate-platform-filesystem-clients.md)。
 
 ## 一、两个角色
 
@@ -8,7 +8,7 @@
 
 **server** —— volume 与文件占有的权威持有者。它将原生支持发布检查的 **storage** 与对应锁服务配对，经 HTTP 暴露出去。volume 的事实、有效授权和修改顺序以这里为准。
 
-**client** —— volume 的使用者。它通过 remote storage 的路径接口与保留文件接口访问数据，通过标准 advisory 协调参与者，并通过显式 S/X 控制取得与核对强权限；client 侧通过 Linux FUSE 或 Windows 本机 SMB 把 volume 呈现给操作系统。普通文件打开不自动执行显式 S/X 占有策略。Windows 共享模式与范围访问限制由 authority 按独立语义执行。
+**client** —— volume 的使用者。它通过 remote storage 的路径接口与保留对象接口访问数据，通过显式 S/X 控制取得与核对强权限；Linux FUSE 与 Windows 本机 SMB 分别解释平台的名字、属性、owner、锁转换与关闭规则。普通打开不自动选择 S/X 策略。平台规则映射成共同 claims、范围集合和身份条件，所有入口由同一 authority 排序。
 
 一个 server 面对多个 client（R-CON-1）。client 之间不直接通信。
 
@@ -23,14 +23,14 @@ flowchart LR
         Fuse --> Replica[本地元数据副本]
         Replica --> Remote[remote storage]
         SDK[显式 S/X 控制]
-        Fuse -. 文件引用与 advisory .-> Replica
+        Fuse -. 对象引用与范围状态 .-> Replica
     end
     subgraph server[server]
         HTTP[HTTP v3]
         subgraph Pair[同一授权方的 volume 与锁服务]
             volume[enforcing volume] --> Backend[原生 backend]
             Authority[强 S/X 与动作历史]
-            Files[保留对象与 advisory]
+            Files[保留对象与访问声明]
             volume --> Files
             Backend -. 最终转换检查 .-> Authority
         end
@@ -53,7 +53,7 @@ flowchart LR
 
 ## 三、同一个接口，两个模块
 
-client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storage.Storage` 基础接口**，并提供有界结果扩展 `storage.BoundedStorage`。`FileStorage` 提供普通保留文件与 advisory 能力；`WindowsStorage`、`WindowsSession` 与 `WindowsFile` 提供 Windows 命名启用、目录引用、共享模式和范围访问。强 S/X 控制与 mutation scope 是另外的成对能力。
+client 侧的 remote storage 与 server 侧 storage 实现同一份 `storage.Storage` 基础接口，并提供 `BoundedStorage` 有界结果。`FileStorage`、`FileSession` 与 `File` 提供文件／目录／符号链接的保留身份、条件操作、claims、范围状态和有限动作结果。强 S/X 与 mutation scope 是独立的成对能力。
 
 它们**不是同一个模块**，也不在同一个角色里：server 侧的那个真正持有数据；client 侧的那个不保存权威内容，它把调用翻译为 HTTP 交换，并保存完成核对所需的有限能力与动作状态。
 
@@ -66,7 +66,7 @@ client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storag
 
 基础 storage 描述 volume 操作，锁控制描述跨请求的占有与核对，HTTP 同时承载它们和复制。各自的义务不能由另一层猜测补齐。
 
-**内核接入与权威状态分离。** 当前底层提供按路径寻址的基础 volume、`FileStorage` 的普通文件与 advisory，以及 `WindowsStorage` 的 Windows 访问、目录引用与动作结果。这些接口不依赖内核句柄，但仍解释平台规则。FUSE 保存内核编号和 owner 的映射，SMB 保存 session/tree/open 映射；对象在 rename、unlink 或覆盖后的存活由服务端保留引用保证，不由旧路径重建。Windows 的 lookup 与 rename 还携带父目录身份和 leaf name，WindowsBasicAttr 与当前名字信息来自 authority。
+**平台解释属于客户端。** FUSE 保存内核 inode／owner 映射并解释 Unix 权限与进程关闭；SMB 保存 session/tree/open 映射并解释 Windows 名字、DOS、共享与删除规则。远端只处理精确名字、NodeKind、通用时间、opaque metadata、版本与身份条件。保留引用使对象在 rename、unlink 或覆盖后继续存活；名字相关操作用完整位置 witness 校验祖先条件，纯身份 I/O 不由旧路径重建。后端对宿主 OS 的 fsync／flock 等持久实现仍在服务端。
 
 **节点身份在契约里**（R-FS-5）。属性带一个 `ID`，说的是「这个名字后面是哪个节点」，与它此刻叫什么无关。挂载呈现层分不出这件事就会把两个活着的节点报成一个：一个描述符会读到别人的字节，而 mmap 了它的程序拿到 SIGBUS。而挂载点只直接观测到自己执行的操作，别的客户端做的改名不经过它的任何一条路径，所以这个答案只能由 volume 给。
 
@@ -88,7 +88,7 @@ client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storag
 
 `storage.BoundedStorage` 在不改变上述十一个操作的前提下增加三项 server-backend 义务：`CheckBounded` 在服务前验证所有依赖都能接收结果预算；`ReadBounded` 在完整 payload 分配前按 byte bound 拒绝；`ListBounded` 把 entry 逐项交给调用方持有的 `ListResult`，在保留超限 entry 之前失败。普通 `Read` 与 `List` 仍是直接调用者可用的整份结果 API；只有要把 volume 从可嵌入 server 发布出去的调用方必须依赖有界扩展（R-INT-3、R-INT-6）。
 
-属性是节点身份、模式（类型位与权限位）、文件内容的字节数、内容最后被读取的时间与最后改变的时间。身份是一个不透明值，只可比较相等；它随节点走过改名，两个同时存在的节点不共用一个，而 0 不是取值 —— 一个不填它的实现会让每次比较都相等，也就是把所有节点报成同一个节点。可以写回去的是权限位（含 setuid、setgid、sticky）与那两个时间；节点的类型不在其中，`SetAttr` 收到带类型位的模式以 `EINVAL` 拒绝。一次 `SetAttr` 点了不止一个属性时不保证整体生效，报告失败时可能已经改掉了其中一部分。列目录内联属性使得列出 n 个条目花一次调用而不是 n+1 次，这在跨网络时是往返次数的量级差别（R-WS-4）。
+Attr 包含非零节点身份、NodeKind、大小、访问／修改时间、可空的创建／change time、metadata／directory revision 与有界 opaque Metadata。身份只可比较相等，随节点改名，两个同时存在的节点不共用身份。SetAttr 更新命名的通用时间或带 ExpectedRevision 的 metadata；POSIX mode、setuid／setgid／sticky 与 owner 由 [FUSE](client/architecture.md)解释。基础 SetAttr 多字段修改不保证失败时整体回滚，保留对象的固定条件操作提供自己的原子边界。列目录内联属性仍使 n 个条目只需一次调用，而非 n+1 次（R-WS-4）。
 
 根不是任何调用方建出来的节点，删除它、移动它、把别的东西放到它的位置，都不是这个接口提供的操作。若允许，一个根被删掉的 volume 此后对一切回答 `ENOENT` —— 那句话说的是「那个文件不在」，而事实是 volume 不在。
 
@@ -101,7 +101,7 @@ client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storag
 | 义务 | 违反的后果 |
 |---|---|
 | 内容替换是原子的：并发的读者看到旧内容的全部、或新内容的全部，或者一个说得出「这次没读到」的失败 | 其它 client 读到撕裂的文件（R-CON-3、R-CC-5） |
-| 每个操作作用于名字上的那个节点，不是它指向的节点：符号链接被描述为符号链接，`Read` 与 `Write` 对它报 `ELOOP`，设模式报 `EOPNOTSUPP`，设时间落在链接自己身上 | 名字底下悄悄换成了另一个对象，上层的读、写、删除落在它没有点过名的地方（R-ERR-2） |
+| 每个操作作用于名字上的节点，符号链接的 Kind、大小、时间与 metadata 都属于链接自身；Read／Write 对链接报 ELOOP，target 作为数据由客户端解释，不在 remote 自动跟随 | 名字底下悄悄换成了另一个对象，上层的读、写、删除落在它没有点过名的地方（R-ERR-2） |
 | 已命名错误以 `syscall.Errno` 呈现；纯请求取消可保留 context 原因，边界通过 `storage.ErrnoOf` 统一分类 | 挂载与传输对同一结果作出不同判断，或把已发生的修改当成可安全重试的请求 |
 | 判定不了的情况按错误报告，绝不替换成「不存在」或空目录 | 上层把「够不到」当成「不存在」，据此执行破坏性动作（R-ERR-1、R-ERR-2） |
 | 绝对路径、以及爬出根的路径，一律以 `EINVAL` 拒绝 | volume 之外的文件可被读写 |
@@ -115,11 +115,11 @@ client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storag
 
 这些义务的可执行形式是 `packages/storage/storagetest`：`Run` 验证一般 volume 契约，`RunBounded` 验证可发布 server backend 的结果预算与取消义务（R-INT-3、R-INT-6）。
 
-**保留文件接口**：`FileStorage.NewFileSession` 建立有限会话，`OpenFile` 按路径打开，`OpenNode` 按身份打开；`File` 提供当前属性、区间读取、同步补丁、截断、Sync 和 advisory 控制。每次读取返回同一对象状态的属性与字节，写入在对应调用上确认。失去名字的对象仍存活并收费，直到引用退役、操作排空和最后释放完成。普通重叠写入按实际提交顺序生效，完整契约见[打开的文件](server/file-handles.md)。
+**保留对象接口**：`FileStorage.NewFileSession` 建立有限会话并返回初始 status；Retain／RetainAt 按身份及精确 slot 取得引用，Create／Reset／ReplaceAndRetainAt 原子组合内容、metadata、claim 与引用。File 提供一致观察、范围 I/O、目录分页、名字条件操作、范围 CAS／等待和删除生命周期。每次写入在对应调用上确认，失去名字的内容仍计费，直到退役、排空与释放完成。完整契约见[保留对象](server/file-handles.md)。
 
 **强 S/X 控制接口**：显式创建 Session / Owner，解析现有普通文件，取得、续期、解除与核对 S/X 授予。修改只使用调用方给出的有界不可变 proof 集合，普通读取不声称 grant 有效。所有修改，包括匿名调用，都在原生最终转换处遵守占有顺序；重启通过持久最大时长证据与恢复屏障保留已确认保护。身份、动作结果、当前 grant 状态与内容版本分别定义，完整契约见 [文件锁设计](server/file-locks.md)。
 
-**HTTP 接口**：跨角色的实际边界。v3 转发基础 storage、保留文件、advisory 与显式 S/X 控制及复制的订阅、续订、快照和 checkpoint，并必须满足：
+**HTTP 接口**：跨角色的实际边界。v3 转发基础 storage、保留对象、通用访问控制与显式 S/X 控制及复制的订阅、续订、快照和 checkpoint，并必须满足：
 
 | 义务 | 违反的后果 |
 |---|---|
@@ -140,7 +140,7 @@ Checkpoint 是普通有界读取：原子返回日志 incarnation 与已提交�
 
 client 侧的 remote storage 实现 storage 接口，凡是不满足上述任何一条的答案，它一律以 `EIO` 报告，绝不把它变成一句关于 volume 的话。
 
-当前 Windows 命名兼容由显式启用并持久保存的 volume 状态实现；发布 share 只检查状态。它对其它入口施加 Windows 名字限制，是平台隔离提案要移除的实现约束。Windows share/access 与范围锁检查在原生受控操作处排序，Linux 与编程入口不能通过协议差异绕过它们；这一跨入口保护仍须由目标共同原语维持。变更记录携带有界、不可变的通知事实；SMB 的变更来源由宿主注入，与其数据 backend 同源。具体接口与呈现行为见 [Windows 本机 SMB](client/windows-smb.md)。
+Windows Publish 不安装持久命名 profile。SMB 在本地对同一目录版本进行完整名字投影，将精确身份与祖先条件送到最终操作；其它入口可以创建 Windows 不可表示的名字，此时受影响的 Windows 观察明确失败。共享访问与范围限制以共同 claims／ranges 在原生操作处排序，不能通过换入口绕过。变更记录携带有界、不可变的事件时位置和 metadata 图像；SMB 变更源由宿主注入，与数据 backend 同源。见 [Windows 本机 SMB](client/windows-smb.md)。
 
 一次应用大读写跨多个协议请求时的保证单位仍是 R-CON-5【未决】；本文的接口与数据流不替这项需求选择答案。
 
@@ -165,7 +165,7 @@ FileSession、对象引用、advisory owner 与有限控制历史属于挂载生
 ### 读写
 
 ```
-程序 open     ──▶ 挂载层 ──▶ FileSession.OpenNode，保留对象
+程序 open     ──▶ 挂载层 ──▶ FileSession.Retain，保留对象
 程序 read     ──▶ File.ReadAt ──HTTP──▶ 同一对象状态的属性与字节
 程序 write    ──▶ File.WriteAt ─HTTP──▶ 当前状态上的区间修改，确认后成功
 程序 truncate ──▶ File.Truncate ─────▶ 原子长度修改，确认后成功
@@ -227,7 +227,6 @@ go.mod
 
 packages/                    可被外部与自身 import
   locking/                   强 S/X 权限状态、有限历史与原生发布协调
-  advisory/                  标准 flock/POSIX owner、范围、等待与有限历史
   authz/                     嵌入方授权接口与请求，复用 storage 的操作和打开意图
   storage/                   接口、volume 服务操作、实现者义务与 errno 词汇（两个角色共用）
     locked/                  enforcing backend 与其授权方的配对，提供不可变 scope
@@ -261,7 +260,7 @@ docs/
 |---|---|
 | `storage` | 两个角色共用：接口、volume 服务的语义操作与错误词汇 |
 | `authz` | 传输中性的业务授权类型；由嵌入方与 server adapter 使用 |
-| `advisory` | server 侧，按 volume 共享标准锁状态 |
+| `internal/fileaccess`、`internal/filebudget` | server 侧，由原生 fileDomain 共享 claims、范围／等待和内容预算；平台规则在客户端 |
 | `storage/storagetest` | 测试专用：volume 与 bounded-server 契约的可执行形式 |
 | `storage/localstore` | server 侧，持有本地对象与绑定的 SQLite metastore |
 | `storage/objectstore`、`storage/objectstore/azblob`、`storage/objectstore/localdisk` | server 侧 |

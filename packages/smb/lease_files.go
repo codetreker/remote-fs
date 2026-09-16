@@ -31,8 +31,8 @@ type leaseOpen struct {
 	prev, next              *leaseOpen
 	attached                bool
 	uncertain               bool
-	file, probe             storage.WindowsFile
-	openAction, probeAction storage.WindowsActionID
+	file, probe             windowsFile
+	openAction, probeAction windowsActionID
 }
 
 func newLeaseOwner(table *leaseTable, client [16]byte, volume string) *leaseOwner {
@@ -75,7 +75,7 @@ func (o *leaseOwner) removePending(p *leaseOpen) {
 	p.attached = false
 }
 
-func (p *leaseOpen) beforeAction(id storage.WindowsActionID, probe bool) error {
+func (p *leaseOpen) beforeAction(id windowsActionID, probe bool) error {
 	authorityClosed := p.owner.authority != nil && p.owner.authority.isStopping()
 	p.owner.mu.Lock()
 	defer p.owner.mu.Unlock()
@@ -91,7 +91,7 @@ func (p *leaseOpen) beforeAction(id storage.WindowsActionID, probe bool) error {
 	return nil
 }
 
-func (p *leaseOpen) outcome(file storage.WindowsFile, known, probe bool) {
+func (p *leaseOpen) outcome(file windowsFile, known, probe bool) {
 	p.owner.mu.Lock()
 	defer p.owner.mu.Unlock()
 	p.uncertain = !known
@@ -219,18 +219,18 @@ func (o *leaseOwner) releaseAll() {
 	}
 }
 
-func (o *leaseOwner) identity(attr storage.WindowsAttr) (leaseIdentity, error) {
-	if attr.ID == 0 || attr.NameInfo.Check() != nil || attr.NameInfo.State == storage.WindowsNameDetached {
+func (o *leaseOwner) identity(attr windowsAttr) (leaseIdentity, error) {
+	if attr.ID == 0 || attr.NameInfo.Check() != nil || attr.NameInfo.State == windowsNameDetached {
 		return leaseIdentity{}, syscall.EIO
 	}
-	root := attr.NameInfo.State == storage.WindowsNameRoot
+	root := attr.NameInfo.State == windowsNameRoot
 	if root && !attr.IsDir() {
 		return leaseIdentity{}, syscall.EIO
 	}
 	return leaseIdentity{Volume: o.volume, NodeID: attr.ID, Name: attr.NameInfo.Path, Root: root}, nil
 }
 
-func (d *fileDispatcher) leaseLookup(ctx context.Context, p *leaseOpen, lookup storage.WindowsLookup, intent storage.WindowsOpenIntent) (storage.WindowsLookup, error) {
+func (d *fileDispatcher) leaseLookup(ctx context.Context, p *leaseOpen, lookup windowsLookup, intent windowsOpenIntent) (windowsLookup, error) {
 	previous, requireSame := p.admission.expected()
 	if previous.NodeID == 0 {
 		return lookup, nil
@@ -238,14 +238,14 @@ func (d *fileDispatcher) leaseLookup(ctx context.Context, p *leaseOpen, lookup s
 	if requireSame && previous.Volume != p.owner.volume {
 		return lookup, syscall.EINVAL
 	}
-	id, err := d.actionID()
+	id, err := d.actionID(ctx)
 	if err != nil {
 		return lookup, err
 	}
 	if err := p.beforeAction(id, true); err != nil {
 		return lookup, err
 	}
-	probe, known, err := d.openOutcome(ctx, storage.WindowsOpenRequest{Lookup: lookup, WindowsOpenIntent: storage.WindowsOpenIntent{Share: storage.WindowsShareAll, Disposition: storage.WindowsOpen, OpenReparsePoint: intent.OpenReparsePoint}}, id)
+	probe, known, err := d.openOutcome(ctx, windowsOpenRequest{Lookup: lookup, windowsOpenIntent: windowsOpenIntent{Share: windowsShareAll, Disposition: windowsOpen, OpenReparsePoint: intent.OpenReparsePoint}}, id)
 	p.outcome(probe.File, known, true)
 	if err != nil {
 		if storage.ErrnoOf(err) == syscall.ENOENT && !requireSame && known && probe.File == nil {
@@ -254,7 +254,7 @@ func (d *fileDispatcher) leaseLookup(ctx context.Context, p *leaseOpen, lookup s
 		return lookup, err
 	}
 	identity, identityErr := p.owner.identity(probe.Attr)
-	closeID, closeErr := d.actionID()
+	closeID, closeErr := d.actionID(ctx)
 	if closeErr != nil {
 		p.retain()
 		d.fence()
@@ -264,7 +264,7 @@ func (d *fileDispatcher) leaseLookup(ctx context.Context, p *leaseOpen, lookup s
 		return lookup, err
 	}
 	result, closeErr := probe.File.Close(ctx, closeID)
-	if d.mutationResult(closeID, result, closeErr) != 0 {
+	if d.mutationResult(ctx, closeID, result, closeErr) != 0 {
 		p.retain()
 		d.fence()
 		return lookup, syscall.EIO
@@ -272,6 +272,9 @@ func (d *fileDispatcher) leaseLookup(ctx context.Context, p *leaseOpen, lookup s
 	p.outcome(nil, true, true)
 	if identityErr != nil {
 		return lookup, identityErr
+	}
+	if requireSame && intent.Disposition == windowsSupersede {
+		return lookup, syscall.EINVAL
 	}
 	if requireSame && (identity.NodeID != previous.NodeID || identity.Volume != previous.Volume) {
 		return lookup, syscall.EINVAL

@@ -38,7 +38,7 @@ func (a *Anchor) verify() error {
 	if err := a.validateBindingFD(); err != nil {
 		return err
 	}
-	expected, err := encodeLeaseRecord("binding", a.intent.Binding)
+	expected, err := encodeLeaseRecord(a.recordKind("binding"), a.intent.Binding)
 	if err != nil {
 		return err
 	}

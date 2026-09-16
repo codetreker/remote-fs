@@ -20,7 +20,7 @@ Flush  → Write(P)，旧缓冲区覆盖现在占据 P 的对象
 
 旧路径被删除时，无条件 Write 还可能把名字重新创建出来。`node.path()` 跟随本挂载点的 go-fuse 名字树，所以本挂载点自己执行改名时写入能跟随；其它客户端改名不经过这棵树，那个机制保护不到它。原子保存是编辑器、构建工具、`sed -i` 与 `rsync` 的日常模式，触发这种错误不需要受害者与别人主动修改同一个名字。
 
-[名字不是身份](../../implemented/bug-fix/2026-09-01-a-name-is-not-an-identity.md)先让路径查询带回节点身份，修复部分 inode 混用；身份比较并未持有对象，也未改变当时的提交路径。如今 FileSession.OpenNode、StatNode、SetNodeAttr 及 File 操作按身份访问；创建并打开把存在性判断、初始属性、截断与返回引用放进同一结果。旧的 Open 中 Stat→Read、非零 truncate 中 Stat→Read→Write、设时间前 Flush 的文件复合路径因而由新机制接续。
+[名字不是身份](../../implemented/bug-fix/2026-09-01-a-name-is-not-an-identity.md)先让路径查询带回节点身份，修复部分 inode 混用；身份比较并未持有对象，也未改变当时的提交路径。如今 FileSession.Retain、RetainAt、StatNode、SetNodeAttr 及 File 操作按身份访问；创建并打开把存在性判断、初始属性、截断与返回引用放进同一结果。旧的 Open 中 Stat→Read、非零 truncate 中 Stat→Read→Write、设时间前 Flush 的文件复合路径因而由新机制接续。
 
 这不是把打开期间冻结成快照。一次 ReadAt 的字节、大小与 EOF 必须相容；多个读取调用可以看见不同的已完成修改。[缓冲内容与长度](../../implemented/bug-fix/2026-09-07-bind-buffered-reads-to-their-size.md)及[跨句柄页缓存](../../implemented/bug-fix/2026-09-07-prevent-cross-handle-page-cache-staleness.md)分别保留旧缺陷的复现与验收范围。
 
@@ -36,7 +36,7 @@ R-CC-1 另外要求调用方能够显式选择内容版本前置条件。内部 
 
 [FUSE 节点实现](../../../../packages/fuse/node.go)的 path、Readdir 与目录子项操作仍使用名字树派生路径；go-fuse 的 [stableAttrs inode 复用](https://github.com/hanwen/go-fuse/blob/423b377e1452ab7b3522229185a3047f72e3f966/fs/bridge.go#L178-L238)、[目录父关系更新](https://github.com/hanwen/go-fuse/blob/423b377e1452ab7b3522229185a3047f72e3f966/fs/inode.go#L326-L345)与[最近父关系选择](https://github.com/hanwen/go-fuse/blob/423b377e1452ab7b3522229185a3047f72e3f966/fs/inode_parents.go#L7-L45)共同构成这项推导。它与已经保留的普通 File 引用不同：固定文件对象不能自动固定目录子项操作的父对象。
 
-在执行前单独 Stat(parentID) 只能证明检查时该父对象存在，检查与随后按路径修改之间仍能换对象。最终访问必须受权威父身份约束，不能从一次先验检查推导后续路径仍指向它。具体操作形状与验证由后续实现确定，本文不声明已有目录句柄能力。
+在执行前单独 Stat(parentID) 只能证明检查时该父对象存在，检查与随后按路径修改之间仍能换对象。最终访问必须受权威父身份约束，不能从一次先验检查推导后续路径仍指向它。[平台隔离决定](../../implemented/architecture/2026-09-16-isolate-platform-filesystem-clients.md)已提供通用目录引用、LookupAt／ListAt 和最终父条件；FUSE 的全部名字路径是否正确采用这些能力仍须对上述交错验证，不能从公共接口存在推导该入口已完成迁移。
 
 ## 提案
 
@@ -46,7 +46,7 @@ R-CC-1 另外要求调用方能够显式选择内容版本前置条件。内部 
 
 版本是不透明、仅可比等的令牌，见[定序与版本](2026-08-19-ordering-and-versions.md)。内容改变必须改变版本；时间戳加长度不能证明这一点。内容哈希可以检测字节变化，却认不出两个内容相同的不同对象，因此不能替代目标身份。Grant generation、advisory owner、FileSession revision 与日志位置都不是调用方的内容依据。
 
-若工作流表达「此前不存在」，须有明确的创建前置条件，目标已存在则拒绝，不能以空版本暗示无条件写入。这与普通非排他 OpenFile(Create) 打开竞争胜者的语义分别定义。
+若工作流表达「此前不存在」，须有明确的创建前置条件，目标已存在则拒绝，不能以空版本暗示无条件写入。这与普通非排他创建打开竞争胜者的语义分别定义。
 
 这个目标不改变普通 File.WriteAt / Truncate 的 Linux 语义，也不自动给 Open 取得 S/X。R-CC-4 仍决定显式版本冲突由哪一次调用报告及调用方如何处理；属性更新是否携带内容版本亦未在本提案中决定。已经发生或无法判定的发布不能包装成一次可安全重试的未执行。
 

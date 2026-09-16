@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -14,7 +16,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-func openPublicationFile(t *testing.T) (*LockingStore, metastore.File) {
+func openPublicationFile(t *testing.T) (*LockingStore, *fileReference) {
 	t.Helper()
 	config := lockingTestConfig(t)
 	config.Allowance = 100
@@ -22,13 +24,24 @@ func openPublicationFile(t *testing.T) (*LockingStore, metastore.File) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0o600})
+	if err := s.Create(t.Context(), "file"); err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	node, err := s.Stat(t.Context(), "file")
 	if err != nil {
 		s.Close()
 		t.Fatal(err)
 	}
+	native, _, err := s.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		s.Close()
+		t.Fatal(err)
+	}
+	session := native.(*fileSession)
+	f := retainRangeFile(t, session, uint64(node.ID))
 	t.Cleanup(func() {
-		if err := f.Close(context.Background()); err != nil {
+		if err := session.Dispose(context.Background()); err != nil {
 			t.Error(err)
 		}
 		if err := s.Close(); err != nil {
@@ -38,9 +51,36 @@ func openPublicationFile(t *testing.T) (*LockingStore, metastore.File) {
 	return s, f
 }
 
+func startPublication(t *testing.T, f *fileReference, operation storage.FileIO) storage.FileActionID {
+	t.Helper()
+	id := fileActionID(t, f.session)
+	_, fresh, err := f.BeginContent(t.Context(), id, [32]byte{}, operation)
+	if err != nil || !fresh {
+		t.Fatalf("content admission=%v %v", fresh, err)
+	}
+	return id
+}
+
+func publicationTarget(t *testing.T, s *LockingStore, session *fileSession, name string) storage.EntryTarget {
+	t.Helper()
+	receipt, err := session.Retain(t.Context(), storage.RetainRequest{NodeID: uint64(s.root)}, fileActionID(t, session))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, live, err := session.Reference(t.Context(), receipt.Reference)
+	if err != nil || !live {
+		t.Fatalf("parent reference=%v %v", live, err)
+	}
+	entry, err := parent.LookupAt(t.Context(), []byte(name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return storage.EntryTarget{Parent: receipt.Reference, ParentID: uint64(s.root), Name: []byte(name), DirectoryRevision: entry.DirectoryRevision, ExpectedEntryID: entry.EntryID, ExpectedNodeID: entry.Attr.ID, ExpectedMetadataRevision: entry.Attr.MetadataRevision}
+}
+
 func TestRetiredReferenceCannotPublishAPreviouslyReservedObject(t *testing.T) {
 	s, f := openPublicationFile(t)
-	before, err := f.Node(t.Context())
+	before, err := f.Capture(t.Context(), storage.FileIO{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,14 +88,15 @@ func TestRetiredReferenceCannotPublishAPreviouslyReservedObject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	action := startPublication(t, f, storage.FileIO{Write: true, Length: 7})
 	if err := s.Remove(t.Context(), "file"); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Retire(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Commit(t.Context(), before.Revision, metastore.Object{Key: key, Size: 7, ModTime: time.Now()}); !errors.Is(err, syscall.ESTALE) {
-		t.Fatalf("retired commit: %v", err)
+	if _, err := f.CommitContent(t.Context(), action, before.Revision, metastore.Object{Key: key, Size: 7, ModTime: time.Now()}); !errors.Is(err, syscall.EBADF) {
+		t.Fatalf("retired commit=%v", err)
 	}
 	var nodes, reserved int
 	if err := s.read.QueryRow(`SELECT (SELECT count(*) FROM nodes WHERE id=? AND detached=1),(SELECT state FROM objects WHERE key=?)`, before.ID, string(key)).Scan(&nodes, &reserved); err != nil {
@@ -65,22 +106,22 @@ func TestRetiredReferenceCannotPublishAPreviouslyReservedObject(t *testing.T) {
 		t.Fatalf("physical node=%d object state=%d", nodes, reserved)
 	}
 	if used, err := s.Usage(t.Context()); err != nil || used != 0 {
-		t.Fatalf("usage=%d error=%v", used, err)
+		t.Fatalf("usage=%d %v", used, err)
 	}
 	if err := s.Abandon(t.Context(), key); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Close(t.Context()); err != nil {
+	if _, err := f.Close(t.Context(), fileActionID(t, f.session)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.StatNode(t.Context(), uint64(before.ID)); !errors.Is(err, syscall.ESTALE) {
-		t.Fatalf("released node: %v", err)
+	if _, err := f.session.StatNode(t.Context(), uint64(before.ID), storage.ObservationOptions{}); !errors.Is(err, syscall.ESTALE) {
+		t.Fatalf("released node=%v", err)
 	}
 }
 
 func TestRetirementOrdersAfterAnAdmittedFinalPublication(t *testing.T) {
 	s, f := openPublicationFile(t)
-	before, err := f.Node(t.Context())
+	before, err := f.Capture(t.Context(), storage.FileIO{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +129,11 @@ func TestRetirementOrdersAfterAnAdmittedFinalPublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	action := startPublication(t, f, storage.FileIO{Write: true, Length: 9})
 	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
 	ctx := storage.WithPublicationAccounting(t.Context(), func(previous, next int64) (storage.PublicationSettlement, error) {
 		if previous != 0 || next != 9 {
 			return nil, fmt.Errorf("wrong accounting %d -> %d", previous, next)
@@ -104,22 +149,22 @@ func TestRetirementOrdersAfterAnAdmittedFinalPublication(t *testing.T) {
 	})
 	committed := make(chan error, 1)
 	go func() {
-		_, err := f.Commit(ctx, before.Revision, metastore.Object{Key: key, Size: 9, ModTime: time.Now()})
+		_, err := f.CommitContent(ctx, action, before.Revision, metastore.Object{Key: key, Size: 9, ModTime: time.Now()})
 		committed <- err
 	}()
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("publication did not reach its final gate")
+		t.Fatal("publication did not reach final gate")
 	}
 	retired := make(chan error, 1)
 	go func() { retired <- f.Retire(t.Context()) }()
 	select {
 	case err := <-retired:
-		t.Fatalf("retirement passed an active final publication: %v", err)
+		t.Fatalf("retirement passed active publication=%v", err)
 	default:
 	}
-	close(release)
+	unblock()
 	if err := <-committed; err != nil {
 		t.Fatal(err)
 	}
@@ -128,16 +173,16 @@ func TestRetirementOrdersAfterAnAdmittedFinalPublication(t *testing.T) {
 	}
 	node, err := s.Stat(t.Context(), "file")
 	if err != nil || node.Size != 9 {
-		t.Fatalf("published node=%+v error=%v", node, err)
+		t.Fatalf("published node=%+v %v", node, err)
 	}
-	if _, err := f.Commit(t.Context(), before.Revision+1, metastore.Object{}); !errors.Is(err, syscall.ESTALE) {
-		t.Fatalf("later commit: %v", err)
+	if _, _, err := f.BeginContent(t.Context(), fileActionID(t, f.session), [32]byte{}, storage.FileIO{Write: true, Truncate: true}); !errors.Is(err, syscall.EBADF) {
+		t.Fatalf("later publication=%v", err)
 	}
 }
 
 func TestRetainedCleanupKnownRefusalPreservesThePinForRetry(t *testing.T) {
 	s, f := openPublicationFile(t)
-	state, err := f.Node(t.Context())
+	state, err := f.Capture(t.Context(), storage.FileIO{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +190,8 @@ func TestRetainedCleanupKnownRefusalPreservesThePinForRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Commit(t.Context(), state.Revision, metastore.Object{Key: key, Size: 5, ModTime: time.Now()}); err != nil {
+	action := startPublication(t, f, storage.FileIO{Write: true, Length: 5})
+	if _, err := f.CommitContent(t.Context(), action, state.Revision, metastore.Object{Key: key, Size: 5, ModTime: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Remove(t.Context(), "file"); err != nil {
@@ -158,17 +204,17 @@ func TestRetainedCleanupKnownRefusalPreservesThePinForRetry(t *testing.T) {
 		}
 		return nil, refused
 	})
-	if err := f.Close(ctx); !errors.Is(err, refused) {
-		t.Fatalf("cleanup refusal: %v", err)
+	if _, err := f.Close(ctx, fileActionID(t, f.session)); !errors.Is(err, refused) {
+		t.Fatalf("cleanup refusal=%v", err)
 	}
 	if used, err := s.Usage(t.Context()); err != nil || used != 5 {
-		t.Fatalf("refused cleanup usage=%d error=%v", used, err)
+		t.Fatalf("refused cleanup usage=%d %v", used, err)
 	}
-	if err := f.Close(t.Context()); err != nil {
+	if _, err := f.Close(t.Context(), fileActionID(t, f.session)); err != nil {
 		t.Fatal(err)
 	}
 	if used, err := s.Usage(t.Context()); err != nil || used != 0 {
-		t.Fatalf("retried cleanup usage=%d error=%v", used, err)
+		t.Fatalf("retried cleanup usage=%d %v", used, err)
 	}
 }
 
@@ -178,20 +224,27 @@ func (w *retainedFailureWitness) Accept(DurableState) error     { return w.failu
 func (w *retainedFailureWitness) Checkpoint(DurableState) error { return nil }
 
 func TestRetainedCleanupUnknownAcceptanceKeepsPhysicalOwnership(t *testing.T) {
-	config := lockingTestConfig(t)
-	s, err := OpenLocking(t.Context(), config)
+	s, err := OpenLocking(t.Context(), lockingTestConfig(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
+	if err := s.Create(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	node, err := s.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	native, _, err := s.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
 	if err != nil {
 		s.Close()
 		t.Fatal(err)
 	}
+	session := native.(*fileSession)
+	f := retainRangeFile(t, session, uint64(node.ID))
 	if err := s.Remove(t.Context(), "file"); err != nil {
 		t.Fatal(err)
 	}
-	ref := f.(*retainedFile)
 	acceptErr := errors.New("retained cleanup acceptance unavailable")
 	s.witness = &retainedFailureWitness{failure: acceptErr}
 	var settlements atomic.Int32
@@ -204,26 +257,26 @@ func TestRetainedCleanupUnknownAcceptanceKeepsPhysicalOwnership(t *testing.T) {
 			return nil
 		}, nil
 	})
-	err = f.Close(ctx)
+	id := fileActionID(t, session)
+	_, err = f.Close(ctx, id)
 	if !errors.Is(err, acceptErr) || !storage.IsPublicationAccountingUncertain(err) {
-		t.Fatalf("unknown cleanup: %v", err)
+		t.Fatalf("unknown cleanup=%v", err)
 	}
-	if again := f.Close(ctx); !errors.Is(again, acceptErr) || settlements.Load() != 1 {
+	if _, again := f.Close(ctx, id); !errors.Is(again, acceptErr) || settlements.Load() != 1 {
 		t.Fatalf("repeated cleanup=%v settlements=%d", again, settlements.Load())
 	}
-	if s.coordinator.pins[retainedNode{s.volume, ref.id}] != 1 || len(s.files) != 1 || s.leaseOwner.FD() < 0 {
+	if s.coordinator.pins[retainedNode{s.volume, f.id}] != 1 || len(s.files) != 1 || s.leaseOwner.FD() < 0 {
 		t.Fatal("unknown cleanup released native retention")
 	}
 	if err := s.Close(); !errors.Is(err, syscall.EBUSY) {
-		t.Fatalf("store close with unresolved reference: %v", err)
+		t.Fatalf("store close with unresolved reference=%v", err)
 	}
-	// Model process teardown after observing that public cleanup kept every hold.
+	// Process teardown follows the assertion that ordinary cleanup kept ownership.
 	if err := s.locks.Close(); err != nil && !errors.Is(err, acceptErr) {
 		t.Fatal(err)
 	}
 	s.locks = nil
 	s.witness = nil
-	s.files = nil
 	if err := s.Abort(); err != nil {
 		t.Fatal(err)
 	}
@@ -231,19 +284,27 @@ func TestRetainedCleanupUnknownAcceptanceKeepsPhysicalOwnership(t *testing.T) {
 
 func TestStrongGrantsRetireTheNameWhileOrdinaryReferencesKeepTheNode(t *testing.T) {
 	s, file := openPublicationFile(t)
-	f := publicationFixture{store: s.Store, service: s.LockService()}
-	f.put(t, t.Context(), "file", 5)
-	owner := f.owner(t)
-	grant := f.grant(t, owner, "file", locking.Exclusive)
-	opened, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true}, Mode: 0o777})
+	fixture := publicationFixture{store: s.Store, service: s.LockService()}
+	fixture.put(t, t.Context(), "file", 5)
+	owner := fixture.owner(t)
+	grant := fixture.grant(t, owner, "file", locking.Exclusive)
+	node, err := s.Stat(t.Context(), "file")
 	if err != nil {
-		t.Fatalf("ordinary open while strongly protected: %v", err)
+		t.Fatal(err)
 	}
-	if err := opened.Close(t.Context()); err != nil {
+	opened, err := file.session.Retain(t.Context(), storage.RetainRequest{NodeID: uint64(node.ID), Claim: storage.AccessClaim{Uses: storage.ReadContent}}, fileActionID(t, file.session))
+	if err != nil {
+		t.Fatalf("ordinary retain while strongly protected=%v", err)
+	}
+	ref, _, err := file.session.Reference(t.Context(), opened.Reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ref.Close(t.Context(), fileActionID(t, file.session)); err != nil {
 		t.Fatal(err)
 	}
 	requirePublicationCode(t, s.Remove(t.Context(), "file"), locking.Conflict)
-	state, err := file.Node(t.Context())
+	state, err := file.Capture(t.Context(), storage.FileIO{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,13 +329,18 @@ func TestStrongGrantsRetireTheNameWhileOrdinaryReferencesKeepTheNode(t *testing.
 	}
 	status, err := s.locks.QueryGrant(t.Context(), owner, grant)
 	if err != nil || status.State != locking.TargetGone {
-		t.Fatalf("retired grant=%+v error=%v", status, err)
+		t.Fatalf("retired grant=%+v %v", status, err)
 	}
 	err = (sqliteNative{s.Store}).Guard(t.Context(), s.backendKey(state.ID), func() error { return errors.New("detached node passed named guard") })
 	requirePublicationCode(t, err, locking.StaleResource)
-	updated, err := file.Commit(t.Context(), state.Revision, metastore.Object{ModTime: time.Now()})
-	if err != nil || !updated.Detached || updated.ID != state.ID {
-		t.Fatalf("retained write after strong retirement=%+v error=%v", updated, err)
+	action := startPublication(t, file, storage.FileIO{Write: true, Truncate: true})
+	updated, err := file.CommitContent(t.Context(), action, state.Revision, metastore.Object{ModTime: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err := file.Capture(t.Context(), storage.FileIO{})
+	if err != nil || !observed.Detached || observed.ID != state.ID || updated.Observation.Attr.ID != uint64(state.ID) {
+		t.Fatalf("retained write after strong retirement=%+v %v", observed, err)
 	}
 }
 
@@ -290,25 +356,41 @@ func TestSharedDatabaseOwnershipRefusesNativeRetentionBeforeMutation(t *testing.
 		}
 	}()
 	if err := s.CheckFileStore(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("shared native capability=%v", err)
+	}
+	if _, err := s.FileState(t.Context()); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("shared capability=%v", err)
 	}
-	if _, err := s.OpenFile(t.Context(), "forbidden", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Create: true}}); !errors.Is(err, syscall.EOPNOTSUPP) {
-		t.Fatalf("shared create/open=%v", err)
+	if _, _, err := s.NewFileSession(t.Context(), storage.DefaultFileSessionOptions()); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("shared session=%v", err)
 	}
 	if _, err := s.Stat(t.Context(), "forbidden"); !errors.Is(err, syscall.ENOENT) {
-		t.Fatalf("refused retention created a name: %v", err)
+		t.Fatalf("refused retention created name=%v", err)
 	}
 }
 
 func TestFilePublicationGuardRefusesEveryIdentityMutationAtFinalAdmission(t *testing.T) {
-	for _, operation := range []string{"create", "truncate-open", "truncate-node", "commit", "file-attributes", "node-attributes"} {
+	for _, operation := range []string{"create", "reset-and-retain", "truncate-reference", "commit", "file-attributes", "node-attributes"} {
 		t.Run(operation, func(t *testing.T) {
 			s, file := openPublicationFile(t)
-			f := publicationFixture{store: s.Store, service: s.LockService()}
-			f.put(t, t.Context(), "file", 5)
-			before, err := file.Node(t.Context())
+			fixture := publicationFixture{store: s.Store, service: s.LockService()}
+			fixture.put(t, t.Context(), "file", 5)
+			before, err := file.Capture(t.Context(), storage.FileIO{})
 			if err != nil {
 				t.Fatal(err)
+			}
+			var target storage.EntryTarget
+			if operation == "create" {
+				target = publicationTarget(t, s, file.session, "new")
+			} else if operation == "reset-and-retain" {
+				target = publicationTarget(t, s, file.session, "file")
+			}
+			var reserved metastore.Key
+			if operation == "commit" {
+				reserved, err = file.Reserve(t.Context(), 5)
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 			position, err := s.CommittedPosition(t.Context())
 			if err != nil {
@@ -319,110 +401,222 @@ func TestFilePublicationGuardRefusesEveryIdentityMutationAtFinalAdmission(t *tes
 			at := time.Now()
 			switch operation {
 			case "create":
-				_, err = s.OpenFile(ctx, "new", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Create: true}})
-			case "truncate-open":
-				_, err = s.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Truncate: true}})
-			case "truncate-node":
-				_, err = s.OpenNode(ctx, uint64(before.ID), storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Truncate: true}})
+				_, err = file.session.CreateAndRetainAt(ctx, storage.CreateAndRetainRequest{Target: target, Initial: storage.NodeInitial{Kind: storage.NodeRegular}, Claim: storage.AccessClaim{Uses: storage.WriteContent}}, fileActionID(t, file.session))
+			case "reset-and-retain":
+				_, err = file.session.ResetAndRetainAt(ctx, storage.ResetAndRetainRequest{Target: target, ExpectedRevision: before.MetadataRevision, Claim: storage.AccessClaim{Uses: storage.WriteContent}}, fileActionID(t, file.session))
+			case "truncate-reference":
+				action := startPublication(t, file, storage.FileIO{Write: true, Truncate: true})
+				_, err = file.CommitContent(ctx, action, before.Revision, metastore.Object{ModTime: at})
 			case "commit":
-				_, err = file.Commit(ctx, before.Revision, metastore.Object{ModTime: at})
+				action := startPublication(t, file, storage.FileIO{Write: true, Length: 5})
+				_, err = file.CommitContent(ctx, action, before.Revision, metastore.Object{Key: reserved, Size: 5, ModTime: at})
 			case "file-attributes":
-				_, err = file.SetAttr(ctx, storage.AttrChange{ModTime: &at})
+				_, err = file.SetAttr(ctx, storage.AttrChange{ExpectedRevision: before.MetadataRevision, ModTime: &at}, fileActionID(t, file.session))
 			case "node-attributes":
-				_, err = s.SetNodeAttr(ctx, uint64(before.ID), storage.AttrChange{ModTime: &at})
+				_, err = file.session.SetNodeAttr(ctx, uint64(before.ID), storage.AttrChange{ExpectedRevision: before.MetadataRevision, ModTime: &at}, fileActionID(t, file.session))
 			}
 			if !errors.Is(err, syscall.ESTALE) || calls != 1 {
 				t.Fatalf("guard result=%v calls=%d", err, calls)
 			}
-			after, err := file.Node(t.Context())
-			if err != nil || after != before {
-				t.Fatalf("guarded mutation changed state=%+v error=%v; before=%+v", after, err, before)
+			after, err := file.Capture(t.Context(), storage.FileIO{})
+			if err != nil || !reflect.DeepEqual(after, before) {
+				t.Fatalf("guard changed state=%+v %v; before=%+v", after, err, before)
 			}
 			afterPosition, err := s.CommittedPosition(t.Context())
 			if err != nil || afterPosition != position {
-				t.Fatalf("guarded mutation advanced position=%v error=%v; before=%v", afterPosition, err, position)
+				t.Fatalf("guard advanced position=%v %v; before=%v", afterPosition, err, position)
 			}
 			if operation == "create" {
 				if _, err := s.Stat(t.Context(), "new"); !errors.Is(err, syscall.ENOENT) {
-					t.Fatalf("guarded create left name: %v", err)
+					t.Fatalf("guarded create left name=%v", err)
+				}
+			}
+			if reserved != "" {
+				if err := s.Abandon(t.Context(), reserved); err != nil {
+					t.Fatal(err)
 				}
 			}
 			if err := s.Remove(t.Context(), "file"); err != nil {
 				t.Fatal(err)
 			}
-			if err := file.Close(ctx); err != nil {
-				t.Fatalf("expired guard prevented reference cleanup: %v", err)
+			if _, err := file.Close(ctx, fileActionID(t, file.session)); err != nil {
+				t.Fatalf("expired publication guard blocked cleanup=%v", err)
 			}
 		})
 	}
 }
 
-func TestAdvisoryAuthorityIsSharedAndRetiredWithItsStore(t *testing.T) {
-	s, f := openPublicationFile(t)
+func TestRangeAuthorityIsSharedAndRetiredWithItsStore(t *testing.T) {
+	s, firstFile := openPublicationFile(t)
 	ctx := t.Context()
-	a, err := s.Advisory(ctx)
+	first := firstFile.session
+	native, _, err := s.NewFileSession(ctx, storage.DefaultFileSessionOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := s.Advisory(ctx)
-	if err != nil || a != b {
-		t.Fatalf("volume authority changed: %p, %p, %v", a, b, err)
-	}
-	first, err := a.NewSession(storage.DefaultFileSessionOptions(), func() error { return nil })
-	if err != nil {
-		t.Fatal(err)
-	}
+	second := native.(*fileSession)
 	t.Cleanup(func() {
-		if err := first.Retire(context.Background()); err != nil {
+		if err := second.Dispose(context.Background()); err != nil {
 			t.Error(err)
 		}
 	})
-	second, err := b.NewSession(storage.DefaultFileSessionOptions(), func() error { return nil })
+	state, err := firstFile.Capture(ctx, storage.FileIO{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if err := second.Retire(context.Background()); err != nil {
-			t.Error(err)
-		}
-	})
-	node, err := f.Node(ctx)
+	secondFile := retainRangeFile(t, second, uint64(state.ID))
+	scope := storage.RangeScope{Domain: 7}
+	snapshot, err := firstFile.RangeSnapshot(ctx, 1, scope)
 	if err != nil {
 		t.Fatal(err)
 	}
-	epoch, err := first.Epoch(ctx)
-	if err != nil {
+	request := storage.RangeReplaceRequest{Owner: 1, Scope: scope, ExpectedRevision: snapshot.Revision, Ranges: []storage.RangeAcquisition{{ID: 1, Start: 0, End: 7, Exclusive: true}}}
+	if result, err := firstFile.ReplaceRanges(ctx, request, fileActionID(t, first)); err != nil || result.State != storage.FileActionCompleted {
+		t.Fatalf("first range=%+v %v", result, err)
+	}
+	other, err := secondFile.RangeSnapshot(ctx, 2, scope)
+	if err != nil || len(other.Other) != 1 {
+		t.Fatalf("shared conflict=%+v %v", other, err)
+	}
+	if _, err := firstFile.RetireRangeOwner(ctx, 1, scope, fileActionID(t, first)); err != nil {
 		t.Fatal(err)
 	}
-	id, err := storage.NewLockRequestID(epoch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, Start: 0, End: 7}
-	if attempt, err := first.Set(ctx, uint64(node.ID), 1, lock, id); err != nil || attempt.State != storage.LockGranted {
-		t.Fatalf("first lock = %+v, %v", attempt, err)
-	}
-	if conflict, err := second.Get(ctx, uint64(node.ID), 2, lock); err != nil || !conflict.Found {
-		t.Fatalf("shared conflict = %+v, %v", conflict, err)
-	}
-	if err := first.Drop(ctx, uint64(node.ID), 1, storage.POSIX); err != nil {
-		t.Fatal(err)
-	}
-	if conflict, err := second.Get(ctx, uint64(node.ID), 2, lock); err != nil || conflict.Found {
-		t.Fatalf("released conflict = %+v, %v", conflict, err)
+	other, err = secondFile.RangeSnapshot(ctx, 2, scope)
+	if err != nil || len(other.Other) != 0 {
+		t.Fatalf("released conflict=%+v %v", other, err)
 	}
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	if _, err := s.Advisory(canceled); !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled authority access = %v", err)
+	if _, err := firstFile.RangeSnapshot(canceled, 1, scope); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled authority access=%v", err)
 	}
-	if err := f.Close(ctx); err != nil {
+	if err := second.Dispose(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Dispose(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Advisory(ctx); !errors.Is(err, syscall.ESTALE) {
-		t.Fatalf("retired authority access = %v", err)
+	if _, _, err := s.NewFileSession(ctx, storage.DefaultFileSessionOptions()); err == nil {
+		t.Fatal("closed store admitted another range authority")
+	}
+}
+
+func TestNodeFacadesKeepIdentityAcrossNameReplacement(t *testing.T) {
+	s, err := OpenLocking(t.Context(), lockingTestConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := s.Create(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	original, err := s.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(t.Context(), "file", "moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Create(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := s.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := s.Store.StatNode(t.Context(), uint64(original.ID))
+	if err != nil || current.ID != original.ID {
+		t.Fatalf("identity lookup=%+v %v", current, err)
+	}
+	metadata := storage.Metadata{{Key: "facade.test", Version: 27, Data: []byte{0, 0xff, 7}}}
+	modified := time.Unix(1234, 56).UTC()
+	updated, err := s.Store.SetNodeAttr(t.Context(), uint64(original.ID), storage.AttrChange{ExpectedRevision: current.MetadataRevision, Metadata: &metadata, ModTime: &modified})
+	if err != nil || updated.ID != original.ID || updated.MetadataRevision != current.MetadataRevision+1 || !reflect.DeepEqual(updated.Metadata, metadata) || !updated.ModTime.Equal(modified) {
+		t.Fatalf("identity metadata update=%+v %v", updated, err)
+	}
+	moved, err := s.Stat(t.Context(), "moved")
+	if err != nil || !reflect.DeepEqual(moved, updated) {
+		t.Fatalf("moved name disagrees with retained identity: %+v %v", moved, err)
+	}
+	untouched, err := s.Stat(t.Context(), "file")
+	if err != nil || !reflect.DeepEqual(untouched, replacement) {
+		t.Fatalf("identity mutation reached replacement: %+v %v", untouched, err)
+	}
+	if _, err := s.Store.SetNodeAttr(t.Context(), uint64(original.ID), storage.AttrChange{ExpectedRevision: current.MetadataRevision, Metadata: &metadata}); !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("stale metadata facade=%v", err)
+	}
+	unchanged, err := s.Store.StatNode(t.Context(), uint64(original.ID))
+	if err != nil || !reflect.DeepEqual(unchanged, updated) {
+		t.Fatalf("refused update changed identity=%+v %v", unchanged, err)
+	}
+	if err := s.Remove(t.Context(), "moved"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Store.StatNode(t.Context(), uint64(original.ID)); !errors.Is(err, syscall.ESTALE) || got.ID != 0 {
+		t.Fatalf("removed identity=%+v %v", got, err)
+	}
+	if got, err := s.Store.SetNodeAttr(t.Context(), uint64(original.ID), storage.AttrChange{ModTime: &modified}); !errors.Is(err, syscall.ESTALE) || got.ID != 0 {
+		t.Fatalf("removed identity update=%+v %v", got, err)
+	}
+}
+
+func TestNodeFacadesRejectInvalidRequestsAndClosedStore(t *testing.T) {
+	s, err := OpenLocking(t.Context(), lockingTestConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	for _, id := range []uint64{0, 1 << 63, ^uint64(0)} {
+		if got, err := s.Store.StatNode(t.Context(), id); !errors.Is(err, syscall.ESTALE) || got.ID != 0 {
+			t.Fatalf("invalid identity %d returned %+v %v", id, got, err)
+		}
+		if got, err := s.Store.SetNodeAttr(t.Context(), id, storage.AttrChange{}); !errors.Is(err, syscall.ESTALE) || got.ID != 0 {
+			t.Fatalf("invalid identity mutation %d returned %+v %v", id, got, err)
+		}
+	}
+	id := uint64(s.root)
+	bad := storage.Metadata{{Key: "bad key", Version: 1}}
+	for _, change := range []storage.AttrChange{{Metadata: &bad}, {ExpectedRevision: 1, Metadata: &bad}} {
+		if got, err := s.Store.SetNodeAttr(t.Context(), id, change); !errors.Is(err, syscall.EINVAL) || got.ID != 0 {
+			t.Fatalf("malformed metadata facade=%+v %v", got, err)
+		}
+	}
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if got, err := s.Store.StatNode(cancelled, id); storage.ErrnoOf(err) != syscall.EINTR || got.ID != 0 {
+		t.Fatalf("cancelled identity=%+v %v", got, err)
+	}
+	if got, err := s.Store.SetNodeAttr(cancelled, id, storage.AttrChange{}); storage.ErrnoOf(err) != syscall.EINTR || got.ID != 0 {
+		t.Fatalf("cancelled identity mutation=%+v %v", got, err)
+	}
+	if err := s.Store.CheckFileStore(); err != nil {
+		t.Fatalf("exclusive capability=%v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Capability is immutable; live operations still have to reject the closed owner.
+	if err := s.Store.CheckFileStore(); err != nil {
+		t.Fatalf("closed store changed static capability=%v", err)
+	}
+	if got, err := s.Store.StatNode(t.Context(), id); err == nil || errors.Is(err, syscall.ENOENT) || got.ID != 0 {
+		t.Fatalf("closed identity lookup=%+v %v", got, err)
+	}
+	if got, err := s.Store.SetNodeAttr(t.Context(), id, storage.AttrChange{}); err == nil || errors.Is(err, syscall.ENOENT) || got.ID != 0 {
+		t.Fatalf("closed identity mutation=%+v %v", got, err)
+	}
+	if err := (&Store{}).CheckFileStore(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("absent native ownership capability=%v", err)
 	}
 }

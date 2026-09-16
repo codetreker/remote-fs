@@ -118,10 +118,7 @@ func mountedPair(t *testing.T) (mountpoint, plain string, backing storage.Storag
 	if err != nil {
 		t.Fatal(err)
 	}
-	mode := info.Mode() & storage.SettableMode
-	if err := backing.SetAttr(t.Context(), "", storage.AttrChange{Mode: &mode}); err != nil {
-		t.Fatal(err)
-	}
+	setStoredMode(t, backing, "", info.Mode())
 	mountpoint = mountStorage(t, backing, fuse.Options{Logger: testLogger(t)})
 	return mountpoint, plain, backing
 }
@@ -1226,7 +1223,8 @@ type linkStorage struct {
 
 func (s *linkStorage) describe(attr storage.Attr) storage.Attr {
 	if length, ok := s.lengths[attr.ID]; ok {
-		attr.Mode = fs.ModeSymlink | 0o777
+		attr.Kind = storage.NodeSymlink
+		attr.Metadata = permissionMetadata(0777)
 		attr.Size = length
 	}
 	return attr
@@ -1251,7 +1249,7 @@ func (s *linkStorage) List(ctx context.Context, path string) ([]storage.Entry, e
 	return entries, nil
 }
 
-func (s *linkStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+func (s *linkStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
 	return decorateSession(ctx, s.FileStorage, options, retainedHooks{
 		attr: func(_ string, attr storage.Attr) storage.Attr { return s.describe(attr) },
 	})
@@ -1445,7 +1443,7 @@ func (s *countingStorage) Read(ctx context.Context, path string) ([]byte, error)
 	return s.FileStorage.Read(ctx, path)
 }
 
-func (s *countingStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+func (s *countingStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
 	return decorateSession(ctx, s.FileStorage, options, retainedHooks{
 		before: func(operation, _ string) error { s.record(operation); return nil },
 	})
@@ -1586,7 +1584,7 @@ func (s *faultyStorage) Rename(ctx context.Context, from, to string) error {
 	return s.FileStorage.Rename(ctx, from, to)
 }
 
-func (s *faultyStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+func (s *faultyStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
 	return decorateSession(ctx, s.FileStorage, options, retainedHooks{
 		before: s.check,
 		path:   func(id uint64) string { return fixturePath(&s.paths, id) },
@@ -1628,69 +1626,117 @@ func fixturePath(paths *sync.Map, id uint64) string {
 	return fmt.Sprintf("node:%d", id)
 }
 
-func decorateSession(ctx context.Context, backing storage.FileStorage, options storage.FileSessionOptions, hooks retainedHooks) (storage.FileSession, error) {
-	session, err := backing.NewFileSession(ctx, options)
+func decorateSession(ctx context.Context, backing storage.FileStorage, options storage.FileSessionOptions, hooks retainedHooks) (storage.FileSession, storage.FileSessionStatus, error) {
+	session, status, err := backing.NewFileSession(ctx, options)
 	if err != nil {
-		return nil, err
+		return nil, status, err
 	}
-	return &decoratedSession{FileSession: session, hooks: hooks}, nil
+	return &decoratedSession{FileSession: session, hooks: hooks}, status, nil
 }
 
 type decoratedSession struct {
 	storage.FileSession
 	hooks retainedHooks
+	paths sync.Map
 }
 
-func (s *decoratedSession) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, error) {
-	if err := s.hooks.check("OpenFile", path); err != nil {
-		return nil, err
+func rejectedFixtureAction(id storage.FileActionID, op storage.Operation, err error) (storage.FileActionReceipt, error) {
+	return storage.FileActionReceipt{Action: id, Operation: op, State: storage.FileActionNotApplied, Errno: storage.ErrnoOf(err)}, err
+}
+
+func (s *decoratedSession) retained(path string, receipt storage.FileActionReceipt, err error) (storage.FileActionReceipt, error) {
+	if receipt.Reference != 0 {
+		s.paths.Store(receipt.Reference, path)
 	}
-	if options.Create {
-		if err := s.hooks.check("Create", path); err != nil {
-			return nil, err
+	if err == nil {
+		if fault := s.hooks.check("Stat", path); fault != nil {
+			receipt.Errno = storage.ErrnoOf(fault)
+			return receipt, fault
+		}
+		receipt.Observation.Attr = s.hooks.describe(path, receipt.Observation.Attr)
+	}
+	return receipt, err
+}
+func (s *decoratedSession) targetPath(target storage.EntryTarget) string {
+	parent := s.hooks.nodePath(target.ParentID)
+	if parent == "" {
+		return string(target.Name)
+	}
+	return parent + "/" + string(target.Name)
+}
+
+func (s *decoratedSession) Retain(ctx context.Context, r storage.RetainRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	path := s.hooks.nodePath(r.NodeID)
+	if err := s.hooks.check("OpenNode", path); err != nil {
+		return rejectedFixtureAction(id, storage.OpFileRetain, err)
+	}
+	receipt, err := s.FileSession.Retain(ctx, r, id)
+	return s.retained(path, receipt, err)
+}
+func (s *decoratedSession) RetainAt(ctx context.Context, r storage.RetainAtRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	path := s.targetPath(r.Target)
+	if err := s.hooks.check("OpenFile", path); err != nil {
+		return rejectedFixtureAction(id, storage.OpFileRetainAt, err)
+	}
+	receipt, err := s.FileSession.RetainAt(ctx, r, id)
+	return s.retained(path, receipt, err)
+}
+func (s *decoratedSession) CreateAndRetainAt(ctx context.Context, r storage.CreateAndRetainRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	path := s.targetPath(r.Target)
+	operation := "Create"
+	if r.Initial.Kind == storage.NodeDirectory {
+		operation = "Mkdir"
+	}
+	for _, op := range []string{"OpenFile", operation} {
+		if err := s.hooks.check(op, path); err != nil {
+			return rejectedFixtureAction(id, storage.OpFileCreateAndRetainAt, err)
 		}
 	}
-	file, err := s.FileSession.OpenFile(ctx, path, options)
+	receipt, err := s.FileSession.CreateAndRetainAt(ctx, r, id)
+	return s.retained(path, receipt, err)
+}
+func (s *decoratedSession) ResetAndRetainAt(ctx context.Context, r storage.ResetAndRetainRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	path := s.targetPath(r.Target)
+	for _, op := range []string{"OpenFile", "Truncate"} {
+		if err := s.hooks.check(op, path); err != nil {
+			return rejectedFixtureAction(id, storage.OpFileResetAndRetainAt, err)
+		}
+	}
+	receipt, err := s.FileSession.ResetAndRetainAt(ctx, r, id)
+	return s.retained(path, receipt, err)
+}
+func (s *decoratedSession) Reference(ctx context.Context, id storage.FileReferenceID) (storage.File, error) {
+	file, err := s.FileSession.Reference(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	return &decoratedFile{File: file, hooks: s.hooks, path: path}, nil
-}
-
-func (s *decoratedSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
-	path := s.hooks.nodePath(id)
-	if err := s.hooks.check("OpenNode", path); err != nil {
-		return nil, err
+	label, found := s.paths.Load(id)
+	if !found {
+		return nil, fmt.Errorf("fixture has no retained reference label: %w", syscall.EIO)
 	}
-	file, err := s.FileSession.OpenNode(ctx, id, options)
-	if err != nil {
-		return nil, err
-	}
-	return &decoratedFile{File: file, hooks: s.hooks, path: path}, nil
+	return &decoratedFile{File: file, hooks: s.hooks, path: label.(string)}, nil
 }
-
-func (s *decoratedSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
+func (s *decoratedSession) StatNode(ctx context.Context, id uint64, o storage.ObservationOptions) (storage.FileObservation, error) {
 	path := s.hooks.nodePath(id)
 	if err := s.hooks.check("Stat", path); err != nil {
-		return storage.Attr{}, err
+		return storage.FileObservation{}, err
 	}
-	attr, err := s.FileSession.StatNode(ctx, id)
-	if err != nil {
-		return storage.Attr{}, err
+	observation, err := s.FileSession.StatNode(ctx, id, o)
+	if err == nil {
+		observation.Attr = s.hooks.describe(path, observation.Attr)
 	}
-	return s.hooks.describe(path, attr), nil
+	return observation, err
 }
-
-func (s *decoratedSession) SetNodeAttr(ctx context.Context, id uint64, change storage.AttrChange) (storage.Attr, error) {
-	path := s.hooks.nodePath(id)
+func (s *decoratedSession) SetNodeAttr(ctx context.Context, node uint64, c storage.AttrChange, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	path := s.hooks.nodePath(node)
 	if err := s.hooks.check("SetAttr", path); err != nil {
-		return storage.Attr{}, err
+		return rejectedFixtureAction(id, storage.OpFileSetNodeAttr, err)
 	}
-	attr, err := s.FileSession.SetNodeAttr(ctx, id, change)
-	if err != nil {
-		return storage.Attr{}, err
+	receipt, err := s.FileSession.SetNodeAttr(ctx, node, c, id)
+	if err == nil {
+		receipt.Observation.Attr = s.hooks.describe(path, receipt.Observation.Attr)
 	}
-	return s.hooks.describe(path, attr), nil
+	return receipt, err
 }
 
 type decoratedFile struct {
@@ -1699,62 +1745,68 @@ type decoratedFile struct {
 	path  string
 }
 
-func (f *decoratedFile) Stat(ctx context.Context) (storage.Attr, error) {
+func (f *decoratedFile) Stat(ctx context.Context, o storage.ObservationOptions) (storage.FileObservation, error) {
 	if err := f.hooks.check("Stat", f.path); err != nil {
-		return storage.Attr{}, err
+		return storage.FileObservation{}, err
 	}
-	attr, err := f.File.Stat(ctx)
-	if err != nil {
-		return storage.Attr{}, err
+	observation, err := f.File.Stat(ctx, o)
+	if err == nil {
+		observation.Attr = f.hooks.describe(f.path, observation.Attr)
 	}
-	return f.hooks.describe(f.path, attr), nil
+	return observation, err
 }
-
-func (f *decoratedFile) ReadAt(ctx context.Context, offset int64, length int) (storage.FileRead, error) {
+func (f *decoratedFile) ReadAt(ctx context.Context, r storage.FileReadRequest) (storage.FileRead, error) {
 	if err := f.hooks.check("Read", f.path); err != nil {
 		return storage.FileRead{}, err
 	}
-	read, err := f.File.ReadAt(ctx, offset, length)
-	if err != nil {
-		return storage.FileRead{}, err
+	read, err := f.File.ReadAt(ctx, r)
+	if err == nil {
+		read.Attr = f.hooks.describe(f.path, read.Attr)
 	}
-	read.Attr = f.hooks.describe(f.path, read.Attr)
-	return read, nil
+	return read, err
 }
-
-func (f *decoratedFile) WriteAt(ctx context.Context, offset int64, data []byte) (storage.Attr, error) {
+func (f *decoratedFile) WriteAt(ctx context.Context, r storage.FileWriteRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
 	if err := f.hooks.check("Write", f.path); err != nil {
-		return storage.Attr{}, err
+		return rejectedFixtureAction(id, storage.OpFileWrite, err)
 	}
-	attr, err := f.File.WriteAt(ctx, offset, data)
-	if err != nil {
-		return storage.Attr{}, err
+	receipt, err := f.File.WriteAt(ctx, r, id)
+	if err == nil {
+		receipt.Observation.Attr = f.hooks.describe(f.path, receipt.Observation.Attr)
 	}
-	return f.hooks.describe(f.path, attr), nil
+	return receipt, err
 }
-
-func (f *decoratedFile) Truncate(ctx context.Context, size int64) (storage.Attr, error) {
+func (f *decoratedFile) Truncate(ctx context.Context, r storage.FileTruncateRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
 	if err := f.hooks.check("Truncate", f.path); err != nil {
-		return storage.Attr{}, err
+		return rejectedFixtureAction(id, storage.OpFileTruncate, err)
 	}
-	attr, err := f.File.Truncate(ctx, size)
-	if err != nil {
-		return storage.Attr{}, err
+	receipt, err := f.File.Truncate(ctx, r, id)
+	if err == nil {
+		receipt.Observation.Attr = f.hooks.describe(f.path, receipt.Observation.Attr)
 	}
-	return f.hooks.describe(f.path, attr), nil
+	return receipt, err
 }
-
-func (f *decoratedFile) SetAttr(ctx context.Context, change storage.AttrChange) (storage.Attr, error) {
+func (f *decoratedFile) SetAttr(ctx context.Context, c storage.AttrChange, id storage.FileActionID) (storage.FileActionReceipt, error) {
 	if err := f.hooks.check("SetAttr", f.path); err != nil {
-		return storage.Attr{}, err
+		return rejectedFixtureAction(id, storage.OpFileSetAttr, err)
 	}
-	attr, err := f.File.SetAttr(ctx, change)
-	if err != nil {
-		return storage.Attr{}, err
+	receipt, err := f.File.SetAttr(ctx, c, id)
+	if err == nil {
+		receipt.Observation.Attr = f.hooks.describe(f.path, receipt.Observation.Attr)
 	}
-	return f.hooks.describe(f.path, attr), nil
+	return receipt, err
 }
-
+func (f *decoratedFile) ListAt(ctx context.Context, r storage.DirectoryPageRequest) (storage.DirectoryPage, error) {
+	if err := f.hooks.check("List", f.path); err != nil {
+		return storage.DirectoryPage{}, err
+	}
+	page, err := f.File.ListAt(ctx, r)
+	if err == nil {
+		for i := range page.Entries {
+			page.Entries[i].Attr = f.hooks.describe(f.path, page.Entries[i].Attr)
+		}
+	}
+	return page, err
+}
 func (f *decoratedFile) Sync(ctx context.Context) error {
 	if err := f.hooks.check("Sync", f.path); err != nil {
 		return err
@@ -1968,8 +2020,8 @@ func TestAFailureReadingBackWhatWasJustMadeIsReported(t *testing.T) {
 	}
 }
 
-// File creation includes its initial mode atomically; directory initialization still
-// has a separate metadata mutation. Failure at either boundary must reach the caller.
+// Creation includes initial metadata atomically for both files and directories.
+// A refusal at that authoritative operation must reach the caller.
 func TestAFailureCreatingANodeWithItsModeIsReported(t *testing.T) {
 	for _, c := range []struct {
 		name      string
@@ -1983,7 +2035,7 @@ func TestAFailureCreatingANodeWithItsModeIsReported(t *testing.T) {
 			}
 			return f.Close()
 		}},
-		{"a created directory", "SetAttr", func(root string) error {
+		{"a created directory", "Mkdir", func(root string) error {
 			return os.Mkdir(filepath.Join(root, "new"), 0o700)
 		}},
 	} {
@@ -2091,7 +2143,7 @@ func (s *oddStorage) List(ctx context.Context, path string) ([]storage.Entry, er
 	entries, err := s.FileStorage.List(ctx, path)
 	for i := range entries {
 		if s.odd(path + "/" + entries[i].Name) {
-			entries[i].Attr.Mode |= fs.ModeIrregular
+			entries[i].Attr.Kind = 255
 		}
 	}
 	return entries, err
@@ -2099,12 +2151,12 @@ func (s *oddStorage) List(ctx context.Context, path string) ([]storage.Entry, er
 
 func (s *oddStorage) describe(path string, attr storage.Attr) storage.Attr {
 	if s.odd(path) {
-		attr.Mode |= fs.ModeIrregular
+		attr.Kind = 255
 	}
 	return attr
 }
 
-func (s *oddStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+func (s *oddStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
 	return decorateSession(ctx, s.FileStorage, options, retainedHooks{
 		attr: s.describe,
 		path: func(id uint64) string { return fixturePath(&s.paths, id) },
@@ -2184,7 +2236,7 @@ func TestAModeChangeReachesTheVolume(t *testing.T) {
 	for _, want := range []fs.FileMode{
 		0o600, 0o755, 0o000, 0o777,
 		0o755 | fs.ModeSetuid, 0o755 | fs.ModeSetgid, 0o777 | fs.ModeSticky,
-		0o700 | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky,
+		0o754 | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky,
 		0o644,
 	} {
 		if err := os.Chmod(path, want); err != nil {
@@ -2194,8 +2246,8 @@ func TestAModeChangeReachesTheVolume(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if underneath.Mode != want {
-			t.Fatalf("the volume holds mode %v after a chmod to %v", underneath.Mode, want)
+		if underneath.Kind != storage.NodeRegular || storedMode(t, underneath) != want {
+			t.Fatalf("the volume holds mode %v after a chmod to %v", storedMode(t, underneath), want)
 		}
 		through, err := os.Stat(path)
 		if err != nil {
@@ -2203,7 +2255,7 @@ func TestAModeChangeReachesTheVolume(t *testing.T) {
 		}
 		if through.Mode() != want {
 			t.Fatalf("the mount reports mode %v where the volume holds %v",
-				through.Mode(), underneath.Mode)
+				through.Mode(), storedMode(t, underneath))
 		}
 	}
 
@@ -2219,9 +2271,9 @@ func TestAModeChangeReachesTheVolume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if underneath.Mode != fs.ModeDir|0o700 {
+	if underneath.Kind != storage.NodeDirectory || storedMode(t, underneath) != fs.ModeDir|0o700 {
 		t.Fatalf("the volume holds mode %v for the directory, want %v",
-			underneath.Mode, fs.ModeDir|0o700)
+			storedMode(t, underneath), fs.ModeDir|0o700)
 	}
 }
 

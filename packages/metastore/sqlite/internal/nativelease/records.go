@@ -14,14 +14,15 @@ import (
 )
 
 const (
-	leaseBindingAttribute = "user.remote-fs.lease-state"
-	leaseAnchorMaxBytes   = 16 << 10
-	leaseAnchorVersion    = 1
+	leaseBindingAttribute     = "user.remote-fs.lease-state"
+	fileLeaseBindingAttribute = "user.remote-fs.file-lease-state"
+	leaseAnchorMaxBytes       = 16 << 10
+	leaseAnchorVersion        = 1
 )
 
 func (a *Anchor) readBinding() ([]byte, bool, error) {
 	encoded := make([]byte, leaseAnchorMaxBytes)
-	n, err := unix.Fgetxattr(a.bindingFD, leaseBindingAttribute, encoded)
+	n, err := unix.Fgetxattr(a.bindingFD, a.attribute, encoded)
 	if errors.Is(err, unix.ENODATA) {
 		return nil, false, nil
 	}

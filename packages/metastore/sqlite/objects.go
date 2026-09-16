@@ -5,13 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io/fs"
 	"syscall"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
-	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/schema"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
@@ -68,7 +66,7 @@ func (s *Store) Reserve(ctx context.Context, path string, size int64) (metastore
 		if err != nil {
 			return err
 		}
-		if found && node.Mode&fs.ModeSymlink != 0 {
+		if found && node.Kind == storage.NodeSymlink {
 			return syscall.ELOOP
 		}
 		if found && node.IsDir() {
@@ -250,7 +248,7 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 	if err != nil {
 		return err
 	}
-	if found && node.Mode&fs.ModeSymlink != 0 {
+	if found && node.Kind == storage.NodeSymlink {
 		return syscall.ELOOP
 	}
 	if found && node.IsDir() {
@@ -311,25 +309,20 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 // contents changed.
 func (s *Store) createCommitted(ctx context.Context, tx *sql.Tx, parent metastore.Node, name []byte, object metastore.Object) error {
 	now := time.Now()
-	accessSec, accessNsec := sqlvalue.StoredTime(now)
-	sec, nsec := sqlvalue.StoredTime(object.ModTime)
-	id, err := dbstate.AllocateNodeID(ctx, tx)
+	node, err := s.insertInitialNode(ctx, tx, storage.NodeInitial{Kind: storage.NodeRegular, ModTime: &object.ModTime})
 	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, s.volume, int64(fileMode), object.Size, accessSec, accessNsec, sec, nsec, sqlvalue.StoredKey(object.Key)); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET size=?,content=? WHERE volume=? AND id=?`, object.Size, sqlvalue.StoredKey(object.Key), s.volume, node.ID); err != nil {
 		return err
 	}
-	if err := s.link(ctx, tx, parent.ID, name, id); err != nil {
+	if err := s.link(ctx, tx, parent.ID, name, node.ID); err != nil {
 		return err
 	}
-	if err := s.recordCreated(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, id); err != nil {
+	if err := s.touch(ctx, tx, parent.ID, now, parent); err != nil {
 		return err
 	}
-	return s.touch(ctx, tx, parent.ID, now)
+	return s.recordCreated(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, node.ID)
 }
 
 // account moves the volume's byte counter by delta, refusing what the allowance cannot

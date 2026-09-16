@@ -3,12 +3,65 @@ package smb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
+
+type queryAccessFile struct {
+	*clientTestFile
+	syncs int
+}
+
+func (f *queryAccessFile) Sync(context.Context) error { f.syncs++; return nil }
+
+func TestClientMetadataQueriesRequireReadAttributesOnActualHandle(t *testing.T) {
+	for _, class := range []byte{4, 18, 34, 35} {
+		t.Run(fmt.Sprintf("class_%d", class), func(t *testing.T) {
+			session, _, _, _, native := newClientTestSession(t)
+			raw := &queryAccessFile{clientTestFile: native}
+			file := &clientFile{session: session, raw: raw, access: windowsWriteData}
+			d := newFileDispatcher(session.backend, session, 17, DefaultLimits())
+			id := wire.FileID{1}
+			h := &fileHandle{file: file, identity: notificationIdentity{ID: 3}, access: 2}
+			d.handles[id] = h
+			if _, status := d.handle(t.Context(), queryCommand(id, 1, class, 4096)); status != statusDenied || len(native.stats) != 0 {
+				t.Fatalf("write-only metadata status=%x stats=%d", status, len(native.stats))
+			}
+			file.access |= windowsReadAttributes
+			h.access |= 0x80
+			if _, status := d.handle(t.Context(), queryCommand(id, 1, class, 4096)); status != 0 || len(native.stats) == 0 {
+				t.Fatalf("read-attributes metadata status=%x stats=%d", status, len(native.stats))
+			}
+		})
+	}
+}
+
+func TestClientIdentityAndNameQueriesRemainReadAttributesNeutral(t *testing.T) {
+	for _, class := range []byte{6, 8, 14, 16, 59, 9} {
+		t.Run(fmt.Sprintf("class_%d", class), func(t *testing.T) {
+			session, _, _, _, native := newClientTestSession(t)
+			raw := &queryAccessFile{clientTestFile: native}
+			file := &clientFile{session: session, raw: raw, access: windowsWriteData}
+			d := newFileDispatcher(session.backend, session, 17, DefaultLimits())
+			id := wire.FileID{1}
+			d.handles[id] = &fileHandle{file: file, identity: notificationIdentity{ID: 3}, access: 2}
+			if _, status := d.handle(t.Context(), queryCommand(id, 1, class, 4096)); status != 0 {
+				t.Fatalf("rights-neutral query status=%x", status)
+			}
+			if class == 9 {
+				if len(native.stats) != 1 || !native.stats[0].IncludeLocation {
+					t.Fatal("name query omitted current location proof")
+				}
+			} else if len(native.stats) != 0 || raw.syncs != 1 {
+				t.Fatalf("identity query fetched metadata stats=%d syncs=%d", len(native.stats), raw.syncs)
+			}
+		})
+	}
+}
 
 func TestSecurityDescriptorContainsOnlyVerifiedSIDAndGrantedRights(t *testing.T) {
 	c, s, tr, _, _, _ := testConnection(t)
@@ -75,47 +128,42 @@ func TestSecurityQueryNeedsOnlyReadControlAndReportsRequiredLength(t *testing.T)
 	}
 }
 
-func TestMaximumAllowedHonorsCurrentAuthorization(t *testing.T) {
+func TestMaximalAccessQueryHonorsCurrentAuthorization(t *testing.T) {
 	c, s, tr, _, _, _ := testConnection(t)
 	c.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, a authz.AccessRequest) error {
-		if a.WindowsOpen.Access&^(storage.WindowsReadData|storage.WindowsReadAttributes|storage.WindowsReadSecurity) != 0 {
-			return authz.ErrDenied
+		switch a.Operation {
+		case storage.OpFileRetainAt:
+			if a.Claim.Uses & ^storage.ReadContent == 0 {
+				return nil
+			}
+		case storage.OpFileRead, storage.OpFileStat:
+			return nil
 		}
-		return nil
+		return authz.ErrDenied
 	})
-	r := createCommand("x", 0x02000000, 1)
-	resolved, err := c.maximumAccess(WithPrincipal(context.Background(), s.principal), tr, r)
-	if err != nil {
-		t.Fatal(err)
+	intent := windowsOpenIntent{Share: windowsShareAll, Disposition: windowsOpen, Kind: windowsRegularFile}
+	access, err := c.authorizeMaximumAccess(WithPrincipal(context.Background(), s.principal), tr, intent)
+	if err != nil || encodeAccess(access) != 0x20081 {
+		t.Fatalf("granted %x err=%v", encodeAccess(access), err)
 	}
-	request, err := resolved.Create()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if request.DesiredAccess != 0x20081 {
-		t.Fatalf("granted %x", request.DesiredAccess)
-	}
-	c.server.config.Authorize = authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return errors.New("policy unavailable") })
-	if _, err := c.maximumAccess(context.Background(), tr, r); err == nil {
-		t.Fatal("authorization outage granted access")
-	}
-	r = createCommand("x", 1, 1)
-	if _, err := c.maximumAccess(context.Background(), tr, r); err != nil {
-		t.Fatal("non-maximum request probed policy")
+	cause := errors.New("policy unavailable")
+	c.server.config.Authorize = authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return cause })
+	if _, err := c.authorizeMaximumAccess(context.Background(), tr, intent); !errors.Is(err, cause) {
+		t.Fatalf("policy outage: %v", err)
 	}
 }
 
 func TestMandatoryNameAndVolumeInformation(t *testing.T) {
 	d, f, _, id := commandDispatcher()
 	d.backend = &sessionBackend{}
-	f.attr.NameInfo = storage.WindowsNameInfo{State: storage.WindowsNameLinked, Path: "parent/file"}
+	f.attr.NameInfo = windowsNameInfo{State: windowsNameLinked, Path: "parent/file"}
 	for _, class := range []byte{9, 18} {
 		b, status := encodeFileInfo(class, f.attr, 1, 0)
 		if status != 0 || len(b) == 0 {
 			t.Fatalf("class %d = %x", class, status)
 		}
 	}
-	f.attr.NameInfo = storage.WindowsNameInfo{State: storage.WindowsNameDetached}
+	f.attr.NameInfo = windowsNameInfo{State: windowsNameDetached}
 	if _, status := encodeFileInfo(9, f.attr, 1, 0); status != 0xc0000123 {
 		t.Fatalf("detached = %x", status)
 	}

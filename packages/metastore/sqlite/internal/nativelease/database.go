@@ -126,20 +126,29 @@ func VerifyDatabaseOwner(a *Anchor, owner *Database) error {
 	return nil
 }
 
-func ValidateOpening(database string, owned bool) error {
+type Opening struct {
+	Strong, File bool
+}
+
+func ValidateOpening(database string, opening Opening) error {
 	if strings.ContainsAny(database, "%?#\x00") {
 		return fmt.Errorf("the SQLite database must be a native pathname without URI parameters or escapes: %w", syscall.EINVAL)
 	}
-	if owned {
-		return nil
-	}
-	for _, name := range []string{database, filepath.Dir(database)} {
-		_, err := unix.Getxattr(name, leaseBindingAttribute, nil)
-		if err == nil {
-			return fmt.Errorf("the native database requires its lease recovery owner: %w", syscall.EIO)
+	for _, binding := range []struct {
+		attribute string
+		owned     bool
+	}{{leaseBindingAttribute, opening.Strong}, {fileLeaseBindingAttribute, opening.File}} {
+		if binding.owned {
+			continue
 		}
-		if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ENODATA) && !errors.Is(err, syscall.ENOTSUP) {
-			return fmt.Errorf("checking native database lease binding: %w", err)
+		for _, name := range []string{database, filepath.Dir(database)} {
+			_, err := unix.Getxattr(name, binding.attribute, nil)
+			if err == nil {
+				return fmt.Errorf("the native database requires its lease recovery owner: %w", syscall.EIO)
+			}
+			if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ENODATA) && !errors.Is(err, syscall.ENOTSUP) {
+				return fmt.Errorf("checking native database lease binding: %w", err)
+			}
 		}
 	}
 	return nil

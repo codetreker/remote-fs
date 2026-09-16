@@ -13,15 +13,15 @@ localstore.Store
   └─ objectstore.Storage
        ├─ localdisk.Objects       不可变对象、物理容量、恢复与独占锁
        └─ sqlite.Store            volume、保留节点、配额、变更日志与最终发布
-            ├─ advisory          句柄与建议锁的 volume 资源域
+            ├─ fileDomain        通用引用、fileaccess 与内容预算
             └─ locking.Authority  强 S/X 占有；恢复证据由组合层绑定
 ```
 
 SQLite 的 schema、数据库状态、原生 lease 证据与日志组件由[内部模块设计](sqlite-modules.md)定义；本页拥有它们组合后的持久化与生命周期。
 
-`localstore.Open(ctx, Config)` 打开或初始化组合存储。volume 选择由 `Config.Volume` 给定，`Status.Volume` 报告绑定的原 volume 名称，名字上限为 `MaxVolumeBytes`（1024 字节）。`Config` 包含根目录、volume 名称、正数配额、变更日志窗口、`sqlite.ObjectLimits`、普通与 snapshot SQLite reader-connection 上限、integrity-record／name-byte 上限、`MaxRetainedFiles`、`advisory.Config`、`localdisk.Options`、`objectstore.Options`、`Locks *locking.Options` 与 `InitializeLocks`。根目录必须预先存在；其绝对路径不能含 SQLite file URI 会解释的 `%`、`?`、`#` 或 NUL；volume 为 1～`localstore.MaxVolumeBytes`（1024）字节；配额不得低于 4096 字节。effective pending-byte threshold 必须不小于 effective local maximum object size，使每个 local-disk 接受的对象都能单独进入 pending backlog。volume、quota、log window、local-disk、SQLite、句柄与占有上限，以及两者的 byte-limit 关系在根目录被修改前校验。
+`localstore.Open(ctx, Config)` 打开或初始化组合存储。volume 选择由 `Config.Volume` 给定，`Status.Volume` 报告绑定的原 volume 名称，名字上限为 `MaxVolumeBytes`（1024 字节）。`Config` 包含根目录、volume 名称、正数配额、变更日志窗口、`sqlite.ObjectLimits`、普通与 snapshot SQLite reader-connection 上限、integrity-record／name-byte 上限、`MaxRetainedFiles`、`Files storage.FileServiceOptions`、`localdisk.Options`、`objectstore.Options`、`Locks *locking.Options` 与 `InitializeLocks`。根目录必须预先存在；其绝对路径不能含 SQLite file URI 会解释的 `%`、`?`、`#` 或 NUL；volume 为 1～`localstore.MaxVolumeBytes`（1024）字节；配额不得低于 4096 字节。effective pending-byte threshold 必须不小于 effective local maximum object size，使每个 local-disk 接受的对象都能单独进入 pending backlog。volume、quota、log window、local-disk、SQLite、句柄与占有上限，以及两者的 byte-limit 关系在根目录被修改前校验。
 
-`Locks` 启用与 SQLite volume 成对的 authority；首次建立占有状态或继续匹配的初始化 intent 还须显式设置 `InitializeLocks`。已绑定 root 重新打开必须提供 `Locks`，省略它不能关闭保护。真正尚未绑定的组合存储仍可由库调用方按原始 storage API 使用，但没有可供 server 接受的占有 authority。
+Locks 只启用与 volume 成对的显式 S/X authority；首次 Strong binding 或匹配初始化仍需 InitializeLocks，已有 Strong binding 不能通过省略 Locks 关闭保护。FileStorage 的引用、claims、范围和退役意图另有独立 File 恢复域，localstore 建立它并维持其所有权；这不自动建立强 S/X 服务。
 
 组合层总会把传入的 `localdisk.Options.CompositeInitialization` 置为 true，使初始化 intent 在 local-disk lifetime lock 下创建。`localdisk.Open` 返回的 `CompositeInitializationState()` 是 `NoCompositeInitialization`、`CompositeInitializationStarted` 或 `CompositeInitializationResumed`；standalone `localdisk.Objects` 的零值 option 不创建组合层 intent。
 
@@ -31,7 +31,7 @@ SQLite 的 schema、数据库状态、原生 lease 证据与日志组件由[内�
 |---|---|
 | `Log()` | 返回与 volume 修改同事务提交的 durable change log |
 | `LockService()` | 返回与本 volume 原生发布绑定的文件占有管理服务 |
-| `NewFileSession(ctx, options)` | 创建有界文件会话，打开与持续访问同一节点；过期或退役后不按路径重开 |
+| `FileState(ctx)`／`NewFileSession(ctx, options)` | 返回 volume 身份／事件上限，或建立通用有限会话及初始 status；失效后不按路径重开 |
 | `Sweep(ctx, limit)` | 删除至多 `limit` 个已记录的未引用对象 |
 | `MaintenanceStatus()` | 返回最近一次后台清扫的时间、删除数与错误 |
 | `Status(ctx)` | 合并逻辑空间、对象记录、本地磁盘、checkpoint 与维护状态 |
@@ -60,6 +60,12 @@ ROOT/                         0700，归 server 的有效用户所有
   .leases.witness.stage       租期见证的恢复 staging name
   .leases.probe-source        占有持久化能力探针
   .leases.probe-target        占有持久化能力探针
+  .file-leases.intent         File 域绑定与 READY 标记
+  .file-leases.witness        File 域最大租期见证
+  .file-leases.intent.stage   File 初始化恢复 staging name
+  .file-leases.witness.stage  File 租期见证 staging name
+  .file-leases.probe-source   File 域持久化探针
+  .file-leases.probe-target   File 域持久化探针
   metastore.sqlite            volume、配额、对象状态与变更日志
   metastore.sqlite-journal    SQLite 按需创建
   metastore.sqlite-wal        SQLite 按需创建
@@ -124,7 +130,7 @@ ROOT/                         0700，归 server 的有效用户所有
 - SQLite `database_state` 的数据库 identity、generation 与 node/change 高水位；
 - `METASTORE` 中相同的 store、volume、数据库 identity、已接受状态与 checkpoint generation。
 
-启用文件占有的 root 还必须同时满足下文的 native binding、SQLite `lease_recovery` 与 `.leases.witness` 恢复规则。`LOCALSTORE` 的 READY 不代替占有状态的 READY，也不能授权补造缺失的占有证据。
+root 的 File 恢复绑定、SQLite file_lease_recovery／file_lease_initialization 与 .file-leases.witness 必须自洽。启用 S/X 时还需独立 Strong binding、lease_recovery 与 .leases.witness。LOCALSTORE 的 READY 不替代任一恢复域的 READY，不授权补造缺失证据。
 
 SQLite binding 覆盖数据库里的所有 volume，因为其中所有 object key 都在同一 object store 中解释；READY marker 进一步把本地 root 限定为一个 volume。组合层在 SQLite 打开前后要求数据库恰好含这一条 volume 记录，durable open 本身也在同一事务内执行 `RequireExistingVolume`。组合层原有的 `requireBoundDatabase` 直接查询当前 `volumes` 布局，用 `LIMIT 2` 分别读取 backing binding 与 volume 的 storage class、定长 ID 和 variable length；只有 cardinality、类型与预期长度都成立后才加载 store/volume 字符串，不用 `count(*)` 扫描全表，也不把超大 TEXT/BLOB 载入内存。丢失该 row、出现另一条 volume 或空 replacement database 都不会触发自动创建。已含 volume 的未绑定数据库不能事后绑定；绑定后的数据库也不能通过普通 `sqlite.Open` 绕过校验。任一 store、database 或 volume identity 不匹配都在 READY announcement 与 HTTP serving 之前失败。
 
@@ -144,11 +150,17 @@ rename 本身失败时，publisher 删除未接受的 stage 并同步 root；清
 
 打开前先记录 WAL 是否存在以及是否超过 32 字节 header。若 `C < A.generation`，非空 WAL 是已确认状态仍然存在的必要证据，缺失、空文件或仅有 header 都以 `EIO` 拒绝。SQLite 打开后可见状态的数据库 identity 必须等于 A；generation 小于 A 表示确认状态回退，等于 A 时全部高水位必须完全相同。只有打开前已有非空 WAL 时，可见 generation 才可大于 A；这表示 SQLite commit 已发生而见证尚未完成，打开事务会继续前进并发布新的 A。高水位在任何恢复路径上都不能倒退。
 
-### 文件占有的持久恢复
+### 强占有与文件引用的持久恢复
 
-schema migration `0004_lease_recovery.sql` 为整份数据库保存 database ID、StateID、已接受 generation 与最大租期，以及可选的下一代 prepared generation 与最大租期。localstore 的数据库仍只持有 root 所绑定的那一个 volume。`.leases.witness` 独立保存同一证据；root inode 上的 create-only xattr `user.remote-fs.lease-state` 把证据目录、名字、store/volume 与 StateID 绑定在一起，`.leases.intent` 保存相同 binding 和初始化 READY 状态。UUID 只证明身份，generation 与两份独立证据共同检测单边回退。
+两个恢复域使用固定 SQL 状态与独立 evidence，不接受任意扩展域名。Strong 沿用 0004 的 lease_recovery、root xattr `user.remote-fs.lease-state` 和 .leases.intent／.leases.witness，既有 SQL 与持久编码保持不变。File 使用 0006 的 file_lease_recovery、file_lease_initialization，root xattr `user.remote-fs.file-lease-state` 和 .file-leases.intent／.file-leases.witness。
 
-一次更长的 Acquire 或 Renew 得到确认之前，SQLite 先在 FULL transaction 中写入 Prepared，并完成对应的 `METASTORE` 确认；随后原子替换并同步 `.leases.witness`；最后另一个 FULL transaction 把 Prepared 收入 Accepted 并清空 Prepared，再完成 `METASTORE` 确认。租期高水位只增不减，准备所需 I/O 在最终资源转换之外执行，完成后仍须重新验证 grant 和期限。
+LeaseAnchorConfig.Domain 选择 LeaseDomainStrong 或 LeaseDomainFile，Strong 为默认零值。两域使用同一 RFSLEASEv1 envelope；File kind 为 file-intent／file-binding／file-witness，其 witness 必须带 typed Quiescent。Strong witness 保持原四字段编码，不接受 Quiescent=true。即使自定义路径与 Identity 相同，另一域的 pending／binding／witness 仍拒绝。每个域绑定 database、StateID、原生 inode 和 canonical 位置。
+
+File Accepted／Prepared 各持有 generation、MaxLease 与 Quiescent；初始只能为 0／0／true。变化使用下一 generation，MaxLease 不下降；进入 Quiescent 不改变 MaxLease，Active 必须有正租期。同一 generation 的相等检查包括 Quiescent。SQL 拒绝仍有任一 volume 持久 removal intent／draining entry 的静止记录；运行期的证明还覆盖全部共享 Store 的状态。
+
+File 初始化只在持久 Pending 下允许匹配的首次建立／中断继续，完成 anchor 后标记 Ready；Ready 缺失必要证据失败。Strong 保留显式初始化选择。普通未拥有该域的 opener 分别校验数据库与父位置，File-only 不跳过 Strong；准备／打开失败保留各域所有权和证据。
+
+任一域确认更长有效期前，先在 FULL transaction 写入 Prepared 并完成对应 METASTORE；随后原子同步本域 witness；再将 Prepared 收入 Accepted 并完成 METASTORE。Strong 对 Acquire／Renew，File 对文件会话的有限保护分别维持最大租期，互不推进或降低另一域。准备 I/O 不占最终资源转换，确认后仍检查实际寿命和发布资格。
 
 令 A 为 Accepted，P 为与 A 身份相同、generation 恰好多一且最大租期不减的 Prepared，重开只接受以下状态：
 
@@ -160,7 +172,11 @@ schema migration `0004_lease_recovery.sql` 为整份数据库保存 database ID�
 
 其余缺失、损坏、身份不符或 generation 组合均以 `EIO` 拒绝。初始化只能建立匹配 durable intent 的零代证据；已有 READY binding 缺少 witness 不会被重新初始化。占有专用 stage 只在 final evidence 已验证之后按其协议清理，其恢复规则与 `METASTORE` stage 独立。
 
-恢复起点采用 SQLite 实际取得数据库原生排他锁时捕获的 monotonic 时间，早于加载租期证据。authority 从这个起点等待完整的持久最大租期；期间普通读取和状态查询可用，新授权与 volume 修改以 Recovering 拒绝。配置调小不缩短旧保护，重启不会把以前确认的剩余保护当作空状态。运行期 grant 与 action receipt 不持久化；旧 authority 及其调用方身份退役，重启后的核对返回退役或结果未知，详见[文件占有](file-locks.md)。
+恢复起点是实际取得数据库排他所有权时的 monotonic 时间。Strong 按自己的持久最大租期保护已有授予。File 的 Active 证据使用 `ownerAcquired + MaxLease` 作为恢复边界，期间保留旧引用／意图的保护；Quiescent 证据跳过 File quarantine，因此已确认 File drain 后的干净重开不等待一份默认 30 秒 lease。它不取消独立 Strong 恢复等待，也不复活旧 session、reference 或动作历史。
+
+数据库级 fileAdmission 覆盖新会话的持久 Active 发布直到 session 注册，也覆盖整个 Store.Close。Quiescent 证明检查 coordinator 中所有 volume／Store 的 session、引用、在途 I/O、memberships、恢复义务和既有恢复期限，以及全局 pins、持久 intents／drains；只检查当前 volume 不足以确认。Close 在 File drain 已知完成后、独立 Strong Close 之前发布 Quiescent。任何未知或失败保留 fence 与所有权，不把仍有义务的数据库标成干净。
+
+下一次文件 session 即使申请不超过原 MaxLease 的同一时长，也先持久切为 Active，再向调用方返回保护。File 的退役义务期满后由所属 Store 完成固定清理，引用 ID 不按路径恢复。OpenBoundDurableFileWithOptions 是 localstore 的默认 opener；需要 Strong 时 OpenBoundDurableLeaseWithOptions 拥有两个固定域。OpenLocking 同时拥有数据库旁的 `.<db>.leases` 与 `.<db>.file-leases`，localstore 则使用 root 下的 `.leases` 与 `.file-leases`。
 
 占有初始化与普通重开都会验证 native binding，并探测本地 `flock`、xattr、原子 rename 和 file/directory `fsync` 能力。证据目录与被绑定 root 必须处在当前同一 mount；mount ID 只在运行期比较，不作为跨重启 identity。canonical evidence directory 是持久 binding 的一部分，移动 root 需要显式迁移，不能仅改配置路径。
 
@@ -175,7 +191,7 @@ schema migration `0004_lease_recovery.sql` 为整份数据库保存 database ID�
 
 这项校验阻止信任边界外的 principal 在打开期间替换路径分量。root、同 UID 进程和管理员仍能改名或替换这些分量，属于部署信任边界；部署必须在 store 的整个 lifetime 内约束它们。组合层在打开各个 pathname-based component 前后比对根目录的 device 与 inode，但这不是跨整个运行期的 rename lease。
 
-对象层同时对根目录描述符与 `OWNER.lock` 取得 non-blocking exclusive `flock`。localstore 的 durable SQLite opener 还持有数据库文件的原生 `LOCK_EX`；原始非独占 SQLite opener 持有同一 native file 上的 `LOCK_SH`，使同进程与跨进程的既存 raw handle 都不能与独占 owner 并存。冲突 opener 得到 `EBUSY`，这些所有权只在全部 SQLite connection 成功关闭后释放。保留文件引用要求实际 EX ownership，只有 SH 的 Store 以 `EOPNOTSUPP` 拒绝这项能力；进程内 pin 不能保护另一写进程的回收。`ConfigureLeaseRecovery` 验证实际 EX owner 与绑定的原生 `LeaseAnchor`，`EnableLocks` 只接受已配置该恢复状态且仍持有 EX 的 Store；调用方提供一个持久化接口不能代替这些条件。完整规则见[文件占有](file-locks.md)和[文件句柄](file-handles.md)。
+对象层对 root FD 与 OWNER.lock 取得 non-blocking EX flock；durable SQLite opener 对数据库持有 LOCK_EX，普通 raw opener 的 LOCK_SH 与之互斥，冲突为 EBUSY。所有 writable SQLite connection 成功关闭后才释放 lifetime ownership。File 能力需要真实 EX 与 File 恢复绑定；ConfigureFileLeaseRecovery 和 ConfigureLeaseRecovery 分别要求匹配域的原生 LeaseAnchor，EnableLocks 只接纳已配置 Strong 恢复的 Store。两个域都独立拒绝未拥有者访问，调用方提供抽象持久接口不能替代这些检查。
 
 ## 五、key、分片与对象 envelope
 
@@ -319,7 +335,7 @@ Avail = min(max(quota - Used, 0), localdisk.Available)
 
 `MaxInFlightBytes` 必须至少容纳一份最大对象及其 envelope/key，recovery-record 上限不得低于 active operation 上限。`MaxWaitingOperations` 必须是小于 `math.MaxInt` 的正数；等待名额已满时新调用以 `EAGAIN` 拒绝。请求先取得 waiting ticket，再等待 per-key/per-shard token，完成 shard 初始化后才把 ticket 提升为 active operation/byte reservation，因此一个 shard 的等待者不会占满全部 active 名额并阻塞其它 shard。等待过程服从 `context.Context`。`Get`／`GetBounded` 的共享读取路径与 `Delete` 在打开有效 shard descriptor 后立即登记关闭，覆盖 active admission 取消、后续健康检查及操作退出；shard 缺席或打开失败不登记无效 FD 的关闭。promotion、健康与缺席判断保持原顺序，各自释放 waiting、active 与 key 协调资源。生命周期取舍见[取消时关闭 shard 描述符](../../../.agents/notes/implemented/bug-fix/2026-09-07-close-shard-descriptors-on-cancel.md)。`Close` 拒绝新的 admission，并等待 waiting、active 与 control operation 离开。
 
-`MaxRetainedFiles` 统计 volume 中的 native 引用数，同一节点的多次打开分别计费；满额以 `EAGAIN` 拒绝。`advisory.Config` 同时拥有 volume 级 materialization operation／byte budget，句柄内容操作在读取 payload 和分配下一份内容前收费。写入收取 current + next，读取收取完整对象加返回范围；单项不能装入上限时为 `EFBIG`，容量被其它操作占用时为 `EAGAIN`。`MaxMaterializedBytes` 必须至少容纳两份 `MaxFileBytes`，共享 volume 的 opener 必须使用相同配置。这些预算不替代 localdisk 物理 admission、pending object 阈值或 HTTP retention 上限。
+`MaxRetainedFiles` 统计 volume 中的 native 引用数，同一节点的多次打开分别计费；满额以 `EAGAIN` 拒绝。`Config.Files` 使用 `storage.FileServiceOptions` 并拥有 volume 级 materialization operation／byte budget，句柄内容操作在读取 payload 和分配下一份内容前收费。写入收取 current + next，读取收取完整对象加返回范围；单项不能装入上限时为 `EFBIG`，容量被其它操作占用时为 `EAGAIN`。`MaxMaterializedBytes` 必须至少容纳两份 `MaxFileBytes`，共享 volume 的 opener 必须使用相同配置。这些预算不替代 localdisk 物理 admission、pending object 阈值或 HTTP retention 上限。
 
 ## 八、维护、状态与关闭
 
@@ -393,9 +409,9 @@ remote-fs-server \
 | `-max-integrity-records` | `sqlite.Options.MaxIntegrityRecords`；Azure/local 共用 |
 | `-max-integrity-bytes` | `sqlite.Options.MaxIntegrityBytes`；Azure/local 共用 |
 | `-max-retained-files` | `sqlite.Options.MaxRetainedFiles`；Azure/local 共用 |
-| `-max-file-size` | `advisory.Config.MaxFileBytes`；不得超过对象和 pending-byte 上限 |
-| `-max-file-staging-bytes` | `advisory.Config.MaxMaterializedBytes`；至少两份最大文件 |
-| `-file-operation-timeout` | `advisory.Config.FileOperationTimeout`；包含内容 revision 重试 |
+| `-max-file-size` | `Config.Files.MaxFileBytes`；不得超过对象和 pending-byte 上限 |
+| `-max-file-staging-bytes` | `Config.Files.MaxMaterializedBytes`；至少两份最大文件 |
+| `-file-operation-timeout` | `Config.Files.FileOperationTimeout`；包含内容 revision 重试 |
 | `-sweep-interval` | `objectstore.Options.SweepInterval`；Azure/local 共用 |
 | `-sweep-batch` | `objectstore.Options.SweepBatch`；Azure/local 共用 |
 

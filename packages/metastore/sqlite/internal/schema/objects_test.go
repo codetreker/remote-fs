@@ -2,7 +2,6 @@ package schema
 
 import (
 	"errors"
-	"io/fs"
 	"strings"
 	"syscall"
 	"testing"
@@ -39,9 +38,12 @@ func TestLegacyObjectsCannotInventDeletionAuthority(t *testing.T) {
 		{"missing file", `DELETE FROM nodes WHERE id=2`, "referenced objects without exactly one"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			db := testDatabase(t, 0)
-			id, root := testVolume(t, db, "workspace")
-			testFile(t, db, id, root, "file", 3, false)
+			db := testDatabase(t, 2)
+			execute(t, db, `INSERT INTO volumes(id,name,root,used) VALUES(1,'legacy',1,3)`)
+			execute(t, db, `INSERT INTO objects(key,volume,state,size,created_sec,created_nsec) VALUES('data',1,1,3,0,0)`)
+			execute(t, db, `INSERT INTO nodes(id,volume,mode,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content)
+				VALUES(1,1,2147484141,0,0,0,0,0,NULL),(2,1,420,3,0,0,0,0,'data')`)
+			execute(t, db, `INSERT INTO entries(volume,parent,name,node) VALUES(1,1,X'66696c65',2)`)
 			if err := validateLegacyObjectIntegrity(t.Context(), db, 2); err != nil {
 				t.Fatal(err)
 			}
@@ -58,12 +60,12 @@ func TestObjectRelationshipsAllowInlineSymlinkBytes(t *testing.T) {
 	db := testDatabase(t, 0)
 	volume, root := testVolume(t, db, "links")
 	node, key := testFile(t, db, volume, root, "link", 0, false)
-	execute(t, db, `UPDATE nodes SET mode=?,size=6,content=NULL WHERE id=?`, int64(fs.ModeSymlink|0777), node)
+	execute(t, db, `UPDATE nodes SET kind=3,size=6,content=NULL,link_target=X'746172676574' WHERE id=?`, node)
 	execute(t, db, `DELETE FROM objects WHERE key=?`, key)
 	if err := validateObjectRelationships(t.Context(), db, &volume); err != nil {
 		t.Fatalf("symlink has no object: %v", err)
 	}
-	execute(t, db, `UPDATE nodes SET mode=420 WHERE id=?`, node)
+	execute(t, db, `UPDATE nodes SET kind=1,link_target=X'' WHERE id=?`, node)
 	if err := validateObjectRelationships(t.Context(), db, &volume); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("regular file bytes have no object: %v", err)
 	}

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
+	"syscall"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/locking"
@@ -37,120 +37,97 @@ func TimeOf(t time.Time) Time {
 // Time returns the instant t carries.
 func (t Time) Time() time.Time { return time.Unix(t.UnixSec, int64(t.Nanos)) }
 
-// Attr is storage.Attr on the wire.
-//
-// Mode carries io/fs.FileMode's own bit layout rather than a POSIX st_mode, because both
-// ends of this protocol are Go and the translation to what a kernel wants belongs to
-// whatever presents the volume as a filesystem.
+// Attr carries generic node facts and canonical opaque metadata.
 type Attr struct {
-	ID         uint64 `json:"id"`
-	Mode       uint32 `json:"mode"`
-	Size       int64  `json:"size"`
-	AccessTime Time   `json:"access_time"`
-	ModTime    Time   `json:"mod_time"`
+	ID                uint64                       `json:"id"`
+	Kind              storage.NodeKind             `json:"kind"`
+	Size              int64                        `json:"size"`
+	AccessTime        Time                         `json:"access_time"`
+	ModTime           Time                         `json:"mod_time"`
+	CreationTime      *Time                        `json:"creation_time,omitempty"`
+	ChangeTime        *Time                        `json:"change_time,omitempty"`
+	MetadataRevision  storage.NodeMetadataRevision `json:"metadata_revision"`
+	DirectoryRevision storage.DirectoryRevision    `json:"directory_revision"`
+	Metadata          []byte                       `json:"metadata"`
 }
 
-// AttrOf renders a for the wire.
-//
-// Attributes travel by pointer wherever they appear, so that a body carrying none has a
-// shape that can be refused. A value could not be refused: a zero Attr reads as a regular
-// file, of length zero, dated the epoch, so a mount above it would present a directory as
-// an empty file and date every node 1970 — and no check on the values could tell that
-// apart from a chmod-000 file, which is a legitimate answer. The refusals themselves are
-// in the UnmarshalJSON methods below, where no decoder of these messages can omit them.
-func AttrOf(a storage.Attr) *Attr {
-	return &Attr{
-		ID:         a.ID,
-		Mode:       uint32(a.Mode),
-		Size:       a.Size,
-		AccessTime: TimeOf(a.AccessTime),
-		ModTime:    TimeOf(a.ModTime),
+func AttrOf(a storage.Attr) (*Attr, error) {
+	if err := a.Check(); err != nil {
+		return nil, errors.Join(syscall.EIO, err)
 	}
-}
-
-// Storage returns the attributes a carries.
-func (a Attr) Storage() storage.Attr {
-	return storage.Attr{
-		ID:         a.ID,
-		Mode:       fs.FileMode(a.Mode),
-		Size:       a.Size,
-		AccessTime: a.AccessTime.Time(),
-		ModTime:    a.ModTime.Time(),
+	metadata, err := storage.EncodeMetadata(a.Metadata)
+	if err != nil {
+		return nil, err
 	}
+	return &Attr{ID: a.ID, Kind: a.Kind, Size: a.Size, AccessTime: TimeOf(a.AccessTime), ModTime: TimeOf(a.ModTime), CreationTime: optionalTimeOf(a.CreationTime), ChangeTime: optionalTimeOf(a.ChangeTime), MetadataRevision: a.MetadataRevision, DirectoryRevision: a.DirectoryRevision, Metadata: metadata}, nil
 }
-
-// UnmarshalJSON decodes attributes, and refuses ones that carry no identity.
-//
-// This is the one field here whose zero is silent rather than loud. A mode of zero is a
-// legitimate answer and an instant at the epoch is a value somebody could have set, so the
-// refusals elsewhere in this file are about the whole Attr being absent. An identity of zero
-// is different: storage.Attr calls it illegal, and every comparison of it in a mount above
-// returns equal — so a peer that does not send the field is not read as sending nothing, it
-// is read as saying every node is the same node. Measured against a server built before the
-// field existed: after an ordinary rename over a name, a held descriptor and the node that
-// arrived came back under one inode number, with no diagnostic anywhere.
-//
-// Refusing here rather than moving the protocol version is deliberate. The version says which
-// vocabulary is spoken; this is a peer speaking it and leaving out a word, which the decoders
-// in this file are where we catch.
+func (a Attr) Storage() (storage.Attr, error) {
+	metadata, err := storage.DecodeMetadata(a.Metadata)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	if a.ID == 0 || a.Size < 0 || a.MetadataRevision == 0 || a.Kind.Check() != nil || (a.Kind == storage.NodeDirectory) != (a.DirectoryRevision != 0) || a.Kind == storage.NodeDirectory && a.Size != 0 {
+		return storage.Attr{}, errors.New("attributes carry invalid generic node facts")
+	}
+	for _, instant := range []*Time{&a.AccessTime, &a.ModTime, a.CreationTime, a.ChangeTime} {
+		if instant != nil && (instant.Nanos < 0 || instant.Nanos >= 1e9) {
+			return storage.Attr{}, errors.New("attribute instant has invalid nanoseconds")
+		}
+	}
+	return storage.Attr{ID: a.ID, Kind: a.Kind, Size: a.Size, AccessTime: a.AccessTime.Time(), ModTime: a.ModTime.Time(), CreationTime: optionalStorageTime(a.CreationTime), ChangeTime: optionalStorageTime(a.ChangeTime), MetadataRevision: a.MetadataRevision, DirectoryRevision: a.DirectoryRevision, Metadata: metadata}, nil
+}
 func (a *Attr) UnmarshalJSON(data []byte) error {
-	type attr Attr
-	var decoded attr
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	type value Attr
+	var decoded value
+	if err := decodeMessageJSON(data, &decoded, len(data)); err != nil {
 		return err
 	}
-	if decoded.ID == 0 {
-		return errors.New("the attributes carry no identity for the node they describe")
+	if _, err := Attr(decoded).Storage(); err != nil {
+		return err
 	}
 	*a = Attr(decoded)
 	return nil
 }
 
-// AttrChange is storage.AttrChange on the wire.
-//
-// Every field is optional and stays optional here, because an attribute the change does
-// not name is exactly what must not be sent: a mode field that defaulted to zero on the
-// way across would turn a request to set the modification time into a chmod 000.
 type AttrChange struct {
-	Mode       *uint32 `json:"mode,omitempty"`
-	AccessTime *Time   `json:"access_time,omitempty"`
-	ModTime    *Time   `json:"mod_time,omitempty"`
+	ExpectedRevision storage.NodeMetadataRevision `json:"expected_revision"`
+	Metadata         *[]byte                      `json:"metadata,omitempty"`
+	AccessTime       *Time                        `json:"access_time,omitempty"`
+	ModTime          *Time                        `json:"mod_time,omitempty"`
+	CreationTime     *Time                        `json:"creation_time,omitempty"`
+	ChangeTime       *Time                        `json:"change_time,omitempty"`
 }
 
-// AttrChangeOf renders c for the wire.
-func AttrChangeOf(c storage.AttrChange) *AttrChange {
-	wire := &AttrChange{}
-	if c.Mode != nil {
-		mode := uint32(*c.Mode)
-		wire.Mode = &mode
+func AttrChangeOf(c storage.AttrChange) (*AttrChange, error) {
+	if err := c.Check(); err != nil {
+		return nil, err
 	}
-	if c.AccessTime != nil {
-		accessed := TimeOf(*c.AccessTime)
-		wire.AccessTime = &accessed
+	var metadata *[]byte
+	if c.Metadata != nil {
+		encoded, err := storage.EncodeMetadata(*c.Metadata)
+		if err != nil {
+			return nil, err
+		}
+		metadata = &encoded
 	}
-	if c.ModTime != nil {
-		changed := TimeOf(*c.ModTime)
-		wire.ModTime = &changed
-	}
-	return wire
+	return &AttrChange{ExpectedRevision: c.ExpectedRevision, Metadata: metadata, AccessTime: optionalTimeOf(c.AccessTime), ModTime: optionalTimeOf(c.ModTime), CreationTime: optionalTimeOf(c.CreationTime), ChangeTime: optionalTimeOf(c.ChangeTime)}, nil
 }
-
-// Storage returns the change c carries.
-func (c AttrChange) Storage() storage.AttrChange {
-	var change storage.AttrChange
-	if c.Mode != nil {
-		mode := fs.FileMode(*c.Mode)
-		change.Mode = &mode
+func (c AttrChange) Storage() (storage.AttrChange, error) {
+	var metadata *storage.Metadata
+	if c.Metadata != nil {
+		decoded, err := storage.DecodeMetadata(*c.Metadata)
+		if err != nil {
+			return storage.AttrChange{}, err
+		}
+		metadata = &decoded
 	}
-	if c.AccessTime != nil {
-		accessed := c.AccessTime.Time()
-		change.AccessTime = &accessed
+	for _, instant := range []*Time{c.AccessTime, c.ModTime, c.CreationTime, c.ChangeTime} {
+		if instant != nil && (instant.Nanos < 0 || instant.Nanos >= 1e9) {
+			return storage.AttrChange{}, errors.New("attribute change has invalid nanoseconds")
+		}
 	}
-	if c.ModTime != nil {
-		changed := c.ModTime.Time()
-		change.ModTime = &changed
-	}
-	return change
+	value := storage.AttrChange{ExpectedRevision: c.ExpectedRevision, Metadata: metadata, AccessTime: optionalStorageTime(c.AccessTime), ModTime: optionalStorageTime(c.ModTime), CreationTime: optionalStorageTime(c.CreationTime), ChangeTime: optionalStorageTime(c.ChangeTime)}
+	return value, value.Check()
 }
 
 // SetAttrRequest is the body of an OpSetAttr.
@@ -171,11 +148,14 @@ type SetAttrRequest struct {
 func (r *SetAttrRequest) UnmarshalJSON(data []byte) error {
 	type request SetAttrRequest
 	var decoded request
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeMessageJSON(data, &decoded, len(data)); err != nil {
 		return err
 	}
 	if decoded.Change == nil {
 		return errors.New("the request carried no change")
+	}
+	if _, err := decoded.Change.Storage(); err != nil {
+		return err
 	}
 	*r = SetAttrRequest(decoded)
 	return nil
@@ -209,12 +189,16 @@ func (e *Entry) UnmarshalJSON(data []byte) error {
 
 // EntriesOf renders a listing for the wire. The result is never nil, so that an empty
 // directory encodes as an empty JSON list rather than as null.
-func EntriesOf(entries []storage.Entry) []Entry {
+func EntriesOf(entries []storage.Entry) ([]Entry, error) {
 	wire := make([]Entry, 0, len(entries))
-	for _, e := range entries {
-		wire = append(wire, Entry{Name: []byte(e.Name), Attr: AttrOf(e.Attr)})
+	for _, entry := range entries {
+		attr, err := AttrOf(entry.Attr)
+		if err != nil {
+			return nil, err
+		}
+		wire = append(wire, Entry{Name: []byte(entry.Name), Attr: attr})
 	}
-	return wire
+	return wire, nil
 }
 
 // StatResponse is the body of a successful OpStat.
@@ -257,12 +241,16 @@ func (r *ListResponse) UnmarshalJSON(data []byte) error {
 }
 
 // Storage returns the listing the response carries.
-func (r ListResponse) Storage() []storage.Entry {
+func (r ListResponse) Storage() ([]storage.Entry, error) {
 	entries := make([]storage.Entry, 0, len(r.Entries))
-	for _, e := range r.Entries {
-		entries = append(entries, storage.Entry{Name: string(e.Name), Attr: e.Attr.Storage()})
+	for _, entry := range r.Entries {
+		attr, err := entry.Attr.Storage()
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, storage.Entry{Name: string(entry.Name), Attr: attr})
 	}
-	return entries
+	return entries, nil
 }
 
 // Space is storage.Space on the wire.

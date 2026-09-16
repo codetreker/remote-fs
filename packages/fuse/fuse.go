@@ -37,6 +37,10 @@ const DefaultFlushTimeout = 30 * time.Second
 
 // Options configure a mount.
 type Options struct {
+	// Permissions select the modes presented for nodes without POSIX metadata.
+	// Nil selects file 0644, directory 0755 and symlink 0777.
+	Permissions *PermissionDefaults
+
 	// Logger receives diagnostics from this package and the FUSE library.
 	// A nil Logger discards them without selecting process output.
 	Logger *log.Logger
@@ -58,6 +62,14 @@ type Options struct {
 	// value is copied; every explicitly supplied field must be valid. Its
 	// MaxFileSize is replaced by the resolved mount ceiling above.
 	FileSession *storage.FileSessionOptions
+}
+
+func (o Options) permissionDefaults() (PermissionDefaults, error) {
+	if o.Permissions == nil {
+		return PermissionDefaults{File: 0644, Directory: 0755, Symlink: 0777}, nil
+	}
+	value := *o.Permissions
+	return value, value.check()
 }
 
 func (o Options) flushTimeout() (time.Duration, error) {
@@ -111,8 +123,11 @@ func New(mountpoint string, s storage.Storage, opts Options) (*Mount, error) {
 	ask, cancel := context.WithTimeout(context.Background(), v.flushTimeout)
 	attr, err := s.Stat(ask, "")
 	cancel()
-	if err == nil && (attr.ID == 0 || !attr.Mode.IsDir()) {
+	if err == nil && (attr.ID == 0 || !attr.IsDir()) {
 		err = syscall.EIO
+	}
+	if err == nil {
+		_, _, err = v.attributes(attr)
 	}
 	if err != nil {
 		return nil, errors.Join(err, v.stopSession())

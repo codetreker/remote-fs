@@ -2,7 +2,7 @@
 
 volume 的使用者。持有 remote storage，通过 Linux FUSE 呈现为本地目录，或通过独立的 Windows 本机 SMB package 呈现为网络驱动器。宿主持有远端身份与各呈现入口的生命周期。
 
-本文只写当前 client 内部。基础 storage、保留文件、锁控制与 RPC 的边界见 [`../architecture.md`](../architecture.md)。Windows 的 SSPI、SMB、盘符映射与 authority 接口见 [Windows 本机 SMB](windows-smb.md)；下文的副本、内核 inode 与 FUSE 生命周期描述 Linux 路径。[平台客户端隔离提案](../../../.agents/notes/proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)将 Windows 规则以及 Unix mode／UID／GID、owner 与关闭解释收归各客户端；当前 FileSession、WindowsStorage 和远端 advisory 仍是待迁移接口，Linux 可观察保证保持不变。
+本文描述 client 内部。基础 storage、保留对象、强锁与 RPC 见[顶层设计](../architecture.md)。[Windows 本机 SMB](windows-smb.md)拥有 Windows 名字、DOS、共享／删除／范围批次、SSPI 和盘符映射；下文拥有 Linux 的副本、inode、Unix 属性、flock／POSIX owner 与生命周期。共同接口不解释平台语义，取舍见[平台客户端隔离决定](../../../.agents/notes/implemented/architecture/2026-09-16-isolate-platform-filesystem-clients.md)。
 
 ## 一、内部构成
 
@@ -12,7 +12,7 @@ volume 的使用者。持有 remote storage，通过 Linux FUSE 呈现为本地�
 | **显式锁控制** | HTTP client 实现锁 Service，调用方保留 Session / Owner 与原动作身份，以 `WithScope` 构造独立、不可变的修改 proof 集合。控制请求具有独立预算。 | R-CC-3、R-CC-6 至 R-CC-11、R-INT-3 |
 | **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：`Stat` 与 `List` 走本地那份元数据副本，其余走远端。副本是一份 SQLite（`packages/metastore/sqlite` 的 `Replica`），由变更流喂着。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
 | **挂载呈现层** `packages/fuse` | 把一份 storage 呈现为本地目录。持有 FileSession、对象引用与内核 owner 的映射；文件以 direct I/O 逐次读写。仅 Linux。 | R-FS-1、R-CON-1~3、R-ERR-1、R-ERR-2、R-WS-5、R-INT-3、R-INT-8 |
-| **Windows 呈现层** `packages/smb`、`packages/smb/windows` | 通过 loopback SMB 3.1.1、SSPI 与当前用户盘符映射访问 WindowsStorage；变更来源由宿主注入。 | R-FS-9、R-CC-14、R-INT-8、R-INT-14 |
+| **Windows 呈现层** `packages/smb`、`packages/smb/windows` | 通过 loopback SMB 3.1.1、SSPI 与当前用户盘符映射访问通用 FileStorage，在本地解释 Windows 规则；变更来源由宿主注入。 | R-FS-9、R-CC-14、R-INT-8、R-INT-14 |
 | **生命周期** | 宿主分别拥有挂载、SMB export、server 与系统映射的建立和拆除。 | R-WS-2 |
 
 ```
@@ -47,7 +47,7 @@ SSE 不把整个 stream 保存在内存里，但每一帧仍有独立的 `DialOp
 
 每个基础数据调用都要先取得 client 自己的 response admission。默认同时保留 64 份响应、允许 64 个等待者，aggregate 上限为 8 GiB；每份都按 `4 * MaxBodyBytes` 预留，覆盖 raw body、decoded listing 与转换过程的同时保留。Subscribe、Resubscribe 与 Snapshot 在发出 HTTP 前也取得同一名额，用来约束 stream 尚未成功建立时可能返回的普通 error body；确认 `200 text/event-stream` 后立即释放，后续 frame 由 `MaxFrameBytes` 约束。等待者已满时，`Stat`、`Write`、`Create` 或 stream setup 都会在发出 HTTP 请求前以 `EAGAIN` 失败；context cancellation 会移除等待计数。non-stream admission 一直持有到 response 解码、mutation response/barrier 验证完成。`ReadBounded` 取 client 与调用方 byte bound 中较小者；`ListBounded` 把解码后的 entry 逐项交给调用方的 `ListResult`。普通 `Read` 与 `List` 仍返回完整 materialized value，但整个 HTTP body 及其同时表示都在上述单体与 aggregate 边界内。server 侧的 backend 预算与 response admission 见 [`../server/architecture.md`](../server/architecture.md#六请求与响应的内存边界)。
 
-**FUSE 到这一层为止。** 挂载层把内核请求翻译为基础 volume 与 `FileStorage` 调用。按名字查询与目录操作使用路径；普通 fd 使用 `File`，无 fd 的身份属性使用 `StatNode`、`SetNodeAttr`。FileSession 拥有服务端保留对象，挂载层拥有内核编号与 owner 映射，两者不依赖旧路径重新绑定。
+**FUSE 到这一层为止。** 挂载把内核请求翻译为基础 volume 与通用 FileSession 调用，保留内核编号／owner、平台权限和锁转换。按名字的基础查询仍可使用副本；打开以精确 LookupAt 结果构造 RetainAt／CreateAndRetainAt／ResetAndRetainAt，普通 fd 使用 File，无 fd 属性使用 StatNode／SetNodeAttr。每个请求保留原 action，服务端引用不依赖旧路径重新绑定。
 
 ### 业务身份与授权结果
 
@@ -106,7 +106,7 @@ mutation 成功后，replicated client 从严格验证过的 response 取得 `(i
 一个 handle 保存 `storage.File` 和访问方式。Open 使用节点 ID，Create 把创建、排他条件、模式和截断交给一次权威打开；文件已存在时，非排他创建保留已有对象的模式。`O_TRUNC` 在 open 返回前完成，即使之后没有任何 write。
 
 ```
-打开   ──▶ OpenNode / OpenFile，取得对象引用，不取内容
+打开   ──▶ Retain / RetainAt 或原子 Create/ResetAndRetainAt，不取内容
 读取   ──▶ File.ReadAt，返回同一状态的属性与区间字节
 写入   ──▶ File.WriteAt，同步确认指定区间的修改
 截断   ──▶ File.Truncate，同步确认长度与内容
@@ -121,15 +121,15 @@ mutation 成功后，replicated client 从严格验证过的 response 取得 `(i
 
 `Options.MaxFileSize` 默认 1 GiB，零值选默认，负值在挂载前拒绝。挂载把有效值传给 FileSession；服务端在每份捕获的 revision 被物化或暂存前检查会话与 volume 上限。写入终点或目标长度超限时整次以 `EFBIG` 拒绝。截断到零可以丢弃超限旧内容，不取回旧 body。
 
-FUSE 不保存全文件缓冲区，objectstore 仍可能完整读取、重建不可变对象。每次读取与替换受[服务端物化预算](../server/file-handles.md#五http复制与资源)、transport body、对象存储与配额共同约束；提高某一层上限不会放宽其它层。只读 open 不取回超限内容，后续实际读取或非零截断仍在物化前拒绝。
+FUSE 不保存全文件缓冲区，objectstore 仍可能完整读取、重建不可变对象。每次读取与替换受[服务端物化预算](../server/file-handles.md#http复制与预算)、transport body、对象存储与配额共同约束；提高某一层上限不会放宽其它层。只读 open 不取回超限内容，后续实际读取或非零截断仍在物化前拒绝。
 
 ## 四、advisory locks 与关闭
 
-挂载启用 FUSE locks，raw bridge 将 `Getlk`、`Setlk`、`Setlkw` 映射到 File 的 advisory 操作。`flock` 使用 OFD owner，dup/fork 共享，最后一个共享 fd 释放；传统 POSIX 锁使用该挂载内的内核 `LockOwner`，关闭同一文件的任一 fd 都解除该 owner 的所有 POSIX 范围。PID 只用于报告冲突，不在独立挂载之间充当全局 owner。
+挂载启用 FUSE locks。raw bridge 将 Getlk、Setlk、Setlkw 交给本地 advisory planner，planner 通过通用 RangeSnapshot／ReplaceRanges／WaitRanges 取得事实和提交自有集合。flock 使用 OFD owner，dup／fork 共享，最后一个共享 fd 释放；POSIX 使用挂载内的内核 LockOwner，关闭同一文件任一个 fd 就清理该 owner 在该文件的全部范围。PID 留在 FUSE 的冲突诊断中，不作为远端或跨挂载 owner。
 
-两种锁域独立；flock EX 可用于只读 fd，POSIX 写锁要求可写。flock 转换先解除旧锁，POSIX 失败转换保留旧范围。阻塞调用以短请求登记、查询和取消，在会话健康时可持续等待；单次 HTTP 超时不是整个锁等待的截止时间。取消核对证明没有残留授予后才返回 `EINTR`。FUSE 遇到未知锁结果时封锁整个挂载，普通操作持续为 `EIO`，停止续期并退役 FileSession；单个 fd 的解锁或关闭不恢复该挂载，调用方须完成清理并重新挂载。原生 advisory API 对 owner 的独立清理能力不改变这项挂载级终止。完整范围与历史契约见[advisory 设计](../server/file-handles.md#四advisory-范围与-owner)。
+两种本地锁协议使用独立的不透明域；flock EX 可用于只读 fd，POSIX 写锁要求可写。flock 转换先解除旧锁，POSIX 失败转换保留旧范围。planner 验证 snapshot revision，保留每次 CAS 的原动作与计划；有界快速重试后进入 WaitRanges，健康 session 下可持续等待。共同有界依赖图保留跨会话／跨文件死锁检测。取消核对证明结果后才返回 EINTR。未知锁结果封锁整个挂载并持续 EIO，停止续期、退役 FileSession；单个 fd 清理不恢复挂载。共同范围与历史见[保留对象](../server/file-handles.md#访问声明与范围)。
 
-`Flush` 清理本次关闭的 POSIX owner，`Release` 结束 File 引用及其 flock 生命周期。它们不提交内容；`Fsync` 调用 `File.Sync` 检查已完成修改的健康与持久性。多次 Flush 不产生重复内容写入，最后 Release 的错误不能作为写入失败的唯一报告位置。
+Flush 在本地解释 POSIX 关闭事件并调用 File.RetireRangeOwner；Release 清理 flock owner 后退役 File 引用。RetireRangeOwner 与 session 关闭清理对应作用域，不让 remote 推断进程语义。它们不提交内容；Fsync 调用 File.Sync 检查已完成修改的健康与持久性。多次 Flush 不重复写内容，Release 错误不替代 write 调用的结果。
 
 `Options.FlushTimeout` 用于文件清理与挂载建立，默认 30 秒，负值在挂载前拒绝。清理 context 忽略关闭线程的取消，保留请求值与较早 deadline；预算只限定清理尝试，不承诺 mutex 等待、内核 Unmount 或整个 Mount.Wait 的耗时。底层 storage 的 Close 仍由它的拥有者负责。
 
@@ -137,35 +137,35 @@ FUSE 不保存全文件缓冲区，objectstore 仍可能完整读取、重建不
 
 挂载层通过 `storage.ErrnoOf` 分类错误，`nil` 为成功。已接受的请求取消返回 `EINTR`；deadline、未知错误与无法证明修改结果的失败返回 `EIO`。go-fuse 的请求 context 被取消后，原 FUSE 请求仍得到回复。
 
-文件创建使用原子的 open/create 结果；Mkdir 和同时修改大小、模式或时间的 Setattr 仍可能含多个阶段。某阶段已经产生效果后，仍需执行的后续阶段被取消时，以 `EIO` 保留原始原因，不能把整个操作报告成未发生。效果开始前接受的取消仍为 `EINTR`。
+文件和目录创建以固定 CreateAndRetainAt 同时设置初始 metadata 并取得引用；同时改变大小与 metadata 的 Setattr 仍有多个阶段。某阶段已有效果后，尚需执行的阶段被取消时，以 EIO 保留原因；效果开始前接受的取消仍为 EINTR。
 
-Setattr 含模式或时间修改时，使用 File.SetAttr 或 FileSession.SetNodeAttr 成功返回的权威属性，经节点身份与属性表示校验后直接填充回复，不再查询一次 Getattr。全部修改已经确认后到达的请求取消不推翻这份结果；真实修改错误、未知结果或无效返回属性仍失败。只有大小变化或空 AttrChange 的路径保留原有 Getattr；先完成截断、再执行模式／时间阶段之前被取消时仍为 `EIO`。
+Setattr 先读取需要的 POSIX metadata，按 ExpectedRevision 保留其它 key 后更新；前序 truncate 改变 revision 时重新捕获。File.SetAttr／FileSession.SetNodeAttr 的成功 receipt 经身份和属性校验后直接填充回复，不再追加 Getattr。全部效果已确认后的取消不推翻结果；真实错误、Unknown 或坏属性仍失败。仅大小变化或空 AttrChange 保留 Getattr，截断后下一阶段取消仍为 EIO。
 
-remote storage 在 HTTP `Do` 前接受取消时返回 `EINTR`，已发出的只读操作也可放弃读取。修改进入 dispatch 后，请求取消不能证明未执行；文件动作通过有界历史核对，仍不能确定的结果以 `EIO` 报告。打开的响应与确认失败必须清理或退役相应引用，不能留下调用方未知的无限引用。没有 Create／Truncate 的已有文件打开，在 ACK 为带 context.Canceled 的规范 EINTR、且同一能力的 Close 清理原始结果为 nil 时，返回无 File 的 EINTR；其余 ACK 失败保持 EIO，完整条件见[文件确认协议](../server/file-handles.md#五http复制与资源)。这不把任意打开变成可重试操作，也不改变丢失 ACK 的既有核对。成功修改未取得副本 barrier 确认时同样为 `EIO`。网络 errno 不进入 volume 错误链。
+remote storage 在 HTTP Do 前接受取消时返回 EINTR，已发出的只读调用可以放弃读取。修改 dispatch 后取消不证明未执行；HTTP 返回 Unknown／EIO，FUSE 持有原动作时显式核对或清理，不通过换新 ID 重做未知效果。无法归属的引用必须退役而非遗忘。没有 HTTP open ACK 或自动 Query 恢复路径，完整动作语义见[保留对象](../server/file-handles.md#内容操作与动作结果)。修改已完成而副本 barrier 未确认仍为 EIO，网络 errno 不作为 volume 的已知事实。
 
 到达挂载层的错误不会改写成空目录或不存在。第二节保留的副本重建缺口仍可能使按名字查询作出过早的旧答案；文件 direct I/O 不替代副本连续性。分类与阶段判定见[请求中断](../../../.agents/notes/implemented/bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)。
 
 ## 六、volume 答不上来的，挂载呈现层不代答
 
-storage 契约有模式与两个时间的写入口，也有整个 volume 的容量，但没有属主、没有扩展属性。凡是内核问到而契约答不上的，挂载呈现层报错：
+通用 Attr 提供 Kind、时间与 opaque metadata；FUSE 解释 `posix` key，不把 mode／UID／GID 规则交给远端。version 1 的 16 字节 little-endian payload 依次为 flags、mode、uid、gid；mode 必须存在，owner 字段按 flags 选择，未选择的值为零。未知版本、坏长度或无效位明确失败。
+
+Options.Permissions 为缺少 POSIX payload 的节点选择默认呈现：nil 使用 file 0644、directory 0755、symlink 0777；显式字段零表示 0000。已有 metadata 的 UID／GID 覆盖挂载默认，缺失 owner 使用挂载者 UID／GID。WithPermissions 合并 mode 时保留已有 owner 和其它 key，调用方提交时仍负责 ExpectedRevision。缺省呈现不授予远端业务权限。ctime 使用实际 ChangeTime，缺失时为零未知，不复制 mtime。
 
 | 被问到 | 回答 |
 |---|---|
-| `chown` 改成挂载者以外的属主 | EPERM |
+| chown 改成当前呈现 owner 以外的值 | EPERM |
 | 契约之外的其它属性 | EPERM |
 | 扩展属性 | EOPNOTSUPP |
-| `renameat2` 的 `RENAME_EXCHANGE`、`RENAME_NOREPLACE` | EINVAL |
-| 符号链接指向哪里 | EOPNOTSUPP |
+| renameat2 的 RENAME_EXCHANGE、RENAME_NOREPLACE | EINVAL |
+| 符号链接目标 | EOPNOTSUPP |
 | 硬链接 | 不提供（R-FS-4） |
-| 类型无法命名的节点 | EIO |
+| 无法表示的节点种类或坏平台 metadata | EIO |
 
-`chmod` 与 `utimens` 使用已有 File 或节点身份；创建文件时的模式在权威打开中设置，创建目录仍通过 volume 操作后设置模式。属主是唯一一个报错的属性：volume 不带属主，挂载点把每个节点都报成挂载它的那个用户（R-SEC-1），因此把属主改成那个用户就是它已经是的样子，改成别人则无处存放。
-
-目录的链接数一律为 1。
+chmod 以 revision 条件更新 POSIX payload；创建文件或目录时初始 mode 与节点创建原子提交。请求把 owner 设置为已经呈现的同一值可以成功，FUSE 不提供改变为另一个 owner 的操作。目录链接数为 1。
 
 ### 符号链接
 
-基础 volume 的路径 API 不创建符号链接，也不提供 readlink。WindowsFile.SetLink 可以在 authority 内把受控对象转换为链接；第三方实现也可以报告已有链接。FUSE 按属性呈现链接类型，类型转换后同一节点仍保留稳定 inode：
+基础 volume 的路径 API 不创建符号链接，也不提供 readlink。SMB 可用通用 SetKind 将受控空节点转换为链接，第三方实现也可报告已有链接。FUSE 按 Kind 呈现真实链接类型，类型转换后同一节点保持稳定 inode：
 
 | 对一个符号链接做 | 结果 |
 |---|---|
@@ -175,7 +175,7 @@ storage 契约有模式与两个时间的写入口，也有整个 volume 的容�
 | `rm` | 删掉链接本身，它指向的文件不动 |
 | 改名 | 搬动链接本身 |
 
-上述限制属于 Linux FUSE 入口：Readlink 与 Symlinker 仍返回 EOPNOTSUPP，不能从正确的 lstat 类型推导出链接解析或创建已经实现。Windows 的 reparse 行为由 [SMB 接入](windows-smb.md#目录观察与符号链接)单独描述。
+上述限制属于 Linux FUSE 入口：Readlink 与 Symlinker 仍返回 EOPNOTSUPP，不能从正确的 lstat 类型推导出链接解析或创建已经实现。Windows 的 reparse 行为由 [SMB 接入](windows-smb.md#名字metadata-与符号链接)单独描述。
 
 ## 七、容量
 

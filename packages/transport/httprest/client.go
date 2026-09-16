@@ -28,12 +28,13 @@ type Storage struct {
 	// maxWriteBytes bounds file-content requests before they are sent.
 	maxWriteBytes int64
 	// maxFrameBytes bounds one replication frame retained by a stream reader.
-	maxFrameBytes   int64
-	responses       *bodyAdmission
-	fileRequests    *bodyAdmission
-	lockControls    *bodyAdmission
-	windowsControls *bodyAdmission
-	scope           *locking.MutationScope
+	maxFrameBytes int64
+	responses     *bodyAdmission
+	fileRequests  *bodyAdmission
+	lockControls  *bodyAdmission
+	fileControls  *bodyAdmission
+	fileWaits     *bodyAdmission
+	scope         *locking.MutationScope
 
 	// silence is how long a stream may say nothing at all before this side stops believing
 	// it is being delivered.
@@ -118,10 +119,11 @@ func DialWithOptions(baseURL string, httpClient *http.Client, options DialOption
 			settled.MaxInFlightResponseBytes,
 			settled.MaxWaitingResponses,
 		),
-		fileRequests:    newBodyAdmission(settled.MaxConcurrentResponses, settled.MaxInFlightResponseBytes, settled.MaxWaitingResponses),
-		silence:         settled.Silence,
-		lockControls:    configuredLockControlAdmission(settled.MaxConcurrentLockControls, settled.MaxWaitingLockControls),
-		windowsControls: newBodyAdmission(settled.MaxConcurrentLockControls, settled.MaxInFlightResponseBytes, settled.MaxWaitingLockControls),
+		fileRequests: newBodyAdmission(settled.MaxConcurrentResponses, settled.MaxInFlightResponseBytes, settled.MaxWaitingResponses),
+		silence:      settled.Silence,
+		lockControls: configuredLockControlAdmission(settled.MaxConcurrentLockControls, settled.MaxWaitingLockControls),
+		fileControls: newBodyAdmission(settled.MaxConcurrentLockControls, settled.MaxInFlightResponseBytes, settled.MaxWaitingLockControls),
+		fileWaits:    newBodyAdmission(settled.MaxConcurrentLockControls, settled.MaxInFlightResponseBytes, settled.MaxWaitingLockControls),
 	}, nil
 }
 
@@ -140,7 +142,7 @@ func (s *Storage) Stat(ctx context.Context, path string) (storage.Attr, error) {
 	if err := json.Unmarshal(answer.content, &resp); err != nil {
 		return storage.Attr{}, unreachable(req, err)
 	}
-	return resp.Attr.Storage(), nil
+	return resp.Attr.Storage()
 }
 
 func (s *Storage) SetAttr(ctx context.Context, path string, change storage.AttrChange) error {
@@ -155,11 +157,12 @@ func (s *Storage) SetAttrWithBarrier(ctx context.Context, path string, change st
 
 func (s *Storage) setAttr(ctx context.Context, path string, change storage.AttrChange) (*MutationBarrier, error) {
 	req := Request{Op: OpSetAttr, Path: path}
-	body, err := json.Marshal(SetAttrRequest{Change: AttrChangeOf(change)})
+	wireChange, err := AttrChangeOf(change)
 	if err != nil {
-		// Rendered from a mode and two instants, so nothing here can refuse to encode.
-		// Reporting it as an outcome nobody knows is still the only honest answer, since
-		// the request was never sent.
+		return nil, err
+	}
+	body, err := json.Marshal(SetAttrRequest{Change: wireChange})
+	if err != nil {
 		return nil, unreachable(req, err)
 	}
 	return s.change(ctx, req, body)
@@ -176,7 +179,7 @@ func (s *Storage) List(ctx context.Context, path string) ([]storage.Entry, error
 	if err := json.Unmarshal(answer.content, &resp); err != nil {
 		return nil, unreachable(req, err)
 	}
-	return resp.Storage(), nil
+	return resp.Storage()
 }
 
 func (s *Storage) ListBounded(ctx context.Context, path string, result *storage.ListResult) (returned error) {
@@ -410,7 +413,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 	if content != nil {
 		httpReq.Header.Set("Content-Type", req.ContentType())
 	}
-	if isVolumeMutation(req.Op) || req.Op == OpFile && fileScopeEnabled(ctx) {
+	if isVolumeMutation(req.Op) {
 		scope := locking.ScopeFromContext(ctx)
 		if !locking.HasScope(ctx) && s.scope != nil {
 			scope = *s.scope
@@ -429,7 +432,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 
 	resp, err := s.http.Do(httpReq)
 	if err != nil {
-		return nil, operationFailure(req, err, requestInterruptible(ctx, req))
+		return nil, operationFailure(req, err, req.Method() == http.MethodGet)
 	}
 	defer resp.Body.Close()
 
@@ -448,7 +451,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 			return nil, &operationError{req: req, errno: syscall.EFBIG, detail: err.Error()}
 		}
 		if err != nil {
-			return nil, operationFailure(req, err, requestInterruptible(ctx, req))
+			return nil, operationFailure(req, err, req.Method() == http.MethodGet)
 		}
 		retained = true
 		return &retainedBody{content: body, done: release}, nil
@@ -459,7 +462,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 		}
 		body, err := readWhole(resp, errorLimit)
 		if err != nil {
-			return nil, operationFailure(req, err, requestInterruptible(ctx, req))
+			return nil, operationFailure(req, err, req.Method() == http.MethodGet)
 		}
 		return nil, s.storageError(req, body)
 	default:
@@ -510,7 +513,11 @@ func decodeListInto(content []byte, result *storage.ListResult) error {
 		if err := decoder.Decode(&entry); err != nil {
 			return err
 		}
-		if err := result.Add(storage.Entry{Name: string(entry.Name), Attr: entry.Attr.Storage()}); err != nil {
+		attr, err := entry.Attr.Storage()
+		if err != nil {
+			return err
+		}
+		if err := result.Add(storage.Entry{Name: string(entry.Name), Attr: attr}); err != nil {
 			return err
 		}
 	}

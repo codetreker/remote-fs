@@ -16,6 +16,10 @@ func validateNodeValues(ctx context.Context, db sqlvalue.Queryer, volume *int64)
 }
 
 func validateNodeValuesVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, version int) error {
+	if version >= firstSharedFileSchemaVersion {
+		return validateSharedNodeValues(ctx, db, volume)
+	}
+
 	where := ""
 	var args []any
 	if volume != nil {
@@ -25,7 +29,7 @@ func validateNodeValuesVersion(ctx context.Context, db sqlvalue.Queryer, volume 
 		where = "WHERE "
 	}
 	args = append(args,
-		int64(math.MaxUint32), int64(fs.ModeType), int64(fs.ModeDir), int64(fs.ModeSymlink),
+		int64(math.MaxUint32), int64(fs.ModeType), int64(fs.ModeDir),
 		int64(fs.ModeType), int64(fs.ModeDir), int64(fs.ModeType),
 	)
 	retainedNodeValues := ""
@@ -35,7 +39,7 @@ func validateNodeValuesVersion(ctx context.Context, db sqlvalue.Queryer, volume 
 	var invalid int64
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*) FROM nodes `+where+`(
-			mode < 0 OR mode > ? OR (mode & ?) NOT IN (0, ?, ?) OR size < 0 OR
+			mode < 0 OR mode > ? OR (mode & ?) NOT IN (0, ?) OR size < 0 OR
 			atime_nsec < 0 OR atime_nsec >= 1000000000 OR
 			mtime_nsec < 0 OR mtime_nsec >= 1000000000 OR
 			((mode & ?) = ? AND (size != 0 OR content IS NOT NULL)) OR
@@ -45,9 +49,6 @@ func validateNodeValuesVersion(ctx context.Context, db sqlvalue.Queryer, volume 
 	}
 	if invalid != 0 {
 		return fmt.Errorf("the database holds %d nodes with invalid metadata values: %w", invalid, syscall.EIO)
-	}
-	if version == schema.Version() {
-		return validateWindowsNodes(ctx, db, volume)
 	}
 	return nil
 }
@@ -154,6 +155,10 @@ func validateNodeRelationshipsVersion(
 	volume *int64,
 	version int,
 ) error {
+	if version >= firstSharedFileSchemaVersion {
+		return validateSharedNodeRelationships(ctx, db, volume)
+	}
+
 	volumeWhere := ""
 	nodeWhere := ""
 	entryWhere := ""
@@ -176,7 +181,7 @@ func validateNodeRelationshipsVersion(
 					WHEN n.id = ns.root OR (n.mode & ?) != 0 OR count(e.node) != 0
 					THEN 1 ELSE 0 END`
 		retainedEntry = ` OR parent.detached != 0 OR child.detached != 0`
-		nodeArgs = append(nodeArgs, int64(fs.ModeType&^(fs.ModeDir|fs.ModeSymlink)))
+		nodeArgs = append(nodeArgs, int64(fs.ModeType))
 	}
 	nodeArgs = append(nodeArgs, scopeArgs...)
 	rootArgs := append([]any{int64(fs.ModeDir)}, scopeArgs...)
@@ -299,10 +304,15 @@ func validateNodeReachability(
 // validateUsedAccounting streams each volume and its nodes in key order. File sizes are
 // added only after checking that the next addition fits in int64, so a corrupt database cannot
 // wrap an aggregate into a plausible counter.
-func validateUsedAccounting(
+func validateUsedAccounting(ctx context.Context, db sqlvalue.Queryer, volume *int64) error {
+	return validateUsedAccountingVersion(ctx, db, volume, schema.Version())
+}
+
+func validateUsedAccountingVersion(
 	ctx context.Context,
 	db sqlvalue.Queryer,
 	volume *int64,
+	version int,
 ) error {
 	where := ""
 	var args []any
@@ -310,10 +320,14 @@ func validateUsedAccounting(
 		where = "WHERE ns.id = ?"
 		args = []any{*volume}
 	}
+	typeColumn := "mode"
+	if version >= firstSharedFileSchemaVersion {
+		typeColumn = "kind"
+	}
 	rows, err := db.QueryContext(ctx, `
 		SELECT
 			ns.id, ns.used, typeof(ns.used),
-			n.id, n.mode, typeof(n.mode), n.size, typeof(n.size)
+			n.id, n.`+typeColumn+`, typeof(n.`+typeColumn+`), n.size, typeof(n.size)
 		FROM volumes ns
 		LEFT JOIN nodes n ON n.volume = ns.id
 		`+where+`
@@ -382,11 +396,12 @@ func validateUsedAccounting(
 		}
 		mode, modeValid := sqlvalue.StoredInteger(modeRaw, modeType)
 		size, sizeValid := sqlvalue.StoredInteger(sizeRaw, sizeType)
-		if !modeValid || mode < 0 || mode > math.MaxUint32 || !sizeValid || size < 0 {
+		if !modeValid || mode < 0 || mode > math.MaxUint32 || (version >= firstSharedFileSchemaVersion && (mode < 1 || mode > 3)) || !sizeValid || size < 0 {
 			invalidNodeValues++
 			continue
 		}
-		if (fs.FileMode(mode).Type() != 0 && fs.FileMode(mode).Type() != fs.ModeSymlink) || calculatedOverflow {
+		if (version < firstSharedFileSchemaVersion && fs.FileMode(mode).Type() != 0) ||
+			(version >= firstSharedFileSchemaVersion && mode == 2) || calculatedOverflow {
 			continue
 		}
 		if size > math.MaxInt64-calculatedUsed {

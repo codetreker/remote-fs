@@ -25,7 +25,6 @@ package metastore
 
 import (
 	"context"
-	"io/fs"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -199,44 +198,6 @@ type BoundedLister interface {
 // it, and it is never reused: R-INT-11 turns on that, because a reused key lets something
 // still holding the old one read bytes that belong to somebody else.
 type Key string
-
-// Node is one node of the tree.
-type Node struct {
-	// ID identifies the node itself rather than the name it currently has. It survives a
-	// rename and is never reused after the node is gone.
-	//
-	// The storage contract addresses nodes by path and carries this alongside, as
-	// storage.Attr.ID: it is how a mount tells a name that holds a different node from one
-	// that holds the same node still, which is what keeps an open descriptor reading the
-	// file it was opened on (R-FS-5). A tree stored as parent-and-name has it for free, and
-	// the shape that would not have it is the one that makes it expensive to add later.
-	ID int64
-
-	// Mode carries the type bits and the permission bits, in io/fs's layout rather than a
-	// kernel's. The type bits say what kind of node this is.
-	Mode fs.FileMode
-
-	// Size is the length of a file's contents. It is zero for a directory, which the storage
-	// contract leaves unspecified.
-	Size int64
-
-	AccessTime time.Time
-	ModTime    time.Time
-
-	// Content is the object holding this file's bytes, empty for a directory and for a file
-	// that has never been written.
-	Content Key
-}
-
-// IsDir reports whether the node is a directory.
-func (n Node) IsDir() bool { return n.Mode.IsDir() }
-
-// Attr renders the node as the storage contract describes it.
-func (n Node) Attr() storage.Attr {
-	return storage.Attr{
-		ID: uint64(n.ID), Mode: n.Mode, Size: n.Size, AccessTime: n.AccessTime, ModTime: n.ModTime,
-	}
-}
 
 // Child is one member of a directory listing. The name is a byte sequence rather than a
 // string because that is what a name is: encoding/json turns an invalid UTF-8 byte into
@@ -490,6 +451,7 @@ type Location struct {
 
 // Row is one node of a snapshot, named the way a Change names one.
 type Row struct {
+	EntryID storage.EntryID
 	// Parent is 0 and Name is nil for the root, which has no name and no parent.
 	Parent int64
 	Name   []byte

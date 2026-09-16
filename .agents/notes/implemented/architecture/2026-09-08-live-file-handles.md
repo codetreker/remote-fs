@@ -14,7 +14,7 @@ Status: implemented
 
 ### fd 保留对象，读写逐次发生
 
-挂载通过 `FileStorage` 建立有限 FileSession，以 `OpenNode` 保留普通文件身份。每个 `File.ReadAt` 返回同一对象状态的属性与区间字节；后续读取可看到已经完成的修改。FUSE 使用 direct I/O，不保留每 fd 或每节点的 dirty 全文件副本。身份属性使用 `StatNode`、`SetNodeAttr` 或已有 File；节点 ID 直接成为内核 inode number，跨挂载改名到新名字也保留同一编号。本地 serial 只记录名字成员的发现次序；路径变化不构成重新绑定的理由。
+挂载通过 FileStorage 建立有限 FileSession，以 Retain／RetainAt 保留对象身份；原子的创建／重置与引用由共同固定操作完成。每次 File.ReadAt 返回同状态 Attr 与区间字节，后续可见已完成修改。FUSE direct I/O 不保留 dirty 全文件副本；身份属性使用 StatNode／SetNodeAttr 或 File。NodeID 对应稳定 inode，本地 serial 只记录名字发现顺序，路径变化不重绑定。平台接口的收敛由[平台隔离决定](2026-09-16-isolate-platform-filesystem-clients.md)拥有。
 
 `WriteAt` 与 `Truncate` 同步发布并在各自调用上报告结果。普通重叠写入按实际提交顺序生效，未修改区间保留。原生 revision CAS 只解决构造替换时的并发状态变化；它不把打开时内容作为强制前置条件。显式版本工作流仍由[排序与版本](../../proposed/architecture/2026-08-19-ordering-and-versions.md)和[操作词汇](../../proposed/architecture/2026-08-19-storage-operation-vocabulary.md)拥有。
 
@@ -36,7 +36,7 @@ flock 按 open file description 归属，dup/fork 共享，最后一个共享描
 
 ### 关闭只结束它拥有的生命周期
 
-`Flush` 显式用内核 owner 调用 DropLocks 处理该关闭事件的 POSIX 清理，最终文件释放结束引用与 flock；两者不承担内容提交。直接 File API 的 Close 不推断进程 owner，集成方须同样显式报告 POSIX 关闭事件；FileSession.Close 才结束会话全部状态。`Sync` 保留已完成写入的健康、持久性确认，所以 `写临时文件 → fsync → rename` 仍有明确顺序。`FlushTimeout` 是清理与挂载建立预算，已经不是上传时机。
+Flush 由 FUSE 解释内核 owner，调用通用 File.RetireRangeOwner 完成该关闭事件的 POSIX 清理；最终 Release 清理 flock 并退役引用。File.Close 不解释进程或平台 owner，FileSession.Close 结束会话状态。Sync 核对已发布内容的健康和持久性，`写临时文件 → fsync → rename` 保持顺序；FlushTimeout 只约束清理与挂载建立，不是上传时机。
 
 挂载在已确认期限内续期 FileSession。失败的 Unmount 保持续期；内核真正退出后，挂载停止并排空会话，即使个别 Release 没有到达。`Mount.Done` 表示清理尝试结束，`Mount.Wait` 返回清理错误，关闭一个引用失败也不跳过其它引用的清理。HTTP handler 同样只清理自己创建的 registry，调用方在它结束之后才关闭 backend。
 

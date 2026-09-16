@@ -525,7 +525,12 @@ func (h *Handler) pages(ctx context.Context, out *frameWriter, snap metastore.Sn
 			if len(page.rows) > 0 {
 				rows := SnapshotPage{Rows: make([]Row, 0, len(page.rows))}
 				for _, row := range page.rows {
-					rows.Rows = append(rows.Rows, RowOf(row))
+					wire, err := RowOf(row)
+					if err != nil {
+						page.release()
+						return false, err
+					}
+					rows.Rows = append(rows.Rows, wire)
 				}
 				if err := out.send(eventRows, rows); err != nil {
 					page.release()
@@ -615,7 +620,7 @@ func newChangeFrameResult(maxFrameBytes int64) (*metastore.ChangeResult, error) 
 		if lengths.Notification == 0 {
 			return 0, fmt.Errorf("a change has no notification facts: %w", syscall.EIO)
 		}
-		if err := payloadLengthsFitFrame(maxFrameBytes, lengths.Name, lengths.FromName, lengths.Content, lengths.Notification); err != nil {
+		if err := payloadLengthsFitFrame(maxFrameBytes, lengths.Name, lengths.FromName, lengths.Content, lengths.Metadata, lengths.Target, lengths.Notification); err != nil {
 			return 0, err
 		}
 		if meta.From != nil {
@@ -625,6 +630,8 @@ func newChangeFrameResult(maxFrameBytes int64) (*metastore.ChangeResult, error) 
 		if meta.Node != nil {
 			node := *meta.Node
 			node.Content = ""
+			node.Metadata = nil
+			node.LinkTarget = nil
 			meta.Node = &node
 		}
 		wire, err := changeShapeOf(meta)
@@ -637,7 +644,7 @@ func newChangeFrameResult(maxFrameBytes int64) (*metastore.ChangeResult, error) 
 			return 0, fmt.Errorf("cannot size a change frame: %w", err)
 		}
 		payloadBytes := int64(len(encoded))
-		for _, length := range []int64{lengths.Name, lengths.FromName, lengths.Content, lengths.Notification} {
+		for _, length := range []int64{lengths.Name, lengths.FromName, lengths.Content, lengths.Metadata, lengths.Target, lengths.Notification} {
 			payloadBytes, err = addFrameBytes(payloadBytes, int64(base64.StdEncoding.EncodedLen(int(length))))
 			if err != nil {
 				return 0, err
@@ -645,41 +652,6 @@ func newChangeFrameResult(maxFrameBytes int64) (*metastore.ChangeResult, error) 
 		}
 		return encodedFrameBytes(eventChange, payloadBytes)
 	})
-}
-
-// maxChangeFrameBytes bounds the SSE encoding of a source's total raw payload cap.
-// A rename has both optional structures; omitting either saves more bytes than any
-// other kind's name or a null entry name adds. Every scalar below uses its widest
-// decimal representation. Four separately encoded byte fields can add at most
-// three base64 padding groups beyond encoding their combined length.
-func maxChangeFrameBytes(maxPayloadBytes int64) (int64, error) {
-	if maxPayloadBytes <= 0 {
-		return 0, fmt.Errorf("the change source has no positive payload bound: %w", syscall.EIO)
-	}
-	if err := payloadLengthsFitFrame(maximumMaxFrameBytes, maxPayloadBytes); err != nil {
-		return 0, err
-	}
-	widestTime := Time{UnixSec: math.MinInt64, Nanos: 999999999}
-	metadata := Change{
-		Position: math.MaxInt64, Kind: kindRenamed, Parent: math.MaxInt64, Name: []byte{},
-		From: &Location{Parent: math.MaxInt64, Name: []byte{}},
-		Node: &Node{ID: math.MaxInt64, Mode: math.MaxUint32, Size: math.MaxInt64,
-			AccessTime: widestTime, ModTime: widestTime, Content: []byte{}},
-		Notification: []byte{},
-	}
-	fixed, err := json.Marshal(metadata)
-	if err != nil {
-		return 0, fmt.Errorf("cannot size change metadata: %w", err)
-	}
-	encoded, err := addFrameBytes(int64(base64.StdEncoding.EncodedLen(int(maxPayloadBytes))), 3*4)
-	if err != nil {
-		return 0, err
-	}
-	encoded, err = addFrameBytes(encoded, int64(len(fixed)))
-	if err != nil {
-		return 0, err
-	}
-	return encodedFrameBytes(eventChange, encoded)
 }
 
 func newSnapshotFrameResult(maxFrameBytes int64) (*metastore.RowResult, error) {
@@ -692,11 +664,14 @@ func newSnapshotFrameResult(maxFrameBytes int64) (*metastore.RowResult, error) {
 		return nil, err
 	}
 	return metastore.NewRowResult(maxFrameBytes, fixed, func(index int, meta metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
-		if err := payloadLengthsFitFrame(maxFrameBytes, lengths.Name, lengths.Content); err != nil {
+		if err := payloadLengthsFitFrame(maxFrameBytes, lengths.Name, lengths.Content, lengths.Metadata, lengths.Target); err != nil {
 			return 0, err
 		}
 		meta.Node.Content = ""
-		one, err := json.Marshal(SnapshotPage{Rows: []Row{RowOf(meta)}})
+		meta.Node.Metadata = nil
+		meta.Node.LinkTarget = nil
+		shape := Row{EntryID: meta.EntryID, Parent: meta.Parent, Name: []byte{}, Node: nodeShapeOf(meta.Node)}
+		one, err := json.Marshal(SnapshotPage{Rows: []Row{shape}})
 		if err != nil {
 			return 0, fmt.Errorf("cannot size a snapshot row: %w", err)
 		}
@@ -704,13 +679,11 @@ func newSnapshotFrameResult(maxFrameBytes int64) (*metastore.RowResult, error) {
 		if index != 0 {
 			charge++
 		}
-		charge, err = addFrameBytes(charge, int64(base64.StdEncoding.EncodedLen(int(lengths.Name))))
-		if err != nil {
-			return 0, err
-		}
-		charge, err = addFrameBytes(charge, int64(base64.StdEncoding.EncodedLen(int(lengths.Content))))
-		if err != nil {
-			return 0, err
+		for _, length := range []int64{lengths.Name, lengths.Content, lengths.Metadata, lengths.Target} {
+			charge, err = addFrameBytes(charge, int64(base64.StdEncoding.EncodedLen(int(length))))
+			if err != nil {
+				return 0, err
+			}
 		}
 		return charge, nil
 	})

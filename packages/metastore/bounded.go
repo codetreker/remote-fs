@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"strings"
 	"syscall"
+	"time"
+
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // MaxChangePayloadBytes bounds the sum of all variable-length fields in one change.
@@ -16,13 +19,15 @@ type ChangePayloadLengths struct {
 	Name         int64
 	FromName     int64
 	Content      int64
+	Metadata     int64
+	Target       int64
 	Notification int64
 }
 
 // Check enforces the producer bound before any payload is loaded or committed.
 func (l ChangePayloadLengths) Check() error {
 	remaining := int64(MaxChangePayloadBytes)
-	for _, length := range []int64{l.Name, l.FromName, l.Content, l.Notification} {
+	for _, length := range []int64{l.Name, l.FromName, l.Content, l.Metadata, l.Target, l.Notification} {
 		if length < 0 {
 			return fmt.Errorf("negative change payload length: %w", syscall.EIO)
 		}
@@ -30,6 +35,9 @@ func (l ChangePayloadLengths) Check() error {
 			return fmt.Errorf("change payload exceeds the %d-byte bound: %w", MaxChangePayloadBytes, syscall.EFBIG)
 		}
 		remaining -= length
+	}
+	if l.Metadata > storage.MaxMetadataBytes || l.Target > storage.MaxLinkTargetBytes {
+		return fmt.Errorf("change node payload exceeds byte bound: %w", syscall.EFBIG)
 	}
 	if l.Notification > MaxNotificationBytes {
 		return fmt.Errorf("notification exceeds encoded byte bound: %w", syscall.EFBIG)
@@ -42,7 +50,7 @@ func (l ChangePayloadLengths) Check() error {
 // a transport format.
 //
 // A producer reserves each change from its scalar fields and payload lengths before loading
-// or copying Name, From.Name, Node.Content, or Notification. A result that cannot fit the next change may
+// or copying Name, From.Name, Node.Content, Node.Metadata, Node.LinkTarget, or Notification. A result that cannot fit the next change may
 // end a non-empty page before it; a change that cannot fit an otherwise empty result fails
 // the whole result with EFBIG. Any producer error must be passed to Fail, because a partial
 // sequence of changes cannot be presented as the complete answer to Since.
@@ -104,6 +112,10 @@ func (r *ChangeResult) Reserve(meta Change, lengths ChangePayloadLengths) (*Chan
 	if meta.Node != nil {
 		node := *meta.Node
 		node.Content = ""
+		node.Metadata = nil
+		node.LinkTarget = nil
+		node.CreationTime = boundedTime(node.CreationTime)
+		node.ChangeTime = boundedTime(node.ChangeTime)
 		node.AccessTime = node.AccessTime.UTC()
 		node.ModTime = node.ModTime.UTC()
 		meta.Node = &node
@@ -130,13 +142,13 @@ func validateChangeMeta(meta Change, lengths ChangePayloadLengths) error {
 	if err := lengths.Check(); err != nil {
 		return err
 	}
-	if meta.Notification != nil || len(meta.Name) != 0 || (meta.From != nil && len(meta.From.Name) != 0) || (meta.Node != nil && len(meta.Node.Content) != 0) {
+	if meta.Notification != nil || len(meta.Name) != 0 || (meta.From != nil && len(meta.From.Name) != 0) || (meta.Node != nil && (len(meta.Node.Content) != 0 || len(meta.Node.Metadata) != 0 || len(meta.Node.LinkTarget) != 0)) {
 		return fmt.Errorf("a change reservation already retains variable-length payload: %w", syscall.EINVAL)
 	}
 	if meta.From == nil && lengths.FromName != 0 {
 		return fmt.Errorf("a change without a source declares a %d-byte source name: %w", lengths.FromName, syscall.EIO)
 	}
-	if meta.Node == nil && lengths.Content != 0 {
+	if meta.Node == nil && (lengths.Content != 0 || lengths.Metadata != 0 || lengths.Target != 0) {
 		return fmt.Errorf("a change without a node declares a %d-byte content key: %w", lengths.Content, syscall.EIO)
 	}
 	return nil
@@ -186,14 +198,14 @@ type ChangeReservation struct {
 }
 
 // Commit supplies the fields whose lengths were charged by Reserve.
-func (r *ChangeReservation) Commit(name, fromName []byte, content Key, notification []byte) error {
+func (r *ChangeReservation) Commit(name, fromName []byte, content Key, metadata, target, notification []byte) error {
 	if r == nil || r.result == nil || r.committed {
 		return fmt.Errorf("a change reservation can be committed exactly once: %w", syscall.EINVAL)
 	}
-	if int64(len(name)) != r.lengths.Name || int64(len(fromName)) != r.lengths.FromName || int64(len(content)) != r.lengths.Content || int64(len(notification)) != r.lengths.Notification {
+	if int64(len(name)) != r.lengths.Name || int64(len(fromName)) != r.lengths.FromName || int64(len(content)) != r.lengths.Content || int64(len(notification)) != r.lengths.Notification || int64(len(metadata)) != r.lengths.Metadata || int64(len(target)) != r.lengths.Target {
 		return r.result.fail(fmt.Errorf(
-			"a change payload has lengths (%d, %d, %d, %d) after (%d, %d, %d, %d) were reserved: %w",
-			len(name), len(fromName), len(content), len(notification), r.lengths.Name, r.lengths.FromName, r.lengths.Content, r.lengths.Notification, syscall.EIO,
+			"a change payload has lengths (%d, %d, %d, %d, %d, %d) after (%d, %d, %d, %d, %d, %d) were reserved: %w",
+			len(name), len(fromName), len(content), len(metadata), len(target), len(notification), r.lengths.Name, r.lengths.FromName, r.lengths.Content, r.lengths.Metadata, r.lengths.Target, r.lengths.Notification, syscall.EIO,
 		))
 	}
 	if r.result.failure != nil {
@@ -206,6 +218,12 @@ func (r *ChangeReservation) Commit(name, fromName []byte, content Key, notificat
 	}
 	if change.Node != nil {
 		change.Node.Content = Key(strings.Clone(string(content)))
+		decoded, err := storage.DecodeMetadata(metadata)
+		if err != nil {
+			return r.result.fail(err)
+		}
+		change.Node.Metadata = decoded
+		change.Node.LinkTarget = bytes.Clone(target)
 	}
 	if len(notification) != 0 {
 		n, err := DecodeNotification(change, notification)
@@ -223,12 +241,14 @@ func (r *ChangeReservation) Commit(name, fromName []byte, content Key, notificat
 // RowPayloadLengths declares the variable-length fields of one snapshot row before they
 // are retained in a result.
 type RowPayloadLengths struct {
-	Name    int64
-	Content int64
+	Name     int64
+	Content  int64
+	Metadata int64
+	Target   int64
 }
 
 // RowResult retains one snapshot page under a caller-defined byte charge. Reserve must run
-// before Name or Node.Content are loaded. A producer leaves the next row for the next call
+// before names, content keys, opaque metadata, or link targets are loaded. A producer leaves the next row for the next call
 // when it fits an empty page but not the remaining space; a single row too large for an
 // empty page fails the whole result.
 type RowResult struct {
@@ -270,10 +290,10 @@ func (r *RowResult) Reserve(meta Row, lengths RowPayloadLengths) (*RowReservatio
 	if r.pending {
 		return nil, false, r.fail(fmt.Errorf("a row was reserved before the previous reservation was committed: %w", syscall.EIO))
 	}
-	if lengths.Name < 0 || lengths.Content < 0 {
-		return nil, false, r.fail(fmt.Errorf("a snapshot row carries a negative payload length: %w", syscall.EIO))
+	if err := (ChangePayloadLengths{Name: lengths.Name, Content: lengths.Content, Metadata: lengths.Metadata, Target: lengths.Target}).Check(); err != nil {
+		return nil, false, r.fail(err)
 	}
-	if len(meta.Name) != 0 || len(meta.Node.Content) != 0 {
+	if len(meta.Name) != 0 || len(meta.Node.Content) != 0 || len(meta.Node.Metadata) != 0 || len(meta.Node.LinkTarget) != 0 {
 		return nil, false, r.fail(fmt.Errorf("a row reservation already retains variable-length payload: %w", syscall.EINVAL))
 	}
 	if meta.Name != nil {
@@ -282,6 +302,10 @@ func (r *RowResult) Reserve(meta Row, lengths RowPayloadLengths) (*RowReservatio
 	meta.Node.AccessTime = meta.Node.AccessTime.UTC()
 	meta.Node.ModTime = meta.Node.ModTime.UTC()
 	meta.Node.Content = ""
+	meta.Node.Metadata = nil
+	meta.Node.LinkTarget = nil
+	meta.Node.CreationTime = boundedTime(meta.Node.CreationTime)
+	meta.Node.ChangeTime = boundedTime(meta.Node.ChangeTime)
 	charge, err := r.rowBytes(len(r.rows), meta, lengths)
 	if err != nil {
 		return nil, false, r.fail(err)
@@ -343,14 +367,14 @@ type RowReservation struct {
 }
 
 // Commit supplies the fields whose lengths were charged by Reserve.
-func (r *RowReservation) Commit(name []byte, content Key) error {
+func (r *RowReservation) Commit(name []byte, content Key, metadata, target []byte) error {
 	if r == nil || r.result == nil || r.committed {
 		return fmt.Errorf("a row reservation can be committed exactly once: %w", syscall.EINVAL)
 	}
-	if int64(len(name)) != r.lengths.Name || int64(len(content)) != r.lengths.Content {
+	if int64(len(name)) != r.lengths.Name || int64(len(content)) != r.lengths.Content || int64(len(metadata)) != r.lengths.Metadata || int64(len(target)) != r.lengths.Target {
 		return r.result.fail(fmt.Errorf(
-			"a snapshot row payload has lengths (%d, %d) after (%d, %d) were reserved: %w",
-			len(name), len(content), r.lengths.Name, r.lengths.Content, syscall.EIO,
+			"a snapshot row payload has lengths (%d, %d, %d, %d) after (%d, %d, %d, %d) were reserved: %w",
+			len(name), len(content), len(metadata), len(target), r.lengths.Name, r.lengths.Content, r.lengths.Metadata, r.lengths.Target, syscall.EIO,
 		))
 	}
 	if r.result.failure != nil {
@@ -359,8 +383,22 @@ func (r *RowReservation) Commit(name []byte, content Key) error {
 	row := r.meta
 	row.Name = bytes.Clone(name)
 	row.Node.Content = Key(strings.Clone(string(content)))
+	decoded, err := storage.DecodeMetadata(metadata)
+	if err != nil {
+		return r.result.fail(err)
+	}
+	row.Node.Metadata = decoded
+	row.Node.LinkTarget = bytes.Clone(target)
 	r.committed = true
 	r.result.pending = false
 	r.result.rows = append(r.result.rows, row)
 	return nil
+}
+
+func boundedTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	instant := value.UTC()
+	return &instant
 }

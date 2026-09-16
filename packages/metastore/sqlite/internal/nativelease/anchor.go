@@ -26,7 +26,15 @@ type Config struct {
 	BindingFD     int
 	RecoveryStart time.Time
 	Initialize    bool
+	Domain        Domain
 }
+
+type Domain uint8
+
+const (
+	DomainStrong Domain = iota
+	DomainFile
+)
 
 type leaseAnchorBinding struct {
 	Directory string
@@ -56,6 +64,8 @@ type Anchor struct {
 	closeErr      error
 	syncFile      func(int) error
 	operations    leaseAnchorOperations
+	domain        Domain
+	attribute     string
 }
 
 // Open validates existing evidence before making it available to SQLite.
@@ -72,8 +82,12 @@ func openAnchor(config Config, operations leaseAnchorOperations) (_ *Anchor, res
 		config.Name == "" || config.Name == "." || config.Name == ".." ||
 		strings.ContainsAny(config.Name, "/\x00") || len(config.Name) > 128 ||
 		config.Identity == "" || len(config.Identity) > 4096 || len(config.Directory) > 4096 ||
-		config.BindingFD < 0 || config.RecoveryStart.IsZero() {
+		config.BindingFD < 0 || config.RecoveryStart.IsZero() || config.Domain > DomainFile {
 		return nil, fmt.Errorf("invalid lease anchor configuration: %w", syscall.EINVAL)
+	}
+	attribute := leaseBindingAttribute
+	if config.Domain == DomainFile {
+		attribute = fileLeaseBindingAttribute
 	}
 	directoryFD, err := openLeaseDirectory(config.Directory)
 	if err != nil {
@@ -81,7 +95,7 @@ func openAnchor(config Config, operations leaseAnchorOperations) (_ *Anchor, res
 	}
 	a := &Anchor{
 		directoryFD: directoryFD, bindingFD: -1, start: config.RecoveryStart,
-		syncFile: operations.fsync, operations: operations,
+		syncFile: operations.fsync, operations: operations, domain: config.Domain, attribute: attribute,
 	}
 	defer func() {
 		if resultErr != nil {
@@ -135,7 +149,7 @@ func openAnchor(config Config, operations leaseAnchorOperations) (_ *Anchor, res
 			Directory: config.Directory, Name: config.Name, Identity: config.Identity,
 			StateID: hex.EncodeToString(stateID[:]),
 		}
-		encoded, err := encodeLeaseRecord("intent", a.intent)
+		encoded, err := encodeLeaseRecord(a.recordKind("intent"), a.intent)
 		if err != nil {
 			return nil, err
 		}
@@ -143,7 +157,7 @@ func openAnchor(config Config, operations leaseAnchorOperations) (_ *Anchor, res
 			return nil, err
 		}
 	} else {
-		if err := decodeLeaseRecord(intentBytes, "intent", &a.intent); err != nil {
+		if err := decodeLeaseRecord(intentBytes, a.recordKind("intent"), &a.intent); err != nil {
 			return nil, err
 		}
 		if a.intent.Binding.Directory != config.Directory || a.intent.Binding.Name != config.Name ||
@@ -151,7 +165,7 @@ func openAnchor(config Config, operations leaseAnchorOperations) (_ *Anchor, res
 			return nil, leaseAnchorFailure("lease initialization intent belongs to another binding", syscall.EIO)
 		}
 	}
-	expectedBinding, err := encodeLeaseRecord("binding", a.intent.Binding)
+	expectedBinding, err := encodeLeaseRecord(a.recordKind("binding"), a.intent.Binding)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +173,7 @@ func openAnchor(config Config, operations leaseAnchorOperations) (_ *Anchor, res
 		if a.intent.Ready || !config.Initialize {
 			return nil, leaseAnchorFailure("native lease binding is missing", syscall.EIO)
 		}
-		if err := unix.Fsetxattr(a.bindingFD, leaseBindingAttribute, expectedBinding, unix.XATTR_CREATE); err != nil {
+		if err := unix.Fsetxattr(a.bindingFD, a.attribute, expectedBinding, unix.XATTR_CREATE); err != nil {
 			return nil, leaseAnchorFailure("create native lease binding", err)
 		}
 		if err := a.syncFile(a.bindingFD); err != nil {
@@ -193,6 +207,17 @@ func (a *Anchor) StateID() string {
 
 func (a *Anchor) RecoveryStart() time.Time { return a.start }
 
+func (a *Anchor) Domain() Domain { return a.domain }
+
+// Record kinds distinguish domains before an interrupted initialization has
+// published its native binding.
+func (a *Anchor) recordKind(kind string) string {
+	if a.domain == DomainFile {
+		return "file-" + kind
+	}
+	return kind
+}
+
 func (a *Anchor) Initializing() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -221,8 +246,8 @@ func (a *Anchor) load() (Evidence, bool, error) {
 		}
 		return Evidence{}, false, nil
 	}
-	var evidence Evidence
-	if err := decodeLeaseRecord(encoded, "witness", &evidence); err != nil {
+	evidence, err := a.decodeWitness(encoded)
+	if err != nil {
 		return Evidence{}, false, err
 	}
 	if err := a.validateEvidence(evidence); err != nil {
@@ -255,8 +280,13 @@ func (a *Anchor) Advance(next Evidence) error {
 			next.MaxLease < previous.MaxLease {
 			return leaseAnchorFailure("lease witness changed identity or did not advance by one nondecreasing generation", syscall.EIO)
 		}
+		if a.domain == DomainFile && next.Quiescent && next.MaxLease != previous.MaxLease {
+			return leaseAnchorFailure("file lease quiescence changed the maximum lease duration", syscall.EIO)
+		}
+	} else if a.domain == DomainFile && next.Generation != 0 {
+		return leaseAnchorFailure("file lease witness must begin quiescent at generation zero", syscall.EIO)
 	}
-	encoded, err := encodeLeaseRecord("witness", next)
+	encoded, err := a.encodeWitness(next)
 	if err != nil {
 		return err
 	}
@@ -282,7 +312,7 @@ func (a *Anchor) Complete() error {
 	}
 	next := a.intent
 	next.Ready = true
-	encoded, err := encodeLeaseRecord("intent", next)
+	encoded, err := encodeLeaseRecord(a.recordKind("intent"), next)
 	if err != nil {
 		return err
 	}
@@ -295,8 +325,12 @@ func (a *Anchor) Complete() error {
 
 func (a *Anchor) validateEvidence(evidence Evidence) error {
 	if !validLeaseAnchorID(evidence.DatabaseID) || evidence.StateID != a.intent.Binding.StateID ||
-		evidence.Generation < 0 || evidence.MaxLease < 0 {
+		evidence.Generation < 0 || evidence.MaxLease < 0 || a.domain == DomainStrong && evidence.Quiescent {
 		return leaseAnchorFailure("lease witness contains invalid identity or counters", syscall.EIO)
+	}
+	if a.domain == DomainFile && (evidence.Generation == 0 && (evidence.MaxLease != 0 || !evidence.Quiescent) ||
+		!evidence.Quiescent && evidence.MaxLease == 0) {
+		return leaseAnchorFailure("file lease witness contains an invalid activity state", syscall.EIO)
 	}
 	return nil
 }

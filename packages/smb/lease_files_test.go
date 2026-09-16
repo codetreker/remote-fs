@@ -3,7 +3,6 @@ package smb
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"sync"
 	"syscall"
 	"testing"
@@ -32,16 +31,16 @@ func leaseTestDispatcher(t *testing.T) (*fileDispatcher, *commandFile, *commandS
 	t.Helper()
 	d, file, session, id := commandDispatcher()
 	delete(d.handles, id)
-	file.attr.Mode = 0644
-	file.attr.NameInfo = storage.WindowsNameInfo{State: storage.WindowsNameLinked, Path: "file"}
+	file.attr.Kind = storage.NodeRegular
+	file.attr.NameInfo = windowsNameInfo{State: windowsNameLinked, Path: "file"}
 	table := newLeaseTable(DefaultLimits())
 	d.leases = newLeaseOwner(table, [16]byte{1}, "authority:volume")
-	session.open = func(request storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
+	session.open = func(request windowsOpenRequest) (windowsOpenResult, error) {
 		if request.Lookup.Name == "" {
-			root := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 1, Mode: fs.ModeDir}}, NameInfo: storage.WindowsNameInfo{State: storage.WindowsNameRoot}}}
-			return storage.WindowsOpenResult{File: root, Attr: root.attr}, nil
+			root := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}, NameInfo: windowsNameInfo{State: windowsNameRoot}}}
+			return windowsOpenResult{File: root, Attr: root.attr}, nil
 		}
-		return storage.WindowsOpenResult{File: file, Attr: file.attr, CreateAction: storage.WindowsOpened}, nil
+		return windowsOpenResult{File: file, Attr: file.attr, CreateAction: windowsOpened}, nil
 	}
 	t.Cleanup(func() { _ = session.Close(context.Background()); d.leases.releaseAll() })
 	return d, file, session, table
@@ -67,15 +66,15 @@ func TestLeaseCreatePinsIdentityBeforeMutation(t *testing.T) {
 	firstID := leasedID(t, body, status)
 	base := session.open
 	mutations := 0
-	session.open = func(request storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
-		if request.Disposition == storage.WindowsOverwriteIf {
+	session.open = func(request windowsOpenRequest) (windowsOpenResult, error) {
+		if request.Disposition == windowsOverwriteIf {
 			mutations++
 		}
 		if request.Lookup.Name == "other" {
-			other := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 8, Mode: 0644}}, NameInfo: storage.WindowsNameInfo{State: storage.WindowsNameLinked, Path: "other"}}}
-			return storage.WindowsOpenResult{File: other, Attr: other.attr}, nil
+			other := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 8, Kind: storage.NodeRegular}}, NameInfo: windowsNameInfo{State: windowsNameLinked, Path: "other"}}}
+			return windowsOpenResult{File: other, Attr: other.attr}, nil
 		}
-		if request.Lookup.Name == "renamed" && request.Disposition == storage.WindowsOverwriteIf && request.Lookup.ExpectedID != 7 {
+		if request.Lookup.Name == "renamed" && request.Disposition == windowsOverwriteIf && request.Lookup.ExpectedID != 7 {
 			t.Error("mutating reuse omitted ExpectedID")
 		}
 		return base(request)
@@ -109,7 +108,7 @@ func TestLeaseRootReuseKeepsTheCanonicalRootLookup(t *testing.T) {
 	d, _, session, table := leaseTestDispatcher(t)
 	base := session.open
 	calls := 0
-	session.open = func(request storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
+	session.open = func(request windowsOpenRequest) (windowsOpenResult, error) {
 		calls++
 		if err := request.Lookup.Check(); err != nil || request.Lookup.ExpectedID != 0 {
 			t.Fatalf("root lookup=%+v %v", request.Lookup, err)
@@ -132,8 +131,8 @@ func TestLeaseRootReuseKeepsTheCanonicalRootLookup(t *testing.T) {
 
 type leaseProbeCloseFailure struct{ *commandFile }
 
-func (f *leaseProbeCloseFailure) Close(context.Context, storage.WindowsActionID) (storage.WindowsActionResult, error) {
-	return storage.WindowsActionResult{}, syscall.EIO
+func (f *leaseProbeCloseFailure) Close(context.Context, windowsActionID) (windowsActionResult, error) {
+	return windowsActionResult{}, syscall.EIO
 }
 
 func TestLeaseProbeCloseFailureRetainsAdmissionBeforeMutation(t *testing.T) {
@@ -143,12 +142,12 @@ func TestLeaseProbeCloseFailureRetainsAdmissionBeforeMutation(t *testing.T) {
 	base := session.open
 	mutations := 0
 	session.queryErr = syscall.EIO
-	session.open = func(request storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
-		if request.Disposition == storage.WindowsOverwriteIf {
+	session.open = func(request windowsOpenRequest) (windowsOpenResult, error) {
+		if request.Disposition == windowsOverwriteIf {
 			mutations++
 		}
 		if request.Lookup.Name == "file" && request.Access == 0 {
-			return storage.WindowsOpenResult{File: &leaseProbeCloseFailure{file}, Attr: file.attr}, nil
+			return windowsOpenResult{File: &leaseProbeCloseFailure{file}, Attr: file.attr}, nil
 		}
 		return base(request)
 	}
@@ -172,9 +171,9 @@ func TestLeaseUnknownCreateOwnsQuotaWithoutAFileID(t *testing.T) {
 	d, _, session, table := leaseTestDispatcher(t)
 	base := session.open
 	session.queryErr = syscall.EIO
-	session.open = func(request storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
+	session.open = func(request windowsOpenRequest) (windowsOpenResult, error) {
 		if request.Lookup.Name != "" {
-			return storage.WindowsOpenResult{}, syscall.EIO
+			return windowsOpenResult{}, syscall.EIO
 		}
 		return base(request)
 	}
@@ -200,11 +199,11 @@ func TestLeaseRetirementRejectsLateCreateInstallation(t *testing.T) {
 	entered, resume := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	base := session.open
-	session.open = func(request storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
+	session.open = func(request windowsOpenRequest) (windowsOpenResult, error) {
 		if request.Lookup.Name != "" {
 			once.Do(func() { close(entered) })
 			<-resume
-			return storage.WindowsOpenResult{File: file, Attr: file.attr}, nil
+			return windowsOpenResult{File: file, Attr: file.attr}, nil
 		}
 		return base(request)
 	}
@@ -255,10 +254,10 @@ func (s *leaseResolverSession) Close(context.Context) error {
 
 func TestLeaseResolverRetainsNonIOCleanupFailure(t *testing.T) {
 	d, _, base, table := leaseTestDispatcher(t)
-	root := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 1, Mode: fs.ModeDir}}, NameInfo: storage.WindowsNameInfo{State: storage.WindowsNameRoot}}}
+	root := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}, NameInfo: windowsNameInfo{State: windowsNameRoot}}}
 	session := &leaseResolverSession{commandSession: base, fail: true, root: root}
-	base.open = func(storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
-		return storage.WindowsOpenResult{File: root, Attr: root.attr}, nil
+	base.open = func(windowsOpenRequest) (windowsOpenResult, error) {
+		return windowsOpenResult{File: root, Attr: root.attr}, nil
 	}
 	d.session = session
 	if _, status := d.create(t.Context(), leaseCreate(t, `parent\file`, 11, 1)); status != statusError(syscall.EAGAIN) {
@@ -289,12 +288,12 @@ func TestLeaseMissingTargetWithRetainedProbeCannotMutate(t *testing.T) {
 	_ = leasedID(t, body, status)
 	base := session.open
 	mutations := 0
-	session.open = func(request storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
-		if request.Disposition == storage.WindowsOverwriteIf {
+	session.open = func(request windowsOpenRequest) (windowsOpenResult, error) {
+		if request.Disposition == windowsOverwriteIf {
 			mutations++
 		}
 		if request.Lookup.Name == "missing" {
-			return storage.WindowsOpenResult{File: file, Attr: file.attr}, syscall.ENOENT
+			return windowsOpenResult{File: file, Attr: file.attr}, syscall.ENOENT
 		}
 		return base(request)
 	}
@@ -303,5 +302,31 @@ func TestLeaseMissingTargetWithRetainedProbeCannotMutate(t *testing.T) {
 	}
 	if slots, _ := table.counts(); slots != 2 {
 		t.Fatal("retained failed probe lost its reservation")
+	}
+}
+
+func TestLeaseSupersedeConflictIsRejectedBeforeReplacement(t *testing.T) {
+	d, _, session, _ := leaseTestDispatcher(t)
+	body, status := d.create(t.Context(), leaseCreate(t, "file", 19, 1))
+	_ = leasedID(t, body, status)
+	base := session.open
+	mutations := 0
+	session.open = func(request windowsOpenRequest) (windowsOpenResult, error) {
+		if request.Disposition == windowsSupersede {
+			mutations++
+		}
+		return base(request)
+	}
+	request := leaseCreate(t, "file", 19, 0)
+	smbLE.PutUint32(request.Body[24:], 0x10080)
+	if _, status = d.create(t.Context(), request); status != fileInvalidParameter || mutations != 0 {
+		t.Fatal(status, mutations)
+	}
+	fresh := leaseCreate(t, "file", 20, 0)
+	smbLE.PutUint32(fresh.Body[24:], 0x10080)
+	body, status = d.create(t.Context(), fresh)
+	_ = leasedID(t, body, status)
+	if mutations != 1 {
+		t.Fatal(mutations)
 	}
 }

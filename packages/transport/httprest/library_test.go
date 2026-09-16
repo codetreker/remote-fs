@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -116,8 +115,12 @@ func exerciseTheLibrary(dir string) (result error) {
 		{"list", func() error { _, err := s.List(ctx, "d"); return err }},
 		{"stat", func() error { _, err := s.Stat(ctx, "d/f"); return err }},
 		{"setattr", func() error {
-			mode := fs.FileMode(0o600)
-			return s.SetAttr(ctx, "d/f", storage.AttrChange{Mode: &mode})
+			metadata := storage.Metadata{{Key: "client.example", Version: 1, Data: []byte{0, 6, 0}}}
+			attr, err := s.Stat(ctx, "d/f")
+			if err != nil {
+				return err
+			}
+			return s.SetAttr(ctx, "d/f", storage.AttrChange{ExpectedRevision: attr.MetadataRevision, Metadata: &metadata})
 		}},
 		{"create", func() error { return s.Create(ctx, "d/g") }},
 		{"rename", func() error { return s.Rename(ctx, "d/f", "d/g") }},

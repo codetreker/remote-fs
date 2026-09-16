@@ -51,7 +51,7 @@ func ReadPage(
 		}
 		for rows.Next() {
 			examined++
-			change, lengths, previous, err := scanChangeMetadata(rows, volume)
+			change, lengths, previous, identityHighWater, err := scanChangeMetadata(rows, volume)
 			if err != nil {
 				rows.Close()
 				return metastore.Retention{}, err
@@ -79,12 +79,15 @@ func ReadPage(
 				stoppedAtCapacity = true
 				break
 			}
-			var name, fromName, notification []byte
+			var name, fromName, metadata, target, notification []byte
 			var content sql.NullString
+			var root int64
 			if err := tx.QueryRowContext(ctx, `
-					SELECT name, from_name, content, notification FROM changes
-					WHERE volume = ? AND position = ?`, volume, int64(change.Position)).Scan(
-				&name, &fromName, &content, &notification,
+					SELECT c.name, c.from_name, c.content, c.metadata, c.link_target, c.notification,
+						CASE WHEN typeof(v.root) = 'integer' THEN v.root END
+					FROM changes c JOIN volumes v ON v.id = c.volume
+					WHERE c.volume = ? AND c.position = ?`, volume, int64(change.Position)).Scan(
+				&name, &fromName, &content, &metadata, &target, &notification, &root,
 			); err != nil {
 				rows.Close()
 				return metastore.Retention{}, err
@@ -93,9 +96,23 @@ func ReadPage(
 				rows.Close()
 				return metastore.Retention{}, err
 			}
-			if err := reservation.Commit(name, fromName, metastore.Key(content.String), notification); err != nil {
+			if err := reservation.Commit(name, fromName, metastore.Key(content.String), metadata, target, notification); err != nil {
 				rows.Close()
 				return metastore.Retention{}, err
+			}
+			committed, err := result.Changes()
+			if err != nil {
+				rows.Close()
+				return metastore.Retention{}, err
+			}
+			if err := validateNotificationRoot(committed[len(committed)-1].Notification, root); err != nil {
+				rows.Close()
+				return metastore.Retention{}, err
+			}
+			actual, err := metastore.NotificationIdentityHighWater(committed[len(committed)-1].Notification)
+			if err != nil || actual != identityHighWater {
+				rows.Close()
+				return metastore.Retention{}, fmt.Errorf("change identity high-water disagrees with images: %w", errors.Join(syscall.EIO, err))
 			}
 			cursor = change.Position
 			expected = int64(change.Position)

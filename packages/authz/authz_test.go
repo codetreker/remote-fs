@@ -13,11 +13,12 @@ import (
 func TestAuthorizerFuncPreservesHostContextIntentAndError(t *testing.T) {
 	type identityKey struct{}
 	ctx := context.WithValue(t.Context(), identityKey{}, "host-owned-identity")
-	options := storage.FileOpenOptions{
-		OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Truncate: true, Exclusive: true},
-		ExpectedID: 42, Mode: 0o600,
+	request := authz.AccessRequest{
+		Volume: "configured-volume", Operation: storage.OpFileReplaceAndRetainAt,
+		Effects:   storage.EffectRetained | storage.EffectCreated | storage.EffectEntryDetached | storage.EffectPreparedChanged,
+		Claim:     storage.AccessClaim{Uses: storage.ReadContent | storage.WriteContent, Excludes: storage.RemoveEntry},
+		Reference: 11, Node: 42, Parent: 12, Destination: 13,
 	}
-	request := authz.AccessRequest{Volume: "configured-volume", Operation: storage.OpFileOpen, Open: options.OpenAccess}
 	cause := errors.New("policy lookup failed")
 	calls := 0
 	policy := authz.AuthorizerFunc(func(got context.Context, copied authz.AccessRequest) error {
@@ -26,14 +27,16 @@ func TestAuthorizerFuncPreservesHostContextIntentAndError(t *testing.T) {
 			t.Fatalf("adapter changed host context or intent: %+v", copied)
 		}
 		copied.Volume = "different"
-		copied.Open.Read = false
+		copied.Effects = 0
+		copied.Claim.Uses = 0
+		copied.Reference, copied.Node, copied.Parent, copied.Destination = 0, 0, 0, 0
 		return cause
 	})
 	var authorizer authz.Authorizer = policy
 	if err := authorizer.Authorize(ctx, request); err != cause || calls != 1 {
 		t.Fatalf("adapter calls=%d error=%v", calls, err)
 	}
-	if request.Volume != "configured-volume" || !request.Open.Read {
+	if request.Volume != "configured-volume" || request.Effects == 0 || request.Claim.Uses != storage.ReadContent|storage.WriteContent || request.Reference != 11 || request.Node != 42 || request.Parent != 12 || request.Destination != 13 {
 		t.Fatal("policy changed the caller's request value")
 	}
 	if err := authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return nil }).Authorize(ctx, request); err != nil {
@@ -52,22 +55,25 @@ func TestDeniedMarkerSurvivesHostErrorWrappingAndJoining(t *testing.T) {
 	}
 }
 
-func TestWindowsOpenIntentPreservesAllAccessDecisions(t *testing.T) {
-	intent := storage.WindowsOpenIntent{Access: storage.WindowsReadAttributes | storage.WindowsDelete, Share: storage.WindowsShareRead, Disposition: storage.WindowsOpenIf, Kind: storage.WindowsDirectory, DeleteOnClose: true, OpenReparsePoint: true}
-	request := authz.AccessRequest{Volume: "configured-volume", Operation: storage.OpWindowsOpen, WindowsOpen: intent}
+func TestMetadataOnlyRetainPreservesItsClaimAndDenial(t *testing.T) {
+	claim := storage.AccessClaim{Excludes: storage.RemoveEntry}
+	request := authz.AccessRequest{Volume: "configured-volume", Operation: storage.OpFileRetain, Effects: storage.EffectRetained, Claim: claim, Node: 17}
 	calls := 0
 	policy := authz.AuthorizerFunc(func(_ context.Context, got authz.AccessRequest) error {
 		calls++
 		if got != request {
-			t.Fatalf("changed Windows authorization intent: %+v", got)
+			t.Fatalf("changed generic authorization intent: %+v", got)
 		}
-		got.WindowsOpen.Access = storage.WindowsAllAccess
+		if got.Claim.Uses != 0 || got.Effects != storage.EffectRetained {
+			t.Fatal("metadata-only retain acquired content access or mutation effects")
+		}
+		got.Claim.Uses = storage.WriteContent
 		return authz.ErrDenied
 	})
 	if err := policy.Authorize(t.Context(), request); !errors.Is(err, authz.ErrDenied) || calls != 1 {
 		t.Fatalf("calls=%d error=%v", calls, err)
 	}
-	if request.WindowsOpen != intent {
+	if request.Claim != claim {
 		t.Fatal("policy changed caller's intent")
 	}
 }

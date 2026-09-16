@@ -34,6 +34,7 @@ type Server struct {
 }
 
 type Export struct {
+	backend        windowsBackend
 	volumeIdentity string
 	server         *Server
 	share          Share
@@ -48,7 +49,7 @@ type Export struct {
 }
 
 func New(config Config) (*Server, error) {
-	if config.Authenticator == nil || config.Authorize == nil {
+	if config.Authenticator == nil || config.Authorize == nil || !validDOSAttributes(config.AbsentDOSAttributes) {
 		return nil, ErrConfig
 	}
 	if err := config.Limits.check(); err != nil {
@@ -67,20 +68,28 @@ func shareKey(name string) (string, error) {
 }
 
 func (s *Server) Publish(share Share) (*Export, error) {
-	key, err := shareKey(share.Name)
-	if err != nil || key == "IPC$" || share.Volume == "" || share.Backend == nil {
+	if share.Backend == nil {
 		return nil, ErrConfig
 	}
-	if err := share.Backend.CheckWindowsStorage(); err != nil {
+	b := &clientBackend{source: share.Backend, limits: s.config.Limits, defaults: windowsMetadata{Attributes: s.config.AbsentDOSAttributes}, authorize: s.config.Authorize, volume: share.Volume}
+	return s.publish(share, b)
+}
+
+func (s *Server) publish(share Share, backend windowsBackend) (*Export, error) {
+	key, err := shareKey(share.Name)
+	if err != nil || key == "IPC$" || share.Volume == "" || backend == nil {
+		return nil, ErrConfig
+	}
+	if err := backend.Check(); err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.config.Limits.RequestTimeout)
 	defer cancel()
-	state, err := share.Backend.WindowsState(ctx)
+	state, err := backend.State(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if !state.Enabled || state.VolumeIdentity == "" || state.MaxEventBytes <= 0 || state.MaxEventBytes > s.config.Limits.MaxDirectoryBytes || s.config.Limits.MaxNotifyEvents < 2 || state.MaxEventBytes > (s.config.Limits.MaxNotifyBytes-4*metastore.MaxNotificationAncestors-64)/2 {
+	if state.VolumeIdentity == "" || state.MaxEventBytes <= 0 || state.MaxEventBytes > s.config.Limits.MaxDirectoryBytes || s.config.Limits.MaxNotifyEvents < 2 || state.MaxEventBytes > (s.config.Limits.MaxNotifyBytes-4*metastore.MaxNotificationAncestors-64)/2 {
 		return nil, ErrConfig
 	}
 	changes, err := newNotificationManager(ctx, share.Changes, s.config.Limits)
@@ -101,7 +110,7 @@ func (s *Server) Publish(share Share) (*Export, error) {
 	if _, ok := s.exports[key]; ok {
 		return nil, ErrBusy
 	}
-	e := &Export{server: s, share: share, key: key, changes: changes, volumeIdentity: state.VolumeIdentity}
+	e := &Export{backend: backend, server: s, share: share, key: key, changes: changes, volumeIdentity: state.VolumeIdentity}
 	s.exports[key] = e
 	keep = true
 	return e, nil

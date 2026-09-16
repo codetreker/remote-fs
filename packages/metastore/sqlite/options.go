@@ -5,9 +5,9 @@ import (
 	"math"
 	"syscall"
 
-	"github.com/codetreker/remote-fs/packages/advisory"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/changes"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/nativelease"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 const (
@@ -36,18 +36,18 @@ const (
 
 // Options configures the serving resources of one Store.
 type Options struct {
-	leaseRecoveryOwner    bool
-	leaseOwner            *nativelease.Database
-	requireExistingVolume bool
-	Window                Window
-	ObjectLimits          ObjectLimits
+	leaseRecoveryOwner     bool
+	fileLeaseRecoveryOwner bool
+	leaseOwner             *nativelease.Database
+	requireExistingVolume  bool
+	Window                 Window
+	ObjectLimits           ObjectLimits
 
 	// MaxRetainedFiles bounds native file references across this volume. Zero
 	// selects DefaultMaxRetainedFiles; admission exhaustion returns EAGAIN.
 	MaxRetainedFiles int
-	// Advisory bounds volume-wide lock and materialization state. The zero
-	// configuration selects advisory.DefaultConfig; shared opens must agree.
-	Advisory advisory.Config
+	// Files bounds the shared volume file authority.
+	Files storage.FileServiceOptions
 
 	// MaxReaderConnections bounds the physical SQLite connections used by ordinary volume
 	// and log reads. Zero selects DefaultMaxReaderConnections. A read waits for a connection
@@ -75,7 +75,7 @@ func DefaultOptions() Options {
 		Window:                       DefaultWindow(),
 		ObjectLimits:                 DefaultObjectLimits(),
 		MaxRetainedFiles:             DefaultMaxRetainedFiles,
-		Advisory:                     advisory.DefaultConfig(),
+		Files:                        storage.DefaultFileServiceOptions(),
 		MaxReaderConnections:         DefaultMaxReaderConnections,
 		MaxSnapshotReaderConnections: DefaultMaxSnapshotReaderConnections,
 		MaxIntegrityRecords:          DefaultMaxIntegrityRecords,
@@ -85,10 +85,10 @@ func DefaultOptions() Options {
 
 // Effective resolves zero-valued defaults and validates Options without opening a database.
 func (o Options) Effective() (Options, error) {
-	if o.Advisory == (advisory.Config{}) {
-		o.Advisory = advisory.DefaultConfig()
+	if o.Files == (storage.FileServiceOptions{}) {
+		o.Files = storage.DefaultFileServiceOptions()
 	}
-	if err := o.Advisory.Check(); err != nil {
+	if err := o.Files.Check(); err != nil {
 		return Options{}, err
 	}
 	if o.MaxRetainedFiles == 0 {

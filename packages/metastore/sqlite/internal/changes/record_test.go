@@ -3,7 +3,6 @@ package changes
 import (
 	"database/sql"
 	"errors"
-	"io/fs"
 	"os"
 	"reflect"
 	"strings"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/sqliteschema"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func logFixture(t *testing.T) (*sql.DB, *sql.Tx) {
@@ -40,11 +40,12 @@ func logFixture(t *testing.T) (*sql.DB, *sql.Tx) {
 		t.Fatal(err)
 	}
 	execLogSQL(t, tx, `INSERT INTO volumes(id,name,root,used) VALUES(1,'one',1,0),(2,'two',3,0)`)
-	execLogSQL(t, tx, `INSERT INTO nodes(id,volume,mode,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec)
-		VALUES(1,1,?,0,0,0,0,0),(2,1,420,0,0,0,0,0),(3,2,?,0,0,0,0,0),(4,2,420,0,0,0,0,0)`,
-		int64(fs.ModeDir|0755), int64(fs.ModeDir|0755))
-	execLogSQL(t, tx, `INSERT INTO entries(volume,parent,name,node) VALUES(1,1,x'66696c65',2),(2,3,x'66696c65',4)`)
-	execLogSQL(t, tx, `UPDATE database_state SET node_high_water=4`)
+	execLogSQL(t, tx, `INSERT INTO nodes(id,volume,kind,directory_revision,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec)
+ VALUES(1,1,2,1,0,0,0,0,0),(2,1,1,0,0,0,0,0,0),(3,2,2,1,0,0,0,0,0),(4,2,1,0,0,0,0,0,0)`)
+	execLogSQL(t, tx, `INSERT INTO entries(id,volume,parent,name,node) VALUES(5,1,1,x'66696c65',2),(6,2,3,x'66696c65',4)`)
+	execLogSQL(t, tx, `UPDATE database_state SET node_high_water=6`)
+	execLogSQL(t, tx, `UPDATE sqlite_sequence SET seq=6 WHERE name='nodes'`)
+
 	for _, volume := range []int64{1, 2} {
 		if err := CreateLog(t.Context(), tx, volume); err != nil {
 			t.Fatal(err)
@@ -73,29 +74,31 @@ func execLogSQL(t *testing.T, tx *sql.Tx, query string, args ...any) {
 }
 
 func fileChange(kind metastore.ChangeKind) metastore.Change {
+	node := metastore.Node{ID: 2, Kind: storage.NodeRegular, MetadataRevision: 2, Size: 4, Content: "body", AccessTime: time.Unix(-100, 123).UTC(), ModTime: time.Unix(100, 456).UTC()}
 	change := metastore.Change{Kind: kind, Parent: 1, Name: []byte("file")}
 	if kind != metastore.Removed {
-		change.Node = &metastore.Node{ID: 2, Mode: 0644, Size: 4, Content: "body",
-			AccessTime: time.Unix(-100, 123).UTC(), ModTime: time.Unix(100, 456).UTC()}
+		change.Node = &node
 	}
-	if kind == metastore.Renamed {
-		change.From = &metastore.Location{Parent: 1, Name: []byte("old")}
-	}
-
-	at := &metastore.LocationFacts{Ancestors: []metastore.DirectoryAncestor{{DirectoryID: 1}}, LeafName: []byte("file")}
-	n := &metastore.Notification{SubjectID: 2, ChangeMask: metastore.ChangeName}
+	location := storage.EntryLocation{State: storage.LocationLinked, RootNodeID: 1, NodeID: 2, Ancestors: []storage.EntryCondition{{ParentID: 1, NodeID: 2, EntryID: 5, DirectoryRevision: 1, Name: []byte("file")}}}
+	image := func() *metastore.EventImage { return &metastore.EventImage{Attr: node.Attr(), Location: location} }
+	n := &metastore.Notification{SubjectID: 2, SubjectKind: storage.NodeRegular, ChangeMask: metastore.ChangeName}
 	switch kind {
 	case metastore.Created:
-		n.After = at
+		n.After = image()
 	case metastore.Removed:
-		n.Before = at
+		n.Before = image()
 	case metastore.Modified:
-		n.Before = at
-		n.After = at
+		n.Before = image()
+		n.Before.Attr.Size = 3
+		n.Before.Attr.MetadataRevision = 1
+		n.After = image()
 		n.ChangeMask = metastore.ChangeSize
 	case metastore.Renamed:
-		n.Before = &metastore.LocationFacts{Ancestors: at.Ancestors, LeafName: []byte("old")}
-		n.After = at
+		change.From = &metastore.Location{Parent: 1, Name: []byte("old")}
+		n.Before = image()
+		n.Before.Location.Ancestors = append([]storage.EntryCondition(nil), location.Ancestors...)
+		n.Before.Location.Ancestors[0].Name = []byte("old")
+		n.After = image()
 	}
 	change.Notification = n
 	return change

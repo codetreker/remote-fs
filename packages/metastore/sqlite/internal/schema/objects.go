@@ -51,7 +51,7 @@ func validateLegacyObjectIntegrity(
 		return fmt.Errorf("schema version %d holds %d referenced objects with an invalid size: %w",
 			version, invalidSizes, syscall.EIO)
 	}
-	if err := validateObjectRelationships(ctx, db, nil); err != nil {
+	if err := validateObjectRelationshipsVersion(ctx, db, nil, version); err != nil {
 		return err
 	}
 	return nil
@@ -60,10 +60,15 @@ func validateLegacyObjectIntegrity(
 // validateObjectRelationships checks both directions of the node/object relation. A nil
 // volume validates the whole database during a legacy migration; a non-nil volume keeps
 // ordinary reopen and status checks scoped to the Store being served.
-func validateObjectRelationships(
+func validateObjectRelationships(ctx context.Context, db sqlvalue.Queryer, volume *int64) error {
+	return validateObjectRelationshipsVersion(ctx, db, volume, schema.Version())
+}
+
+func validateObjectRelationshipsVersion(
 	ctx context.Context,
 	db sqlvalue.Queryer,
 	volume *int64,
+	version int,
 ) error {
 	nodeWhere := ""
 	objectWhere := ""
@@ -73,19 +78,29 @@ func validateObjectRelationships(
 		objectWhere = "WHERE o.volume = ?"
 		scopeArgs = []any{*volume}
 	}
+	typeColumn := "n.mode"
+	nonemptyWithoutContent := "n.size != 0"
+	nonRegular := "(n.mode & ?) != 0"
+	kindArgument := int64(fs.ModeType)
+	if version >= firstSharedFileSchemaVersion {
+		typeColumn = "n.kind"
+		nonemptyWithoutContent = "n.size != 0 AND n.kind != 3"
+		nonRegular = "n.kind != ?"
+		kindArgument = 1
+	}
 	var invalidNodes int64
-	nodeArgs := append([]any{int64(fs.ModeType), int64(fs.ModeSymlink), int64(fs.ModeType), StateReferenced}, scopeArgs...)
+	nodeArgs := append([]any{kindArgument, StateReferenced}, scopeArgs...)
 	if err := db.QueryRowContext(ctx, `
 		SELECT coalesce(sum(CASE
 			WHEN n.content IS NULL THEN
 				CASE WHEN typeof(n.size) != 'integer' OR n.size < 0 OR
- (n.size != 0 AND (n.mode & ?) != ?) THEN 1 ELSE 0 END
+ (`+nonemptyWithoutContent+`) THEN 1 ELSE 0 END
 			WHEN typeof(n.content) != 'text'
 				OR n.content = ''
-				OR typeof(n.mode) != 'integer'
+				OR typeof(`+typeColumn+`) != 'integer'
 				OR typeof(n.size) != 'integer'
 				OR n.size < 0
-				OR (n.mode & ?) != 0
+				OR `+nonRegular+`
 				OR o.key IS NULL
 				OR o.volume != n.volume
 				OR o.state != ?

@@ -64,15 +64,22 @@ func TestHandlerRetirementReclaimsDetachedFilesBeforeStorageClose(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := remote.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	session, _, err := remote.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
-	file, err := session.OpenFile(t.Context(), "held", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0o600})
+	root, err := retainTestRoot(t.Context(), remote, session)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := file.WriteAt(t.Context(), 0, []byte("retained")); err != nil {
+	file, err := createTestFileAt(t.Context(), session, root, "held")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := root.Close(t.Context(), newTestFileAction(t, session)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt(t.Context(), storage.FileWriteRequest{Data: []byte("retained")}, newTestFileAction(t, session)); err != nil {
 		t.Fatal(err)
 	}
 	if err := v.volume.Remove(t.Context(), "held"); err != nil {
@@ -105,12 +112,12 @@ type delayedFileSessionStorage struct {
 	once    sync.Once
 }
 
-func (s *delayedFileSessionStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
-	session, err := s.Store.NewFileSession(ctx, options)
+func (s *delayedFileSessionStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
+	session, status, err := s.Store.NewFileSession(ctx, options)
 	if err != nil {
-		return nil, err
+		return nil, storage.FileSessionStatus{}, err
 	}
-	return &delayedFileSession{FileSession: session, storage: s}, nil
+	return &delayedFileSession{FileSession: session, storage: s}, status, nil
 }
 
 type delayedFileSession struct {
@@ -118,10 +125,10 @@ type delayedFileSession struct {
 	storage *delayedFileSessionStorage
 }
 
-func (s *delayedFileSession) Close(ctx context.Context) error {
+func (s *delayedFileSession) Close(ctx context.Context, action storage.FileActionID) (storage.FileActionReceipt, error) {
 	s.storage.once.Do(func() { close(s.storage.entered) })
 	<-s.storage.release
-	return s.FileSession.Close(ctx)
+	return s.FileSession.Close(ctx, action)
 }
 
 func TestRegistryTimeoutRetainsNativeOwnershipUntilCleanupIsKnown(t *testing.T) {
@@ -154,7 +161,7 @@ func TestRegistryTimeoutRetainsNativeOwnershipUntilCleanupIsKnown(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := remote.NewFileSession(t.Context(), storage.DefaultFileSessionOptions()); err != nil {
+	if _, _, err := remote.NewFileSession(t.Context(), storage.DefaultFileSessionOptions()); err != nil {
 		t.Fatal(err)
 	}
 	httpServer.Close()

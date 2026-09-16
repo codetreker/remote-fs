@@ -39,6 +39,10 @@ func CheckStartup(s Startup) error {
 }
 
 func ReconcileStartup(ctx context.Context, tx *sql.Tx, startup Startup) error {
+	return ReconcileStartupVersion(ctx, tx, startup, 6)
+}
+
+func ReconcileStartupVersion(ctx context.Context, tx *sql.Tx, startup Startup, version int) error {
 	accepted := startup.Accepted
 	if accepted.DatabaseID == "" {
 		return nil
@@ -48,7 +52,7 @@ func ReconcileStartup(ctx context.Context, tx *sql.Tx, startup Startup) error {
 			"accepted generation %d is newer than checkpointed generation %d, but the startup WAL is not present with frames: %w",
 			accepted.Generation, startup.CheckpointedGeneration, syscall.EIO)
 	}
-	visible, err := Validate(ctx, tx)
+	visible, err := ValidateVersion(ctx, tx, version)
 	if err != nil {
 		return err
 	}

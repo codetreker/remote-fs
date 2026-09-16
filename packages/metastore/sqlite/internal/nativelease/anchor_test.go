@@ -49,10 +49,14 @@ func mustLeaseAnchor(t *testing.T, config Config) *Anchor {
 }
 
 func anchorEvidence(a *Anchor) Evidence {
-	return Evidence{
+	evidence := Evidence{
 		DatabaseID: strings.Repeat("a", 32), StateID: a.StateID(),
 		Generation: 0, MaxLease: 10 * time.Second,
 	}
+	if a.Domain() == DomainFile {
+		evidence.MaxLease, evidence.Quiescent = 0, true
+	}
+	return evidence
 }
 
 func TestLeaseAnchorInitializeAdvanceAndReopen(t *testing.T) {
@@ -95,6 +99,344 @@ func TestLeaseAnchorInitializeAdvanceAndReopen(t *testing.T) {
 	}
 	if reopened.RecoveryStart() != config.RecoveryStart {
 		t.Fatal("reopen used an old ownership time")
+	}
+}
+
+func TestStrongWitnessBytesExcludeFileQuiescence(t *testing.T) {
+	config := leaseAnchorFixture(t)
+	a := mustLeaseAnchor(t, config)
+	evidence := anchorEvidence(a)
+	if err := a.Advance(evidence); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := encodeLeaseRecord("witness", struct {
+		DatabaseID string
+		StateID    string
+		Generation int64
+		MaxLease   time.Duration
+	}{evidence.DatabaseID, evidence.StateID, evidence.Generation, evidence.MaxLease})
+	if err != nil {
+		t.Fatal(err)
+	}
+	witness := filepath.Join(config.Directory, config.Name+".witness")
+	actual, err := os.ReadFile(witness)
+	if err != nil || !bytes.Equal(actual, expected) {
+		t.Fatalf("strong witness encoding changed: %v", err)
+	}
+	evidence.Generation++
+	evidence.Quiescent = true
+	if err := a.Advance(evidence); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("strong domain accepted file quiescence: %v", err)
+	}
+	actual, err = os.ReadFile(witness)
+	if err != nil || !bytes.Equal(actual, expected) {
+		t.Fatalf("rejected file quiescence changed strong witness: %v", err)
+	}
+}
+
+func TestFileWitnessQuiescenceUsesMonotonicGenerations(t *testing.T) {
+	config := leaseAnchorFixture(t)
+	config.Domain = DomainFile
+	a := mustLeaseAnchor(t, config)
+	evidence := anchorEvidence(a)
+	if err := a.Advance(evidence); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Complete(); err != nil {
+		t.Fatal(err)
+	}
+	evidence.Generation++
+	evidence.MaxLease, evidence.Quiescent = 10*time.Second, false
+	if err := a.Advance(evidence); err != nil {
+		t.Fatal(err)
+	}
+	evidence.Quiescent = true
+	if err := a.Advance(evidence); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("quiescence changed without a new generation: %v", err)
+	}
+	evidence.Generation++
+	if err := a.Advance(evidence); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Advance(evidence); err != nil {
+		t.Fatalf("identical quiescent witness did not reconcile: %v", err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	config.Initialize = false
+	a = mustLeaseAnchor(t, config)
+	actual, exists, err := a.Load()
+	if err != nil || !exists || actual != evidence {
+		t.Fatalf("reopen lost quiescence evidence: %+v,%v,%v", actual, exists, err)
+	}
+	active := evidence
+	active.Quiescent = false
+	if err := a.Advance(active); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("active witness reused quiescent generation: %v", err)
+	}
+	active.Generation++
+	if err := a.Advance(active); err != nil {
+		t.Fatal(err)
+	}
+	raised := active
+	raised.Generation++
+	raised.MaxLease++
+	raised.Quiescent = true
+	if err := a.Advance(raised); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("quiescence raised lease high-water: %v", err)
+	}
+	decreased := active
+	decreased.Generation++
+	decreased.MaxLease--
+	decreased.Quiescent = true
+	if err := a.Advance(decreased); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("quiescence lowered lease high-water: %v", err)
+	}
+	actual, exists, err = a.Load()
+	if err != nil || !exists || actual != active {
+		t.Fatalf("failed transition changed active witness: %+v,%v,%v", actual, exists, err)
+	}
+}
+
+func TestFileWitnessRequiresQuiescentInitializationAndActiveLease(t *testing.T) {
+	config := leaseAnchorFixture(t)
+	config.Domain = DomainFile
+	a := mustLeaseAnchor(t, config)
+	initial := anchorEvidence(a)
+	for _, next := range []Evidence{
+		{DatabaseID: initial.DatabaseID, StateID: initial.StateID},
+		{DatabaseID: initial.DatabaseID, StateID: initial.StateID, MaxLease: time.Second, Quiescent: true},
+		{DatabaseID: initial.DatabaseID, StateID: initial.StateID, Generation: 1, MaxLease: time.Second},
+	} {
+		if err := a.Advance(next); !errors.Is(err, syscall.EIO) {
+			t.Fatalf("noninitial first publication=%+v,%v", next, err)
+		}
+		if _, exists, err := a.Load(); err != nil || exists {
+			t.Fatalf("rejected initialization published evidence: %v,%v", exists, err)
+		}
+	}
+	if err := a.Advance(initial); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(config.Directory, config.Name+".witness")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := initial
+	active.Generation++
+	active.Quiescent = false
+	if err := a.Advance(active); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("active zero-duration witness accepted: %v", err)
+	}
+	quiescent := initial
+	quiescent.Generation++
+	quiescent.MaxLease = time.Second
+	if err := a.Advance(quiescent); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("quiescence increased duration: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("rejected activity transitions changed witness bytes: %v", err)
+	}
+}
+
+func TestLeaseAnchorsKeepStrongAndFileEvidenceIndependent(t *testing.T) {
+	strongConfig := leaseAnchorFixture(t)
+	strong := mustLeaseAnchor(t, strongConfig)
+	strongEvidence := anchorEvidence(strong)
+	if err := strong.Advance(strongEvidence); err != nil {
+		t.Fatal(err)
+	}
+	if err := strong.Complete(); err != nil {
+		t.Fatal(err)
+	}
+	strongBinding, _, err := strong.readBinding()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileConfig := strongConfig
+	fileConfig.Domain, fileConfig.Name, fileConfig.Identity = DomainFile, ".file-leases", "file/volume/objects"
+	file := mustLeaseAnchor(t, fileConfig)
+	if strong.Domain() != DomainStrong || file.Domain() != DomainFile || strong.StateID() == file.StateID() {
+		t.Fatal("lease domains shared anchor identity")
+	}
+	fileEvidence := anchorEvidence(file)
+	if err := file.Advance(fileEvidence); err != nil {
+		t.Fatal(err)
+	}
+	fileEvidence.Generation++
+	fileEvidence.MaxLease, fileEvidence.Quiescent = 2*time.Minute, false
+	if err := file.Advance(fileEvidence); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Complete(); err != nil {
+		t.Fatal(err)
+	}
+	actual, exists, err := strong.Load()
+	if err != nil || !exists || actual != strongEvidence {
+		t.Fatalf("file publication changed strong evidence: %+v,%v,%v", actual, exists, err)
+	}
+	actualBinding, _, err := strong.readBinding()
+	if err != nil || !bytes.Equal(actualBinding, strongBinding) {
+		t.Fatalf("file initialization changed strong native binding: %v", err)
+	}
+	if err := strong.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fileEvidence.Generation++
+	if err := file.Advance(fileEvidence); err != nil {
+		t.Fatalf("closing strong anchor disabled file anchor: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	strongConfig.Initialize, fileConfig.Initialize = false, false
+	for _, test := range []struct {
+		config Config
+		want   Evidence
+	}{{strongConfig, strongEvidence}, {fileConfig, fileEvidence}} {
+		a := mustLeaseAnchor(t, test.config)
+		actual, exists, err := a.Load()
+		if err != nil || !exists || actual != test.want || a.Domain() != test.config.Domain {
+			t.Fatalf("domain %d reopened wrong evidence: %+v,%v,%v", test.config.Domain, actual, exists, err)
+		}
+	}
+}
+
+func TestFileLeaseAnchorRequiresItsOwnReadyEvidence(t *testing.T) {
+	for _, missing := range []string{"witness", "binding", "domain"} {
+		t.Run(missing, func(t *testing.T) {
+			config := leaseAnchorFixture(t)
+			strong := mustLeaseAnchor(t, config)
+			strongEvidence := anchorEvidence(strong)
+			if err := strong.Advance(strongEvidence); err != nil {
+				t.Fatal(err)
+			}
+			if err := strong.Complete(); err != nil {
+				t.Fatal(err)
+			}
+			config.Domain, config.Name, config.Identity = DomainFile, ".file-leases", "file/volume/objects"
+			file := mustLeaseAnchor(t, config)
+			if err := file.Advance(anchorEvidence(file)); err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Complete(); err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+			switch missing {
+			case "witness":
+				if err := os.Remove(filepath.Join(config.Directory, config.Name+".witness")); err != nil {
+					t.Fatal(err)
+				}
+			case "binding":
+				if err := unix.Fremovexattr(config.BindingFD, fileLeaseBindingAttribute); err != nil {
+					t.Fatal(err)
+				}
+			case "domain":
+				config.Domain = DomainStrong
+			}
+			for _, initialize := range []bool{false, true} {
+				config.Initialize = initialize
+				a, err := Open(config)
+				if a != nil {
+					_ = a.Close()
+				}
+				if !errors.Is(err, syscall.EIO) {
+					t.Fatalf("file %s, initialize=%v borrowed strong evidence: %v", missing, initialize, err)
+				}
+			}
+			actual, exists, err := strong.Load()
+			if err != nil || !exists || actual != strongEvidence {
+				t.Fatalf("file rejection damaged strong evidence: %+v,%v,%v", actual, exists, err)
+			}
+		})
+	}
+}
+
+func TestLeaseAnchorRejectsUnknownDomainBeforeMutation(t *testing.T) {
+	config := leaseAnchorFixture(t)
+	config.Domain = 2
+	if a, err := Open(config); !errors.Is(err, syscall.EINVAL) {
+		if a != nil {
+			_ = a.Close()
+		}
+		t.Fatalf("unknown domain accepted: %v", err)
+	}
+	entries, err := os.ReadDir(config.Directory)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("unknown domain changed state directory: %v,%v", entries, err)
+	}
+	for _, attribute := range []string{leaseBindingAttribute, fileLeaseBindingAttribute} {
+		if _, err := unix.Fgetxattr(config.BindingFD, attribute, nil); !errors.Is(err, syscall.ENODATA) {
+			t.Fatalf("unknown domain changed binding %s: %v", attribute, err)
+		}
+	}
+}
+
+func TestLeaseAnchorRejectsCrossDomainPendingRecordAliases(t *testing.T) {
+	for _, domain := range []Domain{DomainStrong, DomainFile} {
+		for _, bindingPresent := range []bool{false, true} {
+			t.Run(fmt.Sprintf("domain-%d/binding-%t", domain, bindingPresent), func(t *testing.T) {
+				config := leaseAnchorFixture(t)
+				config.Domain = domain
+				original := mustLeaseAnchor(t, config)
+				id := original.StateID()
+				binding, _, err := original.readBinding()
+				if err != nil {
+					t.Fatal(err)
+				}
+				attribute := original.attribute
+				if err := original.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if !bindingPresent {
+					if err := unix.Fremovexattr(config.BindingFD, attribute); err != nil {
+						t.Fatal(err)
+					}
+				}
+				intentPath := filepath.Join(config.Directory, config.Name+".intent")
+				intent, err := os.ReadFile(intentPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				foreign := config
+				foreign.Domain = Domain(1 - domain)
+				a, err := Open(foreign)
+				if a != nil {
+					_ = a.Close()
+				}
+				if !errors.Is(err, syscall.EIO) {
+					t.Fatalf("other domain accepted pending record: %v", err)
+				}
+				actual, err := os.ReadFile(intentPath)
+				if err != nil || !bytes.Equal(actual, intent) {
+					t.Fatalf("rejection changed original intent: %v", err)
+				}
+				if _, err := os.Stat(filepath.Join(config.Directory, config.Name+".witness")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("rejection manufactured witness: %v", err)
+				}
+				for _, name := range []string{leaseBindingAttribute, fileLeaseBindingAttribute} {
+					data := make([]byte, leaseAnchorMaxBytes)
+					n, err := unix.Fgetxattr(config.BindingFD, name, data)
+					if name == attribute && bindingPresent {
+						if err != nil || !bytes.Equal(data[:n], binding) {
+							t.Fatalf("rejection changed original binding: %v", err)
+						}
+					} else if !errors.Is(err, syscall.ENODATA) {
+						t.Fatalf("rejection manufactured binding %s: %v", name, err)
+					}
+				}
+				resumed := mustLeaseAnchor(t, config)
+				if resumed.StateID() != id || !resumed.Initializing() {
+					t.Fatal("same-domain pending resume changed identity")
+				}
+			})
+		}
 	}
 }
 

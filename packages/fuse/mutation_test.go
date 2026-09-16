@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"strings"
 	"syscall"
 	"testing"
@@ -60,12 +59,12 @@ func (s *mutationStorage) Stat(ctx context.Context, path string) (storage.Attr, 
 	return attr, s.finish("stat", err)
 }
 
-func (s *mutationStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
-	session, err := s.FileStorage.NewFileSession(ctx, options)
+func (s *mutationStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
+	session, status, err := s.FileStorage.NewFileSession(ctx, options)
 	if err != nil {
-		return nil, err
+		return nil, status, err
 	}
-	return &mutationSession{FileSession: session, owner: s}, nil
+	return &mutationSession{FileSession: session, owner: s}, status, nil
 }
 
 type mutationSession struct {
@@ -73,41 +72,53 @@ type mutationSession struct {
 	owner *mutationStorage
 }
 
-func (s *mutationSession) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, error) {
-	if err := s.owner.enter(ctx, "open"); err != nil {
-		return nil, err
-	}
-	file, err := s.FileSession.OpenFile(ctx, path, options)
-	if err := s.owner.finish("open", err); err != nil {
-		return nil, err
-	}
-	return &mutationFile{File: file, owner: s.owner}, nil
+func mutationFailure(action storage.FileActionID, err error) (storage.FileActionReceipt, error) {
+	return storage.FileActionReceipt{Action: action, State: storage.FileActionNotApplied, Errno: errnoOf(err)}, err
 }
-
-func (s *mutationSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
+func (s *mutationSession) Retain(ctx context.Context, r storage.RetainRequest, a storage.FileActionID) (storage.FileActionReceipt, error) {
 	if err := s.owner.enter(ctx, "open-node"); err != nil {
-		return nil, err
+		return mutationFailure(a, err)
 	}
-	file, err := s.FileSession.OpenNode(ctx, id, options)
-	if err := s.owner.finish("open-node", err); err != nil {
+	result, err := s.FileSession.Retain(ctx, r, a)
+	return result, s.owner.finish("open-node", err)
+}
+func (s *mutationSession) RetainAt(ctx context.Context, r storage.RetainAtRequest, a storage.FileActionID) (storage.FileActionReceipt, error) {
+	if err := s.owner.enter(ctx, "open"); err != nil {
+		return mutationFailure(a, err)
+	}
+	result, err := s.FileSession.RetainAt(ctx, r, a)
+	return result, s.owner.finish("open", err)
+}
+func (s *mutationSession) CreateAndRetainAt(ctx context.Context, r storage.CreateAndRetainRequest, a storage.FileActionID) (storage.FileActionReceipt, error) {
+	op := "open"
+	if r.Initial.Kind == storage.NodeDirectory {
+		op = "mkdir"
+	}
+	if err := s.owner.enter(ctx, op); err != nil {
+		return mutationFailure(a, err)
+	}
+	result, err := s.FileSession.CreateAndRetainAt(ctx, r, a)
+	return result, s.owner.finish(op, err)
+}
+func (s *mutationSession) Reference(ctx context.Context, id storage.FileReferenceID) (storage.File, error) {
+	file, err := s.FileSession.Reference(ctx, id)
+	if err != nil {
 		return nil, err
 	}
 	return &mutationFile{File: file, owner: s.owner}, nil
 }
-
-func (s *mutationSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
+func (s *mutationSession) StatNode(ctx context.Context, id uint64, options storage.ObservationOptions) (storage.FileObservation, error) {
 	if err := s.owner.enter(ctx, "stat"); err != nil {
-		return storage.Attr{}, err
+		return storage.FileObservation{}, err
 	}
-	attr, err := s.FileSession.StatNode(ctx, id)
+	attr, err := s.FileSession.StatNode(ctx, id, options)
 	return attr, s.owner.finish("stat", err)
 }
-
-func (s *mutationSession) SetNodeAttr(ctx context.Context, id uint64, change storage.AttrChange) (storage.Attr, error) {
+func (s *mutationSession) SetNodeAttr(ctx context.Context, id uint64, c storage.AttrChange, a storage.FileActionID) (storage.FileActionReceipt, error) {
 	if err := s.owner.enter(ctx, "setattr"); err != nil {
-		return storage.Attr{}, err
+		return mutationFailure(a, err)
 	}
-	attr, err := s.FileSession.SetNodeAttr(ctx, id, change)
+	attr, err := s.FileSession.SetNodeAttr(ctx, id, c, a)
 	return attr, s.owner.finish("setattr", err)
 }
 
@@ -116,43 +127,40 @@ type mutationFile struct {
 	owner *mutationStorage
 }
 
-func (f *mutationFile) Stat(ctx context.Context) (storage.Attr, error) {
+func (f *mutationFile) Stat(ctx context.Context, options storage.ObservationOptions) (storage.FileObservation, error) {
 	if err := f.owner.enter(ctx, "stat"); err != nil {
-		return storage.Attr{}, err
+		return storage.FileObservation{}, err
 	}
-	attr, err := f.File.Stat(ctx)
+	attr, err := f.File.Stat(ctx, options)
 	return attr, f.owner.finish("stat", err)
 }
-
-func (f *mutationFile) Truncate(ctx context.Context, size int64) (storage.Attr, error) {
+func (f *mutationFile) Truncate(ctx context.Context, r storage.FileTruncateRequest, a storage.FileActionID) (storage.FileActionReceipt, error) {
 	if err := f.owner.enter(ctx, "truncate"); err != nil {
-		return storage.Attr{}, err
+		return mutationFailure(a, err)
 	}
-	attr, err := f.File.Truncate(ctx, size)
+	attr, err := f.File.Truncate(ctx, r, a)
 	return attr, f.owner.finish("truncate", err)
 }
-
-func (f *mutationFile) WriteAt(ctx context.Context, offset int64, data []byte) (storage.Attr, error) {
+func (f *mutationFile) WriteAt(ctx context.Context, r storage.FileWriteRequest, a storage.FileActionID) (storage.FileActionReceipt, error) {
 	if err := f.owner.enter(ctx, "write"); err != nil {
-		return storage.Attr{}, err
+		return mutationFailure(a, err)
 	}
-	attr, err := f.File.WriteAt(ctx, offset, data)
+	attr, err := f.File.WriteAt(ctx, r, a)
 	return attr, f.owner.finish("write", err)
 }
-
-func (f *mutationFile) SetAttr(ctx context.Context, change storage.AttrChange) (storage.Attr, error) {
+func (f *mutationFile) SetAttr(ctx context.Context, c storage.AttrChange, a storage.FileActionID) (storage.FileActionReceipt, error) {
 	if err := f.owner.enter(ctx, "setattr"); err != nil {
-		return storage.Attr{}, err
+		return mutationFailure(a, err)
 	}
-	attr, err := f.File.SetAttr(ctx, change)
+	attr, err := f.File.SetAttr(ctx, c, a)
 	return attr, f.owner.finish("setattr", err)
 }
-
-func (f *mutationFile) Close(ctx context.Context) error {
+func (f *mutationFile) Close(ctx context.Context, a storage.FileActionID) (storage.FileActionReceipt, error) {
 	if err := f.owner.enter(ctx, "close"); err != nil {
-		return err
+		return mutationFailure(a, err)
 	}
-	return f.owner.finish("close", f.File.Close(ctx))
+	result, err := f.File.Close(ctx, a)
+	return result, f.owner.finish("close", err)
 }
 
 func mutationTree(t *testing.T) (*node, *node, *mutationStorage) {
@@ -161,19 +169,33 @@ func mutationTree(t *testing.T) (*node, *node, *mutationStorage) {
 	if err := local.Write(t.Context(), "f", []byte("contents")); err != nil {
 		t.Fatal(err)
 	}
-	mode := fs.FileMode(0600)
-	if err := local.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}); err != nil {
+	observed, err := local.Stat(t.Context(), "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := initialMetadata(0600)
+	if err := local.SetAttr(t.Context(), "f", storage.AttrChange{ExpectedRevision: observed.MetadataRevision, Metadata: &metadata}); err != nil {
 		t.Fatal(err)
 	}
 	downstream := &mutationStorage{FileStorage: local}
-	session, err := downstream.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	session, _, err := downstream.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := session.Close(ctx); err != nil {
+		status, err := session.Status(ctx)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		action, err := storage.NewFileActionID(status.ActionEpoch)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := session.Close(ctx, action); err != nil {
 			t.Errorf("close mutation session: %v", err)
 		}
 	})
@@ -183,6 +205,11 @@ func mutationTree(t *testing.T) (*node, *node, *mutationStorage) {
 	}
 	v := activeTestVolume(downstream, 1024)
 	v.files = session
+	status, err := session.Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.status = status
 	root := &node{volume: v, id: rootIdentity(attr.ID)}
 	fsbridge.NewNodeFS(root, &fsbridge.Options{})
 	child, errno := root.Lookup(t.Context(), "f", &gofuse.EntryOut{})
@@ -197,7 +224,7 @@ func mutationTree(t *testing.T) (*node, *node, *mutationStorage) {
 
 func mutationHandle(t *testing.T, n *node) *handle {
 	t.Helper()
-	file, err := n.volume.files.OpenNode(t.Context(), n.id.node, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
+	file, _, err := n.volume.retainNode(t.Context(), n.id.node, storage.AccessClaim{Uses: storage.ReadContent | storage.WriteContent})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,10 +237,10 @@ func TestCreationCancellationAccountsForCompletedStages(t *testing.T) {
 		directory, changed bool
 	}{
 		{"atomic file open", "open", false, false},
-		{"opened file attributes", "stat", false, true},
+		{"parent attributes", "stat", false, false},
 		{"directory creation", "mkdir", true, false},
-		{"directory mode", "setattr", true, true},
-		{"directory attributes", "stat", true, true},
+		{"file parent cleanup", "close", false, true},
+		{"directory cleanup", "close", true, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root, _, downstream := mutationTree(t)
@@ -240,8 +267,8 @@ func TestCreationCancellationAccountsForCompletedStages(t *testing.T) {
 			if test.changed && err != nil || !test.changed && !errors.Is(err, syscall.ENOENT) {
 				t.Fatalf("volume after interrupted creation: %v", err)
 			}
-			if test.changed && !test.directory && attr.Mode.Perm() != 0600 {
-				t.Fatalf("atomic create left mode %v instead of requested 0600", attr.Mode)
+			if test.changed && !test.directory && testMode(t, attr).Perm() != 0600 {
+				t.Fatalf("atomic create left mode %v instead of requested 0600", testMode(t, attr))
 			}
 		})
 	}
@@ -305,8 +332,14 @@ func TestSetattrReplyUsesConfirmedAttributes(t *testing.T) {
 			if withHandle {
 				file = mutationHandle(t, n)
 			}
+			confirmed := false
+			downstream.after = func(op string) {
+				if op == "setattr" {
+					confirmed = true
+				}
+			}
 			downstream.before = func(_ context.Context, op string) error {
-				if op == "stat" {
+				if confirmed && op == "stat" {
 					t.Error("confirmed attribute mutation made an additional read")
 					return context.Canceled
 				}
@@ -417,14 +450,14 @@ func TestMutationClassificationPreservesIndependentFailures(t *testing.T) {
 	}
 }
 
-func TestMutationSuccessIgnoresLateCancellation(t *testing.T) {
+func TestConfirmedMutationsClassifyLateCancellation(t *testing.T) {
 	for _, operation := range []string{"create", "mkdir", "setattr"} {
 		t.Run(operation, func(t *testing.T) {
 			root, n, downstream := mutationTree(t)
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			downstream.after = func(op string) {
-				if operation == "setattr" && op == "setattr" || operation != "setattr" && op == "stat" {
+				if operation == "setattr" && op == "setattr" || operation == "create" && op == "open" || operation == "mkdir" && op == "mkdir" {
 					cancel()
 				}
 			}
@@ -439,8 +472,17 @@ func TestMutationSuccessIgnoresLateCancellation(t *testing.T) {
 					Valid: gofuse.FATTR_MODE, Mode: 0600,
 				}}, &gofuse.AttrOut{})
 			}
-			if errno != 0 || ctx.Err() != context.Canceled {
-				t.Fatalf("completed %s returned %v, context %v", operation, errno, ctx.Err())
+			want := syscall.Errno(0)
+			if operation != "setattr" {
+				want = syscall.EIO
+			}
+			if errno != want || ctx.Err() != context.Canceled {
+				t.Fatalf("completed %s returned %v, want %v, context %v", operation, errno, want, ctx.Err())
+			}
+			if operation != "setattr" {
+				if _, err := downstream.FileStorage.Stat(t.Context(), "new"); err != nil {
+					t.Fatalf("confirmed creation missing: %v", err)
+				}
 			}
 		})
 	}

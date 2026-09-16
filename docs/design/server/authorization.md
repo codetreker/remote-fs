@@ -1,10 +1,10 @@
 # 业务方提供的操作授权
 
-本文描述当前 HTTP handler 的 volume 操作授权，对应 R-INT-7、R-INT-2、R-INT-3、R-SEC-4 至 R-SEC-6。跨角色约定见[顶层设计](../architecture.md)，取舍见[授权决定](../../../.agents/notes/implemented/feature/2026-09-10-host-provided-authorization.md)。下文 WindowsOpen 与 windows.* 是现有公共词汇；[平台客户端隔离提案](../../../.agents/notes/proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)将其改为通用意图，完整平台策略留在客户端。宿主业务授权与跨入口检查的保证不随之放宽。
+本文描述 HTTP handler 的通用 volume 操作授权，对应 R-INT-7、R-INT-2、R-INT-3、R-SEC-4 至 R-SEC-6。跨角色约定见[顶层设计](../architecture.md)，授权取舍见[授权决定](../../../.agents/notes/implemented/feature/2026-09-10-host-provided-authorization.md)，平台解释边界见[平台客户端隔离决定](../../../.agents/notes/implemented/architecture/2026-09-16-isolate-platform-filesystem-clients.md)。
 
 ## 一、组件与配置
 
-[`packages/authz`](../../../packages/authz/authz.go) 定义 `Authorizer`、`AuthorizerFunc`、`AccessRequest` 和 `ErrDenied`，并复用 [`storage.Operation`](../../../packages/storage/operations.go) 与 [`storage.OpenAccess`](../../../packages/storage/files.go) 表达操作和打开意图。它依赖基础 storage 类型，不依赖具体存储或 HTTP。HTTP handler 从严格解码的动作构造 AccessRequest；嵌入业务负责认证、身份 context、当前策略与审计。
+[`packages/authz`](../../../packages/authz/authz.go) 定义 Authorizer、AuthorizerFunc、AccessRequest 和 ErrDenied，复用 storage.Operation、FileEffects 与 AccessClaim。HTTP 从已验证的固定操作构造通用意图与目标身份；业务方管理认证、身份 context、当前策略和审计。Windows DesiredAccess／ShareAccess 及 POSIX mode／PID 的解释不进入该接口。
 
 ```go
 type Authorizer interface {
@@ -14,8 +14,12 @@ type Authorizer interface {
 type AccessRequest struct {
     Volume      string
     Operation   storage.Operation
-    Open        storage.OpenAccess
-    WindowsOpen storage.WindowsOpenIntent
+    Effects     storage.FileEffects
+    Claim       storage.AccessClaim
+    Reference   storage.FileReferenceID
+    Node        uint64
+    Parent      storage.FileReferenceID
+    Destination storage.FileReferenceID
 }
 ```
 
@@ -46,28 +50,13 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `replication.resubscribe` | `/v3/resubscribe` | 按游标续订及其后续输出 |
 | `replication.snapshot` | `/v3/snapshot` | 捕获快照及发送整份快照 |
 | `replication.checkpoint` | `/v3/checkpoint` | 读取日志化身与已提交位置 |
-| `file.session-open` | `/v3/file`，`file.session-open` | 建立 FileSession |
-| `file.status` | `/v3/file-control`，`file.status` | 查询 FileSession 状态与历史边界 |
-| `file.renew` | `/v3/file-control`，`file.renew` | 续期 FileSession |
-| `file.session-close` | `/v3/file-control`，`file.session-close` | 关闭 FileSession |
-| `file.stat-node` | `/v3/file`，`file.stat-node` | 按节点身份读取属性 |
-| `file.set-node-attr` | `/v3/file`，`file.set-node-attr` | 按节点身份修改属性 |
-| `file.open` | `/v3/file`，`file.open` | 按路径打开，携带 OpenAccess |
-| `file.open-node` | `/v3/file`，`file.open-node` | 按节点身份打开，携带 OpenAccess |
-| `file.ack` | `/v3/file-control`，`file.ack` | 确认已交付的打开引用 |
-| `file.stat` | `/v3/file`，`file.stat` | 查询保留引用的属性 |
-| `file.read` | `/v3/file`，`file.read` | 按保留引用读取范围 |
-| `file.write` | `/v3/file`，`file.write` | 按保留引用修改范围 |
-| `file.truncate` | `/v3/file`，`file.truncate` | 改变保留文件长度 |
-| `file.set-attr` | `/v3/file`，`file.set-attr` | 修改保留文件属性 |
-| `file.sync` | `/v3/file`，`file.sync` | 同步检查已发布文件状态 |
-| `file.get-lock` | `/v3/file-control`，`file.get-lock` | 查询 advisory 冲突 |
-| `file.set-lock` | `/v3/file-control`，`file.set-lock` | 申请或转换共享／排他 advisory 锁 |
-| `file.unlock` | `/v3/file-control`，`file.unlock` | 显式解除 advisory 锁或范围 |
-| `file.query-lock` | `/v3/file-control`，`file.query-lock` | 核对 advisory 请求结果 |
-| `file.cancel-lock` | `/v3/file-control`，`file.cancel-lock` | 取消／核对原 advisory 请求 |
-| `file.drop-locks` | `/v3/file-control`，`file.drop-locks` | 清理指定 owner／family 的锁 |
-| `file.close` | `/v3/file-control`，`file.close` | 关闭一个保留文件引用 |
+| `file.state`、`file.session-open`、`file.status`、`file.renew`、`file.session-close` | file 协议 | 能力状态、有限会话建立、观察、续期和关闭 |
+| `file.retain`、`file.retain-at`、`file.create-and-retain-at`、`file.reset-and-retain-at`、`file.replace-and-retain-at` | file 协议 | 验证全部可能效果及 claim 后原子保留／创建／重置／替换 |
+| `file.reference`、`file.stat-node`、`file.stat`、`file.check-observation`、`file.lookup-at`、`file.list-at` | file 协议 | 解析已有引用或读取身份、属性、位置与目录 |
+| `file.read`、`file.write`、`file.truncate`、`file.set-attr`、`file.set-node-attr`、`file.set-kind`、`file.rename`、`file.sync` | file 协议 | 内容、通用属性、种类、名字与持久状态 |
+| `file.replace-claim`、`file.range-snapshot`、`file.replace-ranges`、`file.wait-ranges`、`file.retire-ranges`、`file.retire-range-owner` | file 协议 | 访问声明、自有范围、等待及 owner 清理 |
+| `file.prepare-removal`、`file.cancel-prepared`、`file.drain-entry`、`file.cancel-drain` | file 协议 | 固定延迟删除与 entry 生命周期 |
+| `file.query-action`、`file.cancel-action`、`file.close` | file 协议 | 原动作核对、取消与引用关闭 |
 | `lock.session-enrollment` | `/v3/session-enrollment` | 申请强占有会话 enrollment ticket |
 | `lock.session-open` | `/v3/session-open` | 使用 ticket 建立强占有会话 |
 | `lock.session-close` | `/v3/session-close` | 关闭强占有会话 |
@@ -81,25 +70,14 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `lock.query-action` | `/v3/lock-query-action` | 查询动作历史 |
 | `lock.query-grant` | `/v3/lock-query-grant` | 查询 grant 当前状态 |
 | `lock.status` | `/v3/lock-status` | 查询授权方状态 |
-| `windows.state`、`windows.enable`、`windows.query-activation` | `/v3/windows-control` | 查询、显式启用或核对 volume 的 Windows 命名能力 |
-| `windows.session-open`、`windows.session-close` | `/v3/windows-control` | 建立或关闭 Windows 会话 |
-| `windows.renew`、`windows.status` | `/v3/windows-control` | 续期或观察 Windows 会话 |
-| `windows.query-action`、`windows.cancel-action` | `/v3/windows-control` | 核对或取消原 Windows 动作，不制造新结果 |
-| `windows.close` | `/v3/windows-control` | 关闭保留 Windows 引用 |
-| `windows.open` | `/v3/windows` | 按父身份和 leaf 打开，携带完整 WindowsOpenIntent |
-| `windows.stat`、`windows.read`、`windows.list` | `/v3/windows` | 读取保留对象属性、范围字节或有界目录 |
-| `windows.write`、`windows.truncate`、`windows.set-attr` | `/v3/windows` | 修改范围、长度或 Windows 属性 |
-| `windows.read-link`、`windows.set-link` | `/v3/windows` | 读取链接或转换受控对象为符号链接 |
-| `windows.rename`、`windows.set-delete-pending` | `/v3/windows` | 按身份改名或设置删除状态 |
-| `windows.lock-batch`、`windows.sync` | `/v3/windows` | Windows 范围批次或已发布状态检查 |
 
 副本构建还需要 replication.checkpoint 的明确许可；允许订阅或快照不隐含这项权限。Checkpoint 是一次普通读取，遵循入口授权、通用传输预算和安全错误规则，不建立持续输出。
 
-`FileOpenOptions` 嵌入共享的 `storage.OpenAccess`，其 Read、Write、Create、Truncate、Exclusive 与 AccessRequest.Open 是同一类型。Open 的合法性仍由 FileOpenOptions.Check／CheckNode 连同 mode、节点身份验证。AccessRequest.Open 仅在 file.open／file.open-node 携带这份已验证的值，其它操作为零值；open-node 不接受 Create／Exclusive。带 Create 的打开即使最终打开已有文件，也报告创建意图。一次入口 callback 同时决定全部打开意图，允许之后才创建、截断或分配文件引用。
+Effects 描述已验证的固定操作可能产生的全部效果，包括可选 Prepared；它不是请求者提供的回执。Claim 描述实际内容使用与排斥，Reference／Node／Parent／Destination 标识提供的目标，不替代原生归属及 revision 检查。一次授权允许后才进入操作或分配引用，不能把 metadata-only 压缩成读取内容，也不能把父目录子项创建解释为写父内容。
 
-`AccessRequest.WindowsOpen` 仅在 windows.open 携带经过验证的完整意图，包括 Access、Share、Disposition、Kind、DeleteOnClose 与 OpenReparsePoint。metadata-only 和 delete 意图不压缩成普通 OpenAccess；允许之后才触碰对应能力与原生状态。Windows activate、action replay 和 cleanup 也按自己的 Operation 授权，已经成功过的 receipt 不构成后续核对许可。
+已有 action ID 和 receipt 不构成后续查询、取消或关闭许可。NotAdmitted 只证明本次调用未进入动作 admission；授权拒绝不能证明同 ID 的旧动作从未发生。已经接纳的 Prepared 是固定动作的剩余效果，内部退役／expiry 清理继续由原拥有者执行，不借后台任务取得任意新删除权限。
 
-`volume.write` 可以创建缺失文件，单独拒绝 volume.create 不能禁止创建。file.set-lock 表达共享／排他申请与转换；file.unlock 是独立的 wire 操作与策略操作，必须携带 Unlock 类型；file.set-lock 不能携带 Unlock。EX flock 可用于只读 fd，锁模式不代替内容写权限；后续内容修改仍检查 file.write 等操作。
+volume.write 可以创建缺失文件，单独拒绝 volume.create 不能禁止创建。file.replace-ranges 表达自有范围集合替换，file.retire-ranges／file.retire-range-owner 分别清理范围作用域和 owner；每个固定操作按自身 Operation／Effects 授权。FUSE 在本地解释获取、转换与解锁，EX flock 可用于只读 fd，锁模式不代替内容写权限；后续内容修改仍检查 file.write 等操作。
 
 ## 三、请求、capability 与关闭
 
@@ -110,13 +88,13 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 3. handler 从已解码语义构造一个 AccessRequest，执行一次入口 Authorize。
 4. 允许后才读取或触碰 capability、分配引用或动作、重放回执、读取 Log、取得订阅／snapshot／page 资源或访问 backend。存储权限、配额、锁与原有取消分类继续生效。
 
-格式合法但不存在的 capability、无 Log（包括 publisher 为 nil）或错误续订游标，在拒绝时只返回授权错误；允许后才返回原有 ESTALE／ENOSYS 等结果。旧 RequestID、成功过的动作与已有 capability 均不能省略检查。ack、renew、status、history、cancel、unlock、release、retire 与 close 各自可被拒绝。
+格式合法但不存在的 capability、无 Log（包括 publisher 为 nil）或错误续订游标，在拒绝时只返回授权错误；允许后才返回原有 ESTALE／ENOSYS 等结果。旧 action ID、成功过的动作与已有 capability 均不能省略检查。续期、状态、动作核对／取消、范围替换／退役、引用关闭，以及显式强锁的 Release／Owner 退役分别接受对应的授权。
 
 拒绝只说明本次尝试未获准，不能证明此前超时的动作未执行。client 无法获准核对时保留原来的未知结果，不合成 Cancelled、Released、NotApplied 或已记录的 rejection。请求 cleanup 被拒绝仍报告拒绝；服务器自主 lease 到期、退休、shutdown 与资源回收由原拥有者执行，不重新请求该访问身份的权限。
 
 授权 context 派生自请求，保留业务值，并由 handler lifetime 取消。逐请求通过 `context.AfterFunc` 注册取消并在结束时解除注册；callback 前后检查原请求／handler 生命周期。普通 volume／file 请求在可证明尚未 dispatch 时接受调用方取消为 EINTR，deadline 和未知结果为 EIO。强锁 wire 协议没有 EINTR code，服务端原有生命周期或非 native 服务故障仍返回 native Unavailable／EIO、recorded=false 且无 action receipt；它与策略拒绝的普通 EACCES／EIO envelope 分开。这不改变 SDK 在本地发送前或只读阶段接受取消的 EINTR。handler 停止沿关闭路径；原请求仍有效时，策略自己的超时为授权 EIO。
 
-Stop 非阻塞地发出取消／停止通知。嵌入方使用 `Stop → HTTP Shutdown／ServeHTTP drain → Handler.Close → backend teardown` 顺序：drain 等待已通知取消的 callback、stream、producer、snapshot、admission 和 watcher 清理；Stop 返回不表示排空完成。handler 的 registry 清理和 backend 所有权仍遵守[文件会话生命周期](file-handles.md#五http复制与资源)。
+Stop 非阻塞地发出取消／停止通知。嵌入方使用 `Stop → HTTP Shutdown／ServeHTTP drain → Handler.Close → backend teardown` 顺序：drain 等待已通知取消的 callback、stream、producer、snapshot、admission 和 watcher 清理；Stop 返回不表示排空完成。handler 的 registry 清理和 backend 所有权仍遵守[文件会话生命周期](file-handles.md#http复制与预算)。
 
 ## 四、持续输出与撤权
 
@@ -182,11 +160,12 @@ func newAuthorizedHandler(
         access, err := lookup(ctx, identity, r.Volume)
         if err != nil { return err }
         if !access.Allowed[r.Operation] { return authz.ErrDenied }
-        if r.Operation == storage.OpFileOpen || r.Operation == storage.OpFileOpenNode {
-            if r.Open.Read && !access.CanRead { return authz.ErrDenied }
-            if (r.Open.Write || r.Open.Create || r.Open.Truncate) && !access.CanWrite {
-                return authz.ErrDenied
-            }
+        if r.Claim.Uses&storage.ReadContent != 0 && !access.CanRead {
+            return authz.ErrDenied
+        }
+        if (r.Claim.Uses&storage.WriteContent != 0 ||
+            r.Effects&(storage.EffectCreated|storage.EffectContentChanged) != 0) && !access.CanWrite {
+            return authz.ErrDenied
         }
         return nil
     })
@@ -210,7 +189,7 @@ func newAuthorizedHandler(
 }
 ```
 
-业务策略分别列出允许的语义操作，并对 Open 检查 CanRead／CanWrite；只读角色可以显式允许它需要的查询、订阅、只读打开、锁与清理。返回的 handler 由宿主按第三节关闭，mux 由宿主 HTTP server 使用。不同 volume 使用各自配好的 handler，这个示例不提供实例注册表。
+业务策略分别列出允许的语义操作，并按 Claim／Effects 检查内容读写和创建意图；只读角色可以显式允许它需要的查询、订阅、只读打开、锁与清理。返回的 handler 由宿主按第三节关闭，mux 由宿主 HTTP server 使用。不同 volume 使用各自配好的 handler，这个示例不提供实例注册表。
 
 host 包装 Authorizer 记录策略版本、耗时、允许／拒绝／故障，使用请求 context 中自己的 request／trace ID 关联 `component=authz`、`phase=authorize`、volume、operation 和 decision。同一长连接的重查保留同一关联值；可通过宿主现有查询 `request_id=X component=authz` 核对请求与输出结果。身份脱敏、凭据、策略错误审计和资源预算属于业务方；库不增加日志目的地、exporter、查询栈或脱离请求的审计任务。
 

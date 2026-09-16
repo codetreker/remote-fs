@@ -17,11 +17,14 @@ type volume struct {
 	storage        storage.Storage
 	files          storage.FileSession
 	owner          gofuse.Owner
+	permissions    PermissionDefaults
 	maxFileSize    int64
 	flushTimeout   time.Duration
 	sessionOptions storage.FileSessionOptions
 	logger         *log.Logger
 	raw            *rawMetadata
+	owners         *advisoryOwners
+	nextRange      uint64
 
 	mu           sync.Mutex
 	status       storage.FileSessionStatus
@@ -177,26 +180,28 @@ func newVolume(ctx context.Context, s storage.Storage, opts Options, logger *log
 	if err != nil {
 		return nil, err
 	}
+	permissions, err := opts.permissionDefaults()
+	if err != nil {
+		return nil, err
+	}
 	ask, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	files, err := capability.NewFileSession(ask, limits)
+	start := time.Now()
+	files, status, err := capability.NewFileSession(ask, limits)
 	if err != nil {
 		return nil, err
 	}
 	v := &volume{
 		storage: s, files: files, maxFileSize: maxFileSize,
-		flushTimeout: timeout, sessionOptions: limits, logger: logger,
+		flushTimeout: timeout, sessionOptions: limits, logger: logger, permissions: permissions,
 		stop: make(chan struct{}), done: make(chan struct{}),
+		status: storage.FileSessionStatus{ActionEpoch: status.ActionEpoch},
 	}
-	start := time.Now()
-	status, err := files.Status(ask)
-	if err == nil {
-		err = v.confirm(start, status)
-	}
+	err = v.confirm(start, status)
 	if err != nil {
 		cleanup, finish := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 		defer finish()
-		return nil, errors.Join(err, files.Close(cleanup))
+		return nil, errors.Join(err, v.closeSession(cleanup))
 	}
 	v.renewContext, v.cancelRenew = context.WithCancel(context.Background())
 	go v.maintain()
@@ -248,7 +253,7 @@ func (v *volume) maintain() {
 	}
 retire:
 	cleanup, cancel := context.WithTimeout(context.Background(), v.flushTimeout)
-	err := v.files.Close(cleanup)
+	err := v.closeSession(cleanup)
 	cancel()
 	v.mu.Lock()
 	v.closeErr = errors.Join(v.fault, err)

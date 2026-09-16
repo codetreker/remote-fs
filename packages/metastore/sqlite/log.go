@@ -3,8 +3,8 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
+	"math"
 	"syscall"
 	"time"
 
@@ -57,145 +57,98 @@ func (s *Store) recordCreated(ctx context.Context, tx *sql.Tx, at metastore.Loca
 	if err != nil {
 		return err
 	}
-	facts, err := s.locationFacts(ctx, tx, at)
+	after, err := s.captureEventImage(ctx, tx, node)
 	if err != nil {
 		return err
 	}
-	directory, err := s.notificationDirectory(ctx, tx, node)
-	if err != nil {
-		return err
-	}
-	return changes.Record(ctx, tx, s.volume, metastore.Change{
-		Notification: &metastore.Notification{SubjectID: node.ID, SubjectKind: node.Mode.Type(), Directory: directory, ChangeMask: metastore.ChangeName, After: facts},
-		Kind:         metastore.Created, Parent: at.Parent, Name: at.Name, Node: &node,
-	})
+	return changes.Record(ctx, tx, s.volume, metastore.Change{Kind: metastore.Created, Parent: at.Parent, Name: at.Name, Node: &node,
+		Notification: &metastore.Notification{SubjectID: node.ID, SubjectKind: node.Kind, ChangeMask: metastore.ChangeName, After: after}})
 }
 
-// recordChanged records that a node is no longer what it was, reading back what it now is.
 func (s *Store) recordChanged(ctx context.Context, tx *sql.Tx, before metastore.Node) error {
-	extra, err := s.updateChangeTime(ctx, tx, before.ID)
+	after, err := nodeByID(ctx, tx, before.ID)
 	if err != nil {
 		return err
 	}
-	return s.recordChangedMask(ctx, tx, before, extra)
+	if after.MetadataRevision == before.MetadataRevision {
+		if _, err := s.updateChangeTime(ctx, tx, before.ID); err != nil {
+			return err
+		}
+	}
+	return s.recordChangedMask(ctx, tx, before, 0)
 }
 
-// recordChangedMask includes authoritative changes stored outside the POSIX node.
 func (s *Store) recordChangedMask(ctx context.Context, tx *sql.Tx, before metastore.Node, extra metastore.ChangeMask) error {
-	id := before.ID
-	at, err := s.locate(ctx, tx, id)
+	node, err := nodeByID(ctx, tx, before.ID)
 	if err != nil {
 		return err
 	}
-	node, err := nodeByID(ctx, tx, id)
+	beforeImage, err := s.captureEventImage(ctx, tx, before)
 	if err != nil {
 		return err
 	}
-	facts, err := s.locationFacts(ctx, tx, at)
+	afterImage, err := s.captureEventImage(ctx, tx, node)
 	if err != nil {
 		return err
 	}
-	directory, err := s.notificationDirectory(ctx, tx, node)
-	if err != nil {
-		return err
-	}
-	return changes.Record(ctx, tx, s.volume, metastore.Change{
-		Notification: &metastore.Notification{SubjectID: node.ID, SubjectKind: node.Mode.Type(), Directory: directory, ChangeMask: metastore.NotificationMask(before, node) | extra, Before: facts, After: facts},
-		Kind:         metastore.Modified, Parent: at.Parent, Name: at.Name, Node: &node,
-	})
+	at := eventLocation(afterImage)
+	return changes.Record(ctx, tx, s.volume, metastore.Change{Kind: metastore.Modified, Parent: at.Parent, Name: at.Name, Node: &node,
+		Notification: &metastore.Notification{SubjectID: node.ID, SubjectKind: node.Kind, ChangeMask: metastore.NotificationMask(before, node) | extra, Before: beforeImage, After: afterImage}})
 }
 
-// recordRemoved records that a name that held a node now holds nothing. It carries no node,
-// because there is none to carry.
+// Removal records the old entry before unlink or retirement makes its ancestry
+// unavailable. Its replication Node stays nil; the image retains the old facts.
 func (s *Store) recordRemoved(ctx context.Context, tx *sql.Tx, at metastore.Location, before metastore.Node) error {
-	facts, err := s.locationFacts(ctx, tx, at)
+	image, err := s.captureEventImage(ctx, tx, before)
 	if err != nil {
 		return err
 	}
-	directory, err := s.notificationDirectory(ctx, tx, before)
-	if err != nil {
-		return err
-	}
-	return changes.Record(ctx, tx, s.volume, metastore.Change{Kind: metastore.Removed, Parent: at.Parent, Name: at.Name, Notification: &metastore.Notification{SubjectID: before.ID, SubjectKind: before.Mode.Type(), Directory: directory, ChangeMask: metastore.ChangeName, Before: facts}})
+	return changes.Record(ctx, tx, s.volume, metastore.Change{Kind: metastore.Removed, Parent: at.Parent, Name: at.Name,
+		Notification: &metastore.Notification{SubjectID: before.ID, SubjectKind: before.Kind, ChangeMask: metastore.ChangeName, Before: image}})
 }
 
-// recordRenamed records a node arriving at a name from another one.
-//
-// One row for a whole subtree: everything beneath a renamed directory keeps the parent it
-// always had, so nothing beneath it has changed and nothing beneath it gets an event. A
-// replica applies this by moving one entry, which is the property that made carrying the node
-// in the event worth its cost — an invalidation would force it to discard the subtree and walk
-// it again, and renaming directories is what build tools and version control do constantly.
-//
-// A rename that lands on an occupied name destroys what was there, and that destruction is
-// recorded as its own Removed rather than left for a replica to infer from this row. The
-// inference is available — whatever was at the name is gone by definition — but it would be
-// the one place where a node stops existing without the log saying so, and a replica that got
-// the rule wrong would keep the replaced node with nothing to correct it. Every node that
-// ceases to exist has exactly one Removed.
-func (s *Store) recordRenamed(ctx context.Context, tx *sql.Tx, at, from metastore.Location, node metastore.Node) error {
-	extra, err := s.updateChangeTime(ctx, tx, node.ID)
+// The source image is captured before the entry moves; the destination image
+// observes the updated parent revisions in the same transaction.
+func (s *Store) recordRenamed(ctx context.Context, tx *sql.Tx, before *metastore.EventImage, nodeID int64) error {
+	extra, err := s.updateChangeTime(ctx, tx, nodeID)
 	if err != nil {
 		return err
 	}
-	before, err := s.locationFacts(ctx, tx, from)
+	node, err := nodeByID(ctx, tx, nodeID)
 	if err != nil {
 		return err
 	}
-	after, err := s.locationFacts(ctx, tx, at)
+	after, err := s.captureEventImage(ctx, tx, node)
 	if err != nil {
 		return err
 	}
-	directory, err := s.notificationDirectory(ctx, tx, node)
-	if err != nil {
-		return err
-	}
-	return changes.Record(ctx, tx, s.volume, metastore.Change{
-		Notification: &metastore.Notification{SubjectID: node.ID, SubjectKind: node.Mode.Type(), Directory: directory, ChangeMask: metastore.ChangeName | extra, Before: before, After: after},
-		Kind:         metastore.Renamed, Parent: at.Parent, Name: at.Name, From: &from, Node: &node,
-	})
+	from, at := eventLocation(before), eventLocation(after)
+	return changes.Record(ctx, tx, s.volume, metastore.Change{Kind: metastore.Renamed, Parent: at.Parent, Name: at.Name, From: &from, Node: &node,
+		Notification: &metastore.Notification{SubjectID: node.ID, SubjectKind: node.Kind, ChangeMask: metastore.ChangeName | extra, Before: before, After: after}})
 }
 
-// updateChangeTime records the Windows metadata timestamp in the same transaction
-// as the ordinary mutation and its notification.
 func (s *Store) updateChangeTime(ctx context.Context, tx *sql.Tx, id int64) (metastore.ChangeMask, error) {
-	var oldSec, oldNsec int64
-	if err := tx.QueryRowContext(ctx, `SELECT windows_change_sec,windows_change_nsec FROM nodes WHERE volume=? AND id=?`, s.volume, id).Scan(&oldSec, &oldNsec); err != nil {
+	before, err := nodeByID(ctx, tx, id)
+	if err != nil {
 		return 0, err
 	}
-	sec, nsec := sqlvalue.StoredTime(time.Now())
-	if sec == oldSec && int64(nsec) == oldNsec {
+	instant := time.Now()
+	sec, nsec := sqlvalue.StoredTime(instant)
+	result, err := tx.ExecContext(ctx, `UPDATE nodes SET change_sec=?,change_nsec=?,metadata_revision=metadata_revision+1 WHERE volume=? AND id=? AND metadata_revision<?`, sec, nsec, s.volume, id, int64(math.MaxInt64))
+	if err != nil {
+		return 0, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if count != 1 {
+		return 0, fmt.Errorf("node metadata revision cannot advance: %w", syscall.EOVERFLOW)
+	}
+	if before.ChangeTime != nil && before.ChangeTime.Equal(instant) {
 		return 0, nil
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET windows_change_sec=?,windows_change_nsec=? WHERE volume=? AND id=?`, sec, nsec, s.volume, id); err != nil {
-		return 0, err
-	}
 	return metastore.ChangeTime, nil
-}
-
-// locate reports where a node sits: the directory holding it, and the name it has there.
-//
-// The root sits nowhere and comes back as the zero Location, which is how metastore.Row and
-// metastore.Change name it. Any other node without an entry is this package having lost the
-// tree rather than a location to report, so it is refused instead of being reported as the
-// root — a change recorded against the wrong parent is applied by a replica without complaint.
-func (s *Store) locate(ctx context.Context, tx *sql.Tx, id int64) (metastore.Location, error) {
-	var (
-		parent int64
-		name   []byte
-	)
-	switch err := tx.QueryRowContext(ctx,
-		`SELECT parent, name FROM entries WHERE node = ? AND volume = ?`,
-		id, s.volume).Scan(&parent, &name); {
-	case errors.Is(err, sql.ErrNoRows):
-		if id != s.root {
-			return metastore.Location{}, fmt.Errorf("%w: node %d holds no name in this volume", syscall.EIO, id)
-		}
-		return metastore.Location{}, nil
-	case err != nil:
-		return metastore.Location{}, err
-	}
-	return metastore.Location{Parent: parent, Name: name}, nil
 }
 
 // nodeByID reads one node by its id, which is how a change reports what a name holds after

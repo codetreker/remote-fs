@@ -36,27 +36,9 @@ func (r Request) Lock() (LockRequest, error) {
 	out.Sequence = le.Uint32(r.Body[4:8])
 	copy(out.FileID[:], r.Body[8:24])
 	out.Elements = make([]LockElement, n)
-	unlock := le.Uint32(r.Body[40:44])&LockUnlock != 0
 	for i := range out.Elements {
 		p := r.Body[24+i*24:]
-		e := LockElement{Offset: le.Uint64(p), Length: le.Uint64(p[8:16]), Flags: le.Uint32(p[16:20])}
-		if e.Flags & ^uint32(LockShared|LockExclusive|LockUnlock|LockFailImmediately) != 0 {
-			return out, ErrMalformed
-		}
-		if unlock {
-			if e.Flags != LockUnlock {
-				return out, ErrMalformed
-			}
-		} else {
-			kind := e.Flags & (LockShared | LockExclusive | LockUnlock)
-			if kind != LockShared && kind != LockExclusive {
-				return out, ErrMalformed
-			}
-			if n > 1 && e.Flags&LockFailImmediately == 0 {
-				return out, ErrMalformed
-			}
-		}
-		out.Elements[i] = e
+		out.Elements[i] = LockElement{Offset: le.Uint64(p), Length: le.Uint64(p[8:16]), Flags: le.Uint32(p[16:20])}
 	}
 	return out, nil
 }

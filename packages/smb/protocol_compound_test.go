@@ -2,7 +2,6 @@ package smb
 
 import (
 	"context"
-	"io/fs"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -21,11 +20,11 @@ func (f *protocolFile) ReadAt(ctx context.Context, offset int64, n int) (storage
 	f.reads.Add(1)
 	return f.commandFile.ReadAt(ctx, offset, n)
 }
-func (f *protocolFile) Close(ctx context.Context, id storage.WindowsActionID) (storage.WindowsActionResult, error) {
+func (f *protocolFile) Close(ctx context.Context, id windowsActionID) (windowsActionResult, error) {
 	f.closes.Add(1)
 	return f.commandFile.Close(ctx, id)
 }
-func (f *protocolFile) WriteAt(ctx context.Context, offset int64, b []byte, id storage.WindowsActionID) (storage.WindowsActionResult, error) {
+func (f *protocolFile) WriteAt(ctx context.Context, offset int64, b []byte, id windowsActionID) (windowsActionResult, error) {
 	f.writes.Add(1)
 	return f.commandFile.WriteAt(ctx, offset, b, id)
 }
@@ -33,16 +32,16 @@ func (f *protocolFile) WriteAt(ctx context.Context, offset int64, b []byte, id s
 func compoundProtocol(t *testing.T, pending bool) (net.Conn, uint64, uint32, *signing.Session, *protocolFile) {
 	t.Helper()
 	s, c := startProtocolServer(t)
-	f := &protocolFile{sessionFile: &sessionFile{commandFile: &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 7, Mode: 0644, Size: 3}}, NameInfo: storage.WindowsNameInfo{State: storage.WindowsNameLinked, Path: "file"}}, data: []byte("abc"), result: storage.WindowsActionResult{State: storage.WindowsActionCompleted}}, pending: pending}}
-	ws := &backendSession{commandSession: &commandSession{}, cancelState: storage.WindowsActionCancelled}
-	ws.open = func(r storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
-		if r.Kind == storage.WindowsDirectory {
-			root := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 1, Mode: fs.ModeDir}}}}
-			return storage.WindowsOpenResult{File: root, Attr: root.attr}, nil
+	f := &protocolFile{sessionFile: &sessionFile{commandFile: &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular, Size: 3}}, NameInfo: windowsNameInfo{State: windowsNameLinked, Path: "file"}}, data: []byte("abc"), result: windowsActionResult{State: windowsActionCompleted}}, pending: pending}}
+	ws := &backendSession{commandSession: &commandSession{}, cancelState: windowsActionCancelled}
+	ws.open = func(r windowsOpenRequest) (windowsOpenResult, error) {
+		if r.Kind == windowsDirectory {
+			root := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}}}
+			return windowsOpenResult{File: root, Attr: root.attr}, nil
 		}
-		return storage.WindowsOpenResult{File: f, Attr: f.attr, CreateAction: storage.WindowsOpened}, nil
+		return windowsOpenResult{File: f, Attr: f.attr, CreateAction: windowsOpened}, nil
 	}
-	if _, err := s.Publish(Share{Name: "work", Volume: "trusted", Backend: &sessionBackend{session: ws}, Changes: testNotifySource(testNotifyStream())}); err != nil {
+	if _, err := s.publish(Share{Name: "work", Volume: "trusted", Changes: testNotifySource(testNotifyStream())}, &sessionBackend{session: ws}); err != nil {
 		t.Fatal(err)
 	}
 	sid, key := authenticateProtocol(t, c)

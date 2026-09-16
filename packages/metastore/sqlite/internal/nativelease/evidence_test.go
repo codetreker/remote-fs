@@ -58,3 +58,55 @@ func TestEvidenceValidationPreservesZeroAndMaximumCounters(t *testing.T) {
 		})
 	}
 }
+
+func TestFileWitnessRequiresExplicitTypedQuiescence(t *testing.T) {
+	base := witnessRecord{DatabaseID: strings.Repeat("a", 32), StateID: strings.Repeat("b", 32), Generation: 1, MaxLease: time.Second}
+	file := &Anchor{domain: DomainFile}
+	for _, test := range []struct {
+		name  string
+		value any
+	}{
+		{"missing", base},
+		{"null", struct {
+			witnessRecord
+			Quiescent any
+		}{base, nil}},
+		{"string", struct {
+			witnessRecord
+			Quiescent any
+		}{base, "false"}},
+		{"number", struct {
+			witnessRecord
+			Quiescent any
+		}{base, 0}},
+		{"unknown field", struct {
+			fileWitnessRecord
+			Unknown bool
+		}{fileWitnessRecord{base, true}, false}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			encoded, err := encodeLeaseRecord("file-witness", test.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := file.decodeWitness(encoded); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("malformed quiescence accepted: %v", err)
+			}
+		})
+	}
+	for _, quiescent := range []bool{false, true} {
+		want := Evidence{DatabaseID: base.DatabaseID, StateID: base.StateID, Generation: base.Generation, MaxLease: base.MaxLease, Quiescent: quiescent}
+		encoded, err := file.encodeWitness(want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		actual, err := file.decodeWitness(encoded)
+		if err != nil || actual != want {
+			t.Fatalf("quiescent=%v roundtrip=%+v,%v", quiescent, actual, err)
+		}
+		strong := &Anchor{domain: DomainStrong}
+		if _, err := strong.decodeWitness(encoded); !errors.Is(err, syscall.EIO) {
+			t.Fatalf("strong domain decoded file witness: %v", err)
+		}
+	}
+}

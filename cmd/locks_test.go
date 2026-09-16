@@ -14,6 +14,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 
+	"github.com/codetreker/remote-fs/packages/fuse"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
@@ -228,12 +229,22 @@ func assertBinaryLockRead(t *testing.T, remote storage.Storage, name, want strin
 func assertBinaryMutationsConflict(t *testing.T, remote storage.Storage) {
 	t.Helper()
 	mode := fs.FileMode(0o600)
+	attr, err := remote.Stat(t.Context(), "artifact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := fuse.WithPermissions(attr.Metadata, mode)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, mutation := range []struct {
 		name string
 		run  func() error
 	}{
 		{"write", func() error { return remote.Write(t.Context(), "artifact", []byte("forbidden")) }},
-		{"setattr", func() error { return remote.SetAttr(t.Context(), "artifact", storage.AttrChange{Mode: &mode}) }},
+		{"setattr", func() error {
+			return remote.SetAttr(t.Context(), "artifact", storage.AttrChange{ExpectedRevision: attr.MetadataRevision, Metadata: &metadata})
+		}},
 		{"remove", func() error { return remote.Remove(t.Context(), "artifact") }},
 		{"rename source", func() error { return remote.Rename(t.Context(), "artifact", "moved") }},
 		{"rename replacement", func() error { return remote.Rename(t.Context(), "other", "artifact") }},

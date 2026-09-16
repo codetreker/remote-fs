@@ -94,13 +94,7 @@ func (c *connection) dispatch(ctx context.Context, r, original wire.Request, h *
 	t.export.active++
 	c.server.mu.Unlock()
 	defer func() { c.server.mu.Lock(); t.export.active--; c.server.mu.Unlock() }()
-	if r.Header.Command == wire.Create {
-		var err error
-		r, err = c.maximumAccess(ctx, t, r)
-		if err != nil {
-			return nil, statusError(err), signer
-		}
-	}
+
 	operation := operationFor(r.Header.Command)
 	if r.Header.Command == wire.SetInfo {
 		info, err := r.SetInfo()
@@ -109,11 +103,11 @@ func (c *connection) dispatch(ctx context.Context, r, original wire.Request, h *
 		}
 		switch info.Class {
 		case 10:
-			operation = storage.OpWindowsRename
+			operation = storage.OpFileRename
 		case 13:
-			operation = storage.OpWindowsSetDeletePending
+			operation = storage.OpFileDrainEntry
 		case 19, 20:
-			operation = storage.OpWindowsTruncate
+			operation = storage.OpFileTruncate
 		}
 	}
 	if r.Header.Command == wire.IOCTL {
@@ -123,29 +117,34 @@ func (c *connection) dispatch(ctx context.Context, r, original wire.Request, h *
 		}
 		switch q.Code {
 		case fsctlGetReparsePoint:
-			operation = storage.OpWindowsReadLink
+			operation = storage.OpFileStat
 		case fsctlSetReparsePoint:
-			operation = storage.OpWindowsSetLink
+			operation = storage.OpFileSetKind
 		}
 	}
 	if operation == "" {
 		return nil, statusUnsupported, signer
 	}
-	request := authz.AccessRequest{Volume: t.export.share.Volume, Operation: operation}
-	if r.Header.Command == wire.Create {
-		create, err := r.Create()
-		if err != nil {
-			return nil, statusInvalid, signer
+	request := authz.AccessRequest{Volume: t.export.share.Volume, Operation: operation, Effects: fileEffects(operation)}
+	authorizeHere := r.Header.Command != wire.Create
+	if r.Header.Command == wire.SetInfo {
+		info, _ := r.SetInfo()
+		if info.Class == 10 || info.Class == 13 {
+			authorizeHere = false
 		}
-		intent, err := windowsIntent(create)
-		if err != nil {
+	}
+	if authorizeHere {
+		if fid, ok := relatedFile(r); ok {
+			if handle := t.files.get(fid); handle != nil {
+				request.Reference = handle.file.Reference()
+				request.Node = handle.identity.ID
+			}
+		}
+		if err := c.server.config.Authorize.Authorize(ctx, request); err != nil {
 			return nil, statusError(err), signer
 		}
-		request.WindowsOpen = intent
 	}
-	if err := c.server.config.Authorize.Authorize(ctx, request); err != nil {
-		return nil, statusError(err), signer
-	}
+
 	if r.Header.Command != wire.Close && r.Header.Command != wire.TreeDisconnect {
 		if err := t.export.changes.Health(ctx); err != nil {
 			return nil, statusIO, signer
@@ -197,7 +196,7 @@ func (c *connection) dispatch(ctx context.Context, r, original wire.Request, h *
 	}
 	if r.Header.Command == wire.Create {
 		authorizeContext := ctx
-		ctx = context.WithValue(ctx, maximalAccessKey{}, func(attr storage.WindowsAttr) (uint32, error) { return c.maximalAccess(authorizeContext, t, attr) })
+		ctx = context.WithValue(ctx, maximalAccessKey{}, func(attr windowsAttr) (uint32, error) { return c.maximalAccess(authorizeContext, t, attr) })
 	}
 	b, status := t.files.handle(ctx, r)
 	return b, status, signer
@@ -206,29 +205,29 @@ func (c *connection) dispatch(ctx context.Context, r, original wire.Request, h *
 func operationFor(command uint16) storage.Operation {
 	switch command {
 	case wire.TreeDisconnect:
-		return storage.OpWindowsSessionClose
+		return storage.OpFileSessionClose
 	case wire.Create:
-		return storage.OpWindowsOpen
+		return storage.OpFileRetainAt
 	case wire.Close:
-		return storage.OpWindowsClose
+		return storage.OpFileClose
 	case wire.Flush:
-		return storage.OpWindowsSync
+		return storage.OpFileSync
 	case wire.Read:
-		return storage.OpWindowsRead
+		return storage.OpFileRead
 	case wire.Write:
-		return storage.OpWindowsWrite
+		return storage.OpFileWrite
 	case wire.Lock:
-		return storage.OpWindowsLockBatch
+		return storage.OpFileReplaceRanges
 	case wire.QueryDirectory:
-		return storage.OpWindowsList
+		return storage.OpFileListAt
 	case wire.QueryInfo:
-		return storage.OpWindowsStat
+		return storage.OpFileStat
 	case wire.SetInfo:
-		return storage.OpWindowsSetAttr
+		return storage.OpFileSetAttr
 	case wire.ChangeNotify:
 		return storage.OpReplicationSubscribe
 	case wire.IOCTL:
-		return storage.OpWindowsStat
+		return storage.OpFileStat
 	}
 	return ""
 }
@@ -520,7 +519,7 @@ func (c *connection) treeConnect(ctx context.Context, s *session, r wire.Request
 		}
 		c.server.mu.Unlock()
 	}()
-	if err := c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: e.share.Volume, Operation: storage.OpWindowsSessionOpen}); err != nil {
+	if err := c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: e.share.Volume, Operation: storage.OpFileSessionOpen}); err != nil {
 		return nil, statusError(err)
 	}
 	s.mu.Lock()
@@ -563,20 +562,25 @@ func (c *connection) treeConnect(ctx context.Context, s *session, r wire.Request
 		}
 	}
 	if a == nil {
-		ws, err := e.share.Backend.NewWindowsSession(ctx, c.server.config.Limits.FileSession)
-		if err != nil {
-			return nil, statusError(err)
-		}
+		ws, openErr := e.backend.NewSession(ctx, c.server.config.Limits.FileSession)
 		if ws == nil {
+			if openErr != nil {
+				return nil, statusError(openErr)
+			}
 			return nil, statusIO
 		}
 		a = &authoritySession{session: ws, refs: 1, orphan: true}
+		if binding, ok := ws.(interface {
+			bindRetirement(func(context.Context) error)
+		}); ok {
+			binding.bindRetirement(a.close)
+		}
 		s.authorities[e] = a
 		state, err := ws.Status(ctx)
-		if err != nil || state.Fenced || state.Retired || state.ActionEpoch == 0 {
+		if openErr != nil || err != nil || state.Fenced || state.Retired || state.ActionEpoch == 0 {
 			cleanup, cancel := context.WithTimeout(context.Background(), c.server.config.Limits.CleanupTimeout)
 			defer cancel()
-			cleanupErr := ws.Close(cleanup)
+			cleanupErr := a.close(cleanup)
 			c.server.cleanupFailure(cleanupErr)
 			if cleanupErr != nil {
 				retained = true
@@ -592,7 +596,7 @@ func (c *connection) treeConnect(ctx context.Context, s *session, r wire.Request
 	c.nextTree++
 	id := c.nextTree
 	c.mu.Unlock()
-	t := &tree{id: id, sessionID: s.id, done: make(chan struct{}), export: e, session: a.session, authority: a, files: newFileDispatcher(e.share.Backend, a.session, a.epoch, c.server.config.Limits)}
+	t := &tree{id: id, sessionID: s.id, done: make(chan struct{}), export: e, session: a.session, authority: a, files: newFileDispatcher(e.backend, a.session, a.epoch, c.server.config.Limits)}
 	t.files.authority = a
 	t.files.leases = newLeaseOwner(c.server.leases, c.clientGUID, e.volumeIdentity)
 	t.files.leases.authority = a

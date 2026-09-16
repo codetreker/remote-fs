@@ -7,12 +7,12 @@ import (
 	"context"
 	"errors"
 	"io"
-	"io/fs"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -58,8 +58,8 @@ func exerciseAll(t *testing.T, ctx context.Context, s storage.Storage) {
 		}
 	})
 	t.Run("setattr", func(t *testing.T) {
-		mode := fs.FileMode(0o600)
-		requireUnreachable(t, s.SetAttr(ctx, "f", storage.AttrChange{Mode: &mode}))
+		metadata := storage.Metadata{{Key: "client.example", Version: 1, Data: []byte{0, 6, 0}}}
+		requireUnreachable(t, s.SetAttr(ctx, "f", storage.AttrChange{ExpectedRevision: 1, Metadata: &metadata}))
 	})
 	t.Run("write", func(t *testing.T) { requireUnreachable(t, s.Write(ctx, "f", []byte("x"))) })
 	t.Run("create", func(t *testing.T) { requireUnreachable(t, s.Create(ctx, "f")) })
@@ -179,7 +179,7 @@ func TestAnswersThatAreNotThisProtocol(t *testing.T) {
 		// An intermediary that answers on the server's behalf cannot know this header.
 		{"a success from something that is not the server", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"attr":{"mode":420,"size":0,"mod_time_unix_sec":0,"mod_time_nanos":0}}`))
+			w.Write([]byte(`{"attr":{"id":9,"kind":1,"size":0,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0},"metadata_revision":1,"directory_revision":0,"metadata":"UkZNAQAA"}}`))
 		}},
 		{"a storage error from something that is not the server", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(httprest.StatusStorageError)
@@ -577,38 +577,26 @@ func TestAListingThatIsNotThere(t *testing.T) {
 	}
 }
 
-// The mirror of the listing case, for a stat. A body that carries no attribute set
-// unmarshals into a zero Attr, and a zero Attr is not visibly wrong: mode 0 has no type
-// bits, so it reads as a regular file, of length 0, dated the epoch. A mount above then
-// presents a directory as an empty regular file, a file with content as empty, and every
-// node as dated 1970 — none of which looks like a failure to whatever is walking the tree.
-//
-// The one shape that must still be accepted is at the bottom: a file whose mode really is
-// 0 is a legitimate answer, so absence has to be told apart by the shape of the body and
-// never by the values in it.
+// Missing node facts must never become a plausible empty file. A valid file
+// can carry an empty opaque metadata envelope, so absence is checked on the wire.
 func TestAStatThatCarriesNoAttributes(t *testing.T) {
+	const emptyAttr = `{"id":9,"kind":1,"size":0,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0},"metadata_revision":1,"directory_revision":0,"metadata":"UkZNAQAA"}`
+	const populatedAttr = `{"id":9,"kind":1,"size":7,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0},"metadata_revision":1,"directory_revision":0,"metadata":"UkZNAQEADgABAAAAAwAAAGNsaWVudC5leGFtcGxlAAYA"}`
 	cases := []struct {
-		body     string
-		wantMode fs.FileMode
-		wantErr  bool
+		body         string
+		wantMetadata storage.Metadata
+		wantSize     int64
+		wantErr      bool
 	}{
-		{`{}`, 0, true},
-		{`null`, 0, true},
-		{`{"attr":null}`, 0, true},
-		// A listing delivered to a stat: the right protocol, the wrong answer.
-		{`{"entries":[]}`, 0, true},
-		// Attributes under a name this side does not read are attributes it did not get.
-		{`{"attributes":{"mode":420,"size":7}}`, 0, true},
-
-		// A peer that sends attributes without an identity is not sending nothing, it is
-		// saying every node is the same node, and every comparison of that above returns
-		// equal. It is refused here, where the other absences are.
-		{`{"attr":{"mode":420,"size":7}}`, 0, true},
-		{`{"attr":{"id":0,"mode":420,"size":7}}`, 0, true},
-
-		// A mode of zero is a legitimate answer, unlike an identity of zero.
-		{`{"attr":{"id":9,"mode":420,"size":7}}`, 0o644, false},
-		{`{"attr":{"id":9,"mode":0,"size":0}}`, 0, false},
+		{`{}`, nil, 0, true},
+		{`null`, nil, 0, true},
+		{`{"attr":null}`, nil, 0, true},
+		{`{"entries":[]}`, nil, 0, true},
+		{`{"attributes":` + populatedAttr + `}`, nil, 0, true},
+		{`{"attr":` + strings.Replace(emptyAttr, `"id":9,`, "", 1) + `}`, nil, 0, true},
+		{`{"attr":` + strings.Replace(emptyAttr, `"id":9`, `"id":0`, 1) + `}`, nil, 0, true},
+		{`{"attr":` + populatedAttr + `}`, storage.Metadata{{Key: "client.example", Version: 1, Data: []byte{0, 6, 0}}}, 7, false},
+		{`{"attr":` + emptyAttr + `}`, nil, 0, false},
 	}
 	for _, c := range cases {
 		t.Run(c.body, func(t *testing.T) {
@@ -628,26 +616,25 @@ func TestAStatThatCarriesNoAttributes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("stat: %v", err)
 			}
-			if attr.Mode != c.wantMode {
-				t.Fatalf("stat delivered mode %v, want %v", attr.Mode, c.wantMode)
+			if attr.ID != 9 || attr.Kind != storage.NodeRegular || attr.Size != c.wantSize || attr.MetadataRevision != 1 || !reflect.DeepEqual(attr.Metadata, c.wantMetadata) {
+				t.Fatalf("stat delivered %+v, want a regular file with size %d and metadata %+v at revision 1", attr, c.wantSize, c.wantMetadata)
 			}
 		})
 	}
 }
 
-// The same hole inside a listing: an entry whose attributes never arrived becomes an
-// entry with a zero Attr, which reads as an empty regular file of that name.
+// Every listed entry must carry its own complete node facts.
 func TestAListingEntryThatCarriesNoAttributes(t *testing.T) {
+	const attr = `{"id":9,"kind":1,"size":0,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0},"metadata_revision":1,"directory_revision":0,"metadata":"UkZNAQAA"}`
 	cases := []struct {
 		body    string
 		wantErr bool
 	}{
 		{`{"entries":[{"name":"Zg=="}]}`, true},
 		{`{"entries":[{"name":"Zg==","attr":null}]}`, true},
-		{`{"entries":[{"name":"Zg==","attr":{"id":9,"mode":420}},{"name":"Zw=="}]}`, true},
-		// An entry whose attributes carry no identity is refused with the rest of them.
-		{`{"entries":[{"name":"Zg==","attr":{"mode":0}}]}`, true},
-		{`{"entries":[{"name":"Zg==","attr":{"id":9,"mode":0}}]}`, false},
+		{`{"entries":[{"name":"Zg==","attr":` + attr + `},{"name":"Zw=="}]}`, true},
+		{`{"entries":[{"name":"Zg==","attr":` + strings.Replace(attr, `"id":9,`, "", 1) + `}]}`, true},
+		{`{"entries":[{"name":"Zg==","attr":` + attr + `}]}`, false},
 	}
 	for _, c := range cases {
 		t.Run(c.body, func(t *testing.T) {
@@ -667,8 +654,8 @@ func TestAListingEntryThatCarriesNoAttributes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("list: %v", err)
 			}
-			if len(entries) != 1 || entries[0].Name != "f" || entries[0].Attr.Mode != 0 {
-				t.Fatalf("list delivered %+v, want one entry named \"f\" of mode 0", entries)
+			if len(entries) != 1 || entries[0].Name != "f" || entries[0].Attr.Kind != storage.NodeRegular || entries[0].Attr.ID != 9 || entries[0].Attr.Size != 0 || entries[0].Attr.MetadataRevision != 1 || len(entries[0].Attr.Metadata) != 0 {
+				t.Fatalf("list delivered %+v, want one regular file named \"f\" with empty metadata at revision 1", entries)
 			}
 		})
 	}
@@ -692,7 +679,7 @@ func TestASpaceReportThatIsNotThere(t *testing.T) {
 		{body: `null`, wantErr: true},
 		{body: `{"space":null}`, wantErr: true},
 		// A stat answer delivered to a space report: the right protocol, the wrong answer.
-		{body: `{"attr":{"mode":420,"size":7}}`, wantErr: true},
+		{body: `{"attr":{"id":9,"kind":1,"size":7,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0},"metadata_revision":1,"directory_revision":0,"metadata":"UkZNAQEADgABAAAAAwAAAGNsaWVudC5leGFtcGxlAAYA"}}`, wantErr: true},
 
 		{body: `{"space":{"used":1024,"avail":3072}}`, wantErr: true},
 		{body: `{"space":{"total":4096,"avail":3072}}`, wantErr: true},

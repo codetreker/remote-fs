@@ -4,8 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io/fs"
-	"math"
+	"reflect"
 	"syscall"
 	"testing"
 	"time"
@@ -15,31 +14,105 @@ import (
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-func retainedSession(t *testing.T, volume storage.FileStorage) storage.FileSession {
+func retainedAction(t *testing.T, epoch uint64) storage.FileActionID {
+	t.Helper()
+	action, err := storage.NewFileActionID(epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return action
+}
+
+func retainedSession(t *testing.T, volume storage.FileStorage) (storage.FileSession, uint64) {
 	t.Helper()
 	if err := volume.CheckFileStorage(); err != nil {
 		t.Fatal(err)
 	}
-	session, err := volume.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	session, status, err := volume.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
+	epoch := status.ActionEpoch
+	closeAction := retainedAction(t, epoch)
 	t.Cleanup(func() {
-		if err := session.Close(context.Background()); err != nil {
+		if _, err := session.Close(context.Background(), closeAction); err != nil {
 			t.Error(err)
 		}
 	})
-	return session
+	return session, epoch
 }
 
-func retainedOpen(t *testing.T, session storage.FileSession, path string, create bool) storage.File {
+func retainedTarget(t *testing.T, volume storage.FileStorage, session storage.FileSession, epoch uint64, name string) (storage.EntryTarget, func()) {
 	t.Helper()
-	file, err := session.OpenFile(t.Context(), path, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: create}, Mode: 0600})
+	state, err := volume.FileState(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
+	root, err := session.StatNode(t.Context(), state.RootID, storage.ObservationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := session.Retain(t.Context(), storage.RetainRequest{NodeID: state.RootID, ExpectedMetadataRevision: root.Attr.MetadataRevision, Claim: storage.AccessClaim{Uses: storage.ReadContent}}, retainedAction(t, epoch))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := session.Reference(t.Context(), receipt.Reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeAction := retainedAction(t, epoch)
+	cleanup := func() {
+		if _, err := parent.Close(context.Background(), closeAction); err != nil {
+			t.Error(err)
+		}
+	}
+	observation, err := parent.Stat(t.Context(), storage.ObservationOptions{IncludeLocation: true})
+	if err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if parent.NodeID() != state.RootID {
+		cleanup()
+		t.Fatal("retained parent changed identity")
+	}
+	lookup, err := parent.LookupAt(t.Context(), []byte(name))
+	if err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if observation.Location == nil {
+		cleanup()
+		t.Fatal("parent observation omitted its requested location")
+	}
+	target := storage.EntryTarget{Parent: parent.Reference(), ParentID: state.RootID, Name: []byte(name), DirectoryRevision: lookup.DirectoryRevision, Witness: observation.Location}
+	if lookup.Found {
+		target.ExpectedEntryID, target.ExpectedNodeID, target.ExpectedMetadataRevision = lookup.EntryID, lookup.Attr.ID, lookup.Attr.MetadataRevision
+	}
+	return target, cleanup
+}
+
+func retainedOpen(t *testing.T, volume storage.FileStorage, session storage.FileSession, epoch uint64, name string, create bool) storage.File {
+	t.Helper()
+	target, cleanup := retainedTarget(t, volume, session, epoch, name)
+	defer cleanup()
+	claim := storage.AccessClaim{Uses: storage.ReadContent | storage.WriteContent}
+	var receipt storage.FileActionReceipt
+	var err error
+	if create {
+		receipt, err = session.CreateAndRetainAt(t.Context(), storage.CreateAndRetainRequest{Target: target, Initial: storage.NodeInitial{Kind: storage.NodeRegular}, Claim: claim}, retainedAction(t, epoch))
+	} else {
+		receipt, err = session.RetainAt(t.Context(), storage.RetainAtRequest{Target: target, Claim: claim}, retainedAction(t, epoch))
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := session.Reference(t.Context(), receipt.Reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeAction := retainedAction(t, epoch)
 	t.Cleanup(func() {
-		if err := file.Close(context.Background()); err != nil {
+		if _, err := file.Close(context.Background(), closeAction); err != nil {
 			t.Error(err)
 		}
 	})
@@ -49,13 +122,13 @@ func retainedOpen(t *testing.T, session storage.FileSession, path string, create
 func TestRetainedFileQueriesTheAuthorityAfterRenameAndUnlink(t *testing.T) {
 	s := serve(t, httprest.DefaultLimits())
 	mounted, local := mount(t, s)
-	session := retainedSession(t, mounted)
-	file := retainedOpen(t, session, "file", true)
+	session, epoch := retainedSession(t, mounted)
+	file := retainedOpen(t, mounted, session, epoch, "file", true)
 	created, err := mounted.Stat(t.Context(), "file")
 	if err != nil {
 		t.Fatal("atomic create did not confirm its replica entry:", err)
 	}
-	if _, err := file.WriteAt(t.Context(), 0, []byte("original")); err != nil {
+	if _, err := file.WriteAt(t.Context(), storage.FileWriteRequest{Data: []byte("original")}, retainedAction(t, epoch)); err != nil {
 		t.Fatal(err)
 	}
 	if attr, err := mounted.Stat(t.Context(), "file"); err != nil || attr.Size != 8 {
@@ -64,7 +137,7 @@ func TestRetainedFileQueriesTheAuthorityAfterRenameAndUnlink(t *testing.T) {
 	if err := s.elsewhere.Write(t.Context(), "file", []byte("current")); err != nil {
 		t.Fatal(err)
 	}
-	read, err := file.ReadAt(t.Context(), 0, 100)
+	read, err := file.ReadAt(t.Context(), storage.FileReadRequest{Offset: 0, Length: 100})
 	if err != nil || string(read.Data) != "current" || read.Attr.Size != 7 || read.Attr.ID != created.ID {
 		t.Fatalf("retained read did not capture current authority content: %+v, %v", read, err)
 	}
@@ -74,7 +147,7 @@ func TestRetainedFileQueriesTheAuthorityAfterRenameAndUnlink(t *testing.T) {
 	if err := s.elsewhere.Write(t.Context(), "file", []byte("replacement")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := file.WriteAt(t.Context(), 1, []byte("!")); err != nil {
+	if _, err := file.WriteAt(t.Context(), storage.FileWriteRequest{Offset: 1, Data: []byte("!")}, retainedAction(t, epoch)); err != nil {
 		t.Fatal(err)
 	}
 	if content, err := s.elsewhere.Read(t.Context(), "moved"); err != nil || string(content) != "c!rrent" {
@@ -85,35 +158,43 @@ func TestRetainedFileQueriesTheAuthorityAfterRenameAndUnlink(t *testing.T) {
 	}
 	requireCaughtUp(t, s, local)
 	position := local.Position()
-	if attr, err := file.Stat(t.Context()); err != nil || attr.ID != created.ID || attr.Size != 7 {
+	if attr, err := file.Stat(t.Context(), storage.ObservationOptions{}); err != nil || attr.Attr.ID != created.ID || attr.Attr.Size != 7 {
 		t.Fatalf("detached file stat: %+v, %v", attr, err)
 	}
-	if attr, err := session.StatNode(t.Context(), created.ID); err != nil || attr.ID != created.ID {
-		t.Fatalf("detached node stat: %+v, %v", attr, err)
+	detached, err := session.StatNode(t.Context(), created.ID, storage.ObservationOptions{})
+	if err != nil || detached.Attr.ID != created.ID {
+		t.Fatalf("detached node stat: %+v, %v", detached, err)
 	}
-	byID, err := session.OpenNode(t.Context(), created.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}, ExpectedID: created.ID})
+	retain, err := session.Retain(t.Context(), storage.RetainRequest{NodeID: created.ID, ExpectedMetadataRevision: detached.Attr.MetadataRevision, Claim: storage.AccessClaim{Uses: storage.ReadContent}}, retainedAction(t, epoch))
 	if err != nil {
-		t.Fatal("opening the retained identity required its former name:", err)
+		t.Fatal("retaining the detached identity required its former name:", err)
 	}
-	if read, err := byID.ReadAt(t.Context(), 0, 7); err != nil || string(read.Data) != "c!rrent" || read.Attr.ID != created.ID {
-		t.Fatalf("identity open selected a replacement: %+v, %v", read, err)
-	}
-	if err := byID.Close(t.Context()); err != nil {
+	byID, err := session.Reference(t.Context(), retain.Reference)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if attr, err := file.Truncate(t.Context(), 10); err != nil || attr.Size != 10 {
-		t.Fatalf("detached truncate: %+v, %v", attr, err)
+	if read, err := byID.ReadAt(t.Context(), storage.FileReadRequest{Length: 7}); err != nil || string(read.Data) != "c!rrent" || read.Attr.ID != created.ID {
+		t.Fatalf("identity retain selected a replacement: %+v, %v", read, err)
 	}
-	read, err = file.ReadAt(t.Context(), 5, 10)
+	if _, err := byID.Close(t.Context(), retainedAction(t, epoch)); err != nil {
+		t.Fatal(err)
+	}
+	if receipt, err := file.Truncate(t.Context(), storage.FileTruncateRequest{Size: 10}, retainedAction(t, epoch)); err != nil || receipt.Observation.Attr.Size != 10 || receipt.Effects&storage.EffectContentChanged == 0 {
+		t.Fatalf("detached truncate: %+v, %v", receipt, err)
+	}
+	read, err = file.ReadAt(t.Context(), storage.FileReadRequest{Offset: 5, Length: 10})
 	if err != nil || !bytes.Equal(read.Data, []byte{'n', 't', 0, 0, 0}) || read.Attr.Size != 10 {
 		t.Fatalf("detached read/EOF lost its content revision: %+v, %v", read, err)
 	}
-	mode := fs.FileMode(0640)
-	if attr, err := session.SetNodeAttr(t.Context(), created.ID, storage.AttrChange{Mode: &mode}); err != nil || attr.Mode.Perm() != mode {
+	metadata, err := read.Attr.Metadata.With(storage.OpaqueMetadata{Key: "test.value", Version: 1, Data: []byte("detached")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attr, err := session.SetNodeAttr(t.Context(), created.ID, storage.AttrChange{ExpectedRevision: read.Attr.MetadataRevision, Metadata: &metadata}, retainedAction(t, epoch)); err != nil || !reflect.DeepEqual(attr.Observation.Attr.Metadata, metadata) {
 		t.Fatalf("detached identity setattr: %+v, %v", attr, err)
 	}
 	moment := time.Unix(1000, 123)
-	if attr, err := file.SetAttr(t.Context(), storage.AttrChange{ModTime: &moment}); err != nil || !attr.ModTime.Equal(moment) {
+	if attr, err := file.SetAttr(t.Context(), storage.AttrChange{ModTime: &moment}, retainedAction(t, epoch)); err != nil || !attr.Observation.Attr.ModTime.Equal(moment) {
 		t.Fatalf("detached file setattr: %+v, %v", attr, err)
 	}
 	if err := file.Sync(t.Context()); err != nil {
@@ -143,25 +224,25 @@ func TestRetainedSessionPreservesMutationScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := retainedSession(t, view.(storage.FileStorage))
+	session, epoch := retainedSession(t, view.(storage.FileStorage))
 	proofs[0].Generation++
-	file := retainedOpen(t, session, "file", false)
-	if _, err := file.WriteAt(t.Context(), 0, []byte("scoped")); err != nil {
+	file := retainedOpen(t, mounted, session, epoch, "file", false)
+	if _, err := file.WriteAt(t.Context(), storage.FileWriteRequest{Data: []byte("scoped")}, retainedAction(t, epoch)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := file.Truncate(locking.WithScope(t.Context(), locking.MutationScope{}), 0); !errors.Is(err, syscall.EBUSY) {
+	if _, err := file.Truncate(locking.WithScope(t.Context(), locking.MutationScope{}), storage.FileTruncateRequest{Size: 0}, retainedAction(t, epoch)); !errors.Is(err, syscall.EBUSY) {
 		t.Fatalf("explicit anonymous file mutation inherited a grant: %v", err)
 	}
 	if _, err := mounted.Release(t.Context(), owner, grant); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := file.SetAttr(t.Context(), storage.AttrChange{}); !errors.Is(err, syscall.ESTALE) {
+	if _, err := file.SetAttr(t.Context(), storage.AttrChange{}, retainedAction(t, epoch)); !errors.Is(err, syscall.ESTALE) {
 		t.Fatalf("file mutation discarded its expired proof: %v", err)
 	}
-	if read, err := file.ReadAt(t.Context(), 0, 6); err != nil || string(read.Data) != "scoped" {
+	if read, err := file.ReadAt(t.Context(), storage.FileReadRequest{Offset: 0, Length: 6}); err != nil || string(read.Data) != "scoped" {
 		t.Fatalf("ordinary retained read asserted a live strong grant: %+v, %v", read, err)
 	}
-	if _, err := file.Stat(t.Context()); err != nil {
+	if _, err := file.Stat(t.Context(), storage.ObservationOptions{}); err != nil {
 		t.Fatal("ordinary retained stat asserted a live strong grant:", err)
 	}
 }
@@ -169,9 +250,9 @@ func TestRetainedSessionPreservesMutationScope(t *testing.T) {
 func TestRetainedControlsRemainAvailableWhenTheStreamFails(t *testing.T) {
 	s := serve(t, httprest.DefaultLimits())
 	mounted, _ := mount(t, s)
-	session := retainedSession(t, mounted)
-	file := retainedOpen(t, session, "file", true)
-	other := retainedOpen(t, session, "file", false)
+	session, epoch := retainedSession(t, mounted)
+	file := retainedOpen(t, mounted, session, epoch, "file", true)
+	other := retainedOpen(t, mounted, session, epoch, "file", false)
 	s.events.cut()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
@@ -183,14 +264,27 @@ func TestRetainedControlsRemainAvailableWhenTheStreamFails(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+	writeAction, truncateAction, attrAction := retainedAction(t, epoch), retainedAction(t, epoch), retainedAction(t, epoch)
 	before := s.calls.total()
 	for name, call := range map[string]func() error{
-		"stat":     func() error { _, err := file.Stat(t.Context()); return err },
-		"read":     func() error { _, err := file.ReadAt(t.Context(), 0, 1); return err },
-		"write":    func() error { _, err := file.WriteAt(t.Context(), 0, []byte{'x'}); return err },
-		"truncate": func() error { _, err := file.Truncate(t.Context(), 0); return err },
-		"setattr":  func() error { _, err := file.SetAttr(t.Context(), storage.AttrChange{}); return err },
-		"sync":     func() error { return file.Sync(t.Context()) },
+		"stat": func() error { _, err := file.Stat(t.Context(), storage.ObservationOptions{}); return err },
+		"read": func() error {
+			_, err := file.ReadAt(t.Context(), storage.FileReadRequest{Offset: 0, Length: 1})
+			return err
+		},
+		"write": func() error {
+			_, err := file.WriteAt(t.Context(), storage.FileWriteRequest{Data: []byte{'x'}}, writeAction)
+			return err
+		},
+		"truncate": func() error {
+			_, err := file.Truncate(t.Context(), storage.FileTruncateRequest{Size: 0}, truncateAction)
+			return err
+		},
+		"setattr": func() error {
+			_, err := file.SetAttr(t.Context(), storage.AttrChange{}, attrAction)
+			return err
+		},
+		"sync": func() error { return file.Sync(t.Context()) },
 	} {
 		if err := call(); !errors.Is(err, syscall.EIO) {
 			t.Fatalf("%s fabricated a healthy answer: %v", name, err)
@@ -199,32 +293,30 @@ func TestRetainedControlsRemainAvailableWhenTheStreamFails(t *testing.T) {
 	if s.calls.total() != before {
 		t.Fatal("unhealthy retained I/O reached the authority")
 	}
-	status, err := session.Status(t.Context())
+	scope := storage.RangeScope{Domain: 1}
+	snapshot, err := file.RangeSnapshot(t.Context(), 1, scope)
 	if err != nil {
 		t.Fatal(err)
 	}
-	request, err := storage.NewLockRequestID(status.ActionEpoch)
-	if err != nil {
+	action := retainedAction(t, epoch)
+	request := storage.RangeReplaceRequest{Owner: 1, Scope: scope, ExpectedRevision: snapshot.Revision, Ranges: []storage.RangeAcquisition{{ID: 1, Start: 0, End: ^uint64(0), Exclusive: true}}}
+	if receipt, err := file.ReplaceRanges(t.Context(), request, action); err != nil || receipt.State != storage.FileActionCompleted || receipt.Effects&storage.EffectRangesChanged == 0 {
+		t.Fatalf("range replacement was not authoritative: %+v, %v", receipt, err)
+	}
+	if snapshot, err := other.RangeSnapshot(t.Context(), 2, scope); err != nil || len(snapshot.Other) != 1 || snapshot.Other[0].Owner.ID != 1 {
+		t.Fatalf("range conflict was not authoritative: %+v, %v", snapshot, err)
+	}
+	if receipt, err := session.QueryAction(t.Context(), action); err != nil || receipt.State != storage.FileActionCompleted {
+		t.Fatalf("range receipt unavailable: %+v, %v", receipt, err)
+	}
+	if receipt, err := session.CancelAction(t.Context(), action); err != nil || receipt.State != storage.FileActionCompleted {
+		t.Fatalf("range cancellation unavailable: %+v, %v", receipt, err)
+	}
+	if _, err := session.RetireRangeOwner(t.Context(), 1, retainedAction(t, epoch)); err != nil {
 		t.Fatal(err)
 	}
-	lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
-	if attempt, err := file.SetLock(t.Context(), 1, lock, request); err != nil || attempt.State != storage.LockGranted {
-		t.Fatalf("advisory lock was not authoritative: %+v, %v", attempt, err)
-	}
-	if conflict, err := other.GetLock(t.Context(), 2, lock); err != nil || !conflict.Found {
-		t.Fatalf("advisory conflict was not authoritative: %+v, %v", conflict, err)
-	}
-	if attempt, err := file.QueryLock(t.Context(), 1, request); err != nil || attempt.State != storage.LockGranted {
-		t.Fatalf("advisory receipt unavailable: %+v, %v", attempt, err)
-	}
-	if attempt, err := file.CancelLock(t.Context(), 1, request); err != nil || attempt.State != storage.LockGranted {
-		t.Fatalf("advisory cancellation unavailable: %+v, %v", attempt, err)
-	}
-	if err := file.DropLocks(t.Context(), 1, storage.Flock); err != nil {
-		t.Fatal(err)
-	}
-	if conflict, err := other.GetLock(t.Context(), 2, lock); err != nil || conflict.Found {
-		t.Fatalf("advisory cleanup did not release the granted acquisition: %+v, %v", conflict, err)
+	if snapshot, err := other.RangeSnapshot(t.Context(), 2, scope); err != nil || len(snapshot.Other) != 0 {
+		t.Fatalf("range cleanup did not release the acquisition: %+v, %v", snapshot, err)
 	}
 	if _, err := session.Renew(t.Context()); err != nil {
 		t.Fatal(err)

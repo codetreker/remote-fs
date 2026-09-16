@@ -68,7 +68,7 @@ func TestBoundedEntrypointsPreserveReplicaAndDependencyFailures(t *testing.T) {
 
 func listResult(t *testing.T, maxBytes int64) *storage.ListResult {
 	t.Helper()
-	result, err := storage.NewListResult(maxBytes, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+	result, err := storage.NewListResult(maxBytes, 0, func(_ int, nameBytes, _ int64, _ storage.Attr) (int64, error) {
 		return nameBytes, nil
 	})
 	if err != nil {

@@ -55,7 +55,7 @@ func TestSinceRefusesLiveChangeCorruptionWithoutExposingAPartialPage(t *testing.
 		damage string
 	}{
 		{"text kind", `UPDATE changes SET kind = 'created' WHERE position = (SELECT min(position) FROM changes)`},
-		{"text mode", `UPDATE changes SET mode = 'regular' WHERE position = (SELECT min(position) FROM changes)`},
+		{"text node kind", `UPDATE changes SET node_kind = 'regular' WHERE position = (SELECT min(position) FROM changes)`},
 		{"text name", `UPDATE changes SET name = 'file' WHERE position = (SELECT min(position) FROM changes)`},
 		{"missing created name", `UPDATE changes SET name = NULL WHERE position = (SELECT min(position) FROM changes)`},
 		{"slash in name", `UPDATE changes SET name = CAST('bad/name' AS BLOB) WHERE position = (SELECT min(position) FROM changes)`},

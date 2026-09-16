@@ -12,7 +12,7 @@ import (
 )
 
 func TestListResultRefusesBeforeRetainingAnOversizedEntry(t *testing.T) {
-	result, err := storage.NewListResult(5, 1, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+	result, err := storage.NewListResult(5, 1, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
 		return nameBytes, nil
 	})
 	if err != nil {
@@ -30,7 +30,7 @@ func TestListResultRefusesBeforeRetainingAnOversizedEntry(t *testing.T) {
 }
 
 func TestListResultSortsBytewise(t *testing.T) {
-	result, err := storage.NewListResult(3, 0, func(_ int, _ int64, _ storage.Attr) (int64, error) { return 1, nil })
+	result, err := storage.NewListResult(3, 0, func(_ int, _ int64, _ int64, _ storage.Attr) (int64, error) { return 1, nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestListResultSortsBytewise(t *testing.T) {
 }
 
 func TestListResultFailInvalidatesRetainedEntries(t *testing.T) {
-	result, err := storage.NewListResult(16, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+	result, err := storage.NewListResult(16, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
 		return nameBytes, nil
 	})
 	if err != nil {
@@ -67,7 +67,7 @@ func TestListResultFailInvalidatesRetainedEntries(t *testing.T) {
 }
 
 func TestListResultOwnsOnlyTheChargedNameAndTimeInstants(t *testing.T) {
-	result, err := storage.NewListResult(1024, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+	result, err := storage.NewListResult(1024, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
 		return nameBytes + 1, nil
 	})
 	if err != nil {

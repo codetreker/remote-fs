@@ -11,6 +11,10 @@ import (
 )
 
 func ValidateIdentityBounds(ctx context.Context, db sqlvalue.Queryer, volume int64) error {
+	return ValidateIdentityBoundsVersion(ctx, db, volume, 6)
+}
+
+func ValidateIdentityBoundsVersion(ctx context.Context, db sqlvalue.Queryer, volume int64, version int) error {
 	state, err := Read(ctx, db)
 	if err != nil {
 		return err
@@ -48,6 +52,20 @@ func ValidateIdentityBounds(ctx context.Context, db sqlvalue.Queryer, volume int
 		return fmt.Errorf("volume %d has %d node identities and %d change positions above durable high-water marks: %w",
 			volume, invalidNodes, invalidChanges, syscall.EIO)
 	}
+	if version >= 6 {
+		var invalid int64
+		if err := db.QueryRowContext(ctx, `SELECT
+			(SELECT count(*) FROM entries WHERE volume = ? AND id > ?) +
+			(SELECT count(*) FROM removal_intents WHERE volume = ? AND entry > ?) +
+			(SELECT count(*) FROM changes WHERE volume = ? AND identity_high_water > ?)`,
+			volume, state.NodeHighWater, volume, state.NodeHighWater, volume, state.NodeHighWater).Scan(&invalid); err != nil {
+			return err
+		}
+		if invalid != 0 {
+			return fmt.Errorf("volume %d has %d entry or historical identities above witnessed high-water %d: %w",
+				volume, invalid, state.NodeHighWater, syscall.EIO)
+		}
+	}
 	return nil
 }
 
@@ -68,6 +86,16 @@ func SequenceValue(ctx context.Context, db sqlvalue.Queryer, name string) (int64
 }
 
 func AllocateNodeID(ctx context.Context, tx *sql.Tx) (int64, error) {
+	return allocateIdentity(ctx, tx)
+}
+
+func AllocateEntryID(ctx context.Context, tx *sql.Tx) (int64, error) {
+	return allocateIdentity(ctx, tx)
+}
+
+// Nodes and entries reserve one witnessed identity space. The SQLite sequence
+// advances with the witness counter, even when no node row consumes the ID.
+func allocateIdentity(ctx context.Context, tx *sql.Tx) (int64, error) {
 	state, err := Read(ctx, tx)
 	if err != nil {
 		return 0, err
@@ -87,7 +115,19 @@ func AllocateNodeID(ctx context.Context, tx *sql.Tx) (int64, error) {
 	if _, err := tx.ExecContext(ctx, `UPDATE database_state SET node_high_water = ? WHERE singleton = 1`, next); err != nil {
 		return 0, err
 	}
+	if err := setIdentitySequence(ctx, tx, next); err != nil {
+		return 0, err
+	}
 	return next, nil
+}
+
+func setIdentitySequence(ctx context.Context, tx *sql.Tx, identity int64) error {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sqlite_sequence (name, seq)
+		SELECT 'nodes', ? WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'nodes')`, identity); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE sqlite_sequence SET seq = ? WHERE name = 'nodes'`, identity)
+	return err
 }
 
 func ObserveNewNodeID(ctx context.Context, tx *sql.Tx, id int64) error {
@@ -111,7 +151,10 @@ func ObserveNewNodeID(ctx context.Context, tx *sql.Tx, id int64) error {
 			id, state.NodeHighWater, syscall.EIO)
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE database_state SET node_high_water = ? WHERE singleton = 1`, id)
-	return err
+	if err != nil {
+		return err
+	}
+	return setIdentitySequence(ctx, tx, id)
 }
 
 func AllocateChangePosition(ctx context.Context, tx *sql.Tx) (int64, error) {

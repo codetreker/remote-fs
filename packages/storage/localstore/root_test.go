@@ -2,18 +2,21 @@ package localstore
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
@@ -1451,5 +1454,63 @@ func TestClampStatusSpaceValidatesAndCombinesMeasurements(t *testing.T) {
 	unclamped, err := clampStatusSpace(logical, localdisk.Status{}, localFailure)
 	if err != nil || unclamped != logical {
 		t.Fatalf("failed physical measurement changed logical space to %+v, %v", unclamped, err)
+	}
+}
+
+type cancelAfterStrongRetirement struct {
+	context.Context
+	cancel    context.CancelFunc
+	authority interface{ Check(context.Context) error }
+	fired     atomic.Bool
+}
+
+func (c *cancelAfterStrongRetirement) Done() <-chan struct{} {
+	if err := c.authority.Check(context.Background()); err != nil && locking.CodeOf(err) == locking.Retired {
+		c.fired.Store(true)
+		c.cancel()
+	}
+	return c.Context.Done()
+}
+
+func TestCloseRetriesCancellationAfterStrongRetirement(t *testing.T) {
+	config := witnessTestConfig(privateTestRoot(t))
+	locks := locking.DefaultOptions()
+	config.Locks, config.InitializeLocks = &locks, true
+	store, err := Open(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	store.durable.stop()
+	<-store.durable.done
+	authority, ok := store.LockService().(interface{ Check(context.Context) error })
+	if !ok {
+		t.Fatal("strong authority cannot report retirement")
+	}
+	base, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ctx := &cancelAfterStrongRetirement{Context: base, cancel: cancel, authority: authority}
+	if err := store.meta.CloseContext(ctx); !errors.Is(err, context.Canceled) || !ctx.fired.Load() {
+		t.Fatalf("close at Strong retirement = %v, triggered=%v", err, ctx.fired.Load())
+	}
+	if contender, err := localdisk.Open(t.Context(), config.Root, config.LocalDisk); !errors.Is(err, syscall.EBUSY) {
+		if contender != nil {
+			contender.Close()
+		}
+		t.Fatalf("canceled close released object ownership: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("retry after Strong retirement: %v", err)
+	}
+	reopened, err := Open(t.Context(), config)
+	if err != nil {
+		t.Fatalf("reopen after retried close: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

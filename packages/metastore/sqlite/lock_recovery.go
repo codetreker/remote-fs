@@ -20,6 +20,7 @@ type LeaseEvidence struct {
 	StateID    string
 	Generation int64
 	MaxLease   time.Duration
+	Quiescent  bool
 }
 
 // LeaseWitness stores independent, volume-anchored evidence. Advance must durably publish
@@ -40,6 +41,7 @@ type LeaseRecoveryConfig struct {
 }
 
 type LeaseRecovery struct {
+	file    bool
 	gate    commitGate
 	store   *Store
 	witness LeaseWitness
@@ -63,7 +65,7 @@ func (s *Store) ConfigureLeaseRecovery(ctx context.Context, config LeaseRecovery
 		return err
 	}
 	anchor, ok := config.Witness.(*LeaseAnchor)
-	if !ok || anchor == nil {
+	if !ok || anchor == nil || anchor.Domain() != LeaseDomainStrong {
 		return fmt.Errorf("lease recovery requires a native anchored witness: %w", syscall.EINVAL)
 	}
 	if err := nativelease.VerifyDatabaseOwner((*nativelease.Anchor)(anchor), s.leaseOwner); err != nil {
@@ -97,7 +99,7 @@ func (s *Store) configureLeaseRecoveryLocked(ctx context.Context, config LeaseRe
 		return err
 	}
 	s.leaseRecovery = recovery
-	return s.configureWindowsRecovery(ctx, recovery)
+	return nil
 }
 
 func (r *LeaseRecovery) open(ctx context.Context, config LeaseRecoveryConfig) error {
@@ -109,7 +111,7 @@ func (r *LeaseRecovery) open(ctx context.Context, config LeaseRecoveryConfig) er
 	var exists bool
 	err = r.store.inspect(ctx, func(tx *sql.Tx) error {
 		var err error
-		record, exists, err = readLeaseRecord(ctx, tx)
+		record, exists, err = readLeaseRecordTable(ctx, tx, r.table())
 		return err
 	})
 	if err != nil {
@@ -124,8 +126,12 @@ func (r *LeaseRecovery) open(ctx context.Context, config LeaseRecoveryConfig) er
 			if err != nil {
 				return err
 			}
-			record.accepted = LeaseEvidence{DatabaseID: state.DatabaseID, StateID: config.StateID}
-			_, err = tx.ExecContext(ctx, `INSERT INTO lease_recovery
+			record.accepted = LeaseEvidence{DatabaseID: state.DatabaseID, StateID: config.StateID, Quiescent: r.file}
+			if r.file {
+				_, err = tx.ExecContext(ctx, `INSERT INTO file_lease_recovery(singleton,database_id,state_id,accepted_generation,accepted_nanos,accepted_quiescent) VALUES(1,?,?,0,0,1)`, state.DatabaseID, config.StateID)
+				return err
+			}
+			_, err = tx.ExecContext(ctx, `INSERT INTO `+r.table()+`
 				(singleton, database_id, state_id, accepted_generation, accepted_nanos)
 				VALUES (1, ?, ?, 0, 0)`, state.DatabaseID, config.StateID)
 			return err
@@ -169,9 +175,12 @@ func (r *LeaseRecovery) open(ctx context.Context, config LeaseRecoveryConfig) er
 	return nil
 }
 
-func readLeaseRecord(ctx context.Context, tx *sql.Tx) (leaseRecord, bool, error) {
+func readLeaseRecordTable(ctx context.Context, tx *sql.Tx, table string) (leaseRecord, bool, error) {
+	if table == "file_lease_recovery" {
+		return readFileLeaseRecord(ctx, tx)
+	}
 	var rows int
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM (SELECT singleton FROM lease_recovery LIMIT 2)`).Scan(&rows); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM (SELECT singleton FROM `+table+` LIMIT 2)`).Scan(&rows); err != nil {
 		return leaseRecord{}, false, err
 	}
 	if rows == 0 {
@@ -195,7 +204,7 @@ func readLeaseRecord(ctx context.Context, tx *sql.Tx) (leaseRecord, bool, error)
 		AND typeof(accepted_generation) = 'integer' AND typeof(accepted_nanos) = 'integer'
 		AND typeof(prepared_generation) IN ('integer', 'null')
 		AND typeof(prepared_nanos) IN ('integer', 'null') THEN 1 ELSE 0 END
-		FROM lease_recovery`).Scan(
+		FROM `+table).Scan(
 		&record.accepted.DatabaseID, &record.accepted.StateID,
 		&record.accepted.Generation, &record.accepted.MaxLease, &preparedGeneration, &preparedNanos, &valid)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -243,15 +252,18 @@ func (r *LeaseRecovery) fail(err error) error {
 }
 
 func (r *LeaseRecovery) finalize(ctx context.Context, next LeaseEvidence) error {
+	if r.file {
+		return r.finalizeFile(ctx, next, false)
+	}
 	err := r.store.mutate(ctx, func(tx *sql.Tx) error {
-		record, exists, err := readLeaseRecord(ctx, tx)
+		record, exists, err := readLeaseRecordTable(ctx, tx, r.table())
 		if err != nil {
 			return err
 		}
 		if !exists || record.prepared == nil || *record.prepared != next {
 			return fmt.Errorf("lease recovery preparation changed before acceptance: %w", syscall.EIO)
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE lease_recovery SET accepted_generation = ?,
+		_, err = tx.ExecContext(ctx, `UPDATE `+r.table()+` SET accepted_generation = ?,
 			accepted_nanos = ?, prepared_generation = NULL, prepared_nanos = NULL WHERE singleton = 1`,
 			next.Generation, int64(next.MaxLease))
 		return err
@@ -275,6 +287,10 @@ func (s *Store) MaxLease(ctx context.Context) (time.Duration, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	if err := s.coordinator.commit.acquire(ctx); err != nil {
+		return 0, err
+	}
+	defer s.coordinator.commit.release()
 	if err := s.coordinator.healthy(); err != nil {
 		return 0, err
 	}
@@ -291,6 +307,14 @@ func (s *Store) RaiseMaxLease(ctx context.Context, ttl time.Duration) error {
 	if err != nil {
 		return err
 	}
+	return r.raise(ctx, ttl)
+}
+
+func (r *LeaseRecovery) raise(ctx context.Context, ttl time.Duration) error {
+	if r.file {
+		return r.store.RaiseFileMaxLease(ctx, ttl)
+	}
+	s := r.store
 	if err := r.gate.acquire(ctx); err != nil {
 		return err
 	}
@@ -298,8 +322,13 @@ func (s *Store) RaiseMaxLease(ctx context.Context, ttl time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := s.coordinator.healthy(); err != nil {
+	if err := s.coordinator.commit.acquire(ctx); err != nil {
 		return err
+	}
+	healthErr := s.coordinator.healthy()
+	s.coordinator.commit.release()
+	if healthErr != nil {
+		return healthErr
 	}
 	if ttl <= r.state.MaxLease {
 		return nil
@@ -310,15 +339,15 @@ func (s *Store) RaiseMaxLease(ctx context.Context, ttl time.Duration) error {
 	next := r.state
 	next.Generation++
 	next.MaxLease = ttl
-	err = s.mutate(ctx, func(tx *sql.Tx) error {
-		record, exists, err := readLeaseRecord(ctx, tx)
+	err := s.mutate(ctx, func(tx *sql.Tx) error {
+		record, exists, err := readLeaseRecordTable(ctx, tx, r.table())
 		if err != nil {
 			return err
 		}
 		if !exists || record.accepted != r.state || record.prepared != nil {
 			return fmt.Errorf("lease recovery state changed before preparation: %w", syscall.EIO)
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE lease_recovery SET prepared_generation = ?,
+		_, err = tx.ExecContext(ctx, `UPDATE `+r.table()+` SET prepared_generation = ?,
 			prepared_nanos = ? WHERE singleton = 1`, next.Generation, int64(next.MaxLease))
 		return err
 	})
@@ -380,5 +409,6 @@ func OpenBoundDurableLeaseWithOptions(
 	mode VolumeOpenMode, startup DurableStartup, witness CommitWitness,
 ) (*Store, error) {
 	options.leaseRecoveryOwner = true
+	options.fileLeaseRecoveryOwner = true
 	return OpenBoundDurableWithOptions(ctx, database, volume, storeID, allowance, options, mode, startup, witness)
 }

@@ -162,7 +162,7 @@ func TestSemanticOperationRouting(t *testing.T) {
 	if operationFor(65535) != "" {
 		t.Fatal("unknown command authorized")
 	}
-	if operationFor(wire.Create) != storage.OpWindowsOpen || operationFor(wire.Write) != storage.OpWindowsWrite || operationFor(wire.Lock) != storage.OpWindowsLockBatch {
+	if operationFor(wire.Create) != storage.OpFileRetainAt || operationFor(wire.Write) != storage.OpFileWrite || operationFor(wire.Lock) != storage.OpFileReplaceRanges {
 		t.Fatal("wrong operation")
 	}
 }

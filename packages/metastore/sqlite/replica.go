@@ -1,11 +1,14 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"syscall"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
@@ -204,93 +207,153 @@ func (r *Replica) Apply(ctx context.Context, change metastore.Change) (bool, err
 }
 
 func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change) error {
-	// A change that does not describe an outcome is refused here as well as where it was
-	// decoded. What arrives is not always something a transport checked — a log read directly
-	// reaches this too — and the alternative to a refusal is a nil dereference that takes the
-	// mount down, or worse, a zero node recorded as a regular file of no length.
-	if wantNode := change.Kind != metastore.Removed; wantNode && change.Node == nil {
-		return fmt.Errorf("%w: the change carries no node, and its kind says what the name holds afterwards", syscall.EIO)
+	if err := metastore.ValidateNotification(change); err != nil {
+		return err
 	}
-	if change.Kind == metastore.Renamed && change.From == nil {
-		return fmt.Errorf("%w: the rename does not say where the node came from", syscall.EIO)
+	for _, image := range []*metastore.EventImage{change.Notification.Before, change.Notification.After} {
+		if image != nil && image.Location.RootNodeID != uint64(r.store.root) {
+			return fmt.Errorf("replicated event names a different root: %w", syscall.EIO)
+		}
 	}
-
-	switch change.Kind {
-	case metastore.Created:
+	if change.Kind == metastore.Created {
 		if err := dbstate.ObserveNewNodeID(ctx, tx, change.Node.ID); err != nil {
 			return err
 		}
+	}
+	maximum, err := metastore.NotificationIdentityHighWater(change.Notification)
+	if err != nil {
+		return err
+	}
+	if err := observeReplicaIdentities(ctx, tx, maximum); err != nil {
+		return err
+	}
+	switch change.Kind {
+	case metastore.Created:
 		if err := insertNode(ctx, tx, r.store.volume, *change.Node); err != nil {
 			return err
 		}
-		return insertEntry(ctx, tx, r.store.volume, change.Parent, change.Name, change.Node.ID)
-
+		at := replicaImageEntry(change.Notification.After)
+		return insertEntry(ctx, tx, r.store.volume, change.Parent, change.Name, change.Node.ID, at.EntryID)
 	case metastore.Modified:
+		if change.Notification.Before.Location.State == storage.LocationLinked {
+			if err := verifyReplicaEntry(ctx, tx, r.store.volume, replicaImageEntry(change.Notification.Before)); err != nil {
+				return err
+			}
+		}
 		return updateNode(ctx, tx, *change.Node)
-
 	case metastore.Removed:
-		id, err := entryNode(ctx, tx, r.store.volume, change.Parent, change.Name)
-		if err != nil {
+		at := replicaImageEntry(change.Notification.Before)
+		if err := verifyReplicaEntry(ctx, tx, r.store.volume, at); err != nil {
 			return err
 		}
 		if err := removeEntry(ctx, tx, r.store.volume, change.Parent, change.Name); err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, id)
-		return err
-
-	case metastore.Renamed:
-		// The entry is moved rather than rewritten in place, so that a directory arriving here
-		// carries everything beneath it: the nodes under it keep the parent they always had and
-		// none of their rows is touched. That is the property that made carrying the node in the
-		// change worth its cost, and it is the one a replica would give up if it discarded the
-		// subtree and asked for it again.
-		if err := removeEntry(ctx, tx, r.store.volume, change.From.Parent, change.From.Name); err != nil {
+		result, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE volume=? AND id=?`, r.store.volume, int64(at.NodeID))
+		if err != nil {
 			return err
 		}
-		if err := insertEntry(ctx, tx, r.store.volume, change.Parent, change.Name, change.Node.ID); err != nil {
+		return sqlvalue.ExactlyOne(result, fmt.Sprintf("removed node %d", at.NodeID))
+	case metastore.Renamed:
+		at := replicaImageEntry(change.Notification.Before)
+		if err := verifyReplicaEntry(ctx, tx, r.store.volume, at); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE entries SET parent=?,name=? WHERE volume=? AND id=?`, change.Parent, change.Name, r.store.volume, int64(at.EntryID))
+		if err != nil {
+			return err
+		}
+		if err := sqlvalue.ExactlyOne(result, fmt.Sprintf("renamed entry %d", at.EntryID)); err != nil {
 			return err
 		}
 		return updateNode(ctx, tx, *change.Node)
 	}
-	return fmt.Errorf("%w: the change is of kind %d, which this build has no meaning for",
-		syscall.EIO, change.Kind)
+	return fmt.Errorf("unknown replicated change kind: %w", syscall.EIO)
+}
+
+func replicaImageEntry(image *metastore.EventImage) storage.EntryCondition {
+	return image.Location.Ancestors[len(image.Location.Ancestors)-1]
+}
+
+func verifyReplicaEntry(ctx context.Context, tx *sql.Tx, volume int64, expected storage.EntryCondition) error {
+	var entry, node int64
+	err := tx.QueryRowContext(ctx, `SELECT id,node FROM entries WHERE volume=? AND parent=? AND name=?`, volume, int64(expected.ParentID), expected.Name).Scan(&entry, &node)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && (entry != int64(expected.EntryID) || node != int64(expected.NodeID)) {
+		return fmt.Errorf("replicated entry no longer identifies the expected node: %w", syscall.EIO)
+	}
+	return err
+}
+
+func observeReplicaIdentities(ctx context.Context, tx *sql.Tx, maximum int64) error {
+	state, err := dbstate.Read(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if maximum > state.NodeHighWater {
+		return dbstate.ObserveNewNodeID(ctx, tx, maximum)
+	}
+	return nil
 }
 
 // --- the rows a copy is made of ---------------------------------------------------------
 
 // insertNode records a node under the id it arrived with. Its content key is dropped: see
 // the type's own comment for why a copy holds no keys.
-func insertNode(ctx context.Context, tx *sql.Tx, volume int64, node metastore.Node) error {
+func replicaNodeValues(node metastore.Node) ([]any, error) {
+	if node.ID <= 0 || node.Attr().Check() != nil || len(node.LinkTarget) > storage.MaxLinkTargetBytes || node.Kind != storage.NodeSymlink && len(node.LinkTarget) != 0 || node.Kind == storage.NodeSymlink && node.Size != int64(len(node.LinkTarget)) {
+		return nil, fmt.Errorf("invalid replicated node facts: %w", syscall.EIO)
+	}
+	metadata, err := storage.EncodeMetadata(node.Metadata)
+	if err != nil {
+		return nil, err
+	}
 	accessSec, accessNsec := sqlvalue.StoredTime(node.AccessTime)
-	changeSec, changeNsec := sqlvalue.StoredTime(node.ModTime)
-	_, err := tx.ExecContext(ctx, `
-		INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-		node.ID, volume, int64(node.Mode), node.Size, accessSec, accessNsec, changeSec, changeNsec)
+	modifiedSec, modifiedNsec := sqlvalue.StoredTime(node.ModTime)
+	creationSec, creationNsec := replicaOptionalTime(node.CreationTime)
+	changeSec, changeNsec := replicaOptionalTime(node.ChangeTime)
+	return []any{int64(node.Kind), node.Size, accessSec, accessNsec, modifiedSec, modifiedNsec,
+		creationSec, creationNsec, changeSec, changeNsec, int64(node.MetadataRevision), int64(node.DirectoryRevision), metadata, append([]byte{}, node.LinkTarget...)}, nil
+}
+
+func replicaOptionalTime(value *time.Time) (any, any) {
+	if value == nil {
+		return nil, nil
+	}
+	seconds, nanos := sqlvalue.StoredTime(*value)
+	return seconds, nanos
+}
+
+func insertNode(ctx context.Context, tx *sql.Tx, volume int64, node metastore.Node) error {
+	values, err := replicaNodeValues(node)
+	if err != nil {
+		return err
+	}
+	args := append([]any{node.ID, volume}, values...)
+	_, err = tx.ExecContext(ctx, `INSERT INTO nodes
+ (id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,creation_sec,creation_nsec,change_sec,change_nsec,metadata_revision,directory_revision,metadata,link_target,content)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)`, args...)
 	return err
 }
 
-// updateNode replaces what a copy holds about a node it already has, and refuses to be a
-// statement about a node it does not.
 func updateNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
-	accessSec, accessNsec := sqlvalue.StoredTime(node.AccessTime)
-	changeSec, changeNsec := sqlvalue.StoredTime(node.ModTime)
-	result, err := tx.ExecContext(ctx, `
-		UPDATE nodes SET mode = ?, size = ?, atime_sec = ?, atime_nsec = ?, mtime_sec = ?, mtime_nsec = ?
-		WHERE id = ?`,
-		int64(node.Mode), node.Size, accessSec, accessNsec, changeSec, changeNsec, node.ID)
+	values, err := replicaNodeValues(node)
+	if err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE nodes SET kind=?,size=?,atime_sec=?,atime_nsec=?,mtime_sec=?,mtime_nsec=?,creation_sec=?,creation_nsec=?,change_sec=?,change_nsec=?,metadata_revision=?,directory_revision=?,metadata=?,link_target=? WHERE id=?`, append(values, node.ID)...)
 	if err != nil {
 		return err
 	}
 	return sqlvalue.ExactlyOne(result, fmt.Sprintf("node %d, which this copy does not hold", node.ID))
 }
 
-func insertEntry(ctx context.Context, tx *sql.Tx, volume, parent int64, name []byte, node int64) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO entries (volume, parent, name, node) VALUES (?, ?, ?, ?)`,
-		volume, parent, name, node)
+func insertEntry(ctx context.Context, tx *sql.Tx, volume, parent int64, name []byte, node int64, entry storage.EntryID) error {
+	if parent <= 0 || entry == 0 || uint64(entry) > math.MaxInt64 || len(name) == 0 || len(name) > storage.MaxEntryNameBytes || bytes.IndexByte(name, 0) >= 0 || bytes.IndexByte(name, '/') >= 0 || bytes.Equal(name, []byte(".")) || bytes.Equal(name, []byte("..")) {
+		return fmt.Errorf("invalid replicated entry facts: %w", syscall.EIO)
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO entries(volume,parent,name,node,id) VALUES(?,?,?,?,?)`, volume, parent, name, node, int64(entry))
 	if err != nil && sqlerr.IsUniqueViolation(err) {
-		return fmt.Errorf("%w: %q under node %d is already taken in this copy", syscall.EIO, name, parent)
+		return fmt.Errorf("replicated name or entry identity is already present: %w", syscall.EIO)
 	}
 	return err
 }
@@ -302,20 +365,6 @@ func removeEntry(ctx context.Context, tx *sql.Tx, volume, parent int64, name []b
 		return err
 	}
 	return sqlvalue.ExactlyOne(result, fmt.Sprintf("%q under node %d, which this copy does not hold", name, parent))
-}
-
-func entryNode(ctx context.Context, tx *sql.Tx, volume, parent int64, name []byte) (int64, error) {
-	var id int64
-	switch err := tx.QueryRowContext(ctx,
-		`SELECT node FROM entries WHERE volume = ? AND parent = ? AND name = ?`,
-		volume, parent, name).Scan(&id); {
-	case errors.Is(err, sql.ErrNoRows):
-		return 0, fmt.Errorf("%w: the change names %q under node %d, which this copy does not hold",
-			syscall.EIO, name, parent)
-	case err != nil:
-		return 0, err
-	}
-	return id, nil
 }
 
 // --- filling a copy from a picture -------------------------------------------------------
@@ -408,11 +457,25 @@ func (s *Seeding) empty(ctx context.Context) error {
 
 // Add records one page of the picture.
 func (s *Seeding) Add(ctx context.Context, rows []metastore.Row) error {
+	if s.done {
+		return fmt.Errorf("snapshot is already settled: %w", syscall.EINVAL)
+	}
+	maximum := s.maxNodeID
+	for _, row := range rows {
+		if row.Node.ID <= 0 || row.Parent < 0 || uint64(row.EntryID) > math.MaxInt64 {
+			return fmt.Errorf("invalid snapshot identity: %w", syscall.EIO)
+		}
+		maximum = max(maximum, row.Node.ID, row.Parent, int64(row.EntryID))
+	}
+	if err := observeReplicaIdentities(ctx, s.tx, maximum); err != nil {
+		return fmt.Errorf("observing snapshot identities: %w", err)
+	}
 	for _, row := range rows {
 		if err := s.add(ctx, row); err != nil {
 			return fmt.Errorf("filling the copy: %w", sqlerr.Failure(err))
 		}
 	}
+	s.maxNodeID = maximum
 	return nil
 }
 
@@ -427,13 +490,16 @@ func (s *Seeding) add(ctx context.Context, row metastore.Row) error {
 	// Parent 0 and no name is how a picture names the one node that has neither. Nothing else
 	// can carry parent 0, since every other row names a node, and ids begin at one.
 	if row.Parent == 0 && row.Name == nil {
+		if row.EntryID != 0 || row.Node.Kind != storage.NodeDirectory {
+			return fmt.Errorf("snapshot root has an entry or is not a directory: %w", syscall.EIO)
+		}
 		if s.root != 0 {
 			return fmt.Errorf("%w: the picture carries two nodes with no parent, %d and %d", syscall.EIO, s.root, row.Node.ID)
 		}
 		s.root = row.Node.ID
 		return nil
 	}
-	return insertEntry(ctx, s.tx, s.replica.store.volume, row.Parent, row.Name, row.Node.ID)
+	return insertEntry(ctx, s.tx, s.replica.store.volume, row.Parent, row.Name, row.Node.ID, row.EntryID)
 }
 
 // Complete records that the picture was whole and that the copy stands at the position it was
@@ -451,19 +517,16 @@ func (s *Seeding) Complete(ctx context.Context, at metastore.Position) error {
 		s.root, s.replica.store.volume); err != nil {
 		return fmt.Errorf("completing the copy: %w", sqlerr.Failure(err))
 	}
-	highWater := max(s.nodeHighWater, s.maxNodeID)
-	if _, err := s.tx.ExecContext(ctx,
-		`UPDATE database_state SET node_high_water = ? WHERE singleton = 1`, highWater,
-	); err != nil {
+	if err := s.validateTree(ctx); err != nil {
 		return fmt.Errorf("completing the copy: %w", sqlerr.Failure(err))
 	}
+	highWater := max(s.nodeHighWater, s.maxNodeID)
 	sequence, err := dbstate.SequenceValue(ctx, s.tx, "nodes")
 	if err != nil {
 		return fmt.Errorf("completing the copy: %w", sqlerr.Failure(err))
 	}
 	if sequence != highWater {
-		return fmt.Errorf("completing the copy: SQLite node sequence %d does not match observed high-water %d: %w",
-			sequence, highWater, syscall.EIO)
+		return fmt.Errorf("replica identity sequence %d differs from imported high-water %d: %w", sequence, highWater, syscall.EIO)
 	}
 	state, err := dbstate.AdvanceGeneration(ctx, s.tx)
 	if err != nil {
@@ -494,6 +557,28 @@ func (s *Seeding) Complete(ctx context.Context, at metastore.Position) error {
 	s.replica.store.root = s.root
 	s.replica.at = at
 	s.settle()
+	return nil
+}
+
+func (s *Seeding) validateTree(ctx context.Context) error {
+	var invalid int64
+	if err := s.tx.QueryRowContext(ctx, `SELECT count(*) FROM entries e
+ LEFT JOIN nodes p ON p.id=e.parent LEFT JOIN nodes n ON n.id=e.node
+ WHERE e.volume=? AND (p.id IS NULL OR n.id IS NULL OR p.volume!=e.volume OR n.volume!=e.volume OR p.kind!=? OR n.id=?)`, s.replica.store.volume, int64(storage.NodeDirectory), s.root).Scan(&invalid); err != nil {
+		return err
+	}
+	if invalid != 0 {
+		return fmt.Errorf("snapshot has invalid directory relationships: %w", syscall.EIO)
+	}
+	var total, reachable int64
+	if err := s.tx.QueryRowContext(ctx, `WITH RECURSIVE reachable(id) AS (
+ SELECT ? UNION SELECT e.node FROM entries e JOIN reachable r ON e.parent=r.id WHERE e.volume=?
+ ) SELECT (SELECT count(*) FROM nodes WHERE volume=?),(SELECT count(*) FROM reachable)`, s.root, s.replica.store.volume, s.replica.store.volume).Scan(&total, &reachable); err != nil {
+		return err
+	}
+	if total != reachable {
+		return fmt.Errorf("snapshot contains nodes outside its rooted tree: %w", syscall.EIO)
+	}
 	return nil
 }
 

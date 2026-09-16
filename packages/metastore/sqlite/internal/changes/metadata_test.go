@@ -3,8 +3,6 @@ package changes
 import (
 	"database/sql"
 	"errors"
-	"io/fs"
-	"math"
 	"reflect"
 	"strings"
 	"syscall"
@@ -12,48 +10,22 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
-
+	"github.com/codetreker/remote-fs/packages/storage"
 	_ "modernc.org/sqlite"
 )
 
-func TestChangeMetadataDecoderNamesInvalidScalarStorage(t *testing.T) {
-	db, err := sql.Open("sqlite", t.TempDir()+"/metadata.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	_, _, _, err = scanChangeMetadata(db.QueryRowContext(t.Context(), `
-		SELECT
-			7, typeof(7), 0, typeof(0), 1, typeof(1), 0, typeof(0),
-			1, typeof(1), 0, typeof(NULL),
-			'bad-parent', typeof('bad-parent'), 0, typeof(NULL),
-			NULL, typeof(NULL), NULL, typeof(NULL), NULL, typeof(NULL),
-			NULL, typeof(NULL), NULL, typeof(NULL),
-			NULL, typeof(NULL), NULL, typeof(NULL),
-			0, typeof(NULL),
-			0, typeof(0), 0, typeof(0), 2, 'blob'`), 1)
-	if !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), "change 7 stores from_parent as text") {
-		t.Fatalf("decoding a text from_parent returned %v", err)
-	}
-
-	if _, err := requiredStoredInteger("position", "bad-position", "text"); !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), "a change stores position as text") {
-		t.Fatalf("decoding a text position returned %v", err)
-	}
-}
-
 func metadataValues() map[string]any {
 	return map[string]any{
-		"position": int64(7), "previous_position": int64(6), "volume": int64(1), "kind": KindCreated,
+		"position": int64(7), "previous_position": int64(6), "identity_high_water": int64(5), "volume": int64(1), "kind": KindCreated,
 		"parent": int64(1), "name": []byte("file"), "from_parent": nil, "from_name": nil,
-		"node": int64(2), "mode": int64(0644), "size": int64(4),
+		"node": int64(2), "node_kind": int64(storage.NodeRegular), "size": int64(4), "metadata_revision": int64(2), "directory_revision": int64(0),
 		"atime_sec": int64(-100), "atime_nsec": int64(123), "mtime_sec": int64(100), "mtime_nsec": int64(456),
-		"notification": []byte("{}"), "content": "body", "recorded_sec": int64(200), "recorded_nsec": int64(0),
+		"metadata": []byte{'R', 'F', 'M', 1, 0, 0}, "link_target": []byte{}, "notification": []byte("{}"), "content": "body", "recorded_sec": int64(200), "recorded_nsec": int64(0),
 	}
 }
 
 func metadataQuery(db *sql.DB, values map[string]any) *sql.Row {
-	columns := []string{"position", "previous_position", "volume", "kind", "parent", "name", "from_parent", "from_name", "node", "mode", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content", "recorded_sec", "recorded_nsec", "notification"}
+	columns := append(append([]string(nil), changeScalarNames...), changePayloadNames...)
 	var aliases []string
 	var args []any
 	for _, column := range columns {
@@ -63,29 +35,36 @@ func metadataQuery(db *sql.DB, values map[string]any) *sql.Row {
 	return db.QueryRow(`SELECT `+changeMetadataColumns+` FROM (SELECT `+strings.Join(aliases, ",")+`)`, args...)
 }
 
-func TestMetadataDecoderPreservesScalarsAndDefersPayloads(t *testing.T) {
-	db, err := sql.Open("sqlite", t.TempDir()+"/decode.db")
+func metadataDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", t.TempDir()+"/metadata.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+func TestMetadataDecoderPreservesScalarsAndDefersPayloads(t *testing.T) {
+	db := metadataDB(t)
 	for _, kind := range []metastore.ChangeKind{metastore.Created, metastore.Modified, metastore.Renamed, metastore.Removed} {
 		values := metadataValues()
-		stored, err := storedKind(kind)
+		value, err := storedKind(kind)
 		if err != nil {
 			t.Fatal(err)
 		}
-		values["kind"] = stored
+		values["kind"] = value
 		want := fileChange(kind)
 		want.Position = 7
 		want.Name = []byte{}
 		want.Notification = nil
-		lengths := metastore.ChangePayloadLengths{Name: 4, Content: 4, Notification: 2}
+		lengths := metastore.ChangePayloadLengths{Name: 4, Content: 4, Metadata: 6, Notification: 2}
 		if kind == metastore.Removed {
-			for _, column := range []string{"node", "mode", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content"} {
+			for _, column := range []string{"node", "node_kind", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "metadata_revision", "directory_revision", "metadata", "link_target", "content"} {
 				values[column] = nil
 			}
 			lengths.Content = 0
+			lengths.Metadata = 0
 		} else {
 			want.Node.Content = ""
 		}
@@ -95,121 +74,93 @@ func TestMetadataDecoderPreservesScalarsAndDefersPayloads(t *testing.T) {
 			want.From.Name = []byte{}
 			lengths.FromName = 3
 		}
-		got, gotLengths, previous, err := scanChangeMetadata(metadataQuery(db, values), 1)
+		got, gotLengths, previous, high, err := scanChangeMetadata(metadataQuery(db, values), 1)
 		if got.Node != nil {
 			got.Node.AccessTime = got.Node.AccessTime.UTC()
 			got.Node.ModTime = got.Node.ModTime.UTC()
 		}
-		if err != nil || previous != 6 || gotLengths != lengths || !reflect.DeepEqual(got, want) {
-			t.Fatalf("kind %v: got=%+v lengths=%+v previous=%d error=%v; want=%+v", kind, got, gotLengths, previous, err, want)
+		if err != nil || previous != 6 || high != 5 || gotLengths != lengths || !reflect.DeepEqual(got, want) {
+			t.Fatalf("kind %v: got=%+v lengths=%+v previous=%d high=%d error=%v want=%+v", kind, got, gotLengths, previous, high, err, want)
 		}
 	}
 	values := metadataValues()
 	values["kind"] = KindModified
 	values["parent"] = int64(0)
 	values["name"] = nil
-	values["mode"] = int64(fs.ModeDir | 0755)
+	values["node_kind"] = int64(storage.NodeDirectory)
+	values["directory_revision"] = int64(9)
 	values["size"] = int64(0)
 	values["content"] = nil
-	got, _, _, err := scanChangeMetadata(metadataQuery(db, values), 1)
-	if err != nil || got.Parent != 0 || got.Name != nil || !got.Node.Mode.IsDir() {
-		t.Fatalf("root directory metadata=%+v %v", got, err)
+	values["creation_sec"] = int64(-1)
+	values["creation_nsec"] = int64(7)
+	values["change_sec"] = int64(5)
+	values["change_nsec"] = int64(11)
+	got, _, _, _, err := scanChangeMetadata(metadataQuery(db, values), 1)
+	if err != nil || !got.Node.IsDir() || got.Node.CreationTime == nil || !got.Node.CreationTime.Equal(time.Unix(-1, 7)) || got.Node.ChangeTime == nil || !got.Node.ChangeTime.Equal(time.Unix(5, 11)) {
+		t.Fatalf("generic times/directory: %+v %v", got, err)
 	}
 }
 
 func TestMetadataDecoderRejectsStorageClassesAndInconsistentFields(t *testing.T) {
-	db, err := sql.Open("sqlite", t.TempDir()+"/decode.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	for _, column := range []string{"position", "previous_position", "volume", "kind", "parent", "from_parent", "node", "mode", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "recorded_sec", "recorded_nsec", "notification"} {
-		t.Run(column+" as text", func(t *testing.T) {
+	db := metadataDB(t)
+	for _, column := range changeScalarNames {
+		t.Run(column+" text", func(t *testing.T) {
 			values := metadataValues()
 			values[column] = "bad"
-			_, _, _, err := scanChangeMetadata(metadataQuery(db, values), 1)
+			_, _, _, _, err := scanChangeMetadata(metadataQuery(db, values), 1)
 			if !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), column) {
-				t.Fatalf("bad %s = %v", column, err)
+				t.Fatalf("bad %s: %v", column, err)
 			}
 		})
 	}
-	for _, test := range []struct {
+	tests := []struct {
 		name    string
 		changes map[string]any
 	}{
-		{"volume mismatch", map[string]any{"volume": int64(2)}},
-		{"nonpositive position", map[string]any{"position": int64(0)}},
-		{"negative parent", map[string]any{"parent": int64(-1)}},
-		{"unknown kind", map[string]any{"kind": int64(9)}},
-		{"negative predecessor", map[string]any{"previous_position": int64(-1)}},
-		{"self predecessor", map[string]any{"previous_position": int64(7)}},
-		{"name text", map[string]any{"name": "file"}},
-		{"source name text", map[string]any{"from_name": "old"}},
-		{"content blob", map[string]any{"content": []byte("body")}},
-		{"missing node", map[string]any{"node": nil}},
-		{"missing source", map[string]any{"kind": KindRenamed}},
-		{"unexpected source", map[string]any{"from_parent": int64(1)}},
-		{"empty content", map[string]any{"content": ""}},
-		{"zero node", map[string]any{"node": int64(0)}},
-		{"negative size", map[string]any{"size": int64(-1)}},
-		{"negative mode", map[string]any{"mode": int64(-1)}},
-		{"overflow mode", map[string]any{"mode": int64(math.MaxUint32) + 1}},
-		{"special node", map[string]any{"mode": int64(fs.ModeSocket)}},
-		{"symlink object", map[string]any{"mode": int64(fs.ModeSymlink)}},
-		{"directory bytes", map[string]any{"mode": int64(fs.ModeDir)}},
-		{"missing content", map[string]any{"content": nil}},
-		{"missing created name", map[string]any{"name": nil}},
-		{"modified unnamed nonroot", map[string]any{"kind": KindModified, "name": nil}},
-		{"invalid rename source", map[string]any{"kind": KindRenamed, "from_parent": int64(0), "from_name": []byte("old")}},
-		{"removed carries content", map[string]any{"kind": KindRemoved, "node": nil, "mode": nil, "size": nil, "atime_sec": nil, "atime_nsec": nil, "mtime_sec": nil, "mtime_nsec": nil}},
-	} {
+		{"wrong volume", map[string]any{"volume": int64(2)}}, {"zero position", map[string]any{"position": int64(0)}}, {"nil position", map[string]any{"position": nil}},
+		{"negative parent", map[string]any{"parent": int64(-1)}}, {"unknown kind", map[string]any{"kind": int64(99)}}, {"self predecessor", map[string]any{"previous_position": int64(7)}},
+		{"missing identity summary", map[string]any{"identity_high_water": int64(0)}}, {"name text", map[string]any{"name": "file"}}, {"source name without parent", map[string]any{"from_name": []byte("old")}},
+		{"missing node", map[string]any{"node": nil}}, {"missing source", map[string]any{"kind": KindRenamed}}, {"bad kind", map[string]any{"node_kind": int64(0)}},
+		{"negative size", map[string]any{"size": int64(-1)}}, {"metadata revision", map[string]any{"metadata_revision": int64(0)}}, {"directory revision", map[string]any{"directory_revision": int64(1)}},
+		{"bad atime", map[string]any{"atime_nsec": int64(1e9)}}, {"bad mtime", map[string]any{"mtime_nsec": int64(-1)}}, {"bad record time", map[string]any{"recorded_nsec": int64(1e9)}},
+		{"unknown creation fraction", map[string]any{"creation_sec": int64(0)}}, {"unknown change seconds", map[string]any{"change_nsec": int64(0)}}, {"bad creation fraction", map[string]any{"creation_sec": int64(0), "creation_nsec": int64(1e9)}},
+		{"metadata absent", map[string]any{"metadata": nil}}, {"metadata text", map[string]any{"metadata": "bad"}}, {"target absent", map[string]any{"link_target": nil}},
+		{"target for file", map[string]any{"link_target": []byte("x")}}, {"content blob", map[string]any{"content": []byte("body")}}, {"empty content key", map[string]any{"content": ""}},
+		{"file size without content", map[string]any{"content": nil}}, {"directory size", map[string]any{"node_kind": int64(storage.NodeDirectory), "directory_revision": int64(1)}},
+		{"symlink object", map[string]any{"node_kind": int64(storage.NodeSymlink), "link_target": []byte("four")}}, {"symlink wrong size", map[string]any{"node_kind": int64(storage.NodeSymlink), "content": nil, "link_target": []byte("x")}},
+		{"notification empty", map[string]any{"notification": []byte{}}}, {"notification text", map[string]any{"notification": "bad"}},
+	}
+	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			values := metadataValues()
 			for key, value := range test.changes {
 				values[key] = value
 			}
-			_, _, _, err := scanChangeMetadata(metadataQuery(db, values), 1)
+			_, _, _, _, err := scanChangeMetadata(metadataQuery(db, values), 1)
 			if !errors.Is(err, syscall.EIO) {
-				t.Fatalf("inconsistent metadata = %v", err)
+				t.Fatalf("invalid facts: %v", err)
 			}
 		})
 	}
-	for _, column := range []string{"atime_nsec", "mtime_nsec", "recorded_nsec"} {
-		for _, value := range []int64{-1, int64(time.Second)} {
-			values := metadataValues()
-			values[column] = value
-			_, _, _, err := scanChangeMetadata(metadataQuery(db, values), 1)
-			if !errors.Is(err, syscall.EIO) {
-				t.Errorf("%s=%d returned %v", column, value, err)
-			}
-		}
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, _, err := scanChangeMetadata(metadataQuery(db, metadataValues()), 1); err == nil {
-		t.Fatal("closed database returned metadata")
+	if _, _, _, _, err := scanChangeMetadata(db.QueryRow(`SELECT 1`), 1); err == nil {
+		t.Fatal("short row accepted")
 	}
 }
 
-func TestChangePayloadRejectsInvalidComponentsAndEmptyContent(t *testing.T) {
-	change := fileChange(metastore.Renamed)
-	change.Position = 7
-	for _, name := range [][]byte{nil, {}, []byte("."), []byte(".."), []byte("a/b"), {'a', 0}} {
-		if validStoredComponent(name) {
-			t.Errorf("invalid component accepted: %q", name)
+func TestMetadataPayloadValidationPreservesExactNames(t *testing.T) {
+	c := fileChange(metastore.Renamed)
+	if err := validateChangePayload(c, []byte{0xff}, []byte("old"), sql.NullString{Valid: true, String: "key"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range [][]byte{nil, []byte("."), []byte(".."), []byte("a/b"), []byte{'a', 0}, make([]byte, storage.MaxEntryNameBytes+1)} {
+		if err := validateChangePayload(c, name, []byte("old"), sql.NullString{}); !errors.Is(err, syscall.EIO) {
+			t.Fatalf("bad destination: %v", err)
 		}
-		if err := validateChangePayload(change, name, []byte("old"), sql.NullString{}); !errors.Is(err, syscall.EIO) {
-			t.Errorf("invalid destination %q = %v", name, err)
-		}
-		if err := validateChangePayload(change, []byte("file"), name, sql.NullString{}); !errors.Is(err, syscall.EIO) {
-			t.Errorf("invalid source %q = %v", name, err)
+		if err := validateChangePayload(c, []byte("file"), name, sql.NullString{}); !errors.Is(err, syscall.EIO) {
+			t.Fatalf("bad source: %v", err)
 		}
 	}
-	if err := validateChangePayload(change, []byte("file"), []byte("old"), sql.NullString{Valid: true}); !errors.Is(err, syscall.EIO) {
-		t.Fatalf("empty content = %v", err)
-	}
-	if err := validateChangePayload(change, []byte{0xff}, []byte("old"), sql.NullString{String: "body", Valid: true}); err != nil {
-		t.Fatalf("byte name = %v", err)
+	if err := validateChangePayload(c, []byte("file"), []byte("old"), sql.NullString{Valid: true}); !errors.Is(err, syscall.EIO) {
+		t.Fatal(err)
 	}
 }

@@ -19,8 +19,9 @@ const (
 
 type durableMetastore struct {
 	*sqlite.Store
-	witness     *metastoreWitness
-	leaseAnchor *sqlite.LeaseAnchor
+	witness         *metastoreWitness
+	leaseAnchor     *sqlite.LeaseAnchor
+	fileLeaseAnchor *sqlite.LeaseAnchor
 
 	stop context.CancelFunc
 	done chan struct{}
@@ -177,6 +178,9 @@ func (d *durableMetastore) Close() error {
 	if err == nil && d.leaseAnchor != nil {
 		err = d.leaseAnchor.Close()
 	}
+	if err == nil && d.fileLeaseAnchor != nil {
+		err = d.fileLeaseAnchor.Close()
+	}
 
 	d.mu.Lock()
 	if err == nil || d.Store.Terminal() {
@@ -215,6 +219,9 @@ func (d *durableMetastore) abortUnexposed() error {
 	err := d.Store.Abort()
 	if err == nil && d.leaseAnchor != nil {
 		err = d.leaseAnchor.Close()
+	}
+	if err == nil && d.fileLeaseAnchor != nil {
+		err = d.fileLeaseAnchor.Close()
 	}
 	d.mu.Lock()
 	if d.Store.Terminal() {

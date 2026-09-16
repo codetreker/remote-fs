@@ -4,184 +4,191 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
-	"io/fs"
-	"math"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// changeMetadataColumns carries every scalar beside its SQLite storage class and only the
-// lengths of variable payloads. We validate those facts before asking SQLite to copy a
-// BLOB or TEXT value into Go memory.
-const changeMetadataColumns = `
-	CASE WHEN typeof(position) = 'integer' THEN position END, typeof(position),
-	CASE WHEN typeof(previous_position) = 'integer' THEN previous_position END, typeof(previous_position),
-	CASE WHEN typeof(volume) = 'integer' THEN volume END, typeof(volume),
-	CASE WHEN typeof(kind) = 'integer' THEN kind END, typeof(kind),
-	CASE WHEN typeof(parent) = 'integer' THEN parent END, typeof(parent),
-	COALESCE(length(CAST(name AS BLOB)), 0), typeof(name),
-	CASE WHEN typeof(from_parent) IN ('integer', 'null') THEN from_parent END, typeof(from_parent),
-	COALESCE(length(CAST(from_name AS BLOB)), 0), typeof(from_name),
-	CASE WHEN typeof(node) IN ('integer', 'null') THEN node END, typeof(node),
-	CASE WHEN typeof(mode) IN ('integer', 'null') THEN mode END, typeof(mode),
-	CASE WHEN typeof(size) IN ('integer', 'null') THEN size END, typeof(size),
-	CASE WHEN typeof(atime_sec) IN ('integer', 'null') THEN atime_sec END, typeof(atime_sec),
-	CASE WHEN typeof(atime_nsec) IN ('integer', 'null') THEN atime_nsec END, typeof(atime_nsec),
-	CASE WHEN typeof(mtime_sec) IN ('integer', 'null') THEN mtime_sec END, typeof(mtime_sec),
-	CASE WHEN typeof(mtime_nsec) IN ('integer', 'null') THEN mtime_nsec END, typeof(mtime_nsec),
-	COALESCE(length(CAST(content AS BLOB)), 0), typeof(content),
-	CASE WHEN typeof(recorded_sec) = 'integer' THEN recorded_sec END, typeof(recorded_sec),
-	CASE WHEN typeof(recorded_nsec) = 'integer' THEN recorded_nsec END, typeof(recorded_nsec),
- COALESCE(length(notification),0), typeof(notification)`
+var changeScalarNames = []string{"position", "previous_position", "identity_high_water", "volume", "kind", "parent", "from_parent", "node", "node_kind", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "creation_sec", "creation_nsec", "change_sec", "change_nsec", "metadata_revision", "directory_revision", "recorded_sec", "recorded_nsec"}
+var changePayloadNames = []string{"name", "from_name", "content", "metadata", "link_target", "notification"}
 
-type rowScanner interface {
-	Scan(dest ...any) error
+// Scalar classes and payload lengths are admitted before SQLite copies any
+// variable-length value into the result.
+var changeMetadataColumns = func() string {
+	var columns []string
+	for _, name := range changeScalarNames {
+		columns = append(columns, "CASE WHEN typeof("+name+")='integer' THEN "+name+" END", "typeof("+name+")")
+	}
+	for _, name := range changePayloadNames {
+		columns = append(columns, "COALESCE(length(CAST("+name+" AS BLOB)),0)", "typeof("+name+")")
+	}
+	return strings.Join(columns, ",")
+}()
+
+type rowScanner interface{ Scan(...any) error }
+
+type storedChangeScalar struct {
+	raw   any
+	class string
 }
 
-func scanChangeMetadata(
-	row rowScanner,
-	expectedVolume int64,
-) (metastore.Change, metastore.ChangePayloadLengths, int64, error) {
-	var (
-		notificationType                                             string
-		positionRaw, previousRaw, volumeRaw, kindRaw, parentRaw      any
-		fromParentRaw, idRaw, modeRaw, sizeRaw                       any
-		atimeSecRaw, atimeNsecRaw, mtimeSecRaw, mtimeNsecRaw         any
-		recordedSecRaw, recordedNsecRaw                              any
-		positionType, previousType, volumeType, kindType, parentType string
-		nameType, fromParentType, fromNameType                       string
-		idType, modeType, sizeType                                   string
-		atimeSecType, atimeNsecType, mtimeSecType, mtimeNsecType     string
-		contentType, recordedSecType, recordedNsecType               string
-		lengths                                                      metastore.ChangePayloadLengths
-	)
-	if err := row.Scan(
-		&positionRaw, &positionType, &previousRaw, &previousType,
-		&volumeRaw, &volumeType, &kindRaw, &kindType,
-		&parentRaw, &parentType, &lengths.Name, &nameType,
-		&fromParentRaw, &fromParentType, &lengths.FromName, &fromNameType,
-		&idRaw, &idType, &modeRaw, &modeType, &sizeRaw, &sizeType,
-		&atimeSecRaw, &atimeSecType, &atimeNsecRaw, &atimeNsecType,
-		&mtimeSecRaw, &mtimeSecType, &mtimeNsecRaw, &mtimeNsecType,
-		&lengths.Content, &contentType,
-		&recordedSecRaw, &recordedSecType, &recordedNsecRaw, &recordedNsecType,
-		&lengths.Notification, &notificationType,
-	); err != nil {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
+func scanChangeMetadata(row rowScanner, expectedVolume int64) (metastore.Change, metastore.ChangePayloadLengths, int64, int64, error) {
+	scalars := make([]storedChangeScalar, len(changeScalarNames))
+	var payloadLengths [6]int64
+	var payloadTypes [6]string
+	var destinations []any
+	for i := range scalars {
+		destinations = append(destinations, &scalars[i].raw, &scalars[i].class)
 	}
-	if notificationType != "blob" || lengths.Notification <= 0 {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, fmt.Errorf("invalid notification storage: %w", syscall.EIO)
+	for i := range payloadLengths {
+		destinations = append(destinations, &payloadLengths[i], &payloadTypes[i])
 	}
-	if lengths.Notification > metastore.MaxNotificationBytes {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, fmt.Errorf("notification exceeds byte bound: %w", syscall.EFBIG)
+	empty := metastore.Change{}
+	lengths := metastore.ChangePayloadLengths{}
+	if err := row.Scan(destinations...); err != nil {
+		return empty, lengths, 0, 0, err
 	}
+	lengths = metastore.ChangePayloadLengths{Name: payloadLengths[0], FromName: payloadLengths[1], Content: payloadLengths[2], Metadata: payloadLengths[3], Target: payloadLengths[4], Notification: payloadLengths[5]}
 	if err := lengths.Check(); err != nil {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
+		return empty, lengths, 0, 0, err
 	}
-	position, err := requiredStoredInteger("position", positionRaw, positionType)
+	if payloadTypes[5] != "blob" || lengths.Notification <= 0 {
+		return empty, lengths, 0, 0, fmt.Errorf("invalid notification storage: %w", syscall.EIO)
+	}
+	values := make(map[string]sql.NullInt64, len(scalars))
+	for i := range scalars {
+		value, ok := nullableStoredInteger(scalars[i].raw, scalars[i].class)
+		if !ok {
+			return empty, lengths, 0, 0, invalidStoredChangeScalar(values["position"].Int64, changeScalarNames[i], scalars[i].class)
+		}
+		values[changeScalarNames[i]] = value
+	}
+	for _, name := range []string{"position", "previous_position", "identity_high_water", "volume", "kind", "parent", "recorded_sec", "recorded_nsec"} {
+		if !values[name].Valid {
+			return empty, lengths, 0, 0, invalidStoredChangeScalar(0, name, "null")
+		}
+	}
+	position, previous, volume := values["position"].Int64, values["previous_position"].Int64, values["volume"].Int64
+	parent := values["parent"].Int64
+	if values["identity_high_water"].Int64 <= 0 || position <= 0 || previous < 0 || previous >= position || volume <= 0 || expectedVolume != 0 && volume != expectedVolume || parent < 0 || !validNanosecond(values["recorded_nsec"].Int64) {
+		return empty, lengths, 0, 0, fmt.Errorf("change %d has invalid identity, predecessor, parent or recorded time: %w", position, syscall.EIO)
+	}
+	kind, err := loadedKind(values["kind"].Int64)
 	if err != nil {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
+		return empty, lengths, 0, 0, err
 	}
-	previous, err := requiredStoredInteger("previous_position", previousRaw, previousType)
-	if err != nil {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
-	}
-	volume, err := requiredStoredInteger("volume", volumeRaw, volumeType)
-	if err != nil {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
-	}
-	kindValue, err := requiredStoredInteger("kind", kindRaw, kindType)
-	if err != nil {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
-	}
-	parent, err := requiredStoredInteger("parent", parentRaw, parentType)
-	if err != nil {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
-	}
-	fromParent, ok := nullableStoredInteger(fromParentRaw, fromParentType)
-	if !ok {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "from_parent", fromParentType)
-	}
-	id, ok := nullableStoredInteger(idRaw, idType)
-	if !ok {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "node", idType)
-	}
-	mode, ok := nullableStoredInteger(modeRaw, modeType)
-	if !ok {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "mode", modeType)
-	}
-	size, ok := nullableStoredInteger(sizeRaw, sizeType)
-	if !ok {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "size", sizeType)
-	}
-	atimeSec, ok := nullableStoredInteger(atimeSecRaw, atimeSecType)
-	if !ok {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "atime_sec", atimeSecType)
-	}
-	atimeNsec, ok := nullableStoredInteger(atimeNsecRaw, atimeNsecType)
-	if !ok {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "atime_nsec", atimeNsecType)
-	}
-	mtimeSec, ok := nullableStoredInteger(mtimeSecRaw, mtimeSecType)
-	if !ok {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "mtime_sec", mtimeSecType)
-	}
-	mtimeNsec, ok := nullableStoredInteger(mtimeNsecRaw, mtimeNsecType)
-	if !ok {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "mtime_nsec", mtimeNsecType)
-	}
-	recordedSec, err := requiredStoredInteger("recorded_sec", recordedSecRaw, recordedSecType)
-	if err != nil {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
-	}
-	recordedNsec, err := requiredStoredInteger("recorded_nsec", recordedNsecRaw, recordedNsecType)
-	if err != nil {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
-	}
-	loaded, err := loadedKind(kindValue)
-	if err != nil {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
-	}
-	change := metastore.Change{Position: metastore.Position(position), Kind: loaded, Parent: parent}
-	if nameType == "blob" {
+	change := metastore.Change{Position: metastore.Position(position), Kind: kind, Parent: parent}
+	if payloadTypes[0] == "blob" {
 		change.Name = []byte{}
 	}
-	if fromParent.Valid {
-		change.From = &metastore.Location{Parent: fromParent.Int64}
-		if fromNameType == "blob" {
+	if values["from_parent"].Valid {
+		change.From = &metastore.Location{Parent: values["from_parent"].Int64}
+		if payloadTypes[1] == "blob" {
 			change.From.Name = []byte{}
 		}
 	}
-	if id.Valid {
-		change.Node = &metastore.Node{
-			ID:         id.Int64,
-			Mode:       fs.FileMode(mode.Int64),
-			Size:       size.Int64,
-			AccessTime: sqlvalue.LoadedTime(atimeSec.Int64, int32(atimeNsec.Int64)),
-			ModTime:    sqlvalue.LoadedTime(mtimeSec.Int64, int32(mtimeNsec.Int64)),
-		}
+	if err := validateLocationMetadata(change, lengths, payloadTypes[0], payloadTypes[1]); err != nil {
+		return empty, lengths, 0, 0, err
 	}
-	if err := validateChangeMetadata(change, lengths, volume, expectedVolume,
-		nameType, fromNameType, contentType, id, mode, size, atimeSec, atimeNsec,
-		mtimeSec, mtimeNsec, recordedSec, recordedNsec); err != nil {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
+	node, err := scanNodeMetadata(values, kind, payloadTypes, lengths)
+	if err != nil {
+		return empty, lengths, 0, 0, err
 	}
-	if previous < 0 || previous >= position {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0,
-			fmt.Errorf("%w: change %d has invalid predecessor %d", syscall.EIO, position, previous)
-	}
-	return change, lengths, previous, nil
+	change.Node = node
+	return change, lengths, previous, values["identity_high_water"].Int64, nil
 }
 
-func requiredStoredInteger(column string, value any, storageClass string) (int64, error) {
-	integer, ok := sqlvalue.StoredInteger(value, storageClass)
-	if !ok {
-		return 0, invalidStoredChangeScalar(0, column, storageClass)
+func scanNodeMetadata(values map[string]sql.NullInt64, kind metastore.ChangeKind, types [6]string, lengths metastore.ChangePayloadLengths) (*metastore.Node, error) {
+	required := []string{"node", "node_kind", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "metadata_revision", "directory_revision"}
+	want := kind != metastore.Removed
+	for _, name := range required {
+		if values[name].Valid != want {
+			return nil, fmt.Errorf("change has incomplete node field %s: %w", name, syscall.EIO)
+		}
 	}
-	return integer, nil
+	if !want {
+		for _, name := range []string{"creation_sec", "creation_nsec", "change_sec", "change_nsec"} {
+			if values[name].Valid {
+				return nil, fmt.Errorf("removed change carries %s: %w", name, syscall.EIO)
+			}
+		}
+		if types[2] != "null" || types[3] != "null" || types[4] != "null" {
+			return nil, fmt.Errorf("removed change carries node payload: %w", syscall.EIO)
+		}
+		return nil, nil
+	}
+	nodeKind := values["node_kind"].Int64
+	if values["node"].Int64 <= 0 || nodeKind < int64(storage.NodeRegular) || nodeKind > int64(storage.NodeSymlink) || values["size"].Int64 < 0 || values["metadata_revision"].Int64 <= 0 || values["directory_revision"].Int64 < 0 || !validNanosecond(values["atime_nsec"].Int64) || !validNanosecond(values["mtime_nsec"].Int64) {
+		return nil, fmt.Errorf("change carries invalid node metadata: %w", syscall.EIO)
+	}
+	creation, err := optionalStoredTime(values, "creation")
+	if err != nil {
+		return nil, err
+	}
+	changed, err := optionalStoredTime(values, "change")
+	if err != nil {
+		return nil, err
+	}
+	node := &metastore.Node{ID: values["node"].Int64, Kind: storage.NodeKind(nodeKind), Size: values["size"].Int64,
+		AccessTime: sqlvalue.LoadedTime(values["atime_sec"].Int64, int32(values["atime_nsec"].Int64)), ModTime: sqlvalue.LoadedTime(values["mtime_sec"].Int64, int32(values["mtime_nsec"].Int64)),
+		CreationTime: creation, ChangeTime: changed, MetadataRevision: storage.NodeMetadataRevision(values["metadata_revision"].Int64), DirectoryRevision: storage.DirectoryRevision(values["directory_revision"].Int64)}
+	if (node.Kind == storage.NodeDirectory) != (node.DirectoryRevision != 0) || types[3] != "blob" || types[4] != "blob" || lengths.Metadata < 6 || types[2] != "null" && types[2] != "text" || types[2] == "text" && lengths.Content == 0 {
+		return nil, fmt.Errorf("change carries invalid node payload classes or revisions: %w", syscall.EIO)
+	}
+	if node.Kind == storage.NodeSymlink {
+		if types[4] != "blob" || types[2] != "null" || node.Size != lengths.Target {
+			return nil, fmt.Errorf("change carries invalid symlink data: %w", syscall.EIO)
+		}
+	} else if lengths.Target != 0 {
+		return nil, fmt.Errorf("change carries target for a non-link node: %w", syscall.EIO)
+	}
+	if node.Kind == storage.NodeDirectory && (node.Size != 0 || types[2] != "null") || node.Kind == storage.NodeRegular && types[2] == "null" && node.Size != 0 {
+		return nil, fmt.Errorf("change carries invalid content for its node kind: %w", syscall.EIO)
+	}
+	return node, nil
+}
+
+func optionalStoredTime(values map[string]sql.NullInt64, prefix string) (*time.Time, error) {
+	sec, nsec := values[prefix+"_sec"], values[prefix+"_nsec"]
+	if sec.Valid != nsec.Valid || nsec.Valid && !validNanosecond(nsec.Int64) {
+		return nil, fmt.Errorf("change carries invalid %s time: %w", prefix, syscall.EIO)
+	}
+	if !sec.Valid {
+		return nil, nil
+	}
+	instant := sqlvalue.LoadedTime(sec.Int64, int32(nsec.Int64))
+	return &instant, nil
+}
+
+func validNanosecond(value int64) bool { return value >= 0 && value < int64(time.Second) }
+
+func validateLocationMetadata(change metastore.Change, lengths metastore.ChangePayloadLengths, nameType, fromType string) error {
+	if nameType != "null" && nameType != "blob" || fromType != "null" && fromType != "blob" {
+		return fmt.Errorf("change stores name with invalid storage class: %w", syscall.EIO)
+	}
+	if (change.Kind == metastore.Renamed) != (change.From != nil) || change.From == nil && (fromType != "null" || lengths.FromName != 0) {
+		return fmt.Errorf("change has incomplete source location: %w", syscall.EIO)
+	}
+	named := change.Parent > 0 && nameType == "blob" && lengths.Name > 0
+	switch change.Kind {
+	case metastore.Created, metastore.Removed:
+		if !named {
+			return fmt.Errorf("change has no addressable destination: %w", syscall.EIO)
+		}
+	case metastore.Modified:
+		if !named && !(change.Parent == 0 && nameType == "null" && lengths.Name == 0) {
+			return fmt.Errorf("modified change has no valid location: %w", syscall.EIO)
+		}
+	case metastore.Renamed:
+		if !named || change.From.Parent <= 0 || fromType != "blob" || lengths.FromName <= 0 {
+			return fmt.Errorf("renamed change has an incomplete location: %w", syscall.EIO)
+		}
+	}
+	return nil
 }
 
 func nullableStoredInteger(value any, storageClass string) (sql.NullInt64, bool) {
@@ -191,109 +198,25 @@ func nullableStoredInteger(value any, storageClass string) (sql.NullInt64, bool)
 	integer, ok := sqlvalue.StoredInteger(value, storageClass)
 	return sql.NullInt64{Int64: integer, Valid: ok}, ok
 }
-
 func invalidStoredChangeScalar(position int64, column, storageClass string) error {
 	if position > 0 {
-		return fmt.Errorf("%w: change %d stores %s as %s", syscall.EIO, position, column, storageClass)
+		return fmt.Errorf("change %d stores %s as %s: %w", position, column, storageClass, syscall.EIO)
 	}
-	return fmt.Errorf("%w: a change stores %s as %s", syscall.EIO, column, storageClass)
-}
-
-func validateChangeMetadata(
-	change metastore.Change,
-	lengths metastore.ChangePayloadLengths,
-	volume, expectedVolume int64,
-	nameType, fromNameType, contentType string,
-	id, mode, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec sql.NullInt64,
-	recordedSec, recordedNsec int64,
-) error {
-	if change.Position <= 0 || volume <= 0 || volume != expectedVolume || change.Parent < 0 ||
-		recordedNsec < 0 || recordedNsec >= int64(time.Second) {
-		return fmt.Errorf("%w: change position %d has invalid identity, parent, or recorded time", syscall.EIO, change.Position)
-	}
-	if nameType != "null" && nameType != "blob" {
-		return fmt.Errorf("%w: change %d stores its name as %s", syscall.EIO, change.Position, nameType)
-	}
-	if fromNameType != "null" && fromNameType != "blob" {
-		return fmt.Errorf("%w: change %d stores its source name as %s", syscall.EIO, change.Position, fromNameType)
-	}
-	if contentType != "null" && contentType != "text" {
-		return fmt.Errorf("%w: change %d stores its content key as %s", syscall.EIO, change.Position, contentType)
-	}
-	if lengths.Name < 0 || lengths.FromName < 0 || lengths.Content < 0 {
-		return fmt.Errorf("%w: change %d has a negative payload length", syscall.EIO, change.Position)
-	}
-	wantFrom := change.Kind == metastore.Renamed
-	if wantFrom != (change.From != nil) {
-		return fmt.Errorf("%w: change %d has an incomplete source location", syscall.EIO, change.Position)
-	}
-	wantNode := change.Kind != metastore.Removed
-	nodeFields := []sql.NullInt64{id, mode, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec}
-	for _, field := range nodeFields {
-		if field.Valid != wantNode {
-			return fmt.Errorf("%w: change %d has an incomplete node", syscall.EIO, change.Position)
-		}
-	}
-	if !wantNode {
-		if contentType != "null" {
-			return fmt.Errorf("%w: removed change %d carries content", syscall.EIO, change.Position)
-		}
-	} else {
-		if contentType == "text" && lengths.Content == 0 {
-			return fmt.Errorf("%w: change %d carries an empty content key", syscall.EIO, change.Position)
-		}
-		if id.Int64 <= 0 || size.Int64 < 0 || mode.Int64 < 0 || mode.Int64 > math.MaxUint32 ||
-			atimeNsec.Int64 < 0 || atimeNsec.Int64 >= int64(time.Second) ||
-			mtimeNsec.Int64 < 0 || mtimeNsec.Int64 >= int64(time.Second) {
-			return fmt.Errorf("%w: change %d carries invalid node metadata", syscall.EIO, change.Position)
-		}
-		if nodeType := fs.FileMode(mode.Int64).Type(); nodeType != 0 && nodeType != fs.ModeDir && nodeType != fs.ModeSymlink {
-			return fmt.Errorf("%w: change %d carries unsupported node type %v", syscall.EIO, change.Position, fs.FileMode(mode.Int64).Type())
-		}
-		if fs.FileMode(mode.Int64).Type() == fs.ModeSymlink && contentType != "null" {
-			return fmt.Errorf("%w: change %d carries object content for a symlink", syscall.EIO, change.Position)
-		}
-		if fs.FileMode(mode.Int64).IsDir() && (size.Int64 != 0 || contentType != "null") {
-			return fmt.Errorf("%w: change %d carries bytes for a directory", syscall.EIO, change.Position)
-		}
-		if fs.FileMode(mode.Int64).Type() == 0 && contentType == "null" && size.Int64 != 0 {
-			return fmt.Errorf("%w: change %d carries file bytes without a content key", syscall.EIO, change.Position)
-		}
-	}
-	switch change.Kind {
-	case metastore.Created, metastore.Removed:
-		if change.Parent <= 0 || nameType != "blob" || lengths.Name <= 0 {
-			return fmt.Errorf("%w: change %d has no addressable destination", syscall.EIO, change.Position)
-		}
-	case metastore.Modified:
-		root := change.Parent == 0 && nameType == "null" && lengths.Name == 0
-		named := change.Parent > 0 && nameType == "blob" && lengths.Name > 0
-		if !root && !named {
-			return fmt.Errorf("%w: modified change %d has no valid location", syscall.EIO, change.Position)
-		}
-	case metastore.Renamed:
-		if change.Parent <= 0 || nameType != "blob" || lengths.Name <= 0 ||
-			change.From == nil || change.From.Parent <= 0 || fromNameType != "blob" || lengths.FromName <= 0 {
-			return fmt.Errorf("%w: renamed change %d has an incomplete location", syscall.EIO, change.Position)
-		}
-	}
-	return nil
+	return fmt.Errorf("a change stores %s as %s: %w", column, storageClass, syscall.EIO)
 }
 
 func validateChangePayload(change metastore.Change, name, fromName []byte, content sql.NullString) error {
 	if change.Name != nil && !validStoredComponent(name) {
-		return fmt.Errorf("%w: change %d carries an invalid destination name", syscall.EIO, change.Position)
+		return fmt.Errorf("change %d carries an invalid destination name: %w", change.Position, syscall.EIO)
 	}
 	if change.From != nil && !validStoredComponent(fromName) {
-		return fmt.Errorf("%w: change %d carries an invalid source name", syscall.EIO, change.Position)
+		return fmt.Errorf("change %d carries an invalid source name: %w", change.Position, syscall.EIO)
 	}
 	if content.Valid && content.String == "" {
-		return fmt.Errorf("%w: change %d carries an empty content key", syscall.EIO, change.Position)
+		return fmt.Errorf("change %d carries an empty content key: %w", change.Position, syscall.EIO)
 	}
 	return nil
 }
-
 func validStoredComponent(name []byte) bool {
-	return len(name) != 0 && !bytes.Equal(name, []byte(".")) && !bytes.Equal(name, []byte("..")) &&
-		bytes.IndexByte(name, '/') < 0 && bytes.IndexByte(name, 0) < 0
+	return len(name) > 0 && len(name) <= storage.MaxEntryNameBytes && !bytes.Equal(name, []byte(".")) && !bytes.Equal(name, []byte("..")) && bytes.IndexByte(name, '/') < 0 && bytes.IndexByte(name, 0) < 0
 }

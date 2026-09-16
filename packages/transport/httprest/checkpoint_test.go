@@ -70,7 +70,7 @@ func TestCheckpointCapturesCurrentLogWithoutChangingTheVolume(t *testing.T) {
 		t.Fatalf("checkpoint changed log: %+v, %v; before %+v", after, err, before)
 	}
 	gotNode, err := meta.Stat(t.Context(), "file")
-	if err != nil || gotNode != node {
+	if err != nil || !reflect.DeepEqual(gotNode, node) {
 		t.Fatalf("checkpoint changed node: %+v, %v", gotNode, err)
 	}
 	gotChildren, err := meta.List(t.Context(), "")

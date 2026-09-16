@@ -1,5 +1,10 @@
 -- The tree, its attributes, and the objects its files point at.
 --
+-- This file has landed. Its statements are history and are never edited: every database
+-- that has ever recorded version 1 was built by exactly these, and a later build that
+-- changed them would be describing a database that never existed. A change to the schema
+-- is a new file, not an edit to this one.
+--
 -- Prose goes between statements rather than inside them. SQLite stores the text of a
 -- CREATE statement verbatim, comments and all, so a comment inside one ends up in
 -- sqlite_schema and in testdata/schema.sql beside it.
@@ -38,12 +43,6 @@ CREATE TABLE nodes (
 	atime_nsec INTEGER NOT NULL,
 	mtime_sec  INTEGER NOT NULL,
 	mtime_nsec INTEGER NOT NULL,
-	windows_creation_sec INTEGER NOT NULL DEFAULT 0,
-	windows_creation_nsec INTEGER NOT NULL DEFAULT 0,
-	windows_change_sec INTEGER NOT NULL DEFAULT 0,
-	windows_change_nsec INTEGER NOT NULL DEFAULT 0,
-	windows_attributes INTEGER NOT NULL DEFAULT 0,
-	windows_link_target BLOB NOT NULL DEFAULT X'',
 	content    TEXT REFERENCES objects(key)
 );
 
@@ -80,8 +79,7 @@ CREATE TABLE volumes (
 	id   INTEGER PRIMARY KEY AUTOINCREMENT,
 	name TEXT    NOT NULL UNIQUE,
 	root INTEGER NOT NULL,
-	used INTEGER NOT NULL,
-	windows_name_version INTEGER NOT NULL DEFAULT 0
+	used INTEGER NOT NULL
 );
 
 -- An object's key is opaque and never reused, so it is its own identity. The state is what a

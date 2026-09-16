@@ -47,24 +47,26 @@ type Storage struct {
 	meta    metastore.Store
 	now     func() time.Time
 
-	maintenanceStop    context.CancelFunc
-	maintenanceDone    chan struct{}
-	maintenanceTrigger chan struct{}
-	cleanupContext     context.Context
-	stopCleanup        context.CancelFunc
-	sweepPermit        chan struct{}
-	statusMu           sync.Mutex
-	maintenanceStatus  MaintenanceStatus
-	operations         sync.RWMutex
-	closeMu            sync.Mutex
-	closeDone          chan struct{}
-	closeErr           error
-	fileMu             sync.Mutex
-	fileSessions       map[*fileSession]struct{}
-	windowsSessions    map[*windowsSession]struct{}
-	filesClosing       bool
-	fileCloseMu        sync.Mutex
-	fileCloseRetry     bool
+	maintenanceStop       context.CancelFunc
+	maintenanceDone       chan struct{}
+	maintenanceTrigger    chan struct{}
+	cleanupContext        context.Context
+	stopCleanup           context.CancelFunc
+	sweepPermit           chan struct{}
+	statusMu              sync.Mutex
+	maintenanceStatus     MaintenanceStatus
+	operations            sync.RWMutex
+	closeMu               sync.Mutex
+	closeDone             chan struct{}
+	closeErr              error
+	fileMu                sync.Mutex
+	fileEnrollment        sync.WaitGroup
+	fileEnrollmentContext context.Context
+	cancelFileEnrollment  context.CancelFunc
+	fileSessions          map[*fileSession]struct{}
+	filesClosing          bool
+	fileCloseMu           sync.Mutex
+	fileCloseRetry        bool
 }
 
 var _ storage.Storage = (*Storage)(nil)
@@ -397,7 +399,7 @@ func (s *Storage) ReadBounded(ctx context.Context, path string, maxBytes int64) 
 }
 
 func (s *Storage) read(ctx context.Context, path string, maxBytes *int64) ([]byte, error) {
-	ctx = metastore.WithFileIO(ctx, metastore.WindowsIO{Length: math.MaxInt64})
+	ctx = metastore.WithFileIO(ctx, storage.FileIO{Length: math.MaxInt64})
 	cleaned, err := storage.CleanPath(path)
 	if err != nil {
 		return nil, &os.PathError{Op: "read", Path: path, Err: err}
@@ -415,7 +417,7 @@ func (s *Storage) read(ctx context.Context, path string, maxBytes *int64) ([]byt
 		switch {
 		case node.IsDir():
 			return nil, &os.PathError{Op: "read", Path: path, Err: syscall.EISDIR}
-		case node.Mode&os.ModeSymlink != 0:
+		case node.Kind == storage.NodeSymlink:
 			return nil, &os.PathError{Op: "read", Path: path, Err: syscall.ELOOP}
 		case node.Content == "":
 			if node.Size != 0 {

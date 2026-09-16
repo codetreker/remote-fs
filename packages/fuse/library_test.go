@@ -189,42 +189,23 @@ func isNilConversion(expr ast.Expr) bool {
 // cannot name is refused rather than presented as an ordinary file, because presenting
 // it would invite reads and writes that cannot mean what they appear to.
 func TestSystemMode(t *testing.T) {
-	for _, c := range []struct {
-		name string
-		mode iofs.FileMode
-		want uint32
+	v := &volume{}
+	for _, kind := range []struct {
+		kind storage.NodeKind
+		bits uint32
 	}{
-		{"a file", 0o644, syscall.S_IFREG | 0o644},
-		{"a directory", iofs.ModeDir | 0o755, syscall.S_IFDIR | 0o755},
-		{"a symbolic link", iofs.ModeSymlink | 0o777, syscall.S_IFLNK | 0o777},
-		{"a named pipe", iofs.ModeNamedPipe | 0o600, syscall.S_IFIFO | 0o600},
-		{"a socket", iofs.ModeSocket | 0o600, syscall.S_IFSOCK | 0o600},
-		{"a block device", iofs.ModeDevice | 0o600, syscall.S_IFBLK | 0o600},
-		{"a character device", iofs.ModeDevice | iofs.ModeCharDevice | 0o600, syscall.S_IFCHR | 0o600},
-
-		// The three beyond the permission bits are settable, so they have to be reported
-		// as well as accepted. A mount that dropped them would answer a chmod that
-		// succeeded with the mode the file had before it.
-		{"a setuid file", iofs.ModeSetuid | 0o755, syscall.S_IFREG | syscall.S_ISUID | 0o755},
-		{"a setgid directory", iofs.ModeDir | iofs.ModeSetgid | 0o2775, syscall.S_IFDIR | syscall.S_ISGID | 0o775},
-		{"a sticky directory", iofs.ModeDir | iofs.ModeSticky | 0o777, syscall.S_IFDIR | syscall.S_ISVTX | 0o777},
-		{"all three at once", iofs.ModeSetuid | iofs.ModeSetgid | iofs.ModeSticky | 0o700,
-			syscall.S_IFREG | syscall.S_ISUID | syscall.S_ISGID | syscall.S_ISVTX | 0o700},
+		{storage.NodeRegular, syscall.S_IFREG}, {storage.NodeDirectory, syscall.S_IFDIR}, {storage.NodeSymlink, syscall.S_IFLNK},
 	} {
-		t.Run(c.name, func(t *testing.T) {
-			got, errno := systemMode(c.mode)
-			if errno != 0 {
-				t.Fatalf("systemMode(%v) failed with %v", c.mode, errno)
+		for _, mode := range []uint32{0, 0644, 0755, 04755, 02775, 01777, 07700} {
+			got, _, err := v.attributes(storage.Attr{Kind: kind.kind, Metadata: initialMetadata(mode)})
+			if err != nil || got != kind.bits|mode {
+				t.Fatalf("kind %v mode %o = %o, %v", kind.kind, mode, got, err)
 			}
-			if got != c.want {
-				t.Fatalf("systemMode(%v) = %o, want %o", c.mode, got, c.want)
-			}
-		})
+		}
 	}
-
-	for _, mode := range []iofs.FileMode{iofs.ModeIrregular, iofs.ModeIrregular | iofs.ModeDir} {
-		if _, errno := systemMode(mode); errno != syscall.EIO {
-			t.Errorf("systemMode(%v) failed with %v, want EIO", mode, errno)
+	for _, kind := range []storage.NodeKind{0, 4, 255} {
+		if _, _, err := v.attributes(storage.Attr{Kind: kind}); !errors.Is(err, syscall.EIO) {
+			t.Fatalf("kind %v error = %v", kind, err)
 		}
 	}
 }
@@ -232,7 +213,7 @@ func TestSystemMode(t *testing.T) {
 // The way back. A mode arrives from the kernel with the node's kind still in it, and the
 // kind is dropped rather than translated: what comes back is a mode to set, and a node's
 // kind is not something a caller sets.
-func TestStorageMode(t *testing.T) {
+func TestGoMode(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		mode uint32
@@ -248,11 +229,11 @@ func TestStorageMode(t *testing.T) {
 			iofs.ModeSetuid | iofs.ModeSetgid | iofs.ModeSticky | 0o700},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			if got := storageMode(c.mode); got != c.want {
-				t.Fatalf("storageMode(%o) = %v, want %v", c.mode, got, c.want)
+			if got := goMode(c.mode); got != c.want {
+				t.Fatalf("goMode(%o) = %v, want %v", c.mode, got, c.want)
 			}
-			if got := storageMode(c.mode); got&^storage.SettableMode != 0 {
-				t.Fatalf("storageMode(%o) = %v, which the contract will refuse", c.mode, got)
+			if got := goMode(c.mode); got&^settableMode != 0 {
+				t.Fatalf("goMode(%o) = %v, which the contract will refuse", c.mode, got)
 			}
 		})
 	}
@@ -327,6 +308,7 @@ func TestRetainedHandlePreservesReadWriteAndTruncateBoundaries(t *testing.T) {
 
 func activeTestVolume(s storage.Storage, maxFileSize int64) *volume {
 	return &volume{storage: s, maxFileSize: maxFileSize, flushTimeout: DefaultFlushTimeout,
+		status:   storage.FileSessionStatus{Epoch: "test", Revision: 1, ActionEpoch: 1, Remaining: time.Hour, HistoryRemaining: time.Hour},
 		deadline: time.Now().Add(time.Hour), stop: make(chan struct{}), done: make(chan struct{})}
 }
 
@@ -341,41 +323,43 @@ func aHandleWithAllowance(t *testing.T, contents []byte, maxFileSize, allowance 
 	if err := backing.Write(t.Context(), "file", contents); err != nil {
 		t.Fatal(err)
 	}
-	session, err := backing.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := session.Close(ctx); err != nil {
-			t.Errorf("close handle session: %v", err)
-		}
-	})
-	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := file.Close(ctx); err != nil {
-			t.Errorf("close retained test file: %v", err)
-		}
-	})
-	attr, err := file.Stat(t.Context())
+	session, status, err := backing.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
 	v := activeTestVolume(unmeasured{}, maxFileSize)
 	v.files = session
+	v.status = status
+	v.deadline = time.Now().Add(status.Remaining)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := v.closeSession(ctx); err != nil {
+			t.Errorf("close handle session: %v", err)
+		}
+	})
+	current, err := backing.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, attr, err := v.retainNode(t.Context(), current.ID, storage.AccessClaim{Uses: storage.ReadContent | storage.WriteContent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := v.closeReference(ctx, file); err != nil {
+			t.Errorf("close retained test file: %v", err)
+		}
+	})
 	n := &node{volume: v, id: rootIdentity(math.MaxUint64).child("file", syscall.S_IFREG, attr.ID)}
 	return newHandle(n, file, true, true)
 }
 
 func retainedContents(t *testing.T, h *handle) []byte {
 	t.Helper()
-	read, err := h.file.ReadAt(t.Context(), 0, 1<<20)
+	read, err := h.file.ReadAt(t.Context(), storage.FileReadRequest{Length: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +463,7 @@ func TestTheChangeARequestAsksFor(t *testing.T) {
 	for _, c := range []struct {
 		name  string
 		in    gofuse.SetAttrIn
-		want  storage.AttrChange
+		want  attributeChange
 		errno syscall.Errno
 	}{
 		{
@@ -495,7 +479,7 @@ func TestTheChangeARequestAsksFor(t *testing.T) {
 			name: "chmod",
 			in: gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
 				Valid: gofuse.FATTR_MODE, Mode: syscall.S_IFREG | 0o640}},
-			want: storage.AttrChange{Mode: aMode(0o640)},
+			want: attributeChange{Mode: aMode(0o640)},
 		},
 		{
 			// The kernel keeps these three in the mode word beside the permission bits, and
@@ -505,7 +489,7 @@ func TestTheChangeARequestAsksFor(t *testing.T) {
 			in: gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
 				Valid: gofuse.FATTR_MODE,
 				Mode:  syscall.S_IFREG | syscall.S_ISUID | syscall.S_ISGID | syscall.S_ISVTX | 0o755}},
-			want: storage.AttrChange{
+			want: attributeChange{
 				Mode: aMode(0o755 | iofs.ModeSetuid | iofs.ModeSetgid | iofs.ModeSticky)},
 		},
 		{
@@ -516,7 +500,7 @@ func TestTheChangeARequestAsksFor(t *testing.T) {
 				Atimensec: uint32(chosen.Nanosecond()),
 				Mtime:     uint64(chosen.Unix()),
 				Mtimensec: uint32(chosen.Nanosecond())}},
-			want: storage.AttrChange{AccessTime: &chosen, ModTime: &chosen},
+			want: attributeChange{AccessTime: &chosen, ModTime: &chosen},
 		},
 		{
 			name: "utimensat with only the modification time",
@@ -524,7 +508,7 @@ func TestTheChangeARequestAsksFor(t *testing.T) {
 				Valid:     gofuse.FATTR_MTIME,
 				Mtime:     uint64(chosen.Unix()),
 				Mtimensec: uint32(chosen.Nanosecond())}},
-			want: storage.AttrChange{ModTime: &chosen},
+			want: attributeChange{ModTime: &chosen},
 		},
 		{
 			// The mount reports every node as belonging to whoever made the mount, so this
@@ -564,7 +548,7 @@ func TestTheChangeARequestAsksFor(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			v := &volume{owner: owner}
-			got, errno := v.requestedChange(&c.in)
+			got, errno := v.requestedChange(&c.in, v.owner)
 			if errno != c.errno {
 				t.Fatalf("the request failed with %v, want %v", errno, c.errno)
 			}
@@ -588,7 +572,7 @@ func TestAChangeTimeIsNotARequestOfItsOwn(t *testing.T) {
 			gofuse.FATTR_MTIME | gofuse.FATTR_MTIME_NOW | gofuse.FATTR_CTIME,
 	}}
 	v := &volume{owner: gofuse.Owner{}}
-	got, errno := v.requestedChange(&in)
+	got, errno := v.requestedChange(&in, v.owner)
 	if errno != 0 {
 		t.Fatalf("the request failed with %v", errno)
 	}
@@ -604,7 +588,7 @@ func TestAChangeTimeIsNotARequestOfItsOwn(t *testing.T) {
 
 func aMode(m iofs.FileMode) *iofs.FileMode { return &m }
 
-func sameChange(got, want storage.AttrChange) bool {
+func sameChange(got, want attributeChange) bool {
 	sameTime := func(a, b *time.Time) bool {
 		return (a == nil) == (b == nil) && (a == nil || a.Equal(*b))
 	}
@@ -612,7 +596,7 @@ func sameChange(got, want storage.AttrChange) bool {
 	return sameMode && sameTime(got.AccessTime, want.AccessTime) && sameTime(got.ModTime, want.ModTime)
 }
 
-func describeChange(c storage.AttrChange) string {
+func describeChange(c attributeChange) string {
 	parts := []string{}
 	if c.Mode != nil {
 		parts = append(parts, fmt.Sprintf("mode %v", *c.Mode))

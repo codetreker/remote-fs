@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -198,7 +199,7 @@ func TestNeighbourGapsKeepSparsePositionsWithoutGrowingTheTree(t *testing.T) {
 	if children, err := n.neighbour.List(ctx, ""); err != nil || len(children) != 0 {
 		t.Fatalf("neighbour tree grew: %+v, %v", children, err)
 	}
-	if after, err := n.neighbour.Stat(ctx, ""); err != nil || after.ID != root.ID || after.Mode != root.Mode {
+	if after, err := n.neighbour.Stat(ctx, ""); err != nil || after.ID != root.ID || after.Kind != root.Kind {
 		t.Fatalf("neighbour root changed identity or mode: %+v, %v", after, err)
 	}
 }
@@ -337,7 +338,7 @@ func TestContractFactoryKeepsSequentialVolumesIsolated(t *testing.T) {
 		t.Fatalf("shared database state before=%+v after=%+v, error=%v", before, after, err)
 	}
 	reopened := open(t, path, "volume-1", 128)
-	if node, err := reopened.Stat(t.Context(), "same"); err != nil || node != savedNode {
+	if node, err := reopened.Stat(t.Context(), "same"); err != nil || !reflect.DeepEqual(node, savedNode) {
 		t.Fatalf("second child changed first node: %+v, error=%v; want %+v", node, err, savedNode)
 	}
 	if space, err := reopened.Space(t.Context()); err != nil || space != savedSpace {

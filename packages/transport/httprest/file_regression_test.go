@@ -10,7 +10,6 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"io"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -23,172 +22,50 @@ import (
 
 func openRetainedFixture(t *testing.T, client *Storage) (*remoteFileSession, *remoteFile) {
 	t.Helper()
-	s, err := client.NewFileSession(context.Background(), storage.DefaultFileSessionOptions())
+	ctx := context.Background()
+	s, status, err := client.NewFileSession(ctx, storage.DefaultFileSessionOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanup, _ := storage.NewFileActionID(status.ActionEpoch)
 	t.Cleanup(func() {
-		if err := s.Close(context.Background()); err != nil {
+		if _, err := s.Close(ctx, cleanup); err != nil {
 			t.Error(err)
 		}
 	})
-	f, err := s.OpenFile(context.Background(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
+	attr, err := client.Stat(ctx, "file")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return s.(*remoteFileSession), f.(*remoteFile)
+	return s.(*remoteFileSession), internalRetainFile(t, s, attr.ID).(*remoteFile)
 }
-
-func TestRetainedHTTPRejectsMissingZeroValuedRequestMembers(t *testing.T) {
-	ctx := context.Background()
-	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
-	if err := backend.Write(ctx, "file", []byte("preserve")); err != nil {
-		t.Fatal(err)
-	}
-	session, file := openRetainedFixture(t, client)
-	action, err := storage.NewLockRequestID(session.epoch)
+func internalRetainFile(t *testing.T, s storage.FileSession, node uint64) storage.File {
+	t.Helper()
+	r, err := s.Retain(context.Background(), storage.RetainRequest{NodeID: node, Claim: storage.AccessClaim{Uses: storage.ReadContent | storage.WriteContent}}, retainedAction(t, s))
 	if err != nil {
 		t.Fatal(err)
 	}
-	complete := fileRequest{Op: storage.OpFileTruncate, Session: session.id, File: file.id, Action: action, Offset: 3, Path: []byte{}, Data: []byte{}}
-	encoded, err := json.Marshal(complete)
+	f, err := s.Reference(context.Background(), r.Reference)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, missing := range []string{"offset", "owner", "length", "data", "options", "open", "lock"} {
-		t.Run(missing, func(t *testing.T) {
-			var fields map[string]json.RawMessage
-			if err := json.Unmarshal(encoded, &fields); err != nil {
-				t.Fatal(err)
-			}
-			delete(fields, missing)
-			body, err := json.Marshal(fields)
-			if err != nil {
-				t.Fatal(err)
-			}
-			u, err := (Request{Op: OpFile}).URL(client.base)
-			if err != nil {
-				t.Fatal(err)
-			}
-			request, err := http.NewRequest(http.MethodPost, u.String(), bytes.NewReader(body))
-			if err != nil {
-				t.Fatal(err)
-			}
-			request.Header.Set("Content-Type", contentJSON)
-			response, err := client.http.Do(request)
-			if err != nil {
-				t.Fatal(err)
-			}
-			response.Body.Close()
-			if response.StatusCode != http.StatusBadRequest {
-				t.Fatalf("missing %s status = %s", missing, response.Status)
-			}
-			contents, err := backend.Read(ctx, "file")
-			if err != nil || string(contents) != "preserve" {
-				t.Fatalf("malformed truncate changed data: %q, %v", contents, err)
-			}
-		})
+	if f.Reference() != r.Reference || f.NodeID() != node {
+		t.Fatalf("resolved reference identity = %d/%d, want %d/%d", f.Reference(), f.NodeID(), r.Reference, node)
 	}
+	return f
+}
+func internalFileNode(t *testing.T, s storage.Storage) uint64 {
+	t.Helper()
+	a, e := s.Stat(context.Background(), "file")
+	if e != nil {
+		t.Fatal(e)
+	}
+	return a.ID
 }
 
 type fileRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f fileRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
-func TestRetainedHTTPRejectsIncompleteAdvisoryReceipts(t *testing.T) {
-	ctx := context.Background()
-	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
-	if err := backend.Write(ctx, "file", []byte("data")); err != nil {
-		t.Fatal(err)
-	}
-	session, file := openRetainedFixture(t, client)
-	original := client.http.Transport
-	for _, field := range []string{"Found", "Owner", "Lock"} {
-		t.Run("conflict-"+field, func(t *testing.T) {
-			client.http.Transport = fileRoundTripFunc(func(r *http.Request) (*http.Response, error) {
-				response, err := original.RoundTrip(r)
-				if err != nil {
-					return nil, err
-				}
-				body, err := io.ReadAll(response.Body)
-				response.Body.Close()
-				if err != nil {
-					return nil, err
-				}
-				var fields map[string]json.RawMessage
-				if err := json.Unmarshal(body, &fields); err != nil {
-					return nil, err
-				}
-				if raw, ok := fields["conflict"]; ok {
-					var conflict map[string]json.RawMessage
-					if err := json.Unmarshal(raw, &conflict); err != nil {
-						return nil, err
-					}
-					delete(conflict, field)
-					fields["conflict"], err = json.Marshal(conflict)
-					if err != nil {
-						return nil, err
-					}
-					body, err = json.Marshal(fields)
-					if err != nil {
-						return nil, err
-					}
-				}
-				response.Body = io.NopCloser(bytes.NewReader(body))
-				response.ContentLength = int64(len(body))
-				response.Header.Set("Content-Length", strconv.Itoa(len(body)))
-				return response, nil
-			})
-			_, err := file.GetLock(ctx, 0, storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64})
-			if !errors.Is(err, syscall.EIO) {
-				t.Fatalf("incomplete conflict = %v", err)
-			}
-		})
-	}
-	client.http.Transport = original
-	_ = session
-}
-
-func TestRetainedHTTPCleanupAndAcknowledgementSurviveDataHistoryCapacity(t *testing.T) {
-	ctx := context.Background()
-	limits := DefaultFileLimits()
-	limits.MaxActions = 1
-	client, _, backend := retainedHTTPFixture(t, limits)
-	if err := backend.Write(ctx, "file", []byte("data")); err != nil {
-		t.Fatal(err)
-	}
-	session, file := openRetainedFixture(t, client)
-	if _, err := file.WriteAt(ctx, 0, []byte("x")); !errors.Is(err, syscall.EAGAIN) {
-		t.Fatalf("data history capacity = %v", err)
-	}
-	status, err := session.Status(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id, err := storage.NewLockRequestID(status.ActionEpoch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, End: math.MaxInt64}
-	if result, err := file.SetLock(ctx, 0, lock, id); err != nil || result.State != storage.LockGranted {
-		t.Fatalf("grant = %+v, %v", result, err)
-	}
-	other, err := backend.NewFileSession(ctx, storage.DefaultFileSessionOptions())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer other.Close(ctx)
-	observer, err := other.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := file.DropLocks(ctx, 0, storage.POSIX); err != nil {
-		t.Fatalf("close-owner cleanup blocked by data history: %v", err)
-	}
-	if conflict, err := observer.GetLock(ctx, 0, lock); err != nil || conflict.Found {
-		t.Fatalf("close-owner cleanup left a lock: %+v, %v", conflict, err)
-	}
-}
 
 type renewOrderBackend struct {
 	*objectstore.Storage
@@ -202,12 +79,12 @@ type renewOrderSession struct {
 	backend *renewOrderBackend
 }
 
-func (b *renewOrderBackend) NewFileSession(ctx context.Context, o storage.FileSessionOptions) (storage.FileSession, error) {
-	s, err := b.Storage.NewFileSession(ctx, o)
+func (b *renewOrderBackend) NewFileSession(ctx context.Context, o storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
+	s, status, err := b.Storage.NewFileSession(ctx, o)
 	if err != nil {
-		return nil, err
+		return nil, status, err
 	}
-	return &renewOrderSession{FileSession: s, backend: b}, nil
+	return &renewOrderSession{FileSession: s, backend: b}, status, nil
 }
 func (s *renewOrderSession) Renew(ctx context.Context) (storage.FileSessionStatus, error) {
 	status, err := s.FileSession.Renew(ctx)
@@ -245,12 +122,12 @@ func TestRetainedHTTPOutOfOrderRenewalCannotShortenConfirmedLifetime(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := client.NewFileSession(ctx, storage.DefaultFileSessionOptions())
+	session, _, err := client.NewFileSession(ctx, storage.DefaultFileSessionOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
 	remote := session.(*remoteFileSession)
-	defer session.Close(ctx)
+	defer session.Close(ctx, retainedAction(t, session))
 	first := make(chan error, 1)
 	go func() { _, err := remote.Renew(ctx); first <- err }()
 	<-backend.entered
@@ -289,208 +166,6 @@ func TestRetainedHTTPOutOfOrderRenewalCannotShortenConfirmedLifetime(t *testing.
 	served.mu.Lock()
 	served.expires = laterExpiry
 	served.mu.Unlock()
-}
-
-func TestRetainedHTTPCancellationAfterOpenEffectIsEIOAndCleansReference(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
-	session, err := client.NewFileSession(ctx, storage.DefaultFileSessionOptions())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close(context.Background())
-	original := client.http.Transport
-	client.http.Transport = fileRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-		var operation struct {
-			Op storage.Operation `json:"op"`
-		}
-		body, err := io.ReadAll(req.Body)
-		if err != nil {
-			return nil, err
-		}
-		req.Body = io.NopCloser(bytes.NewReader(body))
-		if err := json.Unmarshal(body, &operation); err != nil {
-			return nil, err
-		}
-		response, err := original.RoundTrip(req)
-		if err != nil {
-			return nil, err
-		}
-		if operation.Op == storage.OpFileOpen {
-			body, err = io.ReadAll(response.Body)
-			response.Body.Close()
-			if err != nil {
-				return nil, err
-			}
-			response.Body = io.NopCloser(bytes.NewReader(body))
-			cancel()
-		}
-		return response, nil
-	})
-	_, err = session.OpenFile(ctx, "created", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Exclusive: true}, Mode: 0600})
-	client.http.Transport = original
-	if !errors.Is(err, syscall.EIO) || storage.ErrnoOf(err) == syscall.EINTR || !errors.Is(err, context.Canceled) {
-		t.Fatalf("post-create interruption = %v", err)
-	}
-	if _, err := backend.Stat(context.Background(), "created"); err != nil {
-		t.Fatalf("create did not take effect before cancellation: %v", err)
-	}
-	if err := backend.Write(context.Background(), "created", []byte("retained")); err != nil {
-		t.Fatal(err)
-	}
-	if err := backend.Remove(context.Background(), "created"); err != nil {
-		t.Fatal(err)
-	}
-	usage, err := backend.Usage(context.Background())
-	if err != nil || usage != 0 {
-		t.Fatalf("post-open cancellation left a native reference: %d, %v", usage, err)
-	}
-}
-
-func TestRetainedHTTPPureReadCancellationAfterDispatchIsEINTR(t *testing.T) {
-	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
-	if err := backend.Write(context.Background(), "file", []byte("data")); err != nil {
-		t.Fatal(err)
-	}
-	session, file := openRetainedFixture(t, client)
-	attr, err := file.Stat(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	status, err := session.Status(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	id, err := storage.NewLockRequestID(status.ActionEpoch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
-	cases := map[string]func(context.Context) error{
-		"read":       func(ctx context.Context) error { _, e := file.ReadAt(ctx, 0, 4); return e },
-		"stat":       func(ctx context.Context) error { _, e := file.Stat(ctx); return e },
-		"stat-node":  func(ctx context.Context) error { _, e := session.StatNode(ctx, attr.ID); return e },
-		"get-lock":   func(ctx context.Context) error { _, e := file.GetLock(ctx, 0, lock); return e },
-		"query-lock": func(ctx context.Context) error { _, e := file.QueryLock(ctx, 0, id); return e },
-		"status":     func(ctx context.Context) error { _, e := session.Status(ctx); return e },
-	}
-	original := client.http.Transport
-	defer func() { client.http.Transport = original }()
-	for name, call := range cases {
-		t.Run(name, func(t *testing.T) {
-			entered := make(chan struct{})
-			client.http.Transport = fileRoundTripFunc(func(r *http.Request) (*http.Response, error) {
-				close(entered)
-				<-r.Context().Done()
-				return nil, r.Context().Err()
-			})
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			result := make(chan error, 1)
-			go func() { result <- call(ctx) }()
-			<-entered
-			cancel()
-			if err := <-result; !errors.Is(err, syscall.EINTR) || !errors.Is(err, context.Canceled) {
-				t.Fatalf("post-dispatch read cancellation = %v", err)
-			}
-		})
-	}
-}
-
-func TestRetainedHTTPCleanupHistoryExhaustionRetiresOwnedLocks(t *testing.T) {
-	ctx := context.Background()
-	limits := DefaultFileLimits()
-	limits.MaxCleanupActions = 1
-	client, _, backend := retainedHTTPFixture(t, limits)
-	if err := backend.Write(ctx, "file", []byte("data")); err != nil {
-		t.Fatal(err)
-	}
-	session, file := openRetainedFixture(t, client)
-	if err := file.DropLocks(ctx, 0, storage.POSIX); err != nil {
-		t.Fatal(err)
-	}
-	status, err := session.Status(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id, err := storage.NewLockRequestID(status.ActionEpoch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, End: math.MaxInt64}
-	if result, err := file.SetLock(ctx, 1, lock, id); err != nil || result.State != storage.LockGranted {
-		t.Fatalf("grant = %+v, %v", result, err)
-	}
-	if err := file.DropLocks(ctx, 1, storage.POSIX); !errors.Is(err, syscall.EIO) {
-		t.Fatalf("exhausted cleanup history = %v", err)
-	}
-	observerSession, err := backend.NewFileSession(ctx, storage.DefaultFileSessionOptions())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer observerSession.Close(ctx)
-	observer, err := observerSession.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if conflict, err := observer.GetLock(ctx, 0, lock); err != nil || conflict.Found {
-		t.Fatalf("failed cleanup retained a lock: %+v, %v", conflict, err)
-	}
-	if _, err := file.ReadAt(ctx, 0, 4); err == nil {
-		t.Fatal("retired holder still allowed ordinary I/O")
-	}
-}
-
-func TestRetainedHTTPAcceptedSmallBodyLimitSupportsSessionAndFileCalls(t *testing.T) {
-	ctx := context.Background()
-	_, backend := memoryfixture.New(t, "small-http-file-body", 1<<20, locking.DefaultOptions())
-	if err := backend.Write(ctx, "file", []byte("data")); err != nil {
-		t.Fatal(err)
-	}
-	options := DefaultHandlerOptions()
-	options.MaxBodyBytes = 1024
-	handler, err := NewHandlerWithOptions(backend, nil, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := httptest.NewServer(handler)
-	defer func() {
-		server.Close()
-		if err := handler.Close(ctx); err != nil {
-			t.Error(err)
-		}
-	}()
-	dial := DefaultDialOptions()
-	dial.MaxBodyBytes = 1024
-	client, err := DialWithOptions(server.URL, server.Client(), dial)
-	if err != nil {
-		t.Fatal(err)
-	}
-	session, err := client.NewFileSession(ctx, storage.DefaultFileSessionOptions())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close(ctx)
-	if _, err := session.Status(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := session.Renew(ctx); err != nil {
-		t.Fatal(err)
-	}
-	file, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if read, err := file.ReadAt(ctx, 0, 4); err != nil || string(read.Data) != "data" {
-		t.Fatalf("small-body read = %+v, %v", read, err)
-	}
-	if _, err := file.WriteAt(ctx, 0, []byte("live")); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Close(ctx); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func TestRetainedHTTPFileScopeIsFrozenAndReadDoesNotCarryProof(t *testing.T) {
@@ -533,31 +208,28 @@ func TestRetainedHTTPFileScopeIsFrozenAndReadDoesNotCarryProof(t *testing.T) {
 		}
 		return original.RoundTrip(request)
 	})
-	session, err := scoped.NewFileSession(ctx, storage.DefaultFileSessionOptions())
+	session, _, err := scoped.NewFileSession(ctx, storage.DefaultFileSessionOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer session.Close(ctx)
-	file, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
-	if err != nil {
+	defer session.Close(ctx, retainedAction(t, session))
+	file := internalRetainFile(t, session, internalFileNode(t, backend))
+	if _, err := file.WriteAt(ctx, storage.FileWriteRequest{Data: []byte("live")}, retainedAction(t, session)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := file.WriteAt(ctx, 0, []byte("live")); err != nil {
+	if _, err := file.Truncate(ctx, storage.FileTruncateRequest{Size: 3}, retainedAction(t, session)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := file.Truncate(ctx, 3); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := file.SetAttr(ctx, storage.AttrChange{}); err != nil {
+	if _, err := file.SetAttr(ctx, storage.AttrChange{}, retainedAction(t, session)); err != nil {
 		t.Fatal(err)
 	}
 	if err := file.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := file.ReadAt(locking.WithScope(ctx, locking.MutationScope{Owner: owner, Grants: []locking.GrantRef{grant}}), 0, 3); err != nil {
+	if _, err := file.ReadAt(locking.WithScope(ctx, locking.MutationScope{Owner: owner, Grants: []locking.GrantRef{grant}}), storage.FileReadRequest{Length: 3}); err != nil {
 		t.Fatal(err)
 	}
-	if err := file.Close(ctx); err != nil {
+	if _, err := file.Close(ctx, retainedAction(t, session)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -572,74 +244,21 @@ func TestRetainedHTTPEnrollmentEnforcesTheServerFileSizeCap(t *testing.T) {
 	}
 	options := storage.DefaultFileSessionOptions()
 	options.MaxFileSize = 5
-	if _, err := client.NewFileSession(ctx, options); !errors.Is(err, syscall.EINVAL) {
+	if _, _, err := client.NewFileSession(ctx, options); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("enrollment above server file cap = %v", err)
 	}
 	options.MaxFileSize = 4
-	session, err := client.NewFileSession(ctx, options)
+	session, _, err := client.NewFileSession(ctx, options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer session.Close(ctx)
-	file, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
-	if err != nil {
+	defer session.Close(ctx, retainedAction(t, session))
+	file := internalRetainFile(t, session, internalFileNode(t, backend))
+	if _, err := file.ReadAt(ctx, storage.FileReadRequest{Length: 4}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := file.ReadAt(ctx, 0, 4); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := file.WriteAt(ctx, 4, []byte("x")); !errors.Is(err, syscall.EFBIG) {
+	if _, err := file.WriteAt(ctx, storage.FileWriteRequest{Offset: 4, Data: []byte("x")}, retainedAction(t, session)); !errors.Is(err, syscall.EFBIG) {
 		t.Fatalf("session file cap lost across the wire: %v", err)
-	}
-}
-
-func TestRetainedHTTPAdvisoryActionErrorsUseSymbolicErrnos(t *testing.T) {
-	ctx := context.Background()
-	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
-	if err := backend.Write(ctx, "file", []byte("data")); err != nil {
-		t.Fatal(err)
-	}
-	session, file := openRetainedFixture(t, client)
-	status, err := session.Status(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	first, err := storage.NewLockRequestID(status.ActionEpoch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
-	if result, err := file.SetLock(ctx, 1, lock, first); err != nil || result.State != storage.LockGranted {
-		t.Fatalf("first grant = %+v, %v", result, err)
-	}
-	original := client.http.Transport
-	wireErrno := ""
-	client.http.Transport = fileRoundTripFunc(func(request *http.Request) (*http.Response, error) {
-		response, err := original.RoundTrip(request)
-		if err != nil {
-			return nil, err
-		}
-		body, err := io.ReadAll(response.Body)
-		response.Body.Close()
-		if err != nil {
-			return nil, err
-		}
-		var result struct{ Attempt struct{ Errno string } }
-		if err := json.Unmarshal(body, &result); err != nil {
-			return nil, err
-		}
-		wireErrno = result.Attempt.Errno
-		response.Body = io.NopCloser(bytes.NewReader(body))
-		return response, nil
-	})
-	second, err := storage.NewLockRequestID(status.ActionEpoch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := file.SetLock(ctx, 2, lock, second)
-	client.http.Transport = original
-	if err != nil || result.State != storage.LockRejected || result.Errno != syscall.EAGAIN || wireErrno != "EAGAIN" {
-		t.Fatalf("rejected lock result = %+v, wire errno %q, %v", result, wireErrno, err)
 	}
 }
 
@@ -655,21 +274,21 @@ type closeOrderSession struct {
 	backend *closeOrderBackend
 }
 
-func (b *closeOrderBackend) NewFileSession(ctx context.Context, o storage.FileSessionOptions) (storage.FileSession, error) {
-	s, err := b.Storage.NewFileSession(ctx, o)
+func (b *closeOrderBackend) NewFileSession(ctx context.Context, o storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
+	s, status, err := b.Storage.NewFileSession(ctx, o)
 	if err != nil {
-		return nil, err
+		return nil, status, err
 	}
-	return &closeOrderSession{FileSession: s, backend: b}, nil
+	return &closeOrderSession{FileSession: s, backend: b}, status, nil
 }
-func (s *closeOrderSession) Close(ctx context.Context) error {
+func (s *closeOrderSession) Close(ctx context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
 	s.backend.once.Do(func() { close(s.backend.entered) })
 	select {
 	case <-s.backend.release:
 	case <-ctx.Done():
-		return ctx.Err()
+		return storage.FileActionReceipt{}, ctx.Err()
 	}
-	return s.FileSession.Close(ctx)
+	return s.FileSession.Close(ctx, id)
 }
 
 func TestRetainedHTTPQueuedCloseDuringStopCannotAcknowledgeUndrainedCleanup(t *testing.T) {
@@ -697,15 +316,13 @@ func TestRetainedHTTPQueuedCloseDuringStopCannotAcknowledgeUndrainedCleanup(t *t
 			if err != nil {
 				t.Fatal(err)
 			}
-			session, err := client.NewFileSession(ctx, storage.DefaultFileSessionOptions())
+			session, _, err := client.NewFileSession(ctx, storage.DefaultFileSessionOptions())
 			if err != nil {
 				t.Fatal(err)
 			}
-			file, err := session.OpenFile(ctx, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			release, err := handler.lockControls.acquire(ctx, handler.lockControls.maxBytes)
+			file := internalRetainFile(t, session, internalFileNode(t, backend))
+			closeAction := retainedAction(t, session)
+			release, err := handler.fileControls.acquire(ctx, handler.fileControls.maxBytes)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -713,16 +330,18 @@ func TestRetainedHTTPQueuedCloseDuringStopCannotAcknowledgeUndrainedCleanup(t *t
 			outcome := make(chan error, 1)
 			go func() {
 				if operation == "file" {
-					outcome <- file.Close(ctx)
+					_, err := file.Close(ctx, closeAction)
+					outcome <- err
 				} else {
-					outcome <- session.Close(ctx)
+					_, err := session.Close(ctx, closeAction)
+					outcome <- err
 				}
 			}()
 			deadline := time.Now().Add(time.Second)
 			for {
-				handler.lockControls.mu.Lock()
-				waiting := handler.lockControls.waiters
-				handler.lockControls.mu.Unlock()
+				handler.fileControls.mu.Lock()
+				waiting := handler.fileControls.waiters
+				handler.fileControls.mu.Unlock()
 				if waiting > 0 {
 					break
 				}
@@ -780,7 +399,7 @@ func TestRetainedHTTPReadAllowsProgressWithoutInventingEOF(t *testing.T) {
 					return nil, err
 				}
 				result.Data = test.data
-				body, err = json.Marshal(result)
+				body, err = marshalFileJSON(result)
 				if err != nil {
 					return nil, err
 				}
@@ -789,7 +408,7 @@ func TestRetainedHTTPReadAllowsProgressWithoutInventingEOF(t *testing.T) {
 				response.Header.Set("Content-Length", strconv.Itoa(len(body)))
 				return response, nil
 			})
-			read, err := file.ReadAt(context.Background(), 0, 4)
+			read, err := file.ReadAt(context.Background(), storage.FileReadRequest{Length: 4})
 			if test.wantError {
 				if !errors.Is(err, syscall.EIO) {
 					t.Fatalf("inconsistent captured read = %+v, %v", read, err)
@@ -801,138 +420,456 @@ func TestRetainedHTTPReadAllowsProgressWithoutInventingEOF(t *testing.T) {
 	}
 }
 
-func TestRetainedHTTPUnlockReceiptDistinguishesReleaseFromAcquisition(t *testing.T) {
-	for _, family := range []storage.LockFamily{storage.Flock, storage.POSIX} {
-		t.Run(strconv.Itoa(int(family)), func(t *testing.T) {
+func TestRetainedHTTPRejectsMissingZeroValuedRequestMembers(t *testing.T) {
+	ctx := context.Background()
+	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
+	if err := backend.Write(ctx, "file", []byte("preserve")); err != nil {
+		t.Fatal(err)
+	}
+	session, file := openRetainedFixture(t, client)
+	complete := fileRequest{Op: storage.OpFileTruncate, Session: session.id, Reference: file.id, Action: retainedAction(t, session), Truncate: &fileTruncateRequest{Size: 0}}
+	encoded, err := marshalFileJSON(complete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, missing := range []string{"size", "truncate", "action", "reference", "session", "op"} {
+		t.Run(missing, func(t *testing.T) {
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(encoded, &fields); err != nil {
+				t.Fatal(err)
+			}
+			if missing == "size" {
+				fields["truncate"] = json.RawMessage(`{}`)
+			} else {
+				delete(fields, missing)
+			}
+			body, err := json.Marshal(fields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			endpoint, err := (Request{Op: OpFile}).URL(client.base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", contentJSON)
+			response, err := client.http.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode == http.StatusOK {
+				t.Fatalf("missing %s accepted", missing)
+			}
+			data, err := backend.Read(ctx, "file")
+			if err != nil || string(data) != "preserve" {
+				t.Fatalf("invalid request mutated native content=%q,%v", data, err)
+			}
+		})
+	}
+}
+func TestRetainedHTTPRejectsIncompleteRangeSnapshots(t *testing.T) {
+	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
+	if err := backend.Write(t.Context(), "file", []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	_, file := openRetainedFixture(t, client)
+	original := client.http.Transport
+	defer func() { client.http.Transport = original }()
+	for _, field := range []string{"Revision", "Own", "Other", "Available", "OwnerAvailable"} {
+		t.Run(field, func(t *testing.T) {
+			client.http.Transport = fileRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				response, err := original.RoundTrip(req)
+				if err != nil {
+					return nil, err
+				}
+				body, err := io.ReadAll(response.Body)
+				response.Body.Close()
+				if err != nil {
+					return nil, err
+				}
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(body, &fields); err != nil {
+					return nil, err
+				}
+				var ranges map[string]json.RawMessage
+				if err := json.Unmarshal(fields["ranges"], &ranges); err != nil {
+					return nil, err
+				}
+				delete(ranges, field)
+				fields["ranges"], err = json.Marshal(ranges)
+				if err != nil {
+					return nil, err
+				}
+				body, err = json.Marshal(fields)
+				if err != nil {
+					return nil, err
+				}
+				response.Body = io.NopCloser(bytes.NewReader(body))
+				response.ContentLength = int64(len(body))
+				response.Header.Set("Content-Length", strconv.Itoa(len(body)))
+				return response, nil
+			})
+			if result, err := file.RangeSnapshot(t.Context(), 0, storage.RangeScope{Domain: 1}); !errors.Is(err, syscall.EIO) || result.Revision != 0 {
+				t.Fatalf("incomplete range snapshot=%+v,%v", result, err)
+			}
+		})
+	}
+}
+func TestRetainedHTTPCleanupSurvivesNativeDataHistoryCapacity(t *testing.T) {
+	ctx := context.Background()
+	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
+	if err := backend.Write(ctx, "file", []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	options := storage.DefaultFileSessionOptions()
+	options.MaxActions = 1
+	session, _, err := client.NewFileSession(ctx, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := internalRetainFile(t, session, internalFileNode(t, backend))
+	r, err := file.WriteAt(ctx, storage.FileWriteRequest{Data: []byte("x")}, retainedAction(t, session))
+	if !errors.Is(err, syscall.EAGAIN) || r.Effects != 0 {
+		t.Fatalf("history capacity=%+v,%v", r, err)
+	}
+	if _, err := session.Renew(ctx); err != nil {
+		t.Fatalf("renew blocked by data history:%v", err)
+	}
+	if err := backend.Remove(ctx, "file"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Close(ctx, retainedAction(t, session)); err != nil {
+		t.Fatalf("cleanup blocked by data history:%v", err)
+	}
+	if used, err := backend.Usage(ctx); err != nil || used != 0 {
+		t.Fatalf("cleanup retained bytes=%d,%v", used, err)
+	}
+	if _, err := session.Close(ctx, retainedAction(t, session)); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestRetainedHTTPPureReadCancellationAfterDispatchIsEINTR(t *testing.T) {
+	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
+	if err := backend.Write(t.Context(), "file", []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	session, file := openRetainedFixture(t, client)
+	attr, err := file.Stat(t.Context(), storage.ObservationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := retainedAction(t, session)
+	cases := map[string]func(context.Context) error{
+		"read": func(ctx context.Context) error {
+			_, e := file.ReadAt(ctx, storage.FileReadRequest{Length: 4})
+			return e
+		},
+		"stat": func(ctx context.Context) error { _, e := file.Stat(ctx, storage.ObservationOptions{}); return e },
+		"stat-node": func(ctx context.Context) error {
+			_, e := session.StatNode(ctx, attr.Attr.ID, storage.ObservationOptions{})
+			return e
+		},
+		"range-snapshot": func(ctx context.Context) error {
+			_, e := file.RangeSnapshot(ctx, 0, storage.RangeScope{Domain: 1})
+			return e
+		},
+		"query-action": func(ctx context.Context) error { _, e := session.QueryAction(ctx, id); return e },
+		"status":       func(ctx context.Context) error { _, e := session.Status(ctx); return e },
+	}
+	original := client.http.Transport
+	defer func() { client.http.Transport = original }()
+	for name, call := range cases {
+		t.Run(name, func(t *testing.T) {
+			entered := make(chan struct{})
+			client.http.Transport = fileRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				close(entered)
+				<-r.Context().Done()
+				return nil, r.Context().Err()
+			})
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			result := make(chan error, 1)
+			go func() { result <- call(ctx) }()
+			<-entered
+			cancel()
+			if err := <-result; !errors.Is(err, syscall.EINTR) || !errors.Is(err, context.Canceled) {
+				t.Fatalf("read cancellation=%v", err)
+			}
+		})
+	}
+}
+
+func TestRetainedHTTPCancelledMutationPreservesConfirmedNativeEffects(t *testing.T) {
+	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
+	if err := backend.Write(t.Context(), "file", []byte("original")); err != nil {
+		t.Fatal(err)
+	}
+	session, file := openRetainedFixture(t, client)
+	id := retainedAction(t, session)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	original := client.http.Transport
+	defer func() { client.http.Transport = original }()
+	calls := []storage.Operation{}
+	client.http.Transport = fileRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		var op fileRequest
+		if err := json.Unmarshal(body, &op); err != nil {
+			return nil, err
+		}
+		calls = append(calls, op.Op)
+		response, err := original.RoundTrip(req)
+		if err != nil {
+			return nil, err
+		}
+		if op.Op == storage.OpFileTruncate {
+			_, err = io.Copy(io.Discard, response.Body)
+			response.Body.Close()
+			if err != nil {
+				return nil, err
+			}
+			cancel()
+			return nil, context.Canceled
+		}
+		return response, nil
+	})
+	receipt, err := file.Truncate(ctx, storage.FileTruncateRequest{Size: 0}, id)
+	client.http.Transport = original
+	if storage.ErrnoOf(err) != syscall.EIO || !errors.Is(err, context.Canceled) || storage.IsFileCallNotAdmitted(err) || receipt.Action != id || receipt.State != storage.FileActionUnknown || receipt.Effects != 0 || receipt.Reference != 0 {
+		t.Fatalf("uncertain cancelled mutation=%+v,%v", receipt, err)
+	}
+	if len(calls) != 1 || calls[0] != storage.OpFileTruncate {
+		t.Fatalf("HTTP automatically reconciled cancelled mutation: %v", calls)
+	}
+	receipt, err = session.QueryAction(t.Context(), id)
+	if err != nil || receipt.Action != id || receipt.State != storage.FileActionCompleted || receipt.Effects&storage.EffectContentChanged == 0 || receipt.Observation.Attr.Size != 0 {
+		t.Fatalf("explicit cancellation query=%+v,%v", receipt, err)
+	}
+	if err := backend.Write(t.Context(), "file", []byte("later")); err != nil {
+		t.Fatal(err)
+	}
+	repeated, err := session.QueryAction(t.Context(), id)
+	if err != nil || repeated.Observation.Attr.Size != 0 {
+		t.Fatalf("repeat receipt=%+v,%v", repeated, err)
+	}
+	if content, err := backend.Read(t.Context(), "file"); err != nil || string(content) != "later" {
+		t.Fatalf("replayed cancellation reapplied mutation=%q,%v", content, err)
+	}
+}
+func TestRetainedHTTPHistoryExhaustionCannotStrandOwnedRanges(t *testing.T) {
+	ctx := context.Background()
+	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
+	if err := backend.Write(ctx, "file", []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	options := storage.DefaultFileSessionOptions()
+	options.MaxActions = 2
+	session, _, err := client.NewFileSession(ctx, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := internalRetainFile(t, session, internalFileNode(t, backend))
+	scope := storage.RangeScope{Domain: 1}
+	snap, err := file.RangeSnapshot(ctx, 1, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := storage.RangeAcquisition{ID: 1, End: 99, Exclusive: true}
+	if _, err := file.ReplaceRanges(ctx, storage.RangeReplaceRequest{Owner: 1, Scope: scope, ExpectedRevision: snap.Revision, Ranges: []storage.RangeAcquisition{held}}, retainedAction(t, session)); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := file.WriteAt(ctx, storage.FileWriteRequest{Data: []byte("x")}, retainedAction(t, session)); !errors.Is(err, syscall.EAGAIN) || r.Effects != 0 {
+		t.Fatalf("full native history=%+v,%v", r, err)
+	}
+	if _, err := session.Close(ctx, retainedAction(t, session)); err != nil {
+		t.Fatalf("history stranded cleanup:%v", err)
+	}
+	observer, probe := openRetainedFixture(t, client)
+	_ = observer
+	snap, err = probe.RangeSnapshot(ctx, 2, scope)
+	if err != nil || len(snap.Other) != 0 {
+		t.Fatalf("cleanup retained ranges=%+v,%v", snap, err)
+	}
+	if _, err := file.ReadAt(ctx, storage.FileReadRequest{Length: 4}); err == nil {
+		t.Fatal("retired holder still allowed ordinary I/O")
+	}
+}
+func TestRetainedHTTPMinimumBodyLimitSupportsSessionAndFileCalls(t *testing.T) {
+	ctx := context.Background()
+	_, backend := memoryfixture.New(t, "small-http-file-body", 1<<20, locking.DefaultOptions())
+	if err := backend.Write(ctx, "file", []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	options := DefaultHandlerOptions()
+	options.MaxBodyBytes = max(fileControlRequestLimit(), fileControlResponseLimit())
+	handler, err := NewHandlerWithOptions(backend, nil, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	defer func() {
+		server.Close()
+		if err := handler.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	}()
+	dial := DefaultDialOptions()
+	dial.MaxBodyBytes = options.MaxBodyBytes
+	client, err := DialWithOptions(server.URL, server.Client(), dial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := client.NewFileSession(ctx, storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close(ctx, retainedAction(t, session))
+	file := internalRetainFile(t, session, internalFileNode(t, backend))
+	if _, err := session.Status(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Renew(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if read, err := file.ReadAt(ctx, storage.FileReadRequest{Length: 4}); err != nil || string(read.Data) != "data" {
+		t.Fatalf("minimum-body read=%+v,%v", read, err)
+	}
+	if _, err := file.WriteAt(ctx, storage.FileWriteRequest{Data: []byte("live")}, retainedAction(t, session)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Close(ctx, retainedAction(t, session)); err != nil {
+		t.Fatal(err)
+	}
+	dial.MaxBodyBytes--
+	undersized, err := DialWithOptions(server.URL, server.Client(), dial)
+	if err == nil {
+		if _, _, err := undersized.NewFileSession(ctx, storage.DefaultFileSessionOptions()); !errors.Is(err, syscall.EFBIG) {
+			t.Fatalf("under-sized control response admitted:%v", err)
+		}
+	}
+}
+func TestRetainedHTTPRangeActionErrorsUseSymbolicErrnos(t *testing.T) {
+	ctx := context.Background()
+	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
+	if err := backend.Write(ctx, "file", []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	session, file := openRetainedFixture(t, client)
+	scope := storage.RangeScope{Domain: 1}
+	lock := storage.RangeAcquisition{ID: 1, End: 99, Exclusive: true}
+	snap, err := file.RangeSnapshot(ctx, 1, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.ReplaceRanges(ctx, storage.RangeReplaceRequest{Owner: 1, Scope: scope, ExpectedRevision: snap.Revision, Ranges: []storage.RangeAcquisition{lock}}, retainedAction(t, session)); err != nil {
+		t.Fatal(err)
+	}
+	snap, err = file.RangeSnapshot(ctx, 2, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := retainedAction(t, session)
+	original := client.http.Transport
+	defer func() { client.http.Transport = original }()
+	wireErrno := ""
+	client.http.Transport = fileRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		response, err := original.RoundTrip(req)
+		if err != nil {
+			return nil, err
+		}
+		body, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		var result fileErrorResponse
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, err
+		}
+		wireErrno = result.Errno
+		if result.Receipt != nil && result.Receipt.Errno != wireErrno {
+			t.Errorf("receipt/wrapper errno diverged: %+v", result)
+		}
+		response.Body = io.NopCloser(bytes.NewReader(body))
+		return response, nil
+	})
+	result, err := file.ReplaceRanges(ctx, storage.RangeReplaceRequest{Owner: 2, Scope: scope, ExpectedRevision: snap.Revision, Ranges: []storage.RangeAcquisition{lock}}, id)
+	client.http.Transport = original
+	if !errors.Is(err, syscall.EAGAIN) || result.State != storage.FileActionNotApplied || result.Errno != syscall.EAGAIN || wireErrno != "EAGAIN" {
+		t.Fatalf("rejected range=%+v,wire=%q,%v", result, wireErrno, err)
+	}
+}
+
+func TestRetainedHTTPRangeReleasePreservesAcquisitionReceipt(t *testing.T) {
+	for _, domain := range []storage.RangeDomainID{1, 2} {
+		t.Run(strconv.FormatUint(uint64(domain), 10), func(t *testing.T) {
 			ctx := context.Background()
 			client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
 			if err := backend.Write(ctx, "file", []byte("data")); err != nil {
 				t.Fatal(err)
 			}
 			session, file := openRetainedFixture(t, client)
-			status, err := session.Status(ctx)
+			scope := storage.RangeScope{Domain: domain}
+			snap, err := file.RangeSnapshot(ctx, 0, scope)
 			if err != nil {
 				t.Fatal(err)
 			}
-			nextID := func() storage.LockRequestID {
-				id, err := storage.NewLockRequestID(status.ActionEpoch)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return id
+			acquisition := retainedAction(t, session)
+			lock := storage.RangeAcquisition{ID: 1, End: 99, Exclusive: true}
+			grant, err := file.ReplaceRanges(ctx, storage.RangeReplaceRequest{Owner: 0, Scope: scope, ExpectedRevision: snap.Revision, Ranges: []storage.RangeAcquisition{lock}}, acquisition)
+			if err != nil || grant.Effects&storage.EffectRangesChanged == 0 {
+				t.Fatalf("acquisition=%+v,%v", grant, err)
 			}
-			original := client.http.Transport
-			defer func() { client.http.Transport = original }()
-			var sent atomic.Value
-			client.http.Transport = fileRoundTripFunc(func(request *http.Request) (*http.Response, error) {
-				body, err := io.ReadAll(request.Body)
-				if err != nil {
-					return nil, err
-				}
-				request.Body = io.NopCloser(bytes.NewReader(body))
-				var wire fileRequest
-				if err := json.Unmarshal(body, &wire); err != nil {
-					return nil, err
-				}
-				sent.Store(wire.Op)
-				return original.RoundTrip(request)
-			})
-			lock := storage.FileLock{Family: family, Type: storage.Exclusive, End: math.MaxInt64}
-			acquisition := nextID()
-			if result, err := file.SetLock(ctx, 0, lock, acquisition); err != nil || result.State != storage.LockGranted || !result.EverGranted {
-				t.Fatalf("acquisition = %+v, %v", result, err)
+			snap, err = file.RangeSnapshot(ctx, 0, scope)
+			if err != nil || len(snap.Own) != 1 {
+				t.Fatalf("held=%+v,%v", snap, err)
 			}
-			if op := sent.Load(); op != storage.OpFileSetLock {
-				t.Fatalf("acquisition wire operation = %v; want %s", op, storage.OpFileSetLock)
+			release := retainedAction(t, session)
+			request := storage.RangeReplaceRequest{Owner: 0, Scope: scope, ExpectedRevision: snap.Revision, Ranges: []storage.RangeAcquisition{}}
+			removed, err := file.ReplaceRanges(ctx, request, release)
+			if err != nil || removed.State != storage.FileActionCompleted || removed.Effects&storage.EffectRangesChanged == 0 {
+				t.Fatalf("release=%+v,%v", removed, err)
 			}
-			unlock := lock
-			unlock.Type = storage.Unlock
-			release := nextID()
-			result, err := file.SetLock(ctx, 0, unlock, release)
-			if err != nil || result.State != storage.LockReleased || result.EverGranted || result.Lock != unlock {
-				t.Fatalf("explicit unlock receipt = %+v, %v", result, err)
+			repeated, err := file.ReplaceRanges(ctx, request, release)
+			if err != nil || repeated.Action != release || repeated.RangeRevision != removed.RangeRevision {
+				t.Fatalf("release replay=%+v,%v", repeated, err)
 			}
-			if op := sent.Load(); op != storage.OpFileUnlock {
-				t.Fatalf("unlock wire operation = %v; want %s", op, storage.OpFileUnlock)
+			historical, err := session.QueryAction(ctx, acquisition)
+			if err != nil || historical.Action != acquisition || historical.RangeRevision != grant.RangeRevision || historical.Effects != grant.Effects {
+				t.Fatalf("release rewrote acquisition=%+v,%v", historical, err)
 			}
-			result, err = file.QueryLock(ctx, 0, release)
-			if err != nil || result.State != storage.LockReleased || result.EverGranted || result.Lock != unlock {
-				t.Fatalf("queried unlock receipt = %+v, %v", result, err)
-			}
-			if err := file.DropLocks(ctx, 0, family); err != nil {
-				t.Fatal(err)
-			}
-			result, err = file.QueryLock(ctx, 0, acquisition)
-			if err != nil || result.State != storage.LockReleased || !result.EverGranted || result.Lock != lock {
-				t.Fatalf("released acquisition receipt = %+v, %v", result, err)
+			snap, err = file.RangeSnapshot(ctx, 0, scope)
+			if err != nil || len(snap.Own) != 0 || len(snap.Other) != 0 {
+				t.Fatalf("release replay installed a range=%+v,%v", snap, err)
 			}
 		})
 	}
 }
-
-type pendingCloseBackend struct {
-	*objectstore.Storage
-	calls   atomic.Int32
-	first   chan struct{}
-	second  chan struct{}
-	release chan struct{}
-}
-
-type pendingCloseSession struct {
-	storage.FileSession
-	backend *pendingCloseBackend
-}
-type pendingCloseFile struct {
-	storage.File
-	backend *pendingCloseBackend
-}
-
-func (b *pendingCloseBackend) NewFileSession(ctx context.Context, o storage.FileSessionOptions) (storage.FileSession, error) {
-	s, err := b.Storage.NewFileSession(ctx, o)
-	if err != nil {
-		return nil, err
-	}
-	return &pendingCloseSession{FileSession: s, backend: b}, nil
-}
-func (s *pendingCloseSession) OpenFile(ctx context.Context, path string, o storage.FileOpenOptions) (storage.File, error) {
-	f, err := s.FileSession.OpenFile(ctx, path, o)
-	if err != nil {
-		return nil, err
-	}
-	return &pendingCloseFile{File: f, backend: s.backend}, nil
-}
-func (f *pendingCloseFile) Close(ctx context.Context) error {
-	switch f.backend.calls.Add(1) {
-	case 1:
-		close(f.backend.first)
-	case 2:
-		close(f.backend.second)
-	}
-	select {
-	case <-f.backend.release:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	return f.File.Close(ctx)
-}
-
-func TestRetainedHTTPPendingExpiryRetainsCapabilityAndChargeUntilNativeClose(t *testing.T) {
+func TestRetainedHTTPExpiryRetainsSessionChargeUntilNativeClose(t *testing.T) {
 	ctx := context.Background()
 	_, native := memoryfixture.New(t, "pending-close-ownership", 1<<20, locking.DefaultOptions())
 	if err := native.Write(ctx, "file", []byte("retained")); err != nil {
 		t.Fatal(err)
 	}
-	backend := &pendingCloseBackend{Storage: native, first: make(chan struct{}), second: make(chan struct{}), release: make(chan struct{})}
+	backend := &closeOrderBackend{Storage: native, entered: make(chan struct{}), release: make(chan struct{})}
 	options := DefaultHandlerOptions()
 	options.Files = DefaultFileLimits()
-	options.Files.PendingAck = 20 * time.Millisecond
+	options.Files.MaxSessions = 1
 	handler, err := NewHandlerWithOptions(backend, nil, options)
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(handler)
-	var releaseOnce sync.Once
-	release := func() { releaseOnce.Do(func() { close(backend.release) }) }
+	var once sync.Once
+	release := func() { once.Do(func() { close(backend.release) }) }
 	defer func() {
 		release()
 		server.Close()
@@ -944,62 +881,113 @@ func TestRetainedHTTPPendingExpiryRetainsCapabilityAndChargeUntilNativeClose(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	sessionOptions := storage.DefaultFileSessionOptions()
-	sessionOptions.MaxFiles = 1
-	session, err := client.NewFileSession(ctx, sessionOptions)
+	session, _, err := client.NewFileSession(ctx, storage.DefaultFileSessionOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
+	file := internalRetainFile(t, session, internalFileNode(t, native))
+	_ = file
+	closeID := retainedAction(t, session)
 	remote := session.(*remoteFileSession)
-	opened, err := remote.call(ctx, fileRequest{Op: storage.OpFileOpen, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err := native.Remove(ctx, "file"); err != nil {
 		t.Fatal(err)
-	}
-	select {
-	case <-backend.first:
-	case <-time.After(2 * time.Second):
-		t.Fatal("pending expiry did not enter native Close")
 	}
 	handler.files.mu.Lock()
 	served := handler.files.sessions[remote.id]
 	handler.files.mu.Unlock()
 	served.mu.Lock()
-	entry := served.files[opened.File]
-	count := len(served.files)
-	closing := entry != nil && entry.closing
+	served.expires = time.Now().Add(-time.Second)
 	served.mu.Unlock()
-	if entry == nil || !closing || count != 1 {
-		t.Fatalf("pending close lost capability or reference admission charge: entry=%v closing=%v count=%d", entry != nil, closing, count)
+	select {
+	case <-backend.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expiry did not enter native cleanup")
 	}
-	if usage, err := native.Usage(ctx); err != nil || usage != 8 {
-		t.Fatalf("pending close refunded native bytes: %d, %v", usage, err)
+	handler.files.mu.Lock()
+	count := len(handler.files.sessions)
+	retained := handler.files.sessions[remote.id]
+	handler.files.mu.Unlock()
+	if retained != served || count != 1 {
+		t.Fatalf("pending cleanup lost session ownership/charge=%d", count)
+	}
+	if used, err := native.Usage(ctx); err != nil || used != 8 {
+		t.Fatalf("pending cleanup refunded native bytes=%d,%v", used, err)
+	}
+	if _, _, err := client.NewFileSession(ctx, storage.DefaultFileSessionOptions()); !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("pending cleanup freed enrollment charge:%v", err)
 	}
 	outcome := make(chan error, 1)
-	go func() {
-		_, err := client.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: remote.id, File: opened.File})
-		outcome <- err
-	}()
+	go func() { _, err := session.Close(ctx, closeID); outcome <- err }()
 	select {
 	case err := <-outcome:
-		t.Fatalf("explicit Close answered before native drain: %v", err)
-	case <-backend.second:
-	case <-time.After(2 * time.Second):
-		t.Fatal("explicit Close did not reach the retained native reference")
+		t.Fatalf("explicit close acknowledged undrained cleanup:%v", err)
+	case <-time.After(20 * time.Millisecond):
 	}
 	release()
 	if err := <-outcome; err != nil {
 		t.Fatal(err)
 	}
-	if usage, err := native.Usage(ctx); err != nil || usage != 0 {
-		t.Fatalf("known cleanup did not reclaim bytes: %d, %v", usage, err)
+	if used, err := native.Usage(ctx); err != nil || used != 0 {
+		t.Fatalf("confirmed cleanup retained bytes=%d,%v", used, err)
 	}
-	served.mu.Lock()
-	count = len(served.files)
-	served.mu.Unlock()
-	if count != 0 {
-		t.Fatalf("known cleanup retained %d capability charges", count)
+}
+
+func TestRetainedHTTPStrongConflictPreservesNativeClassificationAndReceipt(t *testing.T) {
+	ctx := t.Context()
+	client, handler, backend := retainedHTTPFixture(t, DefaultFileLimits())
+	if err := backend.Write(ctx, "file", []byte("preserve")); err != nil {
+		t.Fatal(err)
+	}
+	session, file := openRetainedFixture(t, client)
+	owner := lockServerOwner(t, client)
+	grant := lockServerGrant(t, client, owner, "file")
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			if _, err := client.Release(context.Background(), owner, grant); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	action := retainedAction(t, session)
+	receipt, err := file.WriteAt(ctx, storage.FileWriteRequest{Data: []byte("CHANGED!")}, action)
+	var refusal *locking.Error
+	if !errors.As(err, &refusal) || refusal.Code != locking.Conflict || refusal.Recorded || !errors.Is(err, syscall.EBUSY) || storage.ErrnoOf(err) != syscall.EBUSY {
+		t.Fatalf("retained strong refusal=%+v, error=%v", refusal, err)
+	}
+	if receipt.Action != action || receipt.Operation != storage.OpFileWrite || receipt.State != storage.FileActionNotApplied || receipt.Effects != 0 || receipt.Errno != syscall.EBUSY {
+		t.Fatalf("strong refusal receipt=%+v", receipt)
+	}
+	handler.files.mu.Lock()
+	served := handler.files.sessions[session.id]
+	handler.files.mu.Unlock()
+	if served == nil {
+		t.Fatal("refused mutation lost its native session")
+	}
+	native, nativeErr := served.native.QueryAction(ctx, action)
+	var nativeRefusal *locking.Error
+	if !errors.As(nativeErr, &nativeRefusal) || nativeRefusal.Code != refusal.Code || nativeRefusal.Recorded != refusal.Recorded || storage.ErrnoOf(nativeErr) != storage.ErrnoOf(err) {
+		t.Fatalf("native/HTTP refusal diverged: native=%+v/%v, HTTP=%+v/%v", nativeRefusal, nativeErr, refusal, err)
+	}
+	if native.Action != receipt.Action || native.Operation != receipt.Operation || native.State != receipt.State || native.Effects != receipt.Effects || native.Reference != receipt.Reference || native.Errno != receipt.Errno {
+		t.Fatalf("HTTP changed native receipt: native=%+v, HTTP=%+v", native, receipt)
+	}
+	if content, err := backend.Read(ctx, "file"); err != nil || string(content) != "preserve" {
+		t.Fatalf("strong refusal changed content=%q,%v", content, err)
+	}
+	if _, err := client.Release(ctx, owner, grant); err != nil {
+		t.Fatal(err)
+	}
+	released = true
+	replay, replayErr := session.QueryAction(ctx, action)
+	var replayRefusal *locking.Error
+	if !errors.As(replayErr, &replayRefusal) || replayRefusal.Code != locking.Conflict || replayRefusal.Recorded != nativeRefusal.Recorded || replay.State != native.State || replay.Effects != 0 {
+		t.Fatalf("release erased historical strong refusal=%+v,%v", replay, replayErr)
+	}
+	if _, err := file.WriteAt(ctx, storage.FileWriteRequest{Data: []byte("allowed!")}, retainedAction(t, session)); err != nil {
+		t.Fatalf("released strong grant still blocked write:%v", err)
+	}
+	if content, err := backend.Read(ctx, "file"); err != nil || string(content) != "allowed!" {
+		t.Fatalf("post-release content=%q,%v", content, err)
 	}
 }

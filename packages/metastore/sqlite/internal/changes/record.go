@@ -10,6 +10,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // The numbers the log stores for metastore.ChangeKind.
@@ -74,23 +75,44 @@ func Record(ctx context.Context, tx *sql.Tx, volume int64, change metastore.Chan
 	}
 	if change.Node != nil {
 		lengths.Content = int64(len(change.Node.Content))
+		lengths.Target = int64(len(change.Node.LinkTarget))
+		metadata, err := storage.EncodeMetadata(change.Node.Metadata)
+		if err != nil {
+			return err
+		}
+		lengths.Metadata = int64(len(metadata))
 	}
 	if err := lengths.Check(); err != nil {
 		return err
 	}
 
+	identityHighWater, err := metastore.NotificationIdentityHighWater(change.Notification)
+	if err != nil {
+		return err
+	}
 	var fromParent, fromName any
 	if change.From != nil {
 		fromParent, fromName = change.From.Parent, change.From.Name
 	}
-	var node, mode, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec, content any
+	var node, nodeKind, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec, content any
+	var creationSec, creationNsec, changeSec, changeNsec, metadataRevision, directoryRevision, metadata, target any
 	if change.Node != nil {
-		accessSec, accessNsec := sqlvalue.StoredTime(change.Node.AccessTime)
-		changeSec, changeNsec := sqlvalue.StoredTime(change.Node.ModTime)
-		node, mode, size = change.Node.ID, int64(change.Node.Mode), change.Node.Size
+		n := change.Node
+		accessSec, accessNsec := sqlvalue.StoredTime(n.AccessTime)
+		modifiedSec, modifiedNsec := sqlvalue.StoredTime(n.ModTime)
+		node, nodeKind, size = n.ID, int64(n.Kind), n.Size
 		atimeSec, atimeNsec = accessSec, accessNsec
-		mtimeSec, mtimeNsec = changeSec, changeNsec
-		content = sqlvalue.StoredKey(change.Node.Content)
+		mtimeSec, mtimeNsec = modifiedSec, modifiedNsec
+		creationSec, creationNsec = storedOptionalTime(n.CreationTime)
+		changeSec, changeNsec = storedOptionalTime(n.ChangeTime)
+		metadataRevision, directoryRevision = int64(n.MetadataRevision), int64(n.DirectoryRevision)
+		encoded, err := storage.EncodeMetadata(n.Metadata)
+		if err != nil {
+			return err
+		}
+		metadata = encoded
+		target = append([]byte{}, n.LinkTarget...)
+		content = sqlvalue.StoredKey(n.Content)
 	}
 
 	sec, nsec := sqlvalue.StoredTime(time.Now())
@@ -116,12 +138,14 @@ func Record(ctx context.Context, tx *sql.Tx, volume int64, change metastore.Chan
 			previous, position, syscall.EIO)
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO changes (position, previous_position, volume, kind, parent, name, from_parent, from_name,
-		                     node, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content,
-		                     recorded_sec, recorded_nsec, notification)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		position, previous, volume, kind, change.Parent, change.Name, fromParent, fromName,
-		node, mode, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec, content,
+  INSERT INTO changes(position,previous_position,identity_high_water,volume,kind,parent,name,from_parent,from_name,
+   node,node_kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,
+   creation_sec,creation_nsec,change_sec,change_nsec,metadata_revision,directory_revision,metadata,link_target,
+   recorded_sec,recorded_nsec,notification)
+  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		position, previous, identityHighWater, volume, kind, change.Parent, change.Name, fromParent, fromName,
+		node, nodeKind, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec, content,
+		creationSec, creationNsec, changeSec, changeNsec, metadataRevision, directoryRevision, metadata, target,
 		sec, nsec, notification)
 	if err != nil {
 		return err
@@ -156,4 +180,12 @@ func CreateLog(ctx context.Context, tx *sql.Tx, volume int64) error {
 		INSERT INTO logs (volume, incarnation, committed_position, trimmed_through, trimmed_by_age)
 		VALUES (?, ?, 0, 0, 0)`, volume, string(incarnation))
 	return err
+}
+
+func storedOptionalTime(value *time.Time) (any, any) {
+	if value == nil {
+		return nil, nil
+	}
+	sec, nsec := sqlvalue.StoredTime(*value)
+	return sec, nsec
 }

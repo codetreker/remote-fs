@@ -1,7 +1,6 @@
 package smb
 
 import (
-	"io/fs"
 	"testing"
 
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
@@ -13,12 +12,12 @@ func TestProtocolAsyncCancelAndResourceRejectionKeepConnectionUsable(t *testing.
 	config.Limits.MaxRequests = 1
 	config.Limits.MaxCompound = 1
 	s, c := startConfiguredServer(t, config)
-	f := &sessionFile{commandFile: &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 1, Mode: fs.ModeDir}}, NameInfo: storage.WindowsNameInfo{State: storage.WindowsNameRoot}}}, pending: true}
-	ws := &backendSession{commandSession: &commandSession{}, cancelState: storage.WindowsActionCancelled}
-	ws.open = func(storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
-		return storage.WindowsOpenResult{File: f, Attr: f.attr, CreateAction: storage.WindowsOpened}, nil
+	f := &sessionFile{commandFile: &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}, NameInfo: windowsNameInfo{State: windowsNameRoot}}}, pending: true}
+	ws := &backendSession{commandSession: &commandSession{}, cancelState: windowsActionCancelled}
+	ws.open = func(windowsOpenRequest) (windowsOpenResult, error) {
+		return windowsOpenResult{File: f, Attr: f.attr, CreateAction: windowsOpened}, nil
 	}
-	if _, err := s.Publish(Share{Name: "work", Volume: "trusted", Backend: &sessionBackend{session: ws}, Changes: testNotifySource(testNotifyStream())}); err != nil {
+	if _, err := s.publish(Share{Name: "work", Volume: "trusted", Changes: testNotifySource(testNotifyStream())}, &sessionBackend{session: ws}); err != nil {
 		t.Fatal(err)
 	}
 	session, key := authenticateProtocol(t, c)

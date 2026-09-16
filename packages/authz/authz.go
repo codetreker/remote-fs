@@ -1,6 +1,6 @@
 // Package authz describes volume operations for a host-provided authorization policy.
 // The host authenticates callers, stores identity in context, and supplies current
-// decisions. This package defines neither identities nor path-level permissions.
+// decisions. This package defines no authentication mechanism or platform permissions.
 package authz
 
 import (
@@ -15,11 +15,16 @@ import (
 type AccessRequest struct {
 	Volume    string
 	Operation storage.Operation
-	// Open preserves the validated storage.OpFileOpen or storage.OpFileOpenNode
-	// intent. Other operations carry its zero value.
-	Open storage.OpenAccess
-	// WindowsOpen preserves the complete validated Windows open intent.
-	WindowsOpen storage.WindowsOpenIntent
+	// Effects describes every possible effect of the validated fixed operation,
+	// including its optional preparation. It is not a caller-supplied receipt.
+	Effects storage.FileEffects
+	Claim   storage.AccessClaim
+	// References and node identities describe the operation's supplied targets.
+	// They do not replace the authority's ownership and revision checks.
+	Reference   storage.FileReferenceID
+	Node        uint64
+	Parent      storage.FileReferenceID
+	Destination storage.FileReferenceID
 }
 
 // Authorizer reads the host's current policy using identity from ctx. It must

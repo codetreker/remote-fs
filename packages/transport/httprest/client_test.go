@@ -7,16 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"maps"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
@@ -276,14 +277,18 @@ func TestWriteAndProtocolBodiesHaveSeparateLimits(t *testing.T) {
 		writeLimit = int64(4 << 20)
 		bodyLimit  = int64(5 << 20)
 	)
-	entries := make([]storage.Entry, 17_000)
+	entries := make([]storage.Entry, 16_000)
 	for i := range entries {
 		entries[i] = storage.Entry{
 			Name: fmt.Sprintf("%05d-%s", i, strings.Repeat("n", 74)),
-			Attr: storage.Attr{ID: uint64(i + 1), Mode: 0o600},
+			Attr: storage.Attr{ID: uint64(i + 1), Kind: storage.NodeRegular, MetadataRevision: 1},
 		}
 	}
-	encoded, err := json.Marshal(httprest.ListResponse{Entries: httprest.EntriesOf(entries)})
+	wireEntries, err := httprest.EntriesOf(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(httprest.ListResponse{Entries: wireEntries})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,8 +372,8 @@ func (s listingStorage) ListBounded(_ context.Context, _ string, result *storage
 
 func TestClientListBoundedInvalidatesAnEarlyDecodedPrefix(t *testing.T) {
 	entries := []storage.Entry{
-		{Name: "a", Attr: storage.Attr{ID: 1, Mode: 0o600}},
-		{Name: "b", Attr: storage.Attr{ID: 2, Mode: 0o600}},
+		{Name: "a", Attr: storage.Attr{ID: 1, Kind: storage.NodeRegular, MetadataRevision: 1}},
+		{Name: "b", Attr: storage.Attr{ID: 2, Kind: storage.NodeRegular, MetadataRevision: 1}},
 	}
 	h, err := httprest.NewHandler(listingStorage{failing: failingStorage(t, syscall.EIO), entries: entries}, nil)
 	if err != nil {
@@ -380,7 +385,7 @@ func TestClientListBoundedInvalidatesAnEarlyDecodedPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := storage.NewListResult(1024, 0, func(_ int, _ int64, _ storage.Attr) (int64, error) {
+	result, err := storage.NewListResult(1024, 0, func(_ int, _, _ int64, _ storage.Attr) (int64, error) {
 		return 600, nil
 	})
 	if err != nil {
@@ -396,10 +401,14 @@ func TestClientListBoundedInvalidatesAnEarlyDecodedPrefix(t *testing.T) {
 
 func TestClientListBoundedStreamsACompleteStrictListing(t *testing.T) {
 	want := []storage.Entry{
-		{Name: "b", Attr: storage.Attr{ID: 2, Mode: 0o600, Size: 7}},
-		{Name: "a", Attr: storage.Attr{ID: 1, Mode: fs.ModeDir | 0o700}},
+		{Name: "b", Attr: storage.Attr{ID: 2, Kind: storage.NodeRegular, MetadataRevision: 1, Size: 7, AccessTime: time.Unix(0, 0), ModTime: time.Unix(0, 0), Metadata: storage.Metadata{{Key: "client.example", Version: 1, Data: []byte{0, 6, 0}}}}},
+		{Name: "a", Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory, MetadataRevision: 1, DirectoryRevision: 1, AccessTime: time.Unix(0, 0), ModTime: time.Unix(0, 0), Metadata: storage.Metadata{{Key: "client.example", Version: 1, Data: []byte{0, 7, 0}}}}},
 	}
-	body, err := json.Marshal(httprest.ListResponse{Entries: httprest.EntriesOf(want)})
+	wireEntries, err := httprest.EntriesOf(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(httprest.ListResponse{Entries: wireEntries})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +422,7 @@ func TestClientListBoundedStreamsACompleteStrictListing(t *testing.T) {
 		t.Fatal(err)
 	}
 	slices.SortFunc(want, func(a, b storage.Entry) int { return strings.Compare(a.Name, b.Name) })
-	if !slices.Equal(got, want) {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("streamed listing = %+v, want %+v", got, want)
 	}
 }
@@ -464,8 +473,8 @@ func dialListingBody(t *testing.T, body []byte) *httprest.Storage {
 
 func newClientListResult(t *testing.T) *storage.ListResult {
 	t.Helper()
-	result, err := storage.NewListResult(1<<20, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
-		return nameBytes + 256, nil
+	result, err := storage.NewListResult(1<<20, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		return nameBytes + metadataBytes + 256, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -724,8 +733,12 @@ func TestEveryAnswerDeclaresItsLength(t *testing.T) {
 				{"read an empty file", func() error { return s.Write(ctx, "d/empty", nil) }},
 				{"stat", func() error { _, err := s.Stat(ctx, "d/f"); return err }},
 				{"setattr", func() error {
-					mode := fs.FileMode(0o600)
-					return s.SetAttr(ctx, "d/f", storage.AttrChange{Mode: &mode})
+					metadata := storage.Metadata{{Key: "client.example", Version: 1, Data: []byte{0, 6, 0}}}
+					attr, err := s.Stat(ctx, "d/f")
+					if err != nil {
+						return err
+					}
+					return s.SetAttr(ctx, "d/f", storage.AttrChange{ExpectedRevision: attr.MetadataRevision, Metadata: &metadata})
 				}},
 				{"list", func() error { _, err := s.List(ctx, "d"); return err }},
 				{"rename", func() error { return s.Rename(ctx, "d/f", "d/g") }},

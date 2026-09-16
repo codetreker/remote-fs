@@ -45,7 +45,7 @@ Status: proposed
 
 代价：客户端需要一份「(父节点, 名字) → 子节点」的反向索引，因为内核的目录项失效是按名字寻址的。
 
-FileSession.OpenNode、StatNode 与 SetNodeAttr 已按身份访问，File 持有同一普通文件并跨越改名、同名替换与 unlink；失效时明确失败，不按旧路径重开。强锁资源另行限定一次授予保护哪个仍具名字的文件，同名替换或 unlink 可退休其资源。完整目录操作、创建链接及分页仍不因有了文件句柄而全部转为本表的形状。
+FileSession 的 Retain／RetainAt、StatNode、SetNodeAttr 与 File 按身份访问，文件／目录／链接可以保留；条件创建、目录分页与位置 witness 由[平台隔离决定](../../implemented/architecture/2026-09-16-isolate-platform-filesystem-clients.md)落地。失效身份不按路径重建，强锁资源仍限定授予保护的命名对象。本提案的显式内容版本工作流和每个入口如何采用全部身份操作仍有独立范围，不因共同原语存在而宣称完成。
 
 ### 版本
 

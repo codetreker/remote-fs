@@ -32,7 +32,7 @@ func TestUnpublishTimeoutRetainsNameUntilCleanupCompletes(t *testing.T) {
 	source.Resume = func(context.Context, metastore.Incarnation, metastore.Position) (ChangeStream, error) {
 		return stream, nil
 	}
-	e, err := s.Publish(Share{Name: "work", Volume: "trusted", Backend: &sessionBackend{}, Changes: source})
+	e, err := s.publish(Share{Name: "work", Volume: "trusted", Changes: source}, &sessionBackend{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestUnpublishTimeoutRetainsNameUntilCleanupCompletes(t *testing.T) {
 	if s.Status().StoppingExports != 1 {
 		t.Fatal("cleanup state lost")
 	}
-	if _, err := s.Publish(Share{Name: "WORK", Volume: "trusted", Backend: &sessionBackend{}, Changes: testNotifySource(testNotifyStream())}); !errors.Is(err, ErrBusy) {
+	if _, err := s.publish(Share{Name: "WORK", Volume: "trusted", Changes: testNotifySource(testNotifyStream())}, &sessionBackend{}); !errors.Is(err, ErrBusy) {
 		t.Fatal(err)
 	}
 	close(stream.release)

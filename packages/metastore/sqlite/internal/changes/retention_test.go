@@ -34,7 +34,12 @@ func TestTrimHonorsVolumeAgeFloorAndVolume(t *testing.T) {
 			foreignChange.Parent = 3
 			foreignChange.Node.ID = 4
 			foreignChange.Notification.SubjectID = 4
-			foreignChange.Notification.After.Ancestors[0].DirectoryID = 3
+			foreignChange.Notification.After.Attr.ID = 4
+			foreignChange.Notification.After.Location.RootNodeID = 3
+			foreignChange.Notification.After.Location.NodeID = 4
+			foreignChange.Notification.After.Location.Ancestors[0].ParentID = 3
+			foreignChange.Notification.After.Location.Ancestors[0].NodeID = 4
+			foreignChange.Notification.After.Location.Ancestors[0].EntryID = 6
 			if err := Record(t.Context(), tx, 2, foreignChange); err != nil {
 				t.Fatal(err)
 			}

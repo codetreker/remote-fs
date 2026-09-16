@@ -16,7 +16,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
+	"math"
+	"reflect"
 	"slices"
 	"syscall"
 	"testing"
@@ -66,7 +67,7 @@ var rootCases = []testCase{
 				t.Fatalf("stat %q: %v", p, err)
 			}
 			if !node.IsDir() {
-				t.Fatalf("stat %q has mode %v, want a directory", p, node.Mode)
+				t.Fatalf("stat %q has kind %v, want a directory", p, node.Kind)
 			}
 			if node.Content != "" {
 				t.Fatalf("stat %q references object %q, want a directory to reference nothing", p, node.Content)
@@ -124,12 +125,13 @@ var rootCases = []testCase{
 
 	{name: "the root takes attributes like any directory", run: func(t *testing.T, s metastore.Store) {
 		changed := time.Date(2021, 3, 4, 5, 6, 7, 89, time.UTC)
-		mustSucceed(t, s.SetAttr(ctx(t), "", storage.AttrChange{Mode: mode(0o750), ModTime: &changed}))
+		mustSucceed(t, s.SetAttr(ctx(t), "", withMetadata(t, s, "", []byte("root"), storage.AttrChange{ModTime: &changed})))
 		node, err := s.Stat(ctx(t), "")
 		mustSucceed(t, err)
-		if !node.IsDir() || node.Mode.Perm() != 0o750 || !node.ModTime.Equal(changed) {
-			t.Fatalf("the root has mode %v and modification time %v, want a directory of 0750 at %v",
-				node.Mode, node.ModTime.UTC(), changed)
+		mustMetadata(t, node, []byte("root"))
+		if !node.IsDir() || !node.ModTime.Equal(changed) {
+			t.Fatalf("the root has kind %v and modification time %v, want a directory at %v",
+				node.Kind, node.ModTime.UTC(), changed)
 		}
 	}},
 }
@@ -147,7 +149,7 @@ var pathCases = []testCase{
 			mustFail(t, s.Mkdir(ctx(t), p), syscall.EINVAL)
 			mustFail(t, s.Remove(ctx(t), p), syscall.EINVAL)
 			mustFail(t, s.RemoveDir(ctx(t), p), syscall.EINVAL)
-			mustFail(t, s.SetAttr(ctx(t), p, storage.AttrChange{Mode: mode(0o600)}), syscall.EINVAL)
+			mustFail(t, s.SetAttr(ctx(t), p, storage.AttrChange{ModTime: &contractAttributeTime}), syscall.EINVAL)
 			mustFail(t, s.Rename(ctx(t), p, "x"), syscall.EINVAL)
 			mustFail(t, s.Rename(ctx(t), "x", p), syscall.EINVAL)
 		}
@@ -180,7 +182,7 @@ var pathCases = []testCase{
 				mustFailAt(t, c.path, s.Mkdir(ctx(t), c.path), c.want)
 				mustFailAt(t, c.path, s.Remove(ctx(t), c.path), c.want)
 				mustFailAt(t, c.path, s.RemoveDir(ctx(t), c.path), c.want)
-				mustFailAt(t, c.path, s.SetAttr(ctx(t), c.path, storage.AttrChange{Mode: mode(0o600)}), c.want)
+				mustFailAt(t, c.path, s.SetAttr(ctx(t), c.path, storage.AttrChange{ModTime: &contractAttributeTime}), c.want)
 				mustFailAt(t, c.path, s.Rename(ctx(t), "f", c.path), c.want)
 			}
 			mustHoldExactly(t, s, "d", "f")
@@ -193,18 +195,18 @@ var pathCases = []testCase{
 		mustFail(t, err, syscall.ENOENT)
 		mustFail(t, s.Remove(ctx(t), "missing"), syscall.ENOENT)
 		mustFail(t, s.RemoveDir(ctx(t), "missing"), syscall.ENOENT)
-		mustFail(t, s.SetAttr(ctx(t), "missing", storage.AttrChange{Mode: mode(0o600)}), syscall.ENOENT)
+		mustFail(t, s.SetAttr(ctx(t), "missing", storage.AttrChange{ModTime: &contractAttributeTime}), syscall.ENOENT)
 		mustFail(t, s.Rename(ctx(t), "missing", "elsewhere"), syscall.ENOENT)
 	}},
 }
 
 var nodeCases = []testCase{
-	{name: "a new file is empty, references nothing, and is 0644", run: func(t *testing.T, s metastore.Store) {
+	{name: "a new file is empty and has generic file facts", run: func(t *testing.T, s metastore.Store) {
 		mustSucceed(t, s.Create(ctx(t), "f"))
 		node, err := s.Stat(ctx(t), "f")
 		mustSucceed(t, err)
-		if node.IsDir() || node.Mode.Perm() != 0o644 {
-			t.Fatalf("the new file has mode %v, want a file of 0644", node.Mode)
+		if node.Kind != storage.NodeRegular || len(node.Metadata) != 0 || node.MetadataRevision == 0 || node.DirectoryRevision != 0 {
+			t.Fatalf("the new file has kind %v, want a regular file", node.Kind)
 		}
 		if node.Size != 0 {
 			t.Fatalf("the new file holds %d bytes, want none", node.Size)
@@ -216,12 +218,12 @@ var nodeCases = []testCase{
 		}
 	}},
 
-	{name: "a new directory is 0755 and empty", run: func(t *testing.T, s metastore.Store) {
+	{name: "a new directory is empty and has a directory revision", run: func(t *testing.T, s metastore.Store) {
 		mustSucceed(t, s.Mkdir(ctx(t), "d"))
 		node, err := s.Stat(ctx(t), "d")
 		mustSucceed(t, err)
-		if !node.IsDir() || node.Mode.Perm() != 0o755 {
-			t.Fatalf("the new directory has mode %v, want a directory of 0755", node.Mode)
+		if node.Kind != storage.NodeDirectory || len(node.Metadata) != 0 || node.MetadataRevision == 0 || node.DirectoryRevision == 0 {
+			t.Fatalf("the new directory has kind %v, want a directory", node.Kind)
 		}
 		children, err := s.List(ctx(t), "d")
 		mustSucceed(t, err)
@@ -334,7 +336,7 @@ var nodeCases = []testCase{
 		node, err := s.Stat(ctx(t), "a/b/c/deep")
 		mustSucceed(t, err)
 		if node.IsDir() {
-			t.Fatalf("a/b/c/deep has mode %v, want a file", node.Mode)
+			t.Fatalf("a/b/c/deep has kind %v, want a file", node.Kind)
 		}
 		if got := names(mustList(t, s, "a/b/c")); !slices.Equal(got, []string{"deep"}) {
 			t.Fatalf("a/b/c holds %q, want [deep]", got)
@@ -343,90 +345,84 @@ var nodeCases = []testCase{
 }
 
 var attrCases = []testCase{
-	{name: "a mode is set and read back", run: func(t *testing.T, s metastore.Store) {
+	{name: "opaque metadata is set and read back without changing node kind", run: func(t *testing.T, s metastore.Store) {
 		mustSucceed(t, s.Create(ctx(t), "f"))
-		for _, want := range []fs.FileMode{0o600, 0o777, 0o000, 0o444} {
-			mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{Mode: mode(want)}))
-			node, err := s.Stat(ctx(t), "f")
-			mustSucceed(t, err)
-			if node.Mode.Perm() != want {
-				t.Fatalf("the file has mode %v, want %v", node.Mode, want)
-			}
-			// Setting permissions does not turn a file into something else.
-			if node.IsDir() || node.Mode.Type() != 0 {
-				t.Fatalf("the file has type bits %v, want a plain file", node.Mode.Type())
+		for _, data := range [][]byte{{0xff, 0}, {1, 2, 3}, {}, {0x80, 0xfe}} {
+			before := mustStat(t, s, "f")
+			mustSucceed(t, s.SetAttr(ctx(t), "f", withMetadata(t, s, "f", data, storage.AttrChange{})))
+			node := mustStat(t, s, "f")
+			mustMetadata(t, node, data)
+			if node.Kind != storage.NodeRegular || node.MetadataRevision <= before.MetadataRevision {
+				t.Fatalf("metadata changed node kind or failed to advance revision: %+v", node)
 			}
 		}
 	}},
-
-	// The three bits that change how the permission bits are applied travel in
-	// storage.SettableMode with them, so they are set and cleared like any other bit.
-	{name: "setuid, setgid and sticky are set and cleared", run: func(t *testing.T, s metastore.Store) {
+	{name: "opaque values retain unknown versions and can be cleared independently", run: func(t *testing.T, s metastore.Store) {
 		mustSucceed(t, s.Create(ctx(t), "f"))
-		special := []fs.FileMode{fs.ModeSetuid, fs.ModeSetgid, fs.ModeSticky}
-		for _, bit := range append(slices.Clone(special), fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky) {
-			mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{Mode: mode(0o755 | bit)}))
-			node, err := s.Stat(ctx(t), "f")
-			mustSucceed(t, err)
-			if node.Mode&storage.SettableMode != 0o755|bit {
-				t.Fatalf("the file has mode %v, want %v", node.Mode, 0o755|bit)
-			}
-
-			mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{Mode: mode(0o755)}))
-			node, err = s.Stat(ctx(t), "f")
-			mustSucceed(t, err)
-			if node.Mode&storage.SettableMode != 0o755 {
-				t.Fatalf("clearing %v left mode %v, want 0755", bit, node.Mode)
-			}
+		original := storage.Metadata{{Key: "first", Version: math.MaxUint32, Data: []byte{0xff, 1}}, {Key: "second", Version: 7, Data: []byte{0, 2}}}
+		node := mustStat(t, s, "f")
+		mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{ExpectedRevision: node.MetadataRevision, Metadata: &original}))
+		node = mustStat(t, s, "f")
+		if !reflect.DeepEqual(node.Metadata, original) {
+			t.Fatalf("opaque values changed: %+v", node.Metadata)
+		}
+		retained := storage.Metadata{original[1]}
+		mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{ExpectedRevision: node.MetadataRevision, Metadata: &retained}))
+		node = mustStat(t, s, "f")
+		if !reflect.DeepEqual(node.Metadata, retained) {
+			t.Fatalf("clearing one value changed another: %+v", node.Metadata)
+		}
+		empty := storage.Metadata{}
+		mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{ExpectedRevision: node.MetadataRevision, Metadata: &empty}))
+		node = mustStat(t, s, "f")
+		if len(node.Metadata) != 0 || node.Kind != storage.NodeRegular {
+			t.Fatalf("clearing metadata changed node kind: %+v", node)
 		}
 	}},
-
-	// The rest of an fs.FileMode says what kind of node this is, and a node's kind is not a
-	// property a caller changes. storage.AttrChange.Check owes every implementation this
-	// refusal, so a change naming one is EINVAL before anything is written.
-	{name: "a mode naming a kind is EINVAL", run: func(t *testing.T, s metastore.Store) {
+	{name: "invalid metadata is refused without effects", run: func(t *testing.T, s metastore.Store) {
 		mustSucceed(t, s.Create(ctx(t), "f"))
-		for _, bad := range []fs.FileMode{fs.ModeDir, fs.ModeSymlink, fs.ModeDevice, fs.ModeNamedPipe, fs.ModeSocket, fs.ModeAppend} {
-			mustFail(t, s.SetAttr(ctx(t), "f", storage.AttrChange{Mode: mode(0o644 | bad)}), syscall.EINVAL)
+		before := mustStat(t, s, "f")
+		for _, bad := range []storage.Metadata{
+			{{Key: "bad", Version: 0}}, {{Key: "Bad", Version: 1}}, {{Key: "x", Version: 1}, {Key: "x", Version: 1}}, {{Key: "z", Version: 1}, {Key: "a", Version: 1}},
+		} {
+			mustFail(t, s.SetAttr(ctx(t), "f", storage.AttrChange{ExpectedRevision: before.MetadataRevision, Metadata: &bad}), syscall.EINVAL)
 		}
-		node, err := s.Stat(ctx(t), "f")
-		mustSucceed(t, err)
-		if node.Mode != 0o644 {
-			t.Fatalf("a refused change left mode %v, want 0644 untouched", node.Mode)
+		if after := mustStat(t, s, "f"); !sameNode(before, after) {
+			t.Fatalf("refused metadata changed node: before=%+v after=%+v", before, after)
 		}
 	}},
-
-	// A kernel sends a mode change and a time change as separate requests, and neither may
-	// clear what the other set.
-	{name: "a mode change leaves the times and a time change leaves the mode",
-		run: func(t *testing.T, s metastore.Store) {
-			mustSucceed(t, s.Create(ctx(t), "f"))
-			accessed := time.Date(2001, 2, 3, 4, 5, 6, 7, time.UTC)
-			changed := time.Date(2002, 3, 4, 5, 6, 7, 8, time.UTC)
-			mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{
-				Mode: mode(0o640), AccessTime: &accessed, ModTime: &changed,
-			}))
-
-			mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{Mode: mode(0o600)}))
-			node, err := s.Stat(ctx(t), "f")
-			mustSucceed(t, err)
-			if !node.AccessTime.Equal(accessed) || !node.ModTime.Equal(changed) {
-				t.Fatalf("a mode change moved the times to %v and %v, want %v and %v",
-					node.AccessTime.UTC(), node.ModTime.UTC(), accessed, changed)
-			}
-
-			later := time.Date(2003, 4, 5, 6, 7, 8, 9, time.UTC)
-			mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{ModTime: &later}))
-			node, err = s.Stat(ctx(t), "f")
-			mustSucceed(t, err)
-			if node.Mode.Perm() != 0o600 {
-				t.Fatalf("a time change moved the mode to %v, want 0600", node.Mode)
-			}
-			if !node.AccessTime.Equal(accessed) {
-				t.Fatalf("setting the modification time moved the access time to %v, want %v",
-					node.AccessTime.UTC(), accessed)
-			}
-		}},
+	{name: "metadata updates require their observed revision", run: func(t *testing.T, s metastore.Store) {
+		mustSucceed(t, s.Create(ctx(t), "f"))
+		before := mustStat(t, s, "f")
+		stale := withMetadata(t, s, "f", []byte("stale"), storage.AttrChange{})
+		mustSucceed(t, s.SetAttr(ctx(t), "f", withMetadata(t, s, "f", []byte("current"), storage.AttrChange{})))
+		mustFail(t, s.SetAttr(ctx(t), "f", stale), syscall.EAGAIN)
+		current := mustStat(t, s, "f")
+		mustMetadata(t, current, []byte("current"))
+		if current.MetadataRevision <= before.MetadataRevision {
+			t.Fatal("metadata revision did not advance")
+		}
+		stale.ExpectedRevision = 0
+		mustFail(t, s.SetAttr(ctx(t), "f", stale), syscall.EINVAL)
+	}},
+	{name: "metadata changes preserve times and time changes preserve metadata", run: func(t *testing.T, s metastore.Store) {
+		mustSucceed(t, s.Create(ctx(t), "f"))
+		accessed := time.Date(2001, 2, 3, 4, 5, 6, 7, time.UTC)
+		changed := time.Date(2002, 3, 4, 5, 6, 7, 8, time.UTC)
+		mustSucceed(t, s.SetAttr(ctx(t), "f", withMetadata(t, s, "f", []byte("initial"), storage.AttrChange{AccessTime: &accessed, ModTime: &changed})))
+		mustSucceed(t, s.SetAttr(ctx(t), "f", withMetadata(t, s, "f", []byte("retained"), storage.AttrChange{})))
+		node := mustStat(t, s, "f")
+		if !node.AccessTime.Equal(accessed) || !node.ModTime.Equal(changed) {
+			t.Fatalf("metadata changed explicit times: %+v", node)
+		}
+		later := time.Date(2003, 4, 5, 6, 7, 8, 9, time.UTC)
+		mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{ModTime: &later}))
+		node = mustStat(t, s, "f")
+		mustMetadata(t, node, []byte("retained"))
+		if !node.AccessTime.Equal(accessed) {
+			t.Fatalf("modification time changed access time: %v", node.AccessTime)
+		}
+	}},
 
 	// The range and the precision a volume keeps are its own, but a store that keeps
 	// times in a database has no filesystem underneath to inherit a range from — it chooses
@@ -456,12 +452,13 @@ var attrCases = []testCase{
 	{name: "attributes are set on a directory too", run: func(t *testing.T, s metastore.Store) {
 		mustSucceed(t, s.Mkdir(ctx(t), "d"))
 		changed := time.Date(1999, 9, 9, 9, 9, 9, 9, time.UTC)
-		mustSucceed(t, s.SetAttr(ctx(t), "d", storage.AttrChange{Mode: mode(0o700), ModTime: &changed}))
+		mustSucceed(t, s.SetAttr(ctx(t), "d", withMetadata(t, s, "d", []byte("directory"), storage.AttrChange{ModTime: &changed})))
 		node, err := s.Stat(ctx(t), "d")
 		mustSucceed(t, err)
-		if !node.IsDir() || node.Mode.Perm() != 0o700 || !node.ModTime.Equal(changed) {
-			t.Fatalf("the directory has mode %v and modification time %v, want a directory of 0700 at %v",
-				node.Mode, node.ModTime.UTC(), changed)
+		mustMetadata(t, node, []byte("directory"))
+		if !node.IsDir() || !node.ModTime.Equal(changed) {
+			t.Fatalf("the directory has kind %v and modification time %v, want a directory at %v",
+				node.Kind, node.ModTime.UTC(), changed)
 		}
 	}},
 
@@ -485,16 +482,14 @@ var attrCases = []testCase{
 			accessed := time.Date(1902, 1, 1, 0, 0, 0, 0, time.UTC)
 			changed := time.Date(2400, 6, 1, 12, 0, 0, 500000000, time.UTC)
 			put(t, s, "f", 4096)
-			mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{
-				Mode: mode(0o640), AccessTime: &accessed, ModTime: &changed,
-			}))
+			mustSucceed(t, s.SetAttr(ctx(t), "f", withMetadata(t, s, "f", []byte("rendered"), storage.AttrChange{AccessTime: &accessed, ModTime: &changed})))
 
 			node, err := s.Stat(ctx(t), "f")
 			mustSucceed(t, err)
 			attr := node.Attr()
-			if attr.Mode != node.Mode || attr.Size != node.Size {
-				t.Fatalf("the node renders as mode %v of %d bytes, want %v of %d",
-					attr.Mode, attr.Size, node.Mode, node.Size)
+			if attr.Kind != node.Kind || attr.Size != node.Size || !reflect.DeepEqual(attr.Metadata, node.Metadata) || attr.MetadataRevision != node.MetadataRevision || attr.DirectoryRevision != node.DirectoryRevision {
+				t.Fatalf("the node renders as kind %v of %d bytes, want %v of %d",
+					attr.Kind, attr.Size, node.Kind, node.Size)
 			}
 			if !attr.AccessTime.Equal(accessed) || !attr.ModTime.Equal(changed) {
 				t.Fatalf("the node renders as accessed %v and changed %v, want %v and %v",
@@ -508,7 +503,7 @@ var attrCases = []testCase{
 			dir, err := s.Stat(ctx(t), "d")
 			mustSucceed(t, err)
 			if !dir.Attr().IsDir() {
-				t.Fatalf("the directory renders as mode %v, want a directory", dir.Attr().Mode)
+				t.Fatalf("the directory renders as kind %v, want a directory", dir.Attr().Kind)
 			}
 		}},
 }
@@ -556,10 +551,7 @@ var renameCases = []testCase{
 		}
 	}},
 
-	// POSIX has rename(2) whose operands resolve to the same existing entry "return
-	// successfully and perform no other action". The node has to be looked up to know it:
-	// the same two strings name a node that is not there just as readily, and that is
-	// ENOENT — so the shortcut may not be taken from the operand strings alone.
+	// A no-op rename still resolves its operand so a missing source cannot succeed.
 	{name: "renaming a node onto itself changes nothing", run: func(t *testing.T, s metastore.Store) {
 		mustSucceed(t, s.Create(ctx(t), "f"))
 		mustSucceed(t, s.Mkdir(ctx(t), "d"))
@@ -574,9 +566,9 @@ var renameCases = []testCase{
 
 		after, err := s.Stat(ctx(t), "f")
 		mustSucceed(t, err)
-		if after.ID != before.ID || after.Mode != before.Mode {
-			t.Fatalf("the file is now id %d mode %v, want id %d mode %v",
-				after.ID, after.Mode, before.ID, before.Mode)
+		if !sameNode(after, before) {
+			t.Fatalf("the file is now id %d kind %v, want id %d kind %v",
+				after.ID, after.Kind, before.ID, before.Kind)
 		}
 		mustHoldExactly(t, s, "d", "f")
 	}},
@@ -695,25 +687,21 @@ var objectCases = []testCase{
 		if !node.ModTime.Equal(changed) {
 			t.Fatalf("the file changed at %v, want %v", node.ModTime.UTC(), changed)
 		}
-		// A file a commit created gets the mode a new file is made with.
-		if node.IsDir() || node.Mode.Perm() != 0o644 {
-			t.Fatalf("the committed file has mode %v, want a file of 0644", node.Mode)
+		// Content publication preserves the generic creation defaults.
+		if node.Kind != storage.NodeRegular || len(node.Metadata) != 0 || node.MetadataRevision == 0 || node.DirectoryRevision != 0 {
+			t.Fatalf("the committed file has kind %v, want a regular file", node.Kind)
 		}
 		mustHoldExactly(t, s, "f")
 	}},
 
-	// Replacing the contents is not a request to change the mode. Every settable bit is
-	// carried over, not the nine permission bits alone: dropping a setuid bit here would be
-	// a change nobody asked for and nothing reported.
-	{name: "a commit leaves the mode a file already had", run: func(t *testing.T, s metastore.Store) {
+	// Content publication cannot reinterpret or discard metadata owned by a client.
+	{name: "a commit preserves the complete opaque metadata", run: func(t *testing.T, s metastore.Store) {
 		mustSucceed(t, s.Create(ctx(t), "f"))
-		mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{Mode: mode(0o600 | fs.ModeSetuid)}))
+		mustSucceed(t, s.SetAttr(ctx(t), "f", withMetadata(t, s, "f", []byte{0xff, 0, 7}, storage.AttrChange{})))
 		put(t, s, "f", 10)
 		node, err := s.Stat(ctx(t), "f")
 		mustSucceed(t, err)
-		if node.Mode&storage.SettableMode != 0o600|fs.ModeSetuid {
-			t.Fatalf("the commit left mode %v, want 0600 with setuid", node.Mode)
-		}
+		mustMetadata(t, node, []byte{0xff, 0, 7})
 	}},
 
 	// The directory holding the file has to exist already, and a commit never makes it. A
@@ -847,8 +835,8 @@ var objectCases = []testCase{
 		if node.Content != "" || node.Size != 0 {
 			t.Fatalf("the file references %q and holds %d bytes, want nothing and 0", node.Content, node.Size)
 		}
-		if node.IsDir() || node.Mode.Perm() != 0o644 {
-			t.Fatalf("the file has mode %v, want a file of 0644", node.Mode)
+		if node.Kind != storage.NodeRegular || len(node.Metadata) != 0 || node.MetadataRevision == 0 || node.DirectoryRevision != 0 {
+			t.Fatalf("the file has kind %v, want a regular file", node.Kind)
 		}
 		if !node.ModTime.Equal(changed) {
 			t.Fatalf("the file changed at %v, want %v", node.ModTime.UTC(), changed)
@@ -1243,9 +1231,24 @@ var spaceCases = []testCase{
 
 func ctx(t *testing.T) context.Context { return t.Context() }
 
-// mode is the address of a mode, which is what an AttrChange takes: a nil there means "not
-// changing this", so every mode being set has to be somewhere addressable.
-func mode(m fs.FileMode) *fs.FileMode { return &m }
+var contractAttributeTime = time.Unix(7, 0).UTC()
+
+func withMetadata(t *testing.T, s metastore.Store, path string, data []byte, change storage.AttrChange) storage.AttrChange {
+	t.Helper()
+	node := mustStat(t, s, path)
+	values := storage.Metadata{{Key: "contract", Version: 17, Data: bytes.Clone(data)}}
+	change.ExpectedRevision = node.MetadataRevision
+	change.Metadata = &values
+	return change
+}
+
+func mustMetadata(t *testing.T, node metastore.Node, data []byte) {
+	t.Helper()
+	want := storage.Metadata{{Key: "contract", Version: 17, Data: data}}
+	if !reflect.DeepEqual(node.Metadata, want) {
+		t.Fatalf("metadata %+v want %+v", node.Metadata, want)
+	}
+}
 
 // put reserves a key and commits an object of the given length at path, which is the two
 // steps every write through this contract takes.
@@ -1349,7 +1352,7 @@ func mustHoldExactly(t *testing.T, s metastore.Store, want ...string) {
 		t.Fatalf("the root no longer stats: %v", err)
 	}
 	if !node.IsDir() {
-		t.Fatalf("the root has mode %v, want a directory", node.Mode)
+		t.Fatalf("the root has kind %v, want a directory", node.Kind)
 	}
 	children, err := s.List(ctx(t), "")
 	if err != nil {

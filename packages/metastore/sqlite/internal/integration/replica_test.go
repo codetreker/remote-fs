@@ -1,10 +1,11 @@
 package integration_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"io/fs"
 	"path"
+	"reflect"
 	"syscall"
 	"testing"
 	"time"
@@ -145,14 +146,62 @@ func requireSame(t *testing.T, from *sqlite.Store, into *sqlite.Replica) {
 		}
 		// The content key is the one thing a copy does not hold: it never reaches an object
 		// store, so a key here would name bytes nothing has.
-		if mirrored.ID != node.ID || mirrored.Mode != node.Mode || mirrored.Size != node.Size ||
-			!mirrored.ModTime.Equal(node.ModTime) || !mirrored.AccessTime.Equal(node.AccessTime) {
+		if mirrored.ID != node.ID || mirrored.Kind != node.Kind || mirrored.Size != node.Size ||
+			!mirrored.ModTime.Equal(node.ModTime) || !mirrored.AccessTime.Equal(node.AccessTime) ||
+			!replicaTimeEqual(mirrored.CreationTime, node.CreationTime) || !replicaTimeEqual(mirrored.ChangeTime, node.ChangeTime) ||
+			mirrored.MetadataRevision != node.MetadataRevision || mirrored.DirectoryRevision != node.DirectoryRevision ||
+			!reflect.DeepEqual(mirrored.Metadata, node.Metadata) || !bytes.Equal(mirrored.LinkTarget, node.LinkTarget) {
 			t.Fatalf("the copy holds %q as %+v, the volume holds it as %+v", at, mirrored, node)
 		}
 		if mirrored.Content != "" {
 			t.Fatalf("the copy holds a content key for %q, and it has no object store to use one against", at)
 		}
 	}
+}
+
+func replicaTimeEqual(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(*b)
+}
+
+func replicaNotificationChange(t *testing.T, kind metastore.ChangeKind, root, node metastore.Node, entry storage.EntryID, name, from string) metastore.Change {
+	t.Helper()
+	image := func(name string) *metastore.EventImage {
+		return &metastore.EventImage{Attr: node.Attr(), LinkTarget: bytes.Clone(node.LinkTarget), Location: storage.EntryLocation{
+			State: storage.LocationLinked, RootNodeID: uint64(root.ID), NodeID: uint64(node.ID),
+			Ancestors: []storage.EntryCondition{{ParentID: uint64(root.ID), DirectoryRevision: root.DirectoryRevision,
+				EntryID: entry, NodeID: uint64(node.ID), Name: []byte(name)}},
+		}}
+	}
+	notification := &metastore.Notification{SubjectID: node.ID, SubjectKind: node.Kind, ChangeMask: metastore.ChangeName}
+	owned := node.Clone()
+	change := metastore.Change{Kind: kind, Parent: root.ID, Name: []byte(name), Node: &owned, Notification: notification}
+	switch kind {
+	case metastore.Created:
+		notification.After = image(name)
+	case metastore.Removed:
+		change.Node = nil
+		notification.Before = image(name)
+	case metastore.Modified:
+		notification.ChangeMask = 0
+		notification.Before, notification.After = image(name), image(name)
+	case metastore.Renamed:
+		change.From = &metastore.Location{Parent: root.ID, Name: []byte(from)}
+		notification.Before, notification.After = image(from), image(name)
+	default:
+		t.Fatalf("unsupported replica notification fixture kind %d", kind)
+	}
+	encoded, err := metastore.EncodeNotification(change)
+	if err != nil {
+		t.Fatalf("encoding replica notification fixture: %v", err)
+	}
+	change.Notification, err = metastore.DecodeNotification(change, encoded)
+	if err != nil {
+		t.Fatalf("decoding replica notification fixture: %v", err)
+	}
+	return change
 }
 
 func names(nodes map[string]metastore.Node) []string {
@@ -180,8 +229,8 @@ func TestReplicaListBoundedPreservesCompleteResultsAndFailures(t *testing.T) {
 	fill(t, from, into, 1024)
 
 	newResult := func() *storage.ListResult {
-		result, err := storage.NewListResult(1<<20, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
-			return 64 + nameBytes, nil
+		result, err := storage.NewListResult(1<<20, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+			return 64 + nameBytes + metadataBytes, nil
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -242,12 +291,18 @@ func TestEveryKindOfChangeIsAppliedAsTheVolumeRecordedIt(t *testing.T) {
 	fill(t, from, into, 1024)
 
 	build(t, from)
-	mode := fs.FileMode(0o600)
+	metadata := storage.Metadata{{Key: "test", Version: 1, Data: []byte{0, 0xff, 6}}}
 	for _, done := range []struct {
 		what string
 		run  func() error
 	}{
-		{"changing a mode", func() error { return from.SetAttr(t.Context(), "d/f", storage.AttrChange{Mode: &mode}) }},
+		{"changing opaque metadata", func() error {
+			node, err := from.Stat(t.Context(), "d/f")
+			if err != nil {
+				return err
+			}
+			return from.SetAttr(t.Context(), "d/f", storage.AttrChange{ExpectedRevision: node.MetadataRevision, Metadata: &metadata})
+		}},
 		{"removing a file", func() error { return from.Remove(t.Context(), "g") }},
 		{"renaming a file", func() error { return from.Rename(t.Context(), "d/f", "d/moved") }},
 		{"renaming a directory", func() error { return from.Rename(t.Context(), "d", "e") }},
@@ -277,24 +332,22 @@ func TestReplicaRefusesAReusedNodeIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	node := metastore.Node{
-		ID: root.ID + 1, Mode: 0o644,
+		ID: root.ID + 1, Kind: storage.NodeRegular, MetadataRevision: 1,
+		Metadata:   storage.Metadata{{Key: "test", Version: 1, Data: []byte{1, 0xff}}},
 		AccessTime: time.Unix(1, 0), ModTime: time.Unix(1, 0),
 	}
-	created := metastore.Change{
-		Position: 1, Kind: metastore.Created, Parent: root.ID, Name: []byte("first"), Node: &node,
-	}
+	created := replicaNotificationChange(t, metastore.Created, root, node, storage.EntryID(root.ID+2), "first", "")
+	created.Position = 1
 	if applied, err := into.Apply(t.Context(), created); err != nil || !applied {
 		t.Fatalf("applying the initial creation returned applied=%v, err=%v", applied, err)
 	}
-	removed := metastore.Change{
-		Position: 2, Kind: metastore.Removed, Parent: root.ID, Name: []byte("first"),
-	}
+	removed := replicaNotificationChange(t, metastore.Removed, root, node, storage.EntryID(root.ID+2), "first", "")
+	removed.Position = 2
 	if applied, err := into.Apply(t.Context(), removed); err != nil || !applied {
 		t.Fatalf("applying the removal returned applied=%v, err=%v", applied, err)
 	}
-	reused := created
+	reused := replicaNotificationChange(t, metastore.Created, root, node, storage.EntryID(root.ID+3), "replacement", "")
 	reused.Position = 3
-	reused.Name = []byte("replacement")
 	if applied, err := into.Apply(t.Context(), reused); !errors.Is(err, syscall.EIO) || applied {
 		t.Fatalf("applying a reused node identity returned applied=%v, err=%v, want false and EIO", applied, err)
 	}
@@ -355,38 +408,31 @@ func TestAChangeThatDoesNotFindWhatItDescribesIsRefused(t *testing.T) {
 		t.Fatalf("reading the root of the copy: %v", err)
 	}
 	filled := into.Position()
-	absent := metastore.Node{ID: 9999, Mode: 0o644, ModTime: time.Now(), AccessTime: time.Now()}
+	absent := metastore.Node{ID: 9999, Kind: storage.NodeRegular, MetadataRevision: 1,
+		Metadata: storage.Metadata{{Key: "test", Version: 1, Data: []byte{9}}}, ModTime: time.Now(), AccessTime: time.Now()}
+	fixture := func(kind metastore.ChangeKind, name, from string) metastore.Change {
+		return replicaNotificationChange(t, kind, root, absent, 10000, name, from)
+	}
+	unknownKind := fixture(metastore.Modified, "g", "")
+	unknownKind.Kind = metastore.ChangeKind(42)
+	missingNode := fixture(metastore.Created, "arrived", "")
+	missingNode.Node = nil
+	missingFrom := fixture(metastore.Renamed, "arrived", "never-existed")
+	missingFrom.From = nil
 
-	// Each case carries a position of its own. A copy that wrongly applied one of them would
-	// stand at that position afterwards, and every later case would then be discarded as
-	// already held — so one defect would read as several, and the ones it hid would read as
-	// passes on the day it was fixed.
+	// Distinct positions keep one erroneous application from making later cases
+	// look like successful duplicate suppression.
 	for at, c := range []struct {
 		name   string
 		change metastore.Change
 	}{
-		{"a rename whose source is not there", metastore.Change{
-			Position: 100, Kind: metastore.Renamed, Parent: root.ID, Name: []byte("arrived"),
-			From: &metastore.Location{Parent: root.ID, Name: []byte("never-existed")}, Node: &absent,
-		}},
-		{"a modification of a node the copy does not hold", metastore.Change{
-			Position: 100, Kind: metastore.Modified, Parent: root.ID, Name: []byte("g"), Node: &absent,
-		}},
-		{"a removal of a name that is not there", metastore.Change{
-			Position: 100, Kind: metastore.Removed, Parent: root.ID, Name: []byte("never-existed"),
-		}},
-		{"a creation at a name that is taken", metastore.Change{
-			Position: 100, Kind: metastore.Created, Parent: root.ID, Name: []byte("g"), Node: &absent,
-		}},
-		{"a change of a kind this build has no meaning for", metastore.Change{
-			Position: 100, Kind: metastore.ChangeKind(42), Parent: root.ID, Name: []byte("g"), Node: &absent,
-		}},
-		{"a change that says what a name holds and carries no node", metastore.Change{
-			Position: 100, Kind: metastore.Created, Parent: root.ID, Name: []byte("arrived"),
-		}},
-		{"a rename that does not say where the node came from", metastore.Change{
-			Position: 100, Kind: metastore.Renamed, Parent: root.ID, Name: []byte("arrived"), Node: &absent,
-		}},
+		{"a rename whose source is not there", fixture(metastore.Renamed, "arrived", "never-existed")},
+		{"a modification of a node the copy does not hold", fixture(metastore.Modified, "g", "")},
+		{"a removal of a name that is not there", fixture(metastore.Removed, "never-existed", "")},
+		{"a creation at a name that is taken", fixture(metastore.Created, "g", "")},
+		{"a change of a kind this build has no meaning for", unknownKind},
+		{"a change that says what a name holds and carries no node", missingNode},
+		{"a rename that does not say where the node came from", missingFrom},
 	} {
 		t.Run(c.name+" is refused", func(t *testing.T) {
 			c.change.Position = filled + metastore.Position(at) + 1
@@ -483,7 +529,8 @@ func TestAFillingThatWasNotCompletedLeavesTheCopyAsItWas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("emptying the copy: %v", err)
 	}
-	if err := seeding.Add(t.Context(), []metastore.Row{{Node: metastore.Node{ID: 4242, Mode: fs.ModeDir | 0o755}}}); err != nil {
+	if err := seeding.Add(t.Context(), []metastore.Row{{Node: metastore.Node{ID: 4242, Kind: storage.NodeDirectory, MetadataRevision: 1, DirectoryRevision: 1,
+		Metadata: storage.Metadata{{Key: "test", Version: 1, Data: []byte{4, 2}}}}}}); err != nil {
 		t.Fatalf("filling the copy: %v", err)
 	}
 	if err := seeding.Close(); err != nil {
@@ -548,5 +595,16 @@ func build(t *testing.T, store *sqlite.Store) {
 		if err := made.run(); err != nil {
 			t.Fatalf("making %s: %v", made.what, err)
 		}
+	}
+	node, err := store.Stat(t.Context(), "d/f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := storage.Metadata{{Key: "test", Version: 1, Data: []byte{0xff, 0, 4}}}
+	created := time.Unix(123, 456789).UTC()
+	if err := store.SetAttr(t.Context(), "d/f", storage.AttrChange{
+		ExpectedRevision: node.MetadataRevision, Metadata: &metadata, CreationTime: &created,
+	}); err != nil {
+		t.Fatalf("setting snapshot metadata: %v", err)
 	}
 }

@@ -2,19 +2,18 @@
 
 volume、保留文件与显式占有的权威持有者。将原生 storage 与它的锁服务配对，经 HTTP 暴露给多个 client。
 
-本文只写当前 server 内部。角色边界与跨角色契约的分工见 [`../architecture.md`](../architecture.md)。下文的 Windows authority／HTTP 分支与 flock／POSIX coordinator 仍解释平台规则；[平台客户端隔离提案](../../../.agents/notes/proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)以既有 file 协议上的共同原语替换这些边界，以满足 R-INT-8、R-INT-14，当前代码尚未完成该迁移。
+本文描述 server 内部，角色与跨角色契约见 [`../architecture.md`](../architecture.md)。共同 file authority 执行身份、版本、claims、范围和生命周期，平台解释由客户端承担；取舍见[平台客户端隔离决定](../../../.agents/notes/implemented/architecture/2026-09-16-isolate-platform-filesystem-clients.md)。
 
 ## 一、内部构成
 
 | 组件 | 职责 | 需求 |
 |---|---|---|
 | **请求处理**（`packages/transport/httprest`） | 一个 `http.Handler`。解析数据与锁控制请求，使用独立的有界 admission，验证 scope 与响应，把控制操作交给配对的授权方。它不缓存 volume 答案；文件 registry、订阅与快照保留各自有界的状态。 | R-INT-1、R-INT-3 |
-| **业务授权**（`packages/authz` 与 handler adapter） | 把可信 volume、语义操作与完整 Open 意图交给嵌入方策略；请求入口和流出站分别检查，原生占有检查保持独立。 | R-INT-7、R-SEC-4 至 R-SEC-6 |
+| **业务授权**（`packages/authz` 与 handler adapter） | 把可信 volume、语义操作、Effects／Claim 与目标身份交给嵌入方策略；请求入口和流出站分别检查，原生占有检查保持独立。 | R-INT-7、R-SEC-4 至 R-SEC-6 |
 | **协议词汇**（`packages/transport/httprest`） | 请求 URL 的形状、响应体的形状；错误的名字取自 storage 契约的 errno 词汇。与 client 共用同一份。 | R-INT-9 |
 | **变更日志** | volume 里每一次改动的有序记录，由 storage 底下的 metastore 提供。请求处理拿到它就开出复制那三个操作；拿不到（`nil`）时，在已启用的操作授权通过后以 `ENOSYS` 拒绝它们。 | R-CON-1、R-CON-2 |
 | **storage** | 原生发布集成确定实际资源并执行最终转换。localstore 与 Azure 组合在 metastore 事务中记账；第三方实现须履行同一原生集成契约。 | R-INT-6、R-INT-13 |
-| **Windows 访问** | 显式命名启用、目录与 metadata-only 引用、共享模式、delete-pending、范围访问及原动作核对，由原生 authority 排序；HTTP 只传递完整结果。 | R-FS-9、R-CC-14、R-INT-14 |
-| **保留文件与 advisory** | FileSession 拥有当前对象引用，原生节点保留无名内容；独立 advisory coordinator 管理 flock/POSIX owner 与范围。 | R-FS-6 至 R-FS-8、R-CC-12、R-CC-13、R-WS-7 |
+| **保留对象与访问状态** | FileSession 保留文件／目录／链接引用；共同 coordinator 执行双向 claims、范围 CAS／等待、固定删除意图与有界动作历史。 | R-FS-6 至 R-FS-9、R-CC-12 至 R-CC-14、R-WS-7 |
 | **文件占有**（`packages/locking`、`packages/storage/locked`） | 有限 S/X 授予、Session / Owner、动作核对与发布顺序；与同一 volume 绑定，重启通过持久证据恢复保护。 | R-CC-3、R-CC-6 至 R-CC-11 |
 
 ```
@@ -31,7 +30,7 @@ volume、保留文件与显式占有的权威持有者。将原生 storage 与�
  └─────────────┘
 ```
 
-基础数据操作各自完成一次请求；FileSession 保留对象与标准 advisory 状态，显式 S/X 另有 Session、Owner、grant 与动作历史。handler 只接受 `locked.New` 验证过的配对 backend，其 `LockService()` 就是绑定原生发布检查的授权方，不能从另一份 storage 单独提供控制服务。控制状态、恢复与拒绝规则见[文件锁设计](file-locks.md)。可选 Authorizer 先按业务身份和语义决定准入，再访问 capability、Log 与 backend；通用有界请求／响应容量可先返回 EAGAIN。操作映射、策略错误与 context 生命周期由[业务授权](authorization.md)定义。
+基础数据操作各自完成一次请求；FileSession 保留对象、通用 claims／ranges 与动作状态，显式 S/X 另有 Session、Owner、grant 和历史。handler 只接受 locked.New 验证过的配对 backend，其 LockService 是绑定原生发布检查的授权方，不能从另一份 storage 提供控制服务。控制状态与恢复见[文件锁设计](file-locks.md)。可选 Authorizer 先决定本次语义准入，再访问 capability、Log 与 backend；通用容量可先返回 EAGAIN。策略与 context 生命周期见[业务授权](authorization.md)。
 
 ## 二、请求的形状
 
@@ -54,8 +53,8 @@ volume、保留文件与显式占有的权威持有者。将原生 storage 与�
 | `Resubscribe` | `GET /v3/resubscribe` | `incarnation`、`position` | — |
 | `Snapshot` | `GET /v3/snapshot` | 无 | — |
 | `Checkpoint` | `GET /v3/checkpoint` | 无 | — |
-| 保留文件数据 | `POST /v3/file` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带 session/file 能力与参数 |
-| 文件会话与 advisory 控制 | `POST /v3/file-control` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带原动作身份及 owner |
+| 保留对象数据 | `POST /v3/file` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带 session 能力、reference ID 与参数 |
+| 文件会话与通用清理控制 | `POST /v3/file-control` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带原动作身份及 owner |
 
 volume 路径以 `url.Values` 的转义走 query string，任意字节序列都逐字往返。根是 `path=`：一个存在且为空的操作数。`Space` 描述整个 volume 而不是某个路径底下的东西，因此它一个操作数都不带；带了 `path=` 的 `Space` 请求与多带了任何操作数的请求一样，是请求错误。
 
@@ -63,7 +62,7 @@ volume 路径以 `url.Values` 的转义走 query string，任意字节序列都�
 
 解析是严格的：query 解析不了、操作数缺失、同一个操作数出现两次、出现了这个操作不要的操作数，都是请求错误。这几种情况在 `url.Values` 里读出来都是空字符串，而空字符串是根。
 
-`Prefix` 为 `/v3/`，相对于 handler 被挂载的位置，挂到别处用 `http.StripPrefix`。v3 在既有 mutation barrier JSON 之外要求配对的锁授权方，并增加严格的控制消息与 mutation scope。server 不提供旧协议路由，client 同时验证路径版本与响应标记；旧服务端不能通过忽略 proof 接受受保护的修改。强 S/X 的十三个 JSON POST 控制端点与 scope 编码见[文件锁协议](file-locks.md#http-v3-编码)，它们不把 capability 放入 query string。保留文件能力、Open 确认、动作历史、会话续期与 advisory 控制见[打开的文件](file-handles.md#五http复制与资源)。Windows 能力使用严格 JSON POST `/v3/windows` 与 `/v3/windows-control`，保留 WindowsOpenIntent、动作 ID、已知 receipt 和独立 WindowsFailure；backend 缺少能力或未启用时明确失败，不用普通路径接口模拟。
+`Prefix` 为 `/v3/`，相对于 handler 挂载位置，嵌入时可用 http.StripPrefix。client 验证路径版本与响应标记；强 S/X 的控制端点及 scope 见[文件锁协议](file-locks.md#http-v3-编码)。保留对象通过 `/v3/file` 与 `/v3/file-control` 传递通用操作、条件、receipt 和控制结果，见[文件协议](file-handles.md#http复制与预算)。HTTP session registry 只管理 enrollment／生命周期，不另存一份引用或动作历史；平台专用接口不进入 transport。
 
 ## 三、响应的形状
 
@@ -93,19 +92,19 @@ handler 用 `MaxBodyBytes` 限制基础 volume 的 non-write 请求与 non-strea
 
 **每个 non-streaming 响应都显式声明 `Content-Length`，失败响应也不例外。** 这是顶层设计第四节「响应体的分帧必须能报告自己提前结束」那条义务在这一侧的落地：一个以连接关闭为终点的响应体，被截断与完整无从分辨，因此不被接受。SSE response 不声明整条 stream 的长度，它靠每个 frame 的明确边界与终止语义区分完整和截断。
 
-**缺席与零值必须分辨得开。** `Stat` 响应里的 `attr`、以及每个目录条目里的 `attr`，都是可以在报文里缺席的字段，而缺席就是解码失败 —— 一个零值的属性读起来是「一个模式为 0、长度为 0、时间停在 1970 年的普通文件」，与一份合法的答案分辨不开。`entries` 同理：`null` 与 `[]` 相差两个字符，意思相反。mutation response 必须是一个只允许可选 `barrier` 字段的 JSON object：没有 change log 的 volume 返回 `{}`；有 log 时 barrier 必须存在，且带非空 incarnation 与非负 position，位置 0 也是合法的初始 barrier。incarnation 的 protocol ceiling 是 256 bytes；handler 再按 `MaxBodyBytes` 与 `MaxFrameBytes` 的 worst-case JSON escaping 计算同一份更紧预算，stream start 与 mutation barrier 都用它，保证合法 identity 在两条路径上一致且一定装得进各自边界。`null`、缺字段、未知字段或错误类型都不是成功答案；普通 remote storage 接受无 barrier 的 `{}`，replicated client 使用的 `*WithBarrier` 方法必须取得并验证它。
+**缺席与零值分开验证。** Stat 及每个 entry 必须带完整 attr，字段缺失不能成为零长度或纪元时间的合法答案。entries 必须是数组，空目录为 []，不是 null。基础 mutation response 只允许可选 barrier：nil log 返回 {}；有日志时提供非空 incarnation 与非负 position，零是合法初始位置。handler 在 body／frame 的编码预算内限制 incarnation，不能让同一身份在两条路径上有不同能力。需要 barrier 的消费者必须取得并验证它，缺失不是成功确认。
 
 容量报告里的三个数各自也是可缺席的字段，而这里的理由更硬：它们是字节数，零对每一个都是合法答案 —— 一份什么都没装的 volume 已用为零，一份装满的可写入量为零 —— 所以一旦当成普通字段读进来，缺席与零就再也分不开，而一份掉了字段的报告读起来恰好是「没有剩余空间」，足以让每一次写入停下。解码还要判定这三个数能不能同时为真，判不成立同样是解码失败：它们最终要进内核回复的无符号字段，在那里一个负数是一个巨大的正数（R-ERR-2）。
 
 目录条目的名字以原始字节编码（JSON 里是 base64）。文件名是任意字节序列，不是文本。
 
-`Attr` 的 `id` 是节点身份（R-FS-5）：一个不透明的无符号整数，只可比较相等，随节点走过改名。**它是这里唯一一个零值不响的字段**，因此由解码拒绝：模式为 0 是合法答案、纪元时刻也是有人设得出来的值，所以别处的拒绝针对的是整个 `attr` 缺席；而身份为 0 在挂载点那边每次比较都相等，于是一个不发这个字段的对端不会被读成「什么都没说」，会被读成「所有节点都是同一个节点」。
+Attr 的 id 是非零节点身份，随节点改名；Kind 和 MetadataRevision 也须有效，DirectoryRevision 只在目录非零。缺字段、错误种类、错误 revision 或目录大小不是零，都在解码时拒绝。身份、类型和观察版本不是权限或内容版本。
 
-`Attr` 的 `mode` 是 Go `io/fs.FileMode` 的位布局。两个时间 —— `access_time` 与 `mod_time` —— 各是一个对象，`unix_sec` 是自 Unix 纪元起的整秒数，`nanos` 是该秒之内的纳秒数。单独一个纳秒数装不下这两个字段要承载的范围 —— `time.Time.UnixNano` 只在 1678-09-21 到 2262-04-11 之间有定义，范围之外的时间（零值的 `time.Time` 也在其中）会变成另一个看上去完全合理的日期，且没有任何东西标出它是错的。秒与纳秒合成一个对象而不是并排两个字段，是因为 `SetAttr` 的请求里每个时间都可以整个缺席，而两个各自可空的字段能互相矛盾。
+Attr 传递通用 kind 和 canonical metadata 字节，不解释 Go mode 或 DOS。access_time／mod_time 以 unix_sec 与 nanos 组成对象；可选 creation_time／change_time 缺失表示未知。分开的秒与纳秒保留 time.Time 的范围，不经 UnixNano 压缩。metadata 为有界、版本化 envelope，client 负责所属 key 的平台解释；坏编码不作为缺省值。
 
-`SetAttr` 的请求体是 `{"change":{…}}`，`change` 里每个属性都是可选的：缺席就是「这一项不改」。`change` 本身缺席则是解码失败 —— 一个什么都不点名的改动是合法请求（它在问这个节点还在不在），因此靠字段本身分辨不出报文是不是掉了内容，外面这一层对象才分辨得出来。
+SetAttr 请求为 {"change":{…}}，缺席 change 是解码失败，空 change 是合法的无字段更新。未命名的属性不改；替换 metadata 必须携带 ExpectedRevision，保留另一个客户端的 key。时间可以整项缺席，不能以两个互相矛盾的可空 scalar 表达。
 
-保留文件的响应 envelope 按操作携带 FileSession 状态、引用能力、属性、字节、advisory 结果与可选 barrier，不能套用基础 mutation 的空 object 规则。Data 与 Path 使用 base64 字节字段；时间间隔以整数纳秒编码。Open 先返回有期限的待确认能力，client 完成确认才交给调用方；未确认引用与关闭的动作记录受 registry 上限约束。完整形状与核对边界见[文件协议](file-handles.md#五http复制与资源)。
+保留对象响应按操作携带初始／当前 FileSessionStatus、reference ID、观察、字节、范围或 FileActionReceipt，并可带 barrier，不能套用基础 mutation 的空 object 规则。名字／内容／target 和 metadata 使用无损 byte 编码，时间间隔用整数纳秒。native session 拥有引用与历史，HTTP 不建立待 ACK 引用或动作账本；Unknown、NotAdmitted 和 Retired 的差异见[文件协议](file-handles.md#http复制与预算)。
 
 ## 四、错误如何离开 server
 
@@ -139,7 +138,7 @@ storage 返回错误时，请求处理用 `storage.ErrnoNameOf` 取得 `422` 响
 
 server 为这几个操作持有的资源都有上限：同时开着的订阅与快照数、一份快照最长可以送多久、单个 encoded frame、跨页保留的 snapshot cursor bytes、同时产生的 snapshot page 数与总 retained bytes、等待 snapshot-page admission 的 goroutine，以及一次读日志或快照最多处理多少行（R-INT-3）。change frame 的 aggregate 由 subscription 数与单帧预算共同给出，不与 snapshot bulk transfer 共用 gate。还有一个不是上限而是下限：**无话可说时多久也要说一句**——心跳的间隔。读的那一侧据此给「一个字节都没来」定上界，于是「流还活着」是被观测到的而不是被假定的；没有它，一条被切断的 TCP 与一个安静的 volume 是同一个观测结果。
 
-`MaxFrameBytes` 不只在 JSON 已经生成后检查。`Log.Incarnation(ctx, maxBytes)` 在载入或复制 stream identity 前限制 UTF-8 bytes；`Log.Since` 把 payload lengths 交给 caller-owned `metastore.ChangeResult`，`Snap.Next` 使用 `metastore.RowResult`。producer 先以 fixed fields 与变长字段长度 `Reserve`，预算通过后才加载 name、source name 与 object key，并用 exact lengths `Commit`。一页已经有内容而下一项只是不够剩余空间时，该项留给下一页；单项本身装不进空 frame 时以 `EFBIG` 使整页失败。其它 production error 同样使 page 不可读取，snapshot 上的这类错误还终止该一致性切割。`EventPage` 与 `SnapshotPage` 继续限制一轮数据库工作量，不能代替 byte bound。`Log.Barrier(ctx, maxIncarnationBytes)` 则在 mutation 完成后原子给出同一份有界 identity 与 committed position。第三方 `metastore.Log` 与 `Snap` 也必须实现这些带预算的唯一入口；接口不保留会在内部建立 unbounded slice 的 count-only 变体。
+`MaxFrameBytes` 不只在 JSON 已经生成后检查。`Log.Incarnation(ctx, maxBytes)` 在载入或复制 stream identity 前限制 UTF-8 bytes；`Log.Since` 把 payload lengths 交给 caller-owned `metastore.ChangeResult`，`Snap.Next` 使用 `metastore.RowResult`。producer 先以 fixed fields 与变长字段长度 `Reserve`，预算通过后才加载名字、object key、opaque metadata、link target 与事件图像，并按精确长度 Commit。snapshot Row.EntryID 保留源端身份，根为零，其它节点的 entry 非零；metadata／entry 字段同样计入编码预算。一页已经有内容而下一项只是不够剩余空间时，该项留给下一页；单项本身装不进空 frame 时以 `EFBIG` 使整页失败。其它 production error 同样使 page 不可读取，snapshot 上的这类错误还终止该一致性切割。`EventPage` 与 `SnapshotPage` 继续限制一轮数据库工作量，不能代替 byte bound。`Log.Barrier(ctx, maxIncarnationBytes)` 则在 mutation 完成后原子给出同一份有界 identity 与 committed position。第三方 `metastore.Log` 与 `Snap` 也必须实现这些带预算的唯一入口；接口不保留会在内部建立 unbounded slice 的 count-only 变体。
 
 每条 subscription 串行地产生 start/change frame，同一时刻至多保留一项，每项按 `3 * MaxFrameBytes` 覆盖 metastore result、wire conversion 与 encoded frame。它不等待共享 admission，因此一份 snapshot 的 bulk production 不能阻塞健康订阅者；默认最多 64 条 subscription 时，change/start 中间表示的 derived aggregate ceiling 是 `64 * 3 * 8 MiB = 1.5 GiB`。
 
@@ -183,9 +182,11 @@ HTTP handler 只接受实现 `storage.BoundedStorage` 的 volume。constructor �
 
 `MaxBodyBytes` 至少为 1024 字节，且必须小到可以计算四倍 response reservation；`MaxWriteBytes` 必须为正且不大于 `MaxBodyBytes`。request aggregate 至少容纳一份 `MaxBodyBytes`，response aggregate 至少容纳一份四倍 reservation。effective operation 与 waiter 上限都为正；option 的零值选择有界默认值。client 对所有 non-streaming operation 持有独立的 response operation、waiter 与 aggregate byte admission，见 [`../client/architecture.md`](../client/architecture.md)。
 
-Windows 数据请求继续使用数据预算；会话、动作核对和清理走 client 与 server 各自独立的 `windowsControls` 池。每个池使用现有 `MaxConcurrentLockControls`、`MaxWaitingLockControls` 与 `MaxInFlightResponseBytes` 设置，实例与普通 response、lock-control 池分开。Windows 控制因此可以在普通响应占用之外保留额外数据；这些池不是一个合并的全局 byte cap。
+通用文件 bulk、control 与 range-wait 使用独立 admission；等待转交有界 waiting 记录，不能阻塞续期、核对和关闭的名额。client 与 server 各自持有这些池，普通 response、强锁 control 与文件 control 也分别计费；不能把一个配置值理解成所有池共用的总额。
 
-Windows control request 仍受 16 KiB 控制 body 限制，response 使用独立的 `windowsControlResponseLimit()`。该函数取最坏 receipt envelope 与状态 envelope 编码长度的较大者；receipt 的固定 metadata／reference 结构之外，加上 `6 * (3 * WindowsMaxNameInfoBytes + 4 * WindowsMaxLinkTargetBytes + 1024)`，覆盖三个名字路径、两组 target／suffix 和诊断的 JSON 转义。每次操作预留该 response ceiling 的四倍，直到解码和验证完成。`MaxBodyBytes` 小于完整控制结果上限时，Windows 能力检查、EnableWindows 与 NewWindowsSession 拒绝；不能先打开引用，再让结果因为 ordinary body 设置过小而无法核对。
+file-control 请求上限为 4096 字节。`fileControlResponseLimit()` 覆盖固定 receipt／observation、最多 256 层祖先 scalar、64 KiB 名字、32 KiB canonical metadata、4096 字节 target，以及诊断、能力与 barrier 的最坏 JSON 编码；每次操作按该 ceiling 的四倍预留，完成解码验证才释放。MaxBodyBytes 不足以容纳这个完整控制结果时，文件调用在 dispatch 前拒绝。
+
+ListAt 按声明的项数／字节预算计算完整响应上限，RangeSnapshot 按 Own 与 Other 合计最多 262144 项计算最坏 envelope；无法容纳时在 native 分配前拒绝，不能靠截断结果通过 body 限制。文件 RPC 的有界状态不依赖复制 frame 大小；无日志 backend 可返回没有 barrier 的真实 receipt，需要 barrier 的消费者则明确失败并保留已发生效果。
 
 内容替换的原子性由 storage 保证（R-CON-3），请求处理不参与；跨多个请求的应用调用保证单位仍按 R-CON-5【未决】处理。
 
@@ -200,7 +201,7 @@ server 通过配对的 volume 与锁服务访问 volume。集成方注入具有�
 
 Azure 形态依赖部署方分别提供和运维 Blob container、数据库及其相邻的 lease 证据，两类存储可以各自失败（R-INT-12、R-ERR-6）。`sqlite.OpenLocking` 对整份数据库取得 lifetime ownership，数据库及确定位置的证据保存数据库级最大 lease 时长。后续启动可以选择另一个已有 volume，但同一时刻只有一份活跃锁服务拥有该数据库，恢复等待仍覆盖整份数据库。`localstore` 则拥有一个私有本地目录下的对象、SQLite、WAL 外部见证、恢复状态与独占锁；它的完整设计见 [`local-disk-object-store.md`](local-disk-object-store.md)。
 
-基础 storage 的十一个操作、路径规则与错误词汇见顶层设计第四节。`FileStorage` 的保留对象与 advisory 是独立能力，原生 EX 所有权、共享预算、retained-file schema 和最终释放见[文件句柄设计](file-handles.md)。
+基础 storage 的十一个操作、路径规则与错误词汇见顶层设计第四节。`FileStorage` 的保留对象、claims 与范围状态是共同能力，原生 EX 所有权、共享预算、retained-file schema 和最终释放见[文件句柄设计](file-handles.md)。
 
 ### 配额住在 storage 这一侧
 
@@ -222,9 +223,9 @@ HTTP 与 replicated 不把 Go context 中的计费 hook 传到远端发布，`li
 
 SQLite metastore 还给 reserved、unresolved 与 garbage object records 的合计数量和 payload bytes 配置独立阈值。一个 payload 自身超过 byte threshold 时 `Reserve` 返回 `EFBIG`；请求本身能装下、但现有 backlog 使新记录越界时返回 `EAGAIN`。`Put` 失败时 reservation 转成 unresolved；这类结果没有 ownership proof，不会因为时间经过而被删除。已经存在的 volume 修改仍可产生 garbage 并把 backlog 推到阈值之上，此时新 reservation 保持拒绝，garbage 清扫与删除继续运行。package 默认值与 `-max-pending-objects`、`-max-pending-bytes` 用于 Azure 和本地形态；本地组合还通过 `Config.ObjectLimits` 暴露覆盖值，见 [`local-disk-object-store.md`](local-disk-object-store.md#七容量与资源上限)。两种 metastore-backed 形态同样使用有界 SQLite reader pool；package 默认为 16，独立 server 以 `-max-reader-connections` 配置。
 
-SQLite 打开与 `ObjectStatus` 验证每个 volume 的 named 节点形成 rooted tree：root 没有 incoming entry，其余 named 节点恰有一个同 volume 的名字且从 root 可达。detached 只能是非 root 的普通文件，不得有名字或参与目录边；其它孤儿、cycle 与跨 volume entry 以 `EIO` 拒绝。`volumes.used` 必须是非负整数，并等于对所有 regular-file size 做 overflow-checked streaming sum 的结果。SQLite 的动态 storage class 也属于完整性：文件名必须是非空 BLOB，标量字段保持声明的整数/文本/可空类型，detached 为 0 或 1，内容 revision 为正；change kind 与 nullable node/from groups、mode/size/time 范围必须彼此一致。否则 cursor order、NULL coercion 或 fabricated reconciliation 可以把损坏记录变成一次成功但缺行/零值的复制结果，因此都在开放 volume 或 history 前拒绝。
+SQLite Open／ObjectStatus 验证每个 volume 的可见节点构成 rooted tree：root 无 incoming entry，其余节点恰有一个同 volume entry 且可达。detached 不是 root，没有名字或目录边；坏父类型、cycle、孤儿和跨 volume entry 失败。EntryID 与 NodeID 不重叠，drain／intent、metadata／revision、时间／target 与内容种类须一致。用量是全部 regular-file size 的非负、无溢出 streaming sum。名字为非空 BLOB，所有 scalar／nullable groups 保持规定 storage class，不让 driver coercion 伪造零值或漏行。
 
-SQLite 的 `database_state` 另持有数据库 identity、提交 generation，以及 node ID 与全局 change position 的持久高水位。ID 从高水位显式分配，`sqlite_sequence` 是同事务推进的冗余记录。durable-state validation 通过 expression indexes 的类型 discriminator 与最大 identity 边界读取全数据库 surviving references，打开、checkpoint 与每个 `Since` page 都要求 sequence 一致且任一 volume 的引用不超过高水位；每次分配也重新核对 sequence，change append 还要求当前 committed tail 严格小于新位置。每条 retained change 另保存同 volume 的 `previous_position`：第一条指向 `trimmed_through`，相邻记录逐条相连，最后一条等于 `committed_position`。位置是全数据库分配的，volume 内允许被其它 volume 留下空洞，完整性因此检查前驱链而不检查算术连续。`Open`、`Snapshot` 与 `ObjectStatus` 在暴露 volume 前验证受 `MaxIntegrityRecords` 限制的完整链；`Since` 用索引锚定 page 起点并执行 O(page) predecessor validation，缺口所在页整体失败，stream error 使 consumer 作废副本。同一 incarnation/position 的续订会在该缺口持续失败，直到持久日志被带外修复或出现合法 rebuild boundary。断链、tail 不一致或高水位回退都不生成新 incarnation 掩盖损坏。
+SQLite 的 `database_state` 另持有数据库 identity、提交 generation，以及 node／entry 共用的身份高水位与全局 change position 高水位。ID 从高水位显式分配，`sqlite_sequence` 是同事务推进的冗余记录。durable-state validation 通过 expression indexes 的类型 discriminator 与最大 identity 边界读取全数据库 surviving references，打开、checkpoint 与每个 `Since` page 都要求 sequence 一致且任一 volume 的引用不超过高水位；每次分配也重新核对 sequence，change append 还要求当前 committed tail 严格小于新位置。每条 retained change 另保存同 volume 的 `previous_position`：第一条指向 `trimmed_through`，相邻记录逐条相连，最后一条等于 `committed_position`。位置是全数据库分配的，volume 内允许被其它 volume 留下空洞，完整性因此检查前驱链而不检查算术连续。`Open`、`Snapshot` 与 `ObjectStatus` 在暴露 volume 前验证受 `MaxIntegrityRecords` 限制的完整链；`Since` 用索引锚定 page 起点并执行 O(page) predecessor validation，缺口所在页整体失败，stream error 使 consumer 作废副本。同一 incarnation/position 的续订会在该缺口持续失败，直到持久日志被带外修复或出现合法 rebuild boundary。断链、tail 不一致或高水位回退都不生成新 incarnation 掩盖损坏。
 
 本地持久形态还在 SQLite WAL 外保存 `METASTORE`：每次成功 open 或 mutation 的 SQLite commit 先推进 generation，再原子发布完整 accepted state；调用在发布完成后才成功。durable writer 为每条物理 connection 启用 SQLite `PERSIST_WAL`；accepted state 尚未完成 witnessed checkpoint 时，异常关闭、`Abort` 或未确认 `Accept` 会留下 WAL 供重开对账。checkpoint 只有在全部 WAL frame 已进入主数据库且状态仍等于 accepted state 时才推进见证中的 checkpoint generation。accepted 比 checkpoint 新时，下一次打开必须在 SQLite 打开前看见非空 WAL；缺失、空或仅有 header 的 WAL 表示确认状态可能回退，以 `EIO` 拒绝。accepted-state 见证发布失败会 poison 当前数据库，checkpoint 见证失败由单个后台 worker 定期重试；正常关闭在完整 checkpoint 和见证同步之后才尝试清除 `PERSIST_WAL` 并关闭 writer。清除调用失败时 flag 状态未知，但 `A = C` 已使 WAL 不再是恢复证据；writer 与 lifetime ownership 保留并允许重试。
 

@@ -16,10 +16,11 @@ var (
 )
 
 type Config struct {
-	Authenticator Authenticator
-	Authorize     authz.Authorizer
-	Limits        Limits
-	Logger        *slog.Logger
+	Authenticator       Authenticator
+	Authorize           authz.Authorizer
+	Limits              Limits
+	Logger              *slog.Logger
+	AbsentDOSAttributes uint32
 }
 
 // Limits bounds allocation before protocol input is decoded. Select defaults
@@ -57,7 +58,7 @@ func (l Limits) check() error {
 
 type Share struct {
 	Name, Volume string
-	Backend      storage.WindowsStorage
+	Backend      storage.FileStorage
 	Changes      ChangeSource
 }
 

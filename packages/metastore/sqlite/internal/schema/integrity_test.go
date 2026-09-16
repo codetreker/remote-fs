@@ -20,7 +20,7 @@ func TestIntegrityAcceptsConsistentGlobalAndVolumeGraphs(t *testing.T) {
 	other, otherRoot := testVolume(t, db, "other")
 	testFile(t, db, other, otherRoot, "other-file", 11, false)
 	for _, scope := range []*int64{nil, &id, &other} {
-		if err := validateIntegrity(t.Context(), db, scope, 1000, 1<<20, 5); err != nil {
+		if err := validateIntegrity(t.Context(), db, scope, 1000, 1<<20, schema.Version()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -28,7 +28,7 @@ func TestIntegrityAcceptsConsistentGlobalAndVolumeGraphs(t *testing.T) {
 	if err := ValidateVolumeIntegrity(t.Context(), db, id, 1000, 1<<20); err != nil {
 		t.Fatalf("unrelated volume corruption crossed the scoped check: %v", err)
 	}
-	if err := validateIntegrity(t.Context(), db, nil, 1000, 1<<20, 5); !errors.Is(err, syscall.EIO) {
+	if err := validateIntegrity(t.Context(), db, nil, 1000, 1<<20, schema.Version()); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("global check accepted another volume's corrupt node: %v", err)
 	}
 }
@@ -38,8 +38,9 @@ func TestIntegrityWorkAndNameBytesHaveExactBounds(t *testing.T) {
 	id, root := testVolume(t, db, "workspace")
 	testFile(t, db, id, root, "name", 3, false)
 	testChange(t, db, id, root, "old")
-	var notificationBytes int64
-	if err := db.QueryRow(`SELECT length(notification) FROM changes`).Scan(&notificationBytes); err != nil {
+	var payloadBytes int64
+	if err := db.QueryRow(`SELECT (SELECT coalesce(sum(length(metadata)+length(link_target)),0) FROM nodes) +
+		(SELECT coalesce(sum(length(notification)+coalesce(length(metadata),0)+coalesce(length(link_target),0)+coalesce(length(CAST(content AS BLOB)),0)),0) FROM changes)`).Scan(&payloadBytes); err != nil {
 		t.Fatal(err)
 	}
 	for _, scope := range []*int64{nil, &id} {
@@ -49,26 +50,26 @@ func TestIntegrityWorkAndNameBytesHaveExactBounds(t *testing.T) {
 		if err := validateIntegrityWork(t.Context(), db, scope, 6); !errors.Is(err, syscall.EFBIG) {
 			t.Fatalf("work limit accepted seven rows: %v", err)
 		}
-		if err := validateIntegrityBytes(t.Context(), db, scope, 7+notificationBytes, 5); err != nil {
+		if err := validateIntegrityBytes(t.Context(), db, scope, 7+payloadBytes, schema.Version()); err != nil {
 			t.Fatalf("exact seven-byte names refused: %v", err)
 		}
-		if err := validateIntegrityBytes(t.Context(), db, scope, 6+notificationBytes, 5); !errors.Is(err, syscall.EFBIG) {
+		if err := validateIntegrityBytes(t.Context(), db, scope, 6+payloadBytes, schema.Version()); !errors.Is(err, syscall.EFBIG) {
 			t.Fatalf("change name escaped byte limit: %v", err)
 		}
-		if err := validateIntegrityBytes(t.Context(), db, scope, 3, 5); !errors.Is(err, syscall.EFBIG) {
+		if err := validateIntegrityBytes(t.Context(), db, scope, 3, schema.Version()); !errors.Is(err, syscall.EFBIG) {
 			t.Fatalf("entry name escaped byte limit: %v", err)
 		}
 	}
 	execute(t, db, `UPDATE changes SET from_name=X'6d6f766564'`)
-	if err := validateIntegrityBytes(t.Context(), db, &id, 11+notificationBytes, 5); !errors.Is(err, syscall.EFBIG) {
+	if err := validateIntegrityBytes(t.Context(), db, &id, 11+payloadBytes, schema.Version()); !errors.Is(err, syscall.EFBIG) {
 		t.Fatalf("from_name escaped byte accounting: %v", err)
 	}
 	execute(t, db, `UPDATE changes SET from_name='text'`)
-	if err := validateIntegrityBytes(t.Context(), db, &id, 100+notificationBytes, 5); !errors.Is(err, syscall.EIO) {
+	if err := validateIntegrityBytes(t.Context(), db, &id, 100+payloadBytes, schema.Version()); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("text from_name coerced to bytes: %v", err)
 	}
 	execute(t, db, `UPDATE entries SET name='text'`)
-	if err := validateIntegrityBytes(t.Context(), db, &id, 100+notificationBytes, 5); !errors.Is(err, syscall.EIO) {
+	if err := validateIntegrityBytes(t.Context(), db, &id, 100+payloadBytes, schema.Version()); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("text entry name coerced to bytes: %v", err)
 	}
 }
@@ -90,7 +91,7 @@ func TestIntegrityRejectsInvalidStoredClassesAndMetadata(t *testing.T) {
 		{"invalid detached flag", `UPDATE nodes SET detached=2 WHERE id=2`, "metadata values", validateNodeValues},
 		{"invalid revision", `UPDATE nodes SET content_revision=0 WHERE id=2`, "metadata values", validateNodeValues},
 		{"unknown object state", `UPDATE objects SET state=99`, "unknown state", func(ctx context.Context, q sqlvalue.Queryer, ns *int64) error {
-			return validateIntegrity(ctx, q, ns, 1000, 1<<20, 5)
+			return validateIntegrity(ctx, q, ns, 1000, 1<<20, schema.Version())
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -119,12 +120,12 @@ func TestIntegrityCancellationPreservesTheCause(t *testing.T) {
 		run  func() error
 	}{
 		{"records", func() error { return validateIntegrityWork(ctx, db, &id, 1000) }},
-		{"names", func() error { return validateIntegrityBytes(ctx, db, &id, 1<<20, 5) }},
+		{"names", func() error { return validateIntegrityBytes(ctx, db, &id, 1<<20, schema.Version()) }},
 		{"classes", func() error { return validateStorageClasses(ctx, db, &id) }},
 		{"node values", func() error { return validateNodeValues(ctx, db, &id) }},
 		{"node relationships", func() error { return validateNodeRelationships(ctx, db, &id) }},
 		{"object relationships", func() error { return validateObjectRelationships(ctx, db, &id) }},
-		{"history", func() error { return validateLogIntegrity(ctx, db, &id) }},
+		{"history", func() error { return validateLogIntegrity(ctx, db, &id, 1000, 8<<20) }},
 		{"accounting", func() error { return validateUsedAccounting(ctx, db, &id) }},
 	} {
 		t.Run(check.name, func(t *testing.T) {
@@ -143,7 +144,7 @@ func TestIntegrityRejectsAggregateChangePayloadOverflow(t *testing.T) {
 	volume, root := testVolume(t, db, "payload")
 	testChange(t, db, volume, root, "removed")
 	execute(t, db, `UPDATE changes SET content=?`, strings.Repeat("x", metastore.MaxChangePayloadBytes))
-	if err := validateIntegrityBytes(t.Context(), db, &volume, 8<<20, 5); !errors.Is(err, syscall.EFBIG) {
+	if err := validateIntegrityBytes(t.Context(), db, &volume, 8<<20, schema.Version()); !errors.Is(err, syscall.EFBIG) {
 		t.Fatalf("aggregate payload overflow: %v", err)
 	}
 }

@@ -3,7 +3,6 @@ package smb
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"net"
 	"sync"
 	"syscall"
@@ -17,46 +16,52 @@ import (
 )
 
 type sessionBackend struct {
-	storage.WindowsStorage
-	session  storage.WindowsSession
+	windowsBackend
+	session  windowsSession
 	stateErr error
 }
 
-func (b *sessionBackend) CheckWindowsStorage() error { return nil }
-func (b *sessionBackend) WindowsState(context.Context) (storage.WindowsState, error) {
-	return storage.WindowsState{Enabled: true, ActionEpoch: 1, MaxEventBytes: 1024, VolumeIdentity: "authority:volume", VolumeSerial: 0x123456789}, b.stateErr
+func (b *sessionBackend) Check() error { return nil }
+func (b *sessionBackend) State(context.Context) (windowsState, error) {
+	return windowsState{RootID: 1, MaxEventBytes: 1024, VolumeIdentity: "authority:volume", VolumeSerial: 0x123456789}, b.stateErr
 }
-func (b *sessionBackend) NewWindowsSession(context.Context, storage.FileSessionOptions) (storage.WindowsSession, error) {
+func (b *sessionBackend) NewSession(context.Context, storage.FileSessionOptions) (windowsSession, error) {
 	return b.session, nil
 }
 
 type sessionFile struct {
 	*commandFile
 	mu      sync.Mutex
-	batch   storage.WindowsLockBatch
+	batch   windowsLockBatch
 	pending bool
 }
 
-func (f *sessionFile) LockBatch(_ context.Context, b storage.WindowsLockBatch, id storage.WindowsActionID) (storage.WindowsActionResult, error) {
+func (f *sessionFile) LockBatch(ctx context.Context, b windowsLockBatch, id windowsActionID) (windowsActionResult, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.batch = b
-	state := storage.WindowsActionCompleted
-	if f.pending {
-		state = storage.WindowsActionPending
+	pending := f.pending
+	f.mu.Unlock()
+	if pending {
+		if notify, ok := ctx.Value(rangePendingKey{}).(func() error); ok {
+			if err := notify(); err != nil {
+				return windowsActionResult{}, err
+			}
+		}
+		<-ctx.Done()
+		return windowsActionResult{}, syscall.EINTR
 	}
-	return storage.WindowsActionResult{Action: id, State: state}, nil
+	return windowsActionResult{Action: id, State: windowsActionCompleted}, nil
 }
 
 type backendSession struct {
 	*commandSession
-	cancelState storage.WindowsActionState
+	cancelState windowsActionState
 	cancelErr   error
 	renewErr    error
 }
 
-func (s *backendSession) CancelAction(_ context.Context, id storage.WindowsActionID) (storage.WindowsActionResult, error) {
-	return storage.WindowsActionResult{Action: id, State: s.cancelState}, s.cancelErr
+func (s *backendSession) CancelAction(_ context.Context, id windowsActionID) (windowsActionResult, error) {
+	return windowsActionResult{Action: id, State: s.cancelState}, s.cancelErr
 }
 func (s *backendSession) Renew(context.Context) (storage.FileSessionStatus, error) {
 	return storage.FileSessionStatus{ActionEpoch: 1, Remaining: time.Minute}, s.renewErr
@@ -80,13 +85,13 @@ func testConnection(t *testing.T) (*connection, *session, *tree, *sessionFile, *
 		s.mu.Unlock()
 		_ = s.Shutdown(context.Background())
 	})
-	f := &sessionFile{commandFile: &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 1, Mode: fs.ModeDir, Size: 3}}, NameInfo: storage.WindowsNameInfo{State: storage.WindowsNameRoot}}, data: []byte("abc"), result: storage.WindowsActionResult{State: storage.WindowsActionCompleted}}}
-	ws := &backendSession{commandSession: &commandSession{}, cancelState: storage.WindowsActionCancelled}
-	ws.open = func(storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
-		return storage.WindowsOpenResult{File: f, Attr: f.attr, CreateAction: storage.WindowsOpened}, nil
+	f := &sessionFile{commandFile: &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory, Size: 3}}, NameInfo: windowsNameInfo{State: windowsNameRoot}}, data: []byte("abc"), result: windowsActionResult{State: windowsActionCompleted}}}
+	ws := &backendSession{commandSession: &commandSession{}, cancelState: windowsActionCancelled}
+	ws.open = func(windowsOpenRequest) (windowsOpenResult, error) {
+		return windowsOpenResult{File: f, Attr: f.attr, CreateAction: windowsOpened}, nil
 	}
 	stream := testNotifyStream()
-	e, err := s.Publish(Share{Name: "work", Volume: "trusted", Backend: &sessionBackend{session: ws}, Changes: testNotifySource(stream)})
+	e, err := s.publish(Share{Name: "work", Volume: "trusted", Changes: testNotifySource(stream)}, &sessionBackend{session: ws})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +107,7 @@ func testConnection(t *testing.T) (*connection, *session, *tree, *sessionFile, *
 	c.nextTree = 1
 	e.refs = 1
 	e.opens = 1
-	tr := &tree{id: 1, sessionID: 1, export: e, session: ws, files: newFileDispatcher(e.share.Backend, ws, 1, s.config.Limits)}
+	tr := &tree{id: 1, sessionID: 1, export: e, session: ws, files: newFileDispatcher(e.backend, ws, 1, s.config.Limits)}
 	ss.trees[1] = tr
 	tr.files.onOpen = func(delta int) { s.mu.Lock(); e.opens += delta; s.mu.Unlock() }
 	tr.files.onUncertain = s.unconfirmedMutation
@@ -160,7 +165,7 @@ func TestAuthorizedDispatchAndExportIsolation(t *testing.T) {
 	if err := tr.export.Unpublish(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.server.Publish(Share{Name: "work", Volume: "v", Backend: &sessionBackend{}, Changes: testNotifySource(testNotifyStream())}); err != nil {
+	if _, err := c.server.publish(Share{Name: "work", Volume: "v", Changes: testNotifySource(testNotifyStream())}, &sessionBackend{}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -198,7 +203,7 @@ func TestLockCancellationReconcilesAuthority(t *testing.T) {
 	if _, status := c.lock(context.Background(), tr, r, nil); status != 0 {
 		t.Fatalf("grant %x", status)
 	}
-	if f.batch.Ranges[0].Type != storage.Exclusive || f.batch.Ranges[0].Length != 10 {
+	if f.batch.Ranges[0].Type != lockExclusive || f.batch.Ranges[0].Length != 10 {
 		t.Fatal(f.batch)
 	}
 	f.pending = true
@@ -207,7 +212,7 @@ func TestLockCancellationReconcilesAuthority(t *testing.T) {
 	if _, status := c.lock(ctx, tr, r, nil); status != statusCancelled {
 		t.Fatalf("cancel %x", status)
 	}
-	ws.cancelState = storage.WindowsActionCompleted
+	ws.cancelState = windowsActionCompleted
 	if _, status := c.lock(ctx, tr, r, nil); status != 0 {
 		t.Fatalf("grant won cancellation %x", status)
 	}

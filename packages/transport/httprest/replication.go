@@ -2,10 +2,9 @@ package httprest
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
+	"github.com/codetreker/remote-fs/packages/storage"
 	"syscall"
 	"time"
 
@@ -26,25 +25,24 @@ import (
 
 // Node is metastore.Node on the wire.
 type Node struct {
-	ID         int64  `json:"id"`
-	Mode       uint32 `json:"mode"`
-	Size       int64  `json:"size"`
-	AccessTime Time   `json:"access_time"`
-	ModTime    Time   `json:"mod_time"`
-
-	// Content is the key of the object holding a file's bytes, and empty for a directory
-	// and for a file that has never been written. It travels as bytes rather than as a
-	// string for the same reason a name does: a key is opaque to everything above the
-	// store that allocated it, so this side may not assume it is text, and a key that came
-	// back altered names bytes that are not there.
-	Content []byte `json:"content"`
+	ID                int64  `json:"id"`
+	Kind              uint8  `json:"kind"`
+	Size              int64  `json:"size"`
+	AccessTime        Time   `json:"access_time"`
+	ModTime           Time   `json:"mod_time"`
+	CreationTime      *Time  `json:"creation_time,omitempty"`
+	ChangeTime        *Time  `json:"change_time,omitempty"`
+	MetadataRevision  uint64 `json:"metadata_revision"`
+	DirectoryRevision uint64 `json:"directory_revision"`
+	Metadata          []byte `json:"metadata"`
+	Content           []byte `json:"content"`
+	LinkTarget        []byte `json:"link_target"`
 }
 
-// UnmarshalJSON refuses node values a replica could persist as plausible metadata.
 func (n *Node) UnmarshalJSON(data []byte) error {
 	type node Node
 	var decoded node
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeMessageJSON(data, &decoded, maximumPageRows); err != nil {
 		return err
 	}
 	got := Node(decoded)
@@ -62,17 +60,41 @@ func (n Node) check() error {
 	if n.Size < 0 {
 		return fmt.Errorf("node %d carries negative size %d", n.ID, n.Size)
 	}
-	if err := checkWireTime("access", n.AccessTime); err != nil {
-		return fmt.Errorf("node %d: %w", n.ID, err)
+	if err := storage.NodeKind(n.Kind).Check(); err != nil {
+		return fmt.Errorf("node %d carries invalid kind: %w", n.ID, err)
 	}
-	if err := checkWireTime("modification", n.ModTime); err != nil {
-		return fmt.Errorf("node %d: %w", n.ID, err)
+	for _, instant := range []struct {
+		name  string
+		value *Time
+	}{
+		{"access", &n.AccessTime}, {"modification", &n.ModTime}, {"creation", n.CreationTime}, {"change", n.ChangeTime},
+	} {
+		if instant.value != nil {
+			if err := checkWireTime(instant.name, *instant.value); err != nil {
+				return fmt.Errorf("node %d: %w", n.ID, err)
+			}
+		}
 	}
-	mode := fs.FileMode(n.Mode)
-	switch mode.Type() {
-	case 0, fs.ModeDir, fs.ModeSymlink:
-	default:
-		return fmt.Errorf("node %d carries unsupported type bits %v", n.ID, mode.Type())
+	if n.MetadataRevision == 0 || (storage.NodeKind(n.Kind) == storage.NodeDirectory) != (n.DirectoryRevision != 0) {
+		return fmt.Errorf("node %d carries invalid revision state: %w", n.ID, syscall.EIO)
+	}
+	if storage.NodeKind(n.Kind) == storage.NodeDirectory && n.Size != 0 {
+		return fmt.Errorf("directory %d carries a nonzero size: %w", n.ID, syscall.EIO)
+	}
+	if storage.NodeKind(n.Kind) == storage.NodeSymlink && n.Size != int64(len(n.LinkTarget)) {
+		return fmt.Errorf("link %d size disagrees with target: %w", n.ID, syscall.EIO)
+	}
+	if err := (metastore.ChangePayloadLengths{Content: int64(len(n.Content)), Metadata: int64(len(n.Metadata)), Target: int64(len(n.LinkTarget))}).Check(); err != nil {
+		return err
+	}
+	if _, err := storage.DecodeMetadata(n.Metadata); err != nil {
+		return fmt.Errorf("node %d carries invalid metadata: %w", n.ID, err)
+	}
+	if len(n.LinkTarget) > storage.MaxLinkTargetBytes {
+		return fmt.Errorf("node %d link target exceeds its byte bound: %w", n.ID, syscall.EFBIG)
+	}
+	if storage.NodeKind(n.Kind) != storage.NodeSymlink && len(n.LinkTarget) != 0 {
+		return fmt.Errorf("node %d carries a link target on a non-link: %w", n.ID, syscall.EIO)
 	}
 	return nil
 }
@@ -84,28 +106,66 @@ func checkWireTime(name string, instant Time) error {
 	return nil
 }
 
-// NodeOf renders n for the wire.
-func NodeOf(n metastore.Node) *Node {
-	return &Node{
-		ID:         n.ID,
-		Mode:       uint32(n.Mode),
-		Size:       n.Size,
-		AccessTime: TimeOf(n.AccessTime),
-		ModTime:    TimeOf(n.ModTime),
-		Content:    []byte(n.Content),
+// NodeOf validates opaque metadata before allocating its wire representation.
+func NodeOf(n metastore.Node) (*Node, error) {
+	metadata, err := storage.EncodeMetadata(n.Metadata)
+	if err != nil {
+		return nil, err
 	}
+	if err := (metastore.ChangePayloadLengths{Content: int64(len(n.Content)), Metadata: int64(len(metadata)), Target: int64(len(n.LinkTarget))}).Check(); err != nil {
+		return nil, err
+	}
+	wire := nodeShapeOf(n)
+	wire.Metadata = metadata
+	wire.Content = []byte(n.Content)
+	wire.LinkTarget = append([]byte{}, n.LinkTarget...)
+	if err := wire.check(); err != nil {
+		return nil, err
+	}
+	return wire, nil
 }
 
-// Metastore returns the node n carries.
-func (n Node) Metastore() metastore.Node {
-	return metastore.Node{
-		ID:         n.ID,
-		Mode:       fs.FileMode(n.Mode),
-		Size:       n.Size,
-		AccessTime: n.AccessTime.Time(),
-		ModTime:    n.ModTime.Time(),
-		Content:    metastore.Key(n.Content),
+// nodeShapeOf contains only fixed-size facts. Frame accounting fills and charges
+// every variable byte field separately before asking a source to load it.
+func nodeShapeOf(n metastore.Node) *Node {
+	wire := &Node{ID: n.ID, Kind: uint8(n.Kind), Size: n.Size,
+		AccessTime: TimeOf(n.AccessTime), ModTime: TimeOf(n.ModTime),
+		MetadataRevision: uint64(n.MetadataRevision), DirectoryRevision: uint64(n.DirectoryRevision),
+		Metadata: []byte{}, Content: []byte{}, LinkTarget: []byte{},
 	}
+	if n.CreationTime != nil {
+		instant := TimeOf(*n.CreationTime)
+		wire.CreationTime = &instant
+	}
+	if n.ChangeTime != nil {
+		instant := TimeOf(*n.ChangeTime)
+		wire.ChangeTime = &instant
+	}
+	return wire
+}
+
+func (n Node) Metastore() (metastore.Node, error) {
+	if err := n.check(); err != nil {
+		return metastore.Node{}, err
+	}
+	metadata, err := storage.DecodeMetadata(n.Metadata)
+	if err != nil {
+		return metastore.Node{}, err
+	}
+	node := metastore.Node{ID: n.ID, Kind: storage.NodeKind(n.Kind), Size: n.Size,
+		AccessTime: n.AccessTime.Time().UTC(), ModTime: n.ModTime.Time().UTC(),
+		MetadataRevision: storage.NodeMetadataRevision(n.MetadataRevision), DirectoryRevision: storage.DirectoryRevision(n.DirectoryRevision),
+		Metadata: metadata, Content: metastore.Key(n.Content), LinkTarget: bytes.Clone(n.LinkTarget),
+	}
+	if n.CreationTime != nil {
+		instant := n.CreationTime.Time().UTC()
+		node.CreationTime = &instant
+	}
+	if n.ChangeTime != nil {
+		instant := n.ChangeTime.Time().UTC()
+		node.ChangeTime = &instant
+	}
+	return node, nil
 }
 
 // The names the four metastore.ChangeKind values travel under.
@@ -164,14 +224,37 @@ type Change struct {
 // ChangeOf renders c for the wire. A kind outside the vocabulary is refused rather than
 // carried, because the receiving side would have to guess what happened to the name.
 func ChangeOf(c metastore.Change) (*Change, error) {
+	notification, err := metastore.EncodeNotification(c)
+	if err != nil {
+		return nil, fmt.Errorf("the change at position %d has invalid notification facts: %w", c.Position, err)
+	}
+	lengths := metastore.ChangePayloadLengths{Name: int64(len(c.Name)), Notification: int64(len(notification))}
+	if c.From != nil {
+		lengths.FromName = int64(len(c.From.Name))
+	}
+	if c.Node != nil {
+		metadata, err := storage.EncodeMetadata(c.Node.Metadata)
+		if err != nil {
+			return nil, err
+		}
+		lengths.Content = int64(len(c.Node.Content))
+		lengths.Metadata = int64(len(metadata))
+		lengths.Target = int64(len(c.Node.LinkTarget))
+	}
+	if err := lengths.Check(); err != nil {
+		return nil, err
+	}
 	wire, err := changeShapeOf(c)
 	if err != nil {
 		return nil, err
 	}
-	wire.Notification, err = metastore.EncodeNotification(c)
-	if err != nil {
-		return nil, fmt.Errorf("the change at position %d has invalid notification facts: %w", c.Position, err)
+	if c.Node != nil {
+		wire.Node, err = NodeOf(*c.Node)
+		if err != nil {
+			return nil, err
+		}
 	}
+	wire.Notification = notification
 	if err := wire.check(); err != nil {
 		return nil, fmt.Errorf("the change at position %d cannot be sent: %w", c.Position, err)
 	}
@@ -183,12 +266,12 @@ func changeShapeOf(c metastore.Change) (*Change, error) {
 	if !known {
 		return nil, fmt.Errorf("the change at position %d is of kind %d, which this protocol cannot name", c.Position, c.Kind)
 	}
-	wire := &Change{Position: int64(c.Position), Kind: name, Parent: c.Parent, Name: c.Name}
+	wire := &Change{Position: int64(c.Position), Kind: name, Parent: c.Parent, Name: append([]byte{}, c.Name...)}
 	if c.From != nil {
-		wire.From = &Location{Parent: c.From.Parent, Name: c.From.Name}
+		wire.From = &Location{Parent: c.From.Parent, Name: append([]byte{}, c.From.Name...)}
 	}
 	if c.Node != nil {
-		wire.Node = NodeOf(*c.Node)
+		wire.Node = nodeShapeOf(*c.Node)
 	}
 	return wire, nil
 }
@@ -198,7 +281,7 @@ func changeShapeOf(c metastore.Change) (*Change, error) {
 func (c *Change) UnmarshalJSON(data []byte) error {
 	type change Change
 	var decoded change
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeMessageJSON(data, &decoded, maximumPageRows); err != nil {
 		return err
 	}
 	got := Change(decoded)
@@ -262,10 +345,13 @@ func (c Change) Metastore() (metastore.Change, error) {
 		Name:     c.Name,
 	}
 	if c.From != nil {
-		change.From = &metastore.Location{Parent: c.From.Parent, Name: c.From.Name}
+		change.From = &metastore.Location{Parent: c.From.Parent, Name: append([]byte{}, c.From.Name...)}
 	}
 	if c.Node != nil {
-		node := c.Node.Metastore()
+		node, err := c.Node.Metastore()
+		if err != nil {
+			return metastore.Change{}, err
+		}
 		change.Node = &node
 	}
 	notification, err := metastore.DecodeNotification(change, c.Notification)
@@ -278,14 +364,29 @@ func (c Change) Metastore() (metastore.Change, error) {
 
 // Row is metastore.Row on the wire. The root carries parent 0 and no name.
 type Row struct {
-	Parent int64  `json:"parent"`
-	Name   []byte `json:"name"`
-	Node   *Node  `json:"node"`
+	EntryID storage.EntryID `json:"entry_id"`
+	Parent  int64           `json:"parent"`
+	Name    []byte          `json:"name"`
+	Node    *Node           `json:"node"`
 }
 
 // RowOf renders r for the wire.
-func RowOf(r metastore.Row) Row {
-	return Row{Parent: r.Parent, Name: r.Name, Node: NodeOf(r.Node)}
+func RowOf(r metastore.Row) (Row, error) {
+	if err := (metastore.ChangePayloadLengths{Name: int64(len(r.Name)), Content: int64(len(r.Node.Content)), Target: int64(len(r.Node.LinkTarget))}).Check(); err != nil {
+		return Row{}, err
+	}
+	node, err := NodeOf(r.Node)
+	if err != nil {
+		return Row{}, err
+	}
+	if err := (metastore.ChangePayloadLengths{Name: int64(len(r.Name)), Content: int64(len(node.Content)), Metadata: int64(len(node.Metadata)), Target: int64(len(node.LinkTarget))}).Check(); err != nil {
+		return Row{}, err
+	}
+	wire := Row{EntryID: r.EntryID, Parent: r.Parent, Name: append([]byte{}, r.Name...), Node: node}
+	if err := wire.check(); err != nil {
+		return Row{}, err
+	}
+	return wire, nil
 }
 
 // UnmarshalJSON decodes a row and refuses one that carries no node, which would otherwise
@@ -293,25 +394,50 @@ func RowOf(r metastore.Row) Row {
 func (r *Row) UnmarshalJSON(data []byte) error {
 	type row Row
 	var decoded row
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeMessageJSON(data, &decoded, maximumPageRows); err != nil {
 		return err
 	}
-	if decoded.Node == nil {
-		return fmt.Errorf("the snapshot row for %q under %d carried no node", decoded.Name, decoded.Parent)
-	}
-	if err := decoded.Node.check(); err != nil {
+	if err := Row(decoded).check(); err != nil {
 		return err
-	}
-	if decoded.Parent < 0 {
-		return fmt.Errorf("the snapshot row carries negative parent %d", decoded.Parent)
 	}
 	*r = Row(decoded)
 	return nil
 }
 
 // Metastore returns the row r carries.
-func (r Row) Metastore() metastore.Row {
-	return metastore.Row{Parent: r.Parent, Name: r.Name, Node: r.Node.Metastore()}
+func (r Row) Metastore() (metastore.Row, error) {
+	if err := r.check(); err != nil {
+		return metastore.Row{}, err
+	}
+	node, err := r.Node.Metastore()
+	if err != nil {
+		return metastore.Row{}, err
+	}
+	name := r.Name
+	if r.Parent == 0 {
+		name = nil
+	}
+	return metastore.Row{EntryID: r.EntryID, Parent: r.Parent, Name: name, Node: node}, nil
+}
+
+func (r Row) check() error {
+	if r.Node == nil {
+		return fmt.Errorf("snapshot row carries no node: %w", syscall.EIO)
+	}
+	if err := r.Node.check(); err != nil {
+		return err
+	}
+	if r.Parent < 0 {
+		return fmt.Errorf("snapshot row carries negative parent: %w", syscall.EIO)
+	}
+	if r.Parent == 0 {
+		if r.EntryID != 0 || len(r.Name) != 0 || storage.NodeKind(r.Node.Kind) != storage.NodeDirectory {
+			return fmt.Errorf("snapshot root is not an unnamed directory: %w", syscall.EIO)
+		}
+	} else if r.EntryID == 0 || len(r.Name) == 0 || bytes.Equal(r.Name, []byte(".")) || bytes.Equal(r.Name, []byte("..")) || bytes.ContainsAny(r.Name, "/\x00") || r.Parent == r.Node.ID {
+		return fmt.Errorf("snapshot row carries an invalid entry: %w", syscall.EIO)
+	}
+	return nil
 }
 
 // The frames a replication stream is made of. Each is one server-sent event: a name
@@ -399,7 +525,7 @@ type StreamStart struct {
 func (s *StreamStart) UnmarshalJSON(data []byte) error {
 	type start StreamStart
 	var decoded start
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeMessageJSON(data, &decoded, maximumPageRows); err != nil {
 		return err
 	}
 	got := StreamStart(decoded)
@@ -453,7 +579,7 @@ type SnapshotOpen struct {
 func (o *SnapshotOpen) UnmarshalJSON(data []byte) error {
 	type open SnapshotOpen
 	var decoded open
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeMessageJSON(data, &decoded, maximumPageRows); err != nil {
 		return err
 	}
 	if decoded.Position == nil {
@@ -477,7 +603,7 @@ type SnapshotPage struct {
 func (p *SnapshotPage) UnmarshalJSON(data []byte) error {
 	type page SnapshotPage
 	var decoded page
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeMessageJSON(data, &decoded, maximumPageRows); err != nil {
 		return err
 	}
 	if len(decoded.Rows) == 0 {
@@ -502,52 +628,14 @@ type StreamFault struct {
 }
 
 func (f *StreamFault) UnmarshalJSON(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	token, err := decoder.Token()
-	if err != nil {
+	type fault StreamFault
+	var decoded fault
+	if err := decodeMessageJSON(data, &decoded, maximumPageRows); err != nil {
 		return err
 	}
-	if token != json.Delim('{') {
-		return errors.New("the stream fault must be an object")
+	if decoded.Errno != nil && *decoded.Errno != "EACCES" && *decoded.Errno != "EIO" {
+		return errors.New("the stream fault carries an unsupported errno")
 	}
-	var decoded StreamFault
-	var hasMessage, hasErrno bool
-	for decoder.More() {
-		field, err := decoder.Token()
-		if err != nil {
-			return err
-		}
-		var raw json.RawMessage
-		if err := decoder.Decode(&raw); err != nil {
-			return err
-		}
-		switch field {
-		case "message":
-			if hasMessage {
-				return errors.New("the stream fault repeats its message")
-			}
-			hasMessage = true
-			if err := json.Unmarshal(raw, &decoded.Message); err != nil {
-				return err
-			}
-		case "errno":
-			if hasErrno {
-				return errors.New("the stream fault repeats its errno")
-			}
-			hasErrno = true
-			var name string
-			if err := json.Unmarshal(raw, &name); err != nil {
-				return fmt.Errorf("the stream fault errno does not decode: %w", err)
-			}
-			if name != "EACCES" && name != "EIO" {
-				return errors.New("the stream fault carries an unsupported errno")
-			}
-			decoded.Errno = &name
-		}
-	}
-	if _, err := decoder.Token(); err != nil {
-		return err
-	}
-	*f = decoded
+	*f = StreamFault(decoded)
 	return nil
 }

@@ -290,6 +290,12 @@ func TestLiveDescriptorsKeepTheirObjectThroughRemoteNameChanges(t *testing.T) {
 			} else if body, err := backing.Read(t.Context(), "file"); err != nil || string(body) != "replacement" {
 				t.Fatalf("retained writes changed the replacement: %q, %v", body, err)
 			}
+			if change != "unlink" {
+				replacement, err := backing.Stat(t.Context(), "file")
+				if err != nil || storedMode(t, replacement).Perm() != 0600 {
+					t.Fatalf("retained chmod changed replacement permissions: %+v, %v", replacement, err)
+				}
+			}
 			if change == "rename" {
 				if body, err := backing.Read(t.Context(), "moved"); err != nil || string(body) != "OLDg" {
 					t.Fatalf("renamed object contains %q, %v", body, err)
@@ -395,8 +401,8 @@ func TestCreateOpenAcrossHTTPMountsHasOneAtomicResult(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, outcome := range successes {
-				if outcome.mode != attr.Mode.Perm() {
-					t.Fatalf("open reported mode %v before the final creation mode %v", outcome.mode, attr.Mode.Perm())
+				if outcome.mode != storedMode(t, attr).Perm() {
+					t.Fatalf("open reported mode %v before the final creation mode %v", outcome.mode, storedMode(t, attr).Perm())
 				}
 				if current := ino(t, filepath.Join([]string{left, right}[outcome.mount], name)); outcome.inode != current {
 					t.Fatalf("open returned inode %d, but its mount resolves the winning file to %d", outcome.inode, current)
@@ -414,18 +420,36 @@ type observedLifetimeStorage struct {
 	closes   atomic.Int32
 }
 
-func (s *observedLifetimeStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
-	session, err := s.FileStorage.NewFileSession(ctx, options)
+func (s *observedLifetimeStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
+	session, status, err := s.FileStorage.NewFileSession(ctx, options)
 	if err != nil {
-		return nil, err
+		return nil, status, err
 	}
 	if s.hold != "" {
-		s.retained, err = session.OpenFile(ctx, s.hold, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
-		if err != nil {
-			return nil, errors.Join(err, session.Close(ctx))
+		attr, holdErr := s.FileStorage.Stat(ctx, s.hold)
+		var id storage.FileActionID
+		if holdErr == nil {
+			id, holdErr = storage.NewFileActionID(status.ActionEpoch)
+		}
+		var receipt storage.FileActionReceipt
+		if holdErr == nil {
+			receipt, holdErr = session.Retain(ctx, storage.RetainRequest{NodeID: attr.ID, Claim: storage.AccessClaim{Uses: storage.ReadContent | storage.WriteContent}}, id)
+		}
+		if holdErr == nil {
+			s.retained, holdErr = session.Reference(ctx, receipt.Reference)
+		}
+		if holdErr != nil {
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			closeID, idErr := storage.NewFileActionID(status.ActionEpoch)
+			if idErr != nil {
+				return nil, status, errors.Join(holdErr, idErr)
+			}
+			_, closeErr := session.Close(cleanup, closeID)
+			return nil, status, errors.Join(holdErr, closeErr)
 		}
 	}
-	return &observedLifetimeSession{FileSession: session, owner: s}, nil
+	return &observedLifetimeSession{FileSession: session, owner: s}, status, nil
 }
 
 type observedLifetimeSession struct {
@@ -441,12 +465,12 @@ func (s *observedLifetimeSession) Renew(ctx context.Context) (storage.FileSessio
 	return status, err
 }
 
-func (s *observedLifetimeSession) Close(ctx context.Context) error {
-	err := s.FileSession.Close(ctx)
+func (s *observedLifetimeSession) Close(ctx context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	receipt, err := s.FileSession.Close(ctx, id)
 	if err == nil {
 		s.owner.closes.Add(1)
 	}
-	return err
+	return receipt, err
 }
 
 func observedLifetimeMount(t *testing.T, url, hold string, lease time.Duration) (*fuse.Mount, string, *observedLifetimeStorage) {
@@ -566,7 +590,7 @@ func TestExternalKernelTeardownRetiresReferencesWithoutRelease(t *testing.T) {
 	if observed.closes.Load() != 1 {
 		t.Fatalf("external teardown closed session %d times", observed.closes.Load())
 	}
-	if _, err := observed.retained.Stat(t.Context()); !errors.Is(err, syscall.ESTALE) && !errors.Is(err, syscall.EBADF) {
+	if _, err := observed.retained.Stat(t.Context(), storage.ObservationOptions{}); !errors.Is(err, syscall.ESTALE) && !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("reference survived session retirement: %v", err)
 	}
 	space, err = backing.Space(t.Context())

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -851,7 +852,7 @@ func TestBoundOpenersPreserveIdentityAndEnforceConfiguredBacklog(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if after, err := s.Stat(t.Context(), "kept"); err != nil || after != before {
+			if after, err := s.Stat(t.Context(), "kept"); err != nil || !reflect.DeepEqual(after, before) {
 				t.Fatalf("reopened node = %+v, %v; want %+v", after, err, before)
 			}
 		})

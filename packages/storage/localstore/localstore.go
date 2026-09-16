@@ -16,7 +16,6 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/codetreker/remote-fs/packages/advisory"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
@@ -61,7 +60,8 @@ var metastoreAuxiliaryFilenames = [...]string{
 // The backing filesystem remains the hard physical ceiling for all bytes.
 // LocalDisk.MaintenanceReserveBytes keeps deletion and SQLite maintenance possible when that
 // ceiling is reached; removal remains available while new object publication is refused.
-// Locks enables the paired file-lease authority. Once initialized, reopening requires Locks;
+// Retained files have their own durable recovery state. Files bounds their shared authority.
+// Locks enables the paired strong-lease authority. Once initialized, reopening requires Locks;
 // its omission cannot disable existing protection. InitializeLocks permits the first durable
 // lease binding or completion of its matching intent; missing active evidence fails closed.
 type Config struct {
@@ -74,9 +74,9 @@ type Config struct {
 	MaxSnapshotReaderConnections int
 	MaxIntegrityRecords          int64
 	MaxIntegrityBytes            int64
-	// Retained-file and advisory limits use SQLite defaults when omitted.
+	// Retained-object, access and content limits use SQLite defaults when omitted.
 	MaxRetainedFiles int
-	Advisory         advisory.Config
+	Files            storage.FileServiceOptions
 	LocalDisk        localdisk.Options
 	Maintenance      objectstore.Options
 	Locks            *locking.Options
@@ -282,7 +282,7 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 	openDurable := hooks.openDurable
 	if openDurable == nil {
 		openDurable = func() (*sqlite.Store, error) {
-			opener := sqlite.OpenBoundDurableWithOptions
+			opener := sqlite.OpenBoundDurableFileWithOptions
 			if config.Locks != nil {
 				opener = sqlite.OpenBoundDurableLeaseWithOptions
 			}
@@ -311,6 +311,9 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 		return nil, errors.Join(err, closeFailure("local object store", objects.Close()), anchor.Close())
 	}
 	durableMeta := newDurableMetastore(meta, witness)
+	if err := durableMeta.bindFileRecovery(ctx, anchor, storeID.String()+":"+config.Volume+":files", recoveryStart); err != nil {
+		return nil, errors.Join(err, cleanupDurableOpen(durableMeta, objects, anchor))
+	}
 	if config.Locks != nil {
 		leaseAnchor, err := sqlite.OpenLeaseAnchor(sqlite.LeaseAnchorConfig{
 			Directory: root, Name: ".leases", Identity: storeID.String() + ":" + config.Volume,
@@ -395,7 +398,7 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 func (config Config) sqliteOptions() (sqlite.Options, error) {
 	return (sqlite.Options{
 		MaxRetainedFiles:             config.MaxRetainedFiles,
-		Advisory:                     config.Advisory,
+		Files:                        config.Files,
 		Window:                       config.Window,
 		ObjectLimits:                 config.ObjectLimits,
 		MaxReaderConnections:         config.MaxReaderConnections,

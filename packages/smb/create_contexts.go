@@ -4,21 +4,20 @@ import (
 	"context"
 
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
-	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 type maximalAccessKey struct{}
 
-func (c *connection) maximalAccess(ctx context.Context, t *tree, attr storage.WindowsAttr) (uint32, error) {
-	intent := storage.WindowsOpenIntent{Disposition: storage.WindowsOpen, Share: storage.WindowsShareAll}
+func (c *connection) maximalAccess(ctx context.Context, t *tree, attr windowsAttr) (uint32, error) {
+	intent := windowsOpenIntent{Disposition: windowsOpen, Share: windowsShareAll}
 	if attr.IsDir() {
-		intent.Kind = storage.WindowsDirectory
+		intent.Kind = windowsDirectory
 	}
 	access, err := c.authorizeMaximumAccess(ctx, t, intent)
 	return encodeAccess(access), err
 }
 
-func createContexts(ctx context.Context, request wire.CreateRequest, attr storage.WindowsAttr, volumeSerial uint64, lease *wire.LeaseResponse) ([]byte, error) {
+func createContexts(ctx context.Context, request wire.CreateRequest, attr windowsAttr, volumeSerial uint64, lease *wire.LeaseResponse) ([]byte, error) {
 	var encoded []byte
 	previous := -1
 	for _, item := range request.Contexts {
@@ -38,7 +37,7 @@ func createContexts(ctx context.Context, request wire.CreateRequest, attr storag
 			if len(item.Data) == 8 && smbLE.Uint64(item.Data) == windowsTime(attr.ChangeTime) {
 				smbLE.PutUint32(data, 0xc0000073)
 			} else {
-				maximal, ok := ctx.Value(maximalAccessKey{}).(func(storage.WindowsAttr) (uint32, error))
+				maximal, ok := ctx.Value(maximalAccessKey{}).(func(windowsAttr) (uint32, error))
 				if !ok {
 					smbLE.PutUint32(data, statusUnsupported)
 				} else {

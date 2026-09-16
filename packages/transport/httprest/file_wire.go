@@ -2,117 +2,244 @@ package httprest
 
 import (
 	"context"
-	"fmt"
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"syscall"
-	"time"
 )
 
 const OpFile Op = "file"
 const OpFileControl Op = "file-control"
 
+// The registry owns sessions; reference identities belong to those native sessions.
+type fileRequest struct {
+	Name        []byte                         `json:"name,omitempty"`
+	Op          storage.Operation              `json:"op"`
+	Session     string                         `json:"session,omitempty"`
+	Reference   storage.FileReferenceID        `json:"reference,omitempty"`
+	Action      storage.FileActionID           `json:"action,omitempty"`
+	Options     *storage.FileSessionOptions    `json:"options,omitempty"`
+	Node        uint64                         `json:"node,omitempty"`
+	Observation *storage.ObservationOptions    `json:"observation,omitempty"`
+	Check       *storage.ObservationCondition  `json:"check,omitempty"`
+	Retain      *fileRetainRequest             `json:"retain,omitempty"`
+	RetainAt    *fileRetainAtRequest           `json:"retainAt,omitempty"`
+	Create      *fileCreateRequest             `json:"create,omitempty"`
+	Reset       *fileResetRequest              `json:"reset,omitempty"`
+	Change      *AttrChange                    `json:"change,omitempty"`
+	Kind        *fileKindRequest               `json:"kind,omitempty"`
+	Read        *fileReadRequest               `json:"read,omitempty"`
+	Write       *fileWriteRequest              `json:"write,omitempty"`
+	Truncate    *fileTruncateRequest           `json:"truncate,omitempty"`
+	List        *storage.DirectoryPageRequest  `json:"list,omitempty"`
+	Rename      *fileRenameRequest             `json:"rename,omitempty"`
+	Claim       *storage.AccessClaim           `json:"claim,omitempty"`
+	Prepare     *storage.PrepareRemovalRequest `json:"prepare,omitempty"`
+	Intent      *storage.RemovalIntentID       `json:"intent,omitempty"`
+	Drain       *storage.DrainEntryRequest     `json:"drain,omitempty"`
+	CancelDrain *storage.CancelDrainRequest    `json:"cancelDrain,omitempty"`
+	Owner       *storage.RangeOwnerID          `json:"owner,omitempty"`
+	Scope       *storage.RangeScope            `json:"scope,omitempty"`
+	Ranges      *storage.RangeReplaceRequest   `json:"ranges,omitempty"`
+	Wait        *storage.RangeWaitRequest      `json:"wait,omitempty"`
+}
+
+type fileRetainRequest struct {
+	NodeID                   uint64                       `json:"nodeId"`
+	ExpectedMetadataRevision storage.NodeMetadataRevision `json:"expectedMetadataRevision"`
+	Claim                    storage.AccessClaim          `json:"claim"`
+	Witness                  *storage.EntryLocation       `json:"witness,omitempty"`
+	Prepared                 *storage.RemovalCondition    `json:"prepared,omitempty"`
+}
+type fileRetainAtRequest struct {
+	Target   fileEntryTarget           `json:"target"`
+	Claim    storage.AccessClaim       `json:"claim"`
+	Prepared *storage.RemovalCondition `json:"prepared,omitempty"`
+}
+type fileReadRequest struct {
+	Offset int64                 `json:"offset"`
+	Length int                   `json:"length"`
+	Owner  *storage.RangeOwnerID `json:"owner,omitempty"`
+}
+type fileWriteRequest struct {
+	ExpectedSize *int64                `json:"expectedSize,omitempty"`
+	Offset       int64                 `json:"offset"`
+	Data         []byte                `json:"data"`
+	Owner        *storage.RangeOwnerID `json:"owner,omitempty"`
+}
+type fileTruncateRequest struct {
+	Size  int64                 `json:"size"`
+	Owner *storage.RangeOwnerID `json:"owner,omitempty"`
+}
+type fileConflict struct {
+	Kind     storage.FileConflictKind `json:"kind"`
+	NodeID   uint64                   `json:"nodeId"`
+	EntryID  storage.EntryID          `json:"entryId"`
+	Revision uint64                   `json:"revision"`
+	Claim    storage.AccessClaim      `json:"claim"`
+	Range    *storage.HeldRange       `json:"range,omitempty"`
+}
+type fileEntryTarget struct {
+	Parent                   storage.FileReferenceID      `json:"parent"`
+	ParentID                 uint64                       `json:"parentId"`
+	Name                     []byte                       `json:"name"`
+	DirectoryRevision        storage.DirectoryRevision    `json:"directoryRevision"`
+	ExpectedEntryID          storage.EntryID              `json:"expectedEntryId"`
+	ExpectedNodeID           uint64                       `json:"expectedNodeId"`
+	ExpectedMetadataRevision storage.NodeMetadataRevision `json:"expectedMetadataRevision"`
+	Witness                  *storage.EntryLocation       `json:"witness,omitempty"`
+}
+type fileRenameRequest struct {
+	NewName     []byte          `json:"newName,omitempty"`
+	Source      fileEntryTarget `json:"source"`
+	Destination fileEntryTarget `json:"destination"`
+}
+type fileEntryLookup struct {
+	ParentID          uint64                    `json:"parentId"`
+	DirectoryRevision storage.DirectoryRevision `json:"directoryRevision"`
+	Name              []byte                    `json:"name"`
+	Found             bool                      `json:"found"`
+	EntryID           storage.EntryID           `json:"entryId"`
+	Attr              *Attr                     `json:"attr,omitempty"`
+}
+type fileInitial struct {
+	Kind         storage.NodeKind `json:"kind"`
+	Metadata     []byte           `json:"metadata"`
+	LinkTarget   []byte           `json:"linkTarget"`
+	AccessTime   *Time            `json:"accessTime,omitempty"`
+	ModTime      *Time            `json:"modTime,omitempty"`
+	CreationTime *Time            `json:"creationTime,omitempty"`
+	ChangeTime   *Time            `json:"changeTime,omitempty"`
+}
+type fileCreateRequest struct {
+	Target   fileEntryTarget           `json:"target"`
+	Initial  fileInitial               `json:"initial"`
+	Claim    storage.AccessClaim       `json:"claim"`
+	Prepared *storage.RemovalCondition `json:"prepared,omitempty"`
+}
+type fileResetRequest struct {
+	Target           fileEntryTarget              `json:"target"`
+	ExpectedRevision storage.NodeMetadataRevision `json:"expectedRevision"`
+	Change           AttrChange                   `json:"change"`
+	Claim            storage.AccessClaim          `json:"claim"`
+	Prepared         *storage.RemovalCondition    `json:"prepared,omitempty"`
+}
+type fileKindRequest struct {
+	Owner            *storage.RangeOwnerID        `json:"owner,omitempty"`
+	Witness          *storage.EntryLocation       `json:"witness,omitempty"`
+	ExpectedRevision storage.NodeMetadataRevision `json:"expectedRevision"`
+	Kind             storage.NodeKind             `json:"kind"`
+	LinkTarget       []byte                       `json:"linkTarget"`
+	Metadata         []byte                       `json:"metadata"`
+}
+type fileObservation struct {
+	Removal    storage.RemovalStatus  `json:"removal"`
+	Attr       *Attr                  `json:"attr"`
+	Location   *storage.EntryLocation `json:"location,omitempty"`
+	LinkTarget []byte                 `json:"linkTarget"`
+}
+type fileReceipt struct {
+	Action           storage.FileActionID    `json:"action"`
+	Operation        storage.Operation       `json:"operation"`
+	State            storage.FileActionState `json:"state"`
+	Effects          storage.FileEffects     `json:"effects"`
+	Reference        storage.FileReferenceID `json:"reference"`
+	Observation      *fileObservation        `json:"observation,omitempty"`
+	RangeRevision    uint64                  `json:"rangeRevision"`
+	Removal          storage.RemovalStatus   `json:"removal"`
+	Errno            string                  `json:"errno"`
+	Conflict         *fileConflict           `json:"conflict,omitempty"`
+	HistoryRemaining int64                   `json:"historyRemaining"`
+}
+type fileDirectoryEntry struct {
+	EntryID storage.EntryID `json:"entryId"`
+	Name    []byte          `json:"name"`
+	Attr    *Attr           `json:"attr"`
+}
+type fileDirectoryPage struct {
+	ParentID uint64                    `json:"parentId"`
+	Revision storage.DirectoryRevision `json:"revision"`
+	Entries  []fileDirectoryEntry      `json:"entries"`
+	Next     storage.DirectoryCursor   `json:"next"`
+	Done     bool                      `json:"done"`
+}
+type fileResponse struct {
+	Lookup      *fileEntryLookup           `json:"lookup,omitempty"`
+	Node        uint64                     `json:"node,omitempty"`
+	Reference   storage.FileReferenceID    `json:"reference,omitempty"`
+	State       *storage.FileVolumeState   `json:"state,omitempty"`
+	Session     string                     `json:"session,omitempty"`
+	Status      *storage.FileSessionStatus `json:"status,omitempty"`
+	Observation *fileObservation           `json:"observation,omitempty"`
+	Receipt     *fileReceipt               `json:"receipt,omitempty"`
+	Data        []byte                     `json:"data,omitempty"`
+	Page        *fileDirectoryPage         `json:"page,omitempty"`
+	Ranges      *storage.RangeSnapshot     `json:"ranges,omitempty"`
+	Barrier     *MutationBarrier           `json:"barrier,omitempty"`
+}
+type fileErrorResponse struct {
+	NotAdmitted bool             `json:"notAdmitted,omitempty"`
+	LockCode    *locking.Code    `json:"lockCode,omitempty"`
+	Recorded    *bool            `json:"recorded,omitempty"`
+	Errno       string           `json:"errno"`
+	Message     string           `json:"message"`
+	Conflict    *fileConflict    `json:"conflict,omitempty"`
+	Receipt     *fileReceipt     `json:"receipt,omitempty"`
+	Barrier     *MutationBarrier `json:"barrier,omitempty"`
+}
+
 func fileControl(op storage.Operation) bool {
 	switch op {
-	case storage.OpFileStatus, storage.OpFileRenew, storage.OpFileSessionClose, storage.OpFileClose, storage.OpFileAck, storage.OpFileGetLock, storage.OpFileSetLock, storage.OpFileUnlock, storage.OpFileQueryLock, storage.OpFileCancelLock, storage.OpFileDropLocks:
+	case storage.OpFileStatus, storage.OpFileRenew, storage.OpFileSessionClose,
+		storage.OpFileClose, storage.OpFileQueryAction, storage.OpFileCancelAction,
+		storage.OpFileRetireRangeOwner, storage.OpFileRetireRanges,
+		storage.OpFileReplaceClaim, storage.OpFileCancelPrepared, storage.OpFileCancelDrain:
 		return true
 	}
 	return false
 }
-
-type fileRequest struct {
-	Op      storage.Operation          `json:"op"`
-	Session string                     `json:"session"`
-	File    string                     `json:"file"`
-	Action  storage.LockRequestID      `json:"action"`
-	Path    []byte                     `json:"path"`
-	Node    uint64                     `json:"node"`
-	Options storage.FileSessionOptions `json:"options"`
-	Open    storage.FileOpenOptions    `json:"open"`
-	Offset  int64                      `json:"offset"`
-	Length  int                        `json:"length"`
-	Data    []byte                     `json:"data"`
-	Change  *AttrChange                `json:"change,omitempty"`
-	Owner   storage.LockOwner          `json:"owner"`
-	Lock    storage.FileLock           `json:"lock"`
-	LockID  storage.LockRequestID      `json:"lockId"`
-	Family  storage.LockFamily         `json:"family"`
-}
-
-type fileResponse struct {
-	Session  string                     `json:"session,omitempty"`
-	File     string                     `json:"file,omitempty"`
-	Retry    bool                       `json:"retry,omitempty"`
-	Epoch    uint64                     `json:"epoch"`
-	Status   *storage.FileSessionStatus `json:"status,omitempty"`
-	Attr     *Attr                      `json:"attr,omitempty"`
-	Data     []byte                     `json:"data"`
-	Conflict *storage.LockConflict      `json:"conflict,omitempty"`
-	Attempt  *fileLockAttempt           `json:"attempt,omitempty"`
-	Barrier  *MutationBarrier           `json:"barrier,omitempty"`
-}
-
-func fileMutation(op storage.Operation) bool {
-	switch op {
-	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileSetNodeAttr, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSync:
-		return true
-	}
-	return false
-}
-
 func fileActionRequired(op storage.Operation) bool {
 	switch op {
-	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileSetNodeAttr, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSync, storage.OpFileDropLocks:
+	case storage.OpFileRetain, storage.OpFileRetainAt, storage.OpFileCreateAndRetainAt,
+		storage.OpFileResetAndRetainAt, storage.OpFileReplaceAndRetainAt, storage.OpFileSetNodeAttr,
+		storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetKind,
+		storage.OpFileRename, storage.OpFileReplaceClaim, storage.OpFilePrepareRemoval,
+		storage.OpFileCancelPrepared, storage.OpFileDrainEntry, storage.OpFileCancelDrain,
+		storage.OpFileReplaceRanges, storage.OpFileWaitRanges, storage.OpFileRetireRangeOwner,
+		storage.OpFileRetireRanges, storage.OpFileSessionClose, storage.OpFileClose,
+		storage.OpFileQueryAction, storage.OpFileCancelAction:
 		return true
 	}
 	return false
 }
+func fileMutation(op storage.Operation) bool {
+	return fileActionRequired(op) && op != storage.OpFileQueryAction && op != storage.OpFileCancelAction
+}
 
-// FileWithBarrier exposes authority progress without requiring a directory entry
-// for detached files. A nil barrier means the volume has no change log.
+// Inline barriers order confirmed effects against a metadata replica. Receipts
+// remain available when observation of the barrier fails.
 type FileWithBarrier interface {
 	storage.File
-	WriteAtWithBarrier(context.Context, int64, []byte) (storage.Attr, *MutationBarrier, error)
-	TruncateWithBarrier(context.Context, int64) (storage.Attr, *MutationBarrier, error)
-	SetAttrWithBarrier(context.Context, storage.AttrChange) (storage.Attr, *MutationBarrier, error)
+	WriteAtWithBarrier(context.Context, storage.FileWriteRequest, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	TruncateWithBarrier(context.Context, storage.FileTruncateRequest, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	SetAttrWithBarrier(context.Context, storage.AttrChange, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	SetKindWithBarrier(context.Context, storage.SetKindRequest, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	RenameWithBarrier(context.Context, storage.RenameRequest, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	PrepareRemovalWithBarrier(context.Context, storage.PrepareRemovalRequest, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	CancelPreparedWithBarrier(context.Context, storage.RemovalIntentID, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	DrainEntryWithBarrier(context.Context, storage.DrainEntryRequest, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	CancelDrainWithBarrier(context.Context, storage.CancelDrainRequest, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	CloseWithBarrier(context.Context, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
 }
-
 type FileSessionWithBarrier interface {
 	storage.FileSession
-	OpenFileWithBarrier(context.Context, string, storage.FileOpenOptions) (storage.File, *MutationBarrier, error)
-	OpenNodeWithBarrier(context.Context, uint64, storage.FileOpenOptions) (storage.File, *MutationBarrier, error)
-	SetNodeAttrWithBarrier(context.Context, uint64, storage.AttrChange) (storage.Attr, *MutationBarrier, error)
+	RetainWithBarrier(context.Context, storage.RetainRequest, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	RetainAtWithBarrier(context.Context, storage.RetainAtRequest, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	CreateAndRetainAtWithBarrier(context.Context, storage.CreateAndRetainRequest, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	ResetAndRetainAtWithBarrier(context.Context, storage.ResetAndRetainRequest, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	ReplaceAndRetainAtWithBarrier(context.Context, storage.CreateAndRetainRequest, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	SetNodeAttrWithBarrier(context.Context, uint64, storage.AttrChange, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	QueryActionWithBarrier(context.Context, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	CancelActionWithBarrier(context.Context, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
+	CloseWithBarrier(context.Context, storage.FileActionID) (storage.FileActionReceipt, *MutationBarrier, error)
 }
 
-type fileLockAttempt struct {
-	Request          storage.LockRequestID
-	State            storage.LockAttemptState
-	Lock             storage.FileLock
-	Conflict         storage.LockConflict
-	Errno            string
-	EverGranted      bool
-	HistoryRemaining time.Duration
-}
-
-func fileAttemptOf(a storage.LockAttempt) (*fileLockAttempt, error) {
-	name := ""
-	if a.Errno != 0 {
-		var ok bool
-		name, ok = storage.ErrnoName(a.Errno)
-		if !ok {
-			return nil, fmt.Errorf("advisory action returned an unnameable error: %w", syscall.EIO)
-		}
-	}
-	return &fileLockAttempt{Request: a.Request, State: a.State, Lock: a.Lock, Conflict: a.Conflict, Errno: name, EverGranted: a.EverGranted, HistoryRemaining: a.HistoryRemaining}, nil
-}
-
-func (a fileLockAttempt) storage() (storage.LockAttempt, error) {
-	var errno syscall.Errno
-	if a.Errno != "" {
-		var ok bool
-		errno, ok = storage.ErrnoByName(a.Errno)
-		if !ok {
-			return storage.LockAttempt{}, fmt.Errorf("advisory action carries unknown errno %q", a.Errno)
-		}
-	}
-	return storage.LockAttempt{Request: a.Request, State: a.State, Lock: a.Lock, Conflict: a.Conflict, Errno: errno, EverGranted: a.EverGranted, HistoryRemaining: a.HistoryRemaining}, nil
-}
+func fileWait(op storage.Operation) bool { return op == storage.OpFileWaitRanges }

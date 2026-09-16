@@ -3,8 +3,8 @@ package integration_test
 import (
 	"errors"
 	"fmt"
-	"io/fs"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"syscall"
 	"testing"
@@ -413,7 +413,12 @@ func TestAVolumeOutlivesTheStoreThatMadeIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := commit(t, first, "d/f", 700)
-	if err := first.SetAttr(t.Context(), "d/f", storage.AttrChange{Mode: mode(0o640), ModTime: &changed}); err != nil {
+	before, err := first.Stat(t.Context(), "d/f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := opaqueMetadata(64)
+	if err := first.SetAttr(t.Context(), "d/f", storage.AttrChange{ExpectedRevision: before.MetadataRevision, Metadata: &metadata, ModTime: &changed}); err != nil {
 		t.Fatal(err)
 	}
 	if err := first.Close(); err != nil {
@@ -428,9 +433,8 @@ func TestAVolumeOutlivesTheStoreThatMadeIt(t *testing.T) {
 	if node.Content != key || node.Size != 700 {
 		t.Fatalf("the file references %q and holds %d bytes, want %q and 700", node.Content, node.Size, key)
 	}
-	if node.Mode.Perm() != 0o640 || !node.ModTime.Equal(changed) {
-		t.Fatalf("the file has mode %v and modification time %v, want 0640 at %v",
-			node.Mode, node.ModTime.UTC(), changed)
+	if node.Kind != storage.NodeRegular || !reflect.DeepEqual(node.Metadata, metadata) || !node.ModTime.Equal(changed) || node.MetadataRevision <= before.MetadataRevision {
+		t.Fatalf("the reopened file lost generic metadata, revision or modification time")
 	}
 	space, err := second.Space(t.Context())
 	if err != nil {
@@ -441,7 +445,9 @@ func TestAVolumeOutlivesTheStoreThatMadeIt(t *testing.T) {
 	}
 }
 
-func mode(m fs.FileMode) *fs.FileMode { return &m }
+func opaqueMetadata(marker byte) storage.Metadata {
+	return storage.Metadata{{Key: "test", Version: 1, Data: []byte{marker}}}
+}
 
 // commit writes an object of the given length at path.
 func commit(t *testing.T, s metastore.Store, path string, size int64) metastore.Key {

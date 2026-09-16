@@ -8,20 +8,19 @@ import (
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
-	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 const fsctlGetReparsePoint uint32 = 0x000900a8
 const fsctlSetReparsePoint uint32 = 0x000900a4
 
-func relativeLink(target string, location storage.WindowsNameInfo) (string, error) {
-	if err := storage.CheckWindowsLinkTarget(target); err != nil {
+func relativeLink(target string, location windowsNameInfo) (string, error) {
+	if err := checkWindowsLinkTarget(target); err != nil {
 		return "", err
 	}
 	if err := location.Check(); err != nil {
 		return "", err
 	}
-	if location.State != storage.WindowsNameLinked {
+	if location.State != windowsNameLinked {
 		return "", syscall.EIO
 	}
 	parent := path.Dir(location.Path)
@@ -43,6 +42,9 @@ func relativeLink(target string, location storage.WindowsNameInfo) (string, erro
 			}
 			parts = parts[:len(parts)-1]
 		default:
+			if _, err := nameKey([]byte(component)); err != nil {
+				return "", err
+			}
 			parts = append(parts, component)
 		}
 	}
@@ -65,7 +67,7 @@ func relativeLink(target string, location storage.WindowsNameInfo) (string, erro
 }
 
 func createFailure(err error) ([]byte, uint32) {
-	var link *storage.WindowsSymlinkError
+	var link *windowsSymlinkError
 	if !errors.As(err, &link) {
 		return nil, statusError(err)
 	}
@@ -134,15 +136,15 @@ func (c *connection) reparse(ctx context.Context, t *tree, r wire.Request) ([]by
 		} else {
 			target = strings.ReplaceAll(target, "\\", "/")
 		}
-		if err := storage.CheckWindowsLinkTarget(target); err != nil {
+		if err := checkWindowsLinkTarget(target); err != nil {
 			return nil, statusError(err)
 		}
-		action, err := t.files.actionID()
+		action, err := t.files.actionID(ctx)
 		if err != nil {
 			return nil, statusError(err)
 		}
 		result, err := h.file.SetLink(ctx, target, action)
-		if status := t.files.mutationResult(action, result, err); status != 0 {
+		if status := t.files.mutationResult(ctx, action, result, err); status != 0 {
 			return nil, status
 		}
 		return wire.IOCTLResponseBody(q.Code, q.FileID, q.Flags, nil), 0

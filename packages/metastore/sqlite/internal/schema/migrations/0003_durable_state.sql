@@ -87,8 +87,7 @@ CREATE TABLE changes (
 	mtime_nsec        INTEGER,
 	content           TEXT,
 	recorded_sec      INTEGER NOT NULL,
-	recorded_nsec     INTEGER NOT NULL,
-	notification      BLOB NOT NULL
+	recorded_nsec     INTEGER NOT NULL
 );
 
 DROP TABLE changes_v2;

@@ -311,7 +311,7 @@ type Storage struct {
 }
 ```
 
-路径 `Stat` 与 `List` 走本地；`Read`、`Write`、`Create`、`Mkdir`、`Remove`、`RemoveDir`、`Rename`、`SetAttr`、`Space` 走远端。FileStorage capability 也传播到权威服务：FileSession.OpenNode、StatNode、SetNodeAttr 与 File 的内容、属性操作都不按副本里的名字重新寻址，已经 detached 的对象不要求本地树仍有对应 entry。普通身份 I/O 仍检查副本可用状态；续期、动作核对、取消和清理不依赖具名副本存在，失去观察不能阻止释放资源。
+路径 Stat／List 走本地，Read／Write／Create／Mkdir／Remove／RemoveDir／Rename／SetAttr／Space 走远端。FileStorage 转发原通用 session、reference、action 与 context：Retain、StatNode、SetNodeAttr 和 File 的内容／属性不按副本名字重建，detached 对象不要求本地 entry。普通身份 I/O 仍检查副本健康；续期、核对、取消与清理不依赖名字视图。固定原语和平台解释见[平台隔离决定](2026-09-16-isolate-platform-filesystem-clients.md)。
 
 具名节点修改沿用 mutation barrier，成功后确认本地可见性；detached 内容修改不生成具名树事件，不能等待一个永远不存在的节点事件。文件引用的退役、续期和 advisory 连续性由独立 FileSession 管理，不从日志位置或 SSE 心跳推导。
 
@@ -319,7 +319,7 @@ type Storage struct {
 
 副本是 `sqlite.Replica`，不是 `sqlite.Store`：它只给出 `Store` 的读那一半，加上 `Apply` 与 `Reseed`。这个类型的意义就在这里——副本与它所复制的 volume 之间的每一处差异都必须以「某人记下来的一条变更」的形式到达，一个能自己造节点的方法就是这棵树的第二个作者。它抄下源端的节点编号，所以一条指名父目录编号的变更不需要任何翻译；它**不存文件的内容 key**，因为副本永远不去对象存储，那个 key 在这里指向的是本地没有的字节，而 schema 里 `nodes.content` 的外键正是这个意思。
 
-`Reseed` 在整份外部 picture 期间持有 replica 独占门和 SQLite write transaction，使读者不会观察半棵树。读写门与 commit gate 的等待都遵从调用 context；等待另一份 picture 时取消不会继续占住 commit gate。SQL 读取先取得与 reader pool 并发数一致的名额，再进入读阶段；等待 SQL 名额的调用不会增加写者必须排空的读者数量。写者登记后，新读者不能延长已在执行的读阶段；一次写入结束又为已经等待的一批读者预留共享访问，后续写者须等待它们结束或取消。读取名额、固定状态与批次交接的取舍见[副本写者推进](../bug-fix/2026-09-07-let-replica-writers-progress.md)。snapshot rows 可以任意排序，`Seeding` 只累计本轮看到的最大 node ID，在 `Complete` 时一次推进 `database_state.node_high_water` 并核对 `sqlite_sequence`，不为每个 row 重读和更新 allocator state。
+`Reseed` 在整份外部 picture 期间持有 replica 独占门和 SQLite write transaction，使读者不会观察半棵树。读写门与 commit gate 的等待都遵从调用 context；等待另一份 picture 时取消不会继续占住 commit gate。SQL 读取先取得与 reader pool 并发数一致的名额，再进入读阶段；等待 SQL 名额的调用不会增加写者必须排空的读者数量。写者登记后，新读者不能延长已在执行的读阶段；一次写入结束又为已经等待的一批读者预留共享访问，后续写者须等待它们结束或取消。读取名额、固定状态与批次交接的取舍见[副本写者推进](../bug-fix/2026-09-07-let-replica-writers-progress.md)。snapshot rows 可以任意排序，Row 保留源端 EntryID，根 row 的 EntryID 为零，其它 row 必须非零。Seeding 在每个 Add page 内观察 node、parent 与 entry 身份的共同最大值，并在同一 reseed transaction 中推进高水位与 sequence，再插入该页。Complete 核对累计高水位和 sequence 后提交，不暴露半棵树。
 
 ```
 packages/metastore/           + 日志能力，+ Change / Position / Incarnation 这些类型

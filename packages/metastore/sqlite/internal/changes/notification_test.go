@@ -1,14 +1,18 @@
 package changes
 
 import (
+	"bytes"
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
-	"io/fs"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func TestNotificationHistoryValidation(t *testing.T) {
@@ -20,26 +24,26 @@ func TestNotificationHistoryValidation(t *testing.T) {
 	}
 	volume := int64(1)
 	for _, scope := range []*int64{nil, &volume} {
-		if err := ValidateNotifications(t.Context(), tx, scope); err != nil {
+		if err := ValidateNotifications(t.Context(), tx, scope, 1000, 8<<20); err != nil {
 			t.Fatal(err)
 		}
 	}
 	execLogSQL(t, tx, `UPDATE changes SET notification=CAST('{}' AS BLOB) WHERE position=1`)
-	if err := ValidateNotifications(t.Context(), tx, nil); !errors.Is(err, syscall.EIO) {
+	if err := ValidateNotifications(t.Context(), tx, nil, 1000, 8<<20); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("corrupt facts: %v", err)
 	}
 	execLogSQL(t, tx, `UPDATE changes SET kind=99 WHERE position=1`)
-	if err := ValidateNotifications(t.Context(), tx, nil); !errors.Is(err, syscall.EIO) {
+	if err := ValidateNotifications(t.Context(), tx, nil, 1000, 8<<20); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("invalid kind: %v", err)
 	}
 	execLogSQL(t, tx, `UPDATE changes SET kind='bad' WHERE position=1`)
-	if err := ValidateNotifications(t.Context(), tx, nil); err == nil {
+	if err := ValidateNotifications(t.Context(), tx, nil, 1000, 8<<20); err == nil {
 		t.Fatal("invalid SQL scalar accepted")
 	}
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateNotifications(t.Context(), tx, nil); err == nil {
+	if err := ValidateNotifications(t.Context(), tx, nil, 1000, 8<<20); err == nil {
 		t.Fatal("closed transaction accepted")
 	}
 }
@@ -90,10 +94,13 @@ func TestNotificationBytesAreReservedBeforePayloadLoad(t *testing.T) {
 func TestNotificationSymlinkTypeSurvivesLogPage(t *testing.T) {
 	_, tx := logFixture(t)
 	c := fileChange(metastore.Created)
-	c.Node.Mode = fs.ModeSymlink | 0777
+	c.Node.Kind = storage.NodeSymlink
+	c.Node.LinkTarget = []byte("target")
 	c.Node.Content = ""
 	c.Node.Size = 6
-	c.Notification.SubjectKind = fs.ModeSymlink
+	c.Notification.SubjectKind = storage.NodeSymlink
+	c.Notification.After.Attr = c.Node.Attr()
+	c.Notification.After.LinkTarget = bytes.Clone(c.Node.LinkTarget)
 	if err := Record(t.Context(), tx, 1, c); err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +109,7 @@ func TestNotificationSymlinkTypeSurvivesLogPage(t *testing.T) {
 		t.Fatal(err)
 	}
 	changes, err := result.Changes()
-	if err != nil || len(changes) != 1 || changes[0].Notification.SubjectKind != fs.ModeSymlink {
+	if err != nil || len(changes) != 1 || changes[0].Notification.SubjectKind != storage.NodeSymlink {
 		t.Fatalf("symlink notification %+v %v", changes, err)
 	}
 }
@@ -116,8 +123,8 @@ func TestRecordPayloadLimitBoundaryAndCallerRollback(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			c.Node.Content = metastore.Key(strings.Repeat("x", metastore.MaxChangePayloadBytes-len(c.Name)-len(encoded)+extra))
-			execLogSQL(t, tx, `UPDATE nodes SET mode=384 WHERE id=2`)
+			c.Node.Content = metastore.Key(strings.Repeat("x", metastore.MaxChangePayloadBytes-len(c.Name)-len(encoded)-6+extra))
+			execLogSQL(t, tx, `UPDATE nodes SET metadata_revision=2 WHERE id=2`)
 			err = Record(t.Context(), tx, 1, c)
 			if extra == 0 {
 				if err != nil {
@@ -137,12 +144,12 @@ func TestRecordPayloadLimitBoundaryAndCallerRollback(t *testing.T) {
 			if err := tx.Rollback(); err != nil {
 				t.Fatal(err)
 			}
-			var mode, count, position int64
-			if err := db.QueryRow(`SELECT mode,(SELECT count(*) FROM changes),(SELECT committed_position FROM logs WHERE volume=1) FROM nodes WHERE id=2`).Scan(&mode, &count, &position); err != nil {
+			var revision, count, position int64
+			if err := db.QueryRow(`SELECT metadata_revision,(SELECT count(*) FROM changes),(SELECT committed_position FROM logs WHERE volume=1) FROM nodes WHERE id=2`).Scan(&revision, &count, &position); err != nil {
 				t.Fatal(err)
 			}
-			if mode != 420 || count != 0 || position != 0 {
-				t.Fatalf("rolled-back mutation leaked: mode=%d rows=%d position=%d", mode, count, position)
+			if revision != 1 || count != 0 || position != 0 {
+				t.Fatalf("rolled-back mutation leaked: revision=%d rows=%d position=%d", revision, count, position)
 			}
 		})
 	}
@@ -155,7 +162,7 @@ func TestReadPageRejectsAggregateOverflowBeforeReservingPayload(t *testing.T) {
 	called := false
 	result, err := metastore.NewChangeResult(1<<20, 0, func(_ int, _ metastore.Change, l metastore.ChangePayloadLengths) (int64, error) {
 		called = true
-		return l.Name + l.FromName + l.Content + l.Notification, nil
+		return l.Name + l.FromName + l.Content + l.Metadata + l.Target + l.Notification, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -165,5 +172,108 @@ func TestReadPageRejectsAggregateOverflowBeforeReservingPayload(t *testing.T) {
 	}
 	if called {
 		t.Fatal("oversized stored row reached reservation")
+	}
+}
+
+type notificationAdmissionProbe struct {
+	*sql.Tx
+	payloadReads int
+}
+
+func (p *notificationAdmissionProbe) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	p.payloadReads++
+	return p.Tx.QueryRowContext(ctx, query, args...)
+}
+
+func TestNotificationIntegrityRejectsOversizedPayloadBeforeLoad(t *testing.T) {
+	for _, update := range []string{
+		`notification=zeroblob(262145)`,
+		`name=zeroblob(524289)`,
+		`content=CAST(zeroblob(524289) AS TEXT)`,
+	} {
+		t.Run(update, func(t *testing.T) {
+			_, tx := logFixture(t)
+			appendLog(t, tx, 1)
+			execLogSQL(t, tx, `UPDATE changes SET `+update)
+			probe := &notificationAdmissionProbe{Tx: tx}
+			if err := ValidateNotifications(t.Context(), probe, nil, 1000, 8<<20); !errors.Is(err, syscall.EFBIG) {
+				t.Fatalf("oversized history: %v", err)
+			}
+			if probe.payloadReads != 0 {
+				t.Fatalf("loaded payload before admission: %d reads", probe.payloadReads)
+			}
+		})
+	}
+}
+
+func TestHistoricalImagesOutliveRemovedEntriesAndLaterMetadata(t *testing.T) {
+	_, tx := logFixture(t)
+	c := fileChange(metastore.Removed)
+	c.Notification.SubjectKind = storage.NodeSymlink
+	before := c.Notification.Before
+	before.Attr.Kind = storage.NodeSymlink
+	before.LinkTarget = []byte("target")
+	before.Attr.Size = int64(len(before.LinkTarget))
+	before.Attr.Metadata = storage.Metadata{{Key: "client", Version: 3, Data: []byte{0xff, 1}}}
+	if err := Record(t.Context(), tx, 1, c); err != nil {
+		t.Fatal(err)
+	}
+	execLogSQL(t, tx, `DELETE FROM entries WHERE node=2`)
+	execLogSQL(t, tx, `DELETE FROM nodes WHERE id=2`)
+	before.Attr.Metadata[0].Data[1] = 2
+	result := changeResult(t, 1)
+	if _, err := ReadPage(t.Context(), tx, 1, 100, 0, 1, result); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := result.Changes()
+	if err != nil || len(changes) != 1 || changes[0].Node != nil || changes[0].Notification.Before.Attr.Metadata[0].Data[1] != 1 || changes[0].Notification.Before.Location.Ancestors[0].EntryID != 5 {
+		t.Fatalf("history lost removed image: %+v %v", changes, err)
+	}
+}
+
+func TestHistoryIdentitySummaryMustMatchImages(t *testing.T) {
+	for _, summary := range []int{4, 6} {
+		t.Run(fmt.Sprint(summary), func(t *testing.T) {
+			_, tx := logFixture(t)
+			appendLog(t, tx, 1)
+			execLogSQL(t, tx, `UPDATE changes SET identity_high_water=?`, summary)
+			if err := ValidateNotifications(t.Context(), tx, nil, 1000, 8<<20); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("corrupt summary: %v", err)
+			}
+			result := changeResult(t, 1)
+			if _, err := ReadPage(t.Context(), tx, 1, 100, 0, 1, result); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("corrupt summary page: %v", err)
+			}
+		})
+	}
+}
+
+func TestRecordRoundTripOwnsOpaqueMetadataAndKnownTimeInstants(t *testing.T) {
+	_, tx := logFixture(t)
+	c := fileChange(metastore.Created)
+	creation, changed := time.Unix(-100, 7).UTC(), time.Unix(0, 11).UTC()
+	c.Node.CreationTime = &creation
+	c.Node.ChangeTime = &changed
+	c.Node.Metadata = storage.Metadata{{Key: "client", Version: 41, Data: []byte{0xff, 0, 1}}}
+	c.Notification.After.Attr = c.Node.Attr()
+	if err := Record(t.Context(), tx, 1, c); err != nil {
+		t.Fatal(err)
+	}
+	c.Node.Metadata[0].Data[0] = 1
+	creation = creation.Add(time.Second)
+	result := changeResult(t, 1)
+	if _, err := ReadPage(t.Context(), tx, 1, 100, 0, 1, result); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := result.Changes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := changes[0].Node
+	if got.Metadata[0].Version != 41 || got.Metadata[0].Data[0] != 0xff || got.CreationTime == nil || !got.CreationTime.Equal(time.Unix(-100, 7)) || got.ChangeTime == nil || !got.ChangeTime.Equal(time.Unix(0, 11)) {
+		t.Fatalf("lost opaque metadata or time facts: %+v", got)
+	}
+	if err := ValidateNotifications(t.Context(), tx, nil, 1000, 8<<20); err != nil {
+		t.Fatal(err)
 	}
 }

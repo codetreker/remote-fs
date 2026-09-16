@@ -18,8 +18,15 @@ type completionFile struct {
 	finish func(context.Context) error
 }
 
-func (f completionFile) Close(ctx context.Context) error { return f.finish(ctx) }
-func (f completionFile) Sync(ctx context.Context) error  { return f.finish(ctx) }
+func (f completionFile) Close(ctx context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	err := f.finish(ctx)
+	receipt := storage.FileActionReceipt{Action: id, Operation: storage.OpFileClose, State: storage.FileActionCompleted, Errno: storage.ErrnoOf(err)}
+	if err == nil {
+		receipt.Effects = storage.EffectReferenceRetired
+	}
+	return receipt, err
+}
+func (f completionFile) Sync(ctx context.Context) error { return f.finish(ctx) }
 
 func completionHandle(t *testing.T, opts Options, finish func(context.Context) error) *handle {
 	t.Helper()

@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"math"
 	"runtime"
 	"slices"
@@ -72,7 +71,7 @@ func RunBounded(t *testing.T, newStorage NewBoundedStorage) {
 				t.Fatal(err)
 			}
 		}
-		result, err := storage.NewListResult(3, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+		result, err := storage.NewListResult(3, 0, func(_ int, nameBytes, _ int64, _ storage.Attr) (int64, error) {
 			return nameBytes, nil
 		})
 		if err != nil {
@@ -85,6 +84,22 @@ func RunBounded(t *testing.T, newStorage NewBoundedStorage) {
 			t.Fatalf("an errored listing exposed a partial result: %+v, %v", entries, resultErr)
 		}
 	})
+	t.Run("a listing includes opaque metadata in its admission charge", func(t *testing.T) {
+		s := newStorage(t)
+		mustSucceed(t, s.Create(ctx(t), "f"))
+		mustSucceed(t, s.SetAttr(ctx(t), "f", metadataChange(t, s, "f", strings.Repeat("x", 1024))))
+		result, err := storage.NewListResult(512, 0, func(_ int, nameBytes, metadataBytes int64, attr storage.Attr) (int64, error) {
+			if len(attr.Metadata) != 0 {
+				return 0, errors.New("metadata loaded before bounded reservation")
+			}
+			return nameBytes + metadataBytes, nil
+		})
+		mustSucceed(t, err)
+		mustFail(t, s.ListBounded(ctx(t), "", result), syscall.EIO)
+		if entries, err := result.Entries(); err == nil || entries != nil {
+			t.Fatal("oversized metadata escaped a failed listing")
+		}
+	})
 	t.Run("cancellation stops bounded result production", func(t *testing.T) {
 		s := newStorage(t)
 		if err := s.Write(ctx(t), "f", []byte("content")); err != nil {
@@ -95,7 +110,7 @@ func RunBounded(t *testing.T, newStorage NewBoundedStorage) {
 		if got, err := s.ReadBounded(cancelled, "f", 16); got != nil || err == nil {
 			t.Fatalf("cancelled ReadBounded returned %q, %v", got, err)
 		}
-		result, err := storage.NewListResult(16, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+		result, err := storage.NewListResult(16, 0, func(_ int, nameBytes, _ int64, _ storage.Attr) (int64, error) {
 			return nameBytes, nil
 		})
 		if err != nil {
@@ -218,7 +233,7 @@ var cases = []testCase{
 				t.Fatalf("stat %q: %v", p, err)
 			}
 			if !attr.IsDir() {
-				t.Fatalf("stat %q has mode %v, want a directory", p, attr.Mode)
+				t.Fatalf("stat %q has kind %v, want a directory", p, attr.Kind)
 			}
 		}
 	}},
@@ -512,70 +527,110 @@ var cases = []testCase{
 
 	// --- setattr ------------------------------------------------------------------
 
-	{"setattr sets the permission bits of a file", func(t *testing.T, s storage.Storage) {
+	{"setattr preserves opaque values without changing file kind", func(t *testing.T, s storage.Storage) {
 		mustSucceed(t, s.Create(ctx(t), "f"))
-		mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{Mode: mode(0o600)}))
+		mustSucceed(t, s.SetAttr(ctx(t), "f", metadataChange(t, s, "f", "value")))
 		attr, err := s.Stat(ctx(t), "f")
 		mustSucceed(t, err)
-		if attr.Mode != 0o600 {
-			t.Fatalf("mode %v (%#o), want %v — the type bits must survive a mode change",
-				attr.Mode, uint32(attr.Mode), fs.FileMode(0o600))
+		if attr.Kind != storage.NodeRegular || !hasMetadata(attr, "value") {
+			t.Fatalf("file metadata or kind changed: %+v", attr)
 		}
 	}},
 
-	{"setattr sets the permission bits of a directory", func(t *testing.T, s storage.Storage) {
+	{"setattr preserves opaque values without changing directory kind", func(t *testing.T, s storage.Storage) {
 		mustSucceed(t, s.Mkdir(ctx(t), "d"))
-		mustSucceed(t, s.SetAttr(ctx(t), "d", storage.AttrChange{Mode: mode(0o700)}))
+		mustSucceed(t, s.SetAttr(ctx(t), "d", metadataChange(t, s, "d", "directory")))
 		attr, err := s.Stat(ctx(t), "d")
 		mustSucceed(t, err)
-		if !attr.IsDir() {
-			t.Fatalf("mode %v, want a directory — a mode change may not change a node's kind", attr.Mode)
-		}
-		if attr.Mode.Perm() != 0o700 {
-			t.Fatalf("permission bits %v, want %v", attr.Mode.Perm(), fs.FileMode(0o700))
+		if !attr.IsDir() || !hasMetadata(attr, "directory") {
+			t.Fatalf("directory metadata or kind changed: %+v", attr)
 		}
 	}},
 
-	// The three bits beyond the permission bits are settable, so they have to survive
-	// being set. An implementation that keeps only Perm() drops them silently, which
-	// reads as chmod having done something other than what it was asked.
-	{"setattr sets the setuid, setgid and sticky bits", func(t *testing.T, s storage.Storage) {
-		want := fs.FileMode(0o754) | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky
+	{"opaque updates preserve unknown versions and other clients values", func(t *testing.T, s storage.Storage) {
 		mustSucceed(t, s.Create(ctx(t), "f"))
-		mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{Mode: &want}))
 		attr, err := s.Stat(ctx(t), "f")
 		mustSucceed(t, err)
-		if attr.Mode != want {
-			t.Fatalf("mode %v, want %v", attr.Mode, want)
-		}
-		// And they come off again, which is the half a chmod that only ever adds bits
-		// would pass without.
-		mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{Mode: mode(0o644)}))
-		attr, err = s.Stat(ctx(t), "f")
-		mustSucceed(t, err)
-		if attr.Mode != 0o644 {
-			t.Fatalf("mode %v after clearing them, want %v", attr.Mode, fs.FileMode(0o644))
+		metadata := storage.Metadata{{Key: "other.client", Version: 4294967295, Data: []byte{0, 255, 128}}}
+		mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{ExpectedRevision: attr.MetadataRevision, Metadata: &metadata}))
+		for _, value := range []string{"first", "second", ""} {
+			mustSucceed(t, s.SetAttr(ctx(t), "f", metadataChange(t, s, "f", value)))
+			attr, err = s.Stat(ctx(t), "f")
+			mustSucceed(t, err)
+			other, ok := attr.Metadata.Get("other.client")
+			if !hasMetadata(attr, value) || !ok || other.Version != 4294967295 || !bytes.Equal(other.Data, []byte{0, 255, 128}) {
+				t.Fatalf("opaque values were interpreted or discarded: %+v", attr.Metadata)
+			}
 		}
 	}},
 
-	// A mode carrying a node's kind is refused rather than masked down to the bits that
-	// are settable. Masking would report success for a request to turn a file into a
-	// directory, and the caller would go on believing it had happened.
-	{"setattr refuses a mode that names a kind", func(t *testing.T, s storage.Storage) {
+	{"setattr refuses malformed metadata without changing prior values", func(t *testing.T, s storage.Storage) {
 		mustSucceed(t, s.Create(ctx(t), "f"))
-		mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{Mode: mode(0o600)}))
-		for _, kind := range []fs.FileMode{
-			fs.ModeDir, fs.ModeSymlink, fs.ModeNamedPipe, fs.ModeSocket, fs.ModeDevice,
-			fs.ModeCharDevice, fs.ModeIrregular, fs.ModeAppend, fs.ModeExclusive,
-			fs.ModeTemporary,
+		mustSucceed(t, s.SetAttr(ctx(t), "f", metadataChange(t, s, "f", "original")))
+		attr, err := s.Stat(ctx(t), "f")
+		mustSucceed(t, err)
+		for _, malformed := range []storage.Metadata{
+			{{Key: "", Version: 1}},
+			{{Key: "test.value", Version: 0}},
+			{{Key: "test.value", Version: 1}, {Key: "test.value", Version: 1}},
+			{{Key: "z", Version: 1}, {Key: "a", Version: 1}},
 		} {
-			requested := kind | 0o644
-			mustFail(t, s.SetAttr(ctx(t), "f", storage.AttrChange{Mode: &requested}), syscall.EINVAL)
+			mustFail(t, s.SetAttr(ctx(t), "f", storage.AttrChange{ExpectedRevision: attr.MetadataRevision, Metadata: &malformed}), syscall.EINVAL)
+		}
+		after, err := s.Stat(ctx(t), "f")
+		mustSucceed(t, err)
+		if after.MetadataRevision != attr.MetadataRevision || !hasMetadata(after, "original") || after.Kind != storage.NodeRegular {
+			t.Fatalf("invalid metadata changed the node: %+v", after)
+		}
+	}},
+
+	{"stale metadata replacement cannot overwrite another client", func(t *testing.T, s storage.Storage) {
+		mustSucceed(t, s.Create(ctx(t), "f"))
+		stale := metadataChange(t, s, "f", "stale")
+		mustSucceed(t, s.SetAttr(ctx(t), "f", metadataChange(t, s, "f", "current")))
+		if err := s.SetAttr(ctx(t), "f", stale); err == nil {
+			t.Fatal("stale metadata replacement succeeded")
 		}
 		attr, err := s.Stat(ctx(t), "f")
 		mustSucceed(t, err)
-		if attr.Mode != 0o600 {
-			t.Fatalf("mode %v after the refusals, want the untouched %v", attr.Mode, fs.FileMode(0o600))
+		if !hasMetadata(attr, "current") {
+			t.Fatal("stale metadata replacement lost the committed value")
+		}
+	}},
+
+	{"metadata observations do not expose mutable authority state", func(t *testing.T, s storage.Storage) {
+		mustSucceed(t, s.Create(ctx(t), "f"))
+		change := metadataChange(t, s, "f", "original")
+		mustSucceed(t, s.SetAttr(ctx(t), "f", change))
+		for i := range *change.Metadata {
+			if (*change.Metadata)[i].Key == "test.value" {
+				(*change.Metadata)[i].Data[0] ^= 255
+			}
+		}
+		attr, err := s.Stat(ctx(t), "f")
+		mustSucceed(t, err)
+		if !hasMetadata(attr, "original") {
+			t.Fatal("mutating a completed request changed authority state")
+		}
+		for i := range attr.Metadata {
+			if attr.Metadata[i].Key == "test.value" {
+				attr.Metadata[i].Data[0] ^= 255
+			}
+		}
+		entries, err := s.List(ctx(t), "")
+		mustSucceed(t, err)
+		if len(entries) != 1 || !hasMetadata(entries[0].Attr, "original") {
+			t.Fatal("mutating a stat result changed authority state")
+		}
+		for i := range entries[0].Attr.Metadata {
+			if entries[0].Attr.Metadata[i].Key == "test.value" {
+				entries[0].Attr.Metadata[i].Data[0] ^= 255
+			}
+		}
+		again, err := s.Stat(ctx(t), "f")
+		mustSucceed(t, err)
+		if !hasMetadata(again, "original") {
+			t.Fatal("mutating a listing changed authority state")
 		}
 	}},
 
@@ -640,113 +695,84 @@ var cases = []testCase{
 		}
 	}},
 
-	// chmod and utimensat arrive as separate calls, so setting one must not disturb the
-	// other. This is the case a change carrying whole attributes rather than named ones
-	// would fail.
 	{"setattr leaves the attributes a change does not name alone", func(t *testing.T, s storage.Storage) {
 		accessed := time.Date(1999, time.December, 31, 23, 59, 58, 1, time.UTC)
 		changed := time.Date(2004, time.July, 6, 1, 2, 3, 999_999_999, time.UTC)
 		mustSucceed(t, s.Create(ctx(t), "f"))
-		mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{
-			Mode: mode(0o640), AccessTime: &accessed, ModTime: &changed,
-		}))
-
-		mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{Mode: mode(0o604)}))
+		change := metadataChange(t, s, "f", "first")
+		change.AccessTime, change.ModTime = &accessed, &changed
+		mustSucceed(t, s.SetAttr(ctx(t), "f", change))
+		mustSucceed(t, s.SetAttr(ctx(t), "f", metadataChange(t, s, "f", "second")))
 		attr, err := s.Stat(ctx(t), "f")
 		mustSucceed(t, err)
 		if !attr.AccessTime.Equal(accessed) || !attr.ModTime.Equal(changed) {
-			t.Fatalf("setting the mode moved the times to %v and %v, want %v and %v",
-				attr.AccessTime.UTC(), attr.ModTime.UTC(), accessed, changed)
+			t.Fatalf("metadata update changed content times: %+v", attr)
 		}
-
 		later := changed.Add(time.Hour)
 		mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{ModTime: &later}))
 		attr, err = s.Stat(ctx(t), "f")
 		mustSucceed(t, err)
-		if attr.Mode != 0o604 {
-			t.Fatalf("setting the modification time moved the mode to %v, want %v", attr.Mode, fs.FileMode(0o604))
-		}
-		if !attr.AccessTime.Equal(accessed) {
-			t.Fatalf("setting the modification time moved the access time to %v, want %v",
-				attr.AccessTime.UTC(), accessed)
+		if !hasMetadata(attr, "second") || !attr.AccessTime.Equal(accessed) {
+			t.Fatalf("modification time update changed unnamed attributes: %+v", attr)
 		}
 	}},
 
-	// Replacing a file's contents is not a request to change its permissions. Somebody
-	// who sets a file to 0600 would otherwise find it back at whatever a new file gets
-	// after the next write. Every settable bit, not only the nine permission bits: a
-	// volume that keeps Perm() alone drops a setuid bit with nothing said.
-	{"a write keeps the mode the file already had", func(t *testing.T, s storage.Storage) {
-		for _, want := range []fs.FileMode{
-			0o600,
-			0o755 | fs.ModeSetuid,
-			0o750 | fs.ModeSetgid,
-			0o777 | fs.ModeSticky,
-		} {
+	{"a write preserves the opaque metadata the file already had", func(t *testing.T, s storage.Storage) {
+		for _, want := range []string{"", "text", "\x00\xff\x80", strings.Repeat("x", 4096)} {
 			mustSucceed(t, s.Write(ctx(t), "f", []byte("first")))
-			mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{Mode: &want}))
+			mustSucceed(t, s.SetAttr(ctx(t), "f", metadataChange(t, s, "f", want)))
 			mustSucceed(t, s.Write(ctx(t), "f", []byte("second")))
 			attr, err := s.Stat(ctx(t), "f")
 			mustSucceed(t, err)
-			if attr.Mode != want {
-				t.Fatalf("mode %v after a write, want the %v it was set to", attr.Mode, want)
+			if !hasMetadata(attr, want) {
+				t.Fatal("content replacement changed opaque metadata")
 			}
 			mustSucceed(t, s.Remove(ctx(t), "f"))
 		}
 	}},
 
-	// A listing carries attributes so that listing n entries costs one call. That is only
-	// worth anything if they are the same attributes a stat reports.
 	{"list carries the attributes setattr set", func(t *testing.T, s storage.Storage) {
 		accessed := time.Date(1999, time.December, 31, 23, 59, 58, 1, time.UTC)
 		changed := time.Date(2004, time.July, 6, 1, 2, 3, 999_999_999, time.UTC)
 		mustSucceed(t, s.Create(ctx(t), "f"))
-		mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{
-			Mode: mode(0o640), AccessTime: &accessed, ModTime: &changed,
-		}))
-
+		change := metadataChange(t, s, "f", "listed")
+		change.AccessTime, change.ModTime = &accessed, &changed
+		mustSucceed(t, s.SetAttr(ctx(t), "f", change))
 		entries, err := s.List(ctx(t), "")
 		mustSucceed(t, err)
 		if len(entries) != 1 || entries[0].Name != "f" {
 			t.Fatalf("listed %+v, want exactly the name %q", entries, "f")
 		}
 		got := entries[0].Attr
-		if got.Mode != 0o640 || !got.AccessTime.Equal(accessed) || !got.ModTime.Equal(changed) {
-			t.Fatalf("the listing reports mode %v, accessed %v, changed %v; a stat reports what was set: %v, %v, %v",
-				got.Mode, got.AccessTime.UTC(), got.ModTime.UTC(), fs.FileMode(0o640), accessed, changed)
+		if !hasMetadata(got, "listed") || !got.AccessTime.Equal(accessed) || !got.ModTime.Equal(changed) {
+			t.Fatalf("listing did not preserve the committed attributes: %+v", got)
 		}
 	}},
 
-	// The root is a directory that is already there, and the rule for such a node settles
-	// this: rsync -a and tar -x both set the mode and the times of the directory they are
-	// filling, and that directory is the root when the destination is the whole volume.
 	{"setattr changes the root like any other directory", func(t *testing.T, s storage.Storage) {
 		changed := time.Date(2004, time.July, 6, 1, 2, 3, 0, time.UTC)
 		mustSucceed(t, s.Create(ctx(t), "f"))
 		for _, p := range []string{"", ".", "./", "a/.."} {
-			mustSucceed(t, s.SetAttr(ctx(t), p, storage.AttrChange{Mode: mode(0o750), ModTime: &changed}))
+			change := metadataChange(t, s, p, "root")
+			change.ModTime = &changed
+			mustSucceed(t, s.SetAttr(ctx(t), p, change))
 		}
 		attr, err := s.Stat(ctx(t), "")
 		mustSucceed(t, err)
-		if !attr.IsDir() || attr.Mode.Perm() != 0o750 || !attr.ModTime.Equal(changed) {
-			t.Fatalf("the root is %v, changed %v; want a directory with %v at %v",
-				attr.Mode, attr.ModTime.UTC(), fs.FileMode(0o750), changed)
+		if !attr.IsDir() || !hasMetadata(attr, "root") || !attr.ModTime.Equal(changed) {
+			t.Fatalf("root attributes changed unexpectedly: %+v", attr)
 		}
 		mustHoldExactly(t, s, "f")
-		// Left usable for whatever runs next, which a volume whose root cannot be
-		// entered would not be.
-		mustSucceed(t, s.SetAttr(ctx(t), "", storage.AttrChange{Mode: mode(0o755)}))
 	}},
 
-	// Each attribute is reached by a route of its own, so each one is a separate chance to
-	// answer for a node that is not there.
 	{"setattr on a missing node is ENOENT", func(t *testing.T, s storage.Storage) {
 		moment := time.Date(2004, time.July, 6, 1, 2, 3, 0, time.UTC)
+		metadata := testMetadata("missing")
 		for _, change := range []storage.AttrChange{
-			{Mode: mode(0o600)},
+			{ExpectedRevision: 1, Metadata: &metadata},
 			{AccessTime: &moment},
 			{ModTime: &moment},
-			{Mode: mode(0o600), AccessTime: &moment, ModTime: &moment},
+			{ExpectedRevision: 1, Metadata: &metadata, AccessTime: &moment, ModTime: &moment},
 			{},
 		} {
 			mustFail(t, s.SetAttr(ctx(t), "f", change), syscall.ENOENT)
@@ -756,7 +782,8 @@ var cases = []testCase{
 	{"setattr under a file is ENOTDIR", func(t *testing.T, s storage.Storage) {
 		moment := time.Date(2004, time.July, 6, 1, 2, 3, 0, time.UTC)
 		mustSucceed(t, s.Create(ctx(t), "f"))
-		mustFail(t, s.SetAttr(ctx(t), "f/g", storage.AttrChange{Mode: mode(0o600)}), syscall.ENOTDIR)
+		metadata := testMetadata("value")
+		mustFail(t, s.SetAttr(ctx(t), "f/g", storage.AttrChange{ExpectedRevision: 1, Metadata: &metadata}), syscall.ENOTDIR)
 		mustFail(t, s.SetAttr(ctx(t), "f/g", storage.AttrChange{ModTime: &moment}), syscall.ENOTDIR)
 	}},
 
@@ -836,7 +863,7 @@ var cases = []testCase{
 		attr, err := s.Stat(ctx(t), "d")
 		mustSucceed(t, err)
 		if !attr.IsDir() {
-			t.Fatalf("mode %v, want a directory", attr.Mode)
+			t.Fatalf("kind %v, want a directory", attr.Kind)
 		}
 	}},
 
@@ -1089,7 +1116,7 @@ var cases = []testCase{
 		mustFail(t, err, syscall.EINVAL)
 
 		mustFail(t, s.Write(ctx(t), outside, []byte("x")), syscall.EINVAL)
-		mustFail(t, s.SetAttr(ctx(t), outside, storage.AttrChange{Mode: mode(0o600)}), syscall.EINVAL)
+		mustFail(t, s.SetAttr(ctx(t), outside, storage.AttrChange{ModTime: new(time.Time)}), syscall.EINVAL)
 		mustFail(t, s.Create(ctx(t), outside), syscall.EINVAL)
 		mustFail(t, s.Mkdir(ctx(t), outside), syscall.EINVAL)
 		mustFail(t, s.Remove(ctx(t), outside), syscall.EINVAL)
@@ -1125,9 +1152,23 @@ func statID(t *testing.T, s storage.Storage, path string) uint64 {
 
 func ctx(t *testing.T) context.Context { return t.Context() }
 
-// mode is the address of a mode, which is what an AttrChange takes: a nil there means
-// "not changing this", so every mode being set has to be somewhere addressable.
-func mode(m fs.FileMode) *fs.FileMode { return &m }
+func testMetadata(value string) storage.Metadata {
+	return storage.Metadata{{Key: "test.value", Version: 1, Data: []byte(value)}}
+}
+
+func metadataChange(t *testing.T, s storage.Storage, path, value string) storage.AttrChange {
+	t.Helper()
+	attr, err := s.Stat(ctx(t), path)
+	mustSucceed(t, err)
+	metadata, err := attr.Metadata.With(testMetadata(value)[0])
+	mustSucceed(t, err)
+	return storage.AttrChange{ExpectedRevision: attr.MetadataRevision, Metadata: &metadata}
+}
+
+func hasMetadata(attr storage.Attr, value string) bool {
+	item, found := attr.Metadata.Get("test.value")
+	return found && item.Version == 1 && bytes.Equal(item.Data, []byte(value))
+}
 
 // summarize renders an observation in one line. The contents involved run to six figures
 // of identical bytes, so printing them says nothing; the length and the run structure say
@@ -1218,7 +1259,7 @@ func mustHoldExactly(t *testing.T, s storage.Storage, names ...string) {
 		t.Fatalf("the root no longer stats: %v", err)
 	}
 	if !attr.IsDir() {
-		t.Fatalf("the root has mode %v, want a directory", attr.Mode)
+		t.Fatalf("the root has kind %v, want a directory", attr.Kind)
 	}
 	entries, err := s.List(ctx(t), "")
 	if err != nil {

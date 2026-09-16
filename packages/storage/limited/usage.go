@@ -34,15 +34,6 @@ func measureUsage(ctx context.Context, backing storage.BoundedStorage, limits Me
 			return 0, err
 		}
 	}
-	if windows, ok := backing.(storage.WindowsStorage); ok {
-		err := windows.CheckWindowsStorage()
-		if err == nil {
-			return 0, fmt.Errorf("Windows references require authoritative usage measurement: %w", syscall.EOPNOTSUPP)
-		}
-		if err != syscall.EOPNOTSUPP {
-			return 0, err
-		}
-	}
 	return measure(ctx, backing, limits)
 }
 

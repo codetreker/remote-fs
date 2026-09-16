@@ -51,14 +51,14 @@ func (h *handle) stat(ctx context.Context) (storage.Attr, error) {
 	if err := h.check(); err != nil {
 		return storage.Attr{}, err
 	}
-	attr, err := h.file.Stat(ctx)
+	observation, err := h.file.Stat(ctx, storage.ObservationOptions{})
 	if err != nil {
 		return storage.Attr{}, err
 	}
-	if err := h.node.checkAttr(attr); err != nil {
+	if err := h.node.checkAttr(observation.Attr); err != nil {
 		return storage.Attr{}, err
 	}
-	return attr, nil
+	return observation.Attr, nil
 }
 
 func (h *handle) Read(ctx context.Context, dest []byte, off int64) (gofuse.ReadResult, syscall.Errno) {
@@ -71,7 +71,7 @@ func (h *handle) Read(ctx context.Context, dest []byte, off int64) (gofuse.ReadR
 	if off < 0 {
 		return nil, syscall.EINVAL
 	}
-	read, err := h.file.ReadAt(ctx, off, len(dest))
+	read, err := h.file.ReadAt(ctx, storage.FileReadRequest{Offset: off, Length: len(dest)})
 	if err != nil {
 		return nil, errnoOf(err)
 	}
@@ -111,11 +111,13 @@ func (h *handle) Write(ctx context.Context, data []byte, off int64) (uint32, sys
 	if !h.node.volume.holds(current.Size) {
 		return 0, syscall.EFBIG
 	}
-	attr, err := h.file.WriteAt(ctx, off, data)
+	receipt, err := h.node.volume.fileAction(ctx, storage.OpFileWrite, func(call context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
+		return h.file.WriteAt(call, storage.FileWriteRequest{Offset: off, Data: data}, id)
+	})
 	if err != nil {
 		return 0, errnoOf(err)
 	}
-	if err := h.node.checkAttr(attr); err != nil {
+	if err := h.node.checkAttr(receipt.Observation.Attr); err != nil {
 		return 0, errnoOf(err)
 	}
 	return uint32(len(data)), 0
@@ -143,25 +145,29 @@ func (h *handle) resize(ctx context.Context, size int64) error {
 			return syscall.EFBIG
 		}
 	}
-	attr, err := h.file.Truncate(ctx, size)
+	receipt, err := h.node.volume.fileAction(ctx, storage.OpFileTruncate, func(call context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
+		return h.file.Truncate(call, storage.FileTruncateRequest{Size: size}, id)
+	})
 	if err != nil {
 		return err
 	}
-	return h.node.checkAttr(attr)
+	return h.node.checkAttr(receipt.Observation.Attr)
 }
 
 func (h *handle) setAttr(ctx context.Context, change storage.AttrChange) (storage.Attr, error) {
 	if err := h.check(); err != nil {
 		return storage.Attr{}, err
 	}
-	attr, err := h.file.SetAttr(ctx, change)
+	receipt, err := h.node.volume.fileAction(ctx, storage.OpFileSetAttr, func(call context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
+		return h.file.SetAttr(call, change, id)
+	})
 	if err != nil {
 		return storage.Attr{}, err
 	}
-	if err := h.node.checkAttr(attr); err != nil {
+	if err := h.node.checkAttr(receipt.Observation.Attr); err != nil {
 		return storage.Attr{}, err
 	}
-	return attr, nil
+	return receipt.Observation.Attr, nil
 }
 
 func (h *handle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
@@ -199,7 +205,7 @@ func (h *handle) closeFile(ctx context.Context) error {
 	h.closeDone = make(chan struct{})
 	h.closeMu.Unlock()
 
-	err := h.node.volume.closeError(h.file.Close(ctx))
+	err := h.node.volume.closeError(h.node.volume.closeReference(ctx, h.file))
 	h.closeMu.Lock()
 	h.closeErr = err
 	close(h.closeDone)

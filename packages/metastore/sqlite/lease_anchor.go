@@ -17,7 +17,15 @@ type LeaseAnchorConfig struct {
 	BindingFD     int
 	RecoveryStart time.Time
 	Initialize    bool
+	Domain        LeaseDomain
 }
+
+type LeaseDomain = nativelease.Domain
+
+const (
+	LeaseDomainStrong = nativelease.DomainStrong
+	LeaseDomainFile   = nativelease.DomainFile
+)
 
 // LeaseAnchor holds a durable initialization intent and an independent accepted witness.
 // Its descriptors pin the native binding, but it does not acquire or release flock itself.
@@ -35,6 +43,7 @@ func OpenLeaseAnchor(config LeaseAnchorConfig) (*LeaseAnchor, error) {
 }
 func (a *LeaseAnchor) StateID() string          { return (*nativelease.Anchor)(a).StateID() }
 func (a *LeaseAnchor) RecoveryStart() time.Time { return (*nativelease.Anchor)(a).RecoveryStart() }
+func (a *LeaseAnchor) Domain() LeaseDomain      { return (*nativelease.Anchor)(a).Domain() }
 func (a *LeaseAnchor) Initializing() bool       { return (*nativelease.Anchor)(a).Initializing() }
 func (a *LeaseAnchor) Load() (LeaseEvidence, bool, error) {
 	evidence, found, err := (*nativelease.Anchor)(a).Load()

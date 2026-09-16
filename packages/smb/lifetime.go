@@ -27,7 +27,7 @@ func (c *connection) renew(t *tree, principal Principal) {
 				return
 			}
 			ctx, cancel := context.WithTimeout(WithPrincipal(c.ctx, principal), interval)
-			err := c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: t.export.share.Volume, Operation: storage.OpWindowsRenew})
+			err := c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: t.export.share.Volume, Operation: storage.OpFileRenew})
 			if err == nil {
 				state, renewErr := t.session.Renew(ctx)
 				err = renewErr

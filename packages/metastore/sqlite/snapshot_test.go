@@ -37,7 +37,7 @@ func TestSnapshotAfterAutomaticRollbackReturnsCancellation(t *testing.T) {
 	waitForReadRollback(t, store.snapshotRead)
 	result, err := metastore.NewRowResult(1024, 0,
 		func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
-			return 192 + lengths.Name + lengths.Content, nil
+			return 192 + lengths.Name + lengths.Content + lengths.Metadata + lengths.Target, nil
 		})
 	if err != nil {
 		t.Fatal(err)

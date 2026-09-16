@@ -5,14 +5,12 @@ import (
 	"errors"
 	"syscall"
 	"testing"
-
-	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-type rejectedCloseFile struct{ storage.WindowsFile }
+type rejectedCloseFile struct{ windowsFile }
 
-func (rejectedCloseFile) Close(context.Context, storage.WindowsActionID) (storage.WindowsActionResult, error) {
-	return storage.WindowsActionResult{}, syscall.EACCES
+func (rejectedCloseFile) Close(context.Context, windowsActionID) (windowsActionResult, error) {
+	return windowsActionResult{}, syscall.EACCES
 }
 
 func TestTreeCleanupRetainsUnconfirmedReferences(t *testing.T) {

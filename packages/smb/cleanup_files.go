@@ -15,12 +15,12 @@ func (d *fileDispatcher) closeAll(ctx context.Context) error {
 	}
 	d.mu.Unlock()
 	for id, h := range handles {
-		action, err := d.actionID()
+		action, err := d.actionID(ctx)
 		if err != nil {
 			return err
 		}
 		result, err := h.file.Close(ctx, action)
-		if d.mutationResult(action, result, err) != 0 {
+		if d.mutationResult(ctx, action, result, err) != 0 {
 			return syscall.EIO
 		}
 		d.mu.Lock()

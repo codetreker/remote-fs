@@ -3,8 +3,7 @@ package sqlite
 import (
 	"database/sql"
 	"errors"
-	"fmt"
-	"io/fs"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -32,7 +31,7 @@ func notificationStore(t *testing.T) *Store {
 func readNotifications(t *testing.T, s *Store, after metastore.Position) []metastore.Change {
 	t.Helper()
 	result, err := metastore.NewChangeResult(4<<20, 0, func(_ int, _ metastore.Change, l metastore.ChangePayloadLengths) (int64, error) {
-		return 256 + l.Name + l.FromName + l.Content + l.Notification, nil
+		return 256 + l.Name + l.FromName + l.Content + l.Metadata + l.Target + l.Notification, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -86,15 +85,15 @@ func TestNotificationKeepsDeletedTypesAndHistoricalAncestors(t *testing.T) {
 		switch c.Kind {
 		case metastore.Removed:
 			removed++
-			if c.Node != nil || n.After != nil || len(n.Before.Ancestors) != 2 || n.Before.Ancestors[1].DirectoryID != parent.ID || string(n.Before.Ancestors[1].Name) != "parent" {
+			if c.Node != nil || n.After != nil || len(n.Before.Location.Ancestors) != 2 || n.Before.Location.Ancestors[0].NodeID != uint64(parent.ID) || string(n.Before.Location.Ancestors[0].Name) != "parent" {
 				t.Fatalf("lost removal history: %+v", n)
 			}
-			if (string(c.Name) == "dir") != (n.SubjectKind == fs.ModeDir) {
+			if (string(c.Name) == "dir") != (n.SubjectKind == storage.NodeDirectory) {
 				t.Fatalf("wrong removed type: %+v", n)
 			}
 		case metastore.Renamed:
 			renamed++
-			if len(n.Before.Ancestors) != 1 || len(n.After.Ancestors) != 2 || string(n.Before.LeafName) != "parent" || string(n.After.LeafName) != "moved" {
+			if len(n.Before.Location.Ancestors) != 1 || len(n.After.Location.Ancestors) != 2 || string(n.Before.Location.Ancestors[0].Name) != "parent" || string(n.After.Location.Ancestors[1].Name) != "moved" {
 				t.Fatalf("lost rename scope: %+v", n)
 			}
 		case metastore.Modified:
@@ -137,7 +136,7 @@ func TestNotificationDepthRefusalRollsBackMutation(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if _, err := tx.ExecContext(t.Context(), `INSERT INTO nodes(id,volume,mode,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec) VALUES(?,?,?,0,0,0,0,0)`, id, s.volume, int64(fs.ModeDir|0755)); err != nil {
+			if _, err := tx.ExecContext(t.Context(), `INSERT INTO nodes(id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,directory_revision) VALUES(?,?,?,0,0,0,0,0,1)`, id, s.volume, int64(storage.NodeDirectory)); err != nil {
 				return err
 			}
 			if err := s.link(t.Context(), tx, parent, []byte("d"), id); err != nil {
@@ -178,224 +177,218 @@ func TestNotificationDepthRefusalRollsBackMutation(t *testing.T) {
 	}
 }
 
-func TestNotificationCombinesWindowsAndNodeMetadataOnce(t *testing.T) {
+func TestNotificationCombinesOpaqueMetadataAndTimesOnce(t *testing.T) {
 	s := notificationStore(t)
 	if err := s.Create(t.Context(), "file"); err != nil {
 		t.Fatal(err)
 	}
+	before, err := s.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
 	start, err := s.CommittedPosition(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.mutate(t.Context(), func(tx *sql.Tx) error {
-		before, err := s.resolve(t.Context(), tx, "file")
-		if err != nil {
-			return err
-		}
-		at := time.Unix(400, 7)
-		if err := applyChange(t.Context(), tx, before, storage.AttrChange{AccessTime: &at}); err != nil {
-			return err
-		}
-		return s.recordChangedMask(t.Context(), tx, before, metastore.ChangeAttributes|metastore.ChangeCreationTime|metastore.ChangeTime)
-	}); err != nil {
+	created, changed, access := time.Unix(300, 6).UTC(), time.Unix(400, 7).UTC(), time.Unix(500, 8).UTC()
+	metadata := storage.Metadata{{Key: "future.client", Version: 37, Data: []byte{0xff, 0, 0xfe}}}
+	if err := s.SetAttr(t.Context(), "file", storage.AttrChange{ExpectedRevision: before.MetadataRevision, Metadata: &metadata, CreationTime: &created, ChangeTime: &changed, AccessTime: &access}); err != nil {
 		t.Fatal(err)
 	}
-	changes := readNotifications(t, s, start)
-	want := metastore.ChangeAccessTime | metastore.ChangeAttributes | metastore.ChangeCreationTime | metastore.ChangeTime
-	if len(changes) != 1 || changes[0].Notification.ChangeMask != want {
-		t.Fatalf("metadata notification %+v, want one mask %v", changes, want)
+	events := readNotifications(t, s, start)
+	want := metastore.ChangeAttributes | metastore.ChangeCreationTime | metastore.ChangeTime | metastore.ChangeAccessTime
+	if len(events) != 1 || events[0].Notification.ChangeMask != want {
+		t.Fatalf("metadata changes=%+v wantmask=%v", events, want)
+	}
+	after := events[0].Notification.After.Attr
+	if after.MetadataRevision != before.MetadataRevision+1 || after.ChangeTime == nil || !after.ChangeTime.Equal(changed) || !reflect.DeepEqual(after.Metadata, metadata) {
+		t.Fatalf("lost exact metadata result: %+v", after)
+	}
+	current, err := s.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stable, err := s.CommittedPosition(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAttr(t.Context(), "file", storage.AttrChange{ExpectedRevision: before.MetadataRevision, Metadata: &metadata}); !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("stale metadata update: %v", err)
+	}
+	unchanged, err := s.Stat(t.Context(), "file")
+	if err != nil || !reflect.DeepEqual(unchanged, current) {
+		t.Fatalf("stale update changed metadata: got %+v, want %+v, err=%v", unchanged, current, err)
+	}
+	position, err := s.CommittedPosition(t.Context())
+	if err != nil || position != stable {
+		t.Fatalf("stale update changed log position: got %d, want %d, err=%v", position, stable, err)
 	}
 }
 
-func TestNotificationWindowsNativeMetadataAndContent(t *testing.T) {
-	_, session := windowsAuthority(t)
-	s := session.store
-	file := windowsOpen(t, session, "file", storage.WindowsAllAccess, storage.WindowsShareAll)
-	created, changed := time.Unix(100, 1), time.Unix(200, 2)
-	attributes := uint32(storage.WindowsDOSReadOnly | storage.WindowsDOSHidden)
-	start, err := s.CommittedPosition(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := file.SetAttr(t.Context(), storage.WindowsAttrChange{CreationTime: &created, ChangeTime: &changed, DOSAttributes: &attributes}, windowsActionID(t, session))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Attr.CreationTime.Equal(created) || !result.Attr.ChangeTime.Equal(changed) || result.Attr.DOSAttributes != attributes {
-		t.Fatalf("explicit metadata overwritten: %+v", result.Attr)
-	}
-	changes := readNotifications(t, s, start)
-	want := metastore.ChangeCreationTime | metastore.ChangeTime | metastore.ChangeAttributes
-	if len(changes) != 1 || changes[0].Notification.ChangeMask != want {
-		t.Fatalf("native metadata notification %+v, want %v", changes, want)
-	}
-	start = changes[0].Position
-	attributes = storage.WindowsDOSArchive
-	if _, err := file.SetAttr(t.Context(), storage.WindowsAttrChange{CreationTime: &created, ChangeTime: &changed, DOSAttributes: &attributes}, windowsActionID(t, session)); err != nil {
-		t.Fatal(err)
-	}
-	changes = readNotifications(t, s, start)
-	if len(changes) != 1 || changes[0].Notification.ChangeMask != metastore.ChangeAttributes {
-		t.Fatalf("unchanged timestamps notified: %+v", changes)
-	}
-	start = changes[0].Position
-	windowsPublish(t, file, 0, 4)
-	changes = readNotifications(t, s, start)
-	want = metastore.ChangeSize | metastore.ChangeContent | metastore.ChangeModTime | metastore.ChangeTime
-	if len(changes) != 1 || changes[0].Notification.ChangeMask != want {
-		t.Fatalf("native content notification %+v, want %v", changes, want)
-	}
-	attr, err := file.Stat(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !attr.ChangeTime.After(changed) {
-		t.Fatalf("content change timestamp not persisted: %+v", attr)
-	}
-}
-
-func TestNotificationWindowsSymlinkSurvivesHistoryAndSnapshot(t *testing.T) {
-	_, session := windowsAuthority(t)
-	s := session.store
-	file := windowsOpen(t, session, "link", storage.WindowsAllAccess, storage.WindowsShareAll)
-	start, err := s.CommittedPosition(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := file.SetLink(t.Context(), "target", windowsActionID(t, session)); err != nil {
-		t.Fatal(err)
-	}
-	changes := readNotifications(t, s, start)
-	if len(changes) != 1 || changes[0].Notification.SubjectKind != fs.ModeSymlink || changes[0].Node.Size != 6 {
-		t.Fatalf("symlink history %+v", changes)
-	}
-	snapshot, _, err := s.Snapshot(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer snapshot.Close()
-	rows, err := metastore.NewRowResult(4096, 0, func(_ int, _ metastore.Row, l metastore.RowPayloadLengths) (int64, error) {
-		return 256 + l.Name + l.Content, nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := snapshot.Next(t.Context(), 100, rows); err != nil {
-		t.Fatal(err)
-	}
-	nodes, err := rows.Rows()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var found bool
-	for _, row := range nodes {
-		if row.Node.ID == file.id {
-			found = true
-			if row.Node.Mode.Type() != fs.ModeSymlink || row.Node.Size != 6 {
-				t.Fatalf("snapshot symlink %+v", row)
+func TestNotificationSymlinkOpaqueHintSurvivesRenameRemovalAndSnapshot(t *testing.T) {
+	for _, hint := range []byte{0, 1} {
+		t.Run(string(rune('0'+hint)), func(t *testing.T) {
+			s, session := newFileAuthority(t)
+			if err := s.Create(t.Context(), "link"); err != nil {
+				t.Fatal(err)
 			}
-		}
-	}
-	if !found {
-		t.Fatal("snapshot lost symlink")
-	}
-}
+			before, err := s.Stat(t.Context(), "link")
+			if err != nil {
+				t.Fatal(err)
+			}
+			retained, err := session.Retain(t.Context(), storage.RetainRequest{NodeID: uint64(before.ID), Claim: storage.AccessClaim{Uses: storage.WriteContent}}, fileActionID(t, session))
+			if err != nil {
+				t.Fatal(err)
+			}
+			file, live, err := session.Reference(t.Context(), retained.Reference)
+			if err != nil || !live {
+				t.Fatalf("retained reference: live=%v, err=%v", live, err)
+			}
+			metadata := storage.Metadata{{Key: "windows.file", Version: 9, Data: []byte{hint, 0xff}}}
+			result, err := file.SetKind(t.Context(), storage.SetKindRequest{ExpectedRevision: before.MetadataRevision, Kind: storage.NodeSymlink, LinkTarget: []byte("target"), Metadata: metadata}, fileActionID(t, session))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.State != storage.FileActionCompleted || result.Observation.Attr.Kind != storage.NodeSymlink {
+				t.Fatalf("link conversion did not complete: %+v", result)
+			}
+			if used, err := s.Usage(t.Context()); err != nil || used != 6 {
+				t.Fatalf("link target accounting: used=%d, err=%v", used, err)
+			}
 
-func TestNotificationPreservesFileAndDirectorySymlinkHintsAfterRenameAndDelete(t *testing.T) {
-	for _, directory := range []bool{false, true} {
-		t.Run(fmt.Sprint(directory), func(t *testing.T) {
-			_, session := windowsAuthority(t)
-			s := session.store
-			if directory {
-				if err := s.Mkdir(t.Context(), "link"); err != nil {
+			snap, _, err := s.Snapshot(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for !found {
+				rows, err := metastore.NewRowResult(1<<20, 0, func(_ int, _ metastore.Row, l metastore.RowPayloadLengths) (int64, error) {
+					return 256 + l.Name + l.Content + l.Metadata + l.Target, nil
+				})
+				if err != nil {
 					t.Fatal(err)
 				}
+				done, err := snap.Next(t.Context(), 10, rows)
+				if err != nil {
+					t.Fatal(err)
+				}
+				values, err := rows.Rows()
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, row := range values {
+					if string(row.Name) == "link" {
+						found = true
+						if row.Node.Kind != storage.NodeSymlink || string(row.Node.LinkTarget) != "target" || !reflect.DeepEqual(row.Node.Metadata, metadata) {
+							t.Fatalf("snapshot lost opaque link facts: %+v", row)
+						}
+					}
+				}
+				if done {
+					break
+				}
 			}
-			file := windowsOpen(t, session, "link", storage.WindowsAllAccess, storage.WindowsShareAll)
-			if _, err := file.SetLink(t.Context(), "target", windowsActionID(t, session)); err != nil {
+			if err := snap.Close(); err != nil {
 				t.Fatal(err)
+			}
+			if !found {
+				t.Fatal("link missing from snapshot")
 			}
 			start, err := s.CommittedPosition(t.Context())
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := s.Rename(t.Context(), "link", "renamed"); err != nil {
+			if err := s.Rename(t.Context(), "link", "moved"); err != nil {
 				t.Fatal(err)
 			}
-			if err := s.Remove(t.Context(), "renamed"); err != nil {
+			if err := s.Remove(t.Context(), "moved"); err != nil {
 				t.Fatal(err)
 			}
-			var renames, removes int
-			for _, c := range readNotifications(t, s, start) {
-				if c.Notification.SubjectID != file.id {
-					continue
-				}
-				if c.Notification.SubjectKind != fs.ModeSymlink || c.Notification.Directory != directory {
-					t.Fatalf("lost historical directory hint: %+v", c.Notification)
-				}
-				switch c.Kind {
-				case metastore.Renamed:
-					renames++
-				case metastore.Removed:
-					removes++
-					if c.Node != nil {
-						t.Fatal("removed notification changed replica semantics")
+			renamed, removed := 0, 0
+			for _, event := range readNotifications(t, s, start) {
+				if event.Kind == metastore.Renamed || event.Kind == metastore.Removed {
+					if event.Kind == metastore.Renamed {
+						renamed++
+					} else {
+						removed++
+					}
+					image := event.Notification.Before
+					if event.Notification.SubjectID != before.ID || image == nil || image.Attr.ID != uint64(before.ID) || event.Notification.SubjectKind != storage.NodeSymlink || string(image.LinkTarget) != "target" || !reflect.DeepEqual(image.Attr.Metadata, metadata) {
+						t.Fatalf("history lost opaque link metadata: %+v", event)
+					}
+					if event.Kind == metastore.Removed && (event.Node != nil || event.Notification.After != nil) {
+						t.Fatal("removal recreated node")
 					}
 				}
 			}
-			if renames != 1 || removes != 1 {
-				t.Fatalf("rename=%d remove=%d", renames, removes)
+			if renamed != 1 || removed != 1 {
+				t.Fatalf("link history: renamed=%d removed=%d", renamed, removed)
+			}
+			if used, err := s.Usage(t.Context()); err != nil || used != 6 {
+				t.Fatalf("retained removed link accounting: used=%d, err=%v", used, err)
+			}
+			if _, err := file.Close(t.Context(), fileActionID(t, session)); err != nil {
+				t.Fatal(err)
+			}
+			if used, err := s.Usage(t.Context()); err != nil || used != 0 {
+				t.Fatalf("closed link accounting: used=%d, err=%v", used, err)
 			}
 		})
 	}
 }
 
-func TestNotificationSymlinkHintRejectsMissingOrCorruptMetadata(t *testing.T) {
+func TestRenameKeepsEntryIdentityAndAdvancesBothParentRevisions(t *testing.T) {
 	s := notificationStore(t)
-	if err := s.Create(t.Context(), "link"); err != nil {
+	for _, name := range []string{"a", "b"} {
+		if err := s.Mkdir(t.Context(), name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Create(t.Context(), "a/file"); err != nil {
 		t.Fatal(err)
 	}
-	node, err := s.Stat(t.Context(), "link")
+	a, err := s.Stat(t.Context(), "a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	node.Mode = fs.ModeSymlink
-	for _, value := range []any{int64(0), int64(storage.WindowsDOSDirectory), "bad", int64(-1), int64(1) << 32, int64(1) << 30} {
-		tx, err := s.write.BeginTx(t.Context(), nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := tx.ExecContext(t.Context(), `UPDATE nodes SET windows_attributes=? WHERE id=?`, value, node.ID); err != nil {
-			t.Fatal(err)
-		}
-		directory, err := s.notificationDirectory(t.Context(), tx, node)
-		switch value {
-		case int64(0):
-			if err != nil || directory {
-				t.Fatalf("file link hint: %t %v", directory, err)
+	b, err := s.Stat(t.Context(), "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, err := s.CommittedPosition(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(t.Context(), "a/file", "b/file"); err != nil {
+		t.Fatal(err)
+	}
+	parents := map[int64]bool{}
+	renames := 0
+	for _, event := range readNotifications(t, s, start) {
+		n := event.Notification
+		if event.Kind == metastore.Renamed {
+			renames++
+			old := n.Before.Location.Ancestors[len(n.Before.Location.Ancestors)-1]
+			next := n.After.Location.Ancestors[len(n.After.Location.Ancestors)-1]
+			if old.EntryID == 0 || old.EntryID != next.EntryID || old.NodeID != next.NodeID || old.ParentID != uint64(a.ID) || next.ParentID != uint64(b.ID) {
+				t.Fatalf("rename moved identities: %+v -> %+v", old, next)
 			}
-		case int64(storage.WindowsDOSDirectory):
-			if err != nil || !directory {
-				t.Fatalf("directory link hint: %t %v", directory, err)
-			}
-		default:
-			if !errors.Is(err, syscall.EIO) {
-				t.Fatalf("invalid hint %v: %v", value, err)
+			if old.DirectoryRevision != a.DirectoryRevision || next.DirectoryRevision != b.DirectoryRevision+1 {
+				t.Fatalf("rename witnesses carry wrong parent revisions: %+v -> %+v", old, next)
 			}
 		}
-		if err := tx.Rollback(); err != nil {
-			t.Fatal(err)
+		if event.Kind == metastore.Modified && (event.Node.ID == a.ID || event.Node.ID == b.ID) {
+			previous := a
+			if event.Node.ID == b.ID {
+				previous = b
+			}
+			if n.Before.Attr.DirectoryRevision != previous.DirectoryRevision || n.After.Attr.DirectoryRevision != previous.DirectoryRevision+1 {
+				t.Fatalf("parent before/after revision lost: %+v", n)
+			}
+			parents[event.Node.ID] = true
 		}
 	}
-	if err := s.inspect(t.Context(), func(tx *sql.Tx) error {
-		missing := node
-		missing.ID = -1
-		_, err := s.notificationDirectory(t.Context(), tx, missing)
-		if !errors.Is(err, sql.ErrNoRows) {
-			t.Fatalf("missing hint defaulted: %v", err)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
+	if renames != 1 || len(parents) != 2 {
+		t.Fatalf("rename events=%d parent events=%d", renames, len(parents))
 	}
 }

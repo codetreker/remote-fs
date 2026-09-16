@@ -2,29 +2,21 @@ package objectstore
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/codetreker/remote-fs/packages/advisory"
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-type fileAuthority interface {
-	metastore.FileStore
-}
-
-// Heartbeats, lock acquisition, and lock reconciliation have independent capacity.
-// Staged data and new acquisitions cannot consume release or renewal admission.
 const (
-	maxFileControlOperations  = 2
-	maxFileAdvisoryOperations = 2
-	maxFileCleanupOperations  = 2
+	maxFileControlOperations = 2
+	maxFileRangeOperations   = 2
+	maxFileCleanupOperations = 2
 )
 
 type fileOperationClass uint8
@@ -32,40 +24,34 @@ type fileOperationClass uint8
 const (
 	fileDataOperation fileOperationClass = iota
 	fileControlOperation
-	fileAdvisoryOperation
+	fileRangeOperation
 	fileCleanupOperation
+	fileWaitOperation
 )
 
 type fileSession struct {
-	storage            *Storage
-	native             fileAuthority
-	domain             *advisory.Coordinator
-	locks              *advisory.Session
-	options            storage.FileSessionOptions
-	cleanup            context.Context
-	epoch              string
-	mu                 sync.Mutex
-	active             bool
-	expires            time.Time
-	revision           uint64
-	operations         int
-	controls           int
-	advisoryOperations int
-	cleanupOperations  int
-	files              map[*openFile]struct{}
-	opening            int
-	identityOps        sync.WaitGroup
-	timer              *time.Timer
-	closeMu            sync.Mutex
-	closeDone          chan struct{}
-	closeErr           error
+	storage        *Storage
+	authority      metastore.FileStore
+	native         metastore.FileSession
+	options        storage.FileSessionOptions
+	cleanup        context.Context
+	mu             sync.Mutex
+	active, closed bool
+	expires        time.Time
+	revision       uint64
+	operations     [5]int
+	idle           chan struct{}
+	files          map[storage.FileReferenceID]*openFile
+	timer          *time.Timer
+	closePermit    chan struct{}
+	closeErr       error
 }
 
 var _ storage.FileStorage = (*Storage)(nil)
 var _ storage.FileSession = (*fileSession)(nil)
 
 func (s *Storage) CheckFileStorage() error {
-	native, ok := s.meta.(fileAuthority)
+	native, ok := s.meta.(metastore.FileStore)
 	if !ok {
 		return syscall.EOPNOTSUPP
 	}
@@ -78,8 +64,17 @@ func (s *Storage) CheckFileStorage() error {
 	return s.CheckBounded()
 }
 
-// Usage includes linked and retained detached file contents. Native staging
-// reservations have independent admission limits and are not committed usage.
+func (s *Storage) FileState(ctx context.Context) (storage.FileVolumeState, error) {
+	if err := s.CheckFileStorage(); err != nil {
+		return storage.FileVolumeState{}, err
+	}
+	if err := s.beginOperation(); err != nil {
+		return storage.FileVolumeState{}, err
+	}
+	defer s.endOperation()
+	return s.meta.(metastore.FileStore).FileState(ctx)
+}
+
 func (s *Storage) Usage(ctx context.Context) (int64, error) {
 	native, ok := s.meta.(metastore.FileStore)
 	if !ok {
@@ -92,381 +87,499 @@ func (s *Storage) Usage(ctx context.Context) (int64, error) {
 	return native.Usage(ctx)
 }
 
-func (s *Storage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+func (s *Storage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
 	if err := options.Check(); err != nil {
-		return nil, err
+		return nil, storage.FileSessionStatus{}, err
 	}
 	if err := s.CheckFileStorage(); err != nil {
-		return nil, err
+		return nil, storage.FileSessionStatus{}, err
 	}
 	if err := s.beginOperation(); err != nil {
-		return nil, err
+		return nil, storage.FileSessionStatus{}, err
 	}
 	defer s.endOperation()
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	native := s.meta.(fileAuthority)
-	domain, err := native.Advisory(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var nonce [16]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return nil, err
-	}
-	s.fileMu.Lock()
-	defer s.fileMu.Unlock()
-	if s.filesClosing {
-		return nil, syscall.ESTALE
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	maxBytes, _, _ := domain.FileOperationLimits()
+	authority := s.meta.(metastore.FileStore)
+	maxBytes, _, _ := authority.FileOperationLimits()
 	options.MaxFileSize = min(options.MaxFileSize, maxBytes)
-	fs := &fileSession{storage: s, native: native, domain: domain, options: options,
-		cleanup: context.WithoutCancel(ctx), epoch: hex.EncodeToString(nonce[:]),
-		active: true, expires: time.Now().Add(options.Lease), revision: 1,
-		files: make(map[*openFile]struct{})}
-	fs.locks, err = domain.NewSession(options, fs.fence)
-	if err != nil {
-		return nil, err
+	s.fileMu.Lock()
+	if s.filesClosing {
+		s.fileMu.Unlock()
+		return nil, storage.FileSessionStatus{}, syscall.ESTALE
 	}
+	if s.fileEnrollmentContext == nil {
+		s.fileEnrollmentContext, s.cancelFileEnrollment = context.WithCancel(s.cleanupContext)
+	}
+	enrollmentContext := s.fileEnrollmentContext
+	s.fileEnrollment.Add(1)
+	s.fileMu.Unlock()
+	ctx, cancelEnrollment := context.WithCancel(ctx)
+	stopEnrollment := context.AfterFunc(enrollmentContext, cancelEnrollment)
+	defer func() { stopEnrollment(); cancelEnrollment() }()
+	defer s.fileEnrollment.Done()
+	started := time.Now()
+	native, status, err := authority.NewFileSession(ctx, options)
+	if err != nil {
+		return nil, storage.FileSessionStatus{}, err
+	}
+	idle := make(chan struct{})
+	close(idle)
+	session := &fileSession{storage: s, authority: authority, native: native, options: options,
+		cleanup: locking.WithScope(context.WithoutCancel(ctx), locking.MutationScope{}),
+		active:  true, expires: started.Add(status.Remaining), revision: status.Revision, idle: idle,
+		files: make(map[storage.FileReferenceID]*openFile), closePermit: make(chan struct{}, 1)}
+	session.closePermit <- struct{}{}
+	s.fileMu.Lock()
 	if s.fileSessions == nil {
 		s.fileSessions = make(map[*fileSession]struct{})
 	}
-	s.fileSessions[fs] = struct{}{}
-	fs.timer = time.AfterFunc(options.Lease, fs.expire)
-	return fs, nil
+	s.fileSessions[session] = struct{}{}
+	closing := s.filesClosing
+	s.fileMu.Unlock()
+	session.mu.Lock()
+	session.timer = time.AfterFunc(time.Until(session.expires), session.expire)
+	session.mu.Unlock()
+	if closing {
+		return nil, storage.FileSessionStatus{}, errors.Join(syscall.ESTALE, session.dispose(ctx))
+	}
+	session.mu.Lock()
+	status.Remaining = min(status.Remaining, max(time.Until(session.expires), 0))
+	status.Retired = status.Retired || !session.active || status.Remaining <= 0
+	session.mu.Unlock()
+	return session, status, nil
 }
 
-func (fs *fileSession) expire() {
-	fs.mu.Lock()
-	if fs.active && time.Now().Before(fs.expires) {
-		fs.timer.Reset(time.Until(fs.expires))
-		fs.mu.Unlock()
-		return
-	}
-	fs.mu.Unlock()
-	fs.startClose()
-}
-
-func (fs *fileSession) begin(ctx context.Context, identity bool) (func(), error) {
-	return fs.admit(ctx, identity, fileDataOperation)
-}
-
-func (fs *fileSession) beginControl(ctx context.Context) (func(), error) {
-	return fs.admit(ctx, false, fileControlOperation)
-}
-
-func (fs *fileSession) admit(ctx context.Context, identity bool, class fileOperationClass) (func(), error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := fs.storage.beginOperation(); err != nil {
-		return nil, err
-	}
-	fs.mu.Lock()
-	if !fs.active || !time.Now().Before(fs.expires) {
-		fs.mu.Unlock()
-		fs.storage.endOperation()
-		fs.startClose()
-		return nil, syscall.ESTALE
-	}
-	active, limit := &fs.operations, fs.options.MaxOperations
-	switch class {
-	case fileControlOperation:
-		active, limit = &fs.controls, maxFileControlOperations
-	case fileAdvisoryOperation:
-		active, limit = &fs.advisoryOperations, maxFileAdvisoryOperations
-	case fileCleanupOperation:
-		active, limit = &fs.cleanupOperations, maxFileCleanupOperations
-	}
-	if *active >= limit {
-		fs.mu.Unlock()
-		fs.storage.endOperation()
-		return nil, syscall.EAGAIN
-	}
-	*active++
-	if identity {
-		fs.identityOps.Add(1)
-	}
-	fs.mu.Unlock()
-	return func() {
-		fs.mu.Lock()
-		*active--
-		fs.mu.Unlock()
-		if identity {
-			fs.identityOps.Done()
-		}
-		fs.storage.endOperation()
-	}, nil
-}
-
-func (fs *fileSession) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, error) {
-	ctx, cancel := fs.operationContext(ctx)
-	defer cancel()
-	ctx = metastore.WithFilePublicationGuard(ctx, fs.publicationAllowed)
-	clean, err := storage.CleanPath(path)
-	if err != nil {
-		return nil, err
-	}
-	if err := options.Check(); err != nil {
-		return nil, err
-	}
-	return fs.open(ctx, options, func() (metastore.File, error) { return fs.native.OpenFile(ctx, clean, options) })
-}
-
-func (fs *fileSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
-	ctx, cancel := fs.operationContext(ctx)
-	defer cancel()
-	ctx = metastore.WithFilePublicationGuard(ctx, fs.publicationAllowed)
-	if err := options.CheckNode(id); err != nil {
-		return nil, err
-	}
-	return fs.open(ctx, options, func() (metastore.File, error) { return fs.native.OpenNode(ctx, id, options) })
-}
-
-func (fs *fileSession) open(ctx context.Context, options storage.FileOpenOptions, open func() (metastore.File, error)) (storage.File, error) {
-	done, err := fs.begin(ctx, true)
-	if err != nil {
-		return nil, err
-	}
-	defer done()
-	fs.mu.Lock()
-	if len(fs.files)+fs.opening >= fs.options.MaxFiles {
-		fs.mu.Unlock()
-		return nil, syscall.EMFILE
-	}
-	fs.opening++
-	fs.mu.Unlock()
-	native, err := open()
-	fs.mu.Lock()
-	fs.opening--
-	if err != nil {
-		fs.mu.Unlock()
-		return nil, err
-	}
-	f := &openFile{session: fs, native: native, options: options, active: true, flock: make(map[storage.LockOwner]uint64)}
-	fs.files[f] = struct{}{}
-	active := fs.active && time.Now().Before(fs.expires)
-	fs.mu.Unlock()
-	if !active {
-		return nil, errors.Join(syscall.ESTALE, f.retire())
-	}
-	return f, nil
-}
-
-func (fs *fileSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
-	ctx, cancel := fs.operationContext(ctx)
-	defer cancel()
-	done, err := fs.begin(ctx, true)
-	if err != nil {
-		return storage.Attr{}, err
-	}
-	defer done()
-	node, err := fs.native.StatNode(ctx, id)
-	return node.Attr(), err
-}
-
-func (fs *fileSession) SetNodeAttr(ctx context.Context, id uint64, change storage.AttrChange) (storage.Attr, error) {
-	ctx, cancel := fs.operationContext(ctx)
-	defer cancel()
-	ctx = metastore.WithFilePublicationGuard(ctx, fs.publicationAllowed)
-	if err := change.Check(); err != nil {
-		return storage.Attr{}, err
-	}
-	done, err := fs.begin(ctx, true)
-	if err != nil {
-		return storage.Attr{}, err
-	}
-	defer done()
-	node, err := fs.native.SetNodeAttr(ctx, id, change)
-	return node.Attr(), err
-}
-
-func (fs *fileSession) Renew(ctx context.Context) (storage.FileSessionStatus, error) {
-	ctx, cancel := fs.operationContext(ctx)
-	defer cancel()
-	done, err := fs.beginControl(ctx)
-	if err != nil {
-		return storage.FileSessionStatus{}, err
-	}
-	defer done()
-	if err := fs.health(ctx); err != nil {
-		return storage.FileSessionStatus{}, err
-	}
-	fs.mu.Lock()
-	if !fs.active || !time.Now().Before(fs.expires) {
-		fs.mu.Unlock()
-		return storage.FileSessionStatus{}, syscall.ESTALE
-	}
-	fs.expires = time.Now().Add(fs.options.Lease)
-	fs.revision++
-	fs.timer.Reset(fs.options.Lease)
-	fs.mu.Unlock()
-	return fs.status(ctx)
-}
-
-func (fs *fileSession) Status(ctx context.Context) (storage.FileSessionStatus, error) {
-	ctx, cancel := fs.operationContext(ctx)
-	defer cancel()
-	done, err := fs.beginControl(ctx)
-	if err != nil {
-		return storage.FileSessionStatus{}, err
-	}
-	defer done()
-	if err := fs.health(ctx); err != nil {
-		return storage.FileSessionStatus{}, err
-	}
-	return fs.status(ctx)
-}
-
-func (fs *fileSession) health(ctx context.Context) error {
-	if _, err := fs.native.Usage(ctx); err != nil {
-		return err
-	}
-	return fs.locks.IOHealth(ctx, 1)
-}
-
-func (fs *fileSession) operationContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	_, _, timeout := fs.domain.FileOperationLimits()
+func (s *fileSession) operationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	_, _, timeout := s.authority.FileOperationLimits()
 	return context.WithTimeout(ctx, timeout)
 }
 
-func (fs *fileSession) publicationAllowed() error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	if !fs.active || !time.Now().Before(fs.expires) {
+func (s *fileSession) cleanupOperation(ctx context.Context) (context.Context, context.CancelFunc) {
+	return s.operationContext(locking.WithScope(s.cleanup, locking.ScopeFromContext(ctx)))
+}
+
+func (s *fileSession) begin(ctx context.Context, class fileOperationClass) (context.Context, func(), error) {
+	return s.admit(ctx, class, class == fileCleanupOperation)
+}
+
+func (s *fileSession) admit(ctx context.Context, class fileOperationClass, allowRetired bool) (context.Context, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	var admissionErr error
+	if allowRetired {
+		admissionErr = s.storage.beginFileCleanup()
+	} else {
+		admissionErr = s.storage.beginOperation()
+	}
+	if admissionErr != nil {
+		return nil, nil, admissionErr
+	}
+	s.mu.Lock()
+	if !allowRetired && (!s.active || !time.Now().Before(s.expires)) {
+		s.mu.Unlock()
+		s.storage.endOperation()
+		return nil, nil, syscall.ESTALE
+	}
+	limit := s.options.MaxOperations
+	switch class {
+	case fileControlOperation:
+		limit = maxFileControlOperations
+	case fileRangeOperation:
+		limit = maxFileRangeOperations
+	case fileCleanupOperation:
+		limit = maxFileCleanupOperations
+	case fileWaitOperation:
+		limit = s.options.MaxWaiters
+	}
+	if s.operations[class] >= limit {
+		s.mu.Unlock()
+		s.storage.endOperation()
+		return nil, nil, syscall.EAGAIN
+	}
+	if class != fileControlOperation && class != fileCleanupOperation && s.drainingOperations() == 0 {
+		s.idle = make(chan struct{})
+	}
+	s.operations[class]++
+	s.mu.Unlock()
+	var cancel context.CancelFunc
+	if class == fileWaitOperation {
+		ctx, cancel = context.WithCancel(ctx)
+	} else {
+		ctx, cancel = s.operationContext(ctx)
+	}
+	ctx = metastore.WithFilePublicationGuard(ctx, s.publicationAllowed)
+	return ctx, func() {
+		cancel()
+		s.mu.Lock()
+		s.operations[class]--
+		if class != fileControlOperation && class != fileCleanupOperation && s.drainingOperations() == 0 {
+			close(s.idle)
+		}
+		s.mu.Unlock()
+		s.storage.endOperation()
+	}, nil
+}
+
+func (s *fileSession) drainingOperations() int {
+	return s.operations[fileDataOperation] + s.operations[fileRangeOperation] + s.operations[fileWaitOperation]
+}
+
+func (s *fileSession) publicationAllowed() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active || !time.Now().Before(s.expires) {
 		return syscall.ESTALE
 	}
 	return nil
 }
 
-func (fs *fileSession) status(ctx context.Context) (storage.FileSessionStatus, error) {
-	epoch, history, err := fs.locks.History(ctx)
+func (s *fileSession) Retain(ctx context.Context, request storage.RetainRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := s.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	result, err := s.native.Retain(ctx, request, id)
+	if result.Effects&(storage.EffectContentChanged|storage.EffectEntryDetached) != 0 {
+		s.storage.sweepAfterMutation()
+	}
+	return result, err
+}
+
+func (s *fileSession) RetainAt(ctx context.Context, request storage.RetainAtRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := s.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	result, err := s.native.RetainAt(ctx, request, id)
+	if result.Effects&(storage.EffectContentChanged|storage.EffectEntryDetached) != 0 {
+		s.storage.sweepAfterMutation()
+	}
+	return result, err
+}
+
+func (s *fileSession) CreateAndRetainAt(ctx context.Context, request storage.CreateAndRetainRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := s.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	result, err := s.native.CreateAndRetainAt(ctx, request, id)
+	if result.Effects&(storage.EffectContentChanged|storage.EffectEntryDetached) != 0 {
+		s.storage.sweepAfterMutation()
+	}
+	return result, err
+}
+
+func (s *fileSession) ResetAndRetainAt(ctx context.Context, request storage.ResetAndRetainRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := s.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	result, err := s.native.ResetAndRetainAt(ctx, request, id)
+	if result.Effects&(storage.EffectContentChanged|storage.EffectEntryDetached) != 0 {
+		s.storage.sweepAfterMutation()
+	}
+	return result, err
+}
+
+func (s *fileSession) ReplaceAndRetainAt(ctx context.Context, request storage.CreateAndRetainRequest, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := s.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	result, err := s.native.ReplaceAndRetainAt(ctx, request, id)
+	if result.Effects&(storage.EffectContentChanged|storage.EffectEntryDetached) != 0 {
+		s.storage.sweepAfterMutation()
+	}
+	return result, err
+}
+
+func (s *fileSession) Reference(ctx context.Context, id storage.FileReferenceID) (storage.File, error) {
+	ctx, done, err := s.begin(ctx, fileCleanupOperation)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	native, live, err := s.native.Reference(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if native.Reference() != id || id == 0 {
+		return nil, syscall.EIO
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f := s.files[id]; f != nil {
+		return f, nil
+	}
+	active := live && s.active && !s.closed && time.Now().Before(s.expires)
+	if active && len(s.files) >= s.options.MaxFiles {
+		return nil, syscall.EMFILE
+	}
+	idle := make(chan struct{})
+	close(idle)
+	f := &openFile{session: s, native: native, active: active, idle: idle, closePermit: make(chan struct{}, 1)}
+	f.closePermit <- struct{}{}
+	if active {
+		s.files[id] = f
+	}
+	return f, nil
+}
+
+func (s *fileSession) StatNode(ctx context.Context, id uint64, options storage.ObservationOptions) (storage.FileObservation, error) {
+	ctx, done, err := s.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.FileObservation{}, err
+	}
+	defer done()
+	return s.native.StatNode(ctx, id, options)
+}
+
+func (s *fileSession) SetNodeAttr(ctx context.Context, node uint64, change storage.AttrChange, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := s.begin(ctx, fileDataOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	return s.native.SetNodeAttr(ctx, node, change, id)
+}
+
+func (s *fileSession) QueryAction(ctx context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := s.begin(ctx, fileCleanupOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, err
+	}
+	defer done()
+	return s.native.QueryAction(ctx, id)
+}
+
+func (s *fileSession) CancelAction(ctx context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := s.begin(ctx, fileCleanupOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, err
+	}
+	defer done()
+	return s.native.CancelAction(ctx, id)
+}
+
+func (s *fileSession) RetireRangeOwner(ctx context.Context, owner storage.RangeOwnerID, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	ctx, done, err := s.begin(ctx, fileCleanupOperation)
+	if err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer done()
+	return s.native.RetireRangeOwner(ctx, owner, id)
+}
+
+func (s *fileSession) Renew(ctx context.Context) (storage.FileSessionStatus, error) {
+	ctx, done, err := s.begin(ctx, fileControlOperation)
 	if err != nil {
 		return storage.FileSessionStatus{}, err
 	}
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	remaining := time.Until(fs.expires)
-	if !fs.active || remaining <= 0 {
-		return storage.FileSessionStatus{}, syscall.ESTALE
+	defer done()
+	started := time.Now()
+	status, err := s.native.Renew(ctx)
+	if err != nil {
+		return status, err
 	}
-	return storage.FileSessionStatus{Epoch: fs.epoch, Remaining: remaining, Revision: fs.revision,
-		ActionEpoch: epoch, HistoryRemaining: history}, nil
+	s.mu.Lock()
+	if s.active && status.Revision > s.revision {
+		s.revision = status.Revision
+		s.expires = started.Add(status.Remaining)
+		s.timer.Reset(time.Until(s.expires))
+	}
+	status.Remaining = min(status.Remaining, max(time.Until(s.expires), 0))
+	status.Retired = status.Retired || !s.active || status.Remaining <= 0
+	s.mu.Unlock()
+	return status, nil
 }
 
-func (fs *fileSession) fence() error {
-	// An opening reference is not available to retire until native Open returns.
-	// Keep advisory grants until those operations join the retained set.
-	fs.identityOps.Wait()
-	fs.mu.Lock()
-	files := make([]*openFile, 0, len(fs.files))
-	for f := range fs.files {
-		files = append(files, f)
+func (s *fileSession) Status(ctx context.Context) (storage.FileSessionStatus, error) {
+	ctx, done, err := s.admit(ctx, fileControlOperation, true)
+	if err != nil {
+		return storage.FileSessionStatus{}, err
 	}
-	fs.mu.Unlock()
-	var errs []error
-	for _, f := range files {
-		errs = append(errs, f.retire())
-	}
-	return errors.Join(errs...)
+	defer done()
+	status, err := s.native.Status(ctx)
+	s.mu.Lock()
+	status.Remaining = min(status.Remaining, max(time.Until(s.expires), 0))
+	status.Retired = status.Retired || !s.active || status.Remaining <= 0
+	s.mu.Unlock()
+	return status, err
 }
 
-func (fs *fileSession) startClose() <-chan struct{} {
-	fs.closeMu.Lock()
-	defer fs.closeMu.Unlock()
-	if fs.closeDone != nil {
-		select {
-		case <-fs.closeDone:
-			if fs.closeErr == nil {
-				return fs.closeDone
-			}
-		default:
-			return fs.closeDone
-		}
+func (s *fileSession) expire() {
+	s.mu.Lock()
+	if s.active && time.Now().Before(s.expires) {
+		s.timer.Reset(time.Until(s.expires))
+		s.mu.Unlock()
+		return
 	}
-	fs.closeDone = make(chan struct{})
-	fs.mu.Lock()
-	fs.active = false
-	if fs.timer != nil {
-		fs.timer.Stop()
-	}
-	fs.mu.Unlock()
-	go fs.finishClose()
-	return fs.closeDone
+	s.mu.Unlock()
+	ctx, cancel := s.operationContext(s.cleanup)
+	defer cancel()
+	_ = s.dispose(ctx)
 }
 
-func (fs *fileSession) finishClose() {
-	err := fs.locks.Retire(fs.cleanup)
-	if err == nil {
-		fs.mu.Lock()
-		files := make([]*openFile, 0, len(fs.files))
-		for f := range fs.files {
-			files = append(files, f)
-		}
-		fs.mu.Unlock()
-		for _, f := range files {
-			err = errors.Join(err, f.Close(fs.cleanup))
-		}
+func (s *fileSession) retireAndDrain(ctx context.Context) error {
+	s.mu.Lock()
+	s.active = false
+	s.timer.Stop()
+	idle := s.idle
+	s.mu.Unlock()
+	if err := s.native.Retire(ctx); err != nil {
+		return err
 	}
-	if err == nil {
-		fs.storage.fileMu.Lock()
-		delete(fs.storage.fileSessions, fs)
-		fs.storage.fileMu.Unlock()
-	}
-	fs.closeMu.Lock()
-	fs.closeErr = err
-	close(fs.closeDone)
-	fs.closeMu.Unlock()
-}
-
-func (fs *fileSession) Close(ctx context.Context) error {
-	done := fs.startClose()
 	select {
-	case <-done:
-		fs.closeMu.Lock()
-		defer fs.closeMu.Unlock()
-		return fs.closeErr
+	case <-idle:
+		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-// CloseFileSessions stops file-session admission and drains the references
-// before either durable half can release its ownership. Cleanup failure keeps
-// the sessions and their native pins owned and returns the original failure.
+func (s *fileSession) finalize(err error) {
+	s.mu.Lock()
+	s.closeErr = err
+	if err == nil {
+		s.closed = true
+		clear(s.files)
+	}
+	s.mu.Unlock()
+	if err == nil {
+		s.storage.fileMu.Lock()
+		delete(s.storage.fileSessions, s)
+		s.storage.fileMu.Unlock()
+		s.storage.sweepAfterMutation()
+	}
+}
+
+func (s *fileSession) dispose(ctx context.Context) error {
+	select {
+	case <-s.closePermit:
+		defer func() { s.closePermit <- struct{}{} }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return nil
+	}
+	if err := s.retireAndDrain(ctx); err != nil {
+		s.finalize(err)
+		return err
+	}
+	cleanup, cancel := s.cleanupOperation(ctx)
+	stop := context.AfterFunc(ctx, cancel)
+	err := s.native.Dispose(cleanup)
+	stop()
+	cancel()
+	s.finalize(err)
+	return err
+}
+
+func (s *fileSession) Close(ctx context.Context, id storage.FileActionID) (receipt storage.FileActionReceipt, err error) {
+	if _, err := id.Epoch(); err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return storage.FileActionReceipt{Operation: storage.OpFileSessionClose, State: storage.FileActionRetired}, nil
+	}
+	if err := s.storage.beginFileCleanup(); err != nil {
+		return storage.FileActionReceipt{}, beforeFileAdmission(err)
+	}
+	defer s.storage.endOperation()
+	select {
+	case <-s.closePermit:
+		defer func() { s.closePermit <- struct{}{} }()
+	case <-ctx.Done():
+		return storage.FileActionReceipt{}, beforeFileAdmission(ctx.Err())
+	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	admitted, proceed, err := s.native.BeginClose(ctx, id)
+	if !proceed || err != nil {
+		if err == nil && admitted.Errno == 0 && (admitted.State == storage.FileActionCompleted || admitted.State == storage.FileActionRetired) {
+			s.mu.Lock()
+			inactive := !s.active
+			s.mu.Unlock()
+			if inactive {
+				s.finalize(nil)
+			}
+		}
+		return admitted, err
+	}
+	defer func() { err = afterFileAdmission(err) }()
+	s.mu.Lock()
+	s.active = false
+	s.timer.Stop()
+	idle := s.idle
+	s.mu.Unlock()
+	select {
+	case <-idle:
+	case <-ctx.Done():
+		s.finalize(ctx.Err())
+		return admitted, ctx.Err()
+	}
+	cleanup, finish := s.cleanupOperation(ctx)
+	stop := context.AfterFunc(ctx, finish)
+	result, err := s.native.Close(cleanup, id)
+	stop()
+	finish()
+	if (result.State == storage.FileActionCompleted || result.State == storage.FileActionRetired) && result.Errno == 0 {
+		s.finalize(nil)
+	} else {
+		s.mu.Lock()
+		s.closeErr = err
+		s.mu.Unlock()
+	}
+	return result, err
+}
+
+// CloseFileSessions keeps failed cleanup owned until a later shutdown retry.
 func (s *Storage) CloseFileSessions() error {
 	s.fileCloseMu.Lock()
 	defer s.fileCloseMu.Unlock()
 	s.fileMu.Lock()
 	s.filesClosing = true
-	sessions := make([]*fileSession, 0, len(s.fileSessions))
-	for fs := range s.fileSessions {
-		sessions = append(sessions, fs)
-	}
-	windows := make([]*windowsSession, 0, len(s.windowsSessions))
-	for ws := range s.windowsSessions {
-		windows = append(windows, ws)
+	if s.cancelFileEnrollment != nil {
+		s.cancelFileEnrollment()
 	}
 	s.fileMu.Unlock()
-	for _, fs := range sessions {
-		fs.startClose()
+	s.fileEnrollment.Wait()
+	s.fileMu.Lock()
+	sessions := make([]*fileSession, 0, len(s.fileSessions))
+	for session := range s.fileSessions {
+		sessions = append(sessions, session)
 	}
+	s.fileMu.Unlock()
 	var errs []error
-	for _, fs := range sessions {
-		errs = append(errs, fs.Close(context.Background()))
-	}
-	for _, ws := range windows {
-		ctx, cancel := ws.operationContext(ws.cleanup)
-		errs = append(errs, ws.Close(ctx))
+	for _, session := range sessions {
+		ctx, cancel := session.operationContext(session.cleanup)
+		errs = append(errs, session.dispose(ctx))
 		cancel()
 	}
 	if err := errors.Join(errs...); err != nil {
 		return fmt.Errorf("closing retained file sessions: %w", err)
 	}
+	return nil
+}
+
+func (s *Storage) beginFileCleanup() error {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if s.closeDone != nil && !s.fileCloseRetry {
+		return fmt.Errorf("the object-store volume is closed: %w", syscall.EIO)
+	}
+	s.operations.RLock()
 	return nil
 }

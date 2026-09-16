@@ -5,6 +5,11 @@
 -- record what they now produce. A diff here without a new migration beside it means a landed
 -- migration was edited, which is the one thing the numbering forbids.
 
+CREATE INDEX changes_by_fact_identity ON changes (
+	CASE WHEN typeof(identity_high_water) = 'integer' THEN 0 ELSE 1 END,
+	identity_high_water
+);
+
 CREATE INDEX changes_by_node_identity ON changes (
 	CASE
 	WHEN typeof(parent) = 'integer'
@@ -25,6 +30,15 @@ CREATE INDEX changes_by_position_identity ON changes (
 
 CREATE INDEX changes_by_volume ON changes (volume, position);
 
+CREATE INDEX entries_by_draining ON entries (draining);
+
+CREATE UNIQUE INDEX entries_by_identity ON entries (id);
+
+CREATE INDEX entries_by_identity_bounds ON entries (
+	CASE WHEN typeof(id) = 'integer' THEN 0 ELSE 1 END,
+	id
+);
+
 CREATE INDEX entries_by_node ON entries (node);
 
 CREATE INDEX entries_by_node_identity ON entries (
@@ -44,7 +58,16 @@ CREATE INDEX nodes_by_content ON nodes (content);
 
 CREATE INDEX objects_by_state ON objects (volume, state, created_sec);
 
+CREATE INDEX removal_intents_by_identity ON removal_intents (
+	CASE WHEN typeof(entry) = 'integer' THEN 0 ELSE 1 END,
+	entry
+);
+
+CREATE INDEX removal_intents_by_volume ON removal_intents (volume, entry);
+
 -- index sqlite_autoindex_objects_1, which SQLite maintains itself
+
+-- index sqlite_autoindex_removal_intents_2, which SQLite maintains itself
 
 -- index sqlite_autoindex_volumes_1, which SQLite maintains itself
 
@@ -59,25 +82,34 @@ CREATE TABLE backing_store (
 ) WITHOUT ROWID;
 
 CREATE TABLE changes (
-	position          INTEGER PRIMARY KEY AUTOINCREMENT,
+	position INTEGER PRIMARY KEY AUTOINCREMENT,
 	previous_position INTEGER NOT NULL,
-	volume         INTEGER NOT NULL REFERENCES volumes(id),
-	kind              INTEGER NOT NULL,
-	parent            INTEGER NOT NULL,
-	name              BLOB,
-	from_parent       INTEGER,
-	from_name         BLOB,
-	node              INTEGER,
-	mode              INTEGER,
-	size              INTEGER,
-	atime_sec         INTEGER,
-	atime_nsec        INTEGER,
-	mtime_sec         INTEGER,
-	mtime_nsec        INTEGER,
-	content           TEXT,
-	recorded_sec      INTEGER NOT NULL,
-	recorded_nsec     INTEGER NOT NULL,
-	notification      BLOB NOT NULL
+	volume INTEGER NOT NULL REFERENCES volumes(id),
+	kind INTEGER NOT NULL,
+	parent INTEGER NOT NULL,
+	name BLOB,
+	from_parent INTEGER,
+	from_name BLOB,
+	node INTEGER,
+	node_kind INTEGER,
+	size INTEGER,
+	atime_sec INTEGER,
+	atime_nsec INTEGER,
+	mtime_sec INTEGER,
+	mtime_nsec INTEGER,
+	creation_sec INTEGER,
+	creation_nsec INTEGER,
+	change_sec INTEGER,
+	change_nsec INTEGER,
+	metadata_revision INTEGER,
+	directory_revision INTEGER,
+	content TEXT,
+	metadata BLOB,
+	link_target BLOB,
+	recorded_sec INTEGER NOT NULL,
+	recorded_nsec INTEGER NOT NULL,
+	identity_high_water INTEGER NOT NULL,
+	notification BLOB NOT NULL
 );
 
 CREATE TABLE database_state (
@@ -92,8 +124,25 @@ CREATE TABLE entries (
 	volume INTEGER NOT NULL REFERENCES volumes(id),
 	parent    INTEGER NOT NULL REFERENCES nodes(id),
 	name      BLOB    NOT NULL,
-	node      INTEGER NOT NULL REFERENCES nodes(id),
+	node      INTEGER NOT NULL REFERENCES nodes(id), id INTEGER NOT NULL DEFAULT 0, draining INTEGER NOT NULL DEFAULT 0, drain_generation INTEGER NOT NULL DEFAULT 0, drain_if_empty INTEGER NOT NULL DEFAULT 0, drain_authority TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (volume, parent, name)
+) WITHOUT ROWID;
+
+CREATE TABLE file_lease_initialization (
+	singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+	state INTEGER NOT NULL CHECK (state IN (0, 1))
+) WITHOUT ROWID;
+
+CREATE TABLE file_lease_recovery (
+	singleton           INTEGER PRIMARY KEY CHECK (singleton = 1),
+	database_id         TEXT NOT NULL,
+	state_id            TEXT NOT NULL,
+	accepted_generation INTEGER NOT NULL,
+	accepted_nanos      INTEGER NOT NULL,
+	accepted_quiescent  INTEGER NOT NULL,
+	prepared_generation INTEGER,
+	prepared_nanos      INTEGER,
+	prepared_quiescent  INTEGER
 ) WITHOUT ROWID;
 
 CREATE TABLE lease_recovery (
@@ -117,20 +166,13 @@ CREATE TABLE logs (
 CREATE TABLE nodes (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
 	volume  INTEGER NOT NULL REFERENCES volumes(id),
-	mode       INTEGER NOT NULL,
 	size       INTEGER NOT NULL,
 	atime_sec  INTEGER NOT NULL,
 	atime_nsec INTEGER NOT NULL,
 	mtime_sec  INTEGER NOT NULL,
 	mtime_nsec INTEGER NOT NULL,
-	windows_creation_sec INTEGER NOT NULL DEFAULT 0,
-	windows_creation_nsec INTEGER NOT NULL DEFAULT 0,
-	windows_change_sec INTEGER NOT NULL DEFAULT 0,
-	windows_change_nsec INTEGER NOT NULL DEFAULT 0,
-	windows_attributes INTEGER NOT NULL DEFAULT 0,
-	windows_link_target BLOB NOT NULL DEFAULT X'',
 	content    TEXT REFERENCES objects(key)
-	, detached INTEGER NOT NULL DEFAULT 0, content_revision INTEGER NOT NULL DEFAULT 1);
+	, detached INTEGER NOT NULL DEFAULT 0, content_revision INTEGER NOT NULL DEFAULT 1, kind INTEGER NOT NULL DEFAULT 1, metadata_revision INTEGER NOT NULL DEFAULT 1, directory_revision INTEGER NOT NULL DEFAULT 0, creation_sec INTEGER, creation_nsec INTEGER, change_sec INTEGER, change_nsec INTEGER, metadata BLOB NOT NULL DEFAULT X'52464d010000', link_target BLOB NOT NULL DEFAULT X'');
 
 CREATE TABLE objects (
 	key          TEXT PRIMARY KEY,
@@ -142,6 +184,15 @@ CREATE TABLE objects (
 	created_nsec INTEGER NOT NULL
 );
 
+CREATE TABLE removal_intents (
+	volume INTEGER NOT NULL,
+	reference TEXT PRIMARY KEY,
+	token TEXT NOT NULL UNIQUE,
+	entry INTEGER NOT NULL,
+	if_empty INTEGER NOT NULL,
+	authority TEXT NOT NULL
+) WITHOUT ROWID;
+
 CREATE TABLE schema_version (version INTEGER NOT NULL);
 
 CREATE TABLE sqlite_sequence(name,seq);
@@ -150,7 +201,6 @@ CREATE TABLE volumes (
 	id   INTEGER PRIMARY KEY AUTOINCREMENT,
 	name TEXT    NOT NULL UNIQUE,
 	root INTEGER NOT NULL,
-	used INTEGER NOT NULL,
-	windows_name_version INTEGER NOT NULL DEFAULT 0
+	used INTEGER NOT NULL
 );
 

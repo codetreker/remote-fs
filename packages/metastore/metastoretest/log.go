@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"syscall"
 	"testing"
@@ -57,12 +58,31 @@ var logCases = []testCase{
 		mustSucceed(t, s.Create(ctx(t), "second"))
 		newResult := func(max int64) *metastore.ChangeResult {
 			result, err := metastore.NewChangeResult(max, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
-				return lengths.Name + lengths.FromName + lengths.Content + 1, nil
+				return lengths.Name + lengths.FromName + lengths.Content + lengths.Metadata + lengths.Target + lengths.Notification + 1, nil
 			})
 			mustSucceed(t, err)
 			return result
 		}
-		firstPage := newResult(int64(len("first") + 1))
+		baseline, _, err := readChanges(ctx(t), s, 0, 100)
+		mustSucceed(t, err)
+		if len(baseline) < 2 {
+			t.Fatal("bounded log fixture has fewer than two changes")
+		}
+		charge := func(change metastore.Change) int64 {
+			encoded, err := metastore.EncodeNotification(change)
+			mustSucceed(t, err)
+			size := int64(1 + len(change.Name) + len(encoded))
+			if change.From != nil {
+				size += int64(len(change.From.Name))
+			}
+			if change.Node != nil {
+				metadata, err := storage.EncodeMetadata(change.Node.Metadata)
+				mustSucceed(t, err)
+				size += int64(len(change.Node.Content) + len(metadata) + len(change.Node.LinkTarget))
+			}
+			return size
+		}
+		firstPage := newResult(max(charge(baseline[0]), charge(baseline[1])))
 		retention, err := s.Since(ctx(t), 0, 100, firstPage)
 		mustSucceed(t, err)
 		changes, err := firstPage.Changes()
@@ -74,7 +94,7 @@ var logCases = []testCase{
 			t.Fatalf("one-change page reported tail %d at position %d", retention.Tail, changes[0].Position)
 		}
 
-		tooSmall := newResult(int64(len("second")))
+		tooSmall := newResult(charge(baseline[1]) - 1)
 		if _, err := s.Since(ctx(t), changes[0].Position, 100, tooSmall); !errors.Is(err, syscall.EFBIG) {
 			t.Fatalf("oversized next change returned %v, want EFBIG", err)
 		}
@@ -97,7 +117,7 @@ var logCases = []testCase{
 		defer snap.Close()
 		newResult := func(max int64) *metastore.RowResult {
 			result, err := metastore.NewRowResult(max, 0, func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
-				return 1 + lengths.Name + lengths.Content, nil
+				return 1 + lengths.Name + lengths.Content + lengths.Metadata + lengths.Target, nil
 			})
 			mustSucceed(t, err)
 			return result
@@ -107,9 +127,9 @@ var logCases = []testCase{
 			name string
 			done bool
 		}{
-			{max: int64(len("first") + 1)},
-			{max: int64(len("second") + 1), name: "first"},
-			{max: int64(len("second") + 1), name: "second", done: true},
+			{max: int64(len("first") + 7)},
+			{max: int64(len("second") + 7), name: "first"},
+			{max: int64(len("second") + 7), name: "second", done: true},
 		} {
 			result := newResult(page.max)
 			done, err := snap.Next(ctx(t), 100, result)
@@ -193,7 +213,9 @@ var logCases = []testCase{
 		}{
 			{"create", func() { mustSucceed(t, s.Create(ctx(t), "f")) }, metastore.Created},
 			{"mkdir", func() { mustSucceed(t, s.Mkdir(ctx(t), "d")) }, metastore.Created},
-			{"setattr", func() { mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{Mode: mode(0o600)})) }, metastore.Modified},
+			{"setattr", func() {
+				mustSucceed(t, s.SetAttr(ctx(t), "f", withMetadata(t, s, "f", []byte("updated"), storage.AttrChange{})))
+			}, metastore.Modified},
 			{"commit", func() { put(t, s, "f", 40) }, metastore.Modified},
 			{"rename", func() { mustSucceed(t, s.Rename(ctx(t), "f", "d/g")) }, metastore.Renamed},
 			{"unlink", func() { mustSucceed(t, s.Remove(ctx(t), "d/g")) }, metastore.Removed},
@@ -219,7 +241,7 @@ var logCases = []testCase{
 		mustSucceed(t, s.Mkdir(ctx(t), "d"))
 		for i := range 40 {
 			put(t, s, "d/f", int64(i))
-			mustSucceed(t, s.SetAttr(ctx(t), "d/f", storage.AttrChange{Mode: mode(0o600)}))
+			mustSucceed(t, s.SetAttr(ctx(t), "d/f", withMetadata(t, s, "d/f", []byte("updated"), storage.AttrChange{})))
 		}
 		mustSucceed(t, s.Rename(ctx(t), "d/f", "moved"))
 		mustSucceed(t, s.Remove(ctx(t), "moved"))
@@ -347,6 +369,27 @@ var renameLogCases = []testCase{
 }
 
 var snapshotCases = []testCase{
+	{name: "snapshot entry identities survive rename and distinguish reused names", run: func(t *testing.T, s metastore.Store) {
+		mustSucceed(t, s.Create(ctx(t), "first"))
+		mustSucceed(t, s.Mkdir(ctx(t), "d"))
+		before, at := picture(t, s, 1, nil)
+		original := before.entryIDs[where{before.root, "first"}]
+		directory := before.entries[where{before.root, "d"}]
+		if original == 0 {
+			t.Fatal("snapshot omitted source entry identity")
+		}
+		mustSucceed(t, s.Rename(ctx(t), "first", "d/moved"))
+		mustSucceed(t, s.Create(ctx(t), "first"))
+		after, _ := picture(t, s, 1, nil)
+		if after.entryIDs[where{directory, "moved"}] != original || after.entryIDs[where{after.root, "first"}] == original {
+			t.Fatal("snapshot changed renamed identity or reused old identity for replacement")
+		}
+		before.apply(t, drain(t, s, at))
+		mustAgree(t, before, s)
+		if !reflect.DeepEqual(before.entryIDs, after.entryIDs) {
+			t.Fatalf("snapshot and replay entry identities differ: %v %v", before.entryIDs, after.entryIDs)
+		}
+	}},
 	{name: "a picture of a fresh volume is the root alone", run: func(t *testing.T, s metastore.Store) {
 		snap, at, err := s.Snapshot(ctx(t))
 		mustSucceed(t, err)
@@ -370,7 +413,7 @@ var snapshotCases = []testCase{
 			t.Fatalf("the root is named (%d, %q), want parent 0 and no name", root.Parent, root.Name)
 		}
 		if !root.Node.IsDir() {
-			t.Fatalf("the root of the picture has mode %v, want a directory", root.Node.Mode)
+			t.Fatalf("the root of the picture has kind %v, want a directory", root.Node.Kind)
 		}
 	}},
 
@@ -401,7 +444,7 @@ var snapshotCases = []testCase{
 			mirror, at := picture(t, s, 1, func(step int) {
 				switch step % 6 {
 				case 0:
-					mustSucceed(t, s.SetAttr(ctx(t), "a/b/c/deep", storage.AttrChange{Mode: mode(0o600)}))
+					mustSucceed(t, s.SetAttr(ctx(t), "a/b/c/deep", withMetadata(t, s, "a/b/c/deep", []byte("updated"), storage.AttrChange{})))
 				case 1:
 					put(t, s, "a/b/c/deep", int64(100+step))
 				case 2:
@@ -620,9 +663,10 @@ var sinceCases = []testCase{
 // different question — whether two implementations agree — while hiding the first one behind
 // its own corrections.
 type replica struct {
-	root    int64
-	nodes   map[int64]metastore.Node
-	entries map[where]int64
+	root     int64
+	nodes    map[int64]metastore.Node
+	entries  map[where]int64
+	entryIDs map[where]storage.EntryID
 
 	// at is the position everything applied so far was recorded at.
 	at metastore.Position
@@ -644,7 +688,7 @@ func picture(t *testing.T, s metastore.Store, page int, between func(step int)) 
 	mustSucceed(t, err)
 	defer func() { mustSucceed(t, snap.Close()) }()
 
-	r := &replica{nodes: map[int64]metastore.Node{}, entries: map[where]int64{}, at: at}
+	r := &replica{nodes: map[int64]metastore.Node{}, entries: map[where]int64{}, entryIDs: map[where]storage.EntryID{}, at: at}
 	for step := 0; ; step++ {
 		rows, done, err := readRows(ctx(t), snap, page)
 		mustSucceed(t, err)
@@ -652,7 +696,7 @@ func picture(t *testing.T, s metastore.Store, page int, between func(step int)) 
 			t.Fatalf("a page of %d rows was asked for and %d came back", page, len(rows))
 		}
 		for _, row := range rows {
-			if (row.Parent == 0) != (row.Name == nil) {
+			if (row.Parent == 0) != (row.Name == nil) || (row.Parent == 0) != (row.EntryID == 0) {
 				t.Fatalf("a row is named (%d, %q); the root has both a parent of 0 and no name, and every other row has neither",
 					row.Parent, row.Name)
 			}
@@ -664,7 +708,17 @@ func picture(t *testing.T, s metastore.Store, page int, between func(step int)) 
 				r.root = row.Node.ID
 				continue
 			}
-			r.entries[where{row.Parent, string(row.Name)}] = row.Node.ID
+			at := where{row.Parent, string(row.Name)}
+			if _, exists := r.entries[at]; exists {
+				t.Fatalf("snapshot repeated entry at %+v", at)
+			}
+			for heldAt, id := range r.entryIDs {
+				if id == row.EntryID {
+					t.Fatalf("snapshot repeats entry identity %d at %+v and %+v", id, heldAt, at)
+				}
+			}
+			r.entries[at] = row.Node.ID
+			r.entryIDs[at] = row.EntryID
 		}
 		if done {
 			break
@@ -696,6 +750,7 @@ func (r *replica) apply(t *testing.T, changes []metastore.Change) {
 		if c.Position <= r.at {
 			continue
 		}
+		mustSucceed(t, metastore.ValidateNotification(c))
 		at := where{c.Parent, string(c.Name)}
 		root := c.Parent == 0 && c.Name == nil
 
@@ -718,7 +773,11 @@ func (r *replica) apply(t *testing.T, changes []metastore.Change) {
 			if !held {
 				t.Fatalf("position %d removes %q under %d, which the replica does not hold", c.Position, c.Name, c.Parent)
 			}
+			if before := c.Notification.Before.Location.Ancestors; r.entryIDs[at] != before[len(before)-1].EntryID {
+				t.Fatal("removal lost source entry identity")
+			}
 			delete(r.entries, at)
+			delete(r.entryIDs, at)
 			delete(r.nodes, id)
 		case metastore.Renamed:
 			if c.From == nil {
@@ -732,7 +791,13 @@ func (r *replica) apply(t *testing.T, changes []metastore.Change) {
 				t.Fatalf("position %d moves a node onto %q under %d, which the replica still holds — the node that was there was destroyed and never reported",
 					c.Position, c.Name, c.Parent)
 			}
+			before := c.Notification.Before.Location.Ancestors
+			after := c.Notification.After.Location.Ancestors
+			if r.entryIDs[from] != before[len(before)-1].EntryID || before[len(before)-1].EntryID != after[len(after)-1].EntryID {
+				t.Fatal("rename changed source entry identity")
+			}
 			delete(r.entries, from)
+			delete(r.entryIDs, from)
 			r.hold(t, c, at, root)
 		default:
 			t.Fatalf("position %d is a change of kind %v, which is not one of the four", c.Position, c.Kind)
@@ -749,6 +814,12 @@ func (r *replica) hold(t *testing.T, c metastore.Change, at where, root bool) {
 	}
 	r.nodes[c.Node.ID] = *c.Node
 	if !root {
+		image := c.Notification.After.Location.Ancestors
+		id := image[len(image)-1].EntryID
+		if previous, held := r.entryIDs[at]; held && previous != id {
+			t.Fatal("modification changed source entry identity")
+		}
+		r.entryIDs[at] = id
 		r.entries[at] = c.Node.ID
 	}
 }
@@ -840,13 +911,14 @@ func walkStore(t *testing.T, s metastore.Store) map[string]metastore.Node {
 // rather than ==, because two instants that are the same moment may carry different monotonic
 // readings and different locations.
 func sameNode(a, b metastore.Node) bool {
-	return a.ID == b.ID && a.Mode == b.Mode && a.Size == b.Size &&
-		a.AccessTime.Equal(b.AccessTime) && a.ModTime.Equal(b.ModTime) && a.Content == b.Content
+	return a.ID == b.ID && a.Kind == b.Kind && a.Size == b.Size && a.MetadataRevision == b.MetadataRevision && a.DirectoryRevision == b.DirectoryRevision &&
+		a.AccessTime.Equal(b.AccessTime) && a.ModTime.Equal(b.ModTime) && sameInstant(a.CreationTime, b.CreationTime) && sameInstant(a.ChangeTime, b.ChangeTime) && a.Content == b.Content &&
+		reflect.DeepEqual(a.Metadata, b.Metadata) && bytes.Equal(a.LinkTarget, b.LinkTarget)
 }
 
 func readChanges(ctx context.Context, log metastore.Log, after metastore.Position, limit int) ([]metastore.Change, metastore.Retention, error) {
 	result, err := metastore.NewChangeResult(64<<20, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
-		return 256 + lengths.Name + lengths.FromName + lengths.Content, nil
+		return 256 + lengths.Name + lengths.FromName + lengths.Content + lengths.Metadata + lengths.Target + lengths.Notification, nil
 	})
 	if err != nil {
 		return nil, metastore.Retention{}, err
@@ -861,7 +933,7 @@ func readChanges(ctx context.Context, log metastore.Log, after metastore.Positio
 
 func readRows(ctx context.Context, snap metastore.Snap, limit int) ([]metastore.Row, bool, error) {
 	result, err := metastore.NewRowResult(64<<20, 0, func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
-		return 192 + lengths.Name + lengths.Content, nil
+		return 192 + lengths.Name + lengths.Content + lengths.Metadata + lengths.Target, nil
 	})
 	if err != nil {
 		return nil, false, err
@@ -912,7 +984,7 @@ func build(t *testing.T, s metastore.Store) {
 	// way through would have lost the file it described.
 	mustSucceed(t, s.Create(ctx(t), string([]byte{0xff, 0xfe})))
 	changed := time.Date(2400, 6, 1, 12, 0, 0, 500000000, time.UTC)
-	mustSucceed(t, s.SetAttr(ctx(t), "a/b", storage.AttrChange{Mode: mode(0o700), ModTime: &changed}))
+	mustSucceed(t, s.SetAttr(ctx(t), "a/b", withMetadata(t, s, "a/b", []byte("directory"), storage.AttrChange{ModTime: &changed})))
 }
 
 // name builds a distinct path for a step of a case that writes while a picture is open.
@@ -936,4 +1008,11 @@ func kinds(changes []metastore.Change) []metastore.ChangeKind {
 		got = append(got, c.Kind)
 	}
 	return got
+}
+
+func sameInstant(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(*b)
 }

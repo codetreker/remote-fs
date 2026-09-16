@@ -47,7 +47,7 @@ func TestUnpublishWaiterKeepsItsFailedAttemptDuringRetry(t *testing.T) {
 	stream := &retryCloseStream{notifyTestStream: testNotifyStream(), second: make(chan struct{}), release: make(chan struct{})}
 	source := testNotifySource(stream.notifyTestStream)
 	source.Subscribe = func(context.Context) (ChangeStream, error) { return stream, nil }
-	e, err := s.Publish(Share{Name: "work", Volume: "trusted", Backend: &sessionBackend{}, Changes: source})
+	e, err := s.publish(Share{Name: "work", Volume: "trusted", Changes: source}, &sessionBackend{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestLateUnpublishCannotRemoveAReplacementExport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e, err := s.Publish(Share{Name: "work", Volume: "trusted", Backend: &sessionBackend{}, Changes: testNotifySource(testNotifyStream())})
+	e, err := s.publish(Share{Name: "work", Volume: "trusted", Changes: testNotifySource(testNotifyStream())}, &sessionBackend{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestLateUnpublishCannotRemoveAReplacementExport(t *testing.T) {
 	if err := e.Unpublish(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	replacement, err := s.Publish(Share{Name: "work", Volume: "trusted", Backend: &sessionBackend{}, Changes: testNotifySource(testNotifyStream())})
+	replacement, err := s.publish(Share{Name: "work", Volume: "trusted", Changes: testNotifySource(testNotifyStream())}, &sessionBackend{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestLateUnpublishCannotRemoveAReplacementExport(t *testing.T) {
 	if s.Status().Exports != 1 {
 		t.Fatal("late retirement removed a new export")
 	}
-	if _, err := s.Publish(Share{Name: "work", Volume: "trusted", Backend: &sessionBackend{}, Changes: testNotifySource(testNotifyStream())}); !errors.Is(err, ErrBusy) {
+	if _, err := s.publish(Share{Name: "work", Volume: "trusted", Changes: testNotifySource(testNotifyStream())}, &sessionBackend{}); !errors.Is(err, ErrBusy) {
 		t.Fatalf("replacement name is no longer registered: %v", err)
 	}
 }

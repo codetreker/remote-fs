@@ -18,18 +18,18 @@ type sessionLifecycleStorage struct {
 	wrap func(storage.FileSession) storage.FileSession
 }
 
-func (s sessionLifecycleStorage) NewFileSession(ctx context.Context, opts storage.FileSessionOptions) (storage.FileSession, error) {
-	fileSession, err := s.FileStorage.NewFileSession(ctx, opts)
+func (s sessionLifecycleStorage) NewFileSession(ctx context.Context, opts storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
+	fileSession, status, err := s.FileStorage.NewFileSession(ctx, opts)
 	if err != nil {
-		return nil, err
+		return nil, status, err
 	}
-	return s.wrap(fileSession), nil
+	return s.wrap(fileSession), status, nil
 }
 
 type sessionLifecycleProbe struct {
 	storage.FileSession
 	renew func(context.Context) (storage.FileSessionStatus, error)
-	close func(context.Context) error
+	close func(context.Context, storage.FileActionID) (storage.FileActionReceipt, error)
 }
 
 func (s *sessionLifecycleProbe) Renew(ctx context.Context) (storage.FileSessionStatus, error) {
@@ -39,11 +39,11 @@ func (s *sessionLifecycleProbe) Renew(ctx context.Context) (storage.FileSessionS
 	return s.FileSession.Renew(ctx)
 }
 
-func (s *sessionLifecycleProbe) Close(ctx context.Context) error {
+func (s *sessionLifecycleProbe) Close(ctx context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
 	if s.close != nil {
-		return s.close(ctx)
+		return s.close(ctx, id)
 	}
-	return s.FileSession.Close(ctx)
+	return s.FileSession.Close(ctx, id)
 }
 
 func lifecycleVolume(t *testing.T, wrap func(storage.FileSession) storage.FileSession) (*volume, storage.FileStorage) {
@@ -85,7 +85,7 @@ func TestFileSessionRenewalKeepsReferencesLiveAndRetiresThem(t *testing.T) {
 			return status, err
 		}}
 	})
-	file, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
+	file, err := retainLifecycleFile(t.Context(), v, storage.ReadContent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,14 +93,14 @@ func TestFileSessionRenewalKeepsReferencesLiveAndRetiresThem(t *testing.T) {
 	if err := v.check(); err != nil {
 		t.Fatalf("renewed volume: %v", err)
 	}
-	read, err := file.ReadAt(t.Context(), 0, 7)
+	read, err := file.ReadAt(t.Context(), storage.FileReadRequest{Length: 7})
 	if err != nil || string(read.Data) != "current" {
 		t.Fatalf("live reference after renewal: %q, %v", read.Data, err)
 	}
 	if err := v.stopSession(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := file.ReadAt(t.Context(), 0, 7); errnoOf(err) != syscall.ESTALE && errnoOf(err) != syscall.EBADF {
+	if _, err := file.ReadAt(t.Context(), storage.FileReadRequest{Length: 7}); errnoOf(err) != syscall.ESTALE && errnoOf(err) != syscall.EBADF {
 		t.Fatalf("retired reference read: %v", err)
 	}
 	if _, err := backing.Read(t.Context(), "file"); err != nil {
@@ -114,7 +114,7 @@ func TestFileSessionContinuityLossFencesAndRetiresTheAuthority(t *testing.T) {
 			return storage.FileSessionStatus{}, syscall.ESTALE
 		}}
 	})
-	file, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
+	file, err := retainLifecycleFile(t.Context(), v, storage.ReadContent|storage.WriteContent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestFileSessionContinuityLossFencesAndRetiresTheAuthority(t *testing.T) {
 	if errnoOf(v.check()) != syscall.EIO || errnoOf(v.stopSession()) != syscall.EIO {
 		t.Fatalf("lost continuity did not persist failure: check=%v close=%v", v.check(), v.stopSession())
 	}
-	if _, err := file.WriteAt(t.Context(), 0, []byte("lost")); errnoOf(err) != syscall.ESTALE && errnoOf(err) != syscall.EBADF {
+	if _, err := file.WriteAt(t.Context(), storage.FileWriteRequest{Data: []byte("lost")}, lifecycleAction(t, v)); errnoOf(err) != syscall.ESTALE && errnoOf(err) != syscall.EBADF {
 		t.Fatalf("authority accepted write after local session fence: %v", err)
 	}
 }
@@ -141,7 +141,7 @@ func TestFileSessionFailedRenewalCannotExtendItsConfirmedLifetime(t *testing.T) 
 	if errnoOf(v.check()) != syscall.EIO {
 		t.Fatalf("expired renewal accepted I/O: %v", v.check())
 	}
-	if _, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}); errnoOf(err) != syscall.ESTALE {
+	if _, err := retainLifecycleFile(t.Context(), v, storage.ReadContent); errnoOf(err) != syscall.ESTALE {
 		t.Fatalf("expired authority accepted a new reference: %v", err)
 	}
 }
@@ -157,9 +157,11 @@ func TestFileSessionStopCancelsRenewalAndReturnsCleanupFailureOnce(t *testing.T)
 				<-ctx.Done()
 				return storage.FileSessionStatus{}, ctx.Err()
 			},
-			close: func(ctx context.Context) error {
+			close: func(ctx context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
 				closes.Add(1)
-				return errors.Join(native.Close(ctx), fault)
+				receipt, err := native.Close(ctx, id)
+				receipt.Errno = syscall.EIO
+				return receipt, errors.Join(err, fault)
 			},
 		}
 	})
@@ -273,7 +275,7 @@ func TestFailedMountHandshakeDetachesBeforeWaitingForSessionCleanup(t *testing.T
 	default:
 		t.Fatal("failed mount returned before session cleanup")
 	}
-	if _, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}); errnoOf(err) != syscall.ESTALE {
+	if _, err := retainLifecycleFile(t.Context(), v, storage.ReadContent); errnoOf(err) != syscall.ESTALE {
 		t.Fatalf("failed mount retained active session: %v", err)
 	}
 	if _, err := backing.Read(t.Context(), "file"); err != nil {
@@ -332,4 +334,27 @@ func TestFailedMountHandshakeRetainsIndependentTeardownErrors(t *testing.T) {
 	if got != nil || !errors.Is(err, handshakeErr) || !errors.Is(err, unmountErr) || !errors.Is(err, retirementErr) {
 		t.Fatalf("completed failed setup lost a cause: mount=%v error=%v", got, err)
 	}
+}
+
+func retainLifecycleFile(ctx context.Context, v *volume, uses storage.AccessUse) (storage.File, error) {
+	if err := v.check(); err != nil {
+		return nil, err
+	}
+	attr, err := v.storage.Stat(ctx, "file")
+	if err != nil {
+		return nil, err
+	}
+	file, _, err := v.retainNode(ctx, attr.ID, storage.AccessClaim{Uses: uses})
+	return file, err
+}
+func lifecycleAction(t *testing.T, v *volume) storage.FileActionID {
+	t.Helper()
+	v.mu.Lock()
+	epoch := v.status.ActionEpoch
+	v.mu.Unlock()
+	id, err := storage.NewFileActionID(epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
 }

@@ -99,55 +99,50 @@ func (c *connection) securityInfo(ctx context.Context, t *tree, r wire.Request) 
 	return wire.BufferResponseBody(descriptor), 0
 }
 
-func (c *connection) maximumAccess(ctx context.Context, t *tree, r wire.Request) (wire.Request, error) {
-	create, err := r.Create()
-	if err != nil {
-		return r, err
+func (c *connection) authorizeMaximumAccess(ctx context.Context, t *tree, intent windowsOpenIntent) (windowsAccess, error) {
+	kind := storage.NodeRegular
+	if intent.Kind == windowsDirectory {
+		kind = storage.NodeDirectory
 	}
-	if create.DesiredAccess&0x02000000 == 0 {
-		return r, nil
-	}
-	mask := expandAccess(create.DesiredAccess &^ uint32(0x02000000))
-	if create.Disposition == 0 || create.Options&0x1000 != 0 {
-		mask |= 0x10000
-	}
-	if create.Disposition == 4 || create.Disposition == 5 {
-		mask |= 2
-	}
-	create.DesiredAccess = mask
-	intent, err := windowsIntent(create)
-	if err != nil {
-		return r, err
-	}
-	access, err := c.authorizeMaximumAccess(ctx, t, intent)
-	if err != nil {
-		return r, err
-	}
-	mask |= encodeAccess(access)
-	body := append([]byte(nil), r.Body...)
-	smbLE.PutUint32(body[24:], mask)
-	r.Body = body
-	r.Packet = append([]byte(nil), r.Packet...)
-	copy(r.Packet[64:], body)
-	return r, nil
+	return maximumWindowsAccess(ctx, intent, kind, func(candidate windowsOpenIntent) error {
+		return c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: t.export.share.Volume, Operation: storage.OpFileRetainAt, Effects: fileEffects(storage.OpFileRetainAt), Claim: windowsClaim(candidate, kind)})
+	}, func(op storage.Operation) error {
+		return c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: t.export.share.Volume, Operation: op, Effects: fileEffects(op)})
+	})
 }
-
-func (c *connection) authorizeMaximumAccess(ctx context.Context, t *tree, intent storage.WindowsOpenIntent) (storage.WindowsAccess, error) {
+func maximumWindowsAccess(ctx context.Context, intent windowsOpenIntent, kind storage.NodeKind, retain func(windowsOpenIntent) error, operation func(storage.Operation) error) (windowsAccess, error) {
 	mask := intent.Access
-	if err := intent.Check(); err != nil {
+	required := mask
+	if intent.DeleteOnClose || intent.Disposition == windowsSupersede {
+		required |= windowsDelete
+	}
+	if intent.Disposition == windowsOverwrite || intent.Disposition == windowsOverwriteIf {
+		required |= windowsWriteData
+	}
+	candidate := intent
+	candidate.MaximumAllowed = false
+	candidate.Access = required
+	if err := candidate.Check(); err != nil {
 		return 0, err
 	}
-	if mask != 0 {
-		if err := c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: t.export.share.Volume, Operation: storage.OpWindowsOpen, WindowsOpen: intent}); err != nil {
-			return 0, err
-		}
+	if err := retain(candidate); err != nil {
+		return 0, err
 	}
 	for _, entry := range accessBits {
-		intent.Access = mask | entry.semantic
-		err := c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: t.export.share.Volume, Operation: storage.OpWindowsOpen, WindowsOpen: intent})
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		op := windowsAccessOperation(entry.semantic, kind)
+		err := operation(op)
+		if err == nil {
+			candidate.Access = mask | entry.semantic
+			err = retain(candidate)
+		}
 		if err == nil {
 			mask |= entry.semantic
 		} else if !errors.Is(err, authz.ErrDenied) {
+			return 0, err
+		} else if required&entry.semantic != 0 {
 			return 0, err
 		}
 	}
@@ -155,4 +150,30 @@ func (c *connection) authorizeMaximumAccess(ctx context.Context, t *tree, intent
 		return 0, authz.ErrDenied
 	}
 	return mask, nil
+}
+func windowsAccessOperation(access windowsAccess, kind storage.NodeKind) storage.Operation {
+	switch access {
+	case windowsReadData:
+		if kind == storage.NodeDirectory {
+			return storage.OpFileListAt
+		}
+		return storage.OpFileRead
+	case windowsWriteData, windowsAppendData:
+		if kind == storage.NodeDirectory {
+			return storage.OpFileCreateAndRetainAt
+		}
+		return storage.OpFileWrite
+	case windowsDelete:
+		return storage.OpFileDrainEntry
+	case windowsReadAttributes, windowsReadSecurity:
+		return storage.OpFileStat
+	case windowsWriteAttributes:
+		return storage.OpFileSetAttr
+	case windowsSynchronize:
+		return storage.OpFileSync
+	case windowsDeleteChild:
+		return storage.OpFileRename
+	default:
+		panic("unknown Windows access bit")
+	}
 }

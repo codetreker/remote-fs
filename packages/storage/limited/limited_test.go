@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
 	"strings"
 	"sync"
 	"syscall"
@@ -135,8 +134,12 @@ func TestTheOperationsThatCarryNoBytesChargeNothing(t *testing.T) {
 	if err := s.Mkdir(t.Context(), "d"); err != nil {
 		t.Fatal(err)
 	}
-	mode := os.FileMode(0o600)
-	if err := s.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}); err != nil {
+	attr, err := s.Stat(t.Context(), "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := storage.Metadata{{Key: "test", Version: 1, Data: []byte("present")}}
+	if err := s.SetAttr(t.Context(), "f", storage.AttrChange{ExpectedRevision: attr.MetadataRevision, Metadata: &metadata}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.RemoveDir(t.Context(), "d"); err != nil {
@@ -315,12 +318,12 @@ func TestMeasurementUsesBoundedListingAndStopsBeforeRetainingAHugeDirectory(t *t
 	}
 }
 
-func TestDirectoryMeasurementBoundIncludesEntryAndNameRetention(t *testing.T) {
+func TestDirectoryMeasurementBoundIncludesEntryNameAndMetadataRetention(t *testing.T) {
 	backing := &faulty{BoundedStorage: newBacking(t)}
 	if err := backing.Write(t.Context(), "f", content(7)); err != nil {
 		t.Fatal(err)
 	}
-	entryBytes := int64(unsafe.Sizeof(storage.Entry{})) + 1
+	entryBytes := int64(256 + 1 + 4*6)
 	for _, c := range []struct {
 		name  string
 		bound int64
@@ -830,15 +833,14 @@ func (l listing) ListBounded(ctx context.Context, name string, result *storage.L
 	return nil
 }
 
-// SQLite supports regular files and directories. This decorator supplies only the
-// symbolic-link metadata needed to measure the bytes occupied by a link target.
+// This fixture supplies a link target without storing file content bytes.
 type symlinkListing struct {
 	storage.BoundedStorage
 	target string
 }
 
 func (s symlinkListing) link() storage.Entry {
-	return storage.Entry{Name: "link", Attr: storage.Attr{Mode: os.ModeSymlink, Size: int64(len(s.target))}}
+	return storage.Entry{Name: "link", Attr: storage.Attr{Kind: storage.NodeSymlink, Size: int64(len(s.target))}}
 }
 
 func (s symlinkListing) Stat(ctx context.Context, name string) (storage.Attr, error) {
@@ -1090,4 +1092,27 @@ type failedAccountingCheck struct {
 func (s *failedAccountingCheck) CheckPublicationAccounting() error {
 	s.checked++
 	return s.failure
+}
+
+func TestDirectoryMeasurementChargesOpaqueMetadataBeforeRetention(t *testing.T) {
+	metadata := storage.Metadata{{Key: "application", Version: 1, Data: make([]byte, 4096)}}
+	encoded, err := metadata.EncodedSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	backing := listing{BoundedStorage: newBacking(t), entries: []storage.Entry{{Name: "file", Attr: storage.Attr{Kind: storage.NodeRegular, Size: 7, Metadata: metadata}}}}
+	charge := int64(256 + len("file") + 4*encoded)
+	for _, bound := range []int64{charge - 1, charge} {
+		allowance, err := limited.NewWithLimits(t.Context(), backing, 8192, limited.MeasurementLimits{MaxDirectoryBytes: bound, MaxFrontierBytes: limited.DefaultMaxFrontierBytes})
+		if bound < charge {
+			if !errors.Is(err, syscall.EIO) {
+				t.Fatalf("metadata below bound returned %v", err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustUse(t, allowance, 7)
+	}
 }

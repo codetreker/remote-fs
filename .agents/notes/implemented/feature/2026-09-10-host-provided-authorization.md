@@ -10,9 +10,9 @@ Status: implemented
 
 ## 决定
 
-`packages/storage` 定义覆盖 volume 服务的 Operation 与统一 Op 前缀常量；路径、文件会话、复制和锁控制共用这份语义词汇。`packages/authz` 定义 Authorizer、AccessRequest 和 ErrDenied，AccessRequest 复用 storage.Operation 与 storage.OpenAccess。FileOpenOptions 嵌入同一类型，打开验证与策略输入不维护两份布尔字段。handler 将可信配置的 volume 与完整语义意图交给业务 callback；身份由业务 context 提供，用户、角色、凭据签发和验证不进入文件系统。配置缺省保持已有嵌入方式；启用时 Authorizer 与 volume 必须同时提供，不能让远端字段选择策略资源。
+`packages/storage` 定义 Operation、FileEffects 和 AccessClaim；路径、文件会话、复制与强锁共用通用操作词汇。AccessRequest 携带可信 volume、完整固定效果、使用声明和目标身份，和执行层使用同一定义。身份来自业务 context，用户、角色和凭据不进入文件系统；Authorizer／volume 成对配置，远端字段不选择策略资源。平台意图由客户端解释，类型收敛见[平台隔离决定](../architecture/2026-09-16-isolate-platform-filesystem-clients.md)。
 
-文件 wire 的 op 与授权输入直接共用 storage.Operation，解锁有独立的 storage.OpFileUnlock；普通与强锁 URL 则在路由规格中声明语义操作，传输名称不承担角色含义。每个请求一次入口回调，具体操作由业务方归组为角色。共享的 OpenAccess 同时表达读、写、创建、截断、排他创建，避免把复合打开拆成多个时刻的策略决定。锁模式不充当内容权限：只读 fd 的 EX flock 是合法操作，解锁和其它 cleanup 独立可控。volume.write 自身可能创建文件，不能只拒绝 create 就宣称禁止创建。
+file wire 与授权直接共用 storage.Operation，范围修改、owner 退役、查询、取消和关闭各有独立动作。固定操作的 Effects／Claim 在一次入口 callback 中完整提供，不拆成多个时刻的策略决定；平台模式不充当内容权限。FUSE 的只读 fd 可取得 EX flock，cleanup 仍分别可控。volume.write 自身可能创建文件，不能只拒绝 create 就宣称禁止创建。
 
 通用的有界传输 admission 可先限制策略调用与错误响应占用；授权先于受控 capability、动作回执、Log、订阅与 snapshot 捕获。已有 capability 仍是 bearer，重复请求也要检查；拒绝核对只说明本次尝试未获准，不抹去原动作的未知结果。服务器自己的 expiry 和 shutdown 回收独立于调用者的 cleanup 权限。
 

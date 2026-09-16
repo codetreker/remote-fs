@@ -2,8 +2,9 @@ package httprest_test
 
 import (
 	"encoding/json"
-	"io/fs"
 	"math"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,74 +12,98 @@ import (
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
+func messageAttr(t *testing.T, a storage.Attr) *httprest.Attr {
+	t.Helper()
+	wire, err := httprest.AttrOf(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
+}
+func messageChange(t *testing.T, c storage.AttrChange) *httprest.AttrChange {
+	t.Helper()
+	wire, err := httprest.AttrChangeOf(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
+}
+func messageEntries(t *testing.T, entries []storage.Entry) []httprest.Entry {
+	t.Helper()
+	wire, err := httprest.EntriesOf(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
+}
+
 func TestAttrSurvivesJSON(t *testing.T) {
+	created, changed := time.Unix(2, 3), time.Unix(4, 5)
 	cases := []storage.Attr{
-		{ID: 9, Mode: 0o644, Size: 0, AccessTime: time.Unix(0, 0), ModTime: time.Unix(0, 0)},
-		{ID: 9, Mode: fs.ModeDir | 0o755, Size: 4096, AccessTime: time.Now(), ModTime: time.Now()},
-		{ID: 9, Mode: 0o600, Size: 1 << 40, AccessTime: time.Unix(1600000000, 1), ModTime: time.Unix(1755000000, 123456789)},
-		{ID: 9, Mode: 0o755 | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky, Size: 1},
+		{ID: 9, Kind: storage.NodeRegular, MetadataRevision: 1, AccessTime: time.Unix(0, 0), ModTime: time.Unix(0, 0)},
+		{ID: 9, Kind: storage.NodeDirectory, MetadataRevision: 2, DirectoryRevision: 3, AccessTime: time.Now(), ModTime: time.Now()},
+		{ID: 9, Kind: storage.NodeRegular, MetadataRevision: 4, Size: 1 << 40, AccessTime: time.Unix(1600000000, 1), ModTime: time.Unix(1755000000, 123456789)},
+		{ID: 9, Kind: storage.NodeSymlink, MetadataRevision: 5, Size: 1, CreationTime: &created, ChangeTime: &changed, Metadata: storage.Metadata{{Key: "client", Version: 7, Data: []byte{0, 255, 1}}}},
 	}
 	for _, want := range cases {
-		encoded, err := json.Marshal(httprest.AttrOf(want))
+		encoded, err := json.Marshal(messageAttr(t, want))
 		if err != nil {
-			t.Fatalf("marshal %+v: %v", want, err)
+			t.Fatal(err)
 		}
 		var wire httprest.Attr
 		if err := json.Unmarshal(encoded, &wire); err != nil {
-			t.Fatalf("unmarshal %s: %v", encoded, err)
+			t.Fatal(err)
 		}
-		got := wire.Storage()
-		if got.Mode != want.Mode || got.Size != want.Size ||
-			!got.AccessTime.Equal(want.AccessTime) || !got.ModTime.Equal(want.ModTime) {
-			t.Fatalf("round trip of %+v through %s gave %+v", want, encoded, got)
-		}
-		if got.IsDir() != want.IsDir() {
-			t.Fatalf("round trip lost the directory bit of %v", want.Mode)
+		got, err := wire.Storage()
+		if err != nil || !reflect.DeepEqual(got.Clone(), want.Clone()) || got.IsDir() != want.IsDir() {
+			t.Fatalf("roundtrip of %+v through %s = %+v %v", want, encoded, got, err)
 		}
 	}
 }
 
-// A change is defined by what it does not name as much as by what it does, so absence has
-// to survive the crossing. A field that came back as a zero value instead would turn a
-// request to set the modification time into a chmod 000 dated the epoch.
 func TestAnAttrChangeSurvivesJSON(t *testing.T) {
-	mode := fs.FileMode(0o750) | fs.ModeSetgid
+	metadata := storage.Metadata{{Key: "client", Version: 2, Data: []byte{0, 255}}}
+	empty := storage.Metadata{}
 	accessed := time.Unix(-2208988800, 7)
 	changed := time.Unix(1755000000, 123456789)
 	cases := map[string]storage.AttrChange{
-		"nothing at all":       {},
-		"the mode alone":       {Mode: &mode},
-		"the access time":      {AccessTime: &accessed},
-		"the modification one": {ModTime: &changed},
-		"both times":           {AccessTime: &accessed, ModTime: &changed},
-		"everything":           {Mode: &mode, AccessTime: &accessed, ModTime: &changed},
+		"nothing at all": {}, "metadata alone": {ExpectedRevision: 3, Metadata: &metadata}, "clear metadata": {ExpectedRevision: 3, Metadata: &empty},
+		"the access time": {AccessTime: &accessed}, "the modification one": {ModTime: &changed}, "both times": {AccessTime: &accessed, ModTime: &changed},
+		"everything": {ExpectedRevision: 3, Metadata: &metadata, AccessTime: &accessed, ModTime: &changed, CreationTime: &accessed, ChangeTime: &changed},
 	}
 	for name, want := range cases {
 		t.Run(name, func(t *testing.T) {
-			encoded, err := json.Marshal(httprest.SetAttrRequest{Change: httprest.AttrChangeOf(want)})
+			encoded, err := json.Marshal(httprest.SetAttrRequest{Change: messageChange(t, want)})
 			if err != nil {
-				t.Fatalf("marshal: %v", err)
+				t.Fatal(err)
 			}
 			var request httprest.SetAttrRequest
 			if err := json.Unmarshal(encoded, &request); err != nil {
-				t.Fatalf("unmarshal %s: %v", encoded, err)
+				t.Fatal(err)
 			}
-			got := request.Change.Storage()
-
-			if (got.Mode == nil) != (want.Mode == nil) {
-				t.Fatalf("round trip through %s changed whether the mode is named", encoded)
+			got, err := request.Change.Storage()
+			if err != nil {
+				t.Fatal(err)
 			}
-			if got.Mode != nil && *got.Mode != *want.Mode {
-				t.Fatalf("mode round-tripped through %s as %v, want %v", encoded, *got.Mode, *want.Mode)
+			if got.ExpectedRevision != want.ExpectedRevision || (got.Metadata == nil) != (want.Metadata == nil) {
+				t.Fatalf("metadata presence/revision changed: %+v", got)
 			}
-			for _, times := range [][2]*time.Time{
-				{got.AccessTime, want.AccessTime}, {got.ModTime, want.ModTime},
-			} {
-				if (times[0] == nil) != (times[1] == nil) {
-					t.Fatalf("round trip through %s changed whether a time is named", encoded)
+			if got.Metadata != nil {
+				actual, e := storage.EncodeMetadata(*got.Metadata)
+				if e != nil {
+					t.Fatal(e)
 				}
-				if times[0] != nil && !times[0].Equal(*times[1]) {
-					t.Fatalf("a time round-tripped through %s as %v, want %v", encoded, *times[0], *times[1])
+				expected, e := storage.EncodeMetadata(*want.Metadata)
+				if e != nil {
+					t.Fatal(e)
+				}
+				if string(actual) != string(expected) {
+					t.Fatalf("opaque metadata changed: %v != %v", actual, expected)
+				}
+			}
+			for _, pair := range [][2]*time.Time{{got.AccessTime, want.AccessTime}, {got.ModTime, want.ModTime}, {got.CreationTime, want.CreationTime}, {got.ChangeTime, want.ChangeTime}} {
+				if (pair[0] == nil) != (pair[1] == nil) || pair[0] != nil && !pair[0].Equal(*pair[1]) {
+					t.Fatalf("optional time changed through %s: %v", encoded, pair)
 				}
 			}
 		})
@@ -87,101 +112,82 @@ func TestAnAttrChangeSurvivesJSON(t *testing.T) {
 
 func TestEntriesSurviveJSON(t *testing.T) {
 	want := []storage.Entry{
-		{Name: "a file", Attr: storage.Attr{ID: 9, Mode: 0o644, Size: 3, AccessTime: time.Unix(9, 0), ModTime: time.Unix(1, 0)}},
-		{Name: "日本語", Attr: storage.Attr{ID: 9, Mode: fs.ModeDir | 0o755, ModTime: time.Unix(2, 0)}},
-		{Name: "\xff not utf-8", Attr: storage.Attr{ID: 9, Mode: 0o600, Size: 7, ModTime: time.Unix(3, 0)}},
+		{Name: "a file", Attr: storage.Attr{ID: 9, Kind: storage.NodeRegular, MetadataRevision: 1, Size: 3, AccessTime: time.Unix(9, 0), ModTime: time.Unix(1, 0)}},
+		{Name: "中文", Attr: storage.Attr{ID: 10, Kind: storage.NodeDirectory, MetadataRevision: 2, DirectoryRevision: 1, ModTime: time.Unix(2, 0)}},
+		{Name: "\xff not utf-8", Attr: storage.Attr{ID: 11, Kind: storage.NodeRegular, MetadataRevision: 3, Size: 7, ModTime: time.Unix(3, 0), Metadata: storage.Metadata{{Key: "application", Version: 1, Data: []byte{255, 0}}}}},
 	}
-	encoded, err := json.Marshal(httprest.ListResponse{Entries: httprest.EntriesOf(want)})
+	encoded, err := json.Marshal(httprest.ListResponse{Entries: messageEntries(t, want)})
 	if err != nil {
-		t.Fatalf("marshal: %v", err)
+		t.Fatal(err)
 	}
-	var resp httprest.ListResponse
-	if err := json.Unmarshal(encoded, &resp); err != nil {
-		t.Fatalf("unmarshal %s: %v", encoded, err)
+	var response httprest.ListResponse
+	if err := json.Unmarshal(encoded, &response); err != nil {
+		t.Fatal(err)
 	}
-	got := resp.Storage()
-	if len(got) != len(want) {
-		t.Fatalf("round trip of %d entries gave %d: %s", len(want), len(got), encoded)
+	got, err := response.Storage()
+	if err != nil || len(got) != len(want) {
+		t.Fatalf("entries=%+v %v", got, err)
 	}
 	for i := range want {
-		if got[i].Name != want[i].Name {
-			t.Fatalf("entry %d round-tripped as name %q, want %q (wire form %s)", i, got[i].Name, want[i].Name, encoded)
-		}
-		if got[i].Attr.Mode != want[i].Attr.Mode || got[i].Attr.Size != want[i].Attr.Size {
-			t.Fatalf("entry %d round-tripped as %+v, want %+v", i, got[i], want[i])
-		}
-		if !got[i].Attr.AccessTime.Equal(want[i].Attr.AccessTime) || !got[i].Attr.ModTime.Equal(want[i].Attr.ModTime) {
-			t.Fatalf("entry %d round-tripped with times %v and %v, want %v and %v", i,
-				got[i].Attr.AccessTime, got[i].Attr.ModTime, want[i].Attr.AccessTime, want[i].Attr.ModTime)
+		if got[i].Name != want[i].Name || !reflect.DeepEqual(got[i].Attr.Clone(), want[i].Attr.Clone()) {
+			t.Fatalf("entry %d changed: %+v != %+v", i, got[i], want[i])
 		}
 	}
 }
 
-// An empty directory must encode as an empty list, never as JSON null: null and "no
-// answer" are too easy to confuse on the far side.
 func TestAnEmptyListingEncodesAsAList(t *testing.T) {
-	encoded, err := json.Marshal(httprest.ListResponse{Entries: httprest.EntriesOf(nil)})
+	encoded, err := json.Marshal(httprest.ListResponse{Entries: messageEntries(t, nil)})
 	if err != nil {
-		t.Fatalf("marshal: %v", err)
+		t.Fatal(err)
 	}
-	if want := `{"entries":[]}`; string(encoded) != want {
-		t.Fatalf("an empty listing encodes as %s, want %s", encoded, want)
+	if string(encoded) != `{"entries":[]}` {
+		t.Fatalf("empty listing=%s", encoded)
 	}
 }
 
-// A time outside 1678-09-21 to 2262-04-11 is where time.Time.UnixNano is undefined, and
-// what it produces there is not an error but a different, entirely plausible date. A
-// filesystem hands times to whatever walks the tree — a build system deciding what is
-// stale, an archiver deciding what changed — so a wrong one that looks right is the answer
-// this system is least able to survive. Both directions are checked: a time being reported
-// and a time being set.
 func TestATimeOutsideTheNanosecondRange(t *testing.T) {
-	cases := map[string]time.Time{
-		"the zero time":                     {},
-		"the last year UnixNano can hold":   time.Date(2262, 4, 11, 23, 47, 16, 854775807, time.UTC),
-		"the first year it cannot":          time.Date(2262, 4, 12, 0, 0, 0, 1, time.UTC),
-		"a time before the epoch":           time.Date(1600, 3, 4, 5, 6, 7, 89, time.UTC),
-		"a time this system may outlive":    time.Date(2500, 1, 2, 3, 4, 5, 678, time.UTC),
-		"the far future":                    time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC),
-		"a date archives are known to hold": time.Date(-4000, 1, 1, 0, 0, 0, 0, time.UTC),
-	}
+	cases := map[string]time.Time{"the zero time": {}, "the last year UnixNano can hold": time.Date(2262, 4, 11, 23, 47, 16, 854775807, time.UTC), "the first year it cannot": time.Date(2262, 4, 12, 0, 0, 0, 1, time.UTC), "a time before the epoch": time.Date(1600, 3, 4, 5, 6, 7, 89, time.UTC), "a time this system may outlive": time.Date(2500, 1, 2, 3, 4, 5, 678, time.UTC), "the far future": time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC), "a date archives are known to hold": time.Date(-4000, 1, 1, 0, 0, 0, 0, time.UTC)}
 	for name, want := range cases {
 		t.Run("reported "+name, func(t *testing.T) {
-			encoded, err := json.Marshal(httprest.AttrOf(storage.Attr{ID: 9, AccessTime: want, ModTime: want}))
+			encoded, err := json.Marshal(messageAttr(t, storage.Attr{ID: 9, Kind: storage.NodeRegular, MetadataRevision: 1, AccessTime: want, ModTime: want, CreationTime: &want, ChangeTime: &want}))
 			if err != nil {
-				t.Fatalf("marshal: %v", err)
+				t.Fatal(err)
 			}
 			var wire httprest.Attr
 			if err := json.Unmarshal(encoded, &wire); err != nil {
-				t.Fatalf("unmarshal %s: %v", encoded, err)
+				t.Fatal(err)
 			}
-			got := wire.Storage()
-			if !got.ModTime.Equal(want) || !got.AccessTime.Equal(want) {
-				t.Fatalf("%v round-tripped through %s as %v and %v", want, encoded, got.AccessTime, got.ModTime)
+			got, err := wire.Storage()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, instant := range []*time.Time{&got.AccessTime, &got.ModTime, got.CreationTime, got.ChangeTime} {
+				if instant == nil || !instant.Equal(want) {
+					t.Fatalf("time %v through %s became %v", want, encoded, instant)
+				}
 			}
 		})
 		t.Run("set to "+name, func(t *testing.T) {
-			encoded, err := json.Marshal(httprest.SetAttrRequest{
-				Change: httprest.AttrChangeOf(storage.AttrChange{AccessTime: &want, ModTime: &want}),
-			})
+			encoded, err := json.Marshal(httprest.SetAttrRequest{Change: messageChange(t, storage.AttrChange{AccessTime: &want, ModTime: &want, CreationTime: &want, ChangeTime: &want})})
 			if err != nil {
-				t.Fatalf("marshal: %v", err)
+				t.Fatal(err)
 			}
 			var request httprest.SetAttrRequest
 			if err := json.Unmarshal(encoded, &request); err != nil {
-				t.Fatalf("unmarshal %s: %v", encoded, err)
+				t.Fatal(err)
 			}
-			got := request.Change.Storage()
-			if !got.ModTime.Equal(want) || !got.AccessTime.Equal(want) {
-				t.Fatalf("%v round-tripped through %s as %v and %v", want, encoded, *got.AccessTime, *got.ModTime)
+			got, err := request.Change.Storage()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, instant := range []*time.Time{got.AccessTime, got.ModTime, got.CreationTime, got.ChangeTime} {
+				if instant == nil || !instant.Equal(want) {
+					t.Fatalf("set time %v through %s became %v", want, encoded, instant)
+				}
 			}
 		})
 	}
 }
-
-// The three counts a space report carries are byte counts whose zero is a legitimate
-// figure, so a field lost on the way across cannot be told from one that says nothing is
-// there. The shape is what tells them apart, and the decoding is what refuses it.
 func TestASpaceReportSurvivesJSON(t *testing.T) {
 	cases := []storage.Space{
 		{},
@@ -243,135 +249,99 @@ func TestABodyThatCarriesNoSpaceReport(t *testing.T) {
 	}
 }
 
-// Absence has to be visible in the shape of a body, because it is not visible in the
-// values once they have been read: a zero Attr reads as a regular file of length 0 dated
-// the epoch, and a file whose mode really is 0 is a legitimate answer with exactly those
-// values. Only the shape tells the two apart, and it is the decoding that refuses it, so
-// that no reader of these messages has to remember to.
 func TestABodyThatCarriesNoAttributes(t *testing.T) {
-	statCases := map[string]bool{
-		`{}`:             false,
-		`null`:           false,
-		`{"attr":null}`:  false,
-		`{"entries":[]}`: false,
-		// Attributes carrying no identity are an absence too, and the one that does not
-		// show in the shape of the body: every comparison of a zero identity above
-		// returns equal, so a peer that omits it reads as saying every node is one node.
-		`{"attr":{"mode":0}}`:                          false,
-		`{"attr":{"id":0,"mode":420,"size":7}}`:        false,
-		`{"attr":{"id":9,"mode":0}}`:                   true,
-		`{"attr":{"id":9,"mode":420,"size":7}}`:        true,
-		`{"attr":{"id":9,"mode":420},"entries":[]}`:    true,
-		`{"attr":{"id":9,"mode":2147484141,"size":0}}`: true,
-	}
+	attr := `{"id":9,"kind":1,"size":0,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0},"metadata_revision":1,"directory_revision":0,"metadata":"UkZNAQAA"}`
+	statCases := map[string]bool{`{}`: false, `null`: false, `{"attr":null}`: false, `{"entries":[]}`: false, `{"attr":{"kind":1}}`: false, `{"attr":{"id":0,"kind":1,"size":7}}`: false, `{"attr":` + attr + `}`: true, `{"attr":` + attr + `,"entries":[]}`: true, `{"attr":` + strings.Replace(attr, `"id":9`, `"id":0`, 1) + `}`: false, `{"attr":` + strings.Replace(attr, `"metadata_revision":1`, `"metadata_revision":0`, 1) + `}`: false}
 	for body, want := range statCases {
 		t.Run("stat "+body, func(t *testing.T) {
-			var resp httprest.StatResponse
-			err := json.Unmarshal([]byte(body), &resp)
-			if got := err == nil; got != want {
-				t.Fatalf("%s decoded as %+v, %v", body, resp.Attr, err)
+			var response httprest.StatResponse
+			err := json.Unmarshal([]byte(body), &response)
+			if (err == nil) != want {
+				t.Fatalf("body=%s attr=%+v err=%v", body, response.Attr, err)
 			}
 		})
 	}
-
-	listCases := map[string]bool{
-		`{}`:                            false,
-		`{"entries":null}`:              false,
-		`{"entries":[{"name":"Zg=="}]}`: false,
-		`{"entries":[{"name":"Zg==","attr":null}]}`:  false,
-		`{"entries":[{"name":7,"attr":{"mode":0}}]}`: false,
-		`{"entries":[]}`: true,
-		`{"entries":[{"name":"Zg==","attr":{"mode":0}}]}`:        false,
-		`{"entries":[{"name":"Zg==","attr":{"id":9,"mode":0}}]}`: true,
-	}
+	listCases := map[string]bool{`{}`: false, `{"entries":null}`: false, `{"entries":[{"name":"Zg=="}]}`: false, `{"entries":[{"name":"Zg==","attr":null}]}`: false, `{"entries":[{"name":7,"attr":` + attr + `}]}`: false, `{"entries":[]}`: true, `{"entries":[{"name":"Zg==","attr":{"kind":1}}]}`: false, `{"entries":[{"name":"Zg==","attr":` + attr + `}]}`: true}
 	for body, want := range listCases {
 		t.Run("list "+body, func(t *testing.T) {
-			var resp httprest.ListResponse
-			err := json.Unmarshal([]byte(body), &resp)
-			if got := err == nil; got != want {
-				t.Fatalf("%s decoded as %+v, %v", body, resp.Entries, err)
+			var response httprest.ListResponse
+			err := json.Unmarshal([]byte(body), &response)
+			if (err == nil) != want {
+				t.Fatalf("body=%s entries=%+v err=%v", body, response.Entries, err)
 			}
 		})
 	}
-
-	// A change naming nothing is a legitimate request — it asks whether the node is there
-	// — so the values cannot tell a whole body from one that lost its contents. Only the
-	// enclosing object can.
-	setAttrCases := map[string]bool{
-		`{}`:                         false,
-		`null`:                       false,
-		`{"change":null}`:            false,
-		`{"change":{"mode":"0644"}}`: false,
-		`{"change":{}}`:              true,
-		`{"change":{"mode":0}}`:      true,
-		`{"change":{"mod_time":{"unix_sec":-1,"nanos":1}}}`: true,
-	}
+	setAttrCases := map[string]bool{`{}`: false, `null`: false, `{"change":null}`: false, `{"change":{"mode":"0644"}}`: false, `{"change":{}}`: false, `{"change":{"expected_revision":0}}`: true, `{"change":{"expected_revision":0,"mod_time":{"unix_sec":-1,"nanos":1}}}`: true}
 	for body, want := range setAttrCases {
 		t.Run("setattr "+body, func(t *testing.T) {
 			var request httprest.SetAttrRequest
 			err := json.Unmarshal([]byte(body), &request)
-			if got := err == nil; got != want {
-				t.Fatalf("%s decoded as %+v, %v", body, request.Change, err)
+			if (err == nil) != want {
+				t.Fatalf("body=%s change=%+v err=%v", body, request.Change, err)
 			}
 		})
 	}
 }
 
-// The wire form is the contract between the two sides, so it is pinned here rather than
-// left to whatever the struct tags happen to say: a field renamed on one side alone
-// arrives as absence on the other, which is a failure this protocol reports but a
-// needless one to walk into.
 func TestTheWireForm(t *testing.T) {
-	attr := storage.Attr{
-		ID:         77,
-		Mode:       fs.ModeDir | 0o755,
-		Size:       4096,
-		AccessTime: time.Unix(1700000000, 1),
-		ModTime:    time.Unix(1755000000, 123456789),
-	}
-	encoded, err := json.Marshal(httprest.StatResponse{Attr: httprest.AttrOf(attr)})
+	attr := storage.Attr{ID: 77, Kind: storage.NodeDirectory, MetadataRevision: 2, DirectoryRevision: 3, AccessTime: time.Unix(1700000000, 1), ModTime: time.Unix(1755000000, 123456789)}
+	encoded, err := json.Marshal(httprest.StatResponse{Attr: messageAttr(t, attr)})
 	if err != nil {
-		t.Fatalf("marshal: %v", err)
+		t.Fatal(err)
 	}
-	want := `{"attr":{"id":77,"mode":2147484141,"size":4096,` +
-		`"access_time":{"unix_sec":1700000000,"nanos":1},` +
-		`"mod_time":{"unix_sec":1755000000,"nanos":123456789}}}`
+	want := `{"attr":{"id":77,"kind":2,"size":0,"access_time":{"unix_sec":1700000000,"nanos":1},"mod_time":{"unix_sec":1755000000,"nanos":123456789},"metadata_revision":2,"directory_revision":3,"metadata":"UkZNAQAA"}}`
 	if string(encoded) != want {
-		t.Fatalf("a stat answer encodes as %s, want %s", encoded, want)
+		t.Fatalf("stat wire=%s want=%s", encoded, want)
 	}
-
-	// An attribute the change does not name is absent from the body rather than present
-	// with a value standing for "unchanged". There is no such value: every mode and every
-	// instant is one a caller may ask for.
-	mode := fs.FileMode(0o600)
+	metadata := storage.Metadata{}
 	changed := time.Unix(1755000000, 123456789)
-	encoded, err = json.Marshal(httprest.SetAttrRequest{
-		Change: httprest.AttrChangeOf(storage.AttrChange{Mode: &mode, ModTime: &changed}),
-	})
+	encoded, err = json.Marshal(httprest.SetAttrRequest{Change: messageChange(t, storage.AttrChange{ExpectedRevision: 2, Metadata: &metadata, ModTime: &changed})})
 	if err != nil {
-		t.Fatalf("marshal: %v", err)
+		t.Fatal(err)
 	}
-	want = `{"change":{"mode":384,"mod_time":{"unix_sec":1755000000,"nanos":123456789}}}`
+	want = `{"change":{"expected_revision":2,"metadata":"UkZNAQAA","mod_time":{"unix_sec":1755000000,"nanos":123456789}}}`
 	if string(encoded) != want {
-		t.Fatalf("a mode-and-time change encodes as %s, want %s", encoded, want)
+		t.Fatalf("metadata-time wire=%s want=%s", encoded, want)
 	}
-
-	encoded, err = json.Marshal(httprest.SetAttrRequest{Change: httprest.AttrChangeOf(storage.AttrChange{})})
+	encoded, err = json.Marshal(httprest.SetAttrRequest{Change: messageChange(t, storage.AttrChange{})})
 	if err != nil {
-		t.Fatalf("marshal: %v", err)
+		t.Fatal(err)
 	}
-	if want := `{"change":{}}`; string(encoded) != want {
-		t.Fatalf("a change naming nothing encodes as %s, want %s", encoded, want)
+	if string(encoded) != `{"change":{"expected_revision":0}}` {
+		t.Fatalf("empty change=%s", encoded)
 	}
-
-	// Every count is written out, zero included: they are pointers so that an absent one
-	// can be refused, and omitting the zeroes would send exactly the shape that refusal
-	// exists to catch.
 	encoded, err = json.Marshal(httprest.SpaceResponse{Space: httprest.SpaceOf(storage.Space{Total: 4096})})
 	if err != nil {
-		t.Fatalf("marshal: %v", err)
+		t.Fatal(err)
 	}
-	if want := `{"space":{"total":4096,"used":0,"avail":0}}`; string(encoded) != want {
-		t.Fatalf("a space report encodes as %s, want %s", encoded, want)
+	if string(encoded) != `{"space":{"total":4096,"used":0,"avail":0}}` {
+		t.Fatalf("space=%s", encoded)
+	}
+}
+
+func TestSetAttrRequestRejectsMalformedChangesBeforeDispatch(t *testing.T) {
+	cases := map[string]string{
+		"removed mode":       `{"change":{"expected_revision":0,"mode":420}}`,
+		"missing revision":   `{"change":{}}`,
+		"missing seconds":    `{"change":{"expected_revision":0,"mod_time":{"nanos":0}}}`,
+		"missing nanos":      `{"change":{"expected_revision":0,"mod_time":{"unix_sec":0}}}`,
+		"negative nanos":     `{"change":{"expected_revision":0,"mod_time":{"unix_sec":0,"nanos":-1}}}`,
+		"overflow nanos":     `{"change":{"expected_revision":0,"mod_time":{"unix_sec":0,"nanos":1000000000}}}`,
+		"null optional time": `{"change":{"expected_revision":0,"mod_time":null}}`,
+		"null metadata":      `{"change":{"expected_revision":1,"metadata":null}}`,
+		"corrupt metadata":   `{"change":{"expected_revision":1,"metadata":"AA=="}}`,
+		"unknown":            `{"change":{"expected_revision":0,"extra":1}}`,
+		"duplicate revision": `{"change":{"expected_revision":0,"expected_revision":0}}`,
+		"duplicate change":   `{"change":{"expected_revision":0},"change":{"expected_revision":0}}`,
+		"wrong case":         `{"change":{"Expected_revision":0}}`,
+		"trailing":           `{"change":{"expected_revision":0}}{}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			var request httprest.SetAttrRequest
+			if err := json.Unmarshal([]byte(body), &request); err == nil {
+				t.Fatalf("malformed change accepted: %s", body)
+			}
+		})
 	}
 }

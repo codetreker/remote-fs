@@ -8,7 +8,7 @@ Windows 上未经修改的程序需要访问远端 volume，集成方需要把�
 
 目标系统为 Windows 11 24H2 及更新版本。业务程序拥有远端连接、访问身份和进程生命周期，系统中的其它用户不能仅凭同机连接取得访问权限。Windows Server 不属于增加的验收平台。文件身份、同步确认、可见性和错误保证继续适用。
 
-本决定记录已经实现的本机 SMB 与 Windows 专用权威方案及其代价。[需求](../../../../docs/spec/requirements.md)中的 R-FS-9、R-INT-8、R-INT-14 已将平台解释限定在客户端；本决定中的持久命名启用、公共 Windows 接口与专用远端动作尚不符合该边界，由[平台客户端隔离提案](../../proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)承接待实施的替换。协议引擎、宿主所有权和已有运行证据仍由本决定记录，R-CC-14 的跨入口保护保持。
+本决定拥有本机 SMB 引擎、身份、映射、通知与缓存边界的取舍。建立这项接入时，Windows 专用 authority 和持久命名 policy 用于集中共享与名字约束；这些跨层机制由[平台客户端隔离决定](../architecture/2026-09-16-isolate-platform-filesystem-clients.md)取代。该决定保留通用权威保护，把平台解释放回客户端；本页继续记录原选择的理由、仍有效的本机机制与未通过的原生验收。
 
 ## 决定
 
@@ -23,22 +23,22 @@ Windows 应用 → 系统 SMB 客户端 → loopback SMB
                                   |
                              packages/smb
                                   |
-                 WindowsStorage + 宿主注入的 ChangeSource
+                 通用 FileStorage + 宿主注入的 ChangeSource
                                   |
                       HTTP／SSE → 远端 authority
 ```
 
 SMB 核心依赖 storage、metastore 和 authz，不导入 HTTP、SQLite、FUSE 或 CLI。`Share.Backend` 与 `Share.Changes` 分别提供权威操作和同源的 Subscribe／Resume／Checkpoint。现有集成使用 HTTP 与 SSE，宿主也可以提供满足相同契约的来源；backend 和变更流必须指向同一 authority。把这份关系留在宿主配置中，避免协议引擎拥有另一套远端连接或目录副本。
 
-`New` 校验显式配置；`Serve` 接受宿主交付的 loopback TCP listener。`Publish` 检查 backend 的 Windows 能力、已启用状态及观察预算，并拥有该 Export 的观察器。映射、Export、Server 与外部 backend 分别关闭：普通 `Unpublish` 在仍有打开对象或活跃请求时返回 busy，清理失败保留停止中的所有权；`Shutdown` 停止接纳并等待自己拥有的资源。调用方拥有的 backend 不随某个 share 停止而关闭。
+`New` 校验显式配置，`Serve` 接受宿主交付的 loopback TCP listener。Publish 检查通用 FileStorage、volume 身份及观察预算，并拥有 Export 的观察器；它不安装全 volume 命名策略。映射、Export、Server 与外部 backend 分别关闭：Unpublish 在仍有打开对象或活跃请求时返回 busy，清理失败保留停止中的所有权；Shutdown 停止接纳并等待自己拥有的资源，不关闭调用方的 backend。
 
-系统客户端的保留 `IPC$` 连接由独立控制树表示，不能把它配置成一个业务 volume Export。它只接受已认证、通过签名校验的 session，计入同一 MaxTrees 预算并遵守 session/tree 清理。pipe-share 响应不代表实现了管道对象；控制树没有 volume backend、WindowsSession、通知或发现接口，不制造一个 volume 身份来请求业务授权。它正常处理 TREE_DISCONNECT，session 的 ECHO／LOGOFF 保持原义；未支持的 pipe、RPC 与控制命令明确失败。已发布 volume 的授权和后端访问保持原有路径。
+系统客户端的保留 `IPC$` 连接由独立控制树表示，不能把它配置成一个业务 volume Export。它只接受已认证、通过签名校验的 session，计入同一 MaxTrees 预算并遵守 session/tree 清理。pipe-share 响应不代表实现了管道对象；控制树没有 volume backend、FileSession、通知或发现接口，不制造一个 volume 身份来请求业务授权。它正常处理 TREE_DISCONNECT，session 的 ECHO／LOGOFF 保持原义；未支持的 pipe、RPC 与控制命令明确失败。已发布 volume 的授权和后端访问保持原有路径。
 
 ### 本机身份与显式映射
 
 [`packages/smb/windows`](../../../../packages/smb/windows/auth.go) 使用真实 SSPI Negotiate 交换取得 token 身份和 session key，每次 Begin 持有独立的 native credentials/context。匿名、guest、无可用签名密钥的交换被拒绝。连接允许一次严格限定的 SMB1 帧形状 multi-protocol NEGOTIATE 前导：必须包含 `SMB 2.???`，wildcard `0x02ff` 响应之后仍须进入真正的 SMB2 格式协商，期间不建立认证会话或接纳文件操作。正式 dialect 只接受 SMB 3.1.1、SHA-512 preauthentication integrity 与 AES-CMAC signing，hash 从正式协商开始，正常会话要求签名。这个入口只处理系统客户端的协商前导，不提供 SMB1 文件操作或旧版 Windows 支持；重复前导被拒绝。同步 SSPI 调用返回后仍检查取消，Close 与已进入的原生调用串行收尾，不把取消解释成原生工作已经停止。
 
-本机 Authenticator 与 Authorizer 是必填配置。`CurrentUserSID` 和 `AllowSID` 提供明确的挂载者 SID 策略；业务也可以注入自己的策略。可信 `Share.Volume` 由宿主配置，对已发布 volume 的访问在本机身份放入请求 context 后逐次授权，WindowsOpenIntent 保留数据、metadata、delete 与共享意图。远端 HTTP 身份由业务 transport 管理，两端授权各自执行；令牌和签名密钥不进入日志。凭据轮换不能替换既有会话的已验证身份，重新认证必须保持同一 SID。
+本机 Authenticator 与 Authorizer 必填。CurrentUserSID／AllowSID 提供已验证 SID 的显式策略，业务可注入自己的策略。可信 Share.Volume 由宿主配置；本地解释完整 Windows intent 后，以通用 Effects、Claim 与目标身份授权。远端 HTTP 身份由业务 transport 管理，两端授权独立；token 和签名 key 不进入日志。凭据轮换不替换现有会话已验证身份，重新认证必须遵守 SID 规则。
 
 SMB SessionID 在每个 Server 实例内跨连接统一分配且不复用；它不是 OS 的登录 SessionID。SESSION_SETUP.Channel 按保留字段忽略，binding flag 仍不受支持。只有新认证成功且认证 context 完成收尾后，才使用最终成功请求的 PreviousSessionId：不存在、属于其它 SID 或指向当前候选 session 的值被忽略；同 SID 的旧 session 由原拥有者退役、排空并清理。清理失败阻止新身份激活并保留旧所有权。这支持会话替换的协议顺序，不恢复旧 tree、FileId、durable handle 或 multichannel。
 
@@ -50,35 +50,31 @@ Windows 的同一 server／transport 映射共用一个端口，宿主为各 Exp
 
 普通 `Unmount` 使用非强制移除，有打开文件时保留映射并返回 busy。`ForceUnmount` 是明确的破坏性断开，不保证在途 I/O 成功或远端结果已确认。二者都不关闭 Export／Server。[WNetCancelConnection2W](https://learn.microsoft.com/en-us/windows/win32/api/winnetwk/nf-winnetwk-wnetcancelconnection2w)的按登录映射与 force 行为，是这些所有权限制的依据。
 
-### 同一权威中的访问、身份与结果
+### 平台解释与同一权威
 
-[`WindowsStorage`、`WindowsSession`、`WindowsFile`](../../../../packages/storage/windows_contract.go) 表达保留文件／目录、metadata-only 打开、六种 disposition、share/access、delete-pending、范围批次和原动作核对。父目录身份与 leaf、ExpectedID 和保留引用进入最终操作，避免客户端先查路径再修改时命中替代对象。稳定 node ID 与一次 SMB open 的 FileId 分开；改名、unlink 或同名替换不转移旧引用的身份。
+当时选择 WindowsStorage／WindowsSession／WindowsFile，是为了让父身份、共享、delete-pending 与批次效果进入同一原生发布门，使 Linux／HTTP 不能绕过限制；本机锁表不能约束另一台机器。其代价是平台规则进入公共 storage、HTTP 和数据库。[平台客户端隔离决定](../architecture/2026-09-16-isolate-platform-filesystem-clients.md)以固定共同原语承接保护，保留这一跨入口保证。
 
-共享检查是双向的，Windows 范围限制与 I/O 在原生 authority 排序。SQLite、objectstore、localstore、locked、limited 及 HTTP 传递同一语义，已有 Linux／HTTP 路径和普通文件入口也遵守生效中的 Windows 约束。Windows 强制范围锁、POSIX/flock advisory 和显式 S/X 各保留自己的规则；本机锁表无法约束另一台机器，故不作为共享状态的权威。
+SMB 内部保存 Windows intent、错误和 range planner，通用 FileSession 提供 Retain／条件创建重置、claims、范围 CAS、Prepared／drain 和原动作结果。NodeID 与 SMB FileId 分开，EntryID 随 rename，unlink 后引用不转向替代物。READ 捕获同一属性与字节，修改等待远端确认，Close 不是首次提交。
 
-动作使用原 epoch-and-nonce 身份和有限历史。批量加锁冲突可撤回此前授予，批量解锁或某些后项错误可保留此前效果；receipt 的 Applied 数量和原错误一起保留。取消、重复请求或丢失响应通过原动作 QueryAction／CancelAction 核对，无法确定时返回 I/O failure 并 fence 受影响访问，不换新 ID 重做。SMB compound 按序执行，但不承诺将已完成子项回滚成未发生。[SMB 加锁](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/670c7eda-e683-4923-9477-414303959613)、[解锁](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/79eb3c91-563b-4d48-a51c-0974f9d144f8)与[CANCEL](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/57bae3d3-5dd7-4a5f-92cb-fc52e2087dad)的区别不能压缩成统一成功／失败布尔值。
+动作使用原 epoch／nonce；本地计划保留 Windows Applied 和部分错误，通用 receipt 确认 Effects 与状态。Unknown 由拥有计划的适配器显式 Query／Cancel 原 ID，HTTP 不自动核对或重新修改。本次 NotAdmitted 不否认此前未知效果；不能核对时 fence 并保留清理责任。[LOCK](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/670c7eda-e683-4923-9477-414303959613)、[UNLOCK](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/79eb3c91-563b-4d48-a51c-0974f9d144f8) 与 [CANCEL](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/57bae3d3-5dd7-4a5f-92cb-fc52e2087dad) 的顺序不能压缩成一个成功布尔值。
 
-READ 使用一次权威捕获的属性与范围字节；WRITE、截断和属性修改等待远端结果，关闭不是首次提交时机。会话续期与后台清理有自己的有限生命周期；远端重启或期限失效不按旧路径重开、不重取锁后复活旧引用。typed WindowsFailure 与符号 errno 保留 sharing violation、range conflict、delete-pending 等区别，未知或不可达不变成空目录、缺失文件或旧内容。具体状态机与资源归属见[文件句柄](../../../../docs/design/server/file-handles.md)和[Windows 接入设计](../../../../docs/design/client/windows-smb.md)。
+### 名字、链接与不可变通知
 
-### 命名、符号链接与不可变通知事实
+本机 SMB 使用同版本的完整有界目录投影与完整 ancestor witness，解释 Windows 名字、大小写和路径范围。其它入口可写入 Windows 无法表示的名字，相关 Windows 观察明确失败，旧身份 I/O 独立成立。初始方案的持久 policy 曾约束所有入口且卸载不撤销；这一代价由平台隔离决定消除，不代表放宽 R-CC-14。
 
-已实施方案由管理方逐个 volume 显式启用 Windows 命名能力，Publish 只检查状态。原生发布门内验证既有名字并提交 policy 1；固定 Unicode 15.0 simple uppercase 比较、保留设备名与表示限制随后约束所有入口。不兼容名字导致拒绝，不自动改名或隐藏；停止 share 不撤销 volume policy。这项持久限制是待替换方案的成本，不是当前 R-FS-9 对其它入口的要求。Windows 时间、DOS attributes 与符号链接目标保存在节点上，未启用 volume 的字节名字规则不因本机启动 SMB 自动变化。
+DOS 和目录链接 hint 位于 smb.windows opaque key；修改保留其它 key，缺席使用显式缺省，坏数据失败。符号链接目标是通用数据，SMB 在 Export 内解释并用 SetKind 原子转换空、唯一引用持有的节点。NodeID 和已有 S/X 保护保持，新的 Resolve 仍只接受普通文件；FUSE 呈现真实类型与稳定 inode，Readlink／Symlinker 仍拒绝。完整行为见[Windows 设计](../../../../docs/design/client/windows-smb.md#名字metadata-与符号链接)。
 
-完整名字同时受 65792 字节和 32767 UTF-16 code units 限制；目录移动也验证后代在新位置的完整路径。SetLink 在最终权威操作中把空、独占引用的文件或目录转换为符号链接，保持 ID 和目录链接标志，目标至多 4096 字节且不能逃出 volume。既有 ResourceRef 与有效 S/X grant 仍绑定原节点；新的按路径 Resolve 继续只接纳普通文件，不能把类型转换解释成旧 grant 已失效。Linux FUSE 报告真实类型并保持 inode，Readlink／Symlinker 仍为 `EOPNOTSUPP`。这项类型一致性不扩张 Linux 链接创建或解析能力。
+Notification 和同一 changes 行一起提交，使用事件时 SubjectKind、ChangeMask 与前后 Attr／metadata／EntryLocation 图像。SMB 本地分类目录符号链接，删除后仍不查当前树。rename 两半属于一组，覆盖目标的删除有自己的记录；无名对象不制造旧路径事件。复用 Position、predecessor 链、incarnation、保留窗口与 SSE，避免第二份日志的提交／裁剪关系。
 
-[`metastore.Notification`](../../../../packages/metastore/notification.go) 与原 changes 行一起提交：SubjectID、SubjectKind、Directory、精确 ChangeMask 和修改前后祖先链都是事件发生时的事实。删除仍保留 `Removed.Node=nil` 的复制含义；通知中的独立身份、类型与 Directory 标志足以过滤文件、目录和目录链接的名字变化。改名前后属于同一记录，覆盖目标的删除保留为自己的记录；无名对象的后续修改不制造旧路径事件。发送端不查询当前树来补历史路径。
-
-这份事实复用日志 Position、previous-position 连续链、incarnation、保留窗口与 SSE，不增加第二份需要协调提交和裁剪的日志。全局 Record 和 decoder 对 Change 的名字、来源名字、content key 与 canonical notification 原始变长字段总量限制为 512 KiB；通知另有 256 层祖先、64 KiB 名字和 256 KiB canonical 编码上限。长度进入生产前检查、result reservation、完整性检查与传输预算；不能先提交必需事实无法传递的修改。
-
-Export 建立订阅并追到固定 checkpoint 后才可健康服务。首次 CHANGE_NOTIFY 先暂存观察者，再取得 checkpoint B；保留 >B 的事件，后续同一 open 沿用原过滤器、递归范围与队列。按事件时的祖先身份生成相对路径，改名前后作为整组计入有界队列。历史缺口、无法表示或容量不足要求重新枚举；损坏或不可达报告真实故障。连续性恢复不能抹去原观察者已经失去历史的结果。通知是变更提示，不是 Windows 内核缓存一致性的证明。[CHANGE_NOTIFY](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/05869c32-39f0-4726-afc9-671b76ae5ca7)与[FILE_NOTIFY_INFORMATION](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-file_notify_information)规定其协议表示。
+Export 建立订阅并达到固定 checkpoint 后才健康。首次 CHANGE_NOTIFY 先登记观察者再取 B，保留 >B 的事件；同一 open 沿用过滤器、递归范围与队列。历史缺口或容量不足要求重新枚举，损坏／不可达报告真实故障；恢复连续性不抹去已丢历史的结果。通知不是 Windows 内核缓存一致性的证明。[CHANGE_NOTIFY](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/05869c32-39f0-4726-afc9-671b76ae5ca7) 与 [FILE_NOTIFY_INFORMATION](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-file_notify_information) 定义协议表示。
 
 ### 有界资源与缓存边界
 
-宿主显式选择 `DefaultLimits` 或完整有效的 Limits。连接、会话、tree/open、请求、compound、create context、frame/I/O、枚举、通知和各阶段期限都有边界；文件会话另有有限历史与存续期。HTTP 数据与 Windows control 使用独立 admission，后者按完整属性路径、symlink 观察和错误 receipt 的最坏 JSON 编码计费。各池的 byte 设置不是一个合并的进程总额，宿主必须计入并存池的额外 retention；公式归[server 内存边界](../../../../docs/design/server/architecture.md#六请求与响应的内存边界)所有。
+宿主显式选择 DefaultLimits 或完整 Limits，连接、会话、tree/open、请求、compound、contexts、frame/I/O、目录、通知与各阶段期限都有边界。FileSession 有独立有限历史，HTTP bulk、control 与 waits 分别 admission；结果按完整 metadata、witness 和 receipt 编码计费。各池配置不代表一个合并的总额，资源归属见[server 内存边界](../../../../docs/design/server/architecture.md#六请求与响应的内存边界)。
 
 映射请求 UseWriteThrough，并禁止离线缓存。SMB 处理真正的 V1／V2 lease 协商：有效 lease CREATE 返回 OplockLevel=LEASE 与 RqLs，编码器把 LeaseState 固定为 NONE；普通打开仍返回 oplock NONE。请求的 read、write 和 handle caching 位不被授予，也不发送 break。`DHnQ`／`DH2Q` 仍可被拒授而使普通打开成功，不返回 durable 授予 context；不提供 durable/persistent handles、multichannel、旧文件跨连接恢复或 encryption。未知 create context 继续拒绝。
 
-Server 保留 NEGOTIATE 的 ClientGUID，用 ClientGUID／LeaseKey 关联有界记录，并为每个打开保留权威 VolumeIdentity／NodeID。重复 key 在副作用前以 Access=0 探测身份，已解析的非根目标再由最终 ExpectedID 核对；不可替换的根保留全零 lookup 形状。成功关联打开设置的 DeleteOnClose 在记录存活期间保持，允许附加的独立对象关联而不重绑定旧打开。响应采用本次请求的 V1／V2 格式，既有 epoch 与 parent 元数据不会被 V1 回复清空。
+Server 保留 ClientGUID，用 ClientGUID／LeaseKey 关联有界记录，每次 open 绑定 VolumeIdentity／NodeID。重复 key 先作零内容使用的身份探测，再以 ExpectedNodeID 和完整条件保留非根目标；根身份不可替换。成功 open 设置的 DeleteOnClose 在记录存活期间保持，允许额外独立关联，不重绑定旧 open。响应使用本次 V1／V2 格式，V1 不清空已有 epoch／parent metadata。
 
 lease 表在所有连接之间使用 MaxOpens slot 和 MaxDirectoryBytes 元数据上限；这是独立预算，不能与普通打开或单次枚举误算成一个合并总额。准入先预留两个最大路径及固定结构，状态计入 LeaseSlots／LeaseBytes。未知结果和清理失败不能提前归还预算：pending／fenced token 由原 tree 或共享 authority 的 orphan 记录持续持有，只有引用与在途操作确认结束才释放。具体协议与身份规则见[Windows 接入设计](../../../../docs/design/client/windows-smb.md#零缓存权利的-smb-lease)。
 
@@ -86,7 +82,7 @@ lease 表在所有连接之间使用 MaxOpens slot 和 MaxDirectoryBytes 元数�
 
 ## 备选方案
 
-**远端直接提供 SMB。** 减少本机协议转换，但改变远端暴露和业务认证接入方式，不能直接复用现有 HTTP 网络路径。本机 adapter 保留独立远端 transport；公共 WindowsStorage 仍可供其它入口使用。
+**远端直接提供 SMB。** 减少本机协议转换，但改变远端暴露和业务认证接入方式，不能直接复用现有 HTTP 网络路径。本机 adapter 保留独立远端 transport，共同文件接口仍供编程入口使用。
 
 **WinFsp／Dokany 挂载。** 更接近 Windows 文件系统回调，但增加驱动安装、分发和生命周期。完整跨客户端范围锁还必须证明锁参数与取消／晚到授予之间的原子关系，不能只增加回调便声称兼容。这些成本不符合无需额外驱动的部署目标。
 
@@ -108,7 +104,7 @@ lease 表在所有连接之间使用 MaxOpens slot 和 MaxDirectoryBytes 元数�
 
 Windows 使用系统自带客户端，业务能够在同一 Go 进程掌握本机服务、映射、授权和远端连接。代价是维护 SMB 的协商、签名、异步请求、取消、枚举、通知及错误转换；协议版本标签或一条成功连接不能证明这些行为符合要求。
 
-独立 package 不消除跨层成本。共享访问与锁必须进入 metastore、存储包装层、HTTP 和所有既有访问路径；命名 policy 持久限制已启用 volume，卸载不恢复宽松名字规则。事件保存祖先事实增加每次修改的 CPU、日志和网络字节，完整路径及事件边界会拒绝无法表示的修改。HTTP control 独立池占用额外 retention，不能只计算 ordinary response 的上限。
+独立 package 不消除跨层成本。共享保护需要所有入口参与共同 claims／ranges 和最终发布；本机平台解释承担一致目录投影与版本竞争。事件时祖先和 metadata 增加每次修改的 CPU、日志及网络字节，资源上限会拒绝不能完整保存的事实。HTTP control 与本机 lease／计划预算分别 retention，不能只计算 ordinary response。
 
 直接 HTTP 查询避免让 Windows 依赖 Linux SQLite replica，但元数据往返承担远端 RTT。未来的 replica 优化须保留健康门控和与 apply 同序的通知，不能让缓存命中代替权威可用性。零权利 lease 已经历真实 Windows 的一秒负查询验收并失败；该运行未进入专用目录阶段。它不修改 backend API，也不构成 cache grant／break 方案。同步确认、签名和不授予缓存权限也有吞吐成本；性能改进不放宽错误、身份或确认语义。UAC 的映射可见性属于按用户部署约束，helper 不通过全局映射或弱化系统安全绕开它。
 
@@ -123,7 +119,7 @@ Windows 使用系统自带客户端，业务能够在同一 Go 进程掌握本�
 1. **本机接入与身份。** 在真实 Windows 11 24H2+ client edition 中保持系统 445 服务运行，使用自定义回环端口、签名和非 guest 认证。验证普通／提升登录会话的映射可见性、资源管理器访问及其它本机用户拒绝，记录 edition、build 和实际身份交换。
 2. **确认时点与断线。** 暂停 Win32 WriteFile、SetEndOfFile、FlushFileBuffers 对应的远端确认，观察应用不能提前成功，确认前后的字节、大小与 EOF 一致。断线读取已有内容、属性、negative lookup 和目录时报告真实错误；UseWriteThrough 或 share flags 本身不能代替这些观察。
 3. **跨客户端与通知。** 两个 Windows 客户端以及 Windows＋Linux FUSE＋HTTP 验证持续打开后的写入、增长、缩短在一秒内可见。分别核对文件／空目录删除过滤、递归目录改名／删除、跨观察范围移动、覆盖目标和延迟消费时的历史身份。首次监视暂停 checkpoint 时的 >B 事件、连续 notify 调用间的事件、改名前后整组交付均不得丢失，也不依赖定时重扫。
-4. **对象、目录与名字。** 通过 FileIdInfo 观察重复打开、改名、跨客户端和重连后新打开的稳定对象身份；替换或删除后重建必须产生新身份，旧有效引用继续报告原对象。查找与最终操作之间插入替换，覆盖父目录改名、相对操作和枚举竞争。现有实现的用例覆盖大小写冲突、非法 UTF-8、启用与并发命名操作的顺序、取消／未知核对和卸载后 policy 保持；目标名字边界的替换验收由平台隔离提案定义。链接 confinement 与非法信息类拒绝仍须验证。
+4. **对象、目录与名字。** 通过 FileIdInfo 观察重复打开、改名、跨客户端和重连后新打开的稳定对象身份；替换或删除后重建必须产生新身份，旧有效引用继续报告原对象。查找与最终操作之间插入替换，覆盖父目录改名、相对操作和枚举竞争。验证大小写冲突、非法 UTF-8、并发祖先移动和目录版本条件；其它入口名字不受 Windows 约束，相关投影失败且纯身份访问保持。链接 confinement 与非法信息类拒绝仍须验证。
 5. **Windows 访问限制。** 覆盖六种 disposition、metadata-only、目录引用、双向 ShareAccess、delete-on-close/pending、共享／排他范围、等待／取消及三种锁族的独立关系。从 HTTP 和 FUSE 尝试绕过既有 Windows 限制。批量加锁的冲突回滚、批量解锁后项失败、非法后项保留先前授予分别核对实际状态；“解锁 A 后在未持有 C 上失败”仍须证明 A 已解锁。
 6. **故障与关闭。** 覆盖远端已执行但响应丢失、重复 MessageId/action、取消赢／授予赢／无法核对、gateway/server 重启、期限到达、busy 卸载、映射创建失败和清理超时。facts 缺失／损坏、祖先超限、帧能力不足、序列化边界、历史缺口与队列溢出各保留正确错误；不能将损坏当作普通重扫，不能在生成 facts 失败后留下已提交修改。所有者关闭后无无限任务、重复 mutation 或假成功。
 7. **嵌入与凭据生命周期。** 业务程序仅通过公共 API 注入 backend、认证、授权、logger 与 listener；New 无后台或系统映射副作用。两个 share 的 Publish／Unpublish、busy／超时／失败相互隔离。持有文件与锁时轮换本机 provider 或远端凭据，区分旧会话身份、新交换、刷新失败和实时撤销；Windows 路径不依赖 Unix nativelease，Linux 调用方不强制导入 SMB。

@@ -363,7 +363,7 @@ func (f *frameReader) decode(want string, payload any) error {
 }
 
 func decodeFrame(event string, data []byte, payload any) error {
-	if err := json.Unmarshal(data, payload); err != nil {
+	if err := decodeMessageJSON(data, payload, maximumPageRows); err != nil {
 		return fmt.Errorf("the %s frame does not decode: %w", event, err)
 	}
 	return nil
@@ -372,7 +372,7 @@ func decodeFrame(event string, data []byte, payload any) error {
 // faultOf turns a fault frame into the error it reports.
 func faultOf(data []byte) error {
 	var fault StreamFault
-	if err := json.Unmarshal(data, &fault); err != nil {
+	if err := decodeMessageJSON(data, &fault, maximumPageRows); err != nil {
 		return fmt.Errorf("the stream failed, and its reason does not decode: %w", errors.Join(err, syscall.EIO))
 	}
 	if fault.Message == "" {

@@ -216,7 +216,7 @@ func openLocal(
 		MaxIntegrityRecords:          maxIntegrityRecords,
 		MaxIntegrityBytes:            maxIntegrityBytes,
 		MaxRetainedFiles:             authority.files.retained,
-		Advisory:                     authority.files.advisory,
+		Files:                        authority.files.service,
 		Maintenance:                  maintenance,
 		Locks:                        &authority.locks,
 		InitializeLocks:              authority.initializeLocks,
@@ -301,7 +301,7 @@ func openBlobsContext(
 
 	options, err := (sqlite.Options{
 		MaxRetainedFiles:             authority.files.retained,
-		Advisory:                     authority.files.advisory,
+		Files:                        authority.files.service,
 		Window:                       sqlite.DefaultWindow(),
 		ObjectLimits:                 objectLimits,
 		MaxReaderConnections:         maxReaderConnections,

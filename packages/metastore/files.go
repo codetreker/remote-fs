@@ -2,52 +2,27 @@ package metastore
 
 import (
 	"context"
+	"time"
 
-	"github.com/codetreker/remote-fs/packages/advisory"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// FileStore retains regular-file identities independently of volume entries.
-// Opens and requested creation/truncation are atomic with retention. Usage includes
-// detached files and remains available when the volume has no allowance.
+// FileStore orders retained references and transient path operations in one
+// authority. Content materialization shares its volume-wide admission budget.
 type FileStore interface {
-	// CheckFileStore reports the constructor-selected retention capability without
-	// waiting for I/O or publication. Operations verify current exclusive ownership.
 	CheckFileStore() error
-	Advisory(context.Context) (*advisory.Coordinator, error)
-	OpenFile(context.Context, string, storage.FileOpenOptions) (File, error)
-	OpenNode(context.Context, uint64, storage.FileOpenOptions) (File, error)
-	StatNode(context.Context, uint64) (Node, error)
-	SetNodeAttr(context.Context, uint64, storage.AttrChange) (Node, error)
+	FileState(context.Context) (storage.FileVolumeState, error)
+	NewFileSession(context.Context, storage.FileSessionOptions) (FileSession, storage.FileSessionStatus, error)
+	FileOperationLimits() (int64, int, time.Duration)
+	AcquireMaterialization(context.Context, int64) (func(), error)
 	Usage(context.Context) (int64, error)
 }
 
-// FileState captures attributes and content identity from one committed revision.
-// Revision changes on every content publication, including empty-to-empty writes.
-// Detached files have no volume entry and produce no volume change events.
+// FileState captures the exact immutable object and metadata at one revision.
 type FileState struct {
 	Node
 	Revision uint64
 	Detached bool
-}
-
-// File is a retained native regular file. The object layer must drain admitted
-// materialization and upload operations before Close releases physical retention.
-// Calls are concurrent-safe. A retired reference returns ESTALE for further work.
-type File interface {
-	Node(context.Context) (FileState, error)
-	Reserve(context.Context, int64) (Key, error)
-	// Commit checks logical liveness and expected revision under final publication
-	// ordering. EAGAIN means the revision changed and the object remains reserved.
-	// Strong mutation scope and publication accounting are carried in context.
-	Commit(context.Context, uint64, Object) (FileState, error)
-	SetAttr(context.Context, storage.AttrChange) (FileState, error)
-	// Retire fences publication before an external caller starts draining I/O.
-	// The physical pin and quota survive until Close has a known durable result.
-	Retire(context.Context) error
-	// Close is idempotent and retires the reference before releasing its pin.
-	// Last-close accounting uses its context and the actual remaining file size.
-	Close(context.Context) error
 }
 
 type filePublicationGuardKey struct{}

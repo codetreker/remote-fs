@@ -23,6 +23,16 @@ func validateIntegrityWork(
 	volume *int64,
 	maxIntegrityRecords int64,
 ) error {
+	return validateIntegrityWorkVersion(ctx, db, volume, maxIntegrityRecords, schema.Version())
+}
+
+func validateIntegrityWorkVersion(
+	ctx context.Context,
+	db sqlvalue.Queryer,
+	volume *int64,
+	maxIntegrityRecords int64,
+	version int,
+) error {
 	var logTables int64
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*) FROM sqlite_schema
@@ -82,10 +92,22 @@ func validateIntegrityWork(
 	if volumes < 0 || nodes < 0 || objects < 0 || entries < 0 || logs < 0 || changes < 0 {
 		return fmt.Errorf("the database returned a negative volume integrity count: %w", syscall.EIO)
 	}
-	if sqlvalue.WouldExceed(maxIntegrityRecords, volumes, nodes, objects, entries, logs, changes) {
+	var intentions int64
+	if version >= firstSharedFileSchemaVersion {
+		where := ""
+		var args []any
+		if volume != nil {
+			where = ` WHERE volume = ? OR entry IN (SELECT id FROM entries WHERE volume = ?)`
+			args = []any{*volume, *volume}
+		}
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM removal_intents`+where, args...).Scan(&intentions); err != nil {
+			return err
+		}
+	}
+	if sqlvalue.WouldExceed(maxIntegrityRecords, volumes, nodes, objects, entries, logs, changes, intentions) {
 		return fmt.Errorf(
-			"volume integrity requires %d volumes, %d nodes, %d objects, %d entries, %d logs, and %d changes, above the configured work limit of %d; raise MaxIntegrityRecords to open it: %w",
-			volumes, nodes, objects, entries, logs, changes, maxIntegrityRecords, syscall.EFBIG)
+			"volume integrity requires %d volumes, %d nodes, %d objects, %d entries, %d logs, %d changes, and %d removal intentions, above the configured work limit of %d; raise MaxIntegrityRecords to open it: %w",
+			volumes, nodes, objects, entries, logs, changes, intentions, maxIntegrityRecords, syscall.EFBIG)
 	}
 	return nil
 }
@@ -101,25 +123,14 @@ func validateIntegrityBytes(
 	version int,
 ) error {
 	remaining := maxIntegrityBytes
-	if version == schema.Version() {
-		where := ""
-		args := []any{}
-		if volume != nil {
-			where = " WHERE volume=?"
-			args = append(args, *volume)
-		}
-		var bytes, invalid int64
-		if err := db.QueryRowContext(ctx, `SELECT coalesce(sum(CASE WHEN typeof(windows_link_target)='blob' THEN length(windows_link_target) ELSE 0 END),0),count(CASE WHEN typeof(windows_link_target)!='blob' THEN 1 END) FROM nodes`+where, args...).Scan(&bytes, &invalid); err != nil {
+	if version >= firstSharedFileSchemaVersion {
+		var err error
+		remaining, err = admitSharedPayloads(ctx, db, volume, remaining)
+		if err != nil {
 			return err
 		}
-		if invalid != 0 || bytes < 0 {
-			return fmt.Errorf("invalid Windows link target payload: %w", syscall.EIO)
-		}
-		if bytes > remaining {
-			return fmt.Errorf("Windows link targets exceed the integrity byte limit: %w", syscall.EFBIG)
-		}
-		remaining -= bytes
 	}
+
 	entryWhere := ""
 	changeWhere := ""
 	entryArgs := []any{}
@@ -165,8 +176,8 @@ func validateIntegrityBytes(
 	}
 
 	notificationColumns := ""
-	if version >= 3 {
-		notificationColumns = ", typeof(notification), length(notification), COALESCE(length(CAST(content AS BLOB)),0)"
+	if version >= firstSharedFileSchemaVersion {
+		notificationColumns = ", typeof(notification), length(notification), COALESCE(length(CAST(content AS BLOB)),0), COALESCE(length(metadata),0), COALESCE(length(link_target),0)"
 	}
 	rows, err = db.QueryContext(ctx, `
 		SELECT
@@ -180,17 +191,17 @@ func validateIntegrityBytes(
 		var nameType, fromNameType string
 		var nameLength, fromNameLength sql.NullInt64
 		var notificationType string
-		var notificationLength, contentLength int64
+		var notificationLength, contentLength, metadataLength, targetLength int64
 		fields := []any{&nameType, &nameLength, &fromNameType, &fromNameLength}
-		if version >= 3 {
-			fields = append(fields, &notificationType, &notificationLength, &contentLength)
+		if version >= firstSharedFileSchemaVersion {
+			fields = append(fields, &notificationType, &notificationLength, &contentLength, &metadataLength, &targetLength)
 		}
 		if err := rows.Scan(fields...); err != nil {
 			rows.Close()
 			return err
 		}
 
-		if version >= 3 {
+		if version >= firstSharedFileSchemaVersion {
 			if notificationType != "blob" || notificationLength <= 0 {
 				rows.Close()
 				return fmt.Errorf("invalid notification storage: %w", syscall.EIO)
@@ -199,15 +210,15 @@ func validateIntegrityBytes(
 				rows.Close()
 				return fmt.Errorf("notification exceeds integrity byte limit: %w", syscall.EFBIG)
 			}
-			if err := (metastore.ChangePayloadLengths{Name: nameLength.Int64, FromName: fromNameLength.Int64, Content: contentLength, Notification: notificationLength}).Check(); err != nil {
+			if err := (metastore.ChangePayloadLengths{Name: nameLength.Int64, FromName: fromNameLength.Int64, Content: contentLength, Notification: notificationLength, Metadata: metadataLength, Target: targetLength}).Check(); err != nil {
 				rows.Close()
 				return err
 			}
-			if contentLength > remaining-notificationLength {
+			if sqlvalue.WouldExceed(remaining-notificationLength, contentLength, metadataLength, targetLength) {
 				rows.Close()
 				return fmt.Errorf("change payload exceeds integrity byte limit: %w", syscall.EFBIG)
 			}
-			remaining -= contentLength
+			remaining -= contentLength + metadataLength + targetLength
 			remaining -= notificationLength
 		}
 		for _, field := range []struct {
@@ -286,6 +297,24 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 	if version >= firstRetainedFileSchemaVersion {
 		retainedNodeClasses = ` OR typeof(detached) != 'integer' OR typeof(content_revision) != 'integer'`
 	}
+	nodeKindColumn, changeKindColumn := "mode", "mode"
+	sharedEntryClasses, sharedChangeClasses := "", ""
+	if version >= firstSharedFileSchemaVersion {
+		nodeKindColumn, changeKindColumn = "kind", "node_kind"
+		retainedNodeClasses += ` OR typeof(metadata_revision) != 'integer' OR typeof(directory_revision) != 'integer' OR
+			typeof(creation_sec) NOT IN ('integer','null') OR typeof(creation_nsec) NOT IN ('integer','null') OR
+			typeof(change_sec) NOT IN ('integer','null') OR typeof(change_nsec) NOT IN ('integer','null') OR
+			typeof(metadata) != 'blob' OR typeof(link_target) != 'blob'`
+		sharedEntryClasses = ` OR typeof(e.id) != 'integer' OR e.id <= 0 OR
+			typeof(e.draining) != 'integer' OR typeof(e.drain_generation) != 'integer' OR
+			typeof(e.drain_if_empty) != 'integer' OR typeof(e.drain_authority) != 'text'`
+		sharedChangeClasses = ` OR typeof(metadata_revision) NOT IN ('integer','null') OR
+			typeof(directory_revision) NOT IN ('integer','null') OR
+			typeof(creation_sec) NOT IN ('integer','null') OR typeof(creation_nsec) NOT IN ('integer','null') OR
+			typeof(change_sec) NOT IN ('integer','null') OR typeof(change_nsec) NOT IN ('integer','null') OR
+			typeof(metadata) NOT IN ('blob','null') OR typeof(link_target) NOT IN ('blob','null') OR
+			typeof(identity_high_water) != 'integer' OR identity_high_water <= 0 OR typeof(notification) != 'blob'`
+	}
 	queries := []struct {
 		name  string
 		query string
@@ -294,7 +323,7 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 		{"nodes", `SELECT count(*) FROM nodes ` + nodeWhere + predicateJoin(nodeWhere) + `(
 			typeof(id) != 'integer' OR id <= 0 OR
 			typeof(volume) != 'integer' OR volume <= 0 OR
-			typeof(mode) != 'integer' OR typeof(size) != 'integer' OR
+			typeof(` + nodeKindColumn + `) != 'integer' OR typeof(size) != 'integer' OR
 			typeof(atime_sec) != 'integer' OR typeof(atime_nsec) != 'integer' OR
 			typeof(mtime_sec) != 'integer' OR typeof(mtime_nsec) != 'integer' OR
 			typeof(content) NOT IN ('text', 'null')` + retainedNodeClasses + `)`, scopeArgs},
@@ -312,7 +341,7 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 			typeof(e.parent) != 'integer' OR e.parent <= 0 OR
 			typeof(e.name) != 'blob' OR length(e.name) = 0 OR
 			e.name IN (X'2e', X'2e2e') OR instr(e.name, X'2f') != 0 OR instr(e.name, X'00') != 0 OR
-			typeof(e.node) != 'integer' OR e.node <= 0)`,
+			typeof(e.node) != 'integer' OR e.node <= 0` + sharedEntryClasses + `)`,
 			entryArgs},
 		{"logs", `SELECT count(*) FROM logs ` + logWhere + predicateJoin(logWhere) + `(
 			typeof(volume) != 'integer' OR volume <= 0 OR
@@ -327,11 +356,11 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 			typeof(name) NOT IN ('blob', 'null') OR
 			typeof(from_parent) NOT IN ('integer', 'null') OR
 			typeof(from_name) NOT IN ('blob', 'null') OR
-			typeof(node) NOT IN ('integer', 'null') OR typeof(mode) NOT IN ('integer', 'null') OR
+			typeof(node) NOT IN ('integer', 'null') OR typeof(` + changeKindColumn + `) NOT IN ('integer', 'null') OR
 			typeof(size) NOT IN ('integer', 'null') OR typeof(atime_sec) NOT IN ('integer', 'null') OR
 			typeof(atime_nsec) NOT IN ('integer', 'null') OR typeof(mtime_sec) NOT IN ('integer', 'null') OR
 			typeof(mtime_nsec) NOT IN ('integer', 'null') OR typeof(content) NOT IN ('text', 'null') OR
-			typeof(recorded_sec) != 'integer' OR typeof(recorded_nsec) != 'integer')`, scopeArgs},
+			typeof(recorded_sec) != 'integer' OR typeof(recorded_nsec) != 'integer'` + sharedChangeClasses + `)`, scopeArgs},
 		{"backing store", `SELECT count(*) FROM backing_store WHERE
 			typeof(singleton) != 'integer' OR singleton != 1 OR
 			typeof(store_id) != 'text' OR store_id = ''`, nil},
@@ -341,6 +370,29 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 			typeof(generation) != 'integer' OR generation < 0 OR
 			typeof(node_high_water) != 'integer' OR node_high_water < 0 OR
 			typeof(change_high_water) != 'integer' OR change_high_water < 0`, nil},
+	}
+	if version >= firstSharedFileSchemaVersion {
+		where := ""
+		var args []any
+		if volume != nil {
+			where = "(r.volume = ? OR e.volume = ?) AND "
+			args = []any{*volume, *volume}
+		}
+		queries = append(queries, struct {
+			name  string
+			query string
+			args  []any
+		}{"removal intentions", `SELECT count(*) FROM removal_intents r
+			LEFT JOIN volumes v ON v.id = r.volume LEFT JOIN entries e ON e.id = r.entry
+			WHERE ` + where + `(
+				typeof(r.volume) != 'integer' OR r.volume <= 0 OR v.id IS NULL OR
+				typeof(r.entry) != 'integer' OR r.entry <= 0 OR
+				typeof(r.if_empty) != 'integer' OR r.if_empty NOT IN (0,1) OR
+				typeof(r.reference) != 'text' OR r.reference = '' OR instr(r.reference, char(0)) != 0 OR
+				typeof(r.token) != 'text' OR r.token = '' OR instr(r.token, char(0)) != 0 OR
+				typeof(r.authority) != 'text' OR r.authority = '' OR instr(r.authority, char(0)) != 0 OR
+				(e.id IS NOT NULL AND e.volume != r.volume)
+			)`, args})
 	}
 	if invalidVolumes != 0 {
 		return fmt.Errorf("the database holds %d volume rows in an invalid SQLite storage class: %w",
@@ -389,7 +441,7 @@ func validateIntegrity(
 	maxIntegrityRecords, maxIntegrityBytes int64,
 	version int,
 ) error {
-	if err := validateIntegrityWork(ctx, db, volume, maxIntegrityRecords); err != nil {
+	if err := validateIntegrityWorkVersion(ctx, db, volume, maxIntegrityRecords, version); err != nil {
 		return err
 	}
 	if err := validateIntegrityBytes(ctx, db, volume, maxIntegrityBytes, version); err != nil {
@@ -398,11 +450,16 @@ func validateIntegrity(
 	if err := validateStorageClassesVersion(ctx, db, volume, version); err != nil {
 		return err
 	}
-	if volume == nil {
-		if _, err := dbstate.Validate(ctx, db); err != nil {
+	if version >= firstSharedFileSchemaVersion {
+		if err := validateFileLeaseInitialization(ctx, db); err != nil {
 			return err
 		}
-	} else if err := dbstate.ValidateIdentityBounds(ctx, db, *volume); err != nil {
+	}
+	if volume == nil {
+		if _, err := dbstate.ValidateVersion(ctx, db, version); err != nil {
+			return err
+		}
+	} else if err := dbstate.ValidateIdentityBoundsVersion(ctx, db, *volume, version); err != nil {
 		return err
 	}
 	if err := validateNodeValuesVersion(ctx, db, volume, version); err != nil {
@@ -428,14 +485,14 @@ func validateIntegrity(
 		return fmt.Errorf("the database holds %d objects in an unknown state and %d objects with an invalid size: %w",
 			invalidStates, invalidSizes, syscall.EIO)
 	}
-	if err := validateObjectRelationships(ctx, db, volume); err != nil {
+	if err := validateObjectRelationshipsVersion(ctx, db, volume, version); err != nil {
 		return err
 	}
 	if err := validateNodeRelationshipsVersion(ctx, db, volume, version); err != nil {
 		return err
 	}
-	if err := validateUsedAccounting(ctx, db, volume); err != nil {
+	if err := validateUsedAccountingVersion(ctx, db, volume, version); err != nil {
 		return err
 	}
-	return validateLogIntegrity(ctx, db, volume)
+	return validateStoredLogIntegrity(ctx, db, volume, version, maxIntegrityRecords, maxIntegrityBytes)
 }

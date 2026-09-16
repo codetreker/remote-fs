@@ -311,7 +311,7 @@ func TestOpeningValidationRequiresTheLeaseOwnerForBoundNativePaths(t *testing.T)
 			if err := os.WriteFile(path, nil, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if err := ValidateOpening(path, false); err != nil {
+			if err := ValidateOpening(path, Opening{}); err != nil {
 				t.Fatal(err)
 			}
 			target := path
@@ -321,33 +321,72 @@ func TestOpeningValidationRequiresTheLeaseOwnerForBoundNativePaths(t *testing.T)
 			if err := unix.Setxattr(target, leaseBindingAttribute, []byte("bound"), unix.XATTR_CREATE); err != nil {
 				t.Fatal(err)
 			}
-			if err := ValidateOpening(path, false); !errors.Is(err, syscall.EIO) {
+			if err := ValidateOpening(path, Opening{}); !errors.Is(err, syscall.EIO) {
 				t.Fatalf("unowned bound database opening = %v", err)
 			}
-			if err := ValidateOpening(path, true); err != nil {
+			if err := ValidateOpening(path, Opening{Strong: true}); err != nil {
 				t.Fatalf("owned bound database opening = %v", err)
 			}
 			if err := unix.Removexattr(target, leaseBindingAttribute); err != nil {
 				t.Fatal(err)
 			}
-			if err := ValidateOpening(path, false); err != nil {
+			if err := ValidateOpening(path, Opening{}); err != nil {
 				t.Fatalf("unbound database opening = %v", err)
 			}
 		})
 	}
 	for _, name := range []string{"metadata%20.sqlite", "metadata?mode=ro", "metadata#fragment", "metadata\x00.sqlite"} {
 		for _, owned := range []bool{false, true} {
-			if err := ValidateOpening(name, owned); !errors.Is(err, syscall.EINVAL) {
+			if err := ValidateOpening(name, Opening{Strong: owned}); !errors.Is(err, syscall.EINVAL) {
 				t.Fatalf("invalid native path %q, owned=%t: %v", name, owned, err)
 			}
 		}
 	}
-	if err := ValidateOpening(filepath.Join(t.TempDir(), "new.sqlite"), false); err != nil {
+	if err := ValidateOpening(filepath.Join(t.TempDir(), "new.sqlite"), Opening{}); err != nil {
 		t.Fatalf("missing unbound database opening = %v", err)
 	}
 	path := filepath.Join(t.TempDir(), strings.Repeat("x", 256))
-	if err := ValidateOpening(path, false); !errors.Is(err, syscall.ENAMETOOLONG) {
+	if err := ValidateOpening(path, Opening{}); !errors.Is(err, syscall.ENAMETOOLONG) {
 		t.Fatalf("native xattr failure lost its cause: %v", err)
+	}
+}
+
+func TestOpeningValidationRequiresEachBoundLeaseDomain(t *testing.T) {
+	for _, bound := range []string{"database", "parent"} {
+		t.Run(bound, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "metadata.sqlite")
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			target := path
+			if bound == "parent" {
+				target = filepath.Dir(path)
+			}
+			for mask := 0; mask < 4; mask++ {
+				for i, attribute := range []string{leaseBindingAttribute, fileLeaseBindingAttribute} {
+					err := unix.Removexattr(target, attribute)
+					if err != nil && !errors.Is(err, syscall.ENODATA) {
+						t.Fatal(err)
+					}
+					if mask&(1<<i) != 0 {
+						if err := unix.Setxattr(target, attribute, []byte("bound"), unix.XATTR_CREATE); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				for allowed := 0; allowed < 4; allowed++ {
+					policy := Opening{Strong: allowed&1 != 0, File: allowed&2 != 0}
+					err := ValidateOpening(path, policy)
+					if mask & ^allowed != 0 {
+						if !errors.Is(err, syscall.EIO) {
+							t.Fatalf("bindings=%d, opening=%+v bypassed another domain: %v", mask, policy, err)
+						}
+					} else if err != nil {
+						t.Fatalf("bindings=%d, opening=%+v refused owned domains: %v", mask, policy, err)
+					}
+				}
+			}
+		})
 	}
 }
 

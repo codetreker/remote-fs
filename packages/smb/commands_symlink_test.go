@@ -3,7 +3,6 @@ package smb
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"strings"
 	"syscall"
 	"testing"
@@ -13,18 +12,18 @@ import (
 )
 
 type symlinkFile struct {
-	storage.WindowsFile
-	info    storage.WindowsSymlinkInfo
+	windowsFile
+	info    windowsSymlinkInfo
 	target  string
 	failure error
 }
 
-func (f *symlinkFile) ReadLink(context.Context) (storage.WindowsSymlinkInfo, error) {
+func (f *symlinkFile) ReadLink(context.Context) (windowsSymlinkInfo, error) {
 	return f.info, f.failure
 }
-func (f *symlinkFile) SetLink(_ context.Context, target string, id storage.WindowsActionID) (storage.WindowsActionResult, error) {
+func (f *symlinkFile) SetLink(_ context.Context, target string, id windowsActionID) (windowsActionResult, error) {
 	f.target = target
-	return storage.WindowsActionResult{Action: id, State: storage.WindowsActionCompleted}, f.failure
+	return windowsActionResult{Action: id, State: windowsActionCompleted}, f.failure
 }
 
 func ioctlCommand(code uint32, input []byte) wire.Request {
@@ -43,7 +42,7 @@ func ioctlCommand(code uint32, input []byte) wire.Request {
 }
 
 func TestSymlinkTargetsRemainInsideVolume(t *testing.T) {
-	location := storage.WindowsNameInfo{State: storage.WindowsNameLinked, Path: "dir/link"}
+	location := windowsNameInfo{State: windowsNameLinked, Path: "dir/link"}
 	for _, tc := range []struct{ target, want string }{{"../file", "..\\file"}, {"/other/file", "..\\other\\file"}, {"/dir/file", "file"}, {"/dir", "."}, {"/", ".."}} {
 		got, err := relativeLink(tc.target, location)
 		if err != nil || got != tc.want {
@@ -55,10 +54,10 @@ func TestSymlinkTargetsRemainInsideVolume(t *testing.T) {
 			t.Fatalf("escaped with %q", target)
 		}
 	}
-	if _, err := relativeLink("file", storage.WindowsNameInfo{State: storage.WindowsNameDetached}); err == nil {
+	if _, err := relativeLink("file", windowsNameInfo{State: windowsNameDetached}); err == nil {
 		t.Fatal("detached relative substitution")
 	}
-	b, status := createFailure(&storage.WindowsSymlinkError{WindowsSymlinkInfo: storage.WindowsSymlinkInfo{Target: "../file", Location: location, Unparsed: "/😀"}, Err: syscall.ELOOP})
+	b, status := createFailure(&windowsSymlinkError{windowsSymlinkInfo: windowsSymlinkInfo{Target: "../file", Location: location, Unparsed: "/😀"}, Err: syscall.ELOOP})
 	if status != 0x8000002d || len(b) < 44 || smbLE.Uint16(b[30:]) != 6 {
 		t.Fatalf("symlink error %x %x", status, b)
 	}
@@ -69,7 +68,7 @@ func TestSymlinkTargetsRemainInsideVolume(t *testing.T) {
 
 func TestReparseReadsAtomicTargetAndLocation(t *testing.T) {
 	c, _, tr, _, _, _ := testConnection(t)
-	f := &symlinkFile{info: storage.WindowsSymlinkInfo{Target: "/target", Location: storage.WindowsNameInfo{State: storage.WindowsNameLinked, Path: "dir/link"}}}
+	f := &symlinkFile{info: windowsSymlinkInfo{Target: "/target", Location: windowsNameInfo{State: windowsNameLinked, Path: "dir/link"}}}
 	tr.files.handles[wire.FileID{1}].file = f
 	b, status := c.reparse(context.Background(), tr, ioctlCommand(fsctlGetReparsePoint, nil))
 	if status != 0 {
@@ -86,7 +85,7 @@ func TestReparseReadsAtomicTargetAndLocation(t *testing.T) {
 	if _, status := c.reparse(context.Background(), tr, ioctlCommand(fsctlSetReparsePoint, data)); status != 0 || f.target != "../target" {
 		t.Fatalf("set %x %q", status, f.target)
 	}
-	f.failure = &storage.WindowsError{Failure: storage.WindowsNotReparsePoint, Err: syscall.EINVAL}
+	f.failure = &windowsError{Failure: windowsNotReparsePoint, Err: syscall.EINVAL}
 	if _, status := c.reparse(context.Background(), tr, ioctlCommand(fsctlGetReparsePoint, nil)); status != 0xc0000275 {
 		t.Fatal(status)
 	}
@@ -99,33 +98,33 @@ func TestReparseReadsAtomicTargetAndLocation(t *testing.T) {
 
 func TestSymlinkOpenReconciliationRetainsTargetAndRemainingPath(t *testing.T) {
 	d, _, s, _ := commandDispatcher()
-	info := storage.WindowsSymlinkInfo{Target: "target", Location: storage.WindowsNameInfo{State: storage.WindowsNameLinked, Path: "link"}}
-	s.open = func(storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
-		return storage.WindowsOpenResult{}, syscall.EIO
+	info := windowsSymlinkInfo{Target: "target", Location: windowsNameInfo{State: windowsNameLinked, Path: "link"}}
+	s.open = func(windowsOpenRequest) (windowsOpenResult, error) {
+		return windowsOpenResult{}, syscall.EIO
 	}
-	s.result = storage.WindowsActionResult{State: storage.WindowsActionRejected, Errno: syscall.ELOOP, Symlink: &info}
+	s.result = windowsActionResult{State: windowsActionRejected, Errno: syscall.ELOOP, Symlink: &info}
 	s.queryErr = syscall.ELOOP
-	id, err := d.actionID()
+	id, err := d.actionID(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = d.open(context.Background(), storage.WindowsOpenRequest{}, id)
-	var link *storage.WindowsSymlinkError
+	_, err = d.open(context.Background(), windowsOpenRequest{}, id)
+	var link *windowsSymlinkError
 	if !errors.As(err, &link) || link.Target != "target" {
 		t.Fatalf("receipt %v", err)
 	}
-	s.open = func(r storage.WindowsOpenRequest) (storage.WindowsOpenResult, error) {
+	s.open = func(r windowsOpenRequest) (windowsOpenResult, error) {
 		if r.Lookup.Name == "" {
-			root := &commandFile{attr: storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 1, Mode: fs.ModeDir}}}}
-			return storage.WindowsOpenResult{File: root, Attr: root.attr}, nil
+			root := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}}}
+			return windowsOpenResult{File: root, Attr: root.attr}, nil
 		}
-		return storage.WindowsOpenResult{}, &storage.WindowsSymlinkError{WindowsSymlinkInfo: info, Err: syscall.ELOOP}
+		return windowsOpenResult{}, &windowsSymlinkError{windowsSymlinkInfo: info, Err: syscall.ELOOP}
 	}
 	_, _, err = d.resolve(context.Background(), "link\\child\\file")
 	if !errors.As(err, &link) || link.Unparsed != "/child/file" {
 		t.Fatalf("suffix %v", err)
 	}
-	a := storage.WindowsAttr{WindowsBasicAttr: storage.WindowsBasicAttr{Attr: storage.Attr{ID: 2, Mode: fs.ModeSymlink, Size: int64(len(info.Target))}, DOSAttributes: storage.WindowsDOSDirectory}}
+	a := windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 2, Kind: storage.NodeSymlink, Size: int64(len(info.Target))}, DOSAttributes: dosDirectory}}
 	standard := encodeStandardInfo(a)
 	if standard[21] != 1 || smbLE.Uint64(standard[8:]) != 0 || fileAttributes(a)&0x410 != 0x410 {
 		t.Fatalf("directory reparse metadata %x", standard)

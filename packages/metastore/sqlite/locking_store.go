@@ -32,9 +32,10 @@ type LockingConfig struct {
 // The embedded Store supplies the volume, publication hooks, and paired lock authority.
 type LockingStore struct {
 	*Store
-	ownerMu sync.Mutex
-	file    *nativelease.Database
-	anchor  *LeaseAnchor
+	ownerMu    sync.Mutex
+	file       *nativelease.Database
+	anchor     *LeaseAnchor
+	fileAnchor *LeaseAnchor
 }
 
 // OpenLocking validates native lifetime ownership and both lease evidence components before
@@ -70,6 +71,7 @@ func OpenLocking(ctx context.Context, config LockingConfig) (*LockingStore, erro
 		return nil, errors.Join(err, file.Close())
 	}
 	options.leaseRecoveryOwner = true
+	options.fileLeaseRecoveryOwner = true
 	options.leaseOwner = file
 	options.requireExistingVolume = !anchor.Initializing()
 	store, err := OpenWithOptions(ctx, database, config.Volume, config.Allowance, options)
@@ -84,7 +86,11 @@ func OpenLocking(ctx context.Context, config LockingConfig) (*LockingStore, erro
 		if err := store.Abort(); err != nil {
 			return nil, errors.Join(primary, err)
 		}
-		return nil, errors.Join(primary, anchor.Close(), file.Close())
+		var fileErr error
+		if opened.fileAnchor != nil {
+			fileErr = opened.fileAnchor.Close()
+		}
+		return nil, errors.Join(primary, fileErr, anchor.Close(), file.Close())
 	}
 	if err := nativelease.VerifyDatabase(file); err != nil {
 		return cleanup(err)
@@ -95,6 +101,21 @@ func OpenLocking(ctx context.Context, config LockingConfig) (*LockingStore, erro
 		return cleanup(err)
 	}
 	if err := anchor.Complete(); err != nil {
+		return cleanup(err)
+	}
+	pending, err := store.FileLeaseInitializationPending(ctx)
+	if err != nil {
+		return cleanup(err)
+	}
+	fileAnchor, err := OpenLeaseAnchor(LeaseAnchorConfig{
+		Directory: filepath.Dir(database), Name: "." + filepath.Base(database) + ".file-leases",
+		Identity: "sqlite-database-file-recovery", BindingFD: file.FD(), RecoveryStart: start, Initialize: pending, Domain: LeaseDomainFile,
+	})
+	if err != nil {
+		return cleanup(err)
+	}
+	opened.fileAnchor = fileAnchor
+	if err := store.ConfigureFileLeaseRecovery(ctx, LeaseRecoveryConfig{Witness: fileAnchor, RecoveryStart: start, StateID: fileAnchor.StateID(), Initialize: fileAnchor.Initializing()}); err != nil {
 		return cleanup(err)
 	}
 	if err := store.EnableLocks(ctx, config.Locks); err != nil {
@@ -142,6 +163,11 @@ func (s *LockingStore) Abort() error {
 func (s *LockingStore) closeOwnership() error {
 	if s.file == nil {
 		return nil
+	}
+	if s.fileAnchor != nil {
+		if err := s.fileAnchor.Close(); err != nil {
+			return err
+		}
 	}
 	if err := s.anchor.Close(); err != nil {
 		return err

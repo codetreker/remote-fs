@@ -7,11 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -270,7 +270,11 @@ func TestSuccessIsAlwaysStatus200(t *testing.T) {
 // changeBody renders an attribute change the way the client sends one.
 func changeBody(t *testing.T, change storage.AttrChange) io.Reader {
 	t.Helper()
-	encoded, err := json.Marshal(httprest.SetAttrRequest{Change: httprest.AttrChangeOf(change)})
+	wireChange, err := httprest.AttrChangeOf(change)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(httprest.SetAttrRequest{Change: wireChange})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,10 +286,14 @@ func TestSetAttrReachesTheStorage(t *testing.T) {
 	if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 		t.Fatal(err)
 	}
-	mode := fs.FileMode(0o600)
+	metadata := storage.Metadata{{Key: "client.example", Version: 1, Data: []byte{0, 6, 0}}}
+	before, err := backing.Stat(t.Context(), "f")
+	if err != nil {
+		t.Fatal(err)
+	}
 	changed := time.Unix(1755000000, 123456789)
 	w := serve(t, h, httprest.Request{Op: httprest.OpSetAttr, Path: "f"},
-		changeBody(t, storage.AttrChange{Mode: &mode, ModTime: &changed}))
+		changeBody(t, storage.AttrChange{ExpectedRevision: before.MetadataRevision, Metadata: &metadata, ModTime: &changed}))
 	if w.Code != http.StatusOK {
 		t.Fatalf("setattr answered %d, want 200: %s", w.Code, w.Body)
 	}
@@ -294,8 +302,8 @@ func TestSetAttrReachesTheStorage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode != mode {
-		t.Fatalf("the stored file has mode %v, want %v", info.Mode, mode)
+	if !reflect.DeepEqual(info.Metadata, metadata) || info.MetadataRevision != before.MetadataRevision+1 {
+		t.Fatalf("the stored metadata is %+v at revision %d, want %+v at revision %d", info.Metadata, info.MetadataRevision, metadata, before.MetadataRevision+1)
 	}
 	if !info.ModTime.Equal(changed) {
 		t.Fatalf("the stored file is dated %v, want %v", info.ModTime, changed)
@@ -308,10 +316,10 @@ func TestSetAttrReachesTheStorage(t *testing.T) {
 func TestAMalformedChangeChangesNothing(t *testing.T) {
 	const existing = "the previous contents, which must survive"
 	cases := map[string]io.Reader{
-		"a body that is not JSON":            bytes.NewReader([]byte("not json")),
-		"a body carrying no change":          bytes.NewReader([]byte(`{}`)),
-		"a change with a mode it cannot use": bytes.NewReader([]byte(`{"change":{"mode":"rwx"}}`)),
-		"a body that ends early":             &errorAfter{[]byte(`{"change":{"mo`), errors.New("connection reset")},
+		"a body that is not JSON":              bytes.NewReader([]byte("not json")),
+		"a body carrying no change":            bytes.NewReader([]byte(`{}`)),
+		"a change with metadata it cannot use": bytes.NewReader([]byte(`{"change":{"expected_revision":1,"metadata":"not base64!"}}`)),
+		"a body that ends early":               &errorAfter{[]byte(`{"change":{"mo`), errors.New("connection reset")},
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -319,8 +327,12 @@ func TestAMalformedChangeChangesNothing(t *testing.T) {
 			if err := backing.Write(t.Context(), "f", []byte(existing)); err != nil {
 				t.Fatal(err)
 			}
-			mode := fs.FileMode(0o600)
-			if err := backing.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}); err != nil {
+			metadata := storage.Metadata{{Key: "client.example", Version: 1, Data: []byte{0, 6, 0}}}
+			before, err := backing.Stat(t.Context(), "f")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := backing.SetAttr(t.Context(), "f", storage.AttrChange{ExpectedRevision: before.MetadataRevision, Metadata: &metadata}); err != nil {
 				t.Fatal(err)
 			}
 			w := serve(t, h, httprest.Request{Op: httprest.OpSetAttr, Path: "f"}, body)
@@ -336,8 +348,8 @@ func TestAMalformedChangeChangesNothing(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if info.Mode != mode {
-				t.Fatalf("the stored file has mode %v, want the untouched %v", info.Mode, mode)
+			if !reflect.DeepEqual(info.Metadata, metadata) || info.MetadataRevision != before.MetadataRevision+1 {
+				t.Fatalf("the malformed change altered metadata: %+v", info)
 			}
 		})
 	}
@@ -374,17 +386,18 @@ func TestAStorageErrorCarriesItsErrnoByName(t *testing.T) {
 		}
 	}
 
-	// setattr carries a body, so it is its own case. The mode names a kind of node rather
-	// than a permission, which the storage refuses; the errno has to arrive by name like
-	// any other.
-	kind := fs.ModeSymlink | 0o644
+	metadata := storage.Metadata{{Key: "client.example", Version: 1, Data: []byte{1}}}
+	directory, err := backing.Stat(t.Context(), "d")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, c := range []struct {
 		change storage.AttrChange
 		path   string
 		want   string
 	}{
 		{storage.AttrChange{}, "missing", "ENOENT"},
-		{storage.AttrChange{Mode: &kind}, "d", "EINVAL"},
+		{storage.AttrChange{ExpectedRevision: directory.MetadataRevision + 1, Metadata: &metadata}, "d", "ESTALE"},
 		{storage.AttrChange{}, "../outside", "EINVAL"},
 	} {
 		w := serve(t, h, httprest.Request{Op: httprest.OpSetAttr, Path: c.path}, changeBody(t, c.change))
@@ -816,8 +829,12 @@ func TestAnOversizedAttributeChangeIsAProtocolFault(t *testing.T) {
 	if err := s.Write(t.Context(), "f", nil); err != nil {
 		t.Fatal(err)
 	}
-	mode := fs.FileMode(0o600)
-	if err := s.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}); err != nil {
+	metadata := storage.Metadata{{Key: "client.example", Version: 1, Data: []byte{0, 6, 0}}}
+	before, err := s.Stat(t.Context(), "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAttr(t.Context(), "f", storage.AttrChange{ExpectedRevision: before.MetadataRevision, Metadata: &metadata}); err != nil {
 		t.Fatal(err)
 	}
 	options := httprest.DefaultHandlerOptions()
@@ -840,8 +857,8 @@ func TestAnOversizedAttributeChangeIsAProtocolFault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode != mode {
-		t.Fatalf("the refused change altered the mode to %v", info.Mode)
+	if !reflect.DeepEqual(info.Metadata, metadata) || info.MetadataRevision != before.MetadataRevision+1 {
+		t.Fatalf("the refused change altered metadata: %+v", info)
 	}
 }
 
@@ -1257,7 +1274,11 @@ func TestListingCarriesNamesUnaltered(t *testing.T) {
 		t.Fatalf("unparseable listing %s: %v", w.Body, err)
 	}
 	got := map[string]bool{}
-	for _, e := range resp.Storage() {
+	entries, err := resp.Storage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
 		got[e.Name] = true
 	}
 	for _, name := range names {

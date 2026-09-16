@@ -9,8 +9,11 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
+	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/sqliteschema"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func stateFixture(t *testing.T) (*sql.DB, State) {
@@ -34,15 +37,24 @@ func stateFixture(t *testing.T) (*sql.DB, State) {
 	}
 	execState(t, db, `INSERT INTO volumes (id, name, root, used) VALUES (1, 'workspace', 1, 0)`)
 	execState(t, db, `INSERT INTO nodes
-		(id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec)
-		VALUES (1, 1, 2147483648, 0, 0, 0, 0, 0), (2, 1, 0, 0, 0, 0, 0, 0)`)
-	execState(t, db, `INSERT INTO entries (volume, parent, name, node) VALUES (1, 1, x'66', 2)`)
+		(id, volume, kind, directory_revision, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec)
+		VALUES (1, 1, 2, 1, 0, 0, 0, 0, 0), (2, 1, 1, 0, 0, 0, 0, 0, 0)`)
+	execState(t, db, `INSERT INTO entries (id, volume, parent, name, node) VALUES (3, 1, 1, x'66', 2)`)
 	execState(t, db, `INSERT INTO logs VALUES (1, '0123456789abcdef0123456789abcdef', 2, 0, 0)`)
+	node := metastore.Node{ID: 2, Kind: storage.NodeRegular, MetadataRevision: 1, AccessTime: time.Unix(0, 0).UTC(), ModTime: time.Unix(0, 0).UTC()}
+	change := metastore.Change{Position: 2, Kind: metastore.Created, Parent: 1, Name: []byte("f"), Node: &node,
+		Notification: &metastore.Notification{SubjectID: 2, SubjectKind: storage.NodeRegular, ChangeMask: metastore.ChangeName,
+			After: &metastore.EventImage{Attr: node.Attr(), Location: storage.EntryLocation{State: storage.LocationLinked, RootNodeID: 1, NodeID: 2,
+				Ancestors: []storage.EntryCondition{{ParentID: 1, DirectoryRevision: 1, EntryID: 3, NodeID: 2, Name: []byte("f")}}}}}}
+	notification, err := metastore.EncodeNotification(change)
+	if err != nil {
+		t.Fatal(err)
+	}
 	execState(t, db, `INSERT INTO changes
 		(position, previous_position, volume, kind, parent, name, node,
-		 mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, recorded_sec, recorded_nsec, notification)
-		VALUES (2, 0, 1, 0, 1, x'66', 2, 0, 0, 0, 0, 0, 0, 0, 0,
-		 CAST('{"SubjectID":2,"SubjectKind":0,"Directory":false,"ChangeMask":1,"Before":null,"After":{"Ancestors":[{"DirectoryID":1,"Name":null}],"LeafName":"Zg=="}}' AS BLOB))`)
+		 node_kind, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, recorded_sec, recorded_nsec,
+		 metadata_revision, directory_revision, metadata, link_target, identity_high_water, notification)
+		VALUES (2, 0, 1, 0, 1, x'66', 2, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, X'52464d010000', X'', 3, ?)`, notification)
 	state := State{DatabaseID: "0123456789abcdef0123456789abcdef", Generation: 7, NodeHighWater: 4, ChangeHighWater: 6}
 	setFixtureState(t, db, state)
 	return db, state

@@ -33,7 +33,7 @@ type confirmedChmodGate struct {
 
 func (g *confirmedChmodGate) unblock() { g.once.Do(func() { close(g.release) }) }
 func (g *confirmedChmodGate) result(ctx context.Context, c storage.AttrChange, a storage.Attr, err error) (storage.Attr, error) {
-	if err == nil && c.Mode != nil && c.Mode.Perm() == 0640 && g.armed.CompareAndSwap(false, true) {
+	if err == nil && c.Metadata != nil && storedModeFromMetadata(*c.Metadata).Perm() == 0640 && g.armed.CompareAndSwap(false, true) {
 		g.entered <- confirmedChmodResult{ctx, a}
 		<-g.release
 	}
@@ -45,12 +45,12 @@ type confirmedChmodStorage struct {
 	gate *confirmedChmodGate
 }
 
-func (s *confirmedChmodStorage) NewFileSession(ctx context.Context, o storage.FileSessionOptions) (storage.FileSession, error) {
-	f, e := s.FileStorage.NewFileSession(ctx, o)
-	if e != nil {
-		return nil, e
+func (s *confirmedChmodStorage) NewFileSession(ctx context.Context, o storage.FileSessionOptions) (storage.FileSession, storage.FileSessionStatus, error) {
+	session, status, err := s.FileStorage.NewFileSession(ctx, o)
+	if err != nil {
+		return nil, status, err
 	}
-	return &confirmedChmodSession{f, s.gate}, nil
+	return &confirmedChmodSession{session, s.gate}, status, nil
 }
 
 type confirmedChmodSession struct {
@@ -58,29 +58,23 @@ type confirmedChmodSession struct {
 	gate *confirmedChmodGate
 }
 
-func (s *confirmedChmodSession) SetNodeAttr(ctx context.Context, id uint64, c storage.AttrChange) (storage.Attr, error) {
-	a, e := s.FileSession.SetNodeAttr(ctx, id, c)
-	return s.gate.result(ctx, c, a, e)
+func (s *confirmedChmodSession) SetNodeAttr(ctx context.Context, node uint64, c storage.AttrChange, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	receipt, err := s.FileSession.SetNodeAttr(ctx, node, c, id)
+	receipt.Observation.Attr, err = s.gate.result(ctx, c, receipt.Observation.Attr, err)
+	return receipt, err
 }
-func (s *confirmedChmodSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
+func (s *confirmedChmodSession) StatNode(ctx context.Context, id uint64, o storage.ObservationOptions) (storage.FileObservation, error) {
 	if s.gate.armed.Load() && ctx.Err() != nil {
 		s.gate.postReads.Add(1)
 	}
-	return s.FileSession.StatNode(ctx, id)
+	return s.FileSession.StatNode(ctx, id, o)
 }
-func (s *confirmedChmodSession) OpenFile(ctx context.Context, p string, o storage.FileOpenOptions) (storage.File, error) {
-	f, e := s.FileSession.OpenFile(ctx, p, o)
-	if e != nil {
-		return nil, e
+func (s *confirmedChmodSession) Reference(ctx context.Context, id storage.FileReferenceID) (storage.File, error) {
+	file, err := s.FileSession.Reference(ctx, id)
+	if err != nil {
+		return nil, err
 	}
-	return &confirmedChmodFile{f, s.gate}, nil
-}
-func (s *confirmedChmodSession) OpenNode(ctx context.Context, id uint64, o storage.FileOpenOptions) (storage.File, error) {
-	f, e := s.FileSession.OpenNode(ctx, id, o)
-	if e != nil {
-		return nil, e
-	}
-	return &confirmedChmodFile{f, s.gate}, nil
+	return &confirmedChmodFile{file, s.gate}, nil
 }
 
 type confirmedChmodFile struct {
@@ -88,15 +82,16 @@ type confirmedChmodFile struct {
 	gate *confirmedChmodGate
 }
 
-func (f *confirmedChmodFile) SetAttr(ctx context.Context, c storage.AttrChange) (storage.Attr, error) {
-	a, e := f.File.SetAttr(ctx, c)
-	return f.gate.result(ctx, c, a, e)
+func (f *confirmedChmodFile) SetAttr(ctx context.Context, c storage.AttrChange, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	receipt, err := f.File.SetAttr(ctx, c, id)
+	receipt.Observation.Attr, err = f.gate.result(ctx, c, receipt.Observation.Attr, err)
+	return receipt, err
 }
-func (f *confirmedChmodFile) Stat(ctx context.Context) (storage.Attr, error) {
+func (f *confirmedChmodFile) Stat(ctx context.Context, o storage.ObservationOptions) (storage.FileObservation, error) {
 	if f.gate.armed.Load() && ctx.Err() != nil {
 		f.gate.postReads.Add(1)
 	}
-	return f.File.Stat(ctx)
+	return f.File.Stat(ctx, o)
 }
 
 func TestSignalAfterConfirmedChmodUsesReturnedAttributes(t *testing.T) {
@@ -157,7 +152,7 @@ func TestSignalAfterConfirmedChmodUsesReturnedAttributes(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatal("chmod did not return confirmed backend result")
 		}
-		if result.attr.Mode.Perm() != 0640 || result.ctx.Err() != nil {
+		if storedMode(t, result.attr).Perm() != 0640 || result.ctx.Err() != nil {
 			t.Fatal("mutation did not confirm before signal")
 		}
 		if err := unix.Tgkill(pid, tid, syscall.SIGURG); err != nil {

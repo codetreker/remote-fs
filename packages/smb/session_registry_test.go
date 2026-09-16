@@ -310,7 +310,7 @@ func TestDisconnectedSessionCannotActivateAfterPreviousCleanup(t *testing.T) {
 	old, previous, tr, _, _, _ := testConnection(t)
 	old.server.config.Authenticator = &registryAuthenticator{sid: previous.principal.SID, immediate: true}
 	current := registryConnection(t, old.server)
-	gate := &cleanupDrainSession{WindowsSession: tr.session, entered: make(chan struct{}), release: make(chan struct{})}
+	gate := &cleanupDrainSession{windowsSession: tr.session, entered: make(chan struct{}), release: make(chan struct{})}
 	tr.session = gate
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
@@ -352,7 +352,7 @@ func TestDisconnectedSessionCannotActivateAfterPreviousCleanup(t *testing.T) {
 
 func TestPreviousAuthorityCleanupFailurePreventsNewSessionActivation(t *testing.T) {
 	old, previous, tr, _, backend, _ := testConnection(t)
-	fault := &cleanupAuthority{WindowsSession: backend}
+	fault := &cleanupAuthority{windowsSession: backend}
 	fault.closeFails.Store(true)
 	tr.session = fault
 	t.Cleanup(func() { fault.closeFails.Store(false) })

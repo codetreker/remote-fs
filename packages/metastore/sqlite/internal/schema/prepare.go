@@ -8,7 +8,6 @@ import (
 	"embed"
 	"errors"
 	"fmt"
-	"io/fs"
 	"math"
 	"syscall"
 	"time"
@@ -18,13 +17,15 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
 	"github.com/codetreker/remote-fs/packages/sqliteschema"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // The migrations that build this package's schema. 0001_tree.sql is the tree as version 1 had
 // it; 0002_replication.sql rekeys the entry table and adds the change log;
 // 0003_durable_state.sql adds the backing-store binding and durable identity witnesses;
 // 0004_lease_recovery.sql stores prepared and accepted lease-duration evidence;
-// 0005_retained_files.sql records unnamed retained files and their content revisions.
+// 0005_retained_files.sql records unnamed retained files and their content revisions;
+// 0006_shared_file_facts.sql separates common facts from opaque platform metadata.
 //
 // packages/sqliteschema documents what a numbered set of files buys and what rule they are kept
 // under: a file that has landed is never edited, and a schema change is a new file.
@@ -39,6 +40,8 @@ var schema = sqliteschema.MustLoad(migrationFiles, "migrations")
 const firstOwnershipAwareSchemaVersion = 3
 
 const firstRetainedFileSchemaVersion = 5
+
+const firstSharedFileSchemaVersion = 6
 
 // VolumeOpenMode decides whether preparation may create the named volume.
 type VolumeOpenMode uint8
@@ -56,8 +59,6 @@ type DurableOpen struct {
 	Startup      dbstate.Startup
 	Witnessed    bool
 }
-
-const rootDirectoryMode fs.FileMode = 0o755
 
 // Prepare brings the database to the layout this build writes, and returns the id of the
 // named volume and of its root directory, creating both when the volume is new.
@@ -94,11 +95,24 @@ func PrepareConfigured(
 	if err != nil {
 		return 0, 0, dbstate.State{}, err
 	}
-	defer tx.Rollback()
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		if rollbackErr := tx.Rollback(); rollbackErr != nil {
+			err = errors.Join(err, fmt.Errorf("rolling back SQLite preparation: %w", sqlerr.NewUncertainCommit(rollbackErr)))
+		}
+	}()
 
 	version, recorded, err := recordedSchemaVersion(ctx, tx)
 	if err != nil {
 		return 0, 0, dbstate.State{}, err
+	}
+	if recorded && version >= 1 && version <= schema.Version() {
+		if err := validateColumnLayout(ctx, tx, version); err != nil {
+			return 0, 0, dbstate.State{}, err
+		}
 	}
 	if durable != nil && durable.Startup.Accepted.DatabaseID != "" {
 		if !recorded || version < firstOwnershipAwareSchemaVersion || version > schema.Version() {
@@ -106,7 +120,7 @@ func PrepareConfigured(
 				"accepted durable state requires a supported durable schema between %d and %d, found recorded version %d: %w",
 				firstOwnershipAwareSchemaVersion, schema.Version(), version, syscall.EIO)
 		}
-		if err := dbstate.ReconcileStartup(ctx, tx, durable.Startup); err != nil {
+		if err := dbstate.ReconcileStartupVersion(ctx, tx, durable.Startup, version); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 	}
@@ -117,16 +131,24 @@ func PrepareConfigured(
 			version, syscall.EIO)
 	}
 	legacy := recorded && version > 0 && version < firstOwnershipAwareSchemaVersion
-	if recorded && version >= firstOwnershipAwareSchemaVersion && version < firstRetainedFileSchemaVersion {
+	if recorded && version >= 1 && version < firstSharedFileSchemaVersion {
+		if err := validateLegacyModeMapping(ctx, tx); err != nil {
+			return 0, 0, dbstate.State{}, err
+		}
+	}
+	if recorded && version >= firstOwnershipAwareSchemaVersion && version < firstSharedFileSchemaVersion {
 		if err := validateIntegrity(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes, version); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 	}
 	if legacy {
-		if err := validateIntegrityWork(ctx, tx, nil, maxIntegrityRecords); err != nil {
+		if err := validateIntegrityWorkVersion(ctx, tx, nil, maxIntegrityRecords, version); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 		if err := validateIntegrityBytes(ctx, tx, nil, maxIntegrityBytes, version); err != nil {
+			return 0, 0, dbstate.State{}, err
+		}
+		if err := validateNodeValuesVersion(ctx, tx, nil, version); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 		if err := validateLegacyObjectIntegrity(ctx, tx, version); err != nil {
@@ -142,7 +164,7 @@ func PrepareConfigured(
 		} else if err := validateNodeRelationshipsVersion(ctx, tx, nil, version); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
-		if err := validateUsedAccounting(ctx, tx, nil); err != nil {
+		if err := validateUsedAccountingVersion(ctx, tx, nil, version); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 		// Version 1 predates the log tables. Version 2's rows and recorded tail are
@@ -154,26 +176,21 @@ func PrepareConfigured(
 			}
 		}
 	}
+	if recorded && version >= 1 && version < firstSharedFileSchemaVersion {
+		if err := validateMigrationIdentityCapacity(ctx, tx, version); err != nil {
+			return 0, 0, dbstate.State{}, err
+		}
+	}
 	if err := schema.Reach(ctx, tx); err != nil {
 		return 0, 0, dbstate.State{}, err
 	}
-	// Version 1 did not carry volume on entries. Validate the global rooted tree and used
-	// accounting after the migrations normalize that table, while the same transaction can
-	// still roll every schema change back on refusal.
-	if legacy {
-		if err := validateStorageClasses(ctx, tx, nil); err != nil {
-			return 0, 0, dbstate.State{}, err
-		}
-		if err := validateNodeValues(ctx, tx, nil); err != nil {
-			return 0, 0, dbstate.State{}, err
-		}
-		if err := validateNodeRelationships(ctx, tx, nil); err != nil {
-			return 0, 0, dbstate.State{}, err
-		}
-		if err := validateUsedAccounting(ctx, tx, nil); err != nil {
-			return 0, 0, dbstate.State{}, err
-		}
-		if err := validateLogIntegrity(ctx, tx, nil); err != nil {
+	if err := validateColumnLayout(ctx, tx, schema.Version()); err != nil {
+		return 0, 0, dbstate.State{}, err
+	}
+	// Migration can alter every volume, so its postflight validates the complete
+	// new graph while every schema and history change can still roll back.
+	if !recorded || version < firstSharedFileSchemaVersion {
+		if err := validateIntegrity(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes, schema.Version()); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 	}
@@ -222,6 +239,7 @@ func PrepareConfigured(
 	if err := tx.Commit(); err != nil {
 		return 0, 0, dbstate.State{}, sqlerr.NewUncertainCommit(err)
 	}
+	committed = true
 	return id, root, state, nil
 }
 
@@ -318,8 +336,6 @@ func createVolume(ctx context.Context, tx *sql.Tx, volume string) (id, root int6
 		return 0, 0, err
 	}
 
-	// The root is a directory nobody made, so it gets the mode a directory is made with and
-	// the moment the volume came into being.
 	now := time.Now()
 	sec, nsec := sqlvalue.StoredTime(now)
 	root, err = dbstate.AllocateNodeID(ctx, tx)
@@ -327,9 +343,10 @@ func createVolume(ctx context.Context, tx *sql.Tx, volume string) (id, root int6
 		return 0, 0, err
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, windows_creation_sec,windows_creation_nsec,windows_change_sec,windows_change_nsec,content)
-		VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?,?,?,?,NULL)`,
-		root, id, int64(fs.ModeDir|rootDirectoryMode), sec, nsec, sec, nsec, sec, nsec, sec, nsec)
+		INSERT INTO nodes (id, volume, kind, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec,
+			creation_sec, creation_nsec, change_sec, change_nsec, directory_revision, content)
+		VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL)`,
+		root, id, int64(storage.NodeDirectory), sec, nsec, sec, nsec, sec, nsec, sec, nsec)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -340,4 +357,30 @@ func createVolume(ctx context.Context, tx *sql.Tx, volume string) (id, root int6
 		return 0, 0, err
 	}
 	return id, root, nil
+}
+
+func validateMigrationIdentityCapacity(ctx context.Context, tx *sql.Tx, version int) error {
+	var highWater int64
+	if version >= firstOwnershipAwareSchemaVersion {
+		state, err := dbstate.Read(ctx, tx)
+		if err != nil {
+			return err
+		}
+		highWater = state.NodeHighWater
+	} else {
+		sequence, err := dbstate.SequenceValue(ctx, tx, "nodes")
+		if err != nil {
+			return err
+		}
+		highWater = sequence
+	}
+	var entries int64
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM entries`).Scan(&entries); err != nil {
+		return err
+	}
+	if entries > math.MaxInt64-highWater {
+		return fmt.Errorf("%d historical entries exceed the remaining shared identity space above %d: %w",
+			entries, highWater, syscall.ENOSPC)
+	}
+	return nil
 }

@@ -75,7 +75,7 @@ func TestBoundedListDoesNotRetainTheEntryThatCrossesItsBudget(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	result, err := storage.NewListResult(3, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+	result, err := storage.NewListResult(3, 0, func(_ int, nameBytes, _ int64, _ storage.Attr) (int64, error) {
 		return nameBytes, nil
 	})
 	if err != nil {

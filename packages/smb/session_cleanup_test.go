@@ -16,18 +16,19 @@ import (
 )
 
 type cleanupBackend struct {
-	storage.WindowsStorage
+	windowsBackend
 	newCalls   atomic.Int32
-	newSession func() storage.WindowsSession
+	newSession func() windowsSession
+	newErr     error
 }
 
-func (b *cleanupBackend) NewWindowsSession(context.Context, storage.FileSessionOptions) (storage.WindowsSession, error) {
+func (b *cleanupBackend) NewSession(context.Context, storage.FileSessionOptions) (windowsSession, error) {
 	b.newCalls.Add(1)
-	return b.newSession(), nil
+	return b.newSession(), b.newErr
 }
 
 type cleanupAuthority struct {
-	storage.WindowsSession
+	windowsSession
 	statusErr  error
 	closeFails atomic.Bool
 	closes     atomic.Int32
@@ -77,8 +78,8 @@ func TestFailedAuthorityAdmissionRetainsCleanupUntilRetry(t *testing.T) {
 	}
 	a := &cleanupAuthority{statusErr: syscall.EIO}
 	a.closeFails.Store(true)
-	backend := &cleanupBackend{WindowsStorage: tr.export.share.Backend, newSession: func() storage.WindowsSession { return a }}
-	tr.export.share.Backend = backend
+	backend := &cleanupBackend{windowsBackend: tr.export.backend, newSession: func() windowsSession { return a }}
+	tr.export.backend = backend
 	for range 2 {
 		if _, status := cleanupDispatch(t, t.Context(), c, s, wire.TreeConnect, 0, cleanupTreeConnectBody()); status != statusIO {
 			t.Fatalf("failed authority admission = %x", status)
@@ -108,16 +109,54 @@ func TestFailedAuthorityAdmissionRetainsCleanupUntilRetry(t *testing.T) {
 	}
 }
 
+func TestNewAuthorityErrorRetainsReturnedOwnerUntilCleanup(t *testing.T) {
+	c, s, tr, _, _, _ := testConnection(t)
+	if _, status := cleanupDispatch(t, t.Context(), c, s, wire.TreeDisconnect, tr.id, wire.EmptyResponseBody()); status != statusOK {
+		t.Fatalf("disconnect=%x", status)
+	}
+	owner := &cleanupAuthority{}
+	owner.closeFails.Store(true)
+	backend := &cleanupBackend{windowsBackend: tr.export.backend, newSession: func() windowsSession { return owner }, newErr: syscall.EIO}
+	tr.export.backend = backend
+	for range 2 {
+		if _, status := cleanupDispatch(t, t.Context(), c, s, wire.TreeConnect, 0, cleanupTreeConnectBody()); status != statusIO {
+			t.Fatalf("failed session admission=%x", status)
+		}
+	}
+	if backend.newCalls.Load() != 1 || owner.closes.Load() != 1 {
+		t.Fatalf("returned owner abandoned: new=%d close=%d", backend.newCalls.Load(), owner.closes.Load())
+	}
+	s.mu.Lock()
+	retained := s.authorities[tr.export]
+	s.mu.Unlock()
+	if retained == nil || retained.session != owner || !retained.orphan {
+		t.Fatal("failed new-session owner not retained")
+	}
+	owner.closeFails.Store(false)
+	if err := tr.export.Unpublish(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if owner.closes.Load() != 2 || backend.newCalls.Load() != 1 {
+		t.Fatalf("cleanup owner replaced: new=%d close=%d", backend.newCalls.Load(), owner.closes.Load())
+	}
+	s.mu.Lock()
+	remaining := len(s.authorities)
+	s.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("retired owners=%d", remaining)
+	}
+}
+
 func TestLogoffPreventsTreeConnectAfterAuthorizationReturns(t *testing.T) {
 	c, s, tr, _, _, _ := testConnection(t)
-	backend := &cleanupBackend{WindowsStorage: tr.export.share.Backend, newSession: func() storage.WindowsSession { return &cleanupAuthority{} }}
-	tr.export.share.Backend = backend
+	backend := &cleanupBackend{windowsBackend: tr.export.backend, newSession: func() windowsSession { return &cleanupAuthority{} }}
+	tr.export.backend = backend
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
 	t.Cleanup(unblock)
 	c.server.config.Authorize = authz.AuthorizerFunc(func(ctx context.Context, req authz.AccessRequest) error {
-		if req.Operation == storage.OpWindowsSessionOpen {
+		if req.Operation == storage.OpFileSessionOpen {
 			close(entered)
 			select {
 			case <-release:
@@ -202,17 +241,17 @@ func TestAuthorityBookkeepingDoesNotAccumulateRetiredExports(t *testing.T) {
 	}
 	c.server.config.Limits.MaxTrees = 2
 	var authorities []*cleanupAuthority
-	backend := &cleanupBackend{WindowsStorage: tr.export.share.Backend, newSession: func() storage.WindowsSession {
-		a := &cleanupAuthority{WindowsSession: &backendSession{commandSession: &commandSession{}}}
+	backend := &cleanupBackend{windowsBackend: tr.export.backend, newSession: func() windowsSession {
+		a := &cleanupAuthority{windowsSession: &backendSession{commandSession: &commandSession{}}}
 		authorities = append(authorities, a)
 		return a
 	}}
 	export := tr.export
-	export.share.Backend = backend
+	export.backend = backend
 	for iteration := range 8 {
 		if iteration != 0 {
 			var err error
-			export, err = c.server.Publish(Share{Name: "work", Volume: "trusted", Backend: backend, Changes: testNotifySource(testNotifyStream())})
+			export, err = c.server.publish(Share{Name: "work", Volume: "trusted", Changes: testNotifySource(testNotifyStream())}, backend)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -246,8 +285,8 @@ func TestDisconnectedAuthorityCleanupFailureRemainsRetryable(t *testing.T) {
 	}
 	a := &cleanupAuthority{statusErr: syscall.EIO}
 	a.closeFails.Store(true)
-	backend := &cleanupBackend{WindowsStorage: tr.export.share.Backend, newSession: func() storage.WindowsSession { return a }}
-	tr.export.share.Backend = backend
+	backend := &cleanupBackend{windowsBackend: tr.export.backend, newSession: func() windowsSession { return a }}
+	tr.export.backend = backend
 	if _, status := cleanupDispatch(t, t.Context(), c, s, wire.TreeConnect, 0, cleanupTreeConnectBody()); status != statusIO {
 		t.Fatalf("failed admission = %x", status)
 	}
@@ -280,7 +319,7 @@ func TestDisconnectedAuthorityCleanupFailureRemainsRetryable(t *testing.T) {
 }
 
 type cleanupDrainSession struct {
-	storage.WindowsSession
+	windowsSession
 	entered chan struct{}
 	release chan struct{}
 	once    sync.Once
@@ -290,7 +329,7 @@ func (s *cleanupDrainSession) Close(ctx context.Context) error {
 	s.once.Do(func() { close(s.entered) })
 	select {
 	case <-s.release:
-		return s.WindowsSession.Close(ctx)
+		return s.windowsSession.Close(ctx)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -299,7 +338,7 @@ func (s *cleanupDrainSession) Close(ctx context.Context) error {
 func TestConcurrentLogoffRetainsSignerUntilBothFramesRetire(t *testing.T) {
 	c, s, tr, _, _, _ := testConnection(t)
 	key := s.signer
-	backend := &cleanupDrainSession{WindowsSession: tr.session, entered: make(chan struct{}), release: make(chan struct{})}
+	backend := &cleanupDrainSession{windowsSession: tr.session, entered: make(chan struct{}), release: make(chan struct{})}
 	tr.session = backend
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(backend.release) }) }
@@ -383,8 +422,8 @@ func TestShutdownRetriesDisconnectedAuthorityOwnership(t *testing.T) {
 	}
 	a := &cleanupAuthority{statusErr: syscall.EIO}
 	a.closeFails.Store(true)
-	backend := &cleanupBackend{WindowsStorage: tr.export.share.Backend, newSession: func() storage.WindowsSession { return a }}
-	tr.export.share.Backend = backend
+	backend := &cleanupBackend{windowsBackend: tr.export.backend, newSession: func() windowsSession { return a }}
+	tr.export.backend = backend
 	if _, status := cleanupDispatch(t, t.Context(), c, s, wire.TreeConnect, 0, cleanupTreeConnectBody()); status != statusIO {
 		t.Fatalf("failed admission = %x", status)
 	}

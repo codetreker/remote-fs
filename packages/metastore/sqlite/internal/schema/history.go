@@ -58,61 +58,56 @@ func validateVersionTwoLogStorageClasses(ctx context.Context, db sqlvalue.Querye
 
 // validateLogIntegrity checks the durable tail, predecessor chain, and operation-dependent
 // shape of every retained change before Snapshot or Since may expose it as history.
-func validateLogIntegrity(ctx context.Context, db sqlvalue.Queryer, volume *int64) error {
-	if err := validateLogIntegrityVersion(ctx, db, volume, true); err != nil {
+func validateLogIntegrity(ctx context.Context, db sqlvalue.Queryer, volume *int64, maxRecords, maxBytes int64) error {
+	return validateStoredLogIntegrity(ctx, db, volume, schema.Version(), maxRecords, maxBytes)
+}
+
+func validateStoredLogIntegrity(ctx context.Context, db sqlvalue.Queryer, volume *int64, version int, maxRecords, maxBytes int64) error {
+	if version < firstSharedFileSchemaVersion {
+		return validateLogIntegrityVersion(ctx, db, volume, version >= firstOwnershipAwareSchemaVersion)
+	}
+	invalid, err := validateLogHeaders(ctx, db, volume, true)
+	if err != nil {
 		return err
 	}
-	return changes.ValidateNotifications(ctx, db, volume)
+	if invalid != 0 {
+		return fmt.Errorf("the database holds %d invalid volume logs and 0 invalid change rows: %w", invalid, syscall.EIO)
+	}
+	where := ""
+	var args []any
+	if volume != nil {
+		where = "c.volume = ? AND "
+		args = []any{*volume}
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM changes c
+		LEFT JOIN volumes v ON v.id = c.volume
+		LEFT JOIN nodes subject ON subject.id = c.node
+		LEFT JOIN nodes parent ON parent.id = c.parent
+		LEFT JOIN nodes source ON source.id = c.from_parent
+		WHERE `+where+`(v.id IS NULL OR
+			(subject.id IS NOT NULL AND subject.volume != c.volume) OR
+			(parent.id IS NOT NULL AND parent.volume != c.volume) OR
+			(source.id IS NOT NULL AND source.volume != c.volume))`, args...).Scan(&invalid); err != nil {
+		return err
+	}
+	if invalid != 0 {
+		return fmt.Errorf("the database holds 0 invalid volume logs and %d invalid change rows: %w", invalid, syscall.EIO)
+	}
+	return changes.ValidateNotifications(ctx, db, volume, maxRecords, maxBytes)
 }
 
 func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, predecessors bool) error {
-	volumeWhere := ""
 	changeWhere := ""
 	var args []any
 	if volume != nil {
-		volumeWhere = "WHERE ns.id = ? AND "
 		changeWhere = "WHERE c.volume = ? AND "
 		args = []any{*volume}
 	} else {
-		volumeWhere = "WHERE "
 		changeWhere = "WHERE "
 	}
 
-	tailPredicate := `l.committed_position != coalesce((
-				SELECT max(c.position) FROM changes c WHERE c.volume = ns.id
-			), l.trimmed_through)`
-	if predecessors {
-		tailPredicate = `l.committed_position != coalesce((
-				SELECT max(c.position) FROM changes c WHERE c.volume = ns.id
-			), l.trimmed_through) OR
-			EXISTS (
-				SELECT 1 FROM (
-					SELECT position, previous_position,
-						row_number() OVER (ORDER BY position) AS ordinal,
-						lag(position) OVER (ORDER BY position) AS preceding
-					FROM changes WHERE volume = ns.id
-				) chain
-				WHERE chain.previous_position != CASE
-					WHEN chain.ordinal = 1 THEN l.trimmed_through
-					ELSE chain.preceding
-				END
-			)`
-	}
-	var invalidLogs int64
-	if err := db.QueryRowContext(ctx, `
-		SELECT count(*)
-		FROM volumes ns
-		LEFT JOIN logs l ON l.volume = ns.id
-		`+volumeWhere+`(
-			l.volume IS NULL OR l.incarnation = '' OR
-			l.committed_position < 0 OR l.trimmed_through < 0 OR
-			l.trimmed_by_age NOT IN (0, 1) OR l.trimmed_through > l.committed_position OR
-			`+tailPredicate+` OR
-			EXISTS (
-				SELECT 1 FROM changes c
-				WHERE c.volume = ns.id AND c.position <= l.trimmed_through
-			)
-		)`, args...).Scan(&invalidLogs); err != nil {
+	invalidLogs, err := validateLogHeaders(ctx, db, volume, predecessors)
+	if err != nil {
 		return err
 	}
 
@@ -129,8 +124,8 @@ func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volum
 		changes.KindCreated, changes.KindRemoved, changes.KindRenamed, changes.KindModified,
 		changes.KindRenamed, changes.KindRenamed,
 		changes.KindRemoved, changes.KindRemoved,
-		int64(math.MaxUint32), int64(fs.ModeType), int64(fs.ModeDir), int64(fs.ModeSymlink),
-		int64(fs.ModeType), int64(fs.ModeDir), int64(fs.ModeType), int64(fs.ModeSymlink), int64(fs.ModeType),
+		int64(math.MaxUint32), int64(fs.ModeType), int64(fs.ModeDir),
+		int64(fs.ModeType), int64(fs.ModeDir), int64(fs.ModeType),
 	)
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*)
@@ -166,9 +161,8 @@ func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volum
 				c.node <= 0 OR c.mode < 0 OR c.mode > ? OR c.size < 0 OR
 				c.atime_nsec < 0 OR c.atime_nsec >= 1000000000 OR
 				c.mtime_nsec < 0 OR c.mtime_nsec >= 1000000000 OR
-				(c.mode & ?) NOT IN (0, ?, ?) OR
+				(c.mode & ?) NOT IN (0, ?) OR
 				((c.mode & ?) = ? AND (c.size != 0 OR c.content IS NOT NULL)) OR
-				((c.mode & ?) = ? AND c.content IS NOT NULL) OR
 				((c.mode & ?) = 0 AND c.content IS NULL AND c.size != 0) OR
 				(c.content IS NOT NULL AND c.content = '')
 			)) OR
@@ -185,4 +179,52 @@ func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volum
 			invalidLogs, invalidChanges, syscall.EIO)
 	}
 	return nil
+}
+
+func validateLogHeaders(ctx context.Context, db sqlvalue.Queryer, volume *int64, predecessors bool) (int64, error) {
+	volumeWhere := "WHERE "
+	var args []any
+	if volume != nil {
+		volumeWhere = "WHERE ns.id = ? AND "
+		args = []any{*volume}
+	}
+	tailPredicate := `l.committed_position != coalesce((
+				SELECT max(c.position) FROM changes c WHERE c.volume = ns.id
+			), l.trimmed_through)`
+	if predecessors {
+		tailPredicate = `l.committed_position != coalesce((
+				SELECT max(c.position) FROM changes c WHERE c.volume = ns.id
+			), l.trimmed_through) OR
+			EXISTS (
+				SELECT 1 FROM (
+					SELECT position, previous_position,
+						row_number() OVER (ORDER BY position) AS ordinal,
+						lag(position) OVER (ORDER BY position) AS preceding
+					FROM changes WHERE volume = ns.id
+				) chain
+				WHERE chain.previous_position != CASE
+					WHEN chain.ordinal = 1 THEN l.trimmed_through
+					ELSE chain.preceding
+				END
+			)`
+	}
+	var invalidLogs int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM volumes ns
+		LEFT JOIN logs l ON l.volume = ns.id
+		`+volumeWhere+`(
+			l.volume IS NULL OR l.incarnation = '' OR
+			l.committed_position < 0 OR l.trimmed_through < 0 OR
+			l.trimmed_by_age NOT IN (0, 1) OR l.trimmed_through > l.committed_position OR
+			`+tailPredicate+` OR
+			EXISTS (
+				SELECT 1 FROM changes c
+				WHERE c.volume = ns.id AND c.position <= l.trimmed_through
+			)
+		)`, args...).Scan(&invalidLogs); err != nil {
+		return 0, err
+	}
+
+	return invalidLogs, nil
 }

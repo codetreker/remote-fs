@@ -18,8 +18,9 @@ func TestLocks(t *testing.T) {
 	for _, flags := range []uint32{0, LockShared | LockExclusive, LockUnlock, LockShared, 0xffffffff} {
 		b := append([]byte(nil), p...)
 		le.PutUint32(b[128:132], flags)
-		if _, err := parseOne(t, b).Lock(); err == nil {
-			t.Fatalf("invalid flags %x", flags)
+		decoded, err := parseOne(t, b).Lock()
+		if err != nil || len(decoded.Elements) != 2 || decoded.Elements[1].Flags != flags {
+			t.Fatalf("later semantic flags were not preserved: %x %+v %v", flags, decoded, err)
 		}
 	}
 	le.PutUint32(p[104:108], LockUnlock)
@@ -28,8 +29,8 @@ func TestLocks(t *testing.T) {
 		t.Fatal(err)
 	}
 	le.PutUint32(p[128:132], LockShared)
-	if _, err := parseOne(t, p).Lock(); err == nil {
-		t.Fatal("mixed unlock accepted")
+	if decoded, err := parseOne(t, p).Lock(); err != nil || decoded.Elements[0].Flags != LockUnlock || decoded.Elements[1].Flags != LockShared {
+		t.Fatal("mixed unlock batch lost its ordered elements")
 	}
 	le.PutUint16(p[66:68], 0)
 	if _, err := parseOne(t, p).Lock(); err == nil {

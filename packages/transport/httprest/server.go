@@ -28,11 +28,11 @@ type Handler struct {
 	lifetime            context.Context
 	cancelLifetime      context.CancelCauseFunc
 	files               *fileRegistry
-	windows             *windowsRegistry
 	storage             *locked.Storage
 	locks               locking.Service
 	lockControls        *bodyAdmission
-	windowsControls     *bodyAdmission
+	fileControls        *bodyAdmission
+	fileWaits           *bodyAdmission
 	log                 metastore.Log
 	limits              Limits
 	maxBodyBytes        int64
@@ -118,7 +118,8 @@ func NewHandlerWithOptions(s storage.Storage, log metastore.Log, options Handler
 		storage:             paired,
 		locks:               paired.LockService(),
 		lockControls:        configuredLockControlAdmission(settled.maxConcurrentLockControls, settled.maxWaitingLockControls),
-		windowsControls:     newBodyAdmission(settled.maxConcurrentLockControls, settled.maxInFlightResponseBytes, settled.maxWaitingLockControls),
+		fileControls:        newBodyAdmission(settled.maxConcurrentLockControls, settled.maxInFlightResponseBytes, settled.maxWaitingLockControls),
+		fileWaits:           newBodyAdmission(settled.maxConcurrentLockControls, settled.maxInFlightResponseBytes, settled.maxWaitingLockControls),
 		log:                 log,
 		limits:              settled.replication,
 		maxBodyBytes:        settled.maxBodyBytes,
@@ -144,7 +145,6 @@ func NewHandlerWithOptions(s storage.Storage, log metastore.Log, options Handler
 		stopping:  make(chan struct{}),
 	}
 	h.files = newFileRegistry(s, options.Files.settled())
-	h.windows = newWindowsRegistry(s, options.Files.settled())
 	if log != nil {
 		h.publisher = newPublisher(settled.replication.MaxSubscriptions)
 	}
@@ -164,9 +164,6 @@ func (h *Handler) Stop() {
 		}
 		if h.files != nil {
 			h.files.stop()
-		}
-		if h.windows != nil {
-			h.windows.stop()
 		}
 	})
 }
@@ -199,10 +196,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Op == OpFile || req.Op == OpFileControl {
 		h.serveFile(w, r)
-		return
-	}
-	if req.Op == OpWindows || req.Op == OpWindowsControl {
-		h.serveWindows(w, r)
 		return
 	}
 	if isLockControl(req.Op) {
@@ -263,7 +256,12 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) 
 			h.writeOperationError(w, err)
 			return
 		}
-		h.writeJSON(w, http.StatusOK, StatResponse{Attr: AttrOf(attr)})
+		wireAttr, err := AttrOf(attr)
+		if err != nil {
+			h.writeOperationError(w, err)
+			return
+		}
+		h.writeJSON(w, http.StatusOK, StatResponse{Attr: wireAttr})
 
 	case OpSetAttr:
 		body, release, err := h.readBody(r, h.maxBodyBytes)
@@ -305,7 +303,12 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) 
 			h.writeOperationError(w, err)
 			return
 		}
-		h.writeJSON(w, http.StatusOK, ListResponse{Entries: EntriesOf(entries)})
+		wireEntries, err := EntriesOf(entries)
+		if err != nil {
+			h.writeOperationError(w, err)
+			return
+		}
+		h.writeJSON(w, http.StatusOK, ListResponse{Entries: wireEntries})
 
 	case OpRead:
 		content, err := h.storage.ReadBounded(ctx, req.Path, h.maxBodyBytes)
@@ -465,7 +468,7 @@ func decodeChange(body []byte) (storage.AttrChange, error) {
 	if err := json.Unmarshal(body, &request); err != nil {
 		return storage.AttrChange{}, fmt.Errorf("the request body is not an attribute change: %w", err)
 	}
-	return request.Change.Storage(), nil
+	return request.Change.Storage()
 }
 
 func (h *Handler) writeRequestBodyFault(w http.ResponseWriter, err error) {
@@ -538,6 +541,13 @@ func volumeLockFailure(err error) *locking.Error {
 			}
 			return nil
 		}
+		if native, ok := err.(*storage.FileError); ok {
+			if native.Code != errno || native.Conflict != nil || native.Cause == nil || storage.ErrnoOf(native.Cause) != errno {
+				return nil
+			}
+			err = native.Cause
+			continue
+		}
 		if _, classified := err.(interface{ Classification() error }); classified {
 			return nil
 		}
@@ -576,19 +586,25 @@ func boundedErrorResponse(response ErrorResponse, limit int64) ErrorResponse {
 }
 
 func newListResult(limit int64) (*storage.ListResult, error) {
-	return storage.NewListResult(limit, int64(len(`{"entries":[]}`)), func(i int, nameBytes int64, attr storage.Attr) (int64, error) {
-		encodedAttr, err := json.Marshal(AttrOf(attr))
+	return storage.NewListResult(limit, int64(len(`{"entries":[]}`)), func(i int, nameBytes, metadataBytes int64, attr storage.Attr) (int64, error) {
+		wireAttr, err := AttrOf(attr)
+		if err != nil {
+			return 0, err
+		}
+		wireAttr.Metadata = []byte{}
+		encodedAttr, err := json.Marshal(wireAttr)
 		if err != nil {
 			return 0, fmt.Errorf("cannot size listing attributes: %w", err)
 		}
-		if nameBytes > limit {
+		if nameBytes > limit || metadataBytes > limit {
 			return limit + 1, nil
 		}
 		if int64(int(nameBytes)) != nameBytes {
 			return 0, fmt.Errorf("a listing name is too large for this process: %w", syscall.EFBIG)
 		}
 		encodedName := int64(base64.StdEncoding.EncodedLen(int(nameBytes)))
-		entryBytes := int64(len(`{"name":"","attr":}`)) + encodedName + int64(len(encodedAttr))
+		encodedMetadata := int64(base64.StdEncoding.EncodedLen(int(metadataBytes)))
+		entryBytes := int64(len(`{"name":"","attr":}`)) + encodedName + encodedMetadata + int64(len(encodedAttr))
 		if i != 0 {
 			entryBytes++
 		}

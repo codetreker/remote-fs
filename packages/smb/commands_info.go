@@ -2,7 +2,6 @@ package smb
 
 import (
 	"encoding/binary"
-	"io/fs"
 	"math"
 	"strings"
 	"time"
@@ -46,29 +45,29 @@ func decodeWindowsTime(v uint64) *time.Time {
 	return &t
 }
 
-func fileAttributes(a storage.WindowsAttr) uint32 {
+func fileAttributes(a windowsAttr) uint32 {
 	flags := a.DOSAttributes
 	if a.IsDir() {
-		flags = flags&^storage.WindowsDOSNormal | 0x10
+		flags = flags&^dosNormal | 0x10
 	}
-	if a.Mode&fs.ModeSymlink != 0 {
-		flags = flags&^storage.WindowsDOSNormal | 0x400
+	if a.Kind == storage.NodeSymlink {
+		flags = flags&^dosNormal | 0x400
 	}
 	if flags == 0 {
-		flags = storage.WindowsDOSNormal
+		flags = dosNormal
 	}
 	return flags
 }
 
 func allocationSize(a storage.Attr) uint64 {
 	// Allocation is reported in bytes because the object backend has no block allocation.
-	if a.IsDir() || a.Mode&fs.ModeSymlink != 0 || a.Size <= 0 {
+	if a.IsDir() || a.Kind == storage.NodeSymlink || a.Size <= 0 {
 		return 0
 	}
 	return uint64(a.Size)
 }
 
-func encodeBasicInfo(a storage.WindowsAttr) []byte {
+func encodeBasicInfo(a windowsAttr) []byte {
 	b := make([]byte, 40)
 	smbLE.PutUint64(b, windowsTime(a.CreationTime))
 	smbLE.PutUint64(b[8:], windowsTime(a.AccessTime))
@@ -78,29 +77,29 @@ func encodeBasicInfo(a storage.WindowsAttr) []byte {
 	return b
 }
 
-func encodeStandardInfo(a storage.WindowsAttr) []byte {
+func encodeStandardInfo(a windowsAttr) []byte {
 	b := make([]byte, 24)
 	smbLE.PutUint64(b, allocationSize(a.Attr))
-	if !a.IsDir() && a.Mode&fs.ModeSymlink == 0 {
+	if !a.IsDir() && a.Kind != storage.NodeSymlink {
 		smbLE.PutUint64(b[8:], uint64(a.Size))
 	}
 	smbLE.PutUint32(b[16:], 1)
 	if a.DeletePending {
 		b[20] = 1
 	}
-	if a.IsDir() || a.Mode&fs.ModeSymlink != 0 && a.DOSAttributes&storage.WindowsDOSDirectory != 0 {
+	if a.IsDir() || a.Kind == storage.NodeSymlink && a.DOSAttributes&dosDirectory != 0 {
 		b[21] = 1
 	}
 	return b
 }
 
-func encodeFileInfo(class byte, a storage.WindowsAttr, access uint32, position uint64) ([]byte, uint32) {
+func encodeFileInfo(class byte, a windowsAttr, access uint32, position uint64) ([]byte, uint32) {
 	switch class {
 	case 9, 18:
 		if err := a.NameInfo.Check(); err != nil {
 			return nil, fileIOError
 		}
-		if a.NameInfo.State == storage.WindowsNameDetached {
+		if a.NameInfo.State == windowsNameDetached {
 			return nil, 0xc0000123
 		}
 		name := wire.EncodeUTF16("\\" + strings.ReplaceAll(a.NameInfo.Path, "/", "\\"))
@@ -140,7 +139,7 @@ func encodeFileInfo(class byte, a storage.WindowsAttr, access uint32, position u
 	case 17:
 		return make([]byte, 4), fileSuccess // Byte alignment.
 	case 22: // The unnamed data stream is the only exposed stream.
-		if a.IsDir() || a.Mode&fs.ModeSymlink != 0 {
+		if a.IsDir() || a.Kind == storage.NodeSymlink {
 			return nil, fileSuccess
 		}
 		n := wire.EncodeUTF16("::$DATA")
@@ -154,7 +153,7 @@ func encodeFileInfo(class byte, a storage.WindowsAttr, access uint32, position u
 		b := make([]byte, 56)
 		copy(b, encodeBasicInfo(a)[:32])
 		smbLE.PutUint64(b[32:], allocationSize(a.Attr))
-		if !a.IsDir() && a.Mode&fs.ModeSymlink == 0 {
+		if !a.IsDir() && a.Kind != storage.NodeSymlink {
 			smbLE.PutUint64(b[40:], uint64(a.Size))
 		}
 		smbLE.PutUint32(b[48:], fileAttributes(a))
@@ -162,7 +161,7 @@ func encodeFileInfo(class byte, a storage.WindowsAttr, access uint32, position u
 	case 35:
 		b := make([]byte, 8)
 		smbLE.PutUint32(b, fileAttributes(a))
-		if a.Mode&fs.ModeSymlink != 0 {
+		if a.Kind == storage.NodeSymlink {
 			smbLE.PutUint32(b[4:], wire.SymlinkReparseTag)
 		}
 		return b, fileSuccess
@@ -171,7 +170,7 @@ func encodeFileInfo(class byte, a storage.WindowsAttr, access uint32, position u
 	}
 }
 
-func directoryEntry(class byte, name string, a storage.WindowsAttr, index uint32) ([]byte, uint32) {
+func directoryEntry(class byte, name string, a windowsAttr, index uint32) ([]byte, uint32) {
 	n := wire.EncodeUTF16(name)
 	base := 0
 	switch class {
@@ -199,13 +198,13 @@ func directoryEntry(class byte, name string, a storage.WindowsAttr, index uint32
 		smbLE.PutUint64(b[16:], windowsTime(a.AccessTime))
 		smbLE.PutUint64(b[24:], windowsTime(a.ModTime))
 		smbLE.PutUint64(b[32:], windowsTime(a.ChangeTime))
-		if !a.IsDir() && a.Mode&fs.ModeSymlink == 0 {
+		if !a.IsDir() && a.Kind != storage.NodeSymlink {
 			smbLE.PutUint64(b[40:], uint64(a.Size))
 		}
 		smbLE.PutUint64(b[48:], allocationSize(a.Attr))
 		smbLE.PutUint32(b[56:], fileAttributes(a))
 		smbLE.PutUint32(b[60:], uint32(len(n)))
-		if class != 1 && a.Mode&fs.ModeSymlink != 0 {
+		if class != 1 && a.Kind == storage.NodeSymlink {
 			smbLE.PutUint32(b[64:], wire.SymlinkReparseTag)
 		}
 		if class == 37 {
@@ -248,13 +247,13 @@ func expandAccess(mask uint32) uint32 {
 	return mask
 }
 
-func decodeAccess(mask uint32) (storage.WindowsAccess, uint32) {
+func decodeAccess(mask uint32) (windowsAccess, uint32) {
 	mask = expandAccess(mask)
 	// EA and execute bits convey no additional authority for the exposed filesystem.
 	if mask & ^uint32(0x001201ff|0x00010000) != 0 {
 		return 0, fileNotSupported
 	}
-	var access storage.WindowsAccess
+	var access windowsAccess
 	for _, v := range accessBits {
 		if mask&v.raw != 0 {
 			access |= v.semantic
@@ -265,10 +264,10 @@ func decodeAccess(mask uint32) (storage.WindowsAccess, uint32) {
 
 var accessBits = []struct {
 	raw      uint32
-	semantic storage.WindowsAccess
-}{{1, storage.WindowsReadData}, {2, storage.WindowsWriteData}, {4, storage.WindowsAppendData}, {0x40, storage.WindowsDeleteChild}, {0x80, storage.WindowsReadAttributes}, {0x100, storage.WindowsWriteAttributes}, {0x10000, storage.WindowsDelete}, {0x20000, storage.WindowsReadSecurity}, {0x100000, storage.WindowsSynchronize}}
+	semantic windowsAccess
+}{{1, windowsReadData}, {2, windowsWriteData}, {4, windowsAppendData}, {0x40, windowsDeleteChild}, {0x80, windowsReadAttributes}, {0x100, windowsWriteAttributes}, {0x10000, windowsDelete}, {0x20000, windowsReadSecurity}, {0x100000, windowsSynchronize}}
 
-func encodeAccess(access storage.WindowsAccess) uint32 {
+func encodeAccess(access windowsAccess) uint32 {
 	var mask uint32
 	for _, v := range accessBits {
 		if access&v.semantic != 0 {

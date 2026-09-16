@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -306,8 +306,8 @@ func TestAnEventChannelThatBrokeMakesEveryOperationFailRatherThanAnswer(t *testi
 		{"removing a directory", func() error { return mounted.RemoveDir(t.Context(), "existing") }},
 		{"renaming", func() error { return mounted.Rename(t.Context(), "a.txt", "b.txt") }},
 		{"changing attributes", func() error {
-			mode := os.FileMode(0o600)
-			return mounted.SetAttr(t.Context(), "a.txt", storage.AttrChange{Mode: &mode})
+			metadata := storage.Metadata{{Key: "test.value", Version: 1, Data: []byte("updated")}}
+			return mounted.SetAttr(t.Context(), "a.txt", storage.AttrChange{ExpectedRevision: 1, Metadata: &metadata})
 		}},
 		{"asking how much room there is", func() error { _, err := mounted.Space(t.Context()); return err }},
 	} {
@@ -900,26 +900,33 @@ func TestAChangeToTheRootIsConfirmedLikeAnyOther(t *testing.T) {
 	s := serve(t, httprest.DefaultLimits())
 	mounted, _ := mountWithGrace(t, s, grace)
 
-	mode := fs.FileMode(0o711)
+	before, err := mounted.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := before.Metadata.With(storage.OpaqueMetadata{Key: "test.value", Version: 1, Data: []byte("updated")})
+	if err != nil {
+		t.Fatal(err)
+	}
 	started := time.Now()
-	if err := mounted.SetAttr(t.Context(), "", storage.AttrChange{Mode: &mode}); err != nil {
-		t.Fatalf("changing the root's mode: %v", err)
+	if err := mounted.SetAttr(t.Context(), "", storage.AttrChange{ExpectedRevision: before.MetadataRevision, Metadata: &metadata}); err != nil {
+		t.Fatalf("changing the root's metadata: %v", err)
 	}
 	took := time.Since(started)
 
 	// It has to be confirmed by the event, not by the grace running out — and the grace here
 	// is long enough that waiting it out is unmistakable.
 	if took >= grace {
-		t.Fatalf("changing the root's mode took %v, which is the whole grace: its barrier was not reached", took)
+		t.Fatalf("changing the root's metadata took %v, which is the whole grace: its barrier was not reached", took)
 	}
 	attr, err := mounted.Stat(t.Context(), "")
 	if err != nil {
 		t.Fatalf("stat of the root straight after changing its mode: %v", err)
 	}
-	if attr.Mode.Perm() != mode.Perm() {
-		t.Fatalf("the copy reports the root as %v straight after it was set to %v", attr.Mode, mode)
+	if !reflect.DeepEqual(attr.Metadata, metadata) {
+		t.Fatalf("the copy reports the root as %v straight after it was set to %v", attr.Metadata, metadata)
 	}
-	t.Logf("the root's mode was changed and confirmed in %v", took)
+	t.Logf("the root's metadata was changed and confirmed in %v", took)
 }
 
 // TestSameTargetReplayCannotConfirmBeforeTheMutationBarrier.
@@ -1070,7 +1077,7 @@ func TestAMutationThatRecordsNothingIsNotWaitedFor(t *testing.T) {
 		t.Fatalf("renaming a name that is not there onto itself gave %v, want ENOENT: it is sent for exactly this answer", err)
 	}
 
-	if after, err := mounted.Stat(t.Context(), "a.txt"); err != nil || after != before {
+	if after, err := mounted.Stat(t.Context(), "a.txt"); err != nil || !reflect.DeepEqual(after.Clone(), before.Clone()) {
 		t.Fatalf("a.txt is now %+v (%v), and nothing here changed it from %+v", after, err, before)
 	}
 	requireCaughtUp(t, s, replica)

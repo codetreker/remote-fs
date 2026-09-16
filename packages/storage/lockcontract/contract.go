@@ -5,7 +5,6 @@ package lockcontract
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"testing"
 	"time"
 
@@ -150,15 +149,22 @@ func sharedProtection(t *testing.T, f Fixture) {
 
 func exclusiveMutations(t *testing.T, f Fixture) {
 	a, b := owner(t, f), owner(t, f)
-	mode := fs.FileMode(0o600)
 	stamp := time.Unix(1700000000, 0)
 	for _, test := range []struct {
 		name string
 		run  func(storage.Storage, string) error
 	}{
 		{"write", func(s storage.Storage, p string) error { return s.Write(t.Context(), p, []byte("updated")) }},
-		{"mode", func(s storage.Storage, p string) error {
-			return s.SetAttr(t.Context(), p, storage.AttrChange{Mode: &mode})
+		{"metadata", func(s storage.Storage, p string) error {
+			attr, err := s.Stat(t.Context(), p)
+			if err != nil {
+				return err
+			}
+			metadata, err := attr.Metadata.With(storage.OpaqueMetadata{Key: "test.value", Version: 1, Data: []byte("updated")})
+			if err != nil {
+				return err
+			}
+			return s.SetAttr(t.Context(), p, storage.AttrChange{ExpectedRevision: attr.MetadataRevision, Metadata: &metadata})
 		}},
 		{"mtime", func(s storage.Storage, p string) error {
 			return s.SetAttr(t.Context(), p, storage.AttrChange{ModTime: &stamp})

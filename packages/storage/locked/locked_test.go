@@ -3,7 +3,6 @@ package locked_test
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"reflect"
 	"syscall"
 	"testing"
@@ -149,7 +148,7 @@ func TestFacadeScopesOnlyMutationsAndPreservesErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := locking.WithScope(t.Context(), scope)
-	mode := fs.FileMode(0o600)
+	metadata := storage.Metadata{{Key: "test", Version: 1, Data: []byte("scope")}}
 	for _, operation := range []struct {
 		name     string
 		mutation bool
@@ -161,7 +160,9 @@ func TestFacadeScopesOnlyMutationsAndPreservesErrors(t *testing.T) {
 		{"remove", true, func() error { return view.Remove(ctx, "file") }},
 		{"remove directory", true, func() error { return view.RemoveDir(ctx, "dir") }},
 		{"rename", true, func() error { return view.Rename(ctx, "from", "to") }},
-		{"attributes", true, func() error { return view.SetAttr(ctx, "file", storage.AttrChange{Mode: &mode}) }},
+		{"attributes", true, func() error {
+			return view.SetAttr(ctx, "file", storage.AttrChange{ExpectedRevision: 1, Metadata: &metadata})
+		}},
 		{"stat", false, func() error { _, err := view.Stat(ctx, "file"); return err }},
 		{"read", false, func() error { _, err := view.Read(ctx, "file"); return err }},
 		{"bounded read", false, func() error { _, err := view.ReadBounded(ctx, "file", 1); return err }},

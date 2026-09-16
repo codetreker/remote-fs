@@ -14,7 +14,6 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/smb/internal/signing"
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
-	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 const (
@@ -101,7 +100,7 @@ type authoritySession struct {
 	installMu    sync.RWMutex
 	orphan       bool
 	mu           sync.Mutex
-	session      storage.WindowsSession
+	session      windowsSession
 	epoch        uint64
 	refs         int
 	stopping     bool
@@ -120,7 +119,7 @@ type tree struct {
 	id        uint32
 	sessionID uint64
 	export    *Export
-	session   storage.WindowsSession
+	session   windowsSession
 	files     *fileDispatcher
 	authority *authoritySession
 	closeMu   sync.Mutex

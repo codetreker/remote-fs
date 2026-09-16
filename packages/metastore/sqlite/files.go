@@ -5,213 +5,19 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io/fs"
-	"math"
-	"syscall"
-	"time"
-
-	"github.com/codetreker/remote-fs/packages/advisory"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
-	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/nativelease"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
 	"github.com/codetreker/remote-fs/packages/storage"
+	"math"
+	"syscall"
 )
 
 type retainedNode struct{ volume, id int64 }
 
-// All fields are protected by the database commit gate. Physical retention is
-// distinct from active publication authority, which is revoked before I/O drains.
-type retainedFile struct {
-	store          *Store
-	id             int64
-	read, write    bool
-	active, closed bool
-	closeErr       error
-	windowsHandle  uint64
-}
-
 var _ metastore.FileStore = (*Store)(nil)
-var _ metastore.File = (*retainedFile)(nil)
-
-func (s *Store) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (metastore.File, error) {
-	if err := options.Check(); err != nil {
-		return nil, err
-	}
-	cleaned, err := storage.CleanPath(path)
-	if err != nil {
-		return nil, err
-	}
-	return s.openFile(ctx, cleaned, 0, options)
-}
-
-func (s *Store) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (metastore.File, error) {
-	if err := options.CheckNode(id); err != nil {
-		return nil, err
-	}
-	if id > math.MaxInt64 {
-		return nil, syscall.ESTALE
-	}
-	return s.openFile(ctx, "", int64(id), options)
-}
-
-func (s *Store) openFile(ctx context.Context, path string, id int64, options storage.FileOpenOptions) (metastore.File, error) {
-	if err := s.coordinator.commit.acquire(ctx); err != nil {
-		return nil, err
-	}
-	defer s.coordinator.commit.release()
-	if err := s.checkFileOwnership(); err != nil {
-		return nil, err
-	}
-	if err := s.coordinator.healthy(); err != nil {
-		return nil, err
-	}
-	if s.files == nil {
-		return nil, syscall.ESTALE
-	}
-	if s.fileDomain.files >= s.fileDomain.maxFiles {
-		return nil, syscall.EAGAIN
-	}
-	var state metastore.FileState
-	handle, err := s.fileDomain.windows.allocateHandle()
-	if err != nil {
-		return nil, err
-	}
-	registered := false
-	defer func() {
-		if registered {
-			_, _ = s.fileDomain.windows.access.Close(handle)
-		}
-	}()
-	resolve := func(tx *sql.Tx) error {
-		var node metastore.Node
-		var err error
-		if id != 0 {
-			node, err = s.nodeByID(ctx, tx, id)
-		} else {
-			node, err = s.resolve(ctx, tx, path)
-		}
-		if err != nil {
-			if errors.Is(err, syscall.ENOENT) && options.ExpectedID != 0 {
-				return syscall.ESTALE
-			}
-			if !errors.Is(err, syscall.ENOENT) || !options.Create {
-				return err
-			}
-			if options.ExpectedID != 0 {
-				return syscall.ESTALE
-			}
-			parent, name, err := s.resolveParent(ctx, tx, path)
-			if err != nil {
-				return err
-			}
-			node, err = s.createOpenNode(ctx, tx, parent, name, options)
-			if err != nil {
-				return err
-			}
-		} else {
-			if options.Create && options.Exclusive {
-				return syscall.EEXIST
-			}
-			if options.ExpectedID != 0 && options.ExpectedID != uint64(node.ID) {
-				return syscall.ESTALE
-			}
-			if node.Mode&fs.ModeSymlink != 0 {
-				return syscall.ELOOP
-			}
-			if !node.Mode.IsRegular() {
-				return syscall.EISDIR
-			}
-			if options.Write {
-				if err := s.checkWindowsReadonly(ctx, tx, node.ID); err != nil {
-					return err
-				}
-			}
-			if options.Truncate {
-				if err := s.replaceNodeContent(ctx, tx, node, metastore.Object{ModTime: time.Now()}, nil); err != nil {
-					return err
-				}
-			}
-		}
-		state, err = s.fileState(ctx, tx, node.ID)
-		if err != nil {
-			return err
-		}
-		var access storage.WindowsAccess
-		if options.Read {
-			access |= storage.WindowsReadData
-		}
-		if options.Write {
-			access |= storage.WindowsWriteData
-		}
-		if err := s.registerWindowsOpenLocked(ctx, handle, node.ID, access, storage.WindowsShareAll); err != nil {
-			return err
-		}
-		registered = true
-		return err
-	}
-	modify := options.Create || options.Truncate
-	if options.Create && !options.Truncate {
-		err := s.inspect(ctx, func(tx *sql.Tx) error {
-			_, err := s.resolve(ctx, tx, path)
-			if err == nil {
-				modify = false
-			}
-			if errors.Is(err, syscall.ENOENT) {
-				return nil
-			}
-			return err
-		})
-		if err != nil {
-			return nil, sqlerr.Failure(err)
-		}
-	}
-	if modify {
-		kind := locking.CreateMutation
-		if options.Truncate {
-			kind = locking.WriteMutation
-		}
-		intent := &volumeIntent{kind: kind, node: id}
-		if id == 0 {
-			intent.paths = []string{path}
-		}
-		if err := s.mutateTransactionLocked(ctx, ctx, intent, resolve); err != nil {
-			return nil, sqlerr.Failure(err)
-		}
-	} else if err := s.inspect(ctx, resolve); err != nil {
-		return nil, sqlerr.Failure(err)
-	}
-	f := &retainedFile{store: s, id: state.ID, read: options.Read, write: options.Write, active: true, windowsHandle: handle}
-	s.files[f] = struct{}{}
-	s.fileDomain.files++
-	s.coordinator.pins[retainedNode{s.volume, f.id}]++
-	registered = false
-	return f, nil
-}
-
-func (s *Store) createOpenNode(ctx context.Context, tx *sql.Tx, parent metastore.Node, name []byte, options storage.FileOpenOptions) (metastore.Node, error) {
-	now := time.Now()
-	sec, nsec := sqlvalue.StoredTime(now)
-	id, err := dbstate.AllocateNodeID(ctx, tx)
-	if err != nil {
-		return metastore.Node{}, err
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO nodes (id,volume,mode,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content) VALUES (?,?,?,0,?,?,?,?,NULL)`, id, s.volume, int64(options.Mode), sec, nsec, sec, nsec); err != nil {
-		return metastore.Node{}, err
-	}
-	if err := s.link(ctx, tx, parent.ID, name, id); err != nil {
-		return metastore.Node{}, err
-	}
-	if err := s.recordCreated(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, id); err != nil {
-		return metastore.Node{}, err
-	}
-	if err := s.touch(ctx, tx, parent.ID, now); err != nil {
-		return metastore.Node{}, err
-	}
-	return s.nodeByID(ctx, tx, id)
-}
 
 func (s *Store) nodeByID(ctx context.Context, tx *sql.Tx, id int64) (metastore.Node, error) {
 	node, err := scanNode(tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes n WHERE n.volume=? AND n.id=?`, s.volume, id))
@@ -235,100 +41,11 @@ func (s *Store) fileState(ctx context.Context, tx *sql.Tx, id int64) (metastore.
 	if revision < 1 {
 		return metastore.FileState{}, syscall.EIO
 	}
-	return metastore.FileState{Node: scan.node(), Revision: uint64(revision), Detached: detached}, nil
-}
-
-func (f *retainedFile) check() error {
-	if !f.active {
-		return syscall.ESTALE
-	}
-	return f.store.coordinator.healthy()
-}
-
-func (f *retainedFile) Node(ctx context.Context) (metastore.FileState, error) {
-	if err := f.store.coordinator.commit.acquire(ctx); err != nil {
+	node, err := scan.node()
+	if err != nil {
 		return metastore.FileState{}, err
 	}
-	defer f.store.coordinator.commit.release()
-	if err := f.check(); err != nil {
-		return metastore.FileState{}, err
-	}
-	var state metastore.FileState
-	err := f.store.inspect(ctx, func(tx *sql.Tx) error {
-		var err error
-		state, err = f.store.fileState(ctx, tx, f.id)
-		if err != nil {
-			return err
-		}
-		if operation, ok := metastore.FileIOFromContext(ctx); ok {
-			return f.store.checkWindowsIOLocked(f.id, f.windowsHandle, state.Size, operation)
-		}
-		return nil
-	})
-	return state, sqlerr.Failure(err)
-}
-
-func (f *retainedFile) Reserve(ctx context.Context, size int64) (metastore.Key, error) {
-	if !f.write {
-		return "", syscall.EBADF
-	}
-	if size < 0 {
-		return "", syscall.EINVAL
-	}
-	if size > f.store.objectLimits.MaxPendingBytes {
-		return "", syscall.EFBIG
-	}
-	key, err := sqlvalue.NewKey()
-	if err != nil {
-		return "", err
-	}
-	sec, nsec := sqlvalue.StoredTime(time.Now())
-	err = f.store.mutate(ctx, func(tx *sql.Tx) error {
-		if err := f.check(); err != nil {
-			return err
-		}
-		node, err := f.store.nodeByID(ctx, tx, f.id)
-		if err != nil {
-			return err
-		}
-		if err := f.store.roomFor(ctx, tx, size-node.Size); err != nil {
-			return err
-		}
-		return f.store.reserveObject(ctx, tx, key, size, sec, nsec)
-	})
-	if err != nil {
-		return "", sqlerr.Failure(err)
-	}
-	return key, nil
-}
-
-func (f *retainedFile) Commit(ctx context.Context, expected uint64, object metastore.Object) (metastore.FileState, error) {
-	if !f.write {
-		return metastore.FileState{}, syscall.EBADF
-	}
-	if object.Size < 0 || expected == 0 {
-		return metastore.FileState{}, syscall.EINVAL
-	}
-	var state metastore.FileState
-	ctx = withWindowsActor(ctx, f.windowsHandle)
-	err := f.store.mutatePublication(ctx, &volumeIntent{kind: locking.WriteMutation, node: f.id}, func(tx *sql.Tx) error {
-		if err := f.check(); err != nil {
-			return err
-		}
-		before, err := f.store.fileState(ctx, tx, f.id)
-		if err != nil {
-			return err
-		}
-		if before.Revision != expected {
-			return syscall.EAGAIN
-		}
-		if err := f.store.replaceNodeContent(ctx, tx, before.Node, object, nil); err != nil {
-			return err
-		}
-		state, err = f.store.fileState(ctx, tx, f.id)
-		return err
-	})
-	return state, sqlerr.Failure(err)
+	return metastore.FileState{Node: node, Revision: uint64(revision), Detached: detached}, nil
 }
 
 func (s *Store) advanceContentRevision(ctx context.Context, tx *sql.Tx, id int64) error {
@@ -346,7 +63,7 @@ func (s *Store) advanceContentRevision(ctx context.Context, tx *sql.Tx, id int64
 	return nil
 }
 
-func (s *Store) replaceNodeContent(ctx context.Context, tx *sql.Tx, node metastore.Node, object metastore.Object, attributes *uint32) error {
+func (s *Store) replaceNodeContent(ctx context.Context, tx *sql.Tx, node metastore.Node, object metastore.Object, change *storage.AttrChange) error {
 	if object.Key == "" {
 		if object.Size != 0 {
 			return syscall.EINVAL
@@ -383,20 +100,12 @@ func (s *Store) replaceNodeContent(ctx context.Context, tx *sql.Tx, node metasto
 			return err
 		}
 	}
-	var mask metastore.ChangeMask
-	if attributes != nil {
-		var before uint32
-		if err := tx.QueryRowContext(ctx, `SELECT windows_attributes FROM nodes WHERE volume=? AND id=?`, s.volume, node.ID).Scan(&before); err != nil {
-			return err
-		}
-		if before != *attributes {
-			mask |= metastore.ChangeAttributes
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE nodes SET windows_attributes=? WHERE volume=? AND id=?`, *attributes, s.volume, node.ID); err != nil {
+	if change != nil && !change.Empty() {
+		if err := applyChange(ctx, tx, node, *change); err != nil {
 			return err
 		}
 	}
-	return s.recordNamedChangedMask(ctx, tx, node, mask)
+	return s.recordNamedChanged(ctx, tx, node)
 }
 
 func (s *Store) recordNamedChanged(ctx context.Context, tx *sql.Tx, before metastore.Node) error {
@@ -404,45 +113,33 @@ func (s *Store) recordNamedChanged(ctx context.Context, tx *sql.Tx, before metas
 }
 
 func (s *Store) recordNamedChangedMask(ctx context.Context, tx *sql.Tx, before metastore.Node, extra metastore.ChangeMask) error {
-	id := before.ID
 	var detached bool
-	if err := tx.QueryRowContext(ctx, `SELECT detached FROM nodes WHERE volume=? AND id=?`, s.volume, id).Scan(&detached); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT detached FROM nodes WHERE volume=? AND id=?`, s.volume, before.ID).Scan(&detached); err != nil {
 		return err
 	}
 	if detached {
-		_, err := s.updateChangeTime(ctx, tx, before.ID)
-		return err
-	}
-	changed, err := s.updateChangeTime(ctx, tx, before.ID)
-	if err != nil {
-		return err
-	}
-	return s.recordChangedMask(ctx, tx, before, extra|changed)
-}
-
-func (f *retainedFile) SetAttr(ctx context.Context, change storage.AttrChange) (metastore.FileState, error) {
-	if err := change.Check(); err != nil {
-		return metastore.FileState{}, err
-	}
-	var state metastore.FileState
-	err := f.store.mutatePublication(ctx, &volumeIntent{kind: locking.SetAttrMutation, node: f.id}, func(tx *sql.Tx) error {
-		if err := f.check(); err != nil {
+		current, err := s.nodeByID(ctx, tx, before.ID)
+		if err != nil {
 			return err
 		}
-		if err := f.store.setNodeAttr(ctx, tx, f.id, change); err != nil {
-			return err
+		if current.MetadataRevision == before.MetadataRevision {
+			_, err = s.updateChangeTime(ctx, tx, before.ID)
 		}
-		var err error
-		state, err = f.store.fileState(ctx, tx, f.id)
 		return err
-	})
-	return state, sqlerr.Failure(err)
+	}
+	if extra != 0 {
+		return s.recordChangedMask(ctx, tx, before, extra)
+	}
+	return s.recordChanged(ctx, tx, before)
 }
 
 func (s *Store) setNodeAttr(ctx context.Context, tx *sql.Tx, id int64, change storage.AttrChange) error {
 	node, err := s.nodeByID(ctx, tx, id)
 	if err != nil {
 		return err
+	}
+	if change.ExpectedRevision != 0 && change.ExpectedRevision != node.MetadataRevision {
+		return &storage.FileError{Code: syscall.EAGAIN, Conflict: &storage.FileConflict{Kind: storage.ConflictRevision, NodeID: uint64(id), Revision: uint64(node.MetadataRevision)}}
 	}
 	if change.Empty() {
 		return nil
@@ -490,133 +187,6 @@ func (s *Store) Usage(ctx context.Context) (int64, error) {
 		err = syscall.EIO
 	}
 	return used, sqlerr.Failure(err)
-}
-
-func (f *retainedFile) Retire(ctx context.Context) error {
-	if err := f.store.coordinator.commit.acquire(ctx); err != nil {
-		return err
-	}
-	defer f.store.coordinator.commit.release()
-	f.active = false
-	return nil
-}
-
-func (f *retainedFile) Close(ctx context.Context) error {
-	if err := f.store.coordinator.commit.acquire(ctx); err != nil {
-		return err
-	}
-	defer f.store.coordinator.commit.release()
-	f.active = false
-	if f.closed || f.closeErr != nil {
-		return f.closeErr
-	}
-	s := f.store
-	if err := s.finishPendingWindowsDeleteLocked(ctx, f.id, f.windowsHandle); err != nil {
-		return err
-	}
-	key := retainedNode{s.volume, f.id}
-	count := s.coordinator.pins[key]
-	if count < 1 {
-		return syscall.EIO
-	}
-	if count == 1 {
-		var detached bool
-		err := s.inspect(ctx, func(tx *sql.Tx) error {
-			return tx.QueryRowContext(ctx, `SELECT detached FROM nodes WHERE volume=? AND id=?`, s.volume, f.id).Scan(&detached)
-		})
-		if err != nil {
-			return sqlerr.Failure(err)
-		}
-		if detached {
-			err = s.mutateTransactionLocked(ctx, ctx, &volumeIntent{kind: locking.RemoveMutation, node: f.id, cleanup: true}, func(tx *sql.Tx) error {
-				node, err := s.nodeByID(ctx, tx, f.id)
-				if err != nil {
-					return err
-				}
-				return s.discardNode(ctx, tx, node)
-			})
-			if err != nil {
-				if s.coordinator.healthy() != nil || storage.IsPublicationAccountingUncertain(err) {
-					f.closeErr = sqlerr.Failure(err)
-					s.coordinator.poisonWith(f.closeErr)
-					if s.locks != nil {
-						s.locks.Fence(f.closeErr)
-					}
-					return f.closeErr
-				}
-				return sqlerr.Failure(err)
-			}
-		}
-		delete(s.coordinator.pins, key)
-	} else {
-		s.coordinator.pins[key] = count - 1
-	}
-	delete(s.files, f)
-	if _, err := s.fileDomain.windows.access.Close(f.windowsHandle); err != nil {
-		return windowsError(err)
-	}
-	s.fileDomain.files--
-	f.closed = true
-	return nil
-}
-
-type fileDomain struct {
-	config      advisory.Config
-	coordinator *advisory.Coordinator
-	stores      int
-	maxFiles    int
-	files       int
-	windows     *windowsDomain
-}
-
-func (s *Store) attachFileDomain(options Options) error {
-	domain := s.coordinator.domains[s.volume]
-	if domain == nil {
-		coordinator, err := advisory.New(options.Advisory)
-		if err != nil {
-			return err
-		}
-		windows, err := newWindowsDomain(options.MaxRetainedFiles, options.Advisory.MaxRanges)
-		if err != nil {
-			return err
-		}
-		domain = &fileDomain{config: options.Advisory, coordinator: coordinator, maxFiles: options.MaxRetainedFiles, windows: windows}
-		s.coordinator.domains[s.volume] = domain
-	} else if domain.config != options.Advisory || domain.maxFiles != options.MaxRetainedFiles {
-		return fmt.Errorf("shared SQLite volume file limits differ from its active owner: %w", syscall.EINVAL)
-	}
-	domain.stores++
-	s.fileDomain = domain
-	return nil
-}
-
-func (s *Store) releaseFileDomain() {
-	if s.fileDomain == nil {
-		return
-	}
-	s.fileDomain.stores--
-	if s.fileDomain.stores == 0 {
-		delete(s.coordinator.domains, s.volume)
-	}
-	s.fileDomain = nil
-}
-
-// Advisory returns the authority shared by all Store values for this volume.
-func (s *Store) Advisory(ctx context.Context) (*advisory.Coordinator, error) {
-	if err := s.coordinator.commit.acquire(ctx); err != nil {
-		return nil, err
-	}
-	defer s.coordinator.commit.release()
-	if s.fileDomain == nil || s.files == nil {
-		return nil, syscall.ESTALE
-	}
-	if err := s.checkFileOwnership(); err != nil {
-		return nil, err
-	}
-	if err := s.coordinator.healthy(); err != nil {
-		return nil, err
-	}
-	return s.fileDomain.coordinator, nil
 }
 
 func (s *Store) CheckFileStore() error {
