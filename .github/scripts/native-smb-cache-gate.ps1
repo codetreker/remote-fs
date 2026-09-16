@@ -94,7 +94,9 @@ if ($Phase -eq 'Run') {
 cacheGateObserve("authority_event", map[string]any{"position": c.Position, "kind": c.Kind, "name": string(c.Name)})
 if len(a.changes) == 1024 {
 '@
-    & gofmt -w $wire $authority (Join-Path $testRoot 'native_cache_gate_windows_test.go')
+    $bridge = Join-Path $testRoot 'native_acceptance_windows_test.go'
+    Replace-ExactlyOnce $bridge 'Limits: smb.DefaultLimits()' 'Limits: cacheGateLimits()'
+    & gofmt -w $wire $authority $bridge (Join-Path $testRoot 'native_cache_gate_windows_test.go')
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & git -C $fixture diff --stat | Write-Output
     $PSNativeCommandUseErrorActionPreference = $false

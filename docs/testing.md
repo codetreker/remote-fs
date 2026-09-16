@@ -293,20 +293,23 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 [诊断工作流](../.github/workflows/native-smb-gate.yml)在原生 Windows 11 24H2+ ARM64 上运行固定的 [SMB 原型](https://github.com/codetreker/remote-fs/tree/1cb9ad7f49d998de4daa4d562d766b18cf06ce16/packages/smb/windows)，用于定位系统重定向器的负名字缓存行为。原型只检出到 `.tmp/native-cache-gate/fixture`；[运行脚本](../.github/scripts/native-smb-cache-gate.ps1)核对 commit 后注入[聚焦探针](../.github/scripts/native-smb-cache-gate_test.go.txt)，不编译工作分支正在实现的 SMB/backend。原型结果只作为可行性证据，已观察结果与取舍见[诊断决定](../.agents/notes/implemented/testing/2026-09-16-native-smb-cache-diagnostic.md)。
 
-六个独立作业只运行 `TestNativeNegativeNameCacheGate`，使用 `-count=1`、三分钟测试超时及十五分钟作业上限。每个 variant 必须取得精确的 pass verdict，skip、缺失 verdict 和失败不能算通过。
+七个独立作业只运行 `TestNativeNegativeNameCacheGate`，使用 `-count=1`、三分钟测试超时及十五分钟作业上限。每个 variant 必须取得精确的 pass verdict，skip、缺失 verdict 和失败不能算通过。
 
 | variant | 被检验的条件 |
 |---|---|
 | baseline | 不显式保留父目录句柄 |
 | held_parent | 保留父目录句柄，但不提交变化监听 |
 | notify_parent | 保留父目录，并先确认 SMB CHANGE_NOTIFY 已被接纳，核对根下创建的匹配通知 |
-| owned_nested | 独立于应用 Stat 的客户端递归 UNC 监听；检查多层目录、受控的 100 ms 重新监听间隔及八个名字的创建突发，并核对每个名字的通知 |
+| owned_nested | 独立于应用 Stat 的客户端递归 UNC 监听；检查多层目录、100 ms 重新监听间隔及八个名字的创建突发。前两个名字仍须有匹配 ADDED；只有突发阶段明确丢明细时才接受 rescan 结果，十个名字的可见性断言全部保留 |
 | owned_lifecycle | 应用句柄使普通卸载以 busy 失败时，监听、匹配通知与一秒可见性仍成立；应用关闭后，仅内部 UNC 监听存在时普通卸载能够完成 |
 | owned_outage | 监听显式报告 HTTP/SSE 故障；原生负缓存到期前，同一缺失名字的查询必须返回不可用错误，不能继续报告不存在 |
+| owned_rescan | 仅将诊断 fixture 的 MaxNotifyEvents 设为 2，在暂停时积累八次创建；先核对与请求关联的真实 wire ENUM 响应，再在响应后、重新监听前建立新的负查找并远端创建，验证一秒/缓存到期前/新权威 CREATE，以及后续监听与另一轮创建 |
 
-创建可见性检查先取得 authority 的 CREATE/NAME_NOT_FOUND 响应，再由独立远端入口创建该名字。成功需要在写者确认后一秒内、且在最早可能的缓存到期之前观察到文件，并取得该名字的一次新权威 SMB CREATE；要求通知的情形还必须有匹配事件。重复 Stat 是测量观察点，不是产品同步机制。环境中三个 SMB 缓存 lifetime 都须大于一秒；写者确认或观察越过可能到期时间时，不能据此证明非 TTL 可见性。故障情形单独检查缓存到期前的错误，不以创建成功代替断线诚实性。
+创建可见性检查先取得 authority 的 CREATE/NAME_NOT_FOUND 响应，再由独立远端入口创建该名字。成功需要在写者确认后一秒内、且在最早可能的缓存到期之前观察到文件，并取得该名字的一次新权威 SMB CREATE；要求逐名字通知的情形还必须有匹配事件，不能用 rescan 替代 owned_nested 的初次创建和普通间隔创建通知。重复 Stat 是测量观察点，不是产品同步机制。环境中三个 SMB 缓存 lifetime 都须大于一秒；写者确认或观察越过可能到期时间时，不能据此证明非 TTL 可见性。故障情形单独检查缓存到期前的错误，不以创建成功代替断线诚实性。
 
-产物记录 OS/build/架构、原型及探针 commit、缓存策略、逐名字操作时间、SMB/authority 事件、映射和最终引用状态。轨迹最多保留 2048 项，溢出或编码失败使该次证据失败；递归监听由单独的测试拥有者驱动，不依靠应用调用推进。Windows overlapped 通知在取消完成前保留其缓冲和结构，异步完成或事件关闭的异常清理错误同样失败。工作流保存诊断产物，并在环境准备成功后核对缓存策略未变且没有新增 SMB 映射残留。
+产物记录 OS/build/架构、原型及探针 commit、缓存策略、逐名字操作时间、SMB/authority 事件、映射和最终引用状态。轨迹最多保留 2048 项，溢出或编码失败使该次证据失败；递归监听由单独的测试拥有者驱动，不依靠应用调用推进。Windows overlapped 通知在取消完成前保留其缓冲和结构。零字节成功或 ERROR_NOTIFY_ENUM_DIR 被明确记录为丢失明细并重新监听，不代表空目录或没有变化；其余异步完成或事件关闭的异常清理错误同样失败。工作流保存诊断产物，并在环境准备成功后核对缓存策略未变且没有新增 SMB 映射残留。
+
+owned_rescan 必须从实际捕获的 SMB Command 15 请求及同一 MessageID 的 `STATUS_NOTIFY_ENUM_DIR`（0x10c）响应证明前置状态，仅有本地零字节不足以开始验证。新名字的权威负查找与远端创建发生在该响应之后、重新监听之前；恢复后还须取得新的 Pending 响应，并在另一轮创建后仍保持健康监听。夹具不维护目录快照，因此这个用例验证的是丢明细后的重新监听和后续缓存观察，不宣称目录枚举已经恢复完整。
 
 这些监听拥有者和受控间隔属于固定原型中的测试夹具，不定义生产 ManagedShare API。实际交付的 package、transport 和 backend 仍须独立验收目录、属性、改名、删除、已打开引用与故障；固定内存 authority 不证明 SQLite 持久性、全部 Windows 行为或历史时间投影。某个 variant 的成功不能扩大成其它 variant 或新实现通过，原生可行性门禁只按实际运行证据关闭。
 
