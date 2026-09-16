@@ -32,6 +32,24 @@ function Replace-ExactlyOnce([string]$Path, [string]$Before, [string]$After) {
     [IO.File]::WriteAllText($Path, $text.Replace($Before, $After), [Text.UTF8Encoding]::new($false))
 }
 
+function Invoke-DiagnosticTests([string]$Package, [string]$Pattern, [string[]]$Expected, [string]$LogName) {
+    & go test -json -count=1 -p=1 -timeout 3m -run $Pattern $Package 2>&1 |
+        Tee-Object -FilePath (Join-Path $results $LogName)
+    $testExit = $LASTEXITCODE
+    if ($testExit -ne 0) { exit $testExit }
+    # Module diagnostics remain in the raw stream; every expected verdict is required.
+    $events = @(Get-Content (Join-Path $results $LogName) | Where-Object { $_.StartsWith('{') } | ForEach-Object { $_ | ConvertFrom-Json })
+    if (@($events | Where-Object { $_.Action -in @('fail', 'skip') }).Count -ne 0) {
+        throw 'Diagnostic tests failed or skipped.'
+    }
+    foreach ($name in $Expected) {
+        $verdict = @($events | Where-Object { $_.Test -eq $name -and $_.Action -in @('pass', 'fail', 'skip') })
+        if ($verdict.Count -ne 1 -or $verdict[0].Action -ne 'pass') {
+            throw "The expected diagnostic test did not execute and pass: $name"
+        }
+    }
+}
+
 if ($Phase -eq 'Prepare') {
     New-Item -ItemType Directory -Force -Path $results | Out-Null
     $actualSource = (& git -C $fixture rev-parse HEAD).Trim()
@@ -80,6 +98,15 @@ if ($Phase -eq 'Run') {
     }
     & go version
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $overlay = Join-Path $PSScriptRoot 'native-smb-notify-continuity.patch'
+    & git -C $fixture apply --unidiff-zero --check $overlay
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & git -C $fixture apply --unidiff-zero $overlay
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $env:RFS_GATE_OVERLAY_SHA = (Get-FileHash $overlay -Algorithm SHA256).Hash.ToLowerInvariant()
+    [ordered]@{ Kind = 'Platform notification continuity overlay'; SHA256 = $env:RFS_GATE_OVERLAY_SHA } |
+        ConvertTo-Json | Set-Content (Join-Path $results 'overlay.json') -Encoding utf8
+    Copy-Item (Join-Path $PSScriptRoot 'native-smb-notify-continuity_test.go.txt') (Join-Path $fixture 'packages/smb/gate_notify_continuity_test.go')
     $testRoot = Join-Path $fixture 'packages/smb/windows'
     Copy-Item (Join-Path $PSScriptRoot 'native-smb-cache-gate_test.go.txt') (Join-Path $testRoot 'native_cache_gate_windows_test.go')
     $wire = Join-Path $testRoot 'native_wire_windows_test.go'
@@ -102,18 +129,10 @@ if len(a.changes) == 1024 {
     $PSNativeCommandUseErrorActionPreference = $false
     Push-Location $fixture
     try {
-        & go test -json -count=1 -p=1 -timeout 3m -run '^TestNativeNegativeNameCacheGate$' ./packages/smb/windows 2>&1 |
-            Tee-Object -FilePath (Join-Path $results 'go-test.jsonl')
-        $testExit = $LASTEXITCODE
+        Invoke-DiagnosticTests './packages/smb' '^Test(Notification|GateNotify)' @('TestGateNotifyRescanRetainsGapEvents', 'TestGateNotifyRescanRejectsReplacedSource') 'notify-unit-test.jsonl'
+        Invoke-DiagnosticTests './packages/smb/windows' '^TestNativeNegativeNameCacheGate$' @('TestNativeNegativeNameCacheGate') 'go-test.jsonl'
     } finally {
         Pop-Location
-    }
-    if ($testExit -ne 0) { exit $testExit }
-    # Module-download diagnostics share the stream; the exact test verdict remains mandatory.
-    $events = @(Get-Content (Join-Path $results 'go-test.jsonl') | Where-Object { $_.StartsWith('{') } | ForEach-Object { $_ | ConvertFrom-Json })
-    $verdict = @($events | Where-Object { $_.Test -eq 'TestNativeNegativeNameCacheGate' -and $_.Action -in @('pass', 'fail', 'skip') })
-    if ($verdict.Count -ne 1 -or $verdict[0].Action -ne 'pass') {
-        throw 'The exact native test must execute and pass without skipping.'
     }
     exit 0
 }

@@ -288,7 +288,7 @@ func TestNativeNegativeNameCacheGate(t *testing.T) {
 		}
 		report := map[string]any{
 			"evidence_kind": "pinned prototype diagnostic; not PR implementation acceptance",
-			"fixture_sha":   os.Getenv("RFS_GATE_FIXTURE_SHA"), "gate_sha": os.Getenv("GITHUB_SHA"), "variant": variant,
+			"overlay_sha":   os.Getenv("RFS_GATE_OVERLAY_SHA"), "fixture_sha": os.Getenv("RFS_GATE_FIXTURE_SHA"), "gate_sha": os.Getenv("GITHUB_SHA"), "variant": variant,
 			"negative_lookup_started_at": negativeStarted, "earliest_possible_cache_expiry": earliestExpiry,
 			"writer_acknowledged_at": writerAcknowledged, "visible_at": visibleAt, "attempts": attempts, "fresh_queries": freshQueries,
 			"test_failed": t.Failed(), "trace_overflow": overflow, "events": events,
@@ -750,7 +750,7 @@ func cacheGateOwnedScenario(t *testing.T, variant string) {
 		if overflow || encodingErr != nil {
 			t.Errorf("incomplete bounded trace: overflow=%v error=%v", overflow, encodingErr)
 		}
-		report := map[string]any{"evidence_kind": "pinned prototype diagnostic; not PR implementation acceptance", "fixture_sha": os.Getenv("RFS_GATE_FIXTURE_SHA"), "gate_sha": os.Getenv("GITHUB_SHA"), "variant": variant, "checks": p.checks, "test_failed": t.Failed(), "trace_overflow": overflow, "events": events}
+		report := map[string]any{"evidence_kind": "pinned prototype diagnostic; not PR implementation acceptance", "overlay_sha": os.Getenv("RFS_GATE_OVERLAY_SHA"), "fixture_sha": os.Getenv("RFS_GATE_FIXTURE_SHA"), "gate_sha": os.Getenv("GITHUB_SHA"), "variant": variant, "checks": p.checks, "test_failed": t.Failed(), "trace_overflow": overflow, "events": events}
 		if p.bridge != nil {
 			report["final_server_status"] = p.bridge.smb.Status()
 			report["final_backend_references"] = p.bridge.backend.openReferences()

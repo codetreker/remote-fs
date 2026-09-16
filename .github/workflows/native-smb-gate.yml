@@ -6,6 +6,8 @@ on:
       - .github/workflows/native-smb-gate.yml
       - .github/scripts/native-smb-cache-gate.ps1
       - .github/scripts/native-smb-cache-gate_test.go.txt
+      - .github/scripts/native-smb-notify-continuity.patch
+      - .github/scripts/native-smb-notify-continuity_test.go.txt
   workflow_dispatch:
 
 permissions:
