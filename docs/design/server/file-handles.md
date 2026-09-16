@@ -1,6 +1,6 @@
 # 打开的文件与 advisory locks
 
-本文描述 `storage.FileStorage`、服务端保留的文件身份和标准 advisory locks。按路径的基础 volume API 见[顶层设计](../architecture.md)，显式 S/X 扩展见[文件占有](file-locks.md)，FUSE 的内核映射见[client 设计](../client/architecture.md)，Windows 的协议与本机映射见 [SMB 接入](../client/windows-smb.md)。决定与代价见[活跃文件句柄](../../../.agents/notes/implemented/architecture/2026-09-08-live-file-handles.md)。
+本文描述当前 `storage.FileStorage`、服务端保留的文件身份和标准 advisory locks。按路径的基础 volume API 见[顶层设计](../architecture.md)，显式 S/X 扩展见[文件占有](file-locks.md)，FUSE 映射见[client 设计](../client/architecture.md)，Windows 接入见 [SMB 接入](../client/windows-smb.md)。决定与代价见[活跃文件句柄](../../../.agents/notes/implemented/architecture/2026-09-08-live-file-handles.md)。[平台客户端隔离提案](../../../.agents/notes/proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)将平台 owner、mode 与 Windows 意图从这些接口移出，演进为通用保留对象、条件操作和纯值 receipt；下文仍是实际接口，身份与有限生命周期保证保持。
 
 ## 一、身份与会话
 

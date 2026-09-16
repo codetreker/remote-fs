@@ -2,7 +2,7 @@
 
 文件锁保护现有普通文件的逻辑身份。稳定权限 `S` 允许多个持有者并存，排他权限 `X` 允许一个持有者修改；稳定权限本身不能用于修改。服务端对显式携带授权的修改与匿名修改执行同一套冲突检查。
 
-本文描述锁机制。普通文件的内容版本前置条件与 FUSE `Open` 自动取得哪种权限是独立事项；锁没有替调用方选择这两项策略。保证由 [R-CC-3、R-CC-6 至 R-CC-11](../../spec/requirements.md)定义，取舍由[实现决定](../../../.agents/notes/implemented/architecture/2026-09-07-file-locks.md)记录。
+本文描述当前锁机制。普通文件的内容版本前置条件与 FUSE `Open` 自动取得哪种权限是独立事项；锁没有替调用方选择这两项策略。保证由 [R-CC-3、R-CC-6 至 R-CC-11](../../spec/requirements.md)定义，取舍由[实现决定](../../../.agents/notes/implemented/architecture/2026-09-07-file-locks.md)记录。[平台客户端隔离提案](../../../.agents/notes/proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)另行定义通用访问声明和范围状态，以承接现有 Windows／Linux 规则；它们不替代本页显式 S/X，也不取消所有入口的最终发布检查。
 
 ## 组件与所有权
 

@@ -1,6 +1,6 @@
 # 顶层设计
 
-本文描述系统由哪些角色构成、各自持有什么、如何交互、数据如何跨角色流动。角色内部的设计不在这里，见 `server/` 与 `client/`。
+本文描述实际实现中的角色、所有权、交互和数据流，角色内部见 `server/` 与 `client/`。当前公共层仍包含 Windows 专用访问、持久命名启用及 Linux advisory 规则，尚不满足 R-FS-9、R-INT-8、R-INT-14 的平台边界；[平台客户端隔离提案](../../.agents/notes/proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)定义待实施的共同原语和迁移，不代表下文接口已改变。
 
 ## 一、两个角色
 
@@ -66,7 +66,7 @@ client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storag
 
 基础 storage 描述 volume 操作，锁控制描述跨请求的占有与核对，HTTP 同时承载它们和复制。各自的义务不能由另一层猜测补齐。
 
-**操作系统适配到呈现层为止。** 底层提供独立于内核的接口：按路径寻址的基础 volume、`FileStorage` 的普通文件与 advisory，以及 `WindowsStorage` 的 Windows 访问、目录引用与动作结果。FUSE 保存内核编号和 owner 的映射，SMB 保存 session/tree/open 映射；对象在 rename、unlink 或覆盖后的存活由服务端保留引用保证，不由旧路径重建。Windows 的 lookup 与 rename 还携带父目录身份和 leaf name，WindowsBasicAttr 与当前名字信息来自 authority。
+**内核接入与权威状态分离。** 当前底层提供按路径寻址的基础 volume、`FileStorage` 的普通文件与 advisory，以及 `WindowsStorage` 的 Windows 访问、目录引用与动作结果。这些接口不依赖内核句柄，但仍解释平台规则。FUSE 保存内核编号和 owner 的映射，SMB 保存 session/tree/open 映射；对象在 rename、unlink 或覆盖后的存活由服务端保留引用保证，不由旧路径重建。Windows 的 lookup 与 rename 还携带父目录身份和 leaf name，WindowsBasicAttr 与当前名字信息来自 authority。
 
 **节点身份在契约里**（R-FS-5）。属性带一个 `ID`，说的是「这个名字后面是哪个节点」，与它此刻叫什么无关。挂载呈现层分不出这件事就会把两个活着的节点报成一个：一个描述符会读到别人的字节，而 mmap 了它的程序拿到 SIGBUS。而挂载点只直接观测到自己执行的操作，别的客户端做的改名不经过它的任何一条路径，所以这个答案只能由 volume 给。
 
@@ -140,7 +140,7 @@ Checkpoint 是普通有界读取：原子返回日志 incarnation 与已提交�
 
 client 侧的 remote storage 实现 storage 接口，凡是不满足上述任何一条的答案，它一律以 `EIO` 报告，绝不把它变成一句关于 volume 的话。
 
-Windows 命名兼容是显式启用并持久保存的 volume 状态；发布 share 只检查状态，不执行隐式启用。Windows share/access 与范围锁检查在原生受控操作处排序，Linux 与编程入口不能通过协议差异绕过它们。变更记录同时携带有界、不可变的通知事实；SMB 的变更来源由宿主注入，与其数据 backend 保持同源。具体接口与呈现行为见 [Windows 本机 SMB](client/windows-smb.md)。
+当前 Windows 命名兼容由显式启用并持久保存的 volume 状态实现；发布 share 只检查状态。它对其它入口施加 Windows 名字限制，是平台隔离提案要移除的实现约束。Windows share/access 与范围锁检查在原生受控操作处排序，Linux 与编程入口不能通过协议差异绕过它们；这一跨入口保护仍须由目标共同原语维持。变更记录携带有界、不可变的通知事实；SMB 的变更来源由宿主注入，与其数据 backend 同源。具体接口与呈现行为见 [Windows 本机 SMB](client/windows-smb.md)。
 
 一次应用大读写跨多个协议请求时的保证单位仍是 R-CON-5【未决】；本文的接口与数据流不替这项需求选择答案。
 

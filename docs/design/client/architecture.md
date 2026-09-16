@@ -2,7 +2,7 @@
 
 volume 的使用者。持有 remote storage，通过 Linux FUSE 呈现为本地目录，或通过独立的 Windows 本机 SMB package 呈现为网络驱动器。宿主持有远端身份与各呈现入口的生命周期。
 
-本文只写 client 内部。基础 storage、保留文件、锁控制与 RPC 的边界见 [`../architecture.md`](../architecture.md)。Windows 的 SSPI、SMB、盘符映射与 authority 接口见 [Windows 本机 SMB](windows-smb.md)；下文的副本、内核 inode 与 FUSE 生命周期描述 Linux 路径。
+本文只写当前 client 内部。基础 storage、保留文件、锁控制与 RPC 的边界见 [`../architecture.md`](../architecture.md)。Windows 的 SSPI、SMB、盘符映射与 authority 接口见 [Windows 本机 SMB](windows-smb.md)；下文的副本、内核 inode 与 FUSE 生命周期描述 Linux 路径。[平台客户端隔离提案](../../../.agents/notes/proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)将 Windows 规则以及 Unix mode／UID／GID、owner 与关闭解释收归各客户端；当前 FileSession、WindowsStorage 和远端 advisory 仍是待迁移接口，Linux 可观察保证保持不变。
 
 ## 一、内部构成
 

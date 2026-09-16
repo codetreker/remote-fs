@@ -1,6 +1,6 @@
 # Windows 本机 SMB 接入
 
-本页描述 Windows client 将远端 volume 发布为本机网络驱动器的结构，对应 R-FS-9、R-CC-14、R-INT-8、R-INT-14 与既有身份、可见性和错误要求。跨角色接口见[顶层设计](../architecture.md)，权威文件状态见[文件句柄](../server/file-handles.md)。
+本页描述当前 Windows client 将远端 volume 发布为本机网络驱动器的实现。现有 WindowsStorage、持久 EnableWindows 与专用 HTTP 动作尚不符合 R-FS-9、R-INT-8、R-INT-14 的平台边界；[平台客户端隔离提案](../../../.agents/notes/proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)承接其替换设计。下文保留真实接口与行为，R-CC-14、身份、可见性和错误保证继续适用。跨角色接口见[顶层设计](../architecture.md)，权威文件状态见[文件句柄](../server/file-handles.md)。
 
 ## 组件与所有权
 
@@ -20,7 +20,7 @@ SMB 核心属于仓库的 MIT 实现；签名密钥派生选取的 BSD 代码保
 
 ## 发布与访问身份
 
-管理方使用 `EnableWindows` 和原动作 ID 显式启用命名能力。结果未知时以 `QueryWindowsActivation` 核对该动作。`Publish` 只验证能力、权威 Enabled 状态、通知来源及预算相容性，不替管理方启用命名规则。share 名称与可信 `Share.Volume` 授权标识分别配置，不能从请求中的 share 名冒充业务 volume 身份。
+当前实现要求管理方使用 `EnableWindows` 和原动作 ID 显式启用命名能力，结果未知时以 `QueryWindowsActivation` 核对。`Publish` 验证能力、权威 Enabled 状态、通知来源及预算相容性，不代为启用。这项持久前置条件及其全 volume 名字限制属于待迁移实现，不是 R-INT-14 要求的接入契约。share 名称与可信 `Share.Volume` 授权标识分别配置，不能从请求中的 share 名冒充业务 volume 身份。
 
 `IPC$` 是不区分大小写的保留 share 名，不能通过 Publish 绑定业务 volume。已认证且通过签名校验的 SMB session 可以建立独立的 IPC 控制树；它与 volume tree 共用该会话的 MaxTrees 预算，并随 tree disconnect、logoff 或连接清理释放。响应的 pipe-share 类型只描述控制树类别，不承诺 named-pipe 或 RPC 能力。控制树不取得 Export、volume backend、WindowsSession、通知源或 volume 授权请求，也不枚举服务端资源。tree 级正常操作仅有 TREE_DISCONNECT；session 级 ECHO／LOGOFF 保持原有行为。未支持的 pipe／RPC／控制操作明确失败，畸形 IOCTL 被拒绝，SMB 3.1.1 的 FSCTL_VALIDATE_NEGOTIATE_INFO 按协议终止连接。
 

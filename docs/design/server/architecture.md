@@ -2,7 +2,7 @@
 
 volume、保留文件与显式占有的权威持有者。将原生 storage 与它的锁服务配对，经 HTTP 暴露给多个 client。
 
-本文只写 server 内部。角色边界与跨角色契约的分工见 [`../architecture.md`](../architecture.md)。
+本文只写当前 server 内部。角色边界与跨角色契约的分工见 [`../architecture.md`](../architecture.md)。下文的 Windows authority／HTTP 分支与 flock／POSIX coordinator 仍解释平台规则；[平台客户端隔离提案](../../../.agents/notes/proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)以既有 file 协议上的共同原语替换这些边界，以满足 R-INT-8、R-INT-14，当前代码尚未完成该迁移。
 
 ## 一、内部构成
 

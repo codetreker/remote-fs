@@ -1,6 +1,6 @@
 # SQLite 内部模块
 
-`packages/metastore/sqlite` 是公开的 SQLite 实现入口。server 的 `Store`、client 使用的 `Replica` 与 `Seeding` 都在该 package 定义；本页只描述这份实现的代码归属和依赖。文件、复制和持久恢复的行为分别由[文件句柄](file-handles.md)、[client 设计](../client/architecture.md)和[本地持久对象存储](local-disk-object-store.md)定义，拆分理由见[模块边界决定](../../../.agents/notes/implemented/architecture/2026-09-09-sqlite-internal-modules.md)。
+`packages/metastore/sqlite` 是公开的 SQLite 实现入口。server 的 `Store`、client 使用的 `Replica` 与 `Seeding` 都在该 package 定义；本页描述当前代码归属和依赖。文件、复制和持久恢复分别见[文件句柄](file-handles.md)、[client 设计](../client/architecture.md)和[本地持久对象存储](local-disk-object-store.md)，拆分理由见[模块边界决定](../../../.agents/notes/implemented/architecture/2026-09-09-sqlite-internal-modules.md)。当前 windowsaccess、持久命名 profile 与 Windows 字段是[平台客户端隔离提案](../../../.agents/notes/proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)的待迁移对象；该提案中的通用 metadata、claims 和 0006 尚未实现，下表不代表目标格式。
 
 ## 入口与组件
 

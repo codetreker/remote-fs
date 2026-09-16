@@ -1,6 +1,6 @@
 # 业务方提供的操作授权
 
-本文描述 HTTP handler 的 volume 操作授权，对应 R-INT-7、R-INT-2、R-INT-3、R-SEC-4 至 R-SEC-6。跨角色的访问与错误约定见[顶层设计](../architecture.md)，取舍见[授权决定](../../../.agents/notes/implemented/feature/2026-09-10-host-provided-authorization.md)。
+本文描述当前 HTTP handler 的 volume 操作授权，对应 R-INT-7、R-INT-2、R-INT-3、R-SEC-4 至 R-SEC-6。跨角色约定见[顶层设计](../architecture.md)，取舍见[授权决定](../../../.agents/notes/implemented/feature/2026-09-10-host-provided-authorization.md)。下文 WindowsOpen 与 windows.* 是现有公共词汇；[平台客户端隔离提案](../../../.agents/notes/proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)将其改为通用意图，完整平台策略留在客户端。宿主业务授权与跨入口检查的保证不随之放宽。
 
 ## 一、组件与配置
 

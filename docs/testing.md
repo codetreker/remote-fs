@@ -164,7 +164,7 @@ busy unmount 用例在真实挂载点保留打开的描述符和排他 flock，�
 
 ## Windows 本机 SMB 与 authority
 
-[SMB 核心](../packages/smb)、[Windows helper](../packages/smb/windows)与[原生 WindowsStorage](../packages/metastore/sqlite/windows_authority_test.go)分别验证。协议与本机映射的运行结果不替代存储持久性；Linux 上的编译或测试也不构成 Windows 系统 SMB 客户端的验收。
+[SMB 核心](../packages/smb)、[Windows helper](../packages/smb/windows)与[原生 WindowsStorage](../packages/metastore/sqlite/windows_authority_test.go)分别验证当前实现。WindowsStorage、持久命名启用和专用 HTTP 尚待按[平台客户端隔离提案](../.agents/notes/proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)迁移，现有测试通过不等于满足 R-FS-9、R-INT-8、R-INT-14 的新边界。提案列出通用原语、平台映射及历史迁移的目标验收；实施时保留既有身份、跨入口、授权、错误与负载断言，并替换全局命名限制的旧实现预期。协议与本机映射的运行结果不替代存储持久性；Linux 上的编译或测试也不构成 Windows 系统 SMB 客户端的验收。
 
 ### 可移植协议与真实存储
 

@@ -6,7 +6,9 @@ Status: implemented
 
 Windows 上未经修改的程序需要访问远端 volume，集成方需要把这项能力嵌入自己的 Go 程序。安装额外文件系统驱动增加了部署与分发成本；复制到普通本地目录再上传无法保持逐次远端确认、同一文件身份和断线错误行为。
 
-目标系统为 Windows 11 24H2 及更新版本。业务程序拥有远端连接、访问身份和进程生命周期，系统中的其它用户不能仅凭同机连接取得访问权限。Windows Server 不属于增加的验收平台。[需求](../../../../docs/spec/requirements.md)中的 R-FS-9、R-CC-14、R-INT-8 与 R-INT-14 定义这项能力；文件身份、同步确认、可见性和错误保证继续适用。
+目标系统为 Windows 11 24H2 及更新版本。业务程序拥有远端连接、访问身份和进程生命周期，系统中的其它用户不能仅凭同机连接取得访问权限。Windows Server 不属于增加的验收平台。文件身份、同步确认、可见性和错误保证继续适用。
+
+本决定记录已经实现的本机 SMB 与 Windows 专用权威方案及其代价。[需求](../../../../docs/spec/requirements.md)中的 R-FS-9、R-INT-8、R-INT-14 已将平台解释限定在客户端；本决定中的持久命名启用、公共 Windows 接口与专用远端动作尚不符合该边界，由[平台客户端隔离提案](../../proposed/architecture/2026-09-16-isolate-platform-filesystem-clients.md)承接待实施的替换。协议引擎、宿主所有权和已有运行证据仍由本决定记录，R-CC-14 的跨入口保护保持。
 
 ## 决定
 
@@ -60,7 +62,7 @@ READ 使用一次权威捕获的属性与范围字节；WRITE、截断和属性�
 
 ### 命名、符号链接与不可变通知事实
 
-Windows 命名能力由管理方逐个 volume 显式启用，Publish 只检查状态。原生发布门内验证既有名字并提交 policy 1；固定 Unicode 15.0 simple uppercase 比较、保留设备名与表示限制随后约束所有入口。不兼容名字导致拒绝，不自动改名或隐藏；停止 share 不撤销 volume policy。Windows 时间、DOS attributes 与符号链接目标持久保存在节点上，普通 volume 的字节名字规则不因本机启动 SMB 自动变化。
+已实施方案由管理方逐个 volume 显式启用 Windows 命名能力，Publish 只检查状态。原生发布门内验证既有名字并提交 policy 1；固定 Unicode 15.0 simple uppercase 比较、保留设备名与表示限制随后约束所有入口。不兼容名字导致拒绝，不自动改名或隐藏；停止 share 不撤销 volume policy。这项持久限制是待替换方案的成本，不是当前 R-FS-9 对其它入口的要求。Windows 时间、DOS attributes 与符号链接目标保存在节点上，未启用 volume 的字节名字规则不因本机启动 SMB 自动变化。
 
 完整名字同时受 65792 字节和 32767 UTF-16 code units 限制；目录移动也验证后代在新位置的完整路径。SetLink 在最终权威操作中把空、独占引用的文件或目录转换为符号链接，保持 ID 和目录链接标志，目标至多 4096 字节且不能逃出 volume。既有 ResourceRef 与有效 S/X grant 仍绑定原节点；新的按路径 Resolve 继续只接纳普通文件，不能把类型转换解释成旧 grant 已失效。Linux FUSE 报告真实类型并保持 inode，Readlink／Symlinker 仍为 `EOPNOTSUPP`。这项类型一致性不扩张 Linux 链接创建或解析能力。
 
@@ -121,7 +123,7 @@ Windows 使用系统自带客户端，业务能够在同一 Go 进程掌握本�
 1. **本机接入与身份。** 在真实 Windows 11 24H2+ client edition 中保持系统 445 服务运行，使用自定义回环端口、签名和非 guest 认证。验证普通／提升登录会话的映射可见性、资源管理器访问及其它本机用户拒绝，记录 edition、build 和实际身份交换。
 2. **确认时点与断线。** 暂停 Win32 WriteFile、SetEndOfFile、FlushFileBuffers 对应的远端确认，观察应用不能提前成功，确认前后的字节、大小与 EOF 一致。断线读取已有内容、属性、negative lookup 和目录时报告真实错误；UseWriteThrough 或 share flags 本身不能代替这些观察。
 3. **跨客户端与通知。** 两个 Windows 客户端以及 Windows＋Linux FUSE＋HTTP 验证持续打开后的写入、增长、缩短在一秒内可见。分别核对文件／空目录删除过滤、递归目录改名／删除、跨观察范围移动、覆盖目标和延迟消费时的历史身份。首次监视暂停 checkpoint 时的 >B 事件、连续 notify 调用间的事件、改名前后整组交付均不得丢失，也不依赖定时重扫。
-4. **对象、目录与名字。** 通过 FileIdInfo 观察重复打开、改名、跨客户端和重连后新打开的稳定对象身份；替换或删除后重建必须产生新身份，旧有效引用继续报告原对象。查找与最终操作之间插入替换，覆盖父目录改名、相对操作和枚举竞争。验证大小写冲突、非法 UTF-8、启用与并发命名操作的顺序、取消／未知核对和卸载后 policy 保持；同时验证链接 confinement 与非法信息类拒绝。
+4. **对象、目录与名字。** 通过 FileIdInfo 观察重复打开、改名、跨客户端和重连后新打开的稳定对象身份；替换或删除后重建必须产生新身份，旧有效引用继续报告原对象。查找与最终操作之间插入替换，覆盖父目录改名、相对操作和枚举竞争。现有实现的用例覆盖大小写冲突、非法 UTF-8、启用与并发命名操作的顺序、取消／未知核对和卸载后 policy 保持；目标名字边界的替换验收由平台隔离提案定义。链接 confinement 与非法信息类拒绝仍须验证。
 5. **Windows 访问限制。** 覆盖六种 disposition、metadata-only、目录引用、双向 ShareAccess、delete-on-close/pending、共享／排他范围、等待／取消及三种锁族的独立关系。从 HTTP 和 FUSE 尝试绕过既有 Windows 限制。批量加锁的冲突回滚、批量解锁后项失败、非法后项保留先前授予分别核对实际状态；“解锁 A 后在未持有 C 上失败”仍须证明 A 已解锁。
 6. **故障与关闭。** 覆盖远端已执行但响应丢失、重复 MessageId/action、取消赢／授予赢／无法核对、gateway/server 重启、期限到达、busy 卸载、映射创建失败和清理超时。facts 缺失／损坏、祖先超限、帧能力不足、序列化边界、历史缺口与队列溢出各保留正确错误；不能将损坏当作普通重扫，不能在生成 facts 失败后留下已提交修改。所有者关闭后无无限任务、重复 mutation 或假成功。
 7. **嵌入与凭据生命周期。** 业务程序仅通过公共 API 注入 backend、认证、授权、logger 与 listener；New 无后台或系统映射副作用。两个 share 的 Publish／Unpublish、busy／超时／失败相互隔离。持有文件与锁时轮换本机 provider 或远端凭据，区分旧会话身份、新交换、刷新失败和实时撤销；Windows 路径不依赖 Unix nativelease，Linux 调用方不强制导入 SMB。
