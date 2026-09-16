@@ -70,7 +70,7 @@ Shutdown 和 Unpublish 的并发调用共享当前 cleanup attempt 的不可变�
 
 credits 核对长度和读写范围，重复/越界拒绝；资源拒绝仍产生签名响应。related compound 保持顺序及继承身份，async 以唯一 AsyncID 核对 CANCEL 和当前 session，pending/terminal 的 credit 归还各一次。LOGOFF/断线分别等待真实借用与响应/签名用户，注册表锁不跨授权、storage I/O 或等待。
 
-当前实现包含会话/控制及不带 postquery 的 CLOSE 清理路径；CREATE、名字解析、文件/属性、范围、通知与映射仍未接入，相关请求在 session/tree 检查后明确拒绝。它不是可用的 Windows 网络驱动器。[测试策略](../../testing.md#smb-本机会话端点)区分真实 TCP、引用安装 fixture、交叉构建和原生运行；旧 SSPI 收据不覆盖新增端点。剩余接入、历史时间和缓存决策仍由[平台提案](../../../.agents/notes/proposed/architecture/2026-09-16-platform-client-capabilities.md)承接。
+当前实现包含会话/控制及不带 postquery 的 CLOSE 清理路径；CREATE、名字解析、文件/属性、范围、通知与映射仍未接入，相关请求在 session/tree 检查后明确拒绝。它不是可用的 Windows 网络驱动器。[测试策略](../../testing.md#smb-本机会话端点)区分真实 TCP、引用安装 fixture、交叉构建和原生运行；新增端点已通过对应源码的 Windows ARM64 包级运行，这仍不等于系统 SMB 重定向器的文件访问验收。剩余接入、历史时间和缓存决策仍由[平台提案](../../../.agents/notes/proposed/architecture/2026-09-16-platform-client-capabilities.md)承接。
 
 ### 业务身份与授权结果
 

@@ -363,7 +363,7 @@ go vet ./packages/smb ./packages/smb/internal/wire ./packages/smb/internal/signi
 
 [handle 用例](../packages/smb/handle_test.go)直接提供 neutral fixture 引用，核对 File/NodeReference 别名只关闭一次、返回错误的非 nil 引用仍保留名额、退役后晚到安装拒绝、borrow 排空和 cleanup attempt 结果不被覆盖；[authority 清理用例](../packages/smb/authority_session_test.go)核对失败关闭继续占连接/session/tree/open/export 额度，确认重试后才归还。fixture 安装不证明 wire CREATE 或真实 SQLite 文件操作，尚未接入的命令须按协议明确不支持。
 
-这一批 packages/smb 自身普通/race 各为 54 根、87 个通过 verdict，覆盖 86.2%、最低函数 50%，vet 与 ARM64/AMD64 交叉构建通过；previous-principal 负向对照在预期授权断言失败。这些是 Linux 端点协议/拥有权与构建证据；旧原生 SSPI 的 71 verdict 只属于其记录的 checkout，新增端点的 Windows 运行和完整文件/映射/缓存验收仍需实际执行。
+这一批 packages/smb 自身普通/race 各为 54 根、87 个通过 verdict，覆盖 86.2%、最低函数 50%，vet 与 ARM64/AMD64 交叉构建通过；previous-principal 负向对照在预期授权断言失败。这些是 Linux 端点协议/拥有权与构建证据。[Windows ARM64 包级运行 35118013777](https://github.com/codetreker/remote-fs/actions/runs/35118013777/job/104868296920)另通过四包的 94 根、156 个 verdict，覆盖新增端点根及真实 SSPI，源码绑定和覆盖见[实现决定](../.agents/notes/implemented/architecture/2026-09-16-smb-protocol-primitives.md)。旧原生 SSPI 的 71 verdict 仍只属于其原 checkout；新的包级结果也不代替系统重定向器、完整文件/映射/缓存验收。
 
 ### Windows 原生 SMB 缓存诊断
 

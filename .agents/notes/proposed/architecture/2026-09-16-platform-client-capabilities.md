@@ -12,7 +12,7 @@ Linux 和编程入口可以创建 Windows 无法表示或存在大小写歧义�
 
 ## 提案
 
-[SMB 协议与会话端点](../../implemented/architecture/2026-09-16-smb-protocol-primitives.md)已交付报文/签名/认证依赖、本机 listener/export、会话和直接 FileSession 引用管理。原生 SSPI 组件已有旧源码的独立实测，新增端点目前只有 Linux 协议/拥有权测试与 Windows 交叉构建；CREATE、文件/名字/属性、范围、通知及映射仍待接入，组合后的原生验收未完成。下述剩余工作保持同一目标。
+[SMB 协议与会话端点](../../implemented/architecture/2026-09-16-smb-protocol-primitives.md)已交付报文/签名/认证依赖、本机 listener/export、会话和直接 FileSession 引用管理。新增端点已有 Linux 与 Windows ARM64 的协议/拥有权包级验证，SSPI 也有对应原生实测；CREATE、文件/名字/属性、范围、通知及映射仍待接入，组合后的原生验收未完成。下述剩余工作保持同一目标。
 
 ### 接入形态与现有依赖
 
