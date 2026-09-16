@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - .github/workflows/native-smb-gate.yml
+      - .github/scripts/native-smb-auth.ps1
+      - packages/smb/**
       - .github/scripts/native-smb-cache-gate.ps1
       - .github/scripts/native-smb-cache-gate_test.go.txt
       - .github/scripts/native-smb-notify-continuity.patch
@@ -20,6 +22,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  protocol-auth:
+    name: Native protocol and SSPI
+    runs-on: windows-11-arm
+    timeout-minutes: 10
+    env:
+      RFS_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Record current-source native environment
+        shell: pwsh
+        run: ./.github/scripts/native-smb-auth.ps1 -Phase Prepare
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - name: Exercise current protocol and native SSPI
+        shell: pwsh
+        run: ./.github/scripts/native-smb-auth.ps1 -Phase Run
+      - name: Preserve native source and test receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-protocol-auth-${{ github.run_attempt }}
+          path: .tmp/native-smb-auth/results
+          if-no-files-found: error
+          retention-days: 14
   cache:
     name: Native cache / ${{ matrix.variant }}
     runs-on: windows-11-arm

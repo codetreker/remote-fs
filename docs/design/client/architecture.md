@@ -48,6 +48,14 @@ SSE 不把整个 stream 保存在内存里，但每一帧仍有独立的 `DialOp
 
 **FUSE 到这一层为止。** 挂载层将 Lookup、Create、Mkdir、Unlink、Rmdir、Rename 与目录读取转换为父 NodeID/原始叶名的能力调用。普通 fd 使用 File，无 fd 的身份属性使用 StatNode/SetNodeAttr；目录 handle 保留 NodeReference 及其 Scope。FileSession 拥有服务端引用，挂载层拥有内核编号、POSIX codec 与 owner 映射，不以过时父路径重新定位对象。
 
+### SMB 协议基础组件
+
+packages/smb 定义认证交换与 Principal context；internal/wire 提供有界报文编解码，internal/signing 提供 preauth/KDF/AES-CMAC 及签名会话销毁。Request slice 借用输入帧，签名 key 的生命周期由明确的 Destroy 结束；这些内部包不拥有 volume 或文件引用。
+
+packages/smb/windows 提供 SSPI Negotiate authenticator 和 SID policy。构造器不取凭据，Begin/Step/Close 拥有单次 native context；同步 native 调用结束后才完成取消/关闭交接。只有认证完成的 Principal 才能由集成方写入 context，显示名不用于授权。非 Windows native 调用明确拒绝。
+
+这些是尚未接入 serving/mapping 的协议组件，未提供 Windows 网络驱动器入口；其独立验证和保留的 NOTICE 见[协议组件决定](../../../.agents/notes/implemented/architecture/2026-09-16-smb-protocol-primitives.md)。实际 Windows 集成仍沿[平台提案](../../../.agents/notes/proposed/architecture/2026-09-16-platform-client-capabilities.md)完成，不复制另一套 File/NodeReference backend。
+
 ### 业务身份与授权结果
 
 HTTP client 的凭据附加和轮换由嵌入方提供；server 使用业务 context 中的稳定身份执行[volume 操作授权](../server/authorization.md)。一份 mount／replica 及其 Session、File、Owner、Grant 固定用于同一身份。同一身份轮换凭据可保持连接，切换身份须创建新的客户端状态，不能带走前一身份的缓存。

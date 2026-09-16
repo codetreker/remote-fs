@@ -12,6 +12,8 @@ Linux 和编程入口可以创建 Windows 无法表示或存在大小写歧义�
 
 ## 提案
 
+[SMB 协议基础组件](../../implemented/architecture/2026-09-16-smb-protocol-primitives.md)部分交付本提案的报文/签名/认证依赖，Windows SSPI helper 也有独立实现；这不代表 endpoint、映射、文件适配或 native 认证/缓存验收完成。下述平台接入与剩余能力仍是同一目标。
+
 ### 接入形态与现有依赖
 
 Windows 11 24H2+ 使用系统 SMB 重定向器；独立、可嵌入的 Go 客户端 package 负责本机 listener、身份隔离、share 发布/停止和 SMB 解释。远端继续使用中立接口，不部署 Windows 专有服务、不为 volume 切换名字模式，也不要求第三方文件系统驱动。业务方控制远端身份、凭据轮换与每个语义操作授权，默认仅创建者能访问本机映射。

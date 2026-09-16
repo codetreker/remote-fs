@@ -315,6 +315,28 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 独立 HTTP server 的资源用例使用真实 TCP listener：占满 accepted-connection 名额后底层 `Accept` 不再前进，connection 的单次与重复 `Close` 只释放一份名额，关闭饱和的 listener 会唤醒正在等待的 `Accept`。两种 mode 都要求至少两条 connection，并在取得 listener 前拒绝非正 timeout。只发一部分 header 的连接在 `ReadHeaderTimeout` 内被关闭，keep-alive connection 超过 `IdleTimeout` 后被关闭；同一用例断言 request-wide `ReadTimeout` 与 `WriteTimeout` 保持为零。shutdown 用例覆盖已经存在和尚未被 tracker 观察到的 `StateNew` connection，确保 stopping state 会关闭 late notification，不把退出安全性押在 header timeout 上。
 
+### SMB 协议基础组件
+
+[wire 用例](../packages/smb/internal/wire)验证 bounded compound/header、请求/响应结构、UTF-16、lease/lock/notify 与 symlink reparse；畸形长度、偏移与上下文数被拒绝。[签名用例](../packages/smb/internal/signing/signing_test.go)验证 CMAC 向量、preauth/密钥派生、报文校验及 Destroy 与签名并发。现有 fuzz seeds 进入普通测试，不把这次运行称为持续 fuzz。
+
+[认证 context](../packages/smb/auth_test.go)核对 Principal 的请求生存期与隔离；[Windows policy 用例](../packages/smb/windows/auth_test.go)核对 canonical SID、显示名不能授权、取消与 SECURITY_STATUS。非 Windows 分支明确拒绝 native authentication；[native SSPI 用例](../packages/smb/windows/auth_windows_test.go)必须在 Windows 实际执行，交叉编译不能代替。
+
+这组代码以自己的测试 binary 验证：
+
+```sh
+.github/scripts/assert-every-test-ran.sh -count=1 -p=1 -timeout=3m \
+  ./packages/smb ./packages/smb/internal/wire ./packages/smb/internal/signing ./packages/smb/windows
+.github/scripts/assert-every-test-ran.sh -count=1 -p=1 -timeout=3m -race \
+  ./packages/smb ./packages/smb/internal/wire ./packages/smb/internal/signing ./packages/smb/windows
+go vet ./packages/smb ./packages/smb/internal/wire ./packages/smb/internal/signing ./packages/smb/windows
+```
+
+[Native protocol and SSPI 作业](../.github/workflows/native-smb-gate.yml)通过[原生认证脚本](../.github/scripts/native-smb-auth.ps1)直接执行当前 checkout 的这四个 package，不检出原型或施加 overlay。环境须为 Windows 11 24H2+ ARM64，记录 checkout、workflow 与 PR head SHA、OS/build，以及 SMB 源文件前后 hash。先列出全部测试，再无 -run 过滤地执行；每个 package 和已列出的 Test/Fuzz 根须有 pass，任何 fail/skip、缺失 verdict 或缺少两项 native SSPI 根均失败。
+
+作业的十分钟上限与单次测试的三分钟上限分开；临时目录和 Go 缓存位于工作区 `.tmp/native-smb-auth`。Windows 原生 profile 只按各 package 自己的测试 binary 计覆盖，要求每包 70%、每函数 50%、合计 85%，无 profile/执行块同样失败。源码、环境、列表/执行 verdict、profile 和逐函数结果作为当前源码证据保存；这个新增执行入口不代表已取得原生通过结果。
+
+实际普通与 race 收据各为 70 pass、无 fail/skip；Windows ARM64/AMD64 的 `go test -c` 构建也通过，但 native SSPI 仍待运行。它们只证明[协议基础组件](../.agents/notes/implemented/architecture/2026-09-16-smb-protocol-primitives.md)，不证明端点、映射、文件适配或 Windows 可用性；固定原型诊断另按下节的来源核对。
+
 ### Windows 原生 SMB 负缓存诊断
 
 [诊断工作流](../.github/workflows/native-smb-gate.yml)在原生 Windows 11 24H2+ ARM64 上，以固定的 [SMB 原型](https://github.com/codetreker/remote-fs/tree/1cb9ad7f49d998de4daa4d562d766b18cf06ce16/packages/smb/windows)为基底验证系统重定向器的负名字缓存行为。基底只检出到 `.tmp/native-cache-gate/fixture`；[运行脚本](../.github/scripts/native-smb-cache-gate.ps1)核对 commit，检查并应用[通知连续性补丁](../.github/scripts/native-smb-notify-continuity.patch)，再注入[聚焦探针](../.github/scripts/native-smb-cache-gate_test.go.txt)和[通知回归用例](../.github/scripts/native-smb-notify-continuity_test.go.txt)。实际执行对象由基底 SHA、补丁 SHA256 与探针 SHA 共同确定，不与纯基底混称，也不编译工作分支正在实现的 SMB/backend。已观察结果与取舍见[诊断决定](../.agents/notes/implemented/testing/2026-09-16-native-smb-cache-diagnostic.md)。
