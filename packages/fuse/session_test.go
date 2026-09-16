@@ -141,8 +141,13 @@ func TestFileSessionFailedRenewalCannotExtendItsConfirmedLifetime(t *testing.T) 
 	if errnoOf(v.check()) != syscall.EIO {
 		t.Fatalf("expired renewal accepted I/O: %v", v.check())
 	}
-	if _, err := retainLifecycleFile(t.Context(), v, storage.ReadContent); errnoOf(err) != syscall.ESTALE {
-		t.Fatalf("expired authority accepted a new reference: %v", err)
+	attr, err := v.storage.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := v.files.Retain(t.Context(), storage.RetainRequest{NodeID: attr.ID, Claim: storage.AccessClaim{Uses: storage.ReadContent}}, lifecycleAction(t, v))
+	if errnoOf(err) != syscall.ESTALE || result.Reference != 0 || result.Effects != 0 {
+		t.Fatalf("expired authority accepted a new reference: %+v, %v", result, err)
 	}
 }
 

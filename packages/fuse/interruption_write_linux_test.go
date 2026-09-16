@@ -171,8 +171,7 @@ func TestSignalDuringClosePreservesOwnerCleanup(t *testing.T) {
 	volume := newSignalVolume(t, 0, map[string][]byte{"file": []byte("old body")})
 	held := &heldCloseCleanup{entered: make(chan context.Context, 1), release: make(chan struct{})}
 	wrapped := &signalFileStorage{FileStorage: volume.served, wrap: func(file storage.File) storage.File {
-		held.File = file
-		return held
+		return &heldCloseCleanup{File: file, entered: held.entered, release: held.release}
 	}}
 	var release sync.Once
 	defer release.Do(func() { close(held.release) })
@@ -222,7 +221,7 @@ type interruptedFileWrite struct {
 	entered  chan context.Context
 	returned chan error
 	release  chan struct{}
-	calls    atomic.Int32
+	calls    *atomic.Int32
 }
 
 func (s *interruptedFileWrite) WriteAt(ctx context.Context, request storage.FileWriteRequest, action storage.FileActionID) (storage.FileActionReceipt, error) {
@@ -254,10 +253,9 @@ func TestSignalDuringWritePreservesTheAuthoritativeQuotaLimit(t *testing.T) {
 				"used": bytes.Repeat([]byte("x"), 32<<10),
 				"file": {},
 			})
-			held := &interruptedFileWrite{entered: make(chan context.Context, 1), returned: make(chan error, 1), release: make(chan struct{})}
+			held := &interruptedFileWrite{entered: make(chan context.Context, 1), returned: make(chan error, 1), release: make(chan struct{}), calls: new(atomic.Int32)}
 			wrapped := &signalFileStorage{FileStorage: volume.served, wrap: func(file storage.File) storage.File {
-				held.File = file
-				return held
+				return &interruptedFileWrite{File: file, entered: held.entered, returned: held.returned, release: held.release, calls: held.calls}
 			}}
 			defer close(held.release)
 			point := mountStorage(t, wrapped, fuse.Options{Logger: testLogger(t)})

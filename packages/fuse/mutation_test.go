@@ -72,8 +72,8 @@ type mutationSession struct {
 	owner *mutationStorage
 }
 
-func mutationFailure(action storage.FileActionID, err error) (storage.FileActionReceipt, error) {
-	return storage.FileActionReceipt{Action: action, State: storage.FileActionNotApplied, Errno: errnoOf(err)}, err
+func mutationFailure(_ storage.FileActionID, err error) (storage.FileActionReceipt, error) {
+	return storage.FileActionReceipt{}, &storage.FileError{Code: errnoOf(err), NotAdmitted: true, Cause: err}
 }
 func (s *mutationSession) Retain(ctx context.Context, r storage.RetainRequest, a storage.FileActionID) (storage.FileActionReceipt, error) {
 	if err := s.owner.enter(ctx, "open-node"); err != nil {
@@ -127,6 +127,13 @@ type mutationFile struct {
 	owner *mutationStorage
 }
 
+func (f *mutationFile) LookupAt(ctx context.Context, name []byte) (storage.EntryLookup, error) {
+	if err := f.owner.enter(ctx, "lookup"); err != nil {
+		return storage.EntryLookup{}, err
+	}
+	result, err := f.File.LookupAt(ctx, name)
+	return result, f.owner.finish("lookup", err)
+}
 func (f *mutationFile) Stat(ctx context.Context, options storage.ObservationOptions) (storage.FileObservation, error) {
 	if err := f.owner.enter(ctx, "stat"); err != nil {
 		return storage.FileObservation{}, err
@@ -237,7 +244,7 @@ func TestCreationCancellationAccountsForCompletedStages(t *testing.T) {
 		directory, changed bool
 	}{
 		{"atomic file open", "open", false, false},
-		{"parent attributes", "stat", false, false},
+		{"exact entry lookup", "lookup", false, false},
 		{"directory creation", "mkdir", true, false},
 		{"file parent cleanup", "close", false, true},
 		{"directory cleanup", "close", true, true},
