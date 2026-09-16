@@ -260,7 +260,7 @@ func TestNativeNegativeNameCacheGate(t *testing.T) {
 		cacheGateSharingScenario(t)
 		return
 	}
-	if variant == "owned_nested" || variant == "owned_lifecycle" || variant == "owned_outage" || variant == "owned_rescan" {
+	if variant == "owned_nested" || variant == "owned_lifecycle" || variant == "owned_outage" || variant == "owned_rescan" || variant == "find_notification" {
 		cacheGateOwnedScenario(t, variant)
 		return
 	}
@@ -794,6 +794,11 @@ func cacheGateOwnedScenario(t *testing.T, variant string) {
 	session, root := nativeRemoteOpen(t, p.bridge.remote, "", storage.NodeDirectory, false)
 	nested := nativeRemoteCreateAt(t, session, root, "nested", storage.NodeDirectory)
 	deep := nativeRemoteCreateAt(t, session, nested, "deep", storage.NodeDirectory)
+	if variant == "find_notification" {
+		cacheGateFindCompatibility(t, p)
+		p.bridge.assertCacheContract(t)
+		return
+	}
 	w := cacheGateStartOwned(t, p.bridge, p.trace)
 	switch variant {
 	case "owned_nested":
@@ -1370,4 +1375,93 @@ func cacheGateSharingScenario(t *testing.T) {
 		})
 	}
 	bridge.assertCacheContract(t)
+}
+
+func cacheGateFindCompatibility(t *testing.T, p *cacheGateOwnedProbe) {
+	cacheGateStatusMappings(t)
+	parent := t.TempDir()
+	cacheGateRequireNTFS(t, parent)
+	raw, err := win.UTF16PtrFromString(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	volume := make([]uint16, 32768)
+	if err := win.GetVolumePathName(raw, &volume[0], uint32(len(volume))); err != nil {
+		t.Fatal(err)
+	}
+	roots := []struct{ name, path string }{{"ntfs_volume_root", win.UTF16ToString(volume)}, {"smb_export_root", `\\127.0.0.1\` + p.bridge.share}}
+	for _, root := range roots {
+		for _, applicationFirst := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/application_first_%t", root.name, applicationFirst), func(t *testing.T) {
+				cacheGateObserve("find_first_case", map[string]any{"platform": root.name, "application_first": applicationFirst})
+				baseline, err := cacheGateSharingOpen(t, root.path, win.FILE_LIST_DIRECTORY, win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, true)
+				if err != nil {
+					cacheGateObserve("find_first_baseline_failed", map[string]string{"error": err.Error()})
+					t.Fatalf("preexisting root conflict or permission failure: %v", err)
+				}
+				if err := baseline.close(); err != nil {
+					t.Fatal(err)
+				}
+				if applicationFirst {
+					application, err := cacheGateSharingOpen(t, root.path, win.FILE_LIST_DIRECTORY, win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, true)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() {
+						if err := application.close(); err != nil {
+							t.Error(err)
+						}
+					}()
+				}
+				before := cacheGatePendingCount(t, p.trace)
+				handle, err := win.FindFirstChangeNotification(root.path, true, win.FILE_NOTIFY_CHANGE_FILE_NAME|win.FILE_NOTIFY_CHANGE_DIR_NAME)
+				cacheGateObserve("find_first_open", map[string]any{"platform": root.name, "application_first": applicationFirst, "success": err == nil, "error": fmt.Sprint(err)})
+				if err != nil {
+					t.Errorf("FindFirstChangeNotification cannot coexist with the root open: %v", err)
+					return
+				}
+				t.Cleanup(func() {
+					if err := win.FindCloseChangeNotification(handle); err != nil {
+						t.Error(err)
+					}
+					cacheGateObserve("find_first_closed", map[string]string{"platform": root.name})
+				})
+				if strings.HasPrefix(root.name, "smb_") {
+					deadline := time.Now().Add(time.Second)
+					for cacheGatePendingCount(t, p.trace) <= before {
+						if time.Now().After(deadline) {
+							t.Fatal("FindFirstChangeNotification had no admitted SMB CHANGE_NOTIFY")
+						}
+						time.Sleep(time.Millisecond)
+					}
+					cacheGateObserve("find_first_pending_confirmed", nil)
+				}
+				if !applicationFirst {
+					application, err := cacheGateSharingOpen(t, root.path, win.FILE_LIST_DIRECTORY, win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, true)
+					cacheGateObserve("find_first_application_open", map[string]any{"platform": root.name, "success": err == nil, "error": fmt.Sprint(err)})
+					if err != nil {
+						t.Errorf("FindFirstChangeNotification changes the application's root-sharing behavior: %v", err)
+						return
+					}
+					if err := application.close(); err != nil {
+						t.Error(err)
+					}
+				}
+			})
+		}
+	}
+	cacheGateObserve("find_first_compatibility_gate", map[string]any{"compatible": !t.Failed(), "visibility_rearm_outage_acceptance": "requires subsequent proof if compatible"})
+}
+
+func cacheGateStatusMappings(t *testing.T) {
+	t.Helper()
+	mapper := win.NewLazySystemDLL("ntdll.dll").NewProc("RtlNtStatusToDosError")
+	if err := mapper.Find(); err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []uint32{0xc000000f, 0xc0000034, 0xc000003a} {
+		// The return value is the mapping; GetLastError is not an output of this API.
+		code, _, _ := mapper.Call(uintptr(status))
+		cacheGateObserve("ntstatus_translation_only", map[string]any{"ntstatus": status, "win32": uint32(code), "wire_status_changed": false})
+	}
 }

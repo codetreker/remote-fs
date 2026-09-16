@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [baseline, held_parent, notify_parent, owned_nested, owned_lifecycle, owned_outage, owned_rescan, directory_sharing]
+        variant: [baseline, held_parent, notify_parent, owned_nested, owned_lifecycle, owned_outage, owned_rescan, directory_sharing, find_notification]
     env:
       RFS_GATE_VARIANT: ${{ matrix.variant }}
       RFS_GATE_FIXTURE_SHA: 1cb9ad7f49d998de4daa4d562d766b18cf06ce16

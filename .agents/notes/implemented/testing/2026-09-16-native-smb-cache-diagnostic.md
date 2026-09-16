@@ -14,7 +14,7 @@ Windows 原生重定向器可以在远端创建已经完成后继续复用此前
 
 平台 overlay 在已建立目录监听的底层 stream 仍健康、generation 未变时，保留 rescan 交付后的注册与有界事件队列；重新请求不再用新 checkpoint 丢弃交付后的间隔。底层来源更换或失败仍使旧注册失效。两项[回归用例](../../../../.github/scripts/native-smb-notify-continuity_test.go.txt)分别检查间隔事件保留与来源替换隔离，和基底现有 Notification 测试一起先于原生场景执行。
 
-工作流由其 workflow、运行脚本、原生探针、连续性补丁及回归用例的 Pull Request 变更或手动触发，以八个独立的 Windows 11 24H2+ ARM64 作业运行。`baseline`、`held_parent`、`notify_parent` 分别比较没有显式父目录句柄、保留父目录句柄及已有 CHANGE_NOTIFY 的情形。`owned_nested`、`owned_lifecycle`、`owned_outage` 使用测试夹具拥有的递归 UNC 监听，检查多层目录、100 ms 重新监听间隔与八名字突发、busy/正常卸载及 HTTP/SSE 故障。owned_rescan 仅把 fixture 的 MaxNotifyEvents 缩小为 2，在实际请求对应的 wire ENUM 响应后暂停，再在重新监听前建立一个新的负查找与远端创建。它继续要求一秒、缓存到期前的新权威查询和后续健康监听，不用本地零字节代替 wire 证据。directory_sharing 以实际 NTFS、可写父目录下的子目录对比 SMB 子目录，另行记录本地 volume 根与导出 share 根；它比较 LIST/READ_ATTRIBUTES-only、双方打开顺序和普通文件读共享拒绝对照，并先排除已有的共享冲突。root 与非 root 不被当成相同对象，目录是否受某种 share mask 约束须由真实结果回答。这种测试拥有者不构成生产 ManagedShare API 的选择。
+工作流由其 workflow、运行脚本、原生探针、连续性补丁及回归用例的 Pull Request 变更或手动触发，以九个独立的 Windows 11 24H2+ ARM64 作业运行。`baseline`、`held_parent`、`notify_parent` 分别比较没有显式父目录句柄、保留父目录句柄及已有 CHANGE_NOTIFY 的情形。`owned_nested`、`owned_lifecycle`、`owned_outage` 使用测试夹具拥有的递归 UNC 监听，检查多层目录、100 ms 重新监听间隔与八名字突发、busy/正常卸载及 HTTP/SSE 故障。owned_rescan 仅把 fixture 的 MaxNotifyEvents 缩小为 2，在实际请求对应的 wire ENUM 响应后暂停，再在重新监听前建立一个新的负查找与远端创建。它继续要求一秒、缓存到期前的新权威查询和后续健康监听，不用本地零字节代替 wire 证据。directory_sharing 以实际 NTFS、可写父目录下的子目录对比 SMB 子目录，另行记录本地 volume 根与导出 share 根；它比较 LIST/READ_ATTRIBUTES-only、双方打开顺序和普通文件读共享拒绝对照，并先排除已有的共享冲突。root 与非 root 分别测量，目录是否受某种 share mask 约束须由真实结果回答。find_notification 进一步比较 FindFirstChangeNotification 与 LIST/share=6 根目录打开的双方顺序，并要求成功的 SMB 通知句柄有新 Pending；它只验证共存性，不包含可见性、重新监听或故障验收。该用例还只读记录三个 NTSTATUS 的系统 Win32 映射，不改线上状态码，不据此推断缓存策略。这些测试拥有者不构成生产 ManagedShare API 的选择。
 
 固定 Go 版本为 1.26.8，测试三分钟、作业十五分钟；编译缓存、模块缓存和临时状态放在工作区 `.tmp` 下。创建的成功判据同时约束 authority 结果、时间与新请求：初次负查找有匹配的 NAME_NOT_FOUND，远端创建确认后的一秒内出现新权威 CREATE 与可见文件，且观察早于最早可能的缓存到期。通知与故障情形各自核对匹配事件或不可用错误，零字节成功或 ERROR_NOTIFY_ENUM_DIR 明确表示丢失明细，测试拥有者记录后重新监听；它不维护目录快照，不能把重挂监听说成枚举恢复。owned_nested 的初次/普通间隔通知仍必需，只有突发明确丢明细时允许不具备每个名字的 ADDED，所有可见性检查保留。三个系统缓存 lifetime 必须大于一秒且诊断不得修改设置。完整可执行规则由[测试策略](../../../../docs/testing.md#windows-原生-smb-负缓存诊断)拥有。
 
@@ -54,8 +54,12 @@ Windows 原生重定向器可以在远端创建已经完成后继续复用此前
 
 [原生运行 35081515613](https://github.com/codetreker/remote-fs/actions/runs/35081515613)验证连续性 overlay：notify_parent、owned_nested、owned_lifecycle、owned_outage、owned_rescan 五项通过，baseline 与 held_parent 仍失败。rescan 间隔中的文件在 ACK 后约 133 ms 可见，带新权威 CREATE 和匹配 ADDED；后一轮创建约 35 ms 可见，监听回到健康 Pending。七个作业的两项新回归均通过、没有 skip；缓存策略仍为 5/10/10 秒且未改变，最终映射、backend 引用与 cleanup failure 均为空或零。
 
-该次探针 SHA 为 `98073635bcb4bc5d4a83788ed77d2189751c429b`，Windows 检出补丁的 SHA256 为 `c18cc0d442de2a93cf8ce0a7a2e39817d033125c9af4b0d967d07099f428612d`。它与审查的 LF 补丁 `f92edc59b55cc317fa0b5dcc1d1a55dd687b979e0e9a6bcb2112606ea4318e26` 经 LF→CRLF 转换后的字节完全一致，差异不被误认为另一份逻辑修复。该证据只属于固定基底加指定 overlay；实际交付的 SMB/backend 仍须独立验收，directory_sharing 也尚无原生结果，不能据此宣称目录共享规则已经明确。
+该次探针 SHA 为 `98073635bcb4bc5d4a83788ed77d2189751c429b`，Windows 检出补丁的 SHA256 为 `c18cc0d442de2a93cf8ce0a7a2e39817d033125c9af4b0d967d07099f428612d`。它与审查的 LF 补丁 `f92edc59b55cc317fa0b5dcc1d1a55dd687b979e0e9a6bcb2112606ea4318e26` 经 LF→CRLF 转换后的字节完全一致，差异不被误认为另一份逻辑修复。该证据只属于固定基底加指定 overlay；实际交付的 SMB/backend 仍须独立验收，directory_sharing 的共享兼容性仍须用自己的对照解释，通知通过不能代替这项证据。
+
+[原生运行 35083279673](https://github.com/codetreker/remote-fs/actions/runs/35083279673)的探针 SHA 为 `8a85133bfc71a3e45aae73b2a1fa1a22bf77fa05`。directory_sharing 的 16 项目录结果与 NTFS 对照一致：所测 LIST/share=6 在两个打开顺序下都与监听句柄冲突，READ_ATTRIBUTES-only/share=6 在两个顺序下都成功；这次测得的两个 root 与各自子目录均如此。16 个无监听基线没有预先冲突，两个普通文件的读共享拒绝对照也成立。
+
+四个冲突的 SMB 目录第二次打开均没有发出新的 CREATE，原生 API 已在重定向器侧返回共享冲突；只修改第二次打开的服务端检查，不能改变这组在发送前已被拒绝的请求。这个结论限于已测的访问/share masks 和打开顺序，不是关于所有目录或 root 的概括。八个作业的缓存策略保持不变、映射和 backend 引用清理完成，通知回归均通过且没有 skip。FindFirstChangeNotification 的替代入口尚无原生结果；若它不能共存，后续可见性验证就没有成立的前提。这里只读观察状态映射，未进行缺失状态码替换，也不宣称某个候选返回码的原生缓存行为。
 
 每次诊断的结果绑定基底 commit、overlay SHA256、探针 commit、variant、OS/build 和缓存设置；没有 overlay 的历史运行分别保留其原始执行来源。JSON 轨迹、Go verdict、映射前后状态及最终引用数作为产物保留十四天；轨迹溢出、编码失败、改变缓存策略或映射残留都会使结果失败。取消 overlapped 通知时保留其结构与缓冲直到完成，除明确的丢明细结果外，意外的异步完成/事件关闭错误仍报告失败，进程卡住由测试超时显式暴露。
 
-代价是维护固定基底的补丁、注入锚点、回归用例与八个原生作业，诊断输入不自动跟随生产代码变化。此入口交付可行性或失败的证据，不证明新实现通过、SQLite 持久性、所有 Windows 操作或历史时间显示策略。实际交付的 package、transport 和 backend 仍须接受自己的原生验收，平台能力提案的状态不因诊断入口存在而改变。
+代价是维护固定基底的补丁、注入锚点、回归用例与九个原生作业，诊断输入不自动跟随生产代码变化。此入口交付可行性或失败的证据，不证明新实现通过、SQLite 持久性、所有 Windows 操作或历史时间显示策略。实际交付的 package、transport 和 backend 仍须接受自己的原生验收，平台能力提案的状态不因诊断入口存在而改变。

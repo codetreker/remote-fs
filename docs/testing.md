@@ -293,7 +293,7 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 [诊断工作流](../.github/workflows/native-smb-gate.yml)在原生 Windows 11 24H2+ ARM64 上，以固定的 [SMB 原型](https://github.com/codetreker/remote-fs/tree/1cb9ad7f49d998de4daa4d562d766b18cf06ce16/packages/smb/windows)为基底验证系统重定向器的负名字缓存行为。基底只检出到 `.tmp/native-cache-gate/fixture`；[运行脚本](../.github/scripts/native-smb-cache-gate.ps1)核对 commit，检查并应用[通知连续性补丁](../.github/scripts/native-smb-notify-continuity.patch)，再注入[聚焦探针](../.github/scripts/native-smb-cache-gate_test.go.txt)和[通知回归用例](../.github/scripts/native-smb-notify-continuity_test.go.txt)。实际执行对象由基底 SHA、补丁 SHA256 与探针 SHA 共同确定，不与纯基底混称，也不编译工作分支正在实现的 SMB/backend。已观察结果与取舍见[诊断决定](../.agents/notes/implemented/testing/2026-09-16-native-smb-cache-diagnostic.md)。
 
-八个独立作业先运行基底的 Notification 测试及两项通知连续性回归，再运行 `TestNativeNegativeNameCacheGate`。测试使用 `-count=1`、三分钟超时，作业上限十五分钟。两项新增回归分别验证 rescan 交付后、重挂前的事件保留，以及底层来源更换后旧监听不能继续信任原来的注册；每项具名回归及原生测试必须取得精确 pass verdict，任何 fail、skip 或缺失预期 verdict 都不能算通过。
+九个独立作业先运行基底的 Notification 测试及两项通知连续性回归，再运行 `TestNativeNegativeNameCacheGate`。测试使用 `-count=1`、三分钟超时，作业上限十五分钟。两项新增回归分别验证 rescan 交付后、重挂前的事件保留，以及底层来源更换后旧监听不能继续信任原来的注册；每项具名回归及原生测试必须取得精确 pass verdict，任何 fail、skip 或缺失预期 verdict 都不能算通过。
 
 补丁只在健康且 generation 未变的底层 stream 上保留已建立的目录监听，在 rescan 响应交付之后继续积累有界事件，避免下一次请求以新 checkpoint 跳过间隔。来源更换、来源失败或关闭仍使旧注册失效。它是平台通知逻辑的诊断 overlay，不改变通用 File 生命周期或当前生产包；unit 回归通过也不能代替相同原生场景。
 
@@ -307,10 +307,13 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 | owned_outage | 监听显式报告 HTTP/SSE 故障；原生负缓存到期前，同一缺失名字的查询必须返回不可用错误，不能继续报告不存在 |
 | owned_rescan | 仅将诊断 fixture 的 MaxNotifyEvents 设为 2，在暂停时积累八次创建；先核对与请求关联的真实 wire ENUM 响应，再在响应后、重新监听前建立新的负查找并远端创建，验证一秒/缓存到期前/新权威 CREATE，以及后续监听与另一轮创建 |
 | directory_sharing | 以实际核对为 NTFS 且父目录可写的本地子目录，对比 SMB 子目录；分别记录 NTFS volume 根与导出 share 根。覆盖 LIST/READ_ATTRIBUTES-only 及双方打开顺序，先排除无监听者时已有的共享冲突，并要求普通文件的读共享拒绝对照成立 |
+| find_notification | 在实际 NTFS volume 根与 SMB share 根先确认 LIST/share=6 的无冲突基线，再分别以双方打开顺序检查 FindFirstChangeNotification 与该打开能否共存；成功的 SMB 通知句柄须有新的 Pending 响应，不兼容则失败 |
 
 创建可见性检查先取得 authority 的 CREATE/NAME_NOT_FOUND 响应，再由独立远端入口创建该名字。成功需要在写者确认后一秒内、且在最早可能的缓存到期之前观察到文件，并取得该名字的一次新权威 SMB CREATE；要求逐名字通知的情形还必须有匹配事件，不能用 rescan 替代 owned_nested 的初次创建和普通间隔创建通知。重复 Stat 是测量观察点，不是产品同步机制。环境中三个 SMB 缓存 lifetime 都须大于一秒；写者确认或观察越过可能到期时间时，不能据此证明非 TTL 可见性。故障情形单独检查缓存到期前的错误，不以创建成功代替断线诚实性。
 
 directory_sharing 记录传给每次 CreateFile 的 access/share mask 及实际 SMB CREATE 轨迹；成功建立的 SMB watcher 还须有新的 Pending 响应。目录子项的对照必须完整，不能用两个根的行为替代；无监听者时已经有 sharing violation 属于不能据此判断的前置冲突，不能算目标行为或被跳过。仅查询属性与列目录分别观察，普通文件对照必须拒绝冲突读打开。此诊断不预设“目录忽略 ShareRead”，也不从某个 root 的结果修改通用访问规则。
+
+find_notification 只检查替代通知入口的共存性；即使通过，也还需要独立证明可见性、重新监听和断线行为。它只读调用 RtlNtStatusToDosError 并记录 `0xc000000f`、`0xc0000034`、`0xc000003a` 的系统映射，明确记录 wire status 未变。Win32 映射不能证明 SMB 缓存行为，也不等于执行了缺失状态码替换实验。
 
 产物记录 OS/build/架构、基底及探针 commit、实际 overlay SHA256、缓存策略、逐名字操作时间、SMB/authority 事件、映射和最终引用状态。轨迹最多保留 2048 项，溢出或编码失败使该次证据失败；递归监听由单独的测试拥有者驱动，不依靠应用调用推进。Windows overlapped 通知在取消完成前保留其缓冲和结构。零字节成功或 ERROR_NOTIFY_ENUM_DIR 被明确记录为丢失明细并重新监听，不代表空目录或没有变化；其余异步完成或事件关闭的异常清理错误同样失败。工作流保存诊断产物，并在环境准备成功后核对缓存策略未变且没有新增 SMB 映射残留。
 
