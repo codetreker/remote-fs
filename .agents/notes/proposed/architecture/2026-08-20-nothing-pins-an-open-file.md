@@ -36,7 +36,7 @@ R-CC-1 另外要求调用方能够显式选择内容版本前置条件。内部 
 
 [FUSE 节点实现](../../../../packages/fuse/node.go)的 path、Readdir 与目录子项操作仍使用名字树派生路径；go-fuse 的 [stableAttrs inode 复用](https://github.com/hanwen/go-fuse/blob/423b377e1452ab7b3522229185a3047f72e3f966/fs/bridge.go#L178-L238)、[目录父关系更新](https://github.com/hanwen/go-fuse/blob/423b377e1452ab7b3522229185a3047f72e3f966/fs/inode.go#L326-L345)与[最近父关系选择](https://github.com/hanwen/go-fuse/blob/423b377e1452ab7b3522229185a3047f72e3f966/fs/inode_parents.go#L7-L45)共同构成这项推导。它与已经保留的普通 File 引用不同：固定文件对象不能自动固定目录子项操作的父对象。
 
-在执行前单独 Stat(parentID) 只能证明检查时该父对象存在，检查与随后按路径修改之间仍能换对象。最终访问必须受权威父身份约束，不能从一次先验检查推导后续路径仍指向它。具体操作形状与验证由后续实现确定，本文不声明已有目录句柄能力。
+在执行前单独 Stat(parentID) 只能证明检查时该父对象存在，检查与随后按路径修改之间仍能换对象。最终访问必须受权威父身份约束，不能从一次先验检查推导后续路径仍指向它。具体操作形状、原子父身份约束与验证由[平台客户端的中立能力](2026-09-16-platform-client-capabilities.md)接续；本文保留该问题的依据和显式内容版本工作流，不声明已有目录句柄能力。
 
 ## 提案
 
