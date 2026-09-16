@@ -24,13 +24,13 @@ positive 的 compound/wire 观察与 authority metadata、digest 逐项关联，
 
 positive_postdeadline_unheld/positive_postdeadline_exclusive 各增加一个独立的路径增长观察。真实 CREATE/WRITE/协议无缓存授权证明先在独立 setup fixture 完成；句柄、映射、SMB/HTTP 和全部保留资源确认结束后，才新建没有 proof file 的测量 share。测量使用自己的 trace、协商检查与曝光起点。真实写入 ACK 后，直到计划 1.1 秒的第一次 GetFileAttributesExW，不触碰目标或相关目录；实际开始严格超过一秒且开始/结束都在原始缓存到期之前。测量间隔仍严格检查额外请求，fixture 退役不被当作 Windows 后台流量永远不会出现的保证。原协商能力 0x26/State NONE 和即时一秒 validator 保持原样。
 
-延迟首值及其与暖 tuple 的相等性立即保存；时间、原生错误或安静间隔失败也继续尝试 post-query oracle 和普通清理。旧值只有在原生观察完整、严格安静、时间合法且 oracle 未变化时才是候选，经过全部本体、句柄和卸载清理后，没有其它错误才成为 violated；清理失败后计数归零也不修复证据资格。延迟当前值只说明在该次查询时已更新，记录 within_one_second_proven=false、contract_result=inconclusive。作业名明确非 SLO 验收，证据收集通过不把一秒期限改成 1.1 秒。包含独立 setup 退役及完整无效样本记录的原能力延迟探针已有下述合格违约结果；NoLeasing 原生测量仍未开始。观察器合成回归普通/race 各 31 pass，基线和 NoLeasing 两种 ARM64 组合构建通过；这些局部检查与原生结果分别归属。
+延迟首值及其与暖 tuple 的相等性立即保存；时间、原生错误或安静间隔失败也继续尝试 post-query oracle 和普通清理。旧值只有在原生观察完整、严格安静、时间合法且 oracle 未变化时才是候选，经过全部本体、句柄和卸载清理后，没有其它错误才成为 violated；清理失败后计数归零也不修复证据资格。延迟当前值只说明在该次查询时已更新，记录 within_one_second_proven=false、contract_result=inconclusive。作业名明确非 SLO 验收，证据收集通过不把一秒期限改成 1.1 秒。独立 setup 退役及完整无效样本记录使原能力与 NoLeasing 的延迟结果都能按下述条件判定。观察器合成回归普通/race 各 31 pass，基线和 NoLeasing 两种 ARM64 组合构建通过；这些局部检查与原生结果分别归属。
 
-NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github/scripts/native-smb-no-leasing.patch)仅进入四个显式 noleasing 变体，在原通知/最终缺失 overlay 后逐层检查和记录；它声明 leasing 与 directory leasing 不受支持，只保留 LARGE_MTU=0x4，最终仍为 SMB 3.1.1。保留 signing/preauthentication 和 CREATE 外层结构验证，忽略不支持的 RqLs 内部字段，不建立 lease table/owner 或 lease-key 关联；所有成功 CREATE 都不授予 oplock/cache，未请求的 ACK 不伪装成功。原 lease 身份检查文件不变，也不改变 authority、NodeID 或引用生命周期。 运行脚本在基线 overlay 完成后，只把 NoLeasing 的三份目标 Go 文件和补丁规范为无 BOM 的 LF，记录 raw/canonical input、patch 和 output hash，并核对已审查值。git apply 仅本次关闭 autocrlf，先检查再应用；LF 与 Windows CRLF 输入必须得到逐字节相同的已审查代码，任何偏差都失败，不用宽松 hunk 匹配改变执行对象。
+NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github/scripts/native-smb-no-leasing.patch)仅进入四个显式 noleasing 变体，在原通知/最终缺失 overlay 后逐层检查和记录；它声明 leasing 与 directory leasing 不受支持，只保留 LARGE_MTU=0x4，最终仍为 SMB 3.1.1。保留 signing/preauthentication 和 CREATE 外层结构验证，忽略不支持的 RqLs 内部字段，不建立 lease table/owner 或 lease-key 关联；所有成功 CREATE 都不授予 oplock/cache，未请求的 ACK 不伪装成功。原 lease 身份检查文件不变，也不改变 authority、NodeID 或引用生命周期。运行脚本在基线 overlay 完成后，只把 NoLeasing 的三份目标 Go 文件和补丁规范为无 BOM 的 LF，记录 raw/canonical input、patch 和 output hash，并核对已审查值。git apply 仅本次关闭 autocrlf，先检查再应用；LF 与 Windows CRLF 输入必须得到逐字节相同的已审查代码，任何偏差都失败，不用宽松 hunk 匹配改变执行对象。
 
 两种根模式分别运行十五项即时 cell，再各用全新 fixture 运行一项独立延迟观察。原 0x26/0x6 基线及其 State NONE 保持原判据，实验 trace 必须实际显示 capability=4、最终 3.1.1；即时 fixture 或已完全退役的延迟 setup fixture 单独证明 proof-file CREATE 为 NONE 且无 lease response，测量连接仍检查自己的策略。旧 H 仍返回 A，新打开必须取得替换后的 B；一次重开成功不能代替属性或名字缓存验收，1.1 秒的新值也仍不证明一秒可见性。
 
-七项[专用测试根](../../../../.github/scripts/native-smb-no-leasing_test.go.txt)在原生场景前取得逐根 verdict。局部协议/回归普通与 race 各 29 pass，ARM64 构建通过；只恢复原 capability 的负向对照在协商断言失败。这些不包含原生缓存效果，仍未知的动作也不由 QueryAction→Completed 回归宣称已经恢复。NoLeasing 原生实验尚未运行，未选作生产默认策略。
+七项[专用测试根](../../../../.github/scripts/native-smb-no-leasing_test.go.txt)在原生场景前取得逐根 verdict。局部协议/回归普通与 race 各 29 pass，ARM64 构建通过；只恢复原 capability 的负向对照在协商断言失败。这些不包含原生缓存效果，仍未知的动作也不由 QueryAction→Completed 回归宣称已经恢复。原生 NoLeasing 的结果与这份局部验证分开记录；它未被选作生产默认策略。
 
 固定 Go 版本为 1.26.8，测试三分钟、作业十五分钟；编译缓存、模块缓存和临时状态放在工作区 `.tmp` 下。创建的成功判据同时约束 authority 结果、时间与新请求：初次负查找有匹配的 NAME_NOT_FOUND，远端创建确认后的一秒内出现新权威 CREATE 与可见文件，且观察早于最早可能的缓存到期。通知与故障情形各自核对匹配事件或不可用错误，零字节成功或 ERROR_NOTIFY_ENUM_DIR 明确表示丢失明细，测试拥有者记录后重新监听；它不维护目录快照，不能把重挂监听说成枚举恢复。owned_nested 的初次/普通间隔通知仍必需，只有突发明确丢明细时允许不具备每个名字的 ADDED，所有可见性检查保留。三个系统缓存 lifetime 必须大于一秒且诊断不得修改设置。完整可执行规则由[测试策略](../../../../docs/testing.md#windows-原生-smb-缓存诊断)拥有。
 
@@ -48,62 +48,53 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 ## 后果
 
-[原生运行 35074898091](https://github.com/codetreker/remote-fs/actions/runs/35074898091)在 Windows 11 Enterprise build 26200 ARM64 上执行前三个 variant。原型为上述固定 commit，runner 记录的探针 SHA 为 `48003488f0a88e66c9556fd795bea92e940a63be`；FileNotFound/Directory/FileInfo cache lifetime 分别为 5/10/10 秒，运行后保持不变。
+### 路径属性的一秒边界
 
-| variant | 实际结果 |
-|---|---|
-| baseline | 一秒窗口内 96 次查询、零次新的权威 CREATE，未见创建，失败 |
-| held_parent | 一秒窗口内 97 次查询、零次新的权威 CREATE，未见创建，失败 |
-| notify_parent | 两次查询、一次新的权威 CREATE，收到匹配 ADDED；约 18 ms 后可见，早于五秒缓存期限，通过 |
+两种独立策略都有合格的旧路径属性反例。运行环境均为 Windows 11 Enterprise build 26200 ARM64，FileNotFound/Directory/FileInfo cache lifetime 为默认 5/10/10 秒且未改变；每个样本都严格早于原始缓存到期。
 
-三份产物的最终映射均为空，backend 引用、pending request 与 lease slot/bytes 均为零。这个结果只证明固定原型中一次已接纳的根目录监听能使该次创建及时可见。
+| 被测策略与执行来源 | 首次 GetFileAttributesExW 相对 ACK 的时间 | 结果 |
+|---|---|---|
+| 原 capability 0x26、lease State NONE；[35111447579](https://github.com/codetreker/remote-fs/actions/runs/35111447579)，探针 `7f2168c32d4a3b89e7b395cbaa81f59838e20004` | exclusive 1.100140 秒；unheld 1.100189 秒 | 两项 stale_after_one_second / violated |
+| NoLeasing capability 0x4、CREATE NONE/无 RqLs；[35114190139](https://github.com/codetreker/remote-fs/actions/runs/35114190139)，探针 `57ab51e17a9b25694e34940775fb70822f27201b` | exclusive 1.100531 秒；unheld 1.100566 秒 | 两项 stale_after_one_second / violated |
 
-[原生运行 35078136507](https://github.com/codetreker/remote-fs/actions/runs/35078136507)执行包含三个 owned variant 的诊断，runner 记录的探针 SHA 为 `aaf7e8d0a282fb9cf82e14f23315e7069c7def1d`，原型固定点不变：
+四个原生结果均仍为暖的 257 字节和 2001 年 mtime；各自 post-query HTTP oracle 确认同一 NodeID=2、769 字节、metadata revision=4 和预期内容。安静间隔无违规，轨迹完整，最终引用、连接、pending 与 cleanup failure 均为零。NoLeasing 的实际协商与无缓存授权断言已经执行，补丁及三个 canonical 输出 hash 与已审查代码一致；它没有因未安装补丁而退回基线。
 
-| variant | 实际结果及限度 |
-|---|---|
-| owned_lifecycle | 通过。应用句柄使卸载返回 busy，随后创建约 20 ms 可见且有新权威查询；应用关闭后，仅内部 UNC 监听存在时普通卸载成功 |
-| owned_outage | 通过。监听报告 I/O 故障，负缓存到期前对缺失名字返回 I/O 错误，未报告不存在 |
-| owned_nested | 整项失败。十个名字的可见性均通过：首个约 34 ms、间隔中的名字约 132 ms、八个突发约 39–191 ms，且各有新权威查询；监听 helper 在零字节丢明细后停止，不能把这些通过的子断言写成整项通过 |
+这证明指定原型、补丁与设置下的这两种路径没有满足一秒要求，不是所有 SMB 实现或所有缓存失效方案都不可能满足的结论。当前端点与文件适配仍须有自己的验收，缓存处理的下一项决定保持未定，规格要求不因诊断失败而自动改变。
 
-这次运行的缓存策略仍为 5/10/10 秒且未改变，最终 backend 引用、pending request 与 lease slot/bytes 归零。它暴露的丢明细处理是 owned_rescan 要验证的独立窗口：发生过 ENUM 之后，新负查找与创建能否跨越重新监听的间隔。[原生运行 35080069968](https://github.com/codetreker/remote-fs/actions/runs/35080069968)对这个新窗口给出了失败证据：runner 的探针 SHA 为 `2796afb08b536e85e2781592e8702bb754b2543a`，尚未施加通知连续性 overlay。owned_rescan 已关联实际 ENUM 响应 MID17，在其后完成新名字的权威负查找与远端创建，100 ms 暂停后又收到 Pending MID19；一秒内 87 次查询仍没有新的权威 CREATE，整项失败。重新进入 Pending 因而不能单独证明间隔没有丢失。
+### 已打开读取与新打开身份
 
-同次运行的 owned_nested 已完成十项可见性与丢明细后的继续监听，整项通过；owned_lifecycle、owned_outage 和 notify_parent 通过，baseline 与 held_parent 仍失败。七个作业的缓存策略不变、最终映射为空，backend 引用与 cleanup failure 均为零。这些是未施加连续性 overlay 的结果，不能从局部回归或构建成功推导加补丁后的行为。
+[原能力即时矩阵 35099917015](https://github.com/codetreker/remote-fs/actions/runs/35099917015)的八项同步/异步增长/缩短读取完整通过；BasicInfo/StandardInfo 的原生值已更新，但 class 34 观察器缺少解码，完整用例失败。即时路径旧值只是毫秒级首次观察，不单独证明持续超过一秒。replace_open 的原型 CREATE 返回 INVALID_PARAMETER，recreate_open 首次缺失返回 FILE_NOT_FOUND，但两种完整流程均未通过；不从这些局部结果推断缓存原因。
 
-[原生运行 35081515613](https://github.com/codetreker/remote-fs/actions/runs/35081515613)验证连续性 overlay：notify_parent、owned_nested、owned_lifecycle、owned_outage、owned_rescan 五项通过，baseline 与 held_parent 仍失败。rescan 间隔中的文件在 ACK 后约 133 ms 可见，带新权威 CREATE 和匹配 ADDED；后一轮创建约 35 ms 可见，监听回到健康 Pending。七个作业的两项新回归均通过、没有 skip；缓存策略仍为 5/10/10 秒且未改变，最终映射、backend 引用与 cleanup failure 均为空或零。
+[NoLeasing 即时矩阵 35114190139](https://github.com/codetreker/remote-fs/actions/runs/35114190139)在两种根模式合计三十项中通过十六项：BasicInfo、StandardInfo、同步和异步读取各自的增长/缩短结果成立，完整矩阵仍失败。路径视图返回旧值；replace/recreate 的新打开进入原生身份检查后得到数值 3，authority 期望为替代对象的 4，原因尚未定位。
 
-该次探针 SHA 为 `98073635bcb4bc5d4a83788ed77d2189751c429b`，Windows 检出补丁的 SHA256 为 `c18cc0d442de2a93cf8ce0a7a2e39817d033125c9af4b0d967d07099f428612d`。它与审查的 LF 补丁 `f92edc59b55cc317fa0b5dcc1d1a55dd687b979e0e9a6bcb2112606ea4318e26` 经 LF→CRLF 转换后的字节完全一致，差异不被误认为另一份逻辑修复。该证据只属于固定基底加指定 overlay；实际交付的 SMB/backend 仍须独立验收，directory_sharing 的共享兼容性仍须用自己的对照解释，通知通过不能代替这项证据。
+这份身份轨迹中的 QUERY_INFO class 7 是 EA 信息，不是 Position；新打开未出现可核对的 QFid，也没有 class 6/18 查询。因此不能据此归因于位置、lease 关联或 authority 把旧对象交给了新引用，更不能把数值不符改成通过。旧引用与新名字的对象区别仍须由完整请求及内容/身份证据验证。
 
-[原生运行 35083279673](https://github.com/codetreker/remote-fs/actions/runs/35083279673)的探针 SHA 为 `8a85133bfc71a3e45aae73b2a1fa1a22bf77fa05`。directory_sharing 的 16 项目录结果与 NTFS 对照一致：所测 LIST/share=6 在两个打开顺序下都与监听句柄冲突，READ_ATTRIBUTES-only/share=6 在两个顺序下都成功；这次测得的两个 root 与各自子目录均如此。16 个无监听基线没有预先冲突，两个普通文件的读共享拒绝对照也成立。
+### 负名字、监听与共享模式
 
-四个冲突的 SMB 目录第二次打开均没有发出新的 CREATE，原生 API 已在重定向器侧返回共享冲突；只修改第二次打开的服务端检查，不能改变这组在发送前已被拒绝的请求。这个结论限于已测的访问/share masks 和打开顺序，不是关于所有目录或 root 的概括。八个作业的缓存策略保持不变、映射和 backend 引用清理完成，通知回归均通过且没有 skip。[原生运行 35087653528](https://github.com/codetreker/remote-fs/actions/runs/35087653528)对 FindFirstChangeNotification 的共存性返回失败，探针 SHA 为 `70beddac497daf1962df36a7827d99a0174d3d44`。NTFS root 两个顺序均冲突；SMB watcher-first 已有 Pending，后续应用打开仍冲突；SMB application-first 的无监听基线失败，因而该行不能作为其后打开顺序的有效对照。没有由此得到可见性、重新监听或故障验收。
+[35074898091](https://github.com/codetreker/remote-fs/actions/runs/35074898091)的 baseline/held_parent 在一秒内分别查询 96/97 次，均无新权威 CREATE；notify_parent 两次查询取得一次新 CREATE 和匹配 ADDED，约 18 ms 可见。这只证明一次已接纳的根监听能推进该次创建。
 
-该次只读 RTL 实测为 0xc000000f→2、0xc0000034→2、0xc000003a→3，wire status 未改变；返回同一 Win32 错误不证明缓存行为相同。missing_final_status 单独改变已核对的最终缺失状态，其结果不能从这次只读映射推导。
+[35088586249](https://github.com/codetreker/remote-fs/actions/runs/35088586249)的最终缺失状态对照将已核对的最终不存在返回为 0xc000000f：无父句柄和持有根 LIST/share=0 的两个名字分别约 7.55/7.49 ms 可见，各有新 CREATE，整个轨迹没有 CHANGE_NOTIFY。只读 RTL 的 0xf→2、0x34→2、0x3a→3 映射不能解释缓存行为；两个负名字成功也不能代替已缓存属性、内容或替换名字的验证。
 
-[原生运行 35088586249](https://github.com/codetreker/remote-fs/actions/runs/35088586249)随后验证了这个独立对照，探针 SHA 为 `6e7a0cf098b04c369754bf3ee81e8da20ceea097`。第一阶段没有监听或显式父目录句柄，wire 最终缺失为 0xc000000f、Win32 为 FILE_NOT_FOUND，远端创建在 ACK 后约 7.55 ms 可见；第二阶段持有根 LIST/share=0，另一个名字约 7.49 ms 可见。两次各有新权威 CREATE，并早于五秒缓存到期；整个轨迹没有 CHANGE_NOTIFY。
+[35080069968](https://github.com/codetreker/remote-fs/actions/runs/35080069968)中，未施加连续性 overlay 的 rescan 样本在真实 ENUM 后又进入 Pending，但一秒内 87 次查询没有新 CREATE。[35081515613](https://github.com/codetreker/remote-fs/actions/runs/35081515613)施加相同健康 generation 下保留注册的 overlay 后，notify_parent、nested、lifecycle、outage、rescan 五项通过；rescan 间隔约 133 ms 可见，随后创建约 35 ms，均有实际请求/通知并回到健康 Pending。监听恢复不能只以 Pending 判定，也不表示丢失的目录明细已经重建。
 
-该次最终缺失 overlay 的 Windows SHA256 为 `263fd82b00308514e994de690351f5add58fe13bff3ddbf07c0853ea7c19ea1b`，与 LF 补丁 `a53e64d479138497e99f96ded82af01ec69be8434eac4cf0952f9c534dfc8d8a` 的 LF→CRLF 转换一致，连续性 overlay 仍单独记录。通知与最终缺失的专用回归均通过且无 skip；缓存策略未变，映射为空，backend 引用与 cleanup failure 为零。这个结果只证明指定基底/补丁下的两项负名字与独占根对照，不代替实际 Windows 集成、其它缓存类型、内部名字观察或当前绑定 API 的验收。
+[35083279673](https://github.com/codetreker/remote-fs/actions/runs/35083279673)的十六项目录结果在已核对的 NTFS 与 SMB 子目录、root 上一致：LIST/share=6 与监听在两个顺序冲突，READ_ATTRIBUTES-only 成功；无监听基线清楚，普通文件读共享拒绝也成立。四个冲突的 SMB 第二次打开没有发出 CREATE，服务端不能处理尚未发送的请求。这个结论仅限被测 masks/顺序，不推出目录或 root 的通用豁免。
 
-[原生运行 35099917015](https://github.com/codetreker/remote-fs/actions/runs/35099917015)在 Windows 11 Enterprise build 26200 ARM64 执行两种即时 positive 模式，探针 checkout 为 `5cdd995b67f668ca3490fa9bbea4c33127c5a0f2`（PR head `046aefcbf88e1c6792e699b8127c316d7d9365dd`）。两种模式的十五项整体均失败，但原因需要逐项区分：
+[FindFirstChangeNotification 对照 35087653528](https://github.com/codetreker/remote-fs/actions/runs/35087653528)中，NTFS root 两个顺序均冲突，SMB watcher-first 已有 Pending 而应用打开仍冲突；SMB application-first 的无监听基线失败，不能作为有效对照。替代通知入口尚未证明兼容，也没有由此取得可见性、重新监听或故障验收。
 
-| 观察 | 已取得的证据与限度 |
-|---|---|
-| 同步/异步读取 × 增长/缩短 × 两种根模式 | 八个 cell 完整通过，包含新内容、尾部/EOF、wire 和资源检查；不覆盖路径属性缓存 |
-| BasicInfo/StandardInfo | 原生返回值已是当前时间/长度；实际使用 class 34，观察器缺少该解码令完整用例失败，不能称为缓存违约 |
-| 路径增长/缩短及名字变化 | ACK 后立即的第一次路径查询仍可返回暖值；这些毫秒级旧值不证明超过一秒仍旧，也不能用后续其它 API 刷新后的结果覆盖它们 |
-| replace_open | 原型 CREATE 返回 INVALID_PARAMETER，未证明 replacement 打开可用；该拒绝本身不定位原因，也不改记成缓存结论 |
-| recreate_open | 首次缺失返回 FILE_NOT_FOUND，但完整用例未通过，不能由局部正确错误码推断重建流程通过 |
+### 样本资格与执行来源
 
-两个作业的通知/缺失状态/positive helper 用例分别为 52/10/30 pass、无 fail/skip，缓存策略仍为 5/10/10 秒，最终映射、引用与清理状态干净。沿用已记录的连续性与最终缺失 overlay；这次结果属于固定原型，不能替代当前中立能力或完整 Windows adapter 的验收。延迟路径观察独立验证即时旧值是否持续越过一秒，不扩大这次八项读取成功的范围。
+[35107398671](https://github.com/codetreker/remote-fs/actions/runs/35107398671)的两个原能力延迟样本虽在约 1.100 秒返回旧 tuple，仍是 inconclusive：安静间隔出现 lease-proof.bin 的 CREATE、QUERY_INFO class 48 与 CLOSE，且没有 post-query oracle。后台请求的具体发起者未确定；资源最终归零不能补回缺失证据。它不计入上述四个合格反例。
 
-[原生运行 35107398671](https://github.com/codetreker/remote-fs/actions/runs/35107398671)执行原 capability 的两个延迟变体，探针 checkout 为 `70ef46b918def8a7be7b62fa438a41d9c9d9ca12`。unheld/exclusive 首个查询分别约在 ACK 后 1.100264/1.100449 秒，原始值均为暖的 257 字节和 2001 年 mtime，而 mutation 确认的是 769 字节与新时间。
+[35078136507](https://github.com/codetreker/remote-fs/actions/runs/35078136507)的 nested 用例也不能由子断言升级为整项通过：十个名字均及时可见，但 helper 在零字节丢明细后停止。该次 lifecycle 和 outage 通过，仍不消除 nested 的失败。成功判据覆盖监听拥有者的完整生命周期。
 
-两个样本都为 inconclusive：安静间隔实际出现 lease-proof.bin 的第二次 CREATE、QUERY_INFO class 48 与 CLOSE，原探针在该检查失败后没有取得 post-query oracle。该后台操作的具体发起者未确定，不能把旧 tuple 单独升级成合格的一秒反例。缓存策略仍为 5/10/10 秒、最终引用与连接/pending/cleanup 归零也不能补回缺失证据。这个结论属于该次不完整样本；分离并完全退役 setup fixture、保留所有原始样本并继续收集 oracle，是后续测量的前置条件。
+准备失败不提供协议效果。[35111447579](https://github.com/codetreker/remote-fs/actions/runs/35111447579)的 NoLeasing 作业因 CRLF/autocrlf 的补丁上下文不匹配而未进入测量；独立重现与 LF/CRLF 组合核对证明规范化后输出与已审查代码相同。[35114190139](https://github.com/codetreker/remote-fs/actions/runs/35114190139)实际完成了规范化准备并运行 NoLeasing，因而其失败是测量结果，不是沿用那个启动错误。
 
-[原生运行 35111447579](https://github.com/codetreker/remote-fs/actions/runs/35111447579)以探针 checkout `7f2168c32d4a3b89e7b395cbaa81f59838e20004` 执行已分离 setup 的原能力延迟对照。exclusive/unheld 首次查询分别在 ACK 后约 1.100140/1.100189 秒，仍返回 257 字节和 2001 年 mtime，且早于原始缓存到期。两份 post-query oracle 均确认同一 NodeID=2、769 字节、metadata revision=4 和预期内容；安静间隔无违规，trace 完整，最终引用、连接、pending 与 cleanup failure 均为零。
+| overlay | 规范 LF SHA256 | 已核对的执行表示 |
+|---|---|---|
+| 通知连续性 | `f92edc59b55cc317fa0b5dcc1d1a55dd687b979e0e9a6bcb2112606ea4318e26` | Windows CRLF 为 `c18cc0d442de2a93cf8ce0a7a2e39817d033125c9af4b0d967d07099f428612d`，仅换行差异 |
+| 最终缺失状态 | `a53e64d479138497e99f96ded82af01ec69be8434eac4cf0952f9c534dfc8d8a` | Windows CRLF 为 `263fd82b00308514e994de690351f5add58fe13bff3ddbf07c0853ea7c19ea1b`，仅换行差异 |
+| NoLeasing | `62538e9c1eb5b2b12a4d6fed71937fdd675b378d253c8f1c6c9d875a84f06734` | 规范化后按该 hash 应用，三个目标源码的输入/输出另外逐一核对 |
 
-这两项被记录为 stale_after_one_second/violated，是固定原型原 capability 策略下的合格一秒反例，不证明其它策略同样失败。NoLeasing 作业在测量前因 Windows CRLF/autocrlf 组合导致补丁上下文不匹配而退出，没有产生原生样本。该准备故障已在相同换行配置下重现；规范化 LF 并逐一核对输入/输出 hash 后，实际 git apply 成功，三个输出与原审查代码完全一致。该修复只恢复确定的实验输入，不构成 NoLeasing 有效或无效的证据。
+每次结果绑定固定基底、overlay、探针 commit、variant、OS/build 和缓存设置；无 overlay 的样本保留各自来源。JSON 轨迹、Go verdict、映射前后状态和最终引用数作为产物保存十四天。轨迹溢出、编码失败、设置改变或映射残留使样本失败；取消 overlapped 通知须等真实完成后才释放结构和缓冲，意外清理错误不能当作正常取消。
 
-每次诊断的结果绑定基底 commit、各 overlay SHA256、探针 commit、variant、OS/build 和缓存设置；没有 overlay 的历史运行分别保留其原始执行来源。JSON 轨迹、Go verdict、映射前后状态及最终引用数作为产物保留十四天；轨迹溢出、编码失败、改变缓存策略或映射残留都会使结果失败。取消 overlapped 通知时保留其结构与缓冲直到完成，除明确的丢明细结果外，意外的异步完成/事件关闭错误仍报告失败，进程卡住由测试超时显式暴露。
-
-代价是维护固定基底的补丁、注入锚点、回归用例与十八个原生作业，诊断输入不自动跟随生产代码变化。此入口交付可行性或失败的证据，不证明新实现通过、SQLite 持久性、所有 Windows 操作或历史时间显示策略。实际交付的 package、transport 和 backend 仍须接受自己的原生验收，平台能力提案的状态不因诊断入口存在而改变。
+代价是维护固定基底补丁、注入锚点、回归和十八个诊断作业，输入不会自动跟随生产代码。诊断提供可行性或失败证据，不交付新的 SMB 文件实现、SQLite 持久性或历史时间显示策略。实际 package、transport 和 backend 仍须独立验收；是否增加缓存失效机制及如何完成平台接入，继续由平台提案承接。
