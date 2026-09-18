@@ -57,7 +57,7 @@ ReadAt 捕获同一 FileState 的 Attr、大小与字节；EOF 返回该状态�
 
 WriteAt/Truncate 从当前状态构造区间补丁，保留未触及字节，扩展为零；Reserve、Put 与 native revision Commit 保持原流水线。上传不占最终许可，也不延长 session/Strong。最后事务检查引用、内容 revision、Uses、enforced 范围、Strong proof、预算与记账；只有已知未提交并已清理的 revision 冲突才重试。
 
-ConditionalFileMutation 可携带 ExpectedSize、只读 ExpectedMetadata 及本次 metadata 更新的期望版本。条件失败不执行效果；Append 以捕获 EOF 构造候选，最终 revision 比较失败后才重新构造。它不为普通 WriteAt 引入打开时内容前置条件，也不提供跨应用大调用的事务。
+ConditionalFileMutation 可携带 ExpectedSize、只读 ExpectedMetadata 及本次 metadata 更新的期望版本。 HTTP 的 Metadata 更新项使用请求专用 CAS 编码，空 version 表示必须缺席，空 data 仍是一次有效更新；返回 Attr 的 OpaquePayload 则必须有非空 authority version。条件失败不执行效果；Append 以捕获 EOF 构造候选，最终 revision 比较失败后才重新构造。它不为普通 WriteAt 引入打开时内容前置条件，也不提供跨应用大调用的事务。
 
 每次实际创建记录 BirthTime/ChangeTime；内容、显式属性/metadata 和名字变化在对应原生事务维护 ChangeTime，replica 保留原值。旧数据 Unknown 保持 nil，普通读、renew、reservation/GC 或失败比较不生成历史。Sync 只检查已完成修改的健康/持久性，Close 没有未提交的本地 dirty 内容要发布。
 

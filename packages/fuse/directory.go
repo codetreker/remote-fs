@@ -42,7 +42,7 @@ func (n *node) OpendirHandle(ctx context.Context, flags uint32) (fs.FileHandle, 
 	if err := references.CheckNodeReferences(); err != nil {
 		return nil, 0, errnoOf(err)
 	}
-	result, err := references.OpenNodeRef(ctx, n.id.node, storage.NodeRefOptions{Kind: storage.NodeDirectory, Target: storage.ChildCondition{State: storage.SameNode, NodeID: n.id.node}, Use: storage.UseClaim{Uses: storage.ReadEntries}, MetadataAccess: storage.ReadMetadata | storage.WriteMetadata})
+	result, err := references.OpenNodeRef(ctx, n.id.node, storage.NodeRefOptions{Kind: storage.NodeDirectory, Target: storage.ChildCondition{State: storage.SameNode, NodeID: n.id.node}, Use: storage.UseClaim{Uses: storage.ReadEntries}, MetadataAccess: storage.ReadMetadata})
 	if result.Reference == nil {
 		if err == nil {
 			err = syscall.EIO
@@ -171,14 +171,39 @@ func (d *directoryHandle) stat(ctx context.Context) (storage.Attr, error) {
 }
 
 func (d *directoryHandle) setAttr(ctx context.Context, change storage.AttrChange) (storage.Attr, error) {
-	if err := d.check(); err != nil {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.checkMutationLocked(ctx); err != nil {
 		return storage.Attr{}, err
 	}
-	attr, err := d.reference.SetAttr(ctx, change)
+	attr, err := d.node.volume.files.SetNodeAttr(ctx, d.node.id.node, change)
 	if err == nil {
 		err = d.node.checkAttr(attr)
 	}
 	return attr, err
+}
+
+// The handle owns its reference exclusively. Holding mu through the identity
+// mutation prevents Releasedir from retiring its pin; session expiry remains
+// subject to the backend's final publication guard.
+func (d *directoryHandle) checkMutationLocked(ctx context.Context) error {
+	if err := d.node.volume.check(); err != nil {
+		return err
+	}
+	if d.closed {
+		return syscall.EBADF
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	scope, err := d.reference.(storage.ScopedReference).Scope(ctx)
+	if err != nil {
+		return err
+	}
+	if scope != d.scope {
+		return storage.ErrInvalidScope
+	}
+	return nil
 }
 
 func (d *directoryHandle) Releasedir(ctx context.Context, _ uint32) {

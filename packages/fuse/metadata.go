@@ -71,21 +71,35 @@ func (n *node) setPermissions(ctx context.Context, f fs.FileHandle, mode iofs.Fi
 	}
 	var attr storage.Attr
 	var update func(context.Context, string, []byte, []byte) (storage.OpaquePayload, error)
-	var reference storage.ReferenceMetadataAccess
-	switch retained := f.(type) {
-	case *handle:
-		reference, _ = retained.file.(storage.ReferenceMetadataAccess)
-	case *directoryHandle:
-		reference, _ = retained.reference.(storage.ReferenceMetadataAccess)
-	}
-	if handle, ok := f.(attributeHandle); ok {
+	if directory, ok := f.(*directoryHandle); ok {
+		directory.mu.Lock()
+		defer directory.mu.Unlock()
+		if err := directory.checkMutationLocked(ctx); err != nil {
+			return err
+		}
+		access, ok := n.volume.files.(storage.MetadataAccess)
+		if !ok {
+			return syscall.EOPNOTSUPP
+		}
+		if err := access.CheckMetadataAccess(); err != nil {
+			return err
+		}
+		attr, err = directory.reference.Stat(ctx)
+		update = func(ctx context.Context, namespace string, version, data []byte) (storage.OpaquePayload, error) {
+			return access.SetMetadata(ctx, n.id.node, namespace, version, data)
+		}
+	} else if h, ok := f.(attributeHandle); ok {
+		var reference storage.ReferenceMetadataAccess
+		if retained, ok := f.(*handle); ok {
+			reference, _ = retained.file.(storage.ReferenceMetadataAccess)
+		}
 		if reference == nil {
 			return syscall.EOPNOTSUPP
 		}
 		if err := reference.CheckMetadataAccess(); err != nil {
 			return err
 		}
-		attr, err = handle.stat(ctx)
+		attr, err = h.stat(ctx)
 		update = reference.SetMetadata
 	} else {
 		access, ok := n.volume.files.(storage.MetadataAccess)

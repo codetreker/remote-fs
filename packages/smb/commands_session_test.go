@@ -148,7 +148,12 @@ func TestSessionSetupBoundsAndExpiry(t *testing.T) {
 	if status != statusMoreProcessing {
 		t.Fatalf("challenge: %x", status)
 	}
-	c.sessions[h.SessionID].deadline = time.Now().Add(-time.Second)
+	c.mu.Lock()
+	expiring := c.sessions[h.SessionID]
+	c.mu.Unlock()
+	expiring.authMu.Lock()
+	expiring.deadline = time.Now().Add(-time.Second)
+	expiring.authMu.Unlock()
 	if _, status, _ := registrySetup(t, t.Context(), c, h.SessionID, 11, 0, 0, 0, "proof"); status != statusDenied {
 		t.Fatalf("expired exchange: %x", status)
 	}

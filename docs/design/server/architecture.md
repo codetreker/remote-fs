@@ -102,7 +102,7 @@ incarnation 的 protocol ceiling 为 256 字节，handler 再按 body/frame wors
 
 Attr 的 id 是非零、不透明的 NodeID，kind 是普通文件/目录/符号链接的中立枚举；解码校验字段存在性、取值和种类/长度一致性。access_time、mod_time 为必需的 `{unix_sec,nanos}`，birth_time、change_time 为可选事实，缺席表示未知。秒与纳秒分开保存 time.Time 的范围，不用 UnixNano 截断远期/早期时间。
 
-metadata 是原始 namespace payload 及 authority version 的映射，不含 Go FileMode。namespace 名、排序/重复键、版本非空、payload 大小与规范编码均验证；byte 值使用 base64，存在空值与缺席不同。SetAttr 修改共同时间；平台 metadata 更新通过对应能力操作完成，不能把旧 mode 字段当兼容别名。
+Attr 的 metadata 是原始 namespace payload 及 authority version 的映射，不含 Go FileMode；返回版本必须非空。FileMutation.Metadata 的请求值是独立 CAS 操作数：version 为空 base64 字符串表示期望 namespace 缺席，data 也可为空，成功后由 authority 返回实际版本。两种形状分别校验 namespace、重复/未知字段、规范 base64、非 null 与既有大小上限，不能用结果版本规则拒绝合法的缺席条件。SetAttr 修改共同时间；平台 metadata 更新通过对应能力操作完成，不能把旧 mode 字段当兼容别名。
 
 `SetAttr` 的请求体是 `{"change":{…}}`，`change` 里每个属性都是可选的：缺席就是「这一项不改」。`change` 本身缺席则是解码失败 —— 一个什么都不点名的改动是合法请求（它在问这个节点还在不在），因此靠字段本身分辨不出报文是不是掉了内容，外面这一层对象才分辨得出来。
 

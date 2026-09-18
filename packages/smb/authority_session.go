@@ -159,6 +159,7 @@ func (c *connection) connectVolume(ctx context.Context, s *session, key string, 
 	e.active++
 	server.mu.Unlock()
 	keep := false
+	opening := false
 	defer func() {
 		server.mu.Lock()
 		e.active--
@@ -166,6 +167,12 @@ func (c *connection) connectVolume(ctx context.Context, s *session, key string, 
 			e.refs--
 		}
 		server.mu.Unlock()
+		if opening {
+			s.mu.Lock()
+			s.openingTrees--
+			s.mu.Unlock()
+			c.finishSessionRetirement(s)
+		}
 	}()
 	if err := server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: e.share.Volume, Operation: storage.OpFileSessionOpen}); err != nil {
 		return nil, statusError(err)
@@ -189,6 +196,7 @@ func (c *connection) connectVolume(ctx context.Context, s *session, key string, 
 		return nil, statusResources
 	}
 	s.openingTrees++
+	opening = true
 	if creator {
 		principal, _ := PrincipalFromContext(ctx)
 		a = &authoritySession{export: e, principal: principal, orphan: true, ready: make(chan struct{}), done: make(chan struct{})}
@@ -241,7 +249,6 @@ func (c *connection) connectVolume(ctx context.Context, s *session, key string, 
 			s.mu.Unlock()
 		}()
 	}
-	defer func() { s.mu.Lock(); s.openingTrees--; s.mu.Unlock() }()
 	if creator {
 		raw, err := e.share.Backend.NewFileSession(ctx, server.config.Limits.FileSession)
 		a.raw = raw

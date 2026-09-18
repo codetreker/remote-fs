@@ -1,7 +1,11 @@
 package httprest
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"strings"
 )
@@ -134,24 +138,76 @@ func (v nameCommand) storage() storage.NameCommand {
 	return storage.NameCommand{Kind: v.Kind, Name: v.Name, Target: v.Target, Destination: v.Destination, Initial: v.Initial.storage(), Guards: v.Guards, Uses: v.Uses}
 }
 
+// metadataUpdate carries a CAS precondition, whose empty version requires absence.
+// Response payloads use OpaquePayload and always carry an assigned version.
+type metadataUpdate struct {
+	ExpectedVersion []byte `json:"version"`
+	Data            []byte `json:"data"`
+}
+
+func (p *metadataUpdate) UnmarshalJSON(data []byte) error {
+	type update metadataUpdate
+	var decoded update
+	if err := decodeFileJSON(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]string
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, name := range []string{"version", "data"} {
+		value, err := base64.StdEncoding.Strict().DecodeString(fields[name])
+		if err != nil || base64.StdEncoding.EncodeToString(value) != fields[name] {
+			return errors.New("metadata update requires canonical base64")
+		}
+	}
+	if len(decoded.ExpectedVersion) > storage.MaxObservationTokenBytes || len(decoded.Data) > storage.MaxMetadataValueBytes {
+		return errors.New("metadata update exceeds its field bounds")
+	}
+	*p = metadataUpdate(decoded)
+	return nil
+}
+
+func metadataUpdatesOf(values map[string]storage.OpaquePayload) map[string]metadataUpdate {
+	if values == nil {
+		return nil
+	}
+	updates := make(map[string]metadataUpdate, len(values))
+	for name, value := range values {
+		updates[strings.Clone(name)] = metadataUpdate{ExpectedVersion: append([]byte{}, value.Version...), Data: append([]byte{}, value.Data...)}
+	}
+	return updates
+}
+
+func metadataUpdatesStorage(values map[string]metadataUpdate) map[string]storage.OpaquePayload {
+	if values == nil {
+		return nil
+	}
+	result := make(map[string]storage.OpaquePayload, len(values))
+	for name, value := range values {
+		result[strings.Clone(name)] = storage.OpaquePayload{Version: bytes.Clone(value.ExpectedVersion), Data: bytes.Clone(value.Data)}
+	}
+	return result
+}
+
 type fileMutationOptions struct {
-	Offset           int64                    `json:"offset"`
-	Data             []byte                   `json:"data,omitempty"`
-	ExpectedSize     *int64                   `json:"expectedSize,omitempty"`
-	ExpectedMetadata map[string][]byte        `json:"expectedMetadata,omitempty"`
-	Kind             storage.FileMutationKind `json:"kind"`
-	Size             int64                    `json:"size"`
-	Attr             AttrChange               `json:"attr"`
-	Metadata         map[string]OpaquePayload `json:"metadata,omitempty"`
-	Guards           *storage.NamespaceGuards `json:"guards,omitempty"`
-	Uses             []storage.TargetUse      `json:"uses,omitempty"`
+	Offset           int64                     `json:"offset"`
+	Data             []byte                    `json:"data,omitempty"`
+	ExpectedSize     *int64                    `json:"expectedSize,omitempty"`
+	ExpectedMetadata map[string][]byte         `json:"expectedMetadata,omitempty"`
+	Kind             storage.FileMutationKind  `json:"kind"`
+	Size             int64                     `json:"size"`
+	Attr             AttrChange                `json:"attr"`
+	Metadata         map[string]metadataUpdate `json:"metadata,omitempty"`
+	Guards           *storage.NamespaceGuards  `json:"guards,omitempty"`
+	Uses             []storage.TargetUse       `json:"uses,omitempty"`
 }
 
 func fileMutationOf(v storage.FileMutation) *fileMutationOptions {
-	return &fileMutationOptions{Offset: v.Offset, Data: v.Data, ExpectedSize: v.ExpectedSize, ExpectedMetadata: initialMetadataOf(v.ExpectedMetadata), Kind: v.Kind, Size: v.Size, Attr: *AttrChangeOf(v.Attr), Metadata: metadataOf(v.Metadata), Guards: v.Guards, Uses: v.Uses}
+	return &fileMutationOptions{Offset: v.Offset, Data: v.Data, ExpectedSize: v.ExpectedSize, ExpectedMetadata: initialMetadataOf(v.ExpectedMetadata), Kind: v.Kind, Size: v.Size, Attr: *AttrChangeOf(v.Attr), Metadata: metadataUpdatesOf(v.Metadata), Guards: v.Guards, Uses: v.Uses}
 }
 func (v fileMutationOptions) storage() storage.FileMutation {
-	return storage.FileMutation{Offset: v.Offset, Data: v.Data, ExpectedSize: v.ExpectedSize, ExpectedMetadata: v.ExpectedMetadata, Kind: v.Kind, Size: v.Size, Attr: v.Attr.Storage(), Metadata: metadataStorage(v.Metadata), Guards: v.Guards, Uses: v.Uses}
+	return storage.FileMutation{Offset: v.Offset, Data: v.Data, ExpectedSize: v.ExpectedSize, ExpectedMetadata: v.ExpectedMetadata, Kind: v.Kind, Size: v.Size, Attr: v.Attr.Storage(), Metadata: metadataUpdatesStorage(v.Metadata), Guards: v.Guards, Uses: v.Uses}
 }
 
 type observedDirectory struct {

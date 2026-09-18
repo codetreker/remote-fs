@@ -35,6 +35,7 @@ const (
 type connection struct {
 	clientGUID   [16]byte
 	cleanupMu    sync.Mutex
+	closing      bool
 	disconnected bool
 	pendingWake  chan struct{}
 	server       *Server
@@ -75,26 +76,30 @@ type requestFrame struct {
 }
 
 type session struct {
-	retirementMu    sync.Mutex
-	retiringFrames  map[requestFrame]struct{}
-	resourcesClosed bool
-	retired         bool
-	finalizing      bool
-	logoffMu        sync.Mutex
-	cleanup         cleanupGate
-	cleaned         bool
-	mu              sync.Mutex
-	identityMu      sync.RWMutex
-	authMu          sync.Mutex
-	id              uint64
-	principal       Principal
-	auth            Authentication
-	signer          *signing.Session
-	preauth         [64]byte
-	openingTrees    int
-	trees           map[uint32]*tree
-	authorities     map[*Export]*authoritySession
-	deadline        time.Time
+	retirementMu                 sync.Mutex
+	retiringFrames               map[requestFrame]struct{}
+	resourcesClosed              bool
+	retired                      bool
+	finalizing                   bool
+	logoffMu                     sync.Mutex
+	cleanup                      cleanupGate
+	cleaned                      bool
+	mu                           sync.Mutex
+	identityMu                   sync.RWMutex
+	authMu                       sync.Mutex
+	id                           uint64
+	principal                    Principal
+	auth                         Authentication
+	authGeneration               uint64
+	authArmed, authExpired       bool
+	authWake, authStop, authDone chan struct{}
+	authStopOnce                 sync.Once
+	signer                       *signing.Session
+	preauth                      [64]byte
+	openingTrees                 int
+	trees                        map[uint32]*tree
+	authorities                  map[*Export]*authoritySession
+	deadline                     time.Time
 }
 
 type treeKind uint8
@@ -261,14 +266,16 @@ func (c *connection) cancelRequest(r wire.Request) error {
 	if pending != nil && pending.sessionID == r.Header.SessionID && (r.Header.Flags&wire.FlagAsync == 0 || pending.async) {
 		cancel = pending.cancel
 	}
-	c.mu.Unlock()
 	if s == nil {
+		c.mu.Unlock()
 		return wire.ErrMalformed
 	}
 	s.identityMu.RLock()
+	c.mu.Unlock()
 	signer := s.signer
+	verified := signer != nil && signer.Verify(r.Packet) == nil
 	s.identityMu.RUnlock()
-	if signer == nil || signer.Verify(r.Packet) != nil {
+	if !verified {
 		return signing.ErrSignature
 	}
 	if cancel != nil {
@@ -287,14 +294,8 @@ func (c *connection) retireRequests(requests []wire.Request) {
 		}
 	}
 	if len(requests) > 0 {
-		frame := requests[0].Header.MessageID
-		for _, s := range c.sessions {
-			s.retirementMu.Lock()
-			delete(s.retiringFrames, requestFrame{connection: c, id: frame})
-			s.retirementMu.Unlock()
-		}
+		c.retireResponseFrameLocked(requestFrame{connection: c, id: requests[0].Header.MessageID})
 	}
-	c.pruneRetiredSessionsLocked()
 	if c.pendingWake != nil {
 		close(c.pendingWake)
 	}
@@ -430,6 +431,7 @@ func (c *connection) process(requests []wire.Request) error {
 			}
 			c.mu.Lock()
 			ss := c.sessions[h.SessionID]
+			c.retainSessionFrameLocked(ss, ctx, r.Header.MessageID)
 			c.mu.Unlock()
 			if ss != nil {
 				ss.identityMu.RLock()
@@ -607,6 +609,12 @@ func (c *connection) cancelOpen(sessionID uint64, treeID uint32, id wire.FileID,
 }
 
 func (c *connection) rejectRequests(requests []wire.Request) error {
+	ctx := context.Background()
+	if len(requests) > 0 {
+		frame := requestFrame{connection: c, id: requests[0].Header.MessageID}
+		ctx = context.WithValue(ctx, pendingFrameKey{}, frame)
+		defer func() { c.mu.Lock(); c.retireResponseFrameLocked(frame); c.mu.Unlock() }()
+	}
 	var output []byte
 	var inheritedSession uint64
 	var inheritedTree uint32
@@ -620,6 +628,7 @@ func (c *connection) rejectRequests(requests []wire.Request) error {
 		inheritedTree = h.TreeID
 		c.mu.Lock()
 		s := c.sessions[h.SessionID]
+		c.retainSessionFrameLocked(s, ctx, r.Header.MessageID)
 		c.mu.Unlock()
 		var key *signing.Session
 		if s != nil {
@@ -682,4 +691,36 @@ func responseBudget(r wire.Request) int {
 		n = 128 + 65535
 	}
 	return max(88, (n+7)&^7)
+}
+
+// Session lookup and frame enrollment share c.mu: no signer can escape a lookup
+// while its last retirement prerequisite concurrently removes the session.
+func (c *connection) retainSessionFrameLocked(s *session, ctx context.Context, message uint64) {
+	if s == nil {
+		return
+	}
+	frame, ok := ctx.Value(pendingFrameKey{}).(requestFrame)
+	if !ok {
+		if p := c.pending[message]; p != nil {
+			frame = requestFrame{connection: c, id: p.frame}
+			ok = true
+		}
+	}
+	if !ok || frame.connection != c {
+		return
+	}
+	s.retirementMu.Lock()
+	if s.retiringFrames == nil {
+		s.retiringFrames = make(map[requestFrame]struct{})
+	}
+	s.retiringFrames[frame] = struct{}{}
+	s.retirementMu.Unlock()
+}
+func (c *connection) retireResponseFrameLocked(frame requestFrame) {
+	for _, s := range c.sessions {
+		s.retirementMu.Lock()
+		delete(s.retiringFrames, frame)
+		s.retirementMu.Unlock()
+	}
+	c.pruneRetiredSessionsLocked()
 }

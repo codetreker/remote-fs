@@ -158,11 +158,15 @@ native admission 用例用一个暂停的 Put 占满 Session 唯一的 data slot
 
 [NodeReference 用例](../packages/metastore/sqlite/node_references_test.go)分别验证 metadata 权限、raw leaf 字节、外来/关闭 Scope、真实 DeleteName 自我豁免与原生顺序。FUSE 的[目录/权限用例](../packages/fuse/directory_test.go)和[metadata 用例](../packages/fuse/metadata_test.go)核对目录引用及 posix.permissions.v1；缺席显示默认值不写回，present malformed 不回退，已知 ChangeTime 优先于 Linux 的历史显示投影。
 
+[目录 fd 授权回归](../packages/fuse/directory_authorization_test.go)通过真实 HTTP 直接驱动 FUSE handle：拒绝写打开的策略仍允许 Opendir/读取，随后被拒绝的时间/权限修改没有效果；允许的修改在改名或 unlink 后仍作用于保留 NodeID，替代目录不受影响。它分别记录 file.set-node-attr/file.set-node-metadata 授权，不把读打开当写许可。[目录拥有权用例](../packages/fuse/directory_test.go)暂停修改并发 Releasedir，核对同一 mutex 覆盖引用 Scope、所需版本读取与身份修改；关闭、失效 Scope、到期和能力错误都在修改前失败。旧 WriteMetadata 打开代码的对照必须在只读策略处以 EACCES 失败；这些 callback/HTTP 回归不代替实际挂载验收。
+
 [共享打开条件](../packages/storage/capability_validation_test.go)验证 ExpectedMetadata 的 SameNode 绑定、缺席/二进制 token、16 项与名字/token 边界，并与原 FileMutation 保持同一比较语义。[原子打开](../packages/metastore/sqlite/atomic_open_test.go)和[节点引用](../packages/metastore/sqlite/node_references_test.go)用例暂停客户端观察，在另一会话完成 metadata CAS 后继续打开，核对 stale/absent 条件在内容、metadata、身份、日志、quota、claim/intent 和 pin 生效前拒绝；当前条件则验证 Reset 保留身份、Replace 以旧目标比较且保留旧引用字节。该运行交错发生在客户端观察与打开之间；初步检查和最终事务复用同一比较由源码顺序保证，不宣称在持续持有的 native gate 内插入了并发修改。
 
 [HTTP 条件回归](../packages/transport/httprest/file_capability_http_test.go)通过真实 SQLite 验证 OpenAt/OpenNodeRef/OpenChildRef 的零效果 EAGAIN、紧结果预算拒绝及原子成功。二进制/空 token、重复/null/过大输入和 SameNode 约束分别检查；相同 action 改变条件须返回原 EINVAL，不能按新输入重放。省略 DTO 条件的隔离负向对照必须让三种 stale 打开在预期断言失败，纯 wire 往返不能代替最终 native 拒绝。
 
 [HTTP 能力用例](../packages/transport/httprest/file_capability_http_test.go)将 lost Open/ACK/retryable Close、零/部分结果、最大范围回执和原生输出预算放到真实 httptest 交换中。客户端和服务端上限不同时必须将较小值传到 producer，在 metadata 载入、引用保留或修改之前拒绝；只给真正返回目标收费，不给内部父观察错收费。每个范围的 Commands/Claims/Effects 上限及整个 envelope 在授予前判断。fixture 验证的交换和真实 SQLite-backed 的数据效果分别记录，不能互相冒充。
+
+[metadata CAS 请求用例](../packages/transport/httprest/file_capabilities_test.go)分别验证 nil/空期望版本编码成缺席条件、空 data、字节所有权与规范 base64/非 null/预算拒绝，返回 OpaquePayload 仍拒绝空版本。[真实 HTTP 首次插入](../packages/transport/httprest/file_capability_http_test.go)核对新版本、同 session 的原引用和 sibling 继续可用、旧条件无效果冲突、当前条件成功及相同动作重放。旧结果 decoder 的隔离对照必须在这两种首次插入输入上重现 400 与 session 清理；这不改变一般 400 或结果未知时的恢复规则。
 
 [能力 decoder](../packages/transport/httprest/file_capabilities_test.go)拒绝不完整观察、丢失 LinkTarget/DirectoryRevision 和错误 capability advertisement；五类中立错误经 wire/journal 仍可由 errors.Is 区分。[部分打开用例](../packages/transport/httprest/file_capability_client_test.go)确保后置 capability/barrier 失败不遗弃可关闭引用，不把发生过效果的取消改成安全重试。
 
@@ -362,6 +366,10 @@ go vet ./packages/smb ./packages/smb/internal/wire ./packages/smb/internal/signi
 [协议 TCP](../packages/smb/server_protocol_test.go)与[连接用例](../packages/smb/connection_test.go)验证 bootstrap/3.1.1、签名、实际 credit/payload 边界、related compound、资源拒绝、AsyncID CANCEL 与 LOGOFF 等待；不能以未签名或虚构成功响应绕过资源错误。[authority session](../packages/smb/authority_session_test.go)验证共享 tree 的单份 FileSession/续期、旧回复不延长期限、失效 fencing 及不带每次 I/O Status 的拥有权路径。
 
 [handle 用例](../packages/smb/handle_test.go)直接提供 neutral fixture 引用，核对 File/NodeReference 别名只关闭一次、返回错误的非 nil 引用仍保留名额、退役后晚到安装拒绝、borrow 排空和 cleanup attempt 结果不被覆盖；[authority 清理用例](../packages/smb/authority_session_test.go)核对失败关闭继续占连接/session/tree/open/export 额度，确认重试后才归还。fixture 安装不证明 wire CREATE 或真实 SQLite 文件操作，尚未接入的命令须按协议明确不支持。
+
+[认证到期用例](../packages/smb/authentication_expiry_test.go)在主 session 保持正常流量时遗弃第二次初始认证，并检查无需新帧的回收；重新认证到期保留原 signer/身份。它分别覆盖旧 generation、到期与 Step/Close 串行、Close 失败仍占容量、连接取消排空，以及真实 TCP 的未完成交换。provider 在截止后返回成功不能安装身份，迟到 timer 不得销毁后来交换。
+
+[退役用例](../packages/smb/session_retirement_test.go)暂停 TREE_CONNECT 创建者，再执行 LOGOFF/最后 frame 收尾，验证最后 opener 返回后 global session 名额最终释放。非 nil session 加错误与 Close 失败保留 authority/额度，成功重试才归还；仍活动 session 的失败打开保持可用，晚到响应的 signer 必须保留到签名完成。它们验证现有拥有权收齐，不引入额外原生关闭或另一生命周期。
 
 这一批 packages/smb 自身普通/race 各为 54 根、87 个通过 verdict，覆盖 86.2%、最低函数 50%，vet 与 ARM64/AMD64 交叉构建通过；previous-principal 负向对照在预期授权断言失败。这些是 Linux 端点协议/拥有权与构建证据。[Windows ARM64 包级运行 35118013777](https://github.com/codetreker/remote-fs/actions/runs/35118013777/job/104868296920)另通过四包的 94 根、156 个 verdict，覆盖新增端点根及真实 SSPI，源码绑定和覆盖见[实现决定](../.agents/notes/implemented/architecture/2026-09-16-smb-protocol-primitives.md)。旧原生 SSPI 的 71 verdict 仍只属于其原 checkout；新的包级结果也不代替系统重定向器、完整文件/映射/缓存验收。
 

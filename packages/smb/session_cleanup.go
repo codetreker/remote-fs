@@ -9,6 +9,9 @@ import (
 )
 
 func (c *connection) cleanup() {
+	c.mu.Lock()
+	c.closing = true
+	c.mu.Unlock()
 	c.cancel()
 	_ = c.net.Close()
 	c.wg.Wait()
@@ -66,35 +69,19 @@ func (c *connection) cleanSession(ctx context.Context, s *session, explicit bool
 			}
 			return nil
 		}
-		s.retired = true
 		s.mu.Unlock()
 		current, _ := ctx.Value(pendingFrameKey{}).(requestFrame)
-		c.mu.Lock()
-		s.retirementMu.Lock()
-		if s.retiringFrames == nil {
-			s.retiringFrames = make(map[requestFrame]struct{})
-		}
-		for _, p := range c.pending {
-			if p.sessionID == s.id {
-				frame := requestFrame{connection: c, id: p.frame}
-				s.retiringFrames[frame] = struct{}{}
-				if frame != current && p.command != wire.Logoff {
-					p.cancel()
-				}
-			}
-		}
-		s.retirementMu.Unlock()
-		c.mu.Unlock()
+		c.retireSessionRequests(s, current)
 		var errs []error
 		s.authMu.Lock()
-		if s.auth != nil {
-			if err := s.auth.Close(); err != nil {
-				errs = append(errs, err)
-			} else {
-				s.auth = nil
-			}
+		s.disarmAuthenticationLocked(true)
+		if err := s.closeAuthenticationLocked(); err != nil {
+			errs = append(errs, err)
 		}
 		s.authMu.Unlock()
+		if err := s.waitAuthenticationWatcher(ctx); err != nil {
+			errs = append(errs, err)
+		}
 		s.mu.Lock()
 		ts := make([]*tree, 0, len(s.trees))
 		for _, t := range s.trees {
@@ -118,26 +105,12 @@ func (c *connection) cleanSession(ctx context.Context, s *session, explicit bool
 				s.mu.Unlock()
 			}
 		}
-		s.authMu.Lock()
-		authClosed := s.auth == nil
-		s.authMu.Unlock()
 		s.mu.Lock()
 		if err := c.closeOrphansLocked(ctx, s, nil); err != nil {
 			errs = append(errs, err)
 		}
-		complete := len(s.trees) == 0 && len(s.authorities) == 0 && s.openingTrees == 0 && authClosed
-		if complete {
-			s.cleaned = true
-		}
 		s.mu.Unlock()
-		if complete {
-			s.retirementMu.Lock()
-			s.resourcesClosed = true
-			s.retirementMu.Unlock()
-			c.mu.Lock()
-			c.pruneRetiredSessionsLocked()
-			c.mu.Unlock()
-		}
+		c.finishSessionRetirement(s)
 		return errors.Join(errs...)
 	})
 }
@@ -321,6 +294,61 @@ func (c *connection) closeExport(ctx context.Context, e *Export) error {
 			errs = append(errs, err)
 		}
 		s.mu.Unlock()
+		c.finishSessionRetirement(s)
 	}
 	return errors.Join(errs...)
+}
+
+// Completion records already-known cleanup only. It never retries a provider or
+// authority, and callers must release admission/provider locks before entering.
+func (c *connection) finishSessionRetirement(s *session) {
+	s.authMu.Lock()
+	watcherDone := s.authDone == nil
+	if !watcherDone {
+		select {
+		case <-s.authDone:
+			watcherDone = true
+		default:
+		}
+	}
+	s.mu.Lock()
+	complete := s.retired && !s.finalizing && s.auth == nil && watcherDone && s.openingTrees == 0 && len(s.trees) == 0 && len(s.authorities) == 0
+	if complete {
+		s.cleaned = true
+	}
+	s.mu.Unlock()
+	s.authMu.Unlock()
+	if !complete {
+		return
+	}
+	s.retirementMu.Lock()
+	s.resourcesClosed = true
+	s.retirementMu.Unlock()
+	c.mu.Lock()
+	c.pruneRetiredSessionsLocked()
+	c.mu.Unlock()
+	c.releaseDisconnected()
+}
+func (c *connection) retireSessionRequests(s *session, except requestFrame) {
+	s.mu.Lock()
+	s.retired = true
+	s.mu.Unlock()
+	s.stopAuthenticationWatcher()
+	c.mu.Lock()
+	s.retirementMu.Lock()
+	if s.retiringFrames == nil {
+		s.retiringFrames = make(map[requestFrame]struct{})
+	}
+	for _, p := range c.pending {
+		if p.sessionID != s.id {
+			continue
+		}
+		frame := requestFrame{connection: c, id: p.frame}
+		s.retiringFrames[frame] = struct{}{}
+		if frame != except && p.command != wire.Logoff {
+			p.cancel()
+		}
+	}
+	s.retirementMu.Unlock()
+	c.mu.Unlock()
 }

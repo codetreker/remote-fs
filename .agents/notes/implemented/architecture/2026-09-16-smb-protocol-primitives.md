@@ -30,6 +30,10 @@ SP800-108 派生实现保留原[NOTICE](../../../../packages/smb/internal/signin
 
 NodeReference 是 handle 唯一 Close 拥有者，普通 File 只作为同一对象的接口别名。open reservation 在原结果交付前保留 Attr/Outcome、字节和名额；即使返回错误，非 nil 引用仍有可达 cleanup 拥有者。安装与原 authority 退役有序，晚到引用不能安装成功；引用、借用者和签名/响应用户分别排空，失败清理继续占原 connection/session/tree/open/export 额度。
 
+未完成认证由现有 session 拥有一个到期 watcher。整段交换共享固定 HandshakeTimeout，后续 token 与无关流量不延期；generation/armed 检查使旧 timer 不能关闭新交换或已经成功的认证。初次到期退役 session，重新认证到期保留原 signer/身份。provider Step/Close 保持串行，deadline 后的成功不安装；不遵守取消的 provider 或失败 Close 继续占原拥有者与额度，等待真实结束或既有清理重试。
+
+退役完成是一份共用状态判据，覆盖认证及 watcher、opening tree、tree、authority 和最后响应/签名用户。最后一个 TREE_CONNECT 创建者结算自己和 export 的计数后再次复核，避免已无资源却继续保留 session 额度；复核本身不重做 LOGOFF 或 native Close。只有确知全部拥有者收尾才进入原 frame 清理，不用计数归零推断失败的关闭已经成功。
+
 [cleanup attempt](../../../../packages/smb/cleanup_attempt.go)让并发调用共享本轮不可变结果，后来调用才能重试。Shutdown 返回当前清理尝试的错误，历史故障继续留在诊断状态；恢复后的成功不被旧错误永久覆盖，当前未知也不被旧成功覆盖。registry 锁不跨授权、I/O 或等待；Status 和结构化日志只报告计数、阶段、协议请求标识和固定错误分类，不记录 SID、名字、token、key 或 payload。
 
 文件 CREATE、名字/属性解释、范围、通知和映射尚未接入；会话/控制与不带属性的 CLOSE 清理路径之外明确返回不支持。新增代码承担后续命令共用的拥有权和准入，不假装提供已经可用的文件系统。具体 API 与限额由[client 设计](../../../../docs/design/client/architecture.md#smb-协议与会话端点)拥有。
@@ -43,6 +47,10 @@ NodeReference 是 handle 唯一 Close 拥有者，普通 File 只作为同一对
 **只接入 framing，再由每个文件命令管理自己的资源。** 这会重复认证、引用安装、续期与清理，并在跨命令取消/退役时失去唯一拥有者。先落实有界 session/tree/handle 管理，后续命令直接消费同一引用；不为每个命令创建另一层文件 backend。
 
 **协议句柄移除后立即释放额度。** native Close 的失败仍可能保留引用和保护；提前退款允许反复断线累积无界资源。保留原额度直到确认清理使错误可见，代价是故障持续时明确拒绝后续准入。
+
+**用连接读期限或下一帧回收遗弃认证。** 已认证 session 的正常流量不能证明另一交换仍有进展；连接级期限也不能只终止那个交换。每个 session 的有限 watcher 只观察自己的 generation，避免每次交换另起 timer callback 堆积在阻塞 provider 后。
+
+**由晚到打开者重新调用 LOGOFF。** 这把已经完成的计数结算变成另一轮远端清理。统一的完成判据只核对已知资源状态，并保留原清理尝试及响应/签名拥有者。
 
 ## 后果
 

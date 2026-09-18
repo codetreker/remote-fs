@@ -26,6 +26,7 @@ func (c *connection) dispatch(ctx context.Context, r, original wire.Request, h *
 	}
 	c.mu.Lock()
 	s := c.sessions[r.Header.SessionID]
+	c.retainSessionFrameLocked(s, ctx, r.Header.MessageID)
 	c.mu.Unlock()
 	if s == nil {
 		return nil, statusSessionDeleted, nil
@@ -210,11 +211,12 @@ func (c *connection) sessionSetup(ctx context.Context, r wire.Request, h *wire.H
 		return nil, statusRequestNotAccepted, nil
 	}
 	c.mu.Lock()
-	if c.disconnected || c.ctx.Err() != nil {
+	if c.closing || c.disconnected || c.ctx.Err() != nil {
 		c.mu.Unlock()
 		return nil, statusSessionDeleted, nil
 	}
 	s := c.sessions[r.Header.SessionID]
+	created := false
 	if r.Header.SessionID == 0 {
 		if len(c.sessions) >= c.server.config.Limits.MaxSessions {
 			c.mu.Unlock()
@@ -226,8 +228,13 @@ func (c *connection) sessionSetup(ctx context.Context, r wire.Request, h *wire.H
 			return nil, statusResources, nil
 		}
 		c.sessions[s.id] = s
+		created = true
 	}
 	if s != nil {
+		c.retainSessionFrameLocked(s, ctx, r.Header.MessageID)
+		if created {
+			c.startAuthenticationWatcherLocked(s)
+		}
 		if pending := c.pending[r.Header.MessageID]; pending != nil {
 			pending.sessionID = s.id
 		}
@@ -237,7 +244,18 @@ func (c *connection) sessionSetup(ctx context.Context, r wire.Request, h *wire.H
 		return nil, statusSessionDeleted, nil
 	}
 	s.authMu.Lock()
-	defer s.authMu.Unlock()
+	defer func() {
+		s.authMu.Unlock()
+		s.mu.Lock()
+		retired := s.retired
+		s.mu.Unlock()
+		if retired {
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.server.config.Limits.CleanupTimeout)
+			c.server.cleanupFailure(s.waitAuthenticationWatcher(cleanup))
+			cancel()
+		}
+		c.finishSessionRetirement(s)
+	}()
 	s.mu.Lock()
 	retired := s.retired
 	finalizing := s.finalizing
@@ -257,44 +275,38 @@ func (c *connection) sessionSetup(ctx context.Context, r wire.Request, h *wire.H
 		if existing.Verify(r.Packet) != nil {
 			return nil, statusDenied, nil
 		}
+		if s.authExpired && s.auth != nil {
+			if err := s.closeAuthenticationLocked(); err != nil {
+				c.server.cleanupFailure(err)
+				return nil, statusIO, existing
+			}
+		}
 		if s.auth == nil {
-			s.deadline = time.Now().Add(c.server.config.Limits.HandshakeTimeout)
+			if err := s.armAuthenticationLocked(c.server.config.Limits.HandshakeTimeout); err != nil {
+				return nil, statusResources, existing
+			}
 		}
 	}
+	closeAttempted := false
+
 	defer func() {
-		if status != 0 && status != statusMoreProcessing {
-			if s.auth != nil {
-				if err := s.auth.Close(); err != nil {
-					c.server.cleanupFailure(err)
-					s.mu.Lock()
-					s.retired = true
-					s.mu.Unlock()
-				} else {
-					s.auth = nil
-				}
-			}
-			if existing == nil {
-				s.mu.Lock()
-				s.retired = true
-				s.mu.Unlock()
-				c.mu.Lock()
-				s.retirementMu.Lock()
-				if s.retiringFrames == nil {
-					s.retiringFrames = make(map[requestFrame]struct{})
-				}
-				for _, p := range c.pending {
-					if p.sessionID == s.id {
-						s.retiringFrames[requestFrame{connection: c, id: p.frame}] = struct{}{}
-					}
-				}
-				s.resourcesClosed = s.auth == nil
-				s.retirementMu.Unlock()
-				c.pruneRetiredSessionsLocked()
-				c.mu.Unlock()
-			}
+		if status == 0 || status == statusMoreProcessing {
+			return
+		}
+		s.disarmAuthenticationLocked(true)
+		if !closeAttempted {
+			closeAttempted = true
+			c.server.cleanupFailure(s.closeAuthenticationLocked())
+		}
+		if existing == nil {
+			frame, _ := ctx.Value(pendingFrameKey{}).(requestFrame)
+			c.retireSessionRequests(s, frame)
 		}
 	}()
-	if time.Now().After(s.deadline) {
+	authContext, cancelAuthentication := s.authenticationContextLocked(ctx)
+	ctx = authContext
+	defer cancelAuthentication()
+	if !time.Now().Before(s.deadline) || ctx.Err() != nil {
 		return nil, statusDenied, existing
 	}
 	if existing == nil {
@@ -308,6 +320,9 @@ func (c *connection) sessionSetup(ctx context.Context, r wire.Request, h *wire.H
 	}
 	result, err := s.auth.Step(ctx, setup.Token)
 	defer clear(result.SessionKey)
+	if ctx.Err() != nil || !time.Now().Before(s.deadline) {
+		return nil, statusDenied, existing
+	}
 	if err != nil || len(result.Token) > c.server.config.Limits.MaxTokenBytes {
 		return nil, statusDenied, existing
 	}
@@ -340,13 +355,19 @@ func (c *connection) sessionSetup(ctx context.Context, r wire.Request, h *wire.H
 	} else {
 		key = existing
 	}
-	if err := s.auth.Close(); err != nil {
+	closeAttempted = true
+	if err := s.closeAuthenticationLocked(); err != nil {
 		if existing == nil {
 			key.Destroy()
 		}
 		return nil, statusIO, existing
 	}
-	s.auth = nil
+	if ctx.Err() != nil || !time.Now().Before(s.deadline) {
+		if existing == nil {
+			key.Destroy()
+		}
+		return nil, statusDenied, existing
+	}
 	s.mu.Lock()
 	s.finalizing = true
 	s.mu.Unlock()
@@ -362,21 +383,25 @@ func (c *connection) sessionSetup(ctx context.Context, r wire.Request, h *wire.H
 	defer s.mu.Unlock()
 	s.finalizing = false
 	c.mu.Lock()
-	unavailable := s.retired || c.disconnected || c.ctx.Err() != nil || c.sessions[s.id] != s
+	unavailable := s.retired || c.closing || c.disconnected || c.ctx.Err() != nil || c.sessions[s.id] != s
 	c.mu.Unlock()
-	if err != nil || ctx.Err() != nil || unavailable {
+	if err != nil || ctx.Err() != nil || !time.Now().Before(s.deadline) || s.authExpired || unavailable {
 		if existing == nil {
 			key.Destroy()
 		}
 		if err != nil {
 			return nil, statusError(err), existing
 		}
-		return nil, statusSessionDeleted, existing
+		if unavailable {
+			return nil, statusSessionDeleted, existing
+		}
+		return nil, statusDenied, existing
 	}
 	s.identityMu.Lock()
 	s.signer = key
 	s.principal = result.Principal
 	s.identityMu.Unlock()
+	s.disarmAuthenticationLocked(false)
 	_ = c.net.SetReadDeadline(time.Time{})
 	return body, 0, key
 }

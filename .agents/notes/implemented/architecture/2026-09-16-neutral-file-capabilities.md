@@ -24,9 +24,13 @@ File 的字节方法不携带新的动作 ID 或平台句柄。NodeReference 使
 
 Attr 包含 NodeKind、ID、Size、AccessTime、ModTime、可选 BirthTime/ChangeTime 及有界 opaque metadata。mode 类型位与权限解释留在 Linux 客户端；创建和打开传入 InitialMetadata，SetAttr 只修改共同时间。namespace 的版本由 authority 分配，只比较该 payload；空期望版本要求缺席，空数据仍是存在的值，其它 namespace 不被覆盖。
 
+HTTP metadata CAS 请求与已存储的 OpaquePayload 结果分别编码。请求的空版本是缺席条件，结果的版本则是 authority 已分配的事实；请求专用 decoder 继续要求规范 base64、非 null 和原有 map/字段预算，不为传递合法条件而放宽返回值检查。
+
 metadata 使用排序键与长度前缀的规范编码。可选时间明确区分未知与合法时间值；新节点在创建事务记录 authority 时间，内容、属性和名字的实际修改在最终事务维护 ChangeTime。旧节点与历史日志缺失的时间保持未知，replica 保留 authority 的值，不能用接收时刻或 mtime 生成历史。
 
 Linux 的 `posix.permissions.v1` 是四字节 little-endian uint32，范围为 07777；存在但畸形报错，缺席只在挂载显示时采用普通文件 0644、目录 0755、符号链接 0777。Linux ctime 显示优先使用真实 ChangeTime，未知时显示 ModTime；这份投影不写回 authority，也不决定 Windows 的历史时间显示政策。
+
+FUSE 的目录打开只取得 ReadMetadata/ReadEntries，不预先申请写打开授权。后续 fd 属性修改由目录 handle 的同一 mutex 串行持有引用 Scope/存活检查、所需版本读取与 session 身份修改，Releasedir 也在这把锁下关闭唯一引用；原 session 最终发布检查处理到期。它复用现有身份操作且逐次授权，避免为只读目录改变核心 metadata 权限或增加 scoped mutation API；未经这份拥有权约束的裸 ID 调用不能代替活引用。
 
 ### 名字操作检查实际身份与观察
 

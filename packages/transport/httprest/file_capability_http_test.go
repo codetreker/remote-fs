@@ -956,3 +956,133 @@ func TestOpenMetadataConditionsNativeHTTPKeepEffectsAtomic(t *testing.T) {
 		})
 	}
 }
+
+func TestMetadataCASFirstInsertPreservesSessionAndSibling(t *testing.T) {
+	for _, replay := range []bool{false, true} {
+		name := "nil version"
+		if replay {
+			name = "empty version replay"
+		}
+		t.Run(name, func(t *testing.T) {
+			meta, backend := memoryfixture.New(t, "metadata-cas", 1<<20, locking.DefaultOptions())
+			for _, path := range []string{"target", "sibling"} {
+				if err := backend.Write(t.Context(), path, []byte("keep "+path)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			handler, err := NewHandler(backend, meta)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(handler)
+			t.Cleanup(func() {
+				server.Close()
+				if err := handler.Close(context.Background()); err != nil {
+					t.Error(err)
+				}
+			})
+			client, err := Dial(server.URL, server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var calls, badRequests, sessionCloses atomic.Int32
+			next := client.http.Transport
+			client.http.Transport = fileRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				body, err := request.GetBody()
+				if err != nil {
+					return nil, err
+				}
+				var requestValue struct {
+					Op storage.Operation `json:"op"`
+				}
+				err = json.NewDecoder(body).Decode(&requestValue)
+				_ = body.Close()
+				if err != nil {
+					return nil, err
+				}
+				if requestValue.Op == storage.OpFileMutate {
+					calls.Add(1)
+				}
+				if requestValue.Op == storage.OpFileSessionClose {
+					sessionCloses.Add(1)
+				}
+				response, err := next.RoundTrip(request)
+				if response != nil && response.StatusCode == http.StatusBadRequest {
+					badRequests.Add(1)
+				}
+				return response, err
+			})
+			opened, err := client.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+			if err != nil {
+				t.Fatal(err)
+			}
+			session := opened.(*remoteFileSession)
+			target, err := session.OpenFile(t.Context(), "target", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sibling, err := session.OpenFile(t.Context(), "sibling", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var version []byte
+			if replay {
+				version = []byte{}
+				client.http.Transport = &loseCapabilityReply{next: client.http.Transport, op: storage.OpFileMutate}
+			}
+			command := storage.FileMutation{Kind: storage.MutateAttributes, Metadata: map[string]storage.OpaquePayload{"test.created": {Version: version, Data: []byte("first")}}}
+			mutation := target.(storage.ConditionalFileMutation)
+			created, err := mutation.MutateFile(t.Context(), command)
+			wantCalls := int32(1)
+			if replay {
+				wantCalls = 2
+			}
+			payload, present := created.Metadata["test.created"]
+			if err != nil || created.ID == 0 || !present || len(payload.Version) == 0 || string(payload.Data) != "first" || calls.Load() != wantCalls || badRequests.Load() != 0 || sessionCloses.Load() != 0 {
+				t.Fatalf("first CAS: attr=%+v err=%v calls=%d badRequests=%d closes=%d", created, err, calls.Load(), badRequests.Load(), sessionCloses.Load())
+			}
+			assertUsable := func() {
+				t.Helper()
+				session.mu.Lock()
+				failed, closed := session.failed, session.closed
+				session.mu.Unlock()
+				if failed != nil || closed {
+					t.Fatalf("CAS fenced session: %v closed=%v", failed, closed)
+				}
+				read, err := sibling.ReadAt(t.Context(), 0, 32)
+				if err != nil || string(read.Data) != "keep sibling" {
+					t.Fatalf("sibling became unusable: %q %v", read.Data, err)
+				}
+				if _, err := session.Status(t.Context()); err != nil {
+					t.Fatalf("session became unusable: %v", err)
+				}
+			}
+			assertUsable()
+			if result, err := mutation.MutateFile(t.Context(), command); !errors.Is(err, storage.ErrConditionConflict) || result.ID != 0 {
+				t.Fatalf("absence CAS overwrote existing namespace: %+v %v", result, err)
+			}
+			command.Metadata["test.created"] = storage.OpaquePayload{Version: payload.Version}
+			updated, err := mutation.MutateFile(t.Context(), command)
+			current := updated.Metadata["test.created"]
+			if err != nil || len(current.Version) == 0 || bytes.Equal(current.Version, payload.Version) || len(current.Data) != 0 {
+				t.Fatalf("current-token CAS: %+v %v", updated, err)
+			}
+			if result, err := mutation.MutateFile(t.Context(), command); !errors.Is(err, storage.ErrConditionConflict) || result.ID != 0 {
+				t.Fatalf("stale token accepted: %+v %v", result, err)
+			}
+			stamp := time.Unix(1234567890, 0)
+			if _, err := mutation.MutateFile(t.Context(), storage.FileMutation{Kind: storage.MutateAttributes, Attr: storage.AttrChange{ModTime: &stamp}, ExpectedMetadata: map[string][]byte{"test.still_absent": nil}}); err != nil {
+				t.Fatalf("independent absence predicate changed: %v", err)
+			}
+			assertUsable()
+			stored, err := backend.Stat(t.Context(), "target")
+			if err != nil || !bytes.Equal(stored.Metadata["test.created"].Version, current.Version) || len(stored.Metadata["test.created"].Data) != 0 {
+				t.Fatalf("rejected CAS changed metadata: %+v %v", stored, err)
+			}
+			data, err := backend.Read(t.Context(), "target")
+			if err != nil || string(data) != "keep target" {
+				t.Fatalf("metadata CAS changed content: %q %v", data, err)
+			}
+		})
+	}
+}

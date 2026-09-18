@@ -48,7 +48,7 @@ SSE 不把整个 stream 保存在内存里，但每一帧仍有独立的 `DialOp
 
 目录 metadata 与引用名字观察是独立可选能力，FUSE 不要求它们或 ReferenceIdentity。支持时，包装器将 guards、IncludeName、ListResult 与引用身份交给 authority，名字不从副本重建；失败不回退到旧路径。原 File 字节方法及 State/Stat 保持自己的捕获，完整接口见[文件能力设计](../server/file-handles.md#显式-metadata-与名字观察)。
 
-**FUSE 到这一层为止。** 挂载层将 Lookup、Create、Mkdir、Unlink、Rmdir、Rename 与目录读取转换为父 NodeID/原始叶名的能力调用。普通 fd 使用 File，无 fd 的身份属性使用 StatNode/SetNodeAttr；目录 handle 保留 NodeReference 及其 Scope。FileSession 拥有服务端引用，挂载层拥有内核编号、POSIX codec 与 owner 映射，不以过时父路径重新定位对象。
+**FUSE 到这一层为止。** 挂载层将 Lookup、Create、Mkdir、Unlink、Rmdir、Rename 与目录读取转换为父 NodeID/原始叶名的能力调用。普通 fd 使用 File，无 fd 的身份属性使用 StatNode/SetNodeAttr；目录 handle 保留 NodeReference 及其 Scope。FileSession 拥有服务端引用，挂载层拥有内核编号、POSIX codec 与 owner 映射，不以过时父路径重新定位对象。 Opendir 的目录引用只申请 ReadMetadata 与 ReadEntries，读打开不要求写打开授权。目录 fd 的 chmod/时间修改在同一 handle mutex 中核对当前 Scope 与保存值相等，必要时读取原引用的 metadata 版本，再通过 session 的固定 NodeID CAS/SetNodeAttr 执行；Releasedir 使用同一锁关闭唯一引用。FileSession 的最终 publication guard 与 identity-operation 排空继续处理到期/退役，这条路径不能省略引用检查而只发裸 ID 修改。
 
 ### SMB 协议与会话端点
 
@@ -60,9 +60,13 @@ New 创建端点，Publish 在检查 backend 前预留 export 名额、验证 sh
 
 SMB 3.1.1 支持直接及 SMB1 形状的 negotiate bootstrap，要求签名；bootstrap 不表示支持旧 dialect。packages/smb/windows 的 SSPI Begin/Step/Close 持有单次 native context，Principal.SID 用于身份判断，Name 不授予访问。每个受支持语义操作用当前 principal context 和可信 Volume 重新调用业务授权；先验证的新 principal 才能退役对应 previous session，不能借旧身份上下文通过授权。
 
+每个已分配 SMB session 拥有一个认证到期 watcher，受现有 MaxSessions 和连接 worker 归属约束，同一时刻至多等待一个 timer。HandshakeTimeout 从本次交换开始计算，MORE_PROCESSING 和其它 session 的流量不延长它；Begin/Step 与最终安装使用同一绝对 deadline。watcher 在 authMu 下核对 generation/armed/deadline，成功、失败或退役使旧到期事件失效，无需等下一帧才处理遗弃的交换。初次认证到期退役该 session；重新认证到期只终止新交换，保留原身份与 signer。仍执行的 provider 调用与失败的 Close 保留拥有者/额度，不能并发销毁 context 或宣告已释放。
+
 一个 SMB session 与 Export 共享一份直接 FileSession，多 tree 只增加引用计数和一份续期 worker。初次 Status 建立保守期限；旧 revision 回复不能延长新期限，Renew/epoch 异常 fencing 所有共享 tree，旧 handle 不重绑。IPC$ 是独立控制 tree，没有 volume、FileSession、root 或文件引用。TREE_CONNECT 不 pin 根，也不为后续每次 I/O 增加 Status。
 
 handle 的 NodeReference 是唯一关闭拥有者；普通文件的可选 File 只是同一对象的接口别名。open reservation 在安装前拥有原 Attr/Outcome、返回字节和一个名额；错误与非 nil 引用同返仍进入 cleanup 注册表。安装与退役有序，退役后到达的 open 不能成功安装；借用者和 native 清理完成前，引用与 charge 均不释放。关闭不补做 Stat 或名字查询。
+
+晚到的 TREE_CONNECT 在外层 defer 先结算 creator/export 计数，再复核同一退役完成条件。只有 session 已退役、没有认证/最终安装、watcher 已停止、opening tree/tree/authority 均为空，才标记资源已收齐；已有 retiring-frame 门继续等待最后响应/签名用户后归还 signer 和全局 session 额度。认证收尾、watcher 退出、最后 authority 移除也复用这个纯状态复核，不再次发起 native cleanup；未退役 session 的失败打开不被误删。
 
 Shutdown 和 Unpublish 的并发调用共享当前 cleanup attempt 的不可变结果；后续调用才能重试。Shutdown 返回本轮清理结果，历史失败保留在 Status/日志诊断中，不把已经恢复的资源继续报告成本轮错误；未知关闭仍保留原 connection/session/tree/open/export 额度，不因协议句柄已移除而归还。取消等待者不取消或遗弃正在进行的尝试。
 

@@ -351,3 +351,104 @@ func TestOpenMetadataConditionsWirePreservesTokensAndOwnership(t *testing.T) {
 		}
 	}
 }
+
+func TestMetadataCASRequestCodecAcceptsAbsenceAndOwnsBytes(t *testing.T) {
+	for _, version := range [][]byte{nil, {}, {0, 0xff, 1}} {
+		command := storage.FileMutation{Kind: storage.MutateAttributes, ExpectedMetadata: map[string][]byte{"test.predicate": nil}, Metadata: map[string]storage.OpaquePayload{"test.value": {Version: version, Data: []byte{0xff, 0, 1}}}}
+		if err := command.Check(); err != nil {
+			t.Fatal(err)
+		}
+		wire := fileMutationOf(command)
+		body, err := json.Marshal(wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(body, []byte(`"version":null`)) || len(version) == 0 && !bytes.Contains(body, []byte(`"version":""`)) {
+			t.Fatalf("noncanonical absence token: %s", body)
+		}
+		var decoded fileMutationOptions
+		if err := decodeFileJSON(body, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		restored := decoded.storage()
+		if err := restored.Check(); err != nil {
+			t.Fatal(err)
+		}
+		value := restored.Metadata["test.value"]
+		if !bytes.Equal(value.Version, version) || !bytes.Equal(value.Data, []byte{0xff, 0, 1}) {
+			t.Fatalf("CAS operands changed: %+v", value)
+		}
+		if predicate, present := restored.ExpectedMetadata["test.predicate"]; !present || len(predicate) != 0 {
+			t.Fatalf("separate predicate changed: %#v", restored.ExpectedMetadata)
+		}
+		command.Metadata["test.value"].Data[0] = 2
+		if wire.Metadata["test.value"].Data[0] != 0xff {
+			t.Fatal("request retained caller payload")
+		}
+		decoded.Metadata["test.value"].Data[0] = 3
+		if restored.Metadata["test.value"].Data[0] != 0xff {
+			t.Fatal("native operands retained decoded payload")
+		}
+	}
+	body, err := json.Marshal(fileMutationOf(storage.FileMutation{Kind: storage.MutateAttributes, Metadata: map[string]storage.OpaquePayload{"test.empty": {}}}))
+	if err != nil || !bytes.Contains(body, []byte(`"version":"","data":""`)) {
+		t.Fatalf("empty value encoding: %s %v", body, err)
+	}
+}
+
+func TestMetadataCASRequestCodecRejectsMalformedAndOversizedValues(t *testing.T) {
+	largeVersion, _ := json.Marshal(struct {
+		Version []byte `json:"version"`
+		Data    []byte `json:"data"`
+	}{Version: bytes.Repeat([]byte{1}, storage.MaxObservationTokenBytes+1), Data: []byte{}})
+	largeData, _ := json.Marshal(struct {
+		Version []byte `json:"version"`
+		Data    []byte `json:"data"`
+	}{Version: []byte{}, Data: bytes.Repeat([]byte{1}, storage.MaxMetadataValueBytes+1)})
+	for name, body := range map[string]string{
+		"missing version": `{"data":""}`, "null version": `{"version":null,"data":""}`, "null data": `{"version":"","data":null}`,
+		"duplicate version": `{"version":"","version":"AQ==","data":""}`, "unknown field": `{"version":"","data":"","extra":1}`,
+		"noncanonical token": `{"version":"AB==","data":""}`, "noncanonical data": `{"version":"","data":"AB=="}`, "base64 newline": `{"version":"AA==\n","data":""}`,
+		"version bound": string(largeVersion), "data bound": string(largeData),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var value metadataUpdate
+			if err := decodeFileJSON([]byte(body), &value); err == nil {
+				t.Fatalf("accepted %s", body)
+			}
+		})
+	}
+	valid := map[string]storage.OpaquePayload{}
+	for i := range storage.MaxMetadataNamespaces + 1 {
+		valid["test."+strings.Repeat("x", i+1)] = storage.OpaquePayload{}
+	}
+	body, err := json.Marshal(fileMutationOf(storage.FileMutation{Kind: storage.MutateAttributes, Metadata: valid}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded fileMutationOptions
+	if err := decodeFileJSON(body, &decoded); err == nil {
+		t.Fatal("accepted oversized request metadata map")
+	}
+}
+
+func TestMetadataCASResponseStillRequiresAssignedVersion(t *testing.T) {
+	for _, payload := range []string{`{"version":"","data":""}`, `{"version":null,"data":""}`, `{"version":"AB==","data":""}`} {
+		var response OpaquePayload
+		if err := json.Unmarshal([]byte(payload), &response); err == nil {
+			t.Fatalf("response accepted invalid assigned version: %s", payload)
+		}
+	}
+	wire := fileResponse{Epoch: 1, Data: []byte{}, Attr: AttrOf(storage.Attr{ID: 1, Kind: storage.NodeRegular, Metadata: map[string]storage.OpaquePayload{"test.value": {Data: []byte("value")}}})}
+	body, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response fileResponse
+	if err := decodeFileJSON(body, &response); err == nil {
+		t.Fatal("file response accepted versionless stored metadata")
+	}
+	if err := json.Unmarshal([]byte(`{"version":"AA==","data":""}`), &OpaquePayload{}); err != nil {
+		t.Fatalf("valid response rejected: %v", err)
+	}
+}
