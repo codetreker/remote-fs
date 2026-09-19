@@ -127,6 +127,7 @@ type platform interface {
 type options struct {
 	Repo, ArtifactDir, PackageDir, SourceSHA, SourceTreeSHA, RunID string
 	RequireNative                                                  bool
+	CurrentSMBCold                                                 bool
 }
 
 func rejectDuplicateKeys(data []byte) error {
@@ -1044,6 +1045,10 @@ func qemuArguments(m manifest, id identity, kernel, initramfs, data, bios string
 }
 
 func runTool(ctx context.Context, host platform, executable string, args []string, directory, name string) (output []byte, resultErr error) {
+	return runToolBefore(ctx, host, executable, args, directory, name, time.Time{})
+}
+
+func runToolBefore(ctx context.Context, host platform, executable string, args []string, directory, name string, cleanupDeadline time.Time) (output []byte, resultErr error) {
 	stdout, err := privateOutput(filepath.Join(directory, name+"-stdout.log"))
 	if err != nil {
 		return nil, err
@@ -1056,6 +1061,9 @@ func runTool(ctx context.Context, host platform, executable string, args []strin
 	var readers []*ownedReader
 	defer func() {
 		deadline := time.Now().Add(10 * time.Second)
+		if !cleanupDeadline.IsZero() && deadline.After(cleanupDeadline) {
+			deadline = cleanupDeadline
+		}
 		cleanup, cancel := context.WithDeadline(context.Background(), deadline)
 		defer cancel()
 		if process != nil {
@@ -1074,7 +1082,8 @@ func runTool(ctx context.Context, host platform, executable string, args []strin
 	}
 	process, err = host.Start(executable, args, directory)
 	if err != nil {
-		return nil, err
+		// A partial startup failure can withhold the handle needed to confirm cleanup.
+		return nil, fmt.Errorf("%w: process start: %w", errOwnedCleanup, err)
 	}
 	var buffer bytes.Buffer
 	readers = append(readers, startReader("tool stdout", func() error {
@@ -1158,8 +1167,7 @@ func validateProbe(data []byte, id identity, phase string, sequence uint64) (res
 func runProbe(ctx context.Context, host platform, guest *guestChannel, executable, directory, endpoint, volume, phase string, sequence uint64) (response, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	args := []string{"--endpoint", endpoint, "--volume", volume, "--run-id", guest.RunID, "--source-sha", guest.SourceSHA,
-		"--fixture-nonce", guest.Nonce, "--phase", phase, "--state-file", filepath.Join(directory, "probe-state.json"), "--sequence", strconv.FormatUint(sequence, 10)}
+	args := probeArguments(guest.identity, directory, endpoint, volume, phase, sequence)
 	type result struct {
 		data []byte
 		err  error
@@ -1191,6 +1199,74 @@ func runProbe(ctx context.Context, host platform, guest *guestChannel, executabl
 	return validateProbe(value.data, guest.identity, phase, sequence)
 }
 
+func probeArguments(id identity, directory, endpoint, volume, phase string, sequence uint64) []string {
+	return []string{"--endpoint", endpoint, "--volume", volume, "--run-id", id.RunID, "--source-sha", id.SourceSHA,
+		"--fixture-nonce", id.Nonce, "--phase", phase, "--state-file", filepath.Join(directory, "probe-state.json"), "--sequence", strconv.FormatUint(sequence, 10)}
+}
+
+const (
+	currentSMBColdPhase    = "current-smb-cold"
+	currentSMBCleanupPhase = "current-smb-cleanup"
+)
+
+func checkSeedReceipt(value, seed response) error {
+	if value.ObjectID != seed.ObjectID || value.AuthorityEpoch != seed.AuthorityEpoch {
+		return errors.New("current SMB receipt differs from the seeded authoritative object or authority")
+	}
+	return nil
+}
+
+func recoverSMBMapping(ctx context.Context, host platform, id identity, seed response, executable, directory, endpoint, volume string) (response, error) {
+	deadline, bounded := ctx.Deadline()
+	if !bounded {
+		return response{}, errors.New("mapping recovery requires an absolute cleanup deadline")
+	}
+	// Reserve the existing Job cleanup allowance within the recovery's total budget.
+	commandCtx, cancel := context.WithDeadline(ctx, deadline.Add(-10*time.Second))
+	defer cancel()
+	data, err := runToolBefore(commandCtx, host, executable, probeArguments(id, directory, endpoint, volume, currentSMBCleanupPhase, 2), directory, currentSMBCleanupPhase, deadline)
+	if err != nil {
+		return response{}, errors.Join(err, ctx.Err())
+	}
+	if err := ctx.Err(); err != nil {
+		return response{}, err
+	}
+	value, err := validateProbe(data, id, currentSMBCleanupPhase, 2)
+	if err != nil {
+		return response{}, err
+	}
+	if err := checkSeedReceipt(value, seed); err != nil {
+		return response{}, err
+	}
+	if !time.Now().Before(deadline) {
+		return response{}, errors.Join(context.DeadlineExceeded, ctx.Err())
+	}
+	return value, nil
+}
+
+func runCurrentSMBCold(ctx context.Context, host platform, guest *guestChannel, seed response, executable, directory, endpoint, volume string, log *events) error {
+	value, err := runProbe(ctx, host, guest, executable, directory, endpoint, volume, currentSMBColdPhase, 2)
+	if err == nil {
+		err = checkSeedReceipt(value, seed)
+	}
+	if err == nil {
+		return log.record(currentSMBColdPhase, "probe", value)
+	}
+	original := fmt.Errorf("%s: %w", currentSMBColdPhase, err)
+	recorded := log.record(currentSMBColdPhase, "probe-failed", map[string]any{"sequence": 2, "error": errorText(err)})
+	if errors.Is(err, errOwnedCleanup) {
+		return errors.Join(original, recorded, log.record(currentSMBCleanupPhase, "mapping-recovery", map[string]any{"sequence": 2, "status": "blocked", "error": "cold child quiescence is unconfirmed"}))
+	}
+	cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	recovered, cleanupErr := recoverSMBMapping(cleanup, host, guest.identity, seed, executable, directory, endpoint, volume)
+	details := map[string]any{"sequence": 2, "status": "error", "error": errorText(cleanupErr)}
+	if cleanupErr == nil {
+		details["status"], details["receipt"] = "ok", recovered
+	}
+	return errors.Join(original, recorded, cleanupErr, log.record(currentSMBCleanupPhase, "mapping-recovery", details))
+}
+
 func copyDisk(source, destination string, expected artifact) error {
 	input, err := os.Open(source)
 	if err != nil {
@@ -1213,7 +1289,7 @@ func copyDisk(source, destination string, expected artifact) error {
 	return nil
 }
 
-func lifecycle(ctx context.Context, host platform, m manifest, id identity, executable, bios, artifactDir, evidenceDir, workDir string, log *events) (resultErr error) {
+func lifecycle(ctx context.Context, host platform, m manifest, id identity, executable, bios, artifactDir, evidenceDir, workDir string, log *events, currentSMBCold bool) (resultErr error) {
 	if err := qemuPreflight(ctx, host, executable, bios, evidenceDir, log); err != nil {
 		return err
 	}
@@ -1323,6 +1399,11 @@ func lifecycle(ctx context.Context, host platform, m manifest, id identity, exec
 	}
 	if err := log.record("readiness-create", "probe", created); err != nil {
 		return err
+	}
+	if currentSMBCold {
+		if err := runCurrentSMBCold(ctx, host, guest, created, artifactPath("probe_windows_arm64"), evidenceDir, endpoint, m.Volume, log); err != nil {
+			return err
+		}
 	}
 	if err := command(2, "stop-authority"); err != nil {
 		return err
@@ -1513,7 +1594,7 @@ func run(ctx context.Context, o options) (resultErr error) {
 		if resultErr == nil {
 			status = "passed"
 		}
-		receipt := map[string]any{"run_id": id.RunID, "source_sha": id.SourceSHA, "fixture_nonce": id.Nonce, "fixture_readiness": status, "native_acceptance": "not-run", "cause": errorText(resultErr), "private_disk_removed": removeErr == nil, "pristine_unchanged": pristineErr == nil}
+		receipt := map[string]any{"run_id": id.RunID, "source_sha": id.SourceSHA, "fixture_nonce": id.Nonce, "fixture_readiness": status, "native_acceptance": "not-run", "current_smb_cold_requested": o.CurrentSMBCold, "cause": errorText(resultErr), "private_disk_removed": removeErr == nil, "pristine_unchanged": pristineErr == nil}
 		resultErr = errors.Join(resultErr, log.record("result", "fixture-readiness", receipt))
 		data, err := json.MarshalIndent(receipt, "", "  ")
 		if err == nil {
@@ -1527,7 +1608,7 @@ func run(ctx context.Context, o options) (resultErr error) {
 	if err := log.record("provenance", "verified", map[string]any{"source_tree_sha": m.SourceTreeSHA, "artifacts": m.Artifacts, "qemu": pkg, "image_version": os.Getenv("ImageVersion")}); err != nil {
 		return err
 	}
-	return lifecycle(ctx, host, m, id, executable, bios, o.ArtifactDir, evidenceDir, workDir, log)
+	return lifecycle(ctx, host, m, id, executable, bios, o.ArtifactDir, evidenceDir, workDir, log, o.CurrentSMBCold)
 }
 
 func nativeHostPlatform(qemu, probe, controller string) (platform, error) {
@@ -1605,6 +1686,7 @@ func main() {
 	flag.StringVar(&o.SourceTreeSHA, "source-tree-sha", "", "expected clean checkout tree")
 	flag.StringVar(&o.RunID, "run-id", "", "unique run directory name")
 	flag.BoolVar(&o.RequireNative, "require-native-acceptance", false, "fail unless current adapter native acceptance is available")
+	flag.BoolVar(&o.CurrentSMBCold, "current-smb-cold", false, "run the current SMB cold redirector probe after seeding")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		fmt.Fprintln(os.Stderr, "unexpected positional arguments")

@@ -1,0 +1,553 @@
+//go:build windows
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+	"unicode/utf16"
+	"unsafe"
+)
+
+func mappingOptionsForTest() options {
+	return options{RunID: "mapping-test", SourceSHA: strings.Repeat("a", 40), FixtureNonce: strings.Repeat("b", 64), Volume: fixtureVolume, Phase: "current-smb-cold", Sequence: 3}
+}
+func cloneMappingValue[T any](t *testing.T, value T) T {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var copy T
+	if err := json.Unmarshal(data, &copy); err != nil {
+		t.Fatal(err)
+	}
+	return copy
+}
+func mappingBaselineForTest() mappingSnapshot {
+	snapshot := mappingSnapshot{Owner: mappingOwner{SID: "S-1-5-21-10-20-30-1001", AuthenticationID: "0000000000000123", WindowsBuild: 26100}, Rows: []mappingRow{{LocalPath: "M:", RemotePath: `\\baseline\share`, Status: "OK"}}, Devices: map[string][]string{}, LogicalDrives: 1<<2 | 1<<12}
+	for letter := 'A'; letter <= 'Z'; letter++ {
+		snapshot.Devices[string(letter)+":"] = nil
+	}
+	snapshot.Devices["C:"] = []string{`\Device\HarddiskVolume4`}
+	snapshot.Devices["M:"] = []string{"baseline opaque mapping"}
+	return snapshot
+}
+
+type mappingMemoryStore struct {
+	t         *testing.T
+	o         options
+	ledger    mappingLedger
+	events    *[]string
+	createErr error
+	saveErrAt int
+	saves     int
+}
+
+func (s *mappingMemoryStore) Create(value mappingLedger) error {
+	*s.events = append(*s.events, "intent")
+	if s.createErr != nil {
+		return s.createErr
+	}
+	if err := validateMappingLedger(value, s.o); err != nil {
+		return err
+	}
+	s.ledger = cloneMappingValue(s.t, value)
+	return nil
+}
+func (s *mappingMemoryStore) Save(value mappingLedger) error {
+	s.saves++
+	*s.events = append(*s.events, "save:"+value.State)
+	if s.saves == s.saveErrAt {
+		return errors.New("ledger sync failed")
+	}
+	if err := validateMappingLedger(value, s.o); err != nil {
+		return err
+	}
+	s.ledger = cloneMappingValue(s.t, value)
+	return nil
+}
+
+type mappingFakeBackend struct {
+	t                           *testing.T
+	current                     mappingSnapshot
+	events                      *[]string
+	store                       *mappingMemoryStore
+	creates, removes, snapshots int
+	createErr                   error
+	createResource              bool
+	rowOnly                     bool
+	removeErr                   error
+	leaveResource               bool
+	snapshotErrors              map[int]error
+	beforeCreate                func()
+}
+
+func (b *mappingFakeBackend) Snapshot(context.Context) (mappingSnapshot, error) {
+	b.snapshots++
+	*b.events = append(*b.events, "snapshot")
+	if err := b.snapshotErrors[b.snapshots]; err != nil {
+		return mappingSnapshot{}, err
+	}
+	return cloneMappingValue(b.t, b.current), nil
+}
+func (b *mappingFakeBackend) Create(ctx context.Context, value mappingLedger) error {
+	b.creates++
+	*b.events = append(*b.events, "create")
+	if b.store.ledger.State != "intent" || b.store.ledger.RemotePath != value.RemotePath {
+		b.t.Fatal("native create preceded durable matching intent")
+	}
+	if b.beforeCreate != nil {
+		b.beforeCreate()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if b.createResource {
+		b.current.Rows = append(b.current.Rows, mappingRow{value.LocalPath, value.RemotePath, "OK"})
+		if !b.rowOnly {
+			b.current.Devices[value.LocalPath] = []string{"opaque target; not a port or SID encoding"}
+			b.current.LogicalDrives |= 1 << uint(value.LocalPath[0]-'A')
+		}
+	}
+	return b.createErr
+}
+func (b *mappingFakeBackend) Remove(_ context.Context, value mappingLedger, row mappingRow) error {
+	b.removes++
+	*b.events = append(*b.events, "remove")
+	if row.LocalPath != value.LocalPath || row.RemotePath != value.RemotePath {
+		b.t.Fatal("unrelated mapping removal")
+	}
+	if b.removeErr != nil {
+		return b.removeErr
+	}
+	if !b.leaveResource {
+		rows := []mappingRow{}
+		for _, existing := range b.current.Rows {
+			if existing.LocalPath != row.LocalPath || existing.RemotePath != row.RemotePath {
+				rows = append(rows, existing)
+			}
+		}
+		b.current.Rows = rows
+		b.current.Devices[value.LocalPath] = nil
+		b.current.LogicalDrives &^= 1 << uint(value.LocalPath[0]-'A')
+	}
+	return nil
+}
+func newMappingModel(t *testing.T) (options, *mappingFakeBackend, *mappingMemoryStore) {
+	t.Helper()
+	o := mappingOptionsForTest()
+	events := []string{}
+	store := &mappingMemoryStore{t: t, o: o, events: &events}
+	backend := &mappingFakeBackend{t: t, current: mappingBaselineForTest(), events: &events, store: store, createResource: true, snapshotErrors: map[int]error{}}
+	return o, backend, store
+}
+func startMappingModel(t *testing.T) (*ownedSMBMapping, *mappingFakeBackend, *mappingMemoryStore) {
+	t.Helper()
+	o, backend, store := newMappingModel(t)
+	mapping, err := beginSMBMapping(context.Background(), o, "rfs-"+o.FixtureNonce, 15445, backend, store, "smb-mapping.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mapping, backend, store
+}
+
+func TestMappingDriveSelectionRequiresAllInventories(t *testing.T) {
+	snapshot := mappingBaselineForTest()
+	snapshot.LogicalDrives |= 1 << 25
+	snapshot.Devices["Y:"] = []string{"unrelated DOS target"}
+	snapshot.Rows = append(snapshot.Rows, mappingRow{"X:", `\\another\share`, "Unavailable"})
+	drive, err := chooseMappingDrive(snapshot)
+	if err != nil || drive != "W:" {
+		t.Fatalf("drive=%q error=%v", drive, err)
+	}
+	snapshot.LogicalDrives = (1 << 26) - 1
+	if _, err := chooseMappingDrive(snapshot); err == nil {
+		t.Fatal("occupied drive adopted")
+	}
+	for _, change := range []func(*mappingSnapshot){
+		func(s *mappingSnapshot) { delete(s.Devices, "A:") },
+		func(s *mappingSnapshot) { s.Rows = append(s.Rows, mappingRow{"m:", `\\duplicate\share`, "OK"}) },
+		func(s *mappingSnapshot) { s.LogicalDrives |= 1 << 31 },
+		func(s *mappingSnapshot) { s.Owner.AuthenticationID = "" },
+	} {
+		copy := cloneMappingValue(t, mappingBaselineForTest())
+		change(&copy)
+		if _, err := chooseMappingDrive(copy); err == nil {
+			t.Fatal("malformed inventory accepted")
+		}
+	}
+}
+
+func TestMappingIntentPrecedesCreateAndCleanupPreservesBaseline(t *testing.T) {
+	mapping, backend, store := startMappingModel(t)
+	want := []string{"snapshot", "intent", "create", "save:create-returned", "snapshot", "save:observed"}
+	if !reflect.DeepEqual(*backend.events, want) {
+		t.Fatalf("ownership ordering %v", *backend.events)
+	}
+	if mapping.LocalPath() != "Z:" || store.ledger.State != "observed" || store.ledger.TCPPort != 15445 || !store.ledger.RequireIntegrity || store.ledger.Persistent || store.ledger.Global || store.ledger.SaveCredentials {
+		t.Fatal("mapping arguments or observation were lost")
+	}
+	facts := mapping.Facts()
+	facts.DOSDevice[0] = "mutated caller slice"
+	if mapping.ledger.ObservedDevice[0] == facts.DOSDevice[0] {
+		t.Fatal("facts alias owned ledger")
+	}
+	if err := mapping.cleanup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if backend.creates != 1 || backend.removes != 1 || store.ledger.State != "removed" {
+		t.Fatalf("create=%d remove=%d state=%s", backend.creates, backend.removes, store.ledger.State)
+	}
+	if !reflect.DeepEqual(backend.current, mappingBaselineForTest()) {
+		t.Fatal("baseline resource changed")
+	}
+}
+
+func TestMappingLostReplyAndPartialCreationAreCleanupOnly(t *testing.T) {
+	for _, name := range []string{"lost-reply", "row-only", "observation-failure"} {
+		t.Run(name, func(t *testing.T) {
+			o, backend, store := newMappingModel(t)
+			original := errors.New("first create observation failed")
+			if name == "observation-failure" {
+				backend.snapshotErrors[2] = original
+			} else {
+				backend.createErr = original
+			}
+			backend.rowOnly = name == "row-only"
+			mapping, err := beginSMBMapping(context.Background(), o, "rfs-"+o.FixtureNonce, 15445, backend, store, "ledger")
+			if mapping == nil || !errors.Is(err, original) {
+				t.Fatalf("partial ownership or first failure lost: %v %v", mapping, err)
+			}
+			if err := mapping.cleanup(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if backend.creates != 1 || backend.removes != 1 || store.ledger.State != "removed" {
+				t.Fatalf("creation was replayed or cleanup lost: %d %d %s", backend.creates, backend.removes, store.ledger.State)
+			}
+			if !errors.Is(err, original) {
+				t.Fatal("successful recovery erased original failure")
+			}
+		})
+	}
+}
+
+func TestMappingUncertainAbsenceRemainsFailure(t *testing.T) {
+	o, backend, store := newMappingModel(t)
+	backend.createErr = errors.New("lost reply")
+	backend.createResource = false
+	mapping, err := beginSMBMapping(context.Background(), o, "rfs-"+o.FixtureNonce, 15445, backend, store, "ledger")
+	if mapping == nil || err == nil {
+		t.Fatal("lost reply reported success")
+	}
+	if err := mapping.cleanup(context.Background()); err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("absence fabricated quiescence: %v", err)
+	}
+	if backend.removes != 0 || store.ledger.State != "intent" {
+		t.Fatal("unproven absence became clean")
+	}
+}
+
+func TestMappingForeignBindingsAreNeverRemoved(t *testing.T) {
+	cases := map[string]func(*ownedSMBMapping, *mappingFakeBackend){
+		"SID":   func(_ *ownedSMBMapping, b *mappingFakeBackend) { b.current.Owner.SID = "S-1-5-21-10-20-30-2002" },
+		"logon": func(_ *ownedSMBMapping, b *mappingFakeBackend) { b.current.Owner.AuthenticationID = "0000000000000999" },
+		"foreign-row": func(m *ownedSMBMapping, b *mappingFakeBackend) {
+			b.current.Rows[len(b.current.Rows)-1].RemotePath = `\\foreign\share`
+		},
+		"different-drive": func(m *ownedSMBMapping, b *mappingFakeBackend) {
+			b.current.Rows[len(b.current.Rows)-1].LocalPath = "Y:"
+		},
+		"DOS-target": func(m *ownedSMBMapping, b *mappingFakeBackend) {
+			b.current.Devices[m.LocalPath()] = []string{"different target"}
+		},
+		"baseline-row": func(_ *ownedSMBMapping, b *mappingFakeBackend) { b.current.Rows = b.current.Rows[1:] },
+		"baseline-device": func(_ *ownedSMBMapping, b *mappingFakeBackend) {
+			b.current.Devices["M:"] = []string{"changed baseline"}
+		},
+		"rowless-device": func(_ *ownedSMBMapping, b *mappingFakeBackend) { b.current.Rows = b.current.Rows[:1] },
+		"rowless-logical-drive": func(m *ownedSMBMapping, b *mappingFakeBackend) {
+			b.current.Rows = b.current.Rows[:1]
+			b.current.Devices[m.LocalPath()] = nil
+		},
+		"recovered-device-change": func(m *ownedSMBMapping, b *mappingFakeBackend) {
+			m.ledger.State = "intent"
+			b.current.Devices[m.LocalPath()] = []string{"new recovery target"}
+		},
+	}
+	for name, change := range cases {
+		t.Run(name, func(t *testing.T) {
+			mapping, backend, _ := startMappingModel(t)
+			change(mapping, backend)
+			if err := mapping.cleanup(context.Background()); err == nil {
+				t.Fatal("mismatched mapping cleanup passed")
+			}
+			if backend.removes != 0 {
+				t.Fatal("mismatched resource was removed")
+			}
+		})
+	}
+}
+
+func TestMappingNoAdoptionNoReappearanceAndNoMissingRemovalProof(t *testing.T) {
+	o, backend, store := newMappingModel(t)
+	backend.current.Rows = append(backend.current.Rows, mappingRow{"", `\\127.0.0.1\rfs-` + o.FixtureNonce, "OK"})
+	if mapping, err := beginSMBMapping(context.Background(), o, "rfs-"+o.FixtureNonce, 15445, backend, store, "ledger"); mapping != nil || err == nil || backend.creates != 0 {
+		t.Fatal("existing nonce share adopted")
+	}
+	mapping, backend, store := startMappingModel(t)
+	backend.current = cloneMappingValue(t, mapping.ledger.Baseline)
+	if err := mapping.cleanup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if backend.removes != 0 || store.ledger.State != "removed" {
+		t.Fatal("confirmed absence required a deletion")
+	}
+	backend.current.Rows = append(backend.current.Rows, mappingRow{mapping.LocalPath(), mapping.ledger.RemotePath, "OK"})
+	if err := mapping.cleanup(context.Background()); err == nil || backend.removes != 0 {
+		t.Fatal("reappeared resource adopted")
+	}
+	mapping, backend, _ = startMappingModel(t)
+	backend.leaveResource = true
+	if err := mapping.cleanup(context.Background()); err == nil {
+		t.Fatal("remove reply substituted for row/device absence")
+	}
+}
+
+func TestMappingPersistenceFailureNeverStartsAnUnrecordedCreate(t *testing.T) {
+	for _, afterCreate := range []bool{false, true} {
+		t.Run(fmt.Sprint(afterCreate), func(t *testing.T) {
+			o, backend, store := newMappingModel(t)
+			if afterCreate {
+				store.saveErrAt = 1
+			} else {
+				store.createErr = errors.New("intent write failed")
+			}
+			mapping, err := beginSMBMapping(context.Background(), o, "rfs-"+o.FixtureNonce, 15445, backend, store, "ledger")
+			if err == nil {
+				t.Fatal("failed persistence ignored")
+			}
+			if !afterCreate {
+				if mapping != nil || backend.creates != 0 {
+					t.Fatal("create ran without intent")
+				}
+				return
+			}
+			if mapping == nil || backend.creates != 1 {
+				t.Fatal("partial ownership lost after create")
+			}
+			if err := mapping.cleanup(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	o, backend, store := newMappingModel(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if mapping, err := beginSMBMapping(ctx, o, "rfs-"+o.FixtureNonce, 15445, backend, store, "ledger"); mapping != nil || !errors.Is(err, context.Canceled) || backend.creates != 0 || store.ledger.State != "" {
+		t.Fatal("canceled invocation acquired resources")
+	}
+}
+
+func TestMappingLedgerRejectsForeignAndBaselineOwnership(t *testing.T) {
+	mapping, _, _ := startMappingModel(t)
+	o := mapping.options
+	for name, change := range map[string]func(*mappingLedger){
+		"source":         func(l *mappingLedger) { l.SourceSHA = strings.Repeat("c", 40) },
+		"nonce":          func(l *mappingLedger) { l.Nonce = strings.Repeat("c", 64) },
+		"zero-sequence":  func(l *mappingLedger) { l.Sequence = 0 },
+		"sequence":       func(l *mappingLedger) { l.Sequence++ },
+		"drive":          func(l *mappingLedger) { l.LocalPath = "C:" },
+		"port":           func(l *mappingLedger) { l.TCPPort = 0 },
+		"persistent":     func(l *mappingLedger) { l.Persistent = true },
+		"global":         func(l *mappingLedger) { l.Global = true },
+		"credentials":    func(l *mappingLedger) { l.SaveCredentials = true },
+		"unsigned":       func(l *mappingLedger) { l.RequireIntegrity = false },
+		"owner":          func(l *mappingLedger) { l.Owner.AuthenticationID = "0000000000000999" },
+		"baseline-drive": func(l *mappingLedger) { l.Baseline.Devices[l.LocalPath] = []string{"baseline"} },
+		"baseline-share": func(l *mappingLedger) { l.Baseline.Rows = append(l.Baseline.Rows, mappingRow{"", l.RemotePath, "OK"}) },
+		"observation":    func(l *mappingLedger) { l.ObservedRow.RemotePath = `\\other\share` },
+		"unknown-state":  func(l *mappingLedger) { l.State = "ready" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			ledger := cloneMappingValue(t, mapping.ledger)
+			change(&ledger)
+			if err := validateMappingLedger(ledger, o); err == nil {
+				t.Fatal("invalid ledger accepted")
+			}
+		})
+	}
+}
+
+func TestMappingRecoveryRequiresCreationSequence(t *testing.T) {
+	mapping, _, _ := startMappingModel(t)
+	cleanup := mapping.options
+	cleanup.Phase = "current-smb-cleanup"
+	if err := validateMappingLedger(mapping.ledger, cleanup); err != nil {
+		t.Fatalf("cleanup changed only phase and lost its owned ledger: %v", err)
+	}
+	cleanup.Sequence++
+	if err := validateMappingLedger(mapping.ledger, cleanup); err == nil {
+		t.Fatal("cleanup adopted a ledger from a different sequence")
+	}
+}
+
+func TestMappingJSONRejectsAmbiguityAndBounds(t *testing.T) {
+	for _, data := range []string{`{"status":"ok","status":"error"}`, `{"rows":[{"local_path":"X:","local_path":"Y:"}]}`, `{} {}`, strings.Repeat("[", 18) + strings.Repeat("]", 18), strings.Repeat(" ", mappingByteLimit+1)} {
+		var value mappingCommandResult
+		if err := decodeMappingJSON([]byte(data), &value); err == nil {
+			t.Fatalf("ambiguous mapping JSON accepted: %.80s", data)
+		}
+	}
+	var output mappingBoundedBuffer
+	if n, err := output.Write(make([]byte, mappingByteLimit)); err != nil || n != mappingByteLimit {
+		t.Fatal(n, err)
+	}
+	if _, err := output.Write([]byte{1}); err == nil || output.Len() != mappingByteLimit {
+		t.Fatal("output overflow accepted")
+	}
+}
+
+type mappingInputBuffer struct {
+	bytes.Buffer
+	closes int
+}
+
+func (b *mappingInputBuffer) Close() error { b.closes++; return nil }
+
+type mappingCommandChild struct {
+	input          *mappingInputBuffer
+	output, stderr io.ReadCloser
+	done           chan struct{}
+	result         error
+	forced         bool
+	finished       int
+	closePipes     func()
+}
+
+func (p *mappingCommandChild) Input() io.WriteCloser { return p.input }
+func (p *mappingCommandChild) Output() io.ReadCloser { return p.output }
+func (p *mappingCommandChild) Errors() io.ReadCloser { return p.stderr }
+func (p *mappingCommandChild) Done() <-chan struct{} { return p.done }
+func (p *mappingCommandChild) Result() error         { return p.result }
+func (p *mappingCommandChild) PID() uint32           { return 55 }
+func (p *mappingCommandChild) Finish() (bool, error) {
+	p.finished++
+	if p.closePipes != nil {
+		p.closePipes()
+	}
+	return p.forced, errors.Join(p.input.Close(), p.output.Close(), p.stderr.Close())
+}
+
+type mappingCommandHost struct {
+	child  *mappingCommandChild
+	args   []string
+	starts int
+	cache  string
+}
+
+func (h *mappingCommandHost) Preflight() (map[string]any, error) { return nil, nil }
+func (h *mappingCommandHost) Start(_ string, args []string, _ string) (child, error) {
+	h.starts++
+	h.args = append([]string(nil), args...)
+	h.cache = os.Getenv("PSModuleAnalysisCachePath")
+	return h.child, nil
+}
+func mappingReplyChild(reply string) *mappingCommandChild {
+	p := &mappingCommandChild{input: &mappingInputBuffer{}, output: io.NopCloser(strings.NewReader(reply)), stderr: io.NopCloser(strings.NewReader("")), done: make(chan struct{})}
+	close(p.done)
+	return p
+}
+
+func TestMappingCommandUsesOwnedProcessAndSingleLineInput(t *testing.T) {
+	sid := mappingBaselineForTest().Owner.SID
+	data, _ := json.Marshal(mappingCommandResult{Status: "ok", OwnerSID: sid, Rows: []mappingRow{}})
+	process := mappingReplyChild(string(data))
+	host := &mappingCommandHost{child: process}
+	t.Setenv("PSModuleAnalysisCachePath", "existing-task-cache")
+	request := mappingCommandRequest{Action: "inventory", Module: "system-module", OwnerSID: sid}
+	result, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", request)
+	if err != nil || result.Status != "ok" {
+		t.Fatalf("command: %#v %v", result, err)
+	}
+	if host.cache != "NUL" || os.Getenv("PSModuleAnalysisCachePath") != "existing-task-cache" {
+		t.Fatal("module cache was not isolated and restored")
+	}
+	if process.finished != 1 || process.input.closes != 1 {
+		t.Fatalf("owner/pipe closed incorrectly: %d/%d", process.finished, process.input.closes)
+	}
+	input := process.input.String()
+	if !strings.HasSuffix(input, "\n") || strings.Count(input, "\n") != 1 {
+		t.Fatal("request is not one JSON line")
+	}
+	var decoded mappingCommandRequest
+	if err := json.Unmarshal([]byte(input), &decoded); err != nil || decoded != request {
+		t.Fatal("request changed")
+	}
+	encoded := host.args[len(host.args)-1]
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	words := make([]uint16, len(raw)/2)
+	for i := range words {
+		words[i] = binary.LittleEndian.Uint16(raw[2*i:])
+	}
+	if string(utf16.Decode(words)) != mappingPowerShell {
+		t.Fatal("launched PowerShell differs from bound source")
+	}
+	if !strings.Contains(mappingPowerShell, "ReadLine()") || strings.Contains(mappingPowerShell, "ReadToEnd()") || strings.Contains(mappingPowerShell, "UseWriteThrough") {
+		t.Fatal("mapping changed input ownership or ordinary cache behavior")
+	}
+}
+
+func TestMappingCommandCancellationJoinsOwnedWorkers(t *testing.T) {
+	outReader, outWriter := io.Pipe()
+	errReader, errWriter := io.Pipe()
+	process := &mappingCommandChild{input: &mappingInputBuffer{}, output: outReader, stderr: errReader, done: make(chan struct{}), forced: true}
+	var once sync.Once
+	process.closePipes = func() { once.Do(func() { outWriter.Close(); errWriter.Close(); close(process.done) }) }
+	host := &mappingCommandHost{child: process}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	_, err := runMappingPowerShell(ctx, host, "system-powershell", "private-evidence", mappingCommandRequest{Action: "inventory", OwnerSID: mappingBaselineForTest().Owner.SID})
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "forced") || process.finished != 1 || process.input.closes != 1 {
+		t.Fatalf("canceled command ownership: %v", err)
+	}
+}
+
+func TestMappingCommandCannotReportMalformedOrForcedSuccess(t *testing.T) {
+	sid := mappingBaselineForTest().Owner.SID
+	for _, reply := range []string{`{"status":"ok","owner_sid":"` + sid + `","cause":""}`, `{"status":"ok","owner_sid":"wrong","rows":[],"cause":""}`, `{"status":"ok","owner_sid":"` + sid + `","rows":[],"cause":"failed"}`, `{"status":"ok","owner_sid":"` + sid + `","rows":[],"cause":"","extra":1}`} {
+		child := mappingReplyChild(reply)
+		host := &mappingCommandHost{child: child}
+		if _, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", mappingCommandRequest{OwnerSID: sid}); err == nil || child.finished != 1 {
+			t.Fatal("invalid command receipt passed")
+		}
+	}
+	raw, _ := json.Marshal(mappingCommandResult{Status: "ok", OwnerSID: sid, Rows: []mappingRow{}})
+	child := mappingReplyChild(string(raw))
+	child.forced = true
+	if _, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: child}, "system-powershell", "private-evidence", mappingCommandRequest{OwnerSID: sid}); err == nil {
+		t.Fatal("forced cleanup became success")
+	}
+}
+
+func TestMappingTokenStatisticsABI(t *testing.T) {
+	var value mappingTokenStatistics
+	if unsafe.Sizeof(value) != 56 || unsafe.Alignof(value) != 8 || unsafe.Offsetof(value.AuthenticationID) != 8 || unsafe.Offsetof(value.Expiration) != 16 || unsafe.Offsetof(value.ModifiedID) != 48 {
+		t.Fatal("TOKEN_STATISTICS differs from the Windows 64-bit ABI")
+	}
+}

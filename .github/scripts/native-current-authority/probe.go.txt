@@ -105,7 +105,7 @@ func parseOptions(args []string) (options, error) {
 	flags.StringVar(&o.RunID, "run-id", "", "run identity")
 	flags.StringVar(&o.SourceSHA, "source-sha", "", "source commit")
 	flags.StringVar(&o.FixtureNonce, "fixture-nonce", "", "fixture nonce")
-	flags.StringVar(&o.Phase, "phase", "", "readiness phase")
+	flags.StringVar(&o.Phase, "phase", "", "probe phase")
 	flags.StringVar(&o.StateFile, "state-file", "", "private probe state")
 	flags.Uint64Var(&o.Sequence, "sequence", 0, "probe sequence")
 	if err := flags.Parse(args); err != nil {
@@ -135,16 +135,27 @@ func (o options) check() error {
 	if !identifier(o.RunID, 64) || !lowerHex(o.SourceSHA, 40) || !lowerHex(o.FixtureNonce, 64) {
 		return errors.New("run-id, source-sha or fixture-nonce is invalid")
 	}
-	if o.Phase != createPhase && o.Phase != reopenPhase {
-		return errors.New("invalid readiness phase")
-	}
-	if o.Sequence == 0 || o.Sequence == ^uint64(0) {
-		return errors.New("sequence is outside the supported range")
+	if err := o.checkPhase(); err != nil {
+		return err
 	}
 	if filepath.Base(o.StateFile) != "probe-state.json" || filepath.Base(filepath.Dir(o.StateFile)) != "evidence" {
 		return errors.New("state-file must be RUN/evidence/probe-state.json")
 	}
 	return nil
+}
+
+func (o options) checkPhase() error {
+	switch o.Phase {
+	case createPhase:
+		if o.Sequence == 1 {
+			return nil
+		}
+	case reopenPhase, coldPhase, coldCleanupPhase:
+		if o.Sequence == 2 {
+			return nil
+		}
+	}
+	return errors.New("probe phase and sequence do not match")
 }
 
 func identifier(value string, limit int) bool {
@@ -236,7 +247,21 @@ type fixture struct {
 	epoch   string
 }
 
-func probe(ctx context.Context, o options) (answer receipt, returned error) {
+func probe(ctx context.Context, o options) (receipt, error) {
+	return dispatchProbe(ctx, o, probeHTTP, runSMBPhase)
+}
+
+func dispatchProbe(ctx context.Context, o options, httpPhase, smbPhase func(context.Context, options) (receipt, error)) (receipt, error) {
+	if err := o.check(); err != nil {
+		return receipt{}, err
+	}
+	if o.Phase == coldPhase || o.Phase == coldCleanupPhase {
+		return smbPhase(ctx, o)
+	}
+	return httpPhase(ctx, o)
+}
+
+func probeHTTP(ctx context.Context, o options) (answer receipt, returned error) {
 	if err := checkStateDirectory(o.StateFile); err != nil {
 		return answer, err
 	}
@@ -825,7 +850,10 @@ func readState(o options) (probeState, error) {
 }
 
 func (s probeState) check(o options) error {
-	if s.Version != 1 || s.Phase != createPhase || s.Sequence == 0 || s.Sequence == ^uint64(0) || o.Sequence != s.Sequence+1 ||
+	if err := o.checkPhase(); err != nil {
+		return err
+	}
+	if o.Phase == createPhase || s.Version != 1 || s.Phase != createPhase || s.Sequence != 1 || o.Sequence != 2 ||
 		s.RunID != o.RunID || s.SourceSHA != o.SourceSHA || s.FixtureNonce != o.FixtureNonce || s.Volume != o.Volume {
 		return errors.New("probe state run, source, nonce, volume or sequence differs")
 	}

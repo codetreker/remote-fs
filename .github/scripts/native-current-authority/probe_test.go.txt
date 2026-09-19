@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -32,7 +33,7 @@ func testOptions(t *testing.T) options {
 
 func arguments(o options) []string {
 	return []string{"--endpoint", o.Endpoint, "--volume", o.Volume, "--run-id", o.RunID, "--source-sha", o.SourceSHA,
-		"--fixture-nonce", o.FixtureNonce, "--phase", o.Phase, "--state-file", o.StateFile, "--sequence", "1"}
+		"--fixture-nonce", o.FixtureNonce, "--phase", o.Phase, "--state-file", o.StateFile, "--sequence", strconv.FormatUint(o.Sequence, 10)}
 }
 
 func savedState(o options) probeState {
@@ -85,6 +86,128 @@ func TestProbeArgumentsRejectUnboundInputs(t *testing.T) {
 	for _, extra := range []string{"unexpected", "--unknown"} {
 		if _, err := parseOptions(append(arguments(o), extra)); err == nil {
 			t.Fatalf("extra argument %q accepted", extra)
+		}
+	}
+}
+
+func TestProbeAdmitsOnlyExactPhaseSequencePairs(t *testing.T) {
+	o := testOptions(t)
+	for _, phase := range []string{createPhase, reopenPhase, coldPhase, coldCleanupPhase, "unknown"} {
+		for _, sequence := range []uint64{0, 1, 2, 3, ^uint64(0)} {
+			o.Phase, o.Sequence = phase, sequence
+			_, err := parseOptions(arguments(o))
+			allowed := phase == createPhase && sequence == 1 ||
+				(phase == reopenPhase || phase == coldPhase || phase == coldCleanupPhase) && sequence == 2
+			if (err == nil) != allowed {
+				t.Fatalf("phase=%s sequence=%d allowed=%v: %v", phase, sequence, allowed, err)
+			}
+		}
+	}
+}
+
+func TestProbeStateConsumersRequireOriginalCreateReceipt(t *testing.T) {
+	o := testOptions(t)
+	state := savedState(o)
+	if err := writeState(o.StateFile, state); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(o.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{reopenPhase, coldPhase, coldCleanupPhase} {
+		o.Phase, o.Sequence = phase, 2
+		got, err := readState(o)
+		if err != nil || !reflect.DeepEqual(got, state) {
+			t.Fatalf("phase %s changed seed: %+v, %v", phase, got, err)
+		}
+		shifted := state
+		shifted.Sequence, o.Sequence = 2, 3
+		if err := shifted.check(o); err == nil {
+			t.Fatalf("phase %s accepted a shifted seed/consumer pair", phase)
+		}
+	}
+	for _, phase := range []string{createPhase, "unknown"} {
+		o.Phase, o.Sequence = phase, 1
+		if err := state.check(o); err == nil {
+			t.Fatalf("phase %s consumed an existing seed", phase)
+		}
+	}
+	after, err := os.ReadFile(o.StateFile)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("consumer changed immutable seed: %v", err)
+	}
+}
+
+func TestProbeColdPhasesDispatchBeforeHTTPReadiness(t *testing.T) {
+	o := testOptions(t)
+	state := savedState(o)
+	if err := writeState(o.StateFile, state); err != nil {
+		t.Fatal(err)
+	}
+	o.Endpoint = "http://127.0.0.1:1"
+	for _, phase := range []string{coldPhase, coldCleanupPhase} {
+		o.Phase, o.Sequence = phase, 2
+		calls := 0
+		ctx := t.Context()
+		got, err := dispatchProbe(ctx, o, func(context.Context, options) (receipt, error) {
+			t.Fatal("SMB phase reached HTTP readiness")
+			return receipt{}, nil
+		}, func(received context.Context, actual options) (receipt, error) {
+			calls++
+			if received != ctx || actual != o {
+				t.Fatal("dispatcher changed the cleanup context or identity")
+			}
+			saved, err := readState(actual)
+			if err != nil {
+				return receipt{}, err
+			}
+			return receipt{RunID: saved.RunID, SourceSHA: saved.SourceSHA, FixtureNonce: saved.FixtureNonce,
+				Phase: actual.Phase, Sequence: actual.Sequence, Status: "ok", AuthorityEpoch: saved.AuthorityEpoch,
+				ObjectID: strconv.FormatUint(saved.Reference.Attr.ID, 10)}, nil
+		})
+		if err != nil || calls != 1 || got.Phase != phase || got.Sequence != 2 || got.AuthorityEpoch != state.AuthorityEpoch ||
+			got.ObjectID != strconv.FormatUint(state.Reference.Attr.ID, 10) || got.RunID != state.RunID || got.SourceSHA != state.SourceSHA || got.FixtureNonce != state.FixtureNonce {
+			t.Fatalf("phase %s lost its bound cleanup envelope: %+v, calls=%d, err=%v", phase, got, calls, err)
+		}
+	}
+	for _, phase := range []string{createPhase, reopenPhase} {
+		o.Phase, o.Sequence = phase, 1
+		if phase == reopenPhase {
+			o.Sequence = 2
+		}
+		first := errors.New("HTTP phase result")
+		_, err := dispatchProbe(t.Context(), o, func(context.Context, options) (receipt, error) {
+			return receipt{}, first
+		}, func(context.Context, options) (receipt, error) {
+			t.Fatal("readiness phase reached SMB host")
+			return receipt{}, nil
+		})
+		if !errors.Is(err, first) {
+			t.Fatalf("readiness result was replaced: %v", err)
+		}
+	}
+	o.Phase, o.Sequence = coldCleanupPhase, 3
+	unexpected := func(context.Context, options) (receipt, error) {
+		t.Fatal("invalid phase/sequence invoked a phase handler")
+		return receipt{}, nil
+	}
+	if _, err := dispatchProbe(t.Context(), o, unexpected, unexpected); err == nil {
+		t.Fatal("dispatcher admitted an invalid cleanup sequence")
+	}
+}
+
+func TestProbeFailedColdPhasesWriteNoSuccessReceipt(t *testing.T) {
+	o := testOptions(t)
+	if err := writeState(o.StateFile, savedState(o)); err != nil {
+		t.Fatal(err)
+	}
+	o.SourceSHA = strings.Repeat("c", 40)
+	for _, phase := range []string{coldPhase, coldCleanupPhase} {
+		o.Phase, o.Sequence = phase, 2
+		var stdout bytes.Buffer
+		if err := command(arguments(o), &stdout); err == nil || stdout.Len() != 0 {
+			t.Fatalf("failed phase %s emitted success: %q, %v", phase, stdout.Bytes(), err)
 		}
 	}
 }

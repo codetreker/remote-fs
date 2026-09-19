@@ -147,6 +147,8 @@ POSIX 单项的实际准备证明非测试源码仅改变 Fs5 能力位，适用
 
 [POSIX 原生单项 35428678823](https://github.com/codetreker/remote-fs/actions/runs/35428678823)绑定探针 `09d65eb77f74d4bda6dceab4f5a73e8f98496cf6`，实际 HA Fs5 raw/decoded flags=0x406，最大 component=255、名字不变，且响应全局序号 11 先于 mutation 12 和首次新打开 14。完整 DETAIL、冷 B、来源、oracle 与清理有效，395 个控制 verdict 通过，单项仍为合格 replacement_identity_aliased：初始 HA、Hnew、保留 HA 的 native FileIndex 均为 3，旧 A257 与新 B769 字节各自正确；requested-only 的新 CREATE 仍没有 QFid。全部身份/字节检查在 ACK 后 36.3051 ms 完成。能力曝光发生在 HA 创建之后、mutation 之前；结果仅约束这个已测顺序，不证明其它时点或内部 FCB 行为，也不是超过一秒的陈旧或所有无驱动 SMB 方案不可能的结论。
 
-组合准备的本地控制 50 根、普通/race 各 452 verdict 通过，两个单刺激移除对照在原联合 exposure 断言失败；十九项策略控制、三项 source guard 和四种 ARM64 组合构建完成。三个旧分支的 254 份非测试 Go 输入及原生调用序列保持原样，新组合也不增加原生 API。组合的实际 Windows 单项仍未运行；本地结果不能证明这种交互能修复身份或决定生产采用。
+组合准备的本地控制 50 根、普通/race 各 452 verdict 通过，两个单刺激移除对照在原联合 exposure 断言失败；十九项策略控制、三项 source guard 和四种 ARM64 组合构建完成。三个旧分支的 254 份非测试 Go 输入及原生调用序列保持原样，新组合也不增加原生 API。[实际组合 35430629259](https://github.com/codetreker/remote-fs/actions/runs/35430629259)绑定探针 `31817a904fa42896b47ce5eb64e40cbe8be73e90` 和实际 binary，两项刺激均已真实送达同一 HA：Fs5=0x406 早于 mutation，首个新打开未请求却收到真实 B QFid=4。控制用例 473 个 verdict 通过，精确 DETAIL、冷 B、历史区间、oracle 和清理合格，但原生结果仍是 retained_identity_changed：Hnew 为 4，保留 HA 从初始 3 变成 4，而 A257/B769 字节保持正确。全部身份/字节检查在 ACK 后 44.3882 ms 完成。
+
+这个合格首样本否定了该组合下的旧引用身份稳定性，不证明问题持续超过一秒，也不证明所有无驱动方案不可能。内部 FCB 算法与未请求 QFid 的符合性仍未决定，固定原型结果不代表当前生产能力或缓存验收；此前单刺激结果保持独立。
 
 代价是维护固定基底补丁、注入锚点、回归、十八个诊断作业及相互隔离的祖先/身份实验，输入不会自动跟随生产代码。诊断提供可行性或失败证据，不交付新的 SMB 文件实现、SQLite 持久性或历史时间显示策略。实际 package、transport 和 backend 仍须独立验收；缓存失效机制与平台接入仍由平台提案承接，既有一秒要求保持不变。

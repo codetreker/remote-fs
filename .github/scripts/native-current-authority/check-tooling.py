@@ -82,6 +82,13 @@ def audit(path, expected):
     return {"roots": len(roots), "verdicts": len(verdicts), "fail": 0, "skip": 0}
 
 
+def template_groups(os_name):
+    spec = importlib.util.spec_from_file_location("fixture_image_catalog", TOOLS / "build-image.py")
+    image = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(image)
+    return image.unit_template_groups(os_name)
+
+
 def main():
     global WINDOWS_JOB
     parser = argparse.ArgumentParser(description=__doc__)
@@ -108,15 +115,10 @@ def main():
     version = run(["go", "version"], ROOT, output / "go-version.log", env).strip()
     if "go1.26.8" not in version.split():
         raise ValueError("fixture checks require Go1.26.8")
-    platform = "windows" if sys.platform == "win32" else "other"
-    groups = {"probe": ["probe.go", "probe_test.go", f"private_{platform}.go"],
-              "controller": ["controller.go", "controller_test.go", f"private_{platform}.go", "private_test.go", f"private_{platform}_test.go"]}
-    if platform == "windows":
-        groups["controller"] += ["controller_windows.go", "controller_windows_test.go"]
-    elif sys.platform == "linux":
-        groups["init"] = ["init_linux.go", "init_linux_test.go"]
-    else:
+    if sys.platform not in ("linux", "win32"):
         raise ValueError("fixture tooling supports only Linux and Windows hosts")
+    platform = "windows" if sys.platform == "win32" else "other"
+    groups = template_groups("windows" if sys.platform == "win32" else "linux")
     receipt = {"go_version": version, "platform": sys.platform, "race": args.race, "groups": {}}
     for name, files in groups.items():
         directory = output / name

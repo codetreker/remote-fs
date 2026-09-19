@@ -1,0 +1,12 @@
+//go:build !windows
+
+package main
+
+import (
+	"context"
+	"errors"
+)
+
+func runSMBPhase(context.Context, options) (receipt, error) {
+	return receipt{}, errors.New("current SMB cold and cleanup phases require native Windows")
+}

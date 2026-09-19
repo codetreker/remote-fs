@@ -1,0 +1,314 @@
+//go:build windows
+
+package main
+
+import (
+	"context"
+	"errors"
+	"math"
+	"net/http"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+	"unsafe"
+
+	"github.com/codetreker/remote-fs/packages/smb"
+	smbwindows "github.com/codetreker/remote-fs/packages/smb/windows"
+	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/transport/httprest"
+	"golang.org/x/sys/windows"
+)
+
+func coldTestState(t *testing.T) probeState {
+	t.Helper()
+	instant := time.Date(2026, 9, 19, 1, 2, 3, 123456789, time.UTC)
+	content := []byte("native fixture bytes")
+	return probeState{Content: content, ContentSHA256: digest(content), Reference: storage.ReferenceState{Attr: storage.Attr{
+		ID: 41, Kind: storage.NodeRegular, Size: int64(len(content)), BirthTime: &instant, ChangeTime: &instant, AccessTime: instant, ModTime: instant,
+		Metadata: map[string]storage.OpaquePayload{metadataNamespace: {Version: []byte{1}, Data: []byte("seed")}},
+	}}}
+}
+
+func coldTestCalls(t *testing.T, state probeState, order *[]string) coldNativeCalls {
+	t.Helper()
+	basic, err := expectedNativeBasic(state.Reference.Attr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offset := 0
+	handle := windows.Handle(42)
+	check := func(got windows.Handle, api string) {
+		if got != handle {
+			t.Fatalf("%s changed HANDLE: %v", api, got)
+		}
+		*order = append(*order, api)
+	}
+	return coldNativeCalls{
+		open:  func(string) (windows.Handle, error) { *order = append(*order, "open"); return handle, nil },
+		basic: func(h windows.Handle) (nativeBasicInformation, error) { check(h, "basic"); return basic, nil },
+		standard: func(h windows.Handle) (nativeStandardInformation, error) {
+			check(h, "standard")
+			return nativeStandardInformation{AllocationSize: 512, EndOfFile: int64(len(state.Content)), NumberOfLinks: 1}, nil
+		},
+		identity: func(h windows.Handle) (nativeFileIdentity, error) {
+			check(h, "identity")
+			return nativeFileIdentity{VolumeSerialNumber: 0x87654321, FileID: [16]byte{9, 8, 7, 6, 5, 4, 3, 2, 1}}, nil
+		},
+		read: func(h windows.Handle, data []byte) (uint32, error) {
+			check(h, "read")
+			n := copy(data, state.Content[offset:])
+			offset += n
+			return uint32(n), nil
+		},
+		close: func(h windows.Handle) error { check(h, "close"); return nil },
+	}
+}
+
+func TestColdNativeUsesOneHandleAndKeepsIdentityOpaque(t *testing.T) {
+	state := coldTestState(t)
+	var order []string
+	var events []map[string]any
+	calls := coldTestCalls(t, state, &order)
+	if err := runNativeCold(t.Context(), state, `X:\sentinel`, calls, func(e map[string]any) error { events = append(events, e); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"open", "basic", "standard", "identity", "read", "read", "identity", "close"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("native sequence: %v", order)
+	}
+	if len(events) != 9 {
+		t.Fatalf("native event count=%d", len(events))
+	}
+	for _, tuple := range []nativeFileIdentity{{}, {VolumeSerialNumber: math.MaxUint64, FileID: [16]byte{1, 2, 3}}} {
+		if err := sameNativeIdentity(tuple, tuple); err != nil {
+			t.Fatalf("opaque stable identity rejected: %v", err)
+		}
+		changed := tuple
+		changed.VolumeSerialNumber ^= 1
+		if err := sameNativeIdentity(tuple, changed); err == nil {
+			t.Fatal("serial change accepted")
+		}
+		changed = tuple
+		changed.FileID[15] ^= 1
+		if err := sameNativeIdentity(tuple, changed); err == nil {
+			t.Fatal("128-bit identity change accepted")
+		}
+	}
+}
+
+func TestColdNativeFirstErrorHasNoFallbackAndKeepsCleanupError(t *testing.T) {
+	state := coldTestState(t)
+	var order []string
+	calls := coldTestCalls(t, state, &order)
+	first, cleanup := windows.ERROR_NOT_SUPPORTED, errors.New("native close failed")
+	calls.basic = func(windows.Handle) (nativeBasicInformation, error) {
+		order = append(order, "basic-failed")
+		return nativeBasicInformation{}, first
+	}
+	calls.close = func(windows.Handle) error { order = append(order, "close"); return cleanup }
+	var recorded uint32
+	err := runNativeCold(t.Context(), state, `X:\sentinel`, calls, func(e map[string]any) error {
+		if e["api"] == "GetFileInformationByHandleEx(FileBasicInfo)" {
+			recorded = e["error_code"].(uint32)
+		}
+		return nil
+	})
+	if !errors.Is(err, first) || !errors.Is(err, cleanup) {
+		t.Fatalf("first/cleanup failures lost: %v", err)
+	}
+	if recorded != uint32(first) || !reflect.DeepEqual(order, []string{"open", "basic-failed", "close"}) {
+		t.Fatalf("native fallback or missing first error: %v code=%d", order, recorded)
+	}
+}
+
+func TestColdNativeRejectsWrongDataMetadataAndRepeatedTuple(t *testing.T) {
+	for _, kind := range []string{"bytes", "expected-content", "basic", "allocation", "identity", "oversized-read", "empty-read"} {
+		t.Run(kind, func(t *testing.T) {
+			state := coldTestState(t)
+			var order []string
+			calls := coldTestCalls(t, state, &order)
+			switch kind {
+			case "expected-content":
+				state.Content = append([]byte(nil), state.Content...)
+				state.Content[0] ^= 1
+				state.ContentSHA256 = digest(state.Content)
+			case "bytes":
+				calls.read = func(_ windows.Handle, data []byte) (uint32, error) {
+					for i := range data {
+						data[i] = 'x'
+					}
+					return uint32(len(data)), nil
+				}
+			case "basic":
+				previous := calls.basic
+				calls.basic = func(h windows.Handle) (nativeBasicInformation, error) {
+					v, e := previous(h)
+					v.ChangeTime++
+					return v, e
+				}
+			case "allocation":
+				previous := calls.standard
+				calls.standard = func(h windows.Handle) (nativeStandardInformation, error) {
+					v, e := previous(h)
+					v.AllocationSize++
+					return v, e
+				}
+			case "identity":
+				previous := calls.identity
+				n := 0
+				calls.identity = func(h windows.Handle) (nativeFileIdentity, error) {
+					v, e := previous(h)
+					n++
+					if n == 2 {
+						v.FileID[15] ^= 1
+					}
+					return v, e
+				}
+			case "oversized-read":
+				calls.read = func(_ windows.Handle, data []byte) (uint32, error) { return uint32(len(data) + 1), nil }
+			case "empty-read":
+				calls.read = func(windows.Handle, []byte) (uint32, error) { return 0, nil }
+			}
+			err := runNativeCold(t.Context(), state, `X:\sentinel`, calls, func(map[string]any) error { return nil })
+			if err == nil || order[len(order)-1] != "close" {
+				t.Fatalf("invalid native result accepted or HANDLE leaked: %v, %v", order, err)
+			}
+		})
+	}
+}
+
+func TestColdNativeEOFDoesNotHideEvidenceFailure(t *testing.T) {
+	state := coldTestState(t)
+	var order []string
+	calls := coldTestCalls(t, state, &order)
+	previous := calls.read
+	calls.read = func(h windows.Handle, data []byte) (uint32, error) {
+		n, err := previous(h, data)
+		if n == 0 && err == nil {
+			return 0, windows.ERROR_HANDLE_EOF
+		}
+		return n, err
+	}
+	failure := errors.New("evidence full")
+	err := runNativeCold(t.Context(), state, `X:\sentinel`, calls, func(e map[string]any) error {
+		if e["api"] == "ReadFile(EOF)" {
+			if e["error_code"] != uint32(windows.ERROR_HANDLE_EOF) {
+				t.Fatal("EOF status lost")
+			}
+			return failure
+		}
+		return nil
+	})
+	if !errors.Is(err, failure) || order[len(order)-1] != "close" {
+		t.Fatalf("accepted EOF swallowed evidence failure: %v", err)
+	}
+}
+
+func TestColdNativeCancellationWaitsForCallBeforeClosing(t *testing.T) {
+	state := coldTestState(t)
+	var order []string
+	calls := coldTestCalls(t, state, &order)
+	entered, released, closed := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	previous := calls.read
+	calls.read = func(h windows.Handle, data []byte) (uint32, error) {
+		close(entered)
+		<-released
+		return previous(h, data)
+	}
+	calls.close = func(windows.Handle) error { close(closed); return nil }
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- runNativeCold(ctx, state, `X:\sentinel`, calls, func(map[string]any) error { return nil })
+	}()
+	<-entered
+	cancel()
+	select {
+	case <-closed:
+		t.Fatal("HANDLE closed while native call retained its buffer")
+	case <-done:
+		t.Fatal("native call abandoned")
+	case <-time.After(10 * time.Millisecond):
+	}
+	close(released)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation lost: %v", err)
+	}
+	select {
+	case <-closed:
+	default:
+		t.Fatal("HANDLE was not closed after native call returned")
+	}
+}
+
+func TestColdHostBoundsAndNativeLayouts(t *testing.T) {
+	if unsafe.Sizeof(nativeBasicInformation{}) != 40 || unsafe.Sizeof(nativeStandardInformation{}) != 24 || unsafe.Sizeof(nativeFileIdentity{}) != 24 {
+		t.Fatal("Win32 output layout changed")
+	}
+	limits, dial := coldLimits(), coldDialOptions()
+	if limits.MaxIOBytes != 64<<10 || limits.MaxFrameBytes < limits.MaxIOBytes+65536 || dial.MaxBodyBytes != 1<<20 || dial.MaxWriteBytes != 64<<10 {
+		t.Fatal("HTTP and SMB I/O bounds disagree")
+	}
+	authorize, err := smbwindows.AllowSID("S-1-5-21-1-2-3-1001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := smb.New(smb.Config{Authenticator: smbwindows.NewAuthenticator(), Authorize: authorize, Limits: limits})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := httprest.DialWithOptions("http://127.0.0.1:12345", &http.Client{}, dial); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkColdStopped(server.Status()); err != nil {
+		t.Fatal(err)
+	}
+	busy := server.Status()
+	busy.Exports = 1
+	if err := checkColdStopped(busy); err == nil {
+		t.Fatal("Shutdown alone accepted an export registration")
+	}
+	failed := server.Status()
+	failed.CleanupFailures = 1
+	if err := checkColdStopped(failed); err == nil {
+		t.Fatal("historical cleanup failure became success")
+	}
+	state := coldTestState(t)
+	state.Reference.Attr.BirthTime = nil
+	if _, err := expectedNativeBasic(state.Reference.Attr); err == nil {
+		t.Fatal("unknown creation time invented")
+	}
+	if ticks, err := coldFiletime(time.Unix(-11644473600, 199)); err != nil || ticks != 1 {
+		t.Fatalf("100ns precision=%d,%v", ticks, err)
+	}
+	if _, err := coldFiletime(time.Time{}); err == nil {
+		t.Fatal("unrepresentable timestamp accepted")
+	}
+	if !strings.Contains(coldError(errors.New("first")), "first") {
+		t.Fatal("diagnostic lost")
+	}
+}
+
+func TestColdHostMetadataPoolAdmitsHealthyCommandConcurrency(t *testing.T) {
+	limits := coldLimits()
+	metadata, err := storage.MetadataRetentionBytes(storage.MaxMetadataBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createCharge := metadata + 512
+	stateCharge := createCharge + storage.MaxLinkTargetBytes + storage.MaxObservationTokenBytes
+	// Installed handles release their captured CREATE result. Active commands on
+	// a tree share its connection's request bound; failed cleanup stays charged.
+	required := max(int64(limits.MaxOpens)*createCharge, int64(limits.MaxRequests)*stateCharge)
+	if limits.MaxDirectoryBytes != 8<<20 || limits.MaxDirectoryBytes < required {
+		t.Fatalf("cold metadata pool=%d, need %d for %d opens and %d active commands", limits.MaxDirectoryBytes, required, limits.MaxOpens, limits.MaxRequests)
+	}
+	if 64<<10 >= createCharge {
+		t.Fatal("old 64 KiB pool no longer distinguishes the CREATE reservation")
+	}
+}

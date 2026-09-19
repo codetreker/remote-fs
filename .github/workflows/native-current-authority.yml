@@ -76,7 +76,7 @@ jobs:
           retention-days: 14
 
   windows:
-    name: Native ARM64 HTTP authority lifecycle
+    name: Native ARM64 current SMB cold probe
     needs: image
     runs-on: windows-11-arm
     timeout-minutes: 15
@@ -117,9 +117,9 @@ jobs:
           python -u .github/scripts/native-current-authority/check-tooling.py --output .tmp/native-current-authority-fixture/unit-windows
           if ($LASTEXITCODE -ne 0) { throw 'Native fixture unit checks failed.' }
           ./.github/scripts/native-current-authority/run_windows_test.ps1 | Tee-Object -FilePath .tmp/native-current-authority-fixture/unit-windows/path-guard.jsonl
-      - name: Verify the current HTTP authority across an ordinary restart
+      - name: Verify current SMB cold reads and authority restart
         shell: pwsh
-        run: ./.github/scripts/native-current-authority/run-windows.ps1 -ArtifactDirectory .tmp/native-current-authority-fixture/artifact -RunId "${{ github.run_id }}-${{ github.run_attempt }}"
+        run: ./.github/scripts/native-current-authority/run-windows.ps1 -ArtifactDirectory .tmp/native-current-authority-fixture/artifact -RunId "${{ github.run_id }}-${{ github.run_attempt }}" -CurrentSMBCold
       - name: Preserve first observations and owned-resource cleanup
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

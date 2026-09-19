@@ -13,6 +13,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1064,7 +1066,7 @@ func TestSocketLifecycleFailureStagesCleanOwnedResources(t *testing.T) {
 					return process, nil
 				},
 			}
-			err = lifecycle(ctx, host, m, testIdentity(), "qemu", "bios", artifacts, evidence, work, log)
+			err = lifecycle(ctx, host, m, testIdentity(), "qemu", "bios", artifacts, evidence, work, log, false)
 			if err == nil {
 				t.Fatal("failed lifecycle reported success")
 			}
@@ -1497,5 +1499,354 @@ func TestTerminalResetAfterAcknowledgementRecordsReset(t *testing.T) {
 	}
 	if !errors.Is(guest.serial.err, syscall.Errno(10054)) {
 		t.Fatal("post-ACK reset became ordinary EOF")
+	}
+}
+
+func probeTestReceipt(t *testing.T, phase string, sequence uint64, epoch, object string) string {
+	t.Helper()
+	data, err := json.Marshal(response{identity: testIdentity(), Phase: phase, Sequence: sequence, Status: "ok", AuthorityEpoch: epoch, ObjectID: object})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data) + "\n"
+}
+
+func probeTestArguments(args []string) (map[string]string, error) {
+	if len(args) != 16 {
+		return nil, errors.New("probe argument count changed")
+	}
+	values := make(map[string]string, 8)
+	for i := 0; i < len(args); i += 2 {
+		if _, exists := values[args[i]]; exists {
+			return nil, errors.New("duplicate probe argument")
+		}
+		values[args[i]] = args[i+1]
+	}
+	id := testIdentity()
+	if values["--run-id"] != id.RunID || values["--source-sha"] != id.SourceSHA || values["--fixture-nonce"] != id.Nonce || values["--volume"] != "fixture-current" || filepath.Base(values["--state-file"]) != "probe-state.json" {
+		return nil, errors.New("probe arguments lost run or fixture identity")
+	}
+	return values, nil
+}
+
+func TestCurrentSMBColdRecoveryPreservesFirstFailure(t *testing.T) {
+	first, cleanupFailure := errors.New("first cold failure"), errors.New("cleanup failure")
+	for _, name := range []string{"success", "cold-error", "cold-forced", "cold-cleanup-unknown", "cold-start-unknown", "outer-canceled-guest-dead", "wrong-object", "wrong-authority", "recovery-error", "recovery-wrong-phase", "recovery-wrong-sequence", "recovery-wrong-object"} {
+		t.Run(name, func(t *testing.T) {
+			id := testIdentity()
+			seed := response{identity: id, Phase: "readiness-create", Sequence: 1, Status: "ok", AuthorityEpoch: "seed-authority", ObjectID: "41"}
+			coldOutput := probeTestReceipt(t, currentSMBColdPhase, 2, seed.AuthorityEpoch, seed.ObjectID)
+			if name == "wrong-object" {
+				coldOutput = probeTestReceipt(t, currentSMBColdPhase, 2, seed.AuthorityEpoch, "42")
+			}
+			if name == "wrong-authority" {
+				coldOutput = probeTestReceipt(t, currentSMBColdPhase, 2, "other-authority", seed.ObjectID)
+			}
+			cleanupOutput := probeTestReceipt(t, currentSMBCleanupPhase, 2, seed.AuthorityEpoch, seed.ObjectID)
+			if name == "recovery-wrong-phase" {
+				cleanupOutput = probeTestReceipt(t, currentSMBColdPhase, 2, seed.AuthorityEpoch, seed.ObjectID)
+			}
+			if name == "recovery-wrong-sequence" {
+				cleanupOutput = probeTestReceipt(t, currentSMBCleanupPhase, 3, seed.AuthorityEpoch, seed.ObjectID)
+			}
+			if name == "recovery-wrong-object" {
+				cleanupOutput = probeTestReceipt(t, currentSMBCleanupPhase, 2, seed.AuthorityEpoch, "42")
+			}
+			guest := &guestChannel{identity: id, child: childWithOutput("", false), fault: make(chan error, 1)}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			coldChild := childWithOutput(coldOutput, true)
+			if name != "success" && name != "wrong-object" && name != "wrong-authority" {
+				coldChild.result = first
+			}
+			quiescent := false
+			coldChild.finishBefore = func(time.Time) (bool, error) {
+				if name == "cold-cleanup-unknown" {
+					return false, cleanupFailure
+				}
+				quiescent = true
+				if name == "outer-canceled-guest-dead" {
+					cancel()
+					close(guest.child.(*fakeChild).done)
+				}
+				return name == "cold-forced" || name == "outer-canceled-guest-dead", nil
+			}
+			var calls []string
+			host := fakePlatform{start: func(_ string, args []string, _ string) (child, error) {
+				values, err := probeTestArguments(args)
+				if err != nil {
+					return nil, err
+				}
+				if values["--sequence"] != "2" {
+					return nil, errors.New("cold/recovery sequence changed")
+				}
+				phase := values["--phase"]
+				calls = append(calls, phase)
+				switch phase {
+				case currentSMBColdPhase:
+					if name == "cold-start-unknown" {
+						return nil, first
+					}
+					return coldChild, nil
+				case currentSMBCleanupPhase:
+					if !quiescent {
+						return nil, errors.New("mapping recovery overlapped the cold child")
+					}
+					if name == "outer-canceled-guest-dead" && ctx.Err() == nil {
+						return nil, errors.New("test did not cancel the outer context")
+					}
+					p := childWithOutput(cleanupOutput, true)
+					if name == "recovery-error" {
+						p.result = cleanupFailure
+					}
+					return p, nil
+				default:
+					return nil, errors.New("unexpected recovery helper phase")
+				}
+			}}
+			var recorded bytes.Buffer
+			log := &events{identity: id, output: &cappedWriter{writer: &recorded, remaining: streamLimit}}
+			err := runCurrentSMBCold(ctx, host, guest, seed, "probe", privateTestDirectory(t), "http://127.0.0.1:12345", "fixture-current", log)
+			if name == "success" {
+				if err != nil || len(calls) != 1 {
+					t.Fatalf("healthy cold probe: calls=%v error=%v", calls, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("recovery promoted a failed cold probe to success")
+			}
+			if name != "wrong-object" && name != "wrong-authority" && !errors.Is(err, first) {
+				t.Fatalf("first failure lost: %v", err)
+			}
+			blocked := name == "cold-cleanup-unknown" || name == "cold-start-unknown"
+			if blocked {
+				if len(calls) != 1 || !errors.Is(err, errOwnedCleanup) || !strings.Contains(recorded.String(), `"status":"blocked"`) {
+					t.Fatalf("unconfirmed child permitted recovery: calls=%v err=%v", calls, err)
+				}
+			} else if len(calls) != 2 || calls[1] != currentSMBCleanupPhase {
+				t.Fatalf("recovery was missing or repeated: %v", calls)
+			}
+			if name == "recovery-error" && !errors.Is(err, cleanupFailure) {
+				t.Fatalf("cleanup failure lost: %v", err)
+			}
+			if strings.HasPrefix(name, "recovery-") && !strings.Contains(recorded.String(), `"status":"error"`) {
+				t.Fatalf("failed recovery was reported successful: %s", recorded.String())
+			}
+		})
+	}
+}
+
+func TestCurrentSMBRecoveryUsesOneAbsoluteBudget(t *testing.T) {
+	seed := response{identity: testIdentity(), AuthorityEpoch: "seed-authority", ObjectID: "41"}
+	for _, name := range []string{"complete", "no-deadline", "insufficient-command-budget"} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			var deadline time.Time
+			if name != "no-deadline" {
+				budget := 30 * time.Second
+				if name == "insufficient-command-budget" {
+					budget = 5 * time.Second
+				}
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, budget)
+				defer cancel()
+				deadline, _ = ctx.Deadline()
+			}
+			p := childWithOutput(probeTestReceipt(t, currentSMBCleanupPhase, 2, seed.AuthorityEpoch, seed.ObjectID), true)
+			starts := 0
+			host := fakePlatform{start: func(string, []string, string) (child, error) { starts++; return p, nil }}
+			_, err := recoverSMBMapping(ctx, host, testIdentity(), seed, "probe", privateTestDirectory(t), "http://127.0.0.1:12345", "fixture-current")
+			if name == "complete" {
+				if err != nil || starts != 1 || p.finishes != 1 || p.finishDeadline.After(deadline) {
+					t.Fatalf("recovery escaped its cleanup bound: start=%d finish=%d err=%v", starts, p.finishes, err)
+				}
+			} else if err == nil || starts != 0 {
+				t.Fatalf("unbounded or exhausted recovery launched a child: starts=%d err=%v", starts, err)
+			}
+			if name == "insufficient-command-budget" && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Job-cleanup reserve was lost: %v", err)
+			}
+		})
+	}
+}
+
+func TestToolCleanupClampsTheSuppliedDeadline(t *testing.T) {
+	p := childWithOutput("complete", true)
+	deadline := time.Now().Add(5 * time.Second)
+	if _, err := runToolBefore(socketTestContext(t), fakePlatform{process: p}, "tool", nil, privateTestDirectory(t), "bounded", deadline); err != nil {
+		t.Fatal(err)
+	}
+	if !p.finishDeadline.Equal(deadline) {
+		t.Fatalf("cleanup deadline changed: got=%s want=%s", p.finishDeadline, deadline)
+	}
+}
+
+func TestCurrentSMBPhaseOrderUsesSingleGuest(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		name := "http-only"
+		if enabled {
+			name = "current-smb-cold"
+		}
+		t.Run(name, func(t *testing.T) {
+			artifacts, evidence, work := privateTestDirectory(t), privateTestDirectory(t), privateTestDirectory(t)
+			pristine := filepath.Join(artifacts, "pristine.ext4")
+			if err := os.WriteFile(pristine, []byte("fixture bytes"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			hash, size, err := fileHash(pristine)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := manifest{Artifacts: map[string]artifact{"data": {Path: "pristine.ext4", SHA256: hash, Size: size}, "probe_windows_arm64": {Path: "probe.exe"}}, Volume: "fixture-current", BootToken: strings.Repeat("a", 64)}
+			m.QEMU.Machine = "pc-q35-11.1"
+			listener := newTestControlListener(t)
+			listener.address = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
+			conn, peer := controlTestPair(t)
+			conn.local = listener.Addr()
+			conn.setWriteDeadline = func(deadline time.Time) error {
+				// net.Pipe rejects a deadline reset after peer EOF, unlike a live TCP handle.
+				if deadline.IsZero() {
+					return nil
+				}
+				return conn.Conn.SetWriteDeadline(deadline)
+			}
+			listener.result <- controlAcceptResult{conn: conn}
+			qemu := childWithOutput("diagnostic output\n", false)
+			var exitOnce sync.Once
+			exit := func() { exitOnce.Do(func() { close(qemu.done) }) }
+			var natural atomic.Bool
+			qemu.finishBefore = func(time.Time) (bool, error) {
+				select {
+				case <-qemu.done:
+					return !natural.Load(), nil
+				default:
+					peer.Close()
+					exit()
+					return true, nil
+				}
+			}
+			var orderMu sync.Mutex
+			var order []string
+			record := func(event string) { orderMu.Lock(); order = append(order, event); orderMu.Unlock() }
+			peerDone := make(chan error, 1)
+			started, joined := false, false
+			t.Cleanup(func() {
+				peer.Close()
+				conn.Conn.Close()
+				exit()
+				if started && !joined {
+					select {
+					case <-peerDone:
+					case <-socketTestContext(t).Done():
+						t.Error("scripted guest did not stop")
+					}
+				}
+			})
+			if err := peer.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			boot := controlResponseLine(t, response{identity: testIdentity(), Phase: "boot", Op: "boot-ready", Status: "ok"})
+			qemuStarts := 0
+			host := fakePlatform{listener: listener, start: func(executable string, args []string, _ string) (child, error) {
+				if strings.HasSuffix(executable, "probe.exe") {
+					values, err := probeTestArguments(args)
+					if err != nil {
+						return nil, err
+					}
+					phase, sequence := values["--phase"], values["--sequence"]
+					record("probe:" + phase + "/" + sequence)
+					epoch := "seed-authority"
+					if phase == "readiness-reopen" {
+						epoch = "reopened-authority"
+					}
+					value := response{identity: testIdentity(), Phase: phase, Sequence: 2, Status: "ok", AuthorityEpoch: epoch, ObjectID: "41"}
+					if phase == "readiness-create" {
+						value.Sequence = 1
+					}
+					data, err := json.Marshal(value)
+					if err != nil {
+						return nil, err
+					}
+					return childWithOutput(string(data), true), nil
+				}
+				if !strings.Contains(strings.Join(args, " "), "-chardev") {
+					return childWithOutput("QEMU emulator version 11.1.0 pc-q35-11.1 virtio-blk-pci virtio-net-pci virtio-rng-pci rng-builtin user tcg", true), nil
+				}
+				qemuStarts++
+				if qemuStarts != 1 {
+					return nil, errors.New("cold phase launched another guest")
+				}
+				started = true
+				go func() {
+					result := func() error {
+						if _, err := peer.Write(boot); err != nil {
+							return err
+						}
+						reader := bufio.NewReader(peer)
+						for index, op := range []string{"start", "stop-authority", "start", "shutdown"} {
+							line, err := reader.ReadBytes('\n')
+							if err != nil {
+								return err
+							}
+							var command struct {
+								Nonce    string `json:"nonce"`
+								Sequence uint64 `json:"sequence"`
+								Command  string `json:"command"`
+							}
+							if err := json.Unmarshal(line, &command); err != nil {
+								return err
+							}
+							if command.Nonce != testIdentity().Nonce || command.Sequence != uint64(index+1) || command.Command != op {
+								return errors.New("guest command sequence changed")
+							}
+							record("guest:" + op + "/" + strconv.Itoa(index+1))
+							zero := 0
+							ack, err := json.Marshal(response{identity: testIdentity(), Phase: op, Sequence: command.Sequence, Op: op, Status: "ok", ExitCode: &zero})
+							if err != nil {
+								return err
+							}
+							if _, err := peer.Write(append(append([]byte(responsePrefix), ack...), '\n')); err != nil {
+								return err
+							}
+						}
+						return nil
+					}()
+					if result == nil {
+						natural.Store(true)
+					}
+					peer.Close()
+					exit()
+					peerDone <- result
+				}()
+				return qemu, nil
+			}}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			log := &events{identity: testIdentity(), output: &cappedWriter{writer: io.Discard, remaining: streamLimit}}
+			if err := lifecycle(ctx, host, m, testIdentity(), "qemu", "bios", artifacts, evidence, work, log, enabled); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-peerDone:
+				joined = true
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal("scripted guest did not complete")
+			}
+			want := []string{"guest:start/1", "probe:readiness-create/1"}
+			if enabled {
+				want = append(want, "probe:current-smb-cold/2")
+			}
+			want = append(want, "guest:stop-authority/2", "guest:start/3", "probe:readiness-reopen/2", "guest:shutdown/4")
+			orderMu.Lock()
+			got := append([]string(nil), order...)
+			orderMu.Unlock()
+			if !reflect.DeepEqual(got, want) || qemuStarts != 1 || qemu.finishes != 1 {
+				t.Fatalf("phase order/guest count differs: order=%v guests=%d finishes=%d", got, qemuStarts, qemu.finishes)
+			}
+		})
 	}
 }

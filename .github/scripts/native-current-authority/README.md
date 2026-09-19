@@ -7,11 +7,16 @@ image. The Windows host exposes one loopback HTTP forwarding port and a separate
 controller-owned serial-control listener. No guest network download, external
 service or public endpoint is required.
 
-The result is an authority readiness and restart check. It does not certify the
-Windows SMB adapter, native filesystem caching or the one-second visibility
-requirement. Those need the actual adapter and unchanged native acceptance cases.
-The controller reports `native_acceptance: not-run`; requesting native acceptance
-from this fixture fails.
+The default invocation checks authority readiness and ordinary restart. The
+workflow explicitly adds `-CurrentSMBCold`, forwarded as `-current-smb-cold`, to
+check one cold file through the current SMB endpoint and system redirector. A
+standalone invocation without that switch keeps the HTTP-only sequence.
+
+Cold-open results are recorded separately from `native_acceptance: not-run`.
+`require-native` remains an unavailable broader gate. One object and one HANDLE
+do not establish identity uniqueness, rename/replacement retention, native
+writes, directory or Explorer behavior, disconnect handling, warm-cache
+invalidation or the unchanged one-second visibility requirement.
 
 ## Inputs and build
 
@@ -19,7 +24,8 @@ from this fixture fails.
 and Go version. `build-image.py` verifies the package and assembles a minimal
 initramfs without executing package scripts, mounting a filesystem or executing
 the guest init on the host. It builds the current `cmd/remote-fs-server` and the
-fixture helpers, then formats a new 1 GiB regular file as ext4. The manifest binds
+fixture helpers, including the current SMB/Windows dependency graph, then formats
+a new 1 GiB regular file as ext4. The manifest binds
 each artifact and source input to the checkout commit and tree.
 
 The Windows QEMU bundle is the project-linked Weil native ARM64 11.1.0 build.
@@ -117,10 +123,12 @@ failures. Disk removal still requires process/Job quiescence.
 
 The separate Linux validation driver retains its POSIX stdio transport. The
 Windows socket does not change guest PID 1, the authority, the image, the HTTP
-forward or the public storage API. Native ownership and HTTP/restart have been observed on Windows; the complete
-lifecycle remains unconfirmed after a terminal reset triggered forced cleanup.
-The conditional terminal-reset correction still needs its own native execution;
-portable controls and cross-builds do not prove it.
+forward or the public storage API. [Run 35430629381](https://github.com/codetreker/remote-fs/actions/runs/35430629381)
+on source `31817a904fa42896b47ce5eb64e40cbe8be73e90` passed the native Windows ARM64
+HTTP fixture lifecycle: owned socket, real authority restart/reopen, exact final
+ACK, recorded qualified reset, natural QEMU exit 0, non-forced empty Job and disk
+cleanup. That run did not execute the current SMB cold phase or cache acceptance.
+The cold phase needs its own source-bound native result.
 
 ## Readiness sequence
 
@@ -129,18 +137,76 @@ portable controls and cross-builds do not prove it.
 2. Enroll a real authority lease and file session through HTTP. Exercise captured
    node references, atomic open, byte writes/reads, metadata conditions, retained
    rename/unlink and logical quota. Leave one exact sentinel and close all handles.
-3. Stop and wait for the actual authority child. Restart the same volume without
-   lock-state initialization.
-4. Require the sentinel's ID, bytes and metadata to survive under a new authority
-   incarnation. Remove it and close every reference/session.
-5. Stop the authority, synchronize and unmount ext4, acknowledge shutdown and
-   power off. Require QEMU exit and complete stream drain, then remove the writable
-   copy and verify the pristine image is unchanged.
+3. When selected, run `current-smb-cold` sequence 2 against that immutable seed.
+   Its object ID and authority epoch must match `readiness-create` sequence 1.
+4. Stop the authority with command 2, then restart it with command 3 without
+   lock-state initialization. `readiness-reopen` sequence 2 must preserve the
+   sentinel's ID, bytes and metadata under a new authority epoch; then remove it.
+5. Send shutdown command 4, synchronize and unmount ext4, receive its exact ACK
+   and require natural QEMU exit plus qualified stream/Job completion. Remove the
+   writable copy and verify the pristine image is unchanged.
 
 Receipts and first failure logs remain in
 `.tmp/native-current-authority-fixture/windows-runs/<run-id>/evidence`. The
 packaging receipt is separate. No success is inferred from the TCP listener or
 the server's startup log.
+
+## Current SMB cold phase
+
+The Windows probe publishes one nonce-named share through the current `smb.Server`,
+SSPI authenticator and exact current-SID authorizer. Its backend is the current
+HTTP FileStorage pointing to the same Linux authority; no pinned SMB prototype,
+legacy dispatcher or memory authority is used. The canonical volume key stays
+`fixture-current`, independent of the share alias. The seed's original HTTP
+references are already closed; SMB creates its own FileSession and references.
+
+A free drive is selected from current SMB, DOS-device and logical-drive inventories.
+The private intent ledger is written before `New-SmbMapping`. The mapping uses a
+loopback alternate TCP port, required integrity, no saved credentials and no
+persistent/global mapping. Windows 11 24H2+ and an elevated host are checked.
+The observed drive, remote share, port, SID/logon identity and DOS-device binding
+must match the ledger; no existing mapping is adopted or removed. Mapping commands
+remain descendants of the existing owned Job.
+
+The first call is ordinary synchronous `CreateFileW(OPEN_EXISTING, GENERIC_READ)`
+with read/write/delete sharing and `FILE_ATTRIBUTE_NORMAL`. The same HANDLE supplies
+Basic, Standard and FileIdInfo, exact file bytes and EOF, then FileIdInfo again.
+Basic times and attributes match the captured seed; Standard matches logical EOF
+and the current 512-byte dense virtual allocation. The complete native volume/128-bit
+file-ID tuple is opaque: only repeat stability on this HANDLE is required, with no
+nonzero or numeric-equality rule tying it to NodeID. A cold result becomes successful
+only after the HANDLE, mapping, SMB server/export and HTTP connections close cleanly.
+The first error is retained without an alternate API, flag, reseed or retry.
+
+A bounded transparent SMB/HTTP observer requires a fresh current CREATE and READ
+bound to the seeded authority object. It validates SessionID/TreeID and related
+compound allocation lineage; unsupported async traffic is refused explicitly.
+Actual QUERY_INFO and QFid encodings are checked against their correlated backend
+identity only when observed. Native APIs may use captured CREATE metadata, so no
+missing wire query is manufactured. Backend NodeID, SMB open FileID, wire fields
+and opaque native identity remain separate observations. Tokens, keys and file
+contents are excluded from the trace; content verification records digests.
+
+SMB I/O is bounded at 64 KiB and frames at 128 KiB; HTTP bodies are 1 MiB.
+The shared native-result pool is 8 MiB with MaxOpens/MaxRequests still 16. It covers
+the 4,867,072-byte maximum of sixteen fixed Standard-state reservations; metadata
+admission must not consume the wire/data frame allowance. Exhaustion still refuses
+before effects. Unsupported commands/classes remain recorded first failures,
+not a reason to switch to the prototype or expand backend facts.
+
+The cold probe retains the existing 30-second execution watchdog and owned-child
+cleanup. Once child quiescence is confirmed, abnormal completion may invoke
+`current-smb-cleanup` sequence 2 against the same immutable seed and ledger.
+This has a separate total 30-second recovery budget, including the existing Job
+cleanup allowance. Unknown child quiescence blocks mapping recovery. The helper
+removes only an exact owned mapping, confirms absent rows/devices, and refuses a
+mismatch. Recovery preserves the original failed result. Ordinary success closes
+the native HANDLE, removes the mapping, calls Shutdown, joins Serve, Unpublishes
+the export, closes idle HTTP connections and verifies remote/local cleanup.
+
+This phase's native mapping and cold I/O have not yet run. It adds no notification
+manager, invalidation policy or production mapping API. The earlier qualified
+HTTP fixture pass does not supply the missing current-SMB or one-second evidence.
 
 ## Local Linux validation
 

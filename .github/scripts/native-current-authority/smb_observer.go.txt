@@ -1,0 +1,820 @@
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf16"
+
+	"github.com/codetreker/remote-fs/packages/transport/httprest"
+)
+
+const (
+	coldPhase        = "current-smb-cold"
+	coldCleanupPhase = "current-smb-cleanup"
+	coldTraceLimit   = 16 << 20
+	coldFrameLimit   = 2 << 20
+	coldHTTPLimit    = 1 << 20
+	coldRecordLimit  = 16 << 10
+)
+
+type coldHTTPRef struct{ node uint64 }
+type coldWireLineage struct {
+	messageID uint64
+	sessionID uint64
+	treeID    uint32
+	known     bool
+}
+type coldWireRequest struct {
+	command                  uint16
+	name                     string
+	file                     string
+	offset                   uint64
+	length                   uint32
+	info                     byte
+	class                    byte
+	related                  *uint64
+	lineage, responseLineage *coldWireLineage
+}
+type coldWireOpen struct {
+	name string
+	node uint64
+}
+type coldObserver struct {
+	mu           sync.Mutex
+	options      options
+	state        probeState
+	log          *os.File
+	written      int
+	first        error
+	closed       bool
+	nextConn     uint64
+	httpSessions map[string]bool
+	httpRefs     map[string]coldHTTPRef
+	httpOpen     bool
+	httpRead     bool
+	smbSession   bool
+	smbTree      bool
+	smbOpen      bool
+	smbRead      bool
+	connections  []*coldWireConnection
+}
+
+func newColdObserver(o options, state probeState) (*coldObserver, error) {
+	if state.RunID != o.RunID || state.SourceSHA != o.SourceSHA || state.FixtureNonce != o.FixtureNonce || state.Volume != o.Volume || state.Reference.Attr.ID == 0 || digest(state.Content) != state.ContentSHA256 {
+		return nil, errors.New("cold observation state differs from the bound probe")
+	}
+	if err := checkStateDirectory(o.StateFile); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(filepath.Dir(o.StateFile), "cold-observations.jsonl")
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := makePrivateFile(path); err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
+	return &coldObserver{options: o, state: state, log: file, httpSessions: make(map[string]bool), httpRefs: make(map[string]coldHTTPRef)}, nil
+}
+
+func (o *coldObserver) failLocked(err error) error {
+	if err != nil && o.first == nil {
+		o.first = err
+	}
+	return err
+}
+func (o *coldObserver) recordLocked(event map[string]any) error {
+	if o.closed {
+		return o.failLocked(errors.New("cold observer is closed"))
+	}
+	data, err := json.Marshal(map[string]any{"run_id": o.options.RunID, "source_sha": o.options.SourceSHA,
+		"fixture_nonce": o.options.FixtureNonce, "at": time.Now().UTC(), "event": event})
+	if err != nil {
+		return o.failLocked(err)
+	}
+	if len(data)+1 > coldRecordLimit || o.written > coldTraceLimit-len(data)-1 {
+		return o.failLocked(errors.New("cold observation output exceeded its bound"))
+	}
+	data = append(data, '\n')
+	n, err := o.log.Write(data)
+	o.written += n
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	return o.failLocked(err)
+}
+func (o *coldObserver) Record(event map[string]any) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.recordLocked(event)
+}
+func (o *coldObserver) Close() error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.closed {
+		o.closed = true
+		o.failLocked(errors.Join(o.log.Sync(), o.log.Close()))
+	}
+	return o.first
+}
+func (o *coldObserver) Validate() error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.first != nil {
+		return o.first
+	}
+	if !o.httpOpen || !o.httpRead || !o.smbSession || !o.smbTree || !o.smbOpen || !o.smbRead {
+		return errors.New("cold trace lacks current authentication/tree/retained open/read evidence")
+	}
+	if len(o.httpSessions) != 0 || len(o.httpRefs) != 0 {
+		return errors.New("cold trace lacks confirmed remote session/reference cleanup")
+	}
+	return nil
+}
+
+type coldHTTPTransport struct {
+	base http.RoundTripper
+	o    *coldObserver
+}
+type coldHTTPRequest struct {
+	Op      string                    `json:"op"`
+	Session string                    `json:"session"`
+	File    string                    `json:"file"`
+	Offset  int64                     `json:"offset"`
+	Length  int                       `json:"length"`
+	Child   *struct{ RawLeaf []byte } `json:"child"`
+}
+type coldHTTPResponse struct {
+	Session string         `json:"session"`
+	File    string         `json:"file"`
+	Retry   bool           `json:"retry"`
+	Attr    *httprest.Attr `json:"attr"`
+	Data    []byte         `json:"data"`
+}
+
+func (o *coldObserver) Transport(base http.RoundTripper) http.RoundTripper {
+	return &coldHTTPTransport{base: base, o: o}
+}
+func (t *coldHTTPTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if !strings.HasSuffix(request.URL.Path, "/file") && !strings.HasSuffix(request.URL.Path, "/file-control") {
+		return t.base.RoundTrip(request)
+	}
+	var captured coldHTTPRequest
+	var captureErr error
+	if request.GetBody == nil {
+		captureErr = errors.New("cold HTTP request does not provide a passive body copy")
+	} else {
+		body, err := request.GetBody()
+		if err != nil {
+			captureErr = err
+		} else {
+			data, readErr := io.ReadAll(io.LimitReader(body, coldHTTPLimit+1))
+			captureErr = errors.Join(readErr, body.Close())
+			if captureErr == nil && len(data) > coldHTTPLimit {
+				captureErr = errors.New("cold HTTP request exceeded observation bound")
+			}
+			if captureErr == nil {
+				captureErr = json.Unmarshal(data, &captured)
+			}
+		}
+	}
+	if len(captured.Session) > 256 || len(captured.File) > 256 {
+		captureErr = errors.New("cold HTTP capability identifier exceeded observation bound")
+	}
+	if captureErr != nil {
+		t.o.mu.Lock()
+		t.o.failLocked(captureErr)
+		t.o.mu.Unlock()
+	}
+	response, err := t.base.RoundTrip(request)
+	if err != nil {
+		t.o.Record(map[string]any{"kind": "http", "op": captured.Op, "transport_error": err.Error()})
+		return response, err
+	}
+	if response.Body == nil {
+		t.o.mu.Lock()
+		t.o.failLocked(errors.New("cold HTTP response has no body"))
+		t.o.mu.Unlock()
+		return response, nil
+	}
+	response.Body = &coldHTTPBody{ReadCloser: response.Body, observer: t.o, request: captured, status: response.StatusCode}
+	return response, nil
+}
+
+type coldHTTPBody struct {
+	io.ReadCloser
+	mu       sync.Mutex
+	observer *coldObserver
+	request  coldHTTPRequest
+	status   int
+	data     []byte
+	eof      bool
+	failed   bool
+	once     sync.Once
+}
+
+func (b *coldHTTPBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.mu.Lock()
+	if !b.failed {
+		if len(b.data) > coldHTTPLimit-n {
+			b.failed = true
+		} else {
+			b.data = append(b.data, p[:n]...)
+		}
+	}
+	if err == io.EOF {
+		b.eof = true
+	}
+	if err != nil && err != io.EOF {
+		b.failed = true
+	}
+	b.mu.Unlock()
+	if err != nil {
+		b.observe()
+	}
+	return n, err
+}
+func (b *coldHTTPBody) Close() error {
+	err := b.ReadCloser.Close()
+	if err != nil {
+		b.observer.mu.Lock()
+		b.observer.failLocked(fmt.Errorf("cold HTTP response close: %w", err))
+		b.observer.mu.Unlock()
+	}
+	b.mu.Lock()
+	b.failed = b.failed || err != nil
+	b.mu.Unlock()
+	b.observe()
+	return err
+}
+func (b *coldHTTPBody) observe() {
+	b.once.Do(func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if b.failed || !b.eof {
+			b.observer.mu.Lock()
+			b.observer.failLocked(errors.New("cold HTTP response observation was incomplete or oversized"))
+			b.observer.mu.Unlock()
+			return
+		}
+		b.observer.observeHTTP(b.request, b.status, b.data)
+	})
+}
+
+func (o *coldObserver) observeHTTP(request coldHTTPRequest, status int, data []byte) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	event := map[string]any{"kind": "http", "op": request.Op, "status": status}
+	defer func() { o.recordLocked(event) }()
+	if status != http.StatusOK {
+		return
+	}
+	var response coldHTTPResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		o.failLocked(err)
+		return
+	}
+	if len(response.Session) > 256 || len(response.File) > 256 {
+		o.failLocked(errors.New("cold HTTP response identifier exceeded observation bound"))
+		return
+	}
+	key := request.Session + "\x00" + request.File
+	if response.Retry {
+		event["same_action_retry"] = true
+		return
+	}
+	switch request.Op {
+	case "file.session-open":
+		if response.Session == "" || len(o.httpSessions) >= 32 {
+			o.failLocked(errors.New("cold HTTP session observation is absent or exceeds its bound"))
+			return
+		}
+		o.httpSessions[response.Session] = true
+	case "file.open-at", "file.open-node-ref", "file.open-child-ref":
+		if response.File == "" || response.Attr == nil || response.Attr.ID == 0 || len(o.httpRefs) >= 256 {
+			o.failLocked(errors.New("cold HTTP reference observation is absent or exceeds its bound"))
+			return
+		}
+		key = request.Session + "\x00" + response.File
+		o.httpRefs[key] = coldHTTPRef{response.Attr.ID}
+		event["backend_node_id"] = response.Attr.ID
+		if request.Child != nil && string(request.Child.RawLeaf) == o.state.SentinelName {
+			if response.Attr.ID != o.state.Reference.Attr.ID {
+				o.failLocked(errors.New("cold HTTP open returned another sentinel identity"))
+				return
+			}
+			o.httpOpen = true
+		}
+	case "file.read":
+		ref, found := o.httpRefs[key]
+		if !found || response.Attr == nil || response.Attr.ID != ref.node {
+			o.failLocked(errors.New("cold HTTP read is not bound to an observed retained reference"))
+			return
+		}
+		event["backend_node_id"], event["offset"], event["count"] = ref.node, request.Offset, len(response.Data)
+		event["digest"] = digest(response.Data)
+		if ref.node == o.state.Reference.Attr.ID {
+			if request.Offset < 0 || request.Length < 0 {
+				o.failLocked(errors.New("cold HTTP range has negative bounds"))
+				return
+			}
+			start := min(uint64(request.Offset), uint64(len(o.state.Content)))
+			length := min(uint64(request.Length), uint64(len(o.state.Content))-start)
+			if !bytes.Equal(response.Data, o.state.Content[start:start+length]) || sameAttr(response.Attr.Storage(), o.state.Reference.Attr) != nil {
+				o.failLocked(errors.New("cold HTTP read differs from the authoritative sentinel"))
+				return
+			}
+			if len(response.Data) > 0 {
+				o.httpRead = true
+			}
+		}
+	case "file.close":
+		delete(o.httpRefs, key)
+	case "file.session-close":
+		delete(o.httpSessions, request.Session)
+		for key := range o.httpRefs {
+			if strings.HasPrefix(key, request.Session+"\x00") {
+				delete(o.httpRefs, key)
+			}
+		}
+	}
+}
+
+func coldField(packet []byte, offset, size uint32, minimum int) ([]byte, error) {
+	if size == 0 {
+		return nil, nil
+	}
+	if uint64(offset) < uint64(minimum) || uint64(offset)+uint64(size) > uint64(len(packet)) {
+		return nil, errors.New("cold SMB field is outside its packet")
+	}
+	return packet[offset : offset+size], nil
+}
+func coldName(data []byte) (string, error) {
+	if len(data)%2 != 0 || len(data) > 4096 {
+		return "", errors.New("cold SMB name has invalid UTF-16 length")
+	}
+	units := make([]uint16, len(data)/2)
+	for i := range units {
+		units[i] = binary.LittleEndian.Uint16(data[i*2:])
+	}
+	for i := 0; i < len(units); i++ {
+		if units[i] >= 0xd800 && units[i] <= 0xdbff {
+			i++
+			if i == len(units) || units[i] < 0xdc00 || units[i] > 0xdfff {
+				return "", errors.New("cold SMB name has an unpaired surrogate")
+			}
+		} else if units[i] >= 0xdc00 && units[i] <= 0xdfff {
+			return "", errors.New("cold SMB name has an unpaired surrogate")
+		}
+	}
+	return string(utf16.Decode(units)), nil
+}
+
+func (c *coldWireConnection) frame(frame []byte, out bool) error {
+	if len(frame) >= 5 && string(frame[:4]) == "\xffSMB" {
+		if !out && frame[4] == 0x72 {
+			c.pending[0] = coldWireRequest{command: 0, lineage: &coldWireLineage{known: true}, responseLineage: &coldWireLineage{}}
+		}
+		return c.observer.recordLocked(map[string]any{"kind": "smb", "connection": c.id, "response": out, "bootstrap": true})
+	}
+	var inheritedFile string
+	var inheritedCreate *uint64
+	var inheritedLineage *coldWireLineage
+	for commands := 0; ; commands++ {
+		if commands >= 32 || len(frame) < 64 || string(frame[:4]) != "\xfeSMB" || binary.LittleEndian.Uint16(frame[4:]) != 64 {
+			return errors.New("cold SMB header or compound count is invalid")
+		}
+		next := binary.LittleEndian.Uint32(frame[20:])
+		packet := frame
+		if next != 0 {
+			if next < 64 || next&7 != 0 || uint64(next)+64 > uint64(len(frame)) {
+				return errors.New("cold SMB compound offset is invalid")
+			}
+			packet = frame[:next]
+		}
+		command := binary.LittleEndian.Uint16(packet[12:])
+		message := binary.LittleEndian.Uint64(packet[24:])
+		flags := binary.LittleEndian.Uint32(packet[16:])
+		if (flags&1 != 0) != out {
+			return errors.New("cold SMB direction flag differs from transport direction")
+		}
+		event := map[string]any{"kind": "smb", "connection": c.id, "response": out,
+			"command": command, "message_id": message, "status": binary.LittleEndian.Uint32(packet[8:]),
+			"flags": flags, "session_id": binary.LittleEndian.Uint64(packet[40:])}
+		fail := func(err error) error {
+			c.observer.failLocked(err)
+			event["observation_error"] = err.Error()
+			return errors.Join(err, c.observer.recordLocked(event))
+		}
+		if flags&2 != 0 {
+			event["async_id"] = binary.LittleEndian.Uint64(packet[32:40])
+			return fail(errors.New("cold SMB asynchronous traffic has no supported identity binding"))
+		}
+		if out && binary.LittleEndian.Uint32(packet[8:]) == 0x103 {
+			return fail(errors.New("cold SMB pending response has no supported asynchronous observation"))
+		}
+		event["tree_id"] = binary.LittleEndian.Uint32(packet[36:40])
+		var err error
+		if out {
+			err = c.response(packet, event)
+		} else {
+			var lineage *coldWireLineage
+			if flags&4 == 0 {
+				inheritedFile, inheritedCreate = "", nil
+				lineage = &coldWireLineage{sessionID: binary.LittleEndian.Uint64(packet[40:]), treeID: binary.LittleEndian.Uint32(packet[36:]), known: true}
+			} else {
+				if inheritedLineage == nil {
+					return fail(errors.New("cold related request has no preceding lineage"))
+				}
+				lineage = inheritedLineage
+				event["lineage_from_message_id"] = lineage.messageID
+			}
+			err = c.request(packet, inheritedFile, inheritedCreate, lineage, event)
+			inheritedLineage = nil
+			if command == 12 {
+				inheritedFile, inheritedCreate = "", nil
+			} else if r, ok := c.pending[message]; ok {
+				inheritedLineage = r.responseLineage
+				if command == 5 {
+					id := message
+					inheritedFile, inheritedCreate = "", &id
+				} else if r.file != "" || r.related != nil {
+					inheritedFile, inheritedCreate = r.file, r.related
+				}
+			}
+		}
+		if err != nil {
+			return fail(err)
+		}
+		if err := c.observer.recordLocked(event); err != nil {
+			return err
+		}
+		if next == 0 {
+			return nil
+		}
+		frame = frame[next:]
+	}
+}
+
+func (c *coldWireConnection) request(packet []byte, inheritedFile string, inheritedCreate *uint64, lineage *coldWireLineage, event map[string]any) error {
+	command, message := binary.LittleEndian.Uint16(packet[12:]), binary.LittleEndian.Uint64(packet[24:])
+	if command == 12 {
+		return nil
+	}
+	if len(c.pending) >= 256 {
+		return errors.New("cold SMB pending observation exceeded its bound")
+	}
+	if _, duplicate := c.pending[message]; duplicate {
+		return errors.New("cold SMB message identifier was reused before its response")
+	}
+	r := coldWireRequest{command: command, lineage: lineage, responseLineage: &coldWireLineage{messageID: message}}
+	body := packet[64:]
+	fileAt := -1
+	switch command {
+	case 5:
+		if len(body) < 56 {
+			return errors.New("cold CREATE request is truncated")
+		}
+		data, err := coldField(packet, uint32(binary.LittleEndian.Uint16(body[44:])), uint32(binary.LittleEndian.Uint16(body[46:])), 120)
+		if err != nil {
+			return err
+		}
+		r.name, err = coldName(data)
+		if err != nil {
+			return err
+		}
+		event["name"] = r.name
+	case 6, 7:
+		fileAt = 8
+	case 8:
+		if len(body) < 48 {
+			return errors.New("cold READ request is truncated")
+		}
+		r.length, r.offset = binary.LittleEndian.Uint32(body[4:]), binary.LittleEndian.Uint64(body[8:])
+		fileAt = 16
+		event["offset"], event["length"] = r.offset, r.length
+	case 16:
+		if len(body) < 40 {
+			return errors.New("cold QUERY_INFO request is truncated")
+		}
+		r.info, r.class = body[2], body[3]
+		fileAt = 24
+		event["query_type"], event["query_class"] = r.info, r.class
+	}
+	if fileAt >= 0 {
+		if len(body) < fileAt+16 {
+			return errors.New("cold SMB retained-open identifier is truncated")
+		}
+		r.file = hex.EncodeToString(body[fileAt : fileAt+16])
+		event["smb_open_file_id"] = r.file
+		if binary.LittleEndian.Uint32(packet[16:])&4 != 0 {
+			if inheritedFile == "" && inheritedCreate == nil {
+				return errors.New("cold related command has no inherited open identity")
+			}
+			r.file, r.related = inheritedFile, inheritedCreate
+		}
+	}
+	c.pending[message] = r
+	return nil
+}
+
+type coldListener struct {
+	net.Listener
+	observer *coldObserver
+}
+
+func (o *coldObserver) Listener(listener net.Listener) net.Listener {
+	return &coldListener{listener, o}
+}
+func (l *coldListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	o := l.observer
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if len(o.connections) >= 16 {
+		o.failLocked(errors.New("cold SMB connection observation exceeded its bound"))
+		return conn, nil
+	}
+	o.nextConn++
+	c := &coldWireConnection{Conn: conn, observer: o, id: o.nextConn,
+		pending: make(map[uint64]coldWireRequest), opens: make(map[string]coldWireOpen), resolved: make(map[uint64]string)}
+	o.connections = append(o.connections, c)
+	return c, nil
+}
+
+type coldWireConnection struct {
+	net.Conn
+	observer *coldObserver
+	id       uint64
+	input    []byte
+	output   []byte
+	pending  map[uint64]coldWireRequest
+	opens    map[string]coldWireOpen
+	resolved map[uint64]string
+}
+
+func (c *coldWireConnection) Read(data []byte) (int, error) {
+	n, err := c.Conn.Read(data)
+	c.feed(false, data[:n], err)
+	return n, err
+}
+func (c *coldWireConnection) Write(data []byte) (int, error) {
+	n, err := c.Conn.Write(data)
+	c.feed(true, data[:n], err)
+	return n, err
+}
+func (c *coldWireConnection) Close() error {
+	err := c.Conn.Close()
+	o := c.observer
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if len(c.input) != 0 || len(c.output) != 0 {
+		o.failLocked(errors.New("cold SMB stream ended inside a frame"))
+	}
+	o.recordLocked(map[string]any{"kind": "smb-connection-close", "connection": c.id, "unanswered": len(c.pending)})
+	return err
+}
+func (c *coldWireConnection) feed(out bool, data []byte, streamErr error) {
+	o := c.observer
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.first != nil {
+		return
+	}
+	buffer := &c.input
+	if out {
+		buffer = &c.output
+	}
+	if len(data) > coldFrameLimit+4-len(*buffer) {
+		o.failLocked(errors.New("cold SMB buffered frame exceeded its bound"))
+		return
+	}
+	*buffer = append(*buffer, data...)
+	for len(*buffer) >= 4 {
+		header := *buffer
+		size := int(header[1])<<16 | int(header[2])<<8 | int(header[3])
+		if header[0] != 0 || size < 4 || size > coldFrameLimit {
+			o.failLocked(errors.New("cold SMB transport frame is invalid or oversized"))
+			return
+		}
+		if len(*buffer) < size+4 {
+			break
+		}
+		if err := c.frame((*buffer)[4:size+4], out); err != nil {
+			o.failLocked(err)
+			return
+		}
+		*buffer = (*buffer)[size+4:]
+	}
+	if streamErr == io.EOF && len(*buffer) != 0 {
+		o.failLocked(errors.New("cold SMB stream reached EOF inside a frame"))
+	}
+}
+
+func coldOpenKey(lineage *coldWireLineage, file string) string {
+	return fmt.Sprintf("%d/%d/%s", lineage.sessionID, lineage.treeID, file)
+}
+
+func (r coldWireRequest) bindResponseLineage(packet []byte, event map[string]any) error {
+	if r.lineage == nil || !r.lineage.known || r.responseLineage == nil {
+		return errors.New("cold SMB response precedes its effective request lineage")
+	}
+	session, tree, status := binary.LittleEndian.Uint64(packet[40:]), binary.LittleEndian.Uint32(packet[36:]), binary.LittleEndian.Uint32(packet[8:])
+	expected := r.lineage
+	event["request_session_id"], event["request_tree_id"] = expected.sessionID, expected.treeID
+	if r.command == 1 && expected.sessionID == 0 {
+		// Initial authentication can assign a session before returning an authentication error.
+		if (status == 0 || status == 0xc0000016) && session == 0 {
+			return errors.New("cold SESSION_SETUP did not allocate a session identity")
+		}
+	} else if session != expected.sessionID {
+		return errors.New("cold SMB response SessionID differs from its effective request")
+	}
+	if r.command == 3 && status == 0 {
+		if tree == 0 {
+			return errors.New("cold TREE_CONNECT did not allocate a tree identity")
+		}
+	} else if tree != expected.treeID {
+		return errors.New("cold SMB response TreeID differs from its effective request")
+	}
+	// Related requests inherit validated response headers, including newly allocated IDs.
+	r.responseLineage.sessionID, r.responseLineage.treeID, r.responseLineage.known = session, tree, true
+	return nil
+}
+func (c *coldWireConnection) response(packet []byte, event map[string]any) error {
+	command, message := binary.LittleEndian.Uint16(packet[12:]), binary.LittleEndian.Uint64(packet[24:])
+	status := binary.LittleEndian.Uint32(packet[8:])
+	r, found := c.pending[message]
+	if !found || r.command != command {
+		return errors.New("cold SMB response has no matching observed command")
+	}
+	if err := r.bindResponseLineage(packet, event); err != nil {
+		return err
+	}
+	delete(c.pending, message)
+	if command == 16 {
+		event["query_type"], event["query_class"] = r.info, r.class
+	}
+	if status != 0 {
+		return nil
+	}
+	o, body := c.observer, packet[64:]
+	key := coldOpenKey(r.responseLineage, r.file)
+	if r.related != nil {
+		var ok bool
+		key, ok = c.resolved[*r.related]
+		if !ok {
+			return errors.New("cold related response lacks the captured CREATE identity")
+		}
+	}
+	opened, hasOpen := c.opens[key]
+	switch command {
+	case 1:
+		if binary.LittleEndian.Uint64(packet[40:]) == 0 {
+			return errors.New("successful SMB authentication has no session identity")
+		}
+		o.smbSession = true
+	case 3:
+		if len(body) < 16 {
+			return errors.New("cold TREE_CONNECT response is truncated")
+		}
+		if body[2] == 1 {
+			o.smbTree = true
+		}
+	case 5:
+		if len(body) < 88 || len(c.opens) >= 256 || len(c.resolved) >= 256 {
+			return errors.New("cold CREATE response is truncated or exceeds its observation bound")
+		}
+		file := hex.EncodeToString(body[64:80])
+		key = coldOpenKey(r.responseLineage, file)
+		if _, exists := c.opens[key]; exists {
+			return errors.New("SMB reused an installed open identifier")
+		}
+		opened = coldWireOpen{name: r.name}
+		if r.name == o.state.SentinelName {
+			opened.node, o.smbOpen = o.state.Reference.Attr.ID, true
+		} else if r.name == "" {
+			opened.node = o.state.RootID
+		}
+		c.opens[key], c.resolved[message] = opened, key
+		event["name"], event["smb_open_file_id"] = r.name, file
+		if err := c.createContexts(packet, opened.node, event); err != nil {
+			return err
+		}
+	case 6:
+		if !hasOpen {
+			return errors.New("cold CLOSE response refers to an unobserved open")
+		}
+		delete(c.opens, key)
+	case 8:
+		if !hasOpen || len(body) < 16 {
+			return errors.New("cold READ response lacks its retained open or body")
+		}
+		data, err := coldField(packet, uint32(body[2]), binary.LittleEndian.Uint32(body[4:]), 80)
+		if err != nil {
+			return err
+		}
+		event["count"], event["digest"], event["offset"] = len(data), digest(data), r.offset
+		if opened.node == o.state.Reference.Attr.ID {
+			start := min(r.offset, uint64(len(o.state.Content)))
+			length := min(uint64(r.length), uint64(len(o.state.Content))-start)
+			if !bytes.Equal(data, o.state.Content[start:start+length]) {
+				return errors.New("cold SMB READ differs from the authoritative sentinel")
+			}
+			if len(data) > 0 {
+				o.smbRead = true
+			}
+		}
+	case 16:
+		if !hasOpen || len(body) < 8 {
+			return errors.New("cold QUERY_INFO response lacks its retained open or body")
+		}
+		data, err := coldField(packet, uint32(binary.LittleEndian.Uint16(body[2:])), binary.LittleEndian.Uint32(body[4:]), 72)
+		if err != nil {
+			return err
+		}
+		if r.info == 1 && (r.class == 6 || r.class == 59) && opened.node != 0 {
+			return o.wireIdentity(r.class, data, opened.node, event)
+		}
+	}
+	return nil
+}
+
+func (o *coldObserver) wireIdentity(class byte, data []byte, node uint64, event map[string]any) error {
+	if class == 6 {
+		if len(data) != 8 || binary.LittleEndian.Uint64(data) != node {
+			return errors.New("FileInternalInformation differs from the captured backend NodeID")
+		}
+		event["wire_internal_id"] = binary.LittleEndian.Uint64(data)
+		return nil
+	}
+	if class != 59 || len(data) != 24 {
+		return errors.New("FileIdInformation has an invalid wire length")
+	}
+	serial := sha256.Sum256([]byte("smb.volume-id.v1\x00" + o.options.Volume))
+	if binary.LittleEndian.Uint64(data) != binary.LittleEndian.Uint64(serial[:8]) || binary.LittleEndian.Uint64(data[8:]) != node || binary.LittleEndian.Uint64(data[16:]) != 0 {
+		return errors.New("FileIdInformation differs from the configured SMB wire projection")
+	}
+	event["wire_volume_serial"] = hex.EncodeToString(data[:8])
+	event["wire_file_id"] = hex.EncodeToString(data[8:])
+	return nil
+}
+
+func (c *coldWireConnection) createContexts(packet []byte, node uint64, event map[string]any) error {
+	body := packet[64:]
+	data, err := coldField(packet, binary.LittleEndian.Uint32(body[80:]), binary.LittleEndian.Uint32(body[84:]), 152)
+	if err != nil {
+		return err
+	}
+	for count := 0; len(data) > 0; count++ {
+		if count >= 16 || len(data) < 16 {
+			return errors.New("cold CREATE contexts exceed their observation bound")
+		}
+		next := binary.LittleEndian.Uint32(data)
+		end := len(data)
+		if next != 0 {
+			if next < 16 || next&7 != 0 || uint64(next)+16 > uint64(len(data)) {
+				return errors.New("cold CREATE context offset is invalid")
+			}
+			end = int(next)
+		}
+		name, err := coldField(data[:end], uint32(binary.LittleEndian.Uint16(data[4:])), uint32(binary.LittleEndian.Uint16(data[6:])), 16)
+		if err != nil {
+			return err
+		}
+		payload, err := coldField(data[:end], uint32(binary.LittleEndian.Uint16(data[10:])), binary.LittleEndian.Uint32(data[12:]), 16)
+		if err != nil {
+			return err
+		}
+		if string(name) == "QFid" && node != 0 {
+			serial := sha256.Sum256([]byte("smb.volume-id.v1\x00" + c.observer.options.Volume))
+			if len(payload) != 32 || binary.LittleEndian.Uint64(payload) != node || binary.LittleEndian.Uint64(payload[8:]) != binary.LittleEndian.Uint64(serial[:8]) || !bytes.Equal(payload[16:], make([]byte, 16)) {
+				return errors.New("QFid differs from the configured SMB wire projection")
+			}
+			event["wire_qfid_disk_id"] = binary.LittleEndian.Uint64(payload)
+			event["wire_qfid_volume_id"] = hex.EncodeToString(payload[8:16])
+		}
+		if next == 0 {
+			return nil
+		}
+		data = data[next:]
+	}
+	return nil
+}

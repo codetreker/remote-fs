@@ -10,7 +10,7 @@ Windows 系统客户端的验收需要实际接入当前 HTTP 与持久 authorit
 
 ## 决定
 
-[独立工作流](../../../../.github/workflows/native-current-authority.yml)把当前源码的 Linux authority 和 Windows HTTP 客户端放在同一项可核对的测试中。Ubuntu 构建固定 kernel、最小 initramfs、当前 server/helper 与私有 ext4 基底；Windows ARM64 作业使用固定的 native ARM64 QEMU bundle，经 TCG 运行同一 Linux AMD64 guest。生产 backend 不移植、不替换，当前 SMB 适配仍独立于这个准备工具。
+[独立工作流](../../../../.github/workflows/native-current-authority.yml)把当前源码的 Linux authority 和 Windows HTTP 客户端放在同一项可核对的测试中。Ubuntu 构建固定 kernel、最小 initramfs、当前 server/helper 与私有 ext4 基底；Windows ARM64 作业使用固定的 native ARM64 QEMU bundle，经 TCG 运行同一 Linux AMD64 guest。生产 backend 不移植、不替换；可选 cold 阶段组合当前 SMB/HTTP 代码与同一 authority，仍属于测试工具。
 
 [工具说明](../../../../.github/scripts/native-current-authority/README.md)拥有依赖 pin、装配命令和进程规则。Weil 11.1.0 ARM64 bundle 按固定大小/SHA-512 和完整提取树核对，QEMU/controller/probe 必须具有 ARM64 PE；qemu-system-x86_64 的名字表示 guest target，不是宿主架构。已检查 85 项 bundled PE 的 ARM64 import closure，publisher 的未测试标签仍保留，字节 hash 不被当作签名或可复现构建。bundle 只提取，installer 不执行；kernel package 不执行安装脚本。结构化源码发现只解码 stdout，stderr 的下载/诊断保持独立输出，命令失败仍传播；合法诊断不改变 JSON 输入。artifact 绑定输入 hash、源码与工具链；Windows 作业核对同一源码的 artifact，CI 的脏来源、缺失 verdict 或来源变化直接失败。依赖、缓存、临时磁盘与证据都留在 checkout 的 `.tmp`。
 
@@ -24,7 +24,15 @@ Windows serial 控制使用 controller 在启动前独占绑定的 `tcp4/127.0.0
 
 terminal serial reset 的合格条件独立于普通读错：必须已有带正确 run/source/nonce、phase/op/sequence 的 shutdown/4 成功 ACK 和 exit_code=0，原始串行 read 结果有独立的完整 LF 记录边界，并且 cause 是唯一的 10054 包裹链；join 的其它错误不能被掩盖。仅在等待这个最终 ACK 时，允许从已解析队列取回被 reset 先选中的 ACK；没有 queued ACK 不能以 reset、EOF、进程退出或 kernel 文本补造。随后在原剩余三十秒内等待自然零退出、全部 reader 完成且无其它错误，才将那个确切 serial 结果标为 qualified-reset 并保留 raw error，不改名为 EOF。缺失事实、尾部半帧、超时、非零退出、未知 Job 或强制清理仍失败，最后的磁盘/基底核对也不省略。
 
-HTTP readiness 使用真实 lease/FileSession，验证引用、原子打开、字节、metadata 条件、改名/移除后的引用身份和逻辑配额；保留 sentinel，停止 authority，再以同一磁盘普通重开，核对 sentinel 的身份、字节和 metadata 后删除它。此工具明确报告 native_acceptance 未运行；请求它代替 SMB/一秒验收会失败。
+HTTP readiness 使用真实 lease/FileSession，验证引用、原子打开、字节、metadata 条件、改名/移除后的引用身份和逻辑配额；保留 sentinel，停止 authority，再以同一磁盘普通重开，核对 sentinel 的身份、字节和 metadata 后删除它。此工具保留 native_acceptance 未运行这个更广的门禁；可选 cold 结果单独记录，require-native 不能把它升级为完整 SMB/一秒验收。
+
+当前源码的 cold 阶段由显式 -CurrentSMBCold 选择，工作流启用该选择，独立调用默认保持 HTTP-only。顺序是 create/1 留下并关闭 seed 引用，cold/2 以该不可变 seed 的 NodeID/epoch/nonce 通过当前 FileStorage 新建 SMB session，再执行 authority stop/2、start/3、reopen/2 与 shutdown/4。该 host 使用当前 SSPI/精确 SID 授权和独立 loopback SMB listener，不复用旧原型 dispatcher、Map 包或内存树。
+
+[映射拥有者](../../../../.github/scripts/native-current-authority/smb_mapping_windows.go.txt)在 New-SmbMapping 前落下私有 intent，核对当前 logon/SID、空闲盘符、唯一 share、TCP port、完整 SMB/DOS-device 基线；要求完整性，不保存凭据、不建立 persistent/global mapping。它不接管或删除既有映射。正常收尾关闭原生 HANDLE、精确映射、server/Serve/export 与 HTTP 空闲连接，并验证远端和本地清理；child 未确认停止时禁止恢复映射。cleanup/2 只接受同一个不可变 seed 和已记录绑定，另有总计三十秒（含原 Job 收尾）的恢复预算，恢复成功也保留首次 cold 失败。
+
+[原生 cold 观察](../../../../.github/scripts/native-current-authority/smb_probe_windows.go.txt)只对一个已知文件首次普通打开，在同一 HANDLE 上核对 Basic/Standard、字节/EOF 和两次 FileIdInfo。原生 volume/128-bit ID 是 opaque tuple，只要求同 HANDLE 稳定，不要求非零或数值等同 NodeID。NodeID、SMB FileID、实际 wire 字段分别记录；被动观察不补发缺失查询，严格核对 session/tree/related compound 归属并拒绝未支持的 async。这个单对象证明不覆盖唯一性、跨改名/替换、原生写入、目录、Explorer、断线或暖缓存。
+
+资源继续在现有 pool 中计量：cold 的 MaxOpens/MaxRequests 均为 16，8 MiB result pool 容纳十六份最坏 Standard-state 固定预留共 4,867,072 字节；64 KiB I/O、128 KiB frame 和 1 MiB HTTP body 分开约束。这样合法返回的 metadata 不被 frame 预算误拒绝，容量不足仍在效果前失败。cold 使用既有三十秒 probe watchdog，额外映射恢复不增加成功操作的等待或改变一秒可见性要求。
 
 ## 备选方案
 
@@ -44,8 +52,10 @@ HTTP readiness 使用真实 lease/FileSession，验证引用、原子打开、�
 
 ## 后果
 
-本地 Linux TCG 已完成一次真实 guest/readiness/普通重启/关闭，私有磁盘删除、基底和输入保持不变。该本地 artifact 明确记录脏源码来源，不能充当随后 CI commit 的收据。[socket 运行 35427363909](https://github.com/codetreker/remote-fs/actions/runs/35427363909)绑定源码 `b2a6da9b0971e549382f7a1c457d5d855c96a110` 与实际 image，controller 39 根/163 verdict、probe 8 根/63 verdict 和路径 guard 十二项通过。已验证 native socket peer 归属、真实 HTTP 创建、停止/重启 authority 后同一 NodeID=3 与新 epoch；精确 shutdown/4 ACK、ext4 unmount 和 kernel power-down 也被观察。serial 的 WSAECONNRESET 先于 QEMU 退出确认到达，controller 触发了强制结束，所以自然退出及完整生命周期仍未证明。私有磁盘删除、基底不变不修复失败资格；该原始结果保持失败。terminal 修正的普通/race 各 31 根/117 verdict 通过，恢复原立即报错次序的对照在最终 ACK 丢失断言失败，ARM64 构建及 Linux/Windows vet 通过；修正后的原生生命周期仍未执行。SMB/缓存与一秒验收未由此通过。
+本地 Linux TCG 已完成一次真实 guest/readiness/普通重启/关闭，私有磁盘删除、基底和输入保持不变。该本地 artifact 明确记录脏源码来源，不能充当随后 CI commit 的收据。[terminal 修正后的原生运行 35430629381](https://github.com/codetreker/remote-fs/actions/runs/35430629381)绑定源码 `31817a904fa42896b47ce5eb64e40cbe8be73e90`，核对 221 项源码输入、16 项 image 产物和 QEMU package；controller 46 根/191 verdict、probe 8 根/63 verdict 与十二项路径检查通过。实际 owned socket、真实 HTTP 创建和普通重开后同一 NodeID=3/新 epoch 已成立；精确 shutdown/4 ACK 后取得自然 QEMU exit 0、完整记录边界的 qualified-reset、非 forced 的空 Job，以及私有磁盘删除/基底不变，HTTP fixture 生命周期完整通过。原始 10054 仍在 serial_error 中，不伪装 EOF。[先前 b2 的强制结束](https://github.com/codetreker/remote-fs/actions/runs/35427363909)仍保持失败。这个通过只属于上述 HTTP fixture；新的当前 SMB 映射/cold 阶段尚未原生执行，缓存与一秒验收也没有由它完成。
 
 隐藏 Go 模板通过显式测试入口运行，不依赖普通模块发现。已有 Linux 模板普通验证为 36 根、176 个通过 verdict；guest/probe/controller 的普通与 race 各有 87/63/26 个通过 verdict，Python 装配/拥有权/checker 用例共 26 根。Job rundown 的三个 AST 提取测试根普通/race 各 11 个通过 verdict，恢复立即强制清理决策的对照在正常退出后计数收齐的断言失败；vet 和 Windows AMD64/ARM64 构建通过。这些局部检查与上述 native helper 收据分开，不能替代 guest 生命周期。各自验证错误、输出界限与清理，不把 mock、交叉构建或 Linux VM 成功称为 Windows 执行。[路径回归](../../../../.github/scripts/native-current-authority/run_windows_test.ps1)直接抽取实际 guard AST，在 VM 前核对 provider/raw-parent 转换及拒绝路径；本地九项通过，旧 guard 的因果对照在父链缺少 PSIsContainer 处失败。Windows 的十二项运行包含三个 junction 场景；这个已观测的路径检查不证明后续 bootstrap 可用。native ARM64 包选择的 controller 普通/race 各 14 根/35 verdict、宿主架构反转对照、相关构建/vet、七项 Python 与九项本地 PowerShell 检查通过；它们与后续 native boot 收据分别计证据。具体执行入口见[测试策略](../../../../docs/testing.md#当前-authority-的独立运行环境)。
+
+current-SMB cold 的本地最终 helper 普通/race 各 83 根/432 verdict，可移植 mapping 控制 13 根/43 verdict；真实核心 pool 与错误 SID 的负向对照、Python/PowerShell source 检查及 Windows 构建/vet 均有独立收据。完整本地 artifact 的 265 项输入/16 项产物与冻结 README、源码一致，kernel/init/authority 字节保持原 F 组合；其 dirty=true 来源不当作未来 CI commit。这些验证供首次当前源码 Windows cold 运行使用，不补足尚缺的映射、单对象原生观察或暖缓存证据。
 
 维护成本包括 kernel/QEMU 固定输入、镜像生成、两作业 artifact 传递和宿主清理工具。boot 上限 120 秒，命令/probe 各 30 秒，输出与磁盘都有界；超限留下明确失败。磁盘使用正常 guest flush 的 writeback，普通重开证明已观察的同步持久路径，不宣称宿主断电或硬件缓存可靠性。完整平台接入仍由[Windows 提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)承接。

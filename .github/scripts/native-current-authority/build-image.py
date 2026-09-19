@@ -23,6 +23,35 @@ ROOT = Path(__file__).resolve().parents[3]
 TOOLS = Path(__file__).resolve().parent
 PINS = json.loads((TOOLS / "inputs.json").read_text())
 
+PROBE_COMMON = ("probe.go", "smb_observer.go")
+PROBE_PLATFORM = {
+    "linux": ("private_other.go", "smb_probe_other.go"),
+    "windows": ("private_windows.go", "smb_probe_windows.go", "smb_mapping_windows.go", "controller_windows.go"),
+}
+CLIENT_DEPENDENCIES = ("./packages/transport/httprest", "./packages/smb", "./packages/smb/windows")
+
+
+def probe_templates(os_name):
+    if os_name not in PROBE_PLATFORM:
+        raise ValueError("fixture probes support only Linux and Windows hosts")
+    return PROBE_COMMON + PROBE_PLATFORM[os_name]
+
+
+def unit_template_groups(os_name):
+    probe = probe_templates(os_name) + ("probe_test.go", "smb_observer_test.go")
+    platform = "windows" if os_name == "windows" else "other"
+    groups = {
+        "probe": probe,
+        "controller": ("controller.go", "controller_test.go", f"private_{platform}.go",
+                       "private_test.go", f"private_{platform}_test.go"),
+    }
+    if os_name == "windows":
+        groups["probe"] += ("smb_probe_windows_test.go", "smb_mapping_windows_test.go")
+        groups["controller"] += ("controller_windows.go", "controller_windows_test.go")
+    else:
+        groups["init"] = ("init_linux.go", "init_linux_test.go")
+    return groups
+
 
 def digest(path):
     h = hashlib.sha256()
@@ -150,9 +179,10 @@ def source_snapshot(package_directories=None):
 
 def dependency_directories(env):
     directories = set()
-    for os_name, targets in (("linux", ["./cmd/remote-fs-server"]), ("windows", ["./packages/transport/httprest"])):
+    for os_name, targets in (("linux", ("./cmd/remote-fs-server",)), ("windows", CLIENT_DEPENDENCIES)):
         arch = "arm64" if os_name == "windows" else "amd64"
         raw = command(["go", "list", "-deps", "-json", *targets], {**env, "GOOS": os_name, "GOARCH": arch}, capture=True)
+        selected = set()
         decoder, offset = json.JSONDecoder(), 0
         while offset < len(raw):
             package, used = decoder.raw_decode(raw[offset:])
@@ -165,9 +195,13 @@ def dependency_directories(env):
             relative = directory.relative_to(ROOT)
             if relative.parts and relative.parts[0] == ".tmp":
                 continue
-            directories.add(str(relative))
+            selected.add(str(relative))
             for embedded in package.get("EmbedFiles", []):
-                directories.add(str((relative / embedded).parent))
+                selected.add(str((relative / embedded).parent))
+        required = {target.removeprefix("./") for target in targets}
+        if missing := required - selected:
+            raise ValueError(f"{os_name} dependency inventory lacks requested packages: " + ", ".join(sorted(missing)))
+        directories.update(selected)
     if not directories:
         raise ValueError("current authority/client module dependency inventory is empty")
     return directories
@@ -242,12 +276,12 @@ def main():
     for arch in ("arm64", "amd64"):
         probe = output / f"host/probe-windows-{arch}.exe"
         controller = output / f"host/controller-windows-{arch}.exe"
-        compile_templates(work, probe, ["probe.go", "private_windows.go"], env, "windows", arch)
+        compile_templates(work, probe, probe_templates("windows"), env, "windows", arch)
         compile_templates(work, controller, ["controller.go", "controller_windows.go", "private_windows.go"], env, "windows", arch)
         binaries[f"probe_windows_{arch}"] = probe
         binaries[f"controller_windows_{arch}"] = controller
     probe = output / "host/probe-linux-amd64"
-    compile_templates(work, probe, ["probe.go", "private_other.go"], env, "linux", "amd64")
+    compile_templates(work, probe, probe_templates("linux"), env, "linux", "amd64")
     binaries["probe_linux_amd64"] = probe
     boot_token = hashlib.sha256((source_sha + digest(init) + digest(authority) + PINS["kernel"]["vmlinuz_sha256"]).encode()).hexdigest()
     config = json.dumps({"source_sha": source_sha, "boot_token": boot_token}, separators=(",", ":")).encode() + b"\n"

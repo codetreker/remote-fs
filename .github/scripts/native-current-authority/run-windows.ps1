@@ -2,6 +2,7 @@
 param(
     [Parameter(Mandatory = $true)][string] $ArtifactDirectory,
     [string] $RunId = ([Guid]::NewGuid().ToString('N')),
+    [switch] $CurrentSMBCold,
     [switch] $RequireNativeAcceptance
 )
 
@@ -117,7 +118,10 @@ try {
         Move-Item -LiteralPath $extract -Destination $package
     }
     Assert-NoReparse $package
-    & $controller -repo-root $repo -artifact-dir $artifact -package-dir $package -source-sha $sourceSha -source-tree-sha $treeSha -run-id $RunId
+    $controllerArguments = @('-repo-root', $repo, '-artifact-dir', $artifact, '-package-dir', $package,
+        '-source-sha', $sourceSha, '-source-tree-sha', $treeSha, '-run-id', $RunId)
+    if ($CurrentSMBCold) { $controllerArguments += '-current-smb-cold' }
+    & $controller @controllerArguments
     if ($LASTEXITCODE -ne 0) { throw "Fixture controller failed with exit code $LASTEXITCODE." }
  } catch {
     [ordered]@{ run_id = $RunId; source_sha = $sourceSha; phase = 'windows-bootstrap'; subsystem = 'fixture-packaging'; category = 'failure'; cause = $_.Exception.Message; native_acceptance = 'not-run' } |
