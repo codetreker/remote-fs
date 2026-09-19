@@ -426,6 +426,18 @@ owned_rescan 必须从实际捕获的 SMB Command 15 请求及同一 MessageID �
 
 这些监听拥有者和受控间隔属于固定原型中的测试夹具，不定义生产 ManagedShare API。实际交付的 package、transport 和 backend 仍须独立验收目录、属性、改名、删除、已打开引用与故障；固定内存 authority 不证明 SQLite 持久性、全部 Windows 行为或历史时间投影。某个 variant 的成功不能扩大成其它 variant 或新实现通过，原生可行性门禁只按实际运行证据关闭。
 
+### 祖先目录通知与属性失效实验
+
+[独立工作流](../.github/workflows/native-smb-parent-invalidation.yml)通过[运行脚本](../.github/scripts/native-smb-parent-invalidation.ps1)执行 `TestNativeParentInvalidation`。它只由自身三个文件的 Pull Request opened/synchronize 变更触发，以单个十五分钟 Windows 11 24H2+ ARM64 作业运行；原十八个诊断作业保持独立。临时检出仍固定为上述原型，依次核对并应用通知连续性、最终缺失状态与 NoLeasing overlay，记录规范输入、补丁及输出 hash。这个执行对象不包含当前生产端点或新的文件适配。
+
+[探针](../.github/scripts/native-smb-parent-invalidation_test.go.txt)使用真实 share 根及其真实子目录 `v`，在父目录保持递归监听，在 `v` 保持应用 LIST 句柄；这只模拟额外父目录的几何关系。四个独立 share/connection cell 覆盖应用 ShareAccess=0/6 与 watcher-first/app-first，另有一个 ShareAccess=0 的 noWatcher 对照。实际 CREATE/CHANGE_NOTIFY 必须证明父、子、目标来自同一连接和 session，应用 mask 与当前 Pending 均须核对；任一打开顺序的共享拒绝不能当作通过。无监听对照不证明 ShareAccess=6 的因果关系。
+
+每项先以真实 HTTP 准备 257 字节及旧 mtime，再两次暖 GetFileAttributesExW；保留引用的 HTTP WriteAt 增长到 769 字节，其已完成收据提供期望身份、大小、时间和 ACK。从写入开始到唯一的首次属性查询，native-call ledger 禁止 harness 额外访问目标或祖先及提前查询 oracle，只允许等待已有通知。监听样本须同时取得当前请求的 wire 与原生 `FILE_ACTION_MODIFIED v\target`。自动 redirector 刷新可以发生在 HTTP ACK 返回或首次 API 之前；新 tuple 的目标响应必须与通知、连接及请求精确关联，分别记录 `refreshed_before_first_api` 与 `refreshed_by_first_api`，来源不清则为 inconclusive。首次查询完成仍须在 ACK 后一秒内，包含通知等待，并早于最早实际曝光的原缓存到期；不以 wire 静默排除合法自动刷新。
+
+首值保持不可变，后置 HTTP oracle、完整轨迹、原策略及清理均为证据资格。合格的 watched 旧首值使候选测试失败，但一秒内的旧样本不是超过一秒的违约证明；noWatcher 的合格旧值或新值只作观察，均不证明一秒保证。溢出、丢明细、无法关联或资源残留不得变成成功；取消 overlapped 通知必须等待完成再释放缓冲。三个解析/关联/资格测试根必须先于原生根通过，协议补丁的具名回归也不能缺失；所有测试使用 `-count=1`、三分钟上限并严格检查 fail/skip/verdict，产物保存十四天。
+
+本地已核对 PowerShell 解析、精确准备及拒绝改动基底的负向对照、actionlint；从探针提取的三个可移植测试根在普通/race 各取得 39 pass，使用限定的 Windows 常量/Filetime shim。两个完整 Windows ARM64 测试 binary 已构建。这些检查不执行 Windows 重定向器；祖先通知的原生可行性尚未观察，生产父目录布局、映射、名字/身份与故障行为仍需各自证明。
+
 ## 每次改动必须带什么
 
 **任何非平凡改动都要在同一次改动里新增或更新测试。** 判据与 Agent Note 相同。
