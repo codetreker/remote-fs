@@ -132,10 +132,16 @@ func TestAuthorityGlobalActionHistoryRejectsBeforeChangingState(t *testing.T) {
 func TestAuthorityResourceCapacityRecoversAfterReferenceExpiry(t *testing.T) {
 	h := newContractHarness(t, func(o *locking.Options, _ *contractPersistence) { o.MaxResources = 1 })
 	owner := h.owner()
+	registered, releaseTimer := h.clock.holdTimer(h.clock.Now().Add(time.Minute))
+	t.Cleanup(releaseTimer)
 	old := h.resource(owner, "a")
 	_, err := h.a.Resolve(context.Background(), owner, "b")
 	contractCode(t, err, locking.Capacity)
+	// The manual clock stays frozen after this advance, so the expiry timer
+	// must already be registered rather than started from the advanced time.
+	contractAwait(t, registered)
 	h.clock.advance(time.Minute)
+	releaseTimer()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		_, err = h.a.Resolve(context.Background(), owner, "b")
