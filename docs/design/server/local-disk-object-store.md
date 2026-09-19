@@ -132,7 +132,11 @@ SQLite writer 使用 WAL、单 writer connection、`BEGIN IMMEDIATE`、`synchron
 
 普通读取先在 database health 的共享门内检查 authority 健康状态，启动只读 transaction，并用对 `database_state` 的第一条常量查询钉住 SQLite snapshot；随后释放 health 门，再执行路径扫描、page production 与 caller-owned result accounting。最终发布从权限判定到 commit、witness 或失败隔离结束期间阻止新的 snapshot capture；已经捕获的旧 snapshot 可以继续完成。对象读取在该 snapshot 中取得 node、size 与不可变 object key，再在门外取得 payload。长扫描、payload I/O 和调用方预算回调不会继续阻挡 mutation 的 commit/Accept 边界。
 
-只读 transaction 使用其拥有的 context 解释查询与回滚结果。纯取消保留原因并返回 `EINTR`；该 context 已取消时，直接的 `sql.ErrTxDone` 可表示 `database/sql` 已自动回滚，包括回调成功后才发生的取消。SQLite `SQLITE_INTERRUPT` 只在读取 context 确已取消时映射为取消；deadline、真实查询或独立 cleanup 故障仍是错误。未知 commit 与 poison 拥有 `EIO` 分类，不因保留的 context 原因改成 `EINTR`。该规则也用于 client 的 SQLite replica，取舍见[请求中断](../../../.agents/notes/implemented/bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)。
+普通读取、snapshot、mutation 和 Replica Apply/Seeding 的 transaction 显式取得所属 reader/writer pool 的 `sql.Conn`，沿用各操作既定的 transaction context；私有拥有者保留连接直到统一收尾。无论已经 Commit 还是中止，收尾都调用 `Tx.Rollback`，再对绑定的 `Conn.Close` 执行一次并等待连接归还，保留该次关闭错误；BeginTx 失败也关闭已取得的连接。`database/sql` 自动回滚先标记 transaction 已结束，直接 `sql.ErrTxDone` 本身不代表连接已归还。清理不屏蔽原有取消、不轮询 pool 状态，也不重试事务或关闭。
+
+mutation 和 Replica 的连接收尾在释放 health/commit/Replica 门之前完成；读结果和 Seeding 的完成/中止也不能越过自己的连接归还。启动 schema Prepare 同样显式取得连接、以原 context BeginTx，并在准备成功或失败返回前完成 Rollback 与绑定 Conn.Close；BeginTx 失败仍关闭连接。准备清理只有在连接关闭成功时才接受直接 ErrTxDone，其余 cleanup 原因保留为 durability failure，不能覆盖已有未知 commit。事务清理失败继续由既有隔离与 poison 规则处理，不因 transaction 已标记结束就释放数据库原生所有权。成功 Commit、见证发布、snapshot capture 的原有顺序、迁移 SQL 与结果分类保持。
+
+只读 transaction 使用其拥有的 context 解释查询与回滚结果。只有连接关闭成功后保留的直接 `sql.ErrTxDone`，且该 context 已取消，才可按自动回滚处理，包括回调成功后才发生的取消。纯取消保留原因并返回 `EINTR`；deadline、真实查询或独立 cleanup 故障保持 `EIO`。连接关闭的错误单独保留为 cleanup failure，即使它包含 context 原因或 `ErrConnDone` 也不能被取消覆盖。SQLite `SQLITE_INTERRUPT` 只在读取 context 确已取消时映射为取消。未知 commit 与 poison 的 `EIO` 分类不因保留 context 原因改变。该规则也用于 client 的 SQLite replica，取舍见[请求中断](../../../.agents/notes/implemented/bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)。
 
 `METASTORE` 是 SQLite WAL 之外的确认边界。它记录完整的已接受状态 A：数据库 identity、generation、node high-water 与 change high-water，并另记已经完整进入主数据库的 checkpoint generation C，始终满足 `0 <= C <= A.generation`。每次 durable open 或 mutation 先提交 SQLite，再用 `.METASTORE.stage` 写入并同步下一份 A，以 rename 原子替换 `METASTORE`，最后同步 root；见证发布完成后调用才可返回成功。A/C 只来自完整验证的 final；stage 不补充确认记录，也不被提升为已接受状态。确认发布失败会 poison SQLite，后续读、写与 checkpoint 均以 `EIO` 拒绝。
 

@@ -219,7 +219,7 @@ func (r *Replica) Close() error { return r.store.Close() }
 // having quietly not applied something: there is no revalidation behind these changes and no
 // timeout that repairs one. The consistent picture is what makes the strictness safe — every
 // change after it acts on something that picture already contained.
-func (r *Replica) Apply(ctx context.Context, change metastore.Change) (bool, error) {
+func (r *Replica) Apply(ctx context.Context, change metastore.Change) (applied bool, returnErr error) {
 	if err := r.admission.acquireWrite(ctx); err != nil {
 		return false, err
 	}
@@ -234,24 +234,25 @@ func (r *Replica) Apply(ctx context.Context, change metastore.Change) (bool, err
 	if change.Position <= r.at {
 		return false, nil
 	}
-	tx, err := r.store.write.BeginTx(ctx, nil)
+	tx, err := beginOwnedTransaction(ctx, r.store.write, nil)
 	if err != nil {
 		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, sqlerr.Failure(err))
 	}
-	defer tx.Rollback()
+	observationHeld := false
+	defer func() { returnErr = r.store.finishMutationTransaction(tx, returnErr, observationHeld) }()
 
-	if err := r.apply(ctx, tx, change); err != nil {
+	if err := r.apply(ctx, tx.Tx, change); err != nil {
 		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, sqlerr.Failure(err))
 	}
-	if err := r.store.checkReplicaMetadataBudget(ctx, tx); err != nil {
+	if err := r.store.checkReplicaMetadataBudget(ctx, tx.Tx); err != nil {
 		return false, err
 	}
-	state, err := dbstate.AdvanceGeneration(ctx, tx)
+	state, err := dbstate.AdvanceGeneration(ctx, tx.Tx)
 	if err != nil {
 		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, sqlerr.Failure(err))
 	}
 	r.store.coordinator.health.Lock()
-	defer r.store.coordinator.health.Unlock()
+	observationHeld = true
 	if err := r.store.coordinator.healthErrorLocked(); err != nil {
 		return false, err
 	}
@@ -451,7 +452,7 @@ func (r *Replica) Reseed(ctx context.Context) (*Seeding, error) {
 		r.admission.releaseWrite()
 		return nil, err
 	}
-	tx, err := r.store.write.BeginTx(ctx, nil)
+	tx, err := beginOwnedTransaction(ctx, r.store.write, nil)
 	if err != nil {
 		r.store.coordinator.commit.release()
 		r.admission.releaseWrite()
@@ -459,7 +460,7 @@ func (r *Replica) Reseed(ctx context.Context) (*Seeding, error) {
 	}
 	state, err := dbstate.Validate(ctx, tx)
 	if err != nil {
-		tx.Rollback()
+		err = r.store.finishMutationTransaction(tx, err, false)
 		r.store.coordinator.commit.release()
 		r.admission.releaseWrite()
 		return nil, fmt.Errorf("validating the copy's identity allocator: %w", sqlerr.Failure(err))
@@ -470,12 +471,10 @@ func (r *Replica) Reseed(ctx context.Context) (*Seeding, error) {
 	// picture's business rather than a rule the two sides have to agree on and keep agreeing on;
 	// the references are still checked, in full, before this transaction is allowed to commit.
 	if _, err := tx.ExecContext(ctx, `PRAGMA defer_foreign_keys = ON`); err != nil {
-		seeding.Close()
-		return nil, fmt.Errorf("beginning to fill the copy: %w", sqlerr.Failure(err))
+		return nil, seeding.finish(fmt.Errorf("beginning to fill the copy: %w", sqlerr.Failure(err)), false)
 	}
 	if err := seeding.empty(ctx); err != nil {
-		seeding.Close()
-		return nil, err
+		return nil, seeding.finish(err, false)
 	}
 	return seeding, nil
 }
@@ -483,7 +482,7 @@ func (r *Replica) Reseed(ctx context.Context) (*Seeding, error) {
 // Seeding is a copy being filled from one picture of its source.
 type Seeding struct {
 	replica *Replica
-	tx      *sql.Tx
+	tx      *ownedTransaction
 
 	// root is the id of the row that had no parent, and 0 until one has arrived. A tree with
 	// no root is not a tree, so completing without one is refused.
@@ -528,7 +527,7 @@ func (s *Seeding) add(ctx context.Context, row metastore.Row) error {
 		return fmt.Errorf("node identity %d is not positive: %w", row.Node.ID, syscall.EIO)
 	}
 	s.maxNodeID = max(s.maxNodeID, row.Node.ID)
-	if err := s.replica.store.insertReplicaNode(ctx, s.tx, row.Node); err != nil {
+	if err := s.replica.store.insertReplicaNode(ctx, s.tx.Tx, row.Node); err != nil {
 		return err
 	}
 	// Parent 0 and no name is how a picture names the one node that has neither. Nothing else
@@ -540,7 +539,7 @@ func (s *Seeding) add(ctx context.Context, row metastore.Row) error {
 		s.root = row.Node.ID
 		return nil
 	}
-	return insertEntry(ctx, s.tx, s.replica.store.volume, row.Parent, row.Name, row.Node.ID)
+	return insertEntry(ctx, s.tx.Tx, s.replica.store.volume, row.Parent, row.Name, row.Node.ID)
 }
 
 // Complete records that the picture was whole and that the copy stands at the position it was
@@ -554,7 +553,7 @@ func (s *Seeding) Complete(ctx context.Context, at metastore.Position) error {
 	if s.root == 0 {
 		return fmt.Errorf("%w: the picture carried no node without a parent, so it is not a tree", syscall.EIO)
 	}
-	if err := s.replica.store.checkReplicaMetadataBudget(ctx, s.tx); err != nil {
+	if err := s.replica.store.checkReplicaMetadataBudget(ctx, s.tx.Tx); err != nil {
 		return err
 	}
 	if _, err := s.tx.ExecContext(ctx, `UPDATE volumes SET root = ? WHERE id = ?`,
@@ -575,7 +574,7 @@ func (s *Seeding) Complete(ctx context.Context, at metastore.Position) error {
 		return fmt.Errorf("completing the copy: SQLite node sequence %d does not match observed high-water %d: %w",
 			sequence, highWater, syscall.EIO)
 	}
-	state, err := dbstate.AdvanceGeneration(ctx, s.tx)
+	state, err := dbstate.AdvanceGeneration(ctx, s.tx.Tx)
 	if err != nil {
 		return fmt.Errorf("completing the copy: %w", sqlerr.Failure(err))
 	}
@@ -587,24 +586,18 @@ func (s *Seeding) Complete(ctx context.Context, at metastore.Position) error {
 	if err := s.tx.Commit(); err != nil {
 		s.replica.store.coordinator.poisonLocked(sqlerr.NewUncertainCommit(sqlerr.Failure(err)))
 		healthErr := s.replica.store.coordinator.healthErrorLocked()
-		s.replica.store.coordinator.health.Unlock()
-		s.settle()
-		return fmt.Errorf("completing the copy: %w", healthErr)
+		return s.finish(fmt.Errorf("completing the copy: %w", healthErr), true)
 	}
 	if err := s.replica.store.acceptLocked(DurableState(state)); err != nil {
-		s.replica.store.coordinator.health.Unlock()
-		s.settle()
-		return fmt.Errorf("completing the copy: %w", err)
+		return s.finish(fmt.Errorf("completing the copy: %w", err), true)
 	}
-	s.replica.store.coordinator.health.Unlock()
 	// The root of the copy is the source's root, arrived with the picture. It is fixed for the
 	// life of a volume, so it is read once rather than joined for on every path resolution,
 	// and this is the one moment at which it changes. Both are written before readers are let
 	// back in, which is what the exclusion this holds is for.
 	s.replica.store.root = s.root
 	s.replica.at = at
-	s.settle()
-	return nil
+	return s.finish(nil, true)
 }
 
 // Close releases what the filling holds, and discards it if it was never completed. A caller
@@ -613,12 +606,24 @@ func (s *Seeding) Close() error {
 	if s.done {
 		return nil
 	}
-	err := s.tx.Rollback()
+	s.replica.store.coordinator.health.Lock()
+	rollbackErr := s.tx.Rollback()
+	err := s.replica.store.mutationCleanupFailure(rollbackErr, nil)
+	s.replica.store.coordinator.health.Unlock()
 	s.settle()
+	if err == nil && rollbackErr != nil {
+		err = sqlerr.Failure(rollbackErr)
+	}
 	if err != nil {
 		return fmt.Errorf("discarding a picture that was not completed: %w", sqlerr.Failure(err))
 	}
 	return nil
+}
+
+func (s *Seeding) finish(primary error, observationHeld bool) error {
+	err := s.replica.store.finishMutationTransaction(s.tx, primary, observationHeld)
+	s.settle()
+	return err
 }
 
 // settle marks the transaction finished and lets readers back in.

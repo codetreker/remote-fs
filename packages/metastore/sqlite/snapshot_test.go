@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
@@ -19,43 +20,45 @@ import (
 )
 
 func TestSnapshotAfterAutomaticRollbackReturnsCancellation(t *testing.T) {
-	store, err := Open(t.Context(), t.TempDir()+"/metastore.db", "workspace", 4096, DefaultWindow())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Errorf("closing store: %v", err)
+	synctest.Test(t, func(t *testing.T) {
+		store, err := Open(t.Context(), t.TempDir()+"/metastore.db", "workspace", 4096, DefaultWindow())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := store.Close(); err != nil {
+				t.Errorf("closing store: %v", err)
+			}
+		})
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		snap, _, err := store.Snapshot(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		synctest.Wait()
+		result, err := metastore.NewRowResult(1024, 0,
+			func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
+				return 192 + lengths.Name + lengths.Content + lengths.Metadata + lengths.Target, nil
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := snap.Next(t.Context(), 1, result); storage.ErrnoOf(err) != syscall.EINTR ||
+			!errors.Is(err, context.Canceled) || !errors.Is(err, sql.ErrTxDone) || errors.Is(err, syscall.EIO) {
+			t.Fatalf("reading automatically rolled back snapshot with a new context = %v, want interruption", err)
+		}
+		if rows, err := result.Rows(); rows != nil || storage.ErrnoOf(err) != syscall.EINTR {
+			t.Fatalf("canceled snapshot exposed rows %v with error %v", rows, err)
+		}
+		if err := snap.Close(); storage.ErrnoOf(err) != syscall.EINTR || errors.Is(err, syscall.EIO) {
+			t.Fatalf("closing automatically rolled back snapshot = %v, want interruption", err)
+		}
+		if err := snap.Close(); err != nil {
+			t.Fatalf("closing snapshot twice: %v", err)
 		}
 	})
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	snap, _, err := store.Snapshot(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cancel()
-	waitForReadRollback(t, store.snapshotRead)
-	result, err := metastore.NewRowResult(1024, 0,
-		func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
-			return 192 + lengths.Name + lengths.Content + lengths.Metadata + lengths.Target, nil
-		})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := snap.Next(t.Context(), 1, result); storage.ErrnoOf(err) != syscall.EINTR ||
-		!errors.Is(err, context.Canceled) || !errors.Is(err, sql.ErrTxDone) || errors.Is(err, syscall.EIO) {
-		t.Fatalf("reading automatically rolled back snapshot with a new context = %v, want interruption", err)
-	}
-	if rows, err := result.Rows(); rows != nil || storage.ErrnoOf(err) != syscall.EINTR {
-		t.Fatalf("canceled snapshot exposed rows %v with error %v", rows, err)
-	}
-	if err := snap.Close(); storage.ErrnoOf(err) != syscall.EINTR || errors.Is(err, syscall.EIO) {
-		t.Fatalf("closing automatically rolled back snapshot = %v, want interruption", err)
-	}
-	if err := snap.Close(); err != nil {
-		t.Fatalf("closing snapshot twice: %v", err)
-	}
 }
 
 func TestSnapshotCancellationDoesNotHideIndependentFailure(t *testing.T) {

@@ -805,7 +805,7 @@ func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context,
 	if err := s.coordinator.healthy(); err != nil {
 		return err
 	}
-	tx, err := s.write.BeginTx(transactionContext, nil)
+	tx, err := beginOwnedTransaction(transactionContext, s.write, nil)
 	if err != nil {
 		return sqlerr.Failure(err)
 	}
@@ -815,35 +815,35 @@ func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context,
 	}()
 
 	var publication *volumePublication
-	metadataBefore, err := s.metadataUsage(ctx, tx)
+	metadataBefore, err := s.metadataUsage(ctx, tx.Tx)
 	if err != nil {
 		return err
 	}
 	if intent != nil {
-		publication, err = s.prepareVolumePublication(ctx, tx, *intent)
+		publication, err = s.prepareVolumePublication(ctx, tx.Tx, *intent)
 		if err != nil {
 			return err
 		}
 	}
-	if err := f(tx); err != nil {
+	if err := f(tx.Tx); err != nil {
 		return err
 	}
 	if publication != nil {
-		if err := s.finishVolumePublication(ctx, tx, publication); err != nil {
+		if err := s.finishVolumePublication(ctx, tx.Tx, publication); err != nil {
 			return err
 		}
 	}
-	if err := changes.Trim(ctx, tx, s.volume, changes.Window(s.window)); err != nil {
+	if err := changes.Trim(ctx, tx.Tx, s.volume, changes.Window(s.window)); err != nil {
 		return sqlerr.Failure(err)
 	}
-	metadataAfter, err := s.metadataUsage(ctx, tx)
+	metadataAfter, err := s.metadataUsage(ctx, tx.Tx)
 	if err != nil {
 		return err
 	}
 	if metadataAfter > metadataBefore && metadataAfter > s.maxMetadataBytes {
 		return fmt.Errorf("stored metadata exceeds the volume's %d-byte limit: %w", s.maxMetadataBytes, syscall.EFBIG)
 	}
-	state, err := dbstate.AdvanceGeneration(ctx, tx)
+	state, err := dbstate.AdvanceGeneration(ctx, tx.Tx)
 	if err != nil {
 		return sqlerr.Failure(err)
 	}
@@ -853,9 +853,9 @@ func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context,
 		return err
 	}
 	if publication != nil {
-		return s.publishVolume(ctx, tx, DurableState(state), publication)
+		return s.publishVolume(ctx, tx.Tx, DurableState(state), publication)
 	}
-	return s.commitPrepared(tx, DurableState(state))
+	return s.commitPrepared(tx.Tx, DurableState(state))
 }
 
 // The commit gate remains held until cleanup finishes. Fresh views wait for rollback
@@ -865,7 +865,10 @@ func (s *Store) finishMutationTransaction(tx rollbacker, primary error, observat
 		s.coordinator.health.Lock()
 	}
 	defer s.coordinator.health.Unlock()
-	rollbackErr := tx.Rollback()
+	return s.mutationCleanupFailure(tx.Rollback(), primary)
+}
+
+func (s *Store) mutationCleanupFailure(rollbackErr, primary error) error {
 	if rollbackErr == nil || rollbackErr == sql.ErrTxDone {
 		return primary
 	}
@@ -903,18 +906,51 @@ func (s *Store) inspect(ctx context.Context, f func(tx *sql.Tx) error) error {
 	if err != nil {
 		return err
 	}
-	return finishReadTransaction(ctx, "reader transaction", tx, f(tx))
+	return finishReadTransaction(ctx, "reader transaction", tx, f(tx.Tx))
+}
+
+type ownedTransaction struct {
+	*sql.Tx
+	closeConnection func() error
+	closeOnce       sync.Once
+	closeErr        error
+}
+
+func (tx *ownedTransaction) Rollback() error {
+	err := tx.Tx.Rollback()
+	// Automatic rollback marks Tx done before returning its connection. Close joins
+	// that release so a completed operation cannot leave database ownership in use.
+	tx.closeOnce.Do(func() { tx.closeErr = tx.closeConnection() })
+	if tx.closeErr != nil {
+		return errors.Join(err, tx.closeErr)
+	}
+	return err
+}
+
+func beginOwnedTransaction(ctx context.Context, pool *sql.DB, options *sql.TxOptions) (*ownedTransaction, error) {
+	conn, err := pool.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	native, err := conn.BeginTx(ctx, options)
+	if err != nil {
+		if closeErr := conn.Close(); closeErr != nil {
+			return nil, errors.Join(err, sqlerr.NewDurabilityFailure(closeErr))
+		}
+		return nil, err
+	}
+	return &ownedTransaction{Tx: native, closeConnection: conn.Close}, nil
 }
 
 // beginReadSnapshot orders a read transaction before an unresolved commit or after its
 // witness publication. The first query pins SQLite's snapshot while the health gate is held;
 // the potentially long scan and caller-owned result accounting then proceed without delaying
 // a writer's commit boundary.
-func (s *Store) beginReadSnapshot(ctx context.Context, pool *sql.DB) (*sql.Tx, error) {
+func (s *Store) beginReadSnapshot(ctx context.Context, pool *sql.DB) (*ownedTransaction, error) {
 	if err := s.beginHealthyRead(ctx); err != nil {
 		return nil, err
 	}
-	tx, err := pool.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := beginOwnedTransaction(ctx, pool, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		s.coordinator.endHealthyRead()
 		return nil, sqlerr.ReadFailure(ctx, err)
@@ -937,8 +973,8 @@ type rollbacker interface {
 func finishReadTransaction(ctx context.Context, subject string, tx rollbacker, primary error) error {
 	primary = sqlerr.ReadFailure(ctx, primary)
 	rollbackErr := tx.Rollback()
-	// database/sql rolls back when the transaction's owning context ends. The direct
-	// ErrTxDone then reports completed cleanup, not another database failure.
+	// database/sql rolls back when the transaction's owning context ends. The owned
+	// connection has joined that cleanup before the direct ErrTxDone reaches here.
 	// https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/database/sql/sql.go#L2207-L2230
 	if rollbackErr == sql.ErrTxDone && ctx.Err() != nil {
 		if primary == nil {
