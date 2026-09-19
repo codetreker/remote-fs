@@ -46,6 +46,10 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 新单项必须取得精确 DETAIL；任何 ENUM 都停止该证据路径。被动观察只记录已有 QFid/identity 查询及原始、有效 compound session 关联，不主动刷新目标。HA/Hnew、不预热的 B、首个打开、不同原生身份与 A/B 字节、一秒和原 TTL 的判据均不放宽。它检验有真实历史事实支持的精确通知能否改变这一个替换结果，不把旧 typed-rescan 的身份失败撤销。
 
+[always-truthful QFid 单项](../../../../.github/workflows/native-smb-qfid-invalidation.yml)在同一固定精确通知 fixture 上只改变成功 CREATE 的身份 context：实际 State 在打开准入前取得 volume 身份，回复使用捕获对象 ID 和真实 serial；未请求时在私有响应列表添加一个 QFid，已请求时仍只有一个。请求校验、响应预算、错误及清理不放宽。[补丁](../../../../.github/scripts/native-smb-qfid-context.patch)限于诊断检出，默认 requested-only 路径保持原 server 输入。未请求 QFid 的符合性尚未确定，因此响应被客户端接受也不能自动成为生产方案。
+
+这项刺激用于区分“没有新身份响应”和“收到真实新身份仍未分离”两种条件。选定新 CREATE 必须确实未请求 QFid；记录缺席、返回原始字段及捕获 B/volume 的关联，不能通过额外查询或预先打开 B 告诉重定向器答案。响应接纳、新句柄身份和旧 HA 稳定性分别判定，任一旧身份被替换或两个句柄仍同身份均失败；精确 DETAIL、原生 opaque 身份/A/B 字节、一秒与原 TTL 仍是同一判据。此前 requested-only 的合格失败保留，不因新实验可能成功而改写。
+
 ## 备选方案
 
 **等整套新实现完成后才运行原生验收。** 最终仍要这样验证交付代码，但把可行性诊断也推迟到那时，会让一个已经知道可能失败的缓存行为在大量实现之后才决定能否交付。固定原型让这项依赖提前得到可复现的回答。
@@ -105,7 +109,13 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 该轨迹中旧 CREATE 请求了 QFid，新 CREATE 只有 DH2Q，未出现 file QUERY_INFO 6/18/59；原观察器没有保存 QFid 数值响应。不能从请求存在或 authority NodeID 推导系统使用了哪个身份值。精确实验为此增加被动关联记录，既不补发查询，也不把原失败改成成功。
 
-typed-rescan 的局部三个根普通/race 各 144 pass，detail-only 与 readiness 对照分别命中规定的失败。精确历史单项的 26 个本地根普通/race 各 285 个 verdict 通过，四个因果对照、十个源提取 PowerShell 清理选择用例、错误 pin 拒绝、精确准备、ARM64 构建和 actionlint 通过。CRLF 准备回归的九个 Go 输出与此前组合逐字节相同，ARM64 binary 也相同；沿用 Go 控制收据有明确字节依据。首次 precise 作业因准备失败未进入控制或原生场景，清理成功不能补出 native 结果。这些分别证明自己的 harness 来源、错误判据与拥有权；精确单项尚未原生执行，已有局部和增长/缩短结果不证明替换身份、当前生产适配或完整缓存方案。
+typed-rescan 的局部三个根普通/race 各 144 pass，detail-only 与 readiness 对照分别命中规定的失败。精确历史单项的 26 个本地根普通/race 各 285 个 verdict 通过，四个因果对照、十个源提取 PowerShell 清理选择用例、错误 pin 拒绝、精确准备、ARM64 构建和 actionlint 通过。CRLF 准备回归的九个 Go 输出与此前组合逐字节相同，ARM64 binary 也相同；沿用 Go 控制收据有明确字节依据。首次 precise 作业因准备失败未进入控制或原生场景，清理成功不能补出 native 结果。这些分别证明自己的 harness 来源、错误判据与拥有权，已有局部和增长/缩短结果不证明替换身份、当前生产适配或完整缓存方案。
+
+[精确单项 35423839239](https://github.com/codetreker/remote-fs/actions/runs/35423839239)绑定探针 `6467000e8ab6c877f96762a9ff34557a288b6d40` 及实际 Go 1.26.8 Windows ARM64 binary，取得完整 REMOVED/OLD_NAME/NEW_NAME DETAIL；P=7/Q=9、前像、原 action 回执、HTTP barrier 与真实交付区间一致。冷 B、安静区间、原默认缓存和清理均合格，但结果为 replacement_identity_aliased：Hnew 读 B 的 769 字节，HA 保留 A 的 257 字节，两个 native FileIndex 均为 3、volume 均为 2206197897。所有身份/字节检查在 ACK 后 29.552 ms 完成，因此失败只约束这个首个合格样本，不证明超过一秒仍旧。
+
+被动数据确认旧 CREATE 的 QFid DiskID=3，VolumeID=3872781749700257929；新 CREATE 未请求且未返回 QFid，实际 file 查询为 7/22/34，没有 6/18/59，也没有 QUERY_DIRECTORY。不能用原 QFid 或 backend NodeID 补造新打开的身份回复。完整 DETAIL 已成立仍出现相同 native identity，这缩小了被测条件，但 redirector 内部身份算法及纠正机制依然未知；固定原型结果不替当前生产接入或一秒缓存验收。
+
+always-truthful QFid 的本地适用控制共 46 根，普通/race 各 380 个 verdict 通过；requested-only 响应回退与移除 alias 拒绝分别在因果断言失败，七项脚本策略控制、default/always 准备和精确 ARM64 构建也已核对。默认分支保持原 server 字节，策略改变处使用对应 no-leasing 控制。原生单项尚未执行，互操作和符合性均不由这些本地收据决定。
 
 ### 样本资格与执行来源
 

@@ -52,10 +52,11 @@ type preciseIdentityRecord struct {
 
 var preciseIdentityRegistry struct {
 	sync.Mutex
-	records []preciseIdentityRecord
-	pending map[parentNotifyKey]preciseIdentityRecord
-	bytes   int
-	failure error
+	records      []preciseIdentityRecord
+	pending      map[parentNotifyKey]preciseIdentityRecord
+	bytes        int
+	failure      error
+	firstOpenEnd uint64
 }
 
 const preciseIdentityRecords = 64
@@ -68,6 +69,7 @@ func preciseIdentityReset() {
 	preciseIdentityRegistry.pending = make(map[parentNotifyKey]preciseIdentityRecord)
 	preciseIdentityRegistry.bytes = 0
 	preciseIdentityRegistry.failure = nil
+	preciseIdentityRegistry.firstOpenEnd = 0
 }
 func preciseIdentitySnapshot() ([]preciseIdentityRecord, error) {
 	preciseIdentityRegistry.Lock()
@@ -297,16 +299,220 @@ func cacheGatePreciseIdentity(packet []byte, r cacheGatePositiveWireRecord) bool
 	}
 	return err == nil
 }
-func preciseIdentityAudit(t *testing.T) {
+
+const preciseRequestedQFid = "requested-only"
+const preciseAlwaysQFid = "always-truthful"
+
+func preciseQFidPolicy(value string) (string, error) {
+	if value == "" {
+		return preciseRequestedQFid, nil
+	}
+	if value != preciseRequestedQFid && value != preciseAlwaysQFid {
+		return "", errors.New("unknown diagnostic QFid response policy")
+	}
+	return value, nil
+}
+
+func preciseIdentityEndFirstOpen() {
+	sequence := parentObservationBoundary()
+	preciseIdentityRegistry.Lock()
+	defer preciseIdentityRegistry.Unlock()
+	if preciseIdentityRegistry.firstOpenEnd != 0 {
+		preciseIdentityRegistry.failure = errors.Join(preciseIdentityRegistry.failure, errors.New("first-open end was recorded twice"))
+		return
+	}
+	preciseIdentityRegistry.firstOpenEnd = sequence
+}
+
+type precisePolicyEvidence struct {
+	Policy                                           string
+	FirstBegin, FirstEnd                             uint64
+	OldRequest, OldResponse, NewRequest, NewResponse *preciseIdentityRecord
+	WireSuccess                                      bool
+	NativeOpenSucceeded                              bool
+	NativeIdentitySucceeded                          bool
+	NewNativeDistinct                                bool
+	RetainedNativeStable                             bool
+	StimulusDelivered                                bool
+	NativeOracle                                     string
+	Error                                            string
+}
+
+func precisePolicyNative(report *parentInvalidationReport) precisePolicyEvidence {
+	evidence := precisePolicyEvidence{NativeOracle: report.IdentityResult}
+	opened := report.Qualification.Native
+	evidence.NativeOpenSucceeded = opened.Error == "" && !opened.Started.IsZero() && !opened.Completed.IsZero() && report.IdentityResult != "replacement_first_open_failed"
+	old, current, retained := report.OldIdentity, report.NewIdentity, report.RetainedIdentity
+	evidence.NativeIdentitySucceeded = current.Error == "" && current.Identity != 0 && !current.Completed.IsZero()
+	evidence.NewNativeDistinct = old.Error == "" && current.Error == "" && old.Identity != 0 && current.Identity != 0 && current.Volume == old.Volume && current.Identity != old.Identity
+	evidence.RetainedNativeStable = old.Error == "" && retained.Error == "" && old.Identity != 0 && retained.Identity != 0 && retained.Volume == old.Volume && retained.Identity == old.Identity
+	return evidence
+}
+
+func preciseContextQFidCount(record preciseIdentityRecord) int {
+	count := 0
+	for _, name := range record.ContextNames {
+		if name == "51466964" {
+			count++
+		}
+	}
+	return count
+}
+
+func precisePolicyGate(policy string, records []preciseIdentityRecord, wireRecords []cacheGatePositiveWireRecord, report *parentInvalidationReport, end uint64) precisePolicyEvidence {
+	result := precisePolicyNative(report)
+	result.Policy = policy
+	result.FirstBegin = report.FirstObservationSequence
+	result.FirstEnd = end
+	refuse := func(message string) precisePolicyEvidence { result.Error = message; return result }
+	if policy == preciseRequestedQFid {
+		return result
+	}
+	if policy != preciseAlwaysQFid {
+		return refuse("unknown QFid evidence policy")
+	}
+	if result.FirstBegin == 0 || end <= result.FirstBegin {
+		return refuse("first CREATE ordinal bracket is absent")
+	}
+	type ownedPair struct{ request, response *preciseIdentityRecord }
+	pairs := make(map[parentNotifyKey]ownedPair)
+	var previous uint64
+	for i := range records {
+		record := &records[i]
+		if record.Sequence == 0 || record.Sequence <= previous || !record.Complete || record.Error != "" {
+			return refuse("passive identity source order or completeness is invalid")
+		}
+		previous = record.Sequence
+		if record.Command != wire.Create {
+			continue
+		}
+		if !record.Response && (!record.ContextsChecked || preciseContextQFidCount(*record) != map[bool]int{false: 0, true: 1}[record.QFidRequested] || record.QFid != nil) {
+			return refuse("CREATE request context absence or presence is unproven")
+		}
+		key := parentNotifyKey{record.Connection, record.MessageID}
+		pair := pairs[key]
+		if record.Connection == 0 || record.Session == 0 || record.Session == ^uint64(0) {
+			return refuse("CREATE identity lineage is absent")
+		}
+		if record.Response {
+			if pair.request == nil || pair.response != nil || pair.request.Session != record.Session || pair.request.QFidRequested != record.QFidRequested || record.Sequence <= pair.request.Sequence {
+				return refuse("CREATE response has ambiguous request ownership")
+			}
+			pair.response = record
+		} else {
+			if pair.request != nil {
+				return refuse("CREATE request key is reused")
+			}
+			pair.request = record
+		}
+		pairs[key] = pair
+	}
+	// The passive identity callback has no names. Only the original correlated
+	// request records establish that a CREATE belongs to the selected target.
+	names := make(map[parentNotifyKey]string)
+	replies := make(map[parentNotifyKey]bool)
+	for _, record := range wireRecords {
+		if record.Command != wire.Create {
+			continue
+		}
+		key := parentNotifyKey{record.Connection, record.MessageID}
+		if record.Response {
+			pair, ok := pairs[key]
+			if !ok || pair.response == nil || replies[key] || record.Incomplete != "" || pair.response.Session != record.SessionID || pair.response.Status != record.Status || pair.response.FileID != record.FileID {
+				return refuse("parent wire and identity response ownership disagree")
+			}
+			replies[key] = true
+			continue
+		}
+		if _, exists := names[key]; exists {
+			return refuse("parent wire CREATE request is duplicated")
+		}
+		pair, ok := pairs[key]
+		if !ok || pair.request == nil || pair.request.Session != record.SessionID || record.Incomplete != "" {
+			return refuse("parent wire and identity request ownership disagree")
+		}
+		names[key] = record.Name
+	}
+	for key, pair := range pairs {
+		if pair.request == nil || pair.response == nil {
+			return refuse("CREATE identity exchange is incomplete")
+		}
+		if _, ok := names[key]; !ok || !replies[key] {
+			return refuse("CREATE identity exchange lacks complete parent wire ownership")
+		}
+		request, response := pair.request, pair.response
+		if request.Sequence > result.FirstBegin && request.Sequence < end && names[key] == `v\target` {
+			if result.NewRequest != nil {
+				return refuse("first native open issued ambiguous target CREATE requests")
+			}
+			result.NewRequest = request
+			result.NewResponse = response
+		}
+	}
+	if result.NewRequest == nil {
+		return refuse("first native open has no bound target CREATE")
+	}
+	result.WireSuccess = result.NewResponse.Status == 0
+	if result.NewRequest.QFidRequested {
+		return refuse("selected new CREATE unexpectedly requested QFid")
+	}
+	for key, pair := range pairs {
+		request, response := pair.request, pair.response
+		if response.Status != 0 {
+			if response.QFid != nil {
+				return refuse("failed CREATE acquired a fabricated QFid")
+			}
+			continue
+		}
+		if !response.ContextsChecked || preciseContextQFidCount(*response) != 1 || response.QFid == nil || response.FileID == "" || len(response.QFid.Raw) != 64 || len(response.QFid.Reserved) != 32 {
+			return refuse("successful CREATE lacks complete QFid payload")
+		}
+		raw, err := hex.DecodeString(response.QFid.Raw)
+		if err != nil || len(raw) != 32 || binary.LittleEndian.Uint64(raw) != response.QFid.DiskID || binary.LittleEndian.Uint64(raw[8:]) != response.QFid.VolumeID || hex.EncodeToString(raw[16:]) != response.QFid.Reserved || response.QFid.Reserved != "00000000000000000000000000000000" {
+			return refuse("QFid raw payload disagrees with retained identity fields")
+		}
+		if request.Sequence < result.FirstBegin && names[key] == `v\target` && response.QFid.DiskID == report.Initial.ID {
+			if result.OldRequest != nil {
+				return refuse("old target QFid ownership is ambiguous")
+			}
+			result.OldRequest = request
+			result.OldResponse = response
+		}
+	}
+	if !result.WireSuccess {
+		return result
+	}
+	if result.OldRequest == nil || result.OldResponse.Sequence >= result.FirstBegin || result.OldRequest.Connection != result.NewRequest.Connection || result.OldRequest.Session != result.NewRequest.Session || result.OldResponse.FileID == result.NewResponse.FileID {
+		return refuse("old and new CREATE identities lack distinct same-session ownership")
+	}
+	if report.Initial.ID == 0 || report.Expected.ID == 0 || report.Expected.ID == report.Initial.ID || result.NewResponse.QFid.DiskID != report.Expected.ID || result.NewResponse.QFid.VolumeID != result.OldResponse.QFid.VolumeID {
+		return refuse("new response QFid is not the captured B and actual A volume tuple")
+	}
+	result.StimulusDelivered = true
+	return result
+}
+
+func preciseIdentityAudit(t *testing.T, report *parentInvalidationReport) {
 	t.Helper()
 	records, err := preciseIdentitySnapshot()
+	policy, policyErr := preciseQFidPolicy(os.Getenv("RFS_QFID_POLICY"))
+	preciseIdentityRegistry.Lock()
+	end := preciseIdentityRegistry.firstOpenEnd
+	preciseIdentityRegistry.Unlock()
+	evidence := precisePolicyGate(policy, records, report.Wire, report, end)
+	err = errors.Join(err, policyErr)
+	if evidence.Error != "" {
+		err = errors.Join(err, errors.New(evidence.Error))
+	}
 	if err != nil {
+		evidence.StimulusDelivered = false
 		t.Error("passive identity evidence:", err)
 	}
 	data, encodeErr := json.MarshalIndent(struct {
 		Records []preciseIdentityRecord
+		Policy  precisePolicyEvidence
 		Error   string
-	}{records, fmt.Sprint(err)}, "", "  ")
+	}{records, evidence, fmt.Sprint(err)}, "", "  ")
 	if encodeErr == nil {
 		encodeErr = os.WriteFile(filepath.Join(os.Getenv("RFS_GATE_OUTPUT_ROOT"), "precise-identity.json"), data, 0600)
 	}
@@ -314,13 +520,22 @@ func preciseIdentityAudit(t *testing.T) {
 		t.Error("write passive identity evidence:", encodeErr)
 	}
 }
+
 func TestNativePreciseReplacement(t *testing.T) {
 	if os.Getenv("RFS_PRECISE_VARIANT") != "historical_detail" {
 		t.Fatal("precise native cell requires its explicit diagnostic variant")
 	}
-	t.Run("share0_app_first_replace_identity_precise", func(t *testing.T) {
+	policy, err := preciseQFidPolicy(os.Getenv("RFS_QFID_POLICY"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "share0_app_first_replace_identity_precise"
+	if policy == preciseAlwaysQFid {
+		name = "share0_app_first_replace_identity_always_qfid"
+	}
+	t.Run(name, func(t *testing.T) {
 		preciseIdentityReset()
-		report := &parentInvalidationReport{Kind: "replacement", Name: "share0_app_first_replace_identity_precise", ShareMode: 0, Order: "app_first"}
+		report := &parentInvalidationReport{Kind: "replacement", Name: name, ShareMode: 0, Order: "app_first"}
 		parentRunCell(t, report.Name, report.Order, report.ShareMode, true, report)
 		if report.RescanRequired || !report.PreciseNotificationProven {
 			t.Error("precise replacement requires complete detailed notification")
@@ -733,5 +948,332 @@ func TestPreciseIdentityInheritedSession(t *testing.T) {
 				t.Fatal("identity provenance changed", rows)
 			}
 		})
+	}
+}
+
+func precisePolicyFixture() ([]preciseIdentityRecord, []cacheGatePositiveWireRecord, parentInvalidationReport) {
+	at := time.Unix(1800000000, 0)
+	qfid := func(id uint64) *preciseQFid {
+		data := make([]byte, 32)
+		binary.LittleEndian.PutUint64(data, id)
+		binary.LittleEndian.PutUint64(data[8:], 17)
+		return &preciseQFid{Raw: hex.EncodeToString(data), DiskID: id, VolumeID: 17, Reserved: hex.EncodeToString(data[16:])}
+	}
+	records := []preciseIdentityRecord{
+		{Sequence: 1, At: at, Connection: 1, Session: 2, RawSession: 2, MessageID: 3, Command: wire.Create, ContextsChecked: true, ContextNames: []string{"51466964"}, QFidRequested: true, Complete: true},
+		{Sequence: 2, At: at, Connection: 1, Session: 2, RawSession: 2, MessageID: 3, Command: wire.Create, Response: true, FileID: "old-A", ContextsChecked: true, ContextNames: []string{"51466964"}, QFidRequested: true, QFid: qfid(3), Complete: true},
+		{Sequence: 11, At: at, Connection: 1, Session: 2, RawSession: 2, MessageID: 4, Command: wire.Create, ContextsChecked: true, Complete: true},
+		{Sequence: 12, At: at, Connection: 1, Session: 2, RawSession: 2, MessageID: 4, Command: wire.Create, Response: true, FileID: "new-B", ContextsChecked: true, ContextNames: []string{"51466964"}, QFid: qfid(4), Complete: true},
+	}
+	wireRecords := []cacheGatePositiveWireRecord{{At: at, Connection: 1, SessionID: 2, MessageID: 3, Command: wire.Create, Name: `v\target`}, {At: at, Connection: 1, SessionID: 2, MessageID: 4, Command: wire.Create, Name: `v\target`}}
+	for _, record := range records {
+		if record.Response {
+			wireRecords = append(wireRecords, cacheGatePositiveWireRecord{At: at, Connection: record.Connection, SessionID: record.Session, MessageID: record.MessageID, Command: wire.Create, Response: true, Status: record.Status, FileID: record.FileID})
+		}
+	}
+	report := parentInvalidationReport{FirstObservationSequence: 10, IdentityResult: "distinct_native_identity_and_preserved_bytes"}
+	report.Initial.ID = 3
+	report.Expected.ID = 4
+	report.Qualification.Native = cacheGatePositiveValue{Started: at, Completed: at}
+	report.OldIdentity = cacheGatePositiveValue{Started: at, Completed: at, Identity: 3001, Volume: 9, Size: 257}
+	report.NewIdentity = cacheGatePositiveValue{Started: at, Completed: at, Identity: 9007, Volume: 9, Size: 769}
+	report.RetainedIdentity = report.OldIdentity
+	return records, wireRecords, report
+}
+
+func TestPreciseQFidPolicy(t *testing.T) {
+	for _, value := range []string{"", preciseRequestedQFid, preciseAlwaysQFid} {
+		policy, err := preciseQFidPolicy(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := value
+		if value == "" {
+			expected = preciseRequestedQFid
+		}
+		if policy != expected {
+			t.Fatal("policy default changed", policy)
+		}
+	}
+	for _, value := range []string{"always", " requested-only", "ALWAYS-TRUTHFUL"} {
+		if _, err := preciseQFidPolicy(value); err == nil {
+			t.Fatal("unknown policy accepted", value)
+		}
+	}
+	t.Run("requested-only preserves passive parser contract", func(t *testing.T) {
+		_, _, report := precisePolicyFixture()
+		result := precisePolicyGate(preciseRequestedQFid, nil, nil, &report, 0)
+		if result.Error != "" || result.StimulusDelivered {
+			t.Fatal("requested-only acquired unsolicited-response requirements", result)
+		}
+	})
+	t.Run("actual unrequested payload and equal clocks", func(t *testing.T) {
+		records, wireRecords, report := precisePolicyFixture()
+		result := precisePolicyGate(preciseAlwaysQFid, records, wireRecords, &report, 13)
+		if result.Error != "" || !result.WireSuccess || !result.StimulusDelivered || !result.NativeOpenSucceeded || !result.NativeIdentitySucceeded || !result.NewNativeDistinct || !result.RetainedNativeStable || result.NewRequest.QFidRequested {
+			t.Fatalf("truthful unsolicited stimulus rejected: %+v", result)
+		}
+		// FileIndex is opaque and deliberately differs numerically from both NodeIDs.
+		if report.NewIdentity.Identity == result.NewResponse.QFid.DiskID {
+			t.Fatal("fixture failed to separate native and wire identities")
+		}
+	})
+}
+
+func TestPreciseQFidPolicyRefusals(t *testing.T) {
+	cases := []struct {
+		name   string
+		change func(*[]preciseIdentityRecord, *[]cacheGatePositiveWireRecord, *parentInvalidationReport, *uint64)
+	}{
+		{"requested-only negative control", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[3].QFid = nil
+			(*r)[3].ContextNames = nil
+		}},
+		{"new request unexpectedly requests QFid", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[2].QFidRequested = true
+			(*r)[2].ContextNames = []string{"51466964"}
+			(*r)[3].QFidRequested = true
+		}},
+		{"request absence unchecked", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[2].ContextsChecked = false
+		}},
+		{"request absence contradicts raw names", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[2].ContextNames = []string{"51466964"}
+		}},
+		{"old response missing QFid", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[1].QFid = nil
+		}},
+		{"duplicate response QFid", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[3].ContextNames = append((*r)[3].ContextNames, "51466964")
+		}},
+		{"wrong new disk identity", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[3].QFid = (*r)[1].QFid
+		}},
+		{"wrong volume", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[3].QFid.VolumeID++
+		}},
+		{"forged parsed ID", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[3].QFid.DiskID++
+		}},
+		{"missing response", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			*r = (*r)[:3]
+		}},
+		{"duplicate response", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			copy := (*r)[3]
+			copy.Sequence = 14
+			*r = append(*r, copy)
+		}},
+		{"response wrong session", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[3].Session++
+		}},
+		{"response wrong key", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[3].MessageID++
+		}},
+		{"same old/new SMB handle", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[3].FileID = (*r)[1].FileID
+		}},
+		{"old identity is unbound", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[1].QFid = (*r)[3].QFid
+		}},
+		{"new wire path mismatch", func(_ *[]preciseIdentityRecord, w *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*w)[1].Name = `v\replacement`
+		}},
+		{"wire key mismatch", func(_ *[]preciseIdentityRecord, w *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*w)[1].MessageID++
+		}},
+		{"wire session mismatch", func(_ *[]preciseIdentityRecord, w *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*w)[1].SessionID++
+		}},
+		{"wire request duplicate", func(_ *[]preciseIdentityRecord, w *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			*w = append(*w, (*w)[1])
+		}},
+		{"missing end ordinal", func(_ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, end *uint64) {
+			*end = 0
+		}},
+		{"at begin ordinal", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[2].Sequence = 10
+		}},
+		{"at end ordinal", func(_ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, end *uint64) {
+			*end = 11
+		}},
+		{"out of order ordinal", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[3].Sequence = 11
+		}},
+		{"unknown current B", func(_ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, r *parentInvalidationReport, _ *uint64) {
+			r.Expected.ID = 0
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			records, wireRecords, report := precisePolicyFixture()
+			end := uint64(13)
+			tc.change(&records, &wireRecords, &report, &end)
+			result := precisePolicyGate(preciseAlwaysQFid, records, wireRecords, &report, end)
+			if result.Error == "" || result.StimulusDelivered {
+				t.Fatalf("unqualified stimulus admitted: %+v", result)
+			}
+		})
+	}
+}
+
+func TestPreciseQFidOutcomeSeparation(t *testing.T) {
+	for _, mode := range []string{"distinct handles", "both old identity", "old handle overwritten", "server rejected CREATE", "native open rejected", "native identity rejected"} {
+		t.Run(mode, func(t *testing.T) {
+			records, wireRecords, report := precisePolicyFixture()
+			before, after := make([]byte, 257), make([]byte, 769)
+			report.RetainedRead = cacheGatePositiveValue{Count: 257, Digest: cacheGatePositiveDigest(before)}
+			report.NewRead = cacheGatePositiveValue{Count: 769, Digest: cacheGatePositiveDigest(after)}
+			switch mode {
+			case "both old identity":
+				report.NewIdentity.Identity = report.OldIdentity.Identity
+			case "old handle overwritten":
+				report.RetainedIdentity.Identity = report.NewIdentity.Identity
+			case "server rejected CREATE":
+				records[3].Status = 0xc000000d
+				records[3].QFid = nil
+				records[3].ContextNames = nil
+				records[3].ContextsChecked = false
+				records[3].FileID = ""
+				wireRecords[3].Status = records[3].Status
+				wireRecords[3].FileID = ""
+				report.Qualification.Native.Error = "CreateFile failed"
+				report.NewIdentity = cacheGatePositiveValue{}
+				report.RetainedIdentity = cacheGatePositiveValue{}
+			case "native open rejected":
+				report.Qualification.Native.Error = "CreateFile failed"
+				report.NewIdentity = cacheGatePositiveValue{}
+				report.RetainedIdentity = cacheGatePositiveValue{}
+			case "native identity rejected":
+				report.NewIdentity.Error = "GetFileInformationByHandle failed"
+				report.NewIdentity.Identity = 0
+			}
+			report.IdentityResult = parentRelativeIdentity(report.OldIdentity, report.NewIdentity, report.RetainedIdentity, report.RetainedRead, report.NewRead, before, after)
+			if mode == "server rejected CREATE" || mode == "native open rejected" {
+				report.IdentityResult = "replacement_first_open_failed"
+			}
+			result := precisePolicyGate(preciseAlwaysQFid, records, wireRecords, &report, 13)
+			if result.Error != "" {
+				t.Fatal(result.Error)
+			}
+			if result.NativeOracle != report.IdentityResult {
+				t.Fatal("native oracle rewritten")
+			}
+			switch mode {
+			case "distinct handles":
+				if !result.WireSuccess || !result.StimulusDelivered || !result.NewNativeDistinct || !result.RetainedNativeStable || result.NativeOracle != "distinct_native_identity_and_preserved_bytes" {
+					t.Fatal(result)
+				}
+			case "both old identity":
+				if !result.StimulusDelivered || result.NewNativeDistinct || !result.RetainedNativeStable || result.NativeOracle != "replacement_identity_aliased" {
+					t.Fatal(result)
+				}
+			case "old handle overwritten":
+				if !result.StimulusDelivered || !result.NewNativeDistinct || result.RetainedNativeStable || result.NativeOracle != "retained_identity_changed" {
+					t.Fatal(result)
+				}
+			case "server rejected CREATE":
+				if result.WireSuccess || result.StimulusDelivered || result.NativeOpenSucceeded || result.NativeIdentitySucceeded || result.NewResponse.Status != 0xc000000d {
+					t.Fatal(result)
+				}
+			case "native open rejected":
+				if !result.WireSuccess || !result.StimulusDelivered || result.NativeOpenSucceeded || result.NativeIdentitySucceeded {
+					t.Fatal(result)
+				}
+			case "native identity rejected":
+				if !result.WireSuccess || !result.StimulusDelivered || !result.NativeOpenSucceeded || result.NativeIdentitySucceeded || result.NewNativeDistinct || result.NativeOracle != "identity_unavailable" {
+					t.Fatal(result)
+				}
+			}
+		})
+	}
+}
+
+func TestPreciseQFidAmbiguousAndOtherCreates(t *testing.T) {
+	for _, mode := range []string{"ambiguous new", "ambiguous old", "other successful CREATE lacks QFid", "different connection", "failed CREATE with fabricated identity"} {
+		t.Run(mode, func(t *testing.T) {
+			records, wireRecords, report := precisePolicyFixture()
+			end := uint64(20)
+			switch mode {
+			case "ambiguous new":
+				request, response := records[2], records[3]
+				request.MessageID = 5
+				response.MessageID = 5
+				request.Sequence = 13
+				response.Sequence = 14
+				response.FileID = "second-new"
+				records = append(records, request, response)
+				copy := wireRecords[1]
+				copy.MessageID = 5
+				wireRecords = append(wireRecords, copy)
+			case "ambiguous old":
+				request, response := records[0], records[1]
+				request.MessageID = 5
+				response.MessageID = 5
+				request.Sequence = 3
+				response.Sequence = 4
+				response.FileID = "second-old"
+				records = append(append(slices.Clone(records[:2]), request, response), records[2:]...)
+				copy := wireRecords[0]
+				copy.MessageID = 5
+				wireRecords = append(wireRecords, copy)
+			case "other successful CREATE lacks QFid":
+				request, response := records[2], records[3]
+				request.MessageID = 5
+				response.MessageID = 5
+				request.Sequence = 13
+				response.Sequence = 14
+				response.FileID = "other"
+				response.QFid = nil
+				response.ContextNames = nil
+				records = append(records, request, response)
+				copy := wireRecords[1]
+				copy.MessageID = 5
+				copy.Name = "v"
+				wireRecords = append(wireRecords, copy)
+			case "different connection":
+				records[2].Connection = 2
+				records[3].Connection = 2
+				wireRecords[1].Connection = 2
+			case "failed CREATE with fabricated identity":
+				records[3].Status = 0xc000000d
+			}
+			for _, record := range records {
+				if record.Response && record.MessageID == 5 {
+					wireRecords = append(wireRecords, cacheGatePositiveWireRecord{Connection: record.Connection, SessionID: record.Session, MessageID: record.MessageID, Command: wire.Create, Response: true, Status: record.Status, FileID: record.FileID})
+				}
+			}
+			if mode == "different connection" {
+				wireRecords[3].Connection = 2
+			}
+			if mode == "failed CREATE with fabricated identity" {
+				wireRecords[3].Status = records[3].Status
+			}
+			result := precisePolicyGate(preciseAlwaysQFid, records, wireRecords, &report, end)
+			if result.Error == "" || result.StimulusDelivered {
+				t.Fatalf("ambiguous or incomplete policy evidence accepted: %+v", result)
+			}
+		})
+	}
+}
+
+func TestPreciseFirstOpenEndOrdinal(t *testing.T) {
+	preciseIdentityReset()
+	before := parentObservationBoundary()
+	preciseIdentityEndFirstOpen()
+	preciseIdentityRegistry.Lock()
+	end := preciseIdentityRegistry.firstOpenEnd
+	preciseIdentityRegistry.Unlock()
+	if end <= before {
+		t.Fatal("end boundary did not advance source order")
+	}
+	preciseIdentityEndFirstOpen()
+	if _, err := preciseIdentitySnapshot(); err == nil {
+		t.Fatal("duplicate end boundary accepted")
+	}
+	preciseIdentityReset()
+	preciseIdentityRegistry.Lock()
+	defer preciseIdentityRegistry.Unlock()
+	if preciseIdentityRegistry.firstOpenEnd != 0 {
+		t.Fatal("first-open bracket leaked to a later fixture")
 	}
 }

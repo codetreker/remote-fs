@@ -1,7 +1,9 @@
 param(
     [Parameter(Mandatory)]
     [ValidateSet('Prepare', 'PrepareFixture', 'Run', 'Verify')]
-    [string]$Phase
+    [string]$Phase,
+    [ValidateSet('requested-only', 'always-truthful')]
+    [string]$IdentityContextPolicy = 'requested-only'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -11,6 +13,8 @@ $probeRoot = Join-Path $workspace '.tmp/native-precise-invalidation'
 $fixture = Join-Path $probeRoot 'fixture'
 $results = Join-Path $probeRoot 'results'
 $parent = Join-Path $PSScriptRoot 'native-smb-parent-invalidation.ps1'
+$IdentityContextPolicy = $IdentityContextPolicy.ToLowerInvariant()
+$env:RFS_QFID_POLICY = $IdentityContextPolicy
 
 function Canonical-Hash([string]$Path) {
     $bytes = [Text.Encoding]::UTF8.GetBytes([IO.File]::ReadAllText($Path).Replace("`r`n", "`n"))
@@ -45,7 +49,17 @@ if ((Canonical-Hash (Join-Path $PSScriptRoot 'native-smb-parent-invalidation_tes
 if ($Phase -in @('Prepare', 'Verify')) {
     & $parent -Phase $Phase -ProbeDirectory 'native-precise-invalidation'
     if ($LASTEXITCODE -ne 0) { throw "Shared precise $Phase failed." }
+    if ($Phase -eq 'Prepare') {
+        Write-JSON 'identity-policy.json' ([ordered]@{ Policy = $IdentityContextPolicy; DiagnosticOnly = $true; PriorRequestedOnlyControl = '35423839239' })
+    } else {
+        $selected = Get-Content (Join-Path $results 'identity-policy.json') -Raw | ConvertFrom-Json
+        if ($selected.Policy -ne $IdentityContextPolicy) { throw 'Identity response policy differs from the prepared fixture.' }
+    }
     exit 0
+}
+if ($Phase -eq 'Run') {
+    $selected = Get-Content (Join-Path $results 'identity-policy.json') -Raw | ConvertFrom-Json
+    if ($selected.Policy -ne $IdentityContextPolicy) { throw 'Identity response policy differs from the prepared fixture.' }
 }
 & $parent -Phase PrepareFixture -ProbeDirectory 'native-precise-invalidation'
 if ($LASTEXITCODE -ne 0) { throw 'Preparing the immutable precise fixture failed.' }
@@ -78,6 +92,38 @@ if ($LASTEXITCODE -ne 0) { throw 'Precise notification patch cannot be applied.'
 if ($LASTEXITCODE -ne 0) { throw 'Applying precise notification patch failed.' }
 foreach ($file in $patchFiles) { if ((Canonical-Hash (Join-Path $fixture $file.Path)) -ne $file.After) { throw "Precise patch output differs: $($file.Path)" } }
 
+$qfidFiles = @()
+$qfidPatchHash = $null
+if ($IdentityContextPolicy -eq 'always-truthful') {
+    $qfidPatch = Join-Path $PSScriptRoot 'native-smb-qfid-context.patch'
+    $qfidPatchHash = 'cb1ed433f9a2baa8ddaa4e63aabf47b682b7da48435005f1e7d0bdab67477d29'
+    if ((Canonical-Hash $qfidPatch) -ne $qfidPatchHash) { throw 'QFid response overlay differs from its reviewed source.' }
+    $qfidFiles = @(
+        @{ Path = 'packages/smb/commands_files.go'; Before = '88570edf50156ea4b275a33722bc1a90aca88cbcd427f1b0cc148e68bc9ef199'; After = '2ee3726368857e596b59cece06dc506936a04b71ab9c0a4f975be9b5a7d8c1cd' },
+        @{ Path = 'packages/smb/create_contexts.go'; Before = 'd349d4ab1c03243a6cc1bb99a94c48554a28ff1b1d88577f2a415be7d53952a7'; After = 'e0ddaee54ddcbde84f5603d8f11fc2c4fde87cb6f166ebccd5f3345020554254' },
+        @{ Path = 'packages/smb/commands_files_test.go'; Before = '8a3085efce3a839eebe379a3d0abb9b689fe3a88b4a074bdd2a53f865af46765'; After = 'd17ef825623c952c38acf83c106c8a60e0d7b38b4efe1a4b66feee73c441e5f2' }
+    )
+    $qfidNormalized = @(foreach ($file in $qfidFiles) {
+        $path = Join-Path $fixture $file.Path
+        $raw = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        $canonical = Canonical-Hash $path
+        if ($canonical -ne $file.Before) { throw "QFid patch input differs: $($file.Path)" }
+        [IO.File]::WriteAllText($path, [IO.File]::ReadAllText($path).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+        $normalized = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($normalized -ne $file.Before) { throw "QFid normalized input differs: $($file.Path)" }
+        [ordered]@{ Path = $file.Path; RawSHA256 = $raw; CanonicalSHA256 = $canonical; NormalizedSHA256 = $normalized }
+    })
+    Write-JSON 'qfid-patch-inputs.json' $qfidNormalized
+    $qfidApplied = Join-Path $results 'native-smb-qfid-context.patch'
+    [IO.File]::WriteAllText($qfidApplied, [IO.File]::ReadAllText($qfidPatch).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+    & git -c core.autocrlf=false -C $fixture apply --unidiff-zero --check $qfidApplied
+    if ($LASTEXITCODE -ne 0) { throw 'QFid response patch cannot be applied.' }
+    & git -c core.autocrlf=false -C $fixture apply --unidiff-zero $qfidApplied
+    if ($LASTEXITCODE -ne 0) { throw 'Applying QFid response patch failed.' }
+    foreach ($file in $qfidFiles) { if ((Canonical-Hash (Join-Path $fixture $file.Path)) -ne $file.After) { throw "QFid patch output differs: $($file.Path)" } }
+    Copy-Item (Join-Path $PSScriptRoot 'native-smb-qfid-context-controls_test.go.txt') (Join-Path $fixture 'packages/smb/gate_qfid_context_controls_test.go')
+}
+
 $testRoot = Join-Path $fixture 'packages/smb/windows'
 foreach ($name in @('history', 'history-controls', 'identity')) {
     Copy-Item (Join-Path $PSScriptRoot "native-smb-precise-$name`_test.go.txt") (Join-Path $testRoot "gate_precise_$($name.Replace('-', '_'))_windows_test.go")
@@ -109,6 +155,7 @@ Replace-Once $probe 'mappingCall := beginCall("map",' "if err := bridge.precise.
 Replace-Once $probe 'q.WriteStarted = time.Now()' "if err := bridge.precise.Arm(replacement, rename, action); err != nil { t.Fatal(`"precise action binding:`", err) }`nq.WriteStarted = time.Now()"
 Replace-Once $probe 'var receipt storage.FileActionReceipt' "var receipt storage.FileActionReceipt`nvar mutationBarrier *httprest.MutationBarrier"
 Replace-Once $probe 'receipt, err = replacement.Rename(t.Context(), rename, action)' 'receipt, mutationBarrier, err = replacement.(httprest.FileWithBarrier).RenameWithBarrier(t.Context(), rename, action)'
+Replace-Once $probe "q.Native = opened`n`t`tendCall(firstCall, &q.Native)" "q.Native = opened`n`t`tendCall(firstCall, &q.Native)`n`t`tpreciseIdentityEndFirstOpen()"
 Replace-Once $probe 'q.ACK = time.Now()' "q.ACK = time.Now()`nif proofErr := bridge.precise.Acknowledge(receipt, mutationBarrier, err); proofErr != nil { t.Errorf(`"precise action provenance: %v`", proofErr) }"
 Replace-Once $probe 'report.NotifyOutcomes = append(report.NotifyOutcomes, outcome)' @'
 report.NotifyOutcomes = append(report.NotifyOutcomes, outcome)
@@ -118,7 +165,7 @@ if detailErr := preciseRequireDetail(outcome); detailErr != nil {
     return detailErr
 }
 '@
-Replace-Once $probe "report.Wire, report.WireNotify = records, results`n" "report.Wire, report.WireNotify = records, results`npreciseIdentityAudit(t)`n"
+Replace-Once $probe "report.Wire, report.WireNotify = records, results`n" "report.Wire, report.WireNotify = records, results`npreciseIdentityAudit(t, report)`n"
 Replace-Once $wire "`t`tif !valid {`n`t`t`tr.Incomplete =" "`t`tif valid { valid = cacheGatePreciseIdentity(member, r) }`n`t`tif !valid {`n`t`t`tr.Incomplete ="
 
 $generated = @($authority, $bridge, $files, $probe, $wire,
@@ -126,17 +173,29 @@ $generated = @($authority, $bridge, $files, $probe, $wire,
     (Join-Path $testRoot 'gate_precise_history_controls_windows_test.go'),
     (Join-Path $testRoot 'gate_precise_identity_windows_test.go'),
     (Join-Path $fixture 'packages/smb/gate_precise_notify_controls_test.go'))
+if ($IdentityContextPolicy -eq 'always-truthful') { $generated += Join-Path $fixture 'packages/smb/gate_qfid_context_controls_test.go' }
 & gofmt -w @generated
 if ($LASTEXITCODE -ne 0) { throw 'Formatting generated precise fixture failed.' }
 $inputNames = @('native-smb-precise-invalidation.ps1', 'native-smb-precise-history.patch', 'native-smb-precise-history_test.go.txt', 'native-smb-precise-history-controls_test.go.txt', 'native-smb-precise-notify-controls_test.go.txt', 'native-smb-precise-identity_test.go.txt', 'native-smb-parent-invalidation.ps1', 'native-smb-parent-invalidation_test.go.txt')
+if ($IdentityContextPolicy -eq 'always-truthful') { $inputNames += @('native-smb-qfid-context.patch', 'native-smb-qfid-context-controls_test.go.txt') }
 $inputs = @($inputNames | ForEach-Object { [ordered]@{ Path = ".github/scripts/$_"; CanonicalSHA256 = Canonical-Hash (Join-Path $PSScriptRoot $_) } })
 $inputs += [ordered]@{ Path = '.github/workflows/native-smb-precise-invalidation.yml'; CanonicalSHA256 = Canonical-Hash (Join-Path $workspace '.github/workflows/native-smb-precise-invalidation.yml') }
-Write-JSON 'precise-inputs.json' ([ordered]@{ SourceSHA = $env:RFS_PARENT_SOURCE_SHA; Mode = $Phase; Mechanism = 'historical_detail'; PriorControlRun = '35419230739'; Files = $inputs; PatchSHA256 = $patchHash; PatchFiles = $patchFiles })
+if ($IdentityContextPolicy -eq 'always-truthful') { $inputs += [ordered]@{ Path = '.github/workflows/native-smb-qfid-invalidation.yml'; CanonicalSHA256 = Canonical-Hash (Join-Path $workspace '.github/workflows/native-smb-qfid-invalidation.yml') } }
+Write-JSON 'precise-inputs.json' ([ordered]@{ SourceSHA = $env:RFS_PARENT_SOURCE_SHA; Mode = $Phase; Mechanism = 'historical_detail'; IdentityContextPolicy = $IdentityContextPolicy; PriorControlRun = $(if ($IdentityContextPolicy -eq 'always-truthful') { '35423839239' } else { '35419230739' }); Files = $inputs; PatchSHA256 = $patchHash; PatchFiles = $patchFiles; QFidPatchSHA256 = $qfidPatchHash; QFidPatchFiles = $qfidFiles })
 Write-JSON 'precise-generated-source.json' @($generated | ForEach-Object { [ordered]@{ Path = [IO.Path]::GetRelativePath($fixture, $_).Replace('\', '/'); SHA256 = Canonical-Hash $_ } })
+if ($IdentityContextPolicy -eq 'always-truthful') { Write-JSON 'qfid-generated-source.json' @($qfidFiles | ForEach-Object { [ordered]@{ Path = $_.Path; SHA256 = Canonical-Hash (Join-Path $fixture $_.Path) } }) }
 if ($Phase -eq 'PrepareFixture') { exit 0 }
 
 Push-Location $fixture
 try {
+    if ($IdentityContextPolicy -eq 'always-truthful') {
+        Invoke-Controls './packages/smb' '^TestGateAlwaysQFid|^TestUnbufferedCreateIsRejectedBeforeBackendAdmission$|^TestCreateRetainsExactParentAndBoundsHandles$|^TestProtocolNativeCreateDeclinesOptionalCaching$|^TestNativeBackupMetadataOpenPreservesIntentAndAbsence$|^TestCompoundReplyReservationCoversPayloadAndErrorFrames$|^TestCreateReturnsRequestedIdentityAndMaximalAccessContexts$|^TestMaximalAccessContextDistinguishesUnchangedFromUnknown$|^TestCreateContextsEncodeOnlyZeroLeaseRights$|^TestGateMissingStatus' @(
+            'TestGateAlwaysQFidContexts', 'TestGateAlwaysQFidAdmission', 'TestGateAlwaysQFidCapturedIdentity', 'TestGateAlwaysQFidFailureOwnership', 'TestGateAlwaysQFidSignedNoLeasing',
+            'TestUnbufferedCreateIsRejectedBeforeBackendAdmission', 'TestCreateRetainsExactParentAndBoundsHandles', 'TestProtocolNativeCreateDeclinesOptionalCaching',
+            'TestNativeBackupMetadataOpenPreservesIntentAndAbsence', 'TestCompoundReplyReservationCoversPayloadAndErrorFrames', 'TestCreateReturnsRequestedIdentityAndMaximalAccessContexts',
+            'TestMaximalAccessContextDistinguishesUnchangedFromUnknown', 'TestCreateContextsEncodeOnlyZeroLeaseRights', 'TestGateMissingStatusRequiresVerifiedParent', 'TestGateMissingStatusOnlyChangesFinalCreate'
+        ) 'qfid-context-controls.jsonl'
+    }
     Invoke-Controls './packages/smb' '^TestDiagnosticNotification' @(
         'TestDiagnosticNotificationQueueOwnership', 'TestDiagnosticNotificationClosePinsValidation',
         'TestDiagnosticNotificationDisclosure', 'TestDiagnosticNotificationRetirementWhileValidating',
@@ -150,6 +209,7 @@ try {
         'TestPreciseHistorySnapshotMustReachSemanticEOF', 'TestPreciseHistorySnapshotSourceIncarnation',
         'TestPreciseHistoryEvidenceOwnsBoundedFacts', 'TestPreciseHistoryEvidenceBoundPreservesFirstFacts',
         'TestPreciseIdentityContexts', 'TestPreciseIdentityQueries', 'TestPreciseIdentityCorrelation', 'TestPreciseIdentityHandleBinding', 'TestPreciseIdentityInheritedSession', 'TestPreciseNotificationMode',
+        'TestPreciseQFidPolicy', 'TestPreciseQFidPolicyRefusals', 'TestPreciseQFidOutcomeSeparation', 'TestPreciseQFidAmbiguousAndOtherCreates', 'TestPreciseFirstOpenEndOrdinal',
         'TestParentInvalidationNotifyParsing', 'TestParentInvalidationHookCorrelation',
         'TestParentInvalidationQualification'
     ) 'precise-producer-observer-controls.jsonl'
@@ -157,12 +217,13 @@ try {
     & go test -c -o $binary './packages/smb/windows'
     if ($LASTEXITCODE -ne 0) { throw 'Building the precise native test executable failed.' }
     $binaryHash = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()
-    Write-JSON 'precise-native-binary.json' ([ordered]@{ SHA256 = $binaryHash; Size = (Get-Item $binary).Length; GoVersion = (& go version); SourceSHA = $env:RFS_PARENT_SOURCE_SHA; Test = 'TestNativePreciseReplacement' })
+    Write-JSON 'precise-native-binary.json' ([ordered]@{ SHA256 = $binaryHash; Size = (Get-Item $binary).Length; GoVersion = (& go version); SourceSHA = $env:RFS_PARENT_SOURCE_SHA; Test = 'TestNativePreciseReplacement'; IdentityContextPolicy = $IdentityContextPolicy })
     $path = Join-Path $results 'precise-native.jsonl'
     & go tool test2json -t -p 'github.com/codetreker/remote-fs/packages/smb/windows' $binary '-test.v=test2json' '-test.count=1' '-test.timeout=3m' '-test.run=^TestNativePreciseReplacement$' 2>&1 | Tee-Object -FilePath $path
     $nativeExit = $LASTEXITCODE
     if ((Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant() -ne $binaryHash) { throw 'The executed precise test binary changed during the run.' }
-    Assert-Verdicts $path $nativeExit @('TestNativePreciseReplacement', 'TestNativePreciseReplacement/share0_app_first_replace_identity_precise')
+    $cell = if ($IdentityContextPolicy -eq 'always-truthful') { 'share0_app_first_replace_identity_always_qfid' } else { 'share0_app_first_replace_identity_precise' }
+    Assert-Verdicts $path $nativeExit @('TestNativePreciseReplacement', "TestNativePreciseReplacement/$cell")
 } finally {
     Pop-Location
 }
