@@ -374,7 +374,7 @@ function Test-InboxOwnedPath([string]$Path,[string]$Root) {
     $pathValue=Convert-InboxLocalPath $Path;$rootValue=Convert-InboxLocalPath $Root
     return $pathValue.Equals($rootValue,[StringComparison]::OrdinalIgnoreCase) -or $pathValue.StartsWith($rootValue+'\',[StringComparison]::OrdinalIgnoreCase)
 }
-function Assert-InboxLocalClient([string]$Name,$Ledger) {
+function Assert-InboxLocalClient([string]$Name,$Ledger,[bool]$AllowUnzoned=$false) {
     if($Name.Equals($Ledger.computer,[StringComparison]::OrdinalIgnoreCase)){return}
     $text=$Name
     if($text.StartsWith('[') -and $text.EndsWith(']')){$text=$text.Substring(1,$text.Length-2)}
@@ -383,6 +383,22 @@ function Assert-InboxLocalClient([string]$Name,$Ledger) {
     if($address.IsIPv4MappedToIPv6){$address=$address.MapToIPv4()}
     if([Net.IPAddress]::IsLoopback($address)){return}
     foreach($local in $Ledger.addresses){$candidate=[Net.IPAddress]::Parse($local);if($candidate.IsIPv4MappedToIPv6){$candidate=$candidate.MapToIPv4()};if($candidate.Equals($address)){return}}
+    # This corroborates the fixture's administrative snapshot, without assigning a zone or establishing client identity.
+    # Unzoned link-local addresses are not independent access-control selectors: https://www.rfc-editor.org/rfc/rfc4007.html#section-12
+    if($AllowUnzoned -and $Name.Length -le 1024 -and -not $text.Contains('%') -and $text.IndexOfAny([char[]]'[]') -lt 0 -and $address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6 -and $address.IsIPv6LinkLocal -and $address.ScopeId -eq 0 -and -not $address.IsIPv4MappedToIPv6 -and @($Ledger.addresses).Count -le 128){
+        $bounded=$true
+        foreach($local in $Ledger.addresses){if($local -isnot [string] -or $local.Length -gt 1024){$bounded=$false;break}}
+        if($bounded){
+            $bytes=[Convert]::ToHexString($address.GetAddressBytes());$matches=0;$matched=$null;$matchedInput=$null
+            foreach($local in $Ledger.addresses){
+                $candidate=[Net.IPAddress]::Parse($local)
+                if($candidate.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6 -and $candidate.IsIPv6LinkLocal -and [Convert]::ToHexString($candidate.GetAddressBytes()) -ceq $bytes){$matches++;$matched=$candidate;$matchedInput=$local}
+            }
+            if($matches -eq 1 -and $matched.ScopeId -ne 0){
+                return [ordered]@{mode='unique_unzoned_link_local_inventory_match';evaluated_argument=$Name;peer=Get-InboxAddressObservation $address;local_input=$matchedInput;local=Get-InboxAddressObservation $matched;exact_equals=$address.Equals($matched)}
+            }
+        }
+    }
     throw 'Administrative client address is not local.'
 }
 function Get-InboxAddressObservation([Net.IPAddress]$Address) {
@@ -449,7 +465,11 @@ function Write-InboxOriginRefusal([string]$Path,$Record) {
 }
 function Assert-InboxSelectedPeer($Ledger,[int]$Stage,[string]$Kind,[string]$OpenID,[string]$SessionID,[string]$Scope,[string]$Instance,$Value) {
     $argument=[string]$Value
-    try{Assert-InboxLocalClient $argument $Ledger}
+    try{
+        $match=Assert-InboxLocalClient $argument $Ledger ($Value -is [string])
+        if($null -ne $match){return $match}
+        return
+    }
     catch{
         $original=$_
         try{
@@ -511,12 +531,13 @@ function Get-InboxOrigin($Ledger,[int]$Stage) {
             if((Convert-InboxID (Get-InboxRequired $found 'SessionId')) -cne $session -or [string](Get-InboxRequired $found 'ScopeName') -cne $scope -or [string](Get-InboxRequired $found 'SmbInstance') -cne $instance){throw 'Server session join changed its exact identity.'}
             if((Resolve-InboxSID ([string](Get-InboxRequired $found 'ClientUserName'))) -cne $Ledger.token.sid){throw 'Server-authenticated client SID differs.'}
             $peer=Get-InboxRequired $found 'ClientComputerName'
-            Assert-InboxSelectedPeer $Ledger $Stage 'session' $id $session $scope $instance $peer
+            $sessionPeerMatch=Assert-InboxSelectedPeer $Ledger $Stage 'session' $id $session $scope $instance $peer
             $sessions[$session]=[ordered]@{id=$session;scope=$scope;instance=$instance;sid=$Ledger.token.sid;local_client=$true}
+            if($null -ne $sessionPeerMatch){$sessions[$session].peer_match=$sessionPeerMatch}
         }
         if((Resolve-InboxSID ([string](Get-InboxRequired $open 'ClientUserName'))) -cne $Ledger.token.sid){throw 'Open-file authenticated SID differs.'}
         $peer=Get-InboxRequired $open 'ClientComputerName'
-        Assert-InboxSelectedPeer $Ledger $Stage 'open' $id $session $scope $instance $peer
+        $openPeerMatch=Assert-InboxSelectedPeer $Ledger $Stage 'open' $id $session $scope $instance $peer
         $path=Convert-InboxLocalPath ([string](Get-InboxRequired $open 'Path'))
         $relative=[string](Get-InboxRequired $open 'ShareRelativePath')
         $expected=$path.Substring($Ledger.root_local.Length).TrimStart('\')
@@ -524,7 +545,9 @@ function Get-InboxOrigin($Ledger,[int]$Stage) {
         if($path.Equals($Ledger.root_local,[StringComparison]::OrdinalIgnoreCase)){$roles.root=$true}
         if($path.Equals($Ledger.root_local+'\v',[StringComparison]::OrdinalIgnoreCase)){$roles.v=$true}
         if($path.Equals($Ledger.root_local+'\v\target',[StringComparison]::OrdinalIgnoreCase)){$roles.target=$true}
-        $rows.Add([ordered]@{id=$id;session=$session;path=$path;relative_path=$relative;scope=$scope;instance=$instance})
+        $row=[ordered]@{id=$id;session=$session;path=$path;relative_path=$relative;scope=$scope;instance=$instance}
+        if($null -ne $openPeerMatch){$row.peer_match=$openPeerMatch}
+        $rows.Add($row)
     }
     if(-not $roles.root -or -not $roles.v -or -not $roles.target){throw 'Administrative snapshot lacks explicit root/v/target open roles.'}
     $raw=[ordered]@{stage=$Stage;nonce=$Ledger.nonce;connections=@($connections);sessions=@($sessions.Values);opens=@($rows);mechanism_trace_complete=$false}

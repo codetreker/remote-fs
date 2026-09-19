@@ -72,7 +72,11 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 [controller](../../../../.github/scripts/native-smb-inbox-reference.ps1)以绑定 nonce/PID/executable 的双阶段 IPC，在 mutation 前和原生观测完成后核对真实 server session/open、当前 SID 与 owned share/path；server bookkeeping ID 不冒充 native FileIndex。子进程拥有映射、watcher 和所有 handle，六十秒生命周期后仅另有五秒 termination/drain；未确认退出保留 ledger，forced 仍失败。只有原 child 静止、精确 mapping/share/目录指纹继续匹配时才清理；Temporary 的重启寿命不能代替清理完成。
 
-来源拒绝时，controller 只捕获现有选中 session/open 行的 ClientComputerName 原 CLR type、支持的 raw string、确切传入字符串，以及已有 preflight 本地地址的解析/原相等比较事实。记录 source/nonce/stage、opaque 行 ID 和已完成检查，不增加 CIM、接口或 DNS 查询，也不改变地址准入判据。每阶段独占写入的 UTF-8 证据至多 64 KiB；未知 type 或超限明确 capture_incomplete，解析失败与不可用事实显式保留，不截断后猜出地址。捕获、写入或关闭故障另保留，最初的 origin error 继续是主失败；诊断不能授权后续 mutation。
+来源拒绝时，controller 只捕获现有选中 session/open 行的 ClientComputerName 原 CLR type、支持的 raw string、确切传入字符串，以及已有 preflight 本地地址的解析/原相等比较事实。记录 source/nonce/stage、opaque 行 ID 和已完成检查，不增加 CIM、接口或 DNS 查询。每阶段独占写入的 UTF-8 证据至多 64 KiB；未知 type 或超限明确 capture_incomplete，解析失败与不可用事实显式保留，不截断后猜出地址。捕获、写入或关闭故障另保留，最初的 origin error 继续是主失败；诊断不能授权后续 mutation。
+
+管理 peer 的原精确 computer-name、loopback、mapped-address 与 IPAddress.Equals 成功路径保持。只有最后未匹配分支中的原始 string 不含显式 `%`、解析为 scope0 的 IPv6 link-local，且现有有界 preflight 输入恰有一行同 16 字节、非零 zone 的 link-local 地址时，才记录 `unique_unzoned_link_local_inventory_match`。同字节重复行（即使同 zone）、多个 zone、显式 `%0` 或不匹配 zone、foreign/port/非 link-local 等不能借此分支通过；畸形或超限比较输入失败，不跳过行；已经由原精确路径通过的情形不重分类。
+
+对应成功 session/open 行的可选 peer_match 分别保留 raw peer、原 scope0、匹配 local input/nonzero scope 和 exact_equals=false，不把 peer 的 scope 改写为本地值。它只佐证这一 fixture 的管理字段表示，不能证明 wire zone、入站接口、独立客户端身份或作为 ACL；后续 SID、owned share/path、唯一 session、live opens、child/mapping/stage 全部仍须通过后才发 admit。来源 artifact/hash 绑定此方法与原始事实，原失败捕获和清理规则不变。
 
 这一参考没有完整 packet/lease/break 轨迹，receipt 固定 mechanism_trace_complete=false。B 不经 fixture 的 SMB 预开或枚举只是调用纪律，不能证明自动流量中的 cold B；没有目标副作用的管理查询也不证明 connection topology。来源、变更、原生观察与清理均完整时，结果才具有 native_behavior_pass/failure 的资格；未知保留原始观察并按不完整处理，不归纳为内部 FCB、未请求 QFid 符合性或当前生产验收。
 
@@ -177,6 +181,8 @@ early+QFid 的本地适用控制 82 根、普通/race 各 635 verdict 通过；�
 
 inbox 参考的[生成器](../../../../.github/scripts/native-smb-inbox-reference-generate.go)按源码 hash 与符号提取七份输入中的 38 个既有 native helper 声明，原 legacy identity/data/time 判据不改写；独立 module 不引入 SMB authority、HTTP 或 metastore。五个可移植根普通/race 各 73 verdict 通过，身份与 share 指纹的隔离对照命中断言；controller 的完整函数体用例模拟 Windows/cmdlet 边界，真实 Linux 子进程用例只证明 stdio/wait/kill 拥有权。ARM64 构建及静态检查不证明原生效果。[首次运行 35446155273](https://github.com/codetreker/remote-fs/actions/runs/35446155273)已建立本次 current-logon mapping 并到达 Ready1，随后在 administrative origin 核对处拒绝；没有进入 local Rename、Hnew 或新旧身份/字节判定。选中 session 与 open 两处复用同一判据，旧回执没有导出被拒绝的 raw peer 或具体调用点，因此不能从这次运行认定 IPv6、scope 或其它地址原因。child 经强制结束且已确认退出，精确 mapping/share/目录物理清理完成，原拒绝与 forced 失败仍保留；native behavior 尚未建立。
 
-来源捕获的本地模拟控制共 68 项（capture 22、origin 24、controller 22）通过，绕过捕获的对照在选中 session/open 行证据断言失败。准入 predicate、原 native helper、生成结果和 binary 保持；既有普通/race 与构建证据复用，不声称重复执行。新增捕获尚未原生运行，也不改写首次来源拒绝和所有既有身份结果。
+[捕获运行 35448201633](https://github.com/codetreker/remote-fs/actions/runs/35448201633)在 Ready1 的选中 session 行记录了无 zone 的原始 link-local string：peer scope0，现有本地输入唯一同字节行的 scope16，原精确 Equals=false。运行仍在 mutation/Hnew 前拒绝，没有身份 verdict；forced child 的实际退出与物理清理完成，原失败保留。这是该次管理字段表示导致的拒绝，不回填首次 35446155273 缺失的 peer，也不推断 wire zone。
+
+唯一管理字段佐证的本地模拟控制共 107 项（zone 39、capture 22、origin 24、controller 22）通过；关闭新分支与丢弃 provenance 的两个对照命中断言，原 raw scope0/local scope16/Equals=false 不改写。native helper、生成结果、binary 与进程拥有者保持，既有 Go 普通/race 和 ARM64 证据复用，此次不声称运行或重建。新规则尚未原生执行，既有来源拒绝和所有身份失败保持独立。
 
 代价是维护固定基底补丁、注入锚点、回归、十八个诊断作业及相互隔离的祖先/身份实验，输入不会自动跟随生产代码。诊断提供可行性或失败证据，不交付新的 SMB 文件实现、SQLite 持久性或历史时间显示策略。实际 package、transport 和 backend 仍须独立验收；缓存失效机制与平台接入仍由平台提案承接，既有一秒要求保持不变。
