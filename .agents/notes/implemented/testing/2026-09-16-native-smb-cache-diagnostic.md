@@ -54,6 +54,10 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 [补丁与控制](../../../../.github/scripts/native-smb-posix-capability-controls_test.go.txt)保持名字、serial、协商、requested-only QFid、native 首调用和全部身份/字节期限不变。真正 Fs5 的 raw/decoded 响应须绑定 HA，先于与被动事件同域的全局 mutation marker；该 marker 位于原 native-call mutation boundary 后、Rename 前，不增加查询。否则能力未暴露或证据无效，即使其它观察看似正确也不能算该机制成功。always-QFid 的失败独立保留，不与这一个能力位同时改变。
 
+[组合单项](../../../../.github/workflows/native-smb-posix-qfid-invalidation.yml)检验 POSIX 能力曝光是否改变随后真实新 QFid 的处理；这只是两个已定刺激的交互假设。显式 InteractionPolicy=posix-qfid 才允许同时启用 posix-unlink-rename/always-truthful，默认 standalone 保留原三个配置和意外组合拒绝。两份语义补丁/控制模板不变，先核对 QFid 的中间结果再施加 POSIX 位，未知或反序输入拒绝。
+
+成功资格要求同一 HA 的实际 Fs5 早于全局 mutation，完整 DETAIL 后的首个新 CREATE 确实未请求但接收到真实 B/volume QFid；两份证据分别保留且都须成立。一个能力已暴露不能补足另一个缺席，新增回复也不能补造原生身份成功。原 first-call、HA 稳定/Hnew 不同、opaque 身份与 A/B 字节、一秒/TTL、冷 B 和清理不变；旧 alias 与 retained-identity 失败不会被重新解释。未请求 QFid 的符合性及客户端内部机制继续独立未决。
+
 ## 备选方案
 
 **等整套新实现完成后才运行原生验收。** 最终仍要这样验证交付代码，但把可行性诊断也推迟到那时，会让一个已经知道可能失败的缓存行为在大量实现之后才决定能否交付。固定原型让这项依赖提前得到可复现的回答。
@@ -139,6 +143,10 @@ always-truthful QFid 的本地适用控制共 46 根，普通/race 各 380 个 v
 
 每次结果绑定固定基底、overlay、探针 commit、variant、OS/build 和缓存设置；无 overlay 的样本保留各自来源。JSON 轨迹、Go verdict、映射前后状态和最终引用数作为产物保存十四天。轨迹溢出、编码失败、设置改变或映射残留使样本失败；取消 overlapped 通知须等真实完成后才释放结构和缓冲，意外清理错误不能当作正常取消。
 
-POSIX 单项的实际准备证明非测试源码仅改变 Fs5 能力位，适用本地控制 41 根、普通/race 各 395 verdict，两个旧能力位负向对照、十二项脚本策略和三种 ARM64 组合构建通过。backend 控制证明自己的 retained A/B 行为，不是 Windows 结果；新单项原生观察仍未知。
+POSIX 单项的实际准备证明非测试源码仅改变 Fs5 能力位，适用本地控制 41 根、普通/race 各 395 verdict，两个旧能力位负向对照、十二项脚本策略和三种 ARM64 组合构建通过。backend 控制证明自己的 retained A/B 行为，不是 Windows 结果。
+
+[POSIX 原生单项 35428678823](https://github.com/codetreker/remote-fs/actions/runs/35428678823)绑定探针 `09d65eb77f74d4bda6dceab4f5a73e8f98496cf6`，实际 HA Fs5 raw/decoded flags=0x406，最大 component=255、名字不变，且响应全局序号 11 先于 mutation 12 和首次新打开 14。完整 DETAIL、冷 B、来源、oracle 与清理有效，395 个控制 verdict 通过，单项仍为合格 replacement_identity_aliased：初始 HA、Hnew、保留 HA 的 native FileIndex 均为 3，旧 A257 与新 B769 字节各自正确；requested-only 的新 CREATE 仍没有 QFid。全部身份/字节检查在 ACK 后 36.3051 ms 完成。能力曝光发生在 HA 创建之后、mutation 之前；结果仅约束这个已测顺序，不证明其它时点或内部 FCB 行为，也不是超过一秒的陈旧或所有无驱动 SMB 方案不可能的结论。
+
+组合准备的本地控制 50 根、普通/race 各 452 verdict 通过，两个单刺激移除对照在原联合 exposure 断言失败；十九项策略控制、三项 source guard 和四种 ARM64 组合构建完成。三个旧分支的 254 份非测试 Go 输入及原生调用序列保持原样，新组合也不增加原生 API。组合的实际 Windows 单项仍未运行；本地结果不能证明这种交互能修复身份或决定生产采用。
 
 代价是维护固定基底补丁、注入锚点、回归、十八个诊断作业及相互隔离的祖先/身份实验，输入不会自动跟随生产代码。诊断提供可行性或失败证据，不交付新的 SMB 文件实现、SQLite 持久性或历史时间显示策略。实际 package、transport 和 backend 仍须独立验收；缓存失效机制与平台接入仍由平台提案承接，既有一秒要求保持不变。

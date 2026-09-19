@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -78,12 +79,18 @@ type fakeChild struct {
 	finishBefore   func(time.Time) (bool, error)
 	verify         func(context.Context, net.Conn) (map[string]any, error)
 	verifications  int
+	doneCalled     func()
 }
 
 func (p *fakeChild) Input() io.WriteCloser { return p.input }
 func (p *fakeChild) Output() io.ReadCloser { return p.output }
 func (p *fakeChild) Errors() io.ReadCloser { return p.stderr }
-func (p *fakeChild) Done() <-chan struct{} { return p.done }
+func (p *fakeChild) Done() <-chan struct{} {
+	if p.doneCalled != nil {
+		p.doneCalled()
+	}
+	return p.done
+}
 func (p *fakeChild) Result() error         { return p.result }
 func (p *fakeChild) PID() uint32           { return 42 }
 func (p *fakeChild) Finish() (bool, error) { return p.FinishBefore(time.Now().Add(10 * time.Second)) }
@@ -1098,5 +1105,397 @@ func TestSocketLifecycleFailureStagesCleanOwnedResources(t *testing.T) {
 				t.Fatalf("pristine fixture changed: %v", hashErr)
 			}
 		})
+	}
+}
+
+type terminalBytesReader struct {
+	data []byte
+	err  error
+}
+
+func (r *terminalBytesReader) Read(data []byte) (int, error) {
+	n := copy(data, r.data)
+	r.data = r.data[n:]
+	if len(r.data) == 0 {
+		return n, r.err
+	}
+	return n, nil
+}
+
+type terminalReadConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (c terminalReadConn) Read(data []byte) (int, error) { return c.reader.Read(data) }
+
+func terminalResetError() error {
+	return &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("wsarecv", syscall.Errno(10054))}
+}
+
+func terminalGuest(t *testing.T, data []byte, readErr error) (*guestChannel, *fakeChild) {
+	t.Helper()
+	guest, err := newGuestChannel(testIdentity(), privateTestDirectory(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, _ := controlTestPair(t)
+	process := childWithOutput("", false)
+	guest.startDiagnostics(process)
+	guest.startSerial(terminalReadConn{Conn: conn, reader: &terminalBytesReader{data: bytes.Clone(data), err: readErr}})
+	ctx := socketTestContext(t)
+	select {
+	case <-guest.serial.done:
+	case <-ctx.Done():
+		t.Fatal("terminal reader did not finish")
+	}
+	t.Cleanup(func() {
+		conn.Close()
+		if err := joinReaders(socketTestContext(t), guest.readers); errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("terminal reader remained unjoined: %v", err)
+		}
+		if err := guest.closeLogs(); err != nil {
+			t.Errorf("terminal evidence close: %v", err)
+		}
+	})
+	return guest, process
+}
+
+func TestTerminalQueuedShutdownAckPrecedesResetFault(t *testing.T) {
+	zero := 0
+	ack := controlResponseLine(t, response{identity: testIdentity(), Phase: "shutdown", Sequence: 4, Op: "shutdown", Status: "ok", ExitCode: &zero})
+	guest, process := terminalGuest(t, ack, terminalResetError())
+	if len(guest.responses) != 1 || len(guest.fault) != 1 {
+		t.Fatal("test did not queue exact ACK before terminal fault selection")
+	}
+	value, err := guest.receive(socketTestContext(t), 4, "shutdown", "shutdown")
+	if err != nil || value.Sequence != 4 || value.ExitCode == nil || *value.ExitCode != 0 {
+		t.Fatalf("queued final ACK was lost to reset: value=%v err=%v", value, err)
+	}
+	if !errors.Is(guest.serial.err, syscall.Errno(10054)) {
+		t.Fatalf("raw reset observation lost: %v", guest.serial.err)
+	}
+	select {
+	case <-process.done:
+		t.Fatal("receiving ACK invented natural process exit")
+	default:
+	}
+	if process.finishes != 0 {
+		t.Fatal("terminal reset forced cleanup before natural exit")
+	}
+}
+
+func TestTerminalResetRequiresExactShutdownAcknowledgement(t *testing.T) {
+	zero, nonzero := 0, 1
+	for _, name := range []string{"missing", "wrong-sequence", "wrong-phase", "wrong-op", "missing-exit", "nonzero-exit", "wrong-identity", "guest-error", "earlier-phase", "wrong-request-sequence"} {
+		t.Run(name, func(t *testing.T) {
+			ack := response{identity: testIdentity(), Phase: "shutdown", Sequence: 4, Op: "shutdown", Status: "ok", ExitCode: &zero}
+			sequence, op, phase := uint64(4), "shutdown", "shutdown"
+			switch name {
+			case "wrong-sequence":
+				ack.Sequence = 3
+			case "wrong-phase":
+				ack.Phase = "boot"
+			case "wrong-op":
+				ack.Op = "stop-authority"
+			case "missing-exit":
+				ack.ExitCode = nil
+			case "nonzero-exit":
+				ack.ExitCode = &nonzero
+			case "wrong-identity":
+				ack.Nonce = strings.Repeat("c", 64)
+			case "guest-error":
+				ack.Status = "error"
+				ack.Category = "unmount"
+				ack.Cause = "unmount failed"
+			case "earlier-phase":
+				ack.Phase = "start"
+				ack.Op = "start"
+				ack.Sequence = 1
+				sequence, op, phase = 1, "start", "start"
+			case "wrong-request-sequence":
+				sequence = 5
+			}
+			data := controlResponseLine(t, ack)
+			if name == "missing" {
+				data = []byte("kernel: Power down\n")
+			}
+			guest, process := terminalGuest(t, data, terminalResetError())
+			if _, err := guest.receive(socketTestContext(t), sequence, op, phase); err == nil {
+				t.Fatal("reset supplied missing or invalid shutdown acknowledgement")
+			}
+			if process.finishes != 0 {
+				t.Fatal("ACK failure itself invoked process cleanup")
+			}
+		})
+	}
+}
+
+func terminalShutdownLine(t *testing.T) []byte {
+	t.Helper()
+	zero := 0
+	return controlResponseLine(t, response{identity: testIdentity(), Phase: "shutdown", Sequence: 4, Op: "shutdown", Status: "ok", ExitCode: &zero})
+}
+
+func TestTerminalShutdownWaitsForNaturalExit(t *testing.T) {
+	for _, name := range []string{"reset", "eof"} {
+		t.Run(name, func(t *testing.T) {
+			readErr := terminalResetError()
+			if name == "eof" {
+				readErr = io.EOF
+			}
+			guest, process := terminalGuest(t, append(terminalShutdownLine(t), []byte("kernel: Power down\n")...), readErr)
+			originalTerminal := guest.serial.err
+			ctx := socketTestContext(t)
+			if _, err := guest.receive(ctx, 4, "shutdown", "shutdown"); err != nil {
+				t.Fatal(err)
+			}
+			entered := make(chan struct{})
+			var once sync.Once
+			process.doneCalled = func() { once.Do(func() { close(entered) }) }
+			type completion struct {
+				evidence map[string]any
+				err      error
+			}
+			finished := make(chan completion, 1)
+			go func() { evidence, err := guest.awaitShutdown(ctx); finished <- completion{evidence, err} }()
+			var exitOnce sync.Once
+			exit := func() { exitOnce.Do(func() { close(process.done) }) }
+			defer exit()
+			select {
+			case <-entered:
+			case <-ctx.Done():
+				t.Fatal("terminal completion did not wait on owned process")
+			}
+			select {
+			case result := <-finished:
+				t.Fatalf("terminal result preceded natural process exit: %v", result.err)
+			default:
+			}
+			if process.finishes != 0 {
+				t.Fatal("serial termination forced process cleanup")
+			}
+			exit()
+			var result completion
+			select {
+			case result = <-finished:
+			case <-ctx.Done():
+				t.Fatal("natural exit did not complete shutdown")
+			}
+			if result.err != nil {
+				t.Fatal(result.err)
+			}
+			termination, raw := "qualified-reset", readErr.Error()
+			if name == "eof" {
+				termination, raw = "eof", ""
+			}
+			if result.evidence["serial_termination"] != termination || result.evidence["serial_error"] != raw || result.evidence["serial_complete_record"] != true || result.evidence["qemu_exit"] != 0 {
+				t.Fatalf("terminal evidence lost reset/EOF distinction: %v", result.evidence)
+			}
+			if name == "reset" && !errors.Is(guest.serial.err, syscall.Errno(10054)) {
+				t.Fatalf("qualified reset was erased: %v", guest.serial.err)
+			}
+			deadline, _ := ctx.Deadline()
+			if forced, err := finishGuest(process, nil, guest, deadline); forced || err != nil {
+				t.Fatalf("qualified terminal result failed cleanup: forced=%v err=%v", forced, err)
+			}
+			if guest.serial.err != originalTerminal {
+				t.Fatal("qualification or cleanup rewrote the serial result")
+			}
+		})
+	}
+}
+
+func TestTerminalResetPartialTailRemainsFatal(t *testing.T) {
+	reset := terminalResetError()
+	guest, process := terminalGuest(t, append(terminalShutdownLine(t), []byte("unfinished kernel record")...), reset)
+	var terminal *serialReadTermination
+	if !errors.As(guest.serial.err, &terminal) || terminal.completeRecord || !errors.Is(guest.serial.err, syscall.Errno(10054)) {
+		t.Fatalf("Scanner reset hid incomplete record: %v", guest.serial.err)
+	}
+	ctx := socketTestContext(t)
+	_, ackErr := guest.receive(ctx, 4, "shutdown", "shutdown")
+	close(process.done)
+	if ackErr == nil {
+		if evidence, err := guest.awaitShutdown(ctx); err == nil {
+			t.Fatalf("partial trailing record qualified: %v", evidence)
+		}
+	}
+	deadline, _ := ctx.Deadline()
+	if _, err := finishGuest(process, nil, guest, deadline); err == nil {
+		t.Fatal("partial-tail serial error disappeared during cleanup")
+	}
+}
+
+func TestTerminalShutdownRejectsMissingFactsAndOtherErrors(t *testing.T) {
+	failure := errors.New("unrelated reader failure")
+	for _, name := range []string{"no-verified-ack", "nonzero-process", "expired-deadline", "other-io", "joined-read-error", "joined-fault-error", "diagnostic-error"} {
+		t.Run(name, func(t *testing.T) {
+			readErr := terminalResetError()
+			if name == "other-io" {
+				readErr = io.ErrUnexpectedEOF
+			}
+			if name == "joined-read-error" {
+				readErr = errors.Join(readErr, failure)
+			}
+			guest, process := terminalGuest(t, terminalShutdownLine(t), readErr)
+			ctx := socketTestContext(t)
+			var ackErr error
+			if name != "no-verified-ack" {
+				_, ackErr = guest.receive(ctx, 4, "shutdown", "shutdown")
+			}
+			if ackErr != nil {
+				if name != "other-io" && name != "joined-read-error" {
+					t.Fatal(ackErr)
+				}
+				if name == "joined-read-error" && !errors.Is(ackErr, failure) {
+					t.Fatalf("joined unrelated read error was lost: %v", ackErr)
+				}
+				if name == "other-io" && !errors.Is(ackErr, io.ErrUnexpectedEOF) {
+					t.Fatalf("different IO cause was lost: %v", ackErr)
+				}
+				return
+			}
+			if name == "joined-fault-error" {
+				select {
+				case observed := <-guest.fault:
+					if !errors.Is(observed, syscall.Errno(10054)) {
+						t.Fatalf("unexpected pending fault: %v", observed)
+					}
+				default:
+				}
+				guest.fault <- errors.Join(guest.serial.err, failure)
+			}
+			if name == "diagnostic-error" {
+				done := make(chan struct{})
+				close(done)
+				guest.readers = append(guest.readers, &ownedReader{name: "failed diagnostic", done: done, err: failure})
+			}
+			if name == "nonzero-process" {
+				process.result = failure
+			}
+			if name == "expired-deadline" {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				defer cancel()
+			}
+			close(process.done)
+			if evidence, err := guest.awaitShutdown(ctx); err == nil {
+				t.Fatalf("missing shutdown fact was accepted: %v", evidence)
+			} else {
+				if name == "expired-deadline" && !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("shutdown restarted its deadline: %v", err)
+				}
+				if (name == "nonzero-process" || name == "diagnostic-error" || name == "joined-read-error" || name == "joined-fault-error") && !errors.Is(err, failure) {
+					t.Fatalf("unrelated failure was swallowed: %v", err)
+				}
+			}
+			if process.finishes != 0 {
+				t.Fatal("terminal observation forced process cleanup")
+			}
+		})
+	}
+}
+
+func TestTerminalQualifiedResetDoesNotForgiveJobCleanup(t *testing.T) {
+	failure := errors.New("job state unknown")
+	for _, name := range []string{"forced", "unknown"} {
+		t.Run(name, func(t *testing.T) {
+			guest, process := terminalGuest(t, terminalShutdownLine(t), terminalResetError())
+			ctx := socketTestContext(t)
+			if _, err := guest.receive(ctx, 4, "shutdown", "shutdown"); err != nil {
+				t.Fatal(err)
+			}
+			close(process.done)
+			if _, err := guest.awaitShutdown(ctx); err != nil {
+				t.Fatal(err)
+			}
+			process.forced = name == "forced"
+			if name == "unknown" {
+				process.finishErr = failure
+			}
+			deadline, _ := ctx.Deadline()
+			forced, err := finishGuest(process, nil, guest, deadline)
+			if err == nil {
+				t.Fatal("qualified reset hid unconfirmed job cleanup")
+			}
+			if name == "forced" && (!forced || !strings.Contains(err.Error(), "forced termination")) {
+				t.Fatalf("forced cleanup became graceful: %v", err)
+			}
+			if name == "unknown" && (!errors.Is(err, failure) || !errors.Is(err, errOwnedCleanup)) {
+				t.Fatalf("unknown job state lost: %v", err)
+			}
+			againForced, again := finishGuest(process, nil, guest, deadline)
+			if again == nil || againForced != forced || name == "unknown" && !errors.Is(again, failure) {
+				t.Fatalf("cleanup failure was not sticky: %v", again)
+			}
+			if !errors.Is(guest.serial.err, syscall.Errno(10054)) {
+				t.Fatal("cleanup erased raw reset evidence")
+			}
+		})
+	}
+}
+
+type gatedTerminalReader struct {
+	data    []byte
+	release <-chan struct{}
+	err     error
+}
+
+func (r *gatedTerminalReader) Read(data []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(data, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	<-r.release
+	return 0, r.err
+}
+
+func TestTerminalResetAfterAcknowledgementRecordsReset(t *testing.T) {
+	guest, err := newGuestChannel(testIdentity(), privateTestDirectory(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, _ := controlTestPair(t)
+	process := childWithOutput("", false)
+	reset := terminalResetError()
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		unblock()
+		conn.Close()
+		if err := joinReaders(socketTestContext(t), guest.readers); errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("gated terminal reader remained active: %v", err)
+		}
+		if err := guest.closeLogs(); err != nil {
+			t.Errorf("terminal log close: %v", err)
+		}
+	})
+	guest.startDiagnostics(process)
+	guest.startSerial(terminalReadConn{Conn: conn, reader: &gatedTerminalReader{data: terminalShutdownLine(t), release: release, err: reset}})
+	ctx := socketTestContext(t)
+	if _, err := guest.receive(ctx, 4, "shutdown", "shutdown"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-guest.serial.done:
+		t.Fatal("reset arrived before the acknowledged test boundary")
+	default:
+	}
+	unblock()
+	select {
+	case <-guest.serial.done:
+	case <-ctx.Done():
+		t.Fatal("released reset did not arrive")
+	}
+	close(process.done)
+	evidence, err := guest.awaitShutdown(ctx)
+	if err != nil || evidence["serial_termination"] != "qualified-reset" || evidence["serial_error"] != reset.Error() || evidence["serial_complete_record"] != true {
+		t.Fatalf("post-ACK reset was not preserved distinctly: %v %v", evidence, err)
+	}
+	if !errors.Is(guest.serial.err, syscall.Errno(10054)) {
+		t.Fatal("post-ACK reset became ordinary EOF")
 	}
 }

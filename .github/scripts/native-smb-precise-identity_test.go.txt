@@ -79,13 +79,14 @@ type preciseIdentityRecord struct {
 
 var preciseIdentityRegistry struct {
 	sync.Mutex
-	records          []preciseIdentityRecord
-	pending          map[parentNotifyKey]preciseIdentityRecord
-	bytes            int
-	failure          error
-	firstOpenEnd     uint64
-	mutationSequence uint64
-	filesystemPolicy string
+	records           []preciseIdentityRecord
+	pending           map[parentNotifyKey]preciseIdentityRecord
+	bytes             int
+	failure           error
+	firstOpenEnd      uint64
+	mutationSequence  uint64
+	filesystemPolicy  string
+	interactionPolicy string
 }
 
 const preciseIdentityRecords = 64
@@ -101,6 +102,7 @@ func preciseIdentityReset() {
 	preciseIdentityRegistry.firstOpenEnd = 0
 	preciseIdentityRegistry.mutationSequence = 0
 	preciseIdentityRegistry.filesystemPolicy = preciseFilesystemBaseline
+	preciseIdentityRegistry.interactionPolicy = preciseInteractionStandalone
 }
 func preciseIdentitySnapshot() ([]preciseIdentityRecord, error) {
 	preciseIdentityRegistry.Lock()
@@ -545,40 +547,57 @@ func preciseIdentityAudit(t *testing.T, report *parentInvalidationReport) {
 	preciseIdentityRegistry.Lock()
 	end := preciseIdentityRegistry.firstOpenEnd
 	filesystemPolicy, mutation := preciseIdentityRegistry.filesystemPolicy, preciseIdentityRegistry.mutationSequence
+	interactionPolicy := preciseIdentityRegistry.interactionPolicy
 	preciseIdentityRegistry.Unlock()
-	filesystem := preciseFilesystemGate(filesystemPolicy, policy, records, report.Wire, report, mutation)
-	evidence := precisePolicyGate(policy, records, report.Wire, report, end)
 	err = errors.Join(err, policyErr)
-	passiveFailure := err != nil || evidence.Error != ""
-	if filesystemPolicy == preciseFilesystemPosix && !filesystem.Exposed {
-		err = errors.Join(err, errors.New(filesystem.Reason))
-		report.WithinOneSecondProven = false
-		report.Classification = "inconclusive"
+	if interactionPolicy == preciseInteractionCombined {
+		_, incomplete := cacheGatePositiveWireSnapshot()
+		if incomplete {
+			err = errors.Join(err, errors.New("parent wire observer is incomplete"))
+		}
 	}
-	if evidence.Error != "" {
-		err = errors.Join(err, errors.New(evidence.Error))
-	}
-	if err != nil {
-		evidence.StimulusDelivered = false
-		if filesystemPolicy == preciseFilesystemPosix {
-			filesystem.Exposed = false
-			if passiveFailure {
-				filesystem.Outcome = "invalid_evidence"
-			}
-			if filesystem.Reason == "" {
-				filesystem.Reason = err.Error()
-			}
+	filesystem, evidence, interaction := preciseInteractionGate(interactionPolicy, filesystemPolicy, policy, records, report.Wire, report, mutation, end, err)
+	if interactionPolicy == preciseInteractionCombined {
+		if !interaction.Exposed {
+			err = errors.Join(err, errors.New(interaction.Reason))
 			report.WithinOneSecondProven = false
 			report.Classification = "inconclusive"
 		}
+	} else {
+		passiveFailure := err != nil || evidence.Error != ""
+		if filesystemPolicy == preciseFilesystemPosix && !filesystem.Exposed {
+			err = errors.Join(err, errors.New(filesystem.Reason))
+			report.WithinOneSecondProven = false
+			report.Classification = "inconclusive"
+		}
+		if evidence.Error != "" {
+			err = errors.Join(err, errors.New(evidence.Error))
+		}
+		if err != nil {
+			evidence.StimulusDelivered = false
+			if filesystemPolicy == preciseFilesystemPosix {
+				filesystem.Exposed = false
+				if passiveFailure {
+					filesystem.Outcome = "invalid_evidence"
+				}
+				if filesystem.Reason == "" {
+					filesystem.Reason = err.Error()
+				}
+				report.WithinOneSecondProven = false
+				report.Classification = "inconclusive"
+			}
+		}
+	}
+	if err != nil {
 		t.Error("passive identity evidence:", err)
 	}
 	data, encodeErr := json.MarshalIndent(struct {
 		Records              []preciseIdentityRecord
 		Policy               precisePolicyEvidence
 		FilesystemCapability preciseFilesystemEvidence
+		Interaction          preciseInteractionEvidence
 		Error                string
-	}{records, evidence, filesystem, fmt.Sprint(err)}, "", "  ")
+	}{records, evidence, filesystem, interaction, fmt.Sprint(err)}, "", "  ")
 	if encodeErr == nil {
 		encodeErr = os.WriteFile(filepath.Join(os.Getenv("RFS_GATE_OUTPUT_ROOT"), "precise-identity.json"), data, 0600)
 	}
@@ -595,7 +614,11 @@ func TestNativePreciseReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	filesystemPolicy, err := preciseFilesystemPolicy(os.Getenv("RFS_FILESYSTEM_CAPABILITY_POLICY"), policy)
+	interaction, err := preciseInteractionPolicy(os.Getenv("RFS_INTERACTION_POLICY"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	filesystemPolicy, err := preciseFilesystemPolicyForInteraction(os.Getenv("RFS_FILESYSTEM_CAPABILITY_POLICY"), policy, interaction)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -606,9 +629,12 @@ func TestNativePreciseReplacement(t *testing.T) {
 	if filesystemPolicy == preciseFilesystemPosix {
 		name = "share0_app_first_replace_identity_posix_capability"
 	}
+	if interaction == preciseInteractionCombined {
+		name = "share0_app_first_replace_identity_posix_qfid"
+	}
 	t.Run(name, func(t *testing.T) {
 		preciseIdentityReset()
-		if err := preciseConfigureFilesystemPolicy(filesystemPolicy, policy); err != nil {
+		if err := preciseConfigureInteractionPolicy(interaction, filesystemPolicy, policy); err != nil {
 			t.Fatal(err)
 		}
 		report := &parentInvalidationReport{Kind: "replacement", Name: name, ShareMode: 0, Order: "app_first"}
@@ -1371,7 +1397,15 @@ func preciseFilesystemPolicy(value, qfid string) (string, error) {
 }
 
 func preciseConfigureFilesystemPolicy(value, qfid string) error {
-	policy, err := preciseFilesystemPolicy(value, qfid)
+	return preciseConfigureInteractionPolicy(preciseInteractionStandalone, value, qfid)
+}
+
+func preciseConfigureInteractionPolicy(interaction, value, qfid string) error {
+	mode, err := preciseInteractionPolicy(interaction)
+	if err != nil {
+		return err
+	}
+	policy, err := preciseFilesystemPolicyForInteraction(value, qfid, mode)
 	if err != nil {
 		return err
 	}
@@ -1381,6 +1415,7 @@ func preciseConfigureFilesystemPolicy(value, qfid string) error {
 		return errors.New("filesystem policy cannot change after observation starts")
 	}
 	preciseIdentityRegistry.filesystemPolicy = policy
+	preciseIdentityRegistry.interactionPolicy = mode
 	return nil
 }
 
@@ -1411,6 +1446,10 @@ type preciseFilesystemEvidence struct {
 }
 
 func preciseFilesystemGate(policy, qfid string, records []preciseIdentityRecord, wireRecords []cacheGatePositiveWireRecord, report *parentInvalidationReport, mutation uint64) preciseFilesystemEvidence {
+	return preciseFilesystemGateForInteraction(policy, qfid, preciseInteractionStandalone, records, wireRecords, report, mutation)
+}
+
+func preciseFilesystemGateForInteraction(policy, qfid, interaction string, records []preciseIdentityRecord, wireRecords []cacheGatePositiveWireRecord, report *parentInvalidationReport, mutation uint64) preciseFilesystemEvidence {
 	result := preciseFilesystemEvidence{Policy: policy, MutationSequence: mutation, FirstOpenSequence: report.FirstObservationSequence, NativeOracle: report.IdentityResult, Outcome: "not_required"}
 	reject := func(reason string) preciseFilesystemEvidence {
 		result.Outcome = "invalid_evidence"
@@ -1424,10 +1463,15 @@ func preciseFilesystemGate(policy, qfid string, records []preciseIdentityRecord,
 		result.Exposed = false
 		return result
 	}
-	if policy == preciseFilesystemBaseline {
+	mode, err := preciseInteractionPolicy(interaction)
+	if err != nil {
+		return reject(err.Error())
+	}
+	interaction = mode
+	if policy == preciseFilesystemBaseline && interaction == preciseInteractionStandalone {
 		return result
 	}
-	if _, err := preciseFilesystemPolicy(policy, qfid); err != nil {
+	if _, err := preciseFilesystemPolicyForInteraction(policy, qfid, interaction); err != nil {
 		return reject(err.Error())
 	}
 	if mutation == 0 || report.FirstObservationSequence <= mutation {
@@ -1502,9 +1546,19 @@ func preciseFilesystemGate(policy, qfid string, records []preciseIdentityRecord,
 				return reject("requested-only context ownership is unproven")
 			}
 			if response.Status == 0 {
-				if !response.ContextsChecked || response.QFidRequested != request.QFidRequested || (response.QFid != nil) != request.QFidRequested || preciseContextQFidCount(*response) != map[bool]int{false: 0, true: 1}[request.QFidRequested] {
+				if !response.ContextsChecked || response.QFidRequested != request.QFidRequested {
+					return reject("successful CREATE context ownership is unproven")
+				}
+				if interaction == preciseInteractionCombined {
+					// Fs5 exposure remains an independent observation. The existing QFid gate
+					// verifies the actual unsolicited identity stimulus for the combined cell.
+					if request.QFidRequested && response.QFid == nil || preciseContextQFidCount(*response) != map[bool]int{false: 0, true: 1}[response.QFid != nil] {
+						return reject("successful CREATE has contradictory context evidence")
+					}
+				} else if (response.QFid != nil) != request.QFidRequested || preciseContextQFidCount(*response) != map[bool]int{false: 0, true: 1}[request.QFidRequested] {
 					return reject("successful CREATE changed requested-only QFid policy")
 				}
+
 			} else if response.QFid != nil {
 				return reject("failed CREATE acquired identity payload")
 			}
@@ -2061,5 +2115,342 @@ func TestPreciseRetainedReplacementBackend(t *testing.T) {
 	oldPath, err := parent.LookupAt(t.Context(), []byte("replacement"))
 	if err != nil || oldPath.Found {
 		t.Fatalf("B's previous entry remains: %+v %v", oldPath, err)
+	}
+}
+
+const preciseInteractionStandalone = "standalone"
+const preciseInteractionCombined = "posix-qfid"
+
+func preciseInteractionPolicy(value string) (string, error) {
+	if value == "" {
+		return preciseInteractionStandalone, nil
+	}
+	if value != preciseInteractionStandalone && value != preciseInteractionCombined {
+		return "", errors.New("unknown interaction policy")
+	}
+	return value, nil
+}
+
+func preciseFilesystemPolicyForInteraction(filesystem, qfid, interaction string) (string, error) {
+	mode, err := preciseInteractionPolicy(interaction)
+	if err != nil {
+		return "", err
+	}
+	if mode == preciseInteractionStandalone {
+		return preciseFilesystemPolicy(filesystem, qfid)
+	}
+	if filesystem != preciseFilesystemPosix || qfid != preciseAlwaysQFid {
+		return "", errors.New("combined interaction requires explicit POSIX capability and always truthful QFid")
+	}
+	return filesystem, nil
+}
+
+type preciseInteractionEvidence struct {
+	Policy, Outcome, Reason            string
+	Exposed                            bool
+	HAConnection, HASession, HAMessage uint64
+	HAFileID                           string
+	NativeOracle                       string
+}
+
+func preciseInteractionGate(interaction, filesystem, qfid string, records []preciseIdentityRecord, wireRecords []cacheGatePositiveWireRecord, report *parentInvalidationReport, mutation, end uint64, sourceErr error) (preciseFilesystemEvidence, precisePolicyEvidence, preciseInteractionEvidence) {
+	if interaction == "" {
+		interaction = preciseInteractionStandalone
+	}
+	fs := preciseFilesystemGateForInteraction(filesystem, qfid, interaction, records, wireRecords, report, mutation)
+	identity := precisePolicyGate(qfid, records, wireRecords, report, end)
+	result := preciseInteractionEvidence{Policy: interaction, Outcome: "not_required", NativeOracle: report.IdentityResult}
+	reject := func(outcome, reason string) (preciseFilesystemEvidence, precisePolicyEvidence, preciseInteractionEvidence) {
+		result.Outcome = outcome
+		result.Reason = reason
+		return fs, identity, result
+	}
+	if interaction == preciseInteractionStandalone {
+		return fs, identity, result
+	}
+	if _, err := preciseFilesystemPolicyForInteraction(filesystem, qfid, interaction); err != nil {
+		return reject("invalid_configuration", err.Error())
+	}
+	if sourceErr != nil {
+		fs.Exposed = false
+		fs.Outcome = "invalid_evidence"
+		fs.Reason = sourceErr.Error()
+		identity.StimulusDelivered = false
+		if identity.Error == "" {
+			identity.Error = sourceErr.Error()
+		} else {
+			identity.Error = errors.Join(errors.New(identity.Error), sourceErr).Error()
+		}
+		return reject("invalid_evidence", sourceErr.Error())
+	}
+	if !fs.Exposed {
+		return reject(fs.Outcome, "filesystem: "+fs.Reason)
+	}
+	if !identity.StimulusDelivered {
+		reason := identity.Error
+		if reason == "" {
+			reason = "first CREATE did not deliver the required unrequested identity stimulus"
+		}
+		return reject("not_exposed", "QFid: "+reason)
+	}
+	a, b, c, d := fs.CreateRequest, fs.CreateResponse, identity.OldRequest, identity.OldResponse
+	if a == nil || b == nil || c == nil || d == nil || a.Sequence != c.Sequence || a.Connection != c.Connection || a.Session != c.Session || a.MessageID != c.MessageID || b.Sequence != d.Sequence || b.Connection != d.Connection || b.Session != d.Session || b.MessageID != d.MessageID || b.FileID != d.FileID {
+		return reject("invalid_evidence", "filesystem and QFid proofs identify different retained HA ownership")
+	}
+	result.Outcome = "exposed"
+	result.Exposed = true
+	result.HAConnection = b.Connection
+	result.HASession = b.Session
+	result.HAMessage = b.MessageID
+	result.HAFileID = b.FileID
+	return fs, identity, result
+}
+
+func preciseCombinedFixture() ([]preciseIdentityRecord, []cacheGatePositiveWireRecord, parentInvalidationReport) {
+	records, wireRecords, report := preciseFilesystemFixture()
+	payload := make([]byte, 32)
+	binary.LittleEndian.PutUint64(payload, report.Expected.ID)
+	binary.LittleEndian.PutUint64(payload[8:], records[1].QFid.VolumeID)
+	records[5].QFid = &preciseQFid{Raw: hex.EncodeToString(payload), DiskID: report.Expected.ID, VolumeID: records[1].QFid.VolumeID, Reserved: hex.EncodeToString(payload[16:])}
+	records[5].ContextNames = []string{"51466964"}
+	return records, wireRecords, report
+}
+
+func TestPreciseInteractionConfiguration(t *testing.T) {
+	for _, value := range []string{"", preciseInteractionStandalone} {
+		mode, err := preciseInteractionPolicy(value)
+		if err != nil || mode != preciseInteractionStandalone {
+			t.Fatal("default interaction changed", mode, err)
+		}
+		for _, qfid := range []string{preciseRequestedQFid, preciseAlwaysQFid} {
+			if _, err := preciseFilesystemPolicyForInteraction(preciseFilesystemBaseline, qfid, mode); err != nil {
+				t.Fatal("standalone baseline rejected", err)
+			}
+		}
+		if _, err := preciseFilesystemPolicyForInteraction(preciseFilesystemPosix, preciseAlwaysQFid, mode); err == nil {
+			t.Fatal("standalone silently admitted combined policies")
+		}
+	}
+	if _, err := preciseFilesystemPolicy(preciseFilesystemPosix, preciseAlwaysQFid); err == nil {
+		t.Fatal("original standalone refusal changed")
+	}
+	for _, combination := range []struct{ mode, fs, qfid string }{
+		{"unknown", preciseFilesystemPosix, preciseAlwaysQFid}, {preciseInteractionCombined, preciseFilesystemBaseline, preciseAlwaysQFid},
+		{preciseInteractionCombined, preciseFilesystemPosix, preciseRequestedQFid}, {preciseInteractionCombined, "", preciseAlwaysQFid}, {preciseInteractionCombined, preciseFilesystemPosix, ""},
+	} {
+		if _, err := preciseFilesystemPolicyForInteraction(combination.fs, combination.qfid, combination.mode); err == nil {
+			t.Fatal("invalid interaction configuration admitted", combination)
+		}
+	}
+	preciseIdentityReset()
+	if err := preciseConfigureInteractionPolicy(preciseInteractionCombined, preciseFilesystemPosix, preciseAlwaysQFid); err != nil {
+		t.Fatal(err)
+	}
+	preciseIdentityRegistry.Lock()
+	configured := preciseIdentityRegistry.interactionPolicy
+	preciseIdentityRegistry.Unlock()
+	if configured != preciseInteractionCombined {
+		t.Fatal("combined policy not retained")
+	}
+	preciseIdentityBeginMutation()
+	if err := preciseConfigureInteractionPolicy(preciseInteractionStandalone, preciseFilesystemBaseline, preciseRequestedQFid); err == nil {
+		t.Fatal("interaction changed after mutation boundary")
+	}
+	preciseIdentityReset()
+	preciseIdentityRegistry.Lock()
+	defer preciseIdentityRegistry.Unlock()
+	if preciseIdentityRegistry.interactionPolicy != preciseInteractionStandalone {
+		t.Fatal("interaction escaped fixture lifetime")
+	}
+}
+
+func TestPreciseInteractionExposure(t *testing.T) {
+	records, wireRecords, report := preciseCombinedFixture()
+	fs, qfid, interaction := preciseInteractionGate(preciseInteractionCombined, preciseFilesystemPosix, preciseAlwaysQFid, records, wireRecords, &report, 8, 13, nil)
+	if !fs.Exposed || !qfid.StimulusDelivered || !interaction.Exposed || interaction.HAFileID != "old-A" || interaction.HAConnection != 1 || interaction.HASession != 2 || interaction.HAMessage != 3 || interaction.NativeOracle != report.IdentityResult {
+		t.Fatalf("joint truthful exposure rejected: fs=%+v qfid=%+v interaction=%+v", fs, qfid, interaction)
+	}
+}
+
+func TestPreciseInteractionPartialExposure(t *testing.T) {
+	t.Run("filesystem only", func(t *testing.T) {
+		records, wireRecords, report := preciseFilesystemFixture()
+		fs, qfid, interaction := preciseInteractionGate(preciseInteractionCombined, preciseFilesystemPosix, preciseAlwaysQFid, records, wireRecords, &report, 8, 13, nil)
+		if !fs.Exposed || qfid.StimulusDelivered || interaction.Exposed || interaction.Outcome != "not_exposed" {
+			t.Fatal("partial filesystem exposure lost or overstated", fs, qfid, interaction)
+		}
+	})
+	t.Run("QFid only", func(t *testing.T) {
+		records, wireRecords, report := preciseCombinedFixture()
+		records[3].FilesystemAttributes, _ = preciseDecodeFilesystemAttributes(preciseTestFilesystemData(0x6))
+		fs, qfid, interaction := preciseInteractionGate(preciseInteractionCombined, preciseFilesystemPosix, preciseAlwaysQFid, records, wireRecords, &report, 8, 13, nil)
+		if fs.Exposed || !qfid.StimulusDelivered || interaction.Exposed || interaction.Outcome != "not_exposed" {
+			t.Fatal("partial QFid exposure lost or overstated", fs, qfid, interaction)
+		}
+	})
+	t.Run("failed CREATE retains the actual server and native failure", func(t *testing.T) {
+		records, wireRecords, report := preciseCombinedFixture()
+		records[5].Status = 0xc000000d
+		records[5].QFid = nil
+		records[5].ContextNames = nil
+		records[5].ContextsChecked = false
+		records[5].FileID = ""
+		wireRecords[3].Status = records[5].Status
+		wireRecords[3].FileID = ""
+		report.Qualification.Native.Error = "CreateFile failed"
+		report.NewIdentity = cacheGatePositiveValue{}
+		report.IdentityResult = "replacement_first_open_failed"
+		fs, qfid, interaction := preciseInteractionGate(preciseInteractionCombined, preciseFilesystemPosix, preciseAlwaysQFid, records, wireRecords, &report, 8, 13, nil)
+		if !fs.Exposed || qfid.WireSuccess || qfid.NativeOpenSucceeded || qfid.StimulusDelivered || interaction.Exposed || qfid.NewResponse == nil || qfid.NewResponse.Status != 0xc000000d || interaction.NativeOracle != "replacement_first_open_failed" {
+			t.Fatal("failed CREATE was reclassified", fs, qfid, interaction)
+		}
+	})
+	t.Run("shared observer failure", func(t *testing.T) {
+		records, wireRecords, report := preciseCombinedFixture()
+		fs, qfid, interaction := preciseInteractionGate(preciseInteractionCombined, preciseFilesystemPosix, preciseAlwaysQFid, records, wireRecords, &report, 8, 13, errors.New("parent observer lost a frame"))
+		if fs.Exposed || qfid.StimulusDelivered || interaction.Exposed || fs.Outcome != "invalid_evidence" || interaction.Outcome != "invalid_evidence" {
+			t.Fatal("shared source failure left qualified facts", fs, qfid, interaction)
+		}
+	})
+}
+
+func preciseSetQFidTuple(record *preciseIdentityRecord, disk, volume uint64) {
+	payload := make([]byte, 32)
+	binary.LittleEndian.PutUint64(payload, disk)
+	binary.LittleEndian.PutUint64(payload[8:], volume)
+	record.QFid = &preciseQFid{Raw: hex.EncodeToString(payload), DiskID: disk, VolumeID: volume, Reserved: hex.EncodeToString(payload[16:])}
+}
+
+func TestPreciseInteractionRefusals(t *testing.T) {
+	cases := []struct {
+		name   string
+		change func(*[]preciseIdentityRecord, *[]cacheGatePositiveWireRecord, *parentInvalidationReport, *uint64, *uint64)
+	}{
+		{"requested new QFid", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64, _ *uint64) {
+			(*r)[4].QFidRequested = true
+			(*r)[4].ContextNames = []string{"51466964"}
+			(*r)[5].QFidRequested = true
+		}},
+		{"wrong initial A", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64, _ *uint64) {
+			preciseSetQFidTuple(&(*r)[1], 30, 17)
+		}},
+		{"wrong actual B", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64, _ *uint64) {
+			preciseSetQFidTuple(&(*r)[5], 40, 17)
+		}},
+		{"wrong actual volume", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64, _ *uint64) {
+			preciseSetQFidTuple(&(*r)[5], 4, 18)
+		}},
+		{"new session changed", func(r *[]preciseIdentityRecord, w *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64, _ *uint64) {
+			for _, i := range []int{4, 5} {
+				(*r)[i].Session = 3
+				(*r)[i].RawSession = 3
+			}
+			(*w)[1].SessionID = 3
+			(*w)[3].SessionID = 3
+		}},
+		{"new handle reused old", func(r *[]preciseIdentityRecord, w *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64, _ *uint64) {
+			(*r)[5].FileID = "old-A"
+			(*w)[3].FileID = "old-A"
+		}},
+		{"unknown HA for Fs5", func(r *[]preciseIdentityRecord, w *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64, _ *uint64) {
+			(*r)[2].FileID = "unknown"
+			(*r)[3].FileID = "unknown"
+			(*w)[4].FileID = "unknown"
+			(*w)[5].FileID = "unknown"
+		}},
+		{"Fs5 after global mutation", func(_ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, m *uint64, _ *uint64) {
+			*m = 3
+		}},
+		{"only native-local mutation counter", func(_ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, r *parentInvalidationReport, m *uint64, _ *uint64) {
+			r.MutationBoundarySequence = 8
+			*m = 0
+		}},
+		{"new request outside first-open bracket", func(_ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64, end *uint64) {
+			*end = 11
+		}},
+		{"missing new reply", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64, _ *uint64) {
+			*r = (*r)[:5]
+		}},
+		{"duplicate new reply", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64, _ *uint64) {
+			copy := (*r)[5]
+			copy.Sequence = 20
+			*r = append(*r, copy)
+		}},
+		{"malformed raw Fs5", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64, _ *uint64) {
+			(*r)[3].FilesystemAttributes.FixedRaw = "bad"
+		}},
+		{"malformed raw QFid", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64, _ *uint64) {
+			(*r)[5].QFid.Raw = "bad"
+		}},
+		{"incomplete shared parsed record", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64, _ *uint64) {
+			(*r)[3].Complete = false
+			(*r)[3].Error = "malformed packet"
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			records, wireRecords, report := preciseCombinedFixture()
+			mutation, end := uint64(8), uint64(13)
+			tc.change(&records, &wireRecords, &report, &mutation, &end)
+			_, _, interaction := preciseInteractionGate(preciseInteractionCombined, preciseFilesystemPosix, preciseAlwaysQFid, records, wireRecords, &report, mutation, end, nil)
+			if interaction.Exposed || interaction.Reason == "" || interaction.NativeOracle != report.IdentityResult {
+				t.Fatal("incomplete or mismatched joint exposure accepted", interaction)
+			}
+		})
+	}
+	t.Run("different HA ownership across otherwise valid proofs", func(t *testing.T) {
+		records, wireRecords, report := preciseCombinedFixture()
+		preciseSetQFidTuple(&records[1], 7, 17)
+		otherRequest, otherResponse := records[0], records[1]
+		otherRequest.MessageID = 8
+		otherResponse.MessageID = 8
+		otherRequest.Sequence = 5
+		otherResponse.Sequence = 6
+		otherResponse.FileID = "other-A"
+		preciseSetQFidTuple(&otherResponse, report.Initial.ID, 17)
+		records = append(append(slices.Clone(records[:4]), otherRequest, otherResponse), records[4:]...)
+		request, response := wireRecords[0], wireRecords[2]
+		request.MessageID = 8
+		response.MessageID = 8
+		response.FileID = "other-A"
+		wireRecords = append(wireRecords, request, response)
+		fs, qfid, interaction := preciseInteractionGate(preciseInteractionCombined, preciseFilesystemPosix, preciseAlwaysQFid, records, wireRecords, &report, 8, 13, nil)
+		if !fs.Exposed || !qfid.StimulusDelivered || interaction.Exposed || interaction.Reason != "filesystem and QFid proofs identify different retained HA ownership" {
+			t.Fatal("different retained handles were combined", fs, qfid, interaction)
+		}
+	})
+}
+
+func TestPreciseInteractionNativeOracle(t *testing.T) {
+	for _, mode := range []string{"distinct handles", "both old identity", "old identity overwritten", "native API failure", "wrong B bytes"} {
+		t.Run(mode, func(t *testing.T) {
+			records, wireRecords, report := preciseCombinedFixture()
+			before, after := make([]byte, 257), make([]byte, 769)
+			report.RetainedRead = cacheGatePositiveValue{Count: 257, Digest: cacheGatePositiveDigest(before)}
+			report.NewRead = cacheGatePositiveValue{Count: 769, Digest: cacheGatePositiveDigest(after)}
+			expected := "distinct_native_identity_and_preserved_bytes"
+			switch mode {
+			case "both old identity":
+				report.NewIdentity.Identity = report.OldIdentity.Identity
+				expected = "replacement_identity_aliased"
+			case "old identity overwritten":
+				report.RetainedIdentity.Identity = report.NewIdentity.Identity
+				expected = "retained_identity_changed"
+			case "native API failure":
+				report.NewIdentity.Error = "GetFileInformationByHandle failed"
+				expected = "identity_unavailable"
+			case "wrong B bytes":
+				report.NewRead.Digest = "wrong"
+				expected = "replacement_bytes_wrong"
+			}
+			report.IdentityResult = parentRelativeIdentity(report.OldIdentity, report.NewIdentity, report.RetainedIdentity, report.RetainedRead, report.NewRead, before, after)
+			fs, qfid, interaction := preciseInteractionGate(preciseInteractionCombined, preciseFilesystemPosix, preciseAlwaysQFid, records, wireRecords, &report, 8, 13, nil)
+			if !fs.Exposed || !qfid.StimulusDelivered || !interaction.Exposed || report.IdentityResult != expected || interaction.NativeOracle != expected {
+				t.Fatal("joint stimulus rewrote unchanged native oracle", mode, interaction)
+			}
+			if mode != "distinct handles" && interaction.NativeOracle == "distinct_native_identity_and_preserved_bytes" {
+				t.Fatal("native failure became a mechanism pass")
+			}
+		})
 	}
 }

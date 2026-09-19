@@ -94,8 +94,22 @@ are not paced or resent.
 QEMU stdout and stderr are drained immediately into separate bounded diagnostic
 logs. The authenticated serial socket carries guest control and separately framed
 authority output; each stream retains its 16 MiB cap. Success requires the exact
-shutdown acknowledgement, actual QEMU exit and natural EOF/complete reader drain
-within one 30-second shutdown deadline. Error cleanup closes socket I/O, finishes
+shutdown/4 acknowledgement, natural QEMU exit 0 and all readers joined within
+one 30-second shutdown deadline. Serial EOF is accepted normally. A terminal
+WSAECONNRESET is eligible only at an independently tracked complete LF record
+boundary and through a single error chain containing error 10054; joined errors
+remain failures. The original serial result must be the one being qualified.
+
+While waiting for the exact final ACK, an eligible reset selected ahead of an
+already parsed ACK may consume and validate that queued response. It cannot infer
+an ACK from reset, exit, kernel text or earlier HTTP success. After the ACK, the
+same remaining shutdown deadline governs natural exit 0 and all readers. Only
+then can that serial reset be recorded as `qualified-reset`, with its raw
+`serial_error` retained; it is never relabeled EOF. Missing/invalid ACK, partial
+trailing records, nonzero exit, timeout and other errors still fail. Non-forced
+empty-Job proof, file closure and pristine-disk checks remain required.
+
+Error cleanup closes socket I/O, finishes
 the owned Job and joins readers using a single ten-second deadline fixed at cleanup
 entry. Natural and forced Job stages retain their five-second caps, clamped to that
 same deadline. Close errors, incomplete readers and forced termination remain
@@ -103,8 +117,10 @@ failures. Disk removal still requires process/Job quiescence.
 
 The separate Linux validation driver retains its POSIX stdio transport. The
 Windows socket does not change guest PID 1, the authority, the image, the HTTP
-forward or the public storage API. Its native ownership and full lifecycle tests
-must execute on Windows; portable controls and cross-builds do not prove them.
+forward or the public storage API. Native ownership and HTTP/restart have been observed on Windows; the complete
+lifecycle remains unconfirmed after a terminal reset triggered forced cleanup.
+The conditional terminal-reset correction still needs its own native execution;
+portable controls and cross-builds do not prove it.
 
 ## Readiness sequence
 

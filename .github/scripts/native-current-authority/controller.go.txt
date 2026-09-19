@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -469,6 +470,10 @@ func startReader(name string, read func() error, report func(error)) *ownedReade
 }
 
 func joinReaders(ctx context.Context, readers []*ownedReader) error {
+	return joinReadersExcept(ctx, readers, nil, nil)
+}
+
+func joinReadersExcept(ctx context.Context, readers []*ownedReader, acceptedReader *ownedReader, acceptedError error) error {
 	var result error
 	for _, reader := range readers {
 		select {
@@ -481,7 +486,7 @@ func joinReaders(ctx context.Context, readers []*ownedReader) error {
 				continue
 			}
 		}
-		if reader.err != nil {
+		if reader.err != nil && !(reader == acceptedReader && acceptedError != nil && reader.err == acceptedError) {
 			result = errors.Join(result, fmt.Errorf("%s: %w", reader.name, reader.err))
 		}
 	}
@@ -491,14 +496,64 @@ func joinReaders(ctx context.Context, readers []*ownedReader) error {
 type guestChannel struct {
 	child child
 	identity
-	conn       net.Conn
-	responses  chan response
-	fault      chan error
-	readers    []*ownedReader
-	serial     *ownedReader
-	logs       map[string]*os.File
-	logsClosed bool
-	logsErr    error
+	conn                 net.Conn
+	responses            chan response
+	fault                chan error
+	readers              []*ownedReader
+	serial               *ownedReader
+	logs                 map[string]*os.File
+	logsClosed           bool
+	logsErr              error
+	shutdownAcknowledged bool
+	qualifiedSerial      *serialReadTermination
+}
+
+type serialReadTermination struct {
+	cause          error
+	completeRecord bool
+}
+
+func (e *serialReadTermination) Error() string {
+	return fmt.Sprintf("serial read terminated (complete record=%t): %v", e.completeRecord, e.cause)
+}
+func (e *serialReadTermination) Unwrap() error { return e.cause }
+
+type serialBoundaryReader struct {
+	io.Reader
+	completeRecord bool
+	readErr        error
+}
+
+func (r *serialBoundaryReader) Read(data []byte) (int, error) {
+	n, err := r.Reader.Read(data)
+	if n > 0 {
+		r.completeRecord = data[n-1] == '\n'
+	}
+	if err != nil {
+		r.readErr = err
+	}
+	return n, err
+}
+
+func eligibleSerialReset(err error) (*serialReadTermination, bool) {
+	terminal, ok := err.(*serialReadTermination)
+	if !ok || terminal == nil || !terminal.completeRecord {
+		return nil, false
+	}
+	for cause := terminal.cause; cause != nil; {
+		if _, joined := cause.(interface{ Unwrap() []error }); joined {
+			return nil, false
+		}
+		if code, ok := cause.(syscall.Errno); ok {
+			return terminal, code == syscall.Errno(10054)
+		}
+		wrapped, ok := cause.(interface{ Unwrap() error })
+		if !ok {
+			return nil, false
+		}
+		cause = wrapped.Unwrap()
+	}
+	return nil, false
 }
 
 func newGuestChannel(id identity, directory string) (*guestChannel, error) {
@@ -563,7 +618,8 @@ func (g *guestChannel) startSerial(conn net.Conn) {
 			"stdout": {writer: g.logs["authority-stdout"], remaining: streamLimit},
 			"stderr": {writer: g.logs["authority-stderr"], remaining: streamLimit},
 		}
-		scanner := bufio.NewScanner(conn)
+		input := &serialBoundaryReader{Reader: conn, completeRecord: true}
+		scanner := bufio.NewScanner(input)
 		scanner.Buffer(make([]byte, 4096), streamLimit)
 		scanner.Split(serialLine)
 		for scanner.Scan() {
@@ -590,7 +646,13 @@ func (g *guestChannel) startSerial(conn net.Conn) {
 				}
 			}
 		}
-		return scanner.Err()
+		if input.readErr != nil && input.readErr != io.EOF {
+			return &serialReadTermination{cause: input.readErr, completeRecord: input.completeRecord}
+		}
+		if err := scanner.Err(); err != nil {
+			return &serialReadTermination{cause: err, completeRecord: input.completeRecord}
+		}
+		return nil
 	}, g.report)
 	g.readers = append(g.readers, g.serial)
 }
@@ -742,7 +804,11 @@ func finishGuest(process child, control *controlSocket, guest *guestChannel, dea
 		result = errors.Join(result, control.join(ctx))
 	}
 	if guest != nil {
-		result = errors.Join(result, joinReaders(ctx, guest.readers), guest.closeLogs())
+		var accepted error
+		if guest.qualifiedSerial != nil {
+			accepted = guest.qualifiedSerial
+		}
+		result = errors.Join(result, joinReadersExcept(ctx, guest.readers, guest.serial, accepted), guest.closeLogs())
 	}
 	return forced, errors.Join(result, ctx.Err())
 }
@@ -780,9 +846,32 @@ func (g *guestChannel) receive(ctx context.Context, sequence uint64, op, phase s
 	if err := ctx.Err(); err != nil {
 		return response{}, err
 	}
+	final := sequence == 4 && op == "shutdown" && phase == "shutdown"
+	check := func(value response) (response, error) {
+		value, err := checkedAcknowledgement(value, sequence, op, phase)
+		if err == nil && final {
+			g.shutdownAcknowledged = true
+		}
+		return value, err
+	}
+	readFailure := func(err error) (response, error) {
+		terminal, eligible := eligibleSerialReset(err)
+		if final && eligible && g.serial != nil && g.serial.err == terminal {
+			select {
+			case value := <-g.responses:
+				value, ackErr := check(value)
+				if ackErr == nil {
+					return value, nil
+				}
+				return response{}, errors.Join(err, ackErr)
+			default:
+			}
+		}
+		return response{}, err
+	}
 	select {
 	case err := <-g.fault:
-		return response{}, err
+		return readFailure(err)
 	default:
 	}
 	exited := g.child.Done()
@@ -793,13 +882,16 @@ func (g *guestChannel) receive(ctx context.Context, sequence uint64, op, phase s
 	for {
 		select {
 		case value := <-g.responses:
-			return checkedAcknowledgement(value, sequence, op, phase)
+			return check(value)
 		case err := <-g.fault:
-			return response{}, err
+			return readFailure(err)
 		case <-serialDone:
+			if g.serial.err != nil {
+				return readFailure(g.serial.err)
+			}
 			select {
 			case value := <-g.responses:
-				return checkedAcknowledgement(value, sequence, op, phase)
+				return check(value)
 			default:
 				return response{}, errors.Join(errors.New("guest serial ended before acknowledgement"), io.ErrUnexpectedEOF, g.serial.err)
 			}
@@ -812,6 +904,80 @@ func (g *guestChannel) receive(ctx context.Context, sequence uint64, op, phase s
 			return response{}, ctx.Err()
 		}
 	}
+}
+
+func (g *guestChannel) awaitShutdown(ctx context.Context) (map[string]any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !g.shutdownAcknowledged || g.child == nil || g.serial == nil {
+		return nil, errors.New("shutdown requires the exact final acknowledgement and owned process and serial reader")
+	}
+	checkFault := func(err error) error {
+		terminal, eligible := eligibleSerialReset(err)
+		if eligible && g.serial.err == terminal {
+			return nil
+		}
+		return err
+	}
+	exited := g.child.Done()
+	for exited != nil {
+		select {
+		case <-exited:
+			if err := g.child.Result(); err != nil {
+				return nil, err
+			}
+			exited = nil
+		case err := <-g.fault:
+			if err := checkFault(err); err != nil {
+				return nil, err
+			}
+		case <-ctx.Done():
+			return nil, fmt.Errorf("QEMU poweroff: %w", ctx.Err())
+		}
+	}
+	select {
+	case <-g.serial.done:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("join guest serial: %w", ctx.Err())
+	}
+	var terminal *serialReadTermination
+	if g.serial.err != nil {
+		var eligible bool
+		terminal, eligible = eligibleSerialReset(g.serial.err)
+		if !eligible {
+			return nil, g.serial.err
+		}
+	}
+	var accepted error
+	if terminal != nil {
+		accepted = terminal
+	}
+	if err := joinReadersExcept(ctx, g.readers, g.serial, accepted); err != nil {
+		return nil, err
+	}
+	select {
+	case err := <-g.fault:
+		if err := checkFault(err); err != nil {
+			return nil, err
+		}
+	default:
+	}
+	select {
+	case value := <-g.responses:
+		return nil, fmt.Errorf("unexpected final guest response: %s", value.Op)
+	default:
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	evidence := map[string]any{"serial_termination": "eof", "serial_error": "", "serial_complete_record": true, "qemu_exit": 0}
+	if terminal != nil {
+		g.qualifiedSerial = terminal
+		evidence["serial_termination"] = "qualified-reset"
+		evidence["serial_error"] = terminal.cause.Error()
+	}
+	return evidence, nil
 }
 
 func (g *guestChannel) command(ctx context.Context, sequence uint64, op string) (response, error) {
@@ -1184,30 +1350,13 @@ func lifecycle(ctx context.Context, host platform, m manifest, id identity, exec
 	if err := log.record("shutdown", "guest-acknowledgement", acknowledged); err != nil {
 		return err
 	}
-	select {
-	case <-process.Done():
-		if err := process.Result(); err != nil {
-			return err
-		}
-	case err := <-guest.fault:
-		return err
-	case <-shutdownCtx.Done():
-		return fmt.Errorf("QEMU poweroff: %w", shutdownCtx.Err())
-	}
-	if err := joinReaders(shutdownCtx, guest.readers); err != nil {
+	terminal, err := guest.awaitShutdown(shutdownCtx)
+	if err != nil {
 		return err
 	}
-	select {
-	case err := <-guest.fault:
-		return err
-	default:
-	}
-	select {
-	case value := <-guest.responses:
-		return fmt.Errorf("unexpected final guest response: %s", value.Op)
-	default:
-	}
-	return log.record("shutdown", "confirmed", map[string]any{"authority_exit": 0, "qemu_exit": 0, "ext4_unmounted": true})
+	terminal["authority_exit"] = 0
+	terminal["ext4_unmounted"] = true
+	return log.record("shutdown", "confirmed", terminal)
 }
 
 func errorText(err error) string {
