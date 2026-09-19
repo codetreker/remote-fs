@@ -50,6 +50,10 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 这项刺激用于区分“没有新身份响应”和“收到真实新身份仍未分离”两种条件。选定新 CREATE 必须确实未请求 QFid；记录缺席、返回原始字段及捕获 B/volume 的关联，不能通过额外查询或预先打开 B 告诉重定向器答案。响应接纳、新句柄身份和旧 HA 稳定性分别判定，任一旧身份被替换或两个句柄仍同身份均失败；精确 DETAIL、原生 opaque 身份/A/B 字节、一秒与原 TTL 仍是同一判据。此前 requested-only 的合格失败保留，不因新实验可能成功而改写。
 
+[POSIX 能力位实验](../../../../.github/workflows/native-smb-posix-capability.yml)单独回到 requested-only QFid 的精确 DETAIL 基线，只将原型 Fs5 的 0x6 改为 0x406。[SMB 查询规则](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/8608a6b8-1e4d-4b25-84e7-003d9faadc49)对该位使用 SHOULD clear，[Microsoft 产品说明 422](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/a64e55aa-1152-48e4-8206-edd96444e7f7#Appendix_A_422)另记录 Windows server 保留 FILE_SUPPORTS_POSIX_UNLINK_RENAME 的行为；真实 fixture 也验证了 A 被替换名字后仍保留引用与字节、B 可在新名字打开。这支持测试该底层能力声明，不预设 Windows 的身份算法，也不替任意 backend 声明能力；SET_INFO 64/65 等未实现命令仍拒绝。
+
+[补丁与控制](../../../../.github/scripts/native-smb-posix-capability-controls_test.go.txt)保持名字、serial、协商、requested-only QFid、native 首调用和全部身份/字节期限不变。真正 Fs5 的 raw/decoded 响应须绑定 HA，先于与被动事件同域的全局 mutation marker；该 marker 位于原 native-call mutation boundary 后、Rename 前，不增加查询。否则能力未暴露或证据无效，即使其它观察看似正确也不能算该机制成功。always-QFid 的失败独立保留，不与这一个能力位同时改变。
+
 ## 备选方案
 
 **等整套新实现完成后才运行原生验收。** 最终仍要这样验证交付代码，但把可行性诊断也推迟到那时，会让一个已经知道可能失败的缓存行为在大量实现之后才决定能否交付。固定原型让这项依赖提前得到可复现的回答。
@@ -135,4 +139,6 @@ always-truthful QFid 的本地适用控制共 46 根，普通/race 各 380 个 v
 
 每次结果绑定固定基底、overlay、探针 commit、variant、OS/build 和缓存设置；无 overlay 的样本保留各自来源。JSON 轨迹、Go verdict、映射前后状态和最终引用数作为产物保存十四天。轨迹溢出、编码失败、设置改变或映射残留使样本失败；取消 overlapped 通知须等真实完成后才释放结构和缓冲，意外清理错误不能当作正常取消。
 
-代价是维护固定基底补丁、注入锚点、回归、十八个诊断作业、独立祖先及精确历史实验，输入不会自动跟随生产代码。诊断提供可行性或失败证据，不交付新的 SMB 文件实现、SQLite 持久性或历史时间显示策略。实际 package、transport 和 backend 仍须独立验收；缓存失效机制与平台接入仍由平台提案承接，既有一秒要求保持不变。
+POSIX 单项的实际准备证明非测试源码仅改变 Fs5 能力位，适用本地控制 41 根、普通/race 各 395 verdict，两个旧能力位负向对照、十二项脚本策略和三种 ARM64 组合构建通过。backend 控制证明自己的 retained A/B 行为，不是 Windows 结果；新单项原生观察仍未知。
+
+代价是维护固定基底补丁、注入锚点、回归、十八个诊断作业及相互隔离的祖先/身份实验，输入不会自动跟随生产代码。诊断提供可行性或失败证据，不交付新的 SMB 文件实现、SQLite 持久性或历史时间显示策略。实际 package、transport 和 backend 仍须独立验收；缓存失效机制与平台接入仍由平台提案承接，既有一秒要求保持不变。

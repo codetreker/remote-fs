@@ -3,7 +3,9 @@ param(
     [ValidateSet('Prepare', 'PrepareFixture', 'Run', 'Verify')]
     [string]$Phase,
     [ValidateSet('requested-only', 'always-truthful')]
-    [string]$IdentityContextPolicy = 'requested-only'
+    [string]$IdentityContextPolicy = 'requested-only',
+    [ValidateSet('baseline', 'posix-unlink-rename')]
+    [string]$FilesystemCapabilityPolicy = 'baseline'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,6 +17,10 @@ $results = Join-Path $probeRoot 'results'
 $parent = Join-Path $PSScriptRoot 'native-smb-parent-invalidation.ps1'
 $IdentityContextPolicy = $IdentityContextPolicy.ToLowerInvariant()
 $env:RFS_QFID_POLICY = $IdentityContextPolicy
+$FilesystemCapabilityPolicy = $FilesystemCapabilityPolicy.ToLowerInvariant()
+$env:RFS_FILESYSTEM_CAPABILITY_POLICY = $FilesystemCapabilityPolicy
+$invalidPolicies = $FilesystemCapabilityPolicy -eq 'posix-unlink-rename' -and $IdentityContextPolicy -ne 'requested-only'
+if ($Phase -ne 'Verify' -and $invalidPolicies) { throw 'The POSIX capability experiment requires requested-only QFid responses.' }
 
 function Canonical-Hash([string]$Path) {
     $bytes = [Text.Encoding]::UTF8.GetBytes([IO.File]::ReadAllText($Path).Replace("`r`n", "`n"))
@@ -50,16 +56,16 @@ if ($Phase -in @('Prepare', 'Verify')) {
     & $parent -Phase $Phase -ProbeDirectory 'native-precise-invalidation'
     if ($LASTEXITCODE -ne 0) { throw "Shared precise $Phase failed." }
     if ($Phase -eq 'Prepare') {
-        Write-JSON 'identity-policy.json' ([ordered]@{ Policy = $IdentityContextPolicy; DiagnosticOnly = $true; PriorRequestedOnlyControl = '35423839239' })
+        Write-JSON 'identity-policy.json' ([ordered]@{ Policy = $IdentityContextPolicy; FilesystemCapabilityPolicy = $FilesystemCapabilityPolicy; DiagnosticOnly = $true; PriorRequestedOnlyControl = '35423839239' })
     } else {
         $selected = Get-Content (Join-Path $results 'identity-policy.json') -Raw | ConvertFrom-Json
-        if ($selected.Policy -ne $IdentityContextPolicy) { throw 'Identity response policy differs from the prepared fixture.' }
+        if ($invalidPolicies -or $selected.Policy -ne $IdentityContextPolicy -or $selected.FilesystemCapabilityPolicy -ne $FilesystemCapabilityPolicy) { throw 'Diagnostic policies differ from the prepared fixture.' }
     }
     exit 0
 }
 if ($Phase -eq 'Run') {
     $selected = Get-Content (Join-Path $results 'identity-policy.json') -Raw | ConvertFrom-Json
-    if ($selected.Policy -ne $IdentityContextPolicy) { throw 'Identity response policy differs from the prepared fixture.' }
+    if ($invalidPolicies -or $selected.Policy -ne $IdentityContextPolicy -or $selected.FilesystemCapabilityPolicy -ne $FilesystemCapabilityPolicy) { throw 'Diagnostic policies differ from the prepared fixture.' }
 }
 & $parent -Phase PrepareFixture -ProbeDirectory 'native-precise-invalidation'
 if ($LASTEXITCODE -ne 0) { throw 'Preparing the immutable precise fixture failed.' }
@@ -124,6 +130,46 @@ if ($IdentityContextPolicy -eq 'always-truthful') {
     Copy-Item (Join-Path $PSScriptRoot 'native-smb-qfid-context-controls_test.go.txt') (Join-Path $fixture 'packages/smb/gate_qfid_context_controls_test.go')
 }
 
+$posixFiles = @()
+$posixPatchHash = $null
+if ($FilesystemCapabilityPolicy -eq 'posix-unlink-rename') {
+    $posixPatch = Join-Path $PSScriptRoot 'native-smb-posix-capability.patch'
+    $posixPatchHash = '4e27300ea4539fb7e9254d904f7e753e3c487c2d80127d5096defa15423da3a5'
+    if ((Canonical-Hash $posixPatch) -ne $posixPatchHash) { throw 'POSIX capability overlay differs from its reviewed source.' }
+    $posixFiles = @(
+        @{ Path = 'packages/smb/commands_files.go'; Before = '88570edf50156ea4b275a33722bc1a90aca88cbcd427f1b0cc148e68bc9ef199'; After = '777a344f40490298bbaf6b28805355ac71d2491acb261bca9c4b9cc089b00178' }
+    )
+    $requestedOnly = @{
+        'packages/smb/create_contexts.go' = 'd349d4ab1c03243a6cc1bb99a94c48554a28ff1b1d88577f2a415be7d53952a7'
+        'packages/smb/commands_files_test.go' = '8a3085efce3a839eebe379a3d0abb9b689fe3a88b4a074bdd2a53f865af46765'
+    }
+    $requestedOnlyVerified = @(foreach ($entry in $requestedOnly.GetEnumerator()) {
+        $actual = Canonical-Hash (Join-Path $fixture $entry.Key)
+        if ($actual -ne $entry.Value) { throw "Requested-only baseline differs: $($entry.Key)" }
+        [ordered]@{ Path = $entry.Key; SHA256 = $actual }
+    })
+    Write-JSON 'posix-requested-only.json' $requestedOnlyVerified
+    $posixNormalized = @(foreach ($file in $posixFiles) {
+        $path = Join-Path $fixture $file.Path
+        $raw = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        $canonical = Canonical-Hash $path
+        if ($canonical -ne $file.Before) { throw "POSIX patch input differs: $($file.Path)" }
+        [IO.File]::WriteAllText($path, [IO.File]::ReadAllText($path).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+        $normalized = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($normalized -ne $file.Before) { throw "POSIX normalized input differs: $($file.Path)" }
+        [ordered]@{ Path = $file.Path; RawSHA256 = $raw; CanonicalSHA256 = $canonical; NormalizedSHA256 = $normalized }
+    })
+    Write-JSON 'posix-patch-inputs.json' $posixNormalized
+    $posixApplied = Join-Path $results 'native-smb-posix-capability.patch'
+    [IO.File]::WriteAllText($posixApplied, [IO.File]::ReadAllText($posixPatch).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+    & git -c core.autocrlf=false -C $fixture apply --unidiff-zero --check $posixApplied
+    if ($LASTEXITCODE -ne 0) { throw 'POSIX capability patch cannot be applied.' }
+    & git -c core.autocrlf=false -C $fixture apply --unidiff-zero $posixApplied
+    if ($LASTEXITCODE -ne 0) { throw 'Applying POSIX capability patch failed.' }
+    foreach ($file in $posixFiles) { if ((Canonical-Hash (Join-Path $fixture $file.Path)) -ne $file.After) { throw "POSIX patch output differs: $($file.Path)" } }
+    Copy-Item (Join-Path $PSScriptRoot 'native-smb-posix-capability-controls_test.go.txt') (Join-Path $fixture 'packages/smb/gate_posix_capability_controls_test.go')
+}
+
 $testRoot = Join-Path $fixture 'packages/smb/windows'
 foreach ($name in @('history', 'history-controls', 'identity')) {
     Copy-Item (Join-Path $PSScriptRoot "native-smb-precise-$name`_test.go.txt") (Join-Path $testRoot "gate_precise_$($name.Replace('-', '_'))_windows_test.go")
@@ -153,6 +199,7 @@ Replace-Once $files 's.actions[id] = nativeReceipt{fingerprint: fingerprint, res
 Replace-Once $probe '"github.com/codetreker/remote-fs/packages/storage"' "`"github.com/codetreker/remote-fs/packages/storage`"`n`"github.com/codetreker/remote-fs/packages/transport/httprest`""
 Replace-Once $probe 'mappingCall := beginCall("map",' "if err := bridge.precise.Prepare(t.Context(), bridge.remote); err != nil { t.Fatal(`"precise snapshot:`", err) }`nmappingCall := beginCall(`"map`","
 Replace-Once $probe 'q.WriteStarted = time.Now()' "if err := bridge.precise.Arm(replacement, rename, action); err != nil { t.Fatal(`"precise action binding:`", err) }`nq.WriteStarted = time.Now()"
+if ($FilesystemCapabilityPolicy -eq 'posix-unlink-rename') { Replace-Once $probe 'report.MutationBoundarySequence = nextEvent()' "report.MutationBoundarySequence = nextEvent()`npreciseIdentityBeginMutation()" }
 Replace-Once $probe 'var receipt storage.FileActionReceipt' "var receipt storage.FileActionReceipt`nvar mutationBarrier *httprest.MutationBarrier"
 Replace-Once $probe 'receipt, err = replacement.Rename(t.Context(), rename, action)' 'receipt, mutationBarrier, err = replacement.(httprest.FileWithBarrier).RenameWithBarrier(t.Context(), rename, action)'
 Replace-Once $probe "q.Native = opened`n`t`tendCall(firstCall, &q.Native)" "q.Native = opened`n`t`tendCall(firstCall, &q.Native)`n`t`tpreciseIdentityEndFirstOpen()"
@@ -174,16 +221,20 @@ $generated = @($authority, $bridge, $files, $probe, $wire,
     (Join-Path $testRoot 'gate_precise_identity_windows_test.go'),
     (Join-Path $fixture 'packages/smb/gate_precise_notify_controls_test.go'))
 if ($IdentityContextPolicy -eq 'always-truthful') { $generated += Join-Path $fixture 'packages/smb/gate_qfid_context_controls_test.go' }
+if ($FilesystemCapabilityPolicy -eq 'posix-unlink-rename') { $generated += Join-Path $fixture 'packages/smb/gate_posix_capability_controls_test.go' }
 & gofmt -w @generated
 if ($LASTEXITCODE -ne 0) { throw 'Formatting generated precise fixture failed.' }
 $inputNames = @('native-smb-precise-invalidation.ps1', 'native-smb-precise-history.patch', 'native-smb-precise-history_test.go.txt', 'native-smb-precise-history-controls_test.go.txt', 'native-smb-precise-notify-controls_test.go.txt', 'native-smb-precise-identity_test.go.txt', 'native-smb-parent-invalidation.ps1', 'native-smb-parent-invalidation_test.go.txt')
 if ($IdentityContextPolicy -eq 'always-truthful') { $inputNames += @('native-smb-qfid-context.patch', 'native-smb-qfid-context-controls_test.go.txt') }
+if ($FilesystemCapabilityPolicy -eq 'posix-unlink-rename') { $inputNames += @('native-smb-posix-capability.patch', 'native-smb-posix-capability-controls_test.go.txt') }
 $inputs = @($inputNames | ForEach-Object { [ordered]@{ Path = ".github/scripts/$_"; CanonicalSHA256 = Canonical-Hash (Join-Path $PSScriptRoot $_) } })
 $inputs += [ordered]@{ Path = '.github/workflows/native-smb-precise-invalidation.yml'; CanonicalSHA256 = Canonical-Hash (Join-Path $workspace '.github/workflows/native-smb-precise-invalidation.yml') }
 if ($IdentityContextPolicy -eq 'always-truthful') { $inputs += [ordered]@{ Path = '.github/workflows/native-smb-qfid-invalidation.yml'; CanonicalSHA256 = Canonical-Hash (Join-Path $workspace '.github/workflows/native-smb-qfid-invalidation.yml') } }
-Write-JSON 'precise-inputs.json' ([ordered]@{ SourceSHA = $env:RFS_PARENT_SOURCE_SHA; Mode = $Phase; Mechanism = 'historical_detail'; IdentityContextPolicy = $IdentityContextPolicy; PriorControlRun = $(if ($IdentityContextPolicy -eq 'always-truthful') { '35423839239' } else { '35419230739' }); Files = $inputs; PatchSHA256 = $patchHash; PatchFiles = $patchFiles; QFidPatchSHA256 = $qfidPatchHash; QFidPatchFiles = $qfidFiles })
+if ($FilesystemCapabilityPolicy -eq 'posix-unlink-rename') { $inputs += [ordered]@{ Path = '.github/workflows/native-smb-posix-capability.yml'; CanonicalSHA256 = Canonical-Hash (Join-Path $workspace '.github/workflows/native-smb-posix-capability.yml') } }
+Write-JSON 'precise-inputs.json' ([ordered]@{ SourceSHA = $env:RFS_PARENT_SOURCE_SHA; Mode = $Phase; Mechanism = 'historical_detail'; IdentityContextPolicy = $IdentityContextPolicy; FilesystemCapabilityPolicy = $FilesystemCapabilityPolicy; PriorControlRun = $(if ($FilesystemCapabilityPolicy -eq 'posix-unlink-rename' -or $IdentityContextPolicy -eq 'always-truthful') { '35423839239' } else { '35419230739' }); Files = $inputs; PatchSHA256 = $patchHash; PatchFiles = $patchFiles; QFidPatchSHA256 = $qfidPatchHash; QFidPatchFiles = $qfidFiles; PosixPatchSHA256 = $posixPatchHash; PosixPatchFiles = $posixFiles })
 Write-JSON 'precise-generated-source.json' @($generated | ForEach-Object { [ordered]@{ Path = [IO.Path]::GetRelativePath($fixture, $_).Replace('\', '/'); SHA256 = Canonical-Hash $_ } })
 if ($IdentityContextPolicy -eq 'always-truthful') { Write-JSON 'qfid-generated-source.json' @($qfidFiles | ForEach-Object { [ordered]@{ Path = $_.Path; SHA256 = Canonical-Hash (Join-Path $fixture $_.Path) } }) }
+if ($FilesystemCapabilityPolicy -eq 'posix-unlink-rename') { Write-JSON 'posix-generated-source.json' @($posixFiles | ForEach-Object { [ordered]@{ Path = $_.Path; SHA256 = Canonical-Hash (Join-Path $fixture $_.Path) } }) }
 if ($Phase -eq 'PrepareFixture') { exit 0 }
 
 Push-Location $fixture
@@ -195,6 +246,12 @@ try {
             'TestNativeBackupMetadataOpenPreservesIntentAndAbsence', 'TestCompoundReplyReservationCoversPayloadAndErrorFrames', 'TestCreateReturnsRequestedIdentityAndMaximalAccessContexts',
             'TestMaximalAccessContextDistinguishesUnchangedFromUnknown', 'TestCreateContextsEncodeOnlyZeroLeaseRights', 'TestGateMissingStatusRequiresVerifiedParent', 'TestGateMissingStatusOnlyChangesFinalCreate'
         ) 'qfid-context-controls.jsonl'
+    }
+    if ($FilesystemCapabilityPolicy -eq 'posix-unlink-rename') {
+        Invoke-Controls './packages/smb' '^TestGatePosixCapability' @(
+            'TestGatePosixCapabilityExactFilesystemAttributes', 'TestGatePosixCapabilityQueryFailureBoundaries',
+            'TestGatePosixCapabilityPreservesRequestedOnlyQFid', 'TestGatePosixCapabilityKeepsExSetInfoUnsupported'
+        ) 'posix-capability-controls.jsonl'
     }
     Invoke-Controls './packages/smb' '^TestDiagnosticNotification' @(
         'TestDiagnosticNotificationQueueOwnership', 'TestDiagnosticNotificationClosePinsValidation',
@@ -210,6 +267,8 @@ try {
         'TestPreciseHistoryEvidenceOwnsBoundedFacts', 'TestPreciseHistoryEvidenceBoundPreservesFirstFacts',
         'TestPreciseIdentityContexts', 'TestPreciseIdentityQueries', 'TestPreciseIdentityCorrelation', 'TestPreciseIdentityHandleBinding', 'TestPreciseIdentityInheritedSession', 'TestPreciseNotificationMode',
         'TestPreciseQFidPolicy', 'TestPreciseQFidPolicyRefusals', 'TestPreciseQFidOutcomeSeparation', 'TestPreciseQFidAmbiguousAndOtherCreates', 'TestPreciseFirstOpenEndOrdinal',
+        'TestPreciseFilesystemCapabilityParsing', 'TestPreciseFilesystemCapabilityOwnership', 'TestPreciseFilesystemCapabilityPolicy',
+        'TestPreciseFilesystemCapabilityRefusals', 'TestPreciseFilesystemCapabilityBaselineControl', 'TestPreciseRetainedReplacementBackend',
         'TestParentInvalidationNotifyParsing', 'TestParentInvalidationHookCorrelation',
         'TestParentInvalidationQualification'
     ) 'precise-producer-observer-controls.jsonl'
@@ -217,12 +276,12 @@ try {
     & go test -c -o $binary './packages/smb/windows'
     if ($LASTEXITCODE -ne 0) { throw 'Building the precise native test executable failed.' }
     $binaryHash = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()
-    Write-JSON 'precise-native-binary.json' ([ordered]@{ SHA256 = $binaryHash; Size = (Get-Item $binary).Length; GoVersion = (& go version); SourceSHA = $env:RFS_PARENT_SOURCE_SHA; Test = 'TestNativePreciseReplacement'; IdentityContextPolicy = $IdentityContextPolicy })
+    Write-JSON 'precise-native-binary.json' ([ordered]@{ SHA256 = $binaryHash; Size = (Get-Item $binary).Length; GoVersion = (& go version); SourceSHA = $env:RFS_PARENT_SOURCE_SHA; Test = 'TestNativePreciseReplacement'; IdentityContextPolicy = $IdentityContextPolicy; FilesystemCapabilityPolicy = $FilesystemCapabilityPolicy })
     $path = Join-Path $results 'precise-native.jsonl'
     & go tool test2json -t -p 'github.com/codetreker/remote-fs/packages/smb/windows' $binary '-test.v=test2json' '-test.count=1' '-test.timeout=3m' '-test.run=^TestNativePreciseReplacement$' 2>&1 | Tee-Object -FilePath $path
     $nativeExit = $LASTEXITCODE
     if ((Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant() -ne $binaryHash) { throw 'The executed precise test binary changed during the run.' }
-    $cell = if ($IdentityContextPolicy -eq 'always-truthful') { 'share0_app_first_replace_identity_always_qfid' } else { 'share0_app_first_replace_identity_precise' }
+    $cell = if ($FilesystemCapabilityPolicy -eq 'posix-unlink-rename') { 'share0_app_first_replace_identity_posix_capability' } elseif ($IdentityContextPolicy -eq 'always-truthful') { 'share0_app_first_replace_identity_always_qfid' } else { 'share0_app_first_replace_identity_precise' }
     Assert-Verdicts $path $nativeExit @('TestNativePreciseReplacement', "TestNativePreciseReplacement/$cell")
 } finally {
     Pop-Location

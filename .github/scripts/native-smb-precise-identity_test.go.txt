@@ -3,6 +3,8 @@
 package windows
 
 import (
+	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 type preciseQFid struct {
@@ -30,6 +33,29 @@ type preciseFileIdentity struct {
 	VolumeID    *uint64
 	ID128       string
 }
+type preciseFilesystemAttributes struct {
+	FixedRaw, NameRaw, Name                    string
+	Flags, MaximumComponent, DeclaredNameBytes uint32
+	ActualNameBytes                            int
+}
+
+const preciseFilesystemNameBytes = 512
+
+func preciseDecodeFilesystemAttributes(data []byte) (*preciseFilesystemAttributes, error) {
+	if len(data) < 12 {
+		return nil, errors.New("filesystem attribute header is truncated")
+	}
+	nameBytes := binary.LittleEndian.Uint32(data[8:12])
+	if nameBytes > preciseFilesystemNameBytes || nameBytes&1 != 0 || uint64(nameBytes) != uint64(len(data)-12) {
+		return nil, errors.New("filesystem attribute name length is invalid")
+	}
+	name, err := wire.DecodeUTF16(data[12:])
+	if err != nil {
+		return nil, err
+	}
+	return &preciseFilesystemAttributes{FixedRaw: hex.EncodeToString(data[:12]), NameRaw: hex.EncodeToString(data[12:]), Name: name, Flags: binary.LittleEndian.Uint32(data), MaximumComponent: binary.LittleEndian.Uint32(data[4:8]), DeclaredNameBytes: nameBytes, ActualNameBytes: len(data) - 12}, nil
+}
+
 type preciseIdentityRecord struct {
 	Sequence                                   uint64
 	At                                         time.Time
@@ -46,17 +72,20 @@ type preciseIdentityRecord struct {
 	QFid                                       *preciseQFid
 	FileIdentity                               *preciseFileIdentity
 	VolumeSerial                               *uint32
+	FilesystemAttributes                       *preciseFilesystemAttributes
 	Complete                                   bool
 	Error                                      string
 }
 
 var preciseIdentityRegistry struct {
 	sync.Mutex
-	records      []preciseIdentityRecord
-	pending      map[parentNotifyKey]preciseIdentityRecord
-	bytes        int
-	failure      error
-	firstOpenEnd uint64
+	records          []preciseIdentityRecord
+	pending          map[parentNotifyKey]preciseIdentityRecord
+	bytes            int
+	failure          error
+	firstOpenEnd     uint64
+	mutationSequence uint64
+	filesystemPolicy string
 }
 
 const preciseIdentityRecords = 64
@@ -70,6 +99,8 @@ func preciseIdentityReset() {
 	preciseIdentityRegistry.bytes = 0
 	preciseIdentityRegistry.failure = nil
 	preciseIdentityRegistry.firstOpenEnd = 0
+	preciseIdentityRegistry.mutationSequence = 0
+	preciseIdentityRegistry.filesystemPolicy = preciseFilesystemBaseline
 }
 func preciseIdentitySnapshot() ([]preciseIdentityRecord, error) {
 	preciseIdentityRegistry.Lock()
@@ -140,6 +171,12 @@ func preciseIdentityFields(packet []byte, r cacheGatePositiveWireRecord) (precis
 			}
 			volume := le.Uint64(data)
 			out.FileIdentity = &preciseFileIdentity{Class: 59, RawIdentity: hex.EncodeToString(data), VolumeID: &volume, ID128: hex.EncodeToString(data[8:])}
+		case r.QueryType == 2 && r.QueryClass == 5:
+			attributes, err := preciseDecodeFilesystemAttributes(data)
+			if err != nil {
+				return out, err
+			}
+			out.FilesystemAttributes = attributes
 		case r.QueryType == 2 && r.QueryClass == 1:
 			if len(data) < 18 || uint64(le.Uint32(data[12:16])) != uint64(len(data)-18) || le.Uint32(data[12:16])&1 != 0 {
 				return out, errors.New("filesystem volume serial framing is invalid")
@@ -226,11 +263,20 @@ func preciseIdentityCharge(record preciseIdentityRecord) int {
 	if record.FileIdentity != nil {
 		charge += 4 * (len(record.FileIdentity.RawIdentity) + len(record.FileIdentity.ID128))
 	}
+	if record.FilesystemAttributes != nil {
+		attributes := record.FilesystemAttributes
+		charge += 4 * (len(attributes.FixedRaw) + len(attributes.NameRaw) + len(attributes.Name))
+	}
 	return charge
 }
 func cacheGatePreciseIdentity(packet []byte, r cacheGatePositiveWireRecord) bool {
 	if !preciseIdentitySelected(r) {
-		return true
+		preciseIdentityRegistry.Lock()
+		enabled := preciseIdentityRegistry.filesystemPolicy == preciseFilesystemPosix
+		preciseIdentityRegistry.Unlock()
+		if !enabled || r.Command != wire.QueryInfo || r.QueryType != 2 || r.QueryClass != 5 {
+			return true
+		}
 	}
 	record, err := preciseIdentityFields(packet, r)
 	record.Sequence = parentObservationBoundary()
@@ -498,21 +544,41 @@ func preciseIdentityAudit(t *testing.T, report *parentInvalidationReport) {
 	policy, policyErr := preciseQFidPolicy(os.Getenv("RFS_QFID_POLICY"))
 	preciseIdentityRegistry.Lock()
 	end := preciseIdentityRegistry.firstOpenEnd
+	filesystemPolicy, mutation := preciseIdentityRegistry.filesystemPolicy, preciseIdentityRegistry.mutationSequence
 	preciseIdentityRegistry.Unlock()
+	filesystem := preciseFilesystemGate(filesystemPolicy, policy, records, report.Wire, report, mutation)
 	evidence := precisePolicyGate(policy, records, report.Wire, report, end)
 	err = errors.Join(err, policyErr)
+	passiveFailure := err != nil || evidence.Error != ""
+	if filesystemPolicy == preciseFilesystemPosix && !filesystem.Exposed {
+		err = errors.Join(err, errors.New(filesystem.Reason))
+		report.WithinOneSecondProven = false
+		report.Classification = "inconclusive"
+	}
 	if evidence.Error != "" {
 		err = errors.Join(err, errors.New(evidence.Error))
 	}
 	if err != nil {
 		evidence.StimulusDelivered = false
+		if filesystemPolicy == preciseFilesystemPosix {
+			filesystem.Exposed = false
+			if passiveFailure {
+				filesystem.Outcome = "invalid_evidence"
+			}
+			if filesystem.Reason == "" {
+				filesystem.Reason = err.Error()
+			}
+			report.WithinOneSecondProven = false
+			report.Classification = "inconclusive"
+		}
 		t.Error("passive identity evidence:", err)
 	}
 	data, encodeErr := json.MarshalIndent(struct {
-		Records []preciseIdentityRecord
-		Policy  precisePolicyEvidence
-		Error   string
-	}{records, evidence, fmt.Sprint(err)}, "", "  ")
+		Records              []preciseIdentityRecord
+		Policy               precisePolicyEvidence
+		FilesystemCapability preciseFilesystemEvidence
+		Error                string
+	}{records, evidence, filesystem, fmt.Sprint(err)}, "", "  ")
 	if encodeErr == nil {
 		encodeErr = os.WriteFile(filepath.Join(os.Getenv("RFS_GATE_OUTPUT_ROOT"), "precise-identity.json"), data, 0600)
 	}
@@ -529,12 +595,22 @@ func TestNativePreciseReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	filesystemPolicy, err := preciseFilesystemPolicy(os.Getenv("RFS_FILESYSTEM_CAPABILITY_POLICY"), policy)
+	if err != nil {
+		t.Fatal(err)
+	}
 	name := "share0_app_first_replace_identity_precise"
 	if policy == preciseAlwaysQFid {
 		name = "share0_app_first_replace_identity_always_qfid"
 	}
+	if filesystemPolicy == preciseFilesystemPosix {
+		name = "share0_app_first_replace_identity_posix_capability"
+	}
 	t.Run(name, func(t *testing.T) {
 		preciseIdentityReset()
+		if err := preciseConfigureFilesystemPolicy(filesystemPolicy, policy); err != nil {
+			t.Fatal(err)
+		}
 		report := &parentInvalidationReport{Kind: "replacement", Name: name, ShareMode: 0, Order: "app_first"}
 		parentRunCell(t, report.Name, report.Order, report.ShareMode, true, report)
 		if report.RescanRequired || !report.PreciseNotificationProven {
@@ -1275,5 +1351,715 @@ func TestPreciseFirstOpenEndOrdinal(t *testing.T) {
 	defer preciseIdentityRegistry.Unlock()
 	if preciseIdentityRegistry.firstOpenEnd != 0 {
 		t.Fatal("first-open bracket leaked to a later fixture")
+	}
+}
+
+const preciseFilesystemBaseline = "baseline"
+const preciseFilesystemPosix = "posix-unlink-rename"
+
+func preciseFilesystemPolicy(value, qfid string) (string, error) {
+	if value == "" {
+		value = preciseFilesystemBaseline
+	}
+	if value != preciseFilesystemBaseline && value != preciseFilesystemPosix {
+		return "", errors.New("unknown filesystem capability policy")
+	}
+	if value == preciseFilesystemPosix && qfid != preciseRequestedQFid {
+		return "", errors.New("POSIX capability requires requested-only QFid")
+	}
+	return value, nil
+}
+
+func preciseConfigureFilesystemPolicy(value, qfid string) error {
+	policy, err := preciseFilesystemPolicy(value, qfid)
+	if err != nil {
+		return err
+	}
+	preciseIdentityRegistry.Lock()
+	defer preciseIdentityRegistry.Unlock()
+	if len(preciseIdentityRegistry.records) != 0 || len(preciseIdentityRegistry.pending) != 0 || preciseIdentityRegistry.mutationSequence != 0 {
+		return errors.New("filesystem policy cannot change after observation starts")
+	}
+	preciseIdentityRegistry.filesystemPolicy = policy
+	return nil
+}
+
+func preciseIdentityBeginMutation() {
+	preciseIdentityRegistry.Lock()
+	enabled := preciseIdentityRegistry.filesystemPolicy == preciseFilesystemPosix
+	preciseIdentityRegistry.Unlock()
+	if !enabled {
+		return
+	}
+	sequence := parentObservationBoundary()
+	preciseIdentityRegistry.Lock()
+	defer preciseIdentityRegistry.Unlock()
+	if preciseIdentityRegistry.mutationSequence != 0 {
+		preciseIdentityRegistry.failure = errors.Join(preciseIdentityRegistry.failure, errors.New("mutation source boundary was recorded twice"))
+		return
+	}
+	preciseIdentityRegistry.mutationSequence = sequence
+}
+
+type preciseFilesystemEvidence struct {
+	Policy                                           string
+	MutationSequence, FirstOpenSequence              uint64
+	Outcome, Reason                                  string
+	Exposed                                          bool
+	CreateRequest, CreateResponse, Request, Response *preciseIdentityRecord
+	NativeOracle                                     string
+}
+
+func preciseFilesystemGate(policy, qfid string, records []preciseIdentityRecord, wireRecords []cacheGatePositiveWireRecord, report *parentInvalidationReport, mutation uint64) preciseFilesystemEvidence {
+	result := preciseFilesystemEvidence{Policy: policy, MutationSequence: mutation, FirstOpenSequence: report.FirstObservationSequence, NativeOracle: report.IdentityResult, Outcome: "not_required"}
+	reject := func(reason string) preciseFilesystemEvidence {
+		result.Outcome = "invalid_evidence"
+		result.Reason = reason
+		result.Exposed = false
+		return result
+	}
+	absent := func(reason string) preciseFilesystemEvidence {
+		result.Outcome = "not_exposed"
+		result.Reason = reason
+		result.Exposed = false
+		return result
+	}
+	if policy == preciseFilesystemBaseline {
+		return result
+	}
+	if _, err := preciseFilesystemPolicy(policy, qfid); err != nil {
+		return reject(err.Error())
+	}
+	if mutation == 0 || report.FirstObservationSequence <= mutation {
+		return reject("mutation and first-open source boundaries are absent or unordered")
+	}
+	if report.Pending == nil || report.Pending.Key.Connection == 0 || report.Pending.Session == 0 {
+		return reject("native session ownership is absent")
+	}
+	type pair struct{ request, response *preciseIdentityRecord }
+	pairs := make(map[parentNotifyKey]pair)
+	var previous uint64
+	for i := range records {
+		record := &records[i]
+		if !record.Complete || record.Error != "" || record.Sequence <= previous {
+			return reject("passive source order or completeness is invalid")
+		}
+		previous = record.Sequence
+		if record.Command != wire.Create && !(record.Command == wire.QueryInfo && record.QueryType == 2 && record.QueryClass == 5) {
+			continue
+		}
+		key := parentNotifyKey{record.Connection, record.MessageID}
+		owned := pairs[key]
+		if record.Connection == 0 || record.Session == 0 || record.Session == ^uint64(0) {
+			return reject("filesystem query source identity is absent")
+		}
+		if record.Response {
+			if owned.request == nil || owned.response != nil || record.Command != owned.request.Command || record.QueryType != owned.request.QueryType || record.QueryClass != owned.request.QueryClass || record.Session != owned.request.Session {
+				return reject("filesystem response has no unique request")
+			}
+			owned.response = record
+		} else {
+			if owned.request != nil {
+				return reject("filesystem query key is reused")
+			}
+			owned.request = record
+		}
+		pairs[key] = owned
+	}
+	names := make(map[parentNotifyKey]string)
+	wireRequests, wireResponses := make(map[parentNotifyKey]bool), make(map[parentNotifyKey]bool)
+	for _, record := range wireRecords {
+		if record.Command != wire.Create && !(record.Command == wire.QueryInfo && record.QueryType == 2 && record.QueryClass == 5) {
+			continue
+		}
+		key := parentNotifyKey{record.Connection, record.MessageID}
+		owned, ok := pairs[key]
+		if !ok || record.Incomplete != "" {
+			return reject("filesystem parent wire ownership is incomplete")
+		}
+		if record.Response {
+			response := owned.response
+			if response == nil || wireResponses[key] || response.Command != record.Command || response.Session != record.SessionID || response.QueryType != record.QueryType || response.QueryClass != record.QueryClass || response.Status != record.Status || response.FileID != record.FileID {
+				return reject("filesystem parent wire response disagrees")
+			}
+			wireResponses[key] = true
+		} else {
+			request := owned.request
+			if request == nil || wireRequests[key] || request.Command != record.Command || request.RawSession != record.SessionID || request.QueryType != record.QueryType || request.QueryClass != record.QueryClass || request.FileID != record.FileID || request.RelatedCreate != record.RelatedCreate {
+				return reject("filesystem parent wire request disagrees")
+			}
+			wireRequests[key] = true
+			names[key] = record.Name
+		}
+	}
+	for key, owned := range pairs {
+		if owned.request == nil || owned.response == nil || !wireRequests[key] || !wireResponses[key] {
+			return reject("filesystem exchange lacks a complete parent wire pair")
+		}
+		if owned.request.Command == wire.Create {
+			request, response := owned.request, owned.response
+			if !request.ContextsChecked || preciseContextQFidCount(*request) != map[bool]int{false: 0, true: 1}[request.QFidRequested] {
+				return reject("requested-only context ownership is unproven")
+			}
+			if response.Status == 0 {
+				if !response.ContextsChecked || response.QFidRequested != request.QFidRequested || (response.QFid != nil) != request.QFidRequested || preciseContextQFidCount(*response) != map[bool]int{false: 0, true: 1}[request.QFidRequested] {
+					return reject("successful CREATE changed requested-only QFid policy")
+				}
+			} else if response.QFid != nil {
+				return reject("failed CREATE acquired identity payload")
+			}
+		}
+	}
+	var retainedHA pair
+	for key, owned := range pairs {
+		if owned.request.Command != wire.Create || owned.response.Status != 0 || owned.response.FileID == "" || names[key] != `v\target` || owned.response.Sequence >= mutation || owned.request.Connection != report.Pending.Key.Connection || owned.request.Session != report.Pending.Session {
+			continue
+		}
+		if retainedHA.request == nil || owned.request.Sequence < retainedHA.request.Sequence {
+			retainedHA = owned
+		}
+	}
+	// Preserve source order when more than one naturally issued filesystem query
+	// is present. A later observation cannot repair an earlier contradictory one.
+	for i := range records {
+		response := &records[i]
+		if !response.Response || response.Command != wire.QueryInfo || response.QueryType != 2 || response.QueryClass != 5 {
+			continue
+		}
+		owned := pairs[parentNotifyKey{response.Connection, response.MessageID}]
+		request := owned.request
+		if request.RelatedCreate == 0 && request.FileID != response.FileID || request.RelatedCreate != response.RelatedCreate {
+			return reject("filesystem query changed handle lineage")
+		}
+		var created pair
+		found := false
+		for _, candidate := range pairs {
+			if candidate.request.Command != wire.Create || candidate.response.Status != 0 || candidate.response.FileID == "" || candidate.response.FileID != response.FileID || candidate.response.Connection != response.Connection || candidate.response.Session != response.Session {
+				continue
+			}
+			if found {
+				return reject("filesystem handle has ambiguous CREATE ownership")
+			}
+			found = true
+			created = candidate
+		}
+		if !found || created.response.Sequence >= response.Sequence || response.Connection != report.Pending.Key.Connection || response.Session != report.Pending.Session {
+			return reject("filesystem response has no known native handle ownership")
+		}
+		if request.RelatedCreate == 0 && created.response.Sequence >= request.Sequence || request.RelatedCreate != 0 && (request.RelatedCreate != created.request.MessageID || created.request.Sequence >= request.Sequence) {
+			return reject("filesystem request precedes its handle ownership")
+		}
+		if response.Status != 0 {
+			if response.FilesystemAttributes != nil {
+				return reject("failed filesystem response acquired attributes")
+			}
+			continue
+		}
+		attributes := response.FilesystemAttributes
+		if attributes == nil || len(attributes.FixedRaw) != 24 || len(attributes.NameRaw) > preciseFilesystemNameBytes*2 {
+			return reject("successful filesystem response lacks bounded raw attributes")
+		}
+		raw, err := hex.DecodeString(attributes.FixedRaw + attributes.NameRaw)
+		if err != nil {
+			return reject("filesystem raw payload is malformed")
+		}
+		decoded, err := preciseDecodeFilesystemAttributes(raw)
+		if err != nil || *decoded != *attributes {
+			return reject("filesystem raw and decoded attributes disagree")
+		}
+		ha := retainedHA.request != nil && created.request == retainedHA.request && created.response == retainedHA.response
+		if ha && result.Response == nil {
+			result.CreateRequest = created.request
+			result.CreateResponse = created.response
+			result.Request = request
+			result.Response = response
+		}
+		if attributes.Flags != 0x406 || attributes.MaximumComponent != 255 || attributes.Name != "remote-fs" {
+			return absent("actual filesystem tuple differs from the advertised candidate")
+		}
+		if ha && response.Sequence < mutation {
+			result.Exposed = true
+			result.Outcome = "exposed"
+			result.Reason = ""
+		}
+	}
+	if !result.Exposed {
+		return absent("no successful HA filesystem advertisement preceded mutation")
+	}
+	return result
+}
+
+func preciseTestFilesystemData(flags uint32) []byte {
+	name := wire.EncodeUTF16("remote-fs")
+	data := make([]byte, 12+len(name))
+	binary.LittleEndian.PutUint32(data, flags)
+	binary.LittleEndian.PutUint32(data[4:], 255)
+	binary.LittleEndian.PutUint32(data[8:], uint32(len(name)))
+	copy(data[12:], name)
+	return data
+}
+
+func TestPreciseFilesystemCapabilityParsing(t *testing.T) {
+	response := cacheGatePositiveWireRecord{Connection: 1, SessionID: 2, MessageID: 19, Command: wire.QueryInfo, Response: true, QueryType: 2, QueryClass: 5, FileID: "old-A"}
+	for _, flags := range []uint32{0x406, 0x6, 0} {
+		data := preciseTestFilesystemData(flags)
+		record, err := preciseIdentityFields(preciseTestQuery(data), response)
+		if err != nil || record.FilesystemAttributes == nil || record.FilesystemAttributes.Flags != flags || record.FilesystemAttributes.MaximumComponent != 255 || record.FilesystemAttributes.Name != "remote-fs" || record.FilesystemAttributes.FixedRaw != hex.EncodeToString(data[:12]) || record.FilesystemAttributes.NameRaw != hex.EncodeToString(data[12:]) {
+			t.Fatalf("actual Fs5 fields lost: %+v %v", record, err)
+		}
+	}
+	cases := []struct {
+		name string
+		data func() []byte
+	}{
+		{"short fixed header", func() []byte { return make([]byte, 11) }},
+		{"truncated name", func() []byte { b := preciseTestFilesystemData(0x406); return b[:len(b)-2] }},
+		{"odd name length", func() []byte {
+			b := preciseTestFilesystemData(0x406)
+			binary.LittleEndian.PutUint32(b[8:], 17)
+			return b[:len(b)-1]
+		}},
+		{"excess name bytes", func() []byte { return append(preciseTestFilesystemData(0x406), 0, 0) }},
+		{"name bound", func() []byte {
+			b := make([]byte, 12+preciseFilesystemNameBytes+2)
+			binary.LittleEndian.PutUint32(b[8:], preciseFilesystemNameBytes+2)
+			return b
+		}},
+		{"declared overflow", func() []byte {
+			b := preciseTestFilesystemData(0x406)
+			binary.LittleEndian.PutUint32(b[8:], ^uint32(0))
+			return b
+		}},
+		{"unpaired UTF16 surrogate", func() []byte {
+			b := preciseTestFilesystemData(0x406)
+			binary.LittleEndian.PutUint16(b[len(b)-2:], 0xd800)
+			return b
+		}},
+		{"NUL in filesystem name", func() []byte { b := preciseTestFilesystemData(0x406); b[12] = 0; b[13] = 0; return b }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			record, err := preciseIdentityFields(preciseTestQuery(tc.data()), response)
+			if err == nil || record.FilesystemAttributes != nil {
+				t.Fatal("malformed Fs5 accepted", record, err)
+			}
+		})
+	}
+	response.Status = 0xc0000022
+	record, err := preciseIdentityFields(make([]byte, 72), response)
+	if err != nil || !record.Complete || record.Status != response.Status || record.FilesystemAttributes != nil {
+		t.Fatal("failure gained a filesystem payload", record, err)
+	}
+}
+
+func preciseFilesystemFixture() ([]preciseIdentityRecord, []cacheGatePositiveWireRecord, parentInvalidationReport) {
+	records, wireRecords, report := precisePolicyFixture()
+	// The selected later CREATE follows the existing requested-only baseline.
+	records[3].QFid = nil
+	records[3].ContextNames = nil
+	attributes, err := preciseDecodeFilesystemAttributes(preciseTestFilesystemData(0x406))
+	if err != nil {
+		panic(err)
+	}
+	query := preciseIdentityRecord{Sequence: 3, At: records[0].At, Connection: 1, Session: 2, RawSession: 2, MessageID: 19, Command: wire.QueryInfo, QueryType: 2, QueryClass: 5, FileID: "old-A", Complete: true}
+	response := query
+	response.Response = true
+	response.Sequence = 4
+	response.FilesystemAttributes = attributes
+	records = append(append(slices.Clone(records[:2]), query, response), records[2:]...)
+	wireQuery := cacheGatePositiveWireRecord{At: query.At, Connection: 1, SessionID: 2, MessageID: 19, Command: wire.QueryInfo, QueryType: 2, QueryClass: 5, FileID: "old-A"}
+	wireResponse := wireQuery
+	wireResponse.Response = true
+	wireRecords = append(wireRecords, wireQuery, wireResponse)
+	report.Pending = &parentNotifyRequest{Key: parentNotifyKey{1, 7}, Session: 2, FileID: "watch-root"}
+	return records, wireRecords, report
+}
+
+func TestPreciseFilesystemCapabilityPolicy(t *testing.T) {
+	for _, qfid := range []string{preciseRequestedQFid, preciseAlwaysQFid} {
+		policy, err := preciseFilesystemPolicy("", qfid)
+		if err != nil || policy != preciseFilesystemBaseline {
+			t.Fatal("default QFid policy changed", policy, err)
+		}
+	}
+	for _, tc := range []struct{ policy, qfid string }{{"unknown", preciseRequestedQFid}, {preciseFilesystemPosix, preciseAlwaysQFid}} {
+		if _, err := preciseFilesystemPolicy(tc.policy, tc.qfid); err == nil {
+			t.Fatal("invalid policy combination accepted")
+		}
+	}
+	t.Run("actual advertisement and tied wall clocks", func(t *testing.T) {
+		records, wireRecords, report := preciseFilesystemFixture()
+		result := preciseFilesystemGate(preciseFilesystemPosix, preciseRequestedQFid, records, wireRecords, &report, 8)
+		if !result.Exposed || result.Outcome != "exposed" || result.Response.Sequence >= result.MutationSequence || result.MutationSequence >= result.FirstOpenSequence || result.CreateResponse.FileID != "old-A" {
+			t.Fatal(result)
+		}
+	})
+	t.Run("later requested QFid remains an allowed outcome", func(t *testing.T) {
+		records, wireRecords, report := preciseFilesystemFixture()
+		records[4].QFidRequested = true
+		records[4].ContextNames = []string{"51466964"}
+		records[5].QFidRequested = true
+		records[5].QFid = records[1].QFid
+		records[5].ContextNames = []string{"51466964"}
+		result := preciseFilesystemGate(preciseFilesystemPosix, preciseRequestedQFid, records, wireRecords, &report, 8)
+		if !result.Exposed {
+			t.Fatal("new requested context was prohibited", result)
+		}
+	})
+	t.Run("temporary warm handle cannot replace retained HA", func(t *testing.T) {
+		records, wireRecords, report := preciseFilesystemFixture()
+		warmRequest, warmResponse := records[0], records[1]
+		warmRequest.MessageID = 8
+		warmResponse.MessageID = 8
+		warmRequest.Sequence = 3
+		warmResponse.Sequence = 4
+		warmResponse.FileID = "warm-target"
+		records[2].Sequence = 5
+		records[3].Sequence = 6
+		records[2].FileID = "warm-target"
+		records[3].FileID = "warm-target"
+		records = append(append(slices.Clone(records[:2]), warmRequest, warmResponse), records[2:]...)
+		wireRecords[4].FileID = "warm-target"
+		wireRecords[5].FileID = "warm-target"
+		request, response := wireRecords[0], wireRecords[2]
+		request.MessageID = 8
+		response.MessageID = 8
+		response.FileID = "warm-target"
+		wireRecords = append(wireRecords, request, response)
+		result := preciseFilesystemGate(preciseFilesystemPosix, preciseRequestedQFid, records, wireRecords, &report, 8)
+		if result.Exposed || result.Outcome != "not_exposed" {
+			t.Fatal("warm handle stood in for initial HA", result)
+		}
+	})
+	t.Run("native alias and retained identity failures stay failures", func(t *testing.T) {
+		for _, outcome := range []string{"replacement_identity_aliased", "retained_identity_changed", "identity_unavailable", "replacement_first_open_failed", "replacement_bytes_wrong"} {
+			records, wireRecords, report := preciseFilesystemFixture()
+			report.IdentityResult = outcome
+			result := preciseFilesystemGate(preciseFilesystemPosix, preciseRequestedQFid, records, wireRecords, &report, 8)
+			if !result.Exposed || result.NativeOracle != outcome {
+				t.Fatal("filesystem stimulus rewrote native verdict", result)
+			}
+		}
+	})
+	t.Run("baseline adds no filesystem observation or source boundary", func(t *testing.T) {
+		preciseIdentityReset()
+		before := parentObservationBoundary()
+		preciseIdentityBeginMutation()
+		after := parentObservationBoundary()
+		query := cacheGatePositiveWireRecord{Connection: 1, SessionID: 2, MessageID: 19, Command: wire.QueryInfo, QueryType: 2, QueryClass: 5}
+		if !cacheGatePreciseIdentity(nil, query) {
+			t.Fatal("baseline intercepted Fs5")
+		}
+		records, err := preciseIdentitySnapshot()
+		if err != nil || len(records) != 0 || after != before+1 {
+			t.Fatal("baseline observer behavior changed", records, err)
+		}
+	})
+	t.Run("mutation marker is unique and reset", func(t *testing.T) {
+		preciseIdentityReset()
+		if err := preciseConfigureFilesystemPolicy(preciseFilesystemPosix, preciseRequestedQFid); err != nil {
+			t.Fatal(err)
+		}
+		before := parentObservationBoundary()
+		preciseIdentityBeginMutation()
+		preciseIdentityRegistry.Lock()
+		at := preciseIdentityRegistry.mutationSequence
+		preciseIdentityRegistry.Unlock()
+		if at <= before {
+			t.Fatal("mutation marker did not use global source order")
+		}
+		preciseIdentityBeginMutation()
+		if _, err := preciseIdentitySnapshot(); err == nil {
+			t.Fatal("duplicate mutation marker accepted")
+		}
+		preciseIdentityReset()
+		preciseIdentityRegistry.Lock()
+		defer preciseIdentityRegistry.Unlock()
+		if preciseIdentityRegistry.mutationSequence != 0 || preciseIdentityRegistry.filesystemPolicy != preciseFilesystemBaseline {
+			t.Fatal("filesystem state escaped its fixture")
+		}
+	})
+}
+
+func TestPreciseFilesystemCapabilityRefusals(t *testing.T) {
+	cases := []struct {
+		name   string
+		change func(*[]preciseIdentityRecord, *[]cacheGatePositiveWireRecord, *parentInvalidationReport, *uint64)
+	}{
+		{"missing advertisement", func(r *[]preciseIdentityRecord, w *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			*r = append(slices.Clone((*r)[:2]), (*r)[4:]...)
+			*w = (*w)[:4]
+		}},
+		{"at mutation", func(_ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, m *uint64) {
+			*m = 4
+		}},
+		{"after mutation", func(_ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, m *uint64) {
+			*m = 3
+		}},
+		{"reply after first open", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			query, response := (*r)[2], (*r)[3]
+			query.Sequence = 13
+			response.Sequence = 14
+			*r = append(append(slices.Clone((*r)[:2]), (*r)[4:]...), query, response)
+		}},
+		{"missing reply", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			*r = append(slices.Clone((*r)[:3]), (*r)[4:]...)
+		}},
+		{"duplicate reply", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			copy := (*r)[3]
+			copy.Sequence = 5
+			*r = append(append(slices.Clone((*r)[:4]), copy), (*r)[4:]...)
+		}},
+		{"missing mutation", func(_ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, m *uint64) {
+			*m = 0
+		}},
+		{"first open precedes mutation", func(_ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, r *parentInvalidationReport, _ *uint64) {
+			r.FirstObservationSequence = 7
+		}},
+		{"failed query", func(r *[]preciseIdentityRecord, w *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[3].Status = 0xc0000022
+			(*r)[3].FilesystemAttributes = nil
+			(*w)[5].Status = 0xc0000022
+		}},
+		{"missing parsed payload", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[3].FilesystemAttributes = nil
+		}},
+		{"unknown handle", func(r *[]preciseIdentityRecord, w *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[2].FileID = "unknown"
+			(*r)[3].FileID = "unknown"
+			(*w)[4].FileID = "unknown"
+			(*w)[5].FileID = "unknown"
+		}},
+		{"changed handle", func(r *[]preciseIdentityRecord, w *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[3].FileID = "other"
+			(*w)[5].FileID = "other"
+		}},
+		{"other session", func(r *[]preciseIdentityRecord, w *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			for _, i := range []int{2, 3} {
+				(*r)[i].Session = 8
+				(*r)[i].RawSession = 8
+			}
+			(*w)[4].SessionID = 8
+			(*w)[5].SessionID = 8
+		}},
+		{"different connection", func(r *[]preciseIdentityRecord, w *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[2].Connection = 8
+			(*r)[3].Connection = 8
+			(*w)[4].Connection = 8
+			(*w)[5].Connection = 8
+		}},
+		{"missing parent request", func(_ *[]preciseIdentityRecord, w *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			*w = append(slices.Clone((*w)[:4]), (*w)[5:]...)
+		}},
+		{"duplicated parent reply", func(_ *[]preciseIdentityRecord, w *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			*w = append(*w, (*w)[5])
+		}},
+		{"raw decoded disagreement", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[3].FilesystemAttributes.Flags = 6
+		}},
+		{"raw name exceeds bound", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[3].FilesystemAttributes.NameRaw = string(make([]byte, preciseFilesystemNameBytes*2+1))
+		}},
+		{"wrong component maximum", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			data := preciseTestFilesystemData(0x406)
+			binary.LittleEndian.PutUint32(data[4:], 254)
+			(*r)[3].FilesystemAttributes, _ = preciseDecodeFilesystemAttributes(data)
+		}},
+		{"wrong filesystem name", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			data := preciseTestFilesystemData(0x406)
+			data[12] = 'R'
+			(*r)[3].FilesystemAttributes, _ = preciseDecodeFilesystemAttributes(data)
+		}},
+		{"extra capability bits", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[3].FilesystemAttributes, _ = preciseDecodeFilesystemAttributes(preciseTestFilesystemData(0x407))
+		}},
+		{"always QFid leaked", func(r *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *parentInvalidationReport, _ *uint64) {
+			(*r)[5].QFid = (*r)[1].QFid
+			(*r)[5].ContextNames = []string{"51466964"}
+		}},
+		{"missing watcher session", func(_ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, r *parentInvalidationReport, _ *uint64) {
+			r.Pending = nil
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			records, wireRecords, report := preciseFilesystemFixture()
+			mutation := uint64(8)
+			tc.change(&records, &wireRecords, &report, &mutation)
+			result := preciseFilesystemGate(preciseFilesystemPosix, preciseRequestedQFid, records, wireRecords, &report, mutation)
+			if result.Exposed || result.Outcome == "exposed" || result.Reason == "" {
+				t.Fatal("incomplete advertisement qualified", result)
+			}
+		})
+	}
+}
+
+func TestPreciseFilesystemCapabilityOwnership(t *testing.T) {
+	for _, mode := range []string{"bound direct query", "inherited query", "changed response session", "changed response handle", "unknown request", "late configuration"} {
+		t.Run(mode, func(t *testing.T) {
+			preciseIdentityReset()
+			if err := preciseConfigureFilesystemPolicy(preciseFilesystemPosix, preciseRequestedQFid); err != nil {
+				t.Fatal(err)
+			}
+			create := cacheGatePositiveWireRecord{Connection: 1, SessionID: 2, MessageID: 3, Command: wire.Create, Name: `v\target`}
+			created := create
+			created.Response = true
+			created.FileID = "old-A"
+			query := cacheGatePositiveWireRecord{Connection: 1, SessionID: 2, MessageID: 19, Command: wire.QueryInfo, QueryType: 2, QueryClass: 5, FileID: "old-A"}
+			response := query
+			response.Response = true
+			if !cacheGatePreciseIdentity(preciseTestCreate(false, nil, nil), create) {
+				t.Fatal("CREATE request rejected")
+			}
+			if mode == "late configuration" {
+				if err := preciseConfigureFilesystemPolicy(preciseFilesystemBaseline, preciseRequestedQFid); err == nil {
+					t.Fatal("active policy changed")
+				}
+				return
+			}
+			if mode == "inherited query" {
+				query.SessionID = ^uint64(0)
+				query.RelatedCreate = 3
+				query.Flags = wire.FlagRelated
+				query.related = true
+				query.FileID = "related"
+				response.RelatedCreate = 3
+			}
+			if mode != "unknown request" && mode == "inherited query" {
+				if !cacheGatePreciseIdentity(make([]byte, 72), query) {
+					t.Fatal("inherited Fs5 request rejected")
+				}
+			}
+			if !cacheGatePreciseIdentity(preciseTestCreate(true, nil, nil), created) {
+				t.Fatal("CREATE response rejected")
+			}
+			if mode != "unknown request" && mode != "inherited query" {
+				if !cacheGatePreciseIdentity(make([]byte, 72), query) {
+					t.Fatal("Fs5 request rejected")
+				}
+			}
+			if mode == "changed response session" {
+				response.SessionID++
+			}
+			if mode == "changed response handle" {
+				response.FileID = "other"
+			}
+			accepted := cacheGatePreciseIdentity(preciseTestQuery(preciseTestFilesystemData(0x406)), response)
+			valid := mode == "bound direct query" || mode == "inherited query"
+			if accepted != valid {
+				t.Fatal("Fs5 response ownership result", accepted, mode)
+			}
+			records, err := preciseIdentitySnapshot()
+			if valid {
+				if err != nil || len(records) != 4 || records[3].FilesystemAttributes == nil {
+					t.Fatal("bounded Fs5 capture incomplete", records, err)
+				}
+				preciseIdentityBeginMutation()
+				preciseIdentityRegistry.Lock()
+				mutation := preciseIdentityRegistry.mutationSequence
+				preciseIdentityRegistry.Unlock()
+				report := parentInvalidationReport{FirstObservationSequence: parentObservationBoundary(), Pending: &parentNotifyRequest{Key: parentNotifyKey{1, 7}, Session: 2}}
+				result := preciseFilesystemGate(preciseFilesystemPosix, preciseRequestedQFid, records, []cacheGatePositiveWireRecord{create, created, query, response}, &report, mutation)
+				if !result.Exposed {
+					t.Fatal("actual correlated callback sequence rejected", result)
+				}
+			} else if err == nil {
+				t.Fatal("invalid ownership did not fence evidence")
+			}
+		})
+	}
+}
+
+func TestPreciseFilesystemCapabilityBaselineControl(t *testing.T) {
+	records, wireRecords, report := preciseFilesystemFixture()
+	records[3].FilesystemAttributes, _ = preciseDecodeFilesystemAttributes(preciseTestFilesystemData(0x6))
+	result := preciseFilesystemGate(preciseFilesystemPosix, preciseRequestedQFid, records, wireRecords, &report, 8)
+	if result.Exposed || result.Outcome != "not_exposed" || result.Response == nil || result.Response.FilesystemAttributes.Flags != 0x6 {
+		t.Fatal("baseline bit pattern established candidate exposure", result)
+	}
+}
+
+func TestPreciseRetainedReplacementBackend(t *testing.T) {
+	authority := newNativeAuthority()
+	session, _, err := authority.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if _, err := session.Close(context.Background(), preciseTestAction(t)); err != nil {
+			t.Error(err)
+		}
+	}()
+	retained, err := session.Retain(t.Context(), storage.RetainRequest{NodeID: 1}, preciseTestAction(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := session.Reference(t.Context(), retained.Reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := func(parent storage.File, name string, kind storage.NodeKind) storage.File {
+		receipt, err := session.CreateAndRetainAt(t.Context(), storage.CreateAndRetainRequest{Target: preciseTestTarget(t, parent, name), Initial: storage.NodeInitial{Kind: kind}, Claim: storage.AccessClaim{Uses: storage.AllAccessUses}}, preciseTestAction(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		file, err := session.Reference(t.Context(), receipt.Reference)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return file
+	}
+	parent := create(root, "v", storage.NodeDirectory)
+	old := create(parent, "target", storage.NodeRegular)
+	replacement := create(parent, "replacement", storage.NodeRegular)
+	before, after := bytes.Repeat([]byte{0x17}, 257), bytes.Repeat([]byte{0x89}, 769)
+	for _, entry := range []struct {
+		file storage.File
+		data []byte
+	}{{old, before}, {replacement, after}} {
+		if _, err := entry.file.WriteAt(t.Context(), storage.FileWriteRequest{Data: entry.data}, preciseTestAction(t)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldID, newID := old.NodeID(), replacement.NodeID()
+	if oldID == 0 || newID == 0 || oldID == newID {
+		t.Fatal("fixture began with aliased identities")
+	}
+	request := storage.RenameRequest{Source: preciseTestTarget(t, parent, "replacement"), Destination: preciseTestTarget(t, parent, "target")}
+	moved, err := replacement.Rename(t.Context(), request, preciseTestAction(t))
+	if err != nil || moved.State != storage.FileActionCompleted || moved.Effects != storage.EffectEntryMoved || moved.Observation.Attr.ID != newID {
+		t.Fatalf("held-target replacement failed: %+v %v", moved, err)
+	}
+	opened, err := session.RetainAt(t.Context(), storage.RetainAtRequest{Target: preciseTestTarget(t, parent, "target"), Claim: storage.AccessClaim{Uses: storage.ReadContent}}, preciseTestAction(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := session.Reference(t.Context(), opened.Reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		for _, entry := range []struct {
+			file storage.File
+			id   uint64
+			data []byte
+		}{{old, oldID, before}, {replacement, newID, after}, {current, newID, after}} {
+			observed, err := entry.file.Stat(t.Context(), storage.ObservationOptions{IncludeLocation: true})
+			if err != nil || observed.Attr.ID != entry.id || observed.Attr.Size != int64(len(entry.data)) || entry.file.NodeID() != entry.id {
+				t.Fatalf("retained object identity changed: %+v %v", observed, err)
+			}
+			read, err := entry.file.ReadAt(t.Context(), storage.FileReadRequest{Length: len(entry.data)})
+			if err != nil || read.Attr.ID != entry.id || !bytes.Equal(read.Data, entry.data) {
+				t.Fatalf("retained object bytes changed: %+v %v", read.Attr, err)
+			}
+		}
+	}
+	oldObservation, err := old.Stat(t.Context(), storage.ObservationOptions{IncludeLocation: true})
+	if err != nil || oldObservation.Location == nil || oldObservation.Location.State != storage.LocationDetached {
+		t.Fatalf("A did not retain a detached object: %+v %v", oldObservation, err)
+	}
+	oldPath, err := parent.LookupAt(t.Context(), []byte("replacement"))
+	if err != nil || oldPath.Found {
+		t.Fatalf("B's previous entry remains: %+v %v", oldPath, err)
 	}
 }
