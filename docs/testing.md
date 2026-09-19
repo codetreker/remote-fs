@@ -158,6 +158,8 @@ native admission 用例用一个暂停的 Put 占满 Session 唯一的 data slot
 
 [NodeReference 用例](../packages/metastore/sqlite/node_references_test.go)分别验证 metadata 权限、raw leaf 字节、外来/关闭 Scope、真实 DeleteName 自我豁免与原生顺序。FUSE 的[目录/权限用例](../packages/fuse/directory_test.go)和[metadata 用例](../packages/fuse/metadata_test.go)核对目录引用及 posix.permissions.v1；缺席显示默认值不写回，present malformed 不回退，已知 ChangeTime 优先于 Linux 的历史显示投影。
 
+[NodeReference 相容性声明](../packages/metastore/sqlite/node_reference_claims_test.go)验证 ReadData/WriteData claim 的双向冲突、失败只释放自己的 claim，以及 claim 不授予字节/metadata/目录枚举方法。关闭、失效、detached 与原生引用拥有权保持；身份 namespace 操作不能凭父目录观察推导 ReadEntries。[HTTP 授权用例](../packages/transport/httprest/file_authorization_test.go)必须在 native 打开前把这些声明纳入 OpenAccess，拒绝不能产生引用。storage/native/HTTP 聚焦普通与 race 分别为 2/53/29 个通过 verdict；恢复旧 claim 拒绝与遗漏授权意图的两个隔离对照在指定断言失败，不把聚焦 profile 当全包覆盖。
+
 [目录 fd 授权回归](../packages/fuse/directory_authorization_test.go)通过真实 HTTP 直接驱动 FUSE handle：拒绝写打开的策略仍允许 Opendir/读取，随后被拒绝的时间/权限修改没有效果；允许的修改在改名或 unlink 后仍作用于保留 NodeID，替代目录不受影响。它分别记录 file.set-node-attr/file.set-node-metadata 授权，不把读打开当写许可。[目录拥有权用例](../packages/fuse/directory_test.go)暂停修改并发 Releasedir，核对同一 mutex 覆盖引用 Scope、所需版本读取与身份修改；关闭、失效 Scope、到期和能力错误都在修改前失败。旧 WriteMetadata 打开代码的对照必须在只读策略处以 EACCES 失败；这些 callback/HTTP 回归不代替实际挂载验收。
 
 [共享打开条件](../packages/storage/capability_validation_test.go)验证 ExpectedMetadata 的 SameNode 绑定、缺席/二进制 token、16 项与名字/token 边界，并与原 FileMutation 保持同一比较语义。[原子打开](../packages/metastore/sqlite/atomic_open_test.go)和[节点引用](../packages/metastore/sqlite/node_references_test.go)用例暂停客户端观察，在另一会话完成 metadata CAS 后继续打开，核对 stale/absent 条件在内容、metadata、身份、日志、quota、claim/intent 和 pin 生效前拒绝；当前条件则验证 Reset 保留身份、Replace 以旧目标比较且保留旧引用字节。该运行交错发生在客户端观察与打开之间；初步检查和最终事务复用同一比较由源码顺序保证，不宣称在持续持有的 native gate 内插入了并发修改。
@@ -367,11 +369,29 @@ go vet ./packages/smb ./packages/smb/internal/wire ./packages/smb/internal/signi
 
 [handle 用例](../packages/smb/handle_test.go)直接提供 neutral fixture 引用，核对 File/NodeReference 别名只关闭一次、返回错误的非 nil 引用仍保留名额、退役后晚到安装拒绝、borrow 排空和 cleanup attempt 结果不被覆盖；[authority 清理用例](../packages/smb/authority_session_test.go)核对失败关闭继续占连接/session/tree/open/export 额度，确认重试后才归还。fixture 安装不证明 wire CREATE 或真实 SQLite 文件操作，尚未接入的命令须按协议明确不支持。
 
-[认证到期用例](../packages/smb/authentication_expiry_test.go)在主 session 保持正常流量时遗弃第二次初始认证，并检查无需新帧的回收；重新认证到期保留原 signer/身份。它分别覆盖旧 generation、到期与 Step/Close 串行、Close 失败仍占容量、连接取消排空，以及真实 TCP 的未完成交换。provider 在截止后返回成功不能安装身份，迟到 timer 不得销毁后来交换。
+[认证到期用例](../packages/smb/authentication_expiry_test.go)在主 session 保持正常流量时遗弃第二次初始认证，并检查无需新帧的回收；重新认证到期保留原 signer/身份。它分别覆盖旧 generation、到期与 Step/Close 串行、Close 失败仍占容量、连接取消排空，以及真实 TCP 的未完成交换。provider 在截止后返回成功不能安装身份，迟到 timer 不得销毁后来交换。[交换到期 fixture](../packages/smb/commands_session_test.go)在 synctest 中推进真实 HandshakeTimeout，等待 watcher 完成退役后再发 continuation，要求 SESSION_DELETED；它不通过手改 deadline 或允许两种状态来绕过顺序，非法 SID 的拒绝独立保留。普通/race 各 14 个 verdict 通过；只恢复旧 DENIED 期望的对照在确切状态码处失败，生产到期行为不变。
 
 [退役用例](../packages/smb/session_retirement_test.go)暂停 TREE_CONNECT 创建者，再执行 LOGOFF/最后 frame 收尾，验证最后 opener 返回后 global session 名额最终释放。非 nil session 加错误与 Close 失败保留 authority/额度，成功重试才归还；仍活动 session 的失败打开保持可用，晚到响应的 signer 必须保留到签名完成。它们验证现有拥有权收齐，不引入额外原生关闭或另一生命周期。
 
 这一批 packages/smb 自身普通/race 各为 54 根、87 个通过 verdict，覆盖 86.2%、最低函数 50%，vet 与 ARM64/AMD64 交叉构建通过；previous-principal 负向对照在预期授权断言失败。这些是 Linux 端点协议/拥有权与构建证据。[Windows ARM64 包级运行 35118013777](https://github.com/codetreker/remote-fs/actions/runs/35118013777/job/104868296920)另通过四包的 94 根、156 个 verdict，覆盖新增端点根及真实 SSPI，源码绑定和覆盖见[实现决定](../.agents/notes/implemented/architecture/2026-09-16-smb-protocol-primitives.md)。旧原生 SSPI 的 71 verdict 仍只属于其原 checkout；新的包级结果也不代替系统重定向器、完整文件/映射/缓存验收。
+
+### SMB 名字、metadata 与 CREATE
+
+[名字用例](../packages/smb/names_test.go)核对字面路径、UTF-16/guard 边界、目录后缀、ADS 拒绝和整个目录的非法/歧义检测。[resolver 用例](../packages/smb/namespace_test.go)验证原始名字与 NodeID、前缀 guards、完整 metadata 披露授权、预算和最终/中间缺席区别；遗漏前缀 guards 的隔离对照必须失败。Linux 使用私有测试比较器，真实路径解析在那里拒绝；[Windows 比较器](../packages/smb/name_compare_windows_test.go)的原生执行另计。
+
+[Windows metadata](../packages/smb/windows_metadata_test.go)和[信息编码](../packages/smb/file_information_test.go)核对格式/CAS token 分离、其它 namespace、缺席/畸形/未知格式、结构属性、FILETIME 极值与未知时间拒绝。大小、链接数、pending、identity 和 granted-access 必须来自显式输入，不靠缺值造事实；这些 helper 测试不代表 QUERY_INFO handler 已接入。
+
+[CREATE 计划和响应](../packages/smb/create_test.go)检查 access/share/disposition、版本条件、最终叶名状态、QFid/MxAc/忽略字段与虚拟大小/serial；[打开生命周期](../packages/smb/create_lifecycle_test.go)核对效果前收费、已知零效果冲突最多四轮、取消和未知结果不得重发、部分引用/清理失败仍归原拥有者。成功响应使用原子结果，不能由后置 Stat 修补。已有 SUPERSEDE、symlink 与未接入的数据/信息命令必须拒绝。
+
+名字/helper 聚焦普通/race 分别通过 10 根/14 verdict 和 11 根/46 verdict；CREATE 为 18 根/54 verdict。包含这些代码的 SMB 普通包级验证通过 104 根/222 verdict，自身覆盖 88.6%，149 个函数均至少 50%。vet 和 ARM64/AMD64 构建证据来自最终平台无关状态修正之前的对应源码；最终 CREATE 普通/race/profile 已重新执行。交叉构建不等于 Windows 原生执行，旧会话/SSPI 收据也不能替新增 CREATE 证明系统客户端、共享模式、映射或缓存。
+
+### 当前 authority 的独立运行环境
+
+[当前 authority 工作流](../.github/workflows/native-current-authority.yml)分别在 Ubuntu 构建、Windows ARM64 消费同一源码绑定 artifact；[工具说明](../.github/scripts/native-current-authority/README.md)拥有固定 kernel/QEMU/Go 输入、精确命令、DACL/Job Object 与清理规则。Windows HTTP client 连接真正 Linux guest 内的 localstore/SQLite/nativelease，通过唯一 loopback 转发读写私有 ext4；这里没有固定原型或内存 authority 镜像。平台文件语义仍属于客户端，测试准备不移植生产 backend。
+
+readiness 经真实 HTTP lease/FileSession 检查原子打开、字节、metadata 条件、retained rename/unlink 与逻辑 quota，然后停止并普通重开同一磁盘，验证 sentinel 的 ID/字节/metadata。成功要求实际 authority/QEMU 退出、guest sync/unmount、流排空、私有磁盘删除和基底不变；监听端口或计数归零不能代替它们。该工具始终把 native_acceptance 标为未运行，不能充当 SMB 或一秒可见性门禁。
+
+[模板测试入口](../.github/scripts/native-current-authority/check-tooling.py)显式列举隐藏 Go 模板的根和 verdict，普通 module 发现不覆盖它们。当前普通检查为 36 根/176 verdict，guest/probe/controller 的普通与 race 分别通过 87/63/26 verdict；Python 装配、进程拥有权和 checker 共 24 根。一次本地 Linux TCG 真正启动、HTTP readiness、普通重启和完整关闭通过；来源明确为本地脏 artifact，不冒充未来 CI commit。Windows 翻译运行、native ACL/Job 和 HTTP 组合尚未实测，SMB/缓存验收未运行；mock/交叉构建及 Linux VM 结果分别记录。[决定](../.agents/notes/implemented/testing/2026-09-19-current-authority-virtual-machine-fixture.md)说明与固定原型诊断的分工，普通重启不宣称断电可靠性。
 
 ### Windows 原生 SMB 缓存诊断
 

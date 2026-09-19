@@ -1,0 +1,1217 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/sha512"
+	"debug/pe"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	responsePrefix = "RFS-FIXTURE/1 "
+	controlLimit   = 1024
+	streamLimit    = 16 << 20
+	qemuSHA512     = "5bcf9eed634e8575a37b74f445af41a2fe4106da512d0c30c368301d4c105037fdfab40a5287367a28a957624cddebbc8c07e16c88ab6634f554cdf3d16bf543"
+	qemuURL        = "https://qemu.weilnetz.de/w64/2026/qemu-w64-setup-20260811.exe"
+)
+
+var (
+	errOwnedCleanup = errors.New("owned process cleanup was not confirmed")
+	hex40           = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	hex64           = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	runIDPattern    = regexp.MustCompile(`^[A-Za-z0-9_-]{1,96}$`)
+	newPlatform     = func() (platform, error) { return nil, errors.New("controller requires native Windows ARM64") }
+)
+
+type artifact struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+}
+
+type manifest struct {
+	Format        int               `json:"format"`
+	SourceSHA     string            `json:"source_sha"`
+	SourceTreeSHA string            `json:"source_tree_sha"`
+	SourceDirty   *bool             `json:"source_dirty"`
+	SourceFiles   map[string]string `json:"source_files"`
+	Volume        string            `json:"volume"`
+	BootToken     string            `json:"boot_token"`
+	QuotaBytes    int64             `json:"quota_bytes"`
+	DiskBytes     int64             `json:"disk_bytes"`
+	Build         struct {
+		GoVersion    string            `json:"go_version"`
+		GOOS         string            `json:"goos"`
+		GOARCH       string            `json:"goarch"`
+		CGOEnabled   string            `json:"cgo_enabled"`
+		Flags        []string          `json:"flags,omitempty"`
+		ToolVersions map[string]string `json:"tool_versions,omitempty"`
+	} `json:"build"`
+	QEMU struct {
+		Version string `json:"version"`
+		URL     string `json:"url"`
+		SHA512  string `json:"sha512"`
+		Machine string `json:"machine"`
+	} `json:"qemu"`
+	Artifacts map[string]artifact `json:"artifacts"`
+}
+
+type packageManifest struct {
+	Format          int               `json:"format"`
+	ArchiveSHA512   string            `json:"archive_sha512"`
+	Executable      string            `json:"executable"`
+	DataDir         string            `json:"data_dir"`
+	SevenZipVersion string            `json:"seven_zip_version"`
+	Files           map[string]string `json:"files"`
+}
+
+type identity struct {
+	RunID     string `json:"run_id"`
+	SourceSHA string `json:"source_sha"`
+	Nonce     string `json:"fixture_nonce"`
+}
+
+type response struct {
+	identity
+	Phase          string `json:"phase"`
+	Sequence       uint64 `json:"sequence"`
+	Op             string `json:"op"`
+	Status         string `json:"status"`
+	Category       string `json:"category,omitempty"`
+	Cause          string `json:"cause,omitempty"`
+	ExitCode       *int   `json:"exit_code,omitempty"`
+	AuthorityEpoch string `json:"authority_epoch,omitempty"`
+	ObjectID       string `json:"object_id,omitempty"`
+}
+
+type child interface {
+	Input() io.WriteCloser
+	Output() io.ReadCloser
+	Errors() io.ReadCloser
+	Done() <-chan struct{}
+	Result() error
+	PID() uint32
+	// Finish verifies the job is empty. Force termination is never a graceful result.
+	Finish() (forced bool, err error)
+}
+
+type platform interface {
+	Preflight() (map[string]any, error)
+	Start(executable string, args []string, directory string) (child, error)
+}
+
+type options struct {
+	Repo, ArtifactDir, PackageDir, SourceSHA, SourceTreeSHA, RunID string
+	RequireNative                                                  bool
+}
+
+func rejectDuplicateKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	var value func() error
+	value = func() error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delimiter, nested := token.(json.Delim)
+		if !nested {
+			return nil
+		}
+		if delimiter != '{' && delimiter != '[' {
+			return errors.New("unexpected JSON delimiter")
+		}
+		keys := make(map[string]bool)
+		for decoder.More() {
+			if delimiter == '{' {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok || keys[key] {
+					return errors.New("duplicate or invalid JSON field")
+				}
+				keys[key] = true
+			}
+			if err := value(); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+		return err
+	}
+	return value()
+}
+
+func decodeOne(data []byte, target any) error {
+	if err := rejectDuplicateKeys(data); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return errors.New("expected exactly one JSON value")
+	}
+	return nil
+}
+
+func readJSON(path string, target any) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, streamLimit+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > streamLimit {
+		return fmt.Errorf("manifest %s exceeds size limit", path)
+	}
+	return decodeOne(data, target)
+}
+
+func makeOwnedDirectories(root, relative string) error {
+	current := root
+	for _, name := range strings.Split(relative, "/") {
+		if name == "" || name == "." || name == ".." {
+			return errors.New("invalid owned directory path")
+		}
+		current = filepath.Join(current, name)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			if err := os.Mkdir(current, 0700); err != nil {
+				return err
+			}
+			info, err = os.Lstat(current)
+		}
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+			return fmt.Errorf("owned directory is not a regular directory: %s", current)
+		}
+	}
+	return nil
+}
+
+func safePath(root, relative string) (string, error) {
+	if relative == "" || strings.Contains(relative, `\`) || strings.Contains(relative, ":") || filepath.IsAbs(relative) {
+		return "", fmt.Errorf("invalid relative artifact path %q", relative)
+	}
+	for _, part := range strings.Split(relative, "/") {
+		if part == "" || part == "." || part == ".." {
+			return "", fmt.Errorf("invalid artifact path %q", relative)
+		}
+	}
+	current := root
+	for _, part := range strings.Split(relative, "/") {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeIrregular != 0 {
+			return "", fmt.Errorf("artifact path is not regular: %s", current)
+		}
+	}
+	return current, nil
+}
+
+func privateOutput(path string) (*os.File, error) {
+	if err := validatePrivateDirectory(filepath.Dir(path)); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := makePrivateFile(path); err != nil {
+		return nil, errors.Join(err, file.Close(), os.Remove(path))
+	}
+	return file, nil
+}
+
+func fileHash(path string) (string, int64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	if !info.Mode().IsRegular() {
+		return "", 0, fmt.Errorf("expected regular file: %s", path)
+	}
+	hash := sha256.New()
+	size, err := io.Copy(hash, file)
+	if err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), size, nil
+}
+
+func verifyFiles(root string, files map[string]string) error {
+	if len(files) == 0 {
+		return errors.New("empty source or package file manifest")
+	}
+	paths := make([]string, 0, len(files))
+	for path := range files {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		if !hex64.MatchString(files[path]) {
+			return fmt.Errorf("invalid hash for %s", path)
+		}
+		full, err := safePath(root, path)
+		if err != nil {
+			return err
+		}
+		actual, _, err := fileHash(full)
+		if err != nil {
+			return err
+		}
+		if actual != files[path] {
+			return fmt.Errorf("SHA256 mismatch: %s", path)
+		}
+	}
+	return nil
+}
+
+func validateManifest(m manifest, o options) error {
+	if m.Format != 1 || !hex40.MatchString(m.SourceSHA) || !hex40.MatchString(m.SourceTreeSHA) || (m.SourceDirty == nil || *m.SourceDirty) || m.SourceSHA != o.SourceSHA || m.SourceTreeSHA != o.SourceTreeSHA {
+		return errors.New("artifact requires the same clean checkout and tree SHA")
+	}
+	if m.Volume != "fixture-current" || !hex64.MatchString(m.BootToken) || m.QuotaBytes != 64<<20 || m.DiskBytes != 1<<30 {
+		return errors.New("artifact volume, boot token, quota, or disk size differs from fixed fixture")
+	}
+	if m.Build.GoVersion != "go1.26.8" || m.Build.GOOS != "linux" || m.Build.GOARCH != "amd64" || m.Build.CGOEnabled != "0" {
+		return errors.New("authority build provenance differs from pinned build")
+	}
+	if len(m.Build.Flags) > 64 || len(m.Build.ToolVersions) > 64 {
+		return errors.New("build provenance exceeds field limit")
+	}
+	for _, value := range m.Build.Flags {
+		if len(value) > 4096 {
+			return errors.New("build flag exceeds size limit")
+		}
+	}
+	for key, value := range m.Build.ToolVersions {
+		if len(key) > 128 || len(value) > 4096 {
+			return errors.New("build tool version exceeds size limit")
+		}
+	}
+
+	if m.QEMU.Version != "11.1.0" || m.QEMU.URL != qemuURL || m.QEMU.SHA512 != qemuSHA512 || m.QEMU.Machine != "pc-q35-11.1" {
+		return errors.New("QEMU provenance differs from pinned bundle")
+	}
+	for _, name := range []string{"kernel", "initramfs", "data", "probe_windows_arm64", "controller_windows_arm64"} {
+		value, ok := m.Artifacts[name]
+		if !ok || !hex64.MatchString(value.SHA256) || value.Size <= 0 {
+			return fmt.Errorf("missing or invalid %s artifact", name)
+		}
+	}
+	if m.Artifacts["data"].Size != m.DiskBytes {
+		return errors.New("pristine disk size differs from fixed disk size")
+	}
+	if err := verifyFiles(o.Repo, m.SourceFiles); err != nil {
+		return fmt.Errorf("source inputs: %w", err)
+	}
+	for name, value := range m.Artifacts {
+		path, err := safePath(o.ArtifactDir, value.Path)
+		if err != nil {
+			return err
+		}
+		actual, size, err := fileHash(path)
+		if err != nil {
+			return err
+		}
+		if actual != value.SHA256 || size != value.Size {
+			return fmt.Errorf("artifact hash or size mismatch: %s", name)
+		}
+	}
+	return nil
+}
+
+type cappedWriter struct {
+	mu        sync.Mutex
+	writer    io.Writer
+	remaining int64
+}
+
+func (w *cappedWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if int64(len(data)) > w.remaining {
+		n, err := w.writer.Write(data[:w.remaining])
+		w.remaining = 0
+		_, markerErr := io.WriteString(w.writer, "\n[fixture log limit exceeded; stream truncated]\n")
+		return n, errors.Join(errors.New("fixture stream exceeds 16 MiB"), err, markerErr)
+	}
+	n, err := w.writer.Write(data)
+	w.remaining -= int64(n)
+	return n, err
+}
+
+type events struct {
+	identity
+	output   *cappedWriter
+	sequence uint64
+}
+
+func (e *events) record(phase, category string, details any) error {
+	e.sequence++
+	record := struct {
+		identity
+		Sequence  uint64 `json:"sequence"`
+		Subsystem string `json:"subsystem"`
+		Time      string `json:"time"`
+		Phase     string `json:"phase"`
+		Category  string `json:"category"`
+		Details   any    `json:"details"`
+	}{e.identity, e.sequence, "windows-controller", time.Now().UTC().Format(time.RFC3339Nano), phase, category, details}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	_, err = e.output.Write(append(data, '\n'))
+	return err
+}
+
+func parseResponse(line []byte, expected identity) (*response, error) {
+	if !bytes.HasPrefix(line, []byte(responsePrefix)) {
+		return nil, nil
+	}
+	if len(line)+1 > controlLimit {
+		return nil, errors.New("guest control response exceeds 1 KiB")
+	}
+	var value response
+	if err := decodeOne(bytes.TrimPrefix(line, []byte(responsePrefix)), &value); err != nil {
+		return nil, fmt.Errorf("guest response JSON: %w", err)
+	}
+	if value.identity != expected {
+		return nil, errors.New("guest response belongs to another run, source, or nonce")
+	}
+	if value.Status != "ok" && value.Status != "error" {
+		return nil, errors.New("guest response has invalid status")
+	}
+	if value.Status == "error" {
+		return nil, fmt.Errorf("guest %s/%s: %s", value.Phase, value.Category, value.Cause)
+	}
+	return &value, nil
+}
+
+func commandBytes(nonce string, sequence uint64, command string) ([]byte, error) {
+	if !hex64.MatchString(nonce) || sequence == 0 || (command != "start" && command != "stop-authority" && command != "shutdown") {
+		return nil, errors.New("invalid guest command")
+	}
+	data, err := json.Marshal(struct {
+		Nonce    string `json:"nonce"`
+		Sequence uint64 `json:"sequence"`
+		Command  string `json:"command"`
+	}{nonce, sequence, command})
+	if err != nil {
+		return nil, err
+	}
+	data = append(data, '\n')
+	if len(data) > controlLimit {
+		return nil, errors.New("guest command exceeds 1 KiB")
+	}
+	return data, nil
+}
+
+type guestChannel struct {
+	child child
+	identity
+	responses chan response
+	fault     chan error
+	streams   chan error
+}
+
+func newGuestChannel(process child, id identity, directory string) (*guestChannel, error) {
+	stdout, err := privateOutput(filepath.Join(directory, "guest-serial.log"))
+	if err != nil {
+		return nil, err
+	}
+	stderr, err := privateOutput(filepath.Join(directory, "qemu-stderr.log"))
+	if err != nil {
+		stdout.Close()
+		return nil, err
+	}
+	authorityLogs := make(map[string]*os.File)
+	for _, name := range []string{"stdout", "stderr"} {
+		file, err := privateOutput(filepath.Join(directory, "authority-"+name+".log"))
+		if err != nil {
+			for _, existing := range authorityLogs {
+				existing.Close()
+			}
+			stdout.Close()
+			stderr.Close()
+			return nil, err
+		}
+		authorityLogs[name] = file
+	}
+	channel := &guestChannel{process, id, make(chan response, 1), make(chan error, 1), make(chan error, 2)}
+	report := func(err error) {
+		select {
+		case channel.fault <- err:
+		default:
+		}
+	}
+	go func() {
+		defer stdout.Close()
+		for _, file := range authorityLogs {
+			defer file.Close()
+		}
+		serial := &cappedWriter{writer: stdout, remaining: streamLimit}
+		logs := make(map[string]*cappedWriter)
+		for name, file := range authorityLogs {
+			logs[name] = &cappedWriter{writer: file, remaining: streamLimit}
+		}
+		scanner := bufio.NewScanner(process.Output())
+		scanner.Buffer(make([]byte, 4096), streamLimit)
+		for scanner.Scan() {
+			line := bytes.TrimSuffix(scanner.Bytes(), []byte{'\r'})
+			handled, err := authorityLogLine(line, logs)
+			if err != nil {
+				report(err)
+				channel.streams <- err
+				return
+			}
+			if handled {
+				continue
+			}
+			if _, err := serial.Write(append(bytes.Clone(line), '\n')); err != nil {
+				report(err)
+				channel.streams <- err
+				return
+			}
+			message, err := parseResponse(line, id)
+			if err != nil {
+				report(err)
+				channel.streams <- err
+				return
+			}
+			if message != nil {
+				select {
+				case channel.responses <- *message:
+				default:
+					err := errors.New("guest produced an unsolicited or duplicate response")
+					report(err)
+					channel.streams <- err
+					return
+				}
+			}
+		}
+		err := scanner.Err()
+		if err != nil {
+			report(err)
+		}
+		channel.streams <- err
+	}()
+	go func() {
+		defer stderr.Close()
+		_, err := io.Copy(&cappedWriter{writer: stderr, remaining: streamLimit}, process.Errors())
+		if err != nil {
+			report(err)
+		}
+		channel.streams <- err
+	}()
+	return channel, nil
+}
+
+func authorityLogLine(line []byte, logs map[string]*cappedWriter) (bool, error) {
+	for name, writer := range logs {
+		prefix := []byte("RFS-AUTHORITY/" + name + " ")
+		if !bytes.HasPrefix(line, prefix) {
+			continue
+		}
+		data, err := base64.StdEncoding.Strict().DecodeString(string(bytes.TrimPrefix(line, prefix)))
+		if err != nil {
+			return true, fmt.Errorf("authority %s log frame: %w", name, err)
+		}
+		_, err = writer.Write(data)
+		return true, err
+	}
+	if bytes.HasPrefix(line, []byte("RFS-AUTHORITY/")) {
+		return true, errors.New("unknown authority log frame")
+	}
+	return false, nil
+}
+
+func (g *guestChannel) receive(ctx context.Context, sequence uint64, op, phase string) (response, error) {
+	select {
+	case err := <-g.fault:
+		return response{}, err
+	default:
+	}
+	select {
+	case value := <-g.responses:
+		if value.Sequence != sequence || value.Op != op || value.Phase != phase {
+			return response{}, fmt.Errorf("unexpected guest response %s/%s sequence %d", value.Phase, value.Op, value.Sequence)
+		}
+		if (op == "stop-authority" || op == "shutdown") && (value.ExitCode == nil || *value.ExitCode != 0) {
+			return response{}, errors.New("guest did not confirm successful authority exit")
+		}
+		return value, nil
+	case err := <-g.fault:
+		return response{}, err
+	case <-g.child.Done():
+		// A shutdown acknowledgement can race process exit, but the pipe still owns it.
+		if op == "shutdown" {
+			select {
+			case value := <-g.responses:
+				if value.Sequence == sequence && value.Op == op && value.Phase == phase && value.ExitCode != nil && *value.ExitCode == 0 {
+					return value, nil
+				}
+			case err := <-g.fault:
+				return response{}, err
+			case <-ctx.Done():
+				return response{}, ctx.Err()
+			}
+		}
+		return response{}, fmt.Errorf("QEMU exited before %s acknowledgement: %v", op, g.child.Result())
+	case <-ctx.Done():
+		return response{}, ctx.Err()
+	}
+}
+
+func (g *guestChannel) command(ctx context.Context, sequence uint64, op string) (response, error) {
+	select {
+	case value := <-g.responses:
+		return response{}, fmt.Errorf("unsolicited guest response before command: %s", value.Op)
+	default:
+	}
+	data, err := commandBytes(g.Nonce, sequence, op)
+	if err != nil {
+		return response{}, err
+	}
+	written := make(chan error, 1)
+	go func() {
+		n, err := g.child.Input().Write(data)
+		if err == nil && n != len(data) {
+			err = io.ErrShortWrite
+		}
+		written <- err
+	}()
+	select {
+	case err = <-written:
+		if err != nil {
+			return response{}, err
+		}
+	case <-ctx.Done():
+		return response{}, ctx.Err()
+	}
+	return g.receive(ctx, sequence, op, op)
+}
+
+func qemuArguments(m manifest, id identity, kernel, initramfs, data, bios string, port int) []string {
+	escape := func(value string) string { return strings.ReplaceAll(value, ",", ",,") }
+	appendArgs := "console=ttyS0,115200 rdinit=/init panic=1 net.ifnames=0" +
+		" RFS_FIXTURE_BOOT_TOKEN=" + m.BootToken + " RFS_FIXTURE_NONCE=" + id.Nonce +
+		" RFS_FIXTURE_RUN_ID=" + id.RunID + " RFS_FIXTURE_VOLUME=" + m.Volume
+	return []string{
+		"-L", bios, "-machine", m.QEMU.Machine, "-accel", "tcg,thread=multi", "-cpu", "qemu64", "-smp", "2", "-m", "1024",
+		"-nodefaults", "-no-user-config", "-display", "none", "-monitor", "none", "-no-reboot",
+		"-kernel", kernel, "-initrd", initramfs, "-append", appendArgs,
+		"-chardev", "stdio,id=console,signal=off", "-serial", "chardev:console",
+		"-drive", "file=" + escape(data) + ",format=raw,if=none,id=data,cache=writeback,rerror=report,werror=report",
+		"-device", "virtio-blk-pci,drive=data",
+		"-netdev", "user,id=net,ipv6=off,restrict=on,hostfwd=tcp:127.0.0.1:" + strconv.Itoa(port) + "-10.0.2.15:8080",
+		"-device", "virtio-net-pci,netdev=net", "-object", "rng-builtin,id=rng", "-device", "virtio-rng-pci,rng=rng", "-rtc", "base=utc,clock=host",
+	}
+}
+
+func runTool(ctx context.Context, host platform, executable string, args []string, directory, name string) (output []byte, resultErr error) {
+	process, err := host.Start(executable, args, directory)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		forced, err := process.Finish()
+		if err != nil {
+			err = fmt.Errorf("%w: %v", errOwnedCleanup, err)
+		}
+		if forced {
+			err = errors.Join(err, errors.New("owned job required forced termination"))
+		}
+		resultErr = errors.Join(resultErr, err)
+	}()
+	stdout, err := privateOutput(filepath.Join(directory, name+"-stdout.log"))
+	if err != nil {
+		return nil, err
+	}
+	defer stdout.Close()
+	stderr, err := privateOutput(filepath.Join(directory, name+"-stderr.log"))
+	if err != nil {
+		return nil, err
+	}
+	defer stderr.Close()
+	var buffer bytes.Buffer
+	streams := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(&cappedWriter{writer: io.MultiWriter(stdout, &buffer), remaining: streamLimit}, process.Output())
+		streams <- err
+	}()
+	go func() {
+		_, err := io.Copy(&cappedWriter{writer: stderr, remaining: streamLimit}, process.Errors())
+		streams <- err
+	}()
+	done := process.Done()
+	completed, drained := false, 0
+	for !completed || drained != 2 {
+		select {
+		case <-done:
+			completed, done = true, nil
+			if err := process.Result(); err != nil {
+				return nil, err
+			}
+		case err := <-streams:
+			drained++
+			if err != nil {
+				return nil, err
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return bytes.Clone(buffer.Bytes()), nil
+}
+
+func qemuPreflight(ctx context.Context, host platform, executable, bios, directory string, log *events) error {
+	queries := []struct {
+		name           string
+		args, required []string
+	}{
+		{"qemu-version", []string{"--version"}, []string{"QEMU emulator version 11.1.0"}},
+		{"qemu-machines", []string{"-L", bios, "-machine", "help"}, []string{"pc-q35-11.1"}},
+		{"qemu-devices", []string{"-L", bios, "-device", "help"}, []string{"virtio-blk-pci", "virtio-net-pci", "virtio-rng-pci"}},
+		{"qemu-objects", []string{"-L", bios, "-object", "help"}, []string{"rng-builtin"}},
+		{"qemu-netdevs", []string{"-L", bios, "-netdev", "help"}, []string{"user"}},
+		{"qemu-accels", []string{"-L", bios, "-accel", "help"}, []string{"tcg"}},
+	}
+	for _, query := range queries {
+		probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		data, err := runTool(probeCtx, host, executable, query.args, directory, query.name)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("%s: %w", query.name, err)
+		}
+		for _, required := range query.required {
+			if !strings.Contains(string(data), required) {
+				return fmt.Errorf("%s lacks %q", query.name, required)
+			}
+		}
+		if err := log.record("preflight", query.name, map[string]any{"verified": query.required}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateProbe(data []byte, id identity, phase string, sequence uint64) (response, error) {
+	if len(data) > controlLimit {
+		return response{}, errors.New("probe receipt exceeds 1 KiB")
+	}
+	var value response
+	if err := decodeOne(data, &value); err != nil {
+		return response{}, fmt.Errorf("probe receipt: %w", err)
+	}
+	if value.identity != id || value.Phase != phase || value.Sequence != sequence || value.Status != "ok" || value.AuthorityEpoch == "" || value.ObjectID == "" {
+		return response{}, errors.New("probe did not confirm the expected run, phase, epoch, and object")
+	}
+	return value, nil
+}
+
+func runProbe(ctx context.Context, host platform, guest *guestChannel, executable, directory, endpoint, volume, phase string, sequence uint64) (response, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	args := []string{"--endpoint", endpoint, "--volume", volume, "--run-id", guest.RunID, "--source-sha", guest.SourceSHA,
+		"--fixture-nonce", guest.Nonce, "--phase", phase, "--state-file", filepath.Join(directory, "probe-state.json"), "--sequence", strconv.FormatUint(sequence, 10)}
+	type result struct {
+		data []byte
+		err  error
+	}
+	finished := make(chan result, 1)
+	go func() {
+		data, err := runTool(probeCtx, host, executable, args, directory, phase)
+		finished <- result{data, err}
+	}()
+	var value result
+	select {
+	case value = <-finished:
+	case err := <-guest.fault:
+		cancel()
+		value = <-finished
+		return response{}, errors.Join(err, value.err)
+	case <-guest.child.Done():
+		cancel()
+		value = <-finished
+		return response{}, errors.Join(errors.New("QEMU exited during probe"), guest.child.Result(), value.err)
+	case <-probeCtx.Done():
+		cancel()
+		value = <-finished
+		return response{}, errors.Join(probeCtx.Err(), value.err)
+	}
+	if value.err != nil {
+		return response{}, value.err
+	}
+	return validateProbe(value.data, guest.identity, phase, sequence)
+}
+
+func copyDisk(source, destination string, expected artifact) error {
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	output, err := privateOutput(destination)
+	if err != nil {
+		return err
+	}
+	hash := sha256.New()
+	n, copyErr := io.Copy(io.MultiWriter(output, hash), input)
+	closeErr := errors.Join(output.Sync(), output.Close())
+	if copyErr != nil || closeErr != nil {
+		return errors.Join(copyErr, closeErr)
+	}
+	if n != expected.Size || hex.EncodeToString(hash.Sum(nil)) != expected.SHA256 {
+		return errors.New("private disk copy differs from pristine artifact")
+	}
+	return nil
+}
+
+func lifecycle(ctx context.Context, host platform, m manifest, id identity, executable, bios, artifactDir, evidenceDir, workDir string, log *events) (resultErr error) {
+	if err := qemuPreflight(ctx, host, executable, bios, evidenceDir, log); err != nil {
+		return err
+	}
+	disk := filepath.Join(workDir, "volume.ext4")
+	if err := copyDisk(filepath.Join(artifactDir, filepath.FromSlash(m.Artifacts["data"].Path)), disk, m.Artifacts["data"]); err != nil {
+		return err
+	}
+	if err := log.record("prepare", "private-disk", map[string]any{"path": disk, "size": m.DiskBytes, "pristine_sha256": m.Artifacts["data"].SHA256}); err != nil {
+		return err
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		return err
+	}
+	artifactPath := func(name string) string {
+		return filepath.Join(artifactDir, filepath.FromSlash(m.Artifacts[name].Path))
+	}
+	args := qemuArguments(m, id, artifactPath("kernel"), artifactPath("initramfs"), disk, bios, port)
+	process, err := host.Start(executable, args, workDir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		forced, err := process.Finish()
+		if err != nil {
+			err = fmt.Errorf("%w: %v", errOwnedCleanup, err)
+		}
+		if forced {
+			err = errors.Join(err, errors.New("QEMU required forced termination; graceful shutdown unconfirmed"))
+		}
+		resultErr = errors.Join(resultErr, err, log.record("hygiene", "owned-job", map[string]any{"pid": process.PID(), "forced": forced, "error": errorText(err)}))
+	}()
+	if err := log.record("boot", "qemu-started", map[string]any{"pid": process.PID(), "port": port, "accel": "tcg", "machine": m.QEMU.Machine}); err != nil {
+		return err
+	}
+	guest, err := newGuestChannel(process, id, evidenceDir)
+	if err != nil {
+		return err
+	}
+	bootCtx, cancelBoot := context.WithTimeout(ctx, 120*time.Second)
+	_, err = guest.receive(bootCtx, 0, "boot-ready", "boot")
+	cancelBoot()
+	if err != nil {
+		return fmt.Errorf("guest boot: %w", err)
+	}
+	command := func(sequence uint64, op string) error {
+		callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		value, err := guest.command(callCtx, sequence, op)
+		if err != nil {
+			return fmt.Errorf("guest %s: %w", op, err)
+		}
+		return log.record(op, "guest-acknowledgement", value)
+	}
+	if err := command(1, "start"); err != nil {
+		return err
+	}
+	endpoint := "http://127.0.0.1:" + strconv.Itoa(port)
+	created, err := runProbe(ctx, host, guest, artifactPath("probe_windows_arm64"), evidenceDir, endpoint, m.Volume, "readiness-create", 1)
+	if err != nil {
+		return fmt.Errorf("readiness-create: %w", err)
+	}
+	if err := log.record("readiness-create", "probe", created); err != nil {
+		return err
+	}
+	if err := command(2, "stop-authority"); err != nil {
+		return err
+	}
+	if err := command(3, "start"); err != nil {
+		return err
+	}
+	reopened, err := runProbe(ctx, host, guest, artifactPath("probe_windows_arm64"), evidenceDir, endpoint, m.Volume, "readiness-reopen", 2)
+	if err != nil {
+		return fmt.Errorf("readiness-reopen: %w", err)
+	}
+	if reopened.ObjectID != created.ObjectID || reopened.AuthorityEpoch == created.AuthorityEpoch {
+		return errors.New("reopen did not preserve object identity across a new authority epoch")
+	}
+	if err := log.record("readiness-reopen", "probe", reopened); err != nil {
+		return err
+	}
+	shutdownCtx, cancelShutdown := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelShutdown()
+	acknowledged, err := guest.command(shutdownCtx, 4, "shutdown")
+	if err != nil {
+		return fmt.Errorf("guest shutdown: %w", err)
+	}
+	if err := log.record("shutdown", "guest-acknowledgement", acknowledged); err != nil {
+		return err
+	}
+	select {
+	case <-process.Done():
+		if err := process.Result(); err != nil {
+			return err
+		}
+	case err := <-guest.fault:
+		return err
+	case <-shutdownCtx.Done():
+		return fmt.Errorf("QEMU poweroff: %w", shutdownCtx.Err())
+	}
+	for range 2 {
+		select {
+		case err := <-guest.streams:
+			if err != nil {
+				return err
+			}
+		case <-shutdownCtx.Done():
+			return fmt.Errorf("guest output drain: %w", shutdownCtx.Err())
+		}
+	}
+	select {
+	case err := <-guest.fault:
+		return err
+	default:
+	}
+	select {
+	case value := <-guest.responses:
+		return fmt.Errorf("unexpected final guest response: %s", value.Op)
+	default:
+	}
+	return log.record("shutdown", "confirmed", map[string]any{"authority_exit": 0, "qemu_exit": 0, "ext4_unmounted": true})
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func run(ctx context.Context, o options) (resultErr error) {
+	if o.RequireNative {
+		return errors.New("current adapter native acceptance is unavailable; fixture readiness cannot satisfy it")
+	}
+	if !hex40.MatchString(o.SourceSHA) || !hex40.MatchString(o.SourceTreeSHA) || !runIDPattern.MatchString(o.RunID) {
+		return errors.New("invalid checkout SHA, tree SHA, or run ID")
+	}
+	for _, path := range []string{o.Repo, o.ArtifactDir, o.PackageDir} {
+		if !filepath.IsAbs(path) {
+			return errors.New("repository, artifact, and package paths must be absolute")
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+			return fmt.Errorf("directory is a reparse point or not a directory: %s", path)
+		}
+	}
+	var m manifest
+	if err := readJSON(filepath.Join(o.ArtifactDir, "manifest.json"), &m); err != nil {
+		return err
+	}
+	if err := validateManifest(m, o); err != nil {
+		return err
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	actual, _, err := fileHash(self)
+	if err != nil {
+		return err
+	}
+	if actual != m.Artifacts["controller_windows_arm64"].SHA256 {
+		return errors.New("running controller differs from source-bound artifact")
+	}
+	var pkg packageManifest
+	if err := readJSON(filepath.Join(o.PackageDir, "package-manifest.json"), &pkg); err != nil {
+		return err
+	}
+	if pkg.Format != 1 || pkg.ArchiveSHA512 != qemuSHA512 || pkg.SevenZipVersion == "" {
+		return errors.New("QEMU package provenance mismatch")
+	}
+	if err := verifyFiles(o.PackageDir, pkg.Files); err != nil {
+		return err
+	}
+	if err := filepath.WalkDir(o.PackageDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == o.PackageDir {
+			return nil
+		}
+		if entry.Type()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+			return fmt.Errorf("QEMU package contains reparse path: %s", path)
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		relative, err := filepath.Rel(o.PackageDir, path)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		if relative != "package-manifest.json" {
+			if _, ok := pkg.Files[relative]; !ok {
+				return fmt.Errorf("unmanifested QEMU file: %s", relative)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	executable, err := safePath(o.PackageDir, pkg.Executable)
+	if err != nil {
+		return err
+	}
+	bios, err := safePath(o.PackageDir, pkg.DataDir)
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{"bios-256k.bin", "kvmvapic.bin", "linuxboot_dma.bin"} {
+		path, err := safePath(bios, name)
+		if err != nil {
+			return fmt.Errorf("QEMU boot data: %w", err)
+		}
+		if _, _, err = fileHash(path); err != nil {
+			return err
+		}
+	}
+	if err := requireMachine(executable, pe.IMAGE_FILE_MACHINE_AMD64); err != nil {
+		return err
+	}
+	for _, name := range []string{"probe_windows_arm64", "controller_windows_arm64"} {
+		if err := requireMachine(filepath.Join(o.ArtifactDir, filepath.FromSlash(m.Artifacts[name].Path)), pe.IMAGE_FILE_MACHINE_ARM64); err != nil {
+			return err
+		}
+	}
+
+	host, err := newPlatform()
+	if err != nil {
+		return err
+	}
+	facts, err := host.Preflight()
+	if err != nil {
+		return err
+	}
+	nonceBytes := make([]byte, 32)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return err
+	}
+	id := identity{o.RunID, m.SourceSHA, hex.EncodeToString(nonceBytes)}
+	root := filepath.Join(o.Repo, ".tmp", "native-current-authority-fixture", "windows-runs")
+	if err := makeOwnedDirectories(o.Repo, ".tmp/native-current-authority-fixture/windows-runs"); err != nil {
+		return err
+	}
+	if _, err := safePath(o.Repo, ".tmp/native-current-authority-fixture/windows-runs"); err != nil {
+		return err
+	}
+	directory := filepath.Join(root, o.RunID)
+	if err := createPrivateDirectory(directory); err != nil {
+		return fmt.Errorf("private run directory must be new: %w", err)
+	}
+	evidenceDir, workDir := filepath.Join(directory, "evidence"), filepath.Join(directory, "work")
+	if err := createPrivateDirectory(evidenceDir); err != nil {
+		return err
+	}
+	if err := createPrivateDirectory(workDir); err != nil {
+		return err
+	}
+	eventFile, err := privateOutput(filepath.Join(evidenceDir, "events.jsonl"))
+	if err != nil {
+		return err
+	}
+	defer eventFile.Close()
+	log := &events{identity: id, output: &cappedWriter{writer: eventFile, remaining: streamLimit}}
+	defer func() {
+		var removeErr error
+		if errors.Is(resultErr, errOwnedCleanup) {
+			removeErr = errors.New("private disk retained because owned process termination is unconfirmed")
+		} else {
+			removeErr = os.RemoveAll(workDir)
+		}
+		resultErr = errors.Join(resultErr, removeErr)
+		pristineHash, pristineSize, pristineErr := fileHash(filepath.Join(o.ArtifactDir, filepath.FromSlash(m.Artifacts["data"].Path)))
+		if pristineErr == nil && (pristineHash != m.Artifacts["data"].SHA256 || pristineSize != m.DiskBytes) {
+			pristineErr = errors.New("pristine artifact changed during run")
+		}
+		resultErr = errors.Join(resultErr, pristineErr)
+		status := "failed"
+		if resultErr == nil {
+			status = "passed"
+		}
+		receipt := map[string]any{"run_id": id.RunID, "source_sha": id.SourceSHA, "fixture_nonce": id.Nonce, "fixture_readiness": status, "native_acceptance": "not-run", "cause": errorText(resultErr), "private_disk_removed": removeErr == nil, "pristine_unchanged": pristineErr == nil}
+		resultErr = errors.Join(resultErr, log.record("result", "fixture-readiness", receipt))
+		data, err := json.MarshalIndent(receipt, "", "  ")
+		if err == nil {
+			err = os.WriteFile(filepath.Join(evidenceDir, "receipt.json"), append(data, '\n'), 0600)
+		}
+		resultErr = errors.Join(resultErr, err, eventFile.Sync())
+	}()
+	if err := log.record("preflight", "host", facts); err != nil {
+		return err
+	}
+	if err := log.record("provenance", "verified", map[string]any{"source_tree_sha": m.SourceTreeSHA, "artifacts": m.Artifacts, "qemu": pkg, "image_version": os.Getenv("ImageVersion")}); err != nil {
+		return err
+	}
+	return lifecycle(ctx, host, m, id, executable, bios, o.ArtifactDir, evidenceDir, workDir, log)
+}
+
+func requireMachine(path string, expected uint16) error {
+	file, err := pe.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if file.Machine != expected {
+		return fmt.Errorf("PE machine mismatch for %s: got 0x%x, want 0x%x", path, file.Machine, expected)
+	}
+	return nil
+}
+
+func extractArchive(ctx context.Context, archive, extractor, directory string) error {
+	for _, path := range []string{archive, extractor, directory} {
+		if !filepath.IsAbs(path) {
+			return errors.New("extraction paths must be absolute")
+		}
+	}
+	file, err := os.Open(archive)
+	if err != nil {
+		return err
+	}
+	hash := sha512.New()
+	_, hashErr := io.Copy(hash, file)
+	if err := errors.Join(hashErr, file.Close()); err != nil {
+		return err
+	}
+	if hex.EncodeToString(hash.Sum(nil)) != qemuSHA512 {
+		return errors.New("QEMU extraction archive SHA512 mismatch")
+	}
+	host, err := newPlatform()
+	if err != nil {
+		return err
+	}
+	if _, err := host.Preflight(); err != nil {
+		return err
+	}
+	if err := validatePrivateDirectory(directory); err != nil {
+		return err
+	}
+	output := filepath.Join(directory, "extracted")
+	if err := createPrivateDirectory(output); err != nil {
+		return err
+	}
+	extractCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+	_, err = runTool(extractCtx, host, extractor, []string{"x", "-y", "-bd", "-o" + output, archive}, directory, "seven-zip")
+	return err
+}
+
+func main() {
+	var o options
+	var archive, extractor, extractDir, prepareDir string
+	flag.StringVar(&prepareDir, "prepare-directory", "", "atomically create a private bootstrap directory")
+	flag.StringVar(&archive, "extract-archive", "", "verified pinned NSIS archive to extract only")
+	flag.StringVar(&extractor, "extractor", "", "installed 7-Zip executable")
+	flag.StringVar(&extractDir, "extract-dir", "", "owned bootstrap directory")
+	flag.StringVar(&o.Repo, "repo-root", "", "absolute clean checkout path")
+	flag.StringVar(&o.ArtifactDir, "artifact-dir", "", "absolute source-bound Linux artifact directory")
+	flag.StringVar(&o.PackageDir, "package-dir", "", "absolute verified QEMU extraction directory")
+	flag.StringVar(&o.SourceSHA, "source-sha", "", "expected clean checkout commit")
+	flag.StringVar(&o.SourceTreeSHA, "source-tree-sha", "", "expected clean checkout tree")
+	flag.StringVar(&o.RunID, "run-id", "", "unique run directory name")
+	flag.BoolVar(&o.RequireNative, "require-native-acceptance", false, "fail unless current adapter native acceptance is available")
+	flag.Parse()
+	if flag.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "unexpected positional arguments")
+		os.Exit(2)
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+	if prepareDir != "" {
+		relative, err := filepath.Rel(o.Repo, prepareDir)
+		if err != nil || !filepath.IsAbs(o.Repo) || !filepath.IsAbs(prepareDir) || !strings.HasPrefix(filepath.ToSlash(relative), ".tmp/native-current-authority-fixture/bootstrap-") || strings.Contains(filepath.Base(prepareDir), ":") {
+			fmt.Fprintln(os.Stderr, "bootstrap directory must be under the task repository .tmp")
+			os.Exit(2)
+		}
+		if err := createPrivateDirectory(prepareDir); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if archive != "" {
+		if err := extractArchive(ctx, archive, extractor, extractDir); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println("Pinned QEMU archive extracted; no fixture was started.")
+		return
+	}
+	if extractor != "" || extractDir != "" {
+		fmt.Fprintln(os.Stderr, "extraction requires an archive")
+		os.Exit(2)
+	}
+	if err := run(ctx, o); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	fmt.Println("Fixture readiness passed; native acceptance was not run.")
+}

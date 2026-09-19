@@ -1,0 +1,583 @@
+//go:build linux
+
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+func validIdentity() identity {
+	return identity{Config: fixtureConfig{SourceSHA: strings.Repeat("a", 40), BootToken: strings.Repeat("b", 64)},
+		Nonce: strings.Repeat("c", 64), RunID: "run-123", Volume: "volume-123"}
+}
+
+func bootEnvironment(id identity) []string {
+	return []string{bootKeys[0] + "=" + id.Config.BootToken, bootKeys[1] + "=" + id.Nonce,
+		bootKeys[2] + "=" + id.RunID, bootKeys[3] + "=" + id.Volume}
+}
+
+func fakeOps(t *testing.T, calls *[]string) systemOps {
+	t.Helper()
+	id := validIdentity()
+	data, err := json.Marshal(id.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := func(name string) error { *calls = append(*calls, name); return nil }
+	return systemOps{
+		PID: func() int { return 1 }, UID: func() int { return 0 }, EUID: func() int { return 0 },
+		RootFS:     func() (int64, error) { return unix.RAMFS_MAGIC, nil },
+		ReadConfig: func() ([]byte, error) { return data, nil }, Environment: func() []string { return bootEnvironment(id) },
+		CommandLine: func() ([]byte, error) {
+			return []byte("console=ttyS0 rdinit=/init " + strings.Join(bootEnvironment(id), " ")), nil
+		},
+		Mount:   func(source, target, kind string, flags uintptr, data string) error { return record("mount:" + target) },
+		Console: func() error { return record("console") },
+		Module:  func(path string) error { return record("module:" + path) },
+		Network: func() error { return record("network") }, Volume: func() error { return record("volume") },
+		Sync: func() error { return record("sync") }, Unmount: func() error { return record("unmount") },
+		PowerOff: func() error { return record("poweroff") },
+		After:    func(time.Duration) <-chan time.Time { return make(chan time.Time) },
+	}
+}
+
+func TestInitRejectsBeforeAnyMutation(t *testing.T) {
+	brokenConfig := func(data string) func(*systemOps) {
+		return func(ops *systemOps) { ops.ReadConfig = func() ([]byte, error) { return []byte(data), nil } }
+	}
+	envChange := func(change func([]string) []string) func(*systemOps) {
+		return func(ops *systemOps) {
+			ops.Environment = func() []string { return change(bootEnvironment(validIdentity())) }
+		}
+	}
+	for _, test := range []struct {
+		name   string
+		change func(*systemOps)
+	}{
+		{"ordinary-root-process", func(o *systemOps) { o.PID = func() int { return 200 } }},
+		{"real-uid", func(o *systemOps) { o.UID = func() int { return 1000 } }},
+		{"effective-uid", func(o *systemOps) { o.EUID = func() int { return 1000 } }},
+		{"host-root-ext4", func(o *systemOps) { o.RootFS = func() (int64, error) { return unix.EXT4_SUPER_MAGIC, nil } }},
+		{"container-overlay", func(o *systemOps) { o.RootFS = func() (int64, error) { return unix.OVERLAYFS_SUPER_MAGIC, nil } }},
+		{"statfs-error", func(o *systemOps) { o.RootFS = func() (int64, error) { return 0, unix.EIO } }},
+		{"config-open-error", func(o *systemOps) { o.ReadConfig = func() ([]byte, error) { return nil, unix.ELOOP } }},
+		{"config-array", brokenConfig("[]")},
+		{"config-missing-field", brokenConfig(`{"source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)},
+		{"config-invalid-token", brokenConfig(`{"source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","boot_token":"bad"}`)},
+		{"config-invalid-source", brokenConfig(`{"source_sha":"bad","boot_token":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`)},
+		{"config-duplicate", brokenConfig(`{"source_sha":"a","source_sha":"b","boot_token":"x"}`)},
+		{"config-null", brokenConfig(`{"source_sha":null,"boot_token":"x"}`)},
+		{"env-missing", envChange(func(env []string) []string { return env[:3] })},
+		{"env-duplicate", envChange(func(env []string) []string { return append(env, env[0]) })},
+		{"env-token", envChange(func(env []string) []string { env[0] = bootKeys[0] + "=" + strings.Repeat("d", 64); return env })},
+		{"env-nonce", envChange(func(env []string) []string { env[1] = bootKeys[1] + "=bad"; return env })},
+		{"env-run-path", envChange(func(env []string) []string { env[2] = bootKeys[2] + "=../other"; return env })},
+		{"env-volume-empty", envChange(func(env []string) []string { env[3] = bootKeys[3] + "="; return env })},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var mutations []string
+			ops := fakeOps(t, &mutations)
+			test.change(&ops)
+			id, err := authorize(ops)
+			if err == nil {
+				err = boot(ops, id)
+			}
+			if err == nil || len(mutations) != 0 {
+				t.Fatalf("err=%v mutations=%v", err, mutations)
+			}
+		})
+	}
+}
+
+func TestConfigMetadataPreventsUnsafeReads(t *testing.T) {
+	valid := unix.Stat_t{Mode: unix.S_IFREG | 0400, Uid: 0, Gid: 0, Nlink: 1, Size: 200}
+	if err := validateConfigFile(valid); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		change func(*unix.Stat_t)
+	}{
+		{"symlink", func(s *unix.Stat_t) { s.Mode = unix.S_IFLNK | 0400 }},
+		{"directory", func(s *unix.Stat_t) { s.Mode = unix.S_IFDIR | 0400 }},
+		{"writeable", func(s *unix.Stat_t) { s.Mode = unix.S_IFREG | 0600 }},
+		{"readable-by-others", func(s *unix.Stat_t) { s.Mode = unix.S_IFREG | 0444 }},
+		{"owner", func(s *unix.Stat_t) { s.Uid = 1000 }},
+		{"group", func(s *unix.Stat_t) { s.Gid = 1000 }},
+		{"multiple-links", func(s *unix.Stat_t) { s.Nlink = 2 }},
+		{"oversized", func(s *unix.Stat_t) { s.Size = 4097 }},
+		{"negative-size", func(s *unix.Stat_t) { s.Size = -1 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stat := valid
+			test.change(&stat)
+			var mutations []string
+			ops := fakeOps(t, &mutations)
+			ops.ReadConfig = func() ([]byte, error) { return nil, validateConfigFile(stat) }
+			if _, err := authorize(ops); err == nil || len(mutations) != 0 {
+				t.Fatalf("err=%v mutations=%v", err, mutations)
+			}
+		})
+	}
+	path := t.TempDir() + "/config"
+	if err := os.Symlink("missing-target", path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readFixtureConfig(path); !errors.Is(err, unix.ELOOP) {
+		t.Fatalf("symlink err=%v", err)
+	}
+}
+
+func TestBootOrderAndCommandLineGuard(t *testing.T) {
+	var calls []string
+	ops := fakeOps(t, &calls)
+	id, err := authorize(ops)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := boot(ops, id); err != nil {
+		t.Fatal(err)
+	}
+	expected := []string{"mount:/proc", "mount:/dev", "mount:/sys", "console", "module:/modules/failover.ko",
+		"module:/modules/net_failover.ko", "module:/modules/virtio_net.ko", "module:/modules/virtio_blk.ko",
+		"module:/modules/virtio-rng.ko", "network", "mount:/data", "volume"}
+	if !reflect.DeepEqual(calls, expected) {
+		t.Fatalf("calls=%v", calls)
+	}
+	for _, test := range []struct {
+		name, line string
+		err        error
+	}{
+		{"missing", "console=ttyS0", nil},
+		{"duplicate", strings.Join(append(bootEnvironment(id), bootEnvironment(id)[0]), " "), nil},
+		{"mismatch", strings.ReplaceAll(strings.Join(bootEnvironment(id), " "), "run-123", "other-run"), nil},
+		{"read-error", "", unix.EIO},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var mutations []string
+			ops := fakeOps(t, &mutations)
+			ops.CommandLine = func() ([]byte, error) { return []byte(test.line), test.err }
+			if err := boot(ops, id); err == nil || !reflect.DeepEqual(mutations, []string{"mount:/proc"}) {
+				t.Fatalf("err=%v mutations=%v", err, mutations)
+			}
+		})
+	}
+	for _, failed := range moduleNames {
+		t.Run("module-"+failed, func(t *testing.T) {
+			var mutations []string
+			ops := fakeOps(t, &mutations)
+			ops.Module = func(path string) error {
+				mutations = append(mutations, path)
+				if path == "/modules/"+failed+".ko" {
+					return unix.ENOEXEC
+				}
+				return nil
+			}
+			if err := boot(ops, id); !errors.Is(err, unix.ENOEXEC) {
+				t.Fatalf("err=%v", err)
+			}
+			for _, call := range mutations {
+				if call == "network" || call == "mount:/data" || call == "volume" {
+					t.Fatalf("mutation after failed module: %v", mutations)
+				}
+			}
+		})
+	}
+}
+
+func controlLine(id identity, sequence uint64, command string) string {
+	return fmt.Sprintf("{\"nonce\":%q,\"sequence\":%d,\"command\":%q}\n", id.Nonce, sequence, command)
+}
+
+func newSupervisor(t *testing.T, calls *[]string, responses *[]response) *supervisor {
+	t.Helper()
+	s := &supervisor{ops: fakeOps(t, calls), id: validIdentity(), mounted: true, phase: "boot"}
+	s.emit = func(r response) error { *responses = append(*responses, r); return nil }
+	s.ops.Start = func(args []string) (*child, error) {
+		*calls = append(*calls, "start:"+strings.Join(args, " "))
+		done := make(chan childExit, 1)
+		return &child{Done: done, Signal: func() error { *calls = append(*calls, "sigterm"); done <- childExit{}; return nil }}, nil
+	}
+	return s
+}
+
+func TestExplicitRestartPreservesDiskAndInitializesOnce(t *testing.T) {
+	var calls []string
+	var responses []response
+	s := newSupervisor(t, &calls, &responses)
+	input := controlLine(s.id, 1, "start") + controlLine(s.id, 2, "stop-authority") + controlLine(s.id, 3, "start") + controlLine(s.id, 4, "shutdown")
+	err := s.run(io.NopCloser(strings.NewReader(input)))
+	if err == nil || !strings.Contains(err.Error(), "power off returned") {
+		t.Fatalf("err=%v", err)
+	}
+	expected := []string{"start:-listen 10.0.2.15:8080 -local-store /data/volume -volume volume-123 -quota 64M -initialize-lock-state", "sigterm",
+		"start:-listen 10.0.2.15:8080 -local-store /data/volume -volume volume-123 -quota 64M", "sigterm", "sync", "unmount", "poweroff"}
+	if !reflect.DeepEqual(calls, expected) || len(responses) != 4 {
+		t.Fatalf("calls=%v responses=%+v", calls, responses)
+	}
+	for i, r := range responses {
+		if r.Sequence != uint64(i+1) || r.Op != r.Phase || r.Status != "ok" || r.RunID != s.id.RunID || r.SourceSHA != s.id.Config.SourceSHA || r.Nonce != s.id.Nonce {
+			t.Fatalf("response=%+v", r)
+		}
+		if (r.Op == "stop-authority" || r.Op == "shutdown") && (r.ExitCode == nil || *r.ExitCode != 0) {
+			t.Fatalf("unconfirmed child exit: %+v", r)
+		}
+	}
+}
+
+func TestControlRejectsMalformedReplayAndWrongState(t *testing.T) {
+	id := validIdentity()
+	for _, test := range []struct {
+		name, input string
+		starts      int
+	}{
+		{"wrong-nonce", strings.Replace(controlLine(id, 1, "start"), id.Nonce, strings.Repeat("d", 64), 1), 0},
+		{"sequence-gap", controlLine(id, 2, "start"), 0},
+		{"sequence-zero", controlLine(id, 0, "start"), 0},
+		{"replay", controlLine(id, 1, "start") + controlLine(id, 1, "stop-authority"), 1},
+		{"unknown-command", controlLine(id, 1, "restart"), 0},
+		{"stop-idle", controlLine(id, 1, "stop-authority"), 0},
+		{"start-running", controlLine(id, 1, "start") + controlLine(id, 2, "start"), 1},
+		{"duplicate-field", `{"nonce":"x","nonce":"y","sequence":1,"command":"start"}` + "\n", 0},
+		{"unknown-field", `{"nonce":"x","sequence":1,"command":"start","initialize":true}` + "\n", 0},
+		{"incorrect-key-case", `{"NONCE":"x","sequence":1,"command":"start"}` + "\n", 0},
+		{"missing-field", `{"nonce":"x","command":"start"}` + "\n", 0},
+		{"null-field", `{"nonce":"x","sequence":null,"command":"start"}` + "\n", 0},
+		{"two-objects", `{} {}` + "\n", 0},
+		{"truncated", strings.TrimSuffix(controlLine(id, 1, "start"), "\n"), 0},
+		{"oversized", strings.Repeat(" ", controlLimit) + "\n", 0},
+		{"eof", "", 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls []string
+			var responses []response
+			s := newSupervisor(t, &calls, &responses)
+			if err := s.run(io.NopCloser(strings.NewReader(test.input))); err == nil {
+				t.Fatal("invalid command passed")
+			}
+			if len(calls) != test.starts || len(responses) != test.starts {
+				t.Fatalf("calls=%v responses=%+v", calls, responses)
+			}
+		})
+	}
+}
+
+func TestControlReaderWaitsForAcknowledgementAndBoundsEachLine(t *testing.T) {
+	id := validIdentity()
+	line := controlLine(id, 1, "start")
+	padded := strings.TrimSuffix(line, "\n") + strings.Repeat(" ", controlLimit-len(line)) + "\n"
+	done := make(chan struct{})
+	defer close(done)
+	requests := readRequests(strings.NewReader(padded+controlLine(id, 2, "shutdown")), done)
+	first := <-requests
+	if first.Err != nil || first.Request.Sequence != 1 {
+		t.Fatalf("first=%+v", first)
+	}
+	select {
+	case second := <-requests:
+		t.Fatalf("accepted command before acknowledgement: %+v", second)
+	default:
+	}
+	close(first.Advance)
+	second := <-requests
+	if second.Err != nil || second.Request.Sequence != 2 {
+		t.Fatalf("second=%+v", second)
+	}
+	over := readRequests(strings.NewReader(" "+padded), done)
+	if message := <-over; message.Err == nil {
+		t.Fatal("1025-byte command passed")
+	}
+}
+
+func TestStopRequiresActualSuccessfulExit(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		result    *childExit
+		signalErr error
+	}{
+		{"timeout", nil, nil},
+		{"nonzero-exit", &childExit{Code: 2, Err: errors.New("storage close failed")}, nil},
+		{"wait-error", &childExit{Code: 0, Err: errors.New("stdout copy failed")}, nil},
+		{"signal-error", nil, unix.EPERM},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls []string
+			var responses []response
+			s := newSupervisor(t, &calls, &responses)
+			s.ops.Start = func([]string) (*child, error) {
+				calls = append(calls, "start")
+				done := make(chan childExit, 1)
+				return &child{Done: done, Signal: func() error {
+					calls = append(calls, "sigterm")
+					if test.result != nil {
+						done <- *test.result
+					}
+					return test.signalErr
+				}}, nil
+			}
+			s.ops.After = func(time.Duration) <-chan time.Time {
+				timer := make(chan time.Time, 1)
+				if test.result == nil {
+					timer <- time.Time{}
+				}
+				return timer
+			}
+			input := controlLine(s.id, 1, "start") + controlLine(s.id, 2, "shutdown")
+			if err := s.run(io.NopCloser(strings.NewReader(input))); err == nil {
+				t.Fatal("unconfirmed shutdown passed")
+			}
+			if !reflect.DeepEqual(calls, []string{"start", "sigterm"}) || len(responses) != 1 || responses[0].Op != "start" {
+				t.Fatalf("calls=%v responses=%+v", calls, responses)
+			}
+			_ = s.cleanupFailure()
+			if test.result == nil && (!reflect.DeepEqual(calls, []string{"start", "sigterm"}) || s.child == nil) {
+				t.Fatalf("cleanup lost live child or mutated disk: calls=%v child=%v", calls, s.child)
+			}
+			if len(responses) != 1 {
+				t.Fatalf("cleanup acknowledged failure: %+v", responses)
+			}
+		})
+	}
+}
+
+func TestUnexpectedExitNeverRestartsAuthority(t *testing.T) {
+	var calls []string
+	var responses []response
+	s := newSupervisor(t, &calls, &responses)
+	s.ops.Start = func(args []string) (*child, error) {
+		calls = append(calls, "start")
+		done := make(chan childExit, 1)
+		done <- childExit{Code: 0}
+		return &child{Done: done, Signal: func() error { t.Fatal("signaled reaped child"); return nil }}, nil
+	}
+	input := controlLine(s.id, 1, "start") + controlLine(s.id, 2, "start")
+	if err := s.run(io.NopCloser(strings.NewReader(input))); err == nil || !strings.Contains(err.Error(), "unexpectedly") {
+		t.Fatalf("err=%v", err)
+	}
+	if !reflect.DeepEqual(calls, []string{"start"}) || s.child != nil || s.lastExit == nil || *s.lastExit != 0 {
+		t.Fatalf("calls=%v child=%v exit=%v", calls, s.child, s.lastExit)
+	}
+}
+
+func TestStartFailureDoesNotRetryEnrollment(t *testing.T) {
+	var calls []string
+	var responses []response
+	s := newSupervisor(t, &calls, &responses)
+	s.ops.Start = func([]string) (*child, error) { calls = append(calls, "start"); return nil, unix.ENOEXEC }
+	input := controlLine(s.id, 1, "start") + controlLine(s.id, 2, "start")
+	if err := s.run(io.NopCloser(strings.NewReader(input))); !errors.Is(err, unix.ENOEXEC) {
+		t.Fatalf("err=%v", err)
+	}
+	if !s.everStarted || len(calls) != 1 || len(responses) != 0 {
+		t.Fatalf("initialized=%v calls=%v responses=%v", s.everStarted, calls, responses)
+	}
+}
+
+func TestDiskErrorsPreventShutdownAcknowledgement(t *testing.T) {
+	for _, failure := range []string{"sync", "unmount"} {
+		t.Run(failure, func(t *testing.T) {
+			var calls []string
+			var responses []response
+			s := newSupervisor(t, &calls, &responses)
+			fail := func() error { calls = append(calls, failure); return unix.EIO }
+			if failure == "sync" {
+				s.ops.Sync = fail
+			} else {
+				s.ops.Unmount = fail
+			}
+			if err := s.run(io.NopCloser(strings.NewReader(controlLine(s.id, 1, "shutdown")))); !errors.Is(err, unix.EIO) {
+				t.Fatalf("err=%v", err)
+			}
+			if len(responses) != 0 || !s.mounted || calls[len(calls)-1] != failure {
+				t.Fatalf("calls=%v responses=%+v mounted=%v", calls, responses, s.mounted)
+			}
+		})
+	}
+}
+
+func TestControlAndAuthorityOutputCannotImpersonateEachOther(t *testing.T) {
+	var output bytes.Buffer
+	out := &consoleOutput{writer: &output, errors: make(chan error, 1)}
+	log := &authorityOutput{out: out, name: "stderr"}
+	spoof := []byte("untrusted\n" + responsePrefix + `{"status":"ok"}` + "\n")
+	if n, err := log.Write(spoof); n != len(spoof) || err != nil {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	lines := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
+	if len(lines) != 1 || !strings.HasPrefix(lines[0], "RFS-AUTHORITY/stderr ") {
+		t.Fatalf("log injected response line: %q", output.String())
+	}
+	output.Reset()
+	log.bytes = logLimit - 1
+	if _, err := log.Write([]byte("over limit")); err == nil {
+		t.Fatal("oversized log passed")
+	}
+	select {
+	case err := <-out.errors:
+		if !strings.Contains(err.Error(), "[truncated]") {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatal("log limit did not fail the supervisor")
+	}
+	if output.Len() != 0 {
+		t.Fatal("partial log frame emitted")
+	}
+	if _, err := log.Write([]byte("again")); err == nil {
+		t.Fatal("failed log resumed")
+	}
+	if err := out.emit(response{Status: "ok", Cause: strings.Repeat("x", controlLimit)}); err == nil {
+		t.Fatal("oversized response passed")
+	}
+}
+
+func TestLogFailureCannotProduceSuccessfulShutdown(t *testing.T) {
+	var calls []string
+	var responses []response
+	s := newSupervisor(t, &calls, &responses)
+	failures := make(chan error, 1)
+	s.logErrors = failures
+	s.ops.Unmount = func() error { calls = append(calls, "unmount"); failures <- errors.New("log truncated"); return nil }
+	if err := s.run(io.NopCloser(strings.NewReader(controlLine(s.id, 1, "shutdown")))); err == nil {
+		t.Fatal("log failure passed")
+	}
+	if len(responses) != 0 || !reflect.DeepEqual(calls, []string{"sync", "unmount"}) {
+		t.Fatalf("calls=%v responses=%v", calls, responses)
+	}
+}
+
+func TestVolumeRejectsNonExt4AndReadOnlyWithoutWriting(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		kind, flags int64
+	}{
+		{"tmpfs", unix.TMPFS_MAGIC, 0},
+		{"readonly-ext4", unix.EXT4_SUPER_MAGIC, unix.ST_RDONLY},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := t.TempDir()
+			fs := realVolumeOps()
+			fs.StatFS = func(_ string, stat *unix.Statfs_t) error { stat.Type, stat.Flags = test.kind, test.flags; return nil }
+			err := prepareVolume(path, fs)
+			if err == nil {
+				t.Fatal("invalid volume passed")
+			}
+			entries, readErr := os.ReadDir(path)
+			if readErr != nil || len(entries) != 0 {
+				t.Fatalf("entries=%v err=%v", entries, readErr)
+			}
+		})
+	}
+}
+
+func fakeVolume(mutations *[]string) volumeOps {
+	return volumeOps{
+		StatFS: func(_ string, stat *unix.Statfs_t) error { stat.Type = unix.EXT4_SUPER_MAGIC; return nil },
+		Lstat: func(path string, stat *unix.Stat_t) error {
+			*stat = unix.Stat_t{Mode: unix.S_IFDIR | 0755}
+			if path == "/data/volume" {
+				*stat = unix.Stat_t{Mode: unix.S_IFDIR | 0700, Uid: 1000, Gid: 1000}
+			}
+			return nil
+		},
+		ReadNames: func(path string) ([]string, error) {
+			if path == "/data" {
+				return []string{"lost+found"}, nil
+			}
+			return nil, nil
+		},
+		Mkdir: func(path string, mode os.FileMode) error {
+			*mutations = append(*mutations, fmt.Sprintf("mkdir:%s:%04o", path, mode))
+			return nil
+		},
+		Chown: func(path string, uid, gid int) error {
+			*mutations = append(*mutations, fmt.Sprintf("chown:%s:%d:%d", path, uid, gid))
+			return nil
+		},
+	}
+}
+
+func TestVolumeRequiresPristinePrivateDisk(t *testing.T) {
+	var mutations []string
+	if err := prepareVolume("/data", fakeVolume(&mutations)); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(mutations, []string{"mkdir:/data/volume:0700", "chown:/data/volume:1000:1000"}) {
+		t.Fatal(mutations)
+	}
+	for _, test := range []struct {
+		name   string
+		change func(*volumeOps)
+	}{
+		{"existing-volume", func(fs *volumeOps) { fs.ReadNames = func(string) ([]string, error) { return []string{"volume"}, nil } }},
+		{"other-state", func(fs *volumeOps) {
+			fs.ReadNames = func(string) ([]string, error) { return []string{"state.db"}, nil }
+		}},
+		{"read-directory-error", func(fs *volumeOps) { fs.ReadNames = func(string) ([]string, error) { return nil, unix.EIO } }},
+		{"recovered-files", func(fs *volumeOps) {
+			fs.ReadNames = func(string) ([]string, error) { return []string{"lost+found"}, nil }
+		}},
+		{"nonroot-owner", func(fs *volumeOps) {
+			fs.Lstat = func(_ string, stat *unix.Stat_t) error {
+				*stat = unix.Stat_t{Mode: unix.S_IFDIR | 0755, Uid: 1000}
+				return nil
+			}
+		}},
+		{"writeable-parent", func(fs *volumeOps) {
+			fs.Lstat = func(_ string, stat *unix.Stat_t) error { *stat = unix.Stat_t{Mode: unix.S_IFDIR | 0777}; return nil }
+		}},
+		{"symlink-parent", func(fs *volumeOps) {
+			fs.Lstat = func(_ string, stat *unix.Stat_t) error { *stat = unix.Stat_t{Mode: unix.S_IFLNK | 0700}; return nil }
+		}},
+		{"stat-error", func(fs *volumeOps) { fs.Lstat = func(string, *unix.Stat_t) error { return unix.EIO } }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var changes []string
+			fs := fakeVolume(&changes)
+			test.change(&fs)
+			if err := prepareVolume("/data", fs); err == nil || len(changes) != 0 {
+				t.Fatalf("err=%v mutations=%v", err, changes)
+			}
+		})
+	}
+}
+
+func TestVolumeCreationErrorsStayVisible(t *testing.T) {
+	for _, stage := range []string{"mkdir", "chown", "verify"} {
+		t.Run(stage, func(t *testing.T) {
+			var changes []string
+			fs := fakeVolume(&changes)
+			switch stage {
+			case "mkdir":
+				fs.Mkdir = func(string, os.FileMode) error { return unix.EEXIST }
+			case "chown":
+				fs.Chown = func(string, int, int) error { return unix.EPERM }
+			case "verify":
+				original := fs.Lstat
+				fs.Lstat = func(path string, stat *unix.Stat_t) error {
+					if err := original(path, stat); err != nil {
+						return err
+					}
+					if path == "/data/volume" {
+						stat.Mode |= 0077
+					}
+					return nil
+				}
+			}
+			if err := prepareVolume("/data", fs); err == nil {
+				t.Fatal("failed volume creation passed")
+			}
+		})
+	}
+}

@@ -1,0 +1,835 @@
+//go:build linux
+
+// This executable is PID 1 inside the fixture initramfs. It must never mount or
+// modify a host filesystem, including when invoked by root.
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+const (
+	responsePrefix = "RFS-FIXTURE/1 "
+	controlLimit   = 1024
+	logLimit       = 16 << 20
+	childStopGrace = 20 * time.Second
+)
+
+var bootKeys = []string{"RFS_FIXTURE_BOOT_TOKEN", "RFS_FIXTURE_NONCE", "RFS_FIXTURE_RUN_ID", "RFS_FIXTURE_VOLUME"}
+var moduleNames = []string{"failover", "net_failover", "virtio_net", "virtio_blk", "virtio-rng"}
+
+type fixtureConfig struct {
+	SourceSHA string `json:"source_sha"`
+	BootToken string `json:"boot_token"`
+}
+
+type identity struct {
+	Config fixtureConfig
+	Nonce  string
+	RunID  string
+	Volume string
+}
+
+type request struct {
+	Nonce    string `json:"nonce"`
+	Sequence uint64 `json:"sequence"`
+	Command  string `json:"command"`
+}
+
+type response struct {
+	RunID     string `json:"run_id"`
+	SourceSHA string `json:"source_sha"`
+	Nonce     string `json:"fixture_nonce"`
+	Phase     string `json:"phase"`
+	Sequence  uint64 `json:"sequence"`
+	Op        string `json:"op"`
+	Status    string `json:"status"`
+	Category  string `json:"category,omitempty"`
+	Cause     string `json:"cause,omitempty"`
+	ExitCode  *int   `json:"exit_code,omitempty"`
+}
+
+type childExit struct {
+	Code int
+	Err  error
+}
+
+type child struct {
+	Done     <-chan childExit
+	Signal   func() error
+	TermSent bool
+}
+
+// Every privileged operation is injected so safety tests can observe the exact
+// first mutation without invoking mount, network ioctl, module load, or reboot.
+type systemOps struct {
+	PID         func() int
+	UID         func() int
+	EUID        func() int
+	RootFS      func() (int64, error)
+	ReadConfig  func() ([]byte, error)
+	Environment func() []string
+	CommandLine func() ([]byte, error)
+	Mount       func(string, string, string, uintptr, string) error
+	Console     func() error
+	Module      func(string) error
+	Network     func() error
+	Volume      func() error
+	Start       func([]string) (*child, error)
+	Sync        func() error
+	Unmount     func() error
+	PowerOff    func() error
+	After       func(time.Duration) <-chan time.Time
+}
+
+func lowerHex(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	for _, c := range value {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func safeID(value string) bool {
+	if len(value) == 0 || len(value) > 96 {
+		return false
+	}
+	for _, c := range value {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func strictObject(data []byte, target any) error {
+	var fields []string
+	switch target.(type) {
+	case *fixtureConfig:
+		fields = []string{"source_sha", "boot_token"}
+	case *request:
+		fields = []string{"nonce", "sequence", "command"}
+	default:
+		return errors.New("unsupported control object")
+	}
+	d := json.NewDecoder(bytes.NewReader(data))
+	first, err := d.Token()
+	if err != nil || first != json.Delim('{') {
+		return errors.New("expected one JSON object")
+	}
+	seen := make(map[string]bool)
+	for d.More() {
+		key, err := d.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := key.(string)
+		if !ok || seen[name] {
+			return errors.New("duplicate or invalid JSON key")
+		}
+		known := false
+		for _, field := range fields {
+			known = known || name == field
+		}
+		if !known {
+			return errors.New("unknown JSON field")
+		}
+		seen[name] = true
+		var value json.RawMessage
+		if err := d.Decode(&value); err != nil {
+			return err
+		}
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return errors.New("null JSON values are forbidden")
+		}
+	}
+	if _, err := d.Token(); err != nil {
+		return err
+	}
+	if _, err := d.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("trailing JSON data")
+	}
+	if len(seen) != len(fields) {
+		return errors.New("missing JSON field")
+	}
+	d = json.NewDecoder(bytes.NewReader(data))
+	d.DisallowUnknownFields()
+	return d.Decode(target)
+}
+
+func bootValues(entries []string) (map[string]string, error) {
+	values := make(map[string]string, len(bootKeys))
+	for _, item := range entries {
+		key, value, ok := strings.Cut(item, "=")
+		for _, expected := range bootKeys {
+			if key == expected {
+				if _, exists := values[key]; !ok || exists {
+					return nil, errors.New("missing or duplicate fixture boot value")
+				}
+				values[key] = value
+			}
+		}
+	}
+	if len(values) != len(bootKeys) {
+		return nil, errors.New("fixture boot values are incomplete")
+	}
+	return values, nil
+}
+
+func authorize(ops systemOps) (identity, error) {
+	var id identity
+	if ops.PID() != 1 || ops.UID() != 0 || ops.EUID() != 0 {
+		return id, errors.New("fixture init requires PID 1 and real/effective UID 0")
+	}
+	kind, err := ops.RootFS()
+	if err != nil {
+		return id, fmt.Errorf("inspect initramfs: %w", err)
+	}
+	if kind != unix.RAMFS_MAGIC && kind != unix.TMPFS_MAGIC {
+		return id, errors.New("fixture init requires a ramfs or tmpfs root")
+	}
+	data, err := ops.ReadConfig()
+	if err != nil {
+		return id, fmt.Errorf("read fixture config: %w", err)
+	}
+	if err := strictObject(data, &id.Config); err != nil {
+		return id, fmt.Errorf("decode fixture config: %w", err)
+	}
+	if !lowerHex(id.Config.SourceSHA, 40) || !lowerHex(id.Config.BootToken, 64) {
+		return id, errors.New("fixture config requires exact source SHA and boot token")
+	}
+	// Linux passes unknown NAME=value boot arguments to init's environment before
+	// proc exists; names containing a dot do not have this behavior.
+	// https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/init/main.c#L540-L577
+	values, err := bootValues(ops.Environment())
+	if err != nil {
+		return id, err
+	}
+	if values[bootKeys[0]] != id.Config.BootToken || !lowerHex(values[bootKeys[1]], 64) || !safeID(values[bootKeys[2]]) || !safeID(values[bootKeys[3]]) {
+		return id, errors.New("fixture boot identity does not match the initramfs")
+	}
+	id.Nonce, id.RunID, id.Volume = values[bootKeys[1]], values[bootKeys[2]], values[bootKeys[3]]
+	return id, nil
+}
+
+func boot(ops systemOps, id identity) error {
+	if err := ops.Mount("proc", "/proc", "proc", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, ""); err != nil {
+		return fmt.Errorf("mount proc: %w", err)
+	}
+	line, err := ops.CommandLine()
+	if err != nil {
+		return fmt.Errorf("read kernel command line: %w", err)
+	}
+	values, err := bootValues(strings.Fields(string(line)))
+	if err != nil {
+		return err
+	}
+	expected := []string{id.Config.BootToken, id.Nonce, id.RunID, id.Volume}
+	for i, key := range bootKeys {
+		if values[key] != expected[i] {
+			return errors.New("kernel command line differs from fixture boot identity")
+		}
+	}
+	if err := ops.Mount("devtmpfs", "/dev", "devtmpfs", unix.MS_NOSUID, "mode=0755"); err != nil {
+		return fmt.Errorf("mount devtmpfs: %w", err)
+	}
+	if err := ops.Mount("sysfs", "/sys", "sysfs", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, ""); err != nil {
+		return fmt.Errorf("mount sysfs: %w", err)
+	}
+	if err := ops.Console(); err != nil {
+		return fmt.Errorf("configure serial console: %w", err)
+	}
+	for _, module := range moduleNames {
+		if err := ops.Module("/modules/" + module + ".ko"); err != nil {
+			return fmt.Errorf("load module %s: %w", module, err)
+		}
+	}
+	if err := ops.Network(); err != nil {
+		return fmt.Errorf("configure guest network: %w", err)
+	}
+	if err := ops.Mount("/dev/vda", "/data", "ext4", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "errors=remount-ro"); err != nil {
+		return fmt.Errorf("mount authority disk: %w", err)
+	}
+	if err := ops.Volume(); err != nil {
+		return fmt.Errorf("prepare authority volume: %w", err)
+	}
+	return nil
+}
+
+type incoming struct {
+	Request request
+	Err     error
+	Advance chan struct{}
+}
+
+func readRequests(input io.Reader, done <-chan struct{}) <-chan incoming {
+	result := make(chan incoming)
+	go func() {
+		reader := bufio.NewReaderSize(input, controlLimit)
+		for {
+			line, err := reader.ReadSlice('\n')
+			var req request
+			if err == nil && len(line) <= controlLimit {
+				err = strictObject(line, &req)
+			} else if errors.Is(err, bufio.ErrBufferFull) || len(line) > controlLimit {
+				err = errors.New("control message exceeds 1024 bytes")
+			} else if errors.Is(err, io.EOF) {
+				err = errors.New("control channel closed before shutdown")
+			}
+			advance := make(chan struct{})
+			select {
+			case result <- incoming{Request: req, Err: err, Advance: advance}:
+			case <-done:
+				return
+			}
+			if err != nil {
+				return
+			}
+			select {
+			case <-advance:
+			case <-done:
+				return
+			}
+		}
+	}()
+	return result
+}
+
+type supervisor struct {
+	ops         systemOps
+	id          identity
+	emit        func(response) error
+	logErrors   <-chan error
+	child       *child
+	everStarted bool
+	sequence    uint64
+	phase       string
+	lastExit    *int
+	mounted     bool
+}
+
+func (s *supervisor) response(op, status string, err error) error {
+	r := response{RunID: s.id.RunID, SourceSHA: s.id.Config.SourceSHA, Nonce: s.id.Nonce, Phase: s.phase,
+		Sequence: s.sequence, Op: op, Status: status, ExitCode: s.lastExit}
+	if err != nil {
+		r.Category = "guest-lifecycle"
+		r.Cause = err.Error()
+		if len(r.Cause) > 256 {
+			r.Cause = r.Cause[:256] + " [truncated]"
+		}
+	}
+	return s.emit(r)
+}
+
+func (s *supervisor) childExited(result childExit) error {
+	s.child = nil
+	s.lastExit = &result.Code
+	if result.Err != nil {
+		return fmt.Errorf("authority exit %d: %w", result.Code, result.Err)
+	}
+	if result.Code != 0 {
+		return fmt.Errorf("authority exit %d", result.Code)
+	}
+	return nil
+}
+
+func (s *supervisor) stop() error {
+	select {
+	case result := <-s.child.Done:
+		return errors.Join(errors.New("authority exited before stop"), s.childExited(result))
+	default:
+	}
+	if !s.child.TermSent {
+		s.child.TermSent = true
+		if err := s.child.Signal(); err != nil {
+			return fmt.Errorf("signal authority: %w", err)
+		}
+	}
+	select {
+	case result := <-s.child.Done:
+		return s.childExited(result)
+	case <-s.ops.After(childStopGrace):
+		return errors.New("authority did not exit within 20 seconds after SIGTERM")
+	}
+}
+
+func (s *supervisor) finishDisk() error {
+	if !s.mounted {
+		return nil
+	}
+	if err := s.ops.Sync(); err != nil {
+		return fmt.Errorf("sync authority disk: %w", err)
+	}
+	if err := s.ops.Unmount(); err != nil {
+		return fmt.Errorf("unmount authority disk: %w", err)
+	}
+	s.mounted = false
+	return nil
+}
+
+func authorityArgs(volume string, initialize bool) []string {
+	args := []string{"-listen", "10.0.2.15:8080", "-local-store", "/data/volume", "-volume", volume, "-quota", "64M"}
+	if initialize {
+		args = append(args, "-initialize-lock-state")
+	}
+	return args
+}
+
+func (s *supervisor) run(input io.ReadCloser) error {
+	done := make(chan struct{})
+	defer close(done)
+	defer input.Close()
+	requests := readRequests(input, done)
+	for {
+		var exits <-chan childExit
+		if s.child != nil {
+			exits = s.child.Done
+		}
+		select {
+		case err := <-s.logErrors:
+			return err
+		case result := <-exits:
+			return errors.Join(errors.New("authority exited unexpectedly"), s.childExited(result))
+		case message := <-requests:
+			if message.Err != nil {
+				return message.Err
+			}
+			select {
+			case result := <-exits:
+				return errors.Join(errors.New("authority exited unexpectedly"), s.childExited(result))
+			default:
+			}
+			req := message.Request
+			if req.Nonce != s.id.Nonce || s.sequence == ^uint64(0) || req.Sequence != s.sequence+1 {
+				return errors.New("control nonce or sequence mismatch")
+			}
+			s.sequence, s.phase = req.Sequence, req.Command
+			switch req.Command {
+			case "start":
+				if s.child != nil {
+					return errors.New("authority is already running")
+				}
+				args := authorityArgs(s.id.Volume, !s.everStarted)
+				s.everStarted = true
+				var err error
+				s.child, err = s.ops.Start(args)
+				if err != nil {
+					return fmt.Errorf("start authority: %w", err)
+				}
+				s.lastExit = nil
+			case "stop-authority":
+				if s.child == nil {
+					return errors.New("authority is not running")
+				}
+				if err := s.stop(); err != nil {
+					return err
+				}
+			case "shutdown":
+				if s.child != nil {
+					if err := s.stop(); err != nil {
+						return err
+					}
+				}
+				if err := s.finishDisk(); err != nil {
+					return err
+				}
+				if err := s.pendingLogError(); err != nil {
+					return err
+				}
+				if err := s.response(req.Command, "ok", nil); err != nil {
+					return err
+				}
+				if err := s.ops.PowerOff(); err != nil {
+					return fmt.Errorf("power off guest: %w", err)
+				}
+				return errors.New("power off returned without stopping the guest")
+			default:
+				return errors.New("unknown control command")
+			}
+			if err := s.pendingLogError(); err != nil {
+				return err
+			}
+			if err := s.response(req.Command, "ok", nil); err != nil {
+				return err
+			}
+			close(message.Advance)
+		}
+	}
+}
+
+func (s *supervisor) pendingLogError() error {
+	select {
+	case err := <-s.logErrors:
+		return err
+	default:
+		return nil
+	}
+}
+
+// Failure cleanup cannot produce a successful shutdown acknowledgement. In
+// particular, an unconfirmed child exit never permits an ext4 unmount.
+func (s *supervisor) failure(err error) {
+	if emitErr := s.response("failure", "error", err); emitErr != nil {
+		fmt.Fprintf(os.Stderr, "fixture failure response: %v\n", emitErr)
+	}
+	if cleanupErr := s.cleanupFailure(); cleanupErr != nil {
+		fmt.Fprintf(os.Stderr, "fixture failure cleanup: %v\n", cleanupErr)
+	}
+	if powerErr := s.ops.PowerOff(); powerErr != nil {
+		fmt.Fprintf(os.Stderr, "fixture poweroff: %v\n", powerErr)
+	}
+	// PID 1 must not return, including if reboot fails. The owning controller
+	// enforces its deadline and terminates its own QEMU job on this path.
+	select {}
+}
+
+func (s *supervisor) cleanupFailure() (returned error) {
+	if s.child != nil {
+		returned = s.stop()
+	}
+	if s.child == nil {
+		returned = errors.Join(returned, s.finishDisk())
+	}
+	return returned
+}
+
+type consoleOutput struct {
+	mu     sync.Mutex
+	writer io.Writer
+	errors chan error
+}
+
+func (out *consoleOutput) write(data []byte) error {
+	out.mu.Lock()
+	defer out.mu.Unlock()
+	n, err := out.writer.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	return err
+}
+
+func (out *consoleOutput) emit(r response) error {
+	data, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	frame := []byte(responsePrefix + string(data) + "\n")
+	if len(frame) > controlLimit {
+		return errors.New("fixture response exceeds 1024 bytes")
+	}
+	return out.write(frame)
+}
+
+type authorityOutput struct {
+	out    *consoleOutput
+	name   string
+	bytes  int
+	failed bool
+}
+
+func (log *authorityOutput) Write(data []byte) (int, error) {
+	if log.failed {
+		return 0, errors.New("authority log stream already failed")
+	}
+	frame := []byte("RFS-AUTHORITY/" + log.name + " " + base64.StdEncoding.EncodeToString(data) + "\n")
+	var err error
+	if log.bytes+len(frame) > logLimit {
+		err = errors.New("authority " + log.name + " exceeds 16 MiB [truncated]")
+	} else {
+		err = log.out.write(frame)
+	}
+	if err != nil {
+		log.failed = true
+		select {
+		case log.out.errors <- err:
+		default:
+		}
+		return 0, err
+	}
+	log.bytes += len(frame)
+	return len(data), nil
+}
+
+func readFixtureConfig(path string) (data []byte, returned error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	defer func() { returned = errors.Join(returned, file.Close()) }()
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return nil, err
+	}
+	if err := validateConfigFile(stat); err != nil {
+		return nil, err
+	}
+	return io.ReadAll(io.LimitReader(file, 4097))
+}
+
+func validateConfigFile(stat unix.Stat_t) error {
+	if stat.Mode != unix.S_IFREG|0400 || stat.Uid != 0 || stat.Gid != 0 || stat.Nlink != 1 || stat.Size > 4096 || stat.Size < 0 {
+		return errors.New("fixture config must be a root-owned 0400 regular file with one link and at most 4096 bytes")
+	}
+	return nil
+}
+
+func configureConsole() error {
+	fd := int(os.Stdin.Fd())
+	termios, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+	if err != nil {
+		return err
+	}
+	termios.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP | unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON
+	termios.Oflag &^= unix.OPOST
+	termios.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.ISIG | unix.IEXTEN
+	termios.Cflag &^= unix.CSIZE | unix.PARENB
+	termios.Cflag |= unix.CS8 | unix.CLOCAL | unix.CREAD
+	termios.Cc[unix.VMIN], termios.Cc[unix.VTIME] = 1, 0
+	return unix.IoctlSetTermios(fd, unix.TCSETS, termios)
+}
+
+func loadModule(path string) (returned error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { returned = errors.Join(returned, unix.Close(fd)) }()
+	return unix.FinitModule(fd, "", 0)
+}
+
+func configureNetwork() (returned error) {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { returned = errors.Join(returned, unix.Close(fd)) }()
+	for _, network := range []struct {
+		name          string
+		address, mask []byte
+	}{
+		{"lo", []byte{127, 0, 0, 1}, []byte{255, 0, 0, 0}},
+		{"eth0", []byte{10, 0, 2, 15}, []byte{255, 255, 255, 0}},
+	} {
+		req, err := unix.NewIfreq(network.name)
+		if err != nil {
+			return err
+		}
+		if err := req.SetInet4Addr(network.address); err != nil {
+			return err
+		}
+		if err := unix.IoctlIfreq(fd, unix.SIOCSIFADDR, req); err != nil {
+			return fmt.Errorf("set %s address: %w", network.name, err)
+		}
+		if err := req.SetInet4Addr(network.mask); err != nil {
+			return err
+		}
+		if err := unix.IoctlIfreq(fd, unix.SIOCSIFNETMASK, req); err != nil {
+			return fmt.Errorf("set %s mask: %w", network.name, err)
+		}
+		if err := unix.IoctlIfreq(fd, unix.SIOCGIFFLAGS, req); err != nil {
+			return err
+		}
+		req.SetUint16(req.Uint16() | unix.IFF_UP)
+		if err := unix.IoctlIfreq(fd, unix.SIOCSIFFLAGS, req); err != nil {
+			return fmt.Errorf("bring up %s: %w", network.name, err)
+		}
+	}
+	return nil
+}
+
+type volumeOps struct {
+	StatFS    func(string, *unix.Statfs_t) error
+	Lstat     func(string, *unix.Stat_t) error
+	ReadNames func(string) ([]string, error)
+	Mkdir     func(string, os.FileMode) error
+	Chown     func(string, int, int) error
+}
+
+func realVolumeOps() volumeOps {
+	return volumeOps{StatFS: unix.Statfs, Lstat: unix.Lstat, Mkdir: os.Mkdir, Chown: os.Chown,
+		ReadNames: func(path string) ([]string, error) {
+			entries, err := os.ReadDir(path)
+			if err != nil {
+				return nil, err
+			}
+			names := make([]string, len(entries))
+			for i, entry := range entries {
+				names[i] = entry.Name()
+			}
+			return names, nil
+		},
+	}
+}
+
+func verifyPrivateParent(path string, lstat func(string, *unix.Stat_t) error) error {
+	var stat unix.Stat_t
+	if err := lstat(path, &stat); err != nil {
+		return err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0022 != 0 || stat.Uid != 0 || stat.Gid != 0 {
+		return errors.New("authority disk parent must be a root-owned directory without group or other write access")
+	}
+	return nil
+}
+
+func prepareVolume(path string, fs volumeOps) error {
+	var stat unix.Statfs_t
+	if err := fs.StatFS(path, &stat); err != nil {
+		return err
+	}
+	if stat.Type != unix.EXT4_SUPER_MAGIC || stat.Flags&unix.ST_RDONLY != 0 {
+		return errors.New("authority disk must be writable ext4")
+	}
+	if err := verifyPrivateParent(path, fs.Lstat); err != nil {
+		return err
+	}
+	entries, err := fs.ReadNames(path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry != "lost+found" {
+			return errors.New("authority disk is not pristine")
+		}
+		if err := verifyPrivateParent(path+"/lost+found", fs.Lstat); err != nil {
+			return err
+		}
+		contents, err := fs.ReadNames(path + "/lost+found")
+		if err != nil {
+			return err
+		}
+		if len(contents) != 0 {
+			return errors.New("authority disk contains recovered files")
+		}
+	}
+	volume := path + "/volume"
+	if err := fs.Mkdir(volume, 0700); err != nil {
+		return err
+	}
+	if err := fs.Chown(volume, 1000, 1000); err != nil {
+		return err
+	}
+	var volumeStat unix.Stat_t
+	if err := fs.Lstat(volume, &volumeStat); err != nil {
+		return err
+	}
+	if volumeStat.Mode != unix.S_IFDIR|0700 || volumeStat.Uid != 1000 || volumeStat.Gid != 1000 {
+		return errors.New("authority volume must be owned by UID/GID 1000 with mode 0700")
+	}
+	return nil
+}
+
+func realOps(out *consoleOutput) systemOps {
+	stdout := &authorityOutput{out: out, name: "stdout"}
+	stderr := &authorityOutput{out: out, name: "stderr"}
+	return systemOps{
+		PID: os.Getpid, UID: os.Getuid, EUID: os.Geteuid,
+		RootFS: func() (int64, error) {
+			var stat unix.Statfs_t
+			if err := unix.Statfs("/", &stat); err != nil {
+				return 0, err
+			}
+			return int64(stat.Type), nil
+		},
+		ReadConfig:  func() ([]byte, error) { return readFixtureConfig("/fixture-config.json") },
+		Environment: os.Environ,
+		CommandLine: func() ([]byte, error) {
+			file, err := os.Open("/proc/cmdline")
+			if err != nil {
+				return nil, err
+			}
+			data, readErr := io.ReadAll(io.LimitReader(file, 4097))
+			closeErr := file.Close()
+			if len(data) > 4096 {
+				readErr = errors.Join(readErr, errors.New("kernel command line exceeds 4096 bytes"))
+			}
+			return data, errors.Join(readErr, closeErr)
+		},
+		Mount: unix.Mount, Console: configureConsole, Module: loadModule, Network: configureNetwork,
+		Volume: func() error { return prepareVolume("/data", realVolumeOps()) },
+		Start: func(args []string) (*child, error) {
+			cmd := exec.Command("/remote-fs-server", args...)
+			cmd.Dir = "/data/volume"
+			cmd.Env = []string{"TMPDIR=/tmp"}
+			cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 1000, Gid: 1000, Groups: []uint32{}}}
+			cmd.Stdout = stdout
+			cmd.Stderr = stderr
+			cmd.WaitDelay = 2 * time.Second
+			if err := cmd.Start(); err != nil {
+				return nil, err
+			}
+			done := make(chan childExit, 1)
+			go func() {
+				err := cmd.Wait()
+				done <- childExit{Code: cmd.ProcessState.ExitCode(), Err: err}
+			}()
+			return &child{Done: done, Signal: func() error { return cmd.Process.Signal(syscall.SIGTERM) }}, nil
+		},
+		Sync: func() (returned error) {
+			fd, err := unix.Open("/data", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+			if err != nil {
+				return err
+			}
+			defer func() { returned = errors.Join(returned, unix.Close(fd)) }()
+			if err := unix.Syncfs(fd); err != nil {
+				return err
+			}
+			unix.Sync()
+			return nil
+		},
+		Unmount: func() error { return unix.Unmount("/data", 0) },
+		PowerOff: func() error {
+			if err := unix.IoctlSetInt(int(os.Stdout.Fd()), unix.TCSBRK, 1); err != nil {
+				return err
+			}
+			return unix.Reboot(unix.LINUX_REBOOT_CMD_POWER_OFF)
+		},
+		After: time.After,
+	}
+}
+
+func main() {
+	out := &consoleOutput{writer: os.Stdout, errors: make(chan error, 1)}
+	ops := realOps(out)
+	id, err := authorize(ops)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fixture init refused: %v\n", err)
+		os.Exit(1)
+	}
+	s := &supervisor{ops: ops, id: id, emit: out.emit, logErrors: out.errors, phase: "boot"}
+	mount := ops.Mount
+	ops.Mount = func(source, target, kind string, flags uintptr, data string) error {
+		err := mount(source, target, kind, flags, data)
+		if err == nil && target == "/data" {
+			s.mounted = true
+		}
+		return err
+	}
+	if err := boot(ops, id); err != nil {
+		s.failure(err)
+	}
+	if err := s.response("boot-ready", "ok", nil); err != nil {
+		s.failure(err)
+	}
+	s.failure(s.run(os.Stdin))
+}

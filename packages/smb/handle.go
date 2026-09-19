@@ -49,6 +49,7 @@ type openReservation struct {
 	outcome                        storage.OpenOutcome
 	installed, finished, finishing bool
 	ready                          chan struct{}
+	responseDone                   chan struct{}
 	cleanup                        cleanupGate
 	charge                         int64
 }
@@ -65,6 +66,14 @@ func (r *handleRegistry) get(id wire.FileID) *fileHandle {
 	return r.handles[id]
 }
 func (r *handleRegistry) reserve() (*openReservation, error) {
+	return r.reserveResult(false)
+}
+
+func (r *handleRegistry) reserveResponse() (*openReservation, error) {
+	return r.reserveResult(true)
+}
+
+func (r *handleRegistry) reserveResult(response bool) (*openReservation, error) {
 	a := r.tree.authority
 	a.installMu.RLock()
 	defer a.installMu.RUnlock()
@@ -91,6 +100,9 @@ func (r *handleRegistry) reserve() (*openReservation, error) {
 		return nil, syscall.ENOMEM
 	}
 	p := &openReservation{registry: r, generation: r.generation, charge: charge, ready: make(chan struct{})}
+	if response {
+		p.responseDone = make(chan struct{})
+	}
 	r.slots++
 	r.resultBytes += charge
 	r.tree.export.opens++
@@ -143,10 +155,31 @@ func (p *openReservation) install(access, share uint32) (wire.FileID, error) {
 	return id, nil
 }
 
+// The captured metadata remains charged while its caller constructs a response,
+// even if tree retirement starts as soon as the native result is attached.
+func (p *openReservation) releaseResponse() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.responseDone != nil {
+		close(p.responseDone)
+		p.responseDone = nil
+	}
+}
+
 // finish releases only a known-clean failed open or the caller's completed
 // response ownership. A returned cleanup-only reference remains charged on error.
 func (p *openReservation) finish(ctx context.Context) error {
 	return p.cleanup.run(ctx, func() error {
+		p.mu.Lock()
+		responseDone := p.responseDone
+		p.mu.Unlock()
+		if responseDone != nil {
+			select {
+			case <-responseDone:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		select {
 		case <-p.ready:
 		case <-ctx.Done():

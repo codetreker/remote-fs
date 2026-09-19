@@ -56,8 +56,12 @@ func (l Limits) check() error {
 }
 
 type Share struct {
-	Name, Volume string
-	Backend      storage.FileStorage
+	Name string
+	// Volume is the host-selected canonical volume identity. It must stay
+	// stable across share aliases and republishing; authorization and the
+	// assigned SMB volume serial use this key, never the share name.
+	Volume  string
+	Backend storage.FileStorage
 }
 
 // Status reports owned resources, including resources awaiting confirmed cleanup.

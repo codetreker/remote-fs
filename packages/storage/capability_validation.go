@@ -236,7 +236,7 @@ func (o NodeRefOptions) Check() error {
 	if o.Target.State == Absent && !o.Create || o.Exclusive && o.Target.State == SameNode || o.Kind != NodeDirectory && o.Use.Uses&ReadEntries != 0 {
 		return syscall.EINVAL
 	}
-	if o.MetadataAccess&^(ReadMetadata|WriteMetadata) != 0 || o.Exclusive && !o.Create || o.Use.Uses&(ReadData|WriteData) != 0 {
+	if o.MetadataAccess&^(ReadMetadata|WriteMetadata) != 0 || o.Exclusive && !o.Create {
 		return syscall.EINVAL
 	}
 	if o.Kind != NodeSymlink && len(o.InitialState.OnCreate.LinkTarget) != 0 || o.Kind == NodeSymlink && o.Create && len(o.InitialState.OnCreate.LinkTarget) == 0 {

@@ -12,7 +12,7 @@ Linux 和编程入口可以创建 Windows 无法表示或存在大小写歧义�
 
 ## 提案
 
-[SMB 协议与会话端点](../../implemented/architecture/2026-09-16-smb-protocol-primitives.md)已交付报文/签名/认证依赖、本机 listener/export、会话和直接 FileSession 引用管理。新增端点已有 Linux 与 Windows ARM64 的协议/拥有权包级验证，SSPI 也有对应原生实测；CREATE、文件/名字/属性、范围、通知及映射仍待接入，组合后的原生验收未完成。下述剩余工作保持同一目标。
+[SMB 协议与会话端点](../../implemented/architecture/2026-09-16-smb-protocol-primitives.md)已交付报文/签名/认证依赖、本机 listener/export、会话和直接 FileSession 引用管理。原会话端点已有 Linux 与 Windows ARM64 的协议/拥有权包级验证，SSPI 也有对应原生实测。guarded 名字解析、平台 metadata helper 和受限 CREATE 已接入，新增部分目前是本地包级与构建证据；数据、信息/名字修改、范围、通知及映射仍待完成，组合后的原生验收未完成。下述剩余工作保持同一目标。
 
 ### 接入形态与现有依赖
 
@@ -22,10 +22,10 @@ Windows 11 24H2+ 使用系统 SMB 重定向器；独立、可嵌入的 Go 客户
 
 | Windows 操作 | 已有中立能力 | Windows 客户端仍须完成的工作 |
 |---|---|---|
-| CREATE 普通文件 | AtomicFileOpener/OpenAt、捕获 Attr/Outcome、Uses、InitialState、CloseIntent | 六种 disposition、访问/share mask、初始化属性和结果映射 |
-| metadata-only / 目录 CREATE | NodeReferences、ScopedReference、ReferenceStateAccess | 正确的 metadata/目录权限，引用失败后的清理；不能冒充 File 字节访问 |
+| CREATE 普通文件 | OpenAt、捕获结果、Uses、初值与 armed intent 已接入 | 已有 SUPERSEDE 等尚拒绝的分支、完整平台组合与原生验收 |
+| metadata-only / 目录 CREATE | NodeReference、完整用途授权、引用清理已接入 | 系统客户端权限/共享组合验收；不把相容性 claim 变成字节方法 |
 | READ/WRITE/FLUSH | File.ReadAt/WriteAt/Sync 与条件 MutateFile | SMB 分段、部分结果与同步确认；R-CON-5 的跨应用调用单位保持未决 |
-| QUERY/SET_INFO | 共同时间、namespace CAS、ReferenceState | 平台属性/历史时间显示与字节格式，真实 pending/detached 事实 |
+| QUERY/SET_INFO | 共同时间、namespace CAS、ReferenceState；部分已知值编码 helper 已实现 | 命令接线、历史时间政策与完整字节格式，真实 pending/detached 事实 |
 | rename / disposition | MutateName、Set/ClearPendingUnlink | 观察名与输出名、generation、armed 与已 pending 的区别及平台状态码 |
 | LOCK / CANCEL | UseOwners/RangeControl | 序列化的已确认 claim ledger、重复获取与精确解除政策、未知结果 fencing |
 | 目录枚举与 CHANGE_NOTIFY | 权威 ReadDirNode/Bounded、现有日志/复制事实 | 名字表示、筛选和一致观察，缓存透明性及可取消的本机生命周期 |
@@ -43,7 +43,7 @@ Open/create、错误非 nil 的部分引用、Remove/RemoveDir 空成功结果�
 
 已交付的 DirectoryMetadataObserver 复用 DirectoryTarget、DirectoryMetadataOptions{Guards, IncludeName} 与 ListResult，在原 FileSession/原生读取顺序中核对父 Scope/linkedness 和前缀 guards，返回完整子项与 DirectoryObservation。IncludeName 可同时取得父目录自身的 Root/Linked 绑定；名字前缀与子项在载入前按实际大小计费，任何错误使整个结果不可读。接口与预算由[文件能力设计](../../../../docs/design/server/file-handles.md#显式-metadata-与名字观察)拥有。
 
-Windows resolver 仍须把这份能力接入名字投影与逐组件选择。HTTP 的只读 discriminator 固定映射既有 OpReplicationSnapshot，披露 snapshot 已授权的 metadata 子集；允许公开枚举不隐含该权限，也不能把被 ReadEntries 拒绝的显式 QUERY_DIRECTORY 改走此入口。客户端不能传任意 Uses 选择绕过行为。Windows 直接使用 portable HTTP，不因此引入 SQLite/replicated 的未完成移植工作。
+Windows resolver 已把这份能力接入 CREATE 的名字投影与逐组件选择：支持字面路径子集，逐目录检查全部名字的表示/歧义，用原始叶名和完整 guards 原子打开。非 Windows 不提供生产名称比较器，后续枚举/名字修改仍须分别接入。HTTP 的只读 discriminator 固定映射既有 OpReplicationSnapshot，披露 snapshot 已授权的 metadata 子集；允许公开枚举不隐含该权限，也不能把被 ReadEntries 拒绝的显式 QUERY_DIRECTORY 改走此入口。客户端不能传任意 Uses 选择绕过行为。Windows 直接使用 portable HTTP，不因此引入 SQLite/replicated 的未完成移植工作。
 
 只有这种成功、完整且 guards 相符的观察才能判定哪个名字组件缺失。普通 Open/Lookup 返回的 ENOENT 可能来自父身份或其它阶段，不是“已证明最终叶名不存在”的凭据；不能用临时打开引用进行无副作用的缺失探测。
 
@@ -59,11 +59,11 @@ handle rename 以观察到的父/叶名、SameNode 和实际引用 Scope 构造�
 
 ### 打开、共享与删除的映射
 
-Windows 依据观察到的 payload 决定允许的访问、破坏性 disposition 或 CloseIntent 时，须把实际依赖的 namespace 版本/缺席条件放入已有 OpenAtOptions/NodeRefOptions.ExpectedMetadata，并绑定 SameNode。只有最终旧目标仍满足条件才能打开；已知无效果条件冲突可在原请求预算内重新观察。缺席目标使用 Absent 和空条件，不能把新节点的缺席 payload 当作对旧对象的确认。平台的只读/hidden/system 等解释仍在客户端，中立核心只比较版本。
+已接入的 CREATE 依据平台 payload 检查 readonly、hidden/system 和 CloseIntent，把依赖的 namespace 版本/缺席条件放入已有 OpenAtOptions/NodeRefOptions.ExpectedMetadata，并绑定 SameNode。只有最终旧目标仍满足条件才能打开；已知无效果条件冲突可在原请求预算内重新观察。缺席目标使用 Absent 和空条件，不能把新节点的缺席 payload 当作对旧对象的确认。平台的只读/hidden/system 等解释仍在客户端，中立核心只比较版本。
 
-OPEN/CREATE/OPEN_IF 分别选择已有、缺席或任一存在性；OVERWRITE/OVERWRITE_IF 使用保留身份的 ResetContent，SUPERSEDE 使用 ReplaceNode 并保留被 pin 的旧对象。创建/清空/替换的共同时间与 Windows payload 进入对应 InitialState，同一次成功返回捕获 Attr/Outcome；不能先 Stat、改内容再补初始属性。
+OPEN/CREATE/OPEN_IF 与具明确 WRITE_DATA 的 OVERWRITE/OVERWRITE_IF 已使用原子打开、ResetContent 和对应 InitialState，捕获结果不由后续 Stat 重建。已有目标的 SUPERSEDE 尚明确拒绝，仍须接入 ReplaceNode 并保留被 pin 的旧对象；完整六种 disposition 的平台验收继续保留。
 
-共享模式映射成中立 Uses/Deny，所有入口继续接受 native 冲突检查。应用的 metadata-only 不虚构字节读取，普通目录枚举必须具有 ReadEntries。内部系统资源不能悄然增加一个会阻止本来合法应用打开的 share claim；也不能为内部监听而忽略应用明确的共享限制。
+CREATE 已把共享模式映射成中立 Uses/Deny，所有入口继续接受 native 冲突检查。应用的 metadata-only 不虚构字节读取，普通目录枚举必须具有 ReadEntries。内部系统资源不能悄然增加一个会阻止本来合法应用打开的 share claim；也不能为内部监听而忽略应用明确的共享限制。
 
 范围命令使用既有 Bytes/Boundary 和独立 ClaimID。Windows 客户端序列化已确认的 ledger，解释自己的同 open 重复获取、共享/独占和精确解除顺序；核心执行显式 DenySelf/DenyOthers。只有成功响应或同动作核对证明的结果进入 ledger，未知时停止依赖该状态的后续选择并清理，不能再申请一次猜测原锁不存在。
 
@@ -77,13 +77,13 @@ FILE_DELETE_ON_CLOSE 对应 armed OnReferenceClose，指定引用结束时触发
 
 原 capability 和 NoLeasing 两种被测策略都已有合格的超过一秒旧路径属性结果；这些结果分别属于固定原型及其精确补丁，不能推断新增端点的文件行为。下一项缓存处理决定仍未确定，一秒要求保持原样，不在此选择新的缓存策略。
 
-生产验证使用实际 package、HTTP/v4 与新 backend，不使用诊断原型代替。需要覆盖文件内容、属性、名字不存在、目录结果、改名/删除及已打开引用，断线时不能让缓存报空或不存在。全局 cache lifetime、安装驱动、放宽系统安全设置和完整 lease-break 协议不因一个失败的探针自动进入范围。
+生产验证使用实际 package、HTTP/v4 与当前 backend，不使用诊断原型代替。[当前 authority 工具](../../implemented/testing/2026-09-19-current-authority-virtual-machine-fixture.md)已提供真实 Linux 持久 backend 与 HTTP 的独立 guest/readiness 路径，本地 Linux VM 普通重启通过；Windows 运行和 SMB/缓存验收仍未取得。需要覆盖文件内容、属性、名字不存在、目录结果、改名/删除及已打开引用，断线时不能让缓存报空或不存在。全局 cache lifetime、安装驱动、放宽系统安全设置和完整 lease-break 协议不因一个失败的探针自动进入范围。
 
 ### 时间与平台属性
 
-共同 BirthTime/ChangeTime 由原生所有创建/修改入口维护，Windows payload 只保存平台专有属性；不能把会被 Linux/SDK 修改的 ChangeTime 只放在 Windows blob。不存在的 DOS 扩展位与畸形的 present payload 分开，后者明确失败，其它平台的 namespace 不被覆盖。
+共同 BirthTime/ChangeTime 由原生所有创建/修改入口维护，Windows payload 只保存平台专有属性；不能把会被 Linux/SDK 修改的 ChangeTime 只放在 Windows blob。已实现的 smb.windows codec 将不存在的 DOS 扩展位与畸形 present payload 分开，后者明确失败，其它平台的 namespace 不被覆盖。CREATE 使用 512 字节稠密虚拟 extent 和由规范 Share.Volume 指定的 serial；它们不是物理 backend 事实。
 
-历史节点的 BirthTime/ChangeTime 可能未知。严格拒绝必需时间查询会影响旧 volume 的网络驱动器可用性；显式兼容投影则须决定显示值、适用条件和“非历史事实”的含义，不能写回 authority 或被当成真实创建时间。该显示选择保持未决；Linux 已选择的 ctime/权限展示不能自动成为 Windows 政策。新建文件成功也不能证明历史数据可用。
+历史节点的 BirthTime/ChangeTime 可能未知。当前编码和 CREATE 对必需未知时间明确拒绝；这会影响旧 volume 的网络驱动器可用性。显式兼容投影则须决定显示值、适用条件和“非历史事实”的含义，不能写回 authority 或被当成真实创建时间。该显示选择保持未决；Linux 已选择的 ctime/权限展示不能自动成为 Windows 政策。新建文件成功也不能证明历史数据可用。
 
 ## 备选方案
 

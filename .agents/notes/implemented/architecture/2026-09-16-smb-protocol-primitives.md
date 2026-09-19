@@ -36,7 +36,17 @@ NodeReference 是 handle 唯一 Close 拥有者，普通 File 只作为同一对
 
 [cleanup attempt](../../../../packages/smb/cleanup_attempt.go)让并发调用共享本轮不可变结果，后来调用才能重试。Shutdown 返回当前清理尝试的错误，历史故障继续留在诊断状态；恢复后的成功不被旧错误永久覆盖，当前未知也不被旧成功覆盖。registry 锁不跨授权、I/O 或等待；Status 和结构化日志只报告计数、阶段、协议请求标识和固定错误分类，不记录 SID、名字、token、key 或 payload。
 
-文件 CREATE、名字/属性解释、范围、通知和映射尚未接入；会话/控制与不带属性的 CLOSE 清理路径之外明确返回不支持。新增代码承担后续命令共用的拥有权和准入，不假装提供已经可用的文件系统。具体 API 与限额由[client 设计](../../../../docs/design/client/architecture.md#smb-协议与会话端点)拥有。
+会话/控制、不带属性的 CLOSE 和下述受限 CREATE 已接入；数据、QUERY/SET_INFO、范围、目录枚举、通知与映射仍明确不支持。具体 API、格式与限额由[client 设计](../../../../docs/design/client/architecture.md#smb-名字与原子-create)拥有，已接入打开不代表可用的 Windows 网络驱动器。
+
+### 名字解释和打开绑定到同一权威条件
+
+[resolver](../../../../packages/smb/namespace.go)使用按父的完整 metadata 观察，将平台表示、大小写选择与最终打开分开：客户端用 Windows CompareStringOrdinal 检查全部子名，authority 只验证原始父/叶名、NodeID、目录 revision、边及 metadata CAS。每层使用已有 snapshot 权限，不借公开目录读取绕过 ReadEntries；成功的完整观察才证明缺失组件位置。保留这些事实到最终 OpenAt/NodeReference，才能避免本地检查正确却打开另一个对象。
+
+[CREATE](../../../../packages/smb/create.go)沿既有 reservation 和唯一 NodeReference 拥有者安装引用，普通 File 仍是别名。OPEN/CREATE/OPEN_IF 和具明确 WRITE_DATA 的普通文件清空分支已接入；已有 SUPERSEDE、symlink 与未接入命令明确拒绝。平台 readonly/hidden/system 条件通过 ExpectedMetadata 约束旧目标，创建/清空初值和 ARCHIVE 与效果一起发布。总共四轮的重新观察只处理已知无效果条件冲突，未知结果或清理失败不制造第二次 mutation。
+
+[平台 metadata](../../../../packages/smb/windows_metadata.go)在单个 `smb.windows` Data 中保存有版本的 DOS 位/hint；authority token 与平台格式版本分开，其它平台 key 保留。共同时间使用真实捕获事实；缺少历史 BirthTime/ChangeTime 拒绝必需响应，不把零值、mtime 或当前时间解释为已知历史。内部 metadata 读取在业务打开授权中如实申报，但不自动成为应用的 FILE_READ_ATTRIBUTES。
+
+[512 字节稠密虚拟 extent 与指定 serial](../../../../packages/smb/file_projection.go)是平台展示政策。allocation 来自同一 EOF，serial 来自 host 的规范 Share.Volume，不能解释成物理占用、配额预留、授权或全局唯一设备身份。QFid 使用原 NodeID 与该 serial，协议 open FileID 保持独立；无法计算的最大访问权限明确返回状态，不填虚构 mask。这些显示规则使 CREATE 结果有完整来源，而不向中立 backend 增加 Windows 数据模型。
 
 ## 备选方案
 
@@ -62,4 +72,6 @@ NodeReference 是 handle 唯一 Close 拥有者，普通 File 只作为同一对
 
 端点这批普通/race 验证各执行 54 个根、87 个 verdict，分别为 0.023/1.052 秒，无 fail/skip；packages/smb 自身覆盖 86.2%，最低函数 50%，vet 与 Windows ARM64/AMD64 构建通过。previous-principal 负向对照在指定授权断言失败。真实 TCP 用例验证会话协议，引用安装用例直接提供 neutral fixture 引用，不能当作 wire CREATE 或真实 backend 文件访问。[原生包级运行 35118013777](https://github.com/codetreker/remote-fs/actions/runs/35118013777/job/104868296920)以 checkout `b8c8a18401bde71f3cab8842585134e4560d3b21`（PR head `47a132d6af0264dbb150a36207de760c7d1891e1`）在 Windows 11 Enterprise build 26200 ARM64、Go 1.26.8 执行四包的 94 个根、156 个通过 verdict，无 fail/skip，包含新增端点的 52 个根和两项真实 SSPI 根。47 个源码文件含新增 18 文件均与该 head 的 Windows CRLF 检出相符；四包自身覆盖合计 2171/2441（88.94%），最低函数 50%。这证明对应源码的原生协议/会话包级行为，不是系统 SMB 重定向器或完整文件适配验收。
 
-本机连接与会话入口已经具备，中立文件命令、名字解释和映射仍待接入，并须对组合后的鉴权与文件行为完成真实平台验收。[中立观察能力](2026-09-16-neutral-file-capabilities.md)的 Windows 接入、历史时间显示和缓存透明性继续由[Windows 提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)承接；本决定接续其协议依赖与会话拥有权，不缩减目标或把诊断原型成功当成交付实现。
+名字/helper 的普通/race 聚焦验证分别通过 10 根/14 verdict 和 11 根/46 verdict；CREATE 聚焦验证为 18 根/54 verdict，SMB 包的该源码普通验证为 104 根/222 verdict、自身覆盖 88.6%、149 个函数均不低于 50%。这些本地与构建证据不延用旧原生收据；新 CREATE 尚未取得系统客户端验收。
+
+本机连接、会话、guarded 名字选择和受限 CREATE 已具备；数据、信息命令、名字修改、范围、通知和映射仍待接入，组合后的鉴权与文件行为继续需要真实平台验收。[中立观察能力](2026-09-16-neutral-file-capabilities.md)的其余 Windows 接入、历史时间显示和缓存透明性继续由[Windows 提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)承接；本决定接续其协议依赖与会话拥有权，不缩减目标或把诊断原型成功当成交付实现。

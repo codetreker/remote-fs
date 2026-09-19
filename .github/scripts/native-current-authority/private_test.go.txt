@@ -1,0 +1,41 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestPrivateFixtureDirectoryAndSealedState(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "private-state")
+	if err := createPrivateDirectory(directory); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivateDirectory(directory); err != nil {
+		t.Fatal(err)
+	}
+	if err := createPrivateDirectory(directory); err == nil {
+		t.Fatal("existing private directory accepted as new")
+	}
+	path := filepath.Join(directory, "state.json")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := makePrivateFile(path); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivateFile(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivateDirectory(path); err == nil {
+		t.Fatal("file accepted as private directory")
+	}
+	if err := validatePrivateFile(directory); err == nil {
+		t.Fatal("directory accepted as private file")
+	}
+}

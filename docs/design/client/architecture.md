@@ -70,11 +70,29 @@ handle 的 NodeReference 是唯一关闭拥有者；普通文件的可选 File �
 
 Shutdown 和 Unpublish 的并发调用共享当前 cleanup attempt 的不可变结果；后续调用才能重试。Shutdown 返回本轮清理结果，历史失败保留在 Status/日志诊断中，不把已经恢复的资源继续报告成本轮错误；未知关闭仍保留原 connection/session/tree/open/export 额度，不因协议句柄已移除而归还。取消等待者不取消或遗弃正在进行的尝试。
 
-默认 server-wide exports/connections/sessions 为 32/16/16；每 session 最多 32 tree，每 tree 和每 export 的 opens 各受 1024 上限约束。每连接 128 request 包含 pending async；compound/context 上限为 32/16，frame 为 2 MiB，I/O 为 1 MiB，token 为 65535 字节，handshake/request/cleanup 为 30/60/30 秒。FileSession 另有自己的限制。分配、捕获结果及 compound 回复在效果前收费，删除 map entry 不返还仍保留的 backing 容量。目录/通知限额保留配置位置，当前不分配相应资源。
+默认 server-wide exports/connections/sessions 为 32/16/16；每 session 最多 32 tree，每 tree 和每 export 的 opens 各受 1024 上限约束。每连接 128 request 包含 pending async；compound/context 上限为 32/16，frame 为 2 MiB，I/O 为 1 MiB，token 为 65535 字节，handshake/request/cleanup 为 30/60/30 秒。FileSession 另有自己的限制。分配、捕获结果及 compound 回复在效果前收费，删除 map entry 不返还仍保留的 backing 容量。目录观察使用现有目录 byte/entry 与 guard 上限；通知配置不表示已经分配监听资源。
 
 credits 核对长度和读写范围，重复/越界拒绝；资源拒绝仍产生签名响应。related compound 保持顺序及继承身份，async 以唯一 AsyncID 核对 CANCEL 和当前 session，pending/terminal 的 credit 归还各一次。LOGOFF/断线分别等待真实借用与响应/签名用户，注册表锁不跨授权、storage I/O 或等待。
 
-当前实现包含会话/控制及不带 postquery 的 CLOSE 清理路径；CREATE、名字解析、文件/属性、范围、通知与映射仍未接入，相关请求在 session/tree 检查后明确拒绝。它不是可用的 Windows 网络驱动器。[测试策略](../../testing.md#smb-本机会话端点)区分真实 TCP、引用安装 fixture、交叉构建和原生运行；新增端点已通过对应源码的 Windows ARM64 包级运行，这仍不等于系统 SMB 重定向器的文件访问验收。剩余接入、历史时间和缓存决策仍由[平台提案](../../../.agents/notes/proposed/architecture/2026-09-16-platform-client-capabilities.md)承接。
+当前实现包含会话/控制、不带 postquery 的 CLOSE，以及下述受限 CREATE。READ/WRITE/FLUSH、QUERY/SET_INFO、范围、目录枚举、通知与映射尚未接入，相关请求在 session/tree 检查后明确拒绝。它不是可用的 Windows 网络驱动器。[测试策略](../../testing.md#smb-本机会话端点)区分真实 TCP、引用安装 fixture、交叉构建和原生运行；此前会话端点源码已有对应的 Windows ARM64 包级运行；它不覆盖新增 CREATE，也不等于系统 SMB 重定向器的文件访问验收。剩余接入、历史时间和缓存决策仍由[平台提案](../../../.agents/notes/proposed/architecture/2026-09-16-platform-client-capabilities.md)承接。
+
+### SMB 名字与原子 CREATE
+
+[名称解析](../../../packages/smb/namespace.go)使用当前 principal 对根 Stat 授权，再逐父按 OpReplicationSnapshot 取得完整有界 metadata 观察。每次观察重验已有前缀 guards，检查所有原始子名的 Windows 表示及大小写冲突后才选择目标；公开 ReadEntries 入口不能作为失败 fallback。解析保存实际 raw leaf、SameNode/Absent、root/目录/边 guards 和捕获 Attr，最终打开原子核对这些事实。只有完整观察证明的最终缺席才可让 OPEN/OVERWRITE 返回 STATUS_NO_SUCH_FILE；中间组件缺失有独立状态，backend ENOENT 保留原因并按 EIO 处理。
+
+支持字面 tree-relative 路径：空值或单个反斜线表示根，可有一个前导反斜线；末尾单个分隔符保留目录要求。重复分隔符、点组件、正斜线和所有 ADS/冒号（包括 ::$DATA）明确拒绝，不作名字修复。叶名最多 255 UTF-16 单元，路径最多 32767，并服从中立 raw-byte/guard 上限；设备名、尾部点/空格和非法字符按平台规则拒绝。Windows 使用带显式 UTF-16 长度的 CompareStringOrdinal(ignoreCase)，非 Windows 的真实名字解析不支持；可移植测试比较器不是生产替代。
+
+[CREATE](../../../packages/smb/create.go)支持普通文件和目录的 OPEN/CREATE/OPEN_IF，普通文件已有目标的 OVERWRITE/OVERWRITE_IF 需要明确 WRITE_DATA 并使用 ResetContent；已有目标的 SUPERSEDE、symlink 打开及未实现选项明确拒绝。缺席目标的允许创建分支通过 OnCreate 初始化；清空通过 OnReset，普通文件创建/清空设置 ARCHIVE。既有 readonly、hidden/system 与删除意图的检查依赖 `smb.windows` 版本/缺席条件，随 SameNode 交给最终原子打开；返回结果直接使用捕获 Attr/Outcome。
+
+DesiredAccess/share mask 映射成既有 Uses/Deny；目录 LIST 对应 ReadEntries，EXECUTE/写意图也保留独立相容性 claim。普通字节引用使用 OpenAt，其余使用 NodeReference；后者内部 ReadMetadata 用于生成协议结果，仍在 OpenAccess.Read 中如实授权，不会给应用增加 FILE_READ_ATTRIBUTES。每个语义操作使用当前业务授权；reset 的属性/metadata、armed CloseIntent 分别取得对应权限。
+
+单次 CREATE 最多四轮解析加最终打开，只有已知无效果的 ErrConditionConflict/EAGAIN 可重新观察。打开返回引用或非零结果后发生错误、结果未知、身份/Outcome 不符或清理失败均不能重提。效果前的 response reservation 和 AttrResultBudget 约束捕获结果，非 nil 引用即归原 cleanup 拥有者；成功安装后仍持有结果直到响应已消费，退役/取消不能释放尚被使用的内容。
+
+[`smb.windows` codec](../../../packages/smb/windows_metadata.go)保存 12 字节 Data：SMW 加格式字节 1、LE uint32 DOS 属性、LE uint32 hints（bit0 为目录 symlink）。authority 的 OpaquePayload.Version 仍是原样 CAS token。缺席不提供 Windows 专有位，present 畸形为 EIO、未知格式为 EOPNOTSUPP；DIRECTORY/REPARSE_POINT 由捕获 NodeKind/hint 派生，无其它位的普通文件显示 NORMAL，初值复制保留其它平台 metadata key。四个共同时间来自同一次 Attr；必需 BirthTime/ChangeTime 未知即拒绝，FILETIME 只接受非负有符号 64 位范围并向下取 100 ns，不填造历史值。
+
+[大小投影](../../../packages/smb/file_projection.go)把普通文件同一捕获 EOF 向上按 512 字节换算为稠密虚拟 extent，目录大小为零；这是平台分配表示，不是物理占用或预留配额。Share.Volume 必须由 host 提供稳定的规范身份；其加固定域前缀的 SHA256 前八字节作为 LE uint64 的展示 serial，share 别名不参与。它不用于授权、不承诺全局无碰撞，也不冒充设备 serial。QFid 返回捕获 NodeID 和该 serial；MxAc 明确返回不支持（匹配 ChangeTime 时 NONE_MAPPED），不制造最大授权 mask。未支持的 AlSi 按协议忽略；CREATE 外层字段/上下文边界继续检查，不授予缓存或 durable/reconnect 能力。
+
+信息编码 helper 已区分 basic/network/tag 所需的 FILE_READ_ATTRIBUTES 与身份/access 等结果，输入不足或不支持的 class 明确失败；它们本身不接入 QUERY_INFO。已交付 helper 和 CREATE 的 Linux/构建证据见[测试策略](../../testing.md#smb-名字metadata-与-create)，后续数据、信息、名字修改命令及系统客户端验收仍须分别完成。
 
 ### 业务身份与授权结果
 

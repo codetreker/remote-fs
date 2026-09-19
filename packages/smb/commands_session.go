@@ -107,6 +107,9 @@ func (c *connection) dispatch(ctx context.Context, r, original wire.Request, h *
 			return nil, statusError(err), signer
 		}
 		return wire.EmptyResponseBody(), statusOK, signer
+	case wire.Create:
+		body, status := c.create(ctx, t, r)
+		return body, status, signer
 	case wire.Close:
 		body, status := c.closeHandle(ctx, t, r)
 		return body, status, signer

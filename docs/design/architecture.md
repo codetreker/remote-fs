@@ -252,7 +252,7 @@ packages/                    可被外部与自身 import
     metastoretest/           metastore 义务的可执行形式
   transport/                 把 storage 契约搬到线上，一种传输一个包
     httprest/                HTTP：URL 与消息的形状、服务端、拨号端
-  smb/                       本机 SMB 端点、认证会话与内部协议/签名组件
+  smb/                       本机 SMB 端点、guarded CREATE、平台名字/metadata 与协议组件
     windows/                 native SSPI 与 SID policy；尚无映射入口
   fuse/                      挂载呈现层：FUSE 与 Linux owner/属性政策
     posix/                   POSIX 权限 payload codec

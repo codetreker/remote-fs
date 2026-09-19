@@ -1,0 +1,306 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func testIdentity() identity {
+	return identity{"run_1", strings.Repeat("a", 40), strings.Repeat("b", 64)}
+}
+
+func TestControlResponsesBindRunAndRejectAmbiguity(t *testing.T) {
+	id := testIdentity()
+	valid := response{identity: id, Phase: "boot", Op: "boot-ready", Status: "ok"}
+	encode := func(value response) []byte {
+		data, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append([]byte(responsePrefix), data...)
+	}
+	if got, err := parseResponse(encode(valid), id); err != nil || got.Op != "boot-ready" {
+		t.Fatalf("valid response: %v %v", got, err)
+	}
+	if got, err := parseResponse([]byte("server: serving; readiness not proven"), id); err != nil || got != nil {
+		t.Fatalf("raw log interpreted as control: %v %v", got, err)
+	}
+	for name, change := range map[string]func(*response){
+		"wrong-run":      func(r *response) { r.RunID = "other" },
+		"wrong-source":   func(r *response) { r.SourceSHA = strings.Repeat("c", 40) },
+		"wrong-nonce":    func(r *response) { r.Nonce = strings.Repeat("c", 64) },
+		"unknown-status": func(r *response) { r.Status = "ready" },
+		"guest-error":    func(r *response) { r.Status = "error"; r.Category = "mount"; r.Cause = "read-only volume" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			value := valid
+			change(&value)
+			if _, err := parseResponse(encode(value), id); err == nil {
+				t.Fatal("accepted invalid response")
+			}
+		})
+	}
+	for _, line := range [][]byte{
+		[]byte(responsePrefix + `{"status":"ok","unexpected":true}`),
+		append(encode(valid), []byte(` {}`)...),
+		[]byte(responsePrefix + strings.Repeat(" ", controlLimit)),
+	} {
+		if _, err := parseResponse(line, id); err == nil {
+			t.Fatal("accepted ambiguous or oversized response")
+		}
+	}
+}
+
+type fakeChild struct {
+	input          io.WriteCloser
+	output, stderr io.ReadCloser
+	done           chan struct{}
+	result         error
+	forced         bool
+	finishes       int
+}
+
+func (p *fakeChild) Input() io.WriteCloser { return p.input }
+func (p *fakeChild) Output() io.ReadCloser { return p.output }
+func (p *fakeChild) Errors() io.ReadCloser { return p.stderr }
+func (p *fakeChild) Done() <-chan struct{} { return p.done }
+func (p *fakeChild) Result() error         { return p.result }
+func (p *fakeChild) PID() uint32           { return 42 }
+func (p *fakeChild) Finish() (bool, error) { p.finishes++; return p.forced, nil }
+
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }
+
+type fakePlatform struct {
+	process  *fakeChild
+	startErr error
+}
+
+func (p fakePlatform) Preflight() (map[string]any, error)            { return nil, nil }
+func (p fakePlatform) Start(string, []string, string) (child, error) { return p.process, p.startErr }
+func childWithOutput(output string, completed bool) *fakeChild {
+	child := &fakeChild{input: nopWriteCloser{io.Discard}, output: io.NopCloser(strings.NewReader(output)), stderr: io.NopCloser(strings.NewReader("")), done: make(chan struct{})}
+	if completed {
+		close(child.done)
+	}
+	return child
+}
+
+func TestGuestAcknowledgementsRequireSequenceAndConfirmedExit(t *testing.T) {
+	zero := 0
+	id := testIdentity()
+	for _, test := range []struct {
+		name     string
+		message  response
+		op       string
+		sequence uint64
+		valid    bool
+	}{
+		{"stop-confirmed", response{identity: id, Phase: "stop-authority", Sequence: 2, Op: "stop-authority", Status: "ok", ExitCode: &zero}, "stop-authority", 2, true},
+		{"stop-no-exit", response{identity: id, Phase: "stop-authority", Sequence: 2, Op: "stop-authority", Status: "ok"}, "stop-authority", 2, false},
+		{"stale-start", response{identity: id, Phase: "start", Sequence: 1, Op: "start", Status: "ok"}, "start", 3, false},
+		{"wrong-phase", response{identity: id, Phase: "boot", Sequence: 1, Op: "start", Status: "ok"}, "start", 1, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			channel := &guestChannel{child: childWithOutput("", false), identity: id, responses: make(chan response, 1), fault: make(chan error, 1)}
+			channel.responses <- test.message
+			_, err := channel.receive(context.Background(), test.sequence, test.op, test.op)
+			if (err == nil) != test.valid {
+				t.Fatalf("valid=%v err=%v", test.valid, err)
+			}
+		})
+	}
+}
+
+func TestGuestControlTimeoutDoesNotClaimExit(t *testing.T) {
+	channel := &guestChannel{child: childWithOutput("", false), identity: testIdentity(), responses: make(chan response, 1), fault: make(chan error, 1)}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	if _, err := channel.command(ctx, 1, "shutdown"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unconfirmed command: %v", err)
+	}
+	if _, err := commandBytes(channel.Nonce, 0, "start"); err == nil {
+		t.Fatal("zero sequence accepted")
+	}
+	if _, err := commandBytes(channel.Nonce, 1, "restart"); err == nil {
+		t.Fatal("unknown command accepted")
+	}
+}
+
+func TestToolOwnershipOnSuccessFailureAndCancellation(t *testing.T) {
+	for _, name := range []string{"success", "nonzero", "cancel", "forced"} {
+		t.Run(name, func(t *testing.T) {
+			process := childWithOutput("tool output", name != "cancel")
+			process.forced = name == "forced"
+			if name == "nonzero" {
+				process.result = errors.New("exit code 7")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+			defer cancel()
+			output, err := runTool(ctx, fakePlatform{process: process}, "tool", nil, privateTestDirectory(t), "tool")
+			if name == "success" && (err != nil || string(output) != "tool output") {
+				t.Fatalf("success %q %v", output, err)
+			}
+			if name != "success" && err == nil {
+				t.Fatal("failure reported success")
+			}
+			if process.finishes != 1 {
+				t.Fatalf("owned process finish count %d", process.finishes)
+			}
+		})
+	}
+}
+
+func TestStreamOverflowIsFailureWithMarker(t *testing.T) {
+	var output bytes.Buffer
+	writer := &cappedWriter{writer: &output, remaining: 5}
+	if _, err := writer.Write([]byte("0123456789")); err == nil {
+		t.Fatal("overflow was hidden")
+	}
+	if !strings.Contains(output.String(), "truncated") || !strings.HasPrefix(output.String(), "01234") {
+		t.Fatalf("missing bounded evidence %q", output.String())
+	}
+}
+
+func TestProbeReceiptCannotUseWrongSourceOrEmptyIdentity(t *testing.T) {
+	id := testIdentity()
+	value := response{identity: id, Phase: "readiness-create", Sequence: 1, Status: "ok", AuthorityEpoch: "epoch", ObjectID: "object"}
+	encode := func() []byte {
+		data, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	if _, err := validateProbe(encode(), id, value.Phase, 1); err != nil {
+		t.Fatal(err)
+	}
+	value.AuthorityEpoch = ""
+	if _, err := validateProbe(encode(), id, value.Phase, 1); err == nil {
+		t.Fatal("empty authority accepted")
+	}
+	value.AuthorityEpoch = "epoch"
+	value.SourceSHA = strings.Repeat("c", 40)
+	if _, err := validateProbe(encode(), id, value.Phase, 1); err == nil {
+		t.Fatal("foreign source accepted")
+	}
+}
+
+func TestArtifactTraversalAndHashMismatchFail(t *testing.T) {
+	root := privateTestDirectory(t)
+	if err := os.WriteFile(filepath.Join(root, "input"), []byte("source"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	hash, _, err := fileHash(filepath.Join(root, "input"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyFiles(root, map[string]string{"input": hash}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"../input", "/input", `a\input`, "a/../input", "./input", "C:/input"} {
+		if _, err := safePath(root, path); err == nil {
+			t.Fatalf("traversal accepted: %s", path)
+		}
+	}
+	if err := verifyFiles(root, map[string]string{"input": strings.Repeat("0", 64)}); err == nil {
+		t.Fatal("hash mismatch accepted")
+	}
+}
+
+func TestPrivateDiskCopyBindsExpectedHash(t *testing.T) {
+	directory := privateTestDirectory(t)
+	source := filepath.Join(directory, "source")
+	if err := os.WriteFile(source, []byte("pristine"), 0400); err != nil {
+		t.Fatal(err)
+	}
+	hash, size, err := fileHash(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := artifact{SHA256: hash, Size: size}
+	if err := copyDisk(source, filepath.Join(directory, "copy"), expected); err != nil {
+		t.Fatal(err)
+	}
+	expected.SHA256 = strings.Repeat("0", 64)
+	if err := copyDisk(source, filepath.Join(directory, "mismatch"), expected); err == nil {
+		t.Fatal("changed pristine disk accepted")
+	}
+	actual, _, err := fileHash(source)
+	if err != nil || actual != hash {
+		t.Fatalf("source changed: %s %v", actual, err)
+	}
+}
+
+func TestQEMULaunchLimitsNetworkAndUsesPrivateDisk(t *testing.T) {
+	var m manifest
+	m.BootToken = strings.Repeat("a", 64)
+	m.Volume = "fixture-current"
+	m.QEMU.Machine = "pc-q35-11.1"
+	args := qemuArguments(m, testIdentity(), "kernel", "initramfs", "private,data", "bios", 43210)
+	joined := strings.Join(args, " ")
+	for _, required := range []string{"-L bios", "-accel tcg,thread=multi", "restrict=on", "hostfwd=tcp:127.0.0.1:43210-10.0.2.15:8080", "file=private,,data,format=raw", "rng-builtin", "RFS_FIXTURE_NONCE="} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("missing %s", required)
+		}
+	}
+	if strings.Count(joined, "hostfwd=") != 1 {
+		t.Fatal("multiple forwards")
+	}
+	for _, forbidden := range []string{"cache=unsafe", "-virtfs", "-fsdev", "-qmp", "rng-random", "whpx"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("forbidden %s", forbidden)
+		}
+	}
+}
+
+func TestFramedAuthorityOutputCannotForgeGuestControl(t *testing.T) {
+	var output bytes.Buffer
+	logs := map[string]*cappedWriter{"stdout": {writer: &output, remaining: streamLimit}, "stderr": {writer: io.Discard, remaining: streamLimit}}
+	forged := responsePrefix + `{"status":"ok"}`
+	line := "RFS-AUTHORITY/stdout " + base64.StdEncoding.EncodeToString([]byte(forged))
+	handled, err := authorityLogLine([]byte(line), logs)
+	if err != nil || !handled || output.String() != forged {
+		t.Fatalf("frame was not isolated: %v %v %q", handled, err, output.String())
+	}
+	for _, line := range []string{"RFS-AUTHORITY/stdout invalid!", "RFS-AUTHORITY/unknown YQ=="} {
+		if handled, err := authorityLogLine([]byte(line), logs); !handled || err == nil {
+			t.Fatalf("malformed frame accepted: %q", line)
+		}
+	}
+}
+
+func TestDuplicateJSONFieldsCannotOverrideIdentity(t *testing.T) {
+	id := testIdentity()
+	data, err := json.Marshal(response{identity: id, Phase: "boot", Op: "boot-ready", Status: "ok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data[:len(data)-1], []byte(`,"run_id":"run_1"}`)...)
+	if _, err := parseResponse(append([]byte(responsePrefix), data...), id); err == nil {
+		t.Fatal("duplicate identity field accepted")
+	}
+	var target map[string]any
+	if err := decodeOne([]byte(`{"source_files":{"x":"a","x":"b"}}`), &target); err == nil {
+		t.Fatal("duplicate nested source hash accepted")
+	}
+}
+
+func privateTestDirectory(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "private")
+	if err := createPrivateDirectory(path); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}

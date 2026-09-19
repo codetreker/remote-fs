@@ -150,7 +150,7 @@ func TestAtomicOpenAndNodeReferenceValidateActualIntent(t *testing.T) {
 			t.Fatalf("validnoderef refused:%+v", o)
 		}
 	}
-	for _, change := range []func(*NodeRefOptions){func(o *NodeRefOptions) { o.Kind = 0 }, func(o *NodeRefOptions) { o.Target = ChildCondition{} }, func(o *NodeRefOptions) { o.Guards = &NamespaceGuards{Edges: []ObservedEdge{{}}} }, func(o *NodeRefOptions) { o.Use.Uses = 128 }, func(o *NodeRefOptions) { o.Use.Uses = ReadData }, func(o *NodeRefOptions) { o.MetadataAccess = 4 }, func(o *NodeRefOptions) { o.Exclusive = true }, func(o *NodeRefOptions) { o.InitialState.OnCreate.LinkTarget = []byte("x") }, func(o *NodeRefOptions) { o.InitialState.OnReset.Metadata = map[string][]byte{"a": nil} }, func(o *NodeRefOptions) {
+	for _, change := range []func(*NodeRefOptions){func(o *NodeRefOptions) { o.Kind = 0 }, func(o *NodeRefOptions) { o.Target = ChildCondition{} }, func(o *NodeRefOptions) { o.Guards = &NamespaceGuards{Edges: []ObservedEdge{{}}} }, func(o *NodeRefOptions) { o.Use.Uses = 128 }, func(o *NodeRefOptions) { o.MetadataAccess = 4 }, func(o *NodeRefOptions) { o.Exclusive = true }, func(o *NodeRefOptions) { o.InitialState.OnCreate.LinkTarget = []byte("x") }, func(o *NodeRefOptions) { o.InitialState.OnReset.Metadata = map[string][]byte{"a": nil} }, func(o *NodeRefOptions) {
 		o.Create = true
 		o.InitialState.OnCreate.Metadata = map[string][]byte{"bad key": nil}
 	}, func(o *NodeRefOptions) {
@@ -370,5 +370,26 @@ func TestOpenMetadataConditionsRemainIndependentOfEffects(t *testing.T) {
 		CloseIntent: &CloseIntent{Trigger: OnReferenceClose, Condition: UnlinkFile}}
 	if err := node.Check(); err != nil {
 		t.Fatalf("metadata-only close-intent admission: %v", err)
+	}
+}
+
+func TestNodeReferenceClaimsRemainIndependentOfMethodPermissions(t *testing.T) {
+	for _, kind := range []NodeKind{NodeRegular, NodeDirectory, NodeSymlink} {
+		for _, uses := range []Uses{ReadData, WriteData, ReadData | WriteData, DeleteName} {
+			options := NodeRefOptions{Kind: kind, Target: ChildCondition{State: Any}, Use: UseClaim{Uses: uses, Deny: ReadData | WriteData | ReadEntries}}
+			if err := options.Check(); err != nil {
+				t.Fatalf("kind %v claims %v without metadata permission: %v", kind, uses, err)
+			}
+		}
+		options := NodeRefOptions{Kind: kind, Target: ChildCondition{State: Any}, Use: UseClaim{Uses: ReadEntries}}
+		if err := options.Check(); (err == nil) != (kind == NodeDirectory) {
+			t.Fatalf("enumeration claim kind %v: %v", kind, err)
+		}
+		for _, claim := range []UseClaim{{Uses: 128}, {Deny: 128}} {
+			options.Use = claim
+			if err := options.Check(); err == nil {
+				t.Fatalf("unknown claim accepted: %+v", options)
+			}
+		}
 	}
 }

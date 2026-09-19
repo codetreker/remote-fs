@@ -32,7 +32,12 @@ func (h *Handler) authorizeFile(ctx context.Context, req fileRequest) error {
 			}
 		}
 	case storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
-		access.Open = storage.OpenAccess{Read: req.NodeRef.MetadataAccess&storage.ReadMetadata != 0, Write: req.NodeRef.MetadataAccess&storage.WriteMetadata != 0, Create: req.NodeRef.Create, Exclusive: req.NodeRef.Exclusive}
+		access.Open = storage.OpenAccess{
+			Read:      req.NodeRef.MetadataAccess&storage.ReadMetadata != 0 || req.NodeRef.Use.Uses&(storage.ReadData|storage.ReadEntries) != 0,
+			Write:     req.NodeRef.MetadataAccess&storage.WriteMetadata != 0 || req.NodeRef.Use.Uses&storage.WriteData != 0,
+			Create:    req.NodeRef.Create,
+			Exclusive: req.NodeRef.Exclusive,
+		}
 		if req.NodeRef.CloseIntent != nil {
 			additional = append(additional, storage.OpFileSetPendingUnlink)
 		}

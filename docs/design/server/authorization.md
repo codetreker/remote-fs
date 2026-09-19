@@ -93,7 +93,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 
 副本构建还需要 replication.checkpoint 的明确许可；允许订阅或快照不隐含这项权限。Checkpoint 是一次普通读取，遵循入口授权、通用传输预算和安全错误规则，不建立持续输出。
 
-FileOpenOptions 继续用 OpenAccess 的 Read/Write/Create/Truncate/Exclusive，ExpectedID 与 InitialMetadata 由其 Check/CheckNode 验证。OpenAt 转成同一 OpenAccess：ResetContent 表示截断，ReplaceNode 另外要求 volume.remove；armed intent 另外要求 file.set-pending-unlink。reset 的共同属性或 metadata 更新还分别要求 file.set-attr/file.set-metadata。NodeReference 打开用 OpenAccess 表达 MetadataAccess 的读写与创建，而不赋予字节方法。
+FileOpenOptions 继续用 OpenAccess 的 Read/Write/Create/Truncate/Exclusive，ExpectedID 与 InitialMetadata 由其 Check/CheckNode 验证。OpenAt 转成同一 OpenAccess：ResetContent 表示截断，ReplaceNode 另外要求 volume.remove；armed intent 另外要求 file.set-pending-unlink。reset 的共同属性或 metadata 更新还分别要求 file.set-attr/file.set-metadata。NodeReference 打开的 OpenAccess.Read 包含 ReadMetadata 或已声明的 ReadData/ReadEntries，OpenAccess.Write 包含 WriteMetadata 或已声明的 WriteData，Create/Exclusive 保留原含义。handler 在 native 打开前授权这份完整意图；相容性 claim 不授予字节方法、metadata 权限或目录枚举权限，不能因引用没有字节方法而从授权中删去读写 claim。
 
 NameCommand 不以包装名称逃避基础语义：Create/Symlink 使用 volume.create，Mkdir/Remove/RemoveDir/Rename 使用各自已有 Operation。ConditionalFileMutation 先授权 file.mutate，再按实际内容分别核对 file.write、file.truncate、file.set-attr 和 file.set-metadata。所有需要的 callback 通过后才进入 native 效果，不能先完成一部分再补授权。
 

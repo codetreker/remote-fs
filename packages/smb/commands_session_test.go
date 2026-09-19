@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
@@ -142,27 +143,51 @@ func TestAuthenticationCloseFailureRetainsGlobalCapacity(t *testing.T) {
 }
 
 func TestSessionSetupBoundsAndExpiry(t *testing.T) {
-	c, _ := registryAuthenticatedConnection(t)
-	c.server.config.Authenticator = &registryAuthenticator{sid: "S-1-5-21-1"}
-	h, status, _ := registrySetup(t, t.Context(), c, 0, 10, 0, 0, 0, "initial")
-	if status != statusMoreProcessing {
-		t.Fatalf("challenge: %x", status)
-	}
-	c.mu.Lock()
-	expiring := c.sessions[h.SessionID]
-	c.mu.Unlock()
-	expiring.authMu.Lock()
-	expiring.deadline = time.Now().Add(-time.Second)
-	expiring.authMu.Unlock()
-	if _, status, _ := registrySetup(t, t.Context(), c, h.SessionID, 11, 0, 0, 0, "proof"); status != statusDenied {
-		t.Fatalf("expired exchange: %x", status)
-	}
-	for _, sid := range []string{"", "S-2-5-1", "S-1-281474976710656-1", "S-1-5-4294967296"} {
-		c.server.config.Authenticator = &registryAuthenticator{sid: sid, immediate: true}
-		if _, status, key := registrySetup(t, t.Context(), c, 0, 12, 0, 0, 0, "proof"); status != statusDenied || key != nil {
-			t.Fatalf("invalid SID %q: %x", sid, status)
+	t.Run("expired exchange", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _ := registryAuthenticatedConnection(t)
+			authenticator := &registryAuthenticator{sid: "S-1-5-21-1"}
+			c.server.config.Authenticator = authenticator
+			c.server.config.Limits.MaxSessions = 2
+			h, status, _ := registrySetup(t, t.Context(), c, 0, 10, 0, 0, 0, "initial")
+			if status != statusMoreProcessing || c.server.Status().Sessions != 2 {
+				t.Fatalf("challenge: %x, state=%+v", status, c.server.Status())
+			}
+			expiring := c.server.sessions.get(h.SessionID).session
+			if expiring == nil {
+				t.Fatal("challenge has no registered session")
+			}
+			time.Sleep(c.server.config.Limits.HandshakeTimeout)
+			synctest.Wait()
+			select {
+			case <-expiring.authDone:
+			default:
+				t.Fatal("expired authentication watcher has not retired")
+			}
+			c.mu.Lock()
+			retained := c.sessions[h.SessionID] != nil
+			c.mu.Unlock()
+			if retained || c.server.sessions.get(h.SessionID).session != nil || c.server.Status().Sessions != 1 || authenticator.closed.Load() != 1 {
+				t.Fatalf("expired exchange retained ownership: local=%v state=%+v closed=%d", retained, c.server.Status(), authenticator.closed.Load())
+			}
+			if _, status, key := registrySetup(t, t.Context(), c, h.SessionID, 11, 0, 0, 0, "proof"); status != statusSessionDeleted || key != nil {
+				t.Fatalf("expired exchange: %x", status)
+			}
+			next, status, _ := registrySetup(t, t.Context(), c, 0, 12, 0, 0, 0, "initial")
+			if status != statusMoreProcessing || next.SessionID == h.SessionID || c.server.Status().Sessions != 2 || authenticator.closed.Load() != 1 {
+				t.Fatalf("reclaimed authentication slot: %x, state=%+v closed=%d", status, c.server.Status(), authenticator.closed.Load())
+			}
+		})
+	})
+	t.Run("invalid SID", func(t *testing.T) {
+		c, _ := registryAuthenticatedConnection(t)
+		for _, sid := range []string{"", "S-2-5-1", "S-1-281474976710656-1", "S-1-5-4294967296"} {
+			c.server.config.Authenticator = &registryAuthenticator{sid: sid, immediate: true}
+			if _, status, key := registrySetup(t, t.Context(), c, 0, 12, 0, 0, 0, "proof"); status != statusDenied || key != nil {
+				t.Fatalf("invalid SID %q: %x", sid, status)
+			}
 		}
-	}
+	})
 }
 
 func TestSessionSetupRequiresOldSignature(t *testing.T) {

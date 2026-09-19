@@ -31,7 +31,7 @@ Renew 返回确认的 epoch、revision、保守剩余 lease/history；Status 只
 | DeleteIntent | SetPendingUnlink/ClearPendingUnlink |
 | ConditionalFileMutation | 按显式条件执行 Truncate/Attributes/WriteAt/Append |
 
-NodeReference 使用同一 retainedFile、session registry、预算和 Close 排空，只提供 Stat/SetAttr/Close。Meta-only 与目录引用不伪装成可读写 File。State 的 Attr、原始 LinkTarget 与 pending/detached 状态由同一捕获提供，失败不能用 false 或当前路径查找补齐。
+NodeReference 使用同一 retainedFile、session registry、预算和 Close 排空，只提供 Stat/SetAttr/Close。它可以声明既有 ReadData/WriteData 相容性 claim，使其它打开与访问参加相同 Uses/Deny 检查；claim 不增加字节方法，也不授予 MetadataAccess 或 ReadEntries。目录 ReadEntries 仍只适用于目录，方法权限与相容性声明分别校验。Meta-only 与目录引用不伪装成可读写 File。State 的 Attr、原始 LinkTarget 与 pending/detached 状态由同一捕获提供，失败不能用 false 或当前路径查找补齐。
 
 ## 二、保留节点与回收
 

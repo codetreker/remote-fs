@@ -1,0 +1,133 @@
+name: Current authority on native Windows
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - .github/workflows/native-current-authority.yml
+      - .github/scripts/native-current-authority/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-current-authority-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: false
+
+env:
+  RFS_FIXTURE_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  GIT_CONFIG_COUNT: '2'
+  GIT_CONFIG_KEY_0: core.autocrlf
+  GIT_CONFIG_VALUE_0: 'false'
+  GIT_CONFIG_KEY_1: core.eol
+  GIT_CONFIG_VALUE_1: lf
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  image:
+    name: Build current Linux authority fixture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GOENV: 'off'
+      GOTOOLCHAIN: local
+      GOCACHE: ${{ github.workspace }}/.tmp/go-cache/build
+      GOMODCACHE: ${{ github.workspace }}/.tmp/go-cache/mod
+      GOPATH: ${{ github.workspace }}/.tmp/go-cache/gopath
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - name: Check the guest builder and process ownership
+        run: |
+          python3 -u .github/scripts/native-current-authority/build_image_test.py -v
+          python3 -u .github/scripts/native-current-authority/run_linux_test.py -v
+          python3 -u .github/scripts/native-current-authority/check_tooling_test.py -v
+          python3 -u .github/scripts/native-current-authority/check_windows_test.py -v
+          python3 -u .github/scripts/native-current-authority/check-tooling.py --output .tmp/native-current-authority-fixture/unit-linux
+          python3 -u .github/scripts/native-current-authority/check-tooling.py --race --output .tmp/native-current-authority-fixture/race-linux
+      - name: Assemble the source-bound kernel, initramfs and private ext4 image
+        run: python3 -u .github/scripts/native-current-authority/build-image.py --output .tmp/native-current-authority-fixture/artifact
+      - name: Publish the verified image inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-current-authority-image-${{ github.run_attempt }}
+          path: .tmp/native-current-authority-fixture/artifact
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+      - name: Preserve image and unit evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-current-authority-linux-evidence-${{ github.run_attempt }}
+          path: |
+            .tmp/native-current-authority-fixture/unit-linux
+            .tmp/native-current-authority-fixture/race-linux
+            .tmp/native-current-authority-fixture/artifact/evidence
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+
+  windows:
+    name: Native ARM64 HTTP authority lifecycle
+    needs: image
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Put every fixture cache and temporary file in the checkout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:GITHUB_WORKSPACE '.tmp'
+          foreach ($name in @('tmp', 'go-cache/build', 'go-cache/mod', 'go-cache/gopath')) {
+            New-Item -ItemType Directory -Force -Path (Join-Path $root $name) | Out-Null
+          }
+          @{
+            GOENV = 'off'; GOTOOLCHAIN = 'local'
+            GOCACHE = (Join-Path $root 'go-cache/build')
+            GOMODCACHE = (Join-Path $root 'go-cache/mod')
+            GOPATH = (Join-Path $root 'go-cache/gopath')
+            TMP = (Join-Path $root 'tmp'); TEMP = (Join-Path $root 'tmp')
+          }.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" >> $env:GITHUB_ENV }
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: native-current-authority-image-${{ github.run_attempt }}
+          path: .tmp/native-current-authority-fixture/artifact
+      - name: Exercise native ACLs and owned process jobs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((& go env GOOS) -ne 'windows' -or (& go env GOARCH) -ne 'arm64') { throw 'Native Windows ARM64 Go is required.' }
+          if ((& go version) -notmatch 'go1\.26\.8 windows/arm64') { throw 'Go 1.26.8 is required.' }
+          python -u .github/scripts/native-current-authority/check-tooling.py --output .tmp/native-current-authority-fixture/unit-windows
+          if ($LASTEXITCODE -ne 0) { throw 'Native fixture unit checks failed.' }
+      - name: Verify the current HTTP authority across an ordinary restart
+        shell: pwsh
+        run: ./.github/scripts/native-current-authority/run-windows.ps1 -ArtifactDirectory .tmp/native-current-authority-fixture/artifact -RunId "${{ github.run_id }}-${{ github.run_attempt }}"
+      - name: Preserve first observations and owned-resource cleanup
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-current-authority-windows-evidence-${{ github.run_attempt }}
+          path: |
+            .tmp/native-current-authority-fixture/unit-windows
+            .tmp/native-current-authority-fixture/windows-runs/*/evidence
+            .tmp/native-current-authority-fixture/packaging-evidence
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14

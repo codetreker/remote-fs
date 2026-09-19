@@ -1,0 +1,360 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/codetreker/remote-fs/packages/storage"
+)
+
+func testOptions(t *testing.T) options {
+	t.Helper()
+	run := filepath.Join(t.TempDir(), "run")
+	if err := createPrivateDirectory(run); err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(run, "evidence")
+	if err := createPrivateDirectory(directory); err != nil {
+		t.Fatal(err)
+	}
+	return options{Endpoint: "http://127.0.0.1:12345", Volume: fixtureVolume, RunID: "test-run_1", SourceSHA: strings.Repeat("a", 40),
+		FixtureNonce: strings.Repeat("b", 64), Phase: createPhase, StateFile: filepath.Join(directory, "probe-state.json"), Sequence: 1}
+}
+
+func arguments(o options) []string {
+	return []string{"--endpoint", o.Endpoint, "--volume", o.Volume, "--run-id", o.RunID, "--source-sha", o.SourceSHA,
+		"--fixture-nonce", o.FixtureNonce, "--phase", o.Phase, "--state-file", o.StateFile, "--sequence", "1"}
+}
+
+func savedState(o options) probeState {
+	content := fixtureContent(o, "sentinel")
+	return probeState{Version: 1, RunID: o.RunID, SourceSHA: o.SourceSHA, FixtureNonce: o.FixtureNonce, Volume: o.Volume,
+		Phase: createPhase, Sequence: o.Sequence, AuthorityEpoch: "authority-identity_1", RootID: 1, SentinelName: "sentinel-" + o.FixtureNonce,
+		Content: content, ContentSHA256: digest(content), LogicalUsed: int64(len(content)), Reference: storage.ReferenceState{
+			Attr: storage.Attr{ID: 2, Kind: storage.NodeRegular, Size: int64(len(content)), Metadata: map[string]storage.OpaquePayload{
+				metadataNamespace: {Version: []byte{1, 2, 3}, Data: []byte("sealed:" + digest(content))},
+			}},
+		}}
+}
+
+func TestProbeArgumentsRejectUnboundInputs(t *testing.T) {
+	o := testOptions(t)
+	got, err := parseOptions(arguments(o))
+	if err != nil || got != o {
+		t.Fatalf("valid arguments: %+v, %v", got, err)
+	}
+	for name, change := range map[string]func(*options){
+		"remote endpoint":   func(o *options) { o.Endpoint = "http://example.com:12345" },
+		"credentials":       func(o *options) { o.Endpoint = "http://secret@127.0.0.1:12345" },
+		"redirect path":     func(o *options) { o.Endpoint += "/other" },
+		"query":             func(o *options) { o.Endpoint += "?" },
+		"fragment":          func(o *options) { o.Endpoint += "#other" },
+		"zero port":         func(o *options) { o.Endpoint = "http://127.0.0.1:0" },
+		"noncanonical port": func(o *options) { o.Endpoint = "http://127.0.0.1:012345" },
+		"volume":            func(o *options) { o.Volume = "another-volume" },
+		"missing run":       func(o *options) { o.RunID = "" },
+		"long run":          func(o *options) { o.RunID = strings.Repeat("a", 65) },
+		"run traversal":     func(o *options) { o.RunID = "../other" },
+		"source length":     func(o *options) { o.SourceSHA = strings.Repeat("a", 39) },
+		"source case":       func(o *options) { o.SourceSHA = strings.Repeat("A", 40) },
+		"nonce length":      func(o *options) { o.FixtureNonce = strings.Repeat("b", 63) },
+		"nonce alphabet":    func(o *options) { o.FixtureNonce = strings.Repeat("z", 64) },
+		"phase":             func(o *options) { o.Phase = "ready" },
+		"sequence zero":     func(o *options) { o.Sequence = 0 },
+		"sequence overflow": func(o *options) { o.Sequence = ^uint64(0) },
+		"state name":        func(o *options) { o.StateFile = filepath.Join(filepath.Dir(o.StateFile), "other.json") },
+		"state directory":   func(o *options) { o.StateFile = filepath.Join(t.TempDir(), "probe-state.json") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := o
+			change(&bad)
+			if err := bad.check(); err == nil {
+				t.Fatal("invalid options accepted")
+			}
+		})
+	}
+	for _, extra := range []string{"unexpected", "--unknown"} {
+		if _, err := parseOptions(append(arguments(o), extra)); err == nil {
+			t.Fatalf("extra argument %q accepted", extra)
+		}
+	}
+}
+
+func TestProbeStateBindsReopenToExactRunAndSentinel(t *testing.T) {
+	o := testOptions(t)
+	s := savedState(o)
+	o.Phase, o.Sequence = reopenPhase, 2
+	if err := s.check(o); err != nil {
+		t.Fatal(err)
+	}
+	for name, change := range map[string]func(*probeState){
+		"run":                func(s *probeState) { s.RunID = "other" },
+		"source":             func(s *probeState) { s.SourceSHA = strings.Repeat("c", 40) },
+		"nonce":              func(s *probeState) { s.FixtureNonce = strings.Repeat("c", 64) },
+		"volume":             func(s *probeState) { s.Volume = "other" },
+		"version":            func(s *probeState) { s.Version++ },
+		"phase":              func(s *probeState) { s.Phase = reopenPhase },
+		"sequence replay":    func(s *probeState) { s.Sequence++ },
+		"sequence overflow":  func(s *probeState) { s.Sequence = ^uint64(0) },
+		"epoch":              func(s *probeState) { s.AuthorityEpoch = "" },
+		"root":               func(s *probeState) { s.RootID = 0 },
+		"identity":           func(s *probeState) { s.Reference.Attr.ID = s.RootID },
+		"name":               func(s *probeState) { s.SentinelName = "../other" },
+		"content":            func(s *probeState) { s.Content = []byte("replacement") },
+		"digest":             func(s *probeState) { s.ContentSHA256 = strings.Repeat("0", 64) },
+		"usage":              func(s *probeState) { s.LogicalUsed++ },
+		"size":               func(s *probeState) { s.Reference.Attr.Size++ },
+		"kind":               func(s *probeState) { s.Reference.Attr.Kind = storage.NodeDirectory },
+		"detached":           func(s *probeState) { s.Reference.Detached = true },
+		"pending":            func(s *probeState) { s.Reference.PendingUnlink = true },
+		"pending generation": func(s *probeState) { s.Reference.PendingGeneration = []byte{1} },
+		"link":               func(s *probeState) { s.Reference.LinkTarget = []byte("other") },
+		"metadata namespace": func(s *probeState) { s.Reference.Attr.Metadata = nil },
+		"metadata token": func(s *probeState) {
+			s.Reference.Attr.Metadata[metadataNamespace] = storage.OpaquePayload{Data: []byte("sealed:" + s.ContentSHA256)}
+		},
+		"metadata payload": func(s *probeState) {
+			s.Reference.Attr.Metadata[metadataNamespace] = storage.OpaquePayload{Version: []byte{1}, Data: []byte("other")}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := s
+			bad.Reference.Attr = s.Reference.Attr.Clone()
+			change(&bad)
+			if err := bad.check(o); err == nil {
+				t.Fatal("changed binding accepted")
+			}
+		})
+	}
+}
+
+func TestProbeStateIsPrivateBoundedAndNeverOverwritten(t *testing.T) {
+	o := testOptions(t)
+	s := savedState(o)
+	if err := checkStateDirectory(o.StateFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeState(o.StateFile, s); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivateFile(o.StateFile); err != nil {
+		t.Fatalf("written state is not private: %v", err)
+	}
+	o.Phase, o.Sequence = reopenPhase, 2
+	got, err := readState(o)
+	if err != nil || !reflect.DeepEqual(got, s) {
+		t.Fatalf("state roundtrip: %+v, %v", got, err)
+	}
+	if err := writeState(o.StateFile, s); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("existing evidence overwritten: %v", err)
+	}
+	data, err := os.ReadFile(o.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, invalid := range map[string][]byte{
+		"trailing object": append(bytes.Clone(data), []byte("{}")...),
+		"unknown field":   bytes.Replace(data, []byte(`"version":1`), []byte(`"unknown":1,"version":1`), 1),
+		"duplicate field": bytes.Replace(data, []byte(`"version":1`), []byte(`"version":1,"version":1`), 1),
+		"oversized":       bytes.Repeat([]byte(" "), maxStateBytes+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(o.StateFile, invalid, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readState(o); err == nil {
+				t.Fatal("invalid evidence accepted")
+			}
+		})
+	}
+	if err := os.WriteFile(o.StateFile, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		for _, mode := range []os.FileMode{0644, 0400} {
+			if err := os.Chmod(o.StateFile, mode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readState(o); err == nil {
+				t.Fatalf("state with mode %04o accepted", mode)
+			}
+		}
+	}
+}
+
+func TestProbeStateRejectsUnprotectedDirectoriesBeforeWriting(t *testing.T) {
+	run := filepath.Join(t.TempDir(), "run")
+	if err := os.Mkdir(run, 0755); err != nil {
+		t.Fatal(err)
+	}
+	evidence := filepath.Join(run, "evidence")
+	if err := os.Mkdir(evidence, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{run, evidence} {
+		if err := os.Chmod(path, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	o := testOptions(t)
+	o.StateFile = filepath.Join(evidence, "probe-state.json")
+	if err := checkStateDirectory(o.StateFile); err == nil {
+		t.Fatal("unprotected state directory accepted")
+	}
+	if err := writeState(o.StateFile, savedState(o)); err == nil {
+		t.Fatal("payload written in an unprotected directory")
+	}
+	if _, err := os.Lstat(o.StateFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed privacy check created state: %v", err)
+	}
+	protected := testOptions(t)
+	if err := writeState(protected.StateFile, savedState(o)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(protected.StateFile, o.StateFile); err != nil {
+		t.Fatal(err)
+	}
+	o.Phase, o.Sequence = reopenPhase, 2
+	if _, err := readState(o); err == nil {
+		t.Fatal("state read from an unprotected directory")
+	}
+}
+
+func TestProbeStateRejectsSymlinkOwnership(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	o := testOptions(t)
+	actual := filepath.Join(filepath.Dir(o.StateFile), "actual.json")
+	if err := writeState(actual, savedState(o)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(actual, o.StateFile); err != nil {
+		t.Fatal(err)
+	}
+	o.Phase, o.Sequence = reopenPhase, 2
+	if _, err := readState(o); err == nil {
+		t.Fatal("symlink state accepted")
+	}
+	other := filepath.Join(t.TempDir(), "evidence")
+	if err := os.Symlink(filepath.Dir(o.StateFile), other); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkStateDirectory(filepath.Join(other, "probe-state.json")); err == nil {
+		t.Fatal("symlink evidence directory accepted")
+	}
+}
+
+func TestProbeOwnershipClosesPartialResultsBeforeTheirSessions(t *testing.T) {
+	var owned ownership
+	var order []string
+	firstFailure, secondFailure := errors.New("reference outcome unknown"), errors.New("file session close failed")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	add := func(name string, failure error) *ownedClose {
+		return owned.add(name, func(received context.Context) error {
+			if received != ctx {
+				t.Fatal("cleanup context was replaced")
+			}
+			order = append(order, name)
+			return failure
+		})
+	}
+	add("authority session", nil)
+	add("file session", secondFailure)
+	add("root reference", nil)
+	closed := add("already closed file", nil)
+	if err := closed.release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	add("partial open result", firstFailure)
+	result := owned.release(ctx)
+	if !errors.Is(result, firstFailure) || !errors.Is(result, secondFailure) {
+		t.Fatalf("cleanup lost errors: %v", result)
+	}
+	want := []string{"already closed file", "partial open result", "root reference", "file session", "authority session"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("cleanup order = %v", order)
+	}
+	if err := owned.release(ctx); !errors.Is(err, firstFailure) || !errors.Is(err, secondFailure) {
+		t.Fatalf("repeated release lost prior failure: %v", err)
+	}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("cleanup resubmitted an unknown mutation: %v", order)
+	}
+}
+
+func TestProbeAttributeComparisonRejectsIdentityAndCASDrift(t *testing.T) {
+	o := testOptions(t)
+	want := savedState(o).Reference.Attr
+	if err := sameAttr(want, want); err != nil {
+		t.Fatal(err)
+	}
+	for name, change := range map[string]func(*storage.Attr){
+		"identity":          func(a *storage.Attr) { a.ID++ },
+		"size":              func(a *storage.Attr) { a.Size++ },
+		"kind":              func(a *storage.Attr) { a.Kind = storage.NodeSymlink },
+		"missing namespace": func(a *storage.Attr) { delete(a.Metadata, metadataNamespace) },
+		"extra namespace":   func(a *storage.Attr) { a.Metadata["other"] = storage.OpaquePayload{Version: []byte{1}} },
+		"version": func(a *storage.Attr) {
+			value := a.Metadata[metadataNamespace]
+			value.Version = []byte{9}
+			a.Metadata[metadataNamespace] = value
+		},
+		"payload": func(a *storage.Attr) {
+			value := a.Metadata[metadataNamespace]
+			value.Data = []byte("other")
+			a.Metadata[metadataNamespace] = value
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := want.Clone()
+			change(&got)
+			if err := sameAttr(got, want); err == nil {
+				t.Fatal("attribute drift accepted")
+			}
+		})
+	}
+}
+
+func TestProbeReceiptIsOneBoundedLineAndFailuresWriteNothing(t *testing.T) {
+	o := testOptions(t)
+	r := receipt{RunID: o.RunID, SourceSHA: o.SourceSHA, FixtureNonce: o.FixtureNonce, Phase: createPhase, Sequence: 1, Status: "ok", AuthorityEpoch: "authority", ObjectID: "2"}
+	data, err := encodeReceipt(r)
+	if err != nil || len(data) > 1024 || bytes.Count(data, []byte{'\n'}) != 1 || data[len(data)-1] != '\n' {
+		t.Fatalf("invalid receipt: %q, %v", data, err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 8 {
+		t.Fatalf("receipt field count = %d", len(fields))
+	}
+	for _, name := range []string{"run_id", "source_sha", "fixture_nonce", "phase", "sequence", "status", "authority_epoch", "object_id"} {
+		if _, ok := fields[name]; !ok {
+			t.Fatalf("missing %s", name)
+		}
+	}
+	r.RunID = strings.Repeat("x", 1024)
+	if _, err := encodeReceipt(r); err == nil {
+		t.Fatal("oversized receipt accepted")
+	}
+	r.RunID, r.AuthorityEpoch = o.RunID, ""
+	if _, err := encodeReceipt(r); err == nil {
+		t.Fatal("empty authority accepted")
+	}
+	var stdout bytes.Buffer
+	if err := command([]string{"--phase", "invalid"}, &stdout); err == nil || stdout.Len() != 0 {
+		t.Fatalf("failure emitted a receipt: %q, %v", stdout.Bytes(), err)
+	}
+}

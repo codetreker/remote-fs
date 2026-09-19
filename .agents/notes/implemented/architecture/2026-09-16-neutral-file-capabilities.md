@@ -18,7 +18,7 @@ Status: implemented
 
 NodeID 分配器与 high-water 保持原有唯一身份。[活跃文件](2026-09-08-live-file-handles.md)继续拥有 File.ReadAt/WriteAt/Truncate 的同步行为，objectstore 仍以 Node→Reserve/Put→revision Commit 构造当前对象的补丁。已知未提交且清理成功的竞争才有界重试；未知提交、计量或清理不变成成功。
 
-File 的字节方法不携带新的动作 ID 或平台句柄。NodeReference 使用同一 retainedFile、session/HTTP registry 与关闭排空，提供属性而没有字节方法。返回错误但仍带非 nil File/Reference 时，调用方继续拥有清理义务；包装器不能丢掉部分打开结果。Scope 只代表这个确切的原生引用，在所属 volume 上验证存活和 NodeID；经 FileSession/HTTP 使用时还核对会话绑定，不从同 session 或相同数字推导豁免。
+File 的字节方法不携带新的动作 ID 或平台句柄。NodeReference 使用同一 retainedFile、session/HTTP registry 与关闭排空，提供属性而没有字节方法。ReadData/WriteData claim 可独立于 MetadataAccess 声明，用于跨入口相容性检查；它们不增加可调用方法，也不替代 ReadEntries。HTTP 的打开授权包含声明的读写意图，原生既有 UseClaim 接纳与释放负责冲突和寿命，无需新持久格式或引用类型。返回错误但仍带非 nil File/Reference 时，调用方继续拥有清理义务；包装器不能丢掉部分打开结果。Scope 只代表这个确切的原生引用，在所属 volume 上验证存活和 NodeID；经 FileSession/HTTP 使用时还核对会话绑定，不从同 session 或相同数字推导豁免。
 
 ### 平台属性与中立事实分开
 
@@ -102,4 +102,4 @@ HTTP/v4 使用中立 Attr、metadata、范围及能力 DTO，旧 v3 路由明确
 
 本决定部分接续[平台客户端提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)的通用核心和[文件目标提案](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)的目录父身份。它保留 live-file、Strong、quota 与未知对象发布的既有理由；显式内容版本、R-CON-5 的应用调用单位和其它独立提案不因能力名称相近而完成。
 
-Windows 本机 SMB 的实际接入与缓存透明性继续由平台提案承接。诊断原型的结果不替代交付实现；已交付的观察能力仍需接入 Windows 名字解释，共享模式/通知共存与历史时间显示不能由通用能力自动推导。本决定不宣称 Windows 已交付，不缩减规格中的 Windows 目标。
+Windows 本机 SMB 的实际接入与缓存透明性继续由平台提案承接。诊断原型的结果不替代交付实现；已交付的观察能力已被 SMB 的 guarded CREATE 解析使用；完整文件命令、共享模式/通知共存与历史时间显示仍不能由通用能力自动推导。本决定不宣称 Windows 已交付，不缩减规格中的 Windows 目标。

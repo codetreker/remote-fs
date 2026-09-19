@@ -242,8 +242,11 @@ type NodeRefOptions struct {
 	Target ChildCondition
 	// ExpectedMetadata has the same existing-target, zero-effect conflict
 	// semantics as OpenAtOptions.ExpectedMetadata, including use and intent admission.
-	ExpectedMetadata  map[string][]byte `json:",omitempty"`
-	Guards            *NamespaceGuards  `json:",omitempty"`
+	ExpectedMetadata map[string][]byte `json:",omitempty"`
+	Guards           *NamespaceGuards  `json:",omitempty"`
+	// Use declares compatibility claims independently of the reference's method
+	// permissions. ReadData and WriteData do not grant byte-file capabilities;
+	// metadata operations still require MetadataAccess.
 	Use               UseClaim
 	MetadataAccess    MetadataPermissions
 	Create, Exclusive bool

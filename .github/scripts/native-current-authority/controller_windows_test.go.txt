@@ -1,0 +1,89 @@
+//go:build windows
+
+package main
+
+import (
+	"context"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestWindowsFixtureChild(t *testing.T) {
+	if len(os.Args) < 2 {
+		return
+	}
+	switch os.Args[len(os.Args)-1] {
+	case "fixture-child-success":
+		os.Stdout.WriteString("owned child\n")
+		os.Exit(0)
+	case "fixture-child-sleep":
+		time.Sleep(time.Minute)
+		os.Exit(0)
+	case "fixture-child-descendant":
+		executable, err := os.Executable()
+		if err != nil {
+			os.Exit(2)
+		}
+		child := exec.Command(executable, "-test.run=^TestWindowsFixtureChild$", "--", "fixture-child-sleep")
+		if err := child.Start(); err != nil {
+			os.Exit(3)
+		}
+		os.Exit(0)
+	}
+}
+
+func TestWindowsOwnedJobNormalAndCancellation(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"fixture-child-success", "fixture-child-sleep", "fixture-child-descendant"} {
+		t.Run(mode, func(t *testing.T) {
+			budget := 5 * time.Second
+			if mode == "fixture-child-sleep" {
+				budget = 200 * time.Millisecond
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), budget)
+			defer cancel()
+			output, err := runTool(ctx, windowsPlatform{}, executable, []string{"-test.run=^TestWindowsFixtureChild$", "--", mode}, privateTestDirectory(t), "child")
+			if mode == "fixture-child-success" {
+				if err != nil || !strings.Contains(string(output), "owned child") {
+					t.Fatalf("normal owned job: %q %v", output, err)
+				}
+			} else if err == nil {
+				t.Fatal("live owned job was reported graceful")
+			}
+			if mode == "fixture-child-descendant" && !strings.Contains(err.Error(), "forced termination") {
+				t.Fatalf("descendant job ownership was not observed: %v", err)
+			}
+		})
+	}
+}
+
+func TestWindowsOwnedChildTerminationClosesPipes(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	process, err := (windowsPlatform{}).Start(executable, []string{"-test.run=^TestWindowsFixtureChild$", "--", "fixture-child-sleep"}, privateTestDirectory(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned := process.(*windowsChild)
+	defer process.Finish()
+	active, err := jobActive(owned.job)
+	if err != nil || active != 1 {
+		t.Fatalf("returned child is not exclusively job-owned: active=%d error=%v", active, err)
+	}
+	forced, err := process.Finish()
+	if err != nil || !forced {
+		t.Fatalf("termination not confirmed: forced=%v error=%v", forced, err)
+	}
+	if _, err := io.Copy(io.Discard, process.Output()); err == nil {
+		t.Fatal("owned output pipe remained open")
+	}
+}
