@@ -190,10 +190,11 @@ option specifies Wsk and the owned TCP port; QUIC/RDMA ports, certificate-skip,
 reserved bytes and padding stay zero. Profile/global/interactive/credential-save
 flags remain clear. The encoding is host ABI, not network byte order.
 
-Acceptance of this SDK option record by the selected WNet4 provider is unproved.
-The first native run must bind the exact API/flags/options/status and actual
-signed traffic on the owned listener. Requested integrity or a copied port is not
-that observation. Missing export, unsupported options, authentication failure,
+The first source-bound hosted ARM64 run accepted this provider/options pairing.
+Exact API arguments are bound by the source and executed binary; successful raw
+syscall/helper frames were not persisted. The ledger records zero create/remove
+status and helper quiescence, while port and signed traffic were observed on the
+owned listener. Missing export, unsupported options, authentication failure,
 wrong traffic or any API failure fails the run without another creation API,
 PowerShell/CIM/CLI fallback, implicit port 445 retry or setting change.
 
@@ -283,9 +284,19 @@ post-VM/warmed controls do not erase it.
 
 The PowerShell mapping suite/tag and automatic post-failure controls are retired.
 PowerShell still drives the existing Windows harness; it is not a mapping fallback.
-The WNet4 provider/options pairing and changed-source cold path have not run
-natively. Historical HTTP lifecycle proof and native helper units do not supply
-that missing acceptance.
+[The first WNet run 35471060655](https://github.com/codetreker/remote-fs/actions/runs/35471060655)
+on `8b403735f2e87a00babbddc0c2bb2383ad40dfd0` passed the complete one-object
+cold and authority/VM lifecycle on a fresh hosted ARM64 runner. The owned port
+62811 carried 52 signed post-authentication packets with checked lineage; HTTP,
+SMB and native reads agreed on all 173 bytes, EOF and repeated same-HANDLE
+FileIdInfo were correct, and original-live mapping removal completed. Reopening
+after an ordinary authority restart retained the object under a new epoch; QEMU
+exited naturally with status zero, without forced Job cleanup, and the private
+disk was removed with the base unchanged. Signed flags and lineage are observed;
+cryptographic enforcement remains source-bound rather than an independent replay.
+This result proves this fresh-run pairing and one-object cold path. The broader
+`native_acceptance` remains `not-run`; warm-cache visibility, replacement identity
+and cross-object uniqueness are separate gates.
 
 ## Local Linux validation
 
