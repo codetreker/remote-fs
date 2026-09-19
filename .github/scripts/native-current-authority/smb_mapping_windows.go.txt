@@ -906,6 +906,10 @@ try {
     $rfsObservationStage = 'environment'
     Write-RfsEnvironmentObservation
     $rfsObservationStage = 'operation'
+    $utilityManifest = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__RFS_UTILITY_MANIFEST_BASE64__'))
+    [Console]::Error.WriteLine('RFS-MAPPING/1 before-utility')
+    $null = Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -ErrorAction Stop
+    [Console]::Error.WriteLine('RFS-MAPPING/1 after-utility')
     [Console]::Error.WriteLine('RFS-MAPPING/1 before-json')
     $request = $requestLine | ConvertFrom-Json
     [Console]::Error.WriteLine('RFS-MAPPING/1 after-json')
@@ -973,6 +977,17 @@ try {
     }
 }
 `
+
+func mappingPowerShellScript(manifestPath string) (string, error) {
+	if manifestPath == "" || !filepath.IsAbs(manifestPath) || strings.IndexByte(manifestPath, 0) >= 0 || !utf8.ValidString(manifestPath) {
+		return "", errors.New("Utility manifest path must be absolute valid text without NUL")
+	}
+	const placeholder = "__RFS_UTILITY_MANIFEST_BASE64__"
+	if strings.Count(mappingPowerShell, placeholder) != 1 {
+		return "", errors.New("mapping script must bind exactly one Utility manifest path")
+	}
+	return strings.Replace(mappingPowerShell, placeholder, base64.StdEncoding.EncodeToString([]byte(manifestPath)), 1), nil
+}
 
 func mappingPowerShellEnvironment(inherited []string, moduleRoot string) ([]string, error) {
 	if moduleRoot == "" || strings.Contains(moduleRoot, ";") {
@@ -1046,41 +1061,160 @@ func (b *mappingBoundedBuffer) diagnostic() mappingStreamDiagnostic {
 	return mappingStreamDiagnostic{b.observed, base64.StdEncoding.EncodeToString(b.prefix), b.observed > int64(len(b.prefix))}
 }
 
+type mappingUtilityPreparation struct {
+	Path             string `json:"path"`
+	Size             *int64 `json:"size,omitempty"`
+	ReadBytes        int    `json:"read_bytes"`
+	SHA256           string `json:"sha256"`
+	ElapsedNanos     int64  `json:"elapsed_ns"`
+	CleanupConfirmed bool   `json:"cleanup_confirmed"`
+}
+
+type mappingUtilityFile interface {
+	io.Reader
+	Stat() (os.FileInfo, error)
+	Close() error
+}
+
+type mappingUtilityOps struct {
+	CheckPath   func(string) error
+	Open        func(string) (mappingUtilityFile, error)
+	CommandLine func([]string) string
+}
+
+func nativeMappingUtilityOps() mappingUtilityOps {
+	return mappingUtilityOps{
+		CheckPath: rejectPrivateReparsePath,
+		Open: func(path string) (mappingUtilityFile, error) {
+			file, err := os.Open(path)
+			if err != nil {
+				return nil, err
+			}
+			return file, nil
+		},
+		CommandLine: windows.ComposeCommandLine,
+	}
+}
+
+func prepareMappingUtility(ctx context.Context, moduleRoot, executable string, buildScript func(string) (string, error), ops mappingUtilityOps) (script string, facts mappingUtilityPreparation, resultErr error) {
+	started := time.Now()
+	facts.Path = filepath.Join(moduleRoot, "Microsoft.PowerShell.Utility", "Microsoft.PowerShell.Utility.psd1")
+	facts.CleanupConfirmed = true
+	defer func() { facts.ElapsedNanos = time.Since(started).Nanoseconds() }()
+	if err := ctx.Err(); err != nil {
+		return "", facts, err
+	}
+	if !filepath.IsAbs(facts.Path) || strings.HasPrefix(facts.Path, `\\`) {
+		return "", facts, errors.New("Utility manifest must have an absolute local path")
+	}
+	if err := ops.CheckPath(facts.Path); err != nil {
+		return "", facts, errors.Join(err, ctx.Err())
+	}
+	if err := ctx.Err(); err != nil {
+		return "", facts, err
+	}
+	file, err := ops.Open(facts.Path)
+	if file != nil {
+		facts.CleanupConfirmed = false
+		defer func() {
+			closeErr := file.Close()
+			facts.CleanupConfirmed = closeErr == nil
+			resultErr = errors.Join(resultErr, closeErr, ctx.Err())
+			if resultErr != nil {
+				script = ""
+			}
+		}()
+	}
+	if err != nil {
+		return "", facts, errors.Join(err, ctx.Err())
+	}
+	if file == nil {
+		return "", facts, errors.New("Utility manifest open returned no file")
+	}
+	before, err := file.Stat()
+	if err != nil {
+		return "", facts, errors.Join(err, ctx.Err())
+	}
+	size := before.Size()
+	facts.Size = &size
+	if !before.Mode().IsRegular() || size < 0 || size > mappingByteLimit {
+		return "", facts, errors.New("Utility manifest is not a bounded regular file")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", facts, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, mappingByteLimit+1))
+	facts.ReadBytes = len(data)
+	if len(data) > mappingByteLimit {
+		readErr = errors.Join(readErr, errors.New("Utility manifest exceeds 1 MiB"))
+	}
+	if readErr != nil {
+		return "", facts, errors.Join(readErr, ctx.Err())
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return "", facts, errors.Join(err, ctx.Err())
+	}
+	if int64(len(data)) != size || size != after.Size() || before.ModTime() != after.ModTime() {
+		return "", facts, errors.New("Utility manifest changed during inspection")
+	}
+	facts.SHA256 = fmt.Sprintf("%x", sha256.Sum256(data))
+	if err := ctx.Err(); err != nil {
+		return "", facts, err
+	}
+	script, err = buildScript(facts.Path)
+	if err != nil {
+		return "", facts, err
+	}
+	words := utf16.Encode([]rune(script))
+	encoded := make([]byte, len(words)*2)
+	for index, word := range words {
+		binary.LittleEndian.PutUint16(encoded[index*2:], word)
+	}
+	args := []string{executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", base64.StdEncoding.EncodeToString(encoded)}
+	commandLine := ops.CommandLine(args)
+	if strings.IndexByte(commandLine, 0) >= 0 || len(utf16.Encode([]rune(commandLine)))+1 > 32767 {
+		return "", facts, errors.New("Utility diagnostic command line exceeds Windows limit")
+	}
+	return script, facts, ctx.Err()
+}
+
 type mappingCommandDiagnostic struct {
-	Action                    string                  `json:"action"`
-	ActionTruncated           bool                    `json:"action_truncated"`
-	PID                       *uint32                 `json:"pid,omitempty"`
-	ElapsedMillis             int64                   `json:"elapsed_ms"`
-	PreCleanupDone            *bool                   `json:"pre_cleanup_done,omitempty"`
-	PreCleanupResult          *string                 `json:"pre_cleanup_result_error,omitempty"`
-	PreCleanupResultTruncated bool                    `json:"pre_cleanup_result_error_truncated"`
-	WriteStarted              bool                    `json:"write_started"`
-	WriteReturned             bool                    `json:"write_returned"`
-	WriteComplete             bool                    `json:"write_complete"`
-	InputBytes                int                     `json:"input_bytes"`
-	InputSHA256               string                  `json:"input_sha256"`
-	InputLineBytes            int                     `json:"input_line_bytes"`
-	InputLineSHA256           string                  `json:"input_line_sha256"`
-	ScriptUTF16Units          int                     `json:"script_utf16_units"`
-	ScriptSHA256              string                  `json:"script_utf16le_sha256"`
-	WriteBytes                int                     `json:"write_bytes"`
-	WriteError                string                  `json:"write_error"`
-	WriteErrorTruncated       bool                    `json:"write_error_truncated"`
-	EOFRequested              bool                    `json:"eof_requested"`
-	EOFAttempted              bool                    `json:"eof_attempted"`
-	EOFCompleted              bool                    `json:"eof_completed"`
-	EOFError                  string                  `json:"eof_error"`
-	EOFErrorTruncated         bool                    `json:"eof_error_truncated"`
-	WorkersStarted            int                     `json:"workers_started"`
-	WorkersJoined             int                     `json:"workers_joined"`
-	CleanupAttempted          bool                    `json:"cleanup_attempted"`
-	CleanupConfirmed          bool                    `json:"cleanup_confirmed"`
-	CleanupForced             bool                    `json:"cleanup_forced"`
-	CleanupError              string                  `json:"cleanup_error"`
-	CleanupErrorTruncated     bool                    `json:"cleanup_error_truncated"`
-	Launch                    *windowsLaunchFacts     `json:"launch,omitempty"`
-	Stdout                    mappingStreamDiagnostic `json:"stdout_observed"`
-	Stderr                    mappingStreamDiagnostic `json:"stderr_observed"`
+	UtilityPreparation        *mappingUtilityPreparation `json:"utility_preparation,omitempty"`
+	Action                    string                     `json:"action"`
+	ActionTruncated           bool                       `json:"action_truncated"`
+	PID                       *uint32                    `json:"pid,omitempty"`
+	ElapsedMillis             int64                      `json:"elapsed_ms"`
+	PreCleanupDone            *bool                      `json:"pre_cleanup_done,omitempty"`
+	PreCleanupResult          *string                    `json:"pre_cleanup_result_error,omitempty"`
+	PreCleanupResultTruncated bool                       `json:"pre_cleanup_result_error_truncated"`
+	WriteStarted              bool                       `json:"write_started"`
+	WriteReturned             bool                       `json:"write_returned"`
+	WriteComplete             bool                       `json:"write_complete"`
+	InputBytes                int                        `json:"input_bytes"`
+	InputSHA256               string                     `json:"input_sha256"`
+	InputLineBytes            int                        `json:"input_line_bytes"`
+	InputLineSHA256           string                     `json:"input_line_sha256"`
+	ScriptUTF16Units          int                        `json:"script_utf16_units"`
+	ScriptSHA256              string                     `json:"script_utf16le_sha256"`
+	WriteBytes                int                        `json:"write_bytes"`
+	WriteError                string                     `json:"write_error"`
+	WriteErrorTruncated       bool                       `json:"write_error_truncated"`
+	EOFRequested              bool                       `json:"eof_requested"`
+	EOFAttempted              bool                       `json:"eof_attempted"`
+	EOFCompleted              bool                       `json:"eof_completed"`
+	EOFError                  string                     `json:"eof_error"`
+	EOFErrorTruncated         bool                       `json:"eof_error_truncated"`
+	WorkersStarted            int                        `json:"workers_started"`
+	WorkersJoined             int                        `json:"workers_joined"`
+	CleanupAttempted          bool                       `json:"cleanup_attempted"`
+	CleanupConfirmed          bool                       `json:"cleanup_confirmed"`
+	CleanupForced             bool                       `json:"cleanup_forced"`
+	CleanupError              string                     `json:"cleanup_error"`
+	CleanupErrorTruncated     bool                       `json:"cleanup_error_truncated"`
+	Launch                    *windowsLaunchFacts        `json:"launch,omitempty"`
+	Stdout                    mappingStreamDiagnostic    `json:"stdout_observed"`
+	Stderr                    mappingStreamDiagnostic    `json:"stderr_observed"`
 }
 
 type mappingExecution struct {
@@ -1278,8 +1412,27 @@ func validateMappingResult(data []byte, request mappingCommandRequest) (result m
 	return result, nil
 }
 
-func runMappingPowerShell(ctx context.Context, host platform, executable, directory, moduleRoot string, request mappingCommandRequest) (mappingCommandResult, error) {
-	execution, commandErr := executeMappingPowerShell(ctx, host, executable, directory, moduleRoot, request, mappingPowerShell, false)
+func executePreparedMappingPowerShell(ctx context.Context, host platform, executable, directory, moduleRoot string, request mappingCommandRequest, closeInput bool, ops mappingUtilityOps) (execution mappingExecution, resultErr error) {
+	started := time.Now()
+	script, preparation, err := prepareMappingUtility(ctx, moduleRoot, executable, mappingPowerShellScript, ops)
+	if err != nil {
+		execution.Diagnostic.Action, execution.Diagnostic.ActionTruncated = mappingDiagnosticText(request.Action, 64)
+		execution.Diagnostic.EOFRequested = closeInput
+		execution.Diagnostic.CleanupConfirmed = preparation.CleanupConfirmed
+	} else {
+		execution, err = executeMappingPowerShell(ctx, host, executable, directory, moduleRoot, request, script, closeInput)
+	}
+	execution.Diagnostic.UtilityPreparation = &preparation
+	execution.Diagnostic.CleanupConfirmed = preparation.CleanupConfirmed && execution.Diagnostic.CleanupConfirmed
+	execution.Diagnostic.ElapsedMillis = time.Since(started).Milliseconds()
+	return execution, err
+}
+
+func runMappingPowerShell(ctx context.Context, host platform, executable, directory, moduleRoot string, request mappingCommandRequest, ops mappingUtilityOps) (mappingCommandResult, error) {
+	execution, commandErr := executePreparedMappingPowerShell(ctx, host, executable, directory, moduleRoot, request, false, ops)
+	if execution.Diagnostic.ScriptUTF16Units == 0 && commandErr != nil {
+		return mappingCommandResult{}, errors.Join(commandErr, encodeMappingDiagnostic(execution.Diagnostic))
+	}
 	result, validationErr := validateMappingResult(execution.Stdout, request)
 	if err := errors.Join(commandErr, validationErr); err != nil {
 		return result, errors.Join(err, encodeMappingDiagnostic(execution.Diagnostic))
@@ -1467,8 +1620,8 @@ func mappingStartupPlan() [6]mappingStartupCell {
 	return [6]mappingStartupCell{
 		{"01_entry_open", mappingStartupEntry, mappingStartupEntryScript, false, "RFS-MAPPING/1 entry-only", `{"status":"entry-ok"}`},
 		{"02_entry_eof", mappingStartupEntry, mappingStartupEntryScript, true, "RFS-MAPPING/1 entry-only", `{"status":"entry-ok"}`},
-		{"03_inventory_open", mappingStartupInventory, mappingPowerShell, false, "RFS-MAPPING/1 entry", ""},
-		{"04_inventory_eof", mappingStartupInventory, mappingPowerShell, true, "RFS-MAPPING/1 entry", ""},
+		{"03_inventory_open", mappingStartupInventory, "", false, "RFS-MAPPING/1 entry", ""},
+		{"04_inventory_eof", mappingStartupInventory, "", true, "RFS-MAPPING/1 entry", ""},
 		{"05_resolve_json_command", mappingStartupResolve, mappingStartupResolveScript, false, "RFS-CMD/1 entry resolve", `{"status":"resolve-ok"}`},
 		{"06_import_utility_parse", mappingStartupImport, "", false, "RFS-CMD/1 entry import-parse", `{"status":"import-parse-ok"}`},
 	}
@@ -1521,7 +1674,7 @@ func (b *nativeMappingBackend) command(ctx context.Context, action string, ledge
 	request := mappingCommandRequest{action, b.module, b.owner.SID, ledger.LocalPath, ledger.RemotePath, ledger.TCPPort}
 	commandCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	result, err := runMappingPowerShell(commandCtx, b.host, b.executable, filepath.Dir(b.o.StateFile), b.moduleRoot, request)
+	result, err := runMappingPowerShell(commandCtx, b.host, b.executable, filepath.Dir(b.o.StateFile), b.moduleRoot, request, nativeMappingUtilityOps())
 	if err != nil {
 		return result, err
 	}

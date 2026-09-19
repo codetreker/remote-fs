@@ -19,8 +19,6 @@ import (
 	"testing"
 	"time"
 	"unicode/utf16"
-
-	"golang.org/x/sys/windows"
 )
 
 type mappingStartupConfig struct {
@@ -38,131 +36,27 @@ type mappingStartupConfig struct {
 }
 
 type mappingStartupCellReceipt struct {
-	Name                            string                            `json:"name"`
-	Kind                            mappingStartupKind                `json:"kind"`
-	Ordinal                         int                               `json:"ordinal"`
-	PriorDiagnosticProcessCreations int                               `json:"prior_diagnostic_process_creations"`
-	Status                          string                            `json:"status"`
-	Error                           string                            `json:"error"`
-	ErrorTruncated                  bool                              `json:"error_truncated"`
-	Diagnostic                      mappingCommandDiagnostic          `json:"diagnostic"`
-	ParentEnvironment               []mappingStartupEnvironment       `json:"parent_environment,omitempty"`
-	ChildEnvironment                []mappingStartupEnvironment       `json:"child_environment,omitempty"`
-	UtilityPreparation              *mappingStartupUtilityPreparation `json:"utility_preparation,omitempty"`
+	Name                            string                      `json:"name"`
+	Kind                            mappingStartupKind          `json:"kind"`
+	Ordinal                         int                         `json:"ordinal"`
+	PriorDiagnosticProcessCreations int                         `json:"prior_diagnostic_process_creations"`
+	Status                          string                      `json:"status"`
+	Error                           string                      `json:"error"`
+	ErrorTruncated                  bool                        `json:"error_truncated"`
+	Diagnostic                      mappingCommandDiagnostic    `json:"diagnostic"`
+	ParentEnvironment               []mappingStartupEnvironment `json:"parent_environment,omitempty"`
+	ChildEnvironment                []mappingStartupEnvironment `json:"child_environment,omitempty"`
+	UtilityPreparation              *mappingUtilityPreparation  `json:"utility_preparation,omitempty"`
 }
 
-type mappingStartupUtilityPreparation struct {
-	Path             string `json:"path"`
-	Size             *int64 `json:"size,omitempty"`
-	ReadBytes        int    `json:"read_bytes"`
-	SHA256           string `json:"sha256"`
-	ElapsedNanos     int64  `json:"elapsed_ns"`
-	CleanupConfirmed bool   `json:"cleanup_confirmed"`
-}
-
-type mappingStartupUtilityFile interface {
-	io.Reader
-	Stat() (os.FileInfo, error)
-	Close() error
-}
-
-type mappingStartupUtilityOps struct {
-	CheckPath   func(string) error
-	Open        func(string) (mappingStartupUtilityFile, error)
-	CommandLine func([]string) string
-}
-
-func prepareMappingStartupUtility(ctx context.Context, moduleRoot, executable string, ops mappingStartupUtilityOps) (script string, facts mappingStartupUtilityPreparation, resultErr error) {
-	started := time.Now()
-	facts.Path = filepath.Join(moduleRoot, "Microsoft.PowerShell.Utility", "Microsoft.PowerShell.Utility.psd1")
-	facts.CleanupConfirmed = true
-	defer func() { facts.ElapsedNanos = time.Since(started).Nanoseconds() }()
-	if err := ctx.Err(); err != nil {
-		return "", facts, err
-	}
-	if !filepath.IsAbs(facts.Path) || strings.HasPrefix(facts.Path, `\\`) {
-		return "", facts, errors.New("Utility manifest must have an absolute local path")
-	}
-	if err := ops.CheckPath(facts.Path); err != nil {
-		return "", facts, errors.Join(err, ctx.Err())
-	}
-	if err := ctx.Err(); err != nil {
-		return "", facts, err
-	}
-	file, err := ops.Open(facts.Path)
-	if file != nil {
-		facts.CleanupConfirmed = false
-		defer func() {
-			closeErr := file.Close()
-			facts.CleanupConfirmed = closeErr == nil
-			resultErr = errors.Join(resultErr, closeErr, ctx.Err())
-			if resultErr != nil {
-				script = ""
-			}
-		}()
-	}
-	if err != nil {
-		return "", facts, errors.Join(err, ctx.Err())
-	}
-	if file == nil {
-		return "", facts, errors.New("Utility manifest open returned no file")
-	}
-	before, err := file.Stat()
-	if err != nil {
-		return "", facts, errors.Join(err, ctx.Err())
-	}
-	size := before.Size()
-	facts.Size = &size
-	if !before.Mode().IsRegular() || size < 0 || size > mappingByteLimit {
-		return "", facts, errors.New("Utility manifest is not a bounded regular file")
-	}
-	if err := ctx.Err(); err != nil {
-		return "", facts, err
-	}
-	data, readErr := io.ReadAll(io.LimitReader(file, mappingByteLimit+1))
-	facts.ReadBytes = len(data)
-	if len(data) > mappingByteLimit {
-		readErr = errors.Join(readErr, errors.New("Utility manifest exceeds 1 MiB"))
-	}
-	if readErr != nil {
-		return "", facts, errors.Join(readErr, ctx.Err())
-	}
-	after, err := file.Stat()
-	if err != nil {
-		return "", facts, errors.Join(err, ctx.Err())
-	}
-	if int64(len(data)) != size || size != after.Size() || before.ModTime() != after.ModTime() {
-		return "", facts, errors.New("Utility manifest changed during inspection")
-	}
-	facts.SHA256 = fmt.Sprintf("%x", sha256.Sum256(data))
-	if err := ctx.Err(); err != nil {
-		return "", facts, err
-	}
-	script, err = mappingStartupImportScript(facts.Path)
-	if err != nil {
-		return "", facts, err
-	}
-	words := utf16.Encode([]rune(script))
-	encoded := make([]byte, len(words)*2)
-	for index, word := range words {
-		binary.LittleEndian.PutUint16(encoded[index*2:], word)
-	}
-	args := []string{executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", base64.StdEncoding.EncodeToString(encoded)}
-	commandLine := ops.CommandLine(args)
-	if strings.IndexByte(commandLine, 0) >= 0 || len(utf16.Encode([]rune(commandLine)))+1 > 32767 {
-		return "", facts, errors.New("Utility diagnostic command line exceeds Windows limit")
-	}
-	return script, facts, ctx.Err()
-}
-
-func prepareMappingStartupCell(ctx context.Context, cell mappingStartupCell, moduleRoot, executable string, ops mappingStartupUtilityOps) (mappingStartupCell, *mappingStartupUtilityPreparation, error) {
+func prepareMappingStartupCell(ctx context.Context, cell mappingStartupCell, moduleRoot, executable string, ops mappingUtilityOps) (mappingStartupCell, *mappingUtilityPreparation, error) {
 	if cell.Kind != mappingStartupImport {
 		return cell, nil, nil
 	}
 	if cell.Script != "" {
 		return cell, nil, errors.New("Utility diagnostic script was prepared before its cell")
 	}
-	script, facts, err := prepareMappingStartupUtility(ctx, moduleRoot, executable, ops)
+	script, facts, err := prepareMappingUtility(ctx, moduleRoot, executable, mappingStartupImportScript, ops)
 	cell.Script = script
 	return cell, &facts, err
 }
@@ -371,6 +265,19 @@ func compareMappingStartupIntent(diagnostic mappingCommandDiagnostic, intent map
 		return errors.New("current inventory request or script differs from produced original facts")
 	}
 	return nil
+}
+
+func observeMappingStartupInventoryIntent(original, current mappingCommandDiagnostic) (*mappingStartupIntent, error) {
+	input, inputErr := mappingStartupObservedPair(current.InputBytes, current.InputSHA256, 4096)
+	script, scriptErr := mappingStartupObservedPair(current.ScriptUTF16Units, current.ScriptSHA256, int(^uint(0)>>1))
+	if err := errors.Join(inputErr, scriptErr); err != nil {
+		return nil, err
+	}
+	if !input || !script {
+		return nil, nil
+	}
+	intent := &mappingStartupIntent{current.InputBytes, current.InputSHA256, current.ScriptUTF16Units, current.ScriptSHA256}
+	return intent, compareMappingStartupIntent(original, *intent)
 }
 
 func readMappingStartupFile(path string, limit int64) ([]byte, error) {
@@ -609,17 +516,12 @@ func TestMappingPowerShellStartupDiagnostic(t *testing.T) {
 		t.Fatal(err)
 	}
 	requestBytes = append(requestBytes, '\n')
-	intent := mappingStartupInventoryIntent(requestBytes, mappingPowerShell)
-	receipt.DiagnosticInventoryIntent = &intent
-	if err := compareMappingStartupIntent(config.initial, intent); err != nil {
-		t.Fatal(err)
-	}
 	processCreations := 0
 	receipt.Aborted = walkMappingStartupCells(func(ordinal int, cell mappingStartupCell) bool {
 		clean := false
 		t.Run(cell.Name, func(t *testing.T) {
 			execution := mappingExecution{Diagnostic: mappingCommandDiagnostic{CleanupConfirmed: true}}
-			var preparation *mappingStartupUtilityPreparation
+			var preparation *mappingUtilityPreparation
 			observed := &mappingStartupObservedPlatform{delegate: native.host, lookup: os.LookupEnv}
 			before, cellErr := currentMappingOwner()
 			if cellErr == nil && before != owner {
@@ -630,26 +532,33 @@ func TestMappingPowerShellStartupDiagnostic(t *testing.T) {
 			}
 			if cellErr == nil {
 				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-				cell, preparation, cellErr = prepareMappingStartupCell(ctx, cell, native.moduleRoot, native.executable, mappingStartupUtilityOps{
-					CheckPath: rejectPrivateReparsePath,
-					Open: func(path string) (mappingStartupUtilityFile, error) {
-						file, err := os.Open(path)
-						if err != nil {
-							return nil, err
-						}
-						return file, nil
-					},
-					CommandLine: windows.ComposeCommandLine,
-				})
-				attempted := cellErr == nil
-				if attempted {
-					execution, cellErr = executeMappingPowerShell(ctx, observed, native.executable, work, native.moduleRoot, request, cell.Script, cell.CloseInput)
-				} else if preparation != nil {
-					execution.Diagnostic.CleanupConfirmed = preparation.CleanupConfirmed
+				attempted := false
+				if cell.Kind == mappingStartupInventory {
+					execution, cellErr = executePreparedMappingPowerShell(ctx, observed, native.executable, work, native.moduleRoot, request, cell.CloseInput, nativeMappingUtilityOps())
+					preparation = execution.Diagnostic.UtilityPreparation
+					attempted = execution.Diagnostic.ScriptUTF16Units > 0
+					intent, intentErr := observeMappingStartupInventoryIntent(config.initial, execution.Diagnostic)
+					if receipt.DiagnosticInventoryIntent == nil && intent != nil {
+						receipt.DiagnosticInventoryIntent = intent
+					}
+					cellErr = errors.Join(cellErr, intentErr)
+					if cellErr == nil && intent == nil {
+						cellErr = errors.New("inventory execution omitted its prepared intent")
+					}
+				} else {
+					cell, preparation, cellErr = prepareMappingStartupCell(ctx, cell, native.moduleRoot, native.executable, nativeMappingUtilityOps())
+					attempted = cellErr == nil
+					if attempted {
+						execution, cellErr = executeMappingPowerShell(ctx, observed, native.executable, work, native.moduleRoot, request, cell.Script, cell.CloseInput)
+					} else if preparation != nil {
+						execution.Diagnostic.CleanupConfirmed = preparation.CleanupConfirmed
+					}
 				}
 				cancel()
 				if attempted {
-					cellErr = errors.Join(cellErr, compareMappingStartupIntent(execution.Diagnostic, mappingStartupInventoryIntent(requestBytes, cell.Script)))
+					if cell.Kind != mappingStartupInventory {
+						cellErr = errors.Join(cellErr, compareMappingStartupIntent(execution.Diagnostic, mappingStartupInventoryIntent(requestBytes, cell.Script)))
+					}
 					prefix, prefixErr := base64.StdEncoding.DecodeString(execution.Diagnostic.Stderr.PrefixBase64)
 					if prefixErr != nil || !strings.HasPrefix(string(prefix), cell.Entry+"\r\n") && !strings.HasPrefix(string(prefix), cell.Entry+"\n") {
 						cellErr = errors.Join(cellErr, prefixErr, errors.New("cell entry marker was not captured"))
@@ -708,7 +617,15 @@ func mappingStartupAssertionJSON(t *testing.T, value any) json.RawMessage {
 }
 
 func mappingStartupAssertionDiagnostic() mappingCommandDiagnostic {
-	intent := mappingStartupInventoryIntent([]byte("{\"action\":\"inventory\"}\n"), mappingPowerShell)
+	path := "/fixture/modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1"
+	if filepath.Separator == '\\' {
+		path = `C:\fixture\modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1`
+	}
+	script, err := mappingPowerShellScript(path)
+	if err != nil {
+		panic(err)
+	}
+	intent := mappingStartupInventoryIntent([]byte("{\"action\":\"inventory\"}\n"), script)
 	return mappingCommandDiagnostic{
 		Action: "inventory", InputBytes: intent.InputBytes, InputSHA256: intent.InputSHA256,
 		ScriptUTF16Units: intent.ScriptUTF16Units, ScriptSHA256: intent.ScriptSHA256,
@@ -841,11 +758,13 @@ func assertMappingStartupAdmission(t *testing.T) {
 
 func assertMappingStartupIntent(t *testing.T) {
 	t.Helper()
-	request := []byte("{\"action\":\"inventory\"}\n")
-	intent := mappingStartupInventoryIntent(request, mappingPowerShell)
 	diagnostic := mappingStartupAssertionDiagnostic()
+	intent := mappingStartupIntent{diagnostic.InputBytes, diagnostic.InputSHA256, diagnostic.ScriptUTF16Units, diagnostic.ScriptSHA256}
 	if err := compareMappingStartupIntent(diagnostic, intent); err != nil {
 		t.Fatal(err)
+	}
+	if observed, err := observeMappingStartupInventoryIntent(diagnostic, diagnostic); err != nil || observed == nil || *observed != intent {
+		t.Fatalf("produced prepared intent was not preserved: %+v %v", observed, err)
 	}
 	for _, change := range []func(*mappingCommandDiagnostic){
 		func(d *mappingCommandDiagnostic) { d.InputBytes++ },
@@ -857,6 +776,9 @@ func assertMappingStartupIntent(t *testing.T) {
 		change(&other)
 		if err := compareMappingStartupIntent(other, intent); err == nil {
 			t.Fatal("produced request/script mismatch admitted")
+		}
+		if observed, err := observeMappingStartupInventoryIntent(diagnostic, other); err == nil || observed == nil {
+			t.Fatal("current inventory substituted a mismatching prepared script or input")
 		}
 	}
 	for _, unavailable := range []string{"input", "script", "both"} {
@@ -871,6 +793,14 @@ func assertMappingStartupIntent(t *testing.T) {
 		if err := compareMappingStartupIntent(other, intent); err != nil || !reflect.DeepEqual(before, other) {
 			t.Fatalf("unavailable %s was rejected or replaced: %v", unavailable, err)
 		}
+		if observed, err := observeMappingStartupInventoryIntent(diagnostic, other); err != nil || observed != nil || !reflect.DeepEqual(before, other) {
+			t.Fatalf("unavailable current %s invented inventory intent: %+v %v", unavailable, observed, err)
+		}
+	}
+	malformed := diagnostic
+	malformed.ScriptSHA256 = ""
+	if observed, err := observeMappingStartupInventoryIntent(diagnostic, malformed); err == nil || observed != nil {
+		t.Fatal("incomplete current script observation was accepted")
 	}
 	unicodeIntent := mappingStartupInventoryIntent([]byte("x\n"), "𝄞")
 	if unicodeIntent.ScriptUTF16Units != 2 || unicodeIntent.ScriptSHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte{0x34, 0xd8, 0x1e, 0xdd})) {
@@ -1040,7 +970,7 @@ func assertMappingStartupUtilityPreparation(t *testing.T) {
 	}
 	checks, opens, commands := 0, 0, 0
 	file := newFile()
-	ops := mappingStartupUtilityOps{
+	ops := mappingUtilityOps{
 		CheckPath: func(path string) error {
 			checks++
 			if path != wantPath {
@@ -1048,7 +978,7 @@ func assertMappingStartupUtilityPreparation(t *testing.T) {
 			}
 			return nil
 		},
-		Open: func(path string) (mappingStartupUtilityFile, error) {
+		Open: func(path string) (mappingUtilityFile, error) {
 			opens++
 			if path != wantPath {
 				t.Fatal("unexpected Utility open")
@@ -1092,51 +1022,51 @@ func assertMappingStartupUtilityPreparation(t *testing.T) {
 	pathError, openError, statError, readError, closeError := errors.New("path-check"), errors.New("open"), errors.New("stat"), errors.New("read"), errors.New("close")
 	for _, test := range []struct {
 		name       string
-		configure  func(*mappingStartupUtilityOps, *mappingStartupUtilityAssertionFile)
+		configure  func(*mappingUtilityOps, *mappingStartupUtilityAssertionFile)
 		want       []error
 		wantClosed int
 		clean      bool
 	}{
-		{"path", func(o *mappingStartupUtilityOps, f *mappingStartupUtilityAssertionFile) {
+		{"path", func(o *mappingUtilityOps, f *mappingStartupUtilityAssertionFile) {
 			o.CheckPath = func(string) error { return pathError }
 		}, []error{pathError}, 0, true},
-		{"open", func(o *mappingStartupUtilityOps, f *mappingStartupUtilityAssertionFile) {
-			o.Open = func(string) (mappingStartupUtilityFile, error) { return nil, openError }
+		{"open", func(o *mappingUtilityOps, f *mappingStartupUtilityAssertionFile) {
+			o.Open = func(string) (mappingUtilityFile, error) { return nil, openError }
 		}, []error{openError}, 0, true},
-		{"open-with-handle", func(o *mappingStartupUtilityOps, f *mappingStartupUtilityAssertionFile) {
-			o.Open = func(string) (mappingStartupUtilityFile, error) { return f, openError }
+		{"open-with-handle", func(o *mappingUtilityOps, f *mappingStartupUtilityAssertionFile) {
+			o.Open = func(string) (mappingUtilityFile, error) { return f, openError }
 			f.closeErr = closeError
 		}, []error{openError, closeError}, 1, false},
-		{"stat", func(o *mappingStartupUtilityOps, f *mappingStartupUtilityAssertionFile) { f.statErr = statError }, []error{statError}, 1, true},
-		{"read-close", func(o *mappingStartupUtilityOps, f *mappingStartupUtilityAssertionFile) {
+		{"stat", func(o *mappingUtilityOps, f *mappingStartupUtilityAssertionFile) { f.statErr = statError }, []error{statError}, 1, true},
+		{"read-close", func(o *mappingUtilityOps, f *mappingStartupUtilityAssertionFile) {
 			f.reader = mappingStartupUtilityAssertionReader(func([]byte) (int, error) { return 0, readError })
 			f.closeErr = closeError
 		}, []error{readError, closeError}, 1, false},
-		{"close", func(o *mappingStartupUtilityOps, f *mappingStartupUtilityAssertionFile) { f.closeErr = closeError }, []error{closeError}, 1, false},
-		{"directory", func(o *mappingStartupUtilityOps, f *mappingStartupUtilityAssertionFile) {
+		{"close", func(o *mappingUtilityOps, f *mappingStartupUtilityAssertionFile) { f.closeErr = closeError }, []error{closeError}, 1, false},
+		{"directory", func(o *mappingUtilityOps, f *mappingStartupUtilityAssertionFile) {
 			f.info = mappingStartupUtilityAssertionInfo{mode: os.ModeDir}
 		}, nil, 1, true},
-		{"oversized-stat", func(o *mappingStartupUtilityOps, f *mappingStartupUtilityAssertionFile) {
+		{"oversized-stat", func(o *mappingUtilityOps, f *mappingStartupUtilityAssertionFile) {
 			f.info = mappingStartupUtilityAssertionInfo{size: mappingByteLimit + 1}
 		}, nil, 1, true},
-		{"oversized-read", func(o *mappingStartupUtilityOps, f *mappingStartupUtilityAssertionFile) {
+		{"oversized-read", func(o *mappingUtilityOps, f *mappingStartupUtilityAssertionFile) {
 			f.reader = strings.NewReader(strings.Repeat("x", mappingByteLimit+1))
 		}, nil, 1, true},
-		{"size-changed", func(o *mappingStartupUtilityOps, f *mappingStartupUtilityAssertionFile) {
+		{"size-changed", func(o *mappingUtilityOps, f *mappingStartupUtilityAssertionFile) {
 			f.info = mappingStartupUtilityAssertionInfo{size: 1}
 		}, nil, 1, true},
-		{"commandline", func(o *mappingStartupUtilityOps, f *mappingStartupUtilityAssertionFile) {
+		{"commandline", func(o *mappingUtilityOps, f *mappingStartupUtilityAssertionFile) {
 			o.CommandLine = func([]string) string { return strings.Repeat("x", 32767) }
 		}, nil, 1, true},
-		{"commandline-NUL", func(o *mappingStartupUtilityOps, f *mappingStartupUtilityAssertionFile) {
+		{"commandline-NUL", func(o *mappingUtilityOps, f *mappingStartupUtilityAssertionFile) {
 			o.CommandLine = func([]string) string { return "bad\x00command" }
 		}, nil, 1, true},
 	} {
 		file := newFile()
 		local := ops
-		local.Open = func(string) (mappingStartupUtilityFile, error) { return file, nil }
+		local.Open = func(string) (mappingUtilityFile, error) { return file, nil }
 		test.configure(&local, file)
-		script, facts, err := prepareMappingStartupUtility(context.Background(), moduleRoot, executable, local)
+		script, facts, err := prepareMappingUtility(context.Background(), moduleRoot, executable, mappingStartupImportScript, local)
 		if err == nil || script != "" || facts.CleanupConfirmed != test.clean || file.closes != test.wantClosed {
 			t.Fatalf("%s hid preparation/cleanup failure: %+v %v", test.name, facts, err)
 		}
@@ -1150,7 +1080,7 @@ func assertMappingStartupUtilityPreparation(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 		defer cancel()
 		beforeChecks := checks
-		if script, facts, err := prepareMappingStartupUtility(ctx, moduleRoot, executable, ops); script != "" || !errors.Is(err, context.DeadlineExceeded) || !facts.CleanupConfirmed || checks != beforeChecks {
+		if script, facts, err := prepareMappingUtility(ctx, moduleRoot, executable, mappingStartupImportScript, ops); script != "" || !errors.Is(err, context.DeadlineExceeded) || !facts.CleanupConfirmed || checks != beforeChecks {
 			t.Fatal("expired original deadline admitted preparation")
 		}
 	}
@@ -1159,11 +1089,11 @@ func assertMappingStartupUtilityPreparation(t *testing.T) {
 		defer cancel()
 		local := ops
 		local.CheckPath = func(string) error { cancel(); return nil }
-		local.Open = func(string) (mappingStartupUtilityFile, error) {
+		local.Open = func(string) (mappingUtilityFile, error) {
 			t.Fatal("canceled preparation opened a file")
 			return nil, nil
 		}
-		if script, facts, err := prepareMappingStartupUtility(ctx, moduleRoot, executable, local); script != "" || !errors.Is(err, context.Canceled) || !facts.CleanupConfirmed {
+		if script, facts, err := prepareMappingUtility(ctx, moduleRoot, executable, mappingStartupImportScript, local); script != "" || !errors.Is(err, context.Canceled) || !facts.CleanupConfirmed {
 			t.Fatal("path check restarted the supplied context")
 		}
 	}
@@ -1172,9 +1102,9 @@ func assertMappingStartupUtilityPreparation(t *testing.T) {
 		defer cancel()
 		local := ops
 		file := newFile()
-		local.Open = func(string) (mappingStartupUtilityFile, error) { return file, nil }
+		local.Open = func(string) (mappingUtilityFile, error) { return file, nil }
 		local.CommandLine = func([]string) string { cancel(); return "bounded" }
-		if script, facts, err := prepareMappingStartupUtility(ctx, moduleRoot, executable, local); script != "" || !errors.Is(err, context.Canceled) || !facts.CleanupConfirmed || file.closes != 1 {
+		if script, facts, err := prepareMappingUtility(ctx, moduleRoot, executable, mappingStartupImportScript, local); script != "" || !errors.Is(err, context.Canceled) || !facts.CleanupConfirmed || file.closes != 1 {
 			t.Fatal("late cancellation restarted the supplied context or leaked the file")
 		}
 	}
@@ -1183,6 +1113,8 @@ func assertMappingStartupUtilityPreparation(t *testing.T) {
 func assertMappingStartupReceiptBounds(t *testing.T) {
 	t.Helper()
 	diagnostic := mappingStartupAssertionDiagnostic()
+	manifestSize := int64(mappingByteLimit)
+	diagnostic.UtilityPreparation = &mappingUtilityPreparation{Path: strings.Repeat("u", 1024), Size: &manifestSize, ReadBytes: mappingByteLimit, SHA256: strings.Repeat("a", 64), ElapsedNanos: int64(^uint64(0) >> 1), CleanupConfirmed: true}
 	diagnostic.Stdout = mappingStartupAssertionCapture([]byte(strings.Repeat("o", 2048)), 4096)
 	diagnostic.Stderr = mappingStartupAssertionCapture([]byte(strings.Repeat("e", 2048)), 4096)
 	diagnostic.WriteError, diagnostic.EOFError, diagnostic.CleanupError = strings.Repeat("w", 512), strings.Repeat("f", 512), strings.Repeat("c", 512)
@@ -1244,6 +1176,9 @@ func assertMappingStartupReceiptBounds(t *testing.T) {
 		entry.Diagnostic.PreCleanupResult = &processError
 		stage := &windowsLaunchCall{Returned: true, Error: escape(512)}
 		entry.Diagnostic.Launch = &windowsLaunchFacts{RequestedImage: escape(1024), ActualImage: escape(1024), CreateProcess: stage, AssignJob: stage, QueryImage: stage, QueryMachine: stage, ResumeThread: stage}
+		preparation := *entry.Diagnostic.UtilityPreparation
+		preparation.Path = escape(1024)
+		entry.Diagnostic.UtilityPreparation = &preparation
 	}
 	if data, err := encodeMappingStartupReceipt(escaped); err != nil || len(data) > 1<<20 {
 		t.Fatalf("six-cell escape-heavy fixture did not fit: bytes=%d error=%v", len(data), err)

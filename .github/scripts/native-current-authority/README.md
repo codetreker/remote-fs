@@ -204,20 +204,21 @@ mismatch. Recovery preserves the original failed result. Ordinary success closes
 the native HANDLE, removes the mapping, calls Shutdown, joins Serve, Unpublishes
 the export, closes idle HTTP connections and verifies remote/local cleanup.
 
-[The source-bound run 35449538972](https://github.com/codetreker/remote-fs/actions/runs/35449538972)
-on `a5ad2d9dfc8f6a9fbcde84fa30e7ee0fc1d56368` completed the new script
-observations natively. Its child ReadLine had 218 UTF-16 units/UTF-8 bytes and the
-same no-LF SHA256 as the parent. The complete effective module path contained
-AllUsers and System32 Windows PowerShell roots; WinPSModulePath was null and the
-cache path NUL. Original and inventory controls emitted the same complete
-761-byte record ending before-json, with no catch/failure/after-json marker.
+[The source-bound run 35454012237](https://github.com/codetreker/remote-fs/actions/runs/35454012237)
+on `7bef4859bc1cbde96bc2b97cf79d018f94fcf228` retained the original inventory
+failure at 4009 ms. Its exact-name Get-Command control also timed out at 4018 ms
+before resolution returned. The separately labeled explicit Utility import and
+unchanged JSON pipeline control passed in 1437 ms, including about 19 ms of
+manifest preparation within the same four-second context, with nonforced cleanup.
+This supports the explicit-import route without isolating the sole timeout cause;
+the controls ran later under different load and warming conditions.
 
-The original inventory still failed at 4010 ms. Post-VM entry controls passed in
-234/178 ms; inventory controls failed in 4020/4019 ms. The 32,165-byte nested
-report and confirmed cleanup do not change that failure. The earlier native
-private-writer and Go-child environment proof remains valid, while command
-discovery/autoload, binding, execution and assignment remain unresolved. No
-current-SMB mapping, cold object or one-second cache acceptance has passed.
+Earlier source-bound observations established the matching child/parent no-LF
+input and complete effective module-path facts. The prior DACL and Go-child
+environment proofs remain valid. None of those results passes the failed original
+cold attempt. The repaired original path described below has not run natively;
+current-SMB mapping, cold object access and one-second cache acceptance remain
+unproved.
 
 Mapping failures retain a bounded diagnostic after the owned child is finished
 and all three I/O workers join. It records action, actual PID when available,
@@ -249,13 +250,39 @@ work from the existing operation markers; request text, full environment values
 and additional exception messages are not emitted.
 
 The maximum-branch formatter projection, including existing markers and CRLF,
-is bounded at 1981 bytes within the existing 2048-byte captured prefix. PowerShell's own extra error
+is bounded at 2040 bytes with the Utility markers, within the existing 2048-byte
+captured prefix. PowerShell's own extra error
 output may still be truncated. Observer work consumes the same four seconds;
 framework initialization and console writes have no separate latency guarantee.
-The original mapping script keeps its operations, imports, environment policy and
-stdin/owner behavior. Its observation statements add no discovery or prewarming
-call; the separately labeled post-failure controls below perform those additional
-operations only after the measured attempt.
+The mapping script retains the JSON pipeline, SmbShare import, mapping operations,
+environment and stdin/owner behavior. The explicit Utility import is described
+above; its observers add no discovery or prewarming call.
+
+Ordinary mapping commands and diagnostic inventory cells share one prepared
+execution path. Within their existing four-second context, it verifies the fixed
+System32 Utility manifest using non-reparse/regular-file checks and a bounded
+1 MiB read, preserving stat/read/hash/close errors. It does not prepare Utility
+in backend construction or start a fresh deadline before launch. The verified
+absolute path is embedded as a base64 literal in the mapping script.
+
+After the existing input/environment observations, Core-qualified Import-Module
+loads that manifest before before-json and the unchanged JSON pipeline. Successful
+import output is suppressed so stdout keeps its existing result. Fixed before-utility
+and after-utility markers expose this operation; the conservative mapping formatter
+projection becomes 2040 bytes within the unchanged 2048-byte prefix. No Force,
+Get-Command, extra process, prewarming, retry or import-by-name fallback is used.
+SmbShare import, mapping operations, input/EOF policies, environment and owner remain
+unchanged. This makes Utility available in the same process; it does not replace
+the JSON parser or establish native acceptance.
+
+Optional preparation facts describe the on-disk path, size/read count, digest,
+duration and checked cleanup, not loaded dependency bytes or code identity. A
+preparation failure has no invented PID, launch, input/script or worker facts.
+File cleanup and process cleanup are combined truthfully: a failed Close cannot
+be confirmed clean merely because no child started. Import failure retains the
+saved ErrorRecord and original failure path. The same four-second deadline covers
+preparation, startup, import and the command; synchronous work has no new latency
+guarantee.
 
 The Windows owner records CreateProcess, Job assignment and ResumeThread timings
 and errors. ResumeThread must return the previous suspend count 1. The retained
@@ -276,8 +303,10 @@ when present, must match; unavailable facts remain unavailable. Manifest keys ar
 strict POSIX-relative paths produced on both platforms, with exact hashes and no
 separator fallback. The tagged test is absent from normal unit and production
 catalogs. Six sequential cells each run once, with an explicit kind and expected
-result. The first four scripts, names, order and EOF policies are unchanged:
-entry/open, entry/EOF, inventory/open and inventory/EOF. The added cells are:
+result. Entry cells 1–2 and controls 5–6 retain their scripts and input policies.
+Inventory cells 3–4 use the same repaired prepared executor as ordinary mapping,
+with their existing open/EOF policies and newly bound script hashes. Controls 5–6
+are:
 
 - `05_resolve_json_command`: Core-qualified Get-Command selects the exact
   ConvertFrom-Json name without All or a command-type filter. It requires one
@@ -294,9 +323,10 @@ entry/open, entry/EOF, inventory/open and inventory/EOF. The added cells are:
 
 Cell 6's same four-second deadline begins before manifest preparation. Existing
 non-reparse/regular-file checks and a bounded 1 MiB read record its on-disk size
-and SHA256, with read/close errors retained. It is prepared only at that ordinal;
-missing or invalid Utility cannot block the cold attempt or cells 1–5. Synchronous
-file calls are not claimed interruptible. A known no-process preparation failure
+and SHA256, with read/close errors retained. Cell 6 still prepares its own diagnostic script only at that ordinal; entry and
+resolution cells do not require this file. Ordinary mapping and inventory cells
+perform their own shared preparation. Synchronous file calls are not claimed
+interruptible. A known no-process preparation failure
 has no invented PID; unknown cleanup stops admission. No fallback script or import
 by name is used.
 
@@ -312,7 +342,8 @@ within the unchanged 2048-byte prefix; engine output may still be truncated.
 EOF in the original EOF cells follows one complete successful write and is closed
 once by the same owner used by Finish. Short writes and close errors fail. Every
 cell retains the four-second command budget and existing owned cleanup; successful
-later controls cannot erase earlier failures. The two new native cells have not run.
+later controls cannot erase earlier failures. Cell 5 timed out and cell 6 passed
+in the source-bound run above; neither result validates the repaired cold path.
 
 Mapping PowerShell children use an explicit Unicode environment block through
 the existing process owner. A private snapshot removes case-insensitive copies

@@ -484,6 +484,64 @@ type mappingInputBuffer struct {
 
 func (b *mappingInputBuffer) Close() error { b.closes++; return nil }
 
+type mappingUtilityTestInfo struct {
+	size     int64
+	mode     os.FileMode
+	modified time.Time
+}
+
+func (i mappingUtilityTestInfo) Name() string       { return "Microsoft.PowerShell.Utility.psd1" }
+func (i mappingUtilityTestInfo) Size() int64        { return i.size }
+func (i mappingUtilityTestInfo) Mode() os.FileMode  { return i.mode }
+func (i mappingUtilityTestInfo) ModTime() time.Time { return i.modified }
+func (i mappingUtilityTestInfo) IsDir() bool        { return i.mode.IsDir() }
+func (i mappingUtilityTestInfo) Sys() any           { return nil }
+
+type mappingUtilityTestFile struct {
+	reader                          io.Reader
+	info, afterInfo                 os.FileInfo
+	statErr, afterStatErr, closeErr error
+	statCalls, closes               int
+	onClose                         func()
+}
+
+func (f *mappingUtilityTestFile) Read(data []byte) (int, error) { return f.reader.Read(data) }
+func (f *mappingUtilityTestFile) Stat() (os.FileInfo, error) {
+	f.statCalls++
+	if f.statCalls > 1 && (f.afterInfo != nil || f.afterStatErr != nil) {
+		return f.afterInfo, f.afterStatErr
+	}
+	return f.info, f.statErr
+}
+func (f *mappingUtilityTestFile) Close() error {
+	f.closes++
+	if f.onClose != nil {
+		f.onClose()
+	}
+	return f.closeErr
+}
+
+type mappingUtilityTestReader func([]byte) (int, error)
+
+func (r mappingUtilityTestReader) Read(data []byte) (int, error) { return r(data) }
+
+const mappingUtilityTestData = "verified Utility manifest bytes"
+
+func mappingUtilityRootForTest(t *testing.T) string {
+	t.Helper()
+	return mappingStartupManifestForTest(t, "modules")
+}
+
+func mappingUtilityOpsForTest() mappingUtilityOps {
+	return mappingUtilityOps{
+		CheckPath: func(string) error { return nil },
+		Open: func(string) (mappingUtilityFile, error) {
+			return &mappingUtilityTestFile{reader: strings.NewReader(mappingUtilityTestData), info: mappingUtilityTestInfo{size: int64(len(mappingUtilityTestData))}}, nil
+		},
+		CommandLine: func(args []string) string { return strings.Join(args, " ") },
+	}
+}
+
 type mappingCommandChild struct {
 	input          *mappingInputBuffer
 	inputOverride  io.WriteCloser
@@ -532,11 +590,15 @@ type mappingCommandHost struct {
 	environment        []string
 	startErr           error
 	returnChildOnError bool
+	onStart            func()
 }
 
 func (h *mappingCommandHost) Preflight() (map[string]any, error) { return nil, nil }
 func (h *mappingCommandHost) StartWithEnvironment(_ string, args []string, _ string, environment []string) (child, error) {
 	h.starts++
+	if h.onStart != nil {
+		h.onStart()
+	}
 	h.args = append([]string(nil), args...)
 	h.environment = append([]string(nil), environment...)
 	h.cache, _ = mappingEnvironmentLookup(environment, "PSModuleAnalysisCachePath")
@@ -547,6 +609,279 @@ func (h *mappingCommandHost) StartWithEnvironment(_ string, args []string, _ str
 		return nil, h.startErr
 	}
 	return h.child, nil
+}
+
+func TestMappingUtilityPreparationFailureRefusesLaunch(t *testing.T) {
+	pathFailure, statFailure, readFailure, closeFailure := errors.New("reparse ancestor"), errors.New("stat failed"), errors.New("read failed"), errors.New("close failed")
+	for _, test := range []struct {
+		name      string
+		configure func(*mappingUtilityOps, *mappingUtilityTestFile)
+		causes    []error
+		closes    int
+		clean     bool
+	}{
+		{"missing", func(o *mappingUtilityOps, _ *mappingUtilityTestFile) {
+			o.Open = func(string) (mappingUtilityFile, error) { return nil, os.ErrNotExist }
+		}, []error{os.ErrNotExist}, 0, true},
+		{"reparse", func(o *mappingUtilityOps, _ *mappingUtilityTestFile) {
+			o.CheckPath = func(string) error { return pathFailure }
+		}, []error{pathFailure}, 0, true},
+		{"open-with-handle", func(o *mappingUtilityOps, f *mappingUtilityTestFile) {
+			o.Open = func(string) (mappingUtilityFile, error) { return f, os.ErrPermission }
+			f.closeErr = closeFailure
+		}, []error{os.ErrPermission, closeFailure}, 1, false},
+		{"no-handle", func(o *mappingUtilityOps, _ *mappingUtilityTestFile) {
+			o.Open = func(string) (mappingUtilityFile, error) { return nil, nil }
+		}, nil, 0, true},
+		{"stat", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) { f.statErr = statFailure }, []error{statFailure}, 1, true},
+		{"second-stat", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) { f.afterStatErr = statFailure }, []error{statFailure}, 1, true},
+		{"read-and-close", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) {
+			f.reader = mappingUtilityTestReader(func([]byte) (int, error) { return 0, readFailure })
+			f.closeErr = closeFailure
+		}, []error{readFailure, closeFailure}, 1, false},
+		{"close", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) { f.closeErr = closeFailure }, []error{closeFailure}, 1, false},
+		{"directory", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) {
+			f.info = mappingUtilityTestInfo{mode: os.ModeDir}
+		}, nil, 1, true},
+		{"nonregular", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) {
+			f.info = mappingUtilityTestInfo{mode: os.ModeSymlink}
+		}, nil, 1, true},
+		{"negative-size", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) { f.info = mappingUtilityTestInfo{size: -1} }, nil, 1, true},
+		{"oversized-stat", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) {
+			f.info = mappingUtilityTestInfo{size: mappingByteLimit + 1}
+		}, nil, 1, true},
+		{"oversized-read", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) {
+			f.reader = strings.NewReader(strings.Repeat("x", mappingByteLimit+1))
+		}, nil, 1, true},
+		{"size-changed", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) { f.afterInfo = mappingUtilityTestInfo{size: 1} }, nil, 1, true},
+		{"mtime-changed", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) {
+			f.afterInfo = mappingUtilityTestInfo{size: int64(len(mappingUtilityTestData)), modified: time.Unix(1, 0)}
+		}, nil, 1, true},
+		{"commandline-too-long", func(o *mappingUtilityOps, _ *mappingUtilityTestFile) {
+			o.CommandLine = func([]string) string { return strings.Repeat("x", 32767) }
+		}, nil, 1, true},
+		{"commandline-nul", func(o *mappingUtilityOps, _ *mappingUtilityTestFile) {
+			o.CommandLine = func([]string) string { return "invalid\x00command" }
+		}, nil, 1, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			file := &mappingUtilityTestFile{reader: strings.NewReader(mappingUtilityTestData), info: mappingUtilityTestInfo{size: int64(len(mappingUtilityTestData))}}
+			ops := mappingUtilityOpsForTest()
+			ops.Open = func(string) (mappingUtilityFile, error) { return file, nil }
+			test.configure(&ops, file)
+			host := &mappingCommandHost{startErr: errors.New("unexpected child launch")}
+			execution, err := executePreparedMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory"}, true, ops)
+			d := execution.Diagnostic
+			if err == nil || host.starts != 0 || d.UtilityPreparation == nil || d.CleanupConfirmed != test.clean || d.UtilityPreparation.CleanupConfirmed != test.clean || file.closes != test.closes {
+				t.Fatalf("preparation failure escaped launch/cleanup ownership: starts=%d closes=%d facts=%+v error=%v", host.starts, file.closes, d.UtilityPreparation, err)
+			}
+			if d.Action != "inventory" || !d.EOFRequested || d.PID != nil || d.Launch != nil || d.WorkersStarted != 0 || d.WorkersJoined != 0 ||
+				d.InputBytes != 0 || d.InputSHA256 != "" || d.InputLineBytes != 0 || d.InputLineSHA256 != "" || d.ScriptUTF16Units != 0 || d.ScriptSHA256 != "" || d.WriteStarted {
+				t.Fatal("failed preparation fabricated process, input or script observations")
+			}
+			for _, cause := range test.causes {
+				if !errors.Is(err, cause) {
+					t.Fatalf("preparation lost its cause: %v", err)
+				}
+			}
+			if len(test.causes) > 1 && !strings.HasPrefix(err.Error(), test.causes[0].Error()) {
+				t.Fatal("cleanup error replaced the first preparation error")
+			}
+		})
+	}
+}
+
+func TestMappingPreparedExecutionKeepsOriginalDeadline(t *testing.T) {
+	for _, phase := range []string{"before", "path", "open", "read", "commandline", "close"} {
+		t.Run(phase, func(t *testing.T) {
+			base, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			ctx := mappingTestDeadline{Context: base}
+			deadline, _ := ctx.Deadline()
+			if phase == "before" {
+				cancel()
+			}
+			checks, opens := 0, 0
+			reader := strings.NewReader(mappingUtilityTestData)
+			file := &mappingUtilityTestFile{reader: reader, info: mappingUtilityTestInfo{size: int64(len(mappingUtilityTestData))}}
+			file.reader = mappingUtilityTestReader(func(data []byte) (int, error) {
+				if phase == "read" {
+					cancel()
+				}
+				return reader.Read(data)
+			})
+			file.onClose = func() {
+				if phase == "close" {
+					cancel()
+				}
+			}
+			ops := mappingUtilityOpsForTest()
+			ops.CheckPath = func(string) error {
+				checks++
+				if phase == "path" {
+					cancel()
+				}
+				return nil
+			}
+			ops.Open = func(string) (mappingUtilityFile, error) {
+				opens++
+				if phase == "open" {
+					cancel()
+				}
+				return file, nil
+			}
+			ops.CommandLine = func(args []string) string {
+				if phase == "commandline" {
+					cancel()
+				}
+				return strings.Join(args, " ")
+			}
+			host := &mappingCommandHost{startErr: errors.New("expired preparation launched a child")}
+			execution, err := executePreparedMappingPowerShell(ctx, host, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory"}, false, ops)
+			remainingDeadline, _ := ctx.Deadline()
+			if !errors.Is(err, context.DeadlineExceeded) || host.starts != 0 || !remainingDeadline.Equal(deadline) || execution.Diagnostic.UtilityPreparation == nil || !execution.Diagnostic.CleanupConfirmed {
+				t.Fatalf("preparation restarted or lost its original budget: starts=%d error=%v", host.starts, err)
+			}
+			if phase == "before" && checks != 0 || (phase == "before" || phase == "path") && opens != 0 || file.closes != opens {
+				t.Fatal("expired preparation performed later work or leaked an opened file")
+			}
+		})
+	}
+}
+
+func mappingScriptFromArgumentsForTest(t *testing.T, args []string) string {
+	t.Helper()
+	if len(args) != 7 || !reflect.DeepEqual(args[:6], []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand"}) {
+		t.Fatal("prepared mapping changed PowerShell invocation flags")
+	}
+	data, err := base64.StdEncoding.DecodeString(args[6])
+	if err != nil || len(data)%2 != 0 {
+		t.Fatal("prepared mapping command is not UTF-16LE base64")
+	}
+	words := make([]uint16, len(data)/2)
+	for index := range words {
+		words[index] = binary.LittleEndian.Uint16(data[2*index:])
+	}
+	return string(utf16.Decode(words))
+}
+
+func TestMappingPreparedNormalAndInventoryUseSameScript(t *testing.T) {
+	request := mappingCommandRequest{Action: "inventory", Module: "SmbShare.psd1", OwnerSID: mappingBaselineForTest().Owner.SID}
+	reply, err := json.Marshal(mappingCommandResult{Status: "ok", OwnerSID: request.OwnerSID, Rows: []mappingRow{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := mappingUtilityRootForTest(t)
+	wantPath := filepath.Join(root, "Microsoft.PowerShell.Utility", "Microsoft.PowerShell.Utility.psd1")
+	wantScript, err := mappingPowerShellScript(wantPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var scripts, frames []string
+	for _, mode := range []string{"normal", "inventory-open", "inventory-eof"} {
+		t.Run(mode, func(t *testing.T) {
+			var order []string
+			file := &mappingUtilityTestFile{reader: strings.NewReader(mappingUtilityTestData), info: mappingUtilityTestInfo{size: int64(len(mappingUtilityTestData))}, onClose: func() { order = append(order, "close") }}
+			ops := mappingUtilityOpsForTest()
+			ops.CheckPath = func(path string) error {
+				order = append(order, "check")
+				if path != wantPath {
+					t.Fatal("preparation selected a different manifest")
+				}
+				return nil
+			}
+			ops.Open = func(path string) (mappingUtilityFile, error) {
+				order = append(order, "open")
+				if path != wantPath {
+					t.Fatal("preparation opened a different manifest")
+				}
+				return file, nil
+			}
+			ops.CommandLine = func(args []string) string {
+				order = append(order, "commandline")
+				if args[0] != "system-powershell" || mappingScriptFromArgumentsForTest(t, args[1:]) != wantScript {
+					t.Fatal("command-line validation did not bind the generated mapping script")
+				}
+				return strings.Join(args, " ")
+			}
+			process := mappingReplyChild(string(reply))
+			process.inputOverride = &ownedProcessInput{pipe: process.input}
+			host := &mappingCommandHost{child: process, onStart: func() {
+				order = append(order, "start")
+				if file.closes != 1 {
+					t.Fatal("child started before checked manifest closure")
+				}
+			}}
+			if mode == "normal" {
+				result, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", root, request, ops)
+				if err != nil || result.Status != "ok" {
+					t.Fatalf("normal prepared mapping failed: %v", err)
+				}
+			} else {
+				execution, err := executePreparedMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", root, request, mode == "inventory-eof", ops)
+				facts := execution.Diagnostic.UtilityPreparation
+				if err != nil || facts == nil || facts.Path != wantPath || facts.Size == nil || *facts.Size != int64(len(mappingUtilityTestData)) || facts.ReadBytes != len(mappingUtilityTestData) || facts.SHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(mappingUtilityTestData))) || facts.ElapsedNanos < 0 || !facts.CleanupConfirmed || !execution.Diagnostic.CleanupConfirmed {
+					t.Fatalf("inventory lost prepared execution facts: %+v %v", facts, err)
+				}
+			}
+			if !reflect.DeepEqual(order, []string{"check", "open", "commandline", "close", "start"}) || file.statCalls != 2 || file.closes != 1 || host.starts != 1 || process.finished != 1 || process.input.closes != 1 {
+				t.Fatalf("prepared execution ordering changed: %v", order)
+			}
+			scripts = append(scripts, mappingScriptFromArgumentsForTest(t, host.args))
+			frames = append(frames, process.input.String())
+		})
+	}
+	for index := range scripts {
+		if scripts[index] != wantScript || frames[index] != frames[0] {
+			t.Fatal("normal mapping and diagnostic inventories used different scripts or input")
+		}
+	}
+}
+
+func TestMappingPreparedFailuresRetainUtilityFactsAndErrorChains(t *testing.T) {
+	request := mappingCommandRequest{Action: "inventory", OwnerSID: mappingBaselineForTest().Owner.SID}
+	reply, err := json.Marshal(mappingCommandResult{Status: "ok", OwnerSID: request.OwnerSID, Rows: []mappingRow{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{"preparation", "launch", "child", "cleanup"} {
+		t.Run(phase, func(t *testing.T) {
+			failure, closeFailure := errors.New("original phase failure"), errors.New("manifest close failure")
+			file := &mappingUtilityTestFile{reader: strings.NewReader(mappingUtilityTestData), info: mappingUtilityTestInfo{size: int64(len(mappingUtilityTestData))}}
+			ops := mappingUtilityOpsForTest()
+			ops.Open = func(string) (mappingUtilityFile, error) { return file, nil }
+			process := mappingReplyChild(string(reply))
+			host := &mappingCommandHost{child: process}
+			switch phase {
+			case "preparation":
+				file.reader = mappingUtilityTestReader(func([]byte) (int, error) { return 0, failure })
+				file.closeErr = closeFailure
+			case "launch":
+				host.startErr = &windowsLaunchError{Facts: windowsLaunchFacts{RequestedImage: "system-powershell", CleanupConfirmed: true}, Cause: failure}
+			case "child":
+				process.result = failure
+			case "cleanup":
+				process.finishErr = failure
+			}
+			_, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), request, ops)
+			if !errors.Is(err, failure) || phase == "preparation" && !errors.Is(err, closeFailure) || !strings.HasPrefix(err.Error(), failure.Error()) {
+				t.Fatalf("prepared mapping replaced an original or cleanup error: %v", err)
+			}
+			d := mappingDiagnosticFrom(t, err).details
+			facts := d.UtilityPreparation
+			wantClean := phase == "launch" || phase == "child"
+			if facts == nil || facts.Path == "" || facts.CleanupConfirmed != (phase != "preparation") || d.CleanupConfirmed != wantClean || file.closes != 1 {
+				t.Fatalf("failure lost Utility facts or combined cleanup truth: %+v", d)
+			}
+			if phase == "preparation" {
+				if host.starts != 0 || d.ScriptUTF16Units != 0 || d.PID != nil || d.Launch != nil || d.WorkersStarted != 0 {
+					t.Fatal("preparation failure fabricated execution facts")
+				}
+			} else if host.starts != 1 || facts.ReadBytes != len(mappingUtilityTestData) || facts.SHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(mappingUtilityTestData))) {
+				t.Fatal("later failure lost completed manifest observations")
+			}
+		})
+	}
 }
 
 func TestMappingExecutionInputCompletion(t *testing.T) {
@@ -635,7 +970,7 @@ func TestMappingInputLineDiagnosticBindsDeliveredFrame(t *testing.T) {
 				t.Run(name, func(t *testing.T) {
 					process := mappingReplyChild("fixed-result\n")
 					process.result = failure
-					execution, err := executeMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", "verified-system-modules", test.request, mappingPowerShell, false)
+					execution, err := executePreparedMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), test.request, false, mappingUtilityOpsForTest())
 					if !errors.Is(err, failure) {
 						t.Fatalf("execution result changed: %v", err)
 					}
@@ -688,7 +1023,7 @@ func TestMappingExecutionRetainsChildStreamAndCleanupErrors(t *testing.T) {
 			if mode == "cleanup" {
 				process.finishErr = cleanupFailure
 			}
-			_, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", "verified-system-modules", mappingCommandRequest{Action: "inventory", OwnerSID: "owner"})
+			_, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory", OwnerSID: "owner"}, mappingUtilityOpsForTest())
 			if !errors.Is(err, childFailure) || mode == "stream" && !errors.Is(err, streamFailure) || mode == "cleanup" && !errors.Is(err, cleanupFailure) {
 				t.Fatalf("lost error chain: %v", err)
 			}
@@ -721,8 +1056,8 @@ func TestMappingStartupCellsOrderAndCleanupAdmission(t *testing.T) {
 	wantPlan := [6]mappingStartupCell{
 		{Name: "01_entry_open", Kind: mappingStartupEntry, Script: mappingStartupEntryScript, CloseInput: false, Entry: "RFS-MAPPING/1 entry-only", Result: `{"status":"entry-ok"}`},
 		{Name: "02_entry_eof", Kind: mappingStartupEntry, Script: mappingStartupEntryScript, CloseInput: true, Entry: "RFS-MAPPING/1 entry-only", Result: `{"status":"entry-ok"}`},
-		{Name: "03_inventory_open", Kind: mappingStartupInventory, Script: mappingPowerShell, CloseInput: false, Entry: "RFS-MAPPING/1 entry", Result: ""},
-		{Name: "04_inventory_eof", Kind: mappingStartupInventory, Script: mappingPowerShell, CloseInput: true, Entry: "RFS-MAPPING/1 entry", Result: ""},
+		{Name: "03_inventory_open", Kind: mappingStartupInventory, Script: "", CloseInput: false, Entry: "RFS-MAPPING/1 entry", Result: ""},
+		{Name: "04_inventory_eof", Kind: mappingStartupInventory, Script: "", CloseInput: true, Entry: "RFS-MAPPING/1 entry", Result: ""},
 		{Name: "05_resolve_json_command", Kind: mappingStartupResolve, Script: mappingStartupResolveScript, CloseInput: false, Entry: "RFS-CMD/1 entry resolve", Result: `{"status":"resolve-ok"}`},
 		{Name: "06_import_utility_parse", Kind: mappingStartupImport, Script: "", CloseInput: false, Entry: "RFS-CMD/1 entry import-parse", Result: `{"status":"import-parse-ok"}`},
 	}
@@ -732,7 +1067,7 @@ func TestMappingStartupCellsOrderAndCleanupAdmission(t *testing.T) {
 	for _, failCleanupAt := range []int{0, 2, 4, 5} {
 		t.Run(fmt.Sprintf("cleanup-failure-at-%d", failCleanupAt), func(t *testing.T) {
 			var names, inputHashes []string
-			starts, failures, preparations := 0, 0, 0
+			starts, failures, preparations, mappingChecks := 0, 0, 0, 0
 			aborted := walkMappingStartupCells(func(ordinal int, cell mappingStartupCell) bool {
 				names = append(names, cell.Name)
 				if ordinal != len(names) || cell != wantPlan[ordinal-1] {
@@ -756,7 +1091,15 @@ func TestMappingStartupCellsOrderAndCleanupAdmission(t *testing.T) {
 					process.finishErr = errors.New("job empty not confirmed")
 				}
 				host := &mappingCommandHost{child: process}
-				execution, err := executeMappingPowerShell(context.Background(), host, "same-executable", "same-directory", "verified-system-modules", request, cell.Script, cell.CloseInput)
+				var execution mappingExecution
+				var err error
+				if cell.Kind == mappingStartupInventory {
+					ops := mappingUtilityOpsForTest()
+					ops.CheckPath = func(string) error { mappingChecks++; return nil }
+					execution, err = executePreparedMappingPowerShell(context.Background(), host, "same-executable", "same-directory", mappingUtilityRootForTest(t), request, cell.CloseInput, ops)
+				} else {
+					execution, err = executeMappingPowerShell(context.Background(), host, "same-executable", "same-directory", mappingUtilityRootForTest(t), request, cell.Script, cell.CloseInput)
+				}
 				starts += host.starts
 				if err != nil {
 					failures++
@@ -783,6 +1126,13 @@ func TestMappingStartupCellsOrderAndCleanupAdmission(t *testing.T) {
 			if failCleanupAt == 0 && (preparations != 1 || failures != 2) || failCleanupAt != 0 && preparations != 0 {
 				t.Fatal("late import preparation ran before admission or clean resolution failure blocked it")
 			}
+			wantMappingChecks := 2
+			if failCleanupAt == 2 {
+				wantMappingChecks = 0
+			}
+			if mappingChecks != wantMappingChecks {
+				t.Fatal("inventory preparation escaped its admitted cell")
+			}
 			for _, hash := range inputHashes {
 				if hash != inputHashes[0] {
 					t.Fatal("request bytes changed between cells")
@@ -798,12 +1148,23 @@ func TestMappingStartupCellsOrderAndCleanupAdmission(t *testing.T) {
 }
 
 func TestMappingStartupOriginalScriptsUnchanged(t *testing.T) {
+	manifest := "/fixture/modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1"
+	importUTF8, importUTF16 := "30599cdbe8e9be12f0eb2302da4920460323f2337bae6037334582048057d1b6", "a76c9ea76b802b4d138f68bdace233a8ff9f5ea7ccf85f27310154d2781a493b"
+	if filepath.Separator == '\\' {
+		manifest = `C:\fixture\modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1`
+		importUTF8, importUTF16 = "597389a69c2dc8bdd65d0dfb6c22e62cd74af2961cad67f38001890791fcd99f", "a6c9a22dcfad6041824b27420f575e0c304c521abf629fea3aae7d815fec9af7"
+	}
+	importScript, err := mappingStartupImportScript(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, test := range []struct {
 		name, script, utf8Hash, utf16Hash string
 		units                             int
 	}{
-		{"inventory", mappingPowerShell, "ccc8528406b85636a4c94395967d3d10f6feaa0f771f0d2b6cb8160b0a67735f", "4d8dacf3ab7ac9e1c8dceb4abfab92d0ea4f75ad60a81e2d2285d33725f3f73c", 8906},
 		{"entry", mappingStartupEntryScript, "35832e1ac6f9fced065027493bc3faeeae304d06106463a728437a95c1328999", "136335e08a760524367812d41bc9362ad286105bb37a9661fdeb8ec6b21f09c7", 105},
+		{"resolve", mappingStartupResolveScript, "d20270905eb2314e1ca8d98a67c5adf2822bf2c2de2d5fffb80c7233ba156ca8", "69edafeb1fd24fce0060b65a0d07778bc5f620bbff53e57a6d99ac2799c60f99", 5272},
+		{"import-parse", importScript, importUTF8, importUTF16, 6297},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			words := utf16.Encode([]rune(test.script))
@@ -902,6 +1263,53 @@ func TestMappingStartupManifestPathEncoding(t *testing.T) {
 	}
 }
 
+func mappingUtilityImportOrder(source string) error {
+	return mappingObservationOrder(source, "$requestLine = [Console]::In.ReadLine()", "Write-RfsEnvironmentObservation",
+		"$rfsObservationStage = 'operation'", "$utilityManifest = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('",
+		"'RFS-MAPPING/1 before-utility'", `$null = Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -ErrorAction Stop`,
+		"'RFS-MAPPING/1 after-utility'", "'RFS-MAPPING/1 before-json'", "$request = $requestLine | ConvertFrom-Json",
+		"'RFS-MAPPING/1 after-json'", "Import-Module -Name $request.module -ErrorAction Stop")
+}
+
+func TestMappingUtilityImportBuilderBindsVerifiedPath(t *testing.T) {
+	const placeholder = "__RFS_UTILITY_MANIFEST_BASE64__"
+	for _, path := range []string{mappingStartupManifestForTest(t, "Microsoft.PowerShell.Utility.psd1"), mappingStartupManifestForTest(t, "quoted'-$name-模块🧪.psd1")} {
+		script, err := mappingPowerShellScript(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded := base64.StdEncoding.EncodeToString([]byte(path))
+		if strings.Count(script, encoded) != 1 || strings.Contains(script, placeholder) || strings.Contains(script, path) || strings.Replace(script, encoded, placeholder, 1) != mappingPowerShell {
+			t.Fatal("mapping builder changed more than its single encoded manifest binding")
+		}
+		if err := mappingUtilityImportOrder(script); err != nil {
+			t.Fatal(err)
+		}
+		withoutImport := strings.Replace(script, `$null = Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -ErrorAction Stop`, "", 1)
+		if withoutImport == script || mappingUtilityImportOrder(withoutImport) == nil {
+			t.Fatal("explicit import omission escaped its source control")
+		}
+		withoutSuppression := strings.Replace(script, `$null = Microsoft.PowerShell.Core\Import-Module`, `Microsoft.PowerShell.Core\Import-Module`, 1)
+		if mappingUtilityImportOrder(withoutSuppression) == nil {
+			t.Fatal("successful import output could contaminate the mapping result")
+		}
+	}
+	for _, invalid := range []string{"", "Utility.psd1", `C:relative.psd1`, "C:\\invalid\x00.psd1", "C:\\invalid\xff.psd1"} {
+		if script, err := mappingPowerShellScript(invalid); script != "" || err == nil {
+			t.Fatal("mapping builder accepted an unverified path or supplied a fallback")
+		}
+	}
+	buildFailure, closeFailure := errors.New("script builder failed"), errors.New("builder cleanup failed")
+	file := &mappingUtilityTestFile{reader: strings.NewReader(mappingUtilityTestData), info: mappingUtilityTestInfo{size: int64(len(mappingUtilityTestData))}, closeErr: closeFailure}
+	ops := mappingUtilityOpsForTest()
+	ops.Open = func(string) (mappingUtilityFile, error) { return file, nil }
+	ops.CommandLine = func([]string) string { t.Fatal("failed builder reached command-line preparation"); return "" }
+	script, facts, err := prepareMappingUtility(context.Background(), mappingUtilityRootForTest(t), "system-powershell", func(string) (string, error) { return "", buildFailure }, ops)
+	if script != "" || !errors.Is(err, buildFailure) || !errors.Is(err, closeFailure) || !strings.HasPrefix(err.Error(), buildFailure.Error()) || facts.CleanupConfirmed || file.closes != 1 {
+		t.Fatalf("builder failure or cleanup cause was lost: facts=%+v error=%v", facts, err)
+	}
+}
+
 func TestMappingCommandControlScriptOperations(t *testing.T) {
 	importScript, err := mappingStartupImportScript(mappingStartupManifestForTest(t, "Microsoft.PowerShell.Utility.psd1"))
 	if err != nil {
@@ -983,7 +1391,7 @@ func TestMappingCommandUsesOwnedProcessAndSingleLineInput(t *testing.T) {
 	host := &mappingCommandHost{child: process}
 	parentEnvironment := append([]string(nil), os.Environ()...)
 	request := mappingCommandRequest{Action: "inventory", Module: "system-module", OwnerSID: sid}
-	result, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", "verified-system-modules", request)
+	result, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), request, mappingUtilityOpsForTest())
 	if err != nil || result.Status != "ok" {
 		t.Fatalf("command: %#v %v", result, err)
 	}
@@ -1010,7 +1418,8 @@ func TestMappingCommandUsesOwnedProcessAndSingleLineInput(t *testing.T) {
 	for i := range words {
 		words[i] = binary.LittleEndian.Uint16(raw[2*i:])
 	}
-	if string(utf16.Decode(words)) != mappingPowerShell {
+	wantScript, err := mappingPowerShellScript(filepath.Join(mappingUtilityRootForTest(t), "Microsoft.PowerShell.Utility", "Microsoft.PowerShell.Utility.psd1"))
+	if err != nil || string(utf16.Decode(words)) != wantScript {
 		t.Fatal("launched PowerShell differs from bound source")
 	}
 	if !strings.Contains(mappingPowerShell, "ReadLine()") || strings.Contains(mappingPowerShell, "ReadToEnd()") || strings.Contains(mappingPowerShell, "UseWriteThrough") {
@@ -1027,7 +1436,7 @@ func TestMappingCommandCancellationJoinsOwnedWorkers(t *testing.T) {
 	host := &mappingCommandHost{child: process}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	_, err := runMappingPowerShell(ctx, host, "system-powershell", "private-evidence", "verified-system-modules", mappingCommandRequest{Action: "inventory", OwnerSID: mappingBaselineForTest().Owner.SID})
+	_, err := runMappingPowerShell(ctx, host, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory", OwnerSID: mappingBaselineForTest().Owner.SID}, mappingUtilityOpsForTest())
 	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "forced") || process.finished != 1 || process.input.closes != 1 {
 		t.Fatalf("canceled command ownership: %v", err)
 	}
@@ -1038,14 +1447,14 @@ func TestMappingCommandCannotReportMalformedOrForcedSuccess(t *testing.T) {
 	for _, reply := range []string{`{"status":"ok","owner_sid":"` + sid + `","cause":""}`, `{"status":"ok","owner_sid":"wrong","rows":[],"cause":""}`, `{"status":"ok","owner_sid":"` + sid + `","rows":[],"cause":"failed"}`, `{"status":"ok","owner_sid":"` + sid + `","rows":[],"cause":"","extra":1}`} {
 		child := mappingReplyChild(reply)
 		host := &mappingCommandHost{child: child}
-		if _, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", "verified-system-modules", mappingCommandRequest{OwnerSID: sid}); err == nil || child.finished != 1 {
+		if _, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{OwnerSID: sid}, mappingUtilityOpsForTest()); err == nil || child.finished != 1 {
 			t.Fatal("invalid command receipt passed")
 		}
 	}
 	raw, _ := json.Marshal(mappingCommandResult{Status: "ok", OwnerSID: sid, Rows: []mappingRow{}})
 	child := mappingReplyChild(string(raw))
 	child.forced = true
-	if _, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: child}, "system-powershell", "private-evidence", "verified-system-modules", mappingCommandRequest{OwnerSID: sid}); err == nil {
+	if _, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: child}, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{OwnerSID: sid}, mappingUtilityOpsForTest()); err == nil {
 		t.Fatal("forced cleanup became success")
 	}
 }
@@ -1152,7 +1561,7 @@ func TestMappingTimeoutDiagnosticFollowsOwnerAndWorkerCompletion(t *testing.T) {
 			cleanupFailure := errors.New("owned cleanup failure")
 			process.finishErr = cleanupFailure
 			process.closePipes = func() { close(process.done) }
-			_, err := runMappingPowerShell(ctx, &mappingCommandHost{child: process}, "system-powershell", "private-evidence", "verified-system-modules", mappingCommandRequest{Action: "inventory", OwnerSID: mappingBaselineForTest().Owner.SID})
+			_, err := runMappingPowerShell(ctx, &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory", OwnerSID: mappingBaselineForTest().Owner.SID}, mappingUtilityOpsForTest())
 			if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, cleanupFailure) || !strings.HasPrefix(err.Error(), context.DeadlineExceeded.Error()+"\n") {
 				t.Fatalf("first/cleanup error chain changed: %v", err)
 			}
@@ -1210,7 +1619,7 @@ func TestMappingWriteFailureDiagnosticsRetainActualProgress(t *testing.T) {
 				}
 				return 0, failure
 			}, close: func() error { closes++; return nil }}
-			_, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", "verified-system-modules", mappingCommandRequest{Action: "inventory", OwnerSID: sid})
+			_, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory", OwnerSID: sid}, mappingUtilityOpsForTest())
 			want := failure
 			if partial {
 				want = io.ErrShortWrite
@@ -1235,7 +1644,7 @@ func TestMappingWriteFailureDiagnosticsRetainActualProgress(t *testing.T) {
 func TestMappingStartupFailureDoesNotInventPIDOrIO(t *testing.T) {
 	failure := errors.New("process startup failed")
 	host := &mappingCommandHost{startErr: failure}
-	_, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", "verified-system-modules", mappingCommandRequest{Action: "inventory"})
+	_, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory"}, mappingUtilityOpsForTest())
 	if !errors.Is(err, failure) || !strings.HasPrefix(err.Error(), failure.Error()+"\n") {
 		t.Fatalf("startup cause replaced: %v", err)
 	}
@@ -1251,7 +1660,7 @@ func TestMappingFailureCaptureIsBoundedAndDoesNotExposeFullStderr(t *testing.T) 
 	secretTail := "stderr-tail-outside-retained-prefix"
 	stderr := strings.Repeat("x", mappingDiagnosticStreamLimit+1) + secretTail
 	process.stderr = io.NopCloser(strings.NewReader(stderr))
-	_, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", "verified-system-modules", mappingCommandRequest{Action: "inventory", OwnerSID: sid})
+	_, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory", OwnerSID: sid}, mappingUtilityOpsForTest())
 	diagnostic := mappingDiagnosticFrom(t, err)
 	if strings.Contains(err.Error(), secretTail) || strings.Contains(err.Error(), "PowerShell stderr:") {
 		t.Fatal("malformed stdout exposed unbounded stderr")
@@ -1269,8 +1678,10 @@ func TestMappingFailureCaptureIsBoundedAndDoesNotExposeFullStderr(t *testing.T) 
 	resultError, resultTruncated := mappingDiagnosticText(long, 512)
 	stream := mappingStreamDiagnostic{ObservedBytes: 1 << 30, PrefixBase64: base64.StdEncoding.EncodeToString(make([]byte, mappingDiagnosticStreamLimit)), PrefixTruncated: true}
 	maximal := mappingCommandDiagnostic{Action: action, ActionTruncated: actionTruncated, PreCleanupResult: &resultError, PreCleanupResultTruncated: resultTruncated, WriteError: writeError, WriteErrorTruncated: writeTruncated, InputLineBytes: 4095, InputLineSHA256: strings.Repeat("a", 64), InputBytes: 4096, InputSHA256: strings.Repeat("b", 64), Stdout: stream, Stderr: stream}
+	manifestSize := int64(mappingByteLimit)
+	maximal.UtilityPreparation = &mappingUtilityPreparation{Path: strings.Repeat("p", 1024), Size: &manifestSize, ReadBytes: mappingByteLimit, SHA256: strings.Repeat("c", 64), CleanupConfirmed: true}
 	bounded := mappingDiagnosticFrom(t, encodeMappingDiagnostic(maximal))
-	if !bounded.details.ActionTruncated || !bounded.details.WriteErrorTruncated || !bounded.details.PreCleanupResultTruncated {
+	if !bounded.details.ActionTruncated || !bounded.details.WriteErrorTruncated || !bounded.details.PreCleanupResultTruncated || !reflect.DeepEqual(bounded.details.UtilityPreparation, maximal.UtilityPreparation) {
 		t.Fatal("bounded text omitted its truncation facts")
 	}
 }
@@ -1298,7 +1709,7 @@ func TestMappingCaptureCopyCannotBypassTheOutputBound(t *testing.T) {
 }
 
 func mappingOperationStagesForTest() []string {
-	return []string{"entry", "before-readline", "after-readline", "before-json", "after-json", "before-owner", "after-owner", "before-import", "after-import", "before-inventory", "after-inventory", "before-create-inventory", "after-create-inventory", "before-remove-inventory", "after-remove-inventory", "after-result"}
+	return []string{"entry", "before-readline", "after-readline", "before-utility", "after-utility", "before-json", "after-json", "before-owner", "after-owner", "before-import", "after-import", "before-inventory", "after-inventory", "before-create-inventory", "after-create-inventory", "before-remove-inventory", "after-remove-inventory", "after-result"}
 }
 
 func mappingObservationOrder(source string, fragments ...string) error {
@@ -1375,7 +1786,9 @@ func TestMappingObservationScriptOwnershipAndOrder(t *testing.T) {
 		"$requestLine = [Console]::In.ReadLine()", "'RFS-MAPPING/1 after-readline'",
 		"$rfsObservationStage = 'input'", "Write-RfsInputObservation $requestLine",
 		"$rfsObservationStage = 'environment'", "Write-RfsEnvironmentObservation",
-		"$rfsObservationStage = 'operation'", "'RFS-MAPPING/1 before-json'",
+		"$rfsObservationStage = 'operation'", "$utilityManifest =", "'RFS-MAPPING/1 before-utility'",
+		`$null = Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -ErrorAction Stop`,
+		"'RFS-MAPPING/1 after-utility'", "'RFS-MAPPING/1 before-json'",
 		"$request = $requestLine | ConvertFrom-Json", "'RFS-MAPPING/1 after-json'",
 		"$owner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
 		"Import-Module -Name $request.module -ErrorAction Stop"); err != nil {
@@ -1523,8 +1936,8 @@ func TestMappingObservationStderrGrammarBound(t *testing.T) {
 	for _, stage := range mappingOperationStagesForTest() {
 		legacy.WriteString(record(stage))
 	}
-	if legacy.Len() != 492 {
-		t.Fatalf("sixteen existing marker bytes changed: %d", legacy.Len())
+	if legacy.Len() != 551 {
+		t.Fatalf("eighteen operation marker bytes changed: %d", legacy.Len())
 	}
 	const maximumLength = "2147483647"
 	environmentPrefix := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, 96))
@@ -1551,7 +1964,7 @@ func TestMappingObservationStderrGrammarBound(t *testing.T) {
 	bounded.WriteString(record("obs-end environment"))
 	bounded.WriteString(catch)
 	bounded.WriteString(failures.String())
-	if bounded.Len() != 1981 || bounded.Len() > mappingDiagnosticStreamLimit {
+	if bounded.Len() != 2040 || bounded.Len() > mappingDiagnosticStreamLimit {
 		t.Fatalf("actual record grammar exceeds its declared prefix budget: bytes=%d limit=%d", bounded.Len(), mappingDiagnosticStreamLimit)
 	}
 	for _, value := range bounded.String() {
@@ -1602,7 +2015,7 @@ func TestMappingStageMarkersKeepSuccessReceiptUnchanged(t *testing.T) {
 	data, _ := json.Marshal(want)
 	process := mappingReplyChild(string(data))
 	process.stderr = io.NopCloser(strings.NewReader("RFS-MAPPING/1 entry\nRFS-MAPPING/1 after-result\n"))
-	result, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", "verified-system-modules", mappingCommandRequest{Action: "inventory", OwnerSID: sid})
+	result, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory", OwnerSID: sid}, mappingUtilityOpsForTest())
 	if err != nil || !reflect.DeepEqual(result, want) || process.finished != 1 || process.input.closes != 1 {
 		t.Fatalf("normal result/owner changed: result=%+v err=%v", result, err)
 	}
