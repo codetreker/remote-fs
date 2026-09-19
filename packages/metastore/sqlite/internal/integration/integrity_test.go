@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"math"
 	"os"
 	"syscall"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func TestMiddleRetainedChangeDeletionIsRefusedByOpenAndSince(t *testing.T) {
@@ -203,8 +203,8 @@ func TestLiveReadersRejectLargeBlobScalarsBeforeMaterializingThem(t *testing.T) 
 			},
 		},
 		{
-			"change mode",
-			`UPDATE changes SET mode = zeroblob(4 * 1024 * 1024)
+			"change node kind",
+			`UPDATE changes SET node_kind = zeroblob(4 * 1024 * 1024)
 			 WHERE position = (SELECT min(position) FROM changes)`,
 			func(store *sqlite.Store) error {
 				result, err := metastore.NewChangeResult(1<<20, 0,
@@ -667,8 +667,8 @@ func addDisconnectedDirectories(t *testing.T, fixture objectIntegrityFixture, cy
 	defer tx.Rollback()
 	insertNode := func() int64 {
 		result, err := tx.Exec(`
-			INSERT INTO nodes (volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-			SELECT ns.id, root.mode, 0, 0, 0, 0, 0, NULL
+			INSERT INTO nodes (volume, kind, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content, directory_revision)
+			SELECT ns.id, root.kind, 0, 0, 0, 0, 0, NULL, root.directory_revision
 			FROM volumes ns JOIN nodes root ON root.id = ns.root
 			WHERE ns.id = ?`, fixture.volume)
 		if err != nil {
@@ -764,8 +764,8 @@ func TestOpenRefusesInconsistentVolumeIntegrity(t *testing.T) {
 		{"a node and its object disagree about size", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE nodes SET size = 11 WHERE content = ?`, f.live)
 		}},
-		{"a node holding content has a non-integer mode", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE nodes SET mode = 'regular' WHERE content = ?`, f.live)
+		{"a node holding content has a non-integer kind", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE nodes SET kind = 'regular' WHERE content = ?`, f.live)
 		}},
 		{"a node claims bytes without an object", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE nodes SET content = NULL, size = 10 WHERE content = ?`, f.live)
@@ -835,12 +835,12 @@ func TestOpenRefusesInconsistentVolumeIntegrity(t *testing.T) {
 		{"the volume used counter is not an integer", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE volumes SET used = 'ten' WHERE id = ?`, f.volume)
 		}},
-		{"an empty leaf has an invalid stored mode", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE nodes SET mode = -1 WHERE `+nodeNamed, f.volume, "copy")
+		{"an empty leaf has an invalid stored kind", func(t *testing.T, f objectIntegrityFixture) {
+			damageDatabase(t, f.path, `UPDATE nodes SET kind = -1 WHERE `+nodeNamed, f.volume, "copy")
 		}},
 		{"a node has an unsupported type", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE nodes SET mode = ? WHERE `+nodeNamed,
-				int64(fs.ModeSymlink|0o777), f.volume, "copy")
+			damageDatabase(t, f.path, `UPDATE nodes SET kind = ? WHERE `+nodeNamed,
+				int64(99), f.volume, "copy")
 		}},
 		{"a node has invalid access nanoseconds", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE nodes SET atime_nsec = 1000000000 WHERE `+nodeNamed,
@@ -880,14 +880,14 @@ func TestOpenRefusesInconsistentVolumeIntegrity(t *testing.T) {
 			damageDatabase(t, f.path, `UPDATE changes SET kind = 'created' WHERE volume = ? AND position = (SELECT min(position) FROM changes WHERE volume = ?)`, f.volume, f.volume)
 		}},
 		{"a change carries an unsupported node type", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE changes SET mode = ? WHERE position = (
+			damageDatabase(t, f.path, `UPDATE changes SET node_kind = ? WHERE position = (
 				SELECT min(position) FROM changes WHERE volume = ? AND node IS NOT NULL)`,
-				int64(fs.ModeSymlink|0o777), f.volume)
+				int64(99), f.volume)
 		}},
 		{"a change carries file bytes without a content key", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE changes SET content = NULL WHERE position = (
-				SELECT min(position) FROM changes WHERE volume = ? AND (mode & ?) = 0 AND size > 0)`,
-				f.volume, int64(fs.ModeType))
+				SELECT min(position) FROM changes WHERE volume = ? AND node_kind = ? AND size > 0)`,
+				f.volume, int64(storage.NodeRegular))
 		}},
 		{"a created change has no name", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE changes SET name = NULL WHERE volume = ? AND kind = 0`, f.volume)
@@ -1121,7 +1121,7 @@ func TestRetainedIntegrityRefusesInvalidDetachedState(t *testing.T) {
 	}
 }
 
-func TestRetainedIntegrityRefusesDetachedDirectoriesAndRoots(t *testing.T) {
+func TestRetainedIntegrityRefusesLinkedDetachedDirectoriesAndRoots(t *testing.T) {
 	for _, node := range []string{"directory", "root"} {
 		for _, entry := range []string{"open", "status"} {
 			t.Run(node+"/"+entry, func(t *testing.T) {
@@ -1136,11 +1136,42 @@ func TestRetainedIntegrityRefusesDetachedDirectoriesAndRoots(t *testing.T) {
 				} else {
 					damageDatabase(t, f.path, `UPDATE nodes SET detached = 1 WHERE `+nodeNamed,
 						f.volume, "directory")
-					damageDatabase(t, f.path, `DELETE FROM entries WHERE volume = ? AND name = CAST('directory' AS BLOB)`, f.volume)
 				}
 				assertRetainedIntegrityFailure(t, f.path, store)
 			})
 		}
+	}
+}
+
+func TestRetainedIntegrityAcceptsDetachedDirectories(t *testing.T) {
+	for _, entry := range []string{"open", "status"} {
+		t.Run(entry, func(t *testing.T) {
+			f := newObjectIntegrityFixture(t)
+			var store *sqlite.Store
+			if entry == "status" {
+				store = open(t, f.path, "workspace", 100)
+			}
+			var id int64
+			db := raw(t, f.path)
+			if err := db.QueryRow(`SELECT node FROM entries WHERE volume=? AND name=CAST('directory' AS BLOB)`, f.volume).Scan(&id); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			damageDatabase(t, f.path, `UPDATE nodes SET detached=1 WHERE id=?; DELETE FROM entries WHERE node=?`, id, id)
+			if store == nil {
+				store = open(t, f.path, "workspace", 100)
+			}
+			if _, err := store.ObjectStatus(t.Context()); err != nil {
+				t.Fatalf("valid detached directory failed integrity: %v", err)
+			}
+			node, err := store.StatNode(t.Context(), uint64(id))
+			if err != nil || node.ID != id || node.Kind != storage.NodeDirectory {
+				t.Fatalf("detached directory identity lost: %+v, %v", node, err)
+			}
+		})
 	}
 }
 

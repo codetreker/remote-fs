@@ -22,7 +22,7 @@ func TestRemoteChangeReachesReplicaDuringContinuousListings(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	mounted, _ := mount(t, s)
+	mounted, local := mount(t, s)
 	var stopped atomic.Bool
 	stopReaders := func() { stopped.Store(true) }
 	var group sync.WaitGroup
@@ -33,7 +33,7 @@ func TestRemoteChangeReachesReplicaDuringContinuousListings(t *testing.T) {
 		group.Go(func() {
 			first := true
 			for !stopped.Load() {
-				entries, err := mounted.List(t.Context(), "")
+				entries, err := local.List(t.Context(), "")
 				if err != nil {
 					failures <- err
 					return

@@ -1,0 +1,438 @@
+//go:build windows
+
+package windows
+
+import (
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+)
+
+type earlyQFidInteractionEvidence struct {
+	Early                                                    earlyWireEvidence
+	QFid                                                     precisePolicyEvidence
+	Exposed                                                  bool
+	Outcome, Reason, SourceError, ProcessError, NativeOracle string
+}
+
+func earlyQFidProcessGuard(state earlyBootstrapState) error {
+	if state.Error != "" {
+		return errors.New(state.Error)
+	}
+	process := state.Process
+	if process == nil || !process.ExitConfirmed || process.ExitCode != 0 || process.KillRequested || process.KillAttempted || process.KillReturned || process.OwnerRetained || process.Error != "" || process.WaitError != "" || process.KillError != "" || process.Outcome != "bootstrap_complete" {
+		return errors.New("helper did not complete ordinary successful process ownership")
+	}
+	if process.Native == nil || !process.OutputComplete || len(process.Stderr) != 0 || process.InputBytes <= 0 || process.InputBytes > earlyBootstrapLimit || process.OutputBytes <= 0 || process.OutputBytes > earlyBootstrapLimit || process.OutputBytes != len(process.Stdout)+len(process.Stderr) {
+		return errors.New("helper receipt or bounded output is incomplete")
+	}
+	if process.Started.IsZero() || process.Exited.Before(process.Started) || process.WaitReturned.IsZero() || process.WaitReturned.Before(process.Exited) || process.Exited.After(process.Started.Add(10*time.Second)) {
+		return errors.New("helper exit was not confirmed inside the original bootstrap budget")
+	}
+	request := earlyBootstrapRequest{Nonce: process.Nonce, Root: state.UNC + `\`, ParentPID: process.ParentPID, Executable: process.Executable, ExecutableSHA256: process.ExecutableSHA256, Token: process.ParentToken}
+	if process.Root != request.Root {
+		return errors.New("helper root differs from the observed experimental share")
+	}
+	if err := earlyBootstrapRequestValid(request); err != nil {
+		return err
+	}
+	var child earlyBootstrapChildReceipt
+	if err := earlyBootstrapReadJSON(process.Stdout, &child); err != nil {
+		return err
+	}
+	if err := earlyBootstrapValidateChild(request, process.PID, child); err != nil {
+		return err
+	}
+	if child.Token != process.ChildToken || child.Native != *process.Native {
+		return errors.New("retained helper facts disagree with its original output")
+	}
+	if child.Native.Flags != 0x406 || child.Native.MaximumComponentLength != 255 || child.Native.FilesystemName != "remote-fs" {
+		return errors.New("helper did not observe the configured filesystem tuple")
+	}
+	return nil
+}
+
+func earlyQFidJoin(early *earlyWireRecord, identity *preciseIdentityRecord) bool {
+	return early != nil && identity != nil && early.Response && identity.Response && early.Command == wire.Create && identity.Command == wire.Create && early.Status == 0 && identity.Status == 0 && early.Connection == identity.Connection && early.Session == identity.Session && early.Message == identity.MessageID && early.FileID != "" && early.FileID == identity.FileID
+}
+
+func earlyQFidInteractionGate(records []earlyWireRecord, identities []preciseIdentityRecord, parentWire []cacheGatePositiveWireRecord, state earlyBootstrapState, report *parentInvalidationReport, sourceErr error) earlyQFidInteractionEvidence {
+	result := earlyQFidInteractionEvidence{
+		Early:   earlyWireGate(records, identities, state.UNC, state.Volume, state.Markers, report.Pending, true),
+		QFid:    precisePolicyGate(preciseAlwaysQFid, identities, parentWire, report, state.Markers.FirstNewEnd),
+		Outcome: "not_exposed", NativeOracle: report.IdentityResult,
+	}
+	if err := earlyQFidProcessGuard(state); err != nil {
+		result.ProcessError = err.Error()
+	}
+	if sourceErr != nil {
+		result.SourceError = sourceErr.Error()
+		result.Outcome = "invalid_source"
+		result.Reason = result.SourceError
+		result.Early.Exposed = false
+		result.Early.Outcome = "inconclusive"
+		result.QFid.StimulusDelivered = false
+		return result
+	}
+	if result.ProcessError != "" {
+		result.Outcome = "process_failed"
+		result.Reason = result.ProcessError
+		return result
+	}
+	if !result.Early.Exposed {
+		result.Reason = "early capability: " + result.Early.Reason
+		return result
+	}
+	if !result.QFid.StimulusDelivered {
+		result.Reason = "QFid: " + result.QFid.Error
+		if result.QFid.Error == "" {
+			result.Reason = "first CREATE did not deliver the required unrequested QFid"
+		}
+		return result
+	}
+	if !earlyQFidJoin(result.Early.HA, result.QFid.OldResponse) || !earlyQFidJoin(result.Early.Hnew, result.QFid.NewResponse) {
+		result.Outcome = "invalid_join"
+		result.Reason = "early and QFid evidence identify different HA or Hnew ownership"
+		return result
+	}
+	if result.Early.HA.Tree != result.Early.Tree || result.Early.Hnew.Tree != result.Early.Tree || result.QFid.OldResponse.QFid == nil || result.QFid.NewResponse.QFid == nil || result.QFid.OldResponse.QFid.VolumeID != result.Early.VolumeSerial || result.QFid.NewResponse.QFid.VolumeID != result.Early.VolumeSerial {
+		result.Outcome = "invalid_join"
+		result.Reason = "QFid identities disagree with the independently bound tree volume"
+		return result
+	}
+	request, response := result.QFid.NewRequest, result.QFid.NewResponse
+	if request == nil || !(state.Markers.Mutation < state.Markers.FirstNewBegin && state.Markers.FirstNewBegin < request.Sequence && request.Sequence < response.Sequence && response.Sequence < state.Markers.FirstNewEnd) || result.Early.Hnew.Sequence >= state.Markers.FirstNewEnd {
+		result.Outcome = "invalid_order"
+		result.Reason = "new CREATE response was not observed inside the original first-open ordinal bracket"
+		return result
+	}
+	result.Exposed = true
+	result.Outcome = "joint_exposure"
+	return result
+}
+
+func earlyQFidInteractionAudit(t *testing.T, report *parentInvalidationReport) {
+	t.Helper()
+	records, sourceErr := earlySnapshot()
+	identities, identityErr := preciseIdentitySnapshot()
+	sourceErr = errors.Join(sourceErr, identityErr)
+	_, wireIncomplete := cacheGatePositiveWireSnapshot()
+	if wireIncomplete {
+		sourceErr = errors.Join(sourceErr, errors.New("parent wire evidence is incomplete"))
+	}
+	earlyRegistry.Lock()
+	state := earlyRegistry.state
+	earlyRegistry.Unlock()
+	preciseIdentityRegistry.Lock()
+	state.Markers.Mutation = preciseIdentityRegistry.mutationSequence
+	state.Markers.FirstNewEnd = preciseIdentityRegistry.firstOpenEnd
+	preciseIdentityRegistry.Unlock()
+	state.Markers.FirstNewBegin = report.FirstObservationSequence
+	result := earlyQFidInteractionGate(records, identities, report.Wire, state, report, sourceErr)
+	if !result.Exposed {
+		report.Classification = "inconclusive"
+		report.WithinOneSecondProven = false
+		t.Error("early QFid interaction qualification:", result.Reason)
+	}
+	data, err := json.MarshalIndent(struct {
+		State       earlyBootstrapState
+		Wire        []earlyWireRecord
+		Identity    []preciseIdentityRecord
+		Interaction earlyQFidInteractionEvidence
+		Native      precisePolicyEvidence
+	}{state, records, identities, result, precisePolicyNative(report)}, "", "  ")
+	if err == nil {
+		err = os.WriteFile(filepath.Join(os.Getenv("RFS_GATE_OUTPUT_ROOT"), "early-qfid-interaction.json"), data, 0600)
+	}
+	if err != nil {
+		t.Error("write early QFid interaction evidence:", err)
+	}
+}
+
+func TestNativeEarlyQFidInteraction(t *testing.T) {
+	if os.Getenv("RFS_CAPABILITY_BOOTSTRAP") != "before-ha-qfid" || os.Getenv("RFS_PRECISE_VARIANT") != "historical_detail" || os.Getenv("RFS_QFID_POLICY") != preciseAlwaysQFid || os.Getenv("RFS_FILESYSTEM_CAPABILITY_POLICY") != preciseFilesystemPosix || os.Getenv("RFS_INTERACTION_POLICY") != preciseInteractionCombined {
+		t.Fatal("early QFid interaction requires its exact explicit policy combination")
+	}
+	t.Run("share0_app_first_replace_identity_early_qfid", func(t *testing.T) {
+		preciseIdentityReset()
+		earlyReset()
+		earlyActivate()
+		t.Cleanup(earlyDeactivate)
+		if err := preciseConfigureInteractionPolicy(preciseInteractionCombined, preciseFilesystemPosix, preciseAlwaysQFid); err != nil {
+			t.Fatal(err)
+		}
+		report := &parentInvalidationReport{Kind: "replacement", Name: "share0_app_first_replace_identity_early_qfid", ShareMode: 0, Order: "app_first"}
+		parentRunCell(t, report.Name, report.Order, report.ShareMode, true, report)
+		if report.RescanRequired || !report.PreciseNotificationProven {
+			t.Error("early QFid interaction requires precise detailed notification")
+		}
+	})
+}
+
+func earlyQFidTestProcess(unc string) *earlyBootstrapProcessReceipt {
+	raw := preciseTestFilesystemData(0x406)
+	native := earlyBootstrapNativeReceipt{RootOpened: true, CloseAttempted: true, RootClosed: true, OpenAccess: 0x100080, OpenShare: 7, OpenFlags: 0x02000000, IOSBSize: 16, IOSBAlignment: 8, IOSBInformationOffset: 8, IOSBPresent: true, IOSBStatus: 0xc0000001, Information: uint64(len(raw)), RawBufferHex: hex.EncodeToString(raw), Flags: 0x406, MaximumComponentLength: 255, FilesystemName: "remote-fs"}
+	token := earlyBootstrapToken{SID: "S-1-5-21-test", AuthenticationID: 12, SessionID: 1}
+	request := earlyBootstrapRequest{Nonce: hex.EncodeToString(bytes.Repeat([]byte{0xab}, 32)), Root: unc + `\`, ParentPID: 100, Executable: filepath.Join(os.TempDir(), "early-fixture.test.exe"), ExecutableSHA256: hex.EncodeToString(bytes.Repeat([]byte{0xcd}, 32)), Token: token}
+	child := earlyBootstrapChildReceipt{Root: request.Root, Nonce: request.Nonce, PID: 101, ParentPID: request.ParentPID, Executable: request.Executable, ExecutableSHA256: request.ExecutableSHA256, Token: token, Native: native}
+	output, err := json.Marshal(child)
+	if err != nil {
+		panic(err)
+	}
+	input, err := json.Marshal(request)
+	if err != nil {
+		panic(err)
+	}
+	at := time.Unix(1800000000, 0)
+	return &earlyBootstrapProcessReceipt{Stdout: output, Nonce: request.Nonce, Root: request.Root, Executable: request.Executable, ExecutableSHA256: request.ExecutableSHA256, ParentPID: 100, PID: 101, ParentToken: token, ChildToken: token, Started: at, Exited: at.Add(time.Millisecond), WaitReturned: at.Add(time.Millisecond), ExitConfirmed: true, ExitCode: 0, Outcome: "bootstrap_complete", InputBytes: len(input), OutputBytes: len(output), OutputComplete: true, Native: &native}
+}
+
+func earlyQFidTestFixture() ([]earlyWireRecord, []preciseIdentityRecord, []cacheGatePositiveWireRecord, earlyBootstrapState, parentInvalidationReport) {
+	records, originalIdentity, unc, volume, markers, watcher := earlyTestFixture()
+	serial := originalIdentity[1].QFid.VolumeID
+	_, _, report := precisePolicyFixture()
+	report.FirstObservationSequence = markers.FirstNewBegin
+	report.Pending = &watcher
+	identities := make([]preciseIdentityRecord, 0, 10)
+	parentWire := make([]cacheGatePositiveWireRecord, 0, 10)
+	for _, record := range records {
+		if record.Command != wire.Create {
+			continue
+		}
+		requested := record.Message != 23
+		identity := preciseIdentityRecord{Sequence: record.Sequence, Connection: record.Connection, Session: record.Session, RawSession: record.RawSession, MessageID: record.Message, Command: wire.Create, Response: record.Response, Status: record.Status, FileID: record.FileID, ContextsChecked: true, QFidRequested: requested, Complete: true}
+		if requested || record.Response {
+			identity.ContextNames = []string{"51466964"}
+		}
+		if record.Response {
+			disk := uint64(1)
+			if record.Name == "v" {
+				disk = 2
+			}
+			if record.Message == 18 {
+				disk = 3
+			}
+			if record.Message == 23 {
+				disk = 4
+			}
+			preciseSetQFidTuple(&identity, disk, serial)
+		}
+		identities = append(identities, identity)
+		parentWire = append(parentWire, cacheGatePositiveWireRecord{Connection: record.Connection, SessionID: record.Session, MessageID: record.Message, Command: wire.Create, Response: record.Response, Status: record.Status, FileID: record.FileID, Name: record.Name})
+	}
+	state := earlyBootstrapState{UNC: unc, Volume: volume, Markers: markers, Process: earlyQFidTestProcess(unc)}
+	return records, identities, parentWire, state, report
+}
+
+func TestEarlyQFidInteractionPositive(t *testing.T) {
+	records, identities, parentWire, state, report := earlyQFidTestFixture()
+	result := earlyQFidInteractionGate(records, identities, parentWire, state, &report, nil)
+	if !result.Exposed || !result.Early.Exposed || !result.QFid.StimulusDelivered || result.Outcome != "joint_exposure" || result.ProcessError != "" || result.SourceError != "" || result.Early.HA.FileID != result.QFid.OldResponse.FileID || result.Early.Hnew.FileID != result.QFid.NewResponse.FileID {
+		t.Fatal("complete early/QFid interaction rejected", result)
+	}
+	if report.NewIdentity.Identity == result.QFid.NewResponse.QFid.DiskID {
+		t.Fatal("fixture failed to keep native identity opaque")
+	}
+}
+
+func TestEarlyQFidInteractionRefusals(t *testing.T) {
+	cases := []struct {
+		name   string
+		change func(*[]earlyWireRecord, *[]preciseIdentityRecord, *[]cacheGatePositiveWireRecord, *earlyBootstrapState, *parentInvalidationReport)
+	}{
+		{"missing early half", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *earlyBootstrapState, _ *parentInvalidationReport) {
+			(*r)[11].Attributes, _ = preciseDecodeFilesystemAttributes(preciseTestFilesystemData(6))
+		}},
+		{"missing QFid half", func(_ *[]earlyWireRecord, i *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *earlyBootstrapState, _ *parentInvalidationReport) {
+			(*i)[9].QFid = nil
+			(*i)[9].ContextNames = nil
+		}},
+		{"late early response", func(_ *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, s *earlyBootstrapState, _ *parentInvalidationReport) {
+			s.Markers.Settled = 13
+		}},
+		{"wrong helper tree", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *earlyBootstrapState, _ *parentInvalidationReport) {
+			(*r)[11].Tree = 8
+		}},
+		{"wrong helper session", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *earlyBootstrapState, _ *parentInvalidationReport) {
+			(*r)[11].Session = 3
+		}},
+		{"requested new QFid", func(_ *[]earlyWireRecord, i *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *earlyBootstrapState, _ *parentInvalidationReport) {
+			(*i)[8].QFidRequested = true
+			(*i)[8].ContextNames = []string{"51466964"}
+			(*i)[9].QFidRequested = true
+		}},
+		{"wrong actual B", func(_ *[]earlyWireRecord, i *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *earlyBootstrapState, _ *parentInvalidationReport) {
+			preciseSetQFidTuple(&(*i)[9], 99, (*i)[9].QFid.VolumeID)
+		}},
+		{"wrong actual volume", func(_ *[]earlyWireRecord, i *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *earlyBootstrapState, _ *parentInvalidationReport) {
+			preciseSetQFidTuple(&(*i)[9], 4, (*i)[9].QFid.VolumeID+1)
+		}},
+		{"malformed QFid", func(_ *[]earlyWireRecord, i *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *earlyBootstrapState, _ *parentInvalidationReport) {
+			(*i)[9].QFid.Raw = "bad"
+		}},
+		{"new response after API end", func(_ *[]earlyWireRecord, i *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *earlyBootstrapState, _ *parentInvalidationReport) {
+			(*i)[9].Sequence = 26
+		}},
+		{"early new response after API end", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *earlyBootstrapState, _ *parentInvalidationReport) {
+			(*r)[18].Sequence = 26
+		}},
+		{"missing new response", func(_ *[]earlyWireRecord, i *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *earlyBootstrapState, _ *parentInvalidationReport) {
+			*i = (*i)[:9]
+		}},
+		{"duplicate new response", func(_ *[]earlyWireRecord, i *[]preciseIdentityRecord, _ *[]cacheGatePositiveWireRecord, _ *earlyBootstrapState, _ *parentInvalidationReport) {
+			copy := (*i)[9]
+			copy.Sequence = 27
+			*i = append(*i, copy)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			records, identities, parentWire, state, report := earlyQFidTestFixture()
+			tc.change(&records, &identities, &parentWire, &state, &report)
+			result := earlyQFidInteractionGate(records, identities, parentWire, state, &report, nil)
+			if result.Exposed || result.Reason == "" || result.NativeOracle != report.IdentityResult {
+				t.Fatal("incomplete interaction admitted or native verdict erased", result)
+			}
+			if tc.name == "missing early half" && !result.QFid.StimulusDelivered {
+				t.Fatal("missing early half erased a true QFid fact", result)
+			}
+			if tc.name == "missing QFid half" && !result.Early.Exposed {
+				t.Fatal("missing QFid half erased a true early fact", result)
+			}
+		})
+	}
+	for _, which := range []string{"HA", "Hnew"} {
+		t.Run("different "+which+" correlation", func(t *testing.T) {
+			records, identities, parentWire, state, report := earlyQFidTestFixture()
+			index, wireIndex := 7, 7
+			if which == "Hnew" {
+				index = 9
+				wireIndex = 9
+			}
+			identities[index].FileID = "other-" + which
+			parentWire[wireIndex].FileID = identities[index].FileID
+			result := earlyQFidInteractionGate(records, identities, parentWire, state, &report, nil)
+			if result.Exposed || result.Reason == "" {
+				t.Fatal("different server-open ownership joined", result)
+			}
+		})
+	}
+	t.Run("raw source failure remains separate", func(t *testing.T) {
+		records, identities, parentWire, state, report := earlyQFidTestFixture()
+		report.IdentityResult = "replacement_identity_aliased"
+		result := earlyQFidInteractionGate(records, identities, parentWire, state, &report, errors.New("observer lost a frame"))
+		if result.Exposed || result.Early.Exposed || result.QFid.StimulusDelivered || result.SourceError != "observer lost a frame" || result.ProcessError != "" || result.NativeOracle != report.IdentityResult {
+			t.Fatal("source failure was hidden or native result replaced", result)
+		}
+	})
+	t.Run("actual failed CREATE with source error stays raw", func(t *testing.T) {
+		records, identities, parentWire, state, report := earlyQFidTestFixture()
+		records[18].Status = 0xc0000034
+		records[18].FileID = ""
+		identities[9].Status = 0xc0000034
+		identities[9].FileID = ""
+		identities[9].QFid = nil
+		identities[9].ContextNames = nil
+		identities[9].ContextsChecked = false
+		parentWire[9].Status = 0xc0000034
+		parentWire[9].FileID = ""
+		report.Qualification.Native.Error = "CreateFile failed"
+		report.IdentityResult = "replacement_first_open_failed"
+		for _, sourceErr := range []error{nil, errors.New("source incomplete")} {
+			result := earlyQFidInteractionGate(records, identities, parentWire, state, &report, sourceErr)
+			if result.Exposed || result.QFid.WireSuccess || result.QFid.NativeOpenSucceeded || result.QFid.NewResponse == nil || result.QFid.NewResponse.Status != 0xc0000034 || result.QFid.NewResponse.QFid != nil || result.QFid.NewResponse.FileID != "" || result.NativeOracle != report.IdentityResult {
+				t.Fatal("real CREATE failure acquired synthetic success", result)
+			}
+			if sourceErr != nil && result.SourceError == "" {
+				t.Fatal("source guard failure hidden", result)
+			}
+		}
+	})
+}
+
+func TestEarlyQFidInteractionProcessRefusals(t *testing.T) {
+	cases := []struct {
+		name   string
+		change func(*earlyBootstrapState)
+	}{
+		{"missing receipt", func(s *earlyBootstrapState) { s.Process = nil }},
+		{"unconfirmed exit", func(s *earlyBootstrapState) { s.Process.ExitConfirmed = false }},
+		{"failed exit", func(s *earlyBootstrapState) { s.Process.ExitCode = 3 }},
+		{"forced exit", func(s *earlyBootstrapState) { s.Process.KillRequested = true }},
+		{"retained owner", func(s *earlyBootstrapState) { s.Process.OwnerRetained = true }},
+		{"wait error", func(s *earlyBootstrapState) { s.Process.WaitError = "unconfirmed wait" }},
+		{"late helper exit", func(s *earlyBootstrapState) {
+			s.Process.Exited = s.Process.Started.Add(11 * time.Second)
+			s.Process.WaitReturned = s.Process.Exited
+		}},
+		{"missing native result", func(s *earlyBootstrapState) { s.Process.Native = nil }},
+		{"foreign token", func(s *earlyBootstrapState) { s.Process.ParentToken.AuthenticationID++ }},
+		{"foreign token session", func(s *earlyBootstrapState) { s.Process.ChildToken.SessionID++ }},
+		{"wrong nonce", func(s *earlyBootstrapState) { s.Process.Nonce = hex.EncodeToString(bytes.Repeat([]byte{0xee}, 32)) }},
+		{"wrong child PID", func(s *earlyBootstrapState) { s.Process.PID++ }},
+		{"wrong root", func(s *earlyBootstrapState) { s.Process.Root += `target` }},
+		{"incomplete output", func(s *earlyBootstrapState) { s.Process.OutputComplete = false }},
+		{"stderr failure", func(s *earlyBootstrapState) {
+			s.Process.Stderr = []byte("helper error")
+			s.Process.OutputBytes += len(s.Process.Stderr)
+		}},
+		{"raw receipt malformed", func(s *earlyBootstrapState) { s.Process.Stdout = []byte("bad"); s.Process.OutputBytes = 3 }},
+		{"native pending", func(s *earlyBootstrapState) { s.Process.Native.Pending = true; s.Process.Native.PinsRetained = true }},
+		{"root close failed", func(s *earlyBootstrapState) {
+			s.Process.Native.RootClosed = false
+			s.Process.Native.CloseError = "close failed"
+		}},
+		{"source bootstrap error", func(s *earlyBootstrapState) { s.Error = "bootstrap cleanup unsettled" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			records, identities, parentWire, state, report := earlyQFidTestFixture()
+			tc.change(&state)
+			result := earlyQFidInteractionGate(records, identities, parentWire, state, &report, nil)
+			if result.Exposed || result.ProcessError == "" || result.SourceError != "" || result.Outcome != "process_failed" || result.NativeOracle != report.IdentityResult {
+				t.Fatal("helper failure lost its ownership", result)
+			}
+		})
+	}
+}
+
+func TestEarlyQFidInteractionNativeOracle(t *testing.T) {
+	for _, mode := range []string{"distinct handles", "both old identity", "both new identity", "native identity API failure", "wrong B bytes"} {
+		t.Run(mode, func(t *testing.T) {
+			records, identities, parentWire, state, report := earlyQFidTestFixture()
+			before, after := make([]byte, 257), make([]byte, 769)
+			report.RetainedRead = cacheGatePositiveValue{Count: 257, Digest: cacheGatePositiveDigest(before)}
+			report.NewRead = cacheGatePositiveValue{Count: 769, Digest: cacheGatePositiveDigest(after)}
+			expected := "distinct_native_identity_and_preserved_bytes"
+			switch mode {
+			case "both old identity":
+				report.NewIdentity.Identity = report.OldIdentity.Identity
+				expected = "replacement_identity_aliased"
+			case "both new identity":
+				report.RetainedIdentity.Identity = report.NewIdentity.Identity
+				expected = "retained_identity_changed"
+			case "native identity API failure":
+				report.NewIdentity.Error = "GetFileInformationByHandle failed"
+				expected = "identity_unavailable"
+			case "wrong B bytes":
+				report.NewRead.Digest = "wrong"
+				expected = "replacement_bytes_wrong"
+			}
+			report.IdentityResult = parentRelativeIdentity(report.OldIdentity, report.NewIdentity, report.RetainedIdentity, report.RetainedRead, report.NewRead, before, after)
+			result := earlyQFidInteractionGate(records, identities, parentWire, state, &report, nil)
+			if !result.Exposed || result.NativeOracle != expected || report.IdentityResult != expected {
+				t.Fatal("joint exposure erased or replaced the original native verdict", mode, result)
+			}
+			if mode != "distinct handles" && result.NativeOracle == "distinct_native_identity_and_preserved_bytes" {
+				t.Fatal("native failure became a mechanism pass")
+			}
+		})
+	}
+}

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -282,10 +281,10 @@ func TestSetAttrReachesTheStorage(t *testing.T) {
 	if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 		t.Fatal(err)
 	}
-	mode := fs.FileMode(0o600)
+	accessed := time.Unix(1500000000, 123)
 	changed := time.Unix(1755000000, 123456789)
 	w := serve(t, h, httprest.Request{Op: httprest.OpSetAttr, Path: "f"},
-		changeBody(t, storage.AttrChange{Mode: &mode, ModTime: &changed}))
+		changeBody(t, storage.AttrChange{AccessTime: &accessed, ModTime: &changed}))
 	if w.Code != http.StatusOK {
 		t.Fatalf("setattr answered %d, want 200: %s", w.Code, w.Body)
 	}
@@ -294,8 +293,8 @@ func TestSetAttrReachesTheStorage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode != mode {
-		t.Fatalf("the stored file has mode %v, want %v", info.Mode, mode)
+	if !info.AccessTime.Equal(accessed) {
+		t.Fatalf("the stored file has access time %v, want %v", info.AccessTime, accessed)
 	}
 	if !info.ModTime.Equal(changed) {
 		t.Fatalf("the stored file is dated %v, want %v", info.ModTime, changed)
@@ -308,10 +307,11 @@ func TestSetAttrReachesTheStorage(t *testing.T) {
 func TestAMalformedChangeChangesNothing(t *testing.T) {
 	const existing = "the previous contents, which must survive"
 	cases := map[string]io.Reader{
-		"a body that is not JSON":            bytes.NewReader([]byte("not json")),
-		"a body carrying no change":          bytes.NewReader([]byte(`{}`)),
-		"a change with a mode it cannot use": bytes.NewReader([]byte(`{"change":{"mode":"rwx"}}`)),
-		"a body that ends early":             &errorAfter{[]byte(`{"change":{"mo`), errors.New("connection reset")},
+		"a body that is not JSON":           bytes.NewReader([]byte("not json")),
+		"a change attempting to alter kind": bytes.NewReader([]byte(`{"change":{"kind":3}}`)),
+		"a body carrying no change":         bytes.NewReader([]byte(`{}`)),
+		"a change with an invalid time":     bytes.NewReader([]byte(`{"change":{"access_time":"yesterday"}}`)),
+		"a body that ends early":            &errorAfter{[]byte(`{"change":{"mo`), errors.New("connection reset")},
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -319,8 +319,8 @@ func TestAMalformedChangeChangesNothing(t *testing.T) {
 			if err := backing.Write(t.Context(), "f", []byte(existing)); err != nil {
 				t.Fatal(err)
 			}
-			mode := fs.FileMode(0o600)
-			if err := backing.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}); err != nil {
+			accessed := time.Unix(1500000000, 123)
+			if err := backing.SetAttr(t.Context(), "f", storage.AttrChange{AccessTime: &accessed}); err != nil {
 				t.Fatal(err)
 			}
 			w := serve(t, h, httprest.Request{Op: httprest.OpSetAttr, Path: "f"}, body)
@@ -336,8 +336,8 @@ func TestAMalformedChangeChangesNothing(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if info.Mode != mode {
-				t.Fatalf("the stored file has mode %v, want the untouched %v", info.Mode, mode)
+			if !info.AccessTime.Equal(accessed) {
+				t.Fatalf("the stored file has access time %v, want the untouched %v", info.AccessTime, accessed)
 			}
 		})
 	}
@@ -374,17 +374,13 @@ func TestAStorageErrorCarriesItsErrnoByName(t *testing.T) {
 		}
 	}
 
-	// setattr carries a body, so it is its own case. The mode names a kind of node rather
-	// than a permission, which the storage refuses; the errno has to arrive by name like
-	// any other.
-	kind := fs.ModeSymlink | 0o644
+	// Attribute requests preserve storage errors after their body is decoded.
 	for _, c := range []struct {
 		change storage.AttrChange
 		path   string
 		want   string
 	}{
 		{storage.AttrChange{}, "missing", "ENOENT"},
-		{storage.AttrChange{Mode: &kind}, "d", "EINVAL"},
 		{storage.AttrChange{}, "../outside", "EINVAL"},
 	} {
 		w := serve(t, h, httprest.Request{Op: httprest.OpSetAttr, Path: c.path}, changeBody(t, c.change))
@@ -816,8 +812,8 @@ func TestAnOversizedAttributeChangeIsAProtocolFault(t *testing.T) {
 	if err := s.Write(t.Context(), "f", nil); err != nil {
 		t.Fatal(err)
 	}
-	mode := fs.FileMode(0o600)
-	if err := s.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}); err != nil {
+	accessed := time.Unix(1500000000, 123)
+	if err := s.SetAttr(t.Context(), "f", storage.AttrChange{AccessTime: &accessed}); err != nil {
 		t.Fatal(err)
 	}
 	options := httprest.DefaultHandlerOptions()
@@ -840,8 +836,8 @@ func TestAnOversizedAttributeChangeIsAProtocolFault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode != mode {
-		t.Fatalf("the refused change altered the mode to %v", info.Mode)
+	if !info.AccessTime.Equal(accessed) {
+		t.Fatalf("the refused change altered the access time to %v", info.AccessTime)
 	}
 }
 
@@ -1214,11 +1210,11 @@ func TestMalformedRequestsGetTheirOwnStatus(t *testing.T) {
 		uri    string
 		want   int
 	}{
-		{"an operation that does not exist", http.MethodGet, "/v3/teleport?path=a", http.StatusNotFound},
+		{"an operation that does not exist", http.MethodGet, "/v4/teleport?path=a", http.StatusNotFound},
 		{"nothing under the prefix", http.MethodGet, "/", http.StatusNotFound},
-		{"the wrong method", http.MethodGet, "/v3/remove?path=a", http.StatusMethodNotAllowed},
-		{"a query that does not parse", http.MethodGet, "/v3/stat?path=%zz", http.StatusBadRequest},
-		{"no path operand", http.MethodGet, "/v3/stat", http.StatusBadRequest},
+		{"the wrong method", http.MethodGet, "/v4/remove?path=a", http.StatusMethodNotAllowed},
+		{"a query that does not parse", http.MethodGet, "/v4/stat?path=%zz", http.StatusBadRequest},
+		{"no path operand", http.MethodGet, "/v4/stat", http.StatusBadRequest},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

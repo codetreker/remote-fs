@@ -25,6 +25,8 @@ CREATE INDEX changes_by_position_identity ON changes (
 
 CREATE INDEX changes_by_volume ON changes (volume, position);
 
+CREATE INDEX close_intents_by_node ON close_intents (volume, node, incarnation, reference);
+
 CREATE INDEX entries_by_node ON entries (node);
 
 CREATE INDEX entries_by_node_identity ON entries (
@@ -41,6 +43,10 @@ CREATE INDEX logs_by_change_identity ON logs (
 );
 
 CREATE INDEX nodes_by_content ON nodes (content);
+
+CREATE INDEX nodes_by_volume ON nodes (volume, id);
+
+CREATE INDEX nodes_pending_unlink ON nodes (volume, id) WHERE pending_unlink = 1;
 
 CREATE INDEX objects_by_state ON objects (volume, state, created_sec);
 
@@ -68,7 +74,6 @@ CREATE TABLE changes (
 	from_parent       INTEGER,
 	from_name         BLOB,
 	node              INTEGER,
-	mode              INTEGER,
 	size              INTEGER,
 	atime_sec         INTEGER,
 	atime_nsec        INTEGER,
@@ -77,7 +82,15 @@ CREATE TABLE changes (
 	content           TEXT,
 	recorded_sec      INTEGER NOT NULL,
 	recorded_nsec     INTEGER NOT NULL
-);
+	, node_kind INTEGER, birth_sec INTEGER, birth_nsec INTEGER, change_sec INTEGER, change_nsec INTEGER, metadata BLOB, link_target BLOB, directory_revision BLOB);
+
+CREATE TABLE close_intents (
+	volume INTEGER NOT NULL,
+	node INTEGER NOT NULL,
+	incarnation BLOB NOT NULL,
+	reference BLOB PRIMARY KEY,
+	if_empty INTEGER NOT NULL CHECK (if_empty IN (0, 1))
+) WITHOUT ROWID;
 
 CREATE TABLE database_state (
 	singleton         INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -116,14 +129,13 @@ CREATE TABLE logs (
 CREATE TABLE nodes (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
 	volume  INTEGER NOT NULL REFERENCES volumes(id),
-	mode       INTEGER NOT NULL,
 	size       INTEGER NOT NULL,
 	atime_sec  INTEGER NOT NULL,
 	atime_nsec INTEGER NOT NULL,
 	mtime_sec  INTEGER NOT NULL,
 	mtime_nsec INTEGER NOT NULL,
 	content    TEXT REFERENCES objects(key)
-	, detached INTEGER NOT NULL DEFAULT 0, content_revision INTEGER NOT NULL DEFAULT 1);
+	, detached INTEGER NOT NULL DEFAULT 0, content_revision INTEGER NOT NULL DEFAULT 1, kind INTEGER NOT NULL DEFAULT 1, birth_sec INTEGER, birth_nsec INTEGER, change_sec INTEGER, change_nsec INTEGER, metadata BLOB NOT NULL DEFAULT X'52464d010000', link_target BLOB NOT NULL DEFAULT X'', directory_revision BLOB NOT NULL DEFAULT X'', pending_unlink INTEGER NOT NULL DEFAULT 0 CHECK (pending_unlink IN (0, 1)), pending_generation INTEGER NOT NULL DEFAULT 0 CHECK (pending_generation >= 0));
 
 CREATE TABLE objects (
 	key          TEXT PRIMARY KEY,
@@ -144,5 +156,40 @@ CREATE TABLE volumes (
 	name TEXT    NOT NULL UNIQUE,
 	root INTEGER NOT NULL,
 	used INTEGER NOT NULL
-);
+	, metadata_used INTEGER NOT NULL DEFAULT 0
+	CHECK (typeof(metadata_used) = 'integer' AND metadata_used >= 0));
+
+CREATE TRIGGER changes_metadata_delete AFTER DELETE ON changes BEGIN
+	UPDATE volumes SET metadata_used = metadata_used - coalesce(length(OLD.metadata), 0) - coalesce(length(OLD.link_target), 0)
+	WHERE id = OLD.volume;
+	END;
+
+CREATE TRIGGER changes_metadata_insert AFTER INSERT ON changes BEGIN
+	UPDATE volumes SET metadata_used = metadata_used + coalesce(length(NEW.metadata), 0) + coalesce(length(NEW.link_target), 0)
+	WHERE id = NEW.volume;
+	END;
+
+CREATE TRIGGER changes_metadata_update AFTER UPDATE OF metadata, link_target, volume ON changes BEGIN
+	UPDATE volumes SET metadata_used = metadata_used - coalesce(length(OLD.metadata), 0) - coalesce(length(OLD.link_target), 0)
+	WHERE id = OLD.volume;
+	UPDATE volumes SET metadata_used = metadata_used + coalesce(length(NEW.metadata), 0) + coalesce(length(NEW.link_target), 0)
+	WHERE id = NEW.volume;
+	END;
+
+CREATE TRIGGER nodes_metadata_delete AFTER DELETE ON nodes BEGIN
+	UPDATE volumes SET metadata_used = metadata_used - length(OLD.metadata) - length(OLD.link_target)
+	WHERE id = OLD.volume;
+	END;
+
+CREATE TRIGGER nodes_metadata_insert AFTER INSERT ON nodes BEGIN
+	UPDATE volumes SET metadata_used = metadata_used + length(NEW.metadata) + length(NEW.link_target)
+	WHERE id = NEW.volume;
+	END;
+
+CREATE TRIGGER nodes_metadata_update AFTER UPDATE OF metadata, link_target, volume ON nodes BEGIN
+	UPDATE volumes SET metadata_used = metadata_used - length(OLD.metadata) - length(OLD.link_target)
+	WHERE id = OLD.volume;
+	UPDATE volumes SET metadata_used = metadata_used + length(NEW.metadata) + length(NEW.link_target)
+	WHERE id = NEW.volume;
+	END;
 

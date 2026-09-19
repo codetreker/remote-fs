@@ -1,0 +1,29 @@
+{
+  "format": 1,
+  "qemu": {
+    "version": "11.1.0",
+    "url": "https://qemu.weilnetz.de/aarch64/qemu-arm-setup-20260811.exe",
+    "sha512": "51db3e9f8afe9e3046ecab114d5c4718f6f8844e956dd1cb60591a903eb99b74feaf7cf7eb295cc2faacc0b2befd19a646a58a86db980be4dbf1b4a7d9d8d6a7",
+    "size": 151734264,
+    "machine": "pc-q35-11.1"
+  },
+  "kernel": {
+    "release": "6.12.107+deb13-cloud-amd64",
+    "url": "https://snapshot.debian.org/archive/debian/20260914T000000Z/pool/main/l/linux-signed-amd64/linux-image-6.12.107+deb13-cloud-amd64_6.12.107-1_amd64.deb",
+    "sha256": "04434ff520f860423eafe4203d986a35682ce73c2f71baa39e988ca0da93ac91",
+    "size": 34402644,
+    "vmlinuz_sha256": "d1bc2c60a78ae6979736d081bc3c90e45ace6baf414f767dff588e319d3492bd",
+    "config_sha256": "9af3363699ff867d94b97d5bd9215b3fe52e9e73182928d77387773171071c9a",
+    "modules": {
+      "virtio_blk": "4f359fd81330283e896adb406691cb0b507fdb2d394d6c392811273b2e1d7d32",
+      "virtio-rng": "3449d04fb1e75417cdfc96627113c64dedda4af0004e918c0ef6228918759c7e",
+      "failover": "6c767118072d75540f0f9f03309c7dca69e07a881b3ae7da19ba2d5a59e2950d",
+      "net_failover": "9297671a356d9583ca6482332df465c3d7e85e27882338783651f76719f14edf",
+      "virtio_net": "a01b6da24399a21689be2c3cd82fc8808e1ed2c95775af6dac15092737c193b6"
+    }
+  },
+  "go_version": "go1.26.8",
+  "volume": "fixture-current",
+  "quota_bytes": 67108864,
+  "disk_bytes": 1073741824
+}

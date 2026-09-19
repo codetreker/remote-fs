@@ -13,7 +13,7 @@ localstore.Store
   └─ objectstore.Storage
        ├─ localdisk.Objects       不可变对象、物理容量、恢复与独占锁
        └─ sqlite.Store            volume、保留节点、配额、变更日志与最终发布
-            ├─ advisory          句柄与建议锁的 volume 资源域
+            ├─ advisory          引用、中立 owner/范围与物化的 volume 资源域
             └─ locking.Authority  强 S/X 占有；恢复证据由组合层绑定
 ```
 
@@ -31,7 +31,7 @@ SQLite 的 schema、数据库状态、原生 lease 证据与日志组件由[内�
 |---|---|
 | `Log()` | 返回与 volume 修改同事务提交的 durable change log |
 | `LockService()` | 返回与本 volume 原生发布绑定的文件占有管理服务 |
-| `NewFileSession(ctx, options)` | 创建有界文件会话，打开与持续访问同一节点；过期或退役后不按路径重开 |
+| `NewFileSession(ctx, options)` | 创建有界文件会话及可选中立能力，保留 File/NodeReference；过期或退役后不按路径重开 |
 | `Sweep(ctx, limit)` | 删除至多 `limit` 个已记录的未引用对象 |
 | `MaintenanceStatus()` | 返回最近一次后台清扫的时间、删除数与错误 |
 | `Status(ctx)` | 合并逻辑空间、对象记录、本地磁盘、checkpoint 与维护状态 |
@@ -132,7 +132,11 @@ SQLite writer 使用 WAL、单 writer connection、`BEGIN IMMEDIATE`、`synchron
 
 普通读取先在 database health 的共享门内检查 authority 健康状态，启动只读 transaction，并用对 `database_state` 的第一条常量查询钉住 SQLite snapshot；随后释放 health 门，再执行路径扫描、page production 与 caller-owned result accounting。最终发布从权限判定到 commit、witness 或失败隔离结束期间阻止新的 snapshot capture；已经捕获的旧 snapshot 可以继续完成。对象读取在该 snapshot 中取得 node、size 与不可变 object key，再在门外取得 payload。长扫描、payload I/O 和调用方预算回调不会继续阻挡 mutation 的 commit/Accept 边界。
 
-只读 transaction 使用其拥有的 context 解释查询与回滚结果。纯取消保留原因并返回 `EINTR`；该 context 已取消时，直接的 `sql.ErrTxDone` 可表示 `database/sql` 已自动回滚，包括回调成功后才发生的取消。SQLite `SQLITE_INTERRUPT` 只在读取 context 确已取消时映射为取消；deadline、真实查询或独立 cleanup 故障仍是错误。未知 commit 与 poison 拥有 `EIO` 分类，不因保留的 context 原因改成 `EINTR`。该规则也用于 client 的 SQLite replica，取舍见[请求中断](../../../.agents/notes/implemented/bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)。
+普通读取、snapshot、mutation 和 Replica Apply/Seeding 的 transaction 显式取得所属 reader/writer pool 的 `sql.Conn`，沿用各操作既定的 transaction context；私有拥有者保留连接直到统一收尾。无论已经 Commit 还是中止，收尾都调用 `Tx.Rollback`，再对绑定的 `Conn.Close` 执行一次并等待连接归还，保留该次关闭错误；BeginTx 失败也关闭已取得的连接。`database/sql` 自动回滚先标记 transaction 已结束，直接 `sql.ErrTxDone` 本身不代表连接已归还。清理不屏蔽原有取消、不轮询 pool 状态，也不重试事务或关闭。
+
+mutation 和 Replica 的连接收尾在释放 health/commit/Replica 门之前完成；读结果和 Seeding 的完成/中止也不能越过自己的连接归还。启动 schema Prepare 同样显式取得连接、以原 context BeginTx，并在准备成功或失败返回前完成 Rollback 与绑定 Conn.Close；BeginTx 失败仍关闭连接。准备清理只有在连接关闭成功时才接受直接 ErrTxDone，其余 cleanup 原因保留为 durability failure，不能覆盖已有未知 commit。事务清理失败继续由既有隔离与 poison 规则处理，不因 transaction 已标记结束就释放数据库原生所有权。成功 Commit、见证发布、snapshot capture 的原有顺序、迁移 SQL 与结果分类保持。
+
+只读 transaction 使用其拥有的 context 解释查询与回滚结果。只有连接关闭成功后保留的直接 `sql.ErrTxDone`，且该 context 已取消，才可按自动回滚处理，包括回调成功后才发生的取消。纯取消保留原因并返回 `EINTR`；deadline、真实查询或独立 cleanup 故障保持 `EIO`。连接关闭的错误单独保留为 cleanup failure，即使它包含 context 原因或 `ErrConnDone` 也不能被取消覆盖。SQLite `SQLITE_INTERRUPT` 只在读取 context 确已取消时映射为取消。未知 commit 与 poison 的 `EIO` 分类不因保留 context 原因改变。该规则也用于 client 的 SQLite replica，取舍见[请求中断](../../../.agents/notes/implemented/bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)。
 
 `METASTORE` 是 SQLite WAL 之外的确认边界。它记录完整的已接受状态 A：数据库 identity、generation、node high-water 与 change high-water，并另记已经完整进入主数据库的 checkpoint generation C，始终满足 `0 <= C <= A.generation`。每次 durable open 或 mutation 先提交 SQLite，再用 `.METASTORE.stage` 写入并同步下一份 A，以 rename 原子替换 `METASTORE`，最后同步 root；见证发布完成后调用才可返回成功。A/C 只来自完整验证的 final；stage 不补充确认记录，也不被提升为已接受状态。确认发布失败会 poison SQLite，后续读、写与 checkpoint 均以 `EIO` 拒绝。
 
@@ -143,6 +147,16 @@ Open 早期只检查，不清理 stage。SQLite 的数据库 identity、generati
 rename 本身失败时，publisher 删除未接受的 stage 并同步 root；清理失败则保留错误与现场。`Checkpoint` publication 失败不会 poison accepted state，清理成功后后台 worker 或关闭可以重试；这也包括 rename 已发生、最终 root barrier 失败的 checkpoint 尝试。`Accept` publication 的任何失败都会 poison 当前 SQLite，因为已提交状态没有完成 acknowledgment；rename 已发生而 root barrier 失败时，重开再以 final witness、WAL 与 visible state 对账。
 
 打开前先记录 WAL 是否存在以及是否超过 32 字节 header。若 `C < A.generation`，非空 WAL 是已确认状态仍然存在的必要证据，缺失、空文件或仅有 header 都以 `EIO` 拒绝。SQLite 打开后可见状态的数据库 identity 必须等于 A；generation 小于 A 表示确认状态回退，等于 A 时全部高水位必须完全相同。只有打开前已有非空 WAL 时，可见 generation 才可大于 A；这表示 SQLite commit 已发生而见证尚未完成，打开事务会继续前进并发布新的 A。高水位在任何恢复路径上都不能倒退。
+
+### v6 节点、metadata 与删除状态
+
+migration 6 在既有一个准备事务中增加 NodeKind、可选 BirthTime/ChangeTime、规范 metadata、link_target、directory_revision 和 pending 字段，并记录有界 close_intents。1–5 的 SQL 不改写；合法旧 mode 的类型与权限分别转换，旧的创建/变更时间为 Unknown。历史 change 的属性独立转换并保留 position，不用当前节点生成过去事实。
+
+旧 v5 先按原布局 preflight，新格式再核对完整 volume、对象、原始名字、metadata 与计数。volumes.metadata_used 通过节点和历史表 triggers 记录编码及 link-target 总长，包含 detached 与历史副本；校验失败不会把缺失计数或 intent 当成空。schema version 与 witness 中的 dbstate.State 分开验证，witness 本身没有 schema version。
+
+设旧 v5 已确认 generation 为 G，升级 SQL 为 v6/G+1。v5/G 与 accepted G 的完整 State 一致，且已有 checkpoint 或必要 WAL 时，可重做未提交的升级。可见 v6/G+1 而 accepted 仍为 G，只在启动前存在非空 WAL、身份/高水位及完整性均正确时接受；Reach 不重跑6，普通准备仍推进到 G+2 并 Commit/Accept。可见 v5/G 而 accepted 为 G+1、同代不同 State、身份或 high-water 回退、缺失必要 WAL 均拒绝，不重置版本或删除证据。
+
+schema 准备阶段只回收已无名字的 detached 节点，完整保留有名 PendingUnlink 与旧 incarnation 的 armed intent。Strong machinery 和恢复 gate 建立后，运行期有界清理才激活/消费旧 intent 并经正常 gate 删除名字；冲突的新打开不能穿过这段恢复。旧引用不会恢复为新 handle，未知结果保留持久状态与 charge。
 
 ### 文件占有的持久恢复
 
@@ -245,17 +259,17 @@ shard identity 或对象 publication 已经发生后，任何无法证明 direct
 
 ### 保留节点与范围修改
 
-`metastore.FileStore` 在同一原生 gate 内完成路径或节点身份核对、创建／截断与引用保留。`ExpectedID` 不匹配以 `ESTALE` 失败；创建不存在的文件、排他创建判断、初始属性与返回的引用属于同一次结果。保留引用绑定 node ID，改名不改变它；unlink 或 rename 替换目的地时，仍有 pin 的普通文件成为 `detached`，其当前 object 引用、属性与配额继续保留。路径查询与 named snapshot 不暴露 detached 节点，其后修改不产生 named change event；句柄仍可读取、修改当前状态。
+`metastore.FileStore` 在同一原生 gate 内完成路径或节点身份核对、创建／截断与引用保留。`ExpectedID` 不匹配以 `ESTALE` 失败；创建不存在的文件、排他创建判断、初始属性与返回的引用属于同一次结果。保留引用绑定 node ID，改名不改变它；unlink 或 rename 替换目的地时，仍有引用的节点成为 detached；File 与 NodeReference 共用原 retainedFile，文件的当前 object 引用、属性与配额继续保留。路径查询与 named snapshot 不暴露 detached 节点，其后修改不产生 named change event；文件仍可读写当前内容，metadata/目录引用只提供其已授权的操作，detached 目录不接受新子项。
 
 句柄的 `ReadAt` 每次从一份 `FileState` 取得 node、size、object key 和 content revision，再在原生 gate 外读取该不可变对象。返回的属性、范围与 EOF 来自这同一状态。旧对象已被清扫且节点已指向另一对象时有界重试；节点仍指向缺失对象时以 `EIO` 失败。一次调用可以输给持续覆盖而返回 `EAGAIN`，不会拼接两份状态。
 
 `WriteAt` 与 `Truncate` 先读取当前完整对象，在有界内存中生成下一份完整内容：范围之外保留当前字节，扩展部分为零。随后按 `Reserve → Put → Commit` 发布，以读取时的 `content_revision` 做原生 CAS；revision 不符表示未提交，成功清理本次新对象后才能重新读取并尝试。真实提交、持久确认或 cleanup 结果未知时立即报错并保留失败隔离，不重放可能已生效的写入。普通重叠写入可依实际顺序各自成功；这项内部重试不是调用方显式内容版本校验的承诺。每次写入和截断成功前完成服务端确认，关闭不补交旧整文件快照。
 
-关闭或会话退役先在最终发布 gate 内撤销引用权限，再排空已接纳的 materialization 与上传，最后释放 native pin。最后一个 pin 关闭 detached 节点时，在同一事务中删除节点、按实际剩余大小释放配额，并把当前对象标为 garbage；真正对象删除由 sweeper 执行。已被逻辑退休的引用不能因为物理字节尚在而继续发布。关闭结果未知会保留 pin 并失败隔离，不宣告配额已释放；旧 epoch 的引用明确失效，不按原路径重建。会话与 advisory 锁的生命周期见[文件句柄](file-handles.md)。
+关闭或会话退役先在最终发布 gate 内撤销引用权限，再排空已接纳的 materialization 与上传，最后释放 native pin。armed CloseIntent 的触发/消费持久成功之前保留保护；仍有名字的 pending 删除必须等待正常 Strong gate。最后一个 pin 关闭 detached 节点时，在同一事务中删除节点、按实际剩余大小释放配额，并把当前对象标为 garbage；真正对象删除由 sweeper 执行。已被逻辑退休的引用不能因为物理字节尚在而继续发布。关闭结果未知会保留 pin 并失败隔离，不宣告配额已释放；旧 epoch 的引用明确失效，不按原路径重建。会话与 advisory 锁的生命周期见[文件句柄](file-handles.md)。
 
 ## 七、容量与资源上限
 
-本地持久 store 必须带正数 volume 配额。SQLite 精确记录 named 与 retained detached 文件当前引用的 payload bytes，并在改变引用与大小的同一 transaction 中以 `EDQUOT` 拒绝超额写入。失去名字不释放仍由打开引用持有的配额；最后物理引用已知关闭后才扣除。reserved、unresolved 与 garbage object、envelope 与 recovery state 不计入逻辑 `Used`，但占用物理磁盘。
+本地持久 store 必须带正数 volume 配额。SQLite 精确记录 named 与 retained detached 普通文件的内容 bytes 和符号链接目标 bytes，并在改变引用与大小的同一 transaction 中以 `EDQUOT` 拒绝超额写入。失去名字不释放仍由打开引用持有的配额；最后物理引用已知关闭后才扣除。reserved、unresolved 与 garbage object、envelope 与 recovery state 不计入逻辑 `Used`，但占用物理磁盘。
 
 `sqlite.ObjectLimits` 另行限制一个 volume 中 reserved、unresolved 与 garbage records 合计的数量和记录 payload bytes。单个请求的 payload 大于 `MaxPendingBytes` 时 `Reserve` 以 `EFBIG` 拒绝，因为任何后台工作都无法让它单独装进阈值；请求本身能装下、但现有 backlog 使新增记录越过数量或字节阈值时返回 `EAGAIN`。拒绝与插入在同一 write transaction 中完成，不上传对象，也不留下 reservation。
 
@@ -263,7 +277,7 @@ unresolved 没有自动恢复或删除路径。重复的未知 `Put` 结果可�
 
 零值 fields 由 `ObjectLimits.Effective()` 换成默认值；负值与 `math.MaxInt64` 被拒绝，没有 unbounded 取值。commit、覆盖、删除和改名必须继续完成其权威状态转换，其中解除 live object 引用的操作可以把 garbage backlog 推到阈值之上；`Quarantine` 与 `Abandon` 也始终可用，且 reserved→unresolved 或 reserved→garbage 都保持 pending count/bytes 不变。`ObjectStatus.OverLimit` 只在 count 或 bytes 严格大于 effective threshold 时为 true；恰好等于阈值仍是 within-limit 状态，但新的 reservation 可能已经没有余量。over-limit 时新的 reservation 持续返回 `EAGAIN`，garbage 清扫与 volume shedding 仍可进行，直到回到阈值内。limits 是 serving configuration，重新打开可以选择不同的有限值。
 
-`Reserve` 的热路径只读取 indexed pending totals；volume 打开与 `ObjectStatus` 执行完整性验证。每个 volume 的 named 节点必须是从唯一 root 可达的一棵树：root 没有 incoming entry，其余 named 节点恰有一个同 volume 的名字。detached 节点只能是非 root 的普通文件，没有名字，也不能作为 entry 的父或子节点；其它孤儿、cycle 与跨 volume entry 都是 `EIO`。`volumes.used` 必须是非负整数，并等于 named 与 detached 全部 regular-file size 的 overflow-checked streaming sum；object state 与 size 同样逐项验证。SQLite storage class 也逐列验证：entry/change name 是 BLOB，identity/key 是非空 text，标量为 integer，`detached` 只能为 0 或 1，`content_revision` 必须为正，可空 change node/from fields 必须按 kind 成组出现，mode、size、position 与纳秒范围有效。对 schema version、database identity、backing-store binding、snapshot/log header 与 append tail 等动态标量，查询先用 `typeof`／长度条件把错误类型投影成 NULL，再由 Go 拒绝 storage class，不让 driver 把超大 BLOB 或错误类型强制成可信的整数／字符串。任何会改变 cursor order 的记录也以 `EIO` 拒绝。
+`Reserve` 的热路径只读取 indexed pending totals；volume 打开与 `ObjectStatus` 执行完整性验证。每个 volume 的 named 节点必须是从唯一 root 可达的一棵树：root 没有 incoming entry，其余 named 节点恰有一个同 volume 的名字。detached 节点必须是合法的非 root 保留对象，没有名字或目录边，detached 目录为空；其它孤儿、cycle 与跨 volume entry 都是 `EIO`。`volumes.used` 必须是非负整数，并等于 named 与 detached 全部普通文件内容及符号链接目标 size 的 overflow-checked streaming sum；object state 与 size 同样逐项验证。SQLite storage class 也逐列验证：entry/change name 是 BLOB，identity/key 是非空 text，标量为 integer，`detached` 只能为 0 或 1，`content_revision` 必须为正，可空 change node/from fields 必须按 kind 成组出现，NodeKind、metadata、size、position 与纳秒范围有效。对 schema version、database identity、backing-store binding、snapshot/log header 与 append tail 等动态标量，查询先用 `typeof`／长度条件把错误类型投影成 NULL，再由 Go 拒绝 storage class，不让 driver 把超大 BLOB 或错误类型强制成可信的整数／字符串。任何会改变 cursor order 的记录也以 `EIO` 拒绝。
 
 `database_state` 保存 32 ASCII 字节的小写十六进制 database identity，以及单调的 generation、node high-water 与 change high-water。节点 ID 和 change position 都由对应 high-water 显式分配，再以显式主键插入；SQLite `AUTOINCREMENT` 与 `sqlite_sequence` 继续作为冗余约束。数据库打开、checkpoint、`DurableState` 与每个 `Since` page 要求 sequence 和对应 high-water 完全相等，并通过按 storage-class discriminator／最大 identity 排序的 expression indexes 读取全数据库的类型异常与最大 surviving node/change reference；任一 volume 的引用超过高水位都会失败，不扫描全部 rows。每次分配重新核对 sequence；change append 还要求现有 committed tail 严格小于新分配的位置，否则事务以 `EIO` 回滚。volume 完整性查询再校验目标 volume 的逐行关系。达到 `math.MaxInt64` 时以 `ENOSPC` 拒绝，不绕回或复用。`METASTORE` 中的外部副本还能检测 `database_state` 与 `sqlite_sequence` 被一同回退的情况。
 
@@ -307,6 +321,7 @@ Avail = min(max(quota - Used, 0), localdisk.Available)
 | SQLite snapshot reader connections | 16 |
 | SQLite integrity records examined | 1,000,000 |
 | SQLite integrity name bytes examined | 64 MiB |
+| SQLite metadata/link-target（含 detached 与历史） | 64 MiB |
 | volume 中保留的 native file references | 65536 |
 | retained-file 单个完整内容 | 1 GiB |
 | volume materialization 的 current + next bytes | 2 GiB |
@@ -321,9 +336,15 @@ Avail = min(max(quota - Used, 0), localdisk.Available)
 
 `MaxRetainedFiles` 统计 volume 中的 native 引用数，同一节点的多次打开分别计费；满额以 `EAGAIN` 拒绝。`advisory.Config` 同时拥有 volume 级 materialization operation／byte budget，句柄内容操作在读取 payload 和分配下一份内容前收费。写入收取 current + next，读取收取完整对象加返回范围；单项不能装入上限时为 `EFBIG`，容量被其它操作占用时为 `EAGAIN`。`MaxMaterializedBytes` 必须至少容纳两份 `MaxFileBytes`，共享 volume 的 opener 必须使用相同配置。这些预算不替代 localdisk 物理 admission、pending object 阈值或 HTTP retention 上限。
 
+sqlite.Options.MaxMetadataBytes 限制 metadata 与 link-target 的总存储，默认 64 MiB，与内容 Used 和 integrity-name 工作上限分开。SQL mutation、replica ingest、日志裁剪与节点回收维护同一个 metadata_used；增长越界在事务内拒绝，读取和打开先验证计数/长度再载入 payload。Name/Attr 返回还遵守请求级 result budget，不能只靠这个持久总量上限控制同时驻留的 map。
+
+MaintenanceAccounting 以原 commit gate 原子读取 Usage、初始化 quota 账本并绑定一条维护 chain。活引用保留创建时捕获的 chain；旧 incarnation 的恢复在 gate 中获取当前 chain。恢复与 live Close 不重复结算，不能先安装新链再以旧计数开放清理。
+
 ## 八、维护、状态与关闭
 
 `objectstore.New` 使用 `DefaultOptions()`（1 分钟 interval、64 个对象一批），`NewWithOptions` 接受显式覆盖；interval 必须为正，batch 必须在 1 到 `MaxSweepBatch`（1,048,576）之间。两者都启动一个由 storage lifetime 持有的 sweeper，并立即安排一次 startup sweep。成功的 `Write`、`Remove`、`Rename` 与把 reservation 改成 garbage 的 `Abandon` 都发送一个容量为 1 的触发信号，突发修改会合并；周期 ticker 也会触发，因此一次 transient failure 在 backend 恢复后无需重启或新 mutation 就会重试。一次只运行一个 sweep，metastore 通过 garbage-only 索引按创建时间取至多配置的 batch；正好删满一个 batch 时重新排队，继续以有界批次排空已经可达的 backlog。reserved 与 unresolved 不是清扫候选。对象删除成功后才调用 `Forget`；`Forget` 只接受 garbage 或已经缺席的 key，对 reserved、unresolved、referenced 以 `EINVAL` 拒绝，未知 state 以 `EIO` 拒绝，一个批次的检查与删除在同一 transaction 中完成。对象删除失败保留 garbage 记录；元数据提交结果未知时保持失败隔离，不能承诺记录仍在并按确定未提交的结果继续清扫。
+
+文件清理沿同一 storage lifetime 的有界维护路径重试失败 Close 和旧 incarnation 的 PendingUnlink；它不为每个 intent 创建独立循环。恢复扫描保留游标并跳过当前 incarnation，正常 Strong 冲突延迟有名删除，未知保留拥有者与账本。live Close 仍使用其创建时捕获的 hooks，不被当前维护 chain 偷换。
 
 `MaintenanceStatus` 保存最近一次已完成尝试的时间、删除数与错误。后续成功会清除旧错误。关闭请求取消正在运行的 background sweep，并等待它结束；若这次尝试返回 cancellation，其错误链仍保存在状态中，不会被静默抹掉。
 

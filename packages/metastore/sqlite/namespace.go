@@ -1,0 +1,142 @@
+package sqlite
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"math"
+	"syscall"
+
+	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
+	"github.com/codetreker/remote-fs/packages/storage"
+)
+
+func (s *Store) CheckNamespaceAccess() error { return s.CheckFileStore() }
+
+func (s *Store) directoryTarget(ctx context.Context, tx *sql.Tx, target storage.DirectoryTarget, uses storage.Uses) (metastore.FileState, storage.UseScope, error) {
+	if target.NodeID > math.MaxInt64 {
+		return metastore.FileState{}, storage.UseScope{}, syscall.ESTALE
+	}
+	var scope storage.UseScope
+	if target.Scope != nil {
+		file, err := s.resolveUseScope(ctx, *target.Scope, target.NodeID, uses)
+		if err != nil {
+			return metastore.FileState{}, scope, err
+		}
+		scope = file.scope
+	}
+	node, err := s.fileState(ctx, tx, int64(target.NodeID))
+	if err != nil {
+		return metastore.FileState{}, scope, err
+	}
+	if !node.IsDir() {
+		return metastore.FileState{}, scope, syscall.ENOTDIR
+	}
+	if node.Detached {
+		return metastore.FileState{}, scope, syscall.ESTALE
+	}
+	if err := s.fileDomain.coordinator.CheckUse(ctx, target.NodeID, scope, uses); err != nil {
+		return metastore.FileState{}, scope, err
+	}
+	return node, scope, nil
+}
+
+func (s *Store) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	result, err := storage.NewListResult(storage.MaxDirectoryBytes, 0, func(index int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		if index >= storage.MaxDirectoryEntries {
+			return 0, syscall.EFBIG
+		}
+		return storage.ObservedEntryBytes(nameBytes, metadataBytes)
+	})
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	observation, err := s.ReadDirNodeBounded(ctx, target, result)
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	entries, err := result.Entries()
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	observed := storage.ObservedDirectory{Observation: observation, Entries: make([]storage.ObservedEntry, len(entries))}
+	for i, entry := range entries {
+		observed.Entries[i] = storage.ObservedEntry{RawLeaf: []byte(entry.Name), Attr: entry.Attr}
+	}
+	if err := observed.Check(); err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	return observed, nil
+}
+
+func (s *Store) ReadDirNodeBounded(ctx context.Context, target storage.DirectoryTarget, result *storage.ListResult) (observation storage.DirectoryObservation, returned error) {
+	if result == nil {
+		return storage.DirectoryObservation{}, syscall.EINVAL
+	}
+	defer func() {
+		if returned != nil {
+			result.Fail(returned)
+		}
+	}()
+	if err := target.Check(); err != nil {
+		return storage.DirectoryObservation{}, err
+	}
+	if err := s.coordinator.commit.acquire(ctx); err != nil {
+		return storage.DirectoryObservation{}, err
+	}
+	defer s.coordinator.commit.release()
+	if err := s.checkFileOwnership(); err != nil {
+		return storage.DirectoryObservation{}, err
+	}
+	if err := metastore.CheckFilePublication(ctx); err != nil {
+		return storage.DirectoryObservation{}, err
+	}
+	err := s.inspect(ctx, func(tx *sql.Tx) error {
+		parent, _, err := s.directoryTarget(ctx, tx, target, storage.ReadEntries)
+		if err != nil {
+			return err
+		}
+		observation = storage.DirectoryObservation{ParentID: target.NodeID, Revision: bytes.Clone(parent.DirectoryRevision)}
+		return s.listChildrenBounded(ctx, tx, parent.ID, result)
+	})
+	if err != nil {
+		return storage.DirectoryObservation{}, sqlerr.Failure(err)
+	}
+	return observation, nil
+}
+
+func (s *Store) LookupAt(ctx context.Context, name storage.ChildName) (storage.Attr, error) {
+	if err := name.Check(); err != nil {
+		return storage.Attr{}, err
+	}
+	if err := s.coordinator.commit.acquire(ctx); err != nil {
+		return storage.Attr{}, err
+	}
+	defer s.coordinator.commit.release()
+	if err := s.checkFileOwnership(); err != nil {
+		return storage.Attr{}, err
+	}
+	if err := metastore.CheckFilePublication(ctx); err != nil {
+		return storage.Attr{}, err
+	}
+	var node metastore.Node
+	err := s.inspect(ctx, func(tx *sql.Tx) error {
+		if _, _, err := s.directoryTarget(ctx, tx, name.Parent, 0); err != nil {
+			return err
+		}
+		id, found, err := s.lookupNodeID(ctx, tx, int64(name.Parent.NodeID), name.RawLeaf)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return syscall.ENOENT
+		}
+		node, err = s.returnedNode(ctx, tx, id)
+		return err
+	})
+	if err != nil {
+		return storage.Attr{}, sqlerr.Failure(err)
+	}
+	return node.Attr(), nil
+}

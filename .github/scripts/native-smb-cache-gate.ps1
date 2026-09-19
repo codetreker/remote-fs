@@ -1,0 +1,257 @@
+param(
+    [Parameter(Mandatory)]
+    [ValidateSet('Prepare', 'Run', 'Verify')]
+    [string]$Phase
+)
+
+$ErrorActionPreference = 'Stop'
+$workspace = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
+$gateRoot = Join-Path $workspace '.tmp/native-cache-gate'
+$fixture = Join-Path $gateRoot 'fixture'
+$results = Join-Path $gateRoot 'results'
+$expectedSource = '1cb9ad7f49d998de4daa4d562d766b18cf06ce16'
+
+function Get-CachePolicy {
+    $policy = Get-SmbClientConfiguration
+    return [ordered]@{
+        FileNotFoundCacheLifetime = $policy.FileNotFoundCacheLifetime
+        DirectoryCacheLifetime = $policy.DirectoryCacheLifetime
+        FileInfoCacheLifetime = $policy.FileInfoCacheLifetime
+    }
+}
+
+function Get-MappingKeys {
+    return @(Get-SmbMapping | ForEach-Object { "$($_.LocalPath)|$($_.RemotePath)" } | Sort-Object)
+}
+
+function Replace-ExactlyOnce([string]$Path, [string]$Before, [string]$After) {
+    $text = [IO.File]::ReadAllText($Path).Replace("`r`n", "`n")
+    if ([regex]::Matches($text, [regex]::Escape($Before)).Count -ne 1) {
+        throw "Pinned diagnostic source has an unexpected instrumentation anchor: $Path"
+    }
+    [IO.File]::WriteAllText($Path, $text.Replace($Before, $After), [Text.UTF8Encoding]::new($false))
+}
+
+function Invoke-DiagnosticTests([string]$Package, [string]$Pattern, [string[]]$Expected, [string]$LogName) {
+    & go test -json -count=1 -p=1 -timeout 3m -run $Pattern $Package 2>&1 |
+        Tee-Object -FilePath (Join-Path $results $LogName)
+    $testExit = $LASTEXITCODE
+    if ($testExit -ne 0) { exit $testExit }
+    # Module diagnostics remain in the raw stream; every expected verdict is required.
+    $events = @(Get-Content (Join-Path $results $LogName) | Where-Object { $_.StartsWith('{') } | ForEach-Object { $_ | ConvertFrom-Json })
+    if (@($events | Where-Object { $_.Action -in @('fail', 'skip') }).Count -ne 0) {
+        throw 'Diagnostic tests failed or skipped.'
+    }
+    foreach ($name in $Expected) {
+        $verdict = @($events | Where-Object { $_.Test -eq $name -and $_.Action -in @('pass', 'fail', 'skip') })
+        if ($verdict.Count -ne 1 -or $verdict[0].Action -ne 'pass') {
+            throw "The expected diagnostic test did not execute and pass: $name"
+        }
+    }
+}
+
+if ($Phase -eq 'Prepare') {
+    New-Item -ItemType Directory -Force -Path $results | Out-Null
+    $actualSource = (& git -C $fixture rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $actualSource -ne $expectedSource) {
+        throw 'The diagnostic prototype must match its pinned commit.'
+    }
+    $os = Get-CimInstance Win32_OperatingSystem
+    $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    $policy = Get-CachePolicy
+    [ordered]@{
+        EvidenceKind = 'Pinned prototype diagnostic; not PR implementation acceptance'
+        FixtureSHA = $actualSource
+        GateSHA = $env:GITHUB_SHA
+        Variant = $env:RFS_GATE_VARIANT
+        Caption = $os.Caption
+        Version = $os.Version
+        BuildNumber = $os.BuildNumber
+        ProductType = $os.ProductType
+        Architecture = $architecture
+        ImageVersion = $env:ImageVersion
+        CachePolicy = $policy
+    } | ConvertTo-Json -Depth 5 | Tee-Object -FilePath (Join-Path $results 'environment.json')
+    if ($os.ProductType -ne 1 -or ([version]$os.Version).Major -ne 10 -or [int]$os.BuildNumber -lt 26100 -or $architecture -ne 'Arm64') {
+        throw 'The probe requires native Windows 11 24H2+ ARM64.'
+    }
+    $lifetimes = @($policy.FileNotFoundCacheLifetime, $policy.DirectoryCacheLifetime, $policy.FileInfoCacheLifetime)
+    if (@($lifetimes | Where-Object { $null -eq $_ -or $_ -le 1 }).Count -ne 0) {
+        throw 'Cache lifetimes above one second are required to exclude an existing global cache override.'
+    }
+    ConvertTo-Json -InputObject (Get-MappingKeys) | Set-Content (Join-Path $results 'mappings-before.json') -Encoding utf8
+    foreach ($pair in @{'GOCACHE'='go-build'; 'GOMODCACHE'='go-mod'; 'GOPATH'='go-path'; 'TMPDIR'='tmp'; 'TMP'='tmp'; 'TEMP'='tmp'}.GetEnumerator()) {
+        $path = Join-Path $gateRoot $pair.Value
+        New-Item -ItemType Directory -Force -Path $path | Out-Null
+        Add-Content $env:GITHUB_ENV -Value "$($pair.Key)=$($path.Replace('\', '/'))" -Encoding utf8
+    }
+    Add-Content $env:GITHUB_ENV -Value 'GOTOOLCHAIN=local' -Encoding utf8
+    Add-Content $env:GITHUB_ENV -Value "RFS_GATE_MIN_CACHE_TTL=$(($lifetimes | Measure-Object -Minimum).Minimum)" -Encoding utf8
+    Add-Content $env:GITHUB_ENV -Value "RFS_GATE_OUTPUT_ROOT=$results" -Encoding utf8
+    exit 0
+}
+
+if ($Phase -eq 'Run') {
+    $target = & go env GOOS GOARCH
+    if ($LASTEXITCODE -ne 0 -or ($target -join '/') -ne 'windows/arm64') {
+        throw 'The diagnostic must execute Go natively on Windows ARM64.'
+    }
+    & go version
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $overlay = Join-Path $PSScriptRoot 'native-smb-notify-continuity.patch'
+    & git -C $fixture apply --unidiff-zero --check $overlay
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & git -C $fixture apply --unidiff-zero $overlay
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $env:RFS_GATE_OVERLAY_SHA = (Get-FileHash $overlay -Algorithm SHA256).Hash.ToLowerInvariant()
+    [ordered]@{ Kind = 'Platform notification continuity overlay'; SHA256 = $env:RFS_GATE_OVERLAY_SHA } |
+        ConvertTo-Json | Set-Content (Join-Path $results 'overlay.json') -Encoding utf8
+    Copy-Item (Join-Path $PSScriptRoot 'native-smb-notify-continuity_test.go.txt') (Join-Path $fixture 'packages/smb/gate_notify_continuity_test.go')
+    if ($env:RFS_GATE_VARIANT -eq 'missing_final_status' -or $env:RFS_GATE_VARIANT.StartsWith('positive_')) {
+        $missingOverlay = Join-Path $PSScriptRoot 'native-smb-missing-status.patch'
+        & git -C $fixture apply --unidiff-zero --check $missingOverlay
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        & git -C $fixture apply --unidiff-zero $missingOverlay
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $env:RFS_GATE_MISSING_STATUS_SHA = (Get-FileHash $missingOverlay -Algorithm SHA256).Hash.ToLowerInvariant()
+        [ordered]@{ Kind = 'Verified final-name absence status overlay'; SHA256 = $env:RFS_GATE_MISSING_STATUS_SHA } |
+            ConvertTo-Json | Set-Content (Join-Path $results 'missing-status-overlay.json') -Encoding utf8
+        Copy-Item (Join-Path $PSScriptRoot 'native-smb-missing-status_test.go.txt') (Join-Path $fixture 'packages/smb/gate_missing_status_test.go')
+    }
+    $noLeasing = $env:RFS_GATE_VARIANT -match '^positive_(postdeadline_)?noleasing_(unheld|exclusive)$'
+    if ($noLeasing) {
+        $noLeasingOverlay = Join-Path $PSScriptRoot 'native-smb-no-leasing.patch'
+        $rawOverlaySHA = (Get-FileHash $noLeasingOverlay -Algorithm SHA256).Hash.ToLowerInvariant()
+        $appliedOverlay = Join-Path $results 'no-leasing.applied.patch'
+        [IO.File]::WriteAllText($appliedOverlay, [IO.File]::ReadAllText($noLeasingOverlay).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+        $expectedNoLeasingSources = @{
+            'packages/smb/server.go' = @{ Input = 'e2fd4f9e6bf6ed458862ee59e2c0f6b9c53b32a1580d71a70651c02c81039325'; Output = '3dcfe03a8c9c8b9dc2b2840e52be0e290d1a973bd2edd367b1f21fdec185d406' }
+            'packages/smb/commands_session.go' = @{ Input = '6228ca6e9813d7915d8f01d34ca15cba517f1450a9463f6ed70f4f10661ee26d'; Output = 'c7e12376dd9b8100a8b224ffa1732b05bbd29096f006fdbe7960beddeb6d78df' }
+            'packages/smb/commands_files.go' = @{ Input = 'ff4394ec0f6396610288253da131cfe5bd3329affac3c3e82266fcd0fa117b07'; Output = '88570edf50156ea4b275a33722bc1a90aca88cbcd427f1b0cc148e68bc9ef199' }
+        }
+        $normalizedSources = @('server.go', 'commands_session.go', 'commands_files.go') | ForEach-Object {
+            $sourcePath = Join-Path $fixture "packages/smb/$_"
+            $rawSHA = (Get-FileHash $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            [IO.File]::WriteAllText($sourcePath, [IO.File]::ReadAllText($sourcePath).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+            $inputSHA = (Get-FileHash $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($inputSHA -ne $expectedNoLeasingSources["packages/smb/$_"].Input) { throw 'Canonical NoLeasing input differs from reviewed source.' }
+            [ordered]@{ Path = "packages/smb/$_"; RawSHA256 = $rawSHA; InputLF_SHA256 = $inputSHA }
+        }
+        $env:RFS_GATE_NO_LEASING_SHA = (Get-FileHash $appliedOverlay -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($env:RFS_GATE_NO_LEASING_SHA -ne '62538e9c1eb5b2b12a4d6fed71937fdd675b378d253c8f1c6c9d875a84f06734') { throw 'Canonical NoLeasing patch differs from the reviewed overlay.' }
+        & git -c core.autocrlf=false -C $fixture apply --check $appliedOverlay
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        & git -c core.autocrlf=false -C $fixture apply $appliedOverlay
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        foreach ($source in $normalizedSources) {
+            $source.OutputLF_SHA256 = (Get-FileHash (Join-Path $fixture $source.Path) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($source.OutputLF_SHA256 -ne $expectedNoLeasingSources[$source.Path].Output) { throw 'Canonical NoLeasing output differs from reviewed source.' }
+        }
+        [ordered]@{ Kind = 'Unsupported-leasing protocol experiment'; RawPatchSHA256 = $rawOverlaySHA; SHA256 = $env:RFS_GATE_NO_LEASING_SHA; Sources = @($normalizedSources) } |
+            ConvertTo-Json -Depth 4 | Set-Content (Join-Path $results 'no-leasing-overlay.json') -Encoding utf8
+        Copy-Item (Join-Path $PSScriptRoot 'native-smb-no-leasing_test.go.txt') (Join-Path $fixture 'packages/smb/gate_no_leasing_test.go')
+    }
+    $testRoot = Join-Path $fixture 'packages/smb/windows'
+    Copy-Item (Join-Path $PSScriptRoot 'native-smb-cache-gate_test.go.txt') (Join-Path $testRoot 'native_cache_gate_windows_test.go')
+    foreach ($name in @('cache', 'wire', 'wire-checks')) {
+        Copy-Item (Join-Path $PSScriptRoot "native-smb-positive-$($name)_test.go.txt") (Join-Path $testRoot "gate_positive_$($name.Replace('-', '_'))_windows_test.go")
+    }
+    $wire = Join-Path $testRoot 'native_wire_windows_test.go'
+    foreach ($field in @('headers', 'creates', 'createReplies')) {
+        $limit = if ($field -eq 'headers') { 16 } else { 8 }
+        $anchor = "c.observation.$field = nativeRetainLast(c.observation.$field, h, $limit)"
+        $replacement = $anchor + "`n" + ('cacheGateObserve("smb_' + $field + '", h)')
+        Replace-ExactlyOnce $wire $anchor $replacement
+    }
+    Replace-ExactlyOnce $wire 'received nativeFrameObserver' "received nativeFrameObserver`npositive *cacheGatePositiveFrameObserver"
+    Replace-ExactlyOnce $wire 'return &nativeObservedConnection{Conn: connection,' 'return &nativeObservedConnection{Conn: connection, positive: cacheGateOptionalPositiveObserver(),'
+    Replace-ExactlyOnce $wire 'c.received.observe(buffer[:n])' "c.received.observe(buffer[:n])`nif c.positive != nil { c.positive.observe(buffer[:n], false) }"
+    Replace-ExactlyOnce $wire 'c.sent.observe(buffer[:n])' "c.sent.observe(buffer[:n])`nif c.positive != nil { c.positive.observe(buffer[:n], true) }"
+    if ($env:RFS_GATE_VARIANT.StartsWith('positive_')) {
+        $files = Join-Path $testRoot 'native_files_windows_test.go'
+        Replace-ExactlyOnce $files "result.Removal = f.removal()`n`treturn result, nil" @'
+result.Removal = f.removal()
+cacheGatePositiveCapture("stat", f.session.id, f.reference, result.Attr, 0, nil)
+return result, nil
+'@
+        Replace-ExactlyOnce $files 'return storage.FileRead{Attr: nativeAttr(f.node), Data: bytes.Clone(f.node.data[start:end])}, nil' @'
+result := storage.FileRead{Attr: nativeAttr(f.node), Data: bytes.Clone(f.node.data[start:end])}
+cacheGatePositiveCapture("read", f.session.id, f.reference, result.Attr, r.Offset, result.Data)
+return result, nil
+'@
+        $positiveSources = @('cache', 'wire', 'wire-checks') | ForEach-Object {
+            $path = Join-Path $PSScriptRoot "native-smb-positive-$($_)_test.go.txt"
+            [ordered]@{ Name = [IO.Path]::GetFileName($path); SHA256 = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() }
+        }
+        ConvertTo-Json -InputObject @($positiveSources) | Set-Content (Join-Path $results 'positive-source.json') -Encoding utf8
+        & gofmt -w $files
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
+    $authority = Join-Path $testRoot 'native_fixture_windows_test.go'
+    Replace-ExactlyOnce $authority 'if len(a.changes) == 1024 {' @'
+cacheGateObserve("authority_event", map[string]any{"position": c.Position, "kind": c.Kind, "name": string(c.Name)})
+if len(a.changes) == 1024 {
+'@
+    $bridge = Join-Path $testRoot 'native_acceptance_windows_test.go'
+    Replace-ExactlyOnce $bridge 'Limits: smb.DefaultLimits()' 'Limits: cacheGateLimits()'
+    Replace-ExactlyOnce $bridge 'b.mapping, err = Map(ctx, MappingOptions{LocalPath: b.path, Share: b.share, TCPPort: b.port})' @'
+if err := cacheGatePositiveOwnMapping(b.path, b.share); err != nil { return err }
+b.mapping, err = Map(ctx, MappingOptions{LocalPath: b.path, Share: b.share, TCPPort: b.port})
+'@
+
+    & gofmt -w $wire $authority $bridge (Join-Path $testRoot 'native_cache_gate_windows_test.go')
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & git -C $fixture diff --stat | Write-Output
+    $PSNativeCommandUseErrorActionPreference = $false
+    Push-Location $fixture
+    try {
+        if ($noLeasing) {
+            Invoke-DiagnosticTests './packages/smb' '^TestGateNoLeasing' @('TestGateNoLeasingNegotiationAndSigning', 'TestGateNoLeasingIgnoresOnlyInnerLeaseContext', 'TestGateNoLeasingKeepsOuterBounds', 'TestGateNoLeasingReplacementKeepsSeparateOpenIdentities', 'TestGateNoLeasingPreservesOpenFailuresAndReconciliation', 'TestGateNoLeasingRetainsAuthorizationAndRejectsUnsolicitedAck', 'TestGateNoLeasingIdleLifecycle') 'no-leasing-unit-test.jsonl'
+        }
+        Invoke-DiagnosticTests './packages/smb' '^Test(Notification|GateNotify)' @('TestGateNotifyRescanRetainsGapEvents', 'TestGateNotifyRescanRejectsReplacedSource') 'notify-unit-test.jsonl'
+        if ($env:RFS_GATE_VARIANT -eq 'missing_final_status' -or $env:RFS_GATE_VARIANT.StartsWith('positive_')) {
+            Invoke-DiagnosticTests './packages/smb' '^TestGateMissingStatus' @('TestGateMissingStatusRequiresVerifiedParent', 'TestGateMissingStatusOnlyChangesFinalCreate') 'missing-status-unit-test.jsonl'
+        }
+        if ($env:RFS_GATE_VARIANT.StartsWith('positive_')) {
+            Invoke-DiagnosticTests './packages/smb/windows' '^TestGatePositive(Wire|Read)|^TestGateProof' @('TestGateProofCleanupPrecedesMeasuredFixture', 'TestGatePositiveReadCompletion','TestGatePositiveWireSplitCompoundResponses','TestGatePositiveWireReadDigestExcludesPayload','TestGatePositiveWireRelatedCreateAndQuery','TestGatePositiveWireErrorsPendingAndSecrets','TestGatePositiveWireMalformedAndBounds','TestGatePositiveWireBootstrapAndContextBounds','TestGatePositiveWireConnectionIsolationAndReset','TestGatePositiveWireSensitiveCreateContextExcluded','TestGatePositiveWireDelayedResponseJoinsRequestInterval','TestGatePositiveWireIncompleteSelectedBufferResults','TestGatePositiveWireNetworkOpenInformation','TestGatePositiveWireIncompleteNetworkOpenBufferResults') 'positive-wire-test.jsonl'
+        }
+        Invoke-DiagnosticTests './packages/smb/windows' '^TestNativeNegativeNameCacheGate$' @('TestNativeNegativeNameCacheGate') 'go-test.jsonl'
+    } finally {
+        Pop-Location
+    }
+    exit 0
+}
+
+$recoveredMappings = @()
+$baselineMappings = @(Get-Content (Join-Path $results 'mappings-before.json') -Raw | ConvertFrom-Json)
+$ownedLedgers = @(Get-ChildItem $results -Filter 'owned-mapping-*.json' -File)
+if ($ownedLedgers.Count -gt 0) {
+    $owned = @($ownedLedgers | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json })
+    foreach ($mapping in @(Get-SmbMapping)) {
+        $key = "$($mapping.LocalPath)|$($mapping.RemotePath)"
+        if ($key -in $baselineMappings) { continue }
+        $match = @($owned | Where-Object { $_.Local -eq $mapping.LocalPath -and $_.Remote -eq $mapping.RemotePath })
+        if ($match.Count -gt 0) {
+            Remove-SmbMapping -LocalPath $mapping.LocalPath -RemotePath $mapping.RemotePath -Force -Confirm:$false
+            $recoveredMappings += $key
+        }
+    }
+}
+ConvertTo-Json -InputObject $recoveredMappings | Set-Content (Join-Path $results 'recovered-owned-mappings.json') -Encoding utf8
+$before = Get-Content (Join-Path $results 'environment.json') -Raw | ConvertFrom-Json
+$afterPolicy = Get-CachePolicy
+$afterMappings = Get-MappingKeys
+[ordered]@{ CachePolicy = $afterPolicy; Mappings = $afterMappings } |
+    ConvertTo-Json -Depth 5 | Tee-Object -FilePath (Join-Path $results 'environment-after.json')
+if (($before.CachePolicy | ConvertTo-Json -Compress) -ne ($afterPolicy | ConvertTo-Json -Compress)) {
+    throw 'The diagnostic changed the workstation cache policy.'
+}
+$beforeMappings = @(Get-Content (Join-Path $results 'mappings-before.json') -Raw | ConvertFrom-Json)
+$remaining = @($afterMappings | Where-Object { $_ -notin $beforeMappings })
+if ($remaining.Count -ne 0) {
+    throw "Mappings outlived the diagnostic: $($remaining -join ', ')"
+}
+
+if ($recoveredMappings.Count -ne 0) {
+    throw 'Recorded test-owned mappings required recovery after the test process exited.'
+}

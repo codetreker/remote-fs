@@ -1,0 +1,88 @@
+//go:build !windows
+
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"syscall"
+)
+
+func rejectPrivateReparsePath(path string) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("private fixture path must be absolute")
+	}
+	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("private fixture path contains a symlink: %s", current)
+		}
+		if current == filepath.Dir(current) {
+			return nil
+		}
+	}
+}
+
+func createPrivateDirectory(path string) error {
+	if err := rejectPrivateReparsePath(filepath.Dir(path)); err != nil {
+		return err
+	}
+	if err := os.Mkdir(path, 0700); err != nil {
+		return err
+	}
+	return validatePrivateDirectory(path)
+}
+
+func validatePrivateDirectory(path string) error { return validatePrivateOtherPath(path, true) }
+func validatePrivateFile(path string) error      { return validatePrivateOtherPath(path, false) }
+
+func validatePrivateOtherPath(path string, directory bool) error {
+	if err := rejectPrivateReparsePath(path); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() != directory || (!directory && !info.Mode().IsRegular()) {
+		return errors.New("private fixture path has the wrong file type")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != os.Geteuid() {
+		return errors.New("private fixture owner differs from current user")
+	}
+	expected := os.FileMode(0600)
+	if directory {
+		expected = 0700
+	}
+	if info.Mode().Perm() != expected {
+		return fmt.Errorf("private fixture mode is %04o; expected %04o", info.Mode().Perm(), expected)
+	}
+	return nil
+}
+
+func makePrivateFile(path string) error {
+	if err := validatePrivateDirectory(filepath.Dir(path)); err != nil {
+		return err
+	}
+	if err := rejectPrivateReparsePath(path); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != os.Geteuid() || !info.Mode().IsRegular() {
+		return errors.New("private fixture file must be regular and owned by current user")
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		return err
+	}
+	return validatePrivateFile(path)
+}

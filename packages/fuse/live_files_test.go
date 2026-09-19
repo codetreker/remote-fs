@@ -395,8 +395,8 @@ func TestCreateOpenAcrossHTTPMountsHasOneAtomicResult(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, outcome := range successes {
-				if outcome.mode != attr.Mode.Perm() {
-					t.Fatalf("open reported mode %v before the final creation mode %v", outcome.mode, attr.Mode.Perm())
+				if outcome.mode != backingMode(t, attr).Perm() {
+					t.Fatalf("open reported mode %v before the final creation mode %v", outcome.mode, backingMode(t, attr).Perm())
 				}
 				if current := ino(t, filepath.Join([]string{left, right}[outcome.mount], name)); outcome.inode != current {
 					t.Fatalf("open returned inode %d, but its mount resolves the winning file to %d", outcome.inode, current)
@@ -425,11 +425,11 @@ func (s *observedLifetimeStorage) NewFileSession(ctx context.Context, options st
 			return nil, errors.Join(err, session.Close(ctx))
 		}
 	}
-	return &observedLifetimeSession{FileSession: session, owner: s}, nil
+	return &observedLifetimeSession{capableTestSession: testSessionCapabilities(session), owner: s}, nil
 }
 
 type observedLifetimeSession struct {
-	storage.FileSession
+	capableTestSession
 	owner *observedLifetimeStorage
 }
 

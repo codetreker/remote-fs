@@ -1,0 +1,62 @@
+package smb
+
+import (
+	"errors"
+	"syscall"
+	"testing"
+
+	"github.com/codetreker/remote-fs/packages/storage"
+)
+
+func TestGateMissingStatusRequiresVerifiedParent(t *testing.T) {
+	session, _, _, parent, _ := newClientTestSession(t)
+	parent.entries = nil
+	_, err := session.Open(t.Context(), clientTestOpenRequest(), clientTestAction(t))
+	if _, ok := err.(*verifiedMissingNameError); !ok || !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("verified absence: %T %v", err, err)
+	}
+	if len(parent.checks) != 1 || len(parent.lists) != 1 {
+		t.Fatal("absence did not verify the parent observation")
+	}
+	for _, failure := range []error{syscall.EACCES, syscall.EIO, syscall.ESTALE} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			session, _, _, parent, _ := newClientTestSession(t)
+			parent.entries = nil
+			parent.checkErr = failure
+			_, err := session.Open(t.Context(), clientTestOpenRequest(), clientTestAction(t))
+			if _, ok := err.(*verifiedMissingNameError); ok || !errors.Is(err, failure) {
+				t.Fatalf("unverified parent mislabeled: %T %v", err, err)
+			}
+		})
+	}
+}
+
+func TestGateMissingStatusOnlyChangesFinalCreate(t *testing.T) {
+	for _, test := range []struct {
+		name, path string
+		failure    error
+		want       uint32
+	}{
+		{"final", "leaf", &verifiedMissingNameError{}, 0xc000000f},
+		{"intermediate", "absent\\leaf", &verifiedMissingNameError{}, 0xc0000034},
+		{"ordinary_enoent", "leaf", syscall.ENOENT, 0xc0000034},
+		{"denied", "leaf", syscall.EACCES, 0xc0000022},
+		{"unknown", "leaf", errors.Join(&verifiedMissingNameError{}, syscall.EIO), fileIOError},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dispatcher, root, session, _ := commandDispatcher()
+			root.attr.Attr.ID = 1
+			root.attr.Attr.Kind = storage.NodeDirectory
+			session.open = func(request windowsOpenRequest) (windowsOpenResult, error) {
+				if request.Lookup.ParentID == 0 {
+					return windowsOpenResult{File: root, Attr: root.attr}, nil
+				}
+				return windowsOpenResult{}, test.failure
+			}
+			_, status := dispatcher.create(t.Context(), createCommand(test.path, 1, 1))
+			if status != test.want {
+				t.Fatalf("status=%08x want=%08x", status, test.want)
+			}
+		})
+	}
+}

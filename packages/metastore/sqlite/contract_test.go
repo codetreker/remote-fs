@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -155,7 +156,7 @@ func TestNeighbourGapsKeepSparsePositionsWithoutGrowingTheTree(t *testing.T) {
 	readChanges := func(store *sqlite.Store) []metastore.Change {
 		t.Helper()
 		result, err := metastore.NewChangeResult(64*1024, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
-			return 128 + lengths.Name + lengths.FromName + lengths.Content, nil
+			return 128 + lengths.Name + lengths.FromName + lengths.Content + lengths.Metadata + lengths.Target, nil
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -198,8 +199,8 @@ func TestNeighbourGapsKeepSparsePositionsWithoutGrowingTheTree(t *testing.T) {
 	if children, err := n.neighbour.List(ctx, ""); err != nil || len(children) != 0 {
 		t.Fatalf("neighbour tree grew: %+v, %v", children, err)
 	}
-	if after, err := n.neighbour.Stat(ctx, ""); err != nil || after.ID != root.ID || after.Mode != root.Mode {
-		t.Fatalf("neighbour root changed identity or mode: %+v, %v", after, err)
+	if after, err := n.neighbour.Stat(ctx, ""); err != nil || after.ID != root.ID || after.Kind != root.Kind {
+		t.Fatalf("neighbour root changed identity or kind: %+v, %v", after, err)
 	}
 }
 
@@ -299,7 +300,7 @@ func TestContractFactoryKeepsSequentialVolumesIsolated(t *testing.T) {
 			}
 		}()
 		result, err := metastore.NewRowResult(1024, 0, func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
-			return 128 + lengths.Name + lengths.Content, nil
+			return 128 + lengths.Name + lengths.Content + lengths.Metadata + lengths.Target, nil
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -337,7 +338,7 @@ func TestContractFactoryKeepsSequentialVolumesIsolated(t *testing.T) {
 		t.Fatalf("shared database state before=%+v after=%+v, error=%v", before, after, err)
 	}
 	reopened := open(t, path, "volume-1", 128)
-	if node, err := reopened.Stat(t.Context(), "same"); err != nil || node != savedNode {
+	if node, err := reopened.Stat(t.Context(), "same"); err != nil || !reflect.DeepEqual(node, savedNode) {
 		t.Fatalf("second child changed first node: %+v, error=%v; want %+v", node, err, savedNode)
 	}
 	if space, err := reopened.Space(t.Context()); err != nil || space != savedSpace {

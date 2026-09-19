@@ -1,0 +1,737 @@
+//go:build windows
+
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"debug/pe"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+	"unicode/utf16"
+	"unicode/utf8"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+)
+
+type windowsPlatform struct{}
+
+func init() { newPlatform = func() (platform, error) { return windowsPlatform{}, nil } }
+
+func (windowsPlatform) Preflight() (map[string]any, error) {
+	version := windows.RtlGetVersion()
+	var processMachine, nativeMachine uint16
+	if err := windows.IsWow64Process2(windows.CurrentProcess(), &processMachine, &nativeMachine); err != nil {
+		return nil, err
+	}
+	if runtime.GOARCH != "arm64" || nativeMachine != pe.IMAGE_FILE_MACHINE_ARM64 || processMachine != pe.IMAGE_FILE_MACHINE_UNKNOWN {
+		return nil, errors.New("fixture requires a native ARM64 controller on Windows ARM64")
+	}
+	if version.MajorVersion != 10 || version.BuildNumber < 26100 || version.ProductType != 1 {
+		return nil, fmt.Errorf("fixture requires Windows 11 24H2 or newer workstation; got %d.%d build %d product %d", version.MajorVersion, version.MinorVersion, version.BuildNumber, version.ProductType)
+	}
+	return map[string]any{"windows_build": version.BuildNumber, "native_machine": nativeMachine, "controller_arch": runtime.GOARCH, "go_version": runtime.Version()}, nil
+}
+
+func (windowsPlatform) ListenControl(ctx context.Context) (net.Listener, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	config := net.ListenConfig{Control: func(network, address string, raw syscall.RawConn) error {
+		if network != "tcp4" {
+			return fmt.Errorf("control listener requires tcp4, got %q", network)
+		}
+		var socketErr error
+		err := raw.Control(func(socket uintptr) {
+			// SO_EXCLUSIVEADDRUSE must precede bind; SO_REUSEADDR cannot replace it.
+			// https://learn.microsoft.com/en-us/windows/win32/winsock/so-exclusiveaddruse
+			socketErr = windows.SetsockoptInt(windows.Handle(socket), windows.SOL_SOCKET, -5, 1)
+		})
+		return errors.Join(err, socketErr)
+	}}
+	listener, err := config.Listen(ctx, "tcp4", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Join(err, listener.Close())
+	}
+	return listener, nil
+}
+
+type controlEndpoint struct {
+	IP   [4]byte
+	Port uint16
+}
+
+func controlEndpointFromAddr(address net.Addr) (controlEndpoint, error) {
+	tcp, ok := address.(*net.TCPAddr)
+	if !ok || tcp == nil || tcp.Zone != "" || tcp.Port < 1 || tcp.Port > 65535 || tcp.IP.To4() == nil || !tcp.IP.IsLoopback() {
+		return controlEndpoint{}, fmt.Errorf("control endpoint is not concrete IPv4 loopback: %v", address)
+	}
+	return controlEndpoint{IP: [4]byte(tcp.IP.To4()), Port: uint16(tcp.Port)}, nil
+}
+
+const controlTCPTableCapacity = 1 << 20
+
+func readControlTCPTable(query func([]byte, *uint32) uint32) ([]byte, uint32, error) {
+	table := make([]byte, controlTCPTableCapacity)
+	size := uint32(len(table))
+	if status := query(table, &size); status != 0 {
+		return nil, 0, fmt.Errorf("GetExtendedTcpTable: %w", syscall.Errno(status))
+	}
+	if size < 4 || size > uint32(len(table)) {
+		return nil, 0, fmt.Errorf("TCP owner table returned invalid size %d", size)
+	}
+	return table, size, nil
+}
+
+func verifyControlTCPTable(table []byte, returned uint32, local, remote controlEndpoint, pid uint32) error {
+	if pid == 0 || returned < 4 || uint64(returned) > uint64(len(table)) {
+		return errors.New("TCP owner table has invalid bounds or process ID")
+	}
+	count := binary.LittleEndian.Uint32(table[:4])
+	// MIB_TCPTABLE_OWNER_PID starts rows at byte 4; each DWORD-aligned row is 24 bytes.
+	// https://github.com/microsoft/win32metadata/blob/5c5efbc01d4c87f6830ec304d42777991d533154/generation/WinSDK/RecompiledIdlHeaders/shared/tcpmib.h#L124-L141
+	if uint64(count) > uint64(returned-4)/24 {
+		return errors.New("TCP owner table row count exceeds its returned size")
+	}
+	matches := 0
+	var state, owner uint32
+	for index := uint32(0); index < count; index++ {
+		row := table[4+int(index)*24 : 4+int(index+1)*24]
+		rowLocal := controlEndpoint{IP: [4]byte(row[4:8]), Port: binary.BigEndian.Uint16(row[8:10])}
+		rowRemote := controlEndpoint{IP: [4]byte(row[12:16]), Port: binary.BigEndian.Uint16(row[16:18])}
+		if rowLocal == remote && rowRemote == local {
+			matches++
+			state, owner = binary.LittleEndian.Uint32(row[:4]), binary.LittleEndian.Uint32(row[20:24])
+		}
+	}
+	if matches != 1 || state != 5 || owner != pid {
+		return fmt.Errorf("control peer ownership mismatch: rows=%d state=%d PID=%d expected=%d", matches, state, owner, pid)
+	}
+	return nil
+}
+
+type controlPeerOps struct {
+	live  func() error
+	pid   func() (uint32, error)
+	table func() ([]byte, uint32, error)
+}
+
+func verifyLiveControlPeer(ctx context.Context, pid uint32, local, remote controlEndpoint, ops controlPeerOps) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ops.live(); err != nil {
+		return err
+	}
+	actualPID, err := ops.pid()
+	if err != nil {
+		return err
+	}
+	if actualPID != pid || pid == 0 {
+		return fmt.Errorf("retained process handle PID %d differs from owned PID %d", actualPID, pid)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	table, size, err := ops.table()
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := verifyControlTCPTable(table, size, local, remote, pid); err != nil {
+		return err
+	}
+	if err := ops.live(); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+var getExtendedTCPTable = windows.NewLazySystemDLL("iphlpapi.dll").NewProc("GetExtendedTcpTable")
+
+func (p *windowsChild) VerifyControlPeer(ctx context.Context, conn net.Conn) (map[string]any, error) {
+	if conn == nil {
+		return nil, errors.New("control connection is missing")
+	}
+	local, err := controlEndpointFromAddr(conn.LocalAddr())
+	if err != nil {
+		return nil, err
+	}
+	remote, err := controlEndpointFromAddr(conn.RemoteAddr())
+	if err != nil {
+		return nil, err
+	}
+	p.processMu.Lock()
+	defer p.processMu.Unlock()
+	if p.process == 0 || p.process == windows.InvalidHandle {
+		return nil, errors.New("owned process handle is closed")
+	}
+	err = verifyLiveControlPeer(ctx, p.pid, local, remote, controlPeerOps{
+		live: func() error {
+			wait, err := windows.WaitForSingleObject(p.process, 0)
+			if err != nil {
+				return err
+			}
+			if wait != uint32(windows.WAIT_TIMEOUT) {
+				return fmt.Errorf("owned process is not live: wait=%d", wait)
+			}
+			return nil
+		},
+		pid: func() (uint32, error) { return windows.GetProcessId(p.process) },
+		table: func() ([]byte, uint32, error) {
+			// The synchronous OS query is not cancellable; the caller checks its context on both sides.
+			return readControlTCPTable(func(table []byte, size *uint32) uint32 {
+				status, _, _ := getExtendedTCPTable.Call(uintptr(unsafe.Pointer(&table[0])), uintptr(unsafe.Pointer(size)), 0, 2, 5, 0)
+				return uint32(status)
+			})
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"transport": "tcp4", "local_address": conn.LocalAddr().String(), "remote_address": conn.RemoteAddr().String(), "owner_pid": p.pid, "tcp_state": 5}, nil
+}
+
+type windowsChild struct {
+	job             windows.Handle
+	processMu       sync.Mutex
+	process         windows.Handle
+	input           *ownedProcessInput
+	output, stderr  *os.File
+	launch          windowsLaunchFacts
+	pid             uint32
+	done            chan struct{}
+	result          error
+	exitObserved    bool
+	processCloseErr error
+	once            sync.Once
+	finishErr       error
+	forced          bool
+}
+
+type ownedProcessInput struct {
+	pipe   io.WriteCloser
+	closed atomic.Bool
+	once   sync.Once
+	err    error
+}
+
+func (p *ownedProcessInput) Write(data []byte) (int, error) {
+	if p.closed.Load() {
+		return 0, os.ErrClosed
+	}
+	return p.pipe.Write(data)
+}
+
+func (p *ownedProcessInput) Close() error {
+	p.once.Do(func() {
+		p.closed.Store(true)
+		// Close must be able to interrupt a blocked Write; it never takes a write lock.
+		p.err = p.pipe.Close()
+	})
+	return p.err
+}
+
+type windowsLaunchCall struct {
+	OffsetNanos    int64  `json:"offset_ns"`
+	DurationNanos  int64  `json:"duration_ns"`
+	Returned       bool   `json:"returned"`
+	Error          string `json:"error"`
+	ErrorTruncated bool   `json:"error_truncated"`
+}
+
+type windowsLaunchFacts struct {
+	RequestedImage       string             `json:"requested_image"`
+	CommandLineUnits     int                `json:"command_line_utf16_units"`
+	CommandLineSHA256    string             `json:"command_line_utf16le_sha256"`
+	PID                  *uint32            `json:"pid,omitempty"`
+	CreateProcess        *windowsLaunchCall `json:"create_process,omitempty"`
+	AssignJob            *windowsLaunchCall `json:"assign_job,omitempty"`
+	QueryImage           *windowsLaunchCall `json:"query_image,omitempty"`
+	QueryMachine         *windowsLaunchCall `json:"query_machine,omitempty"`
+	ResumeThread         *windowsLaunchCall `json:"resume_thread,omitempty"`
+	PreviousSuspendCount *uint32            `json:"previous_suspend_count,omitempty"`
+	ActualImage          string             `json:"actual_image,omitempty"`
+	ProcessMachine       *uint16            `json:"process_machine,omitempty"`
+	NativeMachine        *uint16            `json:"native_machine,omitempty"`
+	CleanupConfirmed     bool               `json:"failed_start_cleanup_confirmed"`
+}
+
+type windowsLaunchError struct {
+	Facts windowsLaunchFacts
+	Cause error
+}
+
+func (e *windowsLaunchError) Error() string { return e.Cause.Error() }
+func (e *windowsLaunchError) Unwrap() error { return e.Cause }
+
+func observeWindowsLaunchCall(start time.Time, now func() time.Time, destination **windowsLaunchCall, operation func() error) error {
+	entered := now()
+	call := &windowsLaunchCall{OffsetNanos: entered.Sub(start).Nanoseconds()}
+	*destination = call
+	err := operation()
+	call.DurationNanos, call.Returned = now().Sub(entered).Nanoseconds(), true
+	if err != nil {
+		call.Error = err.Error()
+		if len(call.Error) > 512 {
+			call.Error, call.ErrorTruncated = call.Error[:512], true
+		}
+	}
+	return err
+}
+
+func checkWindowsResumeCount(count uint32) error {
+	if count != 1 {
+		return fmt.Errorf("owned primary thread resume returned previous suspend count %d; expected 1", count)
+	}
+	return nil
+}
+
+func observeWindowsImage(facts *windowsLaunchFacts, start time.Time, now func() time.Time, image func() (string, error), machine func() (uint16, uint16, error)) error {
+	if err := observeWindowsLaunchCall(start, now, &facts.QueryImage, func() error {
+		path, err := image()
+		if err == nil {
+			facts.ActualImage = path
+		}
+		return err
+	}); err != nil {
+		return err
+	}
+	return observeWindowsLaunchCall(start, now, &facts.QueryMachine, func() error {
+		process, native, err := machine()
+		if err == nil {
+			facts.ProcessMachine, facts.NativeMachine = &process, &native
+		}
+		return err
+	})
+}
+
+func (p *windowsChild) Input() io.WriteCloser           { return p.input }
+func (p *windowsChild) Output() io.ReadCloser           { return p.output }
+func (p *windowsChild) Errors() io.ReadCloser           { return p.stderr }
+func (p *windowsChild) Done() <-chan struct{}           { return p.done }
+func (p *windowsChild) PID() uint32                     { return p.pid }
+func (p *windowsChild) Result() error                   { <-p.done; return p.result }
+func (p *windowsChild) LaunchFacts() windowsLaunchFacts { return p.launch }
+
+type jobAccounting struct {
+	TotalUserTime, TotalKernelTime, PeriodUserTime, PeriodKernelTime int64
+	PageFaults, TotalProcesses, ActiveProcesses, TerminatedProcesses uint32
+}
+
+func checkJobAccountingABI() error {
+	var value jobAccounting
+	offsets := [...]uintptr{unsafe.Offsetof(value.TotalUserTime), unsafe.Offsetof(value.TotalKernelTime),
+		unsafe.Offsetof(value.PeriodUserTime), unsafe.Offsetof(value.PeriodKernelTime),
+		unsafe.Offsetof(value.PageFaults), unsafe.Offsetof(value.TotalProcesses),
+		unsafe.Offsetof(value.ActiveProcesses), unsafe.Offsetof(value.TerminatedProcesses)}
+	if unsafe.Sizeof(value) != 48 || unsafe.Alignof(value) != 8 || offsets != [8]uintptr{0, 8, 16, 24, 32, 36, 40, 44} {
+		return errors.New("job accounting differs from the 64-bit Windows ABI")
+	}
+	return nil
+}
+
+func readJobActive(query func(*jobAccounting, *uint32) error) (uint32, error) {
+	if err := checkJobAccountingABI(); err != nil {
+		return 0, err
+	}
+	var accounting jobAccounting
+	var returned uint32
+	if err := query(&accounting, &returned); err != nil {
+		return 0, err
+	}
+	if returned != uint32(unsafe.Sizeof(accounting)) {
+		return 0, fmt.Errorf("job accounting returned %d bytes; expected %d", returned, unsafe.Sizeof(accounting))
+	}
+	return accounting.ActiveProcesses, nil
+}
+
+func jobActive(job windows.Handle) (uint32, error) {
+	return readJobActive(func(accounting *jobAccounting, returned *uint32) error {
+		return windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation,
+			uintptr(unsafe.Pointer(accounting)), uint32(unsafe.Sizeof(*accounting)), returned)
+	})
+}
+
+var errJobRundownDeadline = errors.New("owned job did not become empty within cleanup budget")
+
+type jobRundownOps struct {
+	now       func() time.Time
+	active    func() (uint32, error)
+	terminate func() error
+	pause     func(time.Time) error
+}
+
+func waitOwnedJobEmpty(deadline time.Time, ops jobRundownOps) error {
+	for {
+		if !ops.now().Before(deadline) {
+			return errJobRundownDeadline
+		}
+		active, err := ops.active()
+		if err != nil {
+			return err
+		}
+		if !ops.now().Before(deadline) {
+			return errJobRundownDeadline
+		}
+		if active == 0 {
+			return nil
+		}
+		if err := ops.pause(deadline); err != nil {
+			return err
+		}
+	}
+}
+
+func finishJobRundown(rootExited bool, deadline time.Time, ops jobRundownOps) (bool, error) {
+	var original error
+	if rootExited {
+		original = waitOwnedJobEmpty(clampJobDeadline(ops.now().Add(5*time.Second), deadline), ops)
+		if original == nil {
+			return false, nil
+		}
+	}
+	terminationErr := ops.terminate()
+	confirmationDeadline := clampJobDeadline(ops.now().Add(5*time.Second), deadline)
+	return true, errors.Join(original, terminationErr, waitOwnedJobEmpty(confirmationDeadline, ops))
+}
+
+func clampJobDeadline(candidate, deadline time.Time) time.Time {
+	if candidate.After(deadline) {
+		return deadline
+	}
+	return candidate
+}
+
+func pauseJobRundown(deadline time.Time) error {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return errJobRundownDeadline
+	}
+	interval := min(10*time.Millisecond, remaining)
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	<-timer.C
+	return nil
+}
+
+func (p *windowsChild) Finish() (bool, error) {
+	return p.FinishBefore(time.Now().Add(10 * time.Second))
+}
+
+func (p *windowsChild) FinishBefore(deadline time.Time) (bool, error) {
+	p.once.Do(func() {
+		overall := clampJobDeadline(time.Now().Add(10*time.Second), deadline)
+		rootExited := false
+		select {
+		case <-p.done:
+			rootExited = p.exitObserved
+		default:
+		}
+		p.forced, p.finishErr = finishJobRundown(rootExited, overall, jobRundownOps{
+			now:       time.Now,
+			active:    func() (uint32, error) { return jobActive(p.job) },
+			terminate: func() error { return windows.TerminateJobObject(p.job, 1) },
+			pause:     pauseJobRundown,
+		})
+		// The unnamed job handle is not inherited. Closing it is also the crash path.
+		p.finishErr = errors.Join(p.finishErr, windows.CloseHandle(p.job))
+		waiterFinished := false
+		select {
+		case <-p.done:
+			waiterFinished = true
+		default:
+		}
+		if !waiterFinished {
+			remaining := max(time.Duration(0), time.Until(overall))
+			timer := time.NewTimer(remaining)
+			defer timer.Stop()
+			select {
+			case <-p.done:
+				waiterFinished = true
+			case <-timer.C:
+				p.finishErr = errors.Join(p.finishErr, errors.New("owned process termination was not confirmed"))
+			}
+		}
+		if waiterFinished {
+			p.finishErr = errors.Join(p.finishErr, p.processCloseErr)
+		}
+		p.finishErr = errors.Join(p.finishErr, p.input.Close(), p.output.Close(), p.stderr.Close())
+	})
+	return p.forced, p.finishErr
+}
+
+func windowsEnvironmentKey(entry string) (string, error) {
+	if strings.IndexByte(entry, 0) >= 0 {
+		return "", fmt.Errorf("environment entry contains NUL: %w", syscall.EINVAL)
+	}
+	if !utf8.ValidString(entry) {
+		return "", fmt.Errorf("environment entry is not valid UTF-8: %w", syscall.EINVAL)
+	}
+	separator := strings.IndexByte(entry, '=')
+	if separator == 0 {
+		// Windows preserves drive-current-directory entries such as =C:=C:\\work.
+		second := strings.IndexByte(entry[1:], '=')
+		if second < 1 {
+			return "", fmt.Errorf("environment special key has no value separator: %w", syscall.EINVAL)
+		}
+		separator = second + 1
+	}
+	if separator < 1 {
+		return "", fmt.Errorf("environment entry has no name/value separator: %w", syscall.EINVAL)
+	}
+	return entry[:separator], nil
+}
+
+func windowsEnvironmentFold(key string) string {
+	data := []byte(key)
+	for i, value := range data {
+		if value >= 'a' && value <= 'z' {
+			data[i] -= 'a' - 'A'
+		}
+	}
+	return string(data)
+}
+
+func windowsEnvironmentBlock(environment []string) ([]uint16, error) {
+	entries := append([]string(nil), environment...)
+	for index, entry := range entries {
+		if _, err := windowsEnvironmentKey(entry); err != nil {
+			return nil, fmt.Errorf("explicit environment entry %d: %w", index, err)
+		}
+	}
+	// Match Go's ASCII-folded first-separator ordering; hidden drive entries sort first.
+	sort.SliceStable(entries, func(i, j int) bool {
+		a := windowsEnvironmentFold(entries[i][:strings.IndexByte(entries[i], '=')])
+		b := windowsEnvironmentFold(entries[j][:strings.IndexByte(entries[j], '=')])
+		return a < b
+	})
+	if len(entries) == 0 {
+		return []uint16{0, 0}, nil
+	}
+	var block []uint16
+	for _, entry := range entries {
+		block = append(block, utf16.Encode([]rune(entry))...)
+		block = append(block, 0)
+	}
+	return append(block, 0), nil
+}
+
+func (windowsPlatform) Start(executable string, args []string, directory string) (child, error) {
+	return startWindowsProcess(executable, args, directory, nil)
+}
+
+func (windowsPlatform) StartWithEnvironment(executable string, args []string, directory string, environment []string) (child, error) {
+	block, err := windowsEnvironmentBlock(environment)
+	if err != nil {
+		return nil, &windowsLaunchError{Facts: windowsLaunchFacts{RequestedImage: executable, CleanupConfirmed: true}, Cause: err}
+	}
+	return startWindowsProcess(executable, args, directory, block)
+}
+
+func startWindowsProcess(executable string, args []string, directory string, environmentBlock []uint16) (_ child, resultErr error) {
+	started := time.Now()
+	facts := windowsLaunchFacts{RequestedImage: executable, CleanupConfirmed: true}
+	defer func() {
+		if resultErr != nil {
+			resultErr = &windowsLaunchError{Facts: facts, Cause: resultErr}
+		}
+	}()
+	if !filepath.IsAbs(executable) || !filepath.IsAbs(directory) {
+		return nil, errors.New("owned process paths must be absolute")
+	}
+	application, err := windows.UTF16PtrFromString(executable)
+	if err != nil {
+		return nil, err
+	}
+	command, err := windows.UTF16FromString(windows.ComposeCommandLine(append([]string{executable}, args...)))
+	if err != nil {
+		return nil, err
+	}
+	commandBytes := make([]byte, 2*len(command))
+	for i, word := range command {
+		binary.LittleEndian.PutUint16(commandBytes[2*i:], word)
+	}
+	facts.CommandLineUnits, facts.CommandLineSHA256 = len(command), fmt.Sprintf("%x", sha256.Sum256(commandBytes))
+	workingDir, err := windows.UTF16PtrFromString(directory)
+	if err != nil {
+		return nil, err
+	}
+	job, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	owned := false
+	defer func() {
+		if !owned {
+			err := windows.CloseHandle(job)
+			resultErr = errors.Join(resultErr, err)
+			if err != nil {
+				facts.CleanupConfirmed = false
+			}
+		}
+	}()
+	info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
+	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
+		return nil, err
+	}
+	childInput, parentInput, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer childInput.Close()
+	defer func() {
+		if !owned {
+			parentInput.Close()
+		}
+	}()
+	parentOutput, childOutput, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer childOutput.Close()
+	defer func() {
+		if !owned {
+			parentOutput.Close()
+		}
+	}()
+	parentError, childError, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer childError.Close()
+	defer func() {
+		if !owned {
+			parentError.Close()
+		}
+	}()
+	handles := []windows.Handle{windows.Handle(childInput.Fd()), windows.Handle(childOutput.Fd()), windows.Handle(childError.Fd())}
+	for _, handle := range handles {
+		if err := windows.SetHandleInformation(handle, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); err != nil {
+			return nil, err
+		}
+	}
+	attributes, err := windows.NewProcThreadAttributeList(1)
+	if err != nil {
+		return nil, err
+	}
+	defer attributes.Delete()
+	if err := attributes.Update(windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&handles[0]), uintptr(len(handles))*unsafe.Sizeof(handles[0])); err != nil {
+		return nil, err
+	}
+	startup := windows.StartupInfoEx{
+		StartupInfo:             windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfoEx{})), Flags: windows.STARTF_USESTDHANDLES, StdInput: handles[0], StdOutput: handles[1], StdErr: handles[2]},
+		ProcThreadAttributeList: attributes.List(),
+	}
+	var process windows.ProcessInformation
+	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_NO_WINDOW | windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT)
+	var environment *uint16
+	if environmentBlock != nil {
+		environment = &environmentBlock[0]
+	}
+	if err := observeWindowsLaunchCall(started, time.Now, &facts.CreateProcess, func() error {
+		err := windows.CreateProcess(application, &command[0], nil, nil, true, flags, environment, workingDir, &startup.StartupInfo, &process)
+		runtime.KeepAlive(environmentBlock)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	facts.PID, facts.CleanupConfirmed = &process.ProcessId, false
+	defer windows.CloseHandle(process.Thread)
+	// Assign before resuming so even immediate child creation remains job-owned.
+	if err := observeWindowsLaunchCall(started, time.Now, &facts.AssignJob, func() error {
+		return windows.AssignProcessToJobObject(job, process.Process)
+	}); err != nil {
+		terminateErr := windows.TerminateProcess(process.Process, 1)
+		wait, waitErr := windows.WaitForSingleObject(process.Process, 5000)
+		if waitErr == nil && wait != windows.WAIT_OBJECT_0 {
+			waitErr = errors.New("unassigned suspended process termination unconfirmed")
+		}
+		closeErr := windows.CloseHandle(process.Process)
+		facts.CleanupConfirmed = terminateErr == nil && waitErr == nil && closeErr == nil
+		return nil, errors.Join(err, terminateErr, waitErr, closeErr)
+	}
+	p := &windowsChild{job: job, process: process.Process, input: &ownedProcessInput{pipe: parentInput}, output: parentOutput, stderr: parentError, pid: process.ProcessId, done: make(chan struct{})}
+	owned = true
+	go func() {
+		wait, err := windows.WaitForSingleObject(process.Process, windows.INFINITE)
+		p.processMu.Lock()
+		if err != nil {
+			p.result = err
+		} else if wait != windows.WAIT_OBJECT_0 {
+			p.result = fmt.Errorf("unexpected process wait result %d", wait)
+		} else {
+			p.exitObserved = true
+			var code uint32
+			if err := windows.GetExitCodeProcess(process.Process, &code); err != nil {
+				p.result = err
+			} else if code != 0 {
+				p.result = fmt.Errorf("owned process %d exited with code %d", p.pid, code)
+			}
+		}
+		// The waiter owns this handle until its final wait and exit-code query complete.
+		p.processCloseErr = windows.CloseHandle(process.Process)
+		p.process = 0
+		p.result = errors.Join(p.result, p.processCloseErr)
+		p.processMu.Unlock()
+		close(p.done)
+	}()
+	p.processMu.Lock()
+	imageErr := observeWindowsImage(&facts, started, time.Now, func() (string, error) {
+		if p.process == 0 {
+			return "", errors.New("owned process handle closed before image query")
+		}
+		buffer := make([]uint16, 32768)
+		size := uint32(len(buffer))
+		if err := windows.QueryFullProcessImageName(p.process, 0, &buffer[0], &size); err != nil {
+			return "", err
+		}
+		if size == 0 || size >= uint32(len(buffer)) {
+			return "", errors.New("owned process image path has invalid length")
+		}
+		return windows.UTF16ToString(buffer[:size]), nil
+	}, func() (uint16, uint16, error) {
+		var processMachine, nativeMachine uint16
+		err := windows.IsWow64Process2(p.process, &processMachine, &nativeMachine)
+		return processMachine, nativeMachine, err
+	})
+	p.processMu.Unlock()
+	if imageErr != nil {
+		_, finishErr := p.Finish()
+		facts.CleanupConfirmed = finishErr == nil
+		return nil, errors.Join(imageErr, finishErr)
+	}
+	if err := observeWindowsLaunchCall(started, time.Now, &facts.ResumeThread, func() error {
+		count, err := windows.ResumeThread(process.Thread)
+		facts.PreviousSuspendCount = &count
+		if err != nil {
+			return err
+		}
+		return checkWindowsResumeCount(count)
+	}); err != nil {
+		_, finishErr := p.Finish()
+		facts.CleanupConfirmed = finishErr == nil
+		return nil, errors.Join(err, finishErr)
+	}
+	p.launch = facts
+	return p, nil
+}

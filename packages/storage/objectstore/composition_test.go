@@ -351,13 +351,13 @@ func TestClosedVolumeOperationsFailWithEIO(t *testing.T) {
 	if err := volume.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	mode := storage.Attr{}.Mode
+	modified := time.Unix(10, 0)
 	for _, operation := range []struct {
 		name string
 		run  func() error
 	}{
 		{name: "stat", run: func() error { _, err := volume.Stat(t.Context(), "f"); return err }},
-		{name: "setattr", run: func() error { return volume.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}) }},
+		{name: "setattr", run: func() error { return volume.SetAttr(t.Context(), "f", storage.AttrChange{ModTime: &modified}) }},
 		{name: "list", run: func() error { _, err := volume.List(t.Context(), ""); return err }},
 		{name: "read", run: func() error { _, err := volume.Read(t.Context(), "f"); return err }},
 		{name: "write", run: func() error { return volume.Write(t.Context(), "f", nil) }},
@@ -477,7 +477,7 @@ func (s *blockedMetastore) Garbage(ctx context.Context, limit int) ([]metastore.
 }
 
 func TestCloseDrainsEveryAdmittedVolumeMethod(t *testing.T) {
-	mode := storage.Attr{}.Mode
+	modified := time.Unix(10, 0)
 	for _, operation := range []struct {
 		name   string
 		method string
@@ -485,7 +485,7 @@ func TestCloseDrainsEveryAdmittedVolumeMethod(t *testing.T) {
 	}{
 		{name: "stat", method: "stat", run: func(s *objectstore.Storage) error { _, err := s.Stat(t.Context(), "missing"); return err }},
 		{name: "setattr", method: "setattr", run: func(s *objectstore.Storage) error {
-			return s.SetAttr(t.Context(), "missing", storage.AttrChange{Mode: &mode})
+			return s.SetAttr(t.Context(), "missing", storage.AttrChange{ModTime: &modified})
 		}},
 		{name: "list", method: "list", run: func(s *objectstore.Storage) error { _, err := s.List(t.Context(), ""); return err }},
 		{name: "read", method: "stat", run: func(s *objectstore.Storage) error { _, err := s.Read(t.Context(), "missing"); return err }},

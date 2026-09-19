@@ -1,0 +1,1852 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"debug/pe"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+)
+
+func testIdentity() identity {
+	return identity{"run_1", strings.Repeat("a", 40), strings.Repeat("b", 64)}
+}
+
+func TestControlResponsesBindRunAndRejectAmbiguity(t *testing.T) {
+	id := testIdentity()
+	valid := response{identity: id, Phase: "boot", Op: "boot-ready", Status: "ok"}
+	encode := func(value response) []byte {
+		data, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append([]byte(responsePrefix), data...)
+	}
+	if got, err := parseResponse(encode(valid), id); err != nil || got.Op != "boot-ready" {
+		t.Fatalf("valid response: %v %v", got, err)
+	}
+	if got, err := parseResponse([]byte("server: serving; readiness not proven"), id); err != nil || got != nil {
+		t.Fatalf("raw log interpreted as control: %v %v", got, err)
+	}
+	for name, change := range map[string]func(*response){
+		"wrong-run":      func(r *response) { r.RunID = "other" },
+		"wrong-source":   func(r *response) { r.SourceSHA = strings.Repeat("c", 40) },
+		"wrong-nonce":    func(r *response) { r.Nonce = strings.Repeat("c", 64) },
+		"unknown-status": func(r *response) { r.Status = "ready" },
+		"guest-error":    func(r *response) { r.Status = "error"; r.Category = "mount"; r.Cause = "read-only volume" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			value := valid
+			change(&value)
+			if _, err := parseResponse(encode(value), id); err == nil {
+				t.Fatal("accepted invalid response")
+			}
+		})
+	}
+	for _, line := range [][]byte{
+		[]byte(responsePrefix + `{"status":"ok","unexpected":true}`),
+		append(encode(valid), []byte(` {}`)...),
+		[]byte(responsePrefix + strings.Repeat(" ", controlLimit)),
+	} {
+		if _, err := parseResponse(line, id); err == nil {
+			t.Fatal("accepted ambiguous or oversized response")
+		}
+	}
+}
+
+type fakeChild struct {
+	input          io.WriteCloser
+	output, stderr io.ReadCloser
+	done           chan struct{}
+	result         error
+	forced         bool
+	finishes       int
+	finishErr      error
+	finishDeadline time.Time
+	finishBefore   func(time.Time) (bool, error)
+	verify         func(context.Context, net.Conn) (map[string]any, error)
+	verifications  int
+	doneCalled     func()
+}
+
+func (p *fakeChild) Input() io.WriteCloser { return p.input }
+func (p *fakeChild) Output() io.ReadCloser { return p.output }
+func (p *fakeChild) Errors() io.ReadCloser { return p.stderr }
+func (p *fakeChild) Done() <-chan struct{} {
+	if p.doneCalled != nil {
+		p.doneCalled()
+	}
+	return p.done
+}
+func (p *fakeChild) Result() error         { return p.result }
+func (p *fakeChild) PID() uint32           { return 42 }
+func (p *fakeChild) Finish() (bool, error) { return p.FinishBefore(time.Now().Add(10 * time.Second)) }
+func (p *fakeChild) FinishBefore(deadline time.Time) (bool, error) {
+	p.finishes++
+	p.finishDeadline = deadline
+	if p.finishBefore != nil {
+		return p.finishBefore(deadline)
+	}
+	return p.forced, p.finishErr
+}
+func (p *fakeChild) VerifyControlPeer(ctx context.Context, conn net.Conn) (map[string]any, error) {
+	p.verifications++
+	if p.verify != nil {
+		return p.verify(ctx, conn)
+	}
+	return map[string]any{"owner_pid": p.PID()}, nil
+}
+
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }
+
+type fakePlatform struct {
+	process   *fakeChild
+	startErr  error
+	listener  net.Listener
+	listenErr error
+	listen    func(context.Context) (net.Listener, error)
+	start     func(string, []string, string) (child, error)
+}
+
+func (p fakePlatform) Preflight() (map[string]any, error) { return nil, nil }
+func (p fakePlatform) ListenControl(ctx context.Context) (net.Listener, error) {
+	if p.listen != nil {
+		return p.listen(ctx)
+	}
+	return p.listener, p.listenErr
+}
+func (p fakePlatform) Start(executable string, args []string, directory string) (child, error) {
+	if p.start != nil {
+		return p.start(executable, args, directory)
+	}
+	return p.process, p.startErr
+}
+func childWithOutput(output string, completed bool) *fakeChild {
+	child := &fakeChild{input: nopWriteCloser{io.Discard}, output: io.NopCloser(strings.NewReader(output)), stderr: io.NopCloser(strings.NewReader("")), done: make(chan struct{})}
+	if completed {
+		close(child.done)
+	}
+	return child
+}
+
+func TestGuestAcknowledgementsRequireSequenceAndConfirmedExit(t *testing.T) {
+	zero := 0
+	id := testIdentity()
+	for _, test := range []struct {
+		name     string
+		message  response
+		op       string
+		sequence uint64
+		valid    bool
+	}{
+		{"stop-confirmed", response{identity: id, Phase: "stop-authority", Sequence: 2, Op: "stop-authority", Status: "ok", ExitCode: &zero}, "stop-authority", 2, true},
+		{"stop-no-exit", response{identity: id, Phase: "stop-authority", Sequence: 2, Op: "stop-authority", Status: "ok"}, "stop-authority", 2, false},
+		{"stale-start", response{identity: id, Phase: "start", Sequence: 1, Op: "start", Status: "ok"}, "start", 3, false},
+		{"wrong-phase", response{identity: id, Phase: "boot", Sequence: 1, Op: "start", Status: "ok"}, "start", 1, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			channel := &guestChannel{child: childWithOutput("", false), identity: id, responses: make(chan response, 1), fault: make(chan error, 1)}
+			channel.responses <- test.message
+			_, err := channel.receive(context.Background(), test.sequence, test.op, test.op)
+			if (err == nil) != test.valid {
+				t.Fatalf("valid=%v err=%v", test.valid, err)
+			}
+		})
+	}
+}
+
+func TestGuestControlTimeoutDoesNotClaimExit(t *testing.T) {
+	channel := &guestChannel{child: childWithOutput("", false), identity: testIdentity(), responses: make(chan response, 1), fault: make(chan error, 1)}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if _, err := channel.command(ctx, 1, "shutdown"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unconfirmed command: %v", err)
+	}
+	if _, err := commandBytes(channel.Nonce, 0, "start"); err == nil {
+		t.Fatal("zero sequence accepted")
+	}
+	if _, err := commandBytes(channel.Nonce, 1, "restart"); err == nil {
+		t.Fatal("unknown command accepted")
+	}
+}
+
+func TestToolOwnershipOnSuccessFailureAndCancellation(t *testing.T) {
+	for _, name := range []string{"success", "nonzero", "cancel", "forced"} {
+		t.Run(name, func(t *testing.T) {
+			process := childWithOutput("tool output", name != "cancel")
+			process.forced = name == "forced"
+			if name == "nonzero" {
+				process.result = errors.New("exit code 7")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+			defer cancel()
+			output, err := runTool(ctx, fakePlatform{process: process}, "tool", nil, privateTestDirectory(t), "tool")
+			if name == "success" && (err != nil || string(output) != "tool output") {
+				t.Fatalf("success %q %v", output, err)
+			}
+			if name != "success" && err == nil {
+				t.Fatal("failure reported success")
+			}
+			if process.finishes != 1 {
+				t.Fatalf("owned process finish count %d", process.finishes)
+			}
+		})
+	}
+}
+
+func TestStreamOverflowIsFailureWithMarker(t *testing.T) {
+	var output bytes.Buffer
+	writer := &cappedWriter{writer: &output, remaining: 5}
+	if _, err := writer.Write([]byte("0123456789")); err == nil {
+		t.Fatal("overflow was hidden")
+	}
+	if !strings.Contains(output.String(), "truncated") || !strings.HasPrefix(output.String(), "01234") {
+		t.Fatalf("missing bounded evidence %q", output.String())
+	}
+}
+
+func TestProbeReceiptCannotUseWrongSourceOrEmptyIdentity(t *testing.T) {
+	id := testIdentity()
+	value := response{identity: id, Phase: "readiness-create", Sequence: 1, Status: "ok", AuthorityEpoch: "epoch", ObjectID: "object"}
+	encode := func() []byte {
+		data, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	if _, err := validateProbe(encode(), id, value.Phase, 1); err != nil {
+		t.Fatal(err)
+	}
+	value.AuthorityEpoch = ""
+	if _, err := validateProbe(encode(), id, value.Phase, 1); err == nil {
+		t.Fatal("empty authority accepted")
+	}
+	value.AuthorityEpoch = "epoch"
+	value.SourceSHA = strings.Repeat("c", 40)
+	if _, err := validateProbe(encode(), id, value.Phase, 1); err == nil {
+		t.Fatal("foreign source accepted")
+	}
+}
+
+func TestArtifactTraversalAndHashMismatchFail(t *testing.T) {
+	root := privateTestDirectory(t)
+	if err := os.WriteFile(filepath.Join(root, "input"), []byte("source"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	hash, _, err := fileHash(filepath.Join(root, "input"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyFiles(root, map[string]string{"input": hash}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"../input", "/input", `a\input`, "a/../input", "./input", "C:/input"} {
+		if _, err := safePath(root, path); err == nil {
+			t.Fatalf("traversal accepted: %s", path)
+		}
+	}
+	if err := verifyFiles(root, map[string]string{"input": strings.Repeat("0", 64)}); err == nil {
+		t.Fatal("hash mismatch accepted")
+	}
+}
+
+func TestPrivateDiskCopyBindsExpectedHash(t *testing.T) {
+	directory := privateTestDirectory(t)
+	source := filepath.Join(directory, "source")
+	if err := os.WriteFile(source, []byte("pristine"), 0400); err != nil {
+		t.Fatal(err)
+	}
+	hash, size, err := fileHash(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := artifact{SHA256: hash, Size: size}
+	if err := copyDisk(source, filepath.Join(directory, "copy"), expected); err != nil {
+		t.Fatal(err)
+	}
+	expected.SHA256 = strings.Repeat("0", 64)
+	if err := copyDisk(source, filepath.Join(directory, "mismatch"), expected); err == nil {
+		t.Fatal("changed pristine disk accepted")
+	}
+	actual, _, err := fileHash(source)
+	if err != nil || actual != hash {
+		t.Fatalf("source changed: %s %v", actual, err)
+	}
+}
+
+func TestQEMULaunchLimitsNetworkAndUsesPrivateDisk(t *testing.T) {
+	var m manifest
+	m.BootToken = strings.Repeat("a", 64)
+	m.Volume = "fixture-current"
+	m.QEMU.Machine = "pc-q35-11.1"
+	args := qemuArguments(m, testIdentity(), "kernel", "initramfs", "private,data", "bios", 43210, 43111)
+	joined := strings.Join(args, " ")
+	for _, required := range []string{"-L bios", "-accel tcg,thread=multi", "restrict=on", "hostfwd=tcp:127.0.0.1:43210-10.0.2.15:8080", "file=private,,data,format=raw", "rng-builtin", "RFS_FIXTURE_NONCE=", "-chardev socket,id=console,host=127.0.0.1,port=43111,server=off,reconnect-ms=0", "-serial chardev:console"} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("missing %s", required)
+		}
+	}
+	if strings.Count(joined, "hostfwd=") != 1 {
+		t.Fatal("multiple forwards")
+	}
+	for _, forbidden := range []string{"cache=unsafe", "-virtfs", "-fsdev", "-qmp", "rng-random", "whpx", "stdio", "server=on"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("forbidden %s", forbidden)
+		}
+	}
+}
+
+func TestFramedAuthorityOutputCannotForgeGuestControl(t *testing.T) {
+	var output bytes.Buffer
+	logs := map[string]*cappedWriter{"stdout": {writer: &output, remaining: streamLimit}, "stderr": {writer: io.Discard, remaining: streamLimit}}
+	forged := responsePrefix + `{"status":"ok"}`
+	line := "RFS-AUTHORITY/stdout " + base64.StdEncoding.EncodeToString([]byte(forged))
+	handled, err := authorityLogLine([]byte(line), logs)
+	if err != nil || !handled || output.String() != forged {
+		t.Fatalf("frame was not isolated: %v %v %q", handled, err, output.String())
+	}
+	for _, line := range []string{"RFS-AUTHORITY/stdout invalid!", "RFS-AUTHORITY/unknown YQ=="} {
+		if handled, err := authorityLogLine([]byte(line), logs); !handled || err == nil {
+			t.Fatalf("malformed frame accepted: %q", line)
+		}
+	}
+}
+
+func TestDuplicateJSONFieldsCannotOverrideIdentity(t *testing.T) {
+	id := testIdentity()
+	data, err := json.Marshal(response{identity: id, Phase: "boot", Op: "boot-ready", Status: "ok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data[:len(data)-1], []byte(`,"run_id":"run_1"}`)...)
+	if _, err := parseResponse(append([]byte(responsePrefix), data...), id); err == nil {
+		t.Fatal("duplicate identity field accepted")
+	}
+	var target map[string]any
+	if err := decodeOne([]byte(`{"source_files":{"x":"a","x":"b"}}`), &target); err == nil {
+		t.Fatal("duplicate nested source hash accepted")
+	}
+}
+
+func privateTestDirectory(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "private")
+	if err := createPrivateDirectory(path); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func hostPEFixture(t *testing.T, path string, machine uint16) {
+	t.Helper()
+	var image bytes.Buffer
+	dos := make([]byte, 128)
+	copy(dos, []byte("MZ"))
+	binary.LittleEndian.PutUint32(dos[0x3c:], 128)
+	image.Write(dos)
+	image.Write([]byte{'P', 'E', 0, 0})
+	header := pe.FileHeader{Machine: machine, SizeOfOptionalHeader: 240, Characteristics: pe.IMAGE_FILE_EXECUTABLE_IMAGE | pe.IMAGE_FILE_LARGE_ADDRESS_AWARE}
+	optional := pe.OptionalHeader64{Magic: 0x20b, ImageBase: 0x140000000, SectionAlignment: 4096, FileAlignment: 512, SizeOfImage: 4096, SizeOfHeaders: 512, Subsystem: pe.IMAGE_SUBSYSTEM_WINDOWS_CUI, NumberOfRvaAndSizes: 16}
+	if err := binary.Write(&image, binary.LittleEndian, header); err != nil {
+		t.Fatal(err)
+	}
+	if err := binary.Write(&image, binary.LittleEndian, optional); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, image.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativeHostPEPolicyPrecedesPlatform(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		machines  [3]uint16
+		malformed int
+		valid     bool
+	}{
+		{name: "native-arm64", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64}, malformed: -1, valid: true},
+		{name: "all-x64", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_AMD64, pe.IMAGE_FILE_MACHINE_AMD64, pe.IMAGE_FILE_MACHINE_AMD64}, malformed: -1},
+		{name: "x64-qemu", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_AMD64, pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64}, malformed: -1},
+		{name: "x64-probe", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_AMD64, pe.IMAGE_FILE_MACHINE_ARM64}, malformed: -1},
+		{name: "x64-controller", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_AMD64}, malformed: -1},
+		{name: "malformed-qemu", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64}, malformed: 0},
+		{name: "malformed-probe", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64}, malformed: 1},
+		{name: "malformed-controller", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64}, malformed: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := privateTestDirectory(t)
+			paths := [3]string{filepath.Join(directory, "qemu-system-x86_64.exe"), filepath.Join(directory, "probe.exe"), filepath.Join(directory, "controller.exe")}
+			for index, path := range paths {
+				hostPEFixture(t, path, test.machines[index])
+			}
+			if test.malformed >= 0 {
+				if err := os.WriteFile(paths[test.malformed], []byte("MZ truncated"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			original := newPlatform
+			calls := 0
+			newPlatform = func() (platform, error) { calls++; return fakePlatform{}, nil }
+			defer func() { newPlatform = original }()
+			host, err := nativeHostPlatform(paths[0], paths[1], paths[2])
+			if test.valid {
+				if err != nil || host == nil || calls != 1 {
+					t.Fatalf("native host rejected: calls=%d error=%v", calls, err)
+				}
+			} else if err == nil || host != nil || calls != 0 {
+				t.Fatalf("invalid host reached platform: calls=%d error=%v", calls, err)
+			}
+		})
+	}
+}
+
+type observedControlConn struct {
+	net.Conn
+	local, remote         net.Addr
+	write                 func([]byte) (int, error)
+	setWriteDeadline      func(time.Time) error
+	closeError            error
+	reads, writes, closes atomic.Int32
+}
+
+func (c *observedControlConn) LocalAddr() net.Addr  { return c.local }
+func (c *observedControlConn) RemoteAddr() net.Addr { return c.remote }
+func (c *observedControlConn) Read(data []byte) (int, error) {
+	c.reads.Add(1)
+	return c.Conn.Read(data)
+}
+func (c *observedControlConn) Write(data []byte) (int, error) {
+	c.writes.Add(1)
+	if c.write != nil {
+		return c.write(data)
+	}
+	return c.Conn.Write(data)
+}
+func (c *observedControlConn) SetWriteDeadline(deadline time.Time) error {
+	if c.setWriteDeadline != nil {
+		return c.setWriteDeadline(deadline)
+	}
+	return c.Conn.SetWriteDeadline(deadline)
+}
+func (c *observedControlConn) Close() error {
+	c.closes.Add(1)
+	return errors.Join(c.Conn.Close(), c.closeError)
+}
+
+func controlTestPair(t *testing.T) (*observedControlConn, net.Conn) {
+	t.Helper()
+	controller, peer := net.Pipe()
+	t.Cleanup(func() { controller.Close(); peer.Close() })
+	return &observedControlConn{Conn: controller,
+		local:  &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001},
+		remote: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40002}}, peer
+}
+
+type controlAcceptResult struct {
+	conn net.Conn
+	err  error
+}
+type testControlListener struct {
+	result          chan controlAcceptResult
+	entered, closed chan struct{}
+	closeOnce       sync.Once
+	closeError      error
+	accept          func() (net.Conn, error)
+	address         net.Addr
+	closes          atomic.Int32
+}
+
+func newTestControlListener(t *testing.T) *testControlListener {
+	t.Helper()
+	l := &testControlListener{result: make(chan controlAcceptResult, 1), entered: make(chan struct{}), closed: make(chan struct{})}
+	t.Cleanup(func() { l.Close() })
+	return l
+}
+func (l *testControlListener) Addr() net.Addr {
+	if l.address != nil {
+		return l.address
+	}
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001}
+}
+func (l *testControlListener) Accept() (net.Conn, error) {
+	close(l.entered)
+	if l.accept != nil {
+		return l.accept()
+	}
+	select {
+	case result := <-l.result:
+		return result.conn, result.err
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+func (l *testControlListener) Close() error {
+	l.closes.Add(1)
+	l.closeOnce.Do(func() { close(l.closed) })
+	return l.closeError
+}
+
+func socketTestContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func controlResponseLine(t *testing.T, message response) []byte {
+	t.Helper()
+	data, err := json.Marshal(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(append([]byte(responsePrefix), data...), '\n')
+}
+
+func TestControlSocketAuthenticationBeforeIO(t *testing.T) {
+	failure := errors.New("foreign process")
+	for _, name := range []string{"owned", "wrong-owner", "missing-evidence", "bad-local-port", "bad-remote", "typed-nil-remote", "expired-during-proof", "listener-close-error"} {
+		t.Run(name, func(t *testing.T) {
+			conn, _ := controlTestPair(t)
+			listener := newTestControlListener(t)
+			if name == "bad-local-port" {
+				conn.local = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40003}
+			}
+			if name == "bad-remote" {
+				conn.remote = &net.TCPAddr{IP: net.ParseIP("::1"), Port: 40002}
+			}
+			if name == "typed-nil-remote" {
+				conn.remote = (*net.TCPAddr)(nil)
+			}
+			if name == "listener-close-error" {
+				listener.closeError = failure
+			}
+			listener.result <- controlAcceptResult{conn: conn}
+			control := newControlSocket(listener)
+			ctx, cancel := context.WithCancel(socketTestContext(t))
+			defer cancel()
+			process := childWithOutput("", false)
+			process.verify = func(context.Context, net.Conn) (map[string]any, error) {
+				if name == "wrong-owner" {
+					return nil, failure
+				}
+				if name == "missing-evidence" {
+					return nil, nil
+				}
+				if name == "expired-during-proof" {
+					cancel()
+				}
+				return map[string]any{"owner_pid": process.PID()}, nil
+			}
+			accepted, facts, err := control.accept(ctx, process, make(chan error))
+			if name == "owned" {
+				if err != nil || accepted != conn || facts["owner_pid"] != process.PID() {
+					t.Fatalf("owned proof: %v %v", facts, err)
+				}
+			} else if err == nil || accepted != nil || facts != nil {
+				t.Fatalf("rejected peer was admitted: %v %v", facts, err)
+			}
+			if conn.reads.Load() != 0 || conn.writes.Load() != 0 {
+				t.Fatal("control bytes consumed before peer authentication")
+			}
+			if strings.HasPrefix(name, "bad-") || name == "typed-nil-remote" || name == "listener-close-error" {
+				if process.verifications != 0 {
+					t.Fatal("invalid endpoint reached process verification")
+				}
+			} else if process.verifications != 1 {
+				t.Fatalf("proof count %d", process.verifications)
+			}
+			closeErr := control.closeIO()
+			if name == "listener-close-error" && !errors.Is(closeErr, failure) {
+				t.Fatalf("lost close error: %v", closeErr)
+			}
+			if name != "listener-close-error" && closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			_ = control.closeIO()
+			if conn.closes.Load() != 1 || listener.closes.Load() != 1 {
+				t.Fatal("control resources were not closed exactly once")
+			}
+		})
+	}
+}
+
+func TestControlSocketInterruptedAcceptJoinsOwner(t *testing.T) {
+	failure := errors.New("control accept failure")
+	for _, name := range []string{"cancellation", "child-exit", "diagnostic-fault", "accept-error", "empty-accept"} {
+		t.Run(name, func(t *testing.T) {
+			listener := newTestControlListener(t)
+			control := newControlSocket(listener)
+			process := childWithOutput("", false)
+			ctx, cancel := context.WithCancel(socketTestContext(t))
+			defer cancel()
+			fault := make(chan error, 1)
+			select {
+			case <-listener.entered:
+			case <-ctx.Done():
+				t.Fatal("accept did not start")
+			}
+			switch name {
+			case "cancellation":
+				cancel()
+			case "child-exit":
+				close(process.done)
+			case "diagnostic-fault":
+				fault <- failure
+			case "accept-error":
+				listener.result <- controlAcceptResult{err: failure}
+			case "empty-accept":
+				listener.result <- controlAcceptResult{}
+			}
+			if conn, facts, err := control.accept(ctx, process, fault); err == nil || conn != nil || facts != nil {
+				t.Fatalf("interrupted accept succeeded: %v", err)
+			}
+			if process.verifications != 0 {
+				t.Fatal("failed accept reached peer verification")
+			}
+			if err := control.closeIO(); err != nil {
+				t.Fatal(err)
+			}
+			_ = control.join(socketTestContext(t))
+			select {
+			case <-control.done:
+			default:
+				t.Fatal("accept owner still running after close")
+			}
+			if listener.closes.Load() != 1 {
+				t.Fatal("listener closed more than once")
+			}
+		})
+	}
+}
+
+func TestControlSocketClosesLateAcceptedConnection(t *testing.T) {
+	conn, _ := controlTestPair(t)
+	listener := newTestControlListener(t)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	listener.accept = func() (net.Conn, error) { <-release; return conn, nil }
+	control := newControlSocket(listener)
+	ctx := socketTestContext(t)
+	select {
+	case <-listener.entered:
+	case <-ctx.Done():
+		t.Fatal("accept did not start")
+	}
+	_, err := finishGuest(nil, control, nil, time.Now().Add(-time.Second))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unfinished accept lost deadline: %v", err)
+	}
+	unblock()
+	if err := control.join(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if conn.closes.Load() != 1 || listener.closes.Load() != 1 {
+		t.Fatal("late connection escaped its closed owner")
+	}
+	if err := control.closeIO(); err != nil {
+		t.Fatal(err)
+	}
+	if conn.closes.Load() != 1 {
+		t.Fatal("late connection closed twice")
+	}
+}
+
+func TestGuestSocketCommandFramingAndNaturalEOF(t *testing.T) {
+	for _, op := range []string{"start", "stop-authority", "shutdown"} {
+		t.Run(op, func(t *testing.T) {
+			conn, peer := controlTestPair(t)
+			directory := privateTestDirectory(t)
+			guest, err := newGuestChannel(testIdentity(), directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer guest.closeLogs()
+			guest.startDiagnostics(childWithOutput("QEMU diagnostics\n", false))
+			guest.startSerial(conn)
+			zero := 0
+			ack := controlResponseLine(t, response{identity: testIdentity(), Phase: op, Sequence: 7, Op: op, Status: "ok", ExitCode: &zero})
+			exchange := make(chan error, 1)
+			allowEOF := make(chan struct{})
+			go func() {
+				line, err := bufio.NewReader(peer).ReadBytes('\n')
+				if err == nil {
+					want, encodeErr := commandBytes(testIdentity().Nonce, 7, op)
+					if encodeErr != nil {
+						err = encodeErr
+					} else if !bytes.Equal(line, want) {
+						err = errors.New("command differs from exact JSONL frame")
+					}
+				}
+				if err == nil {
+					_, err = peer.Write(ack[:9])
+				}
+				if err == nil {
+					_, err = peer.Write(ack[9:])
+				}
+				if err == nil {
+					<-allowEOF
+				}
+				exchange <- errors.Join(err, peer.Close())
+			}()
+			ctx := socketTestContext(t)
+			value, commandErr := guest.command(ctx, 7, op)
+			close(allowEOF)
+			if commandErr != nil || value.Op != op || value.Sequence != 7 {
+				t.Fatalf("socket command: %v %v", value, commandErr)
+			}
+			select {
+			case err := <-exchange:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal("peer exchange did not finish")
+			}
+			if err := joinReaders(ctx, guest.readers); err != nil {
+				t.Fatal(err)
+			}
+			if conn.writes.Load() != 1 {
+				t.Fatalf("command wrote %d frames", conn.writes.Load())
+			}
+			if err := guest.closeLogs(); err != nil {
+				t.Fatal(err)
+			}
+			serial, err := os.ReadFile(filepath.Join(directory, "guest-serial.log"))
+			if err != nil || !bytes.Equal(serial, ack) {
+				t.Fatalf("serial evidence: %q %v", serial, err)
+			}
+		})
+	}
+}
+
+func TestGuestCommandCancellationReleasesBackpressuredWrite(t *testing.T) {
+	conn, _ := controlTestPair(t)
+	entered := make(chan struct{})
+	conn.write = func(data []byte) (int, error) { close(entered); return conn.Conn.Write(data) }
+	guest := &guestChannel{child: childWithOutput("", false), identity: testIdentity(), conn: conn, responses: make(chan response, 1), fault: make(chan error, 1)}
+	ctx, cancel := context.WithCancel(socketTestContext(t))
+	defer cancel()
+	finished := make(chan error, 1)
+	go func() { _, err := guest.command(ctx, 1, "start"); finished <- err }()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("command did not reach write")
+	}
+	cancel()
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("write cancellation lost cause: %v", err)
+		}
+	case <-socketTestContext(t).Done():
+		t.Fatal("canceled socket writer survived")
+	}
+	if conn.writes.Load() != 1 {
+		t.Fatal("canceled command was retried")
+	}
+}
+
+func TestGuestSocketCommandFailures(t *testing.T) {
+	failure := errors.New("socket operation failed")
+	for _, name := range []string{"short-write", "write-error", "deadline-error", "reset-error", "stale-ack", "wrong-phase", "stop-no-exit", "unsolicited", "reader-fault", "unbounded", "unauthenticated"} {
+		t.Run(name, func(t *testing.T) {
+			conn, _ := controlTestPair(t)
+			guest := &guestChannel{child: childWithOutput("", false), identity: testIdentity(), conn: conn, responses: make(chan response, 1), fault: make(chan error, 1)}
+			op := "start"
+			if name == "stop-no-exit" {
+				op = "stop-authority"
+			}
+			ctx := socketTestContext(t)
+			if name == "unbounded" {
+				ctx = context.Background()
+			}
+			if name == "unauthenticated" {
+				guest.conn = nil
+			}
+			if name == "unsolicited" {
+				guest.responses <- response{Op: "start"}
+			}
+			if name == "reader-fault" {
+				guest.fault <- failure
+			}
+			conn.write = func(data []byte) (int, error) {
+				if name == "short-write" {
+					return len(data) - 1, nil
+				}
+				if name == "write-error" {
+					return 0, failure
+				}
+				ack := response{identity: testIdentity(), Phase: op, Sequence: 2, Op: op, Status: "ok"}
+				if name == "stale-ack" {
+					ack.Sequence = 1
+				}
+				if name == "wrong-phase" {
+					ack.Phase = "boot"
+				}
+				guest.responses <- ack
+				return len(data), nil
+			}
+			conn.setWriteDeadline = func(deadline time.Time) error {
+				if name == "deadline-error" || name == "reset-error" && deadline.IsZero() {
+					return failure
+				}
+				return nil
+			}
+			_, err := guest.command(ctx, 2, op)
+			if err == nil {
+				t.Fatal("invalid command exchange succeeded")
+			}
+			if name == "short-write" && !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("short write lost cause: %v", err)
+			}
+			if (name == "write-error" || name == "deadline-error" || name == "reset-error" || name == "reader-fault") && !errors.Is(err, failure) {
+				t.Fatalf("lost error cause: %v", err)
+			}
+			if name == "unbounded" || name == "unauthenticated" || name == "unsolicited" || name == "reader-fault" || name == "deadline-error" {
+				if conn.writes.Load() != 0 {
+					t.Fatal("invalid command reached socket write")
+				}
+			} else if conn.writes.Load() != 1 {
+				t.Fatal("command was retried")
+			}
+		})
+	}
+}
+
+func TestGuestSerialFramingAndProcessLogIsolation(t *testing.T) {
+	id := testIdentity()
+	boot := controlResponseLine(t, response{identity: id, Phase: "boot", Op: "boot-ready", Status: "ok"})
+	for _, name := range []string{"complete", "empty-eof", "no-final-lf", "wrong-identity", "duplicate", "authority-frame"} {
+		t.Run(name, func(t *testing.T) {
+			conn, peer := controlTestPair(t)
+			directory := privateTestDirectory(t)
+			guest, err := newGuestChannel(id, directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer guest.closeLogs()
+			guest.startDiagnostics(childWithOutput(string(boot), false))
+			ctx := socketTestContext(t)
+			if err := joinReaders(ctx, guest.readers); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-guest.responses:
+				t.Fatal("process stdout forged a control response")
+			default:
+			}
+			guest.startSerial(conn)
+			data := bytes.Clone(boot)
+			switch name {
+			case "empty-eof":
+				data = nil
+			case "no-final-lf":
+				data = data[:len(data)-1]
+			case "wrong-identity":
+				other := id
+				other.Nonce = strings.Repeat("c", 64)
+				data = controlResponseLine(t, response{identity: other, Phase: "boot", Op: "boot-ready", Status: "ok"})
+			case "duplicate":
+				data = append(data, boot...)
+			case "authority-frame":
+				data = append([]byte("RFS-AUTHORITY/stdout "+base64.StdEncoding.EncodeToString(boot)+"\n"), data...)
+			}
+			written := make(chan error, 1)
+			go func() {
+				var err error
+				if len(data) > 0 {
+					_, err = peer.Write(data)
+				}
+				written <- errors.Join(err, peer.Close())
+			}()
+			select {
+			case err := <-written:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal("serial write did not finish")
+			}
+			joinErr := joinReaders(ctx, guest.readers)
+			valid := name == "complete" || name == "authority-frame"
+			validStream := valid || name == "empty-eof"
+			if validStream && joinErr != nil || !validStream && joinErr == nil {
+				t.Fatalf("framing result=%v valid=%v", joinErr, validStream)
+			}
+			if name == "no-final-lf" && !errors.Is(joinErr, io.ErrUnexpectedEOF) {
+				t.Fatalf("truncated serial accepted: %v", joinErr)
+			}
+			_, err = guest.receive(ctx, 0, "boot-ready", "boot")
+			if valid && err != nil || !valid && err == nil {
+				t.Fatalf("invalid serial produced acknowledgement: %v", err)
+			}
+			if name == "empty-eof" && !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("empty serial lost EOF: %v", err)
+			}
+			if name == "authority-frame" {
+				got, err := os.ReadFile(filepath.Join(directory, "authority-stdout.log"))
+				if err != nil || !bytes.Equal(got, boot) {
+					t.Fatalf("authority bytes lost: %q %v", got, err)
+				}
+			}
+		})
+	}
+}
+
+func TestGuestCleanupPreservesDeadlineAndFailures(t *testing.T) {
+	finishError := errors.New("job query failed")
+	readError := errors.New("diagnostic read failed")
+	for _, name := range []string{"complete", "forced", "job-error", "reader-error", "unfinished-reader", "log-close-error"} {
+		t.Run(name, func(t *testing.T) {
+			guest, err := newGuestChannel(testIdentity(), privateTestDirectory(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer guest.closeLogs()
+			reader := &ownedReader{name: "controlled reader", done: make(chan struct{})}
+			if name == "reader-error" {
+				reader.err = readError
+			}
+			if name != "unfinished-reader" {
+				close(reader.done)
+			}
+			guest.readers = []*ownedReader{reader}
+			if name == "log-close-error" {
+				if err := guest.logs["guest-serial"].Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			process := childWithOutput("", true)
+			process.forced = name == "forced"
+			if name == "job-error" {
+				process.finishErr = finishError
+			}
+			deadline := time.Now().Add(time.Second)
+			if name == "unfinished-reader" {
+				deadline = time.Now().Add(-time.Second)
+			}
+			forced, err := finishGuest(process, nil, guest, deadline)
+			if process.finishes != 1 || !process.finishDeadline.Equal(deadline) {
+				t.Fatal("cleanup restarted or replaced its absolute deadline")
+			}
+			if name == "complete" && (err != nil || forced) {
+				t.Fatalf("complete cleanup: %v %v", forced, err)
+			}
+			if name != "complete" && err == nil {
+				t.Fatal("cleanup failure was hidden")
+			}
+			if name == "forced" && (!forced || !strings.Contains(err.Error(), "forced termination")) {
+				t.Fatalf("forced cleanup reported graceful: %v", err)
+			}
+			if name == "job-error" && (!errors.Is(err, finishError) || !errors.Is(err, errOwnedCleanup)) {
+				t.Fatalf("job cleanup cause lost: %v", err)
+			}
+			if name == "reader-error" && !errors.Is(err, readError) {
+				t.Fatalf("reader error lost: %v", err)
+			}
+			if name == "unfinished-reader" && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("reader wait restarted its budget: %v", err)
+			}
+			if name == "log-close-error" && !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("close error lost: %v", err)
+			}
+			for _, file := range guest.logs {
+				if _, err := file.Write([]byte("after cleanup")); !errors.Is(err, os.ErrClosed) {
+					t.Fatal("evidence log remains open")
+				}
+			}
+			repeated := guest.closeLogs()
+			if name == "log-close-error" && !errors.Is(repeated, os.ErrClosed) {
+				t.Fatal("close failure was not sticky")
+			}
+		})
+	}
+}
+
+func TestControlCleanupRetainsConnectionCloseError(t *testing.T) {
+	conn, _ := controlTestPair(t)
+	failure := errors.New("connection close failed")
+	conn.closeError = failure
+	listener := newTestControlListener(t)
+	listener.result <- controlAcceptResult{conn: conn}
+	control := newControlSocket(listener)
+	ctx := socketTestContext(t)
+	select {
+	case <-control.done:
+	case <-ctx.Done():
+		t.Fatal("accept did not finish")
+	}
+	for range 2 {
+		_, err := finishGuest(nil, control, nil, time.Now().Add(time.Second))
+		if !errors.Is(err, failure) {
+			t.Fatalf("lost connection close failure: %v", err)
+		}
+	}
+	if conn.closes.Load() != 1 || listener.closes.Load() != 1 {
+		t.Fatal("cleanup repeated a resource close")
+	}
+}
+
+func TestSocketLifecycleFailureStagesCleanOwnedResources(t *testing.T) {
+	failure := errors.New("controlled lifecycle failure")
+	for _, name := range []string{"bind", "log-setup", "start", "boot-canceled", "peer-proof"} {
+		t.Run(name, func(t *testing.T) {
+			artifacts, evidence, work := privateTestDirectory(t), privateTestDirectory(t), privateTestDirectory(t)
+			pristine := filepath.Join(artifacts, "pristine.ext4")
+			if err := os.WriteFile(pristine, []byte("pristine fixture bytes"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			hash, size, err := fileHash(pristine)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := manifest{Artifacts: map[string]artifact{"data": {Path: "pristine.ext4", SHA256: hash, Size: size}}, BootToken: strings.Repeat("a", 64), Volume: "fixture-current"}
+			m.QEMU.Machine = "pc-q35-11.1"
+			log := &events{identity: testIdentity(), output: &cappedWriter{writer: io.Discard, remaining: streamLimit}}
+			listener := newTestControlListener(t)
+			listener.address = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
+			conn, _ := controlTestPair(t)
+			conn.local = listener.Addr()
+			if name == "peer-proof" {
+				listener.result <- controlAcceptResult{conn: conn}
+			}
+			if name == "log-setup" {
+				if err := os.WriteFile(filepath.Join(evidence, "guest-serial.log"), []byte("existing"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			process := childWithOutput("QEMU diagnostic only\n", false)
+			process.verify = func(context.Context, net.Conn) (map[string]any, error) { return nil, failure }
+			starts := 0
+			host := fakePlatform{
+				listen: func(boot context.Context) (net.Listener, error) {
+					if _, ok := boot.Deadline(); !ok {
+						t.Fatal("listener setup has no boot deadline")
+					}
+					if name == "bind" {
+						return nil, failure
+					}
+					if name == "boot-canceled" {
+						cancel()
+					}
+					return listener, nil
+				},
+				start: func(_ string, args []string, _ string) (child, error) {
+					if !strings.Contains(strings.Join(args, " "), "-chardev") {
+						return childWithOutput("QEMU emulator version 11.1.0 pc-q35-11.1 virtio-blk-pci virtio-net-pci virtio-rng-pci rng-builtin user tcg", true), nil
+					}
+					starts++
+					if name == "start" {
+						return nil, failure
+					}
+					return process, nil
+				},
+			}
+			err = lifecycle(ctx, host, m, testIdentity(), "qemu", "bios", artifacts, evidence, work, log, false)
+			if err == nil {
+				t.Fatal("failed lifecycle reported success")
+			}
+			switch name {
+			case "bind", "start", "peer-proof":
+				if !errors.Is(err, failure) {
+					t.Fatalf("stage error lost: %v", err)
+				}
+			case "log-setup":
+				if !errors.Is(err, os.ErrExist) {
+					t.Fatalf("log setup error lost: %v", err)
+				}
+			case "boot-canceled":
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("boot budget lost: %v", err)
+				}
+			}
+			wantStarts := 0
+			if name == "start" || name == "peer-proof" {
+				wantStarts = 1
+			}
+			if starts != wantStarts {
+				t.Fatalf("QEMU launch count=%d want=%d", starts, wantStarts)
+			}
+			if name != "bind" && listener.closes.Load() != 1 {
+				t.Fatal("lifecycle listener was not closed once")
+			}
+			if name == "peer-proof" {
+				if process.finishes != 1 || process.verifications != 1 || conn.closes.Load() != 1 {
+					t.Fatal("owned process or connection escaped rejected proof cleanup")
+				}
+				if conn.reads.Load() != 0 || conn.writes.Load() != 0 {
+					t.Fatal("rejected lifecycle exchanged control bytes")
+				}
+			}
+			actual, _, hashErr := fileHash(pristine)
+			if hashErr != nil || actual != hash {
+				t.Fatalf("pristine fixture changed: %v", hashErr)
+			}
+		})
+	}
+}
+
+type terminalBytesReader struct {
+	data []byte
+	err  error
+}
+
+func (r *terminalBytesReader) Read(data []byte) (int, error) {
+	n := copy(data, r.data)
+	r.data = r.data[n:]
+	if len(r.data) == 0 {
+		return n, r.err
+	}
+	return n, nil
+}
+
+type terminalReadConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (c terminalReadConn) Read(data []byte) (int, error) { return c.reader.Read(data) }
+
+func terminalResetError() error {
+	return &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("wsarecv", syscall.Errno(10054))}
+}
+
+func terminalGuest(t *testing.T, data []byte, readErr error) (*guestChannel, *fakeChild) {
+	t.Helper()
+	guest, err := newGuestChannel(testIdentity(), privateTestDirectory(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, _ := controlTestPair(t)
+	process := childWithOutput("", false)
+	guest.startDiagnostics(process)
+	guest.startSerial(terminalReadConn{Conn: conn, reader: &terminalBytesReader{data: bytes.Clone(data), err: readErr}})
+	ctx := socketTestContext(t)
+	select {
+	case <-guest.serial.done:
+	case <-ctx.Done():
+		t.Fatal("terminal reader did not finish")
+	}
+	t.Cleanup(func() {
+		conn.Close()
+		if err := joinReaders(socketTestContext(t), guest.readers); errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("terminal reader remained unjoined: %v", err)
+		}
+		if err := guest.closeLogs(); err != nil {
+			t.Errorf("terminal evidence close: %v", err)
+		}
+	})
+	return guest, process
+}
+
+func TestTerminalQueuedShutdownAckPrecedesResetFault(t *testing.T) {
+	zero := 0
+	ack := controlResponseLine(t, response{identity: testIdentity(), Phase: "shutdown", Sequence: 4, Op: "shutdown", Status: "ok", ExitCode: &zero})
+	guest, process := terminalGuest(t, ack, terminalResetError())
+	if len(guest.responses) != 1 || len(guest.fault) != 1 {
+		t.Fatal("test did not queue exact ACK before terminal fault selection")
+	}
+	value, err := guest.receive(socketTestContext(t), 4, "shutdown", "shutdown")
+	if err != nil || value.Sequence != 4 || value.ExitCode == nil || *value.ExitCode != 0 {
+		t.Fatalf("queued final ACK was lost to reset: value=%v err=%v", value, err)
+	}
+	if !errors.Is(guest.serial.err, syscall.Errno(10054)) {
+		t.Fatalf("raw reset observation lost: %v", guest.serial.err)
+	}
+	select {
+	case <-process.done:
+		t.Fatal("receiving ACK invented natural process exit")
+	default:
+	}
+	if process.finishes != 0 {
+		t.Fatal("terminal reset forced cleanup before natural exit")
+	}
+}
+
+func TestTerminalResetRequiresExactShutdownAcknowledgement(t *testing.T) {
+	zero, nonzero := 0, 1
+	for _, name := range []string{"missing", "wrong-sequence", "wrong-phase", "wrong-op", "missing-exit", "nonzero-exit", "wrong-identity", "guest-error", "earlier-phase", "wrong-request-sequence"} {
+		t.Run(name, func(t *testing.T) {
+			ack := response{identity: testIdentity(), Phase: "shutdown", Sequence: 4, Op: "shutdown", Status: "ok", ExitCode: &zero}
+			sequence, op, phase := uint64(4), "shutdown", "shutdown"
+			switch name {
+			case "wrong-sequence":
+				ack.Sequence = 3
+			case "wrong-phase":
+				ack.Phase = "boot"
+			case "wrong-op":
+				ack.Op = "stop-authority"
+			case "missing-exit":
+				ack.ExitCode = nil
+			case "nonzero-exit":
+				ack.ExitCode = &nonzero
+			case "wrong-identity":
+				ack.Nonce = strings.Repeat("c", 64)
+			case "guest-error":
+				ack.Status = "error"
+				ack.Category = "unmount"
+				ack.Cause = "unmount failed"
+			case "earlier-phase":
+				ack.Phase = "start"
+				ack.Op = "start"
+				ack.Sequence = 1
+				sequence, op, phase = 1, "start", "start"
+			case "wrong-request-sequence":
+				sequence = 5
+			}
+			data := controlResponseLine(t, ack)
+			if name == "missing" {
+				data = []byte("kernel: Power down\n")
+			}
+			guest, process := terminalGuest(t, data, terminalResetError())
+			if _, err := guest.receive(socketTestContext(t), sequence, op, phase); err == nil {
+				t.Fatal("reset supplied missing or invalid shutdown acknowledgement")
+			}
+			if process.finishes != 0 {
+				t.Fatal("ACK failure itself invoked process cleanup")
+			}
+		})
+	}
+}
+
+func terminalShutdownLine(t *testing.T) []byte {
+	t.Helper()
+	zero := 0
+	return controlResponseLine(t, response{identity: testIdentity(), Phase: "shutdown", Sequence: 4, Op: "shutdown", Status: "ok", ExitCode: &zero})
+}
+
+func TestTerminalShutdownWaitsForNaturalExit(t *testing.T) {
+	for _, name := range []string{"reset", "eof"} {
+		t.Run(name, func(t *testing.T) {
+			readErr := terminalResetError()
+			if name == "eof" {
+				readErr = io.EOF
+			}
+			guest, process := terminalGuest(t, append(terminalShutdownLine(t), []byte("kernel: Power down\n")...), readErr)
+			originalTerminal := guest.serial.err
+			ctx := socketTestContext(t)
+			if _, err := guest.receive(ctx, 4, "shutdown", "shutdown"); err != nil {
+				t.Fatal(err)
+			}
+			entered := make(chan struct{})
+			var once sync.Once
+			process.doneCalled = func() { once.Do(func() { close(entered) }) }
+			type completion struct {
+				evidence map[string]any
+				err      error
+			}
+			finished := make(chan completion, 1)
+			go func() { evidence, err := guest.awaitShutdown(ctx); finished <- completion{evidence, err} }()
+			var exitOnce sync.Once
+			exit := func() { exitOnce.Do(func() { close(process.done) }) }
+			defer exit()
+			select {
+			case <-entered:
+			case <-ctx.Done():
+				t.Fatal("terminal completion did not wait on owned process")
+			}
+			select {
+			case result := <-finished:
+				t.Fatalf("terminal result preceded natural process exit: %v", result.err)
+			default:
+			}
+			if process.finishes != 0 {
+				t.Fatal("serial termination forced process cleanup")
+			}
+			exit()
+			var result completion
+			select {
+			case result = <-finished:
+			case <-ctx.Done():
+				t.Fatal("natural exit did not complete shutdown")
+			}
+			if result.err != nil {
+				t.Fatal(result.err)
+			}
+			termination, raw := "qualified-reset", readErr.Error()
+			if name == "eof" {
+				termination, raw = "eof", ""
+			}
+			if result.evidence["serial_termination"] != termination || result.evidence["serial_error"] != raw || result.evidence["serial_complete_record"] != true || result.evidence["qemu_exit"] != 0 {
+				t.Fatalf("terminal evidence lost reset/EOF distinction: %v", result.evidence)
+			}
+			if name == "reset" && !errors.Is(guest.serial.err, syscall.Errno(10054)) {
+				t.Fatalf("qualified reset was erased: %v", guest.serial.err)
+			}
+			deadline, _ := ctx.Deadline()
+			if forced, err := finishGuest(process, nil, guest, deadline); forced || err != nil {
+				t.Fatalf("qualified terminal result failed cleanup: forced=%v err=%v", forced, err)
+			}
+			if guest.serial.err != originalTerminal {
+				t.Fatal("qualification or cleanup rewrote the serial result")
+			}
+		})
+	}
+}
+
+func TestTerminalResetPartialTailRemainsFatal(t *testing.T) {
+	reset := terminalResetError()
+	guest, process := terminalGuest(t, append(terminalShutdownLine(t), []byte("unfinished kernel record")...), reset)
+	var terminal *serialReadTermination
+	if !errors.As(guest.serial.err, &terminal) || terminal.completeRecord || !errors.Is(guest.serial.err, syscall.Errno(10054)) {
+		t.Fatalf("Scanner reset hid incomplete record: %v", guest.serial.err)
+	}
+	ctx := socketTestContext(t)
+	_, ackErr := guest.receive(ctx, 4, "shutdown", "shutdown")
+	close(process.done)
+	if ackErr == nil {
+		if evidence, err := guest.awaitShutdown(ctx); err == nil {
+			t.Fatalf("partial trailing record qualified: %v", evidence)
+		}
+	}
+	deadline, _ := ctx.Deadline()
+	if _, err := finishGuest(process, nil, guest, deadline); err == nil {
+		t.Fatal("partial-tail serial error disappeared during cleanup")
+	}
+}
+
+func TestTerminalShutdownRejectsMissingFactsAndOtherErrors(t *testing.T) {
+	failure := errors.New("unrelated reader failure")
+	for _, name := range []string{"no-verified-ack", "nonzero-process", "expired-deadline", "other-io", "joined-read-error", "joined-fault-error", "diagnostic-error"} {
+		t.Run(name, func(t *testing.T) {
+			readErr := terminalResetError()
+			if name == "other-io" {
+				readErr = io.ErrUnexpectedEOF
+			}
+			if name == "joined-read-error" {
+				readErr = errors.Join(readErr, failure)
+			}
+			guest, process := terminalGuest(t, terminalShutdownLine(t), readErr)
+			ctx := socketTestContext(t)
+			var ackErr error
+			if name != "no-verified-ack" {
+				_, ackErr = guest.receive(ctx, 4, "shutdown", "shutdown")
+			}
+			if ackErr != nil {
+				if name != "other-io" && name != "joined-read-error" {
+					t.Fatal(ackErr)
+				}
+				if name == "joined-read-error" && !errors.Is(ackErr, failure) {
+					t.Fatalf("joined unrelated read error was lost: %v", ackErr)
+				}
+				if name == "other-io" && !errors.Is(ackErr, io.ErrUnexpectedEOF) {
+					t.Fatalf("different IO cause was lost: %v", ackErr)
+				}
+				return
+			}
+			if name == "joined-fault-error" {
+				select {
+				case observed := <-guest.fault:
+					if !errors.Is(observed, syscall.Errno(10054)) {
+						t.Fatalf("unexpected pending fault: %v", observed)
+					}
+				default:
+				}
+				guest.fault <- errors.Join(guest.serial.err, failure)
+			}
+			if name == "diagnostic-error" {
+				done := make(chan struct{})
+				close(done)
+				guest.readers = append(guest.readers, &ownedReader{name: "failed diagnostic", done: done, err: failure})
+			}
+			if name == "nonzero-process" {
+				process.result = failure
+			}
+			if name == "expired-deadline" {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				defer cancel()
+			}
+			close(process.done)
+			if evidence, err := guest.awaitShutdown(ctx); err == nil {
+				t.Fatalf("missing shutdown fact was accepted: %v", evidence)
+			} else {
+				if name == "expired-deadline" && !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("shutdown restarted its deadline: %v", err)
+				}
+				if (name == "nonzero-process" || name == "diagnostic-error" || name == "joined-read-error" || name == "joined-fault-error") && !errors.Is(err, failure) {
+					t.Fatalf("unrelated failure was swallowed: %v", err)
+				}
+			}
+			if process.finishes != 0 {
+				t.Fatal("terminal observation forced process cleanup")
+			}
+		})
+	}
+}
+
+func TestTerminalQualifiedResetDoesNotForgiveJobCleanup(t *testing.T) {
+	failure := errors.New("job state unknown")
+	for _, name := range []string{"forced", "unknown"} {
+		t.Run(name, func(t *testing.T) {
+			guest, process := terminalGuest(t, terminalShutdownLine(t), terminalResetError())
+			ctx := socketTestContext(t)
+			if _, err := guest.receive(ctx, 4, "shutdown", "shutdown"); err != nil {
+				t.Fatal(err)
+			}
+			close(process.done)
+			if _, err := guest.awaitShutdown(ctx); err != nil {
+				t.Fatal(err)
+			}
+			process.forced = name == "forced"
+			if name == "unknown" {
+				process.finishErr = failure
+			}
+			deadline, _ := ctx.Deadline()
+			forced, err := finishGuest(process, nil, guest, deadline)
+			if err == nil {
+				t.Fatal("qualified reset hid unconfirmed job cleanup")
+			}
+			if name == "forced" && (!forced || !strings.Contains(err.Error(), "forced termination")) {
+				t.Fatalf("forced cleanup became graceful: %v", err)
+			}
+			if name == "unknown" && (!errors.Is(err, failure) || !errors.Is(err, errOwnedCleanup)) {
+				t.Fatalf("unknown job state lost: %v", err)
+			}
+			againForced, again := finishGuest(process, nil, guest, deadline)
+			if again == nil || againForced != forced || name == "unknown" && !errors.Is(again, failure) {
+				t.Fatalf("cleanup failure was not sticky: %v", again)
+			}
+			if !errors.Is(guest.serial.err, syscall.Errno(10054)) {
+				t.Fatal("cleanup erased raw reset evidence")
+			}
+		})
+	}
+}
+
+type gatedTerminalReader struct {
+	data    []byte
+	release <-chan struct{}
+	err     error
+}
+
+func (r *gatedTerminalReader) Read(data []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(data, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	<-r.release
+	return 0, r.err
+}
+
+func TestTerminalResetAfterAcknowledgementRecordsReset(t *testing.T) {
+	guest, err := newGuestChannel(testIdentity(), privateTestDirectory(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, _ := controlTestPair(t)
+	process := childWithOutput("", false)
+	reset := terminalResetError()
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		unblock()
+		conn.Close()
+		if err := joinReaders(socketTestContext(t), guest.readers); errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("gated terminal reader remained active: %v", err)
+		}
+		if err := guest.closeLogs(); err != nil {
+			t.Errorf("terminal log close: %v", err)
+		}
+	})
+	guest.startDiagnostics(process)
+	guest.startSerial(terminalReadConn{Conn: conn, reader: &gatedTerminalReader{data: terminalShutdownLine(t), release: release, err: reset}})
+	ctx := socketTestContext(t)
+	if _, err := guest.receive(ctx, 4, "shutdown", "shutdown"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-guest.serial.done:
+		t.Fatal("reset arrived before the acknowledged test boundary")
+	default:
+	}
+	unblock()
+	select {
+	case <-guest.serial.done:
+	case <-ctx.Done():
+		t.Fatal("released reset did not arrive")
+	}
+	close(process.done)
+	evidence, err := guest.awaitShutdown(ctx)
+	if err != nil || evidence["serial_termination"] != "qualified-reset" || evidence["serial_error"] != reset.Error() || evidence["serial_complete_record"] != true {
+		t.Fatalf("post-ACK reset was not preserved distinctly: %v %v", evidence, err)
+	}
+	if !errors.Is(guest.serial.err, syscall.Errno(10054)) {
+		t.Fatal("post-ACK reset became ordinary EOF")
+	}
+}
+
+func probeTestReceipt(t *testing.T, phase string, sequence uint64, epoch, object string) string {
+	t.Helper()
+	data, err := json.Marshal(response{identity: testIdentity(), Phase: phase, Sequence: sequence, Status: "ok", AuthorityEpoch: epoch, ObjectID: object})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data) + "\n"
+}
+
+func probeTestArguments(args []string) (map[string]string, error) {
+	if len(args) != 16 {
+		return nil, errors.New("probe argument count changed")
+	}
+	values := make(map[string]string, 8)
+	for i := 0; i < len(args); i += 2 {
+		if _, exists := values[args[i]]; exists {
+			return nil, errors.New("duplicate probe argument")
+		}
+		values[args[i]] = args[i+1]
+	}
+	id := testIdentity()
+	if values["--run-id"] != id.RunID || values["--source-sha"] != id.SourceSHA || values["--fixture-nonce"] != id.Nonce || values["--volume"] != "fixture-current" || filepath.Base(values["--state-file"]) != "probe-state.json" {
+		return nil, errors.New("probe arguments lost run or fixture identity")
+	}
+	return values, nil
+}
+
+func TestCurrentSMBColdRecoveryPreservesFirstFailure(t *testing.T) {
+	first, cleanupFailure := errors.New("first cold failure"), errors.New("cleanup failure")
+	for _, name := range []string{"success", "cold-error", "cold-forced", "cold-cleanup-unknown", "cold-start-unknown", "outer-canceled-guest-dead", "wrong-object", "wrong-authority", "recovery-error", "recovery-wrong-phase", "recovery-wrong-sequence", "recovery-wrong-object"} {
+		t.Run(name, func(t *testing.T) {
+			id := testIdentity()
+			seed := response{identity: id, Phase: "readiness-create", Sequence: 1, Status: "ok", AuthorityEpoch: "seed-authority", ObjectID: "41"}
+			coldOutput := probeTestReceipt(t, currentSMBColdPhase, 2, seed.AuthorityEpoch, seed.ObjectID)
+			if name == "wrong-object" {
+				coldOutput = probeTestReceipt(t, currentSMBColdPhase, 2, seed.AuthorityEpoch, "42")
+			}
+			if name == "wrong-authority" {
+				coldOutput = probeTestReceipt(t, currentSMBColdPhase, 2, "other-authority", seed.ObjectID)
+			}
+			cleanupOutput := probeTestReceipt(t, currentSMBCleanupPhase, 2, seed.AuthorityEpoch, seed.ObjectID)
+			if name == "recovery-wrong-phase" {
+				cleanupOutput = probeTestReceipt(t, currentSMBColdPhase, 2, seed.AuthorityEpoch, seed.ObjectID)
+			}
+			if name == "recovery-wrong-sequence" {
+				cleanupOutput = probeTestReceipt(t, currentSMBCleanupPhase, 3, seed.AuthorityEpoch, seed.ObjectID)
+			}
+			if name == "recovery-wrong-object" {
+				cleanupOutput = probeTestReceipt(t, currentSMBCleanupPhase, 2, seed.AuthorityEpoch, "42")
+			}
+			guest := &guestChannel{identity: id, child: childWithOutput("", false), fault: make(chan error, 1)}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			coldChild := childWithOutput(coldOutput, true)
+			if name != "success" && name != "wrong-object" && name != "wrong-authority" {
+				coldChild.result = first
+			}
+			quiescent := false
+			coldChild.finishBefore = func(time.Time) (bool, error) {
+				if name == "cold-cleanup-unknown" {
+					return false, cleanupFailure
+				}
+				quiescent = true
+				if name == "outer-canceled-guest-dead" {
+					cancel()
+					close(guest.child.(*fakeChild).done)
+				}
+				return name == "cold-forced" || name == "outer-canceled-guest-dead", nil
+			}
+			var calls []string
+			host := fakePlatform{start: func(_ string, args []string, _ string) (child, error) {
+				values, err := probeTestArguments(args)
+				if err != nil {
+					return nil, err
+				}
+				if values["--sequence"] != "2" {
+					return nil, errors.New("cold/recovery sequence changed")
+				}
+				phase := values["--phase"]
+				calls = append(calls, phase)
+				switch phase {
+				case currentSMBColdPhase:
+					if name == "cold-start-unknown" {
+						return nil, first
+					}
+					return coldChild, nil
+				case currentSMBCleanupPhase:
+					if !quiescent {
+						return nil, errors.New("mapping recovery overlapped the cold child")
+					}
+					if name == "outer-canceled-guest-dead" && ctx.Err() == nil {
+						return nil, errors.New("test did not cancel the outer context")
+					}
+					p := childWithOutput(cleanupOutput, true)
+					if name == "recovery-error" {
+						p.result = cleanupFailure
+					}
+					return p, nil
+				default:
+					return nil, errors.New("unexpected recovery helper phase")
+				}
+			}}
+			var recorded bytes.Buffer
+			log := &events{identity: id, output: &cappedWriter{writer: &recorded, remaining: streamLimit}}
+			err := runCurrentSMBCold(ctx, host, guest, seed, "probe", privateTestDirectory(t), "http://127.0.0.1:12345", "fixture-current", log)
+			if name == "success" {
+				if err != nil || len(calls) != 1 {
+					t.Fatalf("healthy cold probe: calls=%v error=%v", calls, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("recovery promoted a failed cold probe to success")
+			}
+			if name != "wrong-object" && name != "wrong-authority" && !errors.Is(err, first) {
+				t.Fatalf("first failure lost: %v", err)
+			}
+			blocked := name == "cold-cleanup-unknown" || name == "cold-start-unknown"
+			if blocked {
+				if len(calls) != 1 || !errors.Is(err, errOwnedCleanup) || !strings.Contains(recorded.String(), `"status":"blocked"`) {
+					t.Fatalf("unconfirmed child permitted recovery: calls=%v err=%v", calls, err)
+				}
+			} else if len(calls) != 2 || calls[1] != currentSMBCleanupPhase {
+				t.Fatalf("recovery was missing or repeated: %v", calls)
+			}
+			if name == "recovery-error" && !errors.Is(err, cleanupFailure) {
+				t.Fatalf("cleanup failure lost: %v", err)
+			}
+			if strings.HasPrefix(name, "recovery-") && !strings.Contains(recorded.String(), `"status":"error"`) {
+				t.Fatalf("failed recovery was reported successful: %s", recorded.String())
+			}
+		})
+	}
+}
+
+func TestCurrentSMBRecoveryUsesOneAbsoluteBudget(t *testing.T) {
+	seed := response{identity: testIdentity(), AuthorityEpoch: "seed-authority", ObjectID: "41"}
+	for _, name := range []string{"complete", "no-deadline", "insufficient-command-budget"} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			var deadline time.Time
+			if name != "no-deadline" {
+				budget := 30 * time.Second
+				if name == "insufficient-command-budget" {
+					budget = 5 * time.Second
+				}
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, budget)
+				defer cancel()
+				deadline, _ = ctx.Deadline()
+			}
+			p := childWithOutput(probeTestReceipt(t, currentSMBCleanupPhase, 2, seed.AuthorityEpoch, seed.ObjectID), true)
+			starts := 0
+			host := fakePlatform{start: func(string, []string, string) (child, error) { starts++; return p, nil }}
+			_, err := recoverSMBMapping(ctx, host, testIdentity(), seed, "probe", privateTestDirectory(t), "http://127.0.0.1:12345", "fixture-current")
+			if name == "complete" {
+				if err != nil || starts != 1 || p.finishes != 1 || p.finishDeadline.After(deadline) {
+					t.Fatalf("recovery escaped its cleanup bound: start=%d finish=%d err=%v", starts, p.finishes, err)
+				}
+			} else if err == nil || starts != 0 {
+				t.Fatalf("unbounded or exhausted recovery launched a child: starts=%d err=%v", starts, err)
+			}
+			if name == "insufficient-command-budget" && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Job-cleanup reserve was lost: %v", err)
+			}
+		})
+	}
+}
+
+func TestToolCleanupClampsTheSuppliedDeadline(t *testing.T) {
+	p := childWithOutput("complete", true)
+	deadline := time.Now().Add(5 * time.Second)
+	if _, err := runToolBefore(socketTestContext(t), fakePlatform{process: p}, "tool", nil, privateTestDirectory(t), "bounded", deadline); err != nil {
+		t.Fatal(err)
+	}
+	if !p.finishDeadline.Equal(deadline) {
+		t.Fatalf("cleanup deadline changed: got=%s want=%s", p.finishDeadline, deadline)
+	}
+}
+
+func TestCurrentSMBPhaseOrderUsesSingleGuest(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		name := "http-only"
+		if enabled {
+			name = "current-smb-cold"
+		}
+		t.Run(name, func(t *testing.T) {
+			artifacts, evidence, work := privateTestDirectory(t), privateTestDirectory(t), privateTestDirectory(t)
+			pristine := filepath.Join(artifacts, "pristine.ext4")
+			if err := os.WriteFile(pristine, []byte("fixture bytes"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			hash, size, err := fileHash(pristine)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := manifest{Artifacts: map[string]artifact{"data": {Path: "pristine.ext4", SHA256: hash, Size: size}, "probe_windows_arm64": {Path: "probe.exe"}}, Volume: "fixture-current", BootToken: strings.Repeat("a", 64)}
+			m.QEMU.Machine = "pc-q35-11.1"
+			listener := newTestControlListener(t)
+			listener.address = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
+			conn, peer := controlTestPair(t)
+			conn.local = listener.Addr()
+			conn.setWriteDeadline = func(deadline time.Time) error {
+				// net.Pipe rejects a deadline reset after peer EOF, unlike a live TCP handle.
+				if deadline.IsZero() {
+					return nil
+				}
+				return conn.Conn.SetWriteDeadline(deadline)
+			}
+			listener.result <- controlAcceptResult{conn: conn}
+			qemu := childWithOutput("diagnostic output\n", false)
+			var exitOnce sync.Once
+			exit := func() { exitOnce.Do(func() { close(qemu.done) }) }
+			var natural atomic.Bool
+			qemu.finishBefore = func(time.Time) (bool, error) {
+				select {
+				case <-qemu.done:
+					return !natural.Load(), nil
+				default:
+					peer.Close()
+					exit()
+					return true, nil
+				}
+			}
+			var orderMu sync.Mutex
+			var order []string
+			record := func(event string) { orderMu.Lock(); order = append(order, event); orderMu.Unlock() }
+			peerDone := make(chan error, 1)
+			started, joined := false, false
+			t.Cleanup(func() {
+				peer.Close()
+				conn.Conn.Close()
+				exit()
+				if started && !joined {
+					select {
+					case <-peerDone:
+					case <-socketTestContext(t).Done():
+						t.Error("scripted guest did not stop")
+					}
+				}
+			})
+			if err := peer.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			boot := controlResponseLine(t, response{identity: testIdentity(), Phase: "boot", Op: "boot-ready", Status: "ok"})
+			qemuStarts := 0
+			host := fakePlatform{listener: listener, start: func(executable string, args []string, _ string) (child, error) {
+				if strings.HasSuffix(executable, "probe.exe") {
+					values, err := probeTestArguments(args)
+					if err != nil {
+						return nil, err
+					}
+					phase, sequence := values["--phase"], values["--sequence"]
+					record("probe:" + phase + "/" + sequence)
+					epoch := "seed-authority"
+					if phase == "readiness-reopen" {
+						epoch = "reopened-authority"
+					}
+					value := response{identity: testIdentity(), Phase: phase, Sequence: 2, Status: "ok", AuthorityEpoch: epoch, ObjectID: "41"}
+					if phase == "readiness-create" {
+						value.Sequence = 1
+					}
+					data, err := json.Marshal(value)
+					if err != nil {
+						return nil, err
+					}
+					return childWithOutput(string(data), true), nil
+				}
+				if !strings.Contains(strings.Join(args, " "), "-chardev") {
+					return childWithOutput("QEMU emulator version 11.1.0 pc-q35-11.1 virtio-blk-pci virtio-net-pci virtio-rng-pci rng-builtin user tcg", true), nil
+				}
+				qemuStarts++
+				if qemuStarts != 1 {
+					return nil, errors.New("cold phase launched another guest")
+				}
+				started = true
+				go func() {
+					result := func() error {
+						if _, err := peer.Write(boot); err != nil {
+							return err
+						}
+						reader := bufio.NewReader(peer)
+						for index, op := range []string{"start", "stop-authority", "start", "shutdown"} {
+							line, err := reader.ReadBytes('\n')
+							if err != nil {
+								return err
+							}
+							var command struct {
+								Nonce    string `json:"nonce"`
+								Sequence uint64 `json:"sequence"`
+								Command  string `json:"command"`
+							}
+							if err := json.Unmarshal(line, &command); err != nil {
+								return err
+							}
+							if command.Nonce != testIdentity().Nonce || command.Sequence != uint64(index+1) || command.Command != op {
+								return errors.New("guest command sequence changed")
+							}
+							record("guest:" + op + "/" + strconv.Itoa(index+1))
+							zero := 0
+							ack, err := json.Marshal(response{identity: testIdentity(), Phase: op, Sequence: command.Sequence, Op: op, Status: "ok", ExitCode: &zero})
+							if err != nil {
+								return err
+							}
+							if _, err := peer.Write(append(append([]byte(responsePrefix), ack...), '\n')); err != nil {
+								return err
+							}
+						}
+						return nil
+					}()
+					if result == nil {
+						natural.Store(true)
+					}
+					peer.Close()
+					exit()
+					peerDone <- result
+				}()
+				return qemu, nil
+			}}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			log := &events{identity: testIdentity(), output: &cappedWriter{writer: io.Discard, remaining: streamLimit}}
+			if err := lifecycle(ctx, host, m, testIdentity(), "qemu", "bios", artifacts, evidence, work, log, enabled); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-peerDone:
+				joined = true
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal("scripted guest did not complete")
+			}
+			want := []string{"guest:start/1", "probe:readiness-create/1"}
+			if enabled {
+				want = append(want, "probe:current-smb-cold/2")
+			}
+			want = append(want, "guest:stop-authority/2", "guest:start/3", "probe:readiness-reopen/2", "guest:shutdown/4")
+			orderMu.Lock()
+			got := append([]string(nil), order...)
+			orderMu.Unlock()
+			if !reflect.DeepEqual(got, want) || qemuStarts != 1 || qemu.finishes != 1 {
+				t.Fatalf("phase order/guest count differs: order=%v guests=%d finishes=%d", got, qemuStarts, qemu.finishes)
+			}
+		})
+	}
+}

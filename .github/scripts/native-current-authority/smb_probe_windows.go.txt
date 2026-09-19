@@ -1,0 +1,531 @@
+//go:build windows
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"math"
+	"net"
+	"net/http"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"github.com/codetreker/remote-fs/packages/smb"
+	smbwindows "github.com/codetreker/remote-fs/packages/smb/windows"
+	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/transport/httprest"
+	"golang.org/x/sys/windows"
+)
+
+const coldIOBytes = 64 << 10
+
+// The layouts are Win32 structures, not SMB QUERY_INFO payloads.
+// https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_basic_info
+// https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_standard_info
+// https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_id_info
+type nativeBasicInformation struct {
+	CreationTime, LastAccessTime, LastWriteTime, ChangeTime int64
+	FileAttributes                                          uint32
+	padding                                                 uint32
+}
+
+type nativeStandardInformation struct {
+	AllocationSize, EndOfFile int64
+	NumberOfLinks             uint32
+	DeletePending, Directory  uint8
+	padding                   [2]byte
+}
+
+type nativeFileIdentity struct {
+	VolumeSerialNumber uint64
+	FileID             [16]byte
+}
+
+func (n nativeFileIdentity) fields() map[string]any {
+	return map[string]any{"native_volume_serial_hex": fmt.Sprintf("%016x", n.VolumeSerialNumber), "native_file_id_hex": hex.EncodeToString(n.FileID[:])}
+}
+
+func sameNativeIdentity(first, second nativeFileIdentity) error {
+	if first != second {
+		return errors.New("native identity tuple changed on the same HANDLE")
+	}
+	return nil
+}
+
+type coldNativeCalls struct {
+	open     func(string) (windows.Handle, error)
+	basic    func(windows.Handle) (nativeBasicInformation, error)
+	standard func(windows.Handle) (nativeStandardInformation, error)
+	identity func(windows.Handle) (nativeFileIdentity, error)
+	read     func(windows.Handle, []byte) (uint32, error)
+	close    func(windows.Handle) error
+}
+
+func currentNativeCalls() coldNativeCalls {
+	return coldNativeCalls{
+		open: func(path string) (windows.Handle, error) {
+			name, err := windows.UTF16PtrFromString(path)
+			if err != nil {
+				return windows.InvalidHandle, err
+			}
+			handle, err := windows.CreateFile(name, windows.GENERIC_READ,
+				windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
+				windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+			runtime.KeepAlive(name)
+			return handle, err
+		},
+		basic: func(handle windows.Handle) (nativeBasicInformation, error) {
+			var value nativeBasicInformation
+			err := windows.GetFileInformationByHandleEx(handle, windows.FileBasicInfo, (*byte)(unsafe.Pointer(&value)), uint32(unsafe.Sizeof(value)))
+			runtime.KeepAlive(&value)
+			return value, err
+		},
+		standard: func(handle windows.Handle) (nativeStandardInformation, error) {
+			var value nativeStandardInformation
+			err := windows.GetFileInformationByHandleEx(handle, windows.FileStandardInfo, (*byte)(unsafe.Pointer(&value)), uint32(unsafe.Sizeof(value)))
+			runtime.KeepAlive(&value)
+			return value, err
+		},
+		identity: func(handle windows.Handle) (nativeFileIdentity, error) {
+			var value nativeFileIdentity
+			err := windows.GetFileInformationByHandleEx(handle, windows.FileIdInfo, (*byte)(unsafe.Pointer(&value)), uint32(unsafe.Sizeof(value)))
+			runtime.KeepAlive(&value)
+			return value, err
+		},
+		read: func(handle windows.Handle, data []byte) (uint32, error) {
+			var done uint32
+			err := windows.ReadFile(handle, data, &done, nil)
+			runtime.KeepAlive(data)
+			return done, err
+		},
+		close: windows.CloseHandle,
+	}
+}
+
+func coldLimits() smb.Limits {
+	limits := smb.DefaultLimits()
+	limits.MaxExports, limits.MaxConnections, limits.MaxSessions, limits.MaxTrees = 1, 4, 4, 4
+	limits.MaxOpens, limits.MaxRequests, limits.MaxCompound, limits.MaxContexts = 16, 16, 8, 8
+	limits.MaxIOBytes, limits.MaxFrameBytes = coldIOBytes, 2*coldIOBytes
+	// Captured metadata shares a per-tree pool across CREATE, READ and QUERY_INFO.
+	// Its reservation is independent of the smaller SMB wire I/O bound.
+	limits.MaxDirectoryBytes = 8 << 20
+	limits.MaxNotifyEvents, limits.MaxNotifyBytes = 8, 64<<10
+	limits.HandshakeTimeout, limits.RequestTimeout, limits.CleanupTimeout = 10*time.Second, 10*time.Second, 5*time.Second
+	limits.FileSession.MaxFileSize, limits.FileSession.MaxFiles = coldIOBytes, 16
+	limits.FileSession.MaxOperations, limits.FileSession.MaxWaiters = 16, 16
+	limits.FileSession.MaxLockOwners, limits.FileSession.MaxLockRanges = 16, 16
+	limits.FileSession.MaxPendingLocks, limits.FileSession.MaxLockActions = 16, 16
+	return limits
+}
+
+func coldDialOptions() httprest.DialOptions {
+	o := httprest.DefaultDialOptions()
+	o.MaxBodyBytes, o.MaxWriteBytes = 1<<20, coldIOBytes
+	return o
+}
+
+func runSMBPhase(ctx context.Context, o options) (receipt, error) {
+	state, err := readState(o)
+	if err != nil {
+		return receipt{}, err
+	}
+	switch o.Phase {
+	case coldCleanupPhase:
+		if err := cleanupSMBMapping(ctx, o); err != nil {
+			return receipt{}, err
+		}
+		return coldReceipt(o, state), nil
+	case coldPhase:
+		return runColdSMB(ctx, o, state)
+	default:
+		return receipt{}, errors.New("invalid current SMB phase")
+	}
+}
+
+func coldReceipt(o options, state probeState) receipt {
+	return receipt{RunID: o.RunID, SourceSHA: o.SourceSHA, FixtureNonce: o.FixtureNonce, Phase: o.Phase,
+		Sequence: o.Sequence, Status: "ok", AuthorityEpoch: state.AuthorityEpoch, ObjectID: strconv.FormatUint(state.Reference.Attr.ID, 10)}
+}
+
+func runColdSMB(ctx context.Context, o options, state probeState) (answer receipt, returned error) {
+	if _, err := expectedNativeBasic(state.Reference.Attr); err != nil {
+		return answer, err
+	}
+	observer, err := newColdObserver(o, state)
+	if err != nil {
+		return answer, err
+	}
+	defer func() {
+		status := "ok"
+		if returned != nil {
+			status = "error"
+		}
+		returned = errors.Join(returned, observer.Record(map[string]any{"kind": "cold-result", "status": status, "error": coldError(returned)}), observer.Close())
+	}()
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = (&net.Dialer{Timeout: 4 * time.Second}).DialContext
+	transport.MaxConnsPerHost = 8
+	defer transport.CloseIdleConnections()
+	client, err := httprest.DialWithOptions(o.Endpoint, &http.Client{
+		Transport: observer.Transport(transport), Timeout: 10 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("HTTP redirects are forbidden") },
+	}, coldDialOptions())
+	if err != nil {
+		return answer, err
+	}
+	if err := checkColdAuthority(ctx, client, state); err != nil {
+		return answer, err
+	}
+	sid, err := smbwindows.CurrentUserSID()
+	if err != nil {
+		return answer, err
+	}
+	authorize, err := smbwindows.AllowSID(sid)
+	if err != nil {
+		return answer, err
+	}
+	server, err := smb.New(smb.Config{Authenticator: smbwindows.NewAuthenticator(), Authorize: authorize, Limits: coldLimits()})
+	if err != nil {
+		return answer, err
+	}
+	var export *smb.Export
+	var listener net.Listener
+	var mapping *ownedSMBMapping
+	var serveDone chan error
+	var serveCancel context.CancelFunc
+	var serveJoined bool
+	var serveErr error
+	complete := false
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var cleanupErr error
+		if mapping != nil {
+			cleanupErr = errors.Join(cleanupErr, mapping.Cleanup(cleanup))
+		}
+		cleanupErr = errors.Join(cleanupErr, server.Shutdown(cleanup))
+		if serveCancel != nil {
+			serveCancel()
+		}
+		if listener != nil {
+			if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				cleanupErr = errors.Join(cleanupErr, err)
+			}
+		}
+		if serveDone != nil && !serveJoined {
+			select {
+			case serveErr = <-serveDone:
+				serveJoined = true
+			case <-cleanup.Done():
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("join SMB Serve: %w", cleanup.Err()))
+			}
+		}
+		cleanupErr = errors.Join(cleanupErr, serveErr)
+		if export != nil {
+			cleanupErr = errors.Join(cleanupErr, export.Unpublish(cleanup))
+		}
+		status := server.Status()
+		cleanupErr = errors.Join(cleanupErr, checkColdStopped(status))
+		cleanupErr = errors.Join(cleanupErr, observer.Record(map[string]any{"kind": "smb-cleanup", "status": coldStatus(cleanupErr), "error": coldError(cleanupErr), "resources": status, "serve_joined": serveDone == nil || serveJoined}))
+		transport.CloseIdleConnections()
+		returned = errors.Join(returned, cleanupErr)
+		if returned == nil && complete {
+			returned = observer.Validate()
+		}
+	}()
+	share := "rfs-" + o.FixtureNonce
+	export, err = server.Publish(smb.Share{Name: share, Volume: fixtureVolume, Backend: client})
+	if err != nil {
+		return answer, err
+	}
+	listener, err = net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		return answer, err
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	serveCtx, cancel := context.WithCancel(context.Background())
+	serveCancel = cancel
+	serveDone = make(chan error, 1)
+	observedListener := observer.Listener(listener)
+	go func() { serveDone <- server.Serve(serveCtx, observedListener) }()
+	for !server.Status().Serving {
+		select {
+		case serveErr = <-serveDone:
+			serveJoined = true
+			return answer, errors.Join(errors.New("SMB Serve ended before publication became available"), serveErr)
+		case <-ctx.Done():
+			return answer, ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if err := observer.Record(map[string]any{"kind": "smb-host", "status": "ok", "sid": sid, "share": share, "volume": fixtureVolume, "port": port, "max_io_bytes": coldIOBytes, "mapping_ledger": "smb-mapping.json"}); err != nil {
+		return answer, err
+	}
+	mapping, err = newSMBMapping(ctx, o, share, uint16(port))
+	if err != nil {
+		return answer, err
+	}
+	if mapping == nil {
+		return answer, errors.New("mapping creation returned no owned mapping")
+	}
+	path := filepath.Join(mapping.LocalPath()+`\`, state.SentinelName)
+	if err := runNativeCold(ctx, state, path, currentNativeCalls(), observer.Record); err != nil {
+		return answer, err
+	}
+	if err := checkColdAuthority(ctx, client, state); err != nil {
+		return answer, err
+	}
+	complete = true
+	return coldReceipt(o, state), nil
+}
+
+func checkColdAuthority(ctx context.Context, client *httprest.Storage, state probeState) error {
+	status, err := client.Status(ctx)
+	if err != nil {
+		return err
+	}
+	if status.Authority != state.AuthorityEpoch || status.Unavailable || status.Recovering {
+		return errors.New("cold probe reached a different or unavailable authority")
+	}
+	root, err := client.Stat(ctx, "")
+	if err != nil {
+		return err
+	}
+	if root.ID != state.RootID || root.Kind != storage.NodeDirectory || root.BirthTime == nil || root.ChangeTime == nil {
+		return errors.New("cold root identity or actual timestamps differ")
+	}
+	attr, err := client.Stat(ctx, state.SentinelName)
+	if err != nil {
+		return err
+	}
+	if err := sameAttr(attr, state.Reference.Attr); err != nil {
+		return err
+	}
+	current, err := expectedNativeBasic(attr)
+	if err != nil {
+		return err
+	}
+	expected, err := expectedNativeBasic(state.Reference.Attr)
+	if err != nil {
+		return err
+	}
+	if current != expected {
+		return errors.New("cold sentinel timestamps changed after seeding")
+	}
+	return nil
+}
+
+func checkColdStopped(status smb.Status) error {
+	if status.Serving || !status.Stopped || status.Exports != 0 || status.StoppingExports != 0 || status.Connections != 0 ||
+		status.RetainedConnections != 0 || status.Sessions != 0 || status.Trees != 0 || status.PendingRequests != 0 ||
+		status.OpenReservations != 0 || status.InstalledHandles != 0 || status.CleanupPendingHandles != 0 ||
+		status.FencedAuthorities != 0 || status.CleanupFailures != 0 {
+		return errors.New("SMB cleanup did not confirm an empty stopped host")
+	}
+	return nil
+}
+
+func expectedNativeBasic(attr storage.Attr) (nativeBasicInformation, error) {
+	var value nativeBasicInformation
+	if attr.Kind != storage.NodeRegular || attr.ID == 0 || attr.Size < 0 || attr.BirthTime == nil || attr.ChangeTime == nil {
+		return value, errors.New("cold sentinel requires regular-file identity, EOF and actual creation/change timestamps")
+	}
+	if _, exists := attr.Metadata["smb.windows"]; exists {
+		return value, errors.New("cold sentinel unexpectedly carries Windows-specific metadata")
+	}
+	fields := []*int64{&value.CreationTime, &value.LastAccessTime, &value.LastWriteTime, &value.ChangeTime}
+	for i, instant := range []time.Time{*attr.BirthTime, attr.AccessTime, attr.ModTime, *attr.ChangeTime} {
+		ticks, err := coldFiletime(instant)
+		if err != nil {
+			return value, err
+		}
+		*fields[i] = ticks
+	}
+	value.FileAttributes = windows.FILE_ATTRIBUTE_NORMAL
+	return value, nil
+}
+
+func coldFiletime(instant time.Time) (int64, error) {
+	const epoch = int64(11644473600)
+	const ticks = int64(10000000)
+	last := time.Unix(math.MaxInt64/ticks-epoch, (math.MaxInt64%ticks)*100+99)
+	if instant.Before(time.Unix(-epoch, 0)) || instant.After(last) {
+		return 0, errors.New("cold sentinel time is outside signed FILETIME range")
+	}
+	return (instant.Unix()+epoch)*ticks + int64(instant.Nanosecond()/100), nil
+}
+
+func coldError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+func coldStatus(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	return "error"
+}
+
+func observeNativeCall(ctx context.Context, record func(map[string]any) error, api string, call func() (map[string]any, error), accepts func(error) bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	started := time.Now()
+	fields, apiErr := call()
+	completed := time.Now()
+	if fields == nil {
+		fields = make(map[string]any)
+	}
+	fields["kind"], fields["api"] = "native", api
+	fields["started"], fields["completed"] = started.UTC().Format(time.RFC3339Nano), completed.UTC().Format(time.RFC3339Nano)
+	fields["elapsed_ns"] = completed.Sub(started).Nanoseconds()
+	fields["status"], fields["error"] = coldStatus(apiErr), coldError(apiErr)
+	if apiErr != nil {
+		var errno syscall.Errno
+		if errors.As(apiErr, &errno) {
+			fields["error_code"] = uint32(errno)
+		}
+	}
+	accepted := apiErr != nil && accepts != nil && accepts(apiErr)
+	if accepted {
+		fields["accepted_error"] = true
+	}
+	recordErr := record(fields)
+	if accepted {
+		apiErr = nil
+	}
+	return errors.Join(apiErr, recordErr, ctx.Err())
+}
+
+func runNativeCold(ctx context.Context, state probeState, path string, calls coldNativeCalls, record func(map[string]any) error) (returned error) {
+	if len(state.Content) == 0 || len(state.Content) > coldIOBytes || int64(len(state.Content)) != state.Reference.Attr.Size || digest(state.Content) != state.ContentSHA256 {
+		return errors.New("cold native content expectation is invalid")
+	}
+	expectedBasic, err := expectedNativeBasic(state.Reference.Attr)
+	if err != nil {
+		return err
+	}
+	handle := windows.InvalidHandle
+	defer func() {
+		if handle == windows.InvalidHandle || handle == 0 {
+			return
+		}
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		returned = errors.Join(returned, observeNativeCall(cleanup, record, "CloseHandle", func() (map[string]any, error) {
+			return nil, calls.close(handle)
+		}, nil))
+	}()
+	if err := observeNativeCall(ctx, record, "CreateFileW", func() (map[string]any, error) {
+		var err error
+		handle, err = calls.open(path)
+		return map[string]any{"access": uint32(windows.GENERIC_READ), "share": uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE), "disposition": uint32(windows.OPEN_EXISTING), "flags": uint32(windows.FILE_ATTRIBUTE_NORMAL), "handle_valid": handle != 0 && handle != windows.InvalidHandle}, err
+	}, nil); err != nil {
+		return err
+	}
+	if handle == 0 || handle == windows.InvalidHandle {
+		return errors.New("CreateFileW returned no valid HANDLE")
+	}
+	var basic nativeBasicInformation
+	if err := observeNativeCall(ctx, record, "GetFileInformationByHandleEx(FileBasicInfo)", func() (map[string]any, error) {
+		var err error
+		basic, err = calls.basic(handle)
+		return map[string]any{"native_basic": basic}, err
+	}, nil); err != nil {
+		return err
+	}
+	if basic.CreationTime != expectedBasic.CreationTime || basic.LastAccessTime != expectedBasic.LastAccessTime ||
+		basic.LastWriteTime != expectedBasic.LastWriteTime || basic.ChangeTime != expectedBasic.ChangeTime || basic.FileAttributes != expectedBasic.FileAttributes {
+		return errors.New("native Basic information differs from the captured sentinel")
+	}
+	var standard nativeStandardInformation
+	if err := observeNativeCall(ctx, record, "GetFileInformationByHandleEx(FileStandardInfo)", func() (map[string]any, error) {
+		var err error
+		standard, err = calls.standard(handle)
+		return map[string]any{"native_standard": standard}, err
+	}, nil); err != nil {
+		return err
+	}
+	if standard.EndOfFile != state.Reference.Attr.Size || standard.AllocationSize != (state.Reference.Attr.Size+511)/512*512 ||
+		standard.NumberOfLinks != 1 || standard.DeletePending != 0 || standard.Directory != 0 {
+		return errors.New("native Standard information differs from the linked sentinel's dense virtual allocation and EOF")
+	}
+	var first nativeFileIdentity
+	if err := observeNativeCall(ctx, record, "GetFileInformationByHandleEx(FileIdInfo)", func() (map[string]any, error) {
+		var err error
+		first, err = calls.identity(handle)
+		return first.fields(), err
+	}, nil); err != nil {
+		return err
+	}
+	data := make([]byte, len(state.Content))
+	for offset := 0; offset < len(data); {
+		var count uint32
+		if err := observeNativeCall(ctx, record, "ReadFile", func() (map[string]any, error) {
+			var err error
+			count, err = calls.read(handle, data[offset:])
+			fields := nativeReadFields(data[offset:], count)
+			fields["offset"] = offset
+			return fields, err
+		}, nil); err != nil {
+			return err
+		}
+		if count == 0 || uint64(count) > uint64(len(data)-offset) {
+			return errors.New("native read made no progress or exceeded its buffer")
+		}
+		offset += int(count)
+	}
+	if !bytes.Equal(data, state.Content) || digest(data) != state.ContentSHA256 {
+		return errors.New("native content differs from the authority sentinel")
+	}
+	var eof [1]byte
+	var count uint32
+	if err := observeNativeCall(ctx, record, "ReadFile(EOF)", func() (map[string]any, error) {
+		var err error
+		count, err = calls.read(handle, eof[:])
+		fields := nativeReadFields(eof[:], count)
+		fields["offset"], fields["expected_eof"] = len(data), true
+		return fields, err
+	}, func(err error) bool { return errors.Is(err, windows.ERROR_HANDLE_EOF) && count == 0 }); err != nil {
+		return err
+	}
+	if count != 0 {
+		return errors.New("native read returned bytes beyond the sentinel EOF")
+	}
+	var second nativeFileIdentity
+	if err := observeNativeCall(ctx, record, "GetFileInformationByHandleEx(FileIdInfo)", func() (map[string]any, error) {
+		var err error
+		second, err = calls.identity(handle)
+		return second.fields(), err
+	}, nil); err != nil {
+		return err
+	}
+	if err := sameNativeIdentity(first, second); err != nil {
+		return err
+	}
+	fields := first.fields()
+	fields["kind"], fields["status"] = "native-cold-check", "ok"
+	fields["content_sha256"], fields["bytes"] = digest(data), len(data)
+	fields["identity_scope"] = "one HANDLE, one object"
+	return record(fields)
+}
+
+func nativeReadFields(data []byte, count uint32) map[string]any {
+	fields := map[string]any{"requested": len(data), "bytes": count}
+	if uint64(count) <= uint64(len(data)) {
+		fields["sha256"] = digest(data[:count])
+	}
+	return fields
+}

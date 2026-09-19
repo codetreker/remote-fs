@@ -1307,7 +1307,16 @@ func waitForWitness(
 
 func readWitnessRecord(t *testing.T, store *Store) metastoreWitnessRecord {
 	t.Helper()
-	anchor, err := openRootAnchor(store.anchor.path)
+	return readWitnessRecordWithAnchor(t, store, openRootAnchor)
+}
+
+func readWitnessRecordWithAnchor(t *testing.T, store *Store, openAnchor func(string) (*rootAnchor, error)) metastoreWitnessRecord {
+	t.Helper()
+	// Atomic witness replacement unlinks the previous inode. Keep the publisher
+	// excluded while the independent disk read validates its opened descriptor.
+	store.durable.witness.mu.Lock()
+	defer store.durable.witness.mu.Unlock()
+	anchor, err := openAnchor(store.anchor.path)
 	if err != nil {
 		t.Fatal(err)
 	}

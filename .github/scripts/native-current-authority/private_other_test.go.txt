@@ -1,0 +1,52 @@
+//go:build !windows
+
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestPrivateFixtureRejectsModeAndSymlinkChanges(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "private-state")
+	if err := createPrivateDirectory(directory); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(directory, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivateDirectory(link); err == nil {
+		t.Fatal("symlink directory accepted")
+	}
+	if err := createPrivateDirectory(filepath.Join(link, "child")); err == nil {
+		t.Fatal("directory created through symlink parent")
+	}
+	path := filepath.Join(directory, "state")
+	if err := os.WriteFile(path, []byte("state"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivateFile(path); err == nil {
+		t.Fatal("public state accepted")
+	}
+	if err := makePrivateFile(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivateFile(path); err == nil {
+		t.Fatal("unexpected owner permissions accepted")
+	}
+	if err := os.Chmod(directory, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivateDirectory(directory); err == nil {
+		t.Fatal("public directory accepted")
+	}
+	if err := makePrivateFile(path); err == nil {
+		t.Fatal("state sealed under unprivate parent")
+	}
+}

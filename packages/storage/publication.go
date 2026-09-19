@@ -143,3 +143,37 @@ func settlePublication(settlements []PublicationSettlement, result PublicationRe
 	}
 	return &publicationAccountingUncertain{cause: errors.Join(failures...)}
 }
+
+// PublicationAccountingChain contains only immutable accounting links. It never
+// retains the originating context, credentials, publication proof or cancellation.
+type PublicationAccountingChain struct{ head *publicationAccountingLink }
+
+func PublicationAccountingFrom(ctx context.Context) PublicationAccountingChain {
+	head, _ := ctx.Value(publicationAccountingKey{}).(*publicationAccountingLink)
+	return PublicationAccountingChain{head: head}
+}
+
+// With returns a new complete chain without modifying the earlier chain.
+func (c PublicationAccountingChain) With(hook PublicationAccounting) PublicationAccountingChain {
+	if hook == nil {
+		panic("storage: nil publication accounting hook")
+	}
+	return PublicationAccountingChain{head: &publicationAccountingLink{hook: hook, previous: c.head}}
+}
+func (c PublicationAccountingChain) Empty() bool { return c.head == nil }
+
+// WithPublicationAccountingChain replaces accounting in the supplied cleanup
+// context. All non-accounting values come from that context alone.
+func WithPublicationAccountingChain(ctx context.Context, chain PublicationAccountingChain) context.Context {
+	return context.WithValue(ctx, publicationAccountingKey{}, chain.head)
+}
+
+// MaintenanceAccounting binds one complete chain for recovered or orphaned cleanup
+// with no captured accounting owner. Existing references retain their captured chain.
+// Under final publication ordering, validation and usage reading precede initialize;
+// initialize is bounded, infallible internal accounting. Chain installation is the
+// last step and replaces the old slot. Callers finish all fallible construction first.
+type MaintenanceAccounting interface {
+	CheckMaintenanceAccounting() error
+	BindMaintenanceAccounting(context.Context, PublicationAccountingChain, func(used int64)) error
+}

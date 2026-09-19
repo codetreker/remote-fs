@@ -1,0 +1,77 @@
+name: Inbox directory write-sharing control
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - .github/workflows/native-smb-inbox-share-write.yml
+      - .github/scripts/native-smb-inbox-reference*
+      - .github/scripts/native-smb-inbox-sharing-controls_test.go.txt
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-smb-inbox-share-write-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  inbox-share-write:
+    name: One direct 445 directory write-sharing control
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    env:
+      RFS_INBOX_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      GOMAXPROCS: '2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Read the immutable helper source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 1cb9ad7f49d998de4daa4d562d766b18cf06ce16
+          path: .tmp/native-inbox-share-write/prototype
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - name: Record existing prerequisites and ownership intent
+        id: preflight
+        shell: pwsh
+        run: ./.github/scripts/native-smb-inbox-reference.ps1 -Phase Prepare -ApplicationSharing write-only
+      - name: Generate and build the independent reference fixture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          go run .github/scripts/native-smb-inbox-reference-generate.go -application-sharing write-only -root . -prototype .tmp/native-inbox-share-write/prototype -output .tmp/native-inbox-share-write/fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Write-sharing source generation failed.' }
+          go -C .tmp/native-inbox-share-write/fixture test -json -count=1 -p=1 -timeout=3m -run '^TestInbox(Reference|Sharing)' 2>&1 | Tee-Object .tmp/native-inbox-share-write/results/controls.jsonl
+          $code = $LASTEXITCODE
+          $events = @(Get-Content .tmp/native-inbox-share-write/results/controls.jsonl | Where-Object { $_.StartsWith('{') } | ForEach-Object { $_ | ConvertFrom-Json })
+          if ($code -ne 0 -or @($events | Where-Object { $_.Action -in @('fail','skip','build-fail') }).Count) { throw 'Write-sharing controls failed.' }
+          if (@($events | Where-Object { $_.Action -eq 'pass' -and $_.Test }).Count -ne 170) { throw 'Write-sharing controls did not produce all 170 test verdicts.' }
+          foreach ($name in @('TestInboxReferenceIPC','TestInboxReferenceOwnership','TestInboxReferenceRenamePayload','TestInboxReferenceOracle','TestInboxReferenceWatchOwnership','TestInboxSharingPolicy','TestInboxSharingOutcome','TestInboxSharingErrorEvidence','TestInboxSharingGeometry')) {
+            if (@($events | Where-Object { $_.Test -eq $name -and $_.Action -eq 'pass' }).Count -ne 1) { throw "Missing control verdict: $name" }
+          }
+          go -C .tmp/native-inbox-share-write/fixture test -c -o ../results/native-inbox-reference.test.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Write-sharing ARM64 executable build failed.' }
+          Copy-Item .tmp/native-inbox-share-write/fixture/reuse-manifest.json .tmp/native-inbox-share-write/results/reuse-manifest.json
+      - name: Run the single current-logon write-sharing control
+        shell: pwsh
+        run: ./.github/scripts/native-smb-inbox-reference.ps1 -Phase Run -ApplicationSharing write-only
+      - name: Audit exact owned-resource cleanup
+        if: always()
+        timeout-minutes: 2
+        shell: pwsh
+        run: ./.github/scripts/native-smb-inbox-reference.ps1 -Phase Verify -ApplicationSharing write-only
+      - name: Preserve first native observations and controller evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-smb-inbox-share-write-${{ github.run_attempt }}
+          path: .tmp/native-inbox-share-write/results
+          if-no-files-found: error
+          retention-days: 14

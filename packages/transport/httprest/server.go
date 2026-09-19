@@ -218,7 +218,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Op != OpSubscribe && req.Op != OpResubscribe && req.Op != OpSnapshot {
 		reservation := h.maxBodyBytes
-		if req.Op == OpRead || req.Op == OpList {
+		if req.Op == OpRead || req.Op == OpList || req.Op == OpStat {
 			reservation = retainedResponseMultiplier * h.maxBodyBytes
 		}
 		release, err := h.responses.acquire(r.Context(), reservation)
@@ -247,6 +247,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) 
 	}
 	switch req.Op {
 	case OpStat:
+		ctx = storage.WithAttrResultBudget(ctx, h.attrResultBudget(fileRequest{Op: storage.OpFileStat, ResultBytes: h.maxBodyBytes}))
 		attr, err := h.storage.Stat(ctx, req.Path)
 		if err != nil {
 			h.writeOperationError(w, err)
@@ -507,7 +508,7 @@ func (h *Handler) writeOperationError(w http.ResponseWriter, err error) {
 		h.writeJSON(w, StatusStorageError, response)
 		return
 	}
-	response := ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error()}
+	response := ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error(), CapabilityCode: capabilityErrorCode(err)}
 	if failure := volumeLockFailure(err); failure != nil {
 		response.LockCode = failure.Code
 		recorded := failure.Recorded
@@ -565,24 +566,32 @@ func boundedErrorResponse(response ErrorResponse, limit int64) ErrorResponse {
 }
 
 func newListResult(limit int64) (*storage.ListResult, error) {
-	return storage.NewListResult(limit, int64(len(`{"entries":[]}`)), func(i int, nameBytes int64, attr storage.Attr) (int64, error) {
-		encodedAttr, err := json.Marshal(AttrOf(attr))
-		if err != nil {
-			return 0, fmt.Errorf("cannot size listing attributes: %w", err)
-		}
-		if nameBytes > limit {
-			return limit + 1, nil
-		}
-		if int64(int(nameBytes)) != nameBytes {
-			return 0, fmt.Errorf("a listing name is too large for this process: %w", syscall.EFBIG)
-		}
-		encodedName := int64(base64.StdEncoding.EncodedLen(int(nameBytes)))
-		entryBytes := int64(len(`{"name":"","attr":}`)) + encodedName + int64(len(encodedAttr))
-		if i != 0 {
-			entryBytes++
-		}
-		return entryBytes, nil
+	return storage.NewListResult(limit, int64(len(`{"entries":[]}`)), func(i int, nameBytes, metadataBytes int64, attr storage.Attr) (int64, error) {
+		return listEntryWireBytes(i, nameBytes, metadataBytes, attr, limit, "name")
 	})
+}
+func listEntryWireBytes(i int, nameBytes, metadataBytes int64, attr storage.Attr, limit int64, nameField string) (int64, error) {
+	encodedAttr, err := json.Marshal(AttrOf(attr))
+	if err != nil {
+		return 0, fmt.Errorf("cannot size listing attributes: %w", err)
+	}
+	if nameBytes > limit || metadataBytes > limit {
+		return limit + 1, nil
+	}
+	if int64(int(nameBytes)) != nameBytes {
+		return 0, fmt.Errorf("a listing name is too large for this process: %w", syscall.EFBIG)
+	}
+	encodedName := int64(base64.StdEncoding.EncodedLen(int(nameBytes)))
+	entryBytes := int64(len(`{"":"","attr":}`)+len(nameField)) + encodedName + int64(len(encodedAttr))
+	metadataCharge, err := metadataResultBytes(metadataBytes, 0)
+	if err != nil {
+		return 0, err
+	}
+	entryBytes += metadataCharge
+	if i != 0 {
+		entryBytes++
+	}
+	return entryBytes, nil
 }
 
 // statusForParseError keeps a malformed exchange in the part of the status space that

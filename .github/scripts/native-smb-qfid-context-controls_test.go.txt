@@ -1,0 +1,409 @@
+package smb
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"reflect"
+	"sync/atomic"
+	"syscall"
+	"testing"
+
+	"github.com/codetreker/remote-fs/packages/authz"
+	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+	"github.com/codetreker/remote-fs/packages/storage"
+)
+
+func gateQfidDecode(t *testing.T, data []byte) []wire.CreateContext {
+	t.Helper()
+	var result []wire.CreateContext
+	for len(data) > 0 {
+		if len(data) < 24 || len(data)%8 != 0 || smbLE.Uint16(data[4:]) != 16 || smbLE.Uint16(data[6:]) != 4 || smbLE.Uint16(data[10:]) != 24 {
+			t.Fatalf("invalid context header %x", data)
+		}
+		next := int(smbLE.Uint32(data))
+		end := len(data)
+		if next != 0 {
+			if next < 24 || next%8 != 0 || next >= len(data) {
+				t.Fatalf("invalid next %d", next)
+			}
+			end = next
+		}
+		size := int(smbLE.Uint32(data[12:]))
+		if size > end-24 || (24+size+7)&^7 != end {
+			t.Fatalf("invalid context payload %d/%d", size, end)
+		}
+		if !bytes.Equal(data[20:24], make([]byte, 4)) || !bytes.Equal(data[24+size:end], make([]byte, end-24-size)) {
+			t.Fatal("nonzero context padding")
+		}
+		result = append(result, wire.CreateContext{Name: bytes.Clone(data[16:20]), Data: bytes.Clone(data[24 : 24+size])})
+		if next == 0 {
+			break
+		}
+		data = data[next:]
+	}
+	return result
+}
+func gateQfidIdentity(t *testing.T, body []byte) (uint64, uint64, wire.FileID) {
+	t.Helper()
+	if len(body) != 144 || smbLE.Uint16(body) != 89 || body[2] != 0 || smbLE.Uint32(body[80:]) != 152 || smbLE.Uint32(body[84:]) != 56 {
+		t.Fatalf("invalid NONE/QFid CREATE %x", body)
+	}
+	contexts := gateQfidDecode(t, body[88:])
+	if len(contexts) != 1 || string(contexts[0].Name) != "QFid" || len(contexts[0].Data) != 32 || !bytes.Equal(contexts[0].Data[16:], make([]byte, 16)) {
+		t.Fatalf("invalid truthful identity context %+v", contexts)
+	}
+	var id wire.FileID
+	copy(id[:], body[64:80])
+	return smbLE.Uint64(contexts[0].Data), smbLE.Uint64(contexts[0].Data[8:]), id
+}
+func TestGateAlwaysQFidContexts(t *testing.T) {
+	attr := windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 83}}}
+	for _, name := range []string{"absent", "requested-first", "requested-middle", "requested-last"} {
+		t.Run(name, func(t *testing.T) {
+			items := []wire.CreateContext{{Name: []byte("MxAc")}, {Name: []byte("RqLs")}, {Name: []byte("DH2Q")}}
+			at := map[string]int{"requested-first": 0, "requested-middle": 1, "requested-last": 3}[name]
+			if name != "absent" {
+				items = append(items, wire.CreateContext{})
+				copy(items[at+1:], items[at:])
+				items[at] = wire.CreateContext{Name: []byte("QFid")}
+			}
+			request := wire.CreateRequest{Contexts: items}
+			before := make([]wire.CreateContext, len(items))
+			for i, v := range items {
+				before[i] = wire.CreateContext{Name: bytes.Clone(v.Name), Data: bytes.Clone(v.Data)}
+			}
+			ctx := context.WithValue(t.Context(), maximalAccessKey{}, func(windowsAttr) (uint32, error) { return 0x81, nil })
+			encoded, err := createContexts(ctx, request, attr, 0x123456789, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(request.Contexts, before) {
+				t.Fatal("request contexts mutated")
+			}
+			got := gateQfidDecode(t, encoded)
+			want := []string{"MxAc", "QFid"}
+			if name == "requested-first" {
+				want = []string{"QFid", "MxAc"}
+			}
+			if len(got) != 2 {
+				t.Fatalf("contexts=%+v", got)
+			}
+			for i, item := range got {
+				if string(item.Name) != want[i] {
+					t.Fatalf("context order %+v", got)
+				}
+				if string(item.Name) == "QFid" {
+					if len(item.Data) != 32 || smbLE.Uint64(item.Data) != 83 || smbLE.Uint64(item.Data[8:]) != 0x123456789 || !bytes.Equal(item.Data[16:], make([]byte, 16)) {
+						t.Fatalf("identity %x", item.Data)
+					}
+				} else if !bytes.Equal(item.Data, []byte{0, 0, 0, 0, 0x81, 0, 0, 0}) {
+					t.Fatalf("MxAc changed %x", item.Data)
+				}
+			}
+		})
+	}
+	for _, items := range [][]wire.CreateContext{{{Name: []byte("QFid")}, {Name: []byte("QFid")}}, {{Name: []byte("QFid"), Data: []byte{1}}}} {
+		if body, err := createContexts(t.Context(), wire.CreateRequest{Contexts: items}, attr, 1, nil); !errors.Is(err, syscall.EINVAL) || body != nil {
+			t.Fatal("invalid identity request encoded", err)
+		}
+	}
+	for _, count := range []int{1017, 1018} {
+		items := make([]wire.CreateContext, count)
+		for i := range items {
+			items[i] = wire.CreateContext{Name: []byte("MxAc")}
+		}
+		body, err := createContexts(t.Context(), wire.CreateRequest{Contexts: items}, attr, 1, nil)
+		if count == 1017 {
+			if err != nil || len(body) != count*32+56 {
+				t.Fatalf("exact bound %d %v", len(body), err)
+			}
+		} else if !errors.Is(err, syscall.ENOMEM) || body != nil {
+			t.Fatalf("overflow accepted %d %v", len(body), err)
+		}
+	}
+}
+
+type gateQfidBackend struct {
+	windowsBackend
+	state windowsState
+	err   error
+	calls int
+}
+
+func (b *gateQfidBackend) State(context.Context) (windowsState, error) {
+	b.calls++
+	return b.state, b.err
+}
+func gateQfidDispatcher() (*fileDispatcher, *commandFile, *commandSession, *gateQfidBackend) {
+	d, file, session, _ := commandDispatcher()
+	d.handles = make(map[wire.FileID]*fileHandle)
+	backend := &gateQfidBackend{state: windowsState{VolumeIdentity: "actual-volume", VolumeSerial: 0x123456789}}
+	d.backend = backend
+	return d, file, session, backend
+}
+func TestGateAlwaysQFidAdmission(t *testing.T) {
+	for _, name := range []string{"absent", "requested", "duplicate", "nonempty", "durable-reconnect", "durable-v2-reconnect", "unknown-context", "malformed", "invalid-access", "invalid-options", "state-error", "state-outage", "unknown-volume", "known-zero", "malformed-maximal", "capacity"} {
+		t.Run(name, func(t *testing.T) {
+			d, file, session, backend := gateQfidDispatcher()
+			opens := 0
+			session.open = func(windowsOpenRequest) (windowsOpenResult, error) {
+				opens++
+				return windowsOpenResult{File: file, Attr: file.attr}, nil
+			}
+			request := createCommand("", 1, 1)
+			want := uint32(fileSuccess)
+			wantState := 1
+			switch name {
+			case "requested":
+				request = requestContexts(t, request, []wire.CreateContext{{Name: []byte("QFid")}})
+			case "duplicate":
+				request = requestContexts(t, request, []wire.CreateContext{{Name: []byte("QFid")}, {Name: []byte("QFid")}})
+				want = fileInvalidParameter
+				wantState = 0
+			case "nonempty":
+				request = requestContexts(t, request, []wire.CreateContext{{Name: []byte("QFid"), Data: []byte{1}}})
+				want = fileInvalidParameter
+				wantState = 0
+			case "durable-reconnect", "durable-v2-reconnect", "unknown-context":
+				contextName := map[string]string{"durable-reconnect": "DHnC", "durable-v2-reconnect": "DH2C", "unknown-context": "What"}[name]
+				request = requestContexts(t, request, []wire.CreateContext{{Name: []byte(contextName)}})
+				want = fileNotSupported
+				wantState = 0
+			case "malformed":
+				request = requestContexts(t, request, []wire.CreateContext{{Name: []byte("QFid")}})
+				smbLE.PutUint32(request.Body[48:], 0xffffff00)
+				want = fileInvalidParameter
+				wantState = 0
+			case "invalid-access":
+				smbLE.PutUint32(request.Body[24:], 0x400)
+				want = fileNotSupported
+				wantState = 0
+			case "invalid-options":
+				smbLE.PutUint32(request.Body[40:], 8)
+				want = fileNotSupported
+				wantState = 0
+			case "state-error":
+				backend.err = syscall.EACCES
+				want = statusDenied
+			case "state-outage":
+				backend.err = syscall.EIO
+				want = fileIOError
+			case "malformed-maximal":
+				request = requestContexts(t, request, []wire.CreateContext{{Name: []byte("MxAc"), Data: []byte{1}}})
+				want, wantState = fileInvalidParameter, 0
+			case "capacity":
+				d.limits.MaxOpens = 0
+				want = fileInsufficientResources
+			case "unknown-volume":
+				backend.state.VolumeIdentity = ""
+				want = fileIOError
+			case "known-zero":
+				backend.state.VolumeSerial = 0
+			}
+			before := bytes.Clone(request.Packet)
+			body, status := d.create(t.Context(), request)
+			if status != want || backend.calls != wantState {
+				t.Fatalf("status=%x want=%x State=%d want=%d", status, want, backend.calls, wantState)
+			}
+			if !bytes.Equal(request.Packet, before) {
+				t.Fatal("borrowed CREATE request mutated")
+			}
+			if status == 0 {
+				node, volume, _ := gateQfidIdentity(t, body)
+				if node != file.attr.ID || volume != backend.state.VolumeSerial || opens != 1 {
+					t.Fatalf("identity=%d/%d opens=%d", node, volume, opens)
+				}
+			} else if body != nil || opens != 0 || len(d.handles) != 0 || session.closed != 0 {
+				t.Fatal("failed admission opened or invented identity", opens, session.closed)
+			}
+		})
+	}
+}
+
+func TestGateAlwaysQFidCapturedIdentity(t *testing.T) {
+	d, file, session, backend := gateQfidDispatcher()
+	opens := 0
+	current := file
+	session.open = func(windowsOpenRequest) (windowsOpenResult, error) {
+		opens++
+		return windowsOpenResult{File: current, Attr: current.attr}, nil
+	}
+	var ids []wire.FileID
+	for _, node := range []uint64{7, 7, 19} {
+		if node != current.attr.ID {
+			current = &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: node, Kind: storage.NodeRegular}}}}
+		}
+		body, status := d.create(t.Context(), createCommand("", 1, 1))
+		if status != 0 {
+			t.Fatal(status)
+		}
+		got, volume, id := gateQfidIdentity(t, body)
+		if got != node || volume != backend.state.VolumeSerial {
+			t.Fatal(got, volume)
+		}
+		ids = append(ids, id)
+		// A mutable stat result cannot redefine the identity captured by this open.
+		current.attr.ID = node + 1000
+		reply, status := d.queryInfo(t.Context(), queryCommand(id, 1, 6, 8))
+		if status != 0 || len(reply) != 16 || smbLE.Uint64(reply[8:]) != got {
+			t.Fatalf("QFid/QI6 mismatch %x %x", status, reply)
+		}
+		current.attr.ID = node
+	}
+	if opens != 3 || backend.calls != 3 || ids[0] == ids[1] || ids[1] == ids[2] {
+		t.Fatal("extra opens, state lookups or recycled wire handles", opens, backend.calls)
+	}
+}
+
+type gateQfidCloseFailure struct {
+	windowsSession
+	calls int
+	err   error
+}
+
+func (s *gateQfidCloseFailure) Close(context.Context) error { s.calls++; return s.err }
+func TestGateAlwaysQFidFailureOwnership(t *testing.T) {
+	for _, name := range []string{"denied", "unknown", "missing-file", "zero-node", "frame-bound", "encoding-bound", "cleanup-error"} {
+		t.Run(name, func(t *testing.T) {
+			d, file, session, backend := gateQfidDispatcher()
+			opens := 0
+			session.open = func(windowsOpenRequest) (windowsOpenResult, error) {
+				opens++
+				switch name {
+				case "denied":
+					return windowsOpenResult{}, syscall.EACCES
+				case "unknown":
+					return windowsOpenResult{}, syscall.EIO
+				case "missing-file":
+					return windowsOpenResult{Attr: file.attr}, nil
+				case "zero-node":
+					return windowsOpenResult{File: file}, nil
+				default:
+					return windowsOpenResult{File: file, Attr: file.attr}, nil
+				}
+			}
+			request := createCommand("", 1, 1)
+			var cleanup *gateQfidCloseFailure
+			if name == "frame-bound" || name == "cleanup-error" {
+				d.limits.MaxFrameBytes = 207
+			}
+			if name == "cleanup-error" {
+				cleanup = &gateQfidCloseFailure{windowsSession: session, err: syscall.EIO}
+				d.session = cleanup
+			}
+			if name == "encoding-bound" {
+				contexts := make([]wire.CreateContext, 1018)
+				for i := range contexts {
+					contexts[i] = wire.CreateContext{Name: []byte("MxAc")}
+				}
+				request = requestContexts(t, request, contexts)
+				parsed, err := wire.ParseFrame(request.Packet, wire.Limits{MaxBytes: 1 << 20, MaxCommands: 1, MaxContexts: 2000})
+				if err != nil {
+					t.Fatal(err)
+				}
+				request = parsed[0]
+			}
+			before := bytes.Clone(request.Packet)
+			body, status := d.create(t.Context(), request)
+			want := uint32(fileIOError)
+			if name == "denied" {
+				want = statusDenied
+			}
+			if status != want || body != nil || opens != 1 || backend.calls != 1 || !bytes.Equal(request.Packet, before) {
+				t.Fatalf("status=%x body=%x opens=%d states=%d", status, body, opens, backend.calls)
+			}
+			if name == "denied" {
+				if d.fenced || session.closed != 0 {
+					t.Fatal("known denial fenced session")
+				}
+			} else if !d.fenced || !d.failed {
+				t.Fatal("uncertain/admitted failure did not fence")
+			}
+			if name == "cleanup-error" {
+				if cleanup.calls != 1 || !errors.Is(d.cleanupErr, syscall.EIO) {
+					t.Fatal("cleanup error swallowed", cleanup.calls, d.cleanupErr)
+				}
+			} else if name != "denied" && session.closed != 1 {
+				t.Fatal("failed owner not closed", session.closed)
+			}
+		})
+	}
+}
+
+func TestGateAlwaysQFidSignedNoLeasing(t *testing.T) {
+	file := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular, Size: 3}}}, data: []byte("abc")}
+	var denied atomic.Bool
+	var opens atomic.Int32
+	policy := authz.AuthorizerFunc(func(ctx context.Context, r authz.AccessRequest) error {
+		p, ok := PrincipalFromContext(ctx)
+		if !ok || p.SID != "S-1-5-21-1" || r.Volume != "trusted" {
+			return errors.New("wrong principal/volume")
+		}
+		if denied.Load() {
+			return authz.ErrDenied
+		}
+		return nil
+	})
+	peer, _ := gateNoLeaseConnectWithAuthorizer(t, func(r windowsOpenRequest) (windowsOpenResult, error) {
+		opens.Add(1)
+		if r.Lookup.Name == "" {
+			root := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}}}}
+			return windowsOpenResult{File: root, Attr: root.attr}, nil
+		}
+		if r.Lookup.ExpectedID != 0 {
+			t.Error("lease preflight still active")
+		}
+		return windowsOpenResult{File: file, Attr: file.attr}, nil
+	}, policy)
+	request := gateNoLeaseRequest(t, "file", wire.OplockLease, gateNoLeaseContext(t, wire.LeaseVersion2))
+	before := bytes.Clone(request.Packet)
+	reply := peer.call(t, request)
+	header, err := wire.ParseHeader(reply)
+	if err != nil || header.Status != 0 {
+		t.Fatal(header, err)
+	}
+	node, volume, id := gateQfidIdentity(t, reply[64:])
+	if node != 7 || volume != 0x123456789 || opens.Load() != 2 || !bytes.Equal(request.Packet, before) {
+		t.Fatal("false identity, extra admission or mutation", node, volume, opens.Load())
+	}
+	denied.Store(true)
+	reply = peer.call(t, readCommand(id, 0, 1))
+	header, _ = wire.ParseHeader(reply)
+	if header.Status != statusDenied {
+		t.Fatal("authorization lost", header)
+	}
+	denied.Store(false)
+	originalTree := peer.tree
+	peer.tree = 999
+	reply = peer.call(t, request)
+	header, _ = wire.ParseHeader(reply)
+	if header.Status != statusNetworkDeleted || opens.Load() != 2 {
+		t.Fatal("unknown tree reached CREATE admission", header, opens.Load())
+	}
+	peer.tree = originalTree
+	ack := make([]byte, 36)
+	smbLE.PutUint16(ack, 36)
+	reply = peer.call(t, fileRequest(wire.OplockBreak, ack))
+	header, _ = wire.ParseHeader(reply)
+	if header.Status != statusUnsupported {
+		t.Fatal("lease ACK accepted", header)
+	}
+	unsigned := readCommand(id, 0, 1)
+	packet := requestPacket(wire.Header{Command: wire.Read, MessageID: peer.next, SessionID: peer.sid, TreeID: peer.tree, Credits: 1}, unsigned.Body)
+	peer.next++
+	sendFrame(t, peer.network, packet)
+	reply = readFrame(t, peer.network)
+	header, _ = wire.ParseHeader(reply)
+	if header.Status != statusDenied {
+		t.Fatal("unsigned request accepted", header)
+	}
+	reply = peer.call(t, gateNoLeaseClose(id))
+	header, _ = wire.ParseHeader(reply)
+	if header.Status != 0 {
+		t.Fatal(header)
+	}
+	if peer.server.Status().LeaseSlots != 0 || peer.server.Status().LeaseBytes != 0 {
+		t.Fatal("leasing resources allocated")
+	}
+}

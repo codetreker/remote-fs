@@ -1,0 +1,494 @@
+package windows
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"go/ast"
+	"go/format"
+	"go/parser"
+	"go/token"
+	"io"
+	"math"
+	"os"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+)
+
+type inboxSharingPolicy struct {
+	ApplicationSharing string `json:"application_sharing"`
+	Cell               string `json:"cell"`
+	ApplicationAccess  uint32 `json:"application_access"`
+	ApplicationShare   uint32 `json:"application_share"`
+}
+
+func (p *inboxSharingPolicy) UnmarshalJSON(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	begin, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if begin != json.Delim('{') {
+		return errors.New("policy must be a non-null object")
+	}
+	var result inboxSharingPolicy
+	seen := make(map[string]bool, 4)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := token.(string)
+		if !ok || seen[name] {
+			return errors.New("duplicate or invalid policy field")
+		}
+		seen[name] = true
+		var destination any
+		switch name {
+		case "application_sharing":
+			destination = &result.ApplicationSharing
+		case "cell":
+			destination = &result.Cell
+		case "application_access":
+			destination = &result.ApplicationAccess
+		case "application_share":
+			destination = &result.ApplicationShare
+		default:
+			return fmt.Errorf("unknown policy field %q", name)
+		}
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return err
+		}
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return fmt.Errorf("policy field %q is null", name)
+		}
+		if err := json.Unmarshal(raw, destination); err != nil {
+			return fmt.Errorf("policy field %q: %w", name, err)
+		}
+	}
+	end, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if end != json.Delim('}') || len(seen) != 4 {
+		return errors.New("policy requires every tuple field")
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return errors.New("trailing policy value")
+	}
+	*p = result
+	return nil
+}
+
+type inboxApplicationOpen struct {
+	Attempted       bool   `json:"attempted"`
+	Succeeded       bool   `json:"succeeded"`
+	RequestedAccess uint32 `json:"requested_access"`
+	RequestedShare  uint32 `json:"requested_share"`
+	Error           string `json:"error"`
+}
+type inboxReturnedErrorEvidence struct {
+	State         string  `json:"state"`
+	Message       string  `json:"message"`
+	Type          string  `json:"type"`
+	ReturnedErrno *uint32 `json:"returned_errno"`
+}
+
+func inboxPolicy(name string) (inboxSharingPolicy, error) {
+	switch name {
+	case "original":
+		return inboxSharingPolicy{"original", "inbox-reference", 1, 0}, nil
+	case "write-only":
+		return inboxSharingPolicy{"write-only", "inbox-share-write", 1, 2}, nil
+	default:
+		return inboxSharingPolicy{}, errors.New("unknown application sharing policy")
+	}
+}
+func inboxCompiledPolicy() inboxSharingPolicy {
+	policy, err := inboxPolicy(inboxCompiledSharing)
+	if err != nil {
+		panic(err)
+	}
+	return policy
+}
+func inboxValidatePolicy(actual, expected inboxSharingPolicy) error {
+	known, err := inboxPolicy(actual.ApplicationSharing)
+	if err != nil {
+		return err
+	}
+	if actual != known || actual != expected {
+		return errors.New("application sharing policy mismatch")
+	}
+	return nil
+}
+func inboxRequireSelectedPolicy(name string) error {
+	selected, err := inboxPolicy(name)
+	if err != nil {
+		return err
+	}
+	return inboxValidatePolicy(selected, inboxCompiledPolicy())
+}
+func inboxPolicyOutcome(policy inboxSharingPolicy, native string) string {
+	if err := inboxValidatePolicy(policy, inboxCompiledPolicy()); err != nil {
+		return "policy_mismatch"
+	}
+	if policy.ApplicationSharing == "write-only" {
+		return "share_write_control_" + native
+	}
+	return native
+}
+func inboxSelectedSuccess() string {
+	return inboxPolicyOutcome(inboxCompiledPolicy(), "native_behavior_pass")
+}
+func inboxReturnedError(err error) inboxReturnedErrorEvidence {
+	if err == nil {
+		return inboxReturnedErrorEvidence{State: "success"}
+	}
+	result := inboxReturnedErrorEvidence{State: "errno_unavailable", Message: err.Error(), Type: fmt.Sprintf("%T", err)}
+	var errno syscall.Errno
+	if errors.As(err, &errno) && uint64(errno) <= math.MaxUint32 {
+		code := uint32(errno)
+		result.State = "returned_errno"
+		result.ReturnedErrno = &code
+	}
+	return result
+}
+func inboxApplicationResult(access, share uint32, err error) inboxApplicationOpen {
+	result := inboxApplicationOpen{Attempted: true, Succeeded: err == nil, RequestedAccess: access, RequestedShare: share}
+	if err != nil {
+		result.Error = err.Error()
+	}
+	return result
+}
+func TestInboxSharingPolicy(t *testing.T) {
+	for _, stage := range []int{0, 1, 2} {
+		t.Run(fmt.Sprintf("decode_stage%d", stage), func(t *testing.T) { inboxPolicyDecodeControls(t, stage) })
+	}
+	for _, name := range []string{"original", "write-only"} {
+		t.Run(name, func(t *testing.T) {
+			p, err := inboxPolicy(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = inboxValidatePolicy(p, p); err != nil {
+				t.Fatal(err)
+			}
+			want := uint32(0)
+			if name == "write-only" {
+				want = 2
+			}
+			if p.ApplicationAccess != 1 || p.ApplicationShare != want {
+				t.Fatal("policy geometry changed")
+			}
+		})
+	}
+	for _, name := range []string{"", "2", "share-all", "WRITE-ONLY", "original|write-only"} {
+		t.Run("refuse_"+name, func(t *testing.T) {
+			if _, err := inboxPolicy(name); err == nil {
+				t.Fatal("unknown policy admitted")
+			}
+		})
+	}
+	p := inboxCompiledPolicy()
+	for name, change := range map[string]func(*inboxSharingPolicy){"missing": func(p *inboxSharingPolicy) { *p = inboxSharingPolicy{} }, "cell": func(p *inboxSharingPolicy) { p.Cell = "other" }, "access": func(p *inboxSharingPolicy) { p.ApplicationAccess = 2 }, "share": func(p *inboxSharingPolicy) { p.ApplicationShare = 7 }, "mode": func(p *inboxSharingPolicy) { p.ApplicationSharing = "other" }} {
+		t.Run(name, func(t *testing.T) {
+			bad := p
+			change(&bad)
+			if inboxValidatePolicy(bad, p) == nil {
+				t.Fatal("contradictory policy admitted")
+			}
+		})
+	}
+	t.Run("compiled_env", func(t *testing.T) {
+		if inboxRequireSelectedPolicy(p.ApplicationSharing) != nil || inboxRequireSelectedPolicy("") == nil {
+			t.Fatal("environment guard changed")
+		}
+		other := "original"
+		if p.ApplicationSharing == other {
+			other = "write-only"
+		}
+		if inboxRequireSelectedPolicy(other) == nil {
+			t.Fatal("foreign compiled policy admitted")
+		}
+	})
+	for _, stage := range []int{1, 2} {
+		t.Run(fmt.Sprint("admission", stage), func(t *testing.T) {
+			s := inboxTestStart()
+			a := inboxTestAdmission(stage)
+			a.Policy = inboxSharingPolicy{}
+			if inboxValidateAdmission(s, a, stage, 20) == nil {
+				t.Fatal("missing admission policy admitted")
+			}
+		})
+	}
+	t.Run("missing_start", func(t *testing.T) {
+		s := inboxTestStart()
+		s.Policy = inboxSharingPolicy{}
+		if inboxValidateStart(s) == nil {
+			t.Fatal("missing start policy admitted")
+		}
+	})
+}
+func TestInboxSharingOutcome(t *testing.T) {
+	p := inboxCompiledPolicy()
+	want := "native_behavior_pass"
+	if p.ApplicationSharing == "write-only" {
+		want = "share_write_control_native_behavior_pass"
+	}
+	if got := inboxPolicyOutcome(p, "native_behavior_pass"); got != want || inboxSelectedSuccess() != want {
+		t.Fatalf("success outcome escaped policy: %s", got)
+	}
+	for _, native := range []string{"reference_mutation_refusal", "cleanup_incomplete", "local_truth_incomplete", "native_behavior_failure"} {
+		want := native
+		if p.ApplicationSharing == "write-only" {
+			want = "share_write_control_" + native
+		}
+		if got := inboxPolicyOutcome(p, native); got != want {
+			t.Fatal(got)
+		}
+	}
+	p.ApplicationShare = 7
+	if inboxPolicyOutcome(p, "native_behavior_pass") != "policy_mismatch" {
+		t.Fatal("foreign geometry accepted")
+	}
+}
+func TestInboxSharingErrorEvidence(t *testing.T) {
+	t.Run("not_attempted", func(t *testing.T) {
+		r := inboxReturnedErrorEvidence{State: "not_attempted"}
+		if r.ReturnedErrno != nil || r.Message != "" {
+			t.Fatal("invented error")
+		}
+	})
+	t.Run("nil", func(t *testing.T) {
+		r := inboxReturnedError(nil)
+		if r.State != "success" || r.ReturnedErrno != nil {
+			t.Fatal(r)
+		}
+	})
+	for name, err := range map[string]error{"direct": syscall.Errno(32), "wrapped": fmt.Errorf("rename: %w", syscall.Errno(32))} {
+		t.Run(name, func(t *testing.T) {
+			r := inboxReturnedError(err)
+			if r.State != "returned_errno" || r.ReturnedErrno == nil || *r.ReturnedErrno != 32 || r.Message != err.Error() || !errors.Is(err, syscall.Errno(32)) {
+				t.Fatal(r)
+			}
+		})
+	}
+	t.Run("untyped", func(t *testing.T) {
+		err := errors.New("sharing text alone")
+		r := inboxReturnedError(err)
+		if r.State != "errno_unavailable" || r.ReturnedErrno != nil || r.Message != err.Error() {
+			t.Fatal(r)
+		}
+	})
+	t.Run("out_of_range", func(t *testing.T) {
+		if strconv.IntSize != 64 {
+			t.Fatal("64-bit diagnostic host required")
+		}
+		value := uint64(math.MaxUint32) + 1
+		r := inboxReturnedError(syscall.Errno(value))
+		if r.State != "errno_unavailable" || r.ReturnedErrno != nil {
+			t.Fatal(r)
+		}
+	})
+	t.Run("rename_and_close", func(t *testing.T) {
+		renameErr, closeErr := error(syscall.Errno(32)), error(syscall.Errno(6))
+		r := inboxReturnedError(renameErr)
+		joined := errors.Join(renameErr, closeErr)
+		if r.ReturnedErrno == nil || *r.ReturnedErrno != 32 || !errors.Is(joined, renameErr) || !errors.Is(joined, closeErr) {
+			t.Fatal("stage or error chain changed")
+		}
+	})
+	t.Run("non_errno_rename_typed_close", func(t *testing.T) {
+		renameErr, closeErr := errors.New("untyped rename failure"), error(syscall.Errno(6))
+		r := inboxReturnedError(renameErr)
+		joined := errors.Join(renameErr, closeErr)
+		if r.State != "errno_unavailable" || r.ReturnedErrno != nil || !errors.Is(joined, renameErr) || !errors.Is(joined, closeErr) {
+			t.Fatal("close errno substituted for rename")
+		}
+	})
+}
+func inboxGeometryFile(t *testing.T) *ast.File {
+	t.Helper()
+	data, err := os.ReadFile("reference_windows_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := parser.ParseFile(token.NewFileSet(), "reference_windows_test.go", data, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return file
+}
+func inboxNodeText(node ast.Node) string {
+	var out bytes.Buffer
+	if err := format.Node(&out, token.NewFileSet(), node); err != nil {
+		panic(err)
+	}
+	return out.String()
+}
+func TestInboxSharingGeometry(t *testing.T) {
+	file := inboxGeometryFile(t)
+	var cell *ast.FuncDecl
+	entries := map[string]bool{}
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			entries[fn.Name.Name] = true
+			if fn.Name.Name == "inboxNativeCell" {
+				cell = fn
+			}
+		}
+	}
+	if cell == nil {
+		t.Fatal("missing actual native cell")
+	}
+	p := inboxCompiledPolicy()
+	entry, other := "TestNativeInboxReference", "TestNativeInboxShareWriteControl"
+	share := "0"
+	if p.ApplicationSharing == "write-only" {
+		entry, other = other, entry
+		share = "win.FILE_SHARE_WRITE"
+	}
+	t.Run("entry", func(t *testing.T) {
+		if !entries[entry] || entries[other] {
+			t.Fatal("incorrect selected native entry")
+		}
+	})
+	var opens []*ast.CallExpr
+	positions := map[string]token.Pos{}
+	ast.Inspect(cell, func(node ast.Node) bool {
+		if call, ok := node.(*ast.CallExpr); ok {
+			switch inboxNodeText(call.Fun) {
+			case "cacheGateSharingOpen":
+				opens = append(opens, call)
+			case "win.CreateFile":
+				positions["source_open"] = call.Pos()
+			case "inboxRename":
+				positions["rename"] = call.Pos()
+			case "mutator.close":
+				positions["close"] = call.Pos()
+			case "errors.Join":
+				positions["join"] = call.Pos()
+			}
+		}
+		if assign, ok := node.(*ast.AssignStmt); ok && len(assign.Lhs) == 1 && len(assign.Rhs) == 1 {
+			positions[inboxNodeText(assign.Lhs[0])+"="+inboxNodeText(assign.Rhs[0])] = assign.Pos()
+		}
+		return true
+	})
+	t.Run("application_share", func(t *testing.T) {
+		if len(opens) != 2 || len(opens[0].Args) != 5 || inboxNodeText(opens[0].Args[1]) != "s.ShareUNC + `\\v`" || inboxNodeText(opens[0].Args[2]) != "win.FILE_LIST_DIRECTORY" || inboxNodeText(opens[0].Args[3]) != share || inboxNodeText(opens[0].Args[4]) != "true" {
+			t.Fatal("application share request differs from selected policy")
+		}
+	})
+	t.Run("watcher_unchanged", func(t *testing.T) {
+		if len(opens) != 2 || len(opens[1].Args) != 5 || inboxNodeText(opens[1].Args[1]) != "s.ShareUNC + `\\`" || inboxNodeText(opens[1].Args[2]) != "win.FILE_LIST_DIRECTORY" || inboxNodeText(opens[1].Args[3]) != "7" {
+			t.Fatal("watcher geometry changed")
+		}
+	})
+	t.Run("application_result", func(t *testing.T) {
+		key := "r.ApplicationOpen=inboxApplicationResult(win.FILE_LIST_DIRECTORY, " + share + ", err)"
+		if positions[key] == 0 || len(opens) != 2 || positions[key] <= opens[0].End() || positions[key] >= opens[1].Pos() {
+			t.Fatal("application receipt does not bind actual call return")
+		}
+	})
+	t.Run("source_error", func(t *testing.T) {
+		pos := positions["r.SourceOpenResult=inboxReturnedError(err)"]
+		if pos == 0 || pos <= positions["source_open"] || pos >= positions["rename"] {
+			t.Fatal("source-open error evidence is not from its actual return")
+		}
+	})
+	t.Run("rename_error_before_close", func(t *testing.T) {
+		pos := positions["r.RenameResult=inboxReturnedError(renameErr)"]
+		ack := positions["r.ACK=time.Now()"]
+		if pos == 0 || ack == 0 || pos <= ack || pos >= positions["close"] || pos >= positions["join"] {
+			t.Fatal("rename error attribution must precede close and join")
+		}
+	})
+}
+
+func inboxPolicyDecodeControls(t *testing.T, stage int) {
+	validPolicy, err := json.Marshal(inboxCompiledPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := func(policy []byte) []byte {
+		var value any = inboxTestStart()
+		if stage != 0 {
+			value = inboxTestAdmission(stage)
+		}
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			t.Fatal(err)
+		}
+		if policy == nil {
+			delete(fields, "policy")
+		} else {
+			fields["policy"] = policy
+		}
+		raw, err = json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(append([]byte(inboxPrefix), raw...), '\n')
+	}
+	accept := func(line []byte) error {
+		reader := bufio.NewReaderSize(bytes.NewReader(line), inboxEnvelopeLimit+1)
+		if stage == 0 {
+			var s inboxStart
+			if err := inboxReadEnvelope(reader, &s); err != nil {
+				return err
+			}
+			return inboxValidateStart(s)
+		}
+		var a inboxAdmission
+		if err := inboxReadEnvelope(reader, &a); err != nil {
+			return err
+		}
+		return inboxValidateAdmission(inboxTestStart(), a, stage, 20)
+	}
+	cases := map[string][]byte{"valid_explicit_tuple": validPolicy, "missing_policy": nil, "null_policy": []byte("null"), "wrong_policy_type": []byte(`[]`)}
+	for _, field := range []string{"application_sharing", "cell", "application_access", "application_share"} {
+		for _, mutation := range []string{"missing", "null", "wrong_type"} {
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(validPolicy, &fields); err != nil {
+				t.Fatal(err)
+			}
+			switch mutation {
+			case "missing":
+				delete(fields, field)
+			case "null":
+				fields[field] = json.RawMessage("null")
+			case "wrong_type":
+				fields[field] = json.RawMessage("true")
+			}
+			raw, err := json.Marshal(fields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cases[mutation+"_"+field] = raw
+		}
+	}
+	cases["unknown_field"] = []byte(strings.TrimSuffix(string(validPolicy), "}") + `,"unknown":1}`)
+	cases["duplicate_field"] = []byte(strings.TrimSuffix(string(validPolicy), "}") + fmt.Sprintf(`,"application_share":%d}`, inboxCompiledPolicy().ApplicationShare))
+	cases["contradictory_duplicate"] = []byte(strings.TrimSuffix(string(validPolicy), "}") + `,"application_share":7}`)
+	cases["explicit_zero"] = []byte(fmt.Sprintf(`{"application_sharing":%q,"cell":%q,"application_access":1,"application_share":0}`, inboxCompiledPolicy().ApplicationSharing, inboxCompiledPolicy().Cell))
+	for name, policy := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := accept(envelope(policy))
+			want := name == "valid_explicit_tuple" || (name == "explicit_zero" && inboxCompiledSharing == "original")
+			if (err == nil) != want {
+				t.Fatalf("policy envelope admission mismatch (%s): accepted=%t want=%t error=%v", name, err == nil, want, err)
+			}
+		})
+	}
+}

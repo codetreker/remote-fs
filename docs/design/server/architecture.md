@@ -13,7 +13,7 @@ volume、保留文件与显式占有的权威持有者。将原生 storage 与�
 | **协议词汇**（`packages/transport/httprest`） | 请求 URL 的形状、响应体的形状；错误的名字取自 storage 契约的 errno 词汇。与 client 共用同一份。 | R-INT-9 |
 | **变更日志** | volume 里每一次改动的有序记录，由 storage 底下的 metastore 提供。请求处理拿到它就开出复制那三个操作；拿不到（`nil`）时，在已启用的操作授权通过后以 `ENOSYS` 拒绝它们。 | R-CON-1、R-CON-2 |
 | **storage** | 原生发布集成确定实际资源并执行最终转换。localstore 与 Azure 组合在 metastore 事务中记账；第三方实现须履行同一原生集成契约。 | R-INT-6、R-INT-13 |
-| **保留文件与 advisory** | FileSession 拥有当前对象引用，原生节点保留无名内容；独立 advisory coordinator 管理 flock/POSIX owner 与范围。 | R-FS-6 至 R-FS-8、R-CC-12、R-CC-13、R-WS-7 |
+| **保留引用与中立访问** | FileSession/原生引用保留对象；native use claims 和中立 coordinator 管理声明、owner、范围与历史。 | R-FS-6 至 R-FS-8、R-CC-12、R-CC-13、R-WS-7 |
 | **文件占有**（`packages/locking`、`packages/storage/locked`） | 有限 S/X 授予、Session / Owner、动作核对与发布顺序；与同一 volume 绑定，重启通过持久证据恢复保护。 | R-CC-3、R-CC-6 至 R-CC-11 |
 
 ```
@@ -30,7 +30,7 @@ volume、保留文件与显式占有的权威持有者。将原生 storage 与�
  └─────────────┘
 ```
 
-基础数据操作各自完成一次请求；FileSession 保留对象与标准 advisory 状态，显式 S/X 另有 Session、Owner、grant 与动作历史。handler 只接受 `locked.New` 验证过的配对 backend，其 `LockService()` 就是绑定原生发布检查的授权方，不能从另一份 storage 单独提供控制服务。控制状态、恢复与拒绝规则见[文件锁设计](file-locks.md)。可选 Authorizer 先按业务身份和语义决定准入，再访问 capability、Log 与 backend；通用有界请求／响应容量可先返回 EAGAIN。操作映射、策略错误与 context 生命周期由[业务授权](authorization.md)定义。
+基础数据操作各自完成一次请求；FileSession 保留 File/NodeReference 与中立控制状态，显式 S/X 另有 Session、Owner、grant 与动作历史。handler 只接受 `locked.New` 验证过的配对 backend，其 `LockService()` 就是绑定原生发布检查的授权方，不能从另一份 storage 单独提供控制服务。控制状态、恢复与拒绝规则见[文件锁设计](file-locks.md)。可选 Authorizer 先按业务身份和语义决定准入，再访问 capability、Log 与 backend；通用有界请求／响应容量可先返回 EAGAIN。操作映射、策略错误与 context 生命周期由[业务授权](authorization.md)定义。
 
 ## 二、请求的形状
 
@@ -38,23 +38,23 @@ volume、保留文件与显式占有的权威持有者。将原生 storage 与�
 
 | 操作 | 方法与路径 | 操作数 | 请求体 |
 |---|---|---|---|
-| `Stat` | `GET /v3/stat` | `path` | — |
-| `SetAttr` | `POST /v3/setattr` | `path` | 要改的属性，JSON |
-| `List` | `GET /v3/list` | `path` | — |
-| `Read` | `GET /v3/read` | `path` | — |
-| `Write` | `POST /v3/write` | `path` | 文件内容 |
-| `Create` | `POST /v3/create` | `path` | — |
-| `Mkdir` | `POST /v3/mkdir` | `path` | — |
-| `Remove` | `POST /v3/remove` | `path` | — |
-| `RemoveDir` | `POST /v3/removedir` | `path` | — |
-| `Rename` | `POST /v3/rename` | `path`（源）、`to` | — |
-| `Space` | `GET /v3/space` | 无 | — |
-| `Subscribe` | `GET /v3/subscribe` | 无 | — |
-| `Resubscribe` | `GET /v3/resubscribe` | `incarnation`、`position` | — |
-| `Snapshot` | `GET /v3/snapshot` | 无 | — |
-| `Checkpoint` | `GET /v3/checkpoint` | 无 | — |
-| 保留文件数据 | `POST /v3/file` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带 session/file 能力与参数 |
-| 文件会话与 advisory 控制 | `POST /v3/file-control` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带原动作身份及 owner |
+| `Stat` | `GET /v4/stat` | `path` | — |
+| `SetAttr` | `POST /v4/setattr` | `path` | 要改的属性，JSON |
+| `List` | `GET /v4/list` | `path` | — |
+| `Read` | `GET /v4/read` | `path` | — |
+| `Write` | `POST /v4/write` | `path` | 文件内容 |
+| `Create` | `POST /v4/create` | `path` | — |
+| `Mkdir` | `POST /v4/mkdir` | `path` | — |
+| `Remove` | `POST /v4/remove` | `path` | — |
+| `RemoveDir` | `POST /v4/removedir` | `path` | — |
+| `Rename` | `POST /v4/rename` | `path`（源）、`to` | — |
+| `Space` | `GET /v4/space` | 无 | — |
+| `Subscribe` | `GET /v4/subscribe` | 无 | — |
+| `Resubscribe` | `GET /v4/resubscribe` | `incarnation`、`position` | — |
+| `Snapshot` | `GET /v4/snapshot` | 无 | — |
+| `Checkpoint` | `GET /v4/checkpoint` | 无 | — |
+| 保留文件数据 | `POST /v4/file` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带 session/file 能力与参数 |
+| 文件会话、Scope、owner 与范围控制 | `POST /v4/file-control` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带原动作身份及 owner |
 
 volume 路径以 `url.Values` 的转义走 query string，任意字节序列都逐字往返。根是 `path=`：一个存在且为空的操作数。`Space` 描述整个 volume 而不是某个路径底下的东西，因此它一个操作数都不带；带了 `path=` 的 `Space` 请求与多带了任何操作数的请求一样，是请求错误。
 
@@ -62,13 +62,13 @@ volume 路径以 `url.Values` 的转义走 query string，任意字节序列都�
 
 解析是严格的：query 解析不了、操作数缺失、同一个操作数出现两次、出现了这个操作不要的操作数，都是请求错误。这几种情况在 `url.Values` 里读出来都是空字符串，而空字符串是根。
 
-`Prefix` 为 `/v3/`，相对于 handler 被挂载的位置，挂到别处用 `http.StripPrefix`。v3 在既有 mutation barrier JSON 之外要求配对的锁授权方，并增加严格的控制消息与 mutation scope。server 不提供旧协议路由，client 同时验证路径版本与响应标记；旧服务端不能通过忽略 proof 接受受保护的修改。十三个 JSON POST 控制端点与 scope 编码见[文件锁协议](file-locks.md#http-v3-编码)，它们不把 capability 放入 query string。保留文件能力、Open 确认、动作历史、会话续期与 advisory 控制见[打开的文件](file-handles.md#五http复制与资源)。
+`Prefix` 为 `/v4/`，相对于 handler 被挂载的位置，挂到别处用 `http.StripPrefix`。v4 使用中立 Attr/metadata、范围与附加能力 DTO，保留配对的锁授权方、mutation barrier、原 file journal/ACK 与严格控制消息。server 不提供旧协议路由，client 同时验证路径版本与响应标记；旧服务端不能通过忽略 proof 接受受保护的修改。十三个 JSON POST 控制端点与 scope 编码见[文件锁协议](file-locks.md#http-v4-编码)，它们不把 capability 放入 query string。保留文件能力、Open 确认、动作历史、会话续期与 advisory 控制见[打开的文件](file-handles.md#五http复制与资源)。
 
 ## 三、响应的形状
 
 每个响应带两个头：
 
-- `Remote-Fs-Protocol: 3` —— 标记这是本协议的服务端给出的答案。
+- `Remote-Fs-Protocol: 4` —— 标记这是本协议的服务端给出的答案。
 - `Cache-Control: no-store` —— 一个被缓存住的答案读起来与当前的答案没有区别。
 
 | 情形 | 状态 | 体 |
@@ -86,25 +86,35 @@ volume 路径以 `url.Values` 的转义走 query string，任意字节序列都�
 | 请求解析不了、请求体不完整 | `400` | `{"message":"…"}` |
 | 复制那三个操作成功 | `200` | 一串 server-sent event，`Content-Type: text/event-stream`（见第五节） |
 
-handler 用 `MaxBodyBytes` 限制基础 volume 的 non-write 请求与 non-streaming 响应，用 `MaxWriteBytes` 单独限制 `Write` 的文件内容；package options 中后者为零时继承前者，显式值必须为正且不大于前者。过大的 `Write` 在调用 storage 之前以 `EFBIG` 返回，过大的 `SetAttr` body 是 `413`。协议定义为 bodyless 的操作只探测是否出现第一个字节，任何非空 body 都是 `400`，不会按声明长度保留内容。过大的 `Read` 是 `EFBIG`；无法在 `MaxBodyBytes` 内编码的 `List` 是 `EIO`。错误响应也必须装进 `MaxBodyBytes`，过长的 detail 会换成固定诊断，协议 marker 与 errno 不丢失。锁控制单独使用固定 16 KiB body 与独立 operation / waiter admission，编码与预算见[锁协议](file-locks.md#控制准入与取消)。
+handler 用 `MaxBodyBytes` 限制基础 volume 的 non-write 请求与 non-streaming 响应，用 `MaxWriteBytes` 单独限制 `Write` 的文件内容；package options 中后者为零时继承前者，显式值必须为正且不大于前者。过大的 `Write` 在调用 storage 之前以 `EFBIG` 返回，过大的 `SetAttr` body 是 `413`。协议定义为 bodyless 的操作只探测是否出现第一个字节，任何非空 body 都是 `400`，不会按声明长度保留内容。过大的 `Read` 是 `EFBIG`；无法在 `MaxBodyBytes` 内编码的 `List` 是 `EIO`。错误响应也必须装进 `MaxBodyBytes`，过长的 detail 会换成固定诊断，协议 marker 与 errno 不丢失。Strong 锁控制单独使用固定 16 KiB body 与独立 operation / waiter admission，编码与预算见[锁协议](file-locks.md#控制准入与取消)。
 
 `200` 是唯一的成功状态，`422` 是唯一承载 errno 的状态。它表示 server 已经得到一个可命名的操作结果：来自 storage、来自调用 storage 前就能权威判定的 `EFBIG`/`EAGAIN` 资源拒绝，或来自已经成功的 mutation 之后无法取得 barrier 的 `EIO`。最后一种不能退回成功：volume 已改变，但 server 无法给 replicated client 一条证明副本何时包含它的界线。errno 不编码进状态码 —— 状态码空间与 errno 空间不同构。
 
 **每个 non-streaming 响应都显式声明 `Content-Length`，失败响应也不例外。** 这是顶层设计第四节「响应体的分帧必须能报告自己提前结束」那条义务在这一侧的落地：一个以连接关闭为终点的响应体，被截断与完整无从分辨，因此不被接受。SSE response 不声明整条 stream 的长度，它靠每个 frame 的明确边界与终止语义区分完整和截断。
 
-**缺席与零值必须分辨得开。** `Stat` 响应里的 `attr`、以及每个目录条目里的 `attr`，都是可以在报文里缺席的字段，而缺席就是解码失败 —— 一个零值的属性读起来是「一个模式为 0、长度为 0、时间停在 1970 年的普通文件」，与一份合法的答案分辨不开。`entries` 同理：`null` 与 `[]` 相差两个字符，意思相反。mutation response 必须是一个只允许可选 `barrier` 字段的 JSON object：没有 change log 的 volume 返回 `{}`；有 log 时 barrier 必须存在，且带非空 incarnation 与非负 position，位置 0 也是合法的初始 barrier。incarnation 的 protocol ceiling 是 256 bytes；handler 再按 `MaxBodyBytes` 与 `MaxFrameBytes` 的 worst-case JSON escaping 计算同一份更紧预算，stream start 与 mutation barrier 都用它，保证合法 identity 在两条路径上一致且一定装得进各自边界。`null`、缺字段、未知字段或错误类型都不是成功答案；普通 remote storage 接受无 barrier 的 `{}`，replicated client 使用的 `*WithBarrier` 方法必须取得并验证它。
+**缺席与零值必须分辨得开。** Stat、目录 entry、原子打开/创建/改名的必需 Attr 缺席即失败；NameRemove/NameRemoveDir 的已知成功允许空 NameResult。entries 的空目录是 `[]`，不是 null。基础 mutation response 是只含可选 barrier 的 object，无 log 时为 `{}`；有 log 时必须提供非空 incarnation 与非负 position，位置零也是合法值。
+
+incarnation 的 protocol ceiling 为 256 字节，handler 再按 body/frame worst-case escaping 选更紧预算，stream start 与 mutation barrier 共用。null、缺必需字段、未知字段或错误类型不是成功；直接 client 可接受无 log 的 `{}`，replicated 的 WithBarrier 必须取得并验证真实进度。
 
 容量报告里的三个数各自也是可缺席的字段，而这里的理由更硬：它们是字节数，零对每一个都是合法答案 —— 一份什么都没装的 volume 已用为零，一份装满的可写入量为零 —— 所以一旦当成普通字段读进来，缺席与零就再也分不开，而一份掉了字段的报告读起来恰好是「没有剩余空间」，足以让每一次写入停下。解码还要判定这三个数能不能同时为真，判不成立同样是解码失败：它们最终要进内核回复的无符号字段，在那里一个负数是一个巨大的正数（R-ERR-2）。
 
 目录条目的名字以原始字节编码（JSON 里是 base64）。文件名是任意字节序列，不是文本。
 
-`Attr` 的 `id` 是节点身份（R-FS-5）：一个不透明的无符号整数，只可比较相等，随节点走过改名。**它是这里唯一一个零值不响的字段**，因此由解码拒绝：模式为 0 是合法答案、纪元时刻也是有人设得出来的值，所以别处的拒绝针对的是整个 `attr` 缺席；而身份为 0 在挂载点那边每次比较都相等，于是一个不发这个字段的对端不会被读成「什么都没说」，会被读成「所有节点都是同一个节点」。
+Attr 的 id 是非零、不透明的 NodeID，kind 是普通文件/目录/符号链接的中立枚举；解码校验字段存在性、取值和种类/长度一致性。access_time、mod_time 为必需的 `{unix_sec,nanos}`，birth_time、change_time 为可选事实，缺席表示未知。秒与纳秒分开保存 time.Time 的范围，不用 UnixNano 截断远期/早期时间。
 
-`Attr` 的 `mode` 是 Go `io/fs.FileMode` 的位布局。两个时间 —— `access_time` 与 `mod_time` —— 各是一个对象，`unix_sec` 是自 Unix 纪元起的整秒数，`nanos` 是该秒之内的纳秒数。单独一个纳秒数装不下这两个字段要承载的范围 —— `time.Time.UnixNano` 只在 1678-09-21 到 2262-04-11 之间有定义，范围之外的时间（零值的 `time.Time` 也在其中）会变成另一个看上去完全合理的日期，且没有任何东西标出它是错的。秒与纳秒合成一个对象而不是并排两个字段，是因为 `SetAttr` 的请求里每个时间都可以整个缺席，而两个各自可空的字段能互相矛盾。
+Attr 的 metadata 是原始 namespace payload 及 authority version 的映射，不含 Go FileMode；返回版本必须非空。FileMutation.Metadata 的请求值是独立 CAS 操作数：version 为空 base64 字符串表示期望 namespace 缺席，data 也可为空，成功后由 authority 返回实际版本。两种形状分别校验 namespace、重复/未知字段、规范 base64、非 null 与既有大小上限，不能用结果版本规则拒绝合法的缺席条件。SetAttr 修改共同时间；平台 metadata 更新通过对应能力操作完成，不能把旧 mode 字段当兼容别名。
 
 `SetAttr` 的请求体是 `{"change":{…}}`，`change` 里每个属性都是可选的：缺席就是「这一项不改」。`change` 本身缺席则是解码失败 —— 一个什么都不点名的改动是合法请求（它在问这个节点还在不在），因此靠字段本身分辨不出报文是不是掉了内容，外面这一层对象才分辨得出来。
 
-保留文件的响应 envelope 按操作携带 FileSession 状态、引用能力、属性、字节、advisory 结果与可选 barrier，不能套用基础 mutation 的空 object 规则。Data 与 Path 使用 base64 字节字段；时间间隔以整数纳秒编码。Open 先返回有期限的待确认能力，client 完成确认才交给调用方；未确认引用与关闭的动作记录受 registry 上限约束。完整形状与核对边界见[文件协议](file-handles.md#五http复制与资源)。
+保留文件的响应 envelope 按操作携带 FileSession 状态、引用能力、属性、字节、中立范围结果与可选 barrier，不能套用基础 mutation 的空 object 规则。Data 与 Path 使用 base64 字节字段；时间间隔以整数纳秒编码。Open 先返回有期限的待确认能力，client 完成确认才交给调用方；未确认引用与关闭的动作记录受 registry 上限约束。完整形状与核对边界见[文件协议](file-handles.md#五http复制与资源)。
+
+文件能力的 opcode 仍在 file/file-control 下分发：OpenAt、NodeReference、LookupAt、ReadDirNode、MutateName、metadata、pending 和条件文件修改走 `/v4/file`；session-open 同样走 `/v4/file`；其余 session 控制、ACK/Close、Scope、UseOwner 与 RangeControl 走 `/v4/file-control`。文件控制完整 envelope 至多 256 KiB，不能沿用 Strong 的 16 KiB 限额。接口能力在会话建立时逐项报告，底层缺失不由 handler 用多次路径操作补全。 directoryMetadata/referenceName 两项可选标志分别广告目录 metadata 与引用名字观察；HTTP 自有 `file-observe-directory-metadata`、`file-observe-name` 仍走 `/v4/file` 的只读数据准入，固定授权为 replication.snapshot，不产生 action、ACK 或 barrier。
+
+目录观察请求的 directoryMetadata 携带 Guards/IncludeName，引用名字请求使用 guards；结果分别为 directory 的可选 Name 和 standalone nameObservation。Root/Linked/Detached 的字段组合、目标 NodeID、请求的 IncludeName 均严格核对，错误丢弃整份观察。名字前缀按实际原始叶长、驻留及 JSON/base64 编码在加载前计量；本地 sizing callback 不序列化为远端 per-call 限额，数值边界由 ResultBytes/MaxBody 与目录 ListResult 传递。
+
+名字能力支持时，旧 OpenFile/OpenNode 在原打开回执增加已捕获 node scalar，支持标志缺席时保持旧形状。server 用无 I/O ReferenceIdentity 核对全部打开的 ExpectedID/NodeID 或原子结果 Attr.ID，client 再核对请求；getter/身份失败按已打开结果的 EIO/cleanup 所有权处理，不补做属性或名字查询。
+
+五类中立错误还带经过严格校验的 capabilityCode：use/range conflict、pending delete、condition conflict 与 invalid scope；errno 与 errors.Is 分类保持一致，journal 回放不丢该类别。未知分类或与 errno 不一致的 envelope 为协议错误，业务授权失败仍使用可信的普通 EACCES/EIO，不泄露底层控制状态。
 
 ## 四、错误如何离开 server
 
@@ -154,9 +164,9 @@ SQLite metastore 把普通 volume/log read 与长期 snapshot 放进两个 reade
 
 ### 快照后的 checkpoint
 
-`httprest.Storage.Checkpoint(ctx)` 通过 `GET /v3/checkpoint` 取得原子日志水位。响应是现有 MutationBarrier 的裸 `{incarnation,position}` object，和成功修改回复里的 barrier 使用同一 identity／position 验证；它不代表某个特定修改。请求不带操作数或 body，client／server 都使用普通请求响应预算、协议标记与封闭 errno 检查。
+`httprest.Storage.Checkpoint(ctx)` 通过 `GET /v4/checkpoint` 取得原子日志水位。响应是现有 MutationBarrier 的裸 `{incarnation,position}` object，和成功修改回复里的 barrier 使用同一 identity／position 验证；它不代表某个特定修改。请求不带操作数或 body，client／server 都使用普通请求响应预算、协议标记与封闭 errno 检查。
 
-handler 先按 `storage.OpReplicationCheckpoint` 授权，再调用纯 `Log.Barrier`；缺少 Log 在允许之后返回 ENOSYS。该读取不调用 storage mutation，不唤醒 publisher，不分配订阅、snapshot 或 page 名额。快照响应先关闭再发出 checkpoint，构建因此只需要原订阅和另一条普通 HTTP 连接。client 持续使用原订阅追到固定水位，构建状态由[client 设计](../client/architecture.md#二元数据查询来自本地副本)拥有。
+handler 先按 `storage.OpReplicationCheckpoint` 授权，再调用纯 `Log.Barrier`；缺少 Log 在允许之后返回 ENOSYS。该读取不调用 storage mutation，不唤醒 publisher，不分配订阅、snapshot 或 page 名额。快照响应先关闭再发出 checkpoint，构建因此只需要原订阅和另一条普通 HTTP 连接。client 持续使用原订阅追到固定水位，构建状态由[client 设计](../client/architecture.md#二元数据副本与权威读取)拥有。
 
 ## 六、请求与响应的内存边界
 
@@ -166,9 +176,11 @@ handler 在读取 body 前取得 request operation 与 byte admission。`Write` 
 
 HTTP handler 只接受实现 `storage.BoundedStorage` 的 volume。constructor 在服务请求前调用 `CheckBounded`；任一依赖无法在实际产生结果时接受预算，启动就直接失败。`ReadBounded` 在完整 payload 分配前知道 byte bound，超限以 `EFBIG` 失败。`ListBounded` 按顺序把 entry 加入调用方的 `ListResult`；`ListResult` 用 HTTP 表示的精确逐条 charge 计数，并在保留那条超限 entry 之前以 `EIO` 失败。backend 不得先建立完整的超限 `[]byte` 或 `[]Entry` 中间结果。
 
-`Read` 与 `List` 的 wire format 仍是一份 non-streaming response，在发出前保留一份配置内的完整结果。每个非流式操作在调用 storage 前都取得 response operation 与 byte admission；`Read` 与 `List` 按 `4 * MaxBodyBytes` 预留，覆盖 storage entries、wire conversion、encoded body 与它们同时存在的保守峰值，其余固定结果操作按 `MaxBodyBytes` 预留，使得同时产生的最大错误 JSON 也在 aggregate 上限内。response 等待者已满时，`Stat`、`Write`、`Create` 等操作也会在到达 storage 前以 `EAGAIN` 失败；`Write` 与 `SetAttr` 还不会读取 request body。context cancellation 会退出等待并释放计数。
+`Read` 与 `List` 的 wire format 仍是一份 non-streaming response，在发出前保留一份配置内的完整结果。每个非流式操作在调用 storage 前都取得 response operation 与 byte admission；`Stat`、`Read` 与 `List` 按 `4 * MaxBodyBytes` 预留，覆盖 storage entries、wire conversion、encoded body 与它们同时存在的保守峰值，其余固定结果操作按 `MaxBodyBytes` 预留，使得同时产生的最大错误 JSON 也在 aggregate 上限内。response 等待者已满时，`Stat`、`Write`、`Create` 等操作也会在到达 storage 前以 `EAGAIN` 失败；`Write` 与 `SetAttr` 还不会读取 request body。context cancellation 会退出等待并释放计数。
 
 启用业务授权时，stream 入口的 callback 与拒绝响应也取得通用 response admission；允许后释放，再取得 Log、订阅与 snapshot 资源，长连接不持续占用该名额。未配置 hook 的 stream 不增加这项占用。授权和生命周期顺序见[业务授权](authorization.md)。
+
+FileStorage producer 还履行请求级 AttrResultBudget：handler 从 ResultBytes 与 server/control 上限取得有效预算，在载入目标 metadata 或产生将返回该 Attr 的修改/引用前检查。callback 只看固定 scalar 和规范 metadata 长度，不执行 I/O/重入；内部父观察不当作返回目标收费。MetadataRetentionBytes 与 JSON 上界共同覆盖 decoded map，而不是只计算 base64 字节。ReadDirNodeBounded 同样在原始名字/metadata 载入前 Reserve，失败清空结果；Range Apply 对完整 Commands/Claims/Effects reply 先行预算。
 
 默认资源上限为：
 
@@ -205,9 +217,11 @@ Azure 形态依赖部署方分别提供和运维 Blob container、数据库及�
 
 - 支持保留文件的 backend 以权威 `Usage` 报告已命名与 detached 的合计用量；只有路径 API 的 backend 在打开时遍历计量。遍历前先调用 `CheckBounded`，每个目录经 `ListBounded` 逐项计量；当前目录的 `Entry` 与名字、尚待访问的完整目录路径分别受独立 byte bound 约束，默认各为 64 MiB。目录预算在保留越界 entry 前拒绝，frontier 预算包含当前正在访问的目录；任一上限不足都以 `EIO` 使整次计量失败，不提交部分结果。HTTP body 上限不参与 volume measurement。
 - 原生 backend 的 `CheckPublicationAccounting` 能力把实际新旧长度与效果交给发布计费。增长在效果发生前预留，超限以 `EDQUOT` 拒绝；确定 Applied 后才释放缩短额度，即使随后返回确认错误也按实际效果结算。NotApplied 退回增长预留；volume 效果不明，或结算、撤销带 `IsPublicationAccountingUncertain` 时保留保守账本并使 Space、修改与 Recount 报错，直到重新打开。scope、FileStorage 与锁服务传给同一原生 backend，最后一个 detached 引用的释放同样结算实际效果。原有验收由[缩短提交后释放配额](../../../.agents/notes/implemented/bug-fix/2026-09-07-release-shrunk-quota-after-commit.md)拥有。
-- 让 volume 变小的修改从不被拒绝，已经超出配额时也不拒绝 —— 否则一个超额的 volume 没有任何回到配额之内的路。
+- limited 的额度检查不因已超配额而拒绝缩减内容的修改；其它权限、原生结果与资源预算仍须成立。
 - 配额不得低于一个 4096 字节的块：再小的配额会被报成一个零块的文件系统，那读起来是一块没有剩余空间的盘，而不是一个空间很小的 volume。
 - 所有路径修改携带原生计费 hook，在最终发布处取得实际大小与效果；wrapper 不通过路径 Stat 或 stripe 协调修改。`Recount` 使用相同 measurement limits，并与自主引用回收的计费 revision 核对；最多八次重测后仍有交错则返回 `EAGAIN`。超限、取消或 listing 失败保留原计数，已经不确定的账本不能靠在线重数解除隔离。随附二进制没有 recount 入口。
+
+原生 MaintenanceAccounting 还把绑定维护 chain 与 quota 初始化放在同一个 commit gate。活引用继续使用创建时捕获的 cleanup chain；旧 incarnation 的有界 pending 恢复才取得当前维护 chain，不能把两份所有权叠加结算。有名 pending 清理在 Strong 初始化后正常申请发布，schema 启动阶段不提前 unlink。
 
 HTTP 与 replicated 不把 Go context 中的计费 hook 传到远端发布，`limited` 不能包在这些客户端外执行远端配额；配额在服务端原生 backend 一侧配置。对象暂存可先于最终额度判定，`EDQUOT` 不撤销此前的上传成本，暂存与回收继续受已有对象资源预算约束。构造范围见[原生发布计费](../../../.agents/notes/implemented/bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)。
 
@@ -217,7 +231,9 @@ HTTP 与 replicated 不把 Go context 中的计费 hook 传到远端发布，`li
 
 SQLite metastore 还给 reserved、unresolved 与 garbage object records 的合计数量和 payload bytes 配置独立阈值。一个 payload 自身超过 byte threshold 时 `Reserve` 返回 `EFBIG`；请求本身能装下、但现有 backlog 使新记录越界时返回 `EAGAIN`。`Put` 失败时 reservation 转成 unresolved；这类结果没有 ownership proof，不会因为时间经过而被删除。已经存在的 volume 修改仍可产生 garbage 并把 backlog 推到阈值之上，此时新 reservation 保持拒绝，garbage 清扫与删除继续运行。package 默认值与 `-max-pending-objects`、`-max-pending-bytes` 用于 Azure 和本地形态；本地组合还通过 `Config.ObjectLimits` 暴露覆盖值，见 [`local-disk-object-store.md`](local-disk-object-store.md#七容量与资源上限)。两种 metastore-backed 形态同样使用有界 SQLite reader pool；package 默认为 16，独立 server 以 `-max-reader-connections` 配置。
 
-SQLite 打开与 `ObjectStatus` 验证每个 volume 的 named 节点形成 rooted tree：root 没有 incoming entry，其余 named 节点恰有一个同 volume 的名字且从 root 可达。detached 只能是非 root 的普通文件，不得有名字或参与目录边；其它孤儿、cycle 与跨 volume entry 以 `EIO` 拒绝。`volumes.used` 必须是非负整数，并等于对所有 regular-file size 做 overflow-checked streaming sum 的结果。SQLite 的动态 storage class 也属于完整性：文件名必须是非空 BLOB，标量字段保持声明的整数/文本/可空类型，detached 为 0 或 1，内容 revision 为正；change kind 与 nullable node/from groups、mode/size/time 范围必须彼此一致。否则 cursor order、NULL coercion 或 fabricated reconciliation 可以把损坏记录变成一次成功但缺行/零值的复制结果，因此都在开放 volume 或 history 前拒绝。
+SQLite 打开与 `ObjectStatus` 验证每个 volume 的 named 节点形成 rooted tree：root 没有 incoming entry，其余 named 节点恰有一个同 volume 的名字且从 root 可达。detached 必须是受保留规则允许的非 root 节点，不得有名字或参与目录边，detached 目录必须为空；其它孤儿、cycle 与跨 volume entry 以 `EIO` 拒绝。`volumes.used` 必须是非负整数，并等于对所有普通文件内容及符号链接目标 size 做 overflow-checked streaming sum 的结果。SQLite 的动态 storage class 也属于完整性：文件名必须是非空 BLOB，标量字段保持声明的整数/文本/可空类型，detached 为 0 或 1，内容 revision 为正；change kind 与 nullable node/from groups、NodeKind/size/time/metadata 范围必须彼此一致。否则 cursor order、NULL coercion 或 fabricated reconciliation 可以把损坏记录变成一次成功但缺行/零值的复制结果，因此都在开放 volume 或 history 前拒绝。
+
+v6 的 volumes.metadata_used 独立计量节点（含 detached）及 retained changes 的 metadata/link-target 编码总长，SQL triggers 覆盖创建、更新、复制、裁剪与物理删除。Options.MaxMetadataBytes 默认 64 MiB；增长超限为 EFBIG，计数/长度/类型不一致为错误，不把它混成内容 Used 或只在 HTTP 解码后收费。
 
 SQLite 的 `database_state` 另持有数据库 identity、提交 generation，以及 node ID 与全局 change position 的持久高水位。ID 从高水位显式分配，`sqlite_sequence` 是同事务推进的冗余记录。durable-state validation 通过 expression indexes 的类型 discriminator 与最大 identity 边界读取全数据库 surviving references，打开、checkpoint 与每个 `Since` page 都要求 sequence 一致且任一 volume 的引用不超过高水位；每次分配也重新核对 sequence，change append 还要求当前 committed tail 严格小于新位置。每条 retained change 另保存同 volume 的 `previous_position`：第一条指向 `trimmed_through`，相邻记录逐条相连，最后一条等于 `committed_position`。位置是全数据库分配的，volume 内允许被其它 volume 留下空洞，完整性因此检查前驱链而不检查算术连续。`Open`、`Snapshot` 与 `ObjectStatus` 在暴露 volume 前验证受 `MaxIntegrityRecords` 限制的完整链；`Since` 用索引锚定 page 起点并执行 O(page) predecessor validation，缺口所在页整体失败，stream error 使 consumer 作废副本。同一 incarnation/position 的续订会在该缺口持续失败，直到持久日志被带外修复或出现合法 rebuild boundary。断链、tail 不一致或高水位回退都不生成新 incarnation 掩盖损坏。
 

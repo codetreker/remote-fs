@@ -3,7 +3,6 @@ package locked_test
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"reflect"
 	"syscall"
 	"testing"
@@ -13,6 +12,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 	"github.com/codetreker/remote-fs/packages/storage/locked"
+	"github.com/codetreker/remote-fs/packages/storage/storagetest"
 )
 
 func TestNewRequiresAnEnforcingBackend(t *testing.T) {
@@ -149,7 +149,7 @@ func TestFacadeScopesOnlyMutationsAndPreservesErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := locking.WithScope(t.Context(), scope)
-	mode := fs.FileMode(0o600)
+	modified := time.Unix(1700000000, 0).UTC()
 	for _, operation := range []struct {
 		name     string
 		mutation bool
@@ -161,7 +161,7 @@ func TestFacadeScopesOnlyMutationsAndPreservesErrors(t *testing.T) {
 		{"remove", true, func() error { return view.Remove(ctx, "file") }},
 		{"remove directory", true, func() error { return view.RemoveDir(ctx, "dir") }},
 		{"rename", true, func() error { return view.Rename(ctx, "from", "to") }},
-		{"attributes", true, func() error { return view.SetAttr(ctx, "file", storage.AttrChange{Mode: &mode}) }},
+		{"attributes", true, func() error { return view.SetAttr(ctx, "file", storage.AttrChange{ModTime: &modified}) }},
 		{"stat", false, func() error { _, err := view.Stat(ctx, "file"); return err }},
 		{"read", false, func() error { _, err := view.Read(ctx, "file"); return err }},
 		{"bounded read", false, func() error { _, err := view.ReadBounded(ctx, "file", 1); return err }},
@@ -286,4 +286,14 @@ func TestExplicitAnonymousContextClearsAnInheritedScope(t *testing.T) {
 	if err != nil || string(content) != "protected" {
 		t.Fatalf("anonymous rejection changed content: %q, %v", content, err)
 	}
+}
+
+func TestMetadataContract(t *testing.T) {
+	storagetest.RunMetadata(t, func(t *testing.T) storage.Storage {
+		facade, err := locked.New(pairedBackend(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return facade
+	})
 }

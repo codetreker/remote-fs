@@ -16,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
@@ -32,6 +33,14 @@ const databaseName = "metastore.sqlite"
 
 func TestStorageContract(t *testing.T) {
 	storagetest.Run(t, func(t *testing.T) storage.Storage {
+		store := open(t, testConfig(privateRoot(t)))
+		t.Cleanup(func() { closeStore(t, store) })
+		return store
+	})
+}
+
+func TestMetadataContract(t *testing.T) {
+	storagetest.RunMetadata(t, func(t *testing.T) storage.Storage {
 		store := open(t, testConfig(privateRoot(t)))
 		t.Cleanup(func() { closeStore(t, store) })
 		return store
@@ -197,77 +206,88 @@ func TestContentPersistsAcrossRestart(t *testing.T) {
 }
 
 func TestSweepRetriesGarbageAfterBackgroundFailure(t *testing.T) {
-	config := testConfig(privateRoot(t))
-	store := open(t, config)
-	t.Cleanup(func() { closeStore(t, store) })
-	if err := store.Write(t.Context(), "obsolete", []byte("garbage payload")); err != nil {
-		t.Fatal(err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		config := testConfig(privateRoot(t))
+		store := open(t, config)
+		t.Cleanup(func() { closeStore(t, store) })
+		if err := store.Write(t.Context(), "obsolete", []byte("garbage payload")); err != nil {
+			t.Fatal(err)
+		}
 
-	database := rawDatabase(t, filepath.Join(config.Root, databaseName), true)
-	var key string
-	if err := database.QueryRowContext(t.Context(),
-		`SELECT key FROM objects WHERE state = 1`).Scan(&key); err != nil {
-		t.Fatal(err)
-	}
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
-	}
-	digest := sha256.Sum256([]byte(key))
-	shard := filepath.Join(config.Root, "objects", hex.EncodeToString(digest[:1]))
-	object := filepath.Join(shard, "k"+base64.RawURLEncoding.EncodeToString([]byte(key)))
-	if err := os.Chmod(shard, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	shardRestored := false
-	t.Cleanup(func() {
-		if !shardRestored {
-			_ = os.Chmod(shard, 0o700)
+		database := rawDatabase(t, filepath.Join(config.Root, databaseName), true)
+		var key string
+		if err := database.QueryRowContext(t.Context(),
+			`SELECT key FROM objects WHERE state = 1`).Scan(&key); err != nil {
+			t.Fatal(err)
+		}
+		if err := database.Close(); err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256([]byte(key))
+		shard := filepath.Join(config.Root, "objects", hex.EncodeToString(digest[:1]))
+		object := filepath.Join(shard, "k"+base64.RawURLEncoding.EncodeToString([]byte(key)))
+		if err := os.Chmod(shard, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		shardRestored := false
+		t.Cleanup(func() {
+			if !shardRestored {
+				_ = os.Chmod(shard, 0o700)
+			}
+		})
+
+		if err := store.Remove(t.Context(), "obsolete"); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.NewTimer(5 * time.Second)
+		defer deadline.Stop()
+		for store.MaintenanceStatus().LastSweepError == nil {
+			select {
+			case <-deadline.C:
+				t.Fatal("background maintenance did not retain the shard-permission failure")
+			default:
+				time.Sleep(time.Millisecond)
+			}
+		}
+		if _, err := os.Stat(object); err != nil {
+			t.Fatalf("failed background maintenance removed the object: %v", err)
+		}
+
+		synctest.Wait()
+		if err := os.Chmod(shard, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		shardRestored = true
+		removed, err := store.Sweep(t.Context(), 1)
+		if err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+		if removed != 1 {
+			t.Fatalf("Sweep removed %d objects, want 1", removed)
+		}
+		if _, err := os.Stat(object); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("Sweep left the garbage object behind: %v", err)
+		}
+		status, err := store.Status(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.Objects.GarbageCount != 0 || status.Maintenance.LastSweepError != nil ||
+			status.Maintenance.LastSweepRemoved != 1 {
+			t.Fatalf("Status after Sweep = %+v", status)
+		}
+		if err := store.Write(t.Context(), "next-sweep", nil); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		latest := store.MaintenanceStatus()
+		if latest.LastSweepError != nil || latest.LastSweepRemoved != 0 {
+			t.Fatalf("later empty background sweep = %+v, want the latest successful zero-removal result", latest)
+		}
+		if removed, err := store.Sweep(t.Context(), -1); removed != 0 || !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("negative Sweep returned %d, %v; want 0, EINVAL", removed, err)
 		}
 	})
-
-	if err := store.Remove(t.Context(), "obsolete"); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.NewTimer(5 * time.Second)
-	defer deadline.Stop()
-	for store.MaintenanceStatus().LastSweepError == nil {
-		select {
-		case <-deadline.C:
-			t.Fatal("background maintenance did not retain the shard-permission failure")
-		default:
-			time.Sleep(time.Millisecond)
-		}
-	}
-	if _, err := os.Stat(object); err != nil {
-		t.Fatalf("failed background maintenance removed the object: %v", err)
-	}
-
-	if err := os.Chmod(shard, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	shardRestored = true
-	removed, err := store.Sweep(t.Context(), 1)
-	if err != nil {
-		t.Fatalf("Sweep: %v", err)
-	}
-	if removed != 1 {
-		t.Fatalf("Sweep removed %d objects, want 1", removed)
-	}
-	if _, err := os.Stat(object); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("Sweep left the garbage object behind: %v", err)
-	}
-	status, err := store.Status(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status.Objects.GarbageCount != 0 || status.Maintenance.LastSweepError != nil ||
-		status.Maintenance.LastSweepRemoved != 1 {
-		t.Fatalf("Status after Sweep = %+v", status)
-	}
-	if removed, err := store.Sweep(t.Context(), -1); removed != 0 || !errors.Is(err, syscall.EINVAL) {
-		t.Fatalf("negative Sweep returned %d, %v; want 0, EINVAL", removed, err)
-	}
 }
 
 func TestCorruptReferencedObjectStateFailsBeforeStartupSweep(t *testing.T) {

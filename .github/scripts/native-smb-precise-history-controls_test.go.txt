@@ -1,0 +1,788 @@
+package windows
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/smb"
+	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/transport/httprest"
+)
+
+type preciseTestFixture struct {
+	authority *nativeAuthority
+	history   *preciseHistory
+	remote    *httprest.Storage
+	stream    *preciseHistoryStream
+	file      storage.File
+	request   storage.RenameRequest
+	action    storage.FileActionID
+}
+
+func preciseTestAction(t *testing.T) storage.FileActionID {
+	t.Helper()
+	id, err := storage.NewFileActionID(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func preciseTestTarget(t *testing.T, parent storage.File, name string) storage.EntryTarget {
+	t.Helper()
+	at, err := parent.Stat(t.Context(), storage.ObservationOptions{IncludeLocation: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := storage.EntryTarget{Parent: parent.Reference(), ParentID: at.Attr.ID, Name: []byte(name), DirectoryRevision: at.Attr.DirectoryRevision, Witness: at.Location}
+	page, err := parent.ListAt(t.Context(), storage.DirectoryPageRequest{Revision: at.Attr.DirectoryRevision, MaxEntries: 64, MaxBytes: storage.MaxDirectoryPageBytes})
+	if err != nil || !page.Done {
+		t.Fatalf("complete target observation: %v %+v", err, page)
+	}
+	for _, entry := range page.Entries {
+		if string(entry.Name) == name {
+			result.ExpectedEntryID = entry.EntryID
+			result.ExpectedNodeID = entry.Attr.ID
+			result.ExpectedMetadataRevision = entry.Attr.MetadataRevision
+		}
+	}
+	return result
+}
+
+func preciseTestSetup(t *testing.T) *preciseTestFixture {
+	t.Helper()
+	a := newNativeAuthority()
+	handler, err := httprest.NewHandler(a, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(func() {
+		handler.Stop()
+		server.Close()
+		if err := handler.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	remote, err := httprest.Dial(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := remote.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := session.Close(context.Background(), preciseTestAction(t)); err != nil {
+			t.Error(err)
+		}
+	})
+	retained, err := session.Retain(t.Context(), storage.RetainRequest{NodeID: 1}, preciseTestAction(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := session.Reference(t.Context(), retained.Reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := func(parent storage.File, name string, kind storage.NodeKind) storage.File {
+		result, err := session.CreateAndRetainAt(t.Context(), storage.CreateAndRetainRequest{Target: preciseTestTarget(t, parent, name), Initial: storage.NodeInitial{Kind: kind}, Claim: storage.AccessClaim{Uses: storage.AllAccessUses}}, preciseTestAction(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		file, err := session.Reference(t.Context(), result.Reference)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return file
+	}
+	parent := create(root, "v", storage.NodeDirectory)
+	create(parent, "target", storage.NodeRegular)
+	file := create(parent, "replacement", storage.NodeRegular)
+	request := storage.RenameRequest{Source: preciseTestTarget(t, parent, "replacement"), Destination: preciseTestTarget(t, parent, "target")}
+	h := newPreciseHistory(a)
+	source := h.wrap(smb.ChangeSource{Subscribe: func(ctx context.Context) (smb.ChangeStream, error) { return remote.Subscribe(ctx) }, Resume: func(ctx context.Context, g metastore.Incarnation, p metastore.Position) (smb.ChangeStream, error) {
+		return remote.Resubscribe(ctx, g, p)
+	}, Checkpoint: func(ctx context.Context) (metastore.LogBarrier, error) {
+		b, err := remote.Checkpoint(ctx)
+		return metastore.LogBarrier{Incarnation: metastore.Incarnation(b.Incarnation), Position: metastore.Position(b.Position)}, err
+	}})
+	lifetime, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	t.Cleanup(cancel)
+	stream, err := source.Subscribe(lifetime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := h.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := h.Prepare(t.Context(), remote); err != nil {
+		t.Fatal(err)
+	}
+	action := preciseTestAction(t)
+	if err := h.Arm(file, request, action); err != nil {
+		t.Fatal(err)
+	}
+	return &preciseTestFixture{a, h, remote, stream.(*preciseHistoryStream), file, request, action}
+}
+
+func preciseTestRename(t *testing.T, f *preciseTestFixture) (storage.FileActionReceipt, *httprest.MutationBarrier) {
+	t.Helper()
+	receipt, barrier, err := f.file.(httprest.FileWithBarrier).RenameWithBarrier(t.Context(), f.request, f.action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return receipt, barrier
+}
+
+func TestPreciseHistoryHTTPBinding(t *testing.T) {
+	f := preciseTestSetup(t)
+	receipt, barrier := preciseTestRename(t, f)
+	if !f.history.begun || !f.history.ended || !f.history.finalized || f.history.acknowledged {
+		t.Fatal("actual hook capture is incomplete")
+	}
+	if f.history.events[0].Notification.After != nil || f.history.events[0].Node != nil {
+		t.Fatal("removal acquired an invented after-image")
+	}
+	removedBefore := f.history.events[0].Notification.Before.Location.Ancestors
+	renamedBefore := f.history.events[1].Notification.Before.Location.Ancestors
+	if removedBefore[len(removedBefore)-1].DirectoryRevision != renamedBefore[len(renamedBefore)-1].DirectoryRevision {
+		t.Fatal("test does not exercise same-prestate before images")
+	}
+	if err := f.history.Acknowledge(receipt, barrier, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The original action receipt can replay, but no callback can mint a new P/Q.
+	replay, replayBarrier := preciseTestRename(t, f)
+	if (!preciseReceiptMatches(receipt, f.history.receipt) || !preciseReceiptMatches(replay, f.history.receipt)) || !preciseSame(barrier, replayBarrier) || f.authority.position() != f.history.after {
+		t.Fatal("replay changed captured interval")
+	}
+	for i := 0; i < 2; i++ {
+		event, err := f.stream.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof, err := f.stream.RetainNotificationProof(event)
+		if err != nil || proof == nil {
+			t.Fatalf("proof: %v", err)
+		}
+		mapped, err := smb.DiagnosticMapNotifications(event, 1, 31, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := proof.Validate(t.Context(), 1, event.Position, 31, true, mapped); err != nil {
+			t.Fatal(err)
+		}
+		proof.Release()
+	}
+	if !f.history.published || f.history.snapshot != nil || f.history.events != nil {
+		t.Fatal("bounded snapshot was not transferred and released")
+	}
+	for _, record := range f.stream.registry {
+		if record.refs != 0 {
+			t.Fatal("queued ownership retained")
+		}
+	}
+}
+
+func TestPreciseHistoryAcknowledgmentRefusals(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*preciseTestFixture, *storage.FileActionReceipt, **httprest.MutationBarrier) *error
+	}{
+		{"missing barrier", func(_ *preciseTestFixture, _ *storage.FileActionReceipt, b **httprest.MutationBarrier) *error {
+			*b = nil
+			return nil
+		}},
+		{"larger barrier", func(_ *preciseTestFixture, _ *storage.FileActionReceipt, b **httprest.MutationBarrier) *error {
+			(*b).Position++
+			return nil
+		}},
+		{"earlier barrier", func(_ *preciseTestFixture, _ *storage.FileActionReceipt, b **httprest.MutationBarrier) *error {
+			(*b).Position--
+			return nil
+		}},
+		{"wrong incarnation", func(_ *preciseTestFixture, _ *storage.FileActionReceipt, b **httprest.MutationBarrier) *error {
+			(*b).Incarnation = "other"
+			return nil
+		}},
+		{"wrong action", func(_ *preciseTestFixture, r *storage.FileActionReceipt, _ **httprest.MutationBarrier) *error {
+			r.Action = "other"
+			return nil
+		}},
+		{"unknown receipt", func(_ *preciseTestFixture, r *storage.FileActionReceipt, _ **httprest.MutationBarrier) *error {
+			r.State = 0
+			return nil
+		}},
+		{"wrong effect", func(_ *preciseTestFixture, r *storage.FileActionReceipt, _ **httprest.MutationBarrier) *error {
+			r.Effects = storage.EffectContentChanged
+			return nil
+		}},
+		{"changed observation", func(_ *preciseTestFixture, r *storage.FileActionReceipt, _ **httprest.MutationBarrier) *error {
+			r.Observation.Attr.ID++
+			return nil
+		}},
+		{"missing original capture", func(f *preciseTestFixture, _ *storage.FileActionReceipt, _ **httprest.MutationBarrier) *error {
+			f.history.finalized = false
+			return nil
+		}},
+		{"closed owner", func(f *preciseTestFixture, _ *storage.FileActionReceipt, _ **httprest.MutationBarrier) *error {
+			f.history.closed = true
+			return nil
+		}},
+		{"cancelled HTTP result", func(_ *preciseTestFixture, _ *storage.FileActionReceipt, _ **httprest.MutationBarrier) *error {
+			err := error(context.Canceled)
+			return &err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := preciseTestSetup(t)
+			receipt, barrier := preciseTestRename(t, f)
+			original := nativeReceiptCopy(receipt)
+			var operationErr error
+			if err := tc.mutate(f, &receipt, &barrier); err != nil {
+				operationErr = *err
+			}
+			if err := f.history.Acknowledge(receipt, barrier, operationErr); err == nil {
+				t.Fatal("invalid corroboration admitted")
+			}
+			if f.history.acknowledged {
+				t.Fatal("failure minted provenance")
+			}
+			f.authority.mu.Lock()
+			stored := f.authority.sessions[0].actions[f.action]
+			f.authority.mu.Unlock()
+			if !preciseReceiptMatches(original, stored.result) || stored.err != nil {
+				t.Fatal("diagnostic failure changed successful mutation")
+			}
+		})
+	}
+}
+
+func TestPreciseHistorySnapshotRefusals(t *testing.T) {
+	f := preciseTestSetup(t)
+	base := make([]metastore.Row, 0, len(f.history.snapshot))
+	for _, row := range f.history.snapshot {
+		base = append(base, row)
+	}
+	slices.SortFunc(base, func(a, b metastore.Row) int { return int(a.Node.ID - b.Node.ID) })
+	cases := []struct {
+		name   string
+		change func([]metastore.Row) []metastore.Row
+	}{
+		{"empty", func(_ []metastore.Row) []metastore.Row { return nil }},
+		{"node bound", func(rows []metastore.Row) []metastore.Row { return append(rows, make([]metastore.Row, 65)...) }},
+		{"payload bound", func(rows []metastore.Row) []metastore.Row {
+			rows[3].Node.LinkTarget = make([]byte, preciseMaxBytes)
+			return rows
+		}},
+		{"duplicate node", func(rows []metastore.Row) []metastore.Row { return append(rows, rows[1]) }},
+		{"duplicate entry", func(rows []metastore.Row) []metastore.Row { rows[3].EntryID = rows[2].EntryID; return rows }},
+		{"invalid Windows name", func(rows []metastore.Row) []metastore.Row { rows[3].Name = []byte("CON"); return rows }},
+		{"case collision", func(rows []metastore.Row) []metastore.Row { rows[3].Name = []byte("TARGET"); return rows }},
+		{"missing parent", func(rows []metastore.Row) []metastore.Row { rows[3].Parent = 99; return rows }},
+		{"file parent", func(rows []metastore.Row) []metastore.Row { rows[3].Parent = rows[2].Node.ID; return rows }},
+		{"cycle", func(rows []metastore.Row) []metastore.Row { rows[1].Parent = rows[1].Node.ID; return rows }},
+		{"missing root", func(rows []metastore.Row) []metastore.Row { return rows[1:] }},
+		{"bad root entry", func(rows []metastore.Row) []metastore.Row { rows[0].EntryID = 8; return rows }},
+		{"negative size", func(rows []metastore.Row) []metastore.Row { rows[3].Node.Size = -1; return rows }},
+		{"missing metadata revision", func(rows []metastore.Row) []metastore.Row { rows[3].Node.MetadataRevision = 0; return rows }},
+		{"file directory revision", func(rows []metastore.Row) []metastore.Row { rows[3].Node.DirectoryRevision = 1; return rows }},
+		{"regular link target", func(rows []metastore.Row) []metastore.Row { rows[3].Node.LinkTarget = []byte("bad"); return rows }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := preciseRows(tc.change(slices.Clone(base))); err == nil {
+				t.Fatal("invalid preimage admitted")
+			}
+		})
+	}
+}
+
+func TestPreciseHistoryIntervalRefusals(t *testing.T) {
+	f := preciseTestSetup(t)
+	preciseTestRename(t, f)
+	h := f.history
+	cases := []struct {
+		name   string
+		change func([]metastore.Change) []metastore.Change
+	}{
+		{"missing", func(e []metastore.Change) []metastore.Change { return e[:1] }},
+		{"extra", func(e []metastore.Change) []metastore.Change { return append(e, e[1]) }},
+		{"duplicate", func(e []metastore.Change) []metastore.Change { e[1] = e[0]; return e }},
+		{"reverse", func(e []metastore.Change) []metastore.Change { e[0], e[1] = e[1], e[0]; return e }},
+		{"gap", func(e []metastore.Change) []metastore.Change { e[1].Position++; return e }},
+		{"wrong before revision", func(e []metastore.Change) []metastore.Change {
+			e[1].Notification.Before.Location.Ancestors[1].DirectoryRevision++
+			return e
+		}},
+		{"wrong before entry", func(e []metastore.Change) []metastore.Change {
+			e[0].Notification.Before.Location.Ancestors[1].EntryID++
+			return e
+		}},
+		{"wrong after parent revision", func(e []metastore.Change) []metastore.Change {
+			e[1].Notification.After.Location.Ancestors[1].DirectoryRevision++
+			return e
+		}},
+		{"wrong after ancestor identity", func(e []metastore.Change) []metastore.Change {
+			e[1].Notification.After.Location.Ancestors[0].EntryID++
+			return e
+		}},
+		{"removed synthetic after", func(e []metastore.Change) []metastore.Change {
+			e[0].Notification.After = e[0].Notification.Before
+			return e
+		}},
+		{"wrong subject", func(e []metastore.Change) []metastore.Change { e[1].Notification.SubjectID++; return e }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			events := make([]metastore.Change, 2)
+			for i, e := range h.events {
+				copy, err := preciseCopyChange(e)
+				if err != nil {
+					t.Fatal(err)
+				}
+				events[i] = copy
+			}
+			if err := preciseInterval(h.snapshot, h.before, h.after, h.request, tc.change(events)); err == nil {
+				t.Fatal("invalid atomic interval admitted")
+			}
+		})
+	}
+}
+
+func TestPreciseHistoryMutationCaptureRefusals(t *testing.T) {
+	cases := []struct {
+		name   string
+		change func(*preciseTestFixture)
+	}{
+		{"wrong session", func(f *preciseTestFixture) { f.history.session++ }},
+		{"wrong reference", func(f *preciseTestFixture) { f.history.reference++ }},
+		{"wrong fingerprint", func(f *preciseTestFixture) { f.history.fingerprint[0] ^= 1 }},
+		{"preposition changed", func(f *preciseTestFixture) { f.history.before-- }},
+		{"wrong source incarnation", func(f *preciseTestFixture) { f.history.incarnation = "other" }},
+		{"duplicate capture", func(f *preciseTestFixture) { f.history.begun = true }},
+		{"wrong request", func(f *preciseTestFixture) { f.history.request.Destination.Name = []byte("other") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := preciseTestSetup(t)
+			tc.change(f)
+			receipt, barrier := preciseTestRename(t, f)
+			if receipt.State != storage.FileActionCompleted || receipt.Effects != storage.EffectEntryMoved {
+				t.Fatal("probe changed successful mutation")
+			}
+			if err := f.history.Acknowledge(receipt, barrier, nil); err == nil {
+				t.Fatal("capture mismatch admitted")
+			}
+		})
+	}
+	t.Run("replay without original capture", func(t *testing.T) {
+		f := preciseTestSetup(t)
+		receipt, barrier := preciseTestRename(t, f)
+		f.history.begun = false
+		f.history.ended = false
+		f.history.finalized = false
+		f.history.events = nil
+		replay, replayBarrier := preciseTestRename(t, f)
+		if (!preciseReceiptMatches(receipt, f.history.receipt) || !preciseReceiptMatches(replay, f.history.receipt)) || !preciseSame(barrier, replayBarrier) {
+			t.Fatal("replay changed mutation")
+		}
+		if err := f.history.Acknowledge(replay, replayBarrier, nil); err == nil || f.history.begun {
+			t.Fatal("replay minted missing interval")
+		}
+	})
+	t.Run("unrelated mutation advances P", func(t *testing.T) {
+		f := preciseTestSetup(t)
+		// A real unrelated namespace action advances the captured pre-position.
+		now := time.Now().UTC()
+		if _, err := f.authority.sessions[0].SetNodeAttr(t.Context(), 1, storage.AttrChange{ModTime: &now}, preciseTestAction(t)); err != nil {
+			t.Fatal(err)
+		}
+		receipt, barrier := preciseTestRename(t, f)
+		if err := f.history.Acknowledge(receipt, barrier, nil); err == nil {
+			t.Fatal("intervening mutation admitted")
+		}
+	})
+}
+
+func TestPreciseHistoryProofOwnership(t *testing.T) {
+	f := preciseTestSetup(t)
+	receipt, barrier := preciseTestRename(t, f)
+	if err := f.history.Acknowledge(receipt, barrier, nil); err != nil {
+		t.Fatal(err)
+	}
+	event, err := f.stream.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapped, err := smb.DiagnosticMapNotifications(event, 1, 31, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retain := func() *preciseProof {
+		t.Helper()
+		proof, err := f.stream.RetainNotificationProof(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return proof.(*preciseProof)
+	}
+	for _, tc := range []struct {
+		name      string
+		root      uint64
+		position  metastore.Position
+		filter    uint32
+		recursive bool
+		events    []wire.Notification
+	}{
+		{"wrong root", 2, event.Position, 31, true, mapped},
+		{"wrong position", 1, event.Position + 1, 31, true, mapped},
+		{"wrong filter", 1, event.Position, 1, true, mapped},
+		{"nonrecursive", 1, event.Position, 31, false, mapped},
+		{"missing mapped detail", 1, event.Position, 31, true, nil},
+		{"invented mapped detail", 1, event.Position, 31, true, []wire.Notification{{Action: 2, Name: "other"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proof := retain()
+			defer proof.Release()
+			if err := proof.Validate(t.Context(), tc.root, tc.position, tc.filter, tc.recursive, tc.events); err == nil {
+				t.Fatal("unbound delivery admitted")
+			}
+		})
+	}
+	t.Run("changed event retain", func(t *testing.T) {
+		changed := event
+		changed.Name = []byte("other")
+		if _, err := f.stream.RetainNotificationProof(changed); err == nil {
+			t.Fatal("forged event retained")
+		}
+	})
+	t.Run("reference bound", func(t *testing.T) {
+		proofs := make([]*preciseProof, 8)
+		for i := range proofs {
+			proofs[i] = retain()
+		}
+		if _, err := f.stream.RetainNotificationProof(event); err == nil {
+			t.Error("excess proof admitted")
+		}
+		for _, proof := range proofs {
+			proof.Release()
+		}
+	})
+	t.Run("cancelled validation", func(t *testing.T) {
+		proof := retain()
+		defer proof.Release()
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if !errors.Is(proof.Validate(ctx, 1, event.Position, 31, true, mapped), context.Canceled) {
+			t.Fatal("cancel ignored")
+		}
+	})
+	t.Run("released token", func(t *testing.T) {
+		proof := retain()
+		proof.Release()
+		if err := proof.Validate(t.Context(), 1, event.Position, 31, true, mapped); err == nil {
+			t.Fatal("released token reused")
+		}
+	})
+	t.Run("source generation", func(t *testing.T) {
+		proof := retain()
+		defer proof.Release()
+		f.history.mu.Lock()
+		f.history.generation++
+		f.history.mu.Unlock()
+		if err := proof.Validate(t.Context(), 1, event.Position, 31, true, mapped); err == nil {
+			t.Fatal("old generation admitted")
+		}
+		f.history.mu.Lock()
+		f.history.generation--
+		f.history.mu.Unlock()
+	})
+	t.Run("close does not wait for queued references", func(t *testing.T) {
+		proof := retain()
+		if err := f.stream.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := proof.Validate(t.Context(), 1, event.Position, 31, true, mapped); err == nil {
+			t.Fatal("closed source admitted")
+		}
+		proof.Release()
+	})
+}
+
+func TestPreciseHistoryShutdownRace(t *testing.T) {
+	f := preciseTestSetup(t)
+	receipt, barrier := preciseTestRename(t, f)
+	if err := f.history.Acknowledge(receipt, barrier, nil); err != nil {
+		t.Fatal(err)
+	}
+	event, err := f.stream.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapped, err := smb.DiagnosticMapNotifications(event, 1, 31, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range 8 {
+		proof, err := f.stream.RetainNotificationProof(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wg.Go(func() {
+			<-start
+			err := proof.Validate(context.Background(), 1, event.Position, 31, true, mapped)
+			if err != nil && !errors.Is(err, smb.ErrNotifyRescan) {
+				t.Error(err)
+			}
+			proof.Release()
+		})
+	}
+	close(start)
+	if err := f.stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	f.stream.mu.Lock()
+	defer f.stream.mu.Unlock()
+	if f.stream.pins != 0 || !f.stream.closed || len(f.stream.registry) != 0 {
+		t.Fatal("source shutdown retained registry or admitted validation")
+	}
+}
+
+type preciseTestStream struct {
+	events []metastore.Change
+	index  int
+	done   chan struct{}
+	once   sync.Once
+	second chan struct{}
+}
+
+func (s *preciseTestStream) Next() (metastore.Change, error) {
+	if s.index >= len(s.events) {
+		<-s.done
+		return metastore.Change{}, context.Canceled
+	}
+	event := s.events[s.index]
+	s.index++
+	if s.index == 2 && s.second != nil {
+		close(s.second)
+	}
+	return event, nil
+}
+func (s *preciseTestStream) Close() error                     { s.once.Do(func() { close(s.done) }); return nil }
+func (*preciseTestStream) Incarnation() metastore.Incarnation { return "fake" }
+func (*preciseTestStream) Position() metastore.Position       { return 0 }
+
+func TestPreciseHistoryWholeIntervalDelivery(t *testing.T) {
+	for _, mode := range []string{"wait for acknowledgment", "mismatched actual second", "gap actual second", "close while waiting", "missing actual second"} {
+		t.Run(mode, func(t *testing.T) {
+			f := preciseTestSetup(t)
+			receipt, barrier := preciseTestRename(t, f)
+			events := make([]metastore.Change, 2)
+			for i, event := range f.history.events {
+				copy, err := preciseCopyChange(event)
+				if err != nil {
+					t.Fatal(err)
+				}
+				events[i] = copy
+			}
+			if mode == "mismatched actual second" {
+				events[1].Name = []byte("forged")
+			}
+			if mode == "gap actual second" {
+				events[1].Position++
+			}
+			if mode == "missing actual second" {
+				events = events[:1]
+			}
+			if err := f.stream.upstream.Close(); err != nil {
+				t.Fatal(err)
+			}
+			fake := &preciseTestStream{events: events, done: make(chan struct{}), second: make(chan struct{})}
+			f.stream.upstream = fake
+			result := make(chan error, 1)
+			go func() { _, err := f.stream.Next(); result <- err }()
+			if mode == "missing actual second" {
+				if err := f.stream.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if err := <-result; err == nil {
+					t.Fatal("missing second event delivered")
+				}
+				return
+			}
+			<-fake.second
+			if mode == "wait for acknowledgment" {
+				select {
+				case err := <-result:
+					t.Fatalf("interval escaped before HTTP acknowledgment: %v", err)
+				case <-time.After(5 * time.Millisecond):
+				}
+				if err := f.history.Acknowledge(receipt, barrier, nil); err != nil {
+					t.Fatal(err)
+				}
+				if err := <-result; err != nil {
+					t.Fatal(err)
+				}
+			} else if mode == "close while waiting" {
+				if err := f.stream.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if err := <-result; err == nil {
+					t.Fatal("closed source delivered")
+				}
+			} else {
+				if err := f.history.Acknowledge(receipt, barrier, nil); err != nil {
+					t.Fatal(err)
+				}
+				if err := <-result; err == nil {
+					t.Fatal("invalid delivered interval exposed a prefix")
+				}
+			}
+		})
+	}
+}
+
+type preciseTruncatedSnapshotWriter struct{ http.ResponseWriter }
+
+func (w preciseTruncatedSnapshotWriter) Write(data []byte) (int, error) {
+	if bytes.Contains(data, []byte("event: done")) {
+		return len(data), nil
+	}
+	return w.ResponseWriter.Write(data)
+}
+func (w preciseTruncatedSnapshotWriter) Flush() { w.ResponseWriter.(http.Flusher).Flush() }
+
+func TestPreciseHistorySnapshotMustReachSemanticEOF(t *testing.T) {
+	f := preciseTestSetup(t)
+	handler, err := httprest.NewHandler(f.authority, f.authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(preciseTruncatedSnapshotWriter{w}, r) }))
+	t.Cleanup(func() {
+		handler.Stop()
+		server.Close()
+		if err := handler.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	remote, err := httprest.Dial(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	history := &preciseHistory{authority: f.authority, incarnation: f.history.incarnation, ready: make(chan struct{})}
+	if err := history.Prepare(t.Context(), remote); err == nil {
+		t.Fatal("transport EOF stood in for semantic EOF")
+	}
+	if history.snapshot != nil || history.snapshotCount != 0 {
+		t.Fatal("partial snapshot retained")
+	}
+}
+
+func TestPreciseHistorySnapshotSourceIncarnation(t *testing.T) {
+	f := preciseTestSetup(t)
+	h := &preciseHistory{authority: f.authority, incarnation: "different", ready: make(chan struct{})}
+	if err := h.Prepare(t.Context(), f.remote); err == nil || h.snapshot != nil {
+		t.Fatal("snapshot bound to a different source incarnation")
+	}
+}
+
+func TestPreciseHistoryEvidenceOwnsBoundedFacts(t *testing.T) {
+	f := preciseTestSetup(t)
+	receipt, barrier := preciseTestRename(t, f)
+	if err := f.history.Acknowledge(receipt, barrier, nil); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := f.stream.Next(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evidence := f.history.Evidence()
+	if !evidence.Published || evidence.Error != "" || evidence.EvidenceBytes <= 0 || evidence.EvidenceBytes > preciseMaxEvidenceBytes || evidence.Fingerprint != evidence.StoredFingerprint {
+		t.Fatalf("incomplete evidence: %+v", evidence)
+	}
+	var rows []metastore.Row
+	var captured, delivered []metastore.Change
+	var request storage.RenameRequest
+	var stored storage.FileActionReceipt
+	var acknowledgment struct {
+		Receipt storage.FileActionReceipt
+		Barrier *httprest.MutationBarrier
+		Error   string
+	}
+	for _, field := range []struct {
+		data   []byte
+		target any
+	}{
+		{evidence.Payload.PreSnapshot, &rows}, {evidence.Payload.CapturedEvents, &captured},
+		{evidence.Payload.DeliveredEvents, &delivered}, {evidence.Payload.Request, &request},
+		{evidence.Payload.StoredReceipt, &stored}, {evidence.Payload.Acknowledgment, &acknowledgment},
+	} {
+		if len(field.data) == 0 {
+			t.Fatal("missing raw evidence")
+		}
+		if err := json.Unmarshal(field.data, field.target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tree, err := preciseRows(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preciseInterval(tree, evidence.Before, evidence.After, request, captured); err != nil {
+		t.Fatal("archived interval cannot be verified:", err)
+	}
+	if !preciseSame(captured, delivered) || !preciseReceiptMatches(acknowledgment.Receipt, stored) || acknowledgment.Error != "" || !preciseSame(acknowledgment.Barrier, barrier) {
+		t.Fatal("archived capture and source/HTTP outcomes disagree")
+	}
+	owned := f.history.Evidence()
+	evidence.Payload.CapturedEvents[0] = '!'
+	if bytes.Equal(evidence.Payload.CapturedEvents, owned.Payload.CapturedEvents) || !bytes.Equal(owned.Payload.CapturedEvents, f.history.Evidence().Payload.CapturedEvents) {
+		t.Fatal("evidence aliases source-owned bytes")
+	}
+	if err := f.history.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cleanup := f.history.Evidence()
+	if !cleanup.Closed || cleanup.SourceCount != 0 || cleanup.EvidenceBytes != 0 || len(cleanup.Payload.PreSnapshot) != 0 || len(cleanup.Payload.CapturedEvents) != 0 {
+		t.Fatal("owner cleanup retained serialized facts")
+	}
+	if !json.Valid(owned.Payload.CapturedEvents) {
+		t.Fatal("source cleanup invalidated the archived owned snapshot")
+	}
+}
+
+func TestPreciseHistoryEvidenceBoundPreservesFirstFacts(t *testing.T) {
+	h := &preciseHistory{}
+	if err := h.saveEvidenceLocked(&h.evidence.PreSnapshot, []int{1}); err != nil {
+		t.Fatal(err)
+	}
+	first := bytes.Clone(h.evidence.PreSnapshot)
+	if err := h.saveEvidenceLocked(&h.evidence.PreSnapshot, []int{2}); err == nil || !bytes.Equal(first, h.evidence.PreSnapshot) {
+		t.Fatal("earlier evidence overwritten")
+	}
+	h.evidenceBytes = preciseMaxEvidenceBytes
+	if err := h.saveEvidenceLocked(&h.evidence.Request, []int{3}); !errors.Is(err, syscall.EFBIG) || len(h.evidence.Request) != 0 {
+		t.Fatal("evidence bound admitted excess retained bytes")
+	}
+}

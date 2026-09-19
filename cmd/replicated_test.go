@@ -2,6 +2,8 @@ package cmd_test
 
 import (
 	"bytes"
+	"errors"
+	"github.com/codetreker/remote-fs/packages/storage"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,11 +13,11 @@ import (
 	"time"
 )
 
-// Tree lookups and directory entries use the local replica. Identity-based attributes
-// are confirmed by the authority so an existing inode cannot describe a replacement.
-func TestWalkingAMountedTreeCachesNamesAndConfirmsIdentityAttributes(t *testing.T) {
+// Mounted namespace operations are authoritative; direct path metadata remains
+// cached in the replica and preserves the authority's node identities.
+func TestWalkingAMountedTreeUsesAuthoritativeNamesAndCachedMetadata(t *testing.T) {
 	s := serveVolume(t)
-	a := mountpointOn(t, s)
+	a, copy := mountVolumeOn(t, s)
 
 	// A tree with a couple of levels, made through the mountpoint so that what is walked is
 	// what a program would have put there.
@@ -60,29 +62,16 @@ func TestWalkingAMountedTreeCachesNamesAndConfirmsIdentityAttributes(t *testing.
 		}
 	}
 
-	if arrived := s.calls.sinceExcept(before, fileStatNodeCall, fileRenewCall); arrived != "" {
-		t.Fatalf("walking a copied tree sent unexpected named/data requests: %s", arrived)
-	}
-	identityStats := s.calls.snapshot()[fileStatNodeCall] - before[fileStatNodeCall]
-	if identityStats == 0 {
-		t.Fatal("inode attributes were never confirmed by identity")
-	}
-	t.Logf("walked %d nodes and checked 4 absent names: zero named stat/list requests, %d authoritative identity stats", len(walked), identityStats)
+	assertMetadataTraversal(t, s.calls, before, 4, 0)
+	assertCopiedPathMetadata(t, copy, s, walked, []string{"src/missing.go", "src/inner/missing.go", "docs/missing.md", "missing"})
+
 }
 
-// TestADirectoryRenameKeepsTheIdentitiesBeneathIt.
-//
-// A directory rename is one row in the log and one row in the copy: the nodes beneath keep
-// the parent they always had, so nothing under the renamed directory is fetched again and
-// nothing under it changes identity. An event that had only said "something under this name
-// changed" would have forced the copy to discard the subtree and walk it again — and renaming
-// directories is what build tools, version control and package managers do constantly.
-//
-// The inode numbers are what a program sees of that identity. Anything holding a file open
-// across the rename, and anything that remembers what it has already visited, reads them.
+// Renaming a directory preserves the identities beneath it. Authoritative
+// namespace reads and the cached path view must agree on the moved subtree.
 func TestADirectoryRenameKeepsTheIdentitiesBeneathIt(t *testing.T) {
 	s := serveVolume(t)
-	a := mountpointOn(t, s)
+	a, copy := mountVolumeOn(t, s)
 
 	for _, dir := range []string{"before", "before/inner"} {
 		if err := os.Mkdir(filepath.Join(a, dir), 0o755); err != nil {
@@ -119,11 +108,9 @@ func TestADirectoryRenameKeepsTheIdentitiesBeneathIt(t *testing.T) {
 		t.Fatalf("the moved subtree lists %v, want [g]", got)
 	}
 
-	// The rename is the only named mutation; inode attributes still use identity queries.
-	if arrived := s.calls.sinceExcept(before, fileStatNodeCall, fileRenewCall); arrived != "rename×1" {
-		t.Fatalf("renaming a directory and reading its copied subtree sent %q, want only one named rename", arrived)
-	}
-	t.Logf("renamed and inspected the subtree with %d authoritative identity stats", s.calls.snapshot()[fileStatNodeCall]-before[fileStatNodeCall])
+	assertMetadataTraversal(t, s.calls, before, 1, 1)
+	assertCopiedPathMetadata(t, copy, s, []string{"after", "after/inner", "after/f", "after/inner/g"}, []string{"before"})
+
 }
 
 // ENOSYS selects direct remote operations when a handler does not publish replication.
@@ -145,7 +132,7 @@ func TestAVolumeWithoutPublishedLogIsMountedWithoutACopy(t *testing.T) {
 		t.Fatalf("stat a.txt: %v", err)
 	}
 	arrived := s.calls.since(before)
-	if s.calls.snapshot()["stat"] == before["stat"] {
+	if s.calls.snapshot()[fileLookupCall] == before[fileLookupCall] {
 		t.Fatalf("a stat without published replication sent %q to the server, and with no copy behind it it has nowhere else to come from", arrived)
 	}
 	t.Logf("one stat through the mountpoint: %s", arrived)
@@ -326,5 +313,48 @@ func TestAStatOfAPathIsNotAnsweredFromSomebodyElsesDescriptor(t *testing.T) {
 	// same file: nothing renamed over the name, so its length is the current one.
 	if own, err := held.Stat(); err != nil || own.Size() != int64(len(grown)) {
 		t.Fatalf("fstat on the held descriptor reports %v (%v), want %d", own, err, len(grown))
+	}
+}
+
+func assertMetadataTraversal(t *testing.T, calls *calls, before map[string]int, directories, mutations int) {
+	t.Helper()
+	calls.waitFileCloses(t, before[fileCloseCall]+directories)
+	after := calls.snapshot()
+	for _, operation := range []string{fileOpenNodeRefCall, fileAckCall, fileScopeCall, fileReadDirectoryCall, fileCloseCall} {
+		if got := after[operation] - before[operation]; got != directories {
+			t.Fatalf("directory traversal sent %s %d times, want one per directory (%d)", operation, got, directories)
+		}
+	}
+	if got := after[fileMutateNameCall] - before[fileMutateNameCall]; got != mutations {
+		t.Fatalf("namespace mutations=%d, want %d", got, mutations)
+	}
+	if after[fileLookupCall] == before[fileLookupCall] || after[fileStatNodeCall] == before[fileStatNodeCall] {
+		t.Fatal("namespace lookup and inode attributes were not confirmed by the authority")
+	}
+	if arrived := calls.sinceExcept(before, fileStatNodeCall, fileRenewCall, fileLookupCall, fileOpenNodeRefCall, fileAckCall, fileScopeCall, fileReadDirectoryCall, fileCloseCall, fileMutateNameCall); arrived != "" {
+		t.Fatalf("metadata traversal sent unexpected content, mutation or replication requests: %s", arrived)
+	}
+}
+
+func assertCopiedPathMetadata(t *testing.T, copy storage.Storage, server *volumeServer, present, absent []string) {
+	t.Helper()
+	before := server.calls.snapshot()
+	for _, name := range present {
+		expected, err := server.authoritative.Stat(t.Context(), name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := copy.Stat(t.Context(), name)
+		if err != nil || got.ID != expected.ID || got.Kind != expected.Kind || got.Size != expected.Size || !got.AccessTime.Equal(expected.AccessTime) || !got.ModTime.Equal(expected.ModTime) {
+			t.Fatalf("copied path %q = %+v, %v; authority=%+v", name, got, err, expected)
+		}
+	}
+	for _, name := range absent {
+		if _, err := copy.Stat(t.Context(), name); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("copied missing path %q: %v", name, err)
+		}
+	}
+	if arrived := server.calls.sinceExcept(before, fileRenewCall); arrived != "" {
+		t.Fatalf("copied path metadata reached the authority: %s", arrived)
 	}
 }

@@ -6,8 +6,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -82,8 +84,30 @@ func TestSignalInterruptsARequestWithoutBreakingTheMount(t *testing.T) {
 			request := &interruptedStat{name: "file", entered: make(chan context.Context, 1)}
 			release := make(chan struct{})
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				op, err := httprest.ParseRequest(r.Method, r.URL)
-				if err == nil && op.Op == httprest.OpStat && op.Path == request.name {
+				var control struct {
+					Op    storage.Operation  `json:"op"`
+					Child *storage.ChildName `json:"child"`
+				}
+				if r.Body != nil && r.Method == http.MethodPost {
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Errorf("reading held lookup request: %v", err)
+						http.Error(w, "request read failed", http.StatusInternalServerError)
+						return
+					}
+					if err := r.Body.Close(); err != nil {
+						t.Errorf("closing held lookup request: %v", err)
+						http.Error(w, "request close failed", http.StatusInternalServerError)
+						return
+					}
+					r.Body = io.NopCloser(bytes.NewReader(body))
+					if err := json.Unmarshal(body, &control); err != nil {
+						t.Errorf("decoding held lookup request: %v", err)
+						http.Error(w, "request decode failed", http.StatusInternalServerError)
+						return
+					}
+				}
+				if control.Op == storage.OpFileLookupAt && control.Child != nil && string(control.Child.RawLeaf) == request.name {
 					request.mu.Lock()
 					hold := !request.held
 					request.held = true
@@ -243,4 +267,28 @@ func runSignalChild(t *testing.T, mode string) {
 	if err != nil || string(body) != "still readable" {
 		t.Fatalf("reading after interruption: %q, %v", body, err)
 	}
+}
+
+func (s *observedStatStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+	session, err := s.FileStorage.NewFileSession(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &observedStatSession{capableTestSession: testSessionCapabilities(session), request: s.request}, nil
+}
+
+type observedStatSession struct {
+	capableTestSession
+	request *interruptedStat
+}
+
+func (s *observedStatSession) LookupAt(ctx context.Context, name storage.ChildName) (storage.Attr, error) {
+	if string(name.RawLeaf) == s.request.name {
+		s.request.mu.Lock()
+		if s.request.ctx == nil {
+			s.request.ctx = ctx
+		}
+		s.request.mu.Unlock()
+	}
+	return s.NamespaceAccess.LookupAt(ctx, name)
 }

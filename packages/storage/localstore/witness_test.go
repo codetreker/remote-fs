@@ -6,10 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -96,9 +96,29 @@ func prepareWitnessChild(t *testing.T) (*Store, metastore.Snap, witnessAcknowled
 	if err := store.Write(t.Context(), witnessAcknowledgedName, []byte(witnessAcknowledgedContents)); err != nil {
 		t.Fatal(err)
 	}
-	mode := fs.FileMode(0o640)
+	node, err := store.Stat(t.Context(), witnessAcknowledgedName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := store.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, ok := session.(storage.MetadataAccess)
+	if !ok {
+		t.Fatal("file session cannot update opaque metadata")
+	}
+	if err := metadata.CheckMetadataAccess(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metadata.SetMetadata(t.Context(), node.ID, "test.witness", nil, []byte("acknowledged metadata")); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	atime, mtime := time.Unix(1700000011, 123456789).UTC(), time.Unix(1700000022, 987654321).UTC()
-	if err := store.SetAttr(t.Context(), witnessAcknowledgedName, storage.AttrChange{Mode: &mode, AccessTime: &atime, ModTime: &mtime}); err != nil {
+	if err := store.SetAttr(t.Context(), witnessAcknowledgedName, storage.AttrChange{AccessTime: &atime, ModTime: &mtime}); err != nil {
 		t.Fatal(err)
 	}
 	attr, err := store.Stat(t.Context(), witnessAcknowledgedName)
@@ -128,7 +148,7 @@ func requireWitnessAcknowledgment(t *testing.T, store *Store, ack witnessAcknowl
 	if err != nil {
 		t.Fatal(err)
 	}
-	if attr.ID != ack.Attr.ID || attr.Mode != ack.Attr.Mode || attr.Size != ack.Attr.Size ||
+	if attr.ID != ack.Attr.ID || attr.Kind != ack.Attr.Kind || !reflect.DeepEqual(attr.Metadata, ack.Attr.Metadata) || attr.Size != ack.Attr.Size ||
 		!attr.AccessTime.Equal(ack.Attr.AccessTime) || !attr.ModTime.Equal(ack.Attr.ModTime) {
 		t.Fatalf("acknowledged attributes changed: got %+v, want %+v", attr, ack.Attr)
 	}
@@ -210,8 +230,8 @@ func killWitnessChild(t *testing.T, root, phase, testName string) witnessAcknowl
 	if err != nil || info.Size() <= 32 {
 		t.Fatalf("killed child left no WAL frames: %v, %v", info, err)
 	}
-	t.Logf("verified SIGKILL after %s, acknowledged id=%d mode=%o size=%d A=%d C=%d WAL=%d bytes",
-		phase, ack.Attr.ID, ack.Attr.Mode, ack.Attr.Size, ack.Record.State.Generation, ack.Record.CheckpointedGeneration, info.Size())
+	t.Logf("verified SIGKILL after %s, acknowledged id=%d kind=%d size=%d A=%d C=%d WAL=%d bytes",
+		phase, ack.Attr.ID, ack.Attr.Kind, ack.Attr.Size, ack.Record.State.Generation, ack.Record.CheckpointedGeneration, info.Size())
 	return ack
 }
 

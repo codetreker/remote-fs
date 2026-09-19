@@ -1,0 +1,1518 @@
+//go:build windows
+
+package windows
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+	"unicode/utf16"
+
+	"github.com/codetreker/remote-fs/packages/smb"
+	"github.com/codetreker/remote-fs/packages/storage"
+	win "golang.org/x/sys/windows"
+)
+
+// This test is injected only into the pinned diagnostic prototype checkout.
+// A passing variant is feasibility evidence, not acceptance of the PR's implementation.
+type cacheGateEvent struct {
+	At     time.Time
+	Kind   string
+	Fields json.RawMessage
+}
+type cacheGateTrace struct {
+	mu            sync.Mutex
+	events        []cacheGateEvent
+	overflow      bool
+	encodingError error
+}
+
+var cacheGateActive atomic.Pointer[cacheGateTrace]
+
+func cacheGateObserve(kind string, fields any) {
+	trace := cacheGateActive.Load()
+	if trace == nil {
+		return
+	}
+	encoded, err := json.Marshal(fields)
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	if err != nil {
+		trace.encodingError = err
+		return
+	}
+	if len(trace.events) == 2048 {
+		trace.overflow = true
+		return
+	}
+	trace.events = append(trace.events, cacheGateEvent{At: time.Now().UTC(), Kind: kind, Fields: encoded})
+}
+
+func cacheGateDirectory(t *testing.T, path string) *nativeHandle {
+	t.Helper()
+	name, err := win.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := win.CreateFile(name, win.FILE_LIST_DIRECTORY|win.FILE_READ_ATTRIBUTES|win.READ_CONTROL|win.SYNCHRONIZE, win.FILE_SHARE_READ|win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, nil, win.OPEN_EXISTING, win.FILE_FLAG_BACKUP_SEMANTICS|win.FILE_FLAG_OVERLAPPED, 0)
+	if err != nil {
+		t.Fatalf("open held parent directory: %v", err)
+	}
+	file := &nativeHandle{value: h}
+	t.Cleanup(func() {
+		if err := file.close(); err != nil {
+			t.Error(err)
+		}
+	})
+	cacheGateObserve("parent_open", map[string]any{"path": path})
+	return file
+}
+
+type cacheGateWatch struct {
+	file     *nativeHandle
+	event    win.Handle
+	overlap  win.Overlapped
+	buffer   []byte
+	done     bool
+	observed bool
+}
+
+func cacheGateStartWatch(t *testing.T, file *nativeHandle) *cacheGateWatch {
+	t.Helper()
+	event, err := win.CreateEvent(nil, 1, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &cacheGateWatch{file: file, event: event, buffer: make([]byte, 64<<10)}
+	w.overlap.HEvent = event
+	err = win.ReadDirectoryChanges(file.value, &w.buffer[0], uint32(len(w.buffer)), true, win.FILE_NOTIFY_CHANGE_FILE_NAME|win.FILE_NOTIFY_CHANGE_DIR_NAME, nil, &w.overlap, 0)
+	if err != nil && !errors.Is(err, win.ERROR_IO_PENDING) {
+		_ = win.CloseHandle(event)
+		t.Fatalf("arm parent change notification: %v", err)
+	}
+	t.Cleanup(func() {
+		if !w.done {
+			err := win.CancelIoEx(file.value, &w.overlap)
+			if err != nil && !errors.Is(err, win.ERROR_NOT_FOUND) {
+				t.Errorf("cancel notification: %v", err)
+			}
+			// The OVERLAPPED and buffer stay owned until cancellation completes.
+			// The isolated test process has a three-minute watchdog for a wedged driver.
+			// https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-cancelioex
+			var count uint32
+			if err := win.GetOverlappedResult(file.value, &w.overlap, &count, true); err != nil && !errors.Is(err, win.ERROR_OPERATION_ABORTED) {
+				t.Errorf("notification completion: %v", err)
+			}
+		}
+		if err := win.CloseHandle(event); err != nil {
+			t.Error(err)
+		}
+		runtime.KeepAlive(w)
+	})
+	cacheGateObserve("notify_armed", nil)
+	return w
+}
+
+func (w *cacheGateWatch) poll(t *testing.T) {
+	t.Helper()
+	if w.done {
+		return
+	}
+	status, err := win.WaitForSingleObject(w.event, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status == uint32(win.WAIT_TIMEOUT) {
+		return
+	}
+	if status != uint32(win.WAIT_OBJECT_0) {
+		t.Fatalf("notification wait status=%d", status)
+	}
+	var count uint32
+	err = win.GetOverlappedResult(w.file.value, &w.overlap, &count, false)
+	w.done = true
+	if err != nil {
+		t.Fatalf("native directory notification: %v", err)
+	}
+	if count == 0 || count > uint32(len(w.buffer)) {
+		t.Fatalf("native notification returned invalid byte count %d", count)
+	}
+	for data := w.buffer[:count]; len(data) > 0; {
+		if len(data) < 12 {
+			t.Fatal("truncated native notification")
+		}
+		next := binary.LittleEndian.Uint32(data)
+		action := binary.LittleEndian.Uint32(data[4:8])
+		length := binary.LittleEndian.Uint32(data[8:12])
+		if length&1 != 0 || uint64(length)+12 > uint64(len(data)) {
+			t.Fatal("invalid native notification name")
+		}
+		words := make([]uint16, length/2)
+		for i := range words {
+			words[i] = binary.LittleEndian.Uint16(data[12+2*i:])
+		}
+		name := string(utf16.Decode(words))
+		cacheGateObserve("notify_completed", map[string]any{"action": action, "name": name})
+		if action == win.FILE_ACTION_ADDED && strings.EqualFold(name, "new.bin") {
+			w.observed = true
+		}
+		if next == 0 {
+			break
+		}
+		if next < 12 || next&3 != 0 || uint64(next) > uint64(len(data)) {
+			t.Fatal("invalid native notification chain")
+		}
+		data = data[next:]
+	}
+}
+
+func cacheGateAwaitNotify(t *testing.T, trace *cacheGateTrace) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		trace.mu.Lock()
+		pending := false
+		for _, event := range trace.events {
+			if event.Kind != "smb_headers" {
+				continue
+			}
+			var header nativeHeaderObservation
+			if err := json.Unmarshal(event.Fields, &header); err != nil {
+				trace.mu.Unlock()
+				t.Fatal(err)
+			}
+			if header.Response && header.Command == 15 {
+				if header.Status == 0x103 {
+					pending = true
+				} else if header.Status != 0 {
+					trace.mu.Unlock()
+					t.Fatalf("CHANGE_NOTIFY admission failed with 0x%x", header.Status)
+				}
+			}
+		}
+		trace.mu.Unlock()
+		if pending {
+			cacheGateObserve("notify_pending_received", nil)
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("native directory watcher did not reach an admitted SMB CHANGE_NOTIFY")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func cacheGateAwaitMissingName(t *testing.T, trace *cacheGateTrace, after uint64, name string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		trace.mu.Lock()
+		events := append([]cacheGateEvent(nil), trace.events...)
+		trace.mu.Unlock()
+		requests := make(map[uint64]bool)
+		for _, event := range events {
+			if event.Kind != "smb_creates" {
+				continue
+			}
+			var request nativeCreateObservation
+			if err := json.Unmarshal(event.Fields, &request); err != nil {
+				t.Fatal(err)
+			}
+			if request.Sequence > after && strings.EqualFold(strings.TrimPrefix(request.Name, `\`), name) {
+				requests[request.MessageID] = true
+			}
+		}
+		for _, event := range events {
+			if event.Kind != "smb_headers" {
+				continue
+			}
+			var header nativeHeaderObservation
+			if err := json.Unmarshal(event.Fields, &header); err != nil {
+				t.Fatal(err)
+			}
+			want := uint32(0xc0000034)
+			if os.Getenv("RFS_GATE_VARIANT") == "missing_final_status" {
+				want = 0xc000000f
+			}
+			if header.Response && header.Command == 5 && header.Status == want && requests[header.MessageID] {
+				cacheGateObserve("authoritative_negative_confirmed", map[string]uint64{"message_id": header.MessageID})
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("initial absence had no observed authoritative missing-file CREATE response")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestNativeNegativeNameCacheGate(t *testing.T) {
+	variant := os.Getenv("RFS_GATE_VARIANT")
+	if strings.HasPrefix(variant, "positive_") {
+		cacheGatePositiveScenario(t, variant)
+		return
+	}
+	if variant == "directory_sharing" {
+		cacheGateSharingScenario(t)
+		return
+	}
+	if variant == "owned_nested" || variant == "owned_lifecycle" || variant == "owned_outage" || variant == "owned_rescan" || variant == "find_notification" {
+		cacheGateOwnedScenario(t, variant)
+		return
+	}
+	if variant != "baseline" && variant != "held_parent" && variant != "notify_parent" && variant != "missing_final_status" {
+		t.Fatalf("invalid gate variant %q", variant)
+	}
+	output := os.Getenv("RFS_GATE_OUTPUT_ROOT")
+	if output == "" {
+		t.Fatal("gate receipt output directory is required")
+	}
+	ttl, err := strconv.ParseUint(os.Getenv("RFS_GATE_MIN_CACHE_TTL"), 10, 32)
+	if err != nil || ttl <= 1 {
+		t.Fatal("a verified cache lifetime above one second is required")
+	}
+	trace := &cacheGateTrace{}
+	cacheGateActive.Store(trace)
+	var bridge *nativeBridge
+	var negativeStarted, earliestExpiry, writerAcknowledged, visibleAt time.Time
+	var attempts, freshQueries int
+	var watch *cacheGateWatch
+	var exclusiveCheck *cacheGateOwnedCheck
+	t.Cleanup(func() {
+		cacheGateActive.Store(nil)
+		trace.mu.Lock()
+		events := append([]cacheGateEvent(nil), trace.events...)
+		overflow, encodingError := trace.overflow, trace.encodingError
+		trace.mu.Unlock()
+		if overflow || encodingError != nil {
+			t.Errorf("bounded trace incomplete: overflow=%v error=%v", overflow, encodingError)
+		}
+		if variant == "missing_final_status" {
+			for _, event := range events {
+				if event.Kind != "smb_headers" {
+					continue
+				}
+				var h nativeHeaderObservation
+				if err := json.Unmarshal(event.Fields, &h); err != nil {
+					t.Error(err)
+				}
+				if h.Command == 15 {
+					t.Error("no-watcher status probe issued CHANGE_NOTIFY")
+				}
+			}
+		}
+		report := map[string]any{
+			"evidence_kind": "pinned prototype diagnostic; not PR implementation acceptance",
+			"overlay_sha":   os.Getenv("RFS_GATE_OVERLAY_SHA"), "fixture_sha": os.Getenv("RFS_GATE_FIXTURE_SHA"), "gate_sha": os.Getenv("GITHUB_SHA"), "variant": variant,
+			"negative_lookup_started_at": negativeStarted, "earliest_possible_cache_expiry": earliestExpiry,
+			"writer_acknowledged_at": writerAcknowledged, "visible_at": visibleAt, "attempts": attempts, "fresh_queries": freshQueries,
+			"test_failed": t.Failed(), "trace_overflow": overflow, "events": events,
+			"missing_status_overlay_sha": os.Getenv("RFS_GATE_MISSING_STATUS_SHA"), "exclusive_check": exclusiveCheck,
+		}
+		if watch != nil {
+			report["matching_notification_received"] = watch.observed
+		}
+		if bridge != nil {
+			report["final_server_status"] = bridge.smb.Status()
+			report["final_backend_references"] = bridge.backend.openReferences()
+			report["owned_mapping"] = map[string]string{"local": bridge.path, "remote": fmt.Sprintf(`\\127.0.0.1\%s`, bridge.share)}
+		}
+		encoded, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.WriteFile(filepath.Join(output, "receipt.json"), encoded, 0600); err != nil {
+			t.Error(err)
+		}
+		t.Logf("GATE_RESULT variant=%s failed=%v attempts=%d fresh_queries=%d writer_ack=%s visible=%s", variant, t.Failed(), attempts, freshQueries, writerAcknowledged.Format(time.RFC3339Nano), visibleAt.Format(time.RFC3339Nano))
+	})
+	sid, err := CurrentUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := AllowSID(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge = nativeBridgeFixture(t, policy)
+	if err := bridge.mapDrive(t); err != nil {
+		t.Fatal(err)
+	}
+	cacheGateObserve("mapping_ready", map[string]any{"variant": variant, "port": bridge.port})
+	warm := nativeOpen(t, filepath.Join(bridge.path+`\`, "live.bin"), win.CREATE_ALWAYS)
+	payload := []byte("before-remote")
+	if n, err := nativeTransfer(warm, payload, true); err != nil || n != uint32(len(payload)) {
+		t.Fatalf("warm write: count=%d error=%v", n, err)
+	}
+	session, remote := nativeRemoteOpen(t, bridge.remote, "live.bin", storage.NodeRegular, false)
+	updated := []byte("after--remote")
+	nativeRemoteWrite(t, session, remote, updated)
+	buffer := make([]byte, len(updated))
+	if n, err := nativeTransfer(warm, buffer, false); err != nil || n != uint32(len(buffer)) || !bytes.Equal(buffer, updated) {
+		t.Fatalf("warm remote read: count=%d error=%v", n, err)
+	}
+	bridge.assertCacheContract(t)
+	if variant == "held_parent" || variant == "notify_parent" {
+		parent := cacheGateDirectory(t, bridge.path+`\`)
+		if variant == "notify_parent" {
+			watch = cacheGateStartWatch(t, parent)
+			cacheGateAwaitNotify(t, trace)
+		}
+	}
+	missing := filepath.Join(bridge.path+`\`, "new.bin")
+	beforeNegative := bridge.wire.createSequence.Load()
+	negativeStarted = time.Now()
+	earliestExpiry = negativeStarted.Add(time.Duration(ttl) * time.Second)
+	cacheGateObserve("negative_lookup_started", nil)
+	_, missingErr := os.Stat(missing)
+	if !os.IsNotExist(missingErr) {
+		t.Fatalf("initial negative lookup: %v", missingErr)
+	}
+	if variant == "missing_final_status" {
+		cacheGateStatusMappings(t)
+		cacheGateObserve("missing_status_win32_result", map[string]any{"file_not_found": errors.Is(missingErr, win.ERROR_FILE_NOT_FOUND), "path_not_found": errors.Is(missingErr, win.ERROR_PATH_NOT_FOUND), "error": missingErr.Error()})
+		if !errors.Is(missingErr, win.ERROR_FILE_NOT_FOUND) {
+			t.Fatalf("final absence did not return Win32 FILE_NOT_FOUND: %v", missingErr)
+		}
+	}
+	cacheGateObserve("negative_lookup_completed", nil)
+	cacheGateAwaitMissingName(t, trace, beforeNegative, "new.bin")
+	beforeFresh := bridge.wire.createSequence.Load()
+	cacheGateObserve("remote_create_started", nil)
+	_, _ = nativeRemoteOpen(t, bridge.remote, "new.bin", storage.NodeRegular, true)
+	writerAcknowledged = time.Now()
+	cacheGateObserve("remote_create_acknowledged", nil)
+	if !writerAcknowledged.Before(earliestExpiry) {
+		t.Fatal("remote creation completed after possible negative-cache expiry; probe is inconclusive")
+	}
+	deadline := writerAcknowledged.Add(time.Second)
+	for {
+		if watch != nil {
+			watch.poll(t)
+		}
+		attempts++
+		cacheGateObserve("lookup_started", map[string]int{"attempt": attempts})
+		_, err := os.Stat(missing)
+		completed := time.Now()
+		cacheGateObserve("lookup_completed", map[string]any{"attempt": attempts, "exists": err == nil, "missing": os.IsNotExist(err)})
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("lookup after remote commit: %v", err)
+		}
+		if err == nil {
+			visibleAt = completed
+			break
+		}
+		if !completed.Before(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	trace.mu.Lock()
+	events := append([]cacheGateEvent(nil), trace.events...)
+	trace.mu.Unlock()
+	for _, event := range events {
+		if event.Kind != "smb_creates" {
+			continue
+		}
+		var request nativeCreateObservation
+		if err := json.Unmarshal(event.Fields, &request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Sequence > beforeFresh && strings.EqualFold(strings.TrimPrefix(request.Name, `\`), "new.bin") {
+			freshQueries++
+		}
+	}
+	if watch != nil {
+		watch.poll(t)
+	}
+	bridge.assertCacheContract(t)
+	if visibleAt.IsZero() || visibleAt.After(deadline) {
+		t.Fatal("remote creation after a native negative lookup was not visible within one second")
+	}
+	if !visibleAt.Before(earliestExpiry) {
+		t.Fatal("visibility occurred after possible cache expiry; TTL-independent visibility is not established")
+	}
+	if freshQueries == 0 {
+		t.Fatal("visibility had no fresh authoritative SMB CREATE for the missing name")
+	}
+	if watch != nil && !watch.observed {
+		t.Fatal("the admitted directory watcher delivered no matching creation notification")
+	}
+	if variant == "missing_final_status" {
+		holder, err := cacheGateSharingOpen(t, `\\127.0.0.1\`+bridge.share, win.FILE_LIST_DIRECTORY, 0, true)
+		if err != nil {
+			t.Fatalf("root exclusive LIST open: %v", err)
+		}
+		cacheGateObserve("missing_status_root_exclusive_open", map[string]uint32{"access": win.FILE_LIST_DIRECTORY, "share": 0})
+		probe := &cacheGateOwnedProbe{bridge: bridge, trace: trace, ttl: time.Duration(ttl) * time.Second}
+		exclusiveCheck = probe.prime(t, "exclusive.bin")
+		_, _ = nativeRemoteOpen(t, bridge.remote, "exclusive.bin", storage.NodeRegular, true)
+		probe.acknowledged(t, exclusiveCheck)
+		probe.visible(t, exclusiveCheck)
+		if err := holder.close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+type cacheGatePause struct {
+	reached chan struct{}
+	resume  chan struct{}
+	once    sync.Once
+}
+
+func (p *cacheGatePause) release() { p.once.Do(func() { close(p.resume) }) }
+
+type cacheGateOwnedIO struct {
+	event   win.Handle
+	overlap win.Overlapped
+	buffer  []byte
+}
+
+// The client owner drives notifications independently of application Stat calls.
+// The injected pause models a slow rearm without closing the directory handle.
+type cacheGateOwnedWatcher struct {
+	file         *nativeHandle
+	mu           sync.Mutex
+	current      *cacheGateOwnedIO
+	closing      bool
+	failure      error
+	cleanupError error
+	pause        *cacheGatePause
+	rescanPause  *cacheGatePause
+	rescans      uint64
+	stop         chan struct{}
+	done         chan struct{}
+}
+
+func cacheGateStartOwned(t *testing.T, bridge *nativeBridge, trace *cacheGateTrace) *cacheGateOwnedWatcher {
+	t.Helper()
+	file := cacheGateDirectory(t, `\\127.0.0.1\`+bridge.share)
+	w := &cacheGateOwnedWatcher{file: file, stop: make(chan struct{}), done: make(chan struct{})}
+	go w.run()
+	t.Cleanup(func() {
+		if err := w.close(); err != nil {
+			t.Error(err)
+		}
+		if err := file.close(); err != nil {
+			t.Error(err)
+		}
+	})
+	cacheGateAwaitNotify(t, trace)
+	cacheGateObserve("owned_client_ready", nil)
+	return w
+}
+
+func (w *cacheGateOwnedWatcher) close() error {
+	w.mu.Lock()
+	if !w.closing {
+		w.closing = true
+		close(w.stop)
+		if w.current != nil {
+			if err := win.CancelIoEx(w.file.value, &w.current.overlap); err != nil && !errors.Is(err, win.ERROR_NOT_FOUND) {
+				w.cleanupError = err
+				cacheGateObserve("owned_cancel_error", map[string]string{"error": err.Error()})
+			}
+		}
+	}
+	w.mu.Unlock()
+	<-w.done
+	cacheGateObserve("owned_client_stopped", nil)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.cleanupError
+}
+
+func (w *cacheGateOwnedWatcher) fail(err error) {
+	w.mu.Lock()
+	if !w.closing {
+		w.failure = err
+		cacheGateObserve("owned_watch_failed", map[string]string{"error": err.Error()})
+	}
+	w.mu.Unlock()
+}
+
+func (w *cacheGateOwnedWatcher) closeEvent(event win.Handle) error {
+	err := win.CloseHandle(event)
+	if err != nil {
+		w.mu.Lock()
+		w.cleanupError = errors.Join(w.cleanupError, err)
+		w.mu.Unlock()
+	}
+	return err
+}
+
+func (w *cacheGateOwnedWatcher) pauseAfterNext(t *testing.T) *cacheGatePause {
+	t.Helper()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.pause != nil || w.closing || w.failure != nil {
+		t.Fatal("watcher cannot accept the rearm pause")
+	}
+	p := &cacheGatePause{reached: make(chan struct{}), resume: make(chan struct{})}
+	w.pause = p
+	t.Cleanup(p.release)
+	return p
+}
+
+func (w *cacheGateOwnedWatcher) pauseAfterRescan(t *testing.T) *cacheGatePause {
+	t.Helper()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.rescanPause != nil || w.closing || w.failure != nil {
+		t.Fatal("watcher cannot pause after rescan")
+	}
+	p := &cacheGatePause{reached: make(chan struct{}), resume: make(chan struct{})}
+	w.rescanPause = p
+	t.Cleanup(p.release)
+	return p
+}
+
+func (w *cacheGateOwnedWatcher) run() {
+	defer close(w.done)
+	for {
+		event, err := win.CreateEvent(nil, 1, 0, nil)
+		if err != nil {
+			w.fail(err)
+			return
+		}
+		op := &cacheGateOwnedIO{event: event, buffer: make([]byte, 64<<10)}
+		op.overlap.HEvent = event
+		w.mu.Lock()
+		if w.closing {
+			w.mu.Unlock()
+			_ = w.closeEvent(event)
+			return
+		}
+		w.current = op
+		err = win.ReadDirectoryChanges(w.file.value, &op.buffer[0], uint32(len(op.buffer)), true, win.FILE_NOTIFY_CHANGE_FILE_NAME|win.FILE_NOTIFY_CHANGE_DIR_NAME, nil, &op.overlap, 0)
+		w.mu.Unlock()
+		if err != nil && !errors.Is(err, win.ERROR_IO_PENDING) {
+			w.mu.Lock()
+			w.current = nil
+			w.mu.Unlock()
+			_ = w.closeEvent(event)
+			w.fail(err)
+			return
+		}
+		cacheGateObserve("owned_notify_issued", nil)
+		var count uint32
+		err = win.GetOverlappedResult(w.file.value, &op.overlap, &count, true)
+		rescanError := errors.Is(err, win.ERROR_NOTIFY_ENUM_DIR)
+		if rescanError {
+			err, count = nil, 0
+		}
+		w.mu.Lock()
+		w.current = nil
+		closing := w.closing
+		pause := w.pause
+		w.pause = nil
+		if err == nil && count == 0 {
+			w.rescans++
+			if w.rescanPause != nil {
+				pause = w.rescanPause
+				w.rescanPause = nil
+			}
+		}
+		w.mu.Unlock()
+		closeErr := w.closeEvent(event)
+		if closing {
+			w.mu.Lock()
+			if err != nil && !errors.Is(err, win.ERROR_OPERATION_ABORTED) {
+				w.cleanupError = errors.Join(w.cleanupError, err)
+			}
+			w.mu.Unlock()
+			runtime.KeepAlive(op)
+			return
+		}
+		if err != nil || closeErr != nil {
+			w.fail(errors.Join(err, closeErr))
+			return
+		}
+		if count > uint32(len(op.buffer)) {
+			w.fail(errors.New("native watcher lost event detail"))
+			return
+		}
+		if count == 0 {
+			// This owner keeps no directory snapshot or per-name event consumer.
+			// Zero bytes mean lost detail, never an empty directory or no changes.
+			// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw
+			cacheGateObserve("owned_notify_rescan", map[string]bool{"enum_error": rescanError})
+		} else if err := cacheGateDecodeOwned(op.buffer[:count]); err != nil {
+			w.fail(err)
+			return
+		}
+		runtime.KeepAlive(op)
+		if pause != nil {
+			cacheGateObserve("owned_rearm_paused", nil)
+			close(pause.reached)
+			select {
+			case <-pause.resume:
+			case <-w.stop:
+				return
+			}
+			cacheGateObserve("owned_rearm_resumed", nil)
+		}
+	}
+}
+
+func cacheGateDecodeOwned(data []byte) error {
+	for len(data) > 0 {
+		if len(data) < 12 {
+			return errors.New("short native notification")
+		}
+		next := binary.LittleEndian.Uint32(data)
+		action := binary.LittleEndian.Uint32(data[4:8])
+		length := binary.LittleEndian.Uint32(data[8:12])
+		if length&1 != 0 || uint64(length)+12 > uint64(len(data)) {
+			return errors.New("invalid native notification name")
+		}
+		words := make([]uint16, length/2)
+		for i := range words {
+			words[i] = binary.LittleEndian.Uint16(data[12+2*i:])
+		}
+		cacheGateObserve("owned_notify_completed", map[string]any{"action": action, "name": string(utf16.Decode(words))})
+		if next == 0 {
+			return nil
+		}
+		if next < 12 || next&3 != 0 || uint64(next) > uint64(len(data)) {
+			return errors.New("invalid native notification chain")
+		}
+		data = data[next:]
+	}
+	return nil
+}
+
+type cacheGateOwnedCheck struct {
+	Name               string
+	NegativeStarted    time.Time
+	EarliestExpiry     time.Time
+	WriterAcknowledged time.Time
+	VisibleAt          time.Time
+	BeforeFresh        uint64
+	Attempts           int
+	FreshQueries       int
+}
+
+type cacheGateOwnedProbe struct {
+	bridge *nativeBridge
+	trace  *cacheGateTrace
+	ttl    time.Duration
+	checks []*cacheGateOwnedCheck
+}
+
+func (p *cacheGateOwnedProbe) prime(t *testing.T, name string) *cacheGateOwnedCheck {
+	t.Helper()
+	check := &cacheGateOwnedCheck{Name: name, NegativeStarted: time.Now()}
+	check.EarliestExpiry = check.NegativeStarted.Add(p.ttl)
+	p.checks = append(p.checks, check)
+	before := p.bridge.wire.createSequence.Load()
+	cacheGateObserve("negative_lookup_started", map[string]string{"name": name})
+	_, missingErr := os.Stat(filepath.Join(p.bridge.path+`\`, name))
+	if !os.IsNotExist(missingErr) {
+		t.Fatalf("initial negative lookup %s: %v", name, missingErr)
+	}
+	if os.Getenv("RFS_GATE_VARIANT") == "missing_final_status" && !errors.Is(missingErr, win.ERROR_FILE_NOT_FOUND) {
+		t.Fatalf("exclusive-root final absence: %v", missingErr)
+	}
+	cacheGateAwaitMissingName(t, p.trace, before, name)
+	check.BeforeFresh = p.bridge.wire.createSequence.Load()
+	return check
+}
+
+func (p *cacheGateOwnedProbe) acknowledged(t *testing.T, check *cacheGateOwnedCheck) {
+	t.Helper()
+	check.WriterAcknowledged = time.Now()
+	cacheGateObserve("remote_create_acknowledged", map[string]string{"name": check.Name})
+	if !check.WriterAcknowledged.Before(check.EarliestExpiry) {
+		t.Fatal("writer ACK exceeded earliest cache expiry; diagnostic inconclusive")
+	}
+}
+
+func (p *cacheGateOwnedProbe) visible(t *testing.T, check *cacheGateOwnedCheck) {
+	t.Helper()
+	deadline := check.WriterAcknowledged.Add(time.Second)
+	for {
+		check.Attempts++
+		_, err := os.Stat(filepath.Join(p.bridge.path+`\`, check.Name))
+		completed := time.Now()
+		cacheGateObserve("lookup_completed", map[string]any{"name": check.Name, "attempt": check.Attempts, "exists": err == nil, "missing": os.IsNotExist(err)})
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("lookup %s: %v", check.Name, err)
+		}
+		if err == nil {
+			check.VisibleAt = completed
+			break
+		}
+		if !completed.Before(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	p.trace.mu.Lock()
+	events := append([]cacheGateEvent(nil), p.trace.events...)
+	p.trace.mu.Unlock()
+	for _, event := range events {
+		if event.Kind != "smb_creates" {
+			continue
+		}
+		var request nativeCreateObservation
+		if err := json.Unmarshal(event.Fields, &request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Sequence > check.BeforeFresh && strings.EqualFold(strings.TrimPrefix(request.Name, `\`), check.Name) {
+			check.FreshQueries++
+		}
+	}
+	if check.VisibleAt.IsZero() || check.VisibleAt.After(deadline) {
+		t.Fatalf("%s was not visible within one second of writer ACK", check.Name)
+	}
+	if !check.VisibleAt.Before(check.EarliestExpiry) {
+		t.Fatalf("%s visibility did not precede possible cache expiry", check.Name)
+	}
+	if check.FreshQueries == 0 {
+		t.Fatalf("%s had no fresh authoritative CREATE", check.Name)
+	}
+}
+
+func cacheGateOwnedScenario(t *testing.T, variant string) {
+	output := os.Getenv("RFS_GATE_OUTPUT_ROOT")
+	ttl, err := strconv.ParseUint(os.Getenv("RFS_GATE_MIN_CACHE_TTL"), 10, 32)
+	if output == "" || err != nil || ttl <= 1 {
+		t.Fatal("receipt directory and verified cache TTL above one second are required")
+	}
+	p := &cacheGateOwnedProbe{trace: &cacheGateTrace{}, ttl: time.Duration(ttl) * time.Second}
+	cacheGateActive.Store(p.trace)
+	t.Cleanup(func() {
+		cacheGateActive.Store(nil)
+		p.trace.mu.Lock()
+		events := append([]cacheGateEvent(nil), p.trace.events...)
+		overflow, encodingErr := p.trace.overflow, p.trace.encodingError
+		p.trace.mu.Unlock()
+		if overflow || encodingErr != nil {
+			t.Errorf("incomplete bounded trace: overflow=%v error=%v", overflow, encodingErr)
+		}
+		report := map[string]any{"evidence_kind": "pinned prototype diagnostic; not PR implementation acceptance", "overlay_sha": os.Getenv("RFS_GATE_OVERLAY_SHA"), "fixture_sha": os.Getenv("RFS_GATE_FIXTURE_SHA"), "gate_sha": os.Getenv("GITHUB_SHA"), "variant": variant, "checks": p.checks, "test_failed": t.Failed(), "trace_overflow": overflow, "events": events}
+		if p.bridge != nil {
+			report["final_server_status"] = p.bridge.smb.Status()
+			report["final_backend_references"] = p.bridge.backend.openReferences()
+			report["owned_mapping"] = map[string]string{"local": p.bridge.path, "remote": `\\127.0.0.1\` + p.bridge.share}
+		}
+		encoded, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.WriteFile(filepath.Join(output, "receipt.json"), encoded, 0600); err != nil {
+			t.Error(err)
+		}
+		t.Logf("GATE_RESULT variant=%s failed=%v checks=%d", variant, t.Failed(), len(p.checks))
+	})
+	sid, err := CurrentUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := AllowSID(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.bridge = nativeBridgeFixture(t, policy)
+	if err := p.bridge.mapDrive(t); err != nil {
+		t.Fatal(err)
+	}
+	cacheGateObserve("mapping_ready", map[string]any{"variant": variant, "port": p.bridge.port})
+	warm := nativeOpen(t, filepath.Join(p.bridge.path+`\`, "live.bin"), win.CREATE_ALWAYS)
+	if _, err := nativeTransfer(warm, []byte("warm"), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := warm.close(); err != nil {
+		t.Fatal(err)
+	}
+	p.bridge.assertCacheContract(t)
+	session, root := nativeRemoteOpen(t, p.bridge.remote, "", storage.NodeDirectory, false)
+	nested := nativeRemoteCreateAt(t, session, root, "nested", storage.NodeDirectory)
+	deep := nativeRemoteCreateAt(t, session, nested, "deep", storage.NodeDirectory)
+	if variant == "find_notification" {
+		cacheGateFindCompatibility(t, p)
+		p.bridge.assertCacheContract(t)
+		return
+	}
+	w := cacheGateStartOwned(t, p.bridge, p.trace)
+	switch variant {
+	case "owned_nested":
+		cacheGateOwnedNested(t, p, w, session, deep)
+	case "owned_lifecycle":
+		cacheGateOwnedLifecycle(t, p, w, session, root)
+	case "owned_outage":
+		cacheGateOwnedOutage(t, p, w)
+	case "owned_rescan":
+		cacheGateOwnedRescan(t, p, w, session, deep)
+	default:
+		t.Fatal("invalid owned variant")
+	}
+	p.bridge.assertCacheContract(t)
+}
+
+func cacheGateOwnedNested(t *testing.T, p *cacheGateOwnedProbe, w *cacheGateOwnedWatcher, session storage.FileSession, parent storage.File) {
+	first := p.prime(t, `nested\deep\first.bin`)
+	pause := w.pauseAfterNext(t)
+	_ = nativeRemoteCreateAt(t, session, parent, "first.bin", storage.NodeRegular)
+	p.acknowledged(t, first)
+	p.visible(t, first)
+	select {
+	case <-pause.reached:
+	case <-time.After(time.Second):
+		t.Fatal("watcher did not enter controlled rearm gap")
+	}
+	gap := p.prime(t, `nested\deep\gap.bin`)
+	_ = nativeRemoteCreateAt(t, session, parent, "gap.bin", storage.NodeRegular)
+	p.acknowledged(t, gap)
+	time.Sleep(100 * time.Millisecond)
+	pause.release()
+	p.visible(t, gap)
+	burst := make([]*cacheGateOwnedCheck, 8)
+	for i := range burst {
+		burst[i] = p.prime(t, fmt.Sprintf(`nested\deep\burst-%d.bin`, i))
+	}
+	for i, check := range burst {
+		_ = nativeRemoteCreateAt(t, session, parent, fmt.Sprintf("burst-%d.bin", i), storage.NodeRegular)
+		p.acknowledged(t, check)
+	}
+	for _, check := range burst {
+		p.visible(t, check)
+	}
+	p.notifications(t, p.checks[2].NegativeStarted)
+	cacheGateAwaitHealthy(t, w, p.trace)
+	w.mu.Lock()
+	failure := w.failure
+	w.mu.Unlock()
+	if failure != nil {
+		t.Fatalf("owned recursive watcher failed: %v", failure)
+	}
+}
+
+func cacheGateOwnedLifecycle(t *testing.T, p *cacheGateOwnedProbe, w *cacheGateOwnedWatcher, session storage.FileSession, parent storage.File) {
+	app := nativeOpen(t, filepath.Join(p.bridge.path+`\`, "app.bin"), win.CREATE_ALWAYS)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err := p.bridge.mapping.Unmount(ctx)
+	cacheGateObserve("owned_busy_unmount", map[string]any{"busy": errors.Is(err, ErrMappingBusy), "error": fmt.Sprint(err)})
+	if !errors.Is(err, ErrMappingBusy) {
+		t.Fatalf("unmount with application handle: %v", err)
+	}
+	check := p.prime(t, "after-busy.bin")
+	_ = nativeRemoteCreateAt(t, session, parent, "after-busy.bin", storage.NodeRegular)
+	p.acknowledged(t, check)
+	p.visible(t, check)
+	p.notifications(t, time.Time{})
+	w.mu.Lock()
+	failure := w.failure
+	w.mu.Unlock()
+	if failure != nil {
+		t.Fatalf("owned watcher failed across busy unmount: %v", failure)
+	}
+	if err := app.close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx2, cancel2 := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel2()
+	err = p.bridge.mapping.Unmount(ctx2)
+	cacheGateObserve("owned_internal_watch_unmount", map[string]any{"success": err == nil, "error": fmt.Sprint(err)})
+	if err != nil {
+		t.Fatalf("normal unmount with only client-owned UNC watcher: %v", err)
+	}
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.file.close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func cacheGateOwnedOutage(t *testing.T, p *cacheGateOwnedProbe, w *cacheGateOwnedWatcher) {
+	check := p.prime(t, "outage-missing.bin")
+	p.bridge.gate.down.Store(true)
+	p.bridge.http.CloseClientConnections()
+	t.Cleanup(func() { p.bridge.gate.down.Store(false) })
+	cacheGateObserve("authority_outage_started", nil)
+	select {
+	case <-w.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("owned watcher did not report the HTTP/SSE outage")
+	}
+	w.mu.Lock()
+	failure := w.failure
+	w.mu.Unlock()
+	if failure == nil {
+		t.Fatal("watcher stopped without surfacing the outage")
+	}
+	_, err := os.Stat(filepath.Join(p.bridge.path+`\`, check.Name))
+	observed := time.Now()
+	cacheGateObserve("outage_negative_lookup", map[string]any{"missing": os.IsNotExist(err), "error": fmt.Sprint(err), "before_cache_expiry": observed.Before(check.EarliestExpiry)})
+	if !observed.Before(check.EarliestExpiry) {
+		t.Fatal("outage probe reached possible cache expiry; diagnostic inconclusive")
+	}
+	if err == nil || os.IsNotExist(err) {
+		t.Fatalf("outage returned plausible cached absence instead of an unavailable error: %v", err)
+	}
+}
+
+func (p *cacheGateOwnedProbe) notifications(t *testing.T, rescanAfter time.Time) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		seen := make(map[string]bool)
+		rescan := false
+		p.trace.mu.Lock()
+		events := append([]cacheGateEvent(nil), p.trace.events...)
+		p.trace.mu.Unlock()
+		for _, event := range events {
+			if !rescanAfter.IsZero() && event.Kind == "owned_notify_rescan" && !event.At.Before(rescanAfter) {
+				rescan = true
+				continue
+			}
+			if event.Kind != "owned_notify_completed" {
+				continue
+			}
+			var notice struct {
+				Action uint32
+				Name   string
+			}
+			if err := json.Unmarshal(event.Fields, &notice); err != nil {
+				t.Fatal(err)
+			}
+			if notice.Action == win.FILE_ACTION_ADDED {
+				seen[strings.ToLower(notice.Name)] = true
+			}
+		}
+		missing := make([]string, 0)
+		for _, check := range p.checks {
+			if rescan && !check.NegativeStarted.Before(rescanAfter) {
+				continue
+			}
+			if !seen[strings.ToLower(check.Name)] {
+				missing = append(missing, check.Name)
+			}
+		}
+		if len(missing) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("owned recursive watcher omitted creation notifications: %v", missing)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func cacheGateLimits() smb.Limits {
+	limits := smb.DefaultLimits()
+	if os.Getenv("RFS_GATE_VARIANT") == "owned_rescan" {
+		limits.MaxNotifyEvents = 2
+	}
+	cacheGateObserve("diagnostic_notify_limit", map[string]int{"events": limits.MaxNotifyEvents})
+	return limits
+}
+
+func cacheGatePendingCount(t *testing.T, trace *cacheGateTrace) int {
+	t.Helper()
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	count := 0
+	for _, event := range trace.events {
+		if event.Kind != "smb_headers" {
+			continue
+		}
+		var header nativeHeaderObservation
+		if err := json.Unmarshal(event.Fields, &header); err != nil {
+			t.Fatal(err)
+		}
+		if header.Response && header.Command == 15 && header.Status == 0x103 {
+			count++
+		}
+	}
+	return count
+}
+
+func cacheGateAwaitNewPending(t *testing.T, w *cacheGateOwnedWatcher, trace *cacheGateTrace, before int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		w.mu.Lock()
+		failure, active := w.failure, w.current != nil
+		w.mu.Unlock()
+		if failure != nil {
+			t.Fatalf("watcher recovery failed: %v", failure)
+		}
+		if active && cacheGatePendingCount(t, trace) > before {
+			cacheGateObserve("owned_recovery_admitted", nil)
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("recovered watcher did not admit a new pending CHANGE_NOTIFY")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func cacheGateOwnedRescan(t *testing.T, p *cacheGateOwnedProbe, w *cacheGateOwnedWatcher, session storage.FileSession, parent storage.File) {
+	ordinaryPause := w.pauseAfterNext(t)
+	_ = nativeRemoteCreateAt(t, session, parent, "trigger.bin", storage.NodeRegular)
+	select {
+	case <-ordinaryPause.reached:
+	case <-time.After(time.Second):
+		t.Fatal("setup notification did not pause")
+	}
+	rescanPause := w.pauseAfterRescan(t)
+	p.trace.mu.Lock()
+	beforeOverload := len(p.trace.events)
+	p.trace.mu.Unlock()
+	for i := range 8 {
+		_ = nativeRemoteCreateAt(t, session, parent, fmt.Sprintf("overload-%d.bin", i), storage.NodeRegular)
+	}
+	// The next native request must prove ENUM; queue growth is never assumed.
+	ordinaryPause.release()
+	select {
+	case <-rescanPause.reached:
+	case <-time.After(time.Second):
+		t.Fatal("bounded queue did not produce the required native rescan")
+	}
+	cacheGateAwaitEnum(t, p.trace, beforeOverload)
+	before := cacheGatePendingCount(t, p.trace)
+	gap := p.prime(t, `nested\deep\rescan-gap.bin`)
+	_ = nativeRemoteCreateAt(t, session, parent, "rescan-gap.bin", storage.NodeRegular)
+	p.acknowledged(t, gap)
+	time.Sleep(100 * time.Millisecond)
+	rescanPause.release()
+	p.visible(t, gap)
+	cacheGateAwaitNewPending(t, w, p.trace, before)
+	later := p.prime(t, `nested\deep\after-rescan.bin`)
+	_ = nativeRemoteCreateAt(t, session, parent, "after-rescan.bin", storage.NodeRegular)
+	p.acknowledged(t, later)
+	p.visible(t, later)
+	cacheGateAwaitHealthy(t, w, p.trace)
+	w.mu.Lock()
+	failure, rescans := w.failure, w.rescans
+	w.mu.Unlock()
+	if failure != nil || rescans == 0 {
+		t.Fatalf("rescan recovery state: count=%d error=%v", rescans, failure)
+	}
+}
+
+func cacheGateAwaitHealthy(t *testing.T, w *cacheGateOwnedWatcher, trace *cacheGateTrace) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		w.mu.Lock()
+		failure, active := w.failure, w.current != nil
+		w.mu.Unlock()
+		if failure != nil {
+			t.Fatalf("owned watcher failed: %v", failure)
+		}
+		trace.mu.Lock()
+		events := append([]cacheGateEvent(nil), trace.events...)
+		trace.mu.Unlock()
+		pending, outcome := -1, -1
+		for i, event := range events {
+			if event.Kind == "owned_notify_completed" || event.Kind == "owned_notify_rescan" {
+				outcome = i
+			}
+			if event.Kind != "smb_headers" {
+				continue
+			}
+			var header nativeHeaderObservation
+			if err := json.Unmarshal(event.Fields, &header); err != nil {
+				t.Fatal(err)
+			}
+			if header.Response && header.Command == 15 && header.Status == 0x103 {
+				pending = i
+			}
+		}
+		if active && pending > outcome {
+			cacheGateObserve("owned_healthy_pending", nil)
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("owned watcher has no healthy pending notification after its last completion")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func cacheGateAwaitEnum(t *testing.T, trace *cacheGateTrace, after int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		trace.mu.Lock()
+		events := append([]cacheGateEvent(nil), trace.events[after:]...)
+		trace.mu.Unlock()
+		requests := make(map[uint64]bool)
+		for _, event := range events {
+			if event.Kind != "smb_headers" {
+				continue
+			}
+			var header nativeHeaderObservation
+			if err := json.Unmarshal(event.Fields, &header); err != nil {
+				t.Fatal(err)
+			}
+			if header.Command != 15 {
+				continue
+			}
+			if !header.Response {
+				requests[header.MessageID] = true
+			}
+			if header.Response && header.Status == 0x10c && requests[header.MessageID] {
+				cacheGateObserve("owned_wire_enum_confirmed", map[string]uint64{"message_id": header.MessageID})
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("native rescan had no corresponding SMB STATUS_NOTIFY_ENUM_DIR response")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+type cacheGateShareCase struct {
+	Name              string
+	Directory         bool
+	ApplicationFirst  bool
+	ApplicationAccess uint32
+	ApplicationShare  uint32
+	WatchAccess       uint32
+}
+type cacheGateShareResult struct {
+	Platform         string
+	Case             cacheGateShareCase
+	SharingViolation bool
+	SecondOpen       string
+}
+
+func cacheGateSharingOpen(t *testing.T, path string, access, share uint32, directory bool) (*nativeHandle, error) {
+	t.Helper()
+	name, err := win.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flags := uint32(win.FILE_FLAG_OVERLAPPED)
+	if directory {
+		flags |= win.FILE_FLAG_BACKUP_SEMANTICS
+	}
+	handle, err := win.CreateFile(name, access, share, nil, win.OPEN_EXISTING, flags, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := &nativeHandle{value: handle}
+	t.Cleanup(func() {
+		if err := file.close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return file, nil
+}
+
+func cacheGateSharingAttempt(t *testing.T, trace *cacheGateTrace, platform, path string, test cacheGateShareCase) cacheGateShareResult {
+	t.Helper()
+	all := uint32(win.FILE_SHARE_READ | win.FILE_SHARE_WRITE | win.FILE_SHARE_DELETE)
+	firstAccess, firstShare, secondAccess, secondShare := test.WatchAccess, all, test.ApplicationAccess, test.ApplicationShare
+	secondName := "application"
+	if test.ApplicationFirst {
+		firstAccess, firstShare, secondAccess, secondShare = test.ApplicationAccess, test.ApplicationShare, test.WatchAccess, all
+		secondName = "watcher"
+	}
+	cacheGateObserve("directory_sharing_open_attempt", map[string]any{"platform": platform, "case": test.Name, "stage": "first", "access": firstAccess, "share": firstShare})
+	first, err := cacheGateSharingOpen(t, path, firstAccess, firstShare, test.Directory)
+	if err != nil {
+		t.Fatalf("first %s open: %v", platform, err)
+	}
+	if test.Directory && !test.ApplicationFirst {
+		cacheGateSharingArm(t, trace, platform, first)
+	}
+	cacheGateObserve("directory_sharing_open_attempt", map[string]any{"platform": platform, "case": test.Name, "stage": "second", "access": secondAccess, "share": secondShare})
+	second, err := cacheGateSharingOpen(t, path, secondAccess, secondShare, test.Directory)
+	if err != nil && !errors.Is(err, win.ERROR_SHARING_VIOLATION) {
+		t.Fatalf("second %s open: %v", platform, err)
+	}
+	result := cacheGateShareResult{Platform: platform, Case: test, SharingViolation: errors.Is(err, win.ERROR_SHARING_VIOLATION), SecondOpen: secondName}
+	cacheGateObserve("directory_sharing_result", result)
+	if err == nil && test.Directory && test.ApplicationFirst {
+		cacheGateSharingArm(t, trace, platform, second)
+	}
+	return result
+}
+
+func cacheGateSharingArm(t *testing.T, trace *cacheGateTrace, platform string, file *nativeHandle) {
+	t.Helper()
+	before := cacheGatePendingCount(t, trace)
+	_ = cacheGateStartWatch(t, file)
+	if !strings.HasPrefix(platform, "smb_") {
+		return
+	}
+	deadline := time.Now().Add(time.Second)
+	for cacheGatePendingCount(t, trace) <= before {
+		if time.Now().After(deadline) {
+			t.Fatal("SMB directory sharing control had no admitted native watch")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func cacheGateRequireNTFS(t *testing.T, path string) {
+	t.Helper()
+	file, err := cacheGateSharingOpen(t, path, win.FILE_READ_ATTRIBUTES, win.FILE_SHARE_READ|win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := make([]uint16, 64)
+	var serial, maxName, flags uint32
+	if err := win.GetVolumeInformationByHandle(file.value, nil, 0, &serial, &maxName, &flags, &name[0], uint32(len(name))); err != nil {
+		t.Fatal(err)
+	}
+	filesystem := win.UTF16ToString(name)
+	cacheGateObserve("local_filesystem_control", map[string]string{"filesystem": filesystem})
+	if filesystem != "NTFS" {
+		t.Fatalf("local control requires NTFS, got %q", filesystem)
+	}
+	if err := file.close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func cacheGateSharingScenario(t *testing.T) {
+	output := os.Getenv("RFS_GATE_OUTPUT_ROOT")
+	if output == "" {
+		t.Fatal("receipt output directory is required")
+	}
+	trace := &cacheGateTrace{}
+	cacheGateActive.Store(trace)
+	var bridge *nativeBridge
+	var results []cacheGateShareResult
+	t.Cleanup(func() {
+		cacheGateActive.Store(nil)
+		trace.mu.Lock()
+		events := append([]cacheGateEvent(nil), trace.events...)
+		overflow, encodeErr := trace.overflow, trace.encodingError
+		trace.mu.Unlock()
+		if overflow || encodeErr != nil {
+			t.Errorf("incomplete sharing trace: overflow=%v error=%v", overflow, encodeErr)
+		}
+		report := map[string]any{"evidence_kind": "pinned prototype diagnostic; not PR implementation acceptance", "variant": "directory_sharing", "fixture_sha": os.Getenv("RFS_GATE_FIXTURE_SHA"), "gate_sha": os.Getenv("GITHUB_SHA"), "overlay_sha": os.Getenv("RFS_GATE_OVERLAY_SHA"), "test_failed": t.Failed(), "results": results, "events": events}
+		if bridge != nil {
+			report["final_server_status"] = bridge.smb.Status()
+			report["final_backend_references"] = bridge.backend.openReferences()
+		}
+		encoded, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.WriteFile(filepath.Join(output, "receipt.json"), encoded, 0600); err != nil {
+			t.Error(err)
+		}
+	})
+	parent := t.TempDir()
+	directory := filepath.Join(parent, "sharing")
+	if err := os.Mkdir(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "parent-write-proof.bin"), []byte{1}, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cacheGateObserve("local_parent_write_proven", nil)
+	cacheGateRequireNTFS(t, directory)
+	raw, err := win.UTF16PtrFromString(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	volume := make([]uint16, 32768)
+	if err := win.GetVolumePathName(raw, &volume[0], uint32(len(volume))); err != nil {
+		t.Fatal(err)
+	}
+	volumeRoot := win.UTF16ToString(volume)
+	sid, err := CurrentUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := AllowSID(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge = nativeBridgeFixture(t, policy)
+	if err := bridge.mapDrive(t); err != nil {
+		t.Fatal(err)
+	}
+	proof := nativeOpen(t, filepath.Join(bridge.path+`\`, "parent-write-proof.bin"), win.CREATE_ALWAYS)
+	if n, err := nativeTransfer(proof, []byte{1}, true); err != nil || n != 1 {
+		t.Fatalf("SMB parent write proof: count=%d error=%v", n, err)
+	}
+	if err := proof.close(); err != nil {
+		t.Fatal(err)
+	}
+	cacheGateObserve("smb_parent_write_proven", nil)
+	_, _ = nativeRemoteOpen(t, bridge.remote, "sharing", storage.NodeDirectory, true)
+	list := uint32(win.FILE_LIST_DIRECTORY)
+	metadata := uint32(win.FILE_READ_ATTRIBUTES)
+	watchAccess := uint32(win.FILE_LIST_DIRECTORY | win.FILE_READ_ATTRIBUTES | win.READ_CONTROL | win.SYNCHRONIZE)
+	denyRead := uint32(win.FILE_SHARE_WRITE | win.FILE_SHARE_DELETE)
+	cases := []cacheGateShareCase{
+		{Name: "list_watcher_first", Directory: true, ApplicationAccess: list, ApplicationShare: denyRead, WatchAccess: watchAccess},
+		{Name: "list_application_first", Directory: true, ApplicationFirst: true, ApplicationAccess: list, ApplicationShare: denyRead, WatchAccess: watchAccess},
+		{Name: "metadata_watcher_first", Directory: true, ApplicationAccess: metadata, ApplicationShare: denyRead, WatchAccess: watchAccess},
+		{Name: "metadata_application_first", Directory: true, ApplicationFirst: true, ApplicationAccess: metadata, ApplicationShare: denyRead, WatchAccess: watchAccess},
+	}
+	locations := []struct{ name, path string }{
+		{"ntfs_directory", directory}, {"ntfs_volume_root", volumeRoot},
+		{"smb_directory", `\\127.0.0.1\` + bridge.share + `\sharing`}, {"smb_export_root", `\\127.0.0.1\` + bridge.share},
+	}
+	subdirectories := make(map[string]map[string]bool)
+	for _, location := range locations {
+		subdirectories[location.name] = make(map[string]bool)
+		for _, test := range cases {
+			t.Run(location.name+"/"+test.Name, func(t *testing.T) {
+				cacheGateObserve("directory_sharing_open_attempt", map[string]any{"platform": location.name, "case": test.Name, "stage": "baseline", "access": test.ApplicationAccess, "share": test.ApplicationShare})
+				baseline, err := cacheGateSharingOpen(t, location.path, test.ApplicationAccess, test.ApplicationShare, true)
+				if err != nil && !errors.Is(err, win.ERROR_SHARING_VIOLATION) {
+					t.Fatal(err)
+				}
+				baselineBlocked := errors.Is(err, win.ERROR_SHARING_VIOLATION)
+				if baseline != nil {
+					if err := baseline.close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				cacheGateObserve("directory_sharing_baseline", map[string]any{"platform": location.name, "case": test.Name, "sharing_violation": baselineBlocked})
+				if baselineBlocked {
+					cacheGateObserve("directory_sharing_preexisting_conflict", map[string]string{"platform": location.name, "case": test.Name})
+					t.Error("preexisting directory sharing conflict makes this control inconclusive")
+					return
+				}
+				result := cacheGateSharingAttempt(t, trace, location.name, location.path, test)
+				results = append(results, result)
+				subdirectories[location.name][test.Name] = result.SharingViolation
+			})
+		}
+	}
+	for _, test := range cases {
+		local, localOK := subdirectories["ntfs_directory"][test.Name]
+		remote, remoteOK := subdirectories["smb_directory"][test.Name]
+		if !localOK || !remoteOK {
+			t.Errorf("directory sharing comparison is incomplete for %s", test.Name)
+			continue
+		}
+		if local != remote {
+			t.Errorf("SMB directory sharing differs from writable-parent NTFS for %s", test.Name)
+		}
+	}
+	fileCase := cacheGateShareCase{Name: "regular_read_control", ApplicationAccess: win.GENERIC_READ, ApplicationShare: denyRead, WatchAccess: win.GENERIC_READ}
+	for _, location := range []struct{ name, path string }{{"ntfs_regular", filepath.Join(parent, "parent-write-proof.bin")}, {"smb_regular", filepath.Join(bridge.path+`\`, "parent-write-proof.bin")}} {
+		t.Run(location.name, func(t *testing.T) {
+			result := cacheGateSharingAttempt(t, trace, location.name, location.path, fileCase)
+			results = append(results, result)
+			if !result.SharingViolation {
+				t.Fatal("regular-file read-sharing control did not reject the conflicting open")
+			}
+		})
+	}
+	bridge.assertCacheContract(t)
+}
+
+func cacheGateFindCompatibility(t *testing.T, p *cacheGateOwnedProbe) {
+	cacheGateStatusMappings(t)
+	parent := t.TempDir()
+	cacheGateRequireNTFS(t, parent)
+	raw, err := win.UTF16PtrFromString(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	volume := make([]uint16, 32768)
+	if err := win.GetVolumePathName(raw, &volume[0], uint32(len(volume))); err != nil {
+		t.Fatal(err)
+	}
+	roots := []struct{ name, path string }{{"ntfs_volume_root", win.UTF16ToString(volume)}, {"smb_export_root", `\\127.0.0.1\` + p.bridge.share}}
+	for _, root := range roots {
+		for _, applicationFirst := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/application_first_%t", root.name, applicationFirst), func(t *testing.T) {
+				cacheGateObserve("find_first_case", map[string]any{"platform": root.name, "application_first": applicationFirst})
+				baseline, err := cacheGateSharingOpen(t, root.path, win.FILE_LIST_DIRECTORY, win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, true)
+				if err != nil {
+					cacheGateObserve("find_first_baseline_failed", map[string]string{"error": err.Error()})
+					t.Fatalf("preexisting root conflict or permission failure: %v", err)
+				}
+				if err := baseline.close(); err != nil {
+					t.Fatal(err)
+				}
+				if applicationFirst {
+					application, err := cacheGateSharingOpen(t, root.path, win.FILE_LIST_DIRECTORY, win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, true)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() {
+						if err := application.close(); err != nil {
+							t.Error(err)
+						}
+					}()
+				}
+				before := cacheGatePendingCount(t, p.trace)
+				handle, err := win.FindFirstChangeNotification(root.path, true, win.FILE_NOTIFY_CHANGE_FILE_NAME|win.FILE_NOTIFY_CHANGE_DIR_NAME)
+				cacheGateObserve("find_first_open", map[string]any{"platform": root.name, "application_first": applicationFirst, "success": err == nil, "error": fmt.Sprint(err)})
+				if err != nil {
+					t.Errorf("FindFirstChangeNotification cannot coexist with the root open: %v", err)
+					return
+				}
+				t.Cleanup(func() {
+					if err := win.FindCloseChangeNotification(handle); err != nil {
+						t.Error(err)
+					}
+					cacheGateObserve("find_first_closed", map[string]string{"platform": root.name})
+				})
+				if strings.HasPrefix(root.name, "smb_") {
+					deadline := time.Now().Add(time.Second)
+					for cacheGatePendingCount(t, p.trace) <= before {
+						if time.Now().After(deadline) {
+							t.Fatal("FindFirstChangeNotification had no admitted SMB CHANGE_NOTIFY")
+						}
+						time.Sleep(time.Millisecond)
+					}
+					cacheGateObserve("find_first_pending_confirmed", nil)
+				}
+				if !applicationFirst {
+					application, err := cacheGateSharingOpen(t, root.path, win.FILE_LIST_DIRECTORY, win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, true)
+					cacheGateObserve("find_first_application_open", map[string]any{"platform": root.name, "success": err == nil, "error": fmt.Sprint(err)})
+					if err != nil {
+						t.Errorf("FindFirstChangeNotification changes the application's root-sharing behavior: %v", err)
+						return
+					}
+					if err := application.close(); err != nil {
+						t.Error(err)
+					}
+				}
+			})
+		}
+	}
+	cacheGateObserve("find_first_compatibility_gate", map[string]any{"compatible": !t.Failed(), "visibility_rearm_outage_acceptance": "requires subsequent proof if compatible"})
+}
+
+func cacheGateStatusMappings(t *testing.T) {
+	t.Helper()
+	mapper := win.NewLazySystemDLL("ntdll.dll").NewProc("RtlNtStatusToDosError")
+	if err := mapper.Find(); err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []uint32{0xc000000f, 0xc0000034, 0xc000003a} {
+		// The return value is the mapping; GetLastError is not an output of this API.
+		code, _, _ := mapper.Call(uintptr(status))
+		cacheGateObserve("ntstatus_translation_only", map[string]any{"ntstatus": status, "win32": uint32(code), "wire_status_changed": false})
+	}
+}

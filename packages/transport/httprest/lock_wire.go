@@ -270,6 +270,10 @@ func marshalLockJSON(value any) ([]byte, error) {
 }
 
 func checkLockJSON(decoder *json.Decoder, typ reflect.Type) error {
+	return checkTypedJSON(decoder, typ, 16)
+}
+
+func checkTypedJSON(decoder *json.Decoder, typ reflect.Type, maxElements int) error {
 	for typ.Kind() == reflect.Pointer {
 		typ = typ.Elem()
 	}
@@ -310,7 +314,7 @@ func checkLockJSON(decoder *json.Decoder, typ reflect.Type) error {
 				return errors.New("lock JSON contains an unknown or duplicate member")
 			}
 			seen[name] = true
-			if err := checkLockJSON(decoder, field.Type); err != nil {
+			if err := checkTypedJSON(decoder, field.Type, maxElements); err != nil {
 				return err
 			}
 		}
@@ -322,6 +326,35 @@ func checkLockJSON(decoder *json.Decoder, typ reflect.Type) error {
 		end, err := decoder.Token()
 		if err != nil || end != json.Delim('}') {
 			return errors.New("lock JSON object is incomplete")
+		}
+	case reflect.Map:
+		if typ.Key().Kind() != reflect.String || token != json.Delim('{') {
+			return errors.New("JSON map requires string keys")
+		}
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			key, err := decoder.Token()
+			if err != nil {
+				return errors.New("JSON map key is invalid")
+			}
+			name, ok := key.(string)
+			if !ok {
+				return errors.New("JSON map key is not a string")
+			}
+			if _, duplicate := seen[name]; duplicate {
+				return errors.New("JSON map contains a duplicate key")
+			}
+			if len(seen) >= min(maxElements, storage.MaxMetadataNamespaces) {
+				return errors.New("JSON map exceeds its element limit")
+			}
+			seen[name] = struct{}{}
+			if err := checkTypedJSON(decoder, typ.Elem(), maxElements); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil || end != json.Delim('}') {
+			return errors.New("JSON map is incomplete")
 		}
 	case reflect.Slice:
 		if typ.Elem().Kind() == reflect.Uint8 {
@@ -336,10 +369,10 @@ func checkLockJSON(decoder *json.Decoder, typ reflect.Type) error {
 		count := 0
 		for decoder.More() {
 			count++
-			if count > 16 {
+			if count > maxElements {
 				return errors.New("lock JSON array exceeds its element limit")
 			}
-			if err := checkLockJSON(decoder, typ.Elem()); err != nil {
+			if err := checkTypedJSON(decoder, typ.Elem(), maxElements); err != nil {
 				return err
 			}
 		}

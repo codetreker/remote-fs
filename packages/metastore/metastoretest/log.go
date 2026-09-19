@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"syscall"
 	"testing"
@@ -57,12 +58,12 @@ var logCases = []testCase{
 		mustSucceed(t, s.Create(ctx(t), "second"))
 		newResult := func(max int64) *metastore.ChangeResult {
 			result, err := metastore.NewChangeResult(max, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
-				return lengths.Name + lengths.FromName + lengths.Content + 1, nil
+				return lengths.Name + lengths.FromName + lengths.Content + lengths.Metadata + lengths.Target + 1, nil
 			})
 			mustSucceed(t, err)
 			return result
 		}
-		firstPage := newResult(int64(len("first") + 1))
+		firstPage := newResult(int64(len("first") + 7))
 		retention, err := s.Since(ctx(t), 0, 100, firstPage)
 		mustSucceed(t, err)
 		changes, err := firstPage.Changes()
@@ -74,7 +75,7 @@ var logCases = []testCase{
 			t.Fatalf("one-change page reported tail %d at position %d", retention.Tail, changes[0].Position)
 		}
 
-		tooSmall := newResult(int64(len("second")))
+		tooSmall := newResult(int64(len("second") + 6))
 		if _, err := s.Since(ctx(t), changes[0].Position, 100, tooSmall); !errors.Is(err, syscall.EFBIG) {
 			t.Fatalf("oversized next change returned %v, want EFBIG", err)
 		}
@@ -97,7 +98,7 @@ var logCases = []testCase{
 		defer snap.Close()
 		newResult := func(max int64) *metastore.RowResult {
 			result, err := metastore.NewRowResult(max, 0, func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
-				return 1 + lengths.Name + lengths.Content, nil
+				return 1 + lengths.Name + lengths.Content + lengths.Metadata + lengths.Target, nil
 			})
 			mustSucceed(t, err)
 			return result
@@ -107,9 +108,9 @@ var logCases = []testCase{
 			name string
 			done bool
 		}{
-			{max: int64(len("first") + 1)},
-			{max: int64(len("second") + 1), name: "first"},
-			{max: int64(len("second") + 1), name: "second", done: true},
+			{max: int64(len("first") + 7)},
+			{max: int64(len("second") + 7), name: "first"},
+			{max: int64(len("second") + 7), name: "second", done: true},
 		} {
 			result := newResult(page.max)
 			done, err := snap.Next(ctx(t), 100, result)
@@ -193,7 +194,7 @@ var logCases = []testCase{
 		}{
 			{"create", func() { mustSucceed(t, s.Create(ctx(t), "f")) }, metastore.Created},
 			{"mkdir", func() { mustSucceed(t, s.Mkdir(ctx(t), "d")) }, metastore.Created},
-			{"setattr", func() { mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{Mode: mode(0o600)})) }, metastore.Modified},
+			{"setattr", func() { mustSucceed(t, s.SetAttr(ctx(t), "f", storage.AttrChange{ModTime: instant(1700000000)})) }, metastore.Modified},
 			{"commit", func() { put(t, s, "f", 40) }, metastore.Modified},
 			{"rename", func() { mustSucceed(t, s.Rename(ctx(t), "f", "d/g")) }, metastore.Renamed},
 			{"unlink", func() { mustSucceed(t, s.Remove(ctx(t), "d/g")) }, metastore.Removed},
@@ -219,7 +220,7 @@ var logCases = []testCase{
 		mustSucceed(t, s.Mkdir(ctx(t), "d"))
 		for i := range 40 {
 			put(t, s, "d/f", int64(i))
-			mustSucceed(t, s.SetAttr(ctx(t), "d/f", storage.AttrChange{Mode: mode(0o600)}))
+			mustSucceed(t, s.SetAttr(ctx(t), "d/f", storage.AttrChange{ModTime: instant(1700000000)}))
 		}
 		mustSucceed(t, s.Rename(ctx(t), "d/f", "moved"))
 		mustSucceed(t, s.Remove(ctx(t), "moved"))
@@ -370,7 +371,7 @@ var snapshotCases = []testCase{
 			t.Fatalf("the root is named (%d, %q), want parent 0 and no name", root.Parent, root.Name)
 		}
 		if !root.Node.IsDir() {
-			t.Fatalf("the root of the picture has mode %v, want a directory", root.Node.Mode)
+			t.Fatalf("the root of the picture has kind %v, want a directory", root.Node.Kind)
 		}
 	}},
 
@@ -401,7 +402,7 @@ var snapshotCases = []testCase{
 			mirror, at := picture(t, s, 1, func(step int) {
 				switch step % 6 {
 				case 0:
-					mustSucceed(t, s.SetAttr(ctx(t), "a/b/c/deep", storage.AttrChange{Mode: mode(0o600)}))
+					mustSucceed(t, s.SetAttr(ctx(t), "a/b/c/deep", storage.AttrChange{ModTime: instant(1700000000)}))
 				case 1:
 					put(t, s, "a/b/c/deep", int64(100+step))
 				case 2:
@@ -840,13 +841,14 @@ func walkStore(t *testing.T, s metastore.Store) map[string]metastore.Node {
 // rather than ==, because two instants that are the same moment may carry different monotonic
 // readings and different locations.
 func sameNode(a, b metastore.Node) bool {
-	return a.ID == b.ID && a.Mode == b.Mode && a.Size == b.Size &&
-		a.AccessTime.Equal(b.AccessTime) && a.ModTime.Equal(b.ModTime) && a.Content == b.Content
+	return a.ID == b.ID && a.Kind == b.Kind && a.Size == b.Size &&
+		a.AccessTime.Equal(b.AccessTime) && a.ModTime.Equal(b.ModTime) && a.Content == b.Content &&
+		sameOptionalTime(a.BirthTime, b.BirthTime) && sameOptionalTime(a.ChangeTime, b.ChangeTime) && sameMetadata(a.Metadata, b.Metadata) && bytes.Equal(a.LinkTarget, b.LinkTarget) && bytes.Equal(a.DirectoryRevision, b.DirectoryRevision)
 }
 
 func readChanges(ctx context.Context, log metastore.Log, after metastore.Position, limit int) ([]metastore.Change, metastore.Retention, error) {
 	result, err := metastore.NewChangeResult(64<<20, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
-		return 256 + lengths.Name + lengths.FromName + lengths.Content, nil
+		return 256 + lengths.Name + lengths.FromName + lengths.Content + lengths.Metadata + lengths.Target, nil
 	})
 	if err != nil {
 		return nil, metastore.Retention{}, err
@@ -861,7 +863,7 @@ func readChanges(ctx context.Context, log metastore.Log, after metastore.Positio
 
 func readRows(ctx context.Context, snap metastore.Snap, limit int) ([]metastore.Row, bool, error) {
 	result, err := metastore.NewRowResult(64<<20, 0, func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
-		return 192 + lengths.Name + lengths.Content, nil
+		return 192 + lengths.Name + lengths.Content + lengths.Metadata + lengths.Target, nil
 	})
 	if err != nil {
 		return nil, false, err
@@ -912,7 +914,7 @@ func build(t *testing.T, s metastore.Store) {
 	// way through would have lost the file it described.
 	mustSucceed(t, s.Create(ctx(t), string([]byte{0xff, 0xfe})))
 	changed := time.Date(2400, 6, 1, 12, 0, 0, 500000000, time.UTC)
-	mustSucceed(t, s.SetAttr(ctx(t), "a/b", storage.AttrChange{Mode: mode(0o700), ModTime: &changed}))
+	mustSucceed(t, s.SetAttr(ctx(t), "a/b", storage.AttrChange{ModTime: &changed}))
 }
 
 // name builds a distinct path for a step of a case that writes while a picture is open.
@@ -936,4 +938,17 @@ func kinds(changes []metastore.Change) []metastore.ChangeKind {
 		got = append(got, c.Kind)
 	}
 	return got
+}
+
+func sameOptionalTime(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Equal(*b)
+}
+
+func sameMetadata(a, b map[string]storage.OpaquePayload) bool {
+	return maps.EqualFunc(a, b, func(x, y storage.OpaquePayload) bool {
+		return bytes.Equal(x.Version, y.Version) && bytes.Equal(x.Data, y.Data)
+	})
 }

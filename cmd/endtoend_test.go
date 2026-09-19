@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/replicated"
 )
 
@@ -219,20 +220,33 @@ func TestAnOverwriteOnOneMountpointIsSeenWhole(t *testing.T) {
 	}
 }
 
-// A symbolic-link kind and target length must survive both HTTP and FUSE. The storage
-// interface describes links but provides no operation to resolve their targets.
+// A native link's kind and target length survive HTTP and FUSE. FUSE reports
+// unsupported target resolution while retaining truthful metadata.
 func TestASymbolicLinkSurvivesTheWholeChain(t *testing.T) {
 	volume, _ := volumeFixture(t)
-	for name, content := range map[string]string{"target": "payload\n", "link": "target"} {
-		if err := volume.Write(t.Context(), name, []byte(content)); err != nil {
-			t.Fatalf("seed symbolic-link fixture: %v", err)
-		}
+	if err := volume.Write(t.Context(), "target", []byte("payload\n")); err != nil {
+		t.Fatal(err)
 	}
-	link, err := volume.Stat(t.Context(), "link")
+	root, err := volume.Stat(t.Context(), "")
 	if err != nil {
-		t.Fatalf("stat symbolic-link fixture: %v", err)
+		t.Fatal(err)
 	}
-	s := serveStorage(t, &symlinkMetadata{Storage: volume, linkID: link.ID}, nil)
+	session, err := volume.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespace := session.(storage.NamespaceAccess)
+	if err := namespace.CheckNamespaceAccess(); err != nil {
+		t.Fatal(err)
+	}
+	_, createErr := namespace.MutateName(t.Context(), storage.NameCommand{
+		Kind: storage.NameSymlink, Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("link")},
+		Target: storage.ChildCondition{State: storage.Absent}, Initial: storage.InitialFields{LinkTarget: []byte("target")},
+	})
+	if err := errors.Join(createErr, session.Close(t.Context())); err != nil {
+		t.Fatalf("seed native symbolic link: %v", err)
+	}
+	s := serveStorage(t, volume, nil)
 	a := mountpointOn(t, s)
 
 	got, err := os.Lstat(filepath.Join(a, "link"))
@@ -263,9 +277,6 @@ func TestASymbolicLinkSurvivesTheWholeChain(t *testing.T) {
 		t.Errorf("the listing reports the link as %v, and a lookup reports %v", listed["link"], got.Mode().Type())
 	}
 
-	// Where it points is the one thing that cannot be answered: no operation the volume
-	// offers could produce it, and EOPNOTSUPP says that rather than saying this is not a
-	// link.
 	if target, err := os.Readlink(filepath.Join(a, "link")); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Errorf("readlink through the mount gave %q with error %v, want EOPNOTSUPP", target, err)
 	}

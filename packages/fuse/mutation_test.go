@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"strings"
 	"syscall"
 	"testing"
@@ -13,6 +12,7 @@ import (
 	fsbridge "github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/codetreker/remote-fs/packages/fuse/posix"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
@@ -65,11 +65,14 @@ func (s *mutationStorage) NewFileSession(ctx context.Context, options storage.Fi
 	if err != nil {
 		return nil, err
 	}
-	return &mutationSession{FileSession: session, owner: s}, nil
+	return &mutationSession{FileSession: session, NamespaceAccess: session.(storage.NamespaceAccess), AtomicFileOpener: session.(storage.AtomicFileOpener), MetadataAccess: session.(storage.MetadataAccess), owner: s}, nil
 }
 
 type mutationSession struct {
 	storage.FileSession
+	storage.NamespaceAccess
+	storage.AtomicFileOpener
+	storage.MetadataAccess
 	owner *mutationStorage
 }
 
@@ -161,8 +164,22 @@ func mutationTree(t *testing.T) (*node, *node, *mutationStorage) {
 	if err := local.Write(t.Context(), "f", []byte("contents")); err != nil {
 		t.Fatal(err)
 	}
-	mode := fs.FileMode(0600)
-	if err := local.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}); err != nil {
+	initial, err := local.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := local.Stat(t.Context(), "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := posix.Encode(0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := initial.(storage.MetadataAccess).SetMetadata(t.Context(), original.ID, posix.Namespace, original.Metadata[posix.Namespace].Version, data); err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	downstream := &mutationStorage{FileStorage: local}
@@ -210,10 +227,10 @@ func TestCreationCancellationAccountsForCompletedStages(t *testing.T) {
 		directory, changed bool
 	}{
 		{"atomic file open", "open", false, false},
-		{"opened file attributes", "stat", false, true},
+		{"opened file attributes", "open-result", false, true},
 		{"directory creation", "mkdir", true, false},
-		{"directory mode", "setattr", true, true},
-		{"directory attributes", "stat", true, true},
+		{"directory initial metadata", "mkdir-result", true, true},
+		{"directory attributes", "mkdir-observation", true, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root, _, downstream := mutationTree(t)
@@ -240,8 +257,8 @@ func TestCreationCancellationAccountsForCompletedStages(t *testing.T) {
 			if test.changed && err != nil || !test.changed && !errors.Is(err, syscall.ENOENT) {
 				t.Fatalf("volume after interrupted creation: %v", err)
 			}
-			if test.changed && !test.directory && attr.Mode.Perm() != 0600 {
-				t.Fatalf("atomic create left mode %v instead of requested 0600", attr.Mode)
+			if test.changed && !test.directory && func() bool { mode, err := permissions(attr); return err != nil || mode.Perm() != 0600 }() {
+				t.Fatalf("atomic create left mode %v instead of requested 0600", attr.Metadata)
 			}
 		})
 	}
@@ -267,9 +284,9 @@ func TestSetattrCancellationAccountsForCompletedStages(t *testing.T) {
 				if withHandle {
 					file = mutationHandle(t, n)
 				}
-				truncates := 0
+				truncates, setters := 0, 0
 				downstream.before = func(_ context.Context, op string) error {
-					if op == test.failedOp && (op != "stat" || test.valid&gofuse.FATTR_SIZE == 0 || truncates != 0) {
+					if op == test.failedOp && (op != "stat" || test.valid&gofuse.FATTR_SIZE != 0 && truncates != 0 || test.valid&gofuse.FATTR_SIZE == 0 && setters != 0) {
 						return context.Canceled
 					}
 					return nil
@@ -277,6 +294,9 @@ func TestSetattrCancellationAccountsForCompletedStages(t *testing.T) {
 				downstream.after = func(op string) {
 					if op == "truncate" {
 						truncates++
+					}
+					if op == "setattr" {
+						setters++
 					}
 				}
 				err := n.setattr(t.Context(), file, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
@@ -388,8 +408,13 @@ func TestMutationSuccessIgnoresLateCancellation(t *testing.T) {
 			root, n, downstream := mutationTree(t)
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
+			observations := 0
 			downstream.after = func(op string) {
 				if op == "stat" {
+					observations++
+					if operation == "setattr" && observations == 1 {
+						return
+					}
 					cancel()
 				}
 			}
@@ -426,4 +451,60 @@ func TestSetattrCanceledBeforeStartingHasNoEffects(t *testing.T) {
 	if body, err := downstream.FileStorage.Read(t.Context(), "f"); err != nil || string(body) != "contents" {
 		t.Fatalf("pre-canceled setattr changed %q, %v", body, err)
 	}
+}
+
+func (s *mutationSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
+	if err := s.owner.enter(ctx, "open"); err != nil {
+		return storage.OpenResult{}, err
+	}
+	result, err := s.AtomicFileOpener.OpenAt(ctx, name, options)
+	if err != nil {
+		return result, err
+	}
+	if err := s.owner.enter(ctx, "open-result"); err != nil {
+		return result, err
+	}
+	if result.File != nil {
+		result.File = &mutationFile{File: result.File, owner: s.owner}
+	}
+	s.owner.finish("open", nil)
+	s.owner.finish("stat", nil)
+	return result, nil
+}
+
+func (s *mutationSession) MutateName(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
+	if err := s.owner.enter(ctx, "mkdir"); err != nil {
+		return storage.NameResult{}, err
+	}
+	result, err := s.NamespaceAccess.MutateName(ctx, command)
+	if err != nil {
+		return result, err
+	}
+	s.owner.finish("mkdir", nil)
+	for _, stage := range []string{"mkdir-result", "mkdir-observation"} {
+		if err := s.owner.enter(ctx, stage); err != nil {
+			return result, afterMutation(true, err)
+		}
+	}
+	s.owner.finish("stat", nil)
+	return result, nil
+}
+
+func (s *mutationSession) SetMetadata(ctx context.Context, id uint64, namespace string, version, data []byte) (storage.OpaquePayload, error) {
+	if err := s.owner.enter(ctx, "setattr"); err != nil {
+		return storage.OpaquePayload{}, err
+	}
+	result, err := s.MetadataAccess.SetMetadata(ctx, id, namespace, version, data)
+	return result, s.owner.finish("setattr", err)
+}
+
+func (f *mutationFile) CheckMetadataAccess() error {
+	return f.File.(storage.ReferenceMetadataAccess).CheckMetadataAccess()
+}
+func (f *mutationFile) SetMetadata(ctx context.Context, namespace string, version, data []byte) (storage.OpaquePayload, error) {
+	if err := f.owner.enter(ctx, "setattr"); err != nil {
+		return storage.OpaquePayload{}, err
+	}
+	result, err := f.File.(storage.ReferenceMetadataAccess).SetMetadata(ctx, namespace, version, data)
+	return result, f.owner.finish("setattr", err)
 }

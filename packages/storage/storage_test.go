@@ -2,7 +2,6 @@ package storage_test
 
 import (
 	"errors"
-	"io/fs"
 	"math"
 	"syscall"
 	"testing"
@@ -54,30 +53,19 @@ func TestSpaceRejectsImpossibleCapacity(t *testing.T) {
 }
 
 func TestAttrKindAndChangeValidation(t *testing.T) {
-	for _, mode := range []fs.FileMode{0o600, fs.ModeDir | 0o755, fs.ModeSymlink | 0o777} {
-		if got := (storage.Attr{Mode: mode}).IsDir(); got != (mode&fs.ModeDir != 0) {
-			t.Fatalf("IsDir(%v) = %v", mode, got)
+	for _, kind := range []storage.NodeKind{storage.NodeRegular, storage.NodeDirectory, storage.NodeSymlink} {
+		if got := (storage.Attr{Kind: kind}).IsDir(); got != (kind == storage.NodeDirectory) {
+			t.Fatalf("kind%d directory=%v", kind, got)
 		}
 	}
-	zeroTime := time.Time{}
-	zeroMode := fs.FileMode(0)
-	for _, change := range []storage.AttrChange{{Mode: &zeroMode}, {AccessTime: &zeroTime}, {ModTime: &zeroTime}} {
+	zero := time.Time{}
+	for _, change := range []storage.AttrChange{{BirthTime: &zero}, {ChangeTime: &zero}, {AccessTime: &zero}, {ModTime: &zero}} {
 		if change.Empty() || change.Check() != nil {
-			t.Errorf("explicit zero change rejected: %+v", change)
+			t.Fatalf("explicit zero instant rejected: %+v", change)
 		}
 	}
 	if !(storage.AttrChange{}).Empty() || (storage.AttrChange{}).Check() != nil {
-		t.Fatal("empty change is invalid")
-	}
-	for _, mode := range []fs.FileMode{storage.SettableMode, 0o640, fs.ModeDir, fs.ModeSymlink, fs.ModeAppend, fs.ModeExclusive} {
-		err := (storage.AttrChange{Mode: &mode}).Check()
-		if mode&^storage.SettableMode == 0 {
-			if err != nil {
-				t.Fatal(err)
-			}
-		} else if !errors.Is(err, syscall.EINVAL) {
-			t.Fatalf("mode %v returned %v", mode, err)
-		}
+		t.Fatal("empty time change rejected")
 	}
 }
 
@@ -87,7 +75,7 @@ func TestListResultReportsConfiguredBound(t *testing.T) {
 		t.Fatal("nil result has a nonzero bound")
 	}
 	for _, limit := range []int64{0, 1, math.MaxInt64} {
-		result, err := storage.NewListResult(limit, 0, func(int, int64, storage.Attr) (int64, error) { return 0, nil })
+		result, err := storage.NewListResult(limit, 0, func(int, int64, int64, storage.Attr) (int64, error) { return 0, nil })
 		if err != nil {
 			t.Fatal(err)
 		}

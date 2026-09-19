@@ -1,0 +1,111 @@
+package smb
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/codetreker/remote-fs/packages/metastore"
+)
+
+func gateEstablishWatcher(t *testing.T, m *notificationManager, key string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := m.watch(ctx, key, notificationIdentity{ID: 1, Directory: true}, 1, true, 4096)
+		result <- err
+	}()
+	waitNotify(t, func() bool { m.mu.Lock(); defer m.mu.Unlock(); w := m.watchers[key]; return w != nil && w.ready })
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("establish watch: %v", err)
+	}
+}
+
+func TestGateNotifyRescanRetainsGapEvents(t *testing.T) {
+	stream := testNotifyStream()
+	source := testNotifySource(stream)
+	var tail atomic.Int64
+	var checkpoints atomic.Int64
+	source.Checkpoint = func(context.Context) (metastore.LogBarrier, error) {
+		checkpoints.Add(1)
+		return metastore.LogBarrier{Incarnation: "history", Position: metastore.Position(tail.Load())}, nil
+	}
+	limits := DefaultLimits()
+	limits.MaxNotifyEvents = 1
+	manager, err := newNotificationManager(t.Context(), source, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	gateEstablishWatcher(t, manager, "open")
+	establishedCheckpoints := checkpoints.Load()
+	stream.changes <- namedChange(1, metastore.Created, "overflow-a", 0)
+	stream.changes <- namedChange(2, metastore.Created, "overflow-b", 0)
+	tail.Store(2)
+	waitNotify(t, func() bool { manager.mu.Lock(); defer manager.mu.Unlock(); return manager.position == 2 })
+	if _, err := manager.watch(t.Context(), "open", notificationIdentity{ID: 1, Directory: true}, 1, true, 4096); !errors.Is(err, ErrNotifyRescan) {
+		t.Fatalf("overflow: %v", err)
+	}
+	stream.changes <- namedChange(3, metastore.Created, "created-during-rearm", 0)
+	tail.Store(3)
+	waitNotify(t, func() bool { manager.mu.Lock(); defer manager.mu.Unlock(); return manager.position == 3 })
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	events, err := manager.watch(ctx, "open", notificationIdentity{ID: 1, Directory: true}, 1, true, 4096)
+	if err != nil || len(events) != 1 || events[0].Name != "created-during-rearm" {
+		t.Fatalf("rescan lost the rearm gap: events=%v error=%v", events, err)
+	}
+	if checkpoints.Load() != establishedCheckpoints {
+		t.Fatalf("established watch was rebaselined %d times", checkpoints.Load())
+	}
+}
+
+func TestGateNotifyRescanRejectsReplacedSource(t *testing.T) {
+	oldStream, newStream := testNotifyStream(), testNotifyStream()
+	var subscriptions atomic.Int64
+	source := testNotifySource(oldStream)
+	source.Subscribe = func(context.Context) (ChangeStream, error) {
+		if subscriptions.Add(1) == 1 {
+			return oldStream, nil
+		}
+		return newStream, nil
+	}
+	manager, err := newNotificationManager(t.Context(), source, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	gateEstablishWatcher(t, manager, "old-open")
+	oldStream.failures <- syscall.ESTALE
+	waitNotify(t, func() bool { manager.mu.Lock(); defer manager.mu.Unlock(); return manager.failure != nil })
+	if err := manager.Health(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if subscriptions.Load() != 2 {
+		t.Fatalf("source was not replaced: %d", subscriptions.Load())
+	}
+	if _, err := manager.watch(t.Context(), "old-open", notificationIdentity{ID: 1, Directory: true}, 1, true, 4096); !errors.Is(err, ErrNotifyRescan) {
+		t.Fatalf("old-source notification: %v", err)
+	}
+	manager.mu.Lock()
+	ready := manager.watchers["old-open"].ready
+	manager.mu.Unlock()
+	if ready {
+		t.Fatal("a replaced source preserved the old watch registration")
+	}
+	gateEstablishWatcher(t, manager, "old-open")
+	newStream.changes <- namedChange(1, metastore.Created, "new-source", 0)
+	waitNotify(t, func() bool { manager.mu.Lock(); defer manager.mu.Unlock(); return manager.position == 1 })
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	events, err := manager.watch(ctx, "old-open", notificationIdentity{ID: 1, Directory: true}, 1, true, 4096)
+	if err != nil || len(events) != 1 || events[0].Name != "new-source" {
+		t.Fatalf("new-source watch: %v %v", events, err)
+	}
+}

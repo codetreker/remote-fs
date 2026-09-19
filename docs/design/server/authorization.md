@@ -26,67 +26,84 @@ Authorizer 用业务自己的 context key 取得稳定访问身份，读取当�
 
 ## 二、操作映射
 
-storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transport-neutral 字符串。[Op 前缀常量](../../../packages/storage/operations.go)在文件请求中直接作为 JSON `op` 的值，wire dispatch 与 AccessRequest.Operation 使用同一标识；普通 volume、复制与强锁的 URL 保留传输名称，在路由 opSpec 中登记对应语义。下表是这些入口的完整对应，file 行第二项是 body 的规范操作值。普通、bounded 与 confirmation barrier 变体使用同一语义，HTTP 方法本身不划分读写权限。业务策略对未知操作默认拒绝。
+storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transport-neutral 字符串。[Op 前缀常量](../../../packages/storage/operations.go)通常直接作为文件 JSON `op` 的值；目录 metadata 与引用名字观察使用 HTTP 自己的 discriminator，固定映射到既有 replication.snapshot，NameCommand 则映射实际名字效果。普通 volume、复制与强锁的 URL 保留传输名称，在路由 opSpec 中登记对应语义。下表是这些入口的完整对应，file 行第二项是 body 的规范操作值。普通、bounded 与 confirmation barrier 变体使用同一语义，HTTP 方法本身不划分读写权限。业务策略对未知操作默认拒绝。
 
 | Operation | HTTP wire 入口／动作 | 被授权的语义 |
 |---|---|---|
-| `volume.stat` | `/v3/stat` | 读取路径属性 |
-| `volume.list` | `/v3/list` | 列出目录，含 bounded listing |
-| `volume.read` | `/v3/read` | 读取完整文件，含 bounded read |
-| `volume.space` | `/v3/space` | 查询容量 |
-| `volume.set-attr` | `/v3/setattr` | 修改路径属性 |
-| `volume.write` | `/v3/write` | 创建缺失的文件或替换已有路径内容 |
-| `volume.create` | `/v3/create` | 创建文件 |
-| `volume.mkdir` | `/v3/mkdir` | 创建目录 |
-| `volume.remove` | `/v3/remove` | 删除文件名字 |
-| `volume.remove-dir` | `/v3/removedir` | 删除目录 |
-| `volume.rename` | `/v3/rename` | 在同一 volume 内改名或覆盖目标 |
-| `replication.subscribe` | `/v3/subscribe` | 开始订阅及该订阅后续输出 |
-| `replication.resubscribe` | `/v3/resubscribe` | 按游标续订及其后续输出 |
-| `replication.snapshot` | `/v3/snapshot` | 捕获快照及发送整份快照 |
-| `replication.checkpoint` | `/v3/checkpoint` | 读取日志化身与已提交位置 |
-| `file.session-open` | `/v3/file`，`file.session-open` | 建立 FileSession |
-| `file.status` | `/v3/file-control`，`file.status` | 查询 FileSession 状态与历史边界 |
-| `file.renew` | `/v3/file-control`，`file.renew` | 续期 FileSession |
-| `file.session-close` | `/v3/file-control`，`file.session-close` | 关闭 FileSession |
-| `file.stat-node` | `/v3/file`，`file.stat-node` | 按节点身份读取属性 |
-| `file.set-node-attr` | `/v3/file`，`file.set-node-attr` | 按节点身份修改属性 |
-| `file.open` | `/v3/file`，`file.open` | 按路径打开，携带 OpenAccess |
-| `file.open-node` | `/v3/file`，`file.open-node` | 按节点身份打开，携带 OpenAccess |
-| `file.ack` | `/v3/file-control`，`file.ack` | 确认已交付的打开引用 |
-| `file.stat` | `/v3/file`，`file.stat` | 查询保留引用的属性 |
-| `file.read` | `/v3/file`，`file.read` | 按保留引用读取范围 |
-| `file.write` | `/v3/file`，`file.write` | 按保留引用修改范围 |
-| `file.truncate` | `/v3/file`，`file.truncate` | 改变保留文件长度 |
-| `file.set-attr` | `/v3/file`，`file.set-attr` | 修改保留文件属性 |
-| `file.sync` | `/v3/file`，`file.sync` | 同步检查已发布文件状态 |
-| `file.get-lock` | `/v3/file-control`，`file.get-lock` | 查询 advisory 冲突 |
-| `file.set-lock` | `/v3/file-control`，`file.set-lock` | 申请或转换共享／排他 advisory 锁 |
-| `file.unlock` | `/v3/file-control`，`file.unlock` | 显式解除 advisory 锁或范围 |
-| `file.query-lock` | `/v3/file-control`，`file.query-lock` | 核对 advisory 请求结果 |
-| `file.cancel-lock` | `/v3/file-control`，`file.cancel-lock` | 取消／核对原 advisory 请求 |
-| `file.drop-locks` | `/v3/file-control`，`file.drop-locks` | 清理指定 owner／family 的锁 |
-| `file.close` | `/v3/file-control`，`file.close` | 关闭一个保留文件引用 |
-| `lock.session-enrollment` | `/v3/session-enrollment` | 申请强占有会话 enrollment ticket |
-| `lock.session-open` | `/v3/session-open` | 使用 ticket 建立强占有会话 |
-| `lock.session-close` | `/v3/session-close` | 关闭强占有会话 |
-| `lock.owner-create` | `/v3/owner-create` | 建立强占有 owner |
-| `lock.owner-retire` | `/v3/owner-retire` | 退役强占有 owner |
-| `lock.resolve` | `/v3/lock-resolve` | 取得逻辑资源引用 |
-| `lock.acquire` | `/v3/lock-acquire` | 申请强 S／X 占有 |
-| `lock.renew` | `/v3/lock-renew` | 续期强占有 |
-| `lock.release` | `/v3/lock-release` | 释放强占有 |
-| `lock.cancel` | `/v3/lock-cancel` | 取消／核对强占有动作 |
-| `lock.query-action` | `/v3/lock-query-action` | 查询动作历史 |
-| `lock.query-grant` | `/v3/lock-query-grant` | 查询 grant 当前状态 |
-| `lock.status` | `/v3/lock-status` | 查询授权方状态 |
+| `volume.stat` | `/v4/stat` | 读取路径属性 |
+| `volume.list` | `/v4/list` | 列出目录，含 bounded listing |
+| `volume.read` | `/v4/read` | 读取完整文件，含 bounded read |
+| `volume.space` | `/v4/space` | 查询容量 |
+| `volume.set-attr` | `/v4/setattr` | 修改路径属性 |
+| `volume.write` | `/v4/write` | 创建缺失的文件或替换已有路径内容 |
+| `volume.create` | `/v4/create` | 创建文件 |
+| `volume.mkdir` | `/v4/mkdir` | 创建目录 |
+| `volume.remove` | `/v4/remove` | 删除文件名字 |
+| `volume.remove-dir` | `/v4/removedir` | 删除目录 |
+| `volume.rename` | `/v4/rename` | 在同一 volume 内改名或覆盖目标 |
+| `replication.subscribe` | `/v4/subscribe` | 开始订阅及该订阅后续输出 |
+| `replication.resubscribe` | `/v4/resubscribe` | 按游标续订及其后续输出 |
+| `replication.snapshot` | `/v4/snapshot`；`/v4/file` 的 `file-observe-directory-metadata`、`file-observe-name` | 整份快照，或有界目录 metadata/当前绑定披露；两个观察请求的 OpenAccess 为零 |
+| `replication.checkpoint` | `/v4/checkpoint` | 读取日志化身与已提交位置 |
+| `file.session-open` | `/v4/file`，`file.session-open` | 建立 FileSession |
+| `file.status` | `/v4/file-control`，`file.status` | 查询 FileSession 状态与历史边界 |
+| `file.renew` | `/v4/file-control`，`file.renew` | 续期 FileSession |
+| `file.session-close` | `/v4/file-control`，`file.session-close` | 关闭 FileSession |
+| `file.stat-node` | `/v4/file`，`file.stat-node` | 按节点身份读取属性 |
+| `file.set-node-attr` | `/v4/file`，`file.set-node-attr` | 按节点身份修改属性 |
+| `file.open` | `/v4/file`，`file.open` | 按路径打开，携带 OpenAccess |
+| `file.open-node` | `/v4/file`，`file.open-node` | 按节点身份打开，携带 OpenAccess |
+| `file.ack` | `/v4/file-control`，`file.ack` | 确认已交付的打开引用 |
+| `file.stat` | `/v4/file`，`file.stat` | 查询保留引用的属性 |
+| `file.read` | `/v4/file`，`file.read` | 按保留引用读取范围 |
+| `file.write` | `/v4/file`，`file.write` | 按保留引用修改范围 |
+| `file.truncate` | `/v4/file`，`file.truncate` | 改变保留文件长度 |
+| `file.set-attr` | `/v4/file`，`file.set-attr` | 修改保留文件属性 |
+| `file.sync` | `/v4/file`，`file.sync` | 同步检查已发布文件状态 |
+| `file.open-at` | `/v4/file` | 按父身份/原始叶名原子打开，携带 OpenAccess 与额外效果准入 |
+| `file.lookup-at` | `/v4/file` | 按父身份查询一个叶名的 metadata |
+| `file.read-dir-node` | `/v4/file` | 按目录身份读取有界列表；原生从操作派生 ReadEntries |
+| `file.mutate-name`（wire） | `/v4/file` | Authorizer 按 NameCommand.Kind 接收对应 volume.create/mkdir/remove/remove-dir/rename |
+| `file.open-node-ref`、`file.open-child-ref` | `/v4/file` | 元数据/目录引用打开，OpenAccess 表示其 metadata 读写/创建意图 |
+| `file.state` | `/v4/file` | 一次捕获引用属性、link target 与 detached/pending 状态 |
+| `file.scope` | `/v4/file-control` | 取得确切引用 Scope |
+| `file.set-node-metadata`、`file.set-metadata` | `/v4/file` | 按节点或引用 CAS 修改指定 namespace |
+| `file.new-use-owner`、`file.retire-use-owner` | `/v4/file-control` | 注册/退役绑定引用的 owner |
+| `file.range-get-conflict` | `/v4/file-control` | 无副作用地查询实际范围冲突 |
+| `file.range-apply` | `/v4/file-control` | 接纳范围批量编辑，包括获取、转换或解除 |
+| `file.range-query`、`file.range-cancel` | `/v4/file-control` | 核对/取消原范围动作，保留授予事实 |
+| `file.range-drop` | `/v4/file-control` | 清理 owner 在指定域的状态 |
+| `file.set-pending-unlink`、`file.clear-pending-unlink` | `/v4/file` | 设置或按 generation 清除节点 pending 状态 |
+| `file.mutate` | `/v4/file` | 条件文件修改；另核对实际 write/truncate/attr/metadata 语义 |
+| `file.close` | `/v4/file-control`，`file.close` | 关闭一个保留文件引用 |
+| `lock.session-enrollment` | `/v4/session-enrollment` | 申请强占有会话 enrollment ticket |
+| `lock.session-open` | `/v4/session-open` | 使用 ticket 建立强占有会话 |
+| `lock.session-close` | `/v4/session-close` | 关闭强占有会话 |
+| `lock.owner-create` | `/v4/owner-create` | 建立强占有 owner |
+| `lock.owner-retire` | `/v4/owner-retire` | 退役强占有 owner |
+| `lock.resolve` | `/v4/lock-resolve` | 取得逻辑资源引用 |
+| `lock.acquire` | `/v4/lock-acquire` | 申请强 S／X 占有 |
+| `lock.renew` | `/v4/lock-renew` | 续期强占有 |
+| `lock.release` | `/v4/lock-release` | 释放强占有 |
+| `lock.cancel` | `/v4/lock-cancel` | 取消／核对强占有动作 |
+| `lock.query-action` | `/v4/lock-query-action` | 查询动作历史 |
+| `lock.query-grant` | `/v4/lock-query-grant` | 查询 grant 当前状态 |
+| `lock.status` | `/v4/lock-status` | 查询授权方状态 |
 
 
 副本构建还需要 replication.checkpoint 的明确许可；允许订阅或快照不隐含这项权限。Checkpoint 是一次普通读取，遵循入口授权、通用传输预算和安全错误规则，不建立持续输出。
 
-`FileOpenOptions` 嵌入共享的 `storage.OpenAccess`，其 Read、Write、Create、Truncate、Exclusive 与 AccessRequest.Open 是同一类型。Open 的合法性仍由 FileOpenOptions.Check／CheckNode 连同 mode、节点身份验证。AccessRequest.Open 仅在 file.open／file.open-node 携带这份已验证的值，其它操作为零值；open-node 不接受 Create／Exclusive。带 Create 的打开即使最终打开已有文件，也报告创建意图。一次入口 callback 同时决定全部打开意图，允许之后才创建、截断或分配文件引用。
+FileOpenOptions 继续用 OpenAccess 的 Read/Write/Create/Truncate/Exclusive，ExpectedID 与 InitialMetadata 由其 Check/CheckNode 验证。OpenAt 转成同一 OpenAccess：ResetContent 表示截断，ReplaceNode 另外要求 volume.remove；armed intent 另外要求 file.set-pending-unlink。reset 的共同属性或 metadata 更新还分别要求 file.set-attr/file.set-metadata。NodeReference 打开的 OpenAccess.Read 包含 ReadMetadata 或已声明的 ReadData/ReadEntries，OpenAccess.Write 包含 WriteMetadata 或已声明的 WriteData，Create/Exclusive 保留原含义。handler 在 native 打开前授权这份完整意图；相容性 claim 不授予字节方法、metadata 权限或目录枚举权限，不能因引用没有字节方法而从授权中删去读写 claim。
 
-`volume.write` 可以创建缺失文件，单独拒绝 volume.create 不能禁止创建。file.set-lock 表达共享／排他申请与转换；file.unlock 是独立的 wire 操作与策略操作，必须携带 Unlock 类型；file.set-lock 不能携带 Unlock。EX flock 可用于只读 fd，锁模式不代替内容写权限；后续内容修改仍检查 file.write 等操作。
+NameCommand 不以包装名称逃避基础语义：Create/Symlink 使用 volume.create，Mkdir/Remove/RemoveDir/Rename 使用各自已有 Operation。ConditionalFileMutation 先授权 file.mutate，再按实际内容分别核对 file.write、file.truncate、file.set-attr 和 file.set-metadata。所有需要的 callback 通过后才进入 native 效果，不能先完成一部分再补授权。
+
+volume.write 本来可以创建缺失节点，单独拒绝 volume.create 不禁止它。Range Apply 授权整个中立编辑请求，Range Drop 是独立清理操作；平台锁模式与 owner 归属不替代字节 I/O 的 file.read/file.write 准入。
+
+FUSE 目录打开只声明读取 metadata/entries；随后经活引用拥有者序列化的目录 fd 属性修改分别使用既有 file.set-node-attr 与 file.set-node-metadata 授权。读打开不授予这些修改，原 HTTP OpenAccess 映射保持不变。
+
+“无 Scope”不是匿名业务身份。ReadDirNode 仍绑定 FileSession/store 的可信 volume 和现有 request context；handler 固定授权 file.read-dir-node，native 派生 ReadEntries，调用者不能用空 Uses 跳过检查。无 Scope 时检查全部适用 claims，不豁免同 session；有效 Scope 只给确切引用自我豁免。公开路径 List 走 volume.list 并同样在 authority 检查用途；内部复制 metadata 的权限与公开目录枚举不是可互换的入口。
+
+目录 metadata 与引用名字观察固定使用当前认证 context、选定 volume 的 OpReplicationSnapshot。持有引用、允许 ReadMetadata/ReadEntries 或允许 rename，都不隐含这项披露授权；snapshot 权限也不授予应用枚举、读属性、修改或监听。有效 DeleteName-only 引用可以在该权限允许下观察名字，但 State/Stat 仍执行自己的属性权限，实际 rename 仍检查独立授权及 DeleteName。外来、失效或关闭的 Scope/引用在授权后也必须失败，不降级成裸身份读取。直接 Go 嵌入沿原 host 授权边界。
 
 ## 三、请求、capability 与关闭
 
@@ -94,7 +111,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 
 1. 业务 middleware 验证凭据，将稳定身份放入 request context。
 2. handler 验证协议、方法、动作、大小与参数。通用的有界请求／响应 admission 可在策略前限制调用和错误响应占用，也可先返回传输层 EAGAIN；该层不查询受控状态。
-3. handler 从已解码语义构造一个 AccessRequest，执行一次入口 Authorize。
+3. handler 从已解码语义构造 AccessRequest，执行本次操作及其必需额外效果的 Authorize。
 4. 允许后才读取或触碰 capability、分配引用或动作、重放回执、读取 Log、取得订阅／snapshot／page 资源或访问 backend。存储权限、配额、锁与原有取消分类继续生效。
 
 格式合法但不存在的 capability、无 Log（包括 publisher 为 nil）或错误续订游标，在拒绝时只返回授权错误；允许后才返回原有 ESTALE／ENOSYS 等结果。旧 RequestID、成功过的动作与已有 capability 均不能省略检查。ack、renew、status、history、cancel、unlock、release、retire 与 close 各自可被拒绝。
@@ -107,7 +124,7 @@ Stop 非阻塞地发出取消／停止通知。嵌入方使用 `Stop → HTTP Sh
 
 ## 四、持续输出与撤权
 
-启用 Authorizer 时，subscribe、resubscribe、snapshot 的入口 callback 与拒绝响应占用现有通用 response admission；允许后先释放该名额，再访问 Log、订阅或 snapshot 资源。未配置 hook 时不增加这项 stream 入口占用，既有容量参数不变。入口授权先于 Log 可用性判断、捕获和受控资源准入。每个 start／rebuild、change、snapshot open／rows／done 与 keepalive 在发送前再次调用相同 Operation 和 AccessRequest，使用同一业务身份 context 查询当前策略。游标只选择历史；快照授权覆盖整份捕获视图。
+启用 Authorizer 时，subscribe、resubscribe、snapshot 的入口 callback 与拒绝响应占用现有通用 response admission；允许后先释放该名额，再访问 Log、订阅或 snapshot 资源。未配置 Authorizer 时不增加这项 stream 入口占用，既有容量参数不变。入口授权先于 Log 可用性判断、捕获和受控资源准入。每个 start／rebuild、change、snapshot open／rows／done 与 keepalive 在发送前再次调用相同 Operation 和 AccessRequest，使用同一业务身份 context 查询当前策略。游标只选择历史；快照授权覆盖整份捕获视图。
 
 初始允许后可进行现有的有界、producer 拥有的 snapshot 预取；frame admission 与 Snap.Next 响应派生 context 的取消。每页出站前仍重新检查。拒绝或策略故障使排队页面、保活和成功 done 停止发送，只尝试一次固定 terminal fault，不为 fault 再调用策略。取消 producer、等待其退出、释放排队页面预留后，由原拥有者关闭 snapshot 和释放订阅资源。违反取消契约且仍使用 snapshot 的 backend 不能被并发强制关闭、遗弃或报告清理成功。
 
@@ -127,9 +144,9 @@ Stop 非阻塞地发出取消／停止通知。嵌入方使用 `Stop → HTTP Sh
 
 [内部授权错误](../../../packages/transport/httprest/authorization.go)的 Error() 返回固定文本，Classification() 拥有可信 errno，Unwrap() 保留原 cause。原错误不直接进入普通、file、lock 或 stream writer；writer 不沿策略错误链重新分类或发送其文本。原请求／handler 取消优先于 callback 分类；这一适配不改写普通存储错误或未知动作结果。
 
-未开始 stream 时，授权错误使用 v3 协议标记、422 和普通 `{errno,message}`。强锁 decoder 遇到 lockCode 或 recorded 任一字段，都必须校验完整 native envelope；字段缺失、损坏不转入普通分支。只有精确的普通 errno/message 结构及 EACCES／EIO 才是 dispatch 前的授权失败，header、标记和大小限制仍须满足。授权错误不携带伪造的 native code、recorded 或动作回执。
+未开始 stream 时，授权错误使用 v4 协议标记、422 和普通 `{errno,message}`。强锁 decoder 遇到 lockCode 或 recorded 任一字段，都必须校验完整 native envelope；字段缺失、损坏不转入普通分支。只有精确的普通 errno/message 结构及 EACCES／EIO 才是 dispatch 前的授权失败，header、标记和大小限制仍须满足。授权错误不携带伪造的 native code、recorded 或动作回执。
 
-stream fault 保留 message 并增加可选 errno，只接受 EACCES／EIO；缺省 errno 的 generic fault 仍为 EIO，null、空值、畸形或未知 errno，以及重复的 errno／message 字段，都是协议 EIO。该字段沿用 v3。直接 HTTP SDK 在所有初始 frame 与 Next 包装处保留有效 typed EACCES／EIO；replica 观察 follower 失败后仍统一以 EIO 使本地视图不可用。经失效副本回答的 FUSE 元数据错误因此可为 EIO，不能伪造空目录或不存在。
+stream fault 保留 message 并增加可选 errno，只接受 EACCES／EIO；缺省 errno 的 generic fault 仍为 EIO，null、空值、畸形或未知 errno，以及重复的 errno／message 字段，都是协议 EIO。该字段属于 v4。直接 HTTP SDK 在所有初始 frame 与 Next 包装处保留有效 typed EACCES／EIO；replica 观察 follower 失败后仍统一以 EIO 使本地视图不可用。经失效副本回答的 FUSE 元数据错误因此可为 EIO，不能伪造空目录或不存在。
 
 ## 六、嵌入示例与观测
 
@@ -169,11 +186,9 @@ func newAuthorizedHandler(
         access, err := lookup(ctx, identity, r.Volume)
         if err != nil { return err }
         if !access.Allowed[r.Operation] { return authz.ErrDenied }
-        if r.Operation == storage.OpFileOpen || r.Operation == storage.OpFileOpenNode {
-            if r.Open.Read && !access.CanRead { return authz.ErrDenied }
-            if (r.Open.Write || r.Open.Create || r.Open.Truncate) && !access.CanWrite {
-                return authz.ErrDenied
-            }
+        if r.Open.Read && !access.CanRead { return authz.ErrDenied }
+        if (r.Open.Write || r.Open.Create || r.Open.Truncate) && !access.CanWrite {
+            return authz.ErrDenied
         }
         return nil
     })

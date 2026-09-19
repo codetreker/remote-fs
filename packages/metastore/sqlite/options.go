@@ -29,6 +29,10 @@ const (
 	// one full integrity pass.
 	DefaultMaxIntegrityBytes int64 = 64 << 20
 
+	// DefaultMaxMetadataBytes bounds opaque metadata and link targets, including
+	// detached nodes and copies retained in the volume's change history.
+	DefaultMaxMetadataBytes int64 = 64 << 20
+
 	// MinIntegrityRecords is the volume row, root node, and log row every usable volume
 	// contains.
 	MinIntegrityRecords int64 = 3
@@ -67,6 +71,10 @@ type Options struct {
 	// a full integrity pass before content-sensitive validation. Zero selects
 	// DefaultMaxIntegrityBytes.
 	MaxIntegrityBytes int64
+
+	// MaxMetadataBytes bounds stored metadata envelopes and link targets independently
+	// of content quota and legacy name-byte validation. Zero selects the default.
+	MaxMetadataBytes int64
 }
 
 // DefaultOptions returns the default serving configuration.
@@ -80,6 +88,7 @@ func DefaultOptions() Options {
 		MaxSnapshotReaderConnections: DefaultMaxSnapshotReaderConnections,
 		MaxIntegrityRecords:          DefaultMaxIntegrityRecords,
 		MaxIntegrityBytes:            DefaultMaxIntegrityBytes,
+		MaxMetadataBytes:             DefaultMaxMetadataBytes,
 	}
 }
 
@@ -145,11 +154,19 @@ func (o Options) Effective() (Options, error) {
 	if maxIntegrityBytes == math.MaxInt64 {
 		return Options{}, fmt.Errorf("the SQLite integrity byte limit must be bounded below the largest integer: %w", syscall.EINVAL)
 	}
+	maxMetadataBytes := o.MaxMetadataBytes
+	if maxMetadataBytes == 0 {
+		maxMetadataBytes = DefaultMaxMetadataBytes
+	}
+	if maxMetadataBytes < 1 || maxMetadataBytes == math.MaxInt64 {
+		return Options{}, fmt.Errorf("the SQLite metadata byte limit must be positive and bounded: %w", syscall.EINVAL)
+	}
 	o.ObjectLimits = objectLimits
 	o.MaxReaderConnections = maxReaders
 	o.MaxSnapshotReaderConnections = maxSnapshotReaders
 	o.MaxIntegrityRecords = maxIntegrityRecords
 	o.MaxIntegrityBytes = maxIntegrityBytes
+	o.MaxMetadataBytes = maxMetadataBytes
 	return o, nil
 }
 

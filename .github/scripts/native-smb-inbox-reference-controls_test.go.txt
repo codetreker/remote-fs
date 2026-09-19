@@ -1,0 +1,582 @@
+package windows
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf16"
+)
+
+const inboxPrefix = "RFS_INBOX:"
+const inboxEnvelopeLimit = 16 << 10
+
+type inboxToken struct {
+	SID              string `json:"sid"`
+	AuthenticationID uint64 `json:"authentication_id"`
+	SessionID        uint32 `json:"session_id"`
+}
+type inboxDirectory struct {
+	Path            string `json:"path"`
+	VolumeSerialHex string `json:"volume_serial_hex"`
+	FileIndexHex    string `json:"file_index_hex"`
+	Attributes      uint32 `json:"attributes"`
+}
+type inboxCache struct {
+	File      int `json:"file"`
+	Directory int `json:"directory"`
+	NotFound  int `json:"not_found"`
+}
+type inboxStart struct {
+	Kind             string         `json:"kind"`
+	Stage            int            `json:"stage"`
+	Nonce            string         `json:"nonce"`
+	SourceSHA        string         `json:"source_sha"`
+	ExecutableSHA256 string         `json:"executable_sha256"`
+	ParentPID        int            `json:"parent_pid"`
+	Computer         string         `json:"computer"`
+	RootLocal        string         `json:"root_local"`
+	ShareUNC         string         `json:"share_unc"`
+	Drive            string         `json:"drive"`
+	ExpectedToken    inboxToken     `json:"expected_token"`
+	Directory        inboxDirectory `json:"directory"`
+	CacheSeconds     inboxCache     `json:"cache_seconds"`
+	OutputRoot       string         `json:"output_root"`
+}
+type inboxOrigin struct {
+	ShareUNC   string   `json:"share_unc"`
+	RootLocal  string   `json:"root_local"`
+	SID        string   `json:"sid"`
+	Server     string   `json:"server"`
+	SessionIDs []string `json:"session_ids"`
+	OpenIDs    []string `json:"open_ids"`
+	OpenPaths  []string `json:"open_paths"`
+	SHA256     string   `json:"sha256"`
+}
+type inboxAdmission struct {
+	Kind             string      `json:"kind"`
+	Stage            int         `json:"stage"`
+	Nonce            string      `json:"nonce"`
+	PID              int         `json:"pid"`
+	ExecutableSHA256 string      `json:"executable_sha256"`
+	Origin           inboxOrigin `json:"origin"`
+}
+type inboxMapping struct {
+	Drive string `json:"drive"`
+	UNC   string `json:"unc"`
+}
+type inboxEnvelope struct {
+	Kind                   string       `json:"kind"`
+	Stage                  int          `json:"stage"`
+	Nonce                  string       `json:"nonce"`
+	PID                    int          `json:"pid"`
+	ExecutableSHA256       string       `json:"executable_sha256"`
+	Token                  inboxToken   `json:"token"`
+	Mapping                inboxMapping `json:"mapping"`
+	ReceiptFile            string       `json:"receipt_file,omitempty"`
+	ReceiptSHA256          string       `json:"receipt_sha256,omitempty"`
+	Outcome                string       `json:"outcome,omitempty"`
+	CleanupComplete        bool         `json:"cleanup_complete"`
+	MechanismTraceComplete bool         `json:"mechanism_trace_complete"`
+	Error                  string       `json:"error,omitempty"`
+}
+type inboxCall struct {
+	Ordinal            int
+	Name               string
+	Started, Completed time.Time
+	Error              string
+}
+type inboxReceipt struct {
+	WatchOwnership                                                                                         inboxWatchOwnership
+	LocalNameKnown                                                                                         bool
+	LocalNameError                                                                                         string
+	Request                                                                                                inboxStart
+	PID                                                                                                    int
+	Token                                                                                                  inboxToken
+	ExecutableSHA256                                                                                       string
+	Exposure, ACK, Expiry                                                                                  time.Time
+	PreparedA, PreparedB, Initial, InitialRead, FirstOpen, NewIdentity, RetainedIdentity, OldRead, NewRead cacheGatePositiveValue
+	Warm                                                                                                   []cacheGatePositiveValue
+	Notifications                                                                                          []parentNativeCompletion
+	Calls                                                                                                  []inboxCall
+	Origins                                                                                                []inboxOrigin
+	Pending                                                                                                bool
+	MutationAttempted, MutationSucceeded                                                                   bool
+	RenamePayloadHex                                                                                       string
+	RenameClass                                                                                            uint32
+	RenameError, MutatorCloseError                                                                         string
+	LocalTarget, LocalRead                                                                                 cacheGatePositiveValue
+	ReplacementAbsent                                                                                      bool
+	LocalOracle                                                                                            bool
+	NativeOracle                                                                                           string
+	ObservationsComplete                                                                                   bool
+	OriginComplete                                                                                         bool
+	HelpersClean                                                                                           bool
+	MappingAttempted, MappingCreated, MappingRemoved                                                       bool
+	CleanupComplete                                                                                        bool
+	MechanismTraceComplete                                                                                 bool
+	Outcome, Error                                                                                         string
+	CleanupErrors                                                                                          []string
+}
+
+func inboxHex(value string, n int) bool {
+	if len(value) != n {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+func inboxLocalPath(path string) bool {
+	if len(path) < 4 || len(path) > 1024 || path[1] != ':' || path[2] != '\\' || !((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) || strings.ContainsAny(path, "/\x00") || strings.HasSuffix(path, "\\") {
+		return false
+	}
+	for _, component := range strings.Split(path[3:], "\\") {
+		if component == "" || component == "." || component == ".." || strings.ContainsAny(component, ":*?\"<>|") || strings.HasSuffix(component, ".") || strings.HasSuffix(component, " ") {
+			return false
+		}
+	}
+	return true
+}
+func inboxValidateStart(s inboxStart) error {
+	if s.Kind != "start" || s.Stage != 0 || !inboxHex(s.Nonce, 64) || !inboxHex(s.SourceSHA, 40) || !inboxHex(s.ExecutableSHA256, 64) || s.ParentPID <= 0 {
+		return errors.New("invalid start binding")
+	}
+	if len(s.Computer) == 0 || len(s.Computer) > 63 || strings.ContainsAny(s.Computer, "\\/.: \x00") {
+		return errors.New("invalid computer name")
+	}
+	prefix := `\\` + s.Computer + `\`
+	if !strings.HasPrefix(s.ShareUNC, prefix) || len(s.ShareUNC) == len(prefix) || strings.ContainsAny(s.ShareUNC[len(prefix):], "\\/:*?\"<>| \x00") {
+		return errors.New("invalid exact computer share")
+	}
+	if len(s.Drive) != 2 || s.Drive[0] < 'D' || s.Drive[0] > 'Z' || s.Drive[1] != ':' {
+		return errors.New("invalid drive")
+	}
+	if !inboxLocalPath(s.RootLocal) || !inboxLocalPath(s.OutputRoot) || s.Directory.Path != s.RootLocal || !inboxHex(s.Directory.VolumeSerialHex, 8) || !inboxHex(s.Directory.FileIndexHex, 16) || s.Directory.FileIndexHex == strings.Repeat("0", 16) || s.Directory.Attributes&0x10 == 0 || s.Directory.Attributes&0x400 != 0 {
+		return errors.New("invalid owned directory")
+	}
+	if s.ExpectedToken.SID == "" || s.ExpectedToken.AuthenticationID == 0 || s.CacheSeconds != (inboxCache{10, 10, 5}) {
+		return errors.New("invalid token or cache settings")
+	}
+	return nil
+}
+func inboxReadEnvelope(reader *bufio.Reader, out any) error {
+	line, err := reader.ReadSlice('\n')
+	if err != nil {
+		return fmt.Errorf("IPC line: %w", err)
+	}
+	if len(line) > inboxEnvelopeLimit || !bytes.HasPrefix(line, []byte(inboxPrefix)) {
+		return errors.New("invalid IPC envelope")
+	}
+	dec := json.NewDecoder(bytes.NewReader(line[len(inboxPrefix):]))
+	dec.DisallowUnknownFields()
+	if err = dec.Decode(out); err != nil {
+		return err
+	}
+	var extra any
+	if err = dec.Decode(&extra); err != io.EOF {
+		return errors.New("trailing IPC payload")
+	}
+	return nil
+}
+func inboxUnique(values []string) bool {
+	if len(values) == 0 || len(values) > 32 {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, value := range values {
+		if value == "" || len(value) > 1024 || seen[value] {
+			return false
+		}
+		seen[value] = true
+	}
+	return true
+}
+func inboxValidateAdmission(s inboxStart, a inboxAdmission, stage, pid int) error {
+	if a.Kind != "admit" || a.Stage != stage || (stage != 1 && stage != 2) || a.Nonce != s.Nonce || a.PID != pid || a.ExecutableSHA256 != s.ExecutableSHA256 {
+		return errors.New("foreign or out-of-order admission")
+	}
+	o := a.Origin
+	if o.ShareUNC != s.ShareUNC || o.RootLocal != s.RootLocal || o.SID != s.ExpectedToken.SID || !strings.EqualFold(o.Server, s.Computer) || !inboxHex(o.SHA256, 64) || !inboxUnique(o.SessionIDs) || !inboxUnique(o.OpenIDs) || len(o.OpenPaths) != len(o.OpenIDs) {
+		return errors.New("origin fingerprint mismatch")
+	}
+	roles := map[string]bool{}
+	for _, path := range o.OpenPaths {
+		path = strings.TrimSuffix(path, `\`)
+		if !strings.EqualFold(path, s.RootLocal) && !strings.HasPrefix(strings.ToLower(path), strings.ToLower(s.RootLocal+`\`)) {
+			return errors.New("foreign open path")
+		}
+		if !inboxLocalPath(path) {
+			return errors.New("unsafe open path")
+		}
+		roles[strings.ToLower(path)] = true
+	}
+	for _, role := range []string{s.RootLocal, s.RootLocal + `\v`, s.RootLocal + `\v\target`} {
+		if !roles[strings.ToLower(role)] {
+			return errors.New("required live open role missing")
+		}
+	}
+	return nil
+}
+func inboxRenamePayload(target string) ([]byte, error) {
+	if !inboxLocalPath(target) {
+		return nil, errors.New("rename target is not a bounded absolute local path")
+	}
+	units := utf16.Encode([]rune(target))
+	data := make([]byte, 20+2*len(units))
+	binary.LittleEndian.PutUint32(data, 3)
+	binary.LittleEndian.PutUint32(data[16:], uint32(2*len(units)))
+	for i, v := range units {
+		binary.LittleEndian.PutUint16(data[20+i*2:], v)
+	}
+	return data, nil
+}
+
+func inboxCallOrder(calls []inboxCall, openFailed bool) error {
+	expected := []string{"pending", "mutator_open", "rename_flags3", "mutator_close"}
+	if len(calls) < len(expected)+2 {
+		return errors.New("missing measured calls")
+	}
+	i := 0
+	for ; i < len(expected); i++ {
+		if calls[i].Name != expected[i] {
+			return errors.New("mutation call order changed")
+		}
+	}
+	notifications := 0
+	for i < len(calls) && calls[i].Name == "notify" {
+		i++
+		notifications++
+		if i < len(calls) && calls[i].Name == "notify_rearm" {
+			i++
+		}
+	}
+	if notifications < 1 || notifications > 3 {
+		return errors.New("notification bound changed")
+	}
+	rest := []string{"first_open", "new_identity", "retained_identity", "old_read", "new_read"}
+	if openFailed {
+		rest = rest[:1]
+	}
+	if len(calls)-i != len(rest) {
+		return errors.New("extra or missing first observations")
+	}
+	for j, name := range rest {
+		if calls[i+j].Name != name {
+			return errors.New("first observation order changed")
+		}
+	}
+	for j, call := range calls {
+		if call.Ordinal != j+1 || call.Started.IsZero() || call.Completed.Before(call.Started) || (j > 0 && call.Started.Before(calls[j-1].Completed)) {
+			return errors.New("invalid call ordinal or time")
+		}
+	}
+	return nil
+}
+func inboxClassify(r *inboxReceipt, oldData, newData []byte) string {
+	r.NativeOracle = parentRelativeIdentity(r.Initial, r.NewIdentity, r.RetainedIdentity, r.OldRead, r.NewRead, oldData, newData)
+	if r.MechanismTraceComplete {
+		return "invalid_mechanism_claim"
+	}
+	if !r.CleanupComplete || !r.HelpersClean || !r.MappingRemoved || len(r.CleanupErrors) > 0 {
+		return "cleanup_incomplete"
+	}
+	if !r.MutationAttempted || !r.Pending {
+		return "setup_refusal"
+	}
+	payload, payloadErr := inboxRenamePayload(r.Request.RootLocal + `\v\target`)
+	if !r.MutationSucceeded || r.ACK.IsZero() || r.RenameClass != 22 || payloadErr != nil || r.RenamePayloadHex != hex.EncodeToString(payload) || r.RenameError != "" {
+		return "reference_mutation_refusal"
+	}
+	if !r.OriginComplete || len(r.Origins) != 2 {
+		return "origin_incomplete"
+	}
+	if !r.ObservationsComplete || len(r.Notifications) == 0 {
+		return "observation_incomplete"
+	}
+	if r.MutatorCloseError != "" {
+		return "cleanup_incomplete"
+	}
+	if inboxCallOrder(r.Calls, r.FirstOpen.Error != "") != nil {
+		return "observation_incomplete"
+	}
+	for _, n := range r.Notifications {
+		if !n.Drained || (n.ErrorCode != 0 && n.ErrorCode != parentErrorNotifyEnum) || n.Completed.Before(r.ACK) || n.Completed.After(r.ACK.Add(850*time.Millisecond)) {
+			return "observation_incomplete"
+		}
+	}
+	if r.Exposure.IsZero() || !r.Expiry.Equal(r.Exposure.Add(5*time.Second)) || r.ACK.Before(r.Exposure) || !r.ACK.Before(r.Expiry) {
+		return "timing_incomplete"
+	}
+	values := []cacheGatePositiveValue{r.FirstOpen}
+	if r.FirstOpen.Error == "" {
+		values = append(values, r.NewIdentity, r.RetainedIdentity, r.OldRead, r.NewRead)
+	}
+	for _, value := range values {
+		if !value.Started.Before(r.Expiry) || !value.Completed.Before(r.Expiry) {
+			return "timing_incomplete"
+		}
+		if !parentWithinWindow(value, r.ACK, r.Expiry) {
+			return "native_behavior_failure"
+		}
+	}
+	if !r.LocalNameKnown || r.LocalTarget.Error != "" || r.LocalTarget.Identity == 0 || r.LocalTarget.Started.IsZero() || r.LocalRead.Error != "" || r.LocalRead.Started.IsZero() || r.LocalRead.Digest == "" {
+		return "local_truth_incomplete"
+	}
+	if r.FirstOpen.Error != "" || r.NativeOracle != "distinct_native_identity_and_preserved_bytes" || !r.LocalOracle {
+		return "native_behavior_failure"
+	}
+	return "native_behavior_pass"
+}
+func inboxTestStart() inboxStart {
+	return inboxStart{Kind: "start", Nonce: strings.Repeat("a", 64), SourceSHA: strings.Repeat("b", 40), ExecutableSHA256: strings.Repeat("c", 64), ParentPID: 10, Computer: "HOST", RootLocal: `C:\owned\share`, ShareUNC: `\\HOST\nonce-share`, Drive: "X:", ExpectedToken: inboxToken{"S-1-5-21-1", 5, 1}, Directory: inboxDirectory{`C:\owned\share`, "12345678", "0000000000000123", 16}, CacheSeconds: inboxCache{10, 10, 5}, OutputRoot: `C:\owned\output`}
+}
+func inboxTestAdmission(stage int) inboxAdmission {
+	s := inboxTestStart()
+	return inboxAdmission{Kind: "admit", Stage: stage, Nonce: s.Nonce, PID: 20, ExecutableSHA256: s.ExecutableSHA256, Origin: inboxOrigin{ShareUNC: s.ShareUNC, RootLocal: s.RootLocal, SID: s.ExpectedToken.SID, Server: s.Computer, SessionIDs: []string{"s"}, OpenIDs: []string{"r", "v", "a"}, OpenPaths: []string{s.RootLocal, s.RootLocal + `\v`, s.RootLocal + `\v\target`}, SHA256: strings.Repeat("d", 64)}}
+}
+func TestInboxReferenceIPC(t *testing.T) {
+	s := inboxTestStart()
+	if err := inboxValidateStart(s); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*inboxStart){"wrong_cache": func(s *inboxStart) { s.CacheSeconds.NotFound = 10 }, "unc_alias": func(s *inboxStart) { s.ShareUNC = `\\localhost\nonce-share` }, "path_escape": func(s *inboxStart) { s.RootLocal = `C:\owned\..\share` }, "reparse": func(s *inboxStart) { s.Directory.Attributes |= 0x400 }, "drive": func(s *inboxStart) { s.Drive = "C:" }, "zero_identity": func(s *inboxStart) { s.Directory.FileIndexHex = strings.Repeat("0", 16) }, "token": func(s *inboxStart) { s.ExpectedToken.AuthenticationID = 0 }} {
+		t.Run(name, func(t *testing.T) {
+			bad := s
+			mutate(&bad)
+			if inboxValidateStart(bad) == nil {
+				t.Fatal("unsafe start admitted")
+			}
+		})
+	}
+	good, _ := json.Marshal(s)
+	for name, line := range map[string]string{"valid": inboxPrefix + string(good) + "\n", "prefix": string(good) + "\n", "trailing": inboxPrefix + string(good) + "{}\n", "unknown": inboxPrefix + strings.TrimSuffix(string(good), "}") + `,"extra":1}` + "\n", "oversize": inboxPrefix + strings.Repeat(" ", inboxEnvelopeLimit) + "\n", "unterminated": inboxPrefix + string(good)} {
+		t.Run(name, func(t *testing.T) {
+			var v inboxStart
+			err := inboxReadEnvelope(bufio.NewReaderSize(strings.NewReader(line), inboxEnvelopeLimit+1), &v)
+			if (err == nil) != (name == "valid") {
+				t.Fatalf("unexpected decode: %v", err)
+			}
+		})
+	}
+}
+func TestInboxReferenceOwnership(t *testing.T) {
+	s := inboxTestStart()
+	if err := inboxValidateAdmission(s, inboxTestAdmission(1), 1, 20); err != nil {
+		t.Fatal(err)
+	}
+	mutations := map[string]func(*inboxAdmission){"wrong_share": func(a *inboxAdmission) { a.Origin.ShareUNC += "x" }, "wrong_directory": func(a *inboxAdmission) { a.Origin.RootLocal += "x" }, "wrong_sid": func(a *inboxAdmission) { a.Origin.SID += "x" }, "wrong_server": func(a *inboxAdmission) { a.Origin.Server = "OTHER" }, "foreign_open": func(a *inboxAdmission) { a.Origin.OpenPaths[0] = `C:\other` }, "missing_role": func(a *inboxAdmission) { a.Origin.OpenPaths[0] = s.RootLocal + `\other` }, "duplicate_id": func(a *inboxAdmission) { a.Origin.OpenIDs[1] = a.Origin.OpenIDs[0] }, "missing_id": func(a *inboxAdmission) { a.Origin.OpenIDs = nil }, "wrong_pid": func(a *inboxAdmission) { a.PID++ }, "wrong_nonce": func(a *inboxAdmission) { a.Nonce += "f" }, "wrong_executable": func(a *inboxAdmission) { a.ExecutableSHA256 = strings.Repeat("f", 64) }, "wrong_stage": func(a *inboxAdmission) { a.Stage = 2 }, "path_traversal": func(a *inboxAdmission) { a.Origin.OpenPaths[0] = s.RootLocal + `\..\other` }}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			a := inboxTestAdmission(1)
+			mutate(&a)
+			if inboxValidateAdmission(s, a, 1, 20) == nil {
+				t.Fatal("resource fingerprint bypass admitted")
+			}
+		})
+	}
+}
+func TestInboxReferenceRenamePayload(t *testing.T) {
+	path := `C:\owned\v\target-𝄞`
+	data, err := inboxRenamePayload(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	units := utf16.Encode([]rune(path))
+	if len(data) != 20+len(units)*2 || binary.LittleEndian.Uint32(data) != 3 || binary.LittleEndian.Uint32(data[16:]) != uint32(len(units)*2) || !bytes.Equal(data[4:16], make([]byte, 12)) {
+		t.Fatal("wrong FILE_RENAME_INFO ABI")
+	}
+	for i, u := range units {
+		if binary.LittleEndian.Uint16(data[20+i*2:]) != u {
+			t.Fatal("UTF16 payload changed")
+		}
+	}
+	for _, bad := range []string{`relative`, `\\host\share\target`, `C:\owned\..\target`, "C:\\bad\x00name", `C:\owned\target:stream`, `C:\owned\target.`, "C:\\" + strings.Repeat("x", 1024)} {
+		if _, err := inboxRenamePayload(bad); err == nil {
+			t.Fatalf("unsafe target accepted: %q", bad)
+		}
+	}
+}
+func inboxTestReceipt() (inboxReceipt, []byte, []byte) {
+	a, b := cacheGatePositivePayload(257, 0x17), cacheGatePositivePayload(769, 0x89)
+	ack := time.Unix(2000000000, 0)
+	value := func(id uint64, size int64) cacheGatePositiveValue {
+		return cacheGatePositiveValue{Identity: id, Volume: 7, Size: size, Started: ack.Add(20 * time.Millisecond), Completed: ack.Add(21 * time.Millisecond)}
+	}
+	r := inboxReceipt{Request: inboxTestStart(), RenameClass: 22, Exposure: ack.Add(-time.Second), ACK: ack, Expiry: ack.Add(4 * time.Second), Initial: value(1, 257), FirstOpen: value(0, 0), NewIdentity: value(2, 769), RetainedIdentity: value(1, 257), OldRead: value(0, 0), NewRead: value(0, 0), Pending: true, MutationAttempted: true, MutationSucceeded: true, OriginComplete: true, Origins: []inboxOrigin{inboxTestAdmission(1).Origin, inboxTestAdmission(2).Origin}, ObservationsComplete: true, HelpersClean: true, MappingCreated: true, MappingRemoved: true, CleanupComplete: true, LocalOracle: true, Notifications: []parentNativeCompletion{{Drained: true, Count: 20, Completed: ack.Add(10 * time.Millisecond)}}}
+	payload, _ := inboxRenamePayload(r.Request.RootLocal + `\v\target`)
+	r.RenamePayloadHex = hex.EncodeToString(payload)
+	r.LocalNameKnown = true
+	r.LocalTarget = value(2, 769)
+	r.LocalRead = value(0, 0)
+	r.LocalRead.Count = 769
+	r.LocalRead.Digest = cacheGatePositiveDigest(b)
+	r.OldRead.Count = 257
+	r.OldRead.Digest = cacheGatePositiveDigest(a)
+	r.NewRead.Count = 769
+	r.NewRead.Digest = cacheGatePositiveDigest(b)
+	for i, name := range []string{"pending", "mutator_open", "rename_flags3", "mutator_close", "notify", "first_open", "new_identity", "retained_identity", "old_read", "new_read"} {
+		start := ack.Add(time.Duration(i-3) * time.Millisecond)
+		r.Calls = append(r.Calls, inboxCall{i + 1, name, start, start, ""})
+	}
+	return r, a, b
+}
+func TestInboxReferenceOracle(t *testing.T) {
+	r, a, b := inboxTestReceipt()
+	if got := inboxClassify(&r, a, b); got != "native_behavior_pass" {
+		t.Fatal(got)
+	}
+	cases := map[string]struct {
+		mutate func(*inboxReceipt)
+		want   string
+	}{
+		"both_old":        {func(r *inboxReceipt) { r.NewIdentity.Identity = r.Initial.Identity }, "native_behavior_failure"},
+		"both_new":        {func(r *inboxReceipt) { r.RetainedIdentity.Identity = r.NewIdentity.Identity }, "native_behavior_failure"},
+		"wrong_old_bytes": {func(r *inboxReceipt) { r.OldRead.Digest = r.NewRead.Digest }, "native_behavior_failure"},
+		"wrong_new_bytes": {func(r *inboxReceipt) { r.NewRead.Count = 257 }, "native_behavior_failure"},
+		"api_error":       {func(r *inboxReceipt) { r.NewIdentity.Error = "access denied" }, "native_behavior_failure"},
+		"late":            {func(r *inboxReceipt) { r.NewRead.Completed = r.ACK.Add(time.Second + 1) }, "native_behavior_failure"},
+		"ttl_elapsed": {func(r *inboxReceipt) {
+			r.Exposure = r.ACK.Add(-6 * time.Second)
+			r.Expiry = r.Exposure.Add(5 * time.Second)
+		}, "timing_incomplete"},
+		"ack_at_expiry": {func(r *inboxReceipt) { r.Exposure = r.ACK.Add(-5 * time.Second); r.Expiry = r.ACK }, "timing_incomplete"},
+		"checks_after_expiry": {func(r *inboxReceipt) {
+			r.Exposure = r.ACK.Add(-5*time.Second + time.Millisecond)
+			r.Expiry = r.Exposure.Add(5 * time.Second)
+		}, "timing_incomplete"},
+		"unknown_local_open":  {func(r *inboxReceipt) { r.LocalTarget.Error = "access denied"; r.LocalOracle = false }, "local_truth_incomplete"},
+		"unknown_local_read":  {func(r *inboxReceipt) { r.LocalRead.Error = "read failed"; r.LocalOracle = false }, "local_truth_incomplete"},
+		"missing_local_truth": {func(r *inboxReceipt) { r.LocalTarget = cacheGatePositiveValue{}; r.LocalOracle = false }, "local_truth_incomplete"},
+		"unknown_name_truth": {func(r *inboxReceipt) {
+			r.LocalNameKnown = false
+			r.LocalNameError = "access denied"
+			r.LocalOracle = false
+		}, "local_truth_incomplete"},
+		"known_local_mismatch": {func(r *inboxReceipt) { r.LocalOracle = false }, "native_behavior_failure"},
+		"ttl_reset":            {func(r *inboxReceipt) { r.Expiry = r.ACK.Add(5 * time.Second) }, "timing_incomplete"},
+		"missing_origin":       {func(r *inboxReceipt) { r.OriginComplete = false }, "origin_incomplete"},
+		"ordinary_rename":      {func(r *inboxReceipt) { r.RenameClass = 3 }, "reference_mutation_refusal"},
+		"wrong_flags":          {func(r *inboxReceipt) { r.RenamePayloadHex = "01000000" + r.RenamePayloadHex[8:] }, "reference_mutation_refusal"},
+		"failed_mutation":      {func(r *inboxReceipt) { r.MutationSucceeded = false }, "reference_mutation_refusal"},
+		"missing_pending":      {func(r *inboxReceipt) { r.Pending = false }, "setup_refusal"},
+		"unknown_completion":   {func(r *inboxReceipt) { r.Notifications[0].Drained = false }, "observation_incomplete"},
+		"notify_error":         {func(r *inboxReceipt) { r.Notifications[0].ErrorCode = 5 }, "observation_incomplete"},
+		"notify_late":          {func(r *inboxReceipt) { r.Notifications[0].Completed = r.ACK.Add(time.Second) }, "observation_incomplete"},
+		"changed_order":        {func(r *inboxReceipt) { r.Calls[6].Name = "old_read" }, "observation_incomplete"},
+		"duplicate_first":      {func(r *inboxReceipt) { r.Calls = append(r.Calls, r.Calls[5]) }, "observation_incomplete"},
+		"forced_exit":          {func(r *inboxReceipt) { r.CleanupComplete = false }, "cleanup_incomplete"},
+		"unknown_drain":        {func(r *inboxReceipt) { r.HelpersClean = false }, "cleanup_incomplete"},
+		"mapping_retained":     {func(r *inboxReceipt) { r.MappingRemoved = false }, "cleanup_incomplete"},
+		"close_error":          {func(r *inboxReceipt) { r.CleanupErrors = []string{"CloseHandle failed"} }, "cleanup_incomplete"},
+		"mechanism_claim":      {func(r *inboxReceipt) { r.MechanismTraceComplete = true }, "invalid_mechanism_claim"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			r, a, b := inboxTestReceipt()
+			c.mutate(&r)
+			if got := inboxClassify(&r, a, b); got != c.want {
+				t.Fatalf("oracle bypass: got %s want %s", got, c.want)
+			}
+		})
+	}
+	t.Run("native_rescan_is_not_wire_proof", func(t *testing.T) {
+		r, a, b := inboxTestReceipt()
+		r.Notifications[0].Count = 0
+		r.Notifications[0].ErrorCode = parentErrorNotifyEnum
+		if got := inboxClassify(&r, a, b); got != "native_behavior_pass" || r.MechanismTraceComplete {
+			t.Fatal(got)
+		}
+	})
+}
+
+type inboxWatchOwnership struct {
+	Submitted                                bool
+	TerminalKnown                            bool
+	PinsReleased                             bool
+	Retained                                 bool
+	LastCompletion                           parentNativeCompletion
+	CancelError, DrainError, EventCloseError string
+	EventClosed                              bool
+}
+
+func (s *inboxWatchOwnership) Submit() error {
+	if s.PinsReleased || s.Retained || (s.Submitted && !s.TerminalKnown) {
+		return errors.New("watch submission has unresolved ownership")
+	}
+	s.Submitted = true
+	s.TerminalKnown = false
+	return nil
+}
+func (s *inboxWatchOwnership) Completion(value parentNativeCompletion) {
+	s.LastCompletion = value
+	s.TerminalKnown = value.Drained && !value.Completed.IsZero() && ((value.ErrorCode == 0 && value.Error == "") || value.ErrorCode == 995 || value.ErrorCode == parentErrorNotifyEnum)
+}
+func (s *inboxWatchOwnership) Release() bool {
+	if s.PinsReleased || s.Retained {
+		return false
+	}
+	if s.Submitted && !s.TerminalKnown {
+		s.Retained = true
+		return false
+	}
+	s.PinsReleased = true
+	return true
+}
+func TestInboxReferenceWatchOwnership(t *testing.T) {
+	for _, code := range []uint32{0, 995, parentErrorNotifyEnum} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			var s inboxWatchOwnership
+			if err := s.Submit(); err != nil {
+				t.Fatal(err)
+			}
+			s.Completion(parentNativeCompletion{Drained: true, Completed: time.Now(), ErrorCode: code})
+			if !s.Release() || s.Retained {
+				t.Fatal("known terminal retained")
+			}
+		})
+	}
+	for name, value := range map[string]parentNativeCompletion{"pending": {Completed: time.Now(), ErrorCode: 996}, "unknown_done": {Drained: true, Completed: time.Now(), ErrorCode: 5}, "unknown_error_no_code": {Drained: true, Completed: time.Now(), Error: "unclassified error"}, "missing_provenance": {Drained: true}, "timeout": {}} {
+		t.Run(name, func(t *testing.T) {
+			var s inboxWatchOwnership
+			_ = s.Submit()
+			s.Completion(value)
+			if s.Release() || !s.Retained || s.PinsReleased {
+				t.Fatal("unknown kernel owner released")
+			}
+			if s.Submit() == nil {
+				t.Fatal("retained owner resubmitted")
+			}
+		})
+	}
+	t.Run("rearm_keeps_pins", func(t *testing.T) {
+		var s inboxWatchOwnership
+		_ = s.Submit()
+		s.Completion(parentNativeCompletion{Drained: true, Completed: time.Now()})
+		if err := s.Submit(); err != nil {
+			t.Fatal(err)
+		}
+		if s.TerminalKnown || s.PinsReleased || s.Release() {
+			t.Fatal("rearmed pending owner released")
+		}
+	})
+	t.Run("rearm_requires_terminal", func(t *testing.T) {
+		var s inboxWatchOwnership
+		_ = s.Submit()
+		if s.Submit() == nil {
+			t.Fatal("pending owner resubmitted")
+		}
+	})
+	t.Run("failed_initial_submission", func(t *testing.T) {
+		var s inboxWatchOwnership
+		if !s.Release() || s.Release() {
+			t.Fatal("nonpending release must happen once")
+		}
+	})
+}

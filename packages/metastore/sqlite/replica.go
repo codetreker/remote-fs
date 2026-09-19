@@ -47,6 +47,10 @@ type Replica struct {
 	// Callers waiting for a slot must not extend the current reader phase.
 	readSlots chan struct{}
 
+	// Scan backlog waits outside SQL and phase admission so it cannot consume a
+	// point read's deadline. Both classes still share the same total reader bound.
+	listingSlots chan struct{}
+
 	// at is how far this copy has been brought. It is held here rather than in the database
 	// because nothing ever reads it back: the copy does not outlive the mount that made it,
 	// and a position on disk would offer a resume this version does not do.
@@ -71,7 +75,8 @@ func OpenReplica(ctx context.Context, path string) (*Replica, error) {
 	}
 	return &Replica{
 		store: store, admission: newReplicaGate(),
-		readSlots: make(chan struct{}, options.MaxReaderConnections),
+		readSlots:    make(chan struct{}, options.MaxReaderConnections),
+		listingSlots: make(chan struct{}, max(1, options.MaxReaderConnections-1)),
 	}, nil
 }
 
@@ -93,6 +98,24 @@ func (r *Replica) releaseRead() {
 	<-r.readSlots
 }
 
+func (r *Replica) acquireListing(ctx context.Context) error {
+	select {
+	case r.listingSlots <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := r.acquireRead(ctx); err != nil {
+		<-r.listingSlots
+		return err
+	}
+	return nil
+}
+
+func (r *Replica) releaseListing() {
+	r.releaseRead()
+	<-r.listingSlots
+}
+
 // Stat reports the node at path, as the volume held it at Position.
 func (r *Replica) Stat(ctx context.Context, path string) (metastore.Node, error) {
 	if err := r.acquireRead(ctx); err != nil {
@@ -104,11 +127,20 @@ func (r *Replica) Stat(ctx context.Context, path string) (metastore.Node, error)
 
 // List returns the children of the directory at path, as the volume held them at Position.
 func (r *Replica) List(ctx context.Context, path string) ([]metastore.Child, error) {
-	if err := r.acquireRead(ctx); err != nil {
+	if err := r.acquireListing(ctx); err != nil {
 		return nil, pathError("list", path, sqlerr.Failure(err))
 	}
-	defer r.releaseRead()
-	return r.store.List(ctx, path)
+	defer r.releaseListing()
+	var children []metastore.Child
+	err := r.inspectDirectory(ctx, path, func(tx *sql.Tx, parent int64) error {
+		var err error
+		children, err = r.store.listChildren(ctx, tx, parent)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return children, nil
 }
 
 // ListBounded holds the replica read lock while one ordered database observation is
@@ -122,11 +154,39 @@ func (r *Replica) ListBounded(ctx context.Context, path string, result *storage.
 			}
 		}()
 	}
-	if err := r.acquireRead(ctx); err != nil {
+	if err := r.acquireListing(ctx); err != nil {
 		return pathError("list", path, sqlerr.Failure(err))
 	}
-	defer r.releaseRead()
-	return r.store.ListBounded(ctx, path, result)
+	defer r.releaseListing()
+	if result == nil {
+		return pathError("list", path, syscall.EINVAL)
+	}
+	return r.inspectDirectory(ctx, path, func(tx *sql.Tx, parent int64) error {
+		return r.store.listChildrenBounded(ctx, tx, parent, result)
+	})
+}
+
+// Replica readers observe only copied facts. Their phase gate owns consistency;
+// native access claims belong to the authority that serves the file contents.
+func (r *Replica) inspectDirectory(ctx context.Context, path string, read func(*sql.Tx, int64) error) error {
+	cleaned, err := storage.CleanPath(path)
+	if err != nil {
+		return pathError("list", path, err)
+	}
+	err = r.store.inspect(ctx, func(tx *sql.Tx) error {
+		directory, err := r.store.resolve(ctx, tx, cleaned)
+		if err != nil {
+			return err
+		}
+		if !directory.IsDir() {
+			return syscall.ENOTDIR
+		}
+		return read(tx, directory.ID)
+	})
+	if err != nil {
+		return pathError("list", path, sqlerr.Failure(err))
+	}
+	return nil
 }
 
 // Position is how far this copy has been brought: everything the source recorded up to and
@@ -159,7 +219,7 @@ func (r *Replica) Close() error { return r.store.Close() }
 // having quietly not applied something: there is no revalidation behind these changes and no
 // timeout that repairs one. The consistent picture is what makes the strictness safe — every
 // change after it acts on something that picture already contained.
-func (r *Replica) Apply(ctx context.Context, change metastore.Change) (bool, error) {
+func (r *Replica) Apply(ctx context.Context, change metastore.Change) (applied bool, returnErr error) {
 	if err := r.admission.acquireWrite(ctx); err != nil {
 		return false, err
 	}
@@ -174,21 +234,25 @@ func (r *Replica) Apply(ctx context.Context, change metastore.Change) (bool, err
 	if change.Position <= r.at {
 		return false, nil
 	}
-	tx, err := r.store.write.BeginTx(ctx, nil)
+	tx, err := beginOwnedTransaction(ctx, r.store.write, nil)
 	if err != nil {
 		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, sqlerr.Failure(err))
 	}
-	defer tx.Rollback()
+	observationHeld := false
+	defer func() { returnErr = r.store.finishMutationTransaction(tx, returnErr, observationHeld) }()
 
-	if err := r.apply(ctx, tx, change); err != nil {
+	if err := r.apply(ctx, tx.Tx, change); err != nil {
 		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, sqlerr.Failure(err))
 	}
-	state, err := dbstate.AdvanceGeneration(ctx, tx)
+	if err := r.store.checkReplicaMetadataBudget(ctx, tx.Tx); err != nil {
+		return false, err
+	}
+	state, err := dbstate.AdvanceGeneration(ctx, tx.Tx)
 	if err != nil {
 		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, sqlerr.Failure(err))
 	}
 	r.store.coordinator.health.Lock()
-	defer r.store.coordinator.health.Unlock()
+	observationHeld = true
 	if err := r.store.coordinator.healthErrorLocked(); err != nil {
 		return false, err
 	}
@@ -220,13 +284,13 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 		if err := dbstate.ObserveNewNodeID(ctx, tx, change.Node.ID); err != nil {
 			return err
 		}
-		if err := insertNode(ctx, tx, r.store.volume, *change.Node); err != nil {
+		if err := r.store.insertReplicaNode(ctx, tx, *change.Node); err != nil {
 			return err
 		}
 		return insertEntry(ctx, tx, r.store.volume, change.Parent, change.Name, change.Node.ID)
 
 	case metastore.Modified:
-		return updateNode(ctx, tx, *change.Node)
+		return r.store.updateReplicaNode(ctx, tx, *change.Node)
 
 	case metastore.Removed:
 		id, err := entryNode(ctx, tx, r.store.volume, change.Parent, change.Name)
@@ -251,7 +315,7 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 		if err := insertEntry(ctx, tx, r.store.volume, change.Parent, change.Name, change.Node.ID); err != nil {
 			return err
 		}
-		return updateNode(ctx, tx, *change.Node)
+		return r.store.updateReplicaNode(ctx, tx, *change.Node)
 	}
 	return fmt.Errorf("%w: the change is of kind %d, which this build has no meaning for",
 		syscall.EIO, change.Kind)
@@ -259,31 +323,75 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 
 // --- the rows a copy is made of ---------------------------------------------------------
 
-// insertNode records a node under the id it arrived with. Its content key is dropped: see
+// insertReplicaNode records a node under the id it arrived with. Its content key is dropped: see
 // the type's own comment for why a copy holds no keys.
-func insertNode(ctx context.Context, tx *sql.Tx, volume int64, node metastore.Node) error {
-	accessSec, accessNsec := sqlvalue.StoredTime(node.AccessTime)
-	changeSec, changeNsec := sqlvalue.StoredTime(node.ModTime)
-	_, err := tx.ExecContext(ctx, `
-		INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-		node.ID, volume, int64(node.Mode), node.Size, accessSec, accessNsec, changeSec, changeNsec)
+func (s *Store) insertReplicaNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
+	values, err := replicaNodeValues(node)
+	if err != nil {
+		return err
+	}
+	if err := s.admitReplicaMetadata(ctx, tx, 0, values.bytes); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+  INSERT INTO nodes (id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,
+                     birth_sec,birth_nsec,change_sec,change_nsec,metadata,link_target,directory_revision,content)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)`, append([]any{node.ID, s.volume}, values.fields...)...)
 	return err
 }
 
-// updateNode replaces what a copy holds about a node it already has, and refuses to be a
-// statement about a node it does not.
-func updateNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
-	accessSec, accessNsec := sqlvalue.StoredTime(node.AccessTime)
-	changeSec, changeNsec := sqlvalue.StoredTime(node.ModTime)
+// updateReplicaNode replaces source facts without introducing a replica content key.
+func (s *Store) updateReplicaNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
+	values, err := replicaNodeValues(node)
+	if err != nil {
+		return err
+	}
+	if err := s.admitReplicaMetadata(ctx, tx, node.ID, values.bytes); err != nil {
+		return err
+	}
 	result, err := tx.ExecContext(ctx, `
-		UPDATE nodes SET mode = ?, size = ?, atime_sec = ?, atime_nsec = ?, mtime_sec = ?, mtime_nsec = ?
-		WHERE id = ?`,
-		int64(node.Mode), node.Size, accessSec, accessNsec, changeSec, changeNsec, node.ID)
+  UPDATE nodes SET kind=?,size=?,atime_sec=?,atime_nsec=?,mtime_sec=?,mtime_nsec=?,
+                   birth_sec=?,birth_nsec=?,change_sec=?,change_nsec=?,metadata=?,link_target=?,directory_revision=?
+  WHERE id=?`, append(values.fields, node.ID)...)
 	if err != nil {
 		return err
 	}
 	return sqlvalue.ExactlyOne(result, fmt.Sprintf("node %d, which this copy does not hold", node.ID))
+}
+
+type replicaNodePayload struct {
+	fields []any
+	bytes  int64
+}
+
+func replicaNodeValues(node metastore.Node) (replicaNodePayload, error) {
+	if node.ID <= 0 || node.Kind.Check() != nil || node.Size < 0 || len(node.DirectoryRevision) > storage.MaxObservationTokenBytes || len(node.LinkTarget) > storage.MaxLinkTargetBytes {
+		return replicaNodePayload{}, syscall.EIO
+	}
+	if node.Kind == storage.NodeDirectory && node.Size != 0 || node.Kind != storage.NodeDirectory && len(node.DirectoryRevision) != 0 {
+		return replicaNodePayload{}, syscall.EIO
+	}
+	if node.Kind == storage.NodeSymlink {
+		if len(node.LinkTarget) == 0 || int64(len(node.LinkTarget)) != node.Size {
+			return replicaNodePayload{}, syscall.EIO
+		}
+	} else if len(node.LinkTarget) != 0 {
+		return replicaNodePayload{}, syscall.EIO
+	}
+	metadata, err := storage.EncodeMetadata(node.Metadata)
+	if err != nil {
+		return replicaNodePayload{}, err
+	}
+	atimeSec, atimeNsec := sqlvalue.StoredTime(node.AccessTime)
+	mtimeSec, mtimeNsec := sqlvalue.StoredTime(node.ModTime)
+	var birthSec, birthNsec, changeSec, changeNsec any
+	if node.BirthTime != nil {
+		birthSec, birthNsec = sqlvalue.StoredTime(*node.BirthTime)
+	}
+	if node.ChangeTime != nil {
+		changeSec, changeNsec = sqlvalue.StoredTime(*node.ChangeTime)
+	}
+	return replicaNodePayload{fields: []any{int64(node.Kind), node.Size, atimeSec, atimeNsec, mtimeSec, mtimeNsec, birthSec, birthNsec, changeSec, changeNsec, metadata, append([]byte{}, node.LinkTarget...), append([]byte{}, node.DirectoryRevision...)}, bytes: int64(len(metadata) + len(node.LinkTarget))}, nil
 }
 
 func insertEntry(ctx context.Context, tx *sql.Tx, volume, parent int64, name []byte, node int64) error {
@@ -344,7 +452,7 @@ func (r *Replica) Reseed(ctx context.Context) (*Seeding, error) {
 		r.admission.releaseWrite()
 		return nil, err
 	}
-	tx, err := r.store.write.BeginTx(ctx, nil)
+	tx, err := beginOwnedTransaction(ctx, r.store.write, nil)
 	if err != nil {
 		r.store.coordinator.commit.release()
 		r.admission.releaseWrite()
@@ -352,7 +460,7 @@ func (r *Replica) Reseed(ctx context.Context) (*Seeding, error) {
 	}
 	state, err := dbstate.Validate(ctx, tx)
 	if err != nil {
-		tx.Rollback()
+		err = r.store.finishMutationTransaction(tx, err, false)
 		r.store.coordinator.commit.release()
 		r.admission.releaseWrite()
 		return nil, fmt.Errorf("validating the copy's identity allocator: %w", sqlerr.Failure(err))
@@ -363,12 +471,10 @@ func (r *Replica) Reseed(ctx context.Context) (*Seeding, error) {
 	// picture's business rather than a rule the two sides have to agree on and keep agreeing on;
 	// the references are still checked, in full, before this transaction is allowed to commit.
 	if _, err := tx.ExecContext(ctx, `PRAGMA defer_foreign_keys = ON`); err != nil {
-		seeding.Close()
-		return nil, fmt.Errorf("beginning to fill the copy: %w", sqlerr.Failure(err))
+		return nil, seeding.finish(fmt.Errorf("beginning to fill the copy: %w", sqlerr.Failure(err)), false)
 	}
 	if err := seeding.empty(ctx); err != nil {
-		seeding.Close()
-		return nil, err
+		return nil, seeding.finish(err, false)
 	}
 	return seeding, nil
 }
@@ -376,7 +482,7 @@ func (r *Replica) Reseed(ctx context.Context) (*Seeding, error) {
 // Seeding is a copy being filled from one picture of its source.
 type Seeding struct {
 	replica *Replica
-	tx      *sql.Tx
+	tx      *ownedTransaction
 
 	// root is the id of the row that had no parent, and 0 until one has arrived. A tree with
 	// no root is not a tree, so completing without one is refused.
@@ -421,7 +527,7 @@ func (s *Seeding) add(ctx context.Context, row metastore.Row) error {
 		return fmt.Errorf("node identity %d is not positive: %w", row.Node.ID, syscall.EIO)
 	}
 	s.maxNodeID = max(s.maxNodeID, row.Node.ID)
-	if err := insertNode(ctx, s.tx, s.replica.store.volume, row.Node); err != nil {
+	if err := s.replica.store.insertReplicaNode(ctx, s.tx.Tx, row.Node); err != nil {
 		return err
 	}
 	// Parent 0 and no name is how a picture names the one node that has neither. Nothing else
@@ -433,7 +539,7 @@ func (s *Seeding) add(ctx context.Context, row metastore.Row) error {
 		s.root = row.Node.ID
 		return nil
 	}
-	return insertEntry(ctx, s.tx, s.replica.store.volume, row.Parent, row.Name, row.Node.ID)
+	return insertEntry(ctx, s.tx.Tx, s.replica.store.volume, row.Parent, row.Name, row.Node.ID)
 }
 
 // Complete records that the picture was whole and that the copy stands at the position it was
@@ -446,6 +552,9 @@ func (s *Seeding) Complete(ctx context.Context, at metastore.Position) error {
 	}
 	if s.root == 0 {
 		return fmt.Errorf("%w: the picture carried no node without a parent, so it is not a tree", syscall.EIO)
+	}
+	if err := s.replica.store.checkReplicaMetadataBudget(ctx, s.tx.Tx); err != nil {
+		return err
 	}
 	if _, err := s.tx.ExecContext(ctx, `UPDATE volumes SET root = ? WHERE id = ?`,
 		s.root, s.replica.store.volume); err != nil {
@@ -465,7 +574,7 @@ func (s *Seeding) Complete(ctx context.Context, at metastore.Position) error {
 		return fmt.Errorf("completing the copy: SQLite node sequence %d does not match observed high-water %d: %w",
 			sequence, highWater, syscall.EIO)
 	}
-	state, err := dbstate.AdvanceGeneration(ctx, s.tx)
+	state, err := dbstate.AdvanceGeneration(ctx, s.tx.Tx)
 	if err != nil {
 		return fmt.Errorf("completing the copy: %w", sqlerr.Failure(err))
 	}
@@ -477,24 +586,18 @@ func (s *Seeding) Complete(ctx context.Context, at metastore.Position) error {
 	if err := s.tx.Commit(); err != nil {
 		s.replica.store.coordinator.poisonLocked(sqlerr.NewUncertainCommit(sqlerr.Failure(err)))
 		healthErr := s.replica.store.coordinator.healthErrorLocked()
-		s.replica.store.coordinator.health.Unlock()
-		s.settle()
-		return fmt.Errorf("completing the copy: %w", healthErr)
+		return s.finish(fmt.Errorf("completing the copy: %w", healthErr), true)
 	}
 	if err := s.replica.store.acceptLocked(DurableState(state)); err != nil {
-		s.replica.store.coordinator.health.Unlock()
-		s.settle()
-		return fmt.Errorf("completing the copy: %w", err)
+		return s.finish(fmt.Errorf("completing the copy: %w", err), true)
 	}
-	s.replica.store.coordinator.health.Unlock()
 	// The root of the copy is the source's root, arrived with the picture. It is fixed for the
 	// life of a volume, so it is read once rather than joined for on every path resolution,
 	// and this is the one moment at which it changes. Both are written before readers are let
 	// back in, which is what the exclusion this holds is for.
 	s.replica.store.root = s.root
 	s.replica.at = at
-	s.settle()
-	return nil
+	return s.finish(nil, true)
 }
 
 // Close releases what the filling holds, and discards it if it was never completed. A caller
@@ -503,12 +606,24 @@ func (s *Seeding) Close() error {
 	if s.done {
 		return nil
 	}
-	err := s.tx.Rollback()
+	s.replica.store.coordinator.health.Lock()
+	rollbackErr := s.tx.Rollback()
+	err := s.replica.store.mutationCleanupFailure(rollbackErr, nil)
+	s.replica.store.coordinator.health.Unlock()
 	s.settle()
+	if err == nil && rollbackErr != nil {
+		err = sqlerr.Failure(rollbackErr)
+	}
 	if err != nil {
 		return fmt.Errorf("discarding a picture that was not completed: %w", sqlerr.Failure(err))
 	}
 	return nil
+}
+
+func (s *Seeding) finish(primary error, observationHeld bool) error {
+	err := s.replica.store.finishMutationTransaction(s.tx, primary, observationHeld)
+	s.settle()
+	return err
 }
 
 // settle marks the transaction finished and lets readers back in.
@@ -516,4 +631,38 @@ func (s *Seeding) settle() {
 	s.done = true
 	s.replica.store.coordinator.commit.release()
 	s.replica.admission.releaseWrite()
+}
+
+func (s *Store) admitReplicaMetadata(ctx context.Context, tx *sql.Tx, previous, nextBytes int64) error {
+	used, err := s.metadataUsage(ctx, tx)
+	if err != nil {
+		return err
+	}
+	var oldBytes int64
+	if previous != 0 {
+		if err := tx.QueryRowContext(ctx, `SELECT length(metadata)+length(link_target) FROM nodes WHERE volume=? AND id=?`, s.volume, previous).Scan(&oldBytes); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("node %d is absent from the copy: %w", previous, syscall.EIO)
+			}
+			return err
+		}
+	}
+	if oldBytes < 0 || oldBytes > used {
+		return syscall.EIO
+	}
+	if nextBytes > s.maxMetadataBytes-(used-oldBytes) {
+		return fmt.Errorf("replica metadata exceeds its %d-byte bound: %w", s.maxMetadataBytes, syscall.EFBIG)
+	}
+	return nil
+}
+
+func (s *Store) checkReplicaMetadataBudget(ctx context.Context, tx *sql.Tx) error {
+	used, err := s.metadataUsage(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if used > s.maxMetadataBytes {
+		return fmt.Errorf("replica metadata exceeds its %d-byte bound: %w", s.maxMetadataBytes, syscall.EFBIG)
+	}
+	return nil
 }

@@ -1,0 +1,1207 @@
+//go:build windows
+
+package windows
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+	"unsafe"
+
+	"github.com/codetreker/remote-fs/packages/storage"
+	win "golang.org/x/sys/windows"
+)
+
+type cacheGatePositiveValue struct {
+	PureEOF            bool
+	API                string
+	Started, Completed time.Time
+	Error              string
+	Errno              uint32
+	Size               int64
+	MTime              uint64
+	Identity           uint64
+	Volume             uint32
+	Count              uint32
+	Digest             string
+	Offset             int64
+}
+type cacheGatePositiveMutation struct {
+	Kind         string
+	Acknowledged time.Time
+	Attr         storage.Attr
+	Effects      storage.FileEffects
+}
+type cacheGatePositiveFirst struct {
+	Phase    string
+	Native   cacheGatePositiveValue
+	Expected storage.Attr
+	Passed   bool
+}
+
+type cacheGatePositiveCell struct {
+	postDeadline            bool
+	noLeasing               bool
+	PostDeadline            *cacheGatePostDeadlineResult
+	ExposureSource          cacheGatePositiveWireRecord
+	IOModel                 string
+	First                   []cacheGatePositiveFirst
+	Name, Mode              string
+	Exposed, EarliestExpiry time.Time
+	Mutations               []cacheGatePositiveMutation
+	Native                  []cacheGatePositiveValue
+}
+
+func cacheGatePositiveDigest(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+func cacheGatePositiveTime(t time.Time) uint64 {
+	ft := win.NsecToFiletime(t.UnixNano())
+	return uint64(ft.HighDateTime)<<32 | uint64(ft.LowDateTime)
+}
+func cacheGatePositiveError(v *cacheGatePositiveValue, err error) {
+	v.Completed = time.Now()
+	if err != nil {
+		v.Error = err.Error()
+		var code syscall.Errno
+		if errors.As(err, &code) {
+			v.Errno = uint32(code)
+		}
+	}
+}
+
+func cacheGatePositivePath(path string) cacheGatePositiveValue {
+	v := cacheGatePositiveValue{API: "GetFileAttributesExW", Started: time.Now()}
+	name, err := win.UTF16PtrFromString(path)
+	if err != nil {
+		cacheGatePositiveError(&v, err)
+		return v
+	}
+	var data win.Win32FileAttributeData
+	err = win.GetFileAttributesEx(name, win.GetFileExInfoStandard, (*byte)(unsafe.Pointer(&data)))
+	cacheGatePositiveError(&v, err)
+	if err == nil {
+		v.Size = int64(uint64(data.FileSizeHigh)<<32 | uint64(data.FileSizeLow))
+		v.MTime = uint64(data.LastWriteTime.HighDateTime)<<32 | uint64(data.LastWriteTime.LowDateTime)
+	}
+	return v
+}
+func cacheGatePositiveInfo(file *nativeHandle, class uint32) cacheGatePositiveValue {
+	v := cacheGatePositiveValue{API: fmt.Sprintf("GetFileInformationByHandleEx(%d)", class), Started: time.Now()}
+	var data [40]byte
+	size := uint32(40)
+	if class == win.FileStandardInfo {
+		size = 24
+	}
+	err := win.GetFileInformationByHandleEx(file.value, class, &data[0], size)
+	cacheGatePositiveError(&v, err)
+	if err == nil {
+		if class == win.FileBasicInfo {
+			v.MTime = binary.LittleEndian.Uint64(data[16:24])
+		} else {
+			v.Size = int64(binary.LittleEndian.Uint64(data[8:16]))
+		}
+	}
+	return v
+}
+func cacheGatePositiveIdentity(file *nativeHandle) cacheGatePositiveValue {
+	v := cacheGatePositiveValue{API: "GetFileInformationByHandle", Started: time.Now()}
+	var info win.ByHandleFileInformation
+	err := win.GetFileInformationByHandle(file.value, &info)
+	cacheGatePositiveError(&v, err)
+	if err == nil {
+		v.Identity = uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)
+		v.Volume = info.VolumeSerialNumber
+		v.Size = int64(uint64(info.FileSizeHigh)<<32 | uint64(info.FileSizeLow))
+	}
+	return v
+}
+func cacheGatePositiveOpen(t *testing.T, path string) (*nativeHandle, cacheGatePositiveValue) {
+	t.Helper()
+	v := cacheGatePositiveValue{API: "CreateFileW(READ,OPEN_EXISTING)", Started: time.Now()}
+	name, err := win.UTF16PtrFromString(path)
+	if err != nil {
+		cacheGatePositiveError(&v, err)
+		return nil, v
+	}
+	h, err := win.CreateFile(name, win.GENERIC_READ, win.FILE_SHARE_READ|win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, nil, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL|win.FILE_FLAG_OVERLAPPED, 0)
+	cacheGatePositiveError(&v, err)
+	if err != nil {
+		return nil, v
+	}
+	file := &nativeHandle{value: h}
+	t.Cleanup(func() {
+		if err := file.close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return file, v
+}
+func cacheGatePositiveRead(file *nativeHandle, offset int64, deadline time.Time) (cacheGatePositiveValue, []byte) {
+	v := cacheGatePositiveValue{API: "ReadFile(overlapped)", Started: time.Now(), Offset: offset}
+	data := make([]byte, 1024)
+	event, err := win.CreateEvent(nil, 1, 0, nil)
+	if err != nil {
+		cacheGatePositiveError(&v, err)
+		return v, nil
+	}
+	overlap := win.Overlapped{HEvent: event, Offset: uint32(offset), OffsetHigh: uint32(uint64(offset) >> 32)}
+	err = win.ReadFile(file.value, data, nil, &overlap)
+	if err == nil || errors.Is(err, win.ERROR_IO_PENDING) {
+		if errors.Is(err, win.ERROR_IO_PENDING) {
+			remain := time.Until(deadline)
+			status := uint32(win.WAIT_TIMEOUT)
+			var waitErr error
+			if remain > 0 {
+				status, waitErr = win.WaitForSingleObject(event, uint32((remain+time.Millisecond-1)/time.Millisecond))
+			}
+			if waitErr != nil || status != uint32(win.WAIT_OBJECT_0) {
+				cancelErr := win.CancelIoEx(file.value, &overlap)
+				if errors.Is(cancelErr, win.ERROR_NOT_FOUND) {
+					cancelErr = nil
+				}
+				completionErr := win.GetOverlappedResult(file.value, &overlap, &v.Count, true)
+				err = errors.Join(context.DeadlineExceeded, waitErr, cancelErr, completionErr)
+			} else {
+				err = win.GetOverlappedResult(file.value, &overlap, &v.Count, false)
+			}
+		} else {
+			err = win.GetOverlappedResult(file.value, &overlap, &v.Count, false)
+		}
+	}
+	closeErr := win.CloseHandle(event)
+	v.PureEOF = cacheGatePositivePureEOF(err, closeErr)
+	err = errors.Join(err, closeErr)
+	runtime.KeepAlive(data)
+	runtime.KeepAlive(&overlap)
+	cacheGatePositiveError(&v, err)
+	if v.Count > uint32(len(data)) {
+		v.Error = "native read count exceeds supplied buffer"
+		return v, nil
+	}
+	data = data[:v.Count]
+	v.Digest = cacheGatePositiveDigest(data)
+	return v, data
+}
+func cacheGatePositiveCapture(kind string, session uint64, reference storage.FileReferenceID, attr storage.Attr, offset int64, data []byte) {
+	cacheGateObserve("positive_authority", map[string]any{"kind": kind, "session": session, "reference": reference, "node_id": attr.ID, "revision": attr.MetadataRevision, "size": attr.Size, "mtime": cacheGatePositiveTime(attr.ModTime), "offset": offset, "count": len(data), "digest": cacheGatePositiveDigest(data)})
+}
+func cacheGatePositivePayload(length int, salt byte) []byte {
+	out := make([]byte, length)
+	for i := range out {
+		out[i] = byte((i*37+i/17)%251) ^ salt
+	}
+	return out
+}
+
+func (p *cacheGatePositiveCell) record(v cacheGatePositiveValue) cacheGatePositiveValue {
+	p.Native = append(p.Native, v)
+	cacheGateObserve("positive_native", v)
+	return v
+}
+func (p *cacheGatePositiveCell) timing(t *testing.T, v cacheGatePositiveValue, ack time.Time) {
+	t.Helper()
+	if !v.Completed.Before(p.EarliestExpiry) {
+		t.Error("native observation crossed the earliest possible cache expiry")
+	}
+	if v.Completed.Before(ack) || v.Completed.Sub(ack) > time.Second {
+		t.Error("native observation did not complete within one second of HTTP acknowledgement")
+	}
+}
+func (p *cacheGatePositiveCell) mutation(t *testing.T, kind string, fn func() (storage.FileActionReceipt, error)) storage.Attr {
+	t.Helper()
+	receipt, err := fn()
+	ack := time.Now()
+	p.Mutations = append(p.Mutations, cacheGatePositiveMutation{Kind: kind, Acknowledged: ack, Attr: receipt.Observation.Attr, Effects: receipt.Effects})
+	cacheGateObserve("positive_http_ack", p.Mutations[len(p.Mutations)-1])
+	if err != nil || receipt.State != storage.FileActionCompleted {
+		t.Fatalf("HTTP %s outcome=%+v error=%v", kind, receipt, err)
+	}
+	if !ack.Before(p.EarliestExpiry) {
+		t.Fatal("HTTP acknowledgement crossed the earliest possible cache expiry")
+	}
+	return receipt.Observation.Attr
+}
+func cacheGatePositiveInitial(t *testing.T, session storage.FileSession, file storage.File, data []byte, year int) storage.Attr {
+	t.Helper()
+	nativeRemoteWrite(t, session, file, data)
+	old := time.Date(year, time.January, 1, 0, 0, 0, 0, time.UTC)
+	receipt, err := file.SetAttr(t.Context(), storage.AttrChange{ModTime: &old}, nativeAction(t, session))
+	if err != nil || receipt.State != storage.FileActionCompleted {
+		t.Fatalf("prepare distinct modification time: %+v %v", receipt, err)
+	}
+	return receipt.Observation.Attr
+}
+func cacheGatePositiveOracle(t *testing.T, file storage.File, attr storage.Attr, data []byte) {
+	t.Helper()
+	result, err := file.ReadAt(t.Context(), storage.FileReadRequest{Length: 1024})
+	cacheGateObserve("positive_http_oracle", map[string]any{"node_id": result.Attr.ID, "revision": result.Attr.MetadataRevision, "size": result.Attr.Size, "mtime": cacheGatePositiveTime(result.Attr.ModTime), "count": len(result.Data), "digest": cacheGatePositiveDigest(result.Data), "error": fmt.Sprint(err)})
+	if err != nil || result.Attr.ID != attr.ID || result.Attr.Size != attr.Size || !result.Attr.ModTime.Equal(attr.ModTime) || !bytes.Equal(result.Data, data) {
+		t.Fatalf("independent HTTP byte/metadata oracle failed: attr=%+v err=%v", result.Attr, err)
+	}
+}
+func cacheGatePositiveRequire(t *testing.T, v cacheGatePositiveValue, attr storage.Attr, observe string, data []byte) {
+	t.Helper()
+	if v.Error != "" {
+		t.Errorf("%s failed: %s", v.API, v.Error)
+		return
+	}
+	switch observe {
+	case "path":
+		if v.Size != attr.Size || v.MTime != cacheGatePositiveTime(attr.ModTime) {
+			t.Errorf("path attributes stale: got size=%d mtime=%d want size=%d mtime=%d", v.Size, v.MTime, attr.Size, cacheGatePositiveTime(attr.ModTime))
+		}
+	case "basic":
+		if v.MTime != cacheGatePositiveTime(attr.ModTime) {
+			t.Errorf("held BasicInfo mtime=%d want=%d", v.MTime, cacheGatePositiveTime(attr.ModTime))
+		}
+	case "standard":
+		if v.Size != attr.Size {
+			t.Errorf("held StandardInfo EOF=%d want=%d", v.Size, attr.Size)
+		}
+	case "read":
+		if v.Count != uint32(len(data)) || v.Digest != cacheGatePositiveDigest(data) {
+			t.Errorf("held ReadFile bytes stale: count=%d digest=%s", v.Count, v.Digest)
+		}
+	}
+}
+func cacheGatePositiveSelect(p *cacheGatePositiveCell, path string, h *nativeHandle, observe string, deadline time.Time) cacheGatePositiveValue {
+	switch observe {
+	case "path":
+		return p.record(cacheGatePositivePath(path))
+	case "basic":
+		return p.record(cacheGatePositiveInfo(h, win.FileBasicInfo))
+	case "standard":
+		return p.record(cacheGatePositiveInfo(h, win.FileStandardInfo))
+	case "read":
+		v, _ := cacheGatePositiveRead(h, 0, deadline)
+		return p.record(v)
+	default:
+		panic("invalid positive observer")
+	}
+}
+func cacheGatePositiveEOFTail(t *testing.T, p *cacheGatePositiveCell, h *nativeHandle, data []byte, oldSize int, deadline time.Time) {
+	t.Helper()
+	if len(data) > oldSize {
+		v, got := cacheGatePositiveRead(h, int64(oldSize), deadline)
+		p.record(v)
+		p.timing(t, v, deadline.Add(-time.Second))
+		if v.Error != "" || !bytes.Equal(got, data[oldSize:]) {
+			t.Errorf("grown tail not current: %+v", v)
+		}
+	}
+	offsets := []int64{int64(len(data))}
+	if oldSize > len(data) {
+		offsets = append(offsets, int64(oldSize-1))
+	}
+	for _, offset := range offsets {
+		v, _ := cacheGatePositiveRead(h, offset, deadline)
+		p.record(v)
+		p.timing(t, v, deadline.Add(-time.Second))
+		if !v.PureEOF || v.Count != 0 {
+			t.Errorf("EOF offset%d: %+v", offset, v)
+		}
+	}
+}
+
+func cacheGatePositiveOpenSync(t *testing.T, path string) (*nativeHandle, cacheGatePositiveValue) {
+	t.Helper()
+	v := cacheGatePositiveValue{API: "CreateFileW(READ,synchronous)", Started: time.Now()}
+	name, err := win.UTF16PtrFromString(path)
+	if err != nil {
+		cacheGatePositiveError(&v, err)
+		return nil, v
+	}
+	h, err := win.CreateFile(name, win.GENERIC_READ, win.FILE_SHARE_READ|win.FILE_SHARE_WRITE|win.FILE_SHARE_DELETE, nil, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, 0)
+	cacheGatePositiveError(&v, err)
+	if err != nil {
+		return nil, v
+	}
+	file := &nativeHandle{value: h}
+	t.Cleanup(func() {
+		if err := file.close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return file, v
+}
+func cacheGatePositiveReadSync(file *nativeHandle) cacheGatePositiveValue {
+	v := cacheGatePositiveValue{API: "ReadFile(synchronous)", Started: time.Now()}
+	data := make([]byte, 1024)
+	err := win.ReadFile(file.value, data, &v.Count, nil)
+	cacheGatePositiveError(&v, err)
+	if v.Count > uint32(len(data)) {
+		v.Error = "native read count exceeds supplied buffer"
+		return v
+	}
+	v.Digest = cacheGatePositiveDigest(data[:v.Count])
+	return v
+}
+func cacheGatePositiveSeek(t *testing.T, file *nativeHandle, offset int64) {
+	t.Helper()
+	started := time.Now()
+	position, err := win.Seek(file.value, offset, 0)
+	cacheGateObserve("positive_seek", map[string]any{"api": "SetFilePointer via x/sys/windows.Seek", "started": started, "completed": time.Now(), "requested": offset, "position": position, "error": fmt.Sprint(err)})
+	if err != nil || position != offset {
+		t.Fatalf("prepare native read offset: position=%d error=%v", position, err)
+	}
+}
+
+func cacheGatePositiveFresh(t *testing.T, v cacheGatePositiveValue, observe, name string, attr storage.Attr, want []byte) {
+	t.Helper()
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for {
+		records, incomplete := cacheGatePositiveWireSnapshot()
+		if incomplete {
+			t.Error("positive wire trace is incomplete")
+			return
+		}
+		for _, request := range records {
+			if request.Response || request.At.Before(v.Started) || request.At.After(v.Completed) {
+				continue
+			}
+			for _, response := range records {
+				if !response.Response || response.Connection != request.Connection || response.MessageID != request.MessageID || response.Command != request.Command {
+					continue
+				}
+				match := false
+				switch observe {
+				case "path", "open":
+					match = request.Command == 5 && request.Name == name && response.Status == 0 && response.EOF == uint64(attr.Size) && response.MTime == cacheGatePositiveTime(attr.ModTime)
+				case "absent":
+					match = request.Command == 5 && request.Name == name && response.Status == 0xc000000f
+				case "basic":
+					match = request.Command == 16 && (request.QueryClass == 4 || request.QueryClass == 18 || request.QueryClass == 34) && response.Status == 0 && response.MTime == cacheGatePositiveTime(attr.ModTime)
+				case "standard":
+					match = request.Command == 16 && (request.QueryClass == 5 || request.QueryClass == 18 || request.QueryClass == 34) && response.Status == 0 && response.EOF == uint64(attr.Size)
+				case "read", "sync":
+					match = request.Command == 8 && request.Offset == 0 && response.Status == 0 && response.Count == uint32(len(want)) && response.Digest == cacheGatePositiveDigest(want)
+				}
+				if match {
+					cacheGateObserve("positive_fresh_proof", map[string]any{"api": v.API, "connection": response.Connection, "message_id": response.MessageID, "command": response.Command, "query_class": response.QueryClass, "eof": response.EOF, "mtime": response.MTime, "count": response.Count, "digest": response.Digest})
+					return
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("selected first %s result has no matching current authoritative SMB response", v.API)
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+func cacheGatePositiveSizeCell(t *testing.T, p *cacheGatePositiveCell, bridge *nativeBridge, observe, change string) {
+	session, file := nativeRemoteOpen(t, bridge.remote, "target.bin", storage.NodeRegular, true)
+	before := cacheGatePositivePayload(257, 0x17)
+	after := cacheGatePositivePayload(769, 0x89)
+	if change == "shrink" {
+		before = cacheGatePositivePayload(769, 0x17)
+		after = before[:73]
+	}
+	initial := cacheGatePositiveInitial(t, session, file, before, 2001)
+	path := filepath.Join(bridge.path+`\`, "target.bin")
+	var h *nativeHandle
+	if observe != "path" {
+		var opened cacheGatePositiveValue
+		if observe == "sync" || observe == "basic" || observe == "standard" {
+			h, opened = cacheGatePositiveOpenSync(t, path)
+		} else {
+			h, opened = cacheGatePositiveOpen(t, path)
+		}
+		p.record(opened)
+		if h == nil {
+			t.Fatalf("open target: %s", opened.Error)
+		}
+		identity := p.record(cacheGatePositiveIdentity(h))
+		if identity.Error != "" || identity.Identity != initial.ID {
+			t.Fatalf("initial native identity is not the authority node: %+v", identity)
+		}
+	}
+	for range 2 {
+		var v cacheGatePositiveValue
+		if observe == "sync" {
+			cacheGatePositiveSeek(t, h, 0)
+			v = p.record(cacheGatePositiveReadSync(h))
+		} else {
+			v = cacheGatePositiveSelect(p, path, h, observe, time.Now().Add(time.Second))
+		}
+		selected := observe
+		if selected == "sync" {
+			selected = "read"
+		}
+		cacheGatePositiveRequire(t, v, initial, selected, before)
+	}
+	if t.Failed() {
+		t.Fatal("target warming failed")
+	}
+	if observe == "sync" {
+		cacheGatePositiveSeek(t, h, 0)
+	}
+	if p.postDeadline {
+		cacheGatePositiveExposure(t, p)
+		cacheGateWitnessNegotiation(t, bridge, p.noLeasing)
+		cacheGatePostDeadlineIdle(t)
+	}
+	action := nativeAction(t, session)
+	var expected storage.Attr
+	if change == "grow" {
+		expected = p.mutation(t, change, func() (storage.FileActionReceipt, error) {
+			return file.WriteAt(t.Context(), storage.FileWriteRequest{Data: after}, action)
+		})
+	} else {
+		expected = p.mutation(t, change, func() (storage.FileActionReceipt, error) {
+			return file.Truncate(t.Context(), storage.FileTruncateRequest{Size: 73}, action)
+		})
+	}
+	ack := p.Mutations[len(p.Mutations)-1].Acknowledged
+	if cacheGatePositiveTime(expected.ModTime) == cacheGatePositiveTime(initial.ModTime) {
+		t.Fatal("measured mutation did not change the timestamp at native precision")
+	}
+	if p.postDeadline {
+		cacheGatePostDeadlineObserve(t, p, path, file, initial, expected, after, ack)
+		return
+	}
+	var first cacheGatePositiveValue
+	if observe == "sync" {
+		first = p.record(cacheGatePositiveReadSync(h))
+	} else {
+		first = cacheGatePositiveSelect(p, path, h, observe, ack.Add(time.Second))
+	}
+	p.timing(t, first, ack)
+	selected := observe
+	if selected == "sync" {
+		selected = "read"
+	}
+	cacheGatePositiveRequire(t, first, expected, selected, after)
+	cacheGatePositiveFresh(t, first, observe, "target.bin", expected, after)
+	p.First = append(p.First, cacheGatePositiveFirst{Phase: change, Native: first, Expected: expected, Passed: !t.Failed()})
+	cacheGatePositiveOracle(t, file, expected, after)
+	if h != nil {
+		identity := p.record(cacheGatePositiveIdentity(h))
+		if identity.Error != "" || identity.Identity != initial.ID {
+			t.Errorf("retained native identity changed: %+v", identity)
+		}
+		if observe == "read" {
+			cacheGatePositiveEOFTail(t, p, h, after, len(before), ack.Add(time.Second))
+		}
+		if observe == "sync" {
+			if len(after) > len(before) {
+				cacheGatePositiveSeek(t, h, int64(len(before)))
+				tail := p.record(cacheGatePositiveReadSync(h))
+				p.timing(t, tail, ack)
+				if tail.Error != "" || tail.Count != uint32(len(after)-len(before)) || tail.Digest != cacheGatePositiveDigest(after[len(before):]) {
+					t.Errorf("synchronous grown tail stale: %+v", tail)
+				}
+			}
+			offsets := []int64{int64(len(after))}
+			if len(before) > len(after) {
+				offsets = append(offsets, int64(len(before)-1))
+			}
+			for _, offset := range offsets {
+				cacheGatePositiveSeek(t, h, offset)
+				eof := p.record(cacheGatePositiveReadSync(h))
+				p.timing(t, eof, ack)
+				if eof.Error != "" || eof.Count != 0 {
+					t.Errorf("synchronous EOF must succeed with zero bytes: %+v", eof)
+				}
+			}
+		}
+	}
+}
+func cacheGatePositiveTTL(t *testing.T) time.Duration {
+	t.Helper()
+	seconds, err := strconv.ParseUint(os.Getenv("RFS_GATE_MIN_CACHE_TTL"), 10, 32)
+	if err != nil || seconds <= 1 {
+		t.Fatal("verified cache lifetime above one second required")
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func cacheGatePositiveRename(t *testing.T, p *cacheGatePositiveCell, session storage.FileSession, file, parent storage.File, source, destination string) storage.Attr {
+	t.Helper()
+	request := storage.RenameRequest{Source: nativeTestTarget(t, parent, source), Destination: nativeTestTarget(t, parent, destination)}
+	action := nativeAction(t, session)
+	return p.mutation(t, "rename "+source+" -> "+destination, func() (storage.FileActionReceipt, error) { return file.Rename(t.Context(), request, action) })
+}
+func cacheGatePositiveCheckHandle(t *testing.T, p *cacheGatePositiveCell, h *nativeHandle, attr storage.Attr, data []byte, deadline time.Time, detached bool) {
+	t.Helper()
+	cacheGatePositiveSeek(t, h, 0)
+	v := p.record(cacheGatePositiveReadSync(h))
+	p.timing(t, v, deadline.Add(-time.Second))
+	if v.Error != "" || v.Count != uint32(len(data)) || v.Digest != cacheGatePositiveDigest(data) {
+		t.Errorf("retained handle bytes changed identity: %+v", v)
+	}
+	identity := p.record(cacheGatePositiveIdentity(h))
+	p.timing(t, identity, deadline.Add(-time.Second))
+	if identity.Error != "" {
+		cacheGateObserve("positive_identity_query_gap", map[string]any{"detached": detached, "result": identity})
+		t.Errorf("native identity query unavailable (fixture/API gap): %+v", identity)
+	} else if identity.Identity != attr.ID {
+		t.Errorf("native identity=%d want=%d", identity.Identity, attr.ID)
+	}
+	for _, class := range []uint32{win.FileBasicInfo, win.FileStandardInfo} {
+		info := p.record(cacheGatePositiveInfo(h, class))
+		p.timing(t, info, deadline.Add(-time.Second))
+		observe := "basic"
+		if class == win.FileStandardInfo {
+			observe = "standard"
+		}
+		cacheGatePositiveRequire(t, info, attr, observe, data)
+	}
+}
+func cacheGatePositiveFreshOpen(t *testing.T, p *cacheGatePositiveCell, path string, attr storage.Attr, data []byte, deadline time.Time) {
+	t.Helper()
+	h, v := cacheGatePositiveOpenSync(t, path)
+	p.record(v)
+	p.timing(t, v, deadline.Add(-time.Second))
+	if h == nil {
+		t.Errorf("fresh same-name open failed: %+v", v)
+		return
+	}
+	cacheGatePositiveCheckHandle(t, p, h, attr, data, deadline, false)
+	if err := h.close(); err != nil {
+		t.Error(err)
+	}
+}
+func cacheGatePositiveNamespaceCell(t *testing.T, p *cacheGatePositiveCell, bridge *nativeBridge, kind, observe string) {
+	session, parent := nativeRemoteOpen(t, bridge.remote, "", storage.NodeDirectory, false)
+	a := nativeRemoteCreateAt(t, session, parent, "target.bin", storage.NodeRegular)
+	contentA := cacheGatePositivePayload(257, 0x19)
+	attrA := cacheGatePositiveInitial(t, session, a, contentA, 2001)
+	contentB := cacheGatePositivePayload(769, 0x93)
+	var b storage.File
+	var attrB storage.Attr
+	if kind == "replace" {
+		b = nativeRemoteCreateAt(t, session, parent, "replacement.bin", storage.NodeRegular)
+		attrB = cacheGatePositiveInitial(t, session, b, contentB, 2002)
+	}
+	path := filepath.Join(bridge.path+`\`, "target.bin")
+	h, opened := cacheGatePositiveOpenSync(t, path)
+	p.record(opened)
+	if h == nil {
+		t.Fatalf("open original target: %+v", opened)
+	}
+	identity := p.record(cacheGatePositiveIdentity(h))
+	if identity.Error != "" || identity.Identity != attrA.ID {
+		t.Fatalf("original identity not established: %+v", identity)
+	}
+	for range 2 {
+		cacheGatePositiveRequire(t, p.record(cacheGatePositivePath(path)), attrA, "path", contentA)
+		if observe == "open" {
+			warm, v := cacheGatePositiveOpenSync(t, path)
+			p.record(v)
+			if warm == nil {
+				t.Fatalf("warm same-name open: %+v", v)
+			}
+			if err := warm.close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if t.Failed() {
+		t.Fatal("namespace target warming failed")
+	}
+	if kind == "replace" {
+		attrB = cacheGatePositiveRename(t, p, session, b, parent, "replacement.bin", "target.bin")
+	} else {
+		attrA = cacheGatePositiveRename(t, p, session, a, parent, "target.bin", "away.bin")
+		ack := p.Mutations[len(p.Mutations)-1].Acknowledged
+		absent := cacheGatePositiveMissing(t, p, path, observe)
+		p.timing(t, absent, ack)
+		if absent.Errno != uint32(win.ERROR_FILE_NOT_FOUND) {
+			t.Errorf("old name survived rename: %+v", absent)
+		}
+		cacheGatePositiveFresh(t, absent, "absent", "target.bin", storage.Attr{}, nil)
+		p.First = append(p.First, cacheGatePositiveFirst{Phase: "rename absence", Native: absent, Passed: !t.Failed()})
+		cacheGatePositiveCheckHandle(t, p, h, attrA, contentA, ack.Add(time.Second), false)
+		cacheGatePositiveFreshOpen(t, p, filepath.Join(bridge.path+`\`, "away.bin"), attrA, contentA, ack.Add(time.Second))
+		cacheGatePositiveOracle(t, a, attrA, contentA)
+		if kind == "rename" {
+			return
+		}
+		if t.Failed() {
+			t.Fatal("rename-away phase failed before recreate")
+		}
+		for range 2 {
+			negative := cacheGatePositiveMissing(t, p, path, observe)
+			if negative.Errno != uint32(win.ERROR_FILE_NOT_FOUND) {
+				t.Fatalf("selected negative view was not established before recreate: %+v", negative)
+			}
+		}
+		b = nativeRemoteCreateAt(t, session, parent, "target.bin", storage.NodeRegular)
+		action := nativeAction(t, session)
+		attrB = p.mutation(t, "recreate write", func() (storage.FileActionReceipt, error) {
+			return b.WriteAt(t.Context(), storage.FileWriteRequest{Data: contentB}, action)
+		})
+	}
+	ack := p.Mutations[len(p.Mutations)-1].Acknowledged
+	var first cacheGatePositiveValue
+	var fresh *nativeHandle
+	if observe == "open" {
+		fresh, first = cacheGatePositiveOpenSync(t, path)
+		p.record(first)
+	} else {
+		first = p.record(cacheGatePositivePath(path))
+	}
+	p.timing(t, first, ack)
+	if observe == "open" {
+		if fresh == nil {
+			t.Errorf("first same-name open failed: %+v", first)
+		}
+	} else {
+		cacheGatePositiveRequire(t, first, attrB, "path", contentB)
+	}
+	cacheGatePositiveFresh(t, first, observe, "target.bin", attrB, contentB)
+	p.First = append(p.First, cacheGatePositiveFirst{Phase: kind, Native: first, Expected: attrB, Passed: !t.Failed()})
+	cacheGatePositiveOracle(t, b, attrB, contentB)
+	if fresh != nil {
+		cacheGatePositiveCheckHandle(t, p, fresh, attrB, contentB, ack.Add(time.Second), false)
+	} else {
+		cacheGatePositiveFreshOpen(t, p, path, attrB, contentB, ack.Add(time.Second))
+	}
+	cacheGatePositiveCheckHandle(t, p, h, attrA, contentA, ack.Add(time.Second), kind == "replace")
+	if attrA.ID == attrB.ID {
+		t.Error("replacement identities are not distinct")
+	}
+}
+
+func cacheGatePositiveScenario(t *testing.T, variant string) {
+	postDeadline := strings.HasPrefix(variant, "positive_postdeadline_")
+	mode := strings.TrimPrefix(variant, "positive_")
+	if postDeadline {
+		mode = strings.TrimPrefix(variant, "positive_postdeadline_")
+	}
+	noLeasing := strings.HasPrefix(mode, "noleasing_")
+	if noLeasing {
+		mode = strings.TrimPrefix(mode, "noleasing_")
+	}
+	if mode != "unheld" && mode != "exclusive" {
+		t.Fatal("invalid positive-cache mode")
+	}
+	cells := []string{"path_grow", "path_shrink", "basic_grow", "basic_shrink", "standard_grow", "standard_shrink", "read_grow", "read_shrink", "sync_grow", "sync_shrink", "rename_path", "replace_path", "replace_open", "recreate_path", "recreate_open"}
+	if postDeadline {
+		cells = []string{"postdeadline_path_growth_witness"}
+	}
+	verdicts := map[string]bool{}
+	t.Cleanup(func() {
+		report := map[string]any{"evidence_kind": "pinned prototype diagnostic; not PR implementation acceptance", "variant": variant, "fixture_sha": os.Getenv("RFS_GATE_FIXTURE_SHA"), "gate_sha": os.Getenv("GITHUB_SHA"), "overlay_sha": os.Getenv("RFS_GATE_OVERLAY_SHA"), "missing_status_overlay_sha": os.Getenv("RFS_GATE_MISSING_STATUS_SHA"), "cells": verdicts, "test_failed": t.Failed()}
+		if postDeadline {
+			report["evidence_kind"] = "post-deadline witness collection; not one-second SLO acceptance"
+			report["within_one_second_proven"] = false
+			report["contract_result"] = "see witness classification; a current late sample is inconclusive"
+		}
+		if noLeasing {
+			report["negotiation_policy"] = "unsupported leasing; no cache grants"
+			report["no_leasing_overlay_sha"] = os.Getenv("RFS_GATE_NO_LEASING_SHA")
+		}
+		data, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.WriteFile(filepath.Join(os.Getenv("RFS_GATE_OUTPUT_ROOT"), "receipt.json"), data, 0600); err != nil {
+			t.Error(err)
+		}
+	})
+	if postDeadline && !cacheGateRunProtocolProof(t, noLeasing) {
+		t.Fatal("protocol proof fixture did not complete cleanly")
+	}
+	for _, name := range cells {
+		verdicts[name] = t.Run(name, func(t *testing.T) {
+			trace := &cacheGateTrace{}
+			cacheGateActive.Store(trace)
+			cacheGateResetPositiveWire()
+			cell := &cacheGatePositiveCell{Name: name, Mode: mode, IOModel: "synchronous", postDeadline: postDeadline, noLeasing: noLeasing}
+			if postDeadline {
+				cell.IOModel = "path-only"
+			}
+			if strings.HasPrefix(name, "read_") {
+				cell.IOModel = "overlapped"
+			}
+			if strings.HasPrefix(name, "path_") {
+				cell.IOModel = "path-only"
+			}
+			if strings.HasPrefix(name, "sync_") || strings.HasPrefix(name, "basic_") || strings.HasPrefix(name, "standard_") {
+				cell.IOModel = "synchronous"
+			}
+			var bridge *nativeBridge
+			t.Cleanup(func() {
+				cacheGateActive.Store(nil)
+				records, incomplete := cacheGatePositiveWireSnapshot()
+				evidenceValid := !incomplete
+				for _, r := range records {
+					if noLeasing && r.Response && r.Command == 5 && (r.Oplock != 0 || r.LeasePresent || r.LeaseState != 0) {
+						evidenceValid = false
+						t.Error("unsupported-leasing experiment returned an oplock or lease context")
+					}
+					if r.Command == 15 {
+						evidenceValid = false
+						t.Error("positive no-watcher probe issued CHANGE_NOTIFY")
+					}
+					if r.Response && r.Command == 5 && (r.Oplock != 0 && !(r.Oplock == 0xff && r.LeasePresent && r.LeaseState == 0) || r.LeaseState != 0) {
+						evidenceValid = false
+						t.Error("positive probe received caching rights")
+					}
+				}
+				trace.mu.Lock()
+				events := append([]cacheGateEvent(nil), trace.events...)
+				overflow, encodingError := trace.overflow, trace.encodingError
+				trace.mu.Unlock()
+				if incomplete || overflow || encodingError != nil {
+					evidenceValid = false
+					t.Errorf("positive evidence incomplete: wire=%v events=%v encoding=%v", incomplete, overflow, encodingError)
+				}
+				report := map[string]any{"evidence_kind": "pinned prototype diagnostic; not PR implementation acceptance", "variant": variant, "cell": cell, "test_failed": t.Failed(), "wire_incomplete": incomplete, "trace_overflow": overflow, "events": events, "wire": records}
+				if bridge != nil {
+					status := bridge.smb.Status()
+					refs := bridge.backend.openReferences()
+					report["final_server_status"] = status
+					report["final_backend_references"] = refs
+					if refs != 0 || status.Connections != 0 || status.RetainedConnections != 0 || status.PendingRequests != 0 || status.UnconfirmedMutations != 0 || status.CleanupFailures != 0 {
+						evidenceValid = false
+						t.Error("positive cell cleanup retained resources or unknown effects")
+					}
+				}
+				if postDeadline {
+					report["within_one_second_proven"] = false
+					report["contract_result"] = "inconclusive"
+					if cell.PostDeadline != nil {
+						if !evidenceValid || t.Failed() {
+							cell.PostDeadline.Classification = "invalid_or_inconclusive"
+							cell.PostDeadline.ContractResult = "inconclusive"
+						}
+						report["contract_result"] = cell.PostDeadline.ContractResult
+						if cell.PostDeadline.ContractResult == "violated" {
+							t.Errorf("path attributes remained stale after one second: %+v", cell.PostDeadline.Native)
+						}
+					}
+				}
+				report["test_failed"] = t.Failed()
+				data, err := json.MarshalIndent(report, "", "  ")
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if err := os.WriteFile(filepath.Join(os.Getenv("RFS_GATE_OUTPUT_ROOT"), "positive-"+name+".json"), data, 0600); err != nil {
+					t.Error(err)
+				}
+			})
+			sid, err := CurrentUserSID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			policy, err := AllowSID(sid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bridge = nativeBridgeFixture(t, policy)
+			if err := bridge.mapDrive(t); err != nil {
+				t.Fatal(err)
+			}
+			if !postDeadline {
+				proof := nativeOpen(t, filepath.Join(bridge.path+`\`, "lease-proof.bin"), win.CREATE_ALWAYS)
+				if n, err := nativeTransfer(proof, []byte{1}, true); err != nil || n != 1 {
+					t.Fatalf("exercise zero-rights lease: n=%d error=%v", n, err)
+				}
+				if noLeasing {
+					cacheGateAssertNoLeasing(t, bridge)
+				} else {
+					bridge.assertCacheContract(t)
+				}
+				if err := proof.close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if mode == "exclusive" {
+				root, err := cacheGateSharingOpen(t, bridge.path+`\`, win.FILE_LIST_DIRECTORY, 0, true)
+				if err != nil {
+					t.Fatalf("exclusive root open: %v", err)
+				}
+				if root == nil {
+					t.Fatal("exclusive root handle absent")
+				}
+			}
+			if !postDeadline {
+				cacheGatePositiveExposure(t, cell)
+			}
+			if postDeadline {
+				cacheGatePositiveSizeCell(t, cell, bridge, "path", "grow")
+				return
+			}
+			parts := strings.SplitN(name, "_", 2)
+			if parts[1] == "grow" || parts[1] == "shrink" {
+				cacheGatePositiveSizeCell(t, cell, bridge, parts[0], parts[1])
+			} else {
+				cacheGatePositiveNamespaceCell(t, cell, bridge, parts[0], parts[1])
+			}
+		})
+	}
+}
+
+func cacheGateOptionalPositiveObserver() *cacheGatePositiveFrameObserver {
+	if strings.HasPrefix(os.Getenv("RFS_GATE_VARIANT"), "positive_") {
+		return cacheGateNewPositiveFrameObserver()
+	}
+	return nil
+}
+func (c *nativeObservedConnection) Close() error {
+	err := c.Conn.Close()
+	if c.positive != nil {
+		c.positive.finish()
+	}
+	return err
+}
+
+func cacheGatePositiveOwnMapping(local, share string) error {
+	if !strings.HasPrefix(os.Getenv("RFS_GATE_VARIANT"), "positive_") {
+		return nil
+	}
+	record := map[string]string{"Local": local, "Remote": `\\127.0.0.1\` + share}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	target := filepath.Join(os.Getenv("RFS_GATE_OUTPUT_ROOT"), "owned-mapping-"+share+".json")
+	pending := target + ".tmp"
+	file, err := os.OpenFile(pending, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.Write(data)
+	if err := errors.Join(writeErr, file.Sync(), file.Close()); err != nil {
+		return err
+	}
+	return os.Rename(pending, target)
+}
+
+func cacheGatePositiveMissing(t *testing.T, p *cacheGatePositiveCell, path, observe string) cacheGatePositiveValue {
+	if observe == "open" {
+		h, v := cacheGatePositiveOpenSync(t, path)
+		p.record(v)
+		if h != nil {
+			t.Error("expected missing name unexpectedly opened")
+		}
+		return v
+	}
+	return p.record(cacheGatePositivePath(path))
+}
+
+func cacheGatePositivePureEOF(completion, cleanup error) bool {
+	return completion == win.ERROR_HANDLE_EOF && cleanup == nil
+}
+
+func TestGatePositiveReadCompletion(t *testing.T) {
+	for _, test := range []struct {
+		name                string
+		completion, cleanup error
+		want                bool
+	}{
+		{"pureEOF", win.ERROR_HANDLE_EOF, nil, true},
+		{"successfulRead", nil, nil, false},
+		{"canceledWithEOF", errors.Join(context.DeadlineExceeded, win.ERROR_HANDLE_EOF), nil, false},
+		{"waitFailedWithEOF", errors.Join(win.ERROR_INVALID_HANDLE, win.ERROR_HANDLE_EOF), nil, false},
+		{"cleanupFailed", win.ERROR_HANDLE_EOF, win.ERROR_INVALID_HANDLE, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := cacheGatePositivePureEOF(test.completion, test.cleanup); got != test.want {
+				t.Fatalf("pure EOF=%v want=%v", got, test.want)
+			}
+		})
+	}
+}
+
+func cacheGatePositiveExposure(t *testing.T, p *cacheGatePositiveCell) {
+	records, incomplete := cacheGatePositiveWireSnapshot()
+	if incomplete {
+		t.Fatal("setup trace is incomplete")
+	}
+	for _, record := range records {
+		if record.Response || record.Command != 5 {
+			continue
+		}
+		if p.Exposed.IsZero() || record.At.Before(p.Exposed) {
+			p.Exposed = record.At
+			p.ExposureSource = record
+		}
+	}
+	if p.Exposed.IsZero() {
+		t.Fatal("native setup has no recorded CREATE exposure")
+	}
+	p.EarliestExpiry = p.Exposed.Add(cacheGatePositiveTTL(t))
+	if !time.Now().Before(p.EarliestExpiry) {
+		t.Fatal("setup crossed earliest possible directory-cache expiry")
+	}
+}
+
+type cacheGatePostDeadlineResult struct {
+	InvalidationReasons   []string               `json:"invalidation_reasons"`
+	Classification        string                 `json:"classification"`
+	ContractResult        string                 `json:"contract_result"`
+	WithinOneSecondProven bool                   `json:"within_one_second_proven"`
+	PlannedStartDelayNS   int64                  `json:"planned_start_delay_ns"`
+	StartMinusAckNS       int64                  `json:"start_minus_ack_ns"`
+	CompletionMinusAckNS  int64                  `json:"completion_minus_ack_ns"`
+	Native                cacheGatePositiveValue `json:"native"`
+	Warmed, Expected      storage.Attr
+	QuietViolations       []cacheGatePositiveWireRecord `json:"quiet_violations"`
+	NativeInterval        []cacheGatePositiveWireRecord `json:"native_interval"`
+	MatchesWarmTuple      bool                          `json:"matches_warm_tuple"`
+}
+
+func cacheGatePostDeadlineIdle(t *testing.T) {
+	t.Helper()
+	if err := cacheGatePostDeadlineWaitIdle(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func cacheGatePostDeadlineWaitIdle() error {
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for {
+		records, incomplete := cacheGatePositiveWireSnapshot()
+		if incomplete {
+			return errors.New("post-deadline witness has incomplete trace")
+		}
+		pending := map[[2]uint64]bool{}
+		for _, record := range records {
+			if record.Bootstrap || record.Command == 12 || record.Command == 13 {
+				continue
+			}
+			key := [2]uint64{record.Connection, record.MessageID}
+			if record.Response {
+				if record.Status != 0x103 {
+					delete(pending, key)
+				}
+			} else {
+				pending[key] = true
+			}
+		}
+		if len(pending) == 0 {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return errors.New("native SMB operations remained outstanding")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func cacheGatePostDeadlineObserve(t *testing.T, p *cacheGatePositiveCell, path string, file storage.File, warmed, expected storage.Attr, data []byte, ack time.Time) {
+	t.Helper()
+	result := &cacheGatePostDeadlineResult{Classification: "invalid_or_inconclusive", ContractResult: "inconclusive", PlannedStartDelayNS: int64(1100 * time.Millisecond), Warmed: warmed, Expected: expected}
+	p.PostDeadline = result
+	due := ack.Add(1100 * time.Millisecond)
+	if !due.Before(p.EarliestExpiry) {
+		result.InvalidationReasons = append(result.InvalidationReasons, "no pre-expiry observation window")
+	}
+	timer := time.NewTimer(time.Until(due))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-t.Context().Done():
+		t.Fatal(t.Context().Err())
+	}
+	first := p.record(cacheGatePositivePath(path))
+	result.Native = first
+	result.MatchesWarmTuple = first.Size == warmed.Size && first.MTime == cacheGatePositiveTime(warmed.ModTime)
+	result.StartMinusAckNS = int64(first.Started.Sub(ack))
+	result.CompletionMinusAckNS = int64(first.Completed.Sub(ack))
+	if !first.Started.After(ack.Add(time.Second)) || !first.Started.Before(p.EarliestExpiry) || !first.Completed.Before(p.EarliestExpiry) {
+		result.InvalidationReasons = append(result.InvalidationReasons, "query outside strict post-one-second/pre-TTL window")
+	}
+	if first.Error != "" {
+		result.InvalidationReasons = append(result.InvalidationReasons, "native query failed: "+first.Error)
+	}
+	// Waiting on recorded completions does not issue another native observation.
+	if err := cacheGatePostDeadlineWaitIdle(); err != nil {
+		result.InvalidationReasons = append(result.InvalidationReasons, err.Error())
+	}
+	records, incomplete := cacheGatePositiveWireSnapshot()
+	if incomplete {
+		result.InvalidationReasons = append(result.InvalidationReasons, "wire trace incomplete")
+	}
+	for _, record := range records {
+		if record.Command == 13 {
+			continue
+		}
+		if record.At.After(ack) && record.At.Before(first.Started) {
+			result.QuietViolations = append(result.QuietViolations, record)
+		}
+		if !record.At.Before(first.Started) {
+			result.NativeInterval = append(result.NativeInterval, record)
+		}
+	}
+	if len(result.QuietViolations) != 0 {
+		result.InvalidationReasons = append(result.InvalidationReasons, "SMB activity interrupted the untouched interval")
+	}
+	oracle, err := file.ReadAt(t.Context(), storage.FileReadRequest{Length: 1024})
+	cacheGateObserve("postdeadline_http_oracle", map[string]any{"attr": oracle.Attr, "count": len(oracle.Data), "digest": cacheGatePositiveDigest(oracle.Data), "error": fmt.Sprint(err)})
+	if err != nil || oracle.Attr.ID != expected.ID || oracle.Attr.MetadataRevision != expected.MetadataRevision || oracle.Attr.Size != expected.Size || !oracle.Attr.ModTime.Equal(expected.ModTime) || !bytes.Equal(oracle.Data, data) {
+		result.InvalidationReasons = append(result.InvalidationReasons, "authority oracle changed or failed")
+	}
+	if len(result.InvalidationReasons) != 0 {
+		t.Errorf("post-deadline witness invalid: %v", result.InvalidationReasons)
+		return
+	}
+	if first.Size != expected.Size || first.MTime != cacheGatePositiveTime(expected.ModTime) {
+		result.Classification = "stale_after_one_second"
+		result.ContractResult = "violated"
+		return
+	}
+	result.Classification = "current_at_post_deadline_probe"
+	// A current late sample cannot establish when it first became current.
+	result.ContractResult = "inconclusive"
+}
+
+func cacheGateAssertNoLeasing(t *testing.T, bridge *nativeBridge) {
+	t.Helper()
+	if bridge.wire.unsafeCaching.Load() || bridge.wire.leaseResponses.Load() != 0 {
+		t.Fatal("no-leasing experiment received lease or oplock cache rights")
+	}
+	bridge.wire.mu.Lock()
+	defer bridge.wire.mu.Unlock()
+	formal := false
+	for _, negotiation := range bridge.wire.negotiations {
+		if negotiation.Dialect != 0x311 && negotiation.Dialect != 0x2ff {
+			t.Fatalf("unexpected experimental dialect: %+v", negotiation)
+		}
+		if negotiation.Capabilities != 4 {
+			t.Fatalf("no-leasing experiment advertised unsupported capabilities: %+v", negotiation)
+		}
+		if negotiation.Dialect == 0x311 {
+			formal = true
+		}
+	}
+	if !formal {
+		t.Fatal("no-leasing experiment did not observe final SMB3.1.1 negotiation")
+	}
+	proved := false
+	for _, request := range bridge.wire.creates {
+		if request.Name != "lease-proof.bin" {
+			continue
+		}
+		for _, response := range bridge.wire.createReplies {
+			if response.MessageID != request.MessageID {
+				continue
+			}
+			if response.Truncated || response.Oplock != 0 || len(response.Leases) != 0 {
+				t.Fatalf("ordinary experimental CREATE granted caching: %+v", response)
+			}
+			proved = true
+		}
+	}
+	if !proved {
+		t.Fatal("no-leasing experiment did not observe its ordinary proof-file CREATE response")
+	}
+}
+
+func cacheGateRunProtocolProof(t *testing.T, noLeasing bool) bool {
+	return cacheGateCompleteProofFixture(t, func(t *testing.T) {
+		trace := &cacheGateTrace{}
+		cacheGateActive.Store(trace)
+		cacheGateResetPositiveWire()
+		var bridge *nativeBridge
+		t.Cleanup(func() {
+			cacheGateActive.Store(nil)
+			records, incomplete := cacheGatePositiveWireSnapshot()
+			trace.mu.Lock()
+			events := append([]cacheGateEvent(nil), trace.events...)
+			overflow, encodingError := trace.overflow, trace.encodingError
+			trace.mu.Unlock()
+			if incomplete || overflow || encodingError != nil {
+				t.Error("protocol proof fixture trace is incomplete")
+			}
+			report := map[string]any{"evidence_kind": "completed setup protocol proof; separate from measured pathname fixture", "wire": records, "events": events, "wire_incomplete": incomplete, "trace_overflow": overflow}
+			if bridge != nil {
+				status := bridge.smb.Status()
+				refs := bridge.backend.openReferences()
+				report["server_status"] = status
+				report["backend_references"] = refs
+				if refs != 0 || status.Connections != 0 || status.RetainedConnections != 0 || status.PendingRequests != 0 || status.UnconfirmedMutations != 0 || status.CleanupFailures != 0 {
+					t.Error("protocol proof fixture retained resources or unconfirmed effects")
+				}
+			}
+			report["test_failed"] = t.Failed()
+			data, err := json.MarshalIndent(report, "", "  ")
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if err := os.WriteFile(filepath.Join(os.Getenv("RFS_GATE_OUTPUT_ROOT"), "protocol-proof.json"), data, 0600); err != nil {
+				t.Error(err)
+			}
+		})
+		sid, err := CurrentUserSID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		policy, err := AllowSID(sid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bridge = nativeBridgeFixture(t, policy)
+		if err := bridge.mapDrive(t); err != nil {
+			t.Fatal(err)
+		}
+		proof := nativeOpen(t, filepath.Join(bridge.path+`\`, "lease-proof.bin"), win.CREATE_ALWAYS)
+		if n, err := nativeTransfer(proof, []byte{1}, true); err != nil || n != 1 {
+			t.Fatalf("protocol proof WRITE failed: n=%d error=%v", n, err)
+		}
+		if noLeasing {
+			cacheGateAssertNoLeasing(t, bridge)
+		} else {
+			bridge.assertCacheContract(t)
+		}
+		if err := proof.close(); err != nil {
+			t.Fatal(err)
+		}
+		cacheGatePostDeadlineIdle(t)
+	})
+}
+
+func cacheGateWitnessNegotiation(t *testing.T, bridge *nativeBridge, noLeasing bool) {
+	t.Helper()
+	cacheGatePostDeadlineIdle(t)
+	if bridge.wire.unsafeCaching.Load() || noLeasing && bridge.wire.leaseResponses.Load() != 0 {
+		t.Fatal("measured fixture received unsupported caching rights or contexts")
+	}
+	bridge.wire.mu.Lock()
+	defer bridge.wire.mu.Unlock()
+	formal := false
+	for _, negotiation := range bridge.wire.negotiations {
+		var expected uint32
+		switch negotiation.Dialect {
+		case 0x311:
+			expected = 0x26
+			formal = true
+		case 0x2ff:
+			expected = 0x6
+		default:
+			t.Fatalf("unexpected measured dialect: %+v", negotiation)
+		}
+		if noLeasing {
+			expected = 4
+		}
+		if negotiation.Capabilities != expected {
+			t.Fatalf("measured fixture capabilities=%x expected=%x", negotiation.Capabilities, expected)
+		}
+	}
+	if !formal {
+		t.Fatal("measured fixture has no observed SMB3.1.1 negotiation")
+	}
+}

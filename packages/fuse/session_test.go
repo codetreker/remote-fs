@@ -23,7 +23,7 @@ func (s sessionLifecycleStorage) NewFileSession(ctx context.Context, opts storag
 	if err != nil {
 		return nil, err
 	}
-	return s.wrap(fileSession), nil
+	return &lifecycleCapabilities{FileSession: s.wrap(fileSession), NamespaceAccess: fileSession.(storage.NamespaceAccess), AtomicFileOpener: fileSession.(storage.AtomicFileOpener), MetadataAccess: fileSession.(storage.MetadataAccess), UseOwners: fileSession.(storage.UseOwners), RangeControl: fileSession.(storage.RangeControl), NodeReferences: fileSession.(storage.NodeReferences)}, nil
 }
 
 type sessionLifecycleProbe struct {
@@ -332,4 +332,14 @@ func TestFailedMountHandshakeRetainsIndependentTeardownErrors(t *testing.T) {
 	if got != nil || !errors.Is(err, handshakeErr) || !errors.Is(err, unmountErr) || !errors.Is(err, retirementErr) {
 		t.Fatalf("completed failed setup lost a cause: mount=%v error=%v", got, err)
 	}
+}
+
+type lifecycleCapabilities struct {
+	storage.NodeReferences
+	storage.FileSession
+	storage.NamespaceAccess
+	storage.AtomicFileOpener
+	storage.MetadataAccess
+	storage.UseOwners
+	storage.RangeControl
 }

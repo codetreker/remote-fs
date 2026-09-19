@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"io/fs"
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
@@ -51,7 +50,7 @@ func (s *Store) Snapshot(ctx context.Context) (metastore.Snap, metastore.Positio
 		return nil, 0, finishReadTransaction(ctx, "snapshot transaction", tx, primary)
 	}
 	if err := schema.ValidateVolumeIntegrity(
-		ctx, tx, s.volume, s.maxIntegrityRecords, s.maxIntegrityBytes,
+		ctx, tx, s.volume, s.maxIntegrityRecords, s.maxIntegrityBytes, s.maxMetadataBytes,
 	); err != nil {
 		primary := fmt.Errorf("validating the picture of the tree: %w", sqlerr.ReadFailure(ctx, err))
 		return nil, 0, finishReadTransaction(ctx, "snapshot transaction", tx, primary)
@@ -72,7 +71,7 @@ type snapshot struct {
 	ctx   context.Context
 
 	// tx is the read transaction the picture is taken in, and nil once it is closed.
-	tx *sql.Tx
+	tx *ownedTransaction
 
 	// The root has no name and no parent, so it is not an entry and is delivered on its own.
 	sentRoot bool
@@ -109,12 +108,12 @@ func (p *snapshot) Next(ctx context.Context, limit int, result *metastore.RowRes
 
 	produced := 0
 	if !p.sentRoot {
-		root, contentBytes, err := p.store.rootMetadata(ctx, p.tx)
+		root, lengths, err := p.store.rootMetadata(ctx, p.tx.Tx)
 		if err != nil {
 			return false, result.Fail(fmt.Errorf("reading the root of the picture: %w", p.readFailure(ctx, err)))
 		}
 		reservation, fits, err := result.Reserve(
-			metastore.Row{Node: root}, metastore.RowPayloadLengths{Content: contentBytes},
+			metastore.Row{Node: root}, lengths,
 		)
 		if err != nil {
 			return false, err
@@ -122,11 +121,11 @@ func (p *snapshot) Next(ctx context.Context, limit int, result *metastore.RowRes
 		if !fits {
 			return false, result.Fail(fmt.Errorf("the root did not fit an empty snapshot page: %w", syscall.EIO))
 		}
-		content, err := p.store.nodeContent(ctx, p.tx, root.ID)
+		content, metadata, target, err := p.store.nodePayload(ctx, p.tx.Tx, root.ID)
 		if err != nil {
 			return false, result.Fail(fmt.Errorf("reading the root content key: %w", p.readFailure(ctx, err)))
 		}
-		if err := reservation.Commit(nil, content); err != nil {
+		if err := reservation.Commit(nil, content, metadata, target); err != nil {
 			return false, err
 		}
 		p.sentRoot = true
@@ -152,11 +151,11 @@ func (p *snapshot) Next(ctx context.Context, limit int, result *metastore.RowRes
 		if !fits {
 			return false, nil
 		}
-		name, content, err := p.payload(ctx, row.Parent, row.Node.ID)
+		name, content, metadata, target, err := p.payload(ctx, row.Parent, row.Node.ID)
 		if err != nil {
 			return false, result.Fail(fmt.Errorf("reading a snapshot row payload: %w", p.readFailure(ctx, err)))
 		}
-		if err := reservation.Commit(name, content); err != nil {
+		if err := reservation.Commit(name, content, metadata, target); err != nil {
 			return false, err
 		}
 		p.parent, p.name = row.Parent, name
@@ -209,57 +208,34 @@ func (p *snapshot) readFailure(ctx context.Context, err error) error {
 //
 // TestAPictureIsPagedByRangeRatherThanByScanningAndSorting asserts the plan this produces,
 // with and without table statistics.
-const pageQuery = `
-	SELECT e.parent, length(CAST(e.name AS BLOB)), n.id, n.mode, n.size,
-	       n.atime_sec, n.atime_nsec, n.mtime_sec, n.mtime_nsec,
-	       COALESCE(length(CAST(n.content AS BLOB)), 0)
+var pageQuery = `
+	SELECT e.parent, length(CAST(e.name AS BLOB)), ` + nodeHeaderColumns + `
 	FROM entries e JOIN nodes n ON n.id = e.node
 	WHERE e.volume = ? AND (e.parent, e.name) > (?, ?)
 	ORDER BY e.parent, e.name
 	LIMIT ?`
 
-type nodeMetadataScan struct {
-	id                 int64
-	mode               int64
-	size               int64
-	atimeSec, mtimeSec int64
-	atimeNsec          int32
-	mtimeNsec          int32
-	contentBytes       int64
-}
-
-func (s *nodeMetadataScan) fields() []any {
-	return []any{&s.id, &s.mode, &s.size, &s.atimeSec, &s.atimeNsec, &s.mtimeSec, &s.mtimeNsec, &s.contentBytes}
-}
-
-func (s nodeMetadataScan) node() metastore.Node {
-	return metastore.Node{
-		ID: s.id, Mode: fs.FileMode(s.mode), Size: s.size,
-		AccessTime: sqlvalue.LoadedTime(s.atimeSec, s.atimeNsec),
-		ModTime:    sqlvalue.LoadedTime(s.mtimeSec, s.mtimeNsec),
+func (s *Store) rootMetadata(ctx context.Context, tx *sql.Tx) (metastore.Node, metastore.RowPayloadLengths, error) {
+	var header nodeHeader
+	if err := tx.QueryRowContext(ctx, `SELECT `+nodeHeaderColumns+` FROM nodes n WHERE n.id=?`, s.root).Scan(header.fields()...); err != nil {
+		return metastore.Node{}, metastore.RowPayloadLengths{}, err
 	}
+	node, err := header.node()
+	return node, metastore.RowPayloadLengths{Content: header.contentBytes, Metadata: header.metadataBytes, Target: header.targetBytes}, err
 }
 
-func (s *Store) rootMetadata(ctx context.Context, tx *sql.Tx) (metastore.Node, int64, error) {
-	var node nodeMetadataScan
-	err := tx.QueryRowContext(ctx, `
-		SELECT n.id, n.mode, n.size, n.atime_sec, n.atime_nsec, n.mtime_sec, n.mtime_nsec,
-		       COALESCE(length(CAST(n.content AS BLOB)), 0)
-		FROM nodes n WHERE n.id = ?`, s.root).Scan(node.fields()...)
-	return node.node(), node.contentBytes, err
-}
-
-func (s *Store) nodeContent(ctx context.Context, tx *sql.Tx, id int64) (metastore.Key, error) {
+func (s *Store) nodePayload(ctx context.Context, tx *sql.Tx, id int64) (metastore.Key, []byte, []byte, error) {
 	var content sql.NullString
-	err := tx.QueryRowContext(ctx, `SELECT content FROM nodes WHERE id = ?`, id).Scan(&content)
-	return metastore.Key(content.String), err
+	var metadata, target []byte
+	err := tx.QueryRowContext(ctx, `SELECT content,metadata,link_target FROM nodes WHERE id=?`, id).Scan(&content, &metadata, &target)
+	return metastore.Key(content.String), metadata, target, err
 }
 
 func (p *snapshot) nextMetadata(ctx context.Context) (metastore.Row, metastore.RowPayloadLengths, bool, error) {
 	var (
 		parent    int64
 		nameBytes int64
-		node      nodeMetadataScan
+		node      nodeHeader
 	)
 	err := p.tx.QueryRowContext(ctx, pageQuery, p.store.volume, p.parent, p.name, 1).Scan(
 		append([]any{&parent, &nameBytes}, node.fields()...)...,
@@ -270,22 +246,24 @@ func (p *snapshot) nextMetadata(ctx context.Context) (metastore.Row, metastore.R
 	if err != nil {
 		return metastore.Row{}, metastore.RowPayloadLengths{}, false, err
 	}
-	return metastore.Row{Parent: parent, Name: []byte{}, Node: node.node()}, metastore.RowPayloadLengths{
-		Name: nameBytes, Content: node.contentBytes,
-	}, true, nil
+	value, err := node.node()
+	if err != nil {
+		return metastore.Row{}, metastore.RowPayloadLengths{}, false, err
+	}
+	return metastore.Row{Parent: parent, Name: []byte{}, Node: value}, metastore.RowPayloadLengths{Name: nameBytes, Content: node.contentBytes, Metadata: node.metadataBytes, Target: node.targetBytes}, true, nil
 }
 
-func (p *snapshot) payload(ctx context.Context, parent, node int64) ([]byte, metastore.Key, error) {
+func (p *snapshot) payload(ctx context.Context, parent, node int64) ([]byte, metastore.Key, []byte, []byte, error) {
 	var (
-		name    []byte
-		content sql.NullString
+		name, metadata, target []byte
+		content                sql.NullString
 	)
 	err := p.tx.QueryRowContext(ctx, `
-		SELECT e.name, n.content
+		SELECT e.name, n.content,n.metadata,n.link_target
 		FROM entries e JOIN nodes n ON n.id = e.node
 		WHERE e.volume = ? AND e.parent = ? AND e.node = ?`,
-		p.store.volume, parent, node).Scan(&name, &content)
-	return name, metastore.Key(content.String), err
+		p.store.volume, parent, node).Scan(&name, &content, &metadata, &target)
+	return name, metastore.Key(content.String), metadata, target, err
 }
 
 // Close releases the read transaction the picture is taken in, and with it the WAL that

@@ -1,0 +1,874 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/codetreker/remote-fs/packages/locking"
+	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/transport/httprest"
+)
+
+const (
+	createPhase       = "readiness-create"
+	reopenPhase       = "readiness-reopen"
+	fixtureVolume     = "fixture-current"
+	metadataNamespace = "fixture.current"
+	maxStateBytes     = 16 << 10
+	fixtureQuota      = 64 << 20
+)
+
+type options struct {
+	Endpoint, Volume, RunID, SourceSHA, FixtureNonce, Phase, StateFile string
+	Sequence                                                           uint64
+}
+
+type receipt struct {
+	RunID          string `json:"run_id"`
+	SourceSHA      string `json:"source_sha"`
+	FixtureNonce   string `json:"fixture_nonce"`
+	Phase          string `json:"phase"`
+	Sequence       uint64 `json:"sequence"`
+	Status         string `json:"status"`
+	AuthorityEpoch string `json:"authority_epoch"`
+	ObjectID       string `json:"object_id"`
+}
+
+type probeState struct {
+	Version        int                    `json:"version"`
+	RunID          string                 `json:"run_id"`
+	SourceSHA      string                 `json:"source_sha"`
+	FixtureNonce   string                 `json:"fixture_nonce"`
+	Volume         string                 `json:"volume"`
+	Phase          string                 `json:"phase"`
+	Sequence       uint64                 `json:"sequence"`
+	AuthorityEpoch string                 `json:"authority_epoch"`
+	RootID         uint64                 `json:"root_id"`
+	SentinelName   string                 `json:"sentinel_name"`
+	Content        []byte                 `json:"content"`
+	ContentSHA256  string                 `json:"content_sha256"`
+	Reference      storage.ReferenceState `json:"reference"`
+	LogicalUsed    int64                  `json:"logical_used"`
+}
+
+func main() {
+	if err := command(os.Args[1:], os.Stdout); err != nil {
+		fmt.Fprintln(os.Stderr, "current authority probe:", err)
+		os.Exit(1)
+	}
+}
+
+func command(args []string, stdout io.Writer) error {
+	o, err := parseOptions(args)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Second)
+	defer cancel()
+	r, err := probe(ctx, o)
+	if err != nil {
+		return err
+	}
+	data, err := encodeReceipt(r)
+	if err != nil {
+		return err
+	}
+	n, err := stdout.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	return err
+}
+
+func parseOptions(args []string) (options, error) {
+	var o options
+	flags := flag.NewFlagSet("current-authority-probe", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	flags.StringVar(&o.Endpoint, "endpoint", "", "loopback HTTP endpoint")
+	flags.StringVar(&o.Volume, "volume", "", "fixture volume")
+	flags.StringVar(&o.RunID, "run-id", "", "run identity")
+	flags.StringVar(&o.SourceSHA, "source-sha", "", "source commit")
+	flags.StringVar(&o.FixtureNonce, "fixture-nonce", "", "fixture nonce")
+	flags.StringVar(&o.Phase, "phase", "", "probe phase")
+	flags.StringVar(&o.StateFile, "state-file", "", "private probe state")
+	flags.Uint64Var(&o.Sequence, "sequence", 0, "probe sequence")
+	if err := flags.Parse(args); err != nil {
+		return o, err
+	}
+	if flags.NArg() != 0 {
+		return o, errors.New("positional arguments are not accepted")
+	}
+	if err := o.check(); err != nil {
+		return o, err
+	}
+	return o, nil
+}
+
+func (o options) check() error {
+	u, err := url.Parse(o.Endpoint)
+	if err != nil || u.Scheme != "http" || u.Hostname() != "127.0.0.1" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return errors.New("endpoint must be http://127.0.0.1:PORT")
+	}
+	port, err := strconv.ParseUint(u.Port(), 10, 16)
+	if err != nil || port == 0 || u.Host != net.JoinHostPort("127.0.0.1", strconv.FormatUint(port, 10)) {
+		return errors.New("endpoint requires a canonical nonzero TCP port")
+	}
+	if o.Volume != fixtureVolume {
+		return errors.New("volume must be fixture-current")
+	}
+	if !identifier(o.RunID, 64) || !lowerHex(o.SourceSHA, 40) || !lowerHex(o.FixtureNonce, 64) {
+		return errors.New("run-id, source-sha or fixture-nonce is invalid")
+	}
+	if err := o.checkPhase(); err != nil {
+		return err
+	}
+	if filepath.Base(o.StateFile) != "probe-state.json" || filepath.Base(filepath.Dir(o.StateFile)) != "evidence" {
+		return errors.New("state-file must be RUN/evidence/probe-state.json")
+	}
+	return nil
+}
+
+func (o options) checkPhase() error {
+	switch o.Phase {
+	case createPhase:
+		if o.Sequence == 1 {
+			return nil
+		}
+	case reopenPhase, coldPhase, coldCleanupPhase:
+		if o.Sequence == 2 {
+			return nil
+		}
+	}
+	return errors.New("probe phase and sequence do not match")
+}
+
+func identifier(value string, limit int) bool {
+	if len(value) == 0 || len(value) > limit {
+		return false
+	}
+	for _, c := range value {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerHex(value string, size int) bool {
+	if len(value) != size {
+		return false
+	}
+	for _, c := range value {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func encodeReceipt(r receipt) ([]byte, error) {
+	if r.Status != "ok" || r.AuthorityEpoch == "" || len(r.AuthorityEpoch) > 128 || r.ObjectID == "" {
+		return nil, errors.New("incomplete readiness receipt")
+	}
+	data, err := json.Marshal(r)
+	if err != nil {
+		return nil, err
+	}
+	data = append(data, '\n')
+	if len(data) > 1024 {
+		return nil, errors.New("readiness receipt exceeds 1 KiB")
+	}
+	return data, nil
+}
+
+type ownedClose struct {
+	name      string
+	close     func(context.Context) error
+	attempted bool
+	result    error
+}
+
+func (c *ownedClose) release(ctx context.Context) error {
+	if c.attempted {
+		return c.result
+	}
+	c.attempted = true
+	if err := c.close(ctx); err != nil {
+		c.result = fmt.Errorf("close %s: %w", c.name, err)
+	}
+	return c.result
+}
+
+type ownership struct{ entries []*ownedClose }
+
+func (o *ownership) add(name string, close func(context.Context) error) *ownedClose {
+	c := &ownedClose{name: name, close: close}
+	o.entries = append(o.entries, c)
+	return c
+}
+
+func (o *ownership) release(ctx context.Context) error {
+	var result error
+	for i := len(o.entries) - 1; i >= 0; i-- {
+		result = errors.Join(result, o.entries[i].release(ctx))
+	}
+	return result
+}
+
+type fixtureSession interface {
+	storage.FileSession
+	storage.AtomicFileOpener
+	storage.NodeReferences
+	storage.NamespaceAccess
+}
+
+type fixture struct {
+	client  *httprest.Storage
+	session fixtureSession
+	owned   *ownership
+	root    storage.DirectoryTarget
+	options options
+	epoch   string
+}
+
+func probe(ctx context.Context, o options) (receipt, error) {
+	return dispatchProbe(ctx, o, probeHTTP, runSMBPhase)
+}
+
+func dispatchProbe(ctx context.Context, o options, httpPhase, smbPhase func(context.Context, options) (receipt, error)) (receipt, error) {
+	if err := o.check(); err != nil {
+		return receipt{}, err
+	}
+	if o.Phase == coldPhase || o.Phase == coldCleanupPhase {
+		return smbPhase(ctx, o)
+	}
+	return httpPhase(ctx, o)
+}
+
+func probeHTTP(ctx context.Context, o options) (answer receipt, returned error) {
+	if err := checkStateDirectory(o.StateFile); err != nil {
+		return answer, err
+	}
+	var saved probeState
+	if o.Phase == reopenPhase {
+		var err error
+		saved, err = readState(o)
+		if err != nil {
+			return answer, err
+		}
+	} else if _, err := os.Lstat(o.StateFile); !errors.Is(err, os.ErrNotExist) {
+		if err != nil {
+			return answer, err
+		}
+		return answer, errors.New("create requires an absent probe state file")
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = (&net.Dialer{Timeout: 4 * time.Second}).DialContext
+	transport.MaxConnsPerHost = 1
+	defer transport.CloseIdleConnections()
+	httpClient := &http.Client{Transport: transport, Timeout: 4 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("HTTP redirects are forbidden") }}
+	dialOptions := httprest.DefaultDialOptions()
+	dialOptions.MaxBodyBytes = 64 << 10
+	dialOptions.MaxWriteBytes = 4 << 10
+	client, err := httprest.DialWithOptions(o.Endpoint, httpClient, dialOptions)
+	if err != nil {
+		return answer, err
+	}
+	status, err := waitAuthority(ctx, client)
+	if err != nil {
+		return answer, err
+	}
+	if status.Authority == "" || len(status.Authority) > 128 || status.Unavailable || status.Recovering {
+		return answer, errors.New("authority is unavailable, recovering or has no valid identity")
+	}
+	if o.Phase == reopenPhase && status.Authority == saved.AuthorityEpoch {
+		return answer, errors.New("reopen reached the original authority instance")
+	}
+	var owned ownership
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		returned = errors.Join(returned, owned.release(cleanup))
+	}()
+	ticket, err := client.BeginEnrollment(ctx)
+	if err != nil {
+		return answer, fmt.Errorf("begin authority enrollment: %w", err)
+	}
+	lockSession, err := client.OpenSession(ctx, ticket)
+	if lockSession.ID != "" {
+		owned.add("authority session", func(ctx context.Context) error { return client.CloseSession(ctx, lockSession.ID) })
+	}
+	if err != nil {
+		return answer, fmt.Errorf("enroll authority session: %w", err)
+	}
+	if lockSession.ID == "" || lockSession.Authority != status.Authority || lockSession.Retired || lockSession.HistoryExpiresMillis <= lockSession.NowMillis {
+		return answer, errors.New("authority enrollment returned an invalid live session")
+	}
+	sessionOptions := storage.DefaultFileSessionOptions()
+	sessionOptions.MaxFileSize = 4 << 10
+	sessionOptions.MaxFiles = 4
+	sessionOptions.MaxOperations = 1
+	sessionOptions.MaxWaiters = 0
+	opened, err := client.NewFileSession(ctx, sessionOptions)
+	if opened != nil {
+		owned.add("file session", opened.Close)
+	}
+	if err != nil {
+		return answer, fmt.Errorf("enroll file session: %w", err)
+	}
+	session, ok := opened.(fixtureSession)
+	if !ok {
+		return answer, errors.New("file session lacks required capabilities")
+	}
+	for _, check := range []func() error{session.CheckAtomicFileOpen, session.CheckNamespaceAccess, session.CheckNodeReferences} {
+		if err := check(); err != nil {
+			return answer, fmt.Errorf("file capability: %w", err)
+		}
+	}
+	live, err := session.Status(ctx)
+	if err != nil {
+		return answer, fmt.Errorf("file session status: %w", err)
+	}
+	if live.Epoch == "" || live.Remaining <= 0 || live.HistoryRemaining <= 0 || live.Revision == 0 || live.ActionEpoch == 0 || live.Retired || live.Fenced {
+		return answer, errors.New("file session is not live")
+	}
+	root, err := client.Stat(ctx, "")
+	if err != nil {
+		return answer, fmt.Errorf("stat root: %w", err)
+	}
+	if root.ID == 0 || root.Kind != storage.NodeDirectory {
+		return answer, errors.New("root has no directory identity")
+	}
+	if o.Phase == reopenPhase && root.ID != saved.RootID {
+		return answer, errors.New("reopen changed root identity")
+	}
+	rootResult, err := session.OpenNodeRef(ctx, root.ID, storage.NodeRefOptions{
+		Kind: storage.NodeDirectory, Target: storage.ChildCondition{State: storage.SameNode, NodeID: root.ID},
+		Use: storage.UseClaim{Uses: storage.ReadEntries}, MetadataAccess: storage.ReadMetadata,
+	})
+	if rootResult.Reference != nil {
+		owned.add("root reference", rootResult.Reference.Close)
+	}
+	if err != nil {
+		return answer, fmt.Errorf("retain root: %w", err)
+	}
+	if rootResult.Reference == nil || rootResult.Attr.ID != root.ID || rootResult.Attr.Kind != storage.NodeDirectory || rootResult.Outcome != storage.Opened {
+		return answer, errors.New("retained root differs from the observed root")
+	}
+	rootScope, err := scopeOf(ctx, rootResult.Reference)
+	if err != nil {
+		return answer, err
+	}
+	f := fixture{client: client, session: session, owned: &owned, root: storage.DirectoryTarget{NodeID: root.ID, Scope: &rootScope}, options: o, epoch: lockSession.Authority}
+	if o.Phase == createPhase {
+		saved, err = f.create(ctx)
+	} else {
+		err = f.reopen(ctx, saved)
+	}
+	if err != nil {
+		return answer, err
+	}
+	cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err = owned.release(cleanup)
+	cancel()
+	if err != nil {
+		return answer, err
+	}
+	if o.Phase == createPhase {
+		if err := writeState(o.StateFile, saved); err != nil {
+			return answer, err
+		}
+	}
+	return receipt{RunID: o.RunID, SourceSHA: o.SourceSHA, FixtureNonce: o.FixtureNonce, Phase: o.Phase, Sequence: o.Sequence,
+		Status: "ok", AuthorityEpoch: lockSession.Authority, ObjectID: strconv.FormatUint(saved.Reference.Attr.ID, 10)}, nil
+}
+
+func waitAuthority(ctx context.Context, client *httprest.Storage) (locking.Status, error) {
+	for {
+		status, err := client.Status(ctx)
+		if err == nil {
+			return status, nil
+		}
+		select {
+		case <-ctx.Done():
+			return locking.Status{}, fmt.Errorf("authority readiness: %w", errors.Join(ctx.Err(), err))
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+func scopeOf(ctx context.Context, reference storage.NodeReference) (storage.UseScope, error) {
+	scoped, ok := reference.(storage.ScopedReference)
+	if !ok {
+		return storage.UseScope{}, errors.New("reference lacks scope capability")
+	}
+	if err := scoped.CheckScopedReference(); err != nil {
+		return storage.UseScope{}, err
+	}
+	scope, err := scoped.Scope(ctx)
+	if err != nil {
+		return storage.UseScope{}, err
+	}
+	if scope.Token == "" {
+		return storage.UseScope{}, errors.New("reference has an empty scope")
+	}
+	return scope, nil
+}
+
+func (f *fixture) child(name string) storage.ChildName {
+	return storage.ChildName{Parent: f.root, RawLeaf: []byte(name)}
+}
+
+func (f *fixture) directory(ctx context.Context, expectedName string, expectedID uint64) error {
+	listing, err := f.session.ReadDirNode(ctx, f.root)
+	if err != nil {
+		return fmt.Errorf("read root directory: %w", err)
+	}
+	if listing.Observation.ParentID != f.root.NodeID || len(listing.Observation.Revision) == 0 {
+		return errors.New("root listing has no valid observation")
+	}
+	if expectedName == "" {
+		if len(listing.Entries) != 0 {
+			return errors.New("fixture root is not empty")
+		}
+	} else if len(listing.Entries) != 1 || string(listing.Entries[0].RawLeaf) != expectedName || listing.Entries[0].Attr.ID != expectedID {
+		return errors.New("fixture root does not contain exactly the retained sentinel")
+	}
+	return nil
+}
+
+func (f *fixture) quota(ctx context.Context, expected int64) error {
+	space, err := f.client.Space(ctx)
+	if err != nil {
+		return fmt.Errorf("logical quota: %w", err)
+	}
+	if !space.Coherent() || space.Total != fixtureQuota || space.Used != expected {
+		return fmt.Errorf("logical quota differs: total=%d used=%d expected=%d", space.Total, space.Used, expected)
+	}
+	return nil
+}
+
+func (f *fixture) open(ctx context.Context, name string, expected uint64, metadata map[string][]byte) (storage.File, *ownedClose, error) {
+	o := storage.OpenAtOptions{Read: true, Existing: storage.Keep, Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName}}
+	if expected == 0 {
+		o.Write, o.Create, o.Exclusive = true, true, true
+		o.Use.Uses |= storage.WriteData
+		o.Target = storage.ChildCondition{State: storage.Absent}
+	} else {
+		o.Target = storage.ChildCondition{State: storage.SameNode, NodeID: expected}
+		o.ExpectedMetadata = metadata
+	}
+	result, err := f.session.OpenAt(ctx, f.child(name), o)
+	var owned *ownedClose
+	if result.File != nil {
+		owned = f.owned.add("file reference", result.File.Close)
+	}
+	if err != nil {
+		return nil, owned, fmt.Errorf("open %s: %w", name, err)
+	}
+	want := storage.Created
+	if expected != 0 {
+		want = storage.Opened
+	}
+	if result.File == nil || result.Attr.ID == 0 || result.Attr.Kind != storage.NodeRegular || result.Outcome != want || expected != 0 && result.Attr.ID != expected {
+		return nil, owned, errors.New("open returned a different object or outcome")
+	}
+	return result.File, owned, nil
+}
+
+func (f *fixture) create(ctx context.Context) (probeState, error) {
+	var state probeState
+	if err := f.directory(ctx, "", 0); err != nil {
+		return state, err
+	}
+	if err := f.quota(ctx, 0); err != nil {
+		return state, err
+	}
+	name := "probe-" + f.options.FixtureNonce
+	file, owned, err := f.open(ctx, name, 0, nil)
+	if err != nil {
+		return state, err
+	}
+	content := fixtureContent(f.options, "smoke")
+	before, err := initializeFile(ctx, file, content)
+	if err != nil {
+		return state, err
+	}
+	if err := f.quota(ctx, int64(len(content))); err != nil {
+		return state, err
+	}
+	scope, err := scopeOf(ctx, file)
+	if err != nil {
+		return state, err
+	}
+	renamed := name + "-renamed"
+	result, err := f.session.MutateName(ctx, storage.NameCommand{
+		Kind: storage.NameRename, Name: f.child(name), Target: storage.ChildCondition{State: storage.SameNode, NodeID: before.Attr.ID},
+		Destination: &storage.RenameTarget{Parent: f.root, ObservedLeaf: []byte(renamed), Expected: storage.ChildCondition{State: storage.Absent}, OutputLeaf: []byte(renamed)},
+		Uses:        []storage.TargetUse{{NodeID: before.Attr.ID, Scope: scope}},
+	})
+	if err != nil {
+		return state, fmt.Errorf("rename retained file: %w", err)
+	}
+	if result.Attr == nil || result.Attr.ID != before.Attr.ID {
+		return state, errors.New("rename changed object identity")
+	}
+	if err := f.absent(ctx, name); err != nil {
+		return state, err
+	}
+	if err := f.directory(ctx, renamed, before.Attr.ID); err != nil {
+		return state, err
+	}
+	if err := verifyFile(ctx, file, before, content, false); err != nil {
+		return state, err
+	}
+	if err := f.remove(ctx, renamed, before.Attr.ID, scope); err != nil {
+		return state, err
+	}
+	if err := verifyFile(ctx, file, before, content, true); err != nil {
+		return state, err
+	}
+	if err := f.quota(ctx, int64(len(content))); err != nil {
+		return state, err
+	}
+	if err := owned.release(ctx); err != nil {
+		return state, err
+	}
+	if err := f.quota(ctx, 0); err != nil {
+		return state, err
+	}
+	if err := f.directory(ctx, "", 0); err != nil {
+		return state, err
+	}
+	sentinel := "sentinel-" + f.options.FixtureNonce
+	file, owned, err = f.open(ctx, sentinel, 0, nil)
+	if err != nil {
+		return state, err
+	}
+	content = fixtureContent(f.options, "sentinel")
+	reference, err := initializeFile(ctx, file, content)
+	if err != nil {
+		return state, err
+	}
+	if err := file.Sync(ctx); err != nil {
+		return state, fmt.Errorf("sync sentinel: %w", err)
+	}
+	if err := owned.release(ctx); err != nil {
+		return state, err
+	}
+	if err := f.quota(ctx, int64(len(content))); err != nil {
+		return state, err
+	}
+	if err := f.directory(ctx, sentinel, reference.Attr.ID); err != nil {
+		return state, err
+	}
+	return probeState{Version: 1, RunID: f.options.RunID, SourceSHA: f.options.SourceSHA, FixtureNonce: f.options.FixtureNonce,
+		Volume: f.options.Volume, Phase: createPhase, Sequence: f.options.Sequence, AuthorityEpoch: f.epoch, RootID: f.root.NodeID,
+		SentinelName: sentinel, Content: content, ContentSHA256: digest(content), Reference: reference, LogicalUsed: int64(len(content))}, nil
+}
+
+func (f *fixture) reopen(ctx context.Context, state probeState) error {
+	if err := f.directory(ctx, state.SentinelName, state.Reference.Attr.ID); err != nil {
+		return err
+	}
+	if err := f.quota(ctx, state.LogicalUsed); err != nil {
+		return err
+	}
+	versions := map[string][]byte{metadataNamespace: state.Reference.Attr.Metadata[metadataNamespace].Version}
+	file, owned, err := f.open(ctx, state.SentinelName, state.Reference.Attr.ID, versions)
+	if err != nil {
+		return err
+	}
+	if err := verifyFile(ctx, file, state.Reference, state.Content, false); err != nil {
+		return err
+	}
+	scope, err := scopeOf(ctx, file)
+	if err != nil {
+		return err
+	}
+	if err := f.remove(ctx, state.SentinelName, state.Reference.Attr.ID, scope); err != nil {
+		return err
+	}
+	if err := verifyFile(ctx, file, state.Reference, state.Content, true); err != nil {
+		return err
+	}
+	if err := f.quota(ctx, state.LogicalUsed); err != nil {
+		return err
+	}
+	if err := owned.release(ctx); err != nil {
+		return err
+	}
+	if err := f.quota(ctx, 0); err != nil {
+		return err
+	}
+	return f.directory(ctx, "", 0)
+}
+
+func (f *fixture) absent(ctx context.Context, name string) error {
+	_, err := f.session.LookupAt(ctx, f.child(name))
+	if !errors.Is(err, syscall.ENOENT) || storage.ErrnoOf(err) != syscall.ENOENT {
+		return fmt.Errorf("removed name remains observable or unknown: %w", errors.Join(errors.New("expected ENOENT"), err))
+	}
+	return nil
+}
+
+func (f *fixture) remove(ctx context.Context, name string, id uint64, scope storage.UseScope) error {
+	result, err := f.session.MutateName(ctx, storage.NameCommand{Kind: storage.NameRemove, Name: f.child(name),
+		Target: storage.ChildCondition{State: storage.SameNode, NodeID: id}, Uses: []storage.TargetUse{{NodeID: id, Scope: scope}}})
+	if err != nil {
+		return fmt.Errorf("unlink retained file: %w", err)
+	}
+	if result.Attr != nil && result.Attr.ID != id {
+		return errors.New("unlink returned a different identity")
+	}
+	return f.absent(ctx, name)
+}
+
+func initializeFile(ctx context.Context, file storage.File, content []byte) (storage.ReferenceState, error) {
+	var empty storage.ReferenceState
+	attr, err := file.WriteAt(ctx, 0, content)
+	if err != nil {
+		return empty, fmt.Errorf("write file: %w", err)
+	}
+	if attr.ID == 0 || attr.Size != int64(len(content)) || attr.Kind != storage.NodeRegular {
+		return empty, errors.New("write returned invalid attributes")
+	}
+	metadata, ok := file.(storage.ReferenceMetadataAccess)
+	if !ok {
+		return empty, errors.New("file lacks metadata CAS")
+	}
+	if err := metadata.CheckMetadataAccess(); err != nil {
+		return empty, err
+	}
+	first, err := metadata.SetMetadata(ctx, metadataNamespace, nil, []byte("created:"+digest(content)))
+	if err != nil {
+		return empty, fmt.Errorf("initial metadata CAS: %w", err)
+	}
+	if len(first.Version) == 0 || !bytes.Equal(first.Data, []byte("created:"+digest(content))) {
+		return empty, errors.New("initial metadata CAS returned an invalid payload")
+	}
+	finalData := []byte("sealed:" + digest(content))
+	current, err := metadata.SetMetadata(ctx, metadataNamespace, first.Version, finalData)
+	if err != nil {
+		return empty, fmt.Errorf("replace metadata CAS: %w", err)
+	}
+	if len(current.Version) == 0 || bytes.Equal(current.Version, first.Version) || !bytes.Equal(current.Data, finalData) {
+		return empty, errors.New("metadata CAS did not advance its token and value")
+	}
+	_, err = metadata.SetMetadata(ctx, metadataNamespace, first.Version, []byte("stale"))
+	if !errors.Is(err, storage.ErrConditionConflict) {
+		return empty, fmt.Errorf("stale metadata CAS was not rejected: %w", errors.Join(errors.New("expected condition conflict"), err))
+	}
+	state, err := fileState(ctx, file)
+	if err != nil {
+		return empty, err
+	}
+	attr.Metadata = map[string]storage.OpaquePayload{metadataNamespace: current}
+	if err := sameAttr(state.Attr, attr); err != nil {
+		return empty, err
+	}
+	if err := verifyFile(ctx, file, state, content, false); err != nil {
+		return empty, err
+	}
+	return state, nil
+}
+
+func fileState(ctx context.Context, file storage.File) (storage.ReferenceState, error) {
+	state, ok := file.(storage.ReferenceStateAccess)
+	if !ok {
+		return storage.ReferenceState{}, errors.New("file lacks reference state")
+	}
+	if err := state.CheckReferenceState(); err != nil {
+		return storage.ReferenceState{}, err
+	}
+	return state.State(ctx)
+}
+
+func sameAttr(got, want storage.Attr) error {
+	if got.ID != want.ID || got.Kind != storage.NodeRegular || got.Kind != want.Kind || got.Size != want.Size {
+		return errors.New("file identity, kind or logical size changed")
+	}
+	if err := storage.CheckMetadata(got.Metadata); err != nil {
+		return fmt.Errorf("invalid file metadata: %w", err)
+	}
+	if len(got.Metadata) != len(want.Metadata) {
+		return errors.New("file metadata namespace set changed")
+	}
+	for key, expected := range want.Metadata {
+		value, ok := got.Metadata[key]
+		if !ok || !bytes.Equal(value.Version, expected.Version) || !bytes.Equal(value.Data, expected.Data) {
+			return errors.New("file metadata token or payload changed")
+		}
+	}
+	return nil
+}
+
+func verifyFile(ctx context.Context, file storage.File, expected storage.ReferenceState, content []byte, detached bool) error {
+	state, err := fileState(ctx, file)
+	if err != nil {
+		return fmt.Errorf("read reference state: %w", err)
+	}
+	if err := sameAttr(state.Attr, expected.Attr); err != nil {
+		return err
+	}
+	if state.Detached != detached || state.PendingUnlink || len(state.PendingGeneration) != 0 || len(state.LinkTarget) != 0 {
+		return errors.New("unexpected retained reference state")
+	}
+	var data []byte
+	for len(data) < len(content) {
+		read, err := file.ReadAt(ctx, int64(len(data)), len(content)-len(data))
+		if err != nil {
+			return fmt.Errorf("read retained bytes: %w", err)
+		}
+		if err := sameAttr(read.Attr, expected.Attr); err != nil {
+			return err
+		}
+		if len(read.Data) == 0 || len(read.Data) > len(content)-len(data) {
+			return errors.New("read made no progress or exceeded its request")
+		}
+		data = append(data, read.Data...)
+	}
+	if !bytes.Equal(data, content) || digest(data) != digest(content) {
+		return errors.New("retained content differs from the fixture payload")
+	}
+	eof, err := file.ReadAt(ctx, int64(len(content)), 1)
+	if err != nil {
+		return fmt.Errorf("read EOF: %w", err)
+	}
+	if len(eof.Data) != 0 {
+		return errors.New("read returned bytes beyond sentinel EOF")
+	}
+	return sameAttr(eof.Attr, expected.Attr)
+}
+
+func fixtureContent(o options, kind string) []byte {
+	return []byte(strings.Join([]string{"remote-fs-current-authority", kind, o.RunID, o.SourceSHA, o.FixtureNonce, o.Volume, ""}, "\n"))
+}
+
+func digest(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
+
+func checkStateDirectory(path string) error {
+	for _, directory := range []string{filepath.Dir(path), filepath.Dir(filepath.Dir(path))} {
+		if err := validatePrivateDirectory(directory); err != nil {
+			return fmt.Errorf("state directory: %w", err)
+		}
+	}
+	return nil
+}
+
+func writeState(path string, state probeState) error {
+	if err := checkStateDirectory(path); err != nil {
+		return err
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if len(data) > maxStateBytes {
+		return errors.New("probe state exceeds 16 KiB")
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return fmt.Errorf("create probe state: %w", err)
+	}
+	if err := makePrivateFile(path); err != nil {
+		return errors.Join(fmt.Errorf("protect probe state: %w", err), file.Close())
+	}
+	n, writeErr := file.Write(data)
+	if writeErr == nil && n != len(data) {
+		writeErr = io.ErrShortWrite
+	}
+	var syncErr error
+	if writeErr == nil {
+		syncErr = file.Sync()
+	}
+	return errors.Join(writeErr, syncErr, file.Close())
+}
+
+func readState(o options) (probeState, error) {
+	var state probeState
+	if err := checkStateDirectory(o.StateFile); err != nil {
+		return state, err
+	}
+	if err := validatePrivateFile(o.StateFile); err != nil {
+		return state, fmt.Errorf("probe state privacy: %w", err)
+	}
+	before, err := os.Lstat(o.StateFile)
+	if err != nil {
+		return state, fmt.Errorf("probe state: %w", err)
+	}
+	if !before.Mode().IsRegular() || before.Size() <= 0 || before.Size() > maxStateBytes {
+		return state, errors.New("probe state must be a private regular file of at most 16 KiB")
+	}
+	file, err := os.Open(o.StateFile)
+	if err != nil {
+		return state, err
+	}
+	opened, statErr := file.Stat()
+	if statErr != nil || !os.SameFile(before, opened) {
+		return state, errors.Join(errors.New("probe state identity changed while opening"), statErr, file.Close())
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, maxStateBytes+1))
+	if err := errors.Join(readErr, file.Close()); err != nil {
+		return state, err
+	}
+	if len(data) > maxStateBytes {
+		return state, errors.New("probe state exceeds 16 KiB")
+	}
+	if err := json.Unmarshal(data, &state); err != nil {
+		return state, fmt.Errorf("decode probe state: %w", err)
+	}
+	canonical, err := json.Marshal(state)
+	if err != nil {
+		return state, err
+	}
+	if !bytes.Equal(data, append(canonical, '\n')) {
+		return state, errors.New("probe state is not canonical or contains unknown fields")
+	}
+	if err := state.check(o); err != nil {
+		return state, err
+	}
+	return state, nil
+}
+
+func (s probeState) check(o options) error {
+	if err := o.checkPhase(); err != nil {
+		return err
+	}
+	if o.Phase == createPhase || s.Version != 1 || s.Phase != createPhase || s.Sequence != 1 || o.Sequence != 2 ||
+		s.RunID != o.RunID || s.SourceSHA != o.SourceSHA || s.FixtureNonce != o.FixtureNonce || s.Volume != o.Volume {
+		return errors.New("probe state run, source, nonce, volume or sequence differs")
+	}
+	if !identifier(s.AuthorityEpoch, 128) || s.RootID == 0 || s.Reference.Attr.ID == 0 || s.RootID == s.Reference.Attr.ID ||
+		s.SentinelName != "sentinel-"+o.FixtureNonce || !bytes.Equal(s.Content, fixtureContent(o, "sentinel")) ||
+		s.ContentSHA256 != digest(s.Content) || s.LogicalUsed != int64(len(s.Content)) || s.Reference.Attr.Size != s.LogicalUsed ||
+		s.Reference.Attr.Kind != storage.NodeRegular || s.Reference.Detached || s.Reference.PendingUnlink || len(s.Reference.PendingGeneration) != 0 || len(s.Reference.LinkTarget) != 0 {
+		return errors.New("probe state contains an invalid sentinel")
+	}
+	if err := storage.CheckMetadata(s.Reference.Attr.Metadata); err != nil {
+		return fmt.Errorf("probe state metadata: %w", err)
+	}
+	metadata, ok := s.Reference.Attr.Metadata[metadataNamespace]
+	if !ok || len(s.Reference.Attr.Metadata) != 1 || !bytes.Equal(metadata.Data, []byte("sealed:"+s.ContentSHA256)) {
+		return errors.New("probe state metadata does not match its sentinel")
+	}
+	return nil
+}

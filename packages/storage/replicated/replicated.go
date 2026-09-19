@@ -217,24 +217,15 @@ func (s *Storage) Stat(ctx context.Context, path string) (storage.Attr, error) {
 
 func (s *Storage) CheckBounded() error { return s.remote.CheckBounded() }
 
-// List returns the entries of the directory at path from the copy.
+// List queries the authority so active directory-use exclusions apply to every
+// public entry point. Replica readiness remains required for a coherent view.
 func (s *Storage) List(ctx context.Context, path string) ([]storage.Entry, error) {
 	if err := s.usable("list", path); err != nil {
 		return nil, err
 	}
-	children, err := s.local.List(ctx, path)
-	if err != nil {
-		return nil, err
-	}
-	entries := make([]storage.Entry, len(children))
-	for i, child := range children {
-		entries[i] = storage.Entry{Name: string(child.Name), Attr: child.Node.Attr()}
-	}
-	return entries, nil
+	return s.remote.List(ctx, path)
 }
 
-// ListBounded holds the same replica position for the whole ordered query and transfers
-// each child directly into the caller's bounded result.
 func (s *Storage) ListBounded(ctx context.Context, path string, result *storage.ListResult) (returned error) {
 	if result != nil {
 		defer func() {
@@ -246,7 +237,7 @@ func (s *Storage) ListBounded(ctx context.Context, path string, result *storage.
 	if err := s.usable("list", path); err != nil {
 		return err
 	}
-	return s.local.ListBounded(ctx, path, result)
+	return s.remote.ListBounded(ctx, path, result)
 }
 
 // Read returns the contents of the file at path, from the server.

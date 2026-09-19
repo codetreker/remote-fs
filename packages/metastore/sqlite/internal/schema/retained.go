@@ -8,6 +8,9 @@ import (
 // The exclusive database owner retires references from every previous serving epoch. The
 // complete graph and its byte totals must be validated in this transaction before reaping.
 func reapDetachedFiles(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM close_intents WHERE node IN (SELECT id FROM nodes WHERE detached=1)`); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE objects SET state = ?
 		WHERE key IN (SELECT content FROM nodes WHERE detached = 1 AND content IS NOT NULL)`, StateGarbage); err != nil {
 		return err

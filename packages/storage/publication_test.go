@@ -434,3 +434,51 @@ func TestPublicationSettlementUncertaintySurvivesWrapping(t *testing.T) {
 		}
 	}
 }
+
+func TestMaintenanceAccountingChainExcludesOriginContextAndReplacesOldHooks(t *testing.T) {
+	type secretKey struct{}
+	source, cancel := context.WithCancel(context.WithValue(t.Context(), secretKey{}, "credential"))
+	var calls []string
+	hook := func(name string) storage.PublicationAccounting {
+		return func(before, after int64) (storage.PublicationSettlement, error) {
+			if before != 7 || after != 0 {
+				t.Fatalf("wrongactualusage%d->%d", before, after)
+			}
+			calls = append(calls, "prepare "+name)
+			return func(result storage.PublicationResult) error {
+				if result != storage.PublicationApplied {
+					t.Fatalf("settlement%v", result)
+				}
+				calls = append(calls, "settle "+name)
+				return nil
+			}, nil
+		}
+	}
+	source = storage.WithPublicationAccounting(source, hook("inner"))
+	chain := storage.PublicationAccountingFrom(source).With(hook("outer"))
+	cancel()
+	fresh := storage.WithPublicationAccounting(context.Background(), hook("obsolete"))
+	cleanup := storage.WithPublicationAccountingChain(fresh, chain)
+	if cleanup.Err() != nil || cleanup.Value(secretKey{}) != nil || chain.Empty() {
+		t.Fatal("chain retainedoriginatingcontext orlosthooks")
+	}
+	settle, err := storage.PreparePublication(cleanup, 7, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := settle(storage.PublicationApplied); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(calls, []string{"prepare inner", "prepare outer", "settle outer", "settle inner"}) {
+		t.Fatalf("chain composition=%v", calls)
+	}
+	if !(storage.PublicationAccountingChain{}).Empty() || !storage.PublicationAccountingFrom(context.Background()).Empty() {
+		t.Fatal("empty chain inventedhooks")
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("nil accountinghook accepted")
+		}
+	}()
+	_ = chain.With(nil)
+}

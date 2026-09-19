@@ -15,10 +15,10 @@ import (
 type openFile struct {
 	session    *fileSession
 	native     metastore.File
+	uses       referenceUses
 	options    storage.FileOpenOptions
 	active     bool
 	operations sync.WaitGroup
-	flock      map[storage.LockOwner]uint64
 	retireMu   sync.Mutex
 	retired    bool
 	closeMu    sync.Mutex
@@ -45,8 +45,7 @@ func (f *openFile) admit(ctx context.Context, class fileOperationClass) (context
 	}
 	f.operations.Add(1)
 	f.session.mu.Unlock()
-	_, _, timeout := f.session.domain.FileOperationLimits()
-	operation, cancel := context.WithTimeout(ctx, timeout)
+	operation, cancel := f.session.operationContext(ctx)
 	return metastore.WithFilePublicationGuard(operation, f.session.publicationAllowed), func() { cancel(); f.operations.Done(); done() }, nil
 }
 
@@ -72,9 +71,11 @@ func (f *openFile) Stat(ctx context.Context) (storage.Attr, error) {
 }
 
 func (f *openFile) ReadAt(ctx context.Context, offset int64, length int) (storage.FileRead, error) {
-	if offset < 0 || length < 0 {
-		return storage.FileRead{}, syscall.EINVAL
+	access := metastore.FileAccess{Uses: storage.ReadData, Offset: offset, Length: int64(length)}
+	if err := access.Check(); err != nil {
+		return storage.FileRead{}, err
 	}
+	ctx = metastore.WithFileAccess(ctx, access)
 	if !f.options.Read {
 		return storage.FileRead{}, syscall.EBADF
 	}
@@ -149,6 +150,7 @@ func (f *openFile) body(ctx context.Context, node metastore.FileState, missing m
 }
 
 func (f *openFile) WriteAt(ctx context.Context, offset int64, data []byte) (storage.Attr, error) {
+	ctx = metastore.WithFileAccess(ctx, metastore.FileAccess{Uses: storage.WriteData, Offset: offset, Length: int64(len(data))})
 	if offset < 0 {
 		return storage.Attr{}, syscall.EINVAL
 	}
@@ -170,17 +172,18 @@ func (f *openFile) WriteAt(ctx context.Context, offset int64, data []byte) (stor
 		if len(data) != 0 {
 			copy(body[offset:], data)
 		}
-	})
+	}, nil)
 }
 
 func (f *openFile) Truncate(ctx context.Context, size int64) (storage.Attr, error) {
+	ctx = metastore.WithFileAccess(ctx, metastore.FileAccess{Uses: storage.WriteData, Truncate: true, Size: size})
 	if size < 0 {
 		return storage.Attr{}, syscall.EINVAL
 	}
-	return f.mutate(ctx, func(int64) int64 { return size }, func([]byte) {})
+	return f.mutate(ctx, func(int64) int64 { return size }, func([]byte) {}, nil)
 }
 
-func (f *openFile) mutate(ctx context.Context, size func(int64) int64, patch func([]byte)) (storage.Attr, error) {
+func (f *openFile) mutate(ctx context.Context, size func(int64) int64, patch func([]byte), condition *storage.FileMutation) (storage.Attr, error) {
 	if !f.options.Write {
 		return storage.Attr{}, syscall.EBADF
 	}
@@ -207,7 +210,7 @@ func (f *openFile) mutate(ctx context.Context, size func(int64) int64, patch fun
 		// Emptying a retained object preserves no old bytes. The revision-CAS
 		// publication still validates strong permissions and the reference lifetime.
 		if next == 0 {
-			result, retry, err := f.publish(ctx, node, nil)
+			result, retry, err := f.publish(ctx, node, nil, condition)
 			if retry {
 				continue
 			}
@@ -236,7 +239,7 @@ func (f *openFile) mutate(ctx context.Context, size func(int64) int64, patch fun
 		content := make([]byte, int(next))
 		copy(content, body)
 		patch(content)
-		result, retry, err := f.publish(ctx, node, content)
+		result, retry, err := f.publish(ctx, node, content, condition)
 		release()
 		if retry {
 			continue
@@ -246,7 +249,7 @@ func (f *openFile) mutate(ctx context.Context, size func(int64) int64, patch fun
 	return storage.Attr{}, fmt.Errorf("retained file changed during every publication attempt: %w", syscall.EAGAIN)
 }
 
-func (f *openFile) publish(ctx context.Context, previous metastore.FileState, content []byte) (storage.Attr, bool, error) {
+func (f *openFile) publish(ctx context.Context, previous metastore.FileState, content []byte, condition *storage.FileMutation) (storage.Attr, bool, error) {
 	s := f.session.storage
 	name := fmt.Sprintf("node %d", previous.ID)
 	object := metastore.Object{Size: int64(len(content)), ModTime: s.now()}
@@ -265,7 +268,13 @@ func (f *openFile) publish(ctx context.Context, previous metastore.FileState, co
 		}
 		object.Key, object.Digest = key, digest
 	}
-	node, err := f.native.Commit(ctx, previous.Revision, object)
+	var node metastore.FileState
+	var err error
+	if condition == nil {
+		node, err = f.native.Commit(ctx, previous.Revision, object)
+	} else {
+		node, err = f.native.(metastore.ConditionalFileMutation).CommitMutation(ctx, *condition, previous.Revision, object)
+	}
 	if err != nil {
 		if object.Key != "" {
 			cleanupErr := f.cleanupObject(object.Key, false)
@@ -277,7 +286,7 @@ func (f *openFile) publish(ctx context.Context, previous metastore.FileState, co
 				return storage.Attr{}, false, errors.Join(err, internalFailure("abandoning", name, cleanupErr))
 			}
 		}
-		return storage.Attr{}, isOnly(err, syscall.EAGAIN), err
+		return storage.Attr{}, isRevisionRace(err), err
 	}
 	s.sweepAfterMutation()
 	return node.Attr(), false, nil
@@ -343,11 +352,12 @@ func (f *openFile) Sync(ctx context.Context) error {
 func (f *openFile) retire() error {
 	f.session.mu.Lock()
 	f.active = false
+	f.uses.retiring = true
 	f.session.mu.Unlock()
 	f.retireMu.Lock()
 	defer f.retireMu.Unlock()
 	if f.retired {
-		return nil
+		return f.session.retireReferenceOwners(&f.uses)
 	}
 	ctx, cancel := f.session.operationContext(f.session.cleanup)
 	defer cancel()
@@ -355,7 +365,7 @@ func (f *openFile) retire() error {
 		return err
 	}
 	f.retired = true
-	return nil
+	return f.session.retireReferenceOwners(&f.uses)
 }
 
 func (f *openFile) startClose() <-chan struct{} {
@@ -380,15 +390,6 @@ func (f *openFile) finishClose() {
 	err := f.retire()
 	if err == nil {
 		f.operations.Wait()
-		f.session.mu.Lock()
-		owners := make(map[storage.LockOwner]uint64, len(f.flock))
-		for owner, node := range f.flock {
-			owners[owner] = node
-		}
-		f.session.mu.Unlock()
-		for owner, node := range owners {
-			err = errors.Join(err, f.dropClosedFlock(node, owner))
-		}
 		// Cleanup keeps the creation-time accounting hooks. Attaching Close's
 		// context again would reserve and settle the same outer quota twice.
 		ctx, cancel := f.session.operationContext(f.session.cleanup)

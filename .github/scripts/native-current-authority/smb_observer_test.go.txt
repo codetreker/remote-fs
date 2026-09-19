@@ -1,0 +1,1386 @@
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+	"unicode/utf16"
+
+	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/transport/httprest"
+)
+
+func coldTestObserver(t *testing.T) *coldObserver {
+	t.Helper()
+	parent := filepath.Join(t.TempDir(), "owner")
+	if err := createPrivateDirectory(parent); err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(parent, "evidence")
+	if err := createPrivateDirectory(directory); err != nil {
+		t.Fatal(err)
+	}
+	opts := options{RunID: "observer-run", SourceSHA: strings.Repeat("a", 40), FixtureNonce: strings.Repeat("b", 64),
+		Volume: "observer-volume", StateFile: filepath.Join(directory, "state.json")}
+	content := []byte("sentinel\x00content\n")
+	state := probeState{RunID: opts.RunID, SourceSHA: opts.SourceSHA, FixtureNonce: opts.FixtureNonce, Volume: opts.Volume,
+		RootID: 13, SentinelName: "sentinel.bin", Content: content, ContentSHA256: digest(content),
+		Reference: storage.ReferenceState{Attr: storage.Attr{ID: 0x0102030405060708, Kind: storage.NodeRegular, Size: int64(len(content)),
+			Metadata: map[string]storage.OpaquePayload{"fixture.current": {Version: []byte{1}, Data: []byte("metadata")}}}}}
+	observer, err := newColdObserver(opts, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = observer.Close() })
+	return observer
+}
+
+func coldTestError(o *coldObserver) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.first
+}
+
+func coldTestEvents(t *testing.T, o *coldObserver) []map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(o.options.StateFile), "cold-observations.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var events []map[string]any
+	for {
+		var envelope struct {
+			RunID        string         `json:"run_id"`
+			SourceSHA    string         `json:"source_sha"`
+			FixtureNonce string         `json:"fixture_nonce"`
+			Event        map[string]any `json:"event"`
+		}
+		if err := decoder.Decode(&envelope); errors.Is(err, io.EOF) {
+			return events
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if envelope.RunID != o.options.RunID || envelope.SourceSHA != o.options.SourceSHA || envelope.FixtureNonce != o.options.FixtureNonce {
+			t.Fatalf("unbound evidence: %+v", envelope)
+		}
+		events = append(events, envelope.Event)
+	}
+}
+
+type coldTestRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f coldTestRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type coldTestBody struct {
+	reader   io.Reader
+	readErr  error
+	closeErr error
+	reads    int
+	closes   int
+}
+
+func (b *coldTestBody) Read(p []byte) (int, error) {
+	b.reads++
+	n, err := b.reader.Read(p)
+	if errors.Is(err, io.EOF) && b.readErr != nil {
+		err = b.readErr
+	}
+	return n, err
+}
+func (b *coldTestBody) Close() error { b.closes++; return b.closeErr }
+
+func coldTestHTTP(t *testing.T, o *coldObserver, request any, response any) {
+	t.Helper()
+	requestBytes, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBytes, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := http.NewRequest(http.MethodPost, "http://fixture.invalid/v1/file", bytes.NewReader(requestBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Header.Set("Content-Type", "application/json")
+	body := &coldTestBody{reader: bytes.NewReader(responseBytes)}
+	calls := 0
+	base := coldTestRoundTripper(func(got *http.Request) (*http.Response, error) {
+		calls++
+		data, err := io.ReadAll(got.Body)
+		if err != nil || got != r || !bytes.Equal(data, requestBytes) || got.Header.Get("Content-Type") != "application/json" {
+			t.Fatalf("request changed: data=%q err=%v same=%t", data, err, got == r)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Fixture": {"kept"}}, Body: body}, nil
+	})
+	got, err := o.Transport(base).RoundTrip(r)
+	if err != nil || calls != 1 || body.reads != 0 || body.closes != 0 || got.Header.Get("Fixture") != "kept" {
+		t.Fatalf("RoundTrip changed delivery: err=%v calls=%d reads=%d closes=%d", err, calls, body.reads, body.closes)
+	}
+	data, err := io.ReadAll(got.Body)
+	if err != nil || !bytes.Equal(data, responseBytes) {
+		t.Fatalf("response changed: data=%q err=%v", data, err)
+	}
+	if err := got.Body.Close(); err != nil || body.closes != 1 {
+		t.Fatalf("response close: err=%v calls=%d", err, body.closes)
+	}
+}
+
+func coldTestHTTPOpen(t *testing.T, o *coldObserver) {
+	t.Helper()
+	coldTestHTTP(t, o, coldHTTPRequest{Op: "file.session-open"}, coldHTTPResponse{Session: "session"})
+	coldTestHTTP(t, o, map[string]any{"op": "file.open-at", "session": "session",
+		"child": storage.ChildName{Parent: storage.DirectoryTarget{NodeID: o.state.RootID}, RawLeaf: []byte(o.state.SentinelName)}},
+		coldHTTPResponse{File: "reference", Attr: httprest.AttrOf(o.state.Reference.Attr)})
+}
+
+func coldTestHTTPReadAndClose(t *testing.T, o *coldObserver) {
+	t.Helper()
+	coldTestHTTP(t, o, coldHTTPRequest{Op: "file.read", Session: "session", File: "reference", Length: len(o.state.Content)},
+		coldHTTPResponse{Attr: httprest.AttrOf(o.state.Reference.Attr), Data: o.state.Content})
+	coldTestHTTP(t, o, coldHTTPRequest{Op: "file.close", Session: "session", File: "reference"}, coldHTTPResponse{})
+	coldTestHTTP(t, o, coldHTTPRequest{Op: "file.session-close", Session: "session"}, coldHTTPResponse{})
+}
+
+func TestColdObserverBindingAndEvidenceBounds(t *testing.T) {
+	for _, field := range []string{"run", "source", "nonce", "volume", "identity", "content"} {
+		t.Run(field, func(t *testing.T) {
+			o := coldTestObserver(t)
+			state := o.state
+			switch field {
+			case "run":
+				state.RunID = "other"
+			case "source":
+				state.SourceSHA = strings.Repeat("c", 40)
+			case "nonce":
+				state.FixtureNonce = strings.Repeat("d", 64)
+			case "volume":
+				state.Volume = "other"
+			case "identity":
+				state.Reference.Attr.ID = 0
+			case "content":
+				state.ContentSHA256 = strings.Repeat("0", 64)
+			}
+			if _, err := newColdObserver(o.options, state); err == nil || !strings.Contains(err.Error(), "bound probe") {
+				t.Fatalf("invalid %s binding accepted: %v", field, err)
+			}
+		})
+	}
+	t.Run("exclusive-log", func(t *testing.T) {
+		o := coldTestObserver(t)
+		if _, err := newColdObserver(o.options, o.state); !errors.Is(err, os.ErrExist) {
+			t.Fatalf("existing evidence replaced: %v", err)
+		}
+	})
+	for _, name := range []string{"record", "trace", "json", "closed"} {
+		t.Run(name, func(t *testing.T) {
+			o := coldTestObserver(t)
+			event := map[string]any{"kind": "native", "file_id": "opaque"}
+			switch name {
+			case "record":
+				event["payload"] = strings.Repeat("x", coldRecordLimit)
+			case "trace":
+				o.written = coldTraceLimit - 1
+			case "json":
+				event["invalid"] = make(chan struct{})
+			case "closed":
+				if err := o.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := o.Record(event); err == nil || coldTestError(o) == nil || o.Validate() == nil || o.Close() == nil {
+				t.Fatalf("failed evidence accepted: %v", err)
+			}
+			if events := coldTestEvents(t, o); len(events) != 0 {
+				t.Fatalf("failed record left partial evidence: %+v", events)
+			}
+		})
+	}
+}
+
+func TestColdHTTPPassthroughAndCleanup(t *testing.T) {
+	o := coldTestObserver(t)
+	coldTestHTTPOpen(t, o)
+	if !o.httpOpen || len(o.httpSessions) != 1 || len(o.httpRefs) != 1 || o.Validate() == nil {
+		t.Fatal("retained open or missing evidence was misclassified")
+	}
+	coldTestHTTPReadAndClose(t, o)
+	if err := coldTestError(o); err != nil || !o.httpRead || len(o.httpSessions) != 0 || len(o.httpRefs) != 0 {
+		t.Fatalf("HTTP lifecycle evidence: error=%v sessions=%v references=%v", err, o.httpSessions, o.httpRefs)
+	}
+	events := coldTestEvents(t, o)
+	if len(events) != 5 || events[2]["digest"] != digest(o.state.Content) || events[2]["backend_node_id"] != json.Number(strconv.FormatUint(o.state.Reference.Attr.ID, 10)) {
+		t.Fatalf("read evidence=%+v", events)
+	}
+	if err := o.Close(); err != nil || o.Close() != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+func TestColdHTTPBodyCloseFailureAfterEOF(t *testing.T) {
+	o := coldTestObserver(t)
+	closeFailure := errors.New("response close failed")
+	body := &coldTestBody{reader: strings.NewReader(`{"session":"session"}`), closeErr: closeFailure}
+	r, err := http.NewRequest(http.MethodPost, "http://fixture.invalid/file-control", strings.NewReader(`{"op":"file.session-open"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := o.Transport(coldTestRoundTripper(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+	}))
+	response, err := transport.RoundTrip(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err := coldTestError(o); err != nil {
+		t.Fatalf("complete response failed before Close: %v", err)
+	}
+	if err := response.Body.Close(); err != closeFailure {
+		t.Fatalf("Close lost original error: %v", err)
+	}
+	if err := coldTestError(o); !errors.Is(err, closeFailure) {
+		t.Fatalf("EOF-then-Close failure missing from observation: %v", err)
+	}
+	if o.Validate() == nil || o.Close() == nil {
+		t.Fatal("failed HTTP cleanup reported successful evidence")
+	}
+}
+
+func TestColdHTTPObservationFailureDoesNotChangeTransport(t *testing.T) {
+	for _, name := range []string{"missing-copy", "copy-error", "copy-close-error", "oversized-request", "invalid-request", "long-request-id"} {
+		t.Run(name, func(t *testing.T) {
+			o := coldTestObserver(t)
+			payload := `{"op":"file.session-open"}`
+			switch name {
+			case "oversized-request":
+				payload = strings.Repeat(" ", coldHTTPLimit) + payload
+			case "invalid-request":
+				payload = "{"
+			case "long-request-id":
+				payload = `{"op":"file.read","session":"` + strings.Repeat("x", 257) + `"}`
+			}
+			r, err := http.NewRequest(http.MethodPost, "http://fixture.invalid/file", strings.NewReader(payload))
+			if err != nil {
+				t.Fatal(err)
+			}
+			failure := errors.New("body copy failed")
+			switch name {
+			case "missing-copy":
+				r.GetBody = nil
+			case "copy-error":
+				r.GetBody = func() (io.ReadCloser, error) { return nil, failure }
+			case "copy-close-error":
+				r.GetBody = func() (io.ReadCloser, error) {
+					return &coldTestBody{reader: strings.NewReader(payload), closeErr: failure}, nil
+				}
+			}
+			calls := 0
+			transport := o.Transport(coldTestRoundTripper(func(got *http.Request) (*http.Response, error) {
+				calls++
+				data, err := io.ReadAll(got.Body)
+				if err != nil || string(data) != payload || got != r {
+					t.Fatalf("transport request was consumed or replaced: %v", err)
+				}
+				return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader("unavailable"))}, nil
+			}))
+			response, err := transport.RoundTrip(r)
+			if err != nil || calls != 1 {
+				t.Fatalf("observer changed transport outcome: %v calls=%d", err, calls)
+			}
+			data, err := io.ReadAll(response.Body)
+			if err != nil || string(data) != "unavailable" || response.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("transport response changed: %q %v", data, err)
+			}
+			if err := response.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if coldTestError(o) == nil {
+				t.Fatal("request observation failure was lost")
+			}
+		})
+	}
+	for _, name := range []string{"partial", "oversized", "read-error", "invalid-json", "long-response-id", "missing-body"} {
+		t.Run(name, func(t *testing.T) {
+			o := coldTestObserver(t)
+			payload := `{"session":"session"}`
+			switch name {
+			case "oversized":
+				payload = strings.Repeat(" ", coldHTTPLimit) + payload
+			case "invalid-json":
+				payload = "{"
+			case "long-response-id":
+				payload = `{"session":"` + strings.Repeat("x", 257) + `"}`
+			}
+			failure := errors.New("network read failed")
+			body := &coldTestBody{reader: strings.NewReader(payload)}
+			if name == "read-error" {
+				body.readErr = failure
+			}
+			r, err := http.NewRequest(http.MethodPost, "http://fixture.invalid/file", strings.NewReader(`{"op":"file.session-open"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			transport := o.Transport(coldTestRoundTripper(func(*http.Request) (*http.Response, error) {
+				response := &http.Response{StatusCode: http.StatusOK, Body: body}
+				if name == "missing-body" {
+					response.Body = nil
+				}
+				return response, nil
+			}))
+			response, err := transport.RoundTrip(r)
+			if err != nil || body.reads != 0 {
+				t.Fatalf("response was read before delivery: %v reads=%d", err, body.reads)
+			}
+			if response.Body != nil {
+				if name == "partial" {
+					if _, err := response.Body.Read(make([]byte, 1)); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					data, readErr := io.ReadAll(response.Body)
+					if string(data) != payload || (name == "read-error" && readErr != failure) || (name != "read-error" && readErr != nil) {
+						t.Fatalf("response body changed: bytes=%d error=%v", len(data), readErr)
+					}
+				}
+				if err := response.Body.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if coldTestError(o) == nil || len(o.httpSessions) != 0 {
+				t.Fatalf("failed response credited a session: %+v", o.httpSessions)
+			}
+		})
+	}
+}
+
+func TestColdHTTPUnobservedAndTransportErrorsPassThrough(t *testing.T) {
+	for _, path := range []string{"/capabilities", "/file"} {
+		t.Run(path, func(t *testing.T) {
+			o := coldTestObserver(t)
+			r, err := http.NewRequest(http.MethodPost, "http://fixture.invalid"+path, strings.NewReader(`{"op":"file.read"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			failure := errors.New("round trip failed")
+			original := &http.Response{StatusCode: http.StatusBadGateway, Body: io.NopCloser(strings.NewReader("upstream"))}
+			transport := o.Transport(coldTestRoundTripper(func(got *http.Request) (*http.Response, error) {
+				if got != r {
+					t.Fatal("request identity changed")
+				}
+				return original, failure
+			}))
+			response, err := transport.RoundTrip(r)
+			if response != original || err != failure {
+				t.Fatalf("transport result changed: %p %v", response, err)
+			}
+			if err := original.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
+			events := coldTestEvents(t, o)
+			if path == "/capabilities" && len(events) != 0 {
+				t.Fatalf("unobserved endpoint recorded: %+v", events)
+			}
+			if path == "/file" && (len(events) != 1 || events[0]["transport_error"] != failure.Error()) {
+				t.Fatalf("transport error evidence=%+v", events)
+			}
+		})
+	}
+}
+
+func TestColdHTTPRejectsIdentityAndDataChanges(t *testing.T) {
+	for _, name := range []string{"open-id", "read-id", "reference", "bytes", "short-read", "size", "metadata", "negative-offset", "negative-length"} {
+		t.Run(name, func(t *testing.T) {
+			o := coldTestObserver(t)
+			if name == "open-id" {
+				attr := o.state.Reference.Attr
+				attr.ID++
+				coldTestHTTP(t, o, map[string]any{"op": "file.open-at", "session": "session", "child": storage.ChildName{Parent: storage.DirectoryTarget{NodeID: o.state.RootID}, RawLeaf: []byte(o.state.SentinelName)}}, coldHTTPResponse{File: "reference", Attr: httprest.AttrOf(attr)})
+			} else {
+				coldTestHTTPOpen(t, o)
+				request := coldHTTPRequest{Op: "file.read", Session: "session", File: "reference", Length: len(o.state.Content)}
+				attr := o.state.Reference.Attr
+				data := bytes.Clone(o.state.Content)
+				switch name {
+				case "read-id":
+					attr.ID++
+				case "reference":
+					request.File = "unknown"
+				case "bytes":
+					data[0] ^= 1
+				case "short-read":
+					data = data[:len(data)-1]
+				case "size":
+					attr.Size++
+				case "metadata":
+					attr.Metadata = nil
+				case "negative-offset":
+					request.Offset = -1
+				case "negative-length":
+					request.Length = -1
+				}
+				coldTestHTTP(t, o, request, coldHTTPResponse{Attr: httprest.AttrOf(attr), Data: data})
+			}
+			if coldTestError(o) == nil || o.httpRead {
+				t.Fatal("mismatched authoritative result was credited")
+			}
+		})
+	}
+}
+
+type coldTestAddr string
+
+func (a coldTestAddr) Network() string { return "memory" }
+func (a coldTestAddr) String() string  { return string(a) }
+
+type coldTestConn struct {
+	input    io.Reader
+	output   bytes.Buffer
+	writeMax int
+	writeErr error
+	closeErr error
+	closes   int
+}
+
+func (c *coldTestConn) Read(p []byte) (int, error) {
+	if c.input == nil {
+		return 0, io.EOF
+	}
+	return c.input.Read(p)
+}
+func (c *coldTestConn) Write(p []byte) (int, error) {
+	n := len(p)
+	if c.writeMax > 0 {
+		n = min(n, c.writeMax)
+	}
+	_, _ = c.output.Write(p[:n])
+	return n, c.writeErr
+}
+func (c *coldTestConn) Close() error                     { c.closes++; return c.closeErr }
+func (c *coldTestConn) LocalAddr() net.Addr              { return coldTestAddr("server") }
+func (c *coldTestConn) RemoteAddr() net.Addr             { return coldTestAddr("client") }
+func (c *coldTestConn) SetDeadline(time.Time) error      { return nil }
+func (c *coldTestConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *coldTestConn) SetWriteDeadline(time.Time) error { return nil }
+
+type coldTestListener struct {
+	conn net.Conn
+	err  error
+}
+
+func (l coldTestListener) Accept() (net.Conn, error) { return l.conn, l.err }
+func (coldTestListener) Close() error                { return nil }
+func (coldTestListener) Addr() net.Addr              { return coldTestAddr("listener") }
+
+func coldTestConnection(t *testing.T, o *coldObserver) (*coldWireConnection, *coldTestConn) {
+	t.Helper()
+	base := &coldTestConn{}
+	conn, err := o.Listener(coldTestListener{conn: base}).Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, ok := conn.(*coldWireConnection)
+	if !ok {
+		t.Fatalf("connection was not observed: %T", conn)
+	}
+	return observed, base
+}
+
+func coldTestPacket(command uint16, message uint64, out bool, body []byte) []byte {
+	packet := make([]byte, 64+len(body))
+	copy(packet, "\xfeSMB")
+	binary.LittleEndian.PutUint16(packet[4:], 64)
+	binary.LittleEndian.PutUint16(packet[12:], command)
+	if out {
+		binary.LittleEndian.PutUint32(packet[16:], 1)
+	}
+	binary.LittleEndian.PutUint64(packet[24:], message)
+	binary.LittleEndian.PutUint32(packet[36:], 29)
+	binary.LittleEndian.PutUint64(packet[40:], 47)
+	copy(packet[64:], body)
+	return packet
+}
+
+func coldTestFrame(packets ...[]byte) []byte {
+	var payload []byte
+	for i, packet := range packets {
+		part := bytes.Clone(packet)
+		if i+1 < len(packets) {
+			padded := (len(part) + 7) &^ 7
+			part = append(part, make([]byte, padded-len(part))...)
+			binary.LittleEndian.PutUint32(part[20:], uint32(padded))
+		}
+		payload = append(payload, part...)
+	}
+	frame := []byte{0, byte(len(payload) >> 16), byte(len(payload) >> 8), byte(len(payload))}
+	return append(frame, payload...)
+}
+
+func coldTestName(name string) []byte {
+	var data []byte
+	for _, unit := range utf16.Encode([]rune(name)) {
+		data = binary.LittleEndian.AppendUint16(data, unit)
+	}
+	return data
+}
+
+func coldTestCreateRequest(message uint64, name string) []byte {
+	data := coldTestName(name)
+	body := make([]byte, 56+len(data))
+	binary.LittleEndian.PutUint16(body, 57)
+	binary.LittleEndian.PutUint16(body[44:], 120)
+	binary.LittleEndian.PutUint16(body[46:], uint16(len(data)))
+	copy(body[56:], data)
+	return coldTestPacket(5, message, false, body)
+}
+
+func coldTestQFID(o *coldObserver, node uint64) []byte {
+	context := make([]byte, 64)
+	binary.LittleEndian.PutUint16(context[4:], 16)
+	binary.LittleEndian.PutUint16(context[6:], 4)
+	binary.LittleEndian.PutUint16(context[10:], 24)
+	binary.LittleEndian.PutUint32(context[12:], 32)
+	copy(context[16:], "QFid")
+	binary.LittleEndian.PutUint64(context[24:], node)
+	serial := sha256.Sum256([]byte("smb.volume-id.v1\x00" + o.options.Volume))
+	copy(context[32:40], serial[:8])
+	return context
+}
+
+func coldTestCreateResponse(o *coldObserver, message uint64, file []byte, node uint64, qfid bool) []byte {
+	body := make([]byte, 88)
+	binary.LittleEndian.PutUint16(body, 89)
+	copy(body[64:80], file)
+	if qfid {
+		context := coldTestQFID(o, node)
+		binary.LittleEndian.PutUint32(body[80:], 152)
+		binary.LittleEndian.PutUint32(body[84:], uint32(len(context)))
+		body = append(body, context...)
+	}
+	return coldTestPacket(5, message, true, body)
+}
+
+func coldTestReadRequest(message uint64, file []byte, offset uint64, length uint32) []byte {
+	body := make([]byte, 48)
+	binary.LittleEndian.PutUint16(body, 49)
+	binary.LittleEndian.PutUint32(body[4:], length)
+	binary.LittleEndian.PutUint64(body[8:], offset)
+	copy(body[16:32], file)
+	return coldTestPacket(8, message, false, body)
+}
+
+func coldTestReadResponse(message uint64, data []byte) []byte {
+	body := make([]byte, 16+len(data))
+	binary.LittleEndian.PutUint16(body, 17)
+	body[2] = 80
+	binary.LittleEndian.PutUint32(body[4:], uint32(len(data)))
+	copy(body[16:], data)
+	return coldTestPacket(8, message, true, body)
+}
+
+func coldTestQueryRequest(message uint64, file []byte, class byte) []byte {
+	body := make([]byte, 40)
+	binary.LittleEndian.PutUint16(body, 41)
+	body[2], body[3] = 1, class
+	copy(body[24:40], file)
+	return coldTestPacket(16, message, false, body)
+}
+
+func coldTestQueryResponse(message uint64, data []byte) []byte {
+	body := make([]byte, 8+len(data))
+	binary.LittleEndian.PutUint16(body, 9)
+	binary.LittleEndian.PutUint16(body[2:], 72)
+	binary.LittleEndian.PutUint32(body[4:], uint32(len(data)))
+	copy(body[8:], data)
+	return coldTestPacket(16, message, true, body)
+}
+
+func coldTestFileID(o *coldObserver, node uint64) []byte {
+	serial := sha256.Sum256([]byte("smb.volume-id.v1\x00" + o.options.Volume))
+	data := make([]byte, 24)
+	copy(data, serial[:8])
+	binary.LittleEndian.PutUint64(data[8:], node)
+	return data
+}
+
+func coldTestFeed(c *coldWireConnection, out bool, frame []byte, step int) {
+	for len(frame) > 0 {
+		n := min(step, len(frame))
+		c.feed(out, frame[:n], nil)
+		frame = frame[n:]
+	}
+}
+
+func coldTestOpen(t *testing.T, o *coldObserver, c *coldWireConnection) []byte {
+	t.Helper()
+	file := bytes.Repeat([]byte{0x5a}, 16)
+	c.feed(false, coldTestFrame(coldTestCreateRequest(100, o.state.SentinelName)), nil)
+	c.feed(true, coldTestFrame(coldTestCreateResponse(o, 100, file, o.state.Reference.Attr.ID, true)), nil)
+	if err := coldTestError(o); err != nil {
+		t.Fatal(err)
+	}
+	return file
+}
+
+func TestColdSMBFragmentedCompoundAndOpaqueNativeEvidence(t *testing.T) {
+	o := coldTestObserver(t)
+	c, _ := coldTestConnection(t, o)
+	coldTestHTTPOpen(t, o)
+	coldTestHTTPReadAndClose(t, o)
+	coldTestFeed(c, false, coldTestFrame(coldTestPacket(1, 1, false, make([]byte, 24)), coldTestPacket(3, 2, false, make([]byte, 8))), 3)
+	tree := make([]byte, 16)
+	tree[2] = 1
+	coldTestFeed(c, true, coldTestFrame(coldTestPacket(1, 1, true, make([]byte, 8)), coldTestPacket(3, 2, true, tree)), 7)
+	file, related := bytes.Repeat([]byte{0x42}, 16), bytes.Repeat([]byte{0xff}, 16)
+	requests := [][]byte{coldTestCreateRequest(3, o.state.SentinelName), coldTestReadRequest(4, related, 0, uint32(len(o.state.Content))),
+		coldTestQueryRequest(5, related, 6), coldTestQueryRequest(6, related, 59)}
+	closeBody := make([]byte, 24)
+	copy(closeBody[8:], related)
+	requests = append(requests, coldTestPacket(6, 7, false, closeBody))
+	for _, packet := range requests[1:] {
+		binary.LittleEndian.PutUint32(packet[16:], 4)
+	}
+	coldTestFeed(c, false, coldTestFrame(requests...), 1)
+	responses := [][]byte{coldTestCreateResponse(o, 3, file, o.state.Reference.Attr.ID, true), coldTestReadResponse(4, o.state.Content),
+		coldTestQueryResponse(5, binary.LittleEndian.AppendUint64(nil, o.state.Reference.Attr.ID)),
+		coldTestQueryResponse(6, coldTestFileID(o, o.state.Reference.Attr.ID)), coldTestPacket(6, 7, true, make([]byte, 60))}
+	coldTestFeed(c, true, coldTestFrame(responses...), 11)
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	nativeRecord := o.Record
+	nativeID := strings.Repeat("f0", 16)
+	if err := nativeRecord(map[string]any{"kind": "native", "api": "GetFileInformationByHandleEx(FileIdInfo)", "native_file_id_hex": nativeID, "native_volume_serial_hex": "8877665544332211"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Validate(); err != nil || len(c.pending) != 0 || len(c.opens) != 0 {
+		t.Fatalf("complete observation failed: %v pending=%v opens=%v", err, c.pending, c.opens)
+	}
+	foundInternal, foundFileID, foundQFID, foundNative := false, false, false, false
+	for _, event := range coldTestEvents(t, o) {
+		if value, ok := event["wire_internal_id"]; ok {
+			foundInternal = value == json.Number(strconv.FormatUint(o.state.Reference.Attr.ID, 10))
+		}
+		if value, ok := event["wire_file_id"]; ok {
+			foundFileID = value == hex.EncodeToString(coldTestFileID(o, o.state.Reference.Attr.ID)[8:])
+		}
+		if value, ok := event["wire_qfid_disk_id"]; ok {
+			foundQFID = value == json.Number(strconv.FormatUint(o.state.Reference.Attr.ID, 10))
+		}
+		if event["kind"] == "native" {
+			foundNative = event["native_file_id_hex"] == nativeID && event["native_volume_serial_hex"] == "8877665544332211"
+		}
+	}
+	if !foundInternal || !foundFileID || !foundQFID || !foundNative {
+		t.Fatalf("identity evidence: internal=%t file=%t qfid=%t native=%t", foundInternal, foundFileID, foundQFID, foundNative)
+	}
+}
+
+func TestColdSMBRelatedCompoundInheritsExistingOpen(t *testing.T) {
+	for _, name := range []string{"read-close", "query-info-read", "query-info-read-explicit-ignored-id"} {
+		t.Run(name, func(t *testing.T) {
+			o := coldTestObserver(t)
+			c, _ := coldTestConnection(t, o)
+			file := coldTestOpen(t, o, c)
+			inherited := bytes.Repeat([]byte{0xff}, 16)
+			if name == "query-info-read-explicit-ignored-id" {
+				inherited = bytes.Repeat([]byte{0xab}, 16)
+			}
+			first := coldTestReadRequest(1, file, 0, uint32(len(o.state.Content)))
+			firstResponse := coldTestReadResponse(1, o.state.Content)
+			closeBody := make([]byte, 24)
+			binary.LittleEndian.PutUint16(closeBody, 24)
+			copy(closeBody[8:], inherited)
+			second := coldTestPacket(6, 2, false, closeBody)
+			secondResponse := coldTestPacket(6, 2, true, make([]byte, 60))
+			if name != "read-close" {
+				first = coldTestQueryRequest(1, file, 6)
+				firstResponse = coldTestQueryResponse(1, binary.LittleEndian.AppendUint64(nil, o.state.Reference.Attr.ID))
+				second = coldTestReadRequest(2, inherited, 0, uint32(len(o.state.Content)))
+				secondResponse = coldTestReadResponse(2, o.state.Content)
+			}
+			binary.LittleEndian.PutUint32(second[16:], 4)
+			binary.LittleEndian.PutUint32(second[36:], ^uint32(0))
+			binary.LittleEndian.PutUint64(second[40:], ^uint64(0))
+			binary.LittleEndian.PutUint32(secondResponse[16:], 5)
+			coldTestFeed(c, false, coldTestFrame(first, second), 5)
+			if err := coldTestError(o); err != nil {
+				t.Fatalf("valid existing-open request inheritance rejected: %v", err)
+			}
+			coldTestFeed(c, true, coldTestFrame(firstResponse, secondResponse), 13)
+			if err := coldTestError(o); err != nil || !o.smbRead || len(c.pending) != 0 {
+				t.Fatalf("existing-open response inheritance: err=%v read=%t pending=%v", err, o.smbRead, c.pending)
+			}
+			if name != "read-close" {
+				if len(c.opens) != 1 {
+					t.Fatalf("READ changed open ownership: %+v", c.opens)
+				}
+				copy(closeBody[8:], file)
+				c.feed(false, coldTestFrame(coldTestPacket(6, 3, false, closeBody)), nil)
+				c.feed(true, coldTestFrame(coldTestPacket(6, 3, true, make([]byte, 60))), nil)
+			}
+			if err := c.Close(); err != nil || coldTestError(o) != nil || len(c.opens) != 0 || len(c.pending) != 0 {
+				t.Fatalf("inherited open cleanup: err=%v observation=%v opens=%v pending=%v", err, coldTestError(o), c.opens, c.pending)
+			}
+			readEvidence, identityEvidence := false, name == "read-close"
+			for _, event := range coldTestEvents(t, o) {
+				if event["command"] == json.Number("8") && event["response"] == true && event["digest"] == digest(o.state.Content) {
+					readEvidence = true
+				}
+				if event["wire_internal_id"] == json.Number(strconv.FormatUint(o.state.Reference.Attr.ID, 10)) {
+					identityEvidence = true
+				}
+			}
+			if !readEvidence || !identityEvidence {
+				t.Fatalf("inherited evidence missing: read=%t identity=%t", readEvidence, identityEvidence)
+			}
+		})
+	}
+}
+
+func TestColdSMBUnrelatedBoundaryClearsInheritedOpen(t *testing.T) {
+	for _, predecessor := range []string{"create", "existing-read"} {
+		t.Run(predecessor, func(t *testing.T) {
+			o := coldTestObserver(t)
+			c, _ := coldTestConnection(t, o)
+			file := coldTestOpen(t, o, c)
+			first := coldTestCreateRequest(1, o.state.SentinelName)
+			inherited := bytes.Repeat([]byte{0xff}, 16)
+			last := coldTestReadRequest(3, inherited, 0, uint32(len(o.state.Content)))
+			if predecessor == "existing-read" {
+				first = coldTestReadRequest(1, file, 0, uint32(len(o.state.Content)))
+				body := make([]byte, 24)
+				binary.LittleEndian.PutUint16(body, 24)
+				copy(body[8:], inherited)
+				last = coldTestPacket(6, 3, false, body)
+			}
+			echo := coldTestPacket(13, 2, false, []byte{4, 0, 0, 0})
+			binary.LittleEndian.PutUint32(last[16:], 4)
+			binary.LittleEndian.PutUint32(last[36:], ^uint32(0))
+			binary.LittleEndian.PutUint64(last[40:], ^uint64(0))
+			coldTestFeed(c, false, coldTestFrame(first, echo, last), 7)
+			if coldTestError(o) == nil {
+				t.Fatalf("unrelated ECHO retained the %s identity", predecessor)
+			}
+			if _, accepted := c.pending[3]; accepted || o.smbRead {
+				t.Fatal("missing inherited identity was installed or credited")
+			}
+		})
+	}
+}
+
+func TestColdObserverConcurrentRecordsStayBoundAndWhole(t *testing.T) {
+	o := coldTestObserver(t)
+	var writers sync.WaitGroup
+	for i := range 32 {
+		writers.Go(func() {
+			if err := o.Record(map[string]any{"kind": "native", "id": fmt.Sprintf("event-%d", i)}); err != nil {
+				t.Errorf("record: %v", err)
+			}
+		})
+	}
+	writers.Wait()
+	if err := o.Close(); err != nil {
+		t.Fatal(err)
+	}
+	events := coldTestEvents(t, o)
+	seen := make(map[any]bool)
+	for _, event := range events {
+		seen[event["id"]] = true
+	}
+	if len(events) != 32 || len(seen) != 32 {
+		t.Fatalf("interleaved or missing records: count=%d distinct=%d", len(events), len(seen))
+	}
+}
+
+func TestColdHTTPRetriesAndSessionCleanupDoNotInventReferences(t *testing.T) {
+	o := coldTestObserver(t)
+	coldTestHTTP(t, o, coldHTTPRequest{Op: "file.session-open"}, coldHTTPResponse{Session: "unconfirmed", Retry: true})
+	if len(o.httpSessions) != 0 {
+		t.Fatal("retry response enrolled a session")
+	}
+	coldTestHTTPOpen(t, o)
+	coldTestHTTP(t, o, coldHTTPRequest{Op: "file.open-node-ref", Session: "session"}, coldHTTPResponse{File: "unconfirmed", Retry: true})
+	if len(o.httpRefs) != 1 {
+		t.Fatal("retry response enrolled a reference")
+	}
+	coldTestHTTP(t, o, coldHTTPRequest{Op: "file.open-node-ref", Session: "session"}, coldHTTPResponse{File: "root", Attr: &httprest.Attr{ID: o.state.RootID, Kind: storage.NodeDirectory}})
+	coldTestHTTP(t, o, coldHTTPRequest{Op: "file.session-close", Session: "session"}, coldHTTPResponse{Retry: true})
+	if len(o.httpSessions) != 1 || len(o.httpRefs) != 2 {
+		t.Fatal("unconfirmed session close discarded retained references")
+	}
+	coldTestHTTP(t, o, coldHTTPRequest{Op: "file.session-close", Session: "session"}, coldHTTPResponse{})
+	if err := coldTestError(o); err != nil || len(o.httpSessions) != 0 || len(o.httpRefs) != 0 {
+		t.Fatalf("confirmed session close did not release all references: %v", err)
+	}
+}
+
+func TestColdSMBRejectsMismatchedAndDuplicateResponses(t *testing.T) {
+	for _, name := range []string{"unsolicited", "wrong-command", "duplicate-request", "duplicate-response", "wrong-session", "wrong-tree", "unknown-open", "wrong-data", "short-data", "short-body", "field-offset", "duplicate-open", "related-without-create", "related-before-create"} {
+		t.Run(name, func(t *testing.T) {
+			o := coldTestObserver(t)
+			c, _ := coldTestConnection(t, o)
+			file := coldTestOpen(t, o, c)
+			request := coldTestReadRequest(1, file, 0, uint32(len(o.state.Content)))
+			response := coldTestReadResponse(1, o.state.Content)
+			switch name {
+			case "unsolicited":
+				request = nil
+			case "wrong-command":
+				response = coldTestQueryResponse(1, make([]byte, 8))
+			case "wrong-session":
+				binary.LittleEndian.PutUint64(response[40:], 48)
+			case "wrong-tree":
+				binary.LittleEndian.PutUint32(response[36:], 30)
+			case "unknown-open":
+				request = coldTestReadRequest(1, bytes.Repeat([]byte{0x81}, 16), 0, uint32(len(o.state.Content)))
+			case "wrong-data":
+				response[len(response)-1] ^= 1
+			case "short-data":
+				response = coldTestReadResponse(1, o.state.Content[:len(o.state.Content)-1])
+			case "short-body":
+				response = coldTestPacket(8, 1, true, make([]byte, 15))
+			case "field-offset":
+				response[66] = 79
+			case "duplicate-open":
+				request = coldTestCreateRequest(1, o.state.SentinelName)
+				response = coldTestCreateResponse(o, 1, file, o.state.Reference.Attr.ID, false)
+			case "related-without-create":
+				request = coldTestReadRequest(1, bytes.Repeat([]byte{0xff}, 16), 0, uint32(len(o.state.Content)))
+				binary.LittleEndian.PutUint32(request[16:], 4)
+			case "related-before-create":
+				request = coldTestReadRequest(2, bytes.Repeat([]byte{0xff}, 16), 0, uint32(len(o.state.Content)))
+				binary.LittleEndian.PutUint32(request[16:], 4)
+				c.feed(false, coldTestFrame(coldTestCreateRequest(1, o.state.SentinelName), request), nil)
+				request = nil
+				response = coldTestReadResponse(2, o.state.Content)
+			}
+			if request != nil {
+				c.feed(false, coldTestFrame(request), nil)
+			}
+			if name == "duplicate-request" {
+				c.feed(false, coldTestFrame(request), nil)
+			}
+			c.feed(true, coldTestFrame(response), nil)
+			if name == "duplicate-response" {
+				c.feed(true, coldTestFrame(response), nil)
+			}
+			first := coldTestError(o)
+			if first == nil {
+				t.Fatalf("invalid %s exchange accepted", name)
+			}
+			c.feed(true, coldTestFrame(response), nil)
+			if coldTestError(o) != first {
+				t.Fatal("first observation failure changed")
+			}
+		})
+	}
+}
+
+func TestColdSMBObservedIdentityQueriesAreExact(t *testing.T) {
+	for _, name := range []string{"internal-node", "internal-length", "file-node", "file-volume", "file-upper-id", "file-length", "qfid-node", "qfid-volume", "qfid-reserved", "qfid-length", "qfid-offset"} {
+		t.Run(name, func(t *testing.T) {
+			o := coldTestObserver(t)
+			c, _ := coldTestConnection(t, o)
+			if strings.HasPrefix(name, "qfid-") {
+				response := coldTestCreateResponse(o, 1, bytes.Repeat([]byte{0x19}, 16), o.state.Reference.Attr.ID, true)
+				switch name {
+				case "qfid-node":
+					response[176] ^= 1
+				case "qfid-volume":
+					response[184] ^= 1
+				case "qfid-reserved":
+					response[192] = 1
+				case "qfid-length":
+					binary.LittleEndian.PutUint32(response[164:], 31)
+				case "qfid-offset":
+					binary.LittleEndian.PutUint32(response[144:], 151)
+				}
+				c.feed(false, coldTestFrame(coldTestCreateRequest(1, o.state.SentinelName)), nil)
+				c.feed(true, coldTestFrame(response), nil)
+			} else {
+				file := coldTestOpen(t, o, c)
+				class := byte(59)
+				data := coldTestFileID(o, o.state.Reference.Attr.ID)
+				switch name {
+				case "internal-node", "internal-length":
+					class = 6
+					data = binary.LittleEndian.AppendUint64(nil, o.state.Reference.Attr.ID)
+					if name == "internal-node" {
+						data[0] ^= 1
+					} else {
+						data = append(data, 0)
+					}
+				case "file-node":
+					data[8] ^= 1
+				case "file-volume":
+					data[0] ^= 1
+				case "file-upper-id":
+					data[16] = 1
+				case "file-length":
+					data = data[:23]
+				}
+				c.feed(false, coldTestFrame(coldTestQueryRequest(1, file, class)), nil)
+				c.feed(true, coldTestFrame(coldTestQueryResponse(1, data)), nil)
+			}
+			if coldTestError(o) == nil {
+				t.Fatalf("mismatched %s projection accepted", name)
+			}
+		})
+	}
+}
+
+func TestColdSMBRejectsPartialOversizedAndMalformedFrames(t *testing.T) {
+	for _, name := range []string{"partial-eof", "partial-close", "oversized-frame", "oversized-buffer", "transport-kind", "smb-header", "header-length", "direction", "compound-offset", "compound-tail", "compound-count", "name-odd", "name-surrogate", "name-offset"} {
+		t.Run(name, func(t *testing.T) {
+			o := coldTestObserver(t)
+			c, _ := coldTestConnection(t, o)
+			packet := coldTestCreateRequest(1, o.state.SentinelName)
+			frame := coldTestFrame(packet)
+			ended := error(nil)
+			switch name {
+			case "partial-eof":
+				frame, ended = frame[:len(frame)-1], io.EOF
+			case "partial-close":
+				frame = frame[:3]
+			case "oversized-frame":
+				frame = []byte{0, byte((coldFrameLimit + 1) >> 16), byte(((coldFrameLimit + 1) >> 8) & 255), byte((coldFrameLimit + 1) & 255)}
+			case "oversized-buffer":
+				frame = make([]byte, coldFrameLimit+5)
+			case "transport-kind":
+				frame[0] = 0x81
+			case "smb-header":
+				frame[4] = 0xfd
+			case "header-length":
+				binary.LittleEndian.PutUint16(frame[8:], 63)
+			case "direction":
+				binary.LittleEndian.PutUint32(frame[20:], 1)
+			case "compound-offset":
+				binary.LittleEndian.PutUint32(frame[24:], 65)
+			case "compound-tail":
+				binary.LittleEndian.PutUint32(frame[24:], uint32(len(packet)))
+			case "compound-count":
+				var packets [][]byte
+				for i := range 33 {
+					packets = append(packets, coldTestPacket(1, uint64(i), false, nil))
+				}
+				frame = coldTestFrame(packets...)
+			case "name-odd":
+				binary.LittleEndian.PutUint16(frame[114:], 1)
+			case "name-surrogate":
+				binary.LittleEndian.PutUint16(frame[114:], 2)
+				binary.LittleEndian.PutUint16(frame[124:], 0xd800)
+			case "name-offset":
+				binary.LittleEndian.PutUint16(frame[112:], 119)
+			}
+			c.feed(false, frame, ended)
+			if name == "partial-close" {
+				if err := c.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if coldTestError(o) == nil {
+				t.Fatalf("invalid %s frame accepted", name)
+			}
+		})
+	}
+	if got, err := coldName(coldTestName("dir\\α-😀.txt")); err != nil || got != "dir\\α-😀.txt" {
+		t.Fatalf("valid UTF-16 name=%q err=%v", got, err)
+	}
+	if _, err := coldName(make([]byte, 4098)); err == nil {
+		t.Fatal("oversized UTF-16 name accepted")
+	}
+}
+
+func TestColdSMBTransportPreservesPartialIOAndConnectionErrors(t *testing.T) {
+	o := coldTestObserver(t)
+	c, base := coldTestConnection(t, o)
+	request := coldTestFrame(coldTestPacket(1, 1, false, make([]byte, 24)))
+	base.input = bytes.NewReader(request)
+	var received bytes.Buffer
+	buffer := make([]byte, 7)
+	for {
+		n, err := c.Read(buffer)
+		received.Write(buffer[:n])
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !bytes.Equal(received.Bytes(), request) {
+		t.Fatal("observed Read changed transport bytes")
+	}
+	response := coldTestFrame(coldTestPacket(1, 1, true, make([]byte, 8)))
+	base.writeMax = 5
+	for remaining := response; len(remaining) > 0; {
+		n, err := c.Write(remaining)
+		if err != nil || n != min(5, len(remaining)) {
+			t.Fatalf("partial Write changed n/error: %d %v", n, err)
+		}
+		remaining = remaining[n:]
+	}
+	if !bytes.Equal(base.output.Bytes(), response) || !o.smbSession || coldTestError(o) != nil {
+		t.Fatal("partial writes changed SMB observation")
+	}
+	failure := errors.New("connection close failed")
+	base.closeErr = failure
+	if err := c.Close(); err != failure || base.closes != 1 {
+		t.Fatalf("Close changed result: %v calls=%d", err, base.closes)
+	}
+	if _, err := o.Listener(coldTestListener{err: failure}).Accept(); err != failure {
+		t.Fatalf("Accept changed result: %v", err)
+	}
+}
+
+func TestColdSMBBoundsPendingAndConnectionObservations(t *testing.T) {
+	t.Run("pending", func(t *testing.T) {
+		o := coldTestObserver(t)
+		c, _ := coldTestConnection(t, o)
+		for i := range 256 {
+			c.pending[uint64(i)] = coldWireRequest{command: 1}
+		}
+		c.feed(false, coldTestFrame(coldTestPacket(1, 257, false, nil)), nil)
+		if coldTestError(o) == nil || len(c.pending) != 256 {
+			t.Fatalf("pending bound: error=%v count=%d", coldTestError(o), len(c.pending))
+		}
+	})
+	t.Run("connections", func(t *testing.T) {
+		o := coldTestObserver(t)
+		for range 16 {
+			coldTestConnection(t, o)
+		}
+		base := &coldTestConn{}
+		conn, err := o.Listener(coldTestListener{conn: base}).Accept()
+		if err != nil || conn != base || coldTestError(o) == nil || len(o.connections) != 16 {
+			t.Fatalf("connection bound changed transport: %v count=%d", err, len(o.connections))
+		}
+	})
+}
+
+func coldTestSetLineage(packet []byte, session uint64, tree uint32) {
+	binary.LittleEndian.PutUint64(packet[40:], session)
+	binary.LittleEndian.PutUint32(packet[36:], tree)
+}
+
+func TestColdSMBResponseLineageRejectsForeignHeaders(t *testing.T) {
+	for _, mode := range []string{"standalone", "related-create"} {
+		for _, operation := range []string{"read", "query-info"} {
+			for _, field := range []string{"session", "tree"} {
+				t.Run(mode+"-"+operation+"-"+field, func(t *testing.T) {
+					o := coldTestObserver(t)
+					c, base := coldTestConnection(t, o)
+					file := bytes.Repeat([]byte{0x42}, 16)
+					foreignSession, foreignTree := uint64(47), uint32(29)
+					if field == "session" {
+						foreignSession++
+					} else {
+						foreignTree++
+					}
+					var requests, responses [][]byte
+					if mode == "standalone" {
+						file = coldTestOpen(t, o, c)
+						request := coldTestCreateRequest(101, o.state.SentinelName)
+						response := coldTestCreateResponse(o, 101, file, o.state.Reference.Attr.ID, false)
+						coldTestSetLineage(request, foreignSession, foreignTree)
+						coldTestSetLineage(response, foreignSession, foreignTree)
+						c.feed(false, coldTestFrame(request), nil)
+						c.feed(true, coldTestFrame(response), nil)
+						if err := coldTestError(o); err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						requests = append(requests, coldTestCreateRequest(3, o.state.SentinelName))
+						responses = append(responses, coldTestCreateResponse(o, 3, file, o.state.Reference.Attr.ID, false))
+						file = bytes.Repeat([]byte{0xff}, 16)
+					}
+					request := coldTestReadRequest(4, file, 0, uint32(len(o.state.Content)))
+					response := coldTestReadResponse(4, o.state.Content)
+					if operation == "query-info" {
+						request = coldTestQueryRequest(4, file, 6)
+						response = coldTestQueryResponse(4, binary.LittleEndian.AppendUint64(nil, o.state.Reference.Attr.ID))
+					}
+					if mode == "related-create" {
+						binary.LittleEndian.PutUint32(request[16:], 4)
+						coldTestSetLineage(request, ^uint64(0), ^uint32(0))
+						binary.LittleEndian.PutUint32(response[16:], 5)
+					}
+					coldTestSetLineage(response, foreignSession, foreignTree)
+					requests = append(requests, request)
+					responses = append(responses, response)
+					c.feed(false, coldTestFrame(requests...), nil)
+					if err := coldTestError(o); err != nil {
+						t.Fatal(err)
+					}
+					frame := coldTestFrame(responses...)
+					if n, err := c.Write(frame); n != len(frame) || err != nil || !bytes.Equal(base.output.Bytes(), frame) {
+						t.Fatalf("observer altered rejected response transport: n=%d err=%v", n, err)
+					}
+					first := coldTestError(o)
+					if first == nil || o.smbRead {
+						t.Fatal("same-MID foreign lineage was credited")
+					}
+					if _, pending := c.pending[4]; !pending {
+						t.Fatal("mismatched response retired the bound request")
+					}
+					for _, event := range coldTestEvents(t, o) {
+						if _, credited := event["wire_internal_id"]; credited {
+							t.Fatal("foreign query response produced identity evidence")
+						}
+					}
+					c.feed(true, coldTestFrame(coldTestReadResponse(99, nil)), nil)
+					if coldTestError(o) != first {
+						t.Fatal("later traffic replaced the first lineage error")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestColdSMBRelatedAllocationUsesValidatedResponseLineage(t *testing.T) {
+	for _, name := range []string{"read-sentinel-headers", "query-ignored-headers", "failed-tree"} {
+		t.Run(name, func(t *testing.T) {
+			o := coldTestObserver(t)
+			c, _ := coldTestConnection(t, o)
+			tree := coldTestPacket(3, 1, false, make([]byte, 8))
+			coldTestSetLineage(tree, 47, 0)
+			create := coldTestCreateRequest(2, o.state.SentinelName)
+			binary.LittleEndian.PutUint32(create[16:], 4)
+			coldTestSetLineage(create, ^uint64(0), ^uint32(0))
+			last := coldTestReadRequest(3, bytes.Repeat([]byte{0xff}, 16), 0, uint32(len(o.state.Content)))
+			if name == "query-ignored-headers" {
+				last = coldTestQueryRequest(3, bytes.Repeat([]byte{0xab}, 16), 6)
+				coldTestSetLineage(create, 701, 801)
+			}
+			binary.LittleEndian.PutUint32(last[16:], 4)
+			coldTestSetLineage(last, ^uint64(0), ^uint32(0))
+			if name == "query-ignored-headers" {
+				coldTestSetLineage(last, 702, 802)
+			}
+			c.feed(false, coldTestFrame(tree, create, last), nil)
+			if err := coldTestError(o); err != nil {
+				t.Fatal(err)
+			}
+			allocated := c.pending[2].lineage
+			if allocated == nil || allocated.known {
+				t.Fatal("request parsing guessed the unobserved tree allocation")
+			}
+			treeBody := make([]byte, 16)
+			treeBody[2] = 1
+			treeReply := coldTestPacket(3, 1, true, treeBody)
+			file := bytes.Repeat([]byte{0x19}, 16)
+			createReply := coldTestCreateResponse(o, 2, file, o.state.Reference.Attr.ID, true)
+			lastReply := coldTestReadResponse(3, o.state.Content)
+			if name == "query-ignored-headers" {
+				lastReply = coldTestQueryResponse(3, binary.LittleEndian.AppendUint64(nil, o.state.Reference.Attr.ID))
+			}
+			if name == "failed-tree" {
+				body := []byte{9, 0, 0, 0, 0, 0, 0, 0}
+				treeReply = coldTestPacket(3, 1, true, body)
+				createReply = coldTestPacket(5, 2, true, body)
+				lastReply = coldTestPacket(8, 3, true, body)
+			}
+			for index, packet := range [][]byte{treeReply, createReply, lastReply} {
+				coldTestSetLineage(packet, 47, 313)
+				if index > 0 {
+					binary.LittleEndian.PutUint32(packet[16:], 5)
+				}
+				if name == "failed-tree" {
+					coldTestSetLineage(packet, 47, 0)
+					binary.LittleEndian.PutUint32(packet[8:], 0xc0000022)
+				}
+			}
+			coldTestFeed(c, true, coldTestFrame(treeReply, createReply, lastReply), 7)
+			if err := coldTestError(o); err != nil || len(c.pending) != 0 {
+				t.Fatalf("valid allocation lineage rejected: err=%v pending=%v", err, c.pending)
+			}
+			wantTree := uint32(313)
+			if name == "failed-tree" {
+				wantTree = 0
+				if o.smbTree || o.smbOpen || o.smbRead {
+					t.Fatal("error lineage credited successful work")
+				}
+			} else if !o.smbTree || !o.smbOpen {
+				t.Fatal("successful allocation chain lost its observed tree/open")
+			}
+			if !allocated.known || allocated.sessionID != 47 || allocated.treeID != wantTree {
+				t.Fatal("related request did not inherit the validated response")
+			}
+			if name == "read-sentinel-headers" && !o.smbRead {
+				t.Fatal("valid related READ was not observed")
+			}
+		})
+	}
+}
+
+func TestColdSMBLineageAllocationExceptionsAreCommandSpecific(t *testing.T) {
+	for _, test := range []struct {
+		name                               string
+		command                            uint16
+		requestSession, responseSession    uint64
+		requestTree, responseTree, status  uint32
+		accepted, authenticated, connected bool
+	}{
+		{name: "initial-session-success", command: 1, responseSession: 47, accepted: true, authenticated: true},
+		{name: "initial-session-more-processing", command: 1, responseSession: 47, status: 0xc0000016, accepted: true},
+		{name: "initial-session-error-allocated", command: 1, responseSession: 47, status: 0xc0000022, accepted: true},
+		{name: "initial-session-error-unallocated", command: 1, status: 0xc0000022, accepted: true},
+		{name: "initial-session-success-missing-id", command: 1},
+		{name: "initial-session-more-processing-missing-id", command: 1, status: 0xc0000016},
+		{name: "existing-session-success", command: 1, requestSession: 47, responseSession: 47, accepted: true, authenticated: true},
+		{name: "existing-session-more-processing", command: 1, requestSession: 47, responseSession: 47, status: 0xc0000016, accepted: true},
+		{name: "existing-session-more-processing-cannot-change", command: 1, requestSession: 47, responseSession: 48, status: 0xc0000016},
+		{name: "existing-session-cannot-change", command: 1, requestSession: 47, responseSession: 48},
+		{name: "existing-session-error-cannot-change", command: 1, requestSession: 47, responseSession: 48, status: 0xc0000022},
+		{name: "session-setup-cannot-change-tree", command: 1, responseSession: 47, responseTree: 29},
+		{name: "tree-allocation", command: 3, requestSession: 47, responseSession: 47, responseTree: 313, accepted: true, connected: true},
+		{name: "tree-ignores-request-tree-on-success", command: 3, requestSession: 47, responseSession: 47, requestTree: 29, responseTree: 313, accepted: true, connected: true},
+		{name: "tree-success-missing-id", command: 3, requestSession: 47, responseSession: 47},
+		{name: "tree-cannot-change-session", command: 3, requestSession: 47, responseSession: 48, responseTree: 313},
+		{name: "tree-error-retains-id", command: 3, requestSession: 47, responseSession: 47, requestTree: 29, responseTree: 29, status: 0xc0000022, accepted: true},
+		{name: "tree-error-cannot-allocate", command: 3, requestSession: 47, responseSession: 47, responseTree: 313, status: 0xc0000022},
+		{name: "echo-cannot-allocate-session", command: 13, responseSession: 47},
+		{name: "echo-cannot-allocate-tree", command: 13, requestSession: 47, responseSession: 47, responseTree: 313},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := coldTestObserver(t)
+			c, _ := coldTestConnection(t, o)
+			request := coldTestPacket(test.command, 1, false, make([]byte, 24))
+			body := make([]byte, 16)
+			body[2] = 1
+			response := coldTestPacket(test.command, 1, true, body)
+			coldTestSetLineage(request, test.requestSession, test.requestTree)
+			coldTestSetLineage(response, test.responseSession, test.responseTree)
+			binary.LittleEndian.PutUint32(response[8:], test.status)
+			c.feed(false, coldTestFrame(request), nil)
+			c.feed(true, coldTestFrame(response), nil)
+			if err := coldTestError(o); (err == nil) != test.accepted {
+				t.Fatalf("allocation result=%v, expected accepted=%v", err, test.accepted)
+			}
+			if o.smbSession != test.authenticated || o.smbTree != test.connected {
+				t.Fatalf("allocation/error credited wrong work: session=%v tree=%v", o.smbSession, o.smbTree)
+			}
+		})
+	}
+}
+
+func TestColdSMBRelatedRequestRequiresPrecedingLineage(t *testing.T) {
+	for _, command := range []uint16{5, 8, 13} {
+		t.Run(strconv.Itoa(int(command)), func(t *testing.T) {
+			o := coldTestObserver(t)
+			c, _ := coldTestConnection(t, o)
+			packet := coldTestCreateRequest(1, o.state.SentinelName)
+			if command == 8 {
+				packet = coldTestReadRequest(1, bytes.Repeat([]byte{0xff}, 16), 0, 1)
+			}
+			if command == 13 {
+				packet = coldTestPacket(13, 1, false, []byte{4, 0, 0, 0})
+			}
+			binary.LittleEndian.PutUint32(packet[16:], 4)
+			coldTestSetLineage(packet, ^uint64(0), ^uint32(0))
+			c.feed(false, coldTestFrame(packet), nil)
+			if coldTestError(o) == nil || len(c.pending) != 0 {
+				t.Fatal("first related request invented a lineage")
+			}
+		})
+	}
+	t.Run("response-before-allocation", func(t *testing.T) {
+		o := coldTestObserver(t)
+		c, _ := coldTestConnection(t, o)
+		tree := coldTestPacket(3, 1, false, make([]byte, 8))
+		coldTestSetLineage(tree, 47, 0)
+		create := coldTestCreateRequest(2, o.state.SentinelName)
+		binary.LittleEndian.PutUint32(create[16:], 4)
+		coldTestSetLineage(create, ^uint64(0), ^uint32(0))
+		c.feed(false, coldTestFrame(tree, create), nil)
+		response := coldTestCreateResponse(o, 2, bytes.Repeat([]byte{0x19}, 16), o.state.Reference.Attr.ID, false)
+		coldTestSetLineage(response, 47, 313)
+		c.feed(true, coldTestFrame(response), nil)
+		if coldTestError(o) == nil || o.smbOpen || len(c.pending) != 2 {
+			t.Fatal("response guessed an unobserved allocation")
+		}
+	})
+}
+
+func TestColdSMBAsyncIsObservedAndRefusedWithoutTreeDecoding(t *testing.T) {
+	for _, name := range []string{"async-request", "async-pending", "async-final", "sync-pending"} {
+		t.Run(name, func(t *testing.T) {
+			o := coldTestObserver(t)
+			c, base := coldTestConnection(t, o)
+			file := coldTestOpen(t, o, c)
+			request := coldTestReadRequest(4, file, 0, uint32(len(o.state.Content)))
+			response := coldTestReadResponse(4, o.state.Content)
+			packet, out := response, true
+			if name == "async-request" {
+				packet, out = request, false
+			} else {
+				c.feed(false, coldTestFrame(request), nil)
+			}
+			const asyncID = uint64(0x12345678aabbccdd)
+			if name != "sync-pending" {
+				flags := uint32(2)
+				if out {
+					flags |= 1
+				}
+				binary.LittleEndian.PutUint32(packet[16:], flags)
+				binary.LittleEndian.PutUint64(packet[32:40], asyncID)
+			}
+			if name == "async-pending" || name == "sync-pending" {
+				binary.LittleEndian.PutUint32(packet[8:], 0x103)
+			}
+			frame := coldTestFrame(packet)
+			if out {
+				if n, err := c.Write(frame); n != len(frame) || err != nil || !bytes.Equal(base.output.Bytes(), frame) {
+					t.Fatalf("unsupported async changed forwarded bytes: n=%d err=%v", n, err)
+				}
+			} else {
+				c.feed(false, frame, nil)
+			}
+			if coldTestError(o) == nil || o.smbRead {
+				t.Fatal("unsupported asynchronous traffic was credited")
+			}
+			found := false
+			for _, event := range coldTestEvents(t, o) {
+				if event["message_id"] != json.Number("4") || event["observation_error"] == nil {
+					continue
+				}
+				found = true
+				if _, hasTree := event["tree_id"]; hasTree {
+					t.Fatal("asynchronous or pending layout was decoded as a TreeID")
+				}
+				if name != "sync-pending" && event["async_id"] != json.Number(strconv.FormatUint(asyncID, 10)) {
+					t.Fatal("AsyncID evidence was lost")
+				}
+				if name == "sync-pending" {
+					if _, invented := event["async_id"]; invented {
+						t.Fatal("synchronous pending header invented an AsyncID")
+					}
+				}
+			}
+			if !found {
+				t.Fatal("unsupported async traffic was not recorded")
+			}
+		})
+	}
+}

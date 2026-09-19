@@ -1,0 +1,116 @@
+--- a/packages/smb/commands_files.go
++++ b/packages/smb/commands_files.go
+@@ -361,7 +361,7 @@
+ 	if request.Attributes & ^uint32(dosSettableAttributes|0x10) != 0 {
+ 		return nil, fileNotSupported
+ 	}
+-	var volumeSerial uint64
++	identityRequested := false
+ 	for _, c := range request.Contexts {
+ 		switch string(c.Name) {
+ 		case "MxAc":
+@@ -369,22 +369,23 @@
+ 				return nil, fileInvalidParameter
+ 			}
+ 		case "QFid":
+-			if len(c.Data) != 0 {
++			if identityRequested || len(c.Data) != 0 {
+ 				return nil, fileInvalidParameter
+ 			}
+-			state, err := d.backend.State(ctx)
+-			if err != nil {
+-				return nil, statusError(err)
+-			}
+-			if state.VolumeIdentity == "" {
+-				return nil, fileIOError
+-			}
+-			volumeSerial = state.VolumeSerial
++			identityRequested = true
+ 		case "RqLs", "DHnQ", "DH2Q":
+ 		default:
+ 			return nil, fileNotSupported
+ 		}
+ 	}
++	state, err := d.backend.State(ctx)
++	if err != nil {
++		return nil, statusError(err)
++	}
++	if state.VolumeIdentity == "" {
++		return nil, fileIOError
++	}
++	volumeSerial := state.VolumeSerial
+ 	d.mu.Lock()
+ 	if len(d.handles)+d.opening >= d.limits.MaxOpens {
+ 		d.mu.Unlock()
+@@ -537,7 +538,7 @@
+ 	smbLE.PutUint32(b[56:], fileAttributes(opened.Attr))
+ 	copy(b[64:80], fid[:])
+ 	contexts, encodeErr := createContexts(ctx, request, opened.Attr, volumeSerial, leaseResponse)
+-	if encodeErr != nil {
++	if encodeErr != nil || len(contexts) > min(responseBudget(r), d.limits.MaxFrameBytes)-64-len(b) {
+ 		d.fence()
+ 		return nil, fileIOError
+ 	}
+--- a/packages/smb/create_contexts.go
++++ b/packages/smb/create_contexts.go
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"context"
++	"syscall"
+ 
+ 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+ )
+@@ -18,9 +19,22 @@
+ }
+ 
+ func createContexts(ctx context.Context, request wire.CreateRequest, attr windowsAttr, volumeSerial uint64, lease *wire.LeaseResponse) ([]byte, error) {
++	contexts := append([]wire.CreateContext(nil), request.Contexts...)
++	identityRequested := false
++	for _, item := range contexts {
++		if string(item.Name) == "QFid" {
++			if identityRequested || len(item.Data) != 0 {
++				return nil, syscall.EINVAL
++			}
++			identityRequested = true
++		}
++	}
++	if !identityRequested {
++		contexts = append(contexts, wire.CreateContext{Name: []byte("QFid")})
++	}
+ 	var encoded []byte
+ 	previous := -1
+-	for _, item := range request.Contexts {
++	for _, item := range contexts {
+ 		var data []byte
+ 		switch string(item.Name) {
+ 		case "RqLs":
+@@ -55,12 +69,16 @@
+ 		default:
+ 			continue
+ 		}
++		entryBytes := (24 + len(data) + 7) &^ 7
++		if entryBytes > responseBudget(wire.Request{Header: wire.Header{Command: wire.Create}})-152-len(encoded) {
++			return nil, syscall.ENOMEM
++		}
+ 		start := len(encoded)
+ 		if previous >= 0 {
+ 			smbLE.PutUint32(encoded[previous:], uint32(start-previous))
+ 		}
+ 		previous = start
+-		entry := make([]byte, (24+len(data)+7)&^7)
++		entry := make([]byte, entryBytes)
+ 		smbLE.PutUint16(entry[4:], 16)
+ 		smbLE.PutUint16(entry[6:], 4)
+ 		smbLE.PutUint16(entry[10:], 24)
+--- a/packages/smb/commands_files_test.go
++++ b/packages/smb/commands_files_test.go
+@@ -80,7 +80,7 @@
+ func commandDispatcher() (*fileDispatcher, *commandFile, *commandSession, wire.FileID) {
+ 	f := &commandFile{attr: windowsAttr{windowsBasicAttr: windowsBasicAttr{Attr: storage.Attr{Kind: storage.NodeRegular, ID: 7, Size: 3}}}, data: []byte("abc"), result: windowsActionResult{State: windowsActionCompleted}}
+ 	s := &commandSession{}
+-	d := newFileDispatcher(nil, s, 1, DefaultLimits())
++	d := newFileDispatcher(&sessionBackend{}, s, 1, DefaultLimits())
+ 	id := wire.FileID{1}
+ 	d.handles[id] = &fileHandle{file: f, identity: notificationIdentity{ID: f.attr.ID, Directory: f.attr.IsDir()}}
+ 	return d, f, s, id

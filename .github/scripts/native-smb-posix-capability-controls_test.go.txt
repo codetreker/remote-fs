@@ -1,0 +1,231 @@
+package smb
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"syscall"
+	"testing"
+
+	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+	"github.com/codetreker/remote-fs/packages/storage"
+)
+
+func posixCapabilityExpected() []byte {
+	return []byte{0x06, 0x04, 0, 0, 0xff, 0, 0, 0, 18, 0, 0, 0, 'r', 0, 'e', 0, 'm', 0, 'o', 0, 't', 0, 'e', 0, '-', 0, 'f', 0, 's', 0}
+}
+
+type posixCapabilityBackend struct {
+	windowsBackend
+	calls int
+	err   error
+}
+
+func (b *posixCapabilityBackend) State(context.Context) (windowsState, error) {
+	b.calls++
+	return windowsState{VolumeIdentity: "known-fixture", VolumeSerial: 0x123456789}, b.err
+}
+func (*posixCapabilityBackend) Space(context.Context) (storage.Space, error) {
+	return storage.Space{Total: 100, Used: 60, Avail: 30}, nil
+}
+
+func TestGatePosixCapabilityExactFilesystemAttributes(t *testing.T) {
+	d, _, _, _ := commandDispatcher()
+	backend := &posixCapabilityBackend{}
+	d.backend = backend
+	body, status := d.filesystemInfo(t.Context(), 5)
+	if status != 0 || !bytes.Equal(body, posixCapabilityExpected()) {
+		t.Fatalf("class5 status=%x body=%x", status, body)
+	}
+	baseline := bytes.Clone(posixCapabilityExpected())
+	smbLE.PutUint32(baseline, 6)
+	if smbLE.Uint32(body)^smbLE.Uint32(baseline) != 0x400 || !bytes.Equal(body[4:], baseline[4:]) {
+		t.Fatal("filesystem attributes changed beyond capability bit")
+	}
+	if backend.calls != 0 {
+		t.Fatal("capability query introduced State lookup")
+	}
+	for _, class := range []byte{1, 3, 4, 7, 11} {
+		t.Run(fmt.Sprintf("class%d", class), func(t *testing.T) {
+			actual, status := d.filesystemInfo(t.Context(), class)
+			var expected []byte
+			switch class {
+			case 1:
+				expected = make([]byte, 30)
+				smbLE.PutUint32(expected[8:], 0x23456789)
+				smbLE.PutUint32(expected[12:], 12)
+				copy(expected[18:], []byte{'v', 0, 'o', 0, 'l', 0, 'u', 0, 'm', 0, 'e', 0})
+			case 3:
+				expected = make([]byte, 24)
+				smbLE.PutUint64(expected, 100)
+				smbLE.PutUint64(expected[8:], 30)
+				smbLE.PutUint32(expected[16:], 1)
+				smbLE.PutUint32(expected[20:], 1)
+			case 4:
+				expected = []byte{7, 0, 0, 0, 0x10, 0, 0, 0}
+			case 7:
+				expected = make([]byte, 32)
+				smbLE.PutUint64(expected, 100)
+				smbLE.PutUint64(expected[8:], 30)
+				smbLE.PutUint64(expected[16:], 40)
+				smbLE.PutUint32(expected[24:], 1)
+				smbLE.PutUint32(expected[28:], 1)
+			case 11:
+				expected = make([]byte, 28)
+				for _, at := range []int{0, 4, 8, 12} {
+					smbLE.PutUint32(expected[at:], 1)
+				}
+			}
+			if status != 0 || !bytes.Equal(actual, expected) {
+				t.Fatalf("unrelated class%d changed: %x %x", class, status, actual)
+			}
+		})
+	}
+	if backend.calls != 1 {
+		t.Fatal("volume serial lookup changed", backend.calls)
+	}
+}
+
+type posixCapabilityFile struct {
+	*commandFile
+	syncs int
+}
+
+func (f *posixCapabilityFile) Sync(context.Context) error { f.syncs++; return f.readErr }
+func TestGatePosixCapabilityQueryFailureBoundaries(t *testing.T) {
+	for _, name := range []string{"exact", "short", "sync-outage", "closed"} {
+		t.Run(name, func(t *testing.T) {
+			d, file, _, id := commandDispatcher()
+			tracked := &posixCapabilityFile{commandFile: file}
+			d.handles[id].file = tracked
+			limit := uint32(len(posixCapabilityExpected()))
+			want := uint32(0)
+			switch name {
+			case "short":
+				limit--
+				want = fileBufferTooSmall
+			case "sync-outage":
+				file.readErr = syscall.EIO
+				want = fileIOError
+			case "closed":
+				delete(d.handles, id)
+				want = fileClosed
+			}
+			request := queryCommand(id, 2, 5, limit)
+			before := bytes.Clone(request.Packet)
+			body, status := d.queryInfo(t.Context(), request)
+			if status != want || !bytes.Equal(request.Packet, before) {
+				t.Fatalf("query status=%x want=%x", status, want)
+			}
+			if name == "exact" {
+				if len(body) != 38 || smbLE.Uint16(body) != 9 || smbLE.Uint16(body[2:]) != 72 || smbLE.Uint32(body[4:]) != 30 || !bytes.Equal(body[8:], posixCapabilityExpected()) {
+					t.Fatalf("query framing %x", body)
+				}
+			} else if body != nil {
+				t.Fatal("failed query fabricated attributes", body)
+			}
+			wantSyncs := 1
+			if name == "closed" {
+				wantSyncs = 0
+			}
+			if tracked.syncs != wantSyncs {
+				t.Fatal("query skipped or repeated Sync", tracked.syncs)
+			}
+		})
+	}
+}
+
+func TestGatePosixCapabilityPreservesRequestedOnlyQFid(t *testing.T) {
+	for _, requested := range []bool{false, true} {
+		for _, outage := range []bool{false, true} {
+			t.Run(fmt.Sprintf("requested%v_outage%v", requested, outage), func(t *testing.T) {
+				d, file, session, _ := commandDispatcher()
+				d.handles = make(map[wire.FileID]*fileHandle)
+				backend := &posixCapabilityBackend{}
+				if outage {
+					backend.err = syscall.EIO
+				}
+				d.backend = backend
+				opens := 0
+				session.open = func(windowsOpenRequest) (windowsOpenResult, error) {
+					opens++
+					return windowsOpenResult{File: file, Attr: file.attr}, nil
+				}
+				request := createCommand("", 1, 1)
+				if requested {
+					request = requestContexts(t, request, []wire.CreateContext{{Name: []byte("QFid")}})
+				}
+				before := bytes.Clone(request.Packet)
+				body, status := d.create(t.Context(), request)
+				if !bytes.Equal(request.Packet, before) {
+					t.Fatal("CREATE request mutated")
+				}
+				if requested && outage {
+					if status != fileIOError || body != nil || opens != 0 || backend.calls != 1 || len(d.handles) != 0 {
+						t.Fatal("requested identity outage bypassed", status, opens, backend.calls)
+					}
+					return
+				}
+				if status != 0 || opens != 1 {
+					t.Fatal("CREATE admission changed", status, opens)
+				}
+				if requested {
+					if backend.calls != 1 || len(body) != 144 || smbLE.Uint32(body[80:]) != 152 || smbLE.Uint32(body[84:]) != 56 {
+						t.Fatalf("requested QFid framing %x", body)
+					}
+					context := body[88:]
+					if smbLE.Uint32(context) != 0 || smbLE.Uint16(context[4:]) != 16 || smbLE.Uint16(context[6:]) != 4 || smbLE.Uint16(context[10:]) != 24 || smbLE.Uint32(context[12:]) != 32 || string(context[16:20]) != "QFid" || smbLE.Uint64(context[24:]) != file.attr.ID || smbLE.Uint64(context[32:]) != 0x123456789 || !bytes.Equal(context[40:], make([]byte, 16)) {
+						t.Fatalf("requested QFid values %x", context)
+					}
+				} else if backend.calls != 0 || len(body) != 88 || smbLE.Uint32(body[80:]) != 0 || smbLE.Uint32(body[84:]) != 0 {
+					t.Fatal("always-QFid policy entered fixture", backend.calls, body)
+				}
+				if body[2] != 0 || d.leases != nil {
+					t.Fatal("CREATE gained caching")
+				}
+			})
+		}
+	}
+}
+
+type posixUnsupportedFile struct {
+	windowsFile
+	mutations int
+}
+
+func (f *posixUnsupportedFile) SetDeletePending(context.Context, bool, windowsActionID) (windowsActionResult, error) {
+	f.mutations++
+	return windowsActionResult{State: windowsActionCompleted}, nil
+}
+func (f *posixUnsupportedFile) Rename(context.Context, windowsRenameRequest, windowsActionID) (windowsActionResult, error) {
+	f.mutations++
+	return windowsActionResult{State: windowsActionCompleted}, nil
+}
+func TestGatePosixCapabilityKeepsExSetInfoUnsupported(t *testing.T) {
+	for _, class := range []byte{64, 65} {
+		t.Run(fmt.Sprintf("class%d", class), func(t *testing.T) {
+			d, file, session, id := commandDispatcher()
+			tracked := &posixUnsupportedFile{windowsFile: file}
+			d.handles[id].file = tracked
+			opens := 0
+			session.open = func(windowsOpenRequest) (windowsOpenResult, error) {
+				opens++
+				return windowsOpenResult{File: file, Attr: file.attr}, nil
+			}
+			input := make([]byte, 4)
+			smbLE.PutUint32(input, 1)
+			if class == 65 {
+				input = make([]byte, 26)
+				smbLE.PutUint32(input, 1)
+				smbLE.PutUint32(input[16:], 6)
+				copy(input[20:], []byte{'n', 0, 'e', 0, 'w', 0})
+			}
+			request := setCommand(id, class, input)
+			before := bytes.Clone(request.Packet)
+			body, status := d.setInfo(t.Context(), request)
+			if status != fileNotSupported || body != nil || tracked.mutations != 0 || opens != 0 || d.handleCount() != 1 || d.fenced || session.closed != 0 || file.closed != 0 || !bytes.Equal(request.Packet, before) {
+				t.Fatalf("class%d changed behavior: status=%x mutations=%d opens=%d", class, status, tracked.mutations, opens)
+			}
+		})
+	}
+}

@@ -1,0 +1,422 @@
+package windows
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+)
+
+func cacheGatePositiveTestObserver() *cacheGatePositiveFrameObserver {
+	return &cacheGatePositiveFrameObserver{pending: make(map[uint64]cacheGatePositiveWireRecord), emit: func(cacheGatePositiveWireRecord) {}}
+}
+func cacheGatePositiveTestPacket(t *testing.T, command uint16, mid uint64, flags, status uint32, body []byte) []byte {
+	t.Helper()
+	packet := make([]byte, wire.HeaderSize+len(body))
+	if err := (wire.Header{Command: command, MessageID: mid, Flags: flags, Status: status}).Encode(packet); err != nil {
+		t.Fatal(err)
+	}
+	copy(packet[wire.HeaderSize:], body)
+	return packet
+}
+func cacheGatePositiveTestFrame(packet []byte) []byte {
+	n := len(packet)
+	return append([]byte{0, byte(n >> 16), byte(n >> 8), byte(n)}, packet...)
+}
+func cacheGatePositiveTestQuery(t *testing.T, mid uint64, class byte, id wire.FileID, flags uint32) []byte {
+	t.Helper()
+	body := make([]byte, 40)
+	binary.LittleEndian.PutUint16(body, 41)
+	body[2], body[3] = 1, class
+	copy(body[24:40], id[:])
+	return cacheGatePositiveTestPacket(t, wire.QueryInfo, mid, flags, 0, body)
+}
+func cacheGatePositiveTestCompound(packets ...[]byte) []byte {
+	var result []byte
+	for i, p := range packets {
+		p = append([]byte(nil), p...)
+		if i+1 < len(packets) {
+			p = append(p, make([]byte, (-len(p))&7)...)
+			binary.LittleEndian.PutUint32(p[20:24], uint32(len(p)))
+		}
+		result = append(result, p...)
+	}
+	return result
+}
+
+func TestGatePositiveWireSplitCompoundResponses(t *testing.T) {
+	o := cacheGatePositiveTestObserver()
+	id := wire.FileID{1, 2, 3}
+	request := cacheGatePositiveTestCompound(cacheGatePositiveTestQuery(t, 20, 4, id, 0), cacheGatePositiveTestQuery(t, 21, 5, id, 0))
+	for _, b := range cacheGatePositiveTestFrame(request) {
+		o.observe([]byte{b}, false)
+	}
+	basic := make([]byte, 40)
+	binary.LittleEndian.PutUint64(basic[16:24], 123456789)
+	standard := make([]byte, 24)
+	binary.LittleEndian.PutUint64(standard[8:16], 98765)
+	response := cacheGatePositiveTestCompound(
+		cacheGatePositiveTestPacket(t, wire.QueryInfo, 20, wire.FlagResponse, 0, wire.BufferResponseBody(basic)),
+		cacheGatePositiveTestPacket(t, wire.QueryInfo, 21, wire.FlagResponse, 0, wire.BufferResponseBody(standard)),
+	)
+	for _, b := range cacheGatePositiveTestFrame(response) {
+		o.observe([]byte{b}, true)
+	}
+	o.finish()
+	if o.incomplete || len(o.records) != 4 || len(o.pending) != 0 {
+		t.Fatalf("records=%+v pending=%d incomplete=%v", o.records, len(o.pending), o.incomplete)
+	}
+	if o.records[2].QueryClass != 4 || o.records[2].MTime != 123456789 || o.records[3].QueryClass != 5 || o.records[3].EOF != 98765 || o.records[3].FileID != hex.EncodeToString(id[:]) {
+		t.Fatalf("response association lost: %+v", o.records)
+	}
+	for _, r := range o.records {
+		if r.At.IsZero() {
+			t.Fatal("missing observation timestamp")
+		}
+	}
+}
+
+func TestGatePositiveWireReadDigestExcludesPayload(t *testing.T) {
+	o := cacheGatePositiveTestObserver()
+	payload := []byte("DO-NOT-LOG-READ-PAYLOAD")
+	body := make([]byte, 48)
+	binary.LittleEndian.PutUint16(body, 49)
+	binary.LittleEndian.PutUint32(body[4:8], uint32(len(payload)))
+	binary.LittleEndian.PutUint64(body[8:16], 4096)
+	body[16] = 8
+	o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.Read, 8, 0, 0, body)), false)
+	o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.Read, 8, wire.FlagResponse, 0, wire.ReadResponseBody(payload, 0))), true)
+	encoded, err := json.Marshal(o.records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(payload)
+	r := o.records[len(o.records)-1]
+	if o.incomplete || r.Digest != hex.EncodeToString(digest[:]) || r.Count != uint32(len(payload)) || r.Offset != 4096 {
+		t.Fatalf("read evidence: %+v", r)
+	}
+	if bytes.Contains(encoded, payload) {
+		t.Fatalf("file payload leaked: %s", encoded)
+	}
+	if o.streams[1].frame != nil {
+		t.Fatal("completed frame retained")
+	}
+}
+
+func TestGatePositiveWireRelatedCreateAndQuery(t *testing.T) {
+	o := cacheGatePositiveTestObserver()
+	create := make([]byte, 56)
+	binary.LittleEndian.PutUint16(create, 57)
+	id := wire.FileID{9, 7, 6}
+	related := wire.FileID{}
+	for i := range related {
+		related[i] = 0xff
+	}
+	request := cacheGatePositiveTestCompound(cacheGatePositiveTestPacket(t, wire.Create, 0, 0, 0, create), cacheGatePositiveTestQuery(t, 1, 6, related, wire.FlagRelated))
+	o.observe(cacheGatePositiveTestFrame(request), false)
+	internal := make([]byte, 8)
+	binary.LittleEndian.PutUint64(internal, 444)
+	response := cacheGatePositiveTestCompound(
+		cacheGatePositiveTestPacket(t, wire.Create, 0, wire.FlagResponse, 0, wire.CreateResponseBody(wire.CreateResult{FileID: id, FileInformation: wire.FileInformation{EndOfFile: 23, WriteTime: 456}})),
+		cacheGatePositiveTestPacket(t, wire.QueryInfo, 1, wire.FlagResponse|wire.FlagRelated, 0, wire.BufferResponseBody(internal)),
+	)
+	o.observe(cacheGatePositiveTestFrame(response), true)
+	if o.incomplete || len(o.records) != 4 {
+		t.Fatalf("records=%+v", o.records)
+	}
+	if o.records[2].EOF != 23 || o.records[2].MTime != 456 || o.records[3].FileID != hex.EncodeToString(id[:]) || o.records[3].InternalID != 444 {
+		t.Fatalf("related CREATE result lost: %+v", o.records)
+	}
+}
+
+func TestGatePositiveWireErrorsPendingAndSecrets(t *testing.T) {
+	o := cacheGatePositiveTestObserver()
+	body := make([]byte, 8)
+	binary.LittleEndian.PutUint16(body, 9)
+	body = append(body, []byte("DO-NOT-LOG-AUTH-TOKEN")...)
+	o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.SessionSetup, 4, 0, 0, body)), false)
+	o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.SessionSetup, 4, wire.FlagResponse, 0xc0000016, body)), true)
+	notify := make([]byte, 32)
+	binary.LittleEndian.PutUint16(notify, 32)
+	o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.ChangeNotify, 5, 0, 0, notify)), false)
+	errorBody := make([]byte, 8)
+	binary.LittleEndian.PutUint16(errorBody, 9)
+	o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.ChangeNotify, 5, wire.FlagResponse|wire.FlagAsync, 0x103, errorBody)), true)
+	if len(o.pending) != 1 {
+		t.Fatal("pending response lost correlation")
+	}
+	o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.ChangeNotify, 5, wire.FlagResponse|wire.FlagAsync, 0xc0000120, errorBody)), true)
+	encoded, err := json.Marshal(o.records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.incomplete || len(o.pending) != 0 || bytes.Contains(encoded, []byte("DO-NOT-LOG-AUTH-TOKEN")) {
+		t.Fatalf("status or secret handling: %s", encoded)
+	}
+	if o.records[2].Command != wire.ChangeNotify {
+		t.Fatal("notification command not recorded")
+	}
+}
+
+func TestGatePositiveWireMalformedAndBounds(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func(*cacheGatePositiveFrameObserver)
+	}{
+		{"partial prefix", func(o *cacheGatePositiveFrameObserver) { o.observe([]byte{0, 0}, false); o.finish(); o.finish() }},
+		{"partial body", func(o *cacheGatePositiveFrameObserver) {
+			o.observe([]byte{0, 0, 0, 64, 0xfe, 'S', 'M', 'B'}, true)
+			o.finish()
+		}},
+		{"oversized frame", func(o *cacheGatePositiveFrameObserver) { o.observe([]byte{0, 0x10, 0, 1}, false) }},
+		{"transformed frame", func(o *cacheGatePositiveFrameObserver) {
+			o.observe(cacheGatePositiveTestFrame([]byte("\xfdSMB")), true)
+		}},
+		{"invalid compound offset", func(o *cacheGatePositiveFrameObserver) {
+			p := cacheGatePositiveTestQuery(t, 1, 4, wire.FileID{}, 0)
+			binary.LittleEndian.PutUint32(p[20:24], 64)
+			o.observe(cacheGatePositiveTestFrame(p), false)
+		}},
+		{"truncated query result", func(o *cacheGatePositiveFrameObserver) {
+			o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestQuery(t, 1, 4, wire.FileID{}, 0)), false)
+			o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.QueryInfo, 1, wire.FlagResponse, 0, wire.BufferResponseBody(make([]byte, 39)))), true)
+		}},
+		{"unmatched response", func(o *cacheGatePositiveFrameObserver) {
+			o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.QueryInfo, 1, wire.FlagResponse, 0, wire.BufferResponseBody(make([]byte, 40)))), true)
+		}},
+		{"command mismatch", func(o *cacheGatePositiveFrameObserver) {
+			o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestQuery(t, 1, 4, wire.FileID{}, 0)), false)
+			o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.Read, 1, wire.FlagResponse, 0, wire.ReadResponseBody(nil, 0))), true)
+		}},
+		{"pending bound", func(o *cacheGatePositiveFrameObserver) {
+			for i := 0; i <= cacheGatePositiveMaxPending; i++ {
+				o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestQuery(t, uint64(i), 4, wire.FileID{}, 0)), false)
+			}
+		}},
+		{"record bound", func(o *cacheGatePositiveFrameObserver) {
+			o.records = make([]cacheGatePositiveWireRecord, cacheGatePositiveMaxRecords)
+			o.record(cacheGatePositiveWireRecord{})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := cacheGatePositiveTestObserver()
+			test.run(o)
+			if !o.incomplete {
+				t.Fatalf("malformed evidence accepted: %+v", o.records)
+			}
+			if len(o.pending) > cacheGatePositiveMaxPending || len(o.records) > cacheGatePositiveMaxRecords {
+				t.Fatal("bounded storage exceeded")
+			}
+		})
+	}
+}
+
+func TestGatePositiveWireBootstrapAndContextBounds(t *testing.T) {
+	o := cacheGatePositiveTestObserver()
+	bootstrap := make([]byte, 35)
+	copy(bootstrap, "\xffSMB")
+	bootstrap[4] = 0x72
+	dialect := []byte("\x02SMB 2.???\x00")
+	binary.LittleEndian.PutUint16(bootstrap[33:35], uint16(len(dialect)))
+	bootstrap = append(bootstrap, dialect...)
+	o.observe(cacheGatePositiveTestFrame(bootstrap), false)
+	body := make([]byte, 64)
+	binary.LittleEndian.PutUint16(body, 65)
+	o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.Negotiate, 0, wire.FlagResponse, 0, body)), true)
+	if o.incomplete || len(o.records) != 2 || !o.records[0].Bootstrap {
+		t.Fatalf("bootstrap rejected: %+v", o.records)
+	}
+	for _, test := range []struct {
+		name   string
+		length uint32
+		next   uint32
+	}{
+		{"valid", 32, 0}, {"truncated lease", 31, 0}, {"overflow data", ^uint32(0), 0}, {"invalid next", 32, 8},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			context := make([]byte, 56)
+			binary.LittleEndian.PutUint32(context, test.next)
+			binary.LittleEndian.PutUint16(context[4:6], 16)
+			binary.LittleEndian.PutUint16(context[6:8], 4)
+			binary.LittleEndian.PutUint16(context[10:12], 24)
+			binary.LittleEndian.PutUint32(context[12:16], test.length)
+			copy(context[16:20], "RqLs")
+			binary.LittleEndian.PutUint32(context[40:44], 0)
+			r := cacheGatePositiveWireRecord{}
+			packet := append(make([]byte, 152), context...)
+			valid := cacheGatePositiveContexts(packet, 152, uint32(len(context)), 152, &r)
+			if valid != (test.name == "valid") {
+				t.Fatalf("context validity=%v", valid)
+			}
+			if valid && (!r.LeasePresent || r.LeaseState != 0) {
+				t.Fatalf("lease state missing: %+v", r)
+			}
+		})
+	}
+}
+
+func TestGatePositiveWireConnectionIsolationAndReset(t *testing.T) {
+	// This test owns the registry while no native bridge is running.
+	cacheGateResetPositiveWire()
+	defer cacheGateResetPositiveWire()
+	a := cacheGateNewPositiveFrameObserver()
+	b := cacheGateNewPositiveFrameObserver()
+	a.emit = func(cacheGatePositiveWireRecord) {}
+	b.emit = a.emit
+	a.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestQuery(t, 1, 4, wire.FileID{1}, 0)), false)
+	b.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.QueryInfo, 1, wire.FlagResponse, 0, wire.BufferResponseBody(make([]byte, 40)))), true)
+	records, incomplete := cacheGatePositiveWireSnapshot()
+	if !incomplete || len(records) < 2 || !b.incomplete || a.incomplete {
+		t.Fatalf("cross-connection association accepted: %+v", records)
+	}
+	cacheGateResetPositiveWire()
+	records, incomplete = cacheGatePositiveWireSnapshot()
+	if incomplete || len(records) != 0 {
+		t.Fatal("reset retained evidence")
+	}
+	for i := 0; i < 17; i++ {
+		cacheGateNewPositiveFrameObserver()
+	}
+	_, incomplete = cacheGatePositiveWireSnapshot()
+	if !incomplete {
+		t.Fatal("connection bound was not reported")
+	}
+}
+
+func TestGatePositiveWireSensitiveCreateContextExcluded(t *testing.T) {
+	o := cacheGatePositiveTestObserver()
+	secret := []byte("DO-NOT-LOG-CONTEXT-PAYLOAD")
+	context := make([]byte, 24+len(secret))
+	binary.LittleEndian.PutUint16(context[4:6], 16)
+	binary.LittleEndian.PutUint16(context[6:8], 4)
+	binary.LittleEndian.PutUint16(context[10:12], 24)
+	binary.LittleEndian.PutUint32(context[12:16], uint32(len(secret)))
+	copy(context[16:20], "Test")
+	copy(context[24:], secret)
+	create := make([]byte, 56)
+	binary.LittleEndian.PutUint16(create, 57)
+	binary.LittleEndian.PutUint32(create[48:52], 120)
+	binary.LittleEndian.PutUint32(create[52:56], uint32(len(context)))
+	create = append(create, context...)
+	o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.Create, 9, 0, 0, create)), false)
+	encoded, err := json.Marshal(o.records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.incomplete || strings.Contains(string(encoded), string(secret)) {
+		t.Fatalf("context capture invalid: %s", encoded)
+	}
+}
+
+func TestGatePositiveWireDelayedResponseJoinsRequestInterval(t *testing.T) {
+	o := cacheGatePositiveTestObserver()
+	nativeStart := time.Now().UTC()
+	o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestQuery(t, 50, 4, wire.FileID{3}, 0)), false)
+	nativeEnd := time.Now().UTC()
+	o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.QueryInfo, 50, wire.FlagResponse, 0, wire.BufferResponseBody(make([]byte, 40)))), true)
+	if o.incomplete || len(o.records) != 2 {
+		t.Fatalf("records=%+v", o.records)
+	}
+	req, res := o.records[0], o.records[1]
+	if req.Response || !res.Response || req.Connection != res.Connection || req.MessageID != res.MessageID || req.Command != res.Command {
+		t.Fatal("request response join lost")
+	}
+	if req.At.Before(nativeStart) || req.At.After(nativeEnd) || res.At.Before(nativeEnd) {
+		t.Fatalf("request interval [%v,%v], request=%v response=%v", nativeStart, nativeEnd, req.At, res.At)
+	}
+}
+
+func TestGatePositiveWireIncompleteSelectedBufferResults(t *testing.T) {
+	for _, status := range []uint32{0x80000005, 0xc0000023} {
+		o := cacheGatePositiveTestObserver()
+		o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestQuery(t, 70, 4, wire.FileID{4}, 0)), false)
+		body := make([]byte, 8)
+		binary.LittleEndian.PutUint16(body, 9)
+		o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.QueryInfo, 70, wire.FlagResponse, status, body)), true)
+		if !o.incomplete || o.records[1].Incomplete == "" || o.records[1].Status != status {
+			t.Fatalf("partial metadata result accepted: %+v", o.records)
+		}
+	}
+}
+
+func TestGatePositiveWireNetworkOpenInformation(t *testing.T) {
+	// FILE_NETWORK_OPEN_INFORMATION has six 64-bit values followed by attributes.
+	// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_file_network_open_information
+	for _, test := range []struct {
+		name   string
+		length int
+	}{
+		{"truncated", 55}, {"complete", 56}, {"overlong", 57},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := cacheGatePositiveTestObserver()
+			id := wire.FileID{3, 4}
+			o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestQuery(t, 34, 34, id, 0)), false)
+			data := make([]byte, test.length)
+			const mtime uint64 = 0x0123456789abcdef
+			const eof uint64 = 0x0000000123456789
+			binary.LittleEndian.PutUint64(data[8:16], 111)
+			binary.LittleEndian.PutUint64(data[16:24], mtime)
+			binary.LittleEndian.PutUint64(data[24:32], 222)
+			binary.LittleEndian.PutUint64(data[32:40], 333)
+			binary.LittleEndian.PutUint64(data[40:48], eof)
+			o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.QueryInfo, 34, wire.FlagResponse, 0, wire.BufferResponseBody(data))), true)
+			if len(o.records) != 2 {
+				t.Fatalf("records=%+v", o.records)
+			}
+			r := o.records[1]
+			if test.length != 56 {
+				if !o.incomplete || r.Incomplete == "" {
+					t.Fatalf("invalid network information length accepted: %+v", r)
+				}
+				return
+			}
+			if o.incomplete || r.QueryClass != 34 || r.QueryType != 1 || r.FileID != hex.EncodeToString(id[:]) || r.MTime != mtime || r.EOF != eof {
+				t.Fatalf("network information decode or correlation lost: %+v", r)
+			}
+		})
+	}
+}
+
+func TestGatePositiveWireIncompleteNetworkOpenBufferResults(t *testing.T) {
+	for _, status := range []uint32{0x80000005, 0xc0000023} {
+		o := cacheGatePositiveTestObserver()
+		o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestQuery(t, 34, 34, wire.FileID{3, 4}, 0)), false)
+		body := make([]byte, 8)
+		binary.LittleEndian.PutUint16(body, 9)
+		o.observe(cacheGatePositiveTestFrame(cacheGatePositiveTestPacket(t, wire.QueryInfo, 34, wire.FlagResponse, status, body)), true)
+		if !o.incomplete || len(o.records) != 2 || o.records[1].Incomplete == "" || o.records[1].Status != status {
+			t.Fatalf("partial network metadata accepted: %+v", o.records)
+		}
+	}
+}
+
+func cacheGateCompleteProofFixture(t *testing.T, proof func(*testing.T)) bool {
+	t.Helper()
+	return t.Run("completed_protocol_proof_fixture", proof)
+}
+
+func TestGateProofCleanupPrecedesMeasuredFixture(t *testing.T) {
+	active := false
+	closed := false
+	if !cacheGateCompleteProofFixture(t, func(t *testing.T) {
+		active = true
+		t.Cleanup(func() { active = false; closed = true })
+	}) {
+		t.Fatal("proof setup failed")
+	}
+	if active || !closed {
+		t.Fatal("measured fixture could overlap proof ownership")
+	}
+	active = true
+	if !closed {
+		t.Fatal("proof cleanup was deferred into measurement")
+	}
+	active = false
+}

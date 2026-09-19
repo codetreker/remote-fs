@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -117,7 +118,7 @@ func TestSignalDuringPlainOpenPreservesRetryableCancellation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if after != before || string(body) != "original" {
+			if !reflect.DeepEqual(after, before) || string(body) != "original" {
 				t.Fatalf("plain open changed file: before=%+v after=%+v body=%q", before, after, body)
 			}
 			if err := backing.Remove(t.Context(), "artifact"); err != nil {
@@ -232,17 +233,17 @@ func (s *interruptedOpenStorage) NewFileSession(ctx context.Context, o storage.F
 	if err != nil {
 		return nil, err
 	}
-	return &interruptedOpenSession{FileSession: session, observe: s}, nil
+	return &interruptedOpenSession{capableTestSession: testSessionCapabilities(session), observe: s}, nil
 }
 
 type interruptedOpenSession struct {
-	storage.FileSession
+	capableTestSession
 	observe *interruptedOpenStorage
 }
 
-func (s *interruptedOpenSession) OpenFile(ctx context.Context, path string, o storage.FileOpenOptions) (storage.File, error) {
+func (s *interruptedOpenSession) OpenAt(ctx context.Context, name storage.ChildName, o storage.OpenAtOptions) (storage.OpenResult, error) {
 	s.observe.entered <- ctx
-	file, err := s.FileSession.OpenFile(ctx, path, o)
+	file, err := s.AtomicFileOpener.OpenAt(ctx, name, o)
 	s.observe.results <- openSignalResult{err: err, acks: s.observe.gate.acks.Load(), closed: s.observe.gate.closed.Load()}
 	return file, err
 }
@@ -276,7 +277,7 @@ func (g *openReplyGate) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 	}
 	switch request.Op {
-	case storage.OpFileOpen:
+	case storage.OpFileOpenAt:
 		g.opens.Add(1)
 	case storage.OpFileAck:
 		g.acks.Add(1)
@@ -291,7 +292,7 @@ func (g *openReplyGate) RoundTrip(r *http.Request) (*http.Response, error) {
 		g.closed.Add(1)
 		g.closedEvents <- struct{}{}
 	}
-	if request.Op != storage.OpFileOpen {
+	if request.Op != storage.OpFileOpenAt {
 		return response, nil
 	}
 	hold := false

@@ -1,0 +1,11 @@
+--- a/packages/smb/commands_files.go
++++ b/packages/smb/commands_files.go
+@@ -982,7 +982,7 @@
+ 	case 5:
+ 		name := wire.EncodeUTF16("remote-fs")
+ 		b := make([]byte, 12+len(name))
+-		smbLE.PutUint32(b, 0x2|0x4)
++		smbLE.PutUint32(b, 0x2|0x4|0x400)
+ 		smbLE.PutUint32(b[4:], 255)
+ 		smbLE.PutUint32(b[8:], uint32(len(name)))
+ 		copy(b[12:], name)

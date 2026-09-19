@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
@@ -83,37 +85,39 @@ func TestLabeledReadCancellationSurvivesTransactionCleanup(t *testing.T) {
 }
 
 func TestReadContextAutomaticRollbackPreservesTheOperationResult(t *testing.T) {
-	store, err := Open(t.Context(), t.TempDir()+"/metastore.db", "workspace", 4096, DefaultWindow())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Errorf("closing store: %v", err)
-		}
-	})
 	for _, successful := range []bool{false, true} {
 		t.Run(fmt.Sprintf("successful callback %t", successful), func(t *testing.T) {
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-			err := store.inspect(ctx, func(tx *sql.Tx) error {
-				var one int
-				if err := tx.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil {
-					return err
+			synctest.Test(t, func(t *testing.T) {
+				store, err := Open(t.Context(), t.TempDir()+"/metastore.db", "workspace", 4096, DefaultWindow())
+				if err != nil {
+					t.Fatal(err)
 				}
-				cancel()
-				waitForReadRollback(t, store.read)
-				if successful {
-					return nil
+				t.Cleanup(func() {
+					if err := store.Close(); err != nil {
+						t.Errorf("closing store: %v", err)
+					}
+				})
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				err = store.inspect(ctx, func(tx *sql.Tx) error {
+					var one int
+					if err := tx.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil {
+						return err
+					}
+					cancel()
+					synctest.Wait()
+					if successful {
+						return nil
+					}
+					return ctx.Err()
+				})
+				if storage.ErrnoOf(err) != syscall.EINTR || !errors.Is(err, context.Canceled) || errors.Is(err, syscall.EIO) {
+					t.Fatalf("read after database/sql automatic rollback = %v, want cancellation without EIO", err)
 				}
-				return ctx.Err()
+				if _, err := store.Stat(t.Context(), "."); err != nil {
+					t.Fatalf("canceled read poisoned subsequent reads: %v", err)
+				}
 			})
-			if storage.ErrnoOf(err) != syscall.EINTR || !errors.Is(err, context.Canceled) || errors.Is(err, syscall.EIO) {
-				t.Fatalf("read after database/sql automatic rollback = %v, want cancellation without EIO", err)
-			}
-			if _, err := store.Stat(t.Context(), "."); err != nil {
-				t.Fatalf("canceled read poisoned subsequent reads: %v", err)
-			}
 		})
 	}
 }
@@ -148,20 +152,6 @@ func TestCanceledReadOperationsReturnInterruption(t *testing.T) {
 				t.Fatalf("canceled %s = %v, want interruption without EIO", operation.name, err)
 			}
 		})
-	}
-}
-
-func waitForReadRollback(t *testing.T, pool *sql.DB) {
-	t.Helper()
-	deadline := time.NewTimer(time.Second)
-	defer deadline.Stop()
-	for pool.Stats().InUse != 0 {
-		select {
-		case <-deadline.C:
-			t.Fatal("database/sql did not release the canceled transaction's connection")
-		default:
-			runtime.Gosched()
-		}
 	}
 }
 
@@ -290,7 +280,7 @@ func TestWriterCloseFailureIsJoinedWhenReaderPoolOpenFails(t *testing.T) {
 				}
 				return nil, primary
 			},
-			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64) (int64, int64, error) {
+			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64, int64) (int64, int64, error) {
 				t.Fatal("prepare ran after reader pool open failed")
 				return 0, 0, nil
 			},
@@ -346,7 +336,7 @@ func TestBothPoolCloseFailuresAreJoinedWhenPrepareFails(t *testing.T) {
 				}
 				return snapshot, nil
 			},
-			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64) (int64, int64, error) {
+			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64, int64) (int64, int64, error) {
 				return 0, 0, primary
 			},
 			closePool: func(db *sql.DB) error {
@@ -438,7 +428,7 @@ func TestReaderPoolCloseFailuresAreJoinedWhenSnapshotPoolOpenFails(t *testing.T)
 				}
 				return nil, primary
 			},
-			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64) (int64, int64, error) {
+			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64, int64) (int64, int64, error) {
 				t.Fatal("prepare ran after snapshot reader pool open failed")
 				return 0, 0, nil
 			},
@@ -579,16 +569,17 @@ func TestOpenCleanupFailureRetainsDatabaseOwnership(t *testing.T) {
 }
 
 func TestTerminalPoolCloseReportingFailuresAreCached(t *testing.T) {
-	writer, err := sql.Open("sqlite", ":memory:")
+	database := t.TempDir() + "/terminal-close.db"
+	writer, err := openPool(t.Context(), database, true, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := sql.Open("sqlite", ":memory:")
+	reader, err := openPool(t.Context(), database, false, 1)
 	if err != nil {
 		writer.Close()
 		t.Fatal(err)
 	}
-	snapshot, err := sql.Open("sqlite", ":memory:")
+	snapshot, err := openPool(t.Context(), database, false, 1)
 	if err != nil {
 		writer.Close()
 		reader.Close()
@@ -599,7 +590,7 @@ func TestTerminalPoolCloseReportingFailuresAreCached(t *testing.T) {
 	readerReporting := errors.New("reader close reporting failed after the pool closed")
 	snapshotReporting := errors.New("snapshot close reporting failed after the pool closed")
 	store, err := openWithHooks(
-		t.Context(), "terminal-close", "workspace", "", 0, Options{Window: DefaultWindow()},
+		t.Context(), database, "workspace", "", 0, Options{Window: DefaultWindow()},
 		storeOpenHooks{
 			openPool: func(_ context.Context, _ string, isWriter bool, _ int) (*sql.DB, error) {
 				if isWriter {
@@ -851,7 +842,7 @@ func TestBoundOpenersPreserveIdentityAndEnforceConfiguredBacklog(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if after, err := s.Stat(t.Context(), "kept"); err != nil || after != before {
+			if after, err := s.Stat(t.Context(), "kept"); err != nil || !reflect.DeepEqual(after, before) {
 				t.Fatalf("reopened node = %+v, %v; want %+v", after, err, before)
 			}
 		})

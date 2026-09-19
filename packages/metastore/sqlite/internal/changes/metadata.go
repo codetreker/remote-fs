@@ -4,13 +4,12 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
-	"io/fs"
-	"math"
 	"syscall"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // changeMetadataColumns carries every scalar beside its SQLite storage class and only the
@@ -26,7 +25,7 @@ const changeMetadataColumns = `
 	CASE WHEN typeof(from_parent) IN ('integer', 'null') THEN from_parent END, typeof(from_parent),
 	COALESCE(length(CAST(from_name AS BLOB)), 0), typeof(from_name),
 	CASE WHEN typeof(node) IN ('integer', 'null') THEN node END, typeof(node),
-	CASE WHEN typeof(mode) IN ('integer', 'null') THEN mode END, typeof(mode),
+	CASE WHEN typeof(node_kind) IN ('integer', 'null') THEN node_kind END, typeof(node_kind),
 	CASE WHEN typeof(size) IN ('integer', 'null') THEN size END, typeof(size),
 	CASE WHEN typeof(atime_sec) IN ('integer', 'null') THEN atime_sec END, typeof(atime_sec),
 	CASE WHEN typeof(atime_nsec) IN ('integer', 'null') THEN atime_nsec END, typeof(atime_nsec),
@@ -34,7 +33,15 @@ const changeMetadataColumns = `
 	CASE WHEN typeof(mtime_nsec) IN ('integer', 'null') THEN mtime_nsec END, typeof(mtime_nsec),
 	COALESCE(length(CAST(content AS BLOB)), 0), typeof(content),
 	CASE WHEN typeof(recorded_sec) = 'integer' THEN recorded_sec END, typeof(recorded_sec),
-	CASE WHEN typeof(recorded_nsec) = 'integer' THEN recorded_nsec END, typeof(recorded_nsec)`
+	CASE WHEN typeof(recorded_nsec) = 'integer' THEN recorded_nsec END, typeof(recorded_nsec),
+ CASE WHEN typeof(birth_sec) IN ('integer','null') THEN birth_sec END, typeof(birth_sec),
+ CASE WHEN typeof(birth_nsec) IN ('integer','null') THEN birth_nsec END, typeof(birth_nsec),
+ CASE WHEN typeof(change_sec) IN ('integer','null') THEN change_sec END, typeof(change_sec),
+ CASE WHEN typeof(change_nsec) IN ('integer','null') THEN change_nsec END, typeof(change_nsec),
+ COALESCE(length(CAST(metadata AS BLOB)),0),typeof(metadata),
+ COALESCE(length(CAST(link_target AS BLOB)),0),typeof(link_target),
+ COALESCE(length(CAST(directory_revision AS BLOB)),0),typeof(directory_revision),
+ CASE WHEN typeof(directory_revision)='blob' AND length(directory_revision)<=64 THEN directory_revision END`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -44,14 +51,15 @@ func scanChangeMetadata(
 	row rowScanner,
 	expectedVolume int64,
 ) (metastore.Change, metastore.ChangePayloadLengths, int64, error) {
+	var extra changeExtraMetadata
 	var (
 		positionRaw, previousRaw, volumeRaw, kindRaw, parentRaw      any
-		fromParentRaw, idRaw, modeRaw, sizeRaw                       any
+		fromParentRaw, idRaw, nodeKindRaw, sizeRaw                   any
 		atimeSecRaw, atimeNsecRaw, mtimeSecRaw, mtimeNsecRaw         any
 		recordedSecRaw, recordedNsecRaw                              any
 		positionType, previousType, volumeType, kindType, parentType string
 		nameType, fromParentType, fromNameType                       string
-		idType, modeType, sizeType                                   string
+		idType, nodeKindType, sizeType                               string
 		atimeSecType, atimeNsecType, mtimeSecType, mtimeNsecType     string
 		contentType, recordedSecType, recordedNsecType               string
 		lengths                                                      metastore.ChangePayloadLengths
@@ -61,11 +69,15 @@ func scanChangeMetadata(
 		&volumeRaw, &volumeType, &kindRaw, &kindType,
 		&parentRaw, &parentType, &lengths.Name, &nameType,
 		&fromParentRaw, &fromParentType, &lengths.FromName, &fromNameType,
-		&idRaw, &idType, &modeRaw, &modeType, &sizeRaw, &sizeType,
+		&idRaw, &idType, &nodeKindRaw, &nodeKindType, &sizeRaw, &sizeType,
 		&atimeSecRaw, &atimeSecType, &atimeNsecRaw, &atimeNsecType,
 		&mtimeSecRaw, &mtimeSecType, &mtimeNsecRaw, &mtimeNsecType,
 		&lengths.Content, &contentType,
 		&recordedSecRaw, &recordedSecType, &recordedNsecRaw, &recordedNsecType,
+		&extra.birthSec, &extra.birthSecType, &extra.birthNsec, &extra.birthNsecType,
+		&extra.changeSec, &extra.changeSecType, &extra.changeNsec, &extra.changeNsecType,
+		&lengths.Metadata, &extra.metadataType, &lengths.Target, &extra.targetType,
+		&extra.revisionLength, &extra.revisionType, &extra.revision,
 	); err != nil {
 		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
 	}
@@ -97,9 +109,9 @@ func scanChangeMetadata(
 	if !ok {
 		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "node", idType)
 	}
-	mode, ok := nullableStoredInteger(modeRaw, modeType)
+	nodeKind, ok := nullableStoredInteger(nodeKindRaw, nodeKindType)
 	if !ok {
-		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "mode", modeType)
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "node_kind", nodeKindType)
 	}
 	size, ok := nullableStoredInteger(sizeRaw, sizeType)
 	if !ok {
@@ -146,15 +158,18 @@ func scanChangeMetadata(
 	if id.Valid {
 		change.Node = &metastore.Node{
 			ID:         id.Int64,
-			Mode:       fs.FileMode(mode.Int64),
+			Kind:       storage.NodeKind(nodeKind.Int64),
 			Size:       size.Int64,
 			AccessTime: sqlvalue.LoadedTime(atimeSec.Int64, int32(atimeNsec.Int64)),
 			ModTime:    sqlvalue.LoadedTime(mtimeSec.Int64, int32(mtimeNsec.Int64)),
 		}
 	}
 	if err := validateChangeMetadata(change, lengths, volume, expectedVolume,
-		nameType, fromNameType, contentType, id, mode, size, atimeSec, atimeNsec,
+		nameType, fromNameType, contentType, id, nodeKind, size, atimeSec, atimeNsec,
 		mtimeSec, mtimeNsec, recordedSec, recordedNsec); err != nil {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
+	}
+	if err := extra.apply(change.Node, lengths); err != nil {
 		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
 	}
 	if previous < 0 || previous >= position {
@@ -192,7 +207,7 @@ func validateChangeMetadata(
 	lengths metastore.ChangePayloadLengths,
 	volume, expectedVolume int64,
 	nameType, fromNameType, contentType string,
-	id, mode, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec sql.NullInt64,
+	id, nodeKind, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec sql.NullInt64,
 	recordedSec, recordedNsec int64,
 ) error {
 	if change.Position <= 0 || volume <= 0 || volume != expectedVolume || change.Parent < 0 ||
@@ -216,7 +231,7 @@ func validateChangeMetadata(
 		return fmt.Errorf("%w: change %d has an incomplete source location", syscall.EIO, change.Position)
 	}
 	wantNode := change.Kind != metastore.Removed
-	nodeFields := []sql.NullInt64{id, mode, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec}
+	nodeFields := []sql.NullInt64{id, nodeKind, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec}
 	for _, field := range nodeFields {
 		if field.Valid != wantNode {
 			return fmt.Errorf("%w: change %d has an incomplete node", syscall.EIO, change.Position)
@@ -230,18 +245,18 @@ func validateChangeMetadata(
 		if contentType == "text" && lengths.Content == 0 {
 			return fmt.Errorf("%w: change %d carries an empty content key", syscall.EIO, change.Position)
 		}
-		if id.Int64 <= 0 || size.Int64 < 0 || mode.Int64 < 0 || mode.Int64 > math.MaxUint32 ||
+		if id.Int64 <= 0 || size.Int64 < 0 || nodeKind.Int64 < 0 || nodeKind.Int64 > int64(storage.NodeSymlink) ||
 			atimeNsec.Int64 < 0 || atimeNsec.Int64 >= int64(time.Second) ||
 			mtimeNsec.Int64 < 0 || mtimeNsec.Int64 >= int64(time.Second) {
 			return fmt.Errorf("%w: change %d carries invalid node metadata", syscall.EIO, change.Position)
 		}
-		if nodeType := fs.FileMode(mode.Int64).Type(); nodeType != 0 && nodeType != fs.ModeDir {
-			return fmt.Errorf("%w: change %d carries unsupported node type %v", syscall.EIO, change.Position, fs.FileMode(mode.Int64).Type())
+		if nodeKind.Int64 < int64(storage.NodeRegular) {
+			return fmt.Errorf("%w: change %d carries unsupported node type %d", syscall.EIO, change.Position, nodeKind.Int64)
 		}
-		if fs.FileMode(mode.Int64).IsDir() && (size.Int64 != 0 || contentType != "null") {
+		if nodeKind.Int64 == int64(storage.NodeDirectory) && (size.Int64 != 0 || contentType != "null") {
 			return fmt.Errorf("%w: change %d carries bytes for a directory", syscall.EIO, change.Position)
 		}
-		if fs.FileMode(mode.Int64).Type() == 0 && contentType == "null" && size.Int64 != 0 {
+		if nodeKind.Int64 == int64(storage.NodeRegular) && contentType == "null" && size.Int64 != 0 {
 			return fmt.Errorf("%w: change %d carries file bytes without a content key", syscall.EIO, change.Position)
 		}
 	}
@@ -281,4 +296,58 @@ func validateChangePayload(change metastore.Change, name, fromName []byte, conte
 func validStoredComponent(name []byte) bool {
 	return len(name) != 0 && !bytes.Equal(name, []byte(".")) && !bytes.Equal(name, []byte("..")) &&
 		bytes.IndexByte(name, '/') < 0 && bytes.IndexByte(name, 0) < 0
+}
+
+type changeExtraMetadata struct {
+	birthSec, birthNsec, changeSec, changeNsec                 any
+	birthSecType, birthNsecType, changeSecType, changeNsecType string
+	metadataType, targetType, revisionType                     string
+	revisionLength                                             int64
+	revision                                                   []byte
+}
+
+func optionalChangeTime(secRaw any, secType string, nsecRaw any, nsecType string) (*time.Time, error) {
+	sec, secOK := nullableStoredInteger(secRaw, secType)
+	nsec, nsecOK := nullableStoredInteger(nsecRaw, nsecType)
+	if !secOK || !nsecOK || sec.Valid != nsec.Valid || nsec.Valid && (nsec.Int64 < 0 || nsec.Int64 >= int64(time.Second)) {
+		return nil, fmt.Errorf("invalid optional event time: %w", syscall.EIO)
+	}
+	if !sec.Valid {
+		return nil, nil
+	}
+	value := sqlvalue.LoadedTime(sec.Int64, int32(nsec.Int64))
+	return &value, nil
+}
+
+func (extra changeExtraMetadata) apply(node *metastore.Node, lengths metastore.ChangePayloadLengths) error {
+	birth, err := optionalChangeTime(extra.birthSec, extra.birthSecType, extra.birthNsec, extra.birthNsecType)
+	if err != nil {
+		return err
+	}
+	changed, err := optionalChangeTime(extra.changeSec, extra.changeSecType, extra.changeNsec, extra.changeNsecType)
+	if err != nil {
+		return err
+	}
+	if node == nil {
+		if birth != nil || changed != nil || extra.metadataType != "null" || extra.targetType != "null" || extra.revisionType != "null" || lengths.Metadata != 0 || lengths.Target != 0 || extra.revisionLength != 0 {
+			return fmt.Errorf("removed change carries node payload: %w", syscall.EIO)
+		}
+		return nil
+	}
+	if extra.metadataType != "blob" || lengths.Metadata < 6 || lengths.Metadata > storage.MaxMetadataBytes || extra.targetType != "blob" || lengths.Target < 0 || lengths.Target > storage.MaxLinkTargetBytes {
+		return fmt.Errorf("invalid event metadata or target representation: %w", syscall.EIO)
+	}
+	if extra.revisionType != "null" && extra.revisionType != "blob" || extra.revisionLength < 0 || extra.revisionLength > storage.MaxObservationTokenBytes || int64(len(extra.revision)) != extra.revisionLength || node.Kind != storage.NodeDirectory && extra.revisionLength != 0 {
+		return fmt.Errorf("invalid event directory revision: %w", syscall.EIO)
+	}
+	if node.Kind == storage.NodeSymlink {
+		if lengths.Target == 0 || lengths.Target != node.Size || lengths.Content != 0 {
+			return fmt.Errorf("invalid symbolic link event payload: %w", syscall.EIO)
+		}
+	} else if lengths.Target != 0 {
+		return fmt.Errorf("non-link event carries a link target: %w", syscall.EIO)
+	}
+	node.BirthTime, node.ChangeTime = birth, changed
+	node.DirectoryRevision = bytes.Clone(extra.revision)
+	return nil
 }

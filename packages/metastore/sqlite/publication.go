@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"syscall"
@@ -90,7 +91,7 @@ func (n sqliteNative) Discover(ctx context.Context, path string, adopt func(lock
 		if err != nil {
 			return err
 		}
-		if !node.Mode.IsRegular() {
+		if node.Kind != storage.NodeRegular {
 			return locking.Wrap(locking.UnsupportedTarget, "only an existing regular file can be locked", nil)
 		}
 		key = n.store.backendKey(node.ID)
@@ -115,7 +116,7 @@ func (n sqliteNative) Guard(ctx context.Context, key locking.BackendKey, transit
 		if err != nil {
 			return err
 		}
-		if !node.Mode.IsRegular() {
+		if node.Kind != storage.NodeRegular {
 			return locking.Wrap(locking.UnsupportedTarget, "the resolved node is not a regular file", nil)
 		}
 		return nil
@@ -156,16 +157,23 @@ type volumeIntent struct {
 	kind    locking.MutationKind
 	paths   []string
 	node    int64
+	nodes   []int64
+	added   int64
+	scope   storage.UseScope
 	cleanup bool
 }
 
 type volumePublication struct {
-	intent   volumeIntent
-	targets  []locking.BackendKey
-	nodes    []int64
-	retired  []locking.BackendKey
-	previous int64
-	next     int64
+	intent            volumeIntent
+	targets           []locking.BackendKey
+	nodes             []int64
+	retired           []locking.BackendKey
+	access            []metastore.FileState
+	removed           int64
+	recoveredBefore   map[int64]int64
+	recoveredReleased int64
+	previous          int64
+	next              int64
 }
 
 func (s *Store) mutateVolume(ctx context.Context, kind locking.MutationKind, paths []string, mutate func(*sql.Tx) error) error {
@@ -173,47 +181,98 @@ func (s *Store) mutateVolume(ctx context.Context, kind locking.MutationKind, pat
 }
 
 func (s *Store) prepareVolumePublication(ctx context.Context, tx *sql.Tx, intent volumeIntent) (*volumePublication, error) {
-	publication := &volumePublication{intent: intent}
+	publication := &volumePublication{intent: intent, next: intent.added}
+	ids := intent.nodes
 	if intent.node != 0 {
-		state, err := s.fileState(ctx, tx, intent.node)
-		if err != nil {
-			return nil, err
-		}
-		if state.Mode.IsRegular() && !state.Detached {
-			publication.nodes = []int64{state.ID}
-			publication.targets = []locking.BackendKey{s.backendKey(state.ID)}
-		}
-		if intent.kind == locking.WriteMutation || intent.cleanup {
-			publication.previous = state.Size
-		}
-		return publication, nil
+		ids = []int64{intent.node}
 	}
-	nodes := make([]metastore.Node, len(intent.paths))
-	seen := make(map[int64]bool, len(intent.paths))
-	for i, path := range intent.paths {
-		node, err := s.resolve(ctx, tx, path)
-		if errors.Is(err, syscall.ENOENT) {
-			continue
+	if ids != nil {
+		publication.access = make([]metastore.FileState, len(ids))
+		for i, id := range ids {
+			if id == 0 {
+				continue
+			}
+			state, err := s.fileState(ctx, tx, id)
+			if err != nil {
+				return nil, err
+			}
+			publication.access[i] = state
 		}
+	} else {
+		publication.access = make([]metastore.FileState, len(intent.paths))
+		for i, path := range intent.paths {
+			node, err := s.resolve(ctx, tx, path)
+			if errors.Is(err, syscall.ENOENT) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			publication.access[i] = metastore.FileState{Node: node}
+		}
+	}
+	if intent.node == 0 && intent.nodes == nil && len(intent.paths) != 0 &&
+		(intent.kind == locking.CreateMutation || intent.kind == locking.WriteMutation) && publication.access[0].ID == 0 {
+		parent, _, err := s.resolveParent(ctx, tx, intent.paths[0])
 		if err != nil {
 			return nil, err
 		}
-		nodes[i] = node
-		if node.Mode.IsRegular() && !seen[node.ID] {
+		pending, err := s.nodePendingUnlink(ctx, tx, parent.ID)
+		if err != nil {
+			return nil, err
+		}
+		if pending {
+			return nil, storage.ErrPendingDelete
+		}
+	}
+	if intent.kind == locking.WriteMutation && intent.scope.Token == "" && len(publication.access) != 0 && publication.access[0].ID != 0 {
+		pending, err := s.nodePendingUnlink(ctx, tx, publication.access[0].ID)
+		if err != nil {
+			return nil, err
+		}
+		if pending {
+			return nil, storage.ErrPendingDelete
+		}
+	}
+	seen := make(map[int64]bool, len(publication.access))
+	for _, node := range publication.access {
+		if node.ID != 0 && s.coordinator.pins[retainedNode{s.volume, node.ID}] == 0 {
+			if publication.recoveredBefore == nil {
+				publication.recoveredBefore = make(map[int64]int64)
+			}
+			count, err := s.recoveredUnlinkContribution(ctx, tx, node.ID)
+			if err != nil {
+				return nil, err
+			}
+			publication.recoveredBefore[node.ID] = count
+		}
+		if node.ID != 0 && node.Kind == storage.NodeRegular && !node.Detached && !seen[node.ID] {
 			seen[node.ID] = true
 			publication.nodes = append(publication.nodes, node.ID)
 			publication.targets = append(publication.targets, s.backendKey(node.ID))
 		}
 	}
+	removed := -1
 	switch intent.kind {
-	case locking.WriteMutation, locking.RemoveMutation:
-		if nodes[0].ID != 0 && nodes[0].Mode.IsRegular() {
-			publication.previous = nodes[0].Size
+	case locking.WriteMutation:
+		if len(publication.access) != 0 {
+			publication.previous = publication.access[0].Size
+		}
+	case locking.RemoveMutation:
+		if len(publication.access) != 0 {
+			removed = 0
 		}
 	case locking.RenameMutation:
-		if nodes[1].ID != 0 && nodes[1].ID != nodes[0].ID && nodes[1].Mode.IsRegular() {
-			publication.previous = nodes[1].Size
+		if len(publication.access) > 1 && publication.access[1].ID != publication.access[0].ID {
+			removed = 1
 		}
+	}
+	if removed >= 0 {
+		publication.removed = publication.access[removed].ID
+		publication.previous = publication.access[removed].Size
+	}
+	if intent.cleanup && len(publication.access) != 0 {
+		publication.previous = publication.access[0].Size
 	}
 	return publication, nil
 }
@@ -230,34 +289,52 @@ func (s *Store) finishVolumePublication(ctx context.Context, tx *sql.Tx, publica
 		if err != nil {
 			return err
 		}
+		before := metastore.FileState{Node: metastore.Node{ID: node.ID, Kind: node.Kind}}
+		if len(publication.access) != 0 && publication.access[0].ID != 0 {
+			before = publication.access[0]
+		}
+		if err := s.checkContentPublication(ctx, before, node.Size, publication.intent.scope); err != nil {
+			return err
+		}
 		publication.next = node.Size
+	}
+	if !publication.intent.cleanup && publication.intent.nodes == nil &&
+		(publication.intent.kind == locking.RemoveMutation || publication.intent.kind == locking.RenameMutation) {
+		for _, node := range publication.access {
+			if node.ID == 0 {
+				continue
+			}
+			if err := s.fileDomain.coordinator.CheckUse(ctx, uint64(node.ID), publication.intent.scope, storage.DeleteName); err != nil {
+				return err
+			}
+		}
 	}
 	for i, id := range publication.nodes {
 		var present bool
-		if err := tx.QueryRowContext(ctx,
-			`SELECT EXISTS(SELECT 1 FROM nodes WHERE volume = ? AND id = ? AND detached = 0)`, s.volume, id).Scan(&present); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM nodes WHERE volume=? AND id=? AND detached=0)`, s.volume, id).Scan(&present); err != nil {
 			return err
 		}
 		if !present {
 			publication.retired = append(publication.retired, publication.targets[i])
 		}
 	}
-	if publication.intent.node == 0 && (publication.intent.kind == locking.RemoveMutation || publication.intent.kind == locking.RenameMutation) && publication.previous != 0 {
-		// Retaining a removed destination keeps its current bytes charged. The
-		// removal still retires the named strong resource in the same publication.
-		var retained int64
-		for _, id := range publication.nodes {
-			var size int64
-			err := tx.QueryRowContext(ctx, `SELECT size FROM nodes WHERE volume=? AND id=? AND detached=1`, s.volume, id).Scan(&size)
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			retained += size
+	if publication.removed != 0 {
+		var surviving int64
+		err := tx.QueryRowContext(ctx, `SELECT size FROM nodes WHERE volume=? AND id=?`, s.volume, publication.removed).Scan(&surviving)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
 		}
-		publication.next = retained
+		publication.next += surviving
+	}
+	for id, before := range publication.recoveredBefore {
+		after, err := s.recoveredUnlinkContribution(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if after > before {
+			return fmt.Errorf("publication created an unowned deletion obligation: %w", syscall.EIO)
+		}
+		publication.recoveredReleased += before - after
 	}
 	return nil
 }
@@ -288,6 +365,12 @@ func (s *Store) publishVolume(ctx context.Context, tx *sql.Tx, state DurableStat
 			s.fencePublication(err)
 			return locking.PublicationOutcome{Known: true, Changed: true, Retired: publication.retired, Err: err}
 		}
+		if publication.recoveredReleased > s.fileDomain.recoveredReferences {
+			err := fmt.Errorf("recovered reference accounting cannot release %d of %d retained references: %w", publication.recoveredReleased, s.fileDomain.recoveredReferences, syscall.EIO)
+			s.fencePublication(err)
+			return locking.PublicationOutcome{Known: true, Changed: true, Retired: publication.retired, Err: err}
+		}
+		s.fileDomain.recoveredReferences -= publication.recoveredReleased
 		return locking.PublicationOutcome{Known: true, Changed: true, Retired: publication.retired}
 	}
 	if publication.intent.cleanup {

@@ -1,0 +1,657 @@
+//go:build windows
+
+package windows
+
+import (
+	"bufio"
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+	"unsafe"
+
+	win "golang.org/x/sys/windows"
+)
+
+var inboxMPR = win.NewLazySystemDLL("mpr.dll")
+var inboxWNetAdd = inboxMPR.NewProc("WNetAddConnection2W")
+var inboxWNetGet = inboxMPR.NewProc("WNetGetConnectionW")
+var inboxWNetCancel = inboxMPR.NewProc("WNetCancelConnection2W")
+
+type inboxNetResource struct {
+	Scope, Type, DisplayType, Usage          uint32
+	LocalName, RemoteName, Comment, Provider *uint16
+}
+type inboxLocalCloseError struct{ err error }
+
+func (e *inboxLocalCloseError) Error() string { return "local handle close: " + e.err.Error() }
+func (e *inboxLocalCloseError) Unwrap() error { return e.err }
+func inboxCloseResult(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &inboxLocalCloseError{err}
+}
+
+type inboxRenameLayout struct {
+	Flags  uint32
+	Root   uintptr
+	Length uint32
+	Name   [1]uint16
+}
+
+func inboxCurrentToken() (inboxToken, error) {
+	identity, err := (windowsMappings{}).identity(context.Background())
+	return inboxToken{identity.SID, identity.AuthenticationID, identity.SessionID}, err
+}
+func inboxMappedUNC(drive string) (string, error) {
+	local, err := win.UTF16PtrFromString(drive)
+	if err != nil {
+		return "", err
+	}
+	buffer := make([]uint16, 1024)
+	size := uint32(len(buffer))
+	status, _, _ := inboxWNetGet.Call(uintptr(unsafe.Pointer(local)), uintptr(unsafe.Pointer(&buffer[0])), uintptr(unsafe.Pointer(&size)))
+	runtime.KeepAlive(local)
+	runtime.KeepAlive(buffer)
+	if status != 0 {
+		return "", win.Errno(status)
+	}
+	if size == 0 || size > uint32(len(buffer)) {
+		return "", errors.New("invalid WNet mapping length")
+	}
+	return win.UTF16ToString(buffer[:size]), nil
+}
+func inboxFreeDrive(drive string) error {
+	mask, err := win.GetLogicalDrives()
+	if err != nil {
+		return err
+	}
+	if mask&(1<<uint(drive[0]-'A')) != 0 {
+		return errors.New("drive already allocated")
+	}
+	name, err := win.UTF16PtrFromString(drive)
+	if err != nil {
+		return err
+	}
+	buffer := make([]uint16, 1024)
+	_, err = win.QueryDosDevice(name, &buffer[0], uint32(len(buffer)))
+	if !errors.Is(err, win.ERROR_FILE_NOT_FOUND) {
+		if err == nil {
+			return errors.New("DOS device already allocated")
+		}
+		return err
+	}
+	return nil
+}
+func inboxAddMapping(s inboxStart, attempted *bool) error {
+	if err := inboxFreeDrive(s.Drive); err != nil {
+		return err
+	}
+	local, err := win.UTF16PtrFromString(s.Drive)
+	if err != nil {
+		return err
+	}
+	remote, err := win.UTF16PtrFromString(s.ShareUNC)
+	if err != nil {
+		return err
+	}
+	resource := inboxNetResource{Type: 1, LocalName: local, RemoteName: remote}
+	*attempted = true
+	status, _, _ := inboxWNetAdd.Call(uintptr(unsafe.Pointer(&resource)), 0, 0, 0)
+	runtime.KeepAlive(resource)
+	runtime.KeepAlive(local)
+	runtime.KeepAlive(remote)
+	if status != 0 {
+		return win.Errno(status)
+	}
+	return nil
+}
+func inboxRemoveMapping(s inboxStart) error {
+	identity, err := inboxCurrentToken()
+	if err != nil {
+		return err
+	}
+	if identity != s.ExpectedToken {
+		return errors.New("mapping token changed")
+	}
+	unc, err := inboxMappedUNC(s.Drive)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(unc, s.ShareUNC) {
+		return errors.New("mapping fingerprint changed")
+	}
+	local, err := win.UTF16PtrFromString(s.Drive)
+	if err != nil {
+		return err
+	}
+	status, _, _ := inboxWNetCancel.Call(uintptr(unsafe.Pointer(local)), 0, 0)
+	runtime.KeepAlive(local)
+	if status != 0 {
+		return win.Errno(status)
+	}
+	_, err = inboxMappedUNC(s.Drive)
+	if !errors.Is(err, win.ERROR_NOT_CONNECTED) {
+		if err == nil {
+			return errors.New("mapping survived cancellation")
+		}
+		return err
+	}
+	return inboxFreeDrive(s.Drive)
+}
+func inboxDirectoryIdentity(path string) (inboxDirectory, error) {
+	name, err := win.UTF16PtrFromString(path)
+	if err != nil {
+		return inboxDirectory{}, err
+	}
+	raw, err := win.CreateFile(name, win.FILE_READ_ATTRIBUTES, 7, nil, win.OPEN_EXISTING, win.FILE_FLAG_BACKUP_SEMANTICS|win.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		return inboxDirectory{}, err
+	}
+	var info win.ByHandleFileInformation
+	readErr := win.GetFileInformationByHandle(raw, &info)
+	closeErr := inboxCloseResult(win.CloseHandle(raw))
+	if err = errors.Join(readErr, closeErr); err != nil {
+		return inboxDirectory{}, err
+	}
+	return inboxDirectory{Path: path, VolumeSerialHex: fmt.Sprintf("%08x", info.VolumeSerialNumber), FileIndexHex: fmt.Sprintf("%016x", uint64(info.FileIndexHigh)<<32|uint64(info.FileIndexLow)), Attributes: info.FileAttributes}, nil
+}
+func inboxValidateDirectories(s inboxStart) error {
+	for _, root := range []string{s.RootLocal, s.OutputRoot} {
+		parts := strings.Split(root[3:], `\`)
+		path := root[:2]
+		for _, part := range parts {
+			path += `\` + part
+			got, err := inboxDirectoryIdentity(path)
+			if err != nil {
+				return err
+			}
+			if got.Attributes&win.FILE_ATTRIBUTE_REPARSE_POINT != 0 || got.Attributes&win.FILE_ATTRIBUTE_DIRECTORY == 0 {
+				return errors.New("unsafe directory component")
+			}
+		}
+	}
+	got, err := inboxDirectoryIdentity(s.RootLocal)
+	if err != nil {
+		return err
+	}
+	if got != s.Directory {
+		return errors.New("owned directory identity changed")
+	}
+	v, err := inboxDirectoryIdentity(s.RootLocal + `\v`)
+	if err != nil {
+		return err
+	}
+	if v.Attributes&win.FILE_ATTRIBUTE_REPARSE_POINT != 0 || v.Attributes&win.FILE_ATTRIBUTE_DIRECTORY == 0 || v.VolumeSerialHex != s.Directory.VolumeSerialHex {
+		return errors.New("unsafe v directory")
+	}
+	return nil
+}
+func inboxPrepare(path string, data []byte, modified time.Time) (value cacheGatePositiveValue, err error) {
+	name, err := win.UTF16PtrFromString(path)
+	if err != nil {
+		return value, err
+	}
+	raw, err := win.CreateFile(name, win.GENERIC_READ|win.GENERIC_WRITE, 7, nil, win.CREATE_NEW, win.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return value, err
+	}
+	file := &nativeHandle{value: raw}
+	defer func() { err = errors.Join(err, inboxCloseResult(file.close())) }()
+	var written uint32
+	if err = win.WriteFile(raw, data, &written, nil); err != nil {
+		return value, err
+	}
+	if written != uint32(len(data)) {
+		return value, errors.New("short preparation write")
+	}
+	ft := win.NsecToFiletime(modified.UnixNano())
+	if err = win.SetFileTime(raw, &ft, &ft, &ft); err != nil {
+		return value, err
+	}
+	value = cacheGatePositiveIdentity(file)
+	if value.Error != "" {
+		return value, errors.New(value.Error)
+	}
+	value.Digest = cacheGatePositiveDigest(data)
+	value.Count = written
+	return value, nil
+}
+func inboxRename(file *nativeHandle, target string) ([]byte, error) {
+	var layout inboxRenameLayout
+	if runtime.GOARCH != "arm64" || unsafe.Sizeof(uintptr(0)) != 8 || unsafe.Offsetof(layout.Root) != 8 || unsafe.Offsetof(layout.Length) != 16 || unsafe.Offsetof(layout.Name) != 20 {
+		return nil, errors.New("unsupported FILE_RENAME_INFO ABI")
+	}
+	data, err := inboxRenamePayload(target)
+	if err != nil {
+		return nil, err
+	}
+	err = win.SetFileInformationByHandle(file.value, win.FileRenameInfoEx, &data[0], uint32(len(data)))
+	runtime.KeepAlive(data)
+	runtime.KeepAlive(file)
+	return data, err
+}
+
+func inboxEmit(envelope inboxEnvelope) error {
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		return err
+	}
+	if len(data)+len(inboxPrefix)+1 > inboxEnvelopeLimit {
+		return errors.New("output envelope exceeds bound")
+	}
+	_, err = fmt.Fprintln(os.Stdout, inboxPrefix+string(data))
+	return err
+}
+func inboxStage(s inboxStart, r *inboxReceipt, kind string, stage int) inboxEnvelope {
+	return inboxEnvelope{Kind: kind, Stage: stage, Nonce: s.Nonce, PID: r.PID, ExecutableSHA256: r.ExecutableSHA256, Token: r.Token, Mapping: inboxMapping{s.Drive, s.ShareUNC}}
+}
+func inboxAdmit(reader *bufio.Reader, s inboxStart, r *inboxReceipt, stage int) error {
+	kind := "ready"
+	if stage == 2 {
+		kind = "postcheck"
+	}
+	if err := inboxEmit(inboxStage(s, r, kind, stage)); err != nil {
+		return err
+	}
+	var admission inboxAdmission
+	if err := inboxReadEnvelope(reader, &admission); err != nil {
+		return err
+	}
+	if err := inboxValidateAdmission(s, admission, stage, r.PID); err != nil {
+		return err
+	}
+	r.Origins = append(r.Origins, admission.Origin)
+	return nil
+}
+func inboxRecord(r *inboxReceipt, name string, start time.Time, err error) {
+	call := inboxCall{Ordinal: len(r.Calls) + 1, Name: name, Started: start, Completed: time.Now()}
+	if err != nil {
+		call.Error = err.Error()
+	}
+	r.Calls = append(r.Calls, call)
+}
+func inboxRecordValue(r *inboxReceipt, name string, value cacheGatePositiveValue) {
+	r.Calls = append(r.Calls, inboxCall{Ordinal: len(r.Calls) + 1, Name: name, Started: value.Started, Completed: value.Completed, Error: value.Error})
+}
+func inboxLocalOracle(t *testing.T, s inboxStart, r *inboxReceipt, data []byte) error {
+	target, value := cacheGatePositiveOpenSync(t, s.RootLocal+`\v\target`)
+	r.LocalTarget = value
+	if target == nil {
+		return errors.New(value.Error)
+	}
+	r.LocalTarget = cacheGatePositiveIdentity(target)
+	r.LocalRead = cacheGatePositiveReadSync(target)
+	name, err := win.UTF16PtrFromString(s.RootLocal + `\v\replacement`)
+	if err != nil {
+		return err
+	}
+	_, err = win.GetFileAttributes(name)
+	r.ReplacementAbsent = errors.Is(err, win.ERROR_FILE_NOT_FOUND)
+	r.LocalNameKnown = err == nil || r.ReplacementAbsent
+	if err != nil {
+		r.LocalNameError = err.Error()
+	}
+	r.LocalOracle = r.LocalTarget.Error == "" && r.LocalTarget.Identity == r.PreparedB.Identity && r.LocalTarget.Volume == r.PreparedB.Volume && r.LocalTarget.Size == int64(len(data)) && r.LocalRead.Error == "" && r.LocalRead.Count == uint32(len(data)) && r.LocalRead.Digest == cacheGatePositiveDigest(data) && r.ReplacementAbsent
+	if !r.LocalOracle {
+		return errors.New("local NTFS replacement oracle failed")
+	}
+	return nil
+}
+func inboxNativeCell(t *testing.T, reader *bufio.Reader, s inboxStart, r *inboxReceipt, a, b []byte) error {
+	app, err := cacheGateSharingOpen(t, s.ShareUNC+`\v`, win.FILE_LIST_DIRECTORY, 0, true)
+	if err != nil {
+		return err
+	}
+	watcherFile, err := cacheGateSharingOpen(t, s.ShareUNC+`\`, win.FILE_LIST_DIRECTORY, 7, true)
+	if err != nil {
+		return err
+	}
+	owner, err := inboxWatchStart(t, watcherFile, r)
+	if err != nil {
+		return err
+	}
+	watch := owner.watch
+	old, opened := cacheGatePositiveOpenSync(t, s.ShareUNC+`\v\target`)
+	if old == nil {
+		return errors.New(opened.Error)
+	}
+	r.Initial = cacheGatePositiveIdentity(old)
+	r.InitialRead = cacheGatePositiveReadSync(old)
+	if r.Initial.Error != "" || r.Initial.Identity == 0 || r.Initial.Size != int64(len(a)) || r.InitialRead.Error != "" || r.InitialRead.Count != uint32(len(a)) || r.InitialRead.Digest != cacheGatePositiveDigest(a) {
+		return errors.New("initial A handle failed")
+	}
+	cacheGatePositiveSeek(t, old, 0)
+	r.Warm = []cacheGatePositiveValue{cacheGatePositivePath(s.ShareUNC + `\v\target`), cacheGatePositivePath(s.ShareUNC + `\v\target`)}
+	for _, v := range r.Warm {
+		if v.Error != "" || v.Size != int64(len(a)) {
+			return errors.New("target attribute warm failed")
+		}
+	}
+	if err := inboxAdmit(reader, s, r, 1); err != nil {
+		return err
+	}
+	start := time.Now()
+	var count uint32
+	pendingErr := win.GetOverlappedResult(watcherFile.value, &watch.overlap, &count, false)
+	r.Pending = errors.Is(pendingErr, win.ERROR_IO_INCOMPLETE)
+	inboxRecord(r, "pending", start, pendingErr)
+	if !r.Pending {
+		return fmt.Errorf("watcher not pending: %v", pendingErr)
+	}
+	start = time.Now()
+	name, err := win.UTF16PtrFromString(s.RootLocal + `\v\replacement`)
+	if err != nil {
+		return err
+	}
+	raw, err := win.CreateFile(name, win.DELETE, 7, nil, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, 0)
+	inboxRecord(r, "mutator_open", start, err)
+	if err != nil {
+		return err
+	}
+	mutator := &nativeHandle{value: raw}
+	start = time.Now()
+	r.MutationAttempted = true
+	payload, renameErr := inboxRename(mutator, s.RootLocal+`\v\target`)
+	if renameErr == nil {
+		r.ACK = time.Now()
+		r.MutationSucceeded = true
+	}
+	r.RenamePayloadHex = hex.EncodeToString(payload)
+	r.RenameClass = win.FileRenameInfoEx
+	if renameErr != nil {
+		r.RenameError = renameErr.Error()
+	}
+	inboxRecord(r, "rename_flags3", start, renameErr)
+	start = time.Now()
+	closeErr := mutator.close()
+	inboxRecord(r, "mutator_close", start, closeErr)
+	if closeErr != nil {
+		r.MutatorCloseError = closeErr.Error()
+		r.CleanupErrors = append(r.CleanupErrors, closeErr.Error())
+	}
+	if err = errors.Join(renameErr, closeErr); err != nil {
+		return err
+	}
+	start = time.Now()
+	completion, notifyErr := watch.completeNative(r.ACK.Add(850 * time.Millisecond))
+	owner.state.Completion(completion)
+	r.Notifications = append(r.Notifications, completion)
+	inboxRecord(r, "notify", start, notifyErr)
+	if !completion.Drained || (notifyErr != nil && completion.ErrorCode != parentErrorNotifyEnum) {
+		return fmt.Errorf("native notification unavailable: %w", notifyErr)
+	}
+	if completion.Count == 0 || completion.ErrorCode == parentErrorNotifyEnum {
+		start = time.Now()
+		err = owner.rearm()
+		inboxRecord(r, "notify_rearm", start, err)
+		if err != nil {
+			return err
+		}
+	}
+	current, first := cacheGatePositiveOpenSync(t, s.ShareUNC+`\v\target`)
+	r.FirstOpen = first
+	inboxRecordValue(r, "first_open", first)
+	if current != nil {
+		r.NewIdentity = cacheGatePositiveIdentity(current)
+		inboxRecordValue(r, "new_identity", r.NewIdentity)
+		r.RetainedIdentity = cacheGatePositiveIdentity(old)
+		inboxRecordValue(r, "retained_identity", r.RetainedIdentity)
+		r.OldRead = cacheGatePositiveReadSync(old)
+		inboxRecordValue(r, "old_read", r.OldRead)
+		r.NewRead = cacheGatePositiveReadSync(current)
+		inboxRecordValue(r, "new_read", r.NewRead)
+	}
+	r.ObservationsComplete = true
+	r.NativeOracle = parentRelativeIdentity(r.Initial, r.NewIdentity, r.RetainedIdentity, r.OldRead, r.NewRead, a, b)
+	if err = inboxAdmit(reader, s, r, 2); err != nil {
+		return err
+	}
+	r.OriginComplete = true
+	err = inboxLocalOracle(t, s, r, b)
+	runtime.KeepAlive(old)
+	runtime.KeepAlive(current)
+	runtime.KeepAlive(app)
+	runtime.KeepAlive(watch)
+	return err
+}
+func TestNativeInboxReference(t *testing.T) {
+	if os.Getenv("RFS_INBOX_REFERENCE") != "1" {
+		t.Skip("explicit inbox reference invocation required")
+	}
+	reader := bufio.NewReaderSize(os.Stdin, inboxEnvelopeLimit+1)
+	var s inboxStart
+	if err := inboxReadEnvelope(reader, &s); err != nil {
+		t.Fatal(err)
+	}
+	if err := inboxValidateStart(s); err != nil {
+		t.Fatal(err)
+	}
+	r := inboxReceipt{Request: s, PID: os.Getpid(), MappingRemoved: true, HelpersClean: true}
+	a, b := cacheGatePositivePayload(257, 0x17), cacheGatePositivePayload(769, 0x89)
+	var scenarioErr error
+	defer func() {
+		if r.MappingCreated {
+			if err := inboxRemoveMapping(s); err != nil {
+				r.CleanupErrors = append(r.CleanupErrors, err.Error())
+			} else {
+				r.MappingRemoved = true
+			}
+		}
+		var localClose *inboxLocalCloseError
+		if errors.As(scenarioErr, &localClose) {
+			r.CleanupErrors = append(r.CleanupErrors, localClose.Error())
+		}
+		r.CleanupComplete = r.HelpersClean && r.MappingRemoved && len(r.CleanupErrors) == 0
+		if scenarioErr != nil {
+			r.Error = scenarioErr.Error()
+		}
+		r.Outcome = inboxClassify(&r, a, b)
+		data, err := json.MarshalIndent(r, "", "  ")
+		if err == nil && len(data) > 128<<10 {
+			err = errors.New("receipt exceeds bound")
+		}
+		if err == nil {
+			path := filepath.Join(s.OutputRoot, "native-receipt.json")
+			var file *os.File
+			file, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+			if err == nil {
+				_, writeErr := file.Write(data)
+				err = errors.Join(writeErr, file.Close())
+			}
+		}
+		envelope := inboxStage(s, &r, "result", 3)
+		envelope.Outcome = r.Outcome
+		envelope.CleanupComplete = r.CleanupComplete
+		envelope.Error = r.Error
+		if err != nil {
+			envelope.Error = errors.Join(scenarioErr, err).Error()
+			envelope.Outcome = "receipt_failure"
+		} else {
+			envelope.ReceiptFile = "native-receipt.json"
+			envelope.ReceiptSHA256 = cacheGatePositiveDigest(data)
+		}
+		if emitErr := inboxEmit(envelope); emitErr != nil {
+			t.Error(emitErr)
+		}
+		if envelope.Outcome != "native_behavior_pass" {
+			t.Errorf("inbox reference: %s: %s; native=%s", envelope.Outcome, envelope.Error, r.NativeOracle)
+		}
+	}()
+	if os.Getppid() != s.ParentPID {
+		scenarioErr = errors.New("parent process binding mismatch")
+		return
+	}
+	if runtime.GOOS != "windows" || runtime.GOARCH != "arm64" {
+		scenarioErr = errors.New("Windows ARM64 required")
+		return
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		scenarioErr = err
+		return
+	}
+	binary, err := os.ReadFile(executable)
+	if err != nil {
+		scenarioErr = err
+		return
+	}
+	r.ExecutableSHA256 = cacheGatePositiveDigest(binary)
+	if r.ExecutableSHA256 != s.ExecutableSHA256 {
+		scenarioErr = errors.New("executable fingerprint mismatch")
+		return
+	}
+	r.Token, err = inboxCurrentToken()
+	if err != nil {
+		scenarioErr = err
+		return
+	}
+	if r.Token != s.ExpectedToken {
+		scenarioErr = errors.New("current token mismatch")
+		return
+	}
+	if err = inboxValidateDirectories(s); err != nil {
+		scenarioErr = err
+		return
+	}
+	r.PreparedA, err = inboxPrepare(s.RootLocal+`\v\target`, a, time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		scenarioErr = err
+		return
+	}
+	r.PreparedB, err = inboxPrepare(s.RootLocal+`\v\replacement`, b, time.Date(2002, 1, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		scenarioErr = err
+		return
+	}
+	if r.PreparedA.Identity == r.PreparedB.Identity || r.PreparedA.Volume != r.PreparedB.Volume {
+		scenarioErr = errors.New("local preparation identities invalid")
+		return
+	}
+	r.Exposure = time.Now()
+	r.Expiry = r.Exposure.Add(5 * time.Second)
+	err = inboxAddMapping(s, &r.MappingAttempted)
+	unc, mapErr := inboxMappedUNC(s.Drive)
+	if r.MappingAttempted && mapErr == nil && strings.EqualFold(unc, s.ShareUNC) {
+		r.MappingCreated = true
+		r.MappingRemoved = false
+	}
+	if err != nil {
+		if r.MappingAttempted && !r.MappingCreated {
+			r.MappingRemoved = errors.Is(mapErr, win.ERROR_NOT_CONNECTED) && inboxFreeDrive(s.Drive) == nil
+		}
+		scenarioErr = err
+		return
+	}
+	if mapErr != nil || !r.MappingCreated {
+		r.MappingRemoved = false
+		scenarioErr = errors.Join(mapErr, errors.New("mapping result unowned"))
+		return
+	}
+	identity, err := inboxCurrentToken()
+	if err != nil || identity != s.ExpectedToken {
+		scenarioErr = errors.Join(err, errors.New("mapping token mismatch"))
+		return
+	}
+	r.HelpersClean = t.Run("native", func(t *testing.T) { scenarioErr = inboxNativeCell(t, reader, s, &r, a, b) })
+	if !r.HelpersClean {
+		r.CleanupErrors = append(r.CleanupErrors, "native helper or terminal cleanup failed")
+	}
+}
+
+type inboxPinnedWatch struct {
+	watch *parentNativeWatch
+	pins  runtime.Pinner
+	state *inboxWatchOwnership
+}
+
+var inboxRetainedWatches = struct {
+	sync.Mutex
+	owners map[*inboxPinnedWatch]struct{}
+}{owners: make(map[*inboxPinnedWatch]struct{})}
+
+func inboxWatchStart(t *testing.T, file *nativeHandle, r *inboxReceipt) (*inboxPinnedWatch, error) {
+	event, err := win.CreateEvent(nil, 1, 0, nil)
+	if err != nil {
+		return nil, err
+	}
+	watch := &parentNativeWatch{file: file, event: event, buffer: make([]byte, parentNotifyLimit)}
+	watch.overlap.HEvent = event
+	owner := &inboxPinnedWatch{watch: watch, state: &r.WatchOwnership}
+	owner.pins.Pin(&watch.overlap)
+	owner.pins.Pin(&watch.buffer[0])
+	err = win.ReadDirectoryChanges(file.value, &watch.buffer[0], uint32(len(watch.buffer)), true, parentNotifyFilter, nil, &watch.overlap, 0)
+	if err != nil && !errors.Is(err, win.ERROR_IO_PENDING) {
+		owner.state.Release()
+		owner.pins.Unpin()
+		closeErr := win.CloseHandle(event)
+		owner.state.EventClosed = closeErr == nil
+		if closeErr != nil {
+			owner.state.EventCloseError = closeErr.Error()
+			r.CleanupErrors = append(r.CleanupErrors, closeErr.Error())
+		}
+		return nil, errors.Join(err, closeErr)
+	}
+	if err = owner.state.Submit(); err != nil {
+		panic(err)
+	}
+	t.Cleanup(func() {
+		if !owner.state.TerminalKnown {
+			cancelErr := win.CancelIoEx(file.value, &watch.overlap)
+			if cancelErr != nil && !errors.Is(cancelErr, win.ERROR_NOT_FOUND) {
+				owner.state.CancelError = cancelErr.Error()
+				r.CleanupErrors = append(r.CleanupErrors, cancelErr.Error())
+			}
+			var count uint32
+			drainErr := win.GetOverlappedResult(file.value, &watch.overlap, &count, true)
+			completion := parentNativeCompletion{Drained: true, Count: count, Completed: time.Now()}
+			if drainErr != nil {
+				completion.Error = drainErr.Error()
+				var code win.Errno
+				if errors.As(drainErr, &code) {
+					completion.ErrorCode = uint32(code)
+				} else {
+					completion.Drained = false
+				}
+				owner.state.DrainError = drainErr.Error()
+			}
+			owner.state.Completion(completion)
+		}
+		if !owner.state.Release() {
+			inboxRetainedWatches.Lock()
+			inboxRetainedWatches.owners[owner] = struct{}{}
+			inboxRetainedWatches.Unlock()
+			r.CleanupErrors = append(r.CleanupErrors, "watch terminal ownership unknown; pinned process owner retained")
+			t.Error("watch terminal ownership unknown; pinned process owner retained")
+			return
+		}
+		owner.pins.Unpin()
+		closeErr := win.CloseHandle(event)
+		owner.state.EventClosed = closeErr == nil
+		if closeErr != nil {
+			owner.state.EventCloseError = closeErr.Error()
+			r.CleanupErrors = append(r.CleanupErrors, closeErr.Error())
+			t.Error(closeErr)
+		}
+		runtime.KeepAlive(owner)
+	})
+	return owner, nil
+}
+func (owner *inboxPinnedWatch) rearm() error {
+	if !owner.state.TerminalKnown || owner.state.PinsReleased || owner.state.Retained {
+		return errors.New("rearm lacks actual terminal ownership")
+	}
+	if err := owner.watch.rearm(); err != nil {
+		return err
+	}
+	return owner.state.Submit()
+}

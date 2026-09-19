@@ -1,0 +1,97 @@
+--- a/packages/smb/notify.go
++++ b/packages/smb/notify.go
+@@ -51,13 +51,14 @@
+-	id         int64
+-	filter     uint32
+-	recursive  bool
+-	ready      bool
+-	barrier    metastore.Position
+-	groups     []notifyGroup
+-	bytes      int64
+-	events     int
+-	failure    error
+-	waiters    []*notifyWaiter
+-	generation uint64
+-	validating bool
+-	removed    bool
++	id               int64
++	filter           uint32
++	recursive        bool
++	ready            bool
++	sourceGeneration uint64
++	barrier          metastore.Position
++	groups           []notifyGroup
++	bytes            int64
++	events           int
++	failure          error
++	waiters          []*notifyWaiter
++	generation       uint64
++	validating       bool
++	removed          bool
+@@ -89 +90 @@
+-func (w *directoryWatcher) deliverFailure() error {
++func (m *notificationManager) deliverFailureLocked(w *directoryWatcher) error {
+@@ -92 +93,6 @@
+-	w.ready = false
++	// Lost detail does not close an established directory watch. Buffer changes
++	// after this delivery while the caller rearms; a fresh checkpoint would
++	// discard those changes. A replaced or failed source must still reinitialize.
++	// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw
++	w.ready = errors.Is(err, ErrNotifyRescan) && m.failure == nil && !m.closed &&
++		w.sourceGeneration != 0 && w.sourceGeneration == m.sourceGeneration
+@@ -113,17 +119,18 @@
+-	closeMu     sync.Mutex
+-	closeErr    error
+-	closeDone   bool
+-	source      ChangeSource
+-	limits      Limits
+-	ctx         context.Context
+-	cancel      context.CancelFunc
+-	setup       sync.Mutex
+-	mu          sync.Mutex
+-	stream      ChangeStream
+-	incarnation metastore.Incarnation
+-	position    metastore.Position
+-	failure     error
+-	closed      bool
+-	wake        chan struct{}
+-	watchers    map[string]*directoryWatcher
+-	wg          sync.WaitGroup
++	closeMu          sync.Mutex
++	closeErr         error
++	closeDone        bool
++	source           ChangeSource
++	limits           Limits
++	ctx              context.Context
++	cancel           context.CancelFunc
++	setup            sync.Mutex
++	mu               sync.Mutex
++	stream           ChangeStream
++	incarnation      metastore.Incarnation
++	position         metastore.Position
++	failure          error
++	sourceGeneration uint64
++	closed           bool
++	wake             chan struct{}
++	watchers         map[string]*directoryWatcher
++	wg               sync.WaitGroup
+@@ -215,0 +223 @@
++	m.sourceGeneration++
+@@ -445,0 +454 @@
++			w.sourceGeneration = m.sourceGeneration
+@@ -498 +507 @@
+-				err := w.deliverFailure()
++				err := m.deliverFailureLocked(w)
+@@ -522 +531 @@
+-					err := w.deliverFailure()
++					err := m.deliverFailureLocked(w)
+@@ -560 +569 @@
+-					err := w.deliverFailure()
++					err := m.deliverFailureLocked(w)
+--- a/packages/smb/notify_test.go
++++ b/packages/smb/notify_test.go
+@@ -654,2 +654,2 @@
+-			if w.ready || w.bytes != 0 || len(w.groups) != 0 {
+-				t.Fatalf("failed proof kept continuity: %+v", w)
++			if w.ready != errors.Is(failure, ErrNotifyRescan) || w.bytes != 0 || len(w.groups) != 0 {
++				t.Fatalf("failed proof retained incorrect registration or event detail: %+v", w)

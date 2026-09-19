@@ -1,0 +1,60 @@
+name: Native SMB ancestor invalidation experiment
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - .github/workflows/native-smb-parent-invalidation.yml
+      - .github/scripts/native-smb-parent-invalidation.ps1
+      - .github/scripts/native-smb-parent-invalidation_test.go.txt
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-smb-parent-invalidation-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  ancestor-invalidation:
+    name: Native ancestor notification feasibility
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    env:
+      RFS_PARENT_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      RFS_GATE_VARIANT: positive_parent_invalidation
+      RFS_GATE_FIXTURE_SHA: 1cb9ad7f49d998de4daa4d562d766b18cf06ce16
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Check out the pinned diagnostic prototype
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 1cb9ad7f49d998de4daa4d562d766b18cf06ce16
+          path: .tmp/native-parent-invalidation/fixture
+          persist-credentials: false
+      - name: Record source and unchanged native environment
+        id: baseline
+        shell: pwsh
+        run: ./.github/scripts/native-smb-parent-invalidation.ps1 -Phase Prepare
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - name: Run the bounded ancestor notification experiment
+        shell: pwsh
+        run: ./.github/scripts/native-smb-parent-invalidation.ps1 -Phase Run
+      - name: Verify settings and owned-resource cleanup
+        if: ${{ always() && steps.baseline.outcome == 'success' }}
+        shell: pwsh
+        run: ./.github/scripts/native-smb-parent-invalidation.ps1 -Phase Verify
+      - name: Preserve all first observations and source receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-parent-invalidation-${{ github.run_attempt }}
+          path: .tmp/native-parent-invalidation/results
+          if-no-files-found: error
+          retention-days: 14

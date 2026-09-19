@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -576,7 +577,7 @@ func walkTree(t *testing.T,
 }
 
 // requireSameTree compares a copy against its source node for node: the same names, the same
-// ids, the same modes, sizes and times.
+// ids, kinds, metadata, sizes and times.
 func requireSameTree(t *testing.T, source, copied []node) {
 	t.Helper()
 
@@ -593,8 +594,9 @@ func requireSameTree(t *testing.T, source, copied []node) {
 		if !present {
 			t.Fatalf("the copy does not hold %q, which the volume does", want.Path)
 		}
-		if got.ID != want.ID || got.Mode != want.Mode || got.Size != want.Size ||
-			!got.ModTime.Equal(want.ModTime) || !got.AccessTime.Equal(want.AccessTime) {
+		if got.ID != want.ID || got.Kind != want.Kind || !reflect.DeepEqual(got.Metadata, want.Metadata) || got.Size != want.Size ||
+			!got.ModTime.Equal(want.ModTime) || !got.AccessTime.Equal(want.AccessTime) ||
+			!sameOptionalTime(got.BirthTime, want.BirthTime) || !sameOptionalTime(got.ChangeTime, want.ChangeTime) {
 			t.Fatalf("the copy holds %q as %+v, the volume holds it as %+v", want.Path, got.Node, want.Node)
 		}
 	}
@@ -847,4 +849,11 @@ func (b *blackhole) release() {
 		c.Close()
 	}
 	b.held = nil
+}
+
+func sameOptionalTime(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(*b)
 }

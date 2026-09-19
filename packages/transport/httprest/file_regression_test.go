@@ -13,6 +13,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -55,7 +56,7 @@ func TestRetainedHTTPRejectsMissingZeroValuedRequestMembers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, missing := range []string{"offset", "owner", "length", "data", "options", "open", "lock"} {
+	for _, missing := range []string{"offset", "owner", "length", "data", "options", "open", "domain"} {
 		t.Run(missing, func(t *testing.T) {
 			var fields map[string]json.RawMessage
 			if err := json.Unmarshal(encoded, &fields); err != nil {
@@ -102,8 +103,9 @@ func TestRetainedHTTPRejectsIncompleteAdvisoryReceipts(t *testing.T) {
 		t.Fatal(err)
 	}
 	session, file := openRetainedFixture(t, client)
+	fileRanges, fileOwners := rangeControlFixture(t, session, file, 1)
 	original := client.http.Transport
-	for _, field := range []string{"Found", "Owner", "Lock"} {
+	for _, field := range []string{"Found", "Owner", "Range", "Mode"} {
 		t.Run("conflict-"+field, func(t *testing.T) {
 			client.http.Transport = fileRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 				response, err := original.RoundTrip(r)
@@ -139,7 +141,7 @@ func TestRetainedHTTPRejectsIncompleteAdvisoryReceipts(t *testing.T) {
 				response.Header.Set("Content-Length", strconv.Itoa(len(body)))
 				return response, nil
 			})
-			_, err := file.GetLock(ctx, 0, storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64})
+			_, err := fileRanges.GetConflict(ctx, fileOwners[0], storage.RangeCommand{Domain: storage.DomainWholeFile, Edit: storage.Replace, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}})
 			if !errors.Is(err, syscall.EIO) {
 				t.Fatalf("incomplete conflict = %v", err)
 			}
@@ -152,12 +154,13 @@ func TestRetainedHTTPRejectsIncompleteAdvisoryReceipts(t *testing.T) {
 func TestRetainedHTTPCleanupAndAcknowledgementSurviveDataHistoryCapacity(t *testing.T) {
 	ctx := context.Background()
 	limits := DefaultFileLimits()
-	limits.MaxActions = 1
+	limits.MaxActions = 2
 	client, _, backend := retainedHTTPFixture(t, limits)
 	if err := backend.Write(ctx, "file", []byte("data")); err != nil {
 		t.Fatal(err)
 	}
 	session, file := openRetainedFixture(t, client)
+	fileRanges, fileOwners := rangeControlFixture(t, session, file, 1)
 	if _, err := file.WriteAt(ctx, 0, []byte("x")); !errors.Is(err, syscall.EAGAIN) {
 		t.Fatalf("data history capacity = %v", err)
 	}
@@ -169,8 +172,8 @@ func TestRetainedHTTPCleanupAndAcknowledgementSurviveDataHistoryCapacity(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, End: math.MaxInt64}
-	if result, err := file.SetLock(ctx, 0, lock, id); err != nil || result.State != storage.LockGranted {
+	lock := storage.RangeCommand{Domain: storage.DomainRecord, Edit: storage.Replace, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}
+	if result, err := fileRanges.Apply(ctx, fileOwners[0], []storage.RangeCommand{lock}, id); err != nil || result.State != storage.Granted {
 		t.Fatalf("grant = %+v, %v", result, err)
 	}
 	other, err := backend.NewFileSession(ctx, storage.DefaultFileSessionOptions())
@@ -182,10 +185,11 @@ func TestRetainedHTTPCleanupAndAcknowledgementSurviveDataHistoryCapacity(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := file.DropLocks(ctx, 0, storage.POSIX); err != nil {
+	observerRanges, observerOwners := rangeControlFixture(t, other, observer, 1)
+	if err := fileRanges.Drop(ctx, fileOwners[0], storage.DomainRecord); err != nil {
 		t.Fatalf("close-owner cleanup blocked by data history: %v", err)
 	}
-	if conflict, err := observer.GetLock(ctx, 0, lock); err != nil || conflict.Found {
+	if conflict, err := observerRanges.GetConflict(ctx, observerOwners[0], lock); err != nil || conflict.Found {
 		t.Fatalf("close-owner cleanup left a lock: %+v, %v", conflict, err)
 	}
 }
@@ -328,7 +332,7 @@ func TestRetainedHTTPCancellationAfterOpenEffectIsEIOAndCleansReference(t *testi
 		}
 		return response, nil
 	})
-	_, err = session.OpenFile(ctx, "created", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Exclusive: true}, Mode: 0600})
+	_, err = session.OpenFile(ctx, "created", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Exclusive: true}, InitialMetadata: map[string][]byte{"test": {1, 2}}})
 	client.http.Transport = original
 	if !errors.Is(err, syscall.EIO) || storage.ErrnoOf(err) == syscall.EINTR || !errors.Is(err, context.Canceled) {
 		t.Fatalf("post-create interruption = %v", err)
@@ -354,6 +358,7 @@ func TestRetainedHTTPPureReadCancellationAfterDispatchIsEINTR(t *testing.T) {
 		t.Fatal(err)
 	}
 	session, file := openRetainedFixture(t, client)
+	fileRanges, fileOwners := rangeControlFixture(t, session, file, 1)
 	attr, err := file.Stat(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -366,13 +371,13 @@ func TestRetainedHTTPPureReadCancellationAfterDispatchIsEINTR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
+	lock := storage.RangeCommand{Domain: storage.DomainWholeFile, Edit: storage.Replace, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}
 	cases := map[string]func(context.Context) error{
 		"read":       func(ctx context.Context) error { _, e := file.ReadAt(ctx, 0, 4); return e },
 		"stat":       func(ctx context.Context) error { _, e := file.Stat(ctx); return e },
 		"stat-node":  func(ctx context.Context) error { _, e := session.StatNode(ctx, attr.ID); return e },
-		"get-lock":   func(ctx context.Context) error { _, e := file.GetLock(ctx, 0, lock); return e },
-		"query-lock": func(ctx context.Context) error { _, e := file.QueryLock(ctx, 0, id); return e },
+		"get-lock":   func(ctx context.Context) error { _, e := fileRanges.GetConflict(ctx, fileOwners[0], lock); return e },
+		"query-lock": func(ctx context.Context) error { _, e := fileRanges.Query(ctx, fileOwners[0], id); return e },
 		"status":     func(ctx context.Context) error { _, e := session.Status(ctx); return e },
 	}
 	original := client.http.Transport
@@ -407,7 +412,8 @@ func TestRetainedHTTPCleanupHistoryExhaustionRetiresOwnedLocks(t *testing.T) {
 		t.Fatal(err)
 	}
 	session, file := openRetainedFixture(t, client)
-	if err := file.DropLocks(ctx, 0, storage.POSIX); err != nil {
+	fileRanges, fileOwners := rangeControlFixture(t, session, file, 2)
+	if err := fileRanges.Drop(ctx, fileOwners[0], storage.DomainRecord); err != nil {
 		t.Fatal(err)
 	}
 	status, err := session.Status(ctx)
@@ -418,11 +424,11 @@ func TestRetainedHTTPCleanupHistoryExhaustionRetiresOwnedLocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, End: math.MaxInt64}
-	if result, err := file.SetLock(ctx, 1, lock, id); err != nil || result.State != storage.LockGranted {
+	lock := storage.RangeCommand{Domain: storage.DomainRecord, Edit: storage.Replace, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}
+	if result, err := fileRanges.Apply(ctx, fileOwners[1], []storage.RangeCommand{lock}, id); err != nil || result.State != storage.Granted {
 		t.Fatalf("grant = %+v, %v", result, err)
 	}
-	if err := file.DropLocks(ctx, 1, storage.POSIX); !errors.Is(err, syscall.EIO) {
+	if err := fileRanges.Drop(ctx, fileOwners[1], storage.DomainRecord); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("exhausted cleanup history = %v", err)
 	}
 	observerSession, err := backend.NewFileSession(ctx, storage.DefaultFileSessionOptions())
@@ -434,7 +440,8 @@ func TestRetainedHTTPCleanupHistoryExhaustionRetiresOwnedLocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if conflict, err := observer.GetLock(ctx, 0, lock); err != nil || conflict.Found {
+	observerRanges, observerOwners := rangeControlFixture(t, observerSession, observer, 1)
+	if conflict, err := observerRanges.GetConflict(ctx, observerOwners[0], lock); err != nil || conflict.Found {
 		t.Fatalf("failed cleanup retained a lock: %+v, %v", conflict, err)
 	}
 	if _, err := file.ReadAt(ctx, 0, 4); err == nil {
@@ -593,13 +600,14 @@ func TestRetainedHTTPEnrollmentEnforcesTheServerFileSizeCap(t *testing.T) {
 	}
 }
 
-func TestRetainedHTTPAdvisoryActionErrorsUseSymbolicErrnos(t *testing.T) {
+func TestRetainedHTTPRangeActionErrorsUseNeutralRejections(t *testing.T) {
 	ctx := context.Background()
 	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
 	if err := backend.Write(ctx, "file", []byte("data")); err != nil {
 		t.Fatal(err)
 	}
 	session, file := openRetainedFixture(t, client)
+	fileRanges, fileOwners := rangeControlFixture(t, session, file, 2)
 	status, err := session.Status(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -608,12 +616,12 @@ func TestRetainedHTTPAdvisoryActionErrorsUseSymbolicErrnos(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
-	if result, err := file.SetLock(ctx, 1, lock, first); err != nil || result.State != storage.LockGranted {
+	lock := storage.RangeCommand{Domain: storage.DomainWholeFile, Edit: storage.Replace, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}
+	if result, err := fileRanges.Apply(ctx, fileOwners[0], []storage.RangeCommand{lock}, first); err != nil || result.State != storage.Granted {
 		t.Fatalf("first grant = %+v, %v", result, err)
 	}
 	original := client.http.Transport
-	wireErrno := ""
+	wireRejection := ""
 	client.http.Transport = fileRoundTripFunc(func(request *http.Request) (*http.Response, error) {
 		response, err := original.RoundTrip(request)
 		if err != nil {
@@ -624,11 +632,11 @@ func TestRetainedHTTPAdvisoryActionErrorsUseSymbolicErrnos(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		var result struct{ Attempt struct{ Errno string } }
+		var result struct{ Attempt struct{ Rejection string } }
 		if err := json.Unmarshal(body, &result); err != nil {
 			return nil, err
 		}
-		wireErrno = result.Attempt.Errno
+		wireRejection = result.Attempt.Rejection
 		response.Body = io.NopCloser(bytes.NewReader(body))
 		return response, nil
 	})
@@ -636,10 +644,10 @@ func TestRetainedHTTPAdvisoryActionErrorsUseSymbolicErrnos(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := file.SetLock(ctx, 2, lock, second)
+	result, err := fileRanges.Apply(ctx, fileOwners[1], []storage.RangeCommand{lock}, second)
 	client.http.Transport = original
-	if err != nil || result.State != storage.LockRejected || result.Errno != syscall.EAGAIN || wireErrno != "EAGAIN" {
-		t.Fatalf("rejected lock result = %+v, wire errno %q, %v", result, wireErrno, err)
+	if err != nil || result.State != storage.Rejected || result.Rejection != storage.RangeBlocked || wireRejection != "blocked" {
+		t.Fatalf("rejected lock result = %+v, wire rejection %q, %v", result, wireRejection, err)
 	}
 }
 
@@ -802,7 +810,7 @@ func TestRetainedHTTPReadAllowsProgressWithoutInventingEOF(t *testing.T) {
 }
 
 func TestRetainedHTTPUnlockReceiptDistinguishesReleaseFromAcquisition(t *testing.T) {
-	for _, family := range []storage.LockFamily{storage.Flock, storage.POSIX} {
+	for _, family := range []storage.ConflictDomain{storage.DomainWholeFile, storage.DomainRecord} {
 		t.Run(strconv.Itoa(int(family)), func(t *testing.T) {
 			ctx := context.Background()
 			client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
@@ -810,6 +818,7 @@ func TestRetainedHTTPUnlockReceiptDistinguishesReleaseFromAcquisition(t *testing
 				t.Fatal(err)
 			}
 			session, file := openRetainedFixture(t, client)
+			fileRanges, fileOwners := rangeControlFixture(t, session, file, 1)
 			status, err := session.Status(ctx)
 			if err != nil {
 				t.Fatal(err)
@@ -837,33 +846,33 @@ func TestRetainedHTTPUnlockReceiptDistinguishesReleaseFromAcquisition(t *testing
 				sent.Store(wire.Op)
 				return original.RoundTrip(request)
 			})
-			lock := storage.FileLock{Family: family, Type: storage.Exclusive, End: math.MaxInt64}
+			lock := storage.RangeCommand{Domain: family, Edit: storage.Replace, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}
 			acquisition := nextID()
-			if result, err := file.SetLock(ctx, 0, lock, acquisition); err != nil || result.State != storage.LockGranted || !result.EverGranted {
+			if result, err := fileRanges.Apply(ctx, fileOwners[0], []storage.RangeCommand{lock}, acquisition); err != nil || result.State != storage.Granted || !result.EverGranted {
 				t.Fatalf("acquisition = %+v, %v", result, err)
 			}
-			if op := sent.Load(); op != storage.OpFileSetLock {
-				t.Fatalf("acquisition wire operation = %v; want %s", op, storage.OpFileSetLock)
+			if op := sent.Load(); op != storage.OpFileRangeApply {
+				t.Fatalf("acquisition wire operation = %v; want %s", op, storage.OpFileRangeApply)
 			}
 			unlock := lock
-			unlock.Type = storage.Unlock
+			unlock.Edit = storage.Subtract
 			release := nextID()
-			result, err := file.SetLock(ctx, 0, unlock, release)
-			if err != nil || result.State != storage.LockReleased || result.EverGranted || result.Lock != unlock {
+			result, err := fileRanges.Apply(ctx, fileOwners[0], []storage.RangeCommand{unlock}, release)
+			if err != nil || result.State != storage.Released || result.EverGranted || !reflect.DeepEqual(result.Commands, []storage.RangeCommand{unlock}) {
 				t.Fatalf("explicit unlock receipt = %+v, %v", result, err)
 			}
-			if op := sent.Load(); op != storage.OpFileUnlock {
-				t.Fatalf("unlock wire operation = %v; want %s", op, storage.OpFileUnlock)
+			if op := sent.Load(); op != storage.OpFileRangeApply {
+				t.Fatalf("unlock wire operation = %v; want %s", op, storage.OpFileRangeApply)
 			}
-			result, err = file.QueryLock(ctx, 0, release)
-			if err != nil || result.State != storage.LockReleased || result.EverGranted || result.Lock != unlock {
+			result, err = fileRanges.Query(ctx, fileOwners[0], release)
+			if err != nil || result.State != storage.Released || result.EverGranted || !reflect.DeepEqual(result.Commands, []storage.RangeCommand{unlock}) {
 				t.Fatalf("queried unlock receipt = %+v, %v", result, err)
 			}
-			if err := file.DropLocks(ctx, 0, family); err != nil {
+			if err := fileRanges.Drop(ctx, fileOwners[0], family); err != nil {
 				t.Fatal(err)
 			}
-			result, err = file.QueryLock(ctx, 0, acquisition)
-			if err != nil || result.State != storage.LockReleased || !result.EverGranted || result.Lock != lock {
+			result, err = fileRanges.Query(ctx, fileOwners[0], acquisition)
+			if err != nil || result.State != storage.Released || !result.EverGranted || !reflect.DeepEqual(result.Commands, []storage.RangeCommand{lock}) {
 				t.Fatalf("released acquisition receipt = %+v, %v", result, err)
 			}
 		})
@@ -1002,4 +1011,37 @@ func TestRetainedHTTPPendingExpiryRetainsCapabilityAndChargeUntilNativeClose(t *
 	if count != 0 {
 		t.Fatalf("known cleanup retained %d capability charges", count)
 	}
+}
+
+func rangeControlFixture(t *testing.T, session storage.FileSession, file storage.File, count int) (storage.RangeControl, []storage.UseOwner) {
+	t.Helper()
+	ctx := context.Background()
+	attr, err := file.Stat(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped, ok := file.(storage.ScopedReference)
+	if !ok {
+		t.Fatal("file does not expose a use scope")
+	}
+	scope, err := scoped.Scope(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, ok := session.(storage.RangeControl)
+	if !ok {
+		t.Fatal("session does not expose range control")
+	}
+	factory, ok := session.(storage.UseOwners)
+	if !ok {
+		t.Fatal("session does not expose use owners")
+	}
+	owners := make([]storage.UseOwner, count)
+	for i := range owners {
+		owners[i], err = factory.NewUseOwner(ctx, attr.ID, scope, storage.OwnerOptions{Lifetime: storage.OwnerExplicit})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return control, owners
 }

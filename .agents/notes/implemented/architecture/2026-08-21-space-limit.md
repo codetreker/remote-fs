@@ -34,13 +34,13 @@ Status: implemented
 
 ### volume 配额的计数与拒绝是本系统的事
 
-`packages/storage/limited` 把同时提供 `storage.BoundedStorage` 与原生 `CheckPublicationAccounting` 的 backend 置于字节配额之下。constructor 仍接收 `storage.Storage`；配额与 measurement 参数通过验证后，先核对这两项能力，再测量用量。能力缺失以 `ENOSYS` 拒绝，计费能力检查的错误原样传播。用量优先取自原生 `Usage`。没有权威用量且不支持文件句柄的 backend，才通过 `CheckBounded` 与 `ListBounded` 测量目录树。支持文件句柄却不能测量脱离目录后保留字节的组合必须失败，普通 `List` 或只看仍有名字的节点都不能补足这项能力（R-INT-3、R-INT-6、R-WS-7）。
+`packages/storage/limited` 把同时提供 `storage.BoundedStorage` 与原生 `CheckPublicationAccounting` 的 backend 置于字节配额之下。constructor 仍接收 `storage.Storage`；配额与 measurement 参数通过验证后，先核对这两项能力，再测量用量。能力缺失以 `ENOSYS` 拒绝，计费能力检查的错误原样传播。具备 MaintenanceAccounting 时，在同一个 native gate 中以真实 Usage 初始化账本并绑定维护 chain；没有该能力时，用量仍优先取自原生 Usage。没有权威用量且不支持文件句柄的 backend，才通过 `CheckBounded` 与 `ListBounded` 测量目录树。支持文件句柄却不能测量脱离目录后保留字节的组合必须失败，普通 `List` 或只看仍有名字的节点都不能补足这项能力（R-INT-3、R-INT-6、R-WS-7）。
 
 - **已用量在 `New` 里从底层权威地量出来**，此后由经过包装层的修改与文件引用清理推动。原生 `Usage` 包含仍有名字和已脱离目录的保留节点；不支持保留句柄的底层才遍历目录树，且只调用 `ListBounded`，不会先取得完整 directory slice。
-- **目录树 measurement 有两项独立 byte ceiling。** `MeasurementLimits.MaxDirectoryBytes` 限制当前 directory 的 `storage.Entry` 与 name retention，`MaxFrontierBytes` 限制当前及待访问 directory path；零值各自取 64 MiB 默认值，没有 unbounded 取值。任一结构越界时以 `EIO` 失败，取消与 backing error 保留原错误；任何失败都不产生 partial count。这些上限约束回退遍历，不定义权威 `Usage` 的字节口径。
+- **目录树 measurement 有两项独立 byte ceiling。** `MeasurementLimits.MaxDirectoryBytes` 限制当前 directory 的 Entry、name 和 metadata map retention，`MaxFrontierBytes` 限制当前及待访问 directory path；零值各自取 64 MiB 默认值，没有 unbounded 取值。任一结构越界时以 `EIO` 失败，取消与 backing error 保留原错误；任何失败都不产生 partial count。这些上限约束回退遍历，不定义权威 `Usage` 的字节口径。
 - **写入按差额收费**：增长在效果发生前预留，缩短只在确定完成后释放。底层在最终发布处提供实际新旧大小与效果；Applied 按实际效果结算，即使后续确认失败也不倒退已经发生的缩短。NotApplied 退回增长预留；未知效果保留保守额度。修复验收见[缩短提交后释放配额](../bug-fix/2026-09-07-release-shrunk-quota-after-commit.md)。
 - **超出配额以 `EDQUOT` 拒绝**，不是 `ENOSPC`。没有哪块盘满了，是一份额度用完了，而这两句话给使用者指的是完全不同的下一步。两个名字本来就在 errno 词汇表里，那一侧一个字没动。
-- **让 volume 变小的修改从不被拒绝**，已经超出配额时也不拒绝，否则一个超额的 volume 没有任何回到配额之内的路。同理，一份已经装得比配额多的 volume 照常打开 —— 把配额调到已写内容之下是运维日常，答案是「在吐出一些之前不再收新的」，不是「这份 volume 没法服务了」。
+- **额度检查不拒绝缩减内容的修改**，已经超出配额时也如此，使 volume 仍能回到额度之内；其它资源和权限检查保持独立。同理，一份已经装得比配额多的 volume 照常打开 —— 把配额调到已写内容之下是运维日常，答案是「在吐出一些之前不再收新的」，不是「这份 volume 没法服务了」。
 - **配额不得低于 4096 字节**，见下面「statfs 的算术」。
 
 计数 mutex 不跨底层操作持有。所有路径修改都携带计费 hook，由实际发布协调目标与效果，不在 wrapper 中按路径 Stat 或取得 stripe；`File.WriteAt`、`File.Truncate` 与打开时截断同样按实际大小结算。这与[文件锁](2026-09-07-file-locks.md)在最终变更处检查实际资源使用同一边界。`limited` 只向外提供满足权威用量与原生计费义务的文件会话。没有原生计费能力的 backend 在构造时失败，拒绝理由见[目录改名中的配额记账](../bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)。HTTP 与 replicated 不传递 Go accounting hook，配额位于服务端的原生发布一侧。
@@ -90,12 +90,13 @@ FUSE 的 `write(2)` 与 `ftruncate(2)` 分别通过绑定同一对象的 `File.W
 | 操作 | 计数怎么动 |
 |---|---|
 | `Write`、`File.WriteAt`、`File.Truncate`、打开时截断 | 按最终目标的实际新旧长度收费。范围写和截断针对同一保留对象；新建内容全额计入 |
+| `NameSymlink` | 符号链接目标的实际字节按新增内容计入 Used；opaque metadata 总量另有原生预算 |
 | `Remove` | 有打开引用时只移除名字，保留字节继续收费；没有保留引用时，确定删除后释放额度 |
 | `Rename` | 被搬动的字节继续收费。被覆盖节点仍有引用时成为 detached 并保留收费，没有引用时才释放其额度 |
 | 最后引用关闭或到期清理 | 先终止后续发布，排空已接纳操作，再释放最后一个原生保留引用；确定回收 detached 节点后释放其收费，重复关闭不重复退款 |
 | `Create`、`Mkdir`、`RemoveDir`、`SetAttr`、`Read`、`List`、`Stat` | 不动。`Create` 建的是空文件，字节随后由 `Write` 收费，所以建文件从不因为额度用完而失败 |
 
-脱离目录的文件仍可经有效句柄读写，其内容与属性跟随同一个节点；无名字不等于可回收。引用失效先撤销发布资格，尚未释放的原生 pin 只保护排空期间的物理保留，不允许已失效调用继续提交。清理的最终发布结算来自文件会话持有的独立计费 hook，不复用已取消请求的一次性预留；已知清理拒绝继续保留收费，未知清理或计费结果使账本不可用。逻辑额度的释放与对象存储后续垃圾清扫分开，实测物理余量继续约束 `Space.Avail`。
+脱离目录的文件仍可经有效句柄读写，其内容与属性跟随同一个节点；无名字不等于可回收。引用失效先撤销发布资格，尚未释放的原生 pin 只保护排空期间的物理保留，不允许已失效调用继续提交。活引用清理的最终结算使用创建时捕获的 accounting chain，不复用已取消请求的一次性预留；旧 incarnation 恢复在 gate 中取得当前维护 chain，跳过仍由 live owner 持有的 intent，两者不重复结算；已知清理拒绝继续保留收费，未知清理或计费结果使账本不可用。逻辑额度的释放与对象存储后续垃圾清扫分开，实测物理余量继续约束 `Space.Avail`。
 
 **它对不经过这里的修改一律不精确，而且两个方向都错。** 绕过 `limited` 直接修改其底层 volume，是明确的非目标；这不是疏忽，是因为**没有任何经过包装层的流量能把它修回来**：
 

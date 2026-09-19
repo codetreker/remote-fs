@@ -62,7 +62,7 @@ func (s *fileSession) OpenFile(ctx context.Context, name string, options storage
 	if err != nil {
 		return nil, err
 	}
-	return &file{File: inner, storage: s.storage}, nil
+	return s.storage.wrapFile(inner), nil
 }
 
 func (s *fileSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
@@ -75,7 +75,7 @@ func (s *fileSession) OpenNode(ctx context.Context, id uint64, options storage.F
 	if err != nil {
 		return nil, err
 	}
-	return &file{File: inner, storage: s.storage}, nil
+	return s.storage.wrapFile(inner), nil
 }
 
 func (s *fileSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
@@ -101,6 +101,7 @@ func (s *fileSession) Close(ctx context.Context) error {
 type file struct {
 	storage.File
 	storage *Storage
+	referenceCapabilities
 }
 
 func (f *file) Stat(ctx context.Context) (storage.Attr, error) {
@@ -125,26 +126,6 @@ func (f *file) SetAttr(ctx context.Context, change storage.AttrChange) (storage.
 
 func (f *file) Sync(ctx context.Context) error {
 	return f.File.Sync(readContext(ctx))
-}
-
-func (f *file) GetLock(ctx context.Context, owner storage.LockOwner, lock storage.FileLock) (storage.LockConflict, error) {
-	return f.File.GetLock(readContext(ctx), owner, lock)
-}
-
-func (f *file) SetLock(ctx context.Context, owner storage.LockOwner, lock storage.FileLock, request storage.LockRequestID) (storage.LockAttempt, error) {
-	return f.File.SetLock(readContext(ctx), owner, lock, request)
-}
-
-func (f *file) QueryLock(ctx context.Context, owner storage.LockOwner, request storage.LockRequestID) (storage.LockAttempt, error) {
-	return f.File.QueryLock(readContext(ctx), owner, request)
-}
-
-func (f *file) CancelLock(ctx context.Context, owner storage.LockOwner, request storage.LockRequestID) (storage.LockAttempt, error) {
-	return f.File.CancelLock(readContext(ctx), owner, request)
-}
-
-func (f *file) DropLocks(ctx context.Context, owner storage.LockOwner, family storage.LockFamily) error {
-	return f.File.DropLocks(readContext(ctx), owner, family)
 }
 
 func (f *file) Close(ctx context.Context) error {

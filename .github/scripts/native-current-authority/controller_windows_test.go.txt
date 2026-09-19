@@ -1,0 +1,1053 @@
+//go:build windows
+
+package main
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"net"
+	"os"
+	"os/exec"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+	"unicode/utf16"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+)
+
+func TestWindowsFixtureChild(t *testing.T) {
+	if len(os.Args) < 2 {
+		return
+	}
+	switch os.Args[len(os.Args)-1] {
+	case "fixture-child-success":
+		os.Stdout.WriteString("owned child\n")
+		os.Exit(0)
+	case "fixture-child-sleep":
+		time.Sleep(time.Minute)
+		os.Exit(0)
+	case "fixture-child-descendant":
+		executable, err := os.Executable()
+		if err != nil {
+			os.Exit(2)
+		}
+		child := exec.Command(executable, "-test.run=^TestWindowsFixtureChild$", "--", "fixture-child-sleep")
+		if err := child.Start(); err != nil {
+			os.Exit(3)
+		}
+		os.Exit(0)
+	case "fixture-child-control":
+		if len(os.Args) < 4 || os.Args[len(os.Args)-3] != "--" {
+			os.Exit(4)
+		}
+		conn, err := net.DialTimeout("tcp4", os.Args[len(os.Args)-2], 5*time.Second)
+		if err != nil {
+			os.Exit(5)
+		}
+		if _, err := io.Copy(io.Discard, conn); err != nil {
+			os.Exit(6)
+		}
+		if err := conn.Close(); err != nil {
+			os.Exit(7)
+		}
+		os.Exit(0)
+	case "fixture-child-wait-input":
+		if _, err := io.ReadFull(os.Stdin, make([]byte, 1)); err != nil {
+			os.Exit(8)
+		}
+		os.Exit(0)
+	case "fixture-child-environment":
+		if err := json.NewEncoder(os.Stdout).Encode(windowsTestEnvironmentValues()); err != nil {
+			os.Exit(9)
+		}
+		os.Exit(0)
+	}
+}
+
+func TestWindowsEnvironmentKeyAndFold(t *testing.T) {
+	for _, test := range []struct {
+		entry, key string
+	}{
+		{"Path=one=two", "Path"},
+		{"EMPTY=", "EMPTY"},
+		{`=C:=C:\work`, "=C:"},
+		{"=D:=", "=D:"},
+		{"名称=值", "名称"},
+	} {
+		key, err := windowsEnvironmentKey(test.entry)
+		if err != nil || key != test.key {
+			t.Fatal("valid environment entry did not retain its key")
+		}
+	}
+	if windowsEnvironmentFold("pAtH-äÉİı-名称") != "PATH-äÉİı-名称" {
+		t.Fatal("environment folding changed non-ASCII characters or missed ASCII letters")
+	}
+}
+
+func TestWindowsEnvironmentBlock(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		environment []string
+		want        string
+	}{
+		{name: "nil-explicit", want: "\x00\x00"},
+		{name: "empty-explicit", environment: []string{}, want: "\x00\x00"},
+		{
+			name: "stable-first-separator-order",
+			environment: []string{
+				"z=last-ascii", `=D:=D:\later`, "b=one=two", "A=first", `=C:=C:\earlier`, "a=second", "Ä=unicode",
+			},
+			want: "=D:=D:\\later\x00=C:=C:\\earlier\x00A=first\x00a=second\x00b=one=two\x00z=last-ascii\x00Ä=unicode\x00\x00",
+		},
+		{name: "empty-value", environment: []string{"EMPTY="}, want: "EMPTY=\x00\x00"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := slices.Clone(test.environment)
+			block, err := windowsEnvironmentBlock(test.environment)
+			if err != nil || block == nil || !slices.Equal(block, utf16.Encode([]rune(test.want))) {
+				t.Fatal("explicit environment block has incorrect ordering or termination")
+			}
+			if !slices.Equal(test.environment, before) {
+				t.Fatal("environment block construction mutated caller entries")
+			}
+		})
+	}
+	block, err := windowsEnvironmentBlock([]string{"K=文🧪", "E="})
+	want := []uint16{'E', '=', 0, 'K', '=', 0x6587, 0xd83e, 0xddea, 0, 0}
+	if err != nil || !slices.Equal(block, want) {
+		t.Fatal("Unicode environment block lost UTF-16 units or entry separators")
+	}
+}
+
+func TestWindowsEnvironmentInvalidEntries(t *testing.T) {
+	const secret = "sensitive-environment-value"
+	for _, test := range []struct {
+		name, entry string
+	}{
+		{"empty", ""},
+		{"missing-separator", secret},
+		{"missing-key", "=" + secret},
+		{"empty-special-key", "==" + secret},
+		{"nul-key", "NA\x00ME=" + secret},
+		{"nul-value", "NAME=" + secret + "\x00"},
+		{"invalid-key-utf8", "\xff=" + secret},
+		{"invalid-value-utf8", "NAME=" + secret + "\xff"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			key, keyErr := windowsEnvironmentKey(test.entry)
+			environment := []string{"Z=valid", test.entry, "A=valid"}
+			before := slices.Clone(environment)
+			block, blockErr := windowsEnvironmentBlock(environment)
+			if key != "" || block != nil || !errors.Is(keyErr, syscall.EINVAL) || !errors.Is(blockErr, syscall.EINVAL) {
+				t.Fatal("invalid environment entry did not fail with EINVAL")
+			}
+			if strings.Contains(keyErr.Error(), secret) || strings.Contains(blockErr.Error(), secret) {
+				t.Fatal("environment validation exposed an entry value")
+			}
+			if !slices.Equal(environment, before) {
+				t.Fatal("failed environment construction mutated caller entries")
+			}
+		})
+	}
+}
+
+const windowsEnvironmentTestKey = "RFS_FIXTURE_OWNER_ENV_TEST"
+
+type windowsTestEnvironmentValue struct {
+	Value   string `json:"value"`
+	Present bool   `json:"present"`
+}
+
+func windowsTestEnvironmentValues() map[string]windowsTestEnvironmentValue {
+	values := make(map[string]windowsTestEnvironmentValue, 2)
+	for _, key := range []string{"SystemRoot", windowsEnvironmentTestKey} {
+		value, present := os.LookupEnv(key)
+		values[key] = windowsTestEnvironmentValue{Value: value, Present: present}
+	}
+	return values
+}
+
+type windowsEnvironmentTestPlatform struct {
+	windowsPlatform
+	environment []string
+}
+
+func (p windowsEnvironmentTestPlatform) Start(executable string, args []string, directory string) (child, error) {
+	return p.windowsPlatform.StartWithEnvironment(executable, args, directory, p.environment)
+}
+
+func TestWindowsOwnedChildEnvironment(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := os.Environ()
+	t.Cleanup(func() {
+		if !slices.Equal(os.Environ(), parent) {
+			t.Error("owned child launch changed the parent environment")
+		}
+	})
+	inherited := windowsTestEnvironmentValues()
+	childValue := "explicit-child-value-文🧪"
+	if inherited[windowsEnvironmentTestKey].Value == childValue {
+		childValue += "-changed"
+	}
+	explicit := make([]string, 0, len(parent)+1)
+	for _, entry := range parent {
+		key, _, _ := strings.Cut(entry, "=")
+		if !strings.EqualFold(key, windowsEnvironmentTestKey) {
+			explicit = append(explicit, entry)
+		}
+	}
+	explicit = append(explicit, windowsEnvironmentTestKey+"="+childValue)
+	explicitBefore := slices.Clone(explicit)
+	wantExplicit := maps.Clone(inherited)
+	wantExplicit[windowsEnvironmentTestKey] = windowsTestEnvironmentValue{Value: childValue, Present: true}
+	for _, test := range []struct {
+		name string
+		host platform
+		want map[string]windowsTestEnvironmentValue
+	}{
+		{"inherited", windowsPlatform{}, inherited},
+		{"explicit-child-only", windowsEnvironmentTestPlatform{environment: explicit}, wantExplicit},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			output, err := runTool(ctx, test.host, executable, []string{"-test.run=^TestWindowsFixtureChild$", "--", "fixture-child-environment"}, privateTestDirectory(t), "environment")
+			if err != nil {
+				t.Fatal("owned environment child did not complete successfully")
+			}
+			var observed map[string]windowsTestEnvironmentValue
+			if err := json.Unmarshal(output, &observed); err != nil {
+				t.Fatal("owned environment child returned invalid JSON")
+			}
+			if !maps.Equal(observed, test.want) {
+				t.Fatal("owned child did not receive the selected environment values")
+			}
+			if !slices.Equal(os.Environ(), parent) || !slices.Equal(explicit, explicitBefore) {
+				t.Fatal("owned child launch mutated its parent environment or caller entries")
+			}
+		})
+	}
+}
+
+func TestWindowsExplicitEnvironmentRejectedBeforeLaunch(t *testing.T) {
+	const executable = `C:\fixture\unlaunched.exe`
+	const secret = "sensitive-environment-value"
+	process, err := (windowsPlatform{}).StartWithEnvironment(executable, nil, `C:\fixture`, []string{"NAME=" + secret + "\x00"})
+	if process != nil {
+		process.Finish()
+		t.Fatal("invalid explicit environment created a child")
+	}
+	var launch *windowsLaunchError
+	if !errors.Is(err, syscall.EINVAL) || !errors.As(err, &launch) {
+		t.Fatal("invalid explicit environment lost its launch error or EINVAL cause")
+	}
+	facts := launch.Facts
+	if !facts.CleanupConfirmed || facts.RequestedImage != executable || facts.PID != nil ||
+		facts.CreateProcess != nil || facts.AssignJob != nil || facts.QueryImage != nil || facts.QueryMachine != nil ||
+		facts.ResumeThread != nil || facts.PreviousSuspendCount != nil || facts.ActualImage != "" ||
+		facts.ProcessMachine != nil || facts.NativeMachine != nil || facts.CommandLineUnits != 0 || facts.CommandLineSHA256 != "" {
+		t.Fatal("invalid explicit environment fabricated launch stages or unconfirmed cleanup")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatal("failed launch exposed an invalid environment value")
+	}
+}
+
+func TestWindowsOwnedJobNormalAndCancellation(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"fixture-child-success", "fixture-child-sleep", "fixture-child-descendant"} {
+		t.Run(mode, func(t *testing.T) {
+			budget := 5 * time.Second
+			if mode == "fixture-child-sleep" {
+				budget = 200 * time.Millisecond
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), budget)
+			defer cancel()
+			output, err := runTool(ctx, windowsPlatform{}, executable, []string{"-test.run=^TestWindowsFixtureChild$", "--", mode}, privateTestDirectory(t), "child")
+			if mode == "fixture-child-success" {
+				if err != nil || !strings.Contains(string(output), "owned child") {
+					t.Fatalf("normal owned job: %q %v", output, err)
+				}
+			} else if err == nil {
+				t.Fatal("live owned job was reported graceful")
+			}
+			if mode == "fixture-child-descendant" && !strings.Contains(err.Error(), "forced termination") {
+				t.Fatalf("descendant job ownership was not observed: %v", err)
+			}
+		})
+	}
+}
+
+func TestWindowsOwnedChildTerminationClosesPipes(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	process, err := (windowsPlatform{}).Start(executable, []string{"-test.run=^TestWindowsFixtureChild$", "--", "fixture-child-sleep"}, privateTestDirectory(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned := process.(*windowsChild)
+	facts := owned.LaunchFacts()
+	if facts.PID == nil || *facts.PID != process.PID() || facts.PreviousSuspendCount == nil || *facts.PreviousSuspendCount != 1 ||
+		facts.RequestedImage != executable || !strings.EqualFold(facts.ActualImage, executable) || facts.ProcessMachine == nil ||
+		facts.NativeMachine == nil || *facts.ProcessMachine != 0 || *facts.NativeMachine != 0xaa64 || len(facts.CommandLineSHA256) != 64 {
+		t.Fatalf("native launch facts are incomplete: %#v", facts)
+	}
+	for _, call := range []*windowsLaunchCall{facts.CreateProcess, facts.AssignJob, facts.QueryImage, facts.QueryMachine, facts.ResumeThread} {
+		if call == nil || !call.Returned || call.Error != "" || call.OffsetNanos < 0 || call.DurationNanos < 0 {
+			t.Fatalf("native launch stage is incomplete: %#v", call)
+		}
+	}
+	defer process.Finish()
+	active, err := jobActive(owned.job)
+	if err != nil || active != 1 {
+		t.Fatalf("returned child is not exclusively job-owned: active=%d error=%v", active, err)
+	}
+	forced, err := process.Finish()
+	if err != nil || !forced {
+		t.Fatalf("termination not confirmed: forced=%v error=%v", forced, err)
+	}
+	if _, err := io.Copy(io.Discard, process.Output()); err == nil {
+		t.Fatal("owned output pipe remained open")
+	}
+}
+
+type ownedInputTestPipe struct {
+	writes, closes atomic.Int32
+	closeErr       error
+}
+
+func (p *ownedInputTestPipe) Write(data []byte) (int, error) { p.writes.Add(1); return len(data), nil }
+func (p *ownedInputTestPipe) Close() error                   { p.closes.Add(1); return p.closeErr }
+
+func TestOwnedProcessInputCloseOnce(t *testing.T) {
+	for _, closeErr := range []error{nil, errors.New("close failed")} {
+		t.Run(fmt.Sprint(closeErr), func(t *testing.T) {
+			pipe := &ownedInputTestPipe{closeErr: closeErr}
+			input := &ownedProcessInput{pipe: pipe}
+			if n, err := input.Write([]byte("one")); n != 3 || err != nil {
+				t.Fatal(n, err)
+			}
+			var group sync.WaitGroup
+			for range 8 {
+				group.Go(func() {
+					if err := input.Close(); !errors.Is(err, closeErr) {
+						t.Errorf("close result: %v", err)
+					}
+				})
+			}
+			group.Wait()
+			if err := input.Close(); !errors.Is(err, closeErr) || pipe.closes.Load() != 1 {
+				t.Fatalf("duplicate/sticky close: %v %d", err, pipe.closes.Load())
+			}
+			if n, err := input.Write([]byte("two")); n != 0 || !errors.Is(err, os.ErrClosed) || pipe.writes.Load() != 1 {
+				t.Fatalf("write after close: %d %v", n, err)
+			}
+		})
+	}
+	t.Run("close interrupts blocked write", func(t *testing.T) {
+		reader, writer := io.Pipe()
+		defer reader.Close()
+		defer writer.Close()
+		input := &ownedProcessInput{pipe: writer}
+		done := make(chan error, 1)
+		go func() { _, err := input.Write([]byte("blocked")); done <- err }()
+		if _, err := io.ReadFull(reader, make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		}
+		closed := make(chan error, 1)
+		go func() { closed <- input.Close() }()
+		select {
+		case err := <-closed:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("input close waited for its blocked write")
+		}
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("blocked write became success")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("input close waited for its blocked write")
+		}
+	})
+}
+
+func TestWindowsResumePostcondition(t *testing.T) {
+	for _, count := range []uint32{0, 1, 2, ^uint32(0)} {
+		if err := checkWindowsResumeCount(count); (err == nil) != (count == 1) {
+			t.Fatalf("resume count %d: %v", count, err)
+		}
+	}
+}
+
+func TestWindowsLaunchObservations(t *testing.T) {
+	start := time.Unix(10, 0)
+	now := start.Add(3 * time.Millisecond)
+	clock := func() time.Time { return now }
+	cause := errors.New("native query failed")
+	var call *windowsLaunchCall
+	err := observeWindowsLaunchCall(start, clock, &call, func() error {
+		if call == nil || call.Returned {
+			t.Fatal("unfinished call fabricated a returned result")
+		}
+		now = now.Add(2 * time.Millisecond)
+		return cause
+	})
+	if !errors.Is(err, cause) || call.OffsetNanos != int64(3*time.Millisecond) || call.DurationNanos != int64(2*time.Millisecond) || !call.Returned || call.Error != cause.Error() {
+		t.Fatalf("call facts: %#v %v", call, err)
+	}
+	for _, fail := range []string{"", "image", "machine"} {
+		t.Run(fail, func(t *testing.T) {
+			facts := windowsLaunchFacts{RequestedImage: "requested.exe"}
+			machines := 0
+			err := observeWindowsImage(&facts, start, clock, func() (string, error) {
+				if fail == "image" {
+					return "untrusted-partial.exe", cause
+				}
+				return "actual.exe", nil
+			}, func() (uint16, uint16, error) {
+				machines++
+				if fail == "machine" {
+					return 1, 2, cause
+				}
+				return 0, 0xaa64, nil
+			})
+			if fail == "" {
+				if err != nil || facts.ActualImage != "actual.exe" || facts.ProcessMachine == nil || *facts.ProcessMachine != 0 || facts.NativeMachine == nil || *facts.NativeMachine != 0xaa64 {
+					t.Fatalf("image facts: %#v %v", facts, err)
+				}
+			} else {
+				wrapped := &windowsLaunchError{Facts: facts, Cause: errors.Join(cause, err)}
+				if !errors.Is(wrapped, cause) || facts.ProcessMachine != nil || facts.NativeMachine != nil {
+					t.Fatalf("failed query fabricated machine facts: %#v %v", facts, wrapped)
+				}
+				if fail == "image" && (facts.ActualImage != "" || machines != 0 || facts.QueryMachine != nil) {
+					t.Fatalf("failed image query fabricated later facts: %#v", facts)
+				}
+				if fail == "machine" && facts.ActualImage != "actual.exe" {
+					t.Fatal("validated image fact was lost")
+				}
+			}
+		})
+	}
+	if err := observeWindowsLaunchCall(start, clock, &call, func() error { return errors.New(strings.Repeat("x", 600)) }); err == nil || !call.ErrorTruncated || len(call.Error) != 512 {
+		t.Fatal("native error detail was not bounded")
+	}
+}
+
+func TestJobAccountingABIAndReturnedLength(t *testing.T) {
+	if err := checkJobAccountingABI(); err != nil {
+		t.Fatal(err)
+	}
+	var value jobAccounting
+	if unsafe.Sizeof(value) != 48 || unsafe.Alignof(value) != 8 || unsafe.Offsetof(value.ActiveProcesses) != 40 || unsafe.Offsetof(value.TerminatedProcesses) != 44 {
+		t.Fatal("Windows 64-bit accounting ABI differs")
+	}
+	for _, length := range []uint32{0, 40, 47, 48, 49, 96} {
+		active, err := readJobActive(func(value *jobAccounting, returned *uint32) error {
+			value.TotalProcesses = 99
+			value.ActiveProcesses = 3
+			*returned = length
+			return nil
+		})
+		if length == 48 {
+			if err != nil || active != 3 {
+				t.Fatalf("active count confused with total: %d %v", active, err)
+			}
+		} else if err == nil {
+			t.Fatalf("accepted returned length %d", length)
+		}
+	}
+	failure := errors.New("query failure")
+	if _, err := readJobActive(func(*jobAccounting, *uint32) error { return failure }); !errors.Is(err, failure) {
+		t.Fatalf("lost query error: %v", err)
+	}
+}
+
+func TestOwnedJobRundownTransitions(t *testing.T) {
+	queryFailure := errors.New("query failure")
+	terminateFailure := errors.New("terminate failure")
+	for _, test := range []struct {
+		name             string
+		exited           bool
+		initial          []uint32
+		queryErr         error
+		postQueryErr     error
+		terminateErr     error
+		remainAfterForce bool
+		wantForced       bool
+		wantError        error
+		wantElapsed      time.Duration
+	}{
+		{name: "exited-counter-settles", exited: true, initial: []uint32{1, 1, 0}, wantElapsed: 2 * time.Second},
+		{name: "exited-empty", exited: true, initial: []uint32{0}},
+		{name: "live-root-forces-before-query", exited: false, initial: []uint32{1}, wantForced: true},
+		{name: "descendant-exceeds-natural-budget", exited: true, initial: []uint32{1}, wantForced: true, wantError: errJobRundownDeadline, wantElapsed: 5 * time.Second},
+		{name: "query-error-remains-failure", exited: true, initial: []uint32{1}, queryErr: queryFailure, wantForced: true, wantError: queryFailure},
+		{name: "forced-confirmation-query-error", exited: false, initial: []uint32{1}, postQueryErr: queryFailure, wantForced: true, wantError: queryFailure},
+		{name: "termination-error-remains-failure", exited: false, initial: []uint32{1}, terminateErr: terminateFailure, wantForced: true, wantError: terminateFailure},
+		{name: "forced-confirmation-stays-nonempty", exited: true, initial: []uint32{1}, remainAfterForce: true, wantForced: true, wantError: errJobRundownDeadline, wantElapsed: 10 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			started := time.Unix(1000, 0)
+			now := started
+			reads := 0
+			terminations := 0
+			firstOperation := ""
+			ops := jobRundownOps{
+				now: func() time.Time { return now },
+				active: func() (uint32, error) {
+					if firstOperation == "" {
+						firstOperation = "query"
+					}
+					if terminations != 0 {
+						if test.postQueryErr != nil {
+							return 0, test.postQueryErr
+						}
+						if test.remainAfterForce {
+							return 1, nil
+						}
+						return 0, nil
+					}
+					if test.queryErr != nil {
+						return 0, test.queryErr
+					}
+					index := min(reads, len(test.initial)-1)
+					reads++
+					return test.initial[index], nil
+				},
+				terminate: func() error {
+					if firstOperation == "" {
+						firstOperation = "terminate"
+					}
+					terminations++
+					return test.terminateErr
+				},
+				pause: func(deadline time.Time) error {
+					now = now.Add(time.Second)
+					if now.After(deadline) {
+						t.Fatal("wait passed its deadline")
+					}
+					return nil
+				},
+			}
+			forced, err := finishJobRundown(test.exited, started.Add(10*time.Second), ops)
+			if forced != test.wantForced || (test.wantError == nil && err != nil) || (test.wantError != nil && !errors.Is(err, test.wantError)) {
+				t.Fatalf("forced=%v err=%v", forced, err)
+			}
+			if forced && terminations != 1 || !forced && terminations != 0 {
+				t.Fatalf("termination count %d", terminations)
+			}
+			if !test.exited && firstOperation != "terminate" {
+				t.Fatal("live root was given natural-exit grace")
+			}
+			if elapsed := now.Sub(started); elapsed != test.wantElapsed {
+				t.Fatalf("elapsed %s, expected %s", elapsed, test.wantElapsed)
+			}
+		})
+	}
+}
+
+func TestWindowsProcessWaiterClosesHandleBeforeDone(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	process, err := (windowsPlatform{}).Start(executable, []string{"-test.run=^TestWindowsFixtureChild$", "--", "fixture-child-success"}, privateTestDirectory(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer process.Finish()
+	stdout := make(chan error, 1)
+	stderr := make(chan error, 1)
+	go func() { _, err := io.Copy(io.Discard, process.Output()); stdout <- err }()
+	go func() { _, err := io.Copy(io.Discard, process.Errors()); stderr <- err }()
+	select {
+	case <-process.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("root did not exit")
+	}
+	owned := process.(*windowsChild)
+	if !owned.exitObserved || owned.processCloseErr != nil || owned.Result() != nil {
+		t.Fatalf("Done preceded successful wait/handle close: exited=%v close=%v result=%v", owned.exitObserved, owned.processCloseErr, owned.Result())
+	}
+	owned.processMu.Lock()
+	retained := owned.process
+	owned.processMu.Unlock()
+	if retained != 0 {
+		t.Fatal("Done preceded release of the retained process handle")
+	}
+	for _, stream := range []<-chan error{stdout, stderr} {
+		select {
+		case err := <-stream:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("root output did not drain")
+		}
+	}
+	if forced, err := process.Finish(); forced || err != nil {
+		t.Fatalf("normal root did not reach actual empty job: forced=%v error=%v", forced, err)
+	}
+}
+
+func TestOwnedJobSlowQueryCannotPassItsDeadline(t *testing.T) {
+	now := time.Unix(1000, 0)
+	forced := false
+	result, err := finishJobRundown(true, now.Add(10*time.Second), jobRundownOps{
+		now: func() time.Time { return now },
+		active: func() (uint32, error) {
+			if !forced {
+				now = now.Add(6 * time.Second)
+			}
+			return 0, nil
+		},
+		terminate: func() error { forced = true; return nil },
+		pause:     func(time.Time) error { t.Fatal("empty query must not poll"); return nil },
+	})
+	if !result || !forced || !errors.Is(err, errJobRundownDeadline) {
+		t.Fatalf("late empty query passed: forced=%v err=%v", result, err)
+	}
+	if err := pauseJobRundown(time.Now().Add(-time.Second)); !errors.Is(err, errJobRundownDeadline) {
+		t.Fatalf("expired poll deadline ignored: %v", err)
+	}
+}
+
+type controlTCPTestRow struct {
+	local, remote controlEndpoint
+	state, pid    uint32
+}
+
+func controlTCPTestTable(rows ...controlTCPTestRow) []byte {
+	table := make([]byte, 4+24*len(rows))
+	binary.LittleEndian.PutUint32(table, uint32(len(rows)))
+	for index, value := range rows {
+		row := table[4+24*index : 4+24*(index+1)]
+		binary.LittleEndian.PutUint32(row, value.state)
+		copy(row[4:8], value.local.IP[:])
+		binary.BigEndian.PutUint16(row[8:10], value.local.Port)
+		row[10], row[11] = 0xa5, 0x5a
+		copy(row[12:16], value.remote.IP[:])
+		binary.BigEndian.PutUint16(row[16:18], value.remote.Port)
+		row[18], row[19] = 0xa5, 0x5a
+		binary.LittleEndian.PutUint32(row[20:24], value.pid)
+	}
+	return table
+}
+
+func TestControlTCPTableOwnership(t *testing.T) {
+	local := controlEndpoint{IP: [4]byte{127, 0, 0, 1}, Port: 31002}
+	remote := controlEndpoint{IP: [4]byte{127, 0, 0, 2}, Port: 49231}
+	correct := controlTCPTestRow{local: remote, remote: local, state: 5, pid: 731}
+	for _, test := range []struct {
+		name   string
+		mutate func([]byte) ([]byte, uint32)
+		rows   []controlTCPTestRow
+		ok     bool
+	}{
+		{name: "reversed-tuple-network-order-upper-port-bits-ignored", rows: []controlTCPTestRow{correct}, ok: true},
+		{name: "trailing-capacity", rows: []controlTCPTestRow{correct}, ok: true, mutate: func(b []byte) ([]byte, uint32) { return append(b, make([]byte, 32)...), uint32(len(b) + 8) }},
+		{name: "unrelated-row", rows: []controlTCPTestRow{{local: local, remote: remote, state: 5, pid: 99}, correct}, ok: true},
+		{name: "forward-tuple", rows: []controlTCPTestRow{{local: local, remote: remote, state: 5, pid: 731}}},
+		{name: "wrong-pid", rows: []controlTCPTestRow{{local: remote, remote: local, state: 5, pid: 732}}},
+		{name: "not-established", rows: []controlTCPTestRow{{local: remote, remote: local, state: 8, pid: 731}}},
+		{name: "absent"},
+		{name: "ambiguous", rows: []controlTCPTestRow{correct, correct}},
+		{name: "conflicting-owner", rows: []controlTCPTestRow{correct, {local: remote, remote: local, state: 5, pid: 732}}},
+		{name: "truncated-header", mutate: func([]byte) ([]byte, uint32) { return []byte{0, 0, 0}, 3 }},
+		{name: "truncated-row", rows: []controlTCPTestRow{correct}, mutate: func(b []byte) ([]byte, uint32) { return b[:len(b)-1], uint32(len(b) - 1) }},
+		{name: "returned-beyond-allocation", rows: []controlTCPTestRow{correct}, mutate: func(b []byte) ([]byte, uint32) { return b, uint32(len(b) + 1) }},
+		{name: "count-beyond-returned", rows: []controlTCPTestRow{correct}, mutate: func(b []byte) ([]byte, uint32) { return b, 4 }},
+		{name: "overlarge-count", rows: []controlTCPTestRow{correct}, mutate: func(b []byte) ([]byte, uint32) {
+			binary.LittleEndian.PutUint32(b, ^uint32(0))
+			return b, uint32(len(b))
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			table := controlTCPTestTable(test.rows...)
+			size := uint32(len(table))
+			if test.mutate != nil {
+				table, size = test.mutate(table)
+			}
+			err := verifyControlTCPTable(table, size, local, remote, 731)
+			if (err == nil) != test.ok {
+				t.Fatalf("ownership result=%v, want success=%v", err, test.ok)
+			}
+		})
+	}
+}
+
+func TestControlEndpointValidation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		addr net.Addr
+		ok   bool
+	}{
+		{name: "ipv4-loopback", addr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1}, ok: true},
+		{name: "ipv4-high-port", addr: &net.TCPAddr{IP: net.IP{127, 0, 0, 2}, Port: 65535}, ok: true},
+		{name: "missing", addr: nil},
+		{name: "typed-nil", addr: (*net.TCPAddr)(nil)},
+		{name: "unix", addr: &net.UnixAddr{Name: "control", Net: "unix"}},
+		{name: "ipv6", addr: &net.TCPAddr{IP: net.ParseIP("::1"), Port: 1}},
+		{name: "non-loopback", addr: &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 1}},
+		{name: "wildcard", addr: &net.TCPAddr{IP: net.IPv4zero, Port: 1}},
+		{name: "zero-port", addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}},
+		{name: "negative-port", addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: -1}},
+		{name: "overflow-port", addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 65536}},
+		{name: "zone", addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1, Zone: "zone"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := controlEndpointFromAddr(test.addr)
+			if (err == nil) != test.ok {
+				t.Fatalf("endpoint result=%v, want success=%v", err, test.ok)
+			}
+		})
+	}
+}
+
+func TestControlTCPQueryBoundsAndStatus(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status uint32
+		size   uint32
+		ok     bool
+	}{
+		{name: "success", size: 4, ok: true},
+		{name: "insufficient-buffer", status: 122, size: controlTCPTableCapacity + 4},
+		{name: "access-denied", status: 5, size: 4},
+		{name: "short-result", size: 3},
+		{name: "oversized-result", size: controlTCPTableCapacity + 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			table, size, err := readControlTCPTable(func(table []byte, size *uint32) uint32 {
+				calls++
+				if len(table) != controlTCPTableCapacity || *size != controlTCPTableCapacity {
+					t.Fatal("query did not use the fixed one-MiB buffer")
+				}
+				*size = test.size
+				return test.status
+			})
+			if calls != 1 || (err == nil) != test.ok {
+				t.Fatalf("calls=%d result=%v", calls, err)
+			}
+			if test.status != 0 && !errors.Is(err, syscall.Errno(test.status)) {
+				t.Fatalf("lost API return status: %v", err)
+			}
+			if test.ok && (len(table) != controlTCPTableCapacity || size != test.size) {
+				t.Fatal("query lost its returned bounds")
+			}
+		})
+	}
+}
+
+func TestLiveControlPeerProof(t *testing.T) {
+	local := controlEndpoint{IP: [4]byte{127, 0, 0, 1}, Port: 30123}
+	remote := controlEndpoint{IP: [4]byte{127, 0, 0, 1}, Port: 49123}
+	failure := errors.New("native query failed")
+	for _, test := range []struct {
+		name      string
+		firstDead bool
+		lastDead  bool
+		pid       uint32
+		pidErr    error
+		tableErr  error
+		cancelAt  string
+		wantErr   error
+		wantCalls string
+	}{
+		{name: "live-owned", pid: 731, wantCalls: "live,pid,table,live"},
+		{name: "signaled-before-query", firstDead: true, pid: 731, wantErr: failure, wantCalls: "live"},
+		{name: "signaled-after-query", lastDead: true, pid: 731, wantErr: failure, wantCalls: "live,pid,table,live"},
+		{name: "handle-pid-mismatch", pid: 732, wantCalls: "live,pid"},
+		{name: "handle-pid-query-error", pidErr: failure, wantErr: failure, wantCalls: "live,pid"},
+		{name: "table-query-error", pid: 731, tableErr: failure, wantErr: failure, wantCalls: "live,pid,table"},
+		{name: "expired-before-proof", pid: 731, cancelAt: "before", wantErr: context.Canceled},
+		{name: "expired-before-table", pid: 731, cancelAt: "pid", wantErr: context.Canceled, wantCalls: "live,pid"},
+		{name: "expired-after-table", pid: 731, cancelAt: "table", wantErr: context.Canceled, wantCalls: "live,pid,table"},
+		{name: "expired-after-final-live", pid: 731, cancelAt: "last-live", wantErr: context.Canceled, wantCalls: "live,pid,table,live"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if test.cancelAt == "before" {
+				cancel()
+			}
+			var calls []string
+			livenessChecks := 0
+			err := verifyLiveControlPeer(ctx, 731, local, remote, controlPeerOps{
+				live: func() error {
+					calls = append(calls, "live")
+					livenessChecks++
+					if livenessChecks == 1 && test.firstDead || livenessChecks == 2 && test.lastDead {
+						return failure
+					}
+					if livenessChecks == 2 && test.cancelAt == "last-live" {
+						cancel()
+					}
+					return nil
+				},
+				pid: func() (uint32, error) {
+					calls = append(calls, "pid")
+					if test.cancelAt == "pid" {
+						cancel()
+					}
+					return test.pid, test.pidErr
+				},
+				table: func() ([]byte, uint32, error) {
+					calls = append(calls, "table")
+					if test.cancelAt == "table" {
+						cancel()
+					}
+					table := controlTCPTestTable(controlTCPTestRow{local: remote, remote: local, state: 5, pid: 731})
+					return table, uint32(len(table)), test.tableErr
+				},
+			})
+			if test.name == "live-owned" && err != nil || test.name != "live-owned" && err == nil {
+				t.Fatalf("proof result=%v", err)
+			}
+			if test.wantErr != nil && !errors.Is(err, test.wantErr) {
+				t.Fatalf("lost cause: %v", err)
+			}
+			if got := strings.Join(calls, ","); got != test.wantCalls {
+				t.Fatalf("proof calls=%q, want=%q", got, test.wantCalls)
+			}
+		})
+	}
+}
+
+func TestOwnedJobAbsoluteCleanupDeadline(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		exited    bool
+		remaining time.Duration
+	}{
+		{name: "expired-live", remaining: 0},
+		{name: "expired-exited", exited: true, remaining: 0},
+		{name: "natural-remainder", exited: true, remaining: time.Second},
+		{name: "forced-remainder", remaining: time.Second},
+		{name: "shared-seven-second-budget", exited: true, remaining: 7 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			start := time.Unix(1000, 0)
+			now := start
+			queries, terminations := 0, 0
+			forced, err := finishJobRundown(test.exited, start.Add(test.remaining), jobRundownOps{
+				now:       func() time.Time { return now },
+				active:    func() (uint32, error) { queries++; return 1, nil },
+				terminate: func() error { terminations++; return nil },
+				pause: func(deadline time.Time) error {
+					now = clampJobDeadline(now.Add(time.Second), deadline)
+					return nil
+				},
+			})
+			if !forced || terminations != 1 || !errors.Is(err, errJobRundownDeadline) || now.Sub(start) != test.remaining {
+				t.Fatalf("forced=%v terminations=%d elapsed=%s err=%v", forced, terminations, now.Sub(start), err)
+			}
+			if test.remaining == 0 && queries != 0 {
+				t.Fatal("expired cleanup performed another state query")
+			}
+		})
+	}
+}
+
+func startWindowsSocketTestChild(t *testing.T, mode string, args ...string) *windowsChild {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := append([]string{"-test.run=^TestWindowsFixtureChild$", "--"}, args...)
+	command = append(command, mode)
+	process, err := (windowsPlatform{}).Start(executable, command, privateTestDirectory(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned := process.(*windowsChild)
+	streams := make(chan error, 2)
+	go func() { _, err := io.Copy(io.Discard, owned.Output()); streams <- err }()
+	go func() { _, err := io.Copy(io.Discard, owned.Errors()); streams <- err }()
+	t.Cleanup(func() {
+		if _, err := owned.Finish(); err != nil {
+			t.Errorf("owned socket child cleanup: %v", err)
+		}
+		deadline := time.NewTimer(5 * time.Second)
+		defer deadline.Stop()
+		for range 2 {
+			select {
+			case err := <-streams:
+				if err != nil && !errors.Is(err, os.ErrClosed) {
+					t.Errorf("owned socket child log: %v", err)
+				}
+			case <-deadline.C:
+				t.Error("owned socket child log did not finish")
+				return
+			}
+		}
+	})
+	return owned
+}
+
+func TestWindowsControlSocketOwnedAndForeignPeer(t *testing.T) {
+	for _, foreign := range []bool{false, true} {
+		name := "owned-child"
+		if foreign {
+			name = "foreign-parent"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			listener, err := (windowsPlatform{}).ListenControl(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			deadline, _ := ctx.Deadline()
+			if err := listener.(*net.TCPListener).SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			var process *windowsChild
+			if foreign {
+				process = startWindowsSocketTestChild(t, "fixture-child-sleep")
+				conn, err := (&net.Dialer{}).DialContext(ctx, "tcp4", listener.Addr().String())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Close()
+			} else {
+				process = startWindowsSocketTestChild(t, "fixture-child-control", listener.Addr().String())
+			}
+			conn, err := listener.Accept()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			facts, err := process.VerifyControlPeer(ctx, conn)
+			if foreign {
+				if err == nil || facts != nil {
+					t.Fatal("foreign test-parent connection authenticated as the owned child")
+				}
+				return
+			}
+			if err != nil || facts["owner_pid"] != process.PID() || facts["local_address"] != conn.LocalAddr().String() || facts["remote_address"] != conn.RemoteAddr().String() {
+				t.Fatalf("owned connection proof: facts=%v err=%v", facts, err)
+			}
+			if err := conn.Close(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-process.Done():
+			case <-ctx.Done():
+				t.Fatal("owned control child did not exit after EOF")
+			}
+			if _, err := process.VerifyControlPeer(ctx, conn); err == nil {
+				t.Fatal("exited process retained authority to authenticate a socket")
+			}
+			if forced, err := process.FinishBefore(deadline); forced || err != nil {
+				t.Fatalf("owned control child did not finish gracefully: forced=%v err=%v", forced, err)
+			}
+		})
+	}
+}
+
+func TestWindowsControlListenerExclusiveBind(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	listener, err := (windowsPlatform{}).ListenControl(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if address := listener.Addr().(*net.TCPAddr); !address.IP.Equal(net.IPv4(127, 0, 0, 1)) || address.Port == 0 {
+		t.Fatalf("listener endpoint: %v", address)
+	}
+	configured := false
+	reuse := net.ListenConfig{Control: func(network, address string, raw syscall.RawConn) error {
+		var socketErr error
+		err := raw.Control(func(socket uintptr) {
+			socketErr = windows.SetsockoptInt(windows.Handle(socket), windows.SOL_SOCKET, windows.SO_REUSEADDR, 1)
+			configured = socketErr == nil
+		})
+		return errors.Join(err, socketErr)
+	}}
+	challenger, err := reuse.Listen(ctx, "tcp4", listener.Addr().String())
+	if challenger != nil {
+		challenger.Close()
+	}
+	if !configured || err == nil || challenger != nil {
+		t.Fatalf("reuse-address challenger was not refused after configuration: configured=%v error=%v", configured, err)
+	}
+	canceled, stop := context.WithCancel(context.Background())
+	stop()
+	if extra, err := (windowsPlatform{}).ListenControl(canceled); extra != nil || !errors.Is(err, context.Canceled) {
+		if extra != nil {
+			extra.Close()
+		}
+		t.Fatalf("canceled listener setup: %v", err)
+	}
+}
+
+func TestWindowsWaiterSerializesControlHandleClosure(t *testing.T) {
+	process := startWindowsSocketTestChild(t, "fixture-child-wait-input")
+	process.processMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			process.processMu.Unlock()
+		}
+	}()
+	if _, err := process.Input().Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	wait, err := windows.WaitForSingleObject(process.process, 5000)
+	if err != nil || wait != windows.WAIT_OBJECT_0 {
+		t.Fatalf("child exit not observed: wait=%d error=%v", wait, err)
+	}
+	select {
+	case <-process.Done():
+		t.Fatal("waiter closed a handle while the control proof held its mutex")
+	default:
+	}
+	if process.process == 0 {
+		t.Fatal("retained process handle disappeared while locked")
+	}
+	process.processMu.Unlock()
+	locked = false
+	select {
+	case <-process.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter did not finish after the control proof released its mutex")
+	}
+	process.processMu.Lock()
+	retained := process.process
+	process.processMu.Unlock()
+	if retained != 0 || process.Result() != nil {
+		t.Fatalf("waiter handle closure: retained=%v result=%v", retained, process.Result())
+	}
+	if forced, err := process.Finish(); forced || err != nil {
+		t.Fatalf("waited child cleanup: forced=%v err=%v", forced, err)
+	}
+}

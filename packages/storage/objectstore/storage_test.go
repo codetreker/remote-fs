@@ -15,6 +15,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -81,7 +82,10 @@ func newParts(t *testing.T, allowance int64) parts {
 	if err != nil {
 		t.Fatalf("reaching the blob container: %v", err)
 	}
-	meta, err := sqlite.Open(t.Context(), database, "workspace", allowance, sqlite.DefaultWindow())
+	meta, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
+		Database: database, Volume: "workspace", Allowance: allowance,
+		SQLite: sqlite.DefaultOptions(), Locks: locking.DefaultOptions(), Initialize: true,
+	})
 	if err != nil {
 		t.Fatalf("opening the metastore: %v", err)
 	}
@@ -147,6 +151,10 @@ func makeContainer(ctx context.Context, name string) error {
 // every other volume does.
 func TestContract(t *testing.T) {
 	storagetest.Run(t, newStorage)
+}
+
+func TestMetadataContract(t *testing.T) {
+	storagetest.RunMetadata(t, newStorage)
 }
 
 func TestBoundedContract(t *testing.T) {
