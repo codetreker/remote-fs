@@ -4,12 +4,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestWindowsFixtureChild(t *testing.T) {
@@ -85,5 +87,178 @@ func TestWindowsOwnedChildTerminationClosesPipes(t *testing.T) {
 	}
 	if _, err := io.Copy(io.Discard, process.Output()); err == nil {
 		t.Fatal("owned output pipe remained open")
+	}
+}
+
+func TestJobAccountingABIAndReturnedLength(t *testing.T) {
+	if err := checkJobAccountingABI(); err != nil {
+		t.Fatal(err)
+	}
+	var value jobAccounting
+	if unsafe.Sizeof(value) != 48 || unsafe.Alignof(value) != 8 || unsafe.Offsetof(value.ActiveProcesses) != 40 || unsafe.Offsetof(value.TerminatedProcesses) != 44 {
+		t.Fatal("Windows 64-bit accounting ABI differs")
+	}
+	for _, length := range []uint32{0, 40, 47, 48, 49, 96} {
+		active, err := readJobActive(func(value *jobAccounting, returned *uint32) error {
+			value.TotalProcesses = 99
+			value.ActiveProcesses = 3
+			*returned = length
+			return nil
+		})
+		if length == 48 {
+			if err != nil || active != 3 {
+				t.Fatalf("active count confused with total: %d %v", active, err)
+			}
+		} else if err == nil {
+			t.Fatalf("accepted returned length %d", length)
+		}
+	}
+	failure := errors.New("query failure")
+	if _, err := readJobActive(func(*jobAccounting, *uint32) error { return failure }); !errors.Is(err, failure) {
+		t.Fatalf("lost query error: %v", err)
+	}
+}
+
+func TestOwnedJobRundownTransitions(t *testing.T) {
+	queryFailure := errors.New("query failure")
+	terminateFailure := errors.New("terminate failure")
+	for _, test := range []struct {
+		name             string
+		exited           bool
+		initial          []uint32
+		queryErr         error
+		postQueryErr     error
+		terminateErr     error
+		remainAfterForce bool
+		wantForced       bool
+		wantError        error
+		wantElapsed      time.Duration
+	}{
+		{name: "exited-counter-settles", exited: true, initial: []uint32{1, 1, 0}, wantElapsed: 2 * time.Second},
+		{name: "exited-empty", exited: true, initial: []uint32{0}},
+		{name: "live-root-forces-before-query", exited: false, initial: []uint32{1}, wantForced: true},
+		{name: "descendant-exceeds-natural-budget", exited: true, initial: []uint32{1}, wantForced: true, wantError: errJobRundownDeadline, wantElapsed: 5 * time.Second},
+		{name: "query-error-remains-failure", exited: true, initial: []uint32{1}, queryErr: queryFailure, wantForced: true, wantError: queryFailure},
+		{name: "forced-confirmation-query-error", exited: false, initial: []uint32{1}, postQueryErr: queryFailure, wantForced: true, wantError: queryFailure},
+		{name: "termination-error-remains-failure", exited: false, initial: []uint32{1}, terminateErr: terminateFailure, wantForced: true, wantError: terminateFailure},
+		{name: "forced-confirmation-stays-nonempty", exited: true, initial: []uint32{1}, remainAfterForce: true, wantForced: true, wantError: errJobRundownDeadline, wantElapsed: 10 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			started := time.Unix(1000, 0)
+			now := started
+			reads := 0
+			terminations := 0
+			firstOperation := ""
+			ops := jobRundownOps{
+				now: func() time.Time { return now },
+				active: func() (uint32, error) {
+					if firstOperation == "" {
+						firstOperation = "query"
+					}
+					if terminations != 0 {
+						if test.postQueryErr != nil {
+							return 0, test.postQueryErr
+						}
+						if test.remainAfterForce {
+							return 1, nil
+						}
+						return 0, nil
+					}
+					if test.queryErr != nil {
+						return 0, test.queryErr
+					}
+					index := min(reads, len(test.initial)-1)
+					reads++
+					return test.initial[index], nil
+				},
+				terminate: func() error {
+					if firstOperation == "" {
+						firstOperation = "terminate"
+					}
+					terminations++
+					return test.terminateErr
+				},
+				pause: func(deadline time.Time) error {
+					now = now.Add(time.Second)
+					if now.After(deadline) {
+						t.Fatal("wait passed its deadline")
+					}
+					return nil
+				},
+			}
+			forced, err := finishJobRundown(test.exited, 5*time.Second, ops)
+			if forced != test.wantForced || (test.wantError == nil && err != nil) || (test.wantError != nil && !errors.Is(err, test.wantError)) {
+				t.Fatalf("forced=%v err=%v", forced, err)
+			}
+			if forced && terminations != 1 || !forced && terminations != 0 {
+				t.Fatalf("termination count %d", terminations)
+			}
+			if !test.exited && firstOperation != "terminate" {
+				t.Fatal("live root was given natural-exit grace")
+			}
+			if elapsed := now.Sub(started); elapsed != test.wantElapsed {
+				t.Fatalf("elapsed %s, expected %s", elapsed, test.wantElapsed)
+			}
+		})
+	}
+}
+
+func TestWindowsProcessWaiterClosesHandleBeforeDone(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	process, err := (windowsPlatform{}).Start(executable, []string{"-test.run=^TestWindowsFixtureChild$", "--", "fixture-child-success"}, privateTestDirectory(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer process.Finish()
+	stdout := make(chan error, 1)
+	stderr := make(chan error, 1)
+	go func() { _, err := io.Copy(io.Discard, process.Output()); stdout <- err }()
+	go func() { _, err := io.Copy(io.Discard, process.Errors()); stderr <- err }()
+	select {
+	case <-process.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("root did not exit")
+	}
+	owned := process.(*windowsChild)
+	if !owned.exitObserved || owned.processCloseErr != nil || owned.Result() != nil {
+		t.Fatalf("Done preceded successful wait/handle close: exited=%v close=%v result=%v", owned.exitObserved, owned.processCloseErr, owned.Result())
+	}
+	for _, stream := range []<-chan error{stdout, stderr} {
+		select {
+		case err := <-stream:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("root output did not drain")
+		}
+	}
+	if forced, err := process.Finish(); forced || err != nil {
+		t.Fatalf("normal root did not reach actual empty job: forced=%v error=%v", forced, err)
+	}
+}
+
+func TestOwnedJobSlowQueryCannotPassItsDeadline(t *testing.T) {
+	now := time.Unix(1000, 0)
+	forced := false
+	result, err := finishJobRundown(true, 5*time.Second, jobRundownOps{
+		now: func() time.Time { return now },
+		active: func() (uint32, error) {
+			if !forced {
+				now = now.Add(6 * time.Second)
+			}
+			return 0, nil
+		},
+		terminate: func() error { forced = true; return nil },
+		pause:     func(time.Time) error { t.Fatal("empty query must not poll"); return nil },
+	})
+	if !result || !forced || !errors.Is(err, errJobRundownDeadline) {
+		t.Fatalf("late empty query passed: forced=%v err=%v", result, err)
+	}
+	if err := pauseJobRundown(time.Now().Add(-time.Second)); !errors.Is(err, errJobRundownDeadline) {
+		t.Fatalf("expired poll deadline ignored: %v", err)
 	}
 }

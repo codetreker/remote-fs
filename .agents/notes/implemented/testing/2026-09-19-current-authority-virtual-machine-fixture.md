@@ -16,7 +16,7 @@ Windows 系统客户端的验收需要实际接入当前 HTTP 与持久 authorit
 
 每次运行复制私有可写 ext4 磁盘。guest 中 authority 以 UID/GID 1000 访问真实 localstore、SQLite、nativelease 与 local objects；宿主只开放一个 loopback HTTP 转发，无共享宿主目录。PID 1 在任何 mount/修改前核对执行身份、初始 root、配置和 boot token；nonce、顺序号、有界控制输出将实际 child 生命周期绑定到本次运行。
 
-Windows 目录采用受保护的 owner/SYSTEM DACL，文件内容写入前核对拥有权与权限；reparse 或额外 ACE 不被默认接受。QEMU、探针和提取进程先挂起启动、加入未命名 kill-on-close Job Object，再恢复。正常完成要求 authority 实际退出、guest sync/unmount、QEMU 退出和流排空，再删除私有副本并核对基底未变。强制终止保留失败，不能借清扫取得成功。
+Windows 目录采用受保护的 owner/SYSTEM DACL，文件内容写入前核对拥有权与权限；reparse 或额外 ACE 不被默认接受。QEMU、探针和提取进程先挂起启动、加入未命名 kill-on-close Job Object，再恢复。根进程退出与整个 Job 清空是不同事实：退出后最多用既有五秒预算等待实际 ActiveProcesses=0；根尚未退出、查询失败或等待到期才进入强制终止，并在最多另五秒内确认，整段清理不超过十秒。Job accounting 核对结构 ABI 与 ReturnLength，未知数据不能当作零。唯一 waiter 完成实际 wait/exit-code 查询后关闭进程 handle，Finish 不抢先关闭它。正常完成还要求 authority 实际退出、guest sync/unmount、QEMU/Job 结束和流排空，再删除私有副本并核对基底未变。强制终止即使清空也保留失败，不能借清扫取得成功。
 
 HTTP readiness 使用真实 lease/FileSession，验证引用、原子打开、字节、metadata 条件、改名/移除后的引用身份和逻辑配额；保留 sentinel，停止 authority，再以同一磁盘普通重开，核对 sentinel 的身份、字节和 metadata 后删除它。此工具明确报告 native_acceptance 未运行；请求它代替 SMB/一秒验收会失败。
 
@@ -32,8 +32,8 @@ HTTP readiness 使用真实 lease/FileSession，验证引用、原子打开、�
 
 ## 后果
 
-本地 Linux TCG 已完成一次真实 guest/readiness/普通重启/关闭，私有磁盘删除、基底和输入保持不变。该本地 artifact 明确记录脏源码来源，不能充当随后 CI commit 的收据。Windows 的 QEMU 翻译运行、native ACL/Job 实测及 HTTP 组合仍未执行；这些之外，SMB 映射、系统重定向器缓存和一秒可见性也尚未由本工具验证。
+本地 Linux TCG 已完成一次真实 guest/readiness/普通重启/关闭，私有磁盘删除、基底和输入保持不变。该本地 artifact 明确记录脏源码来源，不能充当随后 CI commit 的收据。[Windows helper 运行 35419230740](https://github.com/codetreker/remote-fs/actions/runs/35419230740)的镜像构建通过，probe 取得 63 个通过 verdict，controller 有 30 个通过 verdict 且 native DACL 用例通过；正常子进程的 Job 收尾 leaf 及所属根失败，不能称整组通过。QEMU/Prism 与 HTTP authority 阶段未执行，SMB 映射、系统重定向器缓存和一秒可见性也未由本工具验证。
 
-隐藏 Go 模板通过显式测试入口运行，不依赖普通模块发现。当前模板普通测试 36 根、176 个通过 verdict；guest/probe/controller 的普通与 race 各有 87/63/26 个通过 verdict，Python 装配/拥有权/checker 用例共 26 根。各自验证错误、输出界限与清理，不把 mock Windows API、交叉构建或 Linux VM 成功称为 Windows 执行。具体执行入口见[测试策略](../../../../docs/testing.md#当前-authority-的独立运行环境)。
+隐藏 Go 模板通过显式测试入口运行，不依赖普通模块发现。已有 Linux 模板普通验证为 36 根、176 个通过 verdict；guest/probe/controller 的普通与 race 各有 87/63/26 个通过 verdict，Python 装配/拥有权/checker 用例共 26 根。Job rundown 的三个 AST 提取测试根普通/race 各 11 个通过 verdict，恢复立即强制清理决策的对照在正常退出后计数收齐的断言失败；vet 和 Windows AMD64/ARM64 构建通过。这些没有执行修正后的 Windows API/进程用例，不证明本机收尾已修复。各自验证错误、输出界限与清理，不把 mock、交叉构建或 Linux VM 成功称为 Windows 执行。具体执行入口见[测试策略](../../../../docs/testing.md#当前-authority-的独立运行环境)。
 
 维护成本包括 kernel/QEMU 固定输入、镜像生成、两作业 artifact 传递和宿主清理工具。boot 上限 120 秒，命令/probe 各 30 秒，输出与磁盘都有界；超限留下明确失败。磁盘使用正常 guest flush 的 writeback，普通重开证明已观察的同步持久路径，不宣称宿主断电或硬件缓存可靠性。完整平台接入仍由[Windows 提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)承接。

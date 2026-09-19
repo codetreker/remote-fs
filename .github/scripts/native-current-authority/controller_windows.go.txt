@@ -37,11 +37,13 @@ func (windowsPlatform) Preflight() (map[string]any, error) {
 }
 
 type windowsChild struct {
-	process, job          windows.Handle
+	job                   windows.Handle
 	input, output, stderr *os.File
 	pid                   uint32
 	done                  chan struct{}
 	result                error
+	exitObserved          bool
+	processCloseErr       error
 	once                  sync.Once
 	finishErr             error
 	forced                bool
@@ -59,51 +61,137 @@ type jobAccounting struct {
 	PageFaults, TotalProcesses, ActiveProcesses, TerminatedProcesses uint32
 }
 
-func jobActive(job windows.Handle) (uint32, error) {
+func checkJobAccountingABI() error {
+	var value jobAccounting
+	offsets := [...]uintptr{unsafe.Offsetof(value.TotalUserTime), unsafe.Offsetof(value.TotalKernelTime),
+		unsafe.Offsetof(value.PeriodUserTime), unsafe.Offsetof(value.PeriodKernelTime),
+		unsafe.Offsetof(value.PageFaults), unsafe.Offsetof(value.TotalProcesses),
+		unsafe.Offsetof(value.ActiveProcesses), unsafe.Offsetof(value.TerminatedProcesses)}
+	if unsafe.Sizeof(value) != 48 || unsafe.Alignof(value) != 8 || offsets != [8]uintptr{0, 8, 16, 24, 32, 36, 40, 44} {
+		return errors.New("job accounting differs from the 64-bit Windows ABI")
+	}
+	return nil
+}
+
+func readJobActive(query func(*jobAccounting, *uint32) error) (uint32, error) {
+	if err := checkJobAccountingABI(); err != nil {
+		return 0, err
+	}
 	var accounting jobAccounting
-	err := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&accounting)), uint32(unsafe.Sizeof(accounting)), nil)
-	return accounting.ActiveProcesses, err
+	var returned uint32
+	if err := query(&accounting, &returned); err != nil {
+		return 0, err
+	}
+	if returned != uint32(unsafe.Sizeof(accounting)) {
+		return 0, fmt.Errorf("job accounting returned %d bytes; expected %d", returned, unsafe.Sizeof(accounting))
+	}
+	return accounting.ActiveProcesses, nil
+}
+
+func jobActive(job windows.Handle) (uint32, error) {
+	return readJobActive(func(accounting *jobAccounting, returned *uint32) error {
+		return windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation,
+			uintptr(unsafe.Pointer(accounting)), uint32(unsafe.Sizeof(*accounting)), returned)
+	})
+}
+
+var errJobRundownDeadline = errors.New("owned job did not become empty within cleanup budget")
+
+type jobRundownOps struct {
+	now       func() time.Time
+	active    func() (uint32, error)
+	terminate func() error
+	pause     func(time.Time) error
+}
+
+func waitOwnedJobEmpty(deadline time.Time, ops jobRundownOps) error {
+	for {
+		if !ops.now().Before(deadline) {
+			return errJobRundownDeadline
+		}
+		active, err := ops.active()
+		if err != nil {
+			return err
+		}
+		if !ops.now().Before(deadline) {
+			return errJobRundownDeadline
+		}
+		if active == 0 {
+			return nil
+		}
+		if err := ops.pause(deadline); err != nil {
+			return err
+		}
+	}
+}
+
+func finishJobRundown(rootExited bool, budget time.Duration, ops jobRundownOps) (bool, error) {
+	started := ops.now()
+	var original error
+	if rootExited {
+		original = waitOwnedJobEmpty(started.Add(budget), ops)
+		if original == nil {
+			return false, nil
+		}
+	}
+	terminationErr := ops.terminate()
+	confirmationDeadline := ops.now().Add(budget)
+	if overall := started.Add(2 * budget); confirmationDeadline.After(overall) {
+		confirmationDeadline = overall
+	}
+	return true, errors.Join(original, terminationErr, waitOwnedJobEmpty(confirmationDeadline, ops))
+}
+
+func pauseJobRundown(deadline time.Time) error {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return errJobRundownDeadline
+	}
+	interval := min(10*time.Millisecond, remaining)
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	<-timer.C
+	return nil
 }
 
 func (p *windowsChild) Finish() (bool, error) {
 	p.once.Do(func() {
-		active, err := jobActive(p.job)
-		p.finishErr = errors.Join(p.finishErr, err)
-		if err != nil || active != 0 {
-			p.forced = true
-			p.finishErr = errors.Join(p.finishErr, windows.TerminateJobObject(p.job, 1))
-		}
-		deadline := time.NewTimer(5 * time.Second)
-		defer deadline.Stop()
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-		empty := false
-		for !empty {
-			active, err = jobActive(p.job)
-			if err != nil {
-				p.finishErr = errors.Join(p.finishErr, err)
-				break
-			}
-			if active == 0 {
-				empty = true
-				break
-			}
-			select {
-			case <-deadline.C:
-				p.finishErr = errors.Join(p.finishErr, errors.New("owned job did not become empty within cleanup budget"))
-				goto closeHandles
-			case <-ticker.C:
-			}
-		}
-	closeHandles:
-		// The unnamed job handle is not inherited. Closing it is also the crash path.
-		p.finishErr = errors.Join(p.finishErr, windows.CloseHandle(p.job))
+		overall := time.Now().Add(10 * time.Second)
+		rootExited := false
 		select {
 		case <-p.done:
-		case <-time.After(5 * time.Second):
-			p.finishErr = errors.Join(p.finishErr, errors.New("owned process termination was not confirmed"))
+			rootExited = p.exitObserved
+		default:
 		}
-		p.finishErr = errors.Join(p.finishErr, p.input.Close(), p.output.Close(), p.stderr.Close(), windows.CloseHandle(p.process))
+		p.forced, p.finishErr = finishJobRundown(rootExited, 5*time.Second, jobRundownOps{
+			now:       time.Now,
+			active:    func() (uint32, error) { return jobActive(p.job) },
+			terminate: func() error { return windows.TerminateJobObject(p.job, 1) },
+			pause:     pauseJobRundown,
+		})
+		// The unnamed job handle is not inherited. Closing it is also the crash path.
+		p.finishErr = errors.Join(p.finishErr, windows.CloseHandle(p.job))
+		waiterFinished := false
+		select {
+		case <-p.done:
+			waiterFinished = true
+		default:
+		}
+		if !waiterFinished {
+			remaining := max(time.Duration(0), time.Until(overall))
+			timer := time.NewTimer(remaining)
+			defer timer.Stop()
+			select {
+			case <-p.done:
+				waiterFinished = true
+			case <-timer.C:
+				p.finishErr = errors.Join(p.finishErr, errors.New("owned process termination was not confirmed"))
+			}
+		}
+		if waiterFinished {
+			p.finishErr = errors.Join(p.finishErr, p.processCloseErr)
+		}
+		p.finishErr = errors.Join(p.finishErr, p.input.Close(), p.output.Close(), p.stderr.Close())
 	})
 	return p.forced, p.finishErr
 }
@@ -202,22 +290,26 @@ func (windowsPlatform) Start(executable string, args []string, directory string)
 		}
 		return nil, errors.Join(err, terminateErr, waitErr, windows.CloseHandle(process.Process))
 	}
-	p := &windowsChild{process: process.Process, job: job, input: parentInput, output: parentOutput, stderr: parentError, pid: process.ProcessId, done: make(chan struct{})}
+	p := &windowsChild{job: job, input: parentInput, output: parentOutput, stderr: parentError, pid: process.ProcessId, done: make(chan struct{})}
 	owned = true
 	go func() {
-		wait, err := windows.WaitForSingleObject(p.process, windows.INFINITE)
+		wait, err := windows.WaitForSingleObject(process.Process, windows.INFINITE)
 		if err != nil {
 			p.result = err
 		} else if wait != windows.WAIT_OBJECT_0 {
 			p.result = fmt.Errorf("unexpected process wait result %d", wait)
 		} else {
+			p.exitObserved = true
 			var code uint32
-			if err := windows.GetExitCodeProcess(p.process, &code); err != nil {
+			if err := windows.GetExitCodeProcess(process.Process, &code); err != nil {
 				p.result = err
 			} else if code != 0 {
 				p.result = fmt.Errorf("owned process %d exited with code %d", p.pid, code)
 			}
 		}
+		// The waiter owns this handle until its final wait and exit-code query complete.
+		p.processCloseErr = windows.CloseHandle(process.Process)
+		p.result = errors.Join(p.result, p.processCloseErr)
 		close(p.done)
 	}()
 	if _, err := windows.ResumeThread(process.Thread); err != nil {
