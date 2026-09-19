@@ -385,6 +385,87 @@ function Assert-InboxLocalClient([string]$Name,$Ledger) {
     foreach($local in $Ledger.addresses){$candidate=[Net.IPAddress]::Parse($local);if($candidate.IsIPv4MappedToIPv6){$candidate=$candidate.MapToIPv4()};if($candidate.Equals($address)){return}}
     throw 'Administrative client address is not local.'
 }
+function Get-InboxAddressObservation([Net.IPAddress]$Address) {
+    $scope=$null
+    if($Address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6){$scope=$Address.ScopeId.ToString([Globalization.CultureInfo]::InvariantCulture)}
+    return [ordered]@{family=$Address.AddressFamily.ToString();presentation=$Address.ToString();bytes_hex=[Convert]::ToHexString($Address.GetAddressBytes()).ToLowerInvariant();scope_id=$scope;ipv4_mapped=$Address.IsIPv4MappedToIPv6}
+}
+function New-InboxOriginRefusal($Ledger,[int]$Stage,[string]$Kind,[string]$OpenID,[string]$SessionID,[string]$Scope,[string]$Instance,$Value,[string]$Argument,$Original) {
+    $type=if($null -eq $Value){$null}else{$Value.GetType().FullName}
+    $record=[ordered]@{stage=$Stage;source_kind=$Kind;capture_state='capture_incomplete';reason=$null;peer_type=$null;peer_type_length=$(if($null -eq $type){$null}else{$type.Length});argument_length=$Argument.Length;local_count=@($Ledger.addresses).Count;mechanism_trace_complete=$false}
+    $fields=[ordered]@{source_sha=@([string]$Ledger.source_sha,40);nonce=@([string]$Ledger.nonce,64);open_id=@($OpenID,20);session_id=@($SessionID,20);scope=@($Scope,256);instance=@($Instance,256);computer=@([string]$Ledger.computer,63);original_error=@([string]$Original.Exception.Message,2048)}
+    foreach($key in $fields.Keys){
+        if($fields[$key][0].Length -gt $fields[$key][1]){$record.reason="Context field exceeds bound: $key";return $record}
+        $record[$key]=$fields[$key][0]
+    }
+    $record.completed_checks=if($Kind -ceq 'session'){'owned_path_connection_credential_session_join_session_sid'}else{'owned_path_connection_credential_session_join_session_sid_session_peer_open_sid'}
+    if($null -eq $type -or $type.Length -gt 256){$record.reason='Provider type is unavailable or exceeds bound.';return $record}
+    $record.peer_type=$type
+    if($Argument.Length -gt 1024){$record.reason='Evaluated peer argument exceeds bound.';return $record}
+    if($Value -isnot [string]){$record.reason='Provider peer value is not a string.';return $record}
+    $record.evaluated_argument=$Argument
+    $record.original_value=$Value
+    if($record.local_count -gt 128){$record.reason='Local comparison inventory exceeds bound.';return $record}
+    foreach($local in $Ledger.addresses){if($local -isnot [string] -or $local.Length -gt 1024){$record.reason='Local comparison input has unsupported type or length.';return $record}}
+    $record.local_inputs=@($Ledger.addresses)
+    $record.computer_name_equal=$Argument.Equals($Ledger.computer,[StringComparison]::OrdinalIgnoreCase)
+    $text=$Argument
+    if($text.StartsWith('[') -and $text.EndsWith(']')){$text=$text.Substring(1,$text.Length-2)}
+    $peer=$null;$parsed=[Net.IPAddress]::TryParse($text,[ref]$peer)
+    $record.peer=[ordered]@{parse_success=$parsed;before_conversion=$null;after_conversion=$null;loopback=$null}
+    if($parsed){
+        $record.peer.before_conversion=Get-InboxAddressObservation $peer
+        if($peer.IsIPv4MappedToIPv6){$peer=$peer.MapToIPv4()}
+        $record.peer.after_conversion=Get-InboxAddressObservation $peer;$record.peer.loopback=[Net.IPAddress]::IsLoopback($peer)
+    }
+    $locals=[Collections.Generic.List[object]]::new();$malformed=$false
+    foreach($local in $Ledger.addresses){
+        $address=$null;$ok=[Net.IPAddress]::TryParse($local,[ref]$address)
+        $row=[ordered]@{input=$local;parse_success=$ok;before_conversion=$null;after_conversion=$null;equals_peer=$null;equality_state='unavailable'}
+        if($ok){
+            $row.before_conversion=Get-InboxAddressObservation $address
+            if($address.IsIPv4MappedToIPv6){$address=$address.MapToIPv4()}
+            $row.after_conversion=Get-InboxAddressObservation $address
+            if($parsed){$row.equals_peer=$address.Equals($peer);$row.equality_state='compared'}
+        }else{$malformed=$true}
+        $locals.Add($row)
+    }
+    $record.local_comparisons=@($locals)
+    if($malformed){$record.reason='Local comparison input did not parse.'}else{$record.capture_state='captured'}
+    return $record
+}
+function Write-InboxOriginRefusal([string]$Path,$Record) {
+    $bytes=[Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject $Record -Depth 12 -Compress)+"`n")
+    if($bytes.Length -gt 65536){
+        $small=[ordered]@{capture_state='capture_incomplete';reason='Encoded observation exceeds bound.';encoded_length=$bytes.Length;mechanism_trace_complete=$false}
+        foreach($key in @('stage','source_kind','source_sha','nonce','open_id','session_id','scope','instance','completed_checks','original_error','peer_type','argument_length','peer_type_length','local_count')){$small[$key]=$Record[$key]}
+        $bytes=[Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject $small -Compress)+"`n")
+    }
+    $stream=[IO.File]::Open($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    $failure=$null
+    try{$stream.Write($bytes);$stream.Flush($true)}catch{$failure=$_}
+    try{$stream.Dispose()}catch{if($null -eq $failure){$failure=$_}else{$failure.Exception.Data['origin_capture_close_error']=$_.Exception.Message}}
+    if($null -ne $failure){throw $failure}
+}
+function Assert-InboxSelectedPeer($Ledger,[int]$Stage,[string]$Kind,[string]$OpenID,[string]$SessionID,[string]$Scope,[string]$Instance,$Value) {
+    $argument=[string]$Value
+    try{Assert-InboxLocalClient $argument $Ledger}
+    catch{
+        $original=$_
+        try{
+            $record=New-InboxOriginRefusal $Ledger $Stage $Kind $OpenID $SessionID $Scope $Instance $Value $argument $original
+            Write-InboxOriginRefusal (Join-Path $script:Results "origin-refusal-$Stage.json") $record
+        }catch{
+            $secondary=$_
+            $original.Exception.Data['origin_capture_error']=$secondary
+            try{
+                $Ledger.errors+=,"Origin refusal capture failed: $($secondary.Exception.Message)"
+                if($secondary.Exception.Data.Contains('origin_capture_close_error')){$Ledger.errors+=,"Origin refusal capture close failed: $($secondary.Exception.Data['origin_capture_close_error'])"}
+            }catch{$original.Exception.Data['origin_capture_ledger_error']=$_}
+        }
+        throw $original
+    }
+}
 function Get-InboxOwnedOpens($Ledger) {
     $owned=[Collections.Generic.List[object]]::new();$scanned=0
     Get-SmbOpenFile -IncludeHidden -ErrorAction Stop | ForEach-Object {
@@ -429,11 +510,13 @@ function Get-InboxOrigin($Ledger,[int]$Stage) {
             $found=$matches[0]
             if((Convert-InboxID (Get-InboxRequired $found 'SessionId')) -cne $session -or [string](Get-InboxRequired $found 'ScopeName') -cne $scope -or [string](Get-InboxRequired $found 'SmbInstance') -cne $instance){throw 'Server session join changed its exact identity.'}
             if((Resolve-InboxSID ([string](Get-InboxRequired $found 'ClientUserName'))) -cne $Ledger.token.sid){throw 'Server-authenticated client SID differs.'}
-            Assert-InboxLocalClient ([string](Get-InboxRequired $found 'ClientComputerName')) $Ledger
+            $peer=Get-InboxRequired $found 'ClientComputerName'
+            Assert-InboxSelectedPeer $Ledger $Stage 'session' $id $session $scope $instance $peer
             $sessions[$session]=[ordered]@{id=$session;scope=$scope;instance=$instance;sid=$Ledger.token.sid;local_client=$true}
         }
         if((Resolve-InboxSID ([string](Get-InboxRequired $open 'ClientUserName'))) -cne $Ledger.token.sid){throw 'Open-file authenticated SID differs.'}
-        Assert-InboxLocalClient ([string](Get-InboxRequired $open 'ClientComputerName')) $Ledger
+        $peer=Get-InboxRequired $open 'ClientComputerName'
+        Assert-InboxSelectedPeer $Ledger $Stage 'open' $id $session $scope $instance $peer
         $path=Convert-InboxLocalPath ([string](Get-InboxRequired $open 'Path'))
         $relative=[string](Get-InboxRequired $open 'ShareRelativePath')
         $expected=$path.Substring($Ledger.root_local.Length).TrimStart('\')
