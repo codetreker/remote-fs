@@ -204,21 +204,19 @@ mismatch. Recovery preserves the original failed result. Ordinary success closes
 the native HANDLE, removes the mapping, calls Shutdown, joins Serve, Unpublishes
 the export, closes idle HTTP connections and verifies remote/local cleanup.
 
-[The source-bound run 35454012237](https://github.com/codetreker/remote-fs/actions/runs/35454012237)
-on `7bef4859bc1cbde96bc2b97cf79d018f94fcf228` retained the original inventory
-failure at 4009 ms. Its exact-name Get-Command control also timed out at 4018 ms
-before resolution returned. The separately labeled explicit Utility import and
-unchanged JSON pipeline control passed in 1437 ms, including about 19 ms of
-manifest preparation within the same four-second context, with nonforced cleanup.
-This supports the explicit-import route without isolating the sole timeout cause;
-the controls ran later under different load and warming conditions.
+[The source-bound run 35456649233](https://github.com/codetreker/remote-fs/actions/runs/35456649233)
+on `00e2f4291c8033a7b2dc0c0773731d5a0b920523` reached after-utility and
+before-json in the original inventory process, then failed at 4012 ms without
+after-json or catch-entry. Manifest preparation took 4.7423 ms within the same
+four-second context. Later identical inventory scripts passed in 2665/867 ms;
+exact-name discovery failed at 4020 ms and the separate import/parse control
+passed in 459 ms. These later results have different VM load and warming context.
 
-Earlier source-bound observations established the matching child/parent no-LF
-input and complete effective module-path facts. The prior DACL and Go-child
-environment proofs remain valid. None of those results passes the failed original
-cold attempt. The repaired original path described below has not run natively;
-current-SMB mapping, cold object access and one-second cache acceptance remain
-unproved.
+Utility import returned in the measured process, but this does not establish a
+try/assignment scope defect, actual command shadowing or the sole timeout cause.
+The candidate below binds the retained exported cmdlet object directly. Its first
+changed-source cold run must still prove mapping, native file behavior and full
+cleanup; it has not run natively. Prior cold failures and cache gates remain.
 
 Mapping failures retain a bounded diagnostic after the owned child is finished
 and all three I/O workers join. It records action, actual PID when available,
@@ -266,20 +264,28 @@ in backend construction or start a fresh deadline before launch. The verified
 absolute path is embedded as a base64 literal in the mapping script.
 
 After the existing input/environment observations, Core-qualified Import-Module
-loads that manifest before before-json and the unchanged JSON pipeline. Successful
-import output is suppressed so stdout keeps its existing result. Fixed before-utility
-and after-utility markers expose this operation; the conservative mapping formatter
-projection becomes 2040 bytes within the unchanged 2048-byte prefix. No Force,
-Get-Command, extra process, prewarming, retry or import-by-name fallback is used.
-SmbShare import, mapping operations, input/EOF policies, environment and owner remain
-unchanged. This makes Utility available in the same process; it does not replace
-the JSON parser or establish native acceptance.
+loads that manifest with PassThru into a local array. after-utility remains directly
+after import returns. Require exactly one PSModuleInfo named
+Microsoft.PowerShell.Utility, then its exact ExportedCmdlets['ConvertFrom-Json']
+entry: a non-null CmdletInfo with the expected name and Cmdlet kind. Invalid output
+fails before JSON invocation; no name lookup, alias following or fallback supplies
+a replacement object.
+
+The original ReadLine string is still piped by value, now to the retained object:
+`$request = $requestLine | & $jsonCommand`. Capturing import output keeps it off
+stdout. before-json means the module/export guards passed; after-json means the
+object-bound pipeline returned. This selects the exported command object, not a
+file hash/signature for its dependencies or proof of the original timeout cause.
+No Force, Get-Command, extra process, prewarming or retry is added. SmbShare import,
+mapping operations, input/EOF policy, environment, owner and saved-error handling
+remain unchanged. The same 2040-byte synthetic formatter projection remains within
+the 2048-byte prefix; there is no new marker, field or deadline.
 
 Optional preparation facts describe the on-disk path, size/read count, digest,
 duration and checked cleanup, not loaded dependency bytes or code identity. A
 preparation failure has no invented PID, launch, input/script or worker facts.
 File cleanup and process cleanup are combined truthfully: a failed Close cannot
-be confirmed clean merely because no child started. Import failure retains the
+be confirmed clean merely because no child started. Import, export-property or invocation failure retains the
 saved ErrorRecord and original failure path. The same four-second deadline covers
 preparation, startup, import and the command; synchronous work has no new latency
 guarantee.

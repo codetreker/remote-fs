@@ -1263,12 +1263,66 @@ func TestMappingStartupManifestPathEncoding(t *testing.T) {
 	}
 }
 
+const mappingUtilityImportForTest = `$utilityModules = @(Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -PassThru -ErrorAction Stop)`
+
+const mappingUtilityModuleGuardForTest = `if ($utilityModules.Count -ne 1 -or $utilityModules[0] -isnot [System.Management.Automation.PSModuleInfo] -or $utilityModules[0].Name -cne 'Microsoft.PowerShell.Utility') {
+        throw 'Utility import did not return exactly the expected module.'
+    }`
+
+const mappingUtilityJSONGuardForTest = `if ($null -eq $jsonCommand -or $jsonCommand -isnot [System.Management.Automation.CmdletInfo] -or $jsonCommand.Name -cne 'ConvertFrom-Json' -or $jsonCommand.CommandType -ne [System.Management.Automation.CommandTypes]::Cmdlet) {
+        throw 'Utility module did not export the expected JSON cmdlet.'
+    }`
+
 func mappingUtilityImportOrder(source string) error {
 	return mappingObservationOrder(source, "$requestLine = [Console]::In.ReadLine()", "Write-RfsEnvironmentObservation",
 		"$rfsObservationStage = 'operation'", "$utilityManifest = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('",
-		"'RFS-MAPPING/1 before-utility'", `$null = Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -ErrorAction Stop`,
-		"'RFS-MAPPING/1 after-utility'", "'RFS-MAPPING/1 before-json'", "$request = $requestLine | ConvertFrom-Json",
-		"'RFS-MAPPING/1 after-json'", "Import-Module -Name $request.module -ErrorAction Stop")
+		"'RFS-MAPPING/1 before-utility'", mappingUtilityImportForTest+"\n    [Console]::Error.WriteLine('RFS-MAPPING/1 after-utility')",
+		mappingUtilityModuleGuardForTest, "$jsonCommand = $utilityModules[0].ExportedCmdlets['ConvertFrom-Json']", mappingUtilityJSONGuardForTest,
+		"'RFS-MAPPING/1 before-json'", "$request = $requestLine | & $jsonCommand\n    [Console]::Error.WriteLine('RFS-MAPPING/1 after-json')",
+		"Import-Module -Name $request.module -ErrorAction Stop")
+}
+
+func TestMappingUtilityExportObjectBinding(t *testing.T) {
+	const export = "$jsonCommand = $utilityModules[0].ExportedCmdlets['ConvertFrom-Json']"
+	const invoke = "$request = $requestLine | & $jsonCommand"
+	if err := mappingUtilityImportOrder(mappingPowerShell); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{mappingUtilityImportForTest, mappingUtilityModuleGuardForTest, export, mappingUtilityJSONGuardForTest, invoke} {
+		if strings.Count(mappingPowerShell, statement) != 1 {
+			t.Fatal("mapping does not retain exactly one guarded imported JSON cmdlet")
+		}
+	}
+	for _, mutation := range []struct {
+		name, before, after string
+	}{
+		{"module-cardinality", "$utilityModules.Count -ne 1 -or ", ""},
+		{"module-type", "$utilityModules[0] -isnot [System.Management.Automation.PSModuleInfo] -or ", ""},
+		{"module-name", " -or $utilityModules[0].Name -cne 'Microsoft.PowerShell.Utility'", ""},
+		{"module-refusal", "throw 'Utility import did not return exactly the expected module.'", "$null = 'Utility import did not return exactly the expected module.'"},
+		{"export-before-module-guard", mappingUtilityModuleGuardForTest + "\n    " + export, export + "\n    " + mappingUtilityModuleGuardForTest},
+		{"wrong-module-export", export, "$jsonCommand = $utilityModules[1].ExportedCmdlets['ConvertFrom-Json']"},
+		{"wrong-export-name", export, "$jsonCommand = $utilityModules[0].ExportedCmdlets['ConvertTo-Json']"},
+		{"null-export", "$null -eq $jsonCommand -or ", ""},
+		{"export-type", "$jsonCommand -isnot [System.Management.Automation.CmdletInfo] -or ", ""},
+		{"export-name", "$jsonCommand.Name -cne 'ConvertFrom-Json' -or ", ""},
+		{"export-command-kind", " -or $jsonCommand.CommandType -ne [System.Management.Automation.CommandTypes]::Cmdlet", ""},
+		{"export-refusal", "throw 'Utility module did not export the expected JSON cmdlet.'", "$null = 'Utility module did not export the expected JSON cmdlet.'"},
+		{"invoke-before-export-guard", mappingUtilityJSONGuardForTest + "\n    [Console]::Error.WriteLine('RFS-MAPPING/1 before-json')\n    " + invoke, "[Console]::Error.WriteLine('RFS-MAPPING/1 before-json')\n    " + invoke + "\n    " + mappingUtilityJSONGuardForTest},
+		{"unqualified-name", invoke, "$request = $requestLine | ConvertFrom-Json"},
+		{"module-qualified-name", invoke, `$request = $requestLine | Microsoft.PowerShell.Utility\ConvertFrom-Json`},
+		{"object-name-substitution", invoke, "$request = $requestLine | & $jsonCommand.Name"},
+		{"string-object-substitution", invoke, "$request = $requestLine | & ([string]$jsonCommand)"},
+		{"rediscovered-target", invoke, "$request = $requestLine | & (Get-Command ConvertFrom-Json)"},
+		{"wrong-object", invoke, "$request = $requestLine | & $utilityModules[0]"},
+	} {
+		t.Run(mutation.name, func(t *testing.T) {
+			source := strings.Replace(mappingPowerShell, mutation.before, mutation.after, 1)
+			if source == mappingPowerShell || mappingUtilityImportOrder(source) == nil {
+				t.Fatal("exact exported-object binding control accepted its targeted mutation")
+			}
+		})
+	}
 }
 
 func TestMappingUtilityImportBuilderBindsVerifiedPath(t *testing.T) {
@@ -1285,11 +1339,11 @@ func TestMappingUtilityImportBuilderBindsVerifiedPath(t *testing.T) {
 		if err := mappingUtilityImportOrder(script); err != nil {
 			t.Fatal(err)
 		}
-		withoutImport := strings.Replace(script, `$null = Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -ErrorAction Stop`, "", 1)
+		withoutImport := strings.Replace(script, mappingUtilityImportForTest, "", 1)
 		if withoutImport == script || mappingUtilityImportOrder(withoutImport) == nil {
 			t.Fatal("explicit import omission escaped its source control")
 		}
-		withoutSuppression := strings.Replace(script, `$null = Microsoft.PowerShell.Core\Import-Module`, `Microsoft.PowerShell.Core\Import-Module`, 1)
+		withoutSuppression := strings.Replace(script, mappingUtilityImportForTest, `Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -PassThru -ErrorAction Stop`, 1)
 		if mappingUtilityImportOrder(withoutSuppression) == nil {
 			t.Fatal("successful import output could contaminate the mapping result")
 		}
@@ -1787,9 +1841,9 @@ func TestMappingObservationScriptOwnershipAndOrder(t *testing.T) {
 		"$rfsObservationStage = 'input'", "Write-RfsInputObservation $requestLine",
 		"$rfsObservationStage = 'environment'", "Write-RfsEnvironmentObservation",
 		"$rfsObservationStage = 'operation'", "$utilityManifest =", "'RFS-MAPPING/1 before-utility'",
-		`$null = Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -ErrorAction Stop`,
-		"'RFS-MAPPING/1 after-utility'", "'RFS-MAPPING/1 before-json'",
-		"$request = $requestLine | ConvertFrom-Json", "'RFS-MAPPING/1 after-json'",
+		mappingUtilityImportForTest, "'RFS-MAPPING/1 after-utility'", mappingUtilityModuleGuardForTest,
+		"$jsonCommand = $utilityModules[0].ExportedCmdlets['ConvertFrom-Json']", mappingUtilityJSONGuardForTest, "'RFS-MAPPING/1 before-json'",
+		"$request = $requestLine | & $jsonCommand", "'RFS-MAPPING/1 after-json'",
 		"$owner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
 		"Import-Module -Name $request.module -ErrorAction Stop"); err != nil {
 		t.Fatal(err)
@@ -1804,7 +1858,8 @@ func TestMappingObservationScriptOwnershipAndOrder(t *testing.T) {
 			}
 		}
 	}
-	if strings.Count(mappingPowerShell, "$requestLine =") != 1 || strings.Count(mappingPowerShell, "ConvertFrom-Json") != 1 ||
+	if strings.Count(mappingPowerShell, "$requestLine =") != 1 || strings.Count(mappingPowerShell, "$request = $requestLine | & $jsonCommand") != 1 ||
+		strings.Contains(mappingPowerShell, "$request = $requestLine | ConvertFrom-Json") ||
 		strings.Count(mappingPowerShell, "ConvertTo-Json") != 2 || strings.Contains(mappingPowerShell, "$cause = $_.") {
 		t.Fatal("observation changed the input, JSON commands or primary cause ownership")
 	}

@@ -908,10 +908,17 @@ try {
     $rfsObservationStage = 'operation'
     $utilityManifest = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__RFS_UTILITY_MANIFEST_BASE64__'))
     [Console]::Error.WriteLine('RFS-MAPPING/1 before-utility')
-    $null = Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -ErrorAction Stop
+    $utilityModules = @(Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -PassThru -ErrorAction Stop)
     [Console]::Error.WriteLine('RFS-MAPPING/1 after-utility')
+    if ($utilityModules.Count -ne 1 -or $utilityModules[0] -isnot [System.Management.Automation.PSModuleInfo] -or $utilityModules[0].Name -cne 'Microsoft.PowerShell.Utility') {
+        throw 'Utility import did not return exactly the expected module.'
+    }
+    $jsonCommand = $utilityModules[0].ExportedCmdlets['ConvertFrom-Json']
+    if ($null -eq $jsonCommand -or $jsonCommand -isnot [System.Management.Automation.CmdletInfo] -or $jsonCommand.Name -cne 'ConvertFrom-Json' -or $jsonCommand.CommandType -ne [System.Management.Automation.CommandTypes]::Cmdlet) {
+        throw 'Utility module did not export the expected JSON cmdlet.'
+    }
     [Console]::Error.WriteLine('RFS-MAPPING/1 before-json')
-    $request = $requestLine | ConvertFrom-Json
+    $request = $requestLine | & $jsonCommand
     [Console]::Error.WriteLine('RFS-MAPPING/1 after-json')
     [Console]::Error.WriteLine('RFS-MAPPING/1 before-owner')
     $owner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
