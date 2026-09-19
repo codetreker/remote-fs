@@ -3,8 +3,12 @@
 package main
 
 import (
+	"bytes"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"golang.org/x/sys/windows"
@@ -48,5 +52,193 @@ func TestPrivateFixtureWindowsRejectsUnprotectedOrBroadDACL(t *testing.T) {
 	}
 	if err := validatePrivateFile(path); err == nil {
 		t.Fatal("Everyone-readable state file accepted")
+	}
+}
+
+func privateEvidenceTestSecurity(t *testing.T, path string) string {
+	t.Helper()
+	descriptor, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := descriptor.String()
+	if value == "" {
+		t.Fatal("security descriptor could not be represented")
+	}
+	return value
+}
+
+func TestPrivateEvidenceWriterCreatesProtectedChildUnderInheritedParent(t *testing.T) {
+	parent := t.TempDir()
+	if err := validatePrivateDirectory(parent); err == nil {
+		t.Fatal("fixture parent must retain its ordinary inherited ACL")
+	}
+	parentSecurity := privateEvidenceTestSecurity(t, parent)
+	directory := filepath.Join(parent, "native-evidence")
+	path := filepath.Join(directory, "mapping-startup.json")
+	payload := []byte("{\"status\":\"failed\",\"observations\":[1,2,3]}\n")
+	if err := writePrivateEvidence(directory, "mapping-startup.json", payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivateDirectory(directory); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivateFile(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("private evidence roundtrip: %q, %v", got, err)
+	}
+	if got := privateEvidenceTestSecurity(t, parent); got != parentSecurity {
+		t.Fatal("writer changed its outer parent security descriptor")
+	}
+	directorySecurity, fileSecurity := privateEvidenceTestSecurity(t, directory), privateEvidenceTestSecurity(t, path)
+	if err := writePrivateEvidence(directory, "mapping-startup.json", []byte("replacement")); err == nil {
+		t.Fatal("writer adopted an existing evidence child")
+	}
+	got, err = os.ReadFile(path)
+	if err != nil || !bytes.Equal(got, payload) || privateEvidenceTestSecurity(t, directory) != directorySecurity ||
+		privateEvidenceTestSecurity(t, path) != fileSecurity || privateEvidenceTestSecurity(t, parent) != parentSecurity {
+		t.Fatalf("existing private evidence changed after refusal: %v", err)
+	}
+}
+
+func TestPrivateEvidenceWriterPreservesExistingChildAndFile(t *testing.T) {
+	for _, existingDirectory := range []bool{false, true} {
+		name := "existing file at child path"
+		if existingDirectory {
+			name = "existing ordinary directory and report"
+		}
+		t.Run(name, func(t *testing.T) {
+			parent := t.TempDir()
+			directory := filepath.Join(parent, "native-evidence")
+			file := directory
+			if existingDirectory {
+				if err := os.Mkdir(directory, 0700); err != nil {
+					t.Fatal(err)
+				}
+				file = filepath.Join(directory, "mapping-startup.json")
+			}
+			payload := []byte("existing evidence must remain exact")
+			if err := os.WriteFile(file, payload, 0600); err != nil {
+				t.Fatal(err)
+			}
+			parentSecurity := privateEvidenceTestSecurity(t, parent)
+			childSecurity, fileSecurity := privateEvidenceTestSecurity(t, directory), privateEvidenceTestSecurity(t, file)
+			if err := writePrivateEvidence(directory, "mapping-startup.json", []byte("replacement")); err == nil {
+				t.Fatal("existing child was adopted")
+			}
+			got, err := os.ReadFile(file)
+			if err != nil || !bytes.Equal(got, payload) || privateEvidenceTestSecurity(t, parent) != parentSecurity ||
+				privateEvidenceTestSecurity(t, directory) != childSecurity || privateEvidenceTestSecurity(t, file) != fileSecurity {
+				t.Fatalf("refusal changed existing bytes or ACL: %v", err)
+			}
+		})
+	}
+}
+
+func TestPrivateEvidenceWriterRejectsNonLeafBeforeCreation(t *testing.T) {
+	for _, name := range []string{"", ".", "..", "../report", `child\report`, "report:stream", "bad\x00name"} {
+		parent := t.TempDir()
+		security := privateEvidenceTestSecurity(t, parent)
+		directory := filepath.Join(parent, "native-evidence")
+		if err := writePrivateEvidence(directory, name, []byte("payload")); err == nil {
+			t.Fatalf("non-leaf %q was accepted", name)
+		}
+		if _, err := os.Lstat(directory); !errors.Is(err, os.ErrNotExist) || privateEvidenceTestSecurity(t, parent) != security {
+			t.Fatalf("invalid name changed its parent or created a child: %v", err)
+		}
+	}
+}
+
+type privateEvidenceTestSink struct {
+	calls    *[]string
+	data     []byte
+	written  int
+	writeErr error
+	syncErr  error
+	closeErr error
+	closed   bool
+}
+
+func (f *privateEvidenceTestSink) Write(data []byte) (int, error) {
+	*f.calls = append(*f.calls, "write")
+	if f.closed {
+		return 0, os.ErrClosed
+	}
+	f.data = append([]byte(nil), data...)
+	return f.written, f.writeErr
+}
+
+func (f *privateEvidenceTestSink) Sync() error {
+	*f.calls = append(*f.calls, "sync")
+	if f.closed {
+		return os.ErrClosed
+	}
+	return f.syncErr
+}
+
+func (f *privateEvidenceTestSink) Close() error {
+	*f.calls = append(*f.calls, "close")
+	if f.closed {
+		return os.ErrClosed
+	}
+	f.closed = true
+	return f.closeErr
+}
+
+func TestPrivateEvidenceWriteSequenceRetainsAllErrors(t *testing.T) {
+	payload := []byte("complete evidence\n")
+	sealFailure, writeFailure := errors.New("seal failed"), errors.New("write failed")
+	syncFailure, closeFailure := errors.New("sync failed"), errors.New("close failed")
+	for _, test := range []struct {
+		name     string
+		written  int
+		sealErr  error
+		writeErr error
+		syncErr  error
+		closeErr error
+		closed   bool
+		want     []error
+	}{
+		{name: "success", written: len(payload)},
+		{name: "short write", written: len(payload) - 1, want: []error{io.ErrShortWrite}},
+		{name: "write sync close errors", written: 2, writeErr: writeFailure, syncErr: syncFailure, closeErr: closeFailure, want: []error{writeFailure, syncFailure, closeFailure}},
+		{name: "short write sync close errors", written: 2, syncErr: syncFailure, closeErr: closeFailure, want: []error{io.ErrShortWrite, syncFailure, closeFailure}},
+		{name: "sync error", written: len(payload), syncErr: syncFailure, want: []error{syncFailure}},
+		{name: "close error", written: len(payload), closeErr: closeFailure, want: []error{closeFailure}},
+		{name: "closed file", closed: true, want: []error{os.ErrClosed}},
+		{name: "seal and close errors", written: len(payload), sealErr: sealFailure, closeErr: closeFailure, want: []error{sealFailure, closeFailure}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls []string
+			file := &privateEvidenceTestSink{calls: &calls, written: test.written, writeErr: test.writeErr, syncErr: test.syncErr, closeErr: test.closeErr, closed: test.closed}
+			err := writeSealedPrivateEvidence(file, payload, func() error {
+				calls = append(calls, "seal")
+				if len(file.data) != 0 {
+					t.Fatal("payload reached the file before sealing")
+				}
+				return test.sealErr
+			})
+			if len(test.want) == 0 && err != nil || len(test.want) != 0 && err == nil {
+				t.Fatalf("write result: %v", err)
+			}
+			for _, expected := range test.want {
+				if !errors.Is(err, expected) {
+					t.Fatalf("lost %v from %v", expected, err)
+				}
+			}
+			wantCalls := []string{"seal", "write", "sync", "close"}
+			if test.sealErr != nil {
+				wantCalls = []string{"seal", "close"}
+			}
+			if !reflect.DeepEqual(calls, wantCalls) || !file.closed {
+				t.Fatalf("write ownership/order changed: %v", calls)
+			}
+			if test.sealErr == nil && !test.closed && !bytes.Equal(file.data, payload) {
+				t.Fatal("writer changed the submitted payload")
+			}
+		})
 	}
 }

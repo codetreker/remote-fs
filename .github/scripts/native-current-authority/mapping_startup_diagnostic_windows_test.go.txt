@@ -28,6 +28,7 @@ type mappingStartupConfig struct {
 	FixtureNonce               string          `json:"fixture_nonce"`
 	PriorEvidenceDirectory     string          `json:"prior_evidence_directory"`
 	EvidenceDirectory          string          `json:"evidence_directory"`
+	NativeEvidenceDirectory    string          `json:"native_evidence_directory"`
 	OwnerSID                   string          `json:"owner_sid"`
 	InitialInventoryError      string          `json:"initial_inventory_error"`
 	InitialInventoryDiagnostic json.RawMessage `json:"initial_inventory_diagnostic"`
@@ -42,7 +43,8 @@ type mappingStartupCellReceipt struct {
 	Error                           string                      `json:"error"`
 	ErrorTruncated                  bool                        `json:"error_truncated"`
 	Diagnostic                      mappingCommandDiagnostic    `json:"diagnostic"`
-	Environment                     []mappingStartupEnvironment `json:"environment,omitempty"`
+	ParentEnvironment               []mappingStartupEnvironment `json:"parent_environment,omitempty"`
+	ChildEnvironment                []mappingStartupEnvironment `json:"child_environment,omitempty"`
 }
 
 type mappingStartupEnvironmentValue struct {
@@ -76,17 +78,19 @@ func observeMappingStartupEnvironment(lookup func(string) (string, bool)) []mapp
 }
 
 type mappingStartupObservedPlatform struct {
-	delegate    platform
-	lookup      func(string) (string, bool)
-	environment []mappingStartupEnvironment
+	delegate          platform
+	lookup            func(string) (string, bool)
+	parentEnvironment []mappingStartupEnvironment
+	childEnvironment  []mappingStartupEnvironment
 }
 
 func (p *mappingStartupObservedPlatform) Preflight() (map[string]any, error) {
 	return p.delegate.Preflight()
 }
-func (p *mappingStartupObservedPlatform) Start(executable string, args []string, directory string) (child, error) {
-	p.environment = observeMappingStartupEnvironment(p.lookup)
-	return p.delegate.Start(executable, args, directory)
+func (p *mappingStartupObservedPlatform) StartWithEnvironment(executable string, args []string, directory string, environment []string) (child, error) {
+	p.parentEnvironment = observeMappingStartupEnvironment(p.lookup)
+	p.childEnvironment = observeMappingStartupEnvironment(func(name string) (string, bool) { return mappingEnvironmentLookup(environment, name) })
+	return p.delegate.StartWithEnvironment(executable, args, directory, environment)
 }
 
 type mappingStartupImageReceipt struct {
@@ -299,6 +303,9 @@ func readMappingStartupConfig() (mappingStartupConfig, error) {
 	if filepath.Dir(path) != config.EvidenceDirectory || filepath.Base(config.PriorEvidenceDirectory) != "evidence" || filepath.Base(filepath.Dir(config.PriorEvidenceDirectory)) != config.RunID {
 		return config, errors.New("diagnostic directories do not bind the configured run")
 	}
+	if config.NativeEvidenceDirectory != filepath.Join(config.EvidenceDirectory, "native-evidence") {
+		return config, errors.New("native evidence directory is not the fixed direct child")
+	}
 	for _, directory := range []string{config.PriorEvidenceDirectory, config.EvidenceDirectory} {
 		if err := rejectPrivateReparsePath(directory); err != nil {
 			return config, err
@@ -347,18 +354,10 @@ func writeMappingStartupReceipt(path string, receipt mappingStartupReceipt) erro
 	if err != nil {
 		return err
 	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return err
+	if filepath.Base(path) != "mapping-startup.json" {
+		return errors.New("native evidence filename is not fixed")
 	}
-	if err := makePrivateFile(path); err != nil {
-		return errors.Join(err, file.Close())
-	}
-	n, writeErr := file.Write(data)
-	if writeErr == nil && n != len(data) {
-		writeErr = io.ErrShortWrite
-	}
-	return errors.Join(writeErr, file.Sync(), file.Close())
+	return writePrivateEvidence(filepath.Dir(path), "mapping-startup.json", data)
 }
 
 func inspectMappingStartupImage(path string) (result mappingStartupImageReceipt) {
@@ -428,7 +427,7 @@ func TestMappingPowerShellStartupDiagnostic(t *testing.T) {
 		Status: "failed", Aborted: true, CleanupConfirmed: true,
 		TimingContext:           "after original cold failure and VM cleanup; sequential cells may be warmed by earlier launches",
 		ImageFactsContext:       "post-attempt on-disk bytes; not proof of bytes loaded by each process",
-		EnvironmentFactsContext: "diagnostic Start calls only; the original cold environment was not recorded",
+		EnvironmentFactsContext: "parent inherited values and configured child input at diagnostic Start only; original cold environment was not recorded; PowerShell may reconstruct runtime paths",
 		PriorEvidenceDirectory:  config.PriorEvidenceDirectory, InitialInventoryDiagnostic: config.InitialInventoryDiagnostic,
 		InitialInventoryError: config.InitialInventoryError,
 		OriginalInputObserved: config.initial.InputBytes > 0, OriginalScriptObserved: config.initial.ScriptUTF16Units > 0,
@@ -459,7 +458,7 @@ func TestMappingPowerShellStartupDiagnostic(t *testing.T) {
 		if !t.Failed() && !receipt.Aborted && len(receipt.Cells) == 4 {
 			receipt.Status = "passed"
 		}
-		if err := writeMappingStartupReceipt(filepath.Join(config.EvidenceDirectory, "mapping-startup.json"), receipt); err != nil {
+		if err := writeMappingStartupReceipt(filepath.Join(config.NativeEvidenceDirectory, "mapping-startup.json"), receipt); err != nil {
 			t.Errorf("write diagnostic receipt: %v", err)
 		}
 	}()
@@ -509,7 +508,7 @@ func TestMappingPowerShellStartupDiagnostic(t *testing.T) {
 			}
 			if cellErr == nil {
 				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-				execution, cellErr = executeMappingPowerShell(ctx, observed, native.executable, work, request, cell.Script, cell.CloseInput)
+				execution, cellErr = executeMappingPowerShell(ctx, observed, native.executable, work, native.moduleRoot, request, cell.Script, cell.CloseInput)
 				cancel()
 				cellErr = errors.Join(cellErr, compareMappingStartupIntent(execution.Diagnostic, mappingStartupInventoryIntent(requestBytes, cell.Script)))
 				marker := "RFS-MAPPING/1 entry"
@@ -544,7 +543,7 @@ func TestMappingPowerShellStartupDiagnostic(t *testing.T) {
 					clean = false
 				}
 			}
-			entry := mappingStartupCellReceipt{Name: cell.Name, Ordinal: ordinal, PriorDiagnosticProcessCreations: processCreations, Status: "passed", Diagnostic: execution.Diagnostic, Environment: observed.environment}
+			entry := mappingStartupCellReceipt{Name: cell.Name, Ordinal: ordinal, PriorDiagnosticProcessCreations: processCreations, Status: "passed", Diagnostic: execution.Diagnostic, ParentEnvironment: observed.parentEnvironment, ChildEnvironment: observed.childEnvironment}
 			if execution.Diagnostic.PID != nil || execution.Diagnostic.Launch != nil && execution.Diagnostic.Launch.PID != nil {
 				processCreations++
 			}
@@ -791,12 +790,12 @@ func assertMappingStartupIdentity(t *testing.T) {
 
 type mappingStartupAssertionPlatform struct {
 	preflight func() (map[string]any, error)
-	start     func(string, []string, string) (child, error)
+	start     func(string, []string, string, []string) (child, error)
 }
 
 func (p mappingStartupAssertionPlatform) Preflight() (map[string]any, error) { return p.preflight() }
-func (p mappingStartupAssertionPlatform) Start(executable string, args []string, directory string) (child, error) {
-	return p.start(executable, args, directory)
+func (p mappingStartupAssertionPlatform) StartWithEnvironment(executable string, args []string, directory string, environment []string) (child, error) {
+	return p.start(executable, args, directory, environment)
 }
 
 type mappingStartupAssertionChild struct{ child }
@@ -830,38 +829,40 @@ func assertMappingStartupEnvironment(t *testing.T) {
 	}
 	for _, startFailure := range []error{nil, errors.New("delegated start failed")} {
 		looked = nil
-		values["PSModulePath"], values["PSModuleAnalysisCachePath"] = "before-start", "before-scope"
+		values["PSModulePath"], values["PSModuleAnalysisCachePath"] = "before-start", "parent-cache"
+		provided := []string{"PSModulePath=verified-root", "PSModuleAnalysisCachePath=NUL", "UNRELATED=preserved", "=C:=C:\\work"}
+		beforeProvided := append([]string(nil), provided...)
 		wantChild := &mappingStartupAssertionChild{}
 		starts, preflights := 0, 0
 		preflightFailure := errors.New("preflight detail")
 		var adapter *mappingStartupObservedPlatform
 		delegate := mappingStartupAssertionPlatform{
 			preflight: func() (map[string]any, error) { preflights++; return map[string]any{"fact": "same"}, preflightFailure },
-			start: func(executable string, args []string, directory string) (child, error) {
+			start: func(executable string, args []string, directory string, environment []string) (child, error) {
 				starts++
-				if executable != "same.exe" || directory != "same-directory" || !reflect.DeepEqual(args, []string{"same-arg"}) {
+				if executable != "same.exe" || directory != "same-directory" || !reflect.DeepEqual(args, []string{"same-arg"}) || !reflect.DeepEqual(environment, beforeProvided) {
 					t.Fatal("adapter changed launch inputs")
 				}
-				if len(adapter.environment) != 3 || adapter.environment[2].Value == nil || adapter.environment[2].Value.SHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte("NUL"))) {
-					t.Fatal("environment was not observed before delegation in the existing cache scope")
+				if len(adapter.parentEnvironment) != 3 || len(adapter.childEnvironment) != 3 || adapter.childEnvironment[2].Value == nil || adapter.childEnvironment[2].Value.SHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte("NUL"))) || adapter.parentEnvironment[2].Value.SHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte("parent-cache"))) {
+					t.Fatal("parent and configured child environments were not observed separately before delegation")
 				}
 				return wantChild, startFailure
 			},
 		}
 		adapter = &mappingStartupObservedPlatform{delegate: delegate, lookup: lookup}
 		facts, preflightErr := adapter.Preflight()
-		if !reflect.DeepEqual(facts, map[string]any{"fact": "same"}) || preflightErr != preflightFailure || preflights != 1 || adapter.environment != nil || len(looked) != 0 {
+		if !reflect.DeepEqual(facts, map[string]any{"fact": "same"}) || preflightErr != preflightFailure || preflights != 1 || adapter.parentEnvironment != nil || adapter.childEnvironment != nil || len(looked) != 0 {
 			t.Fatal("preflight changed results or invented Start observations")
 		}
-		values["PSModulePath"], values["PSModuleAnalysisCachePath"] = "at-start", "NUL"
-		gotChild, gotErr := adapter.Start("same.exe", []string{"same-arg"}, "same-directory")
+		values["PSModulePath"] = "at-start"
+		gotChild, gotErr := adapter.StartWithEnvironment("same.exe", []string{"same-arg"}, "same-directory", provided)
 		if starts != 1 || gotChild != wantChild || gotErr != startFailure || len(looked) != 3 {
 			t.Fatal("adapter changed the delegated child/error or call count")
 		}
-		if adapter.environment[0].Value.SHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte("at-start"))) || values["PSModulePath"] != "at-start" || values["PSModuleAnalysisCachePath"] != "NUL" {
+		if adapter.parentEnvironment[0].Value.SHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte("at-start"))) || adapter.childEnvironment[0].Value.SHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte("verified-root"))) || values["PSModulePath"] != "at-start" || values["PSModuleAnalysisCachePath"] != "parent-cache" || !reflect.DeepEqual(provided, beforeProvided) {
 			t.Fatal("adapter observed early or changed input values")
 		}
-		if _, present := values["WinPSModulePath"]; present {
+		if _, present := values["WinPSModulePath"]; present || adapter.parentEnvironment[1].Present || adapter.childEnvironment[1].Present {
 			t.Fatal("adapter manufactured WinPSModulePath")
 		}
 	}
@@ -881,8 +882,9 @@ func assertMappingStartupReceiptBounds(t *testing.T) {
 	originalError := "context deadline exceeded\noriginal failure\nmapping command diagnostic: " + string(originalDiagnostic)
 	receipt := mappingStartupReceipt{Format: 1, RunID: "run", SourceSHA: strings.Repeat("a", 40), FixtureNonce: strings.Repeat("b", 64), Status: "failed", InitialInventoryError: originalError, InitialInventoryDiagnostic: originalDiagnostic}
 	for ordinal, cell := range mappingStartupPlan() {
-		environment := observeMappingStartupEnvironment(func(name string) (string, bool) { return strings.Repeat("v", 4097), true })
-		receipt.Cells = append(receipt.Cells, mappingStartupCellReceipt{Name: cell.Name, Ordinal: ordinal + 1, Error: strings.Repeat("x", 4096), Diagnostic: diagnostic, Environment: environment})
+		parentEnvironment := observeMappingStartupEnvironment(func(name string) (string, bool) { return strings.Repeat("p", 4097), true })
+		childEnvironment := observeMappingStartupEnvironment(func(name string) (string, bool) { return strings.Repeat("c", 4097), true })
+		receipt.Cells = append(receipt.Cells, mappingStartupCellReceipt{Name: cell.Name, Ordinal: ordinal + 1, Error: strings.Repeat("x", 4096), Diagnostic: diagnostic, ParentEnvironment: parentEnvironment, ChildEnvironment: childEnvironment})
 	}
 	encoded, err := encodeMappingStartupReceipt(receipt)
 	if err != nil || len(encoded) > 256<<10 {
@@ -891,6 +893,9 @@ func assertMappingStartupReceiptBounds(t *testing.T) {
 	var restored mappingStartupReceipt
 	if err := json.Unmarshal(encoded, &restored); err != nil || restored.InitialInventoryError != originalError {
 		t.Fatalf("original inventory error was altered: %v", err)
+	}
+	if len(restored.Cells) != 4 || !reflect.DeepEqual(restored.Cells[0].ParentEnvironment, receipt.Cells[0].ParentEnvironment) || !reflect.DeepEqual(restored.Cells[0].ChildEnvironment, receipt.Cells[0].ChildEnvironment) {
+		t.Fatal("dual environment observations were altered or dropped")
 	}
 	var original, roundTrip mappingCommandDiagnostic
 	if err := json.Unmarshal(originalDiagnostic, &original); err != nil {

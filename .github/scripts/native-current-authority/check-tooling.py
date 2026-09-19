@@ -246,7 +246,8 @@ def diagnostic_prerequisite(run_id, source_sha, output, sources):
                 or checksum(path) != expected):
             raise ValueError("diagnostic dependency bytes differ from the cold source manifest: " + name)
     config = {"format": 1, **identity, "prior_evidence_directory": str(prior),
-              "evidence_directory": str(output), "owner_sid": host["sid"],
+              "evidence_directory": str(output), "native_evidence_directory": str(output / "native-evidence"),
+              "owner_sid": host["sid"],
               "initial_inventory_error": error, "initial_inventory_diagnostic": diagnostic}
     if len(json.dumps(config).encode()) > 64 << 10:
         raise ValueError("diagnostic config exceeds 64 KiB")
@@ -362,9 +363,10 @@ def run_startup_diagnostic(args, output, env):
         receipt["audit"] = diagnostic_audit(output / "test.jsonl")
         if receipt["audit"]["status"] != "passed":
             receipt["errors"].append("diagnostic Go start/verdict audit failed")
-        native_path = output / "mapping-startup.json"
+        native_path = output / "native-evidence" / "mapping-startup.json"
         native = strict_json(bounded_text(native_path, 1 << 20))
-        receipt["native_receipt"] = {"sha256": checksum(native_path), "details": native}
+        receipt["native_receipt"] = {"path": native_path.relative_to(output).as_posix(),
+                                     "sha256": checksum(native_path), "details": native}
         if any(native.get(key) != config[key] for key in ("format", "run_id", "source_sha", "fixture_nonce",
                                                         "initial_inventory_error", "initial_inventory_diagnostic")):
             raise ValueError("native startup receipt differs from the admitted cold evidence")

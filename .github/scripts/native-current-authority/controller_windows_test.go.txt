@@ -5,18 +5,22 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf16"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -63,6 +67,203 @@ func TestWindowsFixtureChild(t *testing.T) {
 			os.Exit(8)
 		}
 		os.Exit(0)
+	case "fixture-child-environment":
+		if err := json.NewEncoder(os.Stdout).Encode(windowsTestEnvironmentValues()); err != nil {
+			os.Exit(9)
+		}
+		os.Exit(0)
+	}
+}
+
+func TestWindowsEnvironmentKeyAndFold(t *testing.T) {
+	for _, test := range []struct {
+		entry, key string
+	}{
+		{"Path=one=two", "Path"},
+		{"EMPTY=", "EMPTY"},
+		{`=C:=C:\work`, "=C:"},
+		{"=D:=", "=D:"},
+		{"名称=值", "名称"},
+	} {
+		key, err := windowsEnvironmentKey(test.entry)
+		if err != nil || key != test.key {
+			t.Fatal("valid environment entry did not retain its key")
+		}
+	}
+	if windowsEnvironmentFold("pAtH-äÉİı-名称") != "PATH-äÉİı-名称" {
+		t.Fatal("environment folding changed non-ASCII characters or missed ASCII letters")
+	}
+}
+
+func TestWindowsEnvironmentBlock(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		environment []string
+		want        string
+	}{
+		{name: "nil-explicit", want: "\x00\x00"},
+		{name: "empty-explicit", environment: []string{}, want: "\x00\x00"},
+		{
+			name: "stable-first-separator-order",
+			environment: []string{
+				"z=last-ascii", `=D:=D:\later`, "b=one=two", "A=first", `=C:=C:\earlier`, "a=second", "Ä=unicode",
+			},
+			want: "=D:=D:\\later\x00=C:=C:\\earlier\x00A=first\x00a=second\x00b=one=two\x00z=last-ascii\x00Ä=unicode\x00\x00",
+		},
+		{name: "empty-value", environment: []string{"EMPTY="}, want: "EMPTY=\x00\x00"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := slices.Clone(test.environment)
+			block, err := windowsEnvironmentBlock(test.environment)
+			if err != nil || block == nil || !slices.Equal(block, utf16.Encode([]rune(test.want))) {
+				t.Fatal("explicit environment block has incorrect ordering or termination")
+			}
+			if !slices.Equal(test.environment, before) {
+				t.Fatal("environment block construction mutated caller entries")
+			}
+		})
+	}
+	block, err := windowsEnvironmentBlock([]string{"K=文🧪", "E="})
+	want := []uint16{'E', '=', 0, 'K', '=', 0x6587, 0xd83e, 0xddea, 0, 0}
+	if err != nil || !slices.Equal(block, want) {
+		t.Fatal("Unicode environment block lost UTF-16 units or entry separators")
+	}
+}
+
+func TestWindowsEnvironmentInvalidEntries(t *testing.T) {
+	const secret = "sensitive-environment-value"
+	for _, test := range []struct {
+		name, entry string
+	}{
+		{"empty", ""},
+		{"missing-separator", secret},
+		{"missing-key", "=" + secret},
+		{"empty-special-key", "==" + secret},
+		{"nul-key", "NA\x00ME=" + secret},
+		{"nul-value", "NAME=" + secret + "\x00"},
+		{"invalid-key-utf8", "\xff=" + secret},
+		{"invalid-value-utf8", "NAME=" + secret + "\xff"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			key, keyErr := windowsEnvironmentKey(test.entry)
+			environment := []string{"Z=valid", test.entry, "A=valid"}
+			before := slices.Clone(environment)
+			block, blockErr := windowsEnvironmentBlock(environment)
+			if key != "" || block != nil || !errors.Is(keyErr, syscall.EINVAL) || !errors.Is(blockErr, syscall.EINVAL) {
+				t.Fatal("invalid environment entry did not fail with EINVAL")
+			}
+			if strings.Contains(keyErr.Error(), secret) || strings.Contains(blockErr.Error(), secret) {
+				t.Fatal("environment validation exposed an entry value")
+			}
+			if !slices.Equal(environment, before) {
+				t.Fatal("failed environment construction mutated caller entries")
+			}
+		})
+	}
+}
+
+const windowsEnvironmentTestKey = "RFS_FIXTURE_OWNER_ENV_TEST"
+
+type windowsTestEnvironmentValue struct {
+	Value   string `json:"value"`
+	Present bool   `json:"present"`
+}
+
+func windowsTestEnvironmentValues() map[string]windowsTestEnvironmentValue {
+	values := make(map[string]windowsTestEnvironmentValue, 2)
+	for _, key := range []string{"SystemRoot", windowsEnvironmentTestKey} {
+		value, present := os.LookupEnv(key)
+		values[key] = windowsTestEnvironmentValue{Value: value, Present: present}
+	}
+	return values
+}
+
+type windowsEnvironmentTestPlatform struct {
+	windowsPlatform
+	environment []string
+}
+
+func (p windowsEnvironmentTestPlatform) Start(executable string, args []string, directory string) (child, error) {
+	return p.windowsPlatform.StartWithEnvironment(executable, args, directory, p.environment)
+}
+
+func TestWindowsOwnedChildEnvironment(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := os.Environ()
+	t.Cleanup(func() {
+		if !slices.Equal(os.Environ(), parent) {
+			t.Error("owned child launch changed the parent environment")
+		}
+	})
+	inherited := windowsTestEnvironmentValues()
+	childValue := "explicit-child-value-文🧪"
+	if inherited[windowsEnvironmentTestKey].Value == childValue {
+		childValue += "-changed"
+	}
+	explicit := make([]string, 0, len(parent)+1)
+	for _, entry := range parent {
+		key, _, _ := strings.Cut(entry, "=")
+		if !strings.EqualFold(key, windowsEnvironmentTestKey) {
+			explicit = append(explicit, entry)
+		}
+	}
+	explicit = append(explicit, windowsEnvironmentTestKey+"="+childValue)
+	explicitBefore := slices.Clone(explicit)
+	wantExplicit := maps.Clone(inherited)
+	wantExplicit[windowsEnvironmentTestKey] = windowsTestEnvironmentValue{Value: childValue, Present: true}
+	for _, test := range []struct {
+		name string
+		host platform
+		want map[string]windowsTestEnvironmentValue
+	}{
+		{"inherited", windowsPlatform{}, inherited},
+		{"explicit-child-only", windowsEnvironmentTestPlatform{environment: explicit}, wantExplicit},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			output, err := runTool(ctx, test.host, executable, []string{"-test.run=^TestWindowsFixtureChild$", "--", "fixture-child-environment"}, privateTestDirectory(t), "environment")
+			if err != nil {
+				t.Fatal("owned environment child did not complete successfully")
+			}
+			var observed map[string]windowsTestEnvironmentValue
+			if err := json.Unmarshal(output, &observed); err != nil {
+				t.Fatal("owned environment child returned invalid JSON")
+			}
+			if !maps.Equal(observed, test.want) {
+				t.Fatal("owned child did not receive the selected environment values")
+			}
+			if !slices.Equal(os.Environ(), parent) || !slices.Equal(explicit, explicitBefore) {
+				t.Fatal("owned child launch mutated its parent environment or caller entries")
+			}
+		})
+	}
+}
+
+func TestWindowsExplicitEnvironmentRejectedBeforeLaunch(t *testing.T) {
+	const executable = `C:\fixture\unlaunched.exe`
+	const secret = "sensitive-environment-value"
+	process, err := (windowsPlatform{}).StartWithEnvironment(executable, nil, `C:\fixture`, []string{"NAME=" + secret + "\x00"})
+	if process != nil {
+		process.Finish()
+		t.Fatal("invalid explicit environment created a child")
+	}
+	var launch *windowsLaunchError
+	if !errors.Is(err, syscall.EINVAL) || !errors.As(err, &launch) {
+		t.Fatal("invalid explicit environment lost its launch error or EINVAL cause")
+	}
+	facts := launch.Facts
+	if !facts.CleanupConfirmed || facts.RequestedImage != executable || facts.PID != nil ||
+		facts.CreateProcess != nil || facts.AssignJob != nil || facts.QueryImage != nil || facts.QueryMachine != nil ||
+		facts.ResumeThread != nil || facts.PreviousSuspendCount != nil || facts.ActualImage != "" ||
+		facts.ProcessMachine != nil || facts.NativeMachine != nil || facts.CommandLineUnits != 0 || facts.CommandLineSHA256 != "" {
+		t.Fatal("invalid explicit environment fabricated launch stages or unconfirmed cleanup")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatal("failed launch exposed an invalid environment value")
 	}
 }
 

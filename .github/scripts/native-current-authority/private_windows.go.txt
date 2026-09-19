@@ -5,8 +5,10 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -176,4 +178,39 @@ func makePrivateFile(path string) error {
 		return err
 	}
 	return validatePrivateFile(path)
+}
+
+type privateEvidenceSink interface {
+	io.Writer
+	Sync() error
+	io.Closer
+}
+
+func writeSealedPrivateEvidence(file privateEvidenceSink, data []byte, seal func() error) (resultErr error) {
+	defer func() { resultErr = errors.Join(resultErr, file.Close()) }()
+	if err := seal(); err != nil {
+		return err
+	}
+	written, writeErr := file.Write(data)
+	if written != len(data) && writeErr == nil {
+		writeErr = io.ErrShortWrite
+	}
+	return errors.Join(writeErr, file.Sync())
+}
+
+// Failed output remains in the exclusively created private child. An existing
+// directory or file never transfers ownership to this writer.
+func writePrivateEvidence(directory, name string, data []byte) error {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\:\x00") {
+		return errors.New("private evidence requires a direct file name")
+	}
+	if err := createPrivateDirectory(directory); err != nil {
+		return fmt.Errorf("create private evidence directory: %w", err)
+	}
+	path := filepath.Join(directory, name)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return fmt.Errorf("create private evidence file: %w", err)
+	}
+	return writeSealedPrivateEvidence(file, data, func() error { return makePrivateFile(path) })
 }

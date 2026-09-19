@@ -14,10 +14,14 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -475,7 +479,75 @@ func (p *windowsChild) FinishBefore(deadline time.Time) (bool, error) {
 	return p.forced, p.finishErr
 }
 
-func (windowsPlatform) Start(executable string, args []string, directory string) (_ child, resultErr error) {
+func windowsEnvironmentKey(entry string) (string, error) {
+	if strings.IndexByte(entry, 0) >= 0 {
+		return "", fmt.Errorf("environment entry contains NUL: %w", syscall.EINVAL)
+	}
+	if !utf8.ValidString(entry) {
+		return "", fmt.Errorf("environment entry is not valid UTF-8: %w", syscall.EINVAL)
+	}
+	separator := strings.IndexByte(entry, '=')
+	if separator == 0 {
+		// Windows preserves drive-current-directory entries such as =C:=C:\\work.
+		second := strings.IndexByte(entry[1:], '=')
+		if second < 1 {
+			return "", fmt.Errorf("environment special key has no value separator: %w", syscall.EINVAL)
+		}
+		separator = second + 1
+	}
+	if separator < 1 {
+		return "", fmt.Errorf("environment entry has no name/value separator: %w", syscall.EINVAL)
+	}
+	return entry[:separator], nil
+}
+
+func windowsEnvironmentFold(key string) string {
+	data := []byte(key)
+	for i, value := range data {
+		if value >= 'a' && value <= 'z' {
+			data[i] -= 'a' - 'A'
+		}
+	}
+	return string(data)
+}
+
+func windowsEnvironmentBlock(environment []string) ([]uint16, error) {
+	entries := append([]string(nil), environment...)
+	for index, entry := range entries {
+		if _, err := windowsEnvironmentKey(entry); err != nil {
+			return nil, fmt.Errorf("explicit environment entry %d: %w", index, err)
+		}
+	}
+	// Match Go's ASCII-folded first-separator ordering; hidden drive entries sort first.
+	sort.SliceStable(entries, func(i, j int) bool {
+		a := windowsEnvironmentFold(entries[i][:strings.IndexByte(entries[i], '=')])
+		b := windowsEnvironmentFold(entries[j][:strings.IndexByte(entries[j], '=')])
+		return a < b
+	})
+	if len(entries) == 0 {
+		return []uint16{0, 0}, nil
+	}
+	var block []uint16
+	for _, entry := range entries {
+		block = append(block, utf16.Encode([]rune(entry))...)
+		block = append(block, 0)
+	}
+	return append(block, 0), nil
+}
+
+func (windowsPlatform) Start(executable string, args []string, directory string) (child, error) {
+	return startWindowsProcess(executable, args, directory, nil)
+}
+
+func (windowsPlatform) StartWithEnvironment(executable string, args []string, directory string, environment []string) (child, error) {
+	block, err := windowsEnvironmentBlock(environment)
+	if err != nil {
+		return nil, &windowsLaunchError{Facts: windowsLaunchFacts{RequestedImage: executable, CleanupConfirmed: true}, Cause: err}
+	}
+	return startWindowsProcess(executable, args, directory, block)
+}
+
+func startWindowsProcess(executable string, args []string, directory string, environmentBlock []uint16) (_ child, resultErr error) {
 	started := time.Now()
 	facts := windowsLaunchFacts{RequestedImage: executable, CleanupConfirmed: true}
 	defer func() {
@@ -572,8 +644,14 @@ func (windowsPlatform) Start(executable string, args []string, directory string)
 	}
 	var process windows.ProcessInformation
 	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_NO_WINDOW | windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT)
+	var environment *uint16
+	if environmentBlock != nil {
+		environment = &environmentBlock[0]
+	}
 	if err := observeWindowsLaunchCall(started, time.Now, &facts.CreateProcess, func() error {
-		return windows.CreateProcess(application, &command[0], nil, nil, true, flags, nil, workingDir, &startup.StartupInfo, &process)
+		err := windows.CreateProcess(application, &command[0], nil, nil, true, flags, environment, workingDir, &startup.StartupInfo, &process)
+		runtime.KeepAlive(environmentBlock)
+		return err
 	}); err != nil {
 		return nil, err
 	}

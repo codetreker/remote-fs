@@ -17,7 +17,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf16"
 	"unsafe"
@@ -37,7 +36,7 @@ type child interface {
 }
 type platform interface {
 	Preflight() (map[string]any, error)
-	Start(string, []string, string) (child, error)
+	StartWithEnvironment(string, []string, string, []string) (child, error)
 }
 
 var newPlatform func() (platform, error)
@@ -714,10 +713,10 @@ func requireMappingJob() error {
 }
 
 type nativeMappingBackend struct {
-	o                  options
-	owner              mappingOwner
-	host               platform
-	executable, module string
+	o                              options
+	owner                          mappingOwner
+	host                           platform
+	executable, module, moduleRoot string
 }
 
 func newNativeMappingBackend(o options) (mappingBackend, error) {
@@ -736,8 +735,20 @@ func newNativeMappingBackend(o options) (mappingBackend, error) {
 	if err != nil {
 		return nil, err
 	}
-	executable := filepath.Join(system, "WindowsPowerShell", "v1.0", "powershell.exe")
-	module := filepath.Join(system, "WindowsPowerShell", "v1.0", "Modules", "SmbShare", "SmbShare.psd1")
+	home := filepath.Join(system, "WindowsPowerShell", "v1.0")
+	executable := filepath.Join(home, "powershell.exe")
+	moduleRoot := filepath.Join(home, "Modules")
+	module := filepath.Join(moduleRoot, "SmbShare", "SmbShare.psd1")
+	if err := rejectPrivateReparsePath(moduleRoot); err != nil {
+		return nil, err
+	}
+	rootInfo, err := os.Lstat(moduleRoot)
+	if err != nil {
+		return nil, err
+	}
+	if !rootInfo.IsDir() || strings.Contains(moduleRoot, ";") {
+		return nil, errors.New("system Windows PowerShell module root is not a single local directory")
+	}
 	for _, path := range []string{executable, module} {
 		if err := rejectPrivateReparsePath(path); err != nil {
 			return nil, err
@@ -750,7 +761,7 @@ func newNativeMappingBackend(o options) (mappingBackend, error) {
 			return nil, errors.New("system PowerShell executable or SMB module is not regular")
 		}
 	}
-	return &nativeMappingBackend{o, owner, host, executable, module}, nil
+	return &nativeMappingBackend{o, owner, host, executable, module, moduleRoot}, nil
 }
 
 func mappingDOSTarget(drive string) ([]string, error) {
@@ -878,27 +889,44 @@ try {
 }
 `
 
-var mappingSpawnMu sync.Mutex
-
-func startMappingPowerShell(host platform, executable string, args []string, directory string) (process child, resultErr error) {
-	mappingSpawnMu.Lock()
-	defer mappingSpawnMu.Unlock()
-	// PowerShell 5.1 reads this before startup; NUL disables its AppData module cache.
-	// https://github.com/MicrosoftDocs/PowerShell-Docs/blob/2a4b9570939a97008d5039b9b318f6e8585338bb/reference/5.1/Microsoft.PowerShell.Core/About/about_Environment_Variables.md#L356
-	old, present := os.LookupEnv("PSModuleAnalysisCachePath")
-	if err := os.Setenv("PSModuleAnalysisCachePath", "NUL"); err != nil {
+func mappingPowerShellEnvironment(inherited []string, moduleRoot string) ([]string, error) {
+	if moduleRoot == "" || strings.Contains(moduleRoot, ";") {
+		return nil, errors.New("Windows PowerShell module root is not one verified directory")
+	}
+	if _, err := windowsEnvironmentKey("PSModulePath=" + moduleRoot); err != nil {
 		return nil, err
 	}
-	defer func() {
-		var err error
-		if present {
-			err = os.Setenv("PSModuleAnalysisCachePath", old)
-		} else {
-			err = os.Unsetenv("PSModuleAnalysisCachePath")
+	environment := make([]string, 0, len(inherited)+2)
+	for index, entry := range inherited {
+		key, err := windowsEnvironmentKey(entry)
+		if err != nil {
+			return nil, fmt.Errorf("inherited environment entry %d: %w", index, err)
 		}
-		resultErr = errors.Join(resultErr, err)
-	}()
-	return host.Start(executable, args, directory)
+		folded := windowsEnvironmentFold(key)
+		if folded == "PSMODULEPATH" || folded == "PSMODULEANALYSISCACHEPATH" {
+			continue
+		}
+		environment = append(environment, entry)
+	}
+	return append(environment, "PSModulePath="+moduleRoot, "PSModuleAnalysisCachePath=NUL"), nil
+}
+
+func mappingEnvironmentLookup(environment []string, name string) (string, bool) {
+	for _, entry := range environment {
+		separator := strings.IndexByte(entry, '=')
+		if separator > 0 && windowsEnvironmentFold(entry[:separator]) == windowsEnvironmentFold(name) {
+			return entry[separator+1:], true
+		}
+	}
+	return "", false
+}
+
+func startMappingPowerShell(host platform, executable string, args []string, directory, moduleRoot string) (child, error) {
+	environment, err := mappingPowerShellEnvironment(os.Environ(), moduleRoot)
+	if err != nil {
+		return nil, &windowsLaunchError{Facts: windowsLaunchFacts{RequestedImage: executable, CleanupConfirmed: true}, Cause: err}
+	}
+	return host.StartWithEnvironment(executable, args, directory, environment)
 }
 
 const mappingDiagnosticStreamLimit = 2 << 10
@@ -999,7 +1027,7 @@ func encodeMappingDiagnostic(details mappingCommandDiagnostic) error {
 }
 
 // The caller runs inside the watchdog-owned probe or tagged diagnostic test.
-func executeMappingPowerShell(ctx context.Context, host platform, executable, directory string, request mappingCommandRequest, scriptSource string, closeInput bool) (execution mappingExecution, resultErr error) {
+func executeMappingPowerShell(ctx context.Context, host platform, executable, directory, moduleRoot string, request mappingCommandRequest, scriptSource string, closeInput bool) (execution mappingExecution, resultErr error) {
 	started := time.Now()
 	var process child
 	var stdout, stderr mappingBoundedBuffer
@@ -1099,7 +1127,7 @@ func executeMappingPowerShell(ctx context.Context, host platform, executable, di
 	diagnostic.ScriptUTF16Units, diagnostic.ScriptSHA256 = len(words), fmt.Sprintf("%x", sha256.Sum256(script))
 	args := []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", base64.StdEncoding.EncodeToString(script)}
 	diagnostic.CleanupConfirmed = false
-	process, err = startMappingPowerShell(host, executable, args, directory)
+	process, err = startMappingPowerShell(host, executable, args, directory, moduleRoot)
 	if err != nil {
 		return execution, err
 	}
@@ -1162,8 +1190,8 @@ func validateMappingResult(data []byte, request mappingCommandRequest) (result m
 	return result, nil
 }
 
-func runMappingPowerShell(ctx context.Context, host platform, executable, directory string, request mappingCommandRequest) (mappingCommandResult, error) {
-	execution, commandErr := executeMappingPowerShell(ctx, host, executable, directory, request, mappingPowerShell, false)
+func runMappingPowerShell(ctx context.Context, host platform, executable, directory, moduleRoot string, request mappingCommandRequest) (mappingCommandResult, error) {
+	execution, commandErr := executeMappingPowerShell(ctx, host, executable, directory, moduleRoot, request, mappingPowerShell, false)
 	result, validationErr := validateMappingResult(execution.Stdout, request)
 	if err := errors.Join(commandErr, validationErr); err != nil {
 		return result, errors.Join(err, encodeMappingDiagnostic(execution.Diagnostic))
@@ -1213,7 +1241,7 @@ func (b *nativeMappingBackend) command(ctx context.Context, action string, ledge
 	request := mappingCommandRequest{action, b.module, b.owner.SID, ledger.LocalPath, ledger.RemotePath, ledger.TCPPort}
 	commandCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	result, err := runMappingPowerShell(commandCtx, b.host, b.executable, filepath.Dir(b.o.StateFile), request)
+	result, err := runMappingPowerShell(commandCtx, b.host, b.executable, filepath.Dir(b.o.StateFile), b.moduleRoot, request)
 	if err != nil {
 		return result, err
 	}

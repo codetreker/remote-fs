@@ -204,18 +204,22 @@ mismatch. Recovery preserves the original failed result. Ordinary success closes
 the native HANDLE, removes the mapping, calls Shutdown, joins Serve, Unpublishes
 the export, closes idle HTTP connections and verifies remote/local cleanup.
 
-[The captured run 35439665455](https://github.com/codetreker/remote-fs/actions/runs/35439665455)
-on source `ece38307e58b515a2778a9eae3738bb161d669b0` failed its initial
-inventory after 4010 ms with 219 input bytes written and ResumeThread previous
-count 1. Its 109 stderr bytes contain entry, before-readline, after-readline and
-before-json markers; no after-json marker was observed. The input JSON and script
-hashes are valid, but the child's parsed value and command/module resolution are
-unknown. The four diagnostic cells did not run because the then-required empty
-capture predicate rejected this evidence. This remains a failed cold run before
-observed mapping effects, SMB traffic or native file calls. The earlier
-[5beb captured failure](https://github.com/codetreker/remote-fs/actions/runs/35437123318)
-had zero captured stream bytes at 4009 ms; neither result proves an EOF or JSON
-conversion cause. Recovery does not qualify current-SMB or one-second acceptance.
+[The source-bound run 35442800512](https://github.com/codetreker/remote-fs/actions/runs/35442800512)
+on `3eed8ec9eceb8bea5743e09d1b3c1fe7c26c093a` retained the original cold
+inventory timeout at 4009 ms, with the last captured marker before-json. Its four
+post-VM diagnostic cells each passed once: entry/open 247 ms, entry/EOF 191 ms,
+inventory/open 3419 ms and inventory/EOF 913 ms. Each had natural exit zero,
+three joined workers and nonforced child cleanup. Their observed inherited
+module path placed PowerShell 7 roots before Windows PowerShell roots;
+WinPSModulePath was absent and the analysis-cache path was NUL.
+
+The diagnostic root still failed: its ordinary parent directory did not satisfy
+the private writer's protected-DACL precondition. The aggregate file was empty;
+no final native aggregate or post-attempt executable PE/hash facts were saved.
+Successful later cells do not repair the original cold failure or isolate EOF,
+warming or module resolution as its cause. Earlier zero-stream and stage-bearing
+cold failures retain their observed classifications. Current-SMB mapping, cold
+object access and one-second cache acceptance remain unproved.
 
 Mapping failures retain a bounded diagnostic after the owned child is finished
 and all three I/O workers join. It records action, actual PID when available,
@@ -245,23 +249,42 @@ partial or unknown stage text remains unclassified. Original input/script facts,
 when present, must match; unavailable facts remain unavailable. Manifest keys are
 strict POSIX-relative paths produced on both platforms, with exact hashes and no
 separator fallback. The tagged test is absent from normal unit and production
-catalogs. Its four
-sequential cells run once each: minimal immediate entry/result with stdin open,
+catalogs. Its four sequential cells run once each: minimal immediate entry/result with stdin open,
 the same script with EOF, exact read-only inventory with stdin open, then the
 same inventory with EOF. Each gets the unchanged four-second command deadline
 and existing owned cleanup. EOF follows one complete successful write and is
 closed once by the same owner used by Finish; short writes and close errors fail.
 The ordinary mapping path keeps its original open-stdin policy.
 
-At each diagnostic delegated Start, a non-owning adapter records only
-`PSModulePath`, `WinPSModulePath` and `PSModuleAnalysisCachePath`, then calls the
-same owner once. Presence, UTF-8 length, SHA256, at most 4096 prefix bytes encoded as base64,
-and truncation are separate facts; absent values are not invented. The adapter
-changes no environment and observes the existing NUL cache setting in its spawn
-scope. These are later diagnostic launch facts, not the earlier cold process's
-unrecorded environment or proof of module resolution. Only the tagged diagnostic
-receipt has a 256 KiB bound for this data; command capture and executor limits
-remain unchanged.
+Mapping PowerShell children use an explicit Unicode environment block through
+the existing process owner. A private snapshot removes case-insensitive copies
+of PSModulePath and PSModuleAnalysisCachePath, then supplies the verified
+System32 WindowsPowerShell/v1.0/Modules root and NUL. Other entries, including
+drive-current-directory entries, are preserved. The parent environment is never
+mutated; ordinary Start retains inheritance and other children are unchanged.
+The module root shares the existing verified system PowerShell home and must be
+an existing local directory without a reparse ancestor. Invalid input fails
+before launch. Script, flags, stdin policy and the four-second deadline stay the
+same. Windows PowerShell may reconstruct its runtime search path; configured
+input does not prove a system-only path, actual command resolution or the sole
+cause of the earlier timeout.
+
+At the explicit delegated Start, the diagnostic observer records only
+PSModulePath, WinPSModulePath and PSModuleAnalysisCachePath, separately labeled
+parent-inherited values and configured child input. Presence, UTF-8 length,
+SHA256, at most 4096 prefix bytes encoded as base64 and truncation remain separate
+facts; absent values are not invented. It delegates once to the same owner and
+does not expose other environment entries. These later facts cannot reconstruct
+the earlier cold process's unrecorded environment.
+
+The tagged report is capped at 256 KiB including LF and written only to
+`OUTPUT/native-evidence/mapping-startup.json`. Go exclusively creates that fixed
+protected child directory, creates the file exclusively and seals it before
+payload write, sync and close. The checker reads the same fixed nested path.
+An existing child/file is refused without adoption or truncation; the outer
+checker's ACL stays unchanged. Every write/sync/close error remains visible and
+created evidence remains on failure. Command capture and executor bounds are
+unchanged. This host-setup correction has not yet run natively.
 
 Each cell joins its process and three workers before the next; unknown Job
 quiescence stops further launches. The cells record their order, actual creation
@@ -270,9 +293,10 @@ intent ledger, mapping change or native file I/O is allowed. The original cold
 failure remains failed even if later cells succeed. The experiment runs after VM
 shutdown and SMB cleanup attempts, under different load; later cells may be warmed
 by earlier launches. Its results cannot alone identify the original cold cause.
-The 120-second test and 15-minute job limits remain unchanged. New native cells
-have not run. A local PowerShell 7 held-open/EOF success establishes only that
-local behavior, not Windows PowerShell 5.1 behavior or a timeout repair.
+The 120-second test and 15-minute job limits remain unchanged. The measured
+four-cell success belongs to the source and environment above.
+A local PowerShell 7 held-open/EOF success establishes only that local behavior;
+neither observation proves a timeout repair.
 
 ## Local Linux validation
 

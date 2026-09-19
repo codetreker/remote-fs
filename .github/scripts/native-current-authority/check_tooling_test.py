@@ -104,11 +104,14 @@ class CheckAccountingTests(unittest.TestCase):
         self.prerequisite()
         config, provenance = self.admit()
         self.assertEqual(set(config), {"format", *self.identity, "prior_evidence_directory", "evidence_directory",
-                                       "owner_sid", "initial_inventory_error", "initial_inventory_diagnostic"})
+                                       "native_evidence_directory", "owner_sid", "initial_inventory_error", "initial_inventory_diagnostic"})
         self.assertEqual(config["initial_inventory_diagnostic"], self.diagnostic)
         self.assertEqual(config["initial_inventory_error"], self.cold[-1]["error"])
         self.assertEqual(config["owner_sid"], "S-1-5-21-1000")
         self.assertEqual(config["prior_evidence_directory"], str(self.prior))
+        self.assertEqual(config["evidence_directory"], str(self.output))
+        self.assertEqual(config["native_evidence_directory"], str(self.output / "native-evidence"))
+        self.assertFalse((self.output / "native-evidence").exists())
         self.assertEqual(provenance["fixture_failure"], self.receipt["cause"])
         self.assertEqual(len(provenance["files"]), 4)
 
@@ -378,7 +381,8 @@ class CheckAccountingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dependency bytes"):
             self.admit()
 
-    def diagnostic_driver(self, fail=None, early_error=None, invalid_prior=False, native_missing=False, unknown_job=False):
+    def diagnostic_driver(self, fail=None, early_error=None, invalid_prior=False, native_missing=False,
+                          unknown_job=False, native_legacy=False, native_override=None):
         self.prerequisite()
         tools = self.directory / ".github/scripts/native-current-authority"
         tools.mkdir(parents=True, exist_ok=True)
@@ -401,6 +405,9 @@ class CheckAccountingTests(unittest.TestCase):
             config = json.loads(Path(env["RFS_MAPPING_STARTUP_CONFIG"]).read_text())
             self.assertEqual(config["initial_inventory_diagnostic"], self.diagnostic)
             self.assertEqual(config["initial_inventory_error"], self.cold[-1]["error"])
+            self.assertEqual(config["evidence_directory"], str(self.output))
+            self.assertEqual(config["native_evidence_directory"], str(self.output / "native-evidence"))
+            self.assertFalse((self.output / "native-evidence").exists())
             if command == ["go", "version"]:
                 if early_error:
                     raise RuntimeError(early_error)
@@ -418,7 +425,12 @@ class CheckAccountingTests(unittest.TestCase):
                           "initial_inventory_error": config["initial_inventory_error"],
                           "initial_inventory_diagnostic": config["initial_inventory_diagnostic"],
                           "aborted": False, "cleanup_confirmed": True, "cells": list(checks.DIAGNOSTIC_CELLS)}
-                (self.output / "mapping-startup.json").write_text(json.dumps(native))
+                if native_override is not None:
+                    native.update(native_override)
+                native_directory = self.output if native_legacy else self.output / "native-evidence"
+                if not native_legacy:
+                    native_directory.mkdir()
+                (native_directory / "mapping-startup.json").write_text(json.dumps(native))
             if fail:
                 raise RuntimeError("command exited 1: native cell failure")
             return log.read_text()
@@ -437,7 +449,7 @@ class CheckAccountingTests(unittest.TestCase):
             if unknown_job:
                 with self.assertRaises(Terminated):
                     checks.run_startup_diagnostic(args, self.output, {})
-            elif fail or early_error or invalid_prior or native_missing:
+            elif fail or early_error or invalid_prior or native_missing or native_legacy or native_override is not None:
                 with self.assertRaisesRegex(RuntimeError, "startup diagnostic failed"):
                     checks.run_startup_diagnostic(args, self.output, {})
             else:
@@ -462,6 +474,31 @@ class CheckAccountingTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertEqual(self.sources, receipt["sources"])
         self.assertEqual(json.loads((self.prior / "receipt.json").read_text())["fixture_readiness"], "failed")
+
+    def test_diagnostic_driver_reads_only_fixed_native_evidence_report(self):
+        receipt, calls, _ = self.diagnostic_driver()
+        self.assertEqual(receipt["status"], "passed")
+        self.assertEqual(len(calls), 3)
+        native = self.output / "native-evidence/mapping-startup.json"
+        self.assertEqual(receipt["native_receipt"]["path"], "native-evidence/mapping-startup.json")
+        self.assertEqual(receipt["native_receipt"]["sha256"], checks.checksum(native))
+        self.assertEqual(receipt["native_receipt"]["details"], json.loads(native.read_text()))
+        self.assertFalse((self.output / "mapping-startup.json").exists())
+
+    def test_diagnostic_driver_refuses_legacy_outer_report_without_nested_evidence(self):
+        receipt, _, _ = self.diagnostic_driver(native_legacy=True)
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(receipt["audit"]["status"], "passed")
+        self.assertFalse(receipt["cleanup_confirmed"])
+        self.assertNotIn("native_receipt", receipt)
+        self.assertTrue((self.output / "mapping-startup.json").is_file())
+        self.assertFalse((self.output / "native-evidence").exists())
+
+    def test_diagnostic_driver_nested_report_rejects_changed_original_failure(self):
+        receipt, _, _ = self.diagnostic_driver(native_override={"initial_inventory_error": "different original failure"})
+        self.assertEqual(receipt["status"], "failed")
+        self.assertIn("native startup receipt differs from the admitted cold evidence", receipt["errors"])
+        self.assertEqual(receipt["prerequisite"]["cold_failure"], self.cold[-1]["error"])
 
     def test_diagnostic_driver_never_launches_for_foreign_prerequisite(self):
         receipt, calls, _ = self.diagnostic_driver(invalid_prior=True)
