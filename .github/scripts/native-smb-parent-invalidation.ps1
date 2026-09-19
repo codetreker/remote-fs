@@ -1,16 +1,19 @@
 param(
     [Parameter(Mandatory)]
     [ValidateSet('Prepare', 'PrepareFixture', 'Run', 'Verify')]
-    [string]$Phase
+    [string]$Phase,
+    [ValidateSet('native-parent-invalidation', 'native-precise-invalidation')]
+    [string]$ProbeDirectory = 'native-parent-invalidation'
 )
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $workspace = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
-$probeRoot = Join-Path $workspace '.tmp/native-parent-invalidation'
+$probeRoot = Join-Path (Join-Path $workspace '.tmp') $ProbeDirectory
 $fixture = Join-Path $probeRoot 'fixture'
 $results = Join-Path $probeRoot 'results'
 $prototype = '1cb9ad7f49d998de4daa4d562d766b18cf06ce16'
+$testProcessPattern = if ($ProbeDirectory -eq 'native-precise-invalidation') { '^(windows|smb|native-precise)\.test$' } else { '^(windows|smb)\.test$' }
 
 function Write-JSON([string]$Name, $Value) {
     ConvertTo-Json -InputObject $Value -Depth 12 | Set-Content (Join-Path $results $Name) -Encoding utf8
@@ -101,7 +104,7 @@ if ($Phase -eq 'Prepare') {
         throw 'All measured cache lifetimes must exceed one second.'
     }
     Write-JSON 'mappings-before.json' @(Get-MappingKeys)
-    Write-JSON 'processes-before.json' @(Get-Process | Where-Object { $_.ProcessName -match '^(windows|smb)\.test$' } | Select-Object -ExpandProperty Id)
+    Write-JSON 'processes-before.json' @(Get-Process | Where-Object { $_.ProcessName -match $testProcessPattern } | Select-Object -ExpandProperty Id)
     foreach ($pair in @{'GOCACHE'='go-build'; 'GOMODCACHE'='go-mod'; 'GOPATH'='go-path'; 'TMPDIR'='tmp'; 'TMP'='tmp'; 'TEMP'='tmp'}.GetEnumerator()) {
         $path = Join-Path $probeRoot $pair.Value
         New-Item -ItemType Directory -Force -Path $path | Out-Null
@@ -280,7 +283,7 @@ foreach ($mapping in @(Get-SmbMapping)) {
 }
 $policy = Get-CachePolicy
 $remainingMappings = @(Get-MappingKeys | Where-Object { $_ -notin $baselineMappings })
-$remainingProcesses = @(Get-Process | Where-Object { $_.ProcessName -match '^(windows|smb)\.test$' -and $_.Id -notin $baselineProcesses } | Select-Object Id, ProcessName)
+$remainingProcesses = @(Get-Process | Where-Object { $_.ProcessName -match $testProcessPattern -and $_.Id -notin $baselineProcesses } | Select-Object Id, ProcessName)
 Write-JSON 'cleanup.json' ([ordered]@{ CachePolicy = $policy; RecoveredMappings = $recovered; RemainingMappings = $remainingMappings; RemainingProcesses = $remainingProcesses })
 if (($before.CachePolicy | ConvertTo-Json -Compress) -ne ($policy | ConvertTo-Json -Compress)) {
     throw 'The probe changed the machine SMB client cache policy.'

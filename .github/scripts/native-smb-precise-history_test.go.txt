@@ -1,0 +1,907 @@
+package windows
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"reflect"
+	"slices"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/smb"
+	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/transport/httprest"
+)
+
+const preciseMaxNodes = 64
+const preciseMaxBytes = 256 << 10
+const preciseMaxEvidenceBytes = 1 << 20
+
+type preciseHistoryPayload struct {
+	Request         json.RawMessage
+	PreSnapshot     json.RawMessage
+	CapturedEvents  json.RawMessage
+	StoredReceipt   json.RawMessage
+	Acknowledgment  json.RawMessage
+	DeliveredEvents json.RawMessage
+}
+
+// Only the generated fixture installs this owner. The authority mutex protects
+// installation and mutation callbacks; mu protects the source and HTTP join.
+type preciseHistory struct {
+	mu                                               sync.Mutex
+	authority                                        *nativeAuthority
+	closed                                           bool
+	incarnation                                      metastore.Incarnation
+	generation                                       uint64
+	streams                                          map[*preciseHistoryStream]bool
+	snapshot                                         map[uint64]metastore.Row
+	snapshotCount                                    int
+	evidence                                         preciseHistoryPayload
+	evidenceBytes                                    int
+	before, after                                    metastore.Position
+	action                                           storage.FileActionID
+	reference                                        storage.FileReferenceID
+	session                                          uint64
+	fingerprint                                      [32]byte
+	storedFingerprint                                [32]byte
+	request                                          storage.RenameRequest
+	begun, ended, finalized, acknowledged, published bool
+	events                                           []metastore.Change
+	receipt                                          storage.FileActionReceipt
+	failure                                          error
+	ready                                            chan struct{}
+	readyOnce                                        sync.Once
+}
+
+type preciseHistoryStream struct {
+	upstream    smb.ChangeStream
+	owner       *preciseHistory
+	ctx         context.Context
+	cancel      context.CancelFunc
+	generation  uint64
+	incarnation metastore.Incarnation
+	start       metastore.Position
+	mu          sync.Mutex
+	closed      bool
+	pins        int
+	drained     chan struct{}
+	closeOnce   sync.Once
+	closeErr    error
+	registry    map[metastore.Position]*preciseProofRecord
+	queued      []metastore.Change
+}
+
+type preciseProofRecord struct {
+	event       metastore.Change
+	root        uint64
+	incarnation metastore.Incarnation
+	generation  uint64
+	refs        int
+}
+
+type preciseProof struct {
+	stream   *preciseHistoryStream
+	record   *preciseProofRecord
+	released bool
+}
+
+func newPreciseHistory(a *nativeAuthority) *preciseHistory {
+	h := &preciseHistory{authority: a, streams: make(map[*preciseHistoryStream]bool), ready: make(chan struct{})}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.precise != nil {
+		panic("duplicate precise history owner")
+	}
+	a.precise = h
+	return h
+}
+
+func (h *preciseHistory) wrap(source smb.ChangeSource) smb.ChangeSource {
+	subscribe := func(ctx context.Context, open func(context.Context) (smb.ChangeStream, error)) (smb.ChangeStream, error) {
+		lifetime, cancel := context.WithCancel(ctx)
+		upstream, err := open(lifetime)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		h.mu.Lock()
+		if h.closed || len(h.streams) >= 2 || upstream.Incarnation() == "" || h.incarnation != "" && h.incarnation != upstream.Incarnation() {
+			h.mu.Unlock()
+			cancel()
+			return nil, errors.Join(smb.ErrNotifyRescan, upstream.Close())
+		}
+		h.generation++
+		h.incarnation = upstream.Incarnation()
+		s := &preciseHistoryStream{upstream: upstream, owner: h, ctx: lifetime, cancel: cancel, generation: h.generation, incarnation: h.incarnation, start: upstream.Position(), registry: make(map[metastore.Position]*preciseProofRecord), drained: make(chan struct{})}
+		h.streams[s] = true
+		h.mu.Unlock()
+		return s, nil
+	}
+	return smb.ChangeSource{
+		Subscribe: func(ctx context.Context) (smb.ChangeStream, error) { return subscribe(ctx, source.Subscribe) },
+		Resume: func(ctx context.Context, g metastore.Incarnation, p metastore.Position) (smb.ChangeStream, error) {
+			return subscribe(ctx, func(c context.Context) (smb.ChangeStream, error) { return source.Resume(c, g, p) })
+		},
+		Checkpoint: source.Checkpoint,
+	}
+}
+
+func preciseRowCost(row metastore.Row) (int, error) {
+	metadata, err := storage.EncodeMetadata(row.Node.Metadata)
+	if err != nil {
+		return 0, err
+	}
+	cost := 512 + len(row.Name) + len(row.Node.Content) + len(row.Node.LinkTarget) + len(metadata)
+	if cost > preciseMaxBytes {
+		return 0, syscall.EFBIG
+	}
+	return cost, nil
+}
+
+func preciseRows(rows []metastore.Row) (map[uint64]metastore.Row, error) {
+	if len(rows) == 0 || len(rows) > preciseMaxNodes {
+		return nil, syscall.EFBIG
+	}
+	tree := make(map[uint64]metastore.Row, len(rows))
+	entries := make(map[storage.EntryID]bool, len(rows))
+	siblings := make(map[int64]map[string]bool)
+	remaining := preciseMaxBytes
+	for _, r := range rows {
+		cost, err := preciseRowCost(r)
+		if err != nil || cost > remaining {
+			return nil, errors.Join(syscall.EFBIG, err)
+		}
+		remaining -= cost
+		if r.Node.ID <= 0 || r.Node.Kind.Check() != nil || r.Node.Size < 0 || r.Node.MetadataRevision == 0 || (r.Node.Kind == storage.NodeDirectory) != (r.Node.DirectoryRevision != 0) {
+			return nil, syscall.EIO
+		}
+		id := uint64(r.Node.ID)
+		if _, ok := tree[id]; ok {
+			return nil, syscall.EIO
+		}
+		if r.Parent == 0 {
+			if id != 1 || r.EntryID != 0 || len(r.Name) != 0 || r.Node.Kind != storage.NodeDirectory {
+				return nil, syscall.EIO
+			}
+		} else {
+			if r.Parent < 0 || r.EntryID == 0 || entries[r.EntryID] {
+				return nil, syscall.EIO
+			}
+			entries[r.EntryID] = true
+			key, err := smb.DiagnosticHistoryNameKey(r.Name)
+			if err != nil {
+				return nil, err
+			}
+			if siblings[r.Parent] == nil {
+				siblings[r.Parent] = make(map[string]bool)
+			}
+			if siblings[r.Parent][key] {
+				return nil, syscall.EEXIST
+			}
+			siblings[r.Parent][key] = true
+		}
+		r.Name = bytes.Clone(r.Name)
+		r.Node = r.Node.Clone()
+		tree[id] = r
+	}
+	if _, ok := tree[1]; !ok {
+		return nil, syscall.EIO
+	}
+	for id, row := range tree {
+		location, err := preciseLocation(tree, id)
+		if err != nil {
+			return nil, err
+		}
+		image := &metastore.EventImage{Attr: row.Node.Attr(), Location: location, LinkTarget: row.Node.LinkTarget}
+		node := row.Node
+		check := metastore.Change{Kind: metastore.Modified, Parent: row.Parent, Name: row.Name, Node: &node, Notification: &metastore.Notification{SubjectID: row.Node.ID, SubjectKind: row.Node.Kind, Before: image, After: image}}
+		if err := metastore.ValidateNotification(check); err != nil {
+			return nil, err
+		}
+	}
+	return tree, nil
+}
+
+func preciseLocation(tree map[uint64]metastore.Row, id uint64) (storage.EntryLocation, error) {
+	location := storage.EntryLocation{RootNodeID: 1, NodeID: id, State: storage.LocationRoot}
+	current, ok := tree[id]
+	if !ok {
+		return location, syscall.ENOENT
+	}
+	if id == 1 {
+		return location, location.Check()
+	}
+	location.State = storage.LocationLinked
+	visited := make(map[uint64]bool)
+	for current.Node.ID != 1 {
+		currentID := uint64(current.Node.ID)
+		if visited[currentID] || len(visited) >= preciseMaxNodes {
+			return location, syscall.EIO
+		}
+		visited[currentID] = true
+		parent, ok := tree[uint64(current.Parent)]
+		if !ok || parent.Node.Kind != storage.NodeDirectory {
+			return location, syscall.EIO
+		}
+		location.Ancestors = append(location.Ancestors, storage.EntryCondition{ParentID: uint64(current.Parent), DirectoryRevision: parent.Node.DirectoryRevision, EntryID: current.EntryID, NodeID: currentID, Name: bytes.Clone(current.Name)})
+		current = parent
+	}
+	slices.Reverse(location.Ancestors)
+	return location, location.Check()
+}
+
+func preciseSame(a, b any) bool { return preciseValueSame(reflect.ValueOf(a), reflect.ValueOf(b)) }
+
+func preciseValueSame(a, b reflect.Value) bool {
+	if !a.IsValid() || !b.IsValid() {
+		return !a.IsValid() && !b.IsValid()
+	}
+	if a.Type() != b.Type() {
+		return false
+	}
+	if a.Type() == reflect.TypeFor[time.Time]() {
+		return a.Interface().(time.Time).Equal(b.Interface().(time.Time))
+	}
+	switch a.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if a.IsNil() || b.IsNil() {
+			return a.IsNil() && b.IsNil()
+		}
+		return preciseValueSame(a.Elem(), b.Elem())
+	case reflect.Slice, reflect.Array:
+		if a.Len() != b.Len() {
+			return false
+		}
+		for i := 0; i < a.Len(); i++ {
+			if !preciseValueSame(a.Index(i), b.Index(i)) {
+				return false
+			}
+		}
+		return true
+	case reflect.Struct:
+		for i := 0; i < a.NumField(); i++ {
+			if !preciseValueSame(a.Field(i), b.Field(i)) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(a.Interface(), b.Interface())
+	}
+}
+
+func preciseReceiptMatches(returned, stored storage.FileActionReceipt) bool {
+	// The HTTP client subtracts transport elapsed time from the history lifetime.
+	if returned.HistoryRemaining <= 0 || returned.HistoryRemaining > stored.HistoryRemaining {
+		return false
+	}
+	returned.HistoryRemaining = 0
+	stored.HistoryRemaining = 0
+	return preciseSame(returned, stored)
+}
+
+func preciseImage(tree map[uint64]metastore.Row, image *metastore.EventImage) error {
+	if image == nil {
+		return syscall.EIO
+	}
+	row, ok := tree[image.Attr.ID]
+	if !ok {
+		return syscall.ENOENT
+	}
+	location, err := preciseLocation(tree, image.Attr.ID)
+	if err != nil {
+		return err
+	}
+	expected := metastore.EventImage{Attr: row.Node.Attr(), Location: location, LinkTarget: row.Node.LinkTarget}
+	if !preciseSame(expected, *image) {
+		return syscall.EIO
+	}
+	return nil
+}
+
+func (h *preciseHistory) Prepare(ctx context.Context, remote *httprest.Storage) (err error) {
+	snapshot, err := remote.Snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, snapshot.Close()) }()
+	rows := make([]metastore.Row, 0, preciseMaxNodes)
+	remaining := preciseMaxBytes
+	for {
+		page, nextErr := snapshot.Next()
+		if errors.Is(nextErr, io.EOF) {
+			break
+		}
+		if nextErr != nil {
+			return nextErr
+		}
+		if len(page) > preciseMaxNodes-len(rows) {
+			return syscall.EFBIG
+		}
+		for _, row := range page {
+			cost, costErr := preciseRowCost(row)
+			if costErr != nil || cost > remaining {
+				return errors.Join(syscall.EFBIG, costErr)
+			}
+			remaining -= cost
+			row.Name = bytes.Clone(row.Name)
+			row.Node = row.Node.Clone()
+			rows = append(rows, row)
+		}
+	}
+	tree, err := preciseRows(rows)
+	if err != nil {
+		return err
+	}
+	h.authority.mu.Lock()
+	defer h.authority.mu.Unlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || h.snapshot != nil || h.incarnation == "" || string(h.incarnation) != h.authority.identity || snapshot.Position() != h.authority.position() {
+		return smb.ErrNotifyRescan
+	}
+	slices.SortFunc(rows, func(a, b metastore.Row) int {
+		if a.Node.ID < b.Node.ID {
+			return -1
+		}
+		if a.Node.ID > b.Node.ID {
+			return 1
+		}
+		return 0
+	})
+	if err := h.saveEvidenceLocked(&h.evidence.PreSnapshot, rows); err != nil {
+		return err
+	}
+	h.snapshot = tree
+	h.snapshotCount = len(tree)
+	h.before = snapshot.Position()
+	return nil
+}
+
+func preciseFingerprint(reference storage.FileReferenceID, request storage.RenameRequest) ([32]byte, error) {
+	encoded, err := json.Marshal(struct {
+		Operation storage.Operation
+		Input     any
+	}{storage.OpFileRename, struct {
+		Reference storage.FileReferenceID
+		Input     any
+	}{reference, request}})
+	if err != nil || len(encoded) > preciseMaxBytes {
+		return [32]byte{}, errors.Join(syscall.EFBIG, err)
+	}
+	return sha256.Sum256(encoded), nil
+}
+
+func (h *preciseHistory) failLocked(err error) error {
+	if err == nil {
+		err = smb.ErrNotifyRescan
+	}
+	h.failure = errors.Join(h.failure, err)
+	h.readyOnce.Do(func() { close(h.ready) })
+	return h.failure
+}
+
+func (h *preciseHistory) Arm(file storage.File, request storage.RenameRequest, action storage.FileActionID) error {
+	fingerprint, err := preciseFingerprint(file.Reference(), request)
+	if err != nil {
+		return err
+	}
+	h.authority.mu.Lock()
+	defer h.authority.mu.Unlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || h.snapshot == nil || h.action != "" || request.Check() != nil || request.Source.ExpectedNodeID != file.NodeID() || request.Destination.ExpectedNodeID == 0 || request.Destination.ExpectedNodeID == file.NodeID() {
+		return h.failLocked(smb.ErrNotifyRescan)
+	}
+	var found *nativeFile
+	for _, session := range h.authority.sessions {
+		if ref := session.files[file.Reference()]; ref != nil {
+			if found != nil || ref.node.attr.ID != file.NodeID() || ref.closed || session.closed {
+				return h.failLocked(smb.ErrNotifyRescan)
+			}
+			found = ref
+		}
+	}
+	if found == nil {
+		return h.failLocked(syscall.EBADF)
+	}
+	if _, replayed := found.session.actions[action]; replayed {
+		return h.failLocked(smb.ErrNotifyRescan)
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return h.failLocked(err)
+	}
+	if err := json.Unmarshal(encoded, &h.request); err != nil {
+		return h.failLocked(err)
+	}
+	if err := h.saveEvidenceLocked(&h.evidence.Request, h.request); err != nil {
+		return h.failLocked(err)
+	}
+	h.action = action
+	h.reference = file.Reference()
+	h.session = found.session.id
+	h.fingerprint = fingerprint
+	return nil
+}
+
+func preciseBeginLocked(file *nativeFile, request storage.RenameRequest, action storage.FileActionID, other *nativeNode) {
+	h := file.session.authority.precise
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.action != action {
+		return
+	}
+	a := file.session.authority
+	if h.closed || h.failure != nil || h.begun || h.authority != a || h.incarnation != metastore.Incarnation(a.identity) || h.session != file.session.id || h.reference != file.reference || !preciseSame(request, h.request) || h.before != a.position() || other.attr.ID != request.Destination.ExpectedNodeID || other.entry != request.Destination.ExpectedEntryID || file.node.attr.ID != request.Source.ExpectedNodeID || file.node.entry != request.Source.ExpectedEntryID {
+		h.failLocked(smb.ErrNotifyRescan)
+		return
+	}
+	h.begun = true
+}
+
+func preciseCopyChange(change metastore.Change) (metastore.Change, error) {
+	// Charge before copying the bounded images. The canonical notification encoder
+	// separately validates the node/image relationship and bounds its representation.
+	encoded, err := metastore.EncodeNotification(change)
+	if err != nil {
+		return metastore.Change{}, err
+	}
+	cost := len(encoded) + len(change.Name) + 512
+	if change.From != nil {
+		cost += len(change.From.Name)
+	}
+	if change.Node != nil {
+		n, err := preciseRowCost(metastore.Row{Node: *change.Node})
+		if err != nil {
+			return metastore.Change{}, err
+		}
+		cost += n
+	}
+	if cost > preciseMaxBytes/2 {
+		return metastore.Change{}, syscall.EFBIG
+	}
+	result := change
+	result.Name = bytes.Clone(change.Name)
+	if change.From != nil {
+		v := *change.From
+		v.Name = bytes.Clone(v.Name)
+		result.From = &v
+	}
+	if change.Node != nil {
+		v := change.Node.Clone()
+		result.Node = &v
+	}
+	result.Notification, err = metastore.DecodeNotification(result, encoded)
+	return result, err
+}
+
+func preciseEndLocked(file *nativeFile, action storage.FileActionID) {
+	h := file.session.authority.precise
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.action != action {
+		return
+	}
+	a := file.session.authority
+	if h.failure != nil {
+		return
+	}
+	if h.closed || !h.begun || h.ended || h.session != file.session.id || h.reference != file.reference || a.position() != h.before+2 {
+		h.failLocked(smb.ErrNotifyRescan)
+		return
+	}
+	events := make([]metastore.Change, 0, 2)
+	for _, event := range a.changes {
+		if event.Position <= h.before {
+			continue
+		}
+		if len(events) == 2 || event.Position != h.before+metastore.Position(len(events))+1 {
+			h.failLocked(smb.ErrNotifyRescan)
+			return
+		}
+		copy, err := preciseCopyChange(event)
+		if err != nil {
+			h.failLocked(err)
+			return
+		}
+		events = append(events, copy)
+	}
+	if len(events) != 2 {
+		h.failLocked(smb.ErrNotifyRescan)
+		return
+	}
+	h.after = a.position()
+	h.events = events
+	h.ended = true
+	if err := h.saveEvidenceLocked(&h.evidence.CapturedEvents, events); err != nil {
+		h.failLocked(err)
+	}
+}
+
+func preciseFinalizeLocked(session *nativeSession, action storage.FileActionID) {
+	h := session.authority.precise
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.action != action {
+		return
+	}
+	stored, ok := session.actions[action]
+	if ok && !h.closed && len(h.evidence.StoredReceipt) == 0 {
+		h.storedFingerprint = stored.fingerprint
+		if err := h.saveEvidenceLocked(&h.evidence.StoredReceipt, stored.result); err != nil {
+			h.failLocked(err)
+		}
+	}
+	if h.failure != nil {
+		return
+	}
+	if h.closed || !h.ended || h.finalized || h.session != session.id || !ok || stored.fingerprint != h.fingerprint || stored.err != nil || stored.result.Action != h.action || stored.result.Operation != storage.OpFileRename || stored.result.State != storage.FileActionCompleted || stored.result.Effects != storage.EffectEntryMoved || stored.result.Errno != 0 || stored.result.Observation.Attr.ID != h.request.Source.ExpectedNodeID {
+		h.failLocked(smb.ErrNotifyRescan)
+		return
+	}
+	h.receipt = nativeReceiptCopy(stored.result)
+	h.finalized = true
+
+}
+
+func preciseInterval(tree map[uint64]metastore.Row, before, after metastore.Position, request storage.RenameRequest, events []metastore.Change) error {
+	if len(events) != 2 || after != before+2 || events[0].Position != before+1 || events[1].Position != after || events[0].Kind != metastore.Removed || events[1].Kind != metastore.Renamed {
+		return smb.ErrNotifyRescan
+	}
+	removed, renamed := events[0], events[1]
+	for _, event := range events {
+		if err := metastore.ValidateNotification(event); err != nil {
+			return err
+		}
+		if err := preciseImage(tree, event.Notification.Before); err != nil {
+			return err
+		}
+	}
+	if removed.Notification.SubjectID != int64(request.Destination.ExpectedNodeID) || renamed.Notification.SubjectID != int64(request.Source.ExpectedNodeID) || removed.Node != nil || removed.Notification.After != nil || renamed.Node == nil || renamed.Notification.After == nil || renamed.From == nil {
+		return smb.ErrNotifyRescan
+	}
+	if removed.Parent != int64(request.Destination.ParentID) || !bytes.Equal(removed.Name, request.Destination.Name) || renamed.From.Parent != int64(request.Source.ParentID) || !bytes.Equal(renamed.From.Name, request.Source.Name) || renamed.Parent != int64(request.Destination.ParentID) {
+		return smb.ErrNotifyRescan
+	}
+	newName := request.Destination.Name
+	if request.NewName != nil {
+		newName = request.NewName
+	}
+	if !bytes.Equal(renamed.Name, newName) || tree[request.Source.ExpectedNodeID].EntryID != request.Source.ExpectedEntryID || tree[request.Destination.ExpectedNodeID].EntryID != request.Destination.ExpectedEntryID {
+		return smb.ErrNotifyRescan
+	}
+	projection := make(map[uint64]metastore.Row, len(tree))
+	for id, row := range tree {
+		projection[id] = row
+	}
+	delete(projection, request.Destination.ExpectedNodeID)
+	row := projection[request.Source.ExpectedNodeID]
+	row.Parent = renamed.Parent
+	row.Name = bytes.Clone(renamed.Name)
+	row.Node = renamed.Node.Clone()
+	projection[request.Source.ExpectedNodeID] = row
+	// This fixture's observed atomic rename increments each affected parent once.
+	// Both Before images were checked against the one immutable pre-image above.
+	for _, parentID := range []uint64{request.Source.ParentID, request.Destination.ParentID} {
+		if parentID == request.Destination.ParentID && request.Source.ParentID == request.Destination.ParentID {
+			continue
+		}
+		parent, ok := projection[parentID]
+		if !ok {
+			return smb.ErrNotifyRescan
+		}
+		parent.Node.DirectoryRevision++
+		projection[parentID] = parent
+	}
+	if request.Source.ParentID == request.Destination.ParentID {
+		parent := projection[request.Source.ParentID]
+		parent.Node.DirectoryRevision++
+		projection[request.Source.ParentID] = parent
+	}
+	rows := make([]metastore.Row, 0, len(projection))
+	for _, row := range projection {
+		rows = append(rows, row)
+	}
+	checked, err := preciseRows(rows)
+	if err != nil {
+		return err
+	}
+	return preciseImage(checked, renamed.Notification.After)
+}
+
+func (h *preciseHistory) Acknowledge(receipt storage.FileActionReceipt, barrier *httprest.MutationBarrier, operationErr error) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.closed && len(h.evidence.Acknowledgment) == 0 {
+		outcome := struct {
+			Receipt storage.FileActionReceipt
+			Barrier *httprest.MutationBarrier
+			Error   string
+		}{receipt, barrier, ""}
+		if operationErr != nil {
+			outcome.Error = operationErr.Error()
+		}
+		if err := h.saveEvidenceLocked(&h.evidence.Acknowledgment, outcome); err != nil {
+			return h.failLocked(err)
+		}
+	}
+	if h.failure != nil {
+		return h.failure
+	}
+	if h.closed || h.acknowledged || !h.finalized || operationErr != nil || barrier == nil || barrier.Incarnation != string(h.incarnation) || barrier.Position != int64(h.after) || !preciseReceiptMatches(receipt, h.receipt) {
+		return h.failLocked(errors.Join(smb.ErrNotifyRescan, operationErr))
+	}
+	if err := preciseInterval(h.snapshot, h.before, h.after, h.request, h.events); err != nil {
+		return h.failLocked(err)
+	}
+	h.acknowledged = true
+	h.readyOnce.Do(func() { close(h.ready) })
+	return nil
+}
+
+func (s *preciseHistoryStream) Incarnation() metastore.Incarnation { return s.incarnation }
+func (s *preciseHistoryStream) Position() metastore.Position       { return s.start }
+
+func (s *preciseHistoryStream) Next() (metastore.Change, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return metastore.Change{}, syscall.EBADF
+	}
+	if len(s.queued) > 0 {
+		event := s.queued[0]
+		s.queued[0] = metastore.Change{}
+		s.queued = s.queued[1:]
+		s.mu.Unlock()
+		return event, nil
+	}
+	s.mu.Unlock()
+	first, err := s.upstream.Next()
+	if err != nil {
+		return metastore.Change{}, err
+	}
+	h := s.owner
+	h.mu.Lock()
+	if h.closed || h.generation != s.generation || h.incarnation != s.incarnation {
+		h.mu.Unlock()
+		return metastore.Change{}, smb.ErrNotifyRescan
+	}
+	prepared, before := h.snapshotCount > 0, h.before
+	h.mu.Unlock()
+	if !prepared || first.Position <= before {
+		return first, nil
+	}
+	if first.Position != before+1 {
+		return metastore.Change{}, smb.ErrNotifyRescan
+	}
+	second, err := s.upstream.Next()
+	if err != nil {
+		return metastore.Change{}, err
+	}
+	if second.Position != before+2 {
+		return metastore.Change{}, smb.ErrNotifyRescan
+	}
+	select {
+	case <-s.ctx.Done():
+		return metastore.Change{}, s.ctx.Err()
+	case <-h.ready:
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || h.failure != nil || !h.acknowledged || h.published || h.generation != s.generation || h.incarnation != s.incarnation || len(h.events) != 2 || !preciseSame(first, h.events[0]) || !preciseSame(second, h.events[1]) {
+		return metastore.Change{}, errors.Join(smb.ErrNotifyRescan, h.failure)
+	}
+	// Compare the actual complete delivered interval before exposing either record.
+	if err := preciseInterval(h.snapshot, h.before, h.after, h.request, []metastore.Change{first, second}); err != nil {
+		return metastore.Change{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || len(s.registry) != 0 {
+		return metastore.Change{}, smb.ErrNotifyRescan
+	}
+	for _, event := range h.events {
+		copy, err := preciseCopyChange(event)
+		if err != nil {
+			return metastore.Change{}, err
+		}
+		s.registry[event.Position] = &preciseProofRecord{event: copy, root: 1, incarnation: s.incarnation, generation: s.generation}
+	}
+	if err := h.saveEvidenceLocked(&h.evidence.DeliveredEvents, []metastore.Change{first, second}); err != nil {
+		return metastore.Change{}, h.failLocked(err)
+	}
+	s.queued = []metastore.Change{second}
+	h.snapshot = nil
+	h.events = nil
+	h.published = true
+	return first, nil
+}
+
+func (s *preciseHistoryStream) RetainNotificationProof(event metastore.Change) (smb.DiagnosticNotificationProof, error) {
+	h := s.owner
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if h.closed || s.closed || h.generation != s.generation || h.incarnation != s.incarnation {
+		return nil, smb.ErrNotifyRescan
+	}
+	record := s.registry[event.Position]
+	if record == nil {
+		if h.snapshotCount > 0 && event.Position > h.before {
+			return nil, smb.ErrNotifyRescan
+		}
+		return nil, nil
+	}
+	if !preciseSame(event, record.event) || record.refs >= 8 {
+		return nil, smb.ErrNotifyRescan
+	}
+	record.refs++
+	return &preciseProof{stream: s, record: record}, nil
+}
+
+func (proof *preciseProof) Validate(ctx context.Context, root uint64, position metastore.Position, filter uint32, recursive bool, events []wire.Notification) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s := proof.stream
+	h := s.owner
+	h.mu.Lock()
+	s.mu.Lock()
+	if h.closed || s.closed || proof.released || h.generation != s.generation || h.incarnation != s.incarnation || proof.record.generation != s.generation || proof.record.incarnation != s.incarnation || proof.record.root != root || proof.record.event.Position != position || filter != 31 || !recursive {
+		s.mu.Unlock()
+		h.mu.Unlock()
+		return smb.ErrNotifyRescan
+	}
+	s.pins++
+	s.mu.Unlock()
+	h.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.pins--
+		if s.closed && s.pins == 0 {
+			close(s.drained)
+		}
+		s.mu.Unlock()
+	}()
+	expected, err := smb.DiagnosticMapNotifications(proof.record.event, int64(root), filter, recursive)
+	if err != nil {
+		return err
+	}
+	if !slices.Equal(expected, events) {
+		return smb.ErrNotifyRescan
+	}
+	return ctx.Err()
+}
+
+func (proof *preciseProof) Release() {
+	s := proof.stream
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if proof.released {
+		panic("precise notification proof released twice")
+	}
+	proof.released = true
+	proof.record.refs--
+	if proof.record.refs < 0 {
+		panic("negative precise notification ownership")
+	}
+}
+
+func (s *preciseHistoryStream) Close() error {
+	s.closeOnce.Do(func() {
+		h := s.owner
+		h.mu.Lock()
+		s.mu.Lock()
+		s.closed = true
+		clear(s.registry)
+		s.registry = nil
+		clear(s.queued)
+		s.queued = nil
+		if s.pins == 0 {
+			close(s.drained)
+		}
+		delete(h.streams, s)
+		s.mu.Unlock()
+		h.mu.Unlock()
+		s.cancel()
+		s.closeErr = s.upstream.Close()
+		<-s.drained
+	})
+	return s.closeErr
+}
+
+func (h *preciseHistory) Close() error {
+	h.authority.mu.Lock()
+	h.mu.Lock()
+	if h.authority.precise == h {
+		h.authority.precise = nil
+	}
+	h.closed = true
+	h.readyOnce.Do(func() { close(h.ready) })
+	streams := make([]*preciseHistoryStream, 0, len(h.streams))
+	for s := range h.streams {
+		streams = append(streams, s)
+	}
+	h.snapshot = nil
+	h.events = nil
+	h.evidence = preciseHistoryPayload{}
+	h.evidenceBytes = 0
+	h.mu.Unlock()
+	h.authority.mu.Unlock()
+	var err error
+	for _, s := range streams {
+		err = errors.Join(err, s.Close())
+	}
+	return err
+}
+
+func (h *preciseHistory) saveEvidenceLocked(destination *json.RawMessage, value any) error {
+	if len(*destination) != 0 {
+		return errors.New("precise evidence cannot replace an earlier observation")
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if len(encoded) > preciseMaxEvidenceBytes-h.evidenceBytes {
+		return syscall.EFBIG
+	}
+	h.evidenceBytes += len(encoded)
+	*destination = encoded
+	return nil
+}
+
+type preciseHistoryEvidence struct {
+	Incarnation                                              metastore.Incarnation
+	Generation                                               uint64
+	SnapshotNodes                                            int
+	Before, After                                            metastore.Position
+	Action                                                   storage.FileActionID
+	Session                                                  uint64
+	Reference                                                storage.FileReferenceID
+	Fingerprint, StoredFingerprint                           string
+	Begun, Ended, Finalized, Acknowledged, Published, Closed bool
+	SourceCount, EvidenceBytes                               int
+	Payload                                                  preciseHistoryPayload
+	Error                                                    string
+}
+
+func (h *preciseHistory) Evidence() preciseHistoryEvidence {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	payload := preciseHistoryPayload{
+		Request:     bytes.Clone(h.evidence.Request),
+		PreSnapshot: bytes.Clone(h.evidence.PreSnapshot), CapturedEvents: bytes.Clone(h.evidence.CapturedEvents),
+		StoredReceipt: bytes.Clone(h.evidence.StoredReceipt), Acknowledgment: bytes.Clone(h.evidence.Acknowledgment), DeliveredEvents: bytes.Clone(h.evidence.DeliveredEvents),
+	}
+	result := preciseHistoryEvidence{Incarnation: h.incarnation, Generation: h.generation, SnapshotNodes: h.snapshotCount, Before: h.before, After: h.after, Action: h.action, Session: h.session, Reference: h.reference, Fingerprint: fmt.Sprintf("%x", h.fingerprint), StoredFingerprint: fmt.Sprintf("%x", h.storedFingerprint), Begun: h.begun, Ended: h.ended, Finalized: h.finalized, Acknowledged: h.acknowledged, Published: h.published, Closed: h.closed, SourceCount: len(h.streams), EvidenceBytes: h.evidenceBytes, Payload: payload}
+	if h.failure != nil {
+		result.Error = h.failure.Error()
+	}
+	return result
+}
+
+// Keep a concrete check in the generated fixture: a source hook with a different
+// lifetime or signature must fail compilation before any native invocation.
+var _ smb.DiagnosticHistoryStream = (*preciseHistoryStream)(nil)
+var _ smb.DiagnosticNotificationProof = (*preciseProof)(nil)

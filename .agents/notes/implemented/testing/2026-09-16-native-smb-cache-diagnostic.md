@@ -40,6 +40,12 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 替换只预先保留原生 A 句柄，B 完全通过 HTTP 准备；mutation 前及最终排空的轨迹均须满足冷态判据：整个轨迹排除 B 的 CREATE/QUERY_INFO/READ，直到 ACK 排除目录枚举和未知 file ID；最终核对只能撤销、不能升级先前资格，迟到污染保留原始数据并使样本 inconclusive、测试失败。不能用预先打开 B 来教会 redirector 新身份。覆盖后先同步打开 target，再核对同一 volume 上的新旧原生 ID 不同、旧 ID 未变及 A/B 各自字节，不能把原生 ID 数值直接等同于 authority NodeID。通知区分 DETAIL 与 VERIFIED_RESCAN：前者核对完整 wire/native 事件及 REMOVED 后相邻 OLD_NAME/NEW_NAME；后者只在当前请求的真实 0x10c 与排空的原生零字节或 ERROR_NOTIFY_ENUM_DIR 配对时成立。VERIFIED_RESCAN 一旦出现便保持 rescan_required=true、precise_notification_proven=false，不能把后续片段重组为已证明的完整事件序列。两者最多三次完成、三次重挂，保持同一 watcher 及精确新 Pending，共用 ACK+850 ms 截止。rescan 还须有 native event 的未完成检查点及首个 API 前的 wire 观察顺序，最终轨迹只能撤销资格；检查点不保证内核未来不会完成。首次打开与全部身份/读取检查仍须在 ACK+一秒及缓存到期之前完成，rescan 成功另标 current_replacement_identity_after_verified_rescan_before_deadline，不冒充精确通知或目录枚举恢复。原始首值、后置双对象 oracle、轨迹和最终清理共同决定资格；旧首值是候选失败，不单独成为超过一秒反例，无监听对照也不外推 share6 因果关系。
 
+精确通知另由[独立单项工作流](../../../../.github/workflows/native-smb-precise-invalidation.yml)与[运行脚本](../../../../.github/scripts/native-smb-precise-invalidation.ps1)执行，只运行全新的 share0/app-first 替换身份场景。固定原型、既有三份 overlay 之外再加入[历史通知补丁](../../../../.github/scripts/native-smb-precise-history.patch)，父探针 Go 判据保持原样；共享脚本只扩展受限的产物目录和 precise 测试进程清理。实验对象仍是有明确来源的诊断树，不能成为当前生产通知 API 的承诺。
+
+[历史 producer](../../../../.github/scripts/native-smb-precise-history_test.go.txt)从实际 HTTP Snapshot 的完整 EOF 建立有界前像，以原 Rename 同一锁内捕获的 P/Q、两项实际事件、action 输入指纹和已保存的原动作回执绑定事实，再核对 RenameWithBarrier 的回复/barrier 与 stream 真正交付的完整区间。上限为 64 节点、256 KiB 前像和 1 MiB 证据，不用预期结果填通知。历史 full-name proof 与当前披露权限分离：存活引用、授权、实际祖先和完整 sibling 集继续检查；group/验证 pin 的拥有权延续至 release，Close 排空验证和释放工作。这让历史叶名不必假装仍属于当前树，同时不会把旧权限当成当前授权。
+
+新单项必须取得精确 DETAIL；任何 ENUM 都停止该证据路径。被动观察只记录已有 QFid/identity 查询及原始、有效 compound session 关联，不主动刷新目标。HA/Hnew、不预热的 B、首个打开、不同原生身份与 A/B 字节、一秒和原 TTL 的判据均不放宽。它检验有真实历史事实支持的精确通知能否改变这一个替换结果，不把旧 typed-rescan 的身份失败撤销。
+
 ## 备选方案
 
 **等整套新实现完成后才运行原生验收。** 最终仍要这样验证交付代码，但把可行性诊断也推迟到那时，会让一个已经知道可能失败的缓存行为在大量实现之后才决定能否交付。固定原型让这项依赖提前得到可复现的回答。
@@ -95,7 +101,11 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 [35414601479](https://github.com/codetreker/remote-fs/actions/runs/35414601479/job/105820628128)使用探针 `d7110afda15994310835e9a5a8354dec88f91df6` 的七项，四项增长在 ACK 后 21.842～23.660 ms 合格可见，share0/app-first 缩短在 22.086 ms 取得 73 字节；noWatcher 的 257 字节仍只作观察。替换收到合法 STATUS_NOTIFY_ENUM_DIR（0x10c）与零字节，detail-only helper 在首次打开前中止，因此没有新旧身份或字节首样本、没有后置双对象 oracle，整项及作业仍失败。cold_source 的 false 来自中止后未赋值的字段参与最终核对；已排空轨迹没有发现 B 名字暴露或目录枚举，不能据该 false 归因于 B 被预热。这只澄清缺失证据，不把原失败改为通过。默认 5/10/10 与清理检查保持，原始失败收据不变。
 
-typed-rescan 探针的精确 PowerShell 准备、actionlint 和完整 Windows ARM64 构建通过，三个可移植解析/关联/资格测试根普通/race 各 144 pass，使用限定 Windows 常量和 Filetime shim。detail-only 的隔离对照在 ENUM 配对失败，删除 readiness 观察序号的对照暴露相等时钟下提前完成的误接纳。当前 typed-rescan 七场景尚未原生执行，已有增长/缩短结果不证明替换身份或完整产品方案。
+[typed-rescan 运行 35419230739](https://github.com/codetreker/remote-fs/actions/runs/35419230739/job/105833626982)以探针 `a6bdeeeba3bbe5bd7e49325d44051bdd6fe73fe7` 完成七项：四项增长和缩短通过，noWatcher 保留观察用旧值；替换是 EvidenceValid=true 的 replacement_identity_aliased，整项失败。真实 0x10c/原生零字节、同 watcher 新 Pending、首个 API 前的观察顺序、冷 B、HTTP oracle 和清理均合格。Hnew 有 769 字节并读 B，HA 保持 257 字节并读 A，但两者报告同一 native FileIndex=3、同一 volume；全部身份/字节检查在 ACK 后约 20.5 ms 完成。它是首个合格样本的身份不一致，不是超过一秒的 staleness 证明。
+
+该轨迹中旧 CREATE 请求了 QFid，新 CREATE 只有 DH2Q，未出现 file QUERY_INFO 6/18/59；原观察器没有保存 QFid 数值响应。不能从请求存在或 authority NodeID 推导系统使用了哪个身份值。精确实验为此增加被动关联记录，既不补发查询，也不把原失败改成成功。
+
+typed-rescan 的局部三个根普通/race 各 144 pass，detail-only 与 readiness 对照分别命中规定的失败。精确历史单项的 26 个本地根普通/race 各 285 个 verdict 通过，四个因果对照、十个源提取 PowerShell 清理选择用例、错误 pin 拒绝、精确准备、ARM64 构建和 actionlint 通过。这些分别证明自己的 harness 来源、错误判据与拥有权；精确单项尚未原生执行，已有局部和增长/缩短结果不证明替换身份、当前生产适配或完整缓存方案。
 
 ### 样本资格与执行来源
 
@@ -113,4 +123,4 @@ typed-rescan 探针的精确 PowerShell 准备、actionlint 和完整 Windows AR
 
 每次结果绑定固定基底、overlay、探针 commit、variant、OS/build 和缓存设置；无 overlay 的样本保留各自来源。JSON 轨迹、Go verdict、映射前后状态和最终引用数作为产物保存十四天。轨迹溢出、编码失败、设置改变或映射残留使样本失败；取消 overlapped 通知须等真实完成后才释放结构和缓冲，意外清理错误不能当作正常取消。
 
-代价是维护固定基底补丁、注入锚点、回归、十八个诊断作业及独立祖先实验，输入不会自动跟随生产代码。诊断提供可行性或失败证据，不交付新的 SMB 文件实现、SQLite 持久性或历史时间显示策略。实际 package、transport 和 backend 仍须独立验收；缓存失效机制与平台接入仍由平台提案承接，既有一秒要求保持不变。
+代价是维护固定基底补丁、注入锚点、回归、十八个诊断作业、独立祖先及精确历史实验，输入不会自动跟随生产代码。诊断提供可行性或失败证据，不交付新的 SMB 文件实现、SQLite 持久性或历史时间显示策略。实际 package、transport 和 backend 仍须独立验收；缓存失效机制与平台接入仍由平台提案承接，既有一秒要求保持不变。

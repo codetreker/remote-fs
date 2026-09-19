@@ -478,7 +478,19 @@ owned_rescan 必须从实际捕获的 SMB Command 15 请求及同一 MessageID �
 
 [五场景运行 35411939518](https://github.com/codetreker/remote-fs/actions/runs/35411939518)保留整体失败及相等时钟导致的 inconclusive。[七场景运行 35414601479](https://github.com/codetreker/remote-fs/actions/runs/35414601479)的四项增长和一项缩短取得合格当前值，noWatcher 仍只返回观察用旧值；替换在合法 0x10c/零字节通知处中止，尚无首次打开、身份或字节样本，整体仍失败。未赋值的 cold_source=false 不证明 B 被预热；历史结果不按新判据追改。完整来源和资格见[诊断决定](../.agents/notes/implemented/testing/2026-09-16-native-smb-cache-diagnostic.md)。
 
-当前 typed-rescan 源码的精确 PowerShell 准备、actionlint 与完整 Windows ARM64 探针构建通过；三个可移植测试根普通/race 各 144 pass，使用限定 Windows 常量/Filetime shim。仅接受 detail 的对照在真实 ENUM 配对断言失败，移除 readiness 观察序号的对照在相等时钟下提前完成的断言失败。typed-rescan 七场景尚未原生执行；生产父目录布局、映射、完整名字/身份与故障行为仍需各自证明。
+当前 typed-rescan 源码的精确 PowerShell 准备、actionlint 与完整 Windows ARM64 探针构建通过；三个可移植测试根普通/race 各 144 pass，使用限定 Windows 常量/Filetime shim。仅接受 detail 的对照在真实 ENUM 配对断言失败，移除 readiness 观察序号的对照在相等时钟下提前完成的断言失败。[typed-rescan 原生运行 35419230739](https://github.com/codetreker/remote-fs/actions/runs/35419230739)仍失败：四项增长和缩短合格，替换在有效 ENUM/重挂证据下取得同一 native FileIndex 的新旧句柄，虽然各自读取 B/A 正确字节。身份/字节检查在 ACK 后约 20.5 ms 完成，这是合格身份不一致，不能称为超过一秒的旧值证明。原 QFid 仅旧 CREATE 请求，新 CREATE 未请求，原观察器未记录其数值响应；因果仍需精确证据。生产父目录布局、映射、完整名字/身份与故障行为仍需各自证明。
+
+### 精确历史通知与替换身份实验
+
+[独立 precise 工作流](../.github/workflows/native-smb-precise-invalidation.yml)通过[运行脚本](../.github/scripts/native-smb-precise-invalidation.ps1)只执行一个全新 `TestNativePreciseReplacement/share0_app_first_replace_identity_precise`。它仍使用固定原型和既有三份 overlay，再核对并应用[历史通知补丁](../.github/scripts/native-smb-precise-history.patch)；这些字节只进入临时诊断检出。父探针 Go 模板及默认判据不变，公共 PowerShell 仅增加受限的产物目录选择与对应 precise binary 清理。工作流保存本次输入/输出来源、首值及清理产物，不能把执行对象叫作当前生产适配。
+
+[历史事实 producer](../.github/scripts/native-smb-precise-history_test.go.txt)先从实际 HTTP Snapshot 读到语义 EOF，核对 incarnation、完整树、位置与预算；最多 64 节点/256 KiB，证据序列总量最多 1 MiB。原 Rename 的同一次 authority 锁区间捕获 P/Q 和实际 Removed/Renamed 事件，绑定 session/reference/action、输入指纹与已保存的原 action receipt。实际 RenameWithBarrier 回复及其 HTTP barrier 必须与这些事实相符，真实 stream 交付的完整两事件区间也须一致，才能交付历史 full-name proof；不以测试预期拼造 mutation、位置或通知。
+
+历史位置证明只回答修改时的名字事实；当前读取授权、存活引用、完整祖先及 sibling 的表示/歧义检查仍由独立披露路径执行。证明按 group 保留，验证时 pin，丢弃、关闭与失败均归还；Close 排空正在验证及延后 release，未知来源或 proof 失败不能降成成功。新单项必须取得完整 DETAIL，ENUM/VERIFIED_RESCAN 会结束本次验证，不能沿旧 rescan 成功条件继续。
+
+[被动身份观察器](../.github/scripts/native-smb-precise-identity_test.go.txt)只解析已有流量的 QFid、QUERY_INFO 6/18/59 和 filesystem class 1；它不主动发查询。原始 SessionID 与可证明的同 compound effective SessionID 分别记录，按 connection/message/command/open 关联请求和响应；未请求、缺失、畸形与数值零分开。关联不清或轨迹超限使证据失效，不从 backend NodeID 猜原生 FileIndex。
+
+HA-only、HTTP-only 冷 B、首次 CreateFile、新旧 native ID/volume 与 A/B 字节保持原判据，通知与所有观察仍受原 ACK+850 ms/一秒/最早 TTL 约束；默认缓存设置、后置 oracle 和清理不变。[producer/身份回归](../.github/scripts/native-smb-precise-history-controls_test.go.txt)与[通知拥有权回归](../.github/scripts/native-smb-precise-notify-controls_test.go.txt)合计 26 根，普通/race 各 285 个通过 verdict；四个独立对照核对 proof 失败、ENUM 误当 DETAIL、未绑定 QFid 与错误 compound session 处理。另有十项源提取 PowerShell 进程选择用例、错误源码 pin 拒绝、精确 fixture 准备、ARM64 构建和 actionlint 检查。当前单项原生结果尚未取得，既有 typed-rescan 身份失败不重分类，当前 production/F guest/系统缓存验收也未由这些本地结果证明。
 
 ## 每次改动必须带什么
 

@@ -1,0 +1,422 @@
+package smb
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/codetreker/remote-fs/packages/authz"
+	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+	"github.com/codetreker/remote-fs/packages/storage"
+)
+
+type diagnosticControlProof struct {
+	released  atomic.Int32
+	validated atomic.Int32
+	check     func(context.Context) error
+	onRelease func()
+}
+
+func (p *diagnosticControlProof) Release() {
+	if p.onRelease != nil {
+		p.onRelease()
+	}
+	p.released.Add(1)
+}
+func (p *diagnosticControlProof) Validate(ctx context.Context, root uint64, position metastore.Position, filter uint32, recursive bool, events []wire.Notification) error {
+	p.validated.Add(1)
+	if p.released.Load() != 0 || root != 1 || position != 1 || filter != 1 || !recursive || !reflect.DeepEqual(events, []wire.Notification{{Action: 2, Name: "gone"}}) {
+		return syscall.ESTALE
+	}
+	if p.check != nil {
+		return p.check(ctx)
+	}
+	return nil
+}
+
+type diagnosticControlStream struct {
+	*notifyTestStream
+	proof     DiagnosticNotificationProof
+	retainErr error
+	retained  atomic.Int32
+}
+
+func (s *diagnosticControlStream) RetainNotificationProof(metastore.Change) (DiagnosticNotificationProof, error) {
+	s.retained.Add(1)
+	return s.proof, s.retainErr
+}
+func diagnosticControlManager(t *testing.T, stream *diagnosticControlStream) *notificationManager {
+	t.Helper()
+	source := testNotifySource(stream.notifyTestStream)
+	source.Subscribe = func(context.Context) (ChangeStream, error) { return stream, nil }
+	m, err := newNotificationManager(t.Context(), source, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := m.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return m
+}
+func diagnosticWaitPosition(t *testing.T, m *notificationManager) {
+	t.Helper()
+	waitNotify(t, func() bool { m.mu.Lock(); defer m.mu.Unlock(); return m.position == 1 })
+}
+func TestDiagnosticNotificationQueueOwnership(t *testing.T) {
+	for _, name := range []string{"consume", "provider-error", "proof-error", "disclosure-error", "missing-disclosure", "cancel-rearm", "remove", "close", "overflow", "ordinary"} {
+		t.Run(name, func(t *testing.T) {
+			proof := &diagnosticControlProof{}
+			stream := &diagnosticControlStream{notifyTestStream: testNotifyStream(), proof: proof}
+			if name == "provider-error" {
+				stream.retainErr = syscall.EACCES
+			}
+			if name == "proof-error" {
+				proof.check = func(context.Context) error { return syscall.ESTALE }
+			}
+			if name == "ordinary" {
+				stream.proof = nil
+			}
+			m := diagnosticControlManager(t, stream)
+			proof.onRelease = func() {
+				unlocked := make(chan struct{})
+				go func() { m.mu.Lock(); m.mu.Unlock(); close(unlocked) }()
+				select {
+				case <-unlocked:
+				case <-time.After(time.Second):
+					t.Error("proof released under manager lock")
+				}
+			}
+			if name == "overflow" {
+				m.limits.MaxNotifyEvents = 0
+			}
+			var ordinary, disclosures atomic.Int32
+			validate := func(context.Context, storage.EntryLocation) error { ordinary.Add(1); return nil }
+			disclose := func(context.Context, storage.EntryLocation) error {
+				disclosures.Add(1)
+				if name == "disclosure-error" {
+					return authz.ErrDenied
+				}
+				return nil
+			}
+			if name == "missing-disclosure" {
+				disclose = nil
+			}
+			registered, release := make(chan struct{}), make(chan struct{})
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			result := make(chan error, 1)
+			go func() {
+				_, err := m.watchDiagnostic(ctx, "watch", notificationIdentity{ID: 1, Directory: true}, 1, true, 4096, func() error { close(registered); <-release; return nil }, validate, disclose)
+				result <- err
+			}()
+			select {
+			case <-registered:
+			case <-time.After(time.Second):
+				t.Fatal("watch not registered")
+			}
+			stream.changes <- namedChange(1, metastore.Removed, "gone", 0)
+			diagnosticWaitPosition(t, m)
+			switch name {
+			case "cancel-rearm":
+				cancel()
+			case "remove":
+				m.remove("watch")
+			case "close":
+				if err := m.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			close(release)
+			var err error
+			select {
+			case err = <-result:
+			case <-time.After(time.Second):
+				t.Fatal("watch did not return")
+			}
+			switch name {
+			case "consume", "ordinary":
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "cancel-rearm":
+				if !errors.Is(err, context.Canceled) || proof.released.Load() != 0 {
+					t.Fatalf("cancel lost buffered group: %v released=%d", err, proof.released.Load())
+				}
+				events, nextErr := m.watchDiagnostic(t.Context(), "watch", notificationIdentity{ID: 1, Directory: true}, 1, true, 4096, nil, validate, disclose)
+				if nextErr != nil || len(events) != 1 {
+					t.Fatalf("rearm: %v %v", events, nextErr)
+				}
+			default:
+				if err == nil {
+					t.Fatal("failure returned success")
+				}
+			}
+			wantRelease := int32(1)
+			if name == "overflow" || name == "ordinary" {
+				wantRelease = 0
+			}
+			if proof.released.Load() != wantRelease {
+				t.Fatalf("release=%d want=%d", proof.released.Load(), wantRelease)
+			}
+			if name == "ordinary" {
+				if ordinary.Load() != 1 || disclosures.Load() != 0 {
+					t.Fatal("ordinary path changed")
+				}
+			} else if ordinary.Load() != 0 {
+				t.Fatal("historical proof failure fell back")
+			}
+			if name == "proof-error" && disclosures.Load() != 0 {
+				t.Fatal("failed proof disclosed names")
+			}
+			if name == "overflow" && stream.retained.Load() != 0 {
+				t.Fatal("retained before budget admission")
+			}
+		})
+	}
+}
+
+func TestDiagnosticNotificationClosePinsValidation(t *testing.T) {
+	proof := &diagnosticControlProof{}
+	entered, allowReturn := make(chan struct{}), make(chan struct{})
+	proof.check = func(ctx context.Context) error { close(entered); <-ctx.Done(); <-allowReturn; return ctx.Err() }
+	stream := &diagnosticControlStream{notifyTestStream: testNotifyStream(), proof: proof}
+	m := diagnosticControlManager(t, stream)
+	proof.onRelease = func() {
+		unlocked := make(chan struct{})
+		go func() { m.mu.Lock(); m.mu.Unlock(); close(unlocked) }()
+		select {
+		case <-unlocked:
+		case <-time.After(time.Second):
+			t.Error("proof released under manager lock")
+		}
+	}
+	registered := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, err := m.watchDiagnostic(t.Context(), "watch", notificationIdentity{ID: 1, Directory: true}, 1, true, 4096, func() error { close(registered); return nil }, notificationTestProof, notificationTestProof)
+		result <- err
+	}()
+	<-registered
+	stream.changes <- namedChange(1, metastore.Removed, "gone", 0)
+	<-entered
+	closed := make(chan error, 1)
+	go func() { closed <- m.Close() }()
+	select {
+	case <-stream.done:
+	case <-time.After(time.Second):
+		t.Fatal("close did not unblock stream")
+	}
+	if proof.released.Load() != 0 {
+		t.Fatal("close released an actively validated proof")
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("close did not drain validation: %v", err)
+	default:
+	}
+	close(allowReturn)
+	select {
+	case <-result:
+	case <-time.After(time.Second):
+		t.Fatal("validation did not drain")
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close did not finish")
+	}
+	if proof.released.Load() != 1 {
+		t.Fatalf("release=%d", proof.released.Load())
+	}
+}
+
+type diagnosticSyncFile struct {
+	storage.File
+	err error
+}
+
+func (f diagnosticSyncFile) Sync(context.Context) error { return f.err }
+func TestDiagnosticNotificationDisclosure(t *testing.T) {
+	for _, name := range []string{"removed-leaf", "retain-denied", "list-denied", "watch-list-denied", "sync-denied", "sync-outage", "missing-ancestor", "changed-ancestor", "moved-ancestor", "collision", "invalid-sibling", "list-outage", "observation-race", "no-list-access"} {
+		t.Run(name, func(t *testing.T) {
+			session, _, root, parent, child := newClientTestSession(t)
+			old := child.observation.Location.Clone()
+			parent.entries = nil
+			parent.observation.Attr.DirectoryRevision++
+			parent.observation.Attr.MetadataRevision++
+			file := &clientFile{session: session, raw: diagnosticSyncFile{File: root}, access: windowsReadData}
+			switch name {
+			case "retain-denied", "list-denied", "watch-list-denied", "sync-denied":
+				session.backend.authorize = authz.AuthorizerFunc(func(_ context.Context, r authz.AccessRequest) error {
+					if name == "retain-denied" && r.Operation == storage.OpFileRetain || name == "list-denied" && r.Operation == storage.OpFileListAt && r.Node == 2 || name == "watch-list-denied" && r.Operation == storage.OpFileListAt && r.Node == 1 || name == "sync-denied" && r.Operation == storage.OpFileSync {
+						return authz.ErrDenied
+					}
+					return nil
+				})
+			case "sync-outage":
+				file.raw = diagnosticSyncFile{File: root, err: syscall.EIO}
+			case "missing-ancestor":
+				root.entries = nil
+			case "changed-ancestor":
+				root.entries[0].EntryID++
+			case "moved-ancestor":
+				parent.observation.Location.Ancestors[0].Name = []byte("Elsewhere")
+			case "collision":
+				parent.entries = []storage.DirectoryEntry{{EntryID: 8, Name: []byte("Foo"), Attr: storage.Attr{ID: 8}}, {EntryID: 9, Name: []byte("foo"), Attr: storage.Attr{ID: 9}}}
+			case "invalid-sibling":
+				parent.entries = []storage.DirectoryEntry{{EntryID: 8, Name: []byte("bad:name"), Attr: storage.Attr{ID: 8}}}
+			case "list-outage":
+				parent.onList = func(storage.DirectoryPageRequest) (storage.DirectoryPage, error) {
+					return storage.DirectoryPage{}, syscall.EIO
+				}
+			case "observation-race":
+				parent.checkErr = syscall.EAGAIN
+			case "no-list-access":
+				file.access = windowsReadAttributes
+			}
+			err := file.ValidateDiagnosticNotification(t.Context(), old)
+			if name == "removed-leaf" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(parent.lists) != 1 || parent.lists[0].Revision != 42 {
+					t.Fatalf("not using current revision: %v", parent.lists)
+				}
+				if err := file.ValidateNotificationLocation(t.Context(), old); err == nil {
+					t.Fatal("ordinary current leaf guard was weakened")
+				}
+			} else if err == nil {
+				t.Fatal("invalid current disclosure accepted")
+			}
+		})
+	}
+}
+
+func TestDiagnosticNotificationRetirementWhileValidating(t *testing.T) {
+	for _, kind := range []string{"remove", "stream-error", "cancel-rearm"} {
+		t.Run(kind, func(t *testing.T) {
+			proof := &diagnosticControlProof{}
+			entered, proceed := make(chan struct{}), make(chan struct{})
+			proof.check = func(context.Context) error {
+				if proof.validated.Load() == 1 {
+					close(entered)
+					<-proceed
+				}
+				return nil
+			}
+			stream := &diagnosticControlStream{notifyTestStream: testNotifyStream(), proof: proof}
+			m := diagnosticControlManager(t, stream)
+			proof.onRelease = func() {
+				unlocked := make(chan struct{})
+				go func() { m.mu.Lock(); m.mu.Unlock(); close(unlocked) }()
+				select {
+				case <-unlocked:
+				case <-time.After(time.Second):
+					t.Error("proof released under manager lock")
+				}
+			}
+			registered := make(chan struct{})
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			result := make(chan error, 1)
+			go func() {
+				_, err := m.watchDiagnostic(ctx, "watch", notificationIdentity{ID: 1, Directory: true}, 1, true, 4096, func() error { close(registered); return nil }, notificationTestProof, notificationTestProof)
+				result <- err
+			}()
+			<-registered
+			stream.changes <- namedChange(1, metastore.Removed, "gone", 0)
+			<-entered
+			switch kind {
+			case "remove":
+				m.remove("watch")
+			case "stream-error":
+				stream.failures <- syscall.EIO
+				waitNotify(t, func() bool { m.mu.Lock(); defer m.mu.Unlock(); return m.failure != nil })
+			case "cancel-rearm":
+				cancel()
+			}
+			if proof.released.Load() != 0 {
+				t.Fatal("retirement released active proof")
+			}
+			close(proceed)
+			select {
+			case err := <-result:
+				if err == nil {
+					t.Fatal("retired request succeeded")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("validation did not retire")
+			}
+			if kind == "cancel-rearm" {
+				if proof.released.Load() != 0 {
+					t.Fatal("wait cancellation destroyed buffered proof")
+				}
+				if _, err := m.watchDiagnostic(t.Context(), "watch", notificationIdentity{ID: 1, Directory: true}, 1, true, 4096, nil, notificationTestProof, notificationTestProof); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if proof.released.Load() != 1 {
+				t.Fatalf("release=%d", proof.released.Load())
+			}
+		})
+	}
+}
+
+func TestDiagnosticNotificationCloseDrainsDiscard(t *testing.T) {
+	proof := &diagnosticControlProof{}
+	entered, proceed := make(chan struct{}), make(chan struct{})
+	proof.onRelease = func() { close(entered); <-proceed }
+	stream := &diagnosticControlStream{notifyTestStream: testNotifyStream(), proof: proof}
+	m := diagnosticControlManager(t, stream)
+	registered := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, err := m.watchDiagnostic(t.Context(), "watch", notificationIdentity{ID: 1, Directory: true}, 1, true, 1, func() error { close(registered); return nil }, notificationTestProof, notificationTestProof)
+		result <- err
+	}()
+	<-registered
+	stream.changes <- namedChange(1, metastore.Removed, "gone", 0)
+	<-entered
+	closed := make(chan error, 1)
+	go func() { closed <- m.Close() }()
+	select {
+	case <-stream.done:
+	case <-time.After(time.Second):
+		t.Fatal("source not closed")
+	}
+	select {
+	case <-closed:
+		t.Fatal("close returned before detached release")
+	default:
+	}
+	close(proceed)
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrNotifyRescan) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("discard did not finish")
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close did not drain release")
+	}
+	if proof.released.Load() != 1 || proof.validated.Load() != 0 {
+		t.Fatalf("release=%d validation=%d", proof.released.Load(), proof.validated.Load())
+	}
+}
