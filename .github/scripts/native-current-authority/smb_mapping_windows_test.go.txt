@@ -468,11 +468,12 @@ func (p *mappingCommandChild) Finish() (bool, error) {
 }
 
 type mappingCommandHost struct {
-	child    *mappingCommandChild
-	args     []string
-	starts   int
-	cache    string
-	startErr error
+	child              *mappingCommandChild
+	args               []string
+	starts             int
+	cache              string
+	startErr           error
+	returnChildOnError bool
 }
 
 func (h *mappingCommandHost) Preflight() (map[string]any, error) { return nil, nil }
@@ -481,9 +482,167 @@ func (h *mappingCommandHost) Start(_ string, args []string, _ string) (child, er
 	h.args = append([]string(nil), args...)
 	h.cache = os.Getenv("PSModuleAnalysisCachePath")
 	if h.startErr != nil {
+		if h.returnChildOnError {
+			return h.child, h.startErr
+		}
 		return nil, h.startErr
 	}
 	return h.child, nil
+}
+
+func TestMappingExecutionInputCompletion(t *testing.T) {
+	writeFailure, closeFailure := errors.New("write failed"), errors.New("input close failed")
+	for _, mode := range []string{"open", "eof", "short", "write-error", "close-error"} {
+		t.Run(mode, func(t *testing.T) {
+			process := mappingReplyChild("fixed-result\n")
+			writes, closes, closeBeforeFinish := 0, 0, false
+			process.inputOverride = &ownedProcessInput{pipe: mappingDiagnosticInput{
+				write: func(data []byte) (int, error) {
+					writes++
+					if mode == "short" {
+						return len(data) - 1, nil
+					}
+					if mode == "write-error" {
+						return 2, writeFailure
+					}
+					return len(data), nil
+				},
+				close: func() error {
+					closes++
+					closeBeforeFinish = process.finished == 0
+					if mode == "close-error" {
+						return closeFailure
+					}
+					return nil
+				},
+			}}
+			request := mappingCommandRequest{Action: "inventory", OwnerSID: "owner"}
+			execution, err := executeMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", request, mappingStartupEntryScript, mode != "open")
+			d := execution.Diagnostic
+			if writes != 1 || closes != 1 || process.finished != 1 || d.WorkersStarted != 3 || d.WorkersJoined != 3 || !d.CleanupAttempted {
+				t.Fatalf("ownership counts: writes=%d closes=%d finish=%d facts=%+v", writes, closes, process.finished, d)
+			}
+			wantEOF := mode == "eof" || mode == "close-error"
+			if d.EOFAttempted != wantEOF || closeBeforeFinish != wantEOF || d.EOFCompleted != (mode == "eof") {
+				t.Fatalf("EOF ordering: %+v", d)
+			}
+			if d.CleanupConfirmed != (mode != "close-error") {
+				t.Fatalf("cleanup fact: %+v", d)
+			}
+			if mode == "short" && !errors.Is(err, io.ErrShortWrite) || mode == "write-error" && !errors.Is(err, writeFailure) || mode == "close-error" && !errors.Is(err, closeFailure) {
+				t.Fatalf("lost operation error: %v", err)
+			}
+			if (mode == "open" || mode == "eof") && (err != nil || !d.WriteComplete || string(execution.Stdout) != "fixed-result\n") {
+				t.Fatalf("normal execution: %+v %v", execution, err)
+			}
+			if len(d.InputSHA256) != 64 || len(d.ScriptSHA256) != 64 || d.ScriptUTF16Units == 0 || d.Stdout.ObservedBytes != int64(len("fixed-result\n")) {
+				t.Fatalf("success observations missing: %+v", d)
+			}
+		})
+	}
+}
+
+type mappingErrorReader struct{ cause error }
+
+func (r mappingErrorReader) Read([]byte) (int, error) { return 0, r.cause }
+
+func TestMappingExecutionRetainsChildStreamAndCleanupErrors(t *testing.T) {
+	childFailure, streamFailure, cleanupFailure := errors.New("child failed"), errors.New("stream failed"), errors.New("cleanup failed")
+	for _, mode := range []string{"stream", "validation", "cleanup"} {
+		t.Run(mode, func(t *testing.T) {
+			process := mappingReplyChild(`{"status":"ok","owner_sid":"foreign","rows":[],"cause":""}`)
+			process.result = childFailure
+			if mode == "stream" {
+				process.output = io.NopCloser(mappingErrorReader{streamFailure})
+			}
+			if mode == "cleanup" {
+				process.finishErr = cleanupFailure
+			}
+			_, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingCommandRequest{Action: "inventory", OwnerSID: "owner"})
+			if !errors.Is(err, childFailure) || mode == "stream" && !errors.Is(err, streamFailure) || mode == "cleanup" && !errors.Is(err, cleanupFailure) {
+				t.Fatalf("lost error chain: %v", err)
+			}
+			if process.finished != 1 || mappingDiagnosticFrom(t, err).details.WorkersJoined != 3 {
+				t.Fatal("failure escaped owned cleanup")
+			}
+		})
+	}
+}
+
+func TestMappingExecutionRetainsPartialLaunchAndReturnedChild(t *testing.T) {
+	cause := errors.New("resume failed")
+	count := uint32(2)
+	facts := windowsLaunchFacts{RequestedImage: "system-powershell", PreviousSuspendCount: &count, CleanupConfirmed: true}
+	host := &mappingCommandHost{startErr: &windowsLaunchError{Facts: facts, Cause: cause}}
+	execution, err := executeMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", mappingCommandRequest{Action: "inventory"}, mappingStartupEntryScript, false)
+	if !errors.Is(err, cause) || execution.Diagnostic.Launch == nil || *execution.Diagnostic.Launch.PreviousSuspendCount != 2 || execution.Diagnostic.Launch.ActualImage != "" || !execution.Diagnostic.CleanupConfirmed {
+		t.Fatalf("partial launch facts: %+v %v", execution, err)
+	}
+	process := mappingReplyChild("")
+	host = &mappingCommandHost{child: process, startErr: cause, returnChildOnError: true}
+	execution, err = executeMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", mappingCommandRequest{Action: "inventory"}, mappingStartupEntryScript, false)
+	if !errors.Is(err, cause) || process.finished != 1 || !execution.Diagnostic.CleanupAttempted || !execution.Diagnostic.CleanupConfirmed || execution.Diagnostic.WorkersStarted != 0 {
+		t.Fatalf("returned child escaped start-error cleanup: %+v %v", execution, err)
+	}
+}
+
+func TestMappingStartupCellsOrderAndCleanupAdmission(t *testing.T) {
+	request := mappingCommandRequest{Action: "inventory", Module: "same-module", OwnerSID: "same-owner"}
+	for _, failCleanup := range []bool{false, true} {
+		t.Run(fmt.Sprint(failCleanup), func(t *testing.T) {
+			var names, inputHashes []string
+			starts, failures := 0, 0
+			aborted := walkMappingStartupCells(func(ordinal int, cell mappingStartupCell) bool {
+				names = append(names, cell.Name)
+				if ordinal != len(names) || cell.CloseInput != (ordinal%2 == 0) {
+					t.Fatal("cell order or input policy changed")
+				}
+				if ordinal <= 2 && cell.Script != mappingStartupEntryScript || ordinal > 2 && cell.Script != mappingPowerShell {
+					t.Fatal("cell script changed")
+				}
+				process := mappingReplyChild("fixed\n")
+				process.inputOverride = &ownedProcessInput{pipe: process.input}
+				process.forced = ordinal == 1
+				if failCleanup && ordinal == 2 {
+					process.finishErr = errors.New("job empty not confirmed")
+				}
+				host := &mappingCommandHost{child: process}
+				execution, err := executeMappingPowerShell(context.Background(), host, "same-executable", "same-directory", request, cell.Script, cell.CloseInput)
+				starts += host.starts
+				if err != nil {
+					failures++
+				}
+				if process.finished != 1 || execution.Diagnostic.WorkersJoined != 3 {
+					t.Fatal("next cell could outlive prior cleanup or streams")
+				}
+				if request.Action != "inventory" || strings.Contains(process.input.String(), `"action":"create"`) || strings.Contains(process.input.String(), `"action":"remove"`) {
+					t.Fatal("diagnostic mutated mappings")
+				}
+				if !reflect.DeepEqual(host.args[:len(host.args)-1], []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand"}) {
+					t.Fatal("diagnostic changed launch flags")
+				}
+				inputHashes = append(inputHashes, execution.Diagnostic.InputSHA256)
+				return execution.Diagnostic.CleanupConfirmed
+			})
+			want := []string{"01_entry_open", "02_entry_eof", "03_inventory_open", "04_inventory_eof"}
+			if failCleanup {
+				want = want[:2]
+			}
+			if !reflect.DeepEqual(names, want) || starts != len(want) || aborted != failCleanup || failures < 1 {
+				t.Fatalf("cell admission: names=%v starts=%d aborted=%v failures=%d", names, starts, aborted, failures)
+			}
+			for _, hash := range inputHashes {
+				if hash != inputHashes[0] {
+					t.Fatal("request bytes changed between cells")
+				}
+			}
+		})
+	}
+	for _, forbidden := range []string{"ReadLine", "$input", "Import-Module", "Get-SmbMapping", "WindowsIdentity", "|"} {
+		if strings.Contains(mappingStartupEntryScript, forbidden) {
+			t.Fatalf("entry-only script gained %s", forbidden)
+		}
+	}
 }
 func mappingReplyChild(reply string) *mappingCommandChild {
 	p := &mappingCommandChild{input: &mappingInputBuffer{}, output: io.NopCloser(strings.NewReader(reply)), stderr: io.NopCloser(strings.NewReader("")), done: make(chan struct{})}

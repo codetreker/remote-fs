@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"debug/pe"
 	"encoding/binary"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -205,26 +207,126 @@ func (p *windowsChild) VerifyControlPeer(ctx context.Context, conn net.Conn) (ma
 }
 
 type windowsChild struct {
-	job                   windows.Handle
-	processMu             sync.Mutex
-	process               windows.Handle
-	input, output, stderr *os.File
-	pid                   uint32
-	done                  chan struct{}
-	result                error
-	exitObserved          bool
-	processCloseErr       error
-	once                  sync.Once
-	finishErr             error
-	forced                bool
+	job             windows.Handle
+	processMu       sync.Mutex
+	process         windows.Handle
+	input           *ownedProcessInput
+	output, stderr  *os.File
+	launch          windowsLaunchFacts
+	pid             uint32
+	done            chan struct{}
+	result          error
+	exitObserved    bool
+	processCloseErr error
+	once            sync.Once
+	finishErr       error
+	forced          bool
 }
 
-func (p *windowsChild) Input() io.WriteCloser { return p.input }
-func (p *windowsChild) Output() io.ReadCloser { return p.output }
-func (p *windowsChild) Errors() io.ReadCloser { return p.stderr }
-func (p *windowsChild) Done() <-chan struct{} { return p.done }
-func (p *windowsChild) PID() uint32           { return p.pid }
-func (p *windowsChild) Result() error         { <-p.done; return p.result }
+type ownedProcessInput struct {
+	pipe   io.WriteCloser
+	closed atomic.Bool
+	once   sync.Once
+	err    error
+}
+
+func (p *ownedProcessInput) Write(data []byte) (int, error) {
+	if p.closed.Load() {
+		return 0, os.ErrClosed
+	}
+	return p.pipe.Write(data)
+}
+
+func (p *ownedProcessInput) Close() error {
+	p.once.Do(func() {
+		p.closed.Store(true)
+		// Close must be able to interrupt a blocked Write; it never takes a write lock.
+		p.err = p.pipe.Close()
+	})
+	return p.err
+}
+
+type windowsLaunchCall struct {
+	OffsetNanos    int64  `json:"offset_ns"`
+	DurationNanos  int64  `json:"duration_ns"`
+	Returned       bool   `json:"returned"`
+	Error          string `json:"error"`
+	ErrorTruncated bool   `json:"error_truncated"`
+}
+
+type windowsLaunchFacts struct {
+	RequestedImage       string             `json:"requested_image"`
+	CommandLineUnits     int                `json:"command_line_utf16_units"`
+	CommandLineSHA256    string             `json:"command_line_utf16le_sha256"`
+	PID                  *uint32            `json:"pid,omitempty"`
+	CreateProcess        *windowsLaunchCall `json:"create_process,omitempty"`
+	AssignJob            *windowsLaunchCall `json:"assign_job,omitempty"`
+	QueryImage           *windowsLaunchCall `json:"query_image,omitempty"`
+	QueryMachine         *windowsLaunchCall `json:"query_machine,omitempty"`
+	ResumeThread         *windowsLaunchCall `json:"resume_thread,omitempty"`
+	PreviousSuspendCount *uint32            `json:"previous_suspend_count,omitempty"`
+	ActualImage          string             `json:"actual_image,omitempty"`
+	ProcessMachine       *uint16            `json:"process_machine,omitempty"`
+	NativeMachine        *uint16            `json:"native_machine,omitempty"`
+	CleanupConfirmed     bool               `json:"failed_start_cleanup_confirmed"`
+}
+
+type windowsLaunchError struct {
+	Facts windowsLaunchFacts
+	Cause error
+}
+
+func (e *windowsLaunchError) Error() string { return e.Cause.Error() }
+func (e *windowsLaunchError) Unwrap() error { return e.Cause }
+
+func observeWindowsLaunchCall(start time.Time, now func() time.Time, destination **windowsLaunchCall, operation func() error) error {
+	entered := now()
+	call := &windowsLaunchCall{OffsetNanos: entered.Sub(start).Nanoseconds()}
+	*destination = call
+	err := operation()
+	call.DurationNanos, call.Returned = now().Sub(entered).Nanoseconds(), true
+	if err != nil {
+		call.Error = err.Error()
+		if len(call.Error) > 512 {
+			call.Error, call.ErrorTruncated = call.Error[:512], true
+		}
+	}
+	return err
+}
+
+func checkWindowsResumeCount(count uint32) error {
+	if count != 1 {
+		return fmt.Errorf("owned primary thread resume returned previous suspend count %d; expected 1", count)
+	}
+	return nil
+}
+
+func observeWindowsImage(facts *windowsLaunchFacts, start time.Time, now func() time.Time, image func() (string, error), machine func() (uint16, uint16, error)) error {
+	if err := observeWindowsLaunchCall(start, now, &facts.QueryImage, func() error {
+		path, err := image()
+		if err == nil {
+			facts.ActualImage = path
+		}
+		return err
+	}); err != nil {
+		return err
+	}
+	return observeWindowsLaunchCall(start, now, &facts.QueryMachine, func() error {
+		process, native, err := machine()
+		if err == nil {
+			facts.ProcessMachine, facts.NativeMachine = &process, &native
+		}
+		return err
+	})
+}
+
+func (p *windowsChild) Input() io.WriteCloser           { return p.input }
+func (p *windowsChild) Output() io.ReadCloser           { return p.output }
+func (p *windowsChild) Errors() io.ReadCloser           { return p.stderr }
+func (p *windowsChild) Done() <-chan struct{}           { return p.done }
+func (p *windowsChild) PID() uint32                     { return p.pid }
+func (p *windowsChild) Result() error                   { <-p.done; return p.result }
+func (p *windowsChild) LaunchFacts() windowsLaunchFacts { return p.launch }
 
 type jobAccounting struct {
 	TotalUserTime, TotalKernelTime, PeriodUserTime, PeriodKernelTime int64
@@ -374,6 +476,13 @@ func (p *windowsChild) FinishBefore(deadline time.Time) (bool, error) {
 }
 
 func (windowsPlatform) Start(executable string, args []string, directory string) (_ child, resultErr error) {
+	started := time.Now()
+	facts := windowsLaunchFacts{RequestedImage: executable, CleanupConfirmed: true}
+	defer func() {
+		if resultErr != nil {
+			resultErr = &windowsLaunchError{Facts: facts, Cause: resultErr}
+		}
+	}()
 	if !filepath.IsAbs(executable) || !filepath.IsAbs(directory) {
 		return nil, errors.New("owned process paths must be absolute")
 	}
@@ -381,10 +490,15 @@ func (windowsPlatform) Start(executable string, args []string, directory string)
 	if err != nil {
 		return nil, err
 	}
-	command, err := windows.UTF16PtrFromString(windows.ComposeCommandLine(append([]string{executable}, args...)))
+	command, err := windows.UTF16FromString(windows.ComposeCommandLine(append([]string{executable}, args...)))
 	if err != nil {
 		return nil, err
 	}
+	commandBytes := make([]byte, 2*len(command))
+	for i, word := range command {
+		binary.LittleEndian.PutUint16(commandBytes[2*i:], word)
+	}
+	facts.CommandLineUnits, facts.CommandLineSHA256 = len(command), fmt.Sprintf("%x", sha256.Sum256(commandBytes))
 	workingDir, err := windows.UTF16PtrFromString(directory)
 	if err != nil {
 		return nil, err
@@ -396,7 +510,11 @@ func (windowsPlatform) Start(executable string, args []string, directory string)
 	owned := false
 	defer func() {
 		if !owned {
-			resultErr = errors.Join(resultErr, windows.CloseHandle(job))
+			err := windows.CloseHandle(job)
+			resultErr = errors.Join(resultErr, err)
+			if err != nil {
+				facts.CleanupConfirmed = false
+			}
 		}
 	}()
 	info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
@@ -454,20 +572,27 @@ func (windowsPlatform) Start(executable string, args []string, directory string)
 	}
 	var process windows.ProcessInformation
 	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_NO_WINDOW | windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT)
-	if err := windows.CreateProcess(application, command, nil, nil, true, flags, nil, workingDir, &startup.StartupInfo, &process); err != nil {
+	if err := observeWindowsLaunchCall(started, time.Now, &facts.CreateProcess, func() error {
+		return windows.CreateProcess(application, &command[0], nil, nil, true, flags, nil, workingDir, &startup.StartupInfo, &process)
+	}); err != nil {
 		return nil, err
 	}
+	facts.PID, facts.CleanupConfirmed = &process.ProcessId, false
 	defer windows.CloseHandle(process.Thread)
 	// Assign before resuming so even immediate child creation remains job-owned.
-	if err := windows.AssignProcessToJobObject(job, process.Process); err != nil {
+	if err := observeWindowsLaunchCall(started, time.Now, &facts.AssignJob, func() error {
+		return windows.AssignProcessToJobObject(job, process.Process)
+	}); err != nil {
 		terminateErr := windows.TerminateProcess(process.Process, 1)
 		wait, waitErr := windows.WaitForSingleObject(process.Process, 5000)
 		if waitErr == nil && wait != windows.WAIT_OBJECT_0 {
 			waitErr = errors.New("unassigned suspended process termination unconfirmed")
 		}
-		return nil, errors.Join(err, terminateErr, waitErr, windows.CloseHandle(process.Process))
+		closeErr := windows.CloseHandle(process.Process)
+		facts.CleanupConfirmed = terminateErr == nil && waitErr == nil && closeErr == nil
+		return nil, errors.Join(err, terminateErr, waitErr, closeErr)
 	}
-	p := &windowsChild{job: job, process: process.Process, input: parentInput, output: parentOutput, stderr: parentError, pid: process.ProcessId, done: make(chan struct{})}
+	p := &windowsChild{job: job, process: process.Process, input: &ownedProcessInput{pipe: parentInput}, output: parentOutput, stderr: parentError, pid: process.ProcessId, done: make(chan struct{})}
 	owned = true
 	go func() {
 		wait, err := windows.WaitForSingleObject(process.Process, windows.INFINITE)
@@ -492,9 +617,43 @@ func (windowsPlatform) Start(executable string, args []string, directory string)
 		p.processMu.Unlock()
 		close(p.done)
 	}()
-	if _, err := windows.ResumeThread(process.Thread); err != nil {
+	p.processMu.Lock()
+	imageErr := observeWindowsImage(&facts, started, time.Now, func() (string, error) {
+		if p.process == 0 {
+			return "", errors.New("owned process handle closed before image query")
+		}
+		buffer := make([]uint16, 32768)
+		size := uint32(len(buffer))
+		if err := windows.QueryFullProcessImageName(p.process, 0, &buffer[0], &size); err != nil {
+			return "", err
+		}
+		if size == 0 || size >= uint32(len(buffer)) {
+			return "", errors.New("owned process image path has invalid length")
+		}
+		return windows.UTF16ToString(buffer[:size]), nil
+	}, func() (uint16, uint16, error) {
+		var processMachine, nativeMachine uint16
+		err := windows.IsWow64Process2(p.process, &processMachine, &nativeMachine)
+		return processMachine, nativeMachine, err
+	})
+	p.processMu.Unlock()
+	if imageErr != nil {
 		_, finishErr := p.Finish()
+		facts.CleanupConfirmed = finishErr == nil
+		return nil, errors.Join(imageErr, finishErr)
+	}
+	if err := observeWindowsLaunchCall(started, time.Now, &facts.ResumeThread, func() error {
+		count, err := windows.ResumeThread(process.Thread)
+		facts.PreviousSuspendCount = &count
+		if err != nil {
+			return err
+		}
+		return checkWindowsResumeCount(count)
+	}); err != nil {
+		_, finishErr := p.Finish()
+		facts.CleanupConfirmed = finishErr == nil
 		return nil, errors.Join(err, finishErr)
 	}
+	p.launch = facts
 	return p, nil
 }

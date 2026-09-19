@@ -6,11 +6,14 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -101,6 +104,17 @@ func TestWindowsOwnedChildTerminationClosesPipes(t *testing.T) {
 		t.Fatal(err)
 	}
 	owned := process.(*windowsChild)
+	facts := owned.LaunchFacts()
+	if facts.PID == nil || *facts.PID != process.PID() || facts.PreviousSuspendCount == nil || *facts.PreviousSuspendCount != 1 ||
+		facts.RequestedImage != executable || !strings.EqualFold(facts.ActualImage, executable) || facts.ProcessMachine == nil ||
+		facts.NativeMachine == nil || *facts.ProcessMachine != 0 || *facts.NativeMachine != 0xaa64 || len(facts.CommandLineSHA256) != 64 {
+		t.Fatalf("native launch facts are incomplete: %#v", facts)
+	}
+	for _, call := range []*windowsLaunchCall{facts.CreateProcess, facts.AssignJob, facts.QueryImage, facts.QueryMachine, facts.ResumeThread} {
+		if call == nil || !call.Returned || call.Error != "" || call.OffsetNanos < 0 || call.DurationNanos < 0 {
+			t.Fatalf("native launch stage is incomplete: %#v", call)
+		}
+	}
 	defer process.Finish()
 	active, err := jobActive(owned.job)
 	if err != nil || active != 1 {
@@ -112,6 +126,133 @@ func TestWindowsOwnedChildTerminationClosesPipes(t *testing.T) {
 	}
 	if _, err := io.Copy(io.Discard, process.Output()); err == nil {
 		t.Fatal("owned output pipe remained open")
+	}
+}
+
+type ownedInputTestPipe struct {
+	writes, closes atomic.Int32
+	closeErr       error
+}
+
+func (p *ownedInputTestPipe) Write(data []byte) (int, error) { p.writes.Add(1); return len(data), nil }
+func (p *ownedInputTestPipe) Close() error                   { p.closes.Add(1); return p.closeErr }
+
+func TestOwnedProcessInputCloseOnce(t *testing.T) {
+	for _, closeErr := range []error{nil, errors.New("close failed")} {
+		t.Run(fmt.Sprint(closeErr), func(t *testing.T) {
+			pipe := &ownedInputTestPipe{closeErr: closeErr}
+			input := &ownedProcessInput{pipe: pipe}
+			if n, err := input.Write([]byte("one")); n != 3 || err != nil {
+				t.Fatal(n, err)
+			}
+			var group sync.WaitGroup
+			for range 8 {
+				group.Go(func() {
+					if err := input.Close(); !errors.Is(err, closeErr) {
+						t.Errorf("close result: %v", err)
+					}
+				})
+			}
+			group.Wait()
+			if err := input.Close(); !errors.Is(err, closeErr) || pipe.closes.Load() != 1 {
+				t.Fatalf("duplicate/sticky close: %v %d", err, pipe.closes.Load())
+			}
+			if n, err := input.Write([]byte("two")); n != 0 || !errors.Is(err, os.ErrClosed) || pipe.writes.Load() != 1 {
+				t.Fatalf("write after close: %d %v", n, err)
+			}
+		})
+	}
+	t.Run("close interrupts blocked write", func(t *testing.T) {
+		reader, writer := io.Pipe()
+		defer reader.Close()
+		defer writer.Close()
+		input := &ownedProcessInput{pipe: writer}
+		done := make(chan error, 1)
+		go func() { _, err := input.Write([]byte("blocked")); done <- err }()
+		if _, err := io.ReadFull(reader, make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		}
+		closed := make(chan error, 1)
+		go func() { closed <- input.Close() }()
+		select {
+		case err := <-closed:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("input close waited for its blocked write")
+		}
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("blocked write became success")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("input close waited for its blocked write")
+		}
+	})
+}
+
+func TestWindowsResumePostcondition(t *testing.T) {
+	for _, count := range []uint32{0, 1, 2, ^uint32(0)} {
+		if err := checkWindowsResumeCount(count); (err == nil) != (count == 1) {
+			t.Fatalf("resume count %d: %v", count, err)
+		}
+	}
+}
+
+func TestWindowsLaunchObservations(t *testing.T) {
+	start := time.Unix(10, 0)
+	now := start.Add(3 * time.Millisecond)
+	clock := func() time.Time { return now }
+	cause := errors.New("native query failed")
+	var call *windowsLaunchCall
+	err := observeWindowsLaunchCall(start, clock, &call, func() error {
+		if call == nil || call.Returned {
+			t.Fatal("unfinished call fabricated a returned result")
+		}
+		now = now.Add(2 * time.Millisecond)
+		return cause
+	})
+	if !errors.Is(err, cause) || call.OffsetNanos != int64(3*time.Millisecond) || call.DurationNanos != int64(2*time.Millisecond) || !call.Returned || call.Error != cause.Error() {
+		t.Fatalf("call facts: %#v %v", call, err)
+	}
+	for _, fail := range []string{"", "image", "machine"} {
+		t.Run(fail, func(t *testing.T) {
+			facts := windowsLaunchFacts{RequestedImage: "requested.exe"}
+			machines := 0
+			err := observeWindowsImage(&facts, start, clock, func() (string, error) {
+				if fail == "image" {
+					return "untrusted-partial.exe", cause
+				}
+				return "actual.exe", nil
+			}, func() (uint16, uint16, error) {
+				machines++
+				if fail == "machine" {
+					return 1, 2, cause
+				}
+				return 0, 0xaa64, nil
+			})
+			if fail == "" {
+				if err != nil || facts.ActualImage != "actual.exe" || facts.ProcessMachine == nil || *facts.ProcessMachine != 0 || facts.NativeMachine == nil || *facts.NativeMachine != 0xaa64 {
+					t.Fatalf("image facts: %#v %v", facts, err)
+				}
+			} else {
+				wrapped := &windowsLaunchError{Facts: facts, Cause: errors.Join(cause, err)}
+				if !errors.Is(wrapped, cause) || facts.ProcessMachine != nil || facts.NativeMachine != nil {
+					t.Fatalf("failed query fabricated machine facts: %#v %v", facts, wrapped)
+				}
+				if fail == "image" && (facts.ActualImage != "" || machines != 0 || facts.QueryMachine != nil) {
+					t.Fatalf("failed image query fabricated later facts: %#v", facts)
+				}
+				if fail == "machine" && facts.ActualImage != "actual.exe" {
+					t.Fatal("validated image fact was lost")
+				}
+			}
+		})
+	}
+	if err := observeWindowsLaunchCall(start, clock, &call, func() error { return errors.New(strings.Repeat("x", 600)) }); err == nil || !call.ErrorTruncated || len(call.Error) != 512 {
+		t.Fatal("native error detail was not bounded")
 	}
 }
 

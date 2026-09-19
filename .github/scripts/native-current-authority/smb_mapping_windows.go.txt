@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -944,11 +945,32 @@ type mappingCommandDiagnostic struct {
 	WriteReturned             bool                    `json:"write_returned"`
 	WriteComplete             bool                    `json:"write_complete"`
 	InputBytes                int                     `json:"input_bytes"`
+	InputSHA256               string                  `json:"input_sha256"`
+	ScriptUTF16Units          int                     `json:"script_utf16_units"`
+	ScriptSHA256              string                  `json:"script_utf16le_sha256"`
 	WriteBytes                int                     `json:"write_bytes"`
 	WriteError                string                  `json:"write_error"`
 	WriteErrorTruncated       bool                    `json:"write_error_truncated"`
+	EOFRequested              bool                    `json:"eof_requested"`
+	EOFAttempted              bool                    `json:"eof_attempted"`
+	EOFCompleted              bool                    `json:"eof_completed"`
+	EOFError                  string                  `json:"eof_error"`
+	EOFErrorTruncated         bool                    `json:"eof_error_truncated"`
+	WorkersStarted            int                     `json:"workers_started"`
+	WorkersJoined             int                     `json:"workers_joined"`
+	CleanupAttempted          bool                    `json:"cleanup_attempted"`
+	CleanupConfirmed          bool                    `json:"cleanup_confirmed"`
+	CleanupForced             bool                    `json:"cleanup_forced"`
+	CleanupError              string                  `json:"cleanup_error"`
+	CleanupErrorTruncated     bool                    `json:"cleanup_error_truncated"`
+	Launch                    *windowsLaunchFacts     `json:"launch,omitempty"`
 	Stdout                    mappingStreamDiagnostic `json:"stdout_observed"`
 	Stderr                    mappingStreamDiagnostic `json:"stderr_observed"`
+}
+
+type mappingExecution struct {
+	Stdout     []byte
+	Diagnostic mappingCommandDiagnostic
 }
 
 type mappingDiagnosticError struct {
@@ -976,20 +998,32 @@ func encodeMappingDiagnostic(details mappingCommandDiagnostic) error {
 	return &mappingDiagnosticError{details: details, encoded: string(data)}
 }
 
-// The caller runs inside F's watchdog-owned probe; Finish owns all child handles.
-func runMappingPowerShell(ctx context.Context, host platform, executable, directory string, request mappingCommandRequest) (result mappingCommandResult, resultErr error) {
+// The caller runs inside the watchdog-owned probe or tagged diagnostic test.
+func executeMappingPowerShell(ctx context.Context, host platform, executable, directory string, request mappingCommandRequest, scriptSource string, closeInput bool) (execution mappingExecution, resultErr error) {
 	started := time.Now()
 	var process child
 	var stdout, stderr mappingBoundedBuffer
 	var streams chan error
 	drained := 0
-	diagnostic := mappingCommandDiagnostic{}
+	diagnostic := &execution.Diagnostic
+	diagnostic.EOFRequested = closeInput
+	diagnostic.CleanupConfirmed = true
 	diagnostic.Action, diagnostic.ActionTruncated = mappingDiagnosticText(request.Action, 64)
-	var writeStarted, writeReturned bool
+	var writeStarted, writeReturned, eofAttempted, resultObserved bool
 	var writeBytes int
-	var writeErr error
+	var writeErr, eofErr, processErr error
 	defer func() {
+		var launchError *windowsLaunchError
+		if errors.As(resultErr, &launchError) {
+			facts := launchError.Facts
+			diagnostic.Launch = &facts
+			diagnostic.CleanupConfirmed = facts.CleanupConfirmed
+		}
 		if process != nil {
+			if observer, ok := process.(interface{ LaunchFacts() windowsLaunchFacts }); ok {
+				facts := observer.LaunchFacts()
+				diagnostic.Launch = &facts
+			}
 			pid := process.PID()
 			diagnostic.PID = &pid
 			done := false
@@ -1000,17 +1034,27 @@ func runMappingPowerShell(ctx context.Context, host platform, executable, direct
 			}
 			diagnostic.PreCleanupDone = &done
 			if done {
+				if !resultObserved {
+					processErr, resultObserved = process.Result(), true
+				}
 				resultText := ""
-				if err := process.Result(); err != nil {
-					resultText, diagnostic.PreCleanupResultTruncated = mappingDiagnosticText(err.Error(), 512)
+				if processErr != nil {
+					resultText, diagnostic.PreCleanupResultTruncated = mappingDiagnosticText(processErr.Error(), 512)
 				}
 				diagnostic.PreCleanupResult = &resultText
 			}
-			forced, err := process.Finish()
-			if forced {
-				err = errors.Join(err, errors.New("mapping command required forced owned-job termination"))
+			resultErr = errors.Join(resultErr, processErr)
+			diagnostic.CleanupAttempted = true
+			forced, finishErr := process.Finish()
+			diagnostic.CleanupForced = forced
+			diagnostic.CleanupConfirmed = finishErr == nil
+			if finishErr != nil {
+				diagnostic.CleanupError, diagnostic.CleanupErrorTruncated = mappingDiagnosticText(finishErr.Error(), 512)
 			}
-			resultErr = errors.Join(resultErr, err)
+			resultErr = errors.Join(resultErr, finishErr)
+			if forced {
+				resultErr = errors.Join(resultErr, errors.New("mapping command required forced owned-job termination"))
+			}
 			if streams != nil {
 				// Finish closes the owned pipes; no capture is read until every worker has joined.
 				for drained < 3 {
@@ -1019,40 +1063,48 @@ func runMappingPowerShell(ctx context.Context, host platform, executable, direct
 				}
 			}
 		}
-		if resultErr != nil {
-			diagnostic.ElapsedMillis = time.Since(started).Milliseconds()
-			diagnostic.WriteStarted, diagnostic.WriteReturned, diagnostic.WriteBytes = writeStarted, writeReturned, writeBytes
-			diagnostic.WriteComplete = writeReturned && writeErr == nil && writeBytes == diagnostic.InputBytes
-			if writeErr != nil {
-				diagnostic.WriteError, diagnostic.WriteErrorTruncated = mappingDiagnosticText(writeErr.Error(), 512)
-			}
-			diagnostic.Stdout, diagnostic.Stderr = stdout.diagnostic(), stderr.diagnostic()
-			resultErr = errors.Join(resultErr, encodeMappingDiagnostic(diagnostic))
+		diagnostic.WorkersJoined = drained
+		diagnostic.CleanupConfirmed = diagnostic.CleanupConfirmed && drained == diagnostic.WorkersStarted
+		diagnostic.ElapsedMillis = time.Since(started).Milliseconds()
+		diagnostic.WriteStarted, diagnostic.WriteReturned, diagnostic.WriteBytes = writeStarted, writeReturned, writeBytes
+		diagnostic.WriteComplete = writeReturned && writeErr == nil && writeBytes == diagnostic.InputBytes
+		diagnostic.EOFAttempted, diagnostic.EOFCompleted = eofAttempted, eofAttempted && eofErr == nil
+		if writeErr != nil {
+			diagnostic.WriteError, diagnostic.WriteErrorTruncated = mappingDiagnosticText(writeErr.Error(), 512)
 		}
+		if eofErr != nil {
+			diagnostic.EOFError, diagnostic.EOFErrorTruncated = mappingDiagnosticText(eofErr.Error(), 512)
+		}
+		diagnostic.Stdout, diagnostic.Stderr = stdout.diagnostic(), stderr.diagnostic()
+		execution.Stdout = append([]byte(nil), stdout.Bytes()...)
 	}()
 	if err := ctx.Err(); err != nil {
-		return result, err
+		return execution, err
 	}
 	data, err := json.Marshal(request)
 	if err != nil {
-		return result, err
+		return execution, err
 	}
 	if len(data)+1 > 4096 {
-		return result, errors.New("mapping command input exceeds 4 KiB")
+		return execution, errors.New("mapping command input exceeds 4 KiB")
 	}
 	data = append(data, '\n')
 	diagnostic.InputBytes = len(data)
-	words := utf16.Encode([]rune(mappingPowerShell))
+	diagnostic.InputSHA256 = fmt.Sprintf("%x", sha256.Sum256(data))
+	words := utf16.Encode([]rune(scriptSource))
 	script := make([]byte, len(words)*2)
 	for i, word := range words {
 		binary.LittleEndian.PutUint16(script[i*2:], word)
 	}
+	diagnostic.ScriptUTF16Units, diagnostic.ScriptSHA256 = len(words), fmt.Sprintf("%x", sha256.Sum256(script))
 	args := []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", base64.StdEncoding.EncodeToString(script)}
+	diagnostic.CleanupConfirmed = false
 	process, err = startMappingPowerShell(host, executable, args, directory)
 	if err != nil {
-		return result, err
+		return execution, err
 	}
 	streams = make(chan error, 3)
+	diagnostic.WorkersStarted = 3
 	go func() { _, err := io.Copy(&stdout, process.Output()); streams <- err }()
 	go func() { _, err := io.Copy(&stderr, process.Errors()); streams <- err }()
 	go func() {
@@ -1062,28 +1114,35 @@ func runMappingPowerShell(ctx context.Context, host platform, executable, direct
 			writeErr = io.ErrShortWrite
 		}
 		writeReturned = true
-		streams <- writeErr
+		if closeInput && writeErr == nil {
+			eofAttempted = true
+			eofErr = process.Input().Close()
+		}
+		streams <- errors.Join(writeErr, eofErr)
 	}()
 	done := process.Done()
 	finished := false
-	var processErr error
 	for !finished || drained != 3 {
 		select {
 		case err := <-streams:
 			drained++
 			if err != nil {
-				return result, err
+				return execution, err
 			}
 		case <-done:
 			finished = true
 			done = nil
-			processErr = process.Result()
+			processErr, resultObserved = process.Result(), true
 		case <-ctx.Done():
-			return result, ctx.Err()
+			return execution, ctx.Err()
 		}
 	}
-	if err := decodeMappingJSON(stdout.Bytes(), &result); err != nil {
-		return result, errors.Join(err, processErr)
+	return execution, nil
+}
+
+func validateMappingResult(data []byte, request mappingCommandRequest) (result mappingCommandResult, resultErr error) {
+	if err := decodeMappingJSON(data, &result); err != nil {
+		return result, err
 	}
 	if request.OwnerSID == "" || result.OwnerSID != request.OwnerSID {
 		return result, errors.New("mapping command returned a different primary-token SID")
@@ -1094,13 +1153,50 @@ func runMappingPowerShell(ctx context.Context, host platform, executable, direct
 	if result.Status == "ok" && result.Cause != "" {
 		return result, errors.New("mapping command returned a failure cause with successful status")
 	}
-	if result.Status != "ok" || processErr != nil {
-		return result, errors.Join(processErr, fmt.Errorf("mapping %s failed: %s", request.Action, result.Cause))
+	if result.Status != "ok" {
+		return result, fmt.Errorf("mapping %s failed: %s", request.Action, result.Cause)
 	}
 	if len(result.Rows) > mappingRowLimit {
 		return result, errors.New("mapping result row count exceeds limit")
 	}
 	return result, nil
+}
+
+func runMappingPowerShell(ctx context.Context, host platform, executable, directory string, request mappingCommandRequest) (mappingCommandResult, error) {
+	execution, commandErr := executeMappingPowerShell(ctx, host, executable, directory, request, mappingPowerShell, false)
+	result, validationErr := validateMappingResult(execution.Stdout, request)
+	if err := errors.Join(commandErr, validationErr); err != nil {
+		return result, errors.Join(err, encodeMappingDiagnostic(execution.Diagnostic))
+	}
+	return result, nil
+}
+
+const mappingStartupEntryScript = `[Console]::Error.WriteLine('RFS-MAPPING/1 entry-only')
+[Console]::Out.WriteLine('{"status":"entry-ok"}')
+`
+
+type mappingStartupCell struct {
+	Name       string
+	Script     string
+	CloseInput bool
+}
+
+func mappingStartupPlan() [4]mappingStartupCell {
+	return [4]mappingStartupCell{
+		{"01_entry_open", mappingStartupEntryScript, false},
+		{"02_entry_eof", mappingStartupEntryScript, true},
+		{"03_inventory_open", mappingPowerShell, false},
+		{"04_inventory_eof", mappingPowerShell, true},
+	}
+}
+
+func walkMappingStartupCells(visit func(int, mappingStartupCell) bool) (aborted bool) {
+	for index, cell := range mappingStartupPlan() {
+		if !visit(index+1, cell) {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *nativeMappingBackend) command(ctx context.Context, action string, ledger mappingLedger) (mappingCommandResult, error) {

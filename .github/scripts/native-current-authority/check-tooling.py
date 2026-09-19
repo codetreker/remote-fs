@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -15,13 +16,17 @@ import threading
 ROOT = Path(__file__).resolve().parents[3]
 TOOLS = Path(__file__).resolve().parent
 WINDOWS_JOB = None
+DIAGNOSTIC_ROOT = "TestMappingPowerShellStartupDiagnostic"
+DIAGNOSTIC_TAG = "rfs_mapping_startup_diagnostic"
+DIAGNOSTIC_CELLS = ("01_entry_open", "02_entry_eof", "03_inventory_open", "04_inventory_eof")
+DIAGNOSTIC_TEMPLATE = "mapping_startup_diagnostic_windows_test.go"
 
 
 def checksum(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def run(args, directory, log, env, timeout=180):
+def run(args, directory, log, env, timeout=180, on_abort=None):
     print(json.dumps({"command": args}), flush=True)
     if sys.platform == "linux":
         spec = importlib.util.spec_from_file_location("fixture_linux_owner", TOOLS / "run-linux.py")
@@ -41,7 +46,14 @@ def run(args, directory, log, env, timeout=180):
             raise RuntimeError("command left live descendants requiring termination")
         return bytes(child.stdout).decode()
     process = subprocess.Popen(args, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
-    timer = threading.Timer(timeout, WINDOWS_JOB.terminate)
+    def terminate_owned():
+        try:
+            if on_abort is not None:
+                on_abort("owned command exceeded its watchdog deadline; cleanup is unconfirmed")
+        finally:
+            WINDOWS_JOB.terminate()
+
+    timer = threading.Timer(timeout, terminate_owned)
     timer.start()
     try:
         with log.open("xb") as output:
@@ -58,7 +70,7 @@ def run(args, directory, log, env, timeout=180):
         timer.cancel()
         timer.join()
         if process.poll() is None:
-            WINDOWS_JOB.terminate()
+            terminate_owned()
         process.wait()
     return log.read_text()
 
@@ -82,11 +94,258 @@ def audit(path, expected):
     return {"roots": len(roots), "verdicts": len(verdicts), "fail": 0, "skip": 0}
 
 
-def template_groups(os_name):
+def image_catalog():
     spec = importlib.util.spec_from_file_location("fixture_image_catalog", TOOLS / "build-image.py")
     image = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(image)
-    return image.unit_template_groups(os_name)
+    return image
+
+
+def template_groups(os_name):
+    return image_catalog().unit_template_groups(os_name)
+
+
+def diagnostic_templates():
+    return image_catalog().probe_templates("windows") + (DIAGNOSTIC_TEMPLATE,)
+
+
+def strict_json(text):
+    def pairs(values):
+        result = {}
+        for key, value in values:
+            if key in result:
+                raise ValueError("duplicate JSON field: " + key)
+            result[key] = value
+        return result
+
+    def invalid(value):
+        raise ValueError("invalid JSON constant: " + value)
+
+    return json.loads(text, object_pairs_hook=pairs, parse_constant=invalid)
+
+
+def bounded_text(path, limit):
+    with path.open("rb") as stream:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("diagnostic evidence exceeds its size limit: " + path.name)
+    return data.decode("utf-8")
+
+
+def diagnostic_prerequisite(run_id, source_sha, output, sources):
+    if not re.fullmatch(r"[0-9]+-[0-9]+", run_id) or not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+        raise ValueError("diagnostic requires the workflow run/attempt and source SHA")
+    prior = ROOT / ".tmp/native-current-authority-fixture/windows-runs" / run_id / "evidence"
+    manifest_path = ROOT / ".tmp/native-current-authority-fixture/artifact/manifest.json"
+    paths = [prior / name for name in ("receipt.json", "cold-observations.jsonl", "events.jsonl")]
+    texts = [bounded_text(path, 1 << 20) for path in paths]
+    receipt = strict_json(texts[0])
+    identity = {"run_id": run_id, "source_sha": source_sha, "fixture_nonce": receipt.get("fixture_nonce")}
+    if not isinstance(identity["fixture_nonce"], str) or not re.fullmatch(r"[0-9a-f]{64}", identity["fixture_nonce"]):
+        raise ValueError("cold receipt has no valid fixture nonce")
+
+    def bound(value):
+        if any(value.get(key) != expected for key, expected in identity.items()):
+            raise ValueError("diagnostic prerequisite has foreign run/source/nonce evidence")
+
+    bound(receipt)
+    if (receipt.get("fixture_readiness") != "failed" or receipt.get("current_smb_cold_requested") is not True
+            or not isinstance(receipt.get("cause"), str) or "current-smb-cold:" not in receipt["cause"]):
+        raise ValueError("diagnostic requires a failed current SMB cold attempt")
+    observations = [strict_json(line) for line in texts[1].splitlines()]
+    events = [strict_json(line) for line in texts[2].splitlines()]
+    for row in observations + events:
+        bound(row)
+    cold = [row["event"] for row in observations]
+    if [event.get("kind") for event in cold] != ["smb-host", "smb-cleanup", "cold-result"]:
+        raise ValueError("cold trace does not identify the initial mapping inventory failure")
+    host, cleanup, result = cold
+    if (host.get("status") != "ok" or not re.fullmatch(r"S-1-[0-9-]+", host.get("sid", ""))
+            or cleanup.get("status") != "ok" or cleanup.get("serve_joined") is not True
+            or result.get("status") != "error"):
+        raise ValueError("cold trace lacks host identity or confirmed SMB cleanup")
+    failure = [row for row in events if row.get("phase") == "current-smb-cold"]
+    recovery = [row for row in events if row.get("phase") == "current-smb-cleanup"]
+    if (len(failure) != 1 or failure[0].get("category") != "probe-failed"
+            or failure[0]["details"].get("sequence") != 2 or len(recovery) != 1
+            or recovery[0].get("category") != "mapping-recovery"
+            or recovery[0]["details"].get("status") != "ok"):
+        raise ValueError("cold child or mapping recovery cleanup is unconfirmed")
+    marker = "mapping command diagnostic: "
+    error = result.get("error", "")
+    if error.count(marker) != 1:
+        raise ValueError("cold failure must contain exactly one mapping diagnostic")
+    diagnostic = strict_json(error.split(marker, 1)[1])
+    if diagnostic.get("action") != "inventory" or diagnostic.get("action_truncated") is not False:
+        raise ValueError("cold mapping failure is not the initial inventory")
+    for name in ("stdout_observed", "stderr_observed"):
+        stream = diagnostic.get(name)
+        if (stream != {"observed_bytes": 0, "prefix_base64": "", "prefix_truncated": False}
+                or type(stream["observed_bytes"]) is not int or stream["prefix_truncated"] is not False):
+            raise ValueError("cold inventory captured entry or stream bytes")
+    if (prior / "smb-mapping.json").exists():
+        raise ValueError("cold inventory left a mapping ledger")
+    manifest = strict_json(bounded_text(manifest_path, 4 << 20))
+    if manifest.get("source_sha") != source_sha or manifest.get("source_dirty") is not False:
+        raise ValueError("diagnostic source manifest differs from the failed cold source")
+    if any(manifest["source_files"].get(path) != value for path, value in sources.items()):
+        raise ValueError("diagnostic template/checker bytes differ from the cold source manifest")
+    for name, expected in manifest["source_files"].items():
+        path = ROOT / name
+        if (Path(name).is_absolute() or ".." in Path(name).parts or not path.resolve().is_relative_to(ROOT.resolve())
+                or checksum(path) != expected):
+            raise ValueError("diagnostic dependency bytes differ from the cold source manifest: " + name)
+    config = {"format": 1, **identity, "prior_evidence_directory": str(prior),
+              "evidence_directory": str(output), "owner_sid": host["sid"],
+              "initial_inventory_diagnostic": diagnostic}
+    if len(json.dumps(config).encode()) > 64 << 10:
+        raise ValueError("diagnostic config exceeds 64 KiB")
+    provenance = {"files": {str(path.relative_to(ROOT)): checksum(path) for path in [*paths, manifest_path]},
+                  "source_files": manifest["source_files"], "cold_failure": error,
+                  "fixture_failure": receipt["cause"], "identity": identity}
+    return config, provenance
+
+
+def diagnostic_audit(path):
+    expected = [DIAGNOSTIC_ROOT, *(DIAGNOSTIC_ROOT + "/" + name for name in DIAGNOSTIC_CELLS)]
+    started, verdicts, packages, errors = [], {}, [], []
+    try:
+        lines = bounded_text(path, 16 << 20).splitlines()
+    except (OSError, ValueError) as error:
+        lines = []
+        errors.append(str(error))
+    for ordinal, line in enumerate(lines, 1):
+        try:
+            value = strict_json(line)
+            if not isinstance(value, dict) or not isinstance(value.get("Action"), str):
+                raise ValueError("Go event must have an action")
+            action, name = value["Action"], value.get("Test")
+            if name is not None and (not isinstance(name, str) or not name):
+                raise ValueError("Go event has an invalid test name")
+            if name and action == "run":
+                if name in started:
+                    errors.append("duplicate test start: " + name)
+                started.append(name)
+            if action in ("pass", "fail", "skip"):
+                if name:
+                    if name in verdicts:
+                        errors.append("duplicate test verdict: " + name)
+                    verdicts[name] = action
+                else:
+                    packages.append(action)
+        except (ValueError, KeyError, TypeError) as error:
+            errors.append(f"invalid Go JSON event at line {ordinal}: {error}")
+    if started != expected:
+        errors.append("diagnostic root/cell starts differ from the exact ordered inventory")
+    if set(verdicts) != set(started):
+        errors.append("diagnostic started/verdict accounting differs")
+    if packages != ["pass"]:
+        errors.append("diagnostic package did not report one passing verdict")
+    failed = [name for name, verdict in verdicts.items() if verdict == "fail"]
+    skipped = [name for name, verdict in verdicts.items() if verdict == "skip"]
+    if failed or skipped:
+        errors.append("diagnostic contains failed or skipped tests")
+    return {"status": "failed" if errors else "passed", "expected": expected, "started": started,
+            "verdicts": verdicts, "missing_verdicts": sorted(set(started) - set(verdicts)),
+            "not_started": [name for name in expected if name not in started],
+            "failed": failed, "skipped": skipped, "package_verdicts": packages, "errors": errors}
+
+
+def run_startup_diagnostic(args, output, env):
+    receipt_path = output / "diagnostic-receipt.json"
+    receipt = {"format": 1, "mode": "mapping-startup-diagnostic", "status": "running",
+               "run_id": args.run_id, "source_sha": args.source_sha, "phase": "prerequisite",
+               "cleanup_confirmed": False, "errors": [], "sources": {}, "commands": []}
+    receipt_lock = threading.RLock()
+
+    def save():
+        with receipt_lock:
+            temporary = output / "diagnostic-receipt.partial"
+            temporary.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(receipt_path)
+
+    def abort(cause):
+        with receipt_lock:
+            receipt.update(status="aborted", cleanup_confirmed=False, abort_cause=cause)
+            receipt["audit"] = diagnostic_audit(output / "test.jsonl")
+            save()
+
+    def command(arguments, log):
+        with receipt_lock:
+            receipt["commands"].append(arguments)
+            save()
+        return run(arguments, ROOT, output / log, env, timeout=120, on_abort=abort)
+
+    save()
+    try:
+        if sys.platform != "win32" or args.race:
+            raise ValueError("startup diagnostic requires native Windows without race mode")
+        files = diagnostic_templates()
+        source_paths = [TOOLS / (name + ".txt") for name in files]
+        source_paths += [TOOLS / name for name in ("check-tooling.py", "build-image.py", "check_windows.py")]
+        receipt["sources"] = {str(path.relative_to(ROOT)): checksum(path) for path in source_paths}
+        config, receipt["prerequisite"] = diagnostic_prerequisite(
+            args.run_id, args.source_sha, output, receipt["sources"])
+        config_path = output / "mapping-startup-config.json"
+        config_path.write_text(json.dumps(config, separators=(",", ":")) + "\n", encoding="utf-8")
+        env = {**env, "RFS_MAPPING_STARTUP_CONFIG": str(config_path)}
+        directory = output / "probe"
+        directory.mkdir()
+        for name in files:
+            shutil.copyfile(TOOLS / (name + ".txt"), directory / name)
+        receipt["phase"] = "go-version"
+        version = command(["go", "version"], "go-version.log").strip()
+        receipt["go_version"] = version
+        if version != "go version go1.26.8 windows/arm64":
+            raise ValueError("startup diagnostic requires Go1.26.8 windows/arm64")
+        receipt["phase"] = "inventory"
+        inventory = command(["go", "test", "-count=1", "-tags=" + DIAGNOSTIC_TAG,
+                             "-list", "^Test", str(directory)], "inventory.log")
+        if [line for line in inventory.splitlines() if line.startswith("Test")] != [DIAGNOSTIC_ROOT]:
+            raise ValueError("startup diagnostic test root inventory differs")
+        receipt["phase"] = "cells"
+        try:
+            command(["go", "test", "-json", "-count=1", "-timeout=120s", "-tags=" + DIAGNOSTIC_TAG,
+                     "-run=^" + DIAGNOSTIC_ROOT + "$", str(directory)], "test.jsonl")
+        except Exception as error:
+            receipt["errors"].append(str(error))
+        receipt["audit"] = diagnostic_audit(output / "test.jsonl")
+        if receipt["audit"]["status"] != "passed":
+            receipt["errors"].append("diagnostic Go start/verdict audit failed")
+        native_path = output / "mapping-startup.json"
+        native = strict_json(bounded_text(native_path, 1 << 20))
+        receipt["native_receipt"] = {"sha256": checksum(native_path), "details": native}
+        if any(native.get(key) != config[key] for key in ("format", "run_id", "source_sha", "fixture_nonce")):
+            raise ValueError("native startup receipt differs from the admitted cold evidence")
+        if native.get("status") != "passed" or native.get("aborted") is not False or native.get("cleanup_confirmed") is not True:
+            receipt["errors"].append("native startup cells failed or cleanup is unconfirmed")
+    except Exception as error:
+        receipt["errors"].append(str(error))
+    finally:
+        if "audit" not in receipt:
+            receipt["audit"] = diagnostic_audit(output / "test.jsonl")
+        try:
+            before = {**receipt.get("prerequisite", {}).get("source_files", {}), **receipt["sources"]}
+            if any(checksum(ROOT / path) != value for path, value in before.items()):
+                receipt["errors"].append("fixture source changed during startup diagnostic")
+        except OSError as error:
+            receipt["errors"].append("cannot verify diagnostic source stability: " + str(error))
+        try:
+            if WINDOWS_JOB is not None:
+                WINDOWS_JOB.assert_idle()
+                WINDOWS_JOB.close_success()
+                receipt["checker_cleanup_confirmed"] = True
+            native_cleanup = receipt.get("native_receipt", {}).get("details", {}).get("cleanup_confirmed")
+            receipt["cleanup_confirmed"] = receipt.get("checker_cleanup_confirmed") is True and native_cleanup is True
+        except Exception as error:
+            abort("checker Job cleanup is unconfirmed: " + str(error))
+            WINDOWS_JOB.terminate()
+        receipt["status"] = "failed" if receipt["errors"] else "passed"
+        receipt["phase"] = "complete"
+        save()
+    if receipt["errors"]:
+        raise RuntimeError("startup diagnostic failed; see " + str(receipt_path))
+    return receipt
 
 
 def main():
@@ -94,10 +353,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True)
     parser.add_argument("--race", action="store_true")
+    parser.add_argument("--mapping-startup-diagnostic", action="store_true")
+    parser.add_argument("--run-id")
+    parser.add_argument("--source-sha")
     args = parser.parse_args()
+    if args.mapping_startup_diagnostic != bool(args.run_id and args.source_sha) or (
+            not args.mapping_startup_diagnostic and (args.run_id or args.source_sha)):
+        parser.error("startup diagnostic requires --run-id and --source-sha together")
     output = Path(args.output).resolve()
     if not output.is_relative_to(ROOT / ".tmp") or output == ROOT / ".tmp" or output.exists():
         raise ValueError("checks require a new output directory below the worktree .tmp")
+    if args.mapping_startup_diagnostic and output.parent != ROOT / ".tmp/native-current-authority-fixture/unit-windows":
+        raise ValueError("startup diagnostic output must be a new child of unit-windows")
     output.mkdir(parents=True)
     if sys.platform == "win32":
         spec = importlib.util.spec_from_file_location("fixture_windows_checks", TOOLS / "check_windows.py")
@@ -112,6 +379,9 @@ def main():
         path = ROOT / ".tmp" / suffix
         path.mkdir(parents=True, exist_ok=True)
         env[key] = str(path)
+    if args.mapping_startup_diagnostic:
+        run_startup_diagnostic(args, output, env)
+        return
     version = run(["go", "version"], ROOT, output / "go-version.log", env).strip()
     if "go1.26.8" not in version.split():
         raise ValueError("fixture checks require Go1.26.8")

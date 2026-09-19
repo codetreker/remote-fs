@@ -1,0 +1,354 @@
+//go:build windows && rfs_mapping_startup_diagnostic
+
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"debug/pe"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+type mappingStartupConfig struct {
+	Format                     int                      `json:"format"`
+	RunID                      string                   `json:"run_id"`
+	SourceSHA                  string                   `json:"source_sha"`
+	FixtureNonce               string                   `json:"fixture_nonce"`
+	PriorEvidenceDirectory     string                   `json:"prior_evidence_directory"`
+	EvidenceDirectory          string                   `json:"evidence_directory"`
+	OwnerSID                   string                   `json:"owner_sid"`
+	InitialInventoryDiagnostic mappingCommandDiagnostic `json:"initial_inventory_diagnostic"`
+}
+
+type mappingStartupCellReceipt struct {
+	Name                            string                   `json:"name"`
+	Ordinal                         int                      `json:"ordinal"`
+	PriorDiagnosticProcessCreations int                      `json:"prior_diagnostic_process_creations"`
+	Status                          string                   `json:"status"`
+	Error                           string                   `json:"error"`
+	ErrorTruncated                  bool                     `json:"error_truncated"`
+	Diagnostic                      mappingCommandDiagnostic `json:"diagnostic"`
+}
+
+type mappingStartupImageReceipt struct {
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	SHA256  string `json:"sha256"`
+	Machine uint16 `json:"pe_machine"`
+	Error   string `json:"error"`
+}
+
+type mappingStartupReceipt struct {
+	Format                     int                          `json:"format"`
+	RunID                      string                       `json:"run_id"`
+	SourceSHA                  string                       `json:"source_sha"`
+	FixtureNonce               string                       `json:"fixture_nonce"`
+	Status                     string                       `json:"status"`
+	Aborted                    bool                         `json:"aborted"`
+	CleanupConfirmed           bool                         `json:"cleanup_confirmed"`
+	TimingContext              string                       `json:"timing_context"`
+	ImageFactsContext          string                       `json:"image_facts_context"`
+	PriorEvidenceDirectory     string                       `json:"prior_evidence_directory"`
+	InitialInventoryDiagnostic mappingCommandDiagnostic     `json:"initial_inventory_diagnostic"`
+	Cells                      []mappingStartupCellReceipt  `json:"cells"`
+	Images                     []mappingStartupImageReceipt `json:"images"`
+}
+
+func readMappingStartupFile(path string, limit int64) ([]byte, error) {
+	if err := rejectPrivateReparsePath(path); err != nil {
+		return nil, err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	info, statErr := file.Stat()
+	if statErr != nil || !info.Mode().IsRegular() || info.Size() > limit {
+		return nil, errors.Join(statErr, errors.New("diagnostic input is not a bounded regular file"), file.Close())
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, limit+1))
+	if len(data) > int(limit) {
+		readErr = errors.Join(readErr, errors.New("diagnostic input exceeded its bound"))
+	}
+	return data, errors.Join(readErr, file.Close())
+}
+
+func readMappingStartupConfig() (mappingStartupConfig, error) {
+	var config mappingStartupConfig
+	path := os.Getenv("RFS_MAPPING_STARTUP_CONFIG")
+	data, err := readMappingStartupFile(path, 64<<10)
+	if err != nil {
+		return config, err
+	}
+	if err := decodeMappingJSON(data, &config); err != nil {
+		return config, err
+	}
+	if config.Format != 1 || config.RunID == "" || len(config.RunID) > 96 || strings.Trim(config.RunID, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != "" ||
+		len(config.SourceSHA) != 40 || strings.Trim(config.SourceSHA, "0123456789abcdef") != "" || len(config.FixtureNonce) != 64 || strings.Trim(config.FixtureNonce, "0123456789abcdef") != "" || config.OwnerSID == "" {
+		return config, errors.New("invalid diagnostic identity")
+	}
+	if filepath.Dir(path) != config.EvidenceDirectory || filepath.Base(config.PriorEvidenceDirectory) != "evidence" || filepath.Base(filepath.Dir(config.PriorEvidenceDirectory)) != config.RunID {
+		return config, errors.New("diagnostic directories do not bind the configured run")
+	}
+	for _, directory := range []string{config.PriorEvidenceDirectory, config.EvidenceDirectory} {
+		if err := rejectPrivateReparsePath(directory); err != nil {
+			return config, err
+		}
+		info, err := os.Stat(directory)
+		if err != nil {
+			return config, err
+		}
+		if !info.IsDir() {
+			return config, errors.New("diagnostic evidence path is not a directory")
+		}
+	}
+	initial := config.InitialInventoryDiagnostic
+	if initial.Action != "inventory" || initial.ActionTruncated || initial.Stdout.ObservedBytes != 0 || initial.Stderr.ObservedBytes != 0 || initial.EOFRequested || initial.InputBytes <= 0 || initial.InputBytes > 4096 {
+		return config, errors.New("diagnostic does not bind an initial zero-stream inventory failure")
+	}
+	priorData, err := readMappingStartupFile(filepath.Join(config.PriorEvidenceDirectory, "receipt.json"), 64<<10)
+	if err != nil {
+		return config, err
+	}
+	var prior map[string]any
+	if err := decodeMappingJSON(priorData, &prior); err != nil {
+		return config, err
+	}
+	if prior["run_id"] != config.RunID || prior["source_sha"] != config.SourceSHA || prior["fixture_nonce"] != config.FixtureNonce || prior["fixture_readiness"] != "failed" || prior["current_smb_cold_requested"] != true {
+		return config, errors.New("prior cold receipt does not match diagnostic identity and failure")
+	}
+	return config, nil
+}
+
+func writeMappingStartupReceipt(path string, receipt mappingStartupReceipt) error {
+	data, err := json.MarshalIndent(receipt, "", "  ")
+	if err != nil {
+		return err
+	}
+	if len(data) > 128<<10 {
+		return errors.New("diagnostic receipt exceeds 128 KiB")
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := makePrivateFile(path); err != nil {
+		return errors.Join(err, file.Close())
+	}
+	n, writeErr := file.Write(append(data, '\n'))
+	if writeErr == nil && n != len(data)+1 {
+		writeErr = io.ErrShortWrite
+	}
+	return errors.Join(writeErr, file.Sync(), file.Close())
+}
+
+func inspectMappingStartupImage(path string) (result mappingStartupImageReceipt) {
+	result.Path = path
+	var inspectionErr error
+	defer func() {
+		if inspectionErr != nil {
+			result.Error, _ = mappingDiagnosticText(inspectionErr.Error(), 1024)
+		}
+	}()
+	if inspectionErr = rejectPrivateReparsePath(path); inspectionErr != nil {
+		return result
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		inspectionErr = err
+		return result
+	}
+	defer func() { inspectionErr = errors.Join(inspectionErr, file.Close()) }()
+	before, err := file.Stat()
+	if err != nil {
+		inspectionErr = err
+		return result
+	}
+	if !before.Mode().IsRegular() || before.Size() > 64<<20 {
+		inspectionErr = errors.New("post-attempt image is not a regular file within 64 MiB")
+		return result
+	}
+	result.Size = before.Size()
+	image, err := pe.NewFile(file)
+	if err != nil {
+		inspectionErr = err
+		return result
+	}
+	result.Machine = image.Machine
+	digest := sha256.New()
+	count, err := io.Copy(digest, io.LimitReader(file, (64<<20)+1))
+	if err != nil {
+		inspectionErr = err
+		return result
+	}
+	after, err := file.Stat()
+	if err != nil {
+		inspectionErr = err
+		return result
+	}
+	if count != before.Size() || before.Size() != after.Size() || before.ModTime() != after.ModTime() {
+		inspectionErr = errors.New("post-attempt image changed during inspection")
+		return result
+	}
+	result.SHA256 = fmt.Sprintf("%x", digest.Sum(nil))
+	return result
+}
+
+func TestMappingPowerShellStartupDiagnostic(t *testing.T) {
+	config, err := readMappingStartupConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := mappingStartupReceipt{
+		Format: 1, RunID: config.RunID, SourceSHA: config.SourceSHA, FixtureNonce: config.FixtureNonce,
+		Status: "failed", Aborted: true, CleanupConfirmed: true,
+		TimingContext:          "after original cold failure and VM cleanup; sequential cells may be warmed by earlier launches",
+		ImageFactsContext:      "post-attempt on-disk bytes; not proof of bytes loaded by each process",
+		PriorEvidenceDirectory: config.PriorEvidenceDirectory, InitialInventoryDiagnostic: config.InitialInventoryDiagnostic,
+		Cells: []mappingStartupCellReceipt{}, Images: []mappingStartupImageReceipt{},
+	}
+	work := ""
+	defer func() {
+		if receipt.CleanupConfirmed {
+			seen := make(map[string]bool)
+			for _, cell := range receipt.Cells {
+				launch := cell.Diagnostic.Launch
+				if launch == nil || launch.ActualImage == "" || seen[launch.ActualImage] {
+					continue
+				}
+				seen[launch.ActualImage] = true
+				image := inspectMappingStartupImage(launch.ActualImage)
+				receipt.Images = append(receipt.Images, image)
+				if image.Error != "" {
+					t.Errorf("post-attempt executable inspection: %s", image.Error)
+				}
+			}
+			if work != "" {
+				if err := os.Remove(work); err != nil {
+					t.Errorf("remove owned diagnostic working directory: %v", err)
+				}
+			}
+		}
+		if !t.Failed() && !receipt.Aborted && len(receipt.Cells) == 4 {
+			receipt.Status = "passed"
+		}
+		if err := writeMappingStartupReceipt(filepath.Join(config.EvidenceDirectory, "mapping-startup.json"), receipt); err != nil {
+			t.Errorf("write diagnostic receipt: %v", err)
+		}
+	}()
+	owner, err := currentMappingOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner.SID != config.OwnerSID {
+		t.Fatal("current primary SID differs from the original cold owner")
+	}
+	work = filepath.Join(config.EvidenceDirectory, "work")
+	if err := createPrivateDirectory(work); err != nil {
+		work = ""
+		t.Fatal(err)
+	}
+	backend, err := newNativeMappingBackend(options{StateFile: filepath.Join(work, "unused-state.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	native := backend.(*nativeMappingBackend)
+	if native.owner != owner {
+		t.Fatal("mapping owner changed during diagnostic preparation")
+	}
+	request := mappingCommandRequest{Action: "inventory", Module: native.module, OwnerSID: owner.SID}
+	requestBytes, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestBytes = append(requestBytes, '\n')
+	requestHash := fmt.Sprintf("%x", sha256.Sum256(requestBytes))
+	initial := config.InitialInventoryDiagnostic
+	if len(requestBytes) != initial.InputBytes || initial.InputSHA256 != "" && initial.InputSHA256 != requestHash {
+		t.Fatal("current inventory input differs from the original attempt")
+	}
+	processCreations := 0
+	receipt.Aborted = walkMappingStartupCells(func(ordinal int, cell mappingStartupCell) bool {
+		clean := false
+		t.Run(cell.Name, func(t *testing.T) {
+			execution := mappingExecution{Diagnostic: mappingCommandDiagnostic{CleanupConfirmed: true}}
+			before, cellErr := currentMappingOwner()
+			if cellErr == nil && before != owner {
+				cellErr = errors.New("mapping owner changed before diagnostic cell")
+			}
+			if cellErr == nil {
+				cellErr = requireMappingJob()
+			}
+			if cellErr == nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+				execution, cellErr = executeMappingPowerShell(ctx, native.host, native.executable, work, request, cell.Script, cell.CloseInput)
+				cancel()
+				if execution.Diagnostic.InputSHA256 != requestHash || execution.Diagnostic.InputBytes != len(requestBytes) {
+					cellErr = errors.Join(cellErr, errors.New("cell input changed"))
+				}
+				marker := "RFS-MAPPING/1 entry"
+				if cell.Script == mappingStartupEntryScript {
+					marker += "-only"
+				}
+				prefix, prefixErr := base64.StdEncoding.DecodeString(execution.Diagnostic.Stderr.PrefixBase64)
+				if prefixErr != nil || !strings.HasPrefix(string(prefix), marker+"\r\n") && !strings.HasPrefix(string(prefix), marker+"\n") {
+					cellErr = errors.Join(cellErr, prefixErr, errors.New("cell entry marker was not captured"))
+				}
+				if cell.Script == mappingStartupEntryScript {
+					if strings.TrimSpace(string(execution.Stdout)) != `{"status":"entry-ok"}` {
+						cellErr = errors.Join(cellErr, errors.New("entry-only cell omitted its fixed result"))
+					}
+				} else {
+					_, validationErr := validateMappingResult(execution.Stdout, request)
+					cellErr = errors.Join(cellErr, validationErr)
+				}
+				clean = execution.Diagnostic.CleanupConfirmed
+				if execution.Diagnostic.WorkersStarted != 3 || execution.Diagnostic.WorkersJoined != 3 {
+					cellErr = errors.Join(cellErr, errors.New("cell did not start and join exactly three I/O workers"))
+				}
+				if cell.CloseInput && !execution.Diagnostic.EOFCompleted {
+					cellErr = errors.Join(cellErr, errors.New("EOF cell did not complete its owned input"))
+				}
+				after, ownerErr := currentMappingOwner()
+				if ownerErr == nil && after != owner {
+					ownerErr = errors.New("mapping owner changed during diagnostic cell")
+				}
+				cellErr = errors.Join(cellErr, ownerErr)
+				if ownerErr != nil {
+					clean = false
+				}
+			}
+			entry := mappingStartupCellReceipt{Name: cell.Name, Ordinal: ordinal, PriorDiagnosticProcessCreations: processCreations, Status: "passed", Diagnostic: execution.Diagnostic}
+			if execution.Diagnostic.PID != nil || execution.Diagnostic.Launch != nil && execution.Diagnostic.Launch.PID != nil {
+				processCreations++
+			}
+			if cellErr != nil {
+				entry.Status = "failed"
+				entry.Error, entry.ErrorTruncated = mappingDiagnosticText(cellErr.Error(), 4096)
+				t.Errorf("diagnostic cell failed: %v", cellErr)
+			}
+			receipt.CleanupConfirmed = receipt.CleanupConfirmed && execution.Diagnostic.CleanupConfirmed
+			receipt.Cells = append(receipt.Cells, entry)
+			data, err := json.Marshal(entry)
+			if err != nil {
+				clean = false
+				t.Error(err)
+			} else {
+				t.Logf("mapping startup cell: %s", data)
+			}
+		})
+		return clean
+	})
+	if receipt.Aborted {
+		t.Error("diagnostic aborted before later cells could be admitted")
+	}
+}

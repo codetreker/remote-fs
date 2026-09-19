@@ -205,14 +205,14 @@ the native HANDLE, removes the mapping, calls Shutdown, joins Serve, Unpublishes
 the export, closes idle HTTP connections and verifies remote/local cleanup.
 
 [The first cold run 35434023125](https://github.com/codetreker/remote-fs/actions/runs/35434023125)
-on source `2c561f0da1b6223d1ab06b1eb87400e699e309b8` failed when its initial
-`Get-SmbMapping` inventory command exceeded the unchanged four-second child
-context. No creation-intent ledger, current SMB connection/traffic or native
-file-call record was observed. The exact PowerShell stage is unknown. Mapping
-cleanup reported no owned mapping and the SMB host drained, but guest cleanup
-was forced; disk removal and an unchanged pristine image do not turn that result
-into a pass. The earlier qualified HTTP fixture pass does not supply the missing
-current-SMB or one-second evidence.
+failed at initial `Get-SmbMapping` inventory before any observed creation intent,
+current SMB traffic or native file call. [The captured run 35437123318](https://github.com/codetreker/remote-fs/actions/runs/35437123318)
+on source `5beb09c2fa5b514adaffa22a184ee7bf9f99bf97` reached the same unchanged
+four-second command deadline after 4009 ms. The parent wrote all 219 request
+bytes; the joined workers captured zero stdout/stderr bytes and no entry marker.
+The waiter had not published Done before cleanup. These facts establish neither
+child input consumption nor a particular startup or module stage. Recovery and
+disk cleanup do not qualify current-SMB or one-second acceptance.
 
 Mapping failures retain a bounded diagnostic after the owned child is finished
 and all three I/O workers join. It records action, actual PID when available,
@@ -224,11 +224,34 @@ module and inventory; stdout retains its single result JSON. The 1 MiB stream
 limit applies through `io.Copy` as well as direct Write calls. Missing prefix
 bytes do not prove a stage never began, and a prefix is not complete output.
 
-This captures the next failure; it does not fix or reclassify the timeout. The
-four-second context, stdin lifetime, flags, mapping operations and outer budgets
-remain unchanged. A local PowerShell 7 test completed with stdin both held open
-and closed; it does not establish Windows PowerShell 5.1 behavior. No notification
-manager, invalidation policy or production mapping API is added.
+The Windows owner records CreateProcess, Job assignment and ResumeThread timings
+and errors. ResumeThread must return the previous suspend count 1. The retained
+original process handle supplies the actual image path and process/native machine
+values before the sole waiter can close it. These synchronous queries are not
+context-cancellable. Image hashing and PE inspection occur after the experiment
+and describe the on-disk file then, not every byte loaded by an earlier child.
+
+[Startup diagnostics](mapping_startup_diagnostic_windows_test.go.txt) run only
+after the actual cold attempt has failed and saved source/run-bound evidence
+qualifies an initial inventory failure with no observed entry or stream bytes.
+The tagged test is absent from normal unit and production catalogs. Its four
+sequential cells run once each: minimal immediate entry/result with stdin open,
+the same script with EOF, exact read-only inventory with stdin open, then the
+same inventory with EOF. Each gets the unchanged four-second command deadline
+and existing owned cleanup. EOF follows one complete successful write and is
+closed once by the same owner used by Finish; short writes and close errors fail.
+The ordinary mapping path keeps its original open-stdin policy.
+
+Each cell joins its process and three workers before the next; unknown Job
+quiescence stops further launches. The cells record their order, actual creation
+count, request/script hashes, launch facts, capture and cleanup. No create/remove,
+intent ledger, mapping change or native file I/O is allowed. The original cold
+failure remains failed even if later cells succeed. The experiment runs after VM
+shutdown and SMB cleanup attempts, under different load; later cells may be warmed
+by earlier launches. Its results cannot alone identify the original cold cause.
+The 120-second test and 15-minute job limits remain unchanged. New native cells
+have not run. A local PowerShell 7 held-open/EOF success establishes only that
+local behavior, not Windows PowerShell 5.1 behavior or a timeout repair.
 
 ## Local Linux validation
 
