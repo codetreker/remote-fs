@@ -602,13 +602,26 @@ Hnew/HA 的同 volume opaque 身份、原 HA 稳定、B769/A257 字节、冷 B�
 
 变更只从 server-local NTFS 路径打开 B，执行一次 FileRenameInfoEx Flags3（REPLACE_IF_EXISTS|POSIX_SEMANTICS）替换 target。ARM64 payload 的 RootDirectory、byte-counted UTF-16 名字与同步 buffer 寿命分别检查；实际成功返回即为本地 ACK，失败不退回普通 rename，也不放宽 share0。watcher 保留实际 DETAIL、原生 overflow/rescan 或错误；同一 watcher 至多三次 completion/rearm，共用 ACK+850 ms，不能把原生零字节称为已证明的 wire ENUM。随后原首个 CreateFile、legacy 新身份、保留 HA 身份、旧 A 与新 B 读取次序不变；旧身份稳定、新身份不同及正确字节必须在 ACK+一秒、从 WNet 准入起最早可能曝光计算的原 5/10/10 TTL 前完成。最终 local NTFS oracle 核对 B 的名字转换/身份/字节，但不要求 SMB native ID 数值等于 local ID。
 
+目录 write-sharing 是[独立对照工作流](../.github/workflows/native-smb-inbox-share-write.yml)，不改变原 share0 判据。两个固定策略对应的请求参数与结果分别绑定：
+
+| 策略 | 临时根 | 原生 entry | app 请求 access/share | 通过结果 |
+|---|---|---|---|---|
+| original | `.tmp/native-inbox-reference` | `TestNativeInboxReference` | LIST1/share0 | `native_behavior_pass` |
+| write-only | `.tmp/native-inbox-share-write` | `TestNativeInboxShareWriteControl` | LIST1/share2 | `share_write_control_native_behavior_pass` |
+
+控制器和生成器默认选择 original，但 IPC/ledger/receipt 的缺失策略不能默认。编译策略、环境、初始请求和各 stage/admit 的 application_sharing/cell/application_access/application_share 四项必须显式存在、非 null、类型正确且一致，数字表示实际请求参数，不推断 server 私有 handle 状态。只生成所选一个 entry；两策略先加入相同的 policy/返回错误观察，再让 write-only 的唯一 native 参数差异为 app ShareAccess0→2，entry/label 分开。冻结模板物理文件和七份提取 helper 不改，已核对 AST/锚点及逆向规范化证明其它 native 调用、顺序、payload、identity/data/time/cleanup 判据保持。生成场景含新观察字段，默认生成 binary 不再冒充旧 binary 的字节。
+
+[sharing 控制](../.github/scripts/native-smb-inbox-sharing-controls_test.go.txt)核对只改变 app share，原 accessLIST1、watcher/HA/source B 的 share7、Flags3/class22/绝对目标及原 ACK/TTL 均保持。SourceOpenResult/RenameResult 独立区分 not_attempted、success、returned_errno 和 errno_unavailable；只从实际 stage error 提取 unsigned32 x/sys syscall.Errno，保留原对象。rename 先按原顺序记录成功 ACK，再观察返回错误，之后才 Close/join；错误归属不能由 close errno 或另一次 GetLastError 补造。原 NativeOutcome/NativeOracle 保持，对照 public outcome 必须带 share_write_control_ 前缀，不能借原 unprefixed success 通过。
+
+Prepare 在任一固定根存在 ownership ledger 时拒绝。Verify 即使传错选择器也只读这两个固定位置：零候选缺失失败、两个候选歧义失败；唯一候选先核对 source/nonce/path，再在原 token、实际 child/exit、操作结算和资源指纹允许时清理实际 owner。策略错误继续保留，清理和 audit 写在实际根，不以 mismatch 授权删除未知 owner，也不跳过已证明 owner 的合法清理。新工作流只运行 write-only entry；共享脚本/生成器变更也可能按原 PR filter 调度原工作流，其结果独立，不替代对照结果或改写此前失败。
+
 child 拥有全部 native handle/watch/mapping；六十秒生命周期与另五秒 termination/drain 分开。未确认退出、未完成 native pending 或未知资源操作不能成为清理成功，forced 永远失败。controller 在 child 已静止后只删除指纹匹配的本次映射/share/目录，保留首次错误和各项清理错误；后续空快照不能消除未知操作。所有 receipt 明确 mechanism_trace_complete=false：没有 lease/break/完整 wire 机制证据，fixture 不预开或枚举 SMB B 也不证明系统自动流量中的 coldness。完整来源、变更和清理下的结果只分类为 native behavior，不能升级为生产或缓存验收。
 
-[生成器](../.github/scripts/native-smb-inbox-reference-generate.go)核对七份输入、提取 38 个原 native helper 声明到独立 module，复用原身份/字节/时间判据，不导入原型 authority、HTTP 或 metastore。[可移植控制](../.github/scripts/native-smb-inbox-reference-controls_test.go.txt)五根普通/race 各 73 verdict 通过，身份 oracle 与 share 指纹绕过分别命中因果断言；controller 二十二项完整函数体用例和二十四项 origin 用例模拟 Windows/cmdlet 边界，六项真实 Linux 子进程控制只验证 stdio/wait/kill 拥有权。晚退出/kill 发布、receipt/order、资源匹配、flags/ABI、错误及清理边界均保留拒绝。ARM64 构建、vet、格式和 actionlint 已核对。[首次原生运行 35446155273](https://github.com/codetreker/remote-fs/actions/runs/35446155273)到达 Ready1 并取得本次 mapping，但来源准入拒绝，未执行 local Rename/Hnew 或原身份/字节判定。被拒绝的实际 peer 与 session/open 调用点未被导出，不能认定具体 IPv6 或地址原因。已确认 forced child exit，mapping/share/目录物理清理完整；这些清理事实不撤销原失败，也不建立 native behavior。
+[生成器](../.github/scripts/native-smb-inbox-reference-generate.go)核对七份输入、提取 38 个原 native helper 声明到独立 module，复用原身份/字节/时间判据，不导入原型 authority、HTTP 或 metastore。两个生成策略的[可移植控制](../.github/scripts/native-smb-inbox-reference-controls_test.go.txt)各有九根，普通/race 各 170 verdict（原 73 加 sharing 97）通过；十二项生成策略/边界控制与双方逆向 AST 核对完成。六项恢复默认 decoder 的实际对照在缺失/null 必填策略字段拒绝断言失败，不能把 original 的合法 share0 当作字段缺席。将 share2 改回 share0、借用 close errno、接受未加前缀原 success 的三个隔离对照命中对应断言。controller 七十五项完整函数体用例模拟 Windows/cmdlet 边界，错误 Verify selector 的 resolver 对照也失败；十六项真实 Linux 模拟 child 用例与 guard 对照验证 stdio/wait/kill/IPC 拥有权，不执行 Windows 文件或 SMB 操作。原 origin/capture/zone 只对未变函数体复用证据。双方 ARM64 构建、vet、格式和 actionlint 已核对，原模板/helper 与历史结果保持。[首次原生运行 35446155273](https://github.com/codetreker/remote-fs/actions/runs/35446155273)到达 Ready1 并取得本次 mapping，但来源准入拒绝，未执行 local Rename/Hnew 或原身份/字节判定。被拒绝的实际 peer 与 session/open 调用点未被导出，不能认定具体 IPv6 或地址原因。已确认 forced child exit，mapping/share/目录物理清理完整；这些清理事实不撤销原失败，也不建立 native behavior。
 
 [后续捕获运行 35448201633](https://github.com/codetreker/remote-fs/actions/runs/35448201633)记录到 Ready1 选中 session peer 的原 string 不含 zone、解析 scope0，已有输入唯一同字节行 scope16，原 Equals=false；仍在 mutation/Hnew 前拒绝，没有 native identity verdict。forced child 退出已确认，mapping/share/目录物理清理完成，原失败不升级为通过；首次 35446155273 的 peer 仍未知，不能由这次值回填。
 
-当前 107 项本地模拟控制分别覆盖 zone 39、capture 22、origin 24、controller 22；真实旧拒绝输入保持 raw scope0/local scope16/Equals=false，关闭新分支和丢弃 provenance 的两个对照命中断言。实际函数体的 provider/process 边界仍是模拟，native helper、生成 fixture/binary 与进程拥有者未变；既有 Go 普通/race 和 ARM64 证据复用，此次未执行 Go 或新 Windows 场景。新佐证规则尚未原生验证。
+zone 佐证的 107 项本地模拟控制分别覆盖 zone 39、capture 22、origin 24、controller 22；真实旧拒绝输入保持 raw scope0/local scope16/Equals=false，关闭新分支和丢弃 provenance 的两个对照命中断言。实际函数体的 provider/process 边界仍是模拟，该 zone 佐证变更保持 native helper、生成 fixture/binary 与进程拥有者，复用其 Go 普通/race 和 ARM64 证据；独立 share2 对照的生成观察变化另行绑定，不沿用旧 binary 相等结论。[原 share0 运行 35449828229](https://github.com/codetreker/remote-fs/actions/runs/35449828229)已取得 Ready1 来源准入，source B DELETE/share7 成功，实际 FileRenameInfoEx22/Flags3/RootDirectory NULL/绝对 target 返回 sharing-violation 文本，没有 ACK 或 Hnew，只有 reference_mutation_refusal、没有身份 verdict。数值 rename errno 与阻塞 handle 未保存，不能由文本反填。native/controller 清理完成不改变失败；新 share2 对照尚未原生执行，成功也不能满足原 share0 或生产验收。
 
 ## 每次改动必须带什么
 

@@ -1,5 +1,6 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][ValidateSet('Prepare','Run','Verify')][string]$Phase)
+param([Parameter(Mandatory)][ValidateSet('Prepare','Run','Verify')][string]$Phase,
+      [ValidateSet('original','write-only')][string]$ApplicationSharing='original')
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -9,6 +10,40 @@ $script:Results = Join-Path $script:Probe 'results'
 $script:LedgerPath = Join-Path $script:Results 'ownership.json'
 $script:Ledger = $null
 $script:ProtocolPrefix = 'RFS_INBOX:'
+$script:RequestedSharing = $ApplicationSharing
+$script:RootSharing = $ApplicationSharing
+
+function Get-InboxPolicy([string]$Sharing) {
+    switch -CaseSensitive ($Sharing) {
+        'original' {return [ordered]@{application_sharing='original';cell='inbox-reference';application_access=1;application_share=0}}
+        'write-only' {return [ordered]@{application_sharing='write-only';cell='inbox-share-write';application_access=1;application_share=2}}
+        default {throw 'Unknown application sharing policy.'}
+    }
+}
+function Get-InboxPolicyRoot([string]$Sharing) {
+    switch -CaseSensitive ($Sharing) {
+        'original' {return Join-Path $script:Workspace '.tmp/native-inbox-reference'}
+        'write-only' {return Join-Path $script:Workspace '.tmp/native-inbox-share-write'}
+        default {throw 'Unknown application sharing root.'}
+    }
+}
+function Set-InboxPolicyRoot([string]$Sharing) {
+    $script:Probe=Get-InboxPolicyRoot $Sharing
+    $script:RootSharing=$Sharing
+    $script:Results=Join-Path $script:Probe 'results'
+    $script:LedgerPath=Join-Path $script:Results 'ownership.json'
+}
+function Assert-InboxPolicy($Expected,$Actual) {
+    if($Actual -isnot [Collections.IDictionary] -or $Actual.Count -ne 4){throw 'Application policy must contain exactly four fields.'}
+    foreach($key in @('application_sharing','cell')){
+        $value=Get-InboxRequired $Actual $key
+        if($value -isnot [string] -or $value -cne $Expected[$key]){throw "Application policy differs: $key"}
+    }
+    foreach($key in @('application_access','application_share')){
+        $value=Get-InboxRequired $Actual $key
+        if(($value -isnot [int] -and $value -isnot [long] -and $value -isnot [uint32] -and $value -isnot [uint64]) -or $value -ne $Expected[$key]){throw "Application policy numeric field differs: $key"}
+    }
+}
 
 function Write-InboxJSON([string]$Path, $Value) {
     $text = ConvertTo-Json -InputObject $Value -Depth 32 -Compress
@@ -182,10 +217,12 @@ namespace InboxReference {
   readonly CancellationTokenSource lifetime=new CancellationTokenSource();
   Task worker,outputTask,errorTask,inputTask; int stop; long firstStop=-1;
   public volatile bool Started,ExitConfirmed,Forced,Unsettled; public int PID,ExitCode=-1; public long ExitElapsedTicks,InputElapsedTicks,OutputElapsedTicks,ErrorElapsedTicks; public string StartUTC,Error,KillError,WaitError;
-  public Child(string executable,string directory,int budgetMilliseconds,int drainMilliseconds) {
+  public Child(string executable,string directory,int budgetMilliseconds,int drainMilliseconds,string applicationSharing="original") {
+   string selector;
+   switch(applicationSharing){case "original":selector="^TestNativeInboxReference$";break;case "write-only":selector="^TestNativeInboxShareWriteControl$";break;default:throw new ArgumentException("Unknown application sharing policy.",nameof(applicationSharing));}
    budget=budgetMilliseconds;drain=drainMilliseconds;
    process=new Process{StartInfo=new ProcessStartInfo(executable){WorkingDirectory=directory,UseShellExecute=false,RedirectStandardInput=true,RedirectStandardOutput=true,RedirectStandardError=true,CreateNoWindow=true,StandardInputEncoding=new UTF8Encoding(false,true)}};
-   process.StartInfo.ArgumentList.Add("-test.run=^TestNativeInboxReference$");process.StartInfo.ArgumentList.Add("-test.count=1");process.StartInfo.ArgumentList.Add("-test.timeout=60s");process.StartInfo.Environment["RFS_INBOX_REFERENCE"]="1";
+   process.StartInfo.ArgumentList.Add("-test.run="+selector);process.StartInfo.ArgumentList.Add("-test.count=1");process.StartInfo.ArgumentList.Add("-test.timeout=60s");process.StartInfo.Environment["RFS_INBOX_REFERENCE"]="1";process.StartInfo.Environment["RFS_INBOX_APPLICATION_SHARING"]=applicationSharing;
    retained[this]=0;
    worker=Task.Run(()=>{
     try {
@@ -556,8 +593,9 @@ function Get-InboxOrigin($Ledger,[int]$Stage) {
 }
 
 function Assert-InboxEnvelope($Message,$Ledger,[int]$PIDExpected) {
-    $allowed=@('kind','stage','nonce','pid','executable_sha256','token','mapping','receipt_file','receipt_sha256','outcome','cleanup_complete','mechanism_trace_complete','error')
+    $allowed=@('kind','stage','nonce','pid','executable_sha256','token','mapping','receipt_file','receipt_sha256','outcome','cleanup_complete','mechanism_trace_complete','error','policy')
     foreach($key in $Message.Keys){if($key -cnotin $allowed){throw 'Native envelope contains an unknown field.'}}
+    Assert-InboxPolicy $Ledger.policy (Get-InboxRequired $Message 'policy')
     if([string](Get-InboxRequired $Message 'nonce') -cne $Ledger.nonce -or [string](Get-InboxRequired $Message 'executable_sha256') -cne $Ledger.executable_sha256 -or (Convert-InboxID (Get-InboxRequired $Message 'pid')) -cne ([string]$PIDExpected)){throw 'Native envelope owner binding differs.'}
     Assert-InboxToken $Ledger.token (Get-InboxRequired $Message 'token')
     $mapping=Get-InboxRequired $Message 'mapping'
@@ -578,7 +616,7 @@ function Send-InboxEnvelope($Child,$Value) {
     $text=ConvertTo-Json -InputObject $Value -Depth 12 -Compress
     $Child.SendLine($script:ProtocolPrefix+$text)
 }
-function Start-InboxOwnedChild($Ledger) { return [InboxReference.Child]::new($Ledger.executable,(Join-Path $script:Probe 'fixture'),60000,5000) }
+function Start-InboxOwnedChild($Ledger) { return [InboxReference.Child]::new($Ledger.executable,(Join-Path $script:Probe 'fixture'),60000,5000,$Ledger.policy.application_sharing) }
 function Set-InboxOperation([string]$Kind,[string]$Target) {
     $script:Ledger.operation=[ordered]@{kind=$Kind;target=$Target;started=[DateTime]::UtcNow.ToString('O');settled=$false}
     Save-InboxLedger
@@ -652,29 +690,35 @@ function Remove-InboxResources {
     $script:Ledger.cleanup_complete=$true
     Save-InboxLedger
 }
-function Read-InboxLedger {
-    if(-not (Test-Path -LiteralPath $script:LedgerPath)){throw 'Owned-resource ledger is absent.'}
-    $raw=[IO.File]::ReadAllText($script:LedgerPath)
+function Read-InboxLedger([string]$Sharing=$script:RootSharing) {
+    $probe=Get-InboxPolicyRoot $Sharing
+    $path=Join-Path $probe 'results/ownership.json'
+    if(-not (Test-Path -LiteralPath $path)){throw 'Owned-resource ledger is absent.'}
+    Assert-InboxNoReparse $path
+    $raw=[IO.File]::ReadAllText($path)
     if([Text.Encoding]::UTF8.GetByteCount($raw) -gt 1048576){throw 'Owned-resource ledger exceeds its bound.'}
     [InboxReference.Native]::ValidateJSON($raw)
     $value=ConvertFrom-Json $raw -AsHashtable -Depth 32
     if($value.version -ne 1 -or $value.source_sha -cne $env:RFS_INBOX_SOURCE_SHA -or $value.nonce -cnotmatch '^[0-9a-f]{64}$'){throw 'Owned-resource ledger binding differs.'}
-    $expected=Join-Path $script:Probe ('owned-'+$value.nonce.Substring(0,24))
+    $expected=Join-Path $probe ('owned-'+$value.nonce.Substring(0,24))
     if($value.owned_root -cne $expected -or $value.root_local -cne (Join-Path $expected 'share') -or $value.share_name -cne ('rfs-inbox-'+$value.nonce.Substring(0,24)) -or $value.share_unc -cne ('\\'+$value.computer+'\'+$value.share_name)){throw 'Owned-resource ledger paths differ from their nonce.'}
     return $value
 }
 function Invoke-InboxPrepare {
     if($env:GITHUB_RUN_ATTEMPT -cne '1'){throw 'The reference permits only the first invocation of reviewed source.'}
-    if(Test-Path -LiteralPath $script:LedgerPath){throw 'This checkout already owns a reference ledger.'}
+    foreach($sharing in @('original','write-only')){if(Test-Path -LiteralPath (Join-Path (Get-InboxPolicyRoot $sharing) 'results/ownership.json')){throw 'This checkout already owns a reference ledger.'}}
     $preflight=Get-InboxPreflight
     $nonce=[Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant()
     $owned=Join-Path $script:Probe ('owned-'+$nonce.Substring(0,24));$share='rfs-inbox-'+$nonce.Substring(0,24)
-    $script:Ledger=[ordered]@{version=1;source_sha=$env:RFS_INBOX_SOURCE_SHA;nonce=$nonce;computer=$preflight.computer;addresses=$preflight.addresses;token=$preflight.token;settings=$preflight.settings;owned_root=$owned;root_local=Join-Path $owned 'share';share_name=$share;share_unc='\\'+$preflight.computer+'\'+$share;description='inbox-reference:'+ $nonce;drive=Select-InboxDrive;directories=@();share=$null;mapping=$null;operation=$null;share_removed=$false;directory_removed=$false;cleanup_complete=$false;errors=@();cleanup_errors=@();child=[ordered]@{attempted=$false;exit_confirmed=$false;pid=0;start_utc=$null;forced=$false;unsettled=$false};executable=$null;executable_sha256=$null}
+    $script:Ledger=[ordered]@{version=1;policy=Get-InboxPolicy $script:RequestedSharing;source_sha=$env:RFS_INBOX_SOURCE_SHA;nonce=$nonce;computer=$preflight.computer;addresses=$preflight.addresses;token=$preflight.token;settings=$preflight.settings;owned_root=$owned;root_local=Join-Path $owned 'share';share_name=$share;share_unc='\\'+$preflight.computer+'\'+$share;description='inbox-reference:'+ $nonce;drive=Select-InboxDrive;directories=@();share=$null;mapping=$null;operation=$null;share_removed=$false;directory_removed=$false;cleanup_complete=$false;errors=@();cleanup_errors=@();child=[ordered]@{attempted=$false;exit_confirmed=$false;pid=0;start_utc=$null;forced=$false;unsettled=$false};executable=$null;executable_sha256=$null}
+    $preflight.policy=$script:Ledger.policy
     Save-InboxLedger
     Write-InboxJSON (Join-Path $script:Results 'preflight.json') $preflight
 }
 function Invoke-InboxRun {
     $script:Ledger=Read-InboxLedger
+    Assert-InboxPolicy (Get-InboxPolicy $script:RequestedSharing) (Get-InboxRequired $script:Ledger 'policy')
+    if($script:RootSharing -cne $script:RequestedSharing){throw 'Selected policy differs from its owned root.'}
     $guard=[IO.File]::Open((Join-Path $script:Results 'native-attempt.lock'),[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None);$guard.Dispose()
     Assert-InboxToken $script:Ledger.token (Get-InboxToken)
     if((ConvertTo-Json (Get-InboxSettings) -Depth 12 -Compress) -cne (ConvertTo-Json $script:Ledger.settings -Depth 12 -Compress)){throw 'SMB settings changed after preflight.'}
@@ -693,7 +737,7 @@ function Invoke-InboxRun {
         $script:Ledger.child.pid=$child.PID;$script:Ledger.child.start_utc=$child.StartUTC;Save-InboxLedger
         $directory=@($script:Ledger.directories | Where-Object{$_.path -ceq $script:Ledger.root_local})
         if($directory.Count -ne 1){throw 'The share-root identity is not unique.'}
-        Send-InboxEnvelope $child ([ordered]@{kind='start';stage=0;nonce=$script:Ledger.nonce;source_sha=$script:Ledger.source_sha;executable_sha256=$script:Ledger.executable_sha256;parent_pid=$PID;computer=$script:Ledger.computer;root_local=$script:Ledger.root_local;share_unc=$script:Ledger.share_unc;drive=$script:Ledger.drive;expected_token=$script:Ledger.token;directory=$directory[0];cache_seconds=[ordered]@{file=10;directory=10;not_found=5};output_root=$script:Results})
+        Send-InboxEnvelope $child ([ordered]@{kind='start';stage=0;policy=$script:Ledger.policy;nonce=$script:Ledger.nonce;source_sha=$script:Ledger.source_sha;executable_sha256=$script:Ledger.executable_sha256;parent_pid=$PID;computer=$script:Ledger.computer;root_local=$script:Ledger.root_local;share_unc=$script:Ledger.share_unc;drive=$script:Ledger.drive;expected_token=$script:Ledger.token;directory=$directory[0];cache_seconds=[ordered]@{file=10;directory=10;not_found=5};output_root=$script:Results})
         while($true){
             $line=$child.NextLine()
             if($null -eq $line){break}
@@ -710,7 +754,7 @@ function Invoke-InboxRun {
             if(-not $mapping.logical -or $mapping.unc -cne $script:Ledger.share_unc -or [string]::IsNullOrEmpty($mapping.device)){throw 'Native mapping has no exact read-back binding.'}
             if($null -eq $script:Ledger.mapping){$script:Ledger.mapping=$mapping;Save-InboxLedger}elseif((ConvertTo-Json $mapping -Compress) -cne (ConvertTo-Json $script:Ledger.mapping -Compress)){throw 'Owned mapping fingerprint changed between stages.'}
             $origin=Get-InboxOrigin $script:Ledger $stage
-            Send-InboxEnvelope $child ([ordered]@{kind='admit';stage=$stage;nonce=$script:Ledger.nonce;pid=$child.PID;executable_sha256=$script:Ledger.executable_sha256;origin=$origin})
+            Send-InboxEnvelope $child ([ordered]@{kind='admit';stage=$stage;policy=$script:Ledger.policy;nonce=$script:Ledger.nonce;pid=$child.PID;executable_sha256=$script:Ledger.executable_sha256;origin=$origin})
             $stage++
         }
         if($null -eq $terminal){throw 'Native process ended without a terminal result.'}
@@ -719,7 +763,13 @@ function Invoke-InboxRun {
         if((Get-Item -LiteralPath $nativePath).Length -gt 131072 -or (Get-InboxSHA256 $nativePath) -cne $terminal.receipt_sha256){throw 'Native result receipt hash or size differs.'}
         $native=ConvertFrom-Json ([IO.File]::ReadAllText($nativePath)) -AsHashtable -Depth 32
         if($native.Request.nonce -cne $script:Ledger.nonce -or $native.Request.source_sha -cne $script:Ledger.source_sha -or $native.PID -ne $child.PID -or $native.ExecutableSHA256 -cne $script:Ledger.executable_sha256 -or $native.Outcome -cne $terminal.outcome -or $native.MechanismTraceComplete){throw 'Native receipt owner or outcome differs.'}
-        if($stage -ne 3 -or -not $terminal.cleanup_complete -or $terminal.outcome -cne 'native_behavior_pass'){throw 'Native reference did not produce a complete passing behavior result.'}
+        Assert-InboxPolicy $script:Ledger.policy (Get-InboxRequired $native.Request 'policy')
+        Assert-InboxPolicy $script:Ledger.policy (Get-InboxRequired $native 'Policy')
+        $opened=Get-InboxRequired $native 'ApplicationOpen'
+        Assert-InboxPolicy $script:Ledger.policy ([ordered]@{application_sharing=$script:Ledger.policy.application_sharing;cell=$script:Ledger.policy.cell;application_access=Get-InboxRequired $opened 'requested_access';application_share=Get-InboxRequired $opened 'requested_share'})
+        if($opened.attempted -isnot [bool] -or -not $opened.attempted -or $opened.succeeded -isnot [bool] -or -not $opened.succeeded -or $opened.error -isnot [string] -or $opened.error -cne ''){throw 'Native application-open observation differs from the selected policy.'}
+        $success=if($script:RequestedSharing -ceq 'original'){'native_behavior_pass'}else{'share_write_control_native_behavior_pass'}
+        if((Get-InboxRequired $native 'NativeOutcome') -cne 'native_behavior_pass' -or $stage -ne 3 -or -not $terminal.cleanup_complete -or $terminal.outcome -cne $success){throw 'Native reference did not produce a complete passing behavior result.'}
     } catch {$primary=$_.Exception.Message;$script:Ledger.errors+=,$primary}
     finally {
         if($null -ne $child){
@@ -736,13 +786,21 @@ function Invoke-InboxRun {
         }
         Save-InboxLedger
         try {Remove-InboxResources} catch {$script:Ledger.cleanup_complete=$false;$script:Ledger.cleanup_errors+=,$_.Exception.Message;Save-InboxLedger}
-        Write-InboxJSON (Join-Path $script:Results 'controller-result.json') ([ordered]@{source_sha=$script:Ledger.source_sha;nonce=$script:Ledger.nonce;candidate=$terminal;child=$script:Ledger.child;errors=$script:Ledger.errors;cleanup_errors=$script:Ledger.cleanup_errors;cleanup_complete=$script:Ledger.cleanup_complete;mechanism_trace_complete=$false})
+        Write-InboxJSON (Join-Path $script:Results 'controller-result.json') ([ordered]@{policy=$script:Ledger.policy;source_sha=$script:Ledger.source_sha;nonce=$script:Ledger.nonce;candidate=$terminal;child=$script:Ledger.child;errors=$script:Ledger.errors;cleanup_errors=$script:Ledger.cleanup_errors;cleanup_complete=$script:Ledger.cleanup_complete;mechanism_trace_complete=$false})
     }
     if($script:Ledger.errors.Count -ne 0 -or $script:Ledger.cleanup_errors.Count -ne 0 -or -not $script:Ledger.cleanup_complete){throw 'Inbox reference failed; original observations and cleanup errors are preserved.'}
 }
 function Invoke-InboxVerify {
-    if(-not (Test-Path -LiteralPath $script:LedgerPath)){Write-InboxJSON (Join-Path $script:Results 'cleanup-audit.json') ([ordered]@{ledger_present=$false;cleanup_complete=$false;mechanism_trace_complete=$false});throw 'No ownership ledger exists for cleanup verification.'}
-    $script:Ledger=Read-InboxLedger
+    $candidates=[Collections.Generic.List[string]]::new()
+    foreach($sharing in @('original','write-only')){if(Test-Path -LiteralPath (Join-Path (Get-InboxPolicyRoot $sharing) 'results/ownership.json')){$candidates.Add($sharing)}}
+    if($candidates.Count -ne 1){
+        Write-InboxJSON (Join-Path $script:Results 'cleanup-audit.json') ([ordered]@{requested_application_sharing=$script:RequestedSharing;ledger_candidates=@($candidates);cleanup_complete=$false;mechanism_trace_complete=$false})
+        throw 'Cleanup requires exactly one owned ledger across the two fixed roots.'
+    }
+    $script:Ledger=Read-InboxLedger $candidates[0]
+    Set-InboxPolicyRoot $candidates[0]
+    if($script:RequestedSharing -cne $script:RootSharing){$script:Ledger.errors+=,'Requested application sharing differs from the actual owned root.'}
+    try{Assert-InboxPolicy (Get-InboxPolicy $script:RootSharing) (Get-InboxRequired $script:Ledger 'policy')}catch{$script:Ledger.errors+=,"Recorded application policy is invalid: $($_.Exception.Message)"}
     try {
         Remove-InboxResources
         if((ConvertTo-Json (Get-InboxSettings) -Depth 12 -Compress) -cne (ConvertTo-Json $script:Ledger.settings -Depth 12 -Compress)){throw 'SMB settings differ from their recorded unchanged baseline.'}
@@ -751,7 +809,8 @@ function Invoke-InboxVerify {
         if($drive.logical -or $null -ne $drive.device -or $null -ne $drive.unc){throw 'Selected drive is not absent after cleanup.'}
         if(Test-Path -LiteralPath $script:Ledger.owned_root){throw 'Owned directory remains after cleanup.'}
     } catch {$script:Ledger.cleanup_complete=$false;$script:Ledger.cleanup_errors+=,$_.Exception.Message;Save-InboxLedger}
-    Write-InboxJSON (Join-Path $script:Results 'cleanup-audit.json') ([ordered]@{child=$script:Ledger.child;cleanup_complete=$script:Ledger.cleanup_complete;errors=$script:Ledger.errors;cleanup_errors=$script:Ledger.cleanup_errors;mechanism_trace_complete=$false})
+    Save-InboxLedger
+    Write-InboxJSON (Join-Path $script:Results 'cleanup-audit.json') ([ordered]@{requested_application_sharing=$script:RequestedSharing;root_application_sharing=$script:RootSharing;policy=Get-InboxPolicy $script:RootSharing;recorded_policy_present=$script:Ledger.Contains('policy');child=$script:Ledger.child;cleanup_complete=$script:Ledger.cleanup_complete;errors=$script:Ledger.errors;cleanup_errors=$script:Ledger.cleanup_errors;mechanism_trace_complete=$false})
     if($script:Ledger.errors.Count -ne 0 -or $script:Ledger.cleanup_errors.Count -ne 0 -or -not $script:Ledger.cleanup_complete){throw 'Reference or cleanup failure remains unresolved; an empty snapshot cannot erase it.'}
 }
 
@@ -780,6 +839,7 @@ function Assert-InboxSource {
 }
 
 try {
+    Set-InboxPolicyRoot $script:RequestedSharing
     Initialize-InboxScratch
     if(-not $IsWindows){throw 'The native controller requires Windows PowerShell 7.'}
     Initialize-InboxNative
@@ -792,7 +852,7 @@ try {
     }
 } catch {
     if(Test-Path -LiteralPath $script:Results){
-        Write-InboxJSON (Join-Path $script:Results ("controller-$($Phase.ToLowerInvariant())-failure.json")) ([ordered]@{phase=$Phase;error=$_.Exception.Message;mechanism_trace_complete=$false})
+        Write-InboxJSON (Join-Path $script:Results ("controller-$($Phase.ToLowerInvariant())-failure.json")) ([ordered]@{phase=$Phase;requested_application_sharing=$script:RequestedSharing;root_application_sharing=$script:RootSharing;error=$_.Exception.Message;mechanism_trace_complete=$false})
     }
     Write-Error $_
     exit 1

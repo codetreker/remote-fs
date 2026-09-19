@@ -27,10 +27,15 @@ type sourceReceipt struct {
 	Declarations         []declarationReceipt
 }
 type generationReceipt struct {
-	Prototype       string
-	Sources         []sourceReceipt
-	Outputs         map[string]string
-	BodiesRewritten bool
+	Policy                generationPolicy
+	NativeEntry           string
+	Transformations       []transformationReceipt
+	ReusedBodiesRewritten bool
+	InverseASTVerified    bool
+	Prototype             string
+	Sources               []sourceReceipt
+	Outputs               map[string]string
+	BodiesRewritten       bool
 }
 
 var selections = []selection{
@@ -77,11 +82,12 @@ func main() {
 	root := flag.String("root", "", "exact checked-out source root")
 	prototype := flag.String("prototype", "", "read-only pinned utility checkout")
 	output := flag.String("output", "", "new empty fixture directory under the task temporary directory")
+	policy := flag.String("application-sharing", "original", "original or write-only application directory sharing")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		fail(errors.New("unexpected positional arguments"))
 	}
-	if err := generate(*root, *prototype, *output); err != nil {
+	if err := generatePolicy(*root, *prototype, *output, *policy); err != nil {
 		fail(err)
 	}
 }
@@ -129,10 +135,16 @@ func noLinks(path string) error {
 }
 
 func generate(root, prototype, output string) error {
+	return generatePolicy(root, prototype, output, "original")
+}
+func generatePolicy(root, prototype, output, sharing string) error {
+	selected, err := generationSelection(sharing)
+	if err != nil {
+		return err
+	}
 	if root == "" || prototype == "" || output == "" {
 		return errors.New("root, prototype and output are required")
 	}
-	var err error
 	root, err = filepath.Abs(root)
 	if err != nil {
 		return err
@@ -145,7 +157,7 @@ func generate(root, prototype, output string) error {
 	if err != nil {
 		return err
 	}
-	task := filepath.Join(root, ".tmp", "native-inbox-reference")
+	task := filepath.Join(root, ".tmp", selected.Root)
 	if !contained(filepath.Join(root, ".tmp"), prototype) || !contained(task, output) {
 		return errors.New("prototype or output is outside the owned temporary trees")
 	}
@@ -164,7 +176,7 @@ func generate(root, prototype, output string) error {
 	var portable, windows bytes.Buffer
 	portable.WriteString(portableHeader)
 	windows.WriteString(windowsHeader)
-	receipt := generationReceipt{Prototype: "1cb9ad7f49d998de4daa4d562d766b18cf06ce16", Outputs: map[string]string{}}
+	receipt := generationReceipt{Policy: selected.Policy, NativeEntry: selected.Entry, BodiesRewritten: true, InverseASTVerified: true, Prototype: "1cb9ad7f49d998de4daa4d562d766b18cf06ce16", Outputs: map[string]string{}}
 	for _, item := range selections {
 		origin := root
 		if item.Origin == "prototype" {
@@ -201,7 +213,7 @@ func generate(root, prototype, output string) error {
 		}
 		outputs[name] = formatted
 	}
-	for _, item := range []struct{ source, destination string }{{"native-smb-inbox-reference_test.go.txt", "reference_windows_test.go"}, {"native-smb-inbox-reference-controls_test.go.txt", "reference_controls_test.go"}} {
+	for _, item := range []struct{ source, destination string }{{"native-smb-inbox-reference_test.go.txt", "reference_windows_test.go"}, {"native-smb-inbox-reference-controls_test.go.txt", "reference_controls_test.go"}, {"native-smb-inbox-sharing-controls_test.go.txt", "sharing_controls_test.go"}} {
 		path := filepath.Join(".github", "scripts", item.source)
 		data, err := canonical(filepath.Join(root, path))
 		if err != nil {
@@ -217,16 +229,26 @@ func generate(root, prototype, output string) error {
 		if item.destination == "reference_windows_test.go" && !bytes.HasPrefix(data, []byte("//go:build windows\n")) {
 			return errors.New("native reference lacks its Windows build constraint")
 		}
-		if item.destination == "reference_controls_test.go" && bytes.Contains(data, []byte("//go:build")) {
+		if item.destination != "reference_windows_test.go" && bytes.Contains(data, []byte("//go:build")) {
 			return errors.New("portable controls cannot be platform excluded")
+		}
+		original := data
+		if item.destination != "sharing_controls_test.go" {
+			var changes []transformationReceipt
+			data, changes, err = transformReference(data, item.destination, selected)
+			if err != nil {
+				return err
+			}
+			receipt.Transformations = append(receipt.Transformations, changes...)
 		}
 		formatted, err := format.Source(data)
 		if err != nil {
 			return err
 		}
 		outputs[item.destination] = formatted
-		receipt.Sources = append(receipt.Sources, sourceReceipt{Origin: "checkout", Path: filepath.ToSlash(path), SHA256: digest(data)})
+		receipt.Sources = append(receipt.Sources, sourceReceipt{Origin: "checkout", Path: filepath.ToSlash(path), SHA256: digest(original)})
 	}
+	outputs["sharing_policy_test.go"] = []byte(fmt.Sprintf("package windows\n\nconst inboxCompiledSharing = %q\n", sharing))
 	outputs["go.mod"] = []byte("module github.com/codetreker/remote-fs/inbox-reference\n\ngo 1.26.0\n\nrequire golang.org/x/sys v0.47.0\n")
 	outputs["go.sum"] = []byte("golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=\ngolang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=\n")
 	for name, data := range outputs {
@@ -349,4 +371,326 @@ func extract(data []byte, path string, names []string, destination string, out *
 		}
 	}
 	return receipts, nil
+}
+
+type generationPolicy struct {
+	ApplicationSharing string `json:"application_sharing"`
+	Cell               string `json:"cell"`
+	ApplicationAccess  uint32 `json:"application_access"`
+	ApplicationShare   uint32 `json:"application_share"`
+}
+type generationChoice struct {
+	Policy             generationPolicy
+	Root, Entry, Share string
+}
+
+func generationSelection(name string) (generationChoice, error) {
+	switch name {
+	case "original":
+		return generationChoice{generationPolicy{"original", "inbox-reference", 1, 0}, "native-inbox-reference", "TestNativeInboxReference", "0"}, nil
+	case "write-only":
+		return generationChoice{generationPolicy{"write-only", "inbox-share-write", 1, 2}, "native-inbox-share-write", "TestNativeInboxShareWriteControl", "win.FILE_SHARE_WRITE"}, nil
+	default:
+		return generationChoice{}, errors.New("unknown application sharing policy")
+	}
+}
+
+type transformationReceipt struct {
+	Source, Declaration, Action                           string
+	BeforeSHA256, AfterSHA256                             string
+	OriginalDeclarationSHA256, GeneratedDeclarationSHA256 string
+}
+type referenceEdit struct {
+	start, end                 int
+	before, after, decl, label string
+}
+
+func astText(node ast.Node) string {
+	var out bytes.Buffer
+	if err := format.Node(&out, token.NewFileSet(), node); err != nil {
+		panic(err)
+	}
+	return out.String()
+}
+func referenceTree(data []byte) (*ast.File, *token.FileSet, error) {
+	fs := token.NewFileSet()
+	tree, err := parser.ParseFile(fs, "reference.go", data, parser.ParseComments)
+	return tree, fs, err
+}
+func transformReference(data []byte, path string, choice generationChoice) ([]byte, []transformationReceipt, error) {
+	expected := "41f003a9fd9db393bdcea0d8a26511c22b038da1208eb3b0019aad87bfeca35f"
+	native := path == "reference_windows_test.go"
+	if native {
+		expected = "a96de8aadbd8d3ba6013fa3db3669a5345ab3467a285331b1d487b898e5a8b63"
+	}
+	if digest(data) != expected {
+		return nil, nil, fmt.Errorf("frozen reference template differs: %s", path)
+	}
+	tree, fs, err := referenceTree(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	funcs := map[string]*ast.FuncDecl{}
+	types := map[string]*ast.TypeSpec{}
+	for _, decl := range tree.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Recv == nil {
+				funcs[d.Name.Name] = d
+			}
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				if typ, ok := spec.(*ast.TypeSpec); ok {
+					types[typ.Name.Name] = typ
+				}
+			}
+		}
+	}
+	var edits []referenceEdit
+	add := func(decl, label string, start, end token.Pos, after string) {
+		a, b := fs.Position(start).Offset, fs.Position(end).Offset
+		edits = append(edits, referenceEdit{a, b, string(data[a:b]), after, decl, label})
+	}
+	statement := func(name, want string) (ast.Stmt, error) {
+		anchor, _, parseErr := referenceTree([]byte("package p\nfunc anchor(){" + want + "\n}"))
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		want = astText(anchor.Decls[0].(*ast.FuncDecl).Body.List[0])
+		fn := funcs[name]
+		if fn == nil {
+			return nil, fmt.Errorf("missing function %s", name)
+		}
+		var found ast.Stmt
+		count := 0
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			if stmt, ok := node.(ast.Stmt); ok && astText(stmt) == want {
+				found = stmt
+				count++
+			}
+			return true
+		})
+		if count != 1 {
+			return nil, fmt.Errorf("statement anchor %s: found %d for %q", name, count, want)
+		}
+		return found, nil
+	}
+	after := func(name, want, label, code string) error {
+		stmt, err := statement(name, want)
+		if err != nil {
+			return err
+		}
+		add(name, label, stmt.End(), stmt.End(), "\n"+code)
+		return nil
+	}
+	field := func(name, code string) error {
+		typ := types[name]
+		if typ == nil {
+			return fmt.Errorf("missing type %s", name)
+		}
+		body, ok := typ.Type.(*ast.StructType)
+		if !ok {
+			return fmt.Errorf("not a struct: %s", name)
+		}
+		add(name, "policy/evidence fields", body.Fields.Closing, body.Fields.Closing, "\n"+code+"\n")
+		return nil
+	}
+	composite := func(fnName, typeName, code string) error {
+		fn := funcs[fnName]
+		if fn == nil {
+			return fmt.Errorf("missing function %s", fnName)
+		}
+		var found *ast.CompositeLit
+		count := 0
+		ast.Inspect(fn, func(node ast.Node) bool {
+			if lit, ok := node.(*ast.CompositeLit); ok && astText(lit.Type) == typeName {
+				found = lit
+				count++
+			}
+			return true
+		})
+		if count != 1 {
+			return fmt.Errorf("composite anchor %s/%s: %d", fnName, typeName, count)
+		}
+		add(fnName, "policy/evidence initialization", found.Lbrace+1, found.Lbrace+1, code)
+		return nil
+	}
+	guard := func(name, code string) error {
+		fn := funcs[name]
+		if fn == nil {
+			return fmt.Errorf("missing function %s", name)
+		}
+		add(name, "policy admission", fn.Body.Lbrace+1, fn.Body.Lbrace+1, "\n"+code+"\n")
+		return nil
+	}
+	if native {
+		if err = guard("TestNativeInboxReference", `if err := inboxRequireSelectedPolicy(os.Getenv("RFS_INBOX_APPLICATION_SHARING")); err != nil { t.Fatal(err) }`); err != nil {
+			return nil, nil, err
+		}
+		if err = composite("TestNativeInboxReference", "inboxReceipt", `Policy: s.Policy, SourceOpenResult: inboxReturnedErrorEvidence{State:"not_attempted"}, RenameResult: inboxReturnedErrorEvidence{State:"not_attempted"},`); err != nil {
+			return nil, nil, err
+		}
+		if err = composite("inboxStage", "inboxEnvelope", `Policy:s.Policy,`); err != nil {
+			return nil, nil, err
+		}
+		app, err := statement("inboxNativeCell", "app, err := cacheGateSharingOpen(t, s.ShareUNC+`\\v`, win.FILE_LIST_DIRECTORY, 0, true)")
+		if err != nil {
+			return nil, nil, err
+		}
+		assign := app.(*ast.AssignStmt)
+		call := assign.Rhs[0].(*ast.CallExpr)
+		if len(call.Args) != 5 || astText(call.Args[3]) != "0" {
+			return nil, nil, errors.New("application share anchor differs")
+		}
+		if choice.Policy.ApplicationSharing == "write-only" {
+			add("inboxNativeCell", "application ShareAccess 0 to FILE_SHARE_WRITE", call.Args[3].Pos(), call.Args[3].End(), choice.Share)
+		}
+		add("inboxNativeCell", "application actual returned call evidence", app.End(), app.End(), "\nr.ApplicationOpen = inboxApplicationResult(win.FILE_LIST_DIRECTORY, "+choice.Share+", err)")
+		if err = after("inboxNativeCell", `inboxRecord(r, "mutator_open", start, err)`, "source-open returned errno", `r.SourceOpenResult = inboxReturnedError(err)`); err != nil {
+			return nil, nil, err
+		}
+		if err = after("inboxNativeCell", `inboxRecord(r, "rename_flags3", start, renameErr)`, "rename returned errno before close", `r.RenameResult = inboxReturnedError(renameErr)`); err != nil {
+			return nil, nil, err
+		}
+		stmt, err := statement("TestNativeInboxReference", `r.Outcome = inboxClassify(&r, a, b)`)
+		if err != nil {
+			return nil, nil, err
+		}
+		add("TestNativeInboxReference", "separate native and policy outcome", stmt.Pos(), stmt.End(), "r.NativeOutcome = inboxClassify(&r, a, b)\nr.Outcome = inboxPolicyOutcome(r.Policy, r.NativeOutcome)")
+		comparison := `if envelope.Outcome != "native_behavior_pass" {\n\tt.Errorf("inbox reference: %s: %s; native=%s", envelope.Outcome, envelope.Error, r.NativeOracle)\n}`
+		comparison = strings.ReplaceAll(comparison, `\n`, "\n")
+		comparison = strings.ReplaceAll(comparison, `\t`, "\t")
+		stmt, err = statement("TestNativeInboxReference", comparison)
+		if err != nil {
+			return nil, nil, err
+		}
+		branch := stmt.(*ast.IfStmt)
+		condition := branch.Cond.(*ast.BinaryExpr)
+		add("TestNativeInboxReference", "selected exact success", condition.Y.Pos(), condition.Y.End(), "inboxSelectedSuccess()")
+		stmt, err = statement("TestNativeInboxReference", `envelope.Outcome = "receipt_failure"`)
+		if err != nil {
+			return nil, nil, err
+		}
+		add("TestNativeInboxReference", "selected receipt failure outcome", stmt.Pos(), stmt.End(), `envelope.Outcome = inboxPolicyOutcome(s.Policy, "receipt_failure")`)
+		if choice.Entry != "TestNativeInboxReference" {
+			fn := funcs["TestNativeInboxReference"]
+			add(fn.Name.Name, "selected native entry", fn.Name.Pos(), fn.Name.End(), choice.Entry)
+		}
+	} else {
+		for _, name := range []string{"inboxStart", "inboxAdmission", "inboxEnvelope"} {
+			if err = field(name, "Policy inboxSharingPolicy `json:\"policy\"`"); err != nil {
+				return nil, nil, err
+			}
+		}
+		if err = field("inboxReceipt", "Policy inboxSharingPolicy\nApplicationOpen inboxApplicationOpen\nSourceOpenResult, RenameResult inboxReturnedErrorEvidence\nNativeOutcome string"); err != nil {
+			return nil, nil, err
+		}
+		if err = guard("inboxValidateStart", `if err := inboxValidatePolicy(s.Policy, inboxCompiledPolicy()); err != nil { return err }`); err != nil {
+			return nil, nil, err
+		}
+		if err = guard("inboxValidateAdmission", `if err := inboxValidatePolicy(s.Policy, inboxCompiledPolicy()); err != nil { return err }; if err := inboxValidatePolicy(a.Policy, s.Policy); err != nil { return err }`); err != nil {
+			return nil, nil, err
+		}
+		if err = composite("inboxTestStart", "inboxStart", `Policy:inboxCompiledPolicy(),`); err != nil {
+			return nil, nil, err
+		}
+		if err = composite("inboxTestAdmission", "inboxAdmission", `Policy:s.Policy,`); err != nil {
+			return nil, nil, err
+		}
+	}
+	return applyReferenceEdits(data, path, edits, choice)
+}
+func applyReferenceEdits(data []byte, path string, edits []referenceEdit, choice generationChoice) ([]byte, []transformationReceipt, error) {
+	slices.SortFunc(edits, func(a, b referenceEdit) int {
+		if a.start < b.start {
+			return -1
+		}
+		if a.start > b.start {
+			return 1
+		}
+		return a.end - b.end
+	})
+	var out bytes.Buffer
+	cursor := 0
+	var reverse []referenceEdit
+	for _, edit := range edits {
+		if edit.start < cursor || edit.end < edit.start || edit.end > len(data) || string(data[edit.start:edit.end]) != edit.before {
+			return nil, nil, errors.New("overlapping or invalid reference edit")
+		}
+		out.Write(data[cursor:edit.start])
+		start := out.Len()
+		out.WriteString(edit.after)
+		reverse = append(reverse, referenceEdit{start, out.Len(), edit.after, edit.before, edit.decl, edit.label})
+		cursor = edit.end
+	}
+	out.Write(data[cursor:])
+	generated := out.Bytes()
+	restored := append([]byte(nil), generated...)
+	for i := len(reverse) - 1; i >= 0; i-- {
+		edit := reverse[i]
+		if string(restored[edit.start:edit.end]) != edit.before {
+			return nil, nil, errors.New("inverse reference edit differs")
+		}
+		restored = append(append(append([]byte(nil), restored[:edit.start]...), []byte(edit.after)...), restored[edit.end:]...)
+	}
+	originalTree, _, err := referenceTree(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	inverseTree, _, err := referenceTree(restored)
+	if err != nil {
+		return nil, nil, err
+	}
+	if astText(originalTree) != astText(inverseTree) {
+		return nil, nil, errors.New("inverse AST differs from frozen template")
+	}
+	generatedTree, _, err := referenceTree(generated)
+	if err != nil {
+		return nil, nil, err
+	}
+	formatted, err := format.Source(generated)
+	if err != nil {
+		return nil, nil, err
+	}
+	formattedTree, _, err := referenceTree(formatted)
+	if err != nil {
+		return nil, nil, err
+	}
+	if astText(generatedTree) != astText(formattedTree) {
+		return nil, nil, errors.New("emitted AST differs from inverse-verified source")
+	}
+	declHash := func(tree *ast.File, name string) (string, error) {
+		for _, decl := range tree.Decls {
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				if d.Recv == nil && d.Name.Name == name {
+					return digest([]byte(astText(d))), nil
+				}
+			case *ast.GenDecl:
+				for _, spec := range d.Specs {
+					if typ, ok := spec.(*ast.TypeSpec); ok && typ.Name.Name == name {
+						return digest([]byte(astText(typ))), nil
+					}
+				}
+			}
+		}
+		return "", fmt.Errorf("missing transformed declaration %s", name)
+	}
+	var receipts []transformationReceipt
+	for _, edit := range edits {
+		before, err := declHash(originalTree, edit.decl)
+		if err != nil {
+			return nil, nil, err
+		}
+		name := edit.decl
+		if name == "TestNativeInboxReference" {
+			name = choice.Entry
+		}
+		after, err := declHash(generatedTree, name)
+		if err != nil {
+			return nil, nil, err
+		}
+		receipts = append(receipts, transformationReceipt{path, edit.decl, edit.label, digest([]byte(edit.before)), digest([]byte(edit.after)), before, after})
+	}
+	return formatted, receipts, nil
 }
