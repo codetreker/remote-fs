@@ -303,7 +303,16 @@ func TestGlobalSessionQuotaIncludesRetiringFrames(t *testing.T) {
 	old, previous := registryAuthenticatedConnection(t)
 	old.server.config.Limits.MaxSessions = 2
 	current := registryConnection(t, old.server)
+	previous.identityMu.RLock()
+	key := previous.signer
+	previous.identityMu.RUnlock()
+	response := wire.EncodeResponse(wire.Header{Command: wire.Read, MessageID: 77, SessionID: previous.id}, wire.EmptyResponseBody())
+	if err := key.Sign(response); err != nil {
+		t.Fatal(err)
+	}
+	old.mu.Lock()
 	old.pending[77] = &pendingRequest{frame: 77, command: wire.Read, sessionID: previous.id, ctx: t.Context(), cancel: func() {}}
+	old.mu.Unlock()
 	header, status, _ := registrySetup(t, t.Context(), current, 0, 78, previous.id, 0, 0, "proof")
 	if status != statusOK {
 		t.Fatalf("replace = %x", status)
@@ -315,7 +324,16 @@ func TestGlobalSessionQuotaIncludesRetiringFrames(t *testing.T) {
 	if old.server.sessions.get(previous.id).session != previous {
 		t.Fatal("previous owner disappeared before its response")
 	}
+	if err := key.Verify(response); err != nil {
+		t.Fatalf("pending response lost its signing key: %v", err)
+	}
 	old.retireRequests([]wire.Request{{Header: wire.Header{MessageID: 77}}})
+	if old.server.sessions.get(previous.id).session != nil {
+		t.Fatal("completed response retained its previous owner")
+	}
+	if err := key.Verify(response); !errors.Is(err, signing.ErrDestroyed) {
+		t.Fatalf("completed response signing key: %v", err)
+	}
 	if _, status, _ := registrySetup(t, t.Context(), third, 0, 2, 0, 0, 0, "proof"); status != statusOK {
 		t.Fatalf("completed response retained server quota: %x", status)
 	}

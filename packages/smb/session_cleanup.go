@@ -331,10 +331,11 @@ func (c *connection) finishSessionRetirement(s *session) {
 }
 func (c *connection) retireSessionRequests(s *session, except requestFrame) {
 	s.mu.Lock()
+	// Retirement and frame enrollment must become visible together to pruning.
+	// The session-to-connection lock order also matches authentication finalization.
+	c.mu.Lock()
 	s.retired = true
 	s.mu.Unlock()
-	s.stopAuthenticationWatcher()
-	c.mu.Lock()
 	s.retirementMu.Lock()
 	if s.retiringFrames == nil {
 		s.retiringFrames = make(map[requestFrame]struct{})
@@ -351,4 +352,5 @@ func (c *connection) retireSessionRequests(s *session, except requestFrame) {
 	}
 	s.retirementMu.Unlock()
 	c.mu.Unlock()
+	s.stopAuthenticationWatcher()
 }
