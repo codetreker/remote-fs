@@ -554,7 +554,19 @@ Hnew/HA 的同 volume opaque 身份、原 HA 稳定、B769/A257 字节、冷 B�
 
 [被动归属/顺序检查](../.github/scripts/native-smb-early-capability-wire_test.go.txt)要求 root Fs5 回复、helper 完成退出、父 HA API-begin marker、实际 HA CREATE 按同一全局序号排序。helper root、仍活跃的 watcher、HA/Hnew 必须共用实际 connection/session/effective TreeID 和正确 share/volume；token 相同不能替代这些证据。可使用系统真实复用的已知 root server-open，不制造新 handle；RELATED 和 async 的归属从已核对的请求/前序解析，raw 字段仍保留。Fs5 不含 serial，不补造它；任何 bootstrap A/B 请求或 enumeration 都使 no-warming 资格失败。
 
-后续 opaque 身份、HA 稳定/Hnew 不同、A257/B769 字节、完整 DETAIL/历史证明、原 ACK+一秒/最早 TTL 和 cleanup 均保持。64 个本地根普通/race 各 542 verdict 通过，八项因果负向对照、二十六项脚本策略和五种 ARM64 构建有绑定收据，四个旧分支的原输入与 native-call 序列保持。Linux 控制确实运行子进程 supervisor 与精确提取 parser，但 NtQuery/token/CreateFile Windows 入口及内核 PENDING 取消仍未原生执行；新单项没有身份效果或生产修复结论。
+后续 opaque 身份、HA 稳定/Hnew 不同、A257/B769 字节、完整 DETAIL/历史证明、原 ACK+一秒/最早 TTL 和 cleanup 均保持。64 个本地根普通/race 各 542 verdict 通过，八项因果负向对照、二十六项脚本策略和五种 ARM64 构建有绑定收据，四个旧分支的原输入与 native-call 序列保持。Linux 控制实际运行子进程 supervisor 与精确提取 parser。
+
+[原生单项 35437559379](https://github.com/codetreker/remote-fs/actions/runs/35437559379)已取得真实 root Fs5=0x406 < helper 成功退出 < HA API 的全局顺序（34<36<38），同一 connection/session/tree/token、冷 B、精确 DETAIL、历史、oracle 与清理均合格。542 个控制 verdict 通过，单项仍为 replacement_identity_aliased：初始 HA、新 Hnew、保留 HA 的 native FileIndex 均为 3，A257/B769 字节正确，新 CREATE 未请求或返回 QFid。全部身份/字节检查在 ACK 后 37.1918 ms、最早 TTL 前完成；这是合格首样本身份失败，不是超过一秒的陈旧证明。该执行覆盖 Windows Nt 终态成功和实际进程退出，不证明 PENDING/内核取消行为，也不确定内部 FCB 机制或生产修复。
+
+### pre-HA 能力与新 QFid 的交互实验
+
+[独立工作流](../.github/workflows/native-smb-early-qfid-interaction.yml)只运行 `TestNativeEarlyQFidInteraction/share0_app_first_replace_identity_early_qfid`。显式 BootstrapPolicy=before-ha-qfid 必须配合 posix-unlink-rename、always-truthful 与 InteractionPolicy=posix-qfid；原 before-ha 仍是 requested-only 独立分支。既有进程 helper/collector 和 QFid→POSIX 补丁不变，原十秒执行加五秒清理、实际进程完成及原生调用序列保持。
+
+[联合检查](../.github/scripts/native-smb-early-qfid-interaction_test.go.txt)同时要求已完成的 pre-HA root Fs5=0x406 证据和首个新 CREATE 未请求但实际收到真实 B/volume QFid 的证据。nonce、root、PID/token/executable、有界完整 receipt、成功 exit 0 均核对；PENDING、forced、未知退出或仍保留拥有权禁止继续。两组被动证据绑定同一实际 HA/Hnew、connection/session/tree 和独立 volume，保留各自的源事实、进程错误与原生 oracle；任何一组不合格都不能由另一组补足。
+
+原 first-open、HA 稳定/Hnew 不同、opaque 身份和 A257/B769 字节、精确 DETAIL、冷 B、一秒/最早 TTL 与清理保持，不增加原生查询。未请求 QFid 的符合性仍未确定，已完成的独立/组合失败保持原资格。该组合只检验一个固定原型的时序交互假设。
+
+本地适用控制 82 根，普通/race 各 635 verdict 通过；早期能力位拒绝与新 CREATE 未请求条件的两个隔离负向对照命中断言，三十三项完整脚本策略控制和六种 ARM64 配置构建通过。五个旧分支的准备结果及 254 份非测试 Go 输入保持。Linux 子进程 supervisor 和精确提取 parser 的执行与 Windows 适配入口的源码/构建检查分别归属；新组合尚未原生运行，不能从这些本地结果推导身份修复或当前生产缓存验收。
 
 ## 每次改动必须带什么
 

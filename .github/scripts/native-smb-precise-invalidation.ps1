@@ -8,7 +8,7 @@ param(
     [string]$FilesystemCapabilityPolicy = 'baseline',
     [ValidateSet('standalone', 'posix-qfid')]
     [string]$InteractionPolicy = 'standalone',
-    [ValidateSet('none', 'before-ha')]
+    [ValidateSet('none', 'before-ha', 'before-ha-qfid')]
     [string]$BootstrapPolicy = 'none'
 )
 
@@ -27,9 +27,12 @@ $InteractionPolicy = $InteractionPolicy.ToLowerInvariant()
 $env:RFS_INTERACTION_POLICY = $InteractionPolicy
 $BootstrapPolicy = $BootstrapPolicy.ToLowerInvariant()
 $env:RFS_CAPABILITY_BOOTSTRAP = $BootstrapPolicy
-$early = $BootstrapPolicy -eq 'before-ha'
+$earlyQFid = $BootstrapPolicy -eq 'before-ha-qfid'
+$early = $BootstrapPolicy -in @('before-ha', 'before-ha-qfid')
 $combined = $InteractionPolicy -eq 'posix-qfid'
-$policyError = if ($early -and ($FilesystemCapabilityPolicy -ne 'posix-unlink-rename' -or $IdentityContextPolicy -ne 'requested-only' -or $InteractionPolicy -ne 'standalone')) {
+$policyError = if ($earlyQFid -and ($FilesystemCapabilityPolicy -ne 'posix-unlink-rename' -or $IdentityContextPolicy -ne 'always-truthful' -or $InteractionPolicy -ne 'posix-qfid')) {
+    'The early QFid interaction requires POSIX capability and always-truthful QFid responses with the explicit combined policy.'
+} elseif ($BootstrapPolicy -eq 'before-ha' -and ($FilesystemCapabilityPolicy -ne 'posix-unlink-rename' -or $IdentityContextPolicy -ne 'requested-only' -or $InteractionPolicy -ne 'standalone')) {
     'The early bootstrap requires standalone POSIX capability and requested-only QFid responses.'
 } elseif ($combined -and ($FilesystemCapabilityPolicy -ne 'posix-unlink-rename' -or $IdentityContextPolicy -ne 'always-truthful')) {
     'The combined experiment requires POSIX capability and always-truthful QFid responses.'
@@ -206,6 +209,11 @@ if ($early) {
         $earlyGenerated += $target
     }
 }
+if ($earlyQFid) {
+    $target = Join-Path $testRoot 'gate_early_qfid_interaction_windows_test.go'
+    Copy-Item (Join-Path $PSScriptRoot 'native-smb-early-qfid-interaction_test.go.txt') $target
+    $earlyGenerated += $target
+}
 $authority = Join-Path $testRoot 'native_fixture_windows_test.go'
 $bridge = Join-Path $testRoot 'native_acceptance_windows_test.go'
 $files = Join-Path $testRoot 'native_files_windows_test.go'
@@ -243,7 +251,7 @@ if detailErr := preciseRequireDetail(outcome); detailErr != nil {
     return detailErr
 }
 '@
-$identityAudit = if ($early) { 'earlyCapabilityAudit' } else { 'preciseIdentityAudit' }
+$identityAudit = if ($earlyQFid) { 'earlyQFidInteractionAudit' } elseif ($early) { 'earlyCapabilityAudit' } else { 'preciseIdentityAudit' }
 Replace-Once $probe "report.Wire, report.WireNotify = records, results`n" "report.Wire, report.WireNotify = records, results`n$identityAudit(t, report)`n"
 if ($early) {
     Replace-Once $probe 'call := beginCall("open-old-target", path)' "earlyBootstrapBeforeHA(t, bridge, report, watch)`nearlyMarkHAAPIBegin()`ncall := beginCall(`"open-old-target`", path)"
@@ -270,12 +278,14 @@ $inputNames = @('native-smb-precise-invalidation.ps1', 'native-smb-precise-histo
 if ($IdentityContextPolicy -eq 'always-truthful') { $inputNames += @('native-smb-qfid-context.patch', 'native-smb-qfid-context-controls_test.go.txt') }
 if ($FilesystemCapabilityPolicy -eq 'posix-unlink-rename') { $inputNames += @('native-smb-posix-capability.patch', 'native-smb-posix-capability-controls_test.go.txt') }
 if ($early) { $inputNames += @('native-smb-early-capability-process_test.go.txt', 'native-smb-early-capability-wire_test.go.txt') }
+if ($earlyQFid) { $inputNames += 'native-smb-early-qfid-interaction_test.go.txt' }
 $inputs = @($inputNames | ForEach-Object { [ordered]@{ Path = ".github/scripts/$_"; CanonicalSHA256 = Canonical-Hash (Join-Path $PSScriptRoot $_) } })
 $inputs += [ordered]@{ Path = '.github/workflows/native-smb-precise-invalidation.yml'; CanonicalSHA256 = Canonical-Hash (Join-Path $workspace '.github/workflows/native-smb-precise-invalidation.yml') }
 if ($IdentityContextPolicy -eq 'always-truthful') { $inputs += [ordered]@{ Path = '.github/workflows/native-smb-qfid-invalidation.yml'; CanonicalSHA256 = Canonical-Hash (Join-Path $workspace '.github/workflows/native-smb-qfid-invalidation.yml') } }
 if ($FilesystemCapabilityPolicy -eq 'posix-unlink-rename') { $inputs += [ordered]@{ Path = '.github/workflows/native-smb-posix-capability.yml'; CanonicalSHA256 = Canonical-Hash (Join-Path $workspace '.github/workflows/native-smb-posix-capability.yml') } }
 if ($combined) { $inputs += [ordered]@{ Path = '.github/workflows/native-smb-posix-qfid-invalidation.yml'; CanonicalSHA256 = Canonical-Hash (Join-Path $workspace '.github/workflows/native-smb-posix-qfid-invalidation.yml') } }
 if ($early) { $inputs += [ordered]@{ Path = '.github/workflows/native-smb-early-capability-bootstrap.yml'; CanonicalSHA256 = Canonical-Hash (Join-Path $workspace '.github/workflows/native-smb-early-capability-bootstrap.yml') } }
+if ($earlyQFid) { $inputs += [ordered]@{ Path = '.github/workflows/native-smb-early-qfid-interaction.yml'; CanonicalSHA256 = Canonical-Hash (Join-Path $workspace '.github/workflows/native-smb-early-qfid-interaction.yml') } }
 Write-JSON 'precise-inputs.json' ([ordered]@{ SourceSHA = $env:RFS_PARENT_SOURCE_SHA; Mode = $Phase; Mechanism = 'historical_detail'; IdentityContextPolicy = $IdentityContextPolicy; FilesystemCapabilityPolicy = $FilesystemCapabilityPolicy; InteractionPolicy = $InteractionPolicy; BootstrapPolicy = $BootstrapPolicy; PriorControlRun = $(if ($FilesystemCapabilityPolicy -eq 'posix-unlink-rename' -or $IdentityContextPolicy -eq 'always-truthful') { '35423839239' } else { '35419230739' }); Files = $inputs; PatchSHA256 = $patchHash; PatchFiles = $patchFiles; QFidPatchSHA256 = $qfidPatchHash; QFidPatchFiles = $qfidFiles; PosixPatchSHA256 = $posixPatchHash; PosixPatchFiles = $posixFiles; PriorStandaloneControls = @('35426210106', '35428678823') })
 Write-JSON 'precise-generated-source.json' @($generated | ForEach-Object { [ordered]@{ Path = [IO.Path]::GetRelativePath($fixture, $_).Replace('\', '/'); SHA256 = Canonical-Hash $_ } })
 if ($IdentityContextPolicy -eq 'always-truthful') { Write-JSON 'qfid-generated-source.json' @($qfidFiles | ForEach-Object { [ordered]@{ Path = $_.Path; SHA256 = Canonical-Hash (Join-Path $fixture $_.Path) } }) }
@@ -330,7 +340,13 @@ try {
             'TestEarlyCapabilityGeneratedRelatedFrames', 'TestEarlyCapabilityGeneratedAsyncFrames', 'TestEarlyCapabilitySessionAllocation'
         ) 'early-capability-controls.jsonl'
     }
-    $nativeTest = if ($early) { 'TestNativeEarlyCapabilityReplacement' } else { 'TestNativePreciseReplacement' }
+    if ($earlyQFid) {
+        Invoke-Controls './packages/smb/windows' '^TestEarlyQFidInteraction' @(
+            'TestEarlyQFidInteractionPositive', 'TestEarlyQFidInteractionRefusals',
+            'TestEarlyQFidInteractionProcessRefusals', 'TestEarlyQFidInteractionNativeOracle'
+        ) 'early-qfid-interaction-controls.jsonl'
+    }
+    $nativeTest = if ($earlyQFid) { 'TestNativeEarlyQFidInteraction' } elseif ($early) { 'TestNativeEarlyCapabilityReplacement' } else { 'TestNativePreciseReplacement' }
     $binary = Join-Path $results 'native-precise.test.exe'
     & go test -c -o $binary './packages/smb/windows'
     if ($LASTEXITCODE -ne 0) { throw 'Building the precise native test executable failed.' }
@@ -340,7 +356,7 @@ try {
     & go tool test2json -t -p 'github.com/codetreker/remote-fs/packages/smb/windows' $binary '-test.v=test2json' '-test.count=1' '-test.timeout=3m' "-test.run=^${nativeTest}$" 2>&1 | Tee-Object -FilePath $path
     $nativeExit = $LASTEXITCODE
     if ((Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant() -ne $binaryHash) { throw 'The executed precise test binary changed during the run.' }
-    $cell = if ($early) { 'share0_app_first_replace_identity_early_capability' } elseif ($combined) { 'share0_app_first_replace_identity_posix_qfid' } elseif ($FilesystemCapabilityPolicy -eq 'posix-unlink-rename') { 'share0_app_first_replace_identity_posix_capability' } elseif ($IdentityContextPolicy -eq 'always-truthful') { 'share0_app_first_replace_identity_always_qfid' } else { 'share0_app_first_replace_identity_precise' }
+    $cell = if ($earlyQFid) { 'share0_app_first_replace_identity_early_qfid' } elseif ($early) { 'share0_app_first_replace_identity_early_capability' } elseif ($combined) { 'share0_app_first_replace_identity_posix_qfid' } elseif ($FilesystemCapabilityPolicy -eq 'posix-unlink-rename') { 'share0_app_first_replace_identity_posix_capability' } elseif ($IdentityContextPolicy -eq 'always-truthful') { 'share0_app_first_replace_identity_always_qfid' } else { 'share0_app_first_replace_identity_precise' }
     Assert-Verdicts $path $nativeExit @($nativeTest, "$nativeTest/$cell")
 } finally {
     Pop-Location

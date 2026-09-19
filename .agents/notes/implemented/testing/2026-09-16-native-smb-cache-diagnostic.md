@@ -62,6 +62,10 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 子进程继承普通 token，必须证明 SID/logon/session、实际进程与 exact executable/nonce，查询不触及 A/B。同步 root handle 的一次 NtQuery 使用固定 pinned IOSB/4096 字节 buffer；非 PENDING 只接受返回 NTSTATUS 的 SUCCESS，正常 close 后实际 exit 0 才交付。PENDING 保留进程生命周期的 pins/root，明确失败退出；十秒执行加五秒 termination/drain 均不延长后来的一秒窗口，未证实 process completion 不能继续 HA 或声称取消完成。[被动检查](../../../../.github/scripts/native-smb-early-capability-wire_test.go.txt)另核对 root Fs5 < settled exit < HA API marker < HA CREATE 的全局次序、同一 connection/session/tree 与正确 share；raw/derived 归属分开，root open 可按真实已知关联复用，不由 token 相同推导连接或隐藏目标预热。
 
+[early+QFid 单项](../../../../.github/workflows/native-smb-early-qfid-interaction.yml)把 pre-HA root 能力曝光与首个新 CREATE 的真实未请求 QFid 组合，检验两项刺激的时序交互。显式 before-ha-qfid 必须同时选择 posix-unlink-rename、always-truthful 和 posix-qfid；原 before-ha 仍为 requested-only 独立分支。复用原进程 helper、被动 collector 及 QFid→POSIX 补丁，进程十秒加五秒清理和原生调用序列保持。
+
+[联合资格检查](../../../../.github/scripts/native-smb-early-qfid-interaction_test.go.txt)要求 root Fs5=0x406 < 成功退出 < HA API 的早期证据，与首个新 CREATE 未请求但实际返回真实 B/volume QFid 的证据共同成立。两者须绑定同一实际 HA/Hnew、connection/session/tree 和独立取得的 volume；源事实、进程失败和原生 oracle 分别保留。PENDING、forced、未确认退出或任一刺激缺席均不能通过。旧 HA 稳定、Hnew 不同、A/B 字节、精确 DETAIL、冷 B、一秒/TTL 与清理判据不变；未请求 QFid 的符合性仍未确定，这项组合不引入生产默认政策。
+
 ## 备选方案
 
 **等整套新实现完成后才运行原生验收。** 最终仍要这样验证交付代码，但把可行性诊断也推迟到那时，会让一个已经知道可能失败的缓存行为在大量实现之后才决定能否交付。固定原型让这项依赖提前得到可复现的回答。
@@ -155,6 +159,10 @@ POSIX 单项的实际准备证明非测试源码仅改变 Fs5 能力位，适用
 
 这个合格首样本否定了该组合下的旧引用身份稳定性，不证明问题持续超过一秒，也不证明所有无驱动方案不可能。内部 FCB 算法与未请求 QFid 的符合性仍未决定，固定原型结果不代表当前生产能力或缓存验收；此前单刺激结果保持独立。
 
-early-bootstrap 本地控制 64 根、普通/race 各 542 verdict，八项因果对照、二十六项策略控制和五种 ARM64 构建通过；四个旧分支字节保持。真实 Linux supervisor/子进程和精确 parser 的这些结果，不证明 Windows Nt/token/root-open 或内核 pending 取消已执行。原生单项仍未运行，全部既有身份失败继续按原资格保留。
+early-bootstrap 本地控制 64 根、普通/race 各 542 verdict，八项因果对照、二十六项策略控制和五种 ARM64 构建通过；四个旧分支字节保持。[原生单项 35437559379](https://github.com/codetreker/remote-fs/actions/runs/35437559379)绑定探针 `0a806421488815980d74c8d89e58fc9fef65a9bf`，真实 root Fs5=0x406 的全局序号 34 < helper 完成退出 36 < HA API 38，同一 connection/session/tree/token 与无目标预热均成立。542 个控制 verdict 通过，单项为合格 replacement_identity_aliased：初始 HA、新 Hnew、保留 HA 的 native FileIndex 均为 3，A257/B769 字节各自正确；requested-only 的新 CREATE 没有 QFid。精确 DETAIL、历史、oracle、原设置和清理有效，所有身份/字节检查在 ACK 后 37.1918 ms、最早 TTL 前完成。
+
+该结果证明这次 Windows Nt 查询的终态成功、root 关闭和实际 exit 0，不覆盖 PENDING 或内核取消路径；身份失败也不证明持续超过一秒或内部 FCB 算法。既有失败保留，当前生产/缓存验收仍独立。
+
+early+QFid 的本地适用控制 82 根、普通/race 各 635 verdict 通过；移除早期能力位拒绝和新 CREATE 未请求条件的两个隔离对照分别命中断言。三十三项脚本策略控制与六种 ARM64 配置构建通过，五个既有分支的准备结果及 254 份非测试 Go 输入保持不变。Linux 子进程控制和精确提取的 parser 已执行，Windows 组合胶合路径经源码核对与构建；新组合尚未原生运行，没有身份修复或生产接受结论。
 
 代价是维护固定基底补丁、注入锚点、回归、十八个诊断作业及相互隔离的祖先/身份实验，输入不会自动跟随生产代码。诊断提供可行性或失败证据，不交付新的 SMB 文件实现、SQLite 持久性或历史时间显示策略。实际 package、transport 和 backend 仍须独立验收；缓存失效机制与平台接入仍由平台提案承接，既有一秒要求保持不变。
