@@ -580,6 +580,18 @@ Hnew/HA 的同 volume opaque 身份、原 HA 稳定、B769/A257 字节、冷 B�
 
 本地适用控制 82 根，普通/race 各 635 verdict 通过；早期能力位拒绝与新 CREATE 未请求条件的两个隔离负向对照命中断言，三十三项完整脚本策略控制和六种 ARM64 配置构建通过。五个旧分支的准备结果及 254 份非测试 Go 输入保持。Linux 子进程 supervisor 和精确提取 parser 的执行与 Windows 适配入口的源码/构建检查分别归属；新组合尚未原生运行，不能从这些本地结果推导身份修复或当前生产缓存验收。
 
+### 系统自带 SMB/NTFS 的原生行为参考
+
+[inbox 参考工作流](../.github/workflows/native-smb-inbox-reference.yml)只运行一次 `TestNativeInboxReference`，使用实际计算机名的 direct445 UNC、当前进程默认凭据和本次独占创建的 NTFS Temporary share。[controller](../.github/scripts/native-smb-inbox-reference.ps1)只读检查 Windows 11 ARM64、提升权限、服务/SMB2/445、NTFS 与实际缓存/安全设置；不启动服务、改设置、保存凭据或换端点。WNet username/password 均为 NULL，使用原始当前 logon；闲置盘符、精确 UNC 与 SID/logon 指纹不符就拒绝，不接管既有映射。Temporary share 仍须实际清理。
+
+[原生探针](../.github/scripts/native-smb-inbox-reference_test.go.txt)保持 app-first 的 v 目录 LIST/share0、祖先 recursive watcher 和原 HA READ/share7 次序。HA 初始 legacy 身份/A257 字节与两次属性预热后，父进程以真实 server session/open 管理数据核对本次 share/path、账户 SID 和 client 来源；绑定 nonce/PID/executable 的 IPC 准入完成后才允许变更。当前 logon 一致不能代替 server 来源证明，管理 open ID 也不等于 native FileIndex。来源 postcheck 在原观测完成后、相关 handle 仍存活时执行，不向测量区间插入新 filesystem 查询。
+
+变更只从 server-local NTFS 路径打开 B，执行一次 FileRenameInfoEx Flags3（REPLACE_IF_EXISTS|POSIX_SEMANTICS）替换 target。ARM64 payload 的 RootDirectory、byte-counted UTF-16 名字与同步 buffer 寿命分别检查；实际成功返回即为本地 ACK，失败不退回普通 rename，也不放宽 share0。watcher 保留实际 DETAIL、原生 overflow/rescan 或错误；同一 watcher 至多三次 completion/rearm，共用 ACK+850 ms，不能把原生零字节称为已证明的 wire ENUM。随后原首个 CreateFile、legacy 新身份、保留 HA 身份、旧 A 与新 B 读取次序不变；旧身份稳定、新身份不同及正确字节必须在 ACK+一秒、从 WNet 准入起最早可能曝光计算的原 5/10/10 TTL 前完成。最终 local NTFS oracle 核对 B 的名字转换/身份/字节，但不要求 SMB native ID 数值等于 local ID。
+
+child 拥有全部 native handle/watch/mapping；六十秒生命周期与另五秒 termination/drain 分开。未确认退出、未完成 native pending 或未知资源操作不能成为清理成功，forced 永远失败。controller 在 child 已静止后只删除指纹匹配的本次映射/share/目录，保留首次错误和各项清理错误；后续空快照不能消除未知操作。所有 receipt 明确 mechanism_trace_complete=false：没有 lease/break/完整 wire 机制证据，fixture 不预开或枚举 SMB B 也不证明系统自动流量中的 coldness。完整来源、变更和清理下的结果只分类为 native behavior，不能升级为生产或缓存验收。
+
+[生成器](../.github/scripts/native-smb-inbox-reference-generate.go)核对七份输入、提取 38 个原 native helper 声明到独立 module，复用原身份/字节/时间判据，不导入原型 authority、HTTP 或 metastore。[可移植控制](../.github/scripts/native-smb-inbox-reference-controls_test.go.txt)五根普通/race 各 73 verdict 通过，身份 oracle 与 share 指纹绕过分别命中因果断言；controller 二十二项完整函数体用例和二十四项 origin 用例模拟 Windows/cmdlet 边界，六项真实 Linux 子进程控制只验证 stdio/wait/kill 拥有权。晚退出/kill 发布、receipt/order、资源匹配、flags/ABI、错误及清理边界均保留拒绝。ARM64 构建、vet、格式和 actionlint 已核对；尚未原生执行 WNet、share/session 查询、NTFS Flags3/share0 或身份场景，不推断 runner 能满足这些前置条件。
+
 ## 每次改动必须带什么
 
 **任何非平凡改动都要在同一次改动里新增或更新测试。** 判据与 Agent Note 相同。

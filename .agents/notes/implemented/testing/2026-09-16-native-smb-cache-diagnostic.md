@@ -6,7 +6,7 @@ Status: implemented
 
 Windows 原生重定向器可以在远端创建已经完成后继续复用此前的名字不存在结果。单个 SMB 请求正确、暖文件读取新内容或没有授予数据缓存权限，都不能证明后续按名访问满足一秒、非 TTL 的可见性。单次监听收到通知，还不足以证明重新监听的间隔、深层名字、卸载与故障期间的行为。
 
-[平台客户端提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)把这项可行性放在广泛实现之前。诊断需要一个能够实际运行、版本确定的 SMB 接入对象；负查找通过还不能说明已经缓存的属性、长度、内容或名字替换会及时更新。正在变化的通用接口不能成为每次重现时额外变化的因素。旧原型的成功也不能被当作新实现的验收。
+[平台客户端提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)把这项可行性放在广泛实现之前。诊断需要一个能够实际运行、版本确定的 SMB 接入对象；负查找通过还不能说明已经缓存的属性、长度、内容或名字替换会及时更新。正在变化的通用接口不能成为每次重现时额外变化的因素。旧原型的成功也不能被当作新实现的验收。 与系统自带 SMB/NTFS 对照可以检验相同原生身份与字节行为，但没有完整 wire 证据时只能作为行为参考，不能据此解释缓存或租约机制。
 
 ## 决定
 
@@ -65,6 +65,14 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 [early+QFid 单项](../../../../.github/workflows/native-smb-early-qfid-interaction.yml)把 pre-HA root 能力曝光与首个新 CREATE 的真实未请求 QFid 组合，检验两项刺激的时序交互。显式 before-ha-qfid 必须同时选择 posix-unlink-rename、always-truthful 和 posix-qfid；原 before-ha 仍为 requested-only 独立分支。复用原进程 helper、被动 collector 及 QFid→POSIX 补丁，进程十秒加五秒清理和原生调用序列保持。
 
 [联合资格检查](../../../../.github/scripts/native-smb-early-qfid-interaction_test.go.txt)要求 root Fs5=0x406 < 成功退出 < HA API 的早期证据，与首个新 CREATE 未请求但实际返回真实 B/volume QFid 的证据共同成立。两者须绑定同一实际 HA/Hnew、connection/session/tree 和独立取得的 volume；源事实、进程失败和原生 oracle 分别保留。PENDING、forced、未确认退出或任一刺激缺席均不能通过。旧 HA 稳定、Hnew 不同、A/B 字节、精确 DETAIL、冷 B、一秒/TTL 与清理判据不变；未请求 QFid 的符合性仍未确定，这项组合不引入生产默认政策。
+
+[inbox SMB/NTFS 参考](../../../../.github/workflows/native-smb-inbox-reference.yml)是独立的 direct445 单项。它使用实际计算机名、当前 logon 的 NULL username/password WNet 连接及本次拥有的 Temporary share，保持系统服务、安全和缓存设置。只读 preflight 要求 Windows 11 ARM64、权限、Server/Workstation、SMB2、445 与实际 NTFS 条件；不满足即拒绝，不启动服务、换凭据或改用代理。新私有目录只含 A257/B769，share 的路径/nonce/SID 指纹和本地目录身份都由外层拥有者保留。
+
+[原生场景](../../../../.github/scripts/native-smb-inbox-reference_test.go.txt)保持 app-first/share0、祖先 watcher、HA 与原 legacy 身份/字节查询次序。变更由 server-local NTFS handle 执行一次 FileRenameInfoEx Flags3，成功返回即是本地 ACK，不冒充 HTTP/action barrier。成功必须保持旧 HA 身份及 A 字节、新打开取得不同身份及 B 字节，并在 ACK+一秒与从最早连接准入计算的原 TTL 前完成。原生 DETAIL/rescan 事实如实记录；rescan 只在原同 watcher 的有界 drain/rearm 下继续，不标成已证明的 wire ENUM，不插入目录枚举。
+
+[controller](../../../../.github/scripts/native-smb-inbox-reference.ps1)以绑定 nonce/PID/executable 的双阶段 IPC，在 mutation 前和原生观测完成后核对真实 server session/open、当前 SID 与 owned share/path；server bookkeeping ID 不冒充 native FileIndex。子进程拥有映射、watcher 和所有 handle，六十秒生命周期后仅另有五秒 termination/drain；未确认退出保留 ledger，forced 仍失败。只有原 child 静止、精确 mapping/share/目录指纹继续匹配时才清理；Temporary 的重启寿命不能代替清理完成。
+
+这一参考没有完整 packet/lease/break 轨迹，receipt 固定 mechanism_trace_complete=false。B 不经 fixture 的 SMB 预开或枚举只是调用纪律，不能证明自动流量中的 cold B；没有目标副作用的管理查询也不证明 connection topology。来源、变更、原生观察与清理均完整时，结果才具有 native_behavior_pass/failure 的资格；未知保留原始观察并按不完整处理，不归纳为内部 FCB、未请求 QFid 符合性或当前生产验收。
 
 ## 备选方案
 
@@ -164,5 +172,7 @@ early-bootstrap 本地控制 64 根、普通/race 各 542 verdict，八项因果
 该结果证明这次 Windows Nt 查询的终态成功、root 关闭和实际 exit 0，不覆盖 PENDING 或内核取消路径；身份失败也不证明持续超过一秒或内部 FCB 算法。既有失败保留，当前生产/缓存验收仍独立。
 
 early+QFid 的本地适用控制 82 根、普通/race 各 635 verdict 通过；移除早期能力位拒绝和新 CREATE 未请求条件的两个隔离对照分别命中断言。三十三项脚本策略控制与六种 ARM64 配置构建通过，五个既有分支的准备结果及 254 份非测试 Go 输入保持不变。Linux 子进程控制和精确提取的 parser 已执行，Windows 组合胶合路径经源码核对与构建；新组合尚未原生运行，没有身份修复或生产接受结论。
+
+inbox 参考的[生成器](../../../../.github/scripts/native-smb-inbox-reference-generate.go)按源码 hash 与符号提取七份输入中的 38 个既有 native helper 声明，原 legacy identity/data/time 判据不改写；独立 module 不引入 SMB authority、HTTP 或 metastore。五个可移植根普通/race 各 73 verdict 通过，身份与 share 指纹的隔离对照命中断言；controller 的完整函数体用例模拟 Windows/cmdlet 边界，真实 Linux 子进程用例只证明 stdio/wait/kill 拥有权。ARM64 构建及静态检查不证明 WNet、server origin、NTFS Flags3/share0 或原生效果；该参考尚未在 Windows 执行，全部既有失败结果保持独立。
 
 代价是维护固定基底补丁、注入锚点、回归、十八个诊断作业及相互隔离的祖先/身份实验，输入不会自动跟随生产代码。诊断提供可行性或失败证据，不交付新的 SMB 文件实现、SQLite 持久性或历史时间显示策略。实际 package、transport 和 backend 仍须独立验收；缓存失效机制与平台接入仍由平台提案承接，既有一秒要求保持不变。
