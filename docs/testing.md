@@ -430,13 +430,17 @@ owned_rescan 必须从实际捕获的 SMB Command 15 请求及同一 MessageID �
 
 [独立工作流](../.github/workflows/native-smb-parent-invalidation.yml)通过[运行脚本](../.github/scripts/native-smb-parent-invalidation.ps1)执行 `TestNativeParentInvalidation`。它只由自身三个文件的 Pull Request opened/synchronize 变更触发，以单个十五分钟 Windows 11 24H2+ ARM64 作业运行；原十八个诊断作业保持独立。临时检出仍固定为上述原型，依次核对并应用通知连续性、最终缺失状态与 NoLeasing overlay，记录规范输入、补丁及输出 hash。这个执行对象不包含当前生产端点或新的文件适配。
 
-[探针](../.github/scripts/native-smb-parent-invalidation_test.go.txt)使用真实 share 根及其真实子目录 `v`，在父目录保持递归监听，在 `v` 保持应用 LIST 句柄；这只模拟额外父目录的几何关系。四个独立 share/connection cell 覆盖应用 ShareAccess=0/6 与 watcher-first/app-first，另有一个 ShareAccess=0 的 noWatcher 对照。实际 CREATE/CHANGE_NOTIFY 必须证明父、子、目标来自同一连接和 session，应用 mask 与当前 Pending 均须核对；任一打开顺序的共享拒绝不能当作通过。无监听对照不证明 ShareAccess=6 的因果关系。
+[探针](../.github/scripts/native-smb-parent-invalidation_test.go.txt)使用真实 share 根及其真实子目录 `v`，在父目录保持递归监听，在 `v` 保持应用 LIST 句柄；这只模拟额外父目录的几何关系。七个独立 share/connection cell 保留四项增长（应用 ShareAccess=0/6 与 watcher-first/app-first）和一项 share0 noWatcher 增长对照，另以 share0/app-first 检查缩短与替换身份。实际 CREATE/CHANGE_NOTIFY 必须证明父、子、目标来自同一连接和 session，应用 mask 与当前 Pending 均须核对；任一打开顺序的共享拒绝不能当作通过。无监听对照不证明 ShareAccess=6 的因果关系。
 
-每项先以真实 HTTP 准备 257 字节及旧 mtime，再两次暖 GetFileAttributesExW；保留引用的 HTTP WriteAt 增长到 769 字节，其已完成收据提供期望身份、大小、时间和 ACK。从写入开始到唯一的首次属性查询，native-call ledger 禁止 harness 额外访问目标或祖先及提前查询 oracle，只允许等待已有通知。监听样本须同时取得当前请求的 wire 与原生 `FILE_ACTION_MODIFIED v\target`。自动 redirector 刷新可以发生在 HTTP ACK 返回或首次 API 之前；新 tuple 的目标响应必须与通知、连接及请求精确关联，分别记录 `refreshed_before_first_api` 与 `refreshed_by_first_api`，来源不清则为 inconclusive。首次查询完成仍须在 ACK 后一秒内，包含通知等待，并早于最早实际曝光的原缓存到期；不以 wire 静默排除合法自动刷新。
+增长先以真实 HTTP 准备 257 字节及旧 mtime，再两次暖 GetFileAttributesExW，由保留引用的 HTTP WriteAt 增长至 769 字节；缩短从 769 字节以 HTTP Truncate 缩至 73 字节。已完成收据提供期望身份、大小、时间和 ACK。native-call ledger 用连续、唯一的开始/结束序号及 mutation 序号判定操作先后，原时钟继续约束持续时间；相等时钟不代表准备访问跨越写入。写入后禁止 harness 额外访问目标或祖先及提前查询 oracle，只允许规定的通知等待与首次观察。增长/缩短须同时取得当前请求的 wire 与原生 `FILE_ACTION_MODIFIED v\target`。自动 redirector 刷新可以发生在 HTTP ACK 返回或首次 API 之前；新 tuple 的目标响应必须与通知、连接及请求精确关联，分别记录 `refreshed_before_first_api` 与 `refreshed_by_first_api`，来源不清则为 inconclusive。首次查询完成仍须在 ACK 后一秒内，包含通知等待，并早于最早实际曝光的原缓存到期。
 
-首值保持不可变，后置 HTTP oracle、完整轨迹、原策略及清理均为证据资格。合格的 watched 旧首值使候选测试失败，但一秒内的旧样本不是超过一秒的违约证明；noWatcher 的合格旧值或新值只作观察，均不证明一秒保证。溢出、丢明细、无法关联或资源残留不得变成成功；取消 overlapped 通知必须等待完成再释放缓冲。三个解析/关联/资格测试根必须先于原生根通过，协议补丁的具名回归也不能缺失；所有测试使用 `-count=1`、三分钟上限并严格检查 fail/skip/verdict，产物保存十四天。
+替换场景只预先打开原生 A 句柄，B 通过 HTTP 创建和准备，不能先打开 B 向 redirector 提供它的身份。mutation 前快照与最终排空的完整轨迹都核对冷态：整个轨迹不得出现 B 的 CREATE/QUERY_INFO/READ，直到 ACK 不得出现目录枚举或无法关联的 file ID。最终核对只能维持或撤销先前资格，不能把已失败的证据升级；迟到的 B 暴露使样本和测试失败，保留原始首值及身份结果。HTTP 把 B 改名覆盖 target 后，首个目标观察是同步 CreateFile，随后核对同一 volume 中新旧原生 ID 不同、旧 ID 不变、旧句柄仍读 A 且新句柄读 B；原生 ID 不与 authority NodeID 作数值等同。首次打开及四项后续身份/读取检查全部须在 ACK+一秒及原缓存到期之前完成，后置 oracle 分别核对 A、B 和源名字移除。
 
-本地已核对 PowerShell 解析、精确准备及拒绝改动基底的负向对照、actionlint；从探针提取的三个可移植测试根在普通/race 各取得 39 pass，使用限定的 Windows 常量/Filetime shim。两个完整 Windows ARM64 测试 binary 已构建。这些检查不执行 Windows 重定向器；祖先通知的原生可行性尚未观察，生产父目录布局、映射、名字/身份与故障行为仍需各自证明。
+替换通知最多接纳三批：同一 watcher 句柄、连接/session/filter/递归属性保持一致，每批原生完成已排空，wire 请求/响应和事件逐项匹配；先有 target 的 REMOVED，再有同批相邻的 replacement OLD_NAME / target NEW_NAME。每次重新监听必须取得新的、精确关联的 Pending，不能重开路径。所有批次共用 ACK+850 ms 的绝对通知截止，重挂不延长一秒期限；第四批、丢明细、额外事件或歧义不能成为成功。
+
+首值保持不可变，后置 HTTP oracle、完整轨迹、原策略及清理均为证据资格。合格的 watched 旧首值使候选测试失败，但一秒内的旧样本不是超过一秒的违约证明；noWatcher 的合格旧值或新值只作观察，均不证明一秒保证。取消 overlapped 通知必须等待完成再释放缓冲。三个解析/关联/资格测试根必须先于原生根通过，协议补丁的具名回归也不能缺失；所有测试使用 `-count=1`、三分钟上限并严格检查 fail/skip/verdict，产物保存十四天。
+
+[首次五场景原生运行 35411939518](https://github.com/codetreker/remote-fs/actions/runs/35411939518)整体失败：三项增长取得合格当前值，share0/app-first 虽返回新值，但准备完成与写入开始的时钟相等使原 Quiet 判据失败，该样本保留 inconclusive；noWatcher 返回旧值，只是观察对照。完整事实由[诊断决定](../.agents/notes/implemented/testing/2026-09-16-native-smb-cache-diagnostic.md)记录，不按新判据追改原结果。七场景源码的精确 PowerShell 准备、actionlint 与完整 Windows ARM64 探针构建通过；从源提取的三个可移植测试根普通/race 各 101 pass，使用限定 Windows 常量/Filetime shim。新七场景尚未原生执行；生产父目录布局、映射、完整名字/身份与故障行为仍需各自证明。
 
 ## 每次改动必须带什么
 

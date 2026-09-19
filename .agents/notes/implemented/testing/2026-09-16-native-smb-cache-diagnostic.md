@@ -34,9 +34,11 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 固定 Go 版本为 1.26.8，测试三分钟、作业十五分钟；编译缓存、模块缓存和临时状态放在工作区 `.tmp` 下。创建的成功判据同时约束 authority 结果、时间与新请求：初次负查找有匹配的 NAME_NOT_FOUND，远端创建确认后的一秒内出现新权威 CREATE 与可见文件，且观察早于最早可能的缓存到期。通知与故障情形各自核对匹配事件或不可用错误，零字节成功或 ERROR_NOTIFY_ENUM_DIR 明确表示丢失明细，测试拥有者记录后重新监听；它不维护目录快照，不能把重挂监听说成枚举恢复。owned_nested 的初次/普通间隔通知仍必需，只有突发明确丢明细时允许不具备每个名字的 ADDED，所有可见性检查保留。三个系统缓存 lifetime 必须大于一秒且诊断不得修改设置。完整可执行规则由[测试策略](../../../../docs/testing.md#windows-原生-smb-缓存诊断)拥有。
 
-祖先通知实验由[独立工作流](../../../../.github/workflows/native-smb-parent-invalidation.yml)和[脚本](../../../../.github/scripts/native-smb-parent-invalidation.ps1)执行，在同一固定原型上施加三份已核对的 overlay。它只监听自身三个文件的 Pull Request opened/synchronize 变更，单作业执行五个新 share/connection，不改变原十八个诊断作业。真实 share 根上保留递归 watcher，应用在真实子目录 `v` 上以 LIST 打开；四项覆盖 ShareAccess=0/6 与双方打开顺序，另有 share0 无 watcher 对照。父、子和目标的同一连接/session、mask、Pending 及匹配 MODIFY 都须有实际证据。这个几何实验回答不同目录上的监听能否共存并使属性及时更新，尚不定义生产私有父目录或映射 API。
+祖先通知实验由[独立工作流](../../../../.github/workflows/native-smb-parent-invalidation.yml)和[脚本](../../../../.github/scripts/native-smb-parent-invalidation.ps1)执行，在同一固定原型上施加三份已核对的 overlay。它只监听自身三个文件的 Pull Request opened/synchronize 变更，单作业执行七个新 share/connection，不改变原十八个诊断作业。真实 share 根上保留递归 watcher，应用在真实子目录 `v` 上以 LIST 打开；增长覆盖 ShareAccess=0/6 与双方打开顺序，另有 share0 无 watcher 对照，以及 share0/app-first 的缩短、替换身份。这回答不同目录上的监听能否共存并推进特定观察，尚不定义生产私有父目录或映射 API。
 
-[祖先探针](../../../../.github/scripts/native-smb-parent-invalidation_test.go.txt)把 257 字节旧属性暖两次，再由真实 HTTP 保留引用增长至 769 字节；首次 GetFileAttributesExW 必须在 ACK 后一秒内完成，且早于原始最早到期。计时包含等待通知。native-call ledger 禁止写入开始后 harness 的额外目标/祖先访问或提前 oracle；它不禁止 redirector 因通知自动刷新。匹配通知之后、新 tuple 的目标响应可以早于 ACK 或首次 API，分别标记 `refreshed_before_first_api`、`refreshed_by_first_api`，关联不完整则不能证明机制。原始首值、后置 oracle、轨迹完整性和最终清理共同决定资格。watched 旧首值使候选失败，但不被描述成超过一秒的反例；无监听的合格旧/新首值只作观察，也不外推 share6 的因果关系。
+[祖先探针](../../../../.github/scripts/native-smb-parent-invalidation_test.go.txt)的增长和缩短分别以真实 HTTP 把暖属性的 257 字节改为 769 字节、769 字节改为 73 字节。首次 GetFileAttributesExW 必须在 ACK 后一秒内完成，且早于原始最早到期，计时包含通知等待。native-call ledger 以连续、唯一的操作开始/结束序号和 mutation 序号记录因果顺序，时钟仍用于期限；这避免时钟精度把已经完成的准备调用误判为插入写入后的访问。harness 不得在写入后额外访问目标/祖先或提前 oracle，合法的自动刷新不受此禁令限制。匹配通知之后、新 tuple 的目标响应可以早于 ACK 或首次 API，分别标记 `refreshed_before_first_api`、`refreshed_by_first_api`，关联不完整则不能证明机制。
+
+替换只预先保留原生 A 句柄，B 完全通过 HTTP 准备；mutation 前及最终排空的轨迹均须满足冷态判据：整个轨迹排除 B 的 CREATE/QUERY_INFO/READ，直到 ACK 排除目录枚举和未知 file ID；最终核对只能撤销、不能升级先前资格，迟到污染保留原始数据并使样本 inconclusive、测试失败。不能用预先打开 B 来教会 redirector 新身份。覆盖后先同步打开 target，再核对同一 volume 上的新旧原生 ID 不同、旧 ID 未变及 A/B 各自字节，不能把原生 ID 数值直接等同于 authority NodeID。通知最多三批，沿同一 watcher 排空后重挂，每次核对新 Pending、完整 wire/native 事件及 REMOVED 后相邻 OLD_NAME/NEW_NAME；共用 ACK+850 ms 通知截止。首次打开与全部身份/读取检查仍须在 ACK+一秒及缓存到期之前完成。原始首值、后置双对象 oracle、轨迹和最终清理共同决定资格；旧首值是候选失败，不单独成为超过一秒反例，无监听对照也不外推 share6 因果关系。
 
 ## 备选方案
 
@@ -85,6 +87,12 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 [FindFirstChangeNotification 对照 35087653528](https://github.com/codetreker/remote-fs/actions/runs/35087653528)中，NTFS root 两个顺序均冲突，SMB watcher-first 已有 Pending 而应用打开仍冲突；SMB application-first 的无监听基线失败，不能作为有效对照。替代通知入口尚未证明兼容，也没有由此取得可见性、重新监听或故障验收。
 
+### 祖先通知的增长观察
+
+[35411939518](https://github.com/codetreker/remote-fs/actions/runs/35411939518/job/105813131180)以探针 `45ba22aed7f338b298f0a7ae1543525b5f7abfec` 在 Windows 11 Enterprise 26200 ARM64 执行最初五项，整体失败。share0/watcher-first、share6/watcher-first、share6/app-first 分别在 ACK 后 25.185、26.501、23.653 ms 取得合格当前属性。share0/app-first 在 24.265 ms 返回新大小，但第二次 warm 完成与写入开始记录了相等时钟，原严格先后判据因此得到 Quiet=false；该项仍为 inconclusive，不能把新顺序判据追用于原结果并改称通过。share0 noWatcher 在 0.511 ms 返回旧的 257 字节，只作观察，不是超过一秒反例。
+
+该次各项后置 oracle 与清理均完成，默认缓存 lifetime 仍为 5/10/10 秒，没有残留映射/进程。三项合格增长只证明各自配置，不等于全部顺序或生产方案通过。完整新七场景的精确 PowerShell 准备、actionlint 和 Windows ARM64 探针构建通过，三个可移植解析/关联/资格测试根普通/race 各 101 pass；其中使用限定 Windows 常量和 Filetime shim。包含顺序判据、缩短与冷 B 替换的七场景尚未原生执行。
+
 ### 样本资格与执行来源
 
 [35107398671](https://github.com/codetreker/remote-fs/actions/runs/35107398671)的两个原能力延迟样本虽在约 1.100 秒返回旧 tuple，仍是 inconclusive：安静间隔出现 lease-proof.bin 的 CREATE、QUERY_INFO class 48 与 CLOSE，且没有 post-query oracle。后台请求的具体发起者未确定；资源最终归零不能补回缺失证据。它不计入上述四个合格反例。
@@ -100,7 +108,5 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 | NoLeasing | `62538e9c1eb5b2b12a4d6fed71937fdd675b378d253c8f1c6c9d875a84f06734` | 规范化后按该 hash 应用，三个目标源码的输入/输出另外逐一核对 |
 
 每次结果绑定固定基底、overlay、探针 commit、variant、OS/build 和缓存设置；无 overlay 的样本保留各自来源。JSON 轨迹、Go verdict、映射前后状态和最终引用数作为产物保存十四天。轨迹溢出、编码失败、设置改变或映射残留使样本失败；取消 overlapped 通知须等真实完成后才释放结构和缓冲，意外清理错误不能当作正常取消。
-
-祖先实验目前完成 PowerShell 解析、精确源码准备、拒绝改动基底的负向对照及 actionlint；三个解析/关联/资格测试根经限定 Windows 常量和 Filetime shim 提取后，普通/race 各 39 pass，两个完整 Windows ARM64 测试 binary 构建通过。原生五项尚未执行。这些检查确认 harness 的来源和判据，不能证明重定向器失效效果，也不能代替完整名字、身份、故障或生产映射验收。
 
 代价是维护固定基底补丁、注入锚点、回归、十八个诊断作业及独立祖先实验，输入不会自动跟随生产代码。诊断提供可行性或失败证据，不交付新的 SMB 文件实现、SQLite 持久性或历史时间显示策略。实际 package、transport 和 backend 仍须独立验收；缓存失效机制与平台接入仍由平台提案承接，既有一秒要求保持不变。

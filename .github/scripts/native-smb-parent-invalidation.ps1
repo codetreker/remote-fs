@@ -256,7 +256,8 @@ b.mapping, err = Map(ctx, MappingOptions{LocalPath: b.path, Share: b.share, TCPP
         Invoke-ProbeTests './packages/smb/windows' '^TestNativeParentInvalidation$' @(
             'TestNativeParentInvalidation', 'TestNativeParentInvalidation/noWatcher',
             'TestNativeParentInvalidation/share0_watcher_first', 'TestNativeParentInvalidation/share0_app_first',
-            'TestNativeParentInvalidation/share6_watcher_first', 'TestNativeParentInvalidation/share6_app_first'
+            'TestNativeParentInvalidation/share6_watcher_first', 'TestNativeParentInvalidation/share6_app_first',
+            'TestNativeParentInvalidation/share0_app_first_shrink', 'TestNativeParentInvalidation/share0_app_first_replace_identity'
         ) 'native-probe.jsonl'
     } finally {
         Pop-Location

@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   ancestor-invalidation:
-    name: Native ancestor MODIFY / four sharing cells and control
+    name: Native ancestor notification feasibility
     runs-on: windows-11-arm
     timeout-minutes: 15
     env:

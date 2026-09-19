@@ -11,7 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf16"
@@ -294,7 +296,10 @@ type parentInvalidationQualification struct {
 }
 
 func parentInvalidationClassify(q parentInvalidationQualification) (string, bool) {
-	if !q.TraceComplete || !q.SameConnection || !q.Quiet || q.Native.Error != "" || q.Native.Started.Before(q.ACK) || q.Native.Completed.Before(q.Native.Started) || q.Native.Completed.After(q.ACK.Add(time.Second)) || !q.Native.Completed.Before(q.EarliestExpiry) || q.FirstExposure.IsZero() || q.FirstExposure.After(q.Native.Started) || q.Expected.ID != q.Initial.ID || q.Initial.Size != 257 || q.Expected.Size != 769 || q.Expected.MetadataRevision <= q.Initial.MetadataRevision || q.Expected.ModTime.Equal(q.Initial.ModTime) {
+	return parentSizeClassify(q, 257, 769)
+}
+func parentSizeClassify(q parentInvalidationQualification, oldSize, newSize int64) (string, bool) {
+	if !q.TraceComplete || !q.SameConnection || !q.Quiet || q.Native.Error != "" || q.Native.Started.Before(q.ACK) || q.Native.Completed.Before(q.Native.Started) || q.Native.Completed.After(q.ACK.Add(time.Second)) || !q.Native.Completed.Before(q.EarliestExpiry) || q.FirstExposure.IsZero() || q.FirstExposure.After(q.Native.Started) || q.Expected.ID != q.Initial.ID || q.Initial.Size != oldSize || q.Expected.Size != newSize || q.Expected.MetadataRevision <= q.Initial.MetadataRevision || q.Expected.ModTime.Equal(q.Initial.ModTime) {
 		return "inconclusive", false
 	}
 	if q.Watched && (!q.Pending || !q.NativeModified || !q.WireModified || q.NotifyCompleted.Before(q.WriteStarted) || q.NotifyCompleted.After(q.Native.Started) || q.NotifyCompleted.IsZero()) {
@@ -365,28 +370,91 @@ func parentConnectionProof(records []cacheGatePositiveWireRecord, request *paren
 }
 
 type parentNativeCall struct {
-	API, Path          string
-	Started, Completed time.Time
+	API, Path                  string
+	Started, Completed         time.Time
+	BeginSequence, EndSequence uint64
+	Selected                   *cacheGatePositiveValue
 }
 
-func parentHarnessQuiet(calls []parentNativeCall, writeStarted time.Time, first cacheGatePositiveValue) bool {
-	selected := 0
+func parentSameObservation(a, b cacheGatePositiveValue) bool {
+	if !a.Started.Equal(b.Started) || !a.Completed.Equal(b.Completed) {
+		return false
+	}
+	a.Started, a.Completed = time.Time{}, time.Time{}
+	b.Started, b.Completed = time.Time{}, time.Time{}
+	return a == b
+}
+
+func parentHarnessQuiet(calls []parentNativeCall, boundary uint64, first cacheGatePositiveValue) bool {
+	return parentHarnessOrdered(calls, boundary, first, false)
+}
+func parentHarnessOrdered(calls []parentNativeCall, boundary uint64, first cacheGatePositiveValue, replacement bool) bool {
+	if boundary == 0 || len(calls) == 0 || len(calls) > 32 {
+		return false
+	}
+	seen := map[uint64]bool{boundary: true}
+	var selectedBegin, previousEnd uint64
+	selected, waits, rearms := 0, 0, 0
+	var lastWatcherAPI string
+	var postSelected []string
 	for _, call := range calls {
-		if call.API == "first-attributes" {
+		if call.BeginSequence == 0 || call.EndSequence <= call.BeginSequence || call.BeginSequence <= previousEnd || seen[call.BeginSequence] || seen[call.EndSequence] || call.Completed.Before(call.Started) {
+			return false
+		}
+		seen[call.BeginSequence], seen[call.EndSequence] = true, true
+		previousEnd = call.EndSequence
+		if !replacement && call.API == "first-attributes" || replacement && call.API == "first-open" {
 			selected++
-			if call.Started.After(first.Started) || call.Completed.Before(first.Completed) {
+			if call.BeginSequence <= boundary || call.Selected == nil || !parentSameObservation(*call.Selected, first) || call.Started.After(first.Started) || call.Completed.Before(first.Completed) {
+				return false
+			}
+			selectedBegin = call.BeginSequence
+			continue
+		}
+		if call.Selected != nil {
+			return false
+		}
+		if replacement && call.API == "notify-rearm" {
+			rearms++
+			if call.BeginSequence <= boundary || lastWatcherAPI != "notify-wait" || selected != 0 {
+				return false
+			}
+			lastWatcherAPI = call.API
+			continue
+		}
+		if replacement && selected == 1 && (call.API == "new-identity" || call.API == "old-identity" || call.API == "old-read" || call.API == "new-read") {
+			postSelected = append(postSelected, call.API)
+			continue
+		}
+		if call.API == "notify-wait" {
+			waits++
+			if replacement && (selected != 0 || waits > 1 && lastWatcherAPI != "notify-rearm") {
+				return false
+			}
+			lastWatcherAPI = call.API
+			if call.BeginSequence <= boundary {
 				return false
 			}
 			continue
 		}
-		if call.API == "notify-wait" {
-			continue
-		}
-		if !call.Completed.Before(writeStarted) && call.Started.Before(first.Completed) {
+		if call.EndSequence >= boundary {
 			return false
 		}
 	}
-	return selected == 1
+	if selected != 1 || !replacement && waits > 1 || replacement && (waits < 1 || waits > 3 || rearms != waits-1 || !(first.Error != "" && len(postSelected) == 0 || first.Error == "" && slices.Equal(postSelected, []string{"new-identity", "old-identity", "old-read", "new-read"}))) {
+		return false
+	}
+	for _, call := range calls {
+		if (call.API == "notify-wait" || call.API == "notify-rearm") && call.EndSequence >= selectedBegin {
+			return false
+		}
+	}
+	for sequence := uint64(1); sequence <= uint64(2*len(calls)+1); sequence++ {
+		if !seen[sequence] {
+			return false
+		}
+	}
+	return len(seen) == 2*len(calls)+1
 }
 func parentRefreshProof(records []cacheGatePositiveWireRecord, writeStarted time.Time, first cacheGatePositiveValue, connection uint64, expected storage.Attr, notify *parentNotifyResult) (bool, string) {
 	for _, request := range records {
@@ -450,28 +518,36 @@ func parentJoinSelectedTrace(first cacheGatePositiveValue, pending *parentNotify
 }
 
 type parentInvalidationReport struct {
-	Name                  string
-	ShareMode             uint32
-	Order                 string
-	UNC                   string
-	Qualification         parentInvalidationQualification
-	Classification        string
-	WithinOneSecondProven bool
-	EvidenceValid         bool
-	Initial, Expected     storage.Attr
-	Warm                  []cacheGatePositiveValue
-	Pending               *parentNotifyRequest
-	NativeNotify          []parentNotifyItem
-	WireNotify            []parentNotifyResult
-	Wire                  []cacheGatePositiveWireRecord
-	Events                []cacheGateEvent
-	Error                 string
-	NativeCalls           []parentNativeCall
-	Mechanism             string
-	CandidateFailed       bool
-	OracleVerified        bool
-	OwnersClean           bool
-	TestFailed            bool
+	Kind                                       string
+	PreparedB                                  storage.Attr
+	ColdSource                                 bool
+	NotifyBatches                              []parentNotifyBatch
+	OldIdentity, NewIdentity, RetainedIdentity cacheGatePositiveValue
+	OldInitialRead, RetainedRead, NewRead      cacheGatePositiveValue
+	IdentityResult                             string
+	Name                                       string
+	ShareMode                                  uint32
+	Order                                      string
+	UNC                                        string
+	Qualification                              parentInvalidationQualification
+	Classification                             string
+	WithinOneSecondProven                      bool
+	EvidenceValid                              bool
+	Initial, Expected                          storage.Attr
+	Warm                                       []cacheGatePositiveValue
+	Pending                                    *parentNotifyRequest
+	NativeNotify                               []parentNotifyItem
+	WireNotify                                 []parentNotifyResult
+	Wire                                       []cacheGatePositiveWireRecord
+	Events                                     []cacheGateEvent
+	Error                                      string
+	MutationBoundarySequence                   uint64
+	NativeCalls                                []parentNativeCall
+	Mechanism                                  string
+	CandidateFailed                            bool
+	OracleVerified                             bool
+	OwnersClean                                bool
+	TestFailed                                 bool
 }
 
 func parentExposure(records []cacheGatePositiveWireRecord) time.Time {
@@ -517,16 +593,38 @@ func parentAppShareProof(t *testing.T, bridge *nativeBridge, share uint32) {
 }
 func parentRunCell(t *testing.T, name, order string, share uint32, watched bool, report *parentInvalidationReport) *parentInvalidationReport {
 	t.Helper()
+	kind := report.Kind
+	if kind != "growth" && kind != "shrink" && kind != "replacement" {
+		t.Fatal("unknown parent experiment kind")
+	}
 	trace := &cacheGateTrace{}
 	cacheGateActive.Store(trace)
 	cacheGateResetPositiveWire()
 	parentNotifyReset()
 	var bridge *nativeBridge
+	var sequence uint64
+	nextEvent := func() uint64 { sequence++; return sequence }
+	beginCall := func(api, path string) int {
+		report.NativeCalls = append(report.NativeCalls, parentNativeCall{API: api, Path: path, Started: time.Now(), BeginSequence: nextEvent()})
+		return len(report.NativeCalls) - 1
+	}
+	endCall := func(index int, selected *cacheGatePositiveValue) {
+		call := &report.NativeCalls[index]
+		call.EndSequence = nextEvent()
+		call.Completed = time.Now()
+		if selected != nil {
+			value := *selected
+			call.Selected = &value
+		}
+	}
 	t.Cleanup(func() {
 		cacheGateActive.Store(nil)
 		records, incomplete := cacheGatePositiveWireSnapshot()
 		_, results, notifyIncomplete := parentNotifySnapshot()
 		report.Wire, report.WireNotify = records, results
+		if !parentRecheckColdSource(report, records) {
+			t.Error("final drained wire cannot confirm replacement source coldness: spare-B exposure or unknown pre-ACK metadata traffic invalidates this cell")
+		}
 		trace.mu.Lock()
 		report.Events = append([]cacheGateEvent(nil), trace.events...)
 		traceBad := trace.overflow || trace.encodingError != nil
@@ -569,38 +667,64 @@ func parentRunCell(t *testing.T, name, order string, share uint32, watched bool,
 	session, parent := nativeRemoteOpen(t, bridge.remote, "v", storage.NodeDirectory, true)
 	file := nativeRemoteCreateAt(t, session, parent, "target", storage.NodeRegular)
 	before, after := cacheGatePositivePayload(257, 0x17), cacheGatePositivePayload(769, 0x89)
+	if kind == "shrink" {
+		before = cacheGatePositivePayload(769, 0x17)
+		after = before[:73]
+	}
 	report.Initial = cacheGatePositiveInitial(t, session, file, before, 2001)
+	var replacement storage.File
+	var metadataParent storage.File
+	if kind == "replacement" {
+		replacement = nativeRemoteCreateAt(t, session, parent, "replacement", storage.NodeRegular)
+		report.PreparedB = cacheGatePositiveInitial(t, session, replacement, after, 2002)
+		if report.PreparedB.ID == report.Initial.ID {
+			t.Fatal("replacement fixture reused authority identity")
+		}
+		observed, err := parent.Stat(t.Context(), storage.ObservationOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		retained, err := session.Retain(t.Context(), storage.RetainRequest{NodeID: observed.Attr.ID}, nativeAction(t, session))
+		if err != nil {
+			t.Fatal("retain zero-use rename parent:", err)
+		}
+		metadataParent, err = session.Reference(t.Context(), retained.Reference)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := parent.Close(t.Context(), nativeAction(t, session)); err != nil {
 		t.Fatal("release setup-only parent claim:", err)
 	}
-	mappingStarted := time.Now()
+
+	mappingCall := beginCall("map", `\\127.0.0.1\`+bridge.share)
 	if err := bridge.mapDrive(t); err != nil {
 		t.Fatal(err)
 	}
-	report.NativeCalls = append(report.NativeCalls, parentNativeCall{API: "map", Path: `\\127.0.0.1\` + bridge.share, Started: mappingStarted, Completed: time.Now()})
+	endCall(mappingCall, nil)
 	report.UNC = `\\127.0.0.1\` + bridge.share
 	path := report.UNC + `\v\target`
 	var application *nativeHandle
 	var watch *parentNativeWatch
 	openApplication := func() {
 		var err error
-		started := time.Now()
+		call := beginCall("open-application", report.UNC+`\v`)
 		application, err = cacheGateSharingOpen(t, report.UNC+`\v`, win.FILE_LIST_DIRECTORY, share, true)
-		report.NativeCalls = append(report.NativeCalls, parentNativeCall{API: "open-application", Path: report.UNC + `\v`, Started: started, Completed: time.Now()})
+		endCall(call, nil)
 		if err != nil {
 			t.Fatalf("application child LIST/share%d open: %v", share, err)
 		}
 	}
 	openWatcher := func() {
-		started := time.Now()
+		call := beginCall("open-watcher", report.UNC)
 		parentHandle, err := cacheGateSharingOpen(t, report.UNC+`\`, win.FILE_LIST_DIRECTORY, 7, true)
-		report.NativeCalls = append(report.NativeCalls, parentNativeCall{API: "open-watcher", Path: report.UNC, Started: started, Completed: time.Now()})
+		endCall(call, nil)
 		if err != nil {
 			t.Fatal("parent LIST watcher open:", err)
 		}
-		started = time.Now()
+		call = beginCall("arm-watcher", report.UNC)
 		watch = parentWatchStart(t, parentHandle)
-		report.NativeCalls = append(report.NativeCalls, parentNativeCall{API: "arm-watcher", Path: report.UNC, Started: started, Completed: time.Now()})
+		endCall(call, nil)
 		pending := parentAwaitPending(t)
 		report.Pending = &pending
 	}
@@ -616,11 +740,34 @@ func parentRunCell(t *testing.T, name, order string, share uint32, watched bool,
 	if application == nil {
 		t.Fatal("missing application handle")
 	}
+	var oldHandle *nativeHandle
+	if kind == "replacement" {
+		call := beginCall("open-old-target", path)
+		var opened cacheGatePositiveValue
+		oldHandle, opened = cacheGatePositiveOpenSync(t, path)
+		endCall(call, nil)
+		if oldHandle == nil {
+			t.Fatalf("prepare native retained A: %+v", opened)
+		}
+		call = beginCall("initial-old-identity", path)
+		report.OldIdentity = cacheGatePositiveIdentity(oldHandle)
+		endCall(call, nil)
+		call = beginCall("initial-old-read", path)
+		report.OldInitialRead = cacheGatePositiveReadSync(oldHandle)
+		endCall(call, nil)
+		if report.OldIdentity.Error != "" || report.OldIdentity.Identity == 0 || report.OldInitialRead.Error != "" || report.OldInitialRead.Count != uint32(len(before)) || report.OldInitialRead.Digest != cacheGatePositiveDigest(before) {
+			t.Fatal("retained A identity or initial bytes unavailable")
+		}
+		call = beginCall("prepare-old-read", path)
+		cacheGatePositiveSeek(t, oldHandle, 0)
+		endCall(call, nil)
+	}
 	for range 2 {
+		call := beginCall("warm-attributes", path)
 		value := cacheGatePositivePath(path)
+		endCall(call, nil)
 		report.Warm = append(report.Warm, value)
-		report.NativeCalls = append(report.NativeCalls, parentNativeCall{API: "warm-attributes", Path: path, Started: value.Started, Completed: value.Completed})
-		if value.Error != "" || value.Size != 257 || value.MTime != cacheGatePositiveTime(report.Initial.ModTime) {
+		if value.Error != "" || value.Size != int64(len(before)) || value.MTime != cacheGatePositiveTime(report.Initial.ModTime) {
 			t.Fatalf("positive target warm failed: %+v", value)
 		}
 	}
@@ -644,22 +791,52 @@ func parentRunCell(t *testing.T, name, order string, share uint32, watched bool,
 			}
 		}
 	}
+	var rename storage.RenameRequest
+	if kind == "replacement" {
+		rename = storage.RenameRequest{Source: nativeTestTarget(t, metadataParent, "replacement"), Destination: nativeTestTarget(t, metadataParent, "target")}
+	}
 	action := nativeAction(t, session)
 	q := parentInvalidationQualification{Watched: watched, Pending: watched, SameConnection: same, FirstExposure: exposure, EarliestExpiry: exposure.Add(cacheGatePositiveTTL(t)), Initial: report.Initial}
+	if kind == "replacement" {
+		prepared, bad := cacheGatePositiveWireSnapshot()
+		if bad || !parentColdSource(prepared, time.Now()) {
+			t.Fatal("replacement B coldness is unproven before mutation")
+		}
+	}
 	q.WriteStarted = time.Now()
-	receipt, err := file.WriteAt(t.Context(), storage.FileWriteRequest{Data: after}, action)
+	report.MutationBoundarySequence = nextEvent()
+	var receipt storage.FileActionReceipt
+	switch kind {
+	case "growth":
+		receipt, err = file.WriteAt(t.Context(), storage.FileWriteRequest{Data: after}, action)
+	case "shrink":
+		receipt, err = file.Truncate(t.Context(), storage.FileTruncateRequest{Size: 73}, action)
+	case "replacement":
+		receipt, err = replacement.Rename(t.Context(), rename, action)
+	}
 	q.ACK = time.Now()
 	report.Expected = receipt.Observation.Attr
 	q.Expected = report.Expected
 	cacheGateObserve("parent_http_write_ack", map[string]any{"ack": q.ACK, "action": action, "receipt": receipt, "error": fmt.Sprint(err)})
-	if err != nil || receipt.State != storage.FileActionCompleted || receipt.Effects&storage.EffectContentChanged == 0 {
-		t.Fatalf("remote growth outcome unknown: %+v, %v", receipt, err)
+	effect := storage.EffectContentChanged
+	if kind == "replacement" {
+		effect = storage.EffectEntryMoved
 	}
-	if watched {
-		waitStarted := time.Now()
+	if err != nil || receipt.State != storage.FileActionCompleted || receipt.Effects&effect == 0 {
+		t.Fatalf("remote mutation outcome unknown: %+v, %v", receipt, err)
+	}
+	if kind == "replacement" {
+		if err := parentCollectRename(t, watch, report, &q, beginCall, endCall); err != nil {
+			report.Error = err.Error()
+			report.Qualification = q
+			t.Error("replacement notification inconclusive:", err)
+			return report
+		}
+	} else if watched {
+		call := beginCall("notify-wait", report.UNC)
 		items, notifyErr := watch.complete(q.ACK.Add(850 * time.Millisecond))
 		q.NotifyCompleted = time.Now()
-		report.NativeCalls = append(report.NativeCalls, parentNativeCall{API: "notify-wait", Path: report.UNC, Started: waitStarted, Completed: q.NotifyCompleted})
+		endCall(call, nil)
 		report.NativeNotify = items
 		if notifyErr != nil {
 			report.Error = notifyErr.Error()
@@ -669,12 +846,41 @@ func parentRunCell(t *testing.T, name, order string, share uint32, watched bool,
 		}
 		q.NativeModified = parentHasModified(items)
 	}
-	q.Native = cacheGatePositivePath(path)
-	report.NativeCalls = append(report.NativeCalls, parentNativeCall{API: "first-attributes", Path: path, Started: q.Native.Started, Completed: q.Native.Completed})
+	if kind == "replacement" {
+		firstCall := beginCall("first-open", path)
+		newHandle, opened := cacheGatePositiveOpenSync(t, path)
+		q.Native = opened
+		endCall(firstCall, &q.Native)
+		if newHandle == nil {
+			report.IdentityResult = "replacement_first_open_failed"
+		} else {
+			call := beginCall("new-identity", path)
+			report.NewIdentity = cacheGatePositiveIdentity(newHandle)
+			endCall(call, nil)
+			call = beginCall("old-identity", path)
+			report.RetainedIdentity = cacheGatePositiveIdentity(oldHandle)
+			endCall(call, nil)
+			call = beginCall("old-read", path)
+			report.RetainedRead = cacheGatePositiveReadSync(oldHandle)
+			endCall(call, nil)
+			call = beginCall("new-read", path)
+			report.NewRead = cacheGatePositiveReadSync(newHandle)
+			endCall(call, nil)
+			report.IdentityResult = parentRelativeIdentity(report.OldIdentity, report.NewIdentity, report.RetainedIdentity, report.RetainedRead, report.NewRead, before, after)
+		}
+	} else {
+		firstCall := beginCall("first-attributes", path)
+		q.Native = cacheGatePositivePath(path)
+		endCall(firstCall, &q.Native)
+	}
 	records, incomplete = parentJoinSelectedTrace(q.Native, report.Pending)
 	_, results, notifyIncomplete := parentNotifySnapshot()
 	q.TraceComplete = !incomplete && !notifyIncomplete
-	q.Quiet = parentHarnessQuiet(report.NativeCalls, q.WriteStarted, q.Native)
+	q.Quiet = parentHarnessQuiet(report.NativeCalls, report.MutationBoundarySequence, q.Native)
+	if kind == "replacement" {
+		q.Quiet = parentHarnessOrdered(report.NativeCalls, report.MutationBoundarySequence, q.Native, true)
+		report.ColdSource = parentColdSource(records, q.ACK)
+	}
 	var matchingNotify *parentNotifyResult
 	for _, result := range results {
 		if report.Pending != nil && result.Request.Key == report.Pending.Key && result.Request.Filter == parentNotifyFilter && result.Request.Recursive && !result.At.Before(q.WriteStarted) && !result.At.After(q.Native.Completed.Add(200*time.Millisecond)) && parentHasModified(result.Items) {
@@ -682,6 +888,10 @@ func parentRunCell(t *testing.T, name, order string, share uint32, watched bool,
 			matched := result
 			matchingNotify = &matched
 		}
+	}
+	if kind == "replacement" && len(report.NotifyBatches) > 0 {
+		last := report.NotifyBatches[len(report.NotifyBatches)-1].Wire
+		matchingNotify = &last
 	}
 	q.FreshTargetTraffic, report.Mechanism = parentRefreshProof(records, q.WriteStarted, q.Native, connection, report.Expected, matchingNotify)
 	for _, r := range records {
@@ -696,10 +906,25 @@ func parentRunCell(t *testing.T, name, order string, share uint32, watched bool,
 		}
 	}
 	report.Qualification = q
-	report.Classification, report.WithinOneSecondProven = parentInvalidationClassify(q)
+	switch kind {
+	case "growth":
+		report.Classification, report.WithinOneSecondProven = parentInvalidationClassify(q)
+	case "shrink":
+		report.Classification, report.WithinOneSecondProven = parentSizeClassify(q, 769, 73)
+	case "replacement":
+		report.Classification, report.WithinOneSecondProven = parentReplacementClassify(q, report)
+	}
 	cacheGateObserve("parent_first_result", report)
 	// The independent oracle runs only after the single measured native query.
-	cacheGatePositiveOracle(t, file, report.Expected, after)
+	if kind == "replacement" {
+		cacheGatePositiveOracle(t, file, report.Initial, before)
+		cacheGatePositiveOracle(t, replacement, report.Expected, after)
+		if _, err := bridge.remote.Stat(t.Context(), "v/replacement"); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("replacement source name was not removed: %v", err)
+		}
+	} else {
+		cacheGatePositiveOracle(t, file, report.Expected, after)
+	}
 	report.OracleVerified = true
 	runtime.KeepAlive(application)
 	runtime.KeepAlive(watch)
@@ -726,17 +951,19 @@ func TestNativeParentInvalidation(t *testing.T) {
 		}
 	})
 	for _, cell := range []struct {
-		name, order string
-		share       uint32
-		watched     bool
+		name, order, kind string
+		share             uint32
+		watched           bool
 	}{
-		{"noWatcher", "app_first", 0, false},
-		{"share0_watcher_first", "watcher_first", 0, true},
-		{"share0_app_first", "app_first", 0, true},
-		{"share6_watcher_first", "watcher_first", 6, true},
-		{"share6_app_first", "app_first", 6, true},
+		{"noWatcher", "app_first", "growth", 0, false},
+		{"share0_watcher_first", "watcher_first", "growth", 0, true},
+		{"share0_app_first", "app_first", "growth", 0, true},
+		{"share6_watcher_first", "watcher_first", "growth", 6, true},
+		{"share6_app_first", "app_first", "growth", 6, true},
+		{"share0_app_first_shrink", "app_first", "shrink", 0, true},
+		{"share0_app_first_replace_identity", "app_first", "replacement", 0, true},
 	} {
-		reports[cell.name] = &parentInvalidationReport{Name: cell.name, ShareMode: cell.share, Order: cell.order, Classification: "inconclusive"}
+		reports[cell.name] = &parentInvalidationReport{Kind: cell.kind, Name: cell.name, ShareMode: cell.share, Order: cell.order, Classification: "inconclusive"}
 		t.Run(cell.name, func(t *testing.T) {
 			parentRunCell(t, cell.name, cell.order, cell.share, cell.watched, reports[cell.name])
 		})
@@ -838,6 +1065,8 @@ func TestParentInvalidationHookCorrelation(t *testing.T) {
 	}
 }
 func TestParentInvalidationQualification(t *testing.T) {
+	parentTestExpandedCases(t)
+	parentTestReplacementQualification(t)
 	t.Run("target shares observed parent connection", func(t *testing.T) {
 		records := []cacheGatePositiveWireRecord{
 			{Response: true, Command: wire.Create, Connection: 1, SessionID: 9, Name: "", FileID: "root"},
@@ -873,22 +1102,79 @@ func TestParentInvalidationQualification(t *testing.T) {
 			})
 		}
 	})
-	t.Run("harness ledger excludes automatic redirector traffic", func(t *testing.T) {
+	t.Run("ordered harness ledger tolerates tied clocks", func(t *testing.T) {
 		at := time.Unix(1800000000, 0)
-		first := cacheGatePositiveValue{Started: at.Add(100 * time.Millisecond), Completed: at.Add(200 * time.Millisecond)}
-		calls := []parentNativeCall{{API: "warm-attributes", Started: at.Add(-time.Second), Completed: at.Add(-time.Millisecond)}, {API: "notify-wait", Started: at, Completed: at.Add(50 * time.Millisecond)}, {API: "first-attributes", Started: first.Started, Completed: first.Completed}}
-		if !parentHarnessQuiet(calls, at, first) {
-			t.Fatal("quiet native ledger rejected")
+		first := cacheGatePositiveValue{Started: at, Completed: at, Size: 769, MTime: 17}
+		calls := []parentNativeCall{
+			{API: "warm-attributes", Started: at, Completed: at, BeginSequence: 1, EndSequence: 2},
+			{API: "notify-wait", Started: at, Completed: at, BeginSequence: 4, EndSequence: 5},
+			{API: "first-attributes", Started: at, Completed: at, BeginSequence: 6, EndSequence: 7, Selected: &first},
+		}
+		if !parentHarnessQuiet(calls, 3, first) {
+			t.Fatal("ordered prep with tied timestamps rejected")
 		}
 		for _, api := range []string{"open-application", "warm-attributes", "enumerate", "get-info", "read"} {
-			contaminated := append(append([]parentNativeCall(nil), calls...), parentNativeCall{API: api, Started: at.Add(25 * time.Millisecond), Completed: at.Add(30 * time.Millisecond)})
-			if parentHarnessQuiet(contaminated, at, first) {
-				t.Fatalf("intervening harness %s accepted", api)
+			contaminated := append([]parentNativeCall(nil), calls[:2]...)
+			contaminated = append(contaminated, parentNativeCall{API: api, Started: at, Completed: at, BeginSequence: 6, EndSequence: 7})
+			selected := calls[2]
+			selected.BeginSequence, selected.EndSequence = 8, 9
+			contaminated = append(contaminated, selected)
+			if parentHarnessQuiet(contaminated, 3, first) {
+				t.Fatalf("tied-clock intervening %s accepted", api)
 			}
 		}
-		if parentHarnessQuiet(append(calls, calls[len(calls)-1]), at, first) {
-			t.Fatal("multiple first queries accepted")
+		for _, test := range []struct {
+			name   string
+			change func([]parentNativeCall, *uint64)
+		}{
+			{"zero boundary", func(_ []parentNativeCall, b *uint64) { *b = 0 }},
+			{"missing begin", func(c []parentNativeCall, _ *uint64) { c[0].BeginSequence = 0 }},
+			{"missing end", func(c []parentNativeCall, _ *uint64) { c[0].EndSequence = 0 }},
+			{"duplicate sequence", func(c []parentNativeCall, _ *uint64) { c[1].EndSequence = c[0].EndSequence }},
+			{"reversed sequence", func(c []parentNativeCall, _ *uint64) { c[0].BeginSequence, c[0].EndSequence = 2, 1 }},
+			{"missing event", func(c []parentNativeCall, _ *uint64) { c[2].EndSequence = 8 }},
+			{"boundary spans forbidden call", func(c []parentNativeCall, b *uint64) { *b = 2; c[0].EndSequence = 3 }},
+			{"postboundary forbidden call", func(c []parentNativeCall, _ *uint64) { c[1].API = "get-info" }},
+			{"selected before boundary", func(c []parentNativeCall, b *uint64) { *b = 7; c[2].BeginSequence, c[2].EndSequence = 3, 6 }},
+			{"selected observation missing", func(c []parentNativeCall, _ *uint64) { c[2].Selected = nil }},
+			{"selected value mismatch", func(c []parentNativeCall, _ *uint64) { v := *c[2].Selected; v.Size++; c[2].Selected = &v }},
+			{"selected time mismatch", func(c []parentNativeCall, _ *uint64) {
+				v := *c[2].Selected
+				v.Started = v.Started.Add(time.Nanosecond)
+				c[2].Selected = &v
+			}},
+			{"selected duplicated", func(c []parentNativeCall, _ *uint64) { c[1].API = "first-attributes"; c[1].Selected = &first }},
+			{"record order reversed", func(c []parentNativeCall, _ *uint64) { c[0], c[1] = c[1], c[0] }},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				changed := append([]parentNativeCall(nil), calls...)
+				boundary := uint64(3)
+				test.change(changed, &boundary)
+				if parentHarnessQuiet(changed, boundary, first) {
+					t.Fatal("invalid ordered ledger accepted")
+				}
+			})
 		}
+		observed := first
+		observed.Started = time.Now()
+		observed.Completed = observed.Started
+		encoded, err := json.Marshal(observed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded cacheGatePositiveValue
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		roundtrip := append([]parentNativeCall(nil), calls...)
+		roundtrip[2].Started, roundtrip[2].Completed, roundtrip[2].Selected = observed.Started, observed.Completed, &decoded
+		if !parentHarnessQuiet(roundtrip, 3, observed) {
+			t.Fatal("JSON observation lost semantic time identity")
+		}
+	})
+	t.Run("automatic redirector refresh remains eligible", func(t *testing.T) {
+		at := time.Unix(1800000000, 0)
+		first := cacheGatePositiveValue{Started: at.Add(100 * time.Millisecond), Completed: at.Add(200 * time.Millisecond)}
 		expected := storage.Attr{Size: 769, ModTime: at}
 		request := cacheGatePositiveWireRecord{At: at.Add(10 * time.Millisecond), Connection: 2, SessionID: 9, MessageID: 7, Command: wire.Create, Name: `v\target`}
 		response := request
@@ -988,4 +1274,594 @@ func TestParentInvalidationQualification(t *testing.T) {
 	if classification, proved := parentInvalidationClassify(q); classification != "inconclusive" || proved {
 		t.Fatal("late control became timely proof", classification, proved)
 	}
+}
+
+type parentNotifyBatch struct {
+	Pending   parentNotifyRequest
+	Native    []parentNotifyItem
+	Wire      parentNotifyResult
+	Completed time.Time
+}
+
+func parentRenameBatchState(batches []parentNotifyBatch, original parentNotifyRequest) (bool, bool) {
+	if len(batches) == 0 || len(batches) > 3 {
+		return false, false
+	}
+	removed, renamed := false, false
+	seen := map[parentNotifyKey]bool{}
+	for _, batch := range batches {
+		p := batch.Pending
+		if p.Key.Connection != original.Key.Connection || p.Session != original.Session || p.FileID != original.FileID || p.Filter != parentNotifyFilter || !p.Recursive || seen[p.Key] || batch.Wire.Request != p || !slices.Equal(batch.Native, batch.Wire.Items) || len(batch.Native) == 0 {
+			return false, false
+		}
+		seen[p.Key] = true
+		for i := 0; i < len(batch.Native); i++ {
+			item := batch.Native[i]
+			if item.Action == 2 && item.Name == `v\target` && !removed && !renamed {
+				removed = true
+				continue
+			}
+			if item.Action == 4 && item.Name == `v\replacement` && removed && !renamed && i+1 < len(batch.Native) && batch.Native[i+1] == (parentNotifyItem{5, `v\target`}) {
+				renamed = true
+				i++
+				continue
+			}
+			return false, false
+		}
+	}
+	return removed && renamed, true
+}
+func parentRecheckColdSource(report *parentInvalidationReport, records []cacheGatePositiveWireRecord) bool {
+	if report.Kind != "replacement" {
+		return true
+	}
+	report.ColdSource = report.ColdSource && parentColdSource(records, report.Qualification.ACK)
+	if !report.ColdSource {
+		report.EvidenceValid = false
+		report.WithinOneSecondProven = false
+		report.Classification = "inconclusive"
+	}
+	return report.ColdSource
+}
+
+func parentColdSource(records []cacheGatePositiveWireRecord, boundary time.Time) bool {
+	type fileKey struct {
+		Connection uint64
+		ID         string
+	}
+	type createKey struct{ Connection, Message uint64 }
+	known := map[fileKey]bool{}
+	creates := map[createKey]string{}
+	for _, r := range records {
+		if r.Name == `v\replacement` && (r.Command == wire.Create || r.Command == wire.QueryInfo || r.Command == wire.Read) {
+			return false
+		}
+		if r.At.After(boundary) {
+			continue
+		}
+		if r.Command == wire.QueryDirectory {
+			return false
+		}
+		if r.Name != "" && r.Name != "v" && r.Name != `v\target` {
+			return false
+		}
+		if r.Command == wire.Create && r.Response && r.Status == 0 && r.FileID != "" {
+			known[fileKey{r.Connection, r.FileID}] = true
+			creates[createKey{r.Connection, r.MessageID}] = r.FileID
+		}
+	}
+	for _, r := range records {
+		if r.At.After(boundary) || r.Response || (r.Command != wire.Read && r.Command != wire.QueryInfo) {
+			continue
+		}
+		id := r.FileID
+		if r.RelatedCreate != 0 {
+			id = creates[createKey{r.Connection, r.RelatedCreate}]
+		}
+		if id == "" || !known[fileKey{r.Connection, id}] {
+			return false
+		}
+	}
+	return true
+}
+func parentRelativeIdentity(initial, current, retained, oldRead, newRead cacheGatePositiveValue, oldData, newData []byte) string {
+	if initial.Error != "" || current.Error != "" || retained.Error != "" || initial.Identity == 0 || current.Identity == 0 || retained.Identity == 0 {
+		return "identity_unavailable"
+	}
+	if current.Volume != initial.Volume || retained.Volume != initial.Volume {
+		return "volume_identity_changed"
+	}
+	if initial.Size != int64(len(oldData)) || retained.Size != int64(len(oldData)) || current.Size != int64(len(newData)) {
+		return "native_handle_size_wrong"
+	}
+	if retained.Identity != initial.Identity {
+		return "retained_identity_changed"
+	}
+	if current.Identity == initial.Identity {
+		return "replacement_identity_aliased"
+	}
+	if oldRead.Error != "" || oldRead.Count != uint32(len(oldData)) || oldRead.Digest != cacheGatePositiveDigest(oldData) {
+		return "retained_bytes_changed"
+	}
+	if newRead.Error != "" || newRead.Count != uint32(len(newData)) || newRead.Digest != cacheGatePositiveDigest(newData) {
+		return "replacement_bytes_wrong"
+	}
+	return "distinct_native_identity_and_preserved_bytes"
+}
+func parentWithinWindow(value cacheGatePositiveValue, ack, expiry time.Time) bool {
+	return !value.Started.Before(ack) && !value.Completed.Before(value.Started) && !value.Completed.After(ack.Add(time.Second)) && value.Completed.Before(expiry)
+}
+func parentReplacementClassify(q parentInvalidationQualification, report *parentInvalidationReport) (string, bool) {
+	if !q.TraceComplete || !q.SameConnection || !q.Quiet || report.Pending == nil || !report.ColdSource || !q.Pending || !parentWithinWindow(q.Native, q.ACK, q.EarliestExpiry) || q.FirstExposure.IsZero() || q.Initial.Size != 257 || report.PreparedB.Size != 769 || q.Expected.ID == q.Initial.ID || q.Expected.ID != report.PreparedB.ID || q.Expected.Size != 769 || !q.Expected.ModTime.Equal(report.PreparedB.ModTime) || q.Expected.MetadataRevision < report.PreparedB.MetadataRevision || q.NotifyCompleted.IsZero() || q.NotifyCompleted.Before(q.WriteStarted) || q.NotifyCompleted.After(q.Native.Started) {
+		return "inconclusive", false
+	}
+	complete, valid := parentRenameBatchState(report.NotifyBatches, *report.Pending)
+	for _, batch := range report.NotifyBatches {
+		if batch.Completed.Before(q.WriteStarted) || batch.Completed.After(q.ACK.Add(850*time.Millisecond)) || batch.Wire.At.Before(q.WriteStarted) || batch.Wire.At.After(q.Native.Started) {
+			return "inconclusive", false
+		}
+	}
+	if !valid || !complete {
+		return "inconclusive", false
+	}
+	if q.Native.Error != "" {
+		return "replacement_first_open_failed", false
+	}
+	for _, value := range []cacheGatePositiveValue{report.NewIdentity, report.RetainedIdentity, report.RetainedRead, report.NewRead} {
+		if !parentWithinWindow(value, q.ACK, q.EarliestExpiry) {
+			return "replacement_native_check_deadline_failed", false
+		}
+	}
+	if report.IdentityResult != "distinct_native_identity_and_preserved_bytes" {
+		return report.IdentityResult, false
+	}
+	if !q.FreshTargetTraffic {
+		return "inconclusive", false
+	}
+	return "current_replacement_identity_before_deadline", true
+}
+
+func (w *parentNativeWatch) rearm() error {
+	if !w.done {
+		return errors.New("rearm attempted before notification drain")
+	}
+	if err := win.ResetEvent(w.event); err != nil {
+		return err
+	}
+	clear(w.buffer)
+	w.overlap = win.Overlapped{HEvent: w.event}
+	err := win.ReadDirectoryChanges(w.file.value, &w.buffer[0], uint32(len(w.buffer)), true, parentNotifyFilter, nil, &w.overlap, 0)
+	if err != nil && !errors.Is(err, win.ERROR_IO_PENDING) {
+		return err
+	}
+	w.done = false
+	return nil
+}
+func parentNotificationResult(current parentNotifyRequest, deadline time.Time) (parentNotifyResult, error) {
+	for {
+		if time.Now().After(deadline) {
+			return parentNotifyResult{}, errors.New("notification trace join exceeded absolute deadline")
+		}
+		_, results, bad := parentNotifySnapshot()
+		_, incomplete := cacheGatePositiveWireSnapshot()
+		if bad || incomplete {
+			return parentNotifyResult{}, errors.New("notification evidence incomplete")
+		}
+		for _, result := range results {
+			if result.Request.Key == current.Key {
+				return result, nil
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return parentNotifyResult{}, errors.New("notification trace join exceeded absolute deadline")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+func parentSelectRearmPending(original parentNotifyRequest, previous map[parentNotifyKey]bool, requests []parentNotifyRequest, records []cacheGatePositiveWireRecord) (parentNotifyRequest, bool, error) {
+	for _, request := range requests {
+		if previous[request.Key] {
+			continue
+		}
+		if request.Key.Connection != original.Key.Connection || request.Session != original.Session || request.FileID != original.FileID || request.Filter != original.Filter || request.Recursive != original.Recursive {
+			return parentNotifyRequest{}, false, errors.New("rearm changed watcher identity or filter")
+		}
+		for _, r := range records {
+			if r.Response && r.Command == wire.ChangeNotify && r.Connection == request.Key.Connection && r.SessionID == request.Session && r.MessageID == request.Key.MessageID && r.Status == 0x103 {
+				return request, true, nil
+			}
+		}
+	}
+	return parentNotifyRequest{}, false, nil
+}
+func parentRearmedPending(original parentNotifyRequest, previous map[parentNotifyKey]bool, deadline time.Time) (parentNotifyRequest, error) {
+	for {
+		if time.Now().After(deadline) {
+			return parentNotifyRequest{}, errors.New("rearm pending exceeded absolute deadline")
+		}
+		requests, _, bad := parentNotifySnapshot()
+		records, incomplete := cacheGatePositiveWireSnapshot()
+		if bad || incomplete {
+			return parentNotifyRequest{}, errors.New("rearmed notification evidence incomplete")
+		}
+		request, found, err := parentSelectRearmPending(original, previous, requests, records)
+		if err != nil {
+			return parentNotifyRequest{}, err
+		}
+		if found {
+			return request, nil
+		}
+		if !time.Now().Before(deadline) {
+			return parentNotifyRequest{}, errors.New("rearm did not establish a new actual pending request")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+func parentCollectRename(t *testing.T, watch *parentNativeWatch, report *parentInvalidationReport, q *parentInvalidationQualification, begin func(string, string) int, end func(int, *cacheGatePositiveValue)) error {
+	current, original := *report.Pending, *report.Pending
+	deadline := q.ACK.Add(850 * time.Millisecond)
+	for index := 0; index < 3; index++ {
+		call := begin("notify-wait", report.UNC)
+		items, err := watch.complete(deadline)
+		q.NotifyCompleted = time.Now()
+		end(call, nil)
+		if err != nil {
+			return err
+		}
+		result, err := parentNotificationResult(current, deadline)
+		if err != nil {
+			return err
+		}
+		if result.At.Before(q.WriteStarted) || q.NotifyCompleted.After(deadline) {
+			return errors.New("rename notification outside measured interval")
+		}
+		report.NotifyBatches = append(report.NotifyBatches, parentNotifyBatch{Pending: current, Native: items, Wire: result, Completed: q.NotifyCompleted})
+		report.NativeNotify = append(report.NativeNotify, items...)
+		complete, valid := parentRenameBatchState(report.NotifyBatches, original)
+		if !valid {
+			return errors.New("rename notification names, order, or lineage ambiguous")
+		}
+		if complete {
+			return nil
+		}
+		if index == 2 {
+			return errors.New("rename notification batch bound exhausted")
+		}
+		requests, _, bad := parentNotifySnapshot()
+		if bad {
+			return errors.New("notification request history incomplete")
+		}
+		previous := make(map[parentNotifyKey]bool, len(requests))
+		for _, request := range requests {
+			previous[request.Key] = true
+		}
+		call = begin("notify-rearm", report.UNC)
+		err = watch.rearm()
+		end(call, nil)
+		if err != nil {
+			return err
+		}
+		current, err = parentRearmedPending(original, previous, deadline)
+		if err != nil {
+			return err
+		}
+	}
+	return errors.New("rename notifications incomplete")
+}
+
+func parentTestExpandedCases(t *testing.T) {
+	t.Run("final drained trace can invalidate but never upgrade coldness", func(t *testing.T) {
+		at := time.Unix(1800000000, 0)
+		early := []cacheGatePositiveWireRecord{{At: at, Response: true, Command: wire.Create, Connection: 1, Name: `v\target`, FileID: "A"}}
+		identity := "distinct_native_identity_and_preserved_bytes"
+		report := parentInvalidationReport{Kind: "replacement", ColdSource: true, EvidenceValid: true, WithinOneSecondProven: true, Classification: "current_replacement_identity_before_deadline", IdentityResult: identity, Qualification: parentInvalidationQualification{ACK: at}}
+		if !parentRecheckColdSource(&report, early) {
+			t.Fatal("clean early source trace rejected")
+		}
+		drained := append(slices.Clone(early), cacheGatePositiveWireRecord{At: at.Add(time.Millisecond), Response: true, Command: wire.Create, Connection: 1, Name: `v\replacement`, FileID: "B"})
+		if parentRecheckColdSource(&report, drained) || report.ColdSource || report.EvidenceValid || report.WithinOneSecondProven || report.Classification != "inconclusive" {
+			t.Fatal("late B exposure retained a successful verdict")
+		}
+		if report.IdentityResult != identity {
+			t.Fatal("coldness failure erased raw native identity outcome")
+		}
+		if parentRecheckColdSource(&report, early) || report.ColdSource || report.WithinOneSecondProven {
+			t.Fatal("later clean trace upgraded known failed coldness")
+		}
+		growth := parentInvalidationReport{Kind: "growth", EvidenceValid: true, WithinOneSecondProven: true, Classification: "current_before_deadline"}
+		if !parentRecheckColdSource(&growth, drained) || !growth.EvidenceValid || !growth.WithinOneSecondProven {
+			t.Fatal("replacement coldness changed existing growth qualification")
+		}
+	})
+	t.Run("bounded rearm ordering and current pending identity", func(t *testing.T) {
+		at := time.Unix(1800000000, 0)
+		first := cacheGatePositiveValue{Started: at, Completed: at}
+		makeCalls := func(arms int) []parentNativeCall {
+			calls := []parentNativeCall{{API: "warm-attributes", Started: at, Completed: at, BeginSequence: 1, EndSequence: 2}}
+			sequence := uint64(4)
+			add := func(api string) {
+				calls = append(calls, parentNativeCall{API: api, Started: at, Completed: at, BeginSequence: sequence, EndSequence: sequence + 1})
+				sequence += 2
+			}
+			add("notify-wait")
+			for i := 0; i < arms; i++ {
+				add("notify-rearm")
+				add("notify-wait")
+			}
+			add("first-open")
+			calls[len(calls)-1].Selected = &first
+			for _, api := range []string{"new-identity", "old-identity", "old-read", "new-read"} {
+				add(api)
+			}
+			return calls
+		}
+		if !parentHarnessOrdered(makeCalls(2), 3, first, true) {
+			t.Fatal("three drained notification batches rejected")
+		}
+		if parentHarnessOrdered(makeCalls(3), 3, first, true) {
+			t.Fatal("fourth notification batch accepted")
+		}
+		if parentHarnessOrdered(makeCalls(1), 3, first, false) {
+			t.Fatal("replacement rearm leaked into growth contract")
+		}
+		calls := makeCalls(1)
+		calls[2].API = "open-watcher"
+		if parentHarnessOrdered(calls, 3, first, true) {
+			t.Fatal("reopening a watcher path accepted as rearm")
+		}
+		calls = makeCalls(1)
+		calls[len(calls)-4].API = "old-identity"
+		calls[len(calls)-3].API = "new-identity"
+		if parentHarnessOrdered(calls, 3, first, true) {
+			t.Fatal("old handle query preceded first new identity")
+		}
+		original := parentNotifyRequest{Key: parentNotifyKey{1, 3}, Session: 9, FileID: "root", Filter: parentNotifyFilter, Recursive: true}
+		next := original
+		next.Key.MessageID = 4
+		previous := map[parentNotifyKey]bool{original.Key: true}
+		pending := cacheGatePositiveWireRecord{Response: true, Command: wire.ChangeNotify, Connection: 1, SessionID: 9, MessageID: 3, Status: 0x103}
+		if _, found, err := parentSelectRearmPending(original, previous, []parentNotifyRequest{original, next}, []cacheGatePositiveWireRecord{pending}); err != nil || found {
+			t.Fatal("old STATUS_PENDING satisfied rearm")
+		}
+		pending.MessageID = 4
+		if got, found, err := parentSelectRearmPending(original, previous, []parentNotifyRequest{original, next}, []cacheGatePositiveWireRecord{pending}); err != nil || !found || got.Key != next.Key {
+			t.Fatal("new actual pending rejected")
+		}
+		pending.SessionID = 10
+		if _, found, _ := parentSelectRearmPending(original, previous, []parentNotifyRequest{next}, []cacheGatePositiveWireRecord{pending}); found {
+			t.Fatal("wrong pending session accepted")
+		}
+		next.FileID = "other"
+		if _, _, err := parentSelectRearmPending(original, previous, []parentNotifyRequest{next}, nil); err == nil {
+			t.Fatal("watcher identity changed during rearm")
+		}
+	})
+	t.Run("shrink requires exact new tuple", func(t *testing.T) {
+		at := time.Unix(1800000000, 0)
+		q := parentInvalidationQualification{Watched: true, Pending: true, NativeModified: true, WireModified: true, SameConnection: true, Quiet: true, FreshTargetTraffic: true, TraceComplete: true, ACK: at, WriteStarted: at, NotifyCompleted: at.Add(10 * time.Millisecond), FirstExposure: at.Add(-time.Second), EarliestExpiry: at.Add(4 * time.Second), Initial: storage.Attr{ID: 3, Size: 769, MetadataRevision: 2, ModTime: at.Add(-time.Hour)}, Expected: storage.Attr{ID: 3, Size: 73, MetadataRevision: 3, ModTime: at}, Native: cacheGatePositiveValue{Started: at.Add(20 * time.Millisecond), Completed: at.Add(30 * time.Millisecond), Size: 73, MTime: cacheGatePositiveTime(at)}}
+		if result, ok := parentSizeClassify(q, 769, 73); !ok || result != "current_before_deadline" {
+			t.Fatal(result, ok)
+		}
+		for _, test := range []struct {
+			name   string
+			mutate func(*parentInvalidationQualification)
+		}{
+			{"wrong EOF", func(q *parentInvalidationQualification) { q.Native.Size = 257 }},
+			{"old mtime", func(q *parentInvalidationQualification) { q.Native.MTime = cacheGatePositiveTime(q.Initial.ModTime) }},
+			{"unchanged revision", func(q *parentInvalidationQualification) { q.Expected.MetadataRevision = q.Initial.MetadataRevision }},
+			{"changed node", func(q *parentInvalidationQualification) { q.Expected.ID++ }},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				changed := q
+				test.mutate(&changed)
+				if _, ok := parentSizeClassify(changed, 769, 73); ok {
+					t.Fatal("wrong shrink tuple accepted")
+				}
+			})
+		}
+	})
+	t.Run("rename batches retain exact lineage and adjacent pair", func(t *testing.T) {
+		original := parentNotifyRequest{Key: parentNotifyKey{1, 3}, Session: 9, FileID: "root", Filter: parentNotifyFilter, Recursive: true, Capacity: 4096}
+		makeBatches := func() []parentNotifyBatch {
+			next := original
+			next.Key.MessageID++
+			removed := []parentNotifyItem{{2, `v\target`}}
+			renamed := []parentNotifyItem{{4, `v\replacement`}, {5, `v\target`}}
+			return []parentNotifyBatch{{Pending: original, Native: slices.Clone(removed), Wire: parentNotifyResult{Request: original, Items: slices.Clone(removed)}}, {Pending: next, Native: slices.Clone(renamed), Wire: parentNotifyResult{Request: next, Items: slices.Clone(renamed)}}}
+		}
+		if complete, valid := parentRenameBatchState(makeBatches(), original); !valid || !complete {
+			t.Fatal("complete replacement notifications rejected")
+		}
+		if complete, valid := parentRenameBatchState(makeBatches()[:1], original); !valid || complete {
+			t.Fatal("removed-only prefix is not bounded pending progress")
+		}
+		for _, test := range []struct {
+			name   string
+			mutate func([]parentNotifyBatch) []parentNotifyBatch
+		}{
+			{"consumed pending MID", func(b []parentNotifyBatch) []parentNotifyBatch {
+				b[1].Pending = b[0].Pending
+				b[1].Wire.Request = b[1].Pending
+				return b
+			}},
+			{"different connection", func(b []parentNotifyBatch) []parentNotifyBatch {
+				b[1].Pending.Key.Connection++
+				b[1].Wire.Request = b[1].Pending
+				return b
+			}},
+			{"different session", func(b []parentNotifyBatch) []parentNotifyBatch {
+				b[1].Pending.Session++
+				b[1].Wire.Request = b[1].Pending
+				return b
+			}},
+			{"different watcher", func(b []parentNotifyBatch) []parentNotifyBatch {
+				b[1].Pending.FileID = "other"
+				b[1].Wire.Request = b[1].Pending
+				return b
+			}},
+			{"wrong filter", func(b []parentNotifyBatch) []parentNotifyBatch {
+				b[1].Pending.Filter = 3
+				b[1].Wire.Request = b[1].Pending
+				return b
+			}},
+			{"native wire mismatch", func(b []parentNotifyBatch) []parentNotifyBatch { b[1].Wire.Items[1].Name = "other"; return b }},
+			{"reversed rename pair", func(b []parentNotifyBatch) []parentNotifyBatch {
+				slices.Reverse(b[1].Native)
+				b[1].Wire.Items = slices.Clone(b[1].Native)
+				return b
+			}},
+			{"split rename pair", func(b []parentNotifyBatch) []parentNotifyBatch {
+				last := b[1]
+				last.Pending.Key.MessageID++
+				last.Native = slices.Clone(last.Native[1:])
+				last.Wire = parentNotifyResult{Request: last.Pending, Items: slices.Clone(last.Native)}
+				b[1].Native = b[1].Native[:1]
+				b[1].Wire.Items = b[1].Wire.Items[:1]
+				return append(b, last)
+			}},
+			{"rename before removal", func(b []parentNotifyBatch) []parentNotifyBatch { return []parentNotifyBatch{b[1], b[0]} }},
+			{"batch bound", func(b []parentNotifyBatch) []parentNotifyBatch { return append(b, b...) }},
+			{"unexpected modification", func(b []parentNotifyBatch) []parentNotifyBatch {
+				b[0].Native[0].Action = 3
+				b[0].Wire.Items[0].Action = 3
+				return b
+			}},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				if complete, valid := parentRenameBatchState(test.mutate(makeBatches()), original); valid || complete {
+					t.Fatal("ambiguous rename notifications accepted")
+				}
+			})
+		}
+	})
+	t.Run("cold replacement source never reaches redirector", func(t *testing.T) {
+		at := time.Unix(1800000000, 0)
+		records := []cacheGatePositiveWireRecord{
+			{At: at, Response: true, Command: wire.Create, Connection: 1, MessageID: 3, Name: "", FileID: "root"},
+			{At: at, Response: true, Command: wire.Create, Connection: 1, MessageID: 4, Name: "v", FileID: "child"},
+			{At: at, Response: true, Command: wire.Create, Connection: 1, MessageID: 5, Name: `v\target`, FileID: "old"},
+			{At: at, Command: wire.QueryInfo, Connection: 1, FileID: "old"},
+			{At: at, Command: wire.Read, Connection: 1, FileID: "ffffffffffffffffffffffffffffffff", RelatedCreate: 5},
+		}
+		if !parentColdSource(records, at) {
+			t.Fatal("known root/v/A and resolved related FileID rejected")
+		}
+		delayed := cacheGatePositiveWireRecord{At: at.Add(time.Millisecond), Response: true, Command: wire.Create, Name: `v\replacement`, Connection: 1, FileID: "B"}
+		if parentColdSource(append(slices.Clone(records), delayed), at) {
+			t.Fatal("delayed successful B response hid source exposure")
+		}
+		intervening := cacheGatePositiveWireRecord{At: at.Add(time.Millisecond), Command: wire.QueryDirectory, Connection: 1}
+		if parentColdSource(append(slices.Clone(records), intervening), at.Add(2*time.Millisecond)) {
+			t.Fatal("pre-ACK directory enumeration escaped coldness audit")
+		}
+		for _, test := range []struct {
+			name   string
+			record cacheGatePositiveWireRecord
+		}{
+			{"B create", cacheGatePositiveWireRecord{Command: wire.Create, Name: `v\replacement`}},
+			{"B named info", cacheGatePositiveWireRecord{Command: wire.QueryInfo, Name: `v\replacement`, FileID: "old"}},
+			{"directory enumeration", cacheGatePositiveWireRecord{Command: wire.QueryDirectory}},
+			{"unknown read FileID", cacheGatePositiveWireRecord{Command: wire.Read, FileID: "unknown"}},
+			{"unknown query FileID", cacheGatePositiveWireRecord{Command: wire.QueryInfo, FileID: "unknown"}},
+			{"unresolved related create", cacheGatePositiveWireRecord{Command: wire.QueryInfo, RelatedCreate: 77, FileID: "old"}},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				r := test.record
+				r.At = at
+				r.Connection = 1
+				if parentColdSource(append(slices.Clone(records), r), at) {
+					t.Fatal("coldness ambiguity accepted")
+				}
+			})
+		}
+	})
+	t.Run("relative Windows identity never equals authority numeric IDs", func(t *testing.T) {
+		a, b := []byte("A"), []byte("BBB")
+		initial := cacheGatePositiveValue{Identity: 3001, Volume: 91, Size: 1}
+		current := cacheGatePositiveValue{Identity: 9007, Volume: 91, Size: 3}
+		oldRead := cacheGatePositiveValue{Count: 1, Digest: cacheGatePositiveDigest(a)}
+		newRead := cacheGatePositiveValue{Count: 3, Digest: cacheGatePositiveDigest(b)}
+		if result := parentRelativeIdentity(initial, current, initial, oldRead, newRead, a, b); result != "distinct_native_identity_and_preserved_bytes" {
+			t.Fatal(result)
+		}
+		for _, test := range []struct {
+			name   string
+			mutate func(*cacheGatePositiveValue, *cacheGatePositiveValue, *cacheGatePositiveValue, *cacheGatePositiveValue)
+		}{
+			{"aliased new ID", func(n, o, r, s *cacheGatePositiveValue) { n.Identity = initial.Identity }},
+			{"unavailable identity", func(n, o, r, s *cacheGatePositiveValue) { n.Error = "unsupported" }},
+			{"zero identity", func(n, o, r, s *cacheGatePositiveValue) { n.Identity = 0 }},
+			{"changed old ID", func(n, o, r, s *cacheGatePositiveValue) { o.Identity++ }},
+			{"changed volume", func(n, o, r, s *cacheGatePositiveValue) { n.Volume++ }},
+			{"wrong old bytes", func(n, o, r, s *cacheGatePositiveValue) { r.Digest = "wrong" }},
+			{"wrong new bytes", func(n, o, r, s *cacheGatePositiveValue) { s.Digest = "wrong" }},
+			{"wrong handle size", func(n, o, r, s *cacheGatePositiveValue) { n.Size = 1 }},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				n, o, r, s := current, initial, oldRead, newRead
+				test.mutate(&n, &o, &r, &s)
+				if result := parentRelativeIdentity(initial, n, o, r, s, a, b); result == "distinct_native_identity_and_preserved_bytes" {
+					t.Fatal("identity or bytes failure became success")
+				}
+			})
+		}
+	})
+}
+
+func parentTestReplacementQualification(t *testing.T) {
+	t.Run("replacement qualification preserves deadlines and identity failures", func(t *testing.T) {
+		at := time.Unix(1800000000, 0)
+		original := parentNotifyRequest{Key: parentNotifyKey{1, 3}, Session: 9, FileID: "root", Filter: parentNotifyFilter, Recursive: true, Capacity: 4096}
+		items := []parentNotifyItem{{2, `v\target`}, {4, `v\replacement`}, {5, `v\target`}}
+		initial := storage.Attr{ID: 3, Size: 257, MetadataRevision: 2, ModTime: at.Add(-time.Hour)}
+		prepared := storage.Attr{ID: 4, Size: 769, MetadataRevision: 3, ModTime: at.Add(-30 * time.Minute)}
+		expected := prepared
+		expected.MetadataRevision++
+		q := parentInvalidationQualification{Watched: true, Pending: true, SameConnection: true, Quiet: true, FreshTargetTraffic: true, TraceComplete: true, ACK: at, WriteStarted: at, NotifyCompleted: at.Add(50 * time.Millisecond), FirstExposure: at.Add(-time.Second), EarliestExpiry: at.Add(4 * time.Second), Initial: initial, Expected: expected, Native: cacheGatePositiveValue{API: "CreateFileW(READ,synchronous)", Started: at.Add(100 * time.Millisecond), Completed: at.Add(150 * time.Millisecond)}}
+		observation := cacheGatePositiveValue{Started: at.Add(160 * time.Millisecond), Completed: at.Add(170 * time.Millisecond)}
+		report := parentInvalidationReport{PreparedB: prepared, ColdSource: true, Pending: &original, NotifyBatches: []parentNotifyBatch{{Pending: original, Native: slices.Clone(items), Wire: parentNotifyResult{Request: original, Items: slices.Clone(items), At: at.Add(60 * time.Millisecond)}, Completed: q.NotifyCompleted}}, NewIdentity: observation, RetainedIdentity: observation, RetainedRead: observation, NewRead: observation, IdentityResult: "distinct_native_identity_and_preserved_bytes"}
+		if result, ok := parentReplacementClassify(q, &report); !ok || result != "current_replacement_identity_before_deadline" {
+			t.Fatal(result, ok)
+		}
+		for _, test := range []struct {
+			name, want string
+			change     func(*parentInvalidationQualification, *parentInvalidationReport)
+		}{
+			{"warm B", "inconclusive", func(q *parentInvalidationQualification, r *parentInvalidationReport) { r.ColdSource = false }},
+			{"wrong authoritative node", "inconclusive", func(q *parentInvalidationQualification, r *parentInvalidationReport) { q.Expected.ID = q.Initial.ID }},
+			{"wrong authoritative size", "inconclusive", func(q *parentInvalidationQualification, r *parentInvalidationReport) { q.Expected.Size = 257 }},
+			{"wrong B mtime", "inconclusive", func(q *parentInvalidationQualification, r *parentInvalidationReport) {
+				q.Expected.ModTime = q.Initial.ModTime
+			}},
+			{"notification budget reset", "inconclusive", func(q *parentInvalidationQualification, r *parentInvalidationReport) {
+				r.NotifyBatches = slices.Clone(r.NotifyBatches)
+				r.NotifyBatches[0].Completed = q.ACK.Add(851 * time.Millisecond)
+			}},
+			{"late immediate identity", "replacement_native_check_deadline_failed", func(q *parentInvalidationQualification, r *parentInvalidationReport) {
+				r.NewIdentity.Completed = q.ACK.Add(time.Second + time.Nanosecond)
+			}},
+			{"identity unavailable", "identity_unavailable", func(q *parentInvalidationQualification, r *parentInvalidationReport) {
+				r.IdentityResult = "identity_unavailable"
+			}},
+			{"identity alias", "replacement_identity_aliased", func(q *parentInvalidationQualification, r *parentInvalidationReport) {
+				r.IdentityResult = "replacement_identity_aliased"
+			}},
+			{"wrong native bytes", "replacement_bytes_wrong", func(q *parentInvalidationQualification, r *parentInvalidationReport) {
+				r.IdentityResult = "replacement_bytes_wrong"
+			}},
+			{"failed first open", "replacement_first_open_failed", func(q *parentInvalidationQualification, r *parentInvalidationReport) {
+				q.Native.Error = "access denied"
+				q.FreshTargetTraffic = false
+			}},
+			{"no successful refresh", "inconclusive", func(q *parentInvalidationQualification, r *parentInvalidationReport) { q.FreshTargetTraffic = false }},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				changed, copyReport := q, report
+				test.change(&changed, &copyReport)
+				if result, ok := parentReplacementClassify(changed, &copyReport); ok || result != test.want {
+					t.Fatal("replacement verdict changed", result, ok)
+				}
+			})
+		}
+	})
 }
