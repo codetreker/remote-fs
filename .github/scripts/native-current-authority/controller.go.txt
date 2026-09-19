@@ -111,12 +111,15 @@ type child interface {
 	Done() <-chan struct{}
 	Result() error
 	PID() uint32
+	VerifyControlPeer(context.Context, net.Conn) (map[string]any, error)
 	// Finish verifies the job is empty. Force termination is never a graceful result.
 	Finish() (forced bool, err error)
+	FinishBefore(time.Time) (forced bool, err error)
 }
 
 type platform interface {
 	Preflight() (map[string]any, error)
+	ListenControl(context.Context) (net.Listener, error)
 	Start(executable string, args []string, directory string) (child, error)
 }
 
@@ -447,104 +450,301 @@ func commandBytes(nonce string, sequence uint64, command string) ([]byte, error)
 	return data, nil
 }
 
+type ownedReader struct {
+	name string
+	done chan struct{}
+	err  error
+}
+
+func startReader(name string, read func() error, report func(error)) *ownedReader {
+	r := &ownedReader{name: name, done: make(chan struct{})}
+	go func() {
+		r.err = read()
+		if r.err != nil && report != nil {
+			report(r.err)
+		}
+		close(r.done)
+	}()
+	return r
+}
+
+func joinReaders(ctx context.Context, readers []*ownedReader) error {
+	var result error
+	for _, reader := range readers {
+		select {
+		case <-reader.done:
+		default:
+			select {
+			case <-reader.done:
+			case <-ctx.Done():
+				result = errors.Join(result, fmt.Errorf("join %s: %w", reader.name, ctx.Err()))
+				continue
+			}
+		}
+		if reader.err != nil {
+			result = errors.Join(result, fmt.Errorf("%s: %w", reader.name, reader.err))
+		}
+	}
+	return result
+}
+
 type guestChannel struct {
 	child child
 	identity
-	responses chan response
-	fault     chan error
-	streams   chan error
+	conn       net.Conn
+	responses  chan response
+	fault      chan error
+	readers    []*ownedReader
+	serial     *ownedReader
+	logs       map[string]*os.File
+	logsClosed bool
+	logsErr    error
 }
 
-func newGuestChannel(process child, id identity, directory string) (*guestChannel, error) {
-	stdout, err := privateOutput(filepath.Join(directory, "guest-serial.log"))
-	if err != nil {
-		return nil, err
-	}
-	stderr, err := privateOutput(filepath.Join(directory, "qemu-stderr.log"))
-	if err != nil {
-		stdout.Close()
-		return nil, err
-	}
-	authorityLogs := make(map[string]*os.File)
-	for _, name := range []string{"stdout", "stderr"} {
-		file, err := privateOutput(filepath.Join(directory, "authority-"+name+".log"))
+func newGuestChannel(id identity, directory string) (*guestChannel, error) {
+	g := &guestChannel{identity: id, responses: make(chan response, 1), fault: make(chan error, 1), logs: make(map[string]*os.File)}
+	for _, name := range []string{"qemu-stdout", "qemu-stderr", "guest-serial", "authority-stdout", "authority-stderr"} {
+		file, err := privateOutput(filepath.Join(directory, name+".log"))
 		if err != nil {
-			for _, existing := range authorityLogs {
-				existing.Close()
+			return nil, errors.Join(err, g.closeLogs())
+		}
+		g.logs[name] = file
+	}
+	return g, nil
+}
+
+func (g *guestChannel) report(err error) {
+	select {
+	case g.fault <- err:
+	default:
+	}
+}
+
+func (g *guestChannel) closeLogs() error {
+	if !g.logsClosed {
+		g.logsClosed = true
+		for _, name := range []string{"qemu-stdout", "qemu-stderr", "guest-serial", "authority-stdout", "authority-stderr"} {
+			if file, exists := g.logs[name]; exists {
+				g.logsErr = errors.Join(g.logsErr, file.Close())
 			}
-			stdout.Close()
-			stderr.Close()
-			return nil, err
-		}
-		authorityLogs[name] = file
-	}
-	channel := &guestChannel{process, id, make(chan response, 1), make(chan error, 1), make(chan error, 2)}
-	report := func(err error) {
-		select {
-		case channel.fault <- err:
-		default:
 		}
 	}
-	go func() {
-		defer stdout.Close()
-		for _, file := range authorityLogs {
-			defer file.Close()
+	return g.logsErr
+}
+
+func (g *guestChannel) startDiagnostics(process child) {
+	g.child = process
+	for _, stream := range []struct {
+		name  string
+		input io.Reader
+	}{{"qemu-stdout", process.Output()}, {"qemu-stderr", process.Errors()}} {
+		g.readers = append(g.readers, startReader(stream.name, func() error {
+			_, err := io.Copy(&cappedWriter{writer: g.logs[stream.name], remaining: streamLimit}, stream.input)
+			return err
+		}, g.report))
+	}
+}
+
+func serialLine(data []byte, atEOF bool) (int, []byte, error) {
+	if end := bytes.IndexByte(data, '\n'); end >= 0 {
+		return end + 1, data[:end], nil
+	}
+	if atEOF && len(data) != 0 {
+		return 0, nil, io.ErrUnexpectedEOF
+	}
+	return 0, nil, nil
+}
+
+func (g *guestChannel) startSerial(conn net.Conn) {
+	g.conn = conn
+	g.serial = startReader("guest serial", func() error {
+		serial := &cappedWriter{writer: g.logs["guest-serial"], remaining: streamLimit}
+		logs := map[string]*cappedWriter{
+			"stdout": {writer: g.logs["authority-stdout"], remaining: streamLimit},
+			"stderr": {writer: g.logs["authority-stderr"], remaining: streamLimit},
 		}
-		serial := &cappedWriter{writer: stdout, remaining: streamLimit}
-		logs := make(map[string]*cappedWriter)
-		for name, file := range authorityLogs {
-			logs[name] = &cappedWriter{writer: file, remaining: streamLimit}
-		}
-		scanner := bufio.NewScanner(process.Output())
+		scanner := bufio.NewScanner(conn)
 		scanner.Buffer(make([]byte, 4096), streamLimit)
+		scanner.Split(serialLine)
 		for scanner.Scan() {
 			line := bytes.TrimSuffix(scanner.Bytes(), []byte{'\r'})
 			handled, err := authorityLogLine(line, logs)
 			if err != nil {
-				report(err)
-				channel.streams <- err
-				return
+				return err
 			}
 			if handled {
 				continue
 			}
 			if _, err := serial.Write(append(bytes.Clone(line), '\n')); err != nil {
-				report(err)
-				channel.streams <- err
-				return
+				return err
 			}
-			message, err := parseResponse(line, id)
+			message, err := parseResponse(line, g.identity)
 			if err != nil {
-				report(err)
-				channel.streams <- err
-				return
+				return err
 			}
 			if message != nil {
 				select {
-				case channel.responses <- *message:
+				case g.responses <- *message:
 				default:
-					err := errors.New("guest produced an unsolicited or duplicate response")
-					report(err)
-					channel.streams <- err
-					return
+					return errors.New("guest produced an unsolicited or duplicate response")
 				}
 			}
 		}
-		err := scanner.Err()
-		if err != nil {
-			report(err)
-		}
-		channel.streams <- err
-	}()
+		return scanner.Err()
+	}, g.report)
+	g.readers = append(g.readers, g.serial)
+}
+
+type controlSocket struct {
+	listener     net.Listener
+	done         chan struct{}
+	listenerOnce sync.Once
+	listenerErr  error
+	mu           sync.Mutex
+	conn         net.Conn
+	acceptErr    error
+	closing      bool
+	connClosed   bool
+	connErr      error
+}
+
+func newControlSocket(listener net.Listener) *controlSocket {
+	s := &controlSocket{listener: listener, done: make(chan struct{})}
 	go func() {
-		defer stderr.Close()
-		_, err := io.Copy(&cappedWriter{writer: stderr, remaining: streamLimit}, process.Errors())
-		if err != nil {
-			report(err)
+		conn, err := listener.Accept()
+		err = errors.Join(err, s.closeListener())
+		s.mu.Lock()
+		s.conn, s.acceptErr = conn, err
+		if s.closing {
+			s.closeConnLocked()
 		}
-		channel.streams <- err
+		s.mu.Unlock()
+		close(s.done)
 	}()
-	return channel, nil
+	return s
+}
+
+func (s *controlSocket) closeListener() error {
+	s.listenerOnce.Do(func() { s.listenerErr = s.listener.Close() })
+	return s.listenerErr
+}
+
+func (s *controlSocket) closeConnLocked() {
+	if s.conn != nil && !s.connClosed {
+		s.connClosed = true
+		s.connErr = s.conn.Close()
+	}
+}
+
+func (s *controlSocket) closeIO() error {
+	err := s.closeListener()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closing = true
+	s.closeConnLocked()
+	return errors.Join(err, s.connErr)
+}
+
+func controlPort(address net.Addr) (int, error) {
+	tcp, ok := address.(*net.TCPAddr)
+	if !ok || tcp == nil || tcp.IP.To4() == nil || !tcp.IP.Equal(net.IPv4(127, 0, 0, 1)) || tcp.Zone != "" || tcp.Port < 1 || tcp.Port > 65535 {
+		return 0, errors.New("control endpoint must be concrete IPv4 127.0.0.1 with a nonzero port")
+	}
+	return tcp.Port, nil
+}
+
+func (s *controlSocket) accept(ctx context.Context, process child, fault <-chan error) (net.Conn, map[string]any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	select {
+	case <-s.done:
+	case <-process.Done():
+		return nil, nil, errors.Join(errors.New("QEMU exited before control accept"), process.Result())
+	case err := <-fault:
+		return nil, nil, err
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+	s.mu.Lock()
+	conn, err := s.conn, s.acceptErr
+	s.mu.Unlock()
+	if err != nil {
+		return nil, nil, fmt.Errorf("accept control: %w", err)
+	}
+	if conn == nil {
+		return nil, nil, errors.New("control accept returned no connection")
+	}
+	local, err := controlPort(conn.LocalAddr())
+	if err != nil {
+		return nil, nil, err
+	}
+	bound, err := controlPort(s.listener.Addr())
+	if err != nil {
+		return nil, nil, err
+	}
+	if local != bound {
+		return nil, nil, errors.New("accepted control endpoint differs from owned listener")
+	}
+	if _, err := controlPort(conn.RemoteAddr()); err != nil {
+		return nil, nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	facts, err := process.VerifyControlPeer(ctx, conn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("control peer ownership: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if facts == nil {
+		return nil, nil, errors.New("control peer ownership evidence is absent")
+	}
+	return conn, facts, nil
+}
+
+func (s *controlSocket) join(ctx context.Context) error {
+	select {
+	case <-s.done:
+	default:
+		select {
+		case <-s.done:
+		case <-ctx.Done():
+			return fmt.Errorf("join control accept: %w", ctx.Err())
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return errors.Join(s.acceptErr, s.connErr)
+}
+
+func finishGuest(process child, control *controlSocket, guest *guestChannel, deadline time.Time) (bool, error) {
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	var result error
+	if control != nil {
+		result = errors.Join(result, control.closeIO())
+	}
+	forced := false
+	if process != nil {
+		var err error
+		forced, err = process.FinishBefore(deadline)
+		if err != nil {
+			result = errors.Join(result, fmt.Errorf("%w: %w", errOwnedCleanup, err))
+		}
+		if forced {
+			result = errors.Join(result, errors.New("QEMU required forced termination; graceful shutdown unconfirmed"))
+		}
+	}
+	if control != nil {
+		result = errors.Join(result, control.join(ctx))
+	}
+	if guest != nil {
+		result = errors.Join(result, joinReaders(ctx, guest.readers), guest.closeLogs())
+	}
+	return forced, errors.Join(result, ctx.Err())
 }
 
 func authorityLogLine(line []byte, logs map[string]*cappedWriter) (bool, error) {
@@ -566,73 +766,101 @@ func authorityLogLine(line []byte, logs map[string]*cappedWriter) (bool, error) 
 	return false, nil
 }
 
+func checkedAcknowledgement(value response, sequence uint64, op, phase string) (response, error) {
+	if value.Sequence != sequence || value.Op != op || value.Phase != phase {
+		return response{}, fmt.Errorf("unexpected guest response %s/%s sequence %d", value.Phase, value.Op, value.Sequence)
+	}
+	if (op == "stop-authority" || op == "shutdown") && (value.ExitCode == nil || *value.ExitCode != 0) {
+		return response{}, errors.New("guest did not confirm successful authority exit")
+	}
+	return value, nil
+}
+
 func (g *guestChannel) receive(ctx context.Context, sequence uint64, op, phase string) (response, error) {
+	if err := ctx.Err(); err != nil {
+		return response{}, err
+	}
 	select {
 	case err := <-g.fault:
 		return response{}, err
 	default:
 	}
-	select {
-	case value := <-g.responses:
-		if value.Sequence != sequence || value.Op != op || value.Phase != phase {
-			return response{}, fmt.Errorf("unexpected guest response %s/%s sequence %d", value.Phase, value.Op, value.Sequence)
-		}
-		if (op == "stop-authority" || op == "shutdown") && (value.ExitCode == nil || *value.ExitCode != 0) {
-			return response{}, errors.New("guest did not confirm successful authority exit")
-		}
-		return value, nil
-	case err := <-g.fault:
-		return response{}, err
-	case <-g.child.Done():
-		// A shutdown acknowledgement can race process exit, but the pipe still owns it.
-		if op == "shutdown" {
+	exited := g.child.Done()
+	var serialDone <-chan struct{}
+	if g.serial != nil {
+		serialDone = g.serial.done
+	}
+	for {
+		select {
+		case value := <-g.responses:
+			return checkedAcknowledgement(value, sequence, op, phase)
+		case err := <-g.fault:
+			return response{}, err
+		case <-serialDone:
 			select {
 			case value := <-g.responses:
-				if value.Sequence == sequence && value.Op == op && value.Phase == phase && value.ExitCode != nil && *value.ExitCode == 0 {
-					return value, nil
-				}
-			case err := <-g.fault:
-				return response{}, err
-			case <-ctx.Done():
-				return response{}, ctx.Err()
+				return checkedAcknowledgement(value, sequence, op, phase)
+			default:
+				return response{}, errors.Join(errors.New("guest serial ended before acknowledgement"), io.ErrUnexpectedEOF, g.serial.err)
 			}
+		case <-exited:
+			if op != "shutdown" {
+				return response{}, errors.Join(errors.New("QEMU exited before "+op+" acknowledgement"), g.child.Result())
+			}
+			exited = nil
+		case <-ctx.Done():
+			return response{}, ctx.Err()
 		}
-		return response{}, fmt.Errorf("QEMU exited before %s acknowledgement: %v", op, g.child.Result())
-	case <-ctx.Done():
-		return response{}, ctx.Err()
 	}
 }
 
 func (g *guestChannel) command(ctx context.Context, sequence uint64, op string) (response, error) {
+	if err := ctx.Err(); err != nil {
+		return response{}, err
+	}
 	select {
 	case value := <-g.responses:
 		return response{}, fmt.Errorf("unsolicited guest response before command: %s", value.Op)
+	case err := <-g.fault:
+		return response{}, err
 	default:
 	}
 	data, err := commandBytes(g.Nonce, sequence, op)
 	if err != nil {
 		return response{}, err
 	}
-	written := make(chan error, 1)
-	go func() {
-		n, err := g.child.Input().Write(data)
-		if err == nil && n != len(data) {
-			err = io.ErrShortWrite
-		}
-		written <- err
-	}()
-	select {
-	case err = <-written:
-		if err != nil {
-			return response{}, err
-		}
-	case <-ctx.Done():
-		return response{}, ctx.Err()
+	deadline, bounded := ctx.Deadline()
+	if !bounded || g.conn == nil {
+		return response{}, errors.New("guest command requires an authenticated socket and deadline")
+	}
+	if err := g.conn.SetWriteDeadline(deadline); err != nil {
+		return response{}, err
+	}
+	interrupted := make(chan struct{})
+	var interruptErr error
+	stop := context.AfterFunc(ctx, func() {
+		interruptErr = g.conn.SetWriteDeadline(time.Now())
+		close(interrupted)
+	})
+	n, writeErr := g.conn.Write(data)
+	if writeErr == nil && n != len(data) {
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr != nil && !time.Now().Before(deadline) {
+		writeErr = errors.Join(writeErr, context.DeadlineExceeded)
+	}
+	if !stop() {
+		<-interrupted
+		writeErr = errors.Join(writeErr, interruptErr)
+	}
+	writeErr = errors.Join(writeErr, ctx.Err(), g.conn.SetWriteDeadline(time.Time{}))
+	if writeErr != nil {
+		return response{}, writeErr
 	}
 	return g.receive(ctx, sequence, op, op)
 }
 
-func qemuArguments(m manifest, id identity, kernel, initramfs, data, bios string, port int) []string {
+func qemuArguments(m manifest, id identity, kernel, initramfs, data, bios string, port, controlPort int) []string {
 	escape := func(value string) string { return strings.ReplaceAll(value, ",", ",,") }
 	appendArgs := "console=ttyS0,115200 rdinit=/init panic=1 net.ifnames=0" +
 		" RFS_FIXTURE_BOOT_TOKEN=" + m.BootToken + " RFS_FIXTURE_NONCE=" + id.Nonce +
@@ -641,7 +869,7 @@ func qemuArguments(m manifest, id identity, kernel, initramfs, data, bios string
 		"-L", bios, "-machine", m.QEMU.Machine, "-accel", "tcg,thread=multi", "-cpu", "qemu64", "-smp", "2", "-m", "1024",
 		"-nodefaults", "-no-user-config", "-display", "none", "-monitor", "none", "-no-reboot",
 		"-kernel", kernel, "-initrd", initramfs, "-append", appendArgs,
-		"-chardev", "stdio,id=console,signal=off", "-serial", "chardev:console",
+		"-chardev", "socket,id=console,host=127.0.0.1,port=" + strconv.Itoa(controlPort) + ",server=off,reconnect-ms=0", "-serial", "chardev:console",
 		"-drive", "file=" + escape(data) + ",format=raw,if=none,id=data,cache=writeback,rerror=report,werror=report",
 		"-device", "virtio-blk-pci,drive=data",
 		"-netdev", "user,id=net,ipv6=off,restrict=on,hostfwd=tcp:127.0.0.1:" + strconv.Itoa(port) + "-10.0.2.15:8080",
@@ -650,53 +878,64 @@ func qemuArguments(m manifest, id identity, kernel, initramfs, data, bios string
 }
 
 func runTool(ctx context.Context, host platform, executable string, args []string, directory, name string) (output []byte, resultErr error) {
-	process, err := host.Start(executable, args, directory)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		forced, err := process.Finish()
-		if err != nil {
-			err = fmt.Errorf("%w: %v", errOwnedCleanup, err)
-		}
-		if forced {
-			err = errors.Join(err, errors.New("owned job required forced termination"))
-		}
-		resultErr = errors.Join(resultErr, err)
-	}()
 	stdout, err := privateOutput(filepath.Join(directory, name+"-stdout.log"))
 	if err != nil {
 		return nil, err
 	}
-	defer stdout.Close()
 	stderr, err := privateOutput(filepath.Join(directory, name+"-stderr.log"))
+	if err != nil {
+		return nil, errors.Join(err, stdout.Close())
+	}
+	var process child
+	var readers []*ownedReader
+	defer func() {
+		deadline := time.Now().Add(10 * time.Second)
+		cleanup, cancel := context.WithDeadline(context.Background(), deadline)
+		defer cancel()
+		if process != nil {
+			forced, err := process.FinishBefore(deadline)
+			if err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("%w: %w", errOwnedCleanup, err))
+			}
+			if forced {
+				resultErr = errors.Join(resultErr, errors.New("owned job required forced termination"))
+			}
+		}
+		resultErr = errors.Join(resultErr, joinReaders(cleanup, readers), stdout.Close(), stderr.Close())
+	}()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	process, err = host.Start(executable, args, directory)
 	if err != nil {
 		return nil, err
 	}
-	defer stderr.Close()
 	var buffer bytes.Buffer
-	streams := make(chan error, 2)
-	go func() {
+	readers = append(readers, startReader("tool stdout", func() error {
 		_, err := io.Copy(&cappedWriter{writer: io.MultiWriter(stdout, &buffer), remaining: streamLimit}, process.Output())
-		streams <- err
-	}()
-	go func() {
+		return err
+	}, nil))
+	readers = append(readers, startReader("tool stderr", func() error {
 		_, err := io.Copy(&cappedWriter{writer: stderr, remaining: streamLimit}, process.Errors())
-		streams <- err
-	}()
-	done := process.Done()
-	completed, drained := false, 0
-	for !completed || drained != 2 {
+		return err
+	}, nil))
+	done, outDone, errDone := process.Done(), (<-chan struct{})(readers[0].done), (<-chan struct{})(readers[1].done)
+	for done != nil || outDone != nil || errDone != nil {
 		select {
 		case <-done:
-			completed, done = true, nil
+			done = nil
 			if err := process.Result(); err != nil {
 				return nil, err
 			}
-		case err := <-streams:
-			drained++
-			if err != nil {
-				return nil, err
+		case <-outDone:
+			outDone = nil
+			if readers[0].err != nil {
+				return nil, readers[0].err
+			}
+		case <-errDone:
+			errDone = nil
+			if readers[1].err != nil {
+				return nil, readers[1].err
 			}
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -819,45 +1058,86 @@ func lifecycle(ctx context.Context, host platform, m manifest, id identity, exec
 	if err := log.record("prepare", "private-disk", map[string]any{"path": disk, "size": m.DiskBytes, "pristine_sha256": m.Artifacts["data"].SHA256}); err != nil {
 		return err
 	}
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+
+	bootCtx, cancelBoot := context.WithTimeout(ctx, 120*time.Second)
+	defer cancelBoot()
+	var control *controlSocket
+	var guest *guestChannel
+	var process child
+	var successDeadline time.Time
+	defer func() {
+		deadline := time.Now().Add(10 * time.Second)
+		if resultErr == nil && !successDeadline.IsZero() {
+			deadline = successDeadline
+		}
+		forced, cleanupErr := finishGuest(process, control, guest, deadline)
+		resultErr = errors.Join(resultErr, cleanupErr)
+		if process != nil {
+			resultErr = errors.Join(resultErr, log.record("hygiene", "owned-job", map[string]any{"pid": process.PID(), "forced": forced, "error": errorText(cleanupErr)}))
+		}
+	}()
+	listener, err := host.ListenControl(bootCtx)
+	if err != nil {
+		return fmt.Errorf("bind owned control endpoint: %w", err)
+	}
+	control = newControlSocket(listener)
+	controlNumber, err := controlPort(listener.Addr())
 	if err != nil {
 		return err
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	if err := listener.Close(); err != nil {
+	if err := bootCtx.Err(); err != nil {
+		return err
+	}
+	forward, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	port, portErr := controlPort(forward.Addr())
+	if err := errors.Join(portErr, forward.Close()); err != nil {
+		return err
+	}
+	if port == controlNumber {
+		return errors.New("HTTP and control ports collided")
+	}
+	guest, err = newGuestChannel(id, evidenceDir)
+	if err != nil {
+		return err
+	}
+	if err := bootCtx.Err(); err != nil {
 		return err
 	}
 	artifactPath := func(name string) string {
 		return filepath.Join(artifactDir, filepath.FromSlash(m.Artifacts[name].Path))
 	}
-	args := qemuArguments(m, id, artifactPath("kernel"), artifactPath("initramfs"), disk, bios, port)
-	process, err := host.Start(executable, args, workDir)
+	args := qemuArguments(m, id, artifactPath("kernel"), artifactPath("initramfs"), disk, bios, port, controlNumber)
+	process, err = host.Start(executable, args, workDir)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		forced, err := process.Finish()
-		if err != nil {
-			err = fmt.Errorf("%w: %v", errOwnedCleanup, err)
-		}
-		if forced {
-			err = errors.Join(err, errors.New("QEMU required forced termination; graceful shutdown unconfirmed"))
-		}
-		resultErr = errors.Join(resultErr, err, log.record("hygiene", "owned-job", map[string]any{"pid": process.PID(), "forced": forced, "error": errorText(err)}))
-	}()
-	if err := log.record("boot", "qemu-started", map[string]any{"pid": process.PID(), "port": port, "accel": "tcg", "machine": m.QEMU.Machine}); err != nil {
+	guest.startDiagnostics(process)
+	if err := bootCtx.Err(); err != nil {
 		return err
 	}
-	guest, err := newGuestChannel(process, id, evidenceDir)
+	if err := log.record("boot", "qemu-started", map[string]any{"pid": process.PID(), "port": port, "control_port": controlNumber, "accel": "tcg", "machine": m.QEMU.Machine}); err != nil {
+		return err
+	}
+	conn, proof, err := control.accept(bootCtx, process, guest.fault)
 	if err != nil {
 		return err
 	}
-	bootCtx, cancelBoot := context.WithTimeout(ctx, 120*time.Second)
+	if err := log.record("boot", "control-peer-verified", proof); err != nil {
+		return err
+	}
+	if err := bootCtx.Err(); err != nil {
+		return err
+	}
+	guest.startSerial(conn)
 	_, err = guest.receive(bootCtx, 0, "boot-ready", "boot")
 	cancelBoot()
 	if err != nil {
 		return fmt.Errorf("guest boot: %w", err)
 	}
+
 	command := func(sequence uint64, op string) error {
 		callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
@@ -896,6 +1176,7 @@ func lifecycle(ctx context.Context, host platform, m manifest, id identity, exec
 	}
 	shutdownCtx, cancelShutdown := context.WithTimeout(ctx, 30*time.Second)
 	defer cancelShutdown()
+	successDeadline, _ = shutdownCtx.Deadline()
 	acknowledged, err := guest.command(shutdownCtx, 4, "shutdown")
 	if err != nil {
 		return fmt.Errorf("guest shutdown: %w", err)
@@ -913,15 +1194,8 @@ func lifecycle(ctx context.Context, host platform, m manifest, id identity, exec
 	case <-shutdownCtx.Done():
 		return fmt.Errorf("QEMU poweroff: %w", shutdownCtx.Err())
 	}
-	for range 2 {
-		select {
-		case err := <-guest.streams:
-			if err != nil {
-				return err
-			}
-		case <-shutdownCtx.Done():
-			return fmt.Errorf("guest output drain: %w", shutdownCtx.Err())
-		}
+	if err := joinReaders(shutdownCtx, guest.readers); err != nil {
+		return err
 	}
 	select {
 	case err := <-guest.fault:

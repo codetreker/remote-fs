@@ -115,7 +115,9 @@ typed-rescan 的局部三个根普通/race 各 144 pass，detail-only 与 readin
 
 被动数据确认旧 CREATE 的 QFid DiskID=3，VolumeID=3872781749700257929；新 CREATE 未请求且未返回 QFid，实际 file 查询为 7/22/34，没有 6/18/59，也没有 QUERY_DIRECTORY。不能用原 QFid 或 backend NodeID 补造新打开的身份回复。完整 DETAIL 已成立仍出现相同 native identity，这缩小了被测条件，但 redirector 内部身份算法及纠正机制依然未知；固定原型结果不替当前生产接入或一秒缓存验收。
 
-always-truthful QFid 的本地适用控制共 46 根，普通/race 各 380 个 verdict 通过；requested-only 响应回退与移除 alias 拒绝分别在因果断言失败，七项脚本策略控制、default/always 准备和精确 ARM64 构建也已核对。默认分支保持原 server 字节，策略改变处使用对应 no-leasing 控制。原生单项尚未执行，互操作和符合性均不由这些本地收据决定。
+always-truthful QFid 的本地适用控制共 46 根，普通/race 各 380 个 verdict 通过；requested-only 响应回退与移除 alias 拒绝分别在因果断言失败，七项脚本策略控制、default/always 准备和精确 ARM64 构建也已核对。默认分支保持原 server 字节，策略改变处使用对应 no-leasing 控制。[原生运行 35426210106](https://github.com/codetreker/remote-fs/actions/runs/35426210106)绑定探针 `ad4d322bdf0eb5bb05a57786fea5a8b649fcf738`，实际控制用例 380 个 verdict 通过，单项仍为合格的 retained_identity_changed 失败。新 CREATE 未请求但接纳了真实 B QFid=4，Hnew 报 native FileIndex=4；HA 的 FileIndex 从初始 3 变成 4，HA 仍读 A 的 257 字节，Hnew 读 B 的 769 字节。完整 DETAIL、冷 B、原设置、HTTP oracle、来源与清理保持，全部身份/字节检查在 ACK 后约 29.63 ms 完成。
+
+这项结果分别确立响应接纳、新身份观察和旧身份不稳定，不能将前两项当作整体成功，也不证明身份问题持续超过一秒。原 requested-only 与 typed-rescan 的失败均保持原样；这些原型观察没有证明共享 FCB 等内部实现，未请求 context 的符合性仍单独未决，当前生产接入也没有由此获得修复或缓存验收。
 
 ### 样本资格与执行来源
 

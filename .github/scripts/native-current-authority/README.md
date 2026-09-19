@@ -3,8 +3,9 @@
 This fixture connects the current Windows ARM64 HTTP client to the current Linux
 authority. Native Windows ARM64 QEMU runs the x86-64 Linux guest under TCG. Its
 SQLite database, native lease witness and local objects live on a private ext4
-image. The Windows host exposes one loopback HTTP forwarding port. No guest
-network download, external service or public endpoint is required.
+image. The Windows host exposes one loopback HTTP forwarding port and a separate,
+controller-owned serial-control listener. No guest network download, external
+service or public endpoint is required.
 
 The result is an authority readiness and restart check. It does not certify the
 Windows SMB adapter, native filesystem caching or the one-second visibility
@@ -70,10 +71,40 @@ start suspended, enter an unnamed kill-on-close Job Object, and only then resume
 The Job handle is not inherited. Actual exit and empty-job observations are
 required before deleting the writable disk. Forced termination is a failure.
 
-Guest control requests carry a random nonce and increasing sequence. The host
-allows 120 seconds for boot and 30 seconds per command/probe. Guest stdout carries
-bounded, identity-bound responses; authority logs have separate encoded frames.
-Duplicate or unexpected responses, stream overflow and missing exit reports fail.
+## Serial control and deadlines
+
+On Windows the controller binds one exclusive `tcp4` listener at `127.0.0.1:0`
+before launching QEMU. The socket chardev connects once as a client with reconnect
+disabled. The first accept closes the listener; an unexpected peer fails the run.
+No bytes are parsed and no command is sent until the reversed TCP four-tuple is
+matched to exactly one established row owned by the retained, live QEMU process.
+The existing process handle is checked before and after the owner-table query,
+with closure serialized against its sole waiter. No process is reopened by PID.
+Loopback location and the subsequent nonce are not substitutes for this proof.
+
+The TCP-owner query has a fixed 1 MiB buffer and one call; invalid bounds, unknown
+ownership and any API error fail. The synchronous Windows query cannot be
+canceled: the existing deadline is checked before and after it, and an expired
+proof never permits command I/O. A single 120-second boot deadline covers bind,
+launch, accept, peer proof and the identity-bound boot-ready frame. Commands remain
+one JSON object plus LF, at most 1 KiB, with the same 30-second context and socket
+write deadline. Nonce, sequence, source and phase checks remain mandatory; commands
+are not paced or resent.
+
+QEMU stdout and stderr are drained immediately into separate bounded diagnostic
+logs. The authenticated serial socket carries guest control and separately framed
+authority output; each stream retains its 16 MiB cap. Success requires the exact
+shutdown acknowledgement, actual QEMU exit and natural EOF/complete reader drain
+within one 30-second shutdown deadline. Error cleanup closes socket I/O, finishes
+the owned Job and joins readers using a single ten-second deadline fixed at cleanup
+entry. Natural and forced Job stages retain their five-second caps, clamped to that
+same deadline. Close errors, incomplete readers and forced termination remain
+failures. Disk removal still requires process/Job quiescence.
+
+The separate Linux validation driver retains its POSIX stdio transport. The
+Windows socket does not change guest PID 1, the authority, the image, the HTTP
+forward or the public storage API. Its native ownership and full lifecycle tests
+must execute on Windows; portable controls and cross-builds do not prove them.
 
 ## Readiness sequence
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"debug/pe"
@@ -9,9 +10,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -69,6 +73,11 @@ type fakeChild struct {
 	result         error
 	forced         bool
 	finishes       int
+	finishErr      error
+	finishDeadline time.Time
+	finishBefore   func(time.Time) (bool, error)
+	verify         func(context.Context, net.Conn) (map[string]any, error)
+	verifications  int
 }
 
 func (p *fakeChild) Input() io.WriteCloser { return p.input }
@@ -77,19 +86,49 @@ func (p *fakeChild) Errors() io.ReadCloser { return p.stderr }
 func (p *fakeChild) Done() <-chan struct{} { return p.done }
 func (p *fakeChild) Result() error         { return p.result }
 func (p *fakeChild) PID() uint32           { return 42 }
-func (p *fakeChild) Finish() (bool, error) { p.finishes++; return p.forced, nil }
+func (p *fakeChild) Finish() (bool, error) { return p.FinishBefore(time.Now().Add(10 * time.Second)) }
+func (p *fakeChild) FinishBefore(deadline time.Time) (bool, error) {
+	p.finishes++
+	p.finishDeadline = deadline
+	if p.finishBefore != nil {
+		return p.finishBefore(deadline)
+	}
+	return p.forced, p.finishErr
+}
+func (p *fakeChild) VerifyControlPeer(ctx context.Context, conn net.Conn) (map[string]any, error) {
+	p.verifications++
+	if p.verify != nil {
+		return p.verify(ctx, conn)
+	}
+	return map[string]any{"owner_pid": p.PID()}, nil
+}
 
 type nopWriteCloser struct{ io.Writer }
 
 func (nopWriteCloser) Close() error { return nil }
 
 type fakePlatform struct {
-	process  *fakeChild
-	startErr error
+	process   *fakeChild
+	startErr  error
+	listener  net.Listener
+	listenErr error
+	listen    func(context.Context) (net.Listener, error)
+	start     func(string, []string, string) (child, error)
 }
 
-func (p fakePlatform) Preflight() (map[string]any, error)            { return nil, nil }
-func (p fakePlatform) Start(string, []string, string) (child, error) { return p.process, p.startErr }
+func (p fakePlatform) Preflight() (map[string]any, error) { return nil, nil }
+func (p fakePlatform) ListenControl(ctx context.Context) (net.Listener, error) {
+	if p.listen != nil {
+		return p.listen(ctx)
+	}
+	return p.listener, p.listenErr
+}
+func (p fakePlatform) Start(executable string, args []string, directory string) (child, error) {
+	if p.start != nil {
+		return p.start(executable, args, directory)
+	}
+	return p.process, p.startErr
+}
 func childWithOutput(output string, completed bool) *fakeChild {
 	child := &fakeChild{input: nopWriteCloser{io.Discard}, output: io.NopCloser(strings.NewReader(output)), stderr: io.NopCloser(strings.NewReader("")), done: make(chan struct{})}
 	if completed {
@@ -126,7 +165,7 @@ func TestGuestAcknowledgementsRequireSequenceAndConfirmedExit(t *testing.T) {
 
 func TestGuestControlTimeoutDoesNotClaimExit(t *testing.T) {
 	channel := &guestChannel{child: childWithOutput("", false), identity: testIdentity(), responses: make(chan response, 1), fault: make(chan error, 1)}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
 	if _, err := channel.command(ctx, 1, "shutdown"); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("unconfirmed command: %v", err)
@@ -249,9 +288,9 @@ func TestQEMULaunchLimitsNetworkAndUsesPrivateDisk(t *testing.T) {
 	m.BootToken = strings.Repeat("a", 64)
 	m.Volume = "fixture-current"
 	m.QEMU.Machine = "pc-q35-11.1"
-	args := qemuArguments(m, testIdentity(), "kernel", "initramfs", "private,data", "bios", 43210)
+	args := qemuArguments(m, testIdentity(), "kernel", "initramfs", "private,data", "bios", 43210, 43111)
 	joined := strings.Join(args, " ")
-	for _, required := range []string{"-L bios", "-accel tcg,thread=multi", "restrict=on", "hostfwd=tcp:127.0.0.1:43210-10.0.2.15:8080", "file=private,,data,format=raw", "rng-builtin", "RFS_FIXTURE_NONCE="} {
+	for _, required := range []string{"-L bios", "-accel tcg,thread=multi", "restrict=on", "hostfwd=tcp:127.0.0.1:43210-10.0.2.15:8080", "file=private,,data,format=raw", "rng-builtin", "RFS_FIXTURE_NONCE=", "-chardev socket,id=console,host=127.0.0.1,port=43111,server=off,reconnect-ms=0", "-serial chardev:console"} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("missing %s", required)
 		}
@@ -259,7 +298,7 @@ func TestQEMULaunchLimitsNetworkAndUsesPrivateDisk(t *testing.T) {
 	if strings.Count(joined, "hostfwd=") != 1 {
 		t.Fatal("multiple forwards")
 	}
-	for _, forbidden := range []string{"cache=unsafe", "-virtfs", "-fsdev", "-qmp", "rng-random", "whpx"} {
+	for _, forbidden := range []string{"cache=unsafe", "-virtfs", "-fsdev", "-qmp", "rng-random", "whpx", "stdio", "server=on"} {
 		if strings.Contains(joined, forbidden) {
 			t.Fatalf("forbidden %s", forbidden)
 		}
@@ -366,6 +405,697 @@ func TestNativeHostPEPolicyPrecedesPlatform(t *testing.T) {
 				}
 			} else if err == nil || host != nil || calls != 0 {
 				t.Fatalf("invalid host reached platform: calls=%d error=%v", calls, err)
+			}
+		})
+	}
+}
+
+type observedControlConn struct {
+	net.Conn
+	local, remote         net.Addr
+	write                 func([]byte) (int, error)
+	setWriteDeadline      func(time.Time) error
+	closeError            error
+	reads, writes, closes atomic.Int32
+}
+
+func (c *observedControlConn) LocalAddr() net.Addr  { return c.local }
+func (c *observedControlConn) RemoteAddr() net.Addr { return c.remote }
+func (c *observedControlConn) Read(data []byte) (int, error) {
+	c.reads.Add(1)
+	return c.Conn.Read(data)
+}
+func (c *observedControlConn) Write(data []byte) (int, error) {
+	c.writes.Add(1)
+	if c.write != nil {
+		return c.write(data)
+	}
+	return c.Conn.Write(data)
+}
+func (c *observedControlConn) SetWriteDeadline(deadline time.Time) error {
+	if c.setWriteDeadline != nil {
+		return c.setWriteDeadline(deadline)
+	}
+	return c.Conn.SetWriteDeadline(deadline)
+}
+func (c *observedControlConn) Close() error {
+	c.closes.Add(1)
+	return errors.Join(c.Conn.Close(), c.closeError)
+}
+
+func controlTestPair(t *testing.T) (*observedControlConn, net.Conn) {
+	t.Helper()
+	controller, peer := net.Pipe()
+	t.Cleanup(func() { controller.Close(); peer.Close() })
+	return &observedControlConn{Conn: controller,
+		local:  &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001},
+		remote: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40002}}, peer
+}
+
+type controlAcceptResult struct {
+	conn net.Conn
+	err  error
+}
+type testControlListener struct {
+	result          chan controlAcceptResult
+	entered, closed chan struct{}
+	closeOnce       sync.Once
+	closeError      error
+	accept          func() (net.Conn, error)
+	address         net.Addr
+	closes          atomic.Int32
+}
+
+func newTestControlListener(t *testing.T) *testControlListener {
+	t.Helper()
+	l := &testControlListener{result: make(chan controlAcceptResult, 1), entered: make(chan struct{}), closed: make(chan struct{})}
+	t.Cleanup(func() { l.Close() })
+	return l
+}
+func (l *testControlListener) Addr() net.Addr {
+	if l.address != nil {
+		return l.address
+	}
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001}
+}
+func (l *testControlListener) Accept() (net.Conn, error) {
+	close(l.entered)
+	if l.accept != nil {
+		return l.accept()
+	}
+	select {
+	case result := <-l.result:
+		return result.conn, result.err
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+func (l *testControlListener) Close() error {
+	l.closes.Add(1)
+	l.closeOnce.Do(func() { close(l.closed) })
+	return l.closeError
+}
+
+func socketTestContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func controlResponseLine(t *testing.T, message response) []byte {
+	t.Helper()
+	data, err := json.Marshal(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(append([]byte(responsePrefix), data...), '\n')
+}
+
+func TestControlSocketAuthenticationBeforeIO(t *testing.T) {
+	failure := errors.New("foreign process")
+	for _, name := range []string{"owned", "wrong-owner", "missing-evidence", "bad-local-port", "bad-remote", "typed-nil-remote", "expired-during-proof", "listener-close-error"} {
+		t.Run(name, func(t *testing.T) {
+			conn, _ := controlTestPair(t)
+			listener := newTestControlListener(t)
+			if name == "bad-local-port" {
+				conn.local = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40003}
+			}
+			if name == "bad-remote" {
+				conn.remote = &net.TCPAddr{IP: net.ParseIP("::1"), Port: 40002}
+			}
+			if name == "typed-nil-remote" {
+				conn.remote = (*net.TCPAddr)(nil)
+			}
+			if name == "listener-close-error" {
+				listener.closeError = failure
+			}
+			listener.result <- controlAcceptResult{conn: conn}
+			control := newControlSocket(listener)
+			ctx, cancel := context.WithCancel(socketTestContext(t))
+			defer cancel()
+			process := childWithOutput("", false)
+			process.verify = func(context.Context, net.Conn) (map[string]any, error) {
+				if name == "wrong-owner" {
+					return nil, failure
+				}
+				if name == "missing-evidence" {
+					return nil, nil
+				}
+				if name == "expired-during-proof" {
+					cancel()
+				}
+				return map[string]any{"owner_pid": process.PID()}, nil
+			}
+			accepted, facts, err := control.accept(ctx, process, make(chan error))
+			if name == "owned" {
+				if err != nil || accepted != conn || facts["owner_pid"] != process.PID() {
+					t.Fatalf("owned proof: %v %v", facts, err)
+				}
+			} else if err == nil || accepted != nil || facts != nil {
+				t.Fatalf("rejected peer was admitted: %v %v", facts, err)
+			}
+			if conn.reads.Load() != 0 || conn.writes.Load() != 0 {
+				t.Fatal("control bytes consumed before peer authentication")
+			}
+			if strings.HasPrefix(name, "bad-") || name == "typed-nil-remote" || name == "listener-close-error" {
+				if process.verifications != 0 {
+					t.Fatal("invalid endpoint reached process verification")
+				}
+			} else if process.verifications != 1 {
+				t.Fatalf("proof count %d", process.verifications)
+			}
+			closeErr := control.closeIO()
+			if name == "listener-close-error" && !errors.Is(closeErr, failure) {
+				t.Fatalf("lost close error: %v", closeErr)
+			}
+			if name != "listener-close-error" && closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			_ = control.closeIO()
+			if conn.closes.Load() != 1 || listener.closes.Load() != 1 {
+				t.Fatal("control resources were not closed exactly once")
+			}
+		})
+	}
+}
+
+func TestControlSocketInterruptedAcceptJoinsOwner(t *testing.T) {
+	failure := errors.New("control accept failure")
+	for _, name := range []string{"cancellation", "child-exit", "diagnostic-fault", "accept-error", "empty-accept"} {
+		t.Run(name, func(t *testing.T) {
+			listener := newTestControlListener(t)
+			control := newControlSocket(listener)
+			process := childWithOutput("", false)
+			ctx, cancel := context.WithCancel(socketTestContext(t))
+			defer cancel()
+			fault := make(chan error, 1)
+			select {
+			case <-listener.entered:
+			case <-ctx.Done():
+				t.Fatal("accept did not start")
+			}
+			switch name {
+			case "cancellation":
+				cancel()
+			case "child-exit":
+				close(process.done)
+			case "diagnostic-fault":
+				fault <- failure
+			case "accept-error":
+				listener.result <- controlAcceptResult{err: failure}
+			case "empty-accept":
+				listener.result <- controlAcceptResult{}
+			}
+			if conn, facts, err := control.accept(ctx, process, fault); err == nil || conn != nil || facts != nil {
+				t.Fatalf("interrupted accept succeeded: %v", err)
+			}
+			if process.verifications != 0 {
+				t.Fatal("failed accept reached peer verification")
+			}
+			if err := control.closeIO(); err != nil {
+				t.Fatal(err)
+			}
+			_ = control.join(socketTestContext(t))
+			select {
+			case <-control.done:
+			default:
+				t.Fatal("accept owner still running after close")
+			}
+			if listener.closes.Load() != 1 {
+				t.Fatal("listener closed more than once")
+			}
+		})
+	}
+}
+
+func TestControlSocketClosesLateAcceptedConnection(t *testing.T) {
+	conn, _ := controlTestPair(t)
+	listener := newTestControlListener(t)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	listener.accept = func() (net.Conn, error) { <-release; return conn, nil }
+	control := newControlSocket(listener)
+	ctx := socketTestContext(t)
+	select {
+	case <-listener.entered:
+	case <-ctx.Done():
+		t.Fatal("accept did not start")
+	}
+	_, err := finishGuest(nil, control, nil, time.Now().Add(-time.Second))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unfinished accept lost deadline: %v", err)
+	}
+	unblock()
+	if err := control.join(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if conn.closes.Load() != 1 || listener.closes.Load() != 1 {
+		t.Fatal("late connection escaped its closed owner")
+	}
+	if err := control.closeIO(); err != nil {
+		t.Fatal(err)
+	}
+	if conn.closes.Load() != 1 {
+		t.Fatal("late connection closed twice")
+	}
+}
+
+func TestGuestSocketCommandFramingAndNaturalEOF(t *testing.T) {
+	for _, op := range []string{"start", "stop-authority", "shutdown"} {
+		t.Run(op, func(t *testing.T) {
+			conn, peer := controlTestPair(t)
+			directory := privateTestDirectory(t)
+			guest, err := newGuestChannel(testIdentity(), directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer guest.closeLogs()
+			guest.startDiagnostics(childWithOutput("QEMU diagnostics\n", false))
+			guest.startSerial(conn)
+			zero := 0
+			ack := controlResponseLine(t, response{identity: testIdentity(), Phase: op, Sequence: 7, Op: op, Status: "ok", ExitCode: &zero})
+			exchange := make(chan error, 1)
+			allowEOF := make(chan struct{})
+			go func() {
+				line, err := bufio.NewReader(peer).ReadBytes('\n')
+				if err == nil {
+					want, encodeErr := commandBytes(testIdentity().Nonce, 7, op)
+					if encodeErr != nil {
+						err = encodeErr
+					} else if !bytes.Equal(line, want) {
+						err = errors.New("command differs from exact JSONL frame")
+					}
+				}
+				if err == nil {
+					_, err = peer.Write(ack[:9])
+				}
+				if err == nil {
+					_, err = peer.Write(ack[9:])
+				}
+				if err == nil {
+					<-allowEOF
+				}
+				exchange <- errors.Join(err, peer.Close())
+			}()
+			ctx := socketTestContext(t)
+			value, commandErr := guest.command(ctx, 7, op)
+			close(allowEOF)
+			if commandErr != nil || value.Op != op || value.Sequence != 7 {
+				t.Fatalf("socket command: %v %v", value, commandErr)
+			}
+			select {
+			case err := <-exchange:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal("peer exchange did not finish")
+			}
+			if err := joinReaders(ctx, guest.readers); err != nil {
+				t.Fatal(err)
+			}
+			if conn.writes.Load() != 1 {
+				t.Fatalf("command wrote %d frames", conn.writes.Load())
+			}
+			if err := guest.closeLogs(); err != nil {
+				t.Fatal(err)
+			}
+			serial, err := os.ReadFile(filepath.Join(directory, "guest-serial.log"))
+			if err != nil || !bytes.Equal(serial, ack) {
+				t.Fatalf("serial evidence: %q %v", serial, err)
+			}
+		})
+	}
+}
+
+func TestGuestCommandCancellationReleasesBackpressuredWrite(t *testing.T) {
+	conn, _ := controlTestPair(t)
+	entered := make(chan struct{})
+	conn.write = func(data []byte) (int, error) { close(entered); return conn.Conn.Write(data) }
+	guest := &guestChannel{child: childWithOutput("", false), identity: testIdentity(), conn: conn, responses: make(chan response, 1), fault: make(chan error, 1)}
+	ctx, cancel := context.WithCancel(socketTestContext(t))
+	defer cancel()
+	finished := make(chan error, 1)
+	go func() { _, err := guest.command(ctx, 1, "start"); finished <- err }()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("command did not reach write")
+	}
+	cancel()
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("write cancellation lost cause: %v", err)
+		}
+	case <-socketTestContext(t).Done():
+		t.Fatal("canceled socket writer survived")
+	}
+	if conn.writes.Load() != 1 {
+		t.Fatal("canceled command was retried")
+	}
+}
+
+func TestGuestSocketCommandFailures(t *testing.T) {
+	failure := errors.New("socket operation failed")
+	for _, name := range []string{"short-write", "write-error", "deadline-error", "reset-error", "stale-ack", "wrong-phase", "stop-no-exit", "unsolicited", "reader-fault", "unbounded", "unauthenticated"} {
+		t.Run(name, func(t *testing.T) {
+			conn, _ := controlTestPair(t)
+			guest := &guestChannel{child: childWithOutput("", false), identity: testIdentity(), conn: conn, responses: make(chan response, 1), fault: make(chan error, 1)}
+			op := "start"
+			if name == "stop-no-exit" {
+				op = "stop-authority"
+			}
+			ctx := socketTestContext(t)
+			if name == "unbounded" {
+				ctx = context.Background()
+			}
+			if name == "unauthenticated" {
+				guest.conn = nil
+			}
+			if name == "unsolicited" {
+				guest.responses <- response{Op: "start"}
+			}
+			if name == "reader-fault" {
+				guest.fault <- failure
+			}
+			conn.write = func(data []byte) (int, error) {
+				if name == "short-write" {
+					return len(data) - 1, nil
+				}
+				if name == "write-error" {
+					return 0, failure
+				}
+				ack := response{identity: testIdentity(), Phase: op, Sequence: 2, Op: op, Status: "ok"}
+				if name == "stale-ack" {
+					ack.Sequence = 1
+				}
+				if name == "wrong-phase" {
+					ack.Phase = "boot"
+				}
+				guest.responses <- ack
+				return len(data), nil
+			}
+			conn.setWriteDeadline = func(deadline time.Time) error {
+				if name == "deadline-error" || name == "reset-error" && deadline.IsZero() {
+					return failure
+				}
+				return nil
+			}
+			_, err := guest.command(ctx, 2, op)
+			if err == nil {
+				t.Fatal("invalid command exchange succeeded")
+			}
+			if name == "short-write" && !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("short write lost cause: %v", err)
+			}
+			if (name == "write-error" || name == "deadline-error" || name == "reset-error" || name == "reader-fault") && !errors.Is(err, failure) {
+				t.Fatalf("lost error cause: %v", err)
+			}
+			if name == "unbounded" || name == "unauthenticated" || name == "unsolicited" || name == "reader-fault" || name == "deadline-error" {
+				if conn.writes.Load() != 0 {
+					t.Fatal("invalid command reached socket write")
+				}
+			} else if conn.writes.Load() != 1 {
+				t.Fatal("command was retried")
+			}
+		})
+	}
+}
+
+func TestGuestSerialFramingAndProcessLogIsolation(t *testing.T) {
+	id := testIdentity()
+	boot := controlResponseLine(t, response{identity: id, Phase: "boot", Op: "boot-ready", Status: "ok"})
+	for _, name := range []string{"complete", "empty-eof", "no-final-lf", "wrong-identity", "duplicate", "authority-frame"} {
+		t.Run(name, func(t *testing.T) {
+			conn, peer := controlTestPair(t)
+			directory := privateTestDirectory(t)
+			guest, err := newGuestChannel(id, directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer guest.closeLogs()
+			guest.startDiagnostics(childWithOutput(string(boot), false))
+			ctx := socketTestContext(t)
+			if err := joinReaders(ctx, guest.readers); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-guest.responses:
+				t.Fatal("process stdout forged a control response")
+			default:
+			}
+			guest.startSerial(conn)
+			data := bytes.Clone(boot)
+			switch name {
+			case "empty-eof":
+				data = nil
+			case "no-final-lf":
+				data = data[:len(data)-1]
+			case "wrong-identity":
+				other := id
+				other.Nonce = strings.Repeat("c", 64)
+				data = controlResponseLine(t, response{identity: other, Phase: "boot", Op: "boot-ready", Status: "ok"})
+			case "duplicate":
+				data = append(data, boot...)
+			case "authority-frame":
+				data = append([]byte("RFS-AUTHORITY/stdout "+base64.StdEncoding.EncodeToString(boot)+"\n"), data...)
+			}
+			written := make(chan error, 1)
+			go func() {
+				var err error
+				if len(data) > 0 {
+					_, err = peer.Write(data)
+				}
+				written <- errors.Join(err, peer.Close())
+			}()
+			select {
+			case err := <-written:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal("serial write did not finish")
+			}
+			joinErr := joinReaders(ctx, guest.readers)
+			valid := name == "complete" || name == "authority-frame"
+			validStream := valid || name == "empty-eof"
+			if validStream && joinErr != nil || !validStream && joinErr == nil {
+				t.Fatalf("framing result=%v valid=%v", joinErr, validStream)
+			}
+			if name == "no-final-lf" && !errors.Is(joinErr, io.ErrUnexpectedEOF) {
+				t.Fatalf("truncated serial accepted: %v", joinErr)
+			}
+			_, err = guest.receive(ctx, 0, "boot-ready", "boot")
+			if valid && err != nil || !valid && err == nil {
+				t.Fatalf("invalid serial produced acknowledgement: %v", err)
+			}
+			if name == "empty-eof" && !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("empty serial lost EOF: %v", err)
+			}
+			if name == "authority-frame" {
+				got, err := os.ReadFile(filepath.Join(directory, "authority-stdout.log"))
+				if err != nil || !bytes.Equal(got, boot) {
+					t.Fatalf("authority bytes lost: %q %v", got, err)
+				}
+			}
+		})
+	}
+}
+
+func TestGuestCleanupPreservesDeadlineAndFailures(t *testing.T) {
+	finishError := errors.New("job query failed")
+	readError := errors.New("diagnostic read failed")
+	for _, name := range []string{"complete", "forced", "job-error", "reader-error", "unfinished-reader", "log-close-error"} {
+		t.Run(name, func(t *testing.T) {
+			guest, err := newGuestChannel(testIdentity(), privateTestDirectory(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer guest.closeLogs()
+			reader := &ownedReader{name: "controlled reader", done: make(chan struct{})}
+			if name == "reader-error" {
+				reader.err = readError
+			}
+			if name != "unfinished-reader" {
+				close(reader.done)
+			}
+			guest.readers = []*ownedReader{reader}
+			if name == "log-close-error" {
+				if err := guest.logs["guest-serial"].Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			process := childWithOutput("", true)
+			process.forced = name == "forced"
+			if name == "job-error" {
+				process.finishErr = finishError
+			}
+			deadline := time.Now().Add(time.Second)
+			if name == "unfinished-reader" {
+				deadline = time.Now().Add(-time.Second)
+			}
+			forced, err := finishGuest(process, nil, guest, deadline)
+			if process.finishes != 1 || !process.finishDeadline.Equal(deadline) {
+				t.Fatal("cleanup restarted or replaced its absolute deadline")
+			}
+			if name == "complete" && (err != nil || forced) {
+				t.Fatalf("complete cleanup: %v %v", forced, err)
+			}
+			if name != "complete" && err == nil {
+				t.Fatal("cleanup failure was hidden")
+			}
+			if name == "forced" && (!forced || !strings.Contains(err.Error(), "forced termination")) {
+				t.Fatalf("forced cleanup reported graceful: %v", err)
+			}
+			if name == "job-error" && (!errors.Is(err, finishError) || !errors.Is(err, errOwnedCleanup)) {
+				t.Fatalf("job cleanup cause lost: %v", err)
+			}
+			if name == "reader-error" && !errors.Is(err, readError) {
+				t.Fatalf("reader error lost: %v", err)
+			}
+			if name == "unfinished-reader" && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("reader wait restarted its budget: %v", err)
+			}
+			if name == "log-close-error" && !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("close error lost: %v", err)
+			}
+			for _, file := range guest.logs {
+				if _, err := file.Write([]byte("after cleanup")); !errors.Is(err, os.ErrClosed) {
+					t.Fatal("evidence log remains open")
+				}
+			}
+			repeated := guest.closeLogs()
+			if name == "log-close-error" && !errors.Is(repeated, os.ErrClosed) {
+				t.Fatal("close failure was not sticky")
+			}
+		})
+	}
+}
+
+func TestControlCleanupRetainsConnectionCloseError(t *testing.T) {
+	conn, _ := controlTestPair(t)
+	failure := errors.New("connection close failed")
+	conn.closeError = failure
+	listener := newTestControlListener(t)
+	listener.result <- controlAcceptResult{conn: conn}
+	control := newControlSocket(listener)
+	ctx := socketTestContext(t)
+	select {
+	case <-control.done:
+	case <-ctx.Done():
+		t.Fatal("accept did not finish")
+	}
+	for range 2 {
+		_, err := finishGuest(nil, control, nil, time.Now().Add(time.Second))
+		if !errors.Is(err, failure) {
+			t.Fatalf("lost connection close failure: %v", err)
+		}
+	}
+	if conn.closes.Load() != 1 || listener.closes.Load() != 1 {
+		t.Fatal("cleanup repeated a resource close")
+	}
+}
+
+func TestSocketLifecycleFailureStagesCleanOwnedResources(t *testing.T) {
+	failure := errors.New("controlled lifecycle failure")
+	for _, name := range []string{"bind", "log-setup", "start", "boot-canceled", "peer-proof"} {
+		t.Run(name, func(t *testing.T) {
+			artifacts, evidence, work := privateTestDirectory(t), privateTestDirectory(t), privateTestDirectory(t)
+			pristine := filepath.Join(artifacts, "pristine.ext4")
+			if err := os.WriteFile(pristine, []byte("pristine fixture bytes"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			hash, size, err := fileHash(pristine)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := manifest{Artifacts: map[string]artifact{"data": {Path: "pristine.ext4", SHA256: hash, Size: size}}, BootToken: strings.Repeat("a", 64), Volume: "fixture-current"}
+			m.QEMU.Machine = "pc-q35-11.1"
+			log := &events{identity: testIdentity(), output: &cappedWriter{writer: io.Discard, remaining: streamLimit}}
+			listener := newTestControlListener(t)
+			listener.address = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
+			conn, _ := controlTestPair(t)
+			conn.local = listener.Addr()
+			if name == "peer-proof" {
+				listener.result <- controlAcceptResult{conn: conn}
+			}
+			if name == "log-setup" {
+				if err := os.WriteFile(filepath.Join(evidence, "guest-serial.log"), []byte("existing"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			process := childWithOutput("QEMU diagnostic only\n", false)
+			process.verify = func(context.Context, net.Conn) (map[string]any, error) { return nil, failure }
+			starts := 0
+			host := fakePlatform{
+				listen: func(boot context.Context) (net.Listener, error) {
+					if _, ok := boot.Deadline(); !ok {
+						t.Fatal("listener setup has no boot deadline")
+					}
+					if name == "bind" {
+						return nil, failure
+					}
+					if name == "boot-canceled" {
+						cancel()
+					}
+					return listener, nil
+				},
+				start: func(_ string, args []string, _ string) (child, error) {
+					if !strings.Contains(strings.Join(args, " "), "-chardev") {
+						return childWithOutput("QEMU emulator version 11.1.0 pc-q35-11.1 virtio-blk-pci virtio-net-pci virtio-rng-pci rng-builtin user tcg", true), nil
+					}
+					starts++
+					if name == "start" {
+						return nil, failure
+					}
+					return process, nil
+				},
+			}
+			err = lifecycle(ctx, host, m, testIdentity(), "qemu", "bios", artifacts, evidence, work, log)
+			if err == nil {
+				t.Fatal("failed lifecycle reported success")
+			}
+			switch name {
+			case "bind", "start", "peer-proof":
+				if !errors.Is(err, failure) {
+					t.Fatalf("stage error lost: %v", err)
+				}
+			case "log-setup":
+				if !errors.Is(err, os.ErrExist) {
+					t.Fatalf("log setup error lost: %v", err)
+				}
+			case "boot-canceled":
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("boot budget lost: %v", err)
+				}
+			}
+			wantStarts := 0
+			if name == "start" || name == "peer-proof" {
+				wantStarts = 1
+			}
+			if starts != wantStarts {
+				t.Fatalf("QEMU launch count=%d want=%d", starts, wantStarts)
+			}
+			if name != "bind" && listener.closes.Load() != 1 {
+				t.Fatal("lifecycle listener was not closed once")
+			}
+			if name == "peer-proof" {
+				if process.finishes != 1 || process.verifications != 1 || conn.closes.Load() != 1 {
+					t.Fatal("owned process or connection escaped rejected proof cleanup")
+				}
+				if conn.reads.Load() != 0 || conn.writes.Load() != 0 {
+					t.Fatal("rejected lifecycle exchanged control bytes")
+				}
+			}
+			actual, _, hashErr := fileHash(pristine)
+			if hashErr != nil || actual != hash {
+				t.Fatalf("pristine fixture changed: %v", hashErr)
 			}
 		})
 	}

@@ -18,6 +18,10 @@ Windows 系统客户端的验收需要实际接入当前 HTTP 与持久 authorit
 
 Windows 目录采用受保护的 owner/SYSTEM DACL，文件内容写入前核对拥有权与权限；reparse 或额外 ACE 不被默认接受。路径 guard 从 provider 入口沿实际 DirectoryInfo/FileInfo 祖先逐级检查，不把只附在入口对象上的 PowerShell 扩展属性当作 Parent 的成员；缺席、其它 provider 和任意 reparse 祖先均拒绝。QEMU、探针和提取进程先挂起启动、加入未命名 kill-on-close Job Object，再恢复。根进程退出与整个 Job 清空是不同事实：退出后最多用既有五秒预算等待实际 ActiveProcesses=0；根尚未退出、查询失败或等待到期才进入强制终止，并在最多另五秒内确认，整段清理不超过十秒。Job accounting 核对结构 ABI 与 ReturnLength，未知数据不能当作零。唯一 waiter 完成实际 wait/exit-code 查询后关闭进程 handle，Finish 不抢先关闭它。正常完成还要求 authority 实际退出、guest sync/unmount、QEMU/Job 结束和流排空，再删除私有副本并核对基底未变。强制终止即使清空也保留失败，不能借清扫取得成功。
 
+Windows serial 控制使用 controller 在启动前独占绑定的 `tcp4/127.0.0.1:0` listener，QEMU 作为 client 连接且不重连。只接纳首个连接并关闭 listener；在读取任何控制字节或发送命令前，按反向四元组核对唯一 ESTABLISHED TCP owner row，要求属于原来保留且仍活跃的 QEMU process handle。查询前后都检查存活与期限，handle 关闭由同一 mutex 与唯一 waiter 串行，不能按 PID 重开进程或仅凭 loopback/nonce 信任对端。TCP table 固定 1 MiB、只查询一次，大小/计数/地址/端口或归属不明均失败；该同步 Windows API 不可取消，期限检查不能被描述为限制其内核执行时长。
+
+绑定、启动、accept、peer proof 和 boot-ready 共用原 120 秒 deadline；JSON+LF 命令至多 1 KiB，沿原 nonce/sequence/source/phase 与 30 秒 deadline 写入 socket，不靠放慢或重发恢复。QEMU stdout/stderr 立即各自排空为诊断，serial 独立承载控制和 authority frame，每个流保留 16 MiB 上限。正常退出在同一 30 秒 shutdown deadline 内取得确认、QEMU exit 与自然 EOF；失败路径从入口固定十秒总期限，关闭 socket、完成 Job 和 join readers 都使用剩余时间，原自然/强制各五秒上限同时受它约束。FinishBefore 只向既有拥有者传递绝对期限，不增加清理管理器；错误、未排空或强制结束保持失败。独立 Linux driver 继续使用其 POSIX stdio，guest/backend/image 和 HTTP 转发不变。
+
 HTTP readiness 使用真实 lease/FileSession，验证引用、原子打开、字节、metadata 条件、改名/移除后的引用身份和逻辑配额；保留 sentinel，停止 authority，再以同一磁盘普通重开，核对 sentinel 的身份、字节和 metadata 后删除它。此工具明确报告 native_acceptance 未运行；请求它代替 SMB/一秒验收会失败。
 
 ## 备选方案
@@ -28,14 +32,18 @@ HTTP readiness 使用真实 lease/FileSession，验证引用、原子打开、�
 
 **使用 WSL 或跨 runner tunnel。** 目标 ARM64 runner 没有可用的既有 WSL/隧道环境；本次 run 拥有的 guest 与 loopback 转发能把进程、来源及关闭证据约束在同一作业中。
 
-**通过 Windows x64 翻译运行 QEMU。** 该 bundle 的版本/能力查询成功，但 guest 启动在 authority 之前以 0xC00000FF 退出，具体 unwind table/module 未确定。native ARM64 bundle 保留同一 QEMU 版本、guest target 和完整提取核对，移除宿主二进制翻译依赖；这项选择仍须实际 boot 验证，不能把静态架构匹配当作根因或修复证明。
+**通过 Windows x64 翻译运行 QEMU。** 该 bundle 的版本/能力查询成功，但 guest 启动在 authority 之前以 0xC00000FF 退出，具体 unwind table/module 未确定。native ARM64 bundle 保留同一 QEMU 版本、guest target 和完整提取核对，移除宿主二进制翻译依赖；[native ARM64 的实测](https://github.com/codetreker/remote-fs/actions/runs/35423839231)已取得 guest boot-ready，但不能据此反推旧异常的根因，也不代表整个 authority 生命周期通过。
+
+**继续用 Windows stdio 传控制命令。** 被检查的 callback 在 frontend 接纳能力不足时可能确认没有完整交付的输入，提取函数与实际 ARM64 binary 分析核对了该分支。实际超时运行没有逐字节接收记录，不能断言就是某次零容量造成；为保持有背压、可认证且可取消的控制通道，socket 不依赖这一 stdio 行为，原诊断输出仍被完整拥有。
+
+**改用 Windows named pipe。** 已检查的 QEMU 后端只创建 server，未提供所需的明确 DACL、first-instance 或远端 client 拒绝配置，也不能连接 controller 先建的私有 pipe。创建后再改 ACL 留有窗口，TokenDefaultDacl 的覆盖及额外权限未获证明；不以这些假设替代持有进程 handle 的 socket peer 核对。
 
 **MSYS2 QEMU、自编 kernel 或完整 cloud image。** MSYS2 需要固定完整 DLL/package 与签名闭包，自编 kernel 增加 compiler/config 维护，完整镜像增加无关启动和用户空间。固定 maintainer bundle、发行版 kernel 与小 initramfs 保留所需 Linux 行为，代价是显式验证提取树、固件和外部输入。
 
 ## 后果
 
-本地 Linux TCG 已完成一次真实 guest/readiness/普通重启/关闭，私有磁盘删除、基底和输入保持不变。该本地 artifact 明确记录脏源码来源，不能充当随后 CI commit 的收据。[Windows 运行 35421799592](https://github.com/codetreker/remote-fs/actions/runs/35421799592)的镜像、controller 20 根/44 verdict、probe 8 根/63 verdict 和路径 guard 十二项均通过。旧 x64 QEMU 在实际 guest 启动时以 0xC00000FF 退出，尚无 guest serial 或 authority；清理完成且基底不变，不把版本/能力查询成功当作启动成功。native ARM64 包的 boot/HTTP 生命周期尚未实测，SMB/缓存和一秒验收也未由本工具证明。
+本地 Linux TCG 已完成一次真实 guest/readiness/普通重启/关闭，私有磁盘删除、基底和输入保持不变。该本地 artifact 明确记录脏源码来源，不能充当随后 CI commit 的收据。[native ARM64 运行 35423839231](https://github.com/codetreker/remote-fs/actions/runs/35423839231)绑定其镜像和源码，controller 21 根/53 verdict、probe 8 根/63 verdict 与路径 guard 十二项通过；实际 Linux init、私有 ext4 挂载及带身份的 boot-ready 已取得。后续 start 命令在三十秒内没有确认，authority 是否执行仍无法确认，空日志不能证明没有执行。强制 Job 清理使完整生命周期失败；私有磁盘已删除、基底不变也不能补成 graceful 成功。该次仍使用 stdio 控制。HTTP readiness、普通重启、完整 Windows 关闭及 SMB/缓存一秒验收尚无成功证据；新 socket 的 native peer proof 和整条生命周期同样尚未执行。
 
-隐藏 Go 模板通过显式测试入口运行，不依赖普通模块发现。已有 Linux 模板普通验证为 36 根、176 个通过 verdict；guest/probe/controller 的普通与 race 各有 87/63/26 个通过 verdict，Python 装配/拥有权/checker 用例共 26 根。Job rundown 的三个 AST 提取测试根普通/race 各 11 个通过 verdict，恢复立即强制清理决策的对照在正常退出后计数收齐的断言失败；vet 和 Windows AMD64/ARM64 构建通过。这些局部检查与上述 native helper 收据分开，不能替代 guest 生命周期。各自验证错误、输出界限与清理，不把 mock、交叉构建或 Linux VM 成功称为 Windows 执行。[路径回归](../../../../.github/scripts/native-current-authority/run_windows_test.ps1)直接抽取实际 guard AST，在 VM 前核对 provider/raw-parent 转换及拒绝路径；本地九项通过，旧 guard 的因果对照在父链缺少 PSIsContainer 处失败。Windows 的十二项运行包含三个 junction 场景；这个已观测的路径检查不证明后续 bootstrap 可用。native ARM64 包选择的 controller 普通/race 各 14 根/35 verdict、宿主架构反转对照、相关构建/vet、七项 Python 与九项本地 PowerShell 检查通过，仍不含 native QEMU boot。具体执行入口见[测试策略](../../../../docs/testing.md#当前-authority-的独立运行环境)。
+隐藏 Go 模板通过显式测试入口运行，不依赖普通模块发现。已有 Linux 模板普通验证为 36 根、176 个通过 verdict；guest/probe/controller 的普通与 race 各有 87/63/26 个通过 verdict，Python 装配/拥有权/checker 用例共 26 根。Job rundown 的三个 AST 提取测试根普通/race 各 11 个通过 verdict，恢复立即强制清理决策的对照在正常退出后计数收齐的断言失败；vet 和 Windows AMD64/ARM64 构建通过。这些局部检查与上述 native helper 收据分开，不能替代 guest 生命周期。各自验证错误、输出界限与清理，不把 mock、交叉构建或 Linux VM 成功称为 Windows 执行。[路径回归](../../../../.github/scripts/native-current-authority/run_windows_test.ps1)直接抽取实际 guard AST，在 VM 前核对 provider/raw-parent 转换及拒绝路径；本地九项通过，旧 guard 的因果对照在父链缺少 PSIsContainer 处失败。Windows 的十二项运行包含三个 junction 场景；这个已观测的路径检查不证明后续 bootstrap 可用。native ARM64 包选择的 controller 普通/race 各 14 根/35 verdict、宿主架构反转对照、相关构建/vet、七项 Python 与九项本地 PowerShell 检查通过；它们与后续 native boot 收据分别计证据。具体执行入口见[测试策略](../../../../docs/testing.md#当前-authority-的独立运行环境)。
 
 维护成本包括 kernel/QEMU 固定输入、镜像生成、两作业 artifact 传递和宿主清理工具。boot 上限 120 秒，命令/probe 各 30 秒，输出与磁盘都有界；超限留下明确失败。磁盘使用正常 guest flush 的 writeback，普通重开证明已观察的同步持久路径，不宣称宿主断电或硬件缓存可靠性。完整平台接入仍由[Windows 提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)承接。
