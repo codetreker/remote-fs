@@ -58,6 +58,10 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 成功资格要求同一 HA 的实际 Fs5 早于全局 mutation，完整 DETAIL 后的首个新 CREATE 确实未请求但接收到真实 B/volume QFid；两份证据分别保留且都须成立。一个能力已暴露不能补足另一个缺席，新增回复也不能补造原生身份成功。原 first-call、HA 稳定/Hnew 不同、opaque 身份与 A/B 字节、一秒/TTL、冷 B 和清理不变；旧 alias 与 retained-identity 失败不会被重新解释。未请求 QFid 的符合性及客户端内部机制继续独立未决。
 
+[pre-HA bootstrap 单项](../../../../.github/workflows/native-smb-early-capability-bootstrap.yml)只检验能力曝光时点：在现有 ancestor watcher 已 Pending 后、原 HA API 前，由同一测试 executable 的专用子进程查询 root Fs5。仍用 requested-only QFid 与固定 0x406，不改后来身份/字节和一秒/TTL 判据；已有目录 handle 保持，不能称为早于全部 FCB。公开依据没有确立 FCB latch 的具体时点，此实验也不把这一假设当事实。
+
+子进程继承普通 token，必须证明 SID/logon/session、实际进程与 exact executable/nonce，查询不触及 A/B。同步 root handle 的一次 NtQuery 使用固定 pinned IOSB/4096 字节 buffer；非 PENDING 只接受返回 NTSTATUS 的 SUCCESS，正常 close 后实际 exit 0 才交付。PENDING 保留进程生命周期的 pins/root，明确失败退出；十秒执行加五秒 termination/drain 均不延长后来的一秒窗口，未证实 process completion 不能继续 HA 或声称取消完成。[被动检查](../../../../.github/scripts/native-smb-early-capability-wire_test.go.txt)另核对 root Fs5 < settled exit < HA API marker < HA CREATE 的全局次序、同一 connection/session/tree 与正确 share；raw/derived 归属分开，root open 可按真实已知关联复用，不由 token 相同推导连接或隐藏目标预热。
+
 ## 备选方案
 
 **等整套新实现完成后才运行原生验收。** 最终仍要这样验证交付代码，但把可行性诊断也推迟到那时，会让一个已经知道可能失败的缓存行为在大量实现之后才决定能否交付。固定原型让这项依赖提前得到可复现的回答。
@@ -150,5 +154,7 @@ POSIX 单项的实际准备证明非测试源码仅改变 Fs5 能力位，适用
 组合准备的本地控制 50 根、普通/race 各 452 verdict 通过，两个单刺激移除对照在原联合 exposure 断言失败；十九项策略控制、三项 source guard 和四种 ARM64 组合构建完成。三个旧分支的 254 份非测试 Go 输入及原生调用序列保持原样，新组合也不增加原生 API。[实际组合 35430629259](https://github.com/codetreker/remote-fs/actions/runs/35430629259)绑定探针 `31817a904fa42896b47ce5eb64e40cbe8be73e90` 和实际 binary，两项刺激均已真实送达同一 HA：Fs5=0x406 早于 mutation，首个新打开未请求却收到真实 B QFid=4。控制用例 473 个 verdict 通过，精确 DETAIL、冷 B、历史区间、oracle 和清理合格，但原生结果仍是 retained_identity_changed：Hnew 为 4，保留 HA 从初始 3 变成 4，而 A257/B769 字节保持正确。全部身份/字节检查在 ACK 后 44.3882 ms 完成。
 
 这个合格首样本否定了该组合下的旧引用身份稳定性，不证明问题持续超过一秒，也不证明所有无驱动方案不可能。内部 FCB 算法与未请求 QFid 的符合性仍未决定，固定原型结果不代表当前生产能力或缓存验收；此前单刺激结果保持独立。
+
+early-bootstrap 本地控制 64 根、普通/race 各 542 verdict，八项因果对照、二十六项策略控制和五种 ARM64 构建通过；四个旧分支字节保持。真实 Linux supervisor/子进程和精确 parser 的这些结果，不证明 Windows Nt/token/root-open 或内核 pending 取消已执行。原生单项仍未运行，全部既有身份失败继续按原资格保留。
 
 代价是维护固定基底补丁、注入锚点、回归、十八个诊断作业及相互隔离的祖先/身份实验，输入不会自动跟随生产代码。诊断提供可行性或失败证据，不交付新的 SMB 文件实现、SQLite 持久性或历史时间显示策略。实际 package、transport 和 backend 仍须独立验收；缓存失效机制与平台接入仍由平台提案承接，既有一秒要求保持不变。

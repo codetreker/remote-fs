@@ -1,0 +1,1095 @@
+package windows
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+	"unicode/utf16"
+	"unsafe"
+
+	win "golang.org/x/sys/windows"
+)
+
+const earlyBootstrapLimit = 16 << 10
+const earlyBootstrapPending = uint32(0x103)
+
+type earlyBootstrapToken struct {
+	SID              string
+	AuthenticationID uint64
+	SessionID        uint32
+}
+type earlyBootstrapRequest struct {
+	Nonce            string
+	Root             string
+	ParentPID        int
+	Executable       string
+	ExecutableSHA256 string
+	Token            earlyBootstrapToken
+}
+type earlyBootstrapNativeReceipt struct {
+	RootOpened, CloseAttempted, RootClosed, Pending, PinsRetained bool
+	OpenAccess, OpenShare, OpenFlags                              uint32
+	IOSBSize, IOSBAlignment, IOSBInformationOffset                uint64
+	ReturnedStatus                                                uint32
+	IOSBPresent                                                   bool
+	IOSBStatus, Information                                       uint64
+	RawBufferHex                                                  string
+	Flags, MaximumComponentLength                                 uint32
+	FilesystemName                                                string
+	Error, CloseError                                             string
+}
+type earlyBootstrapChildReceipt struct {
+	Nonce                        string
+	Root                         string
+	PID, ParentPID               int
+	Executable, ExecutableSHA256 string
+	Token                        earlyBootstrapToken
+	Native                       earlyBootstrapNativeReceipt
+	Error                        string
+}
+type earlyBootstrapProcessReceipt struct {
+	Stdout, Stderr                                            []byte
+	Nonce, Root, Executable, ExecutableSHA256                 string
+	ParentPID, PID                                            int
+	ParentToken, ChildToken                                   earlyBootstrapToken
+	Started, Exited, WaitReturned                             time.Time
+	ExitConfirmed, KillRequested, KillAttempted, KillReturned bool
+	ExitCode                                                  int
+	KillError, WaitError, Outcome, Error                      string
+	InputBytes, OutputBytes                                   int
+	OutputComplete                                            bool
+	OwnerRetained                                             bool
+	Native                                                    *earlyBootstrapNativeReceipt
+	owner                                                     *earlyBootstrapProcessOwner
+}
+
+type earlyBootstrapIOSB struct{ Status, Information uintptr }
+type earlyBootstrapNativeOwner struct {
+	iosb      *earlyBootstrapIOSB
+	buffer    *[4096]byte
+	pins      runtime.Pinner
+	closeRoot func() error
+	receipt   earlyBootstrapNativeReceipt
+}
+
+var earlyBootstrapPendingOwner *earlyBootstrapNativeOwner
+
+func earlyBootstrapDecode(info uint64, data []byte) (uint32, uint32, string, error) {
+	if info < 12 || info > 4096 || info > uint64(len(data)) {
+		return 0, 0, "", errors.New("bootstrap information length outside fixed buffer")
+	}
+	data = data[:int(info)]
+	flags, component, n := binary.LittleEndian.Uint32(data), binary.LittleEndian.Uint32(data[4:]), binary.LittleEndian.Uint32(data[8:])
+	if n&1 != 0 || uint64(n)+12 != info {
+		return 0, 0, "", errors.New("bootstrap filesystem name length is incomplete")
+	}
+	units := make([]uint16, int(n)/2)
+	for i := range units {
+		units[i] = binary.LittleEndian.Uint16(data[12+2*i:])
+	}
+	for i := 0; i < len(units); i++ {
+		u := units[i]
+		if u >= 0xd800 && u <= 0xdbff {
+			if i+1 == len(units) || units[i+1] < 0xdc00 || units[i+1] > 0xdfff {
+				return 0, 0, "", errors.New("bootstrap filesystem name has invalid UTF-16")
+			}
+			i++
+		} else if u >= 0xdc00 && u <= 0xdfff {
+			return 0, 0, "", errors.New("bootstrap filesystem name has invalid UTF-16")
+		}
+	}
+	name := string(utf16.Decode(units))
+	if flags != 0x406 || component != 255 || name != "remote-fs" {
+		return flags, component, name, errors.New("bootstrap filesystem attributes differ from fixture")
+	}
+	return flags, component, name, nil
+}
+
+func earlyBootstrapPerformNative(owner *earlyBootstrapNativeOwner, query func(*earlyBootstrapIOSB, *[4096]byte) uint32) (earlyBootstrapNativeReceipt, error) {
+	owner.receipt.IOSBSize = uint64(unsafe.Sizeof(earlyBootstrapIOSB{}))
+	owner.receipt.IOSBAlignment = uint64(unsafe.Alignof(earlyBootstrapIOSB{}))
+	owner.receipt.IOSBInformationOffset = uint64(unsafe.Offsetof(earlyBootstrapIOSB{}.Information))
+	if owner.receipt.IOSBSize != 16 || owner.receipt.IOSBAlignment != 8 || owner.receipt.IOSBInformationOffset != 8 {
+		return owner.receipt, errors.New("bootstrap IO_STATUS_BLOCK ABI differs")
+	}
+	owner.iosb = new(earlyBootstrapIOSB)
+	owner.buffer = new([4096]byte)
+	owner.pins.Pin(owner.iosb)
+	owner.pins.Pin(owner.buffer)
+	owner.receipt.ReturnedStatus = query(owner.iosb, owner.buffer)
+	runtime.KeepAlive(owner)
+	if owner.receipt.ReturnedStatus == earlyBootstrapPending {
+		owner.receipt.Pending = true
+		owner.receipt.PinsRetained = true
+		owner.receipt.Error = "bootstrap_unexpected_pending"
+		earlyBootstrapPendingOwner = owner
+		return owner.receipt, errors.New(owner.receipt.Error)
+	}
+	owner.receipt.IOSBPresent = true
+	owner.receipt.IOSBStatus = uint64(owner.iosb.Status)
+	owner.receipt.Information = uint64(owner.iosb.Information)
+	if owner.receipt.Information <= uint64(len(owner.buffer)) {
+		owner.receipt.RawBufferHex = hex.EncodeToString(owner.buffer[:int(owner.receipt.Information)])
+	}
+	var err error
+	if owner.receipt.ReturnedStatus != 0 {
+		err = fmt.Errorf("bootstrap NtQueryVolumeInformationFile returned %#08x", owner.receipt.ReturnedStatus)
+	} else {
+		owner.receipt.Flags, owner.receipt.MaximumComponentLength, owner.receipt.FilesystemName, err = earlyBootstrapDecode(owner.receipt.Information, owner.buffer[:])
+	}
+	owner.pins.Unpin()
+	owner.receipt.CloseAttempted = true
+	closeErr := owner.closeRoot()
+	owner.receipt.RootClosed = closeErr == nil
+	if closeErr != nil {
+		owner.receipt.CloseError = closeErr.Error()
+	}
+	err = errors.Join(err, closeErr)
+	if err != nil {
+		owner.receipt.Error = err.Error()
+	}
+	return owner.receipt, err
+}
+
+func earlyBootstrapCurrentToken(ctx context.Context) (earlyBootstrapToken, error) {
+	token, err := (windowsMappings{}).identity(ctx)
+	return earlyBootstrapToken{SID: token.SID, AuthenticationID: token.AuthenticationID, SessionID: token.SessionID}, err
+}
+func earlyBootstrapNative(root string) (earlyBootstrapNativeReceipt, error) {
+	receipt := earlyBootstrapNativeReceipt{OpenAccess: win.FILE_READ_ATTRIBUTES | win.SYNCHRONIZE, OpenShare: win.FILE_SHARE_READ | win.FILE_SHARE_WRITE | win.FILE_SHARE_DELETE, OpenFlags: win.FILE_FLAG_BACKUP_SEMANTICS}
+	if unsafe.Sizeof(earlyBootstrapIOSB{}) != 16 || unsafe.Alignof(earlyBootstrapIOSB{}) != 8 || unsafe.Offsetof(earlyBootstrapIOSB{}.Information) != 8 {
+		return receipt, errors.New("bootstrap IO_STATUS_BLOCK ABI differs")
+	}
+	proc := win.NewLazySystemDLL("ntdll.dll").NewProc("NtQueryVolumeInformationFile")
+	if err := proc.Find(); err != nil {
+		return receipt, err
+	}
+	path, err := win.UTF16PtrFromString(root)
+	if err != nil {
+		return receipt, err
+	}
+	value, err := win.CreateFile(path, receipt.OpenAccess, receipt.OpenShare, nil, win.OPEN_EXISTING, receipt.OpenFlags, 0)
+	if err != nil {
+		return receipt, err
+	}
+	handle := &nativeHandle{value: value}
+	receipt.RootOpened = true
+	owner := &earlyBootstrapNativeOwner{closeRoot: handle.close, receipt: receipt}
+	return earlyBootstrapPerformNative(owner, func(iosb *earlyBootstrapIOSB, buffer *[4096]byte) uint32 {
+		status, _, _ := proc.Call(uintptr(handle.value), uintptr(unsafe.Pointer(iosb)), uintptr(unsafe.Pointer(buffer)), uintptr(len(buffer)), 5)
+		return uint32(status)
+	})
+}
+
+func earlyBootstrapExecutable() (string, string, error) {
+	path, err := os.Executable()
+	if err != nil {
+		return "", "", err
+	}
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return "", "", err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", "", err
+	}
+	digest := sha256.New()
+	_, copyErr := io.Copy(digest, file)
+	if err = errors.Join(copyErr, file.Close()); err != nil {
+		return "", "", err
+	}
+	return path, hex.EncodeToString(digest.Sum(nil)), nil
+}
+func earlyBootstrapRequestValid(request earlyBootstrapRequest) error {
+	nonce, err := hex.DecodeString(request.Nonce)
+	if err != nil || len(nonce) != 32 {
+		return errors.New("bootstrap invocation nonce is invalid")
+	}
+	if len(request.Root) > 1024 || !strings.HasPrefix(request.Root, `\\`) || strings.ContainsAny(request.Root, "/\x00") {
+		return errors.New("bootstrap requires exact root UNC")
+	}
+	parts := strings.Split(strings.TrimSuffix(request.Root[2:], `\`), `\`)
+	if len(parts) != 2 || parts[0] == "" || parts[0] == "." || parts[0] == "?" || parts[0] == ".." || parts[1] == "" || parts[1] == "." || parts[1] == ".." || strings.Contains(parts[1], ":") {
+		return errors.New("bootstrap input contains a descendant path")
+	}
+	digest, err := hex.DecodeString(request.ExecutableSHA256)
+	if err != nil || len(digest) != 32 || !filepath.IsAbs(request.Executable) || request.ParentPID <= 0 || request.Token.SID == "" || len(request.Token.SID) > 256 {
+		return errors.New("bootstrap owner identity is incomplete")
+	}
+	return nil
+}
+func earlyBootstrapReadJSON(data []byte, target any) error {
+	if len(data) == 0 || len(data) > earlyBootstrapLimit {
+		return errors.New("bootstrap JSON length outside bound")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return err
+		}
+		return errors.New("bootstrap has trailing JSON")
+	}
+	return nil
+}
+func earlyBootstrapReadInput() (earlyBootstrapRequest, error) {
+	var request earlyBootstrapRequest
+	data, err := io.ReadAll(io.LimitReader(os.Stdin, earlyBootstrapLimit+1))
+	if err != nil {
+		return request, err
+	}
+	if err = earlyBootstrapReadJSON(data, &request); err != nil {
+		return request, err
+	}
+	return request, earlyBootstrapRequestValid(request)
+}
+func earlyBootstrapWriteExit(receipt earlyBootstrapChildReceipt, code int) {
+	data, err := json.Marshal(receipt)
+	if err != nil || len(data) > earlyBootstrapLimit {
+		os.Exit(7)
+	}
+	if n, err := os.Stdout.Write(data); err != nil || n != len(data) {
+		os.Exit(8)
+	}
+	os.Exit(code)
+}
+func TestNativeEarlyCapabilityHelper(t *testing.T) {
+	if os.Getenv("RFS_EARLY_CAPABILITY_HELPER") != "1" {
+		return
+	}
+	request, err := earlyBootstrapReadInput()
+	child := earlyBootstrapChildReceipt{Root: request.Root, Nonce: request.Nonce, PID: os.Getpid(), ParentPID: os.Getppid()}
+	if err == nil {
+		child.Executable, child.ExecutableSHA256, err = earlyBootstrapExecutable()
+	}
+	if err == nil {
+		child.Token, err = earlyBootstrapCurrentToken(context.Background())
+	}
+	if err == nil && (child.ParentPID != request.ParentPID || child.Token != request.Token || child.Executable != request.Executable || child.ExecutableSHA256 != request.ExecutableSHA256) {
+		err = errors.New("bootstrap inherited identity differs from parent")
+	}
+	if err == nil {
+		child.Native, err = earlyBootstrapNative(request.Root)
+	}
+	code := 0
+	if err != nil {
+		child.Error = err.Error()
+		code = 3
+	}
+	earlyBootstrapWriteExit(child, code)
+}
+
+func earlyBootstrapValidateChild(request earlyBootstrapRequest, pid int, child earlyBootstrapChildReceipt) error {
+	if child.Root != request.Root || child.Nonce != request.Nonce || child.PID != pid || child.ParentPID != request.ParentPID || child.Token != request.Token || child.Executable != request.Executable || child.ExecutableSHA256 != request.ExecutableSHA256 {
+		return errors.New("bootstrap child binding differs")
+	}
+	n := child.Native
+	if child.Error != "" || n.Error != "" || n.CloseError != "" {
+		return fmt.Errorf("bootstrap child failed: %s / %s / %s", child.Error, n.Error, n.CloseError)
+	}
+	if !n.RootOpened || !n.CloseAttempted || !n.RootClosed || n.Pending || n.PinsRetained || !n.IOSBPresent || n.IOSBSize != 16 || n.IOSBAlignment != 8 || n.IOSBInformationOffset != 8 || n.ReturnedStatus != 0 || n.OpenAccess != 0x100080 || n.OpenShare != 7 || n.OpenFlags != 0x02000000 {
+		return errors.New("bootstrap native completion is not successful and closed")
+	}
+	raw, err := hex.DecodeString(n.RawBufferHex)
+	if err != nil || len(raw) > 4096 || uint64(len(raw)) != n.Information {
+		return errors.New("bootstrap native bytes differ from information length")
+	}
+	flags, component, name, err := earlyBootstrapDecode(n.Information, raw)
+	if err != nil {
+		return err
+	}
+	if flags != n.Flags || component != n.MaximumComponentLength || name != n.FilesystemName {
+		return errors.New("bootstrap decoded fields differ from raw bytes")
+	}
+	return nil
+}
+
+type earlyBootstrapWait struct {
+	Confirmed bool
+	Err       error
+	PID, Code int
+	At        time.Time
+}
+type earlyBootstrapRead struct {
+	Stderr []byte
+	Data   []byte
+	Bytes  int
+	Err    error
+}
+type earlyBootstrapKill struct {
+	Attempted bool
+	Err       error
+}
+type earlyBootstrapProcessOwner struct {
+	stderr, childStderr                    *os.File
+	capture                                *earlyBootstrapCapture
+	command                                *exec.Cmd
+	input, output, childInput, childOutput *os.File
+	started                                chan struct{}
+	settled                                chan struct{}
+	startErr, pipeErr                      error
+	pid                                    int
+	waited                                 chan earlyBootstrapWait
+	stop                                   chan struct{}
+	stopOnce                               sync.Once
+	killed                                 chan earlyBootstrapKill
+	inputDone                              chan error
+	outputDone                             chan earlyBootstrapRead
+}
+
+var earlyBootstrapRetained struct {
+	sync.Mutex
+	owners map[*earlyBootstrapProcessOwner]struct{}
+}
+
+func earlyBootstrapRetainProcess(owner *earlyBootstrapProcessOwner) {
+	earlyBootstrapRetained.Lock()
+	defer earlyBootstrapRetained.Unlock()
+	if earlyBootstrapRetained.owners == nil {
+		earlyBootstrapRetained.owners = make(map[*earlyBootstrapProcessOwner]struct{})
+	}
+	earlyBootstrapRetained.owners[owner] = struct{}{}
+}
+func earlyBootstrapReleaseProcess(owner *earlyBootstrapProcessOwner) {
+	earlyBootstrapRetained.Lock()
+	defer earlyBootstrapRetained.Unlock()
+	delete(earlyBootstrapRetained.owners, owner)
+}
+func earlyBootstrapWaitResult(command *exec.Cmd, err error) earlyBootstrapWait {
+	result := earlyBootstrapWait{Err: err, Code: -1, At: time.Now()}
+	if command.Process != nil {
+		result.PID = command.Process.Pid
+	}
+	if command.ProcessState != nil {
+		result.Confirmed = true
+		result.Code = command.ProcessState.ExitCode()
+	}
+	if !result.Confirmed && result.Err == nil {
+		result.Err = errors.New("bootstrap waiter returned no process state")
+	}
+	return result
+}
+
+type earlyBootstrapCapture struct {
+	sync.Mutex
+	stdout, stderr []byte
+	observed       int
+	exceeded       bool
+	overflow       chan struct{}
+}
+
+func (capture *earlyBootstrapCapture) snapshot(err error) earlyBootstrapRead {
+	capture.Lock()
+	defer capture.Unlock()
+	if capture.exceeded {
+		err = errors.Join(err, errors.New("bootstrap output exceeds shared limit"))
+	}
+	return earlyBootstrapRead{Data: bytes.Clone(capture.stdout), Stderr: bytes.Clone(capture.stderr), Bytes: capture.observed, Err: err}
+}
+func (capture *earlyBootstrapCapture) read(file *os.File, stderr bool) error {
+	var buffer [1024]byte
+	for {
+		n, err := file.Read(buffer[:])
+		if n > 0 {
+			capture.Lock()
+			capture.observed += n
+			remaining := earlyBootstrapLimit - len(capture.stdout) - len(capture.stderr)
+			keep := min(n, remaining)
+			if stderr {
+				capture.stderr = append(capture.stderr, buffer[:keep]...)
+			} else {
+				capture.stdout = append(capture.stdout, buffer[:keep]...)
+			}
+			excess := n > remaining
+			if excess && !capture.exceeded {
+				capture.exceeded = true
+				close(capture.overflow)
+			}
+			capture.Unlock()
+			if excess {
+				return errors.Join(errors.New("bootstrap output exceeds shared limit"), earlyBootstrapClosePipe(file))
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				err = nil
+			}
+			return errors.Join(err, earlyBootstrapClosePipe(file))
+		}
+	}
+}
+func earlyBootstrapNewOwner(command *exec.Cmd, input []byte) (*earlyBootstrapProcessOwner, error) {
+	childInput, parentInput, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	parentOutput, childOutput, err := os.Pipe()
+	if err != nil {
+		return nil, errors.Join(err, childInput.Close(), parentInput.Close())
+	}
+	parentStderr, childStderr, err := os.Pipe()
+	if err != nil {
+		return nil, errors.Join(err, childInput.Close(), parentInput.Close(), parentOutput.Close(), childOutput.Close())
+	}
+	owner := &earlyBootstrapProcessOwner{stderr: parentStderr, childStderr: childStderr, capture: &earlyBootstrapCapture{overflow: make(chan struct{})}, command: command, input: parentInput, output: parentOutput, childInput: childInput, childOutput: childOutput, started: make(chan struct{}), settled: make(chan struct{}), waited: make(chan earlyBootstrapWait, 1), stop: make(chan struct{}), killed: make(chan earlyBootstrapKill, 1), inputDone: make(chan error, 1), outputDone: make(chan earlyBootstrapRead, 1)}
+	command.Stdin = childInput
+	command.Stdout = childOutput
+	command.Stderr = childStderr
+	earlyBootstrapRetainProcess(owner)
+	go func() {
+		owner.startErr = command.Start()
+		owner.pipeErr = errors.Join(childInput.Close(), childOutput.Close(), childStderr.Close())
+		if owner.startErr == nil {
+			owner.pid = command.Process.Pid
+		}
+		close(owner.started)
+		if owner.startErr != nil {
+			close(owner.settled)
+			return
+		}
+		err := command.Wait()
+		result := earlyBootstrapWaitResult(command, err)
+		owner.waited <- result
+		if result.Confirmed {
+			close(owner.settled)
+		}
+	}()
+	go func() {
+		select {
+		case <-owner.stop:
+		case <-owner.settled:
+			owner.killed <- earlyBootstrapKill{}
+			return
+		}
+		<-owner.started
+		if owner.startErr != nil {
+			owner.killed <- earlyBootstrapKill{}
+			return
+		}
+		select {
+		case <-owner.settled:
+			owner.killed <- earlyBootstrapKill{}
+			return
+		default:
+		}
+		owner.killed <- earlyBootstrapKill{Attempted: true, Err: command.Process.Kill()}
+	}()
+	go func() {
+		_, err := io.Copy(parentInput, bytes.NewReader(input))
+		closeErr := parentInput.Close()
+		owner.inputDone <- errors.Join(err, closeErr)
+	}()
+	streamDone := make(chan error, 2)
+	go func() { streamDone <- owner.capture.read(parentOutput, false) }()
+	go func() { streamDone <- owner.capture.read(parentStderr, true) }()
+	go func() {
+		err := errors.Join(<-streamDone, <-streamDone)
+		owner.outputDone <- owner.capture.snapshot(err)
+	}()
+
+	return owner, nil
+}
+
+func earlyBootstrapClosePipe(file *os.File) error {
+	err := file.Close()
+	if errors.Is(err, os.ErrClosed) {
+		return nil
+	}
+	return err
+}
+func earlyBootstrapSupervise(ctx context.Context, command *exec.Cmd, request earlyBootstrapRequest, budget, drain time.Duration) (earlyBootstrapProcessReceipt, error) {
+	receipt := earlyBootstrapProcessReceipt{Nonce: request.Nonce, Root: request.Root, Executable: request.Executable, ExecutableSHA256: request.ExecutableSHA256, ParentPID: request.ParentPID, ParentToken: request.Token, Started: time.Now(), ExitCode: -1}
+	failBeforeLaunch := func(err error) (earlyBootstrapProcessReceipt, error) {
+		receipt.Outcome = "bootstrap_admission_failed"
+		receipt.Error = err.Error()
+		return receipt, err
+	}
+	if err := earlyBootstrapRequestValid(request); err != nil {
+		return failBeforeLaunch(err)
+	}
+	if budget <= 0 || drain <= 0 || command.Path != request.Executable || len(command.ExtraFiles) != 0 || command.Stdin != nil || command.Stdout != nil || command.Stderr != nil {
+		return failBeforeLaunch(errors.New("bootstrap command ownership differs"))
+	}
+	if err := ctx.Err(); err != nil {
+		return failBeforeLaunch(err)
+	}
+	input, err := json.Marshal(request)
+	if err != nil {
+		return failBeforeLaunch(err)
+	}
+	if len(input) > earlyBootstrapLimit {
+		return failBeforeLaunch(errors.New("bootstrap input exceeds limit"))
+	}
+	receipt.InputBytes = len(input)
+	deadline := receipt.Started.Add(budget)
+	owner, err := earlyBootstrapNewOwner(command, input)
+	if err != nil {
+		return failBeforeLaunch(err)
+	}
+	receipt.owner = owner
+	receipt.OwnerRetained = true
+	started, waited, inputDone, outputDone := false, false, false, false
+	startCh, waitCh, inCh, outCh := owner.started, owner.waited, owner.inputDone, owner.outputDone
+	var child earlyBootstrapChildReceipt
+	var failure error
+	work := time.NewTimer(time.Until(deadline))
+	defer work.Stop()
+	recordWait := func(result earlyBootstrapWait) {
+		waited = result.Confirmed
+		waitCh = nil
+		receipt.PID = result.PID
+		receipt.ExitConfirmed = result.Confirmed
+		if !result.Confirmed {
+			failure = errors.Join(result.Err, errors.New("bootstrap process exit is unconfirmed"))
+			receipt.Outcome = "bootstrap_wait_unconfirmed"
+		}
+		receipt.WaitReturned = result.At
+		if result.Confirmed {
+			receipt.Exited = result.At
+		}
+		receipt.ExitCode = result.Code
+		if result.Err != nil {
+			receipt.WaitError = result.Err.Error()
+		}
+	}
+	recordRaw := func(result earlyBootstrapRead) {
+		receipt.Stdout = result.Data
+		receipt.Stderr = result.Stderr
+		receipt.OutputBytes = result.Bytes
+		receipt.OutputComplete = result.Err == nil
+	}
+	recordOutput := func(result earlyBootstrapRead) error {
+		recordRaw(result)
+		parseErr := earlyBootstrapReadJSON(result.Data, &child)
+		if parseErr == nil {
+			receipt.ChildToken = child.Token
+			receipt.Native = &child.Native
+		}
+		var stderrErr error
+		if len(result.Stderr) != 0 {
+			stderrErr = errors.New("bootstrap helper wrote stderr")
+		}
+		return errors.Join(result.Err, parseErr, stderrErr)
+	}
+	for failure == nil {
+		if started && outputDone {
+			if err := earlyBootstrapValidateChild(request, receipt.PID, child); err != nil {
+				failure = err
+				receipt.Outcome = "bootstrap_invalid_receipt"
+				if child.Native.Pending {
+					receipt.Outcome = "bootstrap_unexpected_pending"
+				}
+				break
+			}
+		}
+		if started && inputDone && outputDone && waited {
+			if ctx.Err() != nil {
+				failure = ctx.Err()
+				receipt.Outcome = "bootstrap_cancelled"
+			} else if !time.Now().Before(deadline) {
+				failure = context.DeadlineExceeded
+				receipt.Outcome = "bootstrap_deadline"
+			} else if receipt.ExitCode != 0 || receipt.WaitError != "" {
+				failure = fmt.Errorf("bootstrap helper exit: %s", receipt.WaitError)
+				receipt.Outcome = "bootstrap_child_failed"
+			} else if err := earlyBootstrapValidateChild(request, receipt.PID, child); err != nil {
+				failure = err
+				receipt.Outcome = "bootstrap_invalid_receipt"
+			} else {
+				receipt.Outcome = "bootstrap_complete"
+				earlyBootstrapReleaseProcess(owner)
+				receipt.owner = nil
+				receipt.OwnerRetained = false
+				return receipt, nil
+			}
+			break
+		}
+		select {
+		case <-ctx.Done():
+			failure = ctx.Err()
+			receipt.Outcome = "bootstrap_cancelled"
+		case <-work.C:
+			failure = context.DeadlineExceeded
+			receipt.Outcome = "bootstrap_deadline"
+		case <-owner.capture.overflow:
+			failure = errors.New("bootstrap output exceeds shared limit")
+			receipt.Outcome = "bootstrap_output_failed"
+		case <-startCh:
+			started = true
+			startCh = nil
+			receipt.PID = owner.pid
+			if owner.startErr != nil {
+				failure = owner.startErr
+				receipt.Outcome = "bootstrap_start_failed"
+			} else if owner.pipeErr != nil {
+				failure = owner.pipeErr
+				receipt.Outcome = "bootstrap_pipe_failed"
+			}
+		case result := <-waitCh:
+			recordWait(result)
+		case err := <-inCh:
+			inputDone = true
+			inCh = nil
+			if err != nil {
+				failure = err
+				receipt.Outcome = "bootstrap_input_failed"
+			}
+		case result := <-outCh:
+			outputDone = true
+			outCh = nil
+			if err := recordOutput(result); err != nil {
+				failure = err
+				receipt.Outcome = "bootstrap_invalid_receipt"
+			}
+		}
+	}
+	receipt.Error = failure.Error()
+	if !waited && !(started && owner.startErr != nil) {
+		receipt.KillRequested = true
+		owner.stopOnce.Do(func() { close(owner.stop) })
+	}
+	termination := time.NewTimer(drain)
+	defer termination.Stop()
+	killCh := owner.killed
+	killDone := !receipt.KillRequested
+	recordKill := func(result earlyBootstrapKill) {
+		killDone = true
+		killCh = nil
+		receipt.KillAttempted = result.Attempted
+		receipt.KillReturned = result.Attempted
+		if result.Err != nil {
+			receipt.KillError = result.Err.Error()
+		}
+	}
+	unsettled := func() (earlyBootstrapProcessReceipt, error) {
+		recordRaw(owner.capture.snapshot(errors.New("bootstrap pipe capture is incomplete")))
+		receipt.Outcome = "bootstrap_cleanup_unsettled"
+		failure = errors.Join(failure, errors.New(receipt.Outcome))
+		receipt.Error = failure.Error()
+		return receipt, failure
+	}
+	for !waited && !(started && owner.startErr != nil) {
+		select {
+		case <-startCh:
+			started = true
+			startCh = nil
+			receipt.PID = owner.pid
+		case result := <-waitCh:
+			recordWait(result)
+		case result := <-killCh:
+			recordKill(result)
+		case <-termination.C:
+			return unsettled()
+		}
+	}
+	failure = errors.Join(failure, earlyBootstrapClosePipe(owner.input))
+	for !inputDone || !outputDone || !killDone {
+		select {
+		case err := <-inCh:
+			inputDone = true
+			inCh = nil
+			failure = errors.Join(failure, err)
+		case result := <-outCh:
+			outputDone = true
+			outCh = nil
+			failure = errors.Join(failure, recordOutput(result))
+		case result := <-killCh:
+			recordKill(result)
+		case <-termination.C:
+			return unsettled()
+		}
+	}
+	failure = errors.Join(failure, earlyBootstrapClosePipe(owner.output), earlyBootstrapClosePipe(owner.stderr))
+	receipt.Error = failure.Error()
+
+	earlyBootstrapReleaseProcess(owner)
+	receipt.owner = nil
+	receipt.OwnerRetained = false
+	return receipt, failure
+}
+
+func earlyBootstrapRun(ctx context.Context, root string) (earlyBootstrapProcessReceipt, error) {
+	executable, digest, err := earlyBootstrapExecutable()
+	if err != nil {
+		return earlyBootstrapProcessReceipt{Outcome: "bootstrap_setup_failed", Error: err.Error()}, err
+	}
+	token, err := earlyBootstrapCurrentToken(ctx)
+	if err != nil {
+		return earlyBootstrapProcessReceipt{Outcome: "bootstrap_setup_failed", Error: err.Error()}, err
+	}
+	var nonce [32]byte
+	if _, err = rand.Read(nonce[:]); err != nil {
+		return earlyBootstrapProcessReceipt{Outcome: "bootstrap_setup_failed", Error: err.Error()}, err
+	}
+	request := earlyBootstrapRequest{Nonce: hex.EncodeToString(nonce[:]), Root: root, ParentPID: os.Getpid(), Executable: executable, ExecutableSHA256: digest, Token: token}
+	command := exec.Command(executable, "-test.run=^TestNativeEarlyCapabilityHelper$", "-test.count=1")
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "RFS_EARLY_CAPABILITY_HELPER=") {
+			command.Env = append(command.Env, entry)
+		}
+	}
+	command.Env = append(command.Env, "RFS_EARLY_CAPABILITY_HELPER=1")
+	return earlyBootstrapSupervise(ctx, command, request, 10*time.Second, 5*time.Second)
+}
+
+func earlyBootstrapControlBytes() []byte {
+	return []byte{6, 4, 0, 0, 255, 0, 0, 0, 18, 0, 0, 0, 'r', 0, 'e', 0, 'm', 0, 'o', 0, 't', 0, 'e', 0, '-', 0, 'f', 0, 's', 0}
+}
+func earlyBootstrapControlQuery(mode string) (earlyBootstrapNativeReceipt, error) {
+	closed := 0
+	owner := &earlyBootstrapNativeOwner{receipt: earlyBootstrapNativeReceipt{RootOpened: true, OpenAccess: 0x100080, OpenShare: 7, OpenFlags: 0x02000000}, closeRoot: func() error {
+		closed++
+		if mode == "close-error" {
+			return errors.New("controlled root close failure")
+		}
+		return nil
+	}}
+	receipt, err := earlyBootstrapPerformNative(owner, func(iosb *earlyBootstrapIOSB, buffer *[4096]byte) uint32 {
+		if mode == "blocked" {
+			for {
+				time.Sleep(time.Hour)
+			}
+		}
+		if mode == "pending" {
+			active := make(chan struct{})
+			go func() {
+				iosb.Status = 1
+				close(active)
+				for {
+					iosb.Status++
+					iosb.Information++
+					buffer[0]++
+					time.Sleep(time.Millisecond)
+				}
+			}()
+			<-active
+			return earlyBootstrapPending
+		}
+		copy(buffer[:], earlyBootstrapControlBytes())
+		iosb.Information = 30
+		iosb.Status = 0xc0000001
+		if mode == "native-error" {
+			iosb.Status = 0
+			return 0xc0000001
+		}
+		if mode == "overflow" {
+			return 0x80000005
+		}
+		if mode == "bad-information" {
+			iosb.Information = 4097
+		}
+		return 0
+	})
+	if mode == "pending" {
+		if earlyBootstrapPendingOwner != owner || !receipt.PinsRetained || receipt.IOSBPresent || closed != 0 {
+			panic("pending owner was released")
+		}
+	} else if closed != 1 || receipt.PinsRetained {
+		panic("terminal query did not release exactly once")
+	}
+	return receipt, err
+}
+func TestEarlyBootstrapProcessControlHelper(t *testing.T) {
+	mode := os.Getenv("RFS_EARLY_BOOTSTRAP_CONTROL")
+	if mode == "" {
+		return
+	}
+	request, err := earlyBootstrapReadInput()
+	if err != nil {
+		os.Exit(11)
+	}
+	if mode == "lost" {
+		os.Exit(0)
+	}
+	if mode == "malformed" {
+		_, _ = os.Stdout.Write([]byte("{"))
+		os.Exit(0)
+	}
+	if mode == "oversized" {
+		_, _ = os.Stdout.Write(bytes.Repeat([]byte("x"), earlyBootstrapLimit+1))
+		os.Exit(0)
+	}
+	if mode == "mixed-oversized" {
+		_, _ = os.Stdout.Write(bytes.Repeat([]byte("x"), earlyBootstrapLimit/2))
+		_, _ = os.Stderr.Write(bytes.Repeat([]byte("y"), earlyBootstrapLimit/2+1))
+		os.Exit(0)
+	}
+	if mode == "stderr" {
+		_, _ = os.Stderr.Write([]byte("controlled stderr"))
+	}
+
+	child := earlyBootstrapChildReceipt{Root: request.Root, Nonce: request.Nonce, PID: os.Getpid(), ParentPID: os.Getppid(), Token: request.Token}
+	child.Executable, child.ExecutableSHA256, err = earlyBootstrapExecutable()
+	if err != nil {
+		os.Exit(12)
+	}
+	child.Native, err = earlyBootstrapControlQuery(mode)
+	if err != nil {
+		child.Error = err.Error()
+	}
+	switch mode {
+	case "wrong-root":
+		child.Root += "A"
+	case "wrong-pid":
+		child.PID++
+	case "wrong-parent":
+		child.ParentPID++
+	case "wrong-nonce":
+		child.Nonce = strings.Repeat("0", 64)
+	case "wrong-token":
+		child.Token.AuthenticationID++
+	case "wrong-session":
+		child.Token.SessionID++
+	case "wrong-sid":
+		child.Token.SID += "-1"
+	case "wrong-hash":
+		child.ExecutableSHA256 = strings.Repeat("0", 64)
+	case "wrong-path":
+		child.Executable += ".other"
+	case "receipt-then-block":
+		data, _ := json.Marshal(child)
+		_, _ = os.Stdout.Write(data)
+		_ = os.Stdout.Close()
+		_ = os.Stderr.Close()
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
+	code := 0
+	if err != nil {
+		code = 3
+	}
+	earlyBootstrapWriteExit(child, code)
+}
+func earlyBootstrapControlRequest(t *testing.T) earlyBootstrapRequest {
+	t.Helper()
+	executable, digest, err := earlyBootstrapExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		t.Fatal(err)
+	}
+	return earlyBootstrapRequest{Nonce: hex.EncodeToString(nonce[:]), Root: `\\127.0.0.1\private-share\`, ParentPID: os.Getpid(), Executable: executable, ExecutableSHA256: digest, Token: earlyBootstrapToken{SID: "portable-token-model", AuthenticationID: 19, SessionID: 2}}
+}
+func earlyBootstrapControlCommand(request earlyBootstrapRequest, mode string) *exec.Cmd {
+	command := exec.Command(request.Executable, "-test.run=^TestEarlyBootstrapProcessControlHelper$", "-test.count=1")
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "RFS_EARLY_BOOTSTRAP_CONTROL=") {
+			command.Env = append(command.Env, entry)
+		}
+	}
+	command.Env = append(command.Env, "RFS_EARLY_BOOTSTRAP_CONTROL="+mode)
+	return command
+}
+func TestEarlyBootstrapProcessControls(t *testing.T) {
+	for _, mode := range []string{"success", "lost", "malformed", "oversized", "mixed-oversized", "stderr", "wrong-root", "wrong-pid", "wrong-parent", "wrong-nonce", "wrong-token", "wrong-session", "wrong-sid", "wrong-hash", "wrong-path", "native-error", "overflow", "bad-information", "close-error", "pending", "blocked", "receipt-then-block"} {
+		t.Run(mode, func(t *testing.T) {
+			request := earlyBootstrapControlRequest(t)
+			command := earlyBootstrapControlCommand(request, mode)
+			budget := 5 * time.Second
+			if mode == "blocked" || mode == "receipt-then-block" {
+				budget = 200 * time.Millisecond
+			}
+			receipt, err := earlyBootstrapSupervise(t.Context(), command, request, budget, 2*time.Second)
+			if len(receipt.Stdout)+len(receipt.Stderr) > earlyBootstrapLimit {
+				t.Fatal("raw streams exceed shared bound")
+			}
+			if mode == "stderr" {
+				if !bytes.Equal(receipt.Stderr, []byte("controlled stderr")) || len(receipt.Stdout) == 0 {
+					t.Fatal("raw stderr/stdout lost", receipt)
+				}
+			} else if mode != "mixed-oversized" && len(receipt.Stderr) != 0 {
+				t.Fatalf("unexpected child stderr: %s", receipt.Stderr)
+			}
+			if mode == "malformed" && !bytes.Equal(receipt.Stdout, []byte("{")) {
+				t.Fatal("malformed helper bytes lost", receipt.Stdout)
+			}
+			if mode == "mixed-oversized" && (len(receipt.Stdout)+len(receipt.Stderr) != earlyBootstrapLimit || receipt.OutputBytes <= earlyBootstrapLimit || receipt.OutputComplete) {
+				t.Fatal("shared stream overflow hidden", receipt)
+			}
+			if mode == "success" {
+				if err != nil || !receipt.ExitConfirmed || receipt.ExitCode != 0 || receipt.KillRequested || receipt.Native == nil || receipt.Native.IOSBStatus != 0xc0000001 || !receipt.Native.RootClosed {
+					t.Fatalf("terminal returned-status semantics: %+v %v", receipt, err)
+				}
+			} else if err == nil {
+				t.Fatalf("%s became success: %+v", mode, receipt)
+			}
+			if !receipt.ExitConfirmed || receipt.PID <= 0 || receipt.owner != nil {
+				t.Fatalf("child exit not owned/confirmed: %+v %v", receipt, err)
+			}
+			if mode == "oversized" && receipt.OutputBytes != earlyBootstrapLimit+1 {
+				t.Fatal("oversized output length hidden", receipt.OutputBytes)
+			}
+			if mode == "pending" && (receipt.Native == nil || !receipt.Native.PinsRetained || receipt.Native.RootClosed || receipt.Native.IOSBPresent) {
+				t.Fatal("pending completion decoded/released", receipt.Native)
+			}
+			if (mode == "blocked" || mode == "receipt-then-block") && (!receipt.KillRequested || receipt.ExitCode == 0) {
+				t.Fatal("receipt or Kill was treated as process exit", receipt)
+			}
+			earlyBootstrapRetained.Lock()
+			owners := len(earlyBootstrapRetained.owners)
+			earlyBootstrapRetained.Unlock()
+			if owners != 0 {
+				t.Fatal("settled process owner retained", owners)
+			}
+		})
+	}
+}
+
+func TestEarlyBootstrapNativeParsing(t *testing.T) {
+	if unsafe.Sizeof(earlyBootstrapIOSB{}) != 16 || unsafe.Alignof(earlyBootstrapIOSB{}) != 8 || unsafe.Offsetof(earlyBootstrapIOSB{}.Information) != 8 {
+		t.Fatal("wrong IOSB ABI")
+	}
+	for _, name := range []string{"success", "short-header", "oversized-information", "truncated-name", "odd-name", "bad-utf16", "wrong-flags", "wrong-component", "wrong-name"} {
+		t.Run(name, func(t *testing.T) {
+			data := earlyBootstrapControlBytes()
+			info := uint64(len(data))
+			switch name {
+			case "short-header":
+				info = 11
+			case "oversized-information":
+				info = 4097
+			case "truncated-name":
+				info--
+			case "odd-name":
+				binary.LittleEndian.PutUint32(data[8:], 17)
+			case "bad-utf16":
+				binary.LittleEndian.PutUint16(data[12:], 0xd800)
+			case "wrong-flags":
+				binary.LittleEndian.PutUint32(data, 6)
+			case "wrong-component":
+				binary.LittleEndian.PutUint32(data[4:], 254)
+			case "wrong-name":
+				data[12] = 'x'
+			}
+			flags, component, fsname, err := earlyBootstrapDecode(info, data)
+			if name == "success" {
+				if err != nil || flags != 0x406 || component != 255 || fsname != "remote-fs" {
+					t.Fatal(flags, component, fsname, err)
+				}
+			} else if err == nil {
+				t.Fatal("malformed native buffer accepted")
+			}
+		})
+	}
+	for _, status := range []uint32{0, 0xc0000001, 0x80000005} {
+		closes := 0
+		owner := &earlyBootstrapNativeOwner{receipt: earlyBootstrapNativeReceipt{RootOpened: true}, closeRoot: func() error { closes++; return nil }}
+		receipt, err := earlyBootstrapPerformNative(owner, func(iosb *earlyBootstrapIOSB, buffer *[4096]byte) uint32 {
+			copy(buffer[:], earlyBootstrapControlBytes())
+			iosb.Information = 30
+			if status == 0 {
+				iosb.Status = 0xc0000001
+			}
+			return status
+		})
+		if (status == 0) != (err == nil) || closes != 1 || !receipt.RootClosed || receipt.PinsRetained {
+			t.Fatal("returned status/terminal ownership changed", receipt, err, closes)
+		}
+	}
+}
+func TestEarlyBootstrapAdmissionAndJSON(t *testing.T) {
+	request := earlyBootstrapControlRequest(t)
+	for _, root := range []string{`\\127.0.0.1\private-share`, `\\127.0.0.1\private-share\`} {
+		request.Root = root
+		if err := earlyBootstrapRequestValid(request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, root := range []string{`\\127.0.0.1\private-share\A`, `\\127.0.0.1\private-share\B`, `\\127.0.0.1\private-share\\`, `C:\root`, `\\.\PhysicalDrive0`, `\\?\volume`, `\\127.0.0.1\`, "\\\\127.0.0.1\\share\x00"} {
+		request.Root = root
+		if err := earlyBootstrapRequestValid(request); err == nil {
+			t.Fatal("non-root input admitted", root)
+		}
+	}
+	for _, raw := range [][]byte{nil, []byte(`{"unknown":1}`), []byte(`{} {}`), bytes.Repeat([]byte("x"), earlyBootstrapLimit+1)} {
+		var got earlyBootstrapChildReceipt
+		if err := earlyBootstrapReadJSON(raw, &got); err == nil {
+			t.Fatal("invalid bounded receipt admitted")
+		}
+	}
+	request = earlyBootstrapControlRequest(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	receipt, err := earlyBootstrapSupervise(ctx, earlyBootstrapControlCommand(request, "success"), request, time.Second, time.Second)
+	if !errors.Is(err, context.Canceled) || receipt.PID != 0 || receipt.KillRequested {
+		t.Fatal("cancelled admission launched helper", receipt, err)
+	}
+	command := earlyBootstrapControlCommand(request, "success")
+	command.Path += ".missing"
+	receipt, err = earlyBootstrapSupervise(t.Context(), command, request, time.Second, time.Second)
+	if err == nil || receipt.PID != 0 {
+		t.Fatal("different executable admitted", receipt, err)
+	}
+	request.Executable += ".missing"
+	command = earlyBootstrapControlCommand(request, "success")
+	receipt, err = earlyBootstrapSupervise(t.Context(), command, request, time.Second, time.Second)
+	if err == nil || receipt.ExitConfirmed || receipt.PID != 0 || receipt.owner != nil {
+		t.Fatal("failed launch manufactured process exit", receipt, err)
+	}
+	request = earlyBootstrapControlRequest(t)
+	request.Executable = string(os.PathSeparator) + strings.Repeat("x", earlyBootstrapLimit)
+	command = earlyBootstrapControlCommand(request, "success")
+	receipt, err = earlyBootstrapSupervise(t.Context(), command, request, time.Second, time.Second)
+	if err == nil || receipt.PID != 0 {
+		t.Fatal("oversized invocation admitted", receipt, err)
+	}
+}
+func TestEarlyBootstrapCancellationAndDeadline(t *testing.T) {
+	for _, name := range []string{"cancel", "deadline"} {
+		t.Run(name, func(t *testing.T) {
+			request := earlyBootstrapControlRequest(t)
+			command := earlyBootstrapControlCommand(request, "blocked")
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			budget := 5 * time.Second
+			if name == "cancel" {
+				timer := time.AfterFunc(200*time.Millisecond, cancel)
+				defer timer.Stop()
+			} else {
+				budget = time.Nanosecond
+			}
+			receipt, err := earlyBootstrapSupervise(ctx, command, request, budget, 2*time.Second)
+			if err == nil || !receipt.ExitConfirmed || !receipt.KillRequested || receipt.PID <= 0 || receipt.owner != nil || receipt.ExitCode == 0 {
+				t.Fatal("cancel/deadline became success or lost owner", receipt, err)
+			}
+			if name == "cancel" && !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
+			if name == "deadline" && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestEarlyBootstrapWaitRequiresProcessState(t *testing.T) {
+	for _, err := range []error{nil, errors.New("controlled process wait failure")} {
+		result := earlyBootstrapWaitResult(&exec.Cmd{}, err)
+		if result.Confirmed || result.Code != -1 || result.Err == nil {
+			t.Fatal("unknown waiter result became exit proof", result)
+		}
+	}
+}

@@ -544,6 +544,18 @@ Hnew/HA 的同 volume opaque 身份、原 HA 稳定、B769/A257 字节、冷 B�
 
 本地适用控制 50 根，普通/race 各 452 verdict 通过；两个隔离对照各移除一个真实刺激，原联合 exposure 断言失败，另一个刺激的事实保留。十九项脚本策略控制、三项未知输入/中间态/反序拒绝和四种配置的 ARM64 构建通过；三个旧分支的 254 份非测试 Go 源码与 native-call 序列保持不变。[原生组合 35430629259](https://github.com/codetreker/remote-fs/actions/runs/35430629259)已证明同一 HA 的 Fs5=0x406 在 mutation 前送达、首个新 CREATE 接纳了未请求的真实 B QFid=4，仍为合格 retained_identity_changed：Hnew 为 4，保留 HA 从 3 变成 4，A257/B769 字节各自正确。473 个控制 verdict 通过，完整 DETAIL、冷 B、oracle、原设置与清理合格，全部身份/字节检查在 ACK 后 44.3882 ms 完成。两个刺激已暴露不代表旧引用稳定；该首样本不是超过一秒的陈旧证明，也不决定内部机制、未请求 QFid 的符合性或当前生产/缓存验收。
 
+### HA 打开前的能力 bootstrap 实验
+
+[独立工作流](../.github/workflows/native-smb-early-capability-bootstrap.yml)在 requested-only QFid、固定 0x406 和精确 DETAIL 的原型上只增加一次 pre-HA root 查询。显式 before-ha 选择要求 standalone POSIX 配置，不混入 always-QFid。已有 descendant share0 应用打开和 ancestor watcher 次序不变：watcher 已实际 Pending 后，由同一个已构建测试 executable 的专用子进程查询确切 share 根，并确认退出后才允许原 HA API 开始。目录 handle/FCB 可能已经存在；这不是“在全部 FCB 创建前”的证明，也不预设 capability latch 机制。
+
+[进程 helper](../.github/scripts/native-smb-early-capability-process_test.go.txt)核对继承的 SID、AuthenticationId、token session、实际 PID、executable 与调用 nonce，IPC 各至多 16 KiB。只以同步 CreateFileW 在 root 打开 READ_ATTRIBUTES|SYNCHRONIZE、共享 read/write/delete 的 metadata handle，调用一次 NtQueryVolumeInformationFile(FileFsAttributeInformation)。固定 4096 字节 buffer 与正确 ABI 的 IOSB 为独立、pointer-free、pinned 对象；非 PENDING 时以返回 NTSTATUS 为准，仅 exact SUCCESS、完整有界 Fs5 与正常 root Close 可以通过，不比较返回值与 IOSB.Status 是否相等，也不重试或扩容。
+
+意外 STATUS_PENDING 明确失败，保留 pins、buffer、IOSB 和 root 的进程生命周期拥有权，不解码、不 unpin，也不宣称普通关闭或原生取消成功。固定十秒包含启动、查询、关闭、receipt 和实际成功退出；另至多五秒终止/排空。Kill 返回或关闭 process handle 不等于进程完成，必须由唯一 waiter 取得真实 ProcessState/退出；超时、forced、未知退出或丢 receipt 均禁止后续 HA 和 mutation，并交原外层清理保留失败。此等待预算不承诺内核一定及时完成取消。
+
+[被动归属/顺序检查](../.github/scripts/native-smb-early-capability-wire_test.go.txt)要求 root Fs5 回复、helper 完成退出、父 HA API-begin marker、实际 HA CREATE 按同一全局序号排序。helper root、仍活跃的 watcher、HA/Hnew 必须共用实际 connection/session/effective TreeID 和正确 share/volume；token 相同不能替代这些证据。可使用系统真实复用的已知 root server-open，不制造新 handle；RELATED 和 async 的归属从已核对的请求/前序解析，raw 字段仍保留。Fs5 不含 serial，不补造它；任何 bootstrap A/B 请求或 enumeration 都使 no-warming 资格失败。
+
+后续 opaque 身份、HA 稳定/Hnew 不同、A257/B769 字节、完整 DETAIL/历史证明、原 ACK+一秒/最早 TTL 和 cleanup 均保持。64 个本地根普通/race 各 542 verdict 通过，八项因果负向对照、二十六项脚本策略和五种 ARM64 构建有绑定收据，四个旧分支的原输入与 native-call 序列保持。Linux 控制确实运行子进程 supervisor 与精确提取 parser，但 NtQuery/token/CreateFile Windows 入口及内核 PENDING 取消仍未原生执行；新单项没有身份效果或生产修复结论。
+
 ## 每次改动必须带什么
 
 **任何非平凡改动都要在同一次改动里新增或更新测试。** 判据与 Agent Note 相同。

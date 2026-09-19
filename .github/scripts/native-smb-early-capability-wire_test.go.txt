@@ -1,0 +1,1866 @@
+//go:build windows
+
+package windows
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+	"github.com/codetreker/remote-fs/packages/storage"
+)
+
+const earlyWireMaxRecords = 128
+const earlyWireMaxPending = 64
+const earlyWireMaxBytes = 64 << 10
+const earlyWireMaxNameBytes = 1024
+
+type earlyWireRecord struct {
+	Sequence                                 uint64
+	Connection, RawSession, Session, Message uint64
+	RawTree                                  *uint32
+	Tree                                     uint32
+	AsyncID                                  *uint64
+	Related                                  bool
+	RelatedCreate                            uint64
+	Command                                  uint16
+	Response                                 bool
+	Status                                   uint32
+	Name, FileID                             string
+	RawFileID                                string
+	Predecessor                              *parentNotifyKey
+	OwnerPending                             bool
+	QueryType, QueryClass                    byte
+	Attributes                               *preciseFilesystemAttributes
+	Complete                                 bool
+	Error                                    string
+}
+
+type earlyWirePending struct {
+	record  earlyWireRecord
+	async   *uint64
+	pending bool
+}
+type earlyWireChainKey struct {
+	connection uint64
+	response   bool
+}
+type earlyWireChain struct {
+	previous parentNotifyKey
+	active   bool
+}
+type earlyIdentityEvent struct {
+	packet   []byte
+	wire     cacheGatePositiveWireRecord
+	sequence uint64
+}
+
+type earlyMarkers struct{ Started, Settled, HABegin, Mutation, FirstNewBegin, FirstNewEnd uint64 }
+
+type earlyBootstrapState struct {
+	UNC     string
+	Volume  storage.FileVolumeState
+	Markers earlyMarkers
+	Process *earlyBootstrapProcessReceipt
+	Error   string
+}
+
+var earlyRegistry struct {
+	sync.Mutex
+	records  []earlyWireRecord
+	pending  map[parentNotifyKey]earlyWirePending
+	chains   map[earlyWireChainKey]earlyWireChain
+	bytes    int
+	failure  error
+	state    earlyBootstrapState
+	identity []earlyIdentityEvent
+	active   bool
+}
+
+func earlyReset() {
+	earlyRegistry.Lock()
+	defer earlyRegistry.Unlock()
+	earlyRegistry.records = nil
+	earlyRegistry.pending = make(map[parentNotifyKey]earlyWirePending)
+	earlyRegistry.chains = make(map[earlyWireChainKey]earlyWireChain)
+	earlyRegistry.bytes = 0
+	earlyRegistry.failure = nil
+	earlyRegistry.state = earlyBootstrapState{}
+	earlyRegistry.identity = nil
+	earlyRegistry.active = false
+}
+
+func earlyActivate()   { earlyRegistry.Lock(); earlyRegistry.active = true; earlyRegistry.Unlock() }
+func earlyDeactivate() { earlyRegistry.Lock(); earlyRegistry.active = false; earlyRegistry.Unlock() }
+func earlyRelatedActive(flags uint32) bool {
+	earlyRegistry.Lock()
+	defer earlyRegistry.Unlock()
+	return earlyRegistry.active && flags&wire.FlagRelated != 0
+}
+
+func earlySnapshot() ([]earlyWireRecord, error) {
+	earlyRegistry.Lock()
+	defer earlyRegistry.Unlock()
+	err := earlyRegistry.failure
+	for _, record := range earlyRegistry.records {
+		if record.OwnerPending {
+			err = errors.Join(err, errors.New("related ownership awaits a validated predecessor result"))
+			break
+		}
+	}
+	if len(earlyRegistry.identity) != 0 {
+		err = errors.Join(err, errors.New("identity observations await related ownership"))
+	}
+	return slices.Clone(earlyRegistry.records), err
+}
+
+func earlySelected(command uint16) bool {
+	switch command {
+	case wire.SessionSetup, wire.TreeConnect, wire.TreeDisconnect, wire.Logoff, wire.Create, wire.Close, wire.Read, wire.QueryDirectory, wire.QueryInfo, wire.ChangeNotify:
+		return true
+	}
+	return false
+}
+
+func earlyTreeCommand(command uint16) bool {
+	return earlySelected(command) && command != wire.SessionSetup && command != wire.Logoff && command != wire.TreeConnect
+}
+
+func earlyRecordCost(record earlyWireRecord) int {
+	charge := 512 + 4*(len(record.Name)+len(record.FileID)+len(record.RawFileID)+len(record.Error))
+	if record.Attributes != nil {
+		charge += 4 * (len(record.Attributes.FixedRaw) + len(record.Attributes.NameRaw) + len(record.Attributes.Name))
+	}
+	return charge
+}
+
+func earlyRecordLocked(record earlyWireRecord, err error) bool {
+	if earlyRegistry.failure != nil {
+		return false
+	}
+	if err != nil {
+		record.Error = err.Error()
+		record.Complete = false
+		earlyRegistry.failure = err
+	}
+	cost := earlyRecordCost(record)
+	if len(earlyRegistry.records) >= earlyWireMaxRecords || cost > earlyWireMaxBytes-earlyRegistry.bytes {
+		earlyRegistry.failure = errors.New("early tree evidence retention bound exceeded")
+		return false
+	}
+	earlyRegistry.bytes += cost
+	earlyRegistry.records = append(earlyRegistry.records, record)
+	return err == nil
+}
+
+func earlyFindLocked(key parentNotifyKey, response bool) *earlyWireRecord {
+	for i := range earlyRegistry.records {
+		record := &earlyRegistry.records[i]
+		if record.Connection == key.Connection && record.Message == key.MessageID && record.Response == response && (!response || record.Status != 0x103) {
+			return record
+		}
+	}
+	return nil
+}
+
+func earlyNeedsFile(command uint16) bool {
+	switch command {
+	case wire.Close, wire.Read, wire.QueryDirectory, wire.QueryInfo, wire.ChangeNotify:
+		return true
+	}
+	return false
+}
+
+// RELATED request IDs come from the preceding operation/result; their raw
+// header/body values are ignored even when they are not all-ones sentinels.
+// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/46dd4182-62d3-4e30-9fe5-e2ec124edca1
+func earlyResolveOwnersLocked() error {
+	for round := 0; round < len(earlyRegistry.records); round++ {
+		changed := false
+		for i := range earlyRegistry.records {
+			record := &earlyRegistry.records[i]
+			if !record.OwnerPending {
+				continue
+			}
+			if !record.Response {
+				if record.Predecessor == nil {
+					return errors.New("related request has no predecessor")
+				}
+				prior := earlyFindLocked(*record.Predecessor, true)
+				if prior == nil || prior.OwnerPending {
+					continue
+				}
+				if prior.Status != 0 {
+					return errors.New("related predecessor failed; ownership is not established")
+				}
+				record.Session = prior.Session
+				record.Tree = prior.Tree
+				if earlyNeedsFile(record.Command) {
+					if prior.FileID == "" {
+						return errors.New("related predecessor did not contain or produce a file handle")
+					}
+					record.FileID = prior.FileID
+					record.RelatedCreate = prior.RelatedCreate
+					if prior.Command == wire.Create {
+						record.RelatedCreate = prior.Message
+					}
+				}
+				if record.Command != wire.SessionSetup && record.Session == 0 || earlyTreeCommand(record.Command) && record.Tree == 0 {
+					return errors.New("related predecessor did not allocate required session/tree")
+				}
+				record.OwnerPending = false
+				changed = true
+			} else {
+				request := earlyFindLocked(parentNotifyKey{record.Connection, record.Message}, false)
+				if request == nil {
+					return errors.New("response has no recorded request")
+				}
+				if request.OwnerPending {
+					continue
+				}
+				if err := earlyResponseOwner(record, request); err != nil {
+					return err
+				}
+				record.OwnerPending = false
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	// Pending map entries own the same effective request observation. Raw bytes
+	// remain available on the immutable raw fields in the recorded request.
+	for key, pending := range earlyRegistry.pending {
+		if request := earlyFindLocked(key, false); request != nil {
+			pending.record = *request
+			earlyRegistry.pending[key] = pending
+		}
+	}
+	return nil
+}
+
+func earlyResponseOwner(record, request *earlyWireRecord) error {
+	record.Predecessor = request.Predecessor
+	record.RelatedCreate = request.RelatedCreate
+	record.Name = request.Name
+	record.FileID = request.FileID
+	if record.Command == wire.SessionSetup && request.Session == 0 {
+		if (record.Status == 0 || record.Status == 0xc0000016) && record.RawSession == 0 {
+			return errors.New("initial SESSION_SETUP did not allocate a session")
+		}
+	} else if record.RawSession != request.Session {
+		return errors.New("early response changed its resolved session")
+	}
+
+	record.Session = record.RawSession
+	if record.AsyncID != nil {
+		record.Tree = request.Tree
+	} else {
+		if record.RawTree == nil {
+			return errors.New("synchronous response has no physical tree field")
+		}
+		record.Tree = *record.RawTree
+		if record.Command != wire.TreeConnect && earlyTreeCommand(record.Command) && record.Tree != request.Tree {
+			return errors.New("early response changed its resolved tree")
+		}
+	}
+	if record.Command == wire.Create {
+		record.FileID = ""
+		if record.Status == 0 {
+			record.FileID = record.RawFileID
+			if record.FileID == "" {
+				return errors.New("successful CREATE did not produce a physical handle")
+			}
+		}
+	}
+	return nil
+}
+
+// The existing frame parser validates command bodies first. Effective ownership
+// may remain pending until an earlier operation's real response is observed.
+func earlyCapture(packet []byte, r cacheGatePositiveWireRecord) bool {
+	h, err := wire.ParseHeader(packet)
+	if err != nil {
+		earlyRegistry.Lock()
+		earlyRegistry.failure = errors.Join(earlyRegistry.failure, err)
+		earlyRegistry.Unlock()
+		return false
+	}
+	sequence := parentObservationBoundary()
+	earlyRegistry.Lock()
+	defer earlyRegistry.Unlock()
+	selected := earlySelected(h.Command)
+	record := earlyWireRecord{Sequence: sequence, Connection: r.Connection, RawSession: h.SessionID, Session: h.SessionID, Message: h.MessageID, Command: h.Command, Response: h.Flags&wire.FlagResponse != 0, Status: h.Status, Related: h.Flags&wire.FlagRelated != 0, QueryType: r.QueryType, QueryClass: r.QueryClass}
+	if h.Flags&wire.FlagAsync != 0 {
+		v := h.AsyncID
+		record.AsyncID = &v
+	} else {
+		v := h.TreeID
+		record.RawTree = &v
+		record.Tree = v
+	}
+	if len(packet) > cacheGatePositiveMaxFrame || len(packet) < 72 || r.Connection == 0 || h.Command != r.Command || h.MessageID != r.MessageID || record.Response != r.Response || h.Status != r.Status || h.SessionID != r.SessionID || r.Incomplete != "" {
+		err = errors.New("early header and correlated record disagree")
+	}
+	key := parentNotifyKey{record.Connection, record.Message}
+	chainKey := earlyWireChainKey{record.Connection, false}
+	chain := earlyRegistry.chains[chainKey]
+	if !record.Response {
+		if record.Related {
+			if !chain.active {
+				err = errors.New("related tree member lacks a prior compound operation")
+			} else {
+				previous := chain.previous
+				record.Predecessor = &previous
+				record.OwnerPending = true
+				record.Session = 0
+				record.Tree = 0
+			}
+		} else if record.Session == ^uint64(0) || record.Tree == ^uint32(0) {
+			err = errors.New("unrelated request uses inherited session/tree sentinels")
+		}
+		if h.NextCommand == 0 {
+			delete(earlyRegistry.chains, chainKey)
+		} else {
+			if len(earlyRegistry.chains) >= 16 && !chain.active {
+				err = errors.New("early compound chain bound exceeded")
+			}
+			earlyRegistry.chains[chainKey] = earlyWireChain{key, true}
+		}
+	}
+	if selected && err == nil {
+		if record.Response {
+			pending, ok := earlyRegistry.pending[key]
+			if !ok || pending.record.Command != record.Command {
+				err = errors.New("early response lacks an exact request")
+			} else {
+				if record.Status == 0x103 {
+					if record.AsyncID == nil || pending.pending {
+						err = errors.New("pending response lacks unique asynchronous ownership")
+					} else {
+						pending.pending = true
+						pending.async = record.AsyncID
+						earlyRegistry.pending[key] = pending
+					}
+				} else {
+					if record.AsyncID != nil && (!pending.pending || pending.async == nil || *pending.async != *record.AsyncID) {
+						err = errors.New("async final lacks its owned pending AsyncId")
+					}
+					if record.AsyncID == nil && pending.pending {
+						err = errors.New("async pending was completed by a synchronous response")
+					}
+					delete(earlyRegistry.pending, key)
+				}
+				if record.Command == wire.Create && record.Status == 0 {
+					record.RawFileID = strings.Clone(r.FileID)
+				}
+				request := pending.record
+				record.OwnerPending = request.OwnerPending
+				if record.OwnerPending {
+					record.Session = 0
+					record.Tree = 0
+					record.Name = request.Name
+					record.Predecessor = request.Predecessor
+				} else if ownerErr := earlyResponseOwner(&record, &request); ownerErr != nil {
+					err = ownerErr
+				}
+			}
+		} else {
+			if record.AsyncID != nil {
+				err = errors.New("selected asynchronous request has no supported tree ownership")
+			}
+			if len(r.Name) > earlyWireMaxNameBytes || len(r.FileID) > 64 {
+				err = errors.New("early name or handle exceeds bound")
+			} else {
+				record.Name = strings.Clone(r.Name)
+				record.RawFileID = strings.Clone(r.FileID)
+				if !record.OwnerPending {
+					record.FileID = record.RawFileID
+				}
+			}
+			body := packet[wire.HeaderSize:]
+			if record.Command == wire.TreeConnect {
+				if !cacheGatePositiveFixed(body, 9, 8) {
+					err = errors.New("TREE_CONNECT request is truncated")
+				} else {
+					length, offset := binary.LittleEndian.Uint16(body[6:8]), binary.LittleEndian.Uint16(body[4:6])
+					if int(length) > earlyWireMaxNameBytes {
+						err = errors.New("TREE_CONNECT path exceeds bound")
+					} else {
+						data, ok := cacheGatePositiveField(packet, uint32(offset), uint32(length), 72)
+						if !ok {
+							err = errors.New("TREE_CONNECT path span is invalid")
+						} else {
+							record.Name, err = wire.DecodeUTF16(data)
+						}
+					}
+				}
+			}
+			if record.Command == wire.Close || record.Command == wire.QueryDirectory || record.Command == wire.ChangeNotify {
+				minimum, size := 24, uint16(24)
+				if record.Command == wire.QueryDirectory {
+					minimum = 32
+					size = 33
+				}
+				if record.Command == wire.ChangeNotify {
+					minimum = 32
+					size = 32
+				}
+				if !cacheGatePositiveFixed(body, size, minimum) {
+					err = errors.New("early handle request is truncated")
+				} else {
+					record.RawFileID = hex.EncodeToString(body[8:24])
+					if !record.OwnerPending {
+						record.FileID = record.RawFileID
+					}
+				}
+			}
+			if earlyFindLocked(key, false) != nil {
+				err = errors.New("early request MessageID was reused")
+			}
+			if len(earlyRegistry.pending) >= earlyWireMaxPending {
+				err = errors.New("early pending request bound exceeded")
+			}
+			if err == nil {
+				earlyRegistry.pending[key] = earlyWirePending{record: record}
+			}
+		}
+		if err == nil && !record.OwnerPending && earlyTreeCommand(record.Command) && (record.Tree == 0 || record.Session == 0) {
+			err = errors.New("early tree operation has no effective owner")
+		}
+		if err == nil && record.Response && record.Status == 0 && record.Command == wire.QueryInfo && record.QueryType == 2 && record.QueryClass == 5 {
+			// This decoder reads the response payload; its correlation fields are
+			// checked separately before pending ownership can become qualified.
+			view := r
+			if record.Session != 0 {
+				view.SessionID = record.Session
+			}
+			identity, decodeErr := preciseIdentityFields(packet, view)
+			err = decodeErr
+			record.Attributes = identity.FilesystemAttributes
+		}
+	}
+	if !selected {
+		if err != nil {
+			earlyRegistry.failure = err
+			return false
+		}
+		return true
+	}
+	record.Complete = err == nil
+	if !earlyRecordLocked(record, err) {
+		return false
+	}
+	if err := earlyResolveOwnersLocked(); err != nil {
+		earlyRegistry.failure = err
+		return false
+	}
+	return true
+}
+
+func earlyRequest(observer *cacheGatePositiveFrameObserver, packet []byte, r *cacheGatePositiveWireRecord) bool {
+	earlyRegistry.Lock()
+	active := earlyRegistry.active
+	earlyRegistry.Unlock()
+	if !active {
+		return true
+	}
+	return earlyCapture(packet, *r)
+}
+
+func earlyObservedLocked(r cacheGatePositiveWireRecord) *earlyWireRecord {
+	for i := len(earlyRegistry.records) - 1; i >= 0; i-- {
+		record := &earlyRegistry.records[i]
+		if record.Connection == r.Connection && record.Message == r.MessageID && record.Response == r.Response && record.Status == r.Status && record.Command == r.Command {
+			return record
+		}
+	}
+	return nil
+}
+
+func earlyCorrelatedView(record *earlyWireRecord, r cacheGatePositiveWireRecord) cacheGatePositiveWireRecord {
+	r.SessionID = record.Session
+	r.FileID = record.FileID
+	// The effective FileID is proven by the predecessor result. The legacy
+	// observer can use direct ownership while the raw linkage remains here.
+	r.RelatedCreate = 0
+	r.related = false
+	return r
+}
+
+// The caller holds the current frame observer's mutex. Only its owned metadata
+// copies change; packet bytes, raw header fields and original timestamps do not.
+func earlyNormalizeLocked(observer *cacheGatePositiveFrameObserver, current *cacheGatePositiveWireRecord) {
+	for _, record := range earlyRegistry.records {
+		if record.Connection != observer.id || record.OwnerPending {
+			continue
+		}
+		if !record.Response {
+			key := parentNotifyKey{record.Connection, record.Message}
+			if pending, ok := observer.pending[record.Message]; ok {
+				observer.pending[record.Message] = earlyCorrelatedView(&record, pending)
+			}
+			if record.Command == wire.ChangeNotify {
+				parentNotifyRegistry.Lock()
+				if request, ok := parentNotifyRegistry.requests[key]; ok {
+					request.Session = record.Session
+					request.FileID = record.FileID
+					parentNotifyRegistry.requests[key] = request
+				}
+				parentNotifyRegistry.Unlock()
+			}
+		}
+		for i := range observer.records {
+			observed := &observer.records[i]
+			if observed.Connection == record.Connection && observed.MessageID == record.Message && observed.Response == record.Response && observed.Status == record.Status && observed.Command == record.Command {
+				*observed = earlyCorrelatedView(&record, *observed)
+			}
+		}
+	}
+	if record := earlyObservedLocked(*current); record != nil && !record.OwnerPending {
+		*current = earlyCorrelatedView(record, *current)
+	}
+}
+
+func earlyComplete(observer *cacheGatePositiveFrameObserver, packet []byte, r *cacheGatePositiveWireRecord) bool {
+	earlyRegistry.Lock()
+	active := earlyRegistry.active
+	earlyRegistry.Unlock()
+	if !active {
+		return cacheGatePreciseIdentity(packet, *r)
+	}
+	if r.Response && !earlyCapture(packet, *r) {
+		return false
+	}
+	earlyRegistry.Lock()
+	defer earlyRegistry.Unlock()
+	if earlyRegistry.failure != nil {
+		return false
+	}
+	record := earlyObservedLocked(*r)
+	if record == nil {
+		return true
+	}
+	earlyNormalizeLocked(observer, r)
+	selected := preciseIdentitySelected(*r) || r.Command == wire.QueryInfo && r.QueryType == 2 && r.QueryClass == 5
+	// Interim responses contain no completed identity value. Their owned AsyncId
+	// and effective tree remain in the raw early trace until the terminal result.
+	if selected && !(r.Response && r.Status == 0x103) {
+		cost := 128 + len(packet)
+		if len(earlyRegistry.identity) >= earlyWireMaxPending || cost > earlyWireMaxBytes-earlyRegistry.bytes {
+			earlyRegistry.failure = errors.New("deferred identity evidence exceeds existing byte bound")
+			return false
+		}
+		earlyRegistry.bytes += cost
+		earlyRegistry.identity = append(earlyRegistry.identity, earlyIdentityEvent{packet: bytes.Clone(packet), wire: *r, sequence: record.Sequence})
+	}
+	for len(earlyRegistry.identity) > 0 {
+		event := earlyRegistry.identity[0]
+		var observed *earlyWireRecord
+		for i := range earlyRegistry.records {
+			if earlyRegistry.records[i].Sequence == event.sequence {
+				observed = &earlyRegistry.records[i]
+				break
+			}
+		}
+		if observed == nil {
+			earlyRegistry.failure = errors.New("deferred identity observation lost its source record")
+			return false
+		}
+		if observed.OwnerPending {
+			break
+		}
+		view := earlyCorrelatedView(observed, event.wire)
+		preciseIdentityRegistry.Lock()
+		before := len(preciseIdentityRegistry.records)
+		preciseIdentityRegistry.Unlock()
+		accepted := cacheGatePreciseIdentity(event.packet, view)
+		preciseIdentityRegistry.Lock()
+		if len(preciseIdentityRegistry.records) > before {
+			last := &preciseIdentityRegistry.records[len(preciseIdentityRegistry.records)-1]
+			last.RawSession = observed.RawSession
+			last.Sequence = observed.Sequence
+			key := parentNotifyKey{view.Connection, view.MessageID}
+			if pending, ok := preciseIdentityRegistry.pending[key]; ok {
+				pending.RawSession = observed.RawSession
+				pending.Sequence = observed.Sequence
+				preciseIdentityRegistry.pending[key] = pending
+			}
+		}
+		preciseIdentityRegistry.Unlock()
+		earlyRegistry.bytes -= 128 + len(event.packet)
+		earlyRegistry.identity[0] = earlyIdentityEvent{}
+		earlyRegistry.identity = earlyRegistry.identity[1:]
+		if !accepted {
+			earlyRegistry.failure = errors.New("identity observer rejected the resolved correlation")
+			return false
+		}
+	}
+	return true
+}
+
+type earlyWireEvidence struct {
+	Outcome, Reason                                          string
+	Exposed, NoWarming, WatcherPending, HAProven, HnewProven bool
+	HnewBound                                                bool
+	Connection, Session                                      uint64
+	Tree                                                     uint32
+	Share, VolumeIdentity                                    string
+	VolumeSerial                                             uint64
+	Markers                                                  earlyMarkers
+	TreeConnect, RootCreate, Fs5, HA, Hnew                   *earlyWireRecord
+}
+
+type earlyHandleKey struct {
+	connection, session uint64
+	tree                uint32
+	file                string
+}
+
+func earlyWireGate(records []earlyWireRecord, identities []preciseIdentityRecord, unc string, volume storage.FileVolumeState, markers earlyMarkers, watcher *parentNotifyRequest, final bool) earlyWireEvidence {
+	result := earlyWireEvidence{Outcome: "inconclusive", Share: unc, VolumeIdentity: volume.VolumeIdentity, Markers: markers}
+	reject := func(reason string) earlyWireEvidence { result.Exposed = false; result.Reason = reason; return result }
+	if volume.VolumeIdentity == "" || volume.RootID == 0 || volume.MaxEventBytes <= 0 || !strings.HasPrefix(unc, `\\127.0.0.1\`) || strings.Count(unc, `\`) != 3 {
+		return reject("authoritative share/volume anchor is absent")
+	}
+	sum := sha256.Sum256([]byte(volume.VolumeIdentity))
+	result.VolumeSerial = binary.LittleEndian.Uint64(sum[:8])
+	if markers.Started == 0 || markers.Settled <= markers.Started || markers.HABegin <= markers.Settled {
+		return reject("bootstrap exit and HA admission source order is absent")
+	}
+	if watcher == nil || watcher.Key.Connection == 0 || watcher.Session == 0 || watcher.FileID == "" || watcher.Filter != parentNotifyFilter || !watcher.Recursive {
+		return reject("original recursive watcher ownership is absent")
+	}
+	type exchange struct{ request, response *earlyWireRecord }
+	exchanges := make(map[parentNotifyKey]exchange)
+	handles := make(map[earlyHandleKey]*earlyWireRecord)
+	var previous uint64
+	for i := range records {
+		record := &records[i]
+		if !record.Complete || record.Error != "" || record.OwnerPending || record.Sequence <= previous {
+			return reject("early passive source is incomplete or unordered")
+		}
+		previous = record.Sequence
+		key := parentNotifyKey{record.Connection, record.Message}
+		pair := exchanges[key]
+		if !record.Response {
+			if pair.request != nil {
+				return reject("early request identity was reused")
+			}
+			pair.request = record
+		} else {
+			if pair.request == nil || pair.request.Command != record.Command || pair.response != nil {
+				return reject("early response ownership is incomplete")
+			}
+			if record.Status != 0x103 {
+				pair.response = record
+			}
+		}
+		exchanges[key] = pair
+		if record.Response && record.Command == wire.Create && record.Status == 0 {
+			if record.FileID == "" {
+				return reject("successful early CREATE has no handle")
+			}
+			handle := earlyHandleKey{record.Connection, record.Session, record.Tree, record.FileID}
+			if _, exists := handles[handle]; exists {
+				return reject("early CREATE reused a server handle")
+			}
+			handles[handle] = record
+		}
+	}
+	// A unique successful TREE_CONNECT binds this experiment's exact share.
+	for _, pair := range exchanges {
+		if pair.request.Command != wire.TreeConnect || pair.request.Name != unc || pair.response == nil || pair.response.Status != 0 {
+			continue
+		}
+		if result.TreeConnect != nil {
+			return reject("experimental share has ambiguous TREE_CONNECT ownership")
+		}
+		response := pair.response
+		if response.Tree == 0 || response.Session == 0 || response.Session != pair.request.Session || response.Connection != watcher.Key.Connection || response.Session != watcher.Session {
+			return reject("experimental share changed native session ownership")
+		}
+		result.TreeConnect = response
+		result.Connection = response.Connection
+		result.Session = response.Session
+		result.Tree = response.Tree
+	}
+	if result.TreeConnect == nil {
+		return reject("experimental share was not observed in TREE_CONNECT")
+	}
+	sameTree := func(record *earlyWireRecord) bool {
+		return record.Connection == result.Connection && record.Session == result.Session && record.Tree == result.Tree
+	}
+	known := func(record *earlyWireRecord) *earlyWireRecord {
+		if record.RelatedCreate != 0 {
+			pair := exchanges[parentNotifyKey{record.Connection, record.RelatedCreate}]
+			if pair.request == nil || pair.response == nil || pair.request.Command != wire.Create || pair.response.Status != 0 || pair.request.Sequence >= record.Sequence || pair.response.Session != record.Session || pair.response.Tree != record.Tree {
+				return nil
+			}
+			return pair.response
+		}
+		return handles[earlyHandleKey{record.Connection, record.Session, record.Tree, record.FileID}]
+	}
+	watchPair := exchanges[watcher.Key]
+	if watchPair.request == nil || watchPair.request.Command != wire.ChangeNotify || watchPair.request.FileID != watcher.FileID || !sameTree(watchPair.request) {
+		return reject("watcher is not owned by the experimental tree")
+	}
+	watchRoot := known(watchPair.request)
+	if watchRoot == nil || watchRoot.Name != "" || watchRoot.Sequence >= watchPair.request.Sequence {
+		return reject("watcher has no observed ancestor root CREATE")
+	}
+	var pending *earlyWireRecord
+	for i := range records {
+		record := &records[i]
+		if record.Command == wire.ChangeNotify && record.Response && record.Connection == watcher.Key.Connection && record.Message == watcher.Key.MessageID {
+			if record.Status == 0x103 {
+				if pending != nil {
+					return reject("watcher has duplicate pending responses")
+				}
+				pending = record
+			} else if record.Sequence < markers.HABegin {
+				return reject("watcher retired before HA admission")
+			}
+		}
+	}
+	if pending == nil || pending.Sequence >= markers.Started || !sameTree(pending) {
+		return reject("watcher was not actually pending before bootstrap")
+	}
+	result.WatcherPending = true
+	retirementEnd := markers.HABegin
+	if final {
+		if markers.Mutation <= markers.HABegin || markers.FirstNewBegin <= markers.Mutation || markers.FirstNewEnd <= markers.FirstNewBegin {
+			return reject("later mutation and first-new-open source boundaries are missing")
+		}
+		retirementEnd = markers.FirstNewEnd
+	}
+	for i := range records {
+		record := &records[i]
+		if record.Sequence < retirementEnd && record.Connection == result.Connection && (record.Command == wire.Logoff && record.Session == result.Session || record.Command == wire.TreeDisconnect && sameTree(record)) {
+			return reject("the experimental session or tree retired before native admission")
+		}
+		if !record.Response && record.Command == wire.Close && record.Sequence < markers.HABegin && sameTree(record) && record.FileID == watcher.FileID {
+			return reject("bootstrap closed the parent's watcher handle")
+		}
+		if record.Sequence >= markers.HABegin {
+			continue
+		}
+		if record.Command == wire.Create && !record.Response && record.Name != "" && record.Name != "v" {
+			return reject("native target CREATE preceded the HA API marker")
+		}
+		if record.Command == wire.QueryDirectory || record.Command == wire.Read {
+			return reject("enumeration or read traffic warmed targets before HA")
+		}
+		if record.Command == wire.QueryInfo {
+			target := known(record)
+			if target == nil || (record.RelatedCreate == 0 || record.Response) && target.Sequence >= record.Sequence || target.Name != "" && target.Name != "v" {
+				return reject("unknown or target metadata traffic preceded HA")
+			}
+		}
+	}
+	result.NoWarming = true
+	for i := range records {
+		response := &records[i]
+		if !response.Response || response.Command != wire.QueryInfo || response.QueryType != 2 || response.QueryClass != 5 || response.Sequence <= markers.Started || response.Sequence >= markers.Settled {
+			continue
+		}
+		if response.Status != 0 {
+			return reject("bootstrap filesystem query failed on the wire")
+		}
+		request := exchanges[parentNotifyKey{response.Connection, response.Message}].request
+		if request == nil || request.Sequence <= markers.Started || !sameTree(response) || !sameTree(request) {
+			return reject("bootstrap filesystem query crossed tree or invocation ownership")
+		}
+		root := known(response)
+		if root == nil || root.Name != "" || root.Sequence >= response.Sequence || request.RelatedCreate == 0 && root.Sequence >= request.Sequence {
+			return reject("bootstrap Fs5 is not bound to a proven root open")
+		}
+		if result.Fs5 != nil {
+			return reject("bootstrap contains ambiguous root filesystem queries")
+		}
+		attributes := response.Attributes
+		if attributes == nil || len(attributes.FixedRaw) != 24 || len(attributes.NameRaw) > preciseFilesystemNameBytes*2 {
+			return reject("bootstrap Fs5 lacks bounded raw fields")
+		}
+		raw, err := hex.DecodeString(attributes.FixedRaw + attributes.NameRaw)
+		if err != nil {
+			return reject("bootstrap Fs5 raw fields are malformed")
+		}
+		decoded, err := preciseDecodeFilesystemAttributes(raw)
+		if err != nil || *decoded != *attributes || attributes.Flags != 0x406 || attributes.MaximumComponent != 255 || attributes.Name != "remote-fs" {
+			return reject("bootstrap Fs5 is not the truthful configured capability tuple")
+		}
+		result.Fs5 = response
+		result.RootCreate = root
+	}
+	if result.Fs5 == nil {
+		return reject("no actual root Fs5 response was observed during the helper invocation")
+	}
+	if final {
+		for i := range records {
+			response := &records[i]
+			if !response.Response || response.Command != wire.Create || response.Name != `v\target` {
+				continue
+			}
+			request := exchanges[parentNotifyKey{response.Connection, response.Message}].request
+			if request == nil || !sameTree(request) || !sameTree(response) {
+				return reject("native target CREATE changed experimental tree ownership")
+			}
+			if response.Status == 0 && request.Sequence > markers.HABegin && request.Sequence < markers.Mutation {
+				if result.HA == nil {
+					result.HA = response
+				}
+			}
+			if request.Sequence > markers.FirstNewBegin && request.Sequence < markers.FirstNewEnd {
+				if result.Hnew != nil {
+					return reject("first Hnew API has ambiguous target CREATE requests")
+				}
+				result.Hnew = response
+			}
+		}
+		if result.HA == nil || result.HA.Sequence >= markers.Mutation {
+			return reject("initial HA lacks a successful CREATE after its API marker")
+		}
+		if result.Hnew == nil {
+			return reject("Hnew lacks an actual request/response on the original tree")
+		}
+		result.HnewBound = true
+		if result.Hnew.Status == 0 {
+			if result.Hnew.FileID == "" || result.Hnew.FileID == result.HA.FileID {
+				return reject("successful Hnew lacks distinct server-open ownership")
+			}
+			result.HnewProven = true
+		} else if result.Hnew.FileID != "" {
+			return reject("failed Hnew acquired a successful server handle")
+		}
+		result.HAProven = true
+	}
+	for _, identity := range identities {
+		if !identity.Complete || identity.Error != "" {
+			return reject("selected identity payload evidence is incomplete")
+		}
+		if !identity.Response || identity.Command != wire.Create || identity.Status != 0 || identity.QFid == nil {
+			continue
+		}
+		pair := exchanges[parentNotifyKey{identity.Connection, identity.MessageID}]
+		if pair.response == nil || pair.response.Command != wire.Create || pair.response.FileID != identity.FileID || pair.response.Session != identity.Session || !sameTree(pair.response) {
+			return reject("observed QFid lacks original-tree CREATE ownership")
+		}
+		if identity.QFid.VolumeID != result.VolumeSerial {
+			return reject("actual QFid volume conflicts with the authoritative share binding")
+		}
+	}
+	result.Exposed = true
+	result.Outcome = "qualified_early_exposure"
+	return result
+}
+
+func earlyRequestedOnly(records []preciseIdentityRecord) error {
+	requests := make(map[parentNotifyKey]preciseIdentityRecord)
+	for _, record := range records {
+		if !record.Complete || record.Error != "" {
+			return errors.New("early identity evidence is incomplete")
+		}
+		if record.Command != wire.Create {
+			continue
+		}
+		key := parentNotifyKey{record.Connection, record.MessageID}
+		if !record.Response {
+			if _, exists := requests[key]; exists {
+				return errors.New("early CREATE request was reused")
+			}
+			requests[key] = record
+			continue
+		}
+		request, ok := requests[key]
+		if !ok || request.Session != record.Session {
+			return errors.New("early CREATE context lacks a request")
+		}
+		delete(requests, key)
+		if record.Status == 0 && (!request.ContextsChecked || !record.ContextsChecked || request.QFidRequested != record.QFidRequested || (record.QFid != nil) != request.QFidRequested || preciseContextQFidCount(request) != map[bool]int{false: 0, true: 1}[request.QFidRequested] || preciseContextQFidCount(record) != map[bool]int{false: 0, true: 1}[request.QFidRequested]) {
+			return errors.New("bootstrap fixture did not retain requested-only QFid")
+		}
+		if record.Status != 0 && record.QFid != nil {
+			return errors.New("failed early CREATE acquired QFid")
+		}
+	}
+	if len(requests) != 0 {
+		return errors.New("early CREATE response is missing")
+	}
+	return nil
+}
+
+func earlyPending(records []earlyWireRecord, watcher *parentNotifyRequest) bool {
+	if watcher == nil {
+		return false
+	}
+	found := false
+	for _, record := range records {
+		if record.Response && record.Command == wire.ChangeNotify && record.Connection == watcher.Key.Connection && record.Message == watcher.Key.MessageID {
+			if record.Status != 0x103 || found {
+				return false
+			}
+			found = true
+		}
+	}
+	return found
+}
+
+func earlyBootstrapBeforeHA(t *testing.T, bridge *nativeBridge, report *parentInvalidationReport, watch *parentNativeWatch) {
+	t.Helper()
+	if watch == nil || watch.done || report.Pending == nil {
+		t.Fatal("early bootstrap requires the original live watcher")
+	}
+	state, err := bridge.remote.FileState(t.Context())
+	if err != nil {
+		t.Fatal("early authoritative volume anchor:", err)
+	}
+	if state.VolumeIdentity == "" || state.VolumeIdentity != bridge.backend.identity || state.RootID == 0 || state.MaxEventBytes <= 0 {
+		t.Fatal("early authoritative volume binding is unknown")
+	}
+	records, err := earlySnapshot()
+	_, baseIncomplete := cacheGatePositiveWireSnapshot()
+	if err != nil || baseIncomplete || !earlyPending(records, report.Pending) {
+		t.Fatal("watcher is not pending before bootstrap:", err)
+	}
+	earlyRegistry.Lock()
+	earlyRegistry.state.UNC = report.UNC
+	earlyRegistry.state.Volume = state
+	earlyRegistry.Unlock()
+	started := parentObservationBoundary()
+	earlyRegistry.Lock()
+	earlyRegistry.state.Markers.Started = started
+	earlyRegistry.Unlock()
+	receipt, err := earlyBootstrapRun(t.Context(), report.UNC+`\`)
+	earlyRegistry.Lock()
+	earlyRegistry.state.Process = &receipt
+	if err != nil {
+		earlyRegistry.state.Error = err.Error()
+	}
+	earlyRegistry.Unlock()
+	if err != nil {
+		t.Fatal("root capability helper:", err)
+	}
+	if !receipt.ExitConfirmed || receipt.ExitCode != 0 || receipt.KillRequested || receipt.OwnerRetained || receipt.Native == nil || receipt.Native.Pending || receipt.Native.PinsRetained || !receipt.Native.RootClosed || receipt.Native.CloseError != "" || receipt.Native.ReturnedStatus != 0 || receipt.Native.Flags != 0x406 || receipt.Native.MaximumComponentLength != 255 || receipt.Native.FilesystemName != "remote-fs" {
+		t.Fatal("helper did not complete an ordinary successful root query and close")
+	}
+	settled := parentObservationBoundary()
+	admitted := parentObservationBoundary()
+	earlyRegistry.Lock()
+	earlyRegistry.state.Markers.Settled = settled
+	markers := earlyRegistry.state.Markers
+	markers.HABegin = admitted
+	earlyRegistry.Unlock()
+	records, err = earlySnapshot()
+	identities, identityErr := preciseIdentitySnapshot()
+	_, baseIncomplete = cacheGatePositiveWireSnapshot()
+	if err != nil || identityErr != nil || baseIncomplete || !earlyPending(records, report.Pending) {
+		t.Fatal("early passive exposure trace or live watcher:", errors.Join(err, identityErr))
+	}
+	evidence := earlyWireGate(records, identities, report.UNC, state, markers, report.Pending, false)
+	if !evidence.Exposed {
+		t.Fatal("early capability admission:", evidence.Reason)
+	}
+}
+
+func earlyMarkHAAPIBegin() {
+	sequence := parentObservationBoundary()
+	earlyRegistry.Lock()
+	defer earlyRegistry.Unlock()
+	if earlyRegistry.state.Markers.Settled == 0 || earlyRegistry.state.Markers.HABegin != 0 {
+		earlyRegistry.failure = errors.Join(earlyRegistry.failure, errors.New("HA API admission marker lacks unique settled bootstrap"))
+		return
+	}
+	earlyRegistry.state.Markers.HABegin = sequence
+}
+
+func earlyCapabilityAudit(t *testing.T, report *parentInvalidationReport) {
+	t.Helper()
+	records, err := earlySnapshot()
+	identities, identityErr := preciseIdentitySnapshot()
+	err = errors.Join(err, identityErr, earlyRequestedOnly(identities))
+	_, wireIncomplete := cacheGatePositiveWireSnapshot()
+	if wireIncomplete {
+		err = errors.Join(err, errors.New("parent wire evidence is incomplete"))
+	}
+	earlyRegistry.Lock()
+	state := earlyRegistry.state
+	earlyRegistry.Unlock()
+	preciseIdentityRegistry.Lock()
+	state.Markers.Mutation = preciseIdentityRegistry.mutationSequence
+	state.Markers.FirstNewEnd = preciseIdentityRegistry.firstOpenEnd
+	preciseIdentityRegistry.Unlock()
+	state.Markers.FirstNewBegin = report.FirstObservationSequence
+	evidence := earlyWireGate(records, identities, state.UNC, state.Volume, state.Markers, report.Pending, true)
+	if state.Error != "" {
+		err = errors.Join(err, errors.New(state.Error))
+	}
+	if state.Process == nil || !state.Process.ExitConfirmed || state.Process.ExitCode != 0 || state.Process.KillRequested || state.Process.OwnerRetained {
+		err = errors.Join(err, errors.New("helper process exit was not successfully confirmed"))
+	}
+	if !evidence.Exposed {
+		err = errors.Join(err, errors.New(evidence.Reason))
+	}
+	if err != nil {
+		evidence.Exposed = false
+		evidence.Outcome = "inconclusive"
+		report.Classification = "inconclusive"
+		report.WithinOneSecondProven = false
+		t.Error("early capability qualification:", err)
+	}
+	data, encodeErr := json.MarshalIndent(struct {
+		State    earlyBootstrapState
+		Wire     []earlyWireRecord
+		Identity []preciseIdentityRecord
+		Exposure earlyWireEvidence
+		Native   precisePolicyEvidence
+		Error    string
+	}{state, records, identities, evidence, precisePolicyNative(report), fmt.Sprint(err)}, "", "  ")
+	if encodeErr == nil {
+		encodeErr = os.WriteFile(filepath.Join(os.Getenv("RFS_GATE_OUTPUT_ROOT"), "early-capability.json"), data, 0600)
+	}
+	if encodeErr != nil {
+		t.Error("write early capability evidence:", encodeErr)
+	}
+}
+
+func TestNativeEarlyCapabilityReplacement(t *testing.T) {
+	if os.Getenv("RFS_CAPABILITY_BOOTSTRAP") != "before-ha" || os.Getenv("RFS_PRECISE_VARIANT") != "historical_detail" {
+		t.Fatal("early capability cell requires its explicit variant")
+	}
+	qfid, err := preciseQFidPolicy(os.Getenv("RFS_QFID_POLICY"))
+	if err != nil || qfid != preciseRequestedQFid {
+		t.Fatal("early capability requires requested-only QFid")
+	}
+	interaction, err := preciseInteractionPolicy(os.Getenv("RFS_INTERACTION_POLICY"))
+	if err != nil || interaction != preciseInteractionStandalone {
+		t.Fatal("early capability forbids combined identity policy")
+	}
+	filesystem, err := preciseFilesystemPolicy(os.Getenv("RFS_FILESYSTEM_CAPABILITY_POLICY"), qfid)
+	if err != nil || filesystem != preciseFilesystemPosix {
+		t.Fatal("early capability requires its truthful POSIX tuple")
+	}
+	t.Run("share0_app_first_replace_identity_early_capability", func(t *testing.T) {
+		preciseIdentityReset()
+		earlyReset()
+		earlyActivate()
+		t.Cleanup(earlyDeactivate)
+		if err := preciseConfigureFilesystemPolicy(filesystem, qfid); err != nil {
+			t.Fatal(err)
+		}
+		report := &parentInvalidationReport{Kind: "replacement", Name: "share0_app_first_replace_identity_early_capability", ShareMode: 0, Order: "app_first"}
+		parentRunCell(t, report.Name, report.Order, report.ShareMode, true, report)
+		if report.RescanRequired || !report.PreciseNotificationProven {
+			t.Error("early capability replacement requires precise detailed notification")
+		}
+	})
+}
+
+func earlyTestRecord(sequence, message uint64, command uint16, response bool, name, file string) earlyWireRecord {
+	tree := uint32(7)
+	return earlyWireRecord{Sequence: sequence, Connection: 1, RawSession: 2, Session: 2, Message: message, RawTree: &tree, Tree: 7, Command: command, Response: response, Name: name, FileID: file, Complete: true}
+}
+
+func earlyTestFixture() ([]earlyWireRecord, []preciseIdentityRecord, string, storage.FileVolumeState, earlyMarkers, parentNotifyRequest) {
+	unc := `\\127.0.0.1\rfs-test`
+	volume := storage.FileVolumeState{VolumeIdentity: "actual-test-volume", RootID: 1, MaxEventBytes: 256 << 10}
+	rows := []earlyWireRecord{
+		earlyTestRecord(1, 1, wire.TreeConnect, false, unc, ""), earlyTestRecord(2, 1, wire.TreeConnect, true, unc, ""),
+		earlyTestRecord(3, 3, wire.Create, false, "v", ""), earlyTestRecord(4, 3, wire.Create, true, "v", "v"),
+		earlyTestRecord(5, 5, wire.Create, false, "", ""), earlyTestRecord(6, 5, wire.Create, true, "", "watch"),
+		earlyTestRecord(7, 7, wire.ChangeNotify, false, "", "watch"), earlyTestRecord(8, 7, wire.ChangeNotify, true, "", "watch"),
+		earlyTestRecord(10, 10, wire.Create, false, "", ""), earlyTestRecord(11, 10, wire.Create, true, "", "helper"),
+		earlyTestRecord(12, 12, wire.QueryInfo, false, "", "helper"), earlyTestRecord(13, 12, wire.QueryInfo, true, "", "helper"),
+		earlyTestRecord(14, 14, wire.Close, false, "", "helper"), earlyTestRecord(15, 14, wire.Close, true, "", "helper"),
+		earlyTestRecord(18, 18, wire.Create, false, `v\target`, ""), earlyTestRecord(19, 18, wire.Create, true, `v\target`, "old"),
+		earlyTestRecord(21, 7, wire.ChangeNotify, true, "", "watch"),
+		earlyTestRecord(23, 23, wire.Create, false, `v\target`, ""), earlyTestRecord(24, 23, wire.Create, true, `v\target`, "new"),
+	}
+	zero := uint32(0)
+	rows[0].RawTree = &zero
+	rows[0].Tree = 0
+	async := uint64(0x1122334455667788)
+	rows[7].AsyncID = &async
+	rows[7].RawTree = nil
+	rows[7].Status = 0x103
+	rows[16].AsyncID = &async
+	rows[16].RawTree = nil
+	for _, i := range []int{10, 11} {
+		rows[i].QueryType = 2
+		rows[i].QueryClass = 5
+	}
+	rows[11].Attributes, _ = preciseDecodeFilesystemAttributes(preciseTestFilesystemData(0x406))
+	identities := []preciseIdentityRecord{{Sequence: 18, Connection: 1, Session: 2, MessageID: 18, Command: wire.Create, ContextsChecked: true, ContextNames: []string{"51466964"}, QFidRequested: true, Complete: true}, {Sequence: 19, Connection: 1, Session: 2, MessageID: 18, Command: wire.Create, Response: true, FileID: "old", ContextsChecked: true, ContextNames: []string{"51466964"}, QFidRequested: true, Complete: true}}
+	sum := sha256.Sum256([]byte(volume.VolumeIdentity))
+	preciseSetQFidTuple(&identities[1], 3, binary.LittleEndian.Uint64(sum[:8]))
+	return rows, identities, unc, volume, earlyMarkers{Started: 9, Settled: 16, HABegin: 17, Mutation: 20, FirstNewBegin: 22, FirstNewEnd: 25}, parentNotifyRequest{Key: parentNotifyKey{1, 7}, Session: 2, FileID: "watch", Filter: 31, Recursive: true, Capacity: 65536}
+}
+
+func TestEarlyCapabilityWireQualification(t *testing.T) {
+	rows, identities, unc, volume, markers, watcher := earlyTestFixture()
+	evidence := earlyWireGate(rows, identities, unc, volume, markers, &watcher, true)
+	if !evidence.Exposed || !evidence.NoWarming || !evidence.WatcherPending || !evidence.HAProven || !evidence.HnewProven || evidence.Fs5.Sequence >= markers.Settled || markers.HABegin >= evidence.HA.Sequence {
+		t.Fatal("truthful early exposure rejected", evidence)
+	}
+	t.Run("legitimate shared ancestor server open", func(t *testing.T) {
+		rows, identities, unc, volume, markers, watcher := earlyTestFixture()
+		filtered := make([]earlyWireRecord, 0, len(rows))
+		for _, r := range rows {
+			if r.Message == 10 || r.Message == 14 {
+				continue
+			}
+			if r.Message == 12 {
+				r.FileID = "watch"
+			}
+			filtered = append(filtered, r)
+		}
+		result := earlyWireGate(filtered, identities, unc, volume, markers, &watcher, true)
+		if !result.Exposed || result.RootCreate.FileID != "watch" {
+			t.Fatal("shared legitimate root was rejected", result)
+		}
+	})
+	t.Run("bootstrap preflight does not require an invented future HA", func(t *testing.T) {
+		result := earlyWireGate(rows[:14], nil, unc, volume, markers, &watcher, false)
+		if !result.Exposed || result.HAProven || result.HnewProven {
+			t.Fatal("preflight invented future native ownership", result)
+		}
+	})
+}
+
+func TestEarlyCapabilityWireRefusals(t *testing.T) {
+	cases := []struct {
+		name   string
+		change func(*[]earlyWireRecord, *[]preciseIdentityRecord, *string, *storage.FileVolumeState, *earlyMarkers, *parentNotifyRequest)
+	}{
+		{"wrong share", func(_ *[]earlyWireRecord, _ *[]preciseIdentityRecord, u *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			*u = `\\127.0.0.1\other`
+		}},
+		{"missing volume", func(_ *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, v *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			v.VolumeIdentity = ""
+		}},
+		{"wrong actual QFid volume", func(_ *[]earlyWireRecord, i *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*i)[1].QFid.VolumeID++
+		}},
+		{"different helper tree", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[11].Tree = 8
+		}},
+		{"different helper session", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[11].Session = 3
+		}},
+		{"different Hnew tree", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[17].Tree = 8
+			(*r)[18].Tree = 8
+		}},
+		{"helper settled after HA API", func(_ *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, m *earlyMarkers, _ *parentNotifyRequest) {
+			m.Settled = 18
+		}},
+		{"Fs5 after exit marker", func(_ *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, m *earlyMarkers, _ *parentNotifyRequest) {
+			m.Settled = 13
+		}},
+		{"Fs5 before helper invocation", func(_ *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, m *earlyMarkers, _ *parentNotifyRequest) {
+			m.Started = 13
+		}},
+		{"Fs5 after HA API marker", func(_ *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, m *earlyMarkers, _ *parentNotifyRequest) {
+			m.HABegin = 12
+		}},
+		{"HA CREATE before API marker", func(_ *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, m *earlyMarkers, _ *parentNotifyRequest) {
+			m.HABegin = 19
+		}},
+		{"no actual pending watcher", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[7].Status = 0
+		}},
+		{"watcher closed before admission", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[12].FileID = "watch"
+			(*r)[13].FileID = "watch"
+		}},
+		{"session retired before admission", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[12].Command = wire.Logoff
+			(*r)[13].Command = wire.Logoff
+		}},
+		{"tree disconnected before admission", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[12].Command = wire.TreeDisconnect
+			(*r)[13].Command = wire.TreeDisconnect
+		}},
+		{"target warmed by bootstrap CREATE", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[8].Name = `v\target`
+			(*r)[9].Name = `v\target`
+		}},
+		{"replacement warmed by bootstrap CREATE", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[8].Name = `v\replacement`
+			(*r)[9].Name = `v\replacement`
+		}},
+		{"enumeration before HA", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[10].Command = wire.QueryDirectory
+			(*r)[11].Command = wire.QueryDirectory
+		}},
+		{"read before HA", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[10].Command = wire.Read
+			(*r)[11].Command = wire.Read
+		}},
+		{"unknown metadata handle", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[10].FileID = "unknown"
+			(*r)[11].FileID = "unknown"
+		}},
+		{"Fs5 baseline only", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[11].Attributes, _ = preciseDecodeFilesystemAttributes(preciseTestFilesystemData(6))
+		}},
+		{"Fs5 malformed raw", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[11].Attributes.FixedRaw = "bad"
+		}},
+		{"Fs5 actual failure", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[11].Status = 0xc0000022
+			(*r)[11].Attributes = nil
+		}},
+		{"shared server handle for A and B", func(r *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, _ *earlyMarkers, _ *parentNotifyRequest) {
+			(*r)[18].FileID = "old"
+		}},
+		{"missing global mutation", func(_ *[]earlyWireRecord, _ *[]preciseIdentityRecord, _ *string, _ *storage.FileVolumeState, m *earlyMarkers, _ *parentNotifyRequest) {
+			m.Mutation = 0
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rows, identity, unc, volume, markers, watcher := earlyTestFixture()
+			tc.change(&rows, &identity, &unc, &volume, &markers, &watcher)
+			result := earlyWireGate(rows, identity, unc, volume, markers, &watcher, true)
+			if result.Exposed || result.Reason == "" {
+				t.Fatal("unqualified bootstrap admitted", result)
+			}
+		})
+	}
+}
+
+func earlyTestPacket(h wire.Header, body []byte) []byte {
+	packet := make([]byte, 64+len(body))
+	copy(packet[64:], body)
+	if err := h.Encode(packet); err != nil {
+		panic(err)
+	}
+	return packet
+}
+
+func earlyTestCorrelated(h wire.Header) cacheGatePositiveWireRecord {
+	return cacheGatePositiveWireRecord{Connection: 1, SessionID: h.SessionID, MessageID: h.MessageID, Command: h.Command, Flags: h.Flags, Response: h.Flags&wire.FlagResponse != 0, Status: h.Status}
+}
+
+func TestEarlyCapabilityTreeParsing(t *testing.T) {
+	t.Run("exact tree path and successful response", func(t *testing.T) {
+		earlyReset()
+		name := wire.EncodeUTF16(`\\127.0.0.1\rfs-test`)
+		body := make([]byte, 8+len(name))
+		binary.LittleEndian.PutUint16(body, 9)
+		binary.LittleEndian.PutUint16(body[4:], 72)
+		binary.LittleEndian.PutUint16(body[6:], uint16(len(name)))
+		copy(body[8:], name)
+		h := wire.Header{Command: wire.TreeConnect, SessionID: 2, MessageID: 1}
+		if !earlyCapture(earlyTestPacket(h, body), earlyTestCorrelated(h)) {
+			t.Fatal("TREE_CONNECT request rejected")
+		}
+		h.Flags = wire.FlagResponse
+		h.TreeID = 7
+		if !earlyCapture(earlyTestPacket(h, make([]byte, 16)), earlyTestCorrelated(h)) {
+			t.Fatal("TREE_CONNECT response rejected")
+		}
+		rows, err := earlySnapshot()
+		if err != nil || len(rows) != 2 || rows[0].Name != `\\127.0.0.1\rfs-test` || rows[0].Tree != 0 || rows[1].Tree != 7 {
+			t.Fatal(rows, err)
+		}
+	})
+	t.Run("async response inherits matched request tree", func(t *testing.T) {
+		earlyReset()
+		body := make([]byte, 32)
+		binary.LittleEndian.PutUint16(body, 32)
+		copy(body[8:24], []byte("watcher-handle-01"))
+		h := wire.Header{Command: wire.ChangeNotify, SessionID: 2, TreeID: 7, MessageID: 9}
+		if !earlyCapture(earlyTestPacket(h, body), earlyTestCorrelated(h)) {
+			t.Fatal("watch request rejected")
+		}
+		h.Flags = wire.FlagResponse | wire.FlagAsync
+		h.Status = 0x103
+		h.AsyncID = 0x8877665544332211
+		if !earlyCapture(earlyTestPacket(h, make([]byte, 8)), earlyTestCorrelated(h)) {
+			t.Fatal("async pending rejected")
+		}
+		h.Status = 0
+		if !earlyCapture(earlyTestPacket(h, make([]byte, 8)), earlyTestCorrelated(h)) {
+			t.Fatal("async terminal rejected")
+		}
+		rows, err := earlySnapshot()
+		if err != nil || rows[1].RawTree != nil || rows[2].RawTree != nil || rows[1].Tree != 7 || rows[2].Tree != 7 || *rows[1].AsyncID != h.AsyncID {
+			t.Fatal("AsyncId bytes became a tree", rows, err)
+		}
+	})
+
+	for _, mode := range []string{"missing related predecessor", "async unmatched reply", "async changed identity", "response changed tree", "oversized tree path"} {
+		t.Run(mode, func(t *testing.T) {
+			earlyReset()
+			h := wire.Header{Command: wire.QueryInfo, SessionID: 2, TreeID: 7, MessageID: 10}
+			r := earlyTestCorrelated(h)
+			r.FileID = "known"
+			r.QueryType = 1
+			r.QueryClass = 6
+			if mode != "missing related predecessor" && mode != "async unmatched reply" && mode != "oversized tree path" {
+				if !earlyCapture(earlyTestPacket(h, make([]byte, 8)), r) {
+					t.Fatal("setup failed")
+				}
+			}
+			switch mode {
+			case "missing related predecessor":
+				h.Flags = wire.FlagRelated
+				h.SessionID = ^uint64(0)
+				h.TreeID = ^uint32(0)
+
+			case "async unmatched reply":
+				h.Flags = wire.FlagResponse | wire.FlagAsync
+				h.AsyncID = 23
+			case "async changed identity":
+				h.Flags = wire.FlagResponse | wire.FlagAsync
+				h.Status = 0x103
+				h.AsyncID = 23
+				r = earlyTestCorrelated(h)
+				r.FileID = "known"
+				r.QueryType = 1
+				r.QueryClass = 6
+				if !earlyCapture(earlyTestPacket(h, make([]byte, 8)), r) {
+					t.Fatal("pending setup failed")
+				}
+				h.Status = 0
+				h.AsyncID++
+			case "response changed tree":
+				h.Flags = wire.FlagResponse
+				h.TreeID = 8
+			case "oversized tree path":
+				h.Command = wire.TreeConnect
+				h.TreeID = 0
+			}
+			r = earlyTestCorrelated(h)
+			r.FileID = "known"
+			r.QueryType = 1
+			r.QueryClass = 6
+			body := make([]byte, 8)
+			if mode == "oversized tree path" {
+				binary.LittleEndian.PutUint16(body, 9)
+				binary.LittleEndian.PutUint16(body[4:], 72)
+				binary.LittleEndian.PutUint16(body[6:], earlyWireMaxNameBytes+2)
+			}
+			if earlyCapture(earlyTestPacket(h, body), r) {
+				t.Fatal("invalid tree ownership accepted")
+			}
+		})
+	}
+}
+
+func TestEarlyCapabilityNativeFailurePreserved(t *testing.T) {
+	rows, identities, unc, volume, markers, watcher := earlyTestFixture()
+	rows[18].Status = 0xc0000034
+	rows[18].FileID = ""
+	result := earlyWireGate(rows, identities, unc, volume, markers, &watcher, true)
+	if !result.Exposed || !result.HnewBound || result.HnewProven || result.Hnew == nil || result.Hnew.Status != 0xc0000034 || result.Hnew.FileID != "" {
+		t.Fatal("real failed CREATE erased exposure or invented Hnew", result)
+	}
+}
+
+func TestEarlyCapabilityPassiveBounds(t *testing.T) {
+	earlyReset()
+	for i := 0; i < earlyWireMaxPending+1; i++ {
+		h := wire.Header{Command: wire.QueryInfo, SessionID: 2, TreeID: 7, MessageID: uint64(i + 1)}
+		r := earlyTestCorrelated(h)
+		r.FileID = "root"
+		r.QueryType = 1
+		r.QueryClass = 6
+		accepted := earlyCapture(earlyTestPacket(h, make([]byte, 8)), r)
+		if i < earlyWireMaxPending && !accepted {
+			t.Fatal("bounded request refused before limit", i)
+		}
+		if i == earlyWireMaxPending && accepted {
+			t.Fatal("unbounded pending ownership accepted")
+		}
+	}
+	rows, err := earlySnapshot()
+	earlyRegistry.Lock()
+	pending, retained := len(earlyRegistry.pending), earlyRegistry.bytes
+	earlyRegistry.Unlock()
+	if err == nil || pending > earlyWireMaxPending || retained > earlyWireMaxBytes || len(rows) > earlyWireMaxRecords {
+		t.Fatal("passive bound did not fence admission", pending, retained, len(rows), err)
+	}
+	earlyReset()
+	if earlyCapture([]byte("not a header"), cacheGatePositiveWireRecord{Connection: 1}) {
+		t.Fatal("malformed header accepted")
+	}
+	if _, err := earlySnapshot(); err == nil {
+		t.Fatal("malformed header failure disappeared")
+	}
+}
+
+func TestEarlyCapabilityRequestedOnly(t *testing.T) {
+	_, identities, _, _, _, _ := earlyTestFixture()
+	if err := earlyRequestedOnly(identities); err != nil {
+		t.Fatal(err)
+	}
+	identities[0].QFidRequested = false
+	identities[0].ContextNames = nil
+	identities[1].QFidRequested = false
+	if err := earlyRequestedOnly(identities); err == nil {
+		t.Fatal("early cell admitted always-QFid response")
+	}
+}
+
+func TestEarlyCapabilityTargetWarming(t *testing.T) {
+	rows, identity, unc, volume, markers, watcher := earlyTestFixture()
+	// The root query stays valid; only an additional target open is introduced.
+	rows[12] = earlyTestRecord(14, 14, wire.Create, false, `v\target`, "")
+	rows[13] = earlyTestRecord(15, 14, wire.Create, true, `v\target`, "warmed-A")
+	result := earlyWireGate(rows, identity, unc, volume, markers, &watcher, true)
+	if result.Exposed || result.Reason != "native target CREATE preceded the HA API marker" {
+		t.Fatal("bootstrap target warming was not rejected", result)
+	}
+}
+
+func TestEarlyCapabilityRelatedAsyncOwnership(t *testing.T) {
+	earlyReset()
+	head := wire.Header{Command: wire.QueryInfo, SessionID: 2, TreeID: 7, MessageID: 10, NextCommand: 72}
+	r := earlyTestCorrelated(head)
+	r.QueryType = 1
+	r.QueryClass = 6
+	r.FileID = "known"
+	if !earlyCapture(earlyTestPacket(head, make([]byte, 8)), r) {
+		t.Fatal("compound head rejected")
+	}
+	child := wire.Header{Command: wire.QueryInfo, SessionID: 77, TreeID: 88, MessageID: 11, Flags: wire.FlagRelated}
+	r = earlyTestCorrelated(child)
+	r.QueryType = 1
+	r.QueryClass = 6
+	r.FileID = "ignored"
+	if !earlyCapture(earlyTestPacket(child, make([]byte, 8)), r) {
+		t.Fatal("related request rejected")
+	}
+	head.Flags = wire.FlagResponse
+	head.NextCommand = 0
+	r = earlyTestCorrelated(head)
+	r.QueryType = 1
+	r.QueryClass = 6
+	r.FileID = "known"
+	if !earlyCapture(earlyTestPacket(head, make([]byte, 8)), r) {
+		t.Fatal("head result rejected")
+	}
+	child.Flags = wire.FlagResponse | wire.FlagRelated | wire.FlagAsync
+	child.SessionID = 2
+	child.AsyncID = 0xaabbccdd11223344
+	child.Status = 0x103
+	r = earlyTestCorrelated(child)
+	r.QueryType = 1
+	r.QueryClass = 6
+	r.FileID = "known"
+	if !earlyCapture(earlyTestPacket(child, make([]byte, 8)), r) {
+		t.Fatal("asynchronous related ownership was not inherited from request")
+	}
+	rows, err := earlySnapshot()
+	last := rows[len(rows)-1]
+	if err != nil || last.Session != 2 || last.Tree != 7 || last.RawTree != nil || rows[1].RawSession != 77 || rows[1].RawFileID != "ignored" || rows[1].FileID != "known" {
+		t.Fatal("async related provenance lost", rows, err)
+	}
+}
+
+func TestEarlyCapabilityRelatedResults(t *testing.T) {
+	for _, raw := range []struct {
+		session uint64
+		tree    uint32
+	}{{77, 88}, {^uint64(0), ^uint32(0)}} {
+		t.Run(fmt.Sprint(raw), func(t *testing.T) {
+			earlyReset()
+			head := wire.Header{Command: wire.QueryInfo, SessionID: 2, TreeID: 7, MessageID: 10, NextCommand: 72}
+			r := earlyTestCorrelated(head)
+			r.QueryType = 1
+			r.QueryClass = 6
+			r.FileID = "actual"
+			if !earlyCapture(earlyTestPacket(head, make([]byte, 8)), r) {
+				t.Fatal("head rejected")
+			}
+			child := wire.Header{Command: wire.QueryInfo, SessionID: raw.session, TreeID: raw.tree, MessageID: 11, Flags: wire.FlagRelated}
+			r = earlyTestCorrelated(child)
+			r.QueryType = 1
+			r.QueryClass = 6
+			r.FileID = "ignored"
+			if !earlyCapture(earlyTestPacket(child, make([]byte, 8)), r) {
+				t.Fatal("raw ignored request rejected")
+			}
+			rows, err := earlySnapshot()
+			if err == nil || !rows[1].OwnerPending || rows[1].Session != 0 || rows[1].Tree != 0 {
+				t.Fatal("unobserved prior result was treated as an owner", rows, err)
+			}
+			head.Flags = wire.FlagResponse
+			head.NextCommand = 0
+			r = earlyTestCorrelated(head)
+			r.QueryType = 1
+			r.QueryClass = 6
+			r.FileID = "actual"
+			if !earlyCapture(earlyTestPacket(head, make([]byte, 8)), r) {
+				t.Fatal("head response rejected")
+			}
+			rows, err = earlySnapshot()
+			if err != nil || rows[1].OwnerPending || rows[1].Session != 2 || rows[1].Tree != 7 || rows[1].FileID != "actual" || rows[1].RawSession != raw.session || *rows[1].RawTree != raw.tree || rows[1].RawFileID != "ignored" {
+				t.Fatal("validated predecessor ownership was lost", rows, err)
+			}
+		})
+	}
+	for _, mode := range []string{"failed prior result", "foreign prior result", "missing prior result"} {
+		t.Run(mode, func(t *testing.T) {
+			earlyReset()
+			head := wire.Header{Command: wire.QueryInfo, SessionID: 2, TreeID: 7, MessageID: 10, NextCommand: 72}
+			r := earlyTestCorrelated(head)
+			r.FileID = "actual"
+			earlyCapture(earlyTestPacket(head, make([]byte, 8)), r)
+			child := wire.Header{Command: wire.QueryInfo, SessionID: 77, TreeID: 88, MessageID: 11, Flags: wire.FlagRelated}
+			r = earlyTestCorrelated(child)
+			r.FileID = "ignored"
+			earlyCapture(earlyTestPacket(child, make([]byte, 8)), r)
+			if mode != "missing prior result" {
+				head.Flags = wire.FlagResponse
+				head.NextCommand = 0
+				if mode == "failed prior result" {
+					head.Status = 0xc0000022
+				} else {
+					head.SessionID = 3
+				}
+				r = earlyTestCorrelated(head)
+				r.FileID = "actual"
+				if earlyCapture(earlyTestPacket(head, make([]byte, 8)), r) {
+					t.Fatal("failed or foreign predecessor qualified")
+				}
+			}
+			if _, err := earlySnapshot(); err == nil {
+				t.Fatal("unproven related ownership appeared complete")
+			}
+		})
+	}
+}
+
+func TestEarlyCapabilityAsyncTransitionRefusals(t *testing.T) {
+	for _, mode := range []string{"synchronous pending", "async final without pending", "synchronous final after async pending", "changed AsyncId"} {
+		t.Run(mode, func(t *testing.T) {
+			earlyReset()
+			body := make([]byte, 32)
+			binary.LittleEndian.PutUint16(body, 32)
+			copy(body[8:24], []byte("watcher-handle-01"))
+			header := wire.Header{Command: wire.ChangeNotify, SessionID: 2, TreeID: 7, MessageID: 5}
+			if !earlyCapture(earlyTestPacket(header, body), earlyTestCorrelated(header)) {
+				t.Fatal("request rejected")
+			}
+			header.Flags = wire.FlagResponse | wire.FlagAsync
+			header.AsyncID = 17
+			header.Status = 0x103
+			if mode == "synchronous final after async pending" || mode == "changed AsyncId" {
+				if !earlyCapture(earlyTestPacket(header, make([]byte, 8)), earlyTestCorrelated(header)) {
+					t.Fatal("valid pending rejected")
+				}
+			}
+			switch mode {
+			case "synchronous pending":
+				header.Flags = wire.FlagResponse
+			case "async final without pending":
+				header.Status = 0
+			case "synchronous final after async pending":
+				header.Status = 0
+				header.Flags = wire.FlagResponse
+			case "changed AsyncId":
+				header.Status = 0
+				header.AsyncID++
+			}
+			if earlyCapture(earlyTestPacket(header, make([]byte, 8)), earlyTestCorrelated(header)) {
+				t.Fatal("malformed asynchronous ownership qualified")
+			}
+		})
+	}
+}
+
+func earlyTestCompound(packets ...[]byte) []byte {
+	var frame []byte
+	for i, packet := range packets {
+		copy := bytes.Clone(packet)
+		if i < len(packets)-1 {
+			copy = append(copy, make([]byte, (-len(copy))&7)...)
+			binary.LittleEndian.PutUint32(copy[20:24], uint32(len(copy)))
+		} else {
+			binary.LittleEndian.PutUint32(copy[20:24], 0)
+		}
+		frame = append(frame, copy...)
+	}
+	return frame
+}
+
+func earlyTestCreatePacket(response bool, message, session uint64, tree uint32, related bool, file []byte) []byte {
+	packet := preciseTestCreate(response, nil, nil)
+	flags := uint32(0)
+	if response {
+		flags |= wire.FlagResponse
+		copy(packet[128:144], file)
+	}
+	if related {
+		flags |= wire.FlagRelated
+	}
+	if err := (wire.Header{Command: wire.Create, MessageID: message, SessionID: session, TreeID: tree, Flags: flags}).Encode(packet); err != nil {
+		panic(err)
+	}
+	return packet
+}
+
+func earlyTestQueryPacket(response bool, message, session uint64, tree uint32, related bool, file []byte) []byte {
+	var packet []byte
+	if response {
+		packet = preciseTestQuery(make([]byte, 8))
+	} else {
+		packet = make([]byte, 104)
+		binary.LittleEndian.PutUint16(packet[64:], 41)
+		packet[66] = 1
+		packet[67] = 6
+		binary.LittleEndian.PutUint32(packet[68:], 8)
+		copy(packet[88:104], file)
+	}
+	flags := uint32(0)
+	if response {
+		flags |= wire.FlagResponse
+	}
+	if related {
+		flags |= wire.FlagRelated
+	}
+	if err := (wire.Header{Command: wire.QueryInfo, MessageID: message, SessionID: session, TreeID: tree, Flags: flags}).Encode(packet); err != nil {
+		panic(err)
+	}
+	return packet
+}
+
+func earlyTestObserver(t *testing.T) *cacheGatePositiveFrameObserver {
+	preciseIdentityReset()
+	earlyReset()
+	cacheGateResetPositiveWire()
+	parentNotifyReset()
+	earlyActivate()
+	t.Cleanup(earlyDeactivate)
+	return cacheGateNewPositiveFrameObserver()
+}
+
+func TestEarlyCapabilityGeneratedRelatedFrames(t *testing.T) {
+	actual := bytes.Repeat([]byte{0x17}, 16)
+	for _, mode := range []string{"arbitrary ignored IDs", "all-ones IDs", "failed prior TREE_CONNECT", "foreign prior result", "missing prior result"} {
+		t.Run(mode, func(t *testing.T) {
+			observer := earlyTestObserver(t)
+			name := wire.EncodeUTF16(`\\127.0.0.1\rfs-test`)
+			body := make([]byte, 8+len(name))
+			binary.LittleEndian.PutUint16(body, 9)
+			binary.LittleEndian.PutUint16(body[4:], 72)
+			binary.LittleEndian.PutUint16(body[6:], uint16(len(name)))
+			copy(body[8:], name)
+			connect := earlyTestPacket(wire.Header{Command: wire.TreeConnect, SessionID: 2, MessageID: 1}, body)
+			rawSession, rawTree := uint64(77), uint32(88)
+			ignored := bytes.Repeat([]byte{0x55}, 16)
+			if mode == "all-ones IDs" {
+				rawSession = ^uint64(0)
+				rawTree = ^uint32(0)
+				ignored = bytes.Repeat([]byte{0xff}, 16)
+			}
+			request := earlyTestCompound(connect, earlyTestCreatePacket(false, 2, rawSession, rawTree, true, nil), earlyTestQueryPacket(false, 3, rawSession, rawTree, true, ignored))
+			original := bytes.Clone(request)
+			observer.frame(request, false)
+			rows, err := earlySnapshot()
+			if observer.incomplete || err == nil || len(rows) != 3 || !rows[1].OwnerPending || rows[1].Tree != 0 || !bytes.Equal(request, original) {
+				t.Fatal("unresolved request allocation was rejected or invented", rows, err)
+			}
+			if mode == "missing prior result" {
+				return
+			}
+			sid, tree, status := uint64(2), uint32(7), uint32(0)
+			responseBody := wire.TreeConnectResponseBody(1, 0, 0, 0)
+			if mode == "failed prior TREE_CONNECT" {
+				status = 0xc0000022
+				tree = 0
+				responseBody = wire.ErrorResponseBody()
+			}
+			if mode == "foreign prior result" {
+				sid = 3
+			}
+			connected := earlyTestPacket(wire.Header{Command: wire.TreeConnect, SessionID: sid, TreeID: tree, MessageID: 1, Flags: wire.FlagResponse, Status: status}, responseBody)
+			response := earlyTestCompound(connected, earlyTestCreatePacket(true, 2, 2, 7, true, actual), earlyTestQueryPacket(true, 3, 2, 7, true, nil))
+			responseOriginal := bytes.Clone(response)
+			observer.frame(response, true)
+			rows, err = earlySnapshot()
+			identities, identityErr := preciseIdentitySnapshot()
+			if mode == "failed prior TREE_CONNECT" || mode == "foreign prior result" {
+				if !observer.incomplete || err == nil {
+					t.Fatal("failed/foreign allocation qualified", rows, err)
+				}
+				return
+			}
+			if observer.incomplete || err != nil || identityErr != nil || len(identities) != 4 || len(rows) != 6 || rows[1].OwnerPending || rows[1].Tree != 7 || rows[1].Session != 2 || rows[1].RawSession != rawSession || *rows[1].RawTree != rawTree || rows[2].RawFileID != hex.EncodeToString(ignored) || rows[2].FileID != hex.EncodeToString(actual) || !bytes.Equal(response, responseOriginal) {
+				t.Fatal("full parser failed actual related allocation", rows, err, identities, identityErr)
+			}
+			if identities[0].RawSession != rawSession || identities[0].Session != 2 || identities[1].FileID != hex.EncodeToString(actual) {
+				t.Fatal("private identity view lost raw/effective ownership", identities)
+			}
+			for _, record := range observer.records {
+				if record.MessageID == 3 && (record.SessionID != 2 || record.FileID != hex.EncodeToString(actual)) {
+					t.Fatal("base coldness view retained ignored raw ownership", record)
+				}
+			}
+		})
+	}
+	t.Run("related existing-open READ to QUERY_INFO", func(t *testing.T) {
+		observer := earlyTestObserver(t)
+		observer.frame(earlyTestCreatePacket(false, 1, 2, 7, false, nil), false)
+		observer.frame(earlyTestCreatePacket(true, 1, 2, 7, false, actual), true)
+		body := make([]byte, 48)
+		binary.LittleEndian.PutUint16(body, 49)
+		binary.LittleEndian.PutUint32(body[4:], 1)
+		copy(body[16:32], actual)
+		head := earlyTestPacket(wire.Header{Command: wire.Read, SessionID: 2, TreeID: 7, MessageID: 2}, body)
+		ignored := bytes.Repeat([]byte{0xff}, 16)
+		request := earlyTestCompound(head, earlyTestQueryPacket(false, 3, 77, 88, true, ignored))
+		before := bytes.Clone(request)
+		observer.frame(request, false)
+		responseBody := make([]byte, 16)
+		binary.LittleEndian.PutUint16(responseBody, 17)
+		read := earlyTestPacket(wire.Header{Command: wire.Read, SessionID: 2, TreeID: 7, MessageID: 2, Flags: wire.FlagResponse}, responseBody)
+		observer.frame(earlyTestCompound(read, earlyTestQueryPacket(true, 3, 2, 7, true, nil)), true)
+		rows, err := earlySnapshot()
+		identities, identityErr := preciseIdentitySnapshot()
+		if observer.incomplete || err != nil || identityErr != nil || !bytes.Equal(request, before) {
+			t.Fatal("existing-open related chain rejected", rows, err, identities, identityErr)
+		}
+		if identities[len(identities)-2].RawSession != 77 || identities[len(identities)-2].Session != 2 || identities[len(identities)-2].FileID != hex.EncodeToString(actual) {
+			t.Fatal("existing-open identity owner was guessed", identities)
+		}
+	})
+	t.Run("related CREATE to NOTIFY pending", func(t *testing.T) {
+		observer := earlyTestObserver(t)
+		body := make([]byte, 32)
+		binary.LittleEndian.PutUint16(body, 32)
+		binary.LittleEndian.PutUint16(body[2:], 1)
+		binary.LittleEndian.PutUint32(body[4:], 65536)
+		copy(body[8:24], bytes.Repeat([]byte{0xff}, 16))
+		binary.LittleEndian.PutUint32(body[24:], 31)
+		notify := earlyTestPacket(wire.Header{Command: wire.ChangeNotify, SessionID: 77, TreeID: 88, MessageID: 2, Flags: wire.FlagRelated}, body)
+		observer.frame(earlyTestCompound(earlyTestCreatePacket(false, 1, 2, 7, false, nil), notify), false)
+		observer.frame(earlyTestCreatePacket(true, 1, 2, 7, false, actual), true)
+		pending := earlyTestPacket(wire.Header{Command: wire.ChangeNotify, SessionID: 2, MessageID: 2, Flags: wire.FlagResponse | wire.FlagAsync, AsyncID: 91, Status: 0x103}, wire.ErrorResponseBody())
+		observer.frame(pending, true)
+		rows, err := earlySnapshot()
+		requests, _, bad := parentNotifySnapshot()
+		if observer.incomplete || err != nil || bad || len(requests) != 1 || requests[0].Session != 2 || requests[0].FileID != hex.EncodeToString(actual) || rows[len(rows)-1].Tree != 7 || rows[len(rows)-1].RawTree != nil {
+			t.Fatal("related notification hook kept unresolved ownership", rows, err, requests, bad)
+		}
+	})
+}
+
+func TestEarlyCapabilityGeneratedAsyncFrames(t *testing.T) {
+	actual := bytes.Repeat([]byte{0x17}, 16)
+	for _, mode := range []string{"valid pending and terminal", "sync pending", "async terminal without pending", "sync terminal after pending", "changed AsyncId"} {
+		t.Run(mode, func(t *testing.T) {
+			observer := earlyTestObserver(t)
+			observer.frame(earlyTestCreatePacket(false, 1, 2, 7, false, nil), false)
+			observer.frame(earlyTestCreatePacket(true, 1, 2, 7, false, actual), true)
+			body := make([]byte, 32)
+			binary.LittleEndian.PutUint16(body, 32)
+			binary.LittleEndian.PutUint16(body[2:], 1)
+			binary.LittleEndian.PutUint32(body[4:], 65536)
+			copy(body[8:24], actual)
+			binary.LittleEndian.PutUint32(body[24:], 31)
+			observer.frame(earlyTestPacket(wire.Header{Command: wire.ChangeNotify, SessionID: 2, TreeID: 7, MessageID: 2}, body), false)
+			pendingHeader := wire.Header{Command: wire.ChangeNotify, SessionID: 2, TreeID: 7, MessageID: 2, Flags: wire.FlagResponse | wire.FlagAsync, AsyncID: 91, Status: 0x103}
+			if mode == "sync pending" {
+				pendingHeader.Flags = wire.FlagResponse
+			}
+			if mode != "async terminal without pending" {
+				observer.frame(earlyTestPacket(pendingHeader, wire.ErrorResponseBody()), true)
+			}
+			if mode != "sync pending" {
+				data := parentTestNotifyBuffer(parentNotifyItem{Action: 3, Name: `v\target`})
+				terminalBody := make([]byte, 8+len(data))
+				binary.LittleEndian.PutUint16(terminalBody, 9)
+				binary.LittleEndian.PutUint16(terminalBody[2:], 72)
+				binary.LittleEndian.PutUint32(terminalBody[4:], uint32(len(data)))
+				copy(terminalBody[8:], data)
+				terminal := pendingHeader
+				terminal.Status = 0
+				if mode == "sync terminal after pending" {
+					terminal.Flags = wire.FlagResponse
+				}
+				if mode == "changed AsyncId" {
+					terminal.AsyncID++
+				}
+				observer.frame(earlyTestPacket(terminal, terminalBody), true)
+			}
+			rows, err := earlySnapshot()
+			if mode == "valid pending and terminal" {
+				_, results, bad := parentNotifySnapshot()
+				if observer.incomplete || err != nil || bad || len(results) != 1 || results[0].Request.Session != 2 || results[0].Request.FileID != hex.EncodeToString(actual) || rows[len(rows)-1].RawTree != nil || rows[len(rows)-1].Tree != 7 {
+					t.Fatal("actual async frame path lost ownership", rows, err, results, bad)
+				}
+			} else if !observer.incomplete || err == nil {
+				t.Fatal("malformed actual async frame path qualified", mode, rows, err)
+			}
+		})
+	}
+}
+
+func TestEarlyCapabilitySessionAllocation(t *testing.T) {
+	cases := []struct {
+		name              string
+		request, response uint64
+		status            uint32
+		accepted          bool
+	}{
+		{"initial allocation", 0, 2, 0, true}, {"initial challenge allocation", 0, 2, 0xc0000016, true},
+		{"missing successful allocation", 0, 0, 0, false}, {"missing challenge allocation", 0, 0, 0xc0000016, false},
+		{"initial error without allocation", 0, 0, 0xc000006d, true}, {"initial error with allocation", 0, 2, 0xc000006d, true},
+		{"same continuation", 2, 2, 0, true}, {"foreign continuation success", 2, 3, 0, false},
+		{"foreign continuation challenge", 2, 3, 0xc0000016, false}, {"foreign continuation error", 2, 3, 0xc000006d, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			earlyReset()
+			request := wire.Header{Command: wire.SessionSetup, SessionID: tc.request, MessageID: 1}
+			if !earlyCapture(earlyTestPacket(request, make([]byte, 24)), earlyTestCorrelated(request)) {
+				t.Fatal("request rejected")
+			}
+			response := wire.Header{Command: wire.SessionSetup, SessionID: tc.response, MessageID: 1, Flags: wire.FlagResponse, Status: tc.status}
+			if got := earlyCapture(earlyTestPacket(response, make([]byte, 8)), earlyTestCorrelated(response)); got != tc.accepted {
+				t.Fatal("session allocation qualification", got, tc)
+			}
+		})
+	}
+	t.Run("foreign continuation cannot seed a related TREE_CONNECT", func(t *testing.T) {
+		observer := earlyTestObserver(t)
+		setup := make([]byte, 24)
+		binary.LittleEndian.PutUint16(setup, 25)
+		head := earlyTestPacket(wire.Header{Command: wire.SessionSetup, SessionID: 2, MessageID: 1}, setup)
+		name := wire.EncodeUTF16(`\\127.0.0.1\rfs-test`)
+		body := make([]byte, 8+len(name))
+		binary.LittleEndian.PutUint16(body, 9)
+		binary.LittleEndian.PutUint16(body[4:], 72)
+		binary.LittleEndian.PutUint16(body[6:], uint16(len(name)))
+		copy(body[8:], name)
+		connect := earlyTestPacket(wire.Header{Command: wire.TreeConnect, SessionID: 77, TreeID: 88, MessageID: 2, Flags: wire.FlagRelated}, body)
+		request := earlyTestCompound(head, connect)
+		before := bytes.Clone(request)
+		observer.frame(request, false)
+		responseBody := make([]byte, 8)
+		binary.LittleEndian.PutUint16(responseBody, 9)
+		response := earlyTestPacket(wire.Header{Command: wire.SessionSetup, SessionID: 3, MessageID: 1, Flags: wire.FlagResponse}, responseBody)
+		observer.frame(response, true)
+		rows, err := earlySnapshot()
+		if !observer.incomplete || err == nil || !rows[1].OwnerPending || !bytes.Equal(request, before) {
+			t.Fatal("foreign allocation seeded related ownership", rows, err)
+		}
+	})
+}
