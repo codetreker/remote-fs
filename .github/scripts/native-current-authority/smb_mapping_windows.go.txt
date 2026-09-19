@@ -819,6 +819,7 @@ type mappingCommandResult struct {
 }
 
 const mappingPowerShell = `
+[Console]::Error.WriteLine('RFS-MAPPING/1 entry')
 $ErrorActionPreference = 'Stop'
 $WarningPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -828,30 +829,46 @@ Set-StrictMode -Version Latest
 $OutputEncoding = [Console]::OutputEncoding
 $owner = ''
 try {
-    $request = [Console]::In.ReadLine() | ConvertFrom-Json
+    [Console]::Error.WriteLine('RFS-MAPPING/1 before-readline')
+    $requestLine = [Console]::In.ReadLine()
+    [Console]::Error.WriteLine('RFS-MAPPING/1 after-readline')
+    [Console]::Error.WriteLine('RFS-MAPPING/1 before-json')
+    $request = $requestLine | ConvertFrom-Json
+    [Console]::Error.WriteLine('RFS-MAPPING/1 after-json')
+    [Console]::Error.WriteLine('RFS-MAPPING/1 before-owner')
     $owner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    [Console]::Error.WriteLine('RFS-MAPPING/1 after-owner')
     if ($owner -cne $request.owner_sid) { throw 'PowerShell primary-token SID differs from mapping owner.' }
+    [Console]::Error.WriteLine('RFS-MAPPING/1 before-import')
     Import-Module -Name $request.module -ErrorAction Stop
+    [Console]::Error.WriteLine('RFS-MAPPING/1 after-import')
     function Read-Mappings {
+        [Console]::Error.WriteLine('RFS-MAPPING/1 before-inventory')
         $items = @(Get-SmbMapping -ErrorAction Stop)
+        [Console]::Error.WriteLine('RFS-MAPPING/1 after-inventory')
         if ($items.Count -gt 128) { throw 'SMB mapping inventory exceeds 128 rows.' }
         @($items | ForEach-Object {
             [ordered]@{ local_path = [string]$_.LocalPath; remote_path = [string]$_.RemotePath; status = [string]$_.Status }
         })
     }
     if ($request.action -eq 'create') {
+        [Console]::Error.WriteLine('RFS-MAPPING/1 before-create-inventory')
         $prior = @(Get-SmbMapping -ErrorAction Stop | Where-Object { $_.LocalPath -ieq $request.local_path -or $_.RemotePath -ieq $request.remote_path })
+        [Console]::Error.WriteLine('RFS-MAPPING/1 after-create-inventory')
         if ($prior.Count -ne 0) { throw 'Refusing to adopt a pre-existing drive or nonce share mapping.' }
         $command = Get-Command -Name SmbShare\New-SmbMapping -ErrorAction Stop
         if (-not $command.Parameters.ContainsKey('TcpPort')) { throw 'New-SmbMapping lacks alternate TCP-port support.' }
         $null = SmbShare\New-SmbMapping -LocalPath $request.local_path -RemotePath $request.remote_path -TcpPort $request.tcp_port -TransportType TCP -RequireIntegrity $true -Persistent $false -GlobalMapping:$false -SaveCredentials:$false -ErrorAction Stop
     } elseif ($request.action -eq 'remove') {
+        [Console]::Error.WriteLine('RFS-MAPPING/1 before-remove-inventory')
         $matching = @(Get-SmbMapping -ErrorAction Stop | Where-Object { $_.LocalPath -ieq $request.local_path -or $_.RemotePath -ieq $request.remote_path })
+        [Console]::Error.WriteLine('RFS-MAPPING/1 after-remove-inventory')
         if ($matching.Count -ne 1 -or $matching[0].LocalPath -cne $request.local_path -or $matching[0].RemotePath -cne $request.remote_path) { throw 'Mapping changed before exact removal; refusing deletion.' }
         $matching[0] | SmbShare\Remove-SmbMapping -Force -UpdateProfile:$false -Confirm:$false -ErrorAction Stop
     } elseif ($request.action -ne 'inventory') { throw 'Unknown mapping command.' }
     $rows = @(Read-Mappings)
     [ordered]@{ status = 'ok'; owner_sid = $owner; rows = $rows; cause = '' } | ConvertTo-Json -Depth 5 -Compress
+    [Console]::Error.WriteLine('RFS-MAPPING/1 after-result')
 } catch {
     $cause = $_.Exception.Message
     if ($cause.Length -gt 1024) { $cause = $cause.Substring(0,1024) }
@@ -883,17 +900,136 @@ func startMappingPowerShell(host platform, executable string, args []string, dir
 	return host.Start(executable, args, directory)
 }
 
-type mappingBoundedBuffer struct{ bytes.Buffer }
+const mappingDiagnosticStreamLimit = 2 << 10
+
+type mappingBoundedBuffer struct {
+	buffer   bytes.Buffer
+	observed int64
+	prefix   []byte
+}
+
+func (b *mappingBoundedBuffer) Bytes() []byte { return b.buffer.Bytes() }
+func (b *mappingBoundedBuffer) Len() int      { return b.buffer.Len() }
 
 func (b *mappingBoundedBuffer) Write(data []byte) (int, error) {
+	b.observed += int64(len(data))
+	if len(b.prefix) < mappingDiagnosticStreamLimit {
+		b.prefix = append(b.prefix, data[:min(len(data), mappingDiagnosticStreamLimit-len(b.prefix))]...)
+	}
 	if len(data) > mappingByteLimit-b.Len() {
 		return 0, errors.New("mapping command output exceeds 1 MiB")
 	}
-	return b.Buffer.Write(data)
+	return b.buffer.Write(data)
+}
+
+type mappingStreamDiagnostic struct {
+	ObservedBytes   int64  `json:"observed_bytes"`
+	PrefixBase64    string `json:"prefix_base64"`
+	PrefixTruncated bool   `json:"prefix_truncated"`
+}
+
+func (b *mappingBoundedBuffer) diagnostic() mappingStreamDiagnostic {
+	return mappingStreamDiagnostic{b.observed, base64.StdEncoding.EncodeToString(b.prefix), b.observed > int64(len(b.prefix))}
+}
+
+type mappingCommandDiagnostic struct {
+	Action                    string                  `json:"action"`
+	ActionTruncated           bool                    `json:"action_truncated"`
+	PID                       *uint32                 `json:"pid,omitempty"`
+	ElapsedMillis             int64                   `json:"elapsed_ms"`
+	PreCleanupDone            *bool                   `json:"pre_cleanup_done,omitempty"`
+	PreCleanupResult          *string                 `json:"pre_cleanup_result_error,omitempty"`
+	PreCleanupResultTruncated bool                    `json:"pre_cleanup_result_error_truncated"`
+	WriteStarted              bool                    `json:"write_started"`
+	WriteReturned             bool                    `json:"write_returned"`
+	WriteComplete             bool                    `json:"write_complete"`
+	InputBytes                int                     `json:"input_bytes"`
+	WriteBytes                int                     `json:"write_bytes"`
+	WriteError                string                  `json:"write_error"`
+	WriteErrorTruncated       bool                    `json:"write_error_truncated"`
+	Stdout                    mappingStreamDiagnostic `json:"stdout_observed"`
+	Stderr                    mappingStreamDiagnostic `json:"stderr_observed"`
+}
+
+type mappingDiagnosticError struct {
+	details mappingCommandDiagnostic
+	encoded string
+}
+
+func (e *mappingDiagnosticError) Error() string { return "mapping command diagnostic: " + e.encoded }
+
+func mappingDiagnosticText(value string, limit int) (string, bool) {
+	if len(value) > limit {
+		return value[:limit], true
+	}
+	return value, false
+}
+
+func encodeMappingDiagnostic(details mappingCommandDiagnostic) error {
+	data, err := json.Marshal(details)
+	if err != nil {
+		return fmt.Errorf("encode mapping command diagnostic: %w", err)
+	}
+	if len(data) >= 16<<10 {
+		return errors.New("mapping command diagnostic exceeded 16 KiB")
+	}
+	return &mappingDiagnosticError{details: details, encoded: string(data)}
 }
 
 // The caller runs inside F's watchdog-owned probe; Finish owns all child handles.
 func runMappingPowerShell(ctx context.Context, host platform, executable, directory string, request mappingCommandRequest) (result mappingCommandResult, resultErr error) {
+	started := time.Now()
+	var process child
+	var stdout, stderr mappingBoundedBuffer
+	var streams chan error
+	drained := 0
+	diagnostic := mappingCommandDiagnostic{}
+	diagnostic.Action, diagnostic.ActionTruncated = mappingDiagnosticText(request.Action, 64)
+	var writeStarted, writeReturned bool
+	var writeBytes int
+	var writeErr error
+	defer func() {
+		if process != nil {
+			pid := process.PID()
+			diagnostic.PID = &pid
+			done := false
+			select {
+			case <-process.Done():
+				done = true
+			default:
+			}
+			diagnostic.PreCleanupDone = &done
+			if done {
+				resultText := ""
+				if err := process.Result(); err != nil {
+					resultText, diagnostic.PreCleanupResultTruncated = mappingDiagnosticText(err.Error(), 512)
+				}
+				diagnostic.PreCleanupResult = &resultText
+			}
+			forced, err := process.Finish()
+			if forced {
+				err = errors.Join(err, errors.New("mapping command required forced owned-job termination"))
+			}
+			resultErr = errors.Join(resultErr, err)
+			if streams != nil {
+				// Finish closes the owned pipes; no capture is read until every worker has joined.
+				for drained < 3 {
+					resultErr = errors.Join(resultErr, <-streams)
+					drained++
+				}
+			}
+		}
+		if resultErr != nil {
+			diagnostic.ElapsedMillis = time.Since(started).Milliseconds()
+			diagnostic.WriteStarted, diagnostic.WriteReturned, diagnostic.WriteBytes = writeStarted, writeReturned, writeBytes
+			diagnostic.WriteComplete = writeReturned && writeErr == nil && writeBytes == diagnostic.InputBytes
+			if writeErr != nil {
+				diagnostic.WriteError, diagnostic.WriteErrorTruncated = mappingDiagnosticText(writeErr.Error(), 512)
+			}
+			diagnostic.Stdout, diagnostic.Stderr = stdout.diagnostic(), stderr.diagnostic()
+			resultErr = errors.Join(resultErr, encodeMappingDiagnostic(diagnostic))
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
@@ -905,44 +1041,28 @@ func runMappingPowerShell(ctx context.Context, host platform, executable, direct
 		return result, errors.New("mapping command input exceeds 4 KiB")
 	}
 	data = append(data, '\n')
+	diagnostic.InputBytes = len(data)
 	words := utf16.Encode([]rune(mappingPowerShell))
 	script := make([]byte, len(words)*2)
 	for i, word := range words {
 		binary.LittleEndian.PutUint16(script[i*2:], word)
 	}
 	args := []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", base64.StdEncoding.EncodeToString(script)}
-	process, err := startMappingPowerShell(host, executable, args, directory)
-	var streams chan error
-	drained := 0
-	if process != nil {
-		defer func() {
-			forced, err := process.Finish()
-			if forced {
-				err = errors.Join(err, errors.New("mapping command required forced owned-job termination"))
-			}
-			resultErr = errors.Join(resultErr, err)
-			if streams != nil {
-				// Finish closes the owned pipes; join every I/O worker before returning its buffers.
-				for drained < 3 {
-					resultErr = errors.Join(resultErr, <-streams)
-					drained++
-				}
-			}
-		}()
-	}
+	process, err = startMappingPowerShell(host, executable, args, directory)
 	if err != nil {
 		return result, err
 	}
-	var stdout, stderr mappingBoundedBuffer
 	streams = make(chan error, 3)
 	go func() { _, err := io.Copy(&stdout, process.Output()); streams <- err }()
 	go func() { _, err := io.Copy(&stderr, process.Errors()); streams <- err }()
 	go func() {
-		n, err := process.Input().Write(data)
-		if err == nil && n != len(data) {
-			err = io.ErrShortWrite
+		writeStarted = true
+		writeBytes, writeErr = process.Input().Write(data)
+		if writeErr == nil && writeBytes != len(data) {
+			writeErr = io.ErrShortWrite
 		}
-		streams <- err
+		writeReturned = true
+		streams <- writeErr
 	}()
 	done := process.Done()
 	finished := false
@@ -963,7 +1083,7 @@ func runMappingPowerShell(ctx context.Context, host platform, executable, direct
 		}
 	}
 	if err := decodeMappingJSON(stdout.Bytes(), &result); err != nil {
-		return result, errors.Join(err, processErr, fmt.Errorf("PowerShell stderr: %s", stderr.String()))
+		return result, errors.Join(err, processErr)
 	}
 	if request.OwnerSID == "" || result.OwnerSID != request.OwnerSID {
 		return result, errors.New("mapping command returned a different primary-token SID")

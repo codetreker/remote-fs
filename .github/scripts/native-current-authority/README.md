@@ -204,9 +204,31 @@ mismatch. Recovery preserves the original failed result. Ordinary success closes
 the native HANDLE, removes the mapping, calls Shutdown, joins Serve, Unpublishes
 the export, closes idle HTTP connections and verifies remote/local cleanup.
 
-This phase's native mapping and cold I/O have not yet run. It adds no notification
-manager, invalidation policy or production mapping API. The earlier qualified
-HTTP fixture pass does not supply the missing current-SMB or one-second evidence.
+[The first cold run 35434023125](https://github.com/codetreker/remote-fs/actions/runs/35434023125)
+on source `2c561f0da1b6223d1ab06b1eb87400e699e309b8` failed when its initial
+`Get-SmbMapping` inventory command exceeded the unchanged four-second child
+context. No creation-intent ledger, current SMB connection/traffic or native
+file-call record was observed. The exact PowerShell stage is unknown. Mapping
+cleanup reported no owned mapping and the SMB host drained, but guest cleanup
+was forced; disk removal and an unchanged pristine image do not turn that result
+into a pass. The earlier qualified HTTP fixture pass does not supply the missing
+current-SMB or one-second evidence.
+
+Mapping failures retain a bounded diagnostic after the owned child is finished
+and all three I/O workers join. It records action, actual PID when available,
+pre-cleanup exit observation, elapsed time and input-write progress/error. Each
+stdout/stderr prefix is at most 2 KiB, base64 encoded with observed byte count and
+truncation state; the diagnostic stays below 16 KiB and supplements the original
+error chain. Fixed stderr stage markers cover entry, request read/parse, owner,
+module and inventory; stdout retains its single result JSON. The 1 MiB stream
+limit applies through `io.Copy` as well as direct Write calls. Missing prefix
+bytes do not prove a stage never began, and a prefix is not complete output.
+
+This captures the next failure; it does not fix or reclassify the timeout. The
+four-second context, stdin lifetime, flags, mapping operations and outer budgets
+remain unchanged. A local PowerShell 7 test completed with stdin both held open
+and closed; it does not establish Windows PowerShell 5.1 behavior. No notification
+manager, invalidation policy or production mapping API is added.
 
 ## Local Linux validation
 

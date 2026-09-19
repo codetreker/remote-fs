@@ -429,33 +429,50 @@ func (b *mappingInputBuffer) Close() error { b.closes++; return nil }
 
 type mappingCommandChild struct {
 	input          *mappingInputBuffer
+	inputOverride  io.WriteCloser
 	output, stderr io.ReadCloser
 	done           chan struct{}
 	result         error
 	forced         bool
 	finished       int
 	closePipes     func()
+	finishErr      error
+	resultCalls    int
 }
 
-func (p *mappingCommandChild) Input() io.WriteCloser { return p.input }
+func (p *mappingCommandChild) Input() io.WriteCloser {
+	if p.inputOverride != nil {
+		return p.inputOverride
+	}
+	return p.input
+}
 func (p *mappingCommandChild) Output() io.ReadCloser { return p.output }
 func (p *mappingCommandChild) Errors() io.ReadCloser { return p.stderr }
 func (p *mappingCommandChild) Done() <-chan struct{} { return p.done }
-func (p *mappingCommandChild) Result() error         { return p.result }
-func (p *mappingCommandChild) PID() uint32           { return 55 }
+func (p *mappingCommandChild) Result() error {
+	select {
+	case <-p.done:
+	default:
+		panic("Result called before Done")
+	}
+	p.resultCalls++
+	return p.result
+}
+func (p *mappingCommandChild) PID() uint32 { return 55 }
 func (p *mappingCommandChild) Finish() (bool, error) {
 	p.finished++
 	if p.closePipes != nil {
 		p.closePipes()
 	}
-	return p.forced, errors.Join(p.input.Close(), p.output.Close(), p.stderr.Close())
+	return p.forced, errors.Join(p.finishErr, p.Input().Close(), p.output.Close(), p.stderr.Close())
 }
 
 type mappingCommandHost struct {
-	child  *mappingCommandChild
-	args   []string
-	starts int
-	cache  string
+	child    *mappingCommandChild
+	args     []string
+	starts   int
+	cache    string
+	startErr error
 }
 
 func (h *mappingCommandHost) Preflight() (map[string]any, error) { return nil, nil }
@@ -463,6 +480,9 @@ func (h *mappingCommandHost) Start(_ string, args []string, _ string) (child, er
 	h.starts++
 	h.args = append([]string(nil), args...)
 	h.cache = os.Getenv("PSModuleAnalysisCachePath")
+	if h.startErr != nil {
+		return nil, h.startErr
+	}
 	return h.child, nil
 }
 func mappingReplyChild(reply string) *mappingCommandChild {
@@ -549,5 +569,266 @@ func TestMappingTokenStatisticsABI(t *testing.T) {
 	var value mappingTokenStatistics
 	if unsafe.Sizeof(value) != 56 || unsafe.Alignof(value) != 8 || unsafe.Offsetof(value.AuthenticationID) != 8 || unsafe.Offsetof(value.Expiration) != 16 || unsafe.Offsetof(value.ModifiedID) != 48 {
 		t.Fatal("TOKEN_STATISTICS differs from the Windows 64-bit ABI")
+	}
+}
+
+type mappingTestDeadline struct{ context.Context }
+
+func (c mappingTestDeadline) Err() error {
+	if c.Context.Err() != nil {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+type mappingDiagnosticInput struct {
+	write func([]byte) (int, error)
+	close func() error
+}
+
+func (w mappingDiagnosticInput) Write(data []byte) (int, error) { return w.write(data) }
+func (w mappingDiagnosticInput) Close() error                   { return w.close() }
+
+type mappingDiagnosticReader struct {
+	data                          []byte
+	ready, release, ended         chan struct{}
+	readyOnce, closeOnce, endOnce sync.Once
+}
+
+func newMappingDiagnosticReader(data string) *mappingDiagnosticReader {
+	return &mappingDiagnosticReader{data: []byte(data), ready: make(chan struct{}), release: make(chan struct{}), ended: make(chan struct{})}
+}
+func (r *mappingDiagnosticReader) Read(data []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(data, r.data)
+		r.data = r.data[n:]
+		if len(r.data) == 0 {
+			r.readyOnce.Do(func() { close(r.ready) })
+		}
+		return n, nil
+	}
+	r.readyOnce.Do(func() { close(r.ready) })
+	<-r.release
+	r.endOnce.Do(func() { close(r.ended) })
+	return 0, io.EOF
+}
+func (r *mappingDiagnosticReader) Close() error {
+	r.closeOnce.Do(func() { close(r.release) })
+	return nil
+}
+
+func mappingDiagnosticFrom(t *testing.T, err error) *mappingDiagnosticError {
+	t.Helper()
+	var diagnostic *mappingDiagnosticError
+	if !errors.As(err, &diagnostic) {
+		t.Fatalf("missing bounded mapping diagnostic: %v", err)
+	}
+	if len(diagnostic.Error()) >= 16<<10 {
+		t.Fatal("diagnostic exceeded 16 KiB")
+	}
+	return diagnostic
+}
+
+func mappingDiagnosticPrefix(t *testing.T, stream mappingStreamDiagnostic) []byte {
+	t.Helper()
+	data, err := base64.StdEncoding.DecodeString(stream.PrefixBase64)
+	if err != nil || len(data) > mappingDiagnosticStreamLimit {
+		t.Fatalf("invalid bounded stream prefix: bytes=%d error=%v", len(data), err)
+	}
+	return data
+}
+
+func TestMappingTimeoutDiagnosticFollowsOwnerAndWorkerCompletion(t *testing.T) {
+	for _, blocked := range []bool{false, true} {
+		name := "written-input"
+		if blocked {
+			name = "blocked-input"
+		}
+		t.Run(name, func(t *testing.T) {
+			base, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			ctx := mappingTestDeadline{Context: base}
+			out := newMappingDiagnosticReader("observed stdout bytes")
+			stages := "RFS-MAPPING/1 entry\nRFS-MAPPING/1 before-import\n"
+			stderr := newMappingDiagnosticReader(stages)
+			inputClosed := make(chan struct{})
+			closes := 0
+			process := &mappingCommandChild{output: out, stderr: stderr, done: make(chan struct{}), forced: true}
+			process.inputOverride = mappingDiagnosticInput{write: func(data []byte) (int, error) {
+				<-out.ready
+				<-stderr.ready
+				cancel()
+				if blocked {
+					<-inputClosed
+					return 0, io.ErrClosedPipe
+				}
+				return len(data), nil
+			}, close: func() error { closes++; close(inputClosed); return nil }}
+			cleanupFailure := errors.New("owned cleanup failure")
+			process.finishErr = cleanupFailure
+			process.closePipes = func() { close(process.done) }
+			_, err := runMappingPowerShell(ctx, &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingCommandRequest{Action: "inventory", OwnerSID: mappingBaselineForTest().Owner.SID})
+			if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, cleanupFailure) || !strings.HasPrefix(err.Error(), context.DeadlineExceeded.Error()+"\n") {
+				t.Fatalf("first/cleanup error chain changed: %v", err)
+			}
+			if process.finished != 1 || closes != 1 || process.resultCalls != 0 {
+				t.Fatalf("owner/result calls: finishes=%d closes=%d result=%d", process.finished, closes, process.resultCalls)
+			}
+			for _, reader := range []*mappingDiagnosticReader{out, stderr} {
+				select {
+				case <-reader.ended:
+				default:
+					t.Fatal("diagnostic returned before reader finished")
+				}
+			}
+			d := mappingDiagnosticFrom(t, err).details
+			if d.Action != "inventory" || d.PID == nil || *d.PID != 55 || d.PreCleanupDone == nil || *d.PreCleanupDone || d.PreCleanupResult != nil || d.ElapsedMillis < 0 {
+				t.Fatalf("unobserved exit or PID facts: %+v", d)
+			}
+			if !d.WriteStarted || !d.WriteReturned || d.WriteComplete == blocked {
+				t.Fatalf("input completion facts: %+v", d)
+			}
+			if blocked {
+				if d.WriteBytes != 0 || d.WriteError != io.ErrClosedPipe.Error() {
+					t.Fatalf("blocked write was hidden: %+v", d)
+				}
+			} else if d.WriteBytes != d.InputBytes || d.WriteError != "" {
+				t.Fatalf("completed write bytes changed: %+v", d)
+			}
+			if string(mappingDiagnosticPrefix(t, d.Stdout)) != "observed stdout bytes" || d.Stdout.ObservedBytes != int64(len("observed stdout bytes")) || d.Stdout.PrefixTruncated {
+				t.Fatalf("stdout observations changed: %+v", d.Stdout)
+			}
+			if string(mappingDiagnosticPrefix(t, d.Stderr)) != stages || d.Stderr.ObservedBytes != int64(len(stages)) || d.Stderr.PrefixTruncated {
+				t.Fatalf("stderr stages lost: %+v", d.Stderr)
+			}
+		})
+	}
+}
+
+func TestMappingWriteFailureDiagnosticsRetainActualProgress(t *testing.T) {
+	sid := mappingBaselineForTest().Owner.SID
+	reply, _ := json.Marshal(mappingCommandResult{Status: "ok", OwnerSID: sid, Rows: []mappingRow{}})
+	for _, partial := range []bool{false, true} {
+		name := "failed"
+		if partial {
+			name = "partial"
+		}
+		t.Run(name, func(t *testing.T) {
+			process := mappingReplyChild(string(reply))
+			failure := errors.New("input write failed")
+			resultFailure := errors.New("child exited before cleanup")
+			process.result = resultFailure
+			closes := 0
+			process.inputOverride = mappingDiagnosticInput{write: func(data []byte) (int, error) {
+				if partial {
+					return len(data) - 1, nil
+				}
+				return 0, failure
+			}, close: func() error { closes++; return nil }}
+			_, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingCommandRequest{Action: "inventory", OwnerSID: sid})
+			want := failure
+			if partial {
+				want = io.ErrShortWrite
+			}
+			if !errors.Is(err, want) || !strings.HasPrefix(err.Error(), want.Error()+"\n") {
+				t.Fatalf("write cause lost: %v", err)
+			}
+			d := mappingDiagnosticFrom(t, err).details
+			if d.PID == nil || *d.PID != 55 || d.PreCleanupDone == nil || !*d.PreCleanupDone || d.PreCleanupResult == nil || *d.PreCleanupResult != resultFailure.Error() {
+				t.Fatalf("known exit was omitted: %+v", d)
+			}
+			if !d.WriteReturned || d.WriteComplete || d.WriteError != want.Error() || process.finished != 1 || closes != 1 {
+				t.Fatalf("write completion/ownership differs: %+v", d)
+			}
+			if partial && d.WriteBytes != d.InputBytes-1 || !partial && d.WriteBytes != 0 {
+				t.Fatalf("write count invented: %+v", d)
+			}
+		})
+	}
+}
+
+func TestMappingStartupFailureDoesNotInventPIDOrIO(t *testing.T) {
+	failure := errors.New("process startup failed")
+	host := &mappingCommandHost{startErr: failure}
+	_, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", mappingCommandRequest{Action: "inventory"})
+	if !errors.Is(err, failure) || !strings.HasPrefix(err.Error(), failure.Error()+"\n") {
+		t.Fatalf("startup cause replaced: %v", err)
+	}
+	d := mappingDiagnosticFrom(t, err).details
+	if d.PID != nil || d.PreCleanupDone != nil || d.PreCleanupResult != nil || d.WriteStarted || d.WriteReturned || d.WriteComplete || d.WriteBytes != 0 || d.Stdout.ObservedBytes != 0 || d.Stderr.ObservedBytes != 0 || host.starts != 1 {
+		t.Fatalf("startup invented child facts: %+v", d)
+	}
+}
+
+func TestMappingFailureCaptureIsBoundedAndDoesNotExposeFullStderr(t *testing.T) {
+	sid := mappingBaselineForTest().Owner.SID
+	process := mappingReplyChild("not-json")
+	secretTail := "stderr-tail-outside-retained-prefix"
+	stderr := strings.Repeat("x", mappingDiagnosticStreamLimit+1) + secretTail
+	process.stderr = io.NopCloser(strings.NewReader(stderr))
+	_, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingCommandRequest{Action: "inventory", OwnerSID: sid})
+	diagnostic := mappingDiagnosticFrom(t, err)
+	if strings.Contains(err.Error(), secretTail) || strings.Contains(err.Error(), "PowerShell stderr:") {
+		t.Fatal("malformed stdout exposed unbounded stderr")
+	}
+	d := diagnostic.details
+	if d.Stderr.ObservedBytes != int64(len(stderr)) || !d.Stderr.PrefixTruncated || !bytes.Equal(mappingDiagnosticPrefix(t, d.Stderr), []byte(stderr[:mappingDiagnosticStreamLimit])) {
+		t.Fatalf("stderr prefix/count incorrect: %+v", d.Stderr)
+	}
+	if d.PreCleanupDone == nil || !*d.PreCleanupDone || d.PreCleanupResult == nil || *d.PreCleanupResult != "" {
+		t.Fatalf("observed successful Result was not retained: %+v", d)
+	}
+	long := strings.Repeat("\x00", 4096)
+	action, actionTruncated := mappingDiagnosticText(long, 64)
+	writeError, writeTruncated := mappingDiagnosticText(long, 512)
+	resultError, resultTruncated := mappingDiagnosticText(long, 512)
+	stream := mappingStreamDiagnostic{ObservedBytes: 1 << 30, PrefixBase64: base64.StdEncoding.EncodeToString(make([]byte, mappingDiagnosticStreamLimit)), PrefixTruncated: true}
+	maximal := mappingCommandDiagnostic{Action: action, ActionTruncated: actionTruncated, PreCleanupResult: &resultError, PreCleanupResultTruncated: resultTruncated, WriteError: writeError, WriteErrorTruncated: writeTruncated, Stdout: stream, Stderr: stream}
+	bounded := mappingDiagnosticFrom(t, encodeMappingDiagnostic(maximal))
+	if !bounded.details.ActionTruncated || !bounded.details.WriteErrorTruncated || !bounded.details.PreCleanupResultTruncated {
+		t.Fatal("bounded text omitted its truncation facts")
+	}
+}
+
+type mappingReadOnlyReader struct{ io.Reader }
+
+func TestMappingCaptureCopyCannotBypassTheOutputBound(t *testing.T) {
+	var capture mappingBoundedBuffer
+	input := strings.Repeat("x", mappingByteLimit+16)
+	n, err := io.Copy(&capture, mappingReadOnlyReader{strings.NewReader(input)})
+	if err == nil || n != mappingByteLimit || capture.Len() != mappingByteLimit {
+		t.Fatalf("io.Copy bypassed output bound: n=%d captured=%d err=%v", n, capture.Len(), err)
+	}
+	d := capture.diagnostic()
+	if d.ObservedBytes != int64(len(input)) || !d.PrefixTruncated || string(mappingDiagnosticPrefix(t, d)) != input[:mappingDiagnosticStreamLimit] {
+		t.Fatalf("read/write observations invented a complete stream: %+v", d)
+	}
+	var single mappingBoundedBuffer
+	if _, err := single.Write([]byte(input)); err == nil {
+		t.Fatal("oversized writer input was accepted")
+	}
+	if d := single.diagnostic(); d.ObservedBytes != int64(len(input)) || len(mappingDiagnosticPrefix(t, d)) != mappingDiagnosticStreamLimit || single.Len() != 0 {
+		t.Fatalf("rejected write lost its observed prefix: %+v", d)
+	}
+}
+
+func TestMappingStageMarkersKeepSuccessReceiptUnchanged(t *testing.T) {
+	for _, stage := range []string{"entry", "before-readline", "after-readline", "before-json", "after-json", "before-owner", "after-owner", "before-import", "after-import", "before-inventory", "after-inventory", "after-result"} {
+		marker := "[Console]::Error.WriteLine('RFS-MAPPING/1 " + stage + "')"
+		if strings.Count(mappingPowerShell, marker) != 1 {
+			t.Fatalf("missing or repeated fixed stderr stage: %s", stage)
+		}
+	}
+	if strings.Contains(mappingPowerShell, "ReadToEnd") || strings.Contains(mappingPowerShell, "[Console]::In.Close") || strings.Contains(mappingPowerShell, "$input") {
+		t.Fatal("diagnostic changed stdin protocol")
+	}
+	sid := mappingBaselineForTest().Owner.SID
+	want := mappingCommandResult{Status: "ok", OwnerSID: sid, Rows: []mappingRow{}}
+	data, _ := json.Marshal(want)
+	process := mappingReplyChild(string(data))
+	process.stderr = io.NopCloser(strings.NewReader("RFS-MAPPING/1 entry\nRFS-MAPPING/1 after-result\n"))
+	result, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingCommandRequest{Action: "inventory", OwnerSID: sid})
+	if err != nil || !reflect.DeepEqual(result, want) || process.finished != 1 || process.input.closes != 1 {
+		t.Fatalf("normal result/owner changed: result=%+v err=%v", result, err)
 	}
 }
