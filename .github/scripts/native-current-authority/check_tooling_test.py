@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
+import base64
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import sys
 import tempfile
 import unittest
@@ -53,7 +54,10 @@ class CheckAccountingTests(unittest.TestCase):
         self.output = self.directory / ".tmp/native-current-authority-fixture/unit-windows/mapping-startup"
         self.output.mkdir(parents=True)
         stream = {"observed_bytes": 0, "prefix_base64": "", "prefix_truncated": False}
-        self.diagnostic = {"action": "inventory", "action_truncated": False,
+        self.diagnostic = {"action": "inventory", "action_truncated": False, "eof_requested": False,
+                           "cleanup_confirmed": True, "workers_started": 3, "workers_joined": 3,
+                           "input_bytes": 219, "input_sha256": "b" * 64,
+                           "script_utf16_units": 3793, "script_utf16le_sha256": "c" * 64,
                            "stdout_observed": stream.copy(), "stderr_observed": stream.copy()}
         self.cold = [
             {"kind": "smb-host", "status": "ok", "sid": "S-1-5-21-1000"},
@@ -69,7 +73,7 @@ class CheckAccountingTests(unittest.TestCase):
         source = self.directory / ".github/scripts/native-current-authority/check-tooling.py"
         source.parent.mkdir(parents=True)
         source.write_text("source-bound checker")
-        self.sources = {str(source.relative_to(self.directory)): checks.checksum(source)}
+        self.sources = {source.relative_to(self.directory).as_posix(): checks.checksum(source)}
         self.manifest = {"source_sha": self.source_sha, "source_dirty": False, "source_files": self.sources.copy()}
         self.manifest_path = self.directory / ".tmp/native-current-authority-fixture/artifact/manifest.json"
         self.manifest_path.parent.mkdir(parents=True)
@@ -100,8 +104,9 @@ class CheckAccountingTests(unittest.TestCase):
         self.prerequisite()
         config, provenance = self.admit()
         self.assertEqual(set(config), {"format", *self.identity, "prior_evidence_directory", "evidence_directory",
-                                       "owner_sid", "initial_inventory_diagnostic"})
+                                       "owner_sid", "initial_inventory_error", "initial_inventory_diagnostic"})
         self.assertEqual(config["initial_inventory_diagnostic"], self.diagnostic)
+        self.assertEqual(config["initial_inventory_error"], self.cold[-1]["error"])
         self.assertEqual(config["owner_sid"], "S-1-5-21-1000")
         self.assertEqual(config["prior_evidence_directory"], str(self.prior))
         self.assertEqual(provenance["fixture_failure"], self.receipt["cause"])
@@ -131,7 +136,7 @@ class CheckAccountingTests(unittest.TestCase):
                 with self.assertRaises((ValueError, FileNotFoundError)):
                     self.admit()
 
-    def test_prerequisite_rejects_later_inventory_streams_and_unknown_cleanup(self):
+    def test_prerequisite_rejects_later_inventory_non_timeout_and_unknown_cleanup(self):
         self.prerequisite()
         original_cold, original_events = json.dumps(self.cold), json.dumps(self.events)
         mutations = (
@@ -164,6 +169,159 @@ class CheckAccountingTests(unittest.TestCase):
                 (self.prior / "receipt.json").write_text(data)
                 with self.assertRaises(ValueError):
                     self.admit()
+
+    def capture(self, data):
+        return {"observed_bytes": len(data), "prefix_base64": base64.b64encode(data[:2048]).decode("ascii"),
+                "prefix_truncated": len(data) > 2048}
+
+    def inventory_error(self, diagnostic, first_line="context deadline exceeded"):
+        return first_line + "\nmapping command diagnostic: " + json.dumps(diagnostic)
+
+    def update_inventory(self):
+        self.cold[-1]["error"] = self.inventory_error(self.diagnostic)
+        self.write_prerequisite()
+
+    def test_prerequisite_admits_observed_109_byte_timeout(self):
+        self.prerequisite()
+        prefix = (b"RFS-MAPPING/1 entry\r\nRFS-MAPPING/1 before-readline\r\n"
+                  b"RFS-MAPPING/1 after-readline\r\nRFS-MAPPING/1 before-json\r\n")
+        self.assertEqual(len(prefix), 109)
+        self.diagnostic["stderr_observed"] = self.capture(prefix)
+        self.update_inventory()
+        config, provenance = self.admit()
+        self.assertEqual(config["initial_inventory_diagnostic"]["stderr_observed"], self.capture(prefix))
+        self.assertEqual(config["initial_inventory_error"], self.cold[-1]["error"])
+        self.assertEqual(provenance["cold_failure"], self.cold[-1]["error"])
+
+    def test_prerequisite_admits_every_inventory_prefix_and_unclassified_capture(self):
+        self.prerequisite()
+        stages = ("entry", "before-readline", "after-readline", "before-json", "after-json", "before-owner",
+                  "after-owner", "before-import", "after-import", "before-inventory", "after-inventory", "after-result")
+        source = (checks.TOOLS / "smb_mapping_windows.go.txt").read_text()
+        for stage in stages:
+            self.assertIn("WriteLine('RFS-MAPPING/1 " + stage + "')", source)
+        for count in range(len(stages) + 1):
+            with self.subTest(marker_count=count):
+                prefix = b"".join(("RFS-MAPPING/1 " + stage + "\r\n").encode() for stage in stages[:count])
+                self.diagnostic["stderr_observed"] = self.capture(prefix)
+                self.update_inventory()
+                self.admit()
+        for data in (b"RFS-MAPPING/1 bef", b"arbitrary stdout\n", b"\xff\x00\xfe", b"x" * 2048, b"x" * 2049, b"x" * 4096):
+            for stream in ("stdout_observed", "stderr_observed"):
+                with self.subTest(stream=stream, count=len(data)):
+                    self.diagnostic[stream] = self.capture(data)
+                    self.update_inventory()
+                    config, _ = self.admit()
+                    self.assertEqual(config["initial_inventory_diagnostic"][stream], self.capture(data))
+
+    def test_inventory_capture_rejects_inconsistent_counts_base64_and_flags(self):
+        malformed = [
+            {}, {"observed_bytes": None, "prefix_base64": "", "prefix_truncated": False},
+            {"observed_bytes": True, "prefix_base64": "", "prefix_truncated": False},
+            {"observed_bytes": 0.0, "prefix_base64": "", "prefix_truncated": False},
+            {"observed_bytes": -1, "prefix_base64": "", "prefix_truncated": False},
+            {"observed_bytes": 1 << 63, "prefix_base64": "", "prefix_truncated": False},
+            {"observed_bytes": 1, "prefix_base64": "eA==\n", "prefix_truncated": False},
+            {"observed_bytes": 1, "prefix_base64": "eB==", "prefix_truncated": False},
+            {"observed_bytes": 1, "prefix_base64": "!", "prefix_truncated": False},
+            {"observed_bytes": 1, "prefix_base64": "é", "prefix_truncated": False},
+            {"observed_bytes": 0, "prefix_base64": "", "prefix_truncated": 0},
+            {"observed_bytes": 0, "prefix_base64": "", "prefix_truncated": None},
+            {"observed_bytes": 0, "prefix_base64": "", "prefix_truncated": True},
+            {"observed_bytes": 1, "prefix_base64": "", "prefix_truncated": False},
+            {**self.capture(b"x" * 2049), "prefix_truncated": False},
+            {**self.capture(b"x" * 2049), "prefix_base64": base64.b64encode(b"x" * 2049).decode()},
+            {**self.capture(b""), "unexpected": True},
+        ]
+        self.prerequisite()
+        for number, stream in enumerate(malformed):
+            with self.subTest(number=number):
+                self.diagnostic["stdout_observed"] = stream
+                self.update_inventory()
+                with self.assertRaises(ValueError):
+                    self.admit()
+        checks.validate_capture({"observed_bytes": (1 << 63) - 1,
+                                 "prefix_base64": base64.b64encode(b"x" * 2048).decode(), "prefix_truncated": True})
+
+    def test_inventory_timeout_uses_original_first_line_and_confirmed_cleanup(self):
+        self.prerequisite()
+        for first in ("process exited 1", "context canceled", "prefix context deadline exceeded", "", "context deadline exceeded\r"):
+            with self.subTest(first=first):
+                diagnostic = {**self.diagnostic, "stderr_observed": self.capture(b"context deadline exceeded\n")}
+                self.cold[-1]["error"] = self.inventory_error(diagnostic, first)
+                self.write_prerequisite()
+                with self.assertRaisesRegex(ValueError, "original command timeout"):
+                    self.admit()
+        original = self.diagnostic.copy()
+        cases = (("action", "create"), ("action_truncated", True), ("eof_requested", True),
+                 ("cleanup_confirmed", False), ("cleanup_confirmed", None), ("workers_started", False),
+                 ("workers_joined", None), ("workers_started", 4), ("workers_joined", 2), ("workers_started", -1))
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                self.diagnostic = {**original, key: value}
+                self.update_inventory()
+                with self.assertRaises(ValueError):
+                    self.admit()
+        for key in ("cleanup_confirmed", "workers_started", "workers_joined", "eof_requested"):
+            with self.subTest(missing=key):
+                self.diagnostic = original.copy()
+                del self.diagnostic[key]
+                self.update_inventory()
+                with self.assertRaises(ValueError):
+                    self.admit()
+
+    def test_prelaunch_timeout_retains_unavailable_input_script_and_child_facts(self):
+        self.prerequisite()
+        self.diagnostic.update(input_bytes=0, input_sha256="", script_utf16_units=0, script_utf16le_sha256="",
+                               workers_started=0, workers_joined=0)
+        self.update_inventory()
+        config, _ = self.admit()
+        self.assertEqual(config["initial_inventory_diagnostic"], self.diagnostic)
+        for name in ("pid", "launch"):
+            self.assertNotIn(name, config["initial_inventory_diagnostic"])
+        for key, value in (("input_bytes", None), ("input_bytes", True), ("input_bytes", 4097),
+                           ("input_bytes", 1), ("input_sha256", "b" * 64),
+                           ("script_utf16_units", 1 << 63), ("script_utf16le_sha256", "c" * 64)):
+            with self.subTest(key=key, value=value):
+                bad = {**self.diagnostic, key: value}
+                with self.assertRaises(ValueError):
+                    checks.validate_inventory_timeout(self.inventory_error(bad), bad)
+        for key in ("input_bytes", "input_sha256", "script_utf16_units", "script_utf16le_sha256"):
+            with self.subTest(missing=key):
+                bad = self.diagnostic.copy()
+                del bad[key]
+                with self.assertRaises(ValueError):
+                    checks.validate_inventory_timeout(self.inventory_error(bad), bad)
+
+    def test_windows_ten_source_keys_match_posix_manifest_without_fallback(self):
+        expected_names = ("probe.go.txt", "smb_observer.go.txt", "private_windows.go.txt", "smb_probe_windows.go.txt",
+                          "smb_mapping_windows.go.txt", "controller_windows.go.txt", "mapping_startup_diagnostic_windows_test.go.txt",
+                          "check-tooling.py", "build-image.py", "check_windows.py")
+        actual = tuple(name + ".txt" for name in checks.diagnostic_templates()) + ("check-tooling.py", "build-image.py", "check_windows.py")
+        self.assertEqual(actual, expected_names)
+        expected = checks.source_hashes([checks.TOOLS / name for name in expected_names])
+        root = PureWindowsPath("C:/a/remote-fs/remote-fs")
+        paths = [root / name for name in expected]
+        self.assertEqual(sum(str(path.relative_to(root)) not in expected for path in paths), 10)
+        with (mock.patch.object(checks, "ROOT", root),
+              mock.patch.object(checks, "checksum", side_effect=lambda path: expected[path.relative_to(root).as_posix()])):
+            self.assertEqual(checks.source_hashes(paths), expected)
+
+    def test_prerequisite_rejects_noncanonical_manifest_keys_and_bad_hashes(self):
+        self.prerequisite()
+        original = self.manifest["source_files"].copy()
+        bad_keys = ("packages\\smb\\server.go", "/packages/smb/server.go", "packages//smb/server.go",
+                    "./packages/smb/server.go", "packages/../server.go", "C:/packages/server.go", ".", "")
+        for name in bad_keys:
+            with self.subTest(name=name):
+                self.manifest["source_files"] = {**original, name: "d" * 64}
+                self.write_prerequisite()
+                with self.assertRaisesRegex(ValueError, "canonical POSIX"):
+                    self.admit()
+        self.manifest["source_files"] = {next(iter(original)): "D" * 64}
+        self.write_prerequisite()
+        with self.assertRaisesRegex(ValueError, "lowercase SHA256"):
+            self.admit()
 
     def diagnostic_events(self, fail=None):
         root = checks.DIAGNOSTIC_ROOT
@@ -229,7 +387,7 @@ class CheckAccountingTests(unittest.TestCase):
         sources += [tools / name for name in ("check-tooling.py", "build-image.py", "check_windows.py")]
         for path in sources:
             path.write_text("fixture source: " + path.name)
-        self.sources = {str(path.relative_to(self.directory)): checks.checksum(path) for path in sources}
+        self.sources = {path.relative_to(self.directory).as_posix(): checks.checksum(path) for path in sources}
         self.manifest["source_files"] = self.sources.copy()
         if invalid_prior:
             self.receipt["source_sha"] = "f" * 40
@@ -242,6 +400,7 @@ class CheckAccountingTests(unittest.TestCase):
             self.assertEqual(directory, self.directory)
             config = json.loads(Path(env["RFS_MAPPING_STARTUP_CONFIG"]).read_text())
             self.assertEqual(config["initial_inventory_diagnostic"], self.diagnostic)
+            self.assertEqual(config["initial_inventory_error"], self.cold[-1]["error"])
             if command == ["go", "version"]:
                 if early_error:
                     raise RuntimeError(early_error)
@@ -256,6 +415,8 @@ class CheckAccountingTests(unittest.TestCase):
             log.write_text("\n".join(json.dumps(row) for row in self.diagnostic_events(fail)))
             if not native_missing:
                 native = {"format": 1, **self.identity, "status": "failed" if fail else "passed",
+                          "initial_inventory_error": config["initial_inventory_error"],
+                          "initial_inventory_diagnostic": config["initial_inventory_diagnostic"],
                           "aborted": False, "cleanup_confirmed": True, "cells": list(checks.DIAGNOSTIC_CELLS)}
                 (self.output / "mapping-startup.json").write_text(json.dumps(native))
             if fail:

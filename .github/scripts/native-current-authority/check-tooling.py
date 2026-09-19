@@ -2,11 +2,13 @@
 """Compile and test the hidden fixture templates with exact root/verdict accounting."""
 
 import argparse
+import base64
+import binascii
 import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
@@ -24,6 +26,18 @@ DIAGNOSTIC_TEMPLATE = "mapping_startup_diagnostic_windows_test.go"
 
 def checksum(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def source_hashes(paths):
+    return {path.relative_to(ROOT).as_posix(): checksum(path) for path in paths}
+
+
+def canonical_source_key(name):
+    if (not isinstance(name, str) or not name or "\\" in name or ":" in name
+            or PurePosixPath(name).is_absolute() or ".." in PurePosixPath(name).parts
+            or PurePosixPath(name).as_posix() != name or name == "."):
+        raise ValueError("source manifest key is not a canonical POSIX relative path: " + repr(name))
+    return name
 
 
 def run(args, directory, log, env, timeout=180, on_abort=None):
@@ -132,6 +146,44 @@ def bounded_text(path, limit):
     return data.decode("utf-8")
 
 
+def validate_capture(stream):
+    if not isinstance(stream, dict) or set(stream) != {"observed_bytes", "prefix_base64", "prefix_truncated"}:
+        raise ValueError("inventory capture lacks its exact count/prefix/truncation fields")
+    count, encoded, truncated = stream["observed_bytes"], stream["prefix_base64"], stream["prefix_truncated"]
+    if type(count) is not int or not 0 <= count <= (1 << 63) - 1:
+        raise ValueError("inventory capture byte count is not a nonnegative signed 64-bit integer")
+    if not isinstance(encoded, str) or len(encoded) > 2732 or type(truncated) is not bool:
+        raise ValueError("inventory capture has an invalid prefix or truncation flag")
+    try:
+        prefix = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise ValueError("inventory capture prefix is not canonical base64") from error
+    if (base64.b64encode(prefix).decode("ascii") != encoded or len(prefix) != min(count, 2048)
+            or truncated != (count > len(prefix))):
+        raise ValueError("inventory capture count, bounded prefix and truncation disagree")
+
+
+def validate_inventory_timeout(error, diagnostic):
+    if not isinstance(error, str) or error.split("\n", 1)[0] != "context deadline exceeded":
+        raise ValueError("initial inventory failure is not an original command timeout")
+    if (not isinstance(diagnostic, dict) or diagnostic.get("action") != "inventory"
+            or diagnostic.get("action_truncated") is not False or diagnostic.get("eof_requested") is not False):
+        raise ValueError("cold mapping failure is not the initial open-input inventory")
+    for name in ("stdout_observed", "stderr_observed"):
+        validate_capture(diagnostic.get(name))
+    started, joined = diagnostic.get("workers_started"), diagnostic.get("workers_joined")
+    if (diagnostic.get("cleanup_confirmed") is not True or type(started) is not int or type(joined) is not int
+            or not 0 <= started <= 3 or joined != started):
+        raise ValueError("initial inventory cleanup or worker joins are unconfirmed")
+    for count_key, hash_key, maximum in (("input_bytes", "input_sha256", 4096),
+                                         ("script_utf16_units", "script_utf16le_sha256", (1 << 63) - 1)):
+        count, digest = diagnostic.get(count_key), diagnostic.get(hash_key)
+        if type(count) is not int or not 0 <= count <= maximum or not isinstance(digest, str):
+            raise ValueError("initial inventory lacks valid input/script observation fields")
+        if (count == 0 and digest != "") or (count > 0 and not re.fullmatch(r"[0-9a-f]{64}", digest)):
+            raise ValueError("initial inventory input/script observation length and hash disagree")
+
+
 def diagnostic_prerequisite(run_id, source_sha, output, sources):
     if not re.fullmatch(r"[0-9]+-[0-9]+", run_id) or not re.fullmatch(r"[0-9a-f]{40}", source_sha):
         raise ValueError("diagnostic requires the workflow run/attempt and source SHA")
@@ -173,22 +225,20 @@ def diagnostic_prerequisite(run_id, source_sha, output, sources):
         raise ValueError("cold child or mapping recovery cleanup is unconfirmed")
     marker = "mapping command diagnostic: "
     error = result.get("error", "")
-    if error.count(marker) != 1:
+    if not isinstance(error, str) or error.count(marker) != 1:
         raise ValueError("cold failure must contain exactly one mapping diagnostic")
     diagnostic = strict_json(error.split(marker, 1)[1])
-    if diagnostic.get("action") != "inventory" or diagnostic.get("action_truncated") is not False:
-        raise ValueError("cold mapping failure is not the initial inventory")
-    for name in ("stdout_observed", "stderr_observed"):
-        stream = diagnostic.get(name)
-        if (stream != {"observed_bytes": 0, "prefix_base64": "", "prefix_truncated": False}
-                or type(stream["observed_bytes"]) is not int or stream["prefix_truncated"] is not False):
-            raise ValueError("cold inventory captured entry or stream bytes")
+    validate_inventory_timeout(error, diagnostic)
     if (prior / "smb-mapping.json").exists():
         raise ValueError("cold inventory left a mapping ledger")
     manifest = strict_json(bounded_text(manifest_path, 4 << 20))
     if manifest.get("source_sha") != source_sha or manifest.get("source_dirty") is not False:
         raise ValueError("diagnostic source manifest differs from the failed cold source")
-    if any(manifest["source_files"].get(path) != value for path, value in sources.items()):
+    for name, digest in manifest["source_files"].items():
+        canonical_source_key(name)
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("source manifest digest is not a lowercase SHA256: " + name)
+    if any(manifest["source_files"].get(canonical_source_key(path)) != value for path, value in sources.items()):
         raise ValueError("diagnostic template/checker bytes differ from the cold source manifest")
     for name, expected in manifest["source_files"].items():
         path = ROOT / name
@@ -197,10 +247,10 @@ def diagnostic_prerequisite(run_id, source_sha, output, sources):
             raise ValueError("diagnostic dependency bytes differ from the cold source manifest: " + name)
     config = {"format": 1, **identity, "prior_evidence_directory": str(prior),
               "evidence_directory": str(output), "owner_sid": host["sid"],
-              "initial_inventory_diagnostic": diagnostic}
+              "initial_inventory_error": error, "initial_inventory_diagnostic": diagnostic}
     if len(json.dumps(config).encode()) > 64 << 10:
         raise ValueError("diagnostic config exceeds 64 KiB")
-    provenance = {"files": {str(path.relative_to(ROOT)): checksum(path) for path in [*paths, manifest_path]},
+    provenance = {"files": source_hashes([*paths, manifest_path]),
                   "source_files": manifest["source_files"], "cold_failure": error,
                   "fixture_failure": receipt["cause"], "identity": identity}
     return config, provenance
@@ -283,7 +333,7 @@ def run_startup_diagnostic(args, output, env):
         files = diagnostic_templates()
         source_paths = [TOOLS / (name + ".txt") for name in files]
         source_paths += [TOOLS / name for name in ("check-tooling.py", "build-image.py", "check_windows.py")]
-        receipt["sources"] = {str(path.relative_to(ROOT)): checksum(path) for path in source_paths}
+        receipt["sources"] = source_hashes(source_paths)
         config, receipt["prerequisite"] = diagnostic_prerequisite(
             args.run_id, args.source_sha, output, receipt["sources"])
         config_path = output / "mapping-startup-config.json"
@@ -315,7 +365,8 @@ def run_startup_diagnostic(args, output, env):
         native_path = output / "mapping-startup.json"
         native = strict_json(bounded_text(native_path, 1 << 20))
         receipt["native_receipt"] = {"sha256": checksum(native_path), "details": native}
-        if any(native.get(key) != config[key] for key in ("format", "run_id", "source_sha", "fixture_nonce")):
+        if any(native.get(key) != config[key] for key in ("format", "run_id", "source_sha", "fixture_nonce",
+                                                        "initial_inventory_error", "initial_inventory_diagnostic")):
             raise ValueError("native startup receipt differs from the admitted cold evidence")
         if native.get("status") != "passed" or native.get("aborted") is not False or native.get("cleanup_confirmed") is not True:
             receipt["errors"].append("native startup cells failed or cleanup is unconfirmed")
@@ -396,7 +447,7 @@ def main():
         hashes = {}
         for filename in files:
             source = TOOLS / (filename + ".txt")
-            hashes[str(source.relative_to(ROOT))] = checksum(source)
+            hashes[source.relative_to(ROOT).as_posix()] = checksum(source)
             shutil.copyfile(source, directory / filename)
         inventory = run(["go", "test", "-count=1", "-list", "^Test", str(directory)], ROOT, directory / "inventory.log", env, timeout=120)
         (directory / "inventory.txt").write_text(inventory)

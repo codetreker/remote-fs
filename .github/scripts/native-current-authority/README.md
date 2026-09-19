@@ -204,15 +204,18 @@ mismatch. Recovery preserves the original failed result. Ordinary success closes
 the native HANDLE, removes the mapping, calls Shutdown, joins Serve, Unpublishes
 the export, closes idle HTTP connections and verifies remote/local cleanup.
 
-[The first cold run 35434023125](https://github.com/codetreker/remote-fs/actions/runs/35434023125)
-failed at initial `Get-SmbMapping` inventory before any observed creation intent,
-current SMB traffic or native file call. [The captured run 35437123318](https://github.com/codetreker/remote-fs/actions/runs/35437123318)
-on source `5beb09c2fa5b514adaffa22a184ee7bf9f99bf97` reached the same unchanged
-four-second command deadline after 4009 ms. The parent wrote all 219 request
-bytes; the joined workers captured zero stdout/stderr bytes and no entry marker.
-The waiter had not published Done before cleanup. These facts establish neither
-child input consumption nor a particular startup or module stage. Recovery and
-disk cleanup do not qualify current-SMB or one-second acceptance.
+[The captured run 35439665455](https://github.com/codetreker/remote-fs/actions/runs/35439665455)
+on source `ece38307e58b515a2778a9eae3738bb161d669b0` failed its initial
+inventory after 4010 ms with 219 input bytes written and ResumeThread previous
+count 1. Its 109 stderr bytes contain entry, before-readline, after-readline and
+before-json markers; no after-json marker was observed. The input JSON and script
+hashes are valid, but the child's parsed value and command/module resolution are
+unknown. The four diagnostic cells did not run because the then-required empty
+capture predicate rejected this evidence. This remains a failed cold run before
+observed mapping effects, SMB traffic or native file calls. The earlier
+[5beb captured failure](https://github.com/codetreker/remote-fs/actions/runs/35437123318)
+had zero captured stream bytes at 4009 ms; neither result proves an EOF or JSON
+conversion cause. Recovery does not qualify current-SMB or one-second acceptance.
 
 Mapping failures retain a bounded diagnostic after the owned child is finished
 and all three I/O workers join. It records action, actual PID when available,
@@ -232,15 +235,33 @@ context-cancellable. Image hashing and PE inspection occur after the experiment
 and describe the on-disk file then, not every byte loaded by an earlier child.
 
 [Startup diagnostics](mapping_startup_diagnostic_windows_test.go.txt) run only
-after the actual cold attempt has failed and saved source/run-bound evidence
-qualifies an initial inventory failure with no observed entry or stream bytes.
-The tagged test is absent from normal unit and production catalogs. Its four
+after the actual cold attempt has failed and saved source/run/nonce-bound evidence
+qualifies an initial inventory command timeout, no mapping/SMB/native effects,
+and settled cleanup with all started workers joined. The original first error
+line must be exactly `context deadline exceeded`. Both streams may contain valid
+bounded captures: canonical base64 for exactly min(observed bytes, 2048) prefix
+bytes and a matching truncation flag. Contents cannot grant successful mapping;
+partial or unknown stage text remains unclassified. Original input/script facts,
+when present, must match; unavailable facts remain unavailable. Manifest keys are
+strict POSIX-relative paths produced on both platforms, with exact hashes and no
+separator fallback. The tagged test is absent from normal unit and production
+catalogs. Its four
 sequential cells run once each: minimal immediate entry/result with stdin open,
 the same script with EOF, exact read-only inventory with stdin open, then the
 same inventory with EOF. Each gets the unchanged four-second command deadline
 and existing owned cleanup. EOF follows one complete successful write and is
 closed once by the same owner used by Finish; short writes and close errors fail.
 The ordinary mapping path keeps its original open-stdin policy.
+
+At each diagnostic delegated Start, a non-owning adapter records only
+`PSModulePath`, `WinPSModulePath` and `PSModuleAnalysisCachePath`, then calls the
+same owner once. Presence, UTF-8 length, SHA256, at most 4096 prefix bytes encoded as base64,
+and truncation are separate facts; absent values are not invented. The adapter
+changes no environment and observes the existing NUL cache setting in its spawn
+scope. These are later diagnostic launch facts, not the earlier cold process's
+unrecorded environment or proof of module resolution. Only the tagged diagnostic
+receipt has a 256 KiB bound for this data; command capture and executor limits
+remain unchanged.
 
 Each cell joins its process and three workers before the next; unknown Job
 quiescence stops further launches. The cells record their order, actual creation
