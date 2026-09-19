@@ -958,38 +958,11 @@ func TestListingADirectoryNothingHasLookedInsideYet(t *testing.T) {
 // two stats and never observe the numbers the listing itself carries.
 func listedInodes(t *testing.T, dir string) map[string]uint64 {
 	t.Helper()
-	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	listed, err := directoryInodes(dir, directoryCalls{open: unix.Open, getdents: unix.Getdents, close: unix.Close})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer unix.Close(fd)
-
-	listed := map[string]uint64{}
-	buf := make([]byte, 8192)
-	for {
-		n, err := unix.Getdents(fd, buf)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if n == 0 {
-			return listed
-		}
-		for offset := 0; offset < n; {
-			entry := (*unix.Dirent)(unsafe.Pointer(&buf[offset]))
-			offset += int(entry.Reclen)
-			name := make([]byte, 0, len(entry.Name))
-			for _, c := range entry.Name {
-				if c == 0 {
-					break
-				}
-				name = append(name, byte(c))
-			}
-			if string(name) == "." || string(name) == ".." {
-				continue
-			}
-			listed[string(name)] = entry.Ino
-		}
-	}
+	return listed
 }
 
 // ino is the number the mount reports for one path. It does not follow a link: the number

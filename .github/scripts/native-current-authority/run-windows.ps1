@@ -35,10 +35,17 @@ if (-not $artifact.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase
     throw 'Artifacts must be downloaded under the repository .tmp/native-current-authority-fixture directory.'
 }
 function Assert-NoReparse([string] $Path) {
-    $item = Get-Item -LiteralPath $Path -Force
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     while ($null -ne $item) {
+        if ($item -is [IO.DirectoryInfo]) {
+            $parent = $item.Parent
+        } elseif ($item -is [IO.FileInfo]) {
+            $parent = $item.Directory
+        } else {
+            throw "Unsupported filesystem item type: $($item.GetType().FullName)"
+        }
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Reparse path is forbidden: $($item.FullName)" }
-        if ($item.PSIsContainer) { $item = $item.Parent } else { $item = $item.Directory }
+        $item = $parent
     }
 }
 Assert-NoReparse $artifact

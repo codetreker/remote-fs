@@ -16,6 +16,8 @@
 
 普通对拍中的六处时间设置调用使用 [`comparisonChtimes`](../packages/fuse/fuse_test.go)：每处 `os.Chtimes` 的总尝试次数至多八次，仅在上一次返回 `EINTR` 时重做完全相同的路径、绝对 atime 与 mtime，包括明确省略某个时间的参数。挂载点和普通目录使用同一规则，只重试这一次调用；其它错误立即返回，八次仍中断则保留最后的 `EINTR` 并使对拍失败。这里比较最终的 atime / mtime，ctime 不在对拍结果中。专门验证中断的真实信号用例继续断言第一次系统调用的结果，不使用这个辅助函数。
 
+目录 inode 对照使用[原始目录 helper](../packages/fuse/directory_listing_test.go)：每次 Open/Getdents 最多尝试八次，只重试该次 EINTR；Getdents 保持同一 fd、buffer、当前 offset 和已有名字映射，不从头重枚举。有效 buffer 下已交付条目以正长度批次返回并只解析一次，EINTR 没有可重放的批次。其它错误和耗尽的 EINTR 立即保留操作/路径及原因，已打开 fd 只 Close 一次，Close 错误也使结果失败。四个根、11 个 verdict 的普通/race 检查含两项未改断言的真实挂载用例；分别去掉 Open 或 Getdents 的单调用处理都会命中对应确定性中断断言。此规则不修改生产取消分类，也不用于专门核对首个中断的信号用例；[阶段语义](../.agents/notes/implemented/bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)继续独立拥有未知效果与关闭规则。
+
 对拍失败保留双方原错误的类型与文本。模式修改复合步骤先 WriteFile 再 Chmod，失败后才用独立五秒 context 查询 backing 属性及至多 32 字节内容；这些是失败后的额外观察，不重试原操作、不改变原来的失败判定。仍未解释的 EIO 由[独立调查](../.agents/notes/proposed/testing/2026-09-09-trace-unexplained-fuse-eio.md)记录，不能从步骤名称或未复现的批次推断原因。
 
 ## CI 工具链与缓存
@@ -401,7 +403,9 @@ go vet ./packages/smb ./packages/smb/internal/wire ./packages/smb/internal/signi
 
 readiness 经真实 HTTP lease/FileSession 检查原子打开、字节、metadata 条件、retained rename/unlink 与逻辑 quota，然后停止并普通重开同一磁盘，验证 sentinel 的 ID/字节/metadata。成功要求实际 authority/QEMU 退出、guest sync/unmount、整个 Job 清空、流排空、私有磁盘删除和基底不变；监听端口或单独的根进程退出不能代替它们。Windows 收尾在根退出后最多五秒等待实际 job-zero，失败/超时才强制结束并最多再用五秒确认，总预算十秒不变；forced 始终使结果失败。Job accounting 的 ABI/ReturnLength 和唯一 waiter 的进程 handle 关闭归属分别验证。该工具始终把 native_acceptance 标为未运行，不能充当 SMB 或一秒可见性门禁。
 
-[模板测试入口](../.github/scripts/native-current-authority/check-tooling.py)显式列举隐藏 Go 模板的根和 verdict，普通 module 发现不覆盖它们。已有 Linux 模板普通验证为 36 根/176 verdict，guest/probe/controller 的普通与 race 分别通过 87/63/26 verdict；Python 装配、进程拥有权和 checker 共 26 根；结构化源码发现只从 stdout 解码，依赖下载等 stderr 诊断单独流出，失败退出仍传播，不能把合法诊断混入 JSON 或丢弃。一次本地 Linux TCG 真正启动、HTTP readiness、普通重启和完整关闭通过；来源明确为本地脏 artifact，不冒充未来 CI commit。Windows helper 已观察到 probe 63 个通过 verdict、controller 30 个通过 verdict 和正常 Job 收尾 leaf/根失败；native DACL 用例通过，但不能称全部 Windows helper 通过。QEMU/Prism、HTTP guest 组合和 SMB/缓存验收尚未执行。Job rundown 的三个 AST 提取根普通/race 各 11 个 verdict 通过，立即强制清理的负向对照按预期失败，vet 与两个 Windows 架构构建通过；修正后的 native 收尾仍待实测。mock/交叉构建、已执行的 Windows helper 与 Linux VM 结果分别记录。[决定](../.agents/notes/implemented/testing/2026-09-19-current-authority-virtual-machine-fixture.md)说明与固定原型诊断的分工，普通重启不宣称断电可靠性。
+[模板测试入口](../.github/scripts/native-current-authority/check-tooling.py)显式列举隐藏 Go 模板的根和 verdict，普通 module 发现不覆盖它们。已有 Linux 模板普通验证为 36 根/176 verdict，guest/probe/controller 的普通与 race 分别通过 87/63/26 verdict；Python 装配、进程拥有权和 checker 共 26 根；结构化源码发现只从 stdout 解码，依赖下载等 stderr 诊断单独流出，失败退出仍传播，不能把合法诊断混入 JSON 或丢弃。一次本地 Linux TCG 真正启动、HTTP readiness、普通重启和完整关闭通过；来源明确为本地脏 artifact，不冒充未来 CI commit。[Windows helper 运行 35420677792](https://github.com/codetreker/remote-fs/actions/runs/35420677792)的 controller/probe 分别取得 44/63 个通过 verdict；路径祖先检查在 QEMU 启动前失败，不能把 helper 通过当作 QEMU/Prism、HTTP guest 或 SMB/缓存验收。Job rundown 的三个 AST 提取根普通/race 各 11 个 verdict、因果负向对照、vet 与两个 Windows 架构构建分别保留来源。mock/交叉构建、已执行的 Windows helper 与 Linux VM 结果分别记录。[决定](../.agents/notes/implemented/testing/2026-09-19-current-authority-virtual-machine-fixture.md)说明与固定原型诊断的分工，普通重启不宣称断电可靠性。
+
+[路径 guard 回归](../.github/scripts/native-current-authority/run_windows_test.ps1)从实际脚本抽取唯一 Assert-NoReparse 的 FunctionDefinitionAst，在 StrictMode 下直接执行。入口及逐级祖先使用真实 DirectoryInfo/FileInfo 类型，不能依赖只有 provider 初始对象才有的 PSIsContainer；路径不存在、非文件系统 provider、文件或祖先 reparse 均拒绝。工作流在 VM 前运行此检查。本地九项通过，原 guard 对照在 raw DirectoryInfo 父链失败；Windows 专属的三个 junction 场景尚待原生执行，不扩大为整段 bootstrap 通过。
 
 ### Windows 原生 SMB 缓存诊断
 

@@ -116,6 +116,7 @@ jobs:
           if ((& go version) -notmatch 'go1\.26\.8 windows/arm64') { throw 'Go 1.26.8 is required.' }
           python -u .github/scripts/native-current-authority/check-tooling.py --output .tmp/native-current-authority-fixture/unit-windows
           if ($LASTEXITCODE -ne 0) { throw 'Native fixture unit checks failed.' }
+          ./.github/scripts/native-current-authority/run_windows_test.ps1 | Tee-Object -FilePath .tmp/native-current-authority-fixture/unit-windows/path-guard.jsonl
       - name: Verify the current HTTP authority across an ordinary restart
         shell: pwsh
         run: ./.github/scripts/native-current-authority/run-windows.ps1 -ArtifactDirectory .tmp/native-current-authority-fixture/artifact -RunId "${{ github.run_id }}-${{ github.run_attempt }}"
