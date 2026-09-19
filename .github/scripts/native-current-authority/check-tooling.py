@@ -20,7 +20,8 @@ TOOLS = Path(__file__).resolve().parent
 WINDOWS_JOB = None
 DIAGNOSTIC_ROOT = "TestMappingPowerShellStartupDiagnostic"
 DIAGNOSTIC_TAG = "rfs_mapping_startup_diagnostic"
-DIAGNOSTIC_CELLS = ("01_entry_open", "02_entry_eof", "03_inventory_open", "04_inventory_eof")
+DIAGNOSTIC_CELLS = ("01_entry_open", "02_entry_eof", "03_inventory_open", "04_inventory_eof",
+                    "05_resolve_json_command", "06_import_utility_parse")
 DIAGNOSTIC_TEMPLATE = "mapping_startup_diagnostic_windows_test.go"
 
 

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -717,22 +718,41 @@ func TestMappingExecutionRetainsPartialLaunchAndReturnedChild(t *testing.T) {
 
 func TestMappingStartupCellsOrderAndCleanupAdmission(t *testing.T) {
 	request := mappingCommandRequest{Action: "inventory", Module: "same-module", OwnerSID: "same-owner"}
-	for _, failCleanup := range []bool{false, true} {
-		t.Run(fmt.Sprint(failCleanup), func(t *testing.T) {
+	wantPlan := [6]mappingStartupCell{
+		{Name: "01_entry_open", Kind: mappingStartupEntry, Script: mappingStartupEntryScript, CloseInput: false, Entry: "RFS-MAPPING/1 entry-only", Result: `{"status":"entry-ok"}`},
+		{Name: "02_entry_eof", Kind: mappingStartupEntry, Script: mappingStartupEntryScript, CloseInput: true, Entry: "RFS-MAPPING/1 entry-only", Result: `{"status":"entry-ok"}`},
+		{Name: "03_inventory_open", Kind: mappingStartupInventory, Script: mappingPowerShell, CloseInput: false, Entry: "RFS-MAPPING/1 entry", Result: ""},
+		{Name: "04_inventory_eof", Kind: mappingStartupInventory, Script: mappingPowerShell, CloseInput: true, Entry: "RFS-MAPPING/1 entry", Result: ""},
+		{Name: "05_resolve_json_command", Kind: mappingStartupResolve, Script: mappingStartupResolveScript, CloseInput: false, Entry: "RFS-CMD/1 entry resolve", Result: `{"status":"resolve-ok"}`},
+		{Name: "06_import_utility_parse", Kind: mappingStartupImport, Script: "", CloseInput: false, Entry: "RFS-CMD/1 entry import-parse", Result: `{"status":"import-parse-ok"}`},
+	}
+	if got := mappingStartupPlan(); !reflect.DeepEqual(got, wantPlan) {
+		t.Fatal("startup diagnostic differs from the six explicit descriptors")
+	}
+	for _, failCleanupAt := range []int{0, 2, 4, 5} {
+		t.Run(fmt.Sprintf("cleanup-failure-at-%d", failCleanupAt), func(t *testing.T) {
 			var names, inputHashes []string
-			starts, failures := 0, 0
+			starts, failures, preparations := 0, 0, 0
 			aborted := walkMappingStartupCells(func(ordinal int, cell mappingStartupCell) bool {
 				names = append(names, cell.Name)
-				if ordinal != len(names) || cell.CloseInput != (ordinal%2 == 0) {
-					t.Fatal("cell order or input policy changed")
+				if ordinal != len(names) || cell != wantPlan[ordinal-1] {
+					t.Fatal("cell order or explicit descriptor changed")
 				}
-				if ordinal <= 2 && cell.Script != mappingStartupEntryScript || ordinal > 2 && cell.Script != mappingPowerShell {
-					t.Fatal("cell script changed")
+				if cell.Kind == mappingStartupImport {
+					preparations++
+					var err error
+					cell.Script, err = mappingStartupImportScript(mappingStartupManifestForTest(t, "Microsoft.PowerShell.Utility.psd1"))
+					if err != nil || cell.Script == "" {
+						t.Fatal("deferred import cell did not produce its explicit script")
+					}
 				}
 				process := mappingReplyChild("fixed\n")
 				process.inputOverride = &ownedProcessInput{pipe: process.input}
 				process.forced = ordinal == 1
-				if failCleanup && ordinal == 2 {
+				if ordinal == 5 {
+					process.result = errors.New("resolution failed with known cleanup")
+				}
+				if ordinal == failCleanupAt {
 					process.finishErr = errors.New("job empty not confirmed")
 				}
 				host := &mappingCommandHost{child: process}
@@ -753,12 +773,15 @@ func TestMappingStartupCellsOrderAndCleanupAdmission(t *testing.T) {
 				inputHashes = append(inputHashes, execution.Diagnostic.InputSHA256)
 				return execution.Diagnostic.CleanupConfirmed
 			})
-			want := []string{"01_entry_open", "02_entry_eof", "03_inventory_open", "04_inventory_eof"}
-			if failCleanup {
-				want = want[:2]
+			want := []string{"01_entry_open", "02_entry_eof", "03_inventory_open", "04_inventory_eof", "05_resolve_json_command", "06_import_utility_parse"}
+			if failCleanupAt != 0 {
+				want = want[:failCleanupAt]
 			}
-			if !reflect.DeepEqual(names, want) || starts != len(want) || aborted != failCleanup || failures < 1 {
+			if !reflect.DeepEqual(names, want) || starts != len(want) || aborted != (failCleanupAt != 0) || failures < 1 {
 				t.Fatalf("cell admission: names=%v starts=%d aborted=%v failures=%d", names, starts, aborted, failures)
+			}
+			if failCleanupAt == 0 && (preparations != 1 || failures != 2) || failCleanupAt != 0 && preparations != 0 {
+				t.Fatal("late import preparation ran before admission or clean resolution failure blocked it")
 			}
 			for _, hash := range inputHashes {
 				if hash != inputHashes[0] {
@@ -773,6 +796,180 @@ func TestMappingStartupCellsOrderAndCleanupAdmission(t *testing.T) {
 		}
 	}
 }
+
+func TestMappingStartupOriginalScriptsUnchanged(t *testing.T) {
+	for _, test := range []struct {
+		name, script, utf8Hash, utf16Hash string
+		units                             int
+	}{
+		{"inventory", mappingPowerShell, "ccc8528406b85636a4c94395967d3d10f6feaa0f771f0d2b6cb8160b0a67735f", "4d8dacf3ab7ac9e1c8dceb4abfab92d0ea4f75ad60a81e2d2285d33725f3f73c", 8906},
+		{"entry", mappingStartupEntryScript, "35832e1ac6f9fced065027493bc3faeeae304d06106463a728437a95c1328999", "136335e08a760524367812d41bc9362ad286105bb37a9661fdeb8ec6b21f09c7", 105},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			words := utf16.Encode([]rune(test.script))
+			encoded := make([]byte, 2*len(words))
+			for index, word := range words {
+				binary.LittleEndian.PutUint16(encoded[2*index:], word)
+			}
+			if len(words) != test.units || fmt.Sprintf("%x", sha256.Sum256([]byte(test.script))) != test.utf8Hash || fmt.Sprintf("%x", sha256.Sum256(encoded)) != test.utf16Hash {
+				t.Fatal("an original diagnostic script changed while adding post-failure controls")
+			}
+		})
+	}
+}
+
+func TestMappingStartupResultKinds(t *testing.T) {
+	request := mappingCommandRequest{Action: "inventory", OwnerSID: mappingBaselineForTest().Owner.SID}
+	inventory, err := json.Marshal(mappingCommandResult{Status: "ok", OwnerSID: request.OwnerSID, Rows: []mappingRow{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cell := range mappingStartupPlan() {
+		t.Run(cell.Name, func(t *testing.T) {
+			valid := []byte(cell.Result + "\r\n")
+			if cell.Kind == mappingStartupInventory {
+				valid = append(append([]byte(nil), inventory...), '\n')
+			}
+			if err := validateMappingStartupResult(cell, valid, request); err != nil {
+				t.Fatalf("correct cell-specific result rejected: %v", err)
+			}
+			for _, invalid := range [][]byte{nil, []byte(`{"status":"wrong-kind"}`), append(append([]byte(nil), valid...), []byte(`{"extra":true}`)...)} {
+				if err := validateMappingStartupResult(cell, invalid, request); err == nil {
+					t.Fatal("cell accepted missing, foreign or trailing output")
+				}
+			}
+			forged := cell
+			forged.Result = `{"status":"forged"}`
+			forgedOutput := []byte(forged.Result)
+			if cell.Kind == mappingStartupInventory {
+				forgedOutput = inventory
+			}
+			if err := validateMappingStartupResult(forged, forgedOutput, request); err == nil {
+				t.Fatal("cell accepted a reforged expected result")
+			}
+			unknown := cell
+			unknown.Kind = mappingStartupKind("unknown")
+			if err := validateMappingStartupResult(unknown, valid, request); err == nil {
+				t.Fatal("unknown cell kind selected a fallback validator")
+			}
+			if cell.Kind == mappingStartupInventory {
+				foreign := request
+				foreign.OwnerSID = "different-owner"
+				if err := validateMappingStartupResult(cell, inventory, foreign); err == nil {
+					t.Fatal("inventory kind bypassed ordinary owner validation")
+				}
+			} else if err := validateMappingStartupResult(cell, inventory, request); err == nil {
+				t.Fatal("fixed-result control accepted an inventory receipt")
+			}
+		})
+	}
+}
+
+func mappingStartupManifestForTest(t *testing.T, name string) string {
+	t.Helper()
+	path, err := filepath.Abs(filepath.Join("command-control-fixture", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestMappingStartupManifestPathEncoding(t *testing.T) {
+	for _, path := range []string{
+		mappingStartupManifestForTest(t, "Microsoft.PowerShell.Utility.psd1"),
+		mappingStartupManifestForTest(t, "literal'quoted;`$name-模块🧪.psd1"),
+	} {
+		script, err := mappingStartupImportScript(path)
+		if err != nil || script == "" {
+			t.Fatal("absolute manifest path did not produce an import control")
+		}
+		encoded := base64.StdEncoding.EncodeToString([]byte(path))
+		if strings.Count(script, encoded) != 1 || strings.Contains(script, path) || !strings.Contains(script, "[Convert]::FromBase64String('"+encoded+"')") {
+			t.Fatal("manifest path was interpolated as PowerShell syntax or lost its single encoded binding")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil || string(decoded) != path {
+			t.Fatal("manifest path did not preserve its UTF-8 bytes")
+		}
+		if strings.Count(script, "$request = $requestLine | ConvertFrom-Json") != 1 || strings.Contains(script, "Get-Command") {
+			t.Fatal("import control replaced its original JSON pipeline or added discovery")
+		}
+	}
+	for _, invalid := range []string{"", "relative.psd1", `C:relative.psd1`, `\root-relative.psd1`, "C:\\invalid\x00.psd1", "C:\\invalid\xff.psd1"} {
+		if script, err := mappingStartupImportScript(invalid); err == nil || script != "" {
+			t.Fatal("invalid manifest path produced an executable or fallback script")
+		}
+	}
+}
+
+func TestMappingCommandControlScriptOperations(t *testing.T) {
+	importScript, err := mappingStartupImportScript(mappingStartupManifestForTest(t, "Microsoft.PowerShell.Utility.psd1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, script := range []string{mappingStartupResolveScript, importScript} {
+		for _, helper := range []string{"Get-RfsCommandTextFact", "Write-RfsCommandFact", "Format-RfsCommandText", "Write-RfsCommandUnsupported", "Write-RfsCommandProvenance"} {
+			if strings.Count(script, "function "+helper) != 1 {
+				t.Fatalf("control lost its bounded diagnostic helper: %s", helper)
+			}
+		}
+		for _, forbidden := range []string{"Get-SmbMapping", "New-SmbMapping", "Remove-SmbMapping", "ConvertTo-Json", "ReadToEnd", "$input", ".Parameters", ".ParameterSets", ".Definition", ".ExportedCommands", "SetEnvironmentVariable"} {
+			if strings.Contains(script, forbidden) {
+				t.Fatalf("control added an out-of-scope operation: %s", forbidden)
+			}
+		}
+		if strings.Count(script, "$requestLine = [Console]::In.ReadLine()") != 1 || !strings.HasSuffix(script, mappingCommandFailure) {
+			t.Fatal("control changed its one-line input or shared failed-result path")
+		}
+		if err := mappingObservationOrder(script,
+			"$implementingType = $Command.ImplementingType", "$assembly = $implementingType.Assembly",
+			"$mvid = $implementingType.Module.ModuleVersionId.ToString('D')",
+			"$moduleName = $null", "$moduleVersion = $null", "$modulePath = $null", "if ($null -ne $Module)"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const resolution = `Microsoft.PowerShell.Core\Get-Command -Name ConvertFrom-Json -ErrorAction Stop`
+	if strings.Count(mappingStartupResolveScript, resolution) != 1 || strings.Contains(mappingStartupResolveScript, "Import-Module") || strings.Contains(mappingStartupResolveScript, "$request = $requestLine | ConvertFrom-Json") {
+		t.Fatal("resolution control changed its exact query or invoked JSON conversion")
+	}
+	for _, forbidden := range []string{" -All", " -ArgumentList", " -CommandType"} {
+		if strings.Contains(mappingStartupResolveScript, forbidden) {
+			t.Fatalf("resolution control changed command selection: %s", forbidden)
+		}
+	}
+	if err := mappingObservationOrder(mappingStartupResolveScript,
+		"'RFS-CMD/1 entry resolve'", "$requestLine = [Console]::In.ReadLine()", "$rfsCommandStage = 'resolve'",
+		"'RFS-CMD/1 before-resolution'", resolution, "'RFS-CMD/1 after-resolution'", "if ($commands.Count -ne 1",
+		"$rfsCommandStage = 'provenance'", "'RFS-CMD/1 before-provenance'",
+		"Write-RfsCommandProvenance $commands[0] $commands[0].Module 'resolved-command'",
+		"'RFS-CMD/1 after-provenance'", "$rfsCommandStage = 'result'",
+		`[Console]::Out.WriteLine('{"status":"resolve-ok"}')`, "'RFS-CMD/1 complete resolve'"); err != nil {
+		t.Fatal(err)
+	}
+	const importCommand = `Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -PassThru -ErrorAction Stop`
+	if strings.Count(importScript, importCommand) != 1 || strings.Contains(importScript, " -Force") || strings.Contains(importScript, "Get-Command") {
+		t.Fatal("import control changed its explicit import or added rediscovery")
+	}
+	if err := mappingObservationOrder(importScript,
+		"'RFS-CMD/1 entry import-parse'", "$requestLine = [Console]::In.ReadLine()", "$utilityManifest =",
+		"$rfsCommandStage = 'import'", "'RFS-CMD/1 before-import'", importCommand, "'RFS-CMD/1 after-import'",
+		"if ($modules.Count -ne 1", "$rfsCommandStage = 'provenance'", "'RFS-CMD/1 before-provenance'",
+		"$command = $modules[0].ExportedCmdlets['ConvertFrom-Json']", "if ($null -eq $command",
+		"Write-RfsCommandProvenance $command $modules[0] 'imported-export'", "'RFS-CMD/1 after-provenance'",
+		"$rfsCommandStage = 'parse'", "'RFS-CMD/1 before-parse'", "$request = $requestLine | ConvertFrom-Json",
+		"'RFS-CMD/1 after-parse'", "$rfsCommandStage = 'result'",
+		`[Console]::Out.WriteLine('{"status":"import-parse-ok"}')`, "'RFS-CMD/1 complete import-parse'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mappingObservationOrder(mappingCommandFailure,
+		"catch {\n    $primaryError = $_\n    $primaryStage = $rfsCommandStage", "try {",
+		"'RFS-CMD/1 error-begin stage={0}'", "Get-RfsCommandTextFact $primaryError.Exception.GetType().FullName 64",
+		"Get-RfsCommandTextFact $primaryError.FullyQualifiedErrorId 64", "'RFS-CMD/1 error-end'",
+		"} catch {", "'RFS-CMD/1 observer-failure'", "} finally {", "exit 1"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func mappingReplyChild(reply string) *mappingCommandChild {
 	p := &mappingCommandChild{input: &mappingInputBuffer{}, output: io.NopCloser(strings.NewReader(reply)), stderr: io.NopCloser(strings.NewReader("")), done: make(chan struct{})}
 	close(p.done)
@@ -1214,14 +1411,14 @@ func TestMappingObservationScriptOwnershipAndOrder(t *testing.T) {
 	}
 }
 
-func mappingObservationFormatForTest(t *testing.T, prefix string, values ...string) string {
+func mappingScriptFormatForTest(t *testing.T, source, prefix string, values ...string) string {
 	t.Helper()
 	needle := "'" + prefix
-	if strings.Count(mappingPowerShell, needle) != 1 {
+	if strings.Count(source, needle) != 1 {
 		t.Fatalf("record format is missing or ambiguous: %s", prefix)
 	}
-	start := strings.Index(mappingPowerShell, needle) + 1
-	format, _, found := strings.Cut(mappingPowerShell[start:], "'")
+	start := strings.Index(source, needle) + 1
+	format, _, found := strings.Cut(source[start:], "'")
 	if !found {
 		t.Fatal("record format has no closing quote")
 	}
@@ -1232,6 +1429,90 @@ func mappingObservationFormatForTest(t *testing.T, prefix string, values ...stri
 		t.Fatalf("record format has unbound fields: %s", prefix)
 	}
 	return format
+}
+
+func mappingObservationFormatForTest(t *testing.T, prefix string, values ...string) string {
+	t.Helper()
+	return mappingScriptFormatForTest(t, mappingPowerShell, prefix, values...)
+}
+
+func TestMappingCommandControlStderrGrammarBound(t *testing.T) {
+	script, err := mappingStartupImportScript(mappingStartupManifestForTest(t, "Microsoft.PowerShell.Utility.psd1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(script, "RFS-CMD/1 ") != 19 || strings.Count(mappingStartupResolveScript, "RFS-CMD/1 ") != 17 {
+		t.Fatal("control record inventory changed without a new byte accounting")
+	}
+	record := func(prefix string, values ...string) string {
+		return mappingScriptFormatForTest(t, script, "RFS-CMD/1 "+prefix, values...) + "\r\n"
+	}
+	const maximumLength = "2147483647"
+	textFields := func(name string, limit int) string {
+		prefix := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, limit))
+		return mappingScriptFormatForTest(t, script, "{0}_state={1}", name, "value", maximumLength, prefix, "1")
+	}
+	var provenance strings.Builder
+	provenance.WriteString(record("command role={", "resolved-command"))
+	for _, fact := range []struct {
+		name, expression string
+		limit            int
+	}{
+		{"module_name", "$moduleName", 64}, {"module_version", "$moduleVersion", 48}, {"module_path", "$modulePath", 96},
+		{"implementing_type", "$implementingType.FullName", 96}, {"assembly_name", "$assembly.FullName", 112}, {"assembly_location", "$assembly.Location", 96},
+	} {
+		call := fmt.Sprintf("Write-RfsCommandFact '%s' %s %d", fact.name, fact.expression, fact.limit)
+		if strings.Count(mappingCommandPrelude, call) != 1 {
+			t.Fatalf("provenance field or prefix cap changed: %s", fact.name)
+		}
+		prefix := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, fact.limit))
+		provenance.WriteString(record("fact name={0} state={1}", fact.name, "value", maximumLength, prefix, "1"))
+	}
+	provenance.WriteString(record("mvid value={", "ffffffff-ffff-ffff-ffff-ffffffffffff"))
+	var stages strings.Builder
+	for _, stage := range []string{"entry import-parse", "before-readline", "after-readline", "before-import", "after-import", "before-provenance", "after-provenance", "before-parse", "after-parse", "complete import-parse"} {
+		stages.WriteString(record(stage))
+	}
+	var resolveStages strings.Builder
+	for _, stage := range []string{"entry resolve", "before-readline", "after-readline", "before-resolution", "after-resolution", "before-provenance", "after-provenance", "complete resolve"} {
+		resolveStages.WriteString(mappingScriptFormatForTest(t, mappingStartupResolveScript, "RFS-CMD/1 "+stage) + "\r\n")
+	}
+	if resolveStages.Len() > stages.Len() {
+		t.Fatal("resolution stages exceed the selected combined stage bound")
+	}
+	failure := record("error-begin stage={", "provenance") + record("error-end") + record("observer-failure") + record("error {", textFields("type", 64), textFields("id", 64))
+	maximum := provenance.String() + stages.String() + failure
+	unsupported := stages.String() + record("unsupported count={", maximumLength, textFields("name", 64), textFields("kind", 32)) + failure
+	if len(maximum) != 2008 || len(unsupported) != 935 || len(maximum) > mappingDiagnosticStreamLimit || len(unsupported) > mappingDiagnosticStreamLimit {
+		t.Fatalf("control grammar exceeds its declared bounds: provenance=%d unsupported=%d limit=%d", len(maximum), len(unsupported), mappingDiagnosticStreamLimit)
+	}
+	for _, output := range []string{maximum, unsupported} {
+		for _, value := range output {
+			if value > 127 {
+				t.Fatal("control record contains unencoded variable text")
+			}
+		}
+		var buffer mappingBoundedBuffer
+		if n, err := buffer.Write([]byte(output)); err != nil || n != len(output) {
+			t.Fatal("control record did not fit the unchanged capture")
+		}
+		diagnostic := buffer.diagnostic()
+		if diagnostic.PrefixTruncated || string(mappingDiagnosticPrefix(t, diagnostic)) != output {
+			t.Fatal("generated control records were truncated within the declared budget")
+		}
+	}
+	nullField := func(name string) string {
+		return mappingScriptFormatForTest(t, script, "{0}_state=null", name)
+	}
+	for _, output := range []string{
+		record("fact name={0} state=null", "module_path"),
+		record("unsupported count={", "0", nullField("name"), nullField("kind")),
+		record("error {", nullField("type"), nullField("id")),
+	} {
+		if strings.Contains(output, "16=") || strings.Contains(output, "_b64=") || strings.Contains(output, "cut=") {
+			t.Fatal("null control fact invented length or prefix observations")
+		}
+	}
 }
 
 func TestMappingObservationStderrGrammarBound(t *testing.T) {

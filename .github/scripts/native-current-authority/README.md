@@ -204,22 +204,20 @@ mismatch. Recovery preserves the original failed result. Ordinary success closes
 the native HANDLE, removes the mapping, calls Shutdown, joins Serve, Unpublishes
 the export, closes idle HTTP connections and verifies remote/local cleanup.
 
-[The source-bound run 35446688647](https://github.com/codetreker/remote-fs/actions/runs/35446688647)
-on `26ba565b43b9c9569a7aad5e303a9290b7a9e61d` passed the native private-writer
-and Go-child environment tests. Its nested 27,917-byte diagnostic report was
-persisted and cell/checker cleanup completed. The earlier protected-parent DACL
-defect is closed, but initial inventory still failed at 4010 ms before-json.
-Post-VM entry/open and entry/EOF passed in 248/186 ms; both inventory cells failed
-at 4019 ms despite the configured System32 Modules/NUL input, including completed
-EOF in the last cell. Parent-inherited and configured-child facts remain separate.
+[The source-bound run 35449538972](https://github.com/codetreker/remote-fs/actions/runs/35449538972)
+on `a5ad2d9dfc8f6a9fbcde84fa30e7ee0fc1d56368` completed the new script
+observations natively. Its child ReadLine had 218 UTF-16 units/UTF-8 bytes and the
+same no-LF SHA256 as the parent. The complete effective module path contained
+AllUsers and System32 Windows PowerShell roots; WinPSModulePath was null and the
+cache path NUL. Original and inventory controls emitted the same complete
+761-byte record ending before-json, with no catch/failure/after-json marker.
 
-Those facts do not identify the child's ReadLine value, effective runtime module
-path, command resolution or catch branch. The catch also serializes JSON, so the
-last before-json marker does not establish a parser hang. Original SMB resources
-and recovery settled; forced QEMU cleanup keeps the overall run failed despite
-disk removal and an unchanged pristine image. Prior failures retain their result.
-Current-SMB mapping, cold object access and one-second cache acceptance remain
-unproved.
+The original inventory still failed at 4010 ms. Post-VM entry controls passed in
+234/178 ms; inventory controls failed in 4020/4019 ms. The 32,165-byte nested
+report and confirmed cleanup do not change that failure. The earlier native
+private-writer and Go-child environment proof remains valid, while command
+discovery/autoload, binding, execution and assignment remain unresolved. No
+current-SMB mapping, cold object or one-second cache acceptance has passed.
 
 Mapping failures retain a bounded diagnostic after the owned child is finished
 and all three I/O workers join. It records action, actual PID when available,
@@ -254,9 +252,10 @@ The maximum-branch formatter projection, including existing markers and CRLF,
 is bounded at 1981 bytes within the existing 2048-byte captured prefix. PowerShell's own extra error
 output may still be truncated. Observer work consumes the same four seconds;
 framework initialization and console writes have no separate latency guarantee.
-No operation, import, environment policy, stdin/owner behavior or diagnostic cell
-is changed, and no command-discovery or prewarming call is added. These new
-observations have not yet run under native Windows PowerShell.
+The original mapping script keeps its operations, imports, environment policy and
+stdin/owner behavior. Its observation statements add no discovery or prewarming
+call; the separately labeled post-failure controls below perform those additional
+operations only after the measured attempt.
 
 The Windows owner records CreateProcess, Job assignment and ResumeThread timings
 and errors. ResumeThread must return the previous suspend count 1. The retained
@@ -276,12 +275,44 @@ partial or unknown stage text remains unclassified. Original input/script facts,
 when present, must match; unavailable facts remain unavailable. Manifest keys are
 strict POSIX-relative paths produced on both platforms, with exact hashes and no
 separator fallback. The tagged test is absent from normal unit and production
-catalogs. Its four sequential cells run once each: minimal immediate entry/result with stdin open,
-the same script with EOF, exact read-only inventory with stdin open, then the
-same inventory with EOF. Each gets the unchanged four-second command deadline
-and existing owned cleanup. EOF follows one complete successful write and is
-closed once by the same owner used by Finish; short writes and close errors fail.
-The ordinary mapping path keeps its original open-stdin policy.
+catalogs. Six sequential cells each run once, with an explicit kind and expected
+result. The first four scripts, names, order and EOF policies are unchanged:
+entry/open, entry/EOF, inventory/open and inventory/EOF. The added cells are:
+
+- `05_resolve_json_command`: Core-qualified Get-Command selects the exact
+  ConvertFrom-Json name without All or a command-type filter. It requires one
+  Cmdlet result and records that target's implementing type/assembly/MVID and
+  nullable module facts. Alias, Function, missing or multiple results fail without
+  following or invoking another target. Success is the fixed `resolve-ok` JSON
+  literal, not JSON parsing.
+- `06_import_utility_parse`: after cell 5 has settled, prepare the verified
+  System32 Utility manifest and Core-qualified Import-Module it by absolute path,
+  with PassThru and without Force. Require one expected module, inspect its exact
+  exported ConvertFrom-Json cmdlet, then execute the unchanged unqualified JSON
+  pipeline. The fixed `import-parse-ok` result proves its return, not that lookup
+  selected the recorded export or that the full request was validated.
+
+Cell 6's same four-second deadline begins before manifest preparation. Existing
+non-reparse/regular-file checks and a bounded 1 MiB read record its on-disk size
+and SHA256, with read/close errors retained. It is prepared only at that ordinal;
+missing or invalid Utility cannot block the cold attempt or cells 1–5. Synchronous
+file calls are not claimed interruptible. A known no-process preparation failure
+has no invented PID; unknown cleanup stops admission. No fallback script or import
+by name is used.
+
+Both new cells retain the inventory input, open stdin, executable, arguments,
+per-child environment and owner. Discovery/autoload and imports can run module
+code and perform I/O; these are active post-failure experiments. Provenance is
+bounded nullable metadata, not loaded-code hashes, signatures or proof of the
+original command selection. Fixed control results and errors use Console/.NET
+without JSON serialization; errors keep their original record and exit one even
+if reporting also fails. Generated maximum-branch records project 2008 bytes
+within the unchanged 2048-byte prefix; engine output may still be truncated.
+
+EOF in the original EOF cells follows one complete successful write and is closed
+once by the same owner used by Finish. Short writes and close errors fail. Every
+cell retains the four-second command budget and existing owned cleanup; successful
+later controls cannot erase earlier failures. The two new native cells have not run.
 
 Mapping PowerShell children use an explicit Unicode environment block through
 the existing process owner. A private snapshot removes case-insensitive copies
@@ -304,7 +335,7 @@ facts; absent values are not invented. It delegates once to the same owner and
 does not expose other environment entries. These later facts cannot reconstruct
 the earlier cold process's unrecorded environment.
 
-The tagged report is capped at 256 KiB including LF and written only to
+The tagged report is capped at 1 MiB including LF and written only to
 `OUTPUT/native-evidence/mapping-startup.json`. Go exclusively creates that fixed
 protected child directory, creates the file exclusively and seals it before
 payload write, sync and close. The checker reads the same fixed nested path.
@@ -317,7 +348,8 @@ Go-child delivery; it did not establish cold or cache acceptance.
 Each cell joins its process and three workers before the next; unknown Job
 quiescence stops further launches. The cells record their order, actual creation
 count, request/script hashes, launch facts, capture and cleanup. No create/remove,
-intent ledger, mapping change or native file I/O is allowed. The original cold
+intent ledger, mapping change or target-file operation is requested by these
+control scripts; module discovery/import may have its own side effects. The original cold
 failure remains failed even if later cells succeed. The experiment runs after VM
 shutdown and SMB cleanup attempts, under different load; later cells may be warmed
 by earlier launches. Its results cannot alone identify the original cold cause.

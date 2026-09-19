@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -1290,19 +1291,211 @@ const mappingStartupEntryScript = `[Console]::Error.WriteLine('RFS-MAPPING/1 ent
 [Console]::Out.WriteLine('{"status":"entry-ok"}')
 `
 
-type mappingStartupCell struct {
-	Name       string
-	Script     string
-	CloseInput bool
+const mappingCommandPrelude = `$ErrorActionPreference = 'Stop'
+$WarningPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+Set-StrictMode -Version Latest
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$rfsCommandStage = 'input'
+function Get-RfsCommandTextFact($Value, [int]$Limit) {
+    if ($null -eq $Value) { return @{state='null'} }
+    $text = [string]$Value
+    $units = [Math]::Min($text.Length, $Limit + 1)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($text.Substring(0, $units))
+    $length = [Math]::Min($bytes.Length, $Limit)
+    $prefix = [byte[]]::new($length)
+    [Array]::Copy($bytes, $prefix, $length)
+    $cut = [int]($text.Length -gt $units -or $bytes.Length -gt $Limit)
+    $state = if ($text.Length -eq 0) { 'empty' } else { 'value' }
+    return @{state=$state; utf16=$text.Length; prefix=[Convert]::ToBase64String($prefix); truncated=$cut}
+}
+function Write-RfsCommandFact([string]$Name, $Value, [int]$Limit) {
+    $fact = Get-RfsCommandTextFact $Value $Limit
+    if ($fact.state -eq 'null') {
+        [Console]::Error.WriteLine(('RFS-CMD/1 fact name={0} state=null' -f $Name))
+    } else {
+        [Console]::Error.WriteLine(('RFS-CMD/1 fact name={0} state={1} utf16={2} prefix_b64={3} truncated={4}' -f $Name,$fact.state,$fact.utf16,$fact.prefix,$fact.truncated))
+    }
+}
+function Format-RfsCommandText([string]$Label, $Fact) {
+    if ($Fact.state -eq 'null') { return ('{0}_state=null' -f $Label) }
+    return ('{0}_state={1} {0}16={2} {0}_b64={3} {0}cut={4}' -f $Label,$Fact.state,$Fact.utf16,$Fact.prefix,$Fact.truncated)
+}
+function Write-RfsCommandUnsupported([int]$Count, $Name, $Kind) {
+    $nameFact = Get-RfsCommandTextFact $Name 64
+    $kindFact = Get-RfsCommandTextFact $Kind 32
+    [Console]::Error.WriteLine(('RFS-CMD/1 unsupported count={0} {1} {2}' -f $Count,(Format-RfsCommandText 'name' $nameFact),(Format-RfsCommandText 'kind' $kindFact)))
+}
+function Write-RfsCommandProvenance([System.Management.Automation.CmdletInfo]$Command, $Module, [string]$Role) {
+    $implementingType = $Command.ImplementingType
+    if ($null -eq $implementingType) { throw 'resolved cmdlet has no implementing type' }
+    $assembly = $implementingType.Assembly
+    $mvid = $implementingType.Module.ModuleVersionId.ToString('D')
+    $moduleName = $null
+    $moduleVersion = $null
+    $modulePath = $null
+    if ($null -ne $Module) {
+        $moduleName = $Module.Name
+        if ($null -ne $Module.Version) { $moduleVersion = $Module.Version.ToString() }
+        $modulePath = $Module.Path
+    }
+    [Console]::Error.WriteLine(('RFS-CMD/1 command role={0} name=ConvertFrom-Json kind=Cmdlet' -f $Role))
+    Write-RfsCommandFact 'module_name' $moduleName 64
+    Write-RfsCommandFact 'module_version' $moduleVersion 48
+    Write-RfsCommandFact 'module_path' $modulePath 96
+    Write-RfsCommandFact 'implementing_type' $implementingType.FullName 96
+    Write-RfsCommandFact 'assembly_name' $assembly.FullName 112
+    Write-RfsCommandFact 'assembly_location' $assembly.Location 96
+    [Console]::Error.WriteLine(('RFS-CMD/1 mvid value={0}' -f $mvid))
+}
+`
+
+const mappingCommandFailure = `catch {
+    $primaryError = $_
+    $primaryStage = $rfsCommandStage
+    try {
+        [Console]::Error.WriteLine(('RFS-CMD/1 error-begin stage={0}' -f $primaryStage))
+        $typeFact = Get-RfsCommandTextFact $primaryError.Exception.GetType().FullName 64
+        $idFact = Get-RfsCommandTextFact $primaryError.FullyQualifiedErrorId 64
+        [Console]::Error.WriteLine(('RFS-CMD/1 error {0} {1}' -f (Format-RfsCommandText 'type' $typeFact),(Format-RfsCommandText 'id' $idFact)))
+        [Console]::Error.WriteLine('RFS-CMD/1 error-end')
+    } catch {
+        [Console]::Error.WriteLine('RFS-CMD/1 observer-failure')
+    } finally {
+        exit 1
+    }
+}
+`
+
+const mappingStartupResolveScript = `[Console]::Error.WriteLine('RFS-CMD/1 entry resolve')
+` + mappingCommandPrelude + `try {
+    [Console]::Error.WriteLine('RFS-CMD/1 before-readline')
+    $requestLine = [Console]::In.ReadLine()
+    [Console]::Error.WriteLine('RFS-CMD/1 after-readline')
+    if ($null -eq $requestLine) { throw 'missing control input line' }
+    $rfsCommandStage = 'resolve'
+    [Console]::Error.WriteLine('RFS-CMD/1 before-resolution')
+    $commands = @(Microsoft.PowerShell.Core\Get-Command -Name ConvertFrom-Json -ErrorAction Stop)
+    [Console]::Error.WriteLine('RFS-CMD/1 after-resolution')
+    $actualName = $null
+    $actualKind = $null
+    if ($commands.Count -gt 0) { $actualName = $commands[0].Name; $actualKind = [string]$commands[0].CommandType }
+    if ($commands.Count -ne 1 -or $actualName -cne 'ConvertFrom-Json' -or $commands[0] -isnot [System.Management.Automation.CmdletInfo] -or $commands[0].CommandType -ne [System.Management.Automation.CommandTypes]::Cmdlet) {
+        Write-RfsCommandUnsupported $commands.Count $actualName $actualKind
+        throw 'command resolution did not return the requested cmdlet'
+    }
+    $rfsCommandStage = 'provenance'
+    [Console]::Error.WriteLine('RFS-CMD/1 before-provenance')
+    Write-RfsCommandProvenance $commands[0] $commands[0].Module 'resolved-command'
+    [Console]::Error.WriteLine('RFS-CMD/1 after-provenance')
+    $rfsCommandStage = 'result'
+    [Console]::Out.WriteLine('{"status":"resolve-ok"}')
+    [Console]::Error.WriteLine('RFS-CMD/1 complete resolve')
+}
+` + mappingCommandFailure
+
+func mappingStartupImportScript(manifestPath string) (string, error) {
+	if manifestPath == "" || !filepath.IsAbs(manifestPath) || strings.IndexByte(manifestPath, 0) >= 0 || !utf8.ValidString(manifestPath) {
+		return "", errors.New("Utility manifest path must be absolute valid text without NUL")
+	}
+	encodedPath := base64.StdEncoding.EncodeToString([]byte(manifestPath))
+	return `[Console]::Error.WriteLine('RFS-CMD/1 entry import-parse')
+` + mappingCommandPrelude + `try {
+    [Console]::Error.WriteLine('RFS-CMD/1 before-readline')
+    $requestLine = [Console]::In.ReadLine()
+    [Console]::Error.WriteLine('RFS-CMD/1 after-readline')
+    if ($null -eq $requestLine) { throw 'missing control input line' }
+    $utilityManifest = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('` + encodedPath + `'))
+    $rfsCommandStage = 'import'
+    [Console]::Error.WriteLine('RFS-CMD/1 before-import')
+    $modules = @(Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -PassThru -ErrorAction Stop)
+    [Console]::Error.WriteLine('RFS-CMD/1 after-import')
+    $actualName = $null
+    $actualKind = $null
+    if ($modules.Count -gt 0) {
+        $actualKind = $modules[0].GetType().FullName
+        if ($modules[0] -is [System.Management.Automation.PSModuleInfo]) { $actualName = $modules[0].Name }
+    }
+    if ($modules.Count -ne 1 -or $modules[0] -isnot [System.Management.Automation.PSModuleInfo] -or $actualName -cne 'Microsoft.PowerShell.Utility') {
+        Write-RfsCommandUnsupported $modules.Count $actualName $actualKind
+        throw 'manifest import did not return the expected Utility module'
+    }
+    $rfsCommandStage = 'provenance'
+    [Console]::Error.WriteLine('RFS-CMD/1 before-provenance')
+    $command = $modules[0].ExportedCmdlets['ConvertFrom-Json']
+    if ($null -eq $command -or $command -isnot [System.Management.Automation.CmdletInfo] -or $command.Name -cne 'ConvertFrom-Json' -or $command.CommandType -ne [System.Management.Automation.CommandTypes]::Cmdlet) {
+        $actualName = $null
+        $actualKind = $null
+        $count = 0
+        if ($null -ne $command) { $count = 1; $actualName = $command.Name; $actualKind = [string]$command.CommandType }
+        Write-RfsCommandUnsupported $count $actualName $actualKind
+        throw 'Utility module did not export the requested cmdlet'
+    }
+    Write-RfsCommandProvenance $command $modules[0] 'imported-export'
+    [Console]::Error.WriteLine('RFS-CMD/1 after-provenance')
+    $rfsCommandStage = 'parse'
+    [Console]::Error.WriteLine('RFS-CMD/1 before-parse')
+    $request = $requestLine | ConvertFrom-Json
+    [Console]::Error.WriteLine('RFS-CMD/1 after-parse')
+    $rfsCommandStage = 'result'
+    [Console]::Out.WriteLine('{"status":"import-parse-ok"}')
+    [Console]::Error.WriteLine('RFS-CMD/1 complete import-parse')
+}
+` + mappingCommandFailure, nil
 }
 
-func mappingStartupPlan() [4]mappingStartupCell {
-	return [4]mappingStartupCell{
-		{"01_entry_open", mappingStartupEntryScript, false},
-		{"02_entry_eof", mappingStartupEntryScript, true},
-		{"03_inventory_open", mappingPowerShell, false},
-		{"04_inventory_eof", mappingPowerShell, true},
+type mappingStartupKind string
+
+const (
+	mappingStartupEntry     mappingStartupKind = "entry"
+	mappingStartupInventory mappingStartupKind = "inventory"
+	mappingStartupResolve   mappingStartupKind = "resolve"
+	mappingStartupImport    mappingStartupKind = "import-parse"
+)
+
+type mappingStartupCell struct {
+	Name       string
+	Kind       mappingStartupKind
+	Script     string
+	CloseInput bool
+	Entry      string
+	Result     string
+}
+
+func mappingStartupPlan() [6]mappingStartupCell {
+	return [6]mappingStartupCell{
+		{"01_entry_open", mappingStartupEntry, mappingStartupEntryScript, false, "RFS-MAPPING/1 entry-only", `{"status":"entry-ok"}`},
+		{"02_entry_eof", mappingStartupEntry, mappingStartupEntryScript, true, "RFS-MAPPING/1 entry-only", `{"status":"entry-ok"}`},
+		{"03_inventory_open", mappingStartupInventory, mappingPowerShell, false, "RFS-MAPPING/1 entry", ""},
+		{"04_inventory_eof", mappingStartupInventory, mappingPowerShell, true, "RFS-MAPPING/1 entry", ""},
+		{"05_resolve_json_command", mappingStartupResolve, mappingStartupResolveScript, false, "RFS-CMD/1 entry resolve", `{"status":"resolve-ok"}`},
+		{"06_import_utility_parse", mappingStartupImport, "", false, "RFS-CMD/1 entry import-parse", `{"status":"import-parse-ok"}`},
 	}
+}
+
+func validateMappingStartupResult(cell mappingStartupCell, data []byte, request mappingCommandRequest) error {
+	var expected string
+	switch cell.Kind {
+	case mappingStartupInventory:
+		if cell.Result != "" {
+			return errors.New("inventory cell supplied a fixed result")
+		}
+		_, err := validateMappingResult(data, request)
+		return err
+	case mappingStartupEntry:
+		expected = `{"status":"entry-ok"}`
+	case mappingStartupResolve:
+		expected = `{"status":"resolve-ok"}`
+	case mappingStartupImport:
+		expected = `{"status":"import-parse-ok"}`
+	default:
+		return errors.New("unknown mapping startup cell kind")
+	}
+	if cell.Result != expected || strings.TrimSpace(string(data)) != expected {
+		return fmt.Errorf("%s cell omitted its fixed result", cell.Kind)
+	}
+	return nil
 }
 
 func walkMappingStartupCells(visit func(int, mappingStartupCell) bool) (aborted bool) {

@@ -17,6 +17,9 @@ SPEC.loader.exec_module(checks)
 
 
 class CheckAccountingTests(unittest.TestCase):
+    diagnostic_cells = ("01_entry_open", "02_entry_eof", "03_inventory_open", "04_inventory_eof",
+                        "05_resolve_json_command", "06_import_utility_parse")
+
     def setUp(self):
         parent = checks.ROOT / ".tmp/native-current-authority-fixture/checker-unit"
         parent.mkdir(parents=True, exist_ok=True)
@@ -329,7 +332,7 @@ class CheckAccountingTests(unittest.TestCase):
     def diagnostic_events(self, fail=None):
         root = checks.DIAGNOSTIC_ROOT
         rows = [{"Action": "run", "Test": root}]
-        for cell in checks.DIAGNOSTIC_CELLS:
+        for cell in self.diagnostic_cells:
             rows.extend(({"Action": "run", "Test": root + "/" + cell},
                          {"Action": "fail" if cell == fail else "pass", "Test": root + "/" + cell}))
         verdict = "fail" if fail else "pass"
@@ -337,16 +340,46 @@ class CheckAccountingTests(unittest.TestCase):
 
     def test_diagnostic_audit_retains_failed_cells_and_all_verdicts(self):
         path = self.directory / "diagnostic.jsonl"
-        for failing in (None, checks.DIAGNOSTIC_CELLS[0]):
+        for failing in (None, *self.diagnostic_cells):
             with self.subTest(failing=failing):
                 path.write_text("\n".join(json.dumps(row) for row in self.diagnostic_events(failing)))
                 result = checks.diagnostic_audit(path)
                 self.assertEqual(result["status"], "failed" if failing else "passed")
-                self.assertEqual(len(result["started"]), 5)
-                self.assertEqual(len(result["verdicts"]), 5)
+                self.assertEqual(result["started"], [checks.DIAGNOSTIC_ROOT, *(checks.DIAGNOSTIC_ROOT + "/" + cell for cell in self.diagnostic_cells)])
+                self.assertEqual(result["expected"], result["started"])
+                self.assertEqual(len(result["verdicts"]), 7)
                 self.assertEqual(result["missing_verdicts"], [])
                 self.assertEqual(result["not_started"], [])
                 self.assertEqual(len(result["failed"]), 2 if failing else 0)
+
+    def test_diagnostic_audit_rejects_old_four_cell_success(self):
+        path = self.directory / "diagnostic.jsonl"
+        complete = self.diagnostic_events()
+        path.write_text("\n".join(json.dumps(row) for row in complete[:9] + complete[-2:]))
+        result = checks.diagnostic_audit(path)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["not_started"], [checks.DIAGNOSTIC_ROOT + "/" + cell for cell in self.diagnostic_cells[4:]])
+        self.assertEqual(result["missing_verdicts"], [])
+
+    def test_diagnostic_audit_requires_both_new_cells_in_order_with_exact_verdicts(self):
+        path = self.directory / "diagnostic.jsonl"
+        complete = self.diagnostic_events()
+        cases = {"new-cells-reversed": complete[:9] + complete[11:13] + complete[9:11] + complete[13:]}
+        for cell in self.diagnostic_cells[4:]:
+            name = checks.DIAGNOSTIC_ROOT + "/" + cell
+            start = {"Action": "run", "Test": name}
+            verdict = {"Action": "pass", "Test": name}
+            cases[cell + "/missing-cell"] = [row for row in complete if row.get("Test") != name]
+            cases[cell + "/missing-verdict"] = [row for row in complete if row != verdict]
+            cases[cell + "/duplicate-start"] = complete + [start]
+            cases[cell + "/duplicate-verdict"] = complete + [verdict]
+            cases[cell + "/skip"] = [{**row, "Action": "skip"} if row == verdict else row for row in complete]
+        for name, rows in cases.items():
+            with self.subTest(case=name):
+                path.write_text("\n".join(json.dumps(row) for row in rows))
+                result = checks.diagnostic_audit(path)
+                self.assertEqual(result["status"], "failed")
+                self.assertTrue(result["errors"])
 
     def test_diagnostic_audit_rejects_skips_duplicates_missing_and_wrong_order(self):
         path = self.directory / "diagnostic.jsonl"
@@ -360,7 +393,7 @@ class CheckAccountingTests(unittest.TestCase):
                 self.assertEqual(checks.diagnostic_audit(path)["status"], "failed")
         path.write_text("compiler error\n")
         result = checks.diagnostic_audit(path)
-        self.assertEqual(len(result["not_started"]), 5)
+        self.assertEqual(len(result["not_started"]), 7)
         self.assertIn("invalid Go JSON event", result["errors"][0])
         for malformed in (None, [], {"Action": "run", "Test": []}, {"Action": None}, {"Action": "pass", "Test": 1}):
             with self.subTest(malformed=malformed):
@@ -424,7 +457,7 @@ class CheckAccountingTests(unittest.TestCase):
                 native = {"format": 1, **self.identity, "status": "failed" if fail else "passed",
                           "initial_inventory_error": config["initial_inventory_error"],
                           "initial_inventory_diagnostic": config["initial_inventory_diagnostic"],
-                          "aborted": False, "cleanup_confirmed": True, "cells": list(checks.DIAGNOSTIC_CELLS)}
+                          "aborted": False, "cleanup_confirmed": True, "cells": list(self.diagnostic_cells)}
                 if native_override is not None:
                     native.update(native_override)
                 native_directory = self.output if native_legacy else self.output / "native-evidence"
@@ -460,10 +493,12 @@ class CheckAccountingTests(unittest.TestCase):
         receipt, calls, job = self.diagnostic_driver(fail="01_entry_open")
         self.assertEqual(receipt["status"], "failed")
         self.assertEqual(len(calls), 3)
-        self.assertEqual(len(receipt["audit"]["verdicts"]), 5)
+        self.assertEqual(len(receipt["audit"]["verdicts"]), 7)
         self.assertEqual(receipt["audit"]["failed"], [checks.DIAGNOSTIC_ROOT + "/01_entry_open", checks.DIAGNOSTIC_ROOT])
         self.assertIn("command exited 1", receipt["errors"][0])
         self.assertEqual(receipt["prerequisite"]["fixture_failure"], self.receipt["cause"])
+        for cell in self.diagnostic_cells[4:]:
+            self.assertEqual(receipt["audit"]["verdicts"][checks.DIAGNOSTIC_ROOT + "/" + cell], "pass")
         self.assertTrue(receipt["cleanup_confirmed"])
         job.close_success.assert_called_once()
 
