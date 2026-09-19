@@ -600,6 +600,77 @@ func TestMappingExecutionInputCompletion(t *testing.T) {
 	}
 }
 
+func TestMappingInputLineDiagnosticBindsDeliveredFrame(t *testing.T) {
+	sid := mappingBaselineForTest().Owner.SID
+	maximum := mappingCommandRequest{Action: "inventory", OwnerSID: sid}
+	base, err := json.Marshal(maximum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maximum.Module = strings.Repeat("x", 4095-len(base))
+	for _, test := range []struct {
+		name    string
+		request mappingCommandRequest
+	}{
+		{"ascii", mappingCommandRequest{Action: "inventory", Module: "system-module", OwnerSID: sid}},
+		{"unicode-and-escaped-newline", mappingCommandRequest{Action: "inventory", Module: "模块🧪\r\nmanifest", OwnerSID: sid}},
+		{"empty-fields", mappingCommandRequest{}},
+		{"maximum-line", maximum},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			line, err := json.Marshal(test.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			frame := append(append([]byte(nil), line...), '\n')
+			lineDigest := fmt.Sprintf("%x", sha256.Sum256(line))
+			frameDigest := fmt.Sprintf("%x", sha256.Sum256(frame))
+			for _, failed := range []bool{false, true} {
+				name := "success"
+				var failure error
+				if failed {
+					name, failure = "child-failure", errors.New("child failed after input")
+				}
+				t.Run(name, func(t *testing.T) {
+					process := mappingReplyChild("fixed-result\n")
+					process.result = failure
+					execution, err := executeMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", "verified-system-modules", test.request, mappingPowerShell, false)
+					if !errors.Is(err, failure) {
+						t.Fatalf("execution result changed: %v", err)
+					}
+					d := execution.Diagnostic
+					if !bytes.Equal([]byte(process.input.String()), frame) || d.InputBytes != len(frame) || d.InputSHA256 != frameDigest ||
+						d.InputLineBytes != len(line) || d.InputLineSHA256 != lineDigest || d.InputLineSHA256 == d.InputSHA256 {
+						t.Fatal("input observation confused the JSON line with its LF-delimited frame")
+					}
+					if !d.WriteComplete || d.WriteBytes != len(frame) || d.EOFRequested || d.EOFAttempted ||
+						d.WorkersJoined != 3 || !d.CleanupConfirmed || process.finished != 1 || process.input.closes != 1 {
+						t.Fatal("input observation changed delivery, stdin ownership or worker cleanup")
+					}
+					if test.name == "maximum-line" && (d.InputLineBytes != 4095 || d.InputBytes != 4096) {
+						t.Fatal("maximum input fixture no longer reaches the wire boundary")
+					}
+					encoded, err := json.Marshal(d)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var wire struct {
+						LineBytes  int    `json:"input_line_bytes"`
+						LineDigest string `json:"input_line_sha256"`
+						FrameBytes int    `json:"input_bytes"`
+						FrameHash  string `json:"input_sha256"`
+					}
+					if err := json.Unmarshal(encoded, &wire); err != nil || wire.LineBytes != len(line) || wire.LineDigest != lineDigest ||
+						wire.FrameBytes != len(frame) || wire.FrameHash != frameDigest {
+						t.Fatal("diagnostic JSON omitted or renamed the line/frame facts")
+					}
+					mappingDiagnosticFrom(t, encodeMappingDiagnostic(d))
+				})
+			}
+		})
+	}
+}
+
 type mappingErrorReader struct{ cause error }
 
 func (r mappingErrorReader) Read([]byte) (int, error) { return 0, r.cause }
@@ -1000,7 +1071,7 @@ func TestMappingFailureCaptureIsBoundedAndDoesNotExposeFullStderr(t *testing.T) 
 	writeError, writeTruncated := mappingDiagnosticText(long, 512)
 	resultError, resultTruncated := mappingDiagnosticText(long, 512)
 	stream := mappingStreamDiagnostic{ObservedBytes: 1 << 30, PrefixBase64: base64.StdEncoding.EncodeToString(make([]byte, mappingDiagnosticStreamLimit)), PrefixTruncated: true}
-	maximal := mappingCommandDiagnostic{Action: action, ActionTruncated: actionTruncated, PreCleanupResult: &resultError, PreCleanupResultTruncated: resultTruncated, WriteError: writeError, WriteErrorTruncated: writeTruncated, Stdout: stream, Stderr: stream}
+	maximal := mappingCommandDiagnostic{Action: action, ActionTruncated: actionTruncated, PreCleanupResult: &resultError, PreCleanupResultTruncated: resultTruncated, WriteError: writeError, WriteErrorTruncated: writeTruncated, InputLineBytes: 4095, InputLineSHA256: strings.Repeat("a", 64), InputBytes: 4096, InputSHA256: strings.Repeat("b", 64), Stdout: stream, Stderr: stream}
 	bounded := mappingDiagnosticFrom(t, encodeMappingDiagnostic(maximal))
 	if !bounded.details.ActionTruncated || !bounded.details.WriteErrorTruncated || !bounded.details.PreCleanupResultTruncated {
 		t.Fatal("bounded text omitted its truncation facts")
@@ -1029,8 +1100,214 @@ func TestMappingCaptureCopyCannotBypassTheOutputBound(t *testing.T) {
 	}
 }
 
+func mappingOperationStagesForTest() []string {
+	return []string{"entry", "before-readline", "after-readline", "before-json", "after-json", "before-owner", "after-owner", "before-import", "after-import", "before-inventory", "after-inventory", "before-create-inventory", "after-create-inventory", "before-remove-inventory", "after-remove-inventory", "after-result"}
+}
+
+func mappingObservationOrder(source string, fragments ...string) error {
+	for _, fragment := range fragments {
+		index := strings.Index(source, fragment)
+		if index < 0 {
+			return fmt.Errorf("missing or out-of-order observation anchor: %s", fragment)
+		}
+		source = source[index+len(fragment):]
+	}
+	return nil
+}
+
+func mappingObservationOwnership(source string) error {
+	const catchStart = "} catch {\n    $primaryError = $_\n    $primaryOrigin = $rfsObservationStage"
+	index := strings.Index(source, catchStart)
+	if index < 0 {
+		return errors.New("operation catch does not immediately retain the primary ErrorRecord and stage")
+	}
+	return mappingObservationOrder(source[index:], catchStart,
+		"'RFS-MAPPING/1 catch-entry'", "'RFS-MAPPING/1 obs-begin catch'",
+		"$primaryError.Exception.GetType().FullName", "$primaryError.FullyQualifiedErrorId",
+		"'RFS-MAPPING/1 obs-end catch'", "} catch {", "'RFS-MAPPING/1 obs-failure catch'",
+		"} finally {", "$cause = $primaryError.Exception.Message",
+		"if ($cause.Length -gt 1024) { $cause = $cause.Substring(0,1024) }",
+		"[ordered]@{ status = 'error'; owner_sid = $owner; rows = @(); cause = $cause } | ConvertTo-Json -Depth 5 -Compress", "exit 1")
+}
+
+func TestMappingObservationScriptOwnershipAndOrder(t *testing.T) {
+	for _, helper := range []string{"Get-RfsBoundedTextFact", "Write-RfsInputObservation", "Write-RfsEnvironmentObservation"} {
+		if strings.Count(mappingPowerShell, "function "+helper) != 1 {
+			t.Fatalf("missing or repeated observation helper: %s", helper)
+		}
+	}
+	textStart := strings.Index(mappingPowerShell, "function Get-RfsBoundedTextFact")
+	inputStart := strings.Index(mappingPowerShell, "function Write-RfsInputObservation")
+	environmentStart := strings.Index(mappingPowerShell, "function Write-RfsEnvironmentObservation")
+	operationStart := strings.Index(mappingPowerShell, "try {\n    [Console]::Error.WriteLine('RFS-MAPPING/1 before-readline')")
+	if textStart < 0 || inputStart <= textStart || environmentStart <= inputStart || operationStart <= environmentStart {
+		t.Fatal("observation helper boundaries changed")
+	}
+	textHelper := mappingPowerShell[textStart:inputStart]
+	inputHelper := mappingPowerShell[inputStart:environmentStart]
+	environmentHelper := mappingPowerShell[environmentStart:operationStart]
+	if err := mappingObservationOrder(textHelper,
+		"if ($null -eq $Value) { return @{ state = 'null' } }", "$text = [string]$Value",
+		"$head = $text.Substring(0, [Math]::Min($text.Length, $Limit + 1))", "$bytes = $utf8.GetBytes($head)",
+		"$retained = [Math]::Min($bytes.Length, $Limit)", "[Convert]::ToBase64String($bytes, 0, $retained)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mappingObservationOrder(inputHelper,
+		"if ($null -eq $Value)", "'RFS-MAPPING/1 obs-input state=null'", "$text = [string]$Value",
+		"if ($text.Length -gt 4096)", "throw 'Input observation exceeds its UTF-16 limit.'",
+		"$length = $utf8.GetByteCount($text)", "if ($length -gt 12288)", "throw 'Input observation exceeds its UTF-8 limit.'",
+		"$bytes = $utf8.GetBytes($text)", "[Security.Cryptography.SHA256]::Create()", "$hash.ComputeHash($bytes)",
+		"if ($null -ne $hash) { $hash.Dispose() }", "read_line_utf8_sha256={3}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mappingObservationOrder(environmentHelper,
+		"foreach ($name in @('PSModulePath', 'WinPSModulePath', 'PSModuleAnalysisCachePath'))",
+		"$value = [Environment]::GetEnvironmentVariable($name, [EnvironmentVariableTarget]::Process)",
+		"$fact = Get-RfsBoundedTextFact $value 96"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(environmentHelper, "GetEnvironmentVariable(") != 1 {
+		t.Fatal("environment observation no longer snapshots each allowlisted value once")
+	}
+	for _, forbidden := range []string{"ConvertFrom-Json", "ConvertTo-Json", "Import-Module", "Get-Command", "Get-Module", "SetEnvironmentVariable", "ReadLine", "ReadToEnd"} {
+		if strings.Contains(mappingPowerShell[textStart:operationStart], forbidden) {
+			t.Fatalf("observation helpers added operational work: %s", forbidden)
+		}
+	}
+	if err := mappingObservationOrder(mappingPowerShell,
+		"$requestLine = [Console]::In.ReadLine()", "'RFS-MAPPING/1 after-readline'",
+		"$rfsObservationStage = 'input'", "Write-RfsInputObservation $requestLine",
+		"$rfsObservationStage = 'environment'", "Write-RfsEnvironmentObservation",
+		"$rfsObservationStage = 'operation'", "'RFS-MAPPING/1 before-json'",
+		"$request = $requestLine | ConvertFrom-Json", "'RFS-MAPPING/1 after-json'",
+		"$owner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+		"Import-Module -Name $request.module -ErrorAction Stop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mappingObservationOwnership(mappingPowerShell); err != nil {
+		t.Fatal(err)
+	}
+	for _, stage := range []string{"input", "environment", "catch"} {
+		for _, kind := range []string{"obs-begin", "obs-end", "obs-failure"} {
+			if strings.Count(mappingPowerShell, "'RFS-MAPPING/1 "+kind+" "+stage+"'") != 1 {
+				t.Fatalf("missing or repeated observation boundary: %s %s", kind, stage)
+			}
+		}
+	}
+	if strings.Count(mappingPowerShell, "$requestLine =") != 1 || strings.Count(mappingPowerShell, "ConvertFrom-Json") != 1 ||
+		strings.Count(mappingPowerShell, "ConvertTo-Json") != 2 || strings.Contains(mappingPowerShell, "$cause = $_.") {
+		t.Fatal("observation changed the input, JSON commands or primary cause ownership")
+	}
+	for _, mutation := range []struct {
+		name, source string
+	}{
+		{"discard-primary", strings.Replace(mappingPowerShell, "$primaryError = $_", "$primaryError = $null", 1)},
+		{"catch-marker-after-serialization", strings.Replace(strings.Replace(mappingPowerShell, "[Console]::Error.WriteLine('RFS-MAPPING/1 catch-entry')", "", 1), "    exit 1", "    [Console]::Error.WriteLine('RFS-MAPPING/1 catch-entry')\n    exit 1", 1)},
+		{"secondary-overwrites-cause", strings.Replace(mappingPowerShell, "$cause = $primaryError.Exception.Message", "$cause = $_.Exception.Message", 1)},
+		{"serialization-outside-finally", strings.Replace(mappingPowerShell, "} finally {\n        $cause = $primaryError.Exception.Message", "}\n        $cause = $primaryError.Exception.Message", 1)},
+	} {
+		t.Run(mutation.name, func(t *testing.T) {
+			if mutation.source == mappingPowerShell || mappingObservationOwnership(mutation.source) == nil {
+				t.Fatal("observation ownership control accepted its targeted mutation")
+			}
+		})
+	}
+}
+
+func mappingObservationFormatForTest(t *testing.T, prefix string, values ...string) string {
+	t.Helper()
+	needle := "'" + prefix
+	if strings.Count(mappingPowerShell, needle) != 1 {
+		t.Fatalf("record format is missing or ambiguous: %s", prefix)
+	}
+	start := strings.Index(mappingPowerShell, needle) + 1
+	format, _, found := strings.Cut(mappingPowerShell[start:], "'")
+	if !found {
+		t.Fatal("record format has no closing quote")
+	}
+	for index, value := range values {
+		format = strings.ReplaceAll(format, fmt.Sprintf("{%d}", index), value)
+	}
+	if strings.ContainsAny(format, "{}") {
+		t.Fatalf("record format has unbound fields: %s", prefix)
+	}
+	return format
+}
+
+func TestMappingObservationStderrGrammarBound(t *testing.T) {
+	record := func(prefix string, values ...string) string {
+		return mappingObservationFormatForTest(t, "RFS-MAPPING/1 "+prefix, values...) + "\r\n"
+	}
+	var legacy strings.Builder
+	for _, stage := range mappingOperationStagesForTest() {
+		legacy.WriteString(record(stage))
+	}
+	if legacy.Len() != 492 {
+		t.Fatalf("sixteen existing marker bytes changed: %d", legacy.Len())
+	}
+	const maximumLength = "2147483647"
+	environmentPrefix := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, 96))
+	errorPrefix := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, 64))
+	if len(environmentPrefix) != 128 || len(errorPrefix) != 88 {
+		t.Fatal("base64 prefix budget changed")
+	}
+	typeFields := mappingObservationFormatForTest(t, "type_state={", "value", maximumLength, errorPrefix, "1")
+	idFields := mappingObservationFormatForTest(t, "id_state={", "value", maximumLength, errorPrefix, "1")
+	catch := record("catch-entry") + record("obs-begin catch") + record("obs-catch origin={", "environment", typeFields, idFields) + record("obs-end catch")
+	var failures strings.Builder
+	for _, stage := range []string{"input", "environment", "catch"} {
+		failures.WriteString(record("obs-failure " + stage))
+	}
+	var bounded strings.Builder
+	bounded.WriteString(legacy.String())
+	bounded.WriteString(record("obs-begin input"))
+	bounded.WriteString(record("obs-input state={", "value", "4096", "12288", strings.Repeat("f", 64)))
+	bounded.WriteString(record("obs-end input"))
+	bounded.WriteString(record("obs-begin environment"))
+	for _, name := range []string{"PSModulePath", "WinPSModulePath", "PSModuleAnalysisCachePath"} {
+		bounded.WriteString(record("obs-env name={0} state={", name, "value", maximumLength, environmentPrefix, "1"))
+	}
+	bounded.WriteString(record("obs-end environment"))
+	bounded.WriteString(catch)
+	bounded.WriteString(failures.String())
+	if bounded.Len() != 1981 || bounded.Len() > mappingDiagnosticStreamLimit {
+		t.Fatalf("actual record grammar exceeds its declared prefix budget: bytes=%d limit=%d", bounded.Len(), mappingDiagnosticStreamLimit)
+	}
+	for _, value := range bounded.String() {
+		if value > 127 {
+			t.Fatal("record grammar emitted unencoded variable text")
+		}
+	}
+	var captured mappingBoundedBuffer
+	if n, err := captured.Write([]byte(bounded.String())); err != nil || n != bounded.Len() {
+		t.Fatalf("bounded records were not fully captured: bytes=%d error=%v", n, err)
+	}
+	diagnostic := captured.diagnostic()
+	if diagnostic.PrefixTruncated || diagnostic.ObservedBytes != int64(bounded.Len()) || string(mappingDiagnosticPrefix(t, diagnostic)) != bounded.String() {
+		t.Fatal("record grammar lost observations within the existing stderr prefix")
+	}
+	for _, limit := range []string{
+		record("obs-input-limit utf16={0} utf8=unmeasured", maximumLength),
+		record("obs-input-limit utf16={0} utf8={1}", "4096", maximumLength),
+	} {
+		early := legacy.String() + record("obs-begin input") + limit + catch + failures.String()
+		if len(early) > mappingDiagnosticStreamLimit || len(early) >= bounded.Len() {
+			t.Fatal("early input-limit failure exceeds the record budget")
+		}
+	}
+	for _, nullRecord := range []string{
+		record("obs-input state=null"),
+		record("obs-env name={0} state=null", "PSModulePath"),
+		record("obs-catch origin={", "operation", mappingObservationFormatForTest(t, "type_state=null"), mappingObservationFormatForTest(t, "id_state=null")),
+	} {
+		if strings.Contains(nullRecord, "utf16=") || strings.Contains(nullRecord, "utf8=") || strings.Contains(nullRecord, "sha256=") || strings.Contains(nullRecord, "_b64=") || strings.Contains(nullRecord, "16=") {
+			t.Fatal("null record manufactured a length, prefix or digest")
+		}
+	}
+}
+
 func TestMappingStageMarkersKeepSuccessReceiptUnchanged(t *testing.T) {
-	for _, stage := range []string{"entry", "before-readline", "after-readline", "before-json", "after-json", "before-owner", "after-owner", "before-import", "after-import", "before-inventory", "after-inventory", "after-result"} {
+	for _, stage := range mappingOperationStagesForTest() {
 		marker := "[Console]::Error.WriteLine('RFS-MAPPING/1 " + stage + "')"
 		if strings.Count(mappingPowerShell, marker) != 1 {
 			t.Fatalf("missing or repeated fixed stderr stage: %s", stage)

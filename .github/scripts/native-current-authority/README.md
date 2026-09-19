@@ -204,22 +204,22 @@ mismatch. Recovery preserves the original failed result. Ordinary success closes
 the native HANDLE, removes the mapping, calls Shutdown, joins Serve, Unpublishes
 the export, closes idle HTTP connections and verifies remote/local cleanup.
 
-[The source-bound run 35442800512](https://github.com/codetreker/remote-fs/actions/runs/35442800512)
-on `3eed8ec9eceb8bea5743e09d1b3c1fe7c26c093a` retained the original cold
-inventory timeout at 4009 ms, with the last captured marker before-json. Its four
-post-VM diagnostic cells each passed once: entry/open 247 ms, entry/EOF 191 ms,
-inventory/open 3419 ms and inventory/EOF 913 ms. Each had natural exit zero,
-three joined workers and nonforced child cleanup. Their observed inherited
-module path placed PowerShell 7 roots before Windows PowerShell roots;
-WinPSModulePath was absent and the analysis-cache path was NUL.
+[The source-bound run 35446688647](https://github.com/codetreker/remote-fs/actions/runs/35446688647)
+on `26ba565b43b9c9569a7aad5e303a9290b7a9e61d` passed the native private-writer
+and Go-child environment tests. Its nested 27,917-byte diagnostic report was
+persisted and cell/checker cleanup completed. The earlier protected-parent DACL
+defect is closed, but initial inventory still failed at 4010 ms before-json.
+Post-VM entry/open and entry/EOF passed in 248/186 ms; both inventory cells failed
+at 4019 ms despite the configured System32 Modules/NUL input, including completed
+EOF in the last cell. Parent-inherited and configured-child facts remain separate.
 
-The diagnostic root still failed: its ordinary parent directory did not satisfy
-the private writer's protected-DACL precondition. The aggregate file was empty;
-no final native aggregate or post-attempt executable PE/hash facts were saved.
-Successful later cells do not repair the original cold failure or isolate EOF,
-warming or module resolution as its cause. Earlier zero-stream and stage-bearing
-cold failures retain their observed classifications. Current-SMB mapping, cold
-object access and one-second cache acceptance remain unproved.
+Those facts do not identify the child's ReadLine value, effective runtime module
+path, command resolution or catch branch. The catch also serializes JSON, so the
+last before-json marker does not establish a parser hang. Original SMB resources
+and recovery settled; forced QEMU cleanup keeps the overall run failed despite
+disk removal and an unchanged pristine image. Prior failures retain their result.
+Current-SMB mapping, cold object access and one-second cache acceptance remain
+unproved.
 
 Mapping failures retain a bounded diagnostic after the owned child is finished
 and all three I/O workers join. It records action, actual PID when available,
@@ -230,6 +230,33 @@ error chain. Fixed stderr stage markers cover entry, request read/parse, owner,
 module and inventory; stdout retains its single result JSON. The 1 MiB stream
 limit applies through `io.Copy` as well as direct Write calls. Missing prefix
 bytes do not prove a stage never began, and a prefix is not complete output.
+
+Between after-readline and before-json, bounded observations record the existing
+ReadLine string's null/empty/value state, UTF-16 and re-encoded UTF-8 lengths and
+SHA256 without changing the string. Parent `input_line_bytes`/`input_line_sha256`
+exclude LF; the original framed input fields remain separate. Child observation
+refuses more than 4096 UTF-16 units or 12288 UTF-8 bytes before allocating the
+encoded array and does not invent a digest on refusal. Effective process values
+for the same three environment names are read once through .NET, with state,
+UTF-16 length and at most 96 bytes of base64 prefix. They are distinct from both
+parent inheritance and configured child input, and do not prove module selection.
+
+Catch first saves the original ErrorRecord. Before error JSON serialization it
+emits catch-entry and bounded origin/type/error-ID facts with at most 64-byte
+prefixes. Input/environment observation failures keep their own stage and stop
+operation; observation of an already-caught error is secondary and the original
+serialization/exit-one path still uses the saved ErrorRecord. Missing completion
+cannot become success. Fixed begin/end/failure markers distinguish observation
+work from the existing operation markers; request text, full environment values
+and additional exception messages are not emitted.
+
+The maximum-branch formatter projection, including existing markers and CRLF,
+is bounded at 1981 bytes within the existing 2048-byte captured prefix. PowerShell's own extra error
+output may still be truncated. Observer work consumes the same four seconds;
+framework initialization and console writes have no separate latency guarantee.
+No operation, import, environment policy, stdin/owner behavior or diagnostic cell
+is changed, and no command-discovery or prewarming call is added. These new
+observations have not yet run under native Windows PowerShell.
 
 The Windows owner records CreateProcess, Job assignment and ResumeThread timings
 and errors. ResumeThread must return the previous suspend count 1. The retained
@@ -284,7 +311,8 @@ payload write, sync and close. The checker reads the same fixed nested path.
 An existing child/file is refused without adoption or truncation; the outer
 checker's ACL stays unchanged. Every write/sync/close error remains visible and
 created evidence remains on failure. Command capture and executor bounds are
-unchanged. This host-setup correction has not yet run natively.
+unchanged. The source-bound native run above verified the private writer and
+Go-child delivery; it did not establish cold or cache acceptance.
 
 Each cell joins its process and three workers before the next; unknown Job
 quiescence stops further launches. The cells record their order, actual creation
@@ -294,7 +322,7 @@ failure remains failed even if later cells succeed. The experiment runs after VM
 shutdown and SMB cleanup attempts, under different load; later cells may be warmed
 by earlier launches. Its results cannot alone identify the original cold cause.
 The 120-second test and 15-minute job limits remain unchanged. The measured
-four-cell success belongs to the source and environment above.
+four-cell results belong to their exact source and environment.
 A local PowerShell 7 held-open/EOF success establishes only that local behavior;
 neither observation proves a timeout repair.
 

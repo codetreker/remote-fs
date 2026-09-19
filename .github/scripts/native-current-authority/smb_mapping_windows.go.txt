@@ -840,10 +840,71 @@ Set-StrictMode -Version Latest
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $OutputEncoding = [Console]::OutputEncoding
 $owner = ''
+$rfsObservationStage = 'operation'
+function Get-RfsBoundedTextFact {
+    param($Value, [int]$Limit)
+    if ($null -eq $Value) { return @{ state = 'null' } }
+    $text = [string]$Value
+    $state = if ($text.Length -eq 0) { 'empty' } else { 'value' }
+    $head = $text.Substring(0, [Math]::Min($text.Length, $Limit + 1))
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $bytes = $utf8.GetBytes($head)
+    $retained = [Math]::Min($bytes.Length, $Limit)
+    $cut = [int](($text.Length -gt $head.Length) -or ($bytes.Length -gt $Limit))
+    return @{ state = $state; utf16 = $text.Length; prefix = [Convert]::ToBase64String($bytes, 0, $retained); truncated = $cut }
+}
+function Write-RfsInputObservation {
+    param($Value)
+    [Console]::Error.WriteLine('RFS-MAPPING/1 obs-begin input')
+    if ($null -eq $Value) {
+        [Console]::Error.WriteLine('RFS-MAPPING/1 obs-input state=null')
+    } else {
+        $text = [string]$Value
+        if ($text.Length -gt 4096) {
+            [Console]::Error.WriteLine([string]::Format([Globalization.CultureInfo]::InvariantCulture, 'RFS-MAPPING/1 obs-input-limit utf16={0} utf8=unmeasured max16=4096 max8=12288', [object[]]@($text.Length)))
+            throw 'Input observation exceeds its UTF-16 limit.'
+        }
+        $utf8 = [Text.UTF8Encoding]::new($false)
+        $length = $utf8.GetByteCount($text)
+        if ($length -gt 12288) {
+            [Console]::Error.WriteLine([string]::Format([Globalization.CultureInfo]::InvariantCulture, 'RFS-MAPPING/1 obs-input-limit utf16={0} utf8={1} max16=4096 max8=12288', [object[]]@($text.Length, $length)))
+            throw 'Input observation exceeds its UTF-8 limit.'
+        }
+        $bytes = $utf8.GetBytes($text)
+        $hash = $null
+        try {
+            $hash = [Security.Cryptography.SHA256]::Create()
+            $digest = [BitConverter]::ToString($hash.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+        } finally {
+            if ($null -ne $hash) { $hash.Dispose() }
+        }
+        $state = if ($text.Length -eq 0) { 'empty' } else { 'value' }
+        [Console]::Error.WriteLine([string]::Format([Globalization.CultureInfo]::InvariantCulture, 'RFS-MAPPING/1 obs-input state={0} utf16={1} utf8={2} read_line_utf8_sha256={3}', [object[]]@($state, $text.Length, $length, $digest)))
+    }
+    [Console]::Error.WriteLine('RFS-MAPPING/1 obs-end input')
+}
+function Write-RfsEnvironmentObservation {
+    [Console]::Error.WriteLine('RFS-MAPPING/1 obs-begin environment')
+    foreach ($name in @('PSModulePath', 'WinPSModulePath', 'PSModuleAnalysisCachePath')) {
+        $value = [Environment]::GetEnvironmentVariable($name, [EnvironmentVariableTarget]::Process)
+        $fact = Get-RfsBoundedTextFact $value 96
+        if ($fact.state -eq 'null') {
+            [Console]::Error.WriteLine([string]::Format([Globalization.CultureInfo]::InvariantCulture, 'RFS-MAPPING/1 obs-env name={0} state=null', [object[]]@($name)))
+        } else {
+            [Console]::Error.WriteLine([string]::Format([Globalization.CultureInfo]::InvariantCulture, 'RFS-MAPPING/1 obs-env name={0} state={1} utf16={2} utf8_prefix_b64={3} truncated={4}', [object[]]@($name, $fact.state, $fact.utf16, $fact.prefix, $fact.truncated)))
+        }
+    }
+    [Console]::Error.WriteLine('RFS-MAPPING/1 obs-end environment')
+}
 try {
     [Console]::Error.WriteLine('RFS-MAPPING/1 before-readline')
     $requestLine = [Console]::In.ReadLine()
     [Console]::Error.WriteLine('RFS-MAPPING/1 after-readline')
+    $rfsObservationStage = 'input'
+    Write-RfsInputObservation $requestLine
+    $rfsObservationStage = 'environment'
+    Write-RfsEnvironmentObservation
+    $rfsObservationStage = 'operation'
     [Console]::Error.WriteLine('RFS-MAPPING/1 before-json')
     $request = $requestLine | ConvertFrom-Json
     [Console]::Error.WriteLine('RFS-MAPPING/1 after-json')
@@ -882,10 +943,33 @@ try {
     [ordered]@{ status = 'ok'; owner_sid = $owner; rows = $rows; cause = '' } | ConvertTo-Json -Depth 5 -Compress
     [Console]::Error.WriteLine('RFS-MAPPING/1 after-result')
 } catch {
-    $cause = $_.Exception.Message
-    if ($cause.Length -gt 1024) { $cause = $cause.Substring(0,1024) }
-    [ordered]@{ status = 'error'; owner_sid = $owner; rows = @(); cause = $cause } | ConvertTo-Json -Depth 5 -Compress
-    exit 1
+    $primaryError = $_
+    $primaryOrigin = $rfsObservationStage
+    try {
+        [Console]::Error.WriteLine('RFS-MAPPING/1 catch-entry')
+        [Console]::Error.WriteLine('RFS-MAPPING/1 obs-begin catch')
+        if ($primaryOrigin -eq 'input') { [Console]::Error.WriteLine('RFS-MAPPING/1 obs-failure input') }
+        if ($primaryOrigin -eq 'environment') { [Console]::Error.WriteLine('RFS-MAPPING/1 obs-failure environment') }
+        $typeFact = Get-RfsBoundedTextFact ($primaryError.Exception.GetType().FullName) 64
+        $idFact = Get-RfsBoundedTextFact $primaryError.FullyQualifiedErrorId 64
+        $typeFields = 'type_state=null'
+        if ($typeFact.state -ne 'null') {
+            $typeFields = [string]::Format([Globalization.CultureInfo]::InvariantCulture, 'type_state={0} type16={1} type_b64={2} typecut={3}', [object[]]@($typeFact.state, $typeFact.utf16, $typeFact.prefix, $typeFact.truncated))
+        }
+        $idFields = 'id_state=null'
+        if ($idFact.state -ne 'null') {
+            $idFields = [string]::Format([Globalization.CultureInfo]::InvariantCulture, 'id_state={0} id16={1} id_b64={2} idcut={3}', [object[]]@($idFact.state, $idFact.utf16, $idFact.prefix, $idFact.truncated))
+        }
+        [Console]::Error.WriteLine([string]::Format([Globalization.CultureInfo]::InvariantCulture, 'RFS-MAPPING/1 obs-catch origin={0} {1} {2}', [object[]]@($primaryOrigin, $typeFields, $idFields)))
+        [Console]::Error.WriteLine('RFS-MAPPING/1 obs-end catch')
+    } catch {
+        [Console]::Error.WriteLine('RFS-MAPPING/1 obs-failure catch')
+    } finally {
+        $cause = $primaryError.Exception.Message
+        if ($cause.Length -gt 1024) { $cause = $cause.Substring(0,1024) }
+        [ordered]@{ status = 'error'; owner_sid = $owner; rows = @(); cause = $cause } | ConvertTo-Json -Depth 5 -Compress
+        exit 1
+    }
 }
 `
 
@@ -974,6 +1058,8 @@ type mappingCommandDiagnostic struct {
 	WriteComplete             bool                    `json:"write_complete"`
 	InputBytes                int                     `json:"input_bytes"`
 	InputSHA256               string                  `json:"input_sha256"`
+	InputLineBytes            int                     `json:"input_line_bytes"`
+	InputLineSHA256           string                  `json:"input_line_sha256"`
 	ScriptUTF16Units          int                     `json:"script_utf16_units"`
 	ScriptSHA256              string                  `json:"script_utf16le_sha256"`
 	WriteBytes                int                     `json:"write_bytes"`
@@ -1116,6 +1202,7 @@ func executeMappingPowerShell(ctx context.Context, host platform, executable, di
 	if len(data)+1 > 4096 {
 		return execution, errors.New("mapping command input exceeds 4 KiB")
 	}
+	diagnostic.InputLineBytes, diagnostic.InputLineSHA256 = len(data), fmt.Sprintf("%x", sha256.Sum256(data))
 	data = append(data, '\n')
 	diagnostic.InputBytes = len(data)
 	diagnostic.InputSHA256 = fmt.Sprintf("%x", sha256.Sum256(data))
