@@ -2,9 +2,9 @@
   "format": 1,
   "qemu": {
     "version": "11.1.0",
-    "url": "https://qemu.weilnetz.de/w64/2026/qemu-w64-setup-20260811.exe",
-    "sha512": "5bcf9eed634e8575a37b74f445af41a2fe4106da512d0c30c368301d4c105037fdfab40a5287367a28a957624cddebbc8c07e16c88ab6634f554cdf3d16bf543",
-    "size": 206615928,
+    "url": "https://qemu.weilnetz.de/aarch64/qemu-arm-setup-20260811.exe",
+    "sha512": "51db3e9f8afe9e3046ecab114d5c4718f6f8844e956dd1cb60591a903eb99b74feaf7cf7eb295cc2faacc0b2befd19a646a58a86db980be4dbf1b4a7d9d8d6a7",
+    "size": 151734264,
     "machine": "pc-q35-11.1"
   },
   "kernel": {

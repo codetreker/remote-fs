@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"debug/pe"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -303,4 +305,68 @@ func privateTestDirectory(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func hostPEFixture(t *testing.T, path string, machine uint16) {
+	t.Helper()
+	var image bytes.Buffer
+	dos := make([]byte, 128)
+	copy(dos, []byte("MZ"))
+	binary.LittleEndian.PutUint32(dos[0x3c:], 128)
+	image.Write(dos)
+	image.Write([]byte{'P', 'E', 0, 0})
+	header := pe.FileHeader{Machine: machine, SizeOfOptionalHeader: 240, Characteristics: pe.IMAGE_FILE_EXECUTABLE_IMAGE | pe.IMAGE_FILE_LARGE_ADDRESS_AWARE}
+	optional := pe.OptionalHeader64{Magic: 0x20b, ImageBase: 0x140000000, SectionAlignment: 4096, FileAlignment: 512, SizeOfImage: 4096, SizeOfHeaders: 512, Subsystem: pe.IMAGE_SUBSYSTEM_WINDOWS_CUI, NumberOfRvaAndSizes: 16}
+	if err := binary.Write(&image, binary.LittleEndian, header); err != nil {
+		t.Fatal(err)
+	}
+	if err := binary.Write(&image, binary.LittleEndian, optional); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, image.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativeHostPEPolicyPrecedesPlatform(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		machines  [3]uint16
+		malformed int
+		valid     bool
+	}{
+		{name: "native-arm64", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64}, malformed: -1, valid: true},
+		{name: "all-x64", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_AMD64, pe.IMAGE_FILE_MACHINE_AMD64, pe.IMAGE_FILE_MACHINE_AMD64}, malformed: -1},
+		{name: "x64-qemu", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_AMD64, pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64}, malformed: -1},
+		{name: "x64-probe", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_AMD64, pe.IMAGE_FILE_MACHINE_ARM64}, malformed: -1},
+		{name: "x64-controller", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_AMD64}, malformed: -1},
+		{name: "malformed-qemu", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64}, malformed: 0},
+		{name: "malformed-probe", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64}, malformed: 1},
+		{name: "malformed-controller", machines: [3]uint16{pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64, pe.IMAGE_FILE_MACHINE_ARM64}, malformed: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := privateTestDirectory(t)
+			paths := [3]string{filepath.Join(directory, "qemu-system-x86_64.exe"), filepath.Join(directory, "probe.exe"), filepath.Join(directory, "controller.exe")}
+			for index, path := range paths {
+				hostPEFixture(t, path, test.machines[index])
+			}
+			if test.malformed >= 0 {
+				if err := os.WriteFile(paths[test.malformed], []byte("MZ truncated"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			original := newPlatform
+			calls := 0
+			newPlatform = func() (platform, error) { calls++; return fakePlatform{}, nil }
+			defer func() { newPlatform = original }()
+			host, err := nativeHostPlatform(paths[0], paths[1], paths[2])
+			if test.valid {
+				if err != nil || host == nil || calls != 1 {
+					t.Fatalf("native host rejected: calls=%d error=%v", calls, err)
+				}
+			} else if err == nil || host != nil || calls != 0 {
+				t.Fatalf("invalid host reached platform: calls=%d error=%v", calls, err)
+			}
+		})
+	}
 }

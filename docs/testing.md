@@ -16,6 +16,8 @@
 
 普通对拍中的六处时间设置调用使用 [`comparisonChtimes`](../packages/fuse/fuse_test.go)：每处 `os.Chtimes` 的总尝试次数至多八次，仅在上一次返回 `EINTR` 时重做完全相同的路径、绝对 atime 与 mtime，包括明确省略某个时间的参数。挂载点和普通目录使用同一规则，只重试这一次调用；其它错误立即返回，八次仍中断则保留最后的 `EINTR` 并使对拍失败。这里比较最终的 atime / mtime，ctime 不在对拍结果中。专门验证中断的真实信号用例继续断言第一次系统调用的结果，不使用这个辅助函数。
 
+顺序对拍的七处原始 Unlink/Rmdir 使用[单调用 helper](../packages/fuse/comparison_interruption_test.go)，同一路径最多八次，仅在 EINTR 且没有 EIO 时重试。夹具由单一顺序执行者修改名字，不并发重建目标；ENOENT、类型错误和 EIO（包括与 EINTR 并存）保持原错误，不转换成删除成功。若已经删除后仍返回 EINTR，后一次 ENOENT 仍会暴露对拍差异；这不是通用的 Linux namespace EINTR 无效果保证。整个复合步骤、ReadFile/WriteFile 和 Close 不重放，专门测试中断的原始首调用断言保持。四个根、14 个 verdict 的普通/race 检查包括原完整对拍序列、真实挂载的效果前中断及已执行删除后的单次 EIO；两份恢复旧 raw-call 的对照分别在 Unlink/Rmdir 断言失败。
+
 目录 inode 对照使用[原始目录 helper](../packages/fuse/directory_listing_test.go)：每次 Open/Getdents 最多尝试八次，只重试该次 EINTR；Getdents 保持同一 fd、buffer、当前 offset 和已有名字映射，不从头重枚举。有效 buffer 下已交付条目以正长度批次返回并只解析一次，EINTR 没有可重放的批次。其它错误和耗尽的 EINTR 立即保留操作/路径及原因，已打开 fd 只 Close 一次，Close 错误也使结果失败。四个根、11 个 verdict 的普通/race 检查含两项未改断言的真实挂载用例；分别去掉 Open 或 Getdents 的单调用处理都会命中对应确定性中断断言。此规则不修改生产取消分类，也不用于专门核对首个中断的信号用例；[阶段语义](../.agents/notes/implemented/bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)继续独立拥有未知效果与关闭规则。
 
 对拍失败保留双方原错误的类型与文本。模式修改复合步骤先 WriteFile 再 Chmod，失败后才用独立五秒 context 查询 backing 属性及至多 32 字节内容；这些是失败后的额外观察，不重试原操作、不改变原来的失败判定。仍未解释的 EIO 由[独立调查](../.agents/notes/proposed/testing/2026-09-09-trace-unexplained-fuse-eio.md)记录，不能从步骤名称或未复现的批次推断原因。
@@ -399,13 +401,13 @@ go vet ./packages/smb ./packages/smb/internal/wire ./packages/smb/internal/signi
 
 ### 当前 authority 的独立运行环境
 
-[当前 authority 工作流](../.github/workflows/native-current-authority.yml)分别在 Ubuntu 构建、Windows ARM64 消费同一源码绑定 artifact；[工具说明](../.github/scripts/native-current-authority/README.md)拥有固定 kernel/QEMU/Go 输入、精确命令、DACL/Job Object 与清理规则。Windows HTTP client 连接真正 Linux guest 内的 localstore/SQLite/nativelease，通过唯一 loopback 转发读写私有 ext4；这里没有固定原型或内存 authority 镜像。平台文件语义仍属于客户端，测试准备不移植生产 backend。
+[当前 authority 工作流](../.github/workflows/native-current-authority.yml)分别在 Ubuntu 构建、Windows ARM64 消费同一源码绑定 artifact；[工具说明](../.github/scripts/native-current-authority/README.md)拥有固定 kernel/QEMU/Go 输入、精确命令、DACL/Job Object 与清理规则。Windows HTTP client 通过固定 native ARM64 QEMU/TCG 连接真正 Linux AMD64 guest 内的 localstore/SQLite/nativelease，通过唯一 loopback 转发读写私有 ext4；这里没有固定原型或内存 authority 镜像。平台文件语义仍属于客户端，测试准备不移植生产 backend。
 
 readiness 经真实 HTTP lease/FileSession 检查原子打开、字节、metadata 条件、retained rename/unlink 与逻辑 quota，然后停止并普通重开同一磁盘，验证 sentinel 的 ID/字节/metadata。成功要求实际 authority/QEMU 退出、guest sync/unmount、整个 Job 清空、流排空、私有磁盘删除和基底不变；监听端口或单独的根进程退出不能代替它们。Windows 收尾在根退出后最多五秒等待实际 job-zero，失败/超时才强制结束并最多再用五秒确认，总预算十秒不变；forced 始终使结果失败。Job accounting 的 ABI/ReturnLength 和唯一 waiter 的进程 handle 关闭归属分别验证。该工具始终把 native_acceptance 标为未运行，不能充当 SMB 或一秒可见性门禁。
 
-[模板测试入口](../.github/scripts/native-current-authority/check-tooling.py)显式列举隐藏 Go 模板的根和 verdict，普通 module 发现不覆盖它们。已有 Linux 模板普通验证为 36 根/176 verdict，guest/probe/controller 的普通与 race 分别通过 87/63/26 verdict；Python 装配、进程拥有权和 checker 共 26 根；结构化源码发现只从 stdout 解码，依赖下载等 stderr 诊断单独流出，失败退出仍传播，不能把合法诊断混入 JSON 或丢弃。一次本地 Linux TCG 真正启动、HTTP readiness、普通重启和完整关闭通过；来源明确为本地脏 artifact，不冒充未来 CI commit。[Windows helper 运行 35420677792](https://github.com/codetreker/remote-fs/actions/runs/35420677792)的 controller/probe 分别取得 44/63 个通过 verdict；路径祖先检查在 QEMU 启动前失败，不能把 helper 通过当作 QEMU/Prism、HTTP guest 或 SMB/缓存验收。Job rundown 的三个 AST 提取根普通/race 各 11 个 verdict、因果负向对照、vet 与两个 Windows 架构构建分别保留来源。mock/交叉构建、已执行的 Windows helper 与 Linux VM 结果分别记录。[决定](../.agents/notes/implemented/testing/2026-09-19-current-authority-virtual-machine-fixture.md)说明与固定原型诊断的分工，普通重启不宣称断电可靠性。
+[模板测试入口](../.github/scripts/native-current-authority/check-tooling.py)显式列举隐藏 Go 模板的根和 verdict，普通 module 发现不覆盖它们。已有 Linux 模板普通验证为 36 根/176 verdict，guest/probe/controller 的普通与 race 分别通过 87/63/26 verdict；Python 装配、进程拥有权和 checker 共 26 根；结构化源码发现只从 stdout 解码，依赖下载等 stderr 诊断单独流出，失败退出仍传播，不能把合法诊断混入 JSON 或丢弃。一次本地 Linux TCG 真正启动、HTTP readiness、普通重启和完整关闭通过；来源明确为本地脏 artifact，不冒充未来 CI commit。[Windows 运行 35421799592](https://github.com/codetreker/remote-fs/actions/runs/35421799592)的 controller/probe 分别取得 44/63 个通过 verdict，路径 guard 十二项通过；旧 x64 QEMU 通过版本/能力查询后，在 guest 启动、任何 authority 输出之前以 0xC00000FF 退出，具体 unwind table/module 未知。native ARM64 host 包保留同一 Linux guest/backend，controller 普通/race 各 14 根/35 verdict、架构反转对照、相关构建/vet及包字节核对通过；native boot/HTTP 生命周期仍未验证，不能升级为 SMB/缓存验收。Job rundown 的三个 AST 提取根普通/race 各 11 个 verdict、因果负向对照、vet 与两个 Windows 架构构建分别保留来源。mock/交叉构建、已执行的 Windows helper 与 Linux VM 结果分别记录。[决定](../.agents/notes/implemented/testing/2026-09-19-current-authority-virtual-machine-fixture.md)说明与固定原型诊断的分工，普通重启不宣称断电可靠性。
 
-[路径 guard 回归](../.github/scripts/native-current-authority/run_windows_test.ps1)从实际脚本抽取唯一 Assert-NoReparse 的 FunctionDefinitionAst，在 StrictMode 下直接执行。入口及逐级祖先使用真实 DirectoryInfo/FileInfo 类型，不能依赖只有 provider 初始对象才有的 PSIsContainer；路径不存在、非文件系统 provider、文件或祖先 reparse 均拒绝。工作流在 VM 前运行此检查。本地九项通过，原 guard 对照在 raw DirectoryInfo 父链失败；Windows 专属的三个 junction 场景尚待原生执行，不扩大为整段 bootstrap 通过。
+[路径 guard 回归](../.github/scripts/native-current-authority/run_windows_test.ps1)从实际脚本抽取唯一 Assert-NoReparse 的 FunctionDefinitionAst，在 StrictMode 下直接执行。入口及逐级祖先使用真实 DirectoryInfo/FileInfo 类型，不能依赖只有 provider 初始对象才有的 PSIsContainer；路径不存在、非文件系统 provider、文件或祖先 reparse 均拒绝。工作流在 VM 前运行此检查。本地九项通过，原 guard 对照在 raw DirectoryInfo 父链失败；Windows 已执行的十二项包含三个 junction 场景，不扩大为整段 bootstrap 通过。
 
 ### Windows 原生 SMB 缓存诊断
 
@@ -482,7 +484,7 @@ owned_rescan 必须从实际捕获的 SMB Command 15 请求及同一 MessageID �
 
 ### 精确历史通知与替换身份实验
 
-[独立 precise 工作流](../.github/workflows/native-smb-precise-invalidation.yml)通过[运行脚本](../.github/scripts/native-smb-precise-invalidation.ps1)只执行一个全新 `TestNativePreciseReplacement/share0_app_first_replace_identity_precise`。它仍使用固定原型和既有三份 overlay，再核对并应用[历史通知补丁](../.github/scripts/native-smb-precise-history.patch)；这些字节只进入临时诊断检出。父探针 Go 模板及默认判据不变，公共 PowerShell 仅增加受限的产物目录选择与对应 precise binary 清理。工作流保存本次输入/输出来源、首值及清理产物，不能把执行对象叫作当前生产适配。
+[独立 precise 工作流](../.github/workflows/native-smb-precise-invalidation.yml)通过[运行脚本](../.github/scripts/native-smb-precise-invalidation.ps1)只执行一个全新 `TestNativePreciseReplacement/share0_app_first_replace_identity_precise`。它仍使用固定原型和既有三份 overlay，再核对并应用[历史通知补丁](../.github/scripts/native-smb-precise-history.patch)；这些字节只进入临时诊断检出。父探针 Go 模板及默认判据不变，公共 PowerShell 使用受限的产物目录选择与对应 precise binary 清理。补丁目标须先通过原始/规范 hash 核对，才允许将已知 CRLF 字节规范为 LF，随后再核对规范化/patch 输出；未知输入在重写前拒绝。Verify 成功明确退出 0，不能继承旧外部命令状态；真实策略/进程残留错误仍抛出。工作流保存本次输入/输出来源、首值及清理产物，不能把执行对象叫作当前生产适配。
 
 [历史事实 producer](../.github/scripts/native-smb-precise-history_test.go.txt)先从实际 HTTP Snapshot 读到语义 EOF，核对 incarnation、完整树、位置与预算；最多 64 节点/256 KiB，证据序列总量最多 1 MiB。原 Rename 的同一次 authority 锁区间捕获 P/Q 和实际 Removed/Renamed 事件，绑定 session/reference/action、输入指纹与已保存的原 action receipt。实际 RenameWithBarrier 回复及其 HTTP barrier 必须与这些事实相符，真实 stream 交付的完整两事件区间也须一致，才能交付历史 full-name proof；不以测试预期拼造 mutation、位置或通知。
 
@@ -490,7 +492,7 @@ owned_rescan 必须从实际捕获的 SMB Command 15 请求及同一 MessageID �
 
 [被动身份观察器](../.github/scripts/native-smb-precise-identity_test.go.txt)只解析已有流量的 QFid、QUERY_INFO 6/18/59 和 filesystem class 1；它不主动发查询。原始 SessionID 与可证明的同 compound effective SessionID 分别记录，按 connection/message/command/open 关联请求和响应；未请求、缺失、畸形与数值零分开。关联不清或轨迹超限使证据失效，不从 backend NodeID 猜原生 FileIndex。
 
-HA-only、HTTP-only 冷 B、首次 CreateFile、新旧 native ID/volume 与 A/B 字节保持原判据，通知与所有观察仍受原 ACK+850 ms/一秒/最早 TTL 约束；默认缓存设置、后置 oracle 和清理不变。[producer/身份回归](../.github/scripts/native-smb-precise-history-controls_test.go.txt)与[通知拥有权回归](../.github/scripts/native-smb-precise-notify-controls_test.go.txt)合计 26 根，普通/race 各 285 个通过 verdict；四个独立对照核对 proof 失败、ENUM 误当 DETAIL、未绑定 QFid 与错误 compound session 处理。另有十项源提取 PowerShell 进程选择用例、错误源码 pin 拒绝、精确 fixture 准备、ARM64 构建和 actionlint 检查。当前单项原生结果尚未取得，既有 typed-rescan 身份失败不重分类，当前 production/F guest/系统缓存验收也未由这些本地结果证明。
+HA-only、HTTP-only 冷 B、首次 CreateFile、新旧 native ID/volume 与 A/B 字节保持原判据，通知与所有观察仍受原 ACK+850 ms/一秒/最早 TTL 约束；默认缓存设置、后置 oracle 和清理不变。[producer/身份回归](../.github/scripts/native-smb-precise-history-controls_test.go.txt)与[通知拥有权回归](../.github/scripts/native-smb-precise-notify-controls_test.go.txt)合计 26 根，普通/race 各 285 个通过 verdict；四个独立对照核对 proof 失败、ENUM 误当 DETAIL、未绑定 QFid 与错误 compound session 处理。另有十项源提取 PowerShell 进程选择用例、错误源码 pin 拒绝、精确 fixture 准备、ARM64 构建和 actionlint 检查。规范准备从 559 份 CRLF Go 输入产生与原组合相同的九份 Go 输出及 ARM64 binary；因此 Go 控制收据仍绑定相同字节，不是新原生执行。首次 precise 作业在准备阶段停止，尚未执行控制或 native cell；当前单项原生结果未取得，既有 typed-rescan 身份失败不重分类，当前 production/F guest/系统缓存验收也未由这些本地结果证明。
 
 ## 每次改动必须带什么
 

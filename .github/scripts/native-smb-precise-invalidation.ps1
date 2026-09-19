@@ -40,7 +40,7 @@ function Invoke-Controls([string]$Package, [string]$Pattern, [string[]]$Expected
     Assert-Verdicts $path $LASTEXITCODE $Expected
 }
 
-if ((Canonical-Hash $parent) -ne 'b705eceabd1ba519d2fa3368dc84efb5f81e385129ab543487a3cd8a77d8985a') { throw 'Shared preparation harness differs from the reviewed precise input.' }
+if ((Canonical-Hash $parent) -ne 'c6cbf7e557764523dc29c2af1af7015574daf111404800fcaccce6b6253240b0') { throw 'Shared preparation harness differs from the reviewed precise input.' }
 if ((Canonical-Hash (Join-Path $PSScriptRoot 'native-smb-parent-invalidation_test.go.txt')) -ne '7f70553d74ac9811b9680deb0b36ab5b63787889911735c76ed53c7c13ef0395') { throw 'Shared typed probe differs from the reviewed precise input.' }
 if ($Phase -in @('Prepare', 'Verify')) {
     & $parent -Phase $Phase -ProbeDirectory 'native-precise-invalidation'
@@ -59,7 +59,17 @@ $patchFiles = @(
     @{ Path = 'packages/smb/client_notify.go'; Before = '67b2575cf75a88f1a13fc0ac74322c742b5e1bbe943ef4d0a610a40c6bfe1ed9'; After = '972f89b2a164c02047d5f6e900dcbf74c3de182b85ddb59794ea4be86cc2ed5e' },
     @{ Path = 'packages/smb/commands_notify.go'; Before = '2c6e83b6bc87a785b2c0a59755887af4fba53ce3e3417d364f6e4b875eae1ded'; After = '1b3317350512ee74e514dbe2268af75c7f071f511525d7800522f89dd74a472c' }
 )
-foreach ($file in $patchFiles) { if ((Canonical-Hash (Join-Path $fixture $file.Path)) -ne $file.Before) { throw "Precise patch input differs: $($file.Path)" } }
+$normalizedInputs = @(foreach ($file in $patchFiles) {
+    $path = Join-Path $fixture $file.Path
+    $rawHash = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $canonicalHash = Canonical-Hash $path
+    if ($canonicalHash -ne $file.Before) { throw "Precise patch input differs: $($file.Path)" }
+    [IO.File]::WriteAllText($path, [IO.File]::ReadAllText($path).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+    $normalizedHash = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($normalizedHash -ne $file.Before) { throw "Precise normalized patch input differs: $($file.Path)" }
+    [ordered]@{ Path = $file.Path; RawSHA256 = $rawHash; CanonicalSHA256 = $canonicalHash; NormalizedSHA256 = $normalizedHash }
+})
+Write-JSON 'precise-patch-inputs.json' $normalizedInputs
 $applied = Join-Path $results 'native-smb-precise-history.patch'
 [IO.File]::WriteAllText($applied, [IO.File]::ReadAllText($patch).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
 & git -c core.autocrlf=false -C $fixture apply --unidiff-zero --check $applied

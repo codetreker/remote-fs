@@ -40,7 +40,7 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 替换只预先保留原生 A 句柄，B 完全通过 HTTP 准备；mutation 前及最终排空的轨迹均须满足冷态判据：整个轨迹排除 B 的 CREATE/QUERY_INFO/READ，直到 ACK 排除目录枚举和未知 file ID；最终核对只能撤销、不能升级先前资格，迟到污染保留原始数据并使样本 inconclusive、测试失败。不能用预先打开 B 来教会 redirector 新身份。覆盖后先同步打开 target，再核对同一 volume 上的新旧原生 ID 不同、旧 ID 未变及 A/B 各自字节，不能把原生 ID 数值直接等同于 authority NodeID。通知区分 DETAIL 与 VERIFIED_RESCAN：前者核对完整 wire/native 事件及 REMOVED 后相邻 OLD_NAME/NEW_NAME；后者只在当前请求的真实 0x10c 与排空的原生零字节或 ERROR_NOTIFY_ENUM_DIR 配对时成立。VERIFIED_RESCAN 一旦出现便保持 rescan_required=true、precise_notification_proven=false，不能把后续片段重组为已证明的完整事件序列。两者最多三次完成、三次重挂，保持同一 watcher 及精确新 Pending，共用 ACK+850 ms 截止。rescan 还须有 native event 的未完成检查点及首个 API 前的 wire 观察顺序，最终轨迹只能撤销资格；检查点不保证内核未来不会完成。首次打开与全部身份/读取检查仍须在 ACK+一秒及缓存到期之前完成，rescan 成功另标 current_replacement_identity_after_verified_rescan_before_deadline，不冒充精确通知或目录枚举恢复。原始首值、后置双对象 oracle、轨迹和最终清理共同决定资格；旧首值是候选失败，不单独成为超过一秒反例，无监听对照也不外推 share6 因果关系。
 
-精确通知另由[独立单项工作流](../../../../.github/workflows/native-smb-precise-invalidation.yml)与[运行脚本](../../../../.github/scripts/native-smb-precise-invalidation.ps1)执行，只运行全新的 share0/app-first 替换身份场景。固定原型、既有三份 overlay 之外再加入[历史通知补丁](../../../../.github/scripts/native-smb-precise-history.patch)，父探针 Go 判据保持原样；共享脚本只扩展受限的产物目录和 precise 测试进程清理。实验对象仍是有明确来源的诊断树，不能成为当前生产通知 API 的承诺。
+精确通知另由[独立单项工作流](../../../../.github/workflows/native-smb-precise-invalidation.yml)与[运行脚本](../../../../.github/scripts/native-smb-precise-invalidation.ps1)执行，只运行全新的 share0/app-first 替换身份场景。固定原型、既有三份 overlay 之外再加入[历史通知补丁](../../../../.github/scripts/native-smb-precise-history.patch)，父探针 Go 判据保持原样；共享脚本限定产物目录和 precise 测试进程清理。已知补丁输入经原始/规范 hash 核对后转换 CRLF→LF，再核对规范输出；不接受未知字节。成功 Verify 明确退出 0，策略变化或资源残留仍失败。实验对象仍是有明确来源的诊断树，不能成为当前生产通知 API 的承诺。
 
 [历史 producer](../../../../.github/scripts/native-smb-precise-history_test.go.txt)从实际 HTTP Snapshot 的完整 EOF 建立有界前像，以原 Rename 同一锁内捕获的 P/Q、两项实际事件、action 输入指纹和已保存的原动作回执绑定事实，再核对 RenameWithBarrier 的回复/barrier 与 stream 真正交付的完整区间。上限为 64 节点、256 KiB 前像和 1 MiB 证据，不用预期结果填通知。历史 full-name proof 与当前披露权限分离：存活引用、授权、实际祖先和完整 sibling 集继续检查；group/验证 pin 的拥有权延续至 release，Close 排空验证和释放工作。这让历史叶名不必假装仍属于当前树，同时不会把旧权限当成当前授权。
 
@@ -105,7 +105,7 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 该轨迹中旧 CREATE 请求了 QFid，新 CREATE 只有 DH2Q，未出现 file QUERY_INFO 6/18/59；原观察器没有保存 QFid 数值响应。不能从请求存在或 authority NodeID 推导系统使用了哪个身份值。精确实验为此增加被动关联记录，既不补发查询，也不把原失败改成成功。
 
-typed-rescan 的局部三个根普通/race 各 144 pass，detail-only 与 readiness 对照分别命中规定的失败。精确历史单项的 26 个本地根普通/race 各 285 个 verdict 通过，四个因果对照、十个源提取 PowerShell 清理选择用例、错误 pin 拒绝、精确准备、ARM64 构建和 actionlint 通过。这些分别证明自己的 harness 来源、错误判据与拥有权；精确单项尚未原生执行，已有局部和增长/缩短结果不证明替换身份、当前生产适配或完整缓存方案。
+typed-rescan 的局部三个根普通/race 各 144 pass，detail-only 与 readiness 对照分别命中规定的失败。精确历史单项的 26 个本地根普通/race 各 285 个 verdict 通过，四个因果对照、十个源提取 PowerShell 清理选择用例、错误 pin 拒绝、精确准备、ARM64 构建和 actionlint 通过。CRLF 准备回归的九个 Go 输出与此前组合逐字节相同，ARM64 binary 也相同；沿用 Go 控制收据有明确字节依据。首次 precise 作业因准备失败未进入控制或原生场景，清理成功不能补出 native 结果。这些分别证明自己的 harness 来源、错误判据与拥有权；精确单项尚未原生执行，已有局部和增长/缩短结果不证明替换身份、当前生产适配或完整缓存方案。
 
 ### 样本资格与执行来源
 

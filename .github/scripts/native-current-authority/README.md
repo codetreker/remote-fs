@@ -1,7 +1,7 @@
 # Current authority fixture
 
 This fixture connects the current Windows ARM64 HTTP client to the current Linux
-authority. The authority runs inside an x86-64 Linux guest under QEMU TCG. Its
+authority. Native Windows ARM64 QEMU runs the x86-64 Linux guest under TCG. Its
 SQLite database, native lease witness and local objects live on a private ext4
 image. The Windows host exposes one loopback HTTP forwarding port. No guest
 network download, external service or public endpoint is required.
@@ -21,11 +21,20 @@ the guest init on the host. It builds the current `cmd/remote-fs-server` and the
 fixture helpers, then formats a new 1 GiB regular file as ext4. The manifest binds
 each artifact and source input to the checkout commit and tree.
 
-The Windows QEMU bundle is the project-linked Weil maintainer build. Its exact
-SHA-512 is the acceptance criterion; the installer is extracted with the runner's
-7-Zip and is never executed. Every extracted file, the extractor version and the
-complete DLL/firmware tree are recorded. The controller checks the x64 PE machine
-and QEMU version before booting it under Windows ARM64 translation.
+The Windows QEMU bundle is the project-linked Weil native ARM64 11.1.0 build.
+`inputs.json` pins its exact size and SHA-512; the installer is extracted with the
+runner's 7-Zip and is never executed. Every extracted file, extractor version and
+complete DLL/firmware tree are recorded. The controller requires ARM64 PE files
+for QEMU, controller and probe, then checks QEMU version/capabilities. The
+`qemu-system-x86_64.exe` name identifies the Linux guest target, not its host PE
+architecture. The guest kernel, backend, VM manager and deadlines are unchanged.
+
+Static inspection verified the archive and its bundled ARM64 import closure.
+The publisher labels the Windows-on-ARM build untested; the checksum is byte
+provenance, not a signing or reproducible-build claim. Actual native guest boot
+and HTTP readiness remain separate gates. The previous x64 package exited with
+`0xC00000FF` before guest output or authority startup; its offending unwind table
+and module are unknown.
 
 The [workflow](../../workflows/native-current-authority.yml) assembles the image on
 Ubuntu 24.04 and downloads that exact artifact into the Windows 11 ARM64 job. Both

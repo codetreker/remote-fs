@@ -291,3 +291,4 @@ if (($before.CachePolicy | ConvertTo-Json -Compress) -ne ($policy | ConvertTo-Js
 if ($recovered.Count -ne 0 -or $remainingMappings.Count -ne 0 -or $remainingProcesses.Count -ne 0) {
     throw 'The probe did not release all owned mappings and processes cleanly.'
 }
+exit 0

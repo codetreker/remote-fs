@@ -525,25 +525,25 @@ var differentialSteps = []step{
 	}},
 
 	{"remove a directory that still has entries", func(root string) (string, error) {
-		return "", syscall.Rmdir(filepath.Join(root, "sub"))
+		return "", comparisonRmdir(filepath.Join(root, "sub"))
 	}},
 	{"remove a file", func(root string) (string, error) {
-		return "", syscall.Unlink(filepath.Join(root, "sub", "deep.txt"))
+		return "", comparisonUnlink(filepath.Join(root, "sub", "deep.txt"))
 	}},
 	{"remove the now empty directory", func(root string) (string, error) {
-		return "", syscall.Rmdir(filepath.Join(root, "sub"))
+		return "", comparisonRmdir(filepath.Join(root, "sub"))
 	}},
 	{"remove a directory with unlink", func(root string) (string, error) {
-		return "", syscall.Unlink(filepath.Join(root, "d"))
+		return "", comparisonUnlink(filepath.Join(root, "d"))
 	}},
 	{"remove a file with rmdir", func(root string) (string, error) {
-		return "", syscall.Rmdir(filepath.Join(root, "fresh.txt"))
+		return "", comparisonRmdir(filepath.Join(root, "fresh.txt"))
 	}},
 	{"remove a missing file", func(root string) (string, error) {
-		return "", syscall.Unlink(filepath.Join(root, "absent.txt"))
+		return "", comparisonUnlink(filepath.Join(root, "absent.txt"))
 	}},
 	{"remove a missing directory", func(root string) (string, error) {
-		return "", syscall.Rmdir(filepath.Join(root, "absent"))
+		return "", comparisonRmdir(filepath.Join(root, "absent"))
 	}},
 
 	{"list what is left", func(root string) (string, error) {

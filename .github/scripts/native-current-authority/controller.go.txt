@@ -31,8 +31,8 @@ const (
 	responsePrefix = "RFS-FIXTURE/1 "
 	controlLimit   = 1024
 	streamLimit    = 16 << 20
-	qemuSHA512     = "5bcf9eed634e8575a37b74f445af41a2fe4106da512d0c30c368301d4c105037fdfab40a5287367a28a957624cddebbc8c07e16c88ab6634f554cdf3d16bf543"
-	qemuURL        = "https://qemu.weilnetz.de/w64/2026/qemu-w64-setup-20260811.exe"
+	qemuSHA512     = "51db3e9f8afe9e3046ecab114d5c4718f6f8844e956dd1cb60591a903eb99b74feaf7cf7eb295cc2faacc0b2befd19a646a58a86db980be4dbf1b4a7d9d8d6a7"
+	qemuURL        = "https://qemu.weilnetz.de/aarch64/qemu-arm-setup-20260811.exe"
 )
 
 var (
@@ -1034,16 +1034,9 @@ func run(ctx context.Context, o options) (resultErr error) {
 			return err
 		}
 	}
-	if err := requireMachine(executable, pe.IMAGE_FILE_MACHINE_AMD64); err != nil {
-		return err
-	}
-	for _, name := range []string{"probe_windows_arm64", "controller_windows_arm64"} {
-		if err := requireMachine(filepath.Join(o.ArtifactDir, filepath.FromSlash(m.Artifacts[name].Path)), pe.IMAGE_FILE_MACHINE_ARM64); err != nil {
-			return err
-		}
-	}
-
-	host, err := newPlatform()
+	host, err := nativeHostPlatform(executable,
+		filepath.Join(o.ArtifactDir, filepath.FromSlash(m.Artifacts["probe_windows_arm64"].Path)),
+		filepath.Join(o.ArtifactDir, filepath.FromSlash(m.Artifacts["controller_windows_arm64"].Path)))
 	if err != nil {
 		return err
 	}
@@ -1112,6 +1105,17 @@ func run(ctx context.Context, o options) (resultErr error) {
 		return err
 	}
 	return lifecycle(ctx, host, m, id, executable, bios, o.ArtifactDir, evidenceDir, workDir, log)
+}
+
+func nativeHostPlatform(qemu, probe, controller string) (platform, error) {
+	for _, executable := range []struct{ name, path string }{
+		{"QEMU", qemu}, {"probe", probe}, {"controller", controller},
+	} {
+		if err := requireMachine(executable.path, pe.IMAGE_FILE_MACHINE_ARM64); err != nil {
+			return nil, fmt.Errorf("%s host executable: %w", executable.name, err)
+		}
+	}
+	return newPlatform()
 }
 
 func requireMachine(path string, expected uint16) error {
