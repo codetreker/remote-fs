@@ -391,7 +391,7 @@ go vet ./packages/smb ./packages/smb/internal/wire ./packages/smb/internal/signi
 
 readiness 经真实 HTTP lease/FileSession 检查原子打开、字节、metadata 条件、retained rename/unlink 与逻辑 quota，然后停止并普通重开同一磁盘，验证 sentinel 的 ID/字节/metadata。成功要求实际 authority/QEMU 退出、guest sync/unmount、流排空、私有磁盘删除和基底不变；监听端口或计数归零不能代替它们。该工具始终把 native_acceptance 标为未运行，不能充当 SMB 或一秒可见性门禁。
 
-[模板测试入口](../.github/scripts/native-current-authority/check-tooling.py)显式列举隐藏 Go 模板的根和 verdict，普通 module 发现不覆盖它们。当前普通检查为 36 根/176 verdict，guest/probe/controller 的普通与 race 分别通过 87/63/26 verdict；Python 装配、进程拥有权和 checker 共 24 根。一次本地 Linux TCG 真正启动、HTTP readiness、普通重启和完整关闭通过；来源明确为本地脏 artifact，不冒充未来 CI commit。Windows 翻译运行、native ACL/Job 和 HTTP 组合尚未实测，SMB/缓存验收未运行；mock/交叉构建及 Linux VM 结果分别记录。[决定](../.agents/notes/implemented/testing/2026-09-19-current-authority-virtual-machine-fixture.md)说明与固定原型诊断的分工，普通重启不宣称断电可靠性。
+[模板测试入口](../.github/scripts/native-current-authority/check-tooling.py)显式列举隐藏 Go 模板的根和 verdict，普通 module 发现不覆盖它们。当前普通检查为 36 根/176 verdict，guest/probe/controller 的普通与 race 分别通过 87/63/26 verdict；Python 装配、进程拥有权和 checker 共 26 根；结构化源码发现只从 stdout 解码，依赖下载等 stderr 诊断单独流出，失败退出仍传播，不能把合法诊断混入 JSON 或丢弃。一次本地 Linux TCG 真正启动、HTTP readiness、普通重启和完整关闭通过；来源明确为本地脏 artifact，不冒充未来 CI commit。Windows 翻译运行、native ACL/Job 和 HTTP 组合尚未实测，SMB/缓存验收未运行；mock/交叉构建及 Linux VM 结果分别记录。[决定](../.agents/notes/implemented/testing/2026-09-19-current-authority-virtual-machine-fixture.md)说明与固定原型诊断的分工，普通重启不宣称断电可靠性。
 
 ### Windows 原生 SMB 缓存诊断
 
@@ -456,11 +456,15 @@ owned_rescan 必须从实际捕获的 SMB Command 15 请求及同一 MessageID �
 
 替换场景只预先打开原生 A 句柄，B 通过 HTTP 创建和准备，不能先打开 B 向 redirector 提供它的身份。mutation 前快照与最终排空的完整轨迹都核对冷态：整个轨迹不得出现 B 的 CREATE/QUERY_INFO/READ，直到 ACK 不得出现目录枚举或无法关联的 file ID。最终核对只能维持或撤销先前资格，不能把已失败的证据升级；迟到的 B 暴露使样本和测试失败，保留原始首值及身份结果。HTTP 把 B 改名覆盖 target 后，首个目标观察是同步 CreateFile，随后核对同一 volume 中新旧原生 ID 不同、旧 ID 不变、旧句柄仍读 A 且新句柄读 B；原生 ID 不与 authority NodeID 作数值等同。首次打开及四项后续身份/读取检查全部须在 ACK+一秒及原缓存到期之前完成，后置 oracle 分别核对 A、B 和源名字移除。
 
-替换通知最多接纳三批：同一 watcher 句柄、连接/session/filter/递归属性保持一致，每批原生完成已排空，wire 请求/响应和事件逐项匹配；先有 target 的 REMOVED，再有同批相邻的 replacement OLD_NAME / target NEW_NAME。每次重新监听必须取得新的、精确关联的 Pending，不能重开路径。所有批次共用 ACK+850 ms 的绝对通知截止，重挂不延长一秒期限；第四批、丢明细、额外事件或歧义不能成为成功。
+替换通知明确区分 DETAIL 与 VERIFIED_RESCAN。DETAIL 必须匹配排空的 native 完成与同一 wire 请求/响应，先有 target 的 REMOVED，再有同批相邻的 replacement OLD_NAME / target NEW_NAME。只有当前请求的真实 STATUS_NOTIFY_ENUM_DIR（0x10c）与原生零字节或 ERROR_NOTIFY_ENUM_DIR 同时匹配，才能进入 VERIFIED_RESCAN；一旦进入便保留 rescan_required=true、precise_notification_proven=false，不把随后事件拼成完整精确通知。
+
+两条路径都最多处理三次完成，沿同一 watcher 句柄、连接/session/filter/递归属性排空后重挂，最多三次重挂且每次核对新的实际 Pending，不能重开路径。rescan 后还核对 native event 尚未完成和 wire 观察顺序；最终排空轨迹若显示首个 API 之前已观察到 terminal，则撤销资格。序号解决相等时钟下的观测先后，readiness 检查只证明该检查点，不证明内核未来不会交付完成。所有等待/重挂共用 ACK+850 ms 的绝对通知截止，首个打开、身份与 A/B 字节仍遵守一秒/原 TTL。rescan 成功使用独立的 current_replacement_identity_after_verified_rescan_before_deadline 分类，只证明丢明细后该次身份/字节观察，不宣称精确通知或目录枚举恢复。
 
 首值保持不可变，后置 HTTP oracle、完整轨迹、原策略及清理均为证据资格。合格的 watched 旧首值使候选测试失败，但一秒内的旧样本不是超过一秒的违约证明；noWatcher 的合格旧值或新值只作观察，均不证明一秒保证。取消 overlapped 通知必须等待完成再释放缓冲。三个解析/关联/资格测试根必须先于原生根通过，协议补丁的具名回归也不能缺失；所有测试使用 `-count=1`、三分钟上限并严格检查 fail/skip/verdict，产物保存十四天。
 
-[首次五场景原生运行 35411939518](https://github.com/codetreker/remote-fs/actions/runs/35411939518)整体失败：三项增长取得合格当前值，share0/app-first 虽返回新值，但准备完成与写入开始的时钟相等使原 Quiet 判据失败，该样本保留 inconclusive；noWatcher 返回旧值，只是观察对照。完整事实由[诊断决定](../.agents/notes/implemented/testing/2026-09-16-native-smb-cache-diagnostic.md)记录，不按新判据追改原结果。七场景源码的精确 PowerShell 准备、actionlint 与完整 Windows ARM64 探针构建通过；从源提取的三个可移植测试根普通/race 各 101 pass，使用限定 Windows 常量/Filetime shim。新七场景尚未原生执行；生产父目录布局、映射、完整名字/身份与故障行为仍需各自证明。
+[五场景运行 35411939518](https://github.com/codetreker/remote-fs/actions/runs/35411939518)保留整体失败及相等时钟导致的 inconclusive。[七场景运行 35414601479](https://github.com/codetreker/remote-fs/actions/runs/35414601479)的四项增长和一项缩短取得合格当前值，noWatcher 仍只返回观察用旧值；替换在合法 0x10c/零字节通知处中止，尚无首次打开、身份或字节样本，整体仍失败。未赋值的 cold_source=false 不证明 B 被预热；历史结果不按新判据追改。完整来源和资格见[诊断决定](../.agents/notes/implemented/testing/2026-09-16-native-smb-cache-diagnostic.md)。
+
+当前 typed-rescan 源码的精确 PowerShell 准备、actionlint 与完整 Windows ARM64 探针构建通过；三个可移植测试根普通/race 各 144 pass，使用限定 Windows 常量/Filetime shim。仅接受 detail 的对照在真实 ENUM 配对断言失败，移除 readiness 观察序号的对照在相等时钟下提前完成的断言失败。typed-rescan 七场景尚未原生执行；生产父目录布局、映射、完整名字/身份与故障行为仍需各自证明。
 
 ## 每次改动必须带什么
 

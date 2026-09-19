@@ -12,7 +12,7 @@ Windows 系统客户端的验收需要实际接入当前 HTTP 与持久 authorit
 
 [独立工作流](../../../../.github/workflows/native-current-authority.yml)把当前源码的 Linux authority 和 Windows HTTP 客户端放在同一项可核对的测试中。Ubuntu 构建固定 kernel、最小 initramfs、当前 server/helper 与私有 ext4 基底；Windows ARM64 作业使用固定的 x64 QEMU bundle，经系统翻译和 TCG 运行 Linux guest。生产 backend 不移植、不替换，当前 SMB 适配仍独立于这个准备工具。
 
-[工具说明](../../../../.github/scripts/native-current-authority/README.md)拥有依赖 pin、装配命令和进程规则。bundle 只提取，installer 不执行；kernel package 不执行安装脚本。artifact 绑定输入 hash、源码与工具链；Windows 作业核对同一源码的 artifact，CI 的脏来源、缺失 verdict 或来源变化直接失败。依赖、缓存、临时磁盘与证据都留在 checkout 的 `.tmp`。
+[工具说明](../../../../.github/scripts/native-current-authority/README.md)拥有依赖 pin、装配命令和进程规则。bundle 只提取，installer 不执行；kernel package 不执行安装脚本。结构化源码发现只解码 stdout，stderr 的下载/诊断保持独立输出，命令失败仍传播；合法诊断不改变 JSON 输入。artifact 绑定输入 hash、源码与工具链；Windows 作业核对同一源码的 artifact，CI 的脏来源、缺失 verdict 或来源变化直接失败。依赖、缓存、临时磁盘与证据都留在 checkout 的 `.tmp`。
 
 每次运行复制私有可写 ext4 磁盘。guest 中 authority 以 UID/GID 1000 访问真实 localstore、SQLite、nativelease 与 local objects；宿主只开放一个 loopback HTTP 转发，无共享宿主目录。PID 1 在任何 mount/修改前核对执行身份、初始 root、配置和 boot token；nonce、顺序号、有界控制输出将实际 child 生命周期绑定到本次运行。
 
@@ -34,6 +34,6 @@ HTTP readiness 使用真实 lease/FileSession，验证引用、原子打开、�
 
 本地 Linux TCG 已完成一次真实 guest/readiness/普通重启/关闭，私有磁盘删除、基底和输入保持不变。该本地 artifact 明确记录脏源码来源，不能充当随后 CI commit 的收据。Windows 的 QEMU 翻译运行、native ACL/Job 实测及 HTTP 组合仍未执行；这些之外，SMB 映射、系统重定向器缓存和一秒可见性也尚未由本工具验证。
 
-隐藏 Go 模板通过显式测试入口运行，不依赖普通模块发现。当前模板普通测试 36 根、176 个通过 verdict；guest/probe/controller 的普通与 race 各有 87/63/26 个通过 verdict，Python 装配/拥有权/checker 用例共 24 根。各自验证错误、输出界限与清理，不把 mock Windows API、交叉构建或 Linux VM 成功称为 Windows 执行。具体执行入口见[测试策略](../../../../docs/testing.md#当前-authority-的独立运行环境)。
+隐藏 Go 模板通过显式测试入口运行，不依赖普通模块发现。当前模板普通测试 36 根、176 个通过 verdict；guest/probe/controller 的普通与 race 各有 87/63/26 个通过 verdict，Python 装配/拥有权/checker 用例共 26 根。各自验证错误、输出界限与清理，不把 mock Windows API、交叉构建或 Linux VM 成功称为 Windows 执行。具体执行入口见[测试策略](../../../../docs/testing.md#当前-authority-的独立运行环境)。
 
 维护成本包括 kernel/QEMU 固定输入、镜像生成、两作业 artifact 传递和宿主清理工具。boot 上限 120 秒，命令/probe 各 30 秒，输出与磁盘都有界；超限留下明确失败。磁盘使用正常 guest flush 的 writeback，普通重开证明已观察的同步持久路径，不宣称宿主断电或硬件缓存可靠性。完整平台接入仍由[Windows 提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)承接。

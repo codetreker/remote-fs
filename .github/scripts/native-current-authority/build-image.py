@@ -39,10 +39,11 @@ def owned_path(value):
     return path
 
 
-def command(args, env=None, capture=False):
+def command(args, env=None, capture=False, diagnostics=False):
     print(json.dumps({"command": [str(x) for x in args]}), flush=True)
     if capture:
-        return subprocess.check_output(args, cwd=ROOT, env=env, text=True, stderr=subprocess.STDOUT).strip()
+        stderr = subprocess.STDOUT if diagnostics else None
+        return subprocess.check_output(args, cwd=ROOT, env=env, text=True, stderr=stderr).strip()
     subprocess.run(args, cwd=ROOT, env=env, check=True)
 
 
@@ -280,8 +281,8 @@ def main():
                 "build": {"go_version": PINS["go_version"], "goos": "linux", "goarch": "amd64", "cgo_enabled": "0",
                           "flags": ["-trimpath", "-buildvcs=false"],
                           "tool_versions": {"go": go_version, "python": sys.version.splitlines()[0],
-                                            "mke2fs": command(["mke2fs", "-V"], capture=True),
-                                            "dpkg_deb": command(["dpkg-deb", "--version"], capture=True)}},
+                                            "mke2fs": command(["mke2fs", "-V"], capture=True, diagnostics=True),
+                                            "dpkg_deb": command(["dpkg-deb", "--version"], capture=True, diagnostics=True)}},
                 "qemu": {key: PINS["qemu"][key] for key in ("version", "url", "sha512", "machine")},
                 "artifacts": artifacts}
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

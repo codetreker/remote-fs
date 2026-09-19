@@ -207,6 +207,7 @@ if ($Phase -in @('PrepareFixture', 'Run')) {
     Replace-ExactlyOnce $wire 'c.received.observe(buffer[:n])' "c.received.observe(buffer[:n])`nif c.positive != nil { c.positive.observe(buffer[:n], false) }"
     Replace-ExactlyOnce $wire 'c.sent.observe(buffer[:n])' "c.sent.observe(buffer[:n])`nif c.positive != nil { c.positive.observe(buffer[:n], true) }"
     $positiveWire = Join-Path $testRoot 'gate_positive_wire_windows_test.go'
+    Replace-ExactlyOnce $positiveWire 'r.Connection = o.id' "r.Connection = o.id`ncacheGateParentWireObserved(r)"
     Replace-ExactlyOnce $positiveWire 'r := cacheGatePositiveWireRecord{Response: response, MessageID:' 'r := cacheGatePositiveWireRecord{Connection: o.id, Response: response, MessageID:'
     Replace-ExactlyOnce $positiveWire "`tcase wire.Close, wire.Flush:" "`tcase wire.ChangeNotify:`n`t`treturn cacheGateParentNotifyRequest(packet, r)`n`tcase wire.Close, wire.Flush:"
     Replace-ExactlyOnce $positiveWire "`tswitch r.Command {`n`tcase wire.Create:" "`tswitch r.Command {`n`tcase wire.ChangeNotify:`n`t`treturn cacheGateParentNotifyResponse(packet, r)`n`tcase wire.Create:"

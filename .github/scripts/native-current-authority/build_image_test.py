@@ -90,6 +90,15 @@ class ImageSafetyTests(unittest.TestCase):
         self.assertEqual(image.artifact(path, self.root), {
             "path": "payload", "size": 7, "sha256": hashlib.sha256(b"fixture").hexdigest()})
 
+    def test_dependency_json_is_separate_from_download_diagnostics(self):
+        script = 'import json,sys; print("go: downloading fixture-dependency v1",file=sys.stderr); print(json.dumps({"Dir":"/repo/packages/storage"}))'
+        data = image.command([sys.executable, "-c", script], capture=True)
+        self.assertEqual(json.loads(data), {"Dir": "/repo/packages/storage"})
+
+    def test_version_capture_can_explicitly_include_stderr(self):
+        script = 'import sys; print("fixture formatter 1.0",file=sys.stderr)'
+        self.assertEqual(image.command([sys.executable, "-c", script], capture=True, diagnostics=True), "fixture formatter 1.0")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -38,7 +38,7 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 [祖先探针](../../../../.github/scripts/native-smb-parent-invalidation_test.go.txt)的增长和缩短分别以真实 HTTP 把暖属性的 257 字节改为 769 字节、769 字节改为 73 字节。首次 GetFileAttributesExW 必须在 ACK 后一秒内完成，且早于原始最早到期，计时包含通知等待。native-call ledger 以连续、唯一的操作开始/结束序号和 mutation 序号记录因果顺序，时钟仍用于期限；这避免时钟精度把已经完成的准备调用误判为插入写入后的访问。harness 不得在写入后额外访问目标/祖先或提前 oracle，合法的自动刷新不受此禁令限制。匹配通知之后、新 tuple 的目标响应可以早于 ACK 或首次 API，分别标记 `refreshed_before_first_api`、`refreshed_by_first_api`，关联不完整则不能证明机制。
 
-替换只预先保留原生 A 句柄，B 完全通过 HTTP 准备；mutation 前及最终排空的轨迹均须满足冷态判据：整个轨迹排除 B 的 CREATE/QUERY_INFO/READ，直到 ACK 排除目录枚举和未知 file ID；最终核对只能撤销、不能升级先前资格，迟到污染保留原始数据并使样本 inconclusive、测试失败。不能用预先打开 B 来教会 redirector 新身份。覆盖后先同步打开 target，再核对同一 volume 上的新旧原生 ID 不同、旧 ID 未变及 A/B 各自字节，不能把原生 ID 数值直接等同于 authority NodeID。通知最多三批，沿同一 watcher 排空后重挂，每次核对新 Pending、完整 wire/native 事件及 REMOVED 后相邻 OLD_NAME/NEW_NAME；共用 ACK+850 ms 通知截止。首次打开与全部身份/读取检查仍须在 ACK+一秒及缓存到期之前完成。原始首值、后置双对象 oracle、轨迹和最终清理共同决定资格；旧首值是候选失败，不单独成为超过一秒反例，无监听对照也不外推 share6 因果关系。
+替换只预先保留原生 A 句柄，B 完全通过 HTTP 准备；mutation 前及最终排空的轨迹均须满足冷态判据：整个轨迹排除 B 的 CREATE/QUERY_INFO/READ，直到 ACK 排除目录枚举和未知 file ID；最终核对只能撤销、不能升级先前资格，迟到污染保留原始数据并使样本 inconclusive、测试失败。不能用预先打开 B 来教会 redirector 新身份。覆盖后先同步打开 target，再核对同一 volume 上的新旧原生 ID 不同、旧 ID 未变及 A/B 各自字节，不能把原生 ID 数值直接等同于 authority NodeID。通知区分 DETAIL 与 VERIFIED_RESCAN：前者核对完整 wire/native 事件及 REMOVED 后相邻 OLD_NAME/NEW_NAME；后者只在当前请求的真实 0x10c 与排空的原生零字节或 ERROR_NOTIFY_ENUM_DIR 配对时成立。VERIFIED_RESCAN 一旦出现便保持 rescan_required=true、precise_notification_proven=false，不能把后续片段重组为已证明的完整事件序列。两者最多三次完成、三次重挂，保持同一 watcher 及精确新 Pending，共用 ACK+850 ms 截止。rescan 还须有 native event 的未完成检查点及首个 API 前的 wire 观察顺序，最终轨迹只能撤销资格；检查点不保证内核未来不会完成。首次打开与全部身份/读取检查仍须在 ACK+一秒及缓存到期之前完成，rescan 成功另标 current_replacement_identity_after_verified_rescan_before_deadline，不冒充精确通知或目录枚举恢复。原始首值、后置双对象 oracle、轨迹和最终清理共同决定资格；旧首值是候选失败，不单独成为超过一秒反例，无监听对照也不外推 share6 因果关系。
 
 ## 备选方案
 
@@ -87,11 +87,15 @@ NoLeasing 是另一个独立的平台策略对照。[补丁](../../../../.github
 
 [FindFirstChangeNotification 对照 35087653528](https://github.com/codetreker/remote-fs/actions/runs/35087653528)中，NTFS root 两个顺序均冲突，SMB watcher-first 已有 Pending 而应用打开仍冲突；SMB application-first 的无监听基线失败，不能作为有效对照。替代通知入口尚未证明兼容，也没有由此取得可见性、重新监听或故障验收。
 
-### 祖先通知的增长观察
+### 祖先通知的原生观察
 
 [35411939518](https://github.com/codetreker/remote-fs/actions/runs/35411939518/job/105813131180)以探针 `45ba22aed7f338b298f0a7ae1543525b5f7abfec` 在 Windows 11 Enterprise 26200 ARM64 执行最初五项，整体失败。share0/watcher-first、share6/watcher-first、share6/app-first 分别在 ACK 后 25.185、26.501、23.653 ms 取得合格当前属性。share0/app-first 在 24.265 ms 返回新大小，但第二次 warm 完成与写入开始记录了相等时钟，原严格先后判据因此得到 Quiet=false；该项仍为 inconclusive，不能把新顺序判据追用于原结果并改称通过。share0 noWatcher 在 0.511 ms 返回旧的 257 字节，只作观察，不是超过一秒反例。
 
-该次各项后置 oracle 与清理均完成，默认缓存 lifetime 仍为 5/10/10 秒，没有残留映射/进程。三项合格增长只证明各自配置，不等于全部顺序或生产方案通过。完整新七场景的精确 PowerShell 准备、actionlint 和 Windows ARM64 探针构建通过，三个可移植解析/关联/资格测试根普通/race 各 101 pass；其中使用限定 Windows 常量和 Filetime shim。包含顺序判据、缩短与冷 B 替换的七场景尚未原生执行。
+该次各项后置 oracle 与清理均完成，默认缓存 lifetime 仍为 5/10/10 秒，没有残留映射/进程。三项合格增长只证明各自配置，不等于全部顺序或生产方案通过。
+
+[35414601479](https://github.com/codetreker/remote-fs/actions/runs/35414601479/job/105820628128)使用探针 `d7110afda15994310835e9a5a8354dec88f91df6` 的七项，四项增长在 ACK 后 21.842～23.660 ms 合格可见，share0/app-first 缩短在 22.086 ms 取得 73 字节；noWatcher 的 257 字节仍只作观察。替换收到合法 STATUS_NOTIFY_ENUM_DIR（0x10c）与零字节，detail-only helper 在首次打开前中止，因此没有新旧身份或字节首样本、没有后置双对象 oracle，整项及作业仍失败。cold_source 的 false 来自中止后未赋值的字段参与最终核对；已排空轨迹没有发现 B 名字暴露或目录枚举，不能据该 false 归因于 B 被预热。这只澄清缺失证据，不把原失败改为通过。默认 5/10/10 与清理检查保持，原始失败收据不变。
+
+typed-rescan 探针的精确 PowerShell 准备、actionlint 和完整 Windows ARM64 构建通过，三个可移植解析/关联/资格测试根普通/race 各 144 pass，使用限定 Windows 常量和 Filetime shim。detail-only 的隔离对照在 ENUM 配对失败，删除 readiness 观察序号的对照暴露相等时钟下提前完成的误接纳。当前 typed-rescan 七场景尚未原生执行，已有增长/缩短结果不证明替换身份或完整产品方案。
 
 ### 样本资格与执行来源
 
