@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -45,6 +46,66 @@ func savedState(o options) probeState {
 				metadataNamespace: {Version: []byte{1, 2, 3}, Data: []byte("sealed:" + digest(content))},
 			}},
 		}}
+}
+
+func TestProbeCommandRoutesOnlyLeadingMappingHelper(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		args   []string
+		helper bool
+	}{
+		{name: "empty"},
+		{name: "probe", args: []string{"--phase", createPhase}},
+		{name: "helper", args: []string{"--mapping-helper"}, helper: true},
+		{name: "helper arguments", args: []string{"--mapping-helper", "unexpected"}, helper: true},
+		{name: "nonleading", args: []string{"--phase", createPhase, "--mapping-helper"}},
+		{name: "flag value", args: []string{"--mapping-helper=true"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdin := strings.NewReader("request\nsecond frame\n")
+			var stdout bytes.Buffer
+			cause := errors.New("selected command failure")
+			probeCalls, helperCalls := 0, 0
+			probeCommand := func(args []string, output io.Writer) error {
+				probeCalls++
+				if tc.helper || !reflect.DeepEqual(args, tc.args) || output != &stdout {
+					t.Fatal("probe command received changed routing or output")
+				}
+				return cause
+			}
+			mappingHelper := func(args []string, input io.Reader, output io.Writer) error {
+				helperCalls++
+				if !tc.helper || !reflect.DeepEqual(args, tc.args[1:]) || input != stdin || output != &stdout {
+					t.Fatal("mapping helper received changed arguments or streams")
+				}
+				return cause
+			}
+			err := routeProbeCommand(tc.args, stdin, &stdout, probeCommand, mappingHelper)
+			if !errors.Is(err, cause) || probeCalls+helperCalls != 1 || (helperCalls == 1) != tc.helper {
+				t.Fatalf("routing lost the selected error: probe=%d helper=%d err=%v", probeCalls, helperCalls, err)
+			}
+			if stdout.Len() != 0 || stdin.Len() != len("request\nsecond frame\n") {
+				t.Fatal("dispatcher consumed input or wrote an unowned reply")
+			}
+		})
+	}
+}
+
+func TestProbeCommandDispatchRefusalsPreserveStreams(t *testing.T) {
+	stdin := strings.NewReader("request\n")
+	var stdout bytes.Buffer
+	if err := dispatchProbeCommand([]string{"--invalid-probe-option"}, stdin, &stdout); err == nil {
+		t.Fatal("invalid probe arguments were accepted")
+	}
+	if runtime.GOOS != "windows" {
+		err := dispatchProbeCommand([]string{"--mapping-helper"}, stdin, &stdout)
+		if err == nil || !strings.Contains(err.Error(), "requires native Windows") {
+			t.Fatalf("non-Windows mapping helper was not explicitly refused: %v", err)
+		}
+	}
+	if stdout.Len() != 0 || stdin.Len() != len("request\n") {
+		t.Fatal("refused command consumed input or emitted a receipt")
+	}
 }
 
 func TestProbeArgumentsRejectUnboundInputs(t *testing.T) {

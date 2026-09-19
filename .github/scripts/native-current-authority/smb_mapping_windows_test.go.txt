@@ -24,116 +24,997 @@ import (
 	"unsafe"
 )
 
-func mappingOptionsForTest() options {
-	return options{RunID: "mapping-test", SourceSHA: strings.Repeat("a", 40), FixtureNonce: strings.Repeat("b", 64), Volume: fixtureVolume, Phase: "current-smb-cold", Sequence: 3}
+func mappingExpectedTransportForTest(port uint16) [24]byte {
+	return [24]byte{0x54, 0x72, 0x61, 0x50, 24, 0, 0, 0, 1, 0, 0, 0, 0, 0, byte(port), byte(port >> 8), 0, 0, 0, 0, 1, 0, 0, 0}
 }
 
-func TestMappingPowerShellEnvironmentPolicy(t *testing.T) {
-	captured, err := base64.StdEncoding.DecodeString("QzpcVXNlcnNccnVubmVyYWRtaW5cRG9jdW1lbnRzXFBvd2VyU2hlbGxcTW9kdWxlcztDOlxQcm9ncmFtIEZpbGVzXFBvd2VyU2hlbGxcTW9kdWxlcztjOlxwcm9ncmFtIGZpbGVzXHBvd2Vyc2hlbGxcN1xNb2R1bGVzO0M6XFxNb2R1bGVzXGF6XzE1LjYuMTtDOlxVc2Vyc1xwYWNrZXJcRG9jdW1lbnRzXFdpbmRvd3NQb3dlclNoZWxsXE1vZHVsZXM7QzpcUHJvZ3JhbSBGaWxlc1xXaW5kb3dzUG93ZXJTaGVsbFxNb2R1bGVzO0M6XFdpbmRvd3Ncc3lzdGVtMzJcV2luZG93c1Bvd2VyU2hlbGxcdjEuMFxNb2R1bGVzO0M6XFByb2dyYW0gRmlsZXNcTWljcm9zb2Z0IFNRTCBTZXJ2ZXJcMTMwXFRvb2xzXFBvd2VyU2hlbGxcTW9kdWxlc1w=")
-	if err != nil || len(captured) != 359 || fmt.Sprintf("%x", sha256.Sum256(captured)) != "fd4d6623b1d2dd83d73c5c7d52bb5ec06cb61fd63ad5f1e4d174e19a4d6391d5" {
-		t.Fatal("captured parent module-path fixture changed")
+func TestMappingNativeABIAndTransportOptions(t *testing.T) {
+	var resource mappingNetResource
+	offsets := []uintptr{unsafe.Offsetof(resource.Scope), unsafe.Offsetof(resource.Type), unsafe.Offsetof(resource.DisplayType), unsafe.Offsetof(resource.Usage), unsafe.Offsetof(resource.LocalName), unsafe.Offsetof(resource.RemoteName), unsafe.Offsetof(resource.Comment), unsafe.Offsetof(resource.Provider)}
+	if err := checkMappingNativeABI(); err != nil || unsafe.Sizeof(resource) != 48 || unsafe.Alignof(resource) != 8 || !reflect.DeepEqual(offsets, []uintptr{0, 4, 8, 12, 16, 24, 32, 40}) {
+		t.Fatalf("NETRESOURCEW layout differs from the Windows 64-bit ABI: offsets=%v error=%v", offsets, err)
 	}
-	root := `C:\Windows\System32\WindowsPowerShell\v1.0\Modules`
-	parent := []string{"PSModulePath=" + string(captured), "psMODULEpath=duplicate", "PSMODULEANALYSISCACHEPATH=old", "psmoduleanalysiscachepath=", "Path=C:\\bin", "PATH=second-path-entry", "EMPTY=", "=C:=C:\\work", "WinPSModulePath=preserved", "UNICODE=𝄞"}
-	before := append([]string(nil), parent...)
-	child, err := mappingPowerShellEnvironment(parent, root)
-	if err != nil {
-		t.Fatal(err)
+	for _, port := range []uint16{1, 15445, 65535} {
+		encoded, err := mappingTransportOptions(port)
+		if err != nil || encoded != mappingExpectedTransportForTest(port) {
+			t.Fatalf("transport options lost TCP-only fields or zero padding: port=%d bytes=%x error=%v", port, encoded, err)
+		}
 	}
-	want := append(append([]string(nil), parent[4:]...), "PSModulePath="+root, "PSModuleAnalysisCachePath=NUL")
-	if value, present := mappingEnvironmentLookup(child, "PSModulePath"); !present || value != root || value == string(captured) {
-		t.Fatal("child retained incompatible parent module roots")
-	}
-	if !reflect.DeepEqual(child, want) || !reflect.DeepEqual(parent, before) {
-		t.Fatal("mapping environment changed unrelated entries, retained target aliases, or mutated the parent")
-	}
-	if value, present := mappingEnvironmentLookup(child, "PSModuleAnalysisCachePath"); !present || value != "NUL" {
-		t.Fatal("child cache policy is missing")
-	}
-	child[0] = "changed-only-in-child"
-	if !reflect.DeepEqual(parent, before) {
-		t.Fatal("child environment aliases parent storage")
-	}
-	empty, err := mappingPowerShellEnvironment(nil, root)
-	if err != nil || !reflect.DeepEqual(empty, []string{"PSModulePath=" + root, "PSModuleAnalysisCachePath=NUL"}) {
-		t.Fatal("empty parent environment policy changed")
-	}
-	if _, present := mappingEnvironmentLookup(empty, "WinPSModulePath"); present {
-		t.Fatal("WinPSModulePath was manufactured")
+	if encoded, err := mappingTransportOptions(0); err == nil || encoded != [24]byte{} {
+		t.Fatal("zero TCP port produced an option record")
 	}
 }
 
-func TestMappingEnvironmentRejectsInvalidEntriesBeforeDelegation(t *testing.T) {
-	for _, entry := range []string{"missing-value", "=C:", "==value", "X=private-secret\x00tail", "PSModulePath=private-secret\x00tail", "X=\xff"} {
-		parent := []string{entry}
-		before := append([]string(nil), parent...)
-		result, err := mappingPowerShellEnvironment(parent, "verified-root")
-		if result != nil || !errors.Is(err, syscall.EINVAL) || strings.Contains(err.Error(), "private-secret") || !reflect.DeepEqual(parent, before) {
-			t.Fatalf("invalid environment handling: %v", err)
-		}
+func mappingAssertUTF16Pointer(t *testing.T, pointer *uint16, expected string) {
+	t.Helper()
+	if pointer == nil {
+		t.Fatal("native resource omitted a required string")
 	}
-	for _, root := range []string{"", "one;two", "private-secret\x00tail", "\xff"} {
-		host := &mappingCommandHost{}
-		process, err := startMappingPowerShell(host, "system-powershell", []string{"same"}, "private-evidence", root)
-		var launch *windowsLaunchError
-		if process != nil || err == nil || host.starts != 0 || !errors.As(err, &launch) || !launch.Facts.CleanupConfirmed || launch.Facts.PID != nil || launch.Facts.CreateProcess != nil || strings.Contains(err.Error(), "private-secret") {
-			t.Fatalf("invalid root reached process creation or lost error facts: %v", err)
-		}
+	want := append(utf16.Encode([]rune(expected)), 0)
+	if !reflect.DeepEqual(unsafe.Slice(pointer, len(want)), want) {
+		t.Fatal("native resource changed a target string or its terminator")
 	}
 }
+
+func TestMappingNativeCreateUsesExactSevenArguments(t *testing.T) {
+	const local, remote, port = "Z:", `\\127.0.0.1\rfs-fixture`, uint16(15445)
+	for _, status := range []uint32{0, 5, 997, 1201} {
+		var calls []string
+		ops := mappingNativeOps{
+			FindAdd: func() error { calls = append(calls, "find"); return nil },
+			Add: func(owner uintptr, resource *mappingNetResource, auth uintptr, authBytes, flags uint32, options []byte, optionBytes uint32) uint32 {
+				calls = append(calls, "add")
+				if owner != 0 || auth != 0 || authBytes != 0 || flags != 0x4000 || optionBytes != 24 || len(options) != 24 {
+					t.Fatal("WNet4 changed its seven arguments, NULL authentication or integrity-only policy")
+				}
+				if resource == nil || resource.Scope != 0 || resource.Type != 1 || resource.DisplayType != 0 || resource.Usage != 0 || resource.Comment != nil || resource.Provider != nil {
+					t.Fatal("WNet4 resource includes a provider, comment or unsupported flags")
+				}
+				mappingAssertUTF16Pointer(t, resource.LocalName, local)
+				mappingAssertUTF16Pointer(t, resource.RemoteName, remote)
+				want := mappingExpectedTransportForTest(port)
+				if !bytes.Equal(options, want[:]) {
+					t.Fatal("WNet4 did not receive the exact owned TCP port and option record")
+				}
+				return status
+			},
+		}
+		invoked, code, err := mappingNativeCreate(local, remote, port, ops)
+		if !invoked || code != status || err != nil || !reflect.DeepEqual(calls, []string{"find", "add"}) {
+			t.Fatalf("native status was hidden or mutation replayed: invoked=%v status=%d calls=%v error=%v", invoked, code, calls, err)
+		}
+	}
+	lookupFailure := errors.New("WNet4 export unavailable")
+	for _, test := range []struct {
+		name, local, remote string
+		port                uint16
+		findErr             error
+		wantFind            int
+	}{
+		{"zero-port", local, remote, 0, nil, 0},
+		{"local-nul", "Z:\x00", remote, port, nil, 0},
+		{"remote-nul", local, remote + "\x00", port, nil, 0},
+		{"missing-export", local, remote, port, lookupFailure, 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			finds, adds := 0, 0
+			ops := mappingNativeOps{FindAdd: func() error { finds++; return test.findErr }, Add: func(uintptr, *mappingNetResource, uintptr, uint32, uint32, []byte, uint32) uint32 { adds++; return 0 }}
+			invoked, code, err := mappingNativeCreate(test.local, test.remote, test.port, ops)
+			if invoked || code != 0 || err == nil || finds != test.wantFind || adds != 0 || test.findErr != nil && !errors.Is(err, test.findErr) {
+				t.Fatalf("invalid setup reached mutation or lost its cause: invoked=%v finds=%d adds=%d error=%v", invoked, finds, adds, err)
+			}
+		})
+	}
+}
+
+func TestMappingUTF16RejectsMalformedAndBoundsEncodedBytes(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		words []uint16
+		limit int
+		want  string
+		valid bool
+	}{
+		{"empty", nil, 1024, "", true},
+		{"ascii", []uint16{'Z', ':'}, 2, "Z:", true},
+		{"surrogate-pair", []uint16{0x6587, 0xd83e, 0xddea}, 7, "文🧪", true},
+		{"utf8-bound", []uint16{0xd83e, 0xddea}, 3, "", false},
+		{"high-only", []uint16{0xd83e}, 1024, "", false},
+		{"low-only", []uint16{0xddea}, 1024, "", false},
+		{"high-then-ascii", []uint16{0xd83e, 'x'}, 1024, "", false},
+		{"valid-pair-then-low", []uint16{0xd83e, 0xddea, 0xddea}, 1024, "", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			value, err := mappingUTF16(test.words, test.limit)
+			if (err == nil) != test.valid || value != test.want {
+				t.Fatalf("UTF16 validity or byte bound changed: value=%q error=%v", value, err)
+			}
+		})
+	}
+	value := strings.Repeat("é", 512)
+	if got, err := mappingUTF16(utf16.Encode([]rune(value)), 1024); err != nil || got != value {
+		t.Fatal("exact UTF-8 byte limit was rejected")
+	}
+}
+
+func mappingAlignedBufferForTest(size int) []byte {
+	storage := make([]uint64, (size+7)/8)
+	return unsafe.Slice((*byte)(unsafe.Pointer(&storage[0])), size)
+}
+
+func mappingResourcePageForTest(t *testing.T, buffer []byte, rows []mappingRow) int {
+	t.Helper()
+	offset := len(rows) * 48
+	if offset > len(buffer) {
+		t.Fatal("resource fixture exceeds header capacity")
+	}
+	clear(buffer[:offset])
+	put := func(value string) uint64 {
+		words := append(utf16.Encode([]rune(value)), 0)
+		if offset+2*len(words) > len(buffer) {
+			t.Fatal("resource fixture exceeds string capacity")
+		}
+		pointer := uint64(uintptr(unsafe.Pointer(&buffer[offset])))
+		for _, word := range words {
+			binary.LittleEndian.PutUint16(buffer[offset:offset+2], word)
+			offset += 2
+		}
+		return pointer
+	}
+	for index, row := range rows {
+		header := buffer[index*48 : (index+1)*48]
+		binary.LittleEndian.PutUint32(header[4:8], 1)
+		if row.LocalPath != "" {
+			binary.LittleEndian.PutUint64(header[16:24], put(row.LocalPath))
+		}
+		binary.LittleEndian.PutUint64(header[24:32], put(row.RemotePath))
+	}
+	return offset
+}
+
+func TestMappingResourceParserCopiesOnlyBoundedNativeRows(t *testing.T) {
+	want := []mappingRow{{LocalPath: "Z:", RemotePath: `\\server\文🧪`}, {RemotePath: `\\server\deviceless`}}
+	buffer := mappingAlignedBufferForTest(4096)
+	size := mappingResourcePageForTest(t, buffer, want)
+	rows, err := parseMappingResources(buffer[:size], uint32(len(want)))
+	if err != nil || !reflect.DeepEqual(rows, want) {
+		t.Fatalf("bounded resources changed: rows=%v error=%v", rows, err)
+	}
+	clear(buffer)
+	if !reflect.DeepEqual(rows, want) {
+		t.Fatal("parsed names alias the reused enumeration buffer")
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func([]byte) ([]byte, uint32)
+	}{
+		{"zero-count", func(b []byte) ([]byte, uint32) { return b, 0 }},
+		{"over-count", func(b []byte) ([]byte, uint32) { return b, 129 }},
+		{"truncated-array", func(b []byte) ([]byte, uint32) { return b[:47], 1 }},
+		{"unaligned-array", func(b []byte) ([]byte, uint32) { return b[1:], 1 }},
+		{"non-disk", func(b []byte) ([]byte, uint32) { binary.LittleEndian.PutUint32(b[4:8], 2); return b, 1 }},
+		{"missing-remote", func(b []byte) ([]byte, uint32) { binary.LittleEndian.PutUint64(b[24:32], 0); return b, 1 }},
+		{"before-buffer", func(b []byte) ([]byte, uint32) {
+			binary.LittleEndian.PutUint64(b[16:24], uint64(uintptr(unsafe.Pointer(&b[0]))-2))
+			return b, 1
+		}},
+		{"after-buffer", func(b []byte) ([]byte, uint32) {
+			binary.LittleEndian.PutUint64(b[24:32], uint64(uintptr(unsafe.Pointer(&b[0]))+uintptr(len(b))))
+			return b, 1
+		}},
+		{"unaligned-string", func(b []byte) ([]byte, uint32) {
+			binary.LittleEndian.PutUint64(b[16:24], uint64(uintptr(unsafe.Pointer(&b[49]))))
+			return b, 1
+		}},
+		{"unterminated", func(b []byte) ([]byte, uint32) {
+			binary.LittleEndian.PutUint64(b[24:32], uint64(uintptr(unsafe.Pointer(&b[len(b)-2]))))
+			binary.LittleEndian.PutUint16(b[len(b)-2:], 'x')
+			return b, 1
+		}},
+		{"empty-remote", func(b []byte) ([]byte, uint32) {
+			binary.LittleEndian.PutUint64(b[24:32], uint64(uintptr(unsafe.Pointer(&b[len(b)-2]))))
+			return b, 1
+		}},
+		{"invalid-surrogate", func(b []byte) ([]byte, uint32) {
+			binary.LittleEndian.PutUint64(b[24:32], uint64(uintptr(unsafe.Pointer(&b[len(b)-4]))))
+			binary.LittleEndian.PutUint16(b[len(b)-4:], 0xd83e)
+			return b, 1
+		}},
+		{"pointer-beyond-returned-size", func(b []byte) ([]byte, uint32) { return b[:48], 1 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			buffer := mappingAlignedBufferForTest(256)
+			mappingResourcePageForTest(t, buffer, want[:1])
+			changed, count := test.mutate(buffer)
+			if rows, err := parseMappingResources(changed, count); err == nil || rows != nil {
+				t.Fatal("malformed native resource page became a complete inventory")
+			}
+		})
+	}
+	for _, name := range []string{strings.Repeat("x", 1025), strings.Repeat("é", 513)} {
+		buffer := mappingAlignedBufferForTest(4096)
+		size := mappingResourcePageForTest(t, buffer, []mappingRow{{RemotePath: name}})
+		if rows, err := parseMappingResources(buffer[:size], 1); err == nil || rows != nil {
+			t.Fatal("resource field exceeded its UTF-8 byte limit")
+		}
+	}
+	if value, err := mappingBufferString(nil, 0, false); err != nil || value != "" {
+		t.Fatal("optional null local name was rejected")
+	}
+	if _, err := mappingBufferString(nil, 0, true); err == nil {
+		t.Fatal("required null remote name was accepted")
+	}
+}
+
+func TestMappingEnumerationCompletesWithinFixedBounds(t *testing.T) {
+	for _, pageSize := range []int{1, 128} {
+		t.Run(fmt.Sprintf("page-size-%d", pageSize), func(t *testing.T) {
+			calls, closes, emitted := 0, 0, 0
+			ops := mappingNativeOps{
+				OpenEnum: func() (uintptr, uint32) { return 77, 0 },
+				Enum: func(handle uintptr, buffer []byte, count, size *uint32) uint32 {
+					calls++
+					if handle != 77 || len(buffer) != 1<<20 || *size != uint32(len(buffer)) || uintptr(unsafe.Pointer(&buffer[0]))%8 != 0 || *count != uint32(max(1, 128-emitted)) {
+						t.Fatal("enumeration changed handle, aligned fixed-byte capacity or nonzero terminal count")
+					}
+					if emitted == 128 {
+						*count, *size = ^uint32(0), ^uint32(0)
+						clear(buffer)
+						return 259
+					}
+					page := make([]mappingRow, pageSize)
+					for index := range page {
+						page[index].RemotePath = fmt.Sprintf(`\\server\share-%d`, emitted+index)
+					}
+					*count = uint32(len(page))
+					*size = uint32(mappingResourcePageForTest(t, buffer, page))
+					emitted += len(page)
+					return 0
+				},
+				CloseEnum: func(handle uintptr) uint32 {
+					closes++
+					if handle != 77 {
+						t.Fatal("enumeration closed a different handle")
+					}
+					return 0
+				},
+			}
+			rows, err := enumerateMappings(ops)
+			if err != nil || len(rows) != 128 || calls != 128/pageSize+1 || closes != 1 {
+				t.Fatalf("complete bounded enumeration changed: rows=%d calls=%d closes=%d error=%v", len(rows), calls, closes, err)
+			}
+			for index, row := range rows {
+				if row.LocalPath != "" || row.RemotePath != fmt.Sprintf(`\\server\share-%d`, index) {
+					t.Fatal("later enumeration pages overwrote earlier observations")
+				}
+			}
+		})
+	}
+}
+
+func TestMappingEnumerationFailuresNeverBecomeEmptyOrPartialSuccess(t *testing.T) {
+	for _, mode := range []string{"empty", "open-error", "more-data", "after-page-error", "no-progress", "over-count", "over-size", "returned-header-only", "129th-entry", "close-error", "query-and-close-error"} {
+		t.Run(mode, func(t *testing.T) {
+			calls, closes := 0, 0
+			ops := mappingNativeOps{
+				OpenEnum: func() (uintptr, uint32) {
+					if mode == "open-error" {
+						return 99, 5
+					}
+					return 77, 0
+				},
+				Enum: func(_ uintptr, buffer []byte, count, size *uint32) uint32 {
+					calls++
+					if mode == "empty" || mode == "close-error" {
+						*count, *size = ^uint32(0), ^uint32(0)
+						return 259
+					}
+					if mode == "more-data" || mode == "query-and-close-error" || mode == "after-page-error" && calls > 1 {
+						*count, *size = ^uint32(0), ^uint32(0)
+						return 234
+					}
+					if mode == "no-progress" {
+						*count = 0
+						return 0
+					}
+					if mode == "over-count" {
+						*count = 129
+						return 0
+					}
+					if mode == "over-size" {
+						*count, *size = 1, uint32(len(buffer)+1)
+						return 0
+					}
+					page := []mappingRow{{RemotePath: `\\server\share`}}
+					if mode == "129th-entry" && calls == 1 {
+						page = make([]mappingRow, 128)
+						for index := range page {
+							page[index].RemotePath = `\\server\share`
+						}
+					}
+					*count = uint32(len(page))
+					*size = uint32(mappingResourcePageForTest(t, buffer, page))
+					if mode == "returned-header-only" {
+						*size = 48
+					}
+					return 0
+				},
+				CloseEnum: func(uintptr) uint32 {
+					closes++
+					if mode == "close-error" || mode == "query-and-close-error" {
+						return 6
+					}
+					return 0
+				},
+			}
+			rows, err := enumerateMappings(ops)
+			if mode == "empty" {
+				if err != nil || rows == nil || len(rows) != 0 || calls != 1 || closes != 1 {
+					t.Fatal("NO_MORE_ITEMS without prior rows did not prove an empty completed enumeration")
+				}
+				return
+			}
+			wantClosed := 1
+			if mode == "open-error" {
+				wantClosed = 0
+			}
+			if err == nil || closes != wantClosed || mode != "close-error" && rows != nil || calls > 129 {
+				t.Fatalf("incomplete enumeration became success or leaked its handle: calls=%d closes=%d rows=%v error=%v", calls, closes, rows, err)
+			}
+			if mode == "query-and-close-error" && (!strings.Contains(err.Error(), "234") || !strings.Contains(err.Error(), "6")) {
+				t.Fatal("enumeration cleanup replaced the original API failure")
+			}
+		})
+	}
+}
+
+func TestMappingLookupKeepsStatusAndCharacterBounds(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status uint32
+		value  string
+		mutate func([]uint16, *uint32)
+		valid  bool
+	}{
+		{name: "connected", value: `\\server\文🧪`, valid: true},
+		{name: "exact-byte-bound", value: strings.Repeat("é", 512), valid: true},
+		{name: "not-connected", status: 2250, valid: true},
+		{name: "unavailable", status: 1201, valid: true},
+		{name: "more-data", status: 234},
+		{name: "access-denied", status: 5},
+		{name: "empty-success"},
+		{name: "byte-overflow", value: strings.Repeat("é", 513)},
+		{name: "capacity-overflow", value: "remote", mutate: func(_ []uint16, size *uint32) { *size = 1026 }},
+		{name: "unterminated", mutate: func(buffer []uint16, _ *uint32) {
+			for index := range buffer {
+				buffer[index] = 'x'
+			}
+		}},
+		{name: "invalid-surrogate", mutate: func(buffer []uint16, _ *uint32) { buffer[0] = 0xd83e }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			ops := mappingNativeOps{Connection: func(drive string, buffer []uint16, size *uint32) uint32 {
+				calls++
+				if drive != "Z:" || len(buffer) != 1025 || *size != 1025 {
+					t.Fatal("lookup confused character and byte capacities or changed the drive")
+				}
+				if test.status != 0 {
+					buffer[0], *size = 0xd83e, ^uint32(0)
+				} else {
+					words := append(utf16.Encode([]rune(test.value)), 0)
+					copy(buffer, words)
+					*size = uint32(len(words))
+				}
+				if test.mutate != nil {
+					test.mutate(buffer, size)
+				}
+				return test.status
+			}}
+			connection, err := mappingLookup("Z:", ops)
+			if (err == nil) != test.valid || calls != 1 {
+				t.Fatalf("lookup status or bound changed: result=%+v error=%v calls=%d", connection, err, calls)
+			}
+			if test.valid && (connection.Status != test.status || connection.RemotePath != test.value) {
+				t.Fatal("lookup invented a remote name or collapsed unavailable into absent")
+			}
+		})
+	}
+}
+
 func cloneMappingValue[T any](t *testing.T, value T) T {
 	t.Helper()
 	data, err := json.Marshal(value)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var copy T
-	if err := json.Unmarshal(data, &copy); err != nil {
+	var result T
+	if err := json.Unmarshal(data, &result); err != nil {
 		t.Fatal(err)
 	}
-	return copy
+	return result
 }
+
+func mappingOwnerForTest() mappingOwner {
+	return mappingOwner{SID: "S-1-5-21-10-20-30-1001", AuthenticationID: "0000000000000123", WindowsBuild: 26100}
+}
+
 func mappingBaselineForTest() mappingSnapshot {
-	snapshot := mappingSnapshot{Owner: mappingOwner{SID: "S-1-5-21-10-20-30-1001", AuthenticationID: "0000000000000123", WindowsBuild: 26100}, Rows: []mappingRow{{LocalPath: "M:", RemotePath: `\\baseline\share`, Status: "OK"}}, Devices: map[string][]string{}, LogicalDrives: 1<<2 | 1<<12}
+	snapshot := mappingSnapshot{Owner: mappingOwnerForTest(), Rows: []mappingRow{{LocalPath: "M:", RemotePath: `\\baseline\share`}}, Connections: map[string]mappingConnection{}, Devices: map[string][]string{}, LogicalDrives: 1<<2 | 1<<12}
 	for letter := 'A'; letter <= 'Z'; letter++ {
-		snapshot.Devices[string(letter)+":"] = nil
+		drive := string(letter) + ":"
+		snapshot.Connections[drive] = mappingConnection{Status: 2250}
+		snapshot.Devices[drive] = nil
 	}
+	snapshot.Connections["M:"] = mappingConnection{RemotePath: `\\baseline\share`}
 	snapshot.Devices["C:"] = []string{`\Device\HarddiskVolume4`}
 	snapshot.Devices["M:"] = []string{"baseline opaque mapping"}
 	return snapshot
 }
 
-type mappingMemoryStore struct {
-	t         *testing.T
-	o         options
-	ledger    mappingLedger
-	events    *[]string
-	createErr error
-	saveErrAt int
-	saves     int
+func TestMappingDriveSelectionRequiresAllNativeInventories(t *testing.T) {
+	snapshot := mappingBaselineForTest()
+	snapshot.LogicalDrives |= 1 << 25
+	snapshot.Connections["Y:"] = mappingConnection{Status: 1201}
+	snapshot.Rows = append(snapshot.Rows, mappingRow{LocalPath: "X:", RemotePath: `\\another\share`})
+	snapshot.Connections["X:"] = mappingConnection{RemotePath: `\\another\share`}
+	snapshot.Devices["W:"] = []string{"occupied DOS drive"}
+	if drive, err := chooseMappingDrive(snapshot); err != nil || drive != "V:" {
+		t.Fatalf("drive selection ignored a native occupancy fact: drive=%q error=%v", drive, err)
+	}
+	snapshot.LogicalDrives = (1 << 26) - 1
+	if _, err := chooseMappingDrive(snapshot); err == nil {
+		t.Fatal("occupied drives produced a free candidate")
+	}
+	for _, change := range []func(*mappingSnapshot){
+		func(s *mappingSnapshot) { delete(s.Connections, "A:") },
+		func(s *mappingSnapshot) { delete(s.Devices, "A:") },
+		func(s *mappingSnapshot) { s.Connections["Z:"] = mappingConnection{Status: 5} },
+		func(s *mappingSnapshot) { s.Connections["Z:"] = mappingConnection{} },
+		func(s *mappingSnapshot) {
+			s.Connections["Z:"] = mappingConnection{Status: 1201, RemotePath: "invented"}
+		},
+		func(s *mappingSnapshot) { s.Connections["M:"] = mappingConnection{RemotePath: `\\foreign\share`} },
+		func(s *mappingSnapshot) { s.Rows = append(s.Rows, s.Rows[0]) },
+		func(s *mappingSnapshot) { s.LogicalDrives |= 1 << 31 },
+		func(s *mappingSnapshot) { s.Owner.AuthenticationID = "" },
+	} {
+		value := cloneMappingValue(t, mappingBaselineForTest())
+		change(&value)
+		if _, err := chooseMappingDrive(value); err == nil {
+			t.Fatal("incomplete or inconsistent inventory authorized a new mapping")
+		}
+	}
 }
 
-func (s *mappingMemoryStore) Create(value mappingLedger) error {
+func mappingSnapshotOpsForTest(t *testing.T, snapshot mappingSnapshot) mappingNativeOps {
+	t.Helper()
+	page := 0
+	return mappingNativeOps{
+		OpenEnum: func() (uintptr, uint32) { page = 0; return 77, 0 },
+		Enum: func(_ uintptr, buffer []byte, count, size *uint32) uint32 {
+			page++
+			if page > 1 || len(snapshot.Rows) == 0 {
+				return 259
+			}
+			*count = uint32(len(snapshot.Rows))
+			*size = uint32(mappingResourcePageForTest(t, buffer, snapshot.Rows))
+			return 0
+		},
+		CloseEnum: func(uintptr) uint32 { return 0 },
+		Connection: func(drive string, buffer []uint16, size *uint32) uint32 {
+			connection, ok := snapshot.Connections[drive]
+			if !ok {
+				t.Fatal("native snapshot queried an unexpected local drive")
+			}
+			if connection.Status == 0 {
+				words := append(utf16.Encode([]rune(connection.RemotePath)), 0)
+				copy(buffer, words)
+				*size = uint32(len(words))
+			}
+			return connection.Status
+		},
+		DOS:           func(drive string) ([]string, error) { return append([]string(nil), snapshot.Devices[drive]...), nil },
+		LogicalDrives: func() (uint32, error) { return snapshot.LogicalDrives, nil },
+	}
+}
+
+func TestNativeMappingSnapshotRequiresEverySuccessfulObservation(t *testing.T) {
+	want := mappingBaselineForTest()
+	want.Connections["Y:"] = mappingConnection{Status: 1201}
+	ops := mappingSnapshotOpsForTest(t, want)
+	lookup, dos, logical := ops.Connection, ops.DOS, ops.LogicalDrives
+	lookupCalls, dosCalls := map[string]int{}, map[string]int{}
+	logicalCalls := 0
+	ops.Connection = func(drive string, buffer []uint16, size *uint32) uint32 {
+		lookupCalls[drive]++
+		return lookup(drive, buffer, size)
+	}
+	ops.DOS = func(drive string) ([]string, error) { dosCalls[drive]++; return dos(drive) }
+	ops.LogicalDrives = func() (uint32, error) { logicalCalls++; return logical() }
+	got, err := nativeMappingSnapshot(want.Owner, ops)
+	if err != nil || !reflect.DeepEqual(got, want) || logicalCalls != 1 || len(lookupCalls) != 26 || len(dosCalls) != 26 {
+		t.Fatalf("snapshot lost complete native facts: error=%v lookup=%d DOS=%d logical=%d", err, len(lookupCalls), len(dosCalls), logicalCalls)
+	}
+	for letter := 'A'; letter <= 'Z'; letter++ {
+		drive := string(letter) + ":"
+		if lookupCalls[drive] != 1 || dosCalls[drive] != 1 {
+			t.Fatal("snapshot repeated or omitted a drive observation")
+		}
+	}
+	failure := errors.New("native inventory failed")
+	for _, phase := range []string{"enumeration", "lookup", "DOS", "logical", "disagreement"} {
+		t.Run(phase, func(t *testing.T) {
+			ops := mappingSnapshotOpsForTest(t, want)
+			switch phase {
+			case "enumeration":
+				ops.OpenEnum = func() (uintptr, uint32) { return 0, 5 }
+			case "lookup":
+				ops.Connection = func(string, []uint16, *uint32) uint32 { return 5 }
+			case "DOS":
+				ops.DOS = func(string) ([]string, error) { return nil, failure }
+			case "logical":
+				ops.LogicalDrives = func() (uint32, error) { return 0, failure }
+			case "disagreement":
+				ops.Connection = func(string, []uint16, *uint32) uint32 { return 2250 }
+			}
+			_, err := nativeMappingSnapshot(want.Owner, ops)
+			if err == nil || (phase == "DOS" || phase == "logical") && !errors.Is(err, failure) {
+				t.Fatalf("failed observation became an authoritative snapshot: %v", err)
+			}
+		})
+	}
+}
+
+func mappingRequestForTest(t *testing.T, action string) mappingCommandRequest {
+	t.Helper()
+	state, err := filepath.Abs(filepath.Join("native-mapping-fixture", "windows-runs", "123-1", "evidence", "probe-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := mappingCommandRequest{Version: 1, Action: action, RunID: "123-1", SourceSHA: strings.Repeat("a", 40), Nonce: strings.Repeat("b", 64), Volume: fixtureVolume, Sequence: 2, StateFile: state, Owner: mappingOwnerForTest()}
+	if action != "inventory" {
+		request.LocalPath, request.RemotePath, request.TCPPort = "Z:", `\\127.0.0.1\rfs-`+request.Nonce, 15445
+	}
+	return request
+}
+
+func mappingRequestFrameForTest(t *testing.T, request mappingCommandRequest) []byte {
+	t.Helper()
+	data, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(data, '\n')
+}
+
+func mappingLedgerForRequestForTest(request mappingCommandRequest) mappingLedger {
+	ledger := mappingLedger{Version: 2, RunID: request.RunID, SourceSHA: request.SourceSHA, Nonce: request.Nonce, Volume: request.Volume, Sequence: request.Sequence, Owner: request.Owner, LocalPath: request.LocalPath, RemotePath: request.RemotePath, TCPPort: request.TCPPort, Transport: "TCP", RequireIntegrity: true, State: "intent", Baseline: mappingBaselineForTest(), CreateOutcome: mappingMutation{Knowledge: "pending"}, RemoveOutcome: mappingMutation{Knowledge: "none"}}
+	if request.Action == "remove" {
+		code := uint32(0)
+		ledger.State = "remove-pending"
+		ledger.CreateOutcome = mappingMutation{Knowledge: "returned", Code: &code, HelperQuiesced: true}
+		ledger.RemoveOutcome = mappingMutation{Knowledge: "pending"}
+		ledger.ObservedRow = &mappingRow{LocalPath: request.LocalPath, RemotePath: request.RemotePath}
+		ledger.ObservedDevice = []string{"owned native target"}
+	}
+	return ledger
+}
+
+func mappingSnapshotForRequestForTest(request mappingCommandRequest) mappingSnapshot {
+	snapshot := mappingBaselineForTest()
+	if request.Action == "remove" {
+		snapshot.Rows = append(snapshot.Rows, mappingRow{LocalPath: request.LocalPath, RemotePath: request.RemotePath})
+		snapshot.Connections[request.LocalPath] = mappingConnection{RemotePath: request.RemotePath}
+		snapshot.Devices[request.LocalPath] = []string{"owned native target"}
+		snapshot.LogicalDrives |= 1 << uint(request.LocalPath[0]-'A')
+	}
+	return snapshot
+}
+
+type mappingOpenFrameReader struct {
+	data  []byte
+	reads int
+}
+
+func (r *mappingOpenFrameReader) Read(buffer []byte) (int, error) {
+	r.reads++
+	if len(r.data) == 0 {
+		return 0, errors.New("helper waited for stdin EOF")
+	}
+	n := copy(buffer, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func TestNativeMappingHelperUsesOneBoundFrameAndExactOperations(t *testing.T) {
+	for _, action := range []string{"inventory", "create", "remove"} {
+		t.Run(action, func(t *testing.T) {
+			request := mappingRequestForTest(t, action)
+			frame := mappingRequestFrameForTest(t, request)
+			input := &mappingOpenFrameReader{data: frame}
+			var output bytes.Buffer
+			var order []string
+			ops := mappingSnapshotOpsForTest(t, mappingSnapshotForRequestForTest(request))
+			ops.FindAdd = func() error { order = append(order, "find"); return nil }
+			ops.Add = func(_ uintptr, resource *mappingNetResource, _ uintptr, _, _ uint32, _ []byte, _ uint32) uint32 {
+				order = append(order, "create")
+				mappingAssertUTF16Pointer(t, resource.LocalName, request.LocalPath)
+				mappingAssertUTF16Pointer(t, resource.RemoteName, request.RemotePath)
+				return 0
+			}
+			ops.Cancel = func(local string, flags uint32, force bool) uint32 {
+				order = append(order, "remove")
+				if local != request.LocalPath || flags != 0 || force {
+					t.Fatal("removal became remote-wide, persistent or forced")
+				}
+				return 0
+			}
+			services := mappingHelperServices{
+				Owner: func() (mappingOwner, error) { order = append(order, "owner"); return request.Owner, nil },
+				Job:   func() error { order = append(order, "job"); return nil },
+				Authorize: func(actual mappingCommandRequest) (mappingLedger, error) {
+					order = append(order, "authorize")
+					if !reflect.DeepEqual(actual, request) {
+						t.Fatal("helper authorization lost request or state-file identity")
+					}
+					return mappingLedgerForRequestForTest(request), nil
+				},
+				Native: ops,
+			}
+			if err := runMappingHelperWith(nil, input, &output, services); err != nil {
+				t.Fatal(err)
+			}
+			result, err := validateMappingResult(output.Bytes(), request)
+			if err != nil || result.RequestSHA256 != fmt.Sprintf("%x", sha256.Sum256(frame)) || result.Owner != request.Owner || result.OwnerAfter == nil || *result.OwnerAfter != request.Owner || input.reads != 1 || bytes.Count(output.Bytes(), []byte{'\n'}) != 1 {
+				t.Fatalf("helper frame/owner binding changed: result=%+v reads=%d error=%v", result, input.reads, err)
+			}
+			wantOrder := []string{"owner", "job", "authorize"}
+			if action == "inventory" {
+				if result.Knowledge != "inventory" || result.APIStatus != nil || result.Snapshot == nil || !reflect.DeepEqual(*result.Snapshot, mappingBaselineForTest()) {
+					t.Fatal("inventory result lacks actual complete native facts")
+				}
+			} else {
+				if action == "create" {
+					wantOrder = append(wantOrder, "find")
+				}
+				wantOrder = append(wantOrder, action)
+				if result.Knowledge != "returned" || result.APIStatus == nil || *result.APIStatus != 0 || result.Snapshot != nil {
+					t.Fatal("mutation acknowledgement invented inventory or omitted call-return knowledge")
+				}
+			}
+			wantOrder = append(wantOrder, "owner")
+			if !reflect.DeepEqual(order, wantOrder) {
+				t.Fatalf("helper ownership/admission order changed: %v", order)
+			}
+		})
+	}
+}
+
+func TestNativeMappingHelperRejectsMalformedRequestsBeforeOwnership(t *testing.T) {
+	request := mappingRequestForTest(t, "create")
+	frame := mappingRequestFrameForTest(t, request)
+	for _, test := range []struct {
+		name  string
+		args  []string
+		frame []byte
+	}{
+		{"arguments", []string{"extra"}, frame},
+		{"missing-frame", nil, nil},
+		{"missing-LF", nil, frame[:len(frame)-1]},
+		{"over-bound", nil, append(bytes.Repeat([]byte{'x'}, 4096), '\n')},
+		{"duplicate-key", nil, bytes.Replace(frame, []byte(`"version":1`), []byte(`"version":1,"version":1`), 1)},
+		{"unknown-field", nil, bytes.Replace(frame, []byte(`"version":1`), []byte(`"version":1,"extra":true`), 1)},
+		{"second-JSON-value", nil, append(append([]byte(nil), frame[:len(frame)-1]...), []byte("{}\n")...)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owners := 0
+			var output bytes.Buffer
+			services := mappingHelperServices{Owner: func() (mappingOwner, error) { owners++; return mappingOwner{}, errors.New("unexpected owner lookup") }}
+			if err := runMappingHelperWith(test.args, bytes.NewReader(test.frame), &output, services); err == nil || owners != 0 || output.Len() != 0 {
+				t.Fatalf("malformed request reached ownership or generated a reply: owners=%d bytes=%d error=%v", owners, output.Len(), err)
+			}
+		})
+	}
+	for _, mutate := range []func(*mappingCommandRequest){
+		func(r *mappingCommandRequest) { r.Version = 2 },
+		func(r *mappingCommandRequest) { r.Action = "other" },
+		func(r *mappingCommandRequest) { r.Sequence = 0 },
+		func(r *mappingCommandRequest) { r.SourceSHA = strings.Repeat("A", 40) },
+		func(r *mappingCommandRequest) { r.Nonce = "short" },
+		func(r *mappingCommandRequest) { r.Volume = "foreign" },
+		func(r *mappingCommandRequest) { r.Owner.AuthenticationID = "" },
+		func(r *mappingCommandRequest) { r.Owner.SID = "foreign" },
+		func(r *mappingCommandRequest) { r.LocalPath = "C:" },
+		func(r *mappingCommandRequest) { r.RemotePath = `\\foreign\share` },
+		func(r *mappingCommandRequest) { r.TCPPort = 0 },
+		func(r *mappingCommandRequest) { r.Action = "inventory" },
+	} {
+		value := request
+		mutate(&value)
+		if err := validateMappingRequest(value); err == nil {
+			t.Fatal("invalid helper request identity or target was accepted")
+		}
+	}
+}
+
+func TestNativeMappingHelperGuardsAndRawFailureStatus(t *testing.T) {
+	for _, mode := range []string{"owner-error", "foreign-SID", "foreign-logon", "job", "authorize", "occupied", "missing-export", "API-error", "owner-after-error", "owner-after-change"} {
+		t.Run(mode, func(t *testing.T) {
+			request := mappingRequestForTest(t, "create")
+			failure := errors.New("injected helper failure")
+			current := mappingSnapshotForRequestForTest(request)
+			if mode == "occupied" {
+				current.Connections[request.LocalPath] = mappingConnection{Status: 1201}
+			}
+			ops := mappingSnapshotOpsForTest(t, current)
+			calls, owners := 0, 0
+			ops.FindAdd = func() error {
+				if mode == "missing-export" {
+					return failure
+				}
+				return nil
+			}
+			ops.Add = func(uintptr, *mappingNetResource, uintptr, uint32, uint32, []byte, uint32) uint32 {
+				calls++
+				if mode == "API-error" {
+					return 5
+				}
+				return 0
+			}
+			services := mappingHelperServices{
+				Owner: func() (mappingOwner, error) {
+					owners++
+					owner := request.Owner
+					if mode == "owner-error" || mode == "owner-after-error" && owners > 1 {
+						return mappingOwner{}, failure
+					}
+					if mode == "foreign-SID" || mode == "owner-after-change" && owners > 1 {
+						owner.SID = "S-1-5-21-10-20-30-2002"
+					}
+					if mode == "foreign-logon" {
+						owner.AuthenticationID = "0000000000000999"
+					}
+					return owner, nil
+				},
+				Job: func() error {
+					if mode == "job" {
+						return failure
+					}
+					return nil
+				},
+				Authorize: func(mappingCommandRequest) (mappingLedger, error) {
+					if mode == "authorize" {
+						return mappingLedger{}, failure
+					}
+					return mappingLedgerForRequestForTest(request), nil
+				},
+				Native: ops,
+			}
+			var output bytes.Buffer
+			err := runMappingHelperWith(nil, bytes.NewReader(mappingRequestFrameForTest(t, request)), &output, services)
+			invoked := mode == "API-error" || strings.HasPrefix(mode, "owner-after-")
+			wantCalls := 0
+			if invoked {
+				wantCalls = 1
+			}
+			if err == nil || calls != wantCalls {
+				t.Fatalf("helper guard or mutation count changed: calls=%d error=%v", calls, err)
+			}
+			if mode == "owner-error" || mode == "job" || mode == "authorize" || mode == "missing-export" || mode == "owner-after-error" {
+				if !errors.Is(err, failure) {
+					t.Fatalf("helper lost its original failure: %v", err)
+				}
+			}
+			var result mappingCommandResult
+			if err := json.Unmarshal(output.Bytes(), &result); err != nil || result.Cause == "" || result.Snapshot != nil {
+				t.Fatal("failed helper invented inventory or omitted its failure")
+			}
+			if invoked {
+				if result.Knowledge != "returned" || result.APIStatus == nil || mode == "API-error" && *result.APIStatus != 5 {
+					t.Fatal("helper replaced an observed API return with invented non-invocation")
+				}
+			} else if result.Knowledge != "not-invoked" || result.APIStatus != nil {
+				t.Fatal("refused helper fabricated a native call result")
+			}
+			if mode == "API-error" {
+				if _, err := validateMappingResult(output.Bytes(), request); err != nil {
+					t.Fatal("complete bound failure reply lost its call-return knowledge")
+				}
+			}
+			if mode == "foreign-SID" || mode == "foreign-logon" || strings.HasPrefix(mode, "owner-after-") {
+				if _, err := validateMappingResult(output.Bytes(), request); err == nil {
+					t.Fatal("changed or unknown actual owner supplied trusted mutation knowledge")
+				}
+			}
+		})
+	}
+}
+
+func mappingResultFrameForTest(t *testing.T, result mappingCommandResult) []byte {
+	t.Helper()
+	data, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(data, '\n')
+}
+
+func mappingReturnedResultForTest(t *testing.T, request mappingCommandRequest, status uint32) mappingCommandResult {
+	t.Helper()
+	after := request.Owner
+	result := mappingCommandResult{Version: 1, RequestSHA256: fmt.Sprintf("%x", sha256.Sum256(mappingRequestFrameForTest(t, request))), Action: request.Action, Owner: request.Owner, OwnerAfter: &after, Knowledge: "returned", APIStatus: &status, Requested: mappingRequestedAPI(request)}
+	if status != 0 {
+		result.Cause = fmt.Sprintf("native API status %d", status)
+	}
+	return result
+}
+
+func TestNativeMappingReplyRequiresCompleteBoundOperationFacts(t *testing.T) {
+	request := mappingRequestForTest(t, "create")
+	valid := mappingReturnedResultForTest(t, request, 0)
+	frame := mappingResultFrameForTest(t, valid)
+	if _, err := validateMappingResult(frame, request); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*mappingCommandResult){
+		func(r *mappingCommandResult) { r.Version = 0 },
+		func(r *mappingCommandResult) { r.RequestSHA256 = strings.Repeat("c", 64) },
+		func(r *mappingCommandResult) { r.Action = "remove" },
+		func(r *mappingCommandResult) { r.Owner.AuthenticationID = "0000000000000999" },
+		func(r *mappingCommandResult) { r.OwnerAfter = nil },
+		func(r *mappingCommandResult) { r.OwnerAfter.SID = "S-1-5-21-10-20-30-2002" },
+		func(r *mappingCommandResult) { r.Knowledge = "unknown" },
+		func(r *mappingCommandResult) { r.APIStatus = nil },
+		func(r *mappingCommandResult) { snapshot := mappingBaselineForTest(); r.Snapshot = &snapshot },
+		func(r *mappingCommandResult) { code := uint32(5); r.APIStatus = &code },
+		func(r *mappingCommandResult) { r.Cause = strings.Repeat("x", 1025) },
+		func(r *mappingCommandResult) { r.Requested.Name = "WNetAddConnection2W" },
+		func(r *mappingCommandResult) { r.Requested.Flags = 0 },
+		func(r *mappingCommandResult) { r.Requested.AuthBytes = 1 },
+		func(r *mappingCommandResult) { r.Requested.Force = true },
+		func(r *mappingCommandResult) { r.Requested.TransportOptionsHex = "" },
+	} {
+		result := cloneMappingValue(t, valid)
+		mutate(&result)
+		if _, err := validateMappingResult(mappingResultFrameForTest(t, result), request); err == nil {
+			t.Fatal("foreign or contradictory mutation facts were accepted")
+		}
+	}
+	for _, invalid := range [][]byte{
+		nil, frame[:len(frame)-1], append(append([]byte(nil), frame...), '\n'), append(append([]byte(nil), frame...), frame...),
+		bytes.Replace(frame, []byte(`"version":1`), []byte(`"version":1,"version":1`), 1),
+		bytes.Replace(frame, []byte(`"version":1`), []byte(`"version":1,"extra":true`), 1),
+	} {
+		if _, err := validateMappingResult(invalid, request); err == nil {
+			t.Fatal("partial, duplicate or additional reply data supplied operation knowledge")
+		}
+	}
+	for _, status := range []uint32{5, 997, 1201} {
+		result := mappingReturnedResultForTest(t, request, status)
+		got, err := validateMappingResult(mappingResultFrameForTest(t, result), request)
+		if err != nil || got.APIStatus == nil || *got.APIStatus != status || got.Knowledge != "returned" {
+			t.Fatal("nonzero returned status was erased or treated as absence")
+		}
+	}
+	notInvoked := cloneMappingValue(t, valid)
+	notInvoked.Knowledge, notInvoked.APIStatus, notInvoked.OwnerAfter, notInvoked.Cause = "not-invoked", nil, nil, "admission refused"
+	if _, err := validateMappingResult(mappingResultFrameForTest(t, notInvoked), request); err != nil {
+		t.Fatal("bound pre-dispatch refusal lost its explicit knowledge")
+	}
+	for _, mutate := range []func(*mappingCommandResult){
+		func(r *mappingCommandResult) { code := uint32(0); r.APIStatus = &code },
+		func(r *mappingCommandResult) { r.Cause = "" },
+		func(r *mappingCommandResult) { snapshot := mappingBaselineForTest(); r.Snapshot = &snapshot },
+	} {
+		result := cloneMappingValue(t, notInvoked)
+		mutate(&result)
+		if _, err := validateMappingResult(mappingResultFrameForTest(t, result), request); err == nil {
+			t.Fatal("contradictory not-invoked reply was trusted")
+		}
+	}
+	inventoryRequest := mappingRequestForTest(t, "inventory")
+	inventoryError := mappingReturnedResultForTest(t, inventoryRequest, 0)
+	inventoryError.Knowledge, inventoryError.APIStatus, inventoryError.Cause = "inventory-error", nil, "inventory failed"
+	if got, err := validateMappingResult(mappingResultFrameForTest(t, inventoryError), inventoryRequest); err != nil || got.Snapshot != nil {
+		t.Fatal("failed inventory was replaced by invented empty rows")
+	}
+}
+
+func TestNativeMappingZeroAndEmptyFieldsRemainRequired(t *testing.T) {
+	request := mappingRequestForTest(t, "inventory")
+	for _, field := range []string{"local_path", "remote_path", "tcp_port"} {
+		for _, null := range []bool{false, true} {
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(mappingRequestFrameForTest(t, request), &fields); err != nil {
+				t.Fatal(err)
+			}
+			delete(fields, field)
+			if null {
+				fields[field] = json.RawMessage("null")
+			}
+			data, err := json.Marshal(fields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			owners := 0
+			services := mappingHelperServices{Owner: func() (mappingOwner, error) { owners++; return mappingOwner{}, errors.New("unexpected owner query") }}
+			if err := runMappingHelperWith(nil, bytes.NewReader(append(data, '\n')), io.Discard, services); err == nil || owners != 0 {
+				t.Fatal("missing/null inventory field was silently supplied by Go's zero value")
+			}
+		}
+	}
+	remove := mappingRequestForTest(t, "remove")
+	result := mappingReturnedResultForTest(t, remove, 0)
+	for _, field := range []string{"flags", "auth_bytes", "force", "transport_options_hex"} {
+		for _, null := range []bool{false, true} {
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(mappingResultFrameForTest(t, result), &fields); err != nil {
+				t.Fatal(err)
+			}
+			var requested map[string]json.RawMessage
+			if err := json.Unmarshal(fields["requested_api"], &requested); err != nil {
+				t.Fatal(err)
+			}
+			delete(requested, field)
+			if null {
+				requested[field] = json.RawMessage("null")
+			}
+			var err error
+			fields["requested_api"], err = json.Marshal(requested)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := json.Marshal(fields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := validateMappingResult(append(data, '\n'), remove); err == nil {
+				t.Fatal("missing/null native option became a trusted zero/empty observation")
+			}
+		}
+	}
+}
+
+type mappingMemoryStore struct {
+	t                  *testing.T
+	o                  options
+	ledger             mappingLedger
+	events             *[]string
+	created            bool
+	createErr          error
+	saveErrAt, saves   int
+	publishBeforeError bool
+}
+
+func (s *mappingMemoryStore) Create(ledger mappingLedger) error {
 	*s.events = append(*s.events, "intent")
+	if s.created {
+		return os.ErrExist
+	}
 	if s.createErr != nil {
 		return s.createErr
 	}
-	if err := validateMappingLedger(value, s.o); err != nil {
+	if err := validateMappingLedger(ledger, s.o); err != nil {
 		return err
 	}
-	s.ledger = cloneMappingValue(s.t, value)
+	s.created, s.ledger = true, cloneMappingValue(s.t, ledger)
 	return nil
 }
-func (s *mappingMemoryStore) Save(value mappingLedger) error {
+
+func (s *mappingMemoryStore) Save(ledger mappingLedger) error {
 	s.saves++
-	*s.events = append(*s.events, "save:"+value.State)
-	if s.saves == s.saveErrAt {
-		return errors.New("ledger sync failed")
-	}
-	if err := validateMappingLedger(value, s.o); err != nil {
+	*s.events = append(*s.events, "save:"+ledger.State)
+	if err := validateMappingLedger(ledger, s.o); err != nil {
 		return err
 	}
-	s.ledger = cloneMappingValue(s.t, value)
+	failed := s.saves == s.saveErrAt
+	if !failed || s.publishBeforeError {
+		s.ledger = cloneMappingValue(s.t, ledger)
+	}
+	if failed {
+		return syscall.EIO
+	}
 	return nil
 }
 
@@ -141,15 +1022,32 @@ type mappingFakeBackend struct {
 	t                           *testing.T
 	current                     mappingSnapshot
 	events                      *[]string
-	store                       *mappingMemoryStore
+	persisted                   func() mappingLedger
 	creates, removes, snapshots int
-	createErr                   error
+	createErr, removeErr        error
 	createResource              bool
-	rowOnly                     bool
-	removeErr                   error
 	leaveResource               bool
 	snapshotErrors              map[int]error
-	beforeCreate                func()
+}
+
+func mappingPublishForTest(snapshot *mappingSnapshot, ledger mappingLedger) {
+	snapshot.Rows = append(snapshot.Rows, mappingRow{LocalPath: ledger.LocalPath, RemotePath: ledger.RemotePath})
+	snapshot.Connections[ledger.LocalPath] = mappingConnection{RemotePath: ledger.RemotePath}
+	snapshot.Devices[ledger.LocalPath] = []string{"owned native target"}
+	snapshot.LogicalDrives |= 1 << uint(ledger.LocalPath[0]-'A')
+}
+
+func mappingEraseForTest(snapshot *mappingSnapshot, ledger mappingLedger) {
+	rows := []mappingRow{}
+	for _, row := range snapshot.Rows {
+		if row.LocalPath != ledger.LocalPath || row.RemotePath != ledger.RemotePath {
+			rows = append(rows, row)
+		}
+	}
+	snapshot.Rows = rows
+	snapshot.Connections[ledger.LocalPath] = mappingConnection{Status: 2250}
+	snapshot.Devices[ledger.LocalPath] = nil
+	snapshot.LogicalDrives &^= 1 << uint(ledger.LocalPath[0]-'A')
 }
 
 func (b *mappingFakeBackend) Snapshot(context.Context) (mappingSnapshot, error) {
@@ -160,1918 +1058,719 @@ func (b *mappingFakeBackend) Snapshot(context.Context) (mappingSnapshot, error) 
 	}
 	return cloneMappingValue(b.t, b.current), nil
 }
-func (b *mappingFakeBackend) Create(ctx context.Context, value mappingLedger) error {
+
+func (b *mappingFakeBackend) Create(_ context.Context, ledger mappingLedger) error {
 	b.creates++
 	*b.events = append(*b.events, "create")
-	if b.store.ledger.State != "intent" || b.store.ledger.RemotePath != value.RemotePath {
-		b.t.Fatal("native create preceded durable matching intent")
-	}
-	if b.beforeCreate != nil {
-		b.beforeCreate()
-	}
-	if err := ctx.Err(); err != nil {
-		return err
+	durable := b.persisted()
+	if durable.CreateOutcome.Knowledge != "pending" || durable.State != "intent" || durable.RemotePath != ledger.RemotePath {
+		b.t.Fatal("native create preceded its durable matching pending intent")
 	}
 	if b.createResource {
-		b.current.Rows = append(b.current.Rows, mappingRow{value.LocalPath, value.RemotePath, "OK"})
-		if !b.rowOnly {
-			b.current.Devices[value.LocalPath] = []string{"opaque target; not a port or SID encoding"}
-			b.current.LogicalDrives |= 1 << uint(value.LocalPath[0]-'A')
-		}
+		mappingPublishForTest(&b.current, ledger)
 	}
 	return b.createErr
 }
-func (b *mappingFakeBackend) Remove(_ context.Context, value mappingLedger, row mappingRow) error {
+
+func (b *mappingFakeBackend) Remove(_ context.Context, ledger mappingLedger, row mappingRow) error {
 	b.removes++
 	*b.events = append(*b.events, "remove")
-	if row.LocalPath != value.LocalPath || row.RemotePath != value.RemotePath {
-		b.t.Fatal("unrelated mapping removal")
+	durable := b.persisted()
+	if durable.RemoveOutcome.Knowledge != "pending" || durable.State != "remove-pending" || row.LocalPath != ledger.LocalPath || row.RemotePath != ledger.RemotePath {
+		b.t.Fatal("native remove preceded durable pending state or targeted another binding")
 	}
-	if b.removeErr != nil {
-		return b.removeErr
+	if b.removeErr == nil && !b.leaveResource {
+		mappingEraseForTest(&b.current, ledger)
 	}
-	if !b.leaveResource {
-		rows := []mappingRow{}
-		for _, existing := range b.current.Rows {
-			if existing.LocalPath != row.LocalPath || existing.RemotePath != row.RemotePath {
-				rows = append(rows, existing)
-			}
-		}
-		b.current.Rows = rows
-		b.current.Devices[value.LocalPath] = nil
-		b.current.LogicalDrives &^= 1 << uint(value.LocalPath[0]-'A')
-	}
-	return nil
+	return b.removeErr
 }
+
 func newMappingModel(t *testing.T) (options, *mappingFakeBackend, *mappingMemoryStore) {
 	t.Helper()
-	o := mappingOptionsForTest()
+	o := mappingRequestForTest(t, "create").options()
 	events := []string{}
 	store := &mappingMemoryStore{t: t, o: o, events: &events}
-	backend := &mappingFakeBackend{t: t, current: mappingBaselineForTest(), events: &events, store: store, createResource: true, snapshotErrors: map[int]error{}}
+	backend := &mappingFakeBackend{t: t, current: mappingBaselineForTest(), events: &events, persisted: func() mappingLedger { return store.ledger }, createResource: true, snapshotErrors: map[int]error{}}
 	return o, backend, store
 }
+
 func startMappingModel(t *testing.T) (*ownedSMBMapping, *mappingFakeBackend, *mappingMemoryStore) {
 	t.Helper()
 	o, backend, store := newMappingModel(t)
-	mapping, err := beginSMBMapping(context.Background(), o, "rfs-"+o.FixtureNonce, 15445, backend, store, "smb-mapping.json")
+	mapping, err := beginSMBMapping(context.Background(), o, "rfs-"+o.FixtureNonce, 15445, backend, store, "ledger")
 	if err != nil {
 		t.Fatal(err)
 	}
 	return mapping, backend, store
 }
 
-func TestMappingDriveSelectionRequiresAllInventories(t *testing.T) {
-	snapshot := mappingBaselineForTest()
-	snapshot.LogicalDrives |= 1 << 25
-	snapshot.Devices["Y:"] = []string{"unrelated DOS target"}
-	snapshot.Rows = append(snapshot.Rows, mappingRow{"X:", `\\another\share`, "Unavailable"})
-	drive, err := chooseMappingDrive(snapshot)
-	if err != nil || drive != "W:" {
-		t.Fatalf("drive=%q error=%v", drive, err)
-	}
-	snapshot.LogicalDrives = (1 << 26) - 1
-	if _, err := chooseMappingDrive(snapshot); err == nil {
-		t.Fatal("occupied drive adopted")
-	}
-	for _, change := range []func(*mappingSnapshot){
-		func(s *mappingSnapshot) { delete(s.Devices, "A:") },
-		func(s *mappingSnapshot) { s.Rows = append(s.Rows, mappingRow{"m:", `\\duplicate\share`, "OK"}) },
-		func(s *mappingSnapshot) { s.LogicalDrives |= 1 << 31 },
-		func(s *mappingSnapshot) { s.Owner.AuthenticationID = "" },
-	} {
-		copy := cloneMappingValue(t, mappingBaselineForTest())
-		change(&copy)
-		if _, err := chooseMappingDrive(copy); err == nil {
-			t.Fatal("malformed inventory accepted")
-		}
-	}
+func mappingKnownOutcomeForTest(code uint32, quiesced bool, cause error) error {
+	return &mappingOutcomeError{Cause: cause, Outcome: mappingMutation{Knowledge: "returned", Code: &code, HelperQuiesced: quiesced}}
 }
 
-func TestMappingIntentPrecedesCreateAndCleanupPreservesBaseline(t *testing.T) {
+func TestMappingLiveAcknowledgedCreateOwnsOnlyOneRemoval(t *testing.T) {
 	mapping, backend, store := startMappingModel(t)
 	want := []string{"snapshot", "intent", "create", "save:create-returned", "snapshot", "save:observed"}
-	if !reflect.DeepEqual(*backend.events, want) {
-		t.Fatalf("ownership ordering %v", *backend.events)
-	}
-	if mapping.LocalPath() != "Z:" || store.ledger.State != "observed" || store.ledger.TCPPort != 15445 || !store.ledger.RequireIntegrity || store.ledger.Persistent || store.ledger.Global || store.ledger.SaveCredentials {
-		t.Fatal("mapping arguments or observation were lost")
-	}
-	facts := mapping.Facts()
-	facts.DOSDevice[0] = "mutated caller slice"
-	if mapping.ledger.ObservedDevice[0] == facts.DOSDevice[0] {
-		t.Fatal("facts alias owned ledger")
+	if !reflect.DeepEqual(*backend.events, want) || !mapping.removeAuthority || mapping.publicationFailed || store.ledger.Version != 2 || !mappingMutationSucceeded(store.ledger.CreateOutcome) {
+		t.Fatal("creation did not acknowledge durable outcome before issuing live removal authority")
 	}
 	if err := mapping.cleanup(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if backend.creates != 1 || backend.removes != 1 || store.ledger.State != "removed" {
-		t.Fatalf("create=%d remove=%d state=%s", backend.creates, backend.removes, store.ledger.State)
+	if backend.creates != 1 || backend.removes != 1 || mapping.removeAuthority || store.ledger.State != "removed" || !mappingMutationSucceeded(store.ledger.RemoveOutcome) || !reflect.DeepEqual(backend.current, mappingBaselineForTest()) {
+		t.Fatal("normal removal replayed, retained authority or changed the baseline")
 	}
-	if !reflect.DeepEqual(backend.current, mappingBaselineForTest()) {
-		t.Fatal("baseline resource changed")
+	if err := mapping.cleanup(context.Background()); err != nil || backend.removes != 1 {
+		t.Fatal("verified removal replayed during readonly cleanup")
+	}
+	fresh := &ownedSMBMapping{options: mapping.options, path: "ledger", ledger: cloneMappingValue(t, store.ledger), backend: backend, store: store}
+	if err := fresh.cleanup(context.Background()); err == nil || backend.removes != 1 {
+		t.Fatal("fresh cleanup declared clean from terminal bytes and current absence")
+	}
+	mappingPublishForTest(&backend.current, store.ledger)
+	if err := mapping.cleanup(context.Background()); err == nil || backend.removes != 1 {
+		t.Fatal("reappeared resource was adopted or removed again")
 	}
 }
 
-func TestMappingLostReplyAndPartialCreationAreCleanupOnly(t *testing.T) {
-	for _, name := range []string{"lost-reply", "row-only", "observation-failure"} {
-		t.Run(name, func(t *testing.T) {
+func TestMappingUnknownCreateRemainsQuarantinedAfterLateEffects(t *testing.T) {
+	for _, mode := range []string{"timeout-empty", "timeout-visible", "not-invoked", "nonzero-return", "success-unquiesced"} {
+		t.Run(mode, func(t *testing.T) {
 			o, backend, store := newMappingModel(t)
-			original := errors.New("first create observation failed")
-			if name == "observation-failure" {
+			original := context.DeadlineExceeded
+			backend.createErr = original
+			backend.createResource = mode == "timeout-visible" || mode == "success-unquiesced"
+			switch mode {
+			case "not-invoked":
+				backend.createErr = &mappingOutcomeError{Cause: original, Outcome: mappingMutation{Knowledge: "not-invoked", HelperQuiesced: true}}
+			case "nonzero-return":
+				backend.createErr = mappingKnownOutcomeForTest(5, true, original)
+			case "success-unquiesced":
+				backend.createErr = mappingKnownOutcomeForTest(0, false, original)
+			}
+			mapping, err := beginSMBMapping(context.Background(), o, "rfs-"+o.FixtureNonce, 15445, backend, store, "ledger")
+			if mapping == nil || !errors.Is(err, original) || mapping.removeAuthority || store.ledger.State != "quarantined" {
+				t.Fatalf("uncertain create lost ownership, its cause or quarantine: %v", err)
+			}
+			backend.current = cloneMappingValue(t, store.ledger.Baseline)
+			for range 2 {
+				if err := mapping.cleanup(context.Background()); err == nil || backend.removes != 0 {
+					t.Fatal("empty inventory resolved uncertain provider effects")
+				}
+			}
+			mappingPublishForTest(&backend.current, store.ledger)
+			if err := mapping.cleanup(context.Background()); err == nil || backend.removes != 0 {
+				t.Fatal("late visible create authorized a compensating mutation")
+			}
+			reconstructed := &ownedSMBMapping{options: o, path: "ledger", ledger: cloneMappingValue(t, store.ledger), backend: backend, store: store}
+			if err := reconstructed.cleanup(context.Background()); err == nil || backend.removes != 0 {
+				t.Fatal("reconstruction restored mutation authority")
+			}
+			backend.current = cloneMappingValue(t, store.ledger.Baseline)
+			if next, err := beginSMBMapping(context.Background(), o, "rfs-"+o.FixtureNonce, 15445, backend, store, "ledger"); next != nil || !errors.Is(err, os.ErrExist) || backend.creates != 1 {
+				t.Fatal("empty inventory enabled a second create against the reserved ledger")
+			}
+		})
+	}
+}
+
+func TestMappingKnownCreateResultAndObservationFailureStayDistinct(t *testing.T) {
+	for _, lostObservation := range []bool{false, true} {
+		t.Run(fmt.Sprint(lostObservation), func(t *testing.T) {
+			o, backend, store := newMappingModel(t)
+			original := errors.New("independent observation failed")
+			if lostObservation {
 				backend.snapshotErrors[2] = original
 			} else {
-				backend.createErr = original
-			}
-			backend.rowOnly = name == "row-only"
-			mapping, err := beginSMBMapping(context.Background(), o, "rfs-"+o.FixtureNonce, 15445, backend, store, "ledger")
-			if mapping == nil || !errors.Is(err, original) {
-				t.Fatalf("partial ownership or first failure lost: %v %v", mapping, err)
-			}
-			if err := mapping.cleanup(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			if backend.creates != 1 || backend.removes != 1 || store.ledger.State != "removed" {
-				t.Fatalf("creation was replayed or cleanup lost: %d %d %s", backend.creates, backend.removes, store.ledger.State)
-			}
-			if !errors.Is(err, original) {
-				t.Fatal("successful recovery erased original failure")
-			}
-		})
-	}
-}
-
-func TestMappingUncertainAbsenceRemainsFailure(t *testing.T) {
-	o, backend, store := newMappingModel(t)
-	backend.createErr = errors.New("lost reply")
-	backend.createResource = false
-	mapping, err := beginSMBMapping(context.Background(), o, "rfs-"+o.FixtureNonce, 15445, backend, store, "ledger")
-	if mapping == nil || err == nil {
-		t.Fatal("lost reply reported success")
-	}
-	if err := mapping.cleanup(context.Background()); err == nil || !strings.Contains(err.Error(), "unknown") {
-		t.Fatalf("absence fabricated quiescence: %v", err)
-	}
-	if backend.removes != 0 || store.ledger.State != "intent" {
-		t.Fatal("unproven absence became clean")
-	}
-}
-
-func TestMappingForeignBindingsAreNeverRemoved(t *testing.T) {
-	cases := map[string]func(*ownedSMBMapping, *mappingFakeBackend){
-		"SID":   func(_ *ownedSMBMapping, b *mappingFakeBackend) { b.current.Owner.SID = "S-1-5-21-10-20-30-2002" },
-		"logon": func(_ *ownedSMBMapping, b *mappingFakeBackend) { b.current.Owner.AuthenticationID = "0000000000000999" },
-		"foreign-row": func(m *ownedSMBMapping, b *mappingFakeBackend) {
-			b.current.Rows[len(b.current.Rows)-1].RemotePath = `\\foreign\share`
-		},
-		"different-drive": func(m *ownedSMBMapping, b *mappingFakeBackend) {
-			b.current.Rows[len(b.current.Rows)-1].LocalPath = "Y:"
-		},
-		"DOS-target": func(m *ownedSMBMapping, b *mappingFakeBackend) {
-			b.current.Devices[m.LocalPath()] = []string{"different target"}
-		},
-		"baseline-row": func(_ *ownedSMBMapping, b *mappingFakeBackend) { b.current.Rows = b.current.Rows[1:] },
-		"baseline-device": func(_ *ownedSMBMapping, b *mappingFakeBackend) {
-			b.current.Devices["M:"] = []string{"changed baseline"}
-		},
-		"rowless-device": func(_ *ownedSMBMapping, b *mappingFakeBackend) { b.current.Rows = b.current.Rows[:1] },
-		"rowless-logical-drive": func(m *ownedSMBMapping, b *mappingFakeBackend) {
-			b.current.Rows = b.current.Rows[:1]
-			b.current.Devices[m.LocalPath()] = nil
-		},
-		"recovered-device-change": func(m *ownedSMBMapping, b *mappingFakeBackend) {
-			m.ledger.State = "intent"
-			b.current.Devices[m.LocalPath()] = []string{"new recovery target"}
-		},
-	}
-	for name, change := range cases {
-		t.Run(name, func(t *testing.T) {
-			mapping, backend, _ := startMappingModel(t)
-			change(mapping, backend)
-			if err := mapping.cleanup(context.Background()); err == nil {
-				t.Fatal("mismatched mapping cleanup passed")
-			}
-			if backend.removes != 0 {
-				t.Fatal("mismatched resource was removed")
-			}
-		})
-	}
-}
-
-func TestMappingNoAdoptionNoReappearanceAndNoMissingRemovalProof(t *testing.T) {
-	o, backend, store := newMappingModel(t)
-	backend.current.Rows = append(backend.current.Rows, mappingRow{"", `\\127.0.0.1\rfs-` + o.FixtureNonce, "OK"})
-	if mapping, err := beginSMBMapping(context.Background(), o, "rfs-"+o.FixtureNonce, 15445, backend, store, "ledger"); mapping != nil || err == nil || backend.creates != 0 {
-		t.Fatal("existing nonce share adopted")
-	}
-	mapping, backend, store := startMappingModel(t)
-	backend.current = cloneMappingValue(t, mapping.ledger.Baseline)
-	if err := mapping.cleanup(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if backend.removes != 0 || store.ledger.State != "removed" {
-		t.Fatal("confirmed absence required a deletion")
-	}
-	backend.current.Rows = append(backend.current.Rows, mappingRow{mapping.LocalPath(), mapping.ledger.RemotePath, "OK"})
-	if err := mapping.cleanup(context.Background()); err == nil || backend.removes != 0 {
-		t.Fatal("reappeared resource adopted")
-	}
-	mapping, backend, _ = startMappingModel(t)
-	backend.leaveResource = true
-	if err := mapping.cleanup(context.Background()); err == nil {
-		t.Fatal("remove reply substituted for row/device absence")
-	}
-}
-
-func TestMappingPersistenceFailureNeverStartsAnUnrecordedCreate(t *testing.T) {
-	for _, afterCreate := range []bool{false, true} {
-		t.Run(fmt.Sprint(afterCreate), func(t *testing.T) {
-			o, backend, store := newMappingModel(t)
-			if afterCreate {
-				store.saveErrAt = 1
-			} else {
-				store.createErr = errors.New("intent write failed")
+				backend.createErr = mappingKnownOutcomeForTest(0, true, original)
 			}
 			mapping, err := beginSMBMapping(context.Background(), o, "rfs-"+o.FixtureNonce, 15445, backend, store, "ledger")
-			if err == nil {
-				t.Fatal("failed persistence ignored")
+			if mapping == nil || !errors.Is(err, original) || !mapping.removeAuthority || !mappingMutationSucceeded(store.ledger.CreateOutcome) {
+				t.Fatal("acknowledged success plus quiescence was confused with unknown creation")
 			}
-			if !afterCreate {
-				if mapping != nil || backend.creates != 0 {
-					t.Fatal("create ran without intent")
-				}
-				return
-			}
-			if mapping == nil || backend.creates != 1 {
-				t.Fatal("partial ownership lost after create")
-			}
-			if err := mapping.cleanup(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-	o, backend, store := newMappingModel(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if mapping, err := beginSMBMapping(ctx, o, "rfs-"+o.FixtureNonce, 15445, backend, store, "ledger"); mapping != nil || !errors.Is(err, context.Canceled) || backend.creates != 0 || store.ledger.State != "" {
-		t.Fatal("canceled invocation acquired resources")
-	}
-}
-
-func TestMappingLedgerRejectsForeignAndBaselineOwnership(t *testing.T) {
-	mapping, _, _ := startMappingModel(t)
-	o := mapping.options
-	for name, change := range map[string]func(*mappingLedger){
-		"source":         func(l *mappingLedger) { l.SourceSHA = strings.Repeat("c", 40) },
-		"nonce":          func(l *mappingLedger) { l.Nonce = strings.Repeat("c", 64) },
-		"zero-sequence":  func(l *mappingLedger) { l.Sequence = 0 },
-		"sequence":       func(l *mappingLedger) { l.Sequence++ },
-		"drive":          func(l *mappingLedger) { l.LocalPath = "C:" },
-		"port":           func(l *mappingLedger) { l.TCPPort = 0 },
-		"persistent":     func(l *mappingLedger) { l.Persistent = true },
-		"global":         func(l *mappingLedger) { l.Global = true },
-		"credentials":    func(l *mappingLedger) { l.SaveCredentials = true },
-		"unsigned":       func(l *mappingLedger) { l.RequireIntegrity = false },
-		"owner":          func(l *mappingLedger) { l.Owner.AuthenticationID = "0000000000000999" },
-		"baseline-drive": func(l *mappingLedger) { l.Baseline.Devices[l.LocalPath] = []string{"baseline"} },
-		"baseline-share": func(l *mappingLedger) { l.Baseline.Rows = append(l.Baseline.Rows, mappingRow{"", l.RemotePath, "OK"}) },
-		"observation":    func(l *mappingLedger) { l.ObservedRow.RemotePath = `\\other\share` },
-		"unknown-state":  func(l *mappingLedger) { l.State = "ready" },
-	} {
-		t.Run(name, func(t *testing.T) {
-			ledger := cloneMappingValue(t, mapping.ledger)
-			change(&ledger)
-			if err := validateMappingLedger(ledger, o); err == nil {
-				t.Fatal("invalid ledger accepted")
+			if cleanupErr := mapping.cleanup(context.Background()); cleanupErr != nil || backend.removes != 1 || !errors.Is(err, original) {
+				t.Fatalf("live cleanup lost the original failure or exact one-removal authority: %v", cleanupErr)
 			}
 		})
 	}
 }
 
-func TestMappingRecoveryRequiresCreationSequence(t *testing.T) {
-	mapping, _, _ := startMappingModel(t)
-	cleanup := mapping.options
-	cleanup.Phase = "current-smb-cleanup"
-	if err := validateMappingLedger(mapping.ledger, cleanup); err != nil {
-		t.Fatalf("cleanup changed only phase and lost its owned ledger: %v", err)
-	}
-	cleanup.Sequence++
-	if err := validateMappingLedger(mapping.ledger, cleanup); err == nil {
-		t.Fatal("cleanup adopted a ledger from a different sequence")
-	}
-}
-
-func TestMappingJSONRejectsAmbiguityAndBounds(t *testing.T) {
-	for _, data := range []string{`{"status":"ok","status":"error"}`, `{"rows":[{"local_path":"X:","local_path":"Y:"}]}`, `{} {}`, strings.Repeat("[", 18) + strings.Repeat("]", 18), strings.Repeat(" ", mappingByteLimit+1)} {
-		var value mappingCommandResult
-		if err := decodeMappingJSON([]byte(data), &value); err == nil {
-			t.Fatalf("ambiguous mapping JSON accepted: %.80s", data)
-		}
-	}
-	var output mappingBoundedBuffer
-	if n, err := output.Write(make([]byte, mappingByteLimit)); err != nil || n != mappingByteLimit {
-		t.Fatal(n, err)
-	}
-	if _, err := output.Write([]byte{1}); err == nil || output.Len() != mappingByteLimit {
-		t.Fatal("output overflow accepted")
-	}
-}
-
-type mappingInputBuffer struct {
-	bytes.Buffer
-	closes int
-}
-
-func (b *mappingInputBuffer) Close() error { b.closes++; return nil }
-
-type mappingUtilityTestInfo struct {
-	size     int64
-	mode     os.FileMode
-	modified time.Time
-}
-
-func (i mappingUtilityTestInfo) Name() string       { return "Microsoft.PowerShell.Utility.psd1" }
-func (i mappingUtilityTestInfo) Size() int64        { return i.size }
-func (i mappingUtilityTestInfo) Mode() os.FileMode  { return i.mode }
-func (i mappingUtilityTestInfo) ModTime() time.Time { return i.modified }
-func (i mappingUtilityTestInfo) IsDir() bool        { return i.mode.IsDir() }
-func (i mappingUtilityTestInfo) Sys() any           { return nil }
-
-type mappingUtilityTestFile struct {
-	reader                          io.Reader
-	info, afterInfo                 os.FileInfo
-	statErr, afterStatErr, closeErr error
-	statCalls, closes               int
-	onClose                         func()
-}
-
-func (f *mappingUtilityTestFile) Read(data []byte) (int, error) { return f.reader.Read(data) }
-func (f *mappingUtilityTestFile) Stat() (os.FileInfo, error) {
-	f.statCalls++
-	if f.statCalls > 1 && (f.afterInfo != nil || f.afterStatErr != nil) {
-		return f.afterInfo, f.afterStatErr
-	}
-	return f.info, f.statErr
-}
-func (f *mappingUtilityTestFile) Close() error {
-	f.closes++
-	if f.onClose != nil {
-		f.onClose()
-	}
-	return f.closeErr
-}
-
-type mappingUtilityTestReader func([]byte) (int, error)
-
-func (r mappingUtilityTestReader) Read(data []byte) (int, error) { return r(data) }
-
-const mappingUtilityTestData = "verified Utility manifest bytes"
-
-func mappingUtilityRootForTest(t *testing.T) string {
-	t.Helper()
-	return mappingStartupManifestForTest(t, "modules")
-}
-
-func mappingUtilityOpsForTest() mappingUtilityOps {
-	return mappingUtilityOps{
-		CheckPath: func(string) error { return nil },
-		Open: func(string) (mappingUtilityFile, error) {
-			return &mappingUtilityTestFile{reader: strings.NewReader(mappingUtilityTestData), info: mappingUtilityTestInfo{size: int64(len(mappingUtilityTestData))}}, nil
-		},
-		CommandLine: func(args []string) string { return strings.Join(args, " ") },
-	}
-}
-
-type mappingCommandChild struct {
-	input          *mappingInputBuffer
-	inputOverride  io.WriteCloser
-	output, stderr io.ReadCloser
-	done           chan struct{}
-	result         error
-	forced         bool
-	finished       int
-	closePipes     func()
-	finishErr      error
-	resultCalls    int
-}
-
-func (p *mappingCommandChild) Input() io.WriteCloser {
-	if p.inputOverride != nil {
-		return p.inputOverride
-	}
-	return p.input
-}
-func (p *mappingCommandChild) Output() io.ReadCloser { return p.output }
-func (p *mappingCommandChild) Errors() io.ReadCloser { return p.stderr }
-func (p *mappingCommandChild) Done() <-chan struct{} { return p.done }
-func (p *mappingCommandChild) Result() error {
-	select {
-	case <-p.done:
-	default:
-		panic("Result called before Done")
-	}
-	p.resultCalls++
-	return p.result
-}
-func (p *mappingCommandChild) PID() uint32 { return 55 }
-func (p *mappingCommandChild) Finish() (bool, error) {
-	p.finished++
-	if p.closePipes != nil {
-		p.closePipes()
-	}
-	return p.forced, errors.Join(p.finishErr, p.Input().Close(), p.output.Close(), p.stderr.Close())
-}
-
-type mappingCommandHost struct {
-	child              *mappingCommandChild
-	args               []string
-	starts             int
-	cache              string
-	environment        []string
-	startErr           error
-	returnChildOnError bool
-	onStart            func()
-}
-
-func (h *mappingCommandHost) Preflight() (map[string]any, error) { return nil, nil }
-func (h *mappingCommandHost) StartWithEnvironment(_ string, args []string, _ string, environment []string) (child, error) {
-	h.starts++
-	if h.onStart != nil {
-		h.onStart()
-	}
-	h.args = append([]string(nil), args...)
-	h.environment = append([]string(nil), environment...)
-	h.cache, _ = mappingEnvironmentLookup(environment, "PSModuleAnalysisCachePath")
-	if h.startErr != nil {
-		if h.returnChildOnError {
-			return h.child, h.startErr
-		}
-		return nil, h.startErr
-	}
-	return h.child, nil
-}
-
-func TestMappingUtilityPreparationFailureRefusesLaunch(t *testing.T) {
-	pathFailure, statFailure, readFailure, closeFailure := errors.New("reparse ancestor"), errors.New("stat failed"), errors.New("read failed"), errors.New("close failed")
-	for _, test := range []struct {
-		name      string
-		configure func(*mappingUtilityOps, *mappingUtilityTestFile)
-		causes    []error
-		closes    int
-		clean     bool
-	}{
-		{"missing", func(o *mappingUtilityOps, _ *mappingUtilityTestFile) {
-			o.Open = func(string) (mappingUtilityFile, error) { return nil, os.ErrNotExist }
-		}, []error{os.ErrNotExist}, 0, true},
-		{"reparse", func(o *mappingUtilityOps, _ *mappingUtilityTestFile) {
-			o.CheckPath = func(string) error { return pathFailure }
-		}, []error{pathFailure}, 0, true},
-		{"open-with-handle", func(o *mappingUtilityOps, f *mappingUtilityTestFile) {
-			o.Open = func(string) (mappingUtilityFile, error) { return f, os.ErrPermission }
-			f.closeErr = closeFailure
-		}, []error{os.ErrPermission, closeFailure}, 1, false},
-		{"no-handle", func(o *mappingUtilityOps, _ *mappingUtilityTestFile) {
-			o.Open = func(string) (mappingUtilityFile, error) { return nil, nil }
-		}, nil, 0, true},
-		{"stat", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) { f.statErr = statFailure }, []error{statFailure}, 1, true},
-		{"second-stat", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) { f.afterStatErr = statFailure }, []error{statFailure}, 1, true},
-		{"read-and-close", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) {
-			f.reader = mappingUtilityTestReader(func([]byte) (int, error) { return 0, readFailure })
-			f.closeErr = closeFailure
-		}, []error{readFailure, closeFailure}, 1, false},
-		{"close", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) { f.closeErr = closeFailure }, []error{closeFailure}, 1, false},
-		{"directory", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) {
-			f.info = mappingUtilityTestInfo{mode: os.ModeDir}
-		}, nil, 1, true},
-		{"nonregular", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) {
-			f.info = mappingUtilityTestInfo{mode: os.ModeSymlink}
-		}, nil, 1, true},
-		{"negative-size", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) { f.info = mappingUtilityTestInfo{size: -1} }, nil, 1, true},
-		{"oversized-stat", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) {
-			f.info = mappingUtilityTestInfo{size: mappingByteLimit + 1}
-		}, nil, 1, true},
-		{"oversized-read", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) {
-			f.reader = strings.NewReader(strings.Repeat("x", mappingByteLimit+1))
-		}, nil, 1, true},
-		{"size-changed", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) { f.afterInfo = mappingUtilityTestInfo{size: 1} }, nil, 1, true},
-		{"mtime-changed", func(_ *mappingUtilityOps, f *mappingUtilityTestFile) {
-			f.afterInfo = mappingUtilityTestInfo{size: int64(len(mappingUtilityTestData)), modified: time.Unix(1, 0)}
-		}, nil, 1, true},
-		{"commandline-too-long", func(o *mappingUtilityOps, _ *mappingUtilityTestFile) {
-			o.CommandLine = func([]string) string { return strings.Repeat("x", 32767) }
-		}, nil, 1, true},
-		{"commandline-nul", func(o *mappingUtilityOps, _ *mappingUtilityTestFile) {
-			o.CommandLine = func([]string) string { return "invalid\x00command" }
-		}, nil, 1, true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			file := &mappingUtilityTestFile{reader: strings.NewReader(mappingUtilityTestData), info: mappingUtilityTestInfo{size: int64(len(mappingUtilityTestData))}}
-			ops := mappingUtilityOpsForTest()
-			ops.Open = func(string) (mappingUtilityFile, error) { return file, nil }
-			test.configure(&ops, file)
-			host := &mappingCommandHost{startErr: errors.New("unexpected child launch")}
-			execution, err := executePreparedMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory"}, true, ops)
-			d := execution.Diagnostic
-			if err == nil || host.starts != 0 || d.UtilityPreparation == nil || d.CleanupConfirmed != test.clean || d.UtilityPreparation.CleanupConfirmed != test.clean || file.closes != test.closes {
-				t.Fatalf("preparation failure escaped launch/cleanup ownership: starts=%d closes=%d facts=%+v error=%v", host.starts, file.closes, d.UtilityPreparation, err)
-			}
-			if d.Action != "inventory" || !d.EOFRequested || d.PID != nil || d.Launch != nil || d.WorkersStarted != 0 || d.WorkersJoined != 0 ||
-				d.InputBytes != 0 || d.InputSHA256 != "" || d.InputLineBytes != 0 || d.InputLineSHA256 != "" || d.ScriptUTF16Units != 0 || d.ScriptSHA256 != "" || d.WriteStarted {
-				t.Fatal("failed preparation fabricated process, input or script observations")
-			}
-			for _, cause := range test.causes {
-				if !errors.Is(err, cause) {
-					t.Fatalf("preparation lost its cause: %v", err)
-				}
-			}
-			if len(test.causes) > 1 && !strings.HasPrefix(err.Error(), test.causes[0].Error()) {
-				t.Fatal("cleanup error replaced the first preparation error")
-			}
-		})
-	}
-}
-
-func TestMappingPreparedExecutionKeepsOriginalDeadline(t *testing.T) {
-	for _, phase := range []string{"before", "path", "open", "read", "commandline", "close"} {
-		t.Run(phase, func(t *testing.T) {
-			base, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-			defer cancel()
-			ctx := mappingTestDeadline{Context: base}
-			deadline, _ := ctx.Deadline()
-			if phase == "before" {
-				cancel()
-			}
-			checks, opens := 0, 0
-			reader := strings.NewReader(mappingUtilityTestData)
-			file := &mappingUtilityTestFile{reader: reader, info: mappingUtilityTestInfo{size: int64(len(mappingUtilityTestData))}}
-			file.reader = mappingUtilityTestReader(func(data []byte) (int, error) {
-				if phase == "read" {
-					cancel()
-				}
-				return reader.Read(data)
-			})
-			file.onClose = func() {
-				if phase == "close" {
-					cancel()
-				}
-			}
-			ops := mappingUtilityOpsForTest()
-			ops.CheckPath = func(string) error {
-				checks++
-				if phase == "path" {
-					cancel()
-				}
-				return nil
-			}
-			ops.Open = func(string) (mappingUtilityFile, error) {
-				opens++
-				if phase == "open" {
-					cancel()
-				}
-				return file, nil
-			}
-			ops.CommandLine = func(args []string) string {
-				if phase == "commandline" {
-					cancel()
-				}
-				return strings.Join(args, " ")
-			}
-			host := &mappingCommandHost{startErr: errors.New("expired preparation launched a child")}
-			execution, err := executePreparedMappingPowerShell(ctx, host, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory"}, false, ops)
-			remainingDeadline, _ := ctx.Deadline()
-			if !errors.Is(err, context.DeadlineExceeded) || host.starts != 0 || !remainingDeadline.Equal(deadline) || execution.Diagnostic.UtilityPreparation == nil || !execution.Diagnostic.CleanupConfirmed {
-				t.Fatalf("preparation restarted or lost its original budget: starts=%d error=%v", host.starts, err)
-			}
-			if phase == "before" && checks != 0 || (phase == "before" || phase == "path") && opens != 0 || file.closes != opens {
-				t.Fatal("expired preparation performed later work or leaked an opened file")
-			}
-		})
-	}
-}
-
-func mappingScriptFromArgumentsForTest(t *testing.T, args []string) string {
-	t.Helper()
-	if len(args) != 7 || !reflect.DeepEqual(args[:6], []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand"}) {
-		t.Fatal("prepared mapping changed PowerShell invocation flags")
-	}
-	data, err := base64.StdEncoding.DecodeString(args[6])
-	if err != nil || len(data)%2 != 0 {
-		t.Fatal("prepared mapping command is not UTF-16LE base64")
-	}
-	words := make([]uint16, len(data)/2)
-	for index := range words {
-		words[index] = binary.LittleEndian.Uint16(data[2*index:])
-	}
-	return string(utf16.Decode(words))
-}
-
-func TestMappingPreparedNormalAndInventoryUseSameScript(t *testing.T) {
-	request := mappingCommandRequest{Action: "inventory", Module: "SmbShare.psd1", OwnerSID: mappingBaselineForTest().Owner.SID}
-	reply, err := json.Marshal(mappingCommandResult{Status: "ok", OwnerSID: request.OwnerSID, Rows: []mappingRow{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	root := mappingUtilityRootForTest(t)
-	wantPath := filepath.Join(root, "Microsoft.PowerShell.Utility", "Microsoft.PowerShell.Utility.psd1")
-	wantScript, err := mappingPowerShellScript(wantPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var scripts, frames []string
-	for _, mode := range []string{"normal", "inventory-open", "inventory-eof"} {
+func TestMappingRemoveOutcomeNeverAuthorizesReplay(t *testing.T) {
+	for _, mode := range []string{"unknown", "not-invoked", "nonzero", "success-unquiesced", "known-success-independent-error"} {
 		t.Run(mode, func(t *testing.T) {
-			var order []string
-			file := &mappingUtilityTestFile{reader: strings.NewReader(mappingUtilityTestData), info: mappingUtilityTestInfo{size: int64(len(mappingUtilityTestData))}, onClose: func() { order = append(order, "close") }}
-			ops := mappingUtilityOpsForTest()
-			ops.CheckPath = func(path string) error {
-				order = append(order, "check")
-				if path != wantPath {
-					t.Fatal("preparation selected a different manifest")
+			mapping, backend, store := startMappingModel(t)
+			original := context.DeadlineExceeded
+			backend.removeErr = original
+			switch mode {
+			case "not-invoked":
+				backend.removeErr = &mappingOutcomeError{Cause: original, Outcome: mappingMutation{Knowledge: "not-invoked", HelperQuiesced: true}}
+			case "nonzero":
+				backend.removeErr = mappingKnownOutcomeForTest(5, true, original)
+			case "success-unquiesced":
+				backend.removeErr = mappingKnownOutcomeForTest(0, false, original)
+			case "known-success-independent-error":
+				backend.removeErr = mappingKnownOutcomeForTest(0, true, original)
+			}
+			if err := mapping.cleanup(context.Background()); !errors.Is(err, original) || backend.removes != 1 || mapping.removeAuthority {
+				t.Fatalf("remove lost its failure or consumed authority: %v", err)
+			}
+			backend.current = cloneMappingValue(t, store.ledger.Baseline)
+			for index, owned := range []*ownedSMBMapping{mapping, {options: mapping.options, path: "ledger", ledger: cloneMappingValue(t, store.ledger), backend: backend, store: store}} {
+				err := owned.cleanup(context.Background())
+				if (err == nil) != (index == 0 && mode == "known-success-independent-error") || backend.removes != 1 {
+					t.Fatal("absence cleared uncertain removal or caused a second remove")
 				}
-				return nil
-			}
-			ops.Open = func(path string) (mappingUtilityFile, error) {
-				order = append(order, "open")
-				if path != wantPath {
-					t.Fatal("preparation opened a different manifest")
-				}
-				return file, nil
-			}
-			ops.CommandLine = func(args []string) string {
-				order = append(order, "commandline")
-				if args[0] != "system-powershell" || mappingScriptFromArgumentsForTest(t, args[1:]) != wantScript {
-					t.Fatal("command-line validation did not bind the generated mapping script")
-				}
-				return strings.Join(args, " ")
-			}
-			process := mappingReplyChild(string(reply))
-			process.inputOverride = &ownedProcessInput{pipe: process.input}
-			host := &mappingCommandHost{child: process, onStart: func() {
-				order = append(order, "start")
-				if file.closes != 1 {
-					t.Fatal("child started before checked manifest closure")
-				}
-			}}
-			if mode == "normal" {
-				result, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", root, request, ops)
-				if err != nil || result.Status != "ok" {
-					t.Fatalf("normal prepared mapping failed: %v", err)
-				}
-			} else {
-				execution, err := executePreparedMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", root, request, mode == "inventory-eof", ops)
-				facts := execution.Diagnostic.UtilityPreparation
-				if err != nil || facts == nil || facts.Path != wantPath || facts.Size == nil || *facts.Size != int64(len(mappingUtilityTestData)) || facts.ReadBytes != len(mappingUtilityTestData) || facts.SHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(mappingUtilityTestData))) || facts.ElapsedNanos < 0 || !facts.CleanupConfirmed || !execution.Diagnostic.CleanupConfirmed {
-					t.Fatalf("inventory lost prepared execution facts: %+v %v", facts, err)
-				}
-			}
-			if !reflect.DeepEqual(order, []string{"check", "open", "commandline", "close", "start"}) || file.statCalls != 2 || file.closes != 1 || host.starts != 1 || process.finished != 1 || process.input.closes != 1 {
-				t.Fatalf("prepared execution ordering changed: %v", order)
-			}
-			scripts = append(scripts, mappingScriptFromArgumentsForTest(t, host.args))
-			frames = append(frames, process.input.String())
-		})
-	}
-	for index := range scripts {
-		if scripts[index] != wantScript || frames[index] != frames[0] {
-			t.Fatal("normal mapping and diagnostic inventories used different scripts or input")
-		}
-	}
-}
-
-func TestMappingPreparedFailuresRetainUtilityFactsAndErrorChains(t *testing.T) {
-	request := mappingCommandRequest{Action: "inventory", OwnerSID: mappingBaselineForTest().Owner.SID}
-	reply, err := json.Marshal(mappingCommandResult{Status: "ok", OwnerSID: request.OwnerSID, Rows: []mappingRow{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, phase := range []string{"preparation", "launch", "child", "cleanup"} {
-		t.Run(phase, func(t *testing.T) {
-			failure, closeFailure := errors.New("original phase failure"), errors.New("manifest close failure")
-			file := &mappingUtilityTestFile{reader: strings.NewReader(mappingUtilityTestData), info: mappingUtilityTestInfo{size: int64(len(mappingUtilityTestData))}}
-			ops := mappingUtilityOpsForTest()
-			ops.Open = func(string) (mappingUtilityFile, error) { return file, nil }
-			process := mappingReplyChild(string(reply))
-			host := &mappingCommandHost{child: process}
-			switch phase {
-			case "preparation":
-				file.reader = mappingUtilityTestReader(func([]byte) (int, error) { return 0, failure })
-				file.closeErr = closeFailure
-			case "launch":
-				host.startErr = &windowsLaunchError{Facts: windowsLaunchFacts{RequestedImage: "system-powershell", CleanupConfirmed: true}, Cause: failure}
-			case "child":
-				process.result = failure
-			case "cleanup":
-				process.finishErr = failure
-			}
-			_, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), request, ops)
-			if !errors.Is(err, failure) || phase == "preparation" && !errors.Is(err, closeFailure) || !strings.HasPrefix(err.Error(), failure.Error()) {
-				t.Fatalf("prepared mapping replaced an original or cleanup error: %v", err)
-			}
-			d := mappingDiagnosticFrom(t, err).details
-			facts := d.UtilityPreparation
-			wantClean := phase == "launch" || phase == "child"
-			if facts == nil || facts.Path == "" || facts.CleanupConfirmed != (phase != "preparation") || d.CleanupConfirmed != wantClean || file.closes != 1 {
-				t.Fatalf("failure lost Utility facts or combined cleanup truth: %+v", d)
-			}
-			if phase == "preparation" {
-				if host.starts != 0 || d.ScriptUTF16Units != 0 || d.PID != nil || d.Launch != nil || d.WorkersStarted != 0 {
-					t.Fatal("preparation failure fabricated execution facts")
-				}
-			} else if host.starts != 1 || facts.ReadBytes != len(mappingUtilityTestData) || facts.SHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(mappingUtilityTestData))) {
-				t.Fatal("later failure lost completed manifest observations")
 			}
 		})
 	}
 }
 
-func TestMappingExecutionInputCompletion(t *testing.T) {
-	writeFailure, closeFailure := errors.New("write failed"), errors.New("input close failed")
-	for _, mode := range []string{"open", "eof", "short", "write-error", "close-error"} {
-		t.Run(mode, func(t *testing.T) {
-			process := mappingReplyChild("fixed-result\n")
-			writes, closes, closeBeforeFinish := 0, 0, false
-			process.inputOverride = &ownedProcessInput{pipe: mappingDiagnosticInput{
-				write: func(data []byte) (int, error) {
-					writes++
-					if mode == "short" {
-						return len(data) - 1, nil
-					}
-					if mode == "write-error" {
-						return 2, writeFailure
-					}
-					return len(data), nil
-				},
-				close: func() error {
-					closes++
-					closeBeforeFinish = process.finished == 0
-					if mode == "close-error" {
-						return closeFailure
-					}
-					return nil
-				},
-			}}
-			request := mappingCommandRequest{Action: "inventory", OwnerSID: "owner"}
-			execution, err := executeMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", "verified-system-modules", request, mappingStartupEntryScript, mode != "open")
-			d := execution.Diagnostic
-			if writes != 1 || closes != 1 || process.finished != 1 || d.WorkersStarted != 3 || d.WorkersJoined != 3 || !d.CleanupAttempted {
-				t.Fatalf("ownership counts: writes=%d closes=%d finish=%d facts=%+v", writes, closes, process.finished, d)
-			}
-			wantEOF := mode == "eof" || mode == "close-error"
-			if d.EOFAttempted != wantEOF || closeBeforeFinish != wantEOF || d.EOFCompleted != (mode == "eof") {
-				t.Fatalf("EOF ordering: %+v", d)
-			}
-			if d.CleanupConfirmed != (mode != "close-error") {
-				t.Fatalf("cleanup fact: %+v", d)
-			}
-			if mode == "short" && !errors.Is(err, io.ErrShortWrite) || mode == "write-error" && !errors.Is(err, writeFailure) || mode == "close-error" && !errors.Is(err, closeFailure) {
-				t.Fatalf("lost operation error: %v", err)
-			}
-			if (mode == "open" || mode == "eof") && (err != nil || !d.WriteComplete || string(execution.Stdout) != "fixed-result\n") {
-				t.Fatalf("normal execution: %+v %v", execution, err)
-			}
-			if len(d.InputSHA256) != 64 || len(d.ScriptSHA256) != 64 || d.ScriptUTF16Units == 0 || d.Stdout.ObservedBytes != int64(len("fixed-result\n")) {
-				t.Fatalf("success observations missing: %+v", d)
-			}
-		})
-	}
-}
-
-func TestMappingInputLineDiagnosticBindsDeliveredFrame(t *testing.T) {
-	sid := mappingBaselineForTest().Owner.SID
-	maximum := mappingCommandRequest{Action: "inventory", OwnerSID: sid}
-	base, err := json.Marshal(maximum)
-	if err != nil {
-		t.Fatal(err)
-	}
-	maximum.Module = strings.Repeat("x", 4095-len(base))
-	for _, test := range []struct {
-		name    string
-		request mappingCommandRequest
-	}{
-		{"ascii", mappingCommandRequest{Action: "inventory", Module: "system-module", OwnerSID: sid}},
-		{"unicode-and-escaped-newline", mappingCommandRequest{Action: "inventory", Module: "模块🧪\r\nmanifest", OwnerSID: sid}},
-		{"empty-fields", mappingCommandRequest{}},
-		{"maximum-line", maximum},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			line, err := json.Marshal(test.request)
-			if err != nil {
-				t.Fatal(err)
-			}
-			frame := append(append([]byte(nil), line...), '\n')
-			lineDigest := fmt.Sprintf("%x", sha256.Sum256(line))
-			frameDigest := fmt.Sprintf("%x", sha256.Sum256(frame))
-			for _, failed := range []bool{false, true} {
-				name := "success"
-				var failure error
-				if failed {
-					name, failure = "child-failure", errors.New("child failed after input")
-				}
-				t.Run(name, func(t *testing.T) {
-					process := mappingReplyChild("fixed-result\n")
-					process.result = failure
-					execution, err := executePreparedMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), test.request, false, mappingUtilityOpsForTest())
-					if !errors.Is(err, failure) {
-						t.Fatalf("execution result changed: %v", err)
-					}
-					d := execution.Diagnostic
-					if !bytes.Equal([]byte(process.input.String()), frame) || d.InputBytes != len(frame) || d.InputSHA256 != frameDigest ||
-						d.InputLineBytes != len(line) || d.InputLineSHA256 != lineDigest || d.InputLineSHA256 == d.InputSHA256 {
-						t.Fatal("input observation confused the JSON line with its LF-delimited frame")
-					}
-					if !d.WriteComplete || d.WriteBytes != len(frame) || d.EOFRequested || d.EOFAttempted ||
-						d.WorkersJoined != 3 || !d.CleanupConfirmed || process.finished != 1 || process.input.closes != 1 {
-						t.Fatal("input observation changed delivery, stdin ownership or worker cleanup")
-					}
-					if test.name == "maximum-line" && (d.InputLineBytes != 4095 || d.InputBytes != 4096) {
-						t.Fatal("maximum input fixture no longer reaches the wire boundary")
-					}
-					encoded, err := json.Marshal(d)
+func TestMappingPublicationFailureRevokesAuthorityEvenAfterTargetChanges(t *testing.T) {
+	for _, publishBeforeError := range []bool{false, true} {
+		for failAt := 1; failAt <= 5; failAt++ {
+			t.Run(fmt.Sprintf("save-%d-published-%v", failAt, publishBeforeError), func(t *testing.T) {
+				o, backend, store := newMappingModel(t)
+				store.saveErrAt, store.publishBeforeError = failAt, publishBeforeError
+				mapping, err := beginSMBMapping(context.Background(), o, "rfs-"+o.FixtureNonce, 15445, backend, store, "ledger")
+				if failAt > 2 {
 					if err != nil {
 						t.Fatal(err)
 					}
-					var wire struct {
-						LineBytes  int    `json:"input_line_bytes"`
-						LineDigest string `json:"input_line_sha256"`
-						FrameBytes int    `json:"input_bytes"`
-						FrameHash  string `json:"input_sha256"`
+					err = mapping.cleanup(context.Background())
+				}
+				if mapping == nil || !errors.Is(err, syscall.EIO) || !mapping.publicationFailed || mapping.removeAuthority {
+					t.Fatalf("publication error retained live removal authority: %v", err)
+				}
+				if publishBeforeError {
+					states := []string{"", "create-returned", "observed", "remove-pending", "remove-returned", "removed"}
+					if store.ledger.State != states[failAt] {
+						t.Fatal("publication-failure fixture did not actually change its target")
 					}
-					if err := json.Unmarshal(encoded, &wire); err != nil || wire.LineBytes != len(line) || wire.LineDigest != lineDigest ||
-						wire.FrameBytes != len(frame) || wire.FrameHash != frameDigest {
-						t.Fatal("diagnostic JSON omitted or renamed the line/frame facts")
-					}
-					mappingDiagnosticFrom(t, encodeMappingDiagnostic(d))
-				})
+				}
+				priorRemoves := backend.removes
+				if failAt <= 3 && priorRemoves != 0 || failAt > 3 && priorRemoves != 1 {
+					t.Fatal("mutation was dispatched before pending-save acknowledgement")
+				}
+				if err := mapping.cleanup(context.Background()); err == nil || backend.removes != priorRemoves {
+					t.Fatal("same-process cleanup recovered authority from a failed publication")
+				}
+				reconstructed := &ownedSMBMapping{options: o, path: "ledger", ledger: cloneMappingValue(t, store.ledger), backend: backend, store: store}
+				if err := reconstructed.cleanup(context.Background()); err == nil || reconstructed.removeAuthority || backend.removes != priorRemoves || backend.creates != 1 {
+					t.Fatal("published terminal bytes gave a fresh object mutation authority")
+				}
+			})
+		}
+	}
+}
+
+func mappingPrivateDirectoryForTest(t *testing.T) string {
+	t.Helper()
+	directory := filepath.Join(t.TempDir(), "private")
+	if err := createPrivateDirectory(directory); err != nil {
+		t.Fatal(err)
+	}
+	return directory
+}
+
+func TestMappingDiskPublishedTerminalThenErrorCannotAuthorizeRemoval(t *testing.T) {
+	for _, failAt := range []int{1, 2, 4, 5} {
+		t.Run(fmt.Sprintf("publish-%d", failAt), func(t *testing.T) {
+			o := mappingRequestForTest(t, "create").options()
+			path := filepath.Join(mappingPrivateDirectoryForTest(t), "smb-mapping.json")
+			store := &diskMappingStore{path: path, o: o}
+			publications := 0
+			store.publish = func(from, to string) error {
+				publications++
+				if err := replaceMappingFile(from, to); err != nil {
+					return err
+				}
+				if publications == failAt {
+					return syscall.EIO
+				}
+				return nil
+			}
+			events := []string{}
+			backend := &mappingFakeBackend{t: t, current: mappingBaselineForTest(), events: &events, createResource: true, snapshotErrors: map[int]error{}, persisted: func() mappingLedger {
+				ledger, err := readMappingLedger(path, o)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return ledger
+			}}
+			mapping, err := beginSMBMapping(context.Background(), o, "rfs-"+o.FixtureNonce, 15445, backend, store, path)
+			if failAt > 2 {
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = mapping.cleanup(context.Background())
+			}
+			if mapping == nil || !errors.Is(err, syscall.EIO) || mapping.removeAuthority || !mapping.publicationFailed || backend.creates != 1 {
+				t.Fatalf("published rename error did not revoke authority: %v", err)
+			}
+			published, err := readMappingLedger(path, o)
+			if err != nil || !mappingMutationSucceeded(published.CreateOutcome) || published.State != map[int]string{1: "create-returned", 2: "observed", 4: "remove-returned", 5: "removed"}[failAt] {
+				t.Fatalf("the actual disk target did not contain the acknowledged-looking terminal record: %+v %v", published, err)
+			}
+			wantRemoves := 0
+			if failAt > 2 {
+				wantRemoves = 1
+				if !mappingMutationSucceeded(published.RemoveOutcome) || !reflect.DeepEqual(backend.current, mappingBaselineForTest()) {
+					t.Fatal("published remove terminal fixture did not have complete absence")
+				}
+			}
+			if err := mapping.cleanup(context.Background()); err == nil || backend.removes != wantRemoves {
+				t.Fatal("same-process cleanup removed after actual target publication failed")
+			}
+			reopenedStore := &diskMappingStore{path: path, o: o, expected: published}
+			reconstructed := &ownedSMBMapping{options: o, path: path, ledger: published, backend: backend, store: reopenedStore}
+			if err := reconstructed.cleanup(context.Background()); err == nil || backend.removes != wantRemoves || backend.creates != 1 {
+				t.Fatal("read-back terminal bytes authorized mutation in fresh cleanup")
 			}
 		})
 	}
+}
+
+func TestNativeMappingOutcomeSeparatesAPIFactsFromProcessErrors(t *testing.T) {
+	request := mappingRequestForTest(t, "create")
+	frame := mappingResultFrameForTest(t, mappingReturnedResultForTest(t, request, 0))
+	failure := errors.New("independent process failure")
+	for _, mode := range []string{"process-error", "context-expired", "cleanup-unknown", "owner-error", "missing-frame", "exit-zero-without-frame", "not-started", "reply-without-start", "nonzero-return"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			execution := mappingExecution{Stdout: append([]byte(nil), frame...), Diagnostic: mappingCommandDiagnostic{StartAttempted: true, CleanupConfirmed: true}}
+			var commandErr, ownerErr error
+			wantKnowledge, wantCode, wantClean := "returned", uint32(0), true
+			switch mode {
+			case "process-error":
+				commandErr = failure
+			case "context-expired":
+				cancel()
+			case "cleanup-unknown":
+				execution.Diagnostic.CleanupConfirmed, wantClean = false, false
+				commandErr = failure
+			case "owner-error":
+				ownerErr, wantKnowledge = failure, "unknown"
+			case "missing-frame":
+				execution.Stdout, commandErr, wantKnowledge = nil, failure, "unknown"
+			case "exit-zero-without-frame":
+				execution.Stdout, wantKnowledge = nil, "unknown"
+			case "not-started":
+				execution.Stdout, execution.Diagnostic.StartAttempted, commandErr, wantKnowledge = nil, false, failure, "not-invoked"
+			case "reply-without-start":
+				execution.Diagnostic.StartAttempted, wantKnowledge = false, "not-invoked"
+			case "nonzero-return":
+				execution.Stdout = mappingResultFrameForTest(t, mappingReturnedResultForTest(t, request, 5))
+				wantCode = 5
+			}
+			_, err := finishMappingCommand(ctx, request, execution, commandErr, ownerErr)
+			var outcome *mappingOutcomeError
+			if err == nil || !errors.As(err, &outcome) || outcome.Outcome.Knowledge != wantKnowledge || outcome.Outcome.HelperQuiesced != wantClean {
+				t.Fatalf("operation knowledge was conflated with process success: outcome=%+v error=%v", outcome, err)
+			}
+			if commandErr != nil && !errors.Is(err, commandErr) || ownerErr != nil && !errors.Is(err, ownerErr) || mode == "context-expired" && !errors.Is(err, context.Canceled) {
+				t.Fatal("bound final reply erased an independent failure")
+			}
+			if wantKnowledge == "returned" {
+				if outcome.Outcome.Code == nil || *outcome.Outcome.Code != wantCode {
+					t.Fatal("observed API return status was lost")
+				}
+			} else if outcome.Outcome.Code != nil {
+				t.Fatal("unknown or uninvoked operation fabricated an API status")
+			}
+			if mappingMutationSucceeded(outcome.Outcome) != (wantKnowledge == "returned" && wantCode == 0 && wantClean) {
+				t.Fatal("mutation success ignored call status or helper quiescence")
+			}
+		})
+	}
+	if _, err := finishMappingCommand(context.Background(), request, mappingExecution{Stdout: frame, Diagnostic: mappingCommandDiagnostic{StartAttempted: true, CleanupConfirmed: true}}, nil, nil); err != nil {
+		t.Fatalf("complete successful frame with known cleanup was rejected: %v", err)
+	}
+}
+
+func TestMappingRunnerRootAndOwnerNamespaceAreFixed(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("checkout", ".tmp", "native-current-authority-fixture"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := mappingRequestForTest(t, "inventory").options()
+	o.StateFile = filepath.Join(root, "windows-runs", o.RunID, "evidence", "probe-state.json")
+	executable := filepath.Join(root, "artifact", "host", "probe-windows-arm64.exe")
+	if got, err := mappingRootFromExecutable(executable, o); err != nil || got != root {
+		t.Fatalf("canonical executable/state identity failed: root=%q error=%v", got, err)
+	}
+	for _, changed := range []string{filepath.Join(root, "other.exe"), filepath.Join(root, "artifact", "probe-windows-arm64.exe"), "probe-windows-arm64.exe"} {
+		if _, err := mappingRootFromExecutable(changed, o); err == nil {
+			t.Fatal("another artifact location selected an independent admission namespace")
+		}
+	}
+	foreign := o
+	foreign.RunID = "124-1"
+	if _, err := mappingRootFromExecutable(executable, foreign); err == nil {
+		t.Fatal("state path escaped its exact run directory")
+	}
+	owner := mappingOwnerForTest()
+	directory := mappingOwnerDirectory(root, owner)
+	for _, changed := range []mappingOwner{{SID: "S-1-5-21-10-20-30-2002", AuthenticationID: owner.AuthenticationID, WindowsBuild: owner.WindowsBuild}, {SID: owner.SID, AuthenticationID: "0000000000000999", WindowsBuild: owner.WindowsBuild}} {
+		if mappingOwnerDirectory(root, changed) == directory {
+			t.Fatal("different SID/logon contexts share an owner claim")
+		}
+	}
+	values := map[string]string{"GITHUB_ACTIONS": "true", "RFS_FIXTURE_RUNNER_ENVIRONMENT": "github-hosted", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}
+	lookup := func(name string) string { return values[name] }
+	if _, err := mappingRunnerFacts(lookup, "123-1"); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct{ name, value string }{{"GITHUB_ACTIONS", "false"}, {"RFS_FIXTURE_RUNNER_ENVIRONMENT", "self-hosted"}, {"GITHUB_RUN_ID", "0123"}, {"GITHUB_RUN_ATTEMPT", "0"}, {"GITHUB_RUN_ATTEMPT", "2"}} {
+		original := values[test.name]
+		values[test.name] = test.value
+		if _, err := mappingRunnerFacts(lookup, "123-1"); err == nil {
+			t.Fatal("unsupported or foreign runner declaration authorized admission")
+		}
+		values[test.name] = original
+	}
+}
+
+func TestMappingOwnerClaimRemainsConsumedAcrossRunsAndPartialInitialization(t *testing.T) {
+	for _, state := range []string{"complete", "missing-claim", "malformed-claim"} {
+		t.Run(state, func(t *testing.T) {
+			root := mappingPrivateDirectoryForTest(t)
+			request := mappingRequestForTest(t, "create")
+			claim := mappingExpectedClaim(request.options(), request.Owner, mappingRunner{Environment: "github-hosted", RunID: "123", Attempt: "1"})
+			directory := mappingOwnerDirectory(root, request.Owner)
+			if state == "complete" {
+				if err := createMappingClaim(directory, claim); err != nil {
+					t.Fatal(err)
+				}
+				if err := validateMappingClaim(directory, claim); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := createPrivateDirectory(directory); err != nil {
+					t.Fatal(err)
+				}
+				if state == "malformed-claim" {
+					file, err := os.OpenFile(filepath.Join(directory, "claim.json"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := makePrivateFile(file.Name()); err != nil {
+						t.Fatal(errors.Join(err, file.Close()))
+					}
+					_, writeErr := file.WriteString("{incomplete")
+					if err := errors.Join(writeErr, file.Sync(), file.Close()); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := validateMappingClaim(directory, claim); err == nil {
+					t.Fatal("partial claim initialization was adopted")
+				}
+			}
+			other := claim
+			other.RunID, other.SourceSHA, other.Nonce = "124-1", strings.Repeat("c", 40), strings.Repeat("d", 64)
+			if err := createMappingClaim(mappingOwnerDirectory(root, other.Owner), other); err == nil {
+				t.Fatal("new run/source/nonce reset the root/logon's consumed attempt")
+			}
+			if state == "complete" {
+				if err := validateMappingClaim(directory, claim); err != nil {
+					t.Fatal("denied admission changed the immutable original claim")
+				}
+				unlock, err := lockMappingOwner(directory)
+				if err != nil {
+					t.Fatal(err)
+				}
+				second, secondErr := lockMappingOwner(directory)
+				if second != nil {
+					t.Fatal(errors.Join(errors.New("second owner lock was admitted"), second(), unlock()))
+				}
+				unlockErr := unlock()
+				if secondErr == nil {
+					t.Fatal("owner lock failed to exclude concurrent admission")
+				}
+				if unlockErr != nil {
+					t.Fatal(unlockErr)
+				}
+				if err := createMappingClaim(directory, claim); err == nil {
+					t.Fatal("releasing the transient lock reset the immutable attempt claim")
+				}
+			}
+		})
+	}
+}
+
+type mappingTestInput struct {
+	bytes.Buffer
+	writes, closes int
+	write          func([]byte) (int, error)
+	onClose        func()
+}
+
+func (w *mappingTestInput) Write(data []byte) (int, error) {
+	w.writes++
+	if w.write != nil {
+		return w.write(data)
+	}
+	return w.Buffer.Write(data)
+}
+func (w *mappingTestInput) Close() error {
+	w.closes++
+	if w.onClose != nil {
+		w.onClose()
+	}
+	return nil
+}
+
+type mappingTestChild struct {
+	input             *mappingTestInput
+	output, stderr    io.ReadCloser
+	done              chan struct{}
+	result, finishErr error
+	forced            bool
+	finished, results int
+}
+
+func (p *mappingTestChild) Input() io.WriteCloser { return p.input }
+func (p *mappingTestChild) Output() io.ReadCloser { return p.output }
+func (p *mappingTestChild) Errors() io.ReadCloser { return p.stderr }
+func (p *mappingTestChild) Done() <-chan struct{} { return p.done }
+func (p *mappingTestChild) PID() uint32           { return 55 }
+func (p *mappingTestChild) Result() error {
+	select {
+	case <-p.done:
+	default:
+		panic("Result observed before child exit")
+	}
+	p.results++
+	return p.result
+}
+func (p *mappingTestChild) Finish() (bool, error) {
+	p.finished++
+	select {
+	case <-p.done:
+	default:
+		close(p.done)
+	}
+	return p.forced, errors.Join(p.finishErr, p.input.Close(), p.output.Close(), p.stderr.Close())
+}
+
+type mappingTestHost struct {
+	child       child
+	startErr    error
+	starts      int
+	args, env   []string
+	returnChild bool
+}
+
+func (h *mappingTestHost) Preflight() (map[string]any, error) { return nil, nil }
+func (h *mappingTestHost) StartWithEnvironment(_ string, args []string, _ string, environment []string) (child, error) {
+	h.starts++
+	h.args, h.env = append([]string(nil), args...), append([]string(nil), environment...)
+	if h.startErr != nil && !h.returnChild {
+		return nil, h.startErr
+	}
+	return h.child, h.startErr
 }
 
 type mappingErrorReader struct{ cause error }
 
 func (r mappingErrorReader) Read([]byte) (int, error) { return 0, r.cause }
 
-func TestMappingExecutionRetainsChildStreamAndCleanupErrors(t *testing.T) {
-	childFailure, streamFailure, cleanupFailure := errors.New("child failed"), errors.New("stream failed"), errors.New("cleanup failed")
-	for _, mode := range []string{"stream", "validation", "cleanup"} {
+func TestNativeMappingExecutorRetainsFrameProgressAndAllOwnedErrors(t *testing.T) {
+	request := mappingRequestForTest(t, "create")
+	frame := mappingResultFrameForTest(t, mappingReturnedResultForTest(t, request, 0))
+	childFailure, streamFailure, cleanupFailure, writeFailure := errors.New("child failure"), errors.New("stream failure"), errors.New("cleanup failure"), errors.New("write failure")
+	for _, mode := range []string{"success", "child-stream-cleanup", "short-write", "write-error", "forced"} {
 		t.Run(mode, func(t *testing.T) {
-			process := mappingReplyChild(`{"status":"ok","owner_sid":"foreign","rows":[],"cause":""}`)
-			process.result = childFailure
-			if mode == "stream" {
-				process.output = io.NopCloser(mappingErrorReader{streamFailure})
+			process := &mappingTestChild{input: &mappingTestInput{}, output: io.NopCloser(bytes.NewReader(frame)), stderr: io.NopCloser(strings.NewReader("")), done: make(chan struct{})}
+			close(process.done)
+			var want []error
+			switch mode {
+			case "child-stream-cleanup":
+				process.result, process.finishErr = childFailure, cleanupFailure
+				process.stderr = io.NopCloser(mappingErrorReader{streamFailure})
+				want = []error{childFailure, streamFailure, cleanupFailure}
+			case "short-write":
+				process.input.write = func(data []byte) (int, error) { return len(data) - 1, nil }
+				want = []error{io.ErrShortWrite}
+			case "write-error":
+				process.input.write = func([]byte) (int, error) { return 0, writeFailure }
+				want = []error{writeFailure}
+			case "forced":
+				process.forced = true
 			}
-			if mode == "cleanup" {
-				process.finishErr = cleanupFailure
+			host := &mappingTestHost{child: process}
+			parent := append([]string(nil), os.Environ()...)
+			execution, err := executeNativeMapping(context.Background(), host, "verified-probe.exe", "private-work", request)
+			d := execution.Diagnostic
+			if (err == nil) != (mode == "success") || host.starts != 1 || !reflect.DeepEqual(host.args, []string{"--mapping-helper"}) || !reflect.DeepEqual(parent, host.env) || !reflect.DeepEqual(parent, os.Environ()) {
+				t.Fatalf("native helper changed process invocation/environment or erased failure: %v", err)
 			}
-			_, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory", OwnerSID: "owner"}, mappingUtilityOpsForTest())
-			if !errors.Is(err, childFailure) || mode == "stream" && !errors.Is(err, streamFailure) || mode == "cleanup" && !errors.Is(err, cleanupFailure) {
-				t.Fatalf("lost error chain: %v", err)
+			for _, cause := range want {
+				if !errors.Is(err, cause) {
+					t.Fatalf("owned operation lost a failure: %v", err)
+				}
 			}
-			if process.finished != 1 || mappingDiagnosticFrom(t, err).details.WorkersJoined != 3 {
-				t.Fatal("failure escaped owned cleanup")
+			if !d.StartAttempted || d.PID == nil || *d.PID != 55 || d.WorkersStarted != 3 || d.WorkersJoined != 3 || process.finished != 1 || process.input.writes != 1 || process.input.closes != 1 || !bytes.Equal(execution.Stdout, frame) || d.CleanupConfirmed != (mode != "child-stream-cleanup") {
+				t.Fatal("executor returned before all workers/owner cleanup or lost complete captured bytes")
+			}
+			input := mappingRequestFrameForTest(t, request)
+			if d.InputBytes != len(input) || d.InputSHA256 != fmt.Sprintf("%x", sha256.Sum256(input)) || d.InputLineBytes != len(input)-1 || d.InputLineSHA256 != fmt.Sprintf("%x", sha256.Sum256(input[:len(input)-1])) {
+				t.Fatal("executor confused framed and unframed request bytes")
+			}
+			if mode == "success" && (!d.WriteComplete || !bytes.Equal(process.input.Bytes(), input)) {
+				t.Fatal("successful helper did not receive exactly one unchanged frame")
 			}
 		})
 	}
 }
 
-func TestMappingExecutionRetainsPartialLaunchAndReturnedChild(t *testing.T) {
-	cause := errors.New("resume failed")
-	count := uint32(2)
-	facts := windowsLaunchFacts{RequestedImage: "system-powershell", PreviousSuspendCount: &count, CleanupConfirmed: true}
-	host := &mappingCommandHost{startErr: &windowsLaunchError{Facts: facts, Cause: cause}}
-	execution, err := executeMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", "verified-system-modules", mappingCommandRequest{Action: "inventory"}, mappingStartupEntryScript, false)
-	if !errors.Is(err, cause) || execution.Diagnostic.Launch == nil || *execution.Diagnostic.Launch.PreviousSuspendCount != 2 || execution.Diagnostic.Launch.ActualImage != "" || !execution.Diagnostic.CleanupConfirmed {
-		t.Fatalf("partial launch facts: %+v %v", execution, err)
-	}
-	process := mappingReplyChild("")
-	host = &mappingCommandHost{child: process, startErr: cause, returnChildOnError: true}
-	execution, err = executeMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", "verified-system-modules", mappingCommandRequest{Action: "inventory"}, mappingStartupEntryScript, false)
-	if !errors.Is(err, cause) || process.finished != 1 || !execution.Diagnostic.CleanupAttempted || !execution.Diagnostic.CleanupConfirmed || execution.Diagnostic.WorkersStarted != 0 {
-		t.Fatalf("returned child escaped start-error cleanup: %+v %v", execution, err)
-	}
+type mappingControlledReader struct {
+	data        *bytes.Reader
+	ready, done chan struct{}
+	readOnce    sync.Once
+	closeOnce   sync.Once
 }
 
-func TestMappingStartupCellsOrderAndCleanupAdmission(t *testing.T) {
-	request := mappingCommandRequest{Action: "inventory", Module: "same-module", OwnerSID: "same-owner"}
-	wantPlan := [6]mappingStartupCell{
-		{Name: "01_entry_open", Kind: mappingStartupEntry, Script: mappingStartupEntryScript, CloseInput: false, Entry: "RFS-MAPPING/1 entry-only", Result: `{"status":"entry-ok"}`},
-		{Name: "02_entry_eof", Kind: mappingStartupEntry, Script: mappingStartupEntryScript, CloseInput: true, Entry: "RFS-MAPPING/1 entry-only", Result: `{"status":"entry-ok"}`},
-		{Name: "03_inventory_open", Kind: mappingStartupInventory, Script: "", CloseInput: false, Entry: "RFS-MAPPING/1 entry", Result: ""},
-		{Name: "04_inventory_eof", Kind: mappingStartupInventory, Script: "", CloseInput: true, Entry: "RFS-MAPPING/1 entry", Result: ""},
-		{Name: "05_resolve_json_command", Kind: mappingStartupResolve, Script: mappingStartupResolveScript, CloseInput: false, Entry: "RFS-CMD/1 entry resolve", Result: `{"status":"resolve-ok"}`},
-		{Name: "06_import_utility_parse", Kind: mappingStartupImport, Script: "", CloseInput: false, Entry: "RFS-CMD/1 entry import-parse", Result: `{"status":"import-parse-ok"}`},
-	}
-	if got := mappingStartupPlan(); !reflect.DeepEqual(got, wantPlan) {
-		t.Fatal("startup diagnostic differs from the six explicit descriptors")
-	}
-	for _, failCleanupAt := range []int{0, 2, 4, 5} {
-		t.Run(fmt.Sprintf("cleanup-failure-at-%d", failCleanupAt), func(t *testing.T) {
-			var names, inputHashes []string
-			starts, failures, preparations, mappingChecks := 0, 0, 0, 0
-			aborted := walkMappingStartupCells(func(ordinal int, cell mappingStartupCell) bool {
-				names = append(names, cell.Name)
-				if ordinal != len(names) || cell != wantPlan[ordinal-1] {
-					t.Fatal("cell order or explicit descriptor changed")
-				}
-				if cell.Kind == mappingStartupImport {
-					preparations++
-					var err error
-					cell.Script, err = mappingStartupImportScript(mappingStartupManifestForTest(t, "Microsoft.PowerShell.Utility.psd1"))
-					if err != nil || cell.Script == "" {
-						t.Fatal("deferred import cell did not produce its explicit script")
-					}
-				}
-				process := mappingReplyChild("fixed\n")
-				process.inputOverride = &ownedProcessInput{pipe: process.input}
-				process.forced = ordinal == 1
-				if ordinal == 5 {
-					process.result = errors.New("resolution failed with known cleanup")
-				}
-				if ordinal == failCleanupAt {
-					process.finishErr = errors.New("job empty not confirmed")
-				}
-				host := &mappingCommandHost{child: process}
-				var execution mappingExecution
-				var err error
-				if cell.Kind == mappingStartupInventory {
-					ops := mappingUtilityOpsForTest()
-					ops.CheckPath = func(string) error { mappingChecks++; return nil }
-					execution, err = executePreparedMappingPowerShell(context.Background(), host, "same-executable", "same-directory", mappingUtilityRootForTest(t), request, cell.CloseInput, ops)
-				} else {
-					execution, err = executeMappingPowerShell(context.Background(), host, "same-executable", "same-directory", mappingUtilityRootForTest(t), request, cell.Script, cell.CloseInput)
-				}
-				starts += host.starts
-				if err != nil {
-					failures++
-				}
-				if process.finished != 1 || execution.Diagnostic.WorkersJoined != 3 {
-					t.Fatal("next cell could outlive prior cleanup or streams")
-				}
-				if request.Action != "inventory" || strings.Contains(process.input.String(), `"action":"create"`) || strings.Contains(process.input.String(), `"action":"remove"`) {
-					t.Fatal("diagnostic mutated mappings")
-				}
-				if !reflect.DeepEqual(host.args[:len(host.args)-1], []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand"}) {
-					t.Fatal("diagnostic changed launch flags")
-				}
-				inputHashes = append(inputHashes, execution.Diagnostic.InputSHA256)
-				return execution.Diagnostic.CleanupConfirmed
-			})
-			want := []string{"01_entry_open", "02_entry_eof", "03_inventory_open", "04_inventory_eof", "05_resolve_json_command", "06_import_utility_parse"}
-			if failCleanupAt != 0 {
-				want = want[:failCleanupAt]
-			}
-			if !reflect.DeepEqual(names, want) || starts != len(want) || aborted != (failCleanupAt != 0) || failures < 1 {
-				t.Fatalf("cell admission: names=%v starts=%d aborted=%v failures=%d", names, starts, aborted, failures)
-			}
-			if failCleanupAt == 0 && (preparations != 1 || failures != 2) || failCleanupAt != 0 && preparations != 0 {
-				t.Fatal("late import preparation ran before admission or clean resolution failure blocked it")
-			}
-			wantMappingChecks := 2
-			if failCleanupAt == 2 {
-				wantMappingChecks = 0
-			}
-			if mappingChecks != wantMappingChecks {
-				t.Fatal("inventory preparation escaped its admitted cell")
-			}
-			for _, hash := range inputHashes {
-				if hash != inputHashes[0] {
-					t.Fatal("request bytes changed between cells")
-				}
-			}
-		})
-	}
-	for _, forbidden := range []string{"ReadLine", "$input", "Import-Module", "Get-SmbMapping", "WindowsIdentity", "|"} {
-		if strings.Contains(mappingStartupEntryScript, forbidden) {
-			t.Fatalf("entry-only script gained %s", forbidden)
-		}
-	}
+func newMappingControlledReader(data []byte) *mappingControlledReader {
+	return &mappingControlledReader{data: bytes.NewReader(data), ready: make(chan struct{}), done: make(chan struct{})}
 }
-
-func TestMappingStartupOriginalScriptsUnchanged(t *testing.T) {
-	manifest := "/fixture/modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1"
-	importUTF8, importUTF16 := "30599cdbe8e9be12f0eb2302da4920460323f2337bae6037334582048057d1b6", "a76c9ea76b802b4d138f68bdace233a8ff9f5ea7ccf85f27310154d2781a493b"
-	if filepath.Separator == '\\' {
-		manifest = `C:\fixture\modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1`
-		importUTF8, importUTF16 = "597389a69c2dc8bdd65d0dfb6c22e62cd74af2961cad67f38001890791fcd99f", "a6c9a22dcfad6041824b27420f575e0c304c521abf629fea3aae7d815fec9af7"
+func (r *mappingControlledReader) Read(buffer []byte) (int, error) {
+	r.readOnce.Do(func() { close(r.ready) })
+	if n, err := r.data.Read(buffer); n > 0 || err != io.EOF {
+		return n, err
 	}
-	importScript, err := mappingStartupImportScript(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, test := range []struct {
-		name, script, utf8Hash, utf16Hash string
-		units                             int
-	}{
-		{"entry", mappingStartupEntryScript, "35832e1ac6f9fced065027493bc3faeeae304d06106463a728437a95c1328999", "136335e08a760524367812d41bc9362ad286105bb37a9661fdeb8ec6b21f09c7", 105},
-		{"resolve", mappingStartupResolveScript, "d20270905eb2314e1ca8d98a67c5adf2822bf2c2de2d5fffb80c7233ba156ca8", "69edafeb1fd24fce0060b65a0d07778bc5f620bbff53e57a6d99ac2799c60f99", 5272},
-		{"import-parse", importScript, importUTF8, importUTF16, 6297},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			words := utf16.Encode([]rune(test.script))
-			encoded := make([]byte, 2*len(words))
-			for index, word := range words {
-				binary.LittleEndian.PutUint16(encoded[2*index:], word)
-			}
-			if len(words) != test.units || fmt.Sprintf("%x", sha256.Sum256([]byte(test.script))) != test.utf8Hash || fmt.Sprintf("%x", sha256.Sum256(encoded)) != test.utf16Hash {
-				t.Fatal("an original diagnostic script changed while adding post-failure controls")
-			}
-		})
-	}
+	<-r.done
+	return 0, io.EOF
 }
+func (r *mappingControlledReader) Close() error { r.closeOnce.Do(func() { close(r.done) }); return nil }
 
-func TestMappingStartupResultKinds(t *testing.T) {
-	request := mappingCommandRequest{Action: "inventory", OwnerSID: mappingBaselineForTest().Owner.SID}
-	inventory, err := json.Marshal(mappingCommandResult{Status: "ok", OwnerSID: request.OwnerSID, Rows: []mappingRow{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, cell := range mappingStartupPlan() {
-		t.Run(cell.Name, func(t *testing.T) {
-			valid := []byte(cell.Result + "\r\n")
-			if cell.Kind == mappingStartupInventory {
-				valid = append(append([]byte(nil), inventory...), '\n')
-			}
-			if err := validateMappingStartupResult(cell, valid, request); err != nil {
-				t.Fatalf("correct cell-specific result rejected: %v", err)
-			}
-			for _, invalid := range [][]byte{nil, []byte(`{"status":"wrong-kind"}`), append(append([]byte(nil), valid...), []byte(`{"extra":true}`)...)} {
-				if err := validateMappingStartupResult(cell, invalid, request); err == nil {
-					t.Fatal("cell accepted missing, foreign or trailing output")
-				}
-			}
-			forged := cell
-			forged.Result = `{"status":"forged"}`
-			forgedOutput := []byte(forged.Result)
-			if cell.Kind == mappingStartupInventory {
-				forgedOutput = inventory
-			}
-			if err := validateMappingStartupResult(forged, forgedOutput, request); err == nil {
-				t.Fatal("cell accepted a reforged expected result")
-			}
-			unknown := cell
-			unknown.Kind = mappingStartupKind("unknown")
-			if err := validateMappingStartupResult(unknown, valid, request); err == nil {
-				t.Fatal("unknown cell kind selected a fallback validator")
-			}
-			if cell.Kind == mappingStartupInventory {
-				foreign := request
-				foreign.OwnerSID = "different-owner"
-				if err := validateMappingStartupResult(cell, inventory, foreign); err == nil {
-					t.Fatal("inventory kind bypassed ordinary owner validation")
-				}
-			} else if err := validateMappingStartupResult(cell, inventory, request); err == nil {
-				t.Fatal("fixed-result control accepted an inventory receipt")
-			}
-		})
-	}
-}
+type mappingDeadlineContext struct{ context.Context }
 
-func mappingStartupManifestForTest(t *testing.T, name string) string {
-	t.Helper()
-	path, err := filepath.Abs(filepath.Join("command-control-fixture", name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
-func TestMappingStartupManifestPathEncoding(t *testing.T) {
-	for _, path := range []string{
-		mappingStartupManifestForTest(t, "Microsoft.PowerShell.Utility.psd1"),
-		mappingStartupManifestForTest(t, "literal'quoted;`$name-模块🧪.psd1"),
-	} {
-		script, err := mappingStartupImportScript(path)
-		if err != nil || script == "" {
-			t.Fatal("absolute manifest path did not produce an import control")
-		}
-		encoded := base64.StdEncoding.EncodeToString([]byte(path))
-		if strings.Count(script, encoded) != 1 || strings.Contains(script, path) || !strings.Contains(script, "[Convert]::FromBase64String('"+encoded+"')") {
-			t.Fatal("manifest path was interpolated as PowerShell syntax or lost its single encoded binding")
-		}
-		decoded, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil || string(decoded) != path {
-			t.Fatal("manifest path did not preserve its UTF-8 bytes")
-		}
-		if strings.Count(script, "$request = $requestLine | ConvertFrom-Json") != 1 || strings.Contains(script, "Get-Command") {
-			t.Fatal("import control replaced its original JSON pipeline or added discovery")
-		}
-	}
-	for _, invalid := range []string{"", "relative.psd1", `C:relative.psd1`, `\root-relative.psd1`, "C:\\invalid\x00.psd1", "C:\\invalid\xff.psd1"} {
-		if script, err := mappingStartupImportScript(invalid); err == nil || script != "" {
-			t.Fatal("invalid manifest path produced an executable or fallback script")
-		}
-	}
-}
-
-const mappingUtilityImportForTest = `$utilityModules = @(Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -PassThru -ErrorAction Stop)`
-
-const mappingUtilityModuleGuardForTest = `if ($utilityModules.Count -ne 1 -or $utilityModules[0] -isnot [System.Management.Automation.PSModuleInfo] -or $utilityModules[0].Name -cne 'Microsoft.PowerShell.Utility') {
-        throw 'Utility import did not return exactly the expected module.'
-    }`
-
-const mappingUtilityJSONGuardForTest = `if ($null -eq $jsonCommand -or $jsonCommand -isnot [System.Management.Automation.CmdletInfo] -or $jsonCommand.Name -cne 'ConvertFrom-Json' -or $jsonCommand.CommandType -ne [System.Management.Automation.CommandTypes]::Cmdlet) {
-        throw 'Utility module did not export the expected JSON cmdlet.'
-    }`
-
-func mappingUtilityImportOrder(source string) error {
-	return mappingObservationOrder(source, "$requestLine = [Console]::In.ReadLine()", "Write-RfsEnvironmentObservation",
-		"$rfsObservationStage = 'operation'", "$utilityManifest = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('",
-		"'RFS-MAPPING/1 before-utility'", mappingUtilityImportForTest+"\n    [Console]::Error.WriteLine('RFS-MAPPING/1 after-utility')",
-		mappingUtilityModuleGuardForTest, "$jsonCommand = $utilityModules[0].ExportedCmdlets['ConvertFrom-Json']", mappingUtilityJSONGuardForTest,
-		"'RFS-MAPPING/1 before-json'", "$request = $requestLine | & $jsonCommand\n    [Console]::Error.WriteLine('RFS-MAPPING/1 after-json')",
-		"Import-Module -Name $request.module -ErrorAction Stop")
-}
-
-func TestMappingUtilityExportObjectBinding(t *testing.T) {
-	const export = "$jsonCommand = $utilityModules[0].ExportedCmdlets['ConvertFrom-Json']"
-	const invoke = "$request = $requestLine | & $jsonCommand"
-	if err := mappingUtilityImportOrder(mappingPowerShell); err != nil {
-		t.Fatal(err)
-	}
-	for _, statement := range []string{mappingUtilityImportForTest, mappingUtilityModuleGuardForTest, export, mappingUtilityJSONGuardForTest, invoke} {
-		if strings.Count(mappingPowerShell, statement) != 1 {
-			t.Fatal("mapping does not retain exactly one guarded imported JSON cmdlet")
-		}
-	}
-	for _, mutation := range []struct {
-		name, before, after string
-	}{
-		{"module-cardinality", "$utilityModules.Count -ne 1 -or ", ""},
-		{"module-type", "$utilityModules[0] -isnot [System.Management.Automation.PSModuleInfo] -or ", ""},
-		{"module-name", " -or $utilityModules[0].Name -cne 'Microsoft.PowerShell.Utility'", ""},
-		{"module-refusal", "throw 'Utility import did not return exactly the expected module.'", "$null = 'Utility import did not return exactly the expected module.'"},
-		{"export-before-module-guard", mappingUtilityModuleGuardForTest + "\n    " + export, export + "\n    " + mappingUtilityModuleGuardForTest},
-		{"wrong-module-export", export, "$jsonCommand = $utilityModules[1].ExportedCmdlets['ConvertFrom-Json']"},
-		{"wrong-export-name", export, "$jsonCommand = $utilityModules[0].ExportedCmdlets['ConvertTo-Json']"},
-		{"null-export", "$null -eq $jsonCommand -or ", ""},
-		{"export-type", "$jsonCommand -isnot [System.Management.Automation.CmdletInfo] -or ", ""},
-		{"export-name", "$jsonCommand.Name -cne 'ConvertFrom-Json' -or ", ""},
-		{"export-command-kind", " -or $jsonCommand.CommandType -ne [System.Management.Automation.CommandTypes]::Cmdlet", ""},
-		{"export-refusal", "throw 'Utility module did not export the expected JSON cmdlet.'", "$null = 'Utility module did not export the expected JSON cmdlet.'"},
-		{"invoke-before-export-guard", mappingUtilityJSONGuardForTest + "\n    [Console]::Error.WriteLine('RFS-MAPPING/1 before-json')\n    " + invoke, "[Console]::Error.WriteLine('RFS-MAPPING/1 before-json')\n    " + invoke + "\n    " + mappingUtilityJSONGuardForTest},
-		{"unqualified-name", invoke, "$request = $requestLine | ConvertFrom-Json"},
-		{"module-qualified-name", invoke, `$request = $requestLine | Microsoft.PowerShell.Utility\ConvertFrom-Json`},
-		{"object-name-substitution", invoke, "$request = $requestLine | & $jsonCommand.Name"},
-		{"string-object-substitution", invoke, "$request = $requestLine | & ([string]$jsonCommand)"},
-		{"rediscovered-target", invoke, "$request = $requestLine | & (Get-Command ConvertFrom-Json)"},
-		{"wrong-object", invoke, "$request = $requestLine | & $utilityModules[0]"},
-	} {
-		t.Run(mutation.name, func(t *testing.T) {
-			source := strings.Replace(mappingPowerShell, mutation.before, mutation.after, 1)
-			if source == mappingPowerShell || mappingUtilityImportOrder(source) == nil {
-				t.Fatal("exact exported-object binding control accepted its targeted mutation")
-			}
-		})
-	}
-}
-
-func TestMappingUtilityImportBuilderBindsVerifiedPath(t *testing.T) {
-	const placeholder = "__RFS_UTILITY_MANIFEST_BASE64__"
-	for _, path := range []string{mappingStartupManifestForTest(t, "Microsoft.PowerShell.Utility.psd1"), mappingStartupManifestForTest(t, "quoted'-$name-模块🧪.psd1")} {
-		script, err := mappingPowerShellScript(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		encoded := base64.StdEncoding.EncodeToString([]byte(path))
-		if strings.Count(script, encoded) != 1 || strings.Contains(script, placeholder) || strings.Contains(script, path) || strings.Replace(script, encoded, placeholder, 1) != mappingPowerShell {
-			t.Fatal("mapping builder changed more than its single encoded manifest binding")
-		}
-		if err := mappingUtilityImportOrder(script); err != nil {
-			t.Fatal(err)
-		}
-		withoutImport := strings.Replace(script, mappingUtilityImportForTest, "", 1)
-		if withoutImport == script || mappingUtilityImportOrder(withoutImport) == nil {
-			t.Fatal("explicit import omission escaped its source control")
-		}
-		withoutSuppression := strings.Replace(script, mappingUtilityImportForTest, `Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -PassThru -ErrorAction Stop`, 1)
-		if mappingUtilityImportOrder(withoutSuppression) == nil {
-			t.Fatal("successful import output could contaminate the mapping result")
-		}
-	}
-	for _, invalid := range []string{"", "Utility.psd1", `C:relative.psd1`, "C:\\invalid\x00.psd1", "C:\\invalid\xff.psd1"} {
-		if script, err := mappingPowerShellScript(invalid); script != "" || err == nil {
-			t.Fatal("mapping builder accepted an unverified path or supplied a fallback")
-		}
-	}
-	buildFailure, closeFailure := errors.New("script builder failed"), errors.New("builder cleanup failed")
-	file := &mappingUtilityTestFile{reader: strings.NewReader(mappingUtilityTestData), info: mappingUtilityTestInfo{size: int64(len(mappingUtilityTestData))}, closeErr: closeFailure}
-	ops := mappingUtilityOpsForTest()
-	ops.Open = func(string) (mappingUtilityFile, error) { return file, nil }
-	ops.CommandLine = func([]string) string { t.Fatal("failed builder reached command-line preparation"); return "" }
-	script, facts, err := prepareMappingUtility(context.Background(), mappingUtilityRootForTest(t), "system-powershell", func(string) (string, error) { return "", buildFailure }, ops)
-	if script != "" || !errors.Is(err, buildFailure) || !errors.Is(err, closeFailure) || !strings.HasPrefix(err.Error(), buildFailure.Error()) || facts.CleanupConfirmed || file.closes != 1 {
-		t.Fatalf("builder failure or cleanup cause was lost: facts=%+v error=%v", facts, err)
-	}
-}
-
-func TestMappingCommandControlScriptOperations(t *testing.T) {
-	importScript, err := mappingStartupImportScript(mappingStartupManifestForTest(t, "Microsoft.PowerShell.Utility.psd1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, script := range []string{mappingStartupResolveScript, importScript} {
-		for _, helper := range []string{"Get-RfsCommandTextFact", "Write-RfsCommandFact", "Format-RfsCommandText", "Write-RfsCommandUnsupported", "Write-RfsCommandProvenance"} {
-			if strings.Count(script, "function "+helper) != 1 {
-				t.Fatalf("control lost its bounded diagnostic helper: %s", helper)
-			}
-		}
-		for _, forbidden := range []string{"Get-SmbMapping", "New-SmbMapping", "Remove-SmbMapping", "ConvertTo-Json", "ReadToEnd", "$input", ".Parameters", ".ParameterSets", ".Definition", ".ExportedCommands", "SetEnvironmentVariable"} {
-			if strings.Contains(script, forbidden) {
-				t.Fatalf("control added an out-of-scope operation: %s", forbidden)
-			}
-		}
-		if strings.Count(script, "$requestLine = [Console]::In.ReadLine()") != 1 || !strings.HasSuffix(script, mappingCommandFailure) {
-			t.Fatal("control changed its one-line input or shared failed-result path")
-		}
-		if err := mappingObservationOrder(script,
-			"$implementingType = $Command.ImplementingType", "$assembly = $implementingType.Assembly",
-			"$mvid = $implementingType.Module.ModuleVersionId.ToString('D')",
-			"$moduleName = $null", "$moduleVersion = $null", "$modulePath = $null", "if ($null -ne $Module)"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	const resolution = `Microsoft.PowerShell.Core\Get-Command -Name ConvertFrom-Json -ErrorAction Stop`
-	if strings.Count(mappingStartupResolveScript, resolution) != 1 || strings.Contains(mappingStartupResolveScript, "Import-Module") || strings.Contains(mappingStartupResolveScript, "$request = $requestLine | ConvertFrom-Json") {
-		t.Fatal("resolution control changed its exact query or invoked JSON conversion")
-	}
-	for _, forbidden := range []string{" -All", " -ArgumentList", " -CommandType"} {
-		if strings.Contains(mappingStartupResolveScript, forbidden) {
-			t.Fatalf("resolution control changed command selection: %s", forbidden)
-		}
-	}
-	if err := mappingObservationOrder(mappingStartupResolveScript,
-		"'RFS-CMD/1 entry resolve'", "$requestLine = [Console]::In.ReadLine()", "$rfsCommandStage = 'resolve'",
-		"'RFS-CMD/1 before-resolution'", resolution, "'RFS-CMD/1 after-resolution'", "if ($commands.Count -ne 1",
-		"$rfsCommandStage = 'provenance'", "'RFS-CMD/1 before-provenance'",
-		"Write-RfsCommandProvenance $commands[0] $commands[0].Module 'resolved-command'",
-		"'RFS-CMD/1 after-provenance'", "$rfsCommandStage = 'result'",
-		`[Console]::Out.WriteLine('{"status":"resolve-ok"}')`, "'RFS-CMD/1 complete resolve'"); err != nil {
-		t.Fatal(err)
-	}
-	const importCommand = `Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -PassThru -ErrorAction Stop`
-	if strings.Count(importScript, importCommand) != 1 || strings.Contains(importScript, " -Force") || strings.Contains(importScript, "Get-Command") {
-		t.Fatal("import control changed its explicit import or added rediscovery")
-	}
-	if err := mappingObservationOrder(importScript,
-		"'RFS-CMD/1 entry import-parse'", "$requestLine = [Console]::In.ReadLine()", "$utilityManifest =",
-		"$rfsCommandStage = 'import'", "'RFS-CMD/1 before-import'", importCommand, "'RFS-CMD/1 after-import'",
-		"if ($modules.Count -ne 1", "$rfsCommandStage = 'provenance'", "'RFS-CMD/1 before-provenance'",
-		"$command = $modules[0].ExportedCmdlets['ConvertFrom-Json']", "if ($null -eq $command",
-		"Write-RfsCommandProvenance $command $modules[0] 'imported-export'", "'RFS-CMD/1 after-provenance'",
-		"$rfsCommandStage = 'parse'", "'RFS-CMD/1 before-parse'", "$request = $requestLine | ConvertFrom-Json",
-		"'RFS-CMD/1 after-parse'", "$rfsCommandStage = 'result'",
-		`[Console]::Out.WriteLine('{"status":"import-parse-ok"}')`, "'RFS-CMD/1 complete import-parse'"); err != nil {
-		t.Fatal(err)
-	}
-	if err := mappingObservationOrder(mappingCommandFailure,
-		"catch {\n    $primaryError = $_\n    $primaryStage = $rfsCommandStage", "try {",
-		"'RFS-CMD/1 error-begin stage={0}'", "Get-RfsCommandTextFact $primaryError.Exception.GetType().FullName 64",
-		"Get-RfsCommandTextFact $primaryError.FullyQualifiedErrorId 64", "'RFS-CMD/1 error-end'",
-		"} catch {", "'RFS-CMD/1 observer-failure'", "} finally {", "exit 1"); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func mappingReplyChild(reply string) *mappingCommandChild {
-	p := &mappingCommandChild{input: &mappingInputBuffer{}, output: io.NopCloser(strings.NewReader(reply)), stderr: io.NopCloser(strings.NewReader("")), done: make(chan struct{})}
-	close(p.done)
-	return p
-}
-
-func TestMappingCommandUsesOwnedProcessAndSingleLineInput(t *testing.T) {
-	sid := mappingBaselineForTest().Owner.SID
-	data, _ := json.Marshal(mappingCommandResult{Status: "ok", OwnerSID: sid, Rows: []mappingRow{}})
-	process := mappingReplyChild(string(data))
-	host := &mappingCommandHost{child: process}
-	parentEnvironment := append([]string(nil), os.Environ()...)
-	request := mappingCommandRequest{Action: "inventory", Module: "system-module", OwnerSID: sid}
-	result, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), request, mappingUtilityOpsForTest())
-	if err != nil || result.Status != "ok" {
-		t.Fatalf("command: %#v %v", result, err)
-	}
-	if host.cache != "NUL" || !reflect.DeepEqual(parentEnvironment, os.Environ()) {
-		t.Fatal("module cache was not isolated and restored")
-	}
-	if process.finished != 1 || process.input.closes != 1 {
-		t.Fatalf("owner/pipe closed incorrectly: %d/%d", process.finished, process.input.closes)
-	}
-	input := process.input.String()
-	if !strings.HasSuffix(input, "\n") || strings.Count(input, "\n") != 1 {
-		t.Fatal("request is not one JSON line")
-	}
-	var decoded mappingCommandRequest
-	if err := json.Unmarshal([]byte(input), &decoded); err != nil || decoded != request {
-		t.Fatal("request changed")
-	}
-	encoded := host.args[len(host.args)-1]
-	raw, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		t.Fatal(err)
-	}
-	words := make([]uint16, len(raw)/2)
-	for i := range words {
-		words[i] = binary.LittleEndian.Uint16(raw[2*i:])
-	}
-	wantScript, err := mappingPowerShellScript(filepath.Join(mappingUtilityRootForTest(t), "Microsoft.PowerShell.Utility", "Microsoft.PowerShell.Utility.psd1"))
-	if err != nil || string(utf16.Decode(words)) != wantScript {
-		t.Fatal("launched PowerShell differs from bound source")
-	}
-	if !strings.Contains(mappingPowerShell, "ReadLine()") || strings.Contains(mappingPowerShell, "ReadToEnd()") || strings.Contains(mappingPowerShell, "UseWriteThrough") {
-		t.Fatal("mapping changed input ownership or ordinary cache behavior")
-	}
-}
-
-func TestMappingCommandCancellationJoinsOwnedWorkers(t *testing.T) {
-	outReader, outWriter := io.Pipe()
-	errReader, errWriter := io.Pipe()
-	process := &mappingCommandChild{input: &mappingInputBuffer{}, output: outReader, stderr: errReader, done: make(chan struct{}), forced: true}
-	var once sync.Once
-	process.closePipes = func() { once.Do(func() { outWriter.Close(); errWriter.Close(); close(process.done) }) }
-	host := &mappingCommandHost{child: process}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
-	_, err := runMappingPowerShell(ctx, host, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory", OwnerSID: mappingBaselineForTest().Owner.SID}, mappingUtilityOpsForTest())
-	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "forced") || process.finished != 1 || process.input.closes != 1 {
-		t.Fatalf("canceled command ownership: %v", err)
-	}
-}
-
-func TestMappingCommandCannotReportMalformedOrForcedSuccess(t *testing.T) {
-	sid := mappingBaselineForTest().Owner.SID
-	for _, reply := range []string{`{"status":"ok","owner_sid":"` + sid + `","cause":""}`, `{"status":"ok","owner_sid":"wrong","rows":[],"cause":""}`, `{"status":"ok","owner_sid":"` + sid + `","rows":[],"cause":"failed"}`, `{"status":"ok","owner_sid":"` + sid + `","rows":[],"cause":"","extra":1}`} {
-		child := mappingReplyChild(reply)
-		host := &mappingCommandHost{child: child}
-		if _, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{OwnerSID: sid}, mappingUtilityOpsForTest()); err == nil || child.finished != 1 {
-			t.Fatal("invalid command receipt passed")
-		}
-	}
-	raw, _ := json.Marshal(mappingCommandResult{Status: "ok", OwnerSID: sid, Rows: []mappingRow{}})
-	child := mappingReplyChild(string(raw))
-	child.forced = true
-	if _, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: child}, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{OwnerSID: sid}, mappingUtilityOpsForTest()); err == nil {
-		t.Fatal("forced cleanup became success")
-	}
-}
-
-func TestMappingTokenStatisticsABI(t *testing.T) {
-	var value mappingTokenStatistics
-	if unsafe.Sizeof(value) != 56 || unsafe.Alignof(value) != 8 || unsafe.Offsetof(value.AuthenticationID) != 8 || unsafe.Offsetof(value.Expiration) != 16 || unsafe.Offsetof(value.ModifiedID) != 48 {
-		t.Fatal("TOKEN_STATISTICS differs from the Windows 64-bit ABI")
-	}
-}
-
-type mappingTestDeadline struct{ context.Context }
-
-func (c mappingTestDeadline) Err() error {
+func (c mappingDeadlineContext) Err() error {
 	if c.Context.Err() != nil {
 		return context.DeadlineExceeded
 	}
 	return nil
 }
 
-type mappingDiagnosticInput struct {
-	write func([]byte) (int, error)
-	close func() error
-}
-
-func (w mappingDiagnosticInput) Write(data []byte) (int, error) { return w.write(data) }
-func (w mappingDiagnosticInput) Close() error                   { return w.close() }
-
-type mappingDiagnosticReader struct {
-	data                          []byte
-	ready, release, ended         chan struct{}
-	readyOnce, closeOnce, endOnce sync.Once
-}
-
-func newMappingDiagnosticReader(data string) *mappingDiagnosticReader {
-	return &mappingDiagnosticReader{data: []byte(data), ready: make(chan struct{}), release: make(chan struct{}), ended: make(chan struct{})}
-}
-func (r *mappingDiagnosticReader) Read(data []byte) (int, error) {
-	if len(r.data) > 0 {
-		n := copy(data, r.data)
-		r.data = r.data[n:]
-		if len(r.data) == 0 {
-			r.readyOnce.Do(func() { close(r.ready) })
-		}
-		return n, nil
-	}
-	r.readyOnce.Do(func() { close(r.ready) })
-	<-r.release
-	r.endOnce.Do(func() { close(r.ended) })
-	return 0, io.EOF
-}
-func (r *mappingDiagnosticReader) Close() error {
-	r.closeOnce.Do(func() { close(r.release) })
-	return nil
-}
-
-func mappingDiagnosticFrom(t *testing.T, err error) *mappingDiagnosticError {
-	t.Helper()
-	var diagnostic *mappingDiagnosticError
-	if !errors.As(err, &diagnostic) {
-		t.Fatalf("missing bounded mapping diagnostic: %v", err)
-	}
-	if len(diagnostic.Error()) >= 16<<10 {
-		t.Fatal("diagnostic exceeded 16 KiB")
-	}
-	return diagnostic
-}
-
-func mappingDiagnosticPrefix(t *testing.T, stream mappingStreamDiagnostic) []byte {
-	t.Helper()
-	data, err := base64.StdEncoding.DecodeString(stream.PrefixBase64)
-	if err != nil || len(data) > mappingDiagnosticStreamLimit {
-		t.Fatalf("invalid bounded stream prefix: bytes=%d error=%v", len(data), err)
-	}
-	return data
-}
-
-func TestMappingTimeoutDiagnosticFollowsOwnerAndWorkerCompletion(t *testing.T) {
-	for _, blocked := range []bool{false, true} {
-		name := "written-input"
-		if blocked {
-			name = "blocked-input"
-		}
-		t.Run(name, func(t *testing.T) {
-			base, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			ctx := mappingTestDeadline{Context: base}
-			out := newMappingDiagnosticReader("observed stdout bytes")
-			stages := "RFS-MAPPING/1 entry\nRFS-MAPPING/1 before-import\n"
-			stderr := newMappingDiagnosticReader(stages)
-			inputClosed := make(chan struct{})
-			closes := 0
-			process := &mappingCommandChild{output: out, stderr: stderr, done: make(chan struct{}), forced: true}
-			process.inputOverride = mappingDiagnosticInput{write: func(data []byte) (int, error) {
-				<-out.ready
-				<-stderr.ready
-				cancel()
-				if blocked {
-					<-inputClosed
-					return 0, io.ErrClosedPipe
+func TestNativeMappingTimeoutJoinsWorkersWithoutInventingCompletion(t *testing.T) {
+	request := mappingRequestForTest(t, "create")
+	for _, complete := range []bool{false, true} {
+		for _, cleanupFailed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("complete-%v-cleanup-failed-%v", complete, cleanupFailed), func(t *testing.T) {
+				frame := mappingResultFrameForTest(t, mappingReturnedResultForTest(t, request, 0))
+				if !complete {
+					frame = frame[:len(frame)/2]
 				}
-				return len(data), nil
-			}, close: func() error { closes++; close(inputClosed); return nil }}
-			cleanupFailure := errors.New("owned cleanup failure")
-			process.finishErr = cleanupFailure
-			process.closePipes = func() { close(process.done) }
-			_, err := runMappingPowerShell(ctx, &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory", OwnerSID: mappingBaselineForTest().Owner.SID}, mappingUtilityOpsForTest())
-			if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, cleanupFailure) || !strings.HasPrefix(err.Error(), context.DeadlineExceeded.Error()+"\n") {
-				t.Fatalf("first/cleanup error chain changed: %v", err)
-			}
-			if process.finished != 1 || closes != 1 || process.resultCalls != 0 {
-				t.Fatalf("owner/result calls: finishes=%d closes=%d result=%d", process.finished, closes, process.resultCalls)
-			}
-			for _, reader := range []*mappingDiagnosticReader{out, stderr} {
-				select {
-				case <-reader.ended:
-				default:
-					t.Fatal("diagnostic returned before reader finished")
+				stdout, stderr := newMappingControlledReader(frame), newMappingControlledReader([]byte("native stderr evidence"))
+				base, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				ctx := mappingDeadlineContext{Context: base}
+				inputClosed := make(chan struct{})
+				input := &mappingTestInput{onClose: func() { close(inputClosed) }}
+				input.write = func(data []byte) (int, error) {
+					for _, ready := range []<-chan struct{}{stdout.ready, stderr.ready} {
+						select {
+						case <-ready:
+						case <-inputClosed:
+							return 0, io.ErrClosedPipe
+						}
+					}
+					n, err := input.Buffer.Write(data)
+					cancel()
+					return n, err
 				}
-			}
-			d := mappingDiagnosticFrom(t, err).details
-			if d.Action != "inventory" || d.PID == nil || *d.PID != 55 || d.PreCleanupDone == nil || *d.PreCleanupDone || d.PreCleanupResult != nil || d.ElapsedMillis < 0 {
-				t.Fatalf("unobserved exit or PID facts: %+v", d)
-			}
-			if !d.WriteStarted || !d.WriteReturned || d.WriteComplete == blocked {
-				t.Fatalf("input completion facts: %+v", d)
-			}
-			if blocked {
-				if d.WriteBytes != 0 || d.WriteError != io.ErrClosedPipe.Error() {
-					t.Fatalf("blocked write was hidden: %+v", d)
+				process := &mappingTestChild{input: input, output: stdout, stderr: stderr, done: make(chan struct{}), forced: true}
+				cleanupError := errors.New("owned Job cleanup failed")
+				if cleanupFailed {
+					process.finishErr = cleanupError
 				}
-			} else if d.WriteBytes != d.InputBytes || d.WriteError != "" {
-				t.Fatalf("completed write bytes changed: %+v", d)
-			}
-			if string(mappingDiagnosticPrefix(t, d.Stdout)) != "observed stdout bytes" || d.Stdout.ObservedBytes != int64(len("observed stdout bytes")) || d.Stdout.PrefixTruncated {
-				t.Fatalf("stdout observations changed: %+v", d.Stdout)
-			}
-			if string(mappingDiagnosticPrefix(t, d.Stderr)) != stages || d.Stderr.ObservedBytes != int64(len(stages)) || d.Stderr.PrefixTruncated {
-				t.Fatalf("stderr stages lost: %+v", d.Stderr)
-			}
-		})
+				execution, err := executeNativeMapping(ctx, &mappingTestHost{child: process}, "verified-probe.exe", "private-work", request)
+				d := execution.Diagnostic
+				if !errors.Is(err, context.DeadlineExceeded) || cleanupFailed && !errors.Is(err, cleanupError) || !strings.HasPrefix(err.Error(), context.DeadlineExceeded.Error()) || process.finished != 1 || process.results != 0 || input.closes != 1 {
+					t.Fatalf("timeout lost original errors or fabricated an earlier exit: %v", err)
+				}
+				if d.PreCleanupDone == nil || *d.PreCleanupDone || d.PreCleanupResult != nil || d.WorkersStarted != 3 || d.WorkersJoined != 3 || d.CleanupConfirmed == cleanupFailed || !d.CleanupForced || !bytes.Equal(execution.Stdout, frame) {
+					t.Fatal("timeout observations preceded owned worker completion")
+				}
+				_, err = finishMappingCommand(ctx, request, execution, err, nil)
+				var outcome *mappingOutcomeError
+				if !errors.As(err, &outcome) || (outcome.Outcome.Knowledge == "returned") != complete || outcome.Outcome.HelperQuiesced == cleanupFailed {
+					t.Fatal("process termination supplied missing operation knowledge or erased a complete bound frame")
+				}
+			})
+		}
 	}
 }
 
-func TestMappingWriteFailureDiagnosticsRetainActualProgress(t *testing.T) {
-	sid := mappingBaselineForTest().Owner.SID
-	reply, _ := json.Marshal(mappingCommandResult{Status: "ok", OwnerSID: sid, Rows: []mappingRow{}})
-	for _, partial := range []bool{false, true} {
-		name := "failed"
-		if partial {
-			name = "partial"
-		}
-		t.Run(name, func(t *testing.T) {
-			process := mappingReplyChild(string(reply))
-			failure := errors.New("input write failed")
-			resultFailure := errors.New("child exited before cleanup")
-			process.result = resultFailure
-			closes := 0
-			process.inputOverride = mappingDiagnosticInput{write: func(data []byte) (int, error) {
-				if partial {
-					return len(data) - 1, nil
+type mappingWriterFunc func([]byte) (int, error)
+
+func (w mappingWriterFunc) Write(data []byte) (int, error) { return w(data) }
+
+func TestNativeMappingLostFinalWriteRemainsUnknownToParent(t *testing.T) {
+	for _, short := range []bool{false, true} {
+		t.Run(fmt.Sprint(short), func(t *testing.T) {
+			request := mappingRequestForTest(t, "remove")
+			ops := mappingSnapshotOpsForTest(t, mappingSnapshotForRequestForTest(request))
+			mutations := 0
+			ops.Cancel = func(string, uint32, bool) uint32 { mutations++; return 0 }
+			services := mappingHelperServices{Owner: func() (mappingOwner, error) { return request.Owner, nil }, Job: func() error { return nil }, Authorize: func(mappingCommandRequest) (mappingLedger, error) {
+				return mappingLedgerForRequestForTest(request), nil
+			}, Native: ops}
+			failure := errors.New("final pipe write failed")
+			var captured bytes.Buffer
+			writer := mappingWriterFunc(func(data []byte) (int, error) {
+				if short {
+					return captured.Write(data[:len(data)-1])
 				}
 				return 0, failure
-			}, close: func() error { closes++; return nil }}
-			_, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory", OwnerSID: sid}, mappingUtilityOpsForTest())
+			})
+			err := runMappingHelperWith(nil, bytes.NewReader(mappingRequestFrameForTest(t, request)), writer, services)
 			want := failure
-			if partial {
+			if short {
 				want = io.ErrShortWrite
 			}
-			if !errors.Is(err, want) || !strings.HasPrefix(err.Error(), want.Error()+"\n") {
-				t.Fatalf("write cause lost: %v", err)
+			if !errors.Is(err, want) || mutations != 1 {
+				t.Fatal("lost reply retried mutation or hid the write error")
 			}
-			d := mappingDiagnosticFrom(t, err).details
-			if d.PID == nil || *d.PID != 55 || d.PreCleanupDone == nil || !*d.PreCleanupDone || d.PreCleanupResult == nil || *d.PreCleanupResult != resultFailure.Error() {
-				t.Fatalf("known exit was omitted: %+v", d)
-			}
-			if !d.WriteReturned || d.WriteComplete || d.WriteError != want.Error() || process.finished != 1 || closes != 1 {
-				t.Fatalf("write completion/ownership differs: %+v", d)
-			}
-			if partial && d.WriteBytes != d.InputBytes-1 || !partial && d.WriteBytes != 0 {
-				t.Fatalf("write count invented: %+v", d)
+			_, err = finishMappingCommand(context.Background(), request, mappingExecution{Stdout: captured.Bytes(), Diagnostic: mappingCommandDiagnostic{StartAttempted: true, CleanupConfirmed: true}}, err, nil)
+			var outcome *mappingOutcomeError
+			if !errors.As(err, &outcome) || outcome.Outcome.Knowledge != "unknown" || outcome.Outcome.Code != nil || !errors.Is(err, want) {
+				t.Fatal("actual helper-side return or clean termination replaced a missing complete final frame")
 			}
 		})
-	}
-}
-
-func TestMappingStartupFailureDoesNotInventPIDOrIO(t *testing.T) {
-	failure := errors.New("process startup failed")
-	host := &mappingCommandHost{startErr: failure}
-	_, err := runMappingPowerShell(context.Background(), host, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory"}, mappingUtilityOpsForTest())
-	if !errors.Is(err, failure) || !strings.HasPrefix(err.Error(), failure.Error()+"\n") {
-		t.Fatalf("startup cause replaced: %v", err)
-	}
-	d := mappingDiagnosticFrom(t, err).details
-	if d.PID != nil || d.PreCleanupDone != nil || d.PreCleanupResult != nil || d.WriteStarted || d.WriteReturned || d.WriteComplete || d.WriteBytes != 0 || d.Stdout.ObservedBytes != 0 || d.Stderr.ObservedBytes != 0 || host.starts != 1 {
-		t.Fatalf("startup invented child facts: %+v", d)
-	}
-}
-
-func TestMappingFailureCaptureIsBoundedAndDoesNotExposeFullStderr(t *testing.T) {
-	sid := mappingBaselineForTest().Owner.SID
-	process := mappingReplyChild("not-json")
-	secretTail := "stderr-tail-outside-retained-prefix"
-	stderr := strings.Repeat("x", mappingDiagnosticStreamLimit+1) + secretTail
-	process.stderr = io.NopCloser(strings.NewReader(stderr))
-	_, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory", OwnerSID: sid}, mappingUtilityOpsForTest())
-	diagnostic := mappingDiagnosticFrom(t, err)
-	if strings.Contains(err.Error(), secretTail) || strings.Contains(err.Error(), "PowerShell stderr:") {
-		t.Fatal("malformed stdout exposed unbounded stderr")
-	}
-	d := diagnostic.details
-	if d.Stderr.ObservedBytes != int64(len(stderr)) || !d.Stderr.PrefixTruncated || !bytes.Equal(mappingDiagnosticPrefix(t, d.Stderr), []byte(stderr[:mappingDiagnosticStreamLimit])) {
-		t.Fatalf("stderr prefix/count incorrect: %+v", d.Stderr)
-	}
-	if d.PreCleanupDone == nil || !*d.PreCleanupDone || d.PreCleanupResult == nil || *d.PreCleanupResult != "" {
-		t.Fatalf("observed successful Result was not retained: %+v", d)
-	}
-	long := strings.Repeat("\x00", 4096)
-	action, actionTruncated := mappingDiagnosticText(long, 64)
-	writeError, writeTruncated := mappingDiagnosticText(long, 512)
-	resultError, resultTruncated := mappingDiagnosticText(long, 512)
-	stream := mappingStreamDiagnostic{ObservedBytes: 1 << 30, PrefixBase64: base64.StdEncoding.EncodeToString(make([]byte, mappingDiagnosticStreamLimit)), PrefixTruncated: true}
-	maximal := mappingCommandDiagnostic{Action: action, ActionTruncated: actionTruncated, PreCleanupResult: &resultError, PreCleanupResultTruncated: resultTruncated, WriteError: writeError, WriteErrorTruncated: writeTruncated, InputLineBytes: 4095, InputLineSHA256: strings.Repeat("a", 64), InputBytes: 4096, InputSHA256: strings.Repeat("b", 64), Stdout: stream, Stderr: stream}
-	manifestSize := int64(mappingByteLimit)
-	maximal.UtilityPreparation = &mappingUtilityPreparation{Path: strings.Repeat("p", 1024), Size: &manifestSize, ReadBytes: mappingByteLimit, SHA256: strings.Repeat("c", 64), CleanupConfirmed: true}
-	bounded := mappingDiagnosticFrom(t, encodeMappingDiagnostic(maximal))
-	if !bounded.details.ActionTruncated || !bounded.details.WriteErrorTruncated || !bounded.details.PreCleanupResultTruncated || !reflect.DeepEqual(bounded.details.UtilityPreparation, maximal.UtilityPreparation) {
-		t.Fatal("bounded text omitted its truncation facts")
 	}
 }
 
 type mappingReadOnlyReader struct{ io.Reader }
 
-func TestMappingCaptureCopyCannotBypassTheOutputBound(t *testing.T) {
+func TestNativeMappingCaptureAndDiagnosticBoundsRemainFailClosed(t *testing.T) {
 	var capture mappingBoundedBuffer
-	input := strings.Repeat("x", mappingByteLimit+16)
-	n, err := io.Copy(&capture, mappingReadOnlyReader{strings.NewReader(input)})
+	data := strings.Repeat("x", mappingByteLimit+16)
+	n, err := io.Copy(&capture, mappingReadOnlyReader{strings.NewReader(data)})
 	if err == nil || n != mappingByteLimit || capture.Len() != mappingByteLimit {
-		t.Fatalf("io.Copy bypassed output bound: n=%d captured=%d err=%v", n, capture.Len(), err)
+		t.Fatal("io.Copy bypassed the native helper output bound")
 	}
-	d := capture.diagnostic()
-	if d.ObservedBytes != int64(len(input)) || !d.PrefixTruncated || string(mappingDiagnosticPrefix(t, d)) != input[:mappingDiagnosticStreamLimit] {
-		t.Fatalf("read/write observations invented a complete stream: %+v", d)
+	facts := capture.diagnostic()
+	prefix, err := base64.StdEncoding.DecodeString(facts.PrefixBase64)
+	if err != nil || facts.ObservedBytes != int64(len(data)) || !facts.PrefixTruncated || len(prefix) != 2048 || string(prefix) != data[:2048] {
+		t.Fatal("bounded capture hid truncation or lost actual byte counts")
 	}
-	var single mappingBoundedBuffer
-	if _, err := single.Write([]byte(input)); err == nil {
-		t.Fatal("oversized writer input was accepted")
+	stream := mappingStreamDiagnostic{ObservedBytes: mappingByteLimit + 16, PrefixBase64: base64.StdEncoding.EncodeToString(make([]byte, 2048)), PrefixTruncated: true}
+	resultText := strings.Repeat("\x00", 512)
+	diagnostic := mappingCommandDiagnostic{Action: strings.Repeat("\x00", 64), WriteError: strings.Repeat("\x00", 512), PreCleanupResult: &resultText, Stdout: stream, Stderr: stream}
+	var bounded *mappingDiagnosticError
+	if err := encodeMappingDiagnostic(diagnostic); !errors.As(err, &bounded) || len(bounded.Error()) >= 16<<10 {
+		t.Fatal("bounded native diagnostic no longer fits its existing error envelope")
 	}
-	if d := single.diagnostic(); d.ObservedBytes != int64(len(input)) || len(mappingDiagnosticPrefix(t, d)) != mappingDiagnosticStreamLimit || single.Len() != 0 {
-		t.Fatalf("rejected write lost its observed prefix: %+v", d)
+	diagnostic.WriteError = strings.Repeat("x", 20<<10)
+	if err := encodeMappingDiagnostic(diagnostic); err == nil || errors.As(err, &bounded) {
+		t.Fatal("oversized diagnostic silently truncated required facts")
 	}
-}
-
-func mappingOperationStagesForTest() []string {
-	return []string{"entry", "before-readline", "after-readline", "before-utility", "after-utility", "before-json", "after-json", "before-owner", "after-owner", "before-import", "after-import", "before-inventory", "after-inventory", "before-create-inventory", "after-create-inventory", "before-remove-inventory", "after-remove-inventory", "after-result"}
-}
-
-func mappingObservationOrder(source string, fragments ...string) error {
-	for _, fragment := range fragments {
-		index := strings.Index(source, fragment)
-		if index < 0 {
-			return fmt.Errorf("missing or out-of-order observation anchor: %s", fragment)
+	for _, raw := range []string{`{"version":1,"version":1}`, `{"rows":[{"local_path":"Z:","local_path":"Y:"}]}`, `{} {}`, strings.Repeat("[", 18) + strings.Repeat("]", 18), strings.Repeat(" ", mappingByteLimit+1)} {
+		var value any
+		if err := decodeMappingJSON([]byte(raw), &value); err == nil {
+			t.Fatal("ambiguous or oversized native JSON was accepted")
 		}
-		source = source[index+len(fragment):]
-	}
-	return nil
-}
-
-func mappingObservationOwnership(source string) error {
-	const catchStart = "} catch {\n    $primaryError = $_\n    $primaryOrigin = $rfsObservationStage"
-	index := strings.Index(source, catchStart)
-	if index < 0 {
-		return errors.New("operation catch does not immediately retain the primary ErrorRecord and stage")
-	}
-	return mappingObservationOrder(source[index:], catchStart,
-		"'RFS-MAPPING/1 catch-entry'", "'RFS-MAPPING/1 obs-begin catch'",
-		"$primaryError.Exception.GetType().FullName", "$primaryError.FullyQualifiedErrorId",
-		"'RFS-MAPPING/1 obs-end catch'", "} catch {", "'RFS-MAPPING/1 obs-failure catch'",
-		"} finally {", "$cause = $primaryError.Exception.Message",
-		"if ($cause.Length -gt 1024) { $cause = $cause.Substring(0,1024) }",
-		"[ordered]@{ status = 'error'; owner_sid = $owner; rows = @(); cause = $cause } | ConvertTo-Json -Depth 5 -Compress", "exit 1")
-}
-
-func TestMappingObservationScriptOwnershipAndOrder(t *testing.T) {
-	for _, helper := range []string{"Get-RfsBoundedTextFact", "Write-RfsInputObservation", "Write-RfsEnvironmentObservation"} {
-		if strings.Count(mappingPowerShell, "function "+helper) != 1 {
-			t.Fatalf("missing or repeated observation helper: %s", helper)
-		}
-	}
-	textStart := strings.Index(mappingPowerShell, "function Get-RfsBoundedTextFact")
-	inputStart := strings.Index(mappingPowerShell, "function Write-RfsInputObservation")
-	environmentStart := strings.Index(mappingPowerShell, "function Write-RfsEnvironmentObservation")
-	operationStart := strings.Index(mappingPowerShell, "try {\n    [Console]::Error.WriteLine('RFS-MAPPING/1 before-readline')")
-	if textStart < 0 || inputStart <= textStart || environmentStart <= inputStart || operationStart <= environmentStart {
-		t.Fatal("observation helper boundaries changed")
-	}
-	textHelper := mappingPowerShell[textStart:inputStart]
-	inputHelper := mappingPowerShell[inputStart:environmentStart]
-	environmentHelper := mappingPowerShell[environmentStart:operationStart]
-	if err := mappingObservationOrder(textHelper,
-		"if ($null -eq $Value) { return @{ state = 'null' } }", "$text = [string]$Value",
-		"$head = $text.Substring(0, [Math]::Min($text.Length, $Limit + 1))", "$bytes = $utf8.GetBytes($head)",
-		"$retained = [Math]::Min($bytes.Length, $Limit)", "[Convert]::ToBase64String($bytes, 0, $retained)"); err != nil {
-		t.Fatal(err)
-	}
-	if err := mappingObservationOrder(inputHelper,
-		"if ($null -eq $Value)", "'RFS-MAPPING/1 obs-input state=null'", "$text = [string]$Value",
-		"if ($text.Length -gt 4096)", "throw 'Input observation exceeds its UTF-16 limit.'",
-		"$length = $utf8.GetByteCount($text)", "if ($length -gt 12288)", "throw 'Input observation exceeds its UTF-8 limit.'",
-		"$bytes = $utf8.GetBytes($text)", "[Security.Cryptography.SHA256]::Create()", "$hash.ComputeHash($bytes)",
-		"if ($null -ne $hash) { $hash.Dispose() }", "read_line_utf8_sha256={3}"); err != nil {
-		t.Fatal(err)
-	}
-	if err := mappingObservationOrder(environmentHelper,
-		"foreach ($name in @('PSModulePath', 'WinPSModulePath', 'PSModuleAnalysisCachePath'))",
-		"$value = [Environment]::GetEnvironmentVariable($name, [EnvironmentVariableTarget]::Process)",
-		"$fact = Get-RfsBoundedTextFact $value 96"); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Count(environmentHelper, "GetEnvironmentVariable(") != 1 {
-		t.Fatal("environment observation no longer snapshots each allowlisted value once")
-	}
-	for _, forbidden := range []string{"ConvertFrom-Json", "ConvertTo-Json", "Import-Module", "Get-Command", "Get-Module", "SetEnvironmentVariable", "ReadLine", "ReadToEnd"} {
-		if strings.Contains(mappingPowerShell[textStart:operationStart], forbidden) {
-			t.Fatalf("observation helpers added operational work: %s", forbidden)
-		}
-	}
-	if err := mappingObservationOrder(mappingPowerShell,
-		"$requestLine = [Console]::In.ReadLine()", "'RFS-MAPPING/1 after-readline'",
-		"$rfsObservationStage = 'input'", "Write-RfsInputObservation $requestLine",
-		"$rfsObservationStage = 'environment'", "Write-RfsEnvironmentObservation",
-		"$rfsObservationStage = 'operation'", "$utilityManifest =", "'RFS-MAPPING/1 before-utility'",
-		mappingUtilityImportForTest, "'RFS-MAPPING/1 after-utility'", mappingUtilityModuleGuardForTest,
-		"$jsonCommand = $utilityModules[0].ExportedCmdlets['ConvertFrom-Json']", mappingUtilityJSONGuardForTest, "'RFS-MAPPING/1 before-json'",
-		"$request = $requestLine | & $jsonCommand", "'RFS-MAPPING/1 after-json'",
-		"$owner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-		"Import-Module -Name $request.module -ErrorAction Stop"); err != nil {
-		t.Fatal(err)
-	}
-	if err := mappingObservationOwnership(mappingPowerShell); err != nil {
-		t.Fatal(err)
-	}
-	for _, stage := range []string{"input", "environment", "catch"} {
-		for _, kind := range []string{"obs-begin", "obs-end", "obs-failure"} {
-			if strings.Count(mappingPowerShell, "'RFS-MAPPING/1 "+kind+" "+stage+"'") != 1 {
-				t.Fatalf("missing or repeated observation boundary: %s %s", kind, stage)
-			}
-		}
-	}
-	if strings.Count(mappingPowerShell, "$requestLine =") != 1 || strings.Count(mappingPowerShell, "$request = $requestLine | & $jsonCommand") != 1 ||
-		strings.Contains(mappingPowerShell, "$request = $requestLine | ConvertFrom-Json") ||
-		strings.Count(mappingPowerShell, "ConvertTo-Json") != 2 || strings.Contains(mappingPowerShell, "$cause = $_.") {
-		t.Fatal("observation changed the input, JSON commands or primary cause ownership")
-	}
-	for _, mutation := range []struct {
-		name, source string
-	}{
-		{"discard-primary", strings.Replace(mappingPowerShell, "$primaryError = $_", "$primaryError = $null", 1)},
-		{"catch-marker-after-serialization", strings.Replace(strings.Replace(mappingPowerShell, "[Console]::Error.WriteLine('RFS-MAPPING/1 catch-entry')", "", 1), "    exit 1", "    [Console]::Error.WriteLine('RFS-MAPPING/1 catch-entry')\n    exit 1", 1)},
-		{"secondary-overwrites-cause", strings.Replace(mappingPowerShell, "$cause = $primaryError.Exception.Message", "$cause = $_.Exception.Message", 1)},
-		{"serialization-outside-finally", strings.Replace(mappingPowerShell, "} finally {\n        $cause = $primaryError.Exception.Message", "}\n        $cause = $primaryError.Exception.Message", 1)},
-	} {
-		t.Run(mutation.name, func(t *testing.T) {
-			if mutation.source == mappingPowerShell || mappingObservationOwnership(mutation.source) == nil {
-				t.Fatal("observation ownership control accepted its targeted mutation")
-			}
-		})
-	}
-}
-
-func mappingScriptFormatForTest(t *testing.T, source, prefix string, values ...string) string {
-	t.Helper()
-	needle := "'" + prefix
-	if strings.Count(source, needle) != 1 {
-		t.Fatalf("record format is missing or ambiguous: %s", prefix)
-	}
-	start := strings.Index(source, needle) + 1
-	format, _, found := strings.Cut(source[start:], "'")
-	if !found {
-		t.Fatal("record format has no closing quote")
-	}
-	for index, value := range values {
-		format = strings.ReplaceAll(format, fmt.Sprintf("{%d}", index), value)
-	}
-	if strings.ContainsAny(format, "{}") {
-		t.Fatalf("record format has unbound fields: %s", prefix)
-	}
-	return format
-}
-
-func mappingObservationFormatForTest(t *testing.T, prefix string, values ...string) string {
-	t.Helper()
-	return mappingScriptFormatForTest(t, mappingPowerShell, prefix, values...)
-}
-
-func TestMappingCommandControlStderrGrammarBound(t *testing.T) {
-	script, err := mappingStartupImportScript(mappingStartupManifestForTest(t, "Microsoft.PowerShell.Utility.psd1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Count(script, "RFS-CMD/1 ") != 19 || strings.Count(mappingStartupResolveScript, "RFS-CMD/1 ") != 17 {
-		t.Fatal("control record inventory changed without a new byte accounting")
-	}
-	record := func(prefix string, values ...string) string {
-		return mappingScriptFormatForTest(t, script, "RFS-CMD/1 "+prefix, values...) + "\r\n"
-	}
-	const maximumLength = "2147483647"
-	textFields := func(name string, limit int) string {
-		prefix := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, limit))
-		return mappingScriptFormatForTest(t, script, "{0}_state={1}", name, "value", maximumLength, prefix, "1")
-	}
-	var provenance strings.Builder
-	provenance.WriteString(record("command role={", "resolved-command"))
-	for _, fact := range []struct {
-		name, expression string
-		limit            int
-	}{
-		{"module_name", "$moduleName", 64}, {"module_version", "$moduleVersion", 48}, {"module_path", "$modulePath", 96},
-		{"implementing_type", "$implementingType.FullName", 96}, {"assembly_name", "$assembly.FullName", 112}, {"assembly_location", "$assembly.Location", 96},
-	} {
-		call := fmt.Sprintf("Write-RfsCommandFact '%s' %s %d", fact.name, fact.expression, fact.limit)
-		if strings.Count(mappingCommandPrelude, call) != 1 {
-			t.Fatalf("provenance field or prefix cap changed: %s", fact.name)
-		}
-		prefix := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, fact.limit))
-		provenance.WriteString(record("fact name={0} state={1}", fact.name, "value", maximumLength, prefix, "1"))
-	}
-	provenance.WriteString(record("mvid value={", "ffffffff-ffff-ffff-ffff-ffffffffffff"))
-	var stages strings.Builder
-	for _, stage := range []string{"entry import-parse", "before-readline", "after-readline", "before-import", "after-import", "before-provenance", "after-provenance", "before-parse", "after-parse", "complete import-parse"} {
-		stages.WriteString(record(stage))
-	}
-	var resolveStages strings.Builder
-	for _, stage := range []string{"entry resolve", "before-readline", "after-readline", "before-resolution", "after-resolution", "before-provenance", "after-provenance", "complete resolve"} {
-		resolveStages.WriteString(mappingScriptFormatForTest(t, mappingStartupResolveScript, "RFS-CMD/1 "+stage) + "\r\n")
-	}
-	if resolveStages.Len() > stages.Len() {
-		t.Fatal("resolution stages exceed the selected combined stage bound")
-	}
-	failure := record("error-begin stage={", "provenance") + record("error-end") + record("observer-failure") + record("error {", textFields("type", 64), textFields("id", 64))
-	maximum := provenance.String() + stages.String() + failure
-	unsupported := stages.String() + record("unsupported count={", maximumLength, textFields("name", 64), textFields("kind", 32)) + failure
-	if len(maximum) != 2008 || len(unsupported) != 935 || len(maximum) > mappingDiagnosticStreamLimit || len(unsupported) > mappingDiagnosticStreamLimit {
-		t.Fatalf("control grammar exceeds its declared bounds: provenance=%d unsupported=%d limit=%d", len(maximum), len(unsupported), mappingDiagnosticStreamLimit)
-	}
-	for _, output := range []string{maximum, unsupported} {
-		for _, value := range output {
-			if value > 127 {
-				t.Fatal("control record contains unencoded variable text")
-			}
-		}
-		var buffer mappingBoundedBuffer
-		if n, err := buffer.Write([]byte(output)); err != nil || n != len(output) {
-			t.Fatal("control record did not fit the unchanged capture")
-		}
-		diagnostic := buffer.diagnostic()
-		if diagnostic.PrefixTruncated || string(mappingDiagnosticPrefix(t, diagnostic)) != output {
-			t.Fatal("generated control records were truncated within the declared budget")
-		}
-	}
-	nullField := func(name string) string {
-		return mappingScriptFormatForTest(t, script, "{0}_state=null", name)
-	}
-	for _, output := range []string{
-		record("fact name={0} state=null", "module_path"),
-		record("unsupported count={", "0", nullField("name"), nullField("kind")),
-		record("error {", nullField("type"), nullField("id")),
-	} {
-		if strings.Contains(output, "16=") || strings.Contains(output, "_b64=") || strings.Contains(output, "cut=") {
-			t.Fatal("null control fact invented length or prefix observations")
-		}
-	}
-}
-
-func TestMappingObservationStderrGrammarBound(t *testing.T) {
-	record := func(prefix string, values ...string) string {
-		return mappingObservationFormatForTest(t, "RFS-MAPPING/1 "+prefix, values...) + "\r\n"
-	}
-	var legacy strings.Builder
-	for _, stage := range mappingOperationStagesForTest() {
-		legacy.WriteString(record(stage))
-	}
-	if legacy.Len() != 551 {
-		t.Fatalf("eighteen operation marker bytes changed: %d", legacy.Len())
-	}
-	const maximumLength = "2147483647"
-	environmentPrefix := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, 96))
-	errorPrefix := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, 64))
-	if len(environmentPrefix) != 128 || len(errorPrefix) != 88 {
-		t.Fatal("base64 prefix budget changed")
-	}
-	typeFields := mappingObservationFormatForTest(t, "type_state={", "value", maximumLength, errorPrefix, "1")
-	idFields := mappingObservationFormatForTest(t, "id_state={", "value", maximumLength, errorPrefix, "1")
-	catch := record("catch-entry") + record("obs-begin catch") + record("obs-catch origin={", "environment", typeFields, idFields) + record("obs-end catch")
-	var failures strings.Builder
-	for _, stage := range []string{"input", "environment", "catch"} {
-		failures.WriteString(record("obs-failure " + stage))
-	}
-	var bounded strings.Builder
-	bounded.WriteString(legacy.String())
-	bounded.WriteString(record("obs-begin input"))
-	bounded.WriteString(record("obs-input state={", "value", "4096", "12288", strings.Repeat("f", 64)))
-	bounded.WriteString(record("obs-end input"))
-	bounded.WriteString(record("obs-begin environment"))
-	for _, name := range []string{"PSModulePath", "WinPSModulePath", "PSModuleAnalysisCachePath"} {
-		bounded.WriteString(record("obs-env name={0} state={", name, "value", maximumLength, environmentPrefix, "1"))
-	}
-	bounded.WriteString(record("obs-end environment"))
-	bounded.WriteString(catch)
-	bounded.WriteString(failures.String())
-	if bounded.Len() != 2040 || bounded.Len() > mappingDiagnosticStreamLimit {
-		t.Fatalf("actual record grammar exceeds its declared prefix budget: bytes=%d limit=%d", bounded.Len(), mappingDiagnosticStreamLimit)
-	}
-	for _, value := range bounded.String() {
-		if value > 127 {
-			t.Fatal("record grammar emitted unencoded variable text")
-		}
-	}
-	var captured mappingBoundedBuffer
-	if n, err := captured.Write([]byte(bounded.String())); err != nil || n != bounded.Len() {
-		t.Fatalf("bounded records were not fully captured: bytes=%d error=%v", n, err)
-	}
-	diagnostic := captured.diagnostic()
-	if diagnostic.PrefixTruncated || diagnostic.ObservedBytes != int64(bounded.Len()) || string(mappingDiagnosticPrefix(t, diagnostic)) != bounded.String() {
-		t.Fatal("record grammar lost observations within the existing stderr prefix")
-	}
-	for _, limit := range []string{
-		record("obs-input-limit utf16={0} utf8=unmeasured", maximumLength),
-		record("obs-input-limit utf16={0} utf8={1}", "4096", maximumLength),
-	} {
-		early := legacy.String() + record("obs-begin input") + limit + catch + failures.String()
-		if len(early) > mappingDiagnosticStreamLimit || len(early) >= bounded.Len() {
-			t.Fatal("early input-limit failure exceeds the record budget")
-		}
-	}
-	for _, nullRecord := range []string{
-		record("obs-input state=null"),
-		record("obs-env name={0} state=null", "PSModulePath"),
-		record("obs-catch origin={", "operation", mappingObservationFormatForTest(t, "type_state=null"), mappingObservationFormatForTest(t, "id_state=null")),
-	} {
-		if strings.Contains(nullRecord, "utf16=") || strings.Contains(nullRecord, "utf8=") || strings.Contains(nullRecord, "sha256=") || strings.Contains(nullRecord, "_b64=") || strings.Contains(nullRecord, "16=") {
-			t.Fatal("null record manufactured a length, prefix or digest")
-		}
-	}
-}
-
-func TestMappingStageMarkersKeepSuccessReceiptUnchanged(t *testing.T) {
-	for _, stage := range mappingOperationStagesForTest() {
-		marker := "[Console]::Error.WriteLine('RFS-MAPPING/1 " + stage + "')"
-		if strings.Count(mappingPowerShell, marker) != 1 {
-			t.Fatalf("missing or repeated fixed stderr stage: %s", stage)
-		}
-	}
-	if strings.Contains(mappingPowerShell, "ReadToEnd") || strings.Contains(mappingPowerShell, "[Console]::In.Close") || strings.Contains(mappingPowerShell, "$input") {
-		t.Fatal("diagnostic changed stdin protocol")
-	}
-	sid := mappingBaselineForTest().Owner.SID
-	want := mappingCommandResult{Status: "ok", OwnerSID: sid, Rows: []mappingRow{}}
-	data, _ := json.Marshal(want)
-	process := mappingReplyChild(string(data))
-	process.stderr = io.NopCloser(strings.NewReader("RFS-MAPPING/1 entry\nRFS-MAPPING/1 after-result\n"))
-	result, err := runMappingPowerShell(context.Background(), &mappingCommandHost{child: process}, "system-powershell", "private-evidence", mappingUtilityRootForTest(t), mappingCommandRequest{Action: "inventory", OwnerSID: sid}, mappingUtilityOpsForTest())
-	if err != nil || !reflect.DeepEqual(result, want) || process.finished != 1 || process.input.closes != 1 {
-		t.Fatalf("normal result/owner changed: result=%+v err=%v", result, err)
 	}
 }

@@ -68,10 +68,23 @@ type probeState struct {
 }
 
 func main() {
-	if err := command(os.Args[1:], os.Stdout); err != nil {
+	if err := dispatchProbeCommand(os.Args[1:], os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "current authority probe:", err)
 		os.Exit(1)
 	}
+}
+
+func dispatchProbeCommand(args []string, stdin io.Reader, stdout io.Writer) error {
+	return routeProbeCommand(args, stdin, stdout, command, runMappingHelper)
+}
+
+func routeProbeCommand(args []string, stdin io.Reader, stdout io.Writer,
+	probeCommand func([]string, io.Writer) error, mappingHelper func([]string, io.Reader, io.Writer) error,
+) error {
+	if len(args) != 0 && args[0] == "--mapping-helper" {
+		return mappingHelper(args[1:], stdin, stdout)
+	}
+	return probeCommand(args, stdout)
 }
 
 func command(args []string, stdout io.Writer) error {

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-import base64
+from contextlib import redirect_stderr
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path, PureWindowsPath
 import sys
 import tempfile
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -17,9 +17,6 @@ SPEC.loader.exec_module(checks)
 
 
 class CheckAccountingTests(unittest.TestCase):
-    diagnostic_cells = ("01_entry_open", "02_entry_eof", "03_inventory_open", "04_inventory_eof",
-                        "05_resolve_json_command", "06_import_utility_parse")
-
     def setUp(self):
         parent = checks.ROOT / ".tmp/native-current-authority-fixture/checker-unit"
         parent.mkdir(parents=True, exist_ok=True)
@@ -49,530 +46,136 @@ class CheckAccountingTests(unittest.TestCase):
         pid = int(path.read_text())
         self.assertFalse(Path(f"/proc/{pid}").exists())
 
-    def prerequisite(self):
-        self.run_id, self.source_sha, self.nonce = "12345-1", "a" * 40, "b" * 64
-        self.identity = {"run_id": self.run_id, "source_sha": self.source_sha, "fixture_nonce": self.nonce}
-        self.prior = self.directory / ".tmp/native-current-authority-fixture/windows-runs" / self.run_id / "evidence"
-        self.prior.mkdir(parents=True)
-        self.output = self.directory / ".tmp/native-current-authority-fixture/unit-windows/mapping-startup"
-        self.output.mkdir(parents=True)
-        stream = {"observed_bytes": 0, "prefix_base64": "", "prefix_truncated": False}
-        self.diagnostic = {"action": "inventory", "action_truncated": False, "eof_requested": False,
-                           "cleanup_confirmed": True, "workers_started": 3, "workers_joined": 3,
-                           "input_bytes": 219, "input_sha256": "b" * 64,
-                           "script_utf16_units": 3793, "script_utf16le_sha256": "c" * 64,
-                           "stdout_observed": stream.copy(), "stderr_observed": stream.copy()}
-        self.cold = [
-            {"kind": "smb-host", "status": "ok", "sid": "S-1-5-21-1000"},
-            {"kind": "smb-cleanup", "status": "ok", "serve_joined": True},
-            {"kind": "cold-result", "status": "error", "error": "context deadline exceeded\nmapping command diagnostic: " + json.dumps(self.diagnostic)},
-        ]
-        self.events = [
-            {"phase": "current-smb-cold", "category": "probe-failed", "details": {"sequence": 2}},
-            {"phase": "current-smb-cleanup", "category": "mapping-recovery", "details": {"sequence": 2, "status": "ok"}},
-        ]
-        self.receipt = {**self.identity, "fixture_readiness": "failed", "current_smb_cold_requested": True,
-                        "cause": "current-smb-cold: original cold failure"}
-        source = self.directory / ".github/scripts/native-current-authority/check-tooling.py"
-        source.parent.mkdir(parents=True)
-        source.write_text("source-bound checker")
-        self.sources = {source.relative_to(self.directory).as_posix(): checks.checksum(source)}
-        self.manifest = {"source_sha": self.source_sha, "source_dirty": False, "source_files": self.sources.copy()}
-        self.manifest_path = self.directory / ".tmp/native-current-authority-fixture/artifact/manifest.json"
-        self.manifest_path.parent.mkdir(parents=True)
-        self.write_prerequisite()
-
-    def write_prerequisite(self):
-        (self.prior / "receipt.json").write_text(json.dumps(self.receipt))
-        (self.prior / "cold-observations.jsonl").write_text("\n".join(
-            json.dumps({**self.identity, "event": event}) for event in self.cold))
-        (self.prior / "events.jsonl").write_text("\n".join(json.dumps({**self.identity, **event}) for event in self.events))
-        self.manifest_path.write_text(json.dumps(self.manifest))
-
-    def admit(self):
-        with mock.patch.object(checks, "ROOT", self.directory):
-            return checks.diagnostic_prerequisite(self.run_id, self.source_sha, self.output, self.sources)
-
-    def test_diagnostic_catalog_uses_only_production_probe_and_tagged_test(self):
-        catalog = checks.diagnostic_templates()
-        self.assertEqual(catalog[:-1], checks.image_catalog().probe_templates("windows"))
-        self.assertEqual(catalog[-1], checks.DIAGNOSTIC_TEMPLATE)
-        self.assertEqual([name for name in catalog if name.endswith("_test.go")], [checks.DIAGNOSTIC_TEMPLATE])
-        self.assertNotIn("controller.go", catalog)
+    def test_default_catalog_preserves_probe_controller_and_native_unit_sources(self):
+        image = checks.image_catalog()
         for platform in ("linux", "windows"):
-            for files in checks.template_groups(platform).values():
-                self.assertNotIn(checks.DIAGNOSTIC_TEMPLATE, files)
-
-    def test_prerequisite_binds_exact_cold_failure_identity_and_source_bytes(self):
-        self.prerequisite()
-        config, provenance = self.admit()
-        self.assertEqual(set(config), {"format", *self.identity, "prior_evidence_directory", "evidence_directory",
-                                       "native_evidence_directory", "owner_sid", "initial_inventory_error", "initial_inventory_diagnostic"})
-        self.assertEqual(config["initial_inventory_diagnostic"], self.diagnostic)
-        self.assertEqual(config["initial_inventory_error"], self.cold[-1]["error"])
-        self.assertEqual(config["owner_sid"], "S-1-5-21-1000")
-        self.assertEqual(config["prior_evidence_directory"], str(self.prior))
-        self.assertEqual(config["evidence_directory"], str(self.output))
-        self.assertEqual(config["native_evidence_directory"], str(self.output / "native-evidence"))
-        self.assertFalse((self.output / "native-evidence").exists())
-        self.assertEqual(provenance["fixture_failure"], self.receipt["cause"])
-        self.assertEqual(len(provenance["files"]), 4)
-
-    def test_prerequisite_rejects_missing_foreign_successful_or_unbound_evidence(self):
-        self.prerequisite()
-        cases = (
-            ("missing", lambda: (self.prior / "receipt.json").unlink()),
-            ("foreign-run", lambda: self.receipt.update(run_id="other")),
-            ("foreign-source", lambda: self.receipt.update(source_sha="d" * 40)),
-            ("successful-cold", lambda: self.receipt.update(fixture_readiness="ok")),
-            ("not-cold", lambda: self.receipt.update(current_smb_cold_requested=False)),
-            ("dirty-source", lambda: self.manifest.update(source_dirty=True)),
-            ("changed-bytes", lambda: self.manifest["source_files"].update({next(iter(self.sources)): "e" * 64})),
-        )
-        original_receipt, original_manifest = json.dumps(self.receipt), json.dumps(self.manifest)
-        for name, change in cases:
-            with self.subTest(name=name):
-                self.receipt, self.manifest = json.loads(original_receipt), json.loads(original_manifest)
-                if name == "missing":
-                    self.write_prerequisite()
-                    change()
+            with self.subTest(platform=platform):
+                groups = checks.template_groups(platform)
+                self.assertEqual(groups, image.unit_template_groups(platform))
+                self.assertEqual(set(groups), {"probe", "controller"} if platform == "windows" else {"probe", "controller", "init"})
+                self.assertEqual({name for name in groups["probe"] if not name.endswith("_test.go")}, set(image.probe_templates(platform)))
+                for files in groups.values():
+                    self.assertEqual(len(files), len(set(files)))
+                    self.assertNotIn("mapping_startup_diagnostic_windows_test.go", files)
+                self.assertIn("probe_test.go", groups["probe"])
+                self.assertIn("smb_observer_test.go", groups["probe"])
+                self.assertIn("controller_test.go", groups["controller"])
+                self.assertIn("private_test.go", groups["controller"])
+                if platform == "windows":
+                    self.assertIn("smb_mapping_windows_test.go", groups["probe"])
+                    self.assertIn("smb_probe_windows_test.go", groups["probe"])
+                    self.assertIn("controller_windows_test.go", groups["controller"])
+                    self.assertIn("private_windows_test.go", groups["controller"])
                 else:
-                    change()
-                    self.write_prerequisite()
-                with self.assertRaises((ValueError, FileNotFoundError)):
-                    self.admit()
+                    self.assertIn("smb_probe_other.go", groups["probe"])
+                    self.assertEqual(groups["init"], ("init_linux.go", "init_linux_test.go"))
 
-    def test_prerequisite_rejects_later_inventory_non_timeout_and_unknown_cleanup(self):
-        self.prerequisite()
-        original_cold, original_events = json.dumps(self.cold), json.dumps(self.events)
-        mutations = (
-            lambda: self.cold.insert(1, {"kind": "native", "status": "ok"}),
-            lambda: self.cold[1].update(serve_joined=False),
-            lambda: self.events[1]["details"].update(status="blocked"),
-            lambda: self.events.append(self.events[0].copy()),
-            lambda: self.cold[2].update(error='mapping command diagnostic: {"action":"create","action_truncated":false}'),
-            lambda: self.cold[2].update(error="mapping command diagnostic: " + json.dumps({
-                **self.diagnostic, "stderr_observed": {"observed_bytes": 1, "prefix_base64": "eA==", "prefix_truncated": False}})),
-            lambda: self.cold[2].update(error=self.cold[2]["error"] + self.cold[2]["error"]),
-        )
-        for number, change in enumerate(mutations):
-            with self.subTest(number=number):
-                self.cold, self.events = json.loads(original_cold), json.loads(original_events)
-                change()
-                self.write_prerequisite()
-                with self.assertRaises(ValueError):
-                    self.admit()
-        self.cold, self.events = json.loads(original_cold), json.loads(original_events)
-        self.write_prerequisite()
-        (self.prior / "smb-mapping.json").write_text("{}")
-        with self.assertRaisesRegex(ValueError, "ledger"):
-            self.admit()
-
-    def test_prerequisite_json_rejects_duplicate_fields_and_oversize(self):
-        self.prerequisite()
-        for data in ('{"run_id":"one","run_id":"two"}', '{"value":NaN}', " " * ((1 << 20) + 1)):
-            with self.subTest(data=data[:50]):
-                (self.prior / "receipt.json").write_text(data)
-                with self.assertRaises(ValueError):
-                    self.admit()
-
-    def capture(self, data):
-        return {"observed_bytes": len(data), "prefix_base64": base64.b64encode(data[:2048]).decode("ascii"),
-                "prefix_truncated": len(data) > 2048}
-
-    def inventory_error(self, diagnostic, first_line="context deadline exceeded"):
-        return first_line + "\nmapping command diagnostic: " + json.dumps(diagnostic)
-
-    def update_inventory(self):
-        self.cold[-1]["error"] = self.inventory_error(self.diagnostic)
-        self.write_prerequisite()
-
-    def test_prerequisite_admits_observed_109_byte_timeout(self):
-        self.prerequisite()
-        prefix = (b"RFS-MAPPING/1 entry\r\nRFS-MAPPING/1 before-readline\r\n"
-                  b"RFS-MAPPING/1 after-readline\r\nRFS-MAPPING/1 before-json\r\n")
-        self.assertEqual(len(prefix), 109)
-        self.diagnostic["stderr_observed"] = self.capture(prefix)
-        self.update_inventory()
-        config, provenance = self.admit()
-        self.assertEqual(config["initial_inventory_diagnostic"]["stderr_observed"], self.capture(prefix))
-        self.assertEqual(config["initial_inventory_error"], self.cold[-1]["error"])
-        self.assertEqual(provenance["cold_failure"], self.cold[-1]["error"])
-
-    def test_prerequisite_admits_every_inventory_prefix_and_unclassified_capture(self):
-        self.prerequisite()
-        stages = ("entry", "before-readline", "after-readline", "before-json", "after-json", "before-owner",
-                  "after-owner", "before-import", "after-import", "before-inventory", "after-inventory", "after-result")
-        source = (checks.TOOLS / "smb_mapping_windows.go.txt").read_text()
-        for stage in stages:
-            self.assertIn("WriteLine('RFS-MAPPING/1 " + stage + "')", source)
-        for count in range(len(stages) + 1):
-            with self.subTest(marker_count=count):
-                prefix = b"".join(("RFS-MAPPING/1 " + stage + "\r\n").encode() for stage in stages[:count])
-                self.diagnostic["stderr_observed"] = self.capture(prefix)
-                self.update_inventory()
-                self.admit()
-        for data in (b"RFS-MAPPING/1 bef", b"arbitrary stdout\n", b"\xff\x00\xfe", b"x" * 2048, b"x" * 2049, b"x" * 4096):
-            for stream in ("stdout_observed", "stderr_observed"):
-                with self.subTest(stream=stream, count=len(data)):
-                    self.diagnostic[stream] = self.capture(data)
-                    self.update_inventory()
-                    config, _ = self.admit()
-                    self.assertEqual(config["initial_inventory_diagnostic"][stream], self.capture(data))
-
-    def test_inventory_capture_rejects_inconsistent_counts_base64_and_flags(self):
-        malformed = [
-            {}, {"observed_bytes": None, "prefix_base64": "", "prefix_truncated": False},
-            {"observed_bytes": True, "prefix_base64": "", "prefix_truncated": False},
-            {"observed_bytes": 0.0, "prefix_base64": "", "prefix_truncated": False},
-            {"observed_bytes": -1, "prefix_base64": "", "prefix_truncated": False},
-            {"observed_bytes": 1 << 63, "prefix_base64": "", "prefix_truncated": False},
-            {"observed_bytes": 1, "prefix_base64": "eA==\n", "prefix_truncated": False},
-            {"observed_bytes": 1, "prefix_base64": "eB==", "prefix_truncated": False},
-            {"observed_bytes": 1, "prefix_base64": "!", "prefix_truncated": False},
-            {"observed_bytes": 1, "prefix_base64": "é", "prefix_truncated": False},
-            {"observed_bytes": 0, "prefix_base64": "", "prefix_truncated": 0},
-            {"observed_bytes": 0, "prefix_base64": "", "prefix_truncated": None},
-            {"observed_bytes": 0, "prefix_base64": "", "prefix_truncated": True},
-            {"observed_bytes": 1, "prefix_base64": "", "prefix_truncated": False},
-            {**self.capture(b"x" * 2049), "prefix_truncated": False},
-            {**self.capture(b"x" * 2049), "prefix_base64": base64.b64encode(b"x" * 2049).decode()},
-            {**self.capture(b""), "unexpected": True},
-        ]
-        self.prerequisite()
-        for number, stream in enumerate(malformed):
-            with self.subTest(number=number):
-                self.diagnostic["stdout_observed"] = stream
-                self.update_inventory()
-                with self.assertRaises(ValueError):
-                    self.admit()
-        checks.validate_capture({"observed_bytes": (1 << 63) - 1,
-                                 "prefix_base64": base64.b64encode(b"x" * 2048).decode(), "prefix_truncated": True})
-
-    def test_inventory_timeout_uses_original_first_line_and_confirmed_cleanup(self):
-        self.prerequisite()
-        for first in ("process exited 1", "context canceled", "prefix context deadline exceeded", "", "context deadline exceeded\r"):
-            with self.subTest(first=first):
-                diagnostic = {**self.diagnostic, "stderr_observed": self.capture(b"context deadline exceeded\n")}
-                self.cold[-1]["error"] = self.inventory_error(diagnostic, first)
-                self.write_prerequisite()
-                with self.assertRaisesRegex(ValueError, "original command timeout"):
-                    self.admit()
-        original = self.diagnostic.copy()
-        cases = (("action", "create"), ("action_truncated", True), ("eof_requested", True),
-                 ("cleanup_confirmed", False), ("cleanup_confirmed", None), ("workers_started", False),
-                 ("workers_joined", None), ("workers_started", 4), ("workers_joined", 2), ("workers_started", -1))
-        for key, value in cases:
-            with self.subTest(key=key, value=value):
-                self.diagnostic = {**original, key: value}
-                self.update_inventory()
-                with self.assertRaises(ValueError):
-                    self.admit()
-        for key in ("cleanup_confirmed", "workers_started", "workers_joined", "eof_requested"):
-            with self.subTest(missing=key):
-                self.diagnostic = original.copy()
-                del self.diagnostic[key]
-                self.update_inventory()
-                with self.assertRaises(ValueError):
-                    self.admit()
-
-    def test_prelaunch_timeout_retains_unavailable_input_script_and_child_facts(self):
-        self.prerequisite()
-        self.diagnostic.update(input_bytes=0, input_sha256="", script_utf16_units=0, script_utf16le_sha256="",
-                               workers_started=0, workers_joined=0)
-        self.update_inventory()
-        config, _ = self.admit()
-        self.assertEqual(config["initial_inventory_diagnostic"], self.diagnostic)
-        for name in ("pid", "launch"):
-            self.assertNotIn(name, config["initial_inventory_diagnostic"])
-        for key, value in (("input_bytes", None), ("input_bytes", True), ("input_bytes", 4097),
-                           ("input_bytes", 1), ("input_sha256", "b" * 64),
-                           ("script_utf16_units", 1 << 63), ("script_utf16le_sha256", "c" * 64)):
-            with self.subTest(key=key, value=value):
-                bad = {**self.diagnostic, key: value}
-                with self.assertRaises(ValueError):
-                    checks.validate_inventory_timeout(self.inventory_error(bad), bad)
-        for key in ("input_bytes", "input_sha256", "script_utf16_units", "script_utf16le_sha256"):
-            with self.subTest(missing=key):
-                bad = self.diagnostic.copy()
-                del bad[key]
-                with self.assertRaises(ValueError):
-                    checks.validate_inventory_timeout(self.inventory_error(bad), bad)
-
-    def test_windows_ten_source_keys_match_posix_manifest_without_fallback(self):
-        expected_names = ("probe.go.txt", "smb_observer.go.txt", "private_windows.go.txt", "smb_probe_windows.go.txt",
-                          "smb_mapping_windows.go.txt", "controller_windows.go.txt", "mapping_startup_diagnostic_windows_test.go.txt",
-                          "check-tooling.py", "build-image.py", "check_windows.py")
-        actual = tuple(name + ".txt" for name in checks.diagnostic_templates()) + ("check-tooling.py", "build-image.py", "check_windows.py")
-        self.assertEqual(actual, expected_names)
-        expected = checks.source_hashes([checks.TOOLS / name for name in expected_names])
+    def test_windows_ordinary_source_hashes_use_canonical_posix_keys(self):
+        groups = checks.template_groups("windows")
+        files = sorted({name for names in groups.values() for name in names})
+        expected = checks.source_hashes(checks.TOOLS / (name + ".txt") for name in files)
+        self.assertTrue(expected)
         root = PureWindowsPath("C:/a/remote-fs/remote-fs")
         paths = [root / name for name in expected]
-        self.assertEqual(sum(str(path.relative_to(root)) not in expected for path in paths), 10)
+        self.assertTrue(all(str(path.relative_to(root)) not in expected for path in paths))
         with (mock.patch.object(checks, "ROOT", root),
               mock.patch.object(checks, "checksum", side_effect=lambda path: expected[path.relative_to(root).as_posix()])):
             self.assertEqual(checks.source_hashes(paths), expected)
 
-    def test_prerequisite_rejects_noncanonical_manifest_keys_and_bad_hashes(self):
-        self.prerequisite()
-        original = self.manifest["source_files"].copy()
-        bad_keys = ("packages\\smb\\server.go", "/packages/smb/server.go", "packages//smb/server.go",
-                    "./packages/smb/server.go", "packages/../server.go", "C:/packages/server.go", ".", "")
-        for name in bad_keys:
-            with self.subTest(name=name):
-                self.manifest["source_files"] = {**original, name: "d" * 64}
-                self.write_prerequisite()
-                with self.assertRaisesRegex(ValueError, "canonical POSIX"):
-                    self.admit()
-        self.manifest["source_files"] = {next(iter(original)): "D" * 64}
-        self.write_prerequisite()
-        with self.assertRaisesRegex(ValueError, "lowercase SHA256"):
-            self.admit()
+    def test_retired_diagnostic_arguments_fail_before_output_or_process_creation(self):
+        output = self.directory / "rejected"
+        for arguments in (("--mapping-startup-diagnostic",), ("--run-id", "123-1"), ("--source-sha", "a" * 40)):
+            with self.subTest(arguments=arguments):
+                with (mock.patch.object(checks.sys, "argv", ["check-tooling.py", "--output", str(output), *arguments]),
+                      mock.patch.object(checks, "run") as launch, redirect_stderr(io.StringIO())):
+                    with self.assertRaises(SystemExit) as result:
+                        checks.main()
+                self.assertEqual(result.exception.code, 2)
+                launch.assert_not_called()
+                self.assertFalse(output.exists())
 
-    def diagnostic_events(self, fail=None):
-        root = checks.DIAGNOSTIC_ROOT
-        rows = [{"Action": "run", "Test": root}]
-        for cell in self.diagnostic_cells:
-            rows.extend(({"Action": "run", "Test": root + "/" + cell},
-                         {"Action": "fail" if cell == fail else "pass", "Test": root + "/" + cell}))
-        verdict = "fail" if fail else "pass"
-        return rows + [{"Action": verdict, "Test": root}, {"Action": verdict}]
-
-    def test_diagnostic_audit_retains_failed_cells_and_all_verdicts(self):
-        path = self.directory / "diagnostic.jsonl"
-        for failing in (None, *self.diagnostic_cells):
-            with self.subTest(failing=failing):
-                path.write_text("\n".join(json.dumps(row) for row in self.diagnostic_events(failing)))
-                result = checks.diagnostic_audit(path)
-                self.assertEqual(result["status"], "failed" if failing else "passed")
-                self.assertEqual(result["started"], [checks.DIAGNOSTIC_ROOT, *(checks.DIAGNOSTIC_ROOT + "/" + cell for cell in self.diagnostic_cells)])
-                self.assertEqual(result["expected"], result["started"])
-                self.assertEqual(len(result["verdicts"]), 7)
-                self.assertEqual(result["missing_verdicts"], [])
-                self.assertEqual(result["not_started"], [])
-                self.assertEqual(len(result["failed"]), 2 if failing else 0)
-
-    def test_diagnostic_audit_rejects_old_four_cell_success(self):
-        path = self.directory / "diagnostic.jsonl"
-        complete = self.diagnostic_events()
-        path.write_text("\n".join(json.dumps(row) for row in complete[:9] + complete[-2:]))
-        result = checks.diagnostic_audit(path)
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["not_started"], [checks.DIAGNOSTIC_ROOT + "/" + cell for cell in self.diagnostic_cells[4:]])
-        self.assertEqual(result["missing_verdicts"], [])
-
-    def test_diagnostic_audit_requires_both_new_cells_in_order_with_exact_verdicts(self):
-        path = self.directory / "diagnostic.jsonl"
-        complete = self.diagnostic_events()
-        cases = {"new-cells-reversed": complete[:9] + complete[11:13] + complete[9:11] + complete[13:]}
-        for cell in self.diagnostic_cells[4:]:
-            name = checks.DIAGNOSTIC_ROOT + "/" + cell
-            start = {"Action": "run", "Test": name}
-            verdict = {"Action": "pass", "Test": name}
-            cases[cell + "/missing-cell"] = [row for row in complete if row.get("Test") != name]
-            cases[cell + "/missing-verdict"] = [row for row in complete if row != verdict]
-            cases[cell + "/duplicate-start"] = complete + [start]
-            cases[cell + "/duplicate-verdict"] = complete + [verdict]
-            cases[cell + "/skip"] = [{**row, "Action": "skip"} if row == verdict else row for row in complete]
-        for name, rows in cases.items():
-            with self.subTest(case=name):
-                path.write_text("\n".join(json.dumps(row) for row in rows))
-                result = checks.diagnostic_audit(path)
-                self.assertEqual(result["status"], "failed")
-                self.assertTrue(result["errors"])
-
-    def test_diagnostic_audit_rejects_skips_duplicates_missing_and_wrong_order(self):
-        path = self.directory / "diagnostic.jsonl"
-        good = self.diagnostic_events()
-        cases = [good[:2], good + [good[2]], good + [good[1]],
-                 [*good[:2], {**good[2], "Action": "skip"}, *good[3:]],
-                 [good[0], *good[3:5], *good[1:3], *good[5:]], good[:-1]]
-        for rows in cases:
-            with self.subTest(rows=rows):
-                path.write_text("\n".join(json.dumps(row) for row in rows))
-                self.assertEqual(checks.diagnostic_audit(path)["status"], "failed")
-        path.write_text("compiler error\n")
-        result = checks.diagnostic_audit(path)
-        self.assertEqual(len(result["not_started"]), 7)
-        self.assertIn("invalid Go JSON event", result["errors"][0])
-        for malformed in (None, [], {"Action": "run", "Test": []}, {"Action": None}, {"Action": "pass", "Test": 1}):
-            with self.subTest(malformed=malformed):
-                path.write_text(json.dumps(malformed))
-                result = checks.diagnostic_audit(path)
-                self.assertEqual(result["status"], "failed")
-                self.assertEqual(result["started"], [])
-
-    def test_prerequisite_rejects_changed_dependency_bytes(self):
-        self.prerequisite()
-        dependency = self.directory / "packages/smb/server.go"
-        dependency.parent.mkdir(parents=True)
-        dependency.write_text("package smb\n")
-        self.manifest["source_files"]["packages/smb/server.go"] = checks.checksum(dependency)
-        self.write_prerequisite()
-        self.admit()
-        dependency.write_text("package smb\nvar changed = true\n")
-        with self.assertRaisesRegex(ValueError, "dependency bytes"):
-            self.admit()
-
-    def diagnostic_driver(self, fail=None, early_error=None, invalid_prior=False, native_missing=False,
-                          unknown_job=False, native_legacy=False, native_override=None):
-        self.prerequisite()
-        tools = self.directory / ".github/scripts/native-current-authority"
-        tools.mkdir(parents=True, exist_ok=True)
-        files = ("probe.go", checks.DIAGNOSTIC_TEMPLATE)
-        sources = [tools / (name + ".txt") for name in files]
-        sources += [tools / name for name in ("check-tooling.py", "build-image.py", "check_windows.py")]
-        for path in sources:
-            path.write_text("fixture source: " + path.name)
-        self.sources = {path.relative_to(self.directory).as_posix(): checks.checksum(path) for path in sources}
-        self.manifest["source_files"] = self.sources.copy()
-        if invalid_prior:
-            self.receipt["source_sha"] = "f" * 40
-        self.write_prerequisite()
+    def ordinary_driver(self, *, race=False, failure=None):
+        root = self.directory / ("repository-" + (failure or "success") + ("-race" if race else ""))
+        tools = root / ".github/scripts/native-current-authority"
+        tools.mkdir(parents=True)
+        groups = {name: (name + ".go", name + "_test.go") for name in ("probe", "controller", "init")}
+        for files in groups.values():
+            for name in files:
+                (tools / (name + ".txt")).write_text("package main\n")
+        output = root / ".tmp/checks"
         calls = []
 
-        def execute(command, directory, log, env, timeout, on_abort):
-            calls.append(command)
-            self.assertEqual(timeout, 120)
-            self.assertEqual(directory, self.directory)
-            config = json.loads(Path(env["RFS_MAPPING_STARTUP_CONFIG"]).read_text())
-            self.assertEqual(config["initial_inventory_diagnostic"], self.diagnostic)
-            self.assertEqual(config["initial_inventory_error"], self.cold[-1]["error"])
-            self.assertEqual(config["evidence_directory"], str(self.output))
-            self.assertEqual(config["native_evidence_directory"], str(self.output / "native-evidence"))
-            self.assertFalse((self.output / "native-evidence").exists())
-            if command == ["go", "version"]:
-                if early_error:
-                    raise RuntimeError(early_error)
-                return "go version go1.26.8 windows/arm64\n"
-            self.assertIn("-tags=" + checks.DIAGNOSTIC_TAG, command)
-            self.assertIn("-count=1", command)
-            if "-list" in command:
-                return checks.DIAGNOSTIC_ROOT + "\nok fixture\n"
-            self.assertIn("-run=^" + checks.DIAGNOSTIC_ROOT + "$", command)
-            self.assertIn("-timeout=120s", command)
-            self.assertFalse(any(value.startswith("-coverprofile") for value in command))
-            log.write_text("\n".join(json.dumps(row) for row in self.diagnostic_events(fail)))
-            if not native_missing:
-                native = {"format": 1, **self.identity, "status": "failed" if fail else "passed",
-                          "initial_inventory_error": config["initial_inventory_error"],
-                          "initial_inventory_diagnostic": config["initial_inventory_diagnostic"],
-                          "aborted": False, "cleanup_confirmed": True, "cells": list(self.diagnostic_cells)}
-                if native_override is not None:
-                    native.update(native_override)
-                native_directory = self.output if native_legacy else self.output / "native-evidence"
-                if not native_legacy:
-                    native_directory.mkdir()
-                (native_directory / "mapping-startup.json").write_text(json.dumps(native))
-            if fail:
-                raise RuntimeError("command exited 1: native cell failure")
-            return log.read_text()
+        def run(arguments, directory, log, env, timeout=180):
+            calls.append((arguments, timeout))
+            self.assertEqual(arguments[0], "go")
+            self.assertEqual(directory, root)
+            self.assertEqual(env["GOFLAGS"], "-mod=readonly")
+            self.assertEqual(env["GOMAXPROCS"], "2")
+            self.assertEqual(env["GOENV"], "off")
+            self.assertNotIn("GOTMPDIR", env)
+            for name in ("GOCACHE", "GOMODCACHE", "GOPATH", "TMPDIR", "TMP", "TEMP"):
+                self.assertTrue(Path(env[name]).is_relative_to(root / ".tmp"))
+            if arguments == ["go", "version"]:
+                return "go version go1.26.8 linux/amd64\n"
+            group = Path(arguments[-1]).name
+            test = "Test" + group.title()
+            if "-list" in arguments:
+                self.assertEqual(timeout, 120)
+                self.assertIn("-count=1", arguments)
+                return "ok fixture\n" if failure == "empty-inventory" else test + "\nok fixture\n"
+            if "-json" in arguments:
+                self.assertIn("-count=1", arguments)
+                self.assertIn("-timeout=120s", arguments)
+                self.assertEqual("-race" in arguments, race)
+                self.assertIn("-coverprofile=" + str(output / group / "coverage.out"), arguments)
+                if failure == "wrong-root":
+                    test = "TestUnexpected"
+                verdict = failure if failure in ("skip", "fail") else "pass"
+                rows = [{"Action": "run", "Test": test}, {"Action": "run", "Test": test + "/case"},
+                        {"Action": verdict, "Test": test + "/case"}, {"Action": verdict, "Test": test}, {"Action": "pass"}]
+                if failure == "missing-verdict":
+                    del rows[2]
+                log.write_text("\n".join(json.dumps(row) for row in rows))
+                return log.read_text()
+            self.assertEqual(arguments[:2], ["go", "vet"])
+            if failure == "source-change":
+                (tools / "probe.go.txt").write_text("package main\nvar changed = true\n")
+            return ""
 
-        class Terminated(BaseException):
-            pass
+        arguments = ["check-tooling.py", "--output", str(output)] + (["--race"] if race else [])
+        with (mock.patch.object(checks, "ROOT", root), mock.patch.object(checks, "TOOLS", tools),
+              mock.patch.object(checks.sys, "platform", "linux"), mock.patch.object(checks.sys, "argv", arguments),
+              mock.patch.object(checks, "WINDOWS_JOB", None), mock.patch.object(checks, "template_groups", return_value=groups),
+              mock.patch.object(checks, "run", side_effect=run)):
+            if failure:
+                with self.assertRaises(ValueError):
+                    checks.main()
+                self.assertFalse((output / "receipt.json").exists())
+                return calls, None
+            checks.main()
+        return calls, json.loads((output / "receipt.json").read_text())
 
-        job = mock.Mock(spec=["assert_idle", "close_success", "terminate"])
-        if unknown_job:
-            job.assert_idle.side_effect = RuntimeError("unconfirmed live descendants")
-            job.terminate.side_effect = Terminated
-        args = SimpleNamespace(run_id=self.run_id, source_sha=self.source_sha, race=False)
-        with (mock.patch.object(checks, "ROOT", self.directory), mock.patch.object(checks, "TOOLS", tools),
-              mock.patch.object(checks.sys, "platform", "win32"), mock.patch.object(checks, "WINDOWS_JOB", job),
-              mock.patch.object(checks, "diagnostic_templates", return_value=files), mock.patch.object(checks, "run", side_effect=execute)):
-            if unknown_job:
-                with self.assertRaises(Terminated):
-                    checks.run_startup_diagnostic(args, self.output, {})
-            elif fail or early_error or invalid_prior or native_missing or native_legacy or native_override is not None:
-                with self.assertRaisesRegex(RuntimeError, "startup diagnostic failed"):
-                    checks.run_startup_diagnostic(args, self.output, {})
-            else:
-                checks.run_startup_diagnostic(args, self.output, {})
-        return json.loads((self.output / "diagnostic-receipt.json").read_text()), calls, job
+    def test_ordinary_driver_preserves_all_groups_race_profiles_and_vet(self):
+        for race in (False, True):
+            with self.subTest(race=race):
+                calls, receipt = self.ordinary_driver(race=race)
+                self.assertEqual(receipt["race"], race)
+                self.assertEqual(set(receipt["groups"]), {"probe", "controller", "init"})
+                self.assertEqual(len(calls), 10)
+                self.assertEqual(sum(arguments[:2] == ["go", "vet"] for arguments, _ in calls), 3)
+                for name, group in receipt["groups"].items():
+                    self.assertEqual({key: group[key] for key in ("roots", "verdicts", "fail", "skip")},
+                                     {"roots": 1, "verdicts": 2, "fail": 0, "skip": 0})
+                    self.assertEqual(set(group["sources"]), {
+                        ".github/scripts/native-current-authority/" + name + suffix for suffix in (".go.txt", "_test.go.txt")})
+                    self.assertEqual("-race" in group["command"], race)
 
-    def test_diagnostic_driver_writes_failed_receipt_after_all_native_cell_verdicts(self):
-        receipt, calls, job = self.diagnostic_driver(fail="01_entry_open")
-        self.assertEqual(receipt["status"], "failed")
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(len(receipt["audit"]["verdicts"]), 7)
-        self.assertEqual(receipt["audit"]["failed"], [checks.DIAGNOSTIC_ROOT + "/01_entry_open", checks.DIAGNOSTIC_ROOT])
-        self.assertIn("command exited 1", receipt["errors"][0])
-        self.assertEqual(receipt["prerequisite"]["fixture_failure"], self.receipt["cause"])
-        for cell in self.diagnostic_cells[4:]:
-            self.assertEqual(receipt["audit"]["verdicts"][checks.DIAGNOSTIC_ROOT + "/" + cell], "pass")
-        self.assertTrue(receipt["cleanup_confirmed"])
-        job.close_success.assert_called_once()
-
-    def test_diagnostic_driver_success_is_separate_from_original_cold_failure(self):
-        receipt, calls, _ = self.diagnostic_driver()
-        self.assertEqual(receipt["status"], "passed")
-        self.assertEqual(receipt["prerequisite"]["fixture_failure"], "current-smb-cold: original cold failure")
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(self.sources, receipt["sources"])
-        self.assertEqual(json.loads((self.prior / "receipt.json").read_text())["fixture_readiness"], "failed")
-
-    def test_diagnostic_driver_reads_only_fixed_native_evidence_report(self):
-        receipt, calls, _ = self.diagnostic_driver()
-        self.assertEqual(receipt["status"], "passed")
-        self.assertEqual(len(calls), 3)
-        native = self.output / "native-evidence/mapping-startup.json"
-        self.assertEqual(receipt["native_receipt"]["path"], "native-evidence/mapping-startup.json")
-        self.assertEqual(receipt["native_receipt"]["sha256"], checks.checksum(native))
-        self.assertEqual(receipt["native_receipt"]["details"], json.loads(native.read_text()))
-        self.assertFalse((self.output / "mapping-startup.json").exists())
-
-    def test_diagnostic_driver_refuses_legacy_outer_report_without_nested_evidence(self):
-        receipt, _, _ = self.diagnostic_driver(native_legacy=True)
-        self.assertEqual(receipt["status"], "failed")
-        self.assertEqual(receipt["audit"]["status"], "passed")
-        self.assertFalse(receipt["cleanup_confirmed"])
-        self.assertNotIn("native_receipt", receipt)
-        self.assertTrue((self.output / "mapping-startup.json").is_file())
-        self.assertFalse((self.output / "native-evidence").exists())
-
-    def test_diagnostic_driver_nested_report_rejects_changed_original_failure(self):
-        receipt, _, _ = self.diagnostic_driver(native_override={"initial_inventory_error": "different original failure"})
-        self.assertEqual(receipt["status"], "failed")
-        self.assertIn("native startup receipt differs from the admitted cold evidence", receipt["errors"])
-        self.assertEqual(receipt["prerequisite"]["cold_failure"], self.cold[-1]["error"])
-
-    def test_diagnostic_driver_never_launches_for_foreign_prerequisite(self):
-        receipt, calls, _ = self.diagnostic_driver(invalid_prior=True)
-        self.assertEqual(receipt["status"], "failed")
-        self.assertEqual(calls, [])
-        self.assertFalse((self.output / "mapping-startup-config.json").exists())
-
-    def test_diagnostic_driver_preserves_early_go_failure_receipt(self):
-        receipt, calls, _ = self.diagnostic_driver(early_error="go version failed")
-        self.assertEqual(receipt["status"], "failed")
-        self.assertEqual(calls, [["go", "version"]])
-        self.assertIn("go version failed", receipt["errors"])
-        self.assertFalse(receipt["cleanup_confirmed"])
-
-    def test_diagnostic_driver_missing_native_receipt_keeps_cleanup_unknown(self):
-        receipt, _, _ = self.diagnostic_driver(native_missing=True)
-        self.assertEqual(receipt["status"], "failed")
-        self.assertEqual(receipt["audit"]["status"], "passed")
-        self.assertFalse(receipt["cleanup_confirmed"])
-
-    def test_diagnostic_driver_records_unknown_checker_cleanup_before_termination(self):
-        receipt, _, job = self.diagnostic_driver(unknown_job=True)
-        self.assertEqual(receipt["status"], "aborted")
-        self.assertFalse(receipt["cleanup_confirmed"])
-        self.assertIn("unconfirmed live descendants", receipt["abort_cause"])
-        job.terminate.assert_called_once()
-        job.close_success.assert_not_called()
-
-    def test_workflow_diagnostic_follows_only_the_failed_cold_step(self):
-        workflow = (checks.ROOT / ".github/workflows/native-current-authority.yml").read_text()
-        cold = workflow.index("id: current_smb_cold")
-        diagnostic = workflow.index("if: ${{ failure() && steps.current_smb_cold.outcome == 'failure' }}")
-        upload = workflow.index("name: Preserve first observations")
-        self.assertLess(cold, diagnostic)
-        self.assertLess(diagnostic, upload)
-        self.assertIn("--output .tmp/native-current-authority-fixture/unit-windows/mapping-startup", workflow)
-        self.assertIn("timeout-minutes: 15", workflow)
-        self.assertNotIn("continue-on-error", workflow)
-        self.assertNotIn("timeout-minutes:", workflow[diagnostic:upload])
+    def test_ordinary_driver_refuses_empty_wrong_skipped_missing_failed_or_changed_sources(self):
+        for failure in ("empty-inventory", "wrong-root", "skip", "missing-verdict", "fail", "source-change"):
+            with self.subTest(failure=failure):
+                calls, receipt = self.ordinary_driver(failure=failure)
+                self.assertIsNone(receipt)
+                self.assertEqual(len(calls), 2 if failure == "empty-inventory" else 4 if failure == "source-change" else 3)
 
 
 if __name__ == "__main__":

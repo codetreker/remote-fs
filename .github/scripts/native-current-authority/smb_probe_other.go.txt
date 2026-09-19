@@ -5,8 +5,13 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 )
 
 func runSMBPhase(context.Context, options) (receipt, error) {
 	return receipt{}, errors.New("current SMB cold and cleanup phases require native Windows")
+}
+
+func runMappingHelper([]string, io.Reader, io.Writer) error {
+	return errors.New("mapping helper requires native Windows")
 }

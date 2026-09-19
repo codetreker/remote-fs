@@ -153,247 +153,139 @@ the server's startup log.
 
 ## Current SMB cold phase
 
-The Windows probe publishes one nonce-named share through the current `smb.Server`,
-SSPI authenticator and exact current-SID authorizer. Its backend is the current
-HTTP FileStorage pointing to the same Linux authority; no pinned SMB prototype,
-legacy dispatcher or memory authority is used. The canonical volume key stays
-`fixture-current`, independent of the share alias. The seed's original HTTP
-references are already closed; SMB creates its own FileSession and references.
+The Windows probe publishes one nonce-named share through the current SMB server,
+SSPI and exact current-SID authorizer. Its current HTTP FileStorage reaches the
+same Linux authority and immutable seed; no pinned prototype or memory authority
+is substituted. The canonical volume key remains `fixture-current`.
 
-A free drive is selected from current SMB, DOS-device and logical-drive inventories.
-The private intent ledger is written before `New-SmbMapping`. The mapping uses a
-loopback alternate TCP port, required integrity, no saved credentials and no
-persistent/global mapping. Windows 11 24H2+ and an elevated host are checked.
-The observed drive, remote share, port, SID/logon identity and DOS-device binding
-must match the ledger; no existing mapping is adopted or removed. Mapping commands
-remain descendants of the existing owned Job.
+CurrentSMBCold is supported only in a fresh isolated GitHub-hosted Windows ARM64
+job, with this fixture as the sole mapping-mutating actor in its logon. The driver
+requires GitHub Actions, github-hosted runner context, exact run/attempt identity
+and the canonical artifact directory. The workflow passes runner context at the
+cold step. Manual/shared-logon and self-hosted execution are refused. These checks
+state the supported host conditions; they cannot attest to arbitrary external
+actors or coordinate unrelated checkout roots.
 
-The first call is ordinary synchronous `CreateFileW(OPEN_EXISTING, GENERIC_READ)`
-with read/write/delete sharing and `FILE_ATTRIBUTE_NORMAL`. The same HANDLE supplies
-Basic, Standard and FileIdInfo, exact file bytes and EOF, then FileIdInfo again.
-Basic times and attributes match the captured seed; Standard matches logical EOF
-and the current 512-byte dense virtual allocation. The complete native volume/128-bit
-file-ID tuple is opaque: only repeat stability on this HANDLE is required, with no
-nonzero or numeric-equality rule tying it to NodeID. A cold result becomes successful
-only after the HANDLE, mapping, SMB server/export and HTTP connections close cleanly.
-The first error is retained without an alternate API, flag, reseed or retry.
+The existing source-bound probe executable runs its own one-shot native mapping
+helper through the same Windows Job owner. One bounded JSON+LF request (at most
+4 KiB) and one final frame replace the mapping interpreter. The helper does not
+wait for EOF or start another executable. Non-Windows builds refuse this mode.
+The envelope binds action, run/source/nonce/volume/sequence, exact state identity,
+SID/AuthenticationId and selected drive/UNC/port; the reply also binds the request
+digest and actual owner. Missing, foreign, malformed or oversized final mutation
+frames remain unknown. Exit zero alone cannot supply a missing result.
 
-A bounded transparent SMB/HTTP observer requires a fresh current CREATE and READ
-bound to the seeded authority object. It validates SessionID/TreeID and related
-compound allocation lineage; unsupported async traffic is refused explicitly.
-Actual QUERY_INFO and QFid encodings are checked against their correlated backend
-identity only when observed. Native APIs may use captured CREATE metadata, so no
-missing wire query is manufactured. Backend NodeID, SMB open FileID, wire fields
-and opaque native identity remain separate observations. Tokens, keys and file
-contents are excluded from the trace; content verification records digests.
+The helper validates its immediate kill-on-close/non-breakaway Job and primary
+token, canonical executable/root/state paths, private ACLs and matching claim plus
+pending ledger before a mutation. One four-second context covers launch, all API
+pages/calls and result processing for each Snapshot/Create/Remove. The probe's
+24-second context, controller's 30-second watchdog, recovery's separate 30-second
+total and existing Job cleanup budgets remain. Killing a blocked helper confirms
+local process exit, not provider cancellation or rollback.
 
-SMB I/O is bounded at 64 KiB and frames at 128 KiB; HTTP bodies are 1 MiB.
-The shared native-result pool is 8 MiB with MaxOpens/MaxRequests still 16. It covers
-the 4,867,072-byte maximum of sixteen fixed Standard-state reservations; metadata
-admission must not consume the wire/data frame allowance. Exhaustion still refuses
-before effects. Unsupported commands/classes remain recorded first failures,
-not a reason to switch to the prototype or expand backend facts.
+Creation resolves the system MPR WNetAddConnection4W export only. It requests a
+DISK resource at the exact selected drive and nonce loopback UNC, NULL auth with
+length zero, and CONNECT_REQUIRE_INTEGRITY only. The one 24-byte SDK transport
+option specifies Wsk and the owned TCP port; QUIC/RDMA ports, certificate-skip,
+reserved bytes and padding stay zero. Profile/global/interactive/credential-save
+flags remain clear. The encoding is host ABI, not network byte order.
 
-The cold probe retains the existing 30-second execution watchdog and owned-child
-cleanup. Once child quiescence is confirmed, abnormal completion may invoke
-`current-smb-cleanup` sequence 2 against the same immutable seed and ledger.
-This has a separate total 30-second recovery budget, including the existing Job
-cleanup allowance. Unknown child quiescence blocks mapping recovery. The helper
-removes only an exact owned mapping, confirms absent rows/devices, and refuses a
-mismatch. Recovery preserves the original failed result. Ordinary success closes
-the native HANDLE, removes the mapping, calls Shutdown, joins Serve, Unpublishes
-the export, closes idle HTTP connections and verifies remote/local cleanup.
+Acceptance of this SDK option record by the selected WNet4 provider is unproved.
+The first native run must bind the exact API/flags/options/status and actual
+signed traffic on the owned listener. Requested integrity or a copied port is not
+that observation. Missing export, unsupported options, authentication failure,
+wrong traffic or any API failure fails the run without another creation API,
+PowerShell/CIM/CLI fallback, implicit port 445 retry or setting change.
 
-[The source-bound run 35456649233](https://github.com/codetreker/remote-fs/actions/runs/35456649233)
-on `00e2f4291c8033a7b2dc0c0773731d5a0b920523` reached after-utility and
-before-json in the original inventory process, then failed at 4012 ms without
-after-json or catch-entry. Manifest preparation took 4.7423 ms within the same
-four-second context. Later identical inventory scripts passed in 2665/867 ms;
-exact-name discovery failed at 4020 ms and the separate import/parse control
-passed in 459 ms. These later results have different VM load and warming context.
+Inventory combines complete WNet connected-DISK enumeration, all 26 DOS/logical
+observations and WNetGetConnectionW for each drive. NOT_CONNECTED is distinct
+from CONNECTION_UNAVAIL; unavailable drives are occupied/unusable. A free drive
+has no connected row, DOS target or logical bit and an exact not-connected lookup.
+An enumerated local row must agree with its successful lookup. Other errors and
+inconsistent or incomplete snapshots fail; they never become an empty inventory.
 
-Utility import returned in the measured process, but this does not establish a
-try/assignment scope defect, actual command shadowing or the sole timeout cause.
-The candidate below binds the retained exported cmdlet object directly. Its first
-changed-source cold run must still prove mapping, native file behavior and full
-cleanup; it has not run natively. Prior cold failures and cache gates remain.
+Enumeration uses a fixed aligned 1 MiB buffer, at most 128 total entries and 129
+calls including a nonzero terminal probe. MORE_DATA, invalid pointers/counts or
+no-progress success fail; only NO_MORE_ITEMS completes enumeration. Used strings
+are copied while bounded by the buffer and existing 1024-byte row-field limit.
+Lookup uses 1025 UTF-16 units. The enumeration handle is always closed, with close
+errors retained. This native setup evidence deliberately does not reproduce CIM
+Status==OK or prove data-path health.
 
-Mapping failures retain a bounded diagnostic after the owned child is finished
-and all three I/O workers join. It records action, actual PID when available,
-pre-cleanup exit observation, elapsed time and input-write progress/error. Each
-stdout/stderr prefix is at most 2 KiB, base64 encoded with observed byte count and
-truncation state; the diagnostic stays below 16 KiB and supplements the original
-error chain. Fixed stderr stage markers cover entry, request read/parse, owner,
-module and inventory; stdout retains its single result JSON. The 1 MiB stream
-limit applies through `io.Copy` as well as direct Write calls. Missing prefix
-bytes do not prove a stage never began, and a prefix is not complete output.
+A protected owner directory directly under the canonical fixture root consumes
+one attempt for the SID/AuthenticationId. Its exclusive immutable synced claim
+binds the run and supported host context. An existing directory blocks another
+cold admission even after a clean run or partial initialization; it is never
+adopted, reset or deleted. The owner lock protects the existing mutable per-run
+ledger. Only exact same-attempt cleanup may re-enter. The claim and ledger remain
+uploaded evidence.
 
-Between after-readline and before-json, bounded observations record the existing
-ReadLine string's null/empty/value state, UTF-16 and re-encoded UTF-8 lengths and
-SHA256 without changing the string. Parent `input_line_bytes`/`input_line_sha256`
-exclude LF; the original framed input fields remain separate. Child observation
-refuses more than 4096 UTF-16 units or 12288 UTF-8 bytes before allocating the
-encoded array and does not invent a digest on refusal. Effective process values
-for the same three environment names are read once through .NET, with state,
-UTF-16 length and at most 96 bytes of base64 prefix. They are distinct from both
-parent inheritance and configured child input, and do not prove module selection.
+Create and remove each persist pending before their sole dispatch. Only a
+complete bound final frame can establish not-invoked or an API return; terminal
+knowledge is saved under the owner lock. Replacement may publish terminal bytes
+and still return an error, so readback is not the caller's persistence acknowledgement.
+Any mutable-ledger write, sync, close or replacement error, including an observational
+Save, irrevocably revokes live removal authority. A complete success frame does not
+cancel independent deadline, exit, stream or cleanup errors and does not prove all
+provider work has stopped.
 
-Catch first saves the original ErrorRecord. Before error JSON serialization it
-emits catch-entry and bounded origin/type/error-ID facts with at most 64-byte
-prefixes. Input/environment observation failures keep their own stage and stop
-operation; observation of an already-caught error is secondary and the original
-serialization/exit-one path still uses the saved ErrorRecord. Missing completion
-cannot become success. Fixed begin/end/failure markers distinguish observation
-work from the existing operation markers; request text, full environment values
-and additional exception messages are not emitted.
+Unknown create/remove is sticky quarantine: no further mapping mutation, replay
+or force retry is allowed. A visible row or later absence cannot clear it. Local
+server/process/disk cleanup and read-only evidence may finish, then the isolated
+runner is discarded. Missing/corrupt ledger is not no-dispatch evidence. Initial
+read-only failure still consumes the claim. A new run directory under the same
+root/logon cannot bypass this state.
 
-The maximum-branch formatter projection, including existing markers and CRLF,
-is bounded at 2040 bytes with the Utility markers, within the existing 2048-byte
-captured prefix. PowerShell's own extra error
-output may still be truncated. Observer work consumes the same four seconds;
-framework initialization and console writes have no separate latency guarantee.
-The mapping script retains the JSON pipeline, SmbShare import, mapping operations,
-environment and stdin/owner behavior. The explicit Utility import is described
-above; its observers add no discovery or prewarming call.
+Only the original live attempt can hold nonserializable authority for its sole
+normal removal. It requires validated create API NO_ERROR, caller-acknowledged
+successful persistence of that result, confirmed helper Job quiescence and joined
+streams. A terminal-looking ledger or complete success frame alone is insufficient.
+Read-only snapshot failure may leave this live authority intact, but removal still
+requires a freshly loaded complete matching ledger and fresh resource/baseline checks.
 
-Ordinary mapping commands and diagnostic inventory cells share one prepared
-execution path. Within their existing four-second context, it verifies the fixed
-System32 Utility manifest using non-reparse/regular-file checks and a bounded
-1 MiB read, preserving stat/read/hash/close errors. It does not prepare Utility
-in backend construction or start a fresh deadline before launch. The verified
-absolute path is embedded as a base64 literal in the mapping script.
+Consume the authority before attempting removal-pending publication or dispatch.
+It cannot be retried, serialized or reconstructed after exit or any persistence
+error. Then the selected drive may be passed to WNetCancelConnection2W with flags 0
+and force FALSE. Success still requires API success, complete subsequent
+row/lookup/DOS/logical absence and unchanged baseline. Cleanup-only re-entry is
+always read-only for mappings, even when terminal success bytes or absence are
+visible. It is failure-path recovery, not a step after verified normal cold success.
+Observed absence cannot prove the prior caller's Save acknowledgement or settled
+removal, so unproved recovered state remains an error/quarantine. It can report
+current observations and local process/disk cleanup, not restore mutation authority
+or clear original uncertainty. The public removal API has no generation
+compare, so the fresh exclusive-logon condition matters.
 
-After the existing input/environment observations, Core-qualified Import-Module
-loads that manifest with PassThru into a local array. after-utility remains directly
-after import returns. Require exactly one PSModuleInfo named
-Microsoft.PowerShell.Utility, then its exact ExportedCmdlets['ConvertFrom-Json']
-entry: a non-null CmdletInfo with the expected name and Cmdlet kind. Invalid output
-fails before JSON invocation; no name lookup, alias following or fallback supplies
-a replacement object.
+The unchanged file oracle makes its first ordinary synchronous CreateFileW on the
+sentinel, then uses the same HANDLE for Basic, Standard, FileIdInfo, bytes/EOF and
+repeated opaque identity. It requires stability on that HANDLE, not a nonzero or
+NodeID-equal value. Actual current CREATE/READ, HTTP retained-reference origin,
+owned listener, authentication/signing and observed QUERY_INFO/QFid lineage remain
+mandatory. No missing query is manufactured from a native API result. One object
+does not prove replacement identity, native writes, directories or warm-cache
+visibility.
 
-The original ReadLine string is still piped by value, now to the retained object:
-`$request = $requestLine | & $jsonCommand`. Capturing import output keeps it off
-stdout. before-json means the module/export guards passed; after-json means the
-object-bound pipeline returned. This selects the exported command object, not a
-file hash/signature for its dependencies or proof of the original timeout cause.
-No Force, Get-Command, extra process, prewarming or retry is added. SmbShare import,
-mapping operations, input/EOF policy, environment, owner and saved-error handling
-remain unchanged. The same 2040-byte synthetic formatter projection remains within
-the 2048-byte prefix; there is no new marker, field or deadline.
+SMB I/O remains 64 KiB, frames 128 KiB and HTTP bodies 1 MiB. The shared native
+result pool remains 8 MiB with MaxOpens/MaxRequests 16. Success also requires owned
+HANDLE/mapping/server/Serve/export/HTTP and remote-reference cleanup; first errors
+and unsupported classes are retained. A mapping row or requested option cannot
+replace this complete cold oracle or the separate one-second cache requirement.
 
-Optional preparation facts describe the on-disk path, size/read count, digest,
-duration and checked cleanup, not loaded dependency bytes or code identity. A
-preparation failure has no invented PID, launch, input/script or worker facts.
-File cleanup and process cleanup are combined truthfully: a failed Close cannot
-be confirmed clean merely because no child started. Import, export-property or invocation failure retains the
-saved ErrorRecord and original failure path. The same four-second deadline covers
-preparation, startup, import and the command; synchronous work has no new latency
-guarantee.
+The retired interpreter path remains historical evidence.
+[Its last first run 35459298859](https://github.com/codetreker/remote-fs/actions/runs/35459298859)
+on `58d1663c19d675817d25154be8e35e6a35726c03` failed initial inventory at
+4010 ms with zero stdout/stderr and no observed entry, despite the recorded system
+ARM64 executable, resume count 1 and 219 input bytes written. Later object-bound
+inventory controls passed in 3793/947 ms, discovery failed in 4020 ms and the
+import/parse control passed in 480 ms. The original import/object/native-file stage
+was not observed; this is not a diagnosis of binding or parser failure. Later
+post-VM/warmed controls do not erase it.
 
-The Windows owner records CreateProcess, Job assignment and ResumeThread timings
-and errors. ResumeThread must return the previous suspend count 1. The retained
-original process handle supplies the actual image path and process/native machine
-values before the sole waiter can close it. These synchronous queries are not
-context-cancellable. Image hashing and PE inspection occur after the experiment
-and describe the on-disk file then, not every byte loaded by an earlier child.
-
-[Startup diagnostics](mapping_startup_diagnostic_windows_test.go.txt) run only
-after the actual cold attempt has failed and saved source/run/nonce-bound evidence
-qualifies an initial inventory command timeout, no mapping/SMB/native effects,
-and settled cleanup with all started workers joined. The original first error
-line must be exactly `context deadline exceeded`. Both streams may contain valid
-bounded captures: canonical base64 for exactly min(observed bytes, 2048) prefix
-bytes and a matching truncation flag. Contents cannot grant successful mapping;
-partial or unknown stage text remains unclassified. Original input/script facts,
-when present, must match; unavailable facts remain unavailable. Manifest keys are
-strict POSIX-relative paths produced on both platforms, with exact hashes and no
-separator fallback. The tagged test is absent from normal unit and production
-catalogs. Six sequential cells each run once, with an explicit kind and expected
-result. Entry cells 1–2 and controls 5–6 retain their scripts and input policies.
-Inventory cells 3–4 use the same repaired prepared executor as ordinary mapping,
-with their existing open/EOF policies and newly bound script hashes. Controls 5–6
-are:
-
-- `05_resolve_json_command`: Core-qualified Get-Command selects the exact
-  ConvertFrom-Json name without All or a command-type filter. It requires one
-  Cmdlet result and records that target's implementing type/assembly/MVID and
-  nullable module facts. Alias, Function, missing or multiple results fail without
-  following or invoking another target. Success is the fixed `resolve-ok` JSON
-  literal, not JSON parsing.
-- `06_import_utility_parse`: after cell 5 has settled, prepare the verified
-  System32 Utility manifest and Core-qualified Import-Module it by absolute path,
-  with PassThru and without Force. Require one expected module, inspect its exact
-  exported ConvertFrom-Json cmdlet, then execute the unchanged unqualified JSON
-  pipeline. The fixed `import-parse-ok` result proves its return, not that lookup
-  selected the recorded export or that the full request was validated.
-
-Cell 6's same four-second deadline begins before manifest preparation. Existing
-non-reparse/regular-file checks and a bounded 1 MiB read record its on-disk size
-and SHA256, with read/close errors retained. Cell 6 still prepares its own diagnostic script only at that ordinal; entry and
-resolution cells do not require this file. Ordinary mapping and inventory cells
-perform their own shared preparation. Synchronous file calls are not claimed
-interruptible. A known no-process preparation failure
-has no invented PID; unknown cleanup stops admission. No fallback script or import
-by name is used.
-
-Both new cells retain the inventory input, open stdin, executable, arguments,
-per-child environment and owner. Discovery/autoload and imports can run module
-code and perform I/O; these are active post-failure experiments. Provenance is
-bounded nullable metadata, not loaded-code hashes, signatures or proof of the
-original command selection. Fixed control results and errors use Console/.NET
-without JSON serialization; errors keep their original record and exit one even
-if reporting also fails. Generated maximum-branch records project 2008 bytes
-within the unchanged 2048-byte prefix; engine output may still be truncated.
-
-EOF in the original EOF cells follows one complete successful write and is closed
-once by the same owner used by Finish. Short writes and close errors fail. Every
-cell retains the four-second command budget and existing owned cleanup; successful
-later controls cannot erase earlier failures. Cell 5 timed out and cell 6 passed
-in the source-bound run above; neither result validates the repaired cold path.
-
-Mapping PowerShell children use an explicit Unicode environment block through
-the existing process owner. A private snapshot removes case-insensitive copies
-of PSModulePath and PSModuleAnalysisCachePath, then supplies the verified
-System32 WindowsPowerShell/v1.0/Modules root and NUL. Other entries, including
-drive-current-directory entries, are preserved. The parent environment is never
-mutated; ordinary Start retains inheritance and other children are unchanged.
-The module root shares the existing verified system PowerShell home and must be
-an existing local directory without a reparse ancestor. Invalid input fails
-before launch. Script, flags, stdin policy and the four-second deadline stay the
-same. Windows PowerShell may reconstruct its runtime search path; configured
-input does not prove a system-only path, actual command resolution or the sole
-cause of the earlier timeout.
-
-At the explicit delegated Start, the diagnostic observer records only
-PSModulePath, WinPSModulePath and PSModuleAnalysisCachePath, separately labeled
-parent-inherited values and configured child input. Presence, UTF-8 length,
-SHA256, at most 4096 prefix bytes encoded as base64 and truncation remain separate
-facts; absent values are not invented. It delegates once to the same owner and
-does not expose other environment entries. These later facts cannot reconstruct
-the earlier cold process's unrecorded environment.
-
-The tagged report is capped at 1 MiB including LF and written only to
-`OUTPUT/native-evidence/mapping-startup.json`. Go exclusively creates that fixed
-protected child directory, creates the file exclusively and seals it before
-payload write, sync and close. The checker reads the same fixed nested path.
-An existing child/file is refused without adoption or truncation; the outer
-checker's ACL stays unchanged. Every write/sync/close error remains visible and
-created evidence remains on failure. Command capture and executor bounds are
-unchanged. The source-bound native run above verified the private writer and
-Go-child delivery; it did not establish cold or cache acceptance.
-
-Each cell joins its process and three workers before the next; unknown Job
-quiescence stops further launches. The cells record their order, actual creation
-count, request/script hashes, launch facts, capture and cleanup. No create/remove,
-intent ledger, mapping change or target-file operation is requested by these
-control scripts; module discovery/import may have its own side effects. The original cold
-failure remains failed even if later cells succeed. The experiment runs after VM
-shutdown and SMB cleanup attempts, under different load; later cells may be warmed
-by earlier launches. Its results cannot alone identify the original cold cause.
-The 120-second test and 15-minute job limits remain unchanged. The measured
-four-cell results belong to their exact source and environment.
-A local PowerShell 7 held-open/EOF success establishes only that local behavior;
-neither observation proves a timeout repair.
+The PowerShell mapping suite/tag and automatic post-failure controls are retired.
+PowerShell still drives the existing Windows harness; it is not a mapping fallback.
+The WNet4 provider/options pairing and changed-source cold path have not run
+natively. Historical HTTP lifecycle proof and native helper units do not supply
+that missing acceptance.
 
 ## Local Linux validation
 

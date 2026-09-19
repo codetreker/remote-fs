@@ -49,7 +49,29 @@ function Assert-NoReparse([string] $Path) {
         $item = $parent
     }
 }
+function Assert-CurrentSMBColdContext(
+    [string] $Repository,
+    [string] $Artifact,
+    [string] $Identity,
+    [Collections.IDictionary] $Environment
+) {
+    if ($Environment['GITHUB_ACTIONS'] -cne 'true' -or $Environment['RFS_FIXTURE_RUNNER_ENVIRONMENT'] -cne 'github-hosted') {
+        throw 'CurrentSMBCold requires a fresh GitHub-hosted Actions job as the sole mapping owner in this logon.'
+    }
+    $run = $Environment['GITHUB_RUN_ID']
+    $attempt = $Environment['GITHUB_RUN_ATTEMPT']
+    if ($run -cnotmatch '\A[1-9][0-9]*\z' -or $attempt -cnotmatch '\A[1-9][0-9]*\z' -or $Identity -cne "$run-$attempt") {
+        throw 'CurrentSMBCold RunId must equal the current GitHub run ID and attempt.'
+    }
+    $expectedArtifact = [IO.Path]::GetFullPath([IO.Path]::Combine($Repository, '.tmp', 'native-current-authority-fixture', 'artifact'))
+    if (-not [string]::Equals($Artifact, $expectedArtifact, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'CurrentSMBCold requires the canonical .tmp/native-current-authority-fixture/artifact directory.'
+    }
+}
 Assert-NoReparse $artifact
+if ($CurrentSMBCold) {
+    Assert-CurrentSMBColdContext -Repository $repo -Artifact $artifact -Identity $RunId -Environment ([Environment]::GetEnvironmentVariables('Process'))
+}
 $manifest = Get-Content -LiteralPath (Join-Path $artifact 'manifest.json') -Raw | ConvertFrom-Json
 if ($manifest.format -ne 1 -or $manifest.source_sha -ne $sourceSha -or $manifest.source_tree_sha -ne $treeSha -or $manifest.source_dirty) {
     throw 'Artifact does not belong to this clean checkout.'

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -15,7 +16,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -53,13 +56,17 @@ type mappingOwner struct {
 type mappingRow struct {
 	LocalPath  string `json:"local_path"`
 	RemotePath string `json:"remote_path"`
-	Status     string `json:"status"`
+}
+type mappingConnection struct {
+	Status     uint32 `json:"status"`
+	RemotePath string `json:"remote_path"`
 }
 type mappingSnapshot struct {
-	Owner         mappingOwner        `json:"owner"`
-	Rows          []mappingRow        `json:"rows"`
-	Devices       map[string][]string `json:"dos_devices"`
-	LogicalDrives uint32              `json:"logical_drives"`
+	Owner         mappingOwner                 `json:"owner"`
+	Rows          []mappingRow                 `json:"rows"`
+	Connections   map[string]mappingConnection `json:"connections"`
+	Devices       map[string][]string          `json:"dos_devices"`
+	LogicalDrives uint32                       `json:"logical_drives"`
 }
 type mappingLedger struct {
 	Version          int             `json:"version"`
@@ -81,7 +88,22 @@ type mappingLedger struct {
 	Baseline         mappingSnapshot `json:"baseline"`
 	ObservedRow      *mappingRow     `json:"observed_row,omitempty"`
 	ObservedDevice   []string        `json:"observed_dos_device,omitempty"`
+	CreateOutcome    mappingMutation `json:"create_outcome"`
+	RemoveOutcome    mappingMutation `json:"remove_outcome"`
 }
+type mappingMutation struct {
+	Knowledge      string  `json:"knowledge"`
+	Code           *uint32 `json:"api_status,omitempty"`
+	HelperQuiesced bool    `json:"helper_quiesced"`
+}
+type mappingOutcomeError struct {
+	Cause   error
+	Outcome mappingMutation
+}
+
+func (e *mappingOutcomeError) Error() string { return e.Cause.Error() }
+func (e *mappingOutcomeError) Unwrap() error { return e.Cause }
+
 type mappingFacts struct {
 	Ledger          string       `json:"ledger"`
 	Owner           mappingOwner `json:"owner"`
@@ -101,11 +123,14 @@ type mappingLedgerStore interface {
 	Save(mappingLedger) error
 }
 type ownedSMBMapping struct {
-	options options
-	path    string
-	ledger  mappingLedger
-	backend mappingBackend
-	store   mappingLedgerStore
+	options           options
+	path              string
+	ledger            mappingLedger
+	backend           mappingBackend
+	store             mappingLedgerStore
+	removeAuthority   bool
+	publicationFailed bool
+	liveAttempt       bool
 }
 
 func (m *ownedSMBMapping) LocalPath() string { return m.ledger.LocalPath }
@@ -152,15 +177,19 @@ func checkMappingSnapshot(snapshot mappingSnapshot) error {
 	if snapshot.LogicalDrives&^uint32((1<<26)-1) != 0 {
 		return errors.New("logical-drive inventory contains undefined bits")
 	}
-	if len(snapshot.Rows) > mappingRowLimit || len(snapshot.Devices) != 26 {
+	if snapshot.Rows == nil || len(snapshot.Rows) > mappingRowLimit || len(snapshot.Devices) != 26 || len(snapshot.Connections) != 26 {
 		return errors.New("mapping inventory exceeds bounds or lacks all DOS drives")
 	}
 	used := map[string]bool{}
 	for _, row := range snapshot.Rows {
-		if len(row.LocalPath) > 1024 || len(row.RemotePath) > 1024 || len(row.Status) > 128 || row.RemotePath == "" || row.Status == "" {
+		if len(row.LocalPath) > 1024 || len(row.RemotePath) > 1024 || row.RemotePath == "" {
 			return errors.New("mapping row is malformed")
 		}
 		if row.LocalPath != "" {
+			connection, ok := snapshot.Connections[row.LocalPath]
+			if !ok || connection.Status != 0 || connection.RemotePath != row.RemotePath {
+				return errors.New("enumerated mapping differs from its local-name lookup")
+			}
 			key := strings.ToUpper(row.LocalPath)
 			if used[key] {
 				return errors.New("mapping inventory contains duplicate drive rows")
@@ -170,6 +199,11 @@ func checkMappingSnapshot(snapshot mappingSnapshot) error {
 	}
 	for letter := 'A'; letter <= 'Z'; letter++ {
 		name := string(letter) + ":"
+		connection, ok := snapshot.Connections[name]
+		if !ok || (connection.Status != mappingNoError && connection.Status != mappingNotConnected && connection.Status != mappingConnectionUnavailable) ||
+			(connection.Status == 0 && (connection.RemotePath == "" || len(connection.RemotePath) > 1024)) || (connection.Status != 0 && connection.RemotePath != "") {
+			return errors.New("connection lookup inventory is incomplete or malformed")
+		}
 		targets, ok := snapshot.Devices[name]
 		if !ok || len(targets) > 32 {
 			return errors.New("DOS drive inventory is incomplete or too large")
@@ -189,7 +223,7 @@ func chooseMappingDrive(snapshot mappingSnapshot) (string, error) {
 	}
 	for letter := 'Z'; letter >= 'D'; letter-- {
 		drive := string(letter) + ":"
-		if snapshot.LogicalDrives&(1<<uint(letter-'A')) != 0 || len(snapshot.Devices[drive]) != 0 {
+		if snapshot.LogicalDrives&(1<<uint(letter-'A')) != 0 || len(snapshot.Devices[drive]) != 0 || snapshot.Connections[drive].Status != mappingNotConnected {
 			continue
 		}
 		free := true
@@ -232,6 +266,9 @@ func preserveMappingBaseline(ledger mappingLedger, now mappingSnapshot) error {
 		if !reflect.DeepEqual(targets, now.Devices[drive]) {
 			return errors.New("a baseline DOS device changed")
 		}
+		if ledger.Baseline.Connections[drive] != now.Connections[drive] {
+			return errors.New("a baseline local-name connection changed")
+		}
 	}
 	return nil
 }
@@ -255,23 +292,27 @@ func beginSMBMapping(ctx context.Context, o options, share string, port uint16, 
 	if row, err := matchingRows(baseline, drive, remote); err != nil || row != nil {
 		return nil, errors.Join(errors.New("mapping baseline already contains the requested identity"), err)
 	}
-	ledger := mappingLedger{Version: 1, RunID: o.RunID, SourceSHA: o.SourceSHA, Nonce: o.FixtureNonce, Volume: o.Volume, Sequence: o.Sequence, Owner: baseline.Owner, LocalPath: drive, RemotePath: remote, TCPPort: port, Transport: "TCP", RequireIntegrity: true, State: "intent", Baseline: baseline}
+	ledger := mappingLedger{Version: 2, RunID: o.RunID, SourceSHA: o.SourceSHA, Nonce: o.FixtureNonce, Volume: o.Volume, Sequence: o.Sequence, Owner: baseline.Owner, LocalPath: drive, RemotePath: remote, TCPPort: port, Transport: "TCP", RequireIntegrity: true, State: "intent", Baseline: baseline, CreateOutcome: mappingMutation{Knowledge: "pending"}, RemoveOutcome: mappingMutation{Knowledge: "none"}}
 	if err := store.Create(ledger); err != nil {
 		return nil, err
 	}
-	owned := &ownedSMBMapping{o, path, ledger, backend, store}
-	// An intent is recoverable ownership, never permission to resume a failed create.
+	owned := &ownedSMBMapping{options: o, path: path, ledger: ledger, backend: backend, store: store, liveAttempt: true}
 	if err := ctx.Err(); err != nil {
 		return owned, err
 	}
-	if err := backend.Create(ctx, ledger); err != nil {
-		return owned, err
+	createErr := backend.Create(ctx, ledger)
+	ledger.CreateOutcome = mappingMutationOutcome(createErr)
+	ledger.State = "quarantined"
+	if mappingMutationSucceeded(ledger.CreateOutcome) {
+		ledger.State = "create-returned"
 	}
-	ledger.State = "create-returned"
-	if err := store.Save(ledger); err != nil {
-		return owned, err
+	if saveErr := owned.save(ledger); saveErr != nil {
+		return owned, errors.Join(createErr, saveErr)
 	}
-	owned.ledger = ledger
+	owned.removeAuthority = mappingMutationSucceeded(ledger.CreateOutcome)
+	if createErr != nil {
+		return owned, createErr
+	}
 	now, err := backend.Snapshot(ctx)
 	if err != nil {
 		return owned, err
@@ -283,17 +324,42 @@ func beginSMBMapping(ctx context.Context, o options, share string, port uint16, 
 	if err != nil {
 		return owned, err
 	}
-	if row == nil || row.Status != "OK" || len(now.Devices[drive]) == 0 {
+	if row == nil || now.Connections[drive].Status != 0 || now.Connections[drive].RemotePath != remote || len(now.Devices[drive]) == 0 {
 		return owned, errors.New("mapping creation did not produce an exact connected row and DOS device")
 	}
 	ledger.State = "observed"
 	ledger.ObservedRow = row
 	ledger.ObservedDevice = append([]string(nil), now.Devices[drive]...)
-	if err := store.Save(ledger); err != nil {
+	if err := owned.save(ledger); err != nil {
 		return owned, err
 	}
-	owned.ledger = ledger
 	return owned, nil
+}
+
+func mappingMutationOutcome(err error) mappingMutation {
+	if err == nil {
+		code := uint32(0)
+		return mappingMutation{Knowledge: "returned", Code: &code, HelperQuiesced: true}
+	}
+	var outcome *mappingOutcomeError
+	if errors.As(err, &outcome) {
+		return outcome.Outcome
+	}
+	return mappingMutation{Knowledge: "unknown"}
+}
+
+func mappingMutationSucceeded(value mappingMutation) bool {
+	return value.Knowledge == "returned" && value.Code != nil && *value.Code == 0 && value.HelperQuiesced
+}
+
+func (m *ownedSMBMapping) save(ledger mappingLedger) error {
+	if err := m.store.Save(ledger); err != nil {
+		m.removeAuthority = false
+		m.publicationFailed = true
+		return err
+	}
+	m.ledger = ledger
+	return nil
 }
 
 func (m *ownedSMBMapping) cleanup(ctx context.Context) error {
@@ -312,55 +378,75 @@ func (m *ownedSMBMapping) cleanup(ctx context.Context) error {
 		return err
 	}
 	targets := now.Devices[m.ledger.LocalPath]
-	if row == nil {
-		if len(targets) != 0 || now.LogicalDrives&(1<<uint(m.ledger.LocalPath[0]-'A')) != 0 {
-			return errors.New("mapping row is absent but a DOS or logical drive remains; refusing device deletion")
-		}
-		if m.ledger.State == "intent" {
-			return errors.New("mapping create outcome is unknown; present absence does not prove provider quiescence")
-		}
-		m.ledger.State = "removed"
-		return m.store.Save(m.ledger)
+	absent := row == nil && len(targets) == 0 && now.LogicalDrives&(1<<uint(m.ledger.LocalPath[0]-'A')) == 0 && now.Connections[m.ledger.LocalPath].Status == mappingNotConnected
+	if m.publicationFailed {
+		return errors.New("mapping ledger publication failed; live removal authority is revoked")
 	}
-	if m.ledger.State == "removed" {
-		return errors.New("a mapping reappeared after confirmed removal; refusing adoption")
+	if !m.liveAttempt {
+		return errors.New("mapping cleanup reentry is readonly and cannot settle a prior failed attempt")
+	}
+	if !mappingMutationSucceeded(m.ledger.CreateOutcome) {
+		return errors.New("mapping creation is unresolved; provider effects remain quarantined")
+	}
+	if mappingMutationSucceeded(m.ledger.RemoveOutcome) {
+		if !absent {
+			return errors.New("mapping reappeared or remained after successful removal")
+		}
+		return nil
+	}
+	if !m.removeAuthority || m.ledger.RemoveOutcome.Knowledge != "none" {
+		return errors.New("mapping cleanup is readonly without live acknowledged removal authority")
+	}
+	if row == nil || len(targets) == 0 || now.Connections[m.ledger.LocalPath].Status != 0 || now.Connections[m.ledger.LocalPath].RemotePath != m.ledger.RemotePath {
+		return errors.New("normal removal lacks its fresh exact row, lookup and DOS binding")
 	}
 	if m.ledger.ObservedRow != nil && !reflect.DeepEqual(m.ledger.ObservedDevice, targets) {
-		return errors.New("mapping DOS device differs from its recorded binding")
+		return errors.New("mapping DOS binding changed before removal")
 	}
-	// Recovery can release an exact post-intent row, but cannot convert cold failure to success.
-	if m.ledger.ObservedRow == nil {
-		m.ledger.ObservedRow = row
-		m.ledger.ObservedDevice = append([]string(nil), targets...)
-		if err := m.store.Save(m.ledger); err != nil {
-			return err
-		}
-	}
-	if err := m.backend.Remove(ctx, m.ledger, *row); err != nil {
+	m.removeAuthority = false
+	ledger := m.ledger
+	ledger.ObservedRow = row
+	ledger.ObservedDevice = append([]string(nil), targets...)
+	ledger.RemoveOutcome = mappingMutation{Knowledge: "pending"}
+	ledger.State = "remove-pending"
+	if err := m.save(ledger); err != nil {
 		return err
+	}
+	removeErr := m.backend.Remove(ctx, ledger, *row)
+	ledger.RemoveOutcome = mappingMutationOutcome(removeErr)
+	ledger.State = "quarantined"
+	if mappingMutationSucceeded(ledger.RemoveOutcome) {
+		ledger.State = "remove-returned"
+	}
+	if saveErr := m.save(ledger); saveErr != nil {
+		return errors.Join(removeErr, saveErr)
+	}
+	if removeErr != nil {
+		return removeErr
 	}
 	after, err := m.backend.Snapshot(ctx)
 	if err != nil {
 		return err
 	}
-	if err := preserveMappingBaseline(m.ledger, after); err != nil {
+	if err := preserveMappingBaseline(ledger, after); err != nil {
 		return err
 	}
-	remaining, err := matchingRows(after, m.ledger.LocalPath, m.ledger.RemotePath)
+	remaining, err := matchingRows(after, ledger.LocalPath, ledger.RemotePath)
 	if err != nil {
 		return err
 	}
-	if remaining != nil || len(after.Devices[m.ledger.LocalPath]) != 0 || after.LogicalDrives&(1<<uint(m.ledger.LocalPath[0]-'A')) != 0 {
-		return errors.New("mapping removal did not clear its row and DOS device")
+	if remaining != nil || len(after.Devices[ledger.LocalPath]) != 0 || after.LogicalDrives&(1<<uint(ledger.LocalPath[0]-'A')) != 0 || after.Connections[ledger.LocalPath].Status != mappingNotConnected {
+		return errors.New("mapping removal did not clear all connection and drive observations")
 	}
-	m.ledger.State = "removed"
-	return m.store.Save(m.ledger)
+	ledger.State = "removed"
+	return m.save(ledger)
 }
 
 type diskMappingStore struct {
 	path     string
 	o        options
 	expected mappingLedger
+	publish  func(string, string) error
 }
 
 func mappingLedgerPath(o options) string {
@@ -368,7 +454,7 @@ func mappingLedgerPath(o options) string {
 }
 
 func validateMappingLedger(ledger mappingLedger, o options) error {
-	if ledger.Version != 1 || ledger.RunID != o.RunID || ledger.SourceSHA != o.SourceSHA || ledger.Nonce != o.FixtureNonce || ledger.Volume != o.Volume || ledger.Sequence == 0 || ledger.Sequence != o.Sequence {
+	if ledger.Version != 2 || ledger.RunID != o.RunID || ledger.SourceSHA != o.SourceSHA || ledger.Nonce != o.FixtureNonce || ledger.Volume != o.Volume || ledger.Sequence == 0 || ledger.Sequence != o.Sequence {
 		return errors.New("mapping ledger belongs to another run, source, nonce, volume or sequence")
 	}
 	if len(ledger.LocalPath) != 2 || ledger.LocalPath[0] < 'D' || ledger.LocalPath[0] > 'Z' || ledger.LocalPath[1] != ':' || ledger.RemotePath != `\\127.0.0.1\rfs-`+o.FixtureNonce || ledger.TCPPort == 0 {
@@ -377,8 +463,37 @@ func validateMappingLedger(ledger mappingLedger, o options) error {
 	if ledger.Transport != "TCP" || !ledger.RequireIntegrity || ledger.Persistent || ledger.Global || ledger.SaveCredentials {
 		return errors.New("mapping ledger arguments differ from private signed nonpersistent mapping")
 	}
-	if ledger.State != "intent" && ledger.State != "create-returned" && ledger.State != "observed" && ledger.State != "removed" {
+	if ledger.State != "intent" && ledger.State != "create-returned" && ledger.State != "observed" && ledger.State != "removed" && ledger.State != "remove-pending" && ledger.State != "remove-returned" && ledger.State != "quarantined" {
 		return errors.New("mapping ledger state is invalid")
+	}
+	for index, value := range []mappingMutation{ledger.CreateOutcome, ledger.RemoveOutcome} {
+		if value.Knowledge == "none" && index == 1 && value.Code == nil && !value.HelperQuiesced {
+			continue
+		}
+		if value.Knowledge != "pending" && value.Knowledge != "unknown" && value.Knowledge != "not-invoked" && value.Knowledge != "returned" {
+			return errors.New("mapping mutation knowledge is invalid")
+		}
+		if (value.Knowledge == "returned") != (value.Code != nil) || (value.Knowledge == "pending" && value.HelperQuiesced) {
+			return errors.New("mapping mutation knowledge has contradictory fields")
+		}
+	}
+	if (ledger.State == "create-returned" || ledger.State == "observed" || ledger.State == "remove-pending" || ledger.State == "remove-returned" || ledger.State == "removed") && !mappingMutationSucceeded(ledger.CreateOutcome) {
+		return errors.New("mapping resource state lacks successful creation")
+	}
+	if (ledger.State == "remove-returned" || ledger.State == "removed") && !mappingMutationSucceeded(ledger.RemoveOutcome) {
+		return errors.New("mapping resource state lacks successful removal")
+	}
+	if ledger.State == "intent" && (ledger.CreateOutcome.Knowledge != "pending" || ledger.RemoveOutcome.Knowledge != "none") {
+		return errors.New("mapping create intent has contradictory outcomes")
+	}
+	if (ledger.State == "create-returned" || ledger.State == "observed") && ledger.RemoveOutcome.Knowledge != "none" {
+		return errors.New("mapping pre-removal state contains a removal outcome")
+	}
+	if ledger.State == "remove-pending" && ledger.RemoveOutcome.Knowledge != "pending" {
+		return errors.New("mapping removal intent lacks a pending outcome")
+	}
+	if (ledger.State == "remove-pending" || ledger.State == "remove-returned" || ledger.State == "removed") && (ledger.ObservedRow == nil || len(ledger.ObservedDevice) == 0) {
+		return errors.New("mapping removal lacks its recorded row and DOS binding")
 	}
 	if err := checkMappingSnapshot(ledger.Baseline); err != nil {
 		return err
@@ -387,7 +502,7 @@ func validateMappingLedger(ledger mappingLedger, o options) error {
 		return errors.New("mapping ledger owner differs from its baseline")
 	}
 	letter := ledger.LocalPath[0]
-	if len(ledger.Baseline.Devices[ledger.LocalPath]) != 0 || ledger.Baseline.LogicalDrives&(1<<uint(letter-'A')) != 0 {
+	if len(ledger.Baseline.Devices[ledger.LocalPath]) != 0 || ledger.Baseline.LogicalDrives&(1<<uint(letter-'A')) != 0 || ledger.Baseline.Connections[ledger.LocalPath].Status != mappingNotConnected {
 		return errors.New("mapping ledger attempts to own a baseline DOS drive")
 	}
 	row, err := matchingRows(ledger.Baseline, ledger.LocalPath, ledger.RemotePath)
@@ -448,6 +563,9 @@ func decodeMappingJSON(data []byte, target any) error {
 	if len(data) > mappingByteLimit {
 		return errors.New("mapping JSON exceeds size limit")
 	}
+	if !utf8.Valid(data) {
+		return errors.New("mapping JSON is not valid UTF-8")
+	}
 	if err := uniqueMappingJSON(data); err != nil {
 		return err
 	}
@@ -461,6 +579,20 @@ func decodeMappingJSON(data []byte, target any) error {
 		return errors.New("mapping JSON must contain exactly one value")
 	}
 	return nil
+}
+
+func mappingRequiredFields(data []byte, names ...string) (map[string]json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil, err
+	}
+	for _, name := range names {
+		value, ok := fields[name]
+		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return nil, fmt.Errorf("mapping JSON omitted %s", name)
+		}
+	}
+	return fields, nil
 }
 
 func readMappingLedger(path string, o options) (mappingLedger, error) {
@@ -484,7 +616,7 @@ func readMappingLedger(path string, o options) (mappingLedger, error) {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return ledger, err
 	}
-	for _, name := range []string{"version", "run_id", "source_sha", "fixture_nonce", "volume", "sequence", "owner", "local_path", "remote_path", "tcp_port_argument", "transport_argument", "require_integrity_argument", "persistent_argument", "global_argument", "save_credentials_argument", "state", "baseline"} {
+	for _, name := range []string{"version", "run_id", "source_sha", "fixture_nonce", "volume", "sequence", "owner", "local_path", "remote_path", "tcp_port_argument", "transport_argument", "require_integrity_argument", "persistent_argument", "global_argument", "save_credentials_argument", "state", "baseline", "create_outcome", "remove_outcome"} {
 		value, ok := fields[name]
 		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
 			return ledger, fmt.Errorf("mapping ledger lacks %s", name)
@@ -494,18 +626,7 @@ func readMappingLedger(path string, o options) (mappingLedger, error) {
 }
 
 func writeMappingFile(file *os.File, ledger mappingLedger) error {
-	data, err := json.Marshal(ledger)
-	if err != nil {
-		return err
-	}
-	if len(data)+1 > mappingByteLimit {
-		return errors.New("mapping ledger exceeds size limit")
-	}
-	if err := makePrivateFile(file.Name()); err != nil {
-		return err
-	}
-	_, err = file.Write(append(data, '\n'))
-	return errors.Join(err, file.Sync())
+	return writeMappingJSONFile(file, ledger)
 }
 
 func (s *diskMappingStore) Create(ledger mappingLedger) error {
@@ -542,23 +663,38 @@ func (s *diskMappingStore) Save(ledger mappingLedger) error {
 	if err := errors.Join(writeMappingFile(file, ledger), file.Close()); err != nil {
 		return errors.Join(err, os.Remove(temporary))
 	}
-	from, err := windows.UTF16PtrFromString(temporary)
-	if err != nil {
-		return errors.Join(err, os.Remove(temporary))
+	publish := s.publish
+	if publish == nil {
+		publish = replaceMappingFile
 	}
-	to, err := windows.UTF16PtrFromString(s.path)
-	if err != nil {
-		return errors.Join(err, os.Remove(temporary))
-	}
-	if err := windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH); err != nil {
-		return errors.Join(err, os.Remove(temporary))
+	if err := publish(temporary, s.path); err != nil {
+		removeErr := os.Remove(temporary)
+		if errors.Is(removeErr, os.ErrNotExist) {
+			removeErr = nil
+		}
+		return errors.Join(err, removeErr)
 	}
 	s.expected = ledger
 	return nil
 }
 
-func lockMappingLedger(o options) (func() error, error) {
-	path := filepath.Join(filepath.Dir(o.StateFile), "smb-mapping.lock")
+func replaceMappingFile(temporary, path string) error {
+	from, err := windows.UTF16PtrFromString(temporary)
+	if err != nil {
+		return err
+	}
+	to, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	return windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
+}
+
+func lockMappingOwner(directory string) (func() error, error) {
+	if err := validatePrivateDirectory(directory); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(directory, "owner.lock")
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 	if errors.Is(err, os.ErrExist) {
 		if err := validatePrivateFile(path); err != nil {
@@ -586,15 +722,20 @@ func newSMBMapping(ctx context.Context, o options, share string, port uint16) (o
 	if err := mappingOptions(o); err != nil {
 		return nil, err
 	}
-	unlock, err := lockMappingLedger(o)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { resultErr = errors.Join(resultErr, unlock()) }()
 	backend, err := newNativeMappingBackend(o)
 	if err != nil {
 		return nil, err
 	}
+	native := backend.(*nativeMappingBackend)
+	directory := mappingOwnerDirectory(native.root, native.owner)
+	if err := createMappingClaim(directory, mappingExpectedClaim(o, native.owner, native.runner)); err != nil {
+		return nil, err
+	}
+	unlock, err := lockMappingOwner(directory)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, unlock()) }()
 	path := mappingLedgerPath(o)
 	return beginSMBMapping(ctx, o, share, port, backend, &diskMappingStore{path: path, o: o}, path)
 }
@@ -603,16 +744,28 @@ func (m *ownedSMBMapping) Cleanup(ctx context.Context) (resultErr error) {
 	if err := mappingOptions(m.options); err != nil {
 		return err
 	}
-	unlock, err := lockMappingLedger(m.options)
+	native, ok := m.backend.(*nativeMappingBackend)
+	if !ok {
+		return errors.New("mapping cleanup lacks its native owner context")
+	}
+	directory := mappingOwnerDirectory(native.root, native.owner)
+	if err := validateMappingClaim(directory, mappingExpectedClaim(m.options, native.owner, native.runner)); err != nil {
+		return err
+	}
+	unlock, err := lockMappingOwner(directory)
 	if err != nil {
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, unlock()) }()
 	current, err := readMappingLedger(m.path, m.options)
 	if err != nil {
+		m.removeAuthority = false
 		return err
 	}
-	m.ledger = current
+	if !reflect.DeepEqual(current, m.ledger) {
+		m.removeAuthority = false
+		return errors.New("mapping durable ledger changed outside its acknowledged live state")
+	}
 	m.store = &diskMappingStore{path: m.path, o: m.options, expected: current}
 	return m.cleanup(ctx)
 }
@@ -621,24 +774,26 @@ func cleanupSMBMapping(ctx context.Context, o options) (resultErr error) {
 	if err := mappingOptions(o); err != nil {
 		return err
 	}
-	unlock, err := lockMappingLedger(o)
+	backend, err := newNativeMappingBackend(o)
+	if err != nil {
+		return err
+	}
+	native := backend.(*nativeMappingBackend)
+	directory := mappingOwnerDirectory(native.root, native.owner)
+	if err := validateMappingClaim(directory, mappingExpectedClaim(o, native.owner, native.runner)); err != nil {
+		return err
+	}
+	unlock, err := lockMappingOwner(directory)
 	if err != nil {
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, unlock()) }()
 	path := mappingLedgerPath(o)
 	ledger, err := readMappingLedger(path, o)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
 	if err != nil {
 		return err
 	}
-	backend, err := newNativeMappingBackend(o)
-	if err != nil {
-		return err
-	}
-	owned := &ownedSMBMapping{o, path, ledger, backend, &diskMappingStore{path: path, o: o, expected: ledger}}
+	owned := &ownedSMBMapping{options: o, path: path, ledger: ledger, backend: backend, store: &diskMappingStore{path: path, o: o, expected: ledger}}
 	return owned.cleanup(ctx)
 }
 
@@ -713,56 +868,299 @@ func requireMappingJob() error {
 	return nil
 }
 
-type nativeMappingBackend struct {
-	o                              options
-	owner                          mappingOwner
-	host                           platform
-	executable, module, moduleRoot string
+const (
+	mappingNoError               uint32 = 0
+	mappingMoreData              uint32 = 234
+	mappingNoMoreItems           uint32 = 259
+	mappingConnectionUnavailable uint32 = 1201
+	mappingNotConnected          uint32 = 2250
+	mappingRequireIntegrity      uint32 = 0x4000
+)
+
+type mappingNetResource struct {
+	Scope, Type, DisplayType, Usage          uint32
+	LocalName, RemoteName, Comment, Provider *uint16
 }
 
-func newNativeMappingBackend(o options) (mappingBackend, error) {
-	host := windowsPlatform{}
-	if _, err := host.Preflight(); err != nil {
-		return nil, err
+func checkMappingNativeABI() error {
+	var value mappingNetResource
+	if unsafe.Sizeof(value) != 48 || unsafe.Alignof(value) != 8 || unsafe.Offsetof(value.Type) != 4 || unsafe.Offsetof(value.LocalName) != 16 || unsafe.Offsetof(value.RemoteName) != 24 || unsafe.Offsetof(value.Comment) != 32 || unsafe.Offsetof(value.Provider) != 40 {
+		return errors.New("NETRESOURCEW differs from the Windows 64-bit ABI")
 	}
-	if err := requireMappingJob(); err != nil {
-		return nil, err
+	return nil
+}
+
+func mappingTransportOptions(port uint16) ([24]byte, error) {
+	var data [24]byte
+	if port == 0 {
+		return data, errors.New("mapping TCP port is zero")
 	}
-	owner, err := currentMappingOwner()
+	binary.LittleEndian.PutUint32(data[0:4], 0x50617254)
+	binary.LittleEndian.PutUint16(data[4:6], 24)
+	binary.LittleEndian.PutUint32(data[8:12], 1)
+	binary.LittleEndian.PutUint16(data[14:16], port)
+	binary.LittleEndian.PutUint32(data[20:24], 1)
+	return data, nil
+}
+
+type mappingNativeOps struct {
+	OpenEnum      func() (uintptr, uint32)
+	Enum          func(uintptr, []byte, *uint32, *uint32) uint32
+	CloseEnum     func(uintptr) uint32
+	Connection    func(string, []uint16, *uint32) uint32
+	DOS           func(string) ([]string, error)
+	LogicalDrives func() (uint32, error)
+	FindAdd       func() error
+	Add           func(uintptr, *mappingNetResource, uintptr, uint32, uint32, []byte, uint32) uint32
+	Cancel        func(string, uint32, bool) uint32
+}
+
+func mappingNativeCreate(local, remote string, port uint16, ops mappingNativeOps) (invoked bool, code uint32, resultErr error) {
+	if err := checkMappingNativeABI(); err != nil {
+		return false, 0, err
+	}
+	option, err := mappingTransportOptions(port)
 	if err != nil {
-		return nil, err
+		return false, 0, err
 	}
-	system, err := windows.GetSystemDirectory()
+	localName, err := windows.UTF16FromString(local)
 	if err != nil {
-		return nil, err
+		return false, 0, err
 	}
-	home := filepath.Join(system, "WindowsPowerShell", "v1.0")
-	executable := filepath.Join(home, "powershell.exe")
-	moduleRoot := filepath.Join(home, "Modules")
-	module := filepath.Join(moduleRoot, "SmbShare", "SmbShare.psd1")
-	if err := rejectPrivateReparsePath(moduleRoot); err != nil {
-		return nil, err
-	}
-	rootInfo, err := os.Lstat(moduleRoot)
+	remoteName, err := windows.UTF16FromString(remote)
 	if err != nil {
-		return nil, err
+		return false, 0, err
 	}
-	if !rootInfo.IsDir() || strings.Contains(moduleRoot, ";") {
-		return nil, errors.New("system Windows PowerShell module root is not a single local directory")
+	if err := ops.FindAdd(); err != nil {
+		return false, 0, err
 	}
-	for _, path := range []string{executable, module} {
-		if err := rejectPrivateReparsePath(path); err != nil {
-			return nil, err
+	resource := mappingNetResource{Type: 1, LocalName: &localName[0], RemoteName: &remoteName[0]}
+	code = ops.Add(0, &resource, 0, 0, mappingRequireIntegrity, option[:], uint32(len(option)))
+	runtime.KeepAlive(localName)
+	runtime.KeepAlive(remoteName)
+	runtime.KeepAlive(resource)
+	runtime.KeepAlive(option)
+	return true, code, nil
+}
+
+func mappingUTF16(words []uint16, byteLimit int) (string, error) {
+	for index := 0; index < len(words); index++ {
+		word := words[index]
+		if word >= 0xd800 && word <= 0xdbff {
+			if index+1 >= len(words) || words[index+1] < 0xdc00 || words[index+1] > 0xdfff {
+				return "", errors.New("mapping string has invalid UTF-16")
+			}
+			index++
+		} else if word >= 0xdc00 && word <= 0xdfff {
+			return "", errors.New("mapping string has invalid UTF-16")
 		}
-		info, err := os.Lstat(path)
+	}
+	value := string(utf16.Decode(words))
+	if len(value) > byteLimit {
+		return "", errors.New("mapping string exceeds byte bound")
+	}
+	return value, nil
+}
+
+func mappingBufferString(buffer []byte, pointer uintptr, required bool) (string, error) {
+	if pointer == 0 {
+		if required {
+			return "", errors.New("mapping resource omitted its remote name")
+		}
+		return "", nil
+	}
+	if len(buffer) == 0 {
+		return "", errors.New("mapping resource string has no buffer")
+	}
+	base := uintptr(unsafe.Pointer(&buffer[0]))
+	if pointer < base || pointer-base >= uintptr(len(buffer)) || pointer%2 != 0 {
+		return "", errors.New("mapping resource string pointer is outside its buffer")
+	}
+	offset := int(pointer - base)
+	words := make([]uint16, 0, 1024)
+	for offset+1 < len(buffer) {
+		word := binary.LittleEndian.Uint16(buffer[offset : offset+2])
+		if word == 0 {
+			return mappingUTF16(words, 1024)
+		}
+		words = append(words, word)
+		if len(words) > 1024 {
+			return "", errors.New("mapping resource string is unterminated or too large")
+		}
+		offset += 2
+	}
+	return "", errors.New("mapping resource string is unterminated")
+}
+
+func parseMappingResources(buffer []byte, count uint32) ([]mappingRow, error) {
+	if err := checkMappingNativeABI(); err != nil {
+		return nil, err
+	}
+	if count == 0 || count > mappingRowLimit || uint64(count)*48 > uint64(len(buffer)) {
+		return nil, errors.New("mapping enumeration returned invalid count or array size")
+	}
+	if uintptr(unsafe.Pointer(&buffer[0]))%8 != 0 {
+		return nil, errors.New("mapping enumeration buffer is unaligned")
+	}
+	rows := make([]mappingRow, 0, count)
+	for index := uint32(0); index < count; index++ {
+		header := buffer[int(index)*48 : int(index+1)*48]
+		if binary.LittleEndian.Uint32(header[4:8]) != 1 {
+			return nil, errors.New("mapping enumeration returned a non-disk resource")
+		}
+		local, err := mappingBufferString(buffer, uintptr(binary.LittleEndian.Uint64(header[16:24])), false)
 		if err != nil {
 			return nil, err
 		}
-		if !info.Mode().IsRegular() {
-			return nil, errors.New("system PowerShell executable or SMB module is not regular")
+		remote, err := mappingBufferString(buffer, uintptr(binary.LittleEndian.Uint64(header[24:32])), true)
+		if err != nil || remote == "" {
+			return nil, errors.Join(err, errors.New("mapping enumeration has an empty remote name"))
 		}
+		rows = append(rows, mappingRow{local, remote})
 	}
-	return &nativeMappingBackend{o, owner, host, executable, module, moduleRoot}, nil
+	return rows, nil
+}
+
+func enumerateMappings(ops mappingNativeOps) (rows []mappingRow, resultErr error) {
+	handle, status := ops.OpenEnum()
+	if status != mappingNoError {
+		return nil, fmt.Errorf("WNetOpenEnumW status %d", status)
+	}
+	defer func() {
+		if code := ops.CloseEnum(handle); code != 0 {
+			resultErr = errors.Join(resultErr, fmt.Errorf("WNetCloseEnum status %d", code))
+		}
+	}()
+	storage := make([]uint64, mappingByteLimit/8)
+	buffer := unsafe.Slice((*byte)(unsafe.Pointer(&storage[0])), mappingByteLimit)
+	rows = []mappingRow{}
+	for call := 0; call < mappingRowLimit+1; call++ {
+		count := uint32(max(1, mappingRowLimit-len(rows)))
+		size := uint32(len(buffer))
+		status := ops.Enum(handle, buffer, &count, &size)
+		if status == mappingNoMoreItems {
+			return rows, nil
+		}
+		if status != mappingNoError {
+			return nil, fmt.Errorf("WNetEnumResourceW incomplete status %d", status)
+		}
+		if count == 0 || int(count) > mappingRowLimit-len(rows) || size > uint32(len(buffer)) {
+			return nil, errors.New("mapping enumeration exceeded its count/buffer or made no progress")
+		}
+		page, err := parseMappingResources(buffer[:size], count)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, page...)
+	}
+	return nil, errors.New("mapping enumeration did not terminate within call bound")
+}
+
+func mappingLookup(drive string, ops mappingNativeOps) (mappingConnection, error) {
+	buffer := make([]uint16, 1025)
+	size := uint32(len(buffer))
+	code := ops.Connection(drive, buffer, &size)
+	if code == mappingNotConnected || code == mappingConnectionUnavailable {
+		return mappingConnection{Status: code}, nil
+	}
+	if code != 0 {
+		return mappingConnection{}, fmt.Errorf("WNetGetConnectionW status %d", code)
+	}
+	end := 0
+	for end < len(buffer) && buffer[end] != 0 {
+		end++
+	}
+	if end == 0 || end == len(buffer) || size == 0 || size > uint32(len(buffer)) {
+		return mappingConnection{}, errors.New("connection lookup returned malformed bounded text")
+	}
+	value, err := mappingUTF16(buffer[:end], 1024)
+	return mappingConnection{Status: code, RemotePath: value}, err
+}
+
+func systemMappingOps() mappingNativeOps {
+	dll := windows.NewLazySystemDLL("mpr.dll")
+	open := dll.NewProc("WNetOpenEnumW")
+	enumerate := dll.NewProc("WNetEnumResourceW")
+	closeEnum := dll.NewProc("WNetCloseEnum")
+	connection := dll.NewProc("WNetGetConnectionW")
+	add := dll.NewProc("WNetAddConnection4W")
+	cancel := dll.NewProc("WNetCancelConnection2W")
+	return mappingNativeOps{
+		OpenEnum: func() (uintptr, uint32) {
+			var handle uintptr
+			code, _, _ := open.Call(1, 1, 0, 0, uintptr(unsafe.Pointer(&handle)))
+			return handle, uint32(code)
+		},
+		Enum: func(handle uintptr, buffer []byte, count, size *uint32) uint32 {
+			code, _, _ := enumerate.Call(handle, uintptr(unsafe.Pointer(count)), uintptr(unsafe.Pointer(&buffer[0])), uintptr(unsafe.Pointer(size)))
+			runtime.KeepAlive(buffer)
+			return uint32(code)
+		},
+		CloseEnum: func(handle uintptr) uint32 { code, _, _ := closeEnum.Call(handle); return uint32(code) },
+		Connection: func(drive string, buffer []uint16, size *uint32) uint32 {
+			name, err := windows.UTF16PtrFromString(drive)
+			if err != nil {
+				return uint32(windows.ERROR_INVALID_PARAMETER)
+			}
+			code, _, _ := connection.Call(uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(&buffer[0])), uintptr(unsafe.Pointer(size)))
+			runtime.KeepAlive(name)
+			runtime.KeepAlive(buffer)
+			return uint32(code)
+		},
+		DOS: mappingDOSTarget, LogicalDrives: windows.GetLogicalDrives,
+		FindAdd: add.Find,
+		Add: func(hwnd uintptr, resource *mappingNetResource, auth uintptr, authBytes, flags uint32, option []byte, optionBytes uint32) uint32 {
+			code, _, _ := add.Call(hwnd, uintptr(unsafe.Pointer(resource)), auth, uintptr(authBytes), uintptr(flags), uintptr(unsafe.Pointer(&option[0])), uintptr(optionBytes))
+			runtime.KeepAlive(resource)
+			runtime.KeepAlive(option)
+			return uint32(code)
+		},
+		Cancel: func(drive string, flags uint32, force bool) uint32 {
+			name, err := windows.UTF16PtrFromString(drive)
+			if err != nil {
+				return uint32(windows.ERROR_INVALID_PARAMETER)
+			}
+			var forced uintptr
+			if force {
+				forced = 1
+			}
+			code, _, _ := cancel.Call(uintptr(unsafe.Pointer(name)), uintptr(flags), forced)
+			runtime.KeepAlive(name)
+			return uint32(code)
+		},
+	}
+}
+
+func nativeMappingSnapshot(owner mappingOwner, ops mappingNativeOps) (mappingSnapshot, error) {
+	rows, err := enumerateMappings(ops)
+	if err != nil {
+		return mappingSnapshot{}, err
+	}
+	snapshot := mappingSnapshot{Owner: owner, Rows: rows, Connections: make(map[string]mappingConnection, 26), Devices: make(map[string][]string, 26)}
+	for letter := 'A'; letter <= 'Z'; letter++ {
+		drive := string(letter) + ":"
+		value, err := mappingLookup(drive, ops)
+		if err != nil {
+			return mappingSnapshot{}, err
+		}
+		snapshot.Connections[drive] = value
+		targets, err := ops.DOS(drive)
+		if err != nil {
+			return mappingSnapshot{}, err
+		}
+		snapshot.Devices[drive] = targets
+	}
+	snapshot.LogicalDrives, err = ops.LogicalDrives()
+	if err != nil {
+		return mappingSnapshot{}, err
+	}
+	sort.Slice(snapshot.Rows, func(i, j int) bool {
+		if snapshot.Rows[i].LocalPath != snapshot.Rows[j].LocalPath {
+			return snapshot.Rows[i].LocalPath < snapshot.Rows[j].LocalPath
+		}
+		return snapshot.Rows[i].RemotePath < snapshot.Rows[j].RemotePath
+	})
+	return snapshot, checkMappingSnapshot(snapshot)
 }
 
 func mappingDOSTarget(drive string) ([]string, error) {
@@ -816,224 +1214,591 @@ func mappingDOSTarget(drive string) ([]string, error) {
 	return targets, nil
 }
 
+type mappingRunner struct {
+	Environment string `json:"environment"`
+	RunID       string `json:"run_id"`
+	Attempt     string `json:"attempt"`
+}
+type mappingClaim struct {
+	Version   int           `json:"version"`
+	Owner     mappingOwner  `json:"owner"`
+	RunID     string        `json:"run_id"`
+	SourceSHA string        `json:"source_sha"`
+	Nonce     string        `json:"fixture_nonce"`
+	Volume    string        `json:"volume"`
+	Sequence  uint64        `json:"sequence"`
+	StateFile string        `json:"state_file"`
+	Runner    mappingRunner `json:"runner"`
+}
+
+func mappingRootFromExecutable(executable string, o options) (string, error) {
+	if !filepath.IsAbs(executable) || strings.HasPrefix(executable, `\\`) || filepath.Clean(executable) != executable {
+		return "", errors.New("mapping helper executable must have a canonical local absolute path")
+	}
+	name := filepath.Base(executable)
+	if name != "probe-windows-arm64.exe" && name != "probe-windows-amd64.exe" {
+		return "", errors.New("mapping helper executable name is not fixed")
+	}
+	host := filepath.Dir(executable)
+	artifact := filepath.Dir(host)
+	root := filepath.Dir(artifact)
+	if filepath.Base(host) != "host" || filepath.Base(artifact) != "artifact" || filepath.Base(root) != "native-current-authority-fixture" || filepath.Base(filepath.Dir(root)) != ".tmp" {
+		return "", errors.New("mapping helper is outside the fixed artifact root")
+	}
+	want := filepath.Join(root, "windows-runs", o.RunID, "evidence", "probe-state.json")
+	if o.StateFile != want {
+		return "", errors.New("mapping state is outside the executable's fixed fixture root")
+	}
+	return root, nil
+}
+
+func mappingRunnerFacts(lookup func(string) string, runID string) (mappingRunner, error) {
+	runner := mappingRunner{lookup("RFS_FIXTURE_RUNNER_ENVIRONMENT"), lookup("GITHUB_RUN_ID"), lookup("GITHUB_RUN_ATTEMPT")}
+	for _, value := range []string{runner.RunID, runner.Attempt} {
+		number, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || number == 0 || strconv.FormatUint(number, 10) != value {
+			return runner, errors.New("mapping requires canonical hosted run and attempt identifiers")
+		}
+	}
+	if lookup("GITHUB_ACTIONS") != "true" || runner.Environment != "github-hosted" || runID != runner.RunID+"-"+runner.Attempt {
+		return runner, errors.New("mapping requires this fresh isolated GitHub-hosted attempt")
+	}
+	return runner, nil
+}
+
+func mappingOwnerDirectory(root string, owner mappingOwner) string {
+	key := sha256.Sum256([]byte(owner.SID + "\x00" + owner.AuthenticationID))
+	return filepath.Join(root, fmt.Sprintf("mapping-owner-%x", key))
+}
+
+func mappingExpectedClaim(o options, owner mappingOwner, runner mappingRunner) mappingClaim {
+	return mappingClaim{1, owner, o.RunID, o.SourceSHA, o.FixtureNonce, o.Volume, o.Sequence, o.StateFile, runner}
+}
+
+func writeMappingJSONFile(file *os.File, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if len(data)+1 > mappingByteLimit {
+		return errors.New("private mapping record exceeds size limit")
+	}
+	if err := makePrivateFile(file.Name()); err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	n, err := file.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	return errors.Join(err, file.Sync())
+}
+
+func readMappingClaim(path string) (mappingClaim, error) {
+	var claim mappingClaim
+	if err := validatePrivateFile(path); err != nil {
+		return claim, err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return claim, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, mappingByteLimit+1))
+	if err := errors.Join(readErr, file.Close()); err != nil {
+		return claim, err
+	}
+	err = decodeMappingJSON(data, &claim)
+	return claim, err
+}
+
+func validateMappingClaim(directory string, expected mappingClaim) error {
+	if err := validatePrivateDirectory(directory); err != nil {
+		return err
+	}
+	claim, err := readMappingClaim(filepath.Join(directory, "claim.json"))
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(claim, expected) {
+		return errors.New("mapping owner claim belongs to a different attempt or logon")
+	}
+	return nil
+}
+
+func createMappingClaim(directory string, claim mappingClaim) error {
+	if err := createPrivateDirectory(directory); err != nil {
+		return fmt.Errorf("mapping owner/root attempt is already consumed or unavailable: %w", err)
+	}
+	file, err := os.OpenFile(filepath.Join(directory, "claim.json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	return errors.Join(writeMappingJSONFile(file, claim), file.Close())
+}
+
 type mappingCommandRequest struct {
-	Action     string `json:"action"`
-	Module     string `json:"module"`
-	OwnerSID   string `json:"owner_sid"`
-	LocalPath  string `json:"local_path"`
-	RemotePath string `json:"remote_path"`
-	TCPPort    uint16 `json:"tcp_port"`
+	Version    int          `json:"version"`
+	Action     string       `json:"action"`
+	RunID      string       `json:"run_id"`
+	SourceSHA  string       `json:"source_sha"`
+	Nonce      string       `json:"fixture_nonce"`
+	Volume     string       `json:"volume"`
+	Sequence   uint64       `json:"sequence"`
+	StateFile  string       `json:"state_file"`
+	Owner      mappingOwner `json:"owner"`
+	LocalPath  string       `json:"local_path"`
+	RemotePath string       `json:"remote_path"`
+	TCPPort    uint16       `json:"tcp_port"`
 }
+
+func (r mappingCommandRequest) options() options {
+	return options{RunID: r.RunID, SourceSHA: r.SourceSHA, FixtureNonce: r.Nonce, Volume: r.Volume, Sequence: r.Sequence, StateFile: r.StateFile, Phase: "current-smb-cold"}
+}
+
+func validateMappingRequest(r mappingCommandRequest) error {
+	if r.Version != 1 || !identifier(r.RunID, 64) || !lowerHex(r.SourceSHA, 40) || !lowerHex(r.Nonce, 64) || r.Volume != fixtureVolume || r.Sequence != 2 || !strings.HasPrefix(r.Owner.SID, "S-1-") || len(r.Owner.SID) > 184 || !lowerHex(r.Owner.AuthenticationID, 16) || r.Owner.WindowsBuild < 26100 {
+		return errors.New("native mapping request identity is invalid")
+	}
+	if !filepath.IsAbs(r.StateFile) || filepath.Base(r.StateFile) != "probe-state.json" || filepath.Base(filepath.Dir(r.StateFile)) != "evidence" {
+		return errors.New("native mapping state-file identity is invalid")
+	}
+	if r.Action == "inventory" {
+		if r.LocalPath != "" || r.RemotePath != "" || r.TCPPort != 0 {
+			return errors.New("inventory request has a mutation target")
+		}
+		return nil
+	}
+	if r.Action != "create" && r.Action != "remove" {
+		return errors.New("native mapping action is invalid")
+	}
+	if len(r.LocalPath) != 2 || r.LocalPath[0] < 'D' || r.LocalPath[0] > 'Z' || r.LocalPath[1] != ':' || r.RemotePath != `\\127.0.0.1\rfs-`+r.Nonce || r.TCPPort == 0 {
+		return errors.New("native mapping mutation target is invalid")
+	}
+	return nil
+}
+
 type mappingCommandResult struct {
-	Status   string       `json:"status"`
-	OwnerSID string       `json:"owner_sid"`
-	Rows     []mappingRow `json:"rows"`
-	Cause    string       `json:"cause"`
+	Version        int              `json:"version"`
+	RequestSHA256  string           `json:"request_sha256"`
+	Action         string           `json:"action"`
+	Owner          mappingOwner     `json:"owner"`
+	OwnerAfter     *mappingOwner    `json:"owner_after,omitempty"`
+	Knowledge      string           `json:"knowledge"`
+	APIStatus      *uint32          `json:"api_status,omitempty"`
+	Snapshot       *mappingSnapshot `json:"snapshot,omitempty"`
+	Cause          string           `json:"cause"`
+	CauseTruncated bool             `json:"cause_truncated"`
+	Requested      mappingAPIFacts  `json:"requested_api"`
 }
 
-const mappingPowerShell = `
-[Console]::Error.WriteLine('RFS-MAPPING/1 entry')
-$ErrorActionPreference = 'Stop'
-$WarningPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-Set-StrictMode -Version Latest
-[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-$OutputEncoding = [Console]::OutputEncoding
-$owner = ''
-$rfsObservationStage = 'operation'
-function Get-RfsBoundedTextFact {
-    param($Value, [int]$Limit)
-    if ($null -eq $Value) { return @{ state = 'null' } }
-    $text = [string]$Value
-    $state = if ($text.Length -eq 0) { 'empty' } else { 'value' }
-    $head = $text.Substring(0, [Math]::Min($text.Length, $Limit + 1))
-    $utf8 = [Text.UTF8Encoding]::new($false)
-    $bytes = $utf8.GetBytes($head)
-    $retained = [Math]::Min($bytes.Length, $Limit)
-    $cut = [int](($text.Length -gt $head.Length) -or ($bytes.Length -gt $Limit))
-    return @{ state = $state; utf16 = $text.Length; prefix = [Convert]::ToBase64String($bytes, 0, $retained); truncated = $cut }
-}
-function Write-RfsInputObservation {
-    param($Value)
-    [Console]::Error.WriteLine('RFS-MAPPING/1 obs-begin input')
-    if ($null -eq $Value) {
-        [Console]::Error.WriteLine('RFS-MAPPING/1 obs-input state=null')
-    } else {
-        $text = [string]$Value
-        if ($text.Length -gt 4096) {
-            [Console]::Error.WriteLine([string]::Format([Globalization.CultureInfo]::InvariantCulture, 'RFS-MAPPING/1 obs-input-limit utf16={0} utf8=unmeasured max16=4096 max8=12288', [object[]]@($text.Length)))
-            throw 'Input observation exceeds its UTF-16 limit.'
-        }
-        $utf8 = [Text.UTF8Encoding]::new($false)
-        $length = $utf8.GetByteCount($text)
-        if ($length -gt 12288) {
-            [Console]::Error.WriteLine([string]::Format([Globalization.CultureInfo]::InvariantCulture, 'RFS-MAPPING/1 obs-input-limit utf16={0} utf8={1} max16=4096 max8=12288', [object[]]@($text.Length, $length)))
-            throw 'Input observation exceeds its UTF-8 limit.'
-        }
-        $bytes = $utf8.GetBytes($text)
-        $hash = $null
-        try {
-            $hash = [Security.Cryptography.SHA256]::Create()
-            $digest = [BitConverter]::ToString($hash.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
-        } finally {
-            if ($null -ne $hash) { $hash.Dispose() }
-        }
-        $state = if ($text.Length -eq 0) { 'empty' } else { 'value' }
-        [Console]::Error.WriteLine([string]::Format([Globalization.CultureInfo]::InvariantCulture, 'RFS-MAPPING/1 obs-input state={0} utf16={1} utf8={2} read_line_utf8_sha256={3}', [object[]]@($state, $text.Length, $length, $digest)))
-    }
-    [Console]::Error.WriteLine('RFS-MAPPING/1 obs-end input')
-}
-function Write-RfsEnvironmentObservation {
-    [Console]::Error.WriteLine('RFS-MAPPING/1 obs-begin environment')
-    foreach ($name in @('PSModulePath', 'WinPSModulePath', 'PSModuleAnalysisCachePath')) {
-        $value = [Environment]::GetEnvironmentVariable($name, [EnvironmentVariableTarget]::Process)
-        $fact = Get-RfsBoundedTextFact $value 96
-        if ($fact.state -eq 'null') {
-            [Console]::Error.WriteLine([string]::Format([Globalization.CultureInfo]::InvariantCulture, 'RFS-MAPPING/1 obs-env name={0} state=null', [object[]]@($name)))
-        } else {
-            [Console]::Error.WriteLine([string]::Format([Globalization.CultureInfo]::InvariantCulture, 'RFS-MAPPING/1 obs-env name={0} state={1} utf16={2} utf8_prefix_b64={3} truncated={4}', [object[]]@($name, $fact.state, $fact.utf16, $fact.prefix, $fact.truncated)))
-        }
-    }
-    [Console]::Error.WriteLine('RFS-MAPPING/1 obs-end environment')
-}
-try {
-    [Console]::Error.WriteLine('RFS-MAPPING/1 before-readline')
-    $requestLine = [Console]::In.ReadLine()
-    [Console]::Error.WriteLine('RFS-MAPPING/1 after-readline')
-    $rfsObservationStage = 'input'
-    Write-RfsInputObservation $requestLine
-    $rfsObservationStage = 'environment'
-    Write-RfsEnvironmentObservation
-    $rfsObservationStage = 'operation'
-    $utilityManifest = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__RFS_UTILITY_MANIFEST_BASE64__'))
-    [Console]::Error.WriteLine('RFS-MAPPING/1 before-utility')
-    $utilityModules = @(Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -PassThru -ErrorAction Stop)
-    [Console]::Error.WriteLine('RFS-MAPPING/1 after-utility')
-    if ($utilityModules.Count -ne 1 -or $utilityModules[0] -isnot [System.Management.Automation.PSModuleInfo] -or $utilityModules[0].Name -cne 'Microsoft.PowerShell.Utility') {
-        throw 'Utility import did not return exactly the expected module.'
-    }
-    $jsonCommand = $utilityModules[0].ExportedCmdlets['ConvertFrom-Json']
-    if ($null -eq $jsonCommand -or $jsonCommand -isnot [System.Management.Automation.CmdletInfo] -or $jsonCommand.Name -cne 'ConvertFrom-Json' -or $jsonCommand.CommandType -ne [System.Management.Automation.CommandTypes]::Cmdlet) {
-        throw 'Utility module did not export the expected JSON cmdlet.'
-    }
-    [Console]::Error.WriteLine('RFS-MAPPING/1 before-json')
-    $request = $requestLine | & $jsonCommand
-    [Console]::Error.WriteLine('RFS-MAPPING/1 after-json')
-    [Console]::Error.WriteLine('RFS-MAPPING/1 before-owner')
-    $owner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    [Console]::Error.WriteLine('RFS-MAPPING/1 after-owner')
-    if ($owner -cne $request.owner_sid) { throw 'PowerShell primary-token SID differs from mapping owner.' }
-    [Console]::Error.WriteLine('RFS-MAPPING/1 before-import')
-    Import-Module -Name $request.module -ErrorAction Stop
-    [Console]::Error.WriteLine('RFS-MAPPING/1 after-import')
-    function Read-Mappings {
-        [Console]::Error.WriteLine('RFS-MAPPING/1 before-inventory')
-        $items = @(Get-SmbMapping -ErrorAction Stop)
-        [Console]::Error.WriteLine('RFS-MAPPING/1 after-inventory')
-        if ($items.Count -gt 128) { throw 'SMB mapping inventory exceeds 128 rows.' }
-        @($items | ForEach-Object {
-            [ordered]@{ local_path = [string]$_.LocalPath; remote_path = [string]$_.RemotePath; status = [string]$_.Status }
-        })
-    }
-    if ($request.action -eq 'create') {
-        [Console]::Error.WriteLine('RFS-MAPPING/1 before-create-inventory')
-        $prior = @(Get-SmbMapping -ErrorAction Stop | Where-Object { $_.LocalPath -ieq $request.local_path -or $_.RemotePath -ieq $request.remote_path })
-        [Console]::Error.WriteLine('RFS-MAPPING/1 after-create-inventory')
-        if ($prior.Count -ne 0) { throw 'Refusing to adopt a pre-existing drive or nonce share mapping.' }
-        $command = Get-Command -Name SmbShare\New-SmbMapping -ErrorAction Stop
-        if (-not $command.Parameters.ContainsKey('TcpPort')) { throw 'New-SmbMapping lacks alternate TCP-port support.' }
-        $null = SmbShare\New-SmbMapping -LocalPath $request.local_path -RemotePath $request.remote_path -TcpPort $request.tcp_port -TransportType TCP -RequireIntegrity $true -Persistent $false -GlobalMapping:$false -SaveCredentials:$false -ErrorAction Stop
-    } elseif ($request.action -eq 'remove') {
-        [Console]::Error.WriteLine('RFS-MAPPING/1 before-remove-inventory')
-        $matching = @(Get-SmbMapping -ErrorAction Stop | Where-Object { $_.LocalPath -ieq $request.local_path -or $_.RemotePath -ieq $request.remote_path })
-        [Console]::Error.WriteLine('RFS-MAPPING/1 after-remove-inventory')
-        if ($matching.Count -ne 1 -or $matching[0].LocalPath -cne $request.local_path -or $matching[0].RemotePath -cne $request.remote_path) { throw 'Mapping changed before exact removal; refusing deletion.' }
-        $matching[0] | SmbShare\Remove-SmbMapping -Force -UpdateProfile:$false -Confirm:$false -ErrorAction Stop
-    } elseif ($request.action -ne 'inventory') { throw 'Unknown mapping command.' }
-    $rows = @(Read-Mappings)
-    [ordered]@{ status = 'ok'; owner_sid = $owner; rows = $rows; cause = '' } | ConvertTo-Json -Depth 5 -Compress
-    [Console]::Error.WriteLine('RFS-MAPPING/1 after-result')
-} catch {
-    $primaryError = $_
-    $primaryOrigin = $rfsObservationStage
-    try {
-        [Console]::Error.WriteLine('RFS-MAPPING/1 catch-entry')
-        [Console]::Error.WriteLine('RFS-MAPPING/1 obs-begin catch')
-        if ($primaryOrigin -eq 'input') { [Console]::Error.WriteLine('RFS-MAPPING/1 obs-failure input') }
-        if ($primaryOrigin -eq 'environment') { [Console]::Error.WriteLine('RFS-MAPPING/1 obs-failure environment') }
-        $typeFact = Get-RfsBoundedTextFact ($primaryError.Exception.GetType().FullName) 64
-        $idFact = Get-RfsBoundedTextFact $primaryError.FullyQualifiedErrorId 64
-        $typeFields = 'type_state=null'
-        if ($typeFact.state -ne 'null') {
-            $typeFields = [string]::Format([Globalization.CultureInfo]::InvariantCulture, 'type_state={0} type16={1} type_b64={2} typecut={3}', [object[]]@($typeFact.state, $typeFact.utf16, $typeFact.prefix, $typeFact.truncated))
-        }
-        $idFields = 'id_state=null'
-        if ($idFact.state -ne 'null') {
-            $idFields = [string]::Format([Globalization.CultureInfo]::InvariantCulture, 'id_state={0} id16={1} id_b64={2} idcut={3}', [object[]]@($idFact.state, $idFact.utf16, $idFact.prefix, $idFact.truncated))
-        }
-        [Console]::Error.WriteLine([string]::Format([Globalization.CultureInfo]::InvariantCulture, 'RFS-MAPPING/1 obs-catch origin={0} {1} {2}', [object[]]@($primaryOrigin, $typeFields, $idFields)))
-        [Console]::Error.WriteLine('RFS-MAPPING/1 obs-end catch')
-    } catch {
-        [Console]::Error.WriteLine('RFS-MAPPING/1 obs-failure catch')
-    } finally {
-        $cause = $primaryError.Exception.Message
-        if ($cause.Length -gt 1024) { $cause = $cause.Substring(0,1024) }
-        [ordered]@{ status = 'error'; owner_sid = $owner; rows = @(); cause = $cause } | ConvertTo-Json -Depth 5 -Compress
-        exit 1
-    }
-}
-`
-
-func mappingPowerShellScript(manifestPath string) (string, error) {
-	if manifestPath == "" || !filepath.IsAbs(manifestPath) || strings.IndexByte(manifestPath, 0) >= 0 || !utf8.ValidString(manifestPath) {
-		return "", errors.New("Utility manifest path must be absolute valid text without NUL")
-	}
-	const placeholder = "__RFS_UTILITY_MANIFEST_BASE64__"
-	if strings.Count(mappingPowerShell, placeholder) != 1 {
-		return "", errors.New("mapping script must bind exactly one Utility manifest path")
-	}
-	return strings.Replace(mappingPowerShell, placeholder, base64.StdEncoding.EncodeToString([]byte(manifestPath)), 1), nil
+type mappingAPIFacts struct {
+	Name                string `json:"name"`
+	Flags               uint32 `json:"flags"`
+	AuthBytes           uint32 `json:"auth_bytes"`
+	Force               bool   `json:"force"`
+	TransportOptionsHex string `json:"transport_options_hex"`
 }
 
-func mappingPowerShellEnvironment(inherited []string, moduleRoot string) ([]string, error) {
-	if moduleRoot == "" || strings.Contains(moduleRoot, ";") {
-		return nil, errors.New("Windows PowerShell module root is not one verified directory")
+func mappingRequestedAPI(request mappingCommandRequest) mappingAPIFacts {
+	switch request.Action {
+	case "create":
+		option, _ := mappingTransportOptions(request.TCPPort)
+		return mappingAPIFacts{Name: "WNetAddConnection4W", Flags: mappingRequireIntegrity, TransportOptionsHex: fmt.Sprintf("%x", option)}
+	case "remove":
+		return mappingAPIFacts{Name: "WNetCancelConnection2W"}
+	case "inventory":
+		return mappingAPIFacts{Name: "WNetOpenEnumW/WNetEnumResourceW/WNetGetConnectionW/QueryDosDeviceW/GetLogicalDrives"}
+	default:
+		return mappingAPIFacts{}
 	}
-	if _, err := windowsEnvironmentKey("PSModulePath=" + moduleRoot); err != nil {
+}
+
+type mappingHelperServices struct {
+	Owner     func() (mappingOwner, error)
+	Job       func() error
+	Authorize func(mappingCommandRequest) (mappingLedger, error)
+	Native    mappingNativeOps
+}
+
+func runMappingHelperWith(args []string, input io.Reader, output io.Writer, service mappingHelperServices) error {
+	if len(args) != 0 {
+		return errors.New("mapping helper accepts no arguments")
+	}
+	frame, err := bufio.NewReader(io.LimitReader(input, 4097)).ReadBytes('\n')
+	if err != nil || len(frame) > 4096 || len(frame) == 0 || frame[len(frame)-1] != '\n' {
+		return errors.Join(err, errors.New("mapping helper requires one bounded LF JSON frame"))
+	}
+	var request mappingCommandRequest
+	if err := decodeMappingJSON(frame, &request); err != nil {
+		return err
+	}
+	fields, err := mappingRequiredFields(frame, "version", "action", "run_id", "source_sha", "fixture_nonce", "volume", "sequence", "state_file", "owner", "local_path", "remote_path", "tcp_port")
+	if err != nil {
+		return err
+	}
+	if _, err := mappingRequiredFields(fields["owner"], "sid", "authentication_id", "windows_build"); err != nil {
+		return err
+	}
+	if err := validateMappingRequest(request); err != nil {
+		return err
+	}
+	result := mappingCommandResult{Version: 1, RequestSHA256: fmt.Sprintf("%x", sha256.Sum256(frame)), Action: request.Action, Knowledge: "not-invoked", Requested: mappingRequestedAPI(request)}
+	owner, operationErr := service.Owner()
+	result.Owner = owner
+	if operationErr == nil && owner != request.Owner {
+		operationErr = errors.New("native helper primary SID or authentication logon changed")
+	}
+	if operationErr == nil {
+		operationErr = service.Job()
+	}
+	if operationErr == nil {
+		var ledger mappingLedger
+		ledger, operationErr = service.Authorize(request)
+		if operationErr == nil && request.Action != "inventory" {
+			var snapshot mappingSnapshot
+			snapshot, operationErr = nativeMappingSnapshot(owner, service.Native)
+			if operationErr == nil {
+				operationErr = validateMappingMutationSnapshot(request, ledger, snapshot)
+			}
+		}
+	}
+	if operationErr == nil {
+		switch request.Action {
+		case "inventory":
+			result.Knowledge = "inventory-error"
+			var snapshot mappingSnapshot
+			snapshot, operationErr = nativeMappingSnapshot(owner, service.Native)
+			if operationErr == nil {
+				result.Knowledge = "inventory"
+				result.Snapshot = &snapshot
+			}
+		case "create":
+			var invoked bool
+			var code uint32
+			invoked, code, operationErr = mappingNativeCreate(request.LocalPath, request.RemotePath, request.TCPPort, service.Native)
+			if invoked {
+				result.Knowledge = "returned"
+				result.APIStatus = &code
+				if code != 0 {
+					operationErr = fmt.Errorf("WNetAddConnection4W status %d", code)
+				}
+			}
+		case "remove":
+			code := service.Native.Cancel(request.LocalPath, 0, false)
+			result.Knowledge = "returned"
+			result.APIStatus = &code
+			if code != 0 {
+				operationErr = fmt.Errorf("WNetCancelConnection2W status %d", code)
+			}
+		}
+		after, ownerErr := service.Owner()
+		if ownerErr == nil {
+			result.OwnerAfter = &after
+		}
+		if ownerErr == nil && after != owner {
+			result.Owner = after
+			ownerErr = errors.New("native helper owner changed during API call")
+		}
+		operationErr = errors.Join(operationErr, ownerErr)
+	}
+	if operationErr != nil {
+		result.Cause, result.CauseTruncated = mappingDiagnosticText(operationErr.Error(), 1024)
+	}
+	data, encodeErr := json.Marshal(result)
+	if encodeErr != nil {
+		return errors.Join(operationErr, encodeErr)
+	}
+	if len(data)+1 > mappingByteLimit {
+		return errors.Join(operationErr, errors.New("mapping helper final reply exceeds bound"))
+	}
+	data = append(data, '\n')
+	n, writeErr := output.Write(data)
+	if writeErr == nil && n != len(data) {
+		writeErr = io.ErrShortWrite
+	}
+	return errors.Join(operationErr, writeErr)
+}
+
+func runMappingHelper(args []string, input io.Reader, output io.Writer) error {
+	return runMappingHelperWith(args, input, output, mappingHelperServices{currentMappingOwner, requireMappingJob, authorizeMappingHelper, systemMappingOps()})
+}
+
+func validateMappingResult(data []byte, request mappingCommandRequest) (mappingCommandResult, error) {
+	var result mappingCommandResult
+	if len(data) == 0 || data[len(data)-1] != '\n' || bytes.Count(data, []byte{'\n'}) != 1 {
+		return result, errors.New("native mapping reply is not one complete JSON line")
+	}
+	if err := decodeMappingJSON(data, &result); err != nil {
+		return result, err
+	}
+	fields, err := mappingRequiredFields(data, "version", "request_sha256", "action", "owner", "knowledge", "cause", "cause_truncated", "requested_api")
+	if err != nil {
+		return result, err
+	}
+	if _, err := mappingRequiredFields(fields["owner"], "sid", "authentication_id", "windows_build"); err != nil {
+		return result, err
+	}
+	if _, err := mappingRequiredFields(fields["requested_api"], "name", "flags", "auth_bytes", "force", "transport_options_hex"); err != nil {
+		return result, err
+	}
+	frame, err := json.Marshal(request)
+	if err != nil {
+		return result, err
+	}
+	frame = append(frame, '\n')
+	if result.Version != 1 || result.RequestSHA256 != fmt.Sprintf("%x", sha256.Sum256(frame)) || result.Action != request.Action || result.Owner != request.Owner || result.Requested != mappingRequestedAPI(request) {
+		return result, errors.New("native mapping reply does not bind the request and owner")
+	}
+	if len(result.Cause) > 1024 {
+		return result, errors.New("native mapping reply cause exceeds bound")
+	}
+	if result.Knowledge == "not-invoked" {
+		if result.APIStatus != nil || result.Snapshot != nil || result.Cause == "" {
+			return result, errors.New("not-invoked reply has contradictory facts")
+		}
+		return result, nil
+	}
+	if result.OwnerAfter == nil || *result.OwnerAfter != request.Owner {
+		return result, errors.New("native mapping helper did not retain the same owner after its call")
+	}
+	if request.Action == "inventory" {
+		if result.Knowledge == "inventory-error" && result.APIStatus == nil && result.Snapshot == nil && result.Cause != "" {
+			return result, nil
+		}
+		if result.Knowledge != "inventory" || result.APIStatus != nil || result.Snapshot == nil || result.Cause != "" || result.CauseTruncated || result.Snapshot.Owner != request.Owner {
+			return result, errors.New("native inventory reply is incomplete")
+		}
+		snapshotFields, err := mappingRequiredFields(fields["snapshot"], "owner", "rows", "connections", "dos_devices", "logical_drives")
+		if err != nil {
+			return result, err
+		}
+		var connections map[string]json.RawMessage
+		if err := json.Unmarshal(snapshotFields["connections"], &connections); err != nil {
+			return result, err
+		}
+		for _, value := range connections {
+			if _, err := mappingRequiredFields(value, "status", "remote_path"); err != nil {
+				return result, err
+			}
+		}
+		var rows []json.RawMessage
+		if err := json.Unmarshal(snapshotFields["rows"], &rows); err != nil {
+			return result, err
+		}
+		for _, value := range rows {
+			if _, err := mappingRequiredFields(value, "local_path", "remote_path"); err != nil {
+				return result, err
+			}
+		}
+		return result, checkMappingSnapshot(*result.Snapshot)
+	}
+	if result.Knowledge != "returned" || result.APIStatus == nil || result.Snapshot != nil {
+		return result, errors.New("native mutation reply lacks a call-return fact")
+	}
+	if *result.APIStatus != 0 && result.Cause == "" {
+		return result, errors.New("native failure status lacks its cause")
+	}
+	return result, nil
+}
+
+type nativeMappingBackend struct {
+	o                options
+	owner            mappingOwner
+	host             platform
+	executable, root string
+	runner           mappingRunner
+}
+
+func newNativeMappingBackend(o options) (mappingBackend, error) {
+	if err := requireMappingJob(); err != nil {
 		return nil, err
 	}
-	environment := make([]string, 0, len(inherited)+2)
-	for index, entry := range inherited {
-		key, err := windowsEnvironmentKey(entry)
-		if err != nil {
-			return nil, fmt.Errorf("inherited environment entry %d: %w", index, err)
-		}
-		folded := windowsEnvironmentFold(key)
-		if folded == "PSMODULEPATH" || folded == "PSMODULEANALYSISCACHEPATH" {
-			continue
-		}
-		environment = append(environment, entry)
-	}
-	return append(environment, "PSModulePath="+moduleRoot, "PSModuleAnalysisCachePath=NUL"), nil
-}
-
-func mappingEnvironmentLookup(environment []string, name string) (string, bool) {
-	for _, entry := range environment {
-		separator := strings.IndexByte(entry, '=')
-		if separator > 0 && windowsEnvironmentFold(entry[:separator]) == windowsEnvironmentFold(name) {
-			return entry[separator+1:], true
-		}
-	}
-	return "", false
-}
-
-func startMappingPowerShell(host platform, executable string, args []string, directory, moduleRoot string) (child, error) {
-	environment, err := mappingPowerShellEnvironment(os.Environ(), moduleRoot)
+	host, err := newPlatform()
 	if err != nil {
-		return nil, &windowsLaunchError{Facts: windowsLaunchFacts{RequestedImage: executable, CleanupConfirmed: true}, Cause: err}
+		return nil, err
 	}
-	return host.StartWithEnvironment(executable, args, directory, environment)
+	if _, err := host.Preflight(); err != nil {
+		return nil, err
+	}
+	owner, err := currentMappingOwner()
+	if err != nil {
+		return nil, err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	root, err := mappingRootFromExecutable(executable, o)
+	if err != nil {
+		return nil, err
+	}
+	if err := rejectPrivateReparsePath(executable); err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(executable)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("mapping helper executable is not regular")
+	}
+	runner, err := mappingRunnerFacts(os.Getenv, o.RunID)
+	if err != nil {
+		return nil, err
+	}
+	return &nativeMappingBackend{o, owner, host, executable, root, runner}, nil
+}
+
+func (b *nativeMappingBackend) request(action string, ledger mappingLedger) mappingCommandRequest {
+	return mappingCommandRequest{1, action, b.o.RunID, b.o.SourceSHA, b.o.FixtureNonce, b.o.Volume, b.o.Sequence, b.o.StateFile, b.owner, ledger.LocalPath, ledger.RemotePath, ledger.TCPPort}
+}
+
+func (b *nativeMappingBackend) command(ctx context.Context, action string, ledger mappingLedger) (mappingCommandResult, error) {
+	if err := requireMappingJob(); err != nil {
+		return mappingCommandResult{}, err
+	}
+	owner, err := currentMappingOwner()
+	if err != nil {
+		return mappingCommandResult{}, err
+	}
+	if owner != b.owner {
+		return mappingCommandResult{}, errors.New("mapping SID or authentication logon changed before helper")
+	}
+	request := b.request(action, ledger)
+	commandCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	execution, commandErr := executeNativeMapping(commandCtx, b.host, b.executable, filepath.Dir(b.o.StateFile), request)
+	after, ownerErr := currentMappingOwner()
+	if ownerErr == nil && after != owner {
+		ownerErr = errors.New("mapping SID or authentication logon changed during helper")
+	}
+	return finishMappingCommand(commandCtx, request, execution, commandErr, ownerErr)
+}
+
+func finishMappingCommand(ctx context.Context, request mappingCommandRequest, execution mappingExecution, commandErr, ownerErr error) (mappingCommandResult, error) {
+	result, validationErr := validateMappingResult(execution.Stdout, request)
+	resultErr := errors.Join(commandErr, validationErr, ownerErr, ctx.Err())
+	if !execution.Diagnostic.StartAttempted && len(execution.Stdout) != 0 {
+		resultErr = errors.Join(resultErr, errors.New("native reply appeared without an attempted helper launch"))
+	}
+	if !execution.Diagnostic.CleanupConfirmed {
+		resultErr = errors.Join(resultErr, errors.New("native helper quiescence is unconfirmed"))
+	}
+	outcome := mappingMutation{Knowledge: "unknown", HelperQuiesced: execution.Diagnostic.CleanupConfirmed}
+	if !execution.Diagnostic.StartAttempted {
+		outcome.Knowledge = "not-invoked"
+	} else if validationErr == nil && ownerErr == nil {
+		outcome.Knowledge = result.Knowledge
+		outcome.Code = result.APIStatus
+	}
+	if request.Action != "inventory" {
+		execution.Diagnostic.Outcome = &outcome
+	}
+	if validationErr == nil && result.Cause != "" {
+		resultErr = errors.Join(resultErr, errors.New(result.Cause))
+	}
+	if resultErr != nil {
+		resultErr = errors.Join(resultErr, encodeMappingDiagnostic(execution.Diagnostic))
+		if request.Action != "inventory" {
+			resultErr = &mappingOutcomeError{resultErr, outcome}
+		}
+		return result, resultErr
+	}
+	return result, nil
+}
+
+func (b *nativeMappingBackend) Snapshot(ctx context.Context) (mappingSnapshot, error) {
+	result, err := b.command(ctx, "inventory", mappingLedger{})
+	if err != nil {
+		return mappingSnapshot{}, err
+	}
+	return *result.Snapshot, nil
+}
+func (b *nativeMappingBackend) Create(ctx context.Context, ledger mappingLedger) error {
+	_, err := b.command(ctx, "create", ledger)
+	return err
+}
+func (b *nativeMappingBackend) Remove(ctx context.Context, ledger mappingLedger, row mappingRow) error {
+	if row.LocalPath != ledger.LocalPath || row.RemotePath != ledger.RemotePath {
+		return errors.New("removal row differs from owned intent")
+	}
+	_, err := b.command(ctx, "remove", ledger)
+	return err
+}
+
+func authorizeMappingHelper(request mappingCommandRequest) (mappingLedger, error) {
+	var ledger mappingLedger
+	o := request.options()
+	if err := mappingOptions(o); err != nil {
+		return ledger, err
+	}
+	if _, err := readState(o); err != nil {
+		return ledger, err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return ledger, err
+	}
+	root, err := mappingRootFromExecutable(executable, o)
+	if err != nil {
+		return ledger, err
+	}
+	if err := rejectPrivateReparsePath(executable); err != nil {
+		return ledger, err
+	}
+	info, err := os.Lstat(executable)
+	if err != nil {
+		return ledger, err
+	}
+	if !info.Mode().IsRegular() {
+		return ledger, errors.New("mapping helper executable is not regular")
+	}
+	runner, err := mappingRunnerFacts(os.Getenv, o.RunID)
+	if err != nil {
+		return ledger, err
+	}
+	if err := validateMappingClaim(mappingOwnerDirectory(root, request.Owner), mappingExpectedClaim(o, request.Owner, runner)); err != nil {
+		return ledger, err
+	}
+	if request.Action == "inventory" {
+		return ledger, nil
+	}
+	ledger, err = readMappingLedger(mappingLedgerPath(o), o)
+	if err != nil {
+		return ledger, err
+	}
+	if ledger.Owner != request.Owner || ledger.LocalPath != request.LocalPath || ledger.RemotePath != request.RemotePath || ledger.TCPPort != request.TCPPort {
+		return ledger, errors.New("native mutation differs from its durable ledger")
+	}
+	if request.Action == "create" && ledger.CreateOutcome.Knowledge != "pending" || request.Action == "remove" && ledger.RemoveOutcome.Knowledge != "pending" {
+		return ledger, errors.New("native mutation lacks matching durable pending intent")
+	}
+	if request.Action == "remove" && !mappingMutationSucceeded(ledger.CreateOutcome) {
+		return ledger, errors.New("native removal lacks settled successful creation")
+	}
+	return ledger, nil
+}
+
+func validateMappingMutationSnapshot(request mappingCommandRequest, ledger mappingLedger, snapshot mappingSnapshot) error {
+	if err := preserveMappingBaseline(ledger, snapshot); err != nil {
+		return err
+	}
+	row, err := matchingRows(snapshot, request.LocalPath, request.RemotePath)
+	if err != nil {
+		return err
+	}
+	targets := snapshot.Devices[request.LocalPath]
+	connection := snapshot.Connections[request.LocalPath]
+	if request.Action == "create" {
+		if row != nil || len(targets) != 0 || connection.Status != mappingNotConnected || snapshot.LogicalDrives&(1<<uint(request.LocalPath[0]-'A')) != 0 {
+			return errors.New("native create refuses a pre-existing drive or nonce share")
+		}
+		return nil
+	}
+	if row == nil || len(targets) == 0 || connection.Status != 0 || connection.RemotePath != request.RemotePath || !reflect.DeepEqual(targets, ledger.ObservedDevice) {
+		return errors.New("native removal refuses a changed row, lookup or DOS binding")
+	}
+	return nil
 }
 
 const mappingDiagnosticStreamLimit = 2 << 10
@@ -1068,160 +1833,37 @@ func (b *mappingBoundedBuffer) diagnostic() mappingStreamDiagnostic {
 	return mappingStreamDiagnostic{b.observed, base64.StdEncoding.EncodeToString(b.prefix), b.observed > int64(len(b.prefix))}
 }
 
-type mappingUtilityPreparation struct {
-	Path             string `json:"path"`
-	Size             *int64 `json:"size,omitempty"`
-	ReadBytes        int    `json:"read_bytes"`
-	SHA256           string `json:"sha256"`
-	ElapsedNanos     int64  `json:"elapsed_ns"`
-	CleanupConfirmed bool   `json:"cleanup_confirmed"`
-}
-
-type mappingUtilityFile interface {
-	io.Reader
-	Stat() (os.FileInfo, error)
-	Close() error
-}
-
-type mappingUtilityOps struct {
-	CheckPath   func(string) error
-	Open        func(string) (mappingUtilityFile, error)
-	CommandLine func([]string) string
-}
-
-func nativeMappingUtilityOps() mappingUtilityOps {
-	return mappingUtilityOps{
-		CheckPath: rejectPrivateReparsePath,
-		Open: func(path string) (mappingUtilityFile, error) {
-			file, err := os.Open(path)
-			if err != nil {
-				return nil, err
-			}
-			return file, nil
-		},
-		CommandLine: windows.ComposeCommandLine,
-	}
-}
-
-func prepareMappingUtility(ctx context.Context, moduleRoot, executable string, buildScript func(string) (string, error), ops mappingUtilityOps) (script string, facts mappingUtilityPreparation, resultErr error) {
-	started := time.Now()
-	facts.Path = filepath.Join(moduleRoot, "Microsoft.PowerShell.Utility", "Microsoft.PowerShell.Utility.psd1")
-	facts.CleanupConfirmed = true
-	defer func() { facts.ElapsedNanos = time.Since(started).Nanoseconds() }()
-	if err := ctx.Err(); err != nil {
-		return "", facts, err
-	}
-	if !filepath.IsAbs(facts.Path) || strings.HasPrefix(facts.Path, `\\`) {
-		return "", facts, errors.New("Utility manifest must have an absolute local path")
-	}
-	if err := ops.CheckPath(facts.Path); err != nil {
-		return "", facts, errors.Join(err, ctx.Err())
-	}
-	if err := ctx.Err(); err != nil {
-		return "", facts, err
-	}
-	file, err := ops.Open(facts.Path)
-	if file != nil {
-		facts.CleanupConfirmed = false
-		defer func() {
-			closeErr := file.Close()
-			facts.CleanupConfirmed = closeErr == nil
-			resultErr = errors.Join(resultErr, closeErr, ctx.Err())
-			if resultErr != nil {
-				script = ""
-			}
-		}()
-	}
-	if err != nil {
-		return "", facts, errors.Join(err, ctx.Err())
-	}
-	if file == nil {
-		return "", facts, errors.New("Utility manifest open returned no file")
-	}
-	before, err := file.Stat()
-	if err != nil {
-		return "", facts, errors.Join(err, ctx.Err())
-	}
-	size := before.Size()
-	facts.Size = &size
-	if !before.Mode().IsRegular() || size < 0 || size > mappingByteLimit {
-		return "", facts, errors.New("Utility manifest is not a bounded regular file")
-	}
-	if err := ctx.Err(); err != nil {
-		return "", facts, err
-	}
-	data, readErr := io.ReadAll(io.LimitReader(file, mappingByteLimit+1))
-	facts.ReadBytes = len(data)
-	if len(data) > mappingByteLimit {
-		readErr = errors.Join(readErr, errors.New("Utility manifest exceeds 1 MiB"))
-	}
-	if readErr != nil {
-		return "", facts, errors.Join(readErr, ctx.Err())
-	}
-	after, err := file.Stat()
-	if err != nil {
-		return "", facts, errors.Join(err, ctx.Err())
-	}
-	if int64(len(data)) != size || size != after.Size() || before.ModTime() != after.ModTime() {
-		return "", facts, errors.New("Utility manifest changed during inspection")
-	}
-	facts.SHA256 = fmt.Sprintf("%x", sha256.Sum256(data))
-	if err := ctx.Err(); err != nil {
-		return "", facts, err
-	}
-	script, err = buildScript(facts.Path)
-	if err != nil {
-		return "", facts, err
-	}
-	words := utf16.Encode([]rune(script))
-	encoded := make([]byte, len(words)*2)
-	for index, word := range words {
-		binary.LittleEndian.PutUint16(encoded[index*2:], word)
-	}
-	args := []string{executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", base64.StdEncoding.EncodeToString(encoded)}
-	commandLine := ops.CommandLine(args)
-	if strings.IndexByte(commandLine, 0) >= 0 || len(utf16.Encode([]rune(commandLine)))+1 > 32767 {
-		return "", facts, errors.New("Utility diagnostic command line exceeds Windows limit")
-	}
-	return script, facts, ctx.Err()
-}
-
 type mappingCommandDiagnostic struct {
-	UtilityPreparation        *mappingUtilityPreparation `json:"utility_preparation,omitempty"`
-	Action                    string                     `json:"action"`
-	ActionTruncated           bool                       `json:"action_truncated"`
-	PID                       *uint32                    `json:"pid,omitempty"`
-	ElapsedMillis             int64                      `json:"elapsed_ms"`
-	PreCleanupDone            *bool                      `json:"pre_cleanup_done,omitempty"`
-	PreCleanupResult          *string                    `json:"pre_cleanup_result_error,omitempty"`
-	PreCleanupResultTruncated bool                       `json:"pre_cleanup_result_error_truncated"`
-	WriteStarted              bool                       `json:"write_started"`
-	WriteReturned             bool                       `json:"write_returned"`
-	WriteComplete             bool                       `json:"write_complete"`
-	InputBytes                int                        `json:"input_bytes"`
-	InputSHA256               string                     `json:"input_sha256"`
-	InputLineBytes            int                        `json:"input_line_bytes"`
-	InputLineSHA256           string                     `json:"input_line_sha256"`
-	ScriptUTF16Units          int                        `json:"script_utf16_units"`
-	ScriptSHA256              string                     `json:"script_utf16le_sha256"`
-	WriteBytes                int                        `json:"write_bytes"`
-	WriteError                string                     `json:"write_error"`
-	WriteErrorTruncated       bool                       `json:"write_error_truncated"`
-	EOFRequested              bool                       `json:"eof_requested"`
-	EOFAttempted              bool                       `json:"eof_attempted"`
-	EOFCompleted              bool                       `json:"eof_completed"`
-	EOFError                  string                     `json:"eof_error"`
-	EOFErrorTruncated         bool                       `json:"eof_error_truncated"`
-	WorkersStarted            int                        `json:"workers_started"`
-	WorkersJoined             int                        `json:"workers_joined"`
-	CleanupAttempted          bool                       `json:"cleanup_attempted"`
-	CleanupConfirmed          bool                       `json:"cleanup_confirmed"`
-	CleanupForced             bool                       `json:"cleanup_forced"`
-	CleanupError              string                     `json:"cleanup_error"`
-	CleanupErrorTruncated     bool                       `json:"cleanup_error_truncated"`
-	Launch                    *windowsLaunchFacts        `json:"launch,omitempty"`
-	Stdout                    mappingStreamDiagnostic    `json:"stdout_observed"`
-	Stderr                    mappingStreamDiagnostic    `json:"stderr_observed"`
+	StartAttempted            bool                    `json:"start_attempted"`
+	Requested                 mappingAPIFacts         `json:"requested_api"`
+	Outcome                   *mappingMutation        `json:"validated_outcome,omitempty"`
+	Action                    string                  `json:"action"`
+	ActionTruncated           bool                    `json:"action_truncated"`
+	PID                       *uint32                 `json:"pid,omitempty"`
+	ElapsedMillis             int64                   `json:"elapsed_ms"`
+	PreCleanupDone            *bool                   `json:"pre_cleanup_done,omitempty"`
+	PreCleanupResult          *string                 `json:"pre_cleanup_result_error,omitempty"`
+	PreCleanupResultTruncated bool                    `json:"pre_cleanup_result_error_truncated"`
+	WriteStarted              bool                    `json:"write_started"`
+	WriteReturned             bool                    `json:"write_returned"`
+	WriteComplete             bool                    `json:"write_complete"`
+	InputBytes                int                     `json:"input_bytes"`
+	InputSHA256               string                  `json:"input_sha256"`
+	InputLineBytes            int                     `json:"input_line_bytes"`
+	InputLineSHA256           string                  `json:"input_line_sha256"`
+	WriteBytes                int                     `json:"write_bytes"`
+	WriteError                string                  `json:"write_error"`
+	WriteErrorTruncated       bool                    `json:"write_error_truncated"`
+	WorkersStarted            int                     `json:"workers_started"`
+	WorkersJoined             int                     `json:"workers_joined"`
+	CleanupAttempted          bool                    `json:"cleanup_attempted"`
+	CleanupConfirmed          bool                    `json:"cleanup_confirmed"`
+	CleanupForced             bool                    `json:"cleanup_forced"`
+	CleanupError              string                  `json:"cleanup_error"`
+	CleanupErrorTruncated     bool                    `json:"cleanup_error_truncated"`
+	Launch                    *windowsLaunchFacts     `json:"launch,omitempty"`
+	Stdout                    mappingStreamDiagnostic `json:"stdout_observed"`
+	Stderr                    mappingStreamDiagnostic `json:"stderr_observed"`
 }
 
 type mappingExecution struct {
@@ -1255,19 +1897,19 @@ func encodeMappingDiagnostic(details mappingCommandDiagnostic) error {
 }
 
 // The caller runs inside the watchdog-owned probe or tagged diagnostic test.
-func executeMappingPowerShell(ctx context.Context, host platform, executable, directory, moduleRoot string, request mappingCommandRequest, scriptSource string, closeInput bool) (execution mappingExecution, resultErr error) {
+func executeNativeMapping(ctx context.Context, host platform, executable, directory string, request mappingCommandRequest) (execution mappingExecution, resultErr error) {
 	started := time.Now()
 	var process child
 	var stdout, stderr mappingBoundedBuffer
 	var streams chan error
 	drained := 0
 	diagnostic := &execution.Diagnostic
-	diagnostic.EOFRequested = closeInput
+	diagnostic.Requested = mappingRequestedAPI(request)
 	diagnostic.CleanupConfirmed = true
 	diagnostic.Action, diagnostic.ActionTruncated = mappingDiagnosticText(request.Action, 64)
-	var writeStarted, writeReturned, eofAttempted, resultObserved bool
+	var writeStarted, writeReturned, resultObserved bool
 	var writeBytes int
-	var writeErr, eofErr, processErr error
+	var writeErr, processErr error
 	defer func() {
 		var launchError *windowsLaunchError
 		if errors.As(resultErr, &launchError) {
@@ -1324,13 +1966,10 @@ func executeMappingPowerShell(ctx context.Context, host platform, executable, di
 		diagnostic.ElapsedMillis = time.Since(started).Milliseconds()
 		diagnostic.WriteStarted, diagnostic.WriteReturned, diagnostic.WriteBytes = writeStarted, writeReturned, writeBytes
 		diagnostic.WriteComplete = writeReturned && writeErr == nil && writeBytes == diagnostic.InputBytes
-		diagnostic.EOFAttempted, diagnostic.EOFCompleted = eofAttempted, eofAttempted && eofErr == nil
 		if writeErr != nil {
 			diagnostic.WriteError, diagnostic.WriteErrorTruncated = mappingDiagnosticText(writeErr.Error(), 512)
 		}
-		if eofErr != nil {
-			diagnostic.EOFError, diagnostic.EOFErrorTruncated = mappingDiagnosticText(eofErr.Error(), 512)
-		}
+
 		diagnostic.Stdout, diagnostic.Stderr = stdout.diagnostic(), stderr.diagnostic()
 		execution.Stdout = append([]byte(nil), stdout.Bytes()...)
 	}()
@@ -1348,15 +1987,9 @@ func executeMappingPowerShell(ctx context.Context, host platform, executable, di
 	data = append(data, '\n')
 	diagnostic.InputBytes = len(data)
 	diagnostic.InputSHA256 = fmt.Sprintf("%x", sha256.Sum256(data))
-	words := utf16.Encode([]rune(scriptSource))
-	script := make([]byte, len(words)*2)
-	for i, word := range words {
-		binary.LittleEndian.PutUint16(script[i*2:], word)
-	}
-	diagnostic.ScriptUTF16Units, diagnostic.ScriptSHA256 = len(words), fmt.Sprintf("%x", sha256.Sum256(script))
-	args := []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", base64.StdEncoding.EncodeToString(script)}
 	diagnostic.CleanupConfirmed = false
-	process, err = startMappingPowerShell(host, executable, args, directory, moduleRoot)
+	diagnostic.StartAttempted = true
+	process, err = host.StartWithEnvironment(executable, []string{"--mapping-helper"}, directory, os.Environ())
 	if err != nil {
 		return execution, err
 	}
@@ -1371,11 +2004,8 @@ func executeMappingPowerShell(ctx context.Context, host platform, executable, di
 			writeErr = io.ErrShortWrite
 		}
 		writeReturned = true
-		if closeInput && writeErr == nil {
-			eofAttempted = true
-			eofErr = process.Input().Close()
-		}
-		streams <- errors.Join(writeErr, eofErr)
+
+		streams <- writeErr
 	}()
 	done := process.Done()
 	finished := false
@@ -1395,343 +2025,4 @@ func executeMappingPowerShell(ctx context.Context, host platform, executable, di
 		}
 	}
 	return execution, nil
-}
-
-func validateMappingResult(data []byte, request mappingCommandRequest) (result mappingCommandResult, resultErr error) {
-	if err := decodeMappingJSON(data, &result); err != nil {
-		return result, err
-	}
-	if request.OwnerSID == "" || result.OwnerSID != request.OwnerSID {
-		return result, errors.New("mapping command returned a different primary-token SID")
-	}
-	if result.Rows == nil {
-		return result, errors.New("mapping command omitted its row inventory")
-	}
-	if result.Status == "ok" && result.Cause != "" {
-		return result, errors.New("mapping command returned a failure cause with successful status")
-	}
-	if result.Status != "ok" {
-		return result, fmt.Errorf("mapping %s failed: %s", request.Action, result.Cause)
-	}
-	if len(result.Rows) > mappingRowLimit {
-		return result, errors.New("mapping result row count exceeds limit")
-	}
-	return result, nil
-}
-
-func executePreparedMappingPowerShell(ctx context.Context, host platform, executable, directory, moduleRoot string, request mappingCommandRequest, closeInput bool, ops mappingUtilityOps) (execution mappingExecution, resultErr error) {
-	started := time.Now()
-	script, preparation, err := prepareMappingUtility(ctx, moduleRoot, executable, mappingPowerShellScript, ops)
-	if err != nil {
-		execution.Diagnostic.Action, execution.Diagnostic.ActionTruncated = mappingDiagnosticText(request.Action, 64)
-		execution.Diagnostic.EOFRequested = closeInput
-		execution.Diagnostic.CleanupConfirmed = preparation.CleanupConfirmed
-	} else {
-		execution, err = executeMappingPowerShell(ctx, host, executable, directory, moduleRoot, request, script, closeInput)
-	}
-	execution.Diagnostic.UtilityPreparation = &preparation
-	execution.Diagnostic.CleanupConfirmed = preparation.CleanupConfirmed && execution.Diagnostic.CleanupConfirmed
-	execution.Diagnostic.ElapsedMillis = time.Since(started).Milliseconds()
-	return execution, err
-}
-
-func runMappingPowerShell(ctx context.Context, host platform, executable, directory, moduleRoot string, request mappingCommandRequest, ops mappingUtilityOps) (mappingCommandResult, error) {
-	execution, commandErr := executePreparedMappingPowerShell(ctx, host, executable, directory, moduleRoot, request, false, ops)
-	if execution.Diagnostic.ScriptUTF16Units == 0 && commandErr != nil {
-		return mappingCommandResult{}, errors.Join(commandErr, encodeMappingDiagnostic(execution.Diagnostic))
-	}
-	result, validationErr := validateMappingResult(execution.Stdout, request)
-	if err := errors.Join(commandErr, validationErr); err != nil {
-		return result, errors.Join(err, encodeMappingDiagnostic(execution.Diagnostic))
-	}
-	return result, nil
-}
-
-const mappingStartupEntryScript = `[Console]::Error.WriteLine('RFS-MAPPING/1 entry-only')
-[Console]::Out.WriteLine('{"status":"entry-ok"}')
-`
-
-const mappingCommandPrelude = `$ErrorActionPreference = 'Stop'
-$WarningPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-Set-StrictMode -Version Latest
-[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$rfsCommandStage = 'input'
-function Get-RfsCommandTextFact($Value, [int]$Limit) {
-    if ($null -eq $Value) { return @{state='null'} }
-    $text = [string]$Value
-    $units = [Math]::Min($text.Length, $Limit + 1)
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($text.Substring(0, $units))
-    $length = [Math]::Min($bytes.Length, $Limit)
-    $prefix = [byte[]]::new($length)
-    [Array]::Copy($bytes, $prefix, $length)
-    $cut = [int]($text.Length -gt $units -or $bytes.Length -gt $Limit)
-    $state = if ($text.Length -eq 0) { 'empty' } else { 'value' }
-    return @{state=$state; utf16=$text.Length; prefix=[Convert]::ToBase64String($prefix); truncated=$cut}
-}
-function Write-RfsCommandFact([string]$Name, $Value, [int]$Limit) {
-    $fact = Get-RfsCommandTextFact $Value $Limit
-    if ($fact.state -eq 'null') {
-        [Console]::Error.WriteLine(('RFS-CMD/1 fact name={0} state=null' -f $Name))
-    } else {
-        [Console]::Error.WriteLine(('RFS-CMD/1 fact name={0} state={1} utf16={2} prefix_b64={3} truncated={4}' -f $Name,$fact.state,$fact.utf16,$fact.prefix,$fact.truncated))
-    }
-}
-function Format-RfsCommandText([string]$Label, $Fact) {
-    if ($Fact.state -eq 'null') { return ('{0}_state=null' -f $Label) }
-    return ('{0}_state={1} {0}16={2} {0}_b64={3} {0}cut={4}' -f $Label,$Fact.state,$Fact.utf16,$Fact.prefix,$Fact.truncated)
-}
-function Write-RfsCommandUnsupported([int]$Count, $Name, $Kind) {
-    $nameFact = Get-RfsCommandTextFact $Name 64
-    $kindFact = Get-RfsCommandTextFact $Kind 32
-    [Console]::Error.WriteLine(('RFS-CMD/1 unsupported count={0} {1} {2}' -f $Count,(Format-RfsCommandText 'name' $nameFact),(Format-RfsCommandText 'kind' $kindFact)))
-}
-function Write-RfsCommandProvenance([System.Management.Automation.CmdletInfo]$Command, $Module, [string]$Role) {
-    $implementingType = $Command.ImplementingType
-    if ($null -eq $implementingType) { throw 'resolved cmdlet has no implementing type' }
-    $assembly = $implementingType.Assembly
-    $mvid = $implementingType.Module.ModuleVersionId.ToString('D')
-    $moduleName = $null
-    $moduleVersion = $null
-    $modulePath = $null
-    if ($null -ne $Module) {
-        $moduleName = $Module.Name
-        if ($null -ne $Module.Version) { $moduleVersion = $Module.Version.ToString() }
-        $modulePath = $Module.Path
-    }
-    [Console]::Error.WriteLine(('RFS-CMD/1 command role={0} name=ConvertFrom-Json kind=Cmdlet' -f $Role))
-    Write-RfsCommandFact 'module_name' $moduleName 64
-    Write-RfsCommandFact 'module_version' $moduleVersion 48
-    Write-RfsCommandFact 'module_path' $modulePath 96
-    Write-RfsCommandFact 'implementing_type' $implementingType.FullName 96
-    Write-RfsCommandFact 'assembly_name' $assembly.FullName 112
-    Write-RfsCommandFact 'assembly_location' $assembly.Location 96
-    [Console]::Error.WriteLine(('RFS-CMD/1 mvid value={0}' -f $mvid))
-}
-`
-
-const mappingCommandFailure = `catch {
-    $primaryError = $_
-    $primaryStage = $rfsCommandStage
-    try {
-        [Console]::Error.WriteLine(('RFS-CMD/1 error-begin stage={0}' -f $primaryStage))
-        $typeFact = Get-RfsCommandTextFact $primaryError.Exception.GetType().FullName 64
-        $idFact = Get-RfsCommandTextFact $primaryError.FullyQualifiedErrorId 64
-        [Console]::Error.WriteLine(('RFS-CMD/1 error {0} {1}' -f (Format-RfsCommandText 'type' $typeFact),(Format-RfsCommandText 'id' $idFact)))
-        [Console]::Error.WriteLine('RFS-CMD/1 error-end')
-    } catch {
-        [Console]::Error.WriteLine('RFS-CMD/1 observer-failure')
-    } finally {
-        exit 1
-    }
-}
-`
-
-const mappingStartupResolveScript = `[Console]::Error.WriteLine('RFS-CMD/1 entry resolve')
-` + mappingCommandPrelude + `try {
-    [Console]::Error.WriteLine('RFS-CMD/1 before-readline')
-    $requestLine = [Console]::In.ReadLine()
-    [Console]::Error.WriteLine('RFS-CMD/1 after-readline')
-    if ($null -eq $requestLine) { throw 'missing control input line' }
-    $rfsCommandStage = 'resolve'
-    [Console]::Error.WriteLine('RFS-CMD/1 before-resolution')
-    $commands = @(Microsoft.PowerShell.Core\Get-Command -Name ConvertFrom-Json -ErrorAction Stop)
-    [Console]::Error.WriteLine('RFS-CMD/1 after-resolution')
-    $actualName = $null
-    $actualKind = $null
-    if ($commands.Count -gt 0) { $actualName = $commands[0].Name; $actualKind = [string]$commands[0].CommandType }
-    if ($commands.Count -ne 1 -or $actualName -cne 'ConvertFrom-Json' -or $commands[0] -isnot [System.Management.Automation.CmdletInfo] -or $commands[0].CommandType -ne [System.Management.Automation.CommandTypes]::Cmdlet) {
-        Write-RfsCommandUnsupported $commands.Count $actualName $actualKind
-        throw 'command resolution did not return the requested cmdlet'
-    }
-    $rfsCommandStage = 'provenance'
-    [Console]::Error.WriteLine('RFS-CMD/1 before-provenance')
-    Write-RfsCommandProvenance $commands[0] $commands[0].Module 'resolved-command'
-    [Console]::Error.WriteLine('RFS-CMD/1 after-provenance')
-    $rfsCommandStage = 'result'
-    [Console]::Out.WriteLine('{"status":"resolve-ok"}')
-    [Console]::Error.WriteLine('RFS-CMD/1 complete resolve')
-}
-` + mappingCommandFailure
-
-func mappingStartupImportScript(manifestPath string) (string, error) {
-	if manifestPath == "" || !filepath.IsAbs(manifestPath) || strings.IndexByte(manifestPath, 0) >= 0 || !utf8.ValidString(manifestPath) {
-		return "", errors.New("Utility manifest path must be absolute valid text without NUL")
-	}
-	encodedPath := base64.StdEncoding.EncodeToString([]byte(manifestPath))
-	return `[Console]::Error.WriteLine('RFS-CMD/1 entry import-parse')
-` + mappingCommandPrelude + `try {
-    [Console]::Error.WriteLine('RFS-CMD/1 before-readline')
-    $requestLine = [Console]::In.ReadLine()
-    [Console]::Error.WriteLine('RFS-CMD/1 after-readline')
-    if ($null -eq $requestLine) { throw 'missing control input line' }
-    $utilityManifest = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('` + encodedPath + `'))
-    $rfsCommandStage = 'import'
-    [Console]::Error.WriteLine('RFS-CMD/1 before-import')
-    $modules = @(Microsoft.PowerShell.Core\Import-Module -Name $utilityManifest -PassThru -ErrorAction Stop)
-    [Console]::Error.WriteLine('RFS-CMD/1 after-import')
-    $actualName = $null
-    $actualKind = $null
-    if ($modules.Count -gt 0) {
-        $actualKind = $modules[0].GetType().FullName
-        if ($modules[0] -is [System.Management.Automation.PSModuleInfo]) { $actualName = $modules[0].Name }
-    }
-    if ($modules.Count -ne 1 -or $modules[0] -isnot [System.Management.Automation.PSModuleInfo] -or $actualName -cne 'Microsoft.PowerShell.Utility') {
-        Write-RfsCommandUnsupported $modules.Count $actualName $actualKind
-        throw 'manifest import did not return the expected Utility module'
-    }
-    $rfsCommandStage = 'provenance'
-    [Console]::Error.WriteLine('RFS-CMD/1 before-provenance')
-    $command = $modules[0].ExportedCmdlets['ConvertFrom-Json']
-    if ($null -eq $command -or $command -isnot [System.Management.Automation.CmdletInfo] -or $command.Name -cne 'ConvertFrom-Json' -or $command.CommandType -ne [System.Management.Automation.CommandTypes]::Cmdlet) {
-        $actualName = $null
-        $actualKind = $null
-        $count = 0
-        if ($null -ne $command) { $count = 1; $actualName = $command.Name; $actualKind = [string]$command.CommandType }
-        Write-RfsCommandUnsupported $count $actualName $actualKind
-        throw 'Utility module did not export the requested cmdlet'
-    }
-    Write-RfsCommandProvenance $command $modules[0] 'imported-export'
-    [Console]::Error.WriteLine('RFS-CMD/1 after-provenance')
-    $rfsCommandStage = 'parse'
-    [Console]::Error.WriteLine('RFS-CMD/1 before-parse')
-    $request = $requestLine | ConvertFrom-Json
-    [Console]::Error.WriteLine('RFS-CMD/1 after-parse')
-    $rfsCommandStage = 'result'
-    [Console]::Out.WriteLine('{"status":"import-parse-ok"}')
-    [Console]::Error.WriteLine('RFS-CMD/1 complete import-parse')
-}
-` + mappingCommandFailure, nil
-}
-
-type mappingStartupKind string
-
-const (
-	mappingStartupEntry     mappingStartupKind = "entry"
-	mappingStartupInventory mappingStartupKind = "inventory"
-	mappingStartupResolve   mappingStartupKind = "resolve"
-	mappingStartupImport    mappingStartupKind = "import-parse"
-)
-
-type mappingStartupCell struct {
-	Name       string
-	Kind       mappingStartupKind
-	Script     string
-	CloseInput bool
-	Entry      string
-	Result     string
-}
-
-func mappingStartupPlan() [6]mappingStartupCell {
-	return [6]mappingStartupCell{
-		{"01_entry_open", mappingStartupEntry, mappingStartupEntryScript, false, "RFS-MAPPING/1 entry-only", `{"status":"entry-ok"}`},
-		{"02_entry_eof", mappingStartupEntry, mappingStartupEntryScript, true, "RFS-MAPPING/1 entry-only", `{"status":"entry-ok"}`},
-		{"03_inventory_open", mappingStartupInventory, "", false, "RFS-MAPPING/1 entry", ""},
-		{"04_inventory_eof", mappingStartupInventory, "", true, "RFS-MAPPING/1 entry", ""},
-		{"05_resolve_json_command", mappingStartupResolve, mappingStartupResolveScript, false, "RFS-CMD/1 entry resolve", `{"status":"resolve-ok"}`},
-		{"06_import_utility_parse", mappingStartupImport, "", false, "RFS-CMD/1 entry import-parse", `{"status":"import-parse-ok"}`},
-	}
-}
-
-func validateMappingStartupResult(cell mappingStartupCell, data []byte, request mappingCommandRequest) error {
-	var expected string
-	switch cell.Kind {
-	case mappingStartupInventory:
-		if cell.Result != "" {
-			return errors.New("inventory cell supplied a fixed result")
-		}
-		_, err := validateMappingResult(data, request)
-		return err
-	case mappingStartupEntry:
-		expected = `{"status":"entry-ok"}`
-	case mappingStartupResolve:
-		expected = `{"status":"resolve-ok"}`
-	case mappingStartupImport:
-		expected = `{"status":"import-parse-ok"}`
-	default:
-		return errors.New("unknown mapping startup cell kind")
-	}
-	if cell.Result != expected || strings.TrimSpace(string(data)) != expected {
-		return fmt.Errorf("%s cell omitted its fixed result", cell.Kind)
-	}
-	return nil
-}
-
-func walkMappingStartupCells(visit func(int, mappingStartupCell) bool) (aborted bool) {
-	for index, cell := range mappingStartupPlan() {
-		if !visit(index+1, cell) {
-			return true
-		}
-	}
-	return false
-}
-
-func (b *nativeMappingBackend) command(ctx context.Context, action string, ledger mappingLedger) (mappingCommandResult, error) {
-	if err := requireMappingJob(); err != nil {
-		return mappingCommandResult{}, err
-	}
-	owner, err := currentMappingOwner()
-	if err != nil {
-		return mappingCommandResult{}, err
-	}
-	if owner != b.owner {
-		return mappingCommandResult{}, errors.New("mapping process SID or logon context changed")
-	}
-	request := mappingCommandRequest{action, b.module, b.owner.SID, ledger.LocalPath, ledger.RemotePath, ledger.TCPPort}
-	commandCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	defer cancel()
-	result, err := runMappingPowerShell(commandCtx, b.host, b.executable, filepath.Dir(b.o.StateFile), b.moduleRoot, request, nativeMappingUtilityOps())
-	if err != nil {
-		return result, err
-	}
-	after, err := currentMappingOwner()
-	if err != nil {
-		return result, err
-	}
-	if after != b.owner {
-		return result, errors.New("mapping logon context changed during command")
-	}
-	return result, nil
-}
-
-func (b *nativeMappingBackend) Snapshot(ctx context.Context) (mappingSnapshot, error) {
-	result, err := b.command(ctx, "inventory", mappingLedger{})
-	if err != nil {
-		return mappingSnapshot{}, err
-	}
-	snapshot := mappingSnapshot{Owner: b.owner, Rows: result.Rows, Devices: make(map[string][]string, 26)}
-	for letter := 'A'; letter <= 'Z'; letter++ {
-		if err := ctx.Err(); err != nil {
-			return mappingSnapshot{}, err
-		}
-		drive := string(letter) + ":"
-		targets, err := mappingDOSTarget(drive)
-		if err != nil {
-			return mappingSnapshot{}, err
-		}
-		snapshot.Devices[drive] = targets
-	}
-	snapshot.LogicalDrives, err = windows.GetLogicalDrives()
-	if err != nil {
-		return mappingSnapshot{}, err
-	}
-	sort.Slice(snapshot.Rows, func(i, j int) bool {
-		if snapshot.Rows[i].LocalPath != snapshot.Rows[j].LocalPath {
-			return snapshot.Rows[i].LocalPath < snapshot.Rows[j].LocalPath
-		}
-		return snapshot.Rows[i].RemotePath < snapshot.Rows[j].RemotePath
-	})
-	return snapshot, checkMappingSnapshot(snapshot)
-}
-func (b *nativeMappingBackend) Create(ctx context.Context, ledger mappingLedger) error {
-	_, err := b.command(ctx, "create", ledger)
-	return err
-}
-func (b *nativeMappingBackend) Remove(ctx context.Context, ledger mappingLedger, row mappingRow) error {
-	if row.LocalPath != ledger.LocalPath || row.RemotePath != ledger.RemotePath {
-		return errors.New("removal row differs from owned intent")
-	}
-	_, err := b.command(ctx, "remove", ledger)
-	return err
 }
