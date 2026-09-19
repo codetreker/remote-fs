@@ -278,3 +278,65 @@ func TestRelatedFileIdentityAndResponseReservations(t *testing.T) {
 		}
 	}
 }
+
+func TestTransportQueryInfoCreditsIncludeIgnoredInputLength(t *testing.T) {
+	for _, test := range []struct {
+		input, output uint32
+		credits       int
+	}{
+		{0, 0, 1}, {65536, 1, 1}, {65537, 1, 2}, {1, 131072, 2}, {math.MaxUint32, 1, 65536},
+	} {
+		request := transportPayload(wire.QueryInfo, test.output)
+		request.Body[2], request.Body[3] = 1, 4
+		binary.LittleEndian.PutUint16(request.Body[8:], 65535)
+		binary.LittleEndian.PutUint32(request.Body[12:], test.input)
+		if query, err := request.QueryInfo(); err != nil || query.Input != nil {
+			t.Fatalf("ignored input failed semantic decoding: %+v %v", query, err)
+		}
+		if got := requiredCredits(request); got != test.credits {
+			t.Fatalf("declared input%d output%d: credits%d want%d", test.input, test.output, got, test.credits)
+		}
+	}
+	request := transportPayload(wire.QueryInfo, 1)
+	request.Body[2], request.Body[3] = 1, 15
+	binary.LittleEndian.PutUint32(request.Body[12:], 65537)
+	if _, err := request.QueryInfo(); err == nil {
+		t.Fatal("malformed applicable input accepted")
+	}
+	if got := requiredCredits(request); got != 2 {
+		t.Fatalf("malformed input waived declared credit charge: %d", got)
+	}
+}
+
+func TestTransportFileCommandsDispatchThroughRetainedHandleRegistry(t *testing.T) {
+	c, s, _ := transportFixture(t)
+	c.negotiated = true
+	export := &Export{server: c.server, published: true, share: Share{Name: "files", Volume: "volume"}}
+	authority := &authoritySession{export: export, deadline: time.Now().Add(time.Hour)}
+	tr := &tree{id: 1, kind: volumeTree, export: export, authority: authority}
+	tr.files = newHandleRegistry(tr, c.server.config.Limits)
+	s.trees[1] = tr
+	for _, command := range []uint16{wire.Read, wire.Write, wire.Flush, wire.QueryInfo} {
+		var body []byte
+		if command == wire.Flush {
+			body = make([]byte, 24)
+			binary.LittleEndian.PutUint16(body, 24)
+		} else {
+			body = transportPayload(command, 1).Body
+			if command == wire.QueryInfo {
+				body[2], body[3] = 1, 6
+				binary.LittleEndian.PutUint32(body[4:], 8)
+			}
+		}
+		request := transportRequest(t, s, command, uint64(command), body)
+		header := request.Header
+		_, status, signer := c.dispatch(t.Context(), request, request, &header)
+		if status != statusFileClosed || signer != s.signer {
+			t.Fatalf("command%d bypassed the retained handler: status%x signer%v", command, status, signer == s.signer)
+		}
+		if export.active != 0 {
+			t.Fatal("command dispatch leaked export work")
+		}
+		c.retireRequests([]wire.Request{request})
+	}
+}

@@ -12,11 +12,11 @@ Linux 和编程入口可以创建 Windows 无法表示或存在大小写歧义�
 
 ## 提案
 
-[SMB 协议与会话端点](../../implemented/architecture/2026-09-16-smb-protocol-primitives.md)已交付报文/签名/认证依赖、本机 listener/export、会话和直接 FileSession 引用管理。原会话端点已有 Linux 与 Windows ARM64 的协议/拥有权包级验证，SSPI 也有对应原生实测。guarded 名字解析、平台 metadata helper 和受限 CREATE 已接入，新增部分目前是本地包级与构建证据；数据、信息/名字修改、范围、通知及映射仍待完成，组合后的原生验收未完成。下述剩余工作保持同一目标。
+[SMB 协议与会话端点](../../implemented/architecture/2026-09-16-smb-protocol-primitives.md)已交付报文/签名/认证依赖、本机 listener/export、会话和直接 FileSession 引用管理。原会话端点已有 Linux 与 Windows ARM64 的协议/拥有权包级验证，SSPI 也有对应原生实测。guarded 名字解析、受限 CREATE、READ/WRITE/FLUSH 和选定 QUERY_INFO 已接入；这些新增部分的真实系统客户端组合仍待验证，属性/名字修改、范围、目录枚举、通知及映射仍待完成，组合后的原生验收未完成。下述剩余工作保持同一目标。
 
 ### 接入形态与现有依赖
 
-Windows 11 24H2+ 使用系统 SMB 重定向器；独立、可嵌入的 Go 客户端 package 已提供本机 loopback listener、显式认证/授权、share 发布/停止及会话管理。Windows 映射及文件命令的 SMB 解释仍须接入这些拥有者。远端继续使用中立接口，不部署 Windows 专有服务、不为 volume 切换名字模式，也不要求第三方文件系统驱动。业务方控制远端身份、凭据轮换与每个语义操作授权，默认仅创建者能访问本机映射。
+Windows 11 24H2+ 使用系统 SMB 重定向器；独立、可嵌入的 Go 客户端 package 已提供本机 loopback listener、显式认证/授权、share 发布/停止及会话管理。Windows 映射及其余文件命令的 SMB 解释仍须接入这些拥有者。远端继续使用中立接口，不部署 Windows 专有服务、不为 volume 切换名字模式，也不要求第三方文件系统驱动。业务方控制远端身份、凭据轮换与每个语义操作授权，默认仅创建者能访问本机映射。
 
 已实现的端点把同一 SMB session/Export 的 tree 绑定到一份 FileSession，NodeReference/可选 File 是同一关闭拥有者；后续文件命令继续复用现有 FileSession/File、NodeID 与同步内容管线，普通 Windows 打开随同一 incarnation 有效，断线未知时 fencing，authority 退役后旧 handle 明确失败。短暂 HTTP 超时不代表权限已解除，也不按路径重新创建引用或静默重获锁。Strong 的有限期限、恢复保护与 TargetGone 保持独立；不在此引入 durable/persistent handles、第二份 File lease 或通用动作 receipt。
 
@@ -24,8 +24,8 @@ Windows 11 24H2+ 使用系统 SMB 重定向器；独立、可嵌入的 Go 客户
 |---|---|---|
 | CREATE 普通文件 | OpenAt、捕获结果、Uses、初值与 armed intent 已接入 | 已有 SUPERSEDE 等尚拒绝的分支、完整平台组合与原生验收 |
 | metadata-only / 目录 CREATE | NodeReference、完整用途授权、引用清理已接入 | 系统客户端权限/共享组合验收；不把相容性 claim 变成字节方法 |
-| READ/WRITE/FLUSH | File.ReadAt/WriteAt/Sync 与条件 MutateFile | SMB 分段、部分结果与同步确认；R-CON-5 的跨应用调用单位保持未决 |
-| QUERY/SET_INFO | 共同时间、namespace CAS、ReferenceState；部分已知值编码 helper 已实现 | 命令接线、历史时间政策与完整字节格式，真实 pending/detached 事实 |
+| READ/WRITE/FLUSH | 原引用单次读取、完整写确认、原子 append、真实 Sync 已接入 | 系统客户端与缓存组合；目录/metadata-only Flush 能力，R-CON-5 的跨应用调用单位仍未决 |
+| QUERY/SET_INFO | 选定 file/filesystem QUERY_INFO 已按捕获状态/已知虚拟事实接入 | SET_INFO、当前名字/position/mode 等查询、历史时间政策与完整平台验收 |
 | rename / disposition | MutateName、Set/ClearPendingUnlink | 观察名与输出名、generation、armed 与已 pending 的区别及平台状态码 |
 | LOCK / CANCEL | UseOwners/RangeControl | 序列化的已确认 claim ledger、重复获取与精确解除政策、未知结果 fencing |
 | 目录枚举与 CHANGE_NOTIFY | 权威 ReadDirNode/Bounded、现有日志/复制事实 | 名字表示、筛选和一致观察，缓存透明性及可取消的本机生命周期 |
@@ -83,7 +83,13 @@ FILE_DELETE_ON_CLOSE 对应 armed OnReferenceClose，指定引用结束时触发
 
 共同 BirthTime/ChangeTime 由原生所有创建/修改入口维护，Windows payload 只保存平台专有属性；不能把会被 Linux/SDK 修改的 ChangeTime 只放在 Windows blob。已实现的 smb.windows codec 将不存在的 DOS 扩展位与畸形 present payload 分开，后者明确失败，其它平台的 namespace 不被覆盖。CREATE 使用 512 字节稠密虚拟 extent 和由规范 Share.Volume 指定的 serial；它们不是物理 backend 事实。
 
-历史节点的 BirthTime/ChangeTime 可能未知。当前编码和 CREATE 对必需未知时间明确拒绝；这会影响旧 volume 的网络驱动器可用性。显式兼容投影则须决定显示值、适用条件和“非历史事实”的含义，不能写回 authority 或被当成真实创建时间。该显示选择保持未决；Linux 已选择的 ctime/权限展示不能自动成为 Windows 政策。新建文件成功也不能证明历史数据可用。
+历史节点的 BirthTime/ChangeTime 可能未知。当前编码、CREATE 和需要这些事实的信息查询对必需未知时间明确拒绝；这会影响旧 volume 的网络驱动器可用性。显式兼容投影则须决定显示值、适用条件和“非历史事实”的含义，不能写回 authority 或被当成真实创建时间。该显示选择保持未决；Linux 已选择的 ctime/权限展示不能自动成为 Windows 政策。新建文件成功也不能证明历史数据可用。
+
+### 写入的 ARCHIVE 与未知查询事实
+
+普通 WRITE 当前只发布字节及原生共同时间，Windows ARCHIVE 保持原值；clear/absent 不阻止合法写入，也不额外要求 WRITE_ATTRIBUTES。CREATE/reset 的初始化独立保留。原子 ARCHIVE-on-write 仍须审查现有 FileMutation 的组合和最终事务，把字节/metadata 权限、quota 与发布一次结算；不能用两次 mutation、SMB 重试或 Close 后修补替代原子保证。
+
+已接入的信息 class 只使用实际原引用捕获、NodeID/granted mask、已知空 EA 集合及明确的虚拟 Space/serial 政策。目录/metadata-only Flush、volume 创建时间/label、current-position/mode/name 和其它未实现 class 仍拒绝。后续支持必须补足对应事实或能力，不能用名字旧缓存、零值或物理存储假设填平。
 
 ## 备选方案
 

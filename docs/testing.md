@@ -379,11 +379,21 @@ go vet ./packages/smb ./packages/smb/internal/wire ./packages/smb/internal/signi
 
 [名字用例](../packages/smb/names_test.go)核对字面路径、UTF-16/guard 边界、目录后缀、ADS 拒绝和整个目录的非法/歧义检测。[resolver 用例](../packages/smb/namespace_test.go)验证原始名字与 NodeID、前缀 guards、完整 metadata 披露授权、预算和最终/中间缺席区别；遗漏前缀 guards 的隔离对照必须失败。Linux 使用私有测试比较器，真实路径解析在那里拒绝；[Windows 比较器](../packages/smb/name_compare_windows_test.go)的原生执行另计。
 
-[Windows metadata](../packages/smb/windows_metadata_test.go)和[信息编码](../packages/smb/file_information_test.go)核对格式/CAS token 分离、其它 namespace、缺席/畸形/未知格式、结构属性、FILETIME 极值与未知时间拒绝。大小、链接数、pending、identity 和 granted-access 必须来自显式输入，不靠缺值造事实；这些 helper 测试不代表 QUERY_INFO handler 已接入。
+[Windows metadata](../packages/smb/windows_metadata_test.go)和[信息编码](../packages/smb/file_information_test.go)核对格式/CAS token 分离、其它 namespace、缺席/畸形/未知格式、结构属性、FILETIME 极值与未知时间拒绝。大小、链接数、pending、identity 和 granted-access 必须来自显式输入，不靠缺值造事实；这些 helper 测试不能代替 QUERY_INFO 命令路径的验证。
 
-[CREATE 计划和响应](../packages/smb/create_test.go)检查 access/share/disposition、版本条件、最终叶名状态、QFid/MxAc/忽略字段与虚拟大小/serial；[打开生命周期](../packages/smb/create_lifecycle_test.go)核对效果前收费、已知零效果冲突最多四轮、取消和未知结果不得重发、部分引用/清理失败仍归原拥有者。成功响应使用原子结果，不能由后置 Stat 修补。已有 SUPERSEDE、symlink 与未接入的数据/信息命令必须拒绝。
+[CREATE 计划和响应](../packages/smb/create_test.go)检查 access/share/disposition、版本条件、最终叶名状态、QFid/MxAc/忽略字段与虚拟大小/serial；[打开生命周期](../packages/smb/create_lifecycle_test.go)核对效果前收费、已知零效果冲突最多四轮、取消和未知结果不得重发、部分引用/清理失败仍归原拥有者。成功响应使用原子结果，不能由后置 Stat 修补。已有 SUPERSEDE、symlink 与尚未支持的 disposition/options 必须拒绝。
 
 名字/helper 聚焦普通/race 分别通过 10 根/14 verdict 和 11 根/46 verdict；CREATE 为 18 根/54 verdict。包含这些代码的 SMB 普通包级验证通过 104 根/222 verdict，自身覆盖 88.6%，149 个函数均至少 50%。vet 和 ARM64/AMD64 构建证据来自最终平台无关状态修正之前的对应源码；最终 CREATE 普通/race/profile 已重新执行。交叉构建不等于 Windows 原生执行，旧会话/SSPI 收据也不能替新增 CREATE 证明系统客户端、共享模式、映射或缓存。
+
+### SMB 保留引用的字节与信息命令
+
+[字节用例](../packages/smb/file_io_test.go)核对一次 ReadAt 的 Attr/数据、短读与 MinimumCount/EOF、populated result 加错误拒绝，以及普通/append/零写只调用一次、全量成功 Count 和任何错误都不重发。append-only 使用 native EOF，-2 current-position 与未支持 flag/channel 在效果前拒绝。原引用在名字替换后保持身份，close/cancel 等待真实借用排空；FLUSH 必须调用 Sync，不允许目录或 metadata-only 成功空操作。
+
+[真实 HTTP 组合](../packages/smb/file_io_native_test.go)使用当前 SQLite/objectstore 引用检验 append、quota、同步和共享保护。clear/absent ARCHIVE 不阻止写入且保持原样，不能把另一次 metadata mutation 隐藏为普通写成功。有效大 metadata 与完整 64 KiB 数据请求在分别足够的预算内成功；占满与 CREATE 共用的 result pool 必须在 HTTP/native 效果前拒绝，归还后恢复。原 context callback 仍可拒绝支持它的 producer，但不能把 callback 当跨 HTTP 预留协议；取消/关闭后 charge 只归还一次。
+
+[查询用例](../packages/smb/query_info_test.go)逐 class 核对一次 Stat/State 或完全不观察 backend 的 identity/access/known-EA 路径，以及 Windows class-specific rights 和当前业务授权。Standard 的 Attr/pending/detached 不混捕获，未知时间与畸形事实明确失败。固定 buffer 边界、SMB 3.1.1 error context、资源预留、关闭交错和忽略输入字段分别断言；声明 InputLength 即使无语义也必须参加 credits。
+
+[filesystem 用例](../packages/smb/filesystem_information_test.go)验证 512 字节虚拟单位的余数、Total/Avail 与 max(Total−Used,0) 的不同来源、超限 Used、Space 不可用/不一致及 Unicode 显示名前缀。已声明虚拟 remote disk、保留大小写的 Unicode 名字与空 EA 集合不能扩大为物理 allocation、ACL、EA/stream 或未知 volume 创建时间。字节/查询聚焦普通与 race 各通过 35 根、131 个 verdict；最终组合源码的 SMB 全包普通与 race 各通过 139 根、353 个 verdict，无 fail/skip，自身覆盖 89.7%，166 个函数均至少 50%。vet、格式检查和 Windows AMD64/ARM64 测试构建与可移植用例选择核对通过。隔离对照分别删除捕获身份校验、重发未知写入、增加 ARCHIVE 前置限制、跳过查询权限及漏计声明输入 credits，均在对应语义断言失败。真实 authority/HTTP 组合用例只在 Linux 执行；Windows 构建核对其余可移植命令用例，不把 Linux SQLite/nativelease 当作已移植。当前源码的系统重定向器、映射和缓存验收仍独立。
 
 ### 当前 authority 的独立运行环境
 

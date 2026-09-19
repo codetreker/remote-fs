@@ -9,6 +9,7 @@ type QueryDirectoryRequest struct {
 	OutputLength uint32
 }
 type QueryInfoRequest struct {
+	InputLength  uint32
 	Type         byte
 	Class        byte
 	OutputLength uint32
@@ -60,12 +61,19 @@ func (r Request) QueryInfo() (QueryInfoRequest, error) {
 	out.Type = r.Body[2]
 	out.Class = r.Body[3]
 	out.OutputLength = le.Uint32(r.Body[4:8])
+	out.InputLength = le.Uint32(r.Body[12:16])
 	out.Additional = le.Uint32(r.Body[16:20])
 	out.Flags = le.Uint32(r.Body[20:24])
 	copy(out.FileID[:], r.Body[24:40])
-	var err error
-	out.Input, err = r.field(uint32(le.Uint16(r.Body[8:10])), le.Uint32(r.Body[12:16]), 104)
-	return out, err
+	// Only FullEa and quota queries interpret their input buffer. Its declared
+	// length still participates in credit admission for all query classes.
+	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/abb48417-27e5-4a16-82e0-3e5981db97e8
+	if out.InputLength != 0 && (out.Type == 1 && out.Class == 15 || out.Type == 4) {
+		var err error
+		out.Input, err = r.field(uint32(le.Uint16(r.Body[8:10])), out.InputLength, 104)
+		return out, err
+	}
+	return out, nil
 }
 
 func (r Request) SetInfo() (SetInfoRequest, error) {

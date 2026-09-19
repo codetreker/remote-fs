@@ -525,34 +525,33 @@ func patchRelatedFile(command uint16, body []byte, id wire.FileID) {
 }
 
 func requiredCredits(r wire.Request) int {
-	n := 0
+	n := uint64(0)
 	switch r.Header.Command {
 	case wire.Write:
 		if v, e := r.Write(); e == nil {
-			n = len(v.Data)
+			n = uint64(len(v.Data))
 		}
 	case wire.Read:
 		if v, e := r.Read(); e == nil {
-			n = int(v.Length)
+			n = uint64(v.Length)
 		}
 	case wire.QueryDirectory:
 		if v, e := r.QueryDirectory(); e == nil {
-			n = int(v.OutputLength)
+			n = uint64(v.OutputLength)
 		}
 	case wire.QueryInfo:
-		if v, e := r.QueryInfo(); e == nil {
-			n = int(v.OutputLength)
-		}
+		v, _ := r.QueryInfo()
+		n = uint64(max(v.InputLength, v.OutputLength))
 	case wire.ChangeNotify:
 		if v, e := r.Notify(); e == nil {
-			n = int(v.OutputLength)
+			n = uint64(v.OutputLength)
 		}
 	case wire.IOCTL:
 		if v, e := r.IOCTL(); e == nil {
-			n = max(len(v.Input), len(v.Output), int(v.MaxInputResponse), int(v.MaxOutputResponse))
+			n = max(uint64(len(v.Input)), uint64(len(v.Output)), uint64(v.MaxInputResponse), uint64(v.MaxOutputResponse))
 		}
 	}
-	return max(1, (n+65535)/65536)
+	return int(max(1, (n+65535)/65536))
 }
 
 func (c *connection) grantCredits(requested uint16) uint16 {

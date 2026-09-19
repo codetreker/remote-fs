@@ -36,7 +36,7 @@ NodeReference 是 handle 唯一 Close 拥有者，普通 File 只作为同一对
 
 [cleanup attempt](../../../../packages/smb/cleanup_attempt.go)让并发调用共享本轮不可变结果，后来调用才能重试。Shutdown 返回当前清理尝试的错误，历史故障继续留在诊断状态；恢复后的成功不被旧错误永久覆盖，当前未知也不被旧成功覆盖。registry 锁不跨授权、I/O 或等待；Status 和结构化日志只报告计数、阶段、协议请求标识和固定错误分类，不记录 SID、名字、token、key 或 payload。
 
-会话/控制、不带属性的 CLOSE 和下述受限 CREATE 已接入；数据、QUERY/SET_INFO、范围、目录枚举、通知与映射仍明确不支持。具体 API、格式与限额由[client 设计](../../../../docs/design/client/architecture.md#smb-名字与原子-create)拥有，已接入打开不代表可用的 Windows 网络驱动器。
+会话/控制、不带属性的 CLOSE、受限 CREATE、READ/WRITE/FLUSH 与选定 QUERY_INFO 已接入；SET_INFO、范围、目录枚举、通知与映射仍明确不支持。具体 API、格式与限额由[client 设计](../../../../docs/design/client/architecture.md#smb-名字与原子-create)拥有，已接入打开不代表可用的 Windows 网络驱动器。
 
 ### 名字解释和打开绑定到同一权威条件
 
@@ -47,6 +47,16 @@ NodeReference 是 handle 唯一 Close 拥有者，普通 File 只作为同一对
 [平台 metadata](../../../../packages/smb/windows_metadata.go)在单个 `smb.windows` Data 中保存有版本的 DOS 位/hint；authority token 与平台格式版本分开，其它平台 key 保留。共同时间使用真实捕获事实；缺少历史 BirthTime/ChangeTime 拒绝必需响应，不把零值、mtime 或当前时间解释为已知历史。内部 metadata 读取在业务打开授权中如实申报，但不自动成为应用的 FILE_READ_ATTRIBUTES。
 
 [512 字节稠密虚拟 extent 与指定 serial](../../../../packages/smb/file_projection.go)是平台展示政策。allocation 来自同一 EOF，serial 来自 host 的规范 Share.Volume，不能解释成物理占用、配额预留、授权或全局唯一设备身份。QFid 使用原 NodeID 与该 serial，协议 open FileID 保持独立；无法计算的最大访问权限明确返回状态，不填虚构 mask。这些显示规则使 CREATE 结果有完整来源，而不向中立 backend 增加 Windows 数据模型。
+
+### 字节操作与信息披露保持原引用事实
+
+[字节命令](../../../../packages/smb/file_io.go)借用已安装 File，READ 只使用一次 ReadAt 的同修订属性与数据；WRITE 只执行一次普通写或原子 append，未知结果不返回猜测 Count、不重试。FLUSH 实际等待 Sync；没有该能力的目录/metadata-only 引用明确不支持。当前授权、granted mask 与真实错误分别检查，不通过路径或额外 Status 给旧 handle 续命。
+
+结果 metadata 在 native 调用前使用与 CREATE 相同的 resultBytes/MaxDirectoryBytes 预留固定硬上限，frame/data 有自己的限制。这个成本会让容量不足的调用在无效果时拒绝，但避免远端返回大 metadata 后才发现没有保留空间。HTTP 中间表示仍由既有 response pools 负责，context callback 不能冒充跨 HTTP 的预算协议；不增加新池或核心 API。
+
+普通写入保持 Windows payload 不变，包括 ARCHIVE。现有原子内容能力不能同时更新该 payload；要求 bit 已存在会阻止本来合法的写入，前后追加 SetMetadata 又不能证明与字节同次生效。clear/absent 在成功写后可能保持原样，CREATE/reset 的 ARCHIVE 初始化仍执行。**原子 ARCHIVE-on-write** 保留为具名后续工作：需要评审现有 FileMutation 组合、最终事务、权限及一次 quota/publication 结算，并有真实原子性和未知效果用例，不能通过延迟 Close 修补暗示已经兑现。
+
+[信息命令](../../../../packages/smb/query_info.go)按 class 选择一次 Stat、一次 State 或已拥有的 identity/access，不为所有查询先取属性。Standard 的 pending/detached 与大小来自同次 State；EA=0 表示平台不暴露 EA，内部 namespace 不改称 EA。已知虚拟接口和逻辑 Space 支撑有限 filesystem class；512 单元、指定 serial 和未用虚拟预算均不变成物理 backend 事实。所需时间或未实现的 position/mode/name 缺失仍拒绝。协议要求忽略的输入字段与声明长度 credits 分开，固定输出不足在任何观察前失败。
 
 ## 备选方案
 
@@ -74,4 +84,4 @@ NodeReference 是 handle 唯一 Close 拥有者，普通 File 只作为同一对
 
 名字/helper 的普通/race 聚焦验证分别通过 10 根/14 verdict 和 11 根/46 verdict；CREATE 聚焦验证为 18 根/54 verdict，SMB 包的该源码普通验证为 104 根/222 verdict、自身覆盖 88.6%、149 个函数均不低于 50%。这些本地与构建证据不延用旧原生收据；新 CREATE 尚未取得系统客户端验收。
 
-本机连接、会话、guarded 名字选择和受限 CREATE 已具备；数据、信息命令、名字修改、范围、通知和映射仍待接入，组合后的鉴权与文件行为继续需要真实平台验收。[中立观察能力](2026-09-16-neutral-file-capabilities.md)的其余 Windows 接入、历史时间显示和缓存透明性继续由[Windows 提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)承接；本决定接续其协议依赖与会话拥有权，不缩减目标或把诊断原型成功当成交付实现。
+本机连接、会话、guarded CREATE、保留引用上的字节命令和选定信息查询已具备；名字/属性修改、范围、目录枚举、通知和映射仍待接入，组合后的鉴权与文件行为继续需要真实平台验收。[中立观察能力](2026-09-16-neutral-file-capabilities.md)的其余 Windows 接入、历史时间显示和缓存透明性继续由[Windows 提案](../../proposed/architecture/2026-09-16-platform-client-capabilities.md)承接；本决定接续其协议依赖与会话拥有权，不缩减目标或把诊断原型成功当成交付实现。

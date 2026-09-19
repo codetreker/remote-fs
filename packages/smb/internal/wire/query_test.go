@@ -20,13 +20,13 @@ func TestQueryRequests(t *testing.T) {
 	}
 	p = requestPacket(QueryInfo, 41, 42)
 	p[66] = 1
-	p[67] = 4
+	p[67] = 15
 	p[88] = 42
 	le.PutUint16(p[72:74], 104)
 	le.PutUint32(p[76:80], 2)
 	copy(p[104:], "hi")
 	q, err := parseOne(t, p).QueryInfo()
-	if err != nil || q.FileID[0] != 42 || q.Type != 1 || q.Class != 4 || string(q.Input) != "hi" {
+	if err != nil || q.FileID[0] != 42 || q.Type != 1 || q.Class != 15 || q.InputLength != 2 || string(q.Input) != "hi" {
 		t.Fatalf("query: %+v %v", q, err)
 	}
 	p = requestPacket(SetInfo, 33, 34)
@@ -55,5 +55,46 @@ func TestQueryRequests(t *testing.T) {
 	le.PutUint32(p[88:92], 64)
 	if _, err := parseOne(t, p).IOCTL(); err == nil {
 		t.Fatal("header ioctl data accepted")
+	}
+}
+
+func TestQueryInfoIgnoresUninterpretedInputButPreservesDeclaredLength(t *testing.T) {
+	for _, typ := range []byte{1, 2, 3} {
+		for _, class := range []byte{4, 5, 6, 7, 8, 34, 35, 59} {
+			packet := requestPacket(QueryInfo, 41, 40)
+			packet[66], packet[67] = typ, class
+			le.PutUint16(packet[72:], 65535)
+			le.PutUint32(packet[76:], 0xffffffff)
+			le.PutUint32(packet[80:], 0x76543210)
+			le.PutUint32(packet[84:], 0xfedcba98)
+			query, err := parseOne(t, packet).QueryInfo()
+			if err != nil || query.InputLength != 0xffffffff || query.Input != nil || query.Additional != 0x76543210 || query.Flags != 0xfedcba98 {
+				t.Fatalf("type%d class%d: %+v %v", typ, class, query, err)
+			}
+		}
+	}
+}
+
+func TestQueryInfoApplicableInputRetainsStructuralBounds(t *testing.T) {
+	for _, typ := range []byte{1, 4} {
+		packet := requestPacket(QueryInfo, 41, 42)
+		packet[66], packet[67] = typ, 15
+		le.PutUint16(packet[72:], 104)
+		le.PutUint32(packet[76:], 2)
+		copy(packet[104:], "ea")
+		query, err := parseOne(t, packet).QueryInfo()
+		if err != nil || query.InputLength != 2 || string(query.Input) != "ea" {
+			t.Fatalf("applicable input: %+v %v", query, err)
+		}
+		le.PutUint16(packet[72:], 65535)
+		query, err = parseOne(t, packet).QueryInfo()
+		if err == nil || query.InputLength != 2 {
+			t.Fatalf("malformed applicable input lost raw admission facts: %+v %v", query, err)
+		}
+		le.PutUint32(packet[76:], 0)
+		query, err = parseOne(t, packet).QueryInfo()
+		if err != nil || query.Input != nil {
+			t.Fatalf("empty input offset was interpreted: %+v %v", query, err)
+		}
 	}
 }

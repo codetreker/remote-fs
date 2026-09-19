@@ -110,6 +110,18 @@ func (c *connection) dispatch(ctx context.Context, r, original wire.Request, h *
 	case wire.Create:
 		body, status := c.create(ctx, t, r)
 		return body, status, signer
+	case wire.Read:
+		body, status := c.readHandle(ctx, t, r)
+		return body, status, signer
+	case wire.Write:
+		body, status := c.writeHandle(ctx, t, r)
+		return body, status, signer
+	case wire.Flush:
+		body, status := c.flushHandle(ctx, t, r)
+		return body, status, signer
+	case wire.QueryInfo:
+		body, status := c.queryHandle(ctx, t, r)
+		return body, status, signer
 	case wire.Close:
 		body, status := c.closeHandle(ctx, t, r)
 		return body, status, signer

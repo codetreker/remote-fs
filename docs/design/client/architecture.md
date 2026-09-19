@@ -74,7 +74,7 @@ Shutdown 和 Unpublish 的并发调用共享当前 cleanup attempt 的不可变�
 
 credits 核对长度和读写范围，重复/越界拒绝；资源拒绝仍产生签名响应。related compound 保持顺序及继承身份，async 以唯一 AsyncID 核对 CANCEL 和当前 session，pending/terminal 的 credit 归还各一次。LOGOFF/断线分别等待真实借用与响应/签名用户，注册表锁不跨授权、storage I/O 或等待。
 
-当前实现包含会话/控制、不带 postquery 的 CLOSE，以及下述受限 CREATE。READ/WRITE/FLUSH、QUERY/SET_INFO、范围、目录枚举、通知与映射尚未接入，相关请求在 session/tree 检查后明确拒绝。它不是可用的 Windows 网络驱动器。[测试策略](../../testing.md#smb-本机会话端点)区分真实 TCP、引用安装 fixture、交叉构建和原生运行；此前会话端点源码已有对应的 Windows ARM64 包级运行；它不覆盖新增 CREATE，也不等于系统 SMB 重定向器的文件访问验收。剩余接入、历史时间和缓存决策仍由[平台提案](../../../.agents/notes/proposed/architecture/2026-09-16-platform-client-capabilities.md)承接。
+当前实现包含会话/控制、不带 postquery 的 CLOSE、受限 CREATE、READ/WRITE/FLUSH 及下述 QUERY_INFO。SET_INFO、范围、目录枚举、通知与映射尚未接入，相关请求在 session/tree 检查后明确拒绝。它不是可用的 Windows 网络驱动器。[测试策略](../../testing.md#smb-本机会话端点)区分真实 TCP、引用安装 fixture、交叉构建和原生运行；此前会话端点源码已有对应的 Windows ARM64 包级运行；它不覆盖新增 CREATE，也不等于系统 SMB 重定向器的文件访问验收。剩余接入、历史时间和缓存决策仍由[平台提案](../../../.agents/notes/proposed/architecture/2026-09-16-platform-client-capabilities.md)承接。
 
 ### SMB 名字与原子 CREATE
 
@@ -92,7 +92,32 @@ DesiredAccess/share mask 映射成既有 Uses/Deny；目录 LIST 对应 ReadEntr
 
 [大小投影](../../../packages/smb/file_projection.go)把普通文件同一捕获 EOF 向上按 512 字节换算为稠密虚拟 extent，目录大小为零；这是平台分配表示，不是物理占用或预留配额。Share.Volume 必须由 host 提供稳定的规范身份；其加固定域前缀的 SHA256 前八字节作为 LE uint64 的展示 serial，share 别名不参与。它不用于授权、不承诺全局无碰撞，也不冒充设备 serial。QFid 返回捕获 NodeID 和该 serial；MxAc 明确返回不支持（匹配 ChangeTime 时 NONE_MAPPED），不制造最大授权 mask。未支持的 AlSi 按协议忽略；CREATE 外层字段/上下文边界继续检查，不授予缓存或 durable/reconnect 能力。
 
-信息编码 helper 已区分 basic/network/tag 所需的 FILE_READ_ATTRIBUTES 与身份/access 等结果，输入不足或不支持的 class 明确失败；它们本身不接入 QUERY_INFO。已交付 helper 和 CREATE 的 Linux/构建证据见[测试策略](../../testing.md#smb-名字metadata-与-create)，后续数据、信息、名字修改命令及系统客户端验收仍须分别完成。
+信息编码区分 basic/network/tag 所需的 FILE_READ_ATTRIBUTES 与身份/access 等结果，输入不足或不支持的 class 明确失败。helper 与 CREATE 的验证见[测试策略](../../testing.md#smb-名字metadata-与-create)，数据和查询命令使用下述原引用路径。
+
+### SMB 保留引用上的字节与信息命令
+
+[READ/WRITE/FLUSH](../../../packages/smb/file_io.go)仅在当前 tree 查找 FileID，借用原 handle 到响应构造结束，沿原 File/NodeReference、授权 context 与关闭排空执行。缺失引用为 FILE_CLOSED；Windows granted-access 与每次当前业务授权都须满足，不重开路径、不调用每次 I/O Status。EIO 分类优先于其包裹的冲突，未知修改没有成功 Count 或自动重发；已知范围/共享冲突、quota、容量错误分别映射。
+
+READ 要求 FILE_READ_DATA 与普通 File 别名，只执行一次 ReadAt；同次返回的 Attr/数据须匹配原 NodeID、类型、大小和请求范围，不先 Stat 或用另一 revision 补齐。正长度在 EOF 处返回 END_OF_FILE，短于 MinimumCount 也返回该状态，其余短读返回实际数据。目录 LIST 和 metadata-only 引用不提供字节读取；channel、RDMA、压缩与未支持 flags 在访问前拒绝。
+
+WRITE 要求 WRITE_DATA 或 APPEND_DATA。append-only 忽略传入 offset，通过原子 MutateAppend 取得实际 EOF；具 WRITE_DATA 的普通非负 offset 直接 WriteAt，负 offset 的 append 语义通过同一能力执行，缺少 current-position 事实的 -2 明确拒绝。每条命令只调用一次原写入，nil error 才返回完整 len(Data)，任何错误都不猜部分 Count、不在 SMB 层重试。零长度仍执行 native 无效果检查；READ/WRITE 的 offset/length 在转换前检查，数据由 MaxIOBytes/MaxFrameBytes 限制。当前不支持 unbuffered/RDMA；SMB 3.1.1 的 WRITE_THROUGH 单独 flag 按该分支规则为 INVALID_PARAMETER，未缓冲组合明确不支持，已有同步 publication 保持。
+
+普通 WRITE 不读取或修改 Windows ARCHIVE，也不要求它已置位；clear/absent 可以在成功写后保持不变，不额外要求 WRITE_ATTRIBUTES。共同时间由原生内容发布维护，CREATE/reset 的 ARCHIVE 初始化独立保留。原引用已获写权时不以每次重新读取 readonly 撤销该权利。FLUSH 需要 write/append grant 和 File 别名，授权后实际等待 Sync；目录/metadata-only 没有 Sync 能力即明确拒绝，不以 State/Status 或空成功代替。
+
+[返回值准入](../../../packages/smb/file_commands.go)在借用引用后、所有 ReadAt/WriteAt/Append/Stat/State/Sync 之前，从与 CREATE 共用的 registry.resultBytes/MaxDirectoryBytes 预留 MetadataRetentionBytes(MaxMetadataBytes)+512；State 再计入目标和 generation 的硬上限。耗尽或退役在 native/HTTP 调用前拒绝，锁不跨 I/O，响应构造完成后精确归还且晚于原操作结束。SMB frame/data 预算与这份 metadata 保留预算分开，合法大 metadata 不挤掉完整协商数据块。HTTP 自己的 body/response pools 约束中间表示；任意 AttrResultBudget callback 不被序列化，不能当作远端预留保证，原 context 中已有 callback 继续传递。
+
+[文件 QUERY_INFO](../../../packages/smb/query_info.go)使用以下事实来源；所有 class 仍有当前 host 授权，内部 metadata 权限不扩展 Windows granted mask。
+
+| class | 事实与权限 |
+|---|---|
+| 4 Basic、34 NetworkOpen、35 AttributeTag | 一次原 reference.Stat；要求 FILE_READ_ATTRIBUTES。34 的大小来自同次 Attr，35 不要求历史时间 |
+| 5 Standard | 一次 ReferenceState，Attr/Detached/PendingUnlink 同次捕获；detached 或 pending 显示 links=0/DeletePending=true，否则 1/false |
+| 6 Internal、59 FileId | 已保留 NodeID，59 使用与 QFid 相同的指定 serial；以 OpFileStat 授权披露但不调用 Stat/State |
+| 7 EA、8 Access | 已知未暴露 EA 的大小零、实际 expanded granted mask；以 OpFileStat 授权但不查询 backend |
+
+class 7 的零来自已声明的空 EA 接口，内部 opaque metadata 不是 EA。Position/Mode/All 等缺少 current-position/mode/name 的 class、其它未实现查询均明确不支持。固定结果容量不足在观察前返回 INFO_LENGTH_MISMATCH，SMB 3.1.1 携带规定的空 error context；不返回截断的固定结构。所选 file/filesystem class 忽略协议规定无语义的 AdditionalInformation/Flags/input 字段；decoder 仍保留声明 InputLength，credits 按 max(InputLength, OutputLength) 收费，忽略输入内容不允许少收容量。
+
+[文件系统 QUERY_INFO](../../../packages/smb/filesystem_information.go)的 Size(3)/FullSize(7)每次授权后只调用一次 Backend.Space，要求 Coherent。以 512 字节虚拟单元向下换算 Total/Avail；FullSize 的 ActualAvailable 为 max(Total−Used,0)/512，明确表示未用虚拟 volume 预算，CallerAvailable 继续反映较紧的实际 backing 限制，不宣称物理空闲 cluster。Device(4)只声明 remote disk 接口；Attribute(5)只声明保留大小写的 Unicode 名字、255 单元上限及 REMOTEFS 显示名，不冒充 NTFS/ACL/EA/stream 能力。可变显示名截短使用偶数 UTF-16 前缀和 BUFFER_OVERFLOW；固定前缀不足仍失败。Volume(1)缺少创建时间/label，物理 sector/alignment 等未知事实不填默认值。
 
 ### 业务身份与授权结果
 

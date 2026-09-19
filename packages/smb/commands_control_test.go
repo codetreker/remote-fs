@@ -240,7 +240,7 @@ func TestVolumeCloseUsesRetainedReferenceWithoutMetadata(t *testing.T) {
 			t.Fatalf("retired file: %x", status)
 		}
 	}
-	r := sessionSignedRequest(t, s, tree.id, sessionRequest(wire.Read, wire.EmptyResponseBody()))
+	r := sessionSignedRequest(t, s, tree.id, sessionRequest(wire.SetInfo, wire.EmptyResponseBody()))
 	h := r.Header
 	if _, status, _ := c.dispatch(t.Context(), r, r, &h); status != statusUnsupported {
 		t.Fatalf("futurecommand: %x", status)
