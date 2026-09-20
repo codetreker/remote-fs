@@ -81,10 +81,7 @@ func (c *Coordinator) conflictLocked(key ownerKey, command storage.RangeCommand)
 				rangeStart(held.command.Range) == rangeStart(conflict.Range) && !ownerBefore(other, selected)) {
 				continue
 			}
-			owner := storage.OwnerDiagnostic(0)
-			if other.session == key.session {
-				owner = storage.OwnerDiagnostic(other.owner)
-			}
+			owner := c.sessions[other.session].bindings[other.owner].options.Diagnostic
 			conflict = storage.RangeConflict{Found: true, Owner: owner, Range: held.command.Range, Mode: held.command.Mode}
 			selected = other
 		}

@@ -40,9 +40,13 @@ func session(t *testing.T, c *Coordinator) *Session {
 }
 
 func owner(t *testing.T, s *Session, node, group uint64) storage.UseOwner {
+	return ownerWithDiagnostic(t, s, node, group, 0)
+}
+
+func ownerWithDiagnostic(t *testing.T, s *Session, node, group uint64, diagnostic storage.OwnerDiagnostic) storage.UseOwner {
 	t.Helper()
 	scope := storage.UseScope{Token: fmt.Sprintf("%d/%d/%d", s.id, node, s.nextOwner+1)}
-	o, err := s.NewOwner(background, node, scope, storage.OwnerOptions{Lifetime: storage.OwnerExplicit, Group: group})
+	o, err := s.NewOwner(background, node, scope, storage.OwnerOptions{Lifetime: storage.OwnerExplicit, Group: group, Diagnostic: diagnostic})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +139,9 @@ func TestRecordRangeReplacement(t *testing.T) {
 func TestDomainsOwnersAndDiagnostics(t *testing.T) {
 	c := fixture(t, DefaultConfig())
 	a, b := session(t, c), session(t, c)
-	ao, another, bo := owner(t, a, 1, 0), owner(t, a, 1, 0), owner(t, b, 1, 0)
+	ao := ownerWithDiagnostic(t, a, 1, 0, 101)
+	another := ownerWithDiagnostic(t, a, 1, 0, 202)
+	bo := ownerWithDiagnostic(t, b, 1, 0, 303)
 	command := record(storage.RangeExclusive, 3, 6)
 	wantState(t, apply(t, a, 1, ao, command), storage.Granted, "")
 	wantState(t, apply(t, b, 1, bo, whole(storage.RangeExclusive)), storage.Granted, "")
@@ -145,7 +151,7 @@ func TestDomainsOwnersAndDiagnostics(t *testing.T) {
 		owner storage.UseOwner
 		found bool
 		diag  storage.OwnerDiagnostic
-	}{{a, ao, false, 0}, {a, another, true, storage.OwnerDiagnostic(ao)}, {b, bo, true, 0}} {
+	}{{a, ao, false, 0}, {a, another, true, 101}, {b, bo, true, 101}} {
 		got, err := test.s.GetConflict(background, 1, test.owner, command, ordered)
 		if err != nil || got.Found != test.found || got.Owner != test.diag {
 			t.Fatalf("conflict = %+v, %v", got, err)

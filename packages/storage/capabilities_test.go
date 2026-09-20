@@ -13,7 +13,7 @@ func TestUseScopeAndClaimsAreBoundedNeutralValues(t *testing.T) {
 			t.Fatalf("valid scope %+v: %v", scope, err)
 		}
 	}
-	for _, scope := range []UseScope{{}, {Token: "bad\x00scope"}, {Token: strings.Repeat("x", MaxScopeBytes+1)}} {
+	for _, scope := range []UseScope{{}, {Token: "bad\x00scope"}, {Token: string([]byte{0xff})}, {Token: strings.Repeat("x", MaxScopeBytes+1)}} {
 		if !errors.Is(scope.Check(), syscall.EINVAL) {
 			t.Fatalf("invalid scope accepted: %+v", scope)
 		}
@@ -29,7 +29,7 @@ func TestUseScopeAndClaimsAreBoundedNeutralValues(t *testing.T) {
 }
 
 func TestOwnerOptionsAndMetadataUpdatesRejectUnboundedInputs(t *testing.T) {
-	for _, options := range []OwnerOptions{{Lifetime: OwnerReference}, {Lifetime: OwnerExplicit, Group: 42}} {
+	for _, options := range []OwnerOptions{{Lifetime: OwnerReference}, {Lifetime: OwnerExplicit, Group: 42, Diagnostic: 99}} {
 		if err := options.Check(); err != nil {
 			t.Fatalf("valid owner options %+v: %v", options, err)
 		}

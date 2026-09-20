@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"syscall"
+	"unicode/utf8"
 )
 
 // ScopedReference returns an opaque capability for one exact live File reference.
@@ -53,7 +54,7 @@ const MaxScopeBytes = 128
 type UseScope struct{ Token string }
 
 func (s UseScope) Check() error {
-	if len(s.Token) == 0 || len(s.Token) > MaxScopeBytes {
+	if len(s.Token) == 0 || len(s.Token) > MaxScopeBytes || !utf8.ValidString(s.Token) {
 		return syscall.EINVAL
 	}
 	for i := range s.Token {
@@ -95,6 +96,9 @@ type OwnerOptions struct {
 	// Group identifies a session-local deadlock participant. Zero keeps the
 	// owner independent; it never shares claims or use exemptions.
 	Group uint64
+	// Diagnostic is an opaque caller-owned value reported for conflicts. It
+	// conveys no authority and is never substituted with an internal owner ID.
+	Diagnostic OwnerDiagnostic
 }
 
 type OwnerLifetime uint8
