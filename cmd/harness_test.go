@@ -468,11 +468,27 @@ func (s *symlinkMetadata) NewFileSession(ctx context.Context, options storage.Fi
 	if err != nil {
 		return nil, err
 	}
-	return &symlinkFileSession{FileSession: session, metadata: s}, nil
+	metadata, metadataOK := session.(storage.MetadataAccess)
+	owners, ownersOK := session.(storage.UseOwners)
+	ranges, rangesOK := session.(storage.RangeControl)
+	if !metadataOK || !ownersOK || !rangesOK {
+		_ = session.Close(context.Background())
+		return nil, syscall.EOPNOTSUPP
+	}
+	return &symlinkFileSession{
+		FileSession:    session,
+		MetadataAccess: metadata,
+		UseOwners:      owners,
+		RangeControl:   ranges,
+		metadata:       s,
+	}, nil
 }
 
 type symlinkFileSession struct {
 	storage.FileSession
+	storage.MetadataAccess
+	storage.UseOwners
+	storage.RangeControl
 	metadata *symlinkMetadata
 }
 
