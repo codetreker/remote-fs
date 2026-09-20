@@ -127,7 +127,11 @@ func (s *Storage) CheckBounded() error { return nil }
 
 func (s *Storage) Stat(ctx context.Context, path string) (storage.Attr, error) {
 	req := Request{Op: OpStat, Path: path}
-	answer, err := s.call(ctx, req, nil)
+	limit := s.maxBodyBytes
+	if outer, ok := storage.AttrResultByteLimit(ctx); ok {
+		limit = min(limit, outer)
+	}
+	answer, err := s.callWithin(ctx, req, nil, limit)
 	if err != nil {
 		return storage.Attr{}, err
 	}
@@ -187,7 +191,10 @@ func (s *Storage) ListBounded(ctx context.Context, path string, result *storage.
 		}
 	}()
 	req := Request{Op: OpList, Path: path}
-	limit := min(result.MaxBytes(), s.maxBodyBytes)
+	limit := s.maxBodyBytes
+	if outer, ok := storage.ListResultByteLimit(ctx); ok {
+		limit = min(limit, outer)
+	}
 	answer, err := s.callWithin(ctx, req, nil, limit)
 	if err != nil {
 		return err
@@ -364,7 +371,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 		limit = s.maxWriteBytes
 	}
 	if req.Op == OpFileControl {
-		limit = min(limit, DefaultMaxLockControlBytes)
+		limit = min(limit, MaxFileControlBytes)
 	}
 	if int64(len(content)) > limit {
 		tooLarge := fmt.Errorf("the request body is %d bytes, above the configured limit of %d", len(content), limit)
@@ -376,8 +383,8 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 	admission, reservation := s.responses, retainedResponseMultiplier*s.maxBodyBytes
 	if req.Op == OpFileControl {
 		admission = s.lockControls
-		reservation = retainedResponseMultiplier * DefaultMaxLockControlBytes
-		successLimit = min(successLimit, DefaultMaxLockControlBytes)
+		reservation = retainedResponseMultiplier * MaxFileControlBytes
+		successLimit = min(successLimit, MaxFileControlBytes)
 	}
 	release, err := admission.acquire(ctx, reservation)
 	if err != nil {
@@ -453,7 +460,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 	case StatusStorageError:
 		errorLimit := s.maxBodyBytes
 		if req.Op == OpFileControl {
-			errorLimit = min(errorLimit, DefaultMaxLockControlBytes)
+			errorLimit = min(errorLimit, MaxFileControlBytes)
 		}
 		body, err := readWhole(resp, errorLimit)
 		if err != nil {
@@ -544,6 +551,10 @@ func (s *Storage) storageError(req Request, body []byte) error {
 	}
 	_, hasCode := members["lockCode"]
 	_, hasRecorded := members["recorded"]
+	_, hasCapability := members["capabilityCode"]
+	if hasCapability && (hasCode || hasRecorded) {
+		return unreachable(req, errors.New("response combines unrelated error families"))
+	}
 	if hasCode || hasRecorded {
 		failure, err := decodeVolumeLockFailure(body)
 		if err != nil {
@@ -559,7 +570,18 @@ func (s *Storage) storageError(req Request, body []byte) error {
 	if !ok {
 		return unreachable(req, fmt.Errorf("the server reported errno %q, which this side does not know", resp.Errno))
 	}
-	return &operationError{req: req, errno: errno, detail: resp.Message}
+	var capability error
+	if hasCapability {
+		if err := decodeFileJSON(body, &resp); err != nil {
+			return unreachable(req, err)
+		}
+		var ok bool
+		capability, ok = capabilityErrors[resp.CapabilityCode]
+		if !ok || storage.ErrnoOf(capability) != errno {
+			return unreachable(req, errors.New("invalid capability error classification"))
+		}
+	}
+	return &operationError{req: req, errno: errno, detail: resp.Message, capability: capability}
 }
 
 // readWhole returns the entire response body without retaining more than limit bytes, and
@@ -610,12 +632,13 @@ func readWhole(resp *http.Response, limit int64) ([]byte, error) {
 // asking errors.Is(err, syscall.ENOENT) would be told the file does not exist when the
 // truth is that the server was never reached.
 type operationError struct {
-	req      Request
-	errno    syscall.Errno
-	detail   string
-	canceled bool
-	deadline bool
-	unknown  bool
+	req        Request
+	errno      syscall.Errno
+	detail     string
+	canceled   bool
+	deadline   bool
+	unknown    bool
+	capability error
 }
 
 func (e *operationError) Error() string {
@@ -646,7 +669,7 @@ func (e *operationError) Unwrap() error { return e.errno }
 func (e *operationError) Classification() error { return e.errno }
 
 func (e *operationError) Is(target error) bool {
-	return target == context.Canceled && e.canceled || target == context.DeadlineExceeded && e.deadline
+	return target == context.Canceled && e.canceled || target == context.DeadlineExceeded && e.deadline || e.capability != nil && errors.Is(e.capability, target)
 }
 
 // An interrupted read can be retried. Once a mutation enters Do, cancellation cannot

@@ -3,7 +3,6 @@ package httprest
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"math"
 	"syscall"
 	"testing"
@@ -41,30 +40,29 @@ func TestRetainedHTTPNodeOperationsFollowIdentityThroughVolumeChanges(t *testing
 	if err != nil || read.Attr.ID != original.ID || string(read.Data) != "original" {
 		t.Fatalf("identity open read=%+v, error=%v", read, err)
 	}
-	mode := fs.FileMode(0640)
 	stamp := time.Unix(1700000000, 123456789)
-	attr, err := session.SetNodeAttr(ctx, original.ID, storage.AttrChange{Mode: &mode, ModTime: &stamp})
-	if err != nil || attr.ID != original.ID || attr.Mode.Perm() != mode || !attr.ModTime.Equal(stamp) {
+	attr, err := session.SetNodeAttr(ctx, original.ID, storage.AttrChange{ModTime: &stamp})
+	if err != nil || attr.ID != original.ID || !attr.ModTime.Equal(stamp) {
 		t.Fatalf("identity attributes=%+v, error=%v", attr, err)
 	}
 	moved, err := backend.Stat(ctx, "moved")
-	if err != nil || moved.ID != original.ID || moved.Mode.Perm() != mode || !moved.ModTime.Equal(stamp) {
+	if err != nil || moved.ID != original.ID || !moved.ModTime.Equal(stamp) {
 		t.Fatalf("renamed native attributes=%+v, error=%v", moved, err)
 	}
 	if err := backend.Remove(ctx, "moved"); err != nil {
 		t.Fatal(err)
 	}
-	mode = 0600
-	attr, err = session.SetNodeAttr(ctx, original.ID, storage.AttrChange{Mode: &mode})
-	if err != nil || attr.ID != original.ID || attr.Mode.Perm() != mode {
+	stamp = stamp.Add(time.Hour)
+	attr, err = session.SetNodeAttr(ctx, original.ID, storage.AttrChange{ModTime: &stamp})
+	if err != nil || attr.ID != original.ID || !attr.ModTime.Equal(stamp) {
 		t.Fatalf("detached identity attributes=%+v, error=%v", attr, err)
 	}
 	retained, err := file.Stat(ctx)
-	if err != nil || retained.ID != original.ID || retained.Mode.Perm() != mode {
+	if err != nil || retained.ID != original.ID || !retained.ModTime.Equal(stamp) {
 		t.Fatalf("retained attributes=%+v, error=%v", retained, err)
 	}
 	current, err := backend.Stat(ctx, "file")
-	if err != nil || current.ID != replacement.ID || current.Mode != replacement.Mode || !current.ModTime.Equal(replacement.ModTime) {
+	if err != nil || current.ID != replacement.ID || current.Kind != replacement.Kind || !current.ModTime.Equal(replacement.ModTime) {
 		t.Fatalf("identity mutation changed replacement=%+v, error=%v", current, err)
 	}
 	if _, err := backend.Stat(ctx, "moved"); !errors.Is(err, syscall.ENOENT) {
@@ -79,7 +77,7 @@ func TestRetainedHTTPNodeOperationsFollowIdentityThroughVolumeChanges(t *testing
 	if _, err := session.OpenNode(ctx, original.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}); !errors.Is(err, syscall.ESTALE) {
 		t.Fatalf("reclaimed identity open=%v", err)
 	}
-	if _, err := session.SetNodeAttr(ctx, original.ID, storage.AttrChange{Mode: &mode}); !errors.Is(err, syscall.ESTALE) {
+	if _, err := session.SetNodeAttr(ctx, original.ID, storage.AttrChange{ModTime: &stamp}); !errors.Is(err, syscall.ESTALE) {
 		t.Fatalf("reclaimed identity attributes=%v", err)
 	}
 }
@@ -113,8 +111,7 @@ func TestRetainedHTTPNodeOperationsPreserveValidationAndCancellationErrors(t *te
 			}
 		})
 	}
-	invalidMode := fs.ModeDir
-	if _, err := session.SetNodeAttr(ctx, before.ID, storage.AttrChange{Mode: &invalidMode}); !errors.Is(err, syscall.EINVAL) {
+	if _, err := session.SetMetadata(ctx, before.ID, "invalid namespace", nil, nil); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("invalid identity attributes=%v", err)
 	}
 	request, cancel := context.WithCancel(ctx)
@@ -122,12 +119,12 @@ func TestRetainedHTTPNodeOperationsPreserveValidationAndCancellationErrors(t *te
 	if opened, err := session.OpenNode(request, before.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Truncate: true}}); storage.ErrnoOf(err) != syscall.EINTR || !errors.Is(err, context.Canceled) || opened != nil {
 		t.Fatalf("cancelled identity truncate open=%v, error=%v", opened, err)
 	}
-	mode := fs.FileMode(0600)
-	if _, err := session.SetNodeAttr(request, before.ID, storage.AttrChange{Mode: &mode}); storage.ErrnoOf(err) != syscall.EINTR || !errors.Is(err, context.Canceled) {
+	stamp := time.Unix(1700000000, 0)
+	if _, err := session.SetNodeAttr(request, before.ID, storage.AttrChange{ModTime: &stamp}); storage.ErrnoOf(err) != syscall.EINTR || !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled identity attributes=%v", err)
 	}
 	read, err := file.ReadAt(ctx, 0, 64)
-	if err != nil || string(read.Data) != "preserve" || read.Attr.Mode != before.Mode || !read.Attr.ModTime.Equal(before.ModTime) {
+	if err != nil || string(read.Data) != "preserve" || read.Attr.Kind != before.Kind || !read.Attr.ModTime.Equal(before.ModTime) {
 		t.Fatalf("refused identity operations changed native state=%+v, error=%v", read, err)
 	}
 }

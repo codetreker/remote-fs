@@ -15,6 +15,7 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // publisher wakes the open subscriptions when this server has changed the volume.
@@ -612,7 +613,7 @@ func marshalStartFrame(start StreamStart, maxFrameBytes, maxIncarnationBytes int
 
 func newChangeFrameResult(maxFrameBytes int64) (*metastore.ChangeResult, error) {
 	return metastore.NewChangeResult(maxFrameBytes, 0, func(_ int, meta metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
-		if err := payloadLengthsFitFrame(maxFrameBytes, lengths.Name, lengths.FromName, lengths.Content); err != nil {
+		if err := payloadLengthsFitFrame(maxFrameBytes, lengths.Name, lengths.FromName, lengths.Content, lengths.Metadata); err != nil {
 			return 0, err
 		}
 		if meta.From != nil {
@@ -639,6 +640,14 @@ func newChangeFrameResult(maxFrameBytes int64) (*metastore.ChangeResult, error) 
 				return 0, err
 			}
 		}
+		metadataCharge, err := metadataResultBytes(lengths.Metadata)
+		if err != nil {
+			return 0, err
+		}
+		payloadBytes, err = addFrameBytes(payloadBytes, metadataCharge)
+		if err != nil {
+			return 0, err
+		}
 		return encodedFrameBytes(eventChange, payloadBytes)
 	})
 }
@@ -653,7 +662,7 @@ func newSnapshotFrameResult(maxFrameBytes int64) (*metastore.RowResult, error) {
 		return nil, err
 	}
 	return metastore.NewRowResult(maxFrameBytes, fixed, func(index int, meta metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
-		if err := payloadLengthsFitFrame(maxFrameBytes, lengths.Name, lengths.Content); err != nil {
+		if err := payloadLengthsFitFrame(maxFrameBytes, lengths.Name, lengths.Content, lengths.Metadata); err != nil {
 			return 0, err
 		}
 		meta.Node.Content = ""
@@ -673,8 +682,23 @@ func newSnapshotFrameResult(maxFrameBytes int64) (*metastore.RowResult, error) {
 		if err != nil {
 			return 0, err
 		}
-		return charge, nil
+		metadataCharge, err := metadataResultBytes(lengths.Metadata)
+		if err != nil {
+			return 0, err
+		}
+		return addFrameBytes(charge, metadataCharge)
 	})
+}
+
+func metadataResultBytes(metadataBytes int64) (int64, error) {
+	if metadataBytes <= 6 {
+		return 0, nil
+	}
+	retained, err := storage.MetadataRetentionBytes(metadataBytes)
+	if err != nil {
+		return 0, err
+	}
+	return max(2*metadataBytes+32*storage.MaxMetadataNamespaces, retained), nil
 }
 
 func addFrameBytes(total, more int64) (int64, error) {

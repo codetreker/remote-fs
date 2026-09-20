@@ -70,7 +70,7 @@ func TestCheckpointCapturesCurrentLogWithoutChangingTheVolume(t *testing.T) {
 		t.Fatalf("checkpoint changed log: %+v, %v; before %+v", after, err, before)
 	}
 	gotNode, err := meta.Stat(t.Context(), "file")
-	if err != nil || gotNode != node {
+	if err != nil || !reflect.DeepEqual(gotNode, node) {
 		t.Fatalf("checkpoint changed node: %+v, %v", gotNode, err)
 	}
 	gotChildren, err := meta.List(t.Context(), "")
@@ -194,7 +194,7 @@ func TestCheckpointRejectsMalformedWireBarriers(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			client := checkpointClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodGet || r.URL.RequestURI() != "/v3/checkpoint" {
+				if r.Method != http.MethodGet || r.URL.RequestURI() != "/v4/checkpoint" {
 					t.Errorf("checkpoint request = %s %s", r.Method, r.URL.RequestURI())
 				}
 				w.Header().Set(HeaderProtocol, Version)

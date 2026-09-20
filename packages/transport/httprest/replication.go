@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // The messages of the replication half, and the frames they travel in.
@@ -25,11 +25,14 @@ import (
 
 // Node is metastore.Node on the wire.
 type Node struct {
-	ID         int64  `json:"id"`
-	Mode       uint32 `json:"mode"`
-	Size       int64  `json:"size"`
-	AccessTime Time   `json:"access_time"`
-	ModTime    Time   `json:"mod_time"`
+	ID         int64                    `json:"id"`
+	Kind       storage.NodeKind         `json:"kind"`
+	BirthTime  *Time                    `json:"birth_time,omitempty"`
+	ChangeTime *Time                    `json:"change_time,omitempty"`
+	Metadata   map[string]OpaquePayload `json:"metadata,omitempty"`
+	Size       int64                    `json:"size"`
+	AccessTime Time                     `json:"access_time"`
+	ModTime    Time                     `json:"mod_time"`
 
 	// Content is the key of the object holding a file's bytes, and empty for a directory
 	// and for a file that has never been written. It travels as bytes rather than as a
@@ -43,7 +46,7 @@ type Node struct {
 func (n *Node) UnmarshalJSON(data []byte) error {
 	type node Node
 	var decoded node
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	got := Node(decoded)
@@ -67,11 +70,21 @@ func (n Node) check() error {
 	if err := checkWireTime("modification", n.ModTime); err != nil {
 		return fmt.Errorf("node %d: %w", n.ID, err)
 	}
-	mode := fs.FileMode(n.Mode)
-	switch mode.Type() {
-	case 0, fs.ModeDir, fs.ModeSymlink:
-	default:
-		return fmt.Errorf("node %d carries unsupported type bits %v", n.ID, mode.Type())
+	if err := n.Kind.Check(); err != nil {
+		return fmt.Errorf("node %d carries an invalid kind: %w", n.ID, err)
+	}
+	for _, value := range []struct {
+		name    string
+		instant *Time
+	}{{"birth", n.BirthTime}, {"change", n.ChangeTime}} {
+		if value.instant != nil {
+			if err := checkWireTime(value.name, *value.instant); err != nil {
+				return err
+			}
+		}
+	}
+	if err := storage.CheckMetadata(metadataStorage(n.Metadata)); err != nil {
+		return fmt.Errorf("node %d carries invalid metadata: %w", n.ID, err)
 	}
 	return nil
 }
@@ -87,7 +100,10 @@ func checkWireTime(name string, instant Time) error {
 func NodeOf(n metastore.Node) *Node {
 	return &Node{
 		ID:         n.ID,
-		Mode:       uint32(n.Mode),
+		Kind:       n.Kind,
+		BirthTime:  optionalTimeOf(n.BirthTime),
+		ChangeTime: optionalTimeOf(n.ChangeTime),
+		Metadata:   metadataOf(n.Metadata),
 		Size:       n.Size,
 		AccessTime: TimeOf(n.AccessTime),
 		ModTime:    TimeOf(n.ModTime),
@@ -99,7 +115,10 @@ func NodeOf(n metastore.Node) *Node {
 func (n Node) Metastore() metastore.Node {
 	return metastore.Node{
 		ID:         n.ID,
-		Mode:       fs.FileMode(n.Mode),
+		Kind:       n.Kind,
+		BirthTime:  optionalTimeStorage(n.BirthTime),
+		ChangeTime: optionalTimeStorage(n.ChangeTime),
+		Metadata:   metadataStorage(n.Metadata),
 		Size:       n.Size,
 		AccessTime: n.AccessTime.Time(),
 		ModTime:    n.ModTime.Time(),

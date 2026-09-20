@@ -27,7 +27,7 @@ func TestRetainedOpenAccessKeepsFlatStrictJSONFields(t *testing.T) {
 		Path: []byte("file"), Data: []byte{},
 		Open: storage.FileOpenOptions{
 			OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Truncate: true, Exclusive: true},
-			ExpectedID: 9, Mode: 0o640,
+			ExpectedID: 9, InitialMetadata: map[string][]byte{"test": {1, 2}},
 		},
 	}
 	encoded, err := json.Marshal(request)
@@ -52,10 +52,10 @@ func TestRetainedOpenAccessKeepsFlatStrictJSONFields(t *testing.T) {
 	if err := json.Unmarshal(envelope["open"], &open); err != nil {
 		t.Fatal(err)
 	}
-	if len(open) != 7 {
+	if len(open) != 8 {
 		t.Fatalf("flattened open fields = %v", open)
 	}
-	for _, name := range []string{"Read", "Write", "Create", "Truncate", "Exclusive", "ExpectedID", "Mode"} {
+	for _, name := range []string{"Read", "Write", "Create", "Truncate", "Exclusive", "ExpectedID", "InitialMetadata", "Use"} {
 		if _, exists := open[name]; !exists {
 			t.Fatalf("open field %q is missing", name)
 		}
@@ -80,7 +80,7 @@ func TestRetainedOpenAccessKeepsFlatStrictJSONFields(t *testing.T) {
 	for _, body := range [][]byte{
 		bytes.Replace(envelope["open"], []byte(`"Read":true`), []byte(`"Read":true,"Read":false`), 1),
 		bytes.Replace(envelope["open"], []byte(`"Read":true`), []byte(`"read":true`), 1),
-		[]byte(`{"OpenAccess":{"Read":true,"Write":true,"Create":true,"Truncate":true,"Exclusive":true},"ExpectedID":9,"Mode":416}`),
+		[]byte(`{"OpenAccess":{"Read":true,"Write":true,"Create":true,"Truncate":true,"Exclusive":true},"ExpectedID":9,"InitialMetadata":{"test":"AQI="},"Use":{"Uses":0,"Deny":0}}`),
 	} {
 		var options storage.FileOpenOptions
 		if err := decodeFileJSON(body, &options); err == nil {

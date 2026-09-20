@@ -2,8 +2,8 @@ package httprest_test
 
 import (
 	"encoding/json"
-	"io/fs"
 	"math"
+	"reflect"
 	"testing"
 	"time"
 
@@ -13,10 +13,10 @@ import (
 
 func TestAttrSurvivesJSON(t *testing.T) {
 	cases := []storage.Attr{
-		{ID: 9, Mode: 0o644, Size: 0, AccessTime: time.Unix(0, 0), ModTime: time.Unix(0, 0)},
-		{ID: 9, Mode: fs.ModeDir | 0o755, Size: 4096, AccessTime: time.Now(), ModTime: time.Now()},
-		{ID: 9, Mode: 0o600, Size: 1 << 40, AccessTime: time.Unix(1600000000, 1), ModTime: time.Unix(1755000000, 123456789)},
-		{ID: 9, Mode: 0o755 | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky, Size: 1},
+		{ID: 9, Kind: storage.NodeRegular, Size: 0, AccessTime: time.Unix(0, 0), ModTime: time.Unix(0, 0)},
+		{ID: 9, Kind: storage.NodeDirectory, Size: 4096, AccessTime: time.Now(), ModTime: time.Now()},
+		{ID: 9, Kind: storage.NodeRegular, Size: 1 << 40, AccessTime: time.Unix(1600000000, 1), ModTime: time.Unix(1755000000, 123456789)},
+		{ID: 9, Kind: storage.NodeRegular, Size: 1},
 	}
 	for _, want := range cases {
 		encoded, err := json.Marshal(httprest.AttrOf(want))
@@ -28,30 +28,28 @@ func TestAttrSurvivesJSON(t *testing.T) {
 			t.Fatalf("unmarshal %s: %v", encoded, err)
 		}
 		got := wire.Storage()
-		if got.Mode != want.Mode || got.Size != want.Size ||
+		if got.Kind != want.Kind || !reflect.DeepEqual(got.Metadata, want.Metadata) || got.Size != want.Size ||
 			!got.AccessTime.Equal(want.AccessTime) || !got.ModTime.Equal(want.ModTime) {
 			t.Fatalf("round trip of %+v through %s gave %+v", want, encoded, got)
 		}
 		if got.IsDir() != want.IsDir() {
-			t.Fatalf("round trip lost the directory bit of %v", want.Mode)
+			t.Fatalf("round trip lost the directory bit of %v", want.Kind)
 		}
 	}
 }
 
-// A change is defined by what it does not name as much as by what it does, so absence has
-// to survive the crossing. A field that came back as a zero value instead would turn a
-// request to set the modification time into a chmod 000 dated the epoch.
+// Unspecified times must stay absent even when another time is explicitly zero.
 func TestAnAttrChangeSurvivesJSON(t *testing.T) {
-	mode := fs.FileMode(0o750) | fs.ModeSetgid
+	birth := time.Time{}
 	accessed := time.Unix(-2208988800, 7)
 	changed := time.Unix(1755000000, 123456789)
 	cases := map[string]storage.AttrChange{
 		"nothing at all":       {},
-		"the mode alone":       {Mode: &mode},
+		"the birth time":       {BirthTime: &birth},
 		"the access time":      {AccessTime: &accessed},
 		"the modification one": {ModTime: &changed},
 		"both times":           {AccessTime: &accessed, ModTime: &changed},
-		"everything":           {Mode: &mode, AccessTime: &accessed, ModTime: &changed},
+		"everything":           {BirthTime: &birth, AccessTime: &accessed, ModTime: &changed},
 	}
 	for name, want := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -65,14 +63,8 @@ func TestAnAttrChangeSurvivesJSON(t *testing.T) {
 			}
 			got := request.Change.Storage()
 
-			if (got.Mode == nil) != (want.Mode == nil) {
-				t.Fatalf("round trip through %s changed whether the mode is named", encoded)
-			}
-			if got.Mode != nil && *got.Mode != *want.Mode {
-				t.Fatalf("mode round-tripped through %s as %v, want %v", encoded, *got.Mode, *want.Mode)
-			}
 			for _, times := range [][2]*time.Time{
-				{got.AccessTime, want.AccessTime}, {got.ModTime, want.ModTime},
+				{got.AccessTime, want.AccessTime}, {got.ModTime, want.ModTime}, {got.BirthTime, want.BirthTime},
 			} {
 				if (times[0] == nil) != (times[1] == nil) {
 					t.Fatalf("round trip through %s changed whether a time is named", encoded)
@@ -87,9 +79,9 @@ func TestAnAttrChangeSurvivesJSON(t *testing.T) {
 
 func TestEntriesSurviveJSON(t *testing.T) {
 	want := []storage.Entry{
-		{Name: "a file", Attr: storage.Attr{ID: 9, Mode: 0o644, Size: 3, AccessTime: time.Unix(9, 0), ModTime: time.Unix(1, 0)}},
-		{Name: "日本語", Attr: storage.Attr{ID: 9, Mode: fs.ModeDir | 0o755, ModTime: time.Unix(2, 0)}},
-		{Name: "\xff not utf-8", Attr: storage.Attr{ID: 9, Mode: 0o600, Size: 7, ModTime: time.Unix(3, 0)}},
+		{Name: "a file", Attr: storage.Attr{ID: 9, Kind: storage.NodeRegular, Size: 3, AccessTime: time.Unix(9, 0), ModTime: time.Unix(1, 0)}},
+		{Name: "日本語", Attr: storage.Attr{ID: 9, Kind: storage.NodeDirectory, ModTime: time.Unix(2, 0)}},
+		{Name: "\xff not utf-8", Attr: storage.Attr{ID: 9, Kind: storage.NodeRegular, Size: 7, ModTime: time.Unix(3, 0)}},
 	}
 	encoded, err := json.Marshal(httprest.ListResponse{Entries: httprest.EntriesOf(want)})
 	if err != nil {
@@ -107,7 +99,7 @@ func TestEntriesSurviveJSON(t *testing.T) {
 		if got[i].Name != want[i].Name {
 			t.Fatalf("entry %d round-tripped as name %q, want %q (wire form %s)", i, got[i].Name, want[i].Name, encoded)
 		}
-		if got[i].Attr.Mode != want[i].Attr.Mode || got[i].Attr.Size != want[i].Attr.Size {
+		if got[i].Attr.Kind != want[i].Attr.Kind || got[i].Attr.Size != want[i].Attr.Size {
 			t.Fatalf("entry %d round-tripped as %+v, want %+v", i, got[i], want[i])
 		}
 		if !got[i].Attr.AccessTime.Equal(want[i].Attr.AccessTime) || !got[i].Attr.ModTime.Equal(want[i].Attr.ModTime) {
@@ -147,7 +139,7 @@ func TestATimeOutsideTheNanosecondRange(t *testing.T) {
 	}
 	for name, want := range cases {
 		t.Run("reported "+name, func(t *testing.T) {
-			encoded, err := json.Marshal(httprest.AttrOf(storage.Attr{ID: 9, AccessTime: want, ModTime: want}))
+			encoded, err := json.Marshal(httprest.AttrOf(storage.Attr{ID: 9, Kind: storage.NodeRegular, AccessTime: want, ModTime: want}))
 			if err != nil {
 				t.Fatalf("marshal: %v", err)
 			}
@@ -243,11 +235,7 @@ func TestABodyThatCarriesNoSpaceReport(t *testing.T) {
 	}
 }
 
-// Absence has to be visible in the shape of a body, because it is not visible in the
-// values once they have been read: a zero Attr reads as a regular file of length 0 dated
-// the epoch, and a file whose mode really is 0 is a legitimate answer with exactly those
-// values. Only the shape tells the two apart, and it is the decoding that refuses it, so
-// that no reader of these messages has to remember to.
+// Missing metadata must not become a plausible report about a node.
 func TestABodyThatCarriesNoAttributes(t *testing.T) {
 	statCases := map[string]bool{
 		`{}`:             false,
@@ -257,12 +245,12 @@ func TestABodyThatCarriesNoAttributes(t *testing.T) {
 		// Attributes carrying no identity are an absence too, and the one that does not
 		// show in the shape of the body: every comparison of a zero identity above
 		// returns equal, so a peer that omits it reads as saying every node is one node.
-		`{"attr":{"mode":0}}`:                          false,
-		`{"attr":{"id":0,"mode":420,"size":7}}`:        false,
-		`{"attr":{"id":9,"mode":0}}`:                   true,
-		`{"attr":{"id":9,"mode":420,"size":7}}`:        true,
-		`{"attr":{"id":9,"mode":420},"entries":[]}`:    true,
-		`{"attr":{"id":9,"mode":2147484141,"size":0}}`: true,
+		`{"attr":{"mode":0}}`:                   false,
+		`{"attr":{"id":0,"mode":420,"size":7}}`: false,
+		`{"attr":{"id":9,"kind":1,"size":0,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}`: true,
+		`{"attr":{"id":9,"kind":1,"size":7}}`:     false,
+		`{"attr":{"id":9,"kind":1},"entries":[]}`: false,
+		`{"attr":{"id":9,"kind":2,"size":0}}`:     false,
 	}
 	for body, want := range statCases {
 		t.Run("stat "+body, func(t *testing.T) {
@@ -281,8 +269,8 @@ func TestABodyThatCarriesNoAttributes(t *testing.T) {
 		`{"entries":[{"name":"Zg==","attr":null}]}`:  false,
 		`{"entries":[{"name":7,"attr":{"mode":0}}]}`: false,
 		`{"entries":[]}`: true,
-		`{"entries":[{"name":"Zg==","attr":{"mode":0}}]}`:        false,
-		`{"entries":[{"name":"Zg==","attr":{"id":9,"mode":0}}]}`: true,
+		`{"entries":[{"name":"Zg==","attr":{"mode":0}}]}`: false,
+		`{"entries":[{"name":"Zg==","attr":{"id":9,"kind":1,"size":0,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}]}`: true,
 	}
 	for body, want := range listCases {
 		t.Run("list "+body, func(t *testing.T) {
@@ -303,8 +291,8 @@ func TestABodyThatCarriesNoAttributes(t *testing.T) {
 		`{"change":null}`:            false,
 		`{"change":{"mode":"0644"}}`: false,
 		`{"change":{}}`:              true,
-		`{"change":{"mode":0}}`:      true,
-		`{"change":{"mod_time":{"unix_sec":-1,"nanos":1}}}`: true,
+		`{"change":{"birth_time":{"unix_sec":0,"nanos":0}}}`: true,
+		`{"change":{"mod_time":{"unix_sec":-1,"nanos":1}}}`:  true,
 	}
 	for body, want := range setAttrCases {
 		t.Run("setattr "+body, func(t *testing.T) {
@@ -324,7 +312,7 @@ func TestABodyThatCarriesNoAttributes(t *testing.T) {
 func TestTheWireForm(t *testing.T) {
 	attr := storage.Attr{
 		ID:         77,
-		Mode:       fs.ModeDir | 0o755,
+		Kind:       storage.NodeDirectory,
 		Size:       4096,
 		AccessTime: time.Unix(1700000000, 1),
 		ModTime:    time.Unix(1755000000, 123456789),
@@ -333,7 +321,7 @@ func TestTheWireForm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	want := `{"attr":{"id":77,"mode":2147484141,"size":4096,` +
+	want := `{"attr":{"id":77,"kind":2,"size":4096,` +
 		`"access_time":{"unix_sec":1700000000,"nanos":1},` +
 		`"mod_time":{"unix_sec":1755000000,"nanos":123456789}}}`
 	if string(encoded) != want {
@@ -341,19 +329,18 @@ func TestTheWireForm(t *testing.T) {
 	}
 
 	// An attribute the change does not name is absent from the body rather than present
-	// with a value standing for "unchanged". There is no such value: every mode and every
+	// with a value standing for "unchanged". There is no such value: every
 	// instant is one a caller may ask for.
-	mode := fs.FileMode(0o600)
 	changed := time.Unix(1755000000, 123456789)
 	encoded, err = json.Marshal(httprest.SetAttrRequest{
-		Change: httprest.AttrChangeOf(storage.AttrChange{Mode: &mode, ModTime: &changed}),
+		Change: httprest.AttrChangeOf(storage.AttrChange{BirthTime: &changed, ModTime: &changed}),
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	want = `{"change":{"mode":384,"mod_time":{"unix_sec":1755000000,"nanos":123456789}}}`
+	want = `{"change":{"mod_time":{"unix_sec":1755000000,"nanos":123456789},"birth_time":{"unix_sec":1755000000,"nanos":123456789}}}`
 	if string(encoded) != want {
-		t.Fatalf("a mode-and-time change encodes as %s, want %s", encoded, want)
+		t.Fatalf("a birth-and-modification-time change encodes as %s, want %s", encoded, want)
 	}
 
 	encoded, err = json.Marshal(httprest.SetAttrRequest{Change: httprest.AttrChangeOf(storage.AttrChange{})})
@@ -373,5 +360,79 @@ func TestTheWireForm(t *testing.T) {
 	}
 	if want := `{"space":{"total":4096,"used":0,"avail":0}}`; string(encoded) != want {
 		t.Fatalf("a space report encodes as %s, want %s", encoded, want)
+	}
+}
+
+func TestMetadataFactsPreserveUnknownAndOpaqueBytes(t *testing.T) {
+	zero := time.Time{}
+	future := time.Date(2500, 1, 2, 3, 4, 5, 6, time.UTC)
+	for _, birth := range []*time.Time{nil, &zero, &future} {
+		want := storage.Attr{ID: 11, Kind: storage.NodeSymlink, BirthTime: birth, ChangeTime: &future,
+			Metadata: map[string]storage.OpaquePayload{
+				"client.alpha.v1": {Version: []byte{0xff, 0, 1}, Data: []byte{0xfe, 0, 0xff}},
+				"client.beta.v1":  {Version: []byte{1}, Data: []byte{}},
+			}}
+		wire := httprest.AttrOf(want)
+		encoded, err := json.Marshal(wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded httprest.Attr
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		got := decoded.Storage()
+		if (got.BirthTime == nil) != (birth == nil) || birth != nil && !got.BirthTime.Equal(*birth) ||
+			got.ChangeTime == nil || !got.ChangeTime.Equal(future) || !reflect.DeepEqual(got.Metadata, want.Metadata) {
+			t.Fatalf("metadata round trip: got %+v, want %+v", got, want)
+		}
+		wire.Metadata["client.alpha.v1"].Data[0] = 1
+		got.Metadata["client.alpha.v1"].Version[0] = 1
+		if want.Metadata["client.alpha.v1"].Data[0] != 0xfe || decoded.Metadata["client.alpha.v1"].Version[0] != 0xff {
+			t.Fatal("metadata conversion retained mutable caller bytes")
+		}
+	}
+}
+
+func TestMetadataWireRejectsIncompleteOrNoncanonicalFacts(t *testing.T) {
+	base := `{"id":9,"kind":1,"size":0,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}`
+	for name, suffix := range map[string]string{
+		"unknown kind":        `,"kind":255}`,
+		"duplicate identity":  `,"id":9}`,
+		"platform mode":       `,"mode":420}`,
+		"unknown birth":       `,"birth_time":null}`,
+		"partial time":        `,"birth_time":{"unix_sec":0}}`,
+		"invalid nanos":       `,"change_time":{"unix_sec":0,"nanos":1000000000}}`,
+		"duplicate time":      `,"birth_time":{"unix_sec":0,"unix_sec":1,"nanos":0}}`,
+		"unknown time field":  `,"birth_time":{"unix_sec":0,"nanos":0,"extra":1}}`,
+		"invalid namespace":   `,"metadata":{"UPPER":{"version":"AQ==","data":""}}}`,
+		"missing version":     `,"metadata":{"client.v1":{"data":""}}}`,
+		"empty version":       `,"metadata":{"client.v1":{"version":"","data":""}}}`,
+		"null payload":        `,"metadata":{"client.v1":{"version":"AQ==","data":null}}}`,
+		"duplicate namespace": `,"metadata":{"client.v1":{"version":"AQ==","data":""},"client.v1":{"version":"Ag==","data":""}}}`,
+		"noncanonical base64": `,"metadata":{"client.v1":{"version":"AR==","data":""}}}`,
+		"invalid base64":      `,"metadata":{"client.v1":{"version":"AQ==","data":"%%%"}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var attr httprest.Attr
+			if err := json.Unmarshal([]byte(base+suffix), &attr); err == nil {
+				t.Fatal("invalid metadata accepted")
+			}
+		})
+	}
+	for name, metadata := range map[string]map[string]storage.OpaquePayload{
+		"long version": {"client.v1": {Version: make([]byte, storage.MaxObservationTokenBytes+1)}},
+		"long payload": {"client.v1": {Version: []byte{1}, Data: make([]byte, storage.MaxMetadataValueBytes+1)}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			encoded, err := json.Marshal(httprest.AttrOf(storage.Attr{ID: 9, Kind: storage.NodeRegular, Metadata: metadata}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var attr httprest.Attr
+			if err := json.Unmarshal(encoded, &attr); err == nil {
+				t.Fatal("unbounded metadata accepted")
+			}
+		})
 	}
 }
