@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -371,8 +372,14 @@ func TestMaintenanceAccountingChainIsImmutableAndStripsContextValues(t *testing.
 
 func TestMaintenanceAccountingChainPreservesCustomCancellationCause(t *testing.T) {
 	type secretKey struct{}
-	source, cancel := context.WithCancelCause(context.WithValue(t.Context(), secretKey{}, "credential"))
+	deadline := time.Now().Add(time.Minute)
+	withDeadline, stopDeadline := context.WithDeadline(context.WithValue(t.Context(), secretKey{}, "credential"), deadline)
+	defer stopDeadline()
+	source, cancel := context.WithCancelCause(withDeadline)
 	cleanup := storage.WithPublicationAccountingChain(source, storage.PublicationAccountingChain{})
+	if got, ok := cleanup.Deadline(); !ok || !got.Equal(deadline) {
+		t.Fatalf("cleanup deadline = %v, %v; want %v, true", got, ok, deadline)
+	}
 	cause := errors.New("maintenance stopped")
 	cancel(cause)
 	<-cleanup.Done()
