@@ -525,25 +525,25 @@ var differentialSteps = []step{
 	}},
 
 	{"remove a directory that still has entries", func(root string) (string, error) {
-		return "", syscall.Rmdir(filepath.Join(root, "sub"))
+		return "", comparisonRmdir(filepath.Join(root, "sub"))
 	}},
 	{"remove a file", func(root string) (string, error) {
-		return "", syscall.Unlink(filepath.Join(root, "sub", "deep.txt"))
+		return "", comparisonUnlink(filepath.Join(root, "sub", "deep.txt"))
 	}},
 	{"remove the now empty directory", func(root string) (string, error) {
-		return "", syscall.Rmdir(filepath.Join(root, "sub"))
+		return "", comparisonRmdir(filepath.Join(root, "sub"))
 	}},
 	{"remove a directory with unlink", func(root string) (string, error) {
-		return "", syscall.Unlink(filepath.Join(root, "d"))
+		return "", comparisonUnlink(filepath.Join(root, "d"))
 	}},
 	{"remove a file with rmdir", func(root string) (string, error) {
-		return "", syscall.Rmdir(filepath.Join(root, "fresh.txt"))
+		return "", comparisonRmdir(filepath.Join(root, "fresh.txt"))
 	}},
 	{"remove a missing file", func(root string) (string, error) {
-		return "", syscall.Unlink(filepath.Join(root, "absent.txt"))
+		return "", comparisonUnlink(filepath.Join(root, "absent.txt"))
 	}},
 	{"remove a missing directory", func(root string) (string, error) {
-		return "", syscall.Rmdir(filepath.Join(root, "absent"))
+		return "", comparisonRmdir(filepath.Join(root, "absent"))
 	}},
 
 	{"list what is left", func(root string) (string, error) {
@@ -659,19 +659,58 @@ var differentialSteps = []step{
 	}},
 }
 
-// Runtime preemption can interrupt FUSE requests, and Chtimes does not retry EINTR.
-// Repeating the exact timestamps preserves the atime/mtime values compared here;
-// ctime is outside this comparison.
+// Some FUSE-facing calls do not retry interruption. Differential steps retry only
+// errors classified solely as EINTR with identical arguments; every other result
+// remains the operation's answer.
 // https://github.com/hanwen/go-fuse/blob/423b377e1452ab7b3522229185a3047f72e3f966/fs/api.go#L129-L135
-func comparisonChtimes(path string, accessed, changed time.Time) error {
+func retryComparisonInterruption(call func() error) error {
 	var err error
 	for range 8 {
-		err = os.Chtimes(path, accessed, changed)
-		if !errors.Is(err, syscall.EINTR) {
+		err = call()
+		if storage.ErrnoOf(err) != syscall.EINTR {
 			return err
 		}
 	}
 	return err
+}
+
+func comparisonChtimes(path string, accessed, changed time.Time) error {
+	return retryComparisonInterruption(func() error { return os.Chtimes(path, accessed, changed) })
+}
+
+func comparisonUnlink(path string) error {
+	return retryComparisonInterruption(func() error { return syscall.Unlink(path) })
+}
+
+func comparisonRmdir(path string) error {
+	return retryComparisonInterruption(func() error { return syscall.Rmdir(path) })
+}
+
+func TestComparisonInterruptionRetriesOnlyEINTRWithinTheBound(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		results      []error
+		want         error
+		wantAttempts int
+	}{
+		{name: "success after interruption", results: []error{syscall.EINTR, nil}, wantAttempts: 2},
+		{name: "wrapped interruption", results: []error{&os.PathError{Op: "unlink", Path: "x", Err: syscall.EINTR}, nil}, wantAttempts: 2},
+		{name: "other failure", results: []error{syscall.EINTR, syscall.EIO, nil}, want: syscall.EIO, wantAttempts: 2},
+		{name: "interruption joined with failure", results: []error{errors.Join(syscall.EINTR, syscall.EIO), nil}, want: syscall.EIO, wantAttempts: 1},
+		{name: "bounded interruption", results: []error{syscall.EINTR}, want: syscall.EINTR, wantAttempts: 8},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			attempts := 0
+			err := retryComparisonInterruption(func() error {
+				index := min(attempts, len(test.results)-1)
+				attempts++
+				return test.results[index]
+			})
+			if !errors.Is(err, test.want) || attempts != test.wantAttempts {
+				t.Fatalf("result=%v attempts=%d, want %v after %d", err, attempts, test.want, test.wantAttempts)
+			}
+		})
+	}
 }
 
 // describeTimes reports both of a node's times, to the nanosecond. Set explicitly, they

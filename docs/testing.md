@@ -14,7 +14,7 @@
 
 公共边界各有包内直接用例：[metastore 页结果](../packages/metastore/bounded_test.go)核对预留、提交、整页失效和 payload 所有权，[发布 guard](../packages/metastore/files_test.go)核对组合顺序、首个失败及父 context 不变；[storage 值类型](../packages/storage/storage_test.go)核对路径边界、NodeKind、可选时间与容量一致性。[limited 句柄](../packages/storage/limited/files_test.go)通过 OpenNode 在改名后截断同一对象，核对内容、Used 和超额拒绝后的原状态。[HTTP range cancel](../packages/transport/httprest/file_client_test.go)取消真实 Pending 请求并重复核对同一 Request，原持有者释放后仍为 Cancelled，不能留下迟到授予。
 
-普通对拍中的六处时间设置调用使用 [`comparisonChtimes`](../packages/fuse/fuse_test.go)：每处 `os.Chtimes` 的总尝试次数至多八次，仅在上一次返回 `EINTR` 时重做完全相同的路径、绝对 atime 与 mtime，包括明确省略某个时间的参数。挂载点和普通目录使用同一规则，只重试这一次调用；其它错误立即返回，八次仍中断则保留最后的 `EINTR` 并使对拍失败。这里比较最终的 atime / mtime，ctime 不在对拍结果中。专门验证中断的真实信号用例继续断言第一次系统调用的结果，不使用这个辅助函数。
+普通对拍中可能直接返回 `EINTR` 的调用使用 [`retryComparisonInterruption`](../packages/fuse/fuse_test.go)：六处 `os.Chtimes` 以及 `Unlink`／`Rmdir` 步骤的总尝试次数至多八次，仅在上一次错误只分类为 `EINTR` 时重做完全相同的调用参数。挂载点和普通目录使用同一规则；包含 `EIO` 的组合错误及其它错误立即返回，八次仍中断则保留最后的 `EINTR` 并使对拍失败。时间步骤重复相同的路径、绝对 atime 与 mtime，包括明确省略某个时间的参数；这里比较最终的 atime / mtime，ctime 不在对拍结果中。专门验证中断的真实信号用例继续断言第一次系统调用的结果，不使用这个辅助函数。
 
 对拍失败保留双方原错误的类型与文本。模式修改复合步骤先 WriteFile 再 Chmod，失败后才用独立五秒 context 查询 backing 属性及至多 32 字节内容；这些是失败后的额外观察，不重试原操作、不改变原来的失败判定。仍未解释的 EIO 由[独立调查](../.agents/notes/proposed/testing/2026-09-09-trace-unexplained-fuse-eio.md)记录，不能从步骤名称或未复现的批次推断原因。
 
