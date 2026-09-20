@@ -134,6 +134,10 @@ type RangeAttempt struct {
 	Claims    []ClaimID      `json:",omitempty"`
 	Conflict  RangeConflict
 	Rejection RejectionCode
+	// FailedAt identifies the command whose evaluation rejected the batch. It is
+	// nil for outcomes that are not tied to one command, such as request-wide
+	// admission exhaustion. Earlier release Effects may still have survived.
+	FailedAt *int `json:",omitempty"`
 	// Effects records every effect that survives the attempt. A rejected batch
 	// may retain successful release effects from before the failing command;
 	// acquisitions rolled back by that failure are absent.
@@ -210,5 +214,9 @@ func (a RangeAttempt) Clone() RangeAttempt {
 	a.Commands = append([]RangeCommand(nil), a.Commands...)
 	a.Claims = append([]ClaimID(nil), a.Claims...)
 	a.Effects = append([]RangeEffect(nil), a.Effects...)
+	if a.FailedAt != nil {
+		failedAt := *a.FailedAt
+		a.FailedAt = &failedAt
+	}
 	return a
 }

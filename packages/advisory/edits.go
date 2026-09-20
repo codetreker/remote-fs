@@ -17,6 +17,7 @@ type editResult struct {
 	acquired       bool
 	conflict       storage.RangeConflict
 	rejected       storage.RejectionCode
+	failedAt       *int
 }
 
 func (c *Coordinator) draftLocked(action *request) editResult {
@@ -30,6 +31,7 @@ func (c *Coordinator) draftLocked(action *request) editResult {
 		case storage.Replace, storage.AddExact:
 			if conflict := c.conflictLocked(action.key, command); conflict.Found {
 				result.conflict, result.rejected = conflict, storage.RangeBlocked
+				result.failedAt = commandIndex(index)
 				return result
 			}
 		}
@@ -43,6 +45,7 @@ func (c *Coordinator) draftLocked(action *request) editResult {
 				next := replaceRanges(result.releaseRanges, command)
 				if !c.replacementFitsLocked(action.key, len(next)) {
 					result.rejected = storage.RangeExhausted
+					result.failedAt = commandIndex(index)
 					return result
 				}
 				result.releaseRanges = next
@@ -62,11 +65,13 @@ func (c *Coordinator) draftLocked(action *request) editResult {
 			found := slices.IndexFunc(result.ranges, func(held rangeClaim) bool { return held.id == command.Claim })
 			if found < 0 {
 				result.rejected = storage.RangeNotHeld
+				result.failedAt = commandIndex(index)
 				return result
 			}
 			held := result.ranges[found].command
 			if held.Range != command.Range || held.Mode != command.Mode || held.Policy != command.Policy {
 				result.rejected = storage.RangeInvalid
+				result.failedAt = commandIndex(index)
 				return result
 			}
 			result.ranges = slices.Delete(result.ranges, found, found+1)
@@ -78,8 +83,18 @@ func (c *Coordinator) draftLocked(action *request) editResult {
 			result.releaseIndexes = append(result.releaseIndexes, index)
 		}
 		result.effects = append(result.effects, effect)
+		if !c.replacementFitsLocked(action.key, len(result.ranges)) {
+			result.rejected = storage.RangeExhausted
+			result.failedAt = commandIndex(index)
+			return result
+		}
 	}
 	return result
+}
+
+func commandIndex(index int) *int {
+	value := index
+	return &value
 }
 
 func (c *Coordinator) commitReleasePrefixLocked(action *request, edit editResult) {
@@ -182,11 +197,13 @@ func (c *Coordinator) startLocked(action *request) {
 	c.commitReleasePrefixLocked(action, edit)
 	action.result.Conflict = edit.conflict
 	if edit.rejected != storage.RangeBlocked || !first.Wait {
+		action.result.FailedAt = edit.failedAt
 		c.completeLocked(action, storage.Rejected, edit.rejected)
 		return
 	}
 	s := c.sessions[action.key.session]
 	if len(c.waiting) >= c.config.MaxWaiters || s.pending >= s.options.MaxPendingLocks || s.pending >= s.options.MaxWaiters {
+		action.result.FailedAt = edit.failedAt
 		c.completeLocked(action, storage.Rejected, storage.RangeExhausted)
 		return
 	}
@@ -197,6 +214,7 @@ func (c *Coordinator) startLocked(action *request) {
 			if deadlock {
 				code = storage.RangeDeadlock
 			}
+			action.result.FailedAt = edit.failedAt
 			c.completeLocked(action, storage.Rejected, code)
 			return
 		}

@@ -57,12 +57,14 @@ func TestRangeCommandsPreserveDomainsClaimsAndReceiptOwnership(t *testing.T) {
 			t.Fatalf("invalid enforced command accepted:%+v", c)
 		}
 	}
-	original := RangeAttempt{Commands: []RangeCommand{base}, Claims: []ClaimID{claim}, Effects: []RangeEffect{{Claim: claim, Command: exact}}}
+	failedAt := 1
+	original := RangeAttempt{Commands: []RangeCommand{base}, Claims: []ClaimID{claim}, Effects: []RangeEffect{{Claim: claim, Command: exact}}, FailedAt: &failedAt}
 	copy := original.Clone()
 	copy.Commands[0].Wait = true
 	copy.Claims[0] = "other"
 	copy.Effects[0].Released = true
-	if original.Commands[0].Wait || original.Claims[0] != claim || original.Effects[0].Released {
+	*copy.FailedAt = 0
+	if original.Commands[0].Wait || original.Claims[0] != claim || original.Effects[0].Released || *original.FailedAt != 1 {
 		t.Fatal("receipt clone aliases history")
 	}
 }

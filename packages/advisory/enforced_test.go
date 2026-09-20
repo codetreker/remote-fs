@@ -86,19 +86,29 @@ func TestExactBatchFailureRollsBackAcquisitionsAndKeepsReleases(t *testing.T) {
 	second := enforced(storage.RangeShared, bytesRange(20, 10))
 	rejected := apply(t, b, 1, bo, first, second)
 	wantState(t, rejected, storage.Rejected, storage.RangeBlocked)
+	if rejected.FailedAt == nil || *rejected.FailedAt != 1 {
+		t.Fatalf("failed batch position = %v, want 1", rejected.FailedAt)
+	}
 	if c.ranges != before || len(rejected.Claims) != 0 || len(rejected.Effects) != 0 {
 		t.Fatalf("failed batch retained a prefix: %+v", rejected)
 	}
 	one := apply(t, b, 1, bo, first)
 	wrong := removal(first, one.Claims[0])
 	wrong.Range = bytesRange(1, 9)
-	wantState(t, apply(t, b, 1, bo, wrong), storage.Rejected, storage.RangeInvalid)
+	invalid := apply(t, b, 1, bo, wrong)
+	wantState(t, invalid, storage.Rejected, storage.RangeInvalid)
+	if invalid.FailedAt == nil || *invalid.FailedAt != 0 {
+		t.Fatalf("invalid command position = %v, want 0", invalid.FailedAt)
+	}
 	missing, err := storage.NewClaimID(requestID(t, b), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rejectedRemoval := apply(t, b, 1, bo, removal(first, one.Claims[0]), removal(first, missing))
 	wantState(t, rejectedRemoval, storage.Rejected, storage.RangeNotHeld)
+	if rejectedRemoval.FailedAt == nil || *rejectedRemoval.FailedAt != 1 {
+		t.Fatalf("failed removal position = %v, want 1", rejectedRemoval.FailedAt)
+	}
 	if len(rejectedRemoval.Effects) != 1 || !rejectedRemoval.Effects[0].Released || rejectedRemoval.Effects[0].Claim != one.Claims[0] {
 		t.Fatalf("failed removal batch lost successful prefix: %+v", rejectedRemoval)
 	}
