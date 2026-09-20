@@ -38,7 +38,8 @@ const changeMetadataColumns = `
 	CASE WHEN typeof(birth_nsec) IN ('integer','null') THEN birth_nsec END, typeof(birth_nsec),
 	CASE WHEN typeof(change_sec) IN ('integer','null') THEN change_sec END, typeof(change_sec),
 	CASE WHEN typeof(change_nsec) IN ('integer','null') THEN change_nsec END, typeof(change_nsec),
-	COALESCE(length(CAST(metadata AS BLOB)),0),typeof(metadata)`
+	COALESCE(length(CAST(metadata AS BLOB)),0),typeof(metadata),
+	COALESCE(length(CAST(link_target AS BLOB)),0),typeof(link_target)`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -73,7 +74,7 @@ func scanChangeMetadata(
 		&recordedSecRaw, &recordedSecType, &recordedNsecRaw, &recordedNsecType,
 		&extra.birthSec, &extra.birthSecType, &extra.birthNsec, &extra.birthNsecType,
 		&extra.changeSec, &extra.changeSecType, &extra.changeNsec, &extra.changeNsecType,
-		&lengths.Metadata, &extra.metadataType,
+		&lengths.Metadata, &extra.metadataType, &lengths.Target, &extra.targetType,
 	); err != nil {
 		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
 	}
@@ -219,7 +220,7 @@ func validateChangeMetadata(
 	if contentType != "null" && contentType != "text" {
 		return fmt.Errorf("%w: change %d stores its content key as %s", syscall.EIO, change.Position, contentType)
 	}
-	if lengths.Name < 0 || lengths.FromName < 0 || lengths.Content < 0 || lengths.Metadata < 0 {
+	if lengths.Name < 0 || lengths.FromName < 0 || lengths.Content < 0 || lengths.Metadata < 0 || lengths.Target < 0 {
 		return fmt.Errorf("%w: change %d has a negative payload length", syscall.EIO, change.Position)
 	}
 	wantFrom := change.Kind == metastore.Renamed
@@ -252,6 +253,12 @@ func validateChangeMetadata(
 		}
 		if nodeKind.Int64 == int64(storage.NodeRegular) && contentType == "null" && size.Int64 != 0 {
 			return fmt.Errorf("%w: change %d carries file bytes without a content key", syscall.EIO, change.Position)
+		}
+		if nodeKind.Int64 == int64(storage.NodeSymlink) && (lengths.Target == 0 || lengths.Target != size.Int64 || contentType != "null") {
+			return fmt.Errorf("%w: change %d carries invalid symbolic-link bytes", syscall.EIO, change.Position)
+		}
+		if nodeKind.Int64 != int64(storage.NodeSymlink) && lengths.Target != 0 {
+			return fmt.Errorf("%w: change %d carries a link target for another node kind", syscall.EIO, change.Position)
 		}
 	}
 	switch change.Kind {
@@ -288,14 +295,14 @@ func validateChangePayload(change metastore.Change, name, fromName []byte, conte
 }
 
 func validStoredComponent(name []byte) bool {
-	return len(name) != 0 && !bytes.Equal(name, []byte(".")) && !bytes.Equal(name, []byte("..")) &&
+	return len(name) != 0 && len(name) <= storage.MaxLeafBytes && !bytes.Equal(name, []byte(".")) && !bytes.Equal(name, []byte("..")) &&
 		bytes.IndexByte(name, '/') < 0 && bytes.IndexByte(name, 0) < 0
 }
 
 type changeExtraMetadata struct {
 	birthSec, birthNsec, changeSec, changeNsec                 any
 	birthSecType, birthNsecType, changeSecType, changeNsecType string
-	metadataType                                               string
+	metadataType, targetType                                   string
 }
 
 func optionalChangeTime(secRaw any, secType string, nsecRaw any, nsecType string) (*time.Time, error) {
@@ -321,12 +328,13 @@ func (extra changeExtraMetadata) apply(node *metastore.Node, lengths metastore.C
 		return err
 	}
 	if node == nil {
-		if birth != nil || changed != nil || extra.metadataType != "null" || lengths.Metadata != 0 {
+		if birth != nil || changed != nil || extra.metadataType != "null" || extra.targetType != "null" || lengths.Metadata != 0 || lengths.Target != 0 {
 			return fmt.Errorf("removed change carries node metadata: %w", syscall.EIO)
 		}
 		return nil
 	}
-	if extra.metadataType != "blob" || lengths.Metadata < 6 || lengths.Metadata > storage.MaxMetadataBytes {
+	if extra.metadataType != "blob" || lengths.Metadata < 6 || lengths.Metadata > storage.MaxMetadataBytes ||
+		extra.targetType != "blob" || lengths.Target > storage.MaxLinkTargetBytes {
 		return fmt.Errorf("invalid event metadata representation: %w", syscall.EIO)
 	}
 	node.BirthTime, node.ChangeTime = birth, changed

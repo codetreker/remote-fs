@@ -19,6 +19,10 @@ type FileStore interface {
 	OpenNode(context.Context, uint64, storage.FileOpenOptions) (File, error)
 	StatNode(context.Context, uint64) (Node, error)
 	SetNodeAttr(context.Context, uint64, storage.AttrChange) (Node, error)
+	// QueryDeleteIntent observes one durable close-time deletion obligation even
+	// after the reference or authority process that accepted it has gone away.
+	QueryDeleteIntent(context.Context, storage.DeleteIntentID) (storage.DeleteIntentStatus, error)
+	AcknowledgeDeleteIntent(context.Context, storage.AcknowledgeDeleteIntentCommand) error
 	Usage(context.Context) (int64, error)
 }
 

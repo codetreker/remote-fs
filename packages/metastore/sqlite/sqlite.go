@@ -97,6 +97,7 @@ type Store struct {
 	maxIntegrityRecords int64
 	maxIntegrityBytes   int64
 	maxMetadataBytes    int64
+	maxDeleteIntents    int
 	replicaMetadata     bool
 	files               map[*retainedFile]struct{}
 	fileDomain          *fileDomain
@@ -447,6 +448,7 @@ func openConfiguredWithHooks(
 		maxIntegrityRecords: options.MaxIntegrityRecords,
 		maxIntegrityBytes:   options.MaxIntegrityBytes,
 		maxMetadataBytes:    options.MaxMetadataBytes,
+		maxDeleteIntents:    options.MaxDeleteIntents,
 		replicaMetadata:     options.replicaMetadata,
 		files:               make(map[*retainedFile]struct{}),
 		coordinator:         coordinator,

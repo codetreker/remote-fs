@@ -3,11 +3,27 @@ package schema
 import (
 	"context"
 	"database/sql"
+	"time"
+
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // The exclusive database owner retires references from every previous serving epoch. The
 // complete graph and its byte totals must be validated in this transaction before reaping.
 func reapDetachedFiles(ctx context.Context, tx *sql.Tx) error {
+	now := time.Now()
+	if _, err := tx.ExecContext(ctx, `UPDATE delete_intents SET outcome=?,failure=NULL,updated_sec=?,updated_nsec=?
+		WHERE outcome IN (?,?) AND EXISTS (
+			SELECT 1 FROM nodes n WHERE n.volume=delete_intents.volume AND n.id=delete_intents.node AND n.detached=1)`,
+		storage.DeleteIntentCompleted, now.Unix(), now.Nanosecond(), storage.DeleteIntentPending, storage.DeleteIntentCleanupFailed); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE delete_intents SET outcome=?,failure=NULL,updated_sec=?,updated_nsec=?
+		WHERE outcome=? AND EXISTS (
+			SELECT 1 FROM nodes n WHERE n.volume=delete_intents.volume AND n.id=delete_intents.node AND n.detached=1)`,
+		storage.DeleteIntentNotExecuted, now.Unix(), now.Nanosecond(), storage.DeleteIntentArmed); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE objects SET state = ?
 		WHERE key IN (SELECT content FROM nodes WHERE detached = 1 AND content IS NOT NULL)`, StateGarbage); err != nil {
 		return err

@@ -268,6 +268,9 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 // insertNode records a node under the id it arrived with. Its content key is dropped: see
 // the type's own comment for why a copy holds no keys.
 func insertNode(ctx context.Context, tx *sql.Tx, volume int64, node metastore.Node) error {
+	if err := validateReplicaNode(node); err != nil {
+		return err
+	}
 	accessSec, accessNsec := sqlvalue.StoredTime(node.AccessTime)
 	modifiedSec, modifiedNsec := sqlvalue.StoredTime(node.ModTime)
 	birthSec, birthNsec := storedOptionalTime(node.BirthTime)
@@ -278,16 +281,19 @@ func insertNode(ctx context.Context, tx *sql.Tx, volume int64, node metastore.No
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO nodes (id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,
-		                   birth_sec,birth_nsec,change_sec,change_nsec,metadata)
-		VALUES (?,?,?,?,?,?,?,?,NULL,?,?,?,?,?)`,
+		                   birth_sec,birth_nsec,change_sec,change_nsec,metadata,link_target)
+		VALUES (?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?)`,
 		node.ID, volume, int64(node.Kind), node.Size, accessSec, accessNsec, modifiedSec, modifiedNsec,
-		birthSec, birthNsec, changeSec, changeNsec, metadata)
+		birthSec, birthNsec, changeSec, changeNsec, metadata, append([]byte{}, node.LinkTarget...))
 	return err
 }
 
 // updateNode replaces what a copy holds about a node it already has, and refuses to be a
 // statement about a node it does not.
 func updateNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
+	if err := validateReplicaNode(node); err != nil {
+		return err
+	}
 	accessSec, accessNsec := sqlvalue.StoredTime(node.AccessTime)
 	modifiedSec, modifiedNsec := sqlvalue.StoredTime(node.ModTime)
 	birthSec, birthNsec := storedOptionalTime(node.BirthTime)
@@ -298,14 +304,31 @@ func updateNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
 	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE nodes SET kind=?,size=?,atime_sec=?,atime_nsec=?,mtime_sec=?,mtime_nsec=?,
-		                 birth_sec=?,birth_nsec=?,change_sec=?,change_nsec=?,metadata=?
+		                 birth_sec=?,birth_nsec=?,change_sec=?,change_nsec=?,metadata=?,link_target=?
 		WHERE id = ?`,
 		int64(node.Kind), node.Size, accessSec, accessNsec, modifiedSec, modifiedNsec,
-		birthSec, birthNsec, changeSec, changeNsec, metadata, node.ID)
+		birthSec, birthNsec, changeSec, changeNsec, metadata, append([]byte{}, node.LinkTarget...), node.ID)
 	if err != nil {
 		return err
 	}
 	return sqlvalue.ExactlyOne(result, fmt.Sprintf("node %d, which this copy does not hold", node.ID))
+}
+
+func validateReplicaNode(node metastore.Node) error {
+	if node.ID <= 0 || node.Kind.Check() != nil || node.Size < 0 || len(node.LinkTarget) > storage.MaxLinkTargetBytes {
+		return syscall.EIO
+	}
+	if node.Kind == storage.NodeDirectory && (node.Size != 0 || node.Content != "") {
+		return syscall.EIO
+	}
+	if node.Kind == storage.NodeSymlink {
+		if len(node.LinkTarget) == 0 || int64(len(node.LinkTarget)) != node.Size || node.Content != "" {
+			return syscall.EIO
+		}
+	} else if len(node.LinkTarget) != 0 {
+		return syscall.EIO
+	}
+	return nil
 }
 
 func storedOptionalTime(value *time.Time) (any, any) {
@@ -317,6 +340,9 @@ func storedOptionalTime(value *time.Time) (any, any) {
 }
 
 func insertEntry(ctx context.Context, tx *sql.Tx, volume, parent int64, name []byte, node int64) error {
+	if err := storage.CheckLeaf(name); err != nil {
+		return fmt.Errorf("invalid replicated entry name: %w", syscall.EIO)
+	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO entries (volume, parent, name, node) VALUES (?, ?, ?, ?)`,
 		volume, parent, name, node)
 	if err != nil && sqlerr.IsUniqueViolation(err) {

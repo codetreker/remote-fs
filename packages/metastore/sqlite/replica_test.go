@@ -852,7 +852,8 @@ func TestReplicaReopensOpaqueMetadataVersions(t *testing.T) {
 		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory,
 			Metadata: map[string]storage.OpaquePayload{"client": {Version: version, Data: []byte("value")}}}},
 		{Parent: 1, Name: []byte("link"), Node: metastore.Node{ID: 2, Kind: storage.NodeSymlink, Size: 6,
-			Metadata: map[string]storage.OpaquePayload{"client": {Version: version, Data: []byte("link")}}}},
+			LinkTarget: []byte("target"),
+			Metadata:   map[string]storage.OpaquePayload{"client": {Version: version, Data: []byte("link")}}}},
 	}); err != nil {
 		t.Fatal(err)
 	}

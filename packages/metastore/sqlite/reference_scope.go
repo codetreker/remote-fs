@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"syscall"
 
+	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -25,4 +27,37 @@ func (f *retainedFile) Scope(ctx context.Context) (storage.UseScope, error) {
 		return nil
 	})
 	return scope, err
+}
+
+func (s *Store) resolveUseScope(ctx context.Context, scope storage.UseScope, id uint64, uses storage.Uses) (*retainedFile, error) {
+	if err := scope.Check(); err != nil {
+		return nil, err
+	}
+	for file := range s.files {
+		if file.scope != scope {
+			continue
+		}
+		if !file.active || file.closed || uint64(file.id) != id || file.session != metastore.ReferenceSession(ctx) {
+			return nil, storage.ErrInvalidScope
+		}
+		if uses&^file.use.Uses != 0 {
+			return nil, syscall.EBADF
+		}
+		return file, nil
+	}
+	return nil, storage.ErrInvalidScope
+}
+
+func (s *Store) targetScope(ctx context.Context, id uint64, uses storage.Uses, provided []storage.TargetUse) (storage.UseScope, error) {
+	for _, target := range provided {
+		if target.NodeID != id {
+			continue
+		}
+		file, err := s.resolveUseScope(ctx, target.Scope, id, uses)
+		if err != nil {
+			return storage.UseScope{}, err
+		}
+		return file.scope, nil
+	}
+	return storage.UseScope{}, nil
 }

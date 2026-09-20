@@ -222,10 +222,57 @@ func TestPrepareMigratesPopulatedHistoricalVolumes(t *testing.T) {
 			if err := db.QueryRow(`SELECT (SELECT version FROM schema_version),content_revision,size FROM nodes WHERE id=2`).Scan(&stored, &revision, &size); err != nil {
 				t.Fatal(err)
 			}
-			if stored != 6 || revision != 1 || size != 3 {
+			if stored != schema.Version() || revision != 1 || size != 3 {
 				t.Fatalf("migration changed data: version=%d revision=%d size=%d", stored, revision, size)
 			}
 		})
+	}
+}
+
+func TestVersionSixSymlinkWithoutTargetIsRefusedBeforeMigration(t *testing.T) {
+	db := testDatabase(t, firstNeutralMetadataSchemaVersion)
+	execute(t, db, `INSERT INTO volumes(id,name,root,used) VALUES(1,'legacy',1,0)`)
+	execute(t, db, `INSERT INTO nodes(id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content)
+		VALUES(1,1,2,0,0,0,0,0,NULL),(2,1,3,6,0,0,0,0,NULL)`)
+	execute(t, db, `INSERT INTO entries(volume,parent,name,node) VALUES(1,1,X'6c696e6b',2)`)
+	execute(t, db, `INSERT INTO logs(volume,incarnation,committed_position,trimmed_through,trimmed_by_age)
+		VALUES(1,'0123456789abcdef0123456789abcdef',0,0,0)`)
+	execute(t, db, `UPDATE database_state SET node_high_water=2`)
+	_, _, err := Prepare(t.Context(), db, "legacy", "", changes.DefaultWindow(), 1000, 1<<20)
+	if !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), "without recoverable targets") {
+		t.Fatalf("version 6 symlink migration = %v", err)
+	}
+	var version, targetColumns int
+	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('nodes') WHERE name='link_target'`).Scan(&targetColumns); err != nil {
+		t.Fatal(err)
+	}
+	if version != firstNeutralMetadataSchemaVersion || targetColumns != 0 {
+		t.Fatalf("refused migration changed schema: version=%d target columns=%d", version, targetColumns)
+	}
+}
+
+func TestVersionSixRemovedHistoryKeepsNoLinkTarget(t *testing.T) {
+	db := testDatabase(t, firstNeutralMetadataSchemaVersion)
+	execute(t, db, `INSERT INTO volumes(id,name,root,used) VALUES(1,'legacy',1,0)`)
+	execute(t, db, `INSERT INTO nodes(id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content)
+		VALUES(1,1,2,0,0,0,0,0,NULL)`)
+	execute(t, db, `INSERT INTO logs(volume,incarnation,committed_position,trimmed_through,trimmed_by_age)
+		VALUES(1,'0123456789abcdef0123456789abcdef',1,0,0)`)
+	execute(t, db, `INSERT INTO changes(position,previous_position,volume,kind,parent,name,recorded_sec,recorded_nsec)
+		VALUES(1,0,1,1,1,X'676f6e65',0,0)`)
+	execute(t, db, `UPDATE database_state SET node_high_water=1,change_high_water=1`)
+	if _, _, err := Prepare(t.Context(), db, "legacy", "", changes.DefaultWindow(), 1000, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	var target any
+	if err := db.QueryRow(`SELECT link_target FROM changes WHERE position=1`).Scan(&target); err != nil {
+		t.Fatal(err)
+	}
+	if target != nil {
+		t.Fatalf("removed history gained link target %#v", target)
 	}
 }
 

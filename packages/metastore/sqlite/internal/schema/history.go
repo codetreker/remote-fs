@@ -112,6 +112,13 @@ func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volum
 			(c.birth_sec IS NULL)!=(c.birth_nsec IS NULL) OR (c.change_sec IS NULL)!=(c.change_nsec IS NULL) OR
 			c.birth_nsec NOT BETWEEN 0 AND 999999999 OR c.change_nsec NOT BETWEEN 0 AND 999999999`
 	}
+	if version >= firstDurableIdentitySchemaVersion {
+		removedExtra += ` OR c.link_target IS NOT NULL`
+		requiredExtra += ` OR c.link_target IS NULL`
+		nodeSpecific += ` OR
+			(c.node_kind=3 AND (length(c.link_target)=0 OR c.size!=length(c.link_target))) OR
+			(c.node_kind!=3 AND length(c.link_target)!=0)`
+	}
 	var invalidLogs int64
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*)
@@ -166,10 +173,10 @@ func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volum
 				c.from_name IS NULL OR length(c.from_name) = 0)) OR
 			(c.kind != ? AND (c.from_parent IS NOT NULL OR c.from_name IS NOT NULL)) OR
 			(c.name IS NOT NULL AND (
-				c.name IN (X'2e', X'2e2e') OR instr(c.name, X'2f') != 0 OR instr(c.name, X'00') != 0
+				length(c.name)>4096 OR c.name IN (X'2e', X'2e2e') OR instr(c.name, X'2f') != 0 OR instr(c.name, X'00') != 0
 			)) OR
 			(c.from_name IS NOT NULL AND (
-				c.from_name IN (X'2e', X'2e2e') OR
+				length(c.from_name)>4096 OR c.from_name IN (X'2e', X'2e2e') OR
 				instr(c.from_name, X'2f') != 0 OR instr(c.from_name, X'00') != 0
 			)) OR
 			(c.kind = ? AND (c.node IS NOT NULL OR `+nodeKindColumn+` IS NOT NULL OR c.size IS NOT NULL OR

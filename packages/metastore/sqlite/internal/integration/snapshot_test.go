@@ -27,38 +27,16 @@ func readRows(ctx context.Context, snap metastore.Snap, limit int) ([]metastore.
 	return rows, done, err
 }
 
-func TestSnapshotBoundedMakesAProductionErrorTerminalWithoutExposingPrefixRows(t *testing.T) {
-	store := open(t, database(t), "workspace", 0)
-	if err := store.Create(t.Context(), strings.Repeat("x", 1<<20)); err != nil {
+func TestSnapshotRefusesAnOversizedStoredNameBeforeExposingAPicture(t *testing.T) {
+	path := database(t)
+	store := open(t, path, "workspace", 0)
+	if err := store.Create(t.Context(), "file"); err != nil {
 		t.Fatal(err)
 	}
+	damageDatabase(t, path, `UPDATE entries SET name=? WHERE name=CAST('file' AS BLOB)`, []byte(strings.Repeat("x", 1<<20)))
 	snap, _, err := store.Snapshot(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer snap.Close()
-	newResult := func(max int64) *metastore.RowResult {
-		result, err := metastore.NewRowResult(max, 0, func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
-			return lengths.Name + lengths.Content + 1, nil
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return result
-	}
-	first := newResult(128)
-	if _, err := snap.Next(t.Context(), 1024, first); !errors.Is(err, syscall.EFBIG) {
-		t.Fatalf("oversized snapshot row returned %v, want EFBIG", err)
-	}
-	if rows, err := first.Rows(); !errors.Is(err, syscall.EFBIG) || rows != nil {
-		t.Fatalf("oversized snapshot row exposed prefix %+v, %v", rows, err)
-	}
-	second := newResult(2 << 20)
-	if _, err := snap.Next(t.Context(), 1024, second); !errors.Is(err, syscall.EFBIG) {
-		t.Fatalf("snapshot continued after its production failure with %v", err)
-	}
-	if rows, err := second.Rows(); !errors.Is(err, syscall.EFBIG) || rows != nil {
-		t.Fatalf("failed snapshot later exposed %+v, %v", rows, err)
+	if snap != nil || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("oversized snapshot = %v, %v; want no picture and EIO", snap, err)
 	}
 }
 

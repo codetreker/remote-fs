@@ -31,10 +31,12 @@ func readChanges(ctx context.Context, log metastore.Log, after metastore.Positio
 }
 
 func TestSinceRefusesAnOversizedStoredNameBeforeExposingAPartialPage(t *testing.T) {
-	store := open(t, database(t), "workspace", 0)
-	if err := store.Create(t.Context(), strings.Repeat("x", 1<<20)); err != nil {
+	path := database(t)
+	store := open(t, path, "workspace", 0)
+	if err := store.Create(t.Context(), "file"); err != nil {
 		t.Fatal(err)
 	}
+	damageDatabase(t, path, `UPDATE changes SET name=? WHERE position=(SELECT min(position) FROM changes)`, []byte(strings.Repeat("x", 1<<20)))
 	result, err := metastore.NewChangeResult(128, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
 		return lengths.Name + lengths.FromName + lengths.Content + 1, nil
 	})
