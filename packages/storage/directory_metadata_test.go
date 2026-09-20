@@ -32,6 +32,34 @@ func TestDirectoryMetadataObservationMatchesTargetAndOutputSelection(t *testing.
 	}
 }
 
+func TestDirectoryMetadataOptionsCloneOwnsGuardsAndPreservesAbsence(t *testing.T) {
+	withoutGuards := (storage.DirectoryMetadataOptions{IncludeName: true}).Clone()
+	if withoutGuards.Guards != nil || !withoutGuards.IncludeName {
+		t.Fatalf("cloning absent guards changed options: %+v", withoutGuards)
+	}
+
+	original := storage.DirectoryMetadataOptions{
+		IncludeName: true,
+		Guards: &storage.NamespaceGuards{
+			RootID:      1,
+			Directories: []storage.DirectoryObservation{{ParentID: 1, Revision: []byte{1}}},
+			Edges:       []storage.ObservedEdge{{ParentID: 1, RawLeaf: []byte{0xff, 'x'}, ChildID: 2}},
+		},
+	}
+	clone := original.Clone()
+	if clone.Guards == original.Guards ||
+		unsafe.SliceData(clone.Guards.Directories[0].Revision) == unsafe.SliceData(original.Guards.Directories[0].Revision) ||
+		unsafe.SliceData(clone.Guards.Edges[0].RawLeaf) == unsafe.SliceData(original.Guards.Edges[0].RawLeaf) {
+		t.Fatal("options clone retained caller-owned guard state")
+	}
+	original.Guards.Directories[0].Revision[0] = 9
+	original.Guards.Edges[0].RawLeaf[0] = 'y'
+	original.Guards.RootID = 3
+	if clone.Guards.Directories[0].Revision[0] != 1 || clone.Guards.Edges[0].RawLeaf[0] != 0xff || clone.Guards.RootID != 1 {
+		t.Fatalf("options clone changed with source guards: %+v", clone)
+	}
+}
+
 func TestDirectoryMetadataObservationRejectsSubstitutionAndMissingName(t *testing.T) {
 	target := storage.DirectoryTarget{NodeID: 2}
 	observation := storage.DirectoryObservation{ParentID: 2, Revision: []byte{1}}
