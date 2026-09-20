@@ -36,7 +36,7 @@
 | `UseOwners` | 以有效 File scope 注册和退役 range owner |
 | `RangeControl` | 查询冲突、批量编辑、核对、取消和按 domain 清理范围 |
 
-当前能力集合不包含原子 OpenAt、NodeReference、身份 namespace 操作、引用状态、删除意图、条件文件修改、目录 metadata 或当前名字观察。HTTP v4 为它们保留协商位；这些 bool 必须为 false，decoder 对 true 按协议错误处理。预留位置只避免扩展 capability envelope 时重新安排字段，不构成行为承诺。
+当前能力集合不包含原子 OpenAt、NodeReference、身份 namespace 操作、引用状态、删除意图、条件文件修改、目录 metadata 或当前名字观察。HTTP v4 为它们保留协商位。server 对未实现的 facet 明确发送 false；同版本 client 接受并忽略自己没有实现的 true 值，方法是否存在仍由本地接口决定。预留位置只允许 server/client 在 v4 内错开升级，不构成当前行为承诺。
 
 ## 二、保留节点与回收
 
@@ -76,6 +76,8 @@ metadata 返回值与 Attr 载入前先经过 `AttrResultBudget`。每 volume �
 
 [`packages/advisory`](../../../packages/advisory/coordinator.go) 在同一 volume 内协调三个独立 domain。`DomainRecord` 与 `DomainWholeFile` 只约束参与者；`DomainEnforced` 的显式 policy 约束真实数据访问。普通 File 的 Use claim、owner、range、动作历史与会话生命周期都由同一个 volume coordinator 计量，不能通过再建包装器绕过。
 
+公开 List/ListBounded 在 authority 的 native 读取顺序中派生 `ReadEntries`，因此 replicated wrapper 不能从本地目录副本直接回答。它先检查副本连续性，再把完整目录读取交给远端；失效副本仍以 `EIO` 失败，健康副本也不能绕过当前 deny。
+
 | domain | 编辑 | 作用 |
 |---|---|---|
 | `DomainRecord` | `Replace`、`Subtract` | 传统记录锁的范围替换、分割和解除 |
@@ -90,6 +92,8 @@ metadata 返回值与 Attr 载入前先经过 `AttrResultBudget`。每 volume �
 
 `Apply`、`Query` 与 `Cancel` 使用原有 `LockRequestID` epoch 和 nonce。相同 ID 的不同 intent 以 `EINVAL` 拒绝；旧 epoch 中未见过的 ID 不重新执行。取消只有在结果证明没有遗留 grant 时才能成为安全的中断；授予已经获胜时返回该事实，结果未知时相关访问持续失败。
 
+Use claim、owner、range、等待与动作历史只存在于当前 authority 的有界内存中。FileSession 退役、authority 重启或 incarnation 改变后，旧 File、scope、owner 和 range 均以 `ESTALE` 或相应不可用错误失效，不从 SQLite 或复制日志恢复，也不按同名或同 NodeID 对象静默重建。调用方须建立新 FileSession 并重新申请状态。只有独立 Strong S/X 机制具有自己的持久恢复保证。
+
 FUSE 将 `flock` 映射到 whole-file domain，将传统 POSIX `fcntl` 映射到 record domain。内核 owner、PID 诊断、fork/dup、访问模式、转换及关闭规则都留在 FUSE：`Flush` 对对应 owner 执行 `Drop`，最终 `Release` 关闭引用。直接 File API 不推断 POSIX 进程 owner。完整 `F_OFD_*` 仍不在兼容承诺内。
 
 默认 volume 上限为 1024 个会话、32768 个 owner、262144 个 range、262144 个 action、8192 个 waiter 和 65536 条死锁图边。会话数据、心跳、范围获取、核对和释放使用分开的 admission；数据物化不能耗尽续期与清理能力。
@@ -100,7 +104,9 @@ HTTP 文件请求先执行[业务授权](authorization.md)，再读取或触碰 
 
 HTTP v4 统一转发基础 volume、中立 Attr、metadata、文件引用、range 和强 S/X。请求的 `op` 直接使用 `storage.Operation` 的规范值；二进制内容、metadata version 和 payload 使用 canonical base64。协议拒绝未知、重复、缺席、null 或无关字段，所有结果都携带 v4 marker 与封闭 errno 词汇；v3 路由不提供兼容旁路。
 
-session 能力结果只可宣告 Metadata、Owners 和 Ranges，File 能力只可宣告 Metadata 与 Scope。wire 结构还保留 DirectoryMetadata、ReferenceName、AtomicOpen、Namespace、References、State、Delete 和 Conditional bool；这些字段必须为 false，true 是协议错误。预留字段固定 v4 的扩展位置，不赋予方法或语义。
+当前 server 的 session 能力结果只宣告 Metadata、Owners 和 Ranges，File 能力只宣告 Metadata 与 Scope。wire 结构还保留 DirectoryMetadata、ReferenceName、AtomicOpen、Namespace、References、State、Delete 和 Conditional bool；没有相应 Go 方法的 v4 client 接受这些已知预留字段为 true，但不会调用它们。任意未知字段仍是协议错误。
+
+同一兼容形状还允许 Open/OpenNode response 携带可选 `node`，以及 File.Close/FileSession.Close response 携带可选 barrier。当前 server 不依赖这些字段表达结果；不使用它们的 v4 client 可以安全忽略。它们分别为身份结果与可能产生持久修改的清理预留位置，不能被解释为对应能力已实现。
 
 随机能力标识会话与文件引用。Open 结果在有限 PendingAck 时间内保留，client 收到能力后单独确认；无确认的引用被回收。数据修改、打开和 range 状态请求使用有界动作记录核对，过期历史不能让旧请求变成新执行。响应丢失后不能单凭请求 context 取消推断打开未发生或 range 未授予，已有的 ACK 丢失核对路径继续执行。
 
@@ -110,7 +116,7 @@ session 能力结果只可宣告 Metadata、Owners 和 Ranges，File 能力只�
 
 `HandlerOptions.Files` 默认在整个 registry 内允许 64 个会话，每个会话分别最多保留 16384 个数据动作与 16384 个清理动作，PendingAck 为 5 秒；可接纳的会话 options 受 handler 上限约束。`Handler.Close(ctx)` 停止 admission，退役并排空它创建的 registry；backend 仍归调用方。独立 server 先排空 HTTP 请求，再完成 handler 清理，最后关闭自己拥有的 backend；清理失败不释放 backend 所有权。
 
-replicated storage 转发当前 metadata、scope、owner 和 range 能力，并保留原 remote session、File 与控制历史。路径 metadata 仍可使用有效副本；File 的属性、字节、scope 和 range 控制访问 authority。metadata 与文件修改成功后，提供日志的 server 返回当时的权威 barrier，replica 等待同一 incarnation 的位置达到该值；detached 修改没有路径事件，barrier 仍可证明现有 volume 进度。没有日志的直接 HTTP client 不制造 barrier；需要复制确认却缺少 barrier 时以 `EIO` 失败。
+replicated storage 转发 metadata、scope、owner 和 range 能力。路径节点事实与 opaque metadata 进入 SQLite 副本；公开 Stat 可由副本回答，公开 List/ListBounded 回源 authority。File、Use claim、owner、range 和控制历史仍属于远端 authority/session，不写入副本。File 的属性、字节、scope 和 range 控制直接访问 authority。metadata 与文件修改成功后，提供日志的 server 返回当时的权威 barrier，replica 等待同一 incarnation 的位置达到该值；detached 修改没有路径事件，barrier 仍可证明现有 volume 进度。没有日志的直接 HTTP client 不制造 barrier；需要复制确认却缺少 barrier 时以 `EIO` 失败。
 
 volume 默认单文件上限 1 GiB，同时物化内容上限 2 GiB，最多 32 次 materialization、8 次状态竞争尝试，每次数据操作预算 30 秒。替换预留当前与下一份内容，读取预留完整对象与返回区间；不能只按 patch 的长度收费。单会话、transport body、backend 对象与配额可施加更紧的边界。有限预算在保留超限内容之前拒绝，已经持有的 reservation 在取消或已知失败清理后释放；未知发布或记账结果保留相应所有权并封锁。
 

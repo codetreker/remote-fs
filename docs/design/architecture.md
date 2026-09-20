@@ -143,17 +143,17 @@ client 侧的 remote storage 实现 storage 接口，凡是不满足上述任何
 
 ### 元数据有副本，内容没有
 
-**内核查名字、列目录仍到达 storage**：目录项、属性与负项超时都是 0，路径查询由 client 的 SQLite 副本答复。已经取得的 fd、节点身份属性、metadata 和 range 控制直接访问权威 FileSession。普通文件使用 direct I/O，每次读取返回服务端保留对象的当前状态，不通过私有全文件副本或内核文件页缓存作答。
+**内核查名字、列目录仍到达 storage**：目录项、属性与负项超时都是 0。按路径 Stat 与负查找由 client 的 SQLite 副本答复；公开 List/ListBounded 在确认副本可用后回源 authority，以执行当前 `ReadEntries` 限制。已经取得的 fd、节点身份属性、metadata 和 range 控制直接访问权威 FileSession。普通文件使用 direct I/O，每次读取返回服务端保留对象的当前状态，不通过私有全文件副本或内核文件页缓存作答。
 
 副本保存名字、NodeKind、共同时间、opaque metadata 和大小，不复制文件内容。打开只取得对象引用，字节在每次 ReadAt 时读取。
 
-server 每个 volume 记一条有序的变更日志，位置与树的改动在同一个事务里分配；client 先订阅、再取一次一致性快照，此后由流喂着。副本在观测到流断开时整份作废，到达 replicated storage 的操作以 EIO 失败，没有过期时间或基于间隔的刷新。本地副本在读写阶段之间交接，持续查询不能让已登记的更新一直等待读者空闲；首次构建与重建在快照 EOF 后读取固定 checkpoint，并用原订阅回放到该位置才恢复作答，见 [client 设计](client/architecture.md#二元数据查询来自本地副本)。
+server 每个 volume 记一条有序的变更日志，位置与树的改动在同一个事务里分配；client 先订阅、再取一次一致性快照，此后由流喂着。副本在观测到流断开时整份作废，到达 replicated storage 的操作以 EIO 失败，没有过期时间或基于间隔的刷新。本地副本在读写阶段之间交接，持续查询不能让已登记的更新一直等待读者空闲；首次构建与重建在快照 EOF 后读取固定 checkpoint，并用原订阅回放到该位置才恢复作答，见 [client 设计](client/architecture.md#二路径属性来自副本目录读取来自权威)。
 
 于是跨机器的可见性不依赖轮询：一台机器上的提交完成之后，那条变更走事件流到达另一台机器，`stat` 就看得到（R-CON-1、R-CON-2）。对 metastore-backed volume，成功的 mutation response 携带一次原子读取的 `(incarnation, committed position)` barrier；replicated client 等到同一代副本的位置不小于它才返回。barrier 可以因并发提交而晚于本次 mutation，但不早于它，因此写完立刻 `stat` 得到的是至少包含这次修改的大小与时间（R-CON-4）。
 
 **绕过 server 的改动不产生变更事件。** 保留的本地持久对象存储不支持旁路修改其私有格式；无法验证的对象或组合状态以 I/O 错误暴露。第三方 backend 同样须明确自己的外部写入边界，不能让旁路改动冒充已记录的 volume mutation。
 
-FileSession、File、Use claim、range owner 与有限控制历史属于挂载生命周期，不是 volume 副本。容量由 Statfs 单独查询；同步 WriteAt 与 Truncate 在服务端发布时取得配额的权威结果。复制与内容操作各自保持资源上限，边界见[client 设计](client/architecture.md)。
+FileSession、File、Use claim、range owner 与有限控制历史属于挂载和当前 authority incarnation，不是 volume 副本，也不跨 authority 重启恢复。节点事实与 opaque metadata 才进入持久树和变更日志。容量由 Statfs 单独查询；同步 WriteAt 与 Truncate 在服务端发布时取得配额的权威结果。复制与内容操作各自保持资源上限，边界见[client 设计](client/architecture.md)。
 
 代价：提供 change log 的 volume 在副本建好之前不可用。集成方未提供日志时，复制操作以 `ENOSYS` 说明没有副本，每次 metadata 查询仍是一次远端请求；随附的两种服务端形态都提供日志。
 

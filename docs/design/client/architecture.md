@@ -10,7 +10,7 @@ volume 的使用者。持有一份 remote storage，把 volume 呈现为本地�
 |---|---|---|
 | **remote storage** `packages/transport/httprest` | 基础 storage 操作逐次转换为 HTTP 请求，不缓存内容。复制的订阅与快照使用独立长连接；`DialOptions` 限制 stream silence、body 与 admission，超时由调用方配置。 | R-INT-3、R-INT-5、R-INT-9 |
 | **显式锁控制** | HTTP client 实现锁 Service，调用方保留 Session / Owner 与原动作身份，以 `WithScope` 构造独立、不可变的修改 proof 集合。控制请求具有独立预算。 | R-CC-3、R-CC-6 至 R-CC-11、R-INT-3 |
-| **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：`Stat` 与 `List` 走本地那份元数据副本，其余走远端。副本是一份 SQLite（`packages/metastore/sqlite` 的 `Replica`），由变更流喂着。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
+| **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：按路径 `Stat` 走本地 SQLite，公开 `List` / `ListBounded` 回源 authority，其余操作也走远端。副本由变更流喂着。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
 | **挂载呈现层** `packages/fuse` | 把一份 storage 呈现为本地目录。持有 FileSession、File、UseOwner 与内核 owner 的映射；投影 POSIX metadata，文件以 direct I/O 逐次读写。仅 Linux。 | R-FS-1、R-CON-1~3、R-ERR-1、R-ERR-2、R-CC-12、R-CC-13、R-WS-5、R-INT-3、R-INT-8 |
 | **生命周期** | 挂载的建立与拆除。 | R-WS-2 |
 
@@ -26,7 +26,7 @@ volume 的使用者。持有一份 remote storage，把 volume 呈现为本地�
                        ▼
         ┌──────────────────────────────┐
         │           本地副本           │
-        │  查名字、问属性、列目录走它  │
+        │  查名字与按路径属性走它      │
         └───────┬──────────────┬───────┘
                 │              │ storage 接口
                 │              ▼
@@ -70,9 +70,9 @@ GrantStatus 的剩余时间由服务端对未取整的 deadline 与 now 求差�
 
 Strong 控制请求与响应固定至多 16 KiB；文件 metadata/range 控制使用独立的 256 KiB envelope。容量检查不占用数据 response 或复制 stream 的名额。state-changing control 进入 dispatch 后丢失响应时保持结果未知；只读核对遵循自己的取消边界。缺少 v4 marker、非法 scope 或不一致 receipt 都明确失败。服务端 Strong callback／native 生命周期的失败响应保持 native Unavailable／EIO、recorded=false 且无动作回执；该 wire 协议没有 EINTR code。SDK 本地在 HTTP Do 前接受的取消，以及只读控制在 client 侧接受的取消，仍可返回 EINTR，不经过 native wire 编码。业务策略拒绝另走普通 EACCES／EIO envelope。
 
-## 二、元数据查询来自本地副本
+## 二、路径属性来自副本，目录读取来自权威
 
-内核的目录项超时、属性超时、负项超时都是 0。按名字 Lookup 与列目录落到 storage，由本地 SQLite 查询答复；已取得的节点身份或 fd 属性走服务端身份接口。挂载呈现层不向内核发送失效通知；副本不可用时，普通 volume 与文件 I/O 返回 EIO，文件会话的核对、续期和清理仍可联系服务端。遍历已复制的树会使用身份属性 RPC，并可能与周期续期交错；缓存消除的是具名 Stat/List 回源。
+内核的目录项超时、属性超时、负项超时都是 0。按路径 Lookup/Stat 由本地 SQLite 答复；公开 List/ListBounded 先要求副本可用，再回源 authority，使当前 `ReadEntries` Deny 与枚举共享同一顺序。已取得的节点身份或 fd 属性同样走服务端身份接口。挂载呈现层不向内核发送失效通知；副本不可用时，普通 volume 与文件 I/O 返回 EIO，文件会话的核对、续期和清理仍可联系服务端。遍历已复制的树仍消除具名 Stat 与负查找回源，但每个实际目录读取产生一次 authority 请求。
 
 普通文件的 Open 与 Create 返回 `FOPEN_DIRECT_IO`。文件读取经过挂载层的健康检查与 `File.ReadAt`，不让同一 inode 的页缓存把旧 handle 内容交给新 handle。属性与返回区间来自同一次权威读取；direct I/O 不承诺共享 mmap 的完整行为。
 
@@ -86,7 +86,7 @@ Strong 控制请求与响应固定至多 16 KiB；文件 metadata/range 控制�
 
 构建的 Snapshot 与 Checkpoint 保留调用方 context 值；原订阅属于 storage lifetime 的子 context，构建期间临时关联调用方取消。失败由 reader 关闭订阅，取消回调只发出取消，不与 reader 并发 Close。成功前解除并等待临时取消关联，再确认构建与 lifetime 仍有效，最后恢复查询；成功返回后取消原构建 context 不切断订阅。固定目标之后的修改由正常 follower 接续，不移动目标追逐每个未来提交，也不把这一门槛描述为全局即时新鲜度证明。
 
-SQLite replica 的 `Stat`、`List`、`ListBounded` 先取得 SQL 读取名额，再进入共享读阶段。名额数与 reader pool 使用同一份 `Options.MaxReaderConnections`，默认 16；等待名额的调用不持有读阶段。两次等待都接受调用 context，等阶段失败时归还名额；查询结束时先退出阶段，再归还名额。`Position` 不查询 SQLite，使用无取消的共享阶段，不占 SQL 名额。
+SQLite `Replica` 自身的 `Stat`、`List`、`ListBounded` 先取得 SQL 读取名额，再进入共享读阶段。名额数与 reader pool 使用同一份 `Options.MaxReaderConnections`，默认 16；等待名额的调用不持有读阶段。两次等待都接受调用 context，等阶段失败时归还名额；查询结束时先退出阶段，再归还名额。组合层只用其中的 Stat 回答公开路径查询；公开 List/ListBounded 委托 remote authority。`Position` 不查询 SQLite，使用无取消的共享阶段，不占 SQL 名额。
 
 私有读写门在共享读阶段与独占写阶段之间交接。写者登记后，新读者排队，现有读者排空后进入写阶段；写者退出时先为已经等待的有限读者批次预留名额，再唤醒它们，下一写者等待这些活跃或预留读者全部退出。等待取消撤回相应名额；门只保存固定数量的计数与共享通知状态，不保存逐等待者队列。`Apply` 与整次 `Reseed` 不占 SQL 读取名额，直接使用独占阶段，后者在 `Seeding.Complete` 完成事务或 `Seeding.Close` 中止时释放；`Add` 或 `Complete` 的前置校验失败仍须由调用方 `Close`。取得多项所有权时的顺序为 SQL 读取名额、replica 门、commit gate、database health lock，各入口只取得自己需要的部分。此机制保证阶段间交接，不承诺多个写者之间的 FIFO 或已进入操作的执行时长；取舍见[副本写者推进](../../../.agents/notes/implemented/bug-fix/2026-09-07-let-replica-writers-progress.md)。
 
@@ -215,7 +215,7 @@ volume 报出自己的容量，挂载呈现层把它换算成内核要的块数�
 
 ## 九、生命周期
 
-一次挂载拥有一个 FileSession。`Options.FileSession` 未提供时使用默认 options，显式 options 在建立前验证；实际 MaxFileSize 与挂载大小界限一致。后台续期在上一份已确认 lease 内完成，成功状态只以保守的请求起点更新 deadline。服务端重启、会话退役或期限耗尽使挂载失败，不按路径重开文件，也不自动重新取得 range。
+一次挂载拥有一个 FileSession。`Options.FileSession` 未提供时使用默认 options，显式 options 在建立前验证；实际 MaxFileSize 与挂载大小界限一致。后台续期在上一份已确认 lease 内完成，成功状态只以保守的请求起点更新 deadline。authority 重启、会话退役或期限耗尽使 File、UseOwner、range 与动作历史全部失效；挂载不按路径重开文件，也不自动重新取得 range。节点事实和 opaque metadata 可由新会话再次读取，旧持有者连续性不能由这些持久事实推导。
 
 `Unmount` 失败，例如仍有使用者而返回 `EBUSY` 时，会话继续续期。内核连接退出后，挂载停止续期并尝试排空全部引用；个别 Release 缺失也由会话清理覆盖。`Mount.Done()` 在这次清理尝试结束后关闭，`Mount.Wait()` 返回它的错误，Done 关闭不意味着清理成功。独立 client 等待 Done 后才释放 replica，释放失败保留其目录与错误。
 
