@@ -147,7 +147,7 @@ func TestMetadataDecoderRejectsStorageClassesAndInconsistentFields(t *testing.T)
 		{"zero node", map[string]any{"node": int64(0)}},
 		{"negative size", map[string]any{"size": int64(-1)}},
 		{"zero node kind", map[string]any{"node_kind": int64(0)}},
-		{"unsupported node kind", map[string]any{"node_kind": int64(storage.NodeSymlink)}},
+		{"unsupported node kind", map[string]any{"node_kind": int64(4)}},
 		{"directory bytes", map[string]any{"node_kind": int64(storage.NodeDirectory)}},
 		{"missing content", map[string]any{"content": nil}},
 		{"missing created name", map[string]any{"name": nil}},

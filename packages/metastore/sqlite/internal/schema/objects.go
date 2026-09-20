@@ -80,17 +80,19 @@ func validateObjectRelationshipsVersion(ctx context.Context, db sqlvalue.Queryer
 	var invalidNodes int64
 	kindColumn := "mode"
 	invalidKind := "(n.mode & ?) != 0"
+	inlineInvalid := "n.size != 0"
 	kindArgs := []any{int64(fs.ModeType), StateReferenced}
 	if version >= firstNeutralMetadataSchemaVersion {
 		kindColumn = "kind"
 		invalidKind = "n.kind != 1"
+		inlineInvalid = "(n.kind = 1 AND n.size != 0)"
 		kindArgs = []any{StateReferenced}
 	}
 	nodeArgs := append(kindArgs, scopeArgs...)
 	if err := db.QueryRowContext(ctx, `
 		SELECT coalesce(sum(CASE
 			WHEN n.content IS NULL THEN
-				CASE WHEN typeof(n.size) != 'integer' OR n.size != 0 THEN 1 ELSE 0 END
+				CASE WHEN typeof(n.size) != 'integer' OR `+inlineInvalid+` THEN 1 ELSE 0 END
 			WHEN typeof(n.content) != 'text'
 				OR n.content = ''
 				OR typeof(n.`+kindColumn+`) != 'integer'

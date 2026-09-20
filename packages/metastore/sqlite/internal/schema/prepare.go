@@ -211,7 +211,7 @@ func PrepareConfiguredWithMetadataPolicy(
 	// still roll every schema change back on refusal.
 	if !recorded || version < firstNeutralMetadataSchemaVersion {
 		if err := validateIntegrityWithMetadataPolicy(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes,
-			schema.Version(), maxMetadataBytes, opaqueMetadataVersions); err != nil {
+			schema.Version(), math.MaxInt64, opaqueMetadataVersions); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 	}
@@ -241,7 +241,7 @@ func PrepareConfiguredWithMetadataPolicy(
 	}
 	if durable != nil && durable.ReapDetached {
 		if err := validateIntegrityWithMetadataPolicy(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes,
-			schema.Version(), maxMetadataBytes, opaqueMetadataVersions); err != nil {
+			schema.Version(), math.MaxInt64, opaqueMetadataVersions); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 		if err := reapDetachedFiles(ctx, tx); err != nil {

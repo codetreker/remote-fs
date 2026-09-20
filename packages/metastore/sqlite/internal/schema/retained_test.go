@@ -1,10 +1,12 @@
 package schema
 
 import (
+	"encoding/binary"
 	"strings"
 	"testing"
 
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/changes"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func TestPreparationReclaimsOnlyDetachedFiles(t *testing.T) {
@@ -14,7 +16,14 @@ func TestPreparationReclaimsOnlyDetachedFiles(t *testing.T) {
 	detached, detachedKey := testFile(t, db, id, root, "unlinked", 7, true)
 	other, otherRoot := testVolume(t, db, "other")
 	otherDetached, _ := testFile(t, db, other, otherRoot, "orphan", 11, true)
-	_, _, _, err := PrepareConfigured(t.Context(), db, "workspace", "", changes.DefaultWindow(), 1000, 1<<20,
+	metadata, err := storage.EncodeMetadata(map[string]storage.OpaquePayload{
+		"client.attribute": {Version: binary.BigEndian.AppendUint64(nil, 1), Data: []byte("retained")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execute(t, db, `UPDATE nodes SET metadata=? WHERE id IN (?,?,?)`, metadata, live, detached, otherDetached)
+	_, _, _, err = PrepareConfigured(t.Context(), db, "workspace", "", changes.DefaultWindow(), 1000, 1<<20,
 		&DurableOpen{Mode: RequireExistingVolume, ReapDetached: true})
 	if err != nil {
 		t.Fatal(err)
@@ -35,9 +44,11 @@ func TestPreparationReclaimsOnlyDetachedFiles(t *testing.T) {
 	if retained != 0 || used != 3 || state != StateGarbage || liveState != StateReferenced {
 		t.Fatalf("wrong recovery: retained=%d used=%d garbage-state=%d live-state=%d", retained, used, state, liveState)
 	}
+	assertMetadataUsed(t, db, id, int64(6+len(metadata)))
 	if err := db.QueryRow(`SELECT used FROM volumes WHERE id=?`, other).Scan(&used); err != nil || used != 0 {
 		t.Fatalf("other volume's orphan remains charged: used=%d err=%v", used, err)
 	}
+	assertMetadataUsed(t, db, other, 6)
 }
 
 func TestReclamationFailureRollsBackAllThreeSteps(t *testing.T) {

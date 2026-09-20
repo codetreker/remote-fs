@@ -838,7 +838,7 @@ func TestOpenRefusesInconsistentVolumeIntegrity(t *testing.T) {
 			damageDatabase(t, f.path, `UPDATE nodes SET kind = 0 WHERE `+nodeNamed, f.volume, "copy")
 		}},
 		{"a node has an unsupported type", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE nodes SET kind = 3 WHERE `+nodeNamed, f.volume, "copy")
+			damageDatabase(t, f.path, `UPDATE nodes SET kind = 4 WHERE `+nodeNamed, f.volume, "copy")
 		}},
 		{"a node has invalid access nanoseconds", func(t *testing.T, f objectIntegrityFixture) {
 			damageDatabase(t, f.path, `UPDATE nodes SET atime_nsec = 1000000000 WHERE `+nodeNamed,
@@ -878,7 +878,7 @@ func TestOpenRefusesInconsistentVolumeIntegrity(t *testing.T) {
 			damageDatabase(t, f.path, `UPDATE changes SET kind = 'created' WHERE volume = ? AND position = (SELECT min(position) FROM changes WHERE volume = ?)`, f.volume, f.volume)
 		}},
 		{"a change carries an unsupported node type", func(t *testing.T, f objectIntegrityFixture) {
-			damageDatabase(t, f.path, `UPDATE changes SET node_kind = 3 WHERE position = (
+			damageDatabase(t, f.path, `UPDATE changes SET node_kind = 4 WHERE position = (
 				SELECT min(position) FROM changes WHERE volume = ? AND node IS NOT NULL)`, f.volume)
 		}},
 		{"a change carries file bytes without a content key", func(t *testing.T, f objectIntegrityFixture) {

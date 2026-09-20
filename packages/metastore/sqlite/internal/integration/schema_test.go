@@ -125,6 +125,24 @@ func TestWitnessedRetainedMigrationPreservesNodesAndAcceptedState(t *testing.T) 
 			if total != 4 || initialized != total {
 				t.Fatalf("migrated nodes = %d, valid linked revisions = %d", total, initialized)
 			}
+			var currentEnvelope, historicalEnvelope []byte
+			if err := db.QueryRow(`SELECT metadata FROM nodes WHERE id=2`).Scan(&currentEnvelope); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(`SELECT metadata FROM changes WHERE node=2 ORDER BY position LIMIT 1`).Scan(&historicalEnvelope); err != nil {
+				t.Fatal(err)
+			}
+			currentMetadata, err := storage.DecodeMetadata(currentEnvelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			historicalMetadata, err := storage.DecodeMetadata(historicalEnvelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Equal(currentMetadata["posix.permissions.v1"].Version, historicalMetadata["posix.permissions.v1"].Version) {
+				t.Fatal("migrated current and historical POSIX metadata share a CAS version")
+			}
 			accepted, visible := witness.accepts()
 			want := historicalLeaseDurableState
 			want.Generation++
@@ -201,6 +219,55 @@ func assertRetainedMigrationRefused(t *testing.T, path string, version int, opti
 	}
 	if accepted, _ := witness.accepts(); len(accepted) != 0 {
 		t.Fatalf("refused migration accepted state: %+v", accepted)
+	}
+}
+
+func TestNeutralMetadataMigrationWitnessFailurePreservesRecoveryState(t *testing.T) {
+	path := writePreRetainedDatabase(t, 5)
+	failure := errors.New("migration witness publication unavailable")
+	witness := &recordingWitness{database: path, acceptErr: failure}
+	store, err := sqlite.OpenBoundDurableWithOptions(t.Context(), path, "A", durableStoreID, 1024,
+		sqlite.DefaultOptions(), sqlite.RequireExistingVolume, sqlite.DurableStartup{
+			Accepted: historicalLeaseDurableState, CheckpointedGeneration: historicalLeaseDurableState.Generation,
+		}, witness)
+	if store != nil {
+		store.Abort()
+		t.Fatal("unaccepted migration exposed a Store")
+	}
+	if !errors.Is(err, failure) || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("unaccepted migration = %v; want original witness failure and EIO", err)
+	}
+	assertHistoricalLeaseSchemaVersion(t, path, 6)
+	want := historicalLeaseDurableState
+	want.Generation++
+	accepted, visible := witness.accepts()
+	if len(accepted) != 1 || len(visible) != 1 || accepted[0] != want || visible[0] != want {
+		t.Fatalf("migration acceptance = %+v, visible = %+v; want %+v", accepted, visible, want)
+	}
+	wal, statErr := os.Stat(path + "-wal")
+	if statErr != nil || wal.Size() == 0 {
+		t.Fatalf("unaccepted migration lost recovery WAL: %v, %v", wal, statErr)
+	}
+
+	recoveryWitness := &recordingWitness{database: path}
+	recovered, err := sqlite.OpenBoundDurableWithOptions(t.Context(), path, "A", durableStoreID, 1024,
+		sqlite.DefaultOptions(), sqlite.RequireExistingVolume, sqlite.DurableStartup{
+			Accepted: historicalLeaseDurableState, CheckpointedGeneration: historicalLeaseDurableState.Generation,
+			WALPresent: true, WALNonEmpty: true,
+		}, recoveryWitness)
+	if err != nil {
+		t.Fatalf("recover committed migration: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := recovered.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	assertHistoricalLeaseVolume(t, recovered, "A")
+	want.Generation++
+	accepted, visible = recoveryWitness.accepts()
+	if len(accepted) != 1 || len(visible) != 1 || accepted[0] != want || visible[0] != want {
+		t.Fatalf("recovery acceptance = %+v, visible = %+v; want %+v", accepted, visible, want)
 	}
 }
 

@@ -105,9 +105,10 @@ func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volum
 		removedExtra = ` OR c.birth_sec IS NOT NULL OR c.birth_nsec IS NOT NULL OR
 			c.change_sec IS NOT NULL OR c.change_nsec IS NOT NULL OR c.metadata IS NOT NULL`
 		requiredExtra = ` OR c.metadata IS NULL`
-		nodeSpecific = `c.node_kind NOT IN (1,2) OR
+		nodeSpecific = `c.node_kind NOT IN (1,2,3) OR
 			(c.node_kind=2 AND (c.size!=0 OR c.content IS NOT NULL)) OR
-			(c.node_kind!=2 AND c.content IS NULL AND c.size!=0) OR
+			(c.node_kind=1 AND c.content IS NULL AND c.size!=0) OR
+			(c.node_kind=3 AND c.content IS NOT NULL) OR
 			(c.birth_sec IS NULL)!=(c.birth_nsec IS NULL) OR (c.change_sec IS NULL)!=(c.change_nsec IS NULL) OR
 			c.birth_nsec NOT BETWEEN 0 AND 999999999 OR c.change_nsec NOT BETWEEN 0 AND 999999999`
 	}

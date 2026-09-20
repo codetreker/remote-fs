@@ -57,7 +57,7 @@ func (s *nodeHeader) fields() []any {
 }
 
 func (s *nodeHeader) node() (metastore.Node, error) {
-	if s.valid != 1 || s.id < 1 || s.kind < int64(storage.NodeRegular) || s.kind > int64(storage.NodeDirectory) || s.size < 0 ||
+	if s.valid != 1 || s.id < 1 || s.kind < int64(storage.NodeRegular) || s.kind > int64(storage.NodeSymlink) || s.size < 0 ||
 		s.atimeNsec < 0 || s.atimeNsec >= int64(time.Second) || s.mtimeNsec < 0 || s.mtimeNsec >= int64(time.Second) ||
 		s.contentBytes < 0 || s.metadataBytes < 6 {
 		return metastore.Node{}, fmt.Errorf("invalid stored node metadata: %w", syscall.EIO)
@@ -66,7 +66,8 @@ func (s *nodeHeader) node() (metastore.Node, error) {
 		return metastore.Node{}, fmt.Errorf("stored node metadata exceeds its bound: %w", syscall.EFBIG)
 	}
 	kind := storage.NodeKind(s.kind)
-	if kind == storage.NodeDirectory && (s.size != 0 || s.contentBytes != 0) {
+	if kind == storage.NodeDirectory && (s.size != 0 || s.contentBytes != 0) ||
+		kind == storage.NodeSymlink && s.contentBytes != 0 {
 		return metastore.Node{}, fmt.Errorf("stored node kind and content disagree: %w", syscall.EIO)
 	}
 	birth, err := optionalStoredTime(s.birthSec, s.birthNsec)

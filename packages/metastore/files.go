@@ -37,6 +37,9 @@ type FileState struct {
 type File interface {
 	storage.ScopedReference
 	storage.ReferenceMetadataAccess
+	// Order runs fn while this exact reference is validated and serialized with
+	// native use/range transitions and final publication admission.
+	Order(context.Context, func() error) error
 	Node(context.Context) (FileState, error)
 	Reserve(context.Context, int64) (Key, error)
 	// Commit checks logical liveness and expected revision under final publication

@@ -26,6 +26,9 @@ func checkMetadataUpdate(id uint64, namespace string, expected, data []byte) err
 }
 
 func (s *Store) SetMetadata(ctx context.Context, id uint64, namespace string, expected, data []byte) (storage.OpaquePayload, error) {
+	if err := s.CheckMetadataAccess(); err != nil {
+		return storage.OpaquePayload{}, err
+	}
 	if err := checkMetadataUpdate(id, namespace, expected, data); err != nil {
 		return storage.OpaquePayload{}, err
 	}
@@ -45,6 +48,9 @@ func (s *Store) SetMetadata(ctx context.Context, id uint64, namespace string, ex
 }
 
 func (f *retainedFile) SetMetadata(ctx context.Context, namespace string, expected, data []byte) (storage.OpaquePayload, error) {
+	if err := f.CheckMetadataAccess(); err != nil {
+		return storage.OpaquePayload{}, err
+	}
 	if err := checkMetadataUpdate(uint64(f.id), namespace, expected, data); err != nil {
 		return storage.OpaquePayload{}, err
 	}

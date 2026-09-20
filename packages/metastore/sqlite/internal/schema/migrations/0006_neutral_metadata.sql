@@ -19,7 +19,7 @@ WITH permissions AS (
 UPDATE nodes
 SET kind = CASE WHEN (mode & 2147483648) != 0 THEN 2 ELSE 1 END,
     metadata = (
-        SELECT unhex('52464d0101001400080004000000706f7369782e7065726d697373696f6e732e76310000000000000001' ||
+        SELECT unhex('52464d0101001400080004000000706f7369782e7065726d697373696f6e732e76310000000000000002' ||
             printf('%02x%02x', posix_mode & 255, (posix_mode >> 8) & 255) || '0000')
         FROM permissions WHERE permissions.id = nodes.id
     );

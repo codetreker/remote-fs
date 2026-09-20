@@ -242,7 +242,7 @@ func validateChangeMetadata(
 			return fmt.Errorf("%w: change %d carries an empty content key", syscall.EIO, change.Position)
 		}
 		if id.Int64 <= 0 || size.Int64 < 0 ||
-			nodeKind.Int64 < int64(storage.NodeRegular) || nodeKind.Int64 > int64(storage.NodeDirectory) ||
+			nodeKind.Int64 < int64(storage.NodeRegular) || nodeKind.Int64 > int64(storage.NodeSymlink) ||
 			atimeNsec.Int64 < 0 || atimeNsec.Int64 >= int64(time.Second) ||
 			mtimeNsec.Int64 < 0 || mtimeNsec.Int64 >= int64(time.Second) {
 			return fmt.Errorf("%w: change %d carries invalid node metadata", syscall.EIO, change.Position)

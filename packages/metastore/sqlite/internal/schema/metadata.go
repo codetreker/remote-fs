@@ -16,6 +16,9 @@ import (
 )
 
 func validateMetadataIntegrity(ctx context.Context, db sqlvalue.Queryer, volume *int64, limit int64, opaqueVersions bool) error {
+	if err := validateMetadataPayloads(ctx, db, volume, opaqueVersions); err != nil {
+		return err
+	}
 	if err := validateMetadataAccounting(ctx, db); err != nil {
 		return err
 	}
@@ -54,7 +57,7 @@ func validateMetadataIntegrity(ctx context.Context, db sqlvalue.Queryer, volume 
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return err
 	}
-	return validateMetadataPayloads(ctx, db, volume, opaqueVersions)
+	return nil
 }
 
 func validateMetadataPayloads(ctx context.Context, db sqlvalue.Queryer, volume *int64, opaqueVersions bool) error {
@@ -64,34 +67,55 @@ func validateMetadataPayloads(ctx context.Context, db sqlvalue.Queryer, volume *
 		where = " WHERE volume=?"
 		args = []any{*volume, *volume}
 	}
-	projection := fmt.Sprintf(`CASE WHEN typeof(metadata)='blob' AND length(metadata)<=%d THEN metadata END,
-		typeof(metadata),coalesce(length(metadata),0)`, storage.MaxMetadataBytes)
-	query := `SELECT 1,` + projection + ` FROM nodes` + where +
-		` UNION ALL SELECT CASE WHEN node IS NULL THEN 0 ELSE 1 END,` + projection + ` FROM changes` + where
-	rows, err := db.QueryContext(ctx, query, args...)
+	shape := `SELECT 1,typeof(metadata),CASE WHEN typeof(metadata)='blob' THEN length(metadata) END FROM nodes` + where +
+		` UNION ALL SELECT CASE WHEN node IS NULL THEN 0 ELSE 1 END,typeof(metadata),
+		CASE WHEN typeof(metadata)='blob' THEN length(metadata) END FROM changes` + where
+	rows, err := db.QueryContext(ctx, shape, args...)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var present int
+		var metadataType string
+		var metadataBytes sql.NullInt64
+		if err := rows.Scan(&present, &metadataType, &metadataBytes); err != nil {
+			rows.Close()
+			return err
+		}
+		if present == 0 {
+			if metadataType != "null" {
+				rows.Close()
+				return fmt.Errorf("removed history retains node metadata: %w", syscall.EIO)
+			}
+			continue
+		}
+		if metadataType != "blob" || !metadataBytes.Valid {
+			rows.Close()
+			return fmt.Errorf("invalid metadata payload storage class: %w", syscall.EIO)
+		}
+		if metadataBytes.Int64 < 6 || metadataBytes.Int64 > storage.MaxMetadataBytes {
+			rows.Close()
+			return fmt.Errorf("stored metadata payload exceeds its bound: %w", syscall.EFBIG)
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+
+	query := `SELECT metadata FROM nodes` + where +
+		` UNION ALL SELECT metadata FROM changes` + where + ` AND node IS NOT NULL`
+	if volume == nil {
+		query = `SELECT metadata FROM nodes UNION ALL SELECT metadata FROM changes WHERE node IS NOT NULL`
+	}
+	rows, err = db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var present int
 		var encoded []byte
-		var metadataType string
-		var metadataBytes int64
-		if err := rows.Scan(&present, &encoded, &metadataType, &metadataBytes); err != nil {
+		if err := rows.Scan(&encoded); err != nil {
 			return err
-		}
-		if present == 0 {
-			if metadataType != "null" {
-				return fmt.Errorf("removed history retains node metadata: %w", syscall.EIO)
-			}
-			continue
-		}
-		if metadataType != "blob" {
-			return fmt.Errorf("invalid metadata payload storage class: %w", syscall.EIO)
-		}
-		if metadataBytes > storage.MaxMetadataBytes {
-			return fmt.Errorf("stored metadata payload exceeds its bound: %w", syscall.EFBIG)
 		}
 		values, err := storage.DecodeMetadata(encoded)
 		if err != nil {
@@ -116,6 +140,16 @@ func validateMetadataAccounting(ctx context.Context, db sqlvalue.Queryer) error 
 		return err
 	}
 	source := string(body)
+	var unexpected int64
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name NOT IN (
+		'nodes_metadata_insert','nodes_metadata_update','nodes_metadata_delete',
+		'changes_metadata_insert','changes_metadata_update','changes_metadata_delete'
+	)`).Scan(&unexpected); err != nil {
+		return err
+	}
+	if unexpected != 0 {
+		return fmt.Errorf("the database holds %d unexpected persistent triggers: %w", unexpected, syscall.EIO)
+	}
 	for _, table := range []string{"nodes", "changes"} {
 		for _, action := range []string{"insert", "update", "delete"} {
 			name := table + "_metadata_" + action

@@ -821,10 +821,12 @@ func TestReplicaReopensOpaqueMetadataVersions(t *testing.T) {
 		t.Fatal(err)
 	}
 	version := []byte("authority-opaque-version")
-	if err := seeding.Add(t.Context(), []metastore.Row{{Node: metastore.Node{
-		ID: 1, Kind: storage.NodeDirectory,
-		Metadata: map[string]storage.OpaquePayload{"client": {Version: version, Data: []byte("value")}},
-	}}}); err != nil {
+	if err := seeding.Add(t.Context(), []metastore.Row{
+		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory,
+			Metadata: map[string]storage.OpaquePayload{"client": {Version: version, Data: []byte("value")}}}},
+		{Parent: 1, Name: []byte("link"), Node: metastore.Node{ID: 2, Kind: storage.NodeSymlink, Size: 6,
+			Metadata: map[string]storage.OpaquePayload{"client": {Version: version, Data: []byte("link")}}}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := seeding.Complete(t.Context(), 1); err != nil {
@@ -844,5 +846,9 @@ func TestReplicaReopensOpaqueMetadataVersions(t *testing.T) {
 	root, err := reopened.Stat(t.Context(), "")
 	if err != nil || !bytes.Equal(root.Metadata["client"].Version, version) {
 		t.Fatalf("reopened opaque metadata = %+v, %v", root.Metadata, err)
+	}
+	link, err := reopened.Stat(t.Context(), "link")
+	if err != nil || link.Kind != storage.NodeSymlink || link.Size != 6 || !bytes.Equal(link.Metadata["client"].Version, version) {
+		t.Fatalf("reopened symbolic-link facts = %+v, %v", link, err)
 	}
 }

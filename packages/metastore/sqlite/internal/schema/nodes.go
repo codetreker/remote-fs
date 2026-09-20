@@ -410,7 +410,7 @@ func validateUsedAccountingVersion(
 				invalidNodeValues++
 				continue
 			}
-			hasBytes = mode != 2
+			hasBytes = mode == 1
 		}
 		if !hasBytes || calculatedOverflow {
 			continue

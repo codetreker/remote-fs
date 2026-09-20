@@ -17,12 +17,12 @@ func validateNeutralNodeValues(ctx context.Context, db sqlvalue.Queryer, volume 
 	}
 	var invalid int64
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM nodes WHERE `+where+`(
-		kind NOT IN (1,2) OR size<0 OR detached NOT IN (0,1) OR (detached=1 AND kind!=1) OR content_revision<1 OR
+		kind NOT IN (1,2,3) OR size<0 OR detached NOT IN (0,1) OR (detached=1 AND kind!=1) OR content_revision<1 OR
 		atime_nsec NOT BETWEEN 0 AND 999999999 OR mtime_nsec NOT BETWEEN 0 AND 999999999 OR
 		(birth_sec IS NULL)!=(birth_nsec IS NULL) OR (change_sec IS NULL)!=(change_nsec IS NULL) OR
 		birth_nsec NOT BETWEEN 0 AND 999999999 OR change_nsec NOT BETWEEN 0 AND 999999999 OR
 		(kind=2 AND (size!=0 OR content IS NOT NULL)) OR
-		(kind!=2 AND content IS NULL AND size!=0) OR
+		(kind=1 AND content IS NULL AND size!=0) OR (kind=3 AND content IS NOT NULL) OR
 		(content IS NOT NULL AND content='')
 	)`, args...).Scan(&invalid); err != nil {
 		return err

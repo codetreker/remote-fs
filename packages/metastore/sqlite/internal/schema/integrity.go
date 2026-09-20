@@ -345,16 +345,6 @@ func ValidateVolumeIntegrity(
 	return validateIntegrity(ctx, db, &volume, maxIntegrityRecords, maxIntegrityBytes, schema.Version(), metadataLimits...)
 }
 
-func ValidateReplicaVolumeIntegrity(
-	ctx context.Context,
-	db sqlvalue.Queryer,
-	volume int64,
-	maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes int64,
-) error {
-	return validateIntegrityWithMetadataPolicy(ctx, db, &volume, maxIntegrityRecords, maxIntegrityBytes,
-		schema.Version(), maxMetadataBytes, true)
-}
-
 // A nil volume validates the complete database for migration or exclusive-owner recovery.
 // Version selects the stored layout explicitly; ordinary readers validate the current schema.
 func validateIntegrity(
