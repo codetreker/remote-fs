@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 // PublicationResult describes the volume effect, independently of the operation's
@@ -166,15 +167,11 @@ func (c PublicationAccountingChain) Empty() bool { return c.head == nil }
 
 type publicationAccountingContext struct {
 	context.Context
-	head *publicationAccountingLink
+	deadline    time.Time
+	hasDeadline bool
 }
 
-func (c publicationAccountingContext) Value(key any) any {
-	if _, ok := key.(publicationAccountingKey); ok {
-		return c.head
-	}
-	return nil
-}
+func (c publicationAccountingContext) Deadline() (time.Time, bool) { return c.deadline, c.hasDeadline }
 
 // WithPublicationAccountingChain installs accounting on a cleanup context while
 // retaining only its cancellation and deadline. Every other context value is
@@ -183,7 +180,15 @@ func WithPublicationAccountingChain(ctx context.Context, chain PublicationAccoun
 	if ctx == nil {
 		panic("storage: nil publication accounting context")
 	}
-	return publicationAccountingContext{Context: ctx, head: chain.head}
+	deadline, hasDeadline := ctx.Deadline()
+	lifetime, cancel := context.WithCancelCause(context.Background())
+	if ctx.Err() != nil {
+		cancel(context.Cause(ctx))
+	} else {
+		context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
+	}
+	clean := publicationAccountingContext{Context: lifetime, deadline: deadline, hasDeadline: hasDeadline}
+	return context.WithValue(clean, publicationAccountingKey{}, chain.head)
 }
 
 // MaintenanceAccounting binds one complete chain for recovered or orphaned

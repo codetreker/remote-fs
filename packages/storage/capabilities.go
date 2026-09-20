@@ -64,6 +64,7 @@ type FileActions interface {
 	CheckFileActions() error
 	QueryFileAction(context.Context, FileActionID) (FileActionReceipt, error)
 	QueryDeleteIntent(context.Context, DeleteIntentID) (DeleteIntentStatus, error)
+	AcknowledgeDeleteIntent(context.Context, AcknowledgeDeleteIntentCommand) error
 }
 
 // ScopedReference returns an opaque capability for one exact live File reference.
@@ -218,8 +219,8 @@ type ChildName struct {
 }
 
 // RenameTarget separates the slot observed by the caller from the output leaf.
-// This permits platform clients to validate one slot while preserving the exact
-// bytes they intend to publish.
+// The authority must reject an unobserved third occupant at OutputLeaf; it must
+// never overwrite a node other than the one named by Expected.
 type RenameTarget struct {
 	Parent       DirectoryTarget
 	ObservedLeaf []byte
@@ -459,12 +460,20 @@ const (
 	DeleteIntentCompleted
 	DeleteIntentNotExecuted
 	DeleteIntentCleanupFailed
+	DeleteIntentUnknown
+	DeleteIntentRetired
 )
 
 type DeleteIntentStatus struct {
 	ID      DeleteIntentID
 	NodeID  uint64
 	Outcome DeleteIntentOutcome
+	Failure syscall.Errno `json:",omitempty"`
+}
+
+type AcknowledgeDeleteIntentCommand struct {
+	Action FileActionID
+	Intent DeleteIntentID
 }
 
 func (o OwnerOptions) Check() error {

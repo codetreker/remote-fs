@@ -1,6 +1,7 @@
 package storage_test
 
 import (
+	"bytes"
 	"errors"
 	"math"
 	"reflect"
@@ -32,6 +33,21 @@ func TestCleanPathVolumeBoundary(t *testing.T) {
 				t.Fatalf("CleanPath(%q) = %q, %v; want %q", tc.input, got, err, tc.want)
 			}
 		})
+	}
+}
+
+func TestCleanPathBoundsEveryNormalizedLeaf(t *testing.T) {
+	maximum := string(bytes.Repeat([]byte{'x'}, storage.MaxLeafBytes))
+	if got, err := storage.CleanPath("parent/" + maximum); err != nil || got != "parent/"+maximum {
+		t.Fatalf("maximum component = %q, %v", got, err)
+	}
+	for _, input := range []string{
+		string(bytes.Repeat([]byte{'x'}, storage.MaxLeafBytes+1)),
+		"parent/" + string(bytes.Repeat([]byte{'x'}, storage.MaxLeafBytes+1)),
+	} {
+		if got, err := storage.CleanPath(input); !errors.Is(err, syscall.ENAMETOOLONG) || got != "" {
+			t.Fatalf("oversized path component %q = %q, %v", input[:16], got, err)
+		}
 	}
 }
 

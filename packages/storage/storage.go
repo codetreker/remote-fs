@@ -438,5 +438,10 @@ func CleanPath(p string) (string, error) {
 	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
 		return "", syscall.EINVAL
 	}
+	for _, component := range strings.Split(cleaned, "/") {
+		if err := CheckLeaf([]byte(component)); err != nil {
+			return "", err
+		}
+	}
 	return cleaned, nil
 }

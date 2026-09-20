@@ -296,11 +296,11 @@ func (c FileMutation) Check() error {
 			return syscall.EINVAL
 		}
 	case MutateTruncate:
-		if c.Offset != 0 || len(c.Data) != 0 || !c.Attr.Empty() || len(c.Metadata) != 0 {
+		if c.Offset != 0 || len(c.Data) != 0 || !c.Attr.Empty() {
 			return syscall.EINVAL
 		}
 	case MutateWriteAt, MutateAppend:
-		if c.Size != 0 || !c.Attr.Empty() || len(c.Metadata) != 0 || int64(len(c.Data)) > math.MaxInt64-c.Offset {
+		if c.Size != 0 || !c.Attr.Empty() || int64(len(c.Data)) > math.MaxInt64-c.Offset {
 			return syscall.EINVAL
 		}
 		if c.Kind == MutateAppend && c.Offset != 0 {
@@ -337,7 +337,8 @@ func (r FileActionReceipt) Check() error {
 	}
 	switch r.Operation {
 	case OpFileOpenAt, OpFileMutateName, OpFileOpenNodeRef, OpFileOpenChildRef,
-		OpFileSetPendingUnlink, OpFileClearPendingUnlink, OpFileMutate:
+		OpFileSetPendingUnlink, OpFileClearPendingUnlink, OpFileMutate,
+		OpFileAcknowledgeDeleteIntent:
 	default:
 		return syscall.EINVAL
 	}
@@ -363,10 +364,31 @@ func (s DeleteIntentStatus) Check() error {
 	if err := s.ID.Check(); err != nil {
 		return err
 	}
-	if s.NodeID == 0 || s.Outcome < DeleteIntentArmed || s.Outcome > DeleteIntentCleanupFailed {
+	if s.Outcome < DeleteIntentArmed || s.Outcome > DeleteIntentRetired {
+		return syscall.EINVAL
+	}
+	missing := s.Outcome == DeleteIntentUnknown || s.Outcome == DeleteIntentRetired
+	if missing != (s.NodeID == 0) {
+		return syscall.EINVAL
+	}
+	if s.Outcome == DeleteIntentCleanupFailed {
+		if s.Failure == 0 {
+			return syscall.EINVAL
+		}
+		if _, ok := ErrnoName(s.Failure); !ok {
+			return syscall.EINVAL
+		}
+	} else if s.Failure != 0 {
 		return syscall.EINVAL
 	}
 	return nil
+}
+
+func (c AcknowledgeDeleteIntentCommand) Check() error {
+	if err := c.Action.Check(); err != nil {
+		return err
+	}
+	return c.Intent.Check()
 }
 
 func checkMetadataConditions(expected map[string][]byte) error {

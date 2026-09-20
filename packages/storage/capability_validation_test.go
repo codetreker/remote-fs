@@ -62,11 +62,38 @@ func TestFileActionAndDurableDeleteIdentitiesAreBounded(t *testing.T) {
 			t.Fatalf("outcome %v accepted without a retained operation", outcome)
 		}
 	}
-	for _, outcome := range []DeleteIntentOutcome{DeleteIntentArmed, DeleteIntentPending, DeleteIntentCompleted, DeleteIntentNotExecuted, DeleteIntentCleanupFailed} {
+	for _, outcome := range []DeleteIntentOutcome{DeleteIntentArmed, DeleteIntentPending, DeleteIntentCompleted, DeleteIntentNotExecuted} {
 		status := DeleteIntentStatus{ID: validDeleteIntent, NodeID: 9, Outcome: outcome}
 		if err := status.Check(); err != nil {
 			t.Fatalf("valid delete intent status %+v: %v", status, err)
 		}
+	}
+	failed := DeleteIntentStatus{ID: validDeleteIntent, NodeID: 9, Outcome: DeleteIntentCleanupFailed, Failure: syscall.EIO}
+	if err := failed.Check(); err != nil {
+		t.Fatalf("valid cleanup failure: %v", err)
+	}
+	for _, outcome := range []DeleteIntentOutcome{DeleteIntentUnknown, DeleteIntentRetired} {
+		if err := (DeleteIntentStatus{ID: validDeleteIntent, Outcome: outcome}).Check(); err != nil {
+			t.Fatalf("valid missing intent status %v: %v", outcome, err)
+		}
+	}
+	for _, invalid := range []DeleteIntentStatus{
+		{ID: validDeleteIntent, Outcome: DeleteIntentCompleted},
+		{ID: validDeleteIntent, NodeID: 9, Outcome: DeleteIntentUnknown},
+		{ID: validDeleteIntent, NodeID: 9, Outcome: DeleteIntentCleanupFailed},
+		{ID: validDeleteIntent, NodeID: 9, Outcome: DeleteIntentCompleted, Failure: syscall.EIO},
+		{ID: validDeleteIntent, NodeID: 9, Outcome: DeleteIntentCleanupFailed, Failure: syscall.Errno(255)},
+	} {
+		if invalid.Check() == nil {
+			t.Fatalf("invalid delete intent status accepted: %+v", invalid)
+		}
+	}
+	ack := AcknowledgeDeleteIntentCommand{Action: action, Intent: validDeleteIntent}
+	if err := ack.Check(); err != nil {
+		t.Fatalf("valid delete intent acknowledgement: %v", err)
+	}
+	if (AcknowledgeDeleteIntentCommand{Intent: validDeleteIntent}).Check() == nil || (AcknowledgeDeleteIntentCommand{Action: action}).Check() == nil {
+		t.Fatal("incomplete delete intent acknowledgement accepted")
 	}
 }
 
@@ -306,8 +333,11 @@ func TestConditionalMutationsSeparateConditionsFromEffects(t *testing.T) {
 	size := int64(4)
 	valid := []FileMutation{
 		{Action: action, Kind: MutateTruncate, Size: 3},
+		{Action: action, Kind: MutateTruncate, Size: 3, Metadata: map[string]OpaquePayload{"archive": {Data: []byte{1}}}},
 		{Action: action, Kind: MutateWriteAt, Offset: 2, Data: []byte("xy"), ExpectedSize: &size, ExpectedMetadata: map[string][]byte{"a": {1}, "absent": nil}},
+		{Action: action, Kind: MutateWriteAt, Data: []byte("xy"), Metadata: map[string]OpaquePayload{"archive": {Version: []byte{1}, Data: []byte{2}}}},
 		{Action: action, Kind: MutateAppend, Data: []byte("xy"), ExpectedSize: &size},
+		{Action: action, Kind: MutateAppend, Data: []byte("xy"), Metadata: map[string]OpaquePayload{"archive": {Data: []byte{1}}}},
 		{Action: action, Kind: MutateAttributes, Metadata: map[string]OpaquePayload{"new.namespace": {Data: []byte{1}}}},
 	}
 	for _, command := range valid {
@@ -337,7 +367,7 @@ func TestConditionalMutationsSeparateConditionsFromEffects(t *testing.T) {
 			t.Fatalf("invalid file mutation accepted: %+v", command)
 		}
 	}
-	if !errors.Is(valid[1].CheckDataLimit(1), syscall.EFBIG) || !errors.Is(valid[1].CheckDataLimit(0), syscall.EINVAL) {
+	if !errors.Is(valid[2].CheckDataLimit(1), syscall.EFBIG) || !errors.Is(valid[2].CheckDataLimit(0), syscall.EINVAL) {
 		t.Fatal("conditional mutation byte budget ignored")
 	}
 }

@@ -354,6 +354,7 @@ func TestMaintenanceAccountingChainIsImmutableAndStripsContextValues(t *testing.
 		t.Fatalf("chain calls = %v, want %v", calls, want)
 	}
 	cancel()
+	<-cleanup.Done()
 	if !errors.Is(cleanup.Err(), context.Canceled) {
 		t.Fatalf("cleanup cancellation = %v", cleanup.Err())
 	}
@@ -366,6 +367,21 @@ func TestMaintenanceAccountingChainIsImmutableAndStripsContextValues(t *testing.
 		}
 	}()
 	_ = chain.With(nil)
+}
+
+func TestMaintenanceAccountingChainPreservesCustomCancellationCause(t *testing.T) {
+	type secretKey struct{}
+	source, cancel := context.WithCancelCause(context.WithValue(t.Context(), secretKey{}, "credential"))
+	cleanup := storage.WithPublicationAccountingChain(source, storage.PublicationAccountingChain{})
+	cause := errors.New("maintenance stopped")
+	cancel(cause)
+	<-cleanup.Done()
+	if !errors.Is(cleanup.Err(), context.Canceled) || !errors.Is(context.Cause(cleanup), cause) {
+		t.Fatalf("cleanup cancellation = %v, cause = %v", cleanup.Err(), context.Cause(cleanup))
+	}
+	if cleanup.Value(secretKey{}) != nil {
+		t.Fatal("cleanup context exposed an unrelated source value")
+	}
 }
 
 func TestPublicationContextCompositionIsImmutable(t *testing.T) {
