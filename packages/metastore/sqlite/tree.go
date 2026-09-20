@@ -212,7 +212,13 @@ type reservedChild struct {
 	reservation   *storage.ListReservation
 }
 
+type childReservationCheck func(index int, nameBytes, metadataBytes int64, attr storage.Attr) error
+
 func (s *Store) listChildrenBounded(ctx context.Context, tx *sql.Tx, parent int64, result *storage.ListResult) error {
+	return s.listChildrenBoundedChecked(ctx, tx, parent, result, nil)
+}
+
+func (s *Store) listChildrenBoundedChecked(ctx context.Context, tx *sql.Tx, parent int64, result *storage.ListResult, check childReservationCheck) error {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT length(CAST(e.name AS BLOB)), `+nodeAttrColumns+` FROM entries e JOIN nodes n ON n.id = e.node
 		 WHERE e.volume = ? AND e.parent = ? ORDER BY e.name`,
@@ -234,6 +240,12 @@ func (s *Store) listChildrenBounded(ctx context.Context, tx *sql.Tx, parent int6
 		if err != nil {
 			rows.Close()
 			return err
+		}
+		if check != nil {
+			if err := check(len(reserved), nameBytes, node.metadataBytes, attr); err != nil {
+				rows.Close()
+				return err
+			}
 		}
 		reservation, err := result.Reserve(nameBytes, node.metadataBytes, attr)
 		if err != nil {
@@ -471,13 +483,19 @@ func (s *Store) link(ctx context.Context, tx *sql.Tx, parent int64, name []byte,
 		}
 		return err
 	}
-	return nil
+	return s.advanceDirectoryRevision(ctx, tx, parent)
 }
 
 func (s *Store) unlink(ctx context.Context, tx *sql.Tx, parent int64, name []byte) error {
-	_, err := tx.ExecContext(ctx, `DELETE FROM entries WHERE volume = ? AND parent = ? AND name = ?`,
+	result, err := tx.ExecContext(ctx, `DELETE FROM entries WHERE volume = ? AND parent = ? AND name = ?`,
 		s.volume, parent, name)
-	return err
+	if err != nil {
+		return err
+	}
+	if err := sqlvalue.ExactlyOne(result, "unlinking a directory entry"); err != nil {
+		return err
+	}
+	return s.advanceDirectoryRevision(ctx, tx, parent)
 }
 
 // touch records that a directory's contents changed. A directory's modification time is the
@@ -765,6 +783,14 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 		`UPDATE entries SET parent = ?, name = ? WHERE volume = ? AND parent = ? AND name = ?`,
 		toParent.ID, toName, s.volume, fromParent.ID, fromName); err != nil {
 		return err
+	}
+	if err := s.advanceDirectoryRevision(ctx, tx, fromParent.ID); err != nil {
+		return err
+	}
+	if toParent.ID != fromParent.ID {
+		if err := s.advanceDirectoryRevision(ctx, tx, toParent.ID); err != nil {
+			return err
+		}
 	}
 	now := time.Now()
 	if err := s.setNodeChangeTime(ctx, tx, moving.ID, now); err != nil {

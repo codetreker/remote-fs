@@ -486,7 +486,7 @@ func TestAFillingThatWasNotCompletedLeavesTheCopyAsItWas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("emptying the copy: %v", err)
 	}
-	if err := seeding.Add(t.Context(), []metastore.Row{{Node: metastore.Node{ID: 4242, Kind: storage.NodeDirectory}}}); err != nil {
+	if err := seeding.Add(t.Context(), []metastore.Row{{Node: metastore.Node{ID: 4242, Kind: storage.NodeDirectory, DirectoryRevision: []byte{0, 0, 0, 0, 0, 0, 0, 1}}}}); err != nil {
 		t.Fatalf("filling the copy: %v", err)
 	}
 	if err := seeding.Close(); err != nil {

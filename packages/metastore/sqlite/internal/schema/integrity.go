@@ -306,6 +306,10 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 			OR typeof(pending_generation)!='integer'`
 		neutralChangeClasses += ` OR typeof(link_target) NOT IN ('blob','null')`
 	}
+	if version >= firstDirectoryRevisionSchemaVersion {
+		neutralNodeClasses += ` OR typeof(directory_revision)!='blob'`
+		neutralChangeClasses += ` OR typeof(directory_revision) NOT IN ('blob','null')`
+	}
 	queries := []struct {
 		name  string
 		query string
@@ -459,7 +463,7 @@ func validateIntegrityWithMetadataPolicy(
 		return err
 	}
 	if version >= firstNeutralMetadataSchemaVersion {
-		if err := validateMetadataIntegrity(ctx, db, volume, maxMetadataBytes, opaqueMetadataVersions); err != nil {
+		if err := validateMetadataIntegrity(ctx, db, volume, maxMetadataBytes, opaqueMetadataVersions, version); err != nil {
 			return err
 		}
 	}

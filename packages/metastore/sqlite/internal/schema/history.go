@@ -119,6 +119,14 @@ func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volum
 			(c.node_kind=3 AND (length(c.link_target)=0 OR c.size!=length(c.link_target))) OR
 			(c.node_kind!=3 AND length(c.link_target)!=0)`
 	}
+	if version >= firstDirectoryRevisionSchemaVersion {
+		removedExtra += ` OR c.directory_revision IS NOT NULL`
+		requiredExtra += ` OR c.directory_revision IS NULL`
+		nodeSpecific += ` OR
+			(c.node_kind=2 AND (
+				length(c.directory_revision)!=8 OR c.directory_revision<X'0000000000000001' OR c.directory_revision>X'7fffffffffffffff')) OR
+			(c.node_kind!=2 AND coalesce(length(c.directory_revision),0)!=0) OR length(c.directory_revision)>64`
+	}
 	var invalidLogs int64
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*)

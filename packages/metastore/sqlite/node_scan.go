@@ -26,6 +26,7 @@ var nodeHeaderColumns = fmt.Sprintf(`
 	CASE WHEN typeof(n.birth_nsec)='integer' THEN n.birth_nsec END,
 	CASE WHEN typeof(n.change_sec)='integer' THEN n.change_sec END,
 	CASE WHEN typeof(n.change_nsec)='integer' THEN n.change_nsec END,
+	CASE WHEN typeof(n.directory_revision)='blob' AND length(n.directory_revision)<=%d THEN n.directory_revision END,
 	CASE WHEN typeof(n.content) IN ('text','null') THEN coalesce(length(CAST(n.content AS BLOB)),0) ELSE -1 END,
 	CASE WHEN typeof(n.metadata)='blob' THEN length(n.metadata) ELSE -1 END,
 	CASE WHEN typeof(n.link_target)='blob' THEN length(n.link_target) ELSE -1 END,
@@ -33,7 +34,9 @@ var nodeHeaderColumns = fmt.Sprintf(`
 		AND typeof(n.change_sec) IN ('integer','null') AND typeof(n.change_nsec) IN ('integer','null')
 		AND (n.content IS NULL OR (typeof(n.content)='text' AND length(CAST(n.content AS BLOB))>0))
 		AND typeof(n.metadata)='blob' AND length(n.metadata)<=%d
-		AND typeof(n.link_target)='blob' AND length(n.link_target)<=%d THEN 1 ELSE 0 END`, storage.MaxMetadataBytes, storage.MaxLinkTargetBytes)
+		AND typeof(n.link_target)='blob' AND length(n.link_target)<=%d
+		AND typeof(n.directory_revision)='blob' AND length(n.directory_revision)<=%d THEN 1 ELSE 0 END`,
+	storage.MaxObservationTokenBytes, storage.MaxMetadataBytes, storage.MaxLinkTargetBytes, storage.MaxObservationTokenBytes)
 
 var nodeColumns = nodeHeaderColumns + fmt.Sprintf(`,
 	CASE WHEN typeof(n.content)='text' THEN n.content END,
@@ -48,6 +51,7 @@ type nodeHeader struct {
 	mtimeSec, mtimeNsec   int64
 	birthSec, birthNsec   sql.NullInt64
 	changeSec, changeNsec sql.NullInt64
+	directoryRevision     []byte
 	contentBytes          int64
 	metadataBytes         int64
 	targetBytes           int64
@@ -58,7 +62,8 @@ type nodeAttrScan = nodeHeader
 
 func (s *nodeHeader) fields() []any {
 	return []any{&s.id, &s.kind, &s.size, &s.atimeSec, &s.atimeNsec, &s.mtimeSec, &s.mtimeNsec,
-		&s.birthSec, &s.birthNsec, &s.changeSec, &s.changeNsec, &s.contentBytes, &s.metadataBytes, &s.targetBytes, &s.valid}
+		&s.birthSec, &s.birthNsec, &s.changeSec, &s.changeNsec, &s.directoryRevision,
+		&s.contentBytes, &s.metadataBytes, &s.targetBytes, &s.valid}
 }
 
 func (s *nodeHeader) node() (metastore.Node, error) {
@@ -71,7 +76,8 @@ func (s *nodeHeader) node() (metastore.Node, error) {
 		return metastore.Node{}, fmt.Errorf("stored node metadata exceeds its bound: %w", syscall.EFBIG)
 	}
 	kind := storage.NodeKind(s.kind)
-	if kind == storage.NodeDirectory && (s.size != 0 || s.contentBytes != 0) ||
+	if kind == storage.NodeDirectory && (s.size != 0 || s.contentBytes != 0 || !validDirectoryRevision(s.directoryRevision)) ||
+		kind != storage.NodeDirectory && len(s.directoryRevision) != 0 ||
 		kind == storage.NodeSymlink && (s.targetBytes == 0 || s.targetBytes != s.size || s.contentBytes != 0) ||
 		kind != storage.NodeSymlink && s.targetBytes != 0 {
 		return metastore.Node{}, fmt.Errorf("stored node kind and content disagree: %w", syscall.EIO)
@@ -86,7 +92,7 @@ func (s *nodeHeader) node() (metastore.Node, error) {
 	}
 	return metastore.Node{ID: s.id, Kind: kind, Size: s.size,
 		AccessTime: sqlvalue.LoadedTime(s.atimeSec, int32(s.atimeNsec)), ModTime: sqlvalue.LoadedTime(s.mtimeSec, int32(s.mtimeNsec)),
-		BirthTime: birth, ChangeTime: changed}, nil
+		BirthTime: birth, ChangeTime: changed, DirectoryRevision: bytes.Clone(s.directoryRevision)}, nil
 }
 
 func optionalStoredTime(sec, nsec sql.NullInt64) (*time.Time, error) {

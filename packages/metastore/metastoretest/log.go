@@ -843,7 +843,9 @@ func walkStore(t *testing.T, s metastore.Store) map[string]metastore.Node {
 func sameNode(a, b metastore.Node) bool {
 	return a.ID == b.ID && a.Kind == b.Kind && a.Size == b.Size &&
 		a.AccessTime.Equal(b.AccessTime) && a.ModTime.Equal(b.ModTime) && a.Content == b.Content &&
-		sameOptionalTime(a.BirthTime, b.BirthTime) && sameOptionalTime(a.ChangeTime, b.ChangeTime) && sameMetadata(a.Metadata, b.Metadata)
+		sameOptionalTime(a.BirthTime, b.BirthTime) && sameOptionalTime(a.ChangeTime, b.ChangeTime) &&
+		sameMetadata(a.Metadata, b.Metadata) && bytes.Equal(a.LinkTarget, b.LinkTarget) &&
+		bytes.Equal(a.DirectoryRevision, b.DirectoryRevision)
 }
 
 func readChanges(ctx context.Context, log metastore.Log, after metastore.Position, limit int) ([]metastore.Change, metastore.Retention, error) {

@@ -104,7 +104,7 @@ func TestHistoricalLeaseMigrationPreservesAcceptedDurableProof(t *testing.T) {
 	if len(accepted) != 1 || len(visible) != 1 || accepted[0] != want || visible[0] != want {
 		t.Fatalf("migration witness acceptance = %+v, visible = %+v; want %+v", accepted, visible, want)
 	}
-	assertHistoricalLeaseSchemaVersion(t, path, 7)
+	assertHistoricalLeaseSchemaVersion(t, path, 8)
 }
 
 func TestHistoricalLeaseMigrationRefusesRollbackBeforeChangingSchema(t *testing.T) {
@@ -168,7 +168,7 @@ func TestHistoricalLeaseMigrationProtectsEveryVolumeAcrossReopen(t *testing.T) {
 		}
 	})
 	assertHistoricalLeaseVolume(t, first.Store, "A")
-	assertHistoricalLeaseSchemaVersion(t, path, 7)
+	assertHistoricalLeaseSchemaVersion(t, path, 8)
 	acquireHistoricalLease(t, first.LockService(), "alpha.txt")
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
@@ -245,17 +245,15 @@ func acquireHistoricalLease(t *testing.T, service locking.Service, path string) 
 
 func assertHistoricalLeaseVolume(t *testing.T, store *sqlite.Store, volume string) {
 	t.Helper()
-	name, id, root, size := "alpha.txt", int64(2), int64(1), int64(5)
+	name, id, size := "alpha.txt", int64(2), int64(5)
 	content := metastore.Key("historical-alpha-object")
 	seconds, accessNanos, modifiedNanos := int64(1700000100), int64(201), int64(202)
-	incarnation := metastore.Incarnation("11111111111111111111111111111111")
-	positions := []metastore.Position{1, 3}
+	previousIncarnation := metastore.Incarnation("11111111111111111111111111111111")
 	if volume == "B" {
-		name, id, root, size = "bravo.txt", 4, 3, 7
+		name, id, size = "bravo.txt", 4, 7
 		content = "historical-bravo-object"
 		seconds, accessNanos, modifiedNanos = 1700000300, 401, 402
-		incarnation = "22222222222222222222222222222222"
-		positions = []metastore.Position{2, 4}
+		previousIncarnation = "22222222222222222222222222222222"
 	}
 	node, err := store.Stat(t.Context(), name)
 	if err != nil || node.ID != id || node.Size != size || node.Kind != storage.NodeRegular || node.Content != content ||
@@ -267,22 +265,12 @@ func assertHistoricalLeaseVolume(t *testing.T, store *sqlite.Store, volume strin
 		t.Fatalf("volume %s historical directory changed: %+v, %v", volume, children, err)
 	}
 	gotIncarnation, err := store.Incarnation(t.Context(), 64)
-	if err != nil || gotIncarnation != incarnation {
-		t.Fatalf("volume %s historical log incarnation changed: %q, %v", volume, gotIncarnation, err)
+	if err != nil || gotIncarnation == "" || gotIncarnation == previousIncarnation {
+		t.Fatalf("volume %s did not establish a new revision-aware log incarnation: %q, %v", volume, gotIncarnation, err)
 	}
 	changes, retained, err := readChanges(t.Context(), store, 0, 10)
-	if err != nil || len(changes) != 2 || retained.Oldest != positions[0] || retained.Tail != positions[1] || retained.TrimmedThrough != 0 {
-		t.Fatalf("volume %s historical retention changed: %d changes, %+v, %v", volume, len(changes), retained, err)
-	}
-	for i, change := range changes {
-		kind := metastore.Created
-		if i == 1 {
-			kind = metastore.Modified
-		}
-		if change.Position != positions[i] || change.Kind != kind || change.Parent != root || string(change.Name) != name ||
-			change.From != nil || change.Node == nil || change.Node.ID != id || change.Node.Content != content || change.Node.Size != size {
-			t.Fatalf("volume %s historical change %d was not preserved", volume, i)
-		}
+	if err != nil || len(changes) != 0 || retained.Oldest != 0 || retained.Tail != 0 || retained.TrimmedThrough != 0 {
+		t.Fatalf("volume %s pre-revision history remains replayable: %d changes, %+v, %v", volume, len(changes), retained, err)
 	}
 }
 

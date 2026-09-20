@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -13,6 +14,96 @@ import (
 )
 
 func (s *Store) CheckNamespaceAccess() error { return s.CheckFileStore() }
+
+func (s *Store) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	result, err := storage.NewListResult(s.maxDirectoryBytes, 0, func(index int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		if index >= s.maxDirectoryEntries {
+			return 0, syscall.EFBIG
+		}
+		return storage.ObservedEntryBytes(nameBytes, metadataBytes)
+	})
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	observation, err := s.ReadDirNodeBounded(ctx, target, result)
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	entries, err := result.Entries()
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	observed := storage.ObservedDirectory{Observation: observation, Entries: make([]storage.ObservedEntry, len(entries))}
+	for i, entry := range entries {
+		observed.Entries[i] = storage.ObservedEntry{RawLeaf: []byte(entry.Name), Attr: entry.Attr}
+	}
+	if err := observed.Check(); err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	return observed, nil
+}
+
+func (s *Store) ReadDirNodeBounded(ctx context.Context, target storage.DirectoryTarget, result *storage.ListResult) (observation storage.DirectoryObservation, returned error) {
+	if result == nil {
+		return storage.DirectoryObservation{}, syscall.EINVAL
+	}
+	defer func() {
+		if returned != nil {
+			result.Fail(returned)
+		}
+	}()
+	if err := target.Check(); err != nil {
+		return storage.DirectoryObservation{}, err
+	}
+	if err := s.coordinator.commit.acquire(ctx); err != nil {
+		return storage.DirectoryObservation{}, err
+	}
+	defer s.coordinator.commit.release()
+	if err := s.checkFileOwnership(); err != nil {
+		return storage.DirectoryObservation{}, err
+	}
+	if err := metastore.CheckFilePublication(ctx); err != nil {
+		return storage.DirectoryObservation{}, err
+	}
+	err := s.inspect(ctx, func(tx *sql.Tx) error {
+		parent, _, err := s.directoryTarget(ctx, tx, target, storage.ReadEntries)
+		if err != nil {
+			return err
+		}
+		observation = storage.DirectoryObservation{ParentID: target.NodeID, Revision: bytes.Clone(parent.DirectoryRevision)}
+		used := int64(0)
+		return s.listChildrenBoundedChecked(ctx, tx, parent.ID, result, func(index int, nameBytes, metadataBytes int64, _ storage.Attr) error {
+			if index >= s.maxDirectoryEntries {
+				return syscall.EFBIG
+			}
+			charge, err := storage.ObservedEntryBytes(nameBytes, metadataBytes)
+			if err != nil {
+				return err
+			}
+			if charge > s.maxDirectoryBytes-used {
+				return syscall.EFBIG
+			}
+			used += charge
+			return nil
+		})
+	})
+	if err == nil {
+		err = observation.Check()
+		if err == nil && observation.ParentID != target.NodeID {
+			err = syscall.EIO
+		}
+	}
+	if err == nil {
+		err = metastore.CheckFilePublication(ctx)
+	}
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		return storage.DirectoryObservation{}, sqlerr.Failure(err)
+	}
+	return observation, nil
+}
 
 func checkChildCondition(condition storage.ChildCondition, node metastore.Node, found bool) error {
 	if err := condition.Check(); err != nil {

@@ -69,7 +69,7 @@ func Record(ctx context.Context, tx *sql.Tx, volume int64, change metastore.Chan
 		fromParent, fromName = change.From.Parent, change.From.Name
 	}
 	var node, nodeKind, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec, content any
-	var birthSec, birthNsec, changeSec, changeNsec, metadata, target any
+	var birthSec, birthNsec, changeSec, changeNsec, metadata, target, directoryRevision any
 	if change.Node != nil {
 		accessSec, accessNsec := sqlvalue.StoredTime(change.Node.AccessTime)
 		modifiedSec, modifiedNsec := sqlvalue.StoredTime(change.Node.ModTime)
@@ -88,12 +88,15 @@ func Record(ctx context.Context, tx *sql.Tx, volume int64, change metastore.Chan
 			return err
 		}
 		metadata = encoded
-		if len(change.Node.LinkTarget) > storage.MaxLinkTargetBytes ||
+		if len(change.Node.LinkTarget) > storage.MaxLinkTargetBytes || len(change.Node.DirectoryRevision) > storage.MaxObservationTokenBytes ||
+			change.Node.Kind == storage.NodeDirectory && !validStoredDirectoryRevision(change.Node.DirectoryRevision) ||
+			change.Node.Kind != storage.NodeDirectory && len(change.Node.DirectoryRevision) != 0 ||
 			change.Node.Kind == storage.NodeSymlink && (len(change.Node.LinkTarget) == 0 || int64(len(change.Node.LinkTarget)) != change.Node.Size || change.Node.Content != "") ||
 			change.Node.Kind != storage.NodeSymlink && len(change.Node.LinkTarget) != 0 {
 			return syscall.EIO
 		}
 		target = append([]byte{}, change.Node.LinkTarget...)
+		directoryRevision = append([]byte{}, change.Node.DirectoryRevision...)
 	}
 
 	sec, nsec := sqlvalue.StoredTime(time.Now())
@@ -121,11 +124,11 @@ func Record(ctx context.Context, tx *sql.Tx, volume int64, change metastore.Chan
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO changes (position, previous_position, volume, kind, parent, name, from_parent, from_name,
 			                     node, node_kind, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content,
-			                     recorded_sec, recorded_nsec, birth_sec, birth_nsec, change_sec, change_nsec, metadata, link_target)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			                     recorded_sec, recorded_nsec, birth_sec, birth_nsec, change_sec, change_nsec, metadata, link_target, directory_revision)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		position, previous, volume, kind, change.Parent, change.Name, fromParent, fromName,
 		node, nodeKind, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec, content,
-		sec, nsec, birthSec, birthNsec, changeSec, changeNsec, metadata, target)
+		sec, nsec, birthSec, birthNsec, changeSec, changeNsec, metadata, target, directoryRevision)
 	if err != nil {
 		return err
 	}

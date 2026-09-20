@@ -21,6 +21,12 @@ func validateNeutralNodeValues(ctx context.Context, db sqlvalue.Queryer, volume 
 			(pending_unlink=1 AND pending_generation=0) OR
 			(kind=3 AND (length(link_target)=0 OR size!=length(link_target))) OR (kind!=3 AND length(link_target)!=0)`
 	}
+	directoryRevision := ""
+	if version >= firstDirectoryRevisionSchemaVersion {
+		directoryRevision = ` OR typeof(directory_revision)!='blob' OR length(directory_revision)>64 OR
+			(kind=2 AND (length(directory_revision)!=8 OR directory_revision<X'0000000000000001' OR directory_revision>X'7fffffffffffffff')) OR
+			(kind!=2 AND length(directory_revision)!=0)`
+	}
 	detachedKind := " OR (detached=1 AND kind!=1)"
 	if version >= firstDurableIdentitySchemaVersion {
 		detachedKind = ""
@@ -33,7 +39,7 @@ func validateNeutralNodeValues(ctx context.Context, db sqlvalue.Queryer, volume 
 		birth_nsec NOT BETWEEN 0 AND 999999999 OR change_nsec NOT BETWEEN 0 AND 999999999 OR
 		(kind=2 AND (size!=0 OR content IS NOT NULL)) OR
 		(kind=1 AND content IS NULL AND size!=0) OR (kind=3 AND content IS NOT NULL) OR
-		(content IS NOT NULL AND content='')`+durable+`
+		(content IS NOT NULL AND content='')`+durable+directoryRevision+`
 	)`, args...).Scan(&invalid); err != nil {
 		return err
 	}

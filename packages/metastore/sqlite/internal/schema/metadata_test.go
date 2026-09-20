@@ -44,7 +44,7 @@ func TestMetadataAccountingReleasesTrimmedHistory(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	assertMetadataUsed(t, db, volume, int64(6+3*len(encoded)))
+	assertMetadataUsed(t, db, volume, int64(14+3*len(encoded)))
 
 	tx := testTransaction(t, db)
 	if err := changes.Trim(t.Context(), tx, volume, changes.Window{Cap: 1, Floor: 1, Age: time.Hour}); err != nil {
@@ -53,7 +53,7 @@ func TestMetadataAccountingReleasesTrimmedHistory(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	assertMetadataUsed(t, db, volume, int64(6+2*len(encoded)))
+	assertMetadataUsed(t, db, volume, int64(14+2*len(encoded)))
 }
 
 func TestMetadataIntegrityRejectsCorruptAccountingAndPayload(t *testing.T) {
@@ -79,7 +79,7 @@ func TestMetadataIntegrityRejectsCorruptAccountingAndPayload(t *testing.T) {
 			db := testDatabase(t, 0)
 			volume, _ := testVolume(t, db, "workspace")
 			execute(t, db, test.damage)
-			if err := validateMetadataIntegrity(t.Context(), db, &volume, math.MaxInt64, false); !errors.Is(err, syscall.EIO) {
+			if err := validateMetadataIntegrity(t.Context(), db, &volume, math.MaxInt64, false, schema.Version()); !errors.Is(err, syscall.EIO) {
 				t.Fatalf("corrupt metadata accepted: %v", err)
 			}
 		})
@@ -92,8 +92,8 @@ func assertMetadataUsed(t *testing.T, db interface {
 	t.Helper()
 	var recorded, actual int64
 	if err := db.QueryRowContext(t.Context(), `SELECT metadata_used,
-		coalesce((SELECT sum(length(metadata)) FROM nodes WHERE volume=?),0)+
-		coalesce((SELECT sum(coalesce(length(metadata),0)) FROM changes WHERE volume=?),0)
+		coalesce((SELECT sum(length(metadata)+length(link_target)+length(directory_revision)) FROM nodes WHERE volume=?),0)+
+		coalesce((SELECT sum(coalesce(length(metadata),0)+coalesce(length(link_target),0)+coalesce(length(directory_revision),0)) FROM changes WHERE volume=?),0)
 		FROM volumes WHERE id=?`, volume, volume, volume).Scan(&recorded, &actual); err != nil {
 		t.Fatal(err)
 	}

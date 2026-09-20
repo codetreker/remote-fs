@@ -30,6 +30,10 @@ func seededAdmissionReplica(t *testing.T) *Replica {
 	})
 }
 
+func replicaDirectory(id int64) metastore.Node {
+	return metastore.Node{ID: id, Kind: storage.NodeDirectory, DirectoryRevision: initialDirectoryRevision()}
+}
+
 func TestReplicaSeedRecognizesCanonicalEmptyRootName(t *testing.T) {
 	replica, err := OpenReplica(t.Context(), filepath.Join(t.TempDir(), "replica.db"))
 	if err != nil {
@@ -45,7 +49,7 @@ func TestReplicaSeedRecognizesCanonicalEmptyRootName(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer seeding.Close()
-	root := metastore.Row{Parent: 0, Name: []byte{}, Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory}}
+	root := metastore.Row{Parent: 0, Name: []byte{}, Node: replicaDirectory(1)}
 	if err := seeding.Add(t.Context(), []metastore.Row{root}); err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +59,124 @@ func TestReplicaSeedRecognizesCanonicalEmptyRootName(t *testing.T) {
 	if attr, err := replica.Stat(t.Context(), ""); err != nil || attr.ID != 1 || attr.Kind != storage.NodeDirectory {
 		t.Fatalf("canonical empty root = %+v, %v", attr, err)
 	}
+}
+
+func TestDirectoryRevisionsRoundTripThroughSnapshotChangesAndReplicaReopen(t *testing.T) {
+	authority, _ := openNameObservationStore(t, nil)
+	defer authority.Close()
+	if err := authority.Mkdir(t.Context(), "dir"); err != nil {
+		t.Fatal(err)
+	}
+	directory, err := authority.Stat(t.Context(), "dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, position, err := authority.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rowResult, err := metastore.NewRowResult(1<<20, 0, func(_ int, _ metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
+		return 256 + lengths.Name + lengths.Content + lengths.Metadata + lengths.Target, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done, err := snapshot.Next(t.Context(), 100, rowResult)
+	if err != nil || !done {
+		t.Fatalf("snapshot page done=%t error=%v", done, err)
+	}
+	rows, err := rowResult.Rows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var snapRevision []byte
+	for _, row := range rows {
+		if row.Node.ID == directory.ID {
+			snapRevision = append([]byte{}, row.Node.DirectoryRevision...)
+		}
+		if row.Node.Kind == storage.NodeDirectory && !validDirectoryRevision(row.Node.DirectoryRevision) {
+			t.Fatalf("snapshot directory %d has revision %x", row.Node.ID, row.Node.DirectoryRevision)
+		}
+	}
+	if len(snapRevision) == 0 {
+		t.Fatal("snapshot omitted directory revision")
+	}
+
+	replicaPath := filepath.Join(t.TempDir(), "revision-replica.db")
+	replica, err := OpenReplica(t.Context(), replicaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seeding, err := replica.Reseed(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seeding.Add(t.Context(), rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := seeding.Complete(t.Context(), position); err != nil {
+		t.Fatal(err)
+	}
+	if err := seeding.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := authority.Create(t.Context(), "dir/child"); err != nil {
+		t.Fatal(err)
+	}
+	changeResult, err := metastore.NewChangeResult(1<<20, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
+		return 256 + lengths.Name + lengths.FromName + lengths.Content + lengths.Metadata + lengths.Target, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retention, err := authority.Since(t.Context(), position, 100, changeResult)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes, err := changeResult.Changes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var changedRevision []byte
+	for _, change := range changes {
+		if change.Node != nil && change.Node.ID == directory.ID {
+			changedRevision = append([]byte{}, change.Node.DirectoryRevision...)
+		}
+		if _, err := replica.Apply(t.Context(), change); err != nil {
+			t.Fatalf("applying %+v: %v", change, err)
+		}
+	}
+	if !validDirectoryRevision(changedRevision) || revisionNumber(t, changedRevision) <= revisionNumber(t, snapRevision) || replica.Position() != retention.Tail {
+		t.Fatalf("replicated revision old=%x new=%x position=%d tail=%d", snapRevision, changedRevision, replica.Position(), retention.Tail)
+	}
+	assertReplicaRevision := func(replica *Replica) {
+		t.Helper()
+		var node metastore.Node
+		if err := replica.store.inspect(t.Context(), func(tx *sql.Tx) error {
+			var err error
+			node, err = replica.store.nodeByID(t.Context(), tx, directory.ID)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(node.DirectoryRevision, changedRevision) {
+			t.Fatalf("replica revision=%x want=%x", node.DirectoryRevision, changedRevision)
+		}
+	}
+	assertReplicaRevision(replica)
+	if err := replica.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenReplica(t.Context(), replicaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	assertReplicaRevision(reopened)
 }
 
 func seedAdmissionReplica(t *testing.T, checkClose func(error)) *Replica {
@@ -72,7 +194,7 @@ func seedAdmissionReplica(t *testing.T, checkClose func(error)) *Replica {
 	}
 	defer seeding.Close()
 	rows := []metastore.Row{
-		{Node: metastore.Node{ID: 10, Kind: storage.NodeDirectory}},
+		{Node: replicaDirectory(10)},
 		{Parent: 10, Name: []byte("file"), Node: metastore.Node{ID: 11, Kind: storage.NodeRegular, Size: 7}},
 	}
 	if err := seeding.Add(t.Context(), rows); err != nil {
@@ -296,7 +418,7 @@ func TestReplicaSeedingPublishesTreeAndPositionTogether(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer seeding.Close()
-			root := metastore.Row{Node: metastore.Node{ID: 20, Kind: storage.NodeDirectory}}
+			root := metastore.Row{Node: replicaDirectory(20)}
 			if err := seeding.Add(t.Context(), []metastore.Row{root}); err != nil {
 				t.Fatal(err)
 			}
@@ -605,7 +727,7 @@ func TestReplicaWriterProgressUnderContinuousListings(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer seeding.Close()
-	root := metastore.Node{ID: 1, Kind: storage.NodeDirectory}
+	root := replicaDirectory(1)
 	rows := []metastore.Row{{Node: root}}
 	for i := range 4096 {
 		rows = append(rows, metastore.Row{
@@ -819,7 +941,7 @@ func TestReplicaRejectsMetadataBeyondItsConfiguredLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := []metastore.Row{
-		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory, Metadata: map[string]storage.OpaquePayload{
+		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory, DirectoryRevision: initialDirectoryRevision(), Metadata: map[string]storage.OpaquePayload{
 			"root": {Version: []byte("opaque"), Data: make([]byte, 40)},
 		}}},
 		{Parent: 1, Name: []byte("file"), Node: metastore.Node{ID: 2, Kind: storage.NodeRegular, Metadata: map[string]storage.OpaquePayload{
@@ -849,7 +971,7 @@ func TestReplicaReopensOpaqueMetadataVersions(t *testing.T) {
 	}
 	version := []byte("authority-opaque-version")
 	if err := seeding.Add(t.Context(), []metastore.Row{
-		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory,
+		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory, DirectoryRevision: initialDirectoryRevision(),
 			Metadata: map[string]storage.OpaquePayload{"client": {Version: version, Data: []byte("value")}}}},
 		{Parent: 1, Name: []byte("link"), Node: metastore.Node{ID: 2, Kind: storage.NodeSymlink, Size: 6,
 			LinkTarget: []byte("target"),

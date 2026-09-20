@@ -44,11 +44,11 @@ func TestPreparationReclaimsOnlyDetachedFiles(t *testing.T) {
 	if retained != 0 || used != 3 || state != StateGarbage || liveState != StateReferenced {
 		t.Fatalf("wrong recovery: retained=%d used=%d garbage-state=%d live-state=%d", retained, used, state, liveState)
 	}
-	assertMetadataUsed(t, db, id, int64(6+len(metadata)))
+	assertMetadataUsed(t, db, id, int64(14+len(metadata)))
 	if err := db.QueryRow(`SELECT used FROM volumes WHERE id=?`, other).Scan(&used); err != nil || used != 0 {
 		t.Fatalf("other volume's orphan remains charged: used=%d err=%v", used, err)
 	}
-	assertMetadataUsed(t, db, other, 6)
+	assertMetadataUsed(t, db, other, 14)
 }
 
 func TestReclamationFailureRollsBackAllThreeSteps(t *testing.T) {

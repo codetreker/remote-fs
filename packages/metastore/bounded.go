@@ -84,6 +84,13 @@ func (r *ChangeResult) Reserve(meta Change, lengths ChangePayloadLengths) (*Chan
 		meta.From = &from
 	}
 	if meta.Node != nil {
+		if len(meta.Node.DirectoryRevision) > storage.MaxObservationTokenBytes {
+			return nil, false, r.fail(syscall.EFBIG)
+		}
+		if meta.Node.Kind == storage.NodeDirectory && len(meta.Node.DirectoryRevision) == 0 ||
+			meta.Node.Kind != storage.NodeDirectory && len(meta.Node.DirectoryRevision) != 0 {
+			return nil, false, r.fail(syscall.EIO)
+		}
 		node := meta.Node.Clone()
 		node.Content = ""
 		node.LinkTarget = nil
@@ -263,6 +270,13 @@ func (r *RowResult) Reserve(meta Row, lengths RowPayloadLengths) (*RowReservatio
 	}
 	if len(meta.Name) != 0 || len(meta.Node.Content) != 0 || len(meta.Node.Metadata) != 0 || len(meta.Node.LinkTarget) != 0 {
 		return nil, false, r.fail(fmt.Errorf("a row reservation already retains variable-length payload: %w", syscall.EINVAL))
+	}
+	if len(meta.Node.DirectoryRevision) > storage.MaxObservationTokenBytes {
+		return nil, false, r.fail(syscall.EFBIG)
+	}
+	if meta.Node.Kind == storage.NodeDirectory && len(meta.Node.DirectoryRevision) == 0 ||
+		meta.Node.Kind != storage.NodeDirectory && len(meta.Node.DirectoryRevision) != 0 {
+		return nil, false, r.fail(syscall.EIO)
 	}
 	if meta.Name != nil {
 		meta.Name = []byte{}

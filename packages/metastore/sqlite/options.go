@@ -8,6 +8,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/advisory"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/changes"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/nativelease"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 const (
@@ -33,6 +34,11 @@ const (
 	// DefaultMaxMetadataBytes bounds canonical opaque metadata retained by current nodes
 	// and by the volume's change history.
 	DefaultMaxMetadataBytes int64 = 64 << 20
+
+	// DefaultMaxDirectoryEntries and DefaultMaxDirectoryBytes bound one complete
+	// identity-addressed directory observation.
+	DefaultMaxDirectoryEntries = storage.MaxDirectoryEntries
+	DefaultMaxDirectoryBytes   = storage.MaxDirectoryBytes
 
 	// MinIntegrityRecords is the volume row, root node, and log row every usable volume
 	// contains.
@@ -80,6 +86,11 @@ type Options struct {
 	// MaxMetadataBytes bounds stored metadata independently of content quota and name-byte
 	// integrity work. Zero selects DefaultMaxMetadataBytes.
 	MaxMetadataBytes int64
+
+	// MaxDirectoryEntries and MaxDirectoryBytes bound one complete authoritative
+	// directory observation. Zero selects the corresponding default.
+	MaxDirectoryEntries int
+	MaxDirectoryBytes   int64
 }
 
 // DefaultOptions returns the default serving configuration.
@@ -95,6 +106,8 @@ func DefaultOptions() Options {
 		MaxIntegrityRecords:          DefaultMaxIntegrityRecords,
 		MaxIntegrityBytes:            DefaultMaxIntegrityBytes,
 		MaxMetadataBytes:             DefaultMaxMetadataBytes,
+		MaxDirectoryEntries:          DefaultMaxDirectoryEntries,
+		MaxDirectoryBytes:            DefaultMaxDirectoryBytes,
 	}
 }
 
@@ -173,12 +186,28 @@ func (o Options) Effective() (Options, error) {
 	if maxMetadataBytes < 1 || maxMetadataBytes == math.MaxInt64 {
 		return Options{}, fmt.Errorf("the SQLite metadata byte limit must be positive and bounded: %w", syscall.EINVAL)
 	}
+	maxDirectoryEntries := o.MaxDirectoryEntries
+	if maxDirectoryEntries == 0 {
+		maxDirectoryEntries = DefaultMaxDirectoryEntries
+	}
+	if maxDirectoryEntries < 1 || maxDirectoryEntries > storage.MaxDirectoryEntries {
+		return Options{}, fmt.Errorf("the SQLite directory-entry limit must be positive and at most %d: %w", storage.MaxDirectoryEntries, syscall.EINVAL)
+	}
+	maxDirectoryBytes := o.MaxDirectoryBytes
+	if maxDirectoryBytes == 0 {
+		maxDirectoryBytes = DefaultMaxDirectoryBytes
+	}
+	if maxDirectoryBytes < 1 || maxDirectoryBytes > storage.MaxDirectoryBytes {
+		return Options{}, fmt.Errorf("the SQLite directory byte limit must be positive and at most %d: %w", storage.MaxDirectoryBytes, syscall.EINVAL)
+	}
 	o.ObjectLimits = objectLimits
 	o.MaxReaderConnections = maxReaders
 	o.MaxSnapshotReaderConnections = maxSnapshotReaders
 	o.MaxIntegrityRecords = maxIntegrityRecords
 	o.MaxIntegrityBytes = maxIntegrityBytes
 	o.MaxMetadataBytes = maxMetadataBytes
+	o.MaxDirectoryEntries = maxDirectoryEntries
+	o.MaxDirectoryBytes = maxDirectoryBytes
 	return o, nil
 }
 

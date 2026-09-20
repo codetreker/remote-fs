@@ -281,10 +281,10 @@ func insertNode(ctx context.Context, tx *sql.Tx, volume int64, node metastore.No
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO nodes (id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,
-		                   birth_sec,birth_nsec,change_sec,change_nsec,metadata,link_target)
-		VALUES (?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?)`,
+		                   birth_sec,birth_nsec,change_sec,change_nsec,metadata,link_target,directory_revision)
+		VALUES (?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)`,
 		node.ID, volume, int64(node.Kind), node.Size, accessSec, accessNsec, modifiedSec, modifiedNsec,
-		birthSec, birthNsec, changeSec, changeNsec, metadata, append([]byte{}, node.LinkTarget...))
+		birthSec, birthNsec, changeSec, changeNsec, metadata, append([]byte{}, node.LinkTarget...), append([]byte{}, node.DirectoryRevision...))
 	return err
 }
 
@@ -304,10 +304,10 @@ func updateNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
 	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE nodes SET kind=?,size=?,atime_sec=?,atime_nsec=?,mtime_sec=?,mtime_nsec=?,
-		                 birth_sec=?,birth_nsec=?,change_sec=?,change_nsec=?,metadata=?,link_target=?
+		                 birth_sec=?,birth_nsec=?,change_sec=?,change_nsec=?,metadata=?,link_target=?,directory_revision=?
 		WHERE id = ?`,
 		int64(node.Kind), node.Size, accessSec, accessNsec, modifiedSec, modifiedNsec,
-		birthSec, birthNsec, changeSec, changeNsec, metadata, append([]byte{}, node.LinkTarget...), node.ID)
+		birthSec, birthNsec, changeSec, changeNsec, metadata, append([]byte{}, node.LinkTarget...), append([]byte{}, node.DirectoryRevision...), node.ID)
 	if err != nil {
 		return err
 	}
@@ -315,10 +315,13 @@ func updateNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
 }
 
 func validateReplicaNode(node metastore.Node) error {
-	if node.ID <= 0 || node.Kind.Check() != nil || node.Size < 0 || len(node.LinkTarget) > storage.MaxLinkTargetBytes {
+	if node.ID <= 0 || node.Kind.Check() != nil || node.Size < 0 || len(node.LinkTarget) > storage.MaxLinkTargetBytes || len(node.DirectoryRevision) > storage.MaxObservationTokenBytes {
 		return syscall.EIO
 	}
-	if node.Kind == storage.NodeDirectory && (node.Size != 0 || node.Content != "") {
+	if node.Kind == storage.NodeDirectory && (node.Size != 0 || node.Content != "" || !validDirectoryRevision(node.DirectoryRevision)) {
+		return syscall.EIO
+	}
+	if node.Kind != storage.NodeDirectory && len(node.DirectoryRevision) != 0 {
 		return syscall.EIO
 	}
 	if node.Kind == storage.NodeSymlink {

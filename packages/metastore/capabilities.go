@@ -52,6 +52,8 @@ type NodeReferences interface {
 type NamespaceAccess interface {
 	CheckNamespaceAccess() error
 	LookupAt(context.Context, storage.ChildName) (storage.Attr, error)
+	ReadDirNode(context.Context, storage.DirectoryTarget) (storage.ObservedDirectory, error)
+	ReadDirNodeBounded(context.Context, storage.DirectoryTarget, *storage.ListResult) (storage.DirectoryObservation, error)
 	MutateName(context.Context, storage.NameCommand) (storage.NameResult, error)
 }
 

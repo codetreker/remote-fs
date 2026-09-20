@@ -197,8 +197,8 @@ func assertMetadataAccounting(t *testing.T, store *Store) {
 		t.Fatal(err)
 	}
 	if err := store.read.QueryRowContext(t.Context(), `SELECT
-		coalesce((SELECT sum(length(metadata)) FROM nodes WHERE volume=?),0)+
-		coalesce((SELECT sum(coalesce(length(metadata),0)) FROM changes WHERE volume=?),0)`, store.volume, store.volume).Scan(&actual); err != nil {
+		coalesce((SELECT sum(length(metadata)+length(link_target)+length(directory_revision)) FROM nodes WHERE volume=?),0)+
+		coalesce((SELECT sum(coalesce(length(metadata),0)+coalesce(length(link_target),0)+coalesce(length(directory_revision),0)) FROM changes WHERE volume=?),0)`, store.volume, store.volume).Scan(&actual); err != nil {
 		t.Fatal(err)
 	}
 	if recorded != actual || recorded <= 0 {
