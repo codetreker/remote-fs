@@ -222,7 +222,7 @@ func TestAnOverwriteOnOneMountpointIsSeenWhole(t *testing.T) {
 // A symbolic link created through FUSE must retain its kind, target, and target length
 // across the mounted client's HTTP path to the authoritative volume.
 func TestASymbolicLinkSurvivesTheWholeChain(t *testing.T) {
-	s := serveUnreplicatedVolume(t)
+	s := serveVolume(t)
 	a := mountpointOn(t, s)
 	if err := os.WriteFile(filepath.Join(a, "target"), []byte("payload\n"), 0o644); err != nil {
 		t.Fatalf("creating the symlink target through the mount: %v", err)
