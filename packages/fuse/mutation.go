@@ -6,9 +6,9 @@ import (
 )
 
 // A compound operation cannot invite a retry after an earlier stage changed the
-// volume or a handle buffer. The original cancellation remains available for diagnostics.
+// volume or a handle buffer. The original retryable result remains available for diagnostics.
 func afterMutation(changed bool, err error) error {
-	if changed && errnoOf(err) == syscall.EINTR {
+	if changed && (errnoOf(err) == syscall.EINTR || errnoOf(err) == syscall.EAGAIN) {
 		return &incompleteMutation{cause: err}
 	}
 	return err
@@ -17,7 +17,7 @@ func afterMutation(changed bool, err error) error {
 type incompleteMutation struct{ cause error }
 
 func (e *incompleteMutation) Error() string {
-	return fmt.Sprintf("the operation was interrupted after a change: %v: %v", e.cause, syscall.EIO)
+	return fmt.Sprintf("the operation failed after a change: %v: %v", e.cause, syscall.EIO)
 }
 
 func (e *incompleteMutation) Unwrap() []error { return []error{e.cause, syscall.EIO} }

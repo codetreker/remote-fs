@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	iofs "io/fs"
 	"syscall"
 
@@ -10,6 +11,8 @@ import (
 	"github.com/codetreker/remote-fs/packages/fuse/posix"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
+
+const maxPermissionCASAttempts = 8
 
 type attributeHandle interface {
 	stat(context.Context) (storage.Attr, error)
@@ -69,7 +72,7 @@ func (n *node) setPermissions(ctx context.Context, f fs.FileHandle, mode iofs.Fi
 	if err != nil {
 		return err
 	}
-	var attr storage.Attr
+	var read func(context.Context) (storage.Attr, error)
 	var update func(context.Context, string, []byte, []byte) (storage.OpaquePayload, error)
 	if h, ok := f.(*handle); ok {
 		reference, ok := h.file.(storage.ReferenceMetadataAccess)
@@ -79,7 +82,7 @@ func (n *node) setPermissions(ctx context.Context, f fs.FileHandle, mode iofs.Fi
 		if err := reference.CheckMetadataAccess(); err != nil {
 			return err
 		}
-		attr, err = h.stat(ctx)
+		read = h.stat
 		update = reference.SetMetadata
 	} else {
 		access, ok := n.volume.files.(storage.MetadataAccess)
@@ -89,30 +92,45 @@ func (n *node) setPermissions(ctx context.Context, f fs.FileHandle, mode iofs.Fi
 		if err := access.CheckMetadataAccess(); err != nil {
 			return err
 		}
-		attr, err = n.volume.files.StatNode(ctx, n.id.node)
+		read = func(ctx context.Context) (storage.Attr, error) {
+			return n.volume.files.StatNode(ctx, n.id.node)
+		}
 		update = func(ctx context.Context, namespace string, version, data []byte) (storage.OpaquePayload, error) {
 			return access.SetMetadata(ctx, n.id.node, namespace, version, data)
 		}
 	}
-	if err != nil {
-		return err
+	for range maxPermissionCASAttempts {
+		attr, err := read(ctx)
+		if err != nil {
+			return err
+		}
+		if err := n.checkAttr(attr); err != nil {
+			return err
+		}
+		if attr.Kind == storage.NodeSymlink {
+			return syscall.EOPNOTSUPP
+		}
+		payload, err := update(ctx, posix.Namespace, attr.Metadata[posix.Namespace].Version, data)
+		if errors.Is(err, storage.ErrConditionConflict) && errnoOf(err) == syscall.EAGAIN {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return afterMutation(true, err)
+		}
+		if len(payload.Version) == 0 {
+			return syscall.EIO
+		}
+		got, err := posix.Decode(payload.Data)
+		if err != nil {
+			return err
+		}
+		if got != mode {
+			return syscall.EIO
+		}
+		return nil
 	}
-	if err := n.checkAttr(attr); err != nil {
-		return err
-	}
-	payload, err := update(ctx, posix.Namespace, attr.Metadata[posix.Namespace].Version, data)
-	if err != nil {
-		return afterMutation(true, err)
-	}
-	if len(payload.Version) == 0 {
-		return syscall.EIO
-	}
-	got, err := posix.Decode(payload.Data)
-	if err != nil {
-		return err
-	}
-	if got != mode {
-		return syscall.EIO
-	}
-	return nil
+	return storage.ErrConditionConflict
 }

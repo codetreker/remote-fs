@@ -428,6 +428,10 @@ func TestMutationClassificationPreservesIndependentFailures(t *testing.T) {
 			t.Errorf("partial mutation diagnostic omits %q: %q", detail, err.Error())
 		}
 	}
+	conflict := afterMutation(true, storage.ErrConditionConflict)
+	if errnoOf(conflict) != syscall.EIO || !errors.Is(conflict, storage.ErrConditionConflict) {
+		t.Fatalf("partial condition conflict remained retryable: %v", conflict)
+	}
 }
 
 func TestMutationSuccessIgnoresLateCancellation(t *testing.T) {
