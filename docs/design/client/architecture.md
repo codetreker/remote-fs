@@ -124,7 +124,7 @@ FUSE 不保存全文件缓冲区，objectstore 仍可能完整读取、重建不
 
 ## 四、中立 range 与 Linux 关闭语义
 
-挂载启用 FUSE locks，raw bridge 将 `Getlk`、`Setlk`、`Setlkw` 映射到 FileSession 的 `UseOwners` 与 `RangeControl`。`flock` 选择 whole-file domain，使用 OFD owner，dup/fork 共享，最后一个共享 fd 释放；传统 POSIX 锁选择 record domain，使用该挂载内的内核 owner，关闭同一文件的任一 fd 都解除该 owner 的所有 record range。PID 只用于报告冲突，不在独立挂载之间充当全局 owner。
+挂载启用 FUSE locks，raw bridge 将 `Getlk`、`Setlk`、`Setlkw` 映射到 FileSession 的 `UseOwners` 与 `RangeControl`。`flock` 选择 whole-file domain，使用 OFD owner，dup/fork 共享，最后一个共享 fd 释放；传统 POSIX 锁选择 record domain，使用该挂载内的内核 owner，关闭同一文件的任一 fd 都解除该 owner 的所有 record range。注册 record owner 时，FUSE 把内核给出的 POSIX PID 作为 caller-owned Diagnostic；冲突响应只返回该值，不暴露内部 UseOwner。`F_GETLK` 要求它是非零 `uint32`，缺失或越界为 `EIO`。相同 PID 不在独立挂载之间合并 owner。
 
 两个 advisory domain 独立；flock EX 可用于只读 fd，POSIX 写锁要求可写。FUSE 用 `DropBeforeAcquire` 表达 flock 先释放再转换，用 `Replace` / `Subtract` 保留 POSIX 失败转换与范围代数。阻塞调用以短请求登记、查询和取消，在会话健康时可持续等待；单次 HTTP 超时不是整个锁等待的截止时间。取消核对证明没有遗留 grant 后才返回 `EINTR`。未知结果封锁整个挂载，普通操作持续为 `EIO`，直到重新挂载。完整范围与历史契约见[range 设计](../server/file-handles.md#四使用声明范围与-owner)。
 

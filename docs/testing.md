@@ -138,13 +138,15 @@ schema 迁移从真实 v5 fixture 前滚，核对 mode 到 NodeKind / `posix.per
 
 ### 中立 range 与 POSIX 映射
 
-[advisory 状态机用例](../packages/advisory/coordinator_test.go)逐步核对 Use/Deny 双向冲突、三个 domain、共享/排他冲突、范围替换、拆分、合并、精确 claim 与部分解除。Rejected batch 的 `FailedAt` 必须是原 Commands 中失败项的零基下标；request-wide admission 拒绝保持 nil。它保留此前完成的 release Effects，并回滚本批 acquisition；`DropBeforeAcquire` 不能把部分效果包装成完全未执行。enforced policy 约束实际 ReadData/WriteData，advisory domain 不阻止未参与者。owner scope、Group 与诊断身份分别核对，跨文件等待检测 `EDEADLK`；有界搜索无法确定时明确拒绝，不能把未知当成无冲突。
+[advisory 状态机用例](../packages/advisory/coordinator_test.go)逐步核对 Use/Deny 双向冲突、三个 domain、共享/排他冲突、范围替换、拆分、合并、精确 claim 与部分解除。Rejected batch 的 `FailedAt` 必须是原 Commands 中失败项的零基下标；request-wide admission 拒绝保持 nil。它保留此前完成的 release Effects，并回滚本批 acquisition；`DropBeforeAcquire` 不能把部分效果包装成完全未执行。enforced policy 约束实际 ReadData/WriteData，advisory domain 不阻止未参与者。owner scope、Group、内部 UseOwner 与 caller-owned Diagnostic 分别核对；同 session 与跨 session 的 RangeConflict 都返回持有者登记的 Diagnostic，不泄漏内部编号。跨文件等待检测 `EDEADLK`；有界搜索无法确定时明确拒绝，不能把未知当成无冲突。
 
 [advisory 上限用例](../packages/advisory/bounds_test.go)分别耗尽 Session、Owner、range、pending 与 action history，核对拒绝不会丢弃旧状态、拆分失败不改变原范围、取消及历史到期能回收对应名额。Commands、Claims、Effects 的完整回执在任何效果前验证容量。阻塞申请可以在有效且持续续租的 Session 内等待，不继承 Strong 的有限 Wait。只有 Cancelled/Released 证明没有遗留 grant 时才能返回可重试的 `EINTR`，结果未知保持 `EIO` 和 I/O 隔离；Drop 只清理指定 owner 与 domain。
 
 Use/range 生命周期用例还要区分持久数据与内存控制状态：SQLite 重开后 NodeKind、共同时间和 opaque metadata 保持，旧 authority 的 File、scope、UseOwner、range 与请求历史全部失效。新会话可以重新取得状态，但不能恢复或静默重绑旧持有者；Strong S/X 的持久恢复用例保持独立。
 
-[FUSE bridge 用例](../packages/fuse/advisory_bridge_test.go)通过真实 raw callback 验证内核 LockOwner 到 UseOwner/range command 的映射，包括 owner 为零、没有加过锁的描述符关闭、POSIX 任一描述符关闭与 flock 最后一次 Release 的区别。缺失或饱和的 raw metadata 不得继续以错误 owner 执行动作；取消必须先核对远端结果。`unknown cancellation` 分支直接断言挂载 volume 的健康检查为 `EIO`。Release 中 owner 清理失败仍尝试关闭引用并保存错误，同时核对挂载整体已被隔离。
+[FUSE bridge 用例](../packages/fuse/advisory_bridge_test.go)与[owner 用例](../packages/fuse/lock_owners_test.go)通过真实 raw callback 验证内核 LockOwner 到 UseOwner/range command 的映射，包括 owner 为零、没有加过锁的描述符关闭、POSIX 任一描述符关闭与 flock 最后一次 Release 的区别。record owner 携带内核 POSIX PID 作为 Diagnostic，跨挂载 `F_GETLK` 返回该 PID；缺失、零或超过 `uint32` 的冲突 Diagnostic 以 `EIO` 失败。内部 UseOwner、kernel cookie 和 Group 不作为 PID 泄漏。缺失或饱和的 raw metadata 不得继续以错误 owner 执行动作；取消必须先核对远端结果。`unknown cancellation` 分支直接断言挂载 volume 的健康检查为 `EIO`。Release 中 owner 清理失败仍尝试关闭引用并保存错误，同时核对挂载整体已被隔离。
+
+[UseScope 值类型与 HTTP 用例](../packages/storage/capabilities_test.go)要求 token 非空、至多 128 字节、不含 NUL 且是有效 UTF-8；[文件能力 wire 用例](../packages/transport/httprest/file_capabilities_test.go)核对非 ASCII UTF-8 往返，并在编码请求或接受 response 前拒绝非法 UTF-8。scope 仍只按原样相等比较，不从文本内容推导身份或权限。
 
 ### HTTP、副本与清理所有权
 

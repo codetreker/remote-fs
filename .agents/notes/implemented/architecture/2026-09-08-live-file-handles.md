@@ -28,7 +28,7 @@ SQLite v5 将仍被引用的无名普通文件保存为 detached 节点。名字
 
 ### 标准 advisory 与强权限分别解释
 
-flock 按 open file description 归属，dup/fork 共享，最后一个共享描述符关闭后释放；EX 可以在只读 fd 上取得。传统 POSIX 锁按挂载会话内的内核 owner 与文件归属，同一文件的任一 fd 关闭都释放该 owner 的范围，fork 不继承。PID 只用于诊断，不跨挂载合并身份。两种锁的冲突域独立；flock 转换先放弃旧锁，POSIX 失败转换保留旧范围。
+flock 按 open file description 归属，dup/fork 共享，最后一个共享描述符关闭后释放；EX 可以在只读 fd 上取得。传统 POSIX 锁按挂载会话内的内核 owner 与文件归属，同一文件的任一 fd 关闭都释放该 owner 的范围，fork 不继承。FUSE 把 POSIX PID 作为 caller-owned Diagnostic 注册，冲突查询只返回这个不透明值，不泄漏内部 UseOwner；PID 不跨挂载合并身份，返回内核前还须是非零 `uint32`。两种锁的冲突域独立；flock 转换先放弃旧锁，POSIX 失败转换保留旧范围。
 
 健康会话中的阻塞加锁可跨多次短请求持续等待，所有 owner、范围、pending、动作历史和死锁图都有上限。动作使用 epoch 与随机 nonce 核对；取消只有在确认没有残留授予后才报告 `EINTR`。原生 advisory 丢失占有连续性时，相关 I/O 持续失败直到显式解除或关闭。FUSE 遇到未知锁结果则封锁整个挂载、停止续期并退役会话，单个 fd 的解锁或关闭不恢复它，须清理并重新挂载。两层都不能自动重获锁掩盖失效窗口。
 

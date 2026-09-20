@@ -30,13 +30,15 @@ metadata 每节点最多 16 个 namespace，namespace 名最长 128 字节，单
 
 公开 replicated `List` / `ListBounded` 在确认本地副本仍可用后回源 authority，使目录枚举与当前 `ReadEntries` 限制共享 native 顺序。路径 Stat 与负查找继续使用副本，保留原来的本地名字查询收益；目录结果不能从副本绕过新建立的 deny。
 
-File 可返回只代表该确切活引用的 `UseScope`。它在 FileSession 内验证所属 volume、NodeID 和存活状态，本身不授予方法、业务权限或 Strong proof。`UseOwners` 以这份 scope 注册 `OwnerReference` 或 `OwnerExplicit`；数值 owner 不可伪造权限，Group 只合并死锁参与者，不共享 claim、范围或自我豁免。
+File 可返回只代表该确切活引用的 `UseScope`。token 是非空、至多 128 字节、不含 NUL 的有效 UTF-8 文本，只按原样相等比较；它在 FileSession 内验证所属 volume、NodeID 和存活状态，本身不授予方法、业务权限或 Strong proof。`UseOwners` 以这份 scope 注册 `OwnerReference` 或 `OwnerExplicit`；内部 UseOwner 只供所属 session 的控制调用定位状态，不能伪造权限，也不会作为另一个持有者的冲突身份披露。Group 只合并死锁参与者，不共享 claim、范围或自我豁免。
+
+`OwnerOptions.Diagnostic` 是调用方拥有的不透明值，只在 `RangeConflict.Owner` 中报告冲突持有者。它不参与 owner 相等、授权、scope 验证、死锁分组或清理，也不能替代 UseOwner。跨 session 冲突仍返回持有者登记的 Diagnostic，而不是泄漏内部 owner 编号；零值本身只表示调用方没有提供可用诊断。
 
 `RangeControl` 保留原动作 epoch、nonce、有限历史、等待、Query 与 Cancel。`DomainRecord` 和 `DomainWholeFile` 表达 advisory 冲突；`DomainEnforced` 通过显式 `DenySelf` / `DenyOthers` 约束真实 `ReadData` / `WriteData`。核心不从 shared/exclusive mode 推导某个平台的重复获取、转换或解除政策。
 
 `Bytes` 表达正长度区间，`Boundary` 表达字节间边界；零长度不会被猜成 EOF。`Replace` / `Subtract` 保存 advisory 范围代数，`AddExact` / `RemoveExact` 保存不合并的强制 claim。一次请求的 Commands、Claims 和 Effects 各最多 64 项；完整结果无法保留时，在释放或授予任何状态前拒绝。Rejected 结果的 `FailedAt` 指向原 Commands 中失败项的零基下标；与某一命令无关的整批 admission 拒绝保持 nil。失败项之前已经成功的 release 保留在 Effects 中，本批新增 acquisition 则回滚。`DropBeforeAcquire` 已经完成的释放即使后续获取冲突，也不能被报告为整项未执行。取消本身不证明没有授予，结果未知时相关访问持续失败，直到核对或拥有者清理得到确定结果。
 
-FUSE 负责把 kernel owner、`flock`、传统 POSIX record lock、关闭与转换规则映射为这些中立命令。`Flush` 对对应 owner 执行范围清理，最终 `Release` 关闭 File；直接 File API 不推断进程 owner。Linux errno、PID 诊断和未来 EOF 的解释留在 FUSE 层。
+FUSE 负责把 kernel owner、`flock`、传统 POSIX record lock、关闭与转换规则映射为这些中立命令。record owner 注册时把内核提供的 POSIX PID 作为 Diagnostic，flock 不需要 PID；`F_GETLK` 只接受可表示为非零 `uint32` 的冲突 Diagnostic，缺失或越界以 `EIO` 失败。`Flush` 对对应 owner 执行范围清理，最终 `Release` 关闭 File；直接 File API 不推断进程 owner。Linux errno、PID 和未来 EOF 的解释留在 FUSE 层。
 
 UseClaim、UseOwner、range、等待和动作回执是当前 authority 的有界内存状态，并受 FileSession 生命周期约束。authority 重启或 incarnation 改变后，旧 File、scope、owner、range 和请求历史都明确失效；它们不从 SQLite、变更日志或客户端 ledger 恢复。客户端必须建立新会话并重新取得所需状态，不能把旧持有者静默重绑到同名或同 NodeID 对象。Strong S/X 的持久恢复是独立机制，不由这些状态继承。
 

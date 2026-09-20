@@ -30,7 +30,7 @@
 
 | 接口 | 当前责任 |
 |---|---|
-| `ScopedReference` | 为一个确切、仍存活的 File 返回不透明 `UseScope` |
+| `ScopedReference` | 为一个确切、仍存活的 File 返回有界 UTF-8 `UseScope` |
 | `MetadataAccess` | 按 NodeID 对一个 metadata namespace 作 CAS |
 | `ReferenceMetadataAccess` | 通过保留 File 对一个 metadata namespace 作 CAS |
 | `UseOwners` | 以有效 File scope 注册和退役 range owner |
@@ -86,7 +86,9 @@ metadata 返回值与 Attr 载入前先经过 `AttrResultBudget`。每 volume �
 
 `Bytes` 使用 unsigned Start 和正 Length；`Boundary` 使用独立 CutAt，不从零长度猜测 EOF。`RangeShared` / `RangeExclusive` 只表达冲突关系，核心不推断 SMB 或 POSIX 的重复获取、转换和解除政策。平台 adapter 负责选择命令，authority 负责按同一最终顺序执行冲突检查与受控 I/O。
 
-`UseScope` 绑定一个确切 File 引用。`UseOwners.NewUseOwner` 同时核对 NodeID、scope、session 和引用存活；任意数值 owner 不授予权限。`OwnerReference` 随引用结束，`OwnerExplicit` 由调用方明确退役。Group 只合并同一 session 内的死锁参与者，不共享 claim、range 或 scope 豁免。
+`UseScope` 绑定一个确切 File 引用。token 必须非空、不超过 128 字节、不含 NUL 且是有效 UTF-8；它只作原样相等比较。`UseOwners.NewUseOwner` 同时核对 NodeID、scope、session 和引用存活；内部 UseOwner 只在所属 session 的控制请求中定位状态，不授予额外权限，也不作为冲突持有者身份返回。`OwnerReference` 随引用结束，`OwnerExplicit` 由调用方明确退役。Group 只合并同一 session 内的死锁参与者，不共享 claim、range 或 scope 豁免。
+
+`OwnerOptions.Diagnostic` 是调用方拥有的不透明 `uint64`，唯一用途是作为 `RangeConflict.Owner` 报告另一持有者。它不参与 owner 身份、授权、scope、Group、range 所有权或清理。冲突可以跨 session 返回相同 Diagnostic；调用方负责解释它，authority 不用内部 UseOwner 编号补缺或替代。
 
 `RangeControl.GetConflict` 只查询一个实际冲突。`Apply` 一次接纳最多 64 条命令，返回的 Claims 与 Effects 也分别最多 64 项；完整回执在任何释放或授予前完成容量验证。Rejected 结果的 `FailedAt` 是原 Commands 中失败项的零基下标；request-wide admission 拒绝没有这个位置。此前成功的 release 保留在 Effects 中，本批 acquisition 回滚。`DropBeforeAcquire` 已释放的旧范围即使随后获取 Pending 或 Rejected，也不能被隐藏成完全未执行。
 
@@ -94,7 +96,7 @@ metadata 返回值与 Attr 载入前先经过 `AttrResultBudget`。每 volume �
 
 Use claim、owner、range、等待与动作历史只存在于当前 authority 的有界内存中。FileSession 退役、authority 重启或 incarnation 改变后，旧 File、scope、owner 和 range 均以 `ESTALE` 或相应不可用错误失效，不从 SQLite 或复制日志恢复，也不按同名或同 NodeID 对象静默重建。调用方须建立新 FileSession 并重新申请状态。只有独立 Strong S/X 机制具有自己的持久恢复保证。
 
-FUSE 将 `flock` 映射到 whole-file domain，将传统 POSIX `fcntl` 映射到 record domain。内核 owner、PID 诊断、fork/dup、访问模式、转换及关闭规则都留在 FUSE：`Flush` 对对应 owner 执行 `Drop`，最终 `Release` 关闭引用。直接 File API 不推断 POSIX 进程 owner。完整 `F_OFD_*` 仍不在兼容承诺内。
+FUSE 将 `flock` 映射到 whole-file domain，将传统 POSIX `fcntl` 映射到 record domain。record owner 注册时把内核提供的 POSIX PID 写入 Diagnostic；kernel owner cookie 与内部 UseOwner 不越过这条映射。`F_GETLK` 只把非零且不大于 `math.MaxUint32` 的 Diagnostic 转成 PID，缺失或越界为 `EIO`。fork/dup、访问模式、转换及关闭规则仍留在 FUSE：`Flush` 对对应 owner 执行 `Drop`，最终 `Release` 关闭引用。直接 File API 不推断 POSIX 进程 owner。完整 `F_OFD_*` 仍不在兼容承诺内。
 
 默认 volume 上限为 1024 个会话、32768 个 owner、262144 个 range、262144 个 action、8192 个 waiter 和 65536 条死锁图边。会话数据、心跳、范围获取、核对和释放使用分开的 admission；数据物化不能耗尽续期与清理能力。
 
