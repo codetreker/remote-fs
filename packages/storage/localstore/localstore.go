@@ -60,6 +60,8 @@ var metastoreAuxiliaryFilenames = [...]string{
 // zero uses sqlite.DefaultMaxIntegrityBytes.
 // MaxMetadataBytes bounds canonical opaque metadata retained by SQLite; zero uses
 // sqlite.DefaultMaxMetadataBytes.
+// MaxDeleteIntents bounds durable close-time deletion receipts; zero uses
+// sqlite.DefaultMaxDeleteIntents.
 // The backing filesystem remains the hard physical ceiling for all bytes.
 // LocalDisk.MaintenanceReserveBytes keeps deletion and SQLite maintenance possible when that
 // ceiling is reached; removal remains available while new object publication is refused.
@@ -77,6 +79,7 @@ type Config struct {
 	MaxIntegrityRecords          int64
 	MaxIntegrityBytes            int64
 	MaxMetadataBytes             int64
+	MaxDeleteIntents             int
 	// Retained-file and advisory limits use SQLite defaults when omitted.
 	MaxRetainedFiles int
 	Advisory         advisory.Config
@@ -97,6 +100,7 @@ type Status struct {
 	MaxIntegrityRecords          int64
 	MaxIntegrityBytes            int64
 	MaxMetadataBytes             int64
+	MaxDeleteIntents             int
 	LocalDisk                    localdisk.Status
 	Maintenance                  objectstore.MaintenanceStatus
 	Checkpoint                   CheckpointStatus
@@ -124,6 +128,7 @@ type Store struct {
 	maxIntegrityRecords          int64
 	maxIntegrityBytes            int64
 	maxMetadataBytes             int64
+	maxDeleteIntents             int
 	volumeName                   string
 	closeMu                      sync.Mutex
 	closeRunning                 *closeAttempt
@@ -395,6 +400,7 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 		maxIntegrityRecords:          sqliteOptions.MaxIntegrityRecords,
 		maxIntegrityBytes:            sqliteOptions.MaxIntegrityBytes,
 		maxMetadataBytes:             sqliteOptions.MaxMetadataBytes,
+		maxDeleteIntents:             sqliteOptions.MaxDeleteIntents,
 	}, nil
 }
 
@@ -409,6 +415,7 @@ func (config Config) sqliteOptions() (sqlite.Options, error) {
 		MaxIntegrityRecords:          config.MaxIntegrityRecords,
 		MaxIntegrityBytes:            config.MaxIntegrityBytes,
 		MaxMetadataBytes:             config.MaxMetadataBytes,
+		MaxDeleteIntents:             config.MaxDeleteIntents,
 	}).Effective()
 }
 
@@ -813,6 +820,7 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 			MaxIntegrityRecords:          s.maxIntegrityRecords,
 			MaxIntegrityBytes:            s.maxIntegrityBytes,
 			MaxMetadataBytes:             s.maxMetadataBytes,
+			MaxDeleteIntents:             s.maxDeleteIntents,
 			LocalDisk:                    localDisk,
 			Maintenance:                  s.MaintenanceStatus(),
 			Checkpoint:                   checkpoint,

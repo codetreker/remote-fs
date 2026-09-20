@@ -37,6 +37,7 @@ func TestLocalStatusReportsEveryBoundedAndDurablePart(t *testing.T) {
 		MaxSnapshotReaderConnections: 10,
 		MaxIntegrityRecords:          101,
 		MaxIntegrityBytes:            8 << 20,
+		MaxDeleteIntents:             13,
 		LocalDisk: localdisk.Status{
 			StoreID:            localdisk.ID{1},
 			InFlightOperations: 4,
@@ -72,6 +73,7 @@ func TestLocalStatusReportsEveryBoundedAndDurablePart(t *testing.T) {
 		"snapshot reader-connection limit is 10",
 		"integrity record work limit is 101",
 		"integrity name-byte work limit is 8388608",
+		"durable deletion-intent limit is 13",
 		"garbage sweeps run every 45s with at most 17 objects per attempt",
 		"4 operations and 50 bytes in flight",
 		"5 operations waiting under a limit of 19",

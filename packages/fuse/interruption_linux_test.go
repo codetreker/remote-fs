@@ -6,8 +6,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -56,6 +58,30 @@ func (s *observedStatStorage) Stat(ctx context.Context, name string) (storage.At
 	return s.FileStorage.Stat(ctx, name)
 }
 
+func (s *observedStatStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+	session, err := s.FileStorage.NewFileSession(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &observedStatSession{capableTestSession: testSessionCapabilities(session), request: s.request}, nil
+}
+
+type observedStatSession struct {
+	capableTestSession
+	request *interruptedStat
+}
+
+func (s *observedStatSession) LookupAt(ctx context.Context, name storage.ChildName) (storage.Attr, error) {
+	if string(name.RawLeaf) == s.request.name {
+		s.request.mu.Lock()
+		if s.request.ctx == nil {
+			s.request.ctx = ctx
+		}
+		s.request.mu.Unlock()
+	}
+	return s.NamespaceAccess.LookupAt(ctx, name)
+}
+
 // A thread-directed signal reaches the thread blocked in the FUSE syscall. The
 // request is held in a real HTTP exchange, so only the kernel's FUSE_INTERRUPT can
 // cancel its context. A separate process keeps signal handling out of other tests.
@@ -83,7 +109,19 @@ func TestSignalInterruptsARequestWithoutBreakingTheMount(t *testing.T) {
 			release := make(chan struct{})
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				op, err := httprest.ParseRequest(r.Method, r.URL)
-				if err == nil && op.Op == httprest.OpStat && op.Path == request.name {
+				var operation struct {
+					Op storage.Operation `json:"op"`
+				}
+				if err == nil && op.Op == httprest.OpFile {
+					body, readErr := io.ReadAll(r.Body)
+					if readErr != nil {
+						http.Error(w, readErr.Error(), http.StatusBadRequest)
+						return
+					}
+					r.Body = io.NopCloser(bytes.NewReader(body))
+					err = json.Unmarshal(body, &operation)
+				}
+				if err == nil && operation.Op == storage.OpFileLookupAt {
 					request.mu.Lock()
 					hold := !request.held
 					request.held = true

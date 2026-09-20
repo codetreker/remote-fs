@@ -25,7 +25,8 @@ import (
 // 0004_lease_recovery.sql stores prepared and accepted lease-duration evidence;
 // 0005_retained_files.sql records unnamed retained files and their content revisions;
 // 0006_neutral_metadata.sql separates node kind and adds common times, canonical opaque
-// metadata, and exact retained-metadata accounting.
+// metadata, and exact retained-metadata accounting; 0007_durable_identity.sql adds
+// symbolic-link data and durable, restart-queryable deletion obligations.
 //
 // packages/sqliteschema documents what a numbered set of files buys and what rule they are kept
 // under: a file that has landed is never edited, and a schema change is a new file.
@@ -42,6 +43,8 @@ const firstOwnershipAwareSchemaVersion = 3
 const firstRetainedFileSchemaVersion = 5
 
 const firstNeutralMetadataSchemaVersion = 6
+
+const firstDurableIdentitySchemaVersion = 7
 
 // VolumeOpenMode decides whether preparation may create the named volume.
 type VolumeOpenMode uint8
@@ -201,6 +204,19 @@ func PrepareConfiguredWithMetadataPolicy(
 	if recorded && version >= 1 && version < firstNeutralMetadataSchemaVersion {
 		if err := validateLegacyModeMapping(ctx, tx, version); err != nil {
 			return 0, 0, dbstate.State{}, err
+		}
+	}
+	if recorded && version == firstNeutralMetadataSchemaVersion {
+		var missingTargets int64
+		if err := tx.QueryRowContext(ctx, `SELECT
+			(SELECT count(*) FROM nodes WHERE kind=3) +
+			(SELECT count(*) FROM changes WHERE node_kind=3)`).Scan(&missingTargets); err != nil {
+			return 0, 0, dbstate.State{}, err
+		}
+		if missingTargets != 0 {
+			return 0, 0, dbstate.State{}, fmt.Errorf(
+				"schema version 6 contains %d symbolic-link facts without recoverable targets: %w",
+				missingTargets, syscall.EIO)
 		}
 	}
 	if err := schema.Reach(ctx, tx); err != nil {

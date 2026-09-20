@@ -156,6 +156,7 @@ type volumeIntent struct {
 	kind    locking.MutationKind
 	paths   []string
 	node    int64
+	nodes   []int64
 	scope   storage.UseScope
 	cleanup bool
 }
@@ -176,6 +177,33 @@ func (s *Store) mutateVolume(ctx context.Context, kind locking.MutationKind, pat
 
 func (s *Store) prepareVolumePublication(ctx context.Context, tx *sql.Tx, intent volumeIntent) (*volumePublication, error) {
 	publication := &volumePublication{intent: intent}
+	if intent.nodes != nil {
+		publication.access = make([]metastore.FileState, len(intent.nodes))
+		seen := make(map[int64]bool, len(intent.nodes))
+		for i, id := range intent.nodes {
+			if id == 0 {
+				continue
+			}
+			state, err := s.fileState(ctx, tx, id)
+			if err != nil {
+				return nil, err
+			}
+			publication.access[i] = state
+			if state.Kind == storage.NodeRegular && !state.Detached && !seen[state.ID] {
+				seen[state.ID] = true
+				publication.nodes = append(publication.nodes, state.ID)
+				publication.targets = append(publication.targets, s.backendKey(state.ID))
+			}
+		}
+		if intent.kind == locking.RemoveMutation && len(publication.access) != 0 && publication.access[0].Kind == storage.NodeRegular {
+			publication.previous = publication.access[0].Size
+		}
+		if intent.kind == locking.RenameMutation && len(publication.access) > 1 &&
+			publication.access[1].ID != publication.access[0].ID && publication.access[1].Kind == storage.NodeRegular {
+			publication.previous = publication.access[1].Size
+		}
+		return publication, nil
+	}
 	if intent.node != 0 {
 		state, err := s.fileState(ctx, tx, intent.node)
 		if err != nil {
@@ -186,7 +214,8 @@ func (s *Store) prepareVolumePublication(ctx context.Context, tx *sql.Tx, intent
 			publication.nodes = []int64{state.ID}
 			publication.targets = []locking.BackendKey{s.backendKey(state.ID)}
 		}
-		if intent.kind == locking.WriteMutation || intent.cleanup {
+		if state.Kind == storage.NodeRegular &&
+			(intent.kind == locking.WriteMutation || intent.kind == locking.RemoveMutation || intent.cleanup) {
 			publication.previous = state.Size
 		}
 		return publication, nil
@@ -244,7 +273,7 @@ func (s *Store) finishVolumePublication(ctx context.Context, tx *sql.Tx, publica
 		}
 		publication.next = node.Size
 	}
-	if !publication.intent.cleanup &&
+	if !publication.intent.cleanup && publication.intent.nodes == nil &&
 		(publication.intent.kind == locking.RemoveMutation || publication.intent.kind == locking.RenameMutation) {
 		for _, node := range publication.access {
 			if node.ID == 0 {

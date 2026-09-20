@@ -10,6 +10,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // validateIntegrityWork counts the retained graph with scalar aggregates before any recursive
@@ -32,7 +33,7 @@ func validateIntegrityWork(
 		return fmt.Errorf("the database has %d of the 2 required log tables: %w", logTables, syscall.EIO)
 	}
 
-	var volumes, nodes, objects, entries, logs, changes int64
+	var volumes, nodes, objects, entries, logs, changes, deleteIntents int64
 	var err error
 	if volume == nil {
 		if logTables == 0 {
@@ -78,13 +79,28 @@ func validateIntegrityWork(
 	if err != nil {
 		return fmt.Errorf("counting volume integrity work: %w", sqlerr.ReadFailure(ctx, err))
 	}
-	if volumes < 0 || nodes < 0 || objects < 0 || entries < 0 || logs < 0 || changes < 0 {
+	var identityTables int64
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='delete_intents'`).Scan(&identityTables); err != nil {
+		return fmt.Errorf("reading the durable-identity schema: %w", sqlerr.ReadFailure(ctx, err))
+	}
+	if identityTables == 1 {
+		query := `SELECT count(*) FROM delete_intents`
+		var args []any
+		if volume != nil {
+			query += ` WHERE volume=?`
+			args = []any{*volume}
+		}
+		if err := db.QueryRowContext(ctx, query, args...).Scan(&deleteIntents); err != nil {
+			return fmt.Errorf("counting deletion-intent integrity work: %w", sqlerr.ReadFailure(ctx, err))
+		}
+	}
+	if volumes < 0 || nodes < 0 || objects < 0 || entries < 0 || logs < 0 || changes < 0 || deleteIntents < 0 {
 		return fmt.Errorf("the database returned a negative volume integrity count: %w", syscall.EIO)
 	}
-	if sqlvalue.WouldExceed(maxIntegrityRecords, volumes, nodes, objects, entries, logs, changes) {
+	if sqlvalue.WouldExceed(maxIntegrityRecords, volumes, nodes, objects, entries, logs, changes, deleteIntents) {
 		return fmt.Errorf(
-			"volume integrity requires %d volumes, %d nodes, %d objects, %d entries, %d logs, and %d changes, above the configured work limit of %d; raise MaxIntegrityRecords to open it: %w",
-			volumes, nodes, objects, entries, logs, changes, maxIntegrityRecords, syscall.EFBIG)
+			"volume integrity requires %d volumes, %d nodes, %d objects, %d entries, %d logs, %d changes, and %d deletion intents, above the configured work limit of %d; raise MaxIntegrityRecords to open it: %w",
+			volumes, nodes, objects, entries, logs, changes, deleteIntents, maxIntegrityRecords, syscall.EFBIG)
 	}
 	return nil
 }
@@ -183,6 +199,41 @@ func validateIntegrityBytes(
 			remaining -= field.length.Int64
 		}
 	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	if version < firstDurableIdentitySchemaVersion {
+		return nil
+	}
+	intentWhere := ""
+	var intentArgs []any
+	if volume != nil {
+		intentWhere = "WHERE volume=?"
+		intentArgs = []any{*volume}
+	}
+	rows, err = db.QueryContext(ctx, `SELECT typeof(name),CASE WHEN typeof(name)='blob' THEN length(name) END
+		FROM delete_intents `+intentWhere, intentArgs...)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var class string
+		var length sql.NullInt64
+		if err := rows.Scan(&class, &length); err != nil {
+			rows.Close()
+			return err
+		}
+		if class != "blob" || !length.Valid || length.Int64 < 1 || length.Int64 > storage.MaxLeafBytes {
+			rows.Close()
+			return fmt.Errorf("a deletion-intent name has an invalid representation: %w", syscall.EIO)
+		}
+		if length.Int64 > remaining {
+			rows.Close()
+			return fmt.Errorf("entry, change, and deletion-intent names exceed the %d-byte integrity limit: %w",
+				maxIntegrityBytes, syscall.EFBIG)
+		}
+		remaining -= length.Int64
+	}
 	return errors.Join(rows.Err(), rows.Close())
 }
 
@@ -250,6 +301,11 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 			OR typeof(change_sec) NOT IN ('integer','null') OR typeof(change_nsec) NOT IN ('integer','null')
 			OR typeof(metadata) NOT IN ('blob','null')`
 	}
+	if version >= firstDurableIdentitySchemaVersion {
+		neutralNodeClasses += ` OR typeof(link_target)!='blob' OR typeof(pending_unlink)!='integer'
+			OR typeof(pending_generation)!='integer'`
+		neutralChangeClasses += ` OR typeof(link_target) NOT IN ('blob','null')`
+	}
 	queries := []struct {
 		name  string
 		query string
@@ -274,7 +330,7 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 		 LEFT JOIN nodes child ON child.id = e.node ` + entryWhere + predicateJoin(entryWhere) + `(
 			typeof(e.volume) != 'integer' OR e.volume <= 0 OR
 			typeof(e.parent) != 'integer' OR e.parent <= 0 OR
-			typeof(e.name) != 'blob' OR length(e.name) = 0 OR
+			typeof(e.name) != 'blob' OR length(e.name) = 0 OR length(e.name) > 4096 OR
 			e.name IN (X'2e', X'2e2e') OR instr(e.name, X'2f') != 0 OR instr(e.name, X'00') != 0 OR
 			typeof(e.node) != 'integer' OR e.node <= 0)`,
 			entryArgs},
@@ -289,8 +345,9 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 			typeof(volume) != 'integer' OR volume <= 0 OR
 			typeof(kind) != 'integer' OR typeof(parent) != 'integer' OR
 			typeof(name) NOT IN ('blob', 'null') OR
+			length(name)>4096 OR
 			typeof(from_parent) NOT IN ('integer', 'null') OR
-			typeof(from_name) NOT IN ('blob', 'null') OR
+			typeof(from_name) NOT IN ('blob', 'null') OR length(from_name)>4096 OR
 			typeof(node) NOT IN ('integer', 'null') OR typeof(` + changeKindColumn + `) NOT IN ('integer', 'null') OR
 			typeof(size) NOT IN ('integer', 'null') OR typeof(atime_sec) NOT IN ('integer', 'null') OR
 			typeof(atime_nsec) NOT IN ('integer', 'null') OR typeof(mtime_sec) NOT IN ('integer', 'null') OR
@@ -305,6 +362,29 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 			typeof(generation) != 'integer' OR generation < 0 OR
 			typeof(node_high_water) != 'integer' OR node_high_water < 0 OR
 			typeof(change_high_water) != 'integer' OR change_high_water < 0`, nil},
+	}
+	if version >= firstDurableIdentitySchemaVersion {
+		intentWhere := ""
+		intentArgs := []any{}
+		if volume != nil {
+			intentWhere = "WHERE volume=? AND "
+			intentArgs = []any{*volume}
+		} else {
+			intentWhere = "WHERE "
+		}
+		queries = append(queries, struct {
+			name  string
+			query string
+			args  []any
+		}{"deletion intents", `SELECT count(*) FROM delete_intents ` + intentWhere + `(
+			typeof(intent)!='text' OR length(CAST(intent AS BLOB))!=32 OR intent GLOB '*[^0-9a-f]*' OR
+			typeof(volume)!='integer' OR volume<=0 OR typeof(node)!='integer' OR node<=0 OR
+			typeof(parent) NOT IN ('integer','null') OR typeof(name) NOT IN ('blob','null') OR
+			(parent IS NULL)!=(name IS NULL) OR length(reference)!=16 OR length(request_hash)!=32 OR
+			typeof(if_empty)!='integer' OR if_empty NOT IN (0,1) OR
+			typeof(outcome)!='integer' OR outcome NOT BETWEEN 1 AND 5 OR
+			typeof(failure) NOT IN ('integer','null') OR (outcome=5)!=(failure IS NOT NULL) OR
+			typeof(updated_sec)!='integer' OR typeof(updated_nsec)!='integer')`, intentArgs})
 	}
 	if invalidVolumes != 0 {
 		return fmt.Errorf("the database holds %d volume rows in an invalid SQLite storage class: %w",
@@ -421,6 +501,11 @@ func validateIntegrityWithMetadataPolicy(
 	}
 	if err := validateNodeRelationshipsVersion(ctx, db, volume, version); err != nil {
 		return err
+	}
+	if version >= firstDurableIdentitySchemaVersion {
+		if err := validateDurableIdentity(ctx, db, volume); err != nil {
+			return err
+		}
 	}
 	if err := validateUsedAccountingVersion(ctx, db, volume, version); err != nil {
 		return err

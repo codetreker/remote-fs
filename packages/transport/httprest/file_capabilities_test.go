@@ -154,7 +154,7 @@ func TestCapabilityEnvelopeAdvertisesOnlyImplementedFacets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"atomicOpen", "namespace", "references", "state", "delete", "conditional", "directoryMetadata", "referenceName"} {
+	for _, field := range []string{"atomicOpen", "namespace", "references", "actions", "state", "delete", "conditional", "directoryMetadata", "referenceName"} {
 		if !strings.Contains(string(encoded), `"`+field+`":false`) {
 			t.Fatalf("future capability %q is not explicitly false: %s", field, encoded)
 		}

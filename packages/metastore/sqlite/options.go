@@ -12,6 +12,7 @@ import (
 
 const (
 	DefaultMaxRetainedFiles = 65536
+	DefaultMaxDeleteIntents = 65536
 
 	// DefaultMaxReaderConnections bounds the physical SQLite connections used by concurrent
 	// volume reads when the caller supplies no limit of its own.
@@ -50,6 +51,9 @@ type Options struct {
 	// MaxRetainedFiles bounds native file references across this volume. Zero
 	// selects DefaultMaxRetainedFiles; admission exhaustion returns EAGAIN.
 	MaxRetainedFiles int
+	// MaxDeleteIntents bounds durable close-time deletion receipts, including
+	// terminal records retained for restart queries.
+	MaxDeleteIntents int
 	// Advisory bounds volume-wide lock and materialization state. The zero
 	// configuration selects advisory.DefaultConfig; shared opens must agree.
 	Advisory advisory.Config
@@ -84,6 +88,7 @@ func DefaultOptions() Options {
 		Window:                       DefaultWindow(),
 		ObjectLimits:                 DefaultObjectLimits(),
 		MaxRetainedFiles:             DefaultMaxRetainedFiles,
+		MaxDeleteIntents:             DefaultMaxDeleteIntents,
 		Advisory:                     advisory.DefaultConfig(),
 		MaxReaderConnections:         DefaultMaxReaderConnections,
 		MaxSnapshotReaderConnections: DefaultMaxSnapshotReaderConnections,
@@ -106,6 +111,12 @@ func (o Options) Effective() (Options, error) {
 	}
 	if o.MaxRetainedFiles < 1 || o.MaxRetainedFiles == math.MaxInt {
 		return Options{}, fmt.Errorf("the SQLite retained-file limit must be positive and bounded: %w", syscall.EINVAL)
+	}
+	if o.MaxDeleteIntents == 0 {
+		o.MaxDeleteIntents = DefaultMaxDeleteIntents
+	}
+	if o.MaxDeleteIntents < 1 || o.MaxDeleteIntents == math.MaxInt {
+		return Options{}, fmt.Errorf("the SQLite deletion-intent limit must be positive and bounded: %w", syscall.EINVAL)
 	}
 	if err := changes.CheckWindow(changes.Window(o.Window)); err != nil {
 		return Options{}, err

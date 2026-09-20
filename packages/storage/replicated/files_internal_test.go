@@ -33,6 +33,10 @@ func (f *fileAuthorityStub) ReadAt(ctx context.Context, _ int64, _ int) (storage
 	return f.read(ctx)
 }
 func (f *fileAuthorityStub) Close(ctx context.Context) error { return f.close(ctx) }
+func (f *fileAuthorityStub) CloseWithBarrier(ctx context.Context) (*httprest.MutationBarrier, error) {
+	err := f.close(ctx)
+	return &httprest.MutationBarrier{Incarnation: "log"}, err
+}
 
 type fileSessionStub struct {
 	httprest.FileSessionWithBarrier
@@ -41,6 +45,10 @@ type fileSessionStub struct {
 }
 
 func (s *fileSessionStub) Close(ctx context.Context) error { return s.close(ctx) }
+func (s *fileSessionStub) CloseWithBarrier(ctx context.Context) (*httprest.MutationBarrier, error) {
+	err := s.close(ctx)
+	return &httprest.MutationBarrier{Incarnation: "log"}, err
+}
 func (s *fileSessionStub) OpenFileWithBarrier(ctx context.Context, _ string, _ storage.FileOpenOptions) (storage.File, *httprest.MutationBarrier, error) {
 	return s.open(ctx)
 }
@@ -211,5 +219,19 @@ func TestRetainedFileUsesTheBoundedConfirmationPool(t *testing.T) {
 	}}}
 	if _, err := file.WriteAt(t.Context(), 0, nil); !errors.Is(err, syscall.EAGAIN) {
 		t.Fatal("retained mutation bypassed confirmation admission:", err)
+	}
+}
+
+func TestCleanupConfirmationFailurePreservesItsCauseAndEIOClassification(t *testing.T) {
+	cause := errors.New("replica follower stopped before cleanup became visible")
+	err := &cleanupConfirmationFailure{cause: cause}
+	if !errors.Is(err, cause) || !errors.Is(err, syscall.EIO) || storage.ErrnoOf(err) != syscall.EIO {
+		t.Fatalf("cleanup confirmation error lost cause or classification: %v", err)
+	}
+	if err.Classification() != syscall.EIO {
+		t.Fatalf("classification=%v", err.Classification())
+	}
+	if got := err.Error(); got == "" {
+		t.Fatal("cleanup confirmation error has no diagnostic")
 	}
 }

@@ -30,8 +30,8 @@ func validateMetadataIntegrity(ctx context.Context, db sqlvalue.Queryer, volume 
 	}
 	rows, err := db.QueryContext(ctx, `SELECT v.id,
 		CASE WHEN typeof(v.metadata_used)='integer' THEN v.metadata_used END,typeof(v.metadata_used),
-		coalesce((SELECT sum(length(metadata)) FROM nodes n WHERE n.volume=v.id),0),
-		coalesce((SELECT sum(coalesce(length(metadata),0)) FROM changes c WHERE c.volume=v.id),0)
+		coalesce((SELECT sum(length(metadata) + length(link_target)) FROM nodes n WHERE n.volume=v.id),0),
+		coalesce((SELECT sum(coalesce(length(metadata),0) + coalesce(length(link_target),0)) FROM changes c WHERE c.volume=v.id),0)
 		FROM volumes v `+where, args...)
 	if err != nil {
 		return err
@@ -135,11 +135,10 @@ func validateMetadataPayloads(ctx context.Context, db sqlvalue.Queryer, volume *
 }
 
 func validateMetadataAccounting(ctx context.Context, db sqlvalue.Queryer) error {
-	body, err := migrationFiles.ReadFile("migrations/0006_neutral_metadata.sql")
+	nodeBody, err := migrationFiles.ReadFile("migrations/0007_durable_identity.sql")
 	if err != nil {
 		return err
 	}
-	source := string(body)
 	var unexpected int64
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name NOT IN (
 		'nodes_metadata_insert','nodes_metadata_update','nodes_metadata_delete',
@@ -151,6 +150,7 @@ func validateMetadataAccounting(ctx context.Context, db sqlvalue.Queryer) error 
 		return fmt.Errorf("the database holds %d unexpected persistent triggers: %w", unexpected, syscall.EIO)
 	}
 	for _, table := range []string{"nodes", "changes"} {
+		source := string(nodeBody)
 		for _, action := range []string{"insert", "update", "delete"} {
 			name := table + "_metadata_" + action
 			start := strings.Index(source, "CREATE TRIGGER "+name+" ")

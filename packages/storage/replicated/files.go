@@ -195,7 +195,11 @@ func (s *fileSession) Close(ctx context.Context) error {
 		s.mu.Lock()
 	}
 	s.mu.Unlock()
-	if err := s.remote.Close(ctx); err != nil {
+	barrier, err := s.remote.CloseWithBarrier(ctx)
+	if err != nil {
+		return err
+	}
+	if err := s.confirmCleanup(ctx, "close-file-session", barrier); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -269,6 +273,43 @@ func (s *fileSession) confirm(ctx context.Context, op string, send func(context.
 		return *barrier, nil
 	})
 }
+
+// Cleanup can publish a pending unlink and must remain possible without a live
+// replica stream. A healthy replica waits for the returned barrier; a stopped or
+// failed follower records the authority result without making cleanup depend on it.
+func (s *fileSession) confirmCleanup(ctx context.Context, op string, barrier *httprest.MutationBarrier) error {
+	if barrier == nil {
+		return fmt.Errorf("%s returned no replication barrier: %w", op, syscall.EIO)
+	}
+	captured := &confirmation{}
+	if err := s.base.setBarrier(captured, *barrier); err != nil {
+		return err
+	}
+	s.base.mu.Lock()
+	closing, failed := s.base.closing, s.base.failure != nil
+	s.base.mu.Unlock()
+	if closing || failed {
+		return nil
+	}
+	admitted, err := s.base.expect(ctx, op, "")
+	if err != nil {
+		return &cleanupConfirmationFailure{cause: err}
+	}
+	defer s.base.forget(admitted)
+	if err := s.base.await(ctx, op, "", captured); err != nil {
+		return &cleanupConfirmationFailure{cause: err}
+	}
+	return nil
+}
+
+type cleanupConfirmationFailure struct{ cause error }
+
+func (e *cleanupConfirmationFailure) Error() string {
+	return fmt.Sprintf("authority cleanup completed but replica visibility was not confirmed: %v", e.cause)
+}
+
+func (e *cleanupConfirmationFailure) Unwrap() []error       { return []error{syscall.EIO, e.cause} }
+func (e *cleanupConfirmationFailure) Classification() error { return syscall.EIO }
 
 func (s *fileSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
 	ctx, done, err := s.begin(ctx, true)

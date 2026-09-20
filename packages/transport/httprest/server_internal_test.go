@@ -510,7 +510,7 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 	change := metastore.Change{
 		Position: 7, Kind: metastore.Renamed, Parent: 1, Name: []byte{0xff, 0x00, 'n'},
 		From: &metastore.Location{Parent: 2, Name: []byte("from")},
-		Node: &metastore.Node{ID: 3, Kind: storage.NodeRegular, Size: 5, Content: "object"},
+		Node: &metastore.Node{ID: 3, Kind: storage.NodeSymlink, Size: 5, LinkTarget: []byte{0xff, 0, 'l', 'n', 'k'}},
 	}
 	wireChange, err := ChangeOf(change)
 	if err != nil {
@@ -530,7 +530,7 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 			t.Fatal(err)
 		}
 		meta := change
-		name, fromName, content := meta.Name, meta.From.Name, meta.Node.Content
+		name, fromName, content, target := meta.Name, meta.From.Name, meta.Node.Content, meta.Node.LinkTarget
 		metadata, err := storage.EncodeMetadata(meta.Node.Metadata)
 		if err != nil {
 			t.Fatal(err)
@@ -539,9 +539,10 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 		from, node := *meta.From, *meta.Node
 		from.Name, node.Content = []byte{}, ""
 		node.Metadata = nil
+		node.LinkTarget = nil
 		meta.From, meta.Node = &from, &node
 		reservation, fits, reserveErr := result.Reserve(meta, metastore.ChangePayloadLengths{
-			Name: int64(len(name)), FromName: int64(len(fromName)), Content: int64(len(content)), Metadata: int64(len(metadata)),
+			Name: int64(len(name)), FromName: int64(len(fromName)), Content: int64(len(content)), Metadata: int64(len(metadata)), Target: int64(len(target)),
 		})
 		if delta == -1 {
 			if !errors.Is(reserveErr, syscall.EFBIG) || fits || reservation != nil {
@@ -552,7 +553,7 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 		if reserveErr != nil || !fits {
 			t.Fatalf("change under exact bound: fits=%v err=%v", fits, reserveErr)
 		}
-		if err := reservation.Commit(name, fromName, content, metadata); err != nil {
+		if err := reservation.Commit(name, fromName, content, metadata, target); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -560,6 +561,7 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 	rows := []metastore.Row{
 		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory}},
 		{Parent: 1, Name: []byte{0xff, 'x'}, Node: metastore.Node{ID: 2, Kind: storage.NodeRegular, Content: "key"}},
+		{Parent: 1, Name: []byte("link"), Node: metastore.Node{ID: 3, Kind: storage.NodeSymlink, Size: 3, LinkTarget: []byte{0xff, 0, 'x'}}},
 	}
 	wireRows := SnapshotPage{Rows: []Row{RowOf(rows[0]), RowOf(rows[1])}}
 	encodedRows, err := json.Marshal(wireRows)
@@ -578,12 +580,13 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 		var reserveErr error
 		pageFull := false
 		for _, row := range rows {
-			meta, name, content := row, row.Name, row.Node.Content
+			meta, name, content, target := row, row.Name, row.Node.Content, row.Node.LinkTarget
 			metadata, err := storage.EncodeMetadata(meta.Node.Metadata)
 			if err != nil {
 				t.Fatal(err)
 			}
 			meta.Node.Metadata = nil
+			meta.Node.LinkTarget = nil
 			if name == nil {
 				meta.Name = nil
 			} else {
@@ -591,14 +594,14 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 			}
 			meta.Node.Content = ""
 			reservation, fits, err := result.Reserve(meta, metastore.RowPayloadLengths{
-				Name: int64(len(name)), Content: int64(len(content)), Metadata: int64(len(metadata)),
+				Name: int64(len(name)), Content: int64(len(content)), Metadata: int64(len(metadata)), Target: int64(len(target)),
 			})
 			if err != nil || !fits {
 				reserveErr = err
 				pageFull = !fits && err == nil
 				break
 			}
-			reserveErr = reservation.Commit(name, content, metadata)
+			reserveErr = reservation.Commit(name, content, metadata, target)
 			if reserveErr != nil {
 				break
 			}
@@ -860,5 +863,25 @@ func TestReplicationReservationsAccountForNeutralPayloads(t *testing.T) {
 		metastore.RowPayloadLengths{Metadata: int64(len(metadata))})
 	if !errors.Is(err, syscall.EFBIG) || fits || row != nil {
 		t.Fatalf("oversized snapshot metadata admitted: reservation=%v fits=%v err=%v", row, fits, err)
+	}
+	target := int64(storage.MaxLinkTargetBytes)
+	changes, err = newChangeFrameResult(1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation, fits, err = changes.Reserve(metastore.Change{
+		Position: 1, Kind: metastore.Created, Parent: 1, Name: []byte{}, Node: &metastore.Node{ID: 2, Kind: storage.NodeSymlink, Size: target},
+	}, metastore.ChangePayloadLengths{Target: target})
+	if !errors.Is(err, syscall.EFBIG) || fits || reservation != nil {
+		t.Fatalf("oversized change link target admitted: reservation=%v fits=%v err=%v", reservation, fits, err)
+	}
+	rows, err = newSnapshotFrameResult(1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, fits, err = rows.Reserve(metastore.Row{Parent: 1, Name: []byte{}, Node: metastore.Node{ID: 2, Kind: storage.NodeSymlink, Size: target}},
+		metastore.RowPayloadLengths{Target: target})
+	if !errors.Is(err, syscall.EFBIG) || fits || row != nil {
+		t.Fatalf("oversized snapshot link target admitted: reservation=%v fits=%v err=%v", row, fits, err)
 	}
 }

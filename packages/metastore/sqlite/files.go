@@ -24,12 +24,16 @@ type retainedNode struct{ volume, id int64 }
 // distinct from active publication authority, which is revoked before I/O drains.
 type retainedFile struct {
 	scope          storage.UseScope
+	session        *advisory.Session
 	use            storage.UseClaim
+	metadata       storage.MetadataPermissions
+	closeIntent    storage.DeleteIntentID
 	store          *Store
 	id             int64
 	read, write    bool
 	active, closed bool
 	useDropped     bool
+	retireResult   error
 	closeErr       error
 }
 
@@ -78,7 +82,8 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 	if s.fileDomain.files >= s.fileDomain.maxFiles {
 		return nil, syscall.EAGAIN
 	}
-	f := &retainedFile{store: s, scope: scope, use: options.EffectiveUse(), read: options.Read, write: options.Write, active: true}
+	f := &retainedFile{store: s, scope: scope, session: metastore.ReferenceSession(ctx), use: options.EffectiveUse(),
+		read: options.Read, write: options.Write, metadata: storage.ReadMetadata | storage.WriteMetadata, active: true}
 	claimed := false
 	resolve := func(tx *sql.Tx) error {
 		var node metastore.Node
@@ -102,6 +107,11 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 			if err != nil {
 				return err
 			}
+			if pending, err := s.nodePendingUnlink(ctx, tx, parent.ID); err != nil {
+				return err
+			} else if pending {
+				return storage.ErrPendingDelete
+			}
 			node, err = s.createOpenNode(ctx, tx, parent, name, options)
 			if err != nil {
 				return err
@@ -118,6 +128,11 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 					return syscall.ELOOP
 				}
 				return syscall.EISDIR
+			}
+			if pending, err := s.nodePendingUnlink(ctx, tx, node.ID); err != nil {
+				return err
+			} else if pending {
+				return storage.ErrPendingDelete
 			}
 			if options.Truncate {
 				if err := s.replaceNodeContent(ctx, tx, node, metastore.Object{ModTime: time.Now()}); err != nil {
@@ -182,7 +197,7 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 
 func (s *Store) createOpenNode(ctx context.Context, tx *sql.Tx, parent metastore.Node, name []byte, options storage.FileOpenOptions) (metastore.Node, error) {
 	now := time.Now()
-	node, err := s.insertNode(ctx, tx, storage.NodeRegular, storage.AttrChange{}, options.InitialMetadata, now)
+	node, err := s.insertNode(ctx, tx, storage.NodeRegular, storage.InitialFields{Metadata: options.InitialMetadata}, now)
 	if err != nil {
 		return metastore.Node{}, err
 	}
@@ -335,6 +350,13 @@ func (s *Store) advanceContentRevision(ctx context.Context, tx *sql.Tx, id int64
 }
 
 func (s *Store) replaceNodeContent(ctx context.Context, tx *sql.Tx, node metastore.Node, object metastore.Object) error {
+	if err := s.replaceNodeContentFields(ctx, tx, node, object, time.Now()); err != nil {
+		return err
+	}
+	return s.recordNamedChanged(ctx, tx, node.ID)
+}
+
+func (s *Store) replaceNodeContentFields(ctx context.Context, tx *sql.Tx, node metastore.Node, object metastore.Object, at time.Time) error {
 	if object.Key == "" {
 		if object.Size != 0 {
 			return syscall.EINVAL
@@ -358,7 +380,7 @@ func (s *Store) replaceNodeContent(ctx context.Context, tx *sql.Tx, node metasto
 		return err
 	}
 	sec, nsec := sqlvalue.StoredTime(object.ModTime)
-	changeSec, changeNsec := sqlvalue.StoredTime(time.Now())
+	changeSec, changeNsec := sqlvalue.StoredTime(at)
 	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET size=?,mtime_sec=?,mtime_nsec=?,content=?,change_sec=?,change_nsec=? WHERE volume=? AND id=?`, object.Size, sec, nsec, sqlvalue.StoredKey(object.Key), changeSec, changeNsec, s.volume, node.ID); err != nil {
 		return err
 	}
@@ -372,7 +394,7 @@ func (s *Store) replaceNodeContent(ctx context.Context, tx *sql.Tx, node metasto
 			return err
 		}
 	}
-	return s.recordNamedChanged(ctx, tx, node.ID)
+	return nil
 }
 
 func (s *Store) recordNamedChanged(ctx context.Context, tx *sql.Tx, id int64) error {
@@ -463,7 +485,19 @@ func (f *retainedFile) Retire(ctx context.Context) error {
 		return err
 	}
 	defer f.store.coordinator.commit.release()
+	return f.retireLocked(ctx)
+}
+
+func (f *retainedFile) retireLocked(ctx context.Context) error {
+	if f.closed || !f.active {
+		return f.closeErr
+	}
+	result := f.consumeCloseIntentLocked(ctx)
+	if result != nil && f.closeIntent != "" {
+		return result
+	}
 	f.active = false
+	f.retireResult = result
 	return nil
 }
 
@@ -494,10 +528,14 @@ func (f *retainedFile) Close(ctx context.Context) error {
 		return err
 	}
 	defer f.store.coordinator.commit.release()
+	terminalResult := f.retireResult
 	if !f.useDropped {
-		f.active = false
-		if err := f.dropUseLocked(ctx); err != nil {
+		if err := f.retireLocked(ctx); err != nil {
 			return sqlerr.Failure(err)
+		}
+		terminalResult = f.retireResult
+		if err := f.dropUseLocked(ctx); err != nil {
+			return errors.Join(sqlerr.Failure(terminalResult), sqlerr.Failure(err))
 		}
 		f.useDropped = true
 	}
@@ -511,32 +549,32 @@ func (f *retainedFile) Close(ctx context.Context) error {
 		return syscall.EIO
 	}
 	if count == 1 {
-		var detached bool
+		var state metastore.ReferenceState
 		err := s.inspect(ctx, func(tx *sql.Tx) error {
-			return tx.QueryRowContext(ctx, `SELECT detached FROM nodes WHERE volume=? AND id=?`, s.volume, f.id).Scan(&detached)
+			var err error
+			state, err = s.referenceState(ctx, tx, f.id)
+			return err
 		})
 		if err != nil {
 			return sqlerr.Failure(err)
 		}
-		if detached {
+		if state.PendingUnlink {
+			err = s.finalizePendingUnlinkLocked(ctx, f.id)
+		} else if state.State.Detached {
 			err = s.mutateTransactionLocked(ctx, ctx, &volumeIntent{kind: locking.RemoveMutation, node: f.id, cleanup: true}, func(tx *sql.Tx) error {
-				node, err := s.nodeByID(ctx, tx, f.id)
-				if err != nil {
-					return err
-				}
-				return s.discardNode(ctx, tx, node)
+				return s.discardNode(ctx, tx, state.State.Node)
 			})
-			if err != nil {
-				if s.coordinator.healthy() != nil || storage.IsPublicationAccountingUncertain(err) {
-					f.closeErr = sqlerr.Failure(err)
-					s.coordinator.poisonWith(f.closeErr)
-					if s.locks != nil {
-						s.locks.Fence(f.closeErr)
-					}
-					return f.closeErr
+		}
+		if err != nil {
+			if s.coordinator.healthy() != nil || storage.IsPublicationAccountingUncertain(err) {
+				f.closeErr = sqlerr.Failure(err)
+				s.coordinator.poisonWith(f.closeErr)
+				if s.locks != nil {
+					s.locks.Fence(f.closeErr)
 				}
-				return sqlerr.Failure(err)
+				return errors.Join(sqlerr.Failure(terminalResult), f.closeErr)
 			}
+			return errors.Join(sqlerr.Failure(terminalResult), sqlerr.Failure(err))
 		}
 		delete(s.coordinator.pins, key)
 	} else {
@@ -545,15 +583,19 @@ func (f *retainedFile) Close(ctx context.Context) error {
 	delete(s.files, f)
 	s.fileDomain.files--
 	f.closed = true
-	return nil
+	f.closeErr = sqlerr.Failure(terminalResult)
+	return f.closeErr
 }
 
 type fileDomain struct {
-	config      advisory.Config
-	coordinator *advisory.Coordinator
-	stores      int
-	maxFiles    int
-	files       int
+	config                advisory.Config
+	coordinator           *advisory.Coordinator
+	stores                int
+	maxFiles              int
+	maxDeleteIntents      int
+	files                 int
+	pendingUnlinkCursor   int64
+	maintenanceAccounting storage.PublicationAccountingChain
 }
 
 func (s *Store) attachFileDomain(options Options) error {
@@ -563,9 +605,10 @@ func (s *Store) attachFileDomain(options Options) error {
 		if err != nil {
 			return err
 		}
-		domain = &fileDomain{config: options.Advisory, coordinator: coordinator, maxFiles: options.MaxRetainedFiles}
+		domain = &fileDomain{config: options.Advisory, coordinator: coordinator,
+			maxFiles: options.MaxRetainedFiles, maxDeleteIntents: options.MaxDeleteIntents}
 		s.coordinator.domains[s.volume] = domain
-	} else if domain.config != options.Advisory || domain.maxFiles != options.MaxRetainedFiles {
+	} else if domain.config != options.Advisory || domain.maxFiles != options.MaxRetainedFiles || domain.maxDeleteIntents != options.MaxDeleteIntents {
 		return fmt.Errorf("shared SQLite volume file limits differ from its active owner: %w", syscall.EINVAL)
 	}
 	domain.stores++

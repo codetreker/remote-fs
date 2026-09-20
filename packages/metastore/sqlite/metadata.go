@@ -36,31 +36,33 @@ func (s *Store) insertNode(
 	ctx context.Context,
 	tx *sql.Tx,
 	kind storage.NodeKind,
-	change storage.AttrChange,
-	initial map[string][]byte,
+	initial storage.InitialFields,
 	at time.Time,
 ) (metastore.Node, error) {
-	if kind != storage.NodeRegular && kind != storage.NodeDirectory {
-		return metastore.Node{}, syscall.EINVAL
-	}
-	if err := change.Check(); err != nil {
+	if err := kind.Check(); err != nil {
 		return metastore.Node{}, err
+	}
+	if err := initial.Check(); err != nil {
+		return metastore.Node{}, err
+	}
+	if kind != storage.NodeSymlink && len(initial.LinkTarget) != 0 || kind == storage.NodeSymlink && len(initial.LinkTarget) == 0 {
+		return metastore.Node{}, syscall.EINVAL
 	}
 	id, err := dbstate.AllocateNodeID(ctx, tx)
 	if err != nil {
 		return metastore.Node{}, err
 	}
 	access, modified, birth, changed := at, at, at, at
-	if change.AccessTime != nil {
-		access = *change.AccessTime
+	if initial.Attr.AccessTime != nil {
+		access = *initial.Attr.AccessTime
 	}
-	if change.ModTime != nil {
-		modified = *change.ModTime
+	if initial.Attr.ModTime != nil {
+		modified = *initial.Attr.ModTime
 	}
-	if change.BirthTime != nil {
-		birth = *change.BirthTime
+	if initial.Attr.BirthTime != nil {
+		birth = *initial.Attr.BirthTime
 	}
-	metadata, err := initialMetadata(initial)
+	metadata, err := initialMetadata(initial.Metadata)
 	if err != nil {
 		return metastore.Node{}, err
 	}
@@ -69,7 +71,7 @@ func (s *Store) insertNode(
 		return metastore.Node{}, err
 	}
 	if err := storage.CheckAttrResultBudget(ctx, storage.Attr{
-		ID: uint64(id), Kind: kind, AccessTime: access, ModTime: modified, BirthTime: &birth, ChangeTime: &changed,
+		ID: uint64(id), Kind: kind, Size: int64(len(initial.LinkTarget)), AccessTime: access, ModTime: modified, BirthTime: &birth, ChangeTime: &changed,
 	}, int64(len(encoded))); err != nil {
 		return metastore.Node{}, err
 	}
@@ -77,16 +79,17 @@ func (s *Store) insertNode(
 	modifiedSec, modifiedNsec := sqlvalue.StoredTime(modified)
 	birthSec, birthNsec := sqlvalue.StoredTime(birth)
 	changeSec, changeNsec := sqlvalue.StoredTime(changed)
+	target := append([]byte{}, initial.LinkTarget...)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO nodes
 		(id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,
-		 birth_sec,birth_nsec,change_sec,change_nsec,metadata)
-		VALUES(?,?,?,0,?,?,?,?,NULL,?,?,?,?,?)`,
-		id, s.volume, int64(kind), accessSec, accessNsec, modifiedSec, modifiedNsec,
-		birthSec, birthNsec, changeSec, changeNsec, encoded); err != nil {
+		 birth_sec,birth_nsec,change_sec,change_nsec,metadata,link_target)
+		VALUES(?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?)`,
+		id, s.volume, int64(kind), len(initial.LinkTarget), accessSec, accessNsec, modifiedSec, modifiedNsec,
+		birthSec, birthNsec, changeSec, changeNsec, encoded, target); err != nil {
 		return metastore.Node{}, err
 	}
-	return metastore.Node{ID: id, Kind: kind, AccessTime: access, ModTime: modified,
-		BirthTime: &birth, ChangeTime: &changed, Metadata: metadata}, nil
+	return metastore.Node{ID: id, Kind: kind, Size: int64(len(initial.LinkTarget)), AccessTime: access, ModTime: modified,
+		BirthTime: &birth, ChangeTime: &changed, Metadata: metadata, LinkTarget: bytes.Clone(initial.LinkTarget)}, nil
 }
 
 func (s *Store) setNodeChangeTime(ctx context.Context, tx *sql.Tx, id int64, at time.Time) error {

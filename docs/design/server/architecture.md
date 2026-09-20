@@ -13,7 +13,7 @@ volume、保留文件与显式占有的权威持有者。将原生 storage 与�
 | **协议词汇**（`packages/transport/httprest`） | 请求 URL 的形状、响应体的形状；错误的名字取自 storage 契约的 errno 词汇。与 client 共用同一份。 | R-INT-9 |
 | **变更日志** | volume 里每一次改动的有序记录，由 storage 底下的 metastore 提供。请求处理拿到它就开出复制那三个操作；拿不到（`nil`）时，在已启用的操作授权通过后以 `ENOSYS` 拒绝它们。 | R-CON-1、R-CON-2 |
 | **storage** | 原生发布集成确定实际资源并执行最终转换。localstore 与 Azure 组合在 metastore 事务中记账；第三方实现须履行同一原生集成契约。 | R-INT-6、R-INT-13 |
-| **保留文件与中立访问** | FileSession 拥有当前对象引用与 Use claim；独立 coordinator 管理中立 owner、advisory/enforced range 与有限历史。这些状态限于当前 authority incarnation，不持久恢复。 | R-FS-6 至 R-FS-8、R-CC-12 至 R-CC-14、R-WS-7 |
+| **保留节点与中立访问** | FileSession 拥有 File/NodeReference、Use claim 与有限 action receipt；SQLite 持有身份 namespace、条件 mutation 与 durable delete intent；coordinator 管理 owner、advisory/enforced range。普通引用状态限于当前 authority incarnation。 | R-FS-5 至 R-FS-8、R-CC-12 至 R-CC-14、R-WS-7 |
 | **文件占有**（`packages/locking`、`packages/storage/locked`） | 有限 S/X 授予、Session / Owner、动作核对与发布顺序；与同一 volume 绑定，重启通过持久证据恢复保护。 | R-CC-3、R-CC-6 至 R-CC-11 |
 
 ```
@@ -30,7 +30,7 @@ volume、保留文件与显式占有的权威持有者。将原生 storage 与�
  └─────────────┘
 ```
 
-基础数据操作各自完成一次请求；FileSession 保留 File、Use claim 与 range 状态，显式 S/X 另有 Session、Owner、grant 与动作历史。节点事实与 opaque metadata 由 SQLite 持久并复制；File/Use/range 状态在 authority 重启时失效。handler 只接受 `locked.New` 验证过的配对 backend，其 `LockService()` 就是绑定原生发布检查的授权方，不能从另一份 storage 单独提供控制服务。Strong 的恢复与拒绝规则见[文件锁设计](file-locks.md)。可选 Authorizer 先按业务身份和语义决定准入，再访问 capability、Log 与 backend；通用有界请求／响应容量可先返回 EAGAIN。操作映射、策略错误与 context 生命周期由[业务授权](authorization.md)定义。
+基础数据操作各自完成一次请求；FileSession 保留 File、NodeReference、Use/range 与有限 action receipt，显式 S/X 另有 Session、Owner、grant 与动作历史。节点事实、opaque metadata、pending generation 和 delete intent 由 SQLite 持久；普通引用、Scope 与 session receipt 在 authority 重启时失效。handler 只接受 `locked.New` 验证过的配对 backend，其 `LockService()` 就是绑定原生发布检查的授权方，不能从另一份 storage 单独提供控制服务。Strong 的恢复与拒绝规则见[文件锁设计](file-locks.md)。可选 Authorizer 先按业务身份和语义决定准入，再访问 capability、Log 与 backend；通用有界请求／响应容量可先返回 EAGAIN。操作映射、策略错误与 context 生命周期由[业务授权](authorization.md)定义。
 
 ## 二、请求的形状
 
@@ -53,8 +53,8 @@ volume、保留文件与显式占有的权威持有者。将原生 storage 与�
 | `Resubscribe` | `GET /v4/resubscribe` | `incarnation`、`position` | — |
 | `Snapshot` | `GET /v4/snapshot` | 无 | — |
 | `Checkpoint` | `GET /v4/checkpoint` | 无 | — |
-| 保留文件数据与 metadata | `POST /v4/file` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带 session/file 能力与参数 |
-| 文件会话、owner 与 range 控制 | `POST /v4/file-control` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带原动作身份及 owner |
+| 保留节点、身份 namespace、metadata 与条件修改 | `POST /v4/file` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带 session/reference、action 与参数 |
+| 文件会话、action/intent 查询、owner 与 range 控制 | `POST /v4/file-control` | 无 | 严格 JSON，携带原动作身份、durable intent ID 或 owner |
 
 volume 路径以 `url.Values` 的转义走 query string，任意字节序列都逐字往返。根是 `path=`：一个存在且为空的操作数。`Space` 描述整个 volume 而不是某个路径底下的东西，因此它一个操作数都不带；带了 `path=` 的 `Space` 请求与多带了任何操作数的请求一样，是请求错误。
 
@@ -104,7 +104,7 @@ handler 用 `MaxBodyBytes` 限制基础 volume 的 non-write 请求与 non-strea
 
 `SetAttr` 的请求体是 `{"change":{…}}`，`change` 里每个属性都是可选的：缺席就是「这一项不改」。`change` 本身缺席则是解码失败 —— 一个什么都不点名的改动是合法请求（它在问这个节点还在不在），因此靠字段本身分辨不出报文是不是掉了内容，外面这一层对象才分辨得出来。
 
-保留文件的响应 envelope 按操作携带 FileSession 状态、引用能力、属性、字节、metadata、scope、owner、range 结果与可选 barrier，不能套用基础 mutation 的空 object 规则。Data 与 metadata byte 字段使用 base64；时间间隔以整数纳秒编码。Open 先返回有期限的待确认能力，client 完成确认才交给调用方；未确认引用与关闭的动作记录受 registry 上限约束。v4 为已命名但尚未提供本地接口的能力保留 bool，并为 Open 的 node、Close 的 barrier 保留字段；不使用这些字段的 v4 client 接受并忽略它们，任意未知字段仍失败。完整形状与核对边界见[文件协议](file-handles.md#五http复制与资源)。
+保留文件的响应 envelope 按操作携带 FileSession 状态、File/NodeReference 能力、原子 open outcome、属性、字节、metadata、scope、reference state、action/delete-intent status、owner、range 结果与可选 barrier，不能套用基础 mutation 的空 object 规则。Data、原始叶名、metadata token/payload 与 generation 使用 base64；时间间隔以整数纳秒编码。Open 先返回有期限的待确认能力，client 完成确认才交给调用方；未确认引用与有限 action 记录受 registry 上限约束。DirectoryMetadata 与 ReferenceName 仍只是已知未实现的协商位，任意未知字段失败。完整形状与核对边界见[文件协议](file-handles.md#五http复制与资源)。
 
 ## 四、错误如何离开 server
 
@@ -156,7 +156,7 @@ SQLite metastore 把普通 volume/log read 与长期 snapshot 放进两个 reade
 
 `httprest.Storage.Checkpoint(ctx)` 通过 `GET /v4/checkpoint` 取得原子日志水位。响应是现有 MutationBarrier 的裸 `{incarnation,position}` object，和成功修改回复里的 barrier 使用同一 identity／position 验证；它不代表某个特定修改。请求不带操作数或 body，client／server 都使用普通请求响应预算、协议标记与封闭 errno 检查。
 
-handler 先按 `storage.OpReplicationCheckpoint` 授权，再调用纯 `Log.Barrier`；缺少 Log 在允许之后返回 ENOSYS。该读取不调用 storage mutation，不唤醒 publisher，不分配订阅、snapshot 或 page 名额。快照响应先关闭再发出 checkpoint，构建因此只需要原订阅和另一条普通 HTTP 连接。client 持续使用原订阅追到固定水位，构建状态由[client 设计](../client/architecture.md#二路径属性来自副本目录读取来自权威)拥有。
+handler 先按 `storage.OpReplicationCheckpoint` 授权，再调用纯 `Log.Barrier`；缺少 Log 在允许之后返回 ENOSYS。该读取不调用 storage mutation，不唤醒 publisher，不分配订阅、snapshot 或 page 名额。快照响应先关闭再发出 checkpoint，构建因此只需要原订阅和另一条普通 HTTP 连接。client 持续使用原订阅追到固定水位，构建状态由[client 设计](../client/architecture.md#二路径起点来自副本子项操作到达权威)拥有。
 
 ## 六、请求与响应的内存边界
 
@@ -197,7 +197,7 @@ server 通过配对的 volume 与锁服务访问 volume。集成方注入具有�
 
 Azure 形态依赖部署方分别提供和运维 Blob container、数据库及其相邻的 lease 证据，两类存储可以各自失败（R-INT-12、R-ERR-6）。`sqlite.OpenLocking` 对整份数据库取得 lifetime ownership，数据库及确定位置的证据保存数据库级最大 lease 时长。后续启动可以选择另一个已有 volume，但同一时刻只有一份活跃锁服务拥有该数据库，恢复等待仍覆盖整份数据库。`localstore` 则拥有一个私有本地目录下的对象、SQLite、WAL 外部见证、恢复状态与独占锁；它的完整设计见 [`local-disk-object-store.md`](local-disk-object-store.md)。
 
-基础 storage 的十一个操作、路径规则与错误词汇见顶层设计第四节。`FileStorage` 的保留对象与中立 metadata/Uses/range 是独立能力，原生 EX 所有权、共享预算、retained-file schema 和最终释放见[文件句柄设计](file-handles.md)。
+基础 storage 的十一个操作、路径规则与错误词汇见顶层设计第四节。`FileStorage` 的保留对象、身份 namespace、action/delete-intent、metadata、Uses 与 range 是独立能力，原生 EX 所有权、共享预算、schema v7 和最终释放见[文件句柄设计](file-handles.md)。
 
 ### 配额住在 storage 这一侧
 

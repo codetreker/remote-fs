@@ -22,4 +22,4 @@ FUSE 通过 FileSession 保留普通文件身份，每次 ReadAt 同时取得该
 
 旧句柄不会把短的新长度用于旧字节，路径查询与新句柄也不被旧缓冲区强行覆盖。[真实双 HTTP 挂载用例](../../../../packages/fuse/live_files_test.go)的 `TestLiveDescriptorStatThenReadAfter65536ByteShrink` 固定 65536 字节 `A` 到 `BBB` 的顺序，旧 fd 先 Stat 再读，断言结果为 `BBB`。同文件中的 live 用例另核对等长覆写、增长、缩短至空文件后的 ReadAt、EOF、fstat 与 inode，并对 rename、unlink、同名替换分别验证旧对象保留。
 
-每次读取都需要经过挂载与保留文件接口，失效引用和不可达不会由旧内容代答。完整对象物化与持续并发读取的成本仍在[文件句柄设计](../../../../docs/design/server/file-handles.md)中明确；[跨句柄页缓存](2026-09-07-prevent-cross-handle-page-cache-staleness.md)拥有另一项内核缓存触发顺序。[文件目标提案](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)继续保留显式内容依据与目录父身份约束。
+每次读取都需要经过挂载与保留文件接口，失效引用和不可达不会由旧内容代答。完整对象物化与持续并发读取的成本仍在[文件句柄设计](../../../../docs/design/server/file-handles.md)中明确；[跨句柄页缓存](2026-09-07-prevent-cross-handle-page-cache-staleness.md)拥有另一项内核缓存触发顺序。[文件目标提案](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)继续保留显式内容依据，目录父身份已由[原子身份操作](../architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)接续。

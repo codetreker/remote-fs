@@ -117,6 +117,9 @@ func TestLocalDefaultsFollowThePackagesThatEnforceThem(t *testing.T) {
 	if config.maxIntegrityBytes != sqlite.DefaultMaxIntegrityBytes {
 		t.Fatalf("integrity byte default is %d, want %d", config.maxIntegrityBytes, sqlite.DefaultMaxIntegrityBytes)
 	}
+	if config.files.deleteIntents != sqlite.DefaultMaxDeleteIntents {
+		t.Fatalf("delete intent default is %d, want %d", config.files.deleteIntents, sqlite.DefaultMaxDeleteIntents)
+	}
 	if config.standalone != defaultStandaloneHTTPOptions() {
 		t.Fatalf("standalone HTTP defaults are %+v, want %+v", config.standalone, defaultStandaloneHTTPOptions())
 	}
@@ -147,6 +150,7 @@ func TestLocalBoundsAndHTTPBodyLimitReachTheirOwners(t *testing.T) {
 		"-max-snapshot-reader-connections", "6",
 		"-max-integrity-records", "101",
 		"-max-integrity-bytes", "7M",
+		"-max-delete-intents", "109",
 		"-sweep-interval", "45s",
 		"-sweep-batch", "23",
 		"-http-max-body-bytes", "5M",
@@ -190,6 +194,9 @@ func TestLocalBoundsAndHTTPBodyLimitReachTheirOwners(t *testing.T) {
 	}
 	if config.maxIntegrityBytes != 7<<20 {
 		t.Fatalf("integrity name-byte work limit is %d", config.maxIntegrityBytes)
+	}
+	if config.files.deleteIntents != 109 {
+		t.Fatalf("local deletion-intent limit is %d", config.files.deleteIntents)
 	}
 	if config.maintenance.SweepInterval != 45*time.Second || config.maintenance.SweepBatch != 23 {
 		t.Fatalf("maintenance bounds are %+v", config.maintenance)
@@ -248,6 +255,7 @@ func TestMetastoreBoundsApplyToBlobVolumes(t *testing.T) {
 		"-max-snapshot-reader-connections", "11",
 		"-max-integrity-records", "103",
 		"-max-integrity-bytes", "13M",
+		"-max-delete-intents", "107",
 		"-sweep-interval", "47s",
 		"-sweep-batch", "31",
 		"-http-max-write-bytes", "12M",
@@ -272,6 +280,9 @@ func TestMetastoreBoundsApplyToBlobVolumes(t *testing.T) {
 	}
 	if config.maxIntegrityBytes != 13<<20 {
 		t.Fatalf("blob integrity name-byte work limit is %d", config.maxIntegrityBytes)
+	}
+	if config.files.deleteIntents != 107 {
+		t.Fatalf("blob deletion-intent limit is %d", config.files.deleteIntents)
 	}
 	if config.maintenance != (objectstore.Options{SweepInterval: 47 * time.Second, SweepBatch: 31}) {
 		t.Fatalf("blob maintenance limits are %+v", config.maintenance)
@@ -337,6 +348,8 @@ func TestNonPositiveCountsAndDurationsAreRefused(t *testing.T) {
 		{"-max-reader-connections", "0"},
 		{"-max-snapshot-reader-connections", "0"},
 		{"-max-integrity-records", "1"},
+		{"-max-delete-intents", "0"},
+		{"-max-delete-intents", strconv.Itoa(math.MaxInt)},
 		{"-sweep-interval", "0s"},
 		{"-sweep-batch", "0"},
 		{"-sweep-batch", strconv.Itoa(objectstore.MaxSweepBatch + 1)},
@@ -556,6 +569,7 @@ func TestHelpNamesTheLocalStoreAndStatusSignal(t *testing.T) {
 		"-max-snapshot-reader-connections",
 		"-max-integrity-records",
 		"-max-integrity-bytes",
+		"-max-delete-intents",
 		"-sweep-interval",
 		"-sweep-batch",
 		"maximum SQLite reader connections",
@@ -563,6 +577,7 @@ func TestHelpNamesTheLocalStoreAndStatusSignal(t *testing.T) {
 		"maximum SQLite reader connections held by concurrent snapshots",
 		"integrity record work limit",
 		"integrity name-byte work limit",
+		"durable close-time deletion receipts",
 		"larger retained volumes",
 		"reservation-admission threshold",
 		"unresolved",

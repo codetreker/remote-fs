@@ -75,7 +75,7 @@ func formatLocalStatus(status localstore.Status, options objectstore.Options, ma
 	return fmt.Sprintf(
 		"volume %q in store %s: %d of %d volume bytes used, %d writable; %d physical bytes available; "+
 			"%s; SQLite reader-connection limit is %d; snapshot reader-connection limit is %d; "+
-			"integrity record work limit is %d; integrity name-byte work limit is %d; garbage sweeps run every %v with at most %d objects per attempt; "+
+			"integrity record work limit is %d; integrity name-byte work limit is %d; durable deletion-intent limit is %d; garbage sweeps run every %v with at most %d objects per attempt; "+
 			"%d operations and %d bytes in flight; %d operations waiting under a limit of %d; %d recovery records; "+
 			"SQLite checkpoint has accepted generation %d and checkpointed generation %d; checkpoint pending is %t; %s",
 		status.Volume,
@@ -89,6 +89,7 @@ func formatLocalStatus(status localstore.Status, options objectstore.Options, ma
 		status.MaxSnapshotReaderConnections,
 		status.MaxIntegrityRecords,
 		status.MaxIntegrityBytes,
+		status.MaxDeleteIntents,
 		options.SweepInterval,
 		options.SweepBatch,
 		status.LocalDisk.InFlightOperations,
@@ -111,14 +112,15 @@ func formatObjectStoreStatus(
 	maxSnapshotReaderConnections int,
 	maxIntegrityRecords int64,
 	maxIntegrityBytes int64,
+	maxDeleteIntents int,
 	maintenance objectstore.MaintenanceStatus,
 	options objectstore.Options,
 ) string {
 	return fmt.Sprintf(
 		"volume %q: %s; SQLite reader-connection limit is %d; snapshot reader-connection limit is %d; "+
-			"integrity record work limit is %d; integrity name-byte work limit is %d; garbage sweeps run every %v with at most %d objects per attempt; %s",
+			"integrity record work limit is %d; integrity name-byte work limit is %d; durable deletion-intent limit is %d; garbage sweeps run every %v with at most %d objects per attempt; %s",
 		volume, formatPendingStatus(objects, limits), maxReaderConnections, maxSnapshotReaderConnections,
-		maxIntegrityRecords, maxIntegrityBytes,
+		maxIntegrityRecords, maxIntegrityBytes, maxDeleteIntents,
 		options.SweepInterval,
 		options.SweepBatch,
 		formatMaintenanceStatus(maintenance),

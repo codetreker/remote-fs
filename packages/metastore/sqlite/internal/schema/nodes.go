@@ -17,7 +17,7 @@ func validateNodeValues(ctx context.Context, db sqlvalue.Queryer, volume *int64)
 
 func validateNodeValuesVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, version int) error {
 	if version >= firstNeutralMetadataSchemaVersion {
-		return validateNeutralNodeValues(ctx, db, volume)
+		return validateNeutralNodeValues(ctx, db, volume, version)
 	}
 	where := ""
 	var args []any
@@ -155,7 +155,7 @@ func validateNodeRelationshipsVersion(
 	version int,
 ) error {
 	if version >= firstNeutralMetadataSchemaVersion {
-		return validateNeutralNodeRelationships(ctx, db, volume)
+		return validateNeutralNodeRelationships(ctx, db, volume, version)
 	}
 	volumeWhere := ""
 	nodeWhere := ""

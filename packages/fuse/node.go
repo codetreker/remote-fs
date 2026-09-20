@@ -2,18 +2,18 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	iofs "io/fs"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
-	"github.com/codetreker/remote-fs/packages/fuse/posix"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// Paths are used only for operations on names. Descriptor and inode attribute
-// operations use the retained file or node identity, including after unlink.
+// Names are addressed by parent identity and raw leaf. Descriptor and inode
+// attribute operations use the retained file or node identity, including after unlink.
 type node struct {
 	fs.Inode
 	volume *volume
@@ -32,33 +32,54 @@ func (n *node) checkAttr(attr storage.Attr) error {
 }
 
 var (
-	_ fs.NodeLookuper  = (*node)(nil)
-	_ fs.NodeGetattrer = (*node)(nil)
-	_ fs.NodeSetattrer = (*node)(nil)
-	_ fs.NodeReaddirer = (*node)(nil)
-	_ fs.NodeOpener    = (*node)(nil)
-	_ fs.NodeCreater   = (*node)(nil)
-	_ fs.NodeMkdirer   = (*node)(nil)
-	_ fs.NodeUnlinker  = (*node)(nil)
-	_ fs.NodeRmdirer   = (*node)(nil)
-	_ fs.NodeRenamer   = (*node)(nil)
-	_ fs.NodeStatfser  = (*node)(nil)
+	_ fs.NodeLookuper   = (*node)(nil)
+	_ fs.NodeGetattrer  = (*node)(nil)
+	_ fs.NodeSetattrer  = (*node)(nil)
+	_ fs.NodeReaddirer  = (*node)(nil)
+	_ fs.NodeOpener     = (*node)(nil)
+	_ fs.NodeCreater    = (*node)(nil)
+	_ fs.NodeMkdirer    = (*node)(nil)
+	_ fs.NodeUnlinker   = (*node)(nil)
+	_ fs.NodeRmdirer    = (*node)(nil)
+	_ fs.NodeRenamer    = (*node)(nil)
+	_ fs.NodeSymlinker  = (*node)(nil)
+	_ fs.NodeReadlinker = (*node)(nil)
+	_ fs.NodeStatfser   = (*node)(nil)
 )
 
 func (n *node) path() string { return n.Path(n.Root()) }
 
-func (n *node) childPath(name string) string {
-	if parent := n.path(); parent != "" {
-		return parent + "/" + name
+func (n *node) childName(name string, scope *storage.UseScope) storage.ChildName {
+	return storage.ChildName{
+		Parent:  storage.DirectoryTarget{NodeID: n.id.node, Scope: scope},
+		RawLeaf: []byte(name),
 	}
-	return name
+}
+
+func (v *volume) namespace() (storage.NamespaceAccess, error) {
+	access, ok := v.files.(storage.NamespaceAccess)
+	if !ok {
+		return nil, syscall.EOPNOTSUPP
+	}
+	if err := access.CheckNamespaceAccess(); err != nil {
+		return nil, err
+	}
+	return access, nil
 }
 
 func (n *node) Lookup(ctx context.Context, name string, out *gofuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	return n.lookup(ctx, name, out, nil)
+}
+
+func (n *node) lookup(ctx context.Context, name string, out *gofuse.EntryOut, scope *storage.UseScope) (*fs.Inode, syscall.Errno) {
 	if err := n.volume.check(); err != nil {
 		return nil, errnoOf(err)
 	}
-	attr, err := n.volume.storage.Stat(ctx, n.childPath(name))
+	access, err := n.volume.namespace()
+	if err != nil {
+		return nil, errnoOf(err)
+	}
+	attr, err := access.LookupAt(ctx, n.childName(name, scope))
 	if err != nil {
 		errno := errnoOf(err)
 		if errno == syscall.ENOENT {
@@ -301,19 +322,83 @@ func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	if options.ExpectedID == 0 {
 		return nil, 0, syscall.EIO
 	}
-	file, _, err := n.openFile(ctx, n.path(), options)
+	file, err := n.volume.files.OpenNode(ctx, n.id.node, options)
 	if err != nil {
 		return nil, 0, errnoOf(err)
+	}
+	attr, err := file.Stat(ctx)
+	if err == nil {
+		err = n.checkAttr(attr)
+	}
+	if err == nil && !n.volume.holds(attr.Size) {
+		err = syscall.EFBIG
+	}
+	if err != nil {
+		return nil, 0, errnoOf(n.volume.closeUnreturnedFile(ctx, file, err, options.Truncate))
 	}
 	return newHandle(n, file, options.Read, options.Write), gofuse.FOPEN_DIRECT_IO, 0
 }
 
-func (n *node) openFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, storage.Attr, error) {
-	file, err := n.volume.files.OpenFile(ctx, path, options)
+func (n *node) openFile(ctx context.Context, name storage.ChildName, options storage.FileOpenOptions) (storage.File, storage.Attr, error) {
+	opener, ok := n.volume.files.(storage.AtomicFileOpener)
+	if !ok {
+		return nil, storage.Attr{}, syscall.EOPNOTSUPP
+	}
+	if err := opener.CheckAtomicFileOpen(); err != nil {
+		return nil, storage.Attr{}, err
+	}
+	target := storage.ChildCondition{State: storage.Any}
+	if options.ExpectedID != 0 {
+		target = storage.ChildCondition{State: storage.SameNode, NodeID: options.ExpectedID}
+	} else if options.Exclusive {
+		target = storage.ChildCondition{State: storage.Absent}
+	}
+	effect := storage.Keep
+	if options.Truncate {
+		effect = storage.ResetContent
+	}
+	var uses storage.Uses
+	if options.Read {
+		uses |= storage.ReadData
+	}
+	if options.Write {
+		uses |= storage.WriteData
+	}
+	action, err := n.volume.newFileAction(ctx)
 	if err != nil {
 		return nil, storage.Attr{}, err
 	}
-	attr, err := file.Stat(ctx)
+	request := storage.OpenAtOptions{
+		Read: options.Read, Write: options.Write, Create: options.Create, Exclusive: options.Exclusive,
+		Target: target, Action: action, Existing: effect, Use: storage.UseClaim{Uses: uses},
+		Initial: storage.InitialState{OnCreate: storage.InitialFields{Metadata: options.InitialMetadata}},
+	}
+	result, err := opener.OpenAt(ctx, name, request)
+	replayed := false
+	if result.File == nil && result.Outcome == 0 && err != nil && (errnoOf(err) == syscall.EINTR || errnoOf(err) == syscall.EIO) {
+		replay, reconcileErr := n.volume.reconcileFileAction(ctx, action, storage.OpFileOpenAt, err)
+		if !replay {
+			return nil, storage.Attr{}, reconcileErr
+		}
+		completion, cancel := n.volume.cleanupContext(ctx)
+		result, err = opener.OpenAt(completion, name, request)
+		cancel()
+		replayed = true
+	}
+	if replayed && result.File == nil && result.Outcome == 0 && err != nil {
+		err = errors.Join(err, syscall.EIO)
+	}
+	changed := result.Outcome != storage.Opened
+	if result.File == nil {
+		if err == nil {
+			err = syscall.EIO
+		}
+		return nil, storage.Attr{}, afterMutation(changed, err)
+	}
+	if result.Outcome != storage.Opened && result.Outcome != storage.Created && result.Outcome != storage.Reset {
+		err = errors.Join(syscall.EIO, err)
+	}
+	attr := result.Attr
 	if err == nil {
 		switch {
 		case attr.ID == 0 || attr.Size < 0 || attr.Kind != storage.NodeRegular:
@@ -327,9 +412,9 @@ func (n *node) openFile(ctx context.Context, path string, options storage.FileOp
 		}
 	}
 	if err != nil {
-		return nil, storage.Attr{}, n.volume.closeUnreturnedFile(ctx, file, err, options.Create || options.Truncate)
+		return nil, storage.Attr{}, n.volume.closeUnreturnedFile(ctx, result.File, err, changed)
 	}
-	return file, attr, nil
+	return result.File, attr, nil
 }
 
 // Creation, exclusive existence checks, mode initialization, truncation and retention
@@ -349,7 +434,7 @@ func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	if err != nil {
 		return nil, nil, 0, errnoOf(err)
 	}
-	file, attr, err := n.openFile(ctx, n.childPath(name), options)
+	file, attr, err := n.openFile(ctx, n.childName(name, nil), options)
 	if err != nil {
 		return nil, nil, 0, errnoOf(err)
 	}
@@ -366,67 +451,52 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *gofuse.
 	if err := n.volume.check(); err != nil {
 		return nil, errnoOf(err)
 	}
-	path := n.childPath(name)
-	if err := n.volume.storage.Mkdir(ctx, path); err != nil {
+	metadata, err := initialPermissions(storageMode(mode))
+	if err != nil {
 		return nil, errnoOf(err)
 	}
-	if err := n.volume.wearMode(ctx, path, mode); err != nil {
-		return nil, errnoOf(afterMutation(true, err))
-	}
-	attr, err := n.volume.storage.Stat(ctx, path)
+	access, err := n.volume.namespace()
 	if err != nil {
-		return nil, errnoOf(afterMutation(true, err))
+		return nil, errnoOf(err)
 	}
+	action, err := n.volume.newFileAction(ctx)
+	if err != nil {
+		return nil, errnoOf(err)
+	}
+	result, err := n.mutateName(ctx, access, storage.NameCommand{
+		Kind: storage.NameMkdir, Action: action, Name: n.childName(name, nil),
+		Target: storage.ChildCondition{State: storage.Absent}, Initial: storage.InitialFields{Metadata: metadata},
+	})
+	if err != nil {
+		return nil, errnoOf(afterMutation(result.Attr != nil, err))
+	}
+	if result.Attr == nil || result.Attr.Kind != storage.NodeDirectory {
+		return nil, syscall.EIO
+	}
+	attr := *result.Attr
 	if errno := n.volume.fillAttr(&out.Attr, attr); errno != 0 {
 		return nil, errno
 	}
 	return n.child(ctx, name, out.Attr.Mode, attr.ID), 0
 }
 
-// Directory creation and its requested permissions are separate volume operations.
-// A failure after Mkdir therefore reports the partial mutation to the caller.
-func (v *volume) wearMode(ctx context.Context, path string, mode uint32) error {
-	metadata, err := initialPermissions(storageMode(mode))
-	if err != nil {
-		return err
-	}
-	attr, err := v.storage.Stat(ctx, path)
-	if err != nil {
-		return err
-	}
-	if attr.ID == 0 || attr.Kind != storage.NodeDirectory {
-		return syscall.EIO
-	}
-	access, ok := v.files.(storage.MetadataAccess)
-	if !ok {
-		return syscall.EOPNOTSUPP
-	}
-	if err := access.CheckMetadataAccess(); err != nil {
-		return err
-	}
-	payload, err := access.SetMetadata(ctx, attr.ID, posix.Namespace, attr.Metadata[posix.Namespace].Version, metadata[posix.Namespace])
-	if err != nil {
-		return err
-	}
-	if len(payload.Version) == 0 {
-		return syscall.EIO
-	}
-	got, err := posix.Decode(payload.Data)
-	if err != nil {
-		return err
-	}
-	if got != storageMode(mode) {
-		return syscall.EIO
-	}
-	return nil
-}
-
 func (n *node) Unlink(ctx context.Context, name string) syscall.Errno {
 	if err := n.volume.check(); err != nil {
 		return errnoOf(err)
 	}
-	if err := n.volume.storage.Remove(ctx, n.childPath(name)); err != nil {
+	access, err := n.volume.namespace()
+	if err != nil {
 		return errnoOf(err)
+	}
+	action, err := n.volume.newFileAction(ctx)
+	if err != nil {
+		return errnoOf(err)
+	}
+	result, err := n.mutateName(ctx, access, storage.NameCommand{
+		Kind: storage.NameRemove, Action: action, Name: n.childName(name, nil), Target: storage.ChildCondition{State: storage.Any},
+	})
+	if err != nil {
+		return errnoOf(afterMutation(result.Attr != nil, err))
 	}
 	n.id.forget(name)
 	return 0
@@ -436,8 +506,19 @@ func (n *node) Rmdir(ctx context.Context, name string) syscall.Errno {
 	if err := n.volume.check(); err != nil {
 		return errnoOf(err)
 	}
-	if err := n.volume.storage.RemoveDir(ctx, n.childPath(name)); err != nil {
+	access, err := n.volume.namespace()
+	if err != nil {
 		return errnoOf(err)
+	}
+	action, err := n.volume.newFileAction(ctx)
+	if err != nil {
+		return errnoOf(err)
+	}
+	result, err := n.mutateName(ctx, access, storage.NameCommand{
+		Kind: storage.NameRemoveDir, Action: action, Name: n.childName(name, nil), Target: storage.ChildCondition{State: storage.Any},
+	})
+	if err != nil {
+		return errnoOf(afterMutation(result.Attr != nil, err))
 	}
 	n.id.forget(name)
 	return 0
@@ -454,8 +535,23 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 		return syscall.EINVAL
 	}
 	target := newParent.(*node)
-	if err := n.volume.storage.Rename(ctx, n.childPath(name), target.childPath(newName)); err != nil {
+	access, err := n.volume.namespace()
+	if err != nil {
 		return errnoOf(err)
+	}
+	action, err := n.volume.newFileAction(ctx)
+	if err != nil {
+		return errnoOf(err)
+	}
+	result, err := n.mutateName(ctx, access, storage.NameCommand{
+		Kind: storage.NameRename, Action: action, Name: n.childName(name, nil), Target: storage.ChildCondition{State: storage.Any},
+		Destination: &storage.RenameTarget{
+			Parent: storage.DirectoryTarget{NodeID: target.id.node}, ObservedLeaf: []byte(newName),
+			Expected: storage.ChildCondition{State: storage.Any}, OutputLeaf: []byte(newName),
+		},
+	})
+	if err != nil {
+		return errnoOf(afterMutation(result.Attr != nil, err))
 	}
 	// The FUSE library is about to move the existing inode to the new name, carrying the
 	// number this mount gave it. The name it leaves has to stop referring to that number
@@ -463,6 +559,126 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 	// the two are live at once.
 	n.id.move(name, target.id, newName)
 	return 0
+}
+
+func (n *node) Symlink(ctx context.Context, target, name string, out *gofuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if err := n.volume.check(); err != nil {
+		return nil, errnoOf(err)
+	}
+	if target == "" {
+		return nil, syscall.ENOENT
+	}
+	access, err := n.volume.namespace()
+	if err != nil {
+		return nil, errnoOf(err)
+	}
+	action, err := n.volume.newFileAction(ctx)
+	if err != nil {
+		return nil, errnoOf(err)
+	}
+	result, err := n.mutateName(ctx, access, storage.NameCommand{
+		Kind: storage.NameSymlink, Action: action, Name: n.childName(name, nil),
+		Target: storage.ChildCondition{State: storage.Absent}, Initial: storage.InitialFields{LinkTarget: []byte(target)},
+	})
+	if err != nil {
+		return nil, errnoOf(afterMutation(result.Attr != nil, err))
+	}
+	if result.Attr == nil || result.Attr.Kind != storage.NodeSymlink || result.Attr.Size != int64(len(target)) {
+		return nil, syscall.EIO
+	}
+	attr := *result.Attr
+	if errno := n.volume.fillAttr(&out.Attr, attr); errno != 0 {
+		return nil, errno
+	}
+	return n.child(ctx, name, out.Attr.Mode, attr.ID), 0
+}
+
+func (n *node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
+	if err := n.volume.check(); err != nil {
+		return nil, errnoOf(err)
+	}
+	action, err := n.volume.newFileAction(ctx)
+	if err != nil {
+		return nil, errnoOf(err)
+	}
+	result, err := n.openNodeReference(ctx, n.id.node, storage.NodeRefOptions{
+		Kind: storage.NodeSymlink, Target: storage.ChildCondition{State: storage.SameNode, NodeID: n.id.node},
+		Action: action, MetadataAccess: storage.ReadMetadata,
+	})
+	unknown := result.Outcome != storage.Opened
+	if err != nil {
+		if result.Reference == nil {
+			return nil, errnoOf(afterMutation(result.Outcome != 0, err))
+		}
+		return nil, errnoOf(n.volume.closeUnreturnedReference(ctx, result.Reference, err, unknown))
+	}
+	if result.Reference == nil {
+		return nil, syscall.EIO
+	}
+	if result.Outcome != storage.Opened {
+		return nil, errnoOf(n.volume.closeUnreturnedReference(ctx, result.Reference, syscall.EIO, true))
+	}
+	if err := n.checkAttr(result.Attr); err != nil {
+		return nil, errnoOf(n.volume.closeUnreturnedReference(ctx, result.Reference, err, false))
+	}
+	if err := result.Reference.CheckReferenceState(); err != nil {
+		return nil, errnoOf(n.volume.closeUnreturnedReference(ctx, result.Reference, err, false))
+	}
+	observed, err := result.Reference.State(ctx)
+	if err == nil {
+		err = n.checkAttr(observed.Attr)
+	}
+	if err == nil && (len(observed.LinkTarget) == 0 || int64(len(observed.LinkTarget)) != observed.Attr.Size) {
+		err = syscall.EIO
+	}
+	link := append([]byte(nil), observed.LinkTarget...)
+	if closeErr := n.volume.closeUnreturnedReference(ctx, result.Reference, err, false); closeErr != nil {
+		return nil, errnoOf(closeErr)
+	}
+	return link, 0
+}
+
+func (n *node) openNodeReference(ctx context.Context, id uint64, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	references, ok := n.volume.files.(storage.NodeReferences)
+	if !ok {
+		return storage.NodeOpenResult{}, syscall.EOPNOTSUPP
+	}
+	if err := references.CheckNodeReferences(); err != nil {
+		return storage.NodeOpenResult{}, err
+	}
+	result, err := references.OpenNodeRef(ctx, id, options)
+	if result.Reference != nil || result.Outcome != 0 || err == nil || errnoOf(err) != syscall.EINTR && errnoOf(err) != syscall.EIO {
+		return result, err
+	}
+	replay, reconcileErr := n.volume.reconcileFileAction(ctx, options.Action, storage.OpFileOpenNodeRef, err)
+	if !replay {
+		return storage.NodeOpenResult{}, reconcileErr
+	}
+	completion, cancel := n.volume.cleanupContext(ctx)
+	defer cancel()
+	result, err = references.OpenNodeRef(completion, id, options)
+	if result.Reference == nil && result.Outcome == 0 && err != nil {
+		err = errors.Join(err, syscall.EIO)
+	}
+	return result, err
+}
+
+func (n *node) mutateName(ctx context.Context, access storage.NamespaceAccess, command storage.NameCommand) (storage.NameResult, error) {
+	result, err := access.MutateName(ctx, command)
+	if result.Attr != nil || err == nil || errnoOf(err) != syscall.EINTR && errnoOf(err) != syscall.EIO {
+		return result, err
+	}
+	replay, reconcileErr := n.volume.reconcileFileAction(ctx, command.Action, storage.OpFileMutateName, err)
+	if !replay {
+		return storage.NameResult{}, reconcileErr
+	}
+	completion, cancel := n.volume.cleanupContext(ctx)
+	defer cancel()
+	result, err = access.MutateName(completion, command)
+	if result.Attr == nil && err != nil {
+		err = errors.Join(err, syscall.EIO)
+	}
+	return result, err
 }
 
 // --- identity ------------------------------------------------------------------------

@@ -18,3 +18,11 @@ func (s *Store) NewFileSession(ctx context.Context, options storage.FileSessionO
 func (s *Store) Usage(ctx context.Context) (int64, error) {
 	return s.volume.Usage(ctx)
 }
+
+func (s *Store) CheckMaintenanceAccounting() error { return s.volume.CheckMaintenanceAccounting() }
+
+func (s *Store) BindMaintenanceAccounting(ctx context.Context, chain storage.PublicationAccountingChain, initialize func(int64)) error {
+	return s.volume.BindMaintenanceAccounting(ctx, chain, initialize)
+}
+
+var _ storage.MaintenanceAccounting = (*Store)(nil)

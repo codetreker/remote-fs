@@ -155,6 +155,46 @@ func (v *volume) actionEpoch(ctx context.Context) (uint64, error) {
 	return v.status.ActionEpoch, nil
 }
 
+func (v *volume) newFileAction(ctx context.Context) (storage.FileActionID, error) {
+	epoch, err := v.actionEpoch(ctx)
+	if err != nil {
+		return "", err
+	}
+	return storage.NewFileActionID(epoch)
+}
+
+func (v *volume) reconcileFileAction(ctx context.Context, action storage.FileActionID, operation storage.Operation, cause error) (bool, error) {
+	actions, ok := v.files.(storage.FileActions)
+	if !ok {
+		return false, errors.Join(cause, syscall.EIO)
+	}
+	cleanup, cancel := v.cleanupContext(ctx)
+	defer cancel()
+	receipt, err := actions.QueryFileAction(cleanup, action)
+	if err != nil {
+		return false, errors.Join(cause, err, syscall.EIO)
+	}
+	if err := receipt.Check(); err != nil || receipt.Action != action {
+		return false, errors.Join(cause, err, syscall.EIO)
+	}
+	switch receipt.Outcome {
+	case storage.FileActionNotExecuted:
+		if receipt.Operation != "" && receipt.Operation != operation {
+			return false, errors.Join(cause, syscall.EIO)
+		}
+		return false, cause
+	case storage.FileActionPending, storage.FileActionCompleted:
+		if receipt.Operation != operation {
+			return false, errors.Join(cause, syscall.EIO)
+		}
+		return true, nil
+	case storage.FileActionUnknown, storage.FileActionRetired:
+		return false, errors.Join(cause, syscall.EIO)
+	default:
+		return false, errors.Join(cause, syscall.EIO)
+	}
+}
+
 func newVolume(ctx context.Context, s storage.Storage, opts Options, logger *log.Logger) (*volume, error) {
 	capability, ok := s.(storage.FileStorage)
 	if !ok {
@@ -276,6 +316,20 @@ retire:
 }
 
 func checkSessionCapabilities(files storage.FileSession) error {
+	namespace, ok := files.(storage.NamespaceAccess)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	if err := namespace.CheckNamespaceAccess(); err != nil {
+		return err
+	}
+	opener, ok := files.(storage.AtomicFileOpener)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	if err := opener.CheckAtomicFileOpen(); err != nil {
+		return err
+	}
 	metadata, ok := files.(storage.MetadataAccess)
 	if !ok {
 		return syscall.EOPNOTSUPP
@@ -294,7 +348,21 @@ func checkSessionCapabilities(files storage.FileSession) error {
 	if !ok {
 		return syscall.EOPNOTSUPP
 	}
-	return ranges.CheckRangeControl()
+	if err := ranges.CheckRangeControl(); err != nil {
+		return err
+	}
+	references, ok := files.(storage.NodeReferences)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	if err := references.CheckNodeReferences(); err != nil {
+		return err
+	}
+	actions, ok := files.(storage.FileActions)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	return actions.CheckFileActions()
 }
 
 func minTime(a, b time.Time) time.Time {

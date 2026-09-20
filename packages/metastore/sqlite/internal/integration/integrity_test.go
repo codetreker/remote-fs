@@ -1117,26 +1117,18 @@ func TestRetainedIntegrityRefusesInvalidDetachedState(t *testing.T) {
 	}
 }
 
-func TestRetainedIntegrityRefusesDetachedDirectoriesAndRoots(t *testing.T) {
-	for _, node := range []string{"directory", "root"} {
-		for _, entry := range []string{"open", "status"} {
-			t.Run(node+"/"+entry, func(t *testing.T) {
-				f := newObjectIntegrityFixture(t)
-				var store *sqlite.Store
-				if entry == "status" {
-					store = open(t, f.path, "workspace", 100)
-				}
-				if node == "root" {
-					damageDatabase(t, f.path, `UPDATE nodes SET detached = 1
-						WHERE id = (SELECT root FROM volumes WHERE id = ?)`, f.volume)
-				} else {
-					damageDatabase(t, f.path, `UPDATE nodes SET detached = 1 WHERE `+nodeNamed,
-						f.volume, "directory")
-					damageDatabase(t, f.path, `DELETE FROM entries WHERE volume = ? AND name = CAST('directory' AS BLOB)`, f.volume)
-				}
-				assertRetainedIntegrityFailure(t, f.path, store)
-			})
-		}
+func TestRetainedIntegrityRefusesDetachedRoot(t *testing.T) {
+	for _, entry := range []string{"open", "status"} {
+		t.Run(entry, func(t *testing.T) {
+			f := newObjectIntegrityFixture(t)
+			var store *sqlite.Store
+			if entry == "status" {
+				store = open(t, f.path, "workspace", 100)
+			}
+			damageDatabase(t, f.path, `UPDATE nodes SET detached = 1
+				WHERE id = (SELECT root FROM volumes WHERE id = ?)`, f.volume)
+			assertRetainedIntegrityFailure(t, f.path, store)
+		})
 	}
 }
 

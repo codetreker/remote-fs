@@ -74,16 +74,18 @@ Renew 使用 `max(原 deadline, 转换时刻 + 请求 TTL)`，不缩短已确认
 
 | 修改 | 实际受影响的普通文件 |
 |---|---|
-| `Write`、`SetAttr`、File `WriteAt` / `Truncate` / `SetAttr`、带截断的 Open | 实际目标文件；保留引用按节点身份解析 |
-| `Remove` | 被删除的文件 |
-| `Rename` | 源文件，以及目的地被替换的现有文件 |
+| `Write`、`SetAttr`、File `WriteAt` / `Truncate` / `SetAttr`、ConditionalFileMutation、ResetContent OpenAt | 实际目标文件；保留引用按节点身份解析 |
+| `Remove`、identity `NameRemove`、pending deletion 最终 unlink | 被删除的文件 |
+| `Rename`、identity `NameRename`、ReplaceNode OpenAt | 源文件，以及目的地被替换的现有文件 |
 | 目录创建、删除或改名 | 不能借此绕过实际受影响普通文件的保护；不把整个子树当作文件资源 |
 
 匿名修改只在不冲突于当前 grant 时允许。显式 scope 中的每一份 proof 必须属于当前授权方、Session、Owner 与 generation，仍在有效期内，并且与这次修改的实际文件集合相交。实际受保护的每个文件都必须由调用方有效的 `X` 覆盖。任何过期、失效或无关 proof 都使操作失败，不能退回匿名执行；空 `SetAttr` 与 self-Rename 也验证提供的 scope。
 
 ## 发布与观察的排序
 
-上传、暂存和最终发布是分开的阶段。对象存储的 Reserve 与不可变对象 Put 不持有文件发布许可；SQLite 在修改 entries/nodes 的事务内解析实际目标。删除、改名与属性修改进入同一原生发布检查入口；`limited` 将 scope 和发布能力传到下层。第三方 backend 也必须在实际最终转换中确定资源与效果，不能由包装层提前推断。
+上传、暂存和最终发布是分开的阶段。对象存储的 Reserve 与不可变对象 Put 不持有文件发布许可；SQLite 在修改 entries/nodes 的事务内解析实际目标。路径操作、identity namespace、OpenAt、条件 mutation 与 pending deletion 都进入同一原生发布检查入口；`limited` 将 scope 和发布能力传到下层。第三方 backend 也必须在实际最终转换中确定资源与效果，不能由包装层提前推断。
+
+已经接受的 CloseIntent 后续触发是固定清理效果，不复用已过期的调用方 proof；它仍通过当前 authority 的正常发布门，与有效 S/X grant 排序。若恢复期尚不能证明先前保护已经结束，pending cleanup 等待恢复屏障，不能清空占有状态后抢先删除。名字已经与原对象分离时 intent 明确未执行，不能把 Strong 资源或删除效果转移给同名替代物。
 
 暂存完成且实际受影响资源已经确定后，最终转换在后端的观察排序门内检查权限、proof 相关性、冲突与单调期限，并在该位置取得授权顺序。过期后尚未取得许可的修改失败，即使没有继任持有者。文件资源解析与最终变更不能分成一次先验 `Stat` 和之后不受约束的操作。
 

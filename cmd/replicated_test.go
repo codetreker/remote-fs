@@ -11,9 +11,9 @@ import (
 	"time"
 )
 
-// Tree lookups use the local replica. Directory reads and identity-based attributes
-// reach the authority so current use exclusions and node identity are both enforced.
-func TestWalkingAMountedTreeCachesNamesAndConfirmsIdentityAttributes(t *testing.T) {
+// Names are resolved by parent identity at the authority. Each directory read also holds
+// a scoped directory reference while the path-based enumeration is in progress.
+func TestWalkingAMountedTreeUsesIdentityLookupsAndRetainedDirectories(t *testing.T) {
 	s := serveVolume(t)
 	a := mountpointOn(t, s)
 
@@ -60,14 +60,16 @@ func TestWalkingAMountedTreeCachesNamesAndConfirmsIdentityAttributes(t *testing.
 		}
 	}
 
-	if arrived := s.calls.sinceExcept(before, fileStatNodeCall, fileRenewCall); arrived != "list×4" {
-		t.Fatalf("walking a copied tree sent unexpected named/data requests: %s", arrived)
+	s.calls.waitFileCloses(t, 9)
+	wantCalls := "file-control:file.ack×4 file-control:file.close×4 file-control:file.scope×4 file-control:file.status×4 file:file.lookup-at×26 file:file.open-node-ref×4 file:file.stat×4 list×4"
+	if arrived := s.calls.sinceExcept(before, fileStatNodeCall, fileRenewCall); arrived != wantCalls {
+		t.Fatalf("walking the tree sent %q, want %q", arrived, wantCalls)
 	}
 	identityStats := s.calls.snapshot()[fileStatNodeCall] - before[fileStatNodeCall]
 	if identityStats == 0 {
 		t.Fatal("inode attributes were never confirmed by identity")
 	}
-	t.Logf("walked %d nodes and checked 4 absent names: four authoritative directory reads, %d authoritative identity stats", len(walked), identityStats)
+	t.Logf("walked %d nodes and checked 4 absent names with exact identity lookups, four retained directory reads, and %d inode attribute checks", len(walked), identityStats)
 }
 
 // TestADirectoryRenameKeepsTheIdentitiesBeneathIt.
@@ -119,9 +121,12 @@ func TestADirectoryRenameKeepsTheIdentitiesBeneathIt(t *testing.T) {
 		t.Fatalf("the moved subtree lists %v, want [g]", got)
 	}
 
-	// The rename is the only named mutation; the directory read remains authoritative.
-	if arrived := s.calls.sinceExcept(before, fileStatNodeCall, fileRenewCall); arrived != "list×1 rename×1" {
-		t.Fatalf("renaming a directory and reading its copied subtree sent %q, want one rename and one list", arrived)
+	// The rename is one identity-conditioned mutation. Reading the moved directory opens,
+	// scopes, stats, enumerates, and closes one retained directory reference.
+	s.calls.waitFileCloses(t, 3)
+	wantCalls := "file-control:file.ack×1 file-control:file.close×1 file-control:file.scope×1 file-control:file.status×2 file:file.lookup-at×14 file:file.mutate-name×1 file:file.open-node-ref×1 file:file.stat×1 list×1"
+	if arrived := s.calls.sinceExcept(before, fileStatNodeCall, fileRenewCall); arrived != wantCalls {
+		t.Fatalf("renaming and inspecting the subtree sent %q, want %q", arrived, wantCalls)
 	}
 	t.Logf("renamed and inspected the subtree with %d authoritative identity stats", s.calls.snapshot()[fileStatNodeCall]-before[fileStatNodeCall])
 }
@@ -139,14 +144,16 @@ func TestAVolumeWithoutPublishedLogIsMountedWithoutACopy(t *testing.T) {
 		t.Fatalf("the mountpoint lists %v, want [a.txt]", got)
 	}
 
-	// Named lookup must also reach the authority when no replica is published.
+	// Exclude the setup reference cleanup so the measured calls belong only to Lstat.
+	s.calls.waitFileCloses(t, 2)
 	before := s.calls.snapshot()
 	if _, err := os.Lstat(filepath.Join(a, "a.txt")); err != nil {
 		t.Fatalf("stat a.txt: %v", err)
 	}
 	arrived := s.calls.since(before)
-	if s.calls.snapshot()["stat"] == before["stat"] {
-		t.Fatalf("a stat without published replication sent %q to the server, and with no copy behind it it has nowhere else to come from", arrived)
+	wantCalls := "file:file.lookup-at×1 file:file.stat-node×1"
+	if arrived != wantCalls {
+		t.Fatalf("a stat without published replication sent %q, want %q", arrived, wantCalls)
 	}
 	t.Logf("one stat through the mountpoint: %s", arrived)
 	if got, err := s.authoritative.Read(t.Context(), "a.txt"); err != nil || string(got) != "hello\n" {

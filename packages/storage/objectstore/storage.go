@@ -252,7 +252,14 @@ func (s *Storage) maintain(ctx context.Context, interval time.Duration, batch in
 }
 
 func (s *Storage) maintainBatch(ctx context.Context, batch int) {
+	cleanupErr := s.retryReferenceCleanup(ctx, batch)
+	cleanupErr = errors.Join(cleanupErr, s.retryPendingUnlinks(ctx, batch))
 	removed, err := s.runBackgroundSweep(ctx, batch)
+	if cleanupErr != nil {
+		s.statusMu.Lock()
+		s.maintenanceStatus.LastSweepError = errors.Join(s.maintenanceStatus.LastSweepError, cleanupErr)
+		s.statusMu.Unlock()
+	}
 	if err == nil && removed == batch {
 		s.sweepAfterMutation()
 	}

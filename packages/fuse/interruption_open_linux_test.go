@@ -241,9 +241,9 @@ type interruptedOpenSession struct {
 	observe *interruptedOpenStorage
 }
 
-func (s *interruptedOpenSession) OpenFile(ctx context.Context, path string, o storage.FileOpenOptions) (storage.File, error) {
+func (s *interruptedOpenSession) OpenNode(ctx context.Context, id uint64, o storage.FileOpenOptions) (storage.File, error) {
 	s.observe.entered <- ctx
-	file, err := s.FileSession.OpenFile(ctx, path, o)
+	file, err := s.FileSession.OpenNode(ctx, id, o)
 	s.observe.results <- openSignalResult{err: err, acks: s.observe.gate.acks.Load(), closed: s.observe.gate.closed.Load()}
 	return file, err
 }
@@ -277,7 +277,7 @@ func (g *openReplyGate) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 	}
 	switch request.Op {
-	case storage.OpFileOpen:
+	case storage.OpFileOpenNode:
 		g.opens.Add(1)
 	case storage.OpFileAck:
 		g.acks.Add(1)
@@ -292,7 +292,7 @@ func (g *openReplyGate) RoundTrip(r *http.Request) (*http.Response, error) {
 		g.closed.Add(1)
 		g.closedEvents <- struct{}{}
 	}
-	if request.Op != storage.OpFileOpen {
+	if request.Op != storage.OpFileOpenNode {
 		return response, nil
 	}
 	hold := false

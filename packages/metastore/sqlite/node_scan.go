@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"database/sql"
 	"fmt"
 	"syscall"
@@ -27,14 +28,17 @@ var nodeHeaderColumns = fmt.Sprintf(`
 	CASE WHEN typeof(n.change_nsec)='integer' THEN n.change_nsec END,
 	CASE WHEN typeof(n.content) IN ('text','null') THEN coalesce(length(CAST(n.content AS BLOB)),0) ELSE -1 END,
 	CASE WHEN typeof(n.metadata)='blob' THEN length(n.metadata) ELSE -1 END,
+	CASE WHEN typeof(n.link_target)='blob' THEN length(n.link_target) ELSE -1 END,
 	CASE WHEN typeof(n.birth_sec) IN ('integer','null') AND typeof(n.birth_nsec) IN ('integer','null')
 		AND typeof(n.change_sec) IN ('integer','null') AND typeof(n.change_nsec) IN ('integer','null')
 		AND (n.content IS NULL OR (typeof(n.content)='text' AND length(CAST(n.content AS BLOB))>0))
-		AND typeof(n.metadata)='blob' AND length(n.metadata)<=%d THEN 1 ELSE 0 END`, storage.MaxMetadataBytes)
+		AND typeof(n.metadata)='blob' AND length(n.metadata)<=%d
+		AND typeof(n.link_target)='blob' AND length(n.link_target)<=%d THEN 1 ELSE 0 END`, storage.MaxMetadataBytes, storage.MaxLinkTargetBytes)
 
 var nodeColumns = nodeHeaderColumns + fmt.Sprintf(`,
 	CASE WHEN typeof(n.content)='text' THEN n.content END,
-	CASE WHEN typeof(n.metadata)='blob' AND length(n.metadata)<=%d THEN n.metadata END`, storage.MaxMetadataBytes)
+	CASE WHEN typeof(n.metadata)='blob' AND length(n.metadata)<=%d THEN n.metadata END,
+	CASE WHEN typeof(n.link_target)='blob' AND length(n.link_target)<=%d THEN n.link_target END`, storage.MaxMetadataBytes, storage.MaxLinkTargetBytes)
 
 var nodeAttrColumns = nodeHeaderColumns
 
@@ -46,6 +50,7 @@ type nodeHeader struct {
 	changeSec, changeNsec sql.NullInt64
 	contentBytes          int64
 	metadataBytes         int64
+	targetBytes           int64
 	valid                 int64
 }
 
@@ -53,21 +58,22 @@ type nodeAttrScan = nodeHeader
 
 func (s *nodeHeader) fields() []any {
 	return []any{&s.id, &s.kind, &s.size, &s.atimeSec, &s.atimeNsec, &s.mtimeSec, &s.mtimeNsec,
-		&s.birthSec, &s.birthNsec, &s.changeSec, &s.changeNsec, &s.contentBytes, &s.metadataBytes, &s.valid}
+		&s.birthSec, &s.birthNsec, &s.changeSec, &s.changeNsec, &s.contentBytes, &s.metadataBytes, &s.targetBytes, &s.valid}
 }
 
 func (s *nodeHeader) node() (metastore.Node, error) {
 	if s.valid != 1 || s.id < 1 || s.kind < int64(storage.NodeRegular) || s.kind > int64(storage.NodeSymlink) || s.size < 0 ||
 		s.atimeNsec < 0 || s.atimeNsec >= int64(time.Second) || s.mtimeNsec < 0 || s.mtimeNsec >= int64(time.Second) ||
-		s.contentBytes < 0 || s.metadataBytes < 6 {
+		s.contentBytes < 0 || s.metadataBytes < 6 || s.targetBytes < 0 {
 		return metastore.Node{}, fmt.Errorf("invalid stored node metadata: %w", syscall.EIO)
 	}
-	if s.metadataBytes > storage.MaxMetadataBytes {
+	if s.metadataBytes > storage.MaxMetadataBytes || s.targetBytes > storage.MaxLinkTargetBytes {
 		return metastore.Node{}, fmt.Errorf("stored node metadata exceeds its bound: %w", syscall.EFBIG)
 	}
 	kind := storage.NodeKind(s.kind)
 	if kind == storage.NodeDirectory && (s.size != 0 || s.contentBytes != 0) ||
-		kind == storage.NodeSymlink && s.contentBytes != 0 {
+		kind == storage.NodeSymlink && (s.targetBytes == 0 || s.targetBytes != s.size || s.contentBytes != 0) ||
+		kind != storage.NodeSymlink && s.targetBytes != 0 {
 		return metastore.Node{}, fmt.Errorf("stored node kind and content disagree: %w", syscall.EIO)
 	}
 	birth, err := optionalStoredTime(s.birthSec, s.birthNsec)
@@ -103,10 +109,11 @@ type nodeScan struct {
 	nodeHeader
 	content  sql.NullString
 	metadata []byte
+	target   []byte
 }
 
 func (s *nodeScan) fields() []any {
-	return append(s.nodeHeader.fields(), &s.content, &s.metadata)
+	return append(s.nodeHeader.fields(), &s.content, &s.metadata, &s.target)
 }
 
 func (s *nodeScan) node() (metastore.Node, error) {
@@ -114,14 +121,14 @@ func (s *nodeScan) node() (metastore.Node, error) {
 	if err != nil {
 		return metastore.Node{}, err
 	}
-	if int64(len(s.content.String)) != s.contentBytes || int64(len(s.metadata)) != s.metadataBytes {
+	if int64(len(s.content.String)) != s.contentBytes || int64(len(s.metadata)) != s.metadataBytes || int64(len(s.target)) != s.targetBytes {
 		return metastore.Node{}, fmt.Errorf("stored node payload changed after admission: %w", syscall.EIO)
 	}
 	metadata, err := storage.DecodeMetadata(s.metadata)
 	if err != nil {
 		return metastore.Node{}, err
 	}
-	node.Content, node.Metadata = metastore.Key(s.content.String), metadata
+	node.Content, node.Metadata, node.LinkTarget = metastore.Key(s.content.String), metadata, bytes.Clone(s.target)
 	return node, nil
 }
 

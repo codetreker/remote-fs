@@ -131,6 +131,14 @@ func (s *signalFileSession) OpenNode(ctx context.Context, id uint64, options sto
 	return file, nil
 }
 
+func (s *signalFileSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
+	result, err := s.AtomicFileOpener.OpenAt(ctx, name, options)
+	if result.File != nil && s.wrap != nil {
+		result.File = s.wrap(result.File)
+	}
+	return result, err
+}
+
 type signalFileCapabilities struct {
 	storage.File
 	storage.ScopedReference

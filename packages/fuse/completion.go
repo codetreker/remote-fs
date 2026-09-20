@@ -20,9 +20,16 @@ func (v *volume) cleanupContext(ctx context.Context) (context.Context, context.C
 }
 
 func (v *volume) closeUnreturnedFile(ctx context.Context, file storage.File, cause error, changed bool) error {
+	return v.closeUnreturnedReference(ctx, file, cause, changed)
+}
+
+func (v *volume) closeUnreturnedReference(ctx context.Context, reference interface{ Close(context.Context) error }, cause error, changed bool) error {
+	if reference == nil {
+		return afterMutation(changed, cause)
+	}
 	completion, cancel := v.cleanupContext(ctx)
 	defer cancel()
-	closeErr := v.closeError(file.Close(completion))
+	closeErr := v.closeError(reference.Close(completion))
 	if closeErr != nil {
 		return afterMutation(changed, errors.Join(cause, closeErr))
 	}

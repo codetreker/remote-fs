@@ -11,10 +11,44 @@ import (
 
 type capabilityProbe struct {
 	storage.FileSession
-	checkErr error
-	callErr  error
-	attempt  storage.RangeAttempt
-	metadata storage.OpaquePayload
+	checkErr     error
+	callErr      error
+	attempt      storage.RangeAttempt
+	metadata     storage.OpaquePayload
+	open         storage.OpenResult
+	node         storage.NodeOpenResult
+	name         storage.NameResult
+	action       storage.FileActionReceipt
+	deleteStatus storage.DeleteIntentStatus
+}
+
+func (p *capabilityProbe) CheckAtomicFileOpen() error { return p.checkErr }
+func (p *capabilityProbe) OpenAt(context.Context, storage.ChildName, storage.OpenAtOptions) (storage.OpenResult, error) {
+	return p.open, p.callErr
+}
+func (p *capabilityProbe) CheckNamespaceAccess() error { return p.checkErr }
+func (p *capabilityProbe) LookupAt(context.Context, storage.ChildName) (storage.Attr, error) {
+	return storage.Attr{ID: 3, Kind: storage.NodeRegular}, p.callErr
+}
+func (p *capabilityProbe) MutateName(context.Context, storage.NameCommand) (storage.NameResult, error) {
+	return p.name, p.callErr
+}
+func (p *capabilityProbe) CheckNodeReferences() error { return p.checkErr }
+func (p *capabilityProbe) OpenNodeRef(context.Context, uint64, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	return p.node, p.callErr
+}
+func (p *capabilityProbe) OpenChildRef(context.Context, storage.ChildName, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	return p.node, p.callErr
+}
+func (p *capabilityProbe) CheckFileActions() error { return p.checkErr }
+func (p *capabilityProbe) QueryFileAction(context.Context, storage.FileActionID) (storage.FileActionReceipt, error) {
+	return p.action, p.callErr
+}
+func (p *capabilityProbe) QueryDeleteIntent(context.Context, storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+	return p.deleteStatus, p.callErr
+}
+func (p *capabilityProbe) AcknowledgeDeleteIntent(context.Context, storage.AcknowledgeDeleteIntentCommand) error {
+	return p.callErr
 }
 
 func (p *capabilityProbe) CheckMetadataAccess() error { return p.checkErr }
@@ -48,7 +82,16 @@ type referenceProbe struct {
 	checkErr error
 	callErr  error
 	metadata storage.OpaquePayload
+	state    storage.ReferenceState
 }
+
+func (p *referenceProbe) Stat(context.Context) (storage.Attr, error) {
+	return p.state.Attr, p.callErr
+}
+func (p *referenceProbe) SetAttr(context.Context, storage.AttrChange) (storage.Attr, error) {
+	return p.state.Attr, p.callErr
+}
+func (p *referenceProbe) Close(context.Context) error { return p.callErr }
 
 func (p *referenceProbe) CheckScopedReference() error { return p.checkErr }
 func (p *referenceProbe) Scope(context.Context) (storage.UseScope, error) {
@@ -57,6 +100,21 @@ func (p *referenceProbe) Scope(context.Context) (storage.UseScope, error) {
 func (p *referenceProbe) CheckMetadataAccess() error { return p.checkErr }
 func (p *referenceProbe) SetMetadata(context.Context, string, []byte, []byte) (storage.OpaquePayload, error) {
 	return p.metadata, p.callErr
+}
+func (p *referenceProbe) CheckReferenceState() error { return p.checkErr }
+func (p *referenceProbe) State(context.Context) (storage.ReferenceState, error) {
+	return p.state, p.callErr
+}
+func (p *referenceProbe) CheckDeleteIntent() error { return p.checkErr }
+func (p *referenceProbe) SetPendingUnlink(context.Context, storage.PendingUnlinkCommand) (storage.ReferenceState, error) {
+	return p.state, p.callErr
+}
+func (p *referenceProbe) ClearPendingUnlink(context.Context, storage.ClearPendingUnlinkCommand) (storage.ReferenceState, error) {
+	return p.state, p.callErr
+}
+func (p *referenceProbe) CheckConditionalFileMutation() error { return p.checkErr }
+func (p *referenceProbe) MutateFile(context.Context, storage.FileMutation) (storage.Attr, error) {
+	return p.state.Attr, p.callErr
 }
 
 func TestCapabilityWrappersPreserveChecksAndPartialResults(t *testing.T) {
@@ -158,5 +216,156 @@ func TestCapabilityWrappersPreserveChecksAndPartialResults(t *testing.T) {
 	}
 	if err := missingFile.(storage.ReferenceMetadataAccess).CheckMetadataAccess(); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("missing reference metadata check=%v", err)
+	}
+}
+
+func TestIdentityCapabilityWrappersPreservePartialResultsAndReferences(t *testing.T) {
+	failure := errors.New("native result delivery failed")
+	action, err := storage.NewFileActionID(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := storage.NewDeleteIntentID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attr := storage.Attr{ID: 3, Kind: storage.NodeRegular, Metadata: map[string]storage.OpaquePayload{
+		"test.value": {Version: []byte{1}, Data: []byte("value")},
+	}}
+	nativeReference := &referenceProbe{callErr: failure, state: storage.ReferenceState{Attr: attr, PendingUnlink: true, PendingGeneration: []byte{2}}}
+	probe := &capabilityProbe{
+		callErr:      failure,
+		open:         storage.OpenResult{File: nativeReference, Attr: attr, Outcome: storage.Created},
+		node:         storage.NodeOpenResult{Reference: nativeReference, Attr: attr, Outcome: storage.Opened},
+		name:         storage.NameResult{Attr: &attr},
+		action:       storage.FileActionReceipt{Action: action, Operation: storage.OpFileMutateName, Outcome: storage.FileActionCompleted},
+		deleteStatus: storage.DeleteIntentStatus{ID: intent, NodeID: attr.ID, Outcome: storage.DeleteIntentPending},
+	}
+	wrapper := &fileSession{FileSession: probe, storage: &Storage{limit: MinLimit}}
+	for name, check := range map[string]func() error{
+		"atomic open": wrapper.CheckAtomicFileOpen,
+		"namespace":   wrapper.CheckNamespaceAccess,
+		"node refs":   wrapper.CheckNodeReferences,
+		"actions":     wrapper.CheckFileActions,
+	} {
+		if err := check(); err != nil {
+			t.Fatalf("%s check=%v", name, err)
+		}
+	}
+	opened, err := wrapper.OpenAt(t.Context(), storage.ChildName{}, storage.OpenAtOptions{})
+	if !errors.Is(err, failure) || opened.File == nil || opened.Attr.ID != attr.ID || opened.Outcome != storage.Created {
+		t.Fatalf("atomic open=%+v error=%v", opened, err)
+	}
+	reference, err := wrapper.OpenNodeRef(t.Context(), attr.ID, storage.NodeRefOptions{})
+	if !errors.Is(err, failure) || reference.Reference == nil || reference.Attr.ID != attr.ID {
+		t.Fatalf("node reference=%+v error=%v", reference, err)
+	}
+	if _, ok := reference.Reference.(*nodeReference); !ok {
+		t.Fatalf("node reference was not wrapped: %T", reference.Reference)
+	}
+	child, err := wrapper.OpenChildRef(t.Context(), storage.ChildName{}, storage.NodeRefOptions{})
+	if !errors.Is(err, failure) || child.Reference == nil || child.Attr.ID != attr.ID {
+		t.Fatalf("child reference=%+v error=%v", child, err)
+	}
+	if lookedUp, err := wrapper.LookupAt(t.Context(), storage.ChildName{}); !errors.Is(err, failure) || lookedUp.ID != attr.ID {
+		t.Fatalf("lookup=%+v error=%v", lookedUp, err)
+	}
+	result, err := wrapper.MutateName(t.Context(), storage.NameCommand{})
+	if !errors.Is(err, failure) || result.Attr == nil || result.Attr.ID != attr.ID {
+		t.Fatalf("name result=%+v error=%v", result, err)
+	}
+	if receipt, err := wrapper.QueryFileAction(t.Context(), action); !errors.Is(err, failure) || receipt.Action != action {
+		t.Fatalf("action receipt=%+v error=%v", receipt, err)
+	}
+	if status, err := wrapper.QueryDeleteIntent(t.Context(), intent); !errors.Is(err, failure) || status.ID != intent {
+		t.Fatalf("delete status=%+v error=%v", status, err)
+	}
+	if err := wrapper.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: action, Intent: intent}); !errors.Is(err, failure) {
+		t.Fatalf("acknowledge delete intent=%v", err)
+	}
+	state, err := reference.Reference.State(t.Context())
+	if !errors.Is(err, failure) || state.Attr.ID != attr.ID || !state.PendingUnlink {
+		t.Fatalf("reference state=%+v error=%v", state, err)
+	}
+	deleteRef := reference.Reference.(storage.DeleteIntent)
+	if err := deleteRef.CheckDeleteIntent(); err != nil {
+		t.Fatal(err)
+	}
+	if state, err := deleteRef.SetPendingUnlink(t.Context(), storage.PendingUnlinkCommand{}); !errors.Is(err, failure) || state.Attr.ID != attr.ID {
+		t.Fatalf("pending state=%+v error=%v", state, err)
+	}
+	if state, err := deleteRef.ClearPendingUnlink(t.Context(), storage.ClearPendingUnlinkCommand{}); !errors.Is(err, failure) || state.Attr.ID != attr.ID {
+		t.Fatalf("cleared state=%+v error=%v", state, err)
+	}
+	file := opened.File.(storage.ConditionalFileMutation)
+	if err := file.CheckConditionalFileMutation(); err != nil {
+		t.Fatal(err)
+	}
+	if mutated, err := file.MutateFile(t.Context(), storage.FileMutation{}); !errors.Is(err, failure) || mutated.ID != attr.ID {
+		t.Fatalf("conditional attr=%+v error=%v", mutated, err)
+	}
+	wrappedReference := reference.Reference
+	if changed, err := wrappedReference.SetAttr(t.Context(), storage.AttrChange{}); !errors.Is(err, failure) || changed.ID != attr.ID {
+		t.Fatalf("reference setattr=%+v error=%v", changed, err)
+	}
+	scoped := wrappedReference.(storage.ScopedReference)
+	if err := scoped.CheckScopedReference(); err != nil {
+		t.Fatal(err)
+	}
+	if scope, err := scoped.Scope(t.Context()); !errors.Is(err, failure) || scope.Token != "scope" {
+		t.Fatalf("reference scope=%+v error=%v", scope, err)
+	}
+	stateAccess := wrappedReference.(storage.ReferenceStateAccess)
+	if err := stateAccess.CheckReferenceState(); err != nil {
+		t.Fatal(err)
+	}
+	if err := wrappedReference.Close(t.Context()); !errors.Is(err, failure) {
+		t.Fatalf("reference close=%v", err)
+	}
+}
+
+type maintenanceProbe struct {
+	storage.BoundedStorage
+	initialized int64
+	outerCalls  int
+}
+
+func (*maintenanceProbe) CheckPublicationAccounting() error { return nil }
+func (*maintenanceProbe) CheckMaintenanceAccounting() error { return nil }
+func (p *maintenanceProbe) BindMaintenanceAccounting(ctx context.Context, chain storage.PublicationAccountingChain, initialize func(int64)) error {
+	initialize(7)
+	p.initialized = 7
+	settle, err := storage.PreparePublication(storage.WithPublicationAccountingChain(ctx, chain), 7, 5)
+	if err != nil {
+		return err
+	}
+	return settle(storage.PublicationApplied)
+}
+
+func TestMaintenanceAccountingComposesTheAllowanceHook(t *testing.T) {
+	probe := &maintenanceProbe{}
+	wrapper := &Storage{backing: probe, limit: MinLimit, count: 7}
+	if err := wrapper.CheckMaintenanceAccounting(); err != nil {
+		t.Fatal(err)
+	}
+	chain := (storage.PublicationAccountingChain{}).With(func(previous, next int64) (storage.PublicationSettlement, error) {
+		if previous != 7 || next != 5 {
+			t.Fatalf("outer accounting=%d -> %d", previous, next)
+		}
+		probe.outerCalls++
+		return func(storage.PublicationResult) error { return nil }, nil
+	})
+	initialized := int64(-1)
+	if err := wrapper.BindMaintenanceAccounting(t.Context(), chain, func(used int64) { initialized = used }); err != nil {
+		t.Fatal(err)
+	}
+	if initialized != probe.initialized || probe.outerCalls != 1 {
+		t.Fatalf("initialized=%d native=%d outer calls=%d", initialized, probe.initialized, probe.outerCalls)
+	}
+	wrapper.countMu.Lock()
+	count := wrapper.count
+	wrapper.countMu.Unlock()
+	if count != 5 {
+		t.Fatalf("limited maintenance count=%d, want 5", count)
 	}
 }

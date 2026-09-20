@@ -42,12 +42,13 @@ func metadataValues() map[string]any {
 		"atime_sec": int64(-100), "atime_nsec": int64(123), "mtime_sec": int64(100), "mtime_nsec": int64(456),
 		"content": "body", "recorded_sec": int64(200), "recorded_nsec": int64(0),
 		"birth_sec": nil, "birth_nsec": nil, "change_sec": nil, "change_nsec": nil,
-		"metadata": []byte{'R', 'F', 'M', 1, 0, 0},
+		"metadata":    []byte{'R', 'F', 'M', 1, 0, 0},
+		"link_target": []byte{},
 	}
 }
 
 func metadataQuery(db *sql.DB, values map[string]any) *sql.Row {
-	columns := []string{"position", "previous_position", "volume", "kind", "parent", "name", "from_parent", "from_name", "node", "node_kind", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content", "recorded_sec", "recorded_nsec", "birth_sec", "birth_nsec", "change_sec", "change_nsec", "metadata"}
+	columns := []string{"position", "previous_position", "volume", "kind", "parent", "name", "from_parent", "from_name", "node", "node_kind", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content", "recorded_sec", "recorded_nsec", "birth_sec", "birth_nsec", "change_sec", "change_nsec", "metadata", "link_target"}
 	var aliases []string
 	var args []any
 	for _, column := range columns {
@@ -75,7 +76,7 @@ func TestMetadataDecoderPreservesScalarsAndDefersPayloads(t *testing.T) {
 		want.Name = []byte{}
 		lengths := metastore.ChangePayloadLengths{Name: 4, Content: 4, Metadata: 6}
 		if kind == metastore.Removed {
-			for _, column := range []string{"node", "node_kind", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content", "birth_sec", "birth_nsec", "change_sec", "change_nsec", "metadata"} {
+			for _, column := range []string{"node", "node_kind", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content", "birth_sec", "birth_nsec", "change_sec", "change_nsec", "metadata", "link_target"} {
 				values[column] = nil
 			}
 			lengths.Content = 0

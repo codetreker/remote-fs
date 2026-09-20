@@ -100,7 +100,30 @@ func OpenLocking(ctx context.Context, config LockingConfig) (*LockingStore, erro
 	if err := store.EnableLocks(ctx, config.Locks); err != nil {
 		return cleanup(err)
 	}
+	if err := store.RetryPendingUnlinks(ctx, store.maxDeleteIntents); err != nil && !pendingRecoveryDeferred(err) {
+		return cleanup(err)
+	}
 	return opened, nil
+}
+
+func pendingRecoveryDeferred(err error) bool {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !pendingRecoveryDeferred(child) {
+				return false
+			}
+		}
+		return true
+	}
+	switch locking.CodeOf(err) {
+	case locking.Conflict, locking.Recovering:
+		return true
+	}
+	return false
 }
 
 func prepareOwnedLeaseVolume(ctx context.Context, db *sql.DB, volume, storeID string, window Window, maxRecords, maxBytes, maxMetadataBytes int64, opaqueMetadataVersions bool) (int64, int64, error) {

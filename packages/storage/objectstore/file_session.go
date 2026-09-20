@@ -34,6 +34,13 @@ type rangeAuthority interface {
 	CheckRangeControl() error
 }
 
+type retainedReference interface {
+	retire() error
+	drainAndRelease() error
+	Close(context.Context) error
+	retryClose(context.Context) (bool, error)
+}
+
 // Heartbeats, lock acquisition, and lock reconciliation have independent capacity.
 // Staged data and new acquisitions cannot consume release or renewal admission.
 const (
@@ -67,7 +74,8 @@ type fileSession struct {
 	controls           int
 	advisoryOperations int
 	cleanupOperations  int
-	files              map[*openFile]struct{}
+	files              map[retainedReference]struct{}
+	actions            map[storage.FileActionID]*fileAction
 	opening            int
 	identityOps        sync.WaitGroup
 	timer              *time.Timer
@@ -143,7 +151,7 @@ func (s *Storage) NewFileSession(ctx context.Context, options storage.FileSessio
 	fs := &fileSession{storage: s, native: native, domain: domain, options: options,
 		cleanup: context.WithoutCancel(ctx), epoch: hex.EncodeToString(nonce[:]),
 		active: true, expires: time.Now().Add(options.Lease), revision: 1,
-		files: make(map[*openFile]struct{})}
+		files: make(map[retainedReference]struct{}), actions: make(map[storage.FileActionID]*fileAction)}
 	fs.locks, err = domain.NewSession(options, fs.fence)
 	if err != nil {
 		return nil, err
@@ -244,33 +252,56 @@ func (fs *fileSession) OpenNode(ctx context.Context, id uint64, options storage.
 }
 
 func (fs *fileSession) open(ctx context.Context, options storage.FileOpenOptions, open func() (metastore.File, error)) (storage.File, error) {
-	done, err := fs.begin(ctx, true)
+	done, err := fs.beginOpen(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer done()
+	native, err := open()
+	if native == nil {
+		return nil, fs.finishOpen(nil, err)
+	}
+	f := &openFile{session: fs, native: native, options: options, active: true}
+	err = fs.finishOpen(f, err)
+	if err != nil {
+		err = errors.Join(err, f.retire())
+		f.startClose()
+		return nil, err
+	}
+	return f, nil
+}
+
+func (fs *fileSession) beginOpen(ctx context.Context) (func(), error) {
+	done, err := fs.begin(ctx, true)
+	if err != nil {
+		return nil, err
+	}
 	fs.mu.Lock()
 	if len(fs.files)+fs.opening >= fs.options.MaxFiles {
 		fs.mu.Unlock()
+		done()
 		return nil, syscall.EMFILE
 	}
 	fs.opening++
 	fs.mu.Unlock()
-	native, err := open()
+	return done, nil
+}
+
+func (fs *fileSession) finishOpen(reference retainedReference, err error) error {
 	fs.mu.Lock()
 	fs.opening--
-	if err != nil {
-		fs.mu.Unlock()
-		return nil, err
+	if reference != nil {
+		fs.files[reference] = struct{}{}
 	}
-	f := &openFile{session: fs, native: native, options: options, active: true}
-	fs.files[f] = struct{}{}
 	active := fs.active && time.Now().Before(fs.expires)
 	fs.mu.Unlock()
-	if !active {
-		return nil, errors.Join(syscall.ESTALE, f.retire())
+	if reference != nil && !active {
+		return errors.Join(err, syscall.ESTALE, reference.retire())
 	}
-	return f, nil
+	if reference == nil && err == nil {
+		return syscall.EIO
+	}
+	return err
 }
 
 func (fs *fileSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
@@ -347,7 +378,7 @@ func (fs *fileSession) health(ctx context.Context) error {
 
 func (fs *fileSession) operationContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	_, _, timeout := fs.domain.FileOperationLimits()
-	return context.WithTimeout(ctx, timeout)
+	return context.WithTimeout(metastore.WithReferenceSession(ctx, fs.locks), timeout)
 }
 
 func (fs *fileSession) publicationAllowed() error {
@@ -379,7 +410,7 @@ func (fs *fileSession) fence() error {
 	// Keep advisory grants until those operations join the retained set.
 	fs.identityOps.Wait()
 	fs.mu.Lock()
-	files := make([]*openFile, 0, len(fs.files))
+	files := make([]retainedReference, 0, len(fs.files))
 	for f := range fs.files {
 		files = append(files, f)
 	}
@@ -423,7 +454,7 @@ func (fs *fileSession) finishClose() {
 	err := fs.locks.Retire(fs.cleanup)
 	if err == nil {
 		fs.mu.Lock()
-		files := make([]*openFile, 0, len(fs.files))
+		files := make([]retainedReference, 0, len(fs.files))
 		for f := range fs.files {
 			files = append(files, f)
 		}

@@ -17,7 +17,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -52,9 +51,16 @@ type servedFileSession struct {
 }
 
 type servedFile struct {
-	native  storage.File
-	pending time.Time
-	closing bool
+	native    retainedReference
+	pending   time.Time
+	closing   bool
+	replaying int
+}
+
+type retainedReference interface {
+	Stat(context.Context) (storage.Attr, error)
+	SetAttr(context.Context, storage.AttrChange) (storage.Attr, error)
+	Close(context.Context) error
 }
 
 type servedFileAction struct {
@@ -64,6 +70,7 @@ type servedFileAction struct {
 	done           chan struct{}
 	expires        time.Time
 	response       fileResponse
+	file           string
 	err            error
 	barrierPending bool
 }
@@ -159,7 +166,7 @@ func (r *fileRegistry) run() {
 			pending := make(map[string]*servedFile)
 			if !retire {
 				for cap, f := range s.files {
-					if !f.closing && !f.pending.IsZero() && !now.Before(f.pending) {
+					if !f.closing && f.replaying == 0 && !f.pending.IsZero() && !now.Before(f.pending) {
 						f.closing = true
 						pending[cap] = f
 					}
@@ -294,6 +301,12 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 		writeError(syscall.EFBIG)
 		return
 	}
+	if req.Mutation != nil {
+		if err := req.Mutation.storage().CheckDataLimit(h.maxWriteBytes); err != nil {
+			writeError(err)
+			return
+		}
+	}
 	if req.Op == storage.OpFileWrite && int64(len(req.Data)) > h.maxWriteBytes {
 		writeError(syscall.EFBIG)
 		return
@@ -320,11 +333,7 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 	if present || fileMutation(req.Op) {
 		r = r.WithContext(locking.WithScope(r.Context(), scope))
 	}
-	access := authz.AccessRequest{Operation: req.Op}
-	if req.Op == storage.OpFileOpen || req.Op == storage.OpFileOpenNode {
-		access.Open = req.Open.OpenAccess
-	}
-	if err := h.authorize(r.Context(), access); err != nil {
+	if err := h.authorizeFile(r.Context(), req); err != nil {
 		writeError(err)
 		return
 	}
@@ -338,10 +347,47 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 			h.writeFileResponse(w, StatusStorageError, ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error(), CapabilityCode: capabilityErrorCode(err), Attempt: response.Attempt}, control)
 			return
 		}
+		var recorded *recordedFileError
+		if errors.As(err, &recorded) {
+			body := fileErrorResponse(err, true)
+			body.FileResult = partialFileResult(req, response)
+			h.writeFileResponse(w, StatusStorageError, body, control)
+			return
+		}
+		if result := partialFileResult(req, response); result != nil {
+			body := fileErrorResponse(err, false)
+			body.FileResult = result
+			h.writeFileResponse(w, StatusStorageError, body, control)
+			return
+		}
 		writeError(err)
 		return
 	}
 	h.writeFileResponse(w, http.StatusOK, response, control)
+}
+
+func partialFileResult(request fileRequest, response fileResponse) *fileResponse {
+	include := false
+	switch request.Op {
+	case storage.OpFileQueryAction:
+		include = response.ActionReceipt != nil
+	case storage.OpFileQueryDeleteIntent:
+		include = response.DeleteStatus != nil
+	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
+		include = response.File != "" || response.Attr != nil || response.Outcome != 0 || response.Barrier != nil
+	case storage.OpFileMutateName, storage.OpFileMutate:
+		include = response.Attr != nil || response.Barrier != nil
+	case storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
+		include = response.State != nil || response.Barrier != nil
+	}
+	if !include {
+		return nil
+	}
+	copy := response
+	if copy.Data == nil {
+		copy.Data = []byte{}
+	}
+	return &copy
 }
 
 func fileErrorResponse(err error, retained bool) ErrorResponse {
@@ -375,6 +421,8 @@ func validateFileArguments(req fileRequest, maximum storage.FileSessionOptions) 
 		return err
 	case storage.OpFileOpenNode:
 		return req.Open.CheckNode(req.Node)
+	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef, storage.OpFileLookupAt, storage.OpFileMutateName:
+		return validateCapabilityArguments(req)
 	case storage.OpFileRead:
 		if req.Offset < 0 || req.Length < 0 {
 			return syscall.EINVAL
@@ -428,30 +476,43 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 				session.mu.Unlock()
 				return fileResponse{}, syscall.EINVAL
 			}
-			session.mu.Unlock()
+			replayedFile := ""
 			select {
 			case <-previous.done:
-				previous.retryMu.Lock()
-				defer previous.retryMu.Unlock()
-				if previous.barrierPending {
-					response, retryErr := h.finishFileMutation(ctx, previous.response)
-					previous.response = response
-					previous.err = retainFileActionError(retryErr)
-					previous.barrierPending = retryErr != nil
+				replayedFile = beginSemanticOpenReplay(session, req, previous)
+				session.mu.Unlock()
+			default:
+				session.mu.Unlock()
+				select {
+				case <-previous.done:
+					session.mu.Lock()
+					replayedFile = beginSemanticOpenReplay(session, req, previous)
+					session.mu.Unlock()
+				case <-ctx.Done():
+					return fileResponse{}, operationFailure(Request{Op: OpFile}, ctx.Err(), false)
 				}
-				if previous.err != nil && !previous.barrierPending {
-					return previous.response, &recordedFileError{cause: previous.err}
-				}
-				return previous.response, previous.err
-			case <-ctx.Done():
-				return fileResponse{}, operationFailure(Request{Op: OpFile}, ctx.Err(), false)
 			}
+			previous.retryMu.Lock()
+			defer previous.retryMu.Unlock()
+			if replayedFile != "" {
+				defer h.finishSemanticOpenReplay(session, replayedFile)
+			}
+			if previous.barrierPending {
+				response, retryErr := h.finishFileMutation(ctx, previous.response)
+				previous.response = response
+				previous.err = retainFileActionError(retryErr)
+				previous.barrierPending = retryErr != nil
+			}
+			if previous.err != nil && !previous.barrierPending {
+				return previous.response, &recordedFileError{cause: previous.err}
+			}
+			return previous.response, previous.err
 		}
 		if actionEpoch != epoch {
 			session.mu.Unlock()
 			// The immediately preceding window still has every admitted result.
 			// Absence here proves this action never ran; older windows cannot prove it.
-			if actionEpoch+1 == epoch {
+			if actionEpoch+1 == epoch && semanticFileAction(req) == "" {
 				return fileResponse{Epoch: epoch, Retry: true}, nil
 			}
 			return fileResponse{}, syscall.ESTALE
@@ -484,8 +545,10 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 		var barrierFailure *fileBarrierError
 		session.mu.Lock()
 		action.response = response
+		action.file = response.File
 		action.err = retainFileActionError(err)
 		action.barrierPending = errors.As(err, &barrierFailure)
+		retainSemanticOpenCapability(session, req, response, action.expires)
 		close(action.done)
 		session.mu.Unlock()
 		return response, err
@@ -498,6 +561,51 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 	response, err := h.performFile(ctx, session, req)
 	response.Epoch = epoch
 	return response, err
+}
+
+func (h *Handler) semanticOpenReplayExpiry(session *servedFileSession, actionExpiry time.Time) time.Time {
+	handoffExpiry := time.Now().Add(h.files.limits.PendingAck)
+	if handoffExpiry.After(session.expires) {
+		handoffExpiry = session.expires
+	}
+	if handoffExpiry.After(actionExpiry) {
+		return handoffExpiry
+	}
+	return actionExpiry
+}
+
+func beginSemanticOpenReplay(session *servedFileSession, request fileRequest, action *servedFileAction) string {
+	if semanticFileAction(request) == "" || action.file == "" {
+		return ""
+	}
+	file := session.files[action.file]
+	if file == nil || file.closing {
+		return ""
+	}
+	file.replaying++
+	return action.file
+}
+
+func (h *Handler) finishSemanticOpenReplay(session *servedFileSession, capability string) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	file := session.files[capability]
+	if file == nil || file.replaying == 0 {
+		return
+	}
+	file.replaying--
+	if !file.closing && !file.pending.IsZero() {
+		file.pending = h.semanticOpenReplayExpiry(session, file.pending)
+	}
+}
+
+func retainSemanticOpenCapability(session *servedFileSession, request fileRequest, response fileResponse, expires time.Time) {
+	if semanticFileAction(request) == "" || response.File == "" {
+		return
+	}
+	if file := session.files[response.File]; file != nil && !file.closing && !file.pending.IsZero() && file.pending.Before(expires) {
+		file.pending = expires
+	}
 }
 
 func maxDuration(d time.Duration) time.Duration {
@@ -544,7 +652,7 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		s.mu.Lock()
 		s.retired = true
 		s.mu.Unlock()
-		return response, s.native.Close(ctx)
+		err = s.native.Close(ctx)
 	case storage.OpFileStatNode:
 		attr, err := s.native.StatNode(ctx, req.Node)
 		wire := AttrOf(attr)
@@ -558,37 +666,10 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		err = e
 		wire := AttrOf(attr)
 		response.Attr = wire
-	case storage.OpFileSetNodeMetadata, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop:
+	case storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileAcknowledgeDeleteIntent, storage.OpFileLookupAt, storage.OpFileMutateName, storage.OpFileSetNodeMetadata, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop:
 		response, err = h.performSessionCapability(ctx, s.native, req)
-	case storage.OpFileOpen, storage.OpFileOpenNode:
-		s.mu.Lock()
-		if len(s.files) >= s.options.MaxFiles {
-			s.mu.Unlock()
-			return response, syscall.EAGAIN
-		}
-		cap := fileCapability()
-		entry := &servedFile{closing: true}
-		s.files[cap] = entry
-		s.mu.Unlock()
-		var file storage.File
-		if req.Op == storage.OpFileOpen {
-			file, err = s.native.OpenFile(ctx, string(req.Path), req.Open)
-		} else {
-			file, err = s.native.OpenNode(ctx, req.Node, req.Open)
-		}
-		s.mu.Lock()
-		if err != nil {
-			delete(s.files, cap)
-		} else {
-			entry.native = file
-			entry.closing = false
-			entry.pending = time.Now().Add(min(h.files.limits.PendingAck, s.options.Lease))
-		}
-		s.mu.Unlock()
-		if err == nil {
-			response.File = cap
-			response.Capabilities, err = referenceCapabilitiesOf(file)
-		}
+	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
+		return h.openReference(ctx, s, req)
 	case storage.OpFileAck:
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -625,22 +706,38 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		case storage.OpFileStat:
 			attr, err = file.native.Stat(ctx)
 		case storage.OpFileRead:
-			value, e := file.native.ReadAt(ctx, req.Offset, req.Length)
+			data, ok := file.native.(storage.File)
+			if !ok {
+				return response, syscall.EBADF
+			}
+			value, e := data.ReadAt(ctx, req.Offset, req.Length)
 			err = e
 			attr = value.Attr
 			response.Data = value.Data
 		case storage.OpFileWrite:
-			attr, err = file.native.WriteAt(ctx, req.Offset, req.Data)
+			data, ok := file.native.(storage.File)
+			if !ok {
+				return response, syscall.EBADF
+			}
+			attr, err = data.WriteAt(ctx, req.Offset, req.Data)
 		case storage.OpFileTruncate:
-			attr, err = file.native.Truncate(ctx, req.Offset)
+			data, ok := file.native.(storage.File)
+			if !ok {
+				return response, syscall.EBADF
+			}
+			attr, err = data.Truncate(ctx, req.Offset)
 		case storage.OpFileSetAttr:
 			if req.Change == nil {
 				return response, syscall.EINVAL
 			}
 			attr, err = file.native.SetAttr(ctx, req.Change.Storage())
 		case storage.OpFileSync:
-			err = file.native.Sync(ctx)
-		case storage.OpFileScope, storage.OpFileSetMetadata:
+			data, ok := file.native.(storage.File)
+			if !ok {
+				return response, syscall.EBADF
+			}
+			err = data.Sync(ctx)
+		case storage.OpFileState, storage.OpFileScope, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink, storage.OpFileMutate:
 			response, err = performReferenceCapability(ctx, file.native, req)
 		case storage.OpFileClose:
 			err = file.native.Close(ctx)
@@ -659,6 +756,10 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		}
 	}
 	if err != nil {
+		if fileMutation(req.Op) && (response.Attr != nil || response.State != nil) {
+			updated, barrierErr := h.finishFileMutation(ctx, response)
+			return updated, errors.Join(err, barrierErr)
+		}
 		return response, err
 	}
 	if fileMutation(req.Op) {

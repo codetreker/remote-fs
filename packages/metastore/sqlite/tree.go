@@ -435,8 +435,13 @@ func (s *Store) makeNode(ctx context.Context, op, path string, kind storage.Node
 		if err != nil {
 			return err
 		}
+		if pending, err := s.nodePendingUnlink(ctx, tx, parent.ID); err != nil {
+			return err
+		} else if pending {
+			return storage.ErrPendingDelete
+		}
 		now := time.Now()
-		node, err := s.insertNode(ctx, tx, kind, storage.AttrChange{}, nil, now)
+		node, err := s.insertNode(ctx, tx, kind, storage.InitialFields{}, now)
 		if err != nil {
 			return err
 		}
@@ -456,6 +461,9 @@ func (s *Store) makeNode(ctx context.Context, op, path string, kind storage.Node
 // link puts a name in a directory. A name already there is EEXIST, which the primary key is
 // what decides — so two writers racing for one name cannot both be told they made it.
 func (s *Store) link(ctx context.Context, tx *sql.Tx, parent int64, name []byte, node int64) error {
+	if err := storage.CheckLeaf(name); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO entries (volume, parent, name, node) VALUES (?, ?, ?, ?)`,
 		s.volume, parent, name, node); err != nil {
 		if sqlerr.IsUniqueViolation(err) {
@@ -525,6 +533,16 @@ func (s *Store) Remove(ctx context.Context, path string) error {
 		if !found {
 			return syscall.ENOENT
 		}
+		if pending, err := s.nodePendingUnlink(ctx, tx, parent.ID); err != nil {
+			return err
+		} else if pending {
+			return storage.ErrPendingDelete
+		}
+		if pending, err := s.nodePendingUnlink(ctx, tx, node.ID); err != nil {
+			return err
+		} else if pending {
+			return storage.ErrPendingDelete
+		}
 		if node.IsDir() {
 			return syscall.EISDIR
 		}
@@ -567,6 +585,16 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 		if !found {
 			return syscall.ENOENT
 		}
+		if pending, err := s.nodePendingUnlink(ctx, tx, parent.ID); err != nil {
+			return err
+		} else if pending {
+			return storage.ErrPendingDelete
+		}
+		if pending, err := s.nodePendingUnlink(ctx, tx, node.ID); err != nil {
+			return err
+		} else if pending {
+			return storage.ErrPendingDelete
+		}
 		if !node.IsDir() {
 			return syscall.ENOTDIR
 		}
@@ -595,9 +623,12 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 
 // Physical pins keep the current object and its charge after volume removal.
 // The caller holds the same gate as file open and final physical release.
-func (s *Store) discard(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
-	if node.Kind == storage.NodeRegular && s.coordinator.pins[retainedNode{s.volume, node.ID}] > 0 {
+func (s *Store) discard(ctx context.Context, tx *sql.Tx, node metastore.Node, at ...time.Time) error {
+	if s.coordinator.pins[retainedNode{s.volume, node.ID}] > 0 {
 		now := time.Now()
+		if len(at) != 0 {
+			now = at[0]
+		}
 		sec, nsec := sqlvalue.StoredTime(now)
 		_, err := tx.ExecContext(ctx, `UPDATE nodes SET detached=1,change_sec=?,change_nsec=? WHERE volume=? AND id=?`, sec, nsec, s.volume, node.ID)
 		return err
@@ -615,7 +646,10 @@ func (s *Store) discardNode(ctx context.Context, tx *sql.Tx, node metastore.Node
 			return err
 		}
 	}
-	return s.charge(ctx, tx, -node.Size)
+	if node.Kind == storage.NodeRegular {
+		return s.charge(ctx, tx, -node.Size)
+	}
+	return nil
 }
 
 // Rename moves a node by rewriting the one entry that names it, which is what moves a whole
@@ -654,14 +688,36 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 	if !found {
 		return syscall.ENOENT
 	}
+	if pending, err := s.nodePendingUnlink(ctx, tx, fromParent.ID); err != nil {
+		return err
+	} else if pending {
+		return storage.ErrPendingDelete
+	}
+	if pending, err := s.nodePendingUnlink(ctx, tx, moving.ID); err != nil {
+		return err
+	} else if pending {
+		return storage.ErrPendingDelete
+	}
 
 	toParent, toName, err := s.resolveParent(ctx, tx, cleanTo)
 	if err != nil {
 		return err
 	}
+	if pending, err := s.nodePendingUnlink(ctx, tx, toParent.ID); err != nil {
+		return err
+	} else if pending {
+		return storage.ErrPendingDelete
+	}
 	displaced, occupied, err := s.lookup(ctx, tx, toParent.ID, toName)
 	if err != nil {
 		return err
+	}
+	if occupied && displaced.ID != moving.ID {
+		if pending, err := s.nodePendingUnlink(ctx, tx, displaced.ID); err != nil {
+			return err
+		} else if pending {
+			return storage.ErrPendingDelete
+		}
 	}
 
 	// Both names resolve to one entry: POSIX has rename(2) "return successfully and perform

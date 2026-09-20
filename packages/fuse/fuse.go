@@ -128,11 +128,7 @@ func New(mountpoint string, s storage.Storage, opts Options) (*Mount, error) {
 		RootStableAttr: &fs.StableAttr{Mode: syscall.S_IFDIR, Ino: root.id.ino},
 		// Zero permission bits are a valid file mode, not an omitted default.
 		NullPermissions: true,
-		MountOptions: gofuse.MountOptions{
-			FsName: "remote-fs", Name: "remote-fs", Logger: logger, Debug: opts.Debug,
-			ExtraCapabilities: gofuse.CAP_ATOMIC_O_TRUNC,
-			DisableXAttrs:     true, EnableLocks: true,
-		},
+		MountOptions:    kernelMountOptions(logger, opts.Debug),
 	}
 	raw := newRawFilesystem(fs.NewNodeFS(root, options), v)
 	server, err := gofuse.NewServer(raw, mountpoint, &options.MountOptions)
@@ -146,6 +142,14 @@ func New(mountpoint string, s storage.Storage, opts Options) (*Mount, error) {
 		close(m.done)
 	}()
 	return m.ready(server.WaitMount())
+}
+
+func kernelMountOptions(logger *log.Logger, debug bool) gofuse.MountOptions {
+	return gofuse.MountOptions{
+		FsName: "remote-fs", Name: "remote-fs", Logger: logger, Debug: debug,
+		ExtraCapabilities: gofuse.CAP_ATOMIC_O_TRUNC,
+		DisableXAttrs:     true, EnableLocks: true, DisableReadDirPlus: true,
+	}
 }
 
 func (m *Mount) ready(handshakeErr error) (*Mount, error) {

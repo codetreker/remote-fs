@@ -25,6 +25,8 @@ CREATE INDEX changes_by_position_identity ON changes (
 
 CREATE INDEX changes_by_volume ON changes (volume, position);
 
+CREATE INDEX delete_intents_by_node ON delete_intents (volume, node, outcome, intent);
+
 CREATE INDEX entries_by_node ON entries (node);
 
 CREATE INDEX entries_by_node_identity ON entries (
@@ -43,6 +45,8 @@ CREATE INDEX logs_by_change_identity ON logs (
 CREATE INDEX nodes_by_content ON nodes (content);
 
 CREATE INDEX nodes_by_volume ON nodes (volume, id);
+
+CREATE INDEX nodes_pending_unlink ON nodes (volume, id) WHERE pending_unlink = 1;
 
 CREATE INDEX objects_by_state ON objects (volume, state, created_sec);
 
@@ -78,7 +82,7 @@ CREATE TABLE changes (
 	content           TEXT,
 	recorded_sec      INTEGER NOT NULL,
 	recorded_nsec     INTEGER NOT NULL
-	, node_kind INTEGER, birth_sec INTEGER, birth_nsec INTEGER, change_sec INTEGER, change_nsec INTEGER, metadata BLOB);
+	, node_kind INTEGER, birth_sec INTEGER, birth_nsec INTEGER, change_sec INTEGER, change_nsec INTEGER, metadata BLOB, link_target BLOB);
 
 CREATE TABLE database_state (
 	singleton         INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -86,6 +90,29 @@ CREATE TABLE database_state (
 	generation        INTEGER NOT NULL CHECK (generation >= 0),
 	node_high_water   INTEGER NOT NULL CHECK (node_high_water >= 0),
 	change_high_water INTEGER NOT NULL CHECK (change_high_water >= 0)
+) WITHOUT ROWID;
+
+CREATE TABLE delete_intents (
+	intent TEXT PRIMARY KEY
+	CHECK (length(CAST(intent AS BLOB)) = 32 AND intent NOT GLOB '*[^0-9a-f]*'),
+	volume INTEGER NOT NULL,
+	node INTEGER NOT NULL,
+	parent INTEGER,
+	name BLOB,
+	reference BLOB NOT NULL CHECK (length(reference) = 16),
+	request_hash BLOB NOT NULL CHECK (length(request_hash) = 32),
+	if_empty INTEGER NOT NULL CHECK (if_empty IN (0, 1)),
+	outcome INTEGER NOT NULL CHECK (outcome BETWEEN 1 AND 5),
+	failure INTEGER,
+	updated_sec INTEGER NOT NULL,
+	updated_nsec INTEGER NOT NULL,
+	CHECK ((parent IS NULL) = (name IS NULL)),
+	CHECK (name IS NULL OR (
+	typeof(name) = 'blob' AND length(name) > 0 AND
+	name NOT IN (X'2e', X'2e2e') AND
+	instr(name, X'2f') = 0 AND instr(name, X'00') = 0
+)),
+	CHECK ((outcome = 5) = (failure IS NOT NULL))
 ) WITHOUT ROWID;
 
 CREATE TABLE entries (
@@ -123,7 +150,9 @@ CREATE TABLE nodes (
 	mtime_sec  INTEGER NOT NULL,
 	mtime_nsec INTEGER NOT NULL,
 	content    TEXT REFERENCES objects(key)
-	, detached INTEGER NOT NULL DEFAULT 0, content_revision INTEGER NOT NULL DEFAULT 1, kind INTEGER NOT NULL DEFAULT 1, birth_sec INTEGER, birth_nsec INTEGER, change_sec INTEGER, change_nsec INTEGER, metadata BLOB NOT NULL DEFAULT X'52464d010000');
+	, detached INTEGER NOT NULL DEFAULT 0, content_revision INTEGER NOT NULL DEFAULT 1, kind INTEGER NOT NULL DEFAULT 1, birth_sec INTEGER, birth_nsec INTEGER, change_sec INTEGER, change_nsec INTEGER, metadata BLOB NOT NULL DEFAULT X'52464d010000', link_target BLOB NOT NULL DEFAULT X'', pending_unlink INTEGER NOT NULL DEFAULT 0
+	CHECK (pending_unlink IN (0, 1)), pending_generation INTEGER NOT NULL DEFAULT 0
+	CHECK (pending_generation >= 0));
 
 CREATE TABLE objects (
 	key          TEXT PRIMARY KEY,
@@ -148,36 +177,36 @@ CREATE TABLE volumes (
 	CHECK (typeof(metadata_used) = 'integer' AND metadata_used >= 0));
 
 CREATE TRIGGER changes_metadata_delete AFTER DELETE ON changes BEGIN
-	UPDATE volumes SET metadata_used = metadata_used - coalesce(length(OLD.metadata), 0)
+	UPDATE volumes SET metadata_used = metadata_used - coalesce(length(OLD.metadata), 0) - coalesce(length(OLD.link_target), 0)
 	WHERE id = OLD.volume;
 	END;
 
 CREATE TRIGGER changes_metadata_insert AFTER INSERT ON changes BEGIN
-	UPDATE volumes SET metadata_used = metadata_used + coalesce(length(NEW.metadata), 0)
+	UPDATE volumes SET metadata_used = metadata_used + coalesce(length(NEW.metadata), 0) + coalesce(length(NEW.link_target), 0)
 	WHERE id = NEW.volume;
 	END;
 
-CREATE TRIGGER changes_metadata_update AFTER UPDATE OF metadata, volume ON changes BEGIN
-	UPDATE volumes SET metadata_used = metadata_used - coalesce(length(OLD.metadata), 0)
+CREATE TRIGGER changes_metadata_update AFTER UPDATE OF metadata, link_target, volume ON changes BEGIN
+	UPDATE volumes SET metadata_used = metadata_used - coalesce(length(OLD.metadata), 0) - coalesce(length(OLD.link_target), 0)
 	WHERE id = OLD.volume;
-	UPDATE volumes SET metadata_used = metadata_used + coalesce(length(NEW.metadata), 0)
+	UPDATE volumes SET metadata_used = metadata_used + coalesce(length(NEW.metadata), 0) + coalesce(length(NEW.link_target), 0)
 	WHERE id = NEW.volume;
 	END;
 
 CREATE TRIGGER nodes_metadata_delete AFTER DELETE ON nodes BEGIN
-	UPDATE volumes SET metadata_used = metadata_used - length(OLD.metadata)
+	UPDATE volumes SET metadata_used = metadata_used - length(OLD.metadata) - length(OLD.link_target)
 	WHERE id = OLD.volume;
 	END;
 
 CREATE TRIGGER nodes_metadata_insert AFTER INSERT ON nodes BEGIN
-	UPDATE volumes SET metadata_used = metadata_used + length(NEW.metadata)
+	UPDATE volumes SET metadata_used = metadata_used + length(NEW.metadata) + length(NEW.link_target)
 	WHERE id = NEW.volume;
 	END;
 
-CREATE TRIGGER nodes_metadata_update AFTER UPDATE OF metadata, volume ON nodes BEGIN
-	UPDATE volumes SET metadata_used = metadata_used - length(OLD.metadata)
+CREATE TRIGGER nodes_metadata_update AFTER UPDATE OF metadata, link_target, volume ON nodes BEGIN
+	UPDATE volumes SET metadata_used = metadata_used - length(OLD.metadata) - length(OLD.link_target)
 	WHERE id = OLD.volume;
-	UPDATE volumes SET metadata_used = metadata_used + length(NEW.metadata)
+	UPDATE volumes SET metadata_used = metadata_used + length(NEW.metadata) + length(NEW.link_target)
 	WHERE id = NEW.volume;
 	END;
 

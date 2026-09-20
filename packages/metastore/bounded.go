@@ -3,9 +3,10 @@ package metastore
 import (
 	"bytes"
 	"fmt"
-	"github.com/codetreker/remote-fs/packages/storage"
 	"strings"
 	"syscall"
+
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // ChangePayloadLengths declares the variable-length fields of one change before those
@@ -15,6 +16,7 @@ type ChangePayloadLengths struct {
 	FromName int64
 	Content  int64
 	Metadata int64
+	Target   int64
 }
 
 // ChangeResult retains one page of changes under a caller-defined byte charge. The charge
@@ -84,6 +86,7 @@ func (r *ChangeResult) Reserve(meta Change, lengths ChangePayloadLengths) (*Chan
 	if meta.Node != nil {
 		node := meta.Node.Clone()
 		node.Content = ""
+		node.LinkTarget = nil
 		node.AccessTime = node.AccessTime.UTC()
 		node.ModTime = node.ModTime.UTC()
 		meta.Node = &node
@@ -107,17 +110,17 @@ func (r *ChangeResult) Reserve(meta Change, lengths ChangePayloadLengths) (*Chan
 }
 
 func validateChangeMeta(meta Change, lengths ChangePayloadLengths) error {
-	if lengths.Name < 0 || lengths.FromName < 0 || lengths.Content < 0 || lengths.Metadata < 0 || lengths.Metadata > storage.MaxMetadataBytes {
+	if lengths.Name < 0 || lengths.FromName < 0 || lengths.Content < 0 || lengths.Metadata < 0 || lengths.Metadata > storage.MaxMetadataBytes || lengths.Target < 0 || lengths.Target > storage.MaxLinkTargetBytes {
 		return fmt.Errorf("a change carries a negative payload length: %w", syscall.EIO)
 	}
 	if len(meta.Name) != 0 || (meta.From != nil && len(meta.From.Name) != 0) ||
-		(meta.Node != nil && (len(meta.Node.Content) != 0 || len(meta.Node.Metadata) != 0)) {
+		(meta.Node != nil && (len(meta.Node.Content) != 0 || len(meta.Node.Metadata) != 0 || len(meta.Node.LinkTarget) != 0)) {
 		return fmt.Errorf("a change reservation already retains variable-length payload: %w", syscall.EINVAL)
 	}
 	if meta.From == nil && lengths.FromName != 0 {
 		return fmt.Errorf("a change without a source declares a %d-byte source name: %w", lengths.FromName, syscall.EIO)
 	}
-	if meta.Node == nil && (lengths.Content != 0 || lengths.Metadata != 0) {
+	if meta.Node == nil && (lengths.Content != 0 || lengths.Metadata != 0 || lengths.Target != 0) {
 		return fmt.Errorf("a change without a node declares a %d-byte content key: %w", lengths.Content, syscall.EIO)
 	}
 	return nil
@@ -167,12 +170,12 @@ type ChangeReservation struct {
 }
 
 // Commit supplies the fields whose lengths were charged by Reserve.
-func (r *ChangeReservation) Commit(name, fromName []byte, content Key, metadata []byte) error {
+func (r *ChangeReservation) Commit(name, fromName []byte, content Key, metadata, target []byte) error {
 	if r == nil || r.result == nil || r.committed {
 		return fmt.Errorf("a change reservation can be committed exactly once: %w", syscall.EINVAL)
 	}
 	if int64(len(name)) != r.lengths.Name || int64(len(fromName)) != r.lengths.FromName ||
-		int64(len(content)) != r.lengths.Content || int64(len(metadata)) != r.lengths.Metadata {
+		int64(len(content)) != r.lengths.Content || int64(len(metadata)) != r.lengths.Metadata || int64(len(target)) != r.lengths.Target {
 		return r.result.fail(fmt.Errorf(
 			"a change payload has lengths (%d, %d, %d) after (%d, %d, %d) were reserved: %w",
 			len(name), len(fromName), len(content), r.lengths.Name, r.lengths.FromName, r.lengths.Content, syscall.EIO,
@@ -188,6 +191,7 @@ func (r *ChangeReservation) Commit(name, fromName []byte, content Key, metadata 
 	}
 	if change.Node != nil {
 		change.Node.Content = Key(strings.Clone(string(content)))
+		change.Node.LinkTarget = bytes.Clone(target)
 		if len(metadata) != 0 {
 			decoded, err := storage.DecodeMetadata(metadata)
 			if err != nil {
@@ -208,6 +212,7 @@ type RowPayloadLengths struct {
 	Name     int64
 	Content  int64
 	Metadata int64
+	Target   int64
 }
 
 // RowResult retains one snapshot page under a caller-defined byte charge. Reserve must run
@@ -253,10 +258,10 @@ func (r *RowResult) Reserve(meta Row, lengths RowPayloadLengths) (*RowReservatio
 	if r.pending {
 		return nil, false, r.fail(fmt.Errorf("a row was reserved before the previous reservation was committed: %w", syscall.EIO))
 	}
-	if lengths.Name < 0 || lengths.Content < 0 || lengths.Metadata < 0 || lengths.Metadata > storage.MaxMetadataBytes {
+	if lengths.Name < 0 || lengths.Content < 0 || lengths.Metadata < 0 || lengths.Metadata > storage.MaxMetadataBytes || lengths.Target < 0 || lengths.Target > storage.MaxLinkTargetBytes {
 		return nil, false, r.fail(fmt.Errorf("a snapshot row carries a negative payload length: %w", syscall.EIO))
 	}
-	if len(meta.Name) != 0 || len(meta.Node.Content) != 0 || len(meta.Node.Metadata) != 0 {
+	if len(meta.Name) != 0 || len(meta.Node.Content) != 0 || len(meta.Node.Metadata) != 0 || len(meta.Node.LinkTarget) != 0 {
 		return nil, false, r.fail(fmt.Errorf("a row reservation already retains variable-length payload: %w", syscall.EINVAL))
 	}
 	if meta.Name != nil {
@@ -265,6 +270,7 @@ func (r *RowResult) Reserve(meta Row, lengths RowPayloadLengths) (*RowReservatio
 	meta.Node.AccessTime = meta.Node.AccessTime.UTC()
 	meta.Node.ModTime = meta.Node.ModTime.UTC()
 	meta.Node.Content = ""
+	meta.Node.LinkTarget = nil
 	meta.Node = meta.Node.Clone()
 	charge, err := r.rowBytes(len(r.rows), meta, lengths)
 	if err != nil {
@@ -327,11 +333,11 @@ type RowReservation struct {
 }
 
 // Commit supplies the fields whose lengths were charged by Reserve.
-func (r *RowReservation) Commit(name []byte, content Key, metadata []byte) error {
+func (r *RowReservation) Commit(name []byte, content Key, metadata, target []byte) error {
 	if r == nil || r.result == nil || r.committed {
 		return fmt.Errorf("a row reservation can be committed exactly once: %w", syscall.EINVAL)
 	}
-	if int64(len(name)) != r.lengths.Name || int64(len(content)) != r.lengths.Content || int64(len(metadata)) != r.lengths.Metadata {
+	if int64(len(name)) != r.lengths.Name || int64(len(content)) != r.lengths.Content || int64(len(metadata)) != r.lengths.Metadata || int64(len(target)) != r.lengths.Target {
 		return r.result.fail(fmt.Errorf(
 			"a snapshot row payload has lengths (%d, %d) after (%d, %d) were reserved: %w",
 			len(name), len(content), r.lengths.Name, r.lengths.Content, syscall.EIO,
@@ -343,6 +349,7 @@ func (r *RowReservation) Commit(name []byte, content Key, metadata []byte) error
 	row := r.meta
 	row.Name = bytes.Clone(name)
 	row.Node.Content = Key(strings.Clone(string(content)))
+	row.Node.LinkTarget = bytes.Clone(target)
 	if len(metadata) != 0 {
 		decoded, err := storage.DecodeMetadata(metadata)
 		if err != nil {

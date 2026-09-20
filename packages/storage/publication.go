@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 // PublicationResult describes the volume effect, independently of the operation's
@@ -142,4 +143,59 @@ func settlePublication(settlements []PublicationSettlement, result PublicationRe
 		return nil
 	}
 	return &publicationAccountingUncertain{cause: errors.Join(failures...)}
+}
+
+// PublicationAccountingChain contains only immutable accounting links. It does
+// not retain the originating context, credentials, publication proof or
+// cancellation.
+type PublicationAccountingChain struct{ head *publicationAccountingLink }
+
+func PublicationAccountingFrom(ctx context.Context) PublicationAccountingChain {
+	head, _ := ctx.Value(publicationAccountingKey{}).(*publicationAccountingLink)
+	return PublicationAccountingChain{head: head}
+}
+
+// With returns a new complete chain without modifying the earlier chain.
+func (c PublicationAccountingChain) With(hook PublicationAccounting) PublicationAccountingChain {
+	if hook == nil {
+		panic("storage: nil publication accounting hook")
+	}
+	return PublicationAccountingChain{head: &publicationAccountingLink{hook: hook, previous: c.head}}
+}
+
+func (c PublicationAccountingChain) Empty() bool { return c.head == nil }
+
+type publicationAccountingContext struct {
+	context.Context
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (c publicationAccountingContext) Deadline() (time.Time, bool) { return c.deadline, c.hasDeadline }
+
+// WithPublicationAccountingChain installs accounting on a cleanup context while
+// retaining only its cancellation and deadline. Every other context value is
+// discarded, including authorization, reference scopes and publication proofs.
+func WithPublicationAccountingChain(ctx context.Context, chain PublicationAccountingChain) context.Context {
+	if ctx == nil {
+		panic("storage: nil publication accounting context")
+	}
+	deadline, hasDeadline := ctx.Deadline()
+	lifetime, cancel := context.WithCancelCause(context.Background())
+	if ctx.Err() != nil {
+		cancel(context.Cause(ctx))
+	} else {
+		context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
+	}
+	clean := publicationAccountingContext{Context: lifetime, deadline: deadline, hasDeadline: hasDeadline}
+	return context.WithValue(clean, publicationAccountingKey{}, chain.head)
+}
+
+// MaintenanceAccounting binds one complete chain for recovered or orphaned
+// cleanup with no request/session owner. Validation and usage reading precede
+// initialize under final publication ordering; initialize performs bounded,
+// infallible internal accounting. Chain installation is the last step.
+type MaintenanceAccounting interface {
+	CheckMaintenanceAccounting() error
+	BindMaintenanceAccounting(context.Context, PublicationAccountingChain, func(used int64)) error
 }

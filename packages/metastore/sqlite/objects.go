@@ -300,7 +300,7 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 // createCommitted makes the file a commit is pointing at when nothing is at the name yet.
 func (s *Store) createCommitted(ctx context.Context, tx *sql.Tx, parent metastore.Node, name []byte, object metastore.Object) error {
 	now := time.Now()
-	node, err := s.insertNode(ctx, tx, storage.NodeRegular, storage.AttrChange{ModTime: &object.ModTime}, nil, now)
+	node, err := s.insertNode(ctx, tx, storage.NodeRegular, storage.InitialFields{Attr: storage.AttrChange{ModTime: &object.ModTime}}, now)
 	if err != nil {
 		return err
 	}

@@ -88,8 +88,18 @@ func (n Node) check() error {
 	if err := storage.CheckMetadata(metadataStorage(n.Metadata)); err != nil {
 		return fmt.Errorf("node %d carries invalid metadata: %w", n.ID, err)
 	}
-	if len(n.LinkTarget) != 0 || len(n.DirectoryRevision) != 0 {
-		return errors.New("node carries unsupported reserved payload")
+	if len(n.LinkTarget) > storage.MaxLinkTargetBytes {
+		return fmt.Errorf("node %d carries an oversized symbolic-link target", n.ID)
+	}
+	if n.Kind == storage.NodeSymlink {
+		if len(n.LinkTarget) == 0 || int64(len(n.LinkTarget)) != n.Size || len(n.Content) != 0 {
+			return fmt.Errorf("node %d carries inconsistent symbolic-link data", n.ID)
+		}
+	} else if len(n.LinkTarget) != 0 {
+		return fmt.Errorf("node %d carries a symbolic-link target for kind %d", n.ID, n.Kind)
+	}
+	if len(n.DirectoryRevision) != 0 {
+		return errors.New("node carries unsupported directory revision")
 	}
 	return nil
 }
@@ -113,6 +123,7 @@ func NodeOf(n metastore.Node) *Node {
 		AccessTime: TimeOf(n.AccessTime),
 		ModTime:    TimeOf(n.ModTime),
 		Content:    append([]byte{}, n.Content...),
+		LinkTarget: append([]byte{}, n.LinkTarget...),
 	}
 }
 
@@ -128,6 +139,7 @@ func (n Node) Metastore() metastore.Node {
 		AccessTime: n.AccessTime.Time(),
 		ModTime:    n.ModTime.Time(),
 		Content:    metastore.Key(n.Content),
+		LinkTarget: append([]byte{}, n.LinkTarget...),
 	}
 }
 

@@ -573,6 +573,9 @@ func TestOpenLocalExposesReplicationAndOperationalStatus(t *testing.T) {
 	if !strings.Contains(status, "integrity name-byte work limit is 7340032") {
 		t.Fatalf("local status does not report the configured integrity byte limit: %s", status)
 	}
+	if !strings.Contains(status, "durable deletion-intent limit is 65536") {
+		t.Fatalf("local status does not report the deletion-intent limit: %s", status)
+	}
 	if !strings.Contains(status, "0 operations waiting under a limit of 11") {
 		t.Fatalf("local status does not report the configured waiting-operation limit: %s", status)
 	}
@@ -622,6 +625,7 @@ func TestOpenBlobsExposesPendingAndMaintenanceStatus(t *testing.T) {
 		"snapshot reader-connection limit is 7",
 		"integrity record work limit is 103",
 		"integrity name-byte work limit is 13631488",
+		"durable deletion-intent limit is 65536",
 		"garbage sweeps run every 47s with at most 31 objects per attempt",
 		"garbage sweep",
 	} {

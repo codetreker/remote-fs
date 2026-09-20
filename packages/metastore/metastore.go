@@ -24,6 +24,7 @@
 package metastore
 
 import (
+	"bytes"
 	"context"
 	"time"
 
@@ -215,6 +216,7 @@ type Node struct {
 	BirthTime  *time.Time
 	ChangeTime *time.Time
 	Metadata   map[string]storage.OpaquePayload
+	LinkTarget []byte
 
 	// Size is the length of a file's contents. It is zero for a directory, which the storage
 	// contract leaves unspecified.
@@ -246,6 +248,7 @@ func (n Node) Clone() Node {
 	n.AccessTime = attr.AccessTime
 	n.ModTime = attr.ModTime
 	n.Metadata = attr.Metadata
+	n.LinkTarget = bytes.Clone(n.LinkTarget)
 	return n
 }
 

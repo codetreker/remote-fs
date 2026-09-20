@@ -55,7 +55,7 @@ func TestCapabilityErrorsPreserveActionableClassifications(t *testing.T) {
 	for _, test := range []struct {
 		err  error
 		want syscall.Errno
-	}{{ErrUseConflict, syscall.EAGAIN}, {ErrRangeConflict, syscall.EAGAIN}, {ErrConditionConflict, syscall.EAGAIN}, {ErrInvalidScope, syscall.ESTALE}} {
+	}{{ErrUseConflict, syscall.EAGAIN}, {ErrRangeConflict, syscall.EAGAIN}, {ErrPendingDelete, syscall.EBUSY}, {ErrConditionConflict, syscall.EAGAIN}, {ErrInvalidScope, syscall.ESTALE}} {
 		if test.err.Error() == "" {
 			t.Fatal("capability error has an empty diagnostic")
 		}

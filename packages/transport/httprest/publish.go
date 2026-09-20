@@ -613,7 +613,7 @@ func marshalStartFrame(start StreamStart, maxFrameBytes, maxIncarnationBytes int
 
 func newChangeFrameResult(maxFrameBytes int64) (*metastore.ChangeResult, error) {
 	return metastore.NewChangeResult(maxFrameBytes, 0, func(_ int, meta metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
-		if err := payloadLengthsFitFrame(maxFrameBytes, lengths.Name, lengths.FromName, lengths.Content, lengths.Metadata); err != nil {
+		if err := payloadLengthsFitFrame(maxFrameBytes, lengths.Name, lengths.FromName, lengths.Content, lengths.Metadata, lengths.Target); err != nil {
 			return 0, err
 		}
 		if meta.From != nil {
@@ -623,6 +623,7 @@ func newChangeFrameResult(maxFrameBytes int64) (*metastore.ChangeResult, error) 
 		if meta.Node != nil {
 			node := *meta.Node
 			node.Content = ""
+			node.LinkTarget = nil
 			meta.Node = &node
 		}
 		wire, err := changeShapeOf(meta)
@@ -648,6 +649,10 @@ func newChangeFrameResult(maxFrameBytes int64) (*metastore.ChangeResult, error) 
 		if err != nil {
 			return 0, err
 		}
+		payloadBytes, err = addFrameBytes(payloadBytes, linkTargetResultBytes(lengths.Target))
+		if err != nil {
+			return 0, err
+		}
 		return encodedFrameBytes(eventChange, payloadBytes)
 	})
 }
@@ -662,10 +667,11 @@ func newSnapshotFrameResult(maxFrameBytes int64) (*metastore.RowResult, error) {
 		return nil, err
 	}
 	return metastore.NewRowResult(maxFrameBytes, fixed, func(index int, meta metastore.Row, lengths metastore.RowPayloadLengths) (int64, error) {
-		if err := payloadLengthsFitFrame(maxFrameBytes, lengths.Name, lengths.Content, lengths.Metadata); err != nil {
+		if err := payloadLengthsFitFrame(maxFrameBytes, lengths.Name, lengths.Content, lengths.Metadata, lengths.Target); err != nil {
 			return 0, err
 		}
 		meta.Node.Content = ""
+		meta.Node.LinkTarget = nil
 		one, err := json.Marshal(SnapshotPage{Rows: []Row{RowOf(meta)}})
 		if err != nil {
 			return 0, fmt.Errorf("cannot size a snapshot row: %w", err)
@@ -682,12 +688,23 @@ func newSnapshotFrameResult(maxFrameBytes int64) (*metastore.RowResult, error) {
 		if err != nil {
 			return 0, err
 		}
+		charge, err = addFrameBytes(charge, linkTargetResultBytes(lengths.Target))
+		if err != nil {
+			return 0, err
+		}
 		metadataCharge, err := metadataResultBytes(lengths.Metadata)
 		if err != nil {
 			return 0, err
 		}
 		return addFrameBytes(charge, metadataCharge)
 	})
+}
+
+func linkTargetResultBytes(targetBytes int64) int64 {
+	if targetBytes == 0 {
+		return 0
+	}
+	return int64(len(`,"link_target":""`)) + int64(base64.StdEncoding.EncodedLen(int(targetBytes)))
 }
 
 func metadataResultBytes(metadataBytes int64) (int64, error) {

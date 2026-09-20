@@ -15,8 +15,8 @@ import (
 type AccessRequest struct {
 	Volume    string
 	Operation storage.Operation
-	// Open preserves the validated storage.OpFileOpen or storage.OpFileOpenNode
-	// intent. Other operations carry its zero value.
+	// Open preserves validated file and node-reference open intent, including
+	// compatibility uses that require read or write authority.
 	Open storage.OpenAccess
 }
 

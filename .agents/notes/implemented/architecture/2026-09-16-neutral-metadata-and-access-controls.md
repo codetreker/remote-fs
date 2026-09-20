@@ -50,7 +50,7 @@ SQLite migration 6 在既有 schema 准备事务中把合法 v5 mode 转为 `Nod
 
 HTTP v4 是不兼容的边界：基础属性从 POSIX mode 变为中立节点事实，文件锁 DTO 变为中立 owner/range，所有路由与 response marker 同时升级，v3 不作为兼容旁路。metadata CAS 请求使用独立 decoder，允许空 expected version，并继续要求 canonical base64；响应 `OpaquePayload` 必须携带非空 authority version。
 
-能力协商在 session 和 File 结果里为原子打开、NodeReference、namespace、状态、删除、条件修改、目录 metadata 与名字观察保留布尔字段。当前 server 只宣告 `Metadata`、`Owners`、`Ranges` 和 File `Scope`；尚未实现某个 facet 的 v4 client 接受并忽略对应已知预留 bool 的 true 值，因为本地方法集仍不包含该能力。任意未知字段继续失败。Open/OpenNode 的可选 node 与 File.Close/FileSession.Close 的可选 barrier 使用同一兼容原则，为身份结果和可能产生持久修改的清理预留位置，不把它们解释成已交付行为。
+能力协商在 session 和引用结果里分别声明 AtomicOpen、NodeReference、Namespace、FileActions、State、Delete、Conditional、Metadata、Owners、Ranges 与 Scope。[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)已经实现前一组中立能力；DirectoryMetadata 与 ReferenceName 仍是已知预留位，v4 client 接受并忽略自己没有实现的 facet，任意未知字段继续失败。打开结果携带原 action 的 node/outcome，Close 与 FileSession.Close 可携带清理 barrier。
 
 每项可选能力的 Check 检查完整包装链；缺少底层保证时，Check 和调用都以 `EOPNOTSUPP` 失败。limited、locked、objectstore、localstore、replicated 与 HTTP 包装器保留预算、原始错误、barrier、引用和清理所有权，不能用路径重开、本地 mutex 或默认值模拟能力。
 
@@ -72,4 +72,4 @@ HTTP v4 是不兼容的边界：基础属性从 POSIX mode 变为中立节点事
 
 本决定接续[Windows 系统网络驱动器](../../proposed/feature/2026-09-16-windows-network-drive-support.md)中的平台中立约束，并扩展[活跃文件句柄](2026-09-08-live-file-handles.md)、[显式文件占有](2026-09-07-file-locks.md)和[业务方授权](../feature/2026-09-10-host-provided-authorization.md)的当前实现；它不取代这些决定。
 
-原子 OpenAt、NodeReference、身份 namespace 操作、当前名字或完整目录 metadata 观察、pending deletion、条件文件修改和 SMB/Windows 适配仍未交付。Windows 属性的 codec、`ARCHIVE` 与内容的同事务更新、共享模式映射、原生系统客户端验证也不由这些中立原语自动成立。
+原子 OpenAt、NodeReference、身份 namespace、pending deletion 与条件文件修改由[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)接续。当前名字、完整目录 metadata observation、SMB/Windows 适配仍未交付；Windows 属性 codec、`ARCHIVE` 与内容的同事务更新、共享模式映射和原生系统客户端验证也不由这些中立原语自动成立。

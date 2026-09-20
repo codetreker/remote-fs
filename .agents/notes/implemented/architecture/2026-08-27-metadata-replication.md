@@ -386,7 +386,7 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **最后一个迁移文件例外，而且是暂时的。** 当时最后一个文件是 `0002_replication.sql`；实测把其中的 `entries.name` 改成 `TEXT`、删掉两个索引之一、或把 `logs.trimmed_by_age` 改成 `TEXT`，两条结构比对**一条都不响**，只有可重新生成的 golden 响。最后一个文件在新库与迁移库两条路上都会运行，所以两边一起变化；它成为历史时必须取得独立见证。
 
-`0003_durable_state.sql` 落地时，[v2 fixture](../../../../packages/metastore/sqlite/internal/integration/testdata/version2.sql) 与 `TestTheSecondMigrationDescribesTheVersionTwoDatabasesThatExist` 钉住了 v2，上述义务已经成为测试。`0004_lease_recovery.sql` 使 `0003` 成为历史，v3 结构也须用独立见证固定，不能只比较两条都运行 `0004` 的路径。后续 `0005_retained_files.sql` 增加 detached 与内容 revision；`0006_neutral_metadata.sql` 将合法旧 mode 转成 NodeKind 与 `posix.permissions.v1`，并增加可选 BirthTime/ChangeTime、metadata 及其持久计量。每个已落地文件继续冻结。
+`0003_durable_state.sql` 落地时，[v2 fixture](../../../../packages/metastore/sqlite/internal/integration/testdata/version2.sql) 与 `TestTheSecondMigrationDescribesTheVersionTwoDatabasesThatExist` 钉住了 v2，上述义务已经成为测试。`0004_lease_recovery.sql` 使 `0003` 成为历史，v3 结构也须用独立见证固定，不能只比较两条都运行 `0004` 的路径。后续 `0005_retained_files.sql` 增加 detached 与内容 revision；`0006_neutral_metadata.sql` 将合法旧 mode 转成 NodeKind 与 `posix.permissions.v1`，并增加可选 BirthTime/ChangeTime、metadata 及其持久计量；`0007_durable_identity.sql` 增加 link target、pending generation 与 durable delete intents。每个已落地文件继续冻结。
 
 （顺带记下一个实测意外：`entries.name` 在 `0002` 里改成 `TEXT` 之后，**没有任何行为测试变红**。原因是 SQLite 的 TEXT 亲和性不会把 BLOB 值转成文本，存进去的字节仍按字节比较。所以那一处是 golden 独自兜住的，不是被行为测试兜住的。）
 

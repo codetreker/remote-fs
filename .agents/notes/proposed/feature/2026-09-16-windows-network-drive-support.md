@@ -2,6 +2,8 @@
 
 Status: proposed
 
+[持久节点身份与原子文件操作](../../implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)已经交付本提案依赖的 NodeReference、父身份名字操作、条件 mutation、action receipt 与 durable delete intent。完整目录 metadata/current-name observation、SMB endpoint 与 Windows 映射、共享语义翻译、通知和原生验收仍属于本提案。
+
 ## 问题
 
 Windows 11 上未经修改的程序需要访问同一份远端 volume，但安装第三方文件系统驱动会增加分发、升级和清理成本，把文件同步到普通本地目录则会失去逐次远端确认、同一对象身份、跨入口访问保护与断线时的真实错误。

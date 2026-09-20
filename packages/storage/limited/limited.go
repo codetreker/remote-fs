@@ -166,11 +166,30 @@ func NewWithLimits(
 	if err := native.CheckPublicationAccounting(); err != nil {
 		return nil, err
 	}
+	s := &Storage{backing: native, limit: limit, measurement: effective}
+	if maintenance, ok := any(native).(storage.MaintenanceAccounting); ok {
+		err := maintenance.CheckMaintenanceAccounting()
+		if err == nil {
+			chain := storage.PublicationAccountingFrom(ctx).With(s.maintenanceAccounting)
+			if err := maintenance.BindMaintenanceAccounting(ctx, chain, func(used int64) {
+				s.countMu.Lock()
+				s.count = used
+				s.countMu.Unlock()
+			}); err != nil {
+				return nil, err
+			}
+			return s, nil
+		}
+		if err != syscall.EOPNOTSUPP {
+			return nil, err
+		}
+	}
 	count, err := measureUsage(ctx, native, effective)
 	if err != nil {
 		return nil, err
 	}
-	return &Storage{backing: native, limit: limit, measurement: effective, count: count}, nil
+	s.count = count
+	return s, nil
 }
 
 // Recount measures the volume again and replaces the count with what it finds.

@@ -44,7 +44,7 @@ checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race 
 
 [memoryfixture](../packages/storage/lockcontract/memoryfixture/memory.go)为库测试组合真实 SQLite、objectstore 和内存 Objects，通过 `sqlite.OpenLocking` 取得 native 所有权与持久租约证据；它的对象内容不提供重启持久性，持久性由 local store 用例验证。FUSE、HTTP 与 quota 测试通过 volume API 准备内容和重新读取结果。对拍的另一端仍是独立的普通目录，挂载根 mode 与它保持一致；inode 用例保留真实 `Getdents` 观察以及删除、重建和另一客户端修改后的身份断言。
 
-符号链接的 FUSE 用例在真实 volume 节点上使用 [`linkStorage`](../packages/fuse/fuse_test.go)装饰 Stat/List、StatNode 和 retained File 返回的 Attr，按节点 ID 保留符号链接 kind 与链接文本长度。与普通目录的真实 symlink 对比后，断言 dangling link 仍存在、查找和列目录保持同一 inode、读取和跟随为 `EOPNOTSUPP`，删除链接不改变目标内容；这个 fixture 不向 SQLite 添加符号链接实现。可选日志能力由 [无日志副本用例](../packages/storage/replicated/replicated_test.go)单独验证：只暴露 `locked.Backend` 并向 handler 传入 nil Log，构建 replica 必须返回 `ENOSYS` 且不是 `EIO`，不能因真实组合底层恰有日志而漏测缺失能力。
+符号链接的 FUSE 用例通过真实 SQLite/objectstore 的 MutateName 创建链接，并以短期 NodeReference.State 读取 link target；与普通目录对拍 lstat、readlink、dangling link、rename 和 unlink，断言链接身份、长度与原始目标字节相容，删除链接不改变目标内容。可选日志能力由 [无日志副本用例](../packages/storage/replicated/replicated_test.go)单独验证：只暴露 `locked.Backend` 并向 handler 传入 nil Log，构建 replica 必须返回 `ENOSYS` 且不是 `EIO`，不能因真实组合底层恰有日志而漏测缺失能力。
 
 ## 失败要注入，不要制造
 
@@ -94,7 +94,7 @@ checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race 
 
 [入口授权用例](../packages/transport/httprest/authorization_test.go)验证 Authorizer 与 Volume 同时缺省、成对配置、typed-nil 和 nil 函数拒绝，以及不改写不透明 Volume。普通操作先拒绝再允许，分别核对拒绝时 backend／barrier 未被调用、允许后原 backend 错误仍返回，成功修改只在授权之后读取 barrier。非法请求不触发策略；并发请求保留各自的 host 值，请求结束解除派生 context，未启用 hook 的路径保持原行为。
 
-[文件授权用例](../packages/transport/httprest/authorization_file_test.go)在 capability 查询、引用创建和动作记录之前核对每种 file 操作。合法打开的全部意图经共享的 storage.OpenAccess 值和一次 callback 传入，wire 分发与授权共用规范操作值；metadata CAS、use owner、range apply/query/cancel/drop 分别核对，非法参数在策略之前拒绝。用例先取得真实引用和动作回执，再拒绝 ack、renew、status、重放、修改与 close，核对原回执、期限、pending ack、引用和内容均未改变，拒绝的新动作没有记录。允许后重放仍返回原引用，原动作才可继续执行。
+[文件授权用例](../packages/transport/httprest/authorization_file_test.go)在 capability 查询、引用创建和动作记录之前核对每种 file 操作。旧 open 通过一个 OpenAccess callback；OpenAt、NodeReference 打开、名字与条件修改按固定序列检查基础 Operation 和实际包含的 remove/set-attr/set-metadata/set-pending 效果，任一拒绝都发生在 native action 前。metadata CAS、action/delete-intent query/ACK、use owner 与 range 操作分别核对，非法参数在策略之前拒绝。用例先取得真实引用和动作回执，再拒绝 ack、renew、status、重放、修改与 close，核对原回执、期限、pending ack、引用和内容均未改变，拒绝的新动作没有记录。允许后重放仍返回原引用，原动作才可继续执行。
 
 [强占有授权用例](../packages/transport/httprest/authorization_lock_test.go)逐项检查控制操作在 native service 或 status capability 访问前授权，并重新检查曾经成功的相同请求。拒绝只描述本次入口结果，不能泄漏已有动作回执或捏造 lockCode、recorded、Cancelled、Released 等 native 结果。文件侧另用只读描述符取得真实 whole-file range，拒绝 Range Drop、Cancel 与 Query 后，再从允许的控制路径核对原 grant 和历史仍存在。调用方 cleanup 可以被拒绝；内部 lease 到期仍释放 retained 字节，且不会再次替调用方请求授权。
 
@@ -110,11 +110,15 @@ checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race 
 
 ## 打开的文件、metadata 与范围控制
 
-[文件句柄设计](design/server/file-handles.md)按对象身份、逐次发布、metadata、Use claim、范围与会话生存期分别验证。[公开类型用例](../packages/storage/files_test.go)、[metadata 用例](../packages/storage/metadata_test.go)、[能力用例](../packages/storage/capabilities_test.go)和[range 用例](../packages/storage/ranges_test.go)拒绝无访问权限、非法创建/截断组合、不一致的 OpenNode 身份、无界会话配置、畸形 namespace/version/payload、非法 Use、范围和 action epoch/nonce。实现缺少可选能力时必须明确拒绝，不能重新按路径打开或用本地锁模拟。普通 Open 注册读写 Uses，但不取得 advisory range 或 Strong；FileSession 与 Strong Session 的生存期分别成立。
+[文件句柄设计](design/server/file-handles.md)按对象身份、逐次发布、identity namespace、action receipt、durable deletion、metadata、Use claim、范围与会话生存期分别验证。[公开类型用例](../packages/storage/files_test.go)、[路径用例](../packages/storage/storage_test.go)、[metadata 用例](../packages/storage/metadata_test.go)、[能力校验用例](../packages/storage/capability_validation_test.go)和[range 用例](../packages/storage/ranges_test.go)拒绝无访问权限、非法打开效果、畸形父身份／叶名、任一规范化路径 component 超过 4096 字节、缺失或复用错误的 action、无界 metadata predicates、错误 pending generation、非法 Use/range 与 action epoch/nonce。空 metadata token 必须稳定表示 namespace 缺席。实现缺少可选能力时明确拒绝，不能重新按路径打开或用本地锁模拟。
 
 ### 当前内容、身份与发布
 
 [objectstore 句柄用例](../packages/storage/objectstore/files_test.go)先打开对象，再从另一入口覆盖、扩展、缩短、改名、unlink 和替换名字。每次 ReadAt 同时核对内容、大小、EOF 与节点 ID；原引用继续读取对象的当前版本，已占据旧名字的替代物逐字节不变。OpenNode、StatNode 与 SetNodeAttr 按既有身份访问，失效身份为 `ESTALE`；只读引用仍能按权限策略设置共同时间与 metadata；缺少读写访问，或 Session 仍有效但引用已关闭时为 `EBADF`，Session 到期或退役为 `ESTALE`。创建并打开的用例同时核对 ExpectedID、排他创建、既有 metadata、InitialMetadata 与截断，不能只断言返回了一个引用。
+
+[NodeReference 与原子打开用例](../packages/metastore/sqlite/identity_capabilities_test.go)覆盖普通文件、目录及符号链接引用，父目录改名与旧名字复用，Keep/Reset/Replace、并发 create winner、metadata predicates、Use claim、close intent 与原 action Attr/Outcome。返回 error 但带引用时仍须完成清理；去掉 Scope/State 转发或把条件拆成先查后改，应使契约或 wrapper 用例失败。
+
+[identity namespace 用例](../packages/metastore/sqlite/identity_capabilities_test.go)在 retained parent rename/reuse 后执行 LookupAt、create、remove 与 rename，分别核对源、被替换目标和 output slot。metadata 条件与名字效果必须在同一事务；条件失败、第三对象占位或 scope 失效均无部分修改。FUSE 的 [directory 用例](../packages/fuse/directory_test.go)与[namespace 用例](../packages/fuse/namespace_test.go)验证 Opendir/Readlink 的 NodeReference、普通子项操作的父 NodeID、directory-handle Lookup 的额外 Scope、符号链接创建/读取，以及 Readdir 仍为明确的路径边界。
 
 ### 节点事实与 metadata
 
@@ -122,7 +126,11 @@ checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race 
 
 schema 迁移从真实 v5 fixture 前滚，核对 mode 到 NodeKind / `posix.permissions.v1` 的转换、旧 BirthTime/ChangeTime 保持 unknown、当前节点与 retained change 各自保留历史事实，以及 migration 1 至 5 未被改写。metadata accounting 用精确边界、超限、detached 节点、retained history、复制写入、日志裁剪和物理删除核对 `metadata_used`；缺失或改变 trigger、错误 storage class、畸形 envelope 与计数不符必须在打开或读取时失败。
 
+schema v7 用例从真实 v6 fixture 前滚，核对 link target、pending generation、delete-intent 表与更新后的 metadata accounting；NodeID、高水位、名字、内容、日志及 accepted witness 不得改变。损坏的 intent ID、请求摘要、状态、failure 组合、node/entry 关联或 link target 必须在 serving 前失败，不能先执行恢复清理。
+
 范围写的交错用例暂停一份不可变对象上传，让另一描述符先完成修改，再恢复原 WriteAt；最终内容必须包含两次已完成范围修改。SQLite 的每节点 content revision 与 CAS 用于重新读取当前版本并重算本次范围，不能据此拒绝较早打开的普通描述符。另测零填充、截断、空对象 ABA、revision 耗尽与原状态保留。读取遇到已经收集的旧 revision 可以重取当前对象；当前 metadata 所指对象缺失必须 `EIO`，不能返回空内容。
+
+[条件修改用例](../packages/metastore/sqlite/identity_capabilities_test.go)分别让 truncate、WriteAt、Append 与 attribute effect 同事务更新 metadata，核对 size、只读 metadata predicates 和更新自身 expected version。任一条件冲突必须同时保留内容、长度、共同时间、metadata、ChangeTime 与日志；Append 只在已知内部 revision 竞争时按新 EOF 重建，未知 action 通过原 FileActionID 查询，不能作为新逻辑动作重放。
 
 文件大小上限用例分别收紧 FileSessionOptions.MaxFileSize 与 native MaxFileBytes：先 Stat，再从另一入口增大文件，随后即使只读一个字节，ReadAt、WriteAt、非零 Truncate 和 Sync 也必须在 GetBounded/Put 前以 `EFBIG` 拒绝。Truncate(0) 不读取或暂存被丢弃的旧内容，超限且不可读的对象仍能按权限清空，Usage 随之归零；强 S/X 的最终权限检查继续成立。测试分别计数对象读取与上传，不能只检查最后的 errno。
 
@@ -134,6 +142,8 @@ schema 迁移从真实 v5 fixture 前滚，核对 mode 到 NodeKind / `posix.per
 
 [local store 关闭用例](../packages/storage/localstore/files_test.go)在关闭 durable storage 前退役 retained 引用，重开后核对无名字对象已清理、Used 已释放且旧名字没有重建。最后引用的记账拒绝必须使 Close 保留原错误，第二个 opener 仍以 `EBUSY` 失败；移除故障后重新 Close 才能释放物理所有权。
 
+[pending deletion 用例](../packages/metastore/sqlite/identity_capabilities_test.go)覆盖 armed、pending、completed、明确未执行与带 errno 的 cleanup-failed，rename 后随原关联、unlink/replacement 后不碰同名替代物、目录非空、generation 清除竞争、多个 intent、最后 pin 与重启恢复。终态在显式 acknowledge 前持续占用有界历史；ACK 带自己的 FileActionID，可重放且不重复释放，成功后删除记录、回收容量，后续查询为 unknown。用例还须证明 authority 不保留 tombstone，调用方不会复用已 ACK 的 ID。localstore crash 用例在接受 intent 后终止子进程，重开后从 durable ID 查询并继续清理；恢复使用 maintenance accounting，既不重复返还配额，也不携带原授权、Scope 或 Strong proof。
+
 [retained integrity 用例](../packages/metastore/sqlite/internal/integration/integrity_test.go)将可见 rooted tree 与 detached regular file 分开验证：后者不进入目录快照，仍引用合法对象并计入 quota 与 integrity work；detached directory/root、非法标记、revision 或错误用量均失败。[恢复用例](../packages/metastore/sqlite/internal/integration/files_test.go)在独占打开时清理数据库内每个 volume 的遗留 detached 对象，即使 pending admission 已满仍完成必要清理并报告实际 OverLimit；损坏图在清理前拒绝，失败事务保持节点、对象、用量和 durable generation。[迁移用例](../packages/metastore/sqlite/internal/integration/schema_test.go)从受见证保护的旧 schema 前滚，核对已有节点与 accepted state，并在旧 schema 损坏或预算不足时保持原数据。
 
 ### 中立 range 与 POSIX 映射
@@ -142,7 +152,7 @@ schema 迁移从真实 v5 fixture 前滚，核对 mode 到 NodeKind / `posix.per
 
 [advisory 上限用例](../packages/advisory/bounds_test.go)分别耗尽 Session、Owner、range、pending 与 action history，核对拒绝不会丢弃旧状态、拆分失败不改变原范围、取消及历史到期能回收对应名额。Commands、Claims、Effects 的完整回执在任何效果前验证容量。阻塞申请可以在有效且持续续租的 Session 内等待，不继承 Strong 的有限 Wait。只有 Cancelled/Released 证明没有遗留 grant 时才能返回可重试的 `EINTR`，结果未知保持 `EIO` 和 I/O 隔离；Drop 只清理指定 owner 与 domain。
 
-Use/range 生命周期用例还要区分持久数据与内存控制状态：SQLite 重开后 NodeKind、共同时间和 opaque metadata 保持，旧 authority 的 File、scope、UseOwner、range 与请求历史全部失效。新会话可以重新取得状态，但不能恢复或静默重绑旧持有者；Strong S/X 的持久恢复用例保持独立。
+Use/range 生命周期用例还要区分持久数据与内存控制状态：SQLite 重开后 NodeKind、共同时间、opaque metadata、pending state 与 delete intent 保持，旧 authority 的 File、NodeReference、scope、UseOwner、range 与有限 FileAction history 全部失效。新会话可以查询 durable intent 并重新取得普通状态，但不能恢复或静默重绑旧持有者；Strong S/X 的持久恢复用例保持独立。
 
 [FUSE bridge 用例](../packages/fuse/advisory_bridge_test.go)与[owner 用例](../packages/fuse/lock_owners_test.go)通过真实 raw callback 验证内核 LockOwner 到 UseOwner/range command 的映射，包括 owner 为零、没有加过锁的描述符关闭、POSIX 任一描述符关闭与 flock 最后一次 Release 的区别。record owner 携带内核 POSIX PID 作为 Diagnostic，跨挂载 `F_GETLK` 返回该 PID；缺失、零或超过有符号 Linux `pid_t` 上限 `math.MaxInt32` 的冲突 Diagnostic 以 `EIO` 失败。内部 UseOwner、kernel cookie 和 Group 不作为 PID 泄漏。缺失或饱和的 raw metadata 不得继续以错误 owner 执行动作；取消必须先核对远端结果。`unknown cancellation` 分支直接断言挂载 volume 的健康检查为 `EIO`。Release 中 owner 清理失败仍尝试关闭引用并保存错误，同时核对挂载整体已被隔离。
 
@@ -183,6 +193,8 @@ SQLite 只读用例覆盖查询取消、预算回调取消、回调成功后才�
 [Forget 事务用例](../packages/metastore/sqlite/objects_test.go)分别取消尚未准入与已准入的批次：前者以 `EINTR` 退出并保留原记录，后者完成真实 Commit / Accept，不能因调用方取消捏造失败。[SQL 执行中取消用例](../packages/metastore/sqlite/objects_test.go)在 `objects` 的 DELETE 与 `database_state` 的 UPDATE 已进入 SQLite 时取消调用方，断言没有原生 rollback、garbage 记录已删除、generation 恰推进一次，读取和 Close 仍成功且 SQL 连接已释放。真实提交、见证或回滚故障仍须保持 `EIO` 与失败隔离。[关闭交错用例](../packages/metastore/sqlite/objects_test.go)让已经接纳的 Forget 在授权方退役后发生真实 driver COMMIT 故障，断言 Close 保留该原因、重复 Close 返回相同缓存错误，另一原生排他 opener 仍以 `EBUSY` 失败。[组合关闭用例](../packages/metastore/sqlite/objects_test.go)验证已准入的整批 Forget 完成、待准入者以 `EINTR` 退出，并重开同一数据库检查 garbage 记录。
 
 HTTP 用例区分 `Do` 前取消、已发出的只读请求与已发出的 mutation，断言是否到达服务端以及最终 errno。真实网络错误不能泄漏 `ENOENT` 等底层 errno；成功修改后的 barrier 取消仍为 `EIO`。FUSE 复合操作分别在任何效果之前及已有 volume 或句柄效果之后取消，验证后者不会返回暗示整个操作未执行的 `EINTR`。
+
+FileAction 用例对 OpenAt/OpenNodeRef/OpenChildRef、MutateName、conditional mutation、pending set/clear 与 delete-intent ACK 注入回复丢失和取消：同 ID、同输入只执行一次并返回原结果，同 ID、不同输入拒绝；查询保留记录带原 Operation，缺失记录只能返回空 Operation 的 not-executed/unknown/retired。completed 或 pending 不得缺失 Operation。authority epoch 前进后旧动作不能重新执行，只有明确 not-executed 允许调用方创建新的逻辑动作。
 
 [打开 ACK 用例](../packages/transport/httprest/file_client_test.go)在真实 Open 返回引用后取消 ACK，覆盖按路径只读、读写以及按节点读写的普通已有文件打开；要求没有返回 File、原取消原因和规范 EINTR 保留、ACK 发出零次，同一 Session／File 的清理确认一次，native open／close 各一次，属性与字节不变，unlink 后无残留引用用量。创建、截断、报告 DeadlineExceeded 的 context、已发送但丢失且核对失败的 ACK、会话关闭，以及清理 EIO／ESTALE 仍为无 File 的 EIO；创建和截断效果如实保留，未成功清理的引用仍占用实际用量。该 deadline 用例验证 ACK 前的错误分类，既有真实计时器超时用例继续覆盖时间到期。清理必须原始返回 nil，不能把 ESTALE 的后续抑制当作成功；既有丢失 ACK 后成功核对的用例保留。
 
@@ -240,7 +252,7 @@ authority 的[发布交错用例](../packages/locking/contract_concurrency_test.
 
 [server 用例](../packages/transport/httprest/lock_server_test.go)验证 `/v4/` 协议标记和旧版本拒绝，以及匿名与 scoped 调用都抵达同一个执行保护的 volume。Scope header 的空值、重复值、错误 base64url、缺失或重复成员、未知字段、超长值和错误使用位置必须在修改前拒绝，随后 Stat 证实目标未创建；读取与控制操作不接受 mutation scope。能力值只在 body/header 中传递，URL 与错误诊断不能泄漏它们。[Scope 用例](../packages/transport/httprest/lock_scope_test.go)逐一验证所有 mutation、WithBarrier 与无效果 mutation 保留复制后的 proof，读取不发送它，匿名 handler 不继承被包装客户端的权限。
 
-[文件能力 HTTP 用例](../packages/transport/httprest/file_capabilities_test.go)验证当前 server 的 session 只宣告 Metadata/Owners/Ranges，File 只宣告 Metadata/Scope，并把其它已命名 bool 明确编码为 false。兼容性用例让这些预留 bool 为 true，要求未实现对应 facet 的 v4 client 忽略它们，同时继续拒绝任意未知字段；Open 的可选 node 与 Close/SessionClose 的可选 barrier 也不得改变当前调用结果。metadata request 的空 version 与 response 的非空 authority version 使用不同 decoder，canonical base64、字段上限、ResultBytes、barrier 和引用清理分别核对。[range receipt 用例](../packages/transport/httprest/file_range_receipt_test.go)在进入 coordinator 前验证完整 Commands/Claims/Effects 能装入 256 KiB 文件控制 envelope，并核对 Rejected 的 `FailedAt`、nil 的 request-wide failure 位置及 Effects；截断、矛盾 state、错误 request identity 或缺失 effect 都不能变成成功。
+[文件能力 HTTP 用例](../packages/transport/httprest/file_capabilities_test.go)验证 server 按实际包装链宣告 AtomicOpen/Namespace/References/FileActions/Metadata/Owners/Ranges 与引用的 Scope/State/Delete/Conditional，DirectoryMetadata/ReferenceName 仍为 false。OpenAt/OpenNodeRef/OpenChildRef 的 action、node/outcome、partial reference、ACK 与 barrier，LookupAt/MutateName、条件 mutation、pending set/clear、QueryFileAction、QueryDeleteIntent 和 AcknowledgeDeleteIntent 都使用严格 variant；空 Operation 只允许没有 retained record 的 not-executed/unknown/retired receipt。metadata request 的空 token、canonical base64、字段上限、ResultBytes 和清理 ownership 分别核对。兼容性仍允许已知预留 bool，未知字段继续失败。
 
 [副本转发用例](../packages/storage/replicated/lock_service_test.go)分别把基础 replica 和 scoped 视图交给真实 HTTP handler。代理查询须找到原授权方的 grant，匿名修改被拒绝，显式 proof 修改成功后本地 replica 立即可见；经代理 Release 后，再从原授权方确认 Released。随后匿名写与普通读仍可用，关闭代理 HTTP 服务后底层 replica 仍能写入，内容由原服务端重新读取核对。
 

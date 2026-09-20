@@ -1213,66 +1213,12 @@ func TestAListingNoticesWhatTheDirectoryNoLongerHas(t *testing.T) {
 
 // --- symbolic links --------------------------------------------------------------------
 
-// The storage interface can describe symbolic links but cannot create or resolve them.
-// The mount must preserve that type and refuse resolution. SQLite stores only files
-// and directories, so this decorator describes real sentinel nodes as links, retaining
-// their volume identities in both Stat and List.
-type linkStorage struct {
-	storage.FileStorage
-	lengths map[uint64]int64
-}
-
-func (s *linkStorage) describe(attr storage.Attr) storage.Attr {
-	if length, ok := s.lengths[attr.ID]; ok {
-		attr.Kind = storage.NodeSymlink
-		attr.Size = length
-	}
-	return attr
-}
-
-func (s *linkStorage) Stat(ctx context.Context, path string) (storage.Attr, error) {
-	attr, err := s.FileStorage.Stat(ctx, path)
-	if err != nil {
-		return storage.Attr{}, err
-	}
-	return s.describe(attr), nil
-}
-
-func (s *linkStorage) List(ctx context.Context, path string) ([]storage.Entry, error) {
-	entries, err := s.FileStorage.List(ctx, path)
-	if err != nil {
-		return nil, err
-	}
-	for i := range entries {
-		entries[i].Attr = s.describe(entries[i].Attr)
-	}
-	return entries, nil
-}
-
-func (s *linkStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
-	return decorateSession(ctx, s.FileStorage, options, retainedHooks{
-		attr: func(_ string, attr storage.Attr) storage.Attr { return s.describe(attr) },
-	})
-}
-
 func mountLinks(t *testing.T) (string, storage.Storage) {
 	t.Helper()
 	backing := fuseVolume(t)
-	if err := backing.Write(t.Context(), "target", []byte("payload")); err != nil {
-		t.Fatal(err)
-	}
-	links := &linkStorage{FileStorage: backing, lengths: make(map[uint64]int64)}
-	for name, target := range map[string]string{"link": "target", "dangling": "nowhere"} {
-		if err := backing.Create(t.Context(), name); err != nil {
-			t.Fatal(err)
-		}
-		attr, err := backing.Stat(t.Context(), name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		links.lengths[attr.ID] = int64(len(target))
-	}
-	return mountStorage(t, links, fuse.Options{Logger: testLogger(t)}), backing
+	mountpoint := mountStorage(t, backing, fuse.Options{Logger: testLogger(t)})
+	plantLink(t, mountpoint)
+	return mountpoint, backing
 }
 
 func plantLink(t *testing.T, dir string) {
@@ -1337,51 +1283,32 @@ func TestASymbolicLinkKeepsOneIdentity(t *testing.T) {
 	}
 }
 
-// Where a link points cannot be said, so nothing resolves through one — and the refusal
-// says that rather than saying the name is not a link, or answering with the target.
-//
-// Reading the target's contents under the link's name is the failure that matters: it
-// succeeds, so nothing above notices, and the bytes belong to a file the caller did not
-// name. EOPNOTSUPP is the FUSE library's answer for a node that cannot be read back as a
-// link, and it is the true one: the volume has no operation that could answer.
-func TestNothingResolvesThroughASymbolicLink(t *testing.T) {
+func TestSymbolicLinksResolveAndDanglingLinksRemainObservable(t *testing.T) {
 	mountpoint, backing := mountLinks(t)
 	link := filepath.Join(mountpoint, "link")
-
-	for _, c := range []struct {
-		name string
-		run  func() error
-	}{
-		{"readlink", func() error { _, err := os.Readlink(link); return err }},
-		{"stat, which follows", func() error { _, err := os.Stat(link); return err }},
-		{"open", func() error {
-			f, err := os.Open(link)
-			if err == nil {
-				f.Close()
-			}
-			return err
-		}},
-		{"read", func() error { _, err := os.ReadFile(link); return err }},
-		{"write", func() error { return os.WriteFile(link, []byte("elsewhere"), 0o644) }},
-	} {
-		t.Run(c.name+" is refused", func(t *testing.T) {
-			err := c.run()
-			if err == nil {
-				t.Fatal("the operation succeeded; it can only have been answered by the file the link points at")
-			}
-			if !errors.Is(err, syscall.EOPNOTSUPP) {
-				t.Fatalf("the operation failed with %v, want EOPNOTSUPP", err)
-			}
-		})
+	if target, err := os.Readlink(link); err != nil || target != "target" {
+		t.Fatalf("readlink = %q, %v", target, err)
+	}
+	if body, err := os.ReadFile(link); err != nil || string(body) != "payload" {
+		t.Fatalf("read through link = %q, %v", body, err)
+	}
+	if err := os.WriteFile(link, []byte("elsewhere"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dangling := filepath.Join(mountpoint, "dangling")
+	if target, err := os.Readlink(dangling); err != nil || target != "nowhere" {
+		t.Fatalf("dangling readlink = %q, %v", target, err)
+	}
+	if _, err := os.Stat(dangling); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("following dangling link returned %v, want ENOENT", err)
 	}
 
-	// Nothing reached the target under the link's name.
 	body, err := backing.Read(t.Context(), "target")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(body) != "payload" {
-		t.Fatalf("the file the link points at now holds %q, want %q", body, "payload")
+	if string(body) != "elsewhere" {
+		t.Fatalf("the file the link points at now holds %q", body)
 	}
 }
 
@@ -1631,12 +1558,130 @@ func decorateSession(ctx context.Context, backing storage.FileStorage, options s
 	if err != nil {
 		return nil, err
 	}
-	return &decoratedSession{capableTestSession: testSessionCapabilities(session), hooks: hooks}, nil
+	root, err := backing.Stat(ctx, "")
+	if err != nil {
+		return nil, errors.Join(err, session.Close(ctx))
+	}
+	wrapped := &decoratedSession{capableTestSession: testSessionCapabilities(session), hooks: hooks}
+	wrapped.paths.Store(root.ID, "")
+	return wrapped, nil
 }
 
 type decoratedSession struct {
 	capableTestSession
+	paths sync.Map
 	hooks retainedHooks
+}
+
+func (s *decoratedSession) pathFor(id uint64) string {
+	if path, ok := s.paths.Load(id); ok {
+		return path.(string)
+	}
+	return s.hooks.nodePath(id)
+}
+
+func (s *decoratedSession) childPath(name storage.ChildName) string {
+	parent := s.pathFor(name.Parent.NodeID)
+	if parent == "" {
+		return string(name.RawLeaf)
+	}
+	return parent + "/" + string(name.RawLeaf)
+}
+
+func (s *decoratedSession) LookupAt(ctx context.Context, name storage.ChildName) (storage.Attr, error) {
+	path := s.childPath(name)
+	if err := s.hooks.check("Stat", path); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := s.NamespaceAccess.LookupAt(ctx, name)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	s.paths.Store(attr.ID, path)
+	return s.hooks.describe(path, attr), nil
+}
+
+func (s *decoratedSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
+	path := s.childPath(name)
+	if err := s.hooks.check("OpenFile", path); err != nil {
+		return storage.OpenResult{}, err
+	}
+	if options.Create {
+		if err := s.hooks.check("Create", path); err != nil {
+			return storage.OpenResult{}, err
+		}
+	}
+	result, err := s.AtomicFileOpener.OpenAt(ctx, name, options)
+	if result.File != nil {
+		result.File = &decoratedFile{File: result.File, hooks: s.hooks, path: path}
+	}
+	if err != nil {
+		return result, err
+	}
+	s.paths.Store(result.Attr.ID, path)
+	if err := s.hooks.check("Stat", path); err != nil {
+		return result, err
+	}
+	result.Attr = s.hooks.describe(path, result.Attr)
+	return result, nil
+}
+
+func (s *decoratedSession) MutateName(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
+	operation := map[storage.NameOperation]string{
+		storage.NameCreate: "Create", storage.NameMkdir: "Mkdir", storage.NameRemove: "Remove",
+		storage.NameRemoveDir: "RemoveDir", storage.NameRename: "Rename", storage.NameSymlink: "Symlink",
+	}[command.Kind]
+	path := s.childPath(command.Name)
+	if err := s.hooks.check(operation, path); err != nil {
+		return storage.NameResult{}, err
+	}
+	result, err := s.NamespaceAccess.MutateName(ctx, command)
+	if result.Attr != nil {
+		resultPath := path
+		if command.Destination != nil {
+			resultPath = s.childPath(storage.ChildName{Parent: command.Destination.Parent, RawLeaf: command.Destination.OutputLeaf})
+		}
+		s.paths.Store(result.Attr.ID, resultPath)
+		if err == nil {
+			if hookErr := s.hooks.check("Stat", resultPath); hookErr != nil {
+				return result, hookErr
+			}
+		}
+		attr := s.hooks.describe(resultPath, *result.Attr)
+		result.Attr = &attr
+	}
+	return result, err
+}
+
+func (s *decoratedSession) OpenNodeRef(ctx context.Context, id uint64, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	path := s.pathFor(id)
+	if err := s.hooks.check("OpenNode", path); err != nil {
+		return storage.NodeOpenResult{}, err
+	}
+	result, err := s.NodeReferences.OpenNodeRef(ctx, id, options)
+	if result.Reference != nil {
+		result.Reference = &decoratedNodeReference{NodeReference: result.Reference, hooks: s.hooks, path: path}
+	}
+	if err == nil {
+		result.Attr = s.hooks.describe(path, result.Attr)
+	}
+	return result, err
+}
+
+func (s *decoratedSession) OpenChildRef(ctx context.Context, name storage.ChildName, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	path := s.childPath(name)
+	if err := s.hooks.check("OpenNode", path); err != nil {
+		return storage.NodeOpenResult{}, err
+	}
+	result, err := s.NodeReferences.OpenChildRef(ctx, name, options)
+	if result.Reference != nil {
+		result.Reference = &decoratedNodeReference{NodeReference: result.Reference, hooks: s.hooks, path: path}
+	}
+	if err == nil {
+		s.paths.Store(result.Attr.ID, path)
+		result.Attr = s.hooks.describe(path, result.Attr)
+	}
+	return result, err
 }
 
 func (s *decoratedSession) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, error) {
@@ -1656,7 +1701,7 @@ func (s *decoratedSession) OpenFile(ctx context.Context, path string, options st
 }
 
 func (s *decoratedSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
-	path := s.hooks.nodePath(id)
+	path := s.pathFor(id)
 	if err := s.hooks.check("OpenNode", path); err != nil {
 		return nil, err
 	}
@@ -1668,7 +1713,7 @@ func (s *decoratedSession) OpenNode(ctx context.Context, id uint64, options stor
 }
 
 func (s *decoratedSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
-	path := s.hooks.nodePath(id)
+	path := s.pathFor(id)
 	if err := s.hooks.check("Stat", path); err != nil {
 		return storage.Attr{}, err
 	}
@@ -1680,7 +1725,7 @@ func (s *decoratedSession) StatNode(ctx context.Context, id uint64) (storage.Att
 }
 
 func (s *decoratedSession) SetNodeAttr(ctx context.Context, id uint64, change storage.AttrChange) (storage.Attr, error) {
-	path := s.hooks.nodePath(id)
+	path := s.pathFor(id)
 	if err := s.hooks.check("SetAttr", path); err != nil {
 		return storage.Attr{}, err
 	}
@@ -1692,10 +1737,59 @@ func (s *decoratedSession) SetNodeAttr(ctx context.Context, id uint64, change st
 }
 
 func (s *decoratedSession) SetMetadata(ctx context.Context, id uint64, namespace string, version, data []byte) (storage.OpaquePayload, error) {
-	if err := s.hooks.check("SetAttr", s.hooks.nodePath(id)); err != nil {
+	if err := s.hooks.check("SetAttr", s.pathFor(id)); err != nil {
 		return storage.OpaquePayload{}, err
 	}
 	return s.MetadataAccess.SetMetadata(ctx, id, namespace, version, data)
+}
+
+type decoratedNodeReference struct {
+	storage.NodeReference
+	hooks retainedHooks
+	path  string
+}
+
+func (r *decoratedNodeReference) Stat(ctx context.Context) (storage.Attr, error) {
+	if err := r.hooks.check("Stat", r.path); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := r.NodeReference.Stat(ctx)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	return r.hooks.describe(r.path, attr), nil
+}
+
+func (r *decoratedNodeReference) SetAttr(ctx context.Context, change storage.AttrChange) (storage.Attr, error) {
+	if err := r.hooks.check("SetAttr", r.path); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := r.NodeReference.SetAttr(ctx, change)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	return r.hooks.describe(r.path, attr), nil
+}
+
+func (r *decoratedNodeReference) CheckScopedReference() error {
+	return r.NodeReference.CheckScopedReference()
+}
+
+func (r *decoratedNodeReference) Scope(ctx context.Context) (storage.UseScope, error) {
+	return r.NodeReference.Scope(ctx)
+}
+
+func (r *decoratedNodeReference) CheckReferenceState() error {
+	return r.NodeReference.CheckReferenceState()
+}
+
+func (r *decoratedNodeReference) State(ctx context.Context) (storage.ReferenceState, error) {
+	state, err := r.NodeReference.State(ctx)
+	if err != nil {
+		return state, err
+	}
+	state.Attr = r.hooks.describe(r.path, state.Attr)
+	return state, nil
 }
 
 type decoratedFile struct {
@@ -1796,10 +1890,8 @@ func failing(operation string, err error) func(string, string) error {
 	}
 }
 
-// afterTheLookup produces a fault that lets the first Stat of one path through and fails
-// every Stat of it after that. The lookup that precedes an open, a creation or a
-// truncation is a Stat too, and it has to succeed for the operation itself to be
-// attempted at all; this reaches the Stat the operation makes on its own behalf.
+// afterTheLookup lets the first observation of one path through and fails later
+// attribute observations for the same path.
 func afterTheLookup(path string, err error) func(string, string) error {
 	looked := false
 	return func(operation, candidate string) error {
@@ -1963,11 +2055,9 @@ func TestAWriteFailureIsReportedBeforeClose(t *testing.T) {
 	}
 }
 
-// The volume can fail after a create has already succeeded. Reading back what was
-// just made is the only way to know its attributes, so a failure there has to be a
-// failure; inventing the attributes of a file we could not look at would be a guess
-// presented as fact.
-func TestAFailureReadingBackWhatWasJustMadeIsReported(t *testing.T) {
+// A failure delivering the captured result after creation cannot turn into a guessed
+// success. The caller receives an error while the committed node remains visible.
+func TestAFailureDeliveringCreatedNodeResultIsReported(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		act  func(root string) error
@@ -1992,8 +2082,8 @@ func TestAFailureReadingBackWhatWasJustMadeIsReported(t *testing.T) {
 	}
 }
 
-// File creation includes its initial mode atomically; directory initialization still
-// has a separate metadata mutation. Failure at either boundary must reach the caller.
+// File and directory creation include initial permissions in the same authority
+// mutation. Refusal at that boundary must reach the caller.
 func TestAFailureCreatingANodeWithItsModeIsReported(t *testing.T) {
 	for _, c := range []struct {
 		name      string
@@ -2007,7 +2097,7 @@ func TestAFailureCreatingANodeWithItsModeIsReported(t *testing.T) {
 			}
 			return f.Close()
 		}},
-		{"a created directory", "SetAttr", func(root string) error {
+		{"a created directory", "Mkdir", func(root string) error {
 			return os.Mkdir(filepath.Join(root, "new"), 0o700)
 		}},
 	} {
@@ -3244,16 +3334,24 @@ func setBackingMode(t *testing.T, backing storage.Storage, path string, mode fs.
 
 type capableTestSession struct {
 	storage.FileSession
+	storage.NamespaceAccess
+	storage.AtomicFileOpener
 	storage.MetadataAccess
 	storage.UseOwners
 	storage.RangeControl
+	storage.NodeReferences
+	storage.FileActions
 }
 
 func testSessionCapabilities(session storage.FileSession) capableTestSession {
 	return capableTestSession{
-		FileSession:    session,
-		MetadataAccess: session.(storage.MetadataAccess),
-		UseOwners:      session.(storage.UseOwners),
-		RangeControl:   session.(storage.RangeControl),
+		FileSession:      session,
+		NamespaceAccess:  session.(storage.NamespaceAccess),
+		AtomicFileOpener: session.(storage.AtomicFileOpener),
+		MetadataAccess:   session.(storage.MetadataAccess),
+		UseOwners:        session.(storage.UseOwners),
+		RangeControl:     session.(storage.RangeControl),
+		NodeReferences:   session.(storage.NodeReferences),
+		FileActions:      session.(storage.FileActions),
 	}
 }
