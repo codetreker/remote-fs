@@ -230,6 +230,12 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 		return fileResponse{}, unreachable(Request{Op: OpFile}, err)
 	}
 	req = frozen
+	if semantic := semanticFileAction(req); semantic != "" {
+		if req.Action != "" && req.Action != semantic {
+			return fileResponse{}, unreachable(Request{Op: OpFile}, errors.New("file operation action identity differs from its semantic action"))
+		}
+		req.Action = semantic
+	}
 	scope, hasScope := s.outgoingMutationScope(ctx, req)
 	if response, recovered, err := s.takePendingResult(req, scope, hasScope); recovered || err != nil {
 		return response, err
@@ -245,7 +251,7 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 		return fileResponse{}, syscall.ESTALE
 	}
 	reserved := false
-	if fileActionRequired(req.Op) && req.Action == "" {
+	if fileActionRequired(req.Op) {
 		limit := s.pendingLimit
 		if limit <= 0 {
 			limit = storage.DefaultFileSessionOptions().MaxLockActions
@@ -254,10 +260,12 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 			s.mu.Unlock()
 			return fileResponse{}, syscall.EAGAIN
 		}
-		req.Action, err = storage.NewLockRequestID(s.epoch)
-		if err != nil {
-			s.mu.Unlock()
-			return fileResponse{}, err
+		if req.Action == "" {
+			req.Action, err = storage.NewLockRequestID(s.epoch)
+			if err != nil {
+				s.mu.Unlock()
+				return fileResponse{}, err
+			}
 		}
 		s.inflight++
 		reserved = true
@@ -296,7 +304,7 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 		if recoveryErr == nil && !recovered.Retry {
 			response, err = recovered, nil
 		} else if recordedFileOutcome(recoveryErr) {
-			err = recoveryErr
+			response, err = recovered, recoveryErr
 		} else if recoveryAction != "" {
 			s.mu.Lock()
 			if s.pending == nil {
@@ -398,6 +406,8 @@ func (s *remoteFileSession) resolvePending(ctx context.Context) error {
 		if err != nil {
 			if recordedFileOutcome(err) {
 				s.mu.Lock()
+				copy := response
+				pending.response = &copy
 				pending.resultErr = err
 				s.pending[key] = pending
 				s.mu.Unlock()
@@ -437,7 +447,7 @@ func (s *remoteFileSession) takePendingResult(incoming fileRequest, incomingScop
 		}
 		if pending.response != nil {
 			delete(s.pending, key)
-			return *pending.response, true, nil
+			return *pending.response, true, pending.resultErr
 		}
 		if pending.resultErr != nil {
 			delete(s.pending, key)
@@ -501,6 +511,14 @@ func responseFileAttr(response fileResponse, err error) (storage.Attr, error) {
 		return storage.Attr{}, unreachable(Request{Op: OpFile}, errors.New("file result carries no attributes"))
 	}
 	return response.Attr.Storage(), nil
+}
+
+func responseRegularFileAttr(response fileResponse, err error) (storage.Attr, error) {
+	attr, err := responseFileAttr(response, err)
+	if err == nil && attr.Kind != storage.NodeRegular {
+		return storage.Attr{}, unreachable(Request{Op: OpFile}, errors.New("file operation returned nonregular attributes"))
+	}
+	return attr, err
 }
 func (s *remoteFileSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
 	r, e := s.call(ctx, fileRequest{Op: storage.OpFileStatNode, Node: id})
@@ -576,7 +594,13 @@ func (f *remoteFile) call(ctx context.Context, r fileRequest) (fileResponse, err
 	return f.session.call(ctx, r)
 }
 func (f *remoteFile) Stat(ctx context.Context) (storage.Attr, error) {
+	return f.stat(ctx, true)
+}
+func (f *remoteFile) stat(ctx context.Context, regular bool) (storage.Attr, error) {
 	r, e := f.call(ctx, fileRequest{Op: storage.OpFileStat})
+	if regular {
+		return responseRegularFileAttr(r, e)
+	}
 	return responseFileAttr(r, e)
 }
 func (f *remoteFile) ReadAt(ctx context.Context, offset int64, length int) (storage.FileRead, error) {
@@ -584,7 +608,7 @@ func (f *remoteFile) ReadAt(ctx context.Context, offset int64, length int) (stor
 		return storage.FileRead{}, syscall.EINVAL
 	}
 	r, e := f.call(ctx, fileRequest{Op: storage.OpFileRead, Offset: offset, Length: length})
-	a, e := responseFileAttr(r, e)
+	a, e := responseRegularFileAttr(r, e)
 	if e != nil {
 		return storage.FileRead{}, e
 	}
@@ -608,7 +632,7 @@ func (f *remoteFile) WriteAtWithBarrier(ctx context.Context, offset int64, data 
 		return storage.Attr{}, nil, syscall.EINVAL
 	}
 	r, e := f.call(ctx, fileRequest{Op: storage.OpFileWrite, Offset: offset, Data: data})
-	a, e := responseFileAttr(r, e)
+	a, e := responseRegularFileAttr(r, e)
 	return a, r.Barrier, e
 }
 func (f *remoteFile) Truncate(ctx context.Context, size int64) (storage.Attr, error) {
@@ -620,17 +644,25 @@ func (f *remoteFile) TruncateWithBarrier(ctx context.Context, size int64) (stora
 		return storage.Attr{}, nil, syscall.EINVAL
 	}
 	r, e := f.call(ctx, fileRequest{Op: storage.OpFileTruncate, Offset: size})
-	a, e := responseFileAttr(r, e)
+	a, e := responseRegularFileAttr(r, e)
 	return a, r.Barrier, e
 }
 func (f *remoteFile) SetAttr(ctx context.Context, c storage.AttrChange) (storage.Attr, error) {
-	a, _, e := f.SetAttrWithBarrier(ctx, c)
+	a, _, e := f.setAttrWithBarrier(ctx, c, true)
 	return a, e
 }
 func (f *remoteFile) SetAttrWithBarrier(ctx context.Context, c storage.AttrChange) (storage.Attr, *MutationBarrier, error) {
+	return f.setAttrWithBarrier(ctx, c, true)
+}
+func (f *remoteFile) setAttrWithBarrier(ctx context.Context, c storage.AttrChange, regular bool) (storage.Attr, *MutationBarrier, error) {
 	change := AttrChangeOf(c)
 	r, e := f.call(ctx, fileRequest{Op: storage.OpFileSetAttr, Change: change})
-	a, e := responseFileAttr(r, e)
+	var a storage.Attr
+	if regular {
+		a, e = responseRegularFileAttr(r, e)
+	} else {
+		a, e = responseFileAttr(r, e)
+	}
 	return a, r.Barrier, e
 }
 func (f *remoteFile) Sync(ctx context.Context) error {

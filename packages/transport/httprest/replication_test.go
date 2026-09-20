@@ -807,10 +807,10 @@ func row(parent int64, name string, node metastore.Node) metastore.Row {
 // seconds and the nanoseconds are printed apart because that is how they travel, and a
 // comparison that folded them back together would not notice one of the two going missing.
 func describe(r metastore.Row) string {
-	return fmt.Sprintf("parent=%d name=%q id=%d kind=%v size=%d accessed=%d.%09d changed=%d.%09d content=%q birth=%v change=%v metadata=%v",
+	return fmt.Sprintf("parent=%d name=%q id=%d kind=%v size=%d accessed=%d.%09d changed=%d.%09d content=%q target=%q birth=%v change=%v metadata=%v",
 		r.Parent, r.Name, r.Node.ID, r.Node.Kind, r.Node.Size,
 		r.Node.AccessTime.Unix(), r.Node.AccessTime.Nanosecond(),
-		r.Node.ModTime.Unix(), r.Node.ModTime.Nanosecond(), r.Node.Content,
+		r.Node.ModTime.Unix(), r.Node.ModTime.Nanosecond(), r.Node.Content, r.Node.LinkTarget,
 		wireOptionalInstant(r.Node.BirthTime), wireOptionalInstant(r.Node.ChangeTime), r.Node.Metadata)
 }
 
@@ -1344,10 +1344,42 @@ func TestReplicationFramesRejectAmbiguousJSONAndNoncanonicalBytes(t *testing.T) 
 		{"page duplicate", `{"rows":[` + row + `],"rows":[` + row + `]}`, func() any { return new(httprest.SnapshotPage) }},
 		{"page unknown", `{"rows":[` + row + `],"extra":0}`, func() any { return new(httprest.SnapshotPage) }},
 		{"page noncanonical nested bytes", `{"rows":[{"parent":1,"name":"YR==","node":` + node + `}]}`, func() any { return new(httprest.SnapshotPage) }},
+		{"node noncanonical link target", `{"id":2,"kind":3,"size":1,"access_time":{"unix_sec":1,"nanos":0},"mod_time":{"unix_sec":2,"nanos":0},"content":"","link_target":"eB=="}`, func() any { return new(httprest.Node) }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if err := json.Unmarshal([]byte(test.body), test.into()); err == nil {
 				t.Fatalf("accepted %s", test.body)
+			}
+		})
+	}
+}
+
+func TestReplicationNodesRejectInvalidSymbolicLinkPayloads(t *testing.T) {
+	base := func() map[string]any {
+		return map[string]any{
+			"id": 2, "kind": storage.NodeSymlink, "size": 1,
+			"access_time": map[string]any{"unix_sec": 1, "nanos": 0},
+			"mod_time":    map[string]any{"unix_sec": 2, "nanos": 0},
+			"content":     []byte{}, "link_target": []byte("x"),
+		}
+	}
+	tests := map[string]func(map[string]any){
+		"missing target": func(node map[string]any) { delete(node, "link_target") },
+		"size mismatch":  func(node map[string]any) { node["size"] = 2 },
+		"content key":    func(node map[string]any) { node["content"] = []byte("key") },
+		"oversized target": func(node map[string]any) {
+			node["size"] = storage.MaxLinkTargetBytes + 1
+			node["link_target"] = make([]byte, storage.MaxLinkTargetBytes+1)
+		},
+		"target on regular file": func(node map[string]any) { node["kind"] = storage.NodeRegular },
+	}
+	for name, damage := range tests {
+		t.Run(name, func(t *testing.T) {
+			node := base()
+			damage(node)
+			var decoded httprest.Node
+			if err := decodesInto(t, node, &decoded); err == nil {
+				t.Fatalf("accepted invalid node: %+v", node)
 			}
 		})
 	}
@@ -1585,6 +1617,9 @@ func TestAChangeSurvivesTheRoundTrip(t *testing.T) {
 	for _, want := range []metastore.Change{
 		{Position: 1, Kind: metastore.Created, Parent: 1, Name: []byte("\xff\xfe not utf-8"), Node: &node},
 		{Position: 9007199254740993, Kind: metastore.Modified, Parent: 5, Name: []byte("日本語"), Node: &node},
+		{Position: 2, Kind: metastore.Created, Parent: 1, Name: []byte("link"), Node: &metastore.Node{
+			ID: 8, Kind: storage.NodeSymlink, Size: 3, AccessTime: node.AccessTime, ModTime: node.ModTime, LinkTarget: []byte{0xff, 0, 'x'},
+		}},
 		{Position: 3, Kind: metastore.Removed, Parent: 1, Name: []byte("gone")},
 		{Position: 4, Kind: metastore.Renamed, Parent: 2, Name: []byte("after"),
 			From: &metastore.Location{Parent: 1, Name: []byte("\x00before")}, Node: &node},

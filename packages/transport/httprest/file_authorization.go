@@ -72,8 +72,6 @@ func (h *Handler) authorizeFile(ctx context.Context, request fileRequest) error 
 		if len(request.Name.Initial.Metadata) != 0 {
 			appendOperation(storage.OpFileSetMetadata)
 		}
-	case storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
-		appendOperation(storage.OpVolumeRemove)
 	case storage.OpFileMutate:
 		mutation := request.Mutation.storage()
 		switch mutation.Kind {

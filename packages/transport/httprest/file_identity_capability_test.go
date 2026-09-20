@@ -4,14 +4,89 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/authz"
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
+	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 )
+
+func loseFileResponses(t *testing.T, client *Storage, operation storage.Operation, losses int32) *atomic.Int32 {
+	t.Helper()
+	original := client.http.Transport
+	var calls atomic.Int32
+	client.http.Transport = fileRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var envelope struct {
+			Op storage.Operation `json:"op"`
+		}
+		if request.GetBody != nil {
+			body, err := request.GetBody()
+			if err != nil {
+				return nil, err
+			}
+			err = json.NewDecoder(body).Decode(&envelope)
+			_ = body.Close()
+			if err != nil {
+				return nil, err
+			}
+		}
+		response, err := original.RoundTrip(request)
+		if envelope.Op != operation {
+			return response, err
+		}
+		attempt := calls.Add(1)
+		if err == nil && attempt <= losses {
+			_, _ = io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+			return nil, errors.New("lost semantic file response")
+		}
+		return response, err
+	})
+	t.Cleanup(func() { client.http.Transport = original })
+	return &calls
+}
+
+type partialNameBackend struct {
+	*objectstore.Storage
+	calls atomic.Int32
+}
+
+type partialNameSession struct {
+	storage.FileSession
+	backend *partialNameBackend
+}
+
+func (b *partialNameBackend) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+	session, err := b.Storage.NewFileSession(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &partialNameSession{FileSession: session, backend: b}, nil
+}
+
+func (*partialNameSession) CheckNamespaceAccess() error { return nil }
+
+func (s *partialNameSession) LookupAt(ctx context.Context, name storage.ChildName) (storage.Attr, error) {
+	return s.FileSession.(storage.NamespaceAccess).LookupAt(ctx, name)
+}
+
+func (s *partialNameSession) MutateName(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
+	s.backend.calls.Add(1)
+	result, err := s.FileSession.(storage.NamespaceAccess).MutateName(ctx, command)
+	if err != nil {
+		return result, err
+	}
+	return result, syscall.EIO
+}
 
 func TestIdentityCapabilitiesRoundTripOverHTTP(t *testing.T) {
 	ctx := t.Context()
@@ -144,6 +219,335 @@ func TestIdentityCapabilitiesRoundTripOverHTTP(t *testing.T) {
 	}
 }
 
+func TestLostSemanticOpenResponsesReplayTheOriginalCapability(t *testing.T) {
+	for _, operation := range []storage.Operation{storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef} {
+		t.Run(string(operation), func(t *testing.T) {
+			limits := DefaultFileLimits()
+			limits.PendingAck = 20 * time.Millisecond
+			client, handler, backend := retainedHTTPFixture(t, limits)
+			if err := backend.Mkdir(t.Context(), "dir"); err != nil {
+				t.Fatal(err)
+			}
+			if err := backend.Write(t.Context(), "dir/file", []byte("body")); err != nil {
+				t.Fatal(err)
+			}
+			parent, err := backend.Stat(t.Context(), "dir")
+			if err != nil {
+				t.Fatal(err)
+			}
+			file, err := backend.Stat(t.Context(), "dir/file")
+			if err != nil {
+				t.Fatal(err)
+			}
+			sessionValue, err := client.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+			if err != nil {
+				t.Fatal(err)
+			}
+			session := sessionValue.(*remoteFileSession)
+			defer session.Close(context.Background())
+			status, err := session.Status(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			action, err := storage.NewFileActionID(status.ActionEpoch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := loseFileResponses(t, client, operation, 2)
+
+			open := func() (retainedReference, error) {
+				switch operation {
+				case storage.OpFileOpenAt:
+					result, openErr := session.OpenAt(t.Context(), storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent.ID}, RawLeaf: []byte("file")}, storage.OpenAtOptions{
+						Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID}, Action: action,
+						Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
+					})
+					return result.File, openErr
+				case storage.OpFileOpenNodeRef:
+					result, openErr := session.OpenNodeRef(t.Context(), file.ID, storage.NodeRefOptions{
+						Kind: storage.NodeRegular, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID}, Action: action,
+						Use: storage.UseClaim{Uses: storage.ReadData}, MetadataAccess: storage.ReadMetadata,
+					})
+					return result.Reference, openErr
+				default:
+					result, openErr := session.OpenChildRef(t.Context(), storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent.ID}, RawLeaf: []byte("file")}, storage.NodeRefOptions{
+						Kind: storage.NodeRegular, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID}, Action: action,
+						Use: storage.UseClaim{Uses: storage.ReadData}, MetadataAccess: storage.ReadMetadata,
+					})
+					return result.Reference, openErr
+				}
+			}
+			if reference, lostErr := open(); storage.ErrnoOf(lostErr) != syscall.EIO || reference != nil {
+				t.Fatalf("lost open response reference=%T error=%v", reference, lostErr)
+			}
+			time.Sleep(250 * time.Millisecond)
+			reference, err := open()
+			if err != nil || reference == nil || calls.Load() != 3 {
+				t.Fatalf("open reference=%T calls=%d error=%v", reference, calls.Load(), err)
+			}
+			defer reference.Close(context.Background())
+			attr, err := reference.Stat(t.Context())
+			if err != nil || attr.ID != file.ID {
+				t.Fatalf("replayed capability was invalidated by pending cleanup: attr=%+v error=%v", attr, err)
+			}
+			handler.files.mu.Lock()
+			served := handler.files.sessions[session.id]
+			handler.files.mu.Unlock()
+			served.mu.Lock()
+			retained := len(served.files)
+			served.mu.Unlock()
+			if retained != 1 {
+				t.Fatalf("semantic open retained %d HTTP capabilities", retained)
+			}
+		})
+	}
+}
+
+func TestSemanticOpenReplayGetsAFreshAcknowledgementWindow(t *testing.T) {
+	limits := DefaultFileLimits()
+	limits.PendingAck = 500 * time.Millisecond
+	client, handler, backend := retainedHTTPFixture(t, limits)
+	if err := backend.Write(t.Context(), "file", []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := backend.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := backend.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionValue, err := client.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*remoteFileSession)
+	defer session.Close(context.Background())
+	status, err := session.Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := storage.NewFileActionID(status.ActionEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := fileRequest{
+		Op:    storage.OpFileOpenAt,
+		Child: childNameOf(storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("file")}),
+		OpenAt: openAtOptionsOf(storage.OpenAtOptions{
+			Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID}, Action: action,
+			Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
+		}),
+	}
+	first, err := session.call(t.Context(), request)
+	if err != nil || first.File == "" {
+		t.Fatalf("first open=%+v error=%v", first, err)
+	}
+	handler.files.mu.Lock()
+	served := handler.files.sessions[session.id]
+	handler.files.mu.Unlock()
+	served.mu.Lock()
+	deadline := time.Now().Add(150 * time.Millisecond)
+	served.actions[storage.LockRequestID(action)].expires = deadline
+	served.files[first.File].pending = deadline
+	served.mu.Unlock()
+	time.Sleep(100 * time.Millisecond)
+	replayed, err := session.call(t.Context(), request)
+	if err != nil || replayed.File != first.File {
+		t.Fatalf("replayed open=%+v error=%v", replayed, err)
+	}
+	waitUntil := time.Now().Add(2 * time.Second)
+	available := false
+	for time.Now().Before(waitUntil) {
+		served.mu.Lock()
+		_, actionPresent := served.actions[storage.LockRequestID(action)]
+		file := served.files[first.File]
+		available = !actionPresent && file != nil && !file.closing
+		served.mu.Unlock()
+		if available {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !available {
+		t.Fatal("action history expired without leaving the replayed capability available for acknowledgement")
+	}
+	if _, err := session.call(t.Context(), fileRequest{Op: storage.OpFileAck, File: first.File}); err != nil {
+		t.Fatalf("acknowledge replayed capability=%v", err)
+	}
+}
+
+func TestLostSemanticActionRefusalIsRecoveredAsRecorded(t *testing.T) {
+	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
+	root, err := backend.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionValue, err := client.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*remoteFileSession)
+	defer session.Close(context.Background())
+	status, err := session.Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := storage.NewFileActionID(status.ActionEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := loseFileResponses(t, client, storage.OpFileMutateName, 2)
+	command := storage.NameCommand{
+		Kind: storage.NameRemove, Action: action,
+		Name:   storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("missing")},
+		Target: storage.ChildCondition{State: storage.Any},
+	}
+	if result, lostErr := session.MutateName(t.Context(), command); storage.ErrnoOf(lostErr) != syscall.EIO || result.Attr != nil {
+		t.Fatalf("lost refusal response result=%+v error=%v", result, lostErr)
+	}
+	_, err = session.MutateName(t.Context(), command)
+	if !errors.Is(err, syscall.ENOENT) || calls.Load() != 3 {
+		t.Fatalf("known refusal calls=%d error=%v", calls.Load(), err)
+	}
+	session.mu.Lock()
+	pending := len(session.pending)
+	session.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("known refusal remained pending after replay: %d", pending)
+	}
+}
+
+func TestLostSemanticPartialResultIsRecoveredAsRecorded(t *testing.T) {
+	_, native := memoryfixture.New(t, "partial-semantic-http", 1<<20, locking.DefaultOptions())
+	backend := &partialNameBackend{Storage: native}
+	options := DefaultHandlerOptions()
+	options.Files = DefaultFileLimits()
+	handler, err := NewHandlerWithOptions(backend, nil, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(func() {
+		server.Close()
+		if err := handler.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	client, err := Dial(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := backend.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionValue, err := client.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*remoteFileSession)
+	defer session.Close(context.Background())
+	status, err := session.Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := storage.NewFileActionID(status.ActionEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := loseFileResponses(t, client, storage.OpFileMutateName, 2)
+	command := storage.NameCommand{
+		Kind: storage.NameCreate, Action: action,
+		Name:   storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("created")},
+		Target: storage.ChildCondition{State: storage.Absent},
+	}
+	if result, lostErr := session.MutateName(t.Context(), command); storage.ErrnoOf(lostErr) != syscall.EIO || result.Attr != nil {
+		t.Fatalf("lost partial response result=%+v error=%v", result, lostErr)
+	}
+	result, err := session.MutateName(t.Context(), command)
+	if !errors.Is(err, syscall.EIO) || result.Attr == nil || result.Attr.ID == 0 || calls.Load() != 3 || backend.calls.Load() != 1 {
+		t.Fatalf("partial result=%+v transport calls=%d native calls=%d error=%v", result, calls.Load(), backend.calls.Load(), err)
+	}
+	session.mu.Lock()
+	pending := len(session.pending)
+	session.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("partial result remained pending after replay: %d", pending)
+	}
+}
+
+func TestNodeReferenceStatAndSetAttrAcceptDirectoryAndSymlinkAttributes(t *testing.T) {
+	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
+	if err := backend.Mkdir(t.Context(), "dir"); err != nil {
+		t.Fatal(err)
+	}
+	root, err := backend.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := backend.Stat(t.Context(), "dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionValue, err := client.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*remoteFileSession)
+	defer session.Close(context.Background())
+	status, err := session.Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	newAction := func() storage.FileActionID {
+		action, actionErr := storage.NewFileActionID(status.ActionEpoch)
+		if actionErr != nil {
+			t.Fatal(actionErr)
+		}
+		return action
+	}
+	created, err := session.MutateName(t.Context(), storage.NameCommand{
+		Kind: storage.NameSymlink, Action: newAction(),
+		Name:    storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("link")},
+		Target:  storage.ChildCondition{State: storage.Absent},
+		Initial: storage.InitialFields{LinkTarget: []byte("target")},
+	})
+	if err != nil || created.Attr == nil {
+		t.Fatalf("create symlink=%+v error=%v", created, err)
+	}
+
+	tests := []struct {
+		name string
+		attr storage.Attr
+	}{
+		{name: "directory", attr: directory},
+		{name: "symlink", attr: *created.Attr},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			opened, err := session.OpenNodeRef(t.Context(), test.attr.ID, storage.NodeRefOptions{
+				Kind: test.attr.Kind, Target: storage.ChildCondition{State: storage.SameNode, NodeID: test.attr.ID}, Action: newAction(),
+				MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
+			})
+			if err != nil || opened.Reference == nil {
+				t.Fatalf("open=%+v error=%v", opened, err)
+			}
+			defer opened.Reference.Close(context.Background())
+			observed, err := opened.Reference.Stat(t.Context())
+			if err != nil || observed.ID != test.attr.ID || observed.Kind != test.attr.Kind {
+				t.Fatalf("stat=%+v error=%v", observed, err)
+			}
+			changed := time.Unix(123, 456).UTC()
+			observed, err = opened.Reference.SetAttr(t.Context(), storage.AttrChange{ModTime: &changed})
+			if err != nil || observed.ID != test.attr.ID || observed.Kind != test.attr.Kind || !observed.ModTime.Equal(changed) {
+				t.Fatalf("setattr=%+v error=%v", observed, err)
+			}
+		})
+	}
+}
+
 func TestIdentityCapabilityWireKeepsRequestConditionsSeparateFromResponseVersions(t *testing.T) {
 	action := storage.FileActionID("1:00000000000000000000000000000000")
 	request := fileRequest{
@@ -200,23 +604,51 @@ func TestIdentityCapabilityWireKeepsRequestConditionsSeparateFromResponseVersion
 	}
 }
 
-func TestSemanticFileActionsDoNotCreateASecondTransportJournal(t *testing.T) {
+func TestSemanticFileActionsShareTheirTransportJournalIdentity(t *testing.T) {
 	action := storage.FileActionID("1:00000000000000000000000000000000")
 	requests := []fileRequest{
 		{Op: storage.OpFileOpenAt, OpenAt: openAtOptionsOf(storage.OpenAtOptions{Action: action})},
 		{Op: storage.OpFileOpenNodeRef, NodeRef: nodeRefOptionsOf(storage.NodeRefOptions{Action: action})},
+		{Op: storage.OpFileOpenChildRef, NodeRef: nodeRefOptionsOf(storage.NodeRefOptions{Action: action})},
 		{Op: storage.OpFileMutateName, Name: nameCommandOf(storage.NameCommand{Action: action})},
 		{Op: storage.OpFileSetPendingUnlink, Pending: pendingUnlinkCommandOf(storage.PendingUnlinkCommand{Action: action})},
 		{Op: storage.OpFileClearPendingUnlink, ClearPending: clearPendingUnlinkCommandOf(storage.ClearPendingUnlinkCommand{Action: action})},
 		{Op: storage.OpFileMutate, Mutation: fileMutationOf(storage.FileMutation{Action: action})},
+		{Op: storage.OpFileAcknowledgeDeleteIntent, Acknowledge: acknowledgeDeleteIntentCommandOf(storage.AcknowledgeDeleteIntentCommand{Action: action})},
 	}
 	for _, request := range requests {
-		if fileActionRequired(request.Op) {
-			t.Fatalf("%s allocated a transport action in addition to %s", request.Op, action)
+		if !fileActionRequired(request.Op) {
+			t.Fatalf("%s did not retain its transport result", request.Op)
 		}
 		if got := semanticFileAction(request); got != storage.LockRequestID(action) {
 			t.Fatalf("%s recovery action=%q", request.Op, got)
 		}
+	}
+}
+
+func TestSemanticFileActionMustMatchTheTransportAction(t *testing.T) {
+	action := storage.FileActionID("1:00000000000000000000000000000000")
+	request := fileRequest{
+		Op:      storage.OpFileAcknowledgeDeleteIntent,
+		Session: strings.Repeat("a", 64),
+		Action:  storage.LockRequestID(action),
+		Acknowledge: acknowledgeDeleteIntentCommandOf(storage.AcknowledgeDeleteIntentCommand{
+			Action: action,
+			Intent: storage.DeleteIntentID(strings.Repeat("d", storage.DeleteIntentIDBytes)),
+		}),
+		Path: []byte{},
+		Data: []byte{},
+	}
+	if err := validateFileRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	request.Action = "1:11111111111111111111111111111111"
+	if err := validateFileRequest(request); err == nil {
+		t.Fatal("accepted different transport and semantic action identities")
+	}
+	request.Action = ""
+	if err := validateFileRequest(request); err == nil {
+		t.Fatal("accepted a semantic action without its transport journal identity")
 	}
 }
 
@@ -298,6 +730,28 @@ func TestIdentityAuthorizationCoversCompositeEffectsAndCompatibilityClaims(t *te
 	}
 	if len(requests) != 1 || requests[0].Open != (storage.OpenAccess{Read: true, Write: true}) {
 		t.Fatalf("compatibility claims were not authorized as open access: %+v", requests)
+	}
+}
+
+func TestPendingUnlinkAuthorizationUsesOnlyItsCanonicalOperation(t *testing.T) {
+	for _, op := range []storage.Operation{storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink} {
+		t.Run(string(op), func(t *testing.T) {
+			var requests []authz.AccessRequest
+			handler := &Handler{
+				volume:   "trusted",
+				stopping: make(chan struct{}),
+				authorizer: authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
+					requests = append(requests, request)
+					return nil
+				}),
+			}
+			if err := handler.authorizeFile(t.Context(), fileRequest{Op: op}); err != nil {
+				t.Fatal(err)
+			}
+			if len(requests) != 1 || requests[0].Operation != op {
+				t.Fatalf("authorization requests=%+v", requests)
+			}
+		})
 	}
 }
 

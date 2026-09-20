@@ -338,13 +338,14 @@ var _ storage.NodeReference = (*remoteNodeReference)(nil)
 var _ NodeReferenceWithBarrier = (*remoteNodeReference)(nil)
 
 func (r *remoteNodeReference) Stat(ctx context.Context) (storage.Attr, error) {
-	return r.file.Stat(ctx)
+	return r.file.stat(ctx, false)
 }
 func (r *remoteNodeReference) SetAttr(ctx context.Context, change storage.AttrChange) (storage.Attr, error) {
-	return r.file.SetAttr(ctx, change)
+	attr, _, err := r.file.setAttrWithBarrier(ctx, change, false)
+	return attr, err
 }
 func (r *remoteNodeReference) SetAttrWithBarrier(ctx context.Context, change storage.AttrChange) (storage.Attr, *MutationBarrier, error) {
-	return r.file.SetAttrWithBarrier(ctx, change)
+	return r.file.setAttrWithBarrier(ctx, change, false)
 }
 func (r *remoteNodeReference) Close(ctx context.Context) error { return r.file.Close(ctx) }
 func (r *remoteNodeReference) CloseWithBarrier(ctx context.Context) (*MutationBarrier, error) {

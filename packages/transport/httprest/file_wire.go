@@ -116,7 +116,11 @@ func fileMutation(op storage.Operation) bool {
 
 func fileActionRequired(op storage.Operation) bool {
 	switch op {
-	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileSetNodeAttr, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSync, storage.OpFileSetNodeMetadata, storage.OpFileSetMetadata, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeDrop:
+	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef,
+		storage.OpFileSetNodeAttr, storage.OpFileMutateName, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr,
+		storage.OpFileSync, storage.OpFileSetNodeMetadata, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink,
+		storage.OpFileClearPendingUnlink, storage.OpFileMutate, storage.OpFileAcknowledgeDeleteIntent,
+		storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeDrop:
 		return true
 	}
 	return false

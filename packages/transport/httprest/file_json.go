@@ -159,6 +159,9 @@ func validateFileRequest(r fileRequest) error {
 	if !reflect.DeepEqual(r, expected) {
 		return errors.New("file operation carries unrelated operands")
 	}
+	if action := semanticFileAction(r); action != "" && r.Action != action {
+		return errors.New("file operation action identity differs from its semantic action")
+	}
 	switch r.Op {
 	case storage.OpFileSetAttr, storage.OpFileSetNodeAttr:
 		if r.Change == nil {
@@ -358,8 +361,11 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if err := r.Attr.check(); err != nil {
 			return err
 		}
-		if req.Op != storage.OpFileStatNode && req.Op != storage.OpFileSetNodeAttr && req.Op != storage.OpFileLookupAt && req.Op != storage.OpFileMutateName && req.Op != storage.OpFileOpenNodeRef && req.Op != storage.OpFileOpenChildRef && r.Attr.Kind != storage.NodeRegular {
-			return errors.New("file reference returned nonregular attributes")
+		switch req.Op {
+		case storage.OpFileOpenAt, storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileMutate:
+			if r.Attr.Kind != storage.NodeRegular {
+				return errors.New("file operation returned nonregular attributes")
+			}
 		}
 	}
 	if r.State != nil {

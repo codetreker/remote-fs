@@ -51,9 +51,10 @@ type servedFileSession struct {
 }
 
 type servedFile struct {
-	native  retainedReference
-	pending time.Time
-	closing bool
+	native    retainedReference
+	pending   time.Time
+	closing   bool
+	replaying int
 }
 
 type retainedReference interface {
@@ -69,6 +70,7 @@ type servedFileAction struct {
 	done           chan struct{}
 	expires        time.Time
 	response       fileResponse
+	file           string
 	err            error
 	barrierPending bool
 }
@@ -164,7 +166,7 @@ func (r *fileRegistry) run() {
 			pending := make(map[string]*servedFile)
 			if !retire {
 				for cap, f := range s.files {
-					if !f.closing && !f.pending.IsZero() && !now.Before(f.pending) {
+					if !f.closing && f.replaying == 0 && !f.pending.IsZero() && !now.Before(f.pending) {
 						f.closing = true
 						pending[cap] = f
 					}
@@ -474,30 +476,43 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 				session.mu.Unlock()
 				return fileResponse{}, syscall.EINVAL
 			}
-			session.mu.Unlock()
+			replayedFile := ""
 			select {
 			case <-previous.done:
-				previous.retryMu.Lock()
-				defer previous.retryMu.Unlock()
-				if previous.barrierPending {
-					response, retryErr := h.finishFileMutation(ctx, previous.response)
-					previous.response = response
-					previous.err = retainFileActionError(retryErr)
-					previous.barrierPending = retryErr != nil
+				replayedFile = beginSemanticOpenReplay(session, req, previous)
+				session.mu.Unlock()
+			default:
+				session.mu.Unlock()
+				select {
+				case <-previous.done:
+					session.mu.Lock()
+					replayedFile = beginSemanticOpenReplay(session, req, previous)
+					session.mu.Unlock()
+				case <-ctx.Done():
+					return fileResponse{}, operationFailure(Request{Op: OpFile}, ctx.Err(), false)
 				}
-				if previous.err != nil && !previous.barrierPending {
-					return previous.response, &recordedFileError{cause: previous.err}
-				}
-				return previous.response, previous.err
-			case <-ctx.Done():
-				return fileResponse{}, operationFailure(Request{Op: OpFile}, ctx.Err(), false)
 			}
+			previous.retryMu.Lock()
+			defer previous.retryMu.Unlock()
+			if replayedFile != "" {
+				defer h.finishSemanticOpenReplay(session, replayedFile)
+			}
+			if previous.barrierPending {
+				response, retryErr := h.finishFileMutation(ctx, previous.response)
+				previous.response = response
+				previous.err = retainFileActionError(retryErr)
+				previous.barrierPending = retryErr != nil
+			}
+			if previous.err != nil && !previous.barrierPending {
+				return previous.response, &recordedFileError{cause: previous.err}
+			}
+			return previous.response, previous.err
 		}
 		if actionEpoch != epoch {
 			session.mu.Unlock()
 			// The immediately preceding window still has every admitted result.
 			// Absence here proves this action never ran; older windows cannot prove it.
-			if actionEpoch+1 == epoch {
+			if actionEpoch+1 == epoch && semanticFileAction(req) == "" {
 				return fileResponse{Epoch: epoch, Retry: true}, nil
 			}
 			return fileResponse{}, syscall.ESTALE
@@ -530,8 +545,10 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 		var barrierFailure *fileBarrierError
 		session.mu.Lock()
 		action.response = response
+		action.file = response.File
 		action.err = retainFileActionError(err)
 		action.barrierPending = errors.As(err, &barrierFailure)
+		retainSemanticOpenCapability(session, req, response, action.expires)
 		close(action.done)
 		session.mu.Unlock()
 		return response, err
@@ -544,6 +561,51 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 	response, err := h.performFile(ctx, session, req)
 	response.Epoch = epoch
 	return response, err
+}
+
+func (h *Handler) semanticOpenReplayExpiry(session *servedFileSession, actionExpiry time.Time) time.Time {
+	handoffExpiry := time.Now().Add(h.files.limits.PendingAck)
+	if handoffExpiry.After(session.expires) {
+		handoffExpiry = session.expires
+	}
+	if handoffExpiry.After(actionExpiry) {
+		return handoffExpiry
+	}
+	return actionExpiry
+}
+
+func beginSemanticOpenReplay(session *servedFileSession, request fileRequest, action *servedFileAction) string {
+	if semanticFileAction(request) == "" || action.file == "" {
+		return ""
+	}
+	file := session.files[action.file]
+	if file == nil || file.closing {
+		return ""
+	}
+	file.replaying++
+	return action.file
+}
+
+func (h *Handler) finishSemanticOpenReplay(session *servedFileSession, capability string) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	file := session.files[capability]
+	if file == nil || file.replaying == 0 {
+		return
+	}
+	file.replaying--
+	if !file.closing && !file.pending.IsZero() {
+		file.pending = h.semanticOpenReplayExpiry(session, file.pending)
+	}
+}
+
+func retainSemanticOpenCapability(session *servedFileSession, request fileRequest, response fileResponse, expires time.Time) {
+	if semanticFileAction(request) == "" || response.File == "" {
+		return
+	}
+	if file := session.files[response.File]; file != nil && !file.closing && !file.pending.IsZero() && file.pending.Before(expires) {
+		file.pending = expires
+	}
 }
 
 func maxDuration(d time.Duration) time.Duration {
