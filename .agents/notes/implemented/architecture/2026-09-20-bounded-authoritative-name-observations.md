@@ -20,7 +20,7 @@ FUSE 的 `Opendir` handle 已持有 NodeReference 与 Scope。第一次 `Readdir
 
 ### 完整目录 metadata 与引用名字是独立观察能力
 
-`DirectoryMetadataObserver.ObserveDirectoryMetadata` 接受 DirectoryTarget、`DirectoryMetadataOptions{Guards, IncludeName}` 与调用方拥有的 `ListResult`。成功结果的全部 entries、目录 revision，以及请求时可选的目录自身 `NameObservation` 来自同一个权威捕获。它使用独立的 `file.observe-directory-metadata` 授权操作，不从 `ReadEntries`、`ReadMetadata` 或名字修改权限推导准入。
+`DirectoryMetadataObserver.ObserveDirectoryMetadata` 接受 DirectoryTarget、`DirectoryMetadataOptions{Guards, IncludeName}` 与调用方拥有的 `ListResult`。成功结果的全部 entries、目录 revision，以及请求时可选的目录自身 `NameObservation` 来自同一个权威捕获。它使用独立的 `file.observe-directory-metadata` 授权操作，不从 `ReadEntries`、`ReadMetadata` 或名字修改权限推导准入。Go 接口上它与 NamespaceAccess 保持独立，in-process 调用方可以只实现其中一项。
 
 `ReferenceNameObserver` 位于既有 File 与 NodeReference 上，并通过无 I/O 的 `ReferenceIdentity` 核对返回的 NodeID 没有替换引用身份。`ObserveName` 使用独立的 `file.observe-name` 授权操作，返回三种封闭状态：
 
@@ -50,7 +50,7 @@ v8 迁移为每个现有目录建立初始 revision；迁移前 retained changes
 
 一组 guards 的 directory 与 edge 各最多 256 项，合计驻留最多 64 KiB；单个 revision 最多 64 字节，单个叶名继续受 4096 字节上限约束。HTTP 另外用实际 JSON、canonical base64 和 response envelope 计算调用方的 `ResultBytes` 与 body 上限；server、client 和 native retention 任一上限更紧时，整次调用按更紧者失败。
 
-limited、locked、objectstore、localstore 与 replicated 保留 capability preflight、读取 context、session/reference 生命周期、结果预算和身份复核。replicated 在确认本地副本健康后回源 authority，不从副本或旧路径推断当前名字。HTTP v4 宣告 DirectoryMetadata 与 ReferenceName capability，并以 `file.read-dir-node`、`file.observe-directory-metadata`、`file.observe-name` 三个独立操作转发；严格 DTO 使用 lower-camel 字段与 canonical base64，缺字段、未知字段、身份替换、部分结果或畸形状态都以协议错误失败。
+limited、locked、objectstore、localstore 与 replicated 保留 capability preflight、读取 context、session/reference 生命周期、结果预算和身份复核。replicated 在确认本地副本健康后回源 authority，不从副本或旧路径推断当前名字。HTTP v4 继续使用预留的 DirectoryMetadata bit 作为目录观察 transport bundle gate：server 只有在完整包装链同时支持 NamespaceAccess 与 DirectoryMetadataObserver 时才宣告 true，remote client 的 ReadDirNode、ReadDirNodeBounded 和 ObserveDirectoryMetadata 都要求该 bit；Namespace bit 仍独立覆盖 LookupAt 与 MutateName。这样不改变 v4 capability shape，也不让旧 v4 的 false preflight 被部分实现绕过。ReferenceName 独立协商。三个 wire 操作仍分别使用 `file.read-dir-node`、`file.observe-directory-metadata` 与 `file.observe-name`；严格 DTO 使用 lower-camel 字段与 canonical base64，缺字段、未知字段、身份替换、部分结果或畸形状态都以协议错误失败。
 
 ### 范围边界
 

@@ -50,7 +50,7 @@ SQLite migration 6 在既有 schema 准备事务中把合法 v5 mode 转为 `Nod
 
 HTTP v4 是不兼容的边界：基础属性从 POSIX mode 变为中立节点事实，文件锁 DTO 变为中立 owner/range，所有路由与 response marker 同时升级，v3 不作为兼容旁路。metadata CAS 请求使用独立 decoder，允许空 expected version，并继续要求 canonical base64；响应 `OpaquePayload` 必须携带非空 authority version。
 
-能力协商在 session 和引用结果里分别声明 AtomicOpen、NodeReference、Namespace、FileActions、State、Delete、Conditional、Metadata、Owners、Ranges、Scope、DirectoryMetadata 与 ReferenceName。[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)和[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)实现这些中立能力；任意未知 facet 继续失败。打开结果携带原 action 的 node/outcome，Close 与 FileSession.Close 可携带清理 barrier。
+能力协商在 session 和引用结果里分别声明 AtomicOpen、NodeReference、Namespace、FileActions、State、Delete、Conditional、Metadata、Owners、Ranges、Scope、DirectoryMetadata 与 ReferenceName。[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)和[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)实现这些中立能力。DirectoryMetadata 的预留 v4 bit 作为 identity-bound directory read 与 privileged metadata observation 的完整 transport bundle gate；Go 接口本身仍可独立实现。任意未知 facet 继续失败。打开结果携带原 action 的 node/outcome，Close 与 FileSession.Close 可携带清理 barrier。
 
 每项可选能力的 Check 检查完整包装链；缺少底层保证时，Check 和调用都以 `EOPNOTSUPP` 失败。limited、locked、objectstore、localstore、replicated 与 HTTP 包装器保留预算、原始错误、barrier、引用和清理所有权，不能用路径重开、本地 mutex 或默认值模拟能力。
 

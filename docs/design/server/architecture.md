@@ -104,7 +104,7 @@ handler 用 `MaxBodyBytes` 限制基础 volume 的 non-write 请求与 non-strea
 
 `SetAttr` 的请求体是 `{"change":{…}}`，`change` 里每个属性都是可选的：缺席就是「这一项不改」。`change` 本身缺席则是解码失败 —— 一个什么都不点名的改动是合法请求（它在问这个节点还在不在），因此靠字段本身分辨不出报文是不是掉了内容，外面这一层对象才分辨得出来。
 
-保留文件的响应 envelope 按操作携带 FileSession 状态、File/NodeReference 能力、原子 open outcome、属性、字节、metadata、directory observation、reference name、scope、reference state、action/delete-intent status、owner、range 结果与可选 barrier，不能套用基础 mutation 的空 object 规则。Data、原始叶名、directory revision、metadata token/payload 与 generation 使用 canonical base64；时间间隔以整数纳秒编码。Open 先返回有期限的待确认能力，client 完成确认才交给调用方；未确认引用与有限 action 记录受 registry 上限约束。DirectoryMetadata 与 ReferenceName 按实际包装链协商，任意未知字段失败。完整形状与核对边界见[文件协议](file-handles.md#五http复制与资源)。
+保留文件的响应 envelope 按操作携带 FileSession 状态、File/NodeReference 能力、原子 open outcome、属性、字节、metadata、directory observation、reference name、scope、reference state、action/delete-intent status、owner、range 结果与可选 barrier，不能套用基础 mutation 的空 object 规则。Data、原始叶名、directory revision、metadata token/payload 与 generation 使用 canonical base64；时间间隔以整数纳秒编码。Open 先返回有期限的待确认能力，client 完成确认才交给调用方；未确认引用与有限 action 记录受 registry 上限约束。DirectoryMetadata 是 ReadDirNode 与 DirectoryMetadataObserver 的 v4 transport bundle bit，完整 backing chain 缺少任一接口时不宣告；ReferenceName 独立协商。任意未知字段失败。完整形状与核对边界见[文件协议](file-handles.md#五http复制与资源)。
 
 ## 四、错误如何离开 server
 
