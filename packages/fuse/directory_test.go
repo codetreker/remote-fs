@@ -2,9 +2,11 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	iofs "io/fs"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
@@ -21,6 +23,8 @@ type nodeReferenceFixture struct {
 	link                   []byte
 	closes, stats, updates int
 	clean                  bool
+	closeErr               error
+	checkErr, scopeErr     error
 }
 
 func (r *nodeReferenceFixture) Stat(context.Context) (storage.Attr, error) {
@@ -41,11 +45,11 @@ func (r *nodeReferenceFixture) Close(ctx context.Context) error {
 	r.closes++
 	_, deadline := ctx.Deadline()
 	r.clean = ctx.Err() == nil && deadline
-	return nil
+	return r.closeErr
 }
-func (r *nodeReferenceFixture) CheckScopedReference() error { return nil }
+func (r *nodeReferenceFixture) CheckScopedReference() error { return r.checkErr }
 func (r *nodeReferenceFixture) Scope(context.Context) (storage.UseScope, error) {
-	return r.scope, nil
+	return r.scope, r.scopeErr
 }
 func (r *nodeReferenceFixture) CheckReferenceState() error { return nil }
 func (r *nodeReferenceFixture) State(context.Context) (storage.ReferenceState, error) {
@@ -58,13 +62,21 @@ type directorySessionFixture struct {
 	openOptions    storage.NodeRefOptions
 	openID         uint64
 	opens, updates int
+	queries        int
+	checkErr       error
+	open           func(context.Context, uint64, storage.NodeRefOptions) (storage.NodeOpenResult, error)
+	receipt        storage.FileActionReceipt
+	queryErr       error
 }
 
-func (s *directorySessionFixture) CheckNodeReferences() error { return nil }
-func (s *directorySessionFixture) OpenNodeRef(_ context.Context, id uint64, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+func (s *directorySessionFixture) CheckNodeReferences() error { return s.checkErr }
+func (s *directorySessionFixture) OpenNodeRef(ctx context.Context, id uint64, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	s.opens++
 	s.openID = id
 	s.openOptions = options
+	if s.open != nil {
+		return s.open(ctx, id, options)
+	}
 	return storage.NodeOpenResult{Reference: s.reference, Attr: s.reference.attr, Outcome: storage.Opened}, nil
 }
 func (s *directorySessionFixture) OpenChildRef(context.Context, storage.ChildName, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
@@ -88,6 +100,19 @@ func (s *directorySessionFixture) SetNodeAttr(_ context.Context, id uint64, chan
 		return storage.Attr{}, syscall.ESTALE
 	}
 	return s.reference.SetAttr(context.Background(), change)
+}
+func (s *directorySessionFixture) CheckFileActions() error { return nil }
+func (s *directorySessionFixture) QueryFileAction(_ context.Context, action storage.FileActionID) (storage.FileActionReceipt, error) {
+	s.queries++
+	receipt := s.receipt
+	receipt.Action = action
+	return receipt, s.queryErr
+}
+func (s *directorySessionFixture) QueryDeleteIntent(context.Context, storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+	panic("node reference open queried a delete intent")
+}
+func (s *directorySessionFixture) AcknowledgeDeleteIntent(context.Context, storage.AcknowledgeDeleteIntentCommand) error {
+	panic("node reference open acknowledged a delete intent")
 }
 
 func TestReadOnlyDirectoryHandleRetainsIdentityWithoutRequestingWriteAccess(t *testing.T) {
@@ -140,6 +165,281 @@ func TestReadOnlyDirectoryHandleRetainsIdentityWithoutRequestingWriteAccess(t *t
 	handle.Releasedir(canceled, 0)
 	if reference.closes != 1 || !reference.clean || session.opens != 1 {
 		t.Fatalf("closes=%d clean=%v opens=%d", reference.closes, reference.clean, session.opens)
+	}
+}
+
+func TestInterruptedNodeReferenceOpenReplaysTheSameCompletedAction(t *testing.T) {
+	reference := &nodeReferenceFixture{
+		attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory},
+	}
+	session := &directorySessionFixture{
+		namespaceFixture: &namespaceFixture{},
+		reference:        reference,
+		receipt: storage.FileActionReceipt{
+			Operation: storage.OpFileOpenNodeRef,
+			Outcome:   storage.FileActionCompleted,
+		},
+	}
+	root := namespaceRoot(session)
+	action, err := storage.NewFileActionID(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first storage.FileActionID
+	session.open = func(ctx context.Context, id uint64, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+		if session.opens == 1 {
+			first = options.Action
+			return storage.NodeOpenResult{}, context.Canceled
+		}
+		if id != 7 || options.Action != first || options.Action != action {
+			t.Fatalf("replayed open id=%d action=%q first=%q", id, options.Action, first)
+		}
+		if _, bounded := ctx.Deadline(); !bounded || ctx.Err() != nil {
+			t.Fatalf("replay context deadline=%v err=%v", bounded, ctx.Err())
+		}
+		return storage.NodeOpenResult{Reference: reference, Attr: reference.attr, Outcome: storage.Opened}, nil
+	}
+
+	result, err := root.openNodeReference(t.Context(), 7, storage.NodeRefOptions{Action: action})
+	if err != nil || result.Reference != reference || session.opens != 2 || session.queries != 1 {
+		t.Fatalf("reconciled open result=%+v err=%v opens=%d queries=%d", result, err, session.opens, session.queries)
+	}
+}
+
+func TestNodeReferenceOpenRejectsUnavailableAndInvalidCapabilities(t *testing.T) {
+	action, err := storage.NewFileActionID(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := storage.NodeRefOptions{Action: action}
+
+	if _, err := namespaceRoot(&namespaceFixture{}).openNodeReference(t.Context(), 7, options); errnoOf(err) != syscall.EOPNOTSUPP {
+		t.Fatalf("missing node-reference capability = %v", err)
+	}
+
+	preflight := errors.New("node-reference preflight failed")
+	session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, checkErr: preflight}
+	if _, err := namespaceRoot(session).openNodeReference(t.Context(), 7, options); err != preflight || session.opens != 0 {
+		t.Fatalf("failed preflight result=%v opens=%d", err, session.opens)
+	}
+
+	session.checkErr = nil
+	session.open = func(context.Context, uint64, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+		return storage.NodeOpenResult{}, syscall.ENOENT
+	}
+	if _, err := namespaceRoot(session).openNodeReference(t.Context(), 7, options); err != syscall.ENOENT || session.queries != 0 {
+		t.Fatalf("definite open failure result=%v queries=%d", err, session.queries)
+	}
+}
+
+func TestFileActionReconciliationClassifiesAuthorityReceipts(t *testing.T) {
+	action, err := storage.NewFileActionID(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cause := context.Canceled
+	for _, test := range []struct {
+		name       string
+		files      storage.FileSession
+		wantReplay bool
+		wantErrno  syscall.Errno
+	}{
+		{name: "capability unavailable", files: &namespaceFixture{}, wantErrno: syscall.EIO},
+		{name: "query failed", files: &directorySessionFixture{namespaceFixture: &namespaceFixture{}, queryErr: syscall.ESTALE}, wantErrno: syscall.EIO},
+		{name: "not executed", files: &directorySessionFixture{namespaceFixture: &namespaceFixture{}, receipt: storage.FileActionReceipt{Outcome: storage.FileActionNotExecuted}}, wantErrno: syscall.EINTR},
+		{name: "pending", files: &directorySessionFixture{namespaceFixture: &namespaceFixture{}, receipt: storage.FileActionReceipt{Operation: storage.OpFileOpenNodeRef, Outcome: storage.FileActionPending}}, wantReplay: true},
+		{name: "completed", files: &directorySessionFixture{namespaceFixture: &namespaceFixture{}, receipt: storage.FileActionReceipt{Operation: storage.OpFileOpenNodeRef, Outcome: storage.FileActionCompleted}}, wantReplay: true},
+		{name: "wrong operation", files: &directorySessionFixture{namespaceFixture: &namespaceFixture{}, receipt: storage.FileActionReceipt{Operation: storage.OpFileOpenAt, Outcome: storage.FileActionCompleted}}, wantErrno: syscall.EIO},
+		{name: "unknown", files: &directorySessionFixture{namespaceFixture: &namespaceFixture{}, receipt: storage.FileActionReceipt{Outcome: storage.FileActionUnknown}}, wantErrno: syscall.EIO},
+		{name: "retired", files: &directorySessionFixture{namespaceFixture: &namespaceFixture{}, receipt: storage.FileActionReceipt{Outcome: storage.FileActionRetired}}, wantErrno: syscall.EIO},
+		{name: "invalid receipt", files: &directorySessionFixture{namespaceFixture: &namespaceFixture{}, receipt: storage.FileActionReceipt{}}, wantErrno: syscall.EIO},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			v := activeTestVolume(nil, 1024)
+			v.files = test.files
+			replay, err := v.reconcileFileAction(t.Context(), action, storage.OpFileOpenNodeRef, cause)
+			if replay != test.wantReplay || errnoOf(err) != test.wantErrno {
+				t.Fatalf("replay=%v err=%v", replay, err)
+			}
+			if err != nil && !errors.Is(err, cause) {
+				t.Fatalf("reconciliation lost original failure: %v", err)
+			}
+		})
+	}
+}
+
+func TestDirectoryOpenRejectsInvalidReferencesAndCleansReturnedOwnership(t *testing.T) {
+	if handle, _, errno := namespaceRoot(&directorySessionFixture{
+		namespaceFixture: &namespaceFixture{},
+		reference:        &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}},
+	}).OpendirHandle(t.Context(), syscall.O_WRONLY); errno != syscall.EISDIR || handle != nil {
+		t.Fatalf("writable directory open = %v, %v", handle, errno)
+	}
+
+	for _, test := range []struct {
+		name      string
+		reference *nodeReferenceFixture
+		outcome   storage.OpenOutcome
+		openErr   error
+		wantErrno syscall.Errno
+	}{
+		{
+			name:      "reference returned with interrupted result",
+			reference: &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "scope"}},
+			outcome:   storage.Opened,
+			openErr:   context.Canceled,
+			wantErrno: syscall.EINTR,
+		},
+		{
+			name:      "invalid attributes",
+			reference: &nodeReferenceFixture{attr: storage.Attr{Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "scope"}},
+			outcome:   storage.Opened,
+		},
+		{
+			name: "invalid scoped reference",
+			reference: &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "scope"},
+				checkErr: storage.ErrInvalidScope},
+			outcome: storage.Opened,
+		},
+		{
+			name: "scope query failure",
+			reference: &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "scope"},
+				scopeErr: syscall.ESTALE},
+			outcome: storage.Opened,
+		},
+		{
+			name:      "malformed scope",
+			reference: &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}},
+			outcome:   storage.Opened,
+		},
+		{
+			name:      "impossible outcome",
+			reference: &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "scope"}},
+			outcome:   storage.Created,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, reference: test.reference}
+			session.open = func(context.Context, uint64, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+				return storage.NodeOpenResult{Reference: test.reference, Attr: test.reference.attr, Outcome: test.outcome}, test.openErr
+			}
+			handle, _, errno := namespaceRoot(session).OpendirHandle(t.Context(), syscall.O_RDONLY)
+			if handle != nil || errno == 0 || test.reference.closes != 1 || !test.reference.clean {
+				t.Fatalf("invalid open handle=%v errno=%v closes=%d clean=%v", handle, errno, test.reference.closes, test.reference.clean)
+			}
+			if test.wantErrno != 0 && errno != test.wantErrno {
+				t.Fatalf("open errno=%v, want %v", errno, test.wantErrno)
+			}
+		})
+	}
+
+	session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}}
+	session.open = func(context.Context, uint64, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+		return storage.NodeOpenResult{Outcome: storage.Opened}, nil
+	}
+	if handle, _, errno := namespaceRoot(session).OpendirHandle(t.Context(), syscall.O_RDONLY); handle != nil || errno != syscall.EIO {
+		t.Fatalf("missing returned reference handle=%v errno=%v", handle, errno)
+	}
+}
+
+func TestDirectoryHandleAttributeMutationRevalidatesReferenceScope(t *testing.T) {
+	reference := &nodeReferenceFixture{
+		attr:  storage.Attr{ID: 7, Kind: storage.NodeDirectory},
+		scope: storage.UseScope{Token: "directory"},
+	}
+	session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, reference: reference}
+	root := namespaceRoot(session)
+	opened, _, errno := root.OpendirHandle(t.Context(), syscall.O_RDONLY)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	handle := opened.(*directoryHandle)
+	t.Cleanup(func() { handle.Releasedir(context.Background(), 0) })
+
+	want := time.Unix(123456789, 0)
+	in := &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{Valid: gofuse.FATTR_MTIME, Mtime: uint64(want.Unix())}}
+	if errno := root.Setattr(t.Context(), handle, in, &gofuse.AttrOut{}); errno != 0 || !reference.attr.ModTime.Equal(want) || reference.updates != 1 {
+		t.Fatalf("directory setattr errno=%v modtime=%v updates=%d", errno, reference.attr.ModTime, reference.updates)
+	}
+
+	reference.scope = storage.UseScope{Token: "replacement"}
+	if errno := root.Setattr(t.Context(), handle, in, &gofuse.AttrOut{}); errno != syscall.ESTALE || reference.updates != 1 {
+		t.Fatalf("replaced directory setattr errno=%v updates=%d", errno, reference.updates)
+	}
+}
+
+type fixedDirectoryStream struct {
+	entries []gofuse.DirEntry
+	index   int
+	closes  int
+}
+
+func (s *fixedDirectoryStream) HasNext() bool { return s.index < len(s.entries) }
+func (s *fixedDirectoryStream) Next() (gofuse.DirEntry, syscall.Errno) {
+	entry := s.entries[s.index]
+	s.index++
+	return entry, 0
+}
+func (s *fixedDirectoryStream) Close() { s.closes++ }
+
+type seekableDirectoryStream struct {
+	*fixedDirectoryStream
+	seeks []uint64
+}
+
+func (s *seekableDirectoryStream) Seekdir(_ context.Context, off uint64) syscall.Errno {
+	s.seeks = append(s.seeks, off)
+	if off > uint64(len(s.entries)) {
+		return syscall.EINVAL
+	}
+	s.index = int(off)
+	return 0
+}
+
+func TestDirectoryHandleSeekUsesTheOpenedStream(t *testing.T) {
+	reference := &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "directory"}}
+	session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, reference: reference}
+	root := namespaceRoot(session)
+	stream := &seekableDirectoryStream{fixedDirectoryStream: &fixedDirectoryStream{entries: []gofuse.DirEntry{{Name: "first"}, {Name: "second"}}}}
+	handle := &directoryHandle{node: root, reference: reference, scope: reference.scope, stream: stream}
+
+	if errno := handle.Seekdir(t.Context(), 1); errno != 0 || stream.index != 1 || len(stream.seeks) != 1 {
+		t.Fatalf("seek errno=%v index=%d seeks=%v", errno, stream.index, stream.seeks)
+	}
+	entry, errno := handle.Readdirent(t.Context())
+	if errno != 0 || entry == nil || entry.Name != "second" {
+		t.Fatalf("entry after seek=%+v errno=%v", entry, errno)
+	}
+	if errno := handle.Seekdir(t.Context(), 3); errno != syscall.EINVAL {
+		t.Fatalf("out-of-range seek = %v", errno)
+	}
+
+	nonseekable := &directoryHandle{node: root, reference: reference, scope: reference.scope,
+		stream: &fixedDirectoryStream{entries: []gofuse.DirEntry{{Name: "only"}}}}
+	if errno := nonseekable.Seekdir(t.Context(), 0); errno != syscall.EOPNOTSUPP {
+		t.Fatalf("non-seekable stream = %v", errno)
+	}
+}
+
+func TestDirectoryReleaseClosesEveryResourceOnceAndFencesUnknownCleanup(t *testing.T) {
+	closeErr := errors.New("reference cleanup result unavailable")
+	reference := &nodeReferenceFixture{
+		attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "directory"}, closeErr: closeErr,
+	}
+	session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, reference: reference}
+	root := namespaceRoot(session)
+	stream := &fixedDirectoryStream{}
+	handle := &directoryHandle{node: root, reference: reference, scope: reference.scope, stream: stream}
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	handle.Releasedir(canceled, 0)
+	handle.Releasedir(canceled, 0)
+	if reference.closes != 1 || !reference.clean || stream.closes != 1 || handle.stream != nil {
+		t.Fatalf("release reference closes=%d clean=%v stream closes=%d retained=%v", reference.closes, reference.clean, stream.closes, handle.stream)
+	}
+	if err := root.volume.check(); errnoOf(err) != syscall.EIO || !errors.Is(err, closeErr) {
+		t.Fatalf("unknown cleanup did not fence the volume: %v", err)
 	}
 }
 
