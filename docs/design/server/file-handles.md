@@ -35,7 +35,8 @@
 | 接口 | 当前责任 |
 |---|---|
 | `AtomicFileOpener` | 按目录身份原子打开、创建、清空或替换普通文件 |
-| `NamespaceAccess` | 按父 NodeID/Scope 执行 LookupAt、完整有界 ReadDirNode 与 MutateName |
+| `NamespaceAccess` | 按父 NodeID/Scope 执行 LookupAt 与 MutateName |
+| `DirectoryReader` | 按 DirectoryTarget 执行完整、有界、身份绑定的应用枚举 |
 | `NodeReferences` | 按 NodeID 或父身份打开普通文件、目录及符号链接的 NodeReference |
 | `ScopedReference` / `ReferenceStateAccess` | 返回确切活引用的 Scope，以及同次捕获的 Attr、link target、detached/pending 状态 |
 | `DirectoryMetadataObserver` | 在独立授权下返回完整 entries、directory revision 与可选目录当前名字 |
@@ -48,11 +49,11 @@
 | `DeleteIntent` | 设置或按 generation 清除节点 pending deletion |
 | `ConditionalFileMutation` | 在最终发布处比较 size/metadata 条件并修改内容或属性 |
 
-Go 的 NamespaceAccess 与 DirectoryMetadataObserver 可以独立实现。HTTP v4 的 DirectoryMetadata capability 是一个 transport bundle gate：server 只有在 FileSession 的完整包装链同时通过 CheckNamespaceAccess 与 CheckDirectoryMetadataObservation 时才宣告 true，remote FileSession 的 ReadDirNode、ReadDirNodeBounded 与 ObserveDirectoryMetadata 都要求它。Namespace bit 继续单独表示 LookupAt 与 MutateName。ReferenceName 在 File/NodeReference 上独立宣告。能力缺失时不能由路径查询、副本或缓存模拟。
+Go 的 NamespaceAccess、DirectoryReader 与 DirectoryMetadataObserver 可以独立实现，各有自己的 Check。HTTP v4 的 DirectoryMetadata capability 是一个 transport bundle gate：server 只有在 FileSession 的完整包装链同时通过 CheckDirectoryRead 与 CheckDirectoryMetadataObservation 时才宣告 true，remote FileSession 的 ReadDirNode、ReadDirNodeBounded 与 ObserveDirectoryMetadata 都要求它。Namespace bit 只表示 LookupAt 与 MutateName，不参与这个 bundle。ReferenceName 在 File/NodeReference 上独立宣告。能力缺失时不能由路径查询、副本或缓存模拟。
 
 ## 二、保留节点、名字与回收
 
-SQLite schema v8 在 v7 的符号链接目标、节点 pending generation 和 durable delete intents 之外，为每个目录保存持久、非零的名字集合 revision。`Remove` 或覆盖目标的 `Rename` 移除普通文件名字时，有引用的文件成为 detached 并保留原 NodeID、属性与内容；目录和符号链接的 NodeReference 同样固定身份，名字删除须遵守其 pending/引用条件。volume 日志、快照与目录遍历只包含仍有名字的节点，detached 文件的后续修改不制造虚构路径事件。
+SQLite schema v8 在 v7 的符号链接目标、节点 pending generation 和 durable delete intents 之外，为每个目录保存持久、非零的名字集合 revision。`Remove` 或覆盖目标的 `Rename` 移除节点名字时，有引用的对象成为 detached 并保留原 NodeID 与状态；detached 目录必须为空，任何 detached 节点都不能继续出现在 entry 关系中。volume 日志、快照与普通目录遍历只包含仍有名字的节点，detached 对象的后续修改不制造虚构路径事件。
 
 保留节点的内容仍属于 volume 的实际用量。最后一个引用先退役，在最终发布门处禁止新的修改授权；已经接纳的 I/O 排空之后才物理释放。最后释放在事务内处理用量、当前对象与待回收对象。已知未生效的容量拒绝保留引用供清理重试；结果不明时保留所有权并封锁后续使用，不能提前归还配额。
 
@@ -66,13 +67,15 @@ SQLite schema v8 在 v7 的符号链接目标、节点 pending generation 和 du
 
 `ChildCondition` 的 Any 不要求目标身份，Absent 要求槽位缺席，SameNode 同时要求非零 NodeID；metadata 条件只能与 SameNode 一起使用。空 token 要求 namespace 缺席，非空 token 要求版本相等。已知不符返回 `ErrConditionConflict` 且零效果。rename 的 source leaf、destination observed leaf 与 output leaf 分开表达，既验证调用方观察的替换对象，也拒绝输出名字被第三个对象占据。
 
-公开 List/ListBounded 保持路径入口；FileSession 的 ReadDirNode/ReadDirNodeBounded 以 DirectoryTarget 执行身份绑定的应用枚举，并在原生顺序检查 `ReadEntries`。两者都返回完整 entries，但只有身份入口同时返回该捕获的 directory revision。
+公开 List/ListBounded 保持路径入口；FileSession 的 DirectoryReader.ReadDirNode/ReadDirNodeBounded 以 DirectoryTarget 执行身份绑定的应用枚举，并在原生顺序检查 `ReadEntries`。两者都返回完整 entries，但只有身份入口同时返回该捕获的 directory revision。具名目录接受裸 NodeID；detached 目录只接受它原有活引用的确切 Scope，使已打开目录句柄可继续枚举原对象。错误或缺失 Scope 失败，DirectoryMetadataObserver 不接受 detached 目录。
 
 ### 名字与目录观察
 
 `DirectoryObservation{ParentID, Revision}` 标识一次完整目录捕获。Revision 是非空、不透明、只可比较相等的 token；新目录从 1 开始，成功改变名字集合的 create、remove 或 rename 在同一事务中推进相应父目录。失败、回滚和不改变集合的 no-op 不推进；跨目录 rename 分别推进两个父目录，耗尽可表示范围时以 `EOVERFLOW` 拒绝修改。
 
-`DirectoryMetadataObserver.ObserveDirectoryMetadata` 接受 DirectoryTarget、`DirectoryMetadataOptions{Guards, IncludeName}` 与空的 caller-owned ListResult。成功时 entries、revision 与可选目录自身 NameObservation 来自同一 publication gate 和 SQLite read transaction。它使用独立授权，不从 `ReadEntries`、`ReadMetadata` 或名字修改权限推导。生产方在载入叶名和 metadata 前逐项 reserve；请求自身名字时先 reserve prefix。任一错误使 collector 和 observation 整体失败，不允许读取已产生前缀。
+`DirectoryMetadataObserver.ObserveDirectoryMetadata` 接受 DirectoryTarget、`DirectoryMetadataOptions{Guards, IncludeName}` 与空的 caller-owned ListResult。成功时 entries、revision 与可选目录自身 NameObservation 来自同一 publication gate 和 SQLite read transaction。它使用独立授权，不从 `ReadEntries`、`ReadMetadata` 或名字修改权限推导，也不把 detached 目录当作完整具名树的一部分。生产方在载入叶名和 metadata 前逐项 reserve；请求自身名字时先 reserve prefix。任一错误使 collector 和 observation 整体失败，不允许读取已产生前缀。
+
+每份完整 listing 在载入条目前验证所有 child binding：entry 必须指向同 volume、存在、具名且唯一绑定的非 root child，父对象必须是当前目录。dangling edge、仍被 entry 指向却标为 detached 的 child、重复绑定或其它关系损坏使整份 List、ReadDirNode 或 directory metadata observation 以 `EIO` 失败，不允许省略坏条目后返回其余成员。
 
 File 与 NodeReference 的 `ReferenceNameObserver` 复用既有 session、引用生命周期与固定 NodeID。Root 表示所选 volume 根，Linked 携带当前唯一父 NodeID 与原始叶名字节，Detached 表示已经验证没有当前绑定；Root 与 Detached 不携带父身份或叶名。缺行、重复绑定、损坏或不可达都失败，不能转成 Detached。
 
@@ -158,7 +161,7 @@ HTTP 文件请求先执行[业务授权](authorization.md)，再读取或触碰 
 
 HTTP v4 统一转发基础 volume、中立 Attr、metadata、文件引用、目录／名字观察、range 和强 S/X。请求的 `op` 直接使用 `storage.Operation` 的规范值；二进制内容、原始叶名、revision、metadata version 和 payload 使用 canonical base64。协议拒绝未知、重复、缺席、null 或无关字段，所有结果都携带 v4 marker 与封闭 errno 词汇；v3 路由不提供兼容旁路。
 
-server 的 session 能力宣告 AtomicOpen、Namespace、References、FileActions、Metadata、Owners、Ranges 与 DirectoryMetadata；DirectoryMetadata 只在 NamespaceAccess 和 DirectoryMetadataObserver 的完整 backing chain 都可用时为 true。remote client 用这个 bit 同时 gate ReadDirNode 与 ObserveDirectoryMetadata，Namespace bit 只覆盖其余 identity namespace 操作。File 与 NodeReference 按实际方法宣告 Metadata、Scope、State、Delete、Conditional 与 ReferenceName。v4 client 只在对应 bool 为 true 时暴露可选接口，任意未知 capability 字段仍是协议错误。
+server 的 session 能力宣告 AtomicOpen、Namespace、References、FileActions、Metadata、Owners、Ranges 与 DirectoryMetadata；DirectoryMetadata 只在 DirectoryReader 和 DirectoryMetadataObserver 的完整 backing chain 都可用时为 true。remote client 用这个 bit 同时 gate ReadDirNode 与 ObserveDirectoryMetadata，Namespace bit 只覆盖 LookupAt 与 MutateName。File 与 NodeReference 按实际方法宣告 Metadata、Scope、State、Delete、Conditional 与 ReferenceName。v4 client 只在对应 bool 为 true 时暴露可选接口，任意未知 capability 字段仍是协议错误。
 
 OpenAt、OpenNodeRef 与 OpenChildRef response 携带 storage action 捕获的 node 与 outcome；旧 Open/OpenNode 保留原有 transport journal 与 ACK 形状，不因此取得 storage `FileActionID`。File/NodeReference.Close 和 FileSession.Close 可携带清理产生的 barrier。client 必须验证新原子打开的引用身份与原 action 一致，不能用一次新的 Stat 填补缺失字段。
 

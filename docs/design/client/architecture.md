@@ -46,7 +46,7 @@ SSE 不把整个 stream 保存在内存里，但每一帧仍有独立的 `DialOp
 
 每个基础数据调用都要先取得 client 自己的 response admission。默认同时保留 64 份响应、允许 64 个等待者，aggregate 上限为 8 GiB；每份都按 `4 * MaxBodyBytes` 预留，覆盖 raw body、decoded listing 与转换过程的同时保留。默认 1 GiB body 使每个 List 预留 4 GiB，因此 aggregate byte bound 会先把并发压到 2 个活跃 List，另有至多 64 个调用等待。Subscribe、Resubscribe 与 Snapshot 在发出 HTTP 前也取得同一名额，用来约束 stream 尚未成功建立时可能返回的普通 error body；确认 `200 text/event-stream` 后立即释放，后续 frame 由 `MaxFrameBytes` 约束。等待者已满时，`Stat`、`Write`、`Create` 或 stream setup 都会在发出 HTTP 请求前以 `EAGAIN` 失败；context cancellation 会移除等待计数。non-stream admission 一直持有到 response 解码、mutation response/barrier 验证完成。`ReadBounded` 取 client 与调用方 byte bound 中较小者；`ListBounded` 把解码后的 entry 逐项交给调用方的 `ListResult`。普通 `Read` 与 `List` 仍返回完整 materialized value，但整个 HTTP body 及其同时表示都在上述单体与 aggregate 边界内。server 侧的 backend 预算与 response admission 见 [`../server/architecture.md`](../server/architecture.md#六请求与响应的内存边界)。
 
-**FUSE 到这一层为止。** 挂载层把内核请求翻译为基础 volume、FileStorage 和中立 identity/metadata/range 调用。已有 inode 的 Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 Readlink 使用 OpenNodeRef，Lookup 与名字修改使用 LookupAt/MutateName。普通 node 操作携带稳定父 NodeID；已打开的 directory handle Lookup 与 Readdir 再附带活 Scope，后者使用 ReadDirNodeBounded。远端会话只有在 v4 DirectoryMetadata bundle bit 为 true 时暴露目录读取；in-process NamespaceAccess 不依赖这个 transport 约束。OpenChildRef 是编程入口可用的原子子项引用能力。普通 fd 使用 File，无 fd 的身份属性使用 NodeReference 或 StatNode/SetNodeAttr。
+**FUSE 到这一层为止。** 挂载层把内核请求翻译为基础 volume、FileStorage 和中立 identity/metadata/range 调用。已有 inode 的 Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 Readlink 使用 OpenNodeRef，Lookup 与名字修改使用 LookupAt/MutateName。挂载 preflight 分别要求 NamespaceAccess 与 DirectoryReader；普通 node 操作携带稳定父 NodeID，已打开的 directory handle Lookup 与 Readdir 再附带活 Scope，后者使用 ReadDirNodeBounded。远端会话只有在 v4 DirectoryMetadata bundle bit 为 true 时暴露 DirectoryReader；in-process DirectoryReader 不依赖 DirectoryMetadataObserver。OpenChildRef 是编程入口可用的原子子项引用能力。普通 fd 使用 File，无 fd 的身份属性使用 NodeReference 或 StatNode/SetNodeAttr。
 
 ### 业务身份与授权结果
 
@@ -72,7 +72,7 @@ Strong 控制请求与响应固定至多 16 KiB；文件 metadata/range 控制�
 
 ## 二、路径起点来自副本，子项操作到达权威
 
-内核的目录项超时、属性超时、负项超时都是 0。挂载根与路径起点可由本地 SQLite 副本定位；子项 Lookup 与 mutation 使用稳定父 NodeID 到达 authority。Opendir 建立的 directory handle 另持有 NodeReference/Scope，其 handle Lookup 与 Readdir 同时验证活引用。第一次 Readdir 通过 ReadDirNodeBounded 取得一次完整权威捕获并保存 stream，seekdir 与后续读取复用该捕获；普通应用枚举在 authority 的最终顺序执行 `ReadEntries` 检查。公开 List/ListBounded 继续先要求副本可用，再按路径回源。
+内核的目录项超时、属性超时、负项超时都是 0。挂载根与路径起点可由本地 SQLite 副本定位；子项 Lookup 与 mutation 使用稳定父 NodeID 到达 authority。Opendir 建立的 directory handle 另持有 NodeReference/Scope，其 handle Lookup 与 Readdir 同时验证活引用。第一次 Readdir 通过 DirectoryReader.ReadDirNodeBounded 取得一次完整权威捕获并保存 stream，seekdir 与后续读取复用该捕获；普通应用枚举在 authority 的最终顺序执行 `ReadEntries` 检查。目录名字被删除后，exact scoped Readdir 仍访问原 detached 空目录；裸 NodeID 与 metadata observation 拒绝它。公开 List/ListBounded 继续先要求副本可用，再按路径回源。
 
 挂载呈现层不向内核发送失效通知；副本不可用时，普通 volume 与文件 I/O 返回 EIO，文件会话的 action query、delete-intent query、续期和清理仍可联系服务端。副本仍消除初始路径 Stat 与负查找回源，但它不再决定已经取得的父 inode 后续修改落在哪个目录。
 

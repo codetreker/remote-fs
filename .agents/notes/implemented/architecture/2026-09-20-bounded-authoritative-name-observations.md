@@ -12,15 +12,15 @@ Status: implemented
 
 ### 应用目录枚举绑定目录身份
 
-`NamespaceAccess.ReadDirNode` 与 `ReadDirNodeBounded` 使用 `DirectoryTarget` 的非零 NodeID 定位目录；可选 Scope 存在时同时验证确切活引用。目标已失效、不是目录或已经 detached 时失败，不回退到旧路径。
+`DirectoryReader.ReadDirNode` 与 `ReadDirNodeBounded` 使用 `DirectoryTarget` 的非零 NodeID 定位目录；可选 Scope 存在时同时验证确切活引用。目标已失效或不是目录时失败，不回退到旧路径。detached 目录只有在请求携带该目录确切、仍有效且具有 `ReadEntries` 的 Scope 时可以继续枚举；裸 NodeID、错误 Scope 与 DirectoryMetadataObserver 都拒绝 detached 目标。
 
-一次成功枚举返回同一权威捕获中的全部原始叶名、属性和 `DirectoryObservation{ParentID, Revision}`。Revision 是非空、不透明、只可比较相等的目录名字集合版本；条目按原始名字排序，任一条目或捕获本身无法验证时整份结果失败。普通应用枚举在原生顺序执行 `ReadEntries` Use 检查。
+一次成功枚举返回同一权威捕获中的全部原始叶名、属性和 `DirectoryObservation{ParentID, Revision}`。Revision 是非空、不透明、只可比较相等的目录名字集合版本；条目按原始名字排序，任一条目或捕获本身无法验证时整份结果失败。dangling edge、具名却标为 detached 的 child、重复绑定或其它关系损坏不能被遗漏后返回其余成员。普通应用枚举在原生顺序执行 `ReadEntries` Use 检查。
 
-FUSE 的 `Opendir` handle 已持有 NodeReference 与 Scope。第一次 `Readdirent` 通过这个身份调用 bounded 枚举并保存一份 stream；seekdir 与后续读取复用同一捕获。挂载层不再从 inode 的旧路径调用公开 `List`，并继续以捕获开始前的本地 serial 边界清理名字索引，避免较晚学到的成员被旧捕获删除。
+FUSE 同时要求 NamespaceAccess 与 DirectoryReader：前者处理 Lookup 和 mutation，后者处理枚举。`Opendir` handle 已持有 NodeReference 与 Scope；第一次 `Readdirent` 通过这个身份调用 bounded 枚举并保存一份 stream，目录名字随后被移除时仍能读取同一 detached 对象。seekdir 与后续读取复用同一捕获。挂载层不再从 inode 的旧路径调用公开 `List`，并继续以捕获开始前的本地 serial 边界清理名字索引，避免较晚学到的成员被旧捕获删除。
 
 ### 完整目录 metadata 与引用名字是独立观察能力
 
-`DirectoryMetadataObserver.ObserveDirectoryMetadata` 接受 DirectoryTarget、`DirectoryMetadataOptions{Guards, IncludeName}` 与调用方拥有的 `ListResult`。成功结果的全部 entries、目录 revision，以及请求时可选的目录自身 `NameObservation` 来自同一个权威捕获。它使用独立的 `file.observe-directory-metadata` 授权操作，不从 `ReadEntries`、`ReadMetadata` 或名字修改权限推导准入。Go 接口上它与 NamespaceAccess 保持独立，in-process 调用方可以只实现其中一项。
+`DirectoryMetadataObserver.ObserveDirectoryMetadata` 接受 DirectoryTarget、`DirectoryMetadataOptions{Guards, IncludeName}` 与调用方拥有的 `ListResult`。成功结果的全部 entries、目录 revision，以及请求时可选的目录自身 `NameObservation` 来自同一个权威捕获。它使用独立的 `file.observe-directory-metadata` 授权操作，不从 `ReadEntries`、`ReadMetadata` 或名字修改权限推导准入。Go 接口上的 NamespaceAccess、DirectoryReader 与 DirectoryMetadataObserver 是三个独立 checked facet，in-process 调用方可以只实现其中一项。
 
 `ReferenceNameObserver` 位于既有 File 与 NodeReference 上，并通过无 I/O 的 `ReferenceIdentity` 核对返回的 NodeID 没有替换引用身份。`ObserveName` 使用独立的 `file.observe-name` 授权操作，返回三种封闭状态：
 
@@ -50,7 +50,7 @@ v8 迁移为每个现有目录建立初始 revision；迁移前 retained changes
 
 一组 guards 的 directory 与 edge 各最多 256 项，合计驻留最多 64 KiB；单个 revision 最多 64 字节，单个叶名继续受 4096 字节上限约束。HTTP 另外用实际 JSON、canonical base64 和 response envelope 计算调用方的 `ResultBytes` 与 body 上限；server、client 和 native retention 任一上限更紧时，整次调用按更紧者失败。
 
-limited、locked、objectstore、localstore 与 replicated 保留 capability preflight、读取 context、session/reference 生命周期、结果预算和身份复核。replicated 在确认本地副本健康后回源 authority，不从副本或旧路径推断当前名字。HTTP v4 继续使用预留的 DirectoryMetadata bit 作为目录观察 transport bundle gate：server 只有在完整包装链同时支持 NamespaceAccess 与 DirectoryMetadataObserver 时才宣告 true，remote client 的 ReadDirNode、ReadDirNodeBounded 和 ObserveDirectoryMetadata 都要求该 bit；Namespace bit 仍独立覆盖 LookupAt 与 MutateName。这样不改变 v4 capability shape，也不让旧 v4 的 false preflight 被部分实现绕过。ReferenceName 独立协商。三个 wire 操作仍分别使用 `file.read-dir-node`、`file.observe-directory-metadata` 与 `file.observe-name`；严格 DTO 使用 lower-camel 字段与 canonical base64，缺字段、未知字段、身份替换、部分结果或畸形状态都以协议错误失败。
+limited、locked、objectstore、localstore 与 replicated 分别转发 NamespaceAccess、DirectoryReader 与 DirectoryMetadataObserver，保留各自的 capability preflight、读取 context、session/reference 生命周期、结果预算和身份复核。replicated 在确认本地副本健康后回源 authority，不从副本或旧路径推断当前名字。HTTP v4 继续使用预留的 DirectoryMetadata bit 作为目录观察 transport bundle gate：server 只有在 DirectoryReader 与 DirectoryMetadataObserver 的完整包装链都可用时才宣告 true，remote client 的 ReadDirNode、ReadDirNodeBounded 和 ObserveDirectoryMetadata 都要求该 bit。Namespace bit 独立覆盖 LookupAt 与 MutateName，不参与这个 bundle。这样不改变 v4 capability shape，也不让旧 v4 的 false preflight 被部分实现绕过。ReferenceName 独立协商。三个 wire 操作仍分别使用 `file.read-dir-node`、`file.observe-directory-metadata` 与 `file.observe-name`；严格 DTO 使用 lower-camel 字段与 canonical base64，缺字段、未知字段、身份替换、部分结果或畸形状态都以协议错误失败。
 
 ### 范围边界
 

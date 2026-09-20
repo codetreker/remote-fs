@@ -50,7 +50,7 @@ flowchart LR
 
 ## 三、同一个接口，两个模块
 
-client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storage.Storage` 基础接口**，并提供有界结果扩展 `storage.BoundedStorage`。`FileStorage` 提供有限 FileSession 与保留 File；原子子项打开、NodeReference、身份 namespace、identity-bound directory enumeration、完整目录 metadata、reference current-name、action receipt、metadata、scope、pending deletion、条件 mutation、use owner 与 range 是可选能力。强 S/X 控制与 mutation scope 是另外的成对能力。
+client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storage.Storage` 基础接口**，并提供有界结果扩展 `storage.BoundedStorage`。`FileStorage` 提供有限 FileSession 与保留 File；原子子项打开、NodeReference、身份 namespace、DirectoryReader 的 identity-bound enumeration、完整目录 metadata、reference current-name、action receipt、metadata、scope、pending deletion、条件 mutation、use owner 与 range 是可选能力。强 S/X 控制与 mutation scope 是另外的成对能力。
 
 它们**不是同一个模块**，也不在同一个角色里：server 侧的那个真正持有数据；client 侧的那个不保存权威内容，它把调用翻译为 HTTP 交换，并保存完成核对所需的有限能力与动作状态。
 
@@ -116,7 +116,7 @@ metadata 每节点最多 16 个 namespace、规范编码总长最多 64 KiB；�
 
 **保留文件接口**：`FileStorage.NewFileSession` 建立有限会话，`OpenFile` 按路径打开，`OpenNode` 按身份打开；`OpenAt`、`OpenNodeRef` 与 `OpenChildRef` 使用父或节点身份返回原子捕获的对象引用。`File` 提供当前属性、区间读取、同步补丁、截断、Sync 与 Close；`NodeReference` 提供属性、Scope、State 与 Close，没有字节方法。身份 namespace、条件 mutation、pending deletion 与 session action query 都在相同 authority 顺序中执行。失去名字的对象仍存活并收费，直到引用退役、操作排空和最后释放完成。完整契约见[打开的文件](server/file-handles.md)。
 
-`NamespaceAccess.ReadDirNode` 以 DirectoryTarget 的 NodeID 和可选 Scope 返回一次完整、有界的目录捕获，并执行 `ReadEntries` Use 检查。`DirectoryMetadataObserver` 在独立授权操作下返回同一捕获的 entries、opaque directory revision 与可选目录自身名字；两个 Go capability 可以独立实现。HTTP v4 的预留 DirectoryMetadata bit 把两者作为完整 transport bundle 宣告，避免只支持旧 Namespace 子集的 peer 误通过目录读取 preflight。File 和 NodeReference 的 `ReferenceNameObserver` 返回 Root、Linked 或 Detached。可选 NamespaceGuards 在观察的同一权威读取中核对目录 revision、确切名字边和根关系，不进入 mutation 输入。完整契约见[打开的文件](server/file-handles.md#名字与目录观察)。
+`DirectoryReader.ReadDirNode` 以 DirectoryTarget 的 NodeID 和可选 Scope 返回一次完整、有界的目录捕获，并执行 `ReadEntries` Use 检查；只有 exact scoped read 能继续枚举 detached 空目录，裸 NodeID 与 DirectoryMetadataObserver 都拒绝该目标。`DirectoryMetadataObserver` 在独立授权操作下返回同一捕获的 entries、opaque directory revision 与可选目录自身名字；NamespaceAccess、DirectoryReader 和 DirectoryMetadataObserver 三个 Go capability 可以独立实现。HTTP v4 的预留 DirectoryMetadata bit 只在两个目录 facet 的完整 backing chain 都可用时宣告，避免只支持旧 Namespace 子集的 peer 误通过目录读取 preflight；Namespace bit 仍只表示 LookupAt 与 MutateName。File 和 NodeReference 的 `ReferenceNameObserver` 返回 Root、Linked 或 Detached。可选 NamespaceGuards 在观察的同一权威读取中核对目录 revision、确切名字边和根关系，不进入 mutation 输入。完整契约见[打开的文件](server/file-handles.md#名字与目录观察)。
 
 **强 S/X 控制接口**：显式创建 Session / Owner，解析现有普通文件，取得、续期、解除与核对 S/X 授予。修改只使用调用方给出的有界不可变 proof 集合，普通读取不声称 grant 有效。所有修改，包括匿名调用，都在原生最终转换处遵守占有顺序；重启通过持久最大时长证据与恢复屏障保留已确认保护。身份、动作结果、当前 grant 状态与内容版本分别定义，完整契约见 [文件锁设计](server/file-locks.md)。
 
