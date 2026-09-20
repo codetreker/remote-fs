@@ -30,6 +30,33 @@ func seededAdmissionReplica(t *testing.T) *Replica {
 	})
 }
 
+func TestReplicaSeedRecognizesCanonicalEmptyRootName(t *testing.T) {
+	replica, err := OpenReplica(t.Context(), filepath.Join(t.TempDir(), "replica.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := replica.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	seeding, err := replica.Reseed(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer seeding.Close()
+	root := metastore.Row{Parent: 0, Name: []byte{}, Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory}}
+	if err := seeding.Add(t.Context(), []metastore.Row{root}); err != nil {
+		t.Fatal(err)
+	}
+	if err := seeding.Complete(t.Context(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if attr, err := replica.Stat(t.Context(), ""); err != nil || attr.ID != 1 || attr.Kind != storage.NodeDirectory {
+		t.Fatalf("canonical empty root = %+v, %v", attr, err)
+	}
+}
+
 func seedAdmissionReplica(t *testing.T, checkClose func(error)) *Replica {
 	t.Helper()
 	replica, err := OpenReplica(t.Context(), filepath.Join(t.TempDir(), "replica.db"))

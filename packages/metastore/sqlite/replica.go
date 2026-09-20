@@ -452,14 +452,18 @@ func (s *Seeding) add(ctx context.Context, row metastore.Row) error {
 	if err := insertNode(ctx, s.tx.Tx, s.replica.store.volume, row.Node); err != nil {
 		return err
 	}
-	// Parent 0 and no name is how a picture names the one node that has neither. Nothing else
-	// can carry parent 0, since every other row names a node, and ids begin at one.
-	if row.Parent == 0 && row.Name == nil {
+	// Parent 0 and an empty name is how a picture names the one node that has neither.
+	// The wire uses canonical base64 text, where nil and empty bytes share the empty
+	// representation. Nothing else can carry parent 0, since ids begin at one.
+	if row.Parent == 0 && len(row.Name) == 0 {
 		if s.root != 0 {
 			return fmt.Errorf("%w: the picture carries two nodes with no parent, %d and %d", syscall.EIO, s.root, row.Node.ID)
 		}
 		s.root = row.Node.ID
 		return nil
+	}
+	if row.Parent == 0 || len(row.Name) == 0 {
+		return fmt.Errorf("snapshot row has an invalid parent/name pair: %w", syscall.EIO)
 	}
 	return insertEntry(ctx, s.tx.Tx, s.replica.store.volume, row.Parent, row.Name, row.Node.ID)
 }
