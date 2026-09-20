@@ -120,9 +120,10 @@ func (e *capabilityError) Error() string { return e.message }
 func (e *capabilityError) Unwrap() error { return e.errno }
 
 var (
-	ErrUseConflict   error = &capabilityError{"conflicting reference use", syscall.EAGAIN}
-	ErrRangeConflict error = &capabilityError{"conflicting enforced range", syscall.EAGAIN}
-	ErrInvalidScope  error = &capabilityError{"reference scope invalid", syscall.ESTALE}
+	ErrUseConflict       error = &capabilityError{"conflicting reference use", syscall.EAGAIN}
+	ErrRangeConflict     error = &capabilityError{"conflicting enforced range", syscall.EAGAIN}
+	ErrConditionConflict error = &capabilityError{"metadata condition does not match", syscall.EAGAIN}
+	ErrInvalidScope      error = &capabilityError{"reference scope invalid", syscall.ESTALE}
 )
 
 func CheckMetadataUpdate(namespace string, expectedVersion, payload []byte) error {

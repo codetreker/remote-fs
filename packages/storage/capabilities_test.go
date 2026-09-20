@@ -55,7 +55,7 @@ func TestCapabilityErrorsPreserveActionableClassifications(t *testing.T) {
 	for _, test := range []struct {
 		err  error
 		want syscall.Errno
-	}{{ErrUseConflict, syscall.EAGAIN}, {ErrRangeConflict, syscall.EAGAIN}, {ErrInvalidScope, syscall.ESTALE}} {
+	}{{ErrUseConflict, syscall.EAGAIN}, {ErrRangeConflict, syscall.EAGAIN}, {ErrConditionConflict, syscall.EAGAIN}, {ErrInvalidScope, syscall.ESTALE}} {
 		if !errors.Is(test.err, test.want) {
 			t.Fatalf("%v does not unwrap to %v", test.err, test.want)
 		}
