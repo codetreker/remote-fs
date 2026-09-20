@@ -38,6 +38,29 @@ func TestAttrSurvivesJSON(t *testing.T) {
 	}
 }
 
+func BenchmarkDecodeListResponse4096(b *testing.B) {
+	entries := make([]httprest.Entry, 4096)
+	for index := range entries {
+		entries[index] = httprest.Entry{
+			Name: []byte("entry"),
+			Attr: httprest.AttrOf(storage.Attr{ID: uint64(index + 1), Kind: storage.NodeRegular, Size: 1}),
+		}
+	}
+	encoded, err := json.Marshal(httprest.ListResponse{Entries: entries})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(encoded)))
+	b.ResetTimer()
+	for range b.N {
+		var response httprest.ListResponse
+		if err := json.Unmarshal(encoded, &response); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // Unspecified times must stay absent even when another time is explicitly zero.
 func TestAnAttrChangeSurvivesJSON(t *testing.T) {
 	birth := time.Time{}

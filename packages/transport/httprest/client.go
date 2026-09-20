@@ -490,59 +490,9 @@ func (b *retainedBody) release() {
 }
 
 func decodeListInto(content []byte, result *storage.ListResult) error {
-	decoder := json.NewDecoder(bytes.NewReader(content))
-	token, err := decoder.Token()
-	if err != nil {
-		return fmt.Errorf("reading the listing response object: %w", err)
-	}
-	if token != json.Delim('{') {
-		return fmt.Errorf("the listing response begins with %v, not an object", token)
-	}
-	if !decoder.More() {
-		return errors.New("the response carried no listing")
-	}
-	field, err := decoder.Token()
-	if err != nil {
-		return fmt.Errorf("reading the listing response field: %w", err)
-	}
-	if field != "entries" {
-		return fmt.Errorf("the listing response begins with field %q, want entries", field)
-	}
-	token, err = decoder.Token()
-	if err != nil {
-		return fmt.Errorf("reading the listing array: %w", err)
-	}
-	if token != json.Delim('[') {
-		return errors.New("the response carried no listing array")
-	}
-	for decoder.More() {
-		var entry Entry
-		if err := decoder.Decode(&entry); err != nil {
-			return err
-		}
-		if err := result.Add(storage.Entry{Name: string(entry.Name), Attr: entry.Attr.Storage()}); err != nil {
-			return err
-		}
-	}
-	if token, err = decoder.Token(); err != nil {
-		return fmt.Errorf("reading the end of the listing array: %w", err)
-	}
-	if token != json.Delim(']') {
-		return errors.New("the listing array did not end")
-	}
-	if decoder.More() {
-		return errors.New("the listing response carried fields other than entries")
-	}
-	if token, err = decoder.Token(); err != nil {
-		return fmt.Errorf("reading the end of the listing response: %w", err)
-	}
-	if token != json.Delim('}') {
-		return errors.New("the listing response object did not end")
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("the listing response has trailing content: %w", err)
-	}
-	return nil
+	return decodeListResponse(content, func(entry Entry) error {
+		return result.Add(storage.Entry{Name: string(entry.Name), Attr: entry.Attr.Storage()})
+	})
 }
 
 // storageError turns the one response that states an outcome into that outcome. A body

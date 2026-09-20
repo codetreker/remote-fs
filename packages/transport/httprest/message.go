@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"time"
+	"unicode/utf8"
 
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -263,17 +265,261 @@ type Entry struct {
 
 // UnmarshalJSON decodes an entry, and refuses one that carries no attributes.
 func (e *Entry) UnmarshalJSON(data []byte) error {
-	// The alias sheds this method, so what follows is the ordinary decoding.
-	type entry Entry
-	var decoded entry
-	if err := decodeFileJSON(data, &decoded); err != nil {
+	if !utf8.Valid(data) {
+		return errors.New("listing entry JSON must be UTF-8")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoded, err := decodeEntry(decoder)
+	if err != nil {
 		return err
 	}
-	if decoded.Attr == nil {
-		return fmt.Errorf("the listing entry %q carried no attributes", decoded.Name)
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("listing entry JSON contains trailing content")
 	}
-	*e = Entry(decoded)
+	*e = decoded
 	return nil
+}
+
+func decodeEntry(decoder *json.Decoder) (Entry, error) {
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return Entry{}, errors.New("the listing entry is not an object")
+	}
+	var result Entry
+	var hasName, hasAttr bool
+	for decoder.More() {
+		field, err := decoder.Token()
+		if err != nil {
+			return Entry{}, err
+		}
+		switch field {
+		case "name":
+			if hasName {
+				return Entry{}, errors.New("the listing entry repeats its name")
+			}
+			hasName = true
+			var encoded string
+			if err := decoder.Decode(&encoded); err != nil {
+				return Entry{}, errors.New("the listing entry name is not base64 text")
+			}
+			result.Name, err = base64.StdEncoding.Strict().DecodeString(encoded)
+			if err != nil || base64.StdEncoding.EncodeToString(result.Name) != encoded {
+				return Entry{}, errors.New("the listing entry name is not canonical base64")
+			}
+		case "attr":
+			if hasAttr {
+				return Entry{}, errors.New("the listing entry repeats its attributes")
+			}
+			hasAttr = true
+			attr, err := decodeListingAttr(decoder)
+			if err != nil {
+				return Entry{}, err
+			}
+			result.Attr = &attr
+		default:
+			return Entry{}, fmt.Errorf("the listing entry carries unknown field %q", field)
+		}
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim('}') {
+		return Entry{}, errors.New("the listing entry object did not end")
+	}
+	if !hasName {
+		return Entry{}, errors.New("the listing entry carried no name")
+	}
+	if !hasAttr {
+		return Entry{}, fmt.Errorf("the listing entry %q carried no attributes", result.Name)
+	}
+	return result, nil
+}
+
+func decodeListingAttr(decoder *json.Decoder) (Attr, error) {
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return Attr{}, errors.New("listing attributes are not an object")
+	}
+	var result Attr
+	seen := make(map[string]bool, 8)
+	for decoder.More() {
+		field, err := decoder.Token()
+		if err != nil {
+			return Attr{}, err
+		}
+		name, ok := field.(string)
+		if !ok || seen[name] {
+			return Attr{}, errors.New("listing attributes contain a duplicate member")
+		}
+		seen[name] = true
+		switch name {
+		case "id":
+			err = decoder.Decode(&result.ID)
+		case "kind":
+			err = decoder.Decode(&result.Kind)
+		case "size":
+			err = decoder.Decode(&result.Size)
+		case "access_time":
+			result.AccessTime, err = decodeListingTime(decoder)
+		case "mod_time":
+			result.ModTime, err = decodeListingTime(decoder)
+		case "birth_time":
+			value, decodeErr := decodeListingTime(decoder)
+			result.BirthTime, err = &value, decodeErr
+		case "change_time":
+			value, decodeErr := decodeListingTime(decoder)
+			result.ChangeTime, err = &value, decodeErr
+		case "metadata":
+			result.Metadata, err = decodeListingMetadata(decoder)
+		default:
+			return Attr{}, fmt.Errorf("listing attributes carry unknown field %q", name)
+		}
+		if err != nil {
+			return Attr{}, err
+		}
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim('}') {
+		return Attr{}, errors.New("listing attributes object did not end")
+	}
+	for _, required := range []string{"id", "kind", "size", "access_time", "mod_time"} {
+		if !seen[required] {
+			return Attr{}, fmt.Errorf("listing attributes carry no %s", required)
+		}
+	}
+	if err := result.check(); err != nil {
+		return Attr{}, err
+	}
+	return result, nil
+}
+
+func decodeListingTime(decoder *json.Decoder) (Time, error) {
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return Time{}, errors.New("listing time is not an object")
+	}
+	var result Time
+	var hasSeconds, hasNanos bool
+	for decoder.More() {
+		field, err := decoder.Token()
+		if err != nil {
+			return Time{}, err
+		}
+		switch field {
+		case "unix_sec":
+			if hasSeconds {
+				return Time{}, errors.New("listing time repeats its seconds")
+			}
+			hasSeconds = true
+			err = decoder.Decode(&result.UnixSec)
+		case "nanos":
+			if hasNanos {
+				return Time{}, errors.New("listing time repeats its nanoseconds")
+			}
+			hasNanos = true
+			err = decoder.Decode(&result.Nanos)
+		default:
+			return Time{}, fmt.Errorf("listing time carries unknown field %q", field)
+		}
+		if err != nil {
+			return Time{}, err
+		}
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim('}') || !hasSeconds || !hasNanos {
+		return Time{}, errors.New("listing time is incomplete")
+	}
+	if err := checkWireTime("listing", result); err != nil {
+		return Time{}, err
+	}
+	return result, nil
+}
+
+func decodeListingMetadata(decoder *json.Decoder) (map[string]OpaquePayload, error) {
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, errors.New("listing metadata is not an object")
+	}
+	result := make(map[string]OpaquePayload)
+	for decoder.More() {
+		field, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		name, ok := field.(string)
+		if !ok {
+			return nil, errors.New("listing metadata namespace is not text")
+		}
+		if _, exists := result[name]; exists {
+			return nil, errors.New("listing metadata repeats a namespace")
+		}
+		if len(result) >= storage.MaxMetadataNamespaces {
+			return nil, errors.New("listing metadata carries too many namespaces")
+		}
+		if err := storage.CheckMetadataNamespace(name); err != nil {
+			return nil, err
+		}
+		payload, err := decodeListingPayload(decoder)
+		if err != nil {
+			return nil, err
+		}
+		result[name] = payload
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim('}') {
+		return nil, errors.New("listing metadata object did not end")
+	}
+	return result, nil
+}
+
+func decodeListingPayload(decoder *json.Decoder) (OpaquePayload, error) {
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return OpaquePayload{}, errors.New("listing metadata payload is not an object")
+	}
+	var result OpaquePayload
+	var hasVersion, hasData bool
+	for decoder.More() {
+		field, err := decoder.Token()
+		if err != nil {
+			return OpaquePayload{}, err
+		}
+		switch field {
+		case "version":
+			if hasVersion {
+				return OpaquePayload{}, errors.New("listing metadata repeats its version")
+			}
+			hasVersion = true
+			result.Version, err = decodeListingBytes(decoder, "version", storage.MaxObservationTokenBytes, true)
+		case "data":
+			if hasData {
+				return OpaquePayload{}, errors.New("listing metadata repeats its data")
+			}
+			hasData = true
+			result.Data, err = decodeListingBytes(decoder, "data", storage.MaxMetadataValueBytes, false)
+		default:
+			return OpaquePayload{}, fmt.Errorf("listing metadata carries unknown field %q", field)
+		}
+		if err != nil {
+			return OpaquePayload{}, err
+		}
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim('}') || !hasVersion || !hasData {
+		return OpaquePayload{}, errors.New("listing metadata payload is incomplete")
+	}
+	return result, nil
+}
+
+func decodeListingBytes(decoder *json.Decoder, field string, maximum int, nonempty bool) ([]byte, error) {
+	var encoded string
+	if err := decoder.Decode(&encoded); err != nil {
+		return nil, errors.New("listing bytes are not base64 text")
+	}
+	if len(encoded) > base64.StdEncoding.EncodedLen(maximum) {
+		return nil, fmt.Errorf("listing metadata %s exceeds its field bound", field)
+	}
+	decoded, err := base64.StdEncoding.Strict().DecodeString(encoded)
+	if err != nil || base64.StdEncoding.EncodeToString(decoded) != encoded {
+		return nil, errors.New("listing bytes are not canonical base64")
+	}
+	if nonempty && len(decoded) == 0 {
+		return nil, fmt.Errorf("listing metadata %s is empty", field)
+	}
+	return decoded, nil
 }
 
 // EntriesOf renders a listing for the wire. The result is never nil, so that an empty
@@ -313,15 +559,58 @@ type ListResponse struct {
 // UnmarshalJSON decodes the response, and refuses a body that carries no listing. JSON
 // null and an empty list are two characters apart and mean opposite things.
 func (r *ListResponse) UnmarshalJSON(data []byte) error {
-	type response ListResponse
-	var decoded response
-	if err := decodeFileJSON(data, &decoded); err != nil {
+	entries := make([]Entry, 0)
+	if err := decodeListResponse(data, func(entry Entry) error {
+		entries = append(entries, entry)
+		return nil
+	}); err != nil {
 		return err
 	}
-	if decoded.Entries == nil {
+	*r = ListResponse{Entries: entries}
+	return nil
+}
+
+func decodeListResponse(data []byte, add func(Entry) error) error {
+	if !utf8.Valid(data) {
+		return errors.New("listing response JSON must be UTF-8")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return errors.New("the listing response is not an object")
+	}
+	if !decoder.More() {
 		return errors.New("the response carried no listing")
 	}
-	*r = ListResponse(decoded)
+	field, err := decoder.Token()
+	if err != nil || field != "entries" {
+		return errors.New("the listing response has an unknown field")
+	}
+	token, err = decoder.Token()
+	if err != nil || token != json.Delim('[') {
+		return errors.New("the response carried no listing array")
+	}
+	for decoder.More() {
+		entry, err := decodeEntry(decoder)
+		if err != nil {
+			return err
+		}
+		if err := add(entry); err != nil {
+			return err
+		}
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim(']') {
+		return errors.New("the listing array did not end")
+	}
+	if decoder.More() {
+		return errors.New("the listing response carried duplicate or unknown fields")
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim('}') {
+		return errors.New("the listing response object did not end")
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("listing response JSON contains trailing content")
+	}
 	return nil
 }
 

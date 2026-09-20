@@ -1,8 +1,10 @@
 package httprest
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"syscall"
@@ -63,6 +65,9 @@ func TestFileJSONDirectoryListsDoNotInheritLockBatchLimit(t *testing.T) {
 func TestV4ResponsesRejectAmbiguousJSONAndNoncanonicalBytes(t *testing.T) {
 	attr := AttrOf(storage.Attr{ID: 1, Kind: storage.NodeRegular, AccessTime: time.Unix(1, 0), ModTime: time.Unix(2, 0)})
 	entry, _ := json.Marshal(Entry{Name: []byte("a"), Attr: attr})
+	metadataAttr := *attr
+	metadataAttr.Metadata = map[string]OpaquePayload{"client.v1": {Version: []byte{1}, Data: []byte("a")}}
+	metadataEntry, _ := json.Marshal(Entry{Name: []byte("a"), Attr: &metadataAttr})
 	stat, _ := json.Marshal(StatResponse{Attr: attr})
 	list, _ := json.Marshal(ListResponse{Entries: []Entry{{Name: []byte("a"), Attr: attr}}})
 	space, _ := json.Marshal(SpaceOf(storage.Space{Total: 3, Used: 1, Avail: 2}))
@@ -77,6 +82,9 @@ func TestV4ResponsesRejectAmbiguousJSONAndNoncanonicalBytes(t *testing.T) {
 		{"entry duplicate", strings.Replace(string(entry), `"name":`, `"name":"YQ==","name":`, 1), func() any { return new(Entry) }},
 		{"entry unknown", string(entry[:len(entry)-1]) + `,"extra":0}`, func() any { return new(Entry) }},
 		{"entry noncanonical name", strings.Replace(string(entry), `"YQ=="`, `"YR=="`, 1), func() any { return new(Entry) }},
+		{"entry attr duplicate", strings.Replace(string(entry), `"size":0`, `"size":0,"size":0`, 1), func() any { return new(Entry) }},
+		{"entry time duplicate", strings.Replace(string(entry), `"nanos":0`, `"nanos":0,"nanos":0`, 1), func() any { return new(Entry) }},
+		{"entry metadata noncanonical", strings.Replace(string(metadataEntry), `"YQ=="`, `"YR=="`, 1), func() any { return new(Entry) }},
 		{"stat duplicate", strings.Replace(string(stat), `"attr":`, `"attr":null,"attr":`, 1), func() any { return new(StatResponse) }},
 		{"stat unknown", string(stat[:len(stat)-1]) + `,"extra":0}`, func() any { return new(StatResponse) }},
 		{"list duplicate", strings.Replace(string(list), `"entries":`, `"entries":[],"entries":`, 1), func() any { return new(ListResponse) }},
@@ -95,6 +103,25 @@ func TestV4ResponsesRejectAmbiguousJSONAndNoncanonicalBytes(t *testing.T) {
 				t.Fatalf("accepted %s", test.body)
 			}
 		})
+	}
+	tooMany := make(map[string]OpaquePayload, storage.MaxMetadataNamespaces+1)
+	for index := 0; index <= storage.MaxMetadataNamespaces; index++ {
+		tooMany[fmt.Sprintf("client.%d", index)] = OpaquePayload{Version: []byte{1}, Data: []byte{}}
+	}
+	oversizedAttr := *attr
+	oversizedAttr.Metadata = tooMany
+	encoded, err := json.Marshal(Entry{Name: []byte("a"), Attr: &oversizedAttr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded Entry
+	if err := json.Unmarshal(encoded, &decoded); err == nil {
+		t.Fatal("accepted too many listing metadata namespaces")
+	}
+	longVersion := base64.StdEncoding.EncodeToString(make([]byte, storage.MaxObservationTokenBytes+1))
+	body := strings.Replace(string(metadataEntry), `"AQ=="`, `"`+longVersion+`"`, 1)
+	if err := json.Unmarshal([]byte(body), &decoded); err == nil {
+		t.Fatal("accepted oversized listing metadata version")
 	}
 }
 
