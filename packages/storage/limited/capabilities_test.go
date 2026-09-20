@@ -3,6 +3,7 @@ package limited
 import (
 	"context"
 	"errors"
+	"reflect"
 	"syscall"
 	"testing"
 
@@ -29,6 +30,15 @@ func (p *capabilityProbe) OpenAt(context.Context, storage.ChildName, storage.Ope
 func (p *capabilityProbe) CheckNamespaceAccess() error { return p.checkErr }
 func (p *capabilityProbe) LookupAt(context.Context, storage.ChildName) (storage.Attr, error) {
 	return storage.Attr{ID: 3, Kind: storage.NodeRegular}, p.callErr
+}
+func (p *capabilityProbe) ReadDirNode(context.Context, storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	return storage.ObservedDirectory{Observation: storage.DirectoryObservation{ParentID: 3, Revision: []byte{1}}}, p.callErr
+}
+func (p *capabilityProbe) ReadDirNodeBounded(_ context.Context, _ storage.DirectoryTarget, result *storage.ListResult) (storage.DirectoryObservation, error) {
+	if p.callErr == nil && result != nil {
+		_ = result.Add(storage.Entry{Name: "entry", Attr: storage.Attr{ID: 4, Kind: storage.NodeRegular}})
+	}
+	return storage.DirectoryObservation{ParentID: 3, Revision: []byte{1}}, p.callErr
 }
 func (p *capabilityProbe) MutateName(context.Context, storage.NameCommand) (storage.NameResult, error) {
 	return p.name, p.callErr
@@ -269,6 +279,21 @@ func TestIdentityCapabilityWrappersPreservePartialResultsAndReferences(t *testin
 	}
 	if lookedUp, err := wrapper.LookupAt(t.Context(), storage.ChildName{}); !errors.Is(err, failure) || lookedUp.ID != attr.ID {
 		t.Fatalf("lookup=%+v error=%v", lookedUp, err)
+	}
+	if observed, err := wrapper.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: attr.ID}); !errors.Is(err, failure) || !reflect.DeepEqual(observed, storage.ObservedDirectory{}) {
+		t.Fatalf("directory=%+v error=%v", observed, err)
+	}
+	bounded, err := storage.NewListResult(4096, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		return nameBytes + metadataBytes + 64, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed, err := wrapper.ReadDirNodeBounded(t.Context(), storage.DirectoryTarget{NodeID: attr.ID}, bounded); !errors.Is(err, failure) || !reflect.DeepEqual(observed, storage.DirectoryObservation{}) {
+		t.Fatalf("bounded directory=%+v error=%v", observed, err)
+	}
+	if entries, err := bounded.Entries(); entries != nil || !errors.Is(err, failure) {
+		t.Fatalf("failed bounded directory exposed %+v, %v", entries, err)
 	}
 	result, err := wrapper.MutateName(t.Context(), storage.NameCommand{})
 	if !errors.Is(err, failure) || result.Attr == nil || result.Attr.ID != attr.ID {

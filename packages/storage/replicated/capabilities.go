@@ -159,6 +159,38 @@ func (s *fileSession) LookupAt(ctx context.Context, name storage.ChildName) (sto
 	})
 }
 
+func (s *fileSession) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	observed, err := sessionCapability(ctx, s, true, func(ctx context.Context, capability httprest.NamespaceAccessWithBarrier) (storage.ObservedDirectory, error) {
+		return capability.ReadDirNode(ctx, target)
+	})
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	if err := observed.Check(); err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	return observed, nil
+}
+
+func (s *fileSession) ReadDirNodeBounded(ctx context.Context, target storage.DirectoryTarget, result *storage.ListResult) (observation storage.DirectoryObservation, returned error) {
+	if result == nil {
+		return observation, syscall.EINVAL
+	}
+	defer func() {
+		if returned != nil {
+			result.Fail(returned)
+			observation = storage.DirectoryObservation{}
+		}
+	}()
+	observation, returned = sessionCapability(ctx, s, true, func(ctx context.Context, capability httprest.NamespaceAccessWithBarrier) (storage.DirectoryObservation, error) {
+		return capability.ReadDirNodeBounded(ctx, target, result)
+	})
+	if returned == nil {
+		returned = observation.Check()
+	}
+	return observation, returned
+}
+
 func (s *fileSession) MutateName(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
 	return sessionCapability(ctx, s, true, func(ctx context.Context, capability httprest.NamespaceAccessWithBarrier) (storage.NameResult, error) {
 		var result storage.NameResult

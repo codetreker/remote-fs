@@ -75,6 +75,17 @@ func (p *capabilitySessionProbe) LookupAt(ctx context.Context, _ storage.ChildNa
 	p.capture(ctx)
 	return storage.Attr{ID: 3, Kind: storage.NodeRegular}, p.failure
 }
+func (p *capabilitySessionProbe) ReadDirNode(ctx context.Context, _ storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	p.capture(ctx)
+	return storage.ObservedDirectory{Observation: storage.DirectoryObservation{ParentID: 3, Revision: []byte{1}}}, p.failure
+}
+func (p *capabilitySessionProbe) ReadDirNodeBounded(ctx context.Context, _ storage.DirectoryTarget, result *storage.ListResult) (storage.DirectoryObservation, error) {
+	p.capture(ctx)
+	if p.failure == nil && result != nil {
+		_ = result.Add(storage.Entry{Name: "entry", Attr: storage.Attr{ID: 4, Kind: storage.NodeRegular}})
+	}
+	return storage.DirectoryObservation{ParentID: 3, Revision: []byte{1}}, p.failure
+}
 func (p *capabilitySessionProbe) MutateName(ctx context.Context, _ storage.NameCommand) (storage.NameResult, error) {
 	p.capture(ctx)
 	return p.name, p.failure
@@ -282,6 +293,21 @@ func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
 	}
 	if _, err := session.LookupAt(locking.WithScope(t.Context(), proof), storage.ChildName{}); !errors.Is(err, failure) || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
 		t.Fatalf("lookup error=%v scope=%+v", err, probe.observed)
+	}
+	if observed, err := session.ReadDirNode(locking.WithScope(t.Context(), proof), storage.DirectoryTarget{NodeID: attr.ID}); !errors.Is(err, failure) || !reflect.DeepEqual(observed, storage.ObservedDirectory{}) || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
+		t.Fatalf("directory=%+v error=%v scope=%+v", observed, err, probe.observed)
+	}
+	bounded, err := storage.NewListResult(4096, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		return nameBytes + metadataBytes + 64, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed, err := session.ReadDirNodeBounded(locking.WithScope(t.Context(), proof), storage.DirectoryTarget{NodeID: attr.ID}, bounded); !errors.Is(err, failure) || !reflect.DeepEqual(observed, storage.DirectoryObservation{}) || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
+		t.Fatalf("bounded directory=%+v error=%v scope=%+v", observed, err, probe.observed)
+	}
+	if entries, err := bounded.Entries(); entries != nil || !errors.Is(err, failure) {
+		t.Fatalf("failed bounded directory exposed %+v, %v", entries, err)
 	}
 	if result, err := session.MutateName(t.Context(), storage.NameCommand{}); !errors.Is(err, failure) || result.Attr == nil || result.Attr.ID != attr.ID || !reflect.DeepEqual(probe.observed, proof) {
 		t.Fatalf("name mutation=%+v error=%v scope=%+v", result, err, probe.observed)

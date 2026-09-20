@@ -60,6 +60,10 @@ var metastoreAuxiliaryFilenames = [...]string{
 // zero uses sqlite.DefaultMaxIntegrityBytes.
 // MaxMetadataBytes bounds canonical opaque metadata retained by SQLite; zero uses
 // sqlite.DefaultMaxMetadataBytes.
+// MaxDirectoryEntries bounds entries in one authoritative directory capture; zero uses
+// sqlite.DefaultMaxDirectoryEntries.
+// MaxDirectoryBytes bounds retained raw names and metadata in one authoritative directory
+// capture; zero uses sqlite.DefaultMaxDirectoryBytes.
 // MaxDeleteIntents bounds durable close-time deletion receipts; zero uses
 // sqlite.DefaultMaxDeleteIntents.
 // The backing filesystem remains the hard physical ceiling for all bytes.
@@ -79,6 +83,8 @@ type Config struct {
 	MaxIntegrityRecords          int64
 	MaxIntegrityBytes            int64
 	MaxMetadataBytes             int64
+	MaxDirectoryEntries          int
+	MaxDirectoryBytes            int64
 	MaxDeleteIntents             int
 	// Retained-file and advisory limits use SQLite defaults when omitted.
 	MaxRetainedFiles int
@@ -100,6 +106,8 @@ type Status struct {
 	MaxIntegrityRecords          int64
 	MaxIntegrityBytes            int64
 	MaxMetadataBytes             int64
+	MaxDirectoryEntries          int
+	MaxDirectoryBytes            int64
 	MaxDeleteIntents             int
 	LocalDisk                    localdisk.Status
 	Maintenance                  objectstore.MaintenanceStatus
@@ -128,6 +136,8 @@ type Store struct {
 	maxIntegrityRecords          int64
 	maxIntegrityBytes            int64
 	maxMetadataBytes             int64
+	maxDirectoryEntries          int
+	maxDirectoryBytes            int64
 	maxDeleteIntents             int
 	volumeName                   string
 	closeMu                      sync.Mutex
@@ -400,6 +410,8 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 		maxIntegrityRecords:          sqliteOptions.MaxIntegrityRecords,
 		maxIntegrityBytes:            sqliteOptions.MaxIntegrityBytes,
 		maxMetadataBytes:             sqliteOptions.MaxMetadataBytes,
+		maxDirectoryEntries:          sqliteOptions.MaxDirectoryEntries,
+		maxDirectoryBytes:            sqliteOptions.MaxDirectoryBytes,
 		maxDeleteIntents:             sqliteOptions.MaxDeleteIntents,
 	}, nil
 }
@@ -415,6 +427,8 @@ func (config Config) sqliteOptions() (sqlite.Options, error) {
 		MaxIntegrityRecords:          config.MaxIntegrityRecords,
 		MaxIntegrityBytes:            config.MaxIntegrityBytes,
 		MaxMetadataBytes:             config.MaxMetadataBytes,
+		MaxDirectoryEntries:          config.MaxDirectoryEntries,
+		MaxDirectoryBytes:            config.MaxDirectoryBytes,
 		MaxDeleteIntents:             config.MaxDeleteIntents,
 	}).Effective()
 }
@@ -811,26 +825,28 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 	objects, objectsErr := s.meta.ObjectStatus(ctx)
 	checkpoint := s.durable.status()
 	return Status{
-			Volume:                       s.volumeName,
-			Space:                        space,
-			Objects:                      objects,
-			ObjectLimits:                 s.objectLimits,
-			MaxReaderConnections:         s.maxReaderConnections,
-			MaxSnapshotReaderConnections: s.maxSnapshotReaderConnections,
-			MaxIntegrityRecords:          s.maxIntegrityRecords,
-			MaxIntegrityBytes:            s.maxIntegrityBytes,
-			MaxMetadataBytes:             s.maxMetadataBytes,
-			MaxDeleteIntents:             s.maxDeleteIntents,
-			LocalDisk:                    localDisk,
-			Maintenance:                  s.MaintenanceStatus(),
-			Checkpoint:                   checkpoint,
-		}, errors.Join(
-			statusFailure("logical space", spaceErr),
-			statusFailure("combined space", spaceStatusErr),
-			statusFailure("object records", objectsErr),
-			statusFailure("local object store", localDiskErr),
-			statusFailure("SQLite checkpoint", checkpoint.LastError),
-		)
+		Volume:                       s.volumeName,
+		Space:                        space,
+		Objects:                      objects,
+		ObjectLimits:                 s.objectLimits,
+		MaxReaderConnections:         s.maxReaderConnections,
+		MaxSnapshotReaderConnections: s.maxSnapshotReaderConnections,
+		MaxIntegrityRecords:          s.maxIntegrityRecords,
+		MaxIntegrityBytes:            s.maxIntegrityBytes,
+		MaxMetadataBytes:             s.maxMetadataBytes,
+		MaxDirectoryEntries:          s.maxDirectoryEntries,
+		MaxDirectoryBytes:            s.maxDirectoryBytes,
+		MaxDeleteIntents:             s.maxDeleteIntents,
+		LocalDisk:                    localDisk,
+		Maintenance:                  s.MaintenanceStatus(),
+		Checkpoint:                   checkpoint,
+	}, errors.Join(
+		statusFailure("logical space", spaceErr),
+		statusFailure("combined space", spaceStatusErr),
+		statusFailure("object records", objectsErr),
+		statusFailure("local object store", localDiskErr),
+		statusFailure("SQLite checkpoint", checkpoint.LastError),
+	)
 }
 
 func clampStatusSpace(

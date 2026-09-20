@@ -44,6 +44,42 @@ func (s *fileSession) LookupAt(ctx context.Context, name storage.ChildName) (sto
 	return backend.LookupAt(readContext(ctx), name)
 }
 
+func (s *fileSession) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	backend, err := capability(s.FileSession, storage.NamespaceAccess.CheckNamespaceAccess)
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	observed, err := backend.ReadDirNode(readContext(ctx), target)
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	if err := observed.Check(); err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	return observed, nil
+}
+
+func (s *fileSession) ReadDirNodeBounded(ctx context.Context, target storage.DirectoryTarget, result *storage.ListResult) (observation storage.DirectoryObservation, returned error) {
+	if result == nil {
+		return observation, syscall.EINVAL
+	}
+	defer func() {
+		if returned != nil {
+			observation = storage.DirectoryObservation{}
+			result.Fail(returned)
+		}
+	}()
+	backend, err := capability(s.FileSession, storage.NamespaceAccess.CheckNamespaceAccess)
+	if err != nil {
+		return observation, err
+	}
+	observation, returned = backend.ReadDirNodeBounded(readContext(ctx), target, result)
+	if returned == nil {
+		returned = observation.Check()
+	}
+	return observation, returned
+}
+
 func (s *fileSession) MutateName(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
 	backend, err := capability(s.FileSession, storage.NamespaceAccess.CheckNamespaceAccess)
 	if err != nil {

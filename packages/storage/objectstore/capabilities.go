@@ -180,6 +180,57 @@ func (fs *fileSession) LookupAt(ctx context.Context, name storage.ChildName) (st
 	return fs.native.(metastore.NamespaceAccess).LookupAt(ctx, name)
 }
 
+func (fs *fileSession) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	if err := fs.CheckNamespaceAccess(); err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	ctx, cancel := fs.operationContext(ctx)
+	defer cancel()
+	done, err := fs.begin(ctx, true)
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	defer done()
+	observed, err := fs.native.(metastore.NamespaceAccess).ReadDirNode(ctx, target)
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	if err := observed.Check(); err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	return observed.Clone(), nil
+}
+
+func (fs *fileSession) ReadDirNodeBounded(ctx context.Context, target storage.DirectoryTarget, result *storage.ListResult) (observation storage.DirectoryObservation, err error) {
+	if result == nil {
+		return observation, syscall.EINVAL
+	}
+	defer func() {
+		if err != nil {
+			result.Fail(err)
+			observation = storage.DirectoryObservation{}
+		}
+	}()
+	if err := fs.CheckNamespaceAccess(); err != nil {
+		return observation, err
+	}
+	ctx, cancel := fs.operationContext(ctx)
+	defer cancel()
+	done, err := fs.begin(ctx, true)
+	if err != nil {
+		return observation, err
+	}
+	defer done()
+	observation, err = fs.native.(metastore.NamespaceAccess).ReadDirNodeBounded(ctx, target, result)
+	if err != nil {
+		return observation, err
+	}
+	if err := observation.Check(); err != nil {
+		return observation, err
+	}
+	return observation.Clone(), nil
+}
+
 func (fs *fileSession) MutateName(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
 	if err := fs.CheckNamespaceAccess(); err != nil {
 		return storage.NameResult{}, err
