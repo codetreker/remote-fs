@@ -127,6 +127,25 @@ func (r *nodeReference) ClearPendingUnlink(ctx context.Context, command storage.
 	})
 }
 
+func (r *nodeReference) CheckConditionalFileMutation() error {
+	return capabilityCheck(r.remote, func(capability httprest.ConditionalFileMutationWithBarrier) error {
+		return capability.CheckConditionalFileMutation()
+	})
+}
+
+func (r *nodeReference) MutateFile(ctx context.Context, command storage.FileMutation) (storage.Attr, error) {
+	return referenceCall(ctx, r.session, r.remote, func(ctx context.Context, capability httprest.ConditionalFileMutationWithBarrier) (storage.Attr, error) {
+		var result storage.Attr
+		err := r.session.confirm(ctx, "mutate-file", func(ctx context.Context) (*httprest.MutationBarrier, error) {
+			var barrier *httprest.MutationBarrier
+			var err error
+			result, barrier, err = capability.MutateFileWithBarrier(ctx, command)
+			return barrier, err
+		})
+		return result, err
+	})
+}
+
 func (f *retainedFile) CheckReferenceState() error {
 	return capabilityCheck(f.remote, func(capability storage.ReferenceStateAccess) error { return capability.CheckReferenceState() })
 }
@@ -241,6 +260,7 @@ var (
 	_ storage.ReferenceStateAccess    = (*nodeReference)(nil)
 	_ storage.ReferenceMetadataAccess = (*nodeReference)(nil)
 	_ storage.DeleteIntent            = (*nodeReference)(nil)
+	_ storage.ConditionalFileMutation = (*nodeReference)(nil)
 	_ storage.ReferenceStateAccess    = (*retainedFile)(nil)
 	_ storage.DeleteIntent            = (*retainedFile)(nil)
 	_ storage.ConditionalFileMutation = (*retainedFile)(nil)

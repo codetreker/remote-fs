@@ -206,6 +206,26 @@ func verifyNodeReference(t *testing.T, session storage.FileSession, references s
 	if err != nil || len(payload.Version) == 0 || string(payload.Data) != leaf {
 		t.Fatalf("reference metadata=%+v error=%v", payload, err)
 	}
+	conditional, ok := reference.(storage.ConditionalFileMutation)
+	if !ok {
+		t.Fatalf("%v reference lost conditional file mutation", attr.Kind)
+	}
+	if err := conditional.CheckConditionalFileMutation(); err != nil {
+		t.Fatal(err)
+	}
+	atomicallyModified := time.Unix(789, 123).UTC()
+	atomicValue := []byte("atomic-" + leaf)
+	observed, err = conditional.MutateFile(t.Context(), storage.FileMutation{
+		Action: replicatedFileActionFor(t, session), Kind: storage.MutateAttributes,
+		Attr: storage.AttrChange{ModTime: &atomicallyModified},
+		Metadata: map[string]storage.OpaquePayload{
+			"test.atomic": {Data: atomicValue},
+		},
+	})
+	if err != nil || observed.ID != attr.ID || observed.Kind != attr.Kind || !observed.ModTime.Equal(atomicallyModified) ||
+		string(observed.Metadata["test.atomic"].Data) != string(atomicValue) {
+		t.Fatalf("reference conditional mutation=%+v error=%v", observed, err)
+	}
 	direct, err := references.OpenNodeRef(t.Context(), attr.ID, storage.NodeRefOptions{
 		Kind: attr.Kind, Target: storage.ChildCondition{State: storage.SameNode, NodeID: attr.ID},
 		Action: replicatedFileActionFor(t, session), MetadataAccess: storage.ReadMetadata,

@@ -71,8 +71,14 @@ func (r *cleanupReferenceStub) Close(context.Context) error {
 
 type barrierReferenceStub struct {
 	storage.NodeReference
-	closeErr error
-	closes   int
+	closeErr      error
+	closes        int
+	checkErr      error
+	mutation      storage.Attr
+	mutationErr   error
+	barrier       *httprest.MutationBarrier
+	lastMutation  storage.FileMutation
+	mutationCalls int
 }
 
 func (r *barrierReferenceStub) Close(context.Context) error {
@@ -87,6 +93,19 @@ func (r *barrierReferenceStub) CloseWithBarrier(context.Context) (*httprest.Muta
 
 func (*barrierReferenceStub) SetAttrWithBarrier(context.Context, storage.AttrChange) (storage.Attr, *httprest.MutationBarrier, error) {
 	return storage.Attr{}, &httprest.MutationBarrier{Incarnation: "log"}, nil
+}
+
+func (r *barrierReferenceStub) CheckConditionalFileMutation() error { return r.checkErr }
+
+func (r *barrierReferenceStub) MutateFile(ctx context.Context, command storage.FileMutation) (storage.Attr, error) {
+	result, _, err := r.MutateFileWithBarrier(ctx, command)
+	return result, err
+}
+
+func (r *barrierReferenceStub) MutateFileWithBarrier(_ context.Context, command storage.FileMutation) (storage.Attr, *httprest.MutationBarrier, error) {
+	r.lastMutation = command
+	r.mutationCalls++
+	return r.mutation, r.barrier, r.mutationErr
 }
 
 func (s *referenceCapabilityStub) CheckScopedReference() error { return s.checkErr }
@@ -359,6 +378,47 @@ func TestNodeOpenRejectsAReferenceWithoutReplicationBarriers(t *testing.T) {
 	plain.closeErr = nil
 	if err := result.Reference.Close(t.Context()); err != nil || plain.closes != 2 {
 		t.Fatalf("unsupported node cleanup retry=%v closes=%d", err, plain.closes)
+	}
+}
+
+func TestNodeReferenceConditionalMutationPreservesKindsAndPartialAuthorityResults(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		kind storage.NodeKind
+	}{
+		{name: "directory", kind: storage.NodeDirectory},
+		{name: "symlink", kind: storage.NodeSymlink},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			session := retainedTestSession(t, nil)
+			failure := errors.New("mutation response ended after authority publication")
+			remote := &barrierReferenceStub{
+				mutation:    storage.Attr{ID: 31, Kind: test.kind, Metadata: map[string]storage.OpaquePayload{"test.atomic": {Data: []byte("value")}}},
+				mutationErr: failure,
+			}
+			reference := &nodeReference{session: session, remote: remote}
+			if err := reference.CheckConditionalFileMutation(); err != nil {
+				t.Fatal(err)
+			}
+			command := storage.FileMutation{
+				Action: storage.FileActionID("1:00000000000000000000000000000000"), Kind: storage.MutateAttributes,
+				Metadata: map[string]storage.OpaquePayload{"test.atomic": {Data: []byte("value")}},
+			}
+			result, err := reference.MutateFile(t.Context(), command)
+			if !errors.Is(err, failure) || result.ID != 31 || result.Kind != test.kind || string(result.Metadata["test.atomic"].Data) != "value" {
+				t.Fatalf("partial mutation=%+v error=%v", result, err)
+			}
+			if remote.mutationCalls != 1 || remote.lastMutation.Action != command.Action || remote.lastMutation.Kind != storage.MutateAttributes {
+				t.Fatalf("forwarded mutation=%+v calls=%d", remote.lastMutation, remote.mutationCalls)
+			}
+
+			remote.mutationErr = nil
+			remote.barrier = &httprest.MutationBarrier{Incarnation: "log"}
+			result, err = reference.MutateFile(t.Context(), command)
+			if err != nil || result.ID != 31 || result.Kind != test.kind || remote.mutationCalls != 2 {
+				t.Fatalf("confirmed mutation=%+v error=%v calls=%d", result, err, remote.mutationCalls)
+			}
+		})
 	}
 }
 
