@@ -134,7 +134,7 @@ func (d *directoryHandle) load(ctx context.Context) error {
 }
 
 func (d *directoryHandle) capture(ctx context.Context) (*capturedDirectory, error) {
-	access, err := d.node.volume.namespace()
+	reader, err := d.node.volume.directoryReader()
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +149,7 @@ func (d *directoryHandle) capture(ctx context.Context) (*capturedDirectory, erro
 	// Membership learned after this capture starts may describe a later authority
 	// state and must not be discarded merely because this capture does not contain it.
 	before := d.node.id.given()
-	observation, err := access.ReadDirNodeBounded(ctx, target, result)
+	observation, err := reader.ReadDirNodeBounded(ctx, target, result)
 	if err != nil {
 		return nil, err
 	}

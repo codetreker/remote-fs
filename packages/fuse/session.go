@@ -323,6 +323,13 @@ func checkSessionCapabilities(files storage.FileSession) error {
 	if err := namespace.CheckNamespaceAccess(); err != nil {
 		return err
 	}
+	reader, ok := files.(storage.DirectoryReader)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	if err := reader.CheckDirectoryRead(); err != nil {
+		return err
+	}
 	opener, ok := files.(storage.AtomicFileOpener)
 	if !ok {
 		return syscall.EOPNOTSUPP

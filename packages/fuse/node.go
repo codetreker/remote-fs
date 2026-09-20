@@ -64,6 +64,17 @@ func (v *volume) namespace() (storage.NamespaceAccess, error) {
 	return access, nil
 }
 
+func (v *volume) directoryReader() (storage.DirectoryReader, error) {
+	reader, ok := v.files.(storage.DirectoryReader)
+	if !ok {
+		return nil, syscall.EOPNOTSUPP
+	}
+	if err := reader.CheckDirectoryRead(); err != nil {
+		return nil, err
+	}
+	return reader, nil
+}
+
 func (n *node) Lookup(ctx context.Context, name string, out *gofuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	return n.lookup(ctx, name, out, nil)
 }

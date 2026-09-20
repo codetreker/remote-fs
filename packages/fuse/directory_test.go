@@ -469,6 +469,34 @@ func TestDirectoryHandleEnumerationUsesOneBoundedExactScopeCapture(t *testing.T)
 	}
 }
 
+func TestDirectoryHandleEnumerationRequiresDirectoryReaderPreflight(t *testing.T) {
+	namespace := &namespaceFixture{}
+	namespaceOnly := &struct {
+		storage.FileSession
+		storage.NamespaceAccess
+	}{namespace, namespace}
+	handle := &directoryHandle{
+		node: namespaceRoot(namespaceOnly), scope: storage.UseScope{Token: "directory"},
+	}
+	if err := handle.load(t.Context()); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("missing directory reader = %v", err)
+	}
+
+	cause := errors.New("directory reader dependency unavailable")
+	namespace.directoryErr = cause
+	dispatched := 0
+	namespace.readDirBounded = func(storage.DirectoryTarget, *storage.ListResult) (storage.DirectoryObservation, error) {
+		dispatched++
+		return storage.DirectoryObservation{}, nil
+	}
+	handle = &directoryHandle{
+		node: namespaceRoot(namespace), scope: storage.UseScope{Token: "directory"},
+	}
+	if err := handle.load(t.Context()); !errors.Is(err, cause) || dispatched != 0 {
+		t.Fatalf("failed preflight error=%v dispatched=%d", err, dispatched)
+	}
+}
+
 func TestDirectoryHandleRejectsFailedPartialAndMalformedCapturesBeforeChangingIdentities(t *testing.T) {
 	for _, test := range []struct {
 		name      string

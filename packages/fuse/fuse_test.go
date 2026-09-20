@@ -1606,7 +1606,7 @@ func (s *decoratedSession) ReadDirNode(ctx context.Context, target storage.Direc
 	if err := s.hooks.check("ReadDirNode", path); err != nil {
 		return storage.ObservedDirectory{}, err
 	}
-	observed, err := s.NamespaceAccess.ReadDirNode(ctx, target)
+	observed, err := s.DirectoryReader.ReadDirNode(ctx, target)
 	if err != nil {
 		return storage.ObservedDirectory{}, err
 	}
@@ -1623,7 +1623,7 @@ func (s *decoratedSession) ReadDirNodeBounded(ctx context.Context, target storag
 	if err := s.hooks.check("ReadDirNode", path); err != nil {
 		return storage.DirectoryObservation{}, result.Fail(err)
 	}
-	observation, err := s.NamespaceAccess.ReadDirNodeBounded(ctx, target, result)
+	observation, err := s.DirectoryReader.ReadDirNodeBounded(ctx, target, result)
 	if err != nil {
 		return storage.DirectoryObservation{}, err
 	}
@@ -3380,6 +3380,7 @@ func setBackingMode(t *testing.T, backing storage.Storage, path string, mode fs.
 type capableTestSession struct {
 	storage.FileSession
 	storage.NamespaceAccess
+	storage.DirectoryReader
 	storage.AtomicFileOpener
 	storage.MetadataAccess
 	storage.UseOwners
@@ -3392,6 +3393,7 @@ func testSessionCapabilities(session storage.FileSession) capableTestSession {
 	return capableTestSession{
 		FileSession:      session,
 		NamespaceAccess:  session.(storage.NamespaceAccess),
+		DirectoryReader:  session.(storage.DirectoryReader),
 		AtomicFileOpener: session.(storage.AtomicFileOpener),
 		MetadataAccess:   session.(storage.MetadataAccess),
 		UseOwners:        session.(storage.UseOwners),

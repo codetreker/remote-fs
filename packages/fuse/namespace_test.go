@@ -19,11 +19,13 @@ type namespaceFixture struct {
 	lookup         func(storage.ChildName) (storage.Attr, error)
 	readDir        func(storage.DirectoryTarget) (storage.ObservedDirectory, error)
 	readDirBounded func(storage.DirectoryTarget, *storage.ListResult) (storage.DirectoryObservation, error)
+	directoryErr   error
 	open           func(storage.ChildName, storage.OpenAtOptions) (storage.OpenResult, error)
 	mutate         func(storage.NameCommand) (storage.NameResult, error)
 }
 
 func (s *namespaceFixture) CheckNamespaceAccess() error { return nil }
+func (s *namespaceFixture) CheckDirectoryRead() error   { return s.directoryErr }
 func (s *namespaceFixture) CheckAtomicFileOpen() error  { return nil }
 func (s *namespaceFixture) LookupAt(_ context.Context, name storage.ChildName) (storage.Attr, error) {
 	return s.lookup(name)
