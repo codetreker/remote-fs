@@ -552,7 +552,9 @@ func (s *Storage) storageError(req Request, body []byte) error {
 	_, hasCode := members["lockCode"]
 	_, hasRecorded := members["recorded"]
 	_, hasCapability := members["capabilityCode"]
-	if hasCapability && (hasCode || hasRecorded) {
+	_, hasFileRecorded := members["fileRecorded"]
+	_, hasAttempt := members["attempt"]
+	if (hasCapability || hasFileRecorded) && (hasCode || hasRecorded) {
 		return unreachable(req, errors.New("response combines unrelated error families"))
 	}
 	if hasCode || hasRecorded {
@@ -571,17 +573,24 @@ func (s *Storage) storageError(req Request, body []byte) error {
 		return unreachable(req, fmt.Errorf("the server reported errno %q, which this side does not know", resp.Errno))
 	}
 	var capability error
-	if hasCapability {
+	if hasCapability || hasFileRecorded || hasAttempt {
 		if err := decodeFileJSON(body, &resp); err != nil {
 			return unreachable(req, err)
 		}
-		var ok bool
-		capability, ok = capabilityErrors[resp.CapabilityCode]
-		if !ok || storage.ErrnoOf(capability) != errno {
-			return unreachable(req, errors.New("invalid capability error classification"))
+		if hasCapability {
+			var ok bool
+			capability, ok = capabilityErrors[resp.CapabilityCode]
+			if !ok || storage.ErrnoOf(capability) != errno {
+				return unreachable(req, errors.New("invalid capability error classification"))
+			}
 		}
 	}
-	return &operationError{req: req, errno: errno, detail: resp.Message, capability: capability}
+	if hasFileRecorded {
+		if resp.FileRecorded == nil || !*resp.FileRecorded {
+			return unreachable(req, errors.New("invalid recorded file outcome"))
+		}
+	}
+	return &operationError{req: req, errno: errno, detail: resp.Message, capability: capability, recorded: hasFileRecorded, attempt: resp.Attempt}
 }
 
 // readWhole returns the entire response body without retaining more than limit bytes, and
@@ -639,6 +648,8 @@ type operationError struct {
 	deadline   bool
 	unknown    bool
 	capability error
+	recorded   bool
+	attempt    *storage.RangeAttempt
 }
 
 func (e *operationError) Error() string {

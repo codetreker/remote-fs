@@ -159,6 +159,7 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		case storage.OpFileStatus, storage.OpFileRenew:
 			expected.Status = r.Status
 		case storage.OpFileOpen, storage.OpFileOpenNode:
+			expected.Node = r.Node
 			expected.File = r.File
 			expected.Barrier = r.Barrier
 			expected.Capabilities = r.Capabilities
@@ -170,7 +171,7 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		case storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetNodeAttr:
 			expected.Attr = r.Attr
 			expected.Barrier = r.Barrier
-		case storage.OpFileSync:
+		case storage.OpFileSync, storage.OpFileClose, storage.OpFileSessionClose:
 			expected.Barrier = r.Barrier
 		case storage.OpFileScope:
 			expected.Scope = r.Scope
@@ -183,7 +184,7 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			expected.Conflict = r.Conflict
 		case storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel:
 			expected.Attempt = r.Attempt
-		case storage.OpFileAck, storage.OpFileClose, storage.OpFileSessionClose, storage.OpFileRetireUseOwner, storage.OpFileRangeDrop:
+		case storage.OpFileAck, storage.OpFileRetireUseOwner, storage.OpFileRangeDrop:
 		default:
 			return errors.New("unknown file response variant")
 		}
@@ -199,9 +200,6 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if !validFileCapability(r.Session) || r.Status == nil || r.Capabilities == nil {
 			return errors.New("file session response has no valid capability or status")
 		}
-		if err := validateSessionCapabilities(*r.Capabilities); err != nil {
-			return err
-		}
 	case storage.OpFileStatus, storage.OpFileRenew:
 		if r.Status == nil {
 			return errors.New("file response carries no status")
@@ -209,9 +207,6 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 	case storage.OpFileOpen, storage.OpFileOpenNode:
 		if !validFileCapability(r.File) || r.Capabilities == nil {
 			return errors.New("file open response carries no reference capability")
-		}
-		if err := validateReferenceCapabilities(*r.Capabilities); err != nil {
-			return err
 		}
 	case storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetNodeAttr:
 		if r.Attr == nil {
@@ -223,6 +218,9 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		}
 		if err := r.Scope.Check(); err != nil {
 			return err
+		}
+		if !utf8.ValidString(r.Scope.Token) {
+			return errors.New("reference scope is not valid UTF-8")
 		}
 	case storage.OpFileNewUseOwner:
 		if r.Owner == 0 {
@@ -269,20 +267,6 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if err := validateFileAttempt(req, *r.Attempt); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-func validateSessionCapabilities(c fileCapabilities) error {
-	if c.DirectoryMetadata || c.ReferenceName || c.AtomicOpen || c.Namespace || c.References || c.State || c.Scope || c.Delete || c.Conditional {
-		return errors.New("session advertises a future file capability")
-	}
-	return nil
-}
-
-func validateReferenceCapabilities(c fileCapabilities) error {
-	if c.DirectoryMetadata || c.ReferenceName || c.AtomicOpen || c.Namespace || c.References || c.Owners || c.Ranges || c.State || c.Delete || c.Conditional {
-		return errors.New("reference advertises a future or session capability")
 	}
 	return nil
 }

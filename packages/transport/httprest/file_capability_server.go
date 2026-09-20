@@ -108,7 +108,7 @@ func (h *Handler) performSessionCapability(ctx context.Context, session storage.
 		case storage.OpFileRangeCancel:
 			attempt, err = capability.Cancel(ctx, req.Owner, req.LockID)
 		}
-		if err == nil {
+		if attempt.Request != "" {
 			copy := attempt.Clone()
 			response.Attempt = &copy
 		}

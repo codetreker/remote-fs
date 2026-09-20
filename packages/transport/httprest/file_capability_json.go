@@ -3,6 +3,7 @@ package httprest
 import (
 	"github.com/codetreker/remote-fs/packages/storage"
 	"syscall"
+	"unicode/utf8"
 )
 
 func validateCapabilityArguments(req fileRequest) error {
@@ -20,6 +21,9 @@ func validateCapabilityArguments(req fileRequest) error {
 		}
 		if err := req.Scope.Check(); err != nil {
 			return err
+		}
+		if !utf8.ValidString(req.Scope.Token) {
+			return syscall.EINVAL
 		}
 		return req.OwnerOptions.Check()
 	case storage.OpFileRetireUseOwner:

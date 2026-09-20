@@ -39,7 +39,9 @@ type Node struct {
 	// string for the same reason a name does: a key is opaque to everything above the
 	// store that allocated it, so this side may not assume it is text, and a key that came
 	// back altered names bytes that are not there.
-	Content []byte `json:"content"`
+	Content           []byte `json:"content"`
+	LinkTarget        []byte `json:"link_target,omitempty"`
+	DirectoryRevision []byte `json:"directory_revision,omitempty"`
 }
 
 // UnmarshalJSON refuses node values a replica could persist as plausible metadata.
@@ -85,6 +87,9 @@ func (n Node) check() error {
 	}
 	if err := storage.CheckMetadata(metadataStorage(n.Metadata)); err != nil {
 		return fmt.Errorf("node %d carries invalid metadata: %w", n.ID, err)
+	}
+	if len(n.LinkTarget) > storage.MaxLinkTargetBytes || len(n.DirectoryRevision) > storage.MaxObservationTokenBytes {
+		return errors.New("node carries an oversized reserved payload")
 	}
 	return nil
 }

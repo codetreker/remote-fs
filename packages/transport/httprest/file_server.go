@@ -72,6 +72,11 @@ type fileBarrierError struct{ cause error }
 func (e *fileBarrierError) Error() string { return e.cause.Error() }
 func (e *fileBarrierError) Unwrap() error { return e.cause }
 
+type recordedFileError struct{ cause error }
+
+func (e *recordedFileError) Error() string { return e.cause.Error() }
+func (e *recordedFileError) Unwrap() error { return e.cause }
+
 func newFileRegistry(s storage.Storage, limits FileLimits) *fileRegistry {
 	backend, _ := s.(storage.FileStorage)
 	return &fileRegistry{limits: limits, backend: backend, sessions: make(map[string]*servedFileSession), wake: make(chan struct{}, 1), done: make(chan struct{})}
@@ -214,6 +219,13 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 			writeFault(http.StatusInternalServerError, err)
 			return
 		}
+		var recorded *recordedFileError
+		if errors.As(err, &recorded) {
+			value := true
+			response := ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error(), CapabilityCode: capabilityErrorCode(err), FileRecorded: &value}
+			h.writeFileResponse(w, StatusStorageError, response, control)
+			return
+		}
 		if response, ok := authorizationResponse(err); ok {
 			h.writeFileResponse(w, StatusStorageError, response, control)
 			return
@@ -330,6 +342,10 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 	digest := sha256.Sum256(append(body, []byte(r.Header.Get(HeaderMutationScope))...))
 	response, err := h.fileCall(r.Context(), req, digest)
 	if err != nil {
+		if response.Attempt != nil {
+			h.writeFileResponse(w, StatusStorageError, ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error(), CapabilityCode: capabilityErrorCode(err), Attempt: response.Attempt}, control)
+			return
+		}
 		writeError(err)
 		return
 	}
@@ -414,6 +430,9 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 					previous.response = response
 					previous.err = retainFileActionError(retryErr)
 					previous.barrierPending = retryErr != nil
+				}
+				if previous.err != nil && !previous.barrierPending {
+					return previous.response, &recordedFileError{cause: previous.err}
 				}
 				return previous.response, previous.err
 			case <-ctx.Done():

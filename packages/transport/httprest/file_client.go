@@ -39,7 +39,6 @@ type remoteFileSession struct {
 	id           string
 	mu           sync.Mutex
 	reconcileMu  sync.Mutex
-	actionMu     sync.Mutex
 	epoch        uint64
 	failed       error
 	closed       bool
@@ -50,11 +49,12 @@ type remoteFileSession struct {
 }
 
 type pendingFileAction struct {
-	request  fileRequest
-	scope    locking.MutationScope
-	hasScope bool
-	unknown  error
-	response *fileResponse
+	request   fileRequest
+	scope     locking.MutationScope
+	hasScope  bool
+	unknown   error
+	response  *fileResponse
+	resultErr error
 }
 
 type remoteFile struct {
@@ -169,17 +169,15 @@ func (s *Storage) NewFileSession(ctx context.Context, options storage.FileSessio
 }
 
 func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResponse, error) {
+	if int64(len(req.Path)) > s.storage.maxBodyBytes || int64(len(req.Data)) > s.storage.maxWriteBytes {
+		return fileResponse{}, syscall.EFBIG
+	}
 	frozen, err := freezeFileRequest(req)
 	if err != nil {
 		return fileResponse{}, unreachable(Request{Op: OpFile}, err)
 	}
 	req = frozen
 	scope, hasScope := s.outgoingMutationScope(ctx, req)
-	actionCall := fileActionRequired(req.Op) || req.Action != ""
-	if actionCall {
-		s.actionMu.Lock()
-		defer s.actionMu.Unlock()
-	}
 	if response, recovered, err := s.reconcilePending(ctx, req, scope, hasScope); recovered || err != nil {
 		return response, err
 	}
@@ -321,6 +319,15 @@ func (s *remoteFileSession) reconcilePending(ctx context.Context, incoming fileR
 			}
 			continue
 		}
+		if pending.resultErr != nil {
+			if matches {
+				s.mu.Lock()
+				delete(s.pending, key)
+				s.mu.Unlock()
+				return fileResponse{}, true, pending.resultErr
+			}
+			continue
+		}
 		recovery, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		if pending.hasScope {
 			recovery = locking.WithScope(recovery, pending.scope)
@@ -328,6 +335,21 @@ func (s *remoteFileSession) reconcilePending(ctx context.Context, incoming fileR
 		response, err := s.storage.fileCall(recovery, pending.request)
 		cancel()
 		if err != nil {
+			var operation *operationError
+			if errors.As(err, &operation) && operation.recorded {
+				s.mu.Lock()
+				if matches {
+					delete(s.pending, key)
+				} else {
+					pending.resultErr = err
+					s.pending[key] = pending
+				}
+				s.mu.Unlock()
+				if matches {
+					return fileResponse{}, true, err
+				}
+				continue
+			}
 			return fileResponse{}, false, pending.unknown
 		}
 		if response.Retry {

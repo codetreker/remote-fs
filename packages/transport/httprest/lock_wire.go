@@ -2,6 +2,7 @@ package httprest
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -358,8 +359,13 @@ func checkTypedJSON(decoder *json.Decoder, typ reflect.Type, maxElements int) er
 		}
 	case reflect.Slice:
 		if typ.Elem().Kind() == reflect.Uint8 {
-			if _, ok := token.(string); !ok {
+			encoded, ok := token.(string)
+			if !ok {
 				return errors.New("lock JSON byte strings require base64 text")
+			}
+			decoded, err := base64.StdEncoding.Strict().DecodeString(encoded)
+			if err != nil || base64.StdEncoding.EncodeToString(decoded) != encoded {
+				return errors.New("JSON byte strings require canonical base64")
 			}
 			return nil
 		}

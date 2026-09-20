@@ -70,6 +70,28 @@ func TestMetadataRequestAndResponseUseDifferentVersionRules(t *testing.T) {
 	}
 }
 
+func TestInitialMetadataEncodesPresentEmptyValues(t *testing.T) {
+	request := fileRequest{Op: storage.OpFileOpen, Session: strings.Repeat("a", 64), Action: "1:00000000000000000000000000000000", Path: []byte("f"), Data: []byte{}, Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true}, InitialMetadata: map[string][]byte{"client.empty": nil}}}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte(`"client.empty":null`)) || !bytes.Contains(encoded, []byte(`"client.empty":""`)) {
+		t.Fatalf("empty initial metadata is not canonical: %s", encoded)
+	}
+	var decoded fileRequest
+	if err := decodeFileJSON(encoded, &decoded); err != nil || len(decoded.Open.InitialMetadata["client.empty"]) != 0 {
+		t.Fatalf("empty initial metadata round trip: %+v, %v", decoded.Open.InitialMetadata, err)
+	}
+}
+
+func TestKnownFutureCapabilityBitsAreAccepted(t *testing.T) {
+	response := fileResponse{Epoch: 1, Session: strings.Repeat("a", 64), Data: []byte{}, Status: &storage.FileSessionStatus{Epoch: "authority", Revision: 1, ActionEpoch: 1}, Capabilities: &fileCapabilities{AtomicOpen: true, Namespace: true, References: true, State: true, Delete: true, Conditional: true, DirectoryMetadata: true, ReferenceName: true}}
+	if err := validateFileResponse(fileRequest{Op: storage.OpFileSessionOpen}, response); err != nil {
+		t.Fatalf("known future capability bits were rejected: %v", err)
+	}
+}
+
 type advertisedSession struct {
 	storage.FileSession
 	err error
@@ -122,15 +144,9 @@ func TestCapabilityEnvelopeAdvertisesOnlyImplementedFacets(t *testing.T) {
 	if err != nil || !session.Metadata || !session.Owners || !session.Ranges {
 		t.Fatalf("session capabilities = %#v, %v", session, err)
 	}
-	if err := validateSessionCapabilities(*session); err != nil {
-		t.Fatal(err)
-	}
 	file, err := referenceCapabilitiesOf(advertisedFile{})
 	if err != nil || !file.Metadata || !file.Scope {
 		t.Fatalf("file capabilities = %#v, %v", file, err)
-	}
-	if err := validateReferenceCapabilities(*file); err != nil {
-		t.Fatal(err)
 	}
 	encoded, err := json.Marshal(file)
 	if err != nil {

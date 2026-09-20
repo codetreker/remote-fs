@@ -2,6 +2,7 @@ package httprest
 
 import (
 	"context"
+	"encoding/json"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -44,7 +45,37 @@ type fileRequest struct {
 	Payload      metadataPayload            `json:"payload"`
 }
 
+func (r fileRequest) MarshalJSON() ([]byte, error) {
+	type request fileRequest
+	encoded, err := json.Marshal(request(r))
+	if err != nil || len(r.Open.InitialMetadata) == 0 {
+		return encoded, err
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &envelope); err != nil {
+		return nil, err
+	}
+	var open map[string]json.RawMessage
+	if err := json.Unmarshal(envelope["open"], &open); err != nil {
+		return nil, err
+	}
+	metadata := make(map[string]metadataPayload, len(r.Open.InitialMetadata))
+	for namespace, value := range r.Open.InitialMetadata {
+		metadata[namespace] = metadataPayload(value)
+	}
+	open["InitialMetadata"], err = json.Marshal(metadata)
+	if err != nil {
+		return nil, err
+	}
+	envelope["open"], err = json.Marshal(open)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(envelope)
+}
+
 type fileResponse struct {
+	Node         uint64                     `json:"node,omitempty"`
 	Session      string                     `json:"session,omitempty"`
 	File         string                     `json:"file,omitempty"`
 	Retry        bool                       `json:"retry,omitempty"`

@@ -2,6 +2,7 @@ package httprest
 
 import (
 	"context"
+	"errors"
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -102,6 +103,14 @@ func (s *remoteFileSession) rangeCall(ctx context.Context, req fileRequest) (sto
 	}
 	response, err := s.call(ctx, req)
 	if err != nil {
+		var operation *operationError
+		if errors.As(err, &operation) && operation.attempt != nil {
+			attempt := operation.attempt.Clone()
+			if validationErr := validateFileAttempt(req, attempt); validationErr != nil {
+				return storage.RangeAttempt{}, unreachable(Request{Op: OpFile}, validationErr)
+			}
+			return attempt, err
+		}
 		return storage.RangeAttempt{}, err
 	}
 	return response.Attempt.Clone(), nil
