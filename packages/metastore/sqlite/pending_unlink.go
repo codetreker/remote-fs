@@ -436,7 +436,7 @@ func (s *Store) AcknowledgeDeleteIntent(ctx context.Context, command storage.Ack
 		if err != nil {
 			return err
 		}
-		if outcome == storage.DeleteIntentArmed || outcome == storage.DeleteIntentPending {
+		if outcome != storage.DeleteIntentCompleted && outcome != storage.DeleteIntentNotExecuted {
 			return syscall.EBUSY
 		}
 		result, err := tx.ExecContext(ctx, `DELETE FROM delete_intents WHERE volume=? AND intent=?`, s.volume, string(command.Intent))

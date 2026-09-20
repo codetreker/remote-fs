@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"path/filepath"
 	"syscall"
@@ -19,6 +20,14 @@ func fileAction(t *testing.T) storage.FileActionID {
 		t.Fatal(err)
 	}
 	return id
+}
+
+func accountingContext(t *testing.T, calls *[][2]int64) context.Context {
+	t.Helper()
+	return storage.WithPublicationAccounting(t.Context(), func(previous, next int64) (storage.PublicationSettlement, error) {
+		*calls = append(*calls, [2]int64{previous, next})
+		return func(storage.PublicationResult) error { return nil }, nil
+	})
 }
 
 func TestConditionalPublicationAppliesMetadataWithTheContentRevision(t *testing.T) {
@@ -133,6 +142,146 @@ func TestIdentityAddressedNamespaceAndAtomicOpenPreserveTheSelectedNode(t *testi
 	if err != nil || retained.ID != original.ID {
 		t.Fatalf("retained identity = %+v, %v", retained, err)
 	}
+}
+
+func TestAtomicIdentityOpensCheckAuthoritativeMetadataPredicates(t *testing.T) {
+	store, err := OpenLocking(t.Context(), lockingTestConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Create(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	node, err := store.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := store.SetMetadata(t.Context(), uint64(node.ID), "test.version", nil, []byte("value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := store.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("file")}
+
+	tests := []struct {
+		name string
+		open func(storage.ChildCondition) (func() error, error)
+	}{
+		{"OpenAt", func(condition storage.ChildCondition) (func() error, error) {
+			result, err := store.OpenAt(t.Context(), name, storage.OpenAtOptions{
+				Read: true, Target: condition, Action: fileAction(t), Existing: storage.Keep,
+				Use: storage.UseClaim{Uses: storage.ReadData},
+			})
+			if result.File == nil {
+				return nil, err
+			}
+			return func() error { return result.File.Close(t.Context()) }, err
+		}},
+		{"OpenChildRef", func(condition storage.ChildCondition) (func() error, error) {
+			result, err := store.OpenChildRef(t.Context(), name, storage.NodeRefOptions{
+				Kind: storage.NodeRegular, Target: condition, Action: fileAction(t),
+				Use: storage.UseClaim{Uses: storage.ReadData}, MetadataAccess: storage.ReadMetadata,
+			})
+			if result.Reference == nil {
+				return nil, err
+			}
+			return func() error { return result.Reference.Close(t.Context()) }, err
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, condition := range []storage.ChildCondition{
+				{State: storage.SameNode, NodeID: uint64(node.ID), ExpectedMetadata: map[string][]byte{"test.version": version.Version}},
+				{State: storage.SameNode, NodeID: uint64(node.ID), ExpectedMetadata: map[string][]byte{"test.absent": nil}},
+			} {
+				close, err := test.open(condition)
+				if err != nil {
+					t.Fatalf("matching condition %+v = %v", condition.ExpectedMetadata, err)
+				}
+				if err := close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			close, err := test.open(storage.ChildCondition{State: storage.SameNode, NodeID: uint64(node.ID),
+				ExpectedMetadata: map[string][]byte{"test.version": []byte("stale")}})
+			if close != nil || !errors.Is(err, storage.ErrConditionConflict) {
+				t.Fatalf("stale condition opened reference=%v err=%v", close != nil, err)
+			}
+		})
+	}
+}
+
+func TestUncertainIdentityMutationsPreserveTheirCapturedResults(t *testing.T) {
+	t.Run("open", func(t *testing.T) {
+		store, err := OpenLocking(t.Context(), lockingTestConfig(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		root, err := store.Stat(t.Context(), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		acceptErr := errors.New("open acceptance unavailable")
+		store.witness = &retainedFailureWitness{failure: acceptErr}
+		result, err := store.OpenAt(t.Context(), storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("file")}, storage.OpenAtOptions{
+			Read: true, Create: true, Exclusive: true, Existing: storage.Keep, Action: fileAction(t),
+			Target: storage.ChildCondition{State: storage.Absent}, Use: storage.UseClaim{Uses: storage.ReadData},
+		})
+		if !errors.Is(err, acceptErr) || result.File == nil || result.State.ID == 0 || result.Outcome != storage.Created {
+			t.Fatalf("uncertain atomic open = %+v, %v", result, err)
+		}
+		if err := result.File.Close(t.Context()); !errors.Is(err, acceptErr) {
+			t.Fatalf("uncertain reference close = %v", err)
+		}
+		if err := store.locks.Close(); err != nil && !errors.Is(err, acceptErr) {
+			t.Fatal(err)
+		}
+		store.locks, store.witness, store.files = nil, nil, nil
+		if err := store.Abort(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("name mutation", func(t *testing.T) {
+		store, err := OpenLocking(t.Context(), lockingTestConfig(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Create(t.Context(), "source"); err != nil {
+			t.Fatal(err)
+		}
+		root, err := store.Stat(t.Context(), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		source, err := store.Stat(t.Context(), "source")
+		if err != nil {
+			t.Fatal(err)
+		}
+		acceptErr := errors.New("rename acceptance unavailable")
+		store.witness = &retainedFailureWitness{failure: acceptErr}
+		result, err := store.MutateName(t.Context(), storage.NameCommand{
+			Kind: storage.NameRename, Action: fileAction(t),
+			Name:   storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("source")},
+			Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(source.ID)},
+			Destination: &storage.RenameTarget{Parent: directoryTarget(root), ObservedLeaf: []byte("destination"),
+				Expected: storage.ChildCondition{State: storage.Absent}, OutputLeaf: []byte("destination")},
+		})
+		if !errors.Is(err, acceptErr) || result.Attr == nil || result.Attr.ID != uint64(source.ID) {
+			t.Fatalf("uncertain name mutation = %+v, %v", result, err)
+		}
+		if err := store.locks.Close(); err != nil && !errors.Is(err, acceptErr) {
+			t.Fatal(err)
+		}
+		store.locks, store.witness, store.files = nil, nil, nil
+		if err := store.Abort(); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func directoryTarget(node metastore.Node) storage.DirectoryTarget {
@@ -328,6 +477,11 @@ func TestDeleteCleanupFailureIsReportedAndRetryable(t *testing.T) {
 	if err != nil || status.Outcome != storage.DeleteIntentCleanupFailed || status.Failure == 0 {
 		t.Fatalf("cleanup-failed status = %+v, %v", status, err)
 	}
+	if err := store.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{
+		Action: fileAction(t), Intent: intentID,
+	}); !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("cleanup-failed acknowledgement = %v", err)
+	}
 	if err := opened.File.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -406,5 +560,122 @@ func TestNotExecutedCloseIntentStillReleasesTheReference(t *testing.T) {
 	}
 	if _, err := store.Stat(t.Context(), "dir/child"); err != nil {
 		t.Fatalf("failed deletion changed directory: %v", err)
+	}
+}
+
+func TestIdentityRemovalPublishesOnlyRegularContentBytes(t *testing.T) {
+	store, file := openPublicationFile(t)
+	before, err := file.Node(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := file.Reserve(t.Context(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Commit(t.Context(), before.Revision, metastore.Object{Key: key, Size: 7, ModTime: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	root, err := store.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replacement [][2]int64
+	replaced, err := store.OpenAt(accountingContext(t, &replacement), storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("file")}, storage.OpenAtOptions{
+		Read: true, Create: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(current.ID)},
+		Action: fileAction(t), Existing: storage.ReplaceNode,
+		Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replaced.File.Close(t.Context())
+	if len(replacement) != 1 || replacement[0] != [2]int64{7, 0} {
+		t.Fatalf("regular replacement accounting = %+v", replacement)
+	}
+
+	linkName := storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("link")}
+	link, err := store.OpenChildRef(t.Context(), linkName, storage.NodeRefOptions{
+		Kind: storage.NodeSymlink, Target: storage.ChildCondition{State: storage.Absent}, Action: fileAction(t),
+		Create: true, InitialState: storage.InitialState{OnCreate: storage.InitialFields{LinkTarget: []byte("target")}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var renamed [][2]int64
+	if _, err := store.MutateName(accountingContext(t, &renamed), storage.NameCommand{
+		Kind: storage.NameRename, Action: fileAction(t), Name: linkName,
+		Target: storage.ChildCondition{State: storage.SameNode, NodeID: link.State.Attr().ID},
+		Destination: &storage.RenameTarget{Parent: directoryTarget(root), ObservedLeaf: []byte("renamed-link"),
+			Expected: storage.ChildCondition{State: storage.Absent}, OutputLeaf: []byte("renamed-link")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(renamed) != 1 || renamed[0] != [2]int64{0, 0} {
+		t.Fatalf("symlink rename accounting = %+v", renamed)
+	}
+	var removed [][2]int64
+	if _, err := store.MutateName(accountingContext(t, &removed), storage.NameCommand{
+		Kind: storage.NameRemove, Action: fileAction(t),
+		Name:   storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("renamed-link")},
+		Target: storage.ChildCondition{State: storage.SameNode, NodeID: link.State.Attr().ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 1 || removed[0] != [2]int64{0, 0} {
+		t.Fatalf("symlink removal accounting = %+v", removed)
+	}
+	var cleanup [][2]int64
+	if err := link.Reference.Close(accountingContext(t, &cleanup)); err != nil {
+		t.Fatal(err)
+	}
+	if len(cleanup) != 1 || cleanup[0] != [2]int64{0, 0} {
+		t.Fatalf("detached symlink cleanup accounting = %+v", cleanup)
+	}
+}
+
+func TestPendingDeletePublishesTheRemovedRegularBytes(t *testing.T) {
+	store, err := OpenLocking(t.Context(), lockingTestConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	root, err := store.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := store.OpenAt(t.Context(), storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("victim")}, storage.OpenAtOptions{
+		Read: true, Write: true, Create: true, Exclusive: true, Existing: storage.Keep, Action: fileAction(t),
+		Target:      storage.ChildCondition{State: storage.Absent},
+		Use:         storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName},
+		CloseIntent: &storage.CloseIntent{ID: storage.DeleteIntentID("33333333333333333333333333333333"), Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := opened.File.Node(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := opened.File.Reserve(t.Context(), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.File.Commit(t.Context(), before.Revision, metastore.Object{Key: key, Size: 5, ModTime: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	var calls [][2]int64
+	if err := opened.File.Close(accountingContext(t, &calls)); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 || calls[0] != [2]int64{0, 0} || calls[1] != [2]int64{5, 0} {
+		t.Fatalf("pending-delete accounting = %+v", calls)
 	}
 }

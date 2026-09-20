@@ -67,9 +67,18 @@ func (s *Store) openAtomicChild(ctx context.Context, name storage.ChildName, kin
 			return err
 		}
 		found = exists
-		before = metastore.Node{ID: id}
 		if found && exclusive {
 			return syscall.EEXIST
+		}
+		if found {
+			if existing == storage.Keep {
+				before, err = s.returnedNode(ctx, tx, id)
+			} else {
+				before, err = s.nodeByID(ctx, tx, id)
+			}
+			if err != nil {
+				return err
+			}
 		}
 		if err := checkChildCondition(target, before, found); err != nil {
 			return err
@@ -87,14 +96,6 @@ func (s *Store) openAtomicChild(ctx context.Context, name storage.ChildName, kin
 			}
 			return nil
 		}
-		if existing == storage.Keep {
-			before, err = s.returnedNode(ctx, tx, id)
-		} else {
-			before, err = s.nodeByID(ctx, tx, id)
-		}
-		if err != nil {
-			return err
-		}
 		if before.Kind != kind {
 			return nodeKindMismatch(before.Kind, kind)
 		}
@@ -105,7 +106,7 @@ func (s *Store) openAtomicChild(ctx context.Context, name storage.ChildName, kin
 		if pending {
 			return storage.ErrPendingDelete
 		}
-		return checkExpectedMetadata(before.Metadata, target.ExpectedMetadata)
+		return nil
 	}
 	if err := s.inspect(ctx, inspect); err != nil {
 		return nil, metastore.FileState{}, 0, sqlerr.Failure(err)
@@ -174,7 +175,7 @@ func (s *Store) finishReferenceOpen(ctx context.Context, file *retainedFile, cla
 			file.active, file.closeErr = false, sqlerr.Failure(err)
 			file.closeIntent = closeIntent
 			s.retainFileLocked(file)
-			return file, metastore.FileState{}, 0, file.closeErr
+			return file, state, outcome, file.closeErr
 		}
 		if claimed {
 			err = errors.Join(err, s.fileDomain.coordinator.DropUse(context.WithoutCancel(ctx), uint64(file.id), file.scope))

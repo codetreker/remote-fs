@@ -195,10 +195,11 @@ func (s *Store) prepareVolumePublication(ctx context.Context, tx *sql.Tx, intent
 				publication.targets = append(publication.targets, s.backendKey(state.ID))
 			}
 		}
-		if intent.kind == locking.RemoveMutation && len(publication.access) != 0 {
+		if intent.kind == locking.RemoveMutation && len(publication.access) != 0 && publication.access[0].Kind == storage.NodeRegular {
 			publication.previous = publication.access[0].Size
 		}
-		if intent.kind == locking.RenameMutation && len(publication.access) > 1 && publication.access[1].ID != publication.access[0].ID {
+		if intent.kind == locking.RenameMutation && len(publication.access) > 1 &&
+			publication.access[1].ID != publication.access[0].ID && publication.access[1].Kind == storage.NodeRegular {
 			publication.previous = publication.access[1].Size
 		}
 		return publication, nil
@@ -213,7 +214,8 @@ func (s *Store) prepareVolumePublication(ctx context.Context, tx *sql.Tx, intent
 			publication.nodes = []int64{state.ID}
 			publication.targets = []locking.BackendKey{s.backendKey(state.ID)}
 		}
-		if intent.kind == locking.WriteMutation || intent.cleanup {
+		if state.Kind == storage.NodeRegular &&
+			(intent.kind == locking.WriteMutation || intent.kind == locking.RemoveMutation || intent.cleanup) {
 			publication.previous = state.Size
 		}
 		return publication, nil

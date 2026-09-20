@@ -278,10 +278,7 @@ func (s *Store) MutateName(ctx context.Context, command storage.NameCommand) (st
 		result, err = s.applyNamespaceMutation(ctx, tx, command, mutation, time.Now())
 		return err
 	})
-	if err != nil {
-		return storage.NameResult{}, sqlerr.Failure(err)
-	}
-	return result, nil
+	return result, sqlerr.Failure(err)
 }
 
 func (s *Store) applyNamespaceMutation(ctx context.Context, tx *sql.Tx, command storage.NameCommand, mutation namespaceMutation, at time.Time) (storage.NameResult, error) {
