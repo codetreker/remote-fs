@@ -11,6 +11,7 @@ import (
 var (
 	_ storage.AtomicFileOpener        = (*fileSession)(nil)
 	_ storage.NamespaceAccess         = (*fileSession)(nil)
+	_ storage.DirectoryReader         = (*fileSession)(nil)
 	_ storage.NodeReferences          = (*fileSession)(nil)
 	_ storage.MetadataAccess          = (*fileSession)(nil)
 	_ storage.ScopedReference         = (*openFile)(nil)
@@ -48,6 +49,17 @@ func (fs *fileSession) CheckNamespaceAccess() error {
 		return syscall.EOPNOTSUPP
 	}
 	return native.CheckNamespaceAccess()
+}
+
+func (fs *fileSession) CheckDirectoryRead() error {
+	if err := fs.native.CheckFileStore(); err != nil {
+		return err
+	}
+	native, ok := fs.native.(metastore.DirectoryReader)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	return native.CheckDirectoryRead()
 }
 
 func (fs *fileSession) CheckMetadataAccess() error {
@@ -167,7 +179,7 @@ func (fs *fileSession) openNodeReference(ctx context.Context, open func(context.
 }
 
 func (fs *fileSession) LookupAt(ctx context.Context, name storage.ChildName) (storage.Attr, error) {
-	if err := fs.CheckNamespaceAccess(); err != nil {
+	if err := fs.CheckDirectoryRead(); err != nil {
 		return storage.Attr{}, err
 	}
 	ctx, cancel := fs.operationContext(ctx)
@@ -181,7 +193,7 @@ func (fs *fileSession) LookupAt(ctx context.Context, name storage.ChildName) (st
 }
 
 func (fs *fileSession) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
-	if err := fs.CheckNamespaceAccess(); err != nil {
+	if err := fs.CheckDirectoryRead(); err != nil {
 		return storage.ObservedDirectory{}, err
 	}
 	ctx, cancel := fs.operationContext(ctx)
@@ -191,7 +203,7 @@ func (fs *fileSession) ReadDirNode(ctx context.Context, target storage.Directory
 		return storage.ObservedDirectory{}, err
 	}
 	defer done()
-	observed, err := fs.native.(metastore.NamespaceAccess).ReadDirNode(ctx, target)
+	observed, err := fs.native.(metastore.DirectoryReader).ReadDirNode(ctx, target)
 	if err != nil {
 		return storage.ObservedDirectory{}, err
 	}
@@ -214,7 +226,7 @@ func (fs *fileSession) ReadDirNodeBounded(ctx context.Context, target storage.Di
 			observation = storage.DirectoryObservation{}
 		}
 	}()
-	if err := fs.CheckNamespaceAccess(); err != nil {
+	if err := fs.CheckDirectoryRead(); err != nil {
 		return observation, err
 	}
 	ctx, cancel := fs.operationContext(ctx)
@@ -224,7 +236,7 @@ func (fs *fileSession) ReadDirNodeBounded(ctx context.Context, target storage.Di
 		return observation, err
 	}
 	defer done()
-	observation, err = fs.native.(metastore.NamespaceAccess).ReadDirNodeBounded(ctx, target, result)
+	observation, err = fs.native.(metastore.DirectoryReader).ReadDirNodeBounded(ctx, target, result)
 	if err != nil {
 		return observation, err
 	}

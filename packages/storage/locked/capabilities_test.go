@@ -24,6 +24,29 @@ type capabilitySessionProbe struct {
 	deleted  storage.DeleteIntentStatus
 }
 
+type directoryReaderOnlyProbe struct{ storage.FileSession }
+
+func (directoryReaderOnlyProbe) CheckDirectoryRead() error { return nil }
+func (directoryReaderOnlyProbe) ReadDirNode(_ context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	return storage.ObservedDirectory{Observation: storage.DirectoryObservation{ParentID: target.NodeID, Revision: []byte{1}}}, nil
+}
+func (directoryReaderOnlyProbe) ReadDirNodeBounded(_ context.Context, target storage.DirectoryTarget, _ *storage.ListResult) (storage.DirectoryObservation, error) {
+	return storage.DirectoryObservation{ParentID: target.NodeID, Revision: []byte{1}}, nil
+}
+
+func TestDirectoryReadCapabilityIsIndependentOfNamespaceMutation(t *testing.T) {
+	wrapper := &fileSession{FileSession: directoryReaderOnlyProbe{}, storage: &Storage{}}
+	if err := wrapper.CheckDirectoryRead(); err != nil {
+		t.Fatal(err)
+	}
+	if err := wrapper.CheckNamespaceAccess(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("directory-only backend exposed namespace mutation: %v", err)
+	}
+	if observed, err := wrapper.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: 7}); err != nil || observed.Observation.ParentID != 7 {
+		t.Fatalf("directory-only read = %+v, %v", observed, err)
+	}
+}
+
 func (p *capabilitySessionProbe) capture(ctx context.Context) {
 	p.observed = locking.ScopeFromContext(ctx)
 }
@@ -93,6 +116,7 @@ func (p *capabilitySessionProbe) OpenAt(ctx context.Context, _ storage.ChildName
 	return p.open, p.failure
 }
 func (p *capabilitySessionProbe) CheckNamespaceAccess() error { return p.checkErr }
+func (p *capabilitySessionProbe) CheckDirectoryRead() error   { return p.checkErr }
 func (p *capabilitySessionProbe) LookupAt(ctx context.Context, _ storage.ChildName) (storage.Attr, error) {
 	p.capture(ctx)
 	return storage.Attr{ID: 3, Kind: storage.NodeRegular}, p.failure
@@ -302,6 +326,7 @@ func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
 	for name, check := range map[string]func() error{
 		"atomic open": session.CheckAtomicFileOpen,
 		"namespace":   session.CheckNamespaceAccess,
+		"directory":   session.CheckDirectoryRead,
 		"node refs":   session.CheckNodeReferences,
 		"actions":     session.CheckFileActions,
 	} {

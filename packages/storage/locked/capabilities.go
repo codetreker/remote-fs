@@ -36,6 +36,11 @@ func (s *fileSession) CheckNamespaceAccess() error {
 	return err
 }
 
+func (s *fileSession) CheckDirectoryRead() error {
+	_, err := capability(s.FileSession, storage.DirectoryReader.CheckDirectoryRead)
+	return err
+}
+
 func (s *fileSession) LookupAt(ctx context.Context, name storage.ChildName) (storage.Attr, error) {
 	backend, err := capability(s.FileSession, storage.NamespaceAccess.CheckNamespaceAccess)
 	if err != nil {
@@ -45,7 +50,7 @@ func (s *fileSession) LookupAt(ctx context.Context, name storage.ChildName) (sto
 }
 
 func (s *fileSession) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
-	backend, err := capability(s.FileSession, storage.NamespaceAccess.CheckNamespaceAccess)
+	backend, err := capability(s.FileSession, storage.DirectoryReader.CheckDirectoryRead)
 	if err != nil {
 		return storage.ObservedDirectory{}, err
 	}
@@ -72,7 +77,7 @@ func (s *fileSession) ReadDirNodeBounded(ctx context.Context, target storage.Dir
 			result.Fail(returned)
 		}
 	}()
-	backend, err := capability(s.FileSession, storage.NamespaceAccess.CheckNamespaceAccess)
+	backend, err := capability(s.FileSession, storage.DirectoryReader.CheckDirectoryRead)
 	if err != nil {
 		return observation, err
 	}
@@ -331,6 +336,7 @@ func (s *Storage) BindMaintenanceAccounting(ctx context.Context, chain storage.P
 var (
 	_ storage.AtomicFileOpener        = (*fileSession)(nil)
 	_ storage.NamespaceAccess         = (*fileSession)(nil)
+	_ storage.DirectoryReader         = (*fileSession)(nil)
 	_ storage.NodeReferences          = (*fileSession)(nil)
 	_ storage.FileActions             = (*fileSession)(nil)
 	_ storage.MetadataAccess          = (*fileSession)(nil)

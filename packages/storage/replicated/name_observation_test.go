@@ -56,10 +56,9 @@ type nameObserverContextKey struct{}
 
 type substitutedDirectoryAuthority struct {
 	*fileSessionStub
-	httprest.NamespaceAccessWithBarrier
 }
 
-func (*substitutedDirectoryAuthority) CheckNamespaceAccess() error { return nil }
+func (*substitutedDirectoryAuthority) CheckDirectoryRead() error { return nil }
 func (*substitutedDirectoryAuthority) ReadDirNode(_ context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
 	return storage.ObservedDirectory{Observation: storage.DirectoryObservation{ParentID: target.NodeID + 1, Revision: []byte{1}}}, nil
 }
@@ -73,6 +72,12 @@ func (*substitutedDirectoryAuthority) ReadDirNodeBounded(_ context.Context, targ
 func TestReplicatedNamespaceRejectsSubstitutedAuthorityDirectory(t *testing.T) {
 	remote := &substitutedDirectoryAuthority{fileSessionStub: &fileSessionStub{}}
 	session := retainedTestSession(t, remote)
+	if err := session.CheckDirectoryRead(); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.CheckNamespaceAccess(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("directory-only authority exposed namespace mutation: %v", err)
+	}
 	target := storage.DirectoryTarget{NodeID: 9}
 	if observed, err := session.ReadDirNode(t.Context(), target); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observed, storage.ObservedDirectory{}) {
 		t.Fatalf("substituted directory = %+v, %v", observed, err)

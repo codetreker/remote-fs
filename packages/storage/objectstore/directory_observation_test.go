@@ -55,6 +55,7 @@ func TestObjectDirectoryMetadataObservationKeepsApplicationPermissionsSeparate(t
 	options.MaxFiles = 1
 	session := fileSessionFor(t, volume, options)
 	namespace := objectCapability[storage.NamespaceAccess](t, session)
+	reader := objectCapability[storage.DirectoryReader](t, session)
 	observer := objectCapability[storage.DirectoryMetadataObserver](t, session)
 	if err := observer.CheckDirectoryMetadataObservation(); err != nil {
 		t.Fatal(err)
@@ -101,10 +102,10 @@ func TestObjectDirectoryMetadataObservationKeepsApplicationPermissionsSeparate(t
 	if current, err := result.Entries(); err != nil || len(current) != 1 || !reflect.DeepEqual(current[0].Attr, child) || !bytes.Equal([]byte(current[0].Name), childLeaf) {
 		t.Fatalf("returned metadata bytes changed authority state = %+v, %v", current, err)
 	}
-	if _, err := namespace.ReadDirNode(t.Context(), target); !errors.Is(err, syscall.EBADF) {
+	if _, err := reader.ReadDirNode(t.Context(), target); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("metadata observation granted scoped enumeration: %v", err)
 	}
-	if _, err := namespace.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: directory.ID}); !errors.Is(err, storage.ErrUseConflict) {
+	if _, err := reader.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: directory.ID}); !errors.Is(err, storage.ErrUseConflict) {
 		t.Fatalf("metadata observation bypassed application enumeration denial: %v", err)
 	}
 	if _, err := opened.Reference.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
@@ -192,6 +193,7 @@ func TestObjectDirectoryMetadataObservationPreservesGuardsScopesAndCancellation(
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	foreign := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	namespace := objectCapability[storage.NamespaceAccess](t, session)
+	reader := objectCapability[storage.DirectoryReader](t, session)
 	observer := objectCapability[storage.DirectoryMetadataObserver](t, session)
 	root, err := volume.Stat(t.Context(), "")
 	if err != nil {
@@ -200,11 +202,11 @@ func TestObjectDirectoryMetadataObservationPreservesGuardsScopesAndCancellation(
 	parent := objectObservationNode(t, namespace, storage.NameMkdir, objectChild(root.ID, "parent"), nil)
 	directory := objectObservationNode(t, namespace, storage.NameMkdir, objectChild(parent.ID, "directory"), nil)
 	child := objectObservationNode(t, namespace, storage.NameCreate, objectChild(directory.ID, "child"), nil)
-	rootView, err := namespace.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: root.ID})
+	rootView, err := reader.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: root.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	parentView, err := namespace.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: parent.ID})
+	parentView, err := reader.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: parent.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,6 +288,58 @@ type objectNamespaceSubstitutionProbe struct {
 	*sqlite.LockingStore
 }
 
+type objectDirectoryReaderOnly struct {
+	metastore.Store
+	metastore.FileStore
+	metastore.BoundedLister
+	metastore.DirectoryReader
+}
+
+type objectDirectoryReaderProbe struct{}
+
+func (objectDirectoryReaderProbe) CheckDirectoryRead() error { return nil }
+func (objectDirectoryReaderProbe) ReadDirNode(_ context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	return storage.ObservedDirectory{Observation: storage.DirectoryObservation{ParentID: target.NodeID, Revision: []byte{1}}}, nil
+}
+func (objectDirectoryReaderProbe) ReadDirNodeBounded(_ context.Context, target storage.DirectoryTarget, _ *storage.ListResult) (storage.DirectoryObservation, error) {
+	return storage.DirectoryObservation{ParentID: target.NodeID, Revision: []byte{1}}, nil
+}
+
+func TestObjectDirectoryReadCapabilityIsIndependentOfNamespaceMutation(t *testing.T) {
+	native, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
+		Database: filepath.Join(t.TempDir(), "directory-only.db"), Volume: "directory-only", SQLite: sqlite.DefaultOptions(),
+		Locks: locking.DefaultOptions(), Initialize: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := objectDirectoryReaderOnly{Store: native, FileStore: native, BoundedLister: native, DirectoryReader: objectDirectoryReaderProbe{}}
+	volume := objectstore.New(memory.New(), backend)
+	t.Cleanup(func() {
+		if err := volume.Close(); err != nil {
+			t.Errorf("close directory-only volume: %v", err)
+		}
+		if err := native.Close(); err != nil {
+			t.Errorf("close directory-only metastore: %v", err)
+		}
+	})
+	root, err := volume.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
+	reader := objectCapability[storage.DirectoryReader](t, session)
+	if err := reader.CheckDirectoryRead(); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.(storage.NamespaceAccess).CheckNamespaceAccess(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("directory-only backend exposed namespace mutation: %v", err)
+	}
+	if observed, err := reader.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: root.ID}); err != nil || observed.Observation.ParentID != root.ID || len(observed.Entries) != 0 {
+		t.Fatalf("directory-only read = %+v, %v", observed, err)
+	}
+}
+
 func (p *objectNamespaceSubstitutionProbe) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
 	observed, err := p.LockingStore.ReadDirNode(ctx, target)
 	if err == nil {
@@ -321,13 +375,13 @@ func TestObjectNamespaceRejectsSubstitutedDirectoryIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
-	namespace := objectCapability[storage.NamespaceAccess](t, session)
+	reader := objectCapability[storage.DirectoryReader](t, session)
 	target := storage.DirectoryTarget{NodeID: root.ID}
-	if observed, err := namespace.ReadDirNode(t.Context(), target); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observed, storage.ObservedDirectory{}) {
+	if observed, err := reader.ReadDirNode(t.Context(), target); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observed, storage.ObservedDirectory{}) {
 		t.Fatalf("substituted directory = %+v, %v", observed, err)
 	}
 	result := objectMetadataList(t)
-	if observed, err := namespace.ReadDirNodeBounded(t.Context(), target, result); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observed, storage.DirectoryObservation{}) {
+	if observed, err := reader.ReadDirNodeBounded(t.Context(), target, result); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observed, storage.DirectoryObservation{}) {
 		t.Fatalf("substituted bounded directory = %+v, %v", observed, err)
 	}
 	if entries, err := result.Entries(); entries != nil || !errors.Is(err, syscall.EIO) {

@@ -23,11 +23,35 @@ type capabilityProbe struct {
 	deleteStatus storage.DeleteIntentStatus
 }
 
+type directoryReaderOnlyProbe struct{ storage.FileSession }
+
+func (directoryReaderOnlyProbe) CheckDirectoryRead() error { return nil }
+func (directoryReaderOnlyProbe) ReadDirNode(_ context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	return storage.ObservedDirectory{Observation: storage.DirectoryObservation{ParentID: target.NodeID, Revision: []byte{1}}}, nil
+}
+func (directoryReaderOnlyProbe) ReadDirNodeBounded(_ context.Context, target storage.DirectoryTarget, _ *storage.ListResult) (storage.DirectoryObservation, error) {
+	return storage.DirectoryObservation{ParentID: target.NodeID, Revision: []byte{1}}, nil
+}
+
+func TestDirectoryReadCapabilityIsIndependentOfNamespaceMutation(t *testing.T) {
+	wrapper := &fileSession{FileSession: directoryReaderOnlyProbe{}, storage: &Storage{limit: MinLimit}}
+	if err := wrapper.CheckDirectoryRead(); err != nil {
+		t.Fatal(err)
+	}
+	if err := wrapper.CheckNamespaceAccess(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("directory-only backend exposed namespace mutation: %v", err)
+	}
+	if observed, err := wrapper.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: 7}); err != nil || observed.Observation.ParentID != 7 {
+		t.Fatalf("directory-only read = %+v, %v", observed, err)
+	}
+}
+
 func (p *capabilityProbe) CheckAtomicFileOpen() error { return p.checkErr }
 func (p *capabilityProbe) OpenAt(context.Context, storage.ChildName, storage.OpenAtOptions) (storage.OpenResult, error) {
 	return p.open, p.callErr
 }
 func (p *capabilityProbe) CheckNamespaceAccess() error { return p.checkErr }
+func (p *capabilityProbe) CheckDirectoryRead() error   { return p.checkErr }
 func (p *capabilityProbe) LookupAt(context.Context, storage.ChildName) (storage.Attr, error) {
 	return storage.Attr{ID: 3, Kind: storage.NodeRegular}, p.callErr
 }
@@ -276,6 +300,7 @@ func TestIdentityCapabilityWrappersPreservePartialResultsAndReferences(t *testin
 	for name, check := range map[string]func() error{
 		"atomic open": wrapper.CheckAtomicFileOpen,
 		"namespace":   wrapper.CheckNamespaceAccess,
+		"directory":   wrapper.CheckDirectoryRead,
 		"node refs":   wrapper.CheckNodeReferences,
 		"actions":     wrapper.CheckFileActions,
 	} {

@@ -62,6 +62,10 @@ func (s *fileSession) CheckNamespaceAccess() error {
 	return capabilityCheck(s.remote, func(c httprest.NamespaceAccessWithBarrier) error { return c.CheckNamespaceAccess() })
 }
 
+func (s *fileSession) CheckDirectoryRead() error {
+	return capabilityCheck(s.remote, storage.DirectoryReader.CheckDirectoryRead)
+}
+
 func (s *fileSession) CheckNodeReferences() error {
 	return capabilityCheck(s.remote, func(c httprest.NodeReferencesWithBarrier) error { return c.CheckNodeReferences() })
 }
@@ -160,7 +164,7 @@ func (s *fileSession) LookupAt(ctx context.Context, name storage.ChildName) (sto
 }
 
 func (s *fileSession) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
-	observed, err := sessionCapability(ctx, s, true, func(ctx context.Context, capability httprest.NamespaceAccessWithBarrier) (storage.ObservedDirectory, error) {
+	observed, err := sessionCapability(ctx, s, true, func(ctx context.Context, capability storage.DirectoryReader) (storage.ObservedDirectory, error) {
 		return capability.ReadDirNode(ctx, target)
 	})
 	if err != nil {
@@ -185,7 +189,7 @@ func (s *fileSession) ReadDirNodeBounded(ctx context.Context, target storage.Dir
 			observation = storage.DirectoryObservation{}
 		}
 	}()
-	observation, returned = sessionCapability(ctx, s, true, func(ctx context.Context, capability httprest.NamespaceAccessWithBarrier) (storage.DirectoryObservation, error) {
+	observation, returned = sessionCapability(ctx, s, true, func(ctx context.Context, capability storage.DirectoryReader) (storage.DirectoryObservation, error) {
 		return capability.ReadDirNodeBounded(ctx, target, result)
 	})
 	if returned == nil {
@@ -362,6 +366,7 @@ func (s *fileSession) Drop(ctx context.Context, owner storage.UseOwner, domain s
 var (
 	_ storage.AtomicFileOpener = (*fileSession)(nil)
 	_ storage.NamespaceAccess  = (*fileSession)(nil)
+	_ storage.DirectoryReader  = (*fileSession)(nil)
 	_ storage.NodeReferences   = (*fileSession)(nil)
 	_ storage.FileActions      = (*fileSession)(nil)
 	_ storage.MetadataAccess   = (*fileSession)(nil)
