@@ -58,6 +58,19 @@ type substitutedDirectoryAuthority struct {
 	*fileSessionStub
 }
 
+type namespaceOnlyAuthority struct{ *fileSessionStub }
+
+func (*namespaceOnlyAuthority) CheckNamespaceAccess() error { return nil }
+func (*namespaceOnlyAuthority) LookupAt(context.Context, storage.ChildName) (storage.Attr, error) {
+	return storage.Attr{ID: 11, Kind: storage.NodeRegular}, nil
+}
+func (*namespaceOnlyAuthority) MutateName(context.Context, storage.NameCommand) (storage.NameResult, error) {
+	return storage.NameResult{}, nil
+}
+func (*namespaceOnlyAuthority) MutateNameWithBarrier(context.Context, storage.NameCommand) (storage.NameResult, *httprest.MutationBarrier, error) {
+	return storage.NameResult{}, nil, nil
+}
+
 func (*substitutedDirectoryAuthority) CheckDirectoryRead() error { return nil }
 func (*substitutedDirectoryAuthority) ReadDirNode(_ context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
 	return storage.ObservedDirectory{Observation: storage.DirectoryObservation{ParentID: target.NodeID + 1, Revision: []byte{1}}}, nil
@@ -93,6 +106,19 @@ func TestReplicatedNamespaceRejectsSubstitutedAuthorityDirectory(t *testing.T) {
 	}
 	if entries, err := result.Entries(); entries != nil || !errors.Is(err, syscall.EIO) {
 		t.Fatalf("substituted bounded directory exposed %+v, %v", entries, err)
+	}
+}
+
+func TestReplicatedNamespaceCapabilityIsIndependentOfDirectoryRead(t *testing.T) {
+	session := retainedTestSession(t, &namespaceOnlyAuthority{fileSessionStub: &fileSessionStub{}})
+	if err := session.CheckNamespaceAccess(); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.CheckDirectoryRead(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("namespace-only authority exposed directory read: %v", err)
+	}
+	if attr, err := session.LookupAt(t.Context(), storage.ChildName{}); err != nil || attr.ID != 11 {
+		t.Fatalf("namespace-only lookup = %+v, %v", attr, err)
 	}
 }
 

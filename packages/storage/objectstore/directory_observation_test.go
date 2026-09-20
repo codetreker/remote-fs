@@ -295,6 +295,13 @@ type objectDirectoryReaderOnly struct {
 	metastore.DirectoryReader
 }
 
+type objectNamespaceOnly struct {
+	metastore.Store
+	metastore.FileStore
+	metastore.BoundedLister
+	metastore.NamespaceAccess
+}
+
 type objectDirectoryReaderProbe struct{}
 
 func (objectDirectoryReaderProbe) CheckDirectoryRead() error { return nil }
@@ -337,6 +344,45 @@ func TestObjectDirectoryReadCapabilityIsIndependentOfNamespaceMutation(t *testin
 	}
 	if observed, err := reader.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: root.ID}); err != nil || observed.Observation.ParentID != root.ID || len(observed.Entries) != 0 {
 		t.Fatalf("directory-only read = %+v, %v", observed, err)
+	}
+}
+
+func TestObjectNamespaceCapabilityIsIndependentOfDirectoryRead(t *testing.T) {
+	native, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
+		Database: filepath.Join(t.TempDir(), "namespace-only.db"), Volume: "namespace-only", SQLite: sqlite.DefaultOptions(),
+		Locks: locking.DefaultOptions(), Initialize: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := objectNamespaceOnly{Store: native, FileStore: native, BoundedLister: native, NamespaceAccess: native}
+	volume := objectstore.New(memory.New(), backend)
+	t.Cleanup(func() {
+		if err := volume.Close(); err != nil {
+			t.Errorf("close namespace-only volume: %v", err)
+		}
+		if err := native.Close(); err != nil {
+			t.Errorf("close namespace-only metastore: %v", err)
+		}
+	})
+	if err := volume.Create(t.Context(), "entry"); err != nil {
+		t.Fatal(err)
+	}
+	root, err := volume.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
+	namespace := objectCapability[storage.NamespaceAccess](t, session)
+	if err := namespace.CheckNamespaceAccess(); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.(storage.DirectoryReader).CheckDirectoryRead(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("namespace-only backend exposed directory read: %v", err)
+	}
+	name := storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("entry")}
+	if attr, err := namespace.LookupAt(t.Context(), name); err != nil || attr.ID == 0 {
+		t.Fatalf("namespace-only lookup = %+v, %v", attr, err)
 	}
 }
 

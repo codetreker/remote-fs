@@ -25,6 +25,16 @@ type capabilityProbe struct {
 
 type directoryReaderOnlyProbe struct{ storage.FileSession }
 
+type namespaceOnlyProbe struct{ storage.FileSession }
+
+func (namespaceOnlyProbe) CheckNamespaceAccess() error { return nil }
+func (namespaceOnlyProbe) LookupAt(context.Context, storage.ChildName) (storage.Attr, error) {
+	return storage.Attr{ID: 11, Kind: storage.NodeRegular}, nil
+}
+func (namespaceOnlyProbe) MutateName(context.Context, storage.NameCommand) (storage.NameResult, error) {
+	return storage.NameResult{}, nil
+}
+
 func (directoryReaderOnlyProbe) CheckDirectoryRead() error { return nil }
 func (directoryReaderOnlyProbe) ReadDirNode(_ context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
 	return storage.ObservedDirectory{Observation: storage.DirectoryObservation{ParentID: target.NodeID, Revision: []byte{1}}}, nil
@@ -43,6 +53,19 @@ func TestDirectoryReadCapabilityIsIndependentOfNamespaceMutation(t *testing.T) {
 	}
 	if observed, err := wrapper.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: 7}); err != nil || observed.Observation.ParentID != 7 {
 		t.Fatalf("directory-only read = %+v, %v", observed, err)
+	}
+}
+
+func TestNamespaceCapabilityIsIndependentOfDirectoryRead(t *testing.T) {
+	wrapper := &fileSession{FileSession: namespaceOnlyProbe{}, storage: &Storage{limit: MinLimit}}
+	if err := wrapper.CheckNamespaceAccess(); err != nil {
+		t.Fatal(err)
+	}
+	if err := wrapper.CheckDirectoryRead(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("namespace-only backend exposed directory read: %v", err)
+	}
+	if attr, err := wrapper.LookupAt(t.Context(), storage.ChildName{}); err != nil || attr.ID != 11 {
+		t.Fatalf("namespace-only lookup = %+v, %v", attr, err)
 	}
 }
 

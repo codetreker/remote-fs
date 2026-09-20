@@ -179,7 +179,7 @@ func (fs *fileSession) openNodeReference(ctx context.Context, open func(context.
 }
 
 func (fs *fileSession) LookupAt(ctx context.Context, name storage.ChildName) (storage.Attr, error) {
-	if err := fs.CheckDirectoryRead(); err != nil {
+	if err := fs.CheckNamespaceAccess(); err != nil {
 		return storage.Attr{}, err
 	}
 	ctx, cancel := fs.operationContext(ctx)
