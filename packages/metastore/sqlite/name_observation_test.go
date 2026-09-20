@@ -452,6 +452,10 @@ func TestDirectoryListingsRejectDanglingAndDetachedChildren(t *testing.T) {
 			_, err = connection.ExecContext(t.Context(), `DELETE FROM nodes WHERE volume=? AND id=?`, store.volume, id)
 			return err
 		}},
+		{"root alias", func(store *Store, id int64) error {
+			_, err := store.write.ExecContext(t.Context(), `UPDATE entries SET node=? WHERE volume=? AND node=?`, store.root, store.volume, id)
+			return err
+		}},
 		{"detached", func(store *Store, id int64) error {
 			_, err := store.write.ExecContext(t.Context(), `UPDATE nodes SET detached=1 WHERE volume=? AND id=?`, store.volume, id)
 			return err
@@ -577,6 +581,10 @@ func TestReferenceNameObservationGuardsRejectMalformedExistingEdges(t *testing.T
 				return err
 			}
 			_, err = connection.ExecContext(t.Context(), `DELETE FROM nodes WHERE volume=? AND id=?`, store.volume, id)
+			return err
+		}},
+		{"root alias", func(store *Store, id int64) error {
+			_, err := store.write.ExecContext(t.Context(), `UPDATE entries SET node=? WHERE volume=? AND node=?`, store.root, store.volume, id)
 			return err
 		}},
 	} {

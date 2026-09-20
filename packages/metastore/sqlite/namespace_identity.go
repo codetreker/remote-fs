@@ -64,7 +64,7 @@ func (s *Store) lookupNamespaceIdentity(ctx context.Context, tx *sql.Tx, parent 
 	if matches == 0 {
 		return namespaceIdentity{}, false, nil
 	}
-	if matches != 1 || valid != 1 || id < 1 {
+	if matches != 1 || valid != 1 || id < 1 || id == s.root {
 		return namespaceIdentity{}, false, syscall.EIO
 	}
 	identity, err := s.namespaceIdentity(ctx, tx, id)
