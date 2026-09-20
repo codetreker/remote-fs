@@ -804,25 +804,25 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 	objects, objectsErr := s.meta.ObjectStatus(ctx)
 	checkpoint := s.durable.status()
 	return Status{
-		Volume:                       s.volumeName,
-		Space:                        space,
-		Objects:                      objects,
-		ObjectLimits:                 s.objectLimits,
-		MaxReaderConnections:         s.maxReaderConnections,
-		MaxSnapshotReaderConnections: s.maxSnapshotReaderConnections,
-		MaxIntegrityRecords:          s.maxIntegrityRecords,
-		MaxIntegrityBytes:            s.maxIntegrityBytes,
-		MaxMetadataBytes:             s.maxMetadataBytes,
-		LocalDisk:                    localDisk,
-		Maintenance:                  s.MaintenanceStatus(),
-		Checkpoint:                   checkpoint,
-	}, errors.Join(
-		statusFailure("logical space", spaceErr),
-		statusFailure("combined space", spaceStatusErr),
-		statusFailure("object records", objectsErr),
-		statusFailure("local object store", localDiskErr),
-		statusFailure("SQLite checkpoint", checkpoint.LastError),
-	)
+			Volume:                       s.volumeName,
+			Space:                        space,
+			Objects:                      objects,
+			ObjectLimits:                 s.objectLimits,
+			MaxReaderConnections:         s.maxReaderConnections,
+			MaxSnapshotReaderConnections: s.maxSnapshotReaderConnections,
+			MaxIntegrityRecords:          s.maxIntegrityRecords,
+			MaxIntegrityBytes:            s.maxIntegrityBytes,
+			MaxMetadataBytes:             s.maxMetadataBytes,
+			LocalDisk:                    localDisk,
+			Maintenance:                  s.MaintenanceStatus(),
+			Checkpoint:                   checkpoint,
+		}, errors.Join(
+			statusFailure("logical space", spaceErr),
+			statusFailure("combined space", spaceStatusErr),
+			statusFailure("object records", objectsErr),
+			statusFailure("local object store", localDiskErr),
+			statusFailure("SQLite checkpoint", checkpoint.LastError),
+		)
 }
 
 func clampStatusSpace(
