@@ -98,9 +98,37 @@ func TestRemoteChangeReachesReplicaDuringContinuousListings(t *testing.T) {
 			t.Fatalf("initial directory listing: %v", err)
 		}
 	}
+	rendezvous := s.authorityGate.rendezvousAtBackend(readers)
+	defer rendezvous.Release()
 	before := completed.Load()
 	releaseLoad()
-	write(t, s, "arrived", "new content")
+	select {
+	case <-rendezvous.listsArrived:
+	case err := <-failures:
+		t.Fatalf("arming continuous directory load: %v", err)
+	case <-t.Context().Done():
+		t.Fatal(context.Cause(t.Context()))
+	}
+	writeDone := make(chan error, 1)
+	group.Go(func() { writeDone <- s.elsewhere.Write(t.Context(), "arrived", []byte("new content")) })
+	select {
+	case <-rendezvous.writeArrived:
+	case err := <-writeDone:
+		t.Fatalf("authority write ended before reaching the backend rendezvous: %v", err)
+	case <-t.Context().Done():
+		t.Fatal(context.Cause(t.Context()))
+	}
+	rendezvous.Release()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("writing %q into the volume: %v", "arrived", err)
+		}
+	case err := <-failures:
+		t.Fatalf("concurrent listing during the remote write: %v", err)
+	case <-t.Context().Done():
+		t.Fatal(context.Cause(t.Context()))
+	}
 	written := time.Now()
 	postWrite := completed.Load()
 	ctx, cancel := context.WithDeadline(t.Context(), written.Add(time.Second))

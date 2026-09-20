@@ -40,9 +40,10 @@ import (
 // served is one volume, the server in front of it, and the failures that can be arranged
 // between the two.
 type served struct {
-	meta    *sqlite.Store
-	storage *objectstore.Storage
-	url     string
+	meta          *sqlite.Store
+	storage       *objectstore.Storage
+	url           string
+	authorityGate *authorityGate
 
 	// server is kept so that the connections a mount holds can be closed from underneath it.
 	server *httptest.Server
@@ -82,18 +83,24 @@ func serveWithLockOptions(t *testing.T, limits httprest.Limits, allowance int64,
 	t.Helper()
 	handlerOptions := httprest.DefaultHandlerOptions()
 	handlerOptions.Replication = limits
-	return serveWithHTTPOptions(t, allowance, options, &http.Client{Timeout: 10 * time.Second}, handlerOptions)
+	return serveWithHTTPOptions(t, allowance, options, &http.Client{Timeout: 10 * time.Second}, handlerOptions, false)
 }
 
 func serveWithTransportOptions(t *testing.T, client *http.Client, options httprest.HandlerOptions) *served {
 	t.Helper()
-	return serveWithHTTPOptions(t, 0, locking.DefaultOptions(), client, options)
+	return serveWithHTTPOptions(t, 0, locking.DefaultOptions(), client, options, true)
 }
 
-func serveWithHTTPOptions(t *testing.T, allowance int64, lockOptions locking.Options, client *http.Client, handlerOptions httprest.HandlerOptions) *served {
+func serveWithHTTPOptions(t *testing.T, allowance int64, lockOptions locking.Options, client *http.Client, handlerOptions httprest.HandlerOptions, gateAuthority bool) *served {
 	t.Helper()
 	meta, backing := memoryfixture.New(t, "ws", allowance, lockOptions)
-	handler, err := httprest.NewHandlerWithOptions(backing, meta, handlerOptions)
+	var authority storage.Storage = backing
+	var gate *authorityGate
+	if gateAuthority {
+		gate = &authorityGate{Storage: backing}
+		authority = gate
+	}
+	handler, err := httprest.NewHandlerWithOptions(authority, meta, handlerOptions)
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}
@@ -110,8 +117,105 @@ func serveWithHTTPOptions(t *testing.T, allowance int64, lockOptions locking.Opt
 	return &served{
 		meta: meta, storage: backing, url: server.URL, server: server,
 		elsewhere: elsewhere, events: faults, calls: counted,
-		silence: httprest.DefaultSilence,
+		authorityGate: gate,
+		silence:       httprest.DefaultSilence,
 	}
+}
+
+type authorityGate struct {
+	*objectstore.Storage
+
+	mu         sync.Mutex
+	rendezvous *authorityRendezvous
+}
+
+type authorityRendezvous struct {
+	mu sync.Mutex
+
+	listsRemaining int
+	writeRemaining bool
+	listsArrived   chan struct{}
+	writeArrived   chan struct{}
+	release        chan struct{}
+	releaseOnce    sync.Once
+}
+
+func (g *authorityGate) rendezvousAtBackend(lists int) *authorityRendezvous {
+	r := &authorityRendezvous{
+		listsRemaining: lists,
+		writeRemaining: true,
+		listsArrived:   make(chan struct{}),
+		writeArrived:   make(chan struct{}),
+		release:        make(chan struct{}),
+	}
+	g.mu.Lock()
+	g.rendezvous = r
+	g.mu.Unlock()
+	return r
+}
+
+func (g *authorityGate) activeRendezvous() *authorityRendezvous {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.rendezvous
+}
+
+func (g *authorityGate) ListBounded(ctx context.Context, path string, result *storage.ListResult) error {
+	if r := g.activeRendezvous(); r != nil && r.claimList() {
+		if err := r.wait(ctx); err != nil {
+			if result != nil {
+				result.Fail(err)
+			}
+			return err
+		}
+	}
+	return g.Storage.ListBounded(ctx, path, result)
+}
+
+func (g *authorityGate) Write(ctx context.Context, path string, content []byte) error {
+	if r := g.activeRendezvous(); r != nil && r.claimWrite() {
+		if err := r.wait(ctx); err != nil {
+			return err
+		}
+	}
+	return g.Storage.Write(ctx, path, content)
+}
+
+func (r *authorityRendezvous) claimList() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.listsRemaining == 0 {
+		return false
+	}
+	r.listsRemaining--
+	if r.listsRemaining == 0 {
+		close(r.listsArrived)
+	}
+	return true
+}
+
+func (r *authorityRendezvous) claimWrite() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.writeRemaining {
+		return false
+	}
+	r.writeRemaining = false
+	close(r.writeArrived)
+	return true
+}
+
+func (r *authorityRendezvous) wait(ctx context.Context) error {
+	select {
+	case <-r.release:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
+func (r *authorityRendezvous) Release() {
+	r.releaseOnce.Do(func() { close(r.release) })
 }
 
 // sever closes the connections the server holds, which ends every stream on them at once.
