@@ -230,6 +230,12 @@ func TestSystemMode(t *testing.T) {
 	}
 }
 
+func TestMountOptionsDisableReadDirPlusWhileListingsRemainPathBased(t *testing.T) {
+	if options := kernelMountOptions(nil, false); !options.DisableReadDirPlus {
+		t.Fatal("READDIRPLUS enabled without identity-bound directory observations")
+	}
+}
+
 // The way back. A mode arrives from the kernel with the node's kind still in it, and the
 // kind is dropped rather than translated: what comes back is a mode to set, and a node's
 // kind is not something a caller sets.

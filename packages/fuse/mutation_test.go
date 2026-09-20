@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	iofs "io/fs"
 	"strings"
 	"syscall"
 	"testing"
@@ -71,6 +72,51 @@ func (s *mutationStorage) NewFileSession(ctx context.Context, options storage.Fi
 type mutationSession struct {
 	capableTestSession
 	owner *mutationStorage
+}
+
+func (s *mutationSession) LookupAt(ctx context.Context, name storage.ChildName) (storage.Attr, error) {
+	if err := s.owner.enter(ctx, "stat"); err != nil {
+		return storage.Attr{}, err
+	}
+	attr, err := s.NamespaceAccess.LookupAt(ctx, name)
+	return attr, s.owner.finish("stat", err)
+}
+
+func (s *mutationSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
+	if err := s.owner.enter(ctx, "open"); err != nil {
+		return storage.OpenResult{}, err
+	}
+	result, err := s.AtomicFileOpener.OpenAt(ctx, name, options)
+	if err := s.owner.finish("open", err); err != nil {
+		return result, err
+	}
+	if result.File != nil {
+		result.File = &mutationFile{File: result.File, owner: s.owner}
+	}
+	if err := s.owner.enter(ctx, "open-result"); err != nil {
+		return result, err
+	}
+	s.owner.finish("stat", nil)
+	return result, nil
+}
+
+func (s *mutationSession) MutateName(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
+	op := map[storage.NameOperation]string{
+		storage.NameMkdir: "mkdir", storage.NameSymlink: "symlink", storage.NameRemove: "remove",
+		storage.NameRemoveDir: "rmdir", storage.NameRename: "rename",
+	}[command.Kind]
+	if err := s.owner.enter(ctx, op); err != nil {
+		return storage.NameResult{}, err
+	}
+	result, err := s.NamespaceAccess.MutateName(ctx, command)
+	if err := s.owner.finish(op, err); err != nil {
+		return result, err
+	}
+	if err := s.owner.enter(ctx, op+"-result"); err != nil {
+		return result, err
+	}
+	s.owner.finish("stat", nil)
+	return result, nil
 }
 
 func (s *mutationSession) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, error) {
@@ -252,10 +298,9 @@ func TestCreationCancellationAccountsForCompletedStages(t *testing.T) {
 		directory, changed bool
 	}{
 		{"atomic file open", "open", false, false},
-		{"opened file attributes", "stat", false, true},
+		{"captured file result", "open-result", false, true},
 		{"directory creation", "mkdir", true, false},
-		{"directory mode", "setattr", true, true},
-		{"directory attributes", "stat", true, true},
+		{"captured directory result", "mkdir-result", true, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root, _, downstream := mutationTree(t)
@@ -282,10 +327,14 @@ func TestCreationCancellationAccountsForCompletedStages(t *testing.T) {
 			if test.changed && err != nil || !test.changed && !errors.Is(err, syscall.ENOENT) {
 				t.Fatalf("volume after interrupted creation: %v", err)
 			}
-			if test.changed && !test.directory {
+			if test.changed {
 				mode, modeErr := permissions(attr)
-				if modeErr != nil || mode.Perm() != 0600 {
-					t.Fatalf("atomic create left metadata %v instead of requested 0600: %v", attr.Metadata, modeErr)
+				want := iofs.FileMode(0600)
+				if test.directory {
+					want = 0700
+				}
+				if modeErr != nil || mode.Perm() != want {
+					t.Fatalf("atomic create left metadata %v instead of requested %04o: %v", attr.Metadata, want, modeErr)
 				}
 			}
 		})
@@ -444,7 +493,7 @@ func TestMutationSuccessIgnoresLateCancellation(t *testing.T) {
 			downstream.after = func(op string) {
 				if op == "stat" {
 					observations++
-					if (operation == "setattr" || operation == "mkdir") && observations == 1 {
+					if operation == "setattr" && observations == 1 {
 						return
 					}
 					cancel()

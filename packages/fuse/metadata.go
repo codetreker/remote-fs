@@ -74,7 +74,24 @@ func (n *node) setPermissions(ctx context.Context, f fs.FileHandle, mode iofs.Fi
 	}
 	var read func(context.Context) (storage.Attr, error)
 	var update func(context.Context, string, []byte, []byte) (storage.OpaquePayload, error)
-	if h, ok := f.(*handle); ok {
+	if directory, ok := f.(*directoryHandle); ok {
+		directory.mu.Lock()
+		defer directory.mu.Unlock()
+		if err := directory.checkMutationLocked(ctx); err != nil {
+			return err
+		}
+		access, ok := n.volume.files.(storage.MetadataAccess)
+		if !ok {
+			return syscall.EOPNOTSUPP
+		}
+		if err := access.CheckMetadataAccess(); err != nil {
+			return err
+		}
+		read = directory.reference.Stat
+		update = func(ctx context.Context, namespace string, version, data []byte) (storage.OpaquePayload, error) {
+			return access.SetMetadata(ctx, n.id.node, namespace, version, data)
+		}
+	} else if h, ok := f.(*handle); ok {
 		reference, ok := h.file.(storage.ReferenceMetadataAccess)
 		if !ok {
 			return syscall.EOPNOTSUPP
