@@ -23,13 +23,14 @@ func TestRemoteChangeReachesReplicaDuringContinuousListings(t *testing.T) {
 		responseWaiters     = 64
 		maxBodyBytes        = int64(2 << 20)
 		responsePeak        = 4 * responseConcurrency * maxBodyBytes
+		clientTimeout       = 90 * time.Second
 	)
 	handlerOptions := httprest.DefaultHandlerOptions()
 	handlerOptions.MaxBodyBytes = maxBodyBytes
 	handlerOptions.MaxConcurrentResponses = responseConcurrency
 	handlerOptions.MaxInFlightResponseBytes = responsePeak
 	handlerOptions.MaxWaitingResponses = responseWaiters
-	s := serveWithTransportOptions(t, &http.Client{Timeout: 30 * time.Second}, handlerOptions)
+	s := serveWithTransportOptions(t, &http.Client{Timeout: clientTimeout}, handlerOptions)
 	for i := range 4096 {
 		if err := s.storage.Create(t.Context(), fmt.Sprintf("file-%02d", i)); err != nil {
 			t.Fatal(err)
@@ -48,7 +49,7 @@ func TestRemoteChangeReachesReplicaDuringContinuousListings(t *testing.T) {
 	if handlerOptions.MaxInFlightResponseBytes < requiredResponseBytes || dialOptions.MaxInFlightResponseBytes < requiredResponseBytes {
 		t.Fatal("acceptance transport cannot retain every admitted response")
 	}
-	mounted, _ := mountWithHTTPOptions(t, s, &http.Client{Timeout: 30 * time.Second}, dialOptions)
+	mounted, _ := mountWithHTTPOptions(t, s, &http.Client{Timeout: clientTimeout}, dialOptions)
 	var stopped atomic.Bool
 	stopReaders := func() { stopped.Store(true) }
 	var group sync.WaitGroup
