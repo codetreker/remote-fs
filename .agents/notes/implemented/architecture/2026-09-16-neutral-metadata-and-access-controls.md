@@ -38,7 +38,7 @@ File 可返回只代表该确切活引用的 `UseScope`。token 是非空、至�
 
 `Bytes` 表达正长度区间，`Boundary` 表达字节间边界；零长度不会被猜成 EOF。`Replace` / `Subtract` 保存 advisory 范围代数，`AddExact` / `RemoveExact` 保存不合并的强制 claim。一次请求的 Commands、Claims 和 Effects 各最多 64 项；完整结果无法保留时，在释放或授予任何状态前拒绝。Rejected 结果的 `FailedAt` 指向原 Commands 中失败项的零基下标；与某一命令无关的整批 admission 拒绝保持 nil。失败项之前已经成功的 release 保留在 Effects 中，本批新增 acquisition 则回滚。`DropBeforeAcquire` 已经完成的释放即使后续获取冲突，也不能被报告为整项未执行。取消本身不证明没有授予，结果未知时相关访问持续失败，直到核对或拥有者清理得到确定结果。
 
-FUSE 负责把 kernel owner、`flock`、传统 POSIX record lock、关闭与转换规则映射为这些中立命令。record owner 注册时把内核提供的 POSIX PID 作为 Diagnostic，flock 不需要 PID；`F_GETLK` 只接受可表示为非零 `uint32` 的冲突 Diagnostic，缺失或越界以 `EIO` 失败。`Flush` 对对应 owner 执行范围清理，最终 `Release` 关闭 File；直接 File API 不推断进程 owner。Linux errno、PID 和未来 EOF 的解释留在 FUSE 层。
+FUSE 负责把 kernel owner、`flock`、传统 POSIX record lock、关闭与转换规则映射为这些中立命令。record owner 注册时把内核提供的 POSIX PID 作为 Diagnostic，flock 不需要 PID；Linux `pid_t` 是有符号值，`F_GETLK` 只接受 1 至 `math.MaxInt32` 的冲突 Diagnostic，缺失或越界以 `EIO` 失败。`Flush` 对对应 owner 执行范围清理，最终 `Release` 关闭 File；直接 File API 不推断进程 owner。Linux errno、PID 和未来 EOF 的解释留在 FUSE 层。
 
 UseClaim、UseOwner、range、等待和动作回执是当前 authority 的有界内存状态，并受 FileSession 生命周期约束。authority 重启或 incarnation 改变后，旧 File、scope、owner、range 和请求历史都明确失效；它们不从 SQLite、变更日志或客户端 ledger 恢复。客户端必须建立新会话并重新取得所需状态，不能把旧持有者静默重绑到同名或同 NodeID 对象。Strong S/X 的持久恢复是独立机制，不由这些状态继承。
 

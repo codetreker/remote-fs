@@ -96,7 +96,7 @@ metadata 返回值与 Attr 载入前先经过 `AttrResultBudget`。每 volume �
 
 Use claim、owner、range、等待与动作历史只存在于当前 authority 的有界内存中。FileSession 退役、authority 重启或 incarnation 改变后，旧 File、scope、owner 和 range 均以 `ESTALE` 或相应不可用错误失效，不从 SQLite 或复制日志恢复，也不按同名或同 NodeID 对象静默重建。调用方须建立新 FileSession 并重新申请状态。只有独立 Strong S/X 机制具有自己的持久恢复保证。
 
-FUSE 将 `flock` 映射到 whole-file domain，将传统 POSIX `fcntl` 映射到 record domain。record owner 注册时把内核提供的 POSIX PID 写入 Diagnostic；kernel owner cookie 与内部 UseOwner 不越过这条映射。`F_GETLK` 只把非零且不大于 `math.MaxUint32` 的 Diagnostic 转成 PID，缺失或越界为 `EIO`。fork/dup、访问模式、转换及关闭规则仍留在 FUSE：`Flush` 对对应 owner 执行 `Drop`，最终 `Release` 关闭引用。直接 File API 不推断 POSIX 进程 owner。完整 `F_OFD_*` 仍不在兼容承诺内。
+FUSE 将 `flock` 映射到 whole-file domain，将传统 POSIX `fcntl` 映射到 record domain。record owner 注册时把内核提供的 POSIX PID 写入 Diagnostic；kernel owner cookie 与内部 UseOwner 不越过这条映射。Linux `pid_t` 是有符号值，`F_GETLK` 只把 1 至 `math.MaxInt32` 的 Diagnostic 转成 PID，缺失或越界为 `EIO`。fork/dup、访问模式、转换及关闭规则仍留在 FUSE：`Flush` 对对应 owner 执行 `Drop`，最终 `Release` 关闭引用。直接 File API 不推断 POSIX 进程 owner。完整 `F_OFD_*` 仍不在兼容承诺内。
 
 默认 volume 上限为 1024 个会话、32768 个 owner、262144 个 range、262144 个 action、8192 个 waiter 和 65536 条死锁图边。会话数据、心跳、范围获取、核对和释放使用分开的 admission；数据物化不能耗尽续期与清理能力。
 

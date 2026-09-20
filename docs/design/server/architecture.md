@@ -177,8 +177,10 @@ HTTP handler 只接受实现 `storage.BoundedStorage` 的 volume。constructor �
 | 单个 protocol body / file-content write | 1 GiB / 继承 protocol body |
 | 同时保留的 request bodies / 等待者 | 64 / 64 |
 | request-body aggregate bytes | 2 GiB |
-| 同时保留的 responses / 等待者 | 64 / 64 |
+| 同时保留的 responses / 等待者 | 64 / 128 |
 | response aggregate bytes | 8 GiB |
+
+response active 与 aggregate byte 默认值保持不变。默认 List 的四倍预留是 4 GiB，8 GiB aggregate 因此只允许 2 个同时活跃；128 路 authority List 还会占用 126 个 waiter。128 个 waiter 给同时发生的 SSE setup 与 write 各留一个有界等待位置；超过该队列仍以 `EAGAIN` 拒绝。
 
 `MaxBodyBytes` 至少为 1024 字节，且必须小到可以计算四倍 response reservation；`MaxWriteBytes` 必须为正且不大于 `MaxBodyBytes`。request aggregate 至少容纳一份 `MaxBodyBytes`，response aggregate 至少容纳一份四倍 reservation。effective operation 与 waiter 上限都为正；option 的零值选择有界默认值。client 对所有 non-streaming operation 持有独立的 response operation、waiter 与 aggregate byte admission，见 [`../client/architecture.md`](../client/architecture.md)。
 

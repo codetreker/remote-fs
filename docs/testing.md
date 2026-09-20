@@ -144,7 +144,7 @@ schema 迁移从真实 v5 fixture 前滚，核对 mode 到 NodeKind / `posix.per
 
 Use/range 生命周期用例还要区分持久数据与内存控制状态：SQLite 重开后 NodeKind、共同时间和 opaque metadata 保持，旧 authority 的 File、scope、UseOwner、range 与请求历史全部失效。新会话可以重新取得状态，但不能恢复或静默重绑旧持有者；Strong S/X 的持久恢复用例保持独立。
 
-[FUSE bridge 用例](../packages/fuse/advisory_bridge_test.go)与[owner 用例](../packages/fuse/lock_owners_test.go)通过真实 raw callback 验证内核 LockOwner 到 UseOwner/range command 的映射，包括 owner 为零、没有加过锁的描述符关闭、POSIX 任一描述符关闭与 flock 最后一次 Release 的区别。record owner 携带内核 POSIX PID 作为 Diagnostic，跨挂载 `F_GETLK` 返回该 PID；缺失、零或超过 `uint32` 的冲突 Diagnostic 以 `EIO` 失败。内部 UseOwner、kernel cookie 和 Group 不作为 PID 泄漏。缺失或饱和的 raw metadata 不得继续以错误 owner 执行动作；取消必须先核对远端结果。`unknown cancellation` 分支直接断言挂载 volume 的健康检查为 `EIO`。Release 中 owner 清理失败仍尝试关闭引用并保存错误，同时核对挂载整体已被隔离。
+[FUSE bridge 用例](../packages/fuse/advisory_bridge_test.go)与[owner 用例](../packages/fuse/lock_owners_test.go)通过真实 raw callback 验证内核 LockOwner 到 UseOwner/range command 的映射，包括 owner 为零、没有加过锁的描述符关闭、POSIX 任一描述符关闭与 flock 最后一次 Release 的区别。record owner 携带内核 POSIX PID 作为 Diagnostic，跨挂载 `F_GETLK` 返回该 PID；缺失、零或超过有符号 Linux `pid_t` 上限 `math.MaxInt32` 的冲突 Diagnostic 以 `EIO` 失败。内部 UseOwner、kernel cookie 和 Group 不作为 PID 泄漏。缺失或饱和的 raw metadata 不得继续以错误 owner 执行动作；取消必须先核对远端结果。`unknown cancellation` 分支直接断言挂载 volume 的健康检查为 `EIO`。Release 中 owner 清理失败仍尝试关闭引用并保存错误，同时核对挂载整体已被隔离。
 
 [UseScope 值类型与 HTTP 用例](../packages/storage/capabilities_test.go)要求 token 非空、至多 128 字节、不含 NUL 且是有效 UTF-8；[文件能力 wire 用例](../packages/transport/httprest/file_capabilities_test.go)核对非 ASCII UTF-8 往返，并在编码请求或接受 response 前拒绝非法 UTF-8。scope 仍只按原样相等比较，不从文本内容推导身份或权限。
 
@@ -272,7 +272,7 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 压力与可见性使用不同的时间判据。[SQLite 压力用例](../packages/metastore/sqlite/replica_test.go)先占满现有 reader pool，再直接对 `sqlite.Replica` 启动 128 个公开 `List` 调用。用例在门的互斥保护下确认只有与 pool 容量相等的读者持有共享访问，其余调用仍在阶段外等待 SQL 名额；确认 `Apply` 已登记等待后才释放 reader pool。4096 文件的读取循环保持到写者结果返回，随后停止并取消本用例拥有的读者 context，join 全部读者并检查门空闲、读取 permit 为零。它验证 SQLite 组件自身的读写门，不代表组合 `replicated.Storage.List` 的路由；后者回源 authority。只有停止标志、私有取消原因、错误链中的 `context.Canceled` 和 `EINTR` 分类同时成立，才忽略预期退出；其它错误仍失败。30 秒写者截止时间、Applied、Stat 模式与 Position 断言保持，不能提前撤掉负载。结果后的清理不属于写者延迟，局部测量见[减少无用测试工作](../.agents/notes/implemented/testing/2026-09-09-reduce-test-work.md)；该死锁上限不代表复制延迟。
 
-[真实 HTTP/SSE 全负载可见性用例](../packages/storage/replicated/replica_acceptance_test.go)使用 4096 文件与 128 个持续回源 authority 列目录的读者，以一秒为独立写者提交后另一客户端的本地 Stat 观察到新元数据的上限。用例先观察每个读者都成功完成列目录，再提交变更，并断言计时窗口内权威目录读取继续推进；调用进入某个回调不构成负载成立的证据。
+[真实 HTTP/SSE 全负载可见性用例](../packages/storage/replicated/replica_acceptance_test.go)使用 4096 文件与 128 个持续回源 authority 列目录的读者，以一秒为独立写者提交后另一客户端的本地 Stat 观察到新元数据的上限。默认 1 GiB body 和四倍 response reservation 使 8 GiB aggregate 只容纳 2 个活跃 List；其余 126 个 reader 等待。waiter 默认提高到 128 后，SSE 建立与 write 仍各有一个有界等待位置，active 和 byte bounds 均不改变。用例先观察每个读者都成功完成列目录，再提交变更，并断言计时窗口内权威目录读取继续推进；调用进入某个回调不构成负载成立的证据。
 
 这项验收只在测试文件上使用 `rfs_acceptance` build tag，生产实现没有对应分支。CI 在其它包的并行测试与 race suite 之前，以正常构建、串行执行整个 `packages/storage/replicated` 包，使用 `assert-every-test-ran.sh`，不按 `-run` 缩小集合。原有的一秒 HTTP/SSE 可见性用例仍在默认测试集合中并接受 race 检查；阶段交接、取消与 4096 文件压力用例也保留默认 race 覆盖。全负载一秒断言和 race 下的死锁判据分别验收，不互相替代。
 
