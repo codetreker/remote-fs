@@ -378,6 +378,74 @@ func TestSemanticOpenReplayGetsAFreshAcknowledgementWindow(t *testing.T) {
 	}
 }
 
+func TestOpenCapabilityClosesTheReferenceWhenAcknowledgementIsDenied(t *testing.T) {
+	_, backend := memoryfixture.New(t, "open-ack-denied", 1<<20, locking.DefaultOptions())
+	if err := backend.Write(t.Context(), "file", []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := backend.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := backend.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := DefaultHandlerOptions()
+	options.Volume = "trusted"
+	options.Authorizer = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
+		if request.Operation == storage.OpFileAck {
+			return authz.ErrDenied
+		}
+		return nil
+	})
+	handler, err := NewHandlerWithOptions(backend, nil, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(func() {
+		server.Close()
+		if err := handler.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	client, err := Dial(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionValue, err := client.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*remoteFileSession)
+	defer session.Close(context.Background())
+	status, err := session.Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := storage.NewFileActionID(status.ActionEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := session.OpenAt(t.Context(), storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("file")}, storage.OpenAtOptions{
+		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID}, Action: action,
+		Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
+	})
+	if storage.ErrnoOf(err) != syscall.EIO || opened.File != nil || opened.Attr.ID != file.ID {
+		t.Fatalf("open result=%+v error=%v", opened, err)
+	}
+	handler.files.mu.Lock()
+	served := handler.files.sessions[session.id]
+	handler.files.mu.Unlock()
+	served.mu.Lock()
+	retained := len(served.files)
+	served.mu.Unlock()
+	if retained != 0 {
+		t.Fatalf("failed acknowledgement left %d retained references", retained)
+	}
+}
+
 func TestLostSemanticActionRefusalIsRecoveredAsRecorded(t *testing.T) {
 	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
 	root, err := backend.Stat(t.Context(), "")
@@ -545,6 +613,210 @@ func TestNodeReferenceStatAndSetAttrAcceptDirectoryAndSymlinkAttributes(t *testi
 				t.Fatalf("setattr=%+v error=%v", observed, err)
 			}
 		})
+	}
+}
+
+func TestNodeReferenceCapabilityMethodsRoundTrip(t *testing.T) {
+	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
+	if err := backend.Write(t.Context(), "file", []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	attr, err := backend.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionValue, err := client.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessionValue.(*remoteFileSession)
+	defer session.Close(context.Background())
+	status, err := session.Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	newAction := func() storage.FileActionID {
+		action, actionErr := storage.NewFileActionID(status.ActionEpoch)
+		if actionErr != nil {
+			t.Fatal(actionErr)
+		}
+		return action
+	}
+	opened, err := session.OpenNodeRef(t.Context(), attr.ID, storage.NodeRefOptions{
+		Kind: storage.NodeRegular, Target: storage.ChildCondition{State: storage.SameNode, NodeID: attr.ID}, Action: newAction(),
+		Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName}, MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
+	})
+	if err != nil || opened.Reference == nil {
+		t.Fatalf("open=%+v error=%v", opened, err)
+	}
+	reference := opened.Reference.(*remoteNodeReference)
+
+	for name, check := range map[string]func() error{
+		"scope":       reference.CheckScopedReference,
+		"metadata":    reference.CheckMetadataAccess,
+		"state":       reference.CheckReferenceState,
+		"delete":      reference.CheckDeleteIntent,
+		"conditional": reference.CheckConditionalFileMutation,
+	} {
+		if err := check(); err != nil {
+			t.Fatalf("%s capability=%v", name, err)
+		}
+	}
+	if _, err := reference.Scope(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	changed := time.Unix(456, 789).UTC()
+	if got, _, err := reference.SetAttrWithBarrier(t.Context(), storage.AttrChange{ModTime: &changed}); err != nil || !got.ModTime.Equal(changed) {
+		t.Fatalf("setattr=%+v error=%v", got, err)
+	}
+	changed = time.Unix(457, 790).UTC()
+	if got, _, err := reference.file.SetAttrWithBarrier(t.Context(), storage.AttrChange{ModTime: &changed}); err != nil || !got.ModTime.Equal(changed) {
+		t.Fatalf("file setattr with barrier=%+v error=%v", got, err)
+	}
+	metadata, err := reference.SetMetadata(t.Context(), "client.one", nil, []byte("one"))
+	if err != nil || string(metadata.Data) != "one" {
+		t.Fatalf("set metadata=%+v error=%v", metadata, err)
+	}
+	metadata, _, err = reference.SetMetadataWithBarrier(t.Context(), "client.one", metadata.Version, []byte("two"))
+	if err != nil || string(metadata.Data) != "two" {
+		t.Fatalf("set metadata with barrier=%+v error=%v", metadata, err)
+	}
+	expectedSize := int64(1)
+	mutated, err := reference.MutateFile(t.Context(), storage.FileMutation{Action: newAction(), Kind: storage.MutateWriteAt, Offset: 1, Data: []byte("b"), ExpectedSize: &expectedSize})
+	if !errors.Is(err, syscall.EBADF) || mutated.ID != 0 {
+		t.Fatalf("mutate=%+v error=%v", mutated, err)
+	}
+	mutated, _, err = reference.MutateFileWithBarrier(t.Context(), storage.FileMutation{Action: newAction(), Kind: storage.MutateWriteAt, Offset: 1, Data: []byte("b"), ExpectedSize: &expectedSize})
+	if !errors.Is(err, syscall.EBADF) || mutated.ID != 0 {
+		t.Fatalf("mutate with barrier=%+v error=%v", mutated, err)
+	}
+	pending, err := reference.SetPendingUnlink(t.Context(), storage.PendingUnlinkCommand{Action: newAction(), Condition: storage.UnlinkFile})
+	if err != nil || !pending.PendingUnlink {
+		t.Fatalf("set pending=%+v error=%v", pending, err)
+	}
+	cleared, _, err := reference.ClearPendingUnlinkWithBarrier(t.Context(), storage.ClearPendingUnlinkCommand{Action: newAction(), Generation: pending.PendingGeneration})
+	if err != nil || cleared.PendingUnlink {
+		t.Fatalf("clear pending with barrier=%+v error=%v", cleared, err)
+	}
+	pending, _, err = reference.SetPendingUnlinkWithBarrier(t.Context(), storage.PendingUnlinkCommand{Action: newAction(), Condition: storage.UnlinkFile})
+	if err != nil || !pending.PendingUnlink {
+		t.Fatalf("set pending with barrier=%+v error=%v", pending, err)
+	}
+	cleared, err = reference.ClearPendingUnlink(t.Context(), storage.ClearPendingUnlinkCommand{Action: newAction(), Generation: pending.PendingGeneration})
+	if err != nil || cleared.PendingUnlink {
+		t.Fatalf("clear pending=%+v error=%v", cleared, err)
+	}
+	if _, err := reference.State(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reference.CloseWithBarrier(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIdentityCapabilityCommandWireConversionsOwnTheirPayloads(t *testing.T) {
+	action := storage.FileActionID("1:00000000000000000000000000000000")
+	rename := &storage.RenameTarget{
+		Parent: storage.DirectoryTarget{NodeID: 4}, ObservedLeaf: []byte("old"), OutputLeaf: []byte("new"),
+		Expected: storage.ChildCondition{State: storage.SameNode, NodeID: 5, ExpectedMetadata: map[string][]byte{"client.v1": {1}}},
+	}
+	wireRename := renameTargetOf(rename)
+	rename.ObservedLeaf[0] = 'x'
+	rename.Expected.ExpectedMetadata["client.v1"][0] = 9
+	if string(wireRename.ObservedLeaf) != "old" || wireRename.Expected.ExpectedMetadata["client.v1"][0] != 1 {
+		t.Fatalf("rename wire aliases source: %+v", wireRename)
+	}
+	gotRename := wireRename.storage()
+	wireRename.OutputLeaf[0] = 'y'
+	wireRename.Expected.ExpectedMetadata["client.v1"][0] = 8
+	if string(gotRename.ObservedLeaf) != "old" || string(gotRename.OutputLeaf) != "new" || gotRename.Expected.NodeID != 5 || gotRename.Expected.ExpectedMetadata["client.v1"][0] != 1 {
+		t.Fatalf("rename conversion=%+v", gotRename)
+	}
+
+	updates := map[string]storage.OpaquePayload{"client.v1": {Version: []byte{1}, Data: []byte("value")}}
+	wireUpdates := metadataUpdatesOf(updates)
+	sourceUpdate := updates["client.v1"]
+	sourceUpdate.Version[0] = 9
+	sourceUpdate.Data[0] = 'x'
+	if got := wireUpdates["client.v1"]; got.ExpectedVersion[0] != 1 || string(got.Data) != "value" {
+		t.Fatalf("metadata wire aliases source: %+v", got)
+	}
+	gotUpdates := metadataUpdatesStorage(wireUpdates)
+	wireUpdate := wireUpdates["client.v1"]
+	wireUpdate.ExpectedVersion[0] = 8
+	wireUpdate.Data[0] = 'y'
+	if got := gotUpdates["client.v1"]; len(got.Version) != 1 || string(got.Data) != "value" {
+		t.Fatalf("metadata conversion=%+v", got)
+	}
+	if metadataUpdatesOf(nil) != nil || metadataUpdatesStorage(nil) != nil {
+		t.Fatal("nil metadata update maps became present")
+	}
+
+	pending := storage.PendingUnlinkCommand{
+		Action: action, Condition: storage.UnlinkFile,
+		ExpectedMetadata: map[string][]byte{"client.v1": {2}},
+		Uses:             []storage.TargetUse{{NodeID: 7, Scope: storage.UseScope{Token: "scope"}}},
+	}
+	wirePending := pendingUnlinkCommandOf(pending)
+	pending.ExpectedMetadata["client.v1"][0] = 9
+	if wirePending.ExpectedMetadata["client.v1"][0] != 2 {
+		t.Fatalf("pending wire aliases source: %+v", wirePending)
+	}
+	gotPending := wirePending.storage()
+	wirePending.ExpectedMetadata["client.v1"][0] = 8
+	if gotPending.Action != action || gotPending.Condition != storage.UnlinkFile || gotPending.ExpectedMetadata["client.v1"][0] != 2 {
+		t.Fatalf("pending conversion=%+v", gotPending)
+	}
+
+	clear := storage.ClearPendingUnlinkCommand{Action: action, Generation: []byte{3}, Uses: pending.Uses}
+	wireClear := clearPendingUnlinkCommandOf(clear)
+	clear.Generation[0] = 9
+	if wireClear.Generation[0] != 3 {
+		t.Fatalf("clear wire aliases source: %+v", wireClear)
+	}
+	gotClear := wireClear.storage()
+	wireClear.Generation[0] = 8
+	if gotClear.Action != action || len(gotClear.Generation) != 1 || gotClear.Generation[0] != 3 {
+		t.Fatalf("clear conversion=%+v", gotClear)
+	}
+}
+
+func TestPartialFileResponseValidatesPendingStateAndRejectsUnrelatedFields(t *testing.T) {
+	state := referenceStateOf(storage.ReferenceState{
+		Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular}, PendingUnlink: true, PendingGeneration: []byte{1},
+	})
+	request := fileRequest{Op: storage.OpFileSetPendingUnlink}
+	response := fileResponse{Epoch: 1, Data: []byte{}, State: state}
+	if err := validatePartialFileResponse(request, response); err != nil {
+		t.Fatal(err)
+	}
+	for name, state := range map[string]*referenceState{
+		"missing attributes": {PendingUnlink: true, PendingGeneration: metadataVersion{1}},
+		"detached pending":   referenceStateOf(storage.ReferenceState{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular}, Detached: true, PendingUnlink: true, PendingGeneration: []byte{1}}),
+		"missing generation": referenceStateOf(storage.ReferenceState{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular}, PendingUnlink: true}),
+		"unexpected generation": referenceStateOf(storage.ReferenceState{
+			Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular}, PendingGeneration: []byte{1},
+		}),
+		"invalid link target": referenceStateOf(storage.ReferenceState{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular}, LinkTarget: []byte("target")}),
+		"missing symlink target": referenceStateOf(storage.ReferenceState{
+			Attr: storage.Attr{ID: 7, Kind: storage.NodeSymlink, Size: 1},
+		}),
+		"symlink size mismatch": referenceStateOf(storage.ReferenceState{
+			Attr: storage.Attr{ID: 7, Kind: storage.NodeSymlink, Size: 2}, LinkTarget: []byte("x"),
+		}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validatePartialFileResponse(request, fileResponse{Epoch: 1, Data: []byte{}, State: state}); err == nil {
+				t.Fatalf("accepted invalid partial state: %+v", state)
+			}
+		})
+	}
+	response.Owner = 1
+	if err := validatePartialFileResponse(request, response); err == nil {
+		t.Fatal("accepted an unrelated owner in a partial pending-unlink result")
+	}
+	if err := validatePartialFileResponse(fileRequest{Op: storage.OpFileStatus}, fileResponse{Epoch: 1, Data: []byte{}}); err == nil {
+		t.Fatal("accepted a partial result for an operation without partial-result semantics")
 	}
 }
 

@@ -321,7 +321,7 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			return errors.New("name response carries no required attributes")
 		}
 	case storage.OpFileState, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
-		if r.State == nil || r.State.Attr == nil {
+		if r.State == nil {
 			return errors.New("reference state is incomplete")
 		}
 	case storage.OpFileScope:
@@ -369,17 +369,8 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		}
 	}
 	if r.State != nil {
-		if err := r.State.Attr.check(); err != nil {
+		if err := validateReferenceState(r.State); err != nil {
 			return err
-		}
-		if r.State.Detached && r.State.PendingUnlink {
-			return errors.New("detached reference cannot remain pending unlink")
-		}
-		if r.State.PendingUnlink != (len(r.State.PendingGeneration) != 0) || len(r.State.PendingGeneration) > storage.MaxObservationTokenBytes {
-			return errors.New("reference state carries inconsistent pending generation")
-		}
-		if r.State.Attr.Kind != storage.NodeSymlink && len(r.State.LinkTarget) != 0 || len(r.State.LinkTarget) > storage.MaxLinkTargetBytes {
-			return errors.New("reference state carries an invalid link target")
 		}
 	}
 	if r.Metadata != nil {
@@ -447,8 +438,8 @@ func validatePartialFileResponse(req fileRequest, response fileResponse) error {
 	case storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
 		expected.State = response.State
 		expected.Barrier = response.Barrier
-		if response.State != nil && response.State.Attr != nil {
-			if err := response.State.Attr.check(); err != nil {
+		if response.State != nil {
+			if err := validateReferenceState(response.State); err != nil {
 				return err
 			}
 		}
@@ -457,6 +448,27 @@ func validatePartialFileResponse(req fileRequest, response fileResponse) error {
 	}
 	if !reflect.DeepEqual(response, expected) {
 		return errors.New("partial file result carries unrelated fields")
+	}
+	return nil
+}
+
+func validateReferenceState(state *referenceState) error {
+	if state.Attr == nil {
+		return errors.New("reference state is incomplete")
+	}
+	if err := state.Attr.check(); err != nil {
+		return err
+	}
+	if state.Detached && state.PendingUnlink {
+		return errors.New("detached reference cannot remain pending unlink")
+	}
+	if state.PendingUnlink != (len(state.PendingGeneration) != 0) || len(state.PendingGeneration) > storage.MaxObservationTokenBytes {
+		return errors.New("reference state carries inconsistent pending generation")
+	}
+	if len(state.LinkTarget) > storage.MaxLinkTargetBytes ||
+		state.Attr.Kind == storage.NodeSymlink && (len(state.LinkTarget) == 0 || int64(len(state.LinkTarget)) != state.Attr.Size) ||
+		state.Attr.Kind != storage.NodeSymlink && len(state.LinkTarget) != 0 {
+		return errors.New("reference state carries an invalid link target")
 	}
 	return nil
 }
