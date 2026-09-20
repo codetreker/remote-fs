@@ -104,6 +104,14 @@ func validateFileRequest(r fileRequest) error {
 		expected.NodeRef = r.NodeRef
 	case storage.OpFileLookupAt:
 		expected.Child = r.Child
+	case storage.OpFileReadDirNode:
+		expected.Directory = r.Directory
+	case storage.OpFileObserveDirectoryMetadata:
+		expected.Directory = r.Directory
+		expected.DirectoryMetadata = r.DirectoryMetadata
+	case storage.OpFileObserveName:
+		reference = true
+		expected.Guards = r.Guards
 	case storage.OpFileMutateName:
 		expected.Name = r.Name
 	case storage.OpFileSetNodeMetadata:
@@ -183,6 +191,14 @@ func validateFileRequest(r fileRequest) error {
 		if r.Child == nil {
 			return errors.New("lookup carries no child")
 		}
+	case storage.OpFileReadDirNode:
+		if r.Directory == nil {
+			return errors.New("directory read carries no target")
+		}
+	case storage.OpFileObserveDirectoryMetadata:
+		if r.Directory == nil || r.DirectoryMetadata == nil {
+			return errors.New("directory metadata observation carries no target or options")
+		}
 	case storage.OpFileMutateName:
 		if r.Name == nil {
 			return errors.New("name operation carries no command")
@@ -246,6 +262,10 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			expected.Capabilities = r.Capabilities
 		case storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt:
 			expected.Attr = r.Attr
+		case storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata:
+			expected.Directory = r.Directory
+		case storage.OpFileObserveName:
+			expected.NameObservation = r.NameObservation
 		case storage.OpFileRead:
 			expected.Attr = r.Attr
 			expected.Data = r.Data
@@ -308,6 +328,15 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if !validFileCapability(r.File) || r.Capabilities == nil {
 			return errors.New("file open response carries no reference capability")
 		}
+		if r.Capabilities.ReferenceName != (r.Node != 0) {
+			return errors.New("file open identity does not match name observation capability")
+		}
+		if req.Op == storage.OpFileOpenNode && r.Capabilities.ReferenceName && r.Node != req.Node {
+			return errors.New("identity open substituted its target")
+		}
+		if req.Op == storage.OpFileOpen && r.Capabilities.ReferenceName && req.Open.ExpectedID != 0 && r.Node != req.Open.ExpectedID {
+			return errors.New("path open substituted its expected identity")
+		}
 	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
 		if !validFileCapability(r.File) || r.Attr == nil || r.Capabilities == nil || r.Outcome < storage.Opened || r.Outcome > storage.Replaced {
 			return errors.New("atomic open response is incomplete")
@@ -319,6 +348,37 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 	case storage.OpFileMutateName:
 		if req.Name == nil || nameResultNeedsAttr(req.Name.Kind) && r.Attr == nil {
 			return errors.New("name response carries no required attributes")
+		}
+	case storage.OpFileObserveName:
+		if r.NameObservation == nil {
+			return errors.New("reference name observation is absent")
+		}
+		if err := r.NameObservation.storage().Check(); err != nil {
+			return err
+		}
+	case storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata:
+		if r.Directory == nil || r.Directory.Entries == nil {
+			return errors.New("directory response carries no listing")
+		}
+		if err := r.Directory.check(); err != nil {
+			return err
+		}
+		observed := r.Directory.storage()
+		if req.Directory == nil || observed.Observation.ParentID != req.Directory.NodeID {
+			return errors.New("directory response substituted its target identity")
+		}
+		if req.Op == storage.OpFileObserveDirectoryMetadata {
+			options := req.DirectoryMetadata.storage()
+			metadata := storage.DirectoryMetadataObservation{Observation: observed.Observation}
+			if r.Directory.Name != nil {
+				name := r.Directory.Name.storage()
+				metadata.Name = &name
+			}
+			if err := metadata.Check(*req.Directory, options); err != nil {
+				return err
+			}
+		} else if r.Directory.Name != nil {
+			return errors.New("directory enumeration carries an unrequested name observation")
 		}
 	case storage.OpFileState, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
 		if r.State == nil {

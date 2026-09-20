@@ -80,6 +80,14 @@ func (s *partialNameSession) LookupAt(ctx context.Context, name storage.ChildNam
 	return s.FileSession.(storage.NamespaceAccess).LookupAt(ctx, name)
 }
 
+func (s *partialNameSession) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	return s.FileSession.(storage.NamespaceAccess).ReadDirNode(ctx, target)
+}
+
+func (s *partialNameSession) ReadDirNodeBounded(ctx context.Context, target storage.DirectoryTarget, result *storage.ListResult) (storage.DirectoryObservation, error) {
+	return s.FileSession.(storage.NamespaceAccess).ReadDirNodeBounded(ctx, target, result)
+}
+
 func (s *partialNameSession) MutateName(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
 	s.backend.calls.Add(1)
 	result, err := s.FileSession.(storage.NamespaceAccess).MutateName(ctx, command)

@@ -103,7 +103,11 @@ func (s *remoteFileSession) openCapability(ctx context.Context, req fileRequest)
 		cancel()
 		return nil, response, errors.Join(cleanupErr, unreachable(Request{Op: OpFile}, errors.New("retained reference response is incomplete")))
 	}
-	reference := &remoteFile{session: s, id: response.File, capabilities: *response.Capabilities}
+	node := response.Node
+	if response.Attr != nil {
+		node = response.Attr.ID
+	}
+	reference := &remoteFile{session: s, id: response.File, node: node, capabilities: *response.Capabilities}
 	_, ackErr := s.call(ctx, fileRequest{Op: storage.OpFileAck, File: response.File})
 	if ackErr != nil {
 		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)

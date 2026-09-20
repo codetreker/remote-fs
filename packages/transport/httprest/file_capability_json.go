@@ -47,6 +47,21 @@ func validateCapabilityArguments(req fileRequest) error {
 			return syscall.EINVAL
 		}
 		return req.Child.storage().Check()
+	case storage.OpFileReadDirNode:
+		if req.Directory == nil {
+			return syscall.EINVAL
+		}
+		return req.Directory.Check()
+	case storage.OpFileObserveDirectoryMetadata:
+		if req.Directory == nil || req.DirectoryMetadata == nil {
+			return syscall.EINVAL
+		}
+		if err := req.Directory.Check(); err != nil {
+			return err
+		}
+		return req.DirectoryMetadata.storage().Check()
+	case storage.OpFileObserveName:
+		return req.Guards.storage().Check()
 	case storage.OpFileMutateName:
 		if req.Name == nil {
 			return syscall.EINVAL
