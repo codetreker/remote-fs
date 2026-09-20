@@ -1395,7 +1395,7 @@ func TestEveryLookAtTheVolumeReachesIt(t *testing.T) {
 		act       func() error
 	}{
 		{"a stat", "Stat", func() error { _, err := os.Stat(path); return err }},
-		{"a listing", "List", func() error { _, err := os.ReadDir(mountpoint); return err }},
+		{"a listing", "ReadDirNode", func() error { _, err := os.ReadDir(mountpoint); return err }},
 		{"a read", "Read", func() error { _, err := os.ReadFile(path); return err }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -1599,6 +1599,51 @@ func (s *decoratedSession) LookupAt(ctx context.Context, name storage.ChildName)
 	}
 	s.paths.Store(attr.ID, path)
 	return s.hooks.describe(path, attr), nil
+}
+
+func (s *decoratedSession) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	path := s.pathFor(target.NodeID)
+	if err := s.hooks.check("ReadDirNode", path); err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	observed, err := s.NamespaceAccess.ReadDirNode(ctx, target)
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	for i := range observed.Entries {
+		entryPath := s.listedPath(path, observed.Entries[i].RawLeaf)
+		s.paths.Store(observed.Entries[i].Attr.ID, entryPath)
+		observed.Entries[i].Attr = s.hooks.describe(entryPath, observed.Entries[i].Attr)
+	}
+	return observed, nil
+}
+
+func (s *decoratedSession) ReadDirNodeBounded(ctx context.Context, target storage.DirectoryTarget, result *storage.ListResult) (storage.DirectoryObservation, error) {
+	path := s.pathFor(target.NodeID)
+	if err := s.hooks.check("ReadDirNode", path); err != nil {
+		return storage.DirectoryObservation{}, result.Fail(err)
+	}
+	observation, err := s.NamespaceAccess.ReadDirNodeBounded(ctx, target, result)
+	if err != nil {
+		return storage.DirectoryObservation{}, err
+	}
+	entries, err := result.Entries()
+	if err != nil {
+		return storage.DirectoryObservation{}, err
+	}
+	for i := range entries {
+		entryPath := s.listedPath(path, []byte(entries[i].Name))
+		s.paths.Store(entries[i].Attr.ID, entryPath)
+		entries[i].Attr = s.hooks.describe(entryPath, entries[i].Attr)
+	}
+	return observation, nil
+}
+
+func (s *decoratedSession) listedPath(parent string, leaf []byte) string {
+	if parent == "" {
+		return string(leaf)
+	}
+	return parent + "/" + string(leaf)
 }
 
 func (s *decoratedSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
@@ -1943,7 +1988,7 @@ func TestAnUnreachableVolumeIsNotFileNotFound(t *testing.T) {
 // The same for a directory listing: an empty listing reads as established fact, and
 // acting on it deletes things.
 func TestAnUnreachableVolumeIsNotAnEmptyDirectory(t *testing.T) {
-	mountpoint := mountFaulty(t, failing("List", unreachable), func(backing storage.Storage) {
+	mountpoint := mountFaulty(t, failing("ReadDirNode", unreachable), func(backing storage.Storage) {
 		if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 			t.Fatal(err)
 		}

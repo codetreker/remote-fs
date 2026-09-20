@@ -230,9 +230,9 @@ func TestSystemMode(t *testing.T) {
 	}
 }
 
-func TestMountOptionsDisableReadDirPlusWhileListingsRemainPathBased(t *testing.T) {
+func TestMountOptionsDisableReadDirPlus(t *testing.T) {
 	if options := kernelMountOptions(nil, false); !options.DisableReadDirPlus {
-		t.Fatal("READDIRPLUS enabled without identity-bound directory observations")
+		t.Fatal("READDIRPLUS is enabled")
 	}
 }
 

@@ -12,8 +12,8 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// directoryHandle retains the opened directory identity for lookup and descriptor
-// metadata. Enumeration remains path-based and does not inherit that identity guarantee.
+// directoryHandle retains the opened directory identity for lookup, enumeration,
+// and descriptor metadata.
 type directoryHandle struct {
 	node      *node
 	reference storage.NodeReference
@@ -22,6 +22,18 @@ type directoryHandle struct {
 	mu     sync.Mutex
 	stream fs.DirStream
 	closed bool
+}
+
+type capturedDirectory struct {
+	entries []capturedDirectoryEntry
+	present map[string]struct{}
+	before  uint64
+}
+
+type capturedDirectoryEntry struct {
+	name   string
+	mode   uint32
+	nodeID uint64
 }
 
 var (
@@ -92,38 +104,101 @@ func (d *directoryHandle) check() error {
 }
 
 func (d *directoryHandle) load(ctx context.Context) error {
-	if err := d.check(); err != nil {
+	if err := d.node.volume.check(); err != nil {
 		return err
 	}
 	d.mu.Lock()
-	loaded := d.stream != nil
-	d.mu.Unlock()
-	if loaded {
+	if d.closed {
+		d.mu.Unlock()
+		return syscall.EBADF
+	}
+	if d.stream != nil {
+		d.mu.Unlock()
 		return nil
 	}
-	attr, err := d.reference.Stat(ctx)
+	d.mu.Unlock()
+
+	captured, err := d.capture(ctx)
 	if err != nil {
 		return err
-	}
-	if err := d.node.checkAttr(attr); err != nil {
-		return err
-	}
-	stream, errno := d.node.Readdir(ctx)
-	if errno != 0 {
-		return errno
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
-		stream.Close()
 		return syscall.EBADF
 	}
-	if d.stream != nil {
-		stream.Close()
-	} else {
-		d.stream = stream
+	if d.stream == nil {
+		d.stream = captured.install(d.node.id)
 	}
 	return nil
+}
+
+func (d *directoryHandle) capture(ctx context.Context) (*capturedDirectory, error) {
+	access, err := d.node.volume.namespace()
+	if err != nil {
+		return nil, err
+	}
+	result, err := storage.NewListResult(storage.MaxDirectoryBytes, 0,
+		func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+			return storage.ObservedEntryBytes(nameBytes, metadataBytes)
+		})
+	if err != nil {
+		return nil, err
+	}
+	target := storage.DirectoryTarget{NodeID: d.node.id.node, Scope: &d.scope}
+	// Membership learned after this capture starts may describe a later authority
+	// state and must not be discarded merely because this capture does not contain it.
+	before := d.node.id.given()
+	observation, err := access.ReadDirNodeBounded(ctx, target, result)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := result.Entries()
+	if err != nil {
+		return nil, errors.Join(syscall.EIO, err)
+	}
+	observed := storage.ObservedDirectory{
+		Observation: observation,
+		Entries:     make([]storage.ObservedEntry, len(entries)),
+	}
+	for i, entry := range entries {
+		observed.Entries[i] = storage.ObservedEntry{RawLeaf: []byte(entry.Name), Attr: entry.Attr}
+	}
+	if observation.ParentID != target.NodeID {
+		return nil, syscall.EIO
+	}
+	if err := observed.Check(); err != nil {
+		return nil, errors.Join(syscall.EIO, err)
+	}
+
+	captured := &capturedDirectory{
+		entries: make([]capturedDirectoryEntry, len(observed.Entries)),
+		present: make(map[string]struct{}, len(observed.Entries)),
+		before:  before,
+	}
+	for i, entry := range observed.Entries {
+		mode, errno := attributeMode(entry.Attr)
+		if errno != 0 {
+			return nil, errno
+		}
+		name := string(entry.RawLeaf)
+		captured.entries[i] = capturedDirectoryEntry{name: name, mode: mode, nodeID: entry.Attr.ID}
+		captured.present[name] = struct{}{}
+	}
+	return captured, nil
+}
+
+func (c *capturedDirectory) install(parent *identity) fs.DirStream {
+	listing := make([]gofuse.DirEntry, len(c.entries))
+	for i, entry := range c.entries {
+		listing[i] = gofuse.DirEntry{
+			Name: entry.name,
+			Mode: entry.mode,
+			Ino:  parent.child(entry.name, entry.mode, entry.nodeID).ino,
+		}
+	}
+	parent.keepOnly(c.present, c.before)
+	return fs.NewListDirStream(listing)
 }
 
 func (d *directoryHandle) Readdirent(ctx context.Context) (*gofuse.DirEntry, syscall.Errno) {

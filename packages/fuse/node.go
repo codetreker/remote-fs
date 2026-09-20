@@ -35,7 +35,6 @@ var (
 	_ fs.NodeLookuper   = (*node)(nil)
 	_ fs.NodeGetattrer  = (*node)(nil)
 	_ fs.NodeSetattrer  = (*node)(nil)
-	_ fs.NodeReaddirer  = (*node)(nil)
 	_ fs.NodeOpener     = (*node)(nil)
 	_ fs.NodeCreater    = (*node)(nil)
 	_ fs.NodeMkdirer    = (*node)(nil)
@@ -46,8 +45,6 @@ var (
 	_ fs.NodeReadlinker = (*node)(nil)
 	_ fs.NodeStatfser   = (*node)(nil)
 )
-
-func (n *node) path() string { return n.Path(n.Root()) }
 
 func (n *node) childName(name string, scope *storage.UseScope) storage.ChildName {
 	return storage.ChildName{
@@ -259,39 +256,6 @@ func (n *node) resize(ctx context.Context, f fs.FileHandle, size int64) error {
 	h := newHandle(n, file, false, true)
 	err = h.resize(ctx, size)
 	return n.volume.closeUnreturnedFile(ctx, file, err, err == nil)
-}
-
-func (n *node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	if err := n.volume.check(); err != nil {
-		return nil, errnoOf(err)
-	}
-	// Read before the listing rather than after it, so that a name which appears while
-	// the listing is in flight is not one this listing goes on to call gone.
-	before := n.id.given()
-
-	entries, err := n.volume.storage.List(ctx, n.path())
-	if err != nil {
-		return nil, errnoOf(err)
-	}
-
-	listing := make([]gofuse.DirEntry, 0, len(entries))
-	present := make(map[string]struct{}, len(entries))
-	for _, e := range entries {
-		if e.Attr.ID == 0 || !e.Attr.IsDir() && e.Attr.Size < 0 {
-			return nil, syscall.EIO
-		}
-		mode, errno := attributeMode(e.Attr)
-		if errno != 0 {
-			return nil, errno
-		}
-		present[e.Name] = struct{}{}
-		// The number a listing reports has to be the number a stat of the same name
-		// reports, or programs that pair the two see two different files.
-		listing = append(listing, gofuse.DirEntry{Name: e.Name, Mode: mode, Ino: n.id.child(e.Name, mode, e.Attr.ID).ino})
-	}
-	n.id.keepOnly(present, before)
-
-	return fs.NewListDirStream(listing), 0
 }
 
 func fileOpenOptions(flags uint32) (storage.FileOpenOptions, syscall.Errno) {

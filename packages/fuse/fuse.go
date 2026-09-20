@@ -1,7 +1,7 @@
 // Package fuse presents a remote volume as a Linux filesystem. Named tree
-// operations use storage.Storage; open descriptors retain storage.File objects
-// through rename and unlink. Reads capture current contents, and writes complete
-// at the authority before the kernel receives success.
+// operations use identity-addressed file-session capabilities; open descriptors
+// retain storage references through rename and unlink. Reads capture current
+// contents, and writes complete at the authority before the kernel receives success.
 //
 // Direct I/O and zero metadata timeouts keep ordinary read and pread independent
 // of cached contents and lengths. Each mount renews a bounded file session and
