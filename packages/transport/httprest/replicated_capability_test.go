@@ -72,6 +72,17 @@ func TestReplicatedClientRetainsHTTPFileCapabilities(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	metadata, ok := file.(storage.ReferenceMetadataAccess)
+	if !ok {
+		t.Fatal("replicated file does not expose metadata access")
+	}
+	if err := metadata.CheckMetadataAccess(); err != nil {
+		t.Fatal(err)
+	}
+	value, err := metadata.SetMetadata(t.Context(), "client.reference", nil, []byte("value"))
+	if err != nil || len(value.Version) == 0 || string(value.Data) != "value" {
+		t.Fatalf("reference metadata = %+v, %v", value, err)
+	}
 	owners, ok := session.(storage.UseOwners)
 	if !ok {
 		t.Fatal("replicated session does not expose use owners")
