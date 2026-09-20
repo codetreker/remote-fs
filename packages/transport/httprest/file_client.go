@@ -44,6 +44,7 @@ type remoteFileSession struct {
 	closed       bool
 	closeAction  storage.LockRequestID
 	pending      map[string]pendingFileAction
+	inflight     int
 	pendingLimit int
 	capabilities fileCapabilities
 }
@@ -130,6 +131,12 @@ func (s *Storage) fileCall(ctx context.Context, req fileRequest) (fileResponse, 
 	started := time.Now()
 	answer, err := s.callWithin(ctx, Request{Op: op}, body, fileResponseLimit(req, s.maxBodyBytes))
 	if err != nil {
+		var operation *operationError
+		if errors.As(err, &operation) && operation.attempt != nil {
+			attempt := operation.attempt.Clone()
+			attempt.HistoryRemaining = maxDuration(attempt.HistoryRemaining - time.Since(started))
+			operation.attempt = &attempt
+		}
 		return fileResponse{}, err
 	}
 	defer answer.release()
@@ -172,6 +179,12 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 	if int64(len(req.Path)) > s.storage.maxBodyBytes || int64(len(req.Data)) > s.storage.maxWriteBytes {
 		return fileResponse{}, syscall.EFBIG
 	}
+	if fileBoundedResult(req.Op) && req.ResultBytes == 0 {
+		req.ResultBytes = s.storage.maxBodyBytes
+		if outer, ok := storage.AttrResultByteLimit(ctx); ok {
+			req.ResultBytes = min(req.ResultBytes, outer)
+		}
+	}
 	frozen, err := freezeFileRequest(req)
 	if err != nil {
 		return fileResponse{}, unreachable(Request{Op: OpFile}, err)
@@ -191,12 +204,13 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 		s.mu.Unlock()
 		return fileResponse{}, syscall.ESTALE
 	}
+	reserved := false
 	if fileActionRequired(req.Op) && req.Action == "" {
 		limit := s.pendingLimit
 		if limit <= 0 {
 			limit = storage.DefaultFileSessionOptions().MaxLockActions
 		}
-		if len(s.pending) >= limit {
+		if len(s.pending)+s.inflight >= limit {
 			s.mu.Unlock()
 			return fileResponse{}, syscall.EAGAIN
 		}
@@ -205,8 +219,17 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 			s.mu.Unlock()
 			return fileResponse{}, err
 		}
+		s.inflight++
+		reserved = true
 	}
 	s.mu.Unlock()
+	if reserved {
+		defer func() {
+			s.mu.Lock()
+			s.inflight--
+			s.mu.Unlock()
+		}()
+	}
 	req.Session = s.id
 	response, err := s.storage.fileCall(ctx, req)
 	if err == nil && response.Retry {
@@ -228,6 +251,8 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 		cancel()
 		if recoveryErr == nil && !recovered.Retry {
 			response, err = recovered, nil
+		} else if recordedFileOutcome(recoveryErr) {
+			err = recoveryErr
 		} else if req.Action != "" {
 			s.mu.Lock()
 			if s.pending == nil {
@@ -252,6 +277,11 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 		s.mu.Unlock()
 	}
 	return response, err
+}
+
+func recordedFileOutcome(err error) bool {
+	var operation *operationError
+	return errors.As(err, &operation) && operation.recorded
 }
 
 func freezeFileRequest(req fileRequest) (fileRequest, error) {
@@ -335,8 +365,7 @@ func (s *remoteFileSession) reconcilePending(ctx context.Context, incoming fileR
 		response, err := s.storage.fileCall(recovery, pending.request)
 		cancel()
 		if err != nil {
-			var operation *operationError
-			if errors.As(err, &operation) && operation.recorded {
+			if recordedFileOutcome(err) {
 				s.mu.Lock()
 				if matches {
 					delete(s.pending, key)

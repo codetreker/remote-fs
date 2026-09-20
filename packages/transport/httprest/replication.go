@@ -112,7 +112,7 @@ func NodeOf(n metastore.Node) *Node {
 		Size:       n.Size,
 		AccessTime: TimeOf(n.AccessTime),
 		ModTime:    TimeOf(n.ModTime),
-		Content:    []byte(n.Content),
+		Content:    append([]byte{}, n.Content...),
 	}
 }
 
@@ -198,9 +198,9 @@ func changeShapeOf(c metastore.Change) (*Change, error) {
 	if !known {
 		return nil, fmt.Errorf("the change at position %d is of kind %d, which this protocol cannot name", c.Position, c.Kind)
 	}
-	wire := &Change{Position: int64(c.Position), Kind: name, Parent: c.Parent, Name: c.Name}
+	wire := &Change{Position: int64(c.Position), Kind: name, Parent: c.Parent, Name: append([]byte{}, c.Name...)}
 	if c.From != nil {
-		wire.From = &Location{Parent: c.From.Parent, Name: c.From.Name}
+		wire.From = &Location{Parent: c.From.Parent, Name: append([]byte{}, c.From.Name...)}
 	}
 	if c.Node != nil {
 		wire.Node = NodeOf(*c.Node)
@@ -220,7 +220,7 @@ func changeShapeOf(c metastore.Change) (*Change, error) {
 func (c *Change) UnmarshalJSON(data []byte) error {
 	type change Change
 	var decoded change
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	got := Change(decoded)
@@ -294,7 +294,7 @@ type Row struct {
 
 // RowOf renders r for the wire.
 func RowOf(r metastore.Row) Row {
-	return Row{Parent: r.Parent, Name: r.Name, Node: NodeOf(r.Node)}
+	return Row{Parent: r.Parent, Name: append([]byte{}, r.Name...), Node: NodeOf(r.Node)}
 }
 
 // UnmarshalJSON decodes a row and refuses one that carries no node, which would otherwise
@@ -302,7 +302,7 @@ func RowOf(r metastore.Row) Row {
 func (r *Row) UnmarshalJSON(data []byte) error {
 	type row Row
 	var decoded row
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	if decoded.Node == nil {
@@ -408,7 +408,7 @@ type StreamStart struct {
 func (s *StreamStart) UnmarshalJSON(data []byte) error {
 	type start StreamStart
 	var decoded start
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	got := StreamStart(decoded)
@@ -462,7 +462,7 @@ type SnapshotOpen struct {
 func (o *SnapshotOpen) UnmarshalJSON(data []byte) error {
 	type open SnapshotOpen
 	var decoded open
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	if decoded.Position == nil {
@@ -486,7 +486,7 @@ type SnapshotPage struct {
 func (p *SnapshotPage) UnmarshalJSON(data []byte) error {
 	type page SnapshotPage
 	var decoded page
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	if len(decoded.Rows) == 0 {

@@ -320,6 +320,21 @@ func validateFileAttempt(req fileRequest, a storage.RangeAttempt) error {
 	if a.HistoryRemaining < 0 {
 		return errors.New("range history lifetime is negative")
 	}
+	if a.State == storage.Rejected {
+		if a.FailedAt != nil {
+			if *a.FailedAt < 0 || *a.FailedAt >= len(a.Commands) {
+				return errors.New("range result has an invalid failing command position")
+			}
+		} else {
+			switch a.Rejection {
+			case storage.RangeExhausted, storage.RangeTooLarge:
+			default:
+				return errors.New("range rejection omits its failing command position")
+			}
+		}
+	} else if a.FailedAt != nil {
+		return errors.New("range result has an invalid failing command position")
+	}
 	acquires, waits := false, false
 	for _, command := range a.Commands {
 		acquires = acquires || command.Edit == storage.Replace || command.Edit == storage.AddExact

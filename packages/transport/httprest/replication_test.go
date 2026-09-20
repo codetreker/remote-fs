@@ -1321,6 +1321,34 @@ func decodesInto(t *testing.T, fields map[string]any, into any) error {
 	return json.Unmarshal(encoded, into)
 }
 
+func TestReplicationFramesRejectAmbiguousJSONAndNoncanonicalBytes(t *testing.T) {
+	node := `{"id":2,"kind":1,"size":3,"access_time":{"unix_sec":1,"nanos":0},"mod_time":{"unix_sec":2,"nanos":0},"content":"a2V5"}`
+	row := `{"parent":1,"name":"YQ==","node":` + node + `}`
+	for _, test := range []struct {
+		name string
+		body string
+		into func() any
+	}{
+		{"change duplicate", `{"position":1,"position":1,"kind":"removed","parent":1,"name":"YQ=="}`, func() any { return new(httprest.Change) }},
+		{"change unknown", `{"position":1,"kind":"removed","parent":1,"name":"YQ==","extra":0}`, func() any { return new(httprest.Change) }},
+		{"change noncanonical name", `{"position":1,"kind":"removed","parent":1,"name":"YR=="}`, func() any { return new(httprest.Change) }},
+		{"row duplicate", `{"parent":1,"parent":1,"name":"YQ==","node":` + node + `}`, func() any { return new(httprest.Row) }},
+		{"row unknown", `{"parent":1,"name":"YQ==","node":` + node + `,"extra":0}`, func() any { return new(httprest.Row) }},
+		{"row noncanonical name", `{"parent":1,"name":"YR==","node":` + node + `}`, func() any { return new(httprest.Row) }},
+		{"start duplicate", `{"incarnation":"run","position":0,"position":0,"tail":0}`, func() any { return new(httprest.StreamStart) }},
+		{"start unknown", `{"incarnation":"run","position":0,"tail":0,"extra":0}`, func() any { return new(httprest.StreamStart) }},
+		{"page duplicate", `{"rows":[` + row + `],"rows":[` + row + `]}`, func() any { return new(httprest.SnapshotPage) }},
+		{"page unknown", `{"rows":[` + row + `],"extra":0}`, func() any { return new(httprest.SnapshotPage) }},
+		{"page noncanonical nested bytes", `{"rows":[{"parent":1,"name":"YR==","node":` + node + `}]}`, func() any { return new(httprest.SnapshotPage) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := json.Unmarshal([]byte(test.body), test.into()); err == nil {
+				t.Fatalf("accepted %s", test.body)
+			}
+		})
+	}
+}
+
 // A change that does not say what happened must not be applied, because a replica applies
 // what arrives without asking anything back: there is no revalidation behind these messages
 // and no timeout that repairs one that was wrong. A creation that lost its node decodes into

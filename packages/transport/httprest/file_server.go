@@ -684,10 +684,13 @@ func (h *Handler) writeFileResponse(w http.ResponseWriter, status int, body any,
 		return
 	}
 	limit := min(h.maxBodyBytes, MaxFileControlBytes)
+	var encoded []byte
+	var err error
 	if failure, ok := body.(ErrorResponse); ok {
-		body = boundedErrorResponse(failure, limit)
+		encoded, err = marshalBoundedErrorResponse(failure, limit)
+	} else {
+		encoded, err = json.Marshal(body)
 	}
-	encoded, err := json.Marshal(body)
 	if err != nil || int64(len(encoded)) > limit {
 		status = http.StatusInternalServerError
 		encoded = []byte(`{"message":"file control response exceeds its protocol bound"}`)

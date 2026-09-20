@@ -2,13 +2,18 @@ package httprest
 
 import (
 	"errors"
+	"fmt"
+	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
+var pendingDeleteCapabilityError = fmt.Errorf("node pending unlink: %w", syscall.EBUSY)
+
 var capabilityErrors = map[string]error{
 	"use-conflict":       storage.ErrUseConflict,
 	"range-conflict":     storage.ErrRangeConflict,
+	"pending-delete":     pendingDeleteCapabilityError,
 	"condition-conflict": storage.ErrConditionConflict,
 	"invalid-scope":      storage.ErrInvalidScope,
 }
