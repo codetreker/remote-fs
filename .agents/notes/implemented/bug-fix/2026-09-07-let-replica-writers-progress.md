@@ -61,7 +61,7 @@ SQLite replica 先限制能进入读阶段的 SQL 查询数量，再用私有读
 
 持续读负载下，已经登记的写者等待的是受 reader pool 并发数约束的读阶段；其余 SQL 读取先在门外等名额。连续写负载下，已经等待阶段的一批读者在一次写操作结束时取得保留的执行机会。SQL 读取仍能并行，队列不能把一批有限查询扩展成全部在途调用。
 
-一秒可见性由正常运行的真实 HTTP/SSE 全负载验收判定；带 race instrumentation 的并发测试判定阶段交接、取消与死锁，不用其耗时替代生产延迟。原决定落地时，4096 文件和 128 个本地 Replica 列目录读者验证了写者不会饿死。当前同规模公开 List 负载到达 authority：128 个读者各完成一次 listing 后，测试专用 backend wrapper 在 HTTP admission 之后截住各自下一次 `ListBounded`，并在同一边界截住 authority Write。单次释放使这 129 项操作一起进入 SQLite 竞争；Write 返回后的恰好一秒内，副本 Stat 必须看到变更且 authority listing 必须继续完成。它不把 authority 读取吞吐解释成本地门的性能。夹具与命令见[测试策略](../../../../docs/testing.md#元数据副本的读写交接)。
+一秒可见性由正常运行的真实 HTTP/SSE 全负载验收判定；带 race instrumentation 的并发测试判定阶段交接、取消与死锁，不用其耗时替代生产延迟。原决定落地时，4096 文件和 128 个本地 Replica 列目录读者验证了写者不会饿死。当前同规模公开 List 负载到达 authority：测试专用 backend wrapper 在 HTTP admission 之后截住 128 个读者各自的首次 `ListBounded`，并在同一边界截住 authority Write。单次释放使这 129 项操作一起进入 SQLite 竞争；128 次首次 listing 最终都必须成功，Write 返回后的恰好一秒内，副本 Stat 必须看到变更且 authority listing 必须继续完成。它不把 authority 读取吞吐解释成本地门的性能。夹具与命令见[测试策略](../../../../docs/testing.md#元数据副本的读写交接)。
 
 代价是新读者可能等待一次写操作，后续写者可能等待一批读者；被唤醒但尚未获调度的预留读者也会延后下一项写入。
 
