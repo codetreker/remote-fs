@@ -128,6 +128,8 @@ storage 返回错误时，请求处理用 `storage.ErrnoNameOf` 取得 `422` 响
 | `Resubscribe` | 带着（化身，位置）回来：化身对不上、或者那个位置已经掉出保留窗口，答「必须重建」并说明是从哪个维度掉出去的；否则从那个位置之后接着推。 |
 | `Snapshot` | 一次一致性切割：所有行反映同一个瞬间，并带回那个瞬间的位置。分页送。 |
 
+HTTP replication 保持 v4 Node wire，不加入 DirectoryRevision。snapshot 与 change 只传既有节点事实；HTTP-backed SQLite replica 为缺失 token 的目录建立本地 opaque revision，并在 replay 名字变化时替换它。该 token 不越过 replica 边界，也不用于 NamespaceGuards；ReadDirNode、完整目录 metadata 与 reference current-name 通过独立 file operations 回到 authority。
+
 两点是这三个操作的形状所依赖的：
 
 **先订阅、后取快照。** 反过来不收敛 —— 扫描耗时乘以变更速率超过保留窗口，快照的位置就已经掉出窗口，于是从头再来，而重建代价正比于树的大小。订阅在前之后，保留窗口不在首次同步的关键路径上，它只伺候断线重连。

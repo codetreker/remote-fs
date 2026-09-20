@@ -78,7 +78,7 @@ File 与 NodeReference 的 `ReferenceNameObserver` 复用既有 session、引用
 
 `NamespaceGuards` 携带最多 256 个目录 revision、256 条确切 `(ParentID, RawLeaf, ChildID)` 边和可选 RootID，合计驻留最多 64 KiB。重复目录、重复 child、重复父／叶槽、cycle 或无法到达 RootID 的关系在访问 storage 前拒绝；每个 revision 最多 64 字节，叶名继续受 4096 字节上限约束。有效 guards 与目标 observation 在同一次读取中比较，不符返回 `ErrConditionConflict` 且无部分结果。guards 只进入 ObserveDirectoryMetadata 与 ObserveName；OpenAt、OpenChildRef、NameCommand、FileMutation 和 delete intent 不接受它们。
 
-通用契约允许一份目录捕获最多 65,536 个 entries，native retention charge 最多 8 MiB；SQLite 的 `MaxDirectoryEntries` 与 `MaxDirectoryBytes` 可配置为不超过硬上限的更紧值，零值选择默认硬上限。名字观察按固定状态与真实叶名长度收费。directory revision 随当前 Node、新 change、snapshot 与 replica 传播并计入 `metadata_used`。v8 迁移清空没有可信 revision 的旧 retained history，同时切换 log incarnation 并把窗口位置归零，使持有旧游标的 replica 明确 reseed。revision 不是通知游标或 change-log position，观察接口不建立 watcher，也不提供缓存恢复。
+通用契约允许一份目录捕获最多 65,536 个 entries，native retention charge 最多 8 MiB；SQLite 的 `MaxDirectoryEntries` 与 `MaxDirectoryBytes` 可配置为不超过硬上限的更紧值，零值选择默认硬上限。名字观察按固定状态与真实叶名长度收费。directory revision 随 authority 的当前 Node、新 change 与原生 snapshot 传播并计入 `metadata_used`。HTTP v4 replication 不传该字段；SQLite replica 为缺失 revision 的目录维护本地 opaque token，并在本地 replay 名字变化时替换它，观察 API 不返回这份非权威状态。v8 迁移清空没有可信 revision 的旧 retained history，同时切换 log incarnation 并把窗口位置归零，使持有旧游标的 replica 明确 reseed。revision 不是通知游标或 change-log position，观察接口不建立 watcher，也不提供缓存恢复。
 
 ### 文件动作与结果核对
 
@@ -170,7 +170,7 @@ OpenAt、OpenNodeRef 与 OpenChildRef response 携带 storage action 捕获的 n
 
 `HandlerOptions.Files` 默认在整个 registry 内允许 64 个会话，每个会话分别最多保留 16384 个数据动作与 16384 个清理动作，PendingAck 为 5 秒；可接纳的会话 options 受 handler 上限约束。`Handler.Close(ctx)` 停止 admission，退役并排空它创建的 registry；backend 仍归调用方。独立 server 先排空 HTTP 请求，再完成 handler 清理，最后关闭自己拥有的 backend；清理失败不释放 backend 所有权。
 
-replicated storage 转发原子打开、身份 namespace、identity-bound directory enumeration、DirectoryMetadataObserver、ReferenceNameObserver、NodeReference、FileActions、metadata、scope、pending deletion、条件 mutation、owner 和 range 能力。路径节点事实、opaque metadata 与 directory revision 进入 SQLite 副本；公开 Stat 可由副本回答，公开 List/ListBounded 及三项名字观察在确认副本健康后回源 authority。引用、Use claim、owner、range 与普通 action history 属于远端 authority/session；durable delete intent 属于远端持久 volume，二者都不写入客户端副本。产生名字或属性日志的成功修改返回权威 barrier，replica 等待同一 incarnation 的位置达到该值；detached 修改没有路径事件，barrier 仍可证明现有 volume 进度。
+replicated storage 转发原子打开、身份 namespace、identity-bound directory enumeration、DirectoryMetadataObserver、ReferenceNameObserver、NodeReference、FileActions、metadata、scope、pending deletion、条件 mutation、owner 和 range 能力。路径节点事实与 opaque metadata 进入 SQLite 副本；HTTP v4 Node wire 不携带 authority directory revision，副本只为自身树维护不可导出的本地 token。公开 Stat 可由副本回答，公开 List/ListBounded 及三项名字观察在确认副本健康后回源 authority，因此 guards 永远不与本地 token 比较。引用、Use claim、owner、range 与普通 action history 属于远端 authority/session；durable delete intent 属于远端持久 volume，二者都不写入客户端副本。产生名字或属性日志的成功修改返回权威 barrier，replica 等待同一 incarnation 的位置达到该值；detached 修改没有路径事件，barrier 仍可证明现有 volume 进度。
 
 volume 默认单文件上限 1 GiB，同时物化内容上限 2 GiB，最多 32 次 materialization、8 次状态竞争尝试，每次数据操作预算 30 秒。替换预留当前与下一份内容，读取预留完整对象与返回区间；不能只按 patch 的长度收费。单会话、transport body、backend 对象与配额可施加更紧的边界。有限预算在保留超限内容之前拒绝，已经持有的 reservation 在取消或已知失败清理后释放；未知发布或记账结果保留相应所有权并封锁。
 

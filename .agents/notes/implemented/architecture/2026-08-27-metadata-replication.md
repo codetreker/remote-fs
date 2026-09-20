@@ -311,7 +311,9 @@ type Storage struct {
 }
 ```
 
-路径 `Stat` 走本地；`List`、`ListBounded`、`Read`、`Write`、`Create`、`Mkdir`、`Remove`、`RemoveDir`、`Rename`、`SetAttr` 与 `Space` 走远端。公开目录读取仍先检查副本可用性，再由 authority 执行当前用途限制与完整枚举。副本保存 authority 给出的 NodeKind、共同时间、opaque metadata 与 directory revision，不生成未知 BirthTime/ChangeTime 或迁移前缺失的 revision，也不解释平台 namespace。FileStorage capability 传播到权威服务：FileSession.OpenNode、StatNode、SetNodeAttr、ReadDirNode、DirectoryMetadataObserver、metadata CAS、scope/range 与 File／NodeReference 的内容、属性和 current-name 操作都不按副本里的名字重新寻址，已经 detached 的对象不要求本地树仍有对应 entry。普通身份 I/O 与名字观察仍检查副本可用状态；续期、动作核对、取消和清理不依赖具名副本存在，失去观察不能阻止释放资源。
+路径 `Stat` 走本地；`List`、`ListBounded`、`Read`、`Write`、`Create`、`Mkdir`、`Remove`、`RemoveDir`、`Rename`、`SetAttr` 与 `Space` 走远端。公开目录读取仍先检查副本可用性，再由 authority 执行当前用途限制与完整枚举。副本保存 authority 给出的 NodeKind、共同时间与 opaque metadata，不生成未知 BirthTime/ChangeTime，也不解释平台 namespace。HTTP v4 replication 的 Node wire 不携带 DirectoryRevision；SQLite replica 接受该缺席，为本地目录生成 opaque token，并在 replay 名字变化时替换它。这份 token 只保护本地实现内部，不作为 authority guard 或 observation 返回。
+
+FileStorage capability 传播到权威服务：FileSession.OpenNode、StatNode、SetNodeAttr、ReadDirNode、DirectoryMetadataObserver、metadata CAS、scope/range 与 File／NodeReference 的内容、属性和 current-name 操作都不按副本里的名字重新寻址，已经 detached 的对象不要求本地树仍有对应 entry。ReadDirNode、完整目录 metadata 与 current-name 在检查副本可用状态后直接查询 remote authority，绝不返回本地 revision。普通身份 I/O 与名字观察仍检查副本可用状态；续期、动作核对、取消和清理不依赖具名副本存在，失去观察不能阻止释放资源。
 
 具名节点与 opaque metadata 修改沿用 mutation barrier，成功后确认本地可见性；detached 修改不生成具名树事件，不能等待一个永远不存在的节点事件。File、Use claim、owner 和 range 的退役、续期与连续性由当前 FileSession/authority 管理，不写入副本，也不从日志位置或 SSE 心跳推导；authority incarnation 改变后旧状态失效。
 

@@ -40,7 +40,9 @@ guards 只进入 ObserveDirectoryMetadata 与 ObserveName。OpenAt、OpenChildRe
 
 SQLite schema v8 为每个当前目录保存八字节、非零的 `directory_revision`；非目录必须保存空值。新目录从 1 开始，成功增加、移除或移动名字时在修改名字的同一事务中推进受影响父目录，跨目录 rename 分别推进两个父目录。失败、回滚和不改变名字集合的 no-op 不推进；达到可表示上限时修改以 `EOVERFLOW` 失败。
 
-revision 进入 Node、新产生的 retained change、snapshot、replica、启动完整性检查和每 volume 的 `metadata_used`。v8 迁移为每个现有目录建立初始 revision；迁移前 retained changes 没有可信 revision，因此迁移在同一事务中清空这些记录、为每个 log 生成新 incarnation，并把 committed、trimmed 与 age-trim position 归零。当前树、NodeID、高水位和内容保持，持有旧 incarnation／position 的 replica 必须 reseed。token 只证明一次捕获与后续 guard 是否相同，不表达顺序、通知位置或 change-log position。
+revision 进入 authority 的 Node、新产生的 retained change、原生 snapshot、启动完整性检查和每 volume 的 `metadata_used`。HTTP replication 继续使用 v4 Node wire，不传 DirectoryRevision；HTTP-backed SQLite replica 接受缺失 token，为本地树生成不可作为 authority 证据的 opaque revision，并在本地重放名字变化时使它失效。所有 replicated 的 ReadDirNode、ObserveDirectoryMetadata 与 ObserveName 都回源 authority，不暴露本地 token。
+
+v8 迁移为每个现有目录建立初始 revision；迁移前 retained changes 没有可信 revision，因此迁移在同一事务中清空这些记录、为每个 log 生成新 incarnation，并把 committed、trimmed 与 age-trim position 归零。当前树、NodeID、高水位和内容保持，持有旧 incarnation／position 的 replica 必须 reseed。token 只证明一次捕获与后续 guard 是否相同，不表达顺序、通知位置或 change-log position。
 
 ### 每一层在载入前接受预算
 

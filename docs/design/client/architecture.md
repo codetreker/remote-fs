@@ -10,7 +10,7 @@ volume 的使用者。持有一份 remote storage，把 volume 呈现为本地�
 |---|---|---|
 | **remote storage** `packages/transport/httprest` | 基础 storage 操作逐次转换为 HTTP 请求，不缓存内容。复制的订阅与快照使用独立长连接；`DialOptions` 限制 stream silence、body 与 admission，超时由调用方配置。 | R-INT-3、R-INT-5、R-INT-9 |
 | **显式锁控制** | HTTP client 实现锁 Service，调用方保留 Session / Owner 与原动作身份，以 `WithScope` 构造独立、不可变的修改 proof 集合。控制请求具有独立预算。 | R-CC-3、R-CC-6 至 R-CC-11、R-INT-3 |
-| **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：按路径 `Stat` 走本地 SQLite，公开 `List` / `ListBounded` 与身份目录／名字观察在确认副本健康后回源 authority，其余操作也走远端。副本由变更流喂着，并保存 directory revision。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
+| **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：按路径 `Stat` 走本地 SQLite，公开 `List` / `ListBounded` 与身份目录／名字观察在确认副本健康后回源 authority，其余操作也走远端。副本由 v4 变更流喂着，并为自己的目录树维护不可作为 authority 证据的本地 revision。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
 | **挂载呈现层** `packages/fuse` | 把一份 storage 呈现为本地目录。持有 FileSession、已打开目录的 NodeReference、普通 File、UseOwner 与内核 owner 的映射；以父 NodeID 执行子项操作，目录 handle 以 Scope 捕获一次完整 Readdir，文件以 direct I/O 逐次读写。仅 Linux。 | R-FS-1、R-FS-5、R-FS-6、R-FS-8、R-CON-1~3、R-ERR-1、R-ERR-2、R-CC-12、R-CC-13、R-WS-5、R-INT-3、R-INT-8 |
 | **生命周期** | 挂载的建立与拆除。 | R-WS-2 |
 
@@ -82,7 +82,7 @@ Strong 控制请求与响应固定至多 16 KiB；文件 metadata/range 控制�
 
 构建先保留原订阅，再逐页写入快照。客户端读到 snapshot 的语义 EOF 后，先关闭该 HTTP 响应释放连接，再调用 Checkpoint 取得新鲜的 `(incarnation, committed position)`。快照位置不得早于原订阅的 opening tail；checkpoint 不得早于快照，且其 incarnation 必须与原订阅一致。snapshot 只报告捕获位置；incarnation 一致性由 checkpoint 与原订阅核对。
 
-SQLite schema v8 为目录增加持久 revision 时，authority 原子清空无法携带该事实的旧 retained changes、切换 log incarnation 并把窗口位置归零。持有旧 incarnation／position 的 replica 不能续读这段已删除 history，沿既有 mismatch 分支重新取得包含当前 directory revision 的完整快照。
+SQLite schema v8 为目录增加持久 revision 时，authority 原子清空无法携带该事实的旧 retained changes、切换 log incarnation 并把窗口位置归零。持有旧 incarnation／position 的 replica 不能续读这段已删除 history，沿既有 mismatch 分支重新取得当前树。HTTP v4 snapshot 与 change 不携带 authority DirectoryRevision；SQLite replica 为 revisionless 输入生成本地 opaque token，并在 replay create、remove 或 rename 时替换相应父目录 token。
 
 本地 Seeding.Complete 成功后记录已安装的快照位置，唯一的 reader 随后沿原订阅丢弃已包含的事件、应用快照之后的事件，直到达到或超过固定 checkpoint。位置允许跳跃，不要求逐整数相邻；零位置且已达到目标时不等待一条不存在的事件。Complete 与每次 Apply 的成功位置都会在内部推进，即使副本仍以 EIO 拒绝查询；中途失败后的续订以已提交树的位置继续，而不是沿用更早的公开状态。最终追平前不清除失败状态。
 
@@ -230,7 +230,7 @@ volume 报出自己的容量，挂载呈现层把它换算成内核要的块数�
 
 同步写入不在离线时返回成功，不把未知失败重试为新写入。原生补丁实现可在已知未提交的 revision 竞争后有界重试；这与应用重做一个结果未知的修改不同。普通 fd 没有隐含的内容版本前置条件，显式版本工作流仍独立。
 
-目录子项 Lookup、mutation 与 Readdir 使用 NodeID 和可选 NodeReference Scope；reference current-name、完整有界 directory metadata observation 与持久 directory revision/guard 由[有界权威名字观察](../../../.agents/notes/implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)提供。guards 只约束这些只读观察，不进入名字 mutation 或当前路径遍历。目录 revision 也不是通知游标，挂载层不据此实现缓存失效或恢复。
+目录子项 Lookup、mutation 与 Readdir 使用 NodeID 和可选 NodeReference Scope；reference current-name、完整有界 directory metadata observation 与持久 authority directory revision/guard 由[有界权威名字观察](../../../.agents/notes/implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)提供。guards 只约束回源的只读观察，不与 SQLite replica 的本地 revision 比较，也不进入名字 mutation 或当前路径遍历。目录 revision 不是通知游标，挂载层不据此实现缓存失效或恢复。
 
 标准 advisory 通过中立 range 表达 flock 与传统 POSIX 范围锁，完整 `F_OFD_*` 和 mmap 行为不由此推出。enforced range 为其它平台保留，当前 Linux 不把它冒充 advisory。显式 S/X 仍单独取得，挂载不自动选择 Strong 策略。中立原语没有交付 SMB endpoint、Windows create/share/disposition 映射或 Windows cache 验收，不能据此宣称 Windows 支持完成。
 

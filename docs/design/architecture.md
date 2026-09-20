@@ -147,7 +147,7 @@ client 侧的 remote storage 实现 storage 接口，凡是不满足上述任何
 
 **内核查名字与修改子项到达 storage**：目录项、属性与负项超时都是 0。首次路径定位可由 client 的 SQLite 副本答复；FUSE 的子项 Lookup、打开、创建、删除与 rename 使用父 NodeID 到达 authority，已 Opendir 的目录 handle 还附带其 NodeReference Scope。Readdir 以该身份取得一次完整、有界的权威目录捕获；公开路径 List/ListBounded 继续在确认副本可用后回源。普通文件使用 direct I/O，每次读取返回服务端保留对象的当前状态。
 
-副本保存名字、NodeKind、共同时间、opaque metadata、directory revision 和大小，不复制文件内容。打开只取得对象引用，字节在每次 ReadAt 时读取。
+副本保存名字、NodeKind、共同时间、opaque metadata 和大小，不复制文件内容。HTTP v4 replication 不携带 authority DirectoryRevision；SQLite replica 为本地目录树维护不可导出的 opaque revision，并在 replay 名字变化时使相应 token 失效。所有公开目录／名字观察回源 authority。打开只取得对象引用，字节在每次 ReadAt 时读取。
 
 server 每个 volume 记一条有序的变更日志，位置与树的改动在同一个事务里分配；client 先订阅、再取一次一致性快照，此后由流喂着。副本在观测到流断开时整份作废，到达 replicated storage 的操作以 EIO 失败，没有过期时间或基于间隔的刷新。本地副本在读写阶段之间交接，持续查询不能让已登记的更新一直等待读者空闲；首次构建与重建在快照 EOF 后读取固定 checkpoint，并用原订阅回放到该位置才恢复作答，见 [client 设计](client/architecture.md#二路径起点来自副本子项操作到达权威)。
 
