@@ -383,10 +383,11 @@ func (r *remoteNodeReference) CheckConditionalFileMutation() error {
 	return r.file.CheckConditionalFileMutation()
 }
 func (r *remoteNodeReference) MutateFile(ctx context.Context, mutation storage.FileMutation) (storage.Attr, error) {
-	return r.file.MutateFile(ctx, mutation)
+	result, _, err := r.file.mutateFileWithBarrier(ctx, mutation, false)
+	return result, err
 }
 func (r *remoteNodeReference) MutateFileWithBarrier(ctx context.Context, mutation storage.FileMutation) (storage.Attr, *MutationBarrier, error) {
-	return r.file.MutateFileWithBarrier(ctx, mutation)
+	return r.file.mutateFileWithBarrier(ctx, mutation, false)
 }
 
 func (f *remoteFile) Scope(ctx context.Context) (storage.UseScope, error) {
@@ -472,11 +473,15 @@ func (f *remoteFile) ClearPendingUnlinkWithBarrier(ctx context.Context, command 
 }
 
 func (f *remoteFile) MutateFile(ctx context.Context, mutation storage.FileMutation) (storage.Attr, error) {
-	result, _, err := f.MutateFileWithBarrier(ctx, mutation)
+	result, _, err := f.mutateFileWithBarrier(ctx, mutation, true)
 	return result, err
 }
 
 func (f *remoteFile) MutateFileWithBarrier(ctx context.Context, mutation storage.FileMutation) (storage.Attr, *MutationBarrier, error) {
+	return f.mutateFileWithBarrier(ctx, mutation, true)
+}
+
+func (f *remoteFile) mutateFileWithBarrier(ctx context.Context, mutation storage.FileMutation, regular bool) (storage.Attr, *MutationBarrier, error) {
 	if err := f.CheckConditionalFileMutation(); err != nil {
 		return storage.Attr{}, nil, err
 	}
@@ -487,6 +492,9 @@ func (f *remoteFile) MutateFileWithBarrier(ctx context.Context, mutation storage
 	var result storage.Attr
 	if response.Attr != nil {
 		result = response.Attr.Storage()
+		if regular && result.Kind != storage.NodeRegular {
+			return storage.Attr{}, nil, unreachable(Request{Op: OpFile}, errors.New("file mutation returned nonregular attributes"))
+		}
 	}
 	return result, response.Barrier, err
 }

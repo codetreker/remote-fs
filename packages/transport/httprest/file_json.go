@@ -362,7 +362,7 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			return err
 		}
 		switch req.Op {
-		case storage.OpFileOpenAt, storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileMutate:
+		case storage.OpFileOpenAt, storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate:
 			if r.Attr.Kind != storage.NodeRegular {
 				return errors.New("file operation returned nonregular attributes")
 			}

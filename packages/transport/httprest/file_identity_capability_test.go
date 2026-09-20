@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -612,6 +613,24 @@ func TestNodeReferenceStatAndSetAttrAcceptDirectoryAndSymlinkAttributes(t *testi
 			if err != nil || observed.ID != test.attr.ID || observed.Kind != test.attr.Kind || !observed.ModTime.Equal(changed) {
 				t.Fatalf("setattr=%+v error=%v", observed, err)
 			}
+			reference := opened.Reference.(*remoteNodeReference)
+			namespace := "client." + test.name
+			changed = time.Unix(124, 457).UTC()
+			observed, err = reference.MutateFile(t.Context(), storage.FileMutation{
+				Action: newAction(), Kind: storage.MutateAttributes, Attr: storage.AttrChange{ModTime: &changed},
+				Metadata: map[string]storage.OpaquePayload{namespace: {Data: []byte("one")}},
+			})
+			if err != nil || observed.ID != test.attr.ID || observed.Kind != test.attr.Kind || !observed.ModTime.Equal(changed) || string(observed.Metadata[namespace].Data) != "one" {
+				t.Fatalf("mutate=%+v error=%v", observed, err)
+			}
+			changed = time.Unix(125, 458).UTC()
+			observed, _, err = reference.MutateFileWithBarrier(t.Context(), storage.FileMutation{
+				Action: newAction(), Kind: storage.MutateAttributes, Attr: storage.AttrChange{ModTime: &changed},
+				Metadata: map[string]storage.OpaquePayload{namespace: {Version: observed.Metadata[namespace].Version, Data: []byte("two")}},
+			})
+			if err != nil || observed.ID != test.attr.ID || observed.Kind != test.attr.Kind || !observed.ModTime.Equal(changed) || string(observed.Metadata[namespace].Data) != "two" {
+				t.Fatalf("mutate with barrier=%+v error=%v", observed, err)
+			}
 		})
 	}
 }
@@ -690,6 +709,10 @@ func TestNodeReferenceCapabilityMethodsRoundTrip(t *testing.T) {
 	if !errors.Is(err, syscall.EBADF) || mutated.ID != 0 {
 		t.Fatalf("mutate with barrier=%+v error=%v", mutated, err)
 	}
+	mutated, _, err = reference.file.MutateFileWithBarrier(t.Context(), storage.FileMutation{Action: newAction(), Kind: storage.MutateWriteAt, Offset: 1, Data: []byte("b"), ExpectedSize: &expectedSize})
+	if !errors.Is(err, syscall.EBADF) || mutated.ID != 0 {
+		t.Fatalf("file mutate with barrier=%+v error=%v", mutated, err)
+	}
 	pending, err := reference.SetPendingUnlink(t.Context(), storage.PendingUnlinkCommand{Action: newAction(), Condition: storage.UnlinkFile})
 	if err != nil || !pending.PendingUnlink {
 		t.Fatalf("set pending=%+v error=%v", pending, err)
@@ -711,6 +734,67 @@ func TestNodeReferenceCapabilityMethodsRoundTrip(t *testing.T) {
 	}
 	if _, err := reference.CloseWithBarrier(t.Context()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestByteFileConditionalMutationRejectsNonregularAttributes(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		kind       storage.NodeKind
+		partial    bool
+		wantResult bool
+	}{
+		{name: "successful directory result", kind: storage.NodeDirectory},
+		{name: "partial directory result", kind: storage.NodeDirectory, partial: true},
+		{name: "partial regular result", kind: storage.NodeRegular, partial: true, wantResult: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := fileResponse{Epoch: 1, Data: []byte{}, Attr: AttrOf(storage.Attr{ID: 7, Kind: test.kind})}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				var body []byte
+				var err error
+				status := http.StatusOK
+				if test.partial {
+					recorded := true
+					body, err = json.Marshal(ErrorResponse{Errno: "EIO", Message: "partial mutation", FileRecorded: &recorded, FileResult: &result})
+					status = StatusStorageError
+				} else {
+					body, err = json.Marshal(result)
+				}
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				w.Header().Set(HeaderProtocol, Version)
+				w.Header().Set("Content-Type", contentJSON)
+				w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+				w.WriteHeader(status)
+				_, _ = w.Write(body)
+			}))
+			defer server.Close()
+			client, err := Dial(server.URL, server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			session := &remoteFileSession{storage: client, id: strings.Repeat("a", 64), epoch: 1, pendingLimit: 4}
+			file := &remoteFile{session: session, id: strings.Repeat("b", 64), capabilities: fileCapabilities{Conditional: true}}
+			action, err := storage.NewFileActionID(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			observed, _, err := file.MutateFileWithBarrier(t.Context(), storage.FileMutation{Action: action, Kind: storage.MutateAttributes})
+			var operation *operationError
+			if storage.ErrnoOf(err) != syscall.EIO || !errors.As(err, &operation) {
+				t.Fatalf("mutation result=%+v error=%v", observed, err)
+			}
+			if test.wantResult {
+				if observed.ID != 7 || !operation.recorded {
+					t.Fatalf("regular partial result=%+v error=%+v", observed, operation)
+				}
+			} else if observed.ID != 0 || !operation.unknown || operation.recorded {
+				t.Fatalf("nonregular result=%+v error=%+v", observed, operation)
+			}
+		})
 	}
 }
 
