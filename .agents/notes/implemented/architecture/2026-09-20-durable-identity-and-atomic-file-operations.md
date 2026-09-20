@@ -16,7 +16,7 @@ Status: implemented
 
 `NamespaceAccess.LookupAt` 查询一个子项，`MutateName` 原子执行创建、建目录、建符号链接、删除、删空目录与改名。`ChildCondition` 统一表达 Any、Absent 或 SameNode，并可对 SameNode 携带多个 metadata namespace 的版本／缺席条件。空 token 表示 namespace 必须缺席，非空 token 逐字节比较。rename 的源槽和目标槽分别检查，最终事务拒绝第三个占据输出名字的对象。
 
-这些操作不提供目录 revision、整目录 snapshot 或当前名字观察。完整有界目录 metadata 与 reference current-name 属于独立能力。
+这些操作本身不承担目录 revision、整目录 snapshot 或当前名字观察；[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)以独立只读能力接续这些结果，不改变 mutation 的原子边界。
 
 ### 打开、引用与条件效果属于一个权威结果
 
@@ -44,11 +44,11 @@ Status: implemented
 
 ### schema v7 与组合边界
 
-SQLite migration 7 为节点和 change 增加符号链接目标与 pending generation，并持久保存 delete intents、原对象／名字关联、请求摘要、状态和失败分类。link target 与 metadata 共用每 volume 的持久 metadata budget。迁移保留 NodeID、高水位、内容、名字、用量和日志事实，继续经过 Commit 与 witness Accept。
+SQLite migration 7 为节点和 change 增加符号链接目标与 pending generation，并持久保存 delete intents、原对象／名字关联、请求摘要、状态和失败分类。link target 与 metadata 共用每 volume 的持久 metadata budget；[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)加入的 directory revision 也进入同一计数。迁移保留 NodeID、高水位、内容、名字、用量和日志事实，继续经过 Commit 与 witness Accept。
 
 `metastore/sqlite` 持有身份解析、条件比较、名字事务、pending 状态与恢复扫描；`storage/objectstore` 持有内容 staging、引用 drain 和条件内容重建；limited、locked、replicated 与 HTTP 包装器逐层转发能力、action、scope、部分打开结果和清理所有权。恢复 orphan/pending cleanup 时，`PublicationAccountingChain` 只复制不可变配额 hook；新 cleanup context 保留自己的 deadline/cancel cause，不暴露原请求的授权、scope、proof 或其它值。`MaintenanceAccounting` 在恢复前绑定当前完整计费链。HTTP v4 使用原 file session registry 与 action epoch，不另建只属于 transport 的正确性来源。
 
-FUSE 的已有 inode Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 Readlink 使用 OpenNodeRef；Lookup 与 create/mkdir/symlink/unlink/rmdir/rename 使用父目录 NodeID 到达 authority，只有已打开 directory handle 的 Lookup 再附带活 Scope。OpenChildRef 保留给需要原子取得任意子节点引用的编程入口。普通文件 fd 继续持有 File；Readdir 暂时仍使用既有公开 List 路径，不被描述为 identity-bound directory observation。组合 Setattr 仍由多个调用组成，ConditionalFileMutation 没有被 FUSE 冒充为整项事务。
+FUSE 的已有 inode Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 Readlink 使用 OpenNodeRef；Lookup 与 create/mkdir/symlink/unlink/rmdir/rename 使用父目录 NodeID 到达 authority，只有已打开 directory handle 的 Lookup 再附带活 Scope。OpenChildRef 保留给需要原子取得任意子节点引用的编程入口。普通文件 fd 继续持有 File；Readdir 由独立的[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)使用已打开目录的身份与 Scope。组合 Setattr 仍由多个调用组成，ConditionalFileMutation 没有被 FUSE 冒充为整项事务。
 
 ## 备选方案
 
@@ -66,4 +66,4 @@ FUSE 的已有 inode Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 R
 
 本决定部分取代[文件目标、显式内容依据与目录父身份](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)中的目录父身份部分。该提案关于 R-CC-1 调用方显式内容版本依据的部分仍是 proposed；这里的 metadata/size 条件和内部 content revision 都不宣称完成那项工作流。
 
-目录 metadata observation、reference current-name、目录 revision/guard、SMB endpoint 与 Windows 请求映射均未由本决定交付。系统不因此宣称 Windows 支持已经完成。
+[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)另行交付目录 metadata observation、reference current-name 和只读 guard；这些能力不进入本决定的 mutation 输入。guarded mutation、SMB endpoint 与 Windows 请求映射仍未交付，系统不因此宣称 Windows 支持已经完成。

@@ -2,7 +2,7 @@
 
 Status: proposed
 
-[持久节点身份与原子文件操作](../../implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)已经交付本提案依赖的 NodeReference、父身份名字操作、条件 mutation、action receipt 与 durable delete intent。完整目录 metadata/current-name observation、SMB endpoint 与 Windows 映射、共享语义翻译、通知和原生验收仍属于本提案。
+[持久节点身份与原子文件操作](../../implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)已经交付本提案依赖的 NodeReference、父身份名字操作、条件 mutation、action receipt 与 durable delete intent；[有界权威名字观察](../../implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)已经交付完整目录 metadata、directory revision 和 reference current-name。guarded mutation、SMB endpoint 与 Windows 映射、共享语义翻译、通知、缓存恢复和原生验收仍属于本提案。
 
 ## 问题
 

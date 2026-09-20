@@ -46,11 +46,11 @@ UseClaim、UseOwner、range、等待和动作回执是当前 authority 的有界
 
 SQLite migration 6 在既有 schema 准备事务中把合法 v5 mode 转为 `NodeKind` 与 `posix.permissions.v1`，并为 nodes 和 retained changes 增加可选 BirthTime / ChangeTime 与 metadata。它保留 NodeID、内容、原始名字、用量和日志事实；旧时间保持未知。migration 1 至 5 不变，旧布局先完成 preflight，schema 提交后继续经过既有 `Commit` 与 witness `Accept`。
 
-每个 volume 的 `metadata_used` 同时计量当前节点、detached 节点和 retained change 中的规范 metadata。SQL triggers、启动完整性校验、复制写入、日志裁剪与物理删除维护同一计数；默认上限为 64 MiB，独立于内容 quota、单节点上限和 HTTP 驻留预算。缺失 trigger、错误 storage class、畸形 envelope、计数不一致或超限均拒绝打开或写入，不能从仍可读取的字段拼出成功结果。
+每个 volume 的 `metadata_used` 同时计量当前节点、detached 节点和 retained change 中的规范 metadata；后续能力加入的 link target 与 directory revision 使用同一计数。SQL triggers、启动完整性校验、复制写入、日志裁剪与物理删除维护总量；默认上限为 64 MiB，独立于内容 quota、单节点上限和 HTTP 驻留预算。缺失 trigger、错误 storage class、畸形 envelope、计数不一致或超限均拒绝打开或写入，不能从仍可读取的字段拼出成功结果。
 
 HTTP v4 是不兼容的边界：基础属性从 POSIX mode 变为中立节点事实，文件锁 DTO 变为中立 owner/range，所有路由与 response marker 同时升级，v3 不作为兼容旁路。metadata CAS 请求使用独立 decoder，允许空 expected version，并继续要求 canonical base64；响应 `OpaquePayload` 必须携带非空 authority version。
 
-能力协商在 session 和引用结果里分别声明 AtomicOpen、NodeReference、Namespace、FileActions、State、Delete、Conditional、Metadata、Owners、Ranges 与 Scope。[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)已经实现前一组中立能力；DirectoryMetadata 与 ReferenceName 仍是已知预留位，v4 client 接受并忽略自己没有实现的 facet，任意未知字段继续失败。打开结果携带原 action 的 node/outcome，Close 与 FileSession.Close 可携带清理 barrier。
+能力协商在 session 和引用结果里分别声明 AtomicOpen、NodeReference、Namespace、FileActions、State、Delete、Conditional、Metadata、Owners、Ranges、Scope、DirectoryMetadata 与 ReferenceName。[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)和[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)实现这些中立能力；任意未知 facet 继续失败。打开结果携带原 action 的 node/outcome，Close 与 FileSession.Close 可携带清理 barrier。
 
 每项可选能力的 Check 检查完整包装链；缺少底层保证时，Check 和调用都以 `EOPNOTSUPP` 失败。limited、locked、objectstore、localstore、replicated 与 HTTP 包装器保留预算、原始错误、barrier、引用和清理所有权，不能用路径重开、本地 mutex 或默认值模拟能力。
 
@@ -72,4 +72,4 @@ HTTP v4 是不兼容的边界：基础属性从 POSIX mode 变为中立节点事
 
 本决定接续[Windows 系统网络驱动器](../../proposed/feature/2026-09-16-windows-network-drive-support.md)中的平台中立约束，并扩展[活跃文件句柄](2026-09-08-live-file-handles.md)、[显式文件占有](2026-09-07-file-locks.md)和[业务方授权](../feature/2026-09-10-host-provided-authorization.md)的当前实现；它不取代这些决定。
 
-原子 OpenAt、NodeReference、身份 namespace、pending deletion 与条件文件修改由[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)接续。当前名字、完整目录 metadata observation、SMB/Windows 适配仍未交付；Windows 属性 codec、`ARCHIVE` 与内容的同事务更新、共享模式映射和原生系统客户端验证也不由这些中立原语自动成立。
+原子 OpenAt、NodeReference、身份 namespace、pending deletion 与条件文件修改由[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)接续；当前名字和完整目录 metadata 由[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)接续。guarded mutation、SMB/Windows 适配、Windows 属性 codec、`ARCHIVE` 与内容的同事务更新、共享模式映射和原生系统客户端验证不由这些中立原语自动成立。
