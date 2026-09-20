@@ -110,6 +110,19 @@ type capabilityFileProbe struct {
 	state    storage.ReferenceState
 }
 
+func (p *capabilityFileProbe) Stat(ctx context.Context) (storage.Attr, error) {
+	p.observed = locking.ScopeFromContext(ctx)
+	return p.state.Attr, p.failure
+}
+func (p *capabilityFileProbe) SetAttr(ctx context.Context, _ storage.AttrChange) (storage.Attr, error) {
+	p.observed = locking.ScopeFromContext(ctx)
+	return p.state.Attr, p.failure
+}
+func (p *capabilityFileProbe) Close(ctx context.Context) error {
+	p.observed = locking.ScopeFromContext(ctx)
+	return p.failure
+}
+
 func (p *capabilityFileProbe) CheckScopedReference() error { return p.checkErr }
 func (p *capabilityFileProbe) Scope(ctx context.Context) (storage.UseScope, error) {
 	p.observed = locking.ScopeFromContext(ctx)
@@ -253,12 +266,25 @@ func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
 	proof := locking.MutationScope{Owner: locking.OwnerRef{Session: "session", Owner: "owner"}}
 	view := &Storage{scope: &proof}
 	session := &fileSession{FileSession: probe, storage: view}
+	for name, check := range map[string]func() error{
+		"atomic open": session.CheckAtomicFileOpen,
+		"namespace":   session.CheckNamespaceAccess,
+		"node refs":   session.CheckNodeReferences,
+		"actions":     session.CheckFileActions,
+	} {
+		if err := check(); err != nil {
+			t.Fatalf("%s check=%v", name, err)
+		}
+	}
 	opened, err := session.OpenAt(t.Context(), storage.ChildName{}, storage.OpenAtOptions{})
 	if !errors.Is(err, failure) || opened.File == nil || !reflect.DeepEqual(probe.observed, proof) {
 		t.Fatalf("atomic open=%+v error=%v scope=%+v", opened, err, probe.observed)
 	}
 	if _, err := session.LookupAt(locking.WithScope(t.Context(), proof), storage.ChildName{}); !errors.Is(err, failure) || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
 		t.Fatalf("lookup error=%v scope=%+v", err, probe.observed)
+	}
+	if result, err := session.MutateName(t.Context(), storage.NameCommand{}); !errors.Is(err, failure) || result.Attr == nil || result.Attr.ID != attr.ID || !reflect.DeepEqual(probe.observed, proof) {
+		t.Fatalf("name mutation=%+v error=%v scope=%+v", result, err, probe.observed)
 	}
 	result, err := session.OpenNodeRef(t.Context(), attr.ID, storage.NodeRefOptions{})
 	if !errors.Is(err, failure) || result.Reference == nil || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
@@ -271,8 +297,39 @@ func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
 	if state, err := result.Reference.State(t.Context()); !errors.Is(err, failure) || state.Attr.ID != attr.ID || !reflect.DeepEqual(reference.observed, locking.MutationScope{}) {
 		t.Fatalf("reference state=%+v error=%v scope=%+v", state, err, reference.observed)
 	}
+	if attr, err := result.Reference.Stat(locking.WithScope(t.Context(), proof)); !errors.Is(err, failure) || attr.ID != 3 || !reflect.DeepEqual(reference.observed, locking.MutationScope{}) {
+		t.Fatalf("reference stat=%+v error=%v scope=%+v", attr, err, reference.observed)
+	}
+	if attr, err := result.Reference.SetAttr(t.Context(), storage.AttrChange{}); !errors.Is(err, failure) || attr.ID != 3 || !reflect.DeepEqual(reference.observed, proof) {
+		t.Fatalf("reference setattr=%+v error=%v scope=%+v", attr, err, reference.observed)
+	}
+	scoped := result.Reference.(storage.ScopedReference)
+	if err := scoped.CheckScopedReference(); err != nil {
+		t.Fatal(err)
+	}
+	if scope, err := scoped.Scope(locking.WithScope(t.Context(), proof)); !errors.Is(err, failure) || scope.Token != "scope" || !reflect.DeepEqual(reference.observed, locking.MutationScope{}) {
+		t.Fatalf("reference scope=%+v error=%v scope context=%+v", scope, err, reference.observed)
+	}
+	stateAccess := result.Reference.(storage.ReferenceStateAccess)
+	if err := stateAccess.CheckReferenceState(); err != nil {
+		t.Fatal(err)
+	}
+	deleteIntent := result.Reference.(storage.DeleteIntent)
+	if err := deleteIntent.CheckDeleteIntent(); err != nil {
+		t.Fatal(err)
+	}
 	if state, err := result.Reference.(storage.DeleteIntent).SetPendingUnlink(t.Context(), storage.PendingUnlinkCommand{}); !errors.Is(err, failure) || state.Attr.ID != attr.ID || !reflect.DeepEqual(reference.observed, proof) {
 		t.Fatalf("pending state=%+v error=%v scope=%+v", state, err, reference.observed)
+	}
+	if state, err := deleteIntent.ClearPendingUnlink(t.Context(), storage.ClearPendingUnlinkCommand{}); !errors.Is(err, failure) || state.Attr.ID != attr.ID || !reflect.DeepEqual(reference.observed, proof) {
+		t.Fatalf("clear pending state=%+v error=%v scope=%+v", state, err, reference.observed)
+	}
+	conditional := result.Reference.(storage.ConditionalFileMutation)
+	if err := conditional.CheckConditionalFileMutation(); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := conditional.MutateFile(t.Context(), storage.FileMutation{}); !errors.Is(err, failure) || changed.ID != attr.ID || !reflect.DeepEqual(reference.observed, proof) {
+		t.Fatalf("conditional mutation=%+v error=%v scope=%+v", changed, err, reference.observed)
 	}
 	if receipt, err := session.QueryFileAction(locking.WithScope(t.Context(), proof), action); !errors.Is(err, failure) || receipt.Action != action || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
 		t.Fatalf("action receipt=%+v error=%v scope=%+v", receipt, err, probe.observed)
@@ -282,5 +339,8 @@ func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
 	}
 	if err := session.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: action, Intent: intent}); !errors.Is(err, failure) || !reflect.DeepEqual(probe.observed, proof) {
 		t.Fatalf("delete acknowledgement=%v scope=%+v", err, probe.observed)
+	}
+	if err := result.Reference.Close(locking.WithScope(t.Context(), proof)); !errors.Is(err, failure) || !reflect.DeepEqual(reference.observed, locking.MutationScope{}) {
+		t.Fatalf("reference close=%v scope=%+v", err, reference.observed)
 	}
 }

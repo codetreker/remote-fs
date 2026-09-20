@@ -85,6 +85,14 @@ type referenceProbe struct {
 	state    storage.ReferenceState
 }
 
+func (p *referenceProbe) Stat(context.Context) (storage.Attr, error) {
+	return p.state.Attr, p.callErr
+}
+func (p *referenceProbe) SetAttr(context.Context, storage.AttrChange) (storage.Attr, error) {
+	return p.state.Attr, p.callErr
+}
+func (p *referenceProbe) Close(context.Context) error { return p.callErr }
+
 func (p *referenceProbe) CheckScopedReference() error { return p.checkErr }
 func (p *referenceProbe) Scope(context.Context) (storage.UseScope, error) {
 	return storage.UseScope{Token: "scope"}, p.callErr
@@ -234,6 +242,16 @@ func TestIdentityCapabilityWrappersPreservePartialResultsAndReferences(t *testin
 		deleteStatus: storage.DeleteIntentStatus{ID: intent, NodeID: attr.ID, Outcome: storage.DeleteIntentPending},
 	}
 	wrapper := &fileSession{FileSession: probe, storage: &Storage{limit: MinLimit}}
+	for name, check := range map[string]func() error{
+		"atomic open": wrapper.CheckAtomicFileOpen,
+		"namespace":   wrapper.CheckNamespaceAccess,
+		"node refs":   wrapper.CheckNodeReferences,
+		"actions":     wrapper.CheckFileActions,
+	} {
+		if err := check(); err != nil {
+			t.Fatalf("%s check=%v", name, err)
+		}
+	}
 	opened, err := wrapper.OpenAt(t.Context(), storage.ChildName{}, storage.OpenAtOptions{})
 	if !errors.Is(err, failure) || opened.File == nil || opened.Attr.ID != attr.ID || opened.Outcome != storage.Created {
 		t.Fatalf("atomic open=%+v error=%v", opened, err)
@@ -244,6 +262,13 @@ func TestIdentityCapabilityWrappersPreservePartialResultsAndReferences(t *testin
 	}
 	if _, ok := reference.Reference.(*nodeReference); !ok {
 		t.Fatalf("node reference was not wrapped: %T", reference.Reference)
+	}
+	child, err := wrapper.OpenChildRef(t.Context(), storage.ChildName{}, storage.NodeRefOptions{})
+	if !errors.Is(err, failure) || child.Reference == nil || child.Attr.ID != attr.ID {
+		t.Fatalf("child reference=%+v error=%v", child, err)
+	}
+	if lookedUp, err := wrapper.LookupAt(t.Context(), storage.ChildName{}); !errors.Is(err, failure) || lookedUp.ID != attr.ID {
+		t.Fatalf("lookup=%+v error=%v", lookedUp, err)
 	}
 	result, err := wrapper.MutateName(t.Context(), storage.NameCommand{})
 	if !errors.Is(err, failure) || result.Attr == nil || result.Attr.ID != attr.ID {
@@ -263,11 +288,84 @@ func TestIdentityCapabilityWrappersPreservePartialResultsAndReferences(t *testin
 		t.Fatalf("reference state=%+v error=%v", state, err)
 	}
 	deleteRef := reference.Reference.(storage.DeleteIntent)
+	if err := deleteRef.CheckDeleteIntent(); err != nil {
+		t.Fatal(err)
+	}
 	if state, err := deleteRef.SetPendingUnlink(t.Context(), storage.PendingUnlinkCommand{}); !errors.Is(err, failure) || state.Attr.ID != attr.ID {
 		t.Fatalf("pending state=%+v error=%v", state, err)
 	}
+	if state, err := deleteRef.ClearPendingUnlink(t.Context(), storage.ClearPendingUnlinkCommand{}); !errors.Is(err, failure) || state.Attr.ID != attr.ID {
+		t.Fatalf("cleared state=%+v error=%v", state, err)
+	}
 	file := opened.File.(storage.ConditionalFileMutation)
+	if err := file.CheckConditionalFileMutation(); err != nil {
+		t.Fatal(err)
+	}
 	if mutated, err := file.MutateFile(t.Context(), storage.FileMutation{}); !errors.Is(err, failure) || mutated.ID != attr.ID {
 		t.Fatalf("conditional attr=%+v error=%v", mutated, err)
+	}
+	wrappedReference := reference.Reference
+	if changed, err := wrappedReference.SetAttr(t.Context(), storage.AttrChange{}); !errors.Is(err, failure) || changed.ID != attr.ID {
+		t.Fatalf("reference setattr=%+v error=%v", changed, err)
+	}
+	scoped := wrappedReference.(storage.ScopedReference)
+	if err := scoped.CheckScopedReference(); err != nil {
+		t.Fatal(err)
+	}
+	if scope, err := scoped.Scope(t.Context()); !errors.Is(err, failure) || scope.Token != "scope" {
+		t.Fatalf("reference scope=%+v error=%v", scope, err)
+	}
+	stateAccess := wrappedReference.(storage.ReferenceStateAccess)
+	if err := stateAccess.CheckReferenceState(); err != nil {
+		t.Fatal(err)
+	}
+	if err := wrappedReference.Close(t.Context()); !errors.Is(err, failure) {
+		t.Fatalf("reference close=%v", err)
+	}
+}
+
+type maintenanceProbe struct {
+	storage.BoundedStorage
+	initialized int64
+	outerCalls  int
+}
+
+func (*maintenanceProbe) CheckPublicationAccounting() error { return nil }
+func (*maintenanceProbe) CheckMaintenanceAccounting() error { return nil }
+func (p *maintenanceProbe) BindMaintenanceAccounting(ctx context.Context, chain storage.PublicationAccountingChain, initialize func(int64)) error {
+	initialize(7)
+	p.initialized = 7
+	settle, err := storage.PreparePublication(storage.WithPublicationAccountingChain(ctx, chain), 7, 5)
+	if err != nil {
+		return err
+	}
+	return settle(storage.PublicationApplied)
+}
+
+func TestMaintenanceAccountingComposesTheAllowanceHook(t *testing.T) {
+	probe := &maintenanceProbe{}
+	wrapper := &Storage{backing: probe, limit: MinLimit, count: 7}
+	if err := wrapper.CheckMaintenanceAccounting(); err != nil {
+		t.Fatal(err)
+	}
+	chain := (storage.PublicationAccountingChain{}).With(func(previous, next int64) (storage.PublicationSettlement, error) {
+		if previous != 7 || next != 5 {
+			t.Fatalf("outer accounting=%d -> %d", previous, next)
+		}
+		probe.outerCalls++
+		return func(storage.PublicationResult) error { return nil }, nil
+	})
+	initialized := int64(-1)
+	if err := wrapper.BindMaintenanceAccounting(t.Context(), chain, func(used int64) { initialized = used }); err != nil {
+		t.Fatal(err)
+	}
+	if initialized != probe.initialized || probe.outerCalls != 1 {
+		t.Fatalf("initialized=%d native=%d outer calls=%d", initialized, probe.initialized, probe.outerCalls)
+	}
+	wrapper.countMu.Lock()
+	count := wrapper.count
+	wrapper.countMu.Unlock()
+	if count != 5 {
+		t.Fatalf("limited maintenance count=%d, want 5", count)
 	}
 }
