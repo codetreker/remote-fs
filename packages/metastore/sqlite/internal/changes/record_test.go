@@ -3,7 +3,6 @@ package changes
 import (
 	"database/sql"
 	"errors"
-	"io/fs"
 	"os"
 	"reflect"
 	"strings"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/sqliteschema"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func logFixture(t *testing.T) (*sql.DB, *sql.Tx) {
@@ -40,9 +40,8 @@ func logFixture(t *testing.T) (*sql.DB, *sql.Tx) {
 		t.Fatal(err)
 	}
 	execLogSQL(t, tx, `INSERT INTO volumes(id,name,root,used) VALUES(1,'one',1,0),(2,'two',3,0)`)
-	execLogSQL(t, tx, `INSERT INTO nodes(id,volume,mode,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec)
-		VALUES(1,1,?,0,0,0,0,0),(2,1,420,0,0,0,0,0),(3,2,?,0,0,0,0,0),(4,2,420,0,0,0,0,0)`,
-		int64(fs.ModeDir|0755), int64(fs.ModeDir|0755))
+	execLogSQL(t, tx, `INSERT INTO nodes(id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec)
+		VALUES(1,1,2,0,0,0,0,0),(2,1,1,0,0,0,0,0),(3,2,2,0,0,0,0,0),(4,2,1,0,0,0,0,0)`)
 	execLogSQL(t, tx, `INSERT INTO entries(volume,parent,name,node) VALUES(1,1,x'66696c65',2),(2,3,x'66696c65',4)`)
 	execLogSQL(t, tx, `UPDATE database_state SET node_high_water=4`)
 	for _, volume := range []int64{1, 2} {
@@ -75,7 +74,7 @@ func execLogSQL(t *testing.T, tx *sql.Tx, query string, args ...any) {
 func fileChange(kind metastore.ChangeKind) metastore.Change {
 	change := metastore.Change{Kind: kind, Parent: 1, Name: []byte("file")}
 	if kind != metastore.Removed {
-		change.Node = &metastore.Node{ID: 2, Mode: 0644, Size: 4, Content: "body",
+		change.Node = &metastore.Node{ID: 2, Kind: storage.NodeRegular, Size: 4, Content: "body",
 			AccessTime: time.Unix(-100, 123).UTC(), ModTime: time.Unix(100, 456).UTC()}
 	}
 	if kind == metastore.Renamed {

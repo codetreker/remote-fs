@@ -3,7 +3,6 @@ package storage_test
 import (
 	"encoding/json"
 	"errors"
-	"io/fs"
 	"math"
 	"reflect"
 	"strings"
@@ -17,7 +16,8 @@ import (
 func TestFileOpenOptionsJSONPreservesSharedAccessFields(t *testing.T) {
 	options := storage.FileOpenOptions{
 		OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Truncate: true, Exclusive: true},
-		ExpectedID: 42, Mode: 0o600,
+		ExpectedID: 42, InitialMetadata: map[string][]byte{"test": {1, 2}},
+		Use: storage.UseClaim{Uses: storage.DeleteName, Deny: storage.WriteData},
 	}
 	encoded, err := json.Marshal(options)
 	if err != nil {
@@ -28,7 +28,8 @@ func TestFileOpenOptionsJSONPreservesSharedAccessFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]any{"Read": true, "Write": true, "Create": true, "Truncate": true, "Exclusive": true,
-		"ExpectedID": float64(42), "Mode": float64(0o600)}
+		"ExpectedID": float64(42), "InitialMetadata": map[string]any{"test": "AQI="},
+		"Use": map[string]any{"Uses": float64(storage.DeleteName), "Deny": float64(storage.WriteData)}}
 	if !reflect.DeepEqual(fields, want) {
 		t.Fatalf("file open JSON changed field names or shape: %s", encoded)
 	}
@@ -36,7 +37,7 @@ func TestFileOpenOptionsJSONPreservesSharedAccessFields(t *testing.T) {
 	if err := json.Unmarshal(encoded, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded != options {
+	if !reflect.DeepEqual(decoded, options) {
 		t.Fatalf("shared open access changed on round trip: %+v", decoded)
 	}
 }
@@ -46,8 +47,10 @@ func TestFileOpenOptionsRequireExplicitAccessAndValidCreation(t *testing.T) {
 		{},
 		{OpenAccess: storage.OpenAccess{Read: true, Exclusive: true}},
 		{OpenAccess: storage.OpenAccess{Read: true, Truncate: true}},
-		{OpenAccess: storage.OpenAccess{Write: true}, Mode: fs.ModeDir},
-		{OpenAccess: storage.OpenAccess{Read: true, Create: true}, Mode: fs.ModeSymlink},
+		{OpenAccess: storage.OpenAccess{Write: true}, InitialMetadata: map[string][]byte{"bad key": {}}},
+		{OpenAccess: storage.OpenAccess{Read: true, Create: true}, InitialMetadata: map[string][]byte{"": {}}},
+		{OpenAccess: storage.OpenAccess{Read: true}, InitialMetadata: map[string][]byte{"test": {}}},
+		{OpenAccess: storage.OpenAccess{Read: true}, Use: storage.UseClaim{Deny: 1 << 7}},
 	} {
 		if err := options.Check(); !errors.Is(err, syscall.EINVAL) {
 			t.Errorf("options %+v returned %v, want EINVAL", options, err)
@@ -57,13 +60,31 @@ func TestFileOpenOptionsRequireExplicitAccessAndValidCreation(t *testing.T) {
 		{OpenAccess: storage.OpenAccess{Read: true}},
 		{OpenAccess: storage.OpenAccess{Write: true}},
 		{OpenAccess: storage.OpenAccess{Read: true, Write: true}},
-		{OpenAccess: storage.OpenAccess{Read: true, Create: true, Exclusive: true}, Mode: 0600},
-		{OpenAccess: storage.OpenAccess{Write: true, Create: true, Truncate: true}, Mode: storage.SettableMode},
+		{OpenAccess: storage.OpenAccess{Read: true, Create: true, Exclusive: true}, InitialMetadata: map[string][]byte{"test": {0}}},
+		{OpenAccess: storage.OpenAccess{Write: true, Create: true, Truncate: true}, InitialMetadata: map[string][]byte{"test": {1, 2, 3}}},
 		{OpenAccess: storage.OpenAccess{Read: true}, ExpectedID: 42},
 	} {
 		if err := options.Check(); err != nil {
 			t.Errorf("options %+v returned %v", options, err)
 		}
+	}
+}
+
+func TestFileOpenEffectiveUseCannotOmitAccess(t *testing.T) {
+	options := storage.FileOpenOptions{
+		OpenAccess: storage.OpenAccess{Read: true, Write: true},
+		Use:        storage.UseClaim{Uses: storage.DeleteName, Deny: storage.ReadData},
+	}
+	got := options.EffectiveUse()
+	want := storage.UseClaim{
+		Uses: storage.ReadData | storage.WriteData | storage.DeleteName,
+		Deny: storage.ReadData,
+	}
+	if got != want {
+		t.Fatalf("effective use = %+v; want %+v", got, want)
+	}
+	if options.Use.Uses != storage.DeleteName {
+		t.Fatal("effective use mutated caller options")
 	}
 }
 
@@ -127,35 +148,6 @@ func TestFileSessionLimitsAreExplicitAndValidatedBeforeAdmission(t *testing.T) {
 	defaults.MaxWaiters = 0
 	if err := defaults.Check(); err != nil {
 		t.Fatalf("zero waiter queue must disable waiting: %v", err)
-	}
-}
-
-func TestAdvisoryLockValidationPreservesInclusiveRangeBoundaries(t *testing.T) {
-	for _, lock := range []storage.FileLock{
-		{Family: storage.POSIX, Type: storage.Shared, Start: 0, End: 0},
-		{Family: storage.POSIX, Type: storage.Exclusive, Start: math.MaxInt64, End: math.MaxInt64, Wait: true},
-		{Family: storage.POSIX, Type: storage.Unlock, Start: 17, End: 21},
-		{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64},
-		{Family: storage.Flock, Type: storage.Shared, End: math.MaxInt64, Wait: true},
-		{Family: storage.Flock, Type: storage.Unlock, End: math.MaxInt64},
-	} {
-		if err := lock.Check(); err != nil {
-			t.Errorf("lock %+v returned %v", lock, err)
-		}
-	}
-	for _, lock := range []storage.FileLock{
-		{},
-		{Family: storage.LockFamily(255), Type: storage.Shared},
-		{Family: storage.POSIX, Type: storage.LockType(255)},
-		{Family: storage.POSIX, Type: storage.Shared, Start: 2, End: 1},
-		{Family: storage.POSIX, Type: storage.Shared, End: uint64(math.MaxInt64) + 1},
-		{Family: storage.Flock, Type: storage.Exclusive, Start: 1, End: math.MaxInt64},
-		{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64 - 1},
-		{Family: storage.POSIX, Type: storage.Unlock, Wait: true},
-	} {
-		if err := lock.Check(); !errors.Is(err, syscall.EINVAL) {
-			t.Errorf("lock %+v returned %v, want EINVAL", lock, err)
-		}
 	}
 }
 

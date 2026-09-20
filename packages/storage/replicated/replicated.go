@@ -27,9 +27,9 @@
 //
 // # What is answered from where
 //
-// Path-based Stat and List are answered here. Everything else — the bytes of a file, every change to
-// the volume, and how much room it has — goes to the server, because none of it is
-// metadata this copy holds and none of it is a question a copy may answer.
+// Path-based Stat is answered here. List and everything else — the bytes of a file,
+// every change to the volume, and how much room it has — goes to the server. A cached
+// listing cannot enforce the authority's current ReadEntries restrictions.
 // Retained file and node-identity queries also go to the authority: detached objects have
 // no entry in this tree. Their mutations confirm the authority's returned log position,
 // including an unchanged position when the object has no name.
@@ -217,24 +217,17 @@ func (s *Storage) Stat(ctx context.Context, path string) (storage.Attr, error) {
 
 func (s *Storage) CheckBounded() error { return s.remote.CheckBounded() }
 
-// List returns the entries of the directory at path from the copy.
+// List returns the authority's current directory result. The local copy may be warm,
+// but it cannot decide whether a current ReadEntries denial applies.
 func (s *Storage) List(ctx context.Context, path string) ([]storage.Entry, error) {
 	if err := s.usable("list", path); err != nil {
 		return nil, err
 	}
-	children, err := s.local.List(ctx, path)
-	if err != nil {
-		return nil, err
-	}
-	entries := make([]storage.Entry, len(children))
-	for i, child := range children {
-		entries[i] = storage.Entry{Name: string(child.Name), Attr: child.Node.Attr()}
-	}
-	return entries, nil
+	return s.remote.List(ctx, path)
 }
 
-// ListBounded holds the same replica position for the whole ordered query and transfers
-// each child directly into the caller's bounded result.
+// ListBounded delegates the complete bounded observation to the authority so the
+// authorization check and enumeration share native ordering.
 func (s *Storage) ListBounded(ctx context.Context, path string, result *storage.ListResult) (returned error) {
 	if result != nil {
 		defer func() {
@@ -246,7 +239,7 @@ func (s *Storage) ListBounded(ctx context.Context, path string, result *storage.
 	if err := s.usable("list", path); err != nil {
 		return err
 	}
-	return s.local.ListBounded(ctx, path, result)
+	return s.remote.ListBounded(ctx, path, result)
 }
 
 // Read returns the contents of the file at path, from the server.

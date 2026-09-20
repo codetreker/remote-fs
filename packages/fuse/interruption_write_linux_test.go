@@ -81,14 +81,15 @@ func newSignalVolume(t *testing.T, allowance int64, files map[string][]byte) *si
 		}
 	})
 	volume.served = &signalFileStorage{FileStorage: served, wrap: func(file storage.File) storage.File {
-		return &countedSignalFile{File: file, writes: &volume.writes}
+		return &countedSignalFile{signalFileCapabilities: testSignalFileCapabilities(file), writes: &volume.writes}
 	}}
 	return volume
 }
 
 type signalFileStorage struct {
 	storage.FileStorage
-	wrap func(storage.File) storage.File
+	wrap        func(storage.File) storage.File
+	wrapSession func(storage.FileSession) storage.FileSession
 }
 
 func (s *signalFileStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
@@ -96,11 +97,15 @@ func (s *signalFileStorage) NewFileSession(ctx context.Context, options storage.
 	if err != nil {
 		return nil, err
 	}
-	return &signalFileSession{FileSession: session, wrap: s.wrap}, nil
+	wrapped := storage.FileSession(&signalFileSession{capableTestSession: testSessionCapabilities(session), wrap: s.wrap})
+	if s.wrapSession != nil {
+		wrapped = s.wrapSession(wrapped)
+	}
+	return wrapped, nil
 }
 
 type signalFileSession struct {
-	storage.FileSession
+	capableTestSession
 	wrap func(storage.File) storage.File
 }
 
@@ -109,7 +114,10 @@ func (s *signalFileSession) OpenFile(ctx context.Context, name string, options s
 	if err != nil {
 		return nil, err
 	}
-	return s.wrap(file), nil
+	if s.wrap != nil {
+		file = s.wrap(file)
+	}
+	return file, nil
 }
 
 func (s *signalFileSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
@@ -117,11 +125,24 @@ func (s *signalFileSession) OpenNode(ctx context.Context, id uint64, options sto
 	if err != nil {
 		return nil, err
 	}
-	return s.wrap(file), nil
+	if s.wrap != nil {
+		file = s.wrap(file)
+	}
+	return file, nil
+}
+
+type signalFileCapabilities struct {
+	storage.File
+	storage.ScopedReference
+	storage.ReferenceMetadataAccess
+}
+
+func testSignalFileCapabilities(file storage.File) signalFileCapabilities {
+	return signalFileCapabilities{File: file, ScopedReference: file.(storage.ScopedReference), ReferenceMetadataAccess: file.(storage.ReferenceMetadataAccess)}
 }
 
 type countedSignalFile struct {
-	storage.File
+	signalFileCapabilities
 	writes *atomic.Int32
 }
 
@@ -131,21 +152,18 @@ func (f *countedSignalFile) WriteAt(ctx context.Context, offset int64, data []by
 }
 
 type heldCloseCleanup struct {
-	storage.File
+	capableTestSession
 	entered chan context.Context
 	release chan struct{}
 }
 
-func (s *heldCloseCleanup) DropLocks(ctx context.Context, owner storage.LockOwner, family storage.LockFamily) error {
-	if family != storage.POSIX {
-		return s.File.DropLocks(ctx, owner, family)
-	}
+func (s *heldCloseCleanup) RetireUseOwner(ctx context.Context, owner storage.UseOwner) error {
 	s.entered <- ctx
 	select {
 	case <-s.release:
 	case <-ctx.Done():
 	}
-	return s.File.DropLocks(ctx, owner, family)
+	return s.UseOwners.RetireUseOwner(ctx, owner)
 }
 
 type flushInterruptTrace struct {
@@ -178,8 +196,8 @@ func TestSignalDuringClosePreservesOwnerCleanup(t *testing.T) {
 	requireFUSE(t)
 	volume := newSignalVolume(t, 0, map[string][]byte{"file": []byte("old body")})
 	held := &heldCloseCleanup{entered: make(chan context.Context, 1), release: make(chan struct{})}
-	wrapped := &signalFileStorage{FileStorage: volume.served, wrap: func(file storage.File) storage.File {
-		held.File = file
+	wrapped := &signalFileStorage{FileStorage: volume.served, wrapSession: func(session storage.FileSession) storage.FileSession {
+		held.capableTestSession = testSessionCapabilities(session)
 		return held
 	}}
 	var release sync.Once
@@ -226,7 +244,7 @@ func TestSignalDuringClosePreservesOwnerCleanup(t *testing.T) {
 }
 
 type interruptedFileWrite struct {
-	storage.File
+	signalFileCapabilities
 	entered  chan context.Context
 	returned chan error
 	release  chan struct{}
@@ -264,7 +282,7 @@ func TestSignalDuringWritePreservesTheAuthoritativeQuotaLimit(t *testing.T) {
 			})
 			held := &interruptedFileWrite{entered: make(chan context.Context, 1), returned: make(chan error, 1), release: make(chan struct{})}
 			wrapped := &signalFileStorage{FileStorage: volume.served, wrap: func(file storage.File) storage.File {
-				held.File = file
+				held.signalFileCapabilities = testSignalFileCapabilities(file)
 				return held
 			}}
 			defer close(held.release)
@@ -324,6 +342,10 @@ func runWriteSignalChild(t *testing.T, mode string) {
 	defer file.Close()
 	fd := file.Fd()
 	if mode == "close" {
+		lock := posixRange(unix.F_WRLCK, 0, 0)
+		if err := unix.FcntlFlock(fd, unix.F_SETLK, &lock); err != nil {
+			t.Fatalf("acquire close cleanup owner: %v", err)
+		}
 		if _, err := file.Write([]byte("new body")); err != nil {
 			t.Fatal(err)
 		}

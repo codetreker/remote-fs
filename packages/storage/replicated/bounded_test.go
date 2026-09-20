@@ -15,6 +15,7 @@ func TestBoundedEntrypointsPreserveReplicaAndDependencyFailures(t *testing.T) {
 	write(t, s, "small", "small")
 	write(t, s, "larger", "larger")
 	mkdir(t, s, "directory")
+	mkdir(t, s, "empty")
 	mounted, _ := mount(t, s)
 
 	if err := mounted.CheckBounded(); err != nil {
@@ -30,7 +31,7 @@ func TestBoundedEntrypointsPreserveReplicaAndDependencyFailures(t *testing.T) {
 		t.Fatalf("ReadBounded hid the remote dependency's ENOENT: %v", err)
 	}
 
-	result := listResult(t, 64)
+	result := listResult(t, 4096)
 	if err := mounted.ListBounded(t.Context(), "", result); err != nil {
 		t.Fatalf("ListBounded: %v", err)
 	}
@@ -38,11 +39,18 @@ func TestBoundedEntrypointsPreserveReplicaAndDependencyFailures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the bounded listing: %v", err)
 	}
-	if len(entries) != 3 || entries[0].Name != "directory" || entries[1].Name != "larger" || entries[2].Name != "small" {
+	if len(entries) != 4 || entries[0].Name != "directory" || entries[1].Name != "empty" || entries[2].Name != "larger" || entries[3].Name != "small" {
 		t.Fatalf("bounded listing returned %+v", entries)
 	}
+	empty := listResult(t, 0)
+	if err := mounted.ListBounded(t.Context(), "empty", empty); err != nil {
+		t.Fatalf("empty listing under a zero retained-byte budget: %v", err)
+	}
+	if entries, err := empty.Entries(); err != nil || len(entries) != 0 {
+		t.Fatalf("empty bounded listing = %+v,%v", entries, err)
+	}
 
-	notDirectory := listResult(t, 64)
+	notDirectory := listResult(t, 4096)
 	if err := mounted.ListBounded(t.Context(), "small", notDirectory); !errors.Is(err, syscall.ENOTDIR) {
 		t.Fatalf("ListBounded hid the replica dependency's ENOTDIR: %v", err)
 	}
@@ -59,7 +67,7 @@ func TestBoundedEntrypointsPreserveReplicaAndDependencyFailures(t *testing.T) {
 	if _, err := mounted.ReadBounded(t.Context(), "small", 5); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("ReadBounded answered from an unusable replica: %v", err)
 	}
-	unusable := listResult(t, 64)
+	unusable := listResult(t, 4096)
 	if err := mounted.ListBounded(t.Context(), "", unusable); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("ListBounded answered from an unusable replica: %v", err)
 	}
@@ -68,7 +76,7 @@ func TestBoundedEntrypointsPreserveReplicaAndDependencyFailures(t *testing.T) {
 
 func listResult(t *testing.T, maxBytes int64) *storage.ListResult {
 	t.Helper()
-	result, err := storage.NewListResult(maxBytes, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+	result, err := storage.NewListResult(maxBytes, 0, func(_ int, nameBytes, _ int64, _ storage.Attr) (int64, error) {
 		return nameBytes, nil
 	})
 	if err != nil {

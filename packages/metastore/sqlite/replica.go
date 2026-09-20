@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"syscall"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
@@ -65,6 +66,7 @@ type Replica struct {
 // answer rather than anything this database knows.
 func OpenReplica(ctx context.Context, path string) (*Replica, error) {
 	options := DefaultOptions()
+	options.replicaMetadata = true
 	store, err := OpenWithOptions(ctx, path, replicaVolume, 0, options)
 	if err != nil {
 		return nil, err
@@ -184,6 +186,9 @@ func (r *Replica) Apply(ctx context.Context, change metastore.Change) (applied b
 	if err := r.apply(ctx, tx.Tx, change); err != nil {
 		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, sqlerr.Failure(err))
 	}
+	if err := r.store.checkMetadataLimit(ctx, tx.Tx); err != nil {
+		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, sqlerr.Failure(err))
+	}
 	state, err := dbstate.AdvanceGeneration(ctx, tx.Tx)
 	if err != nil {
 		return false, fmt.Errorf("applying the change at position %d: %w", change.Position, sqlerr.Failure(err))
@@ -264,11 +269,19 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 // the type's own comment for why a copy holds no keys.
 func insertNode(ctx context.Context, tx *sql.Tx, volume int64, node metastore.Node) error {
 	accessSec, accessNsec := sqlvalue.StoredTime(node.AccessTime)
-	changeSec, changeNsec := sqlvalue.StoredTime(node.ModTime)
-	_, err := tx.ExecContext(ctx, `
-		INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-		node.ID, volume, int64(node.Mode), node.Size, accessSec, accessNsec, changeSec, changeNsec)
+	modifiedSec, modifiedNsec := sqlvalue.StoredTime(node.ModTime)
+	birthSec, birthNsec := storedOptionalTime(node.BirthTime)
+	changeSec, changeNsec := storedOptionalTime(node.ChangeTime)
+	metadata, err := storage.EncodeMetadata(node.Metadata)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO nodes (id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,
+		                   birth_sec,birth_nsec,change_sec,change_nsec,metadata)
+		VALUES (?,?,?,?,?,?,?,?,NULL,?,?,?,?,?)`,
+		node.ID, volume, int64(node.Kind), node.Size, accessSec, accessNsec, modifiedSec, modifiedNsec,
+		birthSec, birthNsec, changeSec, changeNsec, metadata)
 	return err
 }
 
@@ -276,15 +289,31 @@ func insertNode(ctx context.Context, tx *sql.Tx, volume int64, node metastore.No
 // statement about a node it does not.
 func updateNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
 	accessSec, accessNsec := sqlvalue.StoredTime(node.AccessTime)
-	changeSec, changeNsec := sqlvalue.StoredTime(node.ModTime)
+	modifiedSec, modifiedNsec := sqlvalue.StoredTime(node.ModTime)
+	birthSec, birthNsec := storedOptionalTime(node.BirthTime)
+	changeSec, changeNsec := storedOptionalTime(node.ChangeTime)
+	metadata, err := storage.EncodeMetadata(node.Metadata)
+	if err != nil {
+		return err
+	}
 	result, err := tx.ExecContext(ctx, `
-		UPDATE nodes SET mode = ?, size = ?, atime_sec = ?, atime_nsec = ?, mtime_sec = ?, mtime_nsec = ?
+		UPDATE nodes SET kind=?,size=?,atime_sec=?,atime_nsec=?,mtime_sec=?,mtime_nsec=?,
+		                 birth_sec=?,birth_nsec=?,change_sec=?,change_nsec=?,metadata=?
 		WHERE id = ?`,
-		int64(node.Mode), node.Size, accessSec, accessNsec, changeSec, changeNsec, node.ID)
+		int64(node.Kind), node.Size, accessSec, accessNsec, modifiedSec, modifiedNsec,
+		birthSec, birthNsec, changeSec, changeNsec, metadata, node.ID)
 	if err != nil {
 		return err
 	}
 	return sqlvalue.ExactlyOne(result, fmt.Sprintf("node %d, which this copy does not hold", node.ID))
+}
+
+func storedOptionalTime(value *time.Time) (any, any) {
+	if value == nil {
+		return nil, nil
+	}
+	sec, nsec := sqlvalue.StoredTime(*value)
+	return sec, nsec
 }
 
 func insertEntry(ctx context.Context, tx *sql.Tx, volume, parent int64, name []byte, node int64) error {
@@ -423,14 +452,18 @@ func (s *Seeding) add(ctx context.Context, row metastore.Row) error {
 	if err := insertNode(ctx, s.tx.Tx, s.replica.store.volume, row.Node); err != nil {
 		return err
 	}
-	// Parent 0 and no name is how a picture names the one node that has neither. Nothing else
-	// can carry parent 0, since every other row names a node, and ids begin at one.
-	if row.Parent == 0 && row.Name == nil {
+	// Parent 0 and an empty name is how a picture names the one node that has neither.
+	// The wire uses canonical base64 text, where nil and empty bytes share the empty
+	// representation. Nothing else can carry parent 0, since ids begin at one.
+	if row.Parent == 0 && len(row.Name) == 0 {
 		if s.root != 0 {
 			return fmt.Errorf("%w: the picture carries two nodes with no parent, %d and %d", syscall.EIO, s.root, row.Node.ID)
 		}
 		s.root = row.Node.ID
 		return nil
+	}
+	if row.Parent == 0 || len(row.Name) == 0 {
+		return fmt.Errorf("snapshot row has an invalid parent/name pair: %w", syscall.EIO)
 	}
 	return insertEntry(ctx, s.tx.Tx, s.replica.store.volume, row.Parent, row.Name, row.Node.ID)
 }
@@ -463,6 +496,9 @@ func (s *Seeding) Complete(ctx context.Context, at metastore.Position) error {
 	if sequence != highWater {
 		return fmt.Errorf("completing the copy: SQLite node sequence %d does not match observed high-water %d: %w",
 			sequence, highWater, syscall.EIO)
+	}
+	if err := s.replica.store.checkMetadataLimit(ctx, s.tx.Tx); err != nil {
+		return fmt.Errorf("completing the copy: %w", sqlerr.Failure(err))
 	}
 	state, err := dbstate.AdvanceGeneration(ctx, s.tx.Tx)
 	if err != nil {

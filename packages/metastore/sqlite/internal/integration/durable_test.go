@@ -344,8 +344,8 @@ func TestAcceptFailureReturnsEIOAndPoisonsReadsAndWrites(t *testing.T) {
 			return err
 		},
 		"bounded list": func() error {
-			result, err := storage.NewListResult(1024, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
-				return nameBytes, nil
+			result, err := storage.NewListResult(1024, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+				return nameBytes + metadataBytes, nil
 			})
 			if err != nil {
 				return err

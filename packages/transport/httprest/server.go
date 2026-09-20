@@ -218,7 +218,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Op != OpSubscribe && req.Op != OpResubscribe && req.Op != OpSnapshot {
 		reservation := h.maxBodyBytes
-		if req.Op == OpRead || req.Op == OpList {
+		if req.Op == OpRead || req.Op == OpList || req.Op == OpStat {
 			reservation = retainedResponseMultiplier * h.maxBodyBytes
 		}
 		release, err := h.responses.acquire(r.Context(), reservation)
@@ -247,6 +247,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) 
 	}
 	switch req.Op {
 	case OpStat:
+		ctx = storage.WithBoundedAttrResult(ctx, h.maxBodyBytes, h.attrResultBudget(fileRequest{Op: storage.OpFileStat, ResultBytes: h.maxBodyBytes}))
 		attr, err := h.storage.Stat(ctx, req.Path)
 		if err != nil {
 			h.writeOperationError(w, err)
@@ -284,6 +285,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, req Request) 
 		if err != nil {
 			panic(fmt.Sprintf("httprest: cannot construct a validated list result: %v", err))
 		}
+		ctx = storage.WithBoundedListResult(ctx, h.maxBodyBytes)
 		err = h.storage.ListBounded(ctx, req.Path, result)
 		if err != nil {
 			h.writeOperationError(w, err)
@@ -477,14 +479,24 @@ func (h *Handler) writeContent(w http.ResponseWriter, content []byte) {
 }
 
 func (h *Handler) writeJSON(w http.ResponseWriter, status int, body any) {
-	if response, ok := body.(ErrorResponse); ok {
-		body = boundedErrorResponse(response, h.maxBodyBytes)
-	}
 	// Rendered whole before anything is written: a marshalling failure part way through
 	// would otherwise leave a status already sent and a body cut in half.
-	encoded, err := json.Marshal(body)
+	var encoded []byte
+	var err error
+	if response, ok := body.(ErrorResponse); ok {
+		encoded, err = marshalBoundedErrorResponse(response, h.maxBodyBytes)
+	} else {
+		encoded, err = json.Marshal(body)
+	}
 	if err != nil {
-		panic(fmt.Sprintf("httprest: cannot render %T: %v", body, err))
+		if !errors.Is(err, errBodyTooLarge) {
+			panic(fmt.Sprintf("httprest: cannot render %T: %v", body, err))
+		}
+		status = http.StatusInternalServerError
+		encoded, err = json.Marshal(ErrorResponse{Message: "the response exceeds the configured HTTP body limit"})
+		if err != nil {
+			panic(fmt.Sprintf("httprest: cannot render the bounded response fault: %v", err))
+		}
 	}
 	if int64(len(encoded)) > h.maxBodyBytes {
 		status = http.StatusInternalServerError
@@ -507,7 +519,7 @@ func (h *Handler) writeOperationError(w http.ResponseWriter, err error) {
 		h.writeJSON(w, StatusStorageError, response)
 		return
 	}
-	response := ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error()}
+	response := ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error(), CapabilityCode: capabilityErrorCode(err)}
 	if failure := volumeLockFailure(err); failure != nil {
 		response.LockCode = failure.Code
 		recorded := failure.Recorded
@@ -553,19 +565,31 @@ func (h *Handler) writeFault(w http.ResponseWriter, status int, err error) {
 	h.writeJSON(w, status, ErrorResponse{Message: err.Error()})
 }
 
-func boundedErrorResponse(response ErrorResponse, limit int64) ErrorResponse {
-	// encoding/json may expand one input byte to a six-byte escape. The fixed envelope,
-	// errno name and replacement diagnostic fit inside the allowance required by
-	// HandlerOptions, so a message that cannot fit is replaced before json.Marshal sees it.
-	const envelopeBytes int64 = 128
-	if int64(len(response.Message)) > (limit-envelopeBytes)/6 {
-		response.Message = "the response detail exceeds the configured HTTP body limit"
+const boundedErrorDetail = "the response detail exceeds the configured HTTP body limit"
+
+func marshalBoundedErrorResponse(response ErrorResponse, limit int64) ([]byte, error) {
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return nil, err
 	}
-	return response
+	if int64(len(encoded)) <= limit {
+		return encoded, nil
+	}
+	for _, message := range []string{boundedErrorDetail, ""} {
+		response.Message = message
+		encoded, err = json.Marshal(response)
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(encoded)) <= limit {
+			return encoded, nil
+		}
+	}
+	return nil, errBodyTooLarge
 }
 
 func newListResult(limit int64) (*storage.ListResult, error) {
-	return storage.NewListResult(limit, int64(len(`{"entries":[]}`)), func(i int, nameBytes int64, attr storage.Attr) (int64, error) {
+	return storage.NewListResult(limit, int64(len(`{"entries":[]}`)), func(i int, nameBytes, metadataBytes int64, attr storage.Attr) (int64, error) {
 		encodedAttr, err := json.Marshal(AttrOf(attr))
 		if err != nil {
 			return 0, fmt.Errorf("cannot size listing attributes: %w", err)
@@ -578,6 +602,11 @@ func newListResult(limit int64) (*storage.ListResult, error) {
 		}
 		encodedName := int64(base64.StdEncoding.EncodedLen(int(nameBytes)))
 		entryBytes := int64(len(`{"name":"","attr":}`)) + encodedName + int64(len(encodedAttr))
+		metadataCharge, err := metadataResultBytes(metadataBytes)
+		if err != nil {
+			return 0, err
+		}
+		entryBytes += metadataCharge
 		if i != 0 {
 			entryBytes++
 		}

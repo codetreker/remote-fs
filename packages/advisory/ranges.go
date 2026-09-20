@@ -1,46 +1,62 @@
 package advisory
 
 import (
+	"math"
 	"sort"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-func overlaps(a, b storage.FileLock) bool {
-	return a.Start <= b.End && b.Start <= a.End
+func overlaps(a, b storage.Range) bool {
+	if a.Kind == storage.Boundary {
+		return b.Kind == storage.Bytes && boundaryOverlaps(b.Start, b.Length, a.CutAt)
+	}
+	if b.Kind == storage.Boundary {
+		return boundaryOverlaps(a.Start, a.Length, b.CutAt)
+	}
+	return bytesOverlap(a.Start, a.Length, b.Start, b.Length)
 }
 
-// Replacing a subrange can add at most two fragments. The result is built before
-// touching live state so a fragment-budget rejection preserves the original lock.
-func replaceRanges(old []storage.FileLock, lock storage.FileLock) []storage.FileLock {
-	next := make([]storage.FileLock, 0, len(old)+2)
+// A replacement is built before live state changes. Fragment-budget rejection
+// therefore preserves the old ranges, including on a partial subtraction.
+func replaceRanges(old []rangeClaim, command storage.RangeCommand) []rangeClaim {
+	next := make([]rangeClaim, 0, len(old)+2)
+	start := command.Range.Start
+	last, _ := byteLast(start, command.Range.Length)
 	for _, existing := range old {
-		if !overlaps(existing, lock) {
+		if !overlaps(existing.command.Range, command.Range) {
 			next = append(next, existing)
 			continue
 		}
-		if existing.Start < lock.Start {
+		oldRange := existing.command.Range
+		oldLast, _ := byteLast(oldRange.Start, oldRange.Length)
+		if oldRange.Start < start {
 			left := existing
-			left.End = lock.Start - 1
+			left.command.Range.Length = start - oldRange.Start
 			next = append(next, left)
 		}
-		if existing.End > lock.End {
+		if oldLast > last {
 			right := existing
-			right.Start = lock.End + 1
+			right.command.Range.Start = last + 1
+			right.command.Range.Length = oldLast - last
 			next = append(next, right)
 		}
 	}
-	if lock.Type != storage.Unlock {
-		lock.Wait = false
-		next = append(next, lock)
+	if command.Edit != storage.Subtract {
+		command.Wait = false
+		command.Conversion = storage.PreserveBeforeAcquire
+		next = append(next, rangeClaim{command: command})
 	}
-	sort.Slice(next, func(i, j int) bool { return next[i].Start < next[j].Start })
+	sort.Slice(next, func(i, j int) bool { return next[i].command.Range.Start < next[j].command.Range.Start })
 	result := next[:0]
 	for _, current := range next {
 		if len(result) > 0 {
 			previous := &result[len(result)-1]
-			if previous.End+1 == current.Start && previous.Type == current.Type {
-				previous.End = current.End
+			previousLast, _ := byteLast(previous.command.Range.Start, previous.command.Range.Length)
+			if previousLast != math.MaxUint64 && previousLast+1 == current.command.Range.Start &&
+				previous.command.Mode == current.command.Mode && previous.command.Policy == current.command.Policy &&
+				current.command.Range.Length <= math.MaxUint64-previous.command.Range.Length {
+				previous.command.Range.Length += current.command.Range.Length
 				continue
 			}
 		}
@@ -49,57 +65,88 @@ func replaceRanges(old []storage.FileLock, lock storage.FileLock) []storage.File
 	return result
 }
 
-func (c *Coordinator) conflictLocked(key ownerKey, lock storage.FileLock) storage.LockConflict {
-	var conflict storage.LockConflict
+func (c *Coordinator) conflictLocked(key ownerKey, command storage.RangeCommand) storage.RangeConflict {
+	var conflict storage.RangeConflict
 	var selected ownerKey
 	for other, state := range c.owners {
-		if other == key || other.node != key.node || other.family != key.family {
+		if other == key || other.node != key.node || other.domain != key.domain {
 			continue
 		}
 		for _, held := range state.ranges {
-			if !overlaps(held, lock) || held.Type == storage.Shared && lock.Type == storage.Shared {
+			if !overlaps(held.command.Range, command.Range) ||
+				held.command.Mode == storage.RangeShared && command.Mode == storage.RangeShared {
 				continue
 			}
-			if conflict.Found && (held.Start > conflict.Lock.Start ||
-				held.Start == conflict.Lock.Start && !ownerBefore(other, selected)) {
+			if conflict.Found && (rangeStart(held.command.Range) > rangeStart(conflict.Range) ||
+				rangeStart(held.command.Range) == rangeStart(conflict.Range) && !ownerBefore(other, selected)) {
 				continue
 			}
-			if other.session != key.session {
-				held.PID = 0
-			}
-			conflict = storage.LockConflict{Found: true, Owner: other.owner, Lock: held}
+			owner := c.sessions[other.session].bindings[other.owner].options.Diagnostic
+			conflict = storage.RangeConflict{Found: true, Owner: owner, Range: held.command.Range, Mode: held.command.Mode}
 			selected = other
 		}
 	}
 	return conflict
 }
 
+func rangeStart(r storage.Range) uint64 {
+	if r.Kind == storage.Boundary {
+		return r.CutAt
+	}
+	return r.Start
+}
+
 func ownerBefore(a, b ownerKey) bool {
 	return a.session < b.session || a.session == b.session && a.owner < b.owner
 }
 
-// POSIX deadlocks are cycles between process owners across files. Flock waits
-// are deliberately excluded: Linux does not promise flock deadlock detection.
+type deadlockParticipant struct {
+	session  uint64
+	identity uint64
+	grouped  bool
+}
+
+func (c *Coordinator) participant(key ownerKey) deadlockParticipant {
+	binding := c.sessions[key.session].bindings[key.owner]
+	if binding.options.Group != 0 {
+		return deadlockParticipant{session: key.session, identity: binding.options.Group, grouped: true}
+	}
+	return deadlockParticipant{session: key.session, identity: uint64(key.owner)}
+}
+
+// Record-domain owners share a wait graph across files. Other domains have no
+// deadlock-detection promise and do not contribute edges to this graph.
 func (c *Coordinator) deadlockLocked(candidate *request) (bool, bool) {
-	edges := make(map[actor][]actor)
+	edges := make(map[deadlockParticipant][]deadlockParticipant)
 	count := 0
 	add := func(r *request) bool {
-		if r.key.family != storage.POSIX {
+		if r.key.domain != storage.DomainRecord {
 			return true
 		}
 		for key, held := range c.owners {
-			if key == r.key || key.node != r.key.node || key.family != storage.POSIX {
+			if key == r.key || key.node != r.key.node || key.domain != storage.DomainRecord {
 				continue
 			}
-			for _, lock := range held.ranges {
-				if overlaps(lock, r.lock) && (lock.Type == storage.Exclusive || r.lock.Type == storage.Exclusive) {
-					if count == c.config.MaxDeadlockEdges {
-						return false
+			conflicts := false
+			for _, command := range r.commands {
+				for _, lock := range held.ranges {
+					if overlaps(lock.command.Range, command.Range) &&
+						(lock.command.Mode == storage.RangeExclusive || command.Mode == storage.RangeExclusive) {
+						conflicts = true
+						break
 					}
-					edges[r.key.actor] = append(edges[r.key.actor], key.actor)
-					count++
+				}
+				if conflicts {
 					break
 				}
+			}
+			if conflicts {
+				if count == c.config.MaxDeadlockEdges {
+					return false
+				}
+				from := c.participant(r.key)
+				edges[from] = append(edges[from], c.participant(key))
+				count++
 			}
 		}
 		return true
@@ -112,13 +159,14 @@ func (c *Coordinator) deadlockLocked(candidate *request) (bool, bool) {
 	if !add(candidate) {
 		return false, false
 	}
-	seen := make(map[actor]bool)
-	stack := append([]actor(nil), edges[candidate.key.actor]...)
+	participant := c.participant(candidate.key)
+	seen := make(map[deadlockParticipant]bool)
+	stack := append([]deadlockParticipant(nil), edges[participant]...)
 	for len(stack) > 0 {
 		last := len(stack) - 1
 		current := stack[last]
 		stack = stack[:last]
-		if current == candidate.key.actor {
+		if current == participant {
 			return true, true
 		}
 		if seen[current] {

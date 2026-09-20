@@ -3,6 +3,7 @@ package advisory
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"sync"
@@ -38,6 +39,20 @@ func session(t *testing.T, c *Coordinator) *Session {
 	return s
 }
 
+func owner(t *testing.T, s *Session, node, group uint64) storage.UseOwner {
+	return ownerWithDiagnostic(t, s, node, group, 0)
+}
+
+func ownerWithDiagnostic(t *testing.T, s *Session, node, group uint64, diagnostic storage.OwnerDiagnostic) storage.UseOwner {
+	t.Helper()
+	scope := storage.UseScope{Token: fmt.Sprintf("%d/%d/%d", s.id, node, s.nextOwner+1)}
+	o, err := s.NewOwner(background, node, scope, storage.OwnerOptions{Lifetime: storage.OwnerExplicit, Group: group, Diagnostic: diagnostic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return o
+}
+
 func requestID(t *testing.T, s *Session) storage.LockRequestID {
 	t.Helper()
 	epoch, err := s.Epoch(background)
@@ -51,244 +66,365 @@ func requestID(t *testing.T, s *Session) storage.LockRequestID {
 	return id
 }
 
-func set(t *testing.T, s *Session, node uint64, owner storage.LockOwner, lock storage.FileLock) storage.LockAttempt {
+func ordered(ctx context.Context, apply func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return apply()
+}
+
+func apply(t *testing.T, s *Session, node uint64, o storage.UseOwner, commands ...storage.RangeCommand) storage.RangeAttempt {
 	t.Helper()
-	result, err := s.Set(background, node, owner, lock, requestID(t, s))
+	result, err := s.Apply(background, node, o, commands, requestID(t, s), ordered)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return result
 }
 
-func wantState(t *testing.T, result storage.LockAttempt, state storage.LockAttemptState, errno syscall.Errno) {
+func wantState(t *testing.T, result storage.RangeAttempt, state storage.AttemptState, rejection storage.RejectionCode) {
 	t.Helper()
-	if result.State != state || result.Errno != errno {
-		t.Fatalf("result = %+v; want state %d errno %v", result, state, errno)
+	if result.State != state || result.Rejection != rejection {
+		t.Fatalf("result = %+v; want state %d rejection %q", result, state, rejection)
 	}
 }
 
-func posix(mode storage.LockType, start, end uint64) storage.FileLock {
-	return storage.FileLock{Family: storage.POSIX, Type: mode, Start: start, End: end}
+func record(mode storage.RangeMode, start, length uint64) storage.RangeCommand {
+	return storage.RangeCommand{Domain: storage.DomainRecord, Mode: mode, Range: storage.Range{Kind: storage.Bytes, Start: start, Length: length}, Edit: storage.Replace}
 }
 
-func flock(mode storage.LockType) storage.FileLock {
-	return storage.FileLock{Family: storage.Flock, Type: mode, End: math.MaxInt64}
+func whole(mode storage.RangeMode) storage.RangeCommand {
+	c := record(mode, 0, 1<<63)
+	c.Domain, c.Conversion = storage.DomainWholeFile, storage.DropBeforeAcquire
+	return c
 }
 
-func TestPOSIXRangeReplacement(t *testing.T) {
+func subtract(command storage.RangeCommand) storage.RangeCommand {
+	command.Edit, command.Wait, command.Conversion = storage.Subtract, false, storage.PreserveBeforeAcquire
+	return command
+}
+
+func TestRecordRangeReplacement(t *testing.T) {
 	c := fixture(t, DefaultConfig())
 	s := session(t, c)
-	key := s.key(1, 7, storage.POSIX)
+	o := owner(t, s, 1, 1)
 	steps := []struct {
-		lock   storage.FileLock
-		ranges []storage.FileLock
+		command storage.RangeCommand
+		want    []storage.RangeCommand
 	}{
-		{posix(storage.Shared, 0, 99), []storage.FileLock{posix(storage.Shared, 0, 99)}},
-		{posix(storage.Exclusive, 20, 39), []storage.FileLock{posix(storage.Shared, 0, 19), posix(storage.Exclusive, 20, 39), posix(storage.Shared, 40, 99)}},
-		{posix(storage.Shared, 20, 39), []storage.FileLock{posix(storage.Shared, 0, 99)}},
-		{posix(storage.Unlock, 20, 39), []storage.FileLock{posix(storage.Shared, 0, 19), posix(storage.Shared, 40, 99)}},
-		{posix(storage.Exclusive, 50, math.MaxInt64), []storage.FileLock{posix(storage.Shared, 0, 19), posix(storage.Shared, 40, 49), posix(storage.Exclusive, 50, math.MaxInt64)}},
-		{posix(storage.Unlock, math.MaxInt64, math.MaxInt64), []storage.FileLock{posix(storage.Shared, 0, 19), posix(storage.Shared, 40, 49), posix(storage.Exclusive, 50, math.MaxInt64-1)}},
+		{record(storage.RangeShared, 0, 100), []storage.RangeCommand{record(storage.RangeShared, 0, 100)}},
+		{record(storage.RangeExclusive, 20, 20), []storage.RangeCommand{record(storage.RangeShared, 0, 20), record(storage.RangeExclusive, 20, 20), record(storage.RangeShared, 40, 60)}},
+		{record(storage.RangeShared, 20, 20), []storage.RangeCommand{record(storage.RangeShared, 0, 100)}},
+		{subtract(record(storage.RangeShared, 20, 20)), []storage.RangeCommand{record(storage.RangeShared, 0, 20), record(storage.RangeShared, 40, 60)}},
+		{record(storage.RangeExclusive, 50, math.MaxInt64-49), []storage.RangeCommand{record(storage.RangeShared, 0, 20), record(storage.RangeShared, 40, 10), record(storage.RangeExclusive, 50, math.MaxInt64-49)}},
+		{subtract(record(storage.RangeShared, math.MaxInt64, 1)), []storage.RangeCommand{record(storage.RangeShared, 0, 20), record(storage.RangeShared, 40, 10), record(storage.RangeExclusive, 50, math.MaxInt64-50)}},
 	}
 	for _, step := range steps {
-		result := set(t, s, 1, 7, step.lock)
-		if step.lock.Type == storage.Unlock {
-			wantState(t, result, storage.LockReleased, 0)
-		} else {
-			wantState(t, result, storage.LockGranted, 0)
+		result := apply(t, s, 1, o, step.command)
+		state := storage.Granted
+		if step.command.Edit == storage.Subtract {
+			state = storage.Released
 		}
-		if got := c.owners[key].ranges; !reflect.DeepEqual(got, step.ranges) {
-			t.Fatalf("ranges = %+v; want %+v", got, step.ranges)
+		wantState(t, result, state, "")
+		var got []storage.RangeCommand
+		for _, held := range c.owners[s.key(1, o, storage.DomainRecord)].ranges {
+			got = append(got, held.command)
+		}
+		if !reflect.DeepEqual(got, step.want) {
+			t.Fatalf("ranges = %+v; want %+v", got, step.want)
 		}
 	}
 }
 
-func TestFamiliesOwnersAndDiagnosticPID(t *testing.T) {
+func TestDomainsOwnersAndDiagnostics(t *testing.T) {
 	c := fixture(t, DefaultConfig())
 	a, b := session(t, c), session(t, c)
-	lock := posix(storage.Exclusive, 3, 8)
-	lock.PID = 123
-	wantState(t, set(t, a, 1, 9, lock), storage.LockGranted, 0)
-	wantState(t, set(t, b, 1, 9, flock(storage.Exclusive)), storage.LockGranted, 0)
-	wantState(t, set(t, b, 1, 9, lock), storage.LockRejected, syscall.EAGAIN)
+	ao := ownerWithDiagnostic(t, a, 1, 0, 101)
+	another := ownerWithDiagnostic(t, a, 1, 0, 202)
+	bo := ownerWithDiagnostic(t, b, 1, 0, 303)
+	command := record(storage.RangeExclusive, 3, 6)
+	wantState(t, apply(t, a, 1, ao, command), storage.Granted, "")
+	wantState(t, apply(t, b, 1, bo, whole(storage.RangeExclusive)), storage.Granted, "")
+	wantState(t, apply(t, b, 1, bo, command), storage.Rejected, storage.RangeBlocked)
 	for _, test := range []struct {
 		s     *Session
-		owner storage.LockOwner
+		owner storage.UseOwner
 		found bool
-		pid   uint32
-	}{{a, 9, false, 0}, {a, 10, true, 123}, {b, 9, true, 0}} {
-		got, err := test.s.Get(background, 1, test.owner, lock)
-		if err != nil || got.Found != test.found || got.Lock.PID != test.pid {
+		diag  storage.OwnerDiagnostic
+	}{{a, ao, false, 0}, {a, another, true, 101}, {b, bo, true, 101}} {
+		got, err := test.s.GetConflict(background, 1, test.owner, command, ordered)
+		if err != nil || got.Found != test.found || got.Owner != test.diag {
 			t.Fatalf("conflict = %+v, %v", got, err)
 		}
 	}
 	if err := b.IOHealth(background, 1); err != nil {
-		t.Fatalf("ordinary I/O joined advisory conflict checks: %v", err)
+		t.Fatalf("I/O health joined advisory conflicts: %v", err)
 	}
 }
 
-func TestFlockAndPOSIXConversion(t *testing.T) {
-	for _, family := range []storage.LockFamily{storage.Flock, storage.POSIX} {
-		t.Run(map[storage.LockFamily]string{storage.Flock: "flock", storage.POSIX: "POSIX"}[family], func(t *testing.T) {
+func TestConversionPreservesOrDropsOriginal(t *testing.T) {
+	for _, domain := range []storage.ConflictDomain{storage.DomainRecord, storage.DomainWholeFile} {
+		t.Run(fmt.Sprint(domain), func(t *testing.T) {
 			c := fixture(t, DefaultConfig())
 			a, b := session(t, c), session(t, c)
-			shared := flock(storage.Shared)
-			shared.Family = family
-			wantState(t, set(t, a, 1, 1, shared), storage.LockGranted, 0)
-			wantState(t, set(t, a, 1, 1, shared), storage.LockGranted, 0)
-			if c.ranges != 1 {
-				t.Fatal("repeated same-mode lock increased range count")
+			ao, bo := owner(t, a, 1, 0), owner(t, b, 1, 0)
+			shared := whole(storage.RangeShared)
+			shared.Domain = domain
+			if domain == storage.DomainRecord {
+				shared.Conversion = storage.PreserveBeforeAcquire
 			}
-			wantState(t, set(t, b, 1, 1, shared), storage.LockGranted, 0)
+			wantState(t, apply(t, a, 1, ao, shared), storage.Granted, "")
+			wantState(t, apply(t, a, 1, ao, shared), storage.Granted, "")
+			if c.ranges != 1 {
+				t.Fatal("repeated acquisition increased range count")
+			}
+			wantState(t, apply(t, b, 1, bo, shared), storage.Granted, "")
 			exclusive := shared
-			exclusive.Type = storage.Exclusive
-			wantState(t, set(t, a, 1, 1, exclusive), storage.LockRejected, syscall.EAGAIN)
-			result := set(t, b, 1, 1, exclusive)
-			if family == storage.Flock {
-				wantState(t, result, storage.LockGranted, 0)
+			exclusive.Mode = storage.RangeExclusive
+			failed := apply(t, a, 1, ao, exclusive)
+			wantState(t, failed, storage.Rejected, storage.RangeBlocked)
+			next := apply(t, b, 1, bo, exclusive)
+			if domain == storage.DomainWholeFile {
+				wantState(t, next, storage.Granted, "")
+				if len(failed.Effects) != 1 || !failed.Effects[0].Released {
+					t.Fatal("conversion receipt lost the original release")
+				}
 			} else {
-				wantState(t, result, storage.LockRejected, syscall.EAGAIN)
+				wantState(t, next, storage.Rejected, storage.RangeBlocked)
+				if len(failed.Effects) != 0 {
+					t.Fatal("preserving conversion reported a release")
+				}
 			}
 		})
 	}
 }
 
-func TestCrossFileDeadlock(t *testing.T) {
+func TestConversionAllowsEarlierWaiterToAcquire(t *testing.T) {
 	c := fixture(t, DefaultConfig())
 	a, b := session(t, c), session(t, c)
-	lock := posix(storage.Exclusive, 0, 99)
-	wantState(t, set(t, a, 1, 1, lock), storage.LockGranted, 0)
-	wantState(t, set(t, b, 2, 1, lock), storage.LockGranted, 0)
-	lock.Wait = true
-	pending := set(t, a, 2, 1, lock)
-	wantState(t, pending, storage.LockPending, 0)
-	wantState(t, set(t, b, 1, 1, lock), storage.LockRejected, syscall.EDEADLK)
-	if err := b.Drop(background, 2, 1, storage.POSIX); err != nil {
-		t.Fatal(err)
-	}
-	got, err := a.Query(background, 2, 1, pending.Request)
+	ao, bo := owner(t, a, 1, 0), owner(t, b, 1, 0)
+	wantState(t, apply(t, a, 1, ao, whole(storage.RangeExclusive)), storage.Granted, "")
+	wait := whole(storage.RangeExclusive)
+	wait.Wait = true
+	pending := apply(t, b, 1, bo, wait)
+	wantState(t, pending, storage.Pending, "")
+	wantState(t, apply(t, a, 1, ao, whole(storage.RangeShared)), storage.Rejected, storage.RangeBlocked)
+	got, err := b.Query(background, 1, bo, pending.Request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantState(t, got, storage.LockGranted, 0)
+	wantState(t, got, storage.Granted, "")
 }
 
-func TestCancelGrantRaceHasKnownOutcome(t *testing.T) {
-	for range 32 {
+func TestDeadlockGroupsAcrossFilesAndSessionIsolation(t *testing.T) {
+	c := fixture(t, DefaultConfig())
+	a, b := session(t, c), session(t, c)
+	a1, a2 := owner(t, a, 1, 7), owner(t, a, 2, 7)
+	b1, b2 := owner(t, b, 1, 7), owner(t, b, 2, 7)
+	lock := record(storage.RangeExclusive, 0, 100)
+	wantState(t, apply(t, a, 1, a1, lock), storage.Granted, "")
+	wantState(t, apply(t, b, 2, b2, lock), storage.Granted, "")
+	lock.Wait = true
+	pending := apply(t, a, 2, a2, lock)
+	wantState(t, pending, storage.Pending, "")
+	wantState(t, apply(t, b, 1, b1, lock), storage.Rejected, storage.RangeDeadlock)
+	if err := b.RetireOwner(background, b2); err != nil {
+		t.Fatal(err)
+	}
+	got, err := a.Query(background, 2, a2, pending.Request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantState(t, got, storage.Granted, "")
+}
+
+func TestCancellationAndGrantRace(t *testing.T) {
+	for range 50 {
 		c := fixture(t, DefaultConfig())
-		a, b, observer := session(t, c), session(t, c), session(t, c)
-		lock := posix(storage.Exclusive, 0, 99)
-		wantState(t, set(t, a, 1, 1, lock), storage.LockGranted, 0)
+		a, b := session(t, c), session(t, c)
+		ao, bo := owner(t, a, 1, 0), owner(t, b, 1, 0)
+		lock := whole(storage.RangeExclusive)
+		wantState(t, apply(t, a, 1, ao, lock), storage.Granted, "")
 		lock.Wait = true
-		pending := set(t, b, 1, 1, lock)
-		wantState(t, pending, storage.LockPending, 0)
+		pending := apply(t, b, 1, bo, lock)
 		start := make(chan struct{})
 		var wg sync.WaitGroup
-		var cancelled storage.LockAttempt
+		var cancelled storage.RangeAttempt
 		var cancelErr, dropErr error
 		wg.Add(2)
-		go func() { defer wg.Done(); <-start; cancelled, cancelErr = b.Cancel(background, 1, 1, pending.Request) }()
-		go func() { defer wg.Done(); <-start; dropErr = a.Drop(background, 1, 1, storage.POSIX) }()
+		go func() { defer wg.Done(); <-start; cancelled, cancelErr = b.Cancel(background, 1, bo, pending.Request) }()
+		go func() { defer wg.Done(); <-start; dropErr = a.Drop(background, 1, ao, storage.DomainWholeFile) }()
 		close(start)
 		wg.Wait()
 		if cancelErr != nil || dropErr != nil {
-			t.Fatalf("cancel %v; drop %v", cancelErr, dropErr)
+			t.Fatalf("cancel=%v drop=%v", cancelErr, dropErr)
 		}
-		conflict, err := observer.Get(background, 1, 1, lock)
+		conflict, err := a.GetConflict(background, 1, ao, whole(storage.RangeExclusive), ordered)
 		if err != nil {
 			t.Fatal(err)
 		}
 		switch cancelled.State {
-		case storage.LockCancelled:
-			if cancelled.EverGranted || conflict.Found {
-				t.Fatalf("cancelled acquisition survived: %+v %+v", cancelled, conflict)
+		case storage.Cancelled:
+			if conflict.Found || cancelled.EverGranted {
+				t.Fatal("confirmed cancellation left a grant")
 			}
-		case storage.LockGranted:
-			if !cancelled.EverGranted || !conflict.Found {
-				t.Fatalf("granted acquisition disappeared: %+v %+v", cancelled, conflict)
+		case storage.Granted:
+			if !conflict.Found || !cancelled.EverGranted {
+				t.Fatal("winning grant disappeared")
 			}
 		default:
-			t.Fatalf("unsettled cancellation: %+v", cancelled)
+			t.Fatalf("unexpected cancel state %+v", cancelled)
 		}
 	}
 }
 
-func TestEpochRetainsPendingAndRefusesExpiredReplay(t *testing.T) {
+func TestPendingGrantRechecksNativeOrder(t *testing.T) {
+	c := fixture(t, DefaultConfig())
+	a, b := session(t, c), session(t, c)
+	ao, bo := owner(t, a, 1, 0), owner(t, b, 1, 0)
+	wantState(t, apply(t, a, 1, ao, whole(storage.RangeExclusive)), storage.Granted, "")
+	alive := true
+	var gate sync.Mutex
+	order := func(ctx context.Context, transition func() error) error {
+		if !c.mu.TryLock() {
+			t.Error("native order entered with coordinator mutex held")
+			return syscall.EIO
+		}
+		c.mu.Unlock()
+		gate.Lock()
+		defer gate.Unlock()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !alive {
+			return syscall.ESTALE
+		}
+		return transition()
+	}
+	lock := whole(storage.RangeExclusive)
+	lock.Wait = true
+	ctx, cancel := context.WithCancel(background)
+	pending, err := b.Apply(ctx, 1, bo, []storage.RangeCommand{lock}, requestID(t, b), order)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantState(t, pending, storage.Pending, "")
+	alive = false
+	if err := a.Drop(background, 1, ao, storage.DomainWholeFile); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Query(background, 1, bo, pending.Request); !errors.Is(err, syscall.ESTALE) {
+		t.Fatalf("stale native reference granted pending lock: %v", err)
+	}
+	alive = true
+	got, err := b.Query(background, 1, bo, pending.Request)
+	if err != nil {
+		t.Fatalf("new query retained original cancelled context: %v", err)
+	}
+	wantState(t, got, storage.Granted, "")
+}
+
+func TestPendingHistorySurvivesEpochChanges(t *testing.T) {
 	c := fixture(t, DefaultConfig())
 	now := time.Unix(1000, 0)
 	c.now = func() time.Time { return now }
 	a, b := session(t, c), session(t, c)
-	lock := posix(storage.Exclusive, 0, 99)
-	wantState(t, set(t, a, 1, 1, lock), storage.LockGranted, 0)
+	ao, bo := owner(t, a, 1, 0), owner(t, b, 1, 0)
+	lock := whole(storage.RangeExclusive)
+	wantState(t, apply(t, a, 1, ao, lock), storage.Granted, "")
 	lock.Wait = true
-	pending := set(t, b, 1, 1, lock)
-	wantState(t, pending, storage.LockPending, 0)
+	pending := apply(t, b, 1, bo, lock)
 	for range 3 {
-		now = now.Add(2 * time.Minute)
-		if _, err := b.Epoch(background); err != nil {
-			t.Fatal(err)
-		}
-		got, err := b.Query(background, 1, 1, pending.Request)
+		now = now.Add(2 * b.options.History)
+		got, err := b.Query(background, 1, bo, pending.Request)
 		if err != nil {
 			t.Fatal(err)
 		}
-		wantState(t, got, storage.LockPending, 0)
+		wantState(t, got, storage.Pending, "")
 	}
-	if err := a.Drop(background, 1, 1, storage.POSIX); err != nil {
+	if err := a.Drop(background, 1, ao, storage.DomainWholeFile); err != nil {
 		t.Fatal(err)
 	}
-	got, err := b.Query(background, 1, 1, pending.Request)
+	got, err := b.Query(background, 1, bo, pending.Request)
+	if err != nil || got.HistoryRemaining != b.options.History {
+		t.Fatalf("completion history = %+v %v", got, err)
+	}
+	wantState(t, got, storage.Granted, "")
+	if err := b.Drop(background, 1, bo, storage.DomainWholeFile); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := b.Apply(background, 1, bo, []storage.RangeCommand{lock}, pending.Request, ordered)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantState(t, got, storage.LockGranted, 0)
-	if got.HistoryRemaining != b.options.History {
-		t.Fatal("old pending epoch shortened completed history")
-	}
-	if err := b.Drop(background, 1, 1, storage.POSIX); err != nil {
-		t.Fatal(err)
-	}
-	got, err = b.Set(background, 1, 1, lock, pending.Request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantState(t, got, storage.LockReleased, 0)
-	now = now.Add(2 * time.Minute)
-	if _, err := b.Set(background, 1, 1, lock, pending.Request); !errors.Is(err, syscall.ESTALE) {
-		t.Fatalf("expired replay = %v", err)
-	}
-	conflict, err := a.Get(background, 1, 1, lock)
-	if err != nil || conflict.Found {
-		t.Fatalf("expired replay reacquired lock: %+v %v", conflict, err)
+	wantState(t, replayed, storage.Released, "")
+	now = now.Add(2 * b.options.History)
+	if _, err := b.Apply(background, 1, bo, []storage.RangeCommand{lock}, pending.Request, ordered); !errors.Is(err, syscall.ESTALE) {
+		t.Fatalf("retired request was executed again: %v", err)
 	}
 }
 
-func TestDropIsScopedToFileOwnerAndFamily(t *testing.T) {
+func TestRetirementPreservesProtectionUntilFenceSucceeds(t *testing.T) {
+	c := fixture(t, DefaultConfig())
+	failed := true
+	a, err := c.NewSession(storage.DefaultFileSessionOptions(), func() error {
+		if failed {
+			return syscall.EIO
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := session(t, c)
+	ao, bo := owner(t, a, 1, 0), owner(t, b, 1, 0)
+	wantState(t, apply(t, a, 1, ao, whole(storage.RangeExclusive)), storage.Granted, "")
+	if err := a.Retire(background); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("failed fence = %v", err)
+	}
+	wantState(t, apply(t, b, 1, bo, whole(storage.RangeExclusive)), storage.Rejected, storage.RangeBlocked)
+	if err := a.IOHealth(background, 1); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("failed retirement accepted I/O: %v", err)
+	}
+	failed = false
+	if err := a.Retire(background); err != nil {
+		t.Fatal(err)
+	}
+	wantState(t, apply(t, b, 1, bo, whole(storage.RangeExclusive)), storage.Granted, "")
+}
+
+func TestDropIsScopedToNodeOwnerAndDomain(t *testing.T) {
 	c := fixture(t, DefaultConfig())
 	s, observer := session(t, c), session(t, c)
+	a, b, other := owner(t, s, 1, 1), owner(t, s, 2, 1), owner(t, s, 1, 0)
+	w1, w2 := owner(t, observer, 1, 0), owner(t, observer, 2, 0)
 	for _, test := range []struct {
-		node  uint64
-		owner storage.LockOwner
-		lock  storage.FileLock
-	}{{1, 1, posix(storage.Exclusive, 0, 10)}, {2, 1, posix(storage.Exclusive, 0, 10)}, {1, 2, posix(storage.Exclusive, 20, 30)}, {1, 1, flock(storage.Exclusive)}} {
-		wantState(t, set(t, s, test.node, test.owner, test.lock), storage.LockGranted, 0)
+		node    uint64
+		owner   storage.UseOwner
+		command storage.RangeCommand
+	}{{1, a, record(storage.RangeExclusive, 0, 10)}, {2, b, record(storage.RangeExclusive, 0, 10)},
+		{1, other, record(storage.RangeExclusive, 20, 10)}, {1, a, whole(storage.RangeExclusive)}} {
+		wantState(t, apply(t, s, test.node, test.owner, test.command), storage.Granted, "")
 	}
-	if err := s.Drop(background, 1, 1, storage.POSIX); err != nil {
+	if err := s.Drop(background, 1, a, storage.DomainRecord); err != nil {
 		t.Fatal(err)
 	}
 	for _, test := range []struct {
-		node  uint64
-		lock  storage.FileLock
-		found bool
-	}{{1, posix(storage.Exclusive, 0, 10), false}, {2, posix(storage.Exclusive, 0, 10), true}, {1, posix(storage.Exclusive, 20, 30), true}, {1, flock(storage.Exclusive), true}} {
-		got, err := observer.Get(background, test.node, 1, test.lock)
+		node    uint64
+		owner   storage.UseOwner
+		command storage.RangeCommand
+		found   bool
+	}{{1, w1, record(storage.RangeExclusive, 0, 10), false}, {2, w2, record(storage.RangeExclusive, 0, 10), true},
+		{1, w1, record(storage.RangeExclusive, 20, 10), true}, {1, w1, whole(storage.RangeExclusive), true}} {
+		got, err := observer.GetConflict(background, test.node, test.owner, test.command, ordered)
 		if err != nil || got.Found != test.found {
-			t.Fatalf("conflict = %+v, %v", got, err)
+			t.Fatalf("scoped drop conflict = %+v %v", got, err)
 		}
 	}
 }
 
-func TestRetirementFencesBeforeGrantRelease(t *testing.T) {
+func TestConcurrentRetirementFencesBeforeGrantRelease(t *testing.T) {
 	c := fixture(t, DefaultConfig())
 	entered, release := make(chan struct{}), make(chan struct{})
 	a, err := c.NewSession(storage.DefaultFileSessionOptions(), func() error { close(entered); <-release; return nil })
@@ -296,80 +432,70 @@ func TestRetirementFencesBeforeGrantRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := session(t, c)
-	wantState(t, set(t, a, 1, 1, flock(storage.Exclusive)), storage.LockGranted, 0)
-	lock := flock(storage.Exclusive)
+	ao, bo := owner(t, a, 1, 0), owner(t, b, 1, 0)
+	wantState(t, apply(t, a, 1, ao, whole(storage.RangeExclusive)), storage.Granted, "")
+	lock := whole(storage.RangeExclusive)
 	lock.Wait = true
-	pending := set(t, b, 1, 1, lock)
+	pending := apply(t, b, 1, bo, lock)
 	done := make(chan error, 1)
 	go func() { done <- a.Retire(background) }()
 	<-entered
+	ctx, cancel := context.WithCancel(background)
+	cancel()
+	if err := a.Retire(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled concurrent retirement = %v", err)
+	}
 	if err := a.IOHealth(background, 1); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("retiring I/O = %v", err)
 	}
-	got, err := b.Query(background, 1, 1, pending.Request)
+	got, err := b.Query(background, 1, bo, pending.Request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantState(t, got, storage.LockPending, 0)
+	wantState(t, got, storage.Pending, "")
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	got, err = b.Query(background, 1, 1, pending.Request)
+	got, err = b.Query(background, 1, bo, pending.Request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantState(t, got, storage.LockGranted, 0)
-	if err := a.IOHealth(background, 1); !errors.Is(err, syscall.ESTALE) {
-		t.Fatalf("retired I/O = %v", err)
-	}
+	wantState(t, got, storage.Granted, "")
 	if err := a.Retire(background); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestFailedRetirementPreservesGrants(t *testing.T) {
-	c := fixture(t, DefaultConfig())
-	failure := errors.New("publication fence failed")
-	a, err := c.NewSession(storage.DefaultFileSessionOptions(), func() error { return failure })
-	if err != nil {
-		t.Fatal(err)
-	}
-	b := session(t, c)
-	wantState(t, set(t, a, 1, 1, flock(storage.Exclusive)), storage.LockGranted, 0)
-	if err := a.Retire(background); !errors.Is(err, failure) {
-		t.Fatalf("retire = %v", err)
-	}
-	wantState(t, set(t, b, 1, 1, flock(storage.Exclusive)), storage.LockRejected, syscall.EAGAIN)
-	if err := a.IOHealth(background, 1); !errors.Is(err, syscall.EIO) {
-		t.Fatalf("failed-retirement I/O = %v", err)
-	}
-	failure = nil
-	if err := a.Retire(background); err != nil {
-		t.Fatal(err)
-	}
-	wantState(t, set(t, b, 1, 1, flock(storage.Exclusive)), storage.LockGranted, 0)
 }
 
 func TestQueuedRangeDowngradeWakesEarlierWaiter(t *testing.T) {
 	c := fixture(t, DefaultConfig())
 	a, b, waiter := session(t, c), session(t, c), session(t, c)
-	wantState(t, set(t, a, 1, 1, posix(storage.Exclusive, 10, 19)), storage.LockGranted, 0)
-	wantState(t, set(t, b, 1, 1, posix(storage.Exclusive, 0, 9)), storage.LockGranted, 0)
-	firstLock := posix(storage.Shared, 0, 9)
+	ao, bo, wo := owner(t, a, 1, 0), owner(t, b, 1, 0), owner(t, waiter, 1, 0)
+	wantState(t, apply(t, a, 1, ao, record(storage.RangeExclusive, 10, 10)), storage.Granted, "")
+	wantState(t, apply(t, b, 1, bo, record(storage.RangeExclusive, 0, 10)), storage.Granted, "")
+	firstLock := record(storage.RangeShared, 0, 10)
 	firstLock.Wait = true
-	first := set(t, waiter, 1, 1, firstLock)
-	wantState(t, first, storage.LockPending, 0)
-	secondLock := posix(storage.Shared, 0, 19)
+	first := apply(t, waiter, 1, wo, firstLock)
+	wantState(t, first, storage.Pending, "")
+	secondLock := record(storage.RangeShared, 0, 20)
 	secondLock.Wait = true
-	second := set(t, b, 1, 1, secondLock)
-	wantState(t, second, storage.LockPending, 0)
-	if err := a.Drop(background, 1, 1, storage.POSIX); err != nil {
+	wantState(t, apply(t, b, 1, bo, secondLock), storage.Pending, "")
+	if err := a.Drop(background, 1, ao, storage.DomainRecord); err != nil {
 		t.Fatal(err)
 	}
-	got, err := waiter.Query(background, 1, 1, first.Request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantState(t, got, storage.LockGranted, 0)
+	c.mu.Lock()
+	got := waiter.receiptLocked(waiter.actions[first.Request], c.now())
+	c.mu.Unlock()
+	wantState(t, got, storage.Granted, "")
+}
+
+func TestIndependentOwnerDoesNotAliasSameNumberedGroup(t *testing.T) {
+	c := fixture(t, DefaultConfig())
+	s := session(t, c)
+	independent := owner(t, s, 1, 0)
+	grouped := owner(t, s, 1, uint64(independent))
+	wantState(t, apply(t, s, 1, independent, record(storage.RangeExclusive, 0, 10)), storage.Granted, "")
+	wait := record(storage.RangeExclusive, 0, 10)
+	wait.Wait = true
+	wantState(t, apply(t, s, 1, grouped, wait), storage.Pending, "")
 }

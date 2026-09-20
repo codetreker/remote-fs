@@ -8,7 +8,6 @@ import (
 	"embed"
 	"errors"
 	"fmt"
-	"io/fs"
 	"math"
 	"syscall"
 	"time"
@@ -24,7 +23,9 @@ import (
 // it; 0002_replication.sql rekeys the entry table and adds the change log;
 // 0003_durable_state.sql adds the backing-store binding and durable identity witnesses;
 // 0004_lease_recovery.sql stores prepared and accepted lease-duration evidence;
-// 0005_retained_files.sql records unnamed retained files and their content revisions.
+// 0005_retained_files.sql records unnamed retained files and their content revisions;
+// 0006_neutral_metadata.sql separates node kind and adds common times, canonical opaque
+// metadata, and exact retained-metadata accounting.
 //
 // packages/sqliteschema documents what a numbered set of files buys and what rule they are kept
 // under: a file that has landed is never edited, and a schema change is a new file.
@@ -39,6 +40,8 @@ var schema = sqliteschema.MustLoad(migrationFiles, "migrations")
 const firstOwnershipAwareSchemaVersion = 3
 
 const firstRetainedFileSchemaVersion = 5
+
+const firstNeutralMetadataSchemaVersion = 6
 
 // VolumeOpenMode decides whether preparation may create the named volume.
 type VolumeOpenMode uint8
@@ -57,8 +60,6 @@ type DurableOpen struct {
 	Witnessed    bool
 }
 
-const rootDirectoryMode fs.FileMode = 0o755
-
 // Prepare brings the database to the layout this build writes, and returns the id of the
 // named volume and of its root directory, creating both when the volume is new.
 //
@@ -73,8 +74,19 @@ func Prepare(
 	window changes.Window,
 	maxIntegrityRecords, maxIntegrityBytes int64,
 ) (id, root int64, err error) {
-	id, root, _, err = PrepareConfigured(
-		ctx, db, volume, storeID, window, maxIntegrityRecords, maxIntegrityBytes, nil,
+	return PrepareWithMetadataLimit(ctx, db, volume, storeID, window, maxIntegrityRecords, maxIntegrityBytes, 64<<20)
+
+}
+
+func PrepareWithMetadataLimit(
+	ctx context.Context,
+	db *sql.DB,
+	volume, storeID string,
+	window changes.Window,
+	maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes int64,
+) (id, root int64, err error) {
+	id, root, _, err = PrepareConfiguredWithMetadataPolicy(
+		ctx, db, volume, storeID, window, maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes, false, nil,
 	)
 	return id, root, err
 }
@@ -88,6 +100,31 @@ func PrepareConfigured(
 	volume, storeID string,
 	window changes.Window,
 	maxIntegrityRecords, maxIntegrityBytes int64,
+	durable *DurableOpen,
+) (id, root int64, state dbstate.State, err error) {
+	return PrepareConfiguredWithMetadataLimit(ctx, db, volume, storeID, window,
+		maxIntegrityRecords, maxIntegrityBytes, 64<<20, durable)
+}
+
+func PrepareConfiguredWithMetadataLimit(
+	ctx context.Context,
+	db *sql.DB,
+	volume, storeID string,
+	window changes.Window,
+	maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes int64,
+	durable *DurableOpen,
+) (id, root int64, state dbstate.State, err error) {
+	return PrepareConfiguredWithMetadataPolicy(ctx, db, volume, storeID, window,
+		maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes, false, durable)
+}
+
+func PrepareConfiguredWithMetadataPolicy(
+	ctx context.Context,
+	db *sql.DB,
+	volume, storeID string,
+	window changes.Window,
+	maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes int64,
+	opaqueMetadataVersions bool,
 	durable *DurableOpen,
 ) (id, root int64, state dbstate.State, err error) {
 	conn, err := db.Conn(ctx)
@@ -123,8 +160,9 @@ func PrepareConfigured(
 			version, syscall.EIO)
 	}
 	legacy := recorded && version > 0 && version < firstOwnershipAwareSchemaVersion
-	if recorded && version >= firstOwnershipAwareSchemaVersion && version < firstRetainedFileSchemaVersion {
-		if err := validateIntegrity(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes, version); err != nil {
+	if recorded && version >= firstOwnershipAwareSchemaVersion && version < firstNeutralMetadataSchemaVersion {
+		if err := validateIntegrityWithMetadataPolicy(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes,
+			version, maxMetadataBytes, opaqueMetadataVersions); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 	}
@@ -148,7 +186,7 @@ func PrepareConfigured(
 		} else if err := validateNodeRelationshipsVersion(ctx, tx, nil, version); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
-		if err := validateUsedAccounting(ctx, tx, nil); err != nil {
+		if err := validateUsedAccountingVersion(ctx, tx, nil, version); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 		// Version 1 predates the log tables. Version 2's rows and recorded tail are
@@ -160,26 +198,20 @@ func PrepareConfigured(
 			}
 		}
 	}
+	if recorded && version >= 1 && version < firstNeutralMetadataSchemaVersion {
+		if err := validateLegacyModeMapping(ctx, tx, version); err != nil {
+			return 0, 0, dbstate.State{}, err
+		}
+	}
 	if err := schema.Reach(ctx, tx); err != nil {
 		return 0, 0, dbstate.State{}, err
 	}
 	// Version 1 did not carry volume on entries. Validate the global rooted tree and used
 	// accounting after the migrations normalize that table, while the same transaction can
 	// still roll every schema change back on refusal.
-	if legacy {
-		if err := validateStorageClasses(ctx, tx, nil); err != nil {
-			return 0, 0, dbstate.State{}, err
-		}
-		if err := validateNodeValues(ctx, tx, nil); err != nil {
-			return 0, 0, dbstate.State{}, err
-		}
-		if err := validateNodeRelationships(ctx, tx, nil); err != nil {
-			return 0, 0, dbstate.State{}, err
-		}
-		if err := validateUsedAccounting(ctx, tx, nil); err != nil {
-			return 0, 0, dbstate.State{}, err
-		}
-		if err := validateLogIntegrity(ctx, tx, nil); err != nil {
+	if !recorded || version < firstNeutralMetadataSchemaVersion {
+		if err := validateIntegrityWithMetadataPolicy(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes,
+			schema.Version(), math.MaxInt64, opaqueMetadataVersions); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 	}
@@ -203,11 +235,13 @@ func PrepareConfigured(
 	case err != nil:
 		return 0, 0, dbstate.State{}, err
 	}
-	if err := ValidateVolumeIntegrity(ctx, tx, id, maxIntegrityRecords, maxIntegrityBytes); err != nil {
+	if err := validateIntegrityWithMetadataPolicy(ctx, tx, &id, maxIntegrityRecords, maxIntegrityBytes,
+		schema.Version(), maxMetadataBytes, opaqueMetadataVersions); err != nil {
 		return 0, 0, dbstate.State{}, err
 	}
 	if durable != nil && durable.ReapDetached {
-		if err := validateIntegrity(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes, schema.Version()); err != nil {
+		if err := validateIntegrityWithMetadataPolicy(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes,
+			schema.Version(), math.MaxInt64, opaqueMetadataVersions); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 		if err := reapDetachedFiles(ctx, tx); err != nil {
@@ -341,8 +375,7 @@ func createVolume(ctx context.Context, tx *sql.Tx, volume string) (id, root int6
 		return 0, 0, err
 	}
 
-	// The root is a directory nobody made, so it gets the mode a directory is made with and
-	// the moment the volume came into being.
+	// The root is a directory nobody made, so it gets the moment the volume came into being.
 	now := time.Now()
 	sec, nsec := sqlvalue.StoredTime(now)
 	root, err = dbstate.AllocateNodeID(ctx, tx)
@@ -350,9 +383,10 @@ func createVolume(ctx context.Context, tx *sql.Tx, volume string) (id, root int6
 		return 0, 0, err
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-		VALUES (?, ?, ?, 0, ?, ?, ?, ?, NULL)`,
-		root, id, int64(fs.ModeDir|rootDirectoryMode), sec, nsec, sec, nsec)
+		INSERT INTO nodes (id, volume, kind, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec,
+		                   content, birth_sec, birth_nsec, change_sec, change_nsec)
+		VALUES (?, ?, 2, 0, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
+		root, id, sec, nsec, sec, nsec, sec, nsec, sec, nsec)
 	if err != nil {
 		return 0, 0, err
 	}

@@ -3,8 +3,6 @@ package changes
 import (
 	"database/sql"
 	"errors"
-	"io/fs"
-	"math"
 	"reflect"
 	"strings"
 	"syscall"
@@ -12,6 +10,7 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/storage"
 
 	_ "modernc.org/sqlite"
 )
@@ -23,16 +22,9 @@ func TestChangeMetadataDecoderNamesInvalidScalarStorage(t *testing.T) {
 	}
 	defer db.Close()
 
-	_, _, _, err = scanChangeMetadata(db.QueryRowContext(t.Context(), `
-		SELECT
-			7, typeof(7), 0, typeof(0), 1, typeof(1), 0, typeof(0),
-			1, typeof(1), 0, typeof(NULL),
-			'bad-parent', typeof('bad-parent'), 0, typeof(NULL),
-			NULL, typeof(NULL), NULL, typeof(NULL), NULL, typeof(NULL),
-			NULL, typeof(NULL), NULL, typeof(NULL),
-			NULL, typeof(NULL), NULL, typeof(NULL),
-			0, typeof(NULL),
-			0, typeof(0), 0, typeof(0)`), 1)
+	values := metadataValues()
+	values["from_parent"] = "bad-parent"
+	_, _, _, err = scanChangeMetadata(metadataQuery(db, values), 1)
 	if !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), "change 7 stores from_parent as text") {
 		t.Fatalf("decoding a text from_parent returned %v", err)
 	}
@@ -46,14 +38,16 @@ func metadataValues() map[string]any {
 	return map[string]any{
 		"position": int64(7), "previous_position": int64(6), "volume": int64(1), "kind": KindCreated,
 		"parent": int64(1), "name": []byte("file"), "from_parent": nil, "from_name": nil,
-		"node": int64(2), "mode": int64(0644), "size": int64(4),
+		"node": int64(2), "node_kind": int64(storage.NodeRegular), "size": int64(4),
 		"atime_sec": int64(-100), "atime_nsec": int64(123), "mtime_sec": int64(100), "mtime_nsec": int64(456),
 		"content": "body", "recorded_sec": int64(200), "recorded_nsec": int64(0),
+		"birth_sec": nil, "birth_nsec": nil, "change_sec": nil, "change_nsec": nil,
+		"metadata": []byte{'R', 'F', 'M', 1, 0, 0},
 	}
 }
 
 func metadataQuery(db *sql.DB, values map[string]any) *sql.Row {
-	columns := []string{"position", "previous_position", "volume", "kind", "parent", "name", "from_parent", "from_name", "node", "mode", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content", "recorded_sec", "recorded_nsec"}
+	columns := []string{"position", "previous_position", "volume", "kind", "parent", "name", "from_parent", "from_name", "node", "node_kind", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content", "recorded_sec", "recorded_nsec", "birth_sec", "birth_nsec", "change_sec", "change_nsec", "metadata"}
 	var aliases []string
 	var args []any
 	for _, column := range columns {
@@ -79,12 +73,13 @@ func TestMetadataDecoderPreservesScalarsAndDefersPayloads(t *testing.T) {
 		want := fileChange(kind)
 		want.Position = 7
 		want.Name = []byte{}
-		lengths := metastore.ChangePayloadLengths{Name: 4, Content: 4}
+		lengths := metastore.ChangePayloadLengths{Name: 4, Content: 4, Metadata: 6}
 		if kind == metastore.Removed {
-			for _, column := range []string{"node", "mode", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content"} {
+			for _, column := range []string{"node", "node_kind", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content", "birth_sec", "birth_nsec", "change_sec", "change_nsec", "metadata"} {
 				values[column] = nil
 			}
 			lengths.Content = 0
+			lengths.Metadata = 0
 		} else {
 			want.Node.Content = ""
 		}
@@ -107,11 +102,11 @@ func TestMetadataDecoderPreservesScalarsAndDefersPayloads(t *testing.T) {
 	values["kind"] = KindModified
 	values["parent"] = int64(0)
 	values["name"] = nil
-	values["mode"] = int64(fs.ModeDir | 0755)
+	values["node_kind"] = int64(storage.NodeDirectory)
 	values["size"] = int64(0)
 	values["content"] = nil
 	got, _, _, err := scanChangeMetadata(metadataQuery(db, values), 1)
-	if err != nil || got.Parent != 0 || got.Name != nil || !got.Node.Mode.IsDir() {
+	if err != nil || got.Parent != 0 || got.Name != nil || !got.Node.IsDir() {
 		t.Fatalf("root directory metadata=%+v %v", got, err)
 	}
 }
@@ -122,7 +117,7 @@ func TestMetadataDecoderRejectsStorageClassesAndInconsistentFields(t *testing.T)
 		t.Fatal(err)
 	}
 	defer db.Close()
-	for _, column := range []string{"position", "previous_position", "volume", "kind", "parent", "from_parent", "node", "mode", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "recorded_sec", "recorded_nsec"} {
+	for _, column := range []string{"position", "previous_position", "volume", "kind", "parent", "from_parent", "node", "node_kind", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "recorded_sec", "recorded_nsec"} {
 		t.Run(column+" as text", func(t *testing.T) {
 			values := metadataValues()
 			values[column] = "bad"
@@ -151,15 +146,14 @@ func TestMetadataDecoderRejectsStorageClassesAndInconsistentFields(t *testing.T)
 		{"empty content", map[string]any{"content": ""}},
 		{"zero node", map[string]any{"node": int64(0)}},
 		{"negative size", map[string]any{"size": int64(-1)}},
-		{"negative mode", map[string]any{"mode": int64(-1)}},
-		{"overflow mode", map[string]any{"mode": int64(math.MaxUint32) + 1}},
-		{"special node", map[string]any{"mode": int64(fs.ModeSymlink)}},
-		{"directory bytes", map[string]any{"mode": int64(fs.ModeDir)}},
+		{"zero node kind", map[string]any{"node_kind": int64(0)}},
+		{"unsupported node kind", map[string]any{"node_kind": int64(4)}},
+		{"directory bytes", map[string]any{"node_kind": int64(storage.NodeDirectory)}},
 		{"missing content", map[string]any{"content": nil}},
 		{"missing created name", map[string]any{"name": nil}},
 		{"modified unnamed nonroot", map[string]any{"kind": KindModified, "name": nil}},
 		{"invalid rename source", map[string]any{"kind": KindRenamed, "from_parent": int64(0), "from_name": []byte("old")}},
-		{"removed carries content", map[string]any{"kind": KindRemoved, "node": nil, "mode": nil, "size": nil, "atime_sec": nil, "atime_nsec": nil, "mtime_sec": nil, "mtime_nsec": nil}},
+		{"removed carries content", map[string]any{"kind": KindRemoved, "node": nil, "node_kind": nil, "size": nil, "atime_sec": nil, "atime_nsec": nil, "mtime_sec": nil, "mtime_nsec": nil, "birth_sec": nil, "birth_nsec": nil, "change_sec": nil, "change_nsec": nil}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			values := metadataValues()

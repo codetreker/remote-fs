@@ -5,97 +5,16 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io/fs"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
-	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
-
-// nodeColumns is every column of a node, in the order nodeScan reads them. Queries that
-// join entries to nodes alias the node table `n`.
-const nodeColumns = `n.id, n.mode, n.size, n.atime_sec, n.atime_nsec, n.mtime_sec, n.mtime_nsec, n.content`
-
-// nodeAttrColumns omits content for bounded directory enumeration. A listing exposes Attr,
-// and loading a content key before the caller reserves an entry would defeat its byte bound.
-const nodeAttrColumns = `n.id, n.mode, n.size, n.atime_sec, n.atime_nsec, n.mtime_sec, n.mtime_nsec`
-
-// scanner is what a *sql.Row and a *sql.Rows have in common, so that one node reader serves
-// both the single lookups and the listing.
-type scanner interface{ Scan(dest ...any) error }
-
-// nodeScan holds a node's columns as the database spells them.
-//
-// It exists because Scan takes a whole row at once: a query that puts the name or the parent
-// in front of a node's columns cannot delegate to a reader that only knows about the node,
-// and three copies of the same eight-column scan are three places for the column order to
-// drift away from nodeColumns.
-type nodeScan struct {
-	id                 int64
-	mode               int64
-	size               int64
-	atimeSec, mtimeSec int64
-	atimeNsec          int32
-	mtimeNsec          int32
-	content            sql.NullString
-}
-
-type nodeAttrScan struct {
-	id                 int64
-	mode               int64
-	size               int64
-	atimeSec, mtimeSec int64
-	atimeNsec          int32
-	mtimeNsec          int32
-}
-
-func (s *nodeAttrScan) fields() []any {
-	return []any{&s.id, &s.mode, &s.size, &s.atimeSec, &s.atimeNsec, &s.mtimeSec, &s.mtimeNsec}
-}
-
-func (s *nodeAttrScan) attr() storage.Attr {
-	return storage.Attr{
-		ID:         uint64(s.id),
-		Mode:       fs.FileMode(s.mode),
-		Size:       s.size,
-		AccessTime: sqlvalue.LoadedTime(s.atimeSec, s.atimeNsec),
-		ModTime:    sqlvalue.LoadedTime(s.mtimeSec, s.mtimeNsec),
-	}
-}
-
-// fields are the destinations for nodeColumns, in that order.
-func (s *nodeScan) fields() []any {
-	return []any{&s.id, &s.mode, &s.size, &s.atimeSec, &s.atimeNsec, &s.mtimeSec, &s.mtimeNsec, &s.content}
-}
-
-// node renders what was scanned. content is NULL for a directory and for a file that has
-// never been written, and both of those are the empty Key: the contract has one absence, not
-// two.
-func (s *nodeScan) node() metastore.Node {
-	return metastore.Node{
-		ID:         s.id,
-		Mode:       fs.FileMode(s.mode),
-		Size:       s.size,
-		AccessTime: sqlvalue.LoadedTime(s.atimeSec, s.atimeNsec),
-		ModTime:    sqlvalue.LoadedTime(s.mtimeSec, s.mtimeNsec),
-		Content:    metastore.Key(s.content.String),
-	}
-}
-
-// scanNode reads one node's columns.
-func scanNode(row scanner) (metastore.Node, error) {
-	var node nodeScan
-	if err := row.Scan(node.fields()...); err != nil {
-		return metastore.Node{}, err
-	}
-	return node.node(), nil
-}
 
 // rootNode reads the directory the volume starts from. It is a node nobody made, and
 // nothing removes or replaces it.
@@ -178,10 +97,23 @@ func (s *Store) Stat(ctx context.Context, path string) (metastore.Node, error) {
 		return metastore.Node{}, pathError("stat", path, err)
 	}
 	var node metastore.Node
+	if _, ordered := metastore.FileAccessFrom(ctx); ordered {
+		if err := s.coordinator.commit.acquire(ctx); err != nil {
+			return metastore.Node{}, pathError("stat", path, err)
+		}
+		defer s.coordinator.commit.release()
+	}
 	if err := s.inspect(ctx, func(tx *sql.Tx) error {
-		found, err := s.resolve(ctx, tx, cleaned)
+		found, err := s.resolveReturnedNode(ctx, tx, cleaned)
 		node = found
-		return err
+		if err != nil {
+			return err
+		}
+		access, present := metastore.FileAccessFrom(ctx)
+		if !present {
+			return nil
+		}
+		return s.checkAccessIntent(ctx, metastore.FileState{Node: node}, storage.UseScope{}, access)
 	}); err != nil {
 		return metastore.Node{}, pathError("stat", path, sqlerr.Failure(err))
 	}
@@ -202,6 +134,13 @@ func (s *Store) List(ctx context.Context, path string) ([]metastore.Child, error
 		return nil, pathError("list", path, err)
 	}
 	var children []metastore.Child
+	enforceUses := s.CheckFileStore() == nil
+	if enforceUses {
+		if err := s.coordinator.commit.acquire(ctx); err != nil {
+			return nil, pathError("list", path, err)
+		}
+		defer s.coordinator.commit.release()
+	}
 	if err := s.inspect(ctx, func(tx *sql.Tx) error {
 		dir, err := s.resolve(ctx, tx, cleaned)
 		if err != nil {
@@ -209,6 +148,11 @@ func (s *Store) List(ctx context.Context, path string) ([]metastore.Child, error
 		}
 		if !dir.IsDir() {
 			return syscall.ENOTDIR
+		}
+		if enforceUses {
+			if err := s.fileDomain.coordinator.CheckUse(ctx, uint64(dir.ID), storage.UseScope{}, storage.ReadEntries); err != nil {
+				return err
+			}
 		}
 		children, err = s.listChildren(ctx, tx, dir.ID)
 		return err
@@ -234,6 +178,13 @@ func (s *Store) ListBounded(ctx context.Context, path string, result *storage.Li
 	if err != nil {
 		return pathError("list", path, err)
 	}
+	enforceUses := s.CheckFileStore() == nil
+	if enforceUses {
+		if err := s.coordinator.commit.acquire(ctx); err != nil {
+			return pathError("list", path, err)
+		}
+		defer s.coordinator.commit.release()
+	}
 	if err := s.inspect(ctx, func(tx *sql.Tx) error {
 		dir, err := s.resolve(ctx, tx, cleaned)
 		if err != nil {
@@ -241,6 +192,11 @@ func (s *Store) ListBounded(ctx context.Context, path string, result *storage.Li
 		}
 		if !dir.IsDir() {
 			return syscall.ENOTDIR
+		}
+		if enforceUses {
+			if err := s.fileDomain.coordinator.CheckUse(ctx, uint64(dir.ID), storage.UseScope{}, storage.ReadEntries); err != nil {
+				return err
+			}
 		}
 		return s.listChildrenBounded(ctx, tx, dir.ID, result)
 	}); err != nil {
@@ -250,9 +206,10 @@ func (s *Store) ListBounded(ctx context.Context, path string, result *storage.Li
 }
 
 type reservedChild struct {
-	node        int64
-	nameBytes   int64
-	reservation *storage.ListReservation
+	node          int64
+	nameBytes     int64
+	metadataBytes int64
+	reservation   *storage.ListReservation
 }
 
 func (s *Store) listChildrenBounded(ctx context.Context, tx *sql.Tx, parent int64, result *storage.ListResult) error {
@@ -273,12 +230,19 @@ func (s *Store) listChildrenBounded(ctx context.Context, tx *sql.Tx, parent int6
 			rows.Close()
 			return err
 		}
-		reservation, err := result.Reserve(nameBytes, node.attr())
+		attr, err := node.attr()
 		if err != nil {
 			rows.Close()
 			return err
 		}
-		reserved = append(reserved, reservedChild{node: node.id, nameBytes: nameBytes, reservation: reservation})
+		reservation, err := result.Reserve(nameBytes, node.metadataBytes, attr)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		reserved = append(reserved, reservedChild{
+			node: node.id, nameBytes: nameBytes, metadataBytes: node.metadataBytes, reservation: reservation,
+		})
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -293,7 +257,17 @@ func (s *Store) listChildrenBounded(ctx context.Context, tx *sql.Tx, parent int6
 		if err != nil {
 			return err
 		}
-		if err := child.reservation.Commit(name); err != nil {
+		var metadata []byte
+		if err := tx.QueryRowContext(ctx,
+			`SELECT metadata FROM nodes WHERE volume=? AND id=? AND length(metadata)=?`,
+			s.volume, child.node, child.metadataBytes).Scan(&metadata); err != nil {
+			return err
+		}
+		values, err := storage.DecodeMetadata(metadata)
+		if err != nil {
+			return err
+		}
+		if err := child.reservation.Commit(name, values); err != nil {
 			return err
 		}
 	}
@@ -356,7 +330,11 @@ func (s *Store) visitChildren(ctx context.Context, tx *sql.Tx, parent int64, add
 		if err := rows.Scan(append([]any{&name}, node.fields()...)...); err != nil {
 			return err
 		}
-		if err := add(metastore.Child{Name: name, Node: node.node()}); err != nil {
+		value, err := node.node()
+		if err != nil {
+			return err
+		}
+		if err := add(metastore.Child{Name: name, Node: value}); err != nil {
 			return err
 		}
 	}
@@ -365,9 +343,7 @@ func (s *Store) visitChildren(ctx context.Context, tx *sql.Tx, parent int64, add
 
 // SetAttr applies the attributes a change names and leaves the rest alone.
 //
-// Only the named columns are written, which is what keeps a mode change from disturbing the
-// times and a time change from disturbing the mode. A kernel sends the two as separate
-// requests, and neither may clear what the other set.
+// Only named common times are written. ChangeTime is maintained by the authority.
 func (s *Store) SetAttr(ctx context.Context, path string, change storage.AttrChange) error {
 	if err := change.Check(); err != nil {
 		return pathError("setattr", path, err)
@@ -389,7 +365,7 @@ func (s *Store) SetAttr(ctx context.Context, path string, change storage.AttrCha
 		if change.Empty() {
 			return nil
 		}
-		if err := applyChange(ctx, tx, node, change); err != nil {
+		if err := applyChange(ctx, tx, node, change, time.Now()); err != nil {
 			return err
 		}
 		return s.recordChanged(ctx, tx, node.ID)
@@ -399,19 +375,18 @@ func (s *Store) SetAttr(ctx context.Context, path string, change storage.AttrCha
 	return nil
 }
 
-func applyChange(ctx context.Context, tx *sql.Tx, node metastore.Node, change storage.AttrChange) error {
+func applyChange(ctx context.Context, tx *sql.Tx, node metastore.Node, change storage.AttrChange, at time.Time) error {
+	if change.Empty() {
+		return nil
+	}
 	var (
 		columns []string
 		args    []any
 	)
-	if change.Mode != nil {
-		// The type bits are kept and the settable ones replaced: a directory does not become
-		// a file by being chmod-ed, and Check has already refused a change naming a kind.
-		// The three special bits travel in storage.SettableMode with the permission bits, so
-		// setuid, setgid and sticky are set and cleared here like any other bit.
-		mode := node.Mode&^storage.SettableMode | *change.Mode&storage.SettableMode
-		columns = append(columns, "mode = ?")
-		args = append(args, int64(mode))
+	if change.BirthTime != nil {
+		sec, nsec := sqlvalue.StoredTime(*change.BirthTime)
+		columns = append(columns, "birth_sec = ?", "birth_nsec = ?")
+		args = append(args, sec, nsec)
 	}
 	if change.AccessTime != nil {
 		sec, nsec := sqlvalue.StoredTime(*change.AccessTime)
@@ -423,24 +398,30 @@ func applyChange(ctx context.Context, tx *sql.Tx, node metastore.Node, change st
 		columns = append(columns, "mtime_sec = ?", "mtime_nsec = ?")
 		args = append(args, sec, nsec)
 	}
+	sec, nsec := sqlvalue.StoredTime(at)
+	columns = append(columns, "change_sec = ?", "change_nsec = ?")
+	args = append(args, sec, nsec)
 	args = append(args, node.ID)
-	_, err := tx.ExecContext(ctx, `UPDATE nodes SET `+strings.Join(columns, ", ")+` WHERE id = ?`, args...)
-	return err
+	result, err := tx.ExecContext(ctx, `UPDATE nodes SET `+strings.Join(columns, ", ")+` WHERE id = ?`, args...)
+	if err != nil {
+		return err
+	}
+	return sqlvalue.ExactlyOne(result, "updating node attributes")
 }
 
 // Create records an empty file. It references no object, because zero bytes are worth no
 // round trip to an object store.
 func (s *Store) Create(ctx context.Context, path string) error {
-	return s.makeNode(ctx, "create", path, fileMode)
+	return s.makeNode(ctx, "create", path, storage.NodeRegular)
 }
 
 func (s *Store) Mkdir(ctx context.Context, path string) error {
-	return s.makeNode(ctx, "mkdir", path, fs.ModeDir|dirMode)
+	return s.makeNode(ctx, "mkdir", path, storage.NodeDirectory)
 }
 
-// makeNode records a new node of the given mode, failing with EEXIST if anything is already
+// makeNode records a new node of the given kind, failing with EEXIST if anything is already
 // at the name.
-func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode) error {
+func (s *Store) makeNode(ctx context.Context, op, path string, kind storage.NodeKind) error {
 	cleaned, err := storage.CleanPath(path)
 	if err != nil {
 		return pathError(op, path, err)
@@ -455,21 +436,14 @@ func (s *Store) makeNode(ctx context.Context, op, path string, mode fs.FileMode)
 			return err
 		}
 		now := time.Now()
-		sec, nsec := sqlvalue.StoredTime(now)
-		id, err := dbstate.AllocateNodeID(ctx, tx)
+		node, err := s.insertNode(ctx, tx, kind, storage.AttrChange{}, nil, now)
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
-			VALUES (?, ?, ?, 0, ?, ?, ?, ?, NULL)`,
-			id, s.volume, int64(mode), sec, nsec, sec, nsec); err != nil {
+		if err := s.link(ctx, tx, parent.ID, name, node.ID); err != nil {
 			return err
 		}
-		if err := s.link(ctx, tx, parent.ID, name, id); err != nil {
-			return err
-		}
-		if err := s.recordCreated(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, id); err != nil {
+		if err := s.recordCreated(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, node.ID); err != nil {
 			return err
 		}
 		return s.touch(ctx, tx, parent.ID, now)
@@ -509,8 +483,8 @@ func (s *Store) unlink(ctx context.Context, tx *sql.Tx, parent int64, name []byt
 // stopped being true, with nothing behind it to correct the answer.
 func (s *Store) touch(ctx context.Context, tx *sql.Tx, id int64, at time.Time) error {
 	sec, nsec := sqlvalue.StoredTime(at)
-	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET mtime_sec = ?, mtime_nsec = ? WHERE id = ?`,
-		sec, nsec, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET mtime_sec=?,mtime_nsec=?,change_sec=?,change_nsec=? WHERE id=?`,
+		sec, nsec, sec, nsec, id); err != nil {
 		return err
 	}
 	return s.recordChanged(ctx, tx, id)
@@ -622,8 +596,10 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 // Physical pins keep the current object and its charge after volume removal.
 // The caller holds the same gate as file open and final physical release.
 func (s *Store) discard(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
-	if node.Mode.IsRegular() && s.coordinator.pins[retainedNode{s.volume, node.ID}] > 0 {
-		_, err := tx.ExecContext(ctx, `UPDATE nodes SET detached=1 WHERE volume=? AND id=?`, s.volume, node.ID)
+	if node.Kind == storage.NodeRegular && s.coordinator.pins[retainedNode{s.volume, node.ID}] > 0 {
+		now := time.Now()
+		sec, nsec := sqlvalue.StoredTime(now)
+		_, err := tx.ExecContext(ctx, `UPDATE nodes SET detached=1,change_sec=?,change_nsec=? WHERE volume=? AND id=?`, sec, nsec, s.volume, node.ID)
 		return err
 	}
 	return s.discardNode(ctx, tx, node)
@@ -734,6 +710,11 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 		toParent.ID, toName, s.volume, fromParent.ID, fromName); err != nil {
 		return err
 	}
+	now := time.Now()
+	if err := s.setNodeChangeTime(ctx, tx, moving.ID, now); err != nil {
+		return err
+	}
+	moving.ChangeTime = &now
 	// The node itself is untouched by the move — only the entry naming it was rewritten — so
 	// the one read before the move is what the destination holds now.
 	if err := s.recordRenamed(ctx, tx,
@@ -742,7 +723,6 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 		return err
 	}
 
-	now := time.Now()
 	if err := s.touch(ctx, tx, fromParent.ID, now); err != nil {
 		return err
 	}

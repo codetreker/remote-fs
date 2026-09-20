@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -117,7 +118,7 @@ func TestSignalDuringPlainOpenPreservesRetryableCancellation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if after != before || string(body) != "original" {
+			if !reflect.DeepEqual(after, before) || string(body) != "original" {
 				t.Fatalf("plain open changed file: before=%+v after=%+v body=%q", before, after, body)
 			}
 			if err := backing.Remove(t.Context(), "artifact"); err != nil {
@@ -232,11 +233,11 @@ func (s *interruptedOpenStorage) NewFileSession(ctx context.Context, o storage.F
 	if err != nil {
 		return nil, err
 	}
-	return &interruptedOpenSession{FileSession: session, observe: s}, nil
+	return &interruptedOpenSession{capableTestSession: testSessionCapabilities(session), observe: s}, nil
 }
 
 type interruptedOpenSession struct {
-	storage.FileSession
+	capableTestSession
 	observe *interruptedOpenStorage
 }
 

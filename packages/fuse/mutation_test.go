@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"strings"
 	"syscall"
 	"testing"
@@ -13,6 +12,7 @@ import (
 	fsbridge "github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/codetreker/remote-fs/packages/fuse/posix"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
@@ -65,11 +65,11 @@ func (s *mutationStorage) NewFileSession(ctx context.Context, options storage.Fi
 	if err != nil {
 		return nil, err
 	}
-	return &mutationSession{FileSession: session, owner: s}, nil
+	return &mutationSession{capableTestSession: testSessionCapabilities(session), owner: s}, nil
 }
 
 type mutationSession struct {
-	storage.FileSession
+	capableTestSession
 	owner *mutationStorage
 }
 
@@ -111,9 +111,37 @@ func (s *mutationSession) SetNodeAttr(ctx context.Context, id uint64, change sto
 	return attr, s.owner.finish("setattr", err)
 }
 
+func (s *mutationSession) SetMetadata(ctx context.Context, id uint64, namespace string, version, data []byte) (storage.OpaquePayload, error) {
+	if err := s.owner.enter(ctx, "setattr"); err != nil {
+		return storage.OpaquePayload{}, err
+	}
+	result, err := s.MetadataAccess.SetMetadata(ctx, id, namespace, version, data)
+	return result, s.owner.finish("setattr", err)
+}
+
 type mutationFile struct {
 	storage.File
 	owner *mutationStorage
+}
+
+func (f *mutationFile) CheckScopedReference() error {
+	return f.File.(storage.ScopedReference).CheckScopedReference()
+}
+
+func (f *mutationFile) Scope(ctx context.Context) (storage.UseScope, error) {
+	return f.File.(storage.ScopedReference).Scope(ctx)
+}
+
+func (f *mutationFile) CheckMetadataAccess() error {
+	return f.File.(storage.ReferenceMetadataAccess).CheckMetadataAccess()
+}
+
+func (f *mutationFile) SetMetadata(ctx context.Context, namespace string, version, data []byte) (storage.OpaquePayload, error) {
+	if err := f.owner.enter(ctx, "setattr"); err != nil {
+		return storage.OpaquePayload{}, err
+	}
+	result, err := f.File.(storage.ReferenceMetadataAccess).SetMetadata(ctx, namespace, version, data)
+	return result, f.owner.finish("setattr", err)
 }
 
 func (f *mutationFile) Stat(ctx context.Context) (storage.Attr, error) {
@@ -161,8 +189,22 @@ func mutationTree(t *testing.T) (*node, *node, *mutationStorage) {
 	if err := local.Write(t.Context(), "f", []byte("contents")); err != nil {
 		t.Fatal(err)
 	}
-	mode := fs.FileMode(0600)
-	if err := local.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}); err != nil {
+	initial, err := local.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := local.Stat(t.Context(), "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := posix.Encode(0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := initial.(storage.MetadataAccess).SetMetadata(t.Context(), original.ID, posix.Namespace, original.Metadata[posix.Namespace].Version, data); err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	downstream := &mutationStorage{FileStorage: local}
@@ -240,8 +282,11 @@ func TestCreationCancellationAccountsForCompletedStages(t *testing.T) {
 			if test.changed && err != nil || !test.changed && !errors.Is(err, syscall.ENOENT) {
 				t.Fatalf("volume after interrupted creation: %v", err)
 			}
-			if test.changed && !test.directory && attr.Mode.Perm() != 0600 {
-				t.Fatalf("atomic create left mode %v instead of requested 0600", attr.Mode)
+			if test.changed && !test.directory {
+				mode, modeErr := permissions(attr)
+				if modeErr != nil || mode.Perm() != 0600 {
+					t.Fatalf("atomic create left metadata %v instead of requested 0600: %v", attr.Metadata, modeErr)
+				}
 			}
 		})
 	}
@@ -267,9 +312,9 @@ func TestSetattrCancellationAccountsForCompletedStages(t *testing.T) {
 				if withHandle {
 					file = mutationHandle(t, n)
 				}
-				truncates := 0
+				truncates, setters := 0, 0
 				downstream.before = func(_ context.Context, op string) error {
-					if op == test.failedOp && (op != "stat" || test.valid&gofuse.FATTR_SIZE == 0 || truncates != 0) {
+					if op == test.failedOp && (op != "stat" || test.valid&gofuse.FATTR_SIZE != 0 && truncates != 0 || test.valid&gofuse.FATTR_SIZE == 0 && setters != 0) {
 						return context.Canceled
 					}
 					return nil
@@ -277,6 +322,9 @@ func TestSetattrCancellationAccountsForCompletedStages(t *testing.T) {
 				downstream.after = func(op string) {
 					if op == "truncate" {
 						truncates++
+					}
+					if op == "setattr" {
+						setters++
 					}
 				}
 				err := n.setattr(t.Context(), file, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
@@ -380,6 +428,10 @@ func TestMutationClassificationPreservesIndependentFailures(t *testing.T) {
 			t.Errorf("partial mutation diagnostic omits %q: %q", detail, err.Error())
 		}
 	}
+	conflict := afterMutation(true, storage.ErrConditionConflict)
+	if errnoOf(conflict) != syscall.EIO || !errors.Is(conflict, storage.ErrConditionConflict) {
+		t.Fatalf("partial condition conflict remained retryable: %v", conflict)
+	}
 }
 
 func TestMutationSuccessIgnoresLateCancellation(t *testing.T) {
@@ -388,8 +440,13 @@ func TestMutationSuccessIgnoresLateCancellation(t *testing.T) {
 			root, n, downstream := mutationTree(t)
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
+			observations := 0
 			downstream.after = func(op string) {
 				if op == "stat" {
+					observations++
+					if (operation == "setattr" || operation == "mkdir") && observations == 1 {
+						return
+					}
 					cancel()
 				}
 			}

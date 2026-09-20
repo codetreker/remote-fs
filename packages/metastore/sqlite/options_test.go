@@ -16,7 +16,8 @@ func TestReaderConnectionOptionsAreBoundedAndValidatedBeforeOpening(t *testing.T
 		defaults.MaxSnapshotReaderConnections != DefaultMaxSnapshotReaderConnections ||
 		defaults.MaxSnapshotReaderConnections < 1 ||
 		defaults.MaxIntegrityRecords != DefaultMaxIntegrityRecords || defaults.MaxIntegrityRecords < 1 ||
-		defaults.MaxIntegrityBytes != DefaultMaxIntegrityBytes || defaults.MaxIntegrityBytes < 1 {
+		defaults.MaxIntegrityBytes != DefaultMaxIntegrityBytes || defaults.MaxIntegrityBytes < 1 ||
+		defaults.MaxMetadataBytes != DefaultMaxMetadataBytes || defaults.MaxMetadataBytes < 1 {
 		t.Fatalf("default SQLite options are %+v", defaults)
 	}
 	effective, err := (Options{Window: DefaultWindow()}).Effective()
@@ -48,6 +49,11 @@ func TestReaderConnectionOptionsAreBoundedAndValidatedBeforeOpening(t *testing.T
 		store.Close()
 		t.Fatalf("Open configured an integrity byte limit of %d, want default %d",
 			store.maxIntegrityBytes, DefaultMaxIntegrityBytes)
+	}
+	if store.maxMetadataBytes != DefaultMaxMetadataBytes {
+		store.Close()
+		t.Fatalf("Open configured a metadata byte limit of %d, want default %d",
+			store.maxMetadataBytes, DefaultMaxMetadataBytes)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -157,6 +163,23 @@ func TestReaderConnectionOptionsAreBoundedAndValidatedBeforeOpening(t *testing.T
 		}
 		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
 			t.Fatalf("invalid integrity byte limit touched the database path: %v", statErr)
+		}
+	}
+	for _, limit := range []int64{-1, math.MaxInt64} {
+		path := t.TempDir() + "/nested/metastore.db"
+		store, err := OpenWithOptions(t.Context(), path, "workspace", 0, Options{
+			Window:           DefaultWindow(),
+			MaxMetadataBytes: limit,
+		})
+		if err == nil {
+			store.Close()
+			t.Fatalf("opening with metadata byte limit %d succeeded", limit)
+		}
+		if !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("opening with metadata byte limit %d: %v, want EINVAL", limit, err)
+		}
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("invalid metadata byte limit touched the database path: %v", statErr)
 		}
 	}
 }

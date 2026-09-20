@@ -329,12 +329,12 @@ func TestCanceledReplicaApplyKeepsAdmissionAndCommitUntilRollback(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	afterWrite, releaseWrite := newTransactionStatementGate("UPDATE nodes SET mode")
+	afterWrite, releaseWrite := newTransactionStatementGate("UPDATE nodes SET kind")
 	defer releaseWrite()
 	gate, releaseRollback := installWriterRollbackGate(t, replica.store, replica.store.databasePath, afterWrite)
 	defer releaseRollback()
 
-	root.Mode = root.Mode&^0o777 | 0o700
+	root.ModTime = root.ModTime.Add(time.Second)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	type applyResult struct {
@@ -367,8 +367,8 @@ func TestCanceledReplicaApplyKeepsAdmissionAndCommitUntilRollback(t *testing.T) 
 		t.Fatalf("commit waiter after Apply rollback = %v", err)
 	}
 	observed := receiveReplica(t, readWait)
-	if observed.err != nil || observed.node.Mode == root.Mode {
-		t.Fatalf("read after Apply rollback = %+v, %v; canceled mode %v became visible", observed.node, observed.err, root.Mode)
+	if observed.err != nil || observed.node.ModTime.Equal(root.ModTime) {
+		t.Fatalf("read after Apply rollback = %+v, %v; canceled modification time %v became visible", observed.node, observed.err, root.ModTime)
 	}
 	if replica.Position() != 1 {
 		t.Fatalf("canceled Apply advanced replica to %d", replica.Position())

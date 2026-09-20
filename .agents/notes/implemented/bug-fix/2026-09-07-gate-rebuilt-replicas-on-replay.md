@@ -13,7 +13,7 @@ Status: implemented
 
 首次构建与全量重建保持同一顺序：先建立订阅，再灌入快照；客户端观察到 snapshot EOF 并关闭这份 snapshot 的 HTTP 响应后，通过纯读取的 `Checkpoint` 取得一个新的已提交位置，再由唯一的 reader 沿原订阅应用到该固定目标，最后恢复查询。快照位置只说明捕获的树包含什么，不能单独宣布积压已回放。
 
-`GET /v3/checkpoint` 复用 `Log.Barrier` 原子读取 incarnation 与 committed position，以现有 `httprest.MutationBarrier` 返回。它遵守普通请求／响应预算，先按 `storage.OpReplicationCheckpoint` 授权，再读取 Log，不产生 mutation、唤醒或新的订阅。snapshot position 不早于原订阅 opening tail，checkpoint 不早于 snapshot，且 checkpoint incarnation 与原订阅一致；snapshot 本身没有 incarnation 字段。
+当前 `GET /v4/checkpoint` 复用 `Log.Barrier` 原子读取 incarnation 与 committed position，以现有 `httprest.MutationBarrier` 返回。它遵守普通请求／响应预算，先按 `storage.OpReplicationCheckpoint` 授权，再读取 Log，不产生 mutation、唤醒或新的订阅。snapshot position 不早于原订阅 opening tail，checkpoint 不早于 snapshot，且 checkpoint incarnation 与原订阅一致；snapshot 本身没有 incarnation 字段。
 
 `ReplayTimeout` 是正数，默认十秒，从观察到 snapshot EOF 时开始，覆盖快照响应关闭、checkpoint 请求、本地 Complete 与固定目标回放。它不把整个快照传输算入这段预算，也不沿后续写入不断移动目标。Complete 与 Apply 确认成功时分别记录对应的已安装位置，即使对外读取仍保持 EIO；恢复查询以同一代树确实达到目标为条件，不能退回旧的可用状态。
 

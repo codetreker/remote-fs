@@ -4,14 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io/fs"
-	"math"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/storagetest"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
@@ -34,7 +33,11 @@ func retainedSession(t *testing.T, volume storage.FileStorage) storage.FileSessi
 
 func retainedOpen(t *testing.T, session storage.FileSession, path string, create bool) storage.File {
 	t.Helper()
-	file, err := session.OpenFile(t.Context(), path, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: create}, Mode: 0600})
+	options := storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: create}}
+	if create {
+		options.InitialMetadata = map[string][]byte{"test.initial": {0, 0xff, 1}}
+	}
+	file, err := session.OpenFile(t.Context(), path, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,6 +57,9 @@ func TestRetainedFileQueriesTheAuthorityAfterRenameAndUnlink(t *testing.T) {
 	created, err := mounted.Stat(t.Context(), "file")
 	if err != nil {
 		t.Fatal("atomic create did not confirm its replica entry:", err)
+	}
+	if !bytes.Equal(created.Metadata["test.initial"].Data, []byte{0, 0xff, 1}) {
+		t.Fatalf("atomic create lost opaque initial metadata: %+v", created.Metadata)
 	}
 	if _, err := file.WriteAt(t.Context(), 0, []byte("original")); err != nil {
 		t.Fatal(err)
@@ -108,8 +114,8 @@ func TestRetainedFileQueriesTheAuthorityAfterRenameAndUnlink(t *testing.T) {
 	if err != nil || !bytes.Equal(read.Data, []byte{'n', 't', 0, 0, 0}) || read.Attr.Size != 10 {
 		t.Fatalf("detached read/EOF lost its content revision: %+v, %v", read, err)
 	}
-	mode := fs.FileMode(0640)
-	if attr, err := session.SetNodeAttr(t.Context(), created.ID, storage.AttrChange{Mode: &mode}); err != nil || attr.Mode.Perm() != mode {
+	birth := time.Unix(700, 321)
+	if attr, err := session.SetNodeAttr(t.Context(), created.ID, storage.AttrChange{BirthTime: &birth}); err != nil || attr.BirthTime == nil || !attr.BirthTime.Equal(birth) {
 		t.Fatalf("detached identity setattr: %+v, %v", attr, err)
 	}
 	moment := time.Unix(1000, 123)
@@ -172,6 +178,24 @@ func TestRetainedControlsRemainAvailableWhenTheStreamFails(t *testing.T) {
 	session := retainedSession(t, mounted)
 	file := retainedOpen(t, session, "file", true)
 	other := retainedOpen(t, session, "file", false)
+	owners := session.(storage.UseOwners)
+	ownerFor := func(ref storage.File) storage.UseOwner {
+		attr, err := ref.Stat(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		scope, err := ref.(storage.ScopedReference).Scope(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		owner, err := owners.NewUseOwner(t.Context(), attr.ID, scope, storage.OwnerOptions{Lifetime: storage.OwnerReference})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return owner
+	}
+	owner, otherOwner := ownerFor(file), ownerFor(other)
+	control := session.(storage.RangeControl)
 	s.events.cut()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
@@ -207,26 +231,54 @@ func TestRetainedControlsRemainAvailableWhenTheStreamFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
-	if attempt, err := file.SetLock(t.Context(), 1, lock, request); err != nil || attempt.State != storage.LockGranted {
+	lock := storage.RangeCommand{Domain: storage.DomainWholeFile, Mode: storage.RangeExclusive, Edit: storage.Replace, Range: storage.Range{Kind: storage.Bytes, Length: 1 << 63}}
+	if attempt, err := control.Apply(t.Context(), owner, []storage.RangeCommand{lock}, request); err != nil || attempt.State != storage.Granted {
 		t.Fatalf("advisory lock was not authoritative: %+v, %v", attempt, err)
 	}
-	if conflict, err := other.GetLock(t.Context(), 2, lock); err != nil || !conflict.Found {
+	if conflict, err := control.GetConflict(t.Context(), otherOwner, lock); err != nil || !conflict.Found {
 		t.Fatalf("advisory conflict was not authoritative: %+v, %v", conflict, err)
 	}
-	if attempt, err := file.QueryLock(t.Context(), 1, request); err != nil || attempt.State != storage.LockGranted {
+	if attempt, err := control.Query(t.Context(), owner, request); err != nil || attempt.State != storage.Granted {
 		t.Fatalf("advisory receipt unavailable: %+v, %v", attempt, err)
 	}
-	if attempt, err := file.CancelLock(t.Context(), 1, request); err != nil || attempt.State != storage.LockGranted {
+	if attempt, err := control.Cancel(t.Context(), owner, request); err != nil || attempt.State != storage.Granted {
 		t.Fatalf("advisory cancellation unavailable: %+v, %v", attempt, err)
 	}
-	if err := file.DropLocks(t.Context(), 1, storage.Flock); err != nil {
+	if err := control.Drop(t.Context(), owner, storage.DomainWholeFile); err != nil {
 		t.Fatal(err)
 	}
-	if conflict, err := other.GetLock(t.Context(), 2, lock); err != nil || conflict.Found {
+	if conflict, err := control.GetConflict(t.Context(), otherOwner, lock); err != nil || conflict.Found {
 		t.Fatalf("advisory cleanup did not release the granted acquisition: %+v, %v", conflict, err)
 	}
 	if _, err := session.Renew(t.Context()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMetadataContract(t *testing.T) {
+	storagetest.RunMetadata(t, func(t *testing.T) storage.Storage {
+		s := serve(t, httprest.DefaultLimits())
+		mounted, _ := mount(t, s)
+		return mounted
+	})
+}
+
+func TestAttributeResultBoundReachesAuthorityBeforeRetainedMutation(t *testing.T) {
+	s := serve(t, httprest.DefaultLimits())
+	mounted, _ := mount(t, s)
+	session := retainedSession(t, mounted)
+	file := retainedOpen(t, session, "file", true)
+	if _, err := file.WriteAt(t.Context(), 0, []byte("before")); err != nil {
+		t.Fatal(err)
+	}
+	bounded := storage.WithBoundedAttrResult(t.Context(), 1, func(storage.Attr, int64) error {
+		return syscall.EFBIG
+	})
+	if _, err := file.WriteAt(bounded, 0, []byte("after")); !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("bounded mutation = %v, want EFBIG", err)
+	}
+	read, err := file.ReadAt(t.Context(), 0, 16)
+	if err != nil || string(read.Data) != "before" {
+		t.Fatalf("refused mutation changed authority content: %q,%v", read.Data, err)
 	}
 }

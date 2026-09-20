@@ -37,12 +37,16 @@ func TestOperationConstantsIdentifyDistinctSemanticActions(t *testing.T) {
 		storage.OpFileTruncate:           "file.truncate",
 		storage.OpFileSetAttr:            "file.set-attr",
 		storage.OpFileSync:               "file.sync",
-		storage.OpFileGetLock:            "file.get-lock",
-		storage.OpFileSetLock:            "file.set-lock",
-		storage.OpFileUnlock:             "file.unlock",
-		storage.OpFileQueryLock:          "file.query-lock",
-		storage.OpFileCancelLock:         "file.cancel-lock",
-		storage.OpFileDropLocks:          "file.drop-locks",
+		storage.OpFileScope:              "file.scope",
+		storage.OpFileSetNodeMetadata:    "file.set-node-metadata",
+		storage.OpFileSetMetadata:        "file.set-metadata",
+		storage.OpFileNewUseOwner:        "file.new-use-owner",
+		storage.OpFileRetireUseOwner:     "file.retire-use-owner",
+		storage.OpFileRangeGetConflict:   "file.range-get-conflict",
+		storage.OpFileRangeApply:         "file.range-apply",
+		storage.OpFileRangeQuery:         "file.range-query",
+		storage.OpFileRangeCancel:        "file.range-cancel",
+		storage.OpFileRangeDrop:          "file.range-drop",
 		storage.OpFileClose:              "file.close",
 		storage.OpLockSessionEnrollment:  "lock.session-enrollment",
 		storage.OpLockSessionOpen:        "lock.session-open",
@@ -58,8 +62,8 @@ func TestOperationConstantsIdentifyDistinctSemanticActions(t *testing.T) {
 		storage.OpLockQueryGrant:         "lock.query-grant",
 		storage.OpLockStatus:             "lock.status",
 	}
-	if len(cases) != 50 {
-		t.Fatalf("operation vocabulary has %d entries, want 50", len(cases))
+	if len(cases) != 54 {
+		t.Fatalf("operation vocabulary has %d entries, want 54", len(cases))
 	}
 	for operation, want := range cases {
 		if string(operation) != want {

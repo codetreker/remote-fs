@@ -14,9 +14,9 @@ Status: implemented
 
 ### 机制与策略分开
 
-`packages/locking` 持有有限授权、Session / Owner、生存期、动作历史与发布排序；`packages/storage/locked` 将它与支持原生发布检查的 volume 配对。HTTP v3 发布显式控制操作与 mutation scope；保留的 localstore 与 Azure 两种形态都在实际修改处执行保护。完整接口与状态流见[文件锁设计](../../../../docs/design/server/file-locks.md)。
+`packages/locking` 持有有限授权、Session / Owner、生存期、动作历史与发布排序；`packages/storage/locked` 将它与支持原生发布检查的 volume 配对。HTTP v4 发布显式控制操作与 mutation scope；保留的 localstore 与 Azure 两种形态都在实际修改处执行保护。完整接口与状态流见[文件锁设计](../../../../docs/design/server/file-locks.md)。
 
-现有普通文件可以取得 `S` 或 `X`。多个 S 相容；X 排斥其他持有者的授权与修改。S 持有者自己也不能只凭 S 修改。显式 `SetAttr` 的 mode、atime 与 mtime 受同一修改检查；普通读取的平台 atime 副作用不是稳定 atime 的承诺。匿名修改只在不冲突于已授予保护时允许，普通读取不因 X 而变成受锁访问控制的操作。
+现有普通文件可以取得 `S` 或 `X`。多个 S 相容；X 排斥其他持有者的授权与修改。S 持有者自己也不能只凭 S 修改。显式共同时间与 opaque metadata 修改受同一修改检查；普通读取的平台 atime 副作用不是稳定 atime 的承诺。匿名修改只在不冲突于已授予保护时允许，普通读取不因 X 而变成受锁访问控制的操作。
 
 Owner 在一个资源上至多有一个当前 grant，没有隐式升级或递归计数。调用方显式 Resolve、Acquire，再用一份不可变的 proof 集合构造 mutation scope。普通 `Open` 不自动取得权限，scope 也不把 Read 的成功变成 grant 仍然有效的证明。
 
@@ -74,7 +74,7 @@ raw SQLite opener 持有数据库共享 flock，启用锁的拥有者取得排�
 | 目录、子树、未存在名字的锁 | 不由文件资源模式承诺，命中时明确拒绝；不能用路径字符串模拟逻辑文件身份 |
 | 升降级与递归获取 | 不提供隐式转换，重复持有明确失败；不得为它们引入隐藏的引用计数 |
 
-[活跃文件句柄](2026-09-08-live-file-handles.md)拥有普通 fd 的同对象读取、rename/unlink 保留、同步区间修改与标准 advisory；它不改变本决定的显式权限。经授权的名字移除使强资源成为 `TargetGone`，保留 File 与 advisory 继续指向旧对象。[打开文件身份](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)保留目录父身份与显式内容依据问题；[定序与版本](../../proposed/architecture/2026-08-19-ordering-and-versions.md)继续区分内容版本与日志位置。[操作词汇](../../proposed/architecture/2026-08-19-storage-operation-vocabulary.md)的分页及显式版本化提交仍独立。被否决的[写会话与暂存](../../rejected/architecture/2026-08-19-write-session-and-staging.md)保留延迟提交的理由与代价，它的本地 dirty 生命周期不等同于远端占有 Session。[volume 契约](../../proposed/architecture/2026-08-19-volume-in-the-contract.md)的注册与名字路由也没有由配对授权方完成。
+[活跃文件句柄](2026-09-08-live-file-handles.md)拥有普通 fd 的同对象读取、rename/unlink 保留与同步区间修改；[中立元数据与访问控制](2026-09-16-neutral-metadata-and-access-controls.md)拥有 Use/Deny、advisory/enforced range 与平台投影边界。两者都不改变本决定的 Strong 权限。经授权的名字移除使强资源成为 `TargetGone`，保留 File 与 range 继续指向旧对象。[打开文件身份](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)保留目录父身份与显式内容依据问题；[定序与版本](../../proposed/architecture/2026-08-19-ordering-and-versions.md)继续区分内容版本与日志位置。[操作词汇](../../proposed/architecture/2026-08-19-storage-operation-vocabulary.md)的分页及显式版本化提交仍独立。被否决的[写会话与暂存](../../rejected/architecture/2026-08-19-write-session-and-staging.md)保留延迟提交的理由与代价，它的本地 dirty 生命周期不等同于远端占有 Session。[volume 契约](../../proposed/architecture/2026-08-19-volume-in-the-contract.md)的注册与名字路由也没有由配对授权方完成。
 
 ## 备选方案
 

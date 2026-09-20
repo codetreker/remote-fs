@@ -18,6 +18,8 @@ Windows 入口负责解释 Windows 的名字、create disposition、属性、共
 
 完整用户契约由 [`docs/spec/requirements.md`](../../../../docs/spec/requirements.md) 的 R-FS-5 至 R-FS-9、R-CON、R-CC-14、R-INT-1、R-INT-8、R-WIN 与 R-ERR 条目共同定义。Windows 支持只有在真实系统客户端通过本文的外部验收矩阵后才能宣告；交叉编译、协议单测、内存后端和自制客户端都不能代替这些结果。
 
+[中立元数据与访问控制](../../implemented/architecture/2026-09-16-neutral-metadata-and-access-controls.md)已经交付 NodeKind、共同时间、opaque metadata、Uses/Deny 与 range 原语。它们只完成本提案的平台中立前置能力；Windows namespace codec、共享规则映射、SMB endpoint、缓存与原生验收仍由本提案拥有。
+
 ### 支持边界
 
 支持日常可读写目录树所需的打开与六种存在性／替换结果、读取、范围写入、截断、刷新、关闭、目录操作、名字变更、受支持属性与时间、目录通知、共享模式、范围锁及空间查询。未支持的信息类、控制操作或标志明确失败，不返回占位数据。若一项可选能力可在不被授予时继续基础操作，基础操作可以成功，但结果不得宣称授予该能力或保留它的状态。

@@ -220,7 +220,11 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 	}
 	query += `(
 		typeof(id) != 'integer' OR id <= 0 OR typeof(name) != 'text' OR name = '' OR
-		typeof(root) != 'integer' OR root <= 0 OR typeof(used) != 'integer')`
+		typeof(root) != 'integer' OR root <= 0 OR typeof(used) != 'integer'`
+	if version >= firstNeutralMetadataSchemaVersion {
+		query += ` OR typeof(metadata_used) != 'integer'`
+	}
+	query += `)`
 	if err := db.QueryRowContext(ctx, query, scopeArgs...).Scan(&invalidVolumes); err != nil {
 		return err
 	}
@@ -235,6 +239,17 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 	if version >= firstRetainedFileSchemaVersion {
 		retainedNodeClasses = ` OR typeof(detached) != 'integer' OR typeof(content_revision) != 'integer'`
 	}
+	nodeKindColumn, changeKindColumn := "mode", "mode"
+	neutralNodeClasses, neutralChangeClasses := "", ""
+	if version >= firstNeutralMetadataSchemaVersion {
+		nodeKindColumn, changeKindColumn = "kind", "node_kind"
+		neutralNodeClasses = ` OR typeof(birth_sec) NOT IN ('integer','null') OR typeof(birth_nsec) NOT IN ('integer','null')
+			OR typeof(change_sec) NOT IN ('integer','null') OR typeof(change_nsec) NOT IN ('integer','null')
+			OR typeof(metadata)!='blob'`
+		neutralChangeClasses = ` OR typeof(birth_sec) NOT IN ('integer','null') OR typeof(birth_nsec) NOT IN ('integer','null')
+			OR typeof(change_sec) NOT IN ('integer','null') OR typeof(change_nsec) NOT IN ('integer','null')
+			OR typeof(metadata) NOT IN ('blob','null')`
+	}
 	queries := []struct {
 		name  string
 		query string
@@ -243,10 +258,10 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 		{"nodes", `SELECT count(*) FROM nodes ` + nodeWhere + predicateJoin(nodeWhere) + `(
 			typeof(id) != 'integer' OR id <= 0 OR
 			typeof(volume) != 'integer' OR volume <= 0 OR
-			typeof(mode) != 'integer' OR typeof(size) != 'integer' OR
+			typeof(` + nodeKindColumn + `) != 'integer' OR typeof(size) != 'integer' OR
 			typeof(atime_sec) != 'integer' OR typeof(atime_nsec) != 'integer' OR
 			typeof(mtime_sec) != 'integer' OR typeof(mtime_nsec) != 'integer' OR
-			typeof(content) NOT IN ('text', 'null')` + retainedNodeClasses + `)`, scopeArgs},
+			typeof(content) NOT IN ('text', 'null')` + retainedNodeClasses + neutralNodeClasses + `)`, scopeArgs},
 		{"objects", `SELECT count(*) FROM objects o ` + objectWhere + predicateJoin(objectWhere) + `(
 			typeof(o.key) != 'text' OR o.key = '' OR
 			typeof(o.volume) != 'integer' OR o.volume <= 0 OR
@@ -276,11 +291,11 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 			typeof(name) NOT IN ('blob', 'null') OR
 			typeof(from_parent) NOT IN ('integer', 'null') OR
 			typeof(from_name) NOT IN ('blob', 'null') OR
-			typeof(node) NOT IN ('integer', 'null') OR typeof(mode) NOT IN ('integer', 'null') OR
+			typeof(node) NOT IN ('integer', 'null') OR typeof(` + changeKindColumn + `) NOT IN ('integer', 'null') OR
 			typeof(size) NOT IN ('integer', 'null') OR typeof(atime_sec) NOT IN ('integer', 'null') OR
 			typeof(atime_nsec) NOT IN ('integer', 'null') OR typeof(mtime_sec) NOT IN ('integer', 'null') OR
 			typeof(mtime_nsec) NOT IN ('integer', 'null') OR typeof(content) NOT IN ('text', 'null') OR
-			typeof(recorded_sec) != 'integer' OR typeof(recorded_nsec) != 'integer')`, scopeArgs},
+			typeof(recorded_sec) != 'integer' OR typeof(recorded_nsec) != 'integer'` + neutralChangeClasses + `)`, scopeArgs},
 		{"backing store", `SELECT count(*) FROM backing_store WHERE
 			typeof(singleton) != 'integer' OR singleton != 1 OR
 			typeof(store_id) != 'text' OR store_id = ''`, nil},
@@ -325,8 +340,9 @@ func ValidateVolumeIntegrity(
 	db sqlvalue.Queryer,
 	volume int64,
 	maxIntegrityRecords, maxIntegrityBytes int64,
+	metadataLimits ...int64,
 ) error {
-	return validateIntegrity(ctx, db, &volume, maxIntegrityRecords, maxIntegrityBytes, schema.Version())
+	return validateIntegrity(ctx, db, &volume, maxIntegrityRecords, maxIntegrityBytes, schema.Version(), metadataLimits...)
 }
 
 // A nil volume validates the complete database for migration or exclusive-owner recovery.
@@ -337,12 +353,35 @@ func validateIntegrity(
 	volume *int64,
 	maxIntegrityRecords, maxIntegrityBytes int64,
 	version int,
+	metadataLimits ...int64,
+) error {
+	maxMetadataBytes := int64(64 << 20)
+	if len(metadataLimits) != 0 {
+		maxMetadataBytes = metadataLimits[0]
+	}
+	return validateIntegrityWithMetadataPolicy(ctx, db, volume, maxIntegrityRecords, maxIntegrityBytes,
+		version, maxMetadataBytes, false)
+}
+
+func validateIntegrityWithMetadataPolicy(
+	ctx context.Context,
+	db sqlvalue.Queryer,
+	volume *int64,
+	maxIntegrityRecords, maxIntegrityBytes int64,
+	version int,
+	maxMetadataBytes int64,
+	opaqueMetadataVersions bool,
 ) error {
 	if err := validateIntegrityWork(ctx, db, volume, maxIntegrityRecords); err != nil {
 		return err
 	}
 	if err := validateIntegrityBytes(ctx, db, volume, maxIntegrityBytes, version); err != nil {
 		return err
+	}
+	if version >= firstNeutralMetadataSchemaVersion {
+		if err := validateMetadataIntegrity(ctx, db, volume, maxMetadataBytes, opaqueMetadataVersions); err != nil {
+			return err
+		}
 	}
 	if err := validateStorageClassesVersion(ctx, db, volume, version); err != nil {
 		return err
@@ -377,14 +416,14 @@ func validateIntegrity(
 		return fmt.Errorf("the database holds %d objects in an unknown state and %d objects with an invalid size: %w",
 			invalidStates, invalidSizes, syscall.EIO)
 	}
-	if err := validateObjectRelationships(ctx, db, volume); err != nil {
+	if err := validateObjectRelationshipsVersion(ctx, db, volume, version); err != nil {
 		return err
 	}
 	if err := validateNodeRelationshipsVersion(ctx, db, volume, version); err != nil {
 		return err
 	}
-	if err := validateUsedAccounting(ctx, db, volume); err != nil {
+	if err := validateUsedAccountingVersion(ctx, db, volume, version); err != nil {
 		return err
 	}
-	return validateLogIntegrity(ctx, db, volume)
+	return validateLogIntegrityVersion(ctx, db, volume, version, true)
 }

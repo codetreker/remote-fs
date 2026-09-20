@@ -1307,27 +1307,16 @@ func waitForWitness(
 
 func readWitnessRecord(t *testing.T, store *Store) metastoreWitnessRecord {
 	t.Helper()
-	anchor, err := openRootAnchor(store.anchor.path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := anchor.Close(); err != nil {
-			t.Fatal(err)
-		}
-	}()
-	record, exists, err := anchor.readMetastoreWitnessEntry(
-		metastoreWitnessFilename,
-		store.objects.ID(),
-		store.volumeName,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !exists {
+	witness := store.durable.witness
+	witness.mu.Lock()
+	defer witness.mu.Unlock()
+	if !witness.exists {
 		t.Fatal("metastore witness is missing")
 	}
-	return record
+	// The in-memory record advances only after the atomically replaced witness has
+	// been synced. Reading it under the publisher lock avoids opening the old inode
+	// in the instant when rename has unlinked it but an existing descriptor remains.
+	return witness.record
 }
 
 func TestInterruptedInitializationRejectsAnotherVolume(t *testing.T) {

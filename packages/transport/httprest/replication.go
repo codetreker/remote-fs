@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // The messages of the replication half, and the frames they travel in.
@@ -25,25 +25,30 @@ import (
 
 // Node is metastore.Node on the wire.
 type Node struct {
-	ID         int64  `json:"id"`
-	Mode       uint32 `json:"mode"`
-	Size       int64  `json:"size"`
-	AccessTime Time   `json:"access_time"`
-	ModTime    Time   `json:"mod_time"`
+	ID         int64                    `json:"id"`
+	Kind       storage.NodeKind         `json:"kind"`
+	BirthTime  *Time                    `json:"birth_time,omitempty"`
+	ChangeTime *Time                    `json:"change_time,omitempty"`
+	Metadata   map[string]OpaquePayload `json:"metadata,omitempty"`
+	Size       int64                    `json:"size"`
+	AccessTime Time                     `json:"access_time"`
+	ModTime    Time                     `json:"mod_time"`
 
 	// Content is the key of the object holding a file's bytes, and empty for a directory
 	// and for a file that has never been written. It travels as bytes rather than as a
 	// string for the same reason a name does: a key is opaque to everything above the
 	// store that allocated it, so this side may not assume it is text, and a key that came
 	// back altered names bytes that are not there.
-	Content []byte `json:"content"`
+	Content           []byte `json:"content"`
+	LinkTarget        []byte `json:"link_target,omitempty"`
+	DirectoryRevision []byte `json:"directory_revision,omitempty"`
 }
 
 // UnmarshalJSON refuses node values a replica could persist as plausible metadata.
 func (n *Node) UnmarshalJSON(data []byte) error {
 	type node Node
 	var decoded node
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	got := Node(decoded)
@@ -67,11 +72,24 @@ func (n Node) check() error {
 	if err := checkWireTime("modification", n.ModTime); err != nil {
 		return fmt.Errorf("node %d: %w", n.ID, err)
 	}
-	mode := fs.FileMode(n.Mode)
-	switch mode.Type() {
-	case 0, fs.ModeDir, fs.ModeSymlink:
-	default:
-		return fmt.Errorf("node %d carries unsupported type bits %v", n.ID, mode.Type())
+	if err := n.Kind.Check(); err != nil {
+		return fmt.Errorf("node %d carries an invalid kind: %w", n.ID, err)
+	}
+	for _, value := range []struct {
+		name    string
+		instant *Time
+	}{{"birth", n.BirthTime}, {"change", n.ChangeTime}} {
+		if value.instant != nil {
+			if err := checkWireTime(value.name, *value.instant); err != nil {
+				return err
+			}
+		}
+	}
+	if err := storage.CheckMetadata(metadataStorage(n.Metadata)); err != nil {
+		return fmt.Errorf("node %d carries invalid metadata: %w", n.ID, err)
+	}
+	if len(n.LinkTarget) != 0 || len(n.DirectoryRevision) != 0 {
+		return errors.New("node carries unsupported reserved payload")
 	}
 	return nil
 }
@@ -87,11 +105,14 @@ func checkWireTime(name string, instant Time) error {
 func NodeOf(n metastore.Node) *Node {
 	return &Node{
 		ID:         n.ID,
-		Mode:       uint32(n.Mode),
+		Kind:       n.Kind,
+		BirthTime:  optionalTimeOf(n.BirthTime),
+		ChangeTime: optionalTimeOf(n.ChangeTime),
+		Metadata:   metadataOf(n.Metadata),
 		Size:       n.Size,
 		AccessTime: TimeOf(n.AccessTime),
 		ModTime:    TimeOf(n.ModTime),
-		Content:    []byte(n.Content),
+		Content:    append([]byte{}, n.Content...),
 	}
 }
 
@@ -99,7 +120,10 @@ func NodeOf(n metastore.Node) *Node {
 func (n Node) Metastore() metastore.Node {
 	return metastore.Node{
 		ID:         n.ID,
-		Mode:       fs.FileMode(n.Mode),
+		Kind:       n.Kind,
+		BirthTime:  optionalTimeStorage(n.BirthTime),
+		ChangeTime: optionalTimeStorage(n.ChangeTime),
+		Metadata:   metadataStorage(n.Metadata),
 		Size:       n.Size,
 		AccessTime: n.AccessTime.Time(),
 		ModTime:    n.ModTime.Time(),
@@ -174,9 +198,9 @@ func changeShapeOf(c metastore.Change) (*Change, error) {
 	if !known {
 		return nil, fmt.Errorf("the change at position %d is of kind %d, which this protocol cannot name", c.Position, c.Kind)
 	}
-	wire := &Change{Position: int64(c.Position), Kind: name, Parent: c.Parent, Name: c.Name}
+	wire := &Change{Position: int64(c.Position), Kind: name, Parent: c.Parent, Name: append([]byte{}, c.Name...)}
 	if c.From != nil {
-		wire.From = &Location{Parent: c.From.Parent, Name: c.From.Name}
+		wire.From = &Location{Parent: c.From.Parent, Name: append([]byte{}, c.From.Name...)}
 	}
 	if c.Node != nil {
 		wire.Node = NodeOf(*c.Node)
@@ -196,7 +220,7 @@ func changeShapeOf(c metastore.Change) (*Change, error) {
 func (c *Change) UnmarshalJSON(data []byte) error {
 	type change Change
 	var decoded change
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	got := Change(decoded)
@@ -270,7 +294,7 @@ type Row struct {
 
 // RowOf renders r for the wire.
 func RowOf(r metastore.Row) Row {
-	return Row{Parent: r.Parent, Name: r.Name, Node: NodeOf(r.Node)}
+	return Row{Parent: r.Parent, Name: append([]byte{}, r.Name...), Node: NodeOf(r.Node)}
 }
 
 // UnmarshalJSON decodes a row and refuses one that carries no node, which would otherwise
@@ -278,7 +302,7 @@ func RowOf(r metastore.Row) Row {
 func (r *Row) UnmarshalJSON(data []byte) error {
 	type row Row
 	var decoded row
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	if decoded.Node == nil {
@@ -384,7 +408,7 @@ type StreamStart struct {
 func (s *StreamStart) UnmarshalJSON(data []byte) error {
 	type start StreamStart
 	var decoded start
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	got := StreamStart(decoded)
@@ -438,7 +462,7 @@ type SnapshotOpen struct {
 func (o *SnapshotOpen) UnmarshalJSON(data []byte) error {
 	type open SnapshotOpen
 	var decoded open
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	if decoded.Position == nil {
@@ -462,7 +486,7 @@ type SnapshotPage struct {
 func (p *SnapshotPage) UnmarshalJSON(data []byte) error {
 	type page SnapshotPage
 	var decoded page
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	if len(decoded.Rows) == 0 {

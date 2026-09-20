@@ -18,7 +18,7 @@ func decodeFileJSON(data []byte, target any) error {
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
-	if err := checkLockJSON(decoder, reflect.TypeOf(target).Elem()); err != nil {
+	if err := checkTypedJSON(decoder, reflect.TypeOf(target).Elem(), len(data)); err != nil {
 		return err
 	}
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
@@ -43,7 +43,7 @@ func validateFileRequest(r fileRequest) error {
 	expected := fileRequest{Op: r.Op, Session: r.Session, Action: r.Action, Path: []byte{}, Data: []byte{}}
 	if r.Op == storage.OpFileSessionOpen {
 		if r.Session != "" {
-			return errors.New("new file session cannot name a previous session")
+			return errors.New("new file session names a previous session")
 		}
 	} else if !validFileCapability(r.Session) {
 		return errors.New("invalid file session capability")
@@ -53,8 +53,9 @@ func validateFileRequest(r fileRequest) error {
 			return err
 		}
 	} else if r.Action != "" {
-		return errors.New("file operation does not accept an action identity")
+		return errors.New("operation does not accept an action identity")
 	}
+	reference := false
 	switch r.Op {
 	case storage.OpFileSessionOpen:
 		expected.Options = r.Options
@@ -70,56 +71,71 @@ func validateFileRequest(r fileRequest) error {
 	case storage.OpFileSetNodeAttr:
 		expected.Node = r.Node
 		expected.Change = r.Change
-	case storage.OpFileStat, storage.OpFileSync, storage.OpFileClose, storage.OpFileAck:
-		expected.File = r.File
+	case storage.OpFileStat, storage.OpFileSync, storage.OpFileClose, storage.OpFileAck, storage.OpFileScope:
+		reference = true
 	case storage.OpFileRead:
-		expected.File = r.File
+		reference = true
 		expected.Offset = r.Offset
 		expected.Length = r.Length
 	case storage.OpFileWrite:
-		expected.File = r.File
+		reference = true
 		expected.Offset = r.Offset
 		expected.Data = r.Data
 	case storage.OpFileTruncate:
-		expected.File = r.File
+		reference = true
 		expected.Offset = r.Offset
 	case storage.OpFileSetAttr:
-		expected.File = r.File
+		reference = true
 		expected.Change = r.Change
-	case storage.OpFileGetLock:
-		expected.File = r.File
+	case storage.OpFileSetNodeMetadata:
+		expected.Node = r.Node
+		expected.Namespace = r.Namespace
+		expected.Version = r.Version
+		expected.Payload = r.Payload
+	case storage.OpFileSetMetadata:
+		reference = true
+		expected.Namespace = r.Namespace
+		expected.Version = r.Version
+		expected.Payload = r.Payload
+	case storage.OpFileNewUseOwner:
+		expected.Node = r.Node
+		expected.Scope = r.Scope
+		expected.OwnerOptions = r.OwnerOptions
+	case storage.OpFileRetireUseOwner:
 		expected.Owner = r.Owner
-		expected.Lock = r.Lock
-	case storage.OpFileSetLock, storage.OpFileUnlock:
-		expected.File = r.File
+	case storage.OpFileRangeGetConflict:
 		expected.Owner = r.Owner
-		expected.Lock = r.Lock
+		expected.Commands = r.Commands
+	case storage.OpFileRangeApply:
+		expected.Owner = r.Owner
+		expected.Commands = r.Commands
 		expected.LockID = r.LockID
-	case storage.OpFileQueryLock, storage.OpFileCancelLock:
-		expected.File = r.File
+	case storage.OpFileRangeQuery, storage.OpFileRangeCancel:
 		expected.Owner = r.Owner
 		expected.LockID = r.LockID
-	case storage.OpFileDropLocks:
-		expected.File = r.File
+	case storage.OpFileRangeDrop:
 		expected.Owner = r.Owner
-		expected.Family = r.Family
+		expected.Domain = r.Domain
 	default:
 		return errors.New("unknown retained file operation")
 	}
-	if !reflect.DeepEqual(r, expected) {
-		return errors.New("file operation carries unrelated operands")
+	if fileBoundedResult(r.Op) {
+		expected.ResultBytes = r.ResultBytes
 	}
-	if expected.File != "" && !validFileCapability(expected.File) {
-		return errors.New("invalid file reference capability")
-	}
-	switch r.Op {
-	case storage.OpFileStat, storage.OpFileSync, storage.OpFileClose, storage.OpFileAck, storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileGetLock, storage.OpFileSetLock, storage.OpFileUnlock, storage.OpFileQueryLock, storage.OpFileCancelLock, storage.OpFileDropLocks:
+	if reference {
+		expected.File = r.File
 		if !validFileCapability(r.File) {
 			return errors.New("file operation has no reference capability")
 		}
 	}
+	if !reflect.DeepEqual(r, expected) {
+		return errors.New("file operation carries unrelated operands")
+	}
 	if (r.Op == storage.OpFileSetAttr || r.Op == storage.OpFileSetNodeAttr) && r.Change == nil {
-		return errors.New("file attribute operation carries no change")
+		return errors.New("attribute operation carries no change")
+	}
+	if r.Op == storage.OpFileNewUseOwner && r.Scope == nil {
+		return errors.New("owner enrollment carries no reference scope")
 	}
 	return nil
 }
@@ -139,11 +155,14 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		case storage.OpFileSessionOpen:
 			expected.Session = r.Session
 			expected.Status = r.Status
+			expected.Capabilities = r.Capabilities
 		case storage.OpFileStatus, storage.OpFileRenew:
 			expected.Status = r.Status
 		case storage.OpFileOpen, storage.OpFileOpenNode:
+			expected.Node = r.Node
 			expected.File = r.File
 			expected.Barrier = r.Barrier
+			expected.Capabilities = r.Capabilities
 		case storage.OpFileStat, storage.OpFileStatNode:
 			expected.Attr = r.Attr
 		case storage.OpFileRead:
@@ -152,13 +171,20 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		case storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetNodeAttr:
 			expected.Attr = r.Attr
 			expected.Barrier = r.Barrier
-		case storage.OpFileSync:
+		case storage.OpFileSync, storage.OpFileClose, storage.OpFileSessionClose:
 			expected.Barrier = r.Barrier
-		case storage.OpFileGetLock:
+		case storage.OpFileScope:
+			expected.Scope = r.Scope
+		case storage.OpFileNewUseOwner:
+			expected.Owner = r.Owner
+		case storage.OpFileSetNodeMetadata, storage.OpFileSetMetadata:
+			expected.Metadata = r.Metadata
+			expected.Barrier = r.Barrier
+		case storage.OpFileRangeGetConflict:
 			expected.Conflict = r.Conflict
-		case storage.OpFileSetLock, storage.OpFileUnlock, storage.OpFileQueryLock, storage.OpFileCancelLock:
+		case storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel:
 			expected.Attempt = r.Attempt
-		case storage.OpFileAck, storage.OpFileClose, storage.OpFileSessionClose, storage.OpFileDropLocks:
+		case storage.OpFileAck, storage.OpFileRetireUseOwner, storage.OpFileRangeDrop:
 		default:
 			return errors.New("unknown file response variant")
 		}
@@ -171,7 +197,7 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 	}
 	switch req.Op {
 	case storage.OpFileSessionOpen:
-		if !validFileCapability(r.Session) || r.Status == nil {
+		if !validFileCapability(r.Session) || r.Status == nil || r.Capabilities == nil {
 			return errors.New("file session response has no valid capability or status")
 		}
 	case storage.OpFileStatus, storage.OpFileRenew:
@@ -179,20 +205,38 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			return errors.New("file response carries no status")
 		}
 	case storage.OpFileOpen, storage.OpFileOpenNode:
-		if !validFileCapability(r.File) {
+		if !validFileCapability(r.File) || r.Capabilities == nil {
 			return errors.New("file open response carries no reference capability")
 		}
 	case storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetNodeAttr:
 		if r.Attr == nil {
 			return errors.New("file response carries no attributes")
 		}
-	case storage.OpFileGetLock:
-		if r.Conflict == nil {
-			return errors.New("file response carries no conflict result")
+	case storage.OpFileScope:
+		if r.Scope == nil {
+			return errors.New("reference scope is absent")
 		}
-	case storage.OpFileSetLock, storage.OpFileUnlock, storage.OpFileQueryLock, storage.OpFileCancelLock:
+		if err := r.Scope.Check(); err != nil {
+			return err
+		}
+		if !utf8.ValidString(r.Scope.Token) {
+			return errors.New("reference scope is not valid UTF-8")
+		}
+	case storage.OpFileNewUseOwner:
+		if r.Owner == 0 {
+			return errors.New("owner enrollment carries no owner")
+		}
+	case storage.OpFileSetNodeMetadata, storage.OpFileSetMetadata:
+		if r.Metadata == nil {
+			return errors.New("metadata result is absent")
+		}
+	case storage.OpFileRangeGetConflict:
+		if r.Conflict == nil {
+			return errors.New("range query has no conflict result")
+		}
+	case storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel:
 		if r.Attempt == nil {
-			return errors.New("file response carries no lock action result")
+			return errors.New("range response has no attempt result")
 		}
 	}
 	if r.Status != nil {
@@ -202,11 +246,16 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		}
 	}
 	if r.Attr != nil {
-		if r.Attr.ID == 0 || r.Attr.AccessTime.Nanos < 0 || r.Attr.AccessTime.Nanos >= 1e9 || r.Attr.ModTime.Nanos < 0 || r.Attr.ModTime.Nanos >= 1e9 {
-			return errors.New("invalid captured file attributes")
+		if err := r.Attr.check(); err != nil {
+			return err
 		}
-		if req.Op != storage.OpFileStatNode && req.Op != storage.OpFileSetNodeAttr && (r.Attr.Size < 0 || !r.Attr.Storage().Mode.IsRegular()) {
+		if req.Op != storage.OpFileStatNode && req.Op != storage.OpFileSetNodeAttr && r.Attr.Kind != storage.NodeRegular {
 			return errors.New("file reference returned nonregular attributes")
+		}
+	}
+	if r.Metadata != nil {
+		if err := storage.CheckMetadata(map[string]storage.OpaquePayload{req.Namespace: {Version: r.Metadata.Version, Data: r.Metadata.Data}}); err != nil {
+			return err
 		}
 	}
 	if r.Conflict != nil {
@@ -215,79 +264,117 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		}
 	}
 	if r.Attempt != nil {
-		attempt, err := r.Attempt.storage()
-		if err != nil {
-			return err
-		}
-		if err := validateFileAttempt(req, attempt); err != nil {
+		if err := validateFileAttempt(req, *r.Attempt); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateFileConflict(c storage.LockConflict) error {
+func validateFileConflict(c storage.RangeConflict) error {
 	if !c.Found {
-		if c != (storage.LockConflict{}) {
-			return errors.New("absent lock conflict carries owner or range state")
+		if c != (storage.RangeConflict{}) {
+			return errors.New("absent conflict carries owner or range state")
 		}
 		return nil
 	}
-	if err := c.Lock.Check(); err != nil {
-		return err
+	if c.Mode != storage.RangeShared && c.Mode != storage.RangeExclusive {
+		return errors.New("range conflict has an invalid mode")
 	}
-	if c.Lock.Type == storage.Unlock {
-		return errors.New("lock conflict identifies an unlocked range")
-	}
-	return nil
+	return c.Range.Check()
 }
 
-func validateFileAttempt(req fileRequest, a storage.LockAttempt) error {
+func validateFileAttempt(req fileRequest, a storage.RangeAttempt) error {
 	if a.Request != req.LockID {
-		return errors.New("lock result identifies a different action")
+		return errors.New("range result identifies a different action")
 	}
-	if err := a.Lock.Check(); err != nil {
-		return err
+	if len(a.Commands) == 0 || len(a.Commands) > storage.MaxRangeCommands || len(a.Claims) > storage.MaxRangeClaims || len(a.Effects) > storage.MaxRangeEffects {
+		return errors.New("range result has an invalid batch size")
+	}
+	for _, command := range a.Commands {
+		if err := command.Check(); err != nil {
+			return err
+		}
+	}
+	if req.Op == storage.OpFileRangeApply && !reflect.DeepEqual(a.Commands, req.Commands) {
+		return errors.New("range result identifies a different intent")
+	}
+	for _, claim := range a.Claims {
+		if err := claim.Check(); err != nil {
+			return err
+		}
+	}
+	for _, effect := range a.Effects {
+		if err := effect.Command.Check(); err != nil {
+			return err
+		}
+		if effect.Claim != "" {
+			if err := effect.Claim.Check(); err != nil {
+				return err
+			}
+		}
 	}
 	if err := validateFileConflict(a.Conflict); err != nil {
 		return err
 	}
 	if a.HistoryRemaining < 0 {
-		return errors.New("lock history lifetime is negative")
+		return errors.New("range history lifetime is negative")
 	}
-	if (req.Op == storage.OpFileSetLock || req.Op == storage.OpFileUnlock) && a.Lock != req.Lock {
-		return errors.New("lock result identifies a different intent")
+	if a.State == storage.Rejected {
+		if a.FailedAt != nil {
+			if *a.FailedAt < 0 || *a.FailedAt >= len(a.Commands) {
+				return errors.New("range result has an invalid failing command position")
+			}
+		} else {
+			switch a.Rejection {
+			case storage.RangeExhausted, storage.RangeTooLarge:
+			default:
+				return errors.New("range rejection omits its failing command position")
+			}
+		}
+	} else if a.FailedAt != nil {
+		return errors.New("range result has an invalid failing command position")
+	}
+	acquires, waits := false, false
+	for _, command := range a.Commands {
+		acquires = acquires || command.Edit == storage.Replace || command.Edit == storage.AddExact
+		waits = waits || command.Wait
 	}
 	switch a.State {
-	case storage.LockPending:
-		if !a.Lock.Wait || a.EverGranted || a.Errno != 0 {
-			return errors.New("inconsistent pending lock result")
+	case storage.Pending:
+		if a.EverGranted || a.Rejection != "" || !waits {
+			return errors.New("inconsistent pending range result")
 		}
-	case storage.LockGranted:
-		if !a.EverGranted || a.Errno != 0 || a.Lock.Type == storage.Unlock {
-			return errors.New("inconsistent granted lock result")
+	case storage.Granted:
+		if !acquires || !a.EverGranted || a.Rejection != "" {
+			return errors.New("inconsistent granted range result")
 		}
-	case storage.LockReleased:
-		if a.Errno != 0 || a.EverGranted != (a.Lock.Type != storage.Unlock) {
-			return errors.New("inconsistent released lock result")
+	case storage.Released:
+		if a.Rejection != "" || a.EverGranted != acquires {
+			return errors.New("inconsistent released range result")
 		}
-	case storage.LockCancelled:
-		if a.EverGranted || a.Errno != 0 {
-			return errors.New("inconsistent cancelled lock result")
+	case storage.Cancelled:
+		if a.EverGranted || a.Rejection != "" {
+			return errors.New("inconsistent cancelled range result")
 		}
-	case storage.LockRejected:
-		if _, ok := storage.ErrnoName(a.Errno); !ok || a.EverGranted {
-			return errors.New("inconsistent rejected lock result")
+	case storage.Rejected:
+		if a.EverGranted {
+			return errors.New("rejected range result claims a grant")
+		}
+		switch a.Rejection {
+		case storage.RangeBlocked, storage.RangeNotHeld, storage.RangeExhausted, storage.RangeDeadlock, storage.RangeInvalid, storage.RangeUnsupported, storage.RangeExpired, storage.RangeTooLarge:
+		default:
+			return errors.New("range rejection code is unknown")
 		}
 	default:
-		return fmt.Errorf("unknown advisory lock action state %d", a.State)
+		return fmt.Errorf("unknown range action state %d", a.State)
 	}
-	return nil
+	return validateRangeEffects(a)
 }
 
 var fileReadEnvelopeBytes = func() int64 {
 	worstTime := Time{UnixSec: math.MinInt64, Nanos: 999999999}
-	response := fileResponse{Epoch: math.MaxUint64, Data: []byte{}, Attr: &Attr{ID: math.MaxUint64, Mode: math.MaxUint32, Size: math.MaxInt64, AccessTime: worstTime, ModTime: worstTime}}
+	response := fileResponse{Epoch: math.MaxUint64, Data: []byte{}, Attr: &Attr{ID: math.MaxUint64, Kind: storage.NodeRegular, Size: math.MaxInt64, AccessTime: worstTime, ModTime: worstTime}}
 	encoded, err := json.Marshal(response)
 	if err != nil {
 		panic(err)

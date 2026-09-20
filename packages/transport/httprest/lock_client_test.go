@@ -92,6 +92,10 @@ func TestLockJSONRejectsDamagedRequests(t *testing.T) {
 	if err := decodeLockJSON([]byte(valid), &request); err != nil {
 		t.Fatal(err)
 	}
+	var resolve lockResolveRequest
+	if err := decodeLockJSON([]byte(`{"owner":{"session":"s","owner":"o"},"path":"YR=="}`), &resolve); err == nil {
+		t.Fatal("lock control accepted noncanonical base64")
+	}
 }
 
 func TestLockWireDurationsAndRetainedReceipts(t *testing.T) {

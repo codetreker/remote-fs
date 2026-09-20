@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"syscall"
 	"time"
 
@@ -22,42 +23,70 @@ var (
 	_ fs.FileReleaser = (*handle)(nil)
 )
 
-func kernelLock(lk *gofuse.FileLock, flags uint32, wait bool) (storage.FileLock, error) {
-	if lk == nil || flags&^uint32(gofuse.FUSE_LK_FLOCK) != 0 {
-		return storage.FileLock{}, syscall.EINVAL
+func kernelLock(lk *gofuse.FileLock, flags uint32, wait bool) (storage.RangeCommand, error) {
+	if lk == nil || flags & ^uint32(gofuse.FUSE_LK_FLOCK) != 0 {
+		return storage.RangeCommand{}, syscall.EINVAL
 	}
-	lock := storage.FileLock{Family: storage.POSIX, Start: lk.Start, End: lk.End, PID: lk.Pid, Wait: wait}
+	start, end := lk.Start, lk.End
+	domain := storage.DomainRecord
+	conversion := storage.PreserveBeforeAcquire
 	if flags&gofuse.FUSE_LK_FLOCK != 0 {
-		lock.Family = storage.Flock
-		lock.Start, lock.End = 0, math.MaxInt64
+		domain = storage.DomainWholeFile
+		start, end = 0, math.MaxInt64
+		conversion = storage.DropBeforeAcquire
 	}
+	if start > end || end > math.MaxInt64 {
+		return storage.RangeCommand{}, syscall.EINVAL
+	}
+	command := storage.RangeCommand{Domain: domain, Range: storage.Range{Kind: storage.Bytes, Start: start, Length: end - start + 1}, Edit: storage.Replace, Wait: wait, Conversion: conversion}
 	switch lk.Typ {
 	case syscall.F_RDLCK:
-		lock.Type = storage.Shared
+		command.Mode = storage.RangeShared
 	case syscall.F_WRLCK:
-		lock.Type = storage.Exclusive
+		command.Mode = storage.RangeExclusive
 	case syscall.F_UNLCK:
-		lock.Type, lock.Wait = storage.Unlock, false
+		command.Mode = storage.RangeShared
+		command.Edit = storage.Subtract
+		command.Wait = false
+		command.Conversion = storage.PreserveBeforeAcquire
 	default:
-		return storage.FileLock{}, syscall.EINVAL
+		return storage.RangeCommand{}, syscall.EINVAL
 	}
-	return lock, lock.Check()
+	return command, command.Check()
 }
 
-func (h *handle) Getlk(ctx context.Context, owner uint64, lk *gofuse.FileLock, flags uint32, out *gofuse.FileLock) syscall.Errno {
-	lock, err := kernelLock(lk, flags, false)
+func (h *handle) Getlk(ctx context.Context, kernel uint64, lk *gofuse.FileLock, flags uint32, out *gofuse.FileLock) (result syscall.Errno) {
+	command, err := kernelLock(lk, flags, false)
 	if err != nil {
 		return errnoOf(err)
 	}
-	if lock.Type == storage.Unlock || out == nil {
+	if command.Edit == storage.Subtract || out == nil {
 		return syscall.EINVAL
 	}
 	if err := h.check(); err != nil {
 		return errnoOf(err)
 	}
+	control, ok := h.node.volume.files.(storage.RangeControl)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	if err := control.CheckRangeControl(); err != nil {
+		return errnoOf(err)
+	}
 	call, cancel := context.WithTimeout(ctx, h.node.volume.flushTimeout)
 	defer cancel()
-	conflict, err := h.file.GetLock(call, storage.LockOwner(owner), lock)
+	owner, err := h.lockOwner(call, kernel, command.Domain, lk.Pid, false)
+	if err != nil {
+		return errnoOf(err)
+	}
+	defer func() {
+		cleanup, finish := h.node.volume.cleanupContext(ctx)
+		defer finish()
+		if err := h.releaseLockOwner(cleanup, owner); err != nil {
+			result = h.unknownLock(err)
+		}
+	}()
+	conflict, err := control.GetConflict(call, owner.id, command)
 	if err != nil {
 		return errnoOf(err)
 	}
@@ -66,39 +95,66 @@ func (h *handle) Getlk(ctx context.Context, owner uint64, lk *gofuse.FileLock, f
 	if !conflict.Found {
 		return 0
 	}
-	other := conflict.Lock
-	if err := other.Check(); err != nil || other.Type == storage.Unlock || other.Family != lock.Family ||
-		other.Start > lock.End || lock.Start > other.End || other.Type == storage.Shared && lock.Type == storage.Shared {
+	other := conflict.Range
+	if err := other.Check(); err != nil || other.Kind != storage.Bytes || other.Start+other.Length-1 > math.MaxInt64 ||
+		other.Start >= command.Range.Start+command.Range.Length || command.Range.Start >= other.Start+other.Length ||
+		conflict.Mode != storage.RangeShared && conflict.Mode != storage.RangeExclusive || conflict.Mode == storage.RangeShared && command.Mode == storage.RangeShared {
 		return syscall.EIO
 	}
-	out.Start, out.End, out.Pid = other.Start, other.End, other.PID
+	out.Start, out.End = other.Start, other.Start+other.Length-1
+	if command.Domain == storage.DomainRecord {
+		if conflict.Owner == 0 || conflict.Owner > math.MaxInt32 {
+			return syscall.EIO
+		}
+		out.Pid = uint32(conflict.Owner)
+	}
 	out.Typ = syscall.F_RDLCK
-	if other.Type == storage.Exclusive {
+	if conflict.Mode == storage.RangeExclusive {
 		out.Typ = syscall.F_WRLCK
 	}
 	return 0
 }
 
 func (h *handle) Setlk(ctx context.Context, owner uint64, lk *gofuse.FileLock, flags uint32) syscall.Errno {
-	return h.setLock(ctx, storage.LockOwner(owner), lk, flags, false)
+	return h.setLock(ctx, owner, lk, flags, false)
 }
 
 func (h *handle) Setlkw(ctx context.Context, owner uint64, lk *gofuse.FileLock, flags uint32) syscall.Errno {
-	return h.setLock(ctx, storage.LockOwner(owner), lk, flags, true)
+	return h.setLock(ctx, owner, lk, flags, true)
 }
 
-func (h *handle) setLock(ctx context.Context, owner storage.LockOwner, lk *gofuse.FileLock, flags uint32, wait bool) syscall.Errno {
+func (h *handle) setLock(ctx context.Context, kernel uint64, lk *gofuse.FileLock, flags uint32, wait bool) (result syscall.Errno) {
 	lock, err := kernelLock(lk, flags, wait)
 	if err != nil {
 		return errnoOf(err)
 	}
-	if lock.Family == storage.POSIX && (lock.Type == storage.Shared && !h.readable || lock.Type == storage.Exclusive && !h.writable) {
+	if lock.Domain == storage.DomainRecord && lock.Edit != storage.Subtract && (lock.Mode == storage.RangeShared && !h.readable || lock.Mode == storage.RangeExclusive && !h.writable) {
 		return syscall.EBADF
 	}
 	if err := h.check(); err != nil {
 		return errnoOf(err)
 	}
+	control, ok := h.node.volume.files.(storage.RangeControl)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	if err := control.CheckRangeControl(); err != nil {
+		return errnoOf(err)
+	}
 	call, cancel := context.WithTimeout(ctx, h.node.volume.flushTimeout)
+	owner, err := h.lockOwner(call, kernel, lock.Domain, lk.Pid, true)
+	cancel()
+	if err != nil {
+		return errnoOf(err)
+	}
+	defer func() {
+		cleanup, finish := h.node.volume.cleanupContext(ctx)
+		defer finish()
+		if err := h.releaseLockOwner(cleanup, owner); err != nil {
+			result = h.unknownLock(err)
+		}
+	}()
+	call, cancel = context.WithTimeout(ctx, h.node.volume.flushTimeout)
 	epoch, err := h.node.volume.actionEpoch(call)
 	cancel()
 	if err != nil {
@@ -109,10 +165,16 @@ func (h *handle) setLock(ctx context.Context, owner storage.LockOwner, lk *gofus
 		return errnoOf(err)
 	}
 	call, cancel = context.WithTimeout(ctx, h.node.volume.flushTimeout)
-	attempt, err := h.file.SetLock(call, owner, lock, request)
+	attempt, err := control.Apply(call, owner.id, []storage.RangeCommand{lock}, request)
 	cancel()
 	if err != nil {
+		if errno, done := h.lockOwnerRetirement(ctx, owner); done {
+			return errno
+		}
 		if errno := errnoOf(err); errno != syscall.EIO && errno != syscall.EINTR {
+			return errno
+		}
+		if errno, done := h.lockOwnerRetirement(ctx, owner); done {
 			return errno
 		}
 		return h.cancelLock(ctx, owner, lock, request, err)
@@ -123,21 +185,27 @@ func (h *handle) setLock(ctx context.Context, owner storage.LockOwner, lk *gofus
 			return h.unknownLock(err)
 		}
 		switch attempt.State {
-		case storage.LockGranted:
+		case storage.Granted:
+			if errno, done := h.lockOwnerRetirement(ctx, owner); done {
+				return errno
+			}
 			return errnoOf(h.check())
-		case storage.LockRejected:
-			return attempt.Errno
-		case storage.LockReleased:
-			if lock.Type == storage.Unlock {
+		case storage.Rejected:
+			return rangeErrno(attempt.Rejection)
+		case storage.Released:
+			if lock.Edit == storage.Subtract {
 				return 0
 			}
 			return syscall.EINTR
-		case storage.LockCancelled:
+		case storage.Cancelled:
 			return syscall.EINTR
 		}
 		if err := h.check(); err != nil {
 			if errnoOf(err) == syscall.ESTALE {
 				return syscall.ESTALE
+			}
+			if errno, done := h.lockOwnerRetirement(ctx, owner); done {
+				return errno
 			}
 			return h.cancelLock(ctx, owner, lock, request, err)
 		}
@@ -149,33 +217,47 @@ func (h *handle) setLock(ctx context.Context, owner storage.LockOwner, lk *gofus
 		case <-timer.C:
 		}
 		call, cancel = context.WithTimeout(ctx, h.node.volume.flushTimeout)
-		attempt, err = h.file.QueryLock(call, owner, request)
+		attempt, err = control.Query(call, owner.id, request)
 		cancel()
 		if err != nil {
+			if errno, done := h.lockOwnerRetirement(ctx, owner); done {
+				return errno
+			}
 			return h.cancelLock(ctx, owner, lock, request, err)
 		}
 	}
 }
 
-func checkLockAttempt(attempt storage.LockAttempt, request storage.LockRequestID, lock storage.FileLock) error {
-	if attempt.Request != request || attempt.Lock != lock {
+func (h *handle) lockOwnerRetirement(ctx context.Context, owner *localLockOwner) (syscall.Errno, bool) {
+	retired, err := h.node.volume.lockOwnerRetirement(ctx, owner)
+	if err != nil {
+		return h.unknownLock(err), true
+	}
+	if retired {
+		return syscall.EINTR, true
+	}
+	return 0, false
+}
+
+func checkLockAttempt(attempt storage.RangeAttempt, request storage.LockRequestID, lock storage.RangeCommand) error {
+	if attempt.Request != request || !slices.Equal(attempt.Commands, []storage.RangeCommand{lock}) {
 		return fmt.Errorf("advisory receipt does not match its request: %w", syscall.EIO)
 	}
-	if attempt.State == storage.LockRejected {
-		if attempt.Errno != 0 {
+	if attempt.State == storage.Rejected {
+		if errno := rangeErrno(attempt.Rejection); errno != 0 && errno != syscall.EIO {
 			return nil
 		}
-	} else if attempt.Errno == 0 {
+	} else if attempt.Rejection == "" {
 		switch attempt.State {
-		case storage.LockPending:
-			if lock.Wait && lock.Type != storage.Unlock {
+		case storage.Pending:
+			if lock.Wait && lock.Edit != storage.Subtract {
 				return nil
 			}
-		case storage.LockGranted:
-			if lock.Type != storage.Unlock && attempt.EverGranted {
+		case storage.Granted:
+			if lock.Edit != storage.Subtract && attempt.EverGranted {
 				return nil
 			}
-		case storage.LockCancelled, storage.LockReleased:
+		case storage.Cancelled, storage.Released:
 			return nil
 		}
 	}
@@ -184,11 +266,21 @@ func checkLockAttempt(attempt storage.LockAttempt, request storage.LockRequestID
 
 // Cancellation acknowledges a retained grant as success. Returning EINTR for that
 // outcome would permit a retry while an acquisition the caller never observed survives.
-func (h *handle) cancelLock(ctx context.Context, owner storage.LockOwner, lock storage.FileLock, request storage.LockRequestID, cause error) syscall.Errno {
+func (h *handle) cancelLock(ctx context.Context, owner *localLockOwner, lock storage.RangeCommand, request storage.LockRequestID, cause error) syscall.Errno {
 	cleanup, cancel := h.node.volume.cleanupContext(ctx)
 	defer cancel()
-	attempt, err := h.file.CancelLock(cleanup, owner, request)
+	control, ok := h.node.volume.files.(storage.RangeControl)
+	if !ok {
+		return h.unknownLock(syscall.EOPNOTSUPP)
+	}
+	if err := control.CheckRangeControl(); err != nil {
+		return h.unknownLock(err)
+	}
+	attempt, err := control.Cancel(cleanup, owner.id, request)
 	if err != nil {
+		if errno, done := h.lockOwnerRetirement(ctx, owner); done {
+			return errno
+		}
 		if h.retiredNormally(err) {
 			return syscall.ESTALE
 		}
@@ -198,15 +290,18 @@ func (h *handle) cancelLock(ctx context.Context, owner storage.LockOwner, lock s
 		return h.unknownLock(errors.Join(cause, err))
 	}
 	switch attempt.State {
-	case storage.LockGranted:
+	case storage.Granted:
+		if errno, done := h.lockOwnerRetirement(ctx, owner); done {
+			return errno
+		}
 		return errnoOf(h.check())
-	case storage.LockCancelled, storage.LockReleased:
-		if lock.Type == storage.Unlock && attempt.State == storage.LockReleased {
+	case storage.Cancelled, storage.Released:
+		if lock.Edit == storage.Subtract && attempt.State == storage.Released {
 			return 0
 		}
 		return syscall.EINTR
-	case storage.LockRejected:
-		return attempt.Errno
+	case storage.Rejected:
+		return rangeErrno(attempt.Rejection)
 	default:
 		return h.unknownLock(errors.Join(cause, fmt.Errorf("advisory cancellation is unresolved: %w", syscall.EIO)))
 	}
@@ -233,7 +328,7 @@ func (h *handle) Flush(ctx context.Context) syscall.Errno {
 	}
 	cleanup, cancel := h.node.volume.cleanupContext(ctx)
 	defer cancel()
-	if err := h.file.DropLocks(cleanup, metadata.owner, storage.POSIX); err != nil {
+	if err := h.dropRecordOwner(cleanup, metadata.owner); err != nil {
 		return h.unknownLock(err)
 	}
 	return 0
@@ -249,12 +344,37 @@ func (h *handle) Release(ctx context.Context) syscall.Errno {
 	var err error
 	if !ok || metadata.kind != rawRelease {
 		err = fmt.Errorf("release lacks its kernel lock owner: %w", syscall.EIO)
-	} else if metadata.flockUnlock {
-		err = h.file.DropLocks(cleanup, metadata.owner, storage.Flock)
+	} else {
+		err = h.retireDescriptionOwners(cleanup)
 	}
 	err = errors.Join(err, h.closeFile(cleanup))
 	if err != nil {
 		return h.unknownLock(err)
 	}
 	return 0
+}
+
+func rangeErrno(code storage.RejectionCode) syscall.Errno {
+	switch code {
+	case "":
+		return 0
+	case storage.RangeBlocked:
+		return syscall.EAGAIN
+	case storage.RangeNotHeld:
+		return syscall.EINVAL
+	case storage.RangeExhausted:
+		return syscall.ENOLCK
+	case storage.RangeTooLarge:
+		return syscall.EFBIG
+	case storage.RangeDeadlock:
+		return syscall.EDEADLK
+	case storage.RangeInvalid:
+		return syscall.EINVAL
+	case storage.RangeUnsupported:
+		return syscall.EOPNOTSUPP
+	case storage.RangeExpired:
+		return syscall.ESTALE
+	default:
+		return syscall.EIO
+	}
 }

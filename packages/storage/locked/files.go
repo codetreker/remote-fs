@@ -41,10 +41,10 @@ func (s *Storage) NewFileSession(ctx context.Context, options storage.FileSessio
 		return nil, err
 	}
 	inner, err := s.backend.(storage.FileStorage).NewFileSession(readContext(ctx), options)
-	if err != nil {
+	if inner == nil {
 		return nil, err
 	}
-	return &fileSession{FileSession: inner, storage: s}, nil
+	return &fileSession{FileSession: inner, storage: s}, err
 }
 
 type fileSession struct {
@@ -59,10 +59,7 @@ func (s *fileSession) OpenFile(ctx context.Context, name string, options storage
 		ctx = readContext(ctx)
 	}
 	inner, err := s.FileSession.OpenFile(ctx, name, options)
-	if err != nil {
-		return nil, err
-	}
-	return &file{File: inner, storage: s.storage}, nil
+	return s.storage.wrapFile(inner), err
 }
 
 func (s *fileSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
@@ -72,10 +69,7 @@ func (s *fileSession) OpenNode(ctx context.Context, id uint64, options storage.F
 		ctx = readContext(ctx)
 	}
 	inner, err := s.FileSession.OpenNode(ctx, id, options)
-	if err != nil {
-		return nil, err
-	}
-	return &file{File: inner, storage: s.storage}, nil
+	return s.storage.wrapFile(inner), err
 }
 
 func (s *fileSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
@@ -100,7 +94,14 @@ func (s *fileSession) Close(ctx context.Context) error {
 
 type file struct {
 	storage.File
-	storage *Storage
+	referenceCapabilities
+}
+
+func (s *Storage) wrapFile(inner storage.File) storage.File {
+	if inner == nil {
+		return nil
+	}
+	return &file{File: inner, referenceCapabilities: referenceCapabilities{backend: inner, storage: s}}
 }
 
 func (f *file) Stat(ctx context.Context) (storage.Attr, error) {
@@ -112,39 +113,19 @@ func (f *file) ReadAt(ctx context.Context, offset int64, length int) (storage.Fi
 }
 
 func (f *file) WriteAt(ctx context.Context, offset int64, data []byte) (storage.Attr, error) {
-	return f.File.WriteAt(f.storage.mutationContext(ctx), offset, data)
+	return f.File.WriteAt(f.referenceCapabilities.storage.mutationContext(ctx), offset, data)
 }
 
 func (f *file) Truncate(ctx context.Context, size int64) (storage.Attr, error) {
-	return f.File.Truncate(f.storage.mutationContext(ctx), size)
+	return f.File.Truncate(f.referenceCapabilities.storage.mutationContext(ctx), size)
 }
 
 func (f *file) SetAttr(ctx context.Context, change storage.AttrChange) (storage.Attr, error) {
-	return f.File.SetAttr(f.storage.mutationContext(ctx), change)
+	return f.File.SetAttr(f.referenceCapabilities.storage.mutationContext(ctx), change)
 }
 
 func (f *file) Sync(ctx context.Context) error {
 	return f.File.Sync(readContext(ctx))
-}
-
-func (f *file) GetLock(ctx context.Context, owner storage.LockOwner, lock storage.FileLock) (storage.LockConflict, error) {
-	return f.File.GetLock(readContext(ctx), owner, lock)
-}
-
-func (f *file) SetLock(ctx context.Context, owner storage.LockOwner, lock storage.FileLock, request storage.LockRequestID) (storage.LockAttempt, error) {
-	return f.File.SetLock(readContext(ctx), owner, lock, request)
-}
-
-func (f *file) QueryLock(ctx context.Context, owner storage.LockOwner, request storage.LockRequestID) (storage.LockAttempt, error) {
-	return f.File.QueryLock(readContext(ctx), owner, request)
-}
-
-func (f *file) CancelLock(ctx context.Context, owner storage.LockOwner, request storage.LockRequestID) (storage.LockAttempt, error) {
-	return f.File.CancelLock(readContext(ctx), owner, request)
-}
-
-func (f *file) DropLocks(ctx context.Context, owner storage.LockOwner, family storage.LockFamily) error {
-	return f.File.DropLocks(readContext(ctx), owner, family)
 }
 
 func (f *file) Close(ctx context.Context) error {

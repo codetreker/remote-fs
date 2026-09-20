@@ -19,6 +19,21 @@ type fileAuthority interface {
 	metastore.FileStore
 }
 
+type metadataAuthority interface {
+	fileAuthority
+	storage.MetadataAccess
+}
+
+type useOwnerAuthority interface {
+	fileAuthority
+	CheckUseOwners() error
+}
+
+type rangeAuthority interface {
+	fileAuthority
+	CheckRangeControl() error
+}
+
 // Heartbeats, lock acquisition, and lock reconciliation have independent capacity.
 // Staged data and new acquisitions cannot consume release or renewal admission.
 const (
@@ -248,7 +263,7 @@ func (fs *fileSession) open(ctx context.Context, options storage.FileOpenOptions
 		fs.mu.Unlock()
 		return nil, err
 	}
-	f := &openFile{session: fs, native: native, options: options, active: true, flock: make(map[storage.LockOwner]uint64)}
+	f := &openFile{session: fs, native: native, options: options, active: true}
 	fs.files[f] = struct{}{}
 	active := fs.active && time.Now().Before(fs.expires)
 	fs.mu.Unlock()
@@ -371,7 +386,11 @@ func (fs *fileSession) fence() error {
 	fs.mu.Unlock()
 	var errs []error
 	for _, f := range files {
-		errs = append(errs, f.retire())
+		if err := f.retire(); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		errs = append(errs, f.drainAndRelease())
 	}
 	return errors.Join(errs...)
 }

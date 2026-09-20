@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// Tree lookups and directory entries use the local replica. Identity-based attributes
-// are confirmed by the authority so an existing inode cannot describe a replacement.
+// Tree lookups use the local replica. Directory reads and identity-based attributes
+// reach the authority so current use exclusions and node identity are both enforced.
 func TestWalkingAMountedTreeCachesNamesAndConfirmsIdentityAttributes(t *testing.T) {
 	s := serveVolume(t)
 	a := mountpointOn(t, s)
@@ -60,14 +60,14 @@ func TestWalkingAMountedTreeCachesNamesAndConfirmsIdentityAttributes(t *testing.
 		}
 	}
 
-	if arrived := s.calls.sinceExcept(before, fileStatNodeCall, fileRenewCall); arrived != "" {
+	if arrived := s.calls.sinceExcept(before, fileStatNodeCall, fileRenewCall); arrived != "list×4" {
 		t.Fatalf("walking a copied tree sent unexpected named/data requests: %s", arrived)
 	}
 	identityStats := s.calls.snapshot()[fileStatNodeCall] - before[fileStatNodeCall]
 	if identityStats == 0 {
 		t.Fatal("inode attributes were never confirmed by identity")
 	}
-	t.Logf("walked %d nodes and checked 4 absent names: zero named stat/list requests, %d authoritative identity stats", len(walked), identityStats)
+	t.Logf("walked %d nodes and checked 4 absent names: four authoritative directory reads, %d authoritative identity stats", len(walked), identityStats)
 }
 
 // TestADirectoryRenameKeepsTheIdentitiesBeneathIt.
@@ -119,9 +119,9 @@ func TestADirectoryRenameKeepsTheIdentitiesBeneathIt(t *testing.T) {
 		t.Fatalf("the moved subtree lists %v, want [g]", got)
 	}
 
-	// The rename is the only named mutation; inode attributes still use identity queries.
-	if arrived := s.calls.sinceExcept(before, fileStatNodeCall, fileRenewCall); arrived != "rename×1" {
-		t.Fatalf("renaming a directory and reading its copied subtree sent %q, want only one named rename", arrived)
+	// The rename is the only named mutation; the directory read remains authoritative.
+	if arrived := s.calls.sinceExcept(before, fileStatNodeCall, fileRenewCall); arrived != "list×1 rename×1" {
+		t.Fatalf("renaming a directory and reading its copied subtree sent %q, want one rename and one list", arrived)
 	}
 	t.Logf("renamed and inspected the subtree with %d authoritative identity stats", s.calls.snapshot()[fileStatNodeCall]-before[fileStatNodeCall])
 }

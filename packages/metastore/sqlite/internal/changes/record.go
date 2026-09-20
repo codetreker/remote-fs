@@ -10,6 +10,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // The numbers the log stores for metastore.ChangeKind.
@@ -67,14 +68,26 @@ func Record(ctx context.Context, tx *sql.Tx, volume int64, change metastore.Chan
 	if change.From != nil {
 		fromParent, fromName = change.From.Parent, change.From.Name
 	}
-	var node, mode, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec, content any
+	var node, nodeKind, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec, content any
+	var birthSec, birthNsec, changeSec, changeNsec, metadata any
 	if change.Node != nil {
 		accessSec, accessNsec := sqlvalue.StoredTime(change.Node.AccessTime)
-		changeSec, changeNsec := sqlvalue.StoredTime(change.Node.ModTime)
-		node, mode, size = change.Node.ID, int64(change.Node.Mode), change.Node.Size
+		modifiedSec, modifiedNsec := sqlvalue.StoredTime(change.Node.ModTime)
+		node, nodeKind, size = change.Node.ID, int64(change.Node.Kind), change.Node.Size
 		atimeSec, atimeNsec = accessSec, accessNsec
-		mtimeSec, mtimeNsec = changeSec, changeNsec
+		mtimeSec, mtimeNsec = modifiedSec, modifiedNsec
 		content = sqlvalue.StoredKey(change.Node.Content)
+		if change.Node.BirthTime != nil {
+			birthSec, birthNsec = sqlvalue.StoredTime(*change.Node.BirthTime)
+		}
+		if change.Node.ChangeTime != nil {
+			changeSec, changeNsec = sqlvalue.StoredTime(*change.Node.ChangeTime)
+		}
+		encoded, err := storage.EncodeMetadata(change.Node.Metadata)
+		if err != nil {
+			return err
+		}
+		metadata = encoded
 	}
 
 	sec, nsec := sqlvalue.StoredTime(time.Now())
@@ -101,12 +114,12 @@ func Record(ctx context.Context, tx *sql.Tx, volume int64, change metastore.Chan
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO changes (position, previous_position, volume, kind, parent, name, from_parent, from_name,
-		                     node, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content,
-		                     recorded_sec, recorded_nsec)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			                     node, node_kind, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content,
+			                     recorded_sec, recorded_nsec, birth_sec, birth_nsec, change_sec, change_nsec, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		position, previous, volume, kind, change.Parent, change.Name, fromParent, fromName,
-		node, mode, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec, content,
-		sec, nsec)
+		node, nodeKind, size, atimeSec, atimeNsec, mtimeSec, mtimeNsec, content,
+		sec, nsec, birthSec, birthNsec, changeSec, changeNsec, metadata)
 	if err != nil {
 		return err
 	}

@@ -28,15 +28,15 @@ SQLite v5 将仍被引用的无名普通文件保存为 detached 节点。名字
 
 ### 标准 advisory 与强权限分别解释
 
-flock 按 open file description 归属，dup/fork 共享，最后一个共享描述符关闭后释放；EX 可以在只读 fd 上取得。传统 POSIX 锁按挂载会话内的内核 owner 与文件归属，同一文件的任一 fd 关闭都释放该 owner 的范围，fork 不继承。PID 只用于诊断，不跨挂载合并身份。两种锁的冲突域独立；flock 转换先放弃旧锁，POSIX 失败转换保留旧范围。
+flock 按 open file description 归属，dup/fork 共享，最后一个共享描述符关闭后释放；EX 可以在只读 fd 上取得。传统 POSIX 锁按挂载会话内的内核 owner 与文件归属，同一文件的任一 fd 关闭都释放该 owner 的范围，fork 不继承。FUSE 把 POSIX PID 作为 caller-owned Diagnostic 注册，冲突查询只返回这个不透明值，不泄漏内部 UseOwner；PID 不跨挂载合并身份，返回内核前还须落在有符号 Linux `pid_t` 的 1 至 `math.MaxInt32`。两种锁的冲突域独立；flock 转换先放弃旧锁，POSIX 失败转换保留旧范围。
 
 健康会话中的阻塞加锁可跨多次短请求持续等待，所有 owner、范围、pending、动作历史和死锁图都有上限。动作使用 epoch 与随机 nonce 核对；取消只有在确认没有残留授予后才报告 `EINTR`。原生 advisory 丢失占有连续性时，相关 I/O 持续失败直到显式解除或关闭。FUSE 遇到未知锁结果则封锁整个挂载、停止续期并退役会话，单个 fd 的解锁或关闭不恢复它，须清理并重新挂载。两层都不能自动重获锁掩盖失效窗口。
 
-标准 advisory 不阻止未参与加锁者的修改。[显式 S/X](2026-09-07-file-locks.md)继续保护内容、存在与身份，并在最终发布检查 proof。普通 Open 不自动加锁；经授权的名字移除令强资源 `TargetGone`，fd 与 advisory 随旧对象保留。FileSession、advisory owner、强 S/X Session/Owner、HTTP 连接与复制 incarnation 的生命周期分别核对。
+标准 advisory 不阻止未参与加锁者的修改。共同接口中的 Linux owner、mode 与锁族解释由[中立元数据与访问控制](2026-09-16-neutral-metadata-and-access-controls.md)移至客户端；本决定的 Linux 关闭/转换语义与内容管线保持。[显式 S/X](2026-09-07-file-locks.md)继续保护内容、存在与身份，并在最终发布检查 proof。普通 Open 不自动取得 Strong；经授权的名字移除令强资源 `TargetGone`，fd、Use claim 与 range 随旧对象保留。FileSession、UseOwner、Strong Session/Owner、HTTP 连接与复制 incarnation 的生命周期分别核对。
 
 ### 关闭只结束它拥有的生命周期
 
-`Flush` 显式用内核 owner 调用 DropLocks 处理该关闭事件的 POSIX 清理，最终文件释放结束引用与 flock；两者不承担内容提交。直接 File API 的 Close 不推断进程 owner，集成方须同样显式报告 POSIX 关闭事件；FileSession.Close 才结束会话全部状态。`Sync` 保留已完成写入的健康、持久性确认，所以 `写临时文件 → fsync → rename` 仍有明确顺序。`FlushTimeout` 是清理与挂载建立预算，已经不是上传时机。
+`Flush` 用内核 owner 对中立 RangeControl 执行 record-domain Drop，最终文件释放结束引用与 whole-file owner；两者不承担内容提交。直接 File API 的 Close 不推断进程 owner，集成方须通过 UseOwners/RangeControl 显式报告所选 owner 的关闭事件；FileSession.Close 才结束会话全部状态。`Sync` 保留已完成写入的健康、持久性确认，所以 `写临时文件 → fsync → rename` 仍有明确顺序。`FlushTimeout` 是清理与挂载建立预算，已经不是上传时机。
 
 挂载在已确认期限内续期 FileSession。失败的 Unmount 保持续期；内核真正退出后，挂载停止并排空会话，即使个别 Release 没有到达。`Mount.Done` 表示清理尝试结束，`Mount.Wait` 返回清理错误，关闭一个引用失败也不跳过其它引用的清理。HTTP handler 同样只清理自己创建的 registry，调用方在它结束之后才关闭 backend。
 
@@ -54,7 +54,7 @@ flock 按 open file description 归属，dup/fork 共享，最后一个共享描
 
 fd 的身份、读入的属性和字节来自同一保留对象；配额、网络与持久化失败直接落到同步修改。旧的[内容与长度混用](../bug-fix/2026-09-07-bind-buffered-reads-to-their-size.md)与[跨句柄页缓存](../bug-fix/2026-09-07-prevent-cross-handle-page-cache-staleness.md)分别保留具体触发、证据和修复边界。direct I/O 付出内核页缓存命中率，逐次写入付出往返和完整对象重新物化的成本。objectstore 的每次区间读仍可获取完整对象，顺序读大文件会重复承担这份传输与分配；区间接口本身没有交付对象后端的范围传输。多个普通写者可能都成功，不再把所有普通 fd 修改解释为显式版本比较。
 
-保留身份不等于保留每一份历史内容，也不自动修复目录操作的父身份竞争。[打开文件身份提案](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)保留路径目录操作与显式内容依据；[读取与清扫](../../proposed/architecture/2026-08-21-readers-in-flight-and-the-sweeper.md)保留旧内容键在读取前被回收的协调问题。文件 direct I/O 也不交付[非零元数据缓存与失效策略](../../proposed/architecture/2026-08-19-kernel-cache-and-unreachable.md)。
+保留身份不等于保留每一份历史内容，也不自动修复目录操作的父身份竞争。[中立元数据与访问控制](2026-09-16-neutral-metadata-and-access-controls.md)接续 NodeKind、metadata、Use claim 与 range；[打开文件身份提案](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)继续拥有目录父身份与显式内容依据；[读取与清扫](../../proposed/architecture/2026-08-21-readers-in-flight-and-the-sweeper.md)保留旧内容键在读取前被回收的协调问题。文件 direct I/O 也不交付[非零元数据缓存与失效策略](../../proposed/architecture/2026-08-19-kernel-cache-and-unreachable.md)。
 
 同机 mmap 的完整行为没有由 direct I/O 自动得到保证，跨客户端 mmap 一致性继续在 R-FS-4 之外；恢复共享映射能力必须单独定义写入确认与缓存交互。完整 `F_OFD_*` 语义同样没有承诺，且 FUSE 归一化后的请求不足以可靠逐条识别它们。
 

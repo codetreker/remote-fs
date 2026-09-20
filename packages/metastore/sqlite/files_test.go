@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -22,7 +23,7 @@ func openPublicationFile(t *testing.T) (*LockingStore, metastore.File) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0o600})
+	f, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
 	if err != nil {
 		s.Close()
 		t.Fatal(err)
@@ -235,7 +236,7 @@ func TestStrongGrantsRetireTheNameWhileOrdinaryReferencesKeepTheNode(t *testing.
 	f.put(t, t.Context(), "file", 5)
 	owner := f.owner(t)
 	grant := f.grant(t, owner, "file", locking.Exclusive)
-	opened, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true}, Mode: 0o777})
+	opened, err := s.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true}})
 	if err != nil {
 		t.Fatalf("ordinary open while strongly protected: %v", err)
 	}
@@ -335,7 +336,7 @@ func TestFilePublicationGuardRefusesEveryIdentityMutationAtFinalAdmission(t *tes
 				t.Fatalf("guard result=%v calls=%d", err, calls)
 			}
 			after, err := file.Node(t.Context())
-			if err != nil || after != before {
+			if err != nil || !reflect.DeepEqual(after, before) {
 				t.Fatalf("guarded mutation changed state=%+v error=%v; before=%+v", after, err, before)
 			}
 			afterPosition, err := s.CommittedPosition(t.Context())
@@ -386,31 +387,6 @@ func TestAdvisoryAuthorityIsSharedAndRetiredWithItsStore(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	node, err := f.Node(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	epoch, err := first.Epoch(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id, err := storage.NewLockRequestID(epoch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, Start: 0, End: 7}
-	if attempt, err := first.Set(ctx, uint64(node.ID), 1, lock, id); err != nil || attempt.State != storage.LockGranted {
-		t.Fatalf("first lock = %+v, %v", attempt, err)
-	}
-	if conflict, err := second.Get(ctx, uint64(node.ID), 2, lock); err != nil || !conflict.Found {
-		t.Fatalf("shared conflict = %+v, %v", conflict, err)
-	}
-	if err := first.Drop(ctx, uint64(node.ID), 1, storage.POSIX); err != nil {
-		t.Fatal(err)
-	}
-	if conflict, err := second.Get(ctx, uint64(node.ID), 2, lock); err != nil || conflict.Found {
-		t.Fatalf("released conflict = %+v, %v", conflict, err)
-	}
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
 	if _, err := s.Advisory(canceled); !errors.Is(err, context.Canceled) {

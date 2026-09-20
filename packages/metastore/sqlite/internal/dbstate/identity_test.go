@@ -128,8 +128,8 @@ func TestAllocatorsPublishOnlyThroughTheCallingTransaction(t *testing.T) {
 					if next != 5 || err != nil {
 						t.Fatalf("node allocation=%d, %v", next, err)
 					}
-					execState(t, tx, `INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec)
-						SELECT ?, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec FROM nodes WHERE id=1`, next)
+					execState(t, tx, `INSERT INTO nodes (id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec)
+						SELECT ?,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec FROM nodes WHERE id=1`, next)
 				} else {
 					next, err = AllocateChangePosition(t.Context(), tx)
 					want.ChangeHighWater++
@@ -236,8 +236,8 @@ func TestObserveNewNodeIDRetainsHistoricalHighWater(t *testing.T) {
 	if err := ObserveNewNodeID(t.Context(), tx, 8); err != nil {
 		t.Fatal(err)
 	}
-	execState(t, tx, `INSERT INTO nodes (id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec)
-		VALUES (8, 1, 0, 0, 0, 0, 0, 0)`)
+	execState(t, tx, `INSERT INTO nodes (id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec)
+		VALUES (8,1,1,0,0,0,0,0)`)
 	execState(t, tx, `DELETE FROM nodes WHERE id=8`)
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)

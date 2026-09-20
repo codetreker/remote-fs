@@ -5,8 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"io/fs"
-	"math"
 	"strconv"
 	"strings"
 	"syscall"
@@ -19,7 +17,9 @@ import (
 type FileStorage interface {
 	BoundedStorage
 	// CheckFileStorage verifies every dependency can retain identity, enforce
-	// lifetime fences, and bound resources before serving file operations.
+	// lifetime fences, and bound resources before serving file operations. Returned
+	// attributes honor CheckAttrResultBudget before payload loading and any
+	// mutation or retention that produces their captured result.
 	CheckFileStorage() error
 	NewFileSession(context.Context, FileSessionOptions) (FileSession, error)
 }
@@ -35,7 +35,7 @@ type FileSession interface {
 	// and ELOOP respectively. Exclusive creation of any existing node is EEXIST.
 	// Nonexclusive creation opens an existing regular file, including a
 	// concurrent creator's winner, and applies requested truncation while
-	// preserving its mode. Creation mode applies only to a newly created file.
+	// preserving its metadata. InitialMetadata applies only to a newly created file.
 	OpenFile(context.Context, string, FileOpenOptions) (File, error)
 
 	// OpenNode opens the existing regular file with id without resolving a
@@ -79,44 +79,21 @@ type File interface {
 	WriteAt(ctx context.Context, offset int64, data []byte) (Attr, error)
 	Truncate(context.Context, int64) (Attr, error)
 
-	// SetAttr permits mode and time changes on read-only descriptors, subject
+	// SetAttr permits common time changes on read-only descriptors, subject
 	// to volume permission policy. Sync confirms reference health and any
 	// durability barrier the backend requires; no dirty content awaits Close.
 	SetAttr(context.Context, AttrChange) (Attr, error)
 	Sync(context.Context) error
 
-	// GetLock reports one actual conflicting holder. A false Found is a
-	// confirmed absence of conflicts, never a substitute for an unknown result.
-	GetLock(context.Context, LockOwner, FileLock) (LockConflict, error)
-
-	// SetLock is replayable by request identity and returns immediately with a
-	// grant, a pending attempt, or a known rejection. Reusing an identity for
-	// another request is EINVAL. POSIX Shared/Exclusive requires matching open
-	// access; Flock Exclusive is permitted on read-only files. Conflicts are
-	// EAGAIN, lock admission exhaustion is ENOLCK, detected deadlock is EDEADLK.
-	SetLock(context.Context, LockOwner, FileLock, LockRequestID) (LockAttempt, error)
-
-	// QueryLock and CancelLock reconcile an admitted request. LockCancelled
-	// or LockReleased proves no acquisition from that request survives. If a
-	// grant wins cancellation, LockGranted reports the retained acquisition.
-	// EINTR is valid only after a result proves no surviving grant. Unknown
-	// outcomes are EIO and fence affected I/O; cancellation alone is no proof.
-	QueryLock(context.Context, LockOwner, LockRequestID) (LockAttempt, error)
-	CancelLock(context.Context, LockOwner, LockRequestID) (LockAttempt, error)
-
-	// DropLocks removes this owner's ranges and pending attempts in one family
-	// on this object, including the sticky failure caused by lost continuity.
-	DropLocks(context.Context, LockOwner, LockFamily) error
-
 	// Close is idempotent. It retires this reference before draining admitted
-	// operations. POSIX close-owner cleanup is explicit through DropLocks;
-	// closing one reference must not infer an unrelated owner's identity.
+	// operations. Owner cleanup is explicit through UseOwners; closing one
+	// reference must not infer an unrelated owner's identity.
 	Close(context.Context) error
 }
 
 // OpenAccess describes the access and atomic creation intent of a file open.
 // Opening a retained node cannot carry Create or Exclusive. Validation belongs
-// to FileOpenOptions, which also supplies creation mode and expected identity.
+// to FileOpenOptions, which also supplies initial metadata and expected identity.
 type OpenAccess struct {
 	Read      bool
 	Write     bool
@@ -127,14 +104,15 @@ type OpenAccess struct {
 
 // FileOpenOptions selects access and atomic creation behavior. ExpectedID zero
 // accepts the node resolved by path; nonzero requires that exact identity.
-// Mode is the initial creation mode and never changes an existing file's mode.
+// InitialMetadata applies only when this operation creates a new file.
 type FileOpenOptions struct {
 	OpenAccess
-	ExpectedID uint64
-	Mode       fs.FileMode
+	ExpectedID      uint64
+	InitialMetadata map[string][]byte `json:",omitempty"`
+	Use             UseClaim
 }
 
-// Check rejects invalid access, creation, and mode combinations with EINVAL.
+// Check rejects invalid access, creation and initial metadata before admission.
 func (o FileOpenOptions) Check() error {
 	if !o.Read && !o.Write {
 		return fmt.Errorf("file open requires read or write access: %w", syscall.EINVAL)
@@ -145,10 +123,30 @@ func (o FileOpenOptions) Check() error {
 	if o.Truncate && !o.Write {
 		return fmt.Errorf("file truncation requires write access: %w", syscall.EINVAL)
 	}
-	if o.Mode&^SettableMode != 0 {
-		return fmt.Errorf("file creation mode sets unsupported bits: %w", syscall.EINVAL)
+	if err := o.Use.Check(); err != nil {
+		return err
+	}
+	if !o.Create && len(o.InitialMetadata) != 0 {
+		return fmt.Errorf("initial metadata requires file creation: %w", syscall.EINVAL)
+	}
+	if err := CheckInitialMetadata(o.InitialMetadata); err != nil {
+		return err
 	}
 	return nil
+}
+
+// EffectiveUse returns the explicit claim plus the data uses implied by the
+// requested read and write access. Callers cannot omit those uses to bypass a
+// conflicting Deny claim; additional neutral uses remain explicit.
+func (o FileOpenOptions) EffectiveUse() UseClaim {
+	claim := o.Use
+	if o.Read {
+		claim.Uses |= ReadData
+	}
+	if o.Write {
+		claim.Uses |= WriteData
+	}
+	return claim
 }
 
 // CheckNode adds the identity-open restrictions to Check. ExpectedID may be
@@ -236,59 +234,6 @@ type FileSessionStatus struct {
 	Fenced           bool
 }
 
-// LockOwner is an opaque kernel owner scoped by its FileSession. Zero is a
-// valid opaque value; a PID or another session's value confers no ownership.
-type LockOwner uint64
-
-type LockFamily uint8
-
-const (
-	Flock LockFamily = iota + 1
-	POSIX
-)
-
-type LockType uint8
-
-const (
-	Unlock LockType = iota + 1
-	Shared
-	Exclusive
-)
-
-// FileLock uses inclusive byte ranges through MaxInt64, including future EOF.
-// Flock always uses the whole file. The families have independent conflict
-// domains and neither restricts nonparticipating I/O or named mutations.
-// PID is diagnostic only. Wait enrolls a pending acquisition without blocking
-// the SetLock call; the session's finite lifetime bounds retained pending work.
-type FileLock struct {
-	Family     LockFamily
-	Type       LockType
-	Start, End uint64
-	PID        uint32
-	Wait       bool
-}
-
-// Check rejects invalid families, modes, and ranges with EINVAL. Unlock never
-// waits and Flock's range must cover the entire file.
-func (l FileLock) Check() error {
-	if l.Family != Flock && l.Family != POSIX {
-		return fmt.Errorf("unknown advisory lock family: %w", syscall.EINVAL)
-	}
-	if l.Type != Unlock && l.Type != Shared && l.Type != Exclusive {
-		return fmt.Errorf("unknown advisory lock type: %w", syscall.EINVAL)
-	}
-	if l.Start > l.End || l.End > math.MaxInt64 {
-		return fmt.Errorf("advisory lock range must be within 0 through MaxInt64: %w", syscall.EINVAL)
-	}
-	if l.Family == Flock && (l.Start != 0 || l.End != math.MaxInt64) {
-		return fmt.Errorf("flock requires the entire file range: %w", syscall.EINVAL)
-	}
-	if l.Type == Unlock && l.Wait {
-		return fmt.Errorf("advisory unlock cannot wait: %w", syscall.EINVAL)
-	}
-	return nil
-}
-
 // LockRequestID combines the server's current action epoch with a random nonce.
 // An unknown request in a retired epoch is ESTALE, never a new acquisition.
 // Current-epoch receipts cannot be evicted to make admission room; terminal
@@ -325,37 +270,4 @@ func (r LockRequestID) Epoch() (uint64, error) {
 		}
 	}
 	return epoch, nil
-}
-
-type LockAttemptState uint8
-
-const (
-	LockPending LockAttemptState = iota + 1
-	LockGranted
-	LockRejected
-	LockCancelled
-	LockReleased
-)
-
-// LockAttempt reports a request's current reconciliation state. EverGranted
-// preserves whether it acquired a lock before cancellation or release. A grant
-// receipt does not freeze ranges against later requests by the same owner.
-// Errno records a known rejection and remains available to QueryLock. An unknown
-// outcome has an error and must not be represented as a known terminal state.
-type LockAttempt struct {
-	Request          LockRequestID
-	State            LockAttemptState
-	Lock             FileLock
-	Conflict         LockConflict
-	Errno            syscall.Errno
-	EverGranted      bool
-	HistoryRemaining time.Duration
-}
-
-// LockConflict identifies one overlapping incompatible range. Its owner is
-// diagnostic and conveys no authority; Lock.PID is zero when unavailable.
-type LockConflict struct {
-	Found bool
-	Owner LockOwner
-	Lock  FileLock
 }

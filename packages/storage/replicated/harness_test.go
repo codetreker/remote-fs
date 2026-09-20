@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,9 +40,10 @@ import (
 // served is one volume, the server in front of it, and the failures that can be arranged
 // between the two.
 type served struct {
-	meta    *sqlite.Store
-	storage *objectstore.Storage
-	url     string
+	meta          *sqlite.Store
+	storage       *objectstore.Storage
+	url           string
+	authorityGate *authorityGate
 
 	// server is kept so that the connections a mount holds can be closed from underneath it.
 	server *httptest.Server
@@ -79,8 +81,26 @@ func serveWithAllowance(t *testing.T, limits httprest.Limits, allowance int64) *
 
 func serveWithLockOptions(t *testing.T, limits httprest.Limits, allowance int64, options locking.Options) *served {
 	t.Helper()
-	meta, backing := memoryfixture.New(t, "ws", allowance, options)
-	handler, err := httprest.NewHandlerWithLimits(backing, meta, limits)
+	handlerOptions := httprest.DefaultHandlerOptions()
+	handlerOptions.Replication = limits
+	return serveWithHTTPOptions(t, allowance, options, &http.Client{Timeout: 10 * time.Second}, handlerOptions, false)
+}
+
+func serveWithTransportOptions(t *testing.T, client *http.Client, options httprest.HandlerOptions) *served {
+	t.Helper()
+	return serveWithHTTPOptions(t, 0, locking.DefaultOptions(), client, options, true)
+}
+
+func serveWithHTTPOptions(t *testing.T, allowance int64, lockOptions locking.Options, client *http.Client, handlerOptions httprest.HandlerOptions, gateAuthority bool) *served {
+	t.Helper()
+	meta, backing := memoryfixture.New(t, "ws", allowance, lockOptions)
+	var authority storage.Storage = backing
+	var gate *authorityGate
+	if gateAuthority {
+		gate = &authorityGate{Storage: backing}
+		authority = gate
+	}
+	handler, err := httprest.NewHandlerWithOptions(authority, meta, handlerOptions)
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}
@@ -90,15 +110,112 @@ func serveWithLockOptions(t *testing.T, limits httprest.Limits, allowance int64,
 	server := httptest.NewServer(counted)
 	t.Cleanup(server.Close)
 
-	elsewhere, err := httprest.Dial(server.URL, &http.Client{Timeout: 10 * time.Second})
+	elsewhere, err := httprest.Dial(server.URL, client)
 	if err != nil {
 		t.Fatalf("dialling the volume: %v", err)
 	}
 	return &served{
 		meta: meta, storage: backing, url: server.URL, server: server,
 		elsewhere: elsewhere, events: faults, calls: counted,
-		silence: httprest.DefaultSilence,
+		authorityGate: gate,
+		silence:       httprest.DefaultSilence,
 	}
+}
+
+type authorityGate struct {
+	*objectstore.Storage
+
+	mu         sync.Mutex
+	rendezvous *authorityRendezvous
+}
+
+type authorityRendezvous struct {
+	mu sync.Mutex
+
+	listsRemaining int
+	writeRemaining bool
+	listsArrived   chan struct{}
+	writeArrived   chan struct{}
+	release        chan struct{}
+	releaseOnce    sync.Once
+}
+
+func (g *authorityGate) rendezvousAtBackend(lists int) *authorityRendezvous {
+	r := &authorityRendezvous{
+		listsRemaining: lists,
+		writeRemaining: true,
+		listsArrived:   make(chan struct{}),
+		writeArrived:   make(chan struct{}),
+		release:        make(chan struct{}),
+	}
+	g.mu.Lock()
+	g.rendezvous = r
+	g.mu.Unlock()
+	return r
+}
+
+func (g *authorityGate) activeRendezvous() *authorityRendezvous {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.rendezvous
+}
+
+func (g *authorityGate) ListBounded(ctx context.Context, path string, result *storage.ListResult) error {
+	if r := g.activeRendezvous(); r != nil && r.claimList() {
+		if err := r.wait(ctx); err != nil {
+			if result != nil {
+				result.Fail(err)
+			}
+			return err
+		}
+	}
+	return g.Storage.ListBounded(ctx, path, result)
+}
+
+func (g *authorityGate) Write(ctx context.Context, path string, content []byte) error {
+	if r := g.activeRendezvous(); r != nil && r.claimWrite() {
+		if err := r.wait(ctx); err != nil {
+			return err
+		}
+	}
+	return g.Storage.Write(ctx, path, content)
+}
+
+func (r *authorityRendezvous) claimList() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.listsRemaining == 0 {
+		return false
+	}
+	r.listsRemaining--
+	if r.listsRemaining == 0 {
+		close(r.listsArrived)
+	}
+	return true
+}
+
+func (r *authorityRendezvous) claimWrite() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.writeRemaining {
+		return false
+	}
+	r.writeRemaining = false
+	close(r.writeArrived)
+	return true
+}
+
+func (r *authorityRendezvous) wait(ctx context.Context) error {
+	select {
+	case <-r.release:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
+func (r *authorityRendezvous) Release() {
+	r.releaseOnce.Do(func() { close(r.release) })
 }
 
 // sever closes the connections the server holds, which ends every stream on them at once.
@@ -113,12 +230,19 @@ func (s *served) sever() { s.server.CloseClientConnections() }
 // copy itself so that a test may compare it against the source node for node.
 func mount(t *testing.T, s *served) (*replicated.Storage, *sqlite.Replica) {
 	t.Helper()
+	options := httprest.DefaultDialOptions()
+	options.Silence = s.silence
+	return mountWithHTTPOptions(t, s, &http.Client{Timeout: 10 * time.Second}, options)
+}
+
+func mountWithHTTPOptions(t *testing.T, s *served, client *http.Client, options httprest.DialOptions) (*replicated.Storage, *sqlite.Replica) {
+	t.Helper()
 
 	replica, err := sqlite.OpenReplica(t.Context(), path.Join(t.TempDir(), "replica.db"))
 	if err != nil {
 		t.Fatalf("opening the copy: %v", err)
 	}
-	remote, err := httprest.DialWithSilence(s.url, &http.Client{Timeout: 10 * time.Second}, s.silence)
+	remote, err := httprest.DialWithOptions(s.url, client, options)
 	if err != nil {
 		t.Fatalf("dialling the volume: %v", err)
 	}
@@ -576,7 +700,7 @@ func walkTree(t *testing.T,
 }
 
 // requireSameTree compares a copy against its source node for node: the same names, the same
-// ids, the same modes, sizes and times.
+// ids, kinds, metadata, sizes and times.
 func requireSameTree(t *testing.T, source, copied []node) {
 	t.Helper()
 
@@ -593,11 +717,19 @@ func requireSameTree(t *testing.T, source, copied []node) {
 		if !present {
 			t.Fatalf("the copy does not hold %q, which the volume does", want.Path)
 		}
-		if got.ID != want.ID || got.Mode != want.Mode || got.Size != want.Size ||
-			!got.ModTime.Equal(want.ModTime) || !got.AccessTime.Equal(want.AccessTime) {
+		if got.ID != want.ID || got.Kind != want.Kind || !reflect.DeepEqual(got.Metadata, want.Metadata) || got.Size != want.Size ||
+			!got.ModTime.Equal(want.ModTime) || !got.AccessTime.Equal(want.AccessTime) ||
+			!sameOptionalTime(got.BirthTime, want.BirthTime) || !sameOptionalTime(got.ChangeTime, want.ChangeTime) {
 			t.Fatalf("the copy holds %q as %+v, the volume holds it as %+v", want.Path, got.Node, want.Node)
 		}
 	}
+}
+
+func sameOptionalTime(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(*b)
 }
 
 // requireCaughtUp waits until the copy has applied everything the volume has recorded, so

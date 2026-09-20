@@ -28,6 +28,7 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/fuse"
 	"github.com/codetreker/remote-fs/packages/fuse/fusetest"
+	"github.com/codetreker/remote-fs/packages/fuse/posix"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/limited"
@@ -118,10 +119,7 @@ func mountedPair(t *testing.T) (mountpoint, plain string, backing storage.Storag
 	if err != nil {
 		t.Fatal(err)
 	}
-	mode := info.Mode() & storage.SettableMode
-	if err := backing.SetAttr(t.Context(), "", storage.AttrChange{Mode: &mode}); err != nil {
-		t.Fatal(err)
-	}
+	setBackingMode(t, backing, "", info.Mode()&posix.Settable)
 	mountpoint = mountStorage(t, backing, fuse.Options{Logger: testLogger(t)})
 	return mountpoint, plain, backing
 }
@@ -1226,7 +1224,7 @@ type linkStorage struct {
 
 func (s *linkStorage) describe(attr storage.Attr) storage.Attr {
 	if length, ok := s.lengths[attr.ID]; ok {
-		attr.Mode = fs.ModeSymlink | 0o777
+		attr.Kind = storage.NodeSymlink
 		attr.Size = length
 	}
 	return attr
@@ -1633,11 +1631,11 @@ func decorateSession(ctx context.Context, backing storage.FileStorage, options s
 	if err != nil {
 		return nil, err
 	}
-	return &decoratedSession{FileSession: session, hooks: hooks}, nil
+	return &decoratedSession{capableTestSession: testSessionCapabilities(session), hooks: hooks}, nil
 }
 
 type decoratedSession struct {
-	storage.FileSession
+	capableTestSession
 	hooks retainedHooks
 }
 
@@ -1693,10 +1691,36 @@ func (s *decoratedSession) SetNodeAttr(ctx context.Context, id uint64, change st
 	return s.hooks.describe(path, attr), nil
 }
 
+func (s *decoratedSession) SetMetadata(ctx context.Context, id uint64, namespace string, version, data []byte) (storage.OpaquePayload, error) {
+	if err := s.hooks.check("SetAttr", s.hooks.nodePath(id)); err != nil {
+		return storage.OpaquePayload{}, err
+	}
+	return s.MetadataAccess.SetMetadata(ctx, id, namespace, version, data)
+}
+
 type decoratedFile struct {
 	storage.File
 	hooks retainedHooks
 	path  string
+}
+
+func (f *decoratedFile) CheckScopedReference() error {
+	return f.File.(storage.ScopedReference).CheckScopedReference()
+}
+
+func (f *decoratedFile) Scope(ctx context.Context) (storage.UseScope, error) {
+	return f.File.(storage.ScopedReference).Scope(ctx)
+}
+
+func (f *decoratedFile) CheckMetadataAccess() error {
+	return f.File.(storage.ReferenceMetadataAccess).CheckMetadataAccess()
+}
+
+func (f *decoratedFile) SetMetadata(ctx context.Context, namespace string, version, data []byte) (storage.OpaquePayload, error) {
+	if err := f.hooks.check("SetAttr", f.path); err != nil {
+		return storage.OpaquePayload{}, err
+	}
+	return f.File.(storage.ReferenceMetadataAccess).SetMetadata(ctx, namespace, version, data)
 }
 
 func (f *decoratedFile) Stat(ctx context.Context) (storage.Attr, error) {
@@ -2091,7 +2115,7 @@ func (s *oddStorage) List(ctx context.Context, path string) ([]storage.Entry, er
 	entries, err := s.FileStorage.List(ctx, path)
 	for i := range entries {
 		if s.odd(path + "/" + entries[i].Name) {
-			entries[i].Attr.Mode |= fs.ModeIrregular
+			entries[i].Attr.Kind = 255
 		}
 	}
 	return entries, err
@@ -2099,7 +2123,7 @@ func (s *oddStorage) List(ctx context.Context, path string) ([]storage.Entry, er
 
 func (s *oddStorage) describe(path string, attr storage.Attr) storage.Attr {
 	if s.odd(path) {
-		attr.Mode |= fs.ModeIrregular
+		attr.Kind = 255
 	}
 	return attr
 }
@@ -2194,8 +2218,8 @@ func TestAModeChangeReachesTheVolume(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if underneath.Mode != want {
-			t.Fatalf("the volume holds mode %v after a chmod to %v", underneath.Mode, want)
+		if backingMode(t, underneath) != want {
+			t.Fatalf("the volume holds mode %v after a chmod to %v", backingMode(t, underneath), want)
 		}
 		through, err := os.Stat(path)
 		if err != nil {
@@ -2203,7 +2227,7 @@ func TestAModeChangeReachesTheVolume(t *testing.T) {
 		}
 		if through.Mode() != want {
 			t.Fatalf("the mount reports mode %v where the volume holds %v",
-				through.Mode(), underneath.Mode)
+				through.Mode(), backingMode(t, underneath))
 		}
 	}
 
@@ -2219,9 +2243,9 @@ func TestAModeChangeReachesTheVolume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if underneath.Mode != fs.ModeDir|0o700 {
+	if backingMode(t, underneath) != fs.ModeDir|0o700 {
 		t.Fatalf("the volume holds mode %v for the directory, want %v",
-			underneath.Mode, fs.ModeDir|0o700)
+			backingMode(t, underneath), fs.ModeDir|0o700)
 	}
 }
 
@@ -3169,4 +3193,67 @@ func TestATruncationWithNoRoomForItIsRefusedAtTheTruncation(t *testing.T) {
 			t.Fatalf("the volume holds %d bytes, want 1024", held.Size)
 		}
 	})
+}
+
+func backingMode(t *testing.T, attr storage.Attr) fs.FileMode {
+	t.Helper()
+	var mode fs.FileMode
+	switch attr.Kind {
+	case storage.NodeRegular:
+		mode = 0644
+	case storage.NodeDirectory:
+		mode = fs.ModeDir | 0755
+	case storage.NodeSymlink:
+		mode = fs.ModeSymlink | 0777
+	default:
+		t.Fatalf("unknown node kind %d", attr.Kind)
+	}
+	if payload, ok := attr.Metadata[posix.Namespace]; ok {
+		permissions, err := posix.Decode(payload.Data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mode = mode.Type() | permissions
+	}
+	return mode
+}
+
+func setBackingMode(t *testing.T, backing storage.Storage, path string, mode fs.FileMode) {
+	t.Helper()
+	attr, err := backing.Stat(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := posix.Encode(mode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := backing.(storage.FileStorage).NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := session.Close(t.Context()); err != nil {
+			t.Error(err)
+		}
+	}()
+	if _, err := session.(storage.MetadataAccess).SetMetadata(t.Context(), attr.ID, posix.Namespace, attr.Metadata[posix.Namespace].Version, data); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type capableTestSession struct {
+	storage.FileSession
+	storage.MetadataAccess
+	storage.UseOwners
+	storage.RangeControl
+}
+
+func testSessionCapabilities(session storage.FileSession) capableTestSession {
+	return capableTestSession{
+		FileSession:    session,
+		MetadataAccess: session.(storage.MetadataAccess),
+		UseOwners:      session.(storage.UseOwners),
+		RangeControl:   session.(storage.RangeControl),
+	}
 }

@@ -12,7 +12,6 @@ import (
 	"github.com/codetreker/remote-fs/packages/advisory"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/metastore"
-	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/nativelease"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
@@ -24,10 +23,13 @@ type retainedNode struct{ volume, id int64 }
 // All fields are protected by the database commit gate. Physical retention is
 // distinct from active publication authority, which is revoked before I/O drains.
 type retainedFile struct {
+	scope          storage.UseScope
+	use            storage.UseClaim
 	store          *Store
 	id             int64
 	read, write    bool
 	active, closed bool
+	useDropped     bool
 	closeErr       error
 }
 
@@ -56,6 +58,10 @@ func (s *Store) OpenNode(ctx context.Context, id uint64, options storage.FileOpe
 }
 
 func (s *Store) openFile(ctx context.Context, path string, id int64, options storage.FileOpenOptions) (metastore.File, error) {
+	scope, err := newReferenceScope()
+	if err != nil {
+		return nil, err
+	}
 	if err := s.coordinator.commit.acquire(ctx); err != nil {
 		return nil, err
 	}
@@ -72,7 +78,8 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 	if s.fileDomain.files >= s.fileDomain.maxFiles {
 		return nil, syscall.EAGAIN
 	}
-	var state metastore.FileState
+	f := &retainedFile{store: s, scope: scope, use: options.EffectiveUse(), read: options.Read, write: options.Write, active: true}
+	claimed := false
 	resolve := func(tx *sql.Tx) error {
 		var node metastore.Node
 		var err error
@@ -106,7 +113,10 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 			if options.ExpectedID != 0 && options.ExpectedID != uint64(node.ID) {
 				return syscall.ESTALE
 			}
-			if !node.Mode.IsRegular() {
+			if node.Kind != storage.NodeRegular {
+				if node.Kind == storage.NodeSymlink {
+					return syscall.ELOOP
+				}
 				return syscall.EISDIR
 			}
 			if options.Truncate {
@@ -115,8 +125,19 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 				}
 			}
 		}
-		state, err = s.fileState(ctx, tx, node.ID)
-		return err
+		state, err := s.returnedFileState(ctx, tx, node.ID)
+		if err != nil {
+			return err
+		}
+		f.id = node.ID
+		if err := s.fileDomain.coordinator.AddUse(ctx, uint64(node.ID), scope, f.use); err != nil {
+			return err
+		}
+		claimed = true
+		if err := f.checkCaptureAccess(ctx, state); err != nil {
+			return err
+		}
+		return metastore.CheckFilePublication(ctx)
 	}
 	modify := options.Create || options.Truncate
 	if options.Create && !options.Truncate {
@@ -139,17 +160,20 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 		if options.Truncate {
 			kind = locking.WriteMutation
 		}
-		intent := &volumeIntent{kind: kind, node: id}
+		intent := &volumeIntent{kind: kind, node: id, scope: f.scope}
 		if id == 0 {
 			intent.paths = []string{path}
 		}
-		if err := s.mutateTransactionLocked(ctx, ctx, intent, resolve); err != nil {
-			return nil, sqlerr.Failure(err)
+		err = s.mutateTransactionLocked(ctx, ctx, intent, resolve)
+	} else {
+		err = s.inspect(ctx, resolve)
+	}
+	if err != nil {
+		if claimed {
+			err = errors.Join(err, s.fileDomain.coordinator.DropUse(context.WithoutCancel(ctx), uint64(f.id), f.scope))
 		}
-	} else if err := s.inspect(ctx, resolve); err != nil {
 		return nil, sqlerr.Failure(err)
 	}
-	f := &retainedFile{store: s, id: state.ID, read: options.Read, write: options.Write, active: true}
 	s.files[f] = struct{}{}
 	s.fileDomain.files++
 	s.coordinator.pins[retainedNode{s.volume, f.id}]++
@@ -158,24 +182,20 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 
 func (s *Store) createOpenNode(ctx context.Context, tx *sql.Tx, parent metastore.Node, name []byte, options storage.FileOpenOptions) (metastore.Node, error) {
 	now := time.Now()
-	sec, nsec := sqlvalue.StoredTime(now)
-	id, err := dbstate.AllocateNodeID(ctx, tx)
+	node, err := s.insertNode(ctx, tx, storage.NodeRegular, storage.AttrChange{}, options.InitialMetadata, now)
 	if err != nil {
 		return metastore.Node{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO nodes (id,volume,mode,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content) VALUES (?,?,?,0,?,?,?,?,NULL)`, id, s.volume, int64(options.Mode), sec, nsec, sec, nsec); err != nil {
+	if err := s.link(ctx, tx, parent.ID, name, node.ID); err != nil {
 		return metastore.Node{}, err
 	}
-	if err := s.link(ctx, tx, parent.ID, name, id); err != nil {
-		return metastore.Node{}, err
-	}
-	if err := s.recordCreated(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, id); err != nil {
+	if err := s.recordCreated(ctx, tx, metastore.Location{Parent: parent.ID, Name: name}, node.ID); err != nil {
 		return metastore.Node{}, err
 	}
 	if err := s.touch(ctx, tx, parent.ID, now); err != nil {
 		return metastore.Node{}, err
 	}
-	return s.nodeByID(ctx, tx, id)
+	return node, nil
 }
 
 func (s *Store) nodeByID(ctx context.Context, tx *sql.Tx, id int64) (metastore.Node, error) {
@@ -200,7 +220,11 @@ func (s *Store) fileState(ctx context.Context, tx *sql.Tx, id int64) (metastore.
 	if revision < 1 {
 		return metastore.FileState{}, syscall.EIO
 	}
-	return metastore.FileState{Node: scan.node(), Revision: uint64(revision), Detached: detached}, nil
+	node, err := scan.node()
+	if err != nil {
+		return metastore.FileState{}, err
+	}
+	return metastore.FileState{Node: node, Revision: uint64(revision), Detached: detached}, nil
 }
 
 func (f *retainedFile) check() error {
@@ -219,7 +243,17 @@ func (f *retainedFile) Node(ctx context.Context) (metastore.FileState, error) {
 		return metastore.FileState{}, err
 	}
 	var state metastore.FileState
-	err := f.store.inspect(ctx, func(tx *sql.Tx) error { var err error; state, err = f.store.fileState(ctx, tx, f.id); return err })
+	err := f.store.inspect(ctx, func(tx *sql.Tx) error {
+		var err error
+		state, err = f.store.returnedFileState(ctx, tx, f.id)
+		if err != nil {
+			return err
+		}
+		if err := metastore.CheckFilePublication(ctx); err != nil {
+			return err
+		}
+		return f.checkCaptureAccess(ctx, state)
+	})
 	return state, sqlerr.Failure(err)
 }
 
@@ -265,7 +299,7 @@ func (f *retainedFile) Commit(ctx context.Context, expected uint64, object metas
 		return metastore.FileState{}, syscall.EINVAL
 	}
 	var state metastore.FileState
-	err := f.store.mutatePublication(ctx, &volumeIntent{kind: locking.WriteMutation, node: f.id}, func(tx *sql.Tx) error {
+	err := f.store.mutatePublication(ctx, &volumeIntent{kind: locking.WriteMutation, node: f.id, scope: f.scope}, func(tx *sql.Tx) error {
 		if err := f.check(); err != nil {
 			return err
 		}
@@ -279,7 +313,7 @@ func (f *retainedFile) Commit(ctx context.Context, expected uint64, object metas
 		if err := f.store.replaceNodeContent(ctx, tx, before.Node, object); err != nil {
 			return err
 		}
-		state, err = f.store.fileState(ctx, tx, f.id)
+		state, err = f.store.returnedFileState(ctx, tx, f.id)
 		return err
 	})
 	return state, sqlerr.Failure(err)
@@ -324,7 +358,8 @@ func (s *Store) replaceNodeContent(ctx context.Context, tx *sql.Tx, node metasto
 		return err
 	}
 	sec, nsec := sqlvalue.StoredTime(object.ModTime)
-	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET size=?,mtime_sec=?,mtime_nsec=?,content=? WHERE volume=? AND id=?`, object.Size, sec, nsec, sqlvalue.StoredKey(object.Key), s.volume, node.ID); err != nil {
+	changeSec, changeNsec := sqlvalue.StoredTime(time.Now())
+	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET size=?,mtime_sec=?,mtime_nsec=?,content=?,change_sec=?,change_nsec=? WHERE volume=? AND id=?`, object.Size, sec, nsec, sqlvalue.StoredKey(object.Key), changeSec, changeNsec, s.volume, node.ID); err != nil {
 		return err
 	}
 	if object.Key != "" {
@@ -356,7 +391,7 @@ func (f *retainedFile) SetAttr(ctx context.Context, change storage.AttrChange) (
 		return metastore.FileState{}, err
 	}
 	var state metastore.FileState
-	err := f.store.mutatePublication(ctx, &volumeIntent{kind: locking.SetAttrMutation, node: f.id}, func(tx *sql.Tx) error {
+	err := f.store.mutatePublication(ctx, &volumeIntent{kind: locking.SetAttrMutation, node: f.id, scope: f.scope}, func(tx *sql.Tx) error {
 		if err := f.check(); err != nil {
 			return err
 		}
@@ -364,7 +399,7 @@ func (f *retainedFile) SetAttr(ctx context.Context, change storage.AttrChange) (
 			return err
 		}
 		var err error
-		state, err = f.store.fileState(ctx, tx, f.id)
+		state, err = f.store.returnedFileState(ctx, tx, f.id)
 		return err
 	})
 	return state, sqlerr.Failure(err)
@@ -378,7 +413,7 @@ func (s *Store) setNodeAttr(ctx context.Context, tx *sql.Tx, id int64, change st
 	if change.Empty() {
 		return nil
 	}
-	if err := applyChange(ctx, tx, node, change); err != nil {
+	if err := applyChange(ctx, tx, node, change, time.Now()); err != nil {
 		return err
 	}
 	return s.recordNamedChanged(ctx, tx, id)
@@ -389,7 +424,7 @@ func (s *Store) StatNode(ctx context.Context, id uint64) (metastore.Node, error)
 		return metastore.Node{}, syscall.ESTALE
 	}
 	var node metastore.Node
-	err := s.inspect(ctx, func(tx *sql.Tx) error { var err error; node, err = s.nodeByID(ctx, tx, int64(id)); return err })
+	err := s.inspect(ctx, func(tx *sql.Tx) error { var err error; node, err = s.returnedNode(ctx, tx, int64(id)); return err })
 	return node, sqlerr.Failure(err)
 }
 
@@ -406,7 +441,7 @@ func (s *Store) SetNodeAttr(ctx context.Context, id uint64, change storage.AttrC
 			return err
 		}
 		var err error
-		node, err = s.nodeByID(ctx, tx, int64(id))
+		node, err = s.returnedNode(ctx, tx, int64(id))
 		return err
 	})
 	return node, sqlerr.Failure(err)
@@ -432,12 +467,40 @@ func (f *retainedFile) Retire(ctx context.Context) error {
 	return nil
 }
 
+func (f *retainedFile) DropUse(ctx context.Context) error {
+	if err := f.store.coordinator.commit.acquire(ctx); err != nil {
+		return err
+	}
+	defer f.store.coordinator.commit.release()
+	return f.dropUseLocked(ctx)
+}
+
+func (f *retainedFile) dropUseLocked(ctx context.Context) error {
+	if f.useDropped {
+		return nil
+	}
+	if f.active {
+		return syscall.EBUSY
+	}
+	if err := f.store.fileDomain.coordinator.DropUse(ctx, uint64(f.id), f.scope); err != nil {
+		return err
+	}
+	f.useDropped = true
+	return nil
+}
+
 func (f *retainedFile) Close(ctx context.Context) error {
 	if err := f.store.coordinator.commit.acquire(ctx); err != nil {
 		return err
 	}
 	defer f.store.coordinator.commit.release()
-	f.active = false
+	if !f.useDropped {
+		f.active = false
+		if err := f.dropUseLocked(ctx); err != nil {
+			return sqlerr.Failure(err)
+		}
+		f.useDropped = true
+	}
 	if f.closed || f.closeErr != nil {
 		return f.closeErr
 	}

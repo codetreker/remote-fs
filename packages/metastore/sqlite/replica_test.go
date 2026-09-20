@@ -1,12 +1,14 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -28,6 +30,33 @@ func seededAdmissionReplica(t *testing.T) *Replica {
 	})
 }
 
+func TestReplicaSeedRecognizesCanonicalEmptyRootName(t *testing.T) {
+	replica, err := OpenReplica(t.Context(), filepath.Join(t.TempDir(), "replica.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := replica.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	seeding, err := replica.Reseed(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer seeding.Close()
+	root := metastore.Row{Parent: 0, Name: []byte{}, Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory}}
+	if err := seeding.Add(t.Context(), []metastore.Row{root}); err != nil {
+		t.Fatal(err)
+	}
+	if err := seeding.Complete(t.Context(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if attr, err := replica.Stat(t.Context(), ""); err != nil || attr.ID != 1 || attr.Kind != storage.NodeDirectory {
+		t.Fatalf("canonical empty root = %+v, %v", attr, err)
+	}
+}
+
 func seedAdmissionReplica(t *testing.T, checkClose func(error)) *Replica {
 	t.Helper()
 	replica, err := OpenReplica(t.Context(), filepath.Join(t.TempDir(), "replica.db"))
@@ -43,8 +72,8 @@ func seedAdmissionReplica(t *testing.T, checkClose func(error)) *Replica {
 	}
 	defer seeding.Close()
 	rows := []metastore.Row{
-		{Node: metastore.Node{ID: 10, Mode: fs.ModeDir | 0o755}},
-		{Parent: 10, Name: []byte("file"), Node: metastore.Node{ID: 11, Mode: 0o644, Size: 7}},
+		{Node: metastore.Node{ID: 10, Kind: storage.NodeDirectory}},
+		{Parent: 10, Name: []byte("file"), Node: metastore.Node{ID: 11, Kind: storage.NodeRegular, Size: 7}},
 	}
 	if err := seeding.Add(t.Context(), rows); err != nil {
 		t.Fatal(err)
@@ -79,10 +108,10 @@ func TestReplicaWaitingWriterCancellationReopensReaderAdmission(t *testing.T) {
 			entered := make(chan struct{})
 			release := make(chan struct{})
 			result, err := storage.NewListResult(1024, 0,
-				func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+				func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
 					close(entered)
 					<-release
-					return nameBytes + 64, nil
+					return nameBytes + metadataBytes + 64, nil
 				})
 			if err != nil {
 				t.Fatal(err)
@@ -182,7 +211,9 @@ func TestReplicaReadersCancelBehindSeeding(t *testing.T) {
 			defer cancel()
 			waiting := observeReplicaWait(ctx)
 			result, err := storage.NewListResult(1024, 0,
-				func(_ int, nameBytes int64, _ storage.Attr) (int64, error) { return nameBytes + 64, nil })
+				func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+					return nameBytes + metadataBytes + 64, nil
+				})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -265,7 +296,7 @@ func TestReplicaSeedingPublishesTreeAndPositionTogether(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer seeding.Close()
-			root := metastore.Row{Node: metastore.Node{ID: 20, Mode: fs.ModeDir | 0o700}}
+			root := metastore.Row{Node: metastore.Node{ID: 20, Kind: storage.NodeDirectory}}
 			if err := seeding.Add(t.Context(), []metastore.Row{root}); err != nil {
 				t.Fatal(err)
 			}
@@ -292,7 +323,7 @@ func TestReplicaSeedingPublishesTreeAndPositionTogether(t *testing.T) {
 
 			switch outcome {
 			case "complete":
-				rows := []metastore.Row{{Parent: 20, Name: []byte("replacement"), Node: metastore.Node{ID: 21, Mode: 0o600, Size: 19}}}
+				rows := []metastore.Row{{Parent: 20, Name: []byte("replacement"), Node: metastore.Node{ID: 21, Kind: storage.NodeRegular, Size: 19}}}
 				if err := seeding.Add(t.Context(), rows); err != nil {
 					t.Fatal(err)
 				}
@@ -304,7 +335,7 @@ func TestReplicaSeedingPublishesTreeAndPositionTogether(t *testing.T) {
 					t.Fatalf("duplicate row returned %v", err)
 				}
 			case "invalid completion":
-				rows := []metastore.Row{{Parent: 999, Name: []byte("orphan"), Node: metastore.Node{ID: 21, Mode: 0o600}}}
+				rows := []metastore.Row{{Parent: 999, Name: []byte("orphan"), Node: metastore.Node{ID: 21, Kind: storage.NodeRegular}}}
 				if err := seeding.Add(t.Context(), rows); err != nil {
 					t.Fatal(err)
 				}
@@ -362,7 +393,7 @@ func TestReplicaReadBatchProgressesThroughApplyBacklog(t *testing.T) {
 	}
 	const writers = 8
 	written := make(chan error, writers)
-	node := metastore.Node{ID: 11, Mode: 0o644, Size: 19}
+	node := metastore.Node{ID: 11, Kind: storage.NodeRegular, Size: 19}
 	for range writers {
 		waiting := observeReplicaWait(t.Context())
 		go func() {
@@ -374,10 +405,10 @@ func TestReplicaReadBatchProgressesThroughApplyBacklog(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	result, err := storage.NewListResult(1024, 0,
-		func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
+		func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
 			close(entered)
 			<-release
-			return nameBytes + 64, nil
+			return nameBytes + metadataBytes + 64, nil
 		})
 	if err != nil {
 		t.Fatal(err)
@@ -448,7 +479,9 @@ func TestReplicaReadersCancelBeforeThePhaseWhenPermitsAreFull(t *testing.T) {
 			defer cancel()
 			waiting := observeReplicaWait(ctx)
 			result, err := storage.NewListResult(1024, 0,
-				func(_ int, nameBytes int64, _ storage.Attr) (int64, error) { return nameBytes + 64, nil })
+				func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+					return nameBytes + metadataBytes + 64, nil
+				})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -572,12 +605,12 @@ func TestReplicaWriterProgressUnderContinuousListings(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer seeding.Close()
-	root := metastore.Node{ID: 1, Mode: fs.ModeDir | 0o755}
+	root := metastore.Node{ID: 1, Kind: storage.NodeDirectory}
 	rows := []metastore.Row{{Node: root}}
 	for i := range 4096 {
 		rows = append(rows, metastore.Row{
 			Parent: 1, Name: []byte(fmt.Sprintf("file-%04d", i)),
-			Node: metastore.Node{ID: int64(i + 2), Mode: 0o644},
+			Node: metastore.Node{ID: int64(i + 2), Kind: storage.NodeRegular},
 		})
 	}
 	if err := seeding.Add(t.Context(), rows); err != nil {
@@ -666,7 +699,7 @@ func TestReplicaWriterProgressUnderContinuousListings(t *testing.T) {
 		}
 		runtime.Gosched()
 	}
-	root.Mode = fs.ModeDir | 0o700
+	root.ModTime = time.Now()
 	change := metastore.Change{Position: 2, Kind: metastore.Modified, Node: &root}
 	// Already admitted scans must finish before Apply can enter. The bound includes
 	// one full reader pool under the race detector; replication latency has a separate test.
@@ -704,7 +737,7 @@ func TestReplicaWriterProgressUnderContinuousListings(t *testing.T) {
 		t.Fatalf("Apply under continuous listings: applied=%v err=%v after %v", applied, applyErr, elapsed)
 	}
 	got, err := replica.Stat(t.Context(), "")
-	if err != nil || got.Mode != root.Mode || replica.Position() != 2 {
+	if err != nil || !got.ModTime.Equal(root.ModTime) || replica.Position() != 2 {
 		t.Fatalf("applied change was not visible: root=%+v err=%v position=%d", got, err, replica.Position())
 	}
 	t.Logf("Seeding completed in %v; reader shutdown after Apply took %v", seedElapsed, shutdownElapsed)
@@ -714,7 +747,7 @@ func TestReplicaWriterProgressUnderContinuousListings(t *testing.T) {
 func TestReplicaAppliesEveryChangeWithoutLosingIdentityOrRollback(t *testing.T) {
 	r := seededAdmissionReplica(t)
 	ctx := t.Context()
-	node := metastore.Node{ID: 12, Mode: 0o600, Size: 3, AccessTime: time.Unix(100, 0), ModTime: time.Unix(200, 0)}
+	node := metastore.Node{ID: 12, Kind: storage.NodeRegular, Size: 3, AccessTime: time.Unix(100, 0), ModTime: time.Unix(200, 0)}
 	apply := func(change metastore.Change) {
 		t.Helper()
 		changed, err := r.Apply(ctx, change)
@@ -723,17 +756,17 @@ func TestReplicaAppliesEveryChangeWithoutLosingIdentityOrRollback(t *testing.T) 
 		}
 	}
 	apply(metastore.Change{Position: 2, Kind: metastore.Created, Parent: 10, Name: []byte("new"), Node: &node})
-	if got, err := r.Stat(ctx, "new"); err != nil || got != node {
+	if got, err := r.Stat(ctx, "new"); err != nil || !reflect.DeepEqual(got, node) {
 		t.Fatalf("created node = %+v, %v", got, err)
 	}
-	node.Size, node.Mode = 9, 0o640
+	node.Size = 9
 	apply(metastore.Change{Position: 3, Kind: metastore.Modified, Parent: 10, Name: []byte("new"), Node: &node})
-	if got, err := r.Stat(ctx, "new"); err != nil || got != node {
+	if got, err := r.Stat(ctx, "new"); err != nil || !reflect.DeepEqual(got, node) {
 		t.Fatalf("modified node = %+v, %v", got, err)
 	}
-	node.Mode, node.ModTime = 0o660, time.Unix(300, 0)
+	node.ModTime = time.Unix(300, 0)
 	apply(metastore.Change{Position: 4, Kind: metastore.Renamed, Parent: 10, Name: []byte("renamed"), From: &metastore.Location{Parent: 10, Name: []byte("new")}, Node: &node})
-	if got, err := r.Stat(ctx, "renamed"); err != nil || got != node {
+	if got, err := r.Stat(ctx, "renamed"); err != nil || !reflect.DeepEqual(got, node) {
 		t.Fatalf("renamed node = %+v, %v", got, err)
 	}
 	if _, err := r.Stat(ctx, "new"); !errors.Is(err, syscall.ENOENT) {
@@ -755,7 +788,7 @@ func TestReplicaAppliesEveryChangeWithoutLosingIdentityOrRollback(t *testing.T) 
 		if r.Position() != 4 {
 			t.Fatalf("failed change advanced position to %d", r.Position())
 		}
-		if got, err := r.Stat(ctx, "renamed"); err != nil || got != node {
+		if got, err := r.Stat(ctx, "renamed"); err != nil || !reflect.DeepEqual(got, node) {
 			t.Fatalf("failed change altered node: %+v, %v", got, err)
 		}
 		if children, err := r.List(ctx, ""); err != nil || len(children) != 2 {
@@ -771,5 +804,78 @@ func TestReplicaAppliesEveryChangeWithoutLosingIdentityOrRollback(t *testing.T) 
 	}
 	if children, err := r.List(ctx, ""); err != nil || len(children) != 1 || string(children[0].Name) != "file" {
 		t.Fatalf("unrelated node = %+v, %v", children, err)
+	}
+}
+
+func TestReplicaRejectsMetadataBeyondItsConfiguredLimit(t *testing.T) {
+	replica, err := OpenReplica(t.Context(), filepath.Join(t.TempDir(), "replica.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replica.Close()
+	replica.store.maxMetadataBytes = 100
+	seeding, err := replica.Reseed(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []metastore.Row{
+		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory, Metadata: map[string]storage.OpaquePayload{
+			"root": {Version: []byte("opaque"), Data: make([]byte, 40)},
+		}}},
+		{Parent: 1, Name: []byte("file"), Node: metastore.Node{ID: 2, Kind: storage.NodeRegular, Metadata: map[string]storage.OpaquePayload{
+			"file": {Version: []byte("opaque"), Data: make([]byte, 40)},
+		}}},
+	}
+	if err := seeding.Add(t.Context(), rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := seeding.Complete(t.Context(), 1); !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("oversized replica metadata = %v", err)
+	}
+	if err := seeding.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReplicaReopensOpaqueMetadataVersions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "replica.db")
+	replica, err := OpenReplica(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seeding, err := replica.Reseed(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := []byte("authority-opaque-version")
+	if err := seeding.Add(t.Context(), []metastore.Row{
+		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory,
+			Metadata: map[string]storage.OpaquePayload{"client": {Version: version, Data: []byte("value")}}}},
+		{Parent: 1, Name: []byte("link"), Node: metastore.Node{ID: 2, Kind: storage.NodeSymlink, Size: 6,
+			Metadata: map[string]storage.OpaquePayload{"client": {Version: version, Data: []byte("link")}}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := seeding.Complete(t.Context(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := seeding.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := replica.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenReplica(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	root, err := reopened.Stat(t.Context(), "")
+	if err != nil || !bytes.Equal(root.Metadata["client"].Version, version) {
+		t.Fatalf("reopened opaque metadata = %+v, %v", root.Metadata, err)
+	}
+	link, err := reopened.Stat(t.Context(), "link")
+	if err != nil || link.Kind != storage.NodeSymlink || link.Size != 6 || !bytes.Equal(link.Metadata["client"].Version, version) {
+		t.Fatalf("reopened symbolic-link facts = %+v, %v", link, err)
 	}
 }

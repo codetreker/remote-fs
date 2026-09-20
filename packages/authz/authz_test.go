@@ -15,7 +15,7 @@ func TestAuthorizerFuncPreservesHostContextIntentAndError(t *testing.T) {
 	ctx := context.WithValue(t.Context(), identityKey{}, "host-owned-identity")
 	options := storage.FileOpenOptions{
 		OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Truncate: true, Exclusive: true},
-		ExpectedID: 42, Mode: 0o600,
+		ExpectedID: 42,
 	}
 	request := authz.AccessRequest{Volume: "configured-volume", Operation: storage.OpFileOpen, Open: options.OpenAccess}
 	cause := errors.New("policy lookup failed")

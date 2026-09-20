@@ -4,7 +4,7 @@ Status: implemented
 
 ## 问题
 
-[R-CON-1](../../../../docs/spec/requirements.md) 要求跨客户端变更在一秒内可见，频繁列目录是正常使用场景。[`Replica.lockExclusive` 通过 `TryLock` 与一毫秒定时器争抢写锁](https://github.com/codetreker/remote-fs/blob/252259f1b89682a5b2acf54004f0fe8b8677528d/packages/metastore/sqlite/replica.go#L361-L381)，等待中的写者不能阻止新读者进入。持续 `List` 可以使变更无法应用，而读取仍成功提供旧副本。
+[R-CON-1](../../../../docs/spec/requirements.md) 要求跨客户端变更在一秒内可见。该问题出现时，公开目录读取由 SQLite Replica 回答；[`Replica.lockExclusive` 通过 `TryLock` 与一毫秒定时器争抢写锁](https://github.com/codetreker/remote-fs/blob/252259f1b89682a5b2acf54004f0fe8b8677528d/packages/metastore/sqlite/replica.go#L361-L381)，等待中的写者不能阻止新读者进入。持续 `List` 可以使变更无法应用，而读取仍成功提供旧副本。
 
 在该提交上，4096 文件的副本由 128 个 goroutine 持续列目录。修改根目录 mode 的 `Apply` 在两秒 deadline 前一直未能取得独占锁，期间完成了 1257 次列目录；停止读者后，同一变更立即成功。轮询争锁把更新能否推进交给了读者是否碰巧全部空闲。
 
@@ -39,6 +39,8 @@ SQLite replica 先限制能进入读阶段的 SQL 查询数量，再用私有读
 
 本决定补足[元数据复制](../architecture/2026-08-27-metadata-replication.md)的可取消读写准入与推进。它修复的是 R-CON-1 所依赖的本地更新进展；锁本身不给整个复制链路作一秒承诺。
 
+[中立元数据与访问控制](../architecture/2026-09-16-neutral-metadata-and-access-controls.md)后来要求公开 replicated List/ListBounded 回源 authority，以执行当前 `ReadEntries` 限制。SQLite Replica 自身的 Stat/List/ListBounded 和读写门仍保留；组合层只用 Stat 回答公开路径查询，目录读取不再构成生产挂载上的本地 reader 负载。
+
 [快照重建后的回放门槛](2026-09-07-gate-rebuilt-replicas-on-replay.md)、[文件页缓存陈旧](2026-09-07-prevent-cross-handle-page-cache-staleness.md)与[首次订阅取消](../../proposed/bug-fix/2026-09-07-cancel-initial-replica-subscription.md)各有独立的可用性或生命周期条件，由各自记录拥有。读写门不改变这些条件，也不引入新的取消错误分类；它保留独立改进这些路径的空间。
 
 ## 备选方案
@@ -59,7 +61,7 @@ SQLite replica 先限制能进入读阶段的 SQL 查询数量，再用私有读
 
 持续读负载下，已经登记的写者等待的是受 reader pool 并发数约束的读阶段；其余 SQL 读取先在门外等名额。连续写负载下，已经等待阶段的一批读者在一次写操作结束时取得保留的执行机会。SQL 读取仍能并行，队列不能把一批有限查询扩展成全部在途调用。
 
-一秒可见性由正常运行的真实 HTTP/SSE 全负载验收判定；带 race instrumentation 的并发测试判定阶段交接、取消与死锁，不用其耗时替代生产延迟。整个 tagged replicated package 的串行验收通过；4096 文件和 128 个持续读者下，变更在 316.970969 毫秒可见，计时窗口内另完成 110 次有效列目录。这是该负载的一次观测，不构成所有环境的延迟上限。验收固定在 CI 的串行步骤中执行，夹具与命令见[测试策略](../../../../docs/testing.md#元数据副本的读写交接)。
+一秒可见性由正常运行的真实 HTTP/SSE 全负载验收判定；带 race instrumentation 的并发测试判定阶段交接、取消与死锁，不用其耗时替代生产延迟。原决定落地时，4096 文件和 128 个本地 Replica 列目录读者验证了写者不会饿死。当前同规模公开 List 负载到达 authority：测试专用 backend wrapper 在 HTTP admission 之后截住 128 个读者各自的首次 `ListBounded`，并在同一边界截住 authority Write。单次释放使这 129 项操作一起进入 SQLite 竞争；128 次首次 listing 最终都必须成功，Write 返回后的恰好一秒内，副本 Stat 必须看到变更且 authority listing 必须继续完成。它不把 authority 读取吞吐解释成本地门的性能。夹具与命令见[测试策略](../../../../docs/testing.md#元数据副本的读写交接)。
 
 代价是新读者可能等待一次写操作，后续写者可能等待一批读者；被唤醒但尚未获调度的预留读者也会延后下一项写入。
 

@@ -36,7 +36,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -53,12 +52,6 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/schema"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 	"github.com/codetreker/remote-fs/packages/storage"
-)
-
-// Volume creation modes are independent of the host process's umask.
-const (
-	fileMode fs.FileMode = 0o644
-	dirMode  fs.FileMode = 0o755
 )
 
 // busyTimeout is how long a statement waits for a lock another connection holds before
@@ -103,6 +96,8 @@ type Store struct {
 	// accepts the volume or reports a successful integrity-checked result.
 	maxIntegrityRecords int64
 	maxIntegrityBytes   int64
+	maxMetadataBytes    int64
+	replicaMetadata     bool
 	files               map[*retainedFile]struct{}
 	fileDomain          *fileDomain
 
@@ -269,7 +264,7 @@ type storeOpenHooks struct {
 	acquireLeaseOwner func(string, bool, bool) (*nativelease.Database, error)
 	openPool          func(context.Context, string, bool, int) (*sql.DB, error)
 	openDurableWriter func(context.Context, string, int) (*sql.DB, error)
-	prepare           func(context.Context, *sql.DB, string, string, Window, int64, int64) (int64, int64, error)
+	prepare           func(context.Context, *sql.DB, string, string, Window, int64, int64, int64, bool) (int64, int64, error)
 	closePool         func(*sql.DB) error
 }
 
@@ -410,7 +405,7 @@ func openConfiguredWithHooks(
 		}
 		id, root, err = prepareVolume(
 			ctx, write, volume, storeID, options.Window,
-			options.MaxIntegrityRecords, options.MaxIntegrityBytes,
+			options.MaxIntegrityRecords, options.MaxIntegrityBytes, options.MaxMetadataBytes, options.replicaMetadata,
 		)
 		if sqlerr.IsUncertainCommit(err) {
 			coordinator.poisonWith(err)
@@ -418,7 +413,7 @@ func openConfiguredWithHooks(
 	} else {
 		id, root, state, err = prepareConfigured(
 			ctx, write, volume, storeID, options.Window,
-			options.MaxIntegrityRecords, options.MaxIntegrityBytes, durable,
+			options.MaxIntegrityRecords, options.MaxIntegrityBytes, options.MaxMetadataBytes, options.replicaMetadata, durable,
 		)
 		if sqlerr.IsUncertainCommit(err) {
 			coordinator.poisonWith(err)
@@ -451,6 +446,8 @@ func openConfiguredWithHooks(
 		allowance:    allowance, window: options.Window, objectLimits: options.ObjectLimits,
 		maxIntegrityRecords: options.MaxIntegrityRecords,
 		maxIntegrityBytes:   options.MaxIntegrityBytes,
+		maxMetadataBytes:    options.MaxMetadataBytes,
+		replicaMetadata:     options.replicaMetadata,
 		files:               make(map[*retainedFile]struct{}),
 		coordinator:         coordinator,
 		closePool:           hooks.closePool,
@@ -811,6 +808,10 @@ func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context,
 	}()
 
 	var publication *volumePublication
+	metadataBefore, err := s.metadataUsage(ctx, tx.Tx)
+	if err != nil {
+		return err
+	}
 	if intent != nil {
 		publication, err = s.prepareVolumePublication(ctx, tx.Tx, *intent)
 		if err != nil {
@@ -827,6 +828,13 @@ func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context,
 	}
 	if err := changes.Trim(ctx, tx.Tx, s.volume, changes.Window(s.window)); err != nil {
 		return sqlerr.Failure(err)
+	}
+	metadataAfter, err := s.metadataUsage(ctx, tx.Tx)
+	if err != nil {
+		return err
+	}
+	if metadataAfter > metadataBefore && metadataAfter > s.maxMetadataBytes {
+		return fmt.Errorf("stored metadata exceeds the volume's %d-byte limit: %w", s.maxMetadataBytes, syscall.EFBIG)
 	}
 	state, err := dbstate.AdvanceGeneration(ctx, tx.Tx)
 	if err != nil {
@@ -996,10 +1004,11 @@ func splitPath(cleaned string) (dir, name string) {
 	return "", cleaned
 }
 
-func prepare(ctx context.Context, db *sql.DB, volume, storeID string, window Window, maxRecords, maxBytes int64) (int64, int64, error) {
-	return schema.Prepare(ctx, db, volume, storeID, changes.Window(window), maxRecords, maxBytes)
+func prepare(ctx context.Context, db *sql.DB, volume, storeID string, window Window, maxRecords, maxBytes, maxMetadataBytes int64, opaqueMetadataVersions bool) (int64, int64, error) {
+	id, root, _, err := schema.PrepareConfiguredWithMetadataPolicy(ctx, db, volume, storeID, changes.Window(window), maxRecords, maxBytes, maxMetadataBytes, opaqueMetadataVersions, nil)
+	return id, root, err
 }
-func prepareConfigured(ctx context.Context, db *sql.DB, volume, storeID string, window Window, maxRecords, maxBytes int64, durable *durableOpen) (int64, int64, DurableState, error) {
+func prepareConfigured(ctx context.Context, db *sql.DB, volume, storeID string, window Window, maxRecords, maxBytes, maxMetadataBytes int64, opaqueMetadataVersions bool, durable *durableOpen) (int64, int64, DurableState, error) {
 	var config *schema.DurableOpen
 	if durable != nil {
 		config = &schema.DurableOpen{
@@ -1009,6 +1018,6 @@ func prepareConfigured(ctx context.Context, db *sql.DB, volume, storeID string, 
 			Witnessed:    durable.witness != nil,
 		}
 	}
-	id, root, state, err := schema.PrepareConfigured(ctx, db, volume, storeID, changes.Window(window), maxRecords, maxBytes, config)
+	id, root, state, err := schema.PrepareConfiguredWithMetadataPolicy(ctx, db, volume, storeID, changes.Window(window), maxRecords, maxBytes, maxMetadataBytes, opaqueMetadataVersions, config)
 	return id, root, DurableState(state), err
 }

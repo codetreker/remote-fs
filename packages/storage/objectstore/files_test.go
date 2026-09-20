@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io/fs"
 	"math"
 	"path/filepath"
 	"sync"
@@ -81,6 +80,37 @@ func retainedLockRequest(t *testing.T, session storage.FileSession) storage.Lock
 	return request
 }
 
+func retainedOwnerFor(t *testing.T, session storage.FileSession, file storage.File, lifetime storage.OwnerLifetime, group uint64) storage.UseOwner {
+	t.Helper()
+	owners, ok := session.(storage.UseOwners)
+	if !ok {
+		t.Fatal("file session lacks owner registration")
+	}
+	if err := owners.CheckUseOwners(); err != nil {
+		t.Fatal(err)
+	}
+	scoped, ok := file.(storage.ScopedReference)
+	if !ok {
+		t.Fatal("file lacks a retained use scope")
+	}
+	if err := scoped.CheckScopedReference(); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := scoped.Scope(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attr, err := file.Stat(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := owners.NewUseOwner(t.Context(), attr.ID, scope, storage.OwnerOptions{Lifetime: lifetime, Group: group})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return owner
+}
+
 func readFileFor(t *testing.T, file storage.File, want string) storage.Attr {
 	t.Helper()
 	read, err := file.ReadAt(t.Context(), 0, len(want)+10)
@@ -93,7 +123,7 @@ func readFileFor(t *testing.T, file storage.File, want string) storage.Attr {
 func TestRetainedFileReadsCurrentObjectThroughNameChanges(t *testing.T) {
 	volume, _ := fileVolume(t, memory.New(), 4096, nil)
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
-	f := openFileFor(t, session, "first", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, Mode: 0600})
+	f := openFileFor(t, session, "first", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, InitialMetadata: map[string][]byte{"test.retained": []byte("initial")}})
 	if _, err := f.WriteAt(t.Context(), 0, []byte("initial")); err != nil {
 		t.Fatal(err)
 	}
@@ -126,10 +156,17 @@ func TestRetainedFileReadsCurrentObjectThroughNameChanges(t *testing.T) {
 	if data, err := volume.Read(t.Context(), "moved"); err != nil || string(data) != "new" {
 		t.Fatalf("replacement=%q %v", data, err)
 	}
-	mode := storage.AttrChange{Mode: newMode(0640)}
-	attr, err := f.SetAttr(t.Context(), mode)
-	if err != nil || attr.ID != id || attr.Mode.Perm() != 0640 {
+	modified := time.Unix(123, 456).UTC()
+	attr, err := f.SetAttr(t.Context(), storage.AttrChange{ModTime: &modified})
+	if err != nil || attr.ID != id || !attr.ModTime.Equal(modified) || string(attr.Metadata["test.retained"].Data) != "initial" {
 		t.Fatalf("detached attributes=%+v %v", attr, err)
+	}
+	payload, err := f.(storage.ReferenceMetadataAccess).SetMetadata(t.Context(), "test.retained", attr.Metadata["test.retained"].Version, []byte("changed"))
+	if err != nil || string(payload.Data) != "changed" || len(payload.Version) == 0 {
+		t.Fatalf("detached metadata=%+v %v", payload, err)
+	}
+	if attr, err := f.Stat(t.Context()); err != nil || attr.ID != id || string(attr.Metadata["test.retained"].Data) != "changed" {
+		t.Fatalf("detached metadata identity=%+v %v", attr, err)
 	}
 	if err := f.Sync(t.Context()); err != nil {
 		t.Fatal(err)
@@ -141,8 +178,6 @@ func TestRetainedFileReadsCurrentObjectThroughNameChanges(t *testing.T) {
 		t.Fatalf("reclaimed identity=%v", err)
 	}
 }
-
-func newMode(mode uint32) *fs.FileMode { value := fs.FileMode(mode); return &value }
 
 type pausedFilePut struct {
 	*memory.Objects
@@ -237,7 +272,7 @@ func TestRetainedRenewalHasAdmissionWhileTheOnlyDataSlotIsStaging(t *testing.T) 
 	readFileFor(t, file, "published")
 }
 
-func TestRetainedPOSIXOwnerCleanupProgressesWhileDataAdmissionIsFull(t *testing.T) {
+func TestRetainedExplicitOwnerCleanupProgressesWhileDataAdmissionIsFull(t *testing.T) {
 	for _, cleanup := range []string{"close owner", "explicit unlock"} {
 		t.Run(cleanup, func(t *testing.T) {
 			objects := newPausedFilePut(t)
@@ -246,17 +281,20 @@ func TestRetainedPOSIXOwnerCleanupProgressesWhileDataAdmissionIsFull(t *testing.
 			options.MaxOperations = 1
 			first := fileSessionFor(t, volume, options)
 			second := fileSessionFor(t, volume, options)
+			firstRanges, secondRanges := first.(storage.RangeControl), second.(storage.RangeControl)
 			t.Cleanup(objects.release)
 			writer := openFileFor(t, first, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Create: true}})
 			closing := openFileFor(t, first, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true}})
+			closingOwner := retainedOwnerFor(t, first, closing, storage.OwnerExplicit, 41)
 			waiter := openFileFor(t, second, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true}})
-			lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, End: math.MaxInt64}
-			if result, err := closing.SetLock(t.Context(), 41, lock, retainedLockRequest(t, first)); err != nil || result.State != storage.LockGranted {
+			waiterOwner := retainedOwnerFor(t, second, waiter, storage.OwnerExplicit, 72)
+			lock := storage.RangeCommand{Domain: storage.DomainRecord, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}, Edit: storage.Replace}
+			if result, err := firstRanges.Apply(t.Context(), closingOwner, []storage.RangeCommand{lock}, retainedLockRequest(t, first)); err != nil || result.State != storage.Granted {
 				t.Fatalf("owner grant = %+v, %v", result, err)
 			}
 			pending := retainedLockRequest(t, second)
 			lock.Wait = true
-			if result, err := waiter.SetLock(t.Context(), 72, lock, pending); err != nil || result.State != storage.LockPending {
+			if result, err := secondRanges.Apply(t.Context(), waiterOwner, []storage.RangeCommand{lock}, pending); err != nil || result.State != storage.Pending {
 				t.Fatalf("waiter = %+v, %v", result, err)
 			}
 			objects.pause.Store(true)
@@ -271,20 +309,20 @@ func TestRetainedPOSIXOwnerCleanupProgressesWhileDataAdmissionIsFull(t *testing.
 				t.Fatalf("data admission = %v", err)
 			}
 			if cleanup == "close owner" {
-				if err := closing.DropLocks(t.Context(), 41, storage.POSIX); err != nil {
+				if err := first.(storage.UseOwners).RetireUseOwner(t.Context(), closingOwner); err != nil {
 					t.Fatalf("owner cleanup under data saturation: %v", err)
 				}
 			} else {
-				unlock := storage.FileLock{Family: storage.POSIX, Type: storage.Unlock, End: math.MaxInt64}
-				if result, err := closing.SetLock(t.Context(), 41, unlock, retainedLockRequest(t, first)); err != nil || result.State != storage.LockReleased {
+				unlock := storage.RangeCommand{Domain: storage.DomainRecord, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}, Edit: storage.Subtract}
+				if result, err := firstRanges.Apply(t.Context(), closingOwner, []storage.RangeCommand{unlock}, retainedLockRequest(t, first)); err != nil || result.State != storage.Released {
 					t.Fatalf("explicit unlock under data saturation = %+v, %v", result, err)
 				}
 			}
 			if err := closing.Close(t.Context()); err != nil {
 				t.Fatalf("closing descriptor after owner cleanup: %v", err)
 			}
-			if result, err := waiter.QueryLock(t.Context(), 72, pending); err != nil || result.State != storage.LockGranted {
-				t.Fatalf("closed POSIX owner left protection behind: %+v, %v", result, err)
+			if result, err := secondRanges.Query(t.Context(), waiterOwner, pending); err != nil || result.State != storage.Granted {
+				t.Fatalf("closed explicit owner left protection behind: %+v, %v", result, err)
 			}
 			if _, err := first.Renew(t.Context()); err != nil {
 				t.Fatalf("cleanup consumed renewal admission: %v", err)
@@ -304,17 +342,20 @@ func TestRetainedPendingLockCancellationProgressesWhileDataAdmissionIsFull(t *te
 	options.MaxOperations = 1
 	first := fileSessionFor(t, volume, options)
 	second := fileSessionFor(t, volume, options)
+	firstRanges, secondRanges := first.(storage.RangeControl), second.(storage.RangeControl)
 	t.Cleanup(objects.release)
 	writer := openFileFor(t, first, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true, Create: true}})
 	closing := openFileFor(t, first, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true}})
+	closingOwner := retainedOwnerFor(t, first, closing, storage.OwnerExplicit, 41)
 	holder := openFileFor(t, second, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Write: true}})
-	lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, End: math.MaxInt64}
-	if result, err := holder.SetLock(t.Context(), 72, lock, retainedLockRequest(t, second)); err != nil || result.State != storage.LockGranted {
+	holderOwner := retainedOwnerFor(t, second, holder, storage.OwnerExplicit, 72)
+	lock := storage.RangeCommand{Domain: storage.DomainRecord, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}, Edit: storage.Replace}
+	if result, err := secondRanges.Apply(t.Context(), holderOwner, []storage.RangeCommand{lock}, retainedLockRequest(t, second)); err != nil || result.State != storage.Granted {
 		t.Fatalf("blocking holder = %+v, %v", result, err)
 	}
 	pending := retainedLockRequest(t, first)
 	lock.Wait = true
-	if result, err := closing.SetLock(t.Context(), 41, lock, pending); err != nil || result.State != storage.LockPending {
+	if result, err := firstRanges.Apply(t.Context(), closingOwner, []storage.RangeCommand{lock}, pending); err != nil || result.State != storage.Pending {
 		t.Fatalf("pending request = %+v, %v", result, err)
 	}
 	objects.pause.Store(true)
@@ -325,26 +366,26 @@ func TestRetainedPendingLockCancellationProgressesWhileDataAdmissionIsFull(t *te
 	case <-time.After(3 * time.Second):
 		t.Fatal("write did not occupy data admission")
 	}
-	if result, err := closing.QueryLock(t.Context(), 41, pending); err != nil || result.State != storage.LockPending {
+	if result, err := firstRanges.Query(t.Context(), closingOwner, pending); err != nil || result.State != storage.Pending {
 		t.Fatalf("pending query under data saturation = %+v, %v", result, err)
 	}
-	if result, err := closing.CancelLock(t.Context(), 41, pending); err != nil || result.State != storage.LockCancelled || result.EverGranted {
+	if result, err := firstRanges.Cancel(t.Context(), closingOwner, pending); err != nil || result.State != storage.Cancelled || result.EverGranted {
 		t.Fatalf("cancellation under data saturation = %+v, %v", result, err)
 	}
-	if err := holder.DropLocks(t.Context(), 72, storage.POSIX); err != nil {
+	if err := secondRanges.Drop(t.Context(), holderOwner, storage.DomainRecord); err != nil {
 		t.Fatal(err)
 	}
-	if result, err := closing.QueryLock(t.Context(), 41, pending); err != nil || result.State != storage.LockCancelled || result.EverGranted {
+	if result, err := firstRanges.Query(t.Context(), closingOwner, pending); err != nil || result.State != storage.Cancelled || result.EverGranted {
 		t.Fatalf("cancelled request acquired after handoff = %+v, %v", result, err)
 	}
-	if err := closing.DropLocks(t.Context(), 41, storage.POSIX); err != nil {
+	if err := firstRanges.Drop(t.Context(), closingOwner, storage.DomainRecord); err != nil {
 		t.Fatal(err)
 	}
 	if err := closing.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	lock.Wait = false
-	if conflict, err := holder.GetLock(t.Context(), 72, lock); err != nil || conflict.Found {
+	if conflict, err := secondRanges.GetConflict(t.Context(), holderOwner, lock); err != nil || conflict.Found {
 		t.Fatalf("closed cancelled owner left a ghost range: %+v, %v", conflict, err)
 	}
 	if _, err := first.Renew(t.Context()); err != nil {
@@ -381,16 +422,26 @@ type pausedLockNode struct {
 	authority *pausedLockNodes
 }
 
-func (f *pausedLockNode) Node(ctx context.Context) (metastore.FileState, error) {
+func (f *pausedLockNode) CheckScopedReference() error {
+	return f.File.(storage.ScopedReference).CheckScopedReference()
+}
+
+func (f *pausedLockNode) Scope(ctx context.Context) (storage.UseScope, error) {
+	return f.File.(storage.ScopedReference).Scope(ctx)
+}
+
+func (f *pausedLockNode) Order(ctx context.Context, transition func() error) error {
 	for {
 		remaining := f.authority.remaining.Load()
 		if remaining == 0 {
-			return f.File.Node(ctx)
+			return f.File.(interface {
+				Order(context.Context, func() error) error
+			}).Order(ctx, transition)
 		}
 		if f.authority.remaining.CompareAndSwap(remaining, remaining-1) {
 			f.authority.entered <- struct{}{}
 			<-ctx.Done()
-			return metastore.FileState{}, ctx.Err()
+			return ctx.Err()
 		}
 	}
 }
@@ -411,17 +462,28 @@ func TestRetainedLockAdmissionPartitionsAreBoundedAndPreserveRenewal(t *testing.
 			options.MaxOperations = 1
 			session := fileSessionFor(t, volume, options)
 			file := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
-			lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, End: math.MaxInt64}
+			ranges := session.(storage.RangeControl)
+			holder := retainedOwnerFor(t, session, file, storage.OwnerExplicit, 41)
+			observer := retainedOwnerFor(t, session, file, storage.OwnerExplicit, 72)
+			lock := storage.RangeCommand{Domain: storage.DomainRecord, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}, Edit: storage.Replace}
 			request := retainedLockRequest(t, session)
-			if result, err := file.SetLock(t.Context(), 41, lock, request); err != nil || result.State != storage.LockGranted {
+			if result, err := ranges.Apply(t.Context(), holder, []storage.RangeCommand{lock}, request); err != nil || result.State != storage.Granted {
 				t.Fatalf("initial lock = %+v, %v", result, err)
+			}
+			pending := retainedLockRequest(t, session)
+			if partition == "reconciliation" {
+				waiting := lock
+				waiting.Wait = true
+				if result, err := ranges.Apply(t.Context(), observer, []storage.RangeCommand{waiting}, pending); err != nil || result.State != storage.Pending {
+					t.Fatalf("pending range = %+v, %v", result, err)
+				}
 			}
 			operation := func(ctx context.Context) error {
 				if partition == "acquisition" {
-					_, err := file.GetLock(ctx, 72, lock)
+					_, err := ranges.GetConflict(ctx, observer, lock)
 					return err
 				}
-				_, err := file.QueryLock(ctx, 41, request)
+				_, err := ranges.Query(ctx, observer, pending)
 				return err
 			}
 			paused.remaining.Store(2)
@@ -448,11 +510,11 @@ func TestRetainedLockAdmissionPartitionsAreBoundedAndPreserveRenewal(t *testing.
 				t.Fatalf("saturated %s consumed data admission: %v", partition, err)
 			}
 			if partition == "acquisition" {
-				if err := file.DropLocks(t.Context(), 41, storage.POSIX); err != nil {
+				if err := ranges.Drop(t.Context(), holder, storage.DomainRecord); err != nil {
 					t.Fatalf("acquisitions consumed release admission: %v", err)
 				}
 			} else {
-				if _, err := file.GetLock(t.Context(), 72, lock); err != nil {
+				if _, err := ranges.GetConflict(t.Context(), observer, lock); err != nil {
 					t.Fatalf("reconciliation consumed acquisition admission: %v", err)
 				}
 			}
@@ -462,7 +524,7 @@ func TestRetainedLockAdmissionPartitionsAreBoundedAndPreserveRenewal(t *testing.
 					t.Fatalf("cancelled lock control = %v", err)
 				}
 			}
-			if err := file.DropLocks(t.Context(), 41, storage.POSIX); err != nil {
+			if err := ranges.Drop(t.Context(), holder, storage.DomainRecord); err != nil {
 				t.Fatalf("cancelled controls retained release admission: %v", err)
 			}
 		})
@@ -628,10 +690,13 @@ func TestRetainedSessionExpiryFencesUploadBeforeAdvisoryHandoff(t *testing.T) {
 		t.Cleanup(objects.release)
 		first := openFileFor(t, firstSession, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
 		second := openFileFor(t, secondSession, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
+		firstRanges, secondRanges := firstSession.(storage.RangeControl), secondSession.(storage.RangeControl)
+		firstOwner := retainedOwnerFor(t, firstSession, first, storage.OwnerReference, 7)
+		secondOwner := retainedOwnerFor(t, secondSession, second, storage.OwnerReference, 7)
 		if _, err := first.WriteAt(t.Context(), 0, []byte("old")); err != nil {
 			t.Fatal(err)
 		}
-		lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
+		lock := storage.RangeCommand{Domain: storage.DomainWholeFile, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}, Edit: storage.Replace, Conversion: storage.DropBeforeAcquire}
 		firstStatus, err := firstSession.Status(t.Context())
 		if err != nil {
 			t.Fatal(err)
@@ -640,7 +705,7 @@ func TestRetainedSessionExpiryFencesUploadBeforeAdvisoryHandoff(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if result, err := first.SetLock(t.Context(), 7, lock, firstID); err != nil || result.State != storage.LockGranted {
+		if result, err := firstRanges.Apply(t.Context(), firstOwner, []storage.RangeCommand{lock}, firstID); err != nil || result.State != storage.Granted {
 			t.Fatalf("first lock=%+v %v", result, err)
 		}
 		secondStatus, err := secondSession.Status(t.Context())
@@ -652,7 +717,7 @@ func TestRetainedSessionExpiryFencesUploadBeforeAdvisoryHandoff(t *testing.T) {
 			t.Fatal(err)
 		}
 		lock.Wait = true
-		if result, err := second.SetLock(t.Context(), 7, lock, secondID); err != nil || result.State != storage.LockPending {
+		if result, err := secondRanges.Apply(t.Context(), secondOwner, []storage.RangeCommand{lock}, secondID); err != nil || result.State != storage.Pending {
 			t.Fatalf("second lock=%+v %v", result, err)
 		}
 		objects.pause.Store(true)
@@ -663,19 +728,24 @@ func TestRetainedSessionExpiryFencesUploadBeforeAdvisoryHandoff(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatal("write did not stage")
 		}
-		await(t, "expiry advisory handoff", func() bool {
-			result, err := second.QueryLock(t.Context(), 7, secondID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return result.State == storage.LockGranted
-		})
-		if _, err := second.WriteAt(t.Context(), 0, []byte("winner")); err != nil {
-			t.Fatal(err)
+		time.Sleep(options.Lease + time.Millisecond)
+		synctest.Wait()
+		if result, err := secondRanges.Query(t.Context(), secondOwner, secondID); err != nil || result.State != storage.Pending {
+			t.Fatalf("expiry released the protected range before admitted I/O drained: %+v, %v", result, err)
 		}
 		objects.release()
 		if err := <-writeDone; !errors.Is(err, syscall.ESTALE) {
 			t.Fatalf("retired upload=%v, want ESTALE", err)
+		}
+		await(t, "expiry advisory handoff", func() bool {
+			result, err := secondRanges.Query(t.Context(), secondOwner, secondID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return result.State == storage.Granted
+		})
+		if _, err := second.WriteAt(t.Context(), 0, []byte("winner")); err != nil {
+			t.Fatal(err)
 		}
 		readFileFor(t, second, "winner")
 		if _, err := firstSession.Renew(t.Context()); !errors.Is(err, syscall.ESTALE) {
@@ -731,9 +801,9 @@ func TestRetainedFileAdmissionAndSizeAreBounded(t *testing.T) {
 func TestRetainedOpenChecksIdentityAndAccess(t *testing.T) {
 	volume, _ := fileVolume(t, memory.New(), 4096, nil)
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
-	f := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Exclusive: true}, Mode: 0600})
+	f := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Exclusive: true}, InitialMetadata: map[string][]byte{"test.retained": []byte("initial")}})
 	attr, err := f.Stat(t.Context())
-	if err != nil || attr.Mode.Perm() != 0600 {
+	if err != nil || attr.Kind != storage.NodeRegular || string(attr.Metadata["test.retained"].Data) != "initial" || len(attr.Metadata["test.retained"].Version) == 0 {
 		t.Fatalf("created attr=%+v %v", attr, err)
 	}
 	if _, err := session.OpenFile(t.Context(), "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true, Exclusive: true}}); !errors.Is(err, syscall.EEXIST) {
@@ -761,8 +831,12 @@ func TestRetainedOpenChecksIdentityAndAccess(t *testing.T) {
 	if _, err := byID.ReadAt(t.Context(), -1, 1); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("negative read=%v", err)
 	}
-	if _, err := byID.SetAttr(t.Context(), storage.AttrChange{Mode: newMode(0640)}); err != nil {
-		t.Fatal(err)
+	modified := time.Unix(123, 456).UTC()
+	if changed, err := byID.SetAttr(t.Context(), storage.AttrChange{ModTime: &modified}); err != nil || changed.ID != attr.ID || !changed.ModTime.Equal(modified) {
+		t.Fatalf("read-only setattr=%+v %v", changed, err)
+	}
+	if payload, err := byID.(storage.ReferenceMetadataAccess).SetMetadata(t.Context(), "test.retained", attr.Metadata["test.retained"].Version, []byte("changed")); err != nil || string(payload.Data) != "changed" {
+		t.Fatalf("read-only metadata=%+v %v", payload, err)
 	}
 	if err := byID.Close(t.Context()); err != nil {
 		t.Fatal(err)
@@ -1063,6 +1137,9 @@ func TestRetainedSessionsShareAdvisoryAuthorityAcrossObjectWrappers(t *testing.T
 	secondSession := fileSessionFor(t, secondVolume, storage.DefaultFileSessionOptions())
 	first := openFileFor(t, firstSession, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Create: true}})
 	second := openFileFor(t, secondSession, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
+	firstRanges, secondRanges := firstSession.(storage.RangeControl), secondSession.(storage.RangeControl)
+	firstOwner := retainedOwnerFor(t, firstSession, first, storage.OwnerReference, 11)
+	secondOwner := retainedOwnerFor(t, secondSession, second, storage.OwnerReference, 11)
 	status, err := firstSession.Status(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -1071,11 +1148,11 @@ func TestRetainedSessionsShareAdvisoryAuthorityAcrossObjectWrappers(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	lock := storage.FileLock{Family: storage.Flock, Type: storage.Exclusive, End: math.MaxInt64}
-	if result, err := first.SetLock(t.Context(), 11, lock, request); err != nil || result.State != storage.LockGranted {
-		t.Fatalf("read-only flock=%+v %v", result, err)
+	lock := storage.RangeCommand{Domain: storage.DomainWholeFile, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}, Edit: storage.Replace, Conversion: storage.DropBeforeAcquire}
+	if result, err := firstRanges.Apply(t.Context(), firstOwner, []storage.RangeCommand{lock}, request); err != nil || result.State != storage.Granted {
+		t.Fatalf("read-only whole-file range=%+v %v", result, err)
 	}
-	if conflict, err := second.GetLock(t.Context(), 11, lock); err != nil || !conflict.Found {
+	if conflict, err := secondRanges.GetConflict(t.Context(), secondOwner, lock); err != nil || !conflict.Found {
 		t.Fatalf("cross-wrapper conflict=%+v %v", conflict, err)
 	}
 	if _, err := second.WriteAt(t.Context(), 0, []byte("advisory")); err != nil {
@@ -1084,8 +1161,8 @@ func TestRetainedSessionsShareAdvisoryAuthorityAcrossObjectWrappers(t *testing.T
 	if err := first.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if conflict, err := second.GetLock(t.Context(), 11, lock); err != nil || conflict.Found {
-		t.Fatalf("closed flock=%+v %v", conflict, err)
+	if conflict, err := secondRanges.GetConflict(t.Context(), secondOwner, lock); err != nil || conflict.Found {
+		t.Fatalf("closed whole-file range=%+v %v", conflict, err)
 	}
 	readFileFor(t, second, "advisory")
 }
@@ -1111,15 +1188,22 @@ func TestRetainedControlMethodsKeepIdentityAndKnownLockOutcomes(t *testing.T) {
 	if err := volume.Rename(t.Context(), "dir", "renamed"); err != nil {
 		t.Fatal(err)
 	}
-	changed, err := session.SetNodeAttr(t.Context(), dir.ID, storage.AttrChange{Mode: newMode(0700)})
-	if err != nil || changed.ID != dir.ID || changed.Mode.Perm() != 0700 {
+	modified := time.Unix(123, 456).UTC()
+	changed, err := session.SetNodeAttr(t.Context(), dir.ID, storage.AttrChange{ModTime: &modified})
+	if err != nil || changed.ID != dir.ID || !changed.ModTime.Equal(modified) {
 		t.Fatalf("node setattr=%+v %v", changed, err)
 	}
-	if got, err := session.StatNode(t.Context(), dir.ID); err != nil || got.ID != dir.ID || got.Mode.Perm() != 0700 {
+	if payload, err := session.(storage.MetadataAccess).SetMetadata(t.Context(), dir.ID, "test.retained", nil, []byte("changed")); err != nil || string(payload.Data) != "changed" || len(payload.Version) == 0 {
+		t.Fatalf("node metadata=%+v %v", payload, err)
+	}
+	if got, err := session.StatNode(t.Context(), dir.ID); err != nil || got.ID != dir.ID || got.Kind != storage.NodeDirectory || !got.ModTime.Equal(modified) || string(got.Metadata["test.retained"].Data) != "changed" {
 		t.Fatalf("node stat=%+v %v", got, err)
 	}
 	first := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
 	second := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
+	ranges := session.(storage.RangeControl)
+	firstOwner := retainedOwnerFor(t, session, first, storage.OwnerExplicit, 1)
+	secondOwner := retainedOwnerFor(t, session, second, storage.OwnerExplicit, 2)
 	request := func() storage.LockRequestID {
 		id, err := storage.NewLockRequestID(after.ActionEpoch)
 		if err != nil {
@@ -1127,22 +1211,22 @@ func TestRetainedControlMethodsKeepIdentityAndKnownLockOutcomes(t *testing.T) {
 		}
 		return id
 	}
-	lock := storage.FileLock{Family: storage.POSIX, Type: storage.Exclusive, Start: 2, End: 8}
-	if result, err := first.SetLock(t.Context(), 1, lock, request()); err != nil || result.State != storage.LockGranted {
-		t.Fatalf("first POSIX=%+v %v", result, err)
+	lock := storage.RangeCommand{Domain: storage.DomainRecord, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Start: 2, Length: 7}, Edit: storage.Replace}
+	if result, err := ranges.Apply(t.Context(), firstOwner, []storage.RangeCommand{lock}, request()); err != nil || result.State != storage.Granted {
+		t.Fatalf("first record range=%+v %v", result, err)
 	}
 	pending := request()
 	lock.Wait = true
-	if result, err := second.SetLock(t.Context(), 2, lock, pending); err != nil || result.State != storage.LockPending {
-		t.Fatalf("pending POSIX=%+v %v", result, err)
+	if result, err := ranges.Apply(t.Context(), secondOwner, []storage.RangeCommand{lock}, pending); err != nil || result.State != storage.Pending {
+		t.Fatalf("pending record range=%+v %v", result, err)
 	}
-	if result, err := second.CancelLock(t.Context(), 2, pending); err != nil || result.State != storage.LockCancelled || result.EverGranted {
+	if result, err := ranges.Cancel(t.Context(), secondOwner, pending); err != nil || result.State != storage.Cancelled || result.EverGranted {
 		t.Fatalf("cancel=%+v %v", result, err)
 	}
-	if err := first.DropLocks(t.Context(), 1, storage.POSIX); err != nil {
+	if err := ranges.Drop(t.Context(), firstOwner, storage.DomainRecord); err != nil {
 		t.Fatal(err)
 	}
-	if result, err := second.QueryLock(t.Context(), 2, pending); err != nil || result.State != storage.LockCancelled || result.EverGranted {
+	if result, err := ranges.Query(t.Context(), secondOwner, pending); err != nil || result.State != storage.Cancelled || result.EverGranted {
 		t.Fatalf("cancelled after release=%+v %v", result, err)
 	}
 	if _, err := first.WriteAt(t.Context(), 0, []byte("abc")); err != nil {
