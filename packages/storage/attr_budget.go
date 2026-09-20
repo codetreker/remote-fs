@@ -14,6 +14,11 @@ type AttrResultBudget func(scalar Attr, metadataBytes int64) error
 
 type attrResultBudgetKey struct{}
 
+type attrResultBudgetValue struct {
+	limit int64
+	check AttrResultBudget
+}
+
 // WithAttrResultBudget attaches a request-local result admission check. A nil
 // callback is a configuration error. The native producer checks only attributes
 // returned to this caller, not unrelated parent or internal state observations.
@@ -21,7 +26,20 @@ func WithAttrResultBudget(ctx context.Context, budget AttrResultBudget) context.
 	if budget == nil {
 		panic("storage: nil attribute result budget")
 	}
-	return context.WithValue(ctx, attrResultBudgetKey{}, budget)
+	return context.WithValue(ctx, attrResultBudgetKey{}, attrResultBudgetValue{check: budget})
+}
+
+// WithBoundedAttrResult attaches an attribute admission check and the caller's
+// transport-independent encoded-result ceiling. Wrappers that cross another
+// transport propagate the ceiling so the authority can refuse before mutation.
+func WithBoundedAttrResult(ctx context.Context, limit int64, budget AttrResultBudget) context.Context {
+	if limit <= 0 {
+		panic("storage: non-positive attribute result bound")
+	}
+	if budget == nil {
+		panic("storage: nil attribute result budget")
+	}
+	return context.WithValue(ctx, attrResultBudgetKey{}, attrResultBudgetValue{limit: limit, check: budget})
 }
 
 // CheckAttrResultBudget runs before loading returned metadata and before any
@@ -41,16 +59,23 @@ func CheckAttrResultBudget(ctx context.Context, scalar Attr, metadataBytes int64
 	if metadataBytes > MaxMetadataBytes {
 		return fmt.Errorf("attribute metadata exceeds native byte bound: %w", syscall.EFBIG)
 	}
-	budget, _ := ctx.Value(attrResultBudgetKey{}).(AttrResultBudget)
-	if budget == nil {
+	value, _ := ctx.Value(attrResultBudgetKey{}).(attrResultBudgetValue)
+	if value.check == nil {
 		return nil
 	}
-	return budget(scalar.Clone(), metadataBytes)
+	return value.check(scalar.Clone(), metadataBytes)
 }
 
 // HasAttrResultBudget allows native producers to keep their single hard-bounded
 // query when no caller-specific admission requires a preliminary header read.
 func HasAttrResultBudget(ctx context.Context) bool {
-	budget, _ := ctx.Value(attrResultBudgetKey{}).(AttrResultBudget)
-	return budget != nil
+	value, _ := ctx.Value(attrResultBudgetKey{}).(attrResultBudgetValue)
+	return value.check != nil
+}
+
+// AttrResultByteLimit returns the encoded-result ceiling carried by
+// WithBoundedAttrResult. A plain callback has no transferable numeric ceiling.
+func AttrResultByteLimit(ctx context.Context) (int64, bool) {
+	value, _ := ctx.Value(attrResultBudgetKey{}).(attrResultBudgetValue)
+	return value.limit, value.limit > 0
 }

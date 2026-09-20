@@ -84,3 +84,21 @@ func TestAttributeResultBudgetPresenceIsRequestLocal(t *testing.T) {
 		t.Fatal("presence query escaped context or invoked accounting")
 	}
 }
+
+func TestBoundedAttributeResultCarriesOnlyAnExplicitByteLimit(t *testing.T) {
+	base := t.Context()
+	plain := storage.WithAttrResultBudget(base, func(storage.Attr, int64) error { return nil })
+	if limit, ok := storage.AttrResultByteLimit(plain); ok || limit != 0 {
+		t.Fatalf("plain callback exposed limit %d, present=%v", limit, ok)
+	}
+	bounded := storage.WithBoundedAttrResult(base, 4096, func(storage.Attr, int64) error { return nil })
+	if limit, ok := storage.AttrResultByteLimit(bounded); !ok || limit != 4096 {
+		t.Fatalf("bounded callback exposed limit %d, present=%v", limit, ok)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("non-positive attribute result bound accepted")
+		}
+	}()
+	_ = storage.WithBoundedAttrResult(base, 0, func(storage.Attr, int64) error { return nil })
+}
