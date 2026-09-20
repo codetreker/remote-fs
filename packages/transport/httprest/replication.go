@@ -88,8 +88,8 @@ func (n Node) check() error {
 	if err := storage.CheckMetadata(metadataStorage(n.Metadata)); err != nil {
 		return fmt.Errorf("node %d carries invalid metadata: %w", n.ID, err)
 	}
-	if len(n.LinkTarget) > storage.MaxLinkTargetBytes || len(n.DirectoryRevision) > storage.MaxObservationTokenBytes {
-		return errors.New("node carries an oversized reserved payload")
+	if len(n.LinkTarget) != 0 || len(n.DirectoryRevision) != 0 {
+		return errors.New("node carries unsupported reserved payload")
 	}
 	return nil
 }
