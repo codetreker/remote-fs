@@ -85,8 +85,8 @@ func PrepareWithMetadataLimit(
 	window changes.Window,
 	maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes int64,
 ) (id, root int64, err error) {
-	id, root, _, err = PrepareConfiguredWithMetadataLimit(
-		ctx, db, volume, storeID, window, maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes, nil,
+	id, root, _, err = PrepareConfiguredWithMetadataPolicy(
+		ctx, db, volume, storeID, window, maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes, false, nil,
 	)
 	return id, root, err
 }
@@ -112,6 +112,19 @@ func PrepareConfiguredWithMetadataLimit(
 	volume, storeID string,
 	window changes.Window,
 	maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes int64,
+	durable *DurableOpen,
+) (id, root int64, state dbstate.State, err error) {
+	return PrepareConfiguredWithMetadataPolicy(ctx, db, volume, storeID, window,
+		maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes, false, durable)
+}
+
+func PrepareConfiguredWithMetadataPolicy(
+	ctx context.Context,
+	db *sql.DB,
+	volume, storeID string,
+	window changes.Window,
+	maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes int64,
+	opaqueMetadataVersions bool,
 	durable *DurableOpen,
 ) (id, root int64, state dbstate.State, err error) {
 	conn, err := db.Conn(ctx)
@@ -148,7 +161,8 @@ func PrepareConfiguredWithMetadataLimit(
 	}
 	legacy := recorded && version > 0 && version < firstOwnershipAwareSchemaVersion
 	if recorded && version >= firstOwnershipAwareSchemaVersion && version < firstNeutralMetadataSchemaVersion {
-		if err := validateIntegrity(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes, version, maxMetadataBytes); err != nil {
+		if err := validateIntegrityWithMetadataPolicy(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes,
+			version, maxMetadataBytes, opaqueMetadataVersions); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 	}
@@ -196,7 +210,8 @@ func PrepareConfiguredWithMetadataLimit(
 	// accounting after the migrations normalize that table, while the same transaction can
 	// still roll every schema change back on refusal.
 	if !recorded || version < firstNeutralMetadataSchemaVersion {
-		if err := validateIntegrity(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes, schema.Version(), maxMetadataBytes); err != nil {
+		if err := validateIntegrityWithMetadataPolicy(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes,
+			schema.Version(), maxMetadataBytes, opaqueMetadataVersions); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 	}
@@ -220,11 +235,13 @@ func PrepareConfiguredWithMetadataLimit(
 	case err != nil:
 		return 0, 0, dbstate.State{}, err
 	}
-	if err := ValidateVolumeIntegrity(ctx, tx, id, maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes); err != nil {
+	if err := validateIntegrityWithMetadataPolicy(ctx, tx, &id, maxIntegrityRecords, maxIntegrityBytes,
+		schema.Version(), maxMetadataBytes, opaqueMetadataVersions); err != nil {
 		return 0, 0, dbstate.State{}, err
 	}
 	if durable != nil && durable.ReapDetached {
-		if err := validateIntegrity(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes, schema.Version(), maxMetadataBytes); err != nil {
+		if err := validateIntegrityWithMetadataPolicy(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes,
+			schema.Version(), maxMetadataBytes, opaqueMetadataVersions); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
 		if err := reapDetachedFiles(ctx, tx); err != nil {

@@ -3,6 +3,7 @@ package schema
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -14,7 +15,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-func validateMetadataIntegrity(ctx context.Context, db sqlvalue.Queryer, volume *int64, limit int64) error {
+func validateMetadataIntegrity(ctx context.Context, db sqlvalue.Queryer, volume *int64, limit int64, opaqueVersions bool) error {
 	if err := validateMetadataAccounting(ctx, db); err != nil {
 		return err
 	}
@@ -53,10 +54,10 @@ func validateMetadataIntegrity(ctx context.Context, db sqlvalue.Queryer, volume 
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return err
 	}
-	return validateMetadataPayloads(ctx, db, volume)
+	return validateMetadataPayloads(ctx, db, volume, opaqueVersions)
 }
 
-func validateMetadataPayloads(ctx context.Context, db sqlvalue.Queryer, volume *int64) error {
+func validateMetadataPayloads(ctx context.Context, db sqlvalue.Queryer, volume *int64, opaqueVersions bool) error {
 	where := ""
 	var args []any
 	if volume != nil {
@@ -97,7 +98,11 @@ func validateMetadataPayloads(ctx context.Context, db sqlvalue.Queryer, volume *
 			return err
 		}
 		for _, value := range values {
-			if len(value.Version) == 0 || len(value.Version) > storage.MaxObservationTokenBytes {
+			valid := len(value.Version) != 0 && len(value.Version) <= storage.MaxObservationTokenBytes
+			if !opaqueVersions {
+				valid = len(value.Version) == 8 && binary.BigEndian.Uint64(value.Version) != 0
+			}
+			if !valid {
 				return fmt.Errorf("stored metadata has an invalid version token: %w", syscall.EIO)
 			}
 		}

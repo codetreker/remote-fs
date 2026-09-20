@@ -103,13 +103,13 @@ func OpenLocking(ctx context.Context, config LockingConfig) (*LockingStore, erro
 	return opened, nil
 }
 
-func prepareOwnedLeaseVolume(ctx context.Context, db *sql.DB, volume, storeID string, window Window, maxRecords, maxBytes, maxMetadataBytes int64) (int64, int64, error) {
-	id, root, _, err := prepareConfigured(ctx, db, volume, storeID, window, maxRecords, maxBytes, maxMetadataBytes, &durableOpen{mode: CreateVolumeIfMissing, reapDetached: true})
+func prepareOwnedLeaseVolume(ctx context.Context, db *sql.DB, volume, storeID string, window Window, maxRecords, maxBytes, maxMetadataBytes int64, opaqueMetadataVersions bool) (int64, int64, error) {
+	id, root, _, err := prepareConfigured(ctx, db, volume, storeID, window, maxRecords, maxBytes, maxMetadataBytes, opaqueMetadataVersions, &durableOpen{mode: CreateVolumeIfMissing, reapDetached: true})
 	return id, root, err
 }
 
-func prepareExistingOwnedLeaseVolume(ctx context.Context, db *sql.DB, volume, storeID string, window Window, maxRecords, maxBytes, maxMetadataBytes int64) (int64, int64, error) {
-	id, root, _, err := prepareConfigured(ctx, db, volume, storeID, window, maxRecords, maxBytes, maxMetadataBytes, &durableOpen{mode: RequireExistingVolume, reapDetached: true})
+func prepareExistingOwnedLeaseVolume(ctx context.Context, db *sql.DB, volume, storeID string, window Window, maxRecords, maxBytes, maxMetadataBytes int64, opaqueMetadataVersions bool) (int64, int64, error) {
+	id, root, _, err := prepareConfigured(ctx, db, volume, storeID, window, maxRecords, maxBytes, maxMetadataBytes, opaqueMetadataVersions, &durableOpen{mode: RequireExistingVolume, reapDetached: true})
 	return id, root, err
 }
 

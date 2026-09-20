@@ -345,6 +345,16 @@ func ValidateVolumeIntegrity(
 	return validateIntegrity(ctx, db, &volume, maxIntegrityRecords, maxIntegrityBytes, schema.Version(), metadataLimits...)
 }
 
+func ValidateReplicaVolumeIntegrity(
+	ctx context.Context,
+	db sqlvalue.Queryer,
+	volume int64,
+	maxIntegrityRecords, maxIntegrityBytes, maxMetadataBytes int64,
+) error {
+	return validateIntegrityWithMetadataPolicy(ctx, db, &volume, maxIntegrityRecords, maxIntegrityBytes,
+		schema.Version(), maxMetadataBytes, true)
+}
+
 // A nil volume validates the complete database for migration or exclusive-owner recovery.
 // Version selects the stored layout explicitly; ordinary readers validate the current schema.
 func validateIntegrity(
@@ -359,6 +369,19 @@ func validateIntegrity(
 	if len(metadataLimits) != 0 {
 		maxMetadataBytes = metadataLimits[0]
 	}
+	return validateIntegrityWithMetadataPolicy(ctx, db, volume, maxIntegrityRecords, maxIntegrityBytes,
+		version, maxMetadataBytes, false)
+}
+
+func validateIntegrityWithMetadataPolicy(
+	ctx context.Context,
+	db sqlvalue.Queryer,
+	volume *int64,
+	maxIntegrityRecords, maxIntegrityBytes int64,
+	version int,
+	maxMetadataBytes int64,
+	opaqueMetadataVersions bool,
+) error {
 	if err := validateIntegrityWork(ctx, db, volume, maxIntegrityRecords); err != nil {
 		return err
 	}
@@ -366,7 +389,7 @@ func validateIntegrity(
 		return err
 	}
 	if version >= firstNeutralMetadataSchemaVersion {
-		if err := validateMetadataIntegrity(ctx, db, volume, maxMetadataBytes); err != nil {
+		if err := validateMetadataIntegrity(ctx, db, volume, maxMetadataBytes, opaqueMetadataVersions); err != nil {
 			return err
 		}
 	}

@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"bytes"
+	"database/sql"
 	"errors"
 	"reflect"
 	"syscall"
@@ -160,5 +161,43 @@ func assertMetadataAccounting(t *testing.T, store *Store) {
 	}
 	if recorded != actual || recorded <= 0 {
 		t.Fatalf("metadata accounting recorded=%d actual=%d", recorded, actual)
+	}
+}
+
+func TestAuthorityReopenRejectsNonNativeMetadataVersion(t *testing.T) {
+	path := t.TempDir() + "/metadata.db"
+	store, err := Open(t.Context(), path, "workspace", 0, DefaultWindow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := storage.EncodeMetadata(map[string]storage.OpaquePayload{
+		"client": {Version: []byte("foreign"), Data: []byte("value")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `UPDATE nodes SET metadata=? WHERE id=(SELECT node FROM entries WHERE name=CAST('file' AS BLOB))`, encoded); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(t.Context(), path, "workspace", 0, DefaultWindow())
+	if reopened != nil {
+		reopened.Close()
+	}
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("authority accepted a foreign metadata version: %v", err)
 	}
 }

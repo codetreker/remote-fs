@@ -66,6 +66,7 @@ type Replica struct {
 // answer rather than anything this database knows.
 func OpenReplica(ctx context.Context, path string) (*Replica, error) {
 	options := DefaultOptions()
+	options.replicaMetadata = true
 	store, err := OpenWithOptions(ctx, path, replicaVolume, 0, options)
 	if err != nil {
 		return nil, err

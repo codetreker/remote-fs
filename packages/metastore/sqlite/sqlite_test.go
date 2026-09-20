@@ -280,7 +280,7 @@ func TestWriterCloseFailureIsJoinedWhenReaderPoolOpenFails(t *testing.T) {
 				}
 				return nil, primary
 			},
-			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64, int64) (int64, int64, error) {
+			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64, int64, bool) (int64, int64, error) {
 				t.Fatal("prepare ran after reader pool open failed")
 				return 0, 0, nil
 			},
@@ -336,7 +336,7 @@ func TestBothPoolCloseFailuresAreJoinedWhenPrepareFails(t *testing.T) {
 				}
 				return snapshot, nil
 			},
-			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64, int64) (int64, int64, error) {
+			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64, int64, bool) (int64, int64, error) {
 				return 0, 0, primary
 			},
 			closePool: func(db *sql.DB) error {
@@ -428,7 +428,7 @@ func TestReaderPoolCloseFailuresAreJoinedWhenSnapshotPoolOpenFails(t *testing.T)
 				}
 				return nil, primary
 			},
-			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64, int64) (int64, int64, error) {
+			prepare: func(context.Context, *sql.DB, string, string, Window, int64, int64, int64, bool) (int64, int64, error) {
 				t.Fatal("prepare ran after snapshot reader pool open failed")
 				return 0, 0, nil
 			},

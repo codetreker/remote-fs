@@ -43,6 +43,7 @@ type Options struct {
 	leaseRecoveryOwner    bool
 	leaseOwner            *nativelease.Database
 	requireExistingVolume bool
+	replicaMetadata       bool
 	Window                Window
 	ObjectLimits          ObjectLimits
 
