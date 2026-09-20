@@ -112,7 +112,7 @@ func (s *remoteFileSession) openCapability(ctx context.Context, req fileRequest)
 		if cleanupErr != nil && !errors.Is(cleanupErr, syscall.ESTALE) {
 			ackErr = errors.Join(ackErr, cleanupErr)
 		}
-		return nil, response, operationFailure(Request{Op: OpFile}, ackErr, false)
+		return nil, response, operationFailure(Request{Op: OpFile}, errors.Join(callErr, ackErr), false)
 	}
 	return reference, response, callErr
 }
