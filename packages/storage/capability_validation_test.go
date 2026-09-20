@@ -48,6 +48,16 @@ func TestFileActionAndDurableDeleteIdentitiesAreBounded(t *testing.T) {
 	if (FileActionReceipt{Action: action, Operation: OpFileRead, Outcome: FileActionCompleted}).Check() == nil {
 		t.Fatal("receipt for a non-action operation accepted")
 	}
+	for _, outcome := range []FileActionOutcome{FileActionNotExecuted, FileActionUnknown, FileActionRetired} {
+		if err := (FileActionReceipt{Action: action, Outcome: outcome}).Check(); err != nil {
+			t.Fatalf("truthful receipt without a retained operation rejected: %v", err)
+		}
+	}
+	for _, outcome := range []FileActionOutcome{FileActionPending, FileActionCompleted} {
+		if (FileActionReceipt{Action: action, Outcome: outcome}).Check() == nil {
+			t.Fatalf("outcome %v accepted without a retained operation", outcome)
+		}
+	}
 	for _, outcome := range []DeleteIntentOutcome{DeleteIntentArmed, DeleteIntentPending, DeleteIntentCompleted, DeleteIntentNotExecuted, DeleteIntentCleanupFailed} {
 		status := DeleteIntentStatus{ID: validDeleteIntent, NodeID: 9, Outcome: outcome}
 		if err := status.Check(); err != nil {

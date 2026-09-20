@@ -340,6 +340,12 @@ func (r FileActionReceipt) Check() error {
 	if err := r.Action.Check(); err != nil {
 		return err
 	}
+	if r.Operation == "" {
+		if r.Outcome != FileActionNotExecuted && r.Outcome != FileActionUnknown && r.Outcome != FileActionRetired {
+			return syscall.EINVAL
+		}
+		return nil
+	}
 	switch r.Operation {
 	case OpFileOpenAt, OpFileMutateName, OpFileOpenNodeRef, OpFileOpenChildRef,
 		OpFileSetPendingUnlink, OpFileClearPendingUnlink, OpFileMutate:

@@ -23,9 +23,13 @@ type NamespaceAccess interface {
 	MutateName(context.Context, NameCommand) (NameResult, error)
 }
 
-// NodeReference retains a node identity without granting file byte methods.
-// It survives name replacement and shares FileSession lifetime and close drain.
+// NodeReference retains a node identity without granting file byte methods. It
+// always exposes the exact live-reference scope and an authoritative state
+// capture, so a caller that passed NodeReferences preflight cannot discover
+// EOPNOTSUPP after opening a directory or metadata-only reference.
 type NodeReference interface {
+	ScopedReference
+	ReferenceStateAccess
 	Stat(context.Context) (Attr, error)
 	SetAttr(context.Context, AttrChange) (Attr, error)
 	Close(context.Context) error
@@ -422,9 +426,9 @@ const (
 	FileActionRetired
 )
 
-// FileActionReceipt reports admission and execution state. Completed and
-// NotExecuted are terminal while retained; Unknown and Retired are not evidence
-// that the mutation did not occur.
+// FileActionReceipt reports admission and execution state. Operation is absent
+// only when no retained record can identify it. Completed and NotExecuted are
+// terminal while retained; Unknown and Retired do not prove the mutation absent.
 type FileActionReceipt struct {
 	Action    FileActionID
 	Operation Operation
