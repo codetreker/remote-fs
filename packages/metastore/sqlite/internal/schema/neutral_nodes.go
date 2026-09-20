@@ -8,7 +8,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
 )
 
-func validateNeutralNodeValues(ctx context.Context, db sqlvalue.Queryer, volume *int64, version int) error {
+func validateNeutralNodeValues(ctx context.Context, db sqlvalue.Queryer, volume *int64, version int, opaqueDirectoryRevisions bool) error {
 	where := ""
 	var args []any
 	if volume != nil {
@@ -23,9 +23,14 @@ func validateNeutralNodeValues(ctx context.Context, db sqlvalue.Queryer, volume 
 	}
 	directoryRevision := ""
 	if version >= firstDirectoryRevisionSchemaVersion {
-		directoryRevision = ` OR typeof(directory_revision)!='blob' OR length(directory_revision)>64 OR
-			(kind=2 AND (length(directory_revision)!=8 OR directory_revision<X'0000000000000001' OR directory_revision>X'7fffffffffffffff')) OR
-			(kind!=2 AND length(directory_revision)!=0)`
+		if opaqueDirectoryRevisions {
+			directoryRevision = ` OR typeof(directory_revision)!='blob' OR length(directory_revision)>64 OR
+				(kind=2 AND length(directory_revision)=0) OR (kind!=2 AND length(directory_revision)!=0)`
+		} else {
+			directoryRevision = ` OR typeof(directory_revision)!='blob' OR length(directory_revision)>64 OR
+				(kind=2 AND (length(directory_revision)!=8 OR directory_revision<X'0000000000000001' OR directory_revision>X'7fffffffffffffff')) OR
+				(kind!=2 AND length(directory_revision)!=0)`
+		}
 	}
 	detachedKind := " OR (detached=1 AND kind!=1)"
 	if version >= firstDurableIdentitySchemaVersion {

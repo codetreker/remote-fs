@@ -477,7 +477,7 @@ func validateIntegrityWithMetadataPolicy(
 	} else if err := dbstate.ValidateIdentityBounds(ctx, db, *volume); err != nil {
 		return err
 	}
-	if err := validateNodeValuesVersion(ctx, db, volume, version); err != nil {
+	if err := validateNodeValuesVersion(ctx, db, volume, version, opaqueMetadataVersions); err != nil {
 		return err
 	}
 	where := ""
@@ -514,5 +514,5 @@ func validateIntegrityWithMetadataPolicy(
 	if err := validateUsedAccountingVersion(ctx, db, volume, version); err != nil {
 		return err
 	}
-	return validateLogIntegrityVersion(ctx, db, volume, version, true)
+	return validateLogIntegrityVersion(ctx, db, volume, version, true, opaqueMetadataVersions)
 }

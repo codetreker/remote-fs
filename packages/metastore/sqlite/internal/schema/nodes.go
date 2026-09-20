@@ -12,12 +12,12 @@ import (
 )
 
 func validateNodeValues(ctx context.Context, db sqlvalue.Queryer, volume *int64) error {
-	return validateNodeValuesVersion(ctx, db, volume, schema.Version())
+	return validateNodeValuesVersion(ctx, db, volume, schema.Version(), false)
 }
 
-func validateNodeValuesVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, version int) error {
+func validateNodeValuesVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, version int, opaqueDirectoryRevisions bool) error {
 	if version >= firstNeutralMetadataSchemaVersion {
-		return validateNeutralNodeValues(ctx, db, volume, version)
+		return validateNeutralNodeValues(ctx, db, volume, version, opaqueDirectoryRevisions)
 	}
 	where := ""
 	var args []any

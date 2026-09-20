@@ -89,7 +89,7 @@ func Record(ctx context.Context, tx *sql.Tx, volume int64, change metastore.Chan
 		}
 		metadata = encoded
 		if len(change.Node.LinkTarget) > storage.MaxLinkTargetBytes || len(change.Node.DirectoryRevision) > storage.MaxObservationTokenBytes ||
-			change.Node.Kind == storage.NodeDirectory && !validStoredDirectoryRevision(change.Node.DirectoryRevision) ||
+			change.Node.Kind == storage.NodeDirectory && !validNativeDirectoryRevision(change.Node.DirectoryRevision) ||
 			change.Node.Kind != storage.NodeDirectory && len(change.Node.DirectoryRevision) != 0 ||
 			change.Node.Kind == storage.NodeSymlink && (len(change.Node.LinkTarget) == 0 || int64(len(change.Node.LinkTarget)) != change.Node.Size || change.Node.Content != "") ||
 			change.Node.Kind != storage.NodeSymlink && len(change.Node.LinkTarget) != 0 {

@@ -66,7 +66,7 @@ func (s *Store) ReadDirNodeBounded(ctx context.Context, target storage.Directory
 		return storage.DirectoryObservation{}, err
 	}
 	err := s.inspect(ctx, func(tx *sql.Tx) error {
-		parent, _, err := s.directoryTarget(ctx, tx, target, storage.ReadEntries)
+		parent, err := s.directoryIdentityTarget(ctx, tx, target, storage.ReadEntries)
 		if err != nil {
 			return err
 		}

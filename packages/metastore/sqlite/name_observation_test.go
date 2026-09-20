@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -191,6 +192,73 @@ func TestDirectoryRevisionOverflowRollsBackTheNameMutation(t *testing.T) {
 	}
 	if got := observedDirectory(t, store.Store, uint64(root.ID)).Observation.Revision; !bytes.Equal(got, maximum) {
 		t.Fatalf("overflow changed revision: %x", got)
+	}
+}
+
+func TestAuthorityObservationsRejectMalformedDirectoryRevisions(t *testing.T) {
+	store, _ := openNameObservationStore(t, nil)
+	defer store.Close()
+	root, err := store.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.write.ExecContext(t.Context(), `UPDATE nodes SET directory_revision=X'01' WHERE volume=? AND id=?`, store.volume, root.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Stat(t.Context(), ""); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("malformed directory revision Stat=%v", err)
+	}
+	if _, err := store.List(t.Context(), ""); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("malformed directory revision List=%v", err)
+	}
+	if _, err := store.StatNode(t.Context(), uint64(root.ID)); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("malformed directory revision StatNode=%v", err)
+	}
+	result, err := storage.NewListResult(1024, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		return storage.ObservedEntryBytes(nameBytes, metadataBytes)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := store.ReadDirNodeBounded(t.Context(), storage.DirectoryTarget{NodeID: uint64(root.ID)}, result)
+	if !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observation, storage.DirectoryObservation{}) {
+		t.Fatalf("malformed directory revision observation=%+v error=%v", observation, err)
+	}
+	if entries, listErr := result.Entries(); entries != nil || !errors.Is(listErr, syscall.EIO) {
+		t.Fatalf("malformed directory revision exposed entries=%+v error=%v", entries, listErr)
+	}
+	if snapshot, _, err := store.Snapshot(t.Context()); snapshot != nil || !errors.Is(err, syscall.EIO) {
+		if snapshot != nil {
+			snapshot.Close()
+		}
+		t.Fatalf("malformed directory revision snapshot=%v error=%v", snapshot, err)
+	}
+}
+
+func TestAuthorityChangeReadRejectsMalformedDirectoryRevision(t *testing.T) {
+	store, _ := openNameObservationStore(t, nil)
+	defer store.Close()
+	if err := store.Create(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	root, err := store.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.write.ExecContext(t.Context(), `UPDATE changes SET directory_revision=X'01' WHERE volume=? AND node=? AND node_kind=?`, store.volume, root.ID, storage.NodeDirectory); err != nil {
+		t.Fatal(err)
+	}
+	result, err := metastore.NewChangeResult(1<<20, 0, func(_ int, _ metastore.Change, lengths metastore.ChangePayloadLengths) (int64, error) {
+		return 256 + lengths.Name + lengths.FromName + lengths.Content + lengths.Metadata + lengths.Target, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Since(t.Context(), 0, 100, result); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("malformed directory change=%v", err)
+	}
+	if changes, resultErr := result.Changes(); changes != nil || !errors.Is(resultErr, syscall.EIO) {
+		t.Fatalf("malformed directory change exposed page=%+v error=%v", changes, resultErr)
 	}
 }
 

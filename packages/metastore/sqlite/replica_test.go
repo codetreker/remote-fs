@@ -179,6 +179,122 @@ func TestDirectoryRevisionsRoundTripThroughSnapshotChangesAndReplicaReopen(t *te
 	assertReplicaRevision(reopened)
 }
 
+func TestReplicaSynthesizesPersistentRevisionsForRevisionlessV4Input(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v4-replica.db")
+	replica, err := OpenReplica(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seeding, err := replica.Reseed(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []metastore.Row{
+		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory}},
+		{Parent: 1, Name: []byte("dir"), Node: metastore.Node{ID: 2, Kind: storage.NodeDirectory}},
+	}
+	if err := seeding.Add(t.Context(), rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := seeding.Complete(t.Context(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := seeding.Close(); err != nil {
+		t.Fatal(err)
+	}
+	revision := func(id int64) []byte {
+		t.Helper()
+		var node metastore.Node
+		if err := replica.store.inspect(t.Context(), func(tx *sql.Tx) error {
+			var err error
+			node, err = replica.store.nodeByID(t.Context(), tx, id)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return node.DirectoryRevision
+	}
+	rootRevision, childRevision := revision(1), revision(2)
+	if !validDirectoryRevision(rootRevision) || !validDirectoryRevision(childRevision) {
+		t.Fatalf("revisionless seed produced root=%x child=%x", rootRevision, childRevision)
+	}
+	file := metastore.Node{ID: 3, Kind: storage.NodeRegular}
+	if applied, err := replica.Apply(t.Context(), metastore.Change{Position: 1, Kind: metastore.Created, Parent: 2, Name: []byte("file"), Node: &file}); err != nil || !applied {
+		t.Fatalf("revisionless v4 create applied=%t error=%v", applied, err)
+	}
+	if applied, err := replica.Apply(t.Context(), metastore.Change{Position: 2, Kind: metastore.Modified, Node: &metastore.Node{ID: 2, Kind: storage.NodeDirectory}}); err != nil || !applied {
+		t.Fatalf("revisionless v4 parent update applied=%t error=%v", applied, err)
+	}
+	advanced := revision(2)
+	if revisionNumber(t, advanced) <= revisionNumber(t, childRevision) {
+		t.Fatalf("revisionless change did not advance hidden revision: %x -> %x", childRevision, advanced)
+	}
+	if err := replica.Close(); err != nil {
+		t.Fatal(err)
+	}
+	replica, err = OpenReplica(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replica.Close()
+	if got := revision(2); !bytes.Equal(got, advanced) {
+		t.Fatalf("reopen changed hidden revision: %x -> %x", advanced, got)
+	}
+}
+
+func TestReplicaPreservesNonemptyOpaqueDirectoryRevisions(t *testing.T) {
+	replica, err := OpenReplica(t.Context(), filepath.Join(t.TempDir(), "opaque-replica.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replica.Close()
+	seeding, err := replica.Reseed(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := metastore.Node{ID: 1, Kind: storage.NodeDirectory, DirectoryRevision: []byte("source-root")}
+	if err := seeding.Add(t.Context(), []metastore.Row{{Node: root}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := seeding.Complete(t.Context(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := seeding.Close(); err != nil {
+		t.Fatal(err)
+	}
+	file := metastore.Node{ID: 2, Kind: storage.NodeRegular}
+	if applied, err := replica.Apply(t.Context(), metastore.Change{Position: 1, Kind: metastore.Created, Parent: 1, Name: []byte("file"), Node: &file}); err != nil || !applied {
+		t.Fatalf("opaque-parent child create applied=%t error=%v", applied, err)
+	}
+	var intermediate metastore.Node
+	if err := replica.store.inspect(t.Context(), func(tx *sql.Tx) error {
+		var err error
+		intermediate, err = replica.store.nodeByID(t.Context(), tx, 1)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(intermediate.DirectoryRevision) == 0 || len(intermediate.DirectoryRevision) > storage.MaxObservationTokenBytes || bytes.Equal(intermediate.DirectoryRevision, []byte("source-root")) {
+		t.Fatalf("opaque parent revision was not invalidated after namespace change: %x", intermediate.DirectoryRevision)
+	}
+	replacement := []byte("source-root-next")
+	root.DirectoryRevision = replacement
+	if applied, err := replica.Apply(t.Context(), metastore.Change{Position: 2, Kind: metastore.Modified, Node: &root}); err != nil || !applied {
+		t.Fatalf("opaque revision update applied=%t error=%v", applied, err)
+	}
+	var got metastore.Node
+	if err := replica.store.inspect(t.Context(), func(tx *sql.Tx) error {
+		var err error
+		got, err = replica.store.nodeByID(t.Context(), tx, 1)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.DirectoryRevision, replacement) {
+		t.Fatalf("opaque revision=%q want=%q", got.DirectoryRevision, replacement)
+	}
+}
+
 func seedAdmissionReplica(t *testing.T, checkClose func(error)) *Replica {
 	t.Helper()
 	replica, err := OpenReplica(t.Context(), filepath.Join(t.TempDir(), "replica.db"))

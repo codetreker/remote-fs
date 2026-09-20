@@ -21,11 +21,14 @@ func (s *Store) checkNodeResultBudget(ctx context.Context, tx *sql.Tx, id int64)
 		}
 		return err
 	}
-	attr, err := header.attr()
+	node, err := header.node()
 	if err != nil {
 		return err
 	}
-	return storage.CheckAttrResultBudget(ctx, attr, header.metadataBytes)
+	if err := s.validateLoadedNode(node); err != nil {
+		return err
+	}
+	return storage.CheckAttrResultBudget(ctx, node.Attr(), header.metadataBytes)
 }
 
 func (s *Store) returnedFileState(ctx context.Context, tx *sql.Tx, id int64) (metastore.FileState, error) {

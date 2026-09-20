@@ -19,12 +19,12 @@ import (
 // rootNode reads the directory the volume starts from. It is a node nobody made, and
 // nothing removes or replaces it.
 func (s *Store) rootNode(ctx context.Context, tx *sql.Tx) (metastore.Node, error) {
-	return scanNode(tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes n WHERE n.id = ?`, s.root))
+	return s.scanNode(tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes n WHERE n.id = ?`, s.root))
 }
 
 // lookup finds the child of parent called name, byte for byte.
 func (s *Store) lookup(ctx context.Context, tx *sql.Tx, parent int64, name []byte) (metastore.Node, bool, error) {
-	node, err := scanNode(tx.QueryRowContext(ctx,
+	node, err := s.scanNode(tx.QueryRowContext(ctx,
 		`SELECT `+nodeColumns+` FROM entries e JOIN nodes n ON n.id = e.node
 		 WHERE e.volume = ? AND e.parent = ? AND e.name = ?`,
 		s.volume, parent, name))
@@ -236,11 +236,16 @@ func (s *Store) listChildrenBoundedChecked(ctx context.Context, tx *sql.Tx, pare
 			rows.Close()
 			return err
 		}
-		attr, err := node.attr()
+		value, err := node.node()
 		if err != nil {
 			rows.Close()
 			return err
 		}
+		if err := s.validateLoadedNode(value); err != nil {
+			rows.Close()
+			return err
+		}
+		attr := value.Attr()
 		if check != nil {
 			if err := check(len(reserved), nameBytes, node.metadataBytes, attr); err != nil {
 				rows.Close()
@@ -344,6 +349,9 @@ func (s *Store) visitChildren(ctx context.Context, tx *sql.Tx, parent int64, add
 		}
 		value, err := node.node()
 		if err != nil {
+			return err
+		}
+		if err := s.validateLoadedNode(value); err != nil {
 			return err
 		}
 		if err := add(metastore.Child{Name: name, Node: value}); err != nil {

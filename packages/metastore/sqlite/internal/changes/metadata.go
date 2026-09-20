@@ -354,5 +354,9 @@ func (extra changeExtraMetadata) apply(node *metastore.Node, lengths metastore.C
 }
 
 func validStoredDirectoryRevision(token []byte) bool {
+	return validNativeDirectoryRevision(token)
+}
+
+func validNativeDirectoryRevision(token []byte) bool {
 	return len(token) == 8 && token[0]&0x80 == 0 && !bytes.Equal(token, make([]byte, 8))
 }

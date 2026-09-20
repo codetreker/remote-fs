@@ -214,7 +214,7 @@ func (s *Store) createOpenNode(ctx context.Context, tx *sql.Tx, parent metastore
 }
 
 func (s *Store) nodeByID(ctx context.Context, tx *sql.Tx, id int64) (metastore.Node, error) {
-	node, err := scanNode(tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes n WHERE n.volume=? AND n.id=?`, s.volume, id))
+	node, err := s.scanNode(tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes n WHERE n.volume=? AND n.id=?`, s.volume, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return metastore.Node{}, syscall.ESTALE
 	}

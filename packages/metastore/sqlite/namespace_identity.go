@@ -45,6 +45,9 @@ func (s *Store) namespaceIdentity(ctx context.Context, tx *sql.Tx, id int64) (na
 	if errors.Is(err, sql.ErrNoRows) {
 		return namespaceIdentity{}, syscall.ESTALE
 	}
+	if err == nil && !s.replicaMetadata && identity.Kind == storage.NodeDirectory && !validDirectoryRevision(identity.DirectoryRevision) {
+		return namespaceIdentity{}, syscall.EIO
+	}
 	return identity, err
 }
 
@@ -55,16 +58,19 @@ func (s *Store) lookupNamespaceIdentity(ctx context.Context, tx *sql.Tx, parent 
 	if errors.Is(err, sql.ErrNoRows) {
 		return namespaceIdentity{}, false, nil
 	}
+	if err == nil && !s.replicaMetadata && identity.Kind == storage.NodeDirectory && !validDirectoryRevision(identity.DirectoryRevision) {
+		return namespaceIdentity{}, false, syscall.EIO
+	}
 	return identity, err == nil, err
 }
 
-func (s *Store) directoryMetadataTarget(ctx context.Context, tx *sql.Tx, target storage.DirectoryTarget) (namespaceIdentity, error) {
+func (s *Store) directoryIdentityTarget(ctx context.Context, tx *sql.Tx, target storage.DirectoryTarget, uses storage.Uses) (namespaceIdentity, error) {
 	if target.NodeID == 0 || target.NodeID > math.MaxInt64 {
 		return namespaceIdentity{}, syscall.ESTALE
 	}
 	var scope storage.UseScope
 	if target.Scope != nil {
-		file, err := s.resolveUseScope(ctx, *target.Scope, target.NodeID, 0)
+		file, err := s.resolveUseScope(ctx, *target.Scope, target.NodeID, uses)
 		if err != nil {
 			return namespaceIdentity{}, err
 		}
@@ -80,8 +86,12 @@ func (s *Store) directoryMetadataTarget(ctx context.Context, tx *sql.Tx, target 
 	if identity.Detached {
 		return namespaceIdentity{}, syscall.ESTALE
 	}
-	if err := s.fileDomain.coordinator.CheckUse(ctx, target.NodeID, scope, 0); err != nil {
+	if err := s.fileDomain.coordinator.CheckUse(ctx, target.NodeID, scope, uses); err != nil {
 		return namespaceIdentity{}, err
 	}
 	return identity, nil
+}
+
+func (s *Store) directoryMetadataTarget(ctx context.Context, tx *sql.Tx, target storage.DirectoryTarget) (namespaceIdentity, error) {
+	return s.directoryIdentityTarget(ctx, tx, target, 0)
 }

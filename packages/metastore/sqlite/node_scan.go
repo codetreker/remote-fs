@@ -76,7 +76,7 @@ func (s *nodeHeader) node() (metastore.Node, error) {
 		return metastore.Node{}, fmt.Errorf("stored node metadata exceeds its bound: %w", syscall.EFBIG)
 	}
 	kind := storage.NodeKind(s.kind)
-	if kind == storage.NodeDirectory && (s.size != 0 || s.contentBytes != 0 || !validDirectoryRevision(s.directoryRevision)) ||
+	if kind == storage.NodeDirectory && (s.size != 0 || s.contentBytes != 0 || len(s.directoryRevision) == 0) ||
 		kind != storage.NodeDirectory && len(s.directoryRevision) != 0 ||
 		kind == storage.NodeSymlink && (s.targetBytes == 0 || s.targetBytes != s.size || s.contentBytes != 0) ||
 		kind != storage.NodeSymlink && s.targetBytes != 0 {
@@ -144,4 +144,22 @@ func scanNode(row scanner) (metastore.Node, error) {
 		return metastore.Node{}, err
 	}
 	return node.node()
+}
+
+func (s *Store) scanNode(row scanner) (metastore.Node, error) {
+	node, err := scanNode(row)
+	if err != nil {
+		return metastore.Node{}, err
+	}
+	if err := s.validateLoadedNode(node); err != nil {
+		return metastore.Node{}, err
+	}
+	return node, nil
+}
+
+func (s *Store) validateLoadedNode(node metastore.Node) error {
+	if !s.replicaMetadata && node.Kind == storage.NodeDirectory && !validDirectoryRevision(node.DirectoryRevision) {
+		return fmt.Errorf("directory %d has an invalid name-set revision: %w", node.ID, syscall.EIO)
+	}
+	return nil
 }
