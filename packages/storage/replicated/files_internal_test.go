@@ -221,3 +221,17 @@ func TestRetainedFileUsesTheBoundedConfirmationPool(t *testing.T) {
 		t.Fatal("retained mutation bypassed confirmation admission:", err)
 	}
 }
+
+func TestCleanupConfirmationFailurePreservesItsCauseAndEIOClassification(t *testing.T) {
+	cause := errors.New("replica follower stopped before cleanup became visible")
+	err := &cleanupConfirmationFailure{cause: cause}
+	if !errors.Is(err, cause) || !errors.Is(err, syscall.EIO) || storage.ErrnoOf(err) != syscall.EIO {
+		t.Fatalf("cleanup confirmation error lost cause or classification: %v", err)
+	}
+	if err.Classification() != syscall.EIO {
+		t.Fatalf("classification=%v", err.Classification())
+	}
+	if got := err.Error(); got == "" {
+		t.Fatal("cleanup confirmation error has no diagnostic")
+	}
+}

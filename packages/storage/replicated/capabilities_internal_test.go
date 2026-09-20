@@ -47,6 +47,48 @@ type referenceCapabilityStub struct {
 	failure  error
 }
 
+type cleanupFileStub struct {
+	storage.File
+	closeErr error
+	closes   int
+}
+
+func (f *cleanupFileStub) Close(context.Context) error {
+	f.closes++
+	return f.closeErr
+}
+
+type cleanupReferenceStub struct {
+	storage.NodeReference
+	closeErr error
+	closes   int
+}
+
+func (r *cleanupReferenceStub) Close(context.Context) error {
+	r.closes++
+	return r.closeErr
+}
+
+type barrierReferenceStub struct {
+	storage.NodeReference
+	closeErr error
+	closes   int
+}
+
+func (r *barrierReferenceStub) Close(context.Context) error {
+	r.closes++
+	return r.closeErr
+}
+
+func (r *barrierReferenceStub) CloseWithBarrier(context.Context) (*httprest.MutationBarrier, error) {
+	r.closes++
+	return &httprest.MutationBarrier{Incarnation: "log"}, r.closeErr
+}
+
+func (*barrierReferenceStub) SetAttrWithBarrier(context.Context, storage.AttrChange) (storage.Attr, *httprest.MutationBarrier, error) {
+	return storage.Attr{}, &httprest.MutationBarrier{Incarnation: "log"}, nil
+}
+
 func (s *referenceCapabilityStub) CheckScopedReference() error { return s.checkErr }
 func (s *referenceCapabilityStub) Scope(context.Context) (storage.UseScope, error) {
 	return storage.UseScope{Token: "scope"}, s.failure
@@ -168,5 +210,174 @@ func TestAtomicOpenNormalizesTypedNilPartialReference(t *testing.T) {
 	result, err := session.wrapOpenResult(storage.OpenResult{File: typedNil}, failure)
 	if !errors.Is(err, failure) || result.File != nil {
 		t.Fatalf("typed-nil result=%+v error=%v", result, err)
+	}
+}
+
+func TestIdentityCapabilityChecksRejectAnAuthorityThatDoesNotAdvertiseThem(t *testing.T) {
+	session := retainedTestSession(t, &fileSessionStub{})
+	for name, check := range map[string]func() error{
+		"atomic open": session.CheckAtomicFileOpen,
+		"namespace":   session.CheckNamespaceAccess,
+		"references":  session.CheckNodeReferences,
+		"actions":     session.CheckFileActions,
+	} {
+		if err := check(); !errors.Is(err, syscall.EOPNOTSUPP) {
+			t.Fatalf("%s check=%v", name, err)
+		}
+	}
+	if _, err := session.OpenAt(t.Context(), storage.ChildName{}, storage.OpenAtOptions{}); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("atomic open dispatch=%v", err)
+	}
+	if _, err := session.LookupAt(t.Context(), storage.ChildName{}); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("namespace dispatch=%v", err)
+	}
+	if _, err := session.OpenNodeRef(t.Context(), 1, storage.NodeRefOptions{}); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("reference dispatch=%v", err)
+	}
+	if _, err := session.QueryFileAction(t.Context(), storage.FileActionID("1:00000000000000000000000000000000")); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("action dispatch=%v", err)
+	}
+}
+
+func TestAtomicOpenRetainsAReferenceWhenFailureCleanupIsUnknown(t *testing.T) {
+	session := retainedTestSession(t, nil)
+	openFailure := errors.New("open response reported failure")
+	cleanupFailure := errors.New("close response was lost")
+
+	plain := &cleanupFileStub{closeErr: cleanupFailure}
+	partial, err := session.wrapOpenResult(storage.OpenResult{
+		File: plain, Attr: storage.Attr{ID: 17}, Outcome: storage.Opened,
+	}, openFailure)
+	if partial.File == nil || partial.Attr.ID != 17 || !errors.Is(err, openFailure) || !errors.Is(err, cleanupFailure) || plain.closes != 1 {
+		t.Fatalf("partial open=%+v error=%v closes=%d", partial, err, plain.closes)
+	}
+	failed := partial.File
+	for name, call := range map[string]func() error{
+		"stat": func() error { _, err := failed.Stat(t.Context()); return err },
+		"setattr": func() error {
+			_, err := failed.SetAttr(t.Context(), storage.AttrChange{})
+			return err
+		},
+		"read":  func() error { _, err := failed.ReadAt(t.Context(), 0, 1); return err },
+		"write": func() error { _, err := failed.WriteAt(t.Context(), 0, nil); return err },
+		"truncate": func() error {
+			_, err := failed.Truncate(t.Context(), 0)
+			return err
+		},
+		"sync": func() error { return failed.Sync(t.Context()) },
+		"scope check": func() error {
+			return failed.(storage.ScopedReference).CheckScopedReference()
+		},
+		"scope": func() error {
+			_, err := failed.(storage.ScopedReference).Scope(t.Context())
+			return err
+		},
+		"state check": func() error {
+			return failed.(storage.ReferenceStateAccess).CheckReferenceState()
+		},
+		"state": func() error {
+			_, err := failed.(storage.ReferenceStateAccess).State(t.Context())
+			return err
+		},
+	} {
+		if err := call(); !errors.Is(err, openFailure) {
+			t.Fatalf("failed-open %s=%v", name, err)
+		}
+	}
+	plain.closeErr = nil
+	if err := failed.Close(t.Context()); err != nil || plain.closes != 2 {
+		t.Fatalf("cleanup retry=%v closes=%d", err, plain.closes)
+	}
+
+	barrierFile := &fileAuthorityStub{close: func(context.Context) error { return cleanupFailure }}
+	partial, err = session.wrapOpenResult(storage.OpenResult{File: barrierFile, Attr: storage.Attr{ID: 18}}, openFailure)
+	if _, ok := partial.File.(*retainedFile); !ok || !errors.Is(err, openFailure) || !errors.Is(err, cleanupFailure) {
+		t.Fatalf("barrier-capable partial open=%T error=%v", partial.File, err)
+	}
+}
+
+func TestNodeOpenRetainsAReferenceWhenFailureCleanupIsUnknown(t *testing.T) {
+	session := retainedTestSession(t, nil)
+	openFailure := errors.New("node open response reported failure")
+	cleanupFailure := errors.New("node close response was lost")
+
+	plain := &cleanupReferenceStub{closeErr: cleanupFailure}
+	result, err := session.openReference(t.Context(), func(context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
+		return storage.NodeOpenResult{Reference: plain, Attr: storage.Attr{ID: 23}, Outcome: storage.Opened}, nil, openFailure
+	})
+	if result.Reference == nil || result.Attr.ID != 23 || !errors.Is(err, openFailure) || !errors.Is(err, cleanupFailure) || plain.closes != 1 {
+		t.Fatalf("partial node open=%+v error=%v closes=%d", result, err, plain.closes)
+	}
+	failed := result.Reference
+	for name, call := range map[string]func() error{
+		"stat": func() error { _, err := failed.Stat(t.Context()); return err },
+		"setattr": func() error {
+			_, err := failed.SetAttr(t.Context(), storage.AttrChange{})
+			return err
+		},
+		"scope check": failed.CheckScopedReference,
+		"scope":       func() error { _, err := failed.Scope(t.Context()); return err },
+		"state check": failed.CheckReferenceState,
+		"state":       func() error { _, err := failed.State(t.Context()); return err },
+	} {
+		if err := call(); !errors.Is(err, openFailure) {
+			t.Fatalf("failed node-open %s=%v", name, err)
+		}
+	}
+	plain.closeErr = nil
+	if err := failed.Close(t.Context()); err != nil || plain.closes != 2 {
+		t.Fatalf("node cleanup retry=%v closes=%d", err, plain.closes)
+	}
+
+	barrierReference := &barrierReferenceStub{closeErr: cleanupFailure}
+	result, err = session.openReference(t.Context(), func(context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
+		return storage.NodeOpenResult{Reference: barrierReference, Attr: storage.Attr{ID: 24}}, nil, openFailure
+	})
+	if _, ok := result.Reference.(*nodeReference); !ok || !errors.Is(err, openFailure) || !errors.Is(err, cleanupFailure) || barrierReference.closes != 1 {
+		t.Fatalf("barrier-capable partial node open=%T error=%v closes=%d", result.Reference, err, barrierReference.closes)
+	}
+}
+
+func TestNodeOpenRejectsAReferenceWithoutReplicationBarriers(t *testing.T) {
+	session := retainedTestSession(t, nil)
+	plain := &cleanupReferenceStub{}
+	result, err := session.openReference(t.Context(), func(context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
+		return storage.NodeOpenResult{Reference: plain, Attr: storage.Attr{ID: 25}}, &httprest.MutationBarrier{Incarnation: "log"}, nil
+	})
+	if result.Reference != nil || !errors.Is(err, syscall.EIO) || plain.closes != 1 {
+		t.Fatalf("unsupported node open=%+v error=%v closes=%d", result, err, plain.closes)
+	}
+
+	cleanupFailure := errors.New("unsupported node cleanup failed")
+	plain = &cleanupReferenceStub{closeErr: cleanupFailure}
+	result, err = session.openReference(t.Context(), func(context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
+		return storage.NodeOpenResult{Reference: plain, Attr: storage.Attr{ID: 26}}, &httprest.MutationBarrier{Incarnation: "log"}, nil
+	})
+	if result.Reference == nil || result.Attr.ID != 26 || !errors.Is(err, syscall.EIO) || !errors.Is(err, cleanupFailure) || plain.closes != 1 {
+		t.Fatalf("retained unsupported node open=%+v error=%v closes=%d", result, err, plain.closes)
+	}
+	plain.closeErr = nil
+	if err := result.Reference.Close(t.Context()); err != nil || plain.closes != 2 {
+		t.Fatalf("unsupported node cleanup retry=%v closes=%d", err, plain.closes)
+	}
+}
+
+func TestAtomicOpenRejectsAFileWithoutReplicationBarriers(t *testing.T) {
+	session := retainedTestSession(t, nil)
+	plain := &cleanupFileStub{}
+	result, err := session.wrapOpenResult(storage.OpenResult{File: plain, Attr: storage.Attr{ID: 19}}, nil)
+	if result.File != nil || !errors.Is(err, syscall.EIO) || plain.closes != 1 {
+		t.Fatalf("unsupported open=%+v error=%v closes=%d", result, err, plain.closes)
+	}
+
+	cleanupFailure := errors.New("unsupported file cleanup failed")
+	plain = &cleanupFileStub{closeErr: cleanupFailure}
+	result, err = session.wrapOpenResult(storage.OpenResult{File: plain, Attr: storage.Attr{ID: 20}}, nil)
+	if result.File == nil || result.Attr.ID != 20 || !errors.Is(err, syscall.EIO) || !errors.Is(err, cleanupFailure) || plain.closes != 1 {
+		t.Fatalf("retained unsupported open=%+v error=%v closes=%d", result, err, plain.closes)
+	}
+	plain.closeErr = nil
+	if err := result.File.Close(t.Context()); err != nil || plain.closes != 2 {
+		t.Fatalf("unsupported cleanup retry=%v closes=%d", err, plain.closes)
 	}
 }
