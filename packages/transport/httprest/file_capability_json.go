@@ -10,6 +10,48 @@ func validateCapabilityArguments(req fileRequest) error {
 	switch req.Op {
 	case storage.OpFileScope:
 		return nil
+	case storage.OpFileState:
+		return nil
+	case storage.OpFileQueryAction:
+		return req.FileAction.Check()
+	case storage.OpFileQueryDeleteIntent:
+		return req.DeleteIntent.Check()
+	case storage.OpFileAcknowledgeDeleteIntent:
+		if req.Acknowledge == nil {
+			return syscall.EINVAL
+		}
+		return req.Acknowledge.storage().Check()
+	case storage.OpFileOpenAt:
+		if req.Child == nil || req.OpenAt == nil {
+			return syscall.EINVAL
+		}
+		if err := req.Child.storage().Check(); err != nil {
+			return err
+		}
+		return req.OpenAt.storage().Check()
+	case storage.OpFileOpenNodeRef:
+		if req.Node == 0 || req.NodeRef == nil {
+			return syscall.EINVAL
+		}
+		return req.NodeRef.storage().Check()
+	case storage.OpFileOpenChildRef:
+		if req.Child == nil || req.NodeRef == nil {
+			return syscall.EINVAL
+		}
+		if err := req.Child.storage().Check(); err != nil {
+			return err
+		}
+		return req.NodeRef.storage().Check()
+	case storage.OpFileLookupAt:
+		if req.Child == nil {
+			return syscall.EINVAL
+		}
+		return req.Child.storage().Check()
+	case storage.OpFileMutateName:
+		if req.Name == nil {
+			return syscall.EINVAL
+		}
+		return req.Name.storage().Check()
 	case storage.OpFileSetNodeMetadata, storage.OpFileSetMetadata:
 		if req.Op == storage.OpFileSetNodeMetadata && req.Node == 0 {
 			return syscall.EINVAL
@@ -56,6 +98,21 @@ func validateCapabilityArguments(req fileRequest) error {
 		if req.Owner == 0 || req.Domain < storage.DomainRecord || req.Domain > storage.DomainEnforced {
 			return syscall.EINVAL
 		}
+	case storage.OpFileSetPendingUnlink:
+		if req.Pending == nil {
+			return syscall.EINVAL
+		}
+		return req.Pending.storage().Check()
+	case storage.OpFileClearPendingUnlink:
+		if req.ClearPending == nil {
+			return syscall.EINVAL
+		}
+		return req.ClearPending.storage().Check()
+	case storage.OpFileMutate:
+		if req.Mutation == nil {
+			return syscall.EINVAL
+		}
+		return req.Mutation.storage().Check()
 	}
 	return nil
 }

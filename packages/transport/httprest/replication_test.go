@@ -180,6 +180,7 @@ func (l *fakeLog) Since(ctx context.Context, after metastore.Position, limit int
 		}
 		var content metastore.Key
 		var metadata []byte
+		var target []byte
 		if meta.Node != nil {
 			node := *meta.Node
 			content = node.Content
@@ -189,11 +190,13 @@ func (l *fakeLog) Since(ctx context.Context, after metastore.Position, limit int
 				return metastore.Retention{}, err
 			}
 			node.Metadata = nil
+			target = node.LinkTarget
+			node.LinkTarget = nil
 			node.Content = ""
 			meta.Node = &node
 		}
 		reservation, fits, err := result.Reserve(meta, metastore.ChangePayloadLengths{
-			Name: int64(len(name)), FromName: int64(len(fromName)), Content: int64(len(content)), Metadata: int64(len(metadata)),
+			Name: int64(len(name)), FromName: int64(len(fromName)), Content: int64(len(content)), Metadata: int64(len(metadata)), Target: int64(len(target)),
 		})
 		if err != nil {
 			return metastore.Retention{}, err
@@ -201,7 +204,7 @@ func (l *fakeLog) Since(ctx context.Context, after metastore.Position, limit int
 		if !fits {
 			return retention, nil
 		}
-		if err := reservation.Commit(name, fromName, content, metadata); err != nil {
+		if err := reservation.Commit(name, fromName, content, metadata, target); err != nil {
 			return metastore.Retention{}, err
 		}
 	}
@@ -288,12 +291,13 @@ func (s *fakeSnap) Next(ctx context.Context, limit int, result *metastore.RowRes
 	}
 	for _, row := range rows {
 		meta := row
-		name, content := meta.Name, meta.Node.Content
+		name, content, target := meta.Name, meta.Node.Content, meta.Node.LinkTarget
 		metadata, err := storage.EncodeMetadata(meta.Node.Metadata)
 		if err != nil {
 			return false, result.Fail(err)
 		}
 		meta.Node.Metadata = nil
+		meta.Node.LinkTarget = nil
 		if name == nil {
 			meta.Name = nil
 		} else {
@@ -301,7 +305,7 @@ func (s *fakeSnap) Next(ctx context.Context, limit int, result *metastore.RowRes
 		}
 		meta.Node.Content = ""
 		reservation, fits, err := result.Reserve(meta, metastore.RowPayloadLengths{
-			Name: int64(len(name)), Content: int64(len(content)), Metadata: int64(len(metadata)),
+			Name: int64(len(name)), Content: int64(len(content)), Metadata: int64(len(metadata)), Target: int64(len(target)),
 		})
 		if err != nil {
 			return false, err
@@ -309,7 +313,7 @@ func (s *fakeSnap) Next(ctx context.Context, limit int, result *metastore.RowRes
 		if !fits {
 			return false, result.Fail(errors.New("the fake snapshot page exceeded its result bound"))
 		}
-		if err := reservation.Commit(name, content, metadata); err != nil {
+		if err := reservation.Commit(name, content, metadata, target); err != nil {
 			return false, err
 		}
 	}

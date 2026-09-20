@@ -17,7 +17,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -52,9 +51,15 @@ type servedFileSession struct {
 }
 
 type servedFile struct {
-	native  storage.File
+	native  retainedReference
 	pending time.Time
 	closing bool
+}
+
+type retainedReference interface {
+	Stat(context.Context) (storage.Attr, error)
+	SetAttr(context.Context, storage.AttrChange) (storage.Attr, error)
+	Close(context.Context) error
 }
 
 type servedFileAction struct {
@@ -294,6 +299,12 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 		writeError(syscall.EFBIG)
 		return
 	}
+	if req.Mutation != nil {
+		if err := req.Mutation.storage().CheckDataLimit(h.maxWriteBytes); err != nil {
+			writeError(err)
+			return
+		}
+	}
 	if req.Op == storage.OpFileWrite && int64(len(req.Data)) > h.maxWriteBytes {
 		writeError(syscall.EFBIG)
 		return
@@ -320,11 +331,7 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 	if present || fileMutation(req.Op) {
 		r = r.WithContext(locking.WithScope(r.Context(), scope))
 	}
-	access := authz.AccessRequest{Operation: req.Op}
-	if req.Op == storage.OpFileOpen || req.Op == storage.OpFileOpenNode {
-		access.Open = req.Open.OpenAccess
-	}
-	if err := h.authorize(r.Context(), access); err != nil {
+	if err := h.authorizeFile(r.Context(), req); err != nil {
 		writeError(err)
 		return
 	}
@@ -338,10 +345,47 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 			h.writeFileResponse(w, StatusStorageError, ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error(), CapabilityCode: capabilityErrorCode(err), Attempt: response.Attempt}, control)
 			return
 		}
+		var recorded *recordedFileError
+		if errors.As(err, &recorded) {
+			body := fileErrorResponse(err, true)
+			body.FileResult = partialFileResult(req, response)
+			h.writeFileResponse(w, StatusStorageError, body, control)
+			return
+		}
+		if result := partialFileResult(req, response); result != nil {
+			body := fileErrorResponse(err, false)
+			body.FileResult = result
+			h.writeFileResponse(w, StatusStorageError, body, control)
+			return
+		}
 		writeError(err)
 		return
 	}
 	h.writeFileResponse(w, http.StatusOK, response, control)
+}
+
+func partialFileResult(request fileRequest, response fileResponse) *fileResponse {
+	include := false
+	switch request.Op {
+	case storage.OpFileQueryAction:
+		include = response.ActionReceipt != nil
+	case storage.OpFileQueryDeleteIntent:
+		include = response.DeleteStatus != nil
+	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
+		include = response.File != "" || response.Attr != nil || response.Outcome != 0 || response.Barrier != nil
+	case storage.OpFileMutateName, storage.OpFileMutate:
+		include = response.Attr != nil || response.Barrier != nil
+	case storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
+		include = response.State != nil || response.Barrier != nil
+	}
+	if !include {
+		return nil
+	}
+	copy := response
+	if copy.Data == nil {
+		copy.Data = []byte{}
+	}
+	return &copy
 }
 
 func fileErrorResponse(err error, retained bool) ErrorResponse {
@@ -375,6 +419,8 @@ func validateFileArguments(req fileRequest, maximum storage.FileSessionOptions) 
 		return err
 	case storage.OpFileOpenNode:
 		return req.Open.CheckNode(req.Node)
+	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef, storage.OpFileLookupAt, storage.OpFileMutateName:
+		return validateCapabilityArguments(req)
 	case storage.OpFileRead:
 		if req.Offset < 0 || req.Length < 0 {
 			return syscall.EINVAL
@@ -544,7 +590,7 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		s.mu.Lock()
 		s.retired = true
 		s.mu.Unlock()
-		return response, s.native.Close(ctx)
+		err = s.native.Close(ctx)
 	case storage.OpFileStatNode:
 		attr, err := s.native.StatNode(ctx, req.Node)
 		wire := AttrOf(attr)
@@ -558,37 +604,10 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		err = e
 		wire := AttrOf(attr)
 		response.Attr = wire
-	case storage.OpFileSetNodeMetadata, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop:
+	case storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileAcknowledgeDeleteIntent, storage.OpFileLookupAt, storage.OpFileMutateName, storage.OpFileSetNodeMetadata, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop:
 		response, err = h.performSessionCapability(ctx, s.native, req)
-	case storage.OpFileOpen, storage.OpFileOpenNode:
-		s.mu.Lock()
-		if len(s.files) >= s.options.MaxFiles {
-			s.mu.Unlock()
-			return response, syscall.EAGAIN
-		}
-		cap := fileCapability()
-		entry := &servedFile{closing: true}
-		s.files[cap] = entry
-		s.mu.Unlock()
-		var file storage.File
-		if req.Op == storage.OpFileOpen {
-			file, err = s.native.OpenFile(ctx, string(req.Path), req.Open)
-		} else {
-			file, err = s.native.OpenNode(ctx, req.Node, req.Open)
-		}
-		s.mu.Lock()
-		if err != nil {
-			delete(s.files, cap)
-		} else {
-			entry.native = file
-			entry.closing = false
-			entry.pending = time.Now().Add(min(h.files.limits.PendingAck, s.options.Lease))
-		}
-		s.mu.Unlock()
-		if err == nil {
-			response.File = cap
-			response.Capabilities, err = referenceCapabilitiesOf(file)
-		}
+	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
+		return h.openReference(ctx, s, req)
 	case storage.OpFileAck:
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -625,22 +644,38 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		case storage.OpFileStat:
 			attr, err = file.native.Stat(ctx)
 		case storage.OpFileRead:
-			value, e := file.native.ReadAt(ctx, req.Offset, req.Length)
+			data, ok := file.native.(storage.File)
+			if !ok {
+				return response, syscall.EBADF
+			}
+			value, e := data.ReadAt(ctx, req.Offset, req.Length)
 			err = e
 			attr = value.Attr
 			response.Data = value.Data
 		case storage.OpFileWrite:
-			attr, err = file.native.WriteAt(ctx, req.Offset, req.Data)
+			data, ok := file.native.(storage.File)
+			if !ok {
+				return response, syscall.EBADF
+			}
+			attr, err = data.WriteAt(ctx, req.Offset, req.Data)
 		case storage.OpFileTruncate:
-			attr, err = file.native.Truncate(ctx, req.Offset)
+			data, ok := file.native.(storage.File)
+			if !ok {
+				return response, syscall.EBADF
+			}
+			attr, err = data.Truncate(ctx, req.Offset)
 		case storage.OpFileSetAttr:
 			if req.Change == nil {
 				return response, syscall.EINVAL
 			}
 			attr, err = file.native.SetAttr(ctx, req.Change.Storage())
 		case storage.OpFileSync:
-			err = file.native.Sync(ctx)
-		case storage.OpFileScope, storage.OpFileSetMetadata:
+			data, ok := file.native.(storage.File)
+			if !ok {
+				return response, syscall.EBADF
+			}
+			err = data.Sync(ctx)
+		case storage.OpFileState, storage.OpFileScope, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink, storage.OpFileMutate:
 			response, err = performReferenceCapability(ctx, file.native, req)
 		case storage.OpFileClose:
 			err = file.native.Close(ctx)
@@ -659,6 +694,10 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		}
 	}
 	if err != nil {
+		if fileMutation(req.Op) && (response.Attr != nil || response.State != nil) {
+			updated, barrierErr := h.finishFileMutation(ctx, response)
+			return updated, errors.Join(err, barrierErr)
+		}
 		return response, err
 	}
 	if fileMutation(req.Op) {

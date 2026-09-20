@@ -60,6 +60,12 @@ func validateFileRequest(r fileRequest) error {
 	case storage.OpFileSessionOpen:
 		expected.Options = r.Options
 	case storage.OpFileStatus, storage.OpFileRenew, storage.OpFileSessionClose:
+	case storage.OpFileQueryAction:
+		expected.FileAction = r.FileAction
+	case storage.OpFileQueryDeleteIntent:
+		expected.DeleteIntent = r.DeleteIntent
+	case storage.OpFileAcknowledgeDeleteIntent:
+		expected.Acknowledge = r.Acknowledge
 	case storage.OpFileOpen:
 		expected.Path = r.Path
 		expected.Open = r.Open
@@ -71,7 +77,7 @@ func validateFileRequest(r fileRequest) error {
 	case storage.OpFileSetNodeAttr:
 		expected.Node = r.Node
 		expected.Change = r.Change
-	case storage.OpFileStat, storage.OpFileSync, storage.OpFileClose, storage.OpFileAck, storage.OpFileScope:
+	case storage.OpFileStat, storage.OpFileSync, storage.OpFileClose, storage.OpFileAck, storage.OpFileState, storage.OpFileScope:
 		reference = true
 	case storage.OpFileRead:
 		reference = true
@@ -87,6 +93,19 @@ func validateFileRequest(r fileRequest) error {
 	case storage.OpFileSetAttr:
 		reference = true
 		expected.Change = r.Change
+	case storage.OpFileOpenAt:
+		expected.Child = r.Child
+		expected.OpenAt = r.OpenAt
+	case storage.OpFileOpenNodeRef:
+		expected.Node = r.Node
+		expected.NodeRef = r.NodeRef
+	case storage.OpFileOpenChildRef:
+		expected.Child = r.Child
+		expected.NodeRef = r.NodeRef
+	case storage.OpFileLookupAt:
+		expected.Child = r.Child
+	case storage.OpFileMutateName:
+		expected.Name = r.Name
 	case storage.OpFileSetNodeMetadata:
 		expected.Node = r.Node
 		expected.Namespace = r.Namespace
@@ -116,6 +135,15 @@ func validateFileRequest(r fileRequest) error {
 	case storage.OpFileRangeDrop:
 		expected.Owner = r.Owner
 		expected.Domain = r.Domain
+	case storage.OpFileSetPendingUnlink:
+		reference = true
+		expected.Pending = r.Pending
+	case storage.OpFileClearPendingUnlink:
+		reference = true
+		expected.ClearPending = r.ClearPending
+	case storage.OpFileMutate:
+		reference = true
+		expected.Mutation = r.Mutation
 	default:
 		return errors.New("unknown retained file operation")
 	}
@@ -131,11 +159,51 @@ func validateFileRequest(r fileRequest) error {
 	if !reflect.DeepEqual(r, expected) {
 		return errors.New("file operation carries unrelated operands")
 	}
-	if (r.Op == storage.OpFileSetAttr || r.Op == storage.OpFileSetNodeAttr) && r.Change == nil {
-		return errors.New("attribute operation carries no change")
-	}
-	if r.Op == storage.OpFileNewUseOwner && r.Scope == nil {
-		return errors.New("owner enrollment carries no reference scope")
+	switch r.Op {
+	case storage.OpFileSetAttr, storage.OpFileSetNodeAttr:
+		if r.Change == nil {
+			return errors.New("attribute operation carries no change")
+		}
+	case storage.OpFileOpenAt:
+		if r.Child == nil || r.OpenAt == nil {
+			return errors.New("atomic open carries no target or options")
+		}
+	case storage.OpFileOpenNodeRef:
+		if r.NodeRef == nil {
+			return errors.New("reference open carries no options")
+		}
+	case storage.OpFileOpenChildRef:
+		if r.Child == nil || r.NodeRef == nil {
+			return errors.New("reference open carries no target or options")
+		}
+	case storage.OpFileLookupAt:
+		if r.Child == nil {
+			return errors.New("lookup carries no child")
+		}
+	case storage.OpFileMutateName:
+		if r.Name == nil {
+			return errors.New("name operation carries no command")
+		}
+	case storage.OpFileNewUseOwner:
+		if r.Scope == nil {
+			return errors.New("owner enrollment carries no reference scope")
+		}
+	case storage.OpFileSetPendingUnlink:
+		if r.Pending == nil {
+			return errors.New("pending unlink carries no command")
+		}
+	case storage.OpFileClearPendingUnlink:
+		if r.ClearPending == nil {
+			return errors.New("pending unlink clear carries no command")
+		}
+	case storage.OpFileMutate:
+		if r.Mutation == nil {
+			return errors.New("conditional mutation carries no command")
+		}
+	case storage.OpFileAcknowledgeDeleteIntent:
+		if r.Acknowledge == nil {
+			return errors.New("delete intent acknowledgement carries no command")
+		}
 	}
 	return nil
 }
@@ -158,33 +226,51 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			expected.Capabilities = r.Capabilities
 		case storage.OpFileStatus, storage.OpFileRenew:
 			expected.Status = r.Status
+		case storage.OpFileQueryAction:
+			expected.ActionReceipt = r.ActionReceipt
+		case storage.OpFileQueryDeleteIntent:
+			expected.DeleteStatus = r.DeleteStatus
 		case storage.OpFileOpen, storage.OpFileOpenNode:
 			expected.Node = r.Node
 			expected.File = r.File
 			expected.Barrier = r.Barrier
 			expected.Capabilities = r.Capabilities
-		case storage.OpFileStat, storage.OpFileStatNode:
+		case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
+			expected.File = r.File
+			expected.Barrier = r.Barrier
+			expected.Attr = r.Attr
+			expected.Outcome = r.Outcome
+			expected.Capabilities = r.Capabilities
+		case storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt:
 			expected.Attr = r.Attr
 		case storage.OpFileRead:
 			expected.Attr = r.Attr
 			expected.Data = r.Data
-		case storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetNodeAttr:
+		case storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetNodeAttr, storage.OpFileMutate:
+			expected.Attr = r.Attr
+			expected.Barrier = r.Barrier
+		case storage.OpFileMutateName:
 			expected.Attr = r.Attr
 			expected.Barrier = r.Barrier
 		case storage.OpFileSync, storage.OpFileClose, storage.OpFileSessionClose:
 			expected.Barrier = r.Barrier
 		case storage.OpFileScope:
 			expected.Scope = r.Scope
+		case storage.OpFileState:
+			expected.State = r.State
 		case storage.OpFileNewUseOwner:
 			expected.Owner = r.Owner
 		case storage.OpFileSetNodeMetadata, storage.OpFileSetMetadata:
 			expected.Metadata = r.Metadata
 			expected.Barrier = r.Barrier
+		case storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
+			expected.State = r.State
+			expected.Barrier = r.Barrier
 		case storage.OpFileRangeGetConflict:
 			expected.Conflict = r.Conflict
 		case storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel:
 			expected.Attempt = r.Attempt
-		case storage.OpFileAck, storage.OpFileRetireUseOwner, storage.OpFileRangeDrop:
+		case storage.OpFileAck, storage.OpFileAcknowledgeDeleteIntent, storage.OpFileRetireUseOwner, storage.OpFileRangeDrop:
 		default:
 			return errors.New("unknown file response variant")
 		}
@@ -204,13 +290,36 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if r.Status == nil {
 			return errors.New("file response carries no status")
 		}
+	case storage.OpFileQueryAction:
+		if r.ActionReceipt == nil || r.ActionReceipt.Check() != nil || r.ActionReceipt.Action != req.FileAction {
+			return errors.New("file action query returned an invalid receipt")
+		}
+	case storage.OpFileQueryDeleteIntent:
+		if r.DeleteStatus == nil || r.DeleteStatus.ID != req.DeleteIntent {
+			return errors.New("delete intent query returned an invalid status")
+		}
+		if _, err := r.DeleteStatus.storage(); err != nil {
+			return err
+		}
 	case storage.OpFileOpen, storage.OpFileOpenNode:
 		if !validFileCapability(r.File) || r.Capabilities == nil {
 			return errors.New("file open response carries no reference capability")
 		}
-	case storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetNodeAttr:
+	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
+		if !validFileCapability(r.File) || r.Attr == nil || r.Capabilities == nil || r.Outcome < storage.Opened || r.Outcome > storage.Replaced {
+			return errors.New("atomic open response is incomplete")
+		}
+	case storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetNodeAttr, storage.OpFileMutate:
 		if r.Attr == nil {
 			return errors.New("file response carries no attributes")
+		}
+	case storage.OpFileMutateName:
+		if req.Name == nil || nameResultNeedsAttr(req.Name.Kind) && r.Attr == nil {
+			return errors.New("name response carries no required attributes")
+		}
+	case storage.OpFileState, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
+		if r.State == nil || r.State.Attr == nil {
+			return errors.New("reference state is incomplete")
 		}
 	case storage.OpFileScope:
 		if r.Scope == nil {
@@ -249,8 +358,22 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if err := r.Attr.check(); err != nil {
 			return err
 		}
-		if req.Op != storage.OpFileStatNode && req.Op != storage.OpFileSetNodeAttr && r.Attr.Kind != storage.NodeRegular {
+		if req.Op != storage.OpFileStatNode && req.Op != storage.OpFileSetNodeAttr && req.Op != storage.OpFileLookupAt && req.Op != storage.OpFileMutateName && req.Op != storage.OpFileOpenNodeRef && req.Op != storage.OpFileOpenChildRef && r.Attr.Kind != storage.NodeRegular {
 			return errors.New("file reference returned nonregular attributes")
+		}
+	}
+	if r.State != nil {
+		if err := r.State.Attr.check(); err != nil {
+			return err
+		}
+		if r.State.Detached && r.State.PendingUnlink {
+			return errors.New("detached reference cannot remain pending unlink")
+		}
+		if r.State.PendingUnlink != (len(r.State.PendingGeneration) != 0) || len(r.State.PendingGeneration) > storage.MaxObservationTokenBytes {
+			return errors.New("reference state carries inconsistent pending generation")
+		}
+		if r.State.Attr.Kind != storage.NodeSymlink && len(r.State.LinkTarget) != 0 || len(r.State.LinkTarget) > storage.MaxLinkTargetBytes {
+			return errors.New("reference state carries an invalid link target")
 		}
 	}
 	if r.Metadata != nil {
@@ -267,6 +390,67 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if err := validateFileAttempt(req, *r.Attempt); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validatePartialFileResponse(req fileRequest, response fileResponse) error {
+	if response.Epoch == 0 || response.Retry || response.Session != "" || response.Status != nil || len(response.Data) != 0 || response.Conflict != nil || response.Attempt != nil || response.Scope != nil || response.Owner != 0 || response.Metadata != nil {
+		return errors.New("partial file result carries unrelated fields")
+	}
+	expected := fileResponse{Epoch: response.Epoch, Data: []byte{}}
+	switch req.Op {
+	case storage.OpFileQueryAction:
+		expected.ActionReceipt = response.ActionReceipt
+		if response.ActionReceipt == nil || response.ActionReceipt.Check() != nil || response.ActionReceipt.Action != req.FileAction {
+			return errors.New("partial file action receipt is invalid")
+		}
+	case storage.OpFileQueryDeleteIntent:
+		expected.DeleteStatus = response.DeleteStatus
+		if response.DeleteStatus == nil || response.DeleteStatus.ID != req.DeleteIntent {
+			return errors.New("partial delete intent status is invalid")
+		}
+		if _, err := response.DeleteStatus.storage(); err != nil {
+			return err
+		}
+	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
+		expected.File = response.File
+		expected.Attr = response.Attr
+		expected.Outcome = response.Outcome
+		expected.Capabilities = response.Capabilities
+		expected.Barrier = response.Barrier
+		if response.File != "" && (!validFileCapability(response.File) || response.Capabilities == nil) {
+			return errors.New("partial open result carries an invalid reference")
+		}
+		if response.Attr != nil {
+			if err := response.Attr.check(); err != nil {
+				return err
+			}
+		}
+		if response.Outcome != 0 && (response.Outcome < storage.Opened || response.Outcome > storage.Replaced) {
+			return errors.New("partial open result carries an invalid outcome")
+		}
+	case storage.OpFileMutateName, storage.OpFileMutate:
+		expected.Attr = response.Attr
+		expected.Barrier = response.Barrier
+		if response.Attr != nil {
+			if err := response.Attr.check(); err != nil {
+				return err
+			}
+		}
+	case storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
+		expected.State = response.State
+		expected.Barrier = response.Barrier
+		if response.State != nil && response.State.Attr != nil {
+			if err := response.State.Attr.check(); err != nil {
+				return err
+			}
+		}
+	default:
+		return errors.New("operation cannot return a partial file result")
+	}
+	if !reflect.DeepEqual(response, expected) {
+		return errors.New("partial file result carries unrelated fields")
 	}
 	return nil
 }

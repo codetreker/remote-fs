@@ -823,6 +823,7 @@ func (r *MutationResponse) UnmarshalJSON(data []byte) error {
 type ErrorResponse struct {
 	CapabilityCode string                `json:"capabilityCode,omitempty"`
 	FileRecorded   *bool                 `json:"fileRecorded,omitempty"`
+	FileResult     *fileResponse         `json:"fileResult,omitempty"`
 	Attempt        *storage.RangeAttempt `json:"attempt,omitempty"`
 	Errno          string                `json:"errno,omitempty"`
 	Message        string                `json:"message,omitempty"`

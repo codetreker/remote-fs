@@ -530,7 +530,7 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 			t.Fatal(err)
 		}
 		meta := change
-		name, fromName, content := meta.Name, meta.From.Name, meta.Node.Content
+		name, fromName, content, target := meta.Name, meta.From.Name, meta.Node.Content, meta.Node.LinkTarget
 		metadata, err := storage.EncodeMetadata(meta.Node.Metadata)
 		if err != nil {
 			t.Fatal(err)
@@ -539,9 +539,10 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 		from, node := *meta.From, *meta.Node
 		from.Name, node.Content = []byte{}, ""
 		node.Metadata = nil
+		node.LinkTarget = nil
 		meta.From, meta.Node = &from, &node
 		reservation, fits, reserveErr := result.Reserve(meta, metastore.ChangePayloadLengths{
-			Name: int64(len(name)), FromName: int64(len(fromName)), Content: int64(len(content)), Metadata: int64(len(metadata)),
+			Name: int64(len(name)), FromName: int64(len(fromName)), Content: int64(len(content)), Metadata: int64(len(metadata)), Target: int64(len(target)),
 		})
 		if delta == -1 {
 			if !errors.Is(reserveErr, syscall.EFBIG) || fits || reservation != nil {
@@ -552,7 +553,7 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 		if reserveErr != nil || !fits {
 			t.Fatalf("change under exact bound: fits=%v err=%v", fits, reserveErr)
 		}
-		if err := reservation.Commit(name, fromName, content, metadata); err != nil {
+		if err := reservation.Commit(name, fromName, content, metadata, target); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -578,12 +579,13 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 		var reserveErr error
 		pageFull := false
 		for _, row := range rows {
-			meta, name, content := row, row.Name, row.Node.Content
+			meta, name, content, target := row, row.Name, row.Node.Content, row.Node.LinkTarget
 			metadata, err := storage.EncodeMetadata(meta.Node.Metadata)
 			if err != nil {
 				t.Fatal(err)
 			}
 			meta.Node.Metadata = nil
+			meta.Node.LinkTarget = nil
 			if name == nil {
 				meta.Name = nil
 			} else {
@@ -591,14 +593,14 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 			}
 			meta.Node.Content = ""
 			reservation, fits, err := result.Reserve(meta, metastore.RowPayloadLengths{
-				Name: int64(len(name)), Content: int64(len(content)), Metadata: int64(len(metadata)),
+				Name: int64(len(name)), Content: int64(len(content)), Metadata: int64(len(metadata)), Target: int64(len(target)),
 			})
 			if err != nil || !fits {
 				reserveErr = err
 				pageFull = !fits && err == nil
 				break
 			}
-			reserveErr = reservation.Commit(name, content, metadata)
+			reserveErr = reservation.Commit(name, content, metadata, target)
 			if reserveErr != nil {
 				break
 			}

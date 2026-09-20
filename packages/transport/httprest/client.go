@@ -420,7 +420,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 	if content != nil {
 		httpReq.Header.Set("Content-Type", req.ContentType())
 	}
-	if isVolumeMutation(req.Op) || req.Op == OpFile && fileScopeEnabled(ctx) {
+	if isVolumeMutation(req.Op) || (req.Op == OpFile || req.Op == OpFileControl) && fileScopeEnabled(ctx) {
 		scope := locking.ScopeFromContext(ctx)
 		if !locking.HasScope(ctx) && s.scope != nil {
 			scope = *s.scope
@@ -512,8 +512,12 @@ func (s *Storage) storageError(req Request, body []byte) error {
 	_, hasRecorded := members["recorded"]
 	_, hasCapability := members["capabilityCode"]
 	_, hasFileRecorded := members["fileRecorded"]
+	_, hasFileResult := members["fileResult"]
 	if hasCode != hasRecorded || hasCapability && hasCode {
 		return unreachable(req, errors.New("response combines unrelated error families"))
+	}
+	if hasFileResult && (resp.FileResult == nil || req.Op != OpFile && req.Op != OpFileControl) {
+		return unreachable(req, errors.New("invalid partial file result"))
 	}
 	if hasCode && !hasFileRecorded {
 		failure, err := decodeVolumeLockFailure(body)
@@ -545,7 +549,7 @@ func (s *Storage) storageError(req Request, body []byte) error {
 			return unreachable(req, errors.New("invalid recorded file outcome"))
 		}
 	}
-	return &operationError{req: req, errno: errno, detail: resp.Message, capability: capability, recorded: hasFileRecorded, attempt: resp.Attempt}
+	return &operationError{req: req, errno: errno, detail: resp.Message, capability: capability, recorded: hasFileRecorded, attempt: resp.Attempt, fileResult: resp.FileResult}
 }
 
 // readWhole returns the entire response body without retaining more than limit bytes, and
@@ -605,6 +609,7 @@ type operationError struct {
 	capability error
 	recorded   bool
 	attempt    *storage.RangeAttempt
+	fileResult *fileResponse
 }
 
 func (e *operationError) Error() string {

@@ -14,7 +14,10 @@ import (
 func fileAttrResult(op storage.Operation) bool {
 	switch op {
 	case storage.OpFileStat, storage.OpFileStatNode, storage.OpFileSetNodeAttr,
-		storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr:
+		storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr,
+		storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef,
+		storage.OpFileLookupAt, storage.OpFileMutateName, storage.OpFileState,
+		storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink, storage.OpFileMutate:
 		return true
 	}
 	return false
@@ -26,9 +29,16 @@ func fileBoundedResult(op storage.Operation) bool {
 
 func fileResponseLimit(req fileRequest, maximum int64) int64 {
 	if fileBoundedResult(req.Op) {
-		return min(req.ResultBytes, maximum)
+		return min(req.ResultBytes, fileOperationLimit(req.Op, maximum))
 	}
 	if fileControl(req.Op) {
+		return min(maximum, MaxFileControlBytes)
+	}
+	return maximum
+}
+
+func fileOperationLimit(operation storage.Operation, maximum int64) int64 {
+	if fileControl(operation) {
 		return min(maximum, MaxFileControlBytes)
 	}
 	return maximum
@@ -49,10 +59,27 @@ func metadataResponseBound(payloadBytes int, barrier bool, maxIncarnationBytes i
 }
 
 func (h *Handler) attrResultBudget(req fileRequest) storage.AttrResultBudget {
-	limit := min(req.ResultBytes, h.maxBodyBytes)
+	limit := min(req.ResultBytes, fileOperationLimit(req.Op, h.maxBodyBytes))
 	return func(attr storage.Attr, metadataBytes int64) error {
-		response := fileResponse{Epoch: math.MaxUint64, Data: []byte{}, Attr: AttrOf(attr)}
+		response := fileResponse{Epoch: math.MaxUint64, Data: []byte{}}
 		extra := int64(0)
+		switch req.Op {
+		case storage.OpFileState, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
+			response.State = &referenceState{Attr: AttrOf(attr), PendingGeneration: make([]byte, storage.MaxObservationTokenBytes)}
+			if attr.Kind == storage.NodeSymlink {
+				if attr.Size < 0 || attr.Size > storage.MaxLinkTargetBytes {
+					return syscall.EFBIG
+				}
+				extra = int64(len(`,"linkTarget":""`)) + int64(base64.StdEncoding.EncodedLen(int(attr.Size)))
+			}
+		default:
+			response.Attr = AttrOf(attr)
+		}
+		if req.Op == storage.OpFileOpenAt || req.Op == storage.OpFileOpenNodeRef || req.Op == storage.OpFileOpenChildRef {
+			response.File = strings.Repeat("f", 64)
+			response.Outcome = storage.Replaced
+			response.Capabilities = &fileCapabilities{}
+		}
 		if req.Op == storage.OpFileRead {
 			length := min(int64(req.Length), max(int64(0), attr.Size-req.Offset))
 			if length < 0 || length > limit {
