@@ -18,16 +18,23 @@ type AtomicFileOpener interface {
 
 // NamespaceAccess addresses exact byte names beneath directory identities. A
 // present Scope must validate the exact live parent reference; implementations
-// must not fall back to the bare NodeID when it is invalid. ReadDirNode requires
-// ReadEntries and returns one complete authoritative capture. Its bounded form
-// reserves names and metadata before loading them and invalidates the collector
-// on any failure; a partial directory is never a successful result.
+// must not fall back to the bare NodeID when it is invalid.
 type NamespaceAccess interface {
 	CheckNamespaceAccess() error
 	LookupAt(context.Context, ChildName) (Attr, error)
+	MutateName(context.Context, NameCommand) (NameResult, error)
+}
+
+// DirectoryReader is the optional identity-addressed directory enumeration
+// capability. ReadDirNode requires ReadEntries and returns one complete
+// authoritative capture. Its bounded form reserves names and metadata before
+// loading them and invalidates the collector on any failure; a partial directory
+// is never a successful result. CheckDirectoryRead verifies this complete chain
+// independently of NamespaceAccess so either capability can be offered alone.
+type DirectoryReader interface {
+	CheckDirectoryRead() error
 	ReadDirNode(context.Context, DirectoryTarget) (ObservedDirectory, error)
 	ReadDirNodeBounded(context.Context, DirectoryTarget, *ListResult) (DirectoryObservation, error)
-	MutateName(context.Context, NameCommand) (NameResult, error)
 }
 
 // NodeReference retains a node identity without granting file byte methods. It
