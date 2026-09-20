@@ -295,6 +295,28 @@ func TestReplicaPreservesNonemptyOpaqueDirectoryRevisions(t *testing.T) {
 	}
 }
 
+func TestReplicaRejectsNamespaceChangeBelowNondirectoryParent(t *testing.T) {
+	replica := seededAdmissionReplica(t)
+	before := replica.Position()
+	candidate := metastore.Node{ID: 12, Kind: storage.NodeRegular}
+	applied, err := replica.Apply(t.Context(), metastore.Change{
+		Position: before + 1, Kind: metastore.Created, Parent: 11, Name: []byte("child"), Node: &candidate,
+	})
+	if applied || !errors.Is(err, syscall.EIO) || replica.Position() != before {
+		t.Fatalf("malformed parent apply=%t error=%v position=%d want=%d", applied, err, replica.Position(), before)
+	}
+	var nodes, entries int
+	if err := replica.store.read.QueryRowContext(t.Context(), `SELECT
+		(SELECT count(*) FROM nodes WHERE volume=? AND id=?),
+		(SELECT count(*) FROM entries WHERE volume=? AND parent=? AND name=?)`,
+		replica.store.volume, candidate.ID, replica.store.volume, 11, []byte("child")).Scan(&nodes, &entries); err != nil {
+		t.Fatal(err)
+	}
+	if nodes != 0 || entries != 0 {
+		t.Fatalf("malformed parent left nodes=%d entries=%d", nodes, entries)
+	}
+}
+
 func seedAdmissionReplica(t *testing.T, checkClose func(error)) *Replica {
 	t.Helper()
 	replica, err := OpenReplica(t.Context(), filepath.Join(t.TempDir(), "replica.db"))

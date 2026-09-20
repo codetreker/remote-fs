@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlvalue"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func initialDirectoryRevision() []byte {
@@ -67,9 +68,17 @@ func (s *Store) advanceDirectoryRevision(ctx context.Context, tx *sql.Tx, id int
 // replaced with a bounded digest of the prior token and applied change identity;
 // a following revision-bearing source event restores its exact token.
 func (s *Store) advanceReplicaDirectoryRevision(ctx context.Context, tx *sql.Tx, id, position int64) error {
+	var kind, detached int64
 	var token []byte
-	if err := tx.QueryRowContext(ctx, `SELECT directory_revision FROM nodes WHERE volume=? AND id=?`, s.volume, id).Scan(&token); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT
+		CASE WHEN typeof(kind)='integer' THEN kind ELSE 0 END,
+		CASE WHEN typeof(detached)='integer' THEN detached ELSE -1 END,
+		CASE WHEN typeof(directory_revision)='blob' AND length(directory_revision) BETWEEN 1 AND 64 THEN directory_revision END
+		FROM nodes WHERE volume=? AND id=?`, s.volume, id).Scan(&kind, &detached, &token); err != nil {
 		return err
+	}
+	if kind != int64(storage.NodeDirectory) || detached != 0 || len(token) == 0 {
+		return fmt.Errorf("replica namespace parent %d is not a live directory: %w", id, syscall.EIO)
 	}
 	var next []byte
 	if validDirectoryRevision(token) && binary.BigEndian.Uint64(token) < math.MaxInt64 {

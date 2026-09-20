@@ -127,3 +127,33 @@ func TestDirectoryRevisionMigrationRefusesCorruptHistoryBeforeRebuild(t *testing
 		t.Fatalf("refused migration changed durable state: version=%d revision-columns=%d nodes=%d incarnation=%q", version, revisionColumns, nodes, afterIncarnation)
 	}
 }
+
+func TestDirectoryRevisionMigrationRefusesMalformedIncarnationBeforeRebuild(t *testing.T) {
+	db := versionSevenDirectoryDatabase(t)
+	execute(t, db, `UPDATE logs SET incarnation='nonempty-but-malformed' WHERE volume=1`)
+	_, _, _, err := PrepareConfigured(t.Context(), db, "workspace", "", changes.DefaultWindow(), 1000, 1<<20, nil)
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("malformed incumbent incarnation migration=%v", err)
+	}
+	var version, revisionColumns, retainedChanges, nodes int
+	var incarnation string
+	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('nodes') WHERE name='directory_revision'`).Scan(&revisionColumns); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM changes`).Scan(&retainedChanges); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM nodes`).Scan(&nodes); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT incarnation FROM logs WHERE volume=1`).Scan(&incarnation); err != nil {
+		t.Fatal(err)
+	}
+	if version != 7 || revisionColumns != 0 || retainedChanges != 1 || nodes != 2 || incarnation != "nonempty-but-malformed" {
+		t.Fatalf("refused incarnation migration changed state: version=%d revision-columns=%d changes=%d nodes=%d incarnation=%q",
+			version, revisionColumns, retainedChanges, nodes, incarnation)
+	}
+}

@@ -64,7 +64,7 @@ func (s *Store) lookupNamespaceIdentity(ctx context.Context, tx *sql.Tx, parent 
 	return identity, err == nil, err
 }
 
-func (s *Store) directoryIdentityTarget(ctx context.Context, tx *sql.Tx, target storage.DirectoryTarget, uses storage.Uses) (namespaceIdentity, error) {
+func (s *Store) directoryIdentityTarget(ctx context.Context, tx *sql.Tx, target storage.DirectoryTarget, uses storage.Uses, allowScopedDetached bool) (namespaceIdentity, error) {
 	if target.NodeID == 0 || target.NodeID > math.MaxInt64 {
 		return namespaceIdentity{}, syscall.ESTALE
 	}
@@ -83,7 +83,7 @@ func (s *Store) directoryIdentityTarget(ctx context.Context, tx *sql.Tx, target 
 	if identity.Kind != storage.NodeDirectory {
 		return namespaceIdentity{}, syscall.ENOTDIR
 	}
-	if identity.Detached {
+	if identity.Detached && (!allowScopedDetached || target.Scope == nil) {
 		return namespaceIdentity{}, syscall.ESTALE
 	}
 	if err := s.fileDomain.coordinator.CheckUse(ctx, target.NodeID, scope, uses); err != nil {
@@ -93,5 +93,5 @@ func (s *Store) directoryIdentityTarget(ctx context.Context, tx *sql.Tx, target 
 }
 
 func (s *Store) directoryMetadataTarget(ctx context.Context, tx *sql.Tx, target storage.DirectoryTarget) (namespaceIdentity, error) {
-	return s.directoryIdentityTarget(ctx, tx, target, 0)
+	return s.directoryIdentityTarget(ctx, tx, target, 0, false)
 }

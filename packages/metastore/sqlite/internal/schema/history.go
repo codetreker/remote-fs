@@ -132,13 +132,20 @@ func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volum
 				(c.node_kind!=2 AND length(c.directory_revision)!=0) OR length(c.directory_revision)>64`
 		}
 	}
+	incarnationPredicate := `l.incarnation = ''`
+	if version >= firstOwnershipAwareSchemaVersion {
+		incarnationPredicate = `(
+			l.incarnation = '' OR length(CAST(l.incarnation AS BLOB)) != 32 OR
+			l.incarnation GLOB '*[^0-9a-f]*'
+		)`
+	}
 	var invalidLogs int64
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*)
 		FROM volumes ns
 		LEFT JOIN logs l ON l.volume = ns.id
 		`+volumeWhere+`(
-			l.volume IS NULL OR l.incarnation = '' OR
+			l.volume IS NULL OR `+incarnationPredicate+` OR
 			l.committed_position < 0 OR l.trimmed_through < 0 OR
 			l.trimmed_by_age NOT IN (0, 1) OR l.trimmed_through > l.committed_position OR
 			`+tailPredicate+` OR

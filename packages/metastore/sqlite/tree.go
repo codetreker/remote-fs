@@ -219,6 +219,9 @@ func (s *Store) listChildrenBounded(ctx context.Context, tx *sql.Tx, parent int6
 }
 
 func (s *Store) listChildrenBoundedChecked(ctx context.Context, tx *sql.Tx, parent int64, result *storage.ListResult, check childReservationCheck) error {
+	if err := s.validateListedChildren(ctx, tx, parent); err != nil {
+		return err
+	}
 	rows, err := tx.QueryContext(ctx,
 		`SELECT length(CAST(e.name AS BLOB)), `+nodeAttrColumns+` FROM entries e JOIN nodes n ON n.id = e.node
 		 WHERE e.volume = ? AND e.parent = ? ORDER BY e.name`,
@@ -330,6 +333,9 @@ func (s *Store) listChildren(ctx context.Context, tx *sql.Tx, parent int64) ([]m
 }
 
 func (s *Store) visitChildren(ctx context.Context, tx *sql.Tx, parent int64, add func(metastore.Child) error) error {
+	if err := s.validateListedChildren(ctx, tx, parent); err != nil {
+		return err
+	}
 	rows, err := tx.QueryContext(ctx,
 		`SELECT e.name, `+nodeColumns+` FROM entries e JOIN nodes n ON n.id = e.node
 		 WHERE e.volume = ? AND e.parent = ? ORDER BY e.name`,
@@ -347,6 +353,9 @@ func (s *Store) visitChildren(ctx context.Context, tx *sql.Tx, parent int64, add
 		if err := rows.Scan(append([]any{&name}, node.fields()...)...); err != nil {
 			return err
 		}
+		if err := storage.CheckLeaf(name); err != nil {
+			return fmt.Errorf("directory %d contains an invalid name: %w", parent, errors.Join(syscall.EIO, err))
+		}
 		value, err := node.node()
 		if err != nil {
 			return err
@@ -359,6 +368,25 @@ func (s *Store) visitChildren(ctx context.Context, tx *sql.Tx, parent int64, add
 		}
 	}
 	return rows.Err()
+}
+
+func (s *Store) validateListedChildren(ctx context.Context, tx *sql.Tx, parent int64) error {
+	var invalid int64
+	if err := tx.QueryRowContext(ctx, `SELECT count(*)
+		FROM entries e LEFT JOIN nodes n ON n.id=e.node
+		WHERE e.volume=? AND e.parent=? AND (
+			typeof(e.volume)!='integer' OR typeof(e.parent)!='integer' OR typeof(e.node)!='integer' OR
+			n.id IS NULL OR typeof(n.volume)!='integer' OR n.volume!=e.volume OR
+			typeof(n.detached)!='integer' OR n.detached!=0 OR n.id=e.parent OR n.id=? OR
+			EXISTS (SELECT 1 FROM entries alias WHERE alias.node=e.node AND
+				(alias.volume!=e.volume OR alias.parent!=e.parent OR alias.name!=e.name))
+		)`, s.volume, parent, s.root).Scan(&invalid); err != nil {
+		return err
+	}
+	if invalid != 0 {
+		return fmt.Errorf("directory %d has %d invalid child bindings: %w", parent, invalid, syscall.EIO)
+	}
+	return nil
 }
 
 // SetAttr applies the attributes a change names and leaves the rest alone.

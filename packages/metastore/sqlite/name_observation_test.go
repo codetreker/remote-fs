@@ -386,6 +386,130 @@ func TestDirectoryMetadataObservationIsIndependentOfApplicationEnumeration(t *te
 	}
 }
 
+func TestScopedDirectoryReadContinuesAfterUnlink(t *testing.T) {
+	store, _ := openNameObservationStore(t, nil)
+	defer store.Close()
+	if err := store.Mkdir(t.Context(), "gone"); err != nil {
+		t.Fatal(err)
+	}
+	directory, err := store.Stat(t.Context(), "gone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := store.OpenNodeRef(t.Context(), uint64(directory.ID), storage.NodeRefOptions{
+		Kind: storage.NodeDirectory, Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(directory.ID)},
+		Action: fileAction(t), Use: storage.UseClaim{Uses: storage.ReadEntries},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Reference.Close(context.Background())
+	scope, err := opened.Reference.(storage.ScopedReference).Scope(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RemoveDir(t.Context(), "gone"); err != nil {
+		t.Fatal(err)
+	}
+	target := storage.DirectoryTarget{NodeID: uint64(directory.ID), Scope: &scope}
+	observed, err := store.ReadDirNode(t.Context(), target)
+	if err != nil || observed.Observation.ParentID != uint64(directory.ID) || len(observed.Entries) != 0 {
+		t.Fatalf("scoped detached directory=%+v error=%v", observed, err)
+	}
+	if _, err := store.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: uint64(directory.ID)}); !errors.Is(err, syscall.ESTALE) {
+		t.Fatalf("bare detached directory read=%v", err)
+	}
+	wrong := storage.UseScope{Token: "00000000000000000000000000000000"}
+	if _, err := store.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: uint64(directory.ID), Scope: &wrong}); !errors.Is(err, storage.ErrInvalidScope) {
+		t.Fatalf("wrong-scope detached directory read=%v", err)
+	}
+	result, err := storage.NewListResult(storage.MaxDirectoryBytes, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		return storage.ObservedEntryBytes(nameBytes, metadataBytes)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := store.ObserveDirectoryMetadata(t.Context(), target, storage.DirectoryMetadataOptions{}, result)
+	if !errors.Is(err, syscall.ESTALE) || !reflect.DeepEqual(metadata, storage.DirectoryMetadataObservation{}) {
+		t.Fatalf("detached metadata observation=%+v error=%v", metadata, err)
+	}
+}
+
+func TestDirectoryListingsRejectDanglingAndDetachedChildren(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		damage func(*Store, int64) error
+	}{
+		{"dangling", func(store *Store, id int64) error {
+			connection, err := store.write.Conn(t.Context())
+			if err != nil {
+				return err
+			}
+			defer connection.Close()
+			if _, err := connection.ExecContext(t.Context(), `PRAGMA foreign_keys=OFF`); err != nil {
+				return err
+			}
+			_, err = connection.ExecContext(t.Context(), `DELETE FROM nodes WHERE volume=? AND id=?`, store.volume, id)
+			return err
+		}},
+		{"detached", func(store *Store, id int64) error {
+			_, err := store.write.ExecContext(t.Context(), `UPDATE nodes SET detached=1 WHERE volume=? AND id=?`, store.volume, id)
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, _ := openNameObservationStore(t, nil)
+			defer store.Close()
+			if err := store.Create(t.Context(), "good"); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Create(t.Context(), "bad"); err != nil {
+				t.Fatal(err)
+			}
+			bad, err := store.Stat(t.Context(), "bad")
+			if err != nil {
+				t.Fatal(err)
+			}
+			root, err := store.Stat(t.Context(), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := test.damage(store.Store, bad.ID); err != nil {
+				t.Fatal(err)
+			}
+			if children, err := store.List(t.Context(), ""); !errors.Is(err, syscall.EIO) || children != nil {
+				t.Fatalf("ordinary listing exposed children=%+v error=%v", children, err)
+			}
+			assertBoundedFailure := func(name string, run func(*storage.ListResult) error) {
+				t.Helper()
+				result, err := storage.NewListResult(storage.MaxDirectoryBytes, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+					return storage.ObservedEntryBytes(nameBytes, metadataBytes)
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := run(result); !errors.Is(err, syscall.EIO) {
+					t.Fatalf("%s=%v", name, err)
+				}
+				if entries, err := result.Entries(); entries != nil || !errors.Is(err, syscall.EIO) {
+					t.Fatalf("%s exposed entries=%+v error=%v", name, entries, err)
+				}
+			}
+			assertBoundedFailure("ListBounded", func(result *storage.ListResult) error {
+				return store.ListBounded(t.Context(), "", result)
+			})
+			assertBoundedFailure("ReadDirNodeBounded", func(result *storage.ListResult) error {
+				_, err := store.ReadDirNodeBounded(t.Context(), storage.DirectoryTarget{NodeID: uint64(root.ID)}, result)
+				return err
+			})
+			assertBoundedFailure("ObserveDirectoryMetadata", func(result *storage.ListResult) error {
+				_, err := store.ObserveDirectoryMetadata(t.Context(), storage.DirectoryTarget{NodeID: uint64(root.ID)}, storage.DirectoryMetadataOptions{}, result)
+				return err
+			})
+		})
+	}
+}
+
 func TestReferenceNameObservationRejectsMissingAndMultipleBindings(t *testing.T) {
 	for _, test := range []struct {
 		name   string

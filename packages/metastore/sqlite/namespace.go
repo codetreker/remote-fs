@@ -13,7 +13,11 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
+var _ metastore.DirectoryReader = (*Store)(nil)
+
 func (s *Store) CheckNamespaceAccess() error { return s.CheckFileStore() }
+
+func (s *Store) CheckDirectoryRead() error { return s.CheckFileStore() }
 
 func (s *Store) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
 	result, err := storage.NewListResult(s.maxDirectoryBytes, 0, func(index int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
@@ -66,7 +70,7 @@ func (s *Store) ReadDirNodeBounded(ctx context.Context, target storage.Directory
 		return storage.DirectoryObservation{}, err
 	}
 	err := s.inspect(ctx, func(tx *sql.Tx) error {
-		parent, err := s.directoryIdentityTarget(ctx, tx, target, storage.ReadEntries)
+		parent, err := s.directoryIdentityTarget(ctx, tx, target, storage.ReadEntries, true)
 		if err != nil {
 			return err
 		}

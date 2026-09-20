@@ -208,7 +208,7 @@ func TestPrepareMigratesPopulatedHistoricalVolumes(t *testing.T) {
 			} else {
 				execute(t, db, `INSERT INTO entries (volume,parent,name,node) VALUES (1,1,X'66696c65',2)`)
 				execute(t, db, `INSERT INTO logs (volume,incarnation,committed_position,trimmed_through,trimmed_by_age)
-					VALUES (1,'historical',0,0,0)`)
+					VALUES (1,'0123456789abcdef0123456789abcdef',0,0,0)`)
 			}
 			if version >= 3 {
 				execute(t, db, `UPDATE database_state SET node_high_water=2`)
