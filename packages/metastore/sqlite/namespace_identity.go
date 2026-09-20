@@ -52,16 +52,39 @@ func (s *Store) namespaceIdentity(ctx context.Context, tx *sql.Tx, id int64) (na
 }
 
 func (s *Store) lookupNamespaceIdentity(ctx context.Context, tx *sql.Tx, parent int64, name []byte) (namespaceIdentity, bool, error) {
-	identity, err := scanNamespaceIdentity(tx.QueryRowContext(ctx,
-		`SELECT `+namespaceIdentityColumns+` FROM entries e JOIN nodes n ON n.id=e.node
-		WHERE e.volume=? AND n.volume=? AND e.parent=? AND e.name=?`, s.volume, s.volume, parent, name))
-	if errors.Is(err, sql.ErrNoRows) {
+	var matches, valid, id int64
+	if err := tx.QueryRowContext(ctx, `SELECT count(*),coalesce(sum(
+		typeof(volume)='integer' AND typeof(parent)='integer' AND typeof(name)='blob' AND
+		typeof(node)='integer' AND node>0
+	),0),coalesce(max(CASE WHEN typeof(node)='integer' THEN node ELSE 0 END),0)
+		FROM entries WHERE volume=? AND parent=? AND CAST(name AS BLOB)=?`,
+		s.volume, parent, name).Scan(&matches, &valid, &id); err != nil {
+		return namespaceIdentity{}, false, err
+	}
+	if matches == 0 {
 		return namespaceIdentity{}, false, nil
 	}
-	if err == nil && !s.replicaMetadata && identity.Kind == storage.NodeDirectory && !validDirectoryRevision(identity.DirectoryRevision) {
+	if matches != 1 || valid != 1 || id < 1 {
 		return namespaceIdentity{}, false, syscall.EIO
 	}
-	return identity, err == nil, err
+	identity, err := s.namespaceIdentity(ctx, tx, id)
+	if errors.Is(err, syscall.ESTALE) {
+		return namespaceIdentity{}, false, syscall.EIO
+	}
+	if err != nil {
+		return namespaceIdentity{}, false, err
+	}
+	if identity.Detached {
+		return namespaceIdentity{}, false, syscall.EIO
+	}
+	var links int64
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM entries WHERE node=?`, id).Scan(&links); err != nil {
+		return namespaceIdentity{}, false, err
+	}
+	if links != 1 {
+		return namespaceIdentity{}, false, syscall.EIO
+	}
+	return identity, true, nil
 }
 
 func (s *Store) directoryIdentityTarget(ctx context.Context, tx *sql.Tx, target storage.DirectoryTarget, uses storage.Uses, allowScopedDetached bool) (namespaceIdentity, error) {

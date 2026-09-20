@@ -558,6 +558,60 @@ func TestReferenceNameObservationRejectsMissingAndMultipleBindings(t *testing.T)
 	}
 }
 
+func TestReferenceNameObservationGuardsRejectMalformedExistingEdges(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		damage func(*Store, int64) error
+	}{
+		{"detached but linked", func(store *Store, id int64) error {
+			_, err := store.write.ExecContext(t.Context(), `UPDATE nodes SET detached=1 WHERE volume=? AND id=?`, store.volume, id)
+			return err
+		}},
+		{"dangling", func(store *Store, id int64) error {
+			connection, err := store.write.Conn(t.Context())
+			if err != nil {
+				return err
+			}
+			defer connection.Close()
+			if _, err := connection.ExecContext(t.Context(), `PRAGMA foreign_keys=OFF`); err != nil {
+				return err
+			}
+			_, err = connection.ExecContext(t.Context(), `DELETE FROM nodes WHERE volume=? AND id=?`, store.volume, id)
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, _ := openNameObservationStore(t, nil)
+			defer store.Close()
+			if err := store.Create(t.Context(), "held"); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Create(t.Context(), "guarded"); err != nil {
+				t.Fatal(err)
+			}
+			held, err := store.OpenFile(t.Context(), "held", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer held.Close(context.Background())
+			guarded, err := store.Stat(t.Context(), "guarded")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := test.damage(store.Store, guarded.ID); err != nil {
+				t.Fatal(err)
+			}
+			guards := &storage.NamespaceGuards{Edges: []storage.ObservedEdge{{
+				ParentID: uint64(store.root), RawLeaf: []byte("guarded"), ChildID: uint64(guarded.ID),
+			}}}
+			got, err := held.(storage.ReferenceNameObserver).ObserveName(t.Context(), guards)
+			if !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(got, storage.NameObservation{}) {
+				t.Fatalf("malformed guarded edge observation=%+v error=%v", got, err)
+			}
+		})
+	}
+}
+
 func TestReferenceNameObservationRejectsOversizedLeafBeforeBudgetingPayload(t *testing.T) {
 	store, _ := openNameObservationStore(t, nil)
 	defer store.Close()
