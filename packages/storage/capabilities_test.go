@@ -56,6 +56,9 @@ func TestCapabilityErrorsPreserveActionableClassifications(t *testing.T) {
 		err  error
 		want syscall.Errno
 	}{{ErrUseConflict, syscall.EAGAIN}, {ErrRangeConflict, syscall.EAGAIN}, {ErrConditionConflict, syscall.EAGAIN}, {ErrInvalidScope, syscall.ESTALE}} {
+		if test.err.Error() == "" {
+			t.Fatal("capability error has an empty diagnostic")
+		}
 		if !errors.Is(test.err, test.want) {
 			t.Fatalf("%v does not unwrap to %v", test.err, test.want)
 		}
