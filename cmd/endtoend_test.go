@@ -219,21 +219,17 @@ func TestAnOverwriteOnOneMountpointIsSeenWhole(t *testing.T) {
 	}
 }
 
-// A symbolic-link kind and target length must survive both HTTP and FUSE. The storage
-// interface describes links but provides no operation to resolve their targets.
+// A symbolic link created through FUSE must retain its kind, target, and target length
+// across the mounted client's HTTP path to the authoritative volume.
 func TestASymbolicLinkSurvivesTheWholeChain(t *testing.T) {
-	volume, _ := volumeFixture(t)
-	for name, content := range map[string]string{"target": "payload\n", "link": "target"} {
-		if err := volume.Write(t.Context(), name, []byte(content)); err != nil {
-			t.Fatalf("seed symbolic-link fixture: %v", err)
-		}
-	}
-	link, err := volume.Stat(t.Context(), "link")
-	if err != nil {
-		t.Fatalf("stat symbolic-link fixture: %v", err)
-	}
-	s := serveStorage(t, &symlinkMetadata{Storage: volume, linkID: link.ID}, nil)
+	s := serveUnreplicatedVolume(t)
 	a := mountpointOn(t, s)
+	if err := os.WriteFile(filepath.Join(a, "target"), []byte("payload\n"), 0o644); err != nil {
+		t.Fatalf("creating the symlink target through the mount: %v", err)
+	}
+	if err := os.Symlink("target", filepath.Join(a, "link")); err != nil {
+		t.Fatalf("creating the symbolic link through the mount: %v", err)
+	}
 
 	got, err := os.Lstat(filepath.Join(a, "link"))
 	if err != nil {
@@ -263,11 +259,11 @@ func TestASymbolicLinkSurvivesTheWholeChain(t *testing.T) {
 		t.Errorf("the listing reports the link as %v, and a lookup reports %v", listed["link"], got.Mode().Type())
 	}
 
-	// Where it points is the one thing that cannot be answered: no operation the volume
-	// offers could produce it, and EOPNOTSUPP says that rather than saying this is not a
-	// link.
-	if target, err := os.Readlink(filepath.Join(a, "link")); !errors.Is(err, syscall.EOPNOTSUPP) {
-		t.Errorf("readlink through the mount gave %q with error %v, want EOPNOTSUPP", target, err)
+	if target, err := os.Readlink(filepath.Join(a, "link")); err != nil || target != "target" {
+		t.Errorf("readlink through the mount gave %q with error %v, want target", target, err)
+	}
+	if content, err := os.ReadFile(filepath.Join(a, "link")); err != nil || string(content) != "payload\n" {
+		t.Errorf("reading through the symbolic link gave %q with error %v, want payload", content, err)
 	}
 }
 
