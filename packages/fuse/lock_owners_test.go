@@ -26,11 +26,14 @@ type rangeSessionFixture struct {
 	retireEntered chan struct{}
 	retireRelease chan struct{}
 	retireErr     error
+	lastOptions   storage.OwnerOptions
+	conflict      *storage.RangeConflict
 }
 
 func (s *rangeSessionFixture) CheckUseOwners() error    { return nil }
 func (s *rangeSessionFixture) CheckRangeControl() error { return nil }
 func (s *rangeSessionFixture) NewUseOwner(ctx context.Context, node uint64, scope storage.UseScope, options storage.OwnerOptions) (storage.UseOwner, error) {
+	s.lastOptions = options
 	return s.engine.NewOwner(ctx, node, scope, options)
 }
 func (s *rangeSessionFixture) RetireUseOwner(ctx context.Context, owner storage.UseOwner) error {
@@ -51,6 +54,9 @@ func (s *rangeSessionFixture) RetireUseOwner(ctx context.Context, owner storage.
 	return s.engine.RetireOwner(ctx, owner)
 }
 func (s *rangeSessionFixture) GetConflict(ctx context.Context, owner storage.UseOwner, c storage.RangeCommand) (storage.RangeConflict, error) {
+	if s.conflict != nil {
+		return *s.conflict, nil
+	}
 	node, err := s.engine.OwnerNode(ctx, owner)
 	if err != nil {
 		return storage.RangeConflict{}, err
@@ -223,7 +229,7 @@ func TestFailedOwnerRetirementCannotMasqueradeAsInterruptedAcquisition(t *testin
 }
 
 func TestKernelOwnersUseOpaqueGroupsAndReclaimAfterClose(t *testing.T) {
-	v, _ := localRangeFixture(t, 4)
+	v, session := localRangeFixture(t, 4)
 	a, b := localRangeHandle(v, 1, "a"), localRangeHandle(v, 2, "b")
 	first, err := a.lockOwner(t.Context(), 0, storage.DomainRecord, 123, true)
 	if err != nil {
@@ -240,8 +246,8 @@ func TestKernelOwnersUseOpaqueGroupsAndReclaimAfterClose(t *testing.T) {
 	if first.id == second.id || first.id == other.id || v.lockGroups[0].id == 0 || v.lockGroups[0].id == v.lockGroups[math.MaxUint64].id {
 		t.Fatal("kernel identities were collapsed or exposed as absent groups")
 	}
-	if v.lockGroups[0].owners != 2 || v.lockPID(storage.OwnerDiagnostic(first.id)) != 123 {
-		t.Fatal("cross-file process group or PID mapping was lost")
+	if v.lockGroups[0].owners != 2 || session.lastOptions.Diagnostic != 456 {
+		t.Fatal("cross-file process group or diagnostic PID was lost")
 	}
 	for _, owner := range []*localLockOwner{first, second, other} {
 		if err := a.releaseLockOwner(t.Context(), owner); err != nil {
@@ -266,6 +272,21 @@ func TestKernelOwnersUseOpaqueGroupsAndReclaimAfterClose(t *testing.T) {
 	}
 	if fresh.id == first.id {
 		t.Fatal("close reused the retired authority owner")
+	}
+}
+
+func TestGetlkRejectsMissingOrOversizedConflictPID(t *testing.T) {
+	for _, diagnostic := range []storage.OwnerDiagnostic{0, storage.OwnerDiagnostic(math.MaxUint32) + 1} {
+		t.Run(fmt.Sprintf("diagnostic=%d", diagnostic), func(t *testing.T) {
+			v, session := localRangeFixture(t, 4)
+			session.conflict = &storage.RangeConflict{Found: true, Owner: diagnostic, Range: storage.Range{Kind: storage.Bytes, Length: 1}, Mode: storage.RangeExclusive}
+			h := localRangeHandle(v, 1, "scope")
+			lk := gofuse.FileLock{Start: 0, End: 0, Typ: syscall.F_WRLCK, Pid: 10}
+			var out gofuse.FileLock
+			if errno := h.Getlk(t.Context(), 1, &lk, 0, &out); errno != syscall.EIO {
+				t.Fatalf("Getlk returned %v with output %+v", errno, out)
+			}
+		})
 	}
 }
 

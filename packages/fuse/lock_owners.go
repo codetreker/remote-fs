@@ -21,7 +21,6 @@ type lockGroup struct {
 type localLockOwner struct {
 	key        lockOwnerKey
 	id         storage.UseOwner
-	pid        uint32
 	users      int
 	persistent bool
 	retired    bool
@@ -30,7 +29,7 @@ type localLockOwner struct {
 }
 
 // The kernel owner is a process cookie for record locks and an open-description
-// cookie for flock. Neither cookie nor the diagnostic PID crosses the wire.
+// cookie for flock. The cookie remains local; the PID crosses only as diagnostic data.
 func (h *handle) lockOwner(ctx context.Context, kernel uint64, domain storage.ConflictDomain, pid uint32, persistent bool) (*localLockOwner, error) {
 	v := h.node.volume
 	key := lockOwnerKey{node: h.node.id.node, kernel: kernel}
@@ -46,9 +45,6 @@ func (h *handle) lockOwner(ctx context.Context, kernel uint64, domain storage.Co
 		}
 		owner.users++
 		owner.persistent = owner.persistent || persistent
-		if pid != 0 {
-			owner.pid = pid
-		}
 		v.ownerMu.Unlock()
 		return owner, nil
 	}
@@ -87,9 +83,6 @@ func (h *handle) lockOwner(ctx context.Context, kernel uint64, domain storage.Co
 		}
 		existing.users++
 		existing.persistent = existing.persistent || persistent
-		if pid != 0 {
-			existing.pid = pid
-		}
 		v.ownerMu.Unlock()
 		return existing, nil
 	}
@@ -110,7 +103,11 @@ func (h *handle) lockOwner(ctx context.Context, kernel uint64, domain storage.Co
 	if domain == storage.DomainWholeFile {
 		lifetime = storage.OwnerReference
 	}
-	id, err := owners.NewUseOwner(ctx, key.node, scope, storage.OwnerOptions{Lifetime: lifetime, Group: group.id})
+	options := storage.OwnerOptions{Lifetime: lifetime, Group: group.id}
+	if domain == storage.DomainRecord {
+		options.Diagnostic = storage.OwnerDiagnostic(pid)
+	}
+	id, err := owners.NewUseOwner(ctx, key.node, scope, options)
 	if err != nil {
 		v.ownerMu.Unlock()
 		return nil, err
@@ -119,7 +116,7 @@ func (h *handle) lockOwner(ctx context.Context, kernel uint64, domain storage.Co
 		v.ownerMu.Unlock()
 		return nil, syscall.EIO
 	}
-	owner := &localLockOwner{key: key, id: id, pid: pid, users: 1, persistent: persistent}
+	owner := &localLockOwner{key: key, id: id, users: 1, persistent: persistent}
 	if v.lockOwners == nil {
 		v.lockOwners = make(map[lockOwnerKey]*localLockOwner)
 		v.lockGroups = make(map[uint64]*lockGroup)
@@ -222,17 +219,6 @@ func (v *volume) lockOwnerRetirement(ctx context.Context, owner *localLockOwner)
 	case <-wait.Done():
 		return false, wait.Err()
 	}
-}
-
-func (v *volume) lockPID(id storage.OwnerDiagnostic) uint32 {
-	v.ownerMu.Lock()
-	defer v.ownerMu.Unlock()
-	for _, owner := range v.lockOwners {
-		if storage.OwnerDiagnostic(owner.id) == id {
-			return owner.pid
-		}
-	}
-	return 0
 }
 
 func (h *handle) dropRecordOwner(ctx context.Context, kernel uint64) error {

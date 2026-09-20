@@ -420,6 +420,17 @@ func TestAdvisoryPOSIXRangesQuerySplitAndPreserveFailedConversion(t *testing.T) 
 	checkPOSIX(t, a, unix.F_SETLK, posixRange(unix.F_WRLCK, 1<<20, 1), syscall.EAGAIN)
 }
 
+func TestAdvisoryPOSIXGetlkReportsCrossMountHolderPID(t *testing.T) {
+	left, right, _ := liveHTTPMounts(t, map[string]string{"file": "content"})
+	holder := openLiveFile(t, filepath.Join(left, "file"), os.O_RDWR)
+	observer := openLiveFile(t, filepath.Join(right, "file"), os.O_RDWR)
+	checkPOSIX(t, holder, unix.F_SETLK, posixRange(unix.F_WRLCK, 7, 11), 0)
+	conflict := checkPOSIX(t, observer, unix.F_GETLK, posixRange(unix.F_WRLCK, 7, 11), 0)
+	if conflict.Type != unix.F_WRLCK || conflict.Start != 7 || conflict.Len != 11 || conflict.Pid != int32(os.Getpid()) {
+		t.Fatalf("cross-mount conflict = %+v, want holder PID %d", conflict, os.Getpid())
+	}
+}
+
 func TestAdvisoryPOSIXAccessModesAreCheckedByTheKernel(t *testing.T) {
 	left, _, _ := liveHTTPMounts(t, map[string]string{"file": "content"})
 	reader := openLiveFile(t, filepath.Join(left, "file"), os.O_RDONLY)

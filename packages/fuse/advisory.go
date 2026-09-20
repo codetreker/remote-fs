@@ -101,7 +101,13 @@ func (h *handle) Getlk(ctx context.Context, kernel uint64, lk *gofuse.FileLock, 
 		conflict.Mode != storage.RangeShared && conflict.Mode != storage.RangeExclusive || conflict.Mode == storage.RangeShared && command.Mode == storage.RangeShared {
 		return syscall.EIO
 	}
-	out.Start, out.End, out.Pid = other.Start, other.Start+other.Length-1, h.node.volume.lockPID(conflict.Owner)
+	out.Start, out.End = other.Start, other.Start+other.Length-1
+	if command.Domain == storage.DomainRecord {
+		if conflict.Owner == 0 || conflict.Owner > math.MaxUint32 {
+			return syscall.EIO
+		}
+		out.Pid = uint32(conflict.Owner)
+	}
 	out.Typ = syscall.F_RDLCK
 	if conflict.Mode == storage.RangeExclusive {
 		out.Typ = syscall.F_WRLCK
