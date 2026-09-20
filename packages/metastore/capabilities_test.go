@@ -1,11 +1,13 @@
 package metastore_test
 
 import (
+	"context"
 	"errors"
 	"math"
 	"syscall"
 	"testing"
 
+	"github.com/codetreker/remote-fs/packages/advisory"
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -41,5 +43,19 @@ func TestFileAccessValidationAndContextRoundTrip(t *testing.T) {
 	}
 	if _, ok := metastore.FileAccessFrom(t.Context()); ok {
 		t.Fatal("plain context unexpectedly carries file access")
+	}
+}
+
+func TestReferenceSessionRoundTripsAndDefaultsToNil(t *testing.T) {
+	if session := metastore.ReferenceSession(t.Context()); session != nil {
+		t.Fatalf("unbound reference session = %p", session)
+	}
+	want := &advisory.Session{}
+	ctx := metastore.WithReferenceSession(t.Context(), want)
+	if session := metastore.ReferenceSession(ctx); session != want {
+		t.Fatalf("reference session = %p, want %p", session, want)
+	}
+	if session := metastore.ReferenceSession(context.WithValue(ctx, struct{}{}, "unrelated")); session != want {
+		t.Fatalf("unrelated context value changed reference session = %p", session)
 	}
 }
