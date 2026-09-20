@@ -370,6 +370,76 @@ func TestObservationDecoderRejectsInvalidRawLeavesBeforeCallerBudget(t *testing.
 	}
 }
 
+func TestObservationBudgetErrorReportsAndPreservesCause(t *testing.T) {
+	cause := errors.New("caller result budget at entry 7")
+	failure := budgetObservationError(cause)
+	if failure.Error() != cause.Error() || !errors.Is(failure, cause) {
+		t.Fatalf("budget error changed reporting or identity: %v", failure)
+	}
+	if budgetObservationError(nil) != nil {
+		t.Fatal("nil budget error became a failure")
+	}
+}
+
+func TestNameObservationScalarValidation(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		observation storage.NameObservation
+		leafBytes   int64
+		leafPresent bool
+		valid       bool
+	}{
+		{name: "root", observation: storage.NameObservation{NodeID: 1, State: storage.NameRoot}, valid: true},
+		{name: "detached", observation: storage.NameObservation{NodeID: 1, State: storage.NameDetached}, valid: true},
+		{name: "linked", observation: storage.NameObservation{NodeID: 2, State: storage.NameLinked, ParentID: 1}, leafBytes: 1, leafPresent: true, valid: true},
+		{name: "missing identity", observation: storage.NameObservation{State: storage.NameRoot}},
+		{name: "root parent", observation: storage.NameObservation{NodeID: 1, State: storage.NameRoot, ParentID: 2}},
+		{name: "root leaf length", observation: storage.NameObservation{NodeID: 1, State: storage.NameRoot}, leafBytes: 1},
+		{name: "detached leaf presence", observation: storage.NameObservation{NodeID: 1, State: storage.NameDetached}, leafPresent: true},
+		{name: "linked no parent", observation: storage.NameObservation{NodeID: 2, State: storage.NameLinked}, leafBytes: 1, leafPresent: true},
+		{name: "linked self parent", observation: storage.NameObservation{NodeID: 2, State: storage.NameLinked, ParentID: 2}, leafBytes: 1, leafPresent: true},
+		{name: "linked empty leaf", observation: storage.NameObservation{NodeID: 2, State: storage.NameLinked, ParentID: 1}, leafPresent: true},
+		{name: "linked absent leaf", observation: storage.NameObservation{NodeID: 2, State: storage.NameLinked, ParentID: 1}, leafBytes: 1},
+		{name: "unknown state", observation: storage.NameObservation{NodeID: 1, State: 255}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := checkNameObservationScalar(test.observation, test.leafBytes, test.leafPresent)
+			if (err == nil) != test.valid {
+				t.Fatalf("validation error=%v valid=%v", err, test.valid)
+			}
+		})
+	}
+}
+
+func TestDeferredObservationMetadataDecodePaths(t *testing.T) {
+	empty, err := (deferredObservedAttr{}).decodeMetadataBytes()
+	if err != nil || empty != nil {
+		t.Fatalf("empty metadata=%v err=%v", empty, err)
+	}
+	valid := deferredObservedAttr{metadata: map[string]encodedObservedPayload{
+		"test.value": {version: []byte("AQ=="), data: []byte("dmFsdWU=")},
+		"test.empty": {version: []byte("Ag=="), data: []byte("")},
+	}}
+	decoded, err := valid.decodeMetadataBytes()
+	if err != nil || string(decoded["test.value"].Version) != "\x01" || string(decoded["test.value"].Data) != "value" || len(decoded["test.empty"].Data) != 0 {
+		t.Fatalf("decoded metadata=%+v err=%v", decoded, err)
+	}
+	for _, test := range []struct {
+		name     string
+		metadata map[string]encodedObservedPayload
+	}{
+		{name: "invalid version", metadata: map[string]encodedObservedPayload{"test.value": {version: []byte("!!!!"), data: []byte("")}}},
+		{name: "invalid data", metadata: map[string]encodedObservedPayload{"test.value": {version: []byte("AQ=="), data: []byte("!!!!")}}},
+		{name: "invalid namespace", metadata: map[string]encodedObservedPayload{"INVALID": {version: []byte("AQ=="), data: []byte("")}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if decoded, err := (deferredObservedAttr{metadata: test.metadata}).decodeMetadataBytes(); err == nil || decoded != nil {
+				t.Fatalf("invalid metadata decoded=%+v err=%v", decoded, err)
+			}
+		})
+	}
+}
+
 func TestObservationDecoderAcceptsReorderedObjectMembers(t *testing.T) {
 	attr, err := json.Marshal(AttrOf(storage.Attr{ID: 3, Kind: storage.NodeRegular}))
 	if err != nil {
