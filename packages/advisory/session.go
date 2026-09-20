@@ -20,6 +20,8 @@ type Session struct {
 	epoch                   uint64
 	epochUntil              time.Time
 	actions                 map[storage.LockRequestID]*request
+	bindings                map[storage.UseOwner]ownerBinding
+	nextOwner               storage.UseOwner
 	owners, ranges, pending int
 	retiring, retired       bool
 	retireDone              chan struct{}
@@ -51,7 +53,7 @@ func (s *Session) advanceLocked(now time.Time) error {
 func (s *Session) pruneHistoryLocked(now time.Time) {
 	for id, action := range s.actions {
 		retiredEpoch := action.epoch < s.epoch || !now.Before(s.epochUntil)
-		if retiredEpoch && action.result.State != storage.LockPending && !now.Before(action.expires) {
+		if retiredEpoch && action.result.State != storage.Pending && !now.Before(action.expires) {
 			delete(s.actions, id)
 			s.coordinator.requests--
 		}
@@ -130,7 +132,6 @@ func (s *Session) Retire(ctx context.Context) error {
 	err := s.fence()
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	s.retireErr = err
 	if err == nil {
 		for key, state := range c.owners {
@@ -149,12 +150,17 @@ func (s *Session) Retire(ctx context.Context) error {
 		c.waiting = remaining
 		c.requests -= len(s.actions)
 		clear(s.actions)
+		c.registeredOwners -= len(s.bindings)
+		clear(s.bindings)
 		s.owners, s.ranges, s.pending = 0, 0, 0
 		s.retired = true
 		delete(c.sessions, s.id)
-		c.pumpLocked()
 	}
 	close(s.retireDone)
 	s.retireDone = nil
+	c.mu.Unlock()
+	if err == nil {
+		c.pump(ctx)
+	}
 	return err
 }
