@@ -30,8 +30,16 @@ func TestOperationConstantsIdentifyDistinctSemanticActions(t *testing.T) {
 		storage.OpFileSetNodeAttr:        "file.set-node-attr",
 		storage.OpFileOpen:               "file.open",
 		storage.OpFileOpenNode:           "file.open-node",
+		storage.OpFileOpenAt:             "file.open-at",
+		storage.OpFileLookupAt:           "file.lookup-at",
+		storage.OpFileMutateName:         "file.mutate-name",
+		storage.OpFileOpenNodeRef:        "file.open-node-ref",
+		storage.OpFileOpenChildRef:       "file.open-child-ref",
+		storage.OpFileQueryAction:        "file.query-action",
+		storage.OpFileQueryDeleteIntent:  "file.query-delete-intent",
 		storage.OpFileAck:                "file.ack",
 		storage.OpFileStat:               "file.stat",
+		storage.OpFileState:              "file.state",
 		storage.OpFileRead:               "file.read",
 		storage.OpFileWrite:              "file.write",
 		storage.OpFileTruncate:           "file.truncate",
@@ -47,6 +55,9 @@ func TestOperationConstantsIdentifyDistinctSemanticActions(t *testing.T) {
 		storage.OpFileRangeQuery:         "file.range-query",
 		storage.OpFileRangeCancel:        "file.range-cancel",
 		storage.OpFileRangeDrop:          "file.range-drop",
+		storage.OpFileSetPendingUnlink:   "file.set-pending-unlink",
+		storage.OpFileClearPendingUnlink: "file.clear-pending-unlink",
+		storage.OpFileMutate:             "file.mutate",
 		storage.OpFileClose:              "file.close",
 		storage.OpLockSessionEnrollment:  "lock.session-enrollment",
 		storage.OpLockSessionOpen:        "lock.session-open",
@@ -62,8 +73,8 @@ func TestOperationConstantsIdentifyDistinctSemanticActions(t *testing.T) {
 		storage.OpLockQueryGrant:         "lock.query-grant",
 		storage.OpLockStatus:             "lock.status",
 	}
-	if len(cases) != 54 {
-		t.Fatalf("operation vocabulary has %d entries, want 54", len(cases))
+	if len(cases) != 65 {
+		t.Fatalf("operation vocabulary has %d entries, want 65", len(cases))
 	}
 	for operation, want := range cases {
 		if string(operation) != want {
