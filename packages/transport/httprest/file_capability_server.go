@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -130,6 +131,9 @@ func performReferenceCapability(ctx context.Context, file storage.File, req file
 		}
 		scope, err := capability.Scope(ctx)
 		if err == nil {
+			if err := scope.Check(); err != nil {
+				return response, fmt.Errorf("file reference returned an invalid use scope: %w", syscall.EIO)
+			}
 			response.Scope = &scope
 		}
 		return response, err

@@ -386,12 +386,17 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 		reservation = retainedResponseMultiplier * MaxFileControlBytes
 		successLimit = min(successLimit, MaxFileControlBytes)
 	}
-	release, err := admission.acquire(ctx, reservation)
-	if err != nil {
-		if errors.Is(err, syscall.EAGAIN) {
-			return nil, &operationError{req: req, errno: syscall.EAGAIN, detail: err.Error()}
+	release := func() {}
+	preAdmitted, _ := ctx.Value(fileRequestAdmissionKey{}).(fileRequestAdmission)
+	if preAdmitted.storage != s || !preAdmitted.control || req.Op != OpFileControl {
+		var err error
+		release, err = admission.acquire(ctx, reservation)
+		if err != nil {
+			if errors.Is(err, syscall.EAGAIN) {
+				return nil, &operationError{req: req, errno: syscall.EAGAIN, detail: err.Error()}
+			}
+			return nil, operationFailure(req, err, true)
 		}
-		return nil, operationFailure(req, err, true)
 	}
 	retained := false
 	defer func() {
@@ -545,6 +550,10 @@ func decodeListInto(content []byte, result *storage.ListResult) error {
 // it was told — which is not the same as knowing the operation failed in a particular
 // way, and must not be reported as if it were.
 func (s *Storage) storageError(req Request, body []byte) error {
+	var resp ErrorResponse
+	if err := decodeFileJSON(body, &resp); err != nil {
+		return unreachable(req, err)
+	}
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(body, &members); err != nil {
 		return unreachable(req, err)
@@ -553,37 +562,33 @@ func (s *Storage) storageError(req Request, body []byte) error {
 	_, hasRecorded := members["recorded"]
 	_, hasCapability := members["capabilityCode"]
 	_, hasFileRecorded := members["fileRecorded"]
-	_, hasAttempt := members["attempt"]
-	if (hasCapability || hasFileRecorded) && (hasCode || hasRecorded) {
+	if hasCode != hasRecorded || hasCapability && hasCode {
 		return unreachable(req, errors.New("response combines unrelated error families"))
 	}
-	if hasCode || hasRecorded {
+	if hasCode && !hasFileRecorded {
 		failure, err := decodeVolumeLockFailure(body)
 		if err != nil {
 			return unreachable(req, err)
 		}
 		return failure
 	}
-	var resp ErrorResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return unreachable(req, err)
-	}
 	errno, ok := storage.ErrnoByName(resp.Errno)
 	if !ok {
 		return unreachable(req, fmt.Errorf("the server reported errno %q, which this side does not know", resp.Errno))
 	}
 	var capability error
-	if hasCapability || hasFileRecorded || hasAttempt {
-		if err := decodeFileJSON(body, &resp); err != nil {
-			return unreachable(req, err)
+	if hasCapability {
+		var ok bool
+		capability, ok = capabilityErrors[resp.CapabilityCode]
+		if !ok || storage.ErrnoOf(capability) != errno {
+			return unreachable(req, errors.New("invalid capability error classification"))
 		}
-		if hasCapability {
-			var ok bool
-			capability, ok = capabilityErrors[resp.CapabilityCode]
-			if !ok || storage.ErrnoOf(capability) != errno {
-				return unreachable(req, errors.New("invalid capability error classification"))
-			}
+	}
+	if hasCode {
+		if !validLockCode(resp.LockCode) || locking.Errno(resp.LockCode) != errno || resp.Recorded == nil {
+			return unreachable(req, errors.New("invalid nested lock error classification"))
 		}
+		capability = &locking.Error{Code: resp.LockCode, Recorded: *resp.Recorded, Message: resp.Message}
 	}
 	if hasFileRecorded {
 		if resp.FileRecorded == nil || !*resp.FileRecorded {
@@ -675,7 +680,12 @@ func (r Request) subject() string {
 	}
 }
 
-func (e *operationError) Unwrap() error { return e.errno }
+func (e *operationError) Unwrap() error {
+	if e.capability != nil {
+		return e.capability
+	}
+	return e.errno
+}
 
 func (e *operationError) Classification() error { return e.errno }
 

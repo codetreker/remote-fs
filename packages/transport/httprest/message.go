@@ -266,7 +266,7 @@ func (e *Entry) UnmarshalJSON(data []byte) error {
 	// The alias sheds this method, so what follows is the ordinary decoding.
 	type entry Entry
 	var decoded entry
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	if decoded.Attr == nil {
@@ -281,7 +281,7 @@ func (e *Entry) UnmarshalJSON(data []byte) error {
 func EntriesOf(entries []storage.Entry) []Entry {
 	wire := make([]Entry, 0, len(entries))
 	for _, e := range entries {
-		wire = append(wire, Entry{Name: []byte(e.Name), Attr: AttrOf(e.Attr)})
+		wire = append(wire, Entry{Name: append([]byte{}, e.Name...), Attr: AttrOf(e.Attr)})
 	}
 	return wire
 }
@@ -295,7 +295,7 @@ type StatResponse struct {
 func (r *StatResponse) UnmarshalJSON(data []byte) error {
 	type response StatResponse
 	var decoded response
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	if decoded.Attr == nil {
@@ -315,7 +315,7 @@ type ListResponse struct {
 func (r *ListResponse) UnmarshalJSON(data []byte) error {
 	type response ListResponse
 	var decoded response
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	if decoded.Entries == nil {
@@ -362,7 +362,7 @@ func SpaceOf(s storage.Space) *Space {
 func (s *Space) UnmarshalJSON(data []byte) error {
 	type space Space
 	var decoded space
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	for _, count := range []struct {
@@ -397,7 +397,7 @@ type SpaceResponse struct {
 func (r *SpaceResponse) UnmarshalJSON(data []byte) error {
 	type response SpaceResponse
 	var decoded response
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
 	if decoded.Space == nil {
@@ -430,39 +430,18 @@ func (b *MutationBarrier) UnmarshalJSON(data []byte) error {
 	if len(data) > maxMutationBarrierJSONBytes {
 		return errors.New("the mutation barrier exceeds its protocol bound")
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
+	type barrier MutationBarrier
+	var decoded barrier
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
-	if fields == nil {
-		return errors.New("the mutation barrier is not an object")
-	}
-	for name := range fields {
-		if name != "incarnation" && name != "position" {
-			return fmt.Errorf("the mutation barrier carries unknown field %q", name)
-		}
-	}
-	var decoded struct {
-		Incarnation json.RawMessage `json:"incarnation"`
-		Position    *int64          `json:"position"`
-	}
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
-	}
-	if len(decoded.Incarnation) == 0 || len(decoded.Incarnation) > 6*MaxIncarnationBytes+2 {
-		return errors.New("the mutation barrier carries no bounded log incarnation")
-	}
-	var incarnation string
-	if err := json.Unmarshal(decoded.Incarnation, &incarnation); err != nil {
-		return fmt.Errorf("the mutation barrier incarnation is not a string: %w", err)
-	}
-	if incarnation == "" || len(incarnation) > MaxIncarnationBytes {
+	if decoded.Incarnation == "" || len(decoded.Incarnation) > MaxIncarnationBytes {
 		return errors.New("the mutation barrier names no log incarnation")
 	}
-	if decoded.Position == nil || *decoded.Position < 0 {
+	if decoded.Position < 0 {
 		return errors.New("the mutation barrier carries no valid log position")
 	}
-	*b = MutationBarrier{Incarnation: incarnation, Position: *decoded.Position}
+	*b = MutationBarrier(decoded)
 	return nil
 }
 
@@ -476,31 +455,12 @@ func (r *MutationResponse) UnmarshalJSON(data []byte) error {
 	if len(data) > maxMutationResponseJSONBytes {
 		return errors.New("the mutation response exceeds its protocol bound")
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
+	type response MutationResponse
+	var decoded response
+	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
-	if fields == nil {
-		return errors.New("the mutation response is not an object")
-	}
-	for name := range fields {
-		if name != "barrier" {
-			return fmt.Errorf("the mutation response carries unknown field %q", name)
-		}
-	}
-	raw, present := fields["barrier"]
-	if !present {
-		*r = MutationResponse{}
-		return nil
-	}
-	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return errors.New("the mutation response carries a null barrier")
-	}
-	var barrier MutationBarrier
-	if err := json.Unmarshal(raw, &barrier); err != nil {
-		return err
-	}
-	*r = MutationResponse{Barrier: &barrier}
+	*r = MutationResponse(decoded)
 	return nil
 }
 

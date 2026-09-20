@@ -16,6 +16,11 @@ import (
 
 type fileScopeKey struct{}
 type fileReadOnlyKey struct{}
+type fileRequestAdmissionKey struct{}
+type fileRequestAdmission struct {
+	storage *Storage
+	control bool
+}
 
 func fileReadOnly(op storage.Operation) bool {
 	switch op {
@@ -92,7 +97,7 @@ func (s *Storage) fileCall(ctx context.Context, req fileRequest) (fileResponse, 
 	op := OpFile
 	if fileControl(req.Op) {
 		op = OpFileControl
-	} else {
+	} else if admission, _ := ctx.Value(fileRequestAdmissionKey{}).(fileRequestAdmission); admission.storage != s || admission.control {
 		release, err := s.fileRequests.acquire(ctx, retainedResponseMultiplier*s.maxBodyBytes)
 		if err != nil {
 			return fileResponse{}, operationFailure(Request{Op: OpFile}, err, true)
@@ -179,11 +184,33 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 	if int64(len(req.Path)) > s.storage.maxBodyBytes || int64(len(req.Data)) > s.storage.maxWriteBytes {
 		return fileResponse{}, syscall.EFBIG
 	}
+	if req.Op == storage.OpFileRead && (req.Length < 0 || int64(req.Length) > fileReadLimit(s.storage.maxBodyBytes)) {
+		return fileResponse{}, syscall.EFBIG
+	}
 	if fileBoundedResult(req.Op) && req.ResultBytes == 0 {
 		req.ResultBytes = s.storage.maxBodyBytes
 		if outer, ok := storage.AttrResultByteLimit(ctx); ok {
 			req.ResultBytes = min(req.ResultBytes, outer)
 		}
+	}
+	if err := s.resolvePending(ctx); err != nil {
+		return fileResponse{}, err
+	}
+	control := fileControl(req.Op)
+	admission := s.storage.fileRequests
+	requestLimit := s.storage.maxBodyBytes
+	if control {
+		admission = s.storage.lockControls
+		requestLimit = MaxFileControlBytes
+	}
+	release, err := admission.acquire(ctx, retainedResponseMultiplier*requestLimit)
+	if err != nil {
+		return fileResponse{}, err
+	}
+	defer release()
+	ctx = context.WithValue(ctx, fileRequestAdmissionKey{}, fileRequestAdmission{storage: s.storage, control: control})
+	if req.Op == storage.OpFileRangeApply && rangeResponseBound(req.Commands) > min(s.storage.maxBodyBytes, MaxFileControlBytes) {
+		return fileResponse{}, syscall.EFBIG
 	}
 	frozen, err := freezeFileRequest(req)
 	if err != nil {
@@ -191,7 +218,7 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 	}
 	req = frozen
 	scope, hasScope := s.outgoingMutationScope(ctx, req)
-	if response, recovered, err := s.reconcilePending(ctx, req, scope, hasScope); recovered || err != nil {
+	if response, recovered, err := s.takePendingResult(req, scope, hasScope); recovered || err != nil {
 		return response, err
 	}
 	s.mu.Lock()
@@ -315,12 +342,19 @@ func (s *remoteFileSession) outgoingMutationScope(ctx context.Context, req fileR
 }
 
 func (s *remoteFileSession) reconcilePending(ctx context.Context, incoming fileRequest, incomingScope locking.MutationScope, incomingHasScope bool) (fileResponse, bool, error) {
+	if err := s.resolvePending(ctx); err != nil {
+		return fileResponse{}, false, err
+	}
+	return s.takePendingResult(incoming, incomingScope, incomingHasScope)
+}
+
+func (s *remoteFileSession) resolvePending(ctx context.Context) error {
 	s.reconcileMu.Lock()
 	defer s.reconcileMu.Unlock()
 	s.mu.Lock()
 	if len(s.pending) == 0 {
 		s.mu.Unlock()
-		return fileResponse{}, false, nil
+		return nil
 	}
 	keys := make([]string, 0, len(s.pending))
 	for key := range s.pending {
@@ -335,27 +369,7 @@ func (s *remoteFileSession) reconcilePending(ctx context.Context, incoming fileR
 		if !ok {
 			continue
 		}
-		previous := pending.request
-		previous.Session, previous.Action = "", ""
-		candidate := incoming
-		candidate.Session, candidate.Action = "", ""
-		matches := reflect.DeepEqual(previous, candidate) && pending.hasScope == incomingHasScope && (!pending.hasScope || reflect.DeepEqual(pending.scope, incomingScope))
-		if pending.response != nil {
-			if matches {
-				s.mu.Lock()
-				delete(s.pending, key)
-				s.mu.Unlock()
-				return *pending.response, true, nil
-			}
-			continue
-		}
-		if pending.resultErr != nil {
-			if matches {
-				s.mu.Lock()
-				delete(s.pending, key)
-				s.mu.Unlock()
-				return fileResponse{}, true, pending.resultErr
-			}
+		if pending.response != nil || pending.resultErr != nil {
 			continue
 		}
 		recovery, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -367,19 +381,12 @@ func (s *remoteFileSession) reconcilePending(ctx context.Context, incoming fileR
 		if err != nil {
 			if recordedFileOutcome(err) {
 				s.mu.Lock()
-				if matches {
-					delete(s.pending, key)
-				} else {
-					pending.resultErr = err
-					s.pending[key] = pending
-				}
+				pending.resultErr = err
+				s.pending[key] = pending
 				s.mu.Unlock()
-				if matches {
-					return fileResponse{}, true, err
-				}
 				continue
 			}
-			return fileResponse{}, false, pending.unknown
+			return pending.unknown
 		}
 		if response.Retry {
 			s.mu.Lock()
@@ -391,16 +398,33 @@ func (s *remoteFileSession) reconcilePending(ctx context.Context, incoming fileR
 		if response.Epoch > s.epoch {
 			s.epoch = response.Epoch
 		}
-		if matches {
-			delete(s.pending, key)
-		} else {
-			copy := response
-			pending.response = &copy
-			s.pending[key] = pending
-		}
+		copy := response
+		pending.response = &copy
+		s.pending[key] = pending
 		s.mu.Unlock()
-		if matches {
-			return response, true, nil
+	}
+	return nil
+}
+
+func (s *remoteFileSession) takePendingResult(incoming fileRequest, incomingScope locking.MutationScope, incomingHasScope bool) (fileResponse, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, pending := range s.pending {
+		previous := pending.request
+		previous.Session, previous.Action = "", ""
+		candidate := incoming
+		candidate.Session, candidate.Action = "", ""
+		matches := reflect.DeepEqual(previous, candidate) && pending.hasScope == incomingHasScope && (!pending.hasScope || reflect.DeepEqual(pending.scope, incomingScope))
+		if !matches {
+			continue
+		}
+		if pending.response != nil {
+			delete(s.pending, key)
+			return *pending.response, true, nil
+		}
+		if pending.resultErr != nil {
+			delete(s.pending, key)
+			return fileResponse{}, true, pending.resultErr
 		}
 	}
 	return fileResponse{}, false, nil
@@ -419,8 +443,11 @@ func (s *remoteFileSession) open(ctx context.Context, req fileRequest) (storage.
 		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_, cleanupErr := s.storage.fileCall(cleanup, fileRequest{Op: storage.OpFileClose, Session: s.id, File: response.File})
 		cancel()
+		s.mu.Lock()
+		sessionClosed := s.closed
+		s.mu.Unlock()
 		interruptible := !req.Open.Create && !req.Open.Truncate &&
-			errors.Is(err, context.Canceled) && storage.ErrnoOf(err) == syscall.EINTR && cleanupErr == nil
+			errors.Is(err, context.Canceled) && storage.ErrnoOf(err) == syscall.EINTR && cleanupErr == nil && !sessionClosed
 		if cleanupErr != nil && !errors.Is(cleanupErr, syscall.ESTALE) {
 			err = errors.Join(err, cleanupErr)
 		}

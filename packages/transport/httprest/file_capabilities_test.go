@@ -218,6 +218,33 @@ func (*partialRangeSession) Drop(context.Context, storage.UseOwner, storage.Conf
 	return nil
 }
 
+type invalidScopeBackend struct{ *objectstore.Storage }
+
+func (b invalidScopeBackend) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+	session, err := b.Storage.NewFileSession(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &invalidScopeSession{FileSession: session}, nil
+}
+
+type invalidScopeSession struct{ storage.FileSession }
+
+func (s *invalidScopeSession) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, error) {
+	file, err := s.FileSession.OpenFile(ctx, path, options)
+	if err != nil {
+		return nil, err
+	}
+	return invalidScopeFile{File: file}, nil
+}
+
+type invalidScopeFile struct{ storage.File }
+
+func (invalidScopeFile) CheckScopedReference() error { return nil }
+func (invalidScopeFile) Scope(context.Context) (storage.UseScope, error) {
+	return storage.UseScope{Token: string([]byte{0xff})}, nil
+}
+
 func TestRangeErrorPreservesPartialReceiptAcrossHTTP(t *testing.T) {
 	meta, backend := memoryfixture.New(t, "partial-range-http", 1<<20, locking.DefaultOptions())
 	handler, err := NewHandler(partialRangeBackend{Storage: backend}, meta)
@@ -301,12 +328,74 @@ func TestReferenceMetadataAndOwnerLifecycleAcrossHTTP(t *testing.T) {
 		t.Fatal(err)
 	}
 	owners := session.(storage.UseOwners)
-	owner, err := owners.NewUseOwner(t.Context(), attr.ID, scope, storage.OwnerOptions{Lifetime: storage.OwnerExplicit})
+	owner, err := owners.NewUseOwner(t.Context(), attr.ID, scope, storage.OwnerOptions{Lifetime: storage.OwnerExplicit, Diagnostic: 4242})
 	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := owners.NewUseOwner(t.Context(), attr.ID, scope, storage.OwnerOptions{Lifetime: storage.OwnerExplicit, Diagnostic: 8484})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ranges := session.(storage.RangeControl)
+	status, err := session.Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := storage.NewLockRequestID(status.ActionEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := storage.RangeCommand{Domain: storage.DomainWholeFile, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: ^uint64(0)}, Edit: storage.Replace}
+	if attempt, err := ranges.Apply(t.Context(), owner, []storage.RangeCommand{command}, request); err != nil || attempt.State != storage.Granted {
+		t.Fatalf("range acquisition=%+v error=%v", attempt, err)
+	}
+	conflict, err := ranges.GetConflict(t.Context(), other, command)
+	if err != nil || !conflict.Found || conflict.Owner != 4242 {
+		t.Fatalf("range conflict=%+v error=%v", conflict, err)
+	}
+	if err := ranges.Drop(t.Context(), owner, storage.DomainWholeFile); err != nil {
 		t.Fatal(err)
 	}
 	if err := owners.RetireUseOwner(t.Context(), owner); err != nil {
 		t.Fatal(err)
+	}
+	if err := owners.RetireUseOwner(t.Context(), other); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHTTPRejectsInvalidBackendUseScopeBeforeEncoding(t *testing.T) {
+	meta, backend := memoryfixture.New(t, "invalid-scope-http", 1<<20, locking.DefaultOptions())
+	if err := backend.Write(t.Context(), "file", []byte("content")); err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewHandler(invalidScopeBackend{Storage: backend}, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(func() {
+		server.Close()
+		if err := handler.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	client, err := Dial(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := client.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close(context.Background())
+	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close(context.Background())
+	if _, err := file.(storage.ScopedReference).Scope(t.Context()); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("invalid backend scope error=%v", err)
 	}
 }
 
@@ -357,6 +446,70 @@ func TestImmediateRecoveryReturnsRecordedFileError(t *testing.T) {
 	}
 }
 
+func TestRecordedFileReplayPreservesNestedLockError(t *testing.T) {
+	failure := &locking.Error{Code: locking.Conflict, Recorded: true, Message: "record lock occupied"}
+	response := fileErrorResponse(&recordedFileError{cause: failure}, true)
+	if response.FileRecorded == nil || !*response.FileRecorded || response.LockCode != failure.Code || response.Recorded == nil || *response.Recorded != failure.Recorded || response.Message != failure.Message {
+		t.Fatalf("recorded response=%+v", response)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded := (&Storage{}).storageError(Request{Op: OpFile}, encoded)
+	var operation *operationError
+	var lockFailure *locking.Error
+	if !errors.As(decoded, &operation) || !operation.recorded || !errors.As(decoded, &lockFailure) || lockFailure.Code != failure.Code || lockFailure.Recorded != failure.Recorded || lockFailure.Message != failure.Message {
+		t.Fatalf("decoded recorded lock error=%#v", decoded)
+	}
+	retained := retainFileError(&locking.Error{Code: locking.Conflict, Recorded: true, Message: strings.Repeat("x", 4097) + string([]byte{0xff})})
+	if !errors.As(retained, &lockFailure) || len(lockFailure.Message) > 4096 || !strings.Contains(lockFailure.Message, "cannot be retained") {
+		t.Fatalf("unbounded retained lock error=%#v", retained)
+	}
+}
+
+func TestFileRequestAdmissionPrecedesRequestFreezing(t *testing.T) {
+	const maximum = int64(1024)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		body, _ := json.Marshal(ErrorResponse{Errno: "EIO", Message: "probe"})
+		w.Header().Set(HeaderProtocol, Version)
+		w.Header().Set("Content-Type", contentJSON)
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(StatusStorageError)
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+	client, err := Dial(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.maxBodyBytes, client.maxWriteBytes = maximum, maximum
+	client.fileRequests = newBodyAdmission(1, retainedResponseMultiplier*maximum, 0)
+	client.lockControls = newBodyAdmission(1, retainedResponseMultiplier*MaxFileControlBytes, 0)
+	session := &remoteFileSession{storage: client, id: strings.Repeat("a", 64), epoch: 1, pendingLimit: 1}
+	releaseData, err := client.fileRequests.acquire(t.Context(), retainedResponseMultiplier*maximum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseData()
+	if _, err := session.call(t.Context(), fileRequest{Op: storage.OpFileSetNodeMetadata, Node: 7, Namespace: "client.v1", Payload: metadataPayload("value")}); !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("saturated data request admission error=%v", err)
+	}
+	if _, err := session.call(t.Context(), fileRequest{Op: storage.OpFileScope, File: strings.Repeat("b", 64)}); !errors.Is(err, syscall.EIO) || calls.Load() != 1 {
+		t.Fatalf("data saturation blocked control request: calls=%d error=%v", calls.Load(), err)
+	}
+	releaseControl, err := client.lockControls.acquire(t.Context(), retainedResponseMultiplier*MaxFileControlBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseControl()
+	if _, err := session.call(t.Context(), fileRequest{Op: storage.OpFileScope, File: strings.Repeat("b", 64)}); !errors.Is(err, syscall.EAGAIN) || calls.Load() != 1 {
+		t.Fatalf("saturated control request admission: calls=%d error=%v", calls.Load(), err)
+	}
+}
+
 func TestPendingActionFreezesOriginalResultBudget(t *testing.T) {
 	server := httptest.NewServer(http.NotFoundHandler())
 	defer server.Close()
@@ -387,6 +540,66 @@ func TestPendingActionFreezesOriginalResultBudget(t *testing.T) {
 	for _, pending := range session.pending {
 		if pending.request.ResultBytes != 1024 {
 			t.Fatalf("pending result bound=%d, want 1024", pending.request.ResultBytes)
+		}
+	}
+}
+
+func TestOppositeClassPendingActionsReconcileWithoutAdmissionDeadlock(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		var sent fileRequest
+		if err := decodeFileJSON(body, &sent); err != nil {
+			t.Error(err)
+			return
+		}
+		response := fileResponse{Epoch: 1, Data: []byte{}}
+		if sent.Op == storage.OpFileSetNodeMetadata {
+			response.Metadata = &OpaquePayload{Version: []byte{1}, Data: []byte("value")}
+		}
+		encoded, _ := json.Marshal(response)
+		w.Header().Set(HeaderProtocol, Version)
+		w.Header().Set("Content-Type", contentJSON)
+		w.Header().Set("Content-Length", strconv.Itoa(len(encoded)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(encoded)
+	}))
+	defer server.Close()
+	client, err := Dial(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.fileRequests = newBodyAdmission(1, retainedResponseMultiplier*client.maxBodyBytes, 2)
+	client.lockControls = newBodyAdmission(1, retainedResponseMultiplier*MaxFileControlBytes, 2)
+	dataAction, _ := storage.NewLockRequestID(1)
+	controlAction, _ := storage.NewLockRequestID(1)
+	sessionID := strings.Repeat("a", 64)
+	data := fileRequest{Op: storage.OpFileSetNodeMetadata, Session: sessionID, Action: dataAction, Node: 7, Namespace: "client.v1", Payload: metadataPayload("value"), ResultBytes: client.maxBodyBytes, Path: []byte{}, Data: []byte{}}
+	control := fileRequest{Op: storage.OpFileRangeDrop, Session: sessionID, Action: controlAction, Owner: 1, Domain: storage.DomainRecord, Path: []byte{}, Data: []byte{}}
+	session := &remoteFileSession{storage: client, id: sessionID, epoch: 1, pendingLimit: 4, pending: map[string]pendingFileAction{
+		string(dataAction):    {request: data, unknown: syscall.EIO},
+		string(controlAction): {request: control, unknown: syscall.EIO},
+	}}
+	done := make(chan error, 2)
+	go func() {
+		_, err := session.call(t.Context(), fileRequest{Op: storage.OpFileSetNodeMetadata, Node: 7, Namespace: "client.v1", Payload: metadataPayload("value")})
+		done <- err
+	}()
+	go func() {
+		_, err := session.call(t.Context(), fileRequest{Op: storage.OpFileRangeDrop, Owner: 1, Domain: storage.DomainRecord})
+		done <- err
+	}()
+	for range 2 {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("opposite-class pending reconciliation deadlocked")
 		}
 	}
 }

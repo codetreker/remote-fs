@@ -149,7 +149,11 @@ func TestRangeReplyBudgetRefusesBeforeDispatch(t *testing.T) {
 		commands[index] = storage.RangeCommand{Domain: storage.DomainEnforced, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Start: uint64(index), Length: 1}, Edit: storage.AddExact, Policy: storage.RangePolicy{DenyOthers: storage.ReadData | storage.WriteData}}
 	}
 	request, _ := storage.NewLockRequestID(1)
-	session := &remoteFileSession{storage: &Storage{maxBodyBytes: DefaultMaxLockControlBytes}, capabilities: fileCapabilities{Ranges: true}}
+	session := &remoteFileSession{storage: &Storage{
+		maxBodyBytes: DefaultMaxLockControlBytes,
+		fileRequests: newBodyAdmission(1, retainedResponseMultiplier*DefaultMaxLockControlBytes, 0),
+		lockControls: newBodyAdmission(1, retainedResponseMultiplier*MaxFileControlBytes, 0),
+	}, capabilities: fileCapabilities{Ranges: true}}
 	if _, err := session.Apply(t.Context(), 1, commands, request); !errors.Is(err, syscall.EFBIG) {
 		t.Fatalf("maximum receipt was not refused before dispatch: %v", err)
 	}

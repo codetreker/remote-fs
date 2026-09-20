@@ -15,6 +15,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/locking"
@@ -221,23 +222,14 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 		}
 		var recorded *recordedFileError
 		if errors.As(err, &recorded) {
-			value := true
-			response := ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error(), CapabilityCode: capabilityErrorCode(err), FileRecorded: &value}
-			h.writeFileResponse(w, StatusStorageError, response, control)
+			h.writeFileResponse(w, StatusStorageError, fileErrorResponse(err, true), control)
 			return
 		}
 		if response, ok := authorizationResponse(err); ok {
 			h.writeFileResponse(w, StatusStorageError, response, control)
 			return
 		}
-		response := ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error()}
-		response.CapabilityCode = capabilityErrorCode(err)
-		if failure := volumeLockFailure(err); failure != nil {
-			response.LockCode = failure.Code
-			recorded := failure.Recorded
-			response.Recorded = &recorded
-		}
-		h.writeFileResponse(w, StatusStorageError, response, control)
+		h.writeFileResponse(w, StatusStorageError, fileErrorResponse(err, false), control)
 	}
 	if h.stopped() {
 		writeError(syscall.EIO)
@@ -350,6 +342,22 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.writeFileResponse(w, http.StatusOK, response, control)
+}
+
+func fileErrorResponse(err error, retained bool) ErrorResponse {
+	response := ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error(), CapabilityCode: capabilityErrorCode(err)}
+	if retained {
+		value := true
+		response.FileRecorded = &value
+	}
+	if failure := volumeLockFailure(err); failure != nil {
+		response.CapabilityCode = ""
+		response.Message = failure.Message
+		response.LockCode = failure.Code
+		recorded := failure.Recorded
+		response.Recorded = &recorded
+	}
+	return response
 }
 
 func validateFileArguments(req fileRequest, maximum storage.FileSessionOptions) error {
@@ -766,14 +774,18 @@ func retainFileError(err error) error {
 	if err == nil {
 		return nil
 	}
-	detail := err.Error()
-	if len(detail) > 4096 {
-		detail = strings.Clone(detail[:4096])
-	}
+	detail := boundedRetainedFileDetail(err.Error())
 	if failure := volumeLockFailure(err); failure != nil {
-		return &locking.Error{Code: failure.Code, Recorded: failure.Recorded, Message: detail}
+		return &locking.Error{Code: failure.Code, Recorded: failure.Recorded, Message: boundedRetainedFileDetail(failure.Message)}
 	}
 	return &operationError{req: Request{Op: OpFile}, errno: storage.ErrnoOf(err), detail: detail, capability: capabilityErrors[capabilityErrorCode(err)], canceled: errors.Is(err, context.Canceled), deadline: errors.Is(err, context.DeadlineExceeded)}
+}
+
+func boundedRetainedFileDetail(detail string) string {
+	if len(detail) > 4096 || !utf8.ValidString(detail) {
+		return "file error detail cannot be retained within its text bound"
+	}
+	return strings.Clone(detail)
 }
 
 func retainFileActionError(err error) error {
