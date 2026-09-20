@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"syscall"
@@ -275,10 +276,28 @@ func TestReferenceNameObservationDistinguishesRootLinkedAndDetached(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer openedRoot.Reference.Close(context.Background())
+	rootID, err := storage.ReferenceNodeID(openedRoot.Reference)
+	if err != nil || rootID != uint64(root.ID) {
+		t.Fatalf("node reference identity=%d error=%v", rootID, err)
+	}
 	rootObserver := openedRoot.Reference.(storage.ReferenceNameObserver)
+	if err := rootObserver.CheckReferenceNameObservation(); err != nil {
+		t.Fatalf("node reference name capability=%v", err)
+	}
 	if got, err := rootObserver.ObserveName(t.Context(), nil); err != nil || got.State != storage.NameRoot || got.NodeID != uint64(root.ID) {
 		t.Fatalf("root observation=%+v error=%v", got, err)
+	}
+	if err := openedRoot.Reference.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if closedID, err := storage.ReferenceNodeID(openedRoot.Reference); err != nil || closedID != rootID {
+		t.Fatalf("closed node reference identity=%d error=%v", closedID, err)
+	}
+	if err := rootObserver.CheckReferenceNameObservation(); err != nil {
+		t.Fatalf("closed reference lost capability shape=%v", err)
+	}
+	if got, err := rootObserver.ObserveName(t.Context(), nil); !errors.Is(err, syscall.ESTALE) || !reflect.DeepEqual(got, storage.NameObservation{}) {
+		t.Fatalf("closed node reference observation=%+v error=%v", got, err)
 	}
 
 	if err := store.Create(t.Context(), "file"); err != nil {
@@ -341,6 +360,9 @@ func TestDirectoryMetadataObservationRejectsStaleGuardsWithoutPartialEntries(t *
 func TestDirectoryMetadataObservationIsIndependentOfApplicationEnumeration(t *testing.T) {
 	store, _ := openNameObservationStore(t, nil)
 	t.Cleanup(func() { _ = store.Close() })
+	if err := store.CheckDirectoryMetadataObservation(); err != nil {
+		t.Fatalf("directory metadata capability=%v", err)
+	}
 	if err := store.Mkdir(t.Context(), "guarded"); err != nil {
 		t.Fatal(err)
 	}
@@ -383,6 +405,17 @@ func TestDirectoryMetadataObservationIsIndependentOfApplicationEnumeration(t *te
 	entries, err := result.Entries()
 	if err != nil || len(entries) != 1 || entries[0].Name != "child" {
 		t.Fatalf("metadata entries=%+v error=%v", entries, err)
+	}
+}
+
+func TestDirectoryMetadataObservationCapabilityCheckRejectsAPlainStore(t *testing.T) {
+	store, err := Open(t.Context(), filepath.Join(t.TempDir(), "plain.db"), "workspace", 0, DefaultWindow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.CheckDirectoryMetadataObservation(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("plain Store directory metadata capability=%v", err)
 	}
 }
 
