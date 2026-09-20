@@ -45,7 +45,7 @@ stat "over.bin": Get "http://…/<protocol>/stat?path=over.bin": context cancele
 
 HTTP transport 的底层 errno 保持隔离：连接 Unix socket 失败时的 `ENOENT` 不能变成 volume 不存在。FUSE 的 Create、Mkdir、Setattr 仍保留已发生效果；创建并打开在原生结果里完成，File / FileSession 的属性操作按身份访问，没有设置时间前提交其它 handle 缓冲区的阶段。后续取消的原因可以被追溯，但外层 `EIO` 不被其覆盖。
 
-SQLite 的纯只读取消保留 context 原因并归为 `EINTR`。只读事务清理使用拥有该事务的 context 判断自动回滚：[database/sql 的 Tx.awaitDone](https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/database/sql/sql.go#L2207-L2230)在 context 取消后主动回滚，[再次 Rollback](https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/database/sql/sql.go#L2324-L2359)可直接返回 `sql.ErrTxDone`。这种收尾也可能发生在查询回调成功之后。真实查询错误与独立清理故障不会被取消覆盖；deadline、无法命名的故障、未知 commit 或 poison 仍为 `EIO`。SQLite code 9 只在确有已取消的读取 context 时解释为取消，不能仅凭 `SQLITE_INTERRUPT` 数字推断请求已撤回。
+SQLite 的纯只读取消保留 context 原因并归为 `EINTR`。[database/sql 的 Tx.awaitDone](https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/database/sql/sql.go#L2207-L2230)在 context 取消后主动回滚，[再次 Rollback](https://github.com/golang/go/blob/e3336a22ad3f0a90bd252c95d8b5544e02674205/src/database/sql/sql.go#L2324-L2359)可直接返回 `sql.ErrTxDone`。直接的 `ErrTxDone` 只证明 transaction 已结束；[等待 SQLite transaction 归还连接](./2026-09-19-wait-for-sqlite-transaction-connections.md)拥有后续 connection cleanup 与 gate/ownership 释放顺序。只有绑定 connection 已无错误归还时，直接的 `ErrTxDone` 才能结合事务原 context 解释为自动回滚，包括回调成功后才发生的取消。真实查询错误与独立 cleanup failure 不会被取消覆盖；deadline、无法命名的故障、未知 commit 或 poison 仍为 `EIO`。SQLite code 9 只在确有已取消的读取 context 时解释为取消，不能仅凭 `SQLITE_INTERRUPT` 数字推断请求已撤回。
 
 ### 关闭清理不依赖调用方重新关闭
 
