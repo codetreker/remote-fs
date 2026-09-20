@@ -24,6 +24,26 @@ type nodeRefActionInput struct {
 	Options storage.NodeRefOptions
 }
 
+type referenceActionTarget struct {
+	NodeID uint64
+	Scope  storage.UseScope
+}
+
+type fileMutationActionInput struct {
+	Target  referenceActionTarget
+	Command storage.FileMutation
+}
+
+type pendingUnlinkActionInput struct {
+	Target  referenceActionTarget
+	Command storage.PendingUnlinkCommand
+}
+
+type clearPendingUnlinkActionInput struct {
+	Target  referenceActionTarget
+	Command storage.ClearPendingUnlinkCommand
+}
+
 type fileAction struct {
 	operation storage.Operation
 	digest    [sha256.Size]byte
@@ -114,15 +134,30 @@ func canonicalFileActionInput(input any) any {
 		value.Uses = canonicalTargetUses(value.Uses)
 		return value
 	case storage.FileMutation:
-		value.Data = canonicalBytes(value.Data)
-		value.ExpectedMetadata = canonicalMetadataConditions(value.ExpectedMetadata)
-		value.Metadata = canonicalMetadataUpdates(value.Metadata)
-		value.Attr = canonicalAttrChange(value.Attr)
-		value.Uses = canonicalTargetUses(value.Uses)
+		return canonicalFileMutation(value)
+	case fileMutationActionInput:
+		value.Command = canonicalFileMutation(value.Command)
+		return value
+	case pendingUnlinkActionInput:
+		value.Command.ExpectedMetadata = canonicalMetadataConditions(value.Command.ExpectedMetadata)
+		value.Command.Uses = canonicalTargetUses(value.Command.Uses)
+		return value
+	case clearPendingUnlinkActionInput:
+		value.Command.Generation = canonicalBytes(value.Command.Generation)
+		value.Command.Uses = canonicalTargetUses(value.Command.Uses)
 		return value
 	default:
 		return input
 	}
+}
+
+func canonicalFileMutation(value storage.FileMutation) storage.FileMutation {
+	value.Data = canonicalBytes(value.Data)
+	value.ExpectedMetadata = canonicalMetadataConditions(value.ExpectedMetadata)
+	value.Metadata = canonicalMetadataUpdates(value.Metadata)
+	value.Attr = canonicalAttrChange(value.Attr)
+	value.Uses = canonicalTargetUses(value.Uses)
+	return value
 }
 
 func canonicalChildName(name storage.ChildName) storage.ChildName {

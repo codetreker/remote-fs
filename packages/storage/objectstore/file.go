@@ -276,6 +276,7 @@ func (f *openFile) publish(ctx context.Context, previous metastore.FileState, co
 		node, err = f.native.(metastore.ConditionalFileMutation).CommitMutation(ctx, *condition, previous.Revision, object)
 	}
 	if err != nil {
+		result := node.Attr()
 		if object.Key != "" {
 			cleanupErr := f.cleanupObject(object.Key, false)
 			s.sweepAfterMutation()
@@ -283,10 +284,10 @@ func (f *openFile) publish(ctx context.Context, previous metastore.FileState, co
 				if isVolumeFact(cleanupErr) {
 					err = ambiguousCommitFailure(name, err)
 				}
-				return storage.Attr{}, false, errors.Join(err, internalFailure("abandoning", name, cleanupErr))
+				return result, false, errors.Join(err, internalFailure("abandoning", name, cleanupErr))
 			}
 		}
-		return storage.Attr{}, isRevisionRace(err), err
+		return result, result.ID == 0 && isRevisionRace(err), err
 	}
 	s.sweepAfterMutation()
 	return node.Attr(), false, nil

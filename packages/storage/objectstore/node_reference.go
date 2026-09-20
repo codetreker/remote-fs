@@ -248,7 +248,12 @@ func (r *nodeReference) SetPendingUnlink(ctx context.Context, command storage.Pe
 	if err := command.Check(); err != nil {
 		return storage.ReferenceState{}, err
 	}
-	return runFileAction(ctx, r.session, command.Action, storage.OpFileSetPendingUnlink, command, cloneReferenceState,
+	target, err := r.session.referenceActionTarget(ctx, r)
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	input := pendingUnlinkActionInput{Target: target, Command: command}
+	return runFileAction(ctx, r.session, command.Action, storage.OpFileSetPendingUnlink, input, cloneReferenceState,
 		func(result storage.ReferenceState) bool { return result.Attr.ID != 0 },
 		func() (storage.ReferenceState, error) { return r.setPendingUnlink(ctx, command) })
 }
@@ -270,7 +275,12 @@ func (r *nodeReference) ClearPendingUnlink(ctx context.Context, command storage.
 	if err := command.Check(); err != nil {
 		return storage.ReferenceState{}, err
 	}
-	return runFileAction(ctx, r.session, command.Action, storage.OpFileClearPendingUnlink, command, cloneReferenceState,
+	target, err := r.session.referenceActionTarget(ctx, r)
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	input := clearPendingUnlinkActionInput{Target: target, Command: command}
+	return runFileAction(ctx, r.session, command.Action, storage.OpFileClearPendingUnlink, input, cloneReferenceState,
 		func(result storage.ReferenceState) bool { return result.Attr.ID != 0 },
 		func() (storage.ReferenceState, error) { return r.clearPendingUnlink(ctx, command) })
 }
@@ -285,10 +295,50 @@ func (r *nodeReference) clearPendingUnlink(ctx context.Context, command storage.
 	return publicReferenceState(state), err
 }
 
+func (r *nodeReference) CheckConditionalFileMutation() error {
+	capability, ok := r.native.(metastore.ConditionalFileMutation)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	return capability.CheckConditionalFileMutation()
+}
+
+func (r *nodeReference) MutateFile(ctx context.Context, command storage.FileMutation) (storage.Attr, error) {
+	if err := r.CheckConditionalFileMutation(); err != nil {
+		return storage.Attr{}, err
+	}
+	if err := command.CheckDataLimit(r.session.options.MaxFileSize); err != nil {
+		return storage.Attr{}, err
+	}
+	target, err := r.session.referenceActionTarget(ctx, r)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	input := fileMutationActionInput{Target: target, Command: command}
+	return runFileAction(ctx, r.session, command.Action, storage.OpFileMutate, input,
+		func(attr storage.Attr) storage.Attr { return attr.Clone() },
+		func(attr storage.Attr) bool { return attr.ID != 0 },
+		func() (storage.Attr, error) { return r.mutateFile(ctx, command) })
+}
+
+func (r *nodeReference) mutateFile(ctx context.Context, command storage.FileMutation) (storage.Attr, error) {
+	if command.Kind != storage.MutateAttributes {
+		return storage.Attr{}, syscall.EBADF
+	}
+	ctx, done, err := r.begin(ctx)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	defer done()
+	state, err := r.native.(metastore.ConditionalFileMutation).MutateFile(ctx, command)
+	return state.Attr(), err
+}
+
 var (
 	_ storage.NodeReference           = (*nodeReference)(nil)
 	_ storage.ScopedReference         = (*nodeReference)(nil)
 	_ storage.ReferenceMetadataAccess = (*nodeReference)(nil)
 	_ storage.ReferenceStateAccess    = (*nodeReference)(nil)
 	_ storage.DeleteIntent            = (*nodeReference)(nil)
+	_ storage.ConditionalFileMutation = (*nodeReference)(nil)
 )

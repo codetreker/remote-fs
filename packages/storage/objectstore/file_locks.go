@@ -23,6 +23,7 @@ type orderedReference interface {
 
 type scopedRetainedReference interface {
 	retainedReference
+	storage.ScopedReference
 	admit(context.Context, fileOperationClass) (context.Context, func(), error)
 	nativeReference() orderedReference
 	useBinding() *referenceUses
@@ -34,6 +35,25 @@ func (r *nodeReference) nativeReference() orderedReference {
 	return r.native
 }
 func (r *nodeReference) useBinding() *referenceUses { return &r.uses }
+
+func (fs *fileSession) referenceActionTarget(ctx context.Context, ref scopedRetainedReference) (referenceActionTarget, error) {
+	fs.mu.Lock()
+	binding := *ref.useBinding()
+	fs.mu.Unlock()
+	if binding.nodeID != 0 && binding.scope.Check() == nil {
+		return referenceActionTarget{NodeID: binding.nodeID, Scope: binding.scope}, nil
+	}
+	if _, err := ref.Scope(ctx); err != nil {
+		return referenceActionTarget{}, err
+	}
+	fs.mu.Lock()
+	binding = *ref.useBinding()
+	fs.mu.Unlock()
+	if binding.nodeID == 0 || binding.scope.Check() != nil {
+		return referenceActionTarget{}, syscall.EIO
+	}
+	return referenceActionTarget{NodeID: binding.nodeID, Scope: binding.scope}, nil
+}
 
 var (
 	_ storage.UseOwners    = (*fileSession)(nil)

@@ -158,11 +158,12 @@ func TestFileActionDigestCanonicalizesEquivalentConditionsAndTargetUses(t *testi
 	second.ExpectedMetadata = map[string][]byte{"absent": {}}
 	second.Metadata = map[string]storage.OpaquePayload{"empty": {Version: []byte{}, Data: []byte{}}}
 	second.Uses = []storage.TargetUse{{NodeID: 3, Scope: storage.UseScope{Token: "three"}}, {NodeID: 9, Scope: storage.UseScope{Token: "nine"}}}
-	a, err := fileActionDigest(storage.OpFileMutate, first)
+	target := referenceActionTarget{NodeID: 7, Scope: storage.UseScope{Token: "scope-a"}}
+	a, err := fileActionDigest(storage.OpFileMutate, fileMutationActionInput{Target: target, Command: first})
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := fileActionDigest(storage.OpFileMutate, second)
+	b, err := fileActionDigest(storage.OpFileMutate, fileMutationActionInput{Target: target, Command: second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,11 +171,29 @@ func TestFileActionDigestCanonicalizesEquivalentConditionsAndTargetUses(t *testi
 		t.Fatal("semantically equal action inputs produced different digests")
 	}
 	second.Metadata["empty"] = storage.OpaquePayload{Data: []byte("changed")}
-	c, err := fileActionDigest(storage.OpFileMutate, second)
+	c, err := fileActionDigest(storage.OpFileMutate, fileMutationActionInput{Target: target, Command: second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if a == c {
 		t.Fatal("changed metadata payload retained the original action digest")
+	}
+	differentNode, err := fileActionDigest(storage.OpFileMutate, fileMutationActionInput{
+		Target: referenceActionTarget{NodeID: 8, Scope: target.Scope}, Command: first,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == differentNode {
+		t.Fatal("different receiver node retained the original action digest")
+	}
+	differentScope, err := fileActionDigest(storage.OpFileMutate, fileMutationActionInput{
+		Target: referenceActionTarget{NodeID: target.NodeID, Scope: storage.UseScope{Token: "scope-b"}}, Command: first,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == differentScope {
+		t.Fatal("different receiver scope retained the original action digest")
 	}
 }

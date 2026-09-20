@@ -304,7 +304,12 @@ func (f *openFile) SetPendingUnlink(ctx context.Context, command storage.Pending
 	if err := command.Check(); err != nil {
 		return storage.ReferenceState{}, err
 	}
-	return runFileAction(ctx, f.session, command.Action, storage.OpFileSetPendingUnlink, command, cloneReferenceState,
+	target, err := f.session.referenceActionTarget(ctx, f)
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	input := pendingUnlinkActionInput{Target: target, Command: command}
+	return runFileAction(ctx, f.session, command.Action, storage.OpFileSetPendingUnlink, input, cloneReferenceState,
 		func(result storage.ReferenceState) bool { return result.Attr.ID != 0 },
 		func() (storage.ReferenceState, error) { return f.setPendingUnlink(ctx, command) })
 }
@@ -326,7 +331,12 @@ func (f *openFile) ClearPendingUnlink(ctx context.Context, command storage.Clear
 	if err := command.Check(); err != nil {
 		return storage.ReferenceState{}, err
 	}
-	return runFileAction(ctx, f.session, command.Action, storage.OpFileClearPendingUnlink, command, cloneReferenceState,
+	target, err := f.session.referenceActionTarget(ctx, f)
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	input := clearPendingUnlinkActionInput{Target: target, Command: command}
+	return runFileAction(ctx, f.session, command.Action, storage.OpFileClearPendingUnlink, input, cloneReferenceState,
 		func(result storage.ReferenceState) bool { return result.Attr.ID != 0 },
 		func() (storage.ReferenceState, error) { return f.clearPendingUnlink(ctx, command) })
 }

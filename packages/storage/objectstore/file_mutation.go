@@ -25,7 +25,12 @@ func (f *openFile) MutateFile(ctx context.Context, command storage.FileMutation)
 	if err := command.CheckDataLimit(f.session.options.MaxFileSize); err != nil {
 		return storage.Attr{}, err
 	}
-	return runFileAction(ctx, f.session, command.Action, storage.OpFileMutate, command,
+	target, err := f.session.referenceActionTarget(ctx, f)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	input := fileMutationActionInput{Target: target, Command: command}
+	return runFileAction(ctx, f.session, command.Action, storage.OpFileMutate, input,
 		func(attr storage.Attr) storage.Attr { return attr.Clone() },
 		func(attr storage.Attr) bool { return attr.ID != 0 },
 		func() (storage.Attr, error) { return f.mutateFile(ctx, command) })
