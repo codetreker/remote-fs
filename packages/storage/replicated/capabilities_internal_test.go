@@ -160,3 +160,13 @@ func TestReferenceCapabilityChecksAndErrorsArePreserved(t *testing.T) {
 		t.Fatalf("refused metadata=%v", err)
 	}
 }
+
+func TestAtomicOpenNormalizesTypedNilPartialReference(t *testing.T) {
+	session := retainedTestSession(t, nil)
+	failure := errors.New("open failed before retaining a reference")
+	var typedNil *fileAuthorityStub
+	result, err := session.wrapOpenResult(storage.OpenResult{File: typedNil}, failure)
+	if !errors.Is(err, failure) || result.File != nil {
+		t.Fatalf("typed-nil result=%+v error=%v", result, err)
+	}
+}

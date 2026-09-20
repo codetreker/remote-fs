@@ -14,17 +14,24 @@ import (
 )
 
 type fileBackendOptions struct {
-	retained int
-	advisory advisory.Config
+	retained      int
+	deleteIntents int
+	advisory      advisory.Config
 }
 
 func defaultFileBackendOptions() fileBackendOptions {
-	return fileBackendOptions{retained: sqlite.DefaultMaxRetainedFiles, advisory: advisory.DefaultConfig()}
+	return fileBackendOptions{
+		retained:      sqlite.DefaultMaxRetainedFiles,
+		deleteIntents: sqlite.DefaultMaxDeleteIntents,
+		advisory:      advisory.DefaultConfig(),
+	}
 }
 
 func bindFileOptions(flags *flag.FlagSet, backend *fileBackendOptions, files *httprest.FileLimits) {
 	flags.IntVar(&backend.retained, "max-retained-files", backend.retained,
 		"maximum live native file references in the volume, including unlinked files")
+	flags.IntVar(&backend.deleteIntents, "max-delete-intents", backend.deleteIntents,
+		"maximum durable close-time deletion receipts retained by the volume")
 	flags.Var((*fileByteLimit)(&backend.advisory.MaxFileBytes), "max-file-size",
 		"largest retained file object, as SIZE; writes and truncation above it fail with EFBIG.\n"+
 			"The default is capped by configured object and pending-byte limits")
@@ -65,6 +72,8 @@ func validateFileOptions(config commandConfig) error {
 	switch {
 	case backend.retained <= 0 || backend.retained == math.MaxInt:
 		return errors.New("-max-retained-files must be positive and below the largest integer")
+	case backend.deleteIntents <= 0 || backend.deleteIntents == math.MaxInt:
+		return errors.New("-max-delete-intents must be positive and below the largest integer")
 	case backend.advisory.MaxMaterializedBytes == math.MaxInt64:
 		return errors.New("-max-file-staging-bytes must be below the largest integer")
 	case backend.advisory.MaxFileBytes > backend.advisory.MaxMaterializedBytes/2:

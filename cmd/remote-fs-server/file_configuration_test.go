@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -31,11 +32,14 @@ func TestFileDefaultsPreserveTheOneGiBFileCeiling(t *testing.T) {
 	if config.files.advisory.MaxSessions != config.http.Files.MaxSessions {
 		t.Fatalf("HTTP and native session bounds disagree: %d/%d", config.http.Files.MaxSessions, config.files.advisory.MaxSessions)
 	}
+	if config.files.deleteIntents != sqlite.DefaultMaxDeleteIntents {
+		t.Fatalf("delete intent default is %d, want %d", config.files.deleteIntents, sqlite.DefaultMaxDeleteIntents)
+	}
 }
 
 func TestFileControlsReachTheirOwnedConfiguration(t *testing.T) {
 	config, _, err := parseConfig(append(fileConfigArgs("/store"),
-		"-max-retained-files", "19", "-max-file-size", "4M", "-max-file-staging-bytes", "8M",
+		"-max-retained-files", "19", "-max-delete-intents", "23", "-max-file-size", "4M", "-max-file-staging-bytes", "8M",
 		"-file-operation-timeout", "2s", "-http-max-file-sessions", "3",
 		"-http-max-file-actions", "5", "-http-max-file-cleanup-actions", "7",
 		"-file-session-lease", "3s", "-file-session-history", "4s", "-http-file-open-ack-timeout", "1s",
@@ -43,7 +47,7 @@ func TestFileControlsReachTheirOwnedConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.files.retained != 19 || config.files.advisory.MaxFileBytes != 4<<20 || config.files.advisory.MaxMaterializedBytes != 8<<20 ||
+	if config.files.retained != 19 || config.files.deleteIntents != 23 || config.files.advisory.MaxFileBytes != 4<<20 || config.files.advisory.MaxMaterializedBytes != 8<<20 ||
 		config.files.advisory.FileOperationTimeout != 2*time.Second || config.files.advisory.MaxSessions != 3 {
 		t.Fatalf("native file configuration is %+v", config.files)
 	}
@@ -69,6 +73,7 @@ func TestImplicitFileCeilingRespectsConfiguredObjectCapacity(t *testing.T) {
 func TestInvalidFileControlsFailBeforeListenerAndStorageInitialization(t *testing.T) {
 	for _, test := range []struct{ name, value string }{
 		{"max-retained-files", "0"}, {"max-retained-files", strconv.Itoa(math.MaxInt)},
+		{"max-delete-intents", "0"}, {"max-delete-intents", strconv.Itoa(math.MaxInt)},
 		{"max-file-size", "0"}, {"max-file-staging-bytes", "1K"},
 		{"file-operation-timeout", "0s"}, {"http-max-file-sessions", "0"},
 		{"http-max-file-actions", "0"}, {"http-max-file-cleanup-actions", "0"},

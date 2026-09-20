@@ -17,6 +17,11 @@ type capabilitySessionProbe struct {
 	failure  error
 	attempt  storage.RangeAttempt
 	observed locking.MutationScope
+	open     storage.OpenResult
+	node     storage.NodeOpenResult
+	name     storage.NameResult
+	action   storage.FileActionReceipt
+	deleted  storage.DeleteIntentStatus
 }
 
 func (p *capabilitySessionProbe) capture(ctx context.Context) {
@@ -60,12 +65,49 @@ func (p *capabilitySessionProbe) Drop(ctx context.Context, _ storage.UseOwner, _
 	p.capture(ctx)
 	return p.failure
 }
+func (p *capabilitySessionProbe) CheckAtomicFileOpen() error { return p.checkErr }
+func (p *capabilitySessionProbe) OpenAt(ctx context.Context, _ storage.ChildName, _ storage.OpenAtOptions) (storage.OpenResult, error) {
+	p.capture(ctx)
+	return p.open, p.failure
+}
+func (p *capabilitySessionProbe) CheckNamespaceAccess() error { return p.checkErr }
+func (p *capabilitySessionProbe) LookupAt(ctx context.Context, _ storage.ChildName) (storage.Attr, error) {
+	p.capture(ctx)
+	return storage.Attr{ID: 3, Kind: storage.NodeRegular}, p.failure
+}
+func (p *capabilitySessionProbe) MutateName(ctx context.Context, _ storage.NameCommand) (storage.NameResult, error) {
+	p.capture(ctx)
+	return p.name, p.failure
+}
+func (p *capabilitySessionProbe) CheckNodeReferences() error { return p.checkErr }
+func (p *capabilitySessionProbe) OpenNodeRef(ctx context.Context, _ uint64, _ storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	p.capture(ctx)
+	return p.node, p.failure
+}
+func (p *capabilitySessionProbe) OpenChildRef(ctx context.Context, _ storage.ChildName, _ storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	p.capture(ctx)
+	return p.node, p.failure
+}
+func (p *capabilitySessionProbe) CheckFileActions() error { return p.checkErr }
+func (p *capabilitySessionProbe) QueryFileAction(ctx context.Context, _ storage.FileActionID) (storage.FileActionReceipt, error) {
+	p.capture(ctx)
+	return p.action, p.failure
+}
+func (p *capabilitySessionProbe) QueryDeleteIntent(ctx context.Context, _ storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+	p.capture(ctx)
+	return p.deleted, p.failure
+}
+func (p *capabilitySessionProbe) AcknowledgeDeleteIntent(ctx context.Context, _ storage.AcknowledgeDeleteIntentCommand) error {
+	p.capture(ctx)
+	return p.failure
+}
 
 type capabilityFileProbe struct {
 	storage.File
 	checkErr error
 	failure  error
 	observed locking.MutationScope
+	state    storage.ReferenceState
 }
 
 func (p *capabilityFileProbe) CheckScopedReference() error { return p.checkErr }
@@ -77,6 +119,25 @@ func (p *capabilityFileProbe) CheckMetadataAccess() error { return p.checkErr }
 func (p *capabilityFileProbe) SetMetadata(ctx context.Context, _ string, _, _ []byte) (storage.OpaquePayload, error) {
 	p.observed = locking.ScopeFromContext(ctx)
 	return storage.OpaquePayload{Version: []byte{1}, Data: []byte("value")}, p.failure
+}
+func (p *capabilityFileProbe) CheckReferenceState() error { return p.checkErr }
+func (p *capabilityFileProbe) State(ctx context.Context) (storage.ReferenceState, error) {
+	p.observed = locking.ScopeFromContext(ctx)
+	return p.state, p.failure
+}
+func (p *capabilityFileProbe) CheckDeleteIntent() error { return p.checkErr }
+func (p *capabilityFileProbe) SetPendingUnlink(ctx context.Context, _ storage.PendingUnlinkCommand) (storage.ReferenceState, error) {
+	p.observed = locking.ScopeFromContext(ctx)
+	return p.state, p.failure
+}
+func (p *capabilityFileProbe) ClearPendingUnlink(ctx context.Context, _ storage.ClearPendingUnlinkCommand) (storage.ReferenceState, error) {
+	p.observed = locking.ScopeFromContext(ctx)
+	return p.state, p.failure
+}
+func (p *capabilityFileProbe) CheckConditionalFileMutation() error { return p.checkErr }
+func (p *capabilityFileProbe) MutateFile(ctx context.Context, _ storage.FileMutation) (storage.Attr, error) {
+	p.observed = locking.ScopeFromContext(ctx)
+	return p.state.Attr, p.failure
 }
 
 func TestSessionCapabilitiesSeparateMutationProofsAndPreserveResults(t *testing.T) {
@@ -166,5 +227,60 @@ func TestSessionCapabilitiesSeparateMutationProofsAndPreserveResults(t *testing.
 	}
 	if err := missingFile.(storage.ReferenceMetadataAccess).CheckMetadataAccess(); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("missing reference metadata check=%v", err)
+	}
+}
+
+func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
+	failure := errors.New("native result delivery failed")
+	attr := storage.Attr{ID: 3, Kind: storage.NodeRegular}
+	reference := &capabilityFileProbe{failure: failure, state: storage.ReferenceState{Attr: attr}}
+	probe := &capabilitySessionProbe{
+		failure: failure,
+		open:    storage.OpenResult{File: reference, Attr: attr, Outcome: storage.Created},
+		node:    storage.NodeOpenResult{Reference: reference, Attr: attr, Outcome: storage.Opened},
+		name:    storage.NameResult{Attr: &attr},
+	}
+	action, err := storage.NewFileActionID(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := storage.NewDeleteIntentID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe.action = storage.FileActionReceipt{Action: action, Operation: storage.OpFileMutateName, Outcome: storage.FileActionCompleted}
+	probe.deleted = storage.DeleteIntentStatus{ID: intent, NodeID: attr.ID, Outcome: storage.DeleteIntentCompleted}
+	proof := locking.MutationScope{Owner: locking.OwnerRef{Session: "session", Owner: "owner"}}
+	view := &Storage{scope: &proof}
+	session := &fileSession{FileSession: probe, storage: view}
+	opened, err := session.OpenAt(t.Context(), storage.ChildName{}, storage.OpenAtOptions{})
+	if !errors.Is(err, failure) || opened.File == nil || !reflect.DeepEqual(probe.observed, proof) {
+		t.Fatalf("atomic open=%+v error=%v scope=%+v", opened, err, probe.observed)
+	}
+	if _, err := session.LookupAt(locking.WithScope(t.Context(), proof), storage.ChildName{}); !errors.Is(err, failure) || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
+		t.Fatalf("lookup error=%v scope=%+v", err, probe.observed)
+	}
+	result, err := session.OpenNodeRef(t.Context(), attr.ID, storage.NodeRefOptions{})
+	if !errors.Is(err, failure) || result.Reference == nil || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
+		t.Fatalf("read-only reference=%+v error=%v scope=%+v", result, err, probe.observed)
+	}
+	result, err = session.OpenChildRef(t.Context(), storage.ChildName{}, storage.NodeRefOptions{Create: true})
+	if !errors.Is(err, failure) || result.Reference == nil || !reflect.DeepEqual(probe.observed, proof) {
+		t.Fatalf("creating reference=%+v error=%v scope=%+v", result, err, probe.observed)
+	}
+	if state, err := result.Reference.State(t.Context()); !errors.Is(err, failure) || state.Attr.ID != attr.ID || !reflect.DeepEqual(reference.observed, locking.MutationScope{}) {
+		t.Fatalf("reference state=%+v error=%v scope=%+v", state, err, reference.observed)
+	}
+	if state, err := result.Reference.(storage.DeleteIntent).SetPendingUnlink(t.Context(), storage.PendingUnlinkCommand{}); !errors.Is(err, failure) || state.Attr.ID != attr.ID || !reflect.DeepEqual(reference.observed, proof) {
+		t.Fatalf("pending state=%+v error=%v scope=%+v", state, err, reference.observed)
+	}
+	if receipt, err := session.QueryFileAction(locking.WithScope(t.Context(), proof), action); !errors.Is(err, failure) || receipt.Action != action || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
+		t.Fatalf("action receipt=%+v error=%v scope=%+v", receipt, err, probe.observed)
+	}
+	if status, err := session.QueryDeleteIntent(locking.WithScope(t.Context(), proof), intent); !errors.Is(err, failure) || status.ID != intent || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
+		t.Fatalf("delete status=%+v error=%v scope=%+v", status, err, probe.observed)
+	}
+	if err := session.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: action, Intent: intent}); !errors.Is(err, failure) || !reflect.DeepEqual(probe.observed, proof) {
+		t.Fatalf("delete acknowledgement=%v scope=%+v", err, probe.observed)
 	}
 }

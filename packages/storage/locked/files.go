@@ -104,6 +104,48 @@ func (s *Storage) wrapFile(inner storage.File) storage.File {
 	return &file{File: inner, referenceCapabilities: referenceCapabilities{backend: inner, storage: s}}
 }
 
+type nodeReference struct {
+	storage.NodeReference
+	referenceCapabilities
+}
+
+func (s *Storage) wrapNodeReference(inner storage.NodeReference) storage.NodeReference {
+	if inner == nil {
+		return nil
+	}
+	return &nodeReference{NodeReference: inner, referenceCapabilities: referenceCapabilities{backend: inner, storage: s}}
+}
+
+func (r *nodeReference) Stat(ctx context.Context) (storage.Attr, error) {
+	return r.NodeReference.Stat(readContext(ctx))
+}
+
+func (r *nodeReference) SetAttr(ctx context.Context, change storage.AttrChange) (storage.Attr, error) {
+	return r.NodeReference.SetAttr(r.storage.mutationContext(ctx), change)
+}
+
+func (r *nodeReference) Close(ctx context.Context) error {
+	return r.NodeReference.Close(readContext(ctx))
+}
+
+func (r *nodeReference) CheckScopedReference() error {
+	return r.referenceCapabilities.CheckScopedReference()
+}
+
+func (r *nodeReference) Scope(ctx context.Context) (storage.UseScope, error) {
+	return r.referenceCapabilities.Scope(ctx)
+}
+
+func (r *nodeReference) CheckReferenceState() error {
+	return r.referenceCapabilities.CheckReferenceState()
+}
+
+func (r *nodeReference) State(ctx context.Context) (storage.ReferenceState, error) {
+	return r.referenceCapabilities.State(ctx)
+}
+
+var _ storage.NodeReference = (*nodeReference)(nil)
+
 func (f *file) Stat(ctx context.Context) (storage.Attr, error) {
 	return f.File.Stat(readContext(ctx))
 }

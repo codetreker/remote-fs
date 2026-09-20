@@ -89,7 +89,11 @@ func (f *retainedFile) Close(ctx context.Context) error {
 		return nil
 	}
 	_, err := fileCall(ctx, f.session, false, func(ctx context.Context) (struct{}, error) {
-		return struct{}{}, f.remote.Close(ctx)
+		barrier, err := f.remote.CloseWithBarrier(ctx)
+		if err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, f.session.confirmCleanup(ctx, "close-file", barrier)
 	})
 	if err == nil {
 		f.mu.Lock()

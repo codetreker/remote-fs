@@ -172,7 +172,7 @@ func (f *openFile) WriteAt(ctx context.Context, offset int64, data []byte) (stor
 		if len(data) != 0 {
 			copy(body[offset:], data)
 		}
-	})
+	}, nil)
 }
 
 func (f *openFile) Truncate(ctx context.Context, size int64) (storage.Attr, error) {
@@ -180,10 +180,10 @@ func (f *openFile) Truncate(ctx context.Context, size int64) (storage.Attr, erro
 		return storage.Attr{}, syscall.EINVAL
 	}
 	ctx = metastore.WithFileAccess(ctx, metastore.FileAccess{Uses: storage.WriteData, Truncate: true, Size: size})
-	return f.mutate(ctx, func(int64) int64 { return size }, func([]byte) {})
+	return f.mutate(ctx, func(int64) int64 { return size }, func([]byte) {}, nil)
 }
 
-func (f *openFile) mutate(ctx context.Context, size func(int64) int64, patch func([]byte)) (storage.Attr, error) {
+func (f *openFile) mutate(ctx context.Context, size func(int64) int64, patch func([]byte), condition *storage.FileMutation) (storage.Attr, error) {
 	if !f.options.Write {
 		return storage.Attr{}, syscall.EBADF
 	}
@@ -210,7 +210,7 @@ func (f *openFile) mutate(ctx context.Context, size func(int64) int64, patch fun
 		// Emptying a retained object preserves no old bytes. The revision-CAS
 		// publication still validates strong permissions and the reference lifetime.
 		if next == 0 {
-			result, retry, err := f.publish(ctx, node, nil)
+			result, retry, err := f.publish(ctx, node, nil, condition)
 			if retry {
 				continue
 			}
@@ -239,7 +239,7 @@ func (f *openFile) mutate(ctx context.Context, size func(int64) int64, patch fun
 		content := make([]byte, int(next))
 		copy(content, body)
 		patch(content)
-		result, retry, err := f.publish(ctx, node, content)
+		result, retry, err := f.publish(ctx, node, content, condition)
 		release()
 		if retry {
 			continue
@@ -249,7 +249,7 @@ func (f *openFile) mutate(ctx context.Context, size func(int64) int64, patch fun
 	return storage.Attr{}, fmt.Errorf("retained file changed during every publication attempt: %w", syscall.EAGAIN)
 }
 
-func (f *openFile) publish(ctx context.Context, previous metastore.FileState, content []byte) (storage.Attr, bool, error) {
+func (f *openFile) publish(ctx context.Context, previous metastore.FileState, content []byte, condition *storage.FileMutation) (storage.Attr, bool, error) {
 	s := f.session.storage
 	name := fmt.Sprintf("node %d", previous.ID)
 	object := metastore.Object{Size: int64(len(content)), ModTime: s.now()}
@@ -268,7 +268,13 @@ func (f *openFile) publish(ctx context.Context, previous metastore.FileState, co
 		}
 		object.Key, object.Digest = key, digest
 	}
-	node, err := f.native.Commit(ctx, previous.Revision, object)
+	var node metastore.FileState
+	var err error
+	if condition == nil {
+		node, err = f.native.Commit(ctx, previous.Revision, object)
+	} else {
+		node, err = f.native.(metastore.ConditionalFileMutation).CommitMutation(ctx, *condition, previous.Revision, object)
+	}
 	if err != nil {
 		if object.Key != "" {
 			cleanupErr := f.cleanupObject(object.Key, false)
@@ -280,7 +286,7 @@ func (f *openFile) publish(ctx context.Context, previous metastore.FileState, co
 				return storage.Attr{}, false, errors.Join(err, internalFailure("abandoning", name, cleanupErr))
 			}
 		}
-		return storage.Attr{}, isOnly(err, syscall.EAGAIN), err
+		return storage.Attr{}, isRevisionRace(err), err
 	}
 	s.sweepAfterMutation()
 	return node.Attr(), false, nil

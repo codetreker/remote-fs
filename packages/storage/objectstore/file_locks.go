@@ -17,6 +17,24 @@ type referenceUses struct {
 	owners   map[storage.UseOwner]struct{}
 }
 
+type orderedReference interface {
+	Order(context.Context, func() error) error
+}
+
+type scopedRetainedReference interface {
+	retainedReference
+	admit(context.Context, fileOperationClass) (context.Context, func(), error)
+	nativeReference() orderedReference
+	useBinding() *referenceUses
+}
+
+func (f *openFile) nativeReference() orderedReference { return f.native }
+func (f *openFile) useBinding() *referenceUses        { return &f.uses }
+func (r *nodeReference) nativeReference() orderedReference {
+	return r.native
+}
+func (r *nodeReference) useBinding() *referenceUses { return &r.uses }
+
 var (
 	_ storage.UseOwners    = (*fileSession)(nil)
 	_ storage.RangeControl = (*fileSession)(nil)
@@ -44,24 +62,27 @@ func (fs *fileSession) CheckRangeControl() error {
 	return native.CheckRangeControl()
 }
 
-func (fs *fileSession) scopedReference(scope storage.UseScope) (*openFile, error) {
+func (fs *fileSession) scopedReference(scope storage.UseScope) (scopedRetainedReference, error) {
 	if err := scope.Check(); err != nil {
 		return nil, err
 	}
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	for ref := range fs.files {
-		if ref.uses.scope == scope {
-			return ref, nil
+		scoped := ref.(scopedRetainedReference)
+		if scoped.useBinding().scope == scope {
+			return scoped, nil
 		}
 	}
 	return nil, storage.ErrInvalidScope
 }
 
-func (fs *fileSession) referenceOrder(ref *openFile) advisory.Order {
+func (fs *fileSession) referenceOrder(ref scopedRetainedReference) (advisory.Order, error) {
+	native := ref.nativeReference()
 	return func(ctx context.Context, transition func() error) error {
-		return ref.native.Order(metastore.WithFilePublicationGuard(ctx, fs.publicationAllowed), transition)
-	}
+		ctx = metastore.WithReferenceSession(ctx, fs.locks)
+		return native.Order(metastore.WithFilePublicationGuard(ctx, fs.publicationAllowed), transition)
+	}, nil
 }
 
 func (fs *fileSession) NewUseOwner(ctx context.Context, node uint64, scope storage.UseScope, options storage.OwnerOptions) (storage.UseOwner, error) {
@@ -81,12 +102,15 @@ func (fs *fileSession) NewUseOwner(ctx context.Context, node uint64, scope stora
 	}
 	defer done()
 	fs.mu.Lock()
-	nodeID := ref.uses.nodeID
+	nodeID := ref.useBinding().nodeID
 	fs.mu.Unlock()
 	if nodeID != node {
 		return 0, storage.ErrInvalidScope
 	}
-	order := fs.referenceOrder(ref)
+	order, err := fs.referenceOrder(ref)
+	if err != nil {
+		return 0, err
+	}
 	var owner storage.UseOwner
 	err = order(ctx, func() error {
 		var err error
@@ -98,16 +122,17 @@ func (fs *fileSession) NewUseOwner(ctx context.Context, node uint64, scope stora
 	}
 	if options.Lifetime == storage.OwnerReference {
 		fs.mu.Lock()
-		if ref.uses.retiring {
+		uses := ref.useBinding()
+		if uses.retiring {
 			fs.mu.Unlock()
 			cleanup, cancel := fs.operationContext(fs.cleanup)
 			defer cancel()
 			return 0, errors.Join(syscall.EBADF, fs.locks.RetireOwner(cleanup, owner))
 		}
-		if ref.uses.owners == nil {
-			ref.uses.owners = make(map[storage.UseOwner]struct{})
+		if uses.owners == nil {
+			uses.owners = make(map[storage.UseOwner]struct{})
 		}
-		ref.uses.owners[owner] = struct{}{}
+		uses.owners[owner] = struct{}{}
 		fs.mu.Unlock()
 	}
 	return owner, nil
@@ -129,7 +154,7 @@ func (fs *fileSession) RetireUseOwner(ctx context.Context, owner storage.UseOwne
 	}
 	fs.mu.Lock()
 	for ref := range fs.files {
-		delete(ref.uses.owners, owner)
+		delete(ref.(scopedRetainedReference).useBinding().owners, owner)
 	}
 	fs.mu.Unlock()
 	return nil
@@ -148,7 +173,8 @@ func (fs *fileSession) ownerOrder(ctx context.Context, owner storage.UseOwner) (
 	if err != nil {
 		return 0, nil, err
 	}
-	return node, fs.referenceOrder(ref), nil
+	order, err := fs.referenceOrder(ref)
+	return node, order, err
 }
 
 func (fs *fileSession) GetConflict(ctx context.Context, owner storage.UseOwner, command storage.RangeCommand) (storage.RangeConflict, error) {

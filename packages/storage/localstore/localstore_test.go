@@ -517,6 +517,12 @@ func TestConfigurationIsValidatedBeforeTheRootIsTouched(t *testing.T) {
 		"unbounded metadata bytes": func(config *localstore.Config) {
 			config.MaxMetadataBytes = math.MaxInt64
 		},
+		"delete intent limit": func(config *localstore.Config) {
+			config.MaxDeleteIntents = -1
+		},
+		"unbounded delete intents": func(config *localstore.Config) {
+			config.MaxDeleteIntents = math.MaxInt
+		},
 	}
 	for name, invalidate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -580,6 +586,7 @@ func TestStatusCombinesLogicalObjectAndPhysicalState(t *testing.T) {
 	config.MaxIntegrityRecords = 100
 	config.MaxIntegrityBytes = 1 << 20
 	config.MaxMetadataBytes = 2 << 20
+	config.MaxDeleteIntents = 17
 	store := open(t, config)
 	t.Cleanup(func() { closeStore(t, store) })
 
@@ -615,6 +622,9 @@ func TestStatusCombinesLogicalObjectAndPhysicalState(t *testing.T) {
 	}
 	if status.MaxMetadataBytes != config.MaxMetadataBytes {
 		t.Fatalf("Status.MaxMetadataBytes = %d, want %d", status.MaxMetadataBytes, config.MaxMetadataBytes)
+	}
+	if status.MaxDeleteIntents != config.MaxDeleteIntents {
+		t.Fatalf("Status.MaxDeleteIntents = %d, want %d", status.MaxDeleteIntents, config.MaxDeleteIntents)
 	}
 	if status.MaxSnapshotReaderConnections != config.MaxSnapshotReaderConnections {
 		t.Fatalf("Status.MaxSnapshotReaderConnections = %d, want %d",
@@ -775,6 +785,10 @@ func TestStatusReportsEffectiveDefaultObjectLimits(t *testing.T) {
 		t.Fatalf("Status.MaxMetadataBytes = %d, want default %d",
 			status.MaxMetadataBytes, sqlite.DefaultMaxMetadataBytes)
 	}
+	if status.MaxDeleteIntents != sqlite.DefaultMaxDeleteIntents {
+		t.Fatalf("Status.MaxDeleteIntents = %d, want default %d",
+			status.MaxDeleteIntents, sqlite.DefaultMaxDeleteIntents)
+	}
 	if status.MaxSnapshotReaderConnections != sqlite.DefaultMaxSnapshotReaderConnections {
 		t.Fatalf("Status.MaxSnapshotReaderConnections = %d, want default %d",
 			status.MaxSnapshotReaderConnections, sqlite.DefaultMaxSnapshotReaderConnections)
@@ -788,6 +802,7 @@ func TestConfiguredReaderConnectionLimitIsReported(t *testing.T) {
 	config.MaxIntegrityRecords = 101
 	config.MaxIntegrityBytes = 202
 	config.MaxMetadataBytes = 303
+	config.MaxDeleteIntents = 17
 	store := open(t, config)
 	t.Cleanup(func() { closeStore(t, store) })
 	status, err := store.Status(t.Context())
@@ -809,6 +824,10 @@ func TestConfiguredReaderConnectionLimitIsReported(t *testing.T) {
 	if status.MaxMetadataBytes != config.MaxMetadataBytes {
 		t.Fatalf("Status.MaxMetadataBytes = %d, want %d",
 			status.MaxMetadataBytes, config.MaxMetadataBytes)
+	}
+	if status.MaxDeleteIntents != config.MaxDeleteIntents {
+		t.Fatalf("Status.MaxDeleteIntents = %d, want %d",
+			status.MaxDeleteIntents, config.MaxDeleteIntents)
 	}
 	if status.MaxSnapshotReaderConnections != config.MaxSnapshotReaderConnections {
 		t.Fatalf("Status.MaxSnapshotReaderConnections = %d, want %d",

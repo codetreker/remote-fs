@@ -16,6 +16,106 @@ func capability[C any](backend any, check func(C) error) (C, error) {
 	return value, check(value)
 }
 
+func (s *fileSession) CheckAtomicFileOpen() error {
+	_, err := capability(s.FileSession, storage.AtomicFileOpener.CheckAtomicFileOpen)
+	return err
+}
+
+func (s *fileSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
+	backend, err := capability(s.FileSession, storage.AtomicFileOpener.CheckAtomicFileOpen)
+	if err != nil {
+		return storage.OpenResult{}, err
+	}
+	result, err := backend.OpenAt(s.storage.mutationContext(ctx), name, options)
+	result.File = s.storage.wrapFile(result.File)
+	return result, err
+}
+
+func (s *fileSession) CheckNamespaceAccess() error {
+	_, err := capability(s.FileSession, storage.NamespaceAccess.CheckNamespaceAccess)
+	return err
+}
+
+func (s *fileSession) LookupAt(ctx context.Context, name storage.ChildName) (storage.Attr, error) {
+	backend, err := capability(s.FileSession, storage.NamespaceAccess.CheckNamespaceAccess)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	return backend.LookupAt(readContext(ctx), name)
+}
+
+func (s *fileSession) MutateName(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
+	backend, err := capability(s.FileSession, storage.NamespaceAccess.CheckNamespaceAccess)
+	if err != nil {
+		return storage.NameResult{}, err
+	}
+	return backend.MutateName(s.storage.mutationContext(ctx), command)
+}
+
+func (s *fileSession) CheckNodeReferences() error {
+	_, err := capability(s.FileSession, storage.NodeReferences.CheckNodeReferences)
+	return err
+}
+
+func (s *fileSession) CheckFileActions() error {
+	_, err := capability(s.FileSession, storage.FileActions.CheckFileActions)
+	return err
+}
+
+func (s *fileSession) QueryFileAction(ctx context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	backend, err := capability(s.FileSession, storage.FileActions.CheckFileActions)
+	if err != nil {
+		return storage.FileActionReceipt{}, err
+	}
+	return backend.QueryFileAction(readContext(ctx), id)
+}
+
+func (s *fileSession) QueryDeleteIntent(ctx context.Context, id storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+	backend, err := capability(s.FileSession, storage.FileActions.CheckFileActions)
+	if err != nil {
+		return storage.DeleteIntentStatus{}, err
+	}
+	return backend.QueryDeleteIntent(readContext(ctx), id)
+}
+
+func (s *fileSession) AcknowledgeDeleteIntent(ctx context.Context, command storage.AcknowledgeDeleteIntentCommand) error {
+	backend, err := capability(s.FileSession, storage.FileActions.CheckFileActions)
+	if err != nil {
+		return err
+	}
+	return backend.AcknowledgeDeleteIntent(s.storage.mutationContext(ctx), command)
+}
+
+func (s *fileSession) OpenNodeRef(ctx context.Context, id uint64, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	backend, err := capability(s.FileSession, storage.NodeReferences.CheckNodeReferences)
+	if err != nil {
+		return storage.NodeOpenResult{}, err
+	}
+	if options.Create || options.CloseIntent != nil {
+		ctx = s.storage.mutationContext(ctx)
+	} else {
+		ctx = readContext(ctx)
+	}
+	result, err := backend.OpenNodeRef(ctx, id, options)
+	result.Reference = s.storage.wrapNodeReference(result.Reference)
+	return result, err
+}
+
+func (s *fileSession) OpenChildRef(ctx context.Context, name storage.ChildName, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	backend, err := capability(s.FileSession, storage.NodeReferences.CheckNodeReferences)
+	if err != nil {
+		return storage.NodeOpenResult{}, err
+	}
+	if options.Create || options.CloseIntent != nil {
+		ctx = s.storage.mutationContext(ctx)
+	} else {
+		ctx = readContext(ctx)
+	}
+	result, err := backend.OpenChildRef(ctx, name, options)
+	result.Reference = s.storage.wrapNodeReference(result.Reference)
+	return result, err
+}
+
 func (s *fileSession) CheckMetadataAccess() error {
 	_, err := capability(s.FileSession, storage.MetadataAccess.CheckMetadataAccess)
 	return err
@@ -126,10 +226,78 @@ func (r *referenceCapabilities) SetMetadata(ctx context.Context, namespace strin
 	return backend.SetMetadata(r.storage.mutationContext(ctx), namespace, version, data)
 }
 
+func (r *referenceCapabilities) CheckReferenceState() error {
+	_, err := capability(r.backend, storage.ReferenceStateAccess.CheckReferenceState)
+	return err
+}
+
+func (r *referenceCapabilities) State(ctx context.Context) (storage.ReferenceState, error) {
+	backend, err := capability(r.backend, storage.ReferenceStateAccess.CheckReferenceState)
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	return backend.State(readContext(ctx))
+}
+
+func (r *referenceCapabilities) CheckDeleteIntent() error {
+	_, err := capability(r.backend, storage.DeleteIntent.CheckDeleteIntent)
+	return err
+}
+
+func (r *referenceCapabilities) SetPendingUnlink(ctx context.Context, command storage.PendingUnlinkCommand) (storage.ReferenceState, error) {
+	backend, err := capability(r.backend, storage.DeleteIntent.CheckDeleteIntent)
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	return backend.SetPendingUnlink(r.storage.mutationContext(ctx), command)
+}
+
+func (r *referenceCapabilities) ClearPendingUnlink(ctx context.Context, command storage.ClearPendingUnlinkCommand) (storage.ReferenceState, error) {
+	backend, err := capability(r.backend, storage.DeleteIntent.CheckDeleteIntent)
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	return backend.ClearPendingUnlink(r.storage.mutationContext(ctx), command)
+}
+
+func (r *referenceCapabilities) CheckConditionalFileMutation() error {
+	_, err := capability(r.backend, storage.ConditionalFileMutation.CheckConditionalFileMutation)
+	return err
+}
+
+func (r *referenceCapabilities) MutateFile(ctx context.Context, command storage.FileMutation) (storage.Attr, error) {
+	backend, err := capability(r.backend, storage.ConditionalFileMutation.CheckConditionalFileMutation)
+	if err != nil {
+		return storage.Attr{}, err
+	}
+	return backend.MutateFile(r.storage.mutationContext(ctx), command)
+}
+
+func (s *Storage) CheckMaintenanceAccounting() error {
+	_, err := capability(s.backend, storage.MaintenanceAccounting.CheckMaintenanceAccounting)
+	return err
+}
+
+func (s *Storage) BindMaintenanceAccounting(ctx context.Context, chain storage.PublicationAccountingChain, initialize func(int64)) error {
+	backend, err := capability(s.backend, storage.MaintenanceAccounting.CheckMaintenanceAccounting)
+	if err != nil {
+		return err
+	}
+	return backend.BindMaintenanceAccounting(readContext(ctx), chain, initialize)
+}
+
 var (
+	_ storage.AtomicFileOpener        = (*fileSession)(nil)
+	_ storage.NamespaceAccess         = (*fileSession)(nil)
+	_ storage.NodeReferences          = (*fileSession)(nil)
+	_ storage.FileActions             = (*fileSession)(nil)
 	_ storage.MetadataAccess          = (*fileSession)(nil)
 	_ storage.UseOwners               = (*fileSession)(nil)
 	_ storage.RangeControl            = (*fileSession)(nil)
-	_ storage.ScopedReference         = (*file)(nil)
-	_ storage.ReferenceMetadataAccess = (*file)(nil)
+	_ storage.ReferenceStateAccess    = (*referenceCapabilities)(nil)
+	_ storage.ScopedReference         = (*referenceCapabilities)(nil)
+	_ storage.ReferenceMetadataAccess = (*referenceCapabilities)(nil)
+	_ storage.DeleteIntent            = (*referenceCapabilities)(nil)
+	_ storage.ConditionalFileMutation = (*referenceCapabilities)(nil)
+	_ storage.MaintenanceAccounting   = (*Storage)(nil)
 )
