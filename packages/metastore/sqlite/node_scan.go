@@ -106,11 +106,6 @@ func optionalStoredTime(sec, nsec sql.NullInt64) (*time.Time, error) {
 	return &value, nil
 }
 
-func (s *nodeHeader) attr() (storage.Attr, error) {
-	node, err := s.node()
-	return node.Attr(), err
-}
-
 type nodeScan struct {
 	nodeHeader
 	content  sql.NullString

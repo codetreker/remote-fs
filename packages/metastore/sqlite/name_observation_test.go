@@ -363,6 +363,9 @@ func TestDirectoryMetadataObservationIsIndependentOfApplicationEnumeration(t *te
 	if err := store.CheckDirectoryMetadataObservation(); err != nil {
 		t.Fatalf("directory metadata capability=%v", err)
 	}
+	if err := store.CheckDirectoryRead(); err != nil {
+		t.Fatalf("directory read capability=%v", err)
+	}
 	if err := store.Mkdir(t.Context(), "guarded"); err != nil {
 		t.Fatal(err)
 	}
@@ -416,6 +419,9 @@ func TestDirectoryMetadataObservationCapabilityCheckRejectsAPlainStore(t *testin
 	defer store.Close()
 	if err := store.CheckDirectoryMetadataObservation(); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("plain Store directory metadata capability=%v", err)
+	}
+	if err := store.CheckDirectoryRead(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("plain Store directory read capability=%v", err)
 	}
 }
 
