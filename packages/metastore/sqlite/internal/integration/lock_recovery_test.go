@@ -15,6 +15,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/sqliteschema"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 var historicalLeaseDurableState = sqlite.DurableState{
@@ -83,7 +84,6 @@ func TestHistoricalLeaseSchemaMatchesTheFirstThreeMigrations(t *testing.T) {
 
 func TestHistoricalLeaseMigrationPreservesAcceptedDurableProof(t *testing.T) {
 	path := writeHistoricalLeaseDatabase(t, true)
-	before := historicalLeaseRows(t, path)
 	witness := &recordingWitness{database: path}
 	store, err := sqlite.OpenBoundDurableWithOptions(t.Context(), path, "A", durableStoreID, 1024,
 		sqlite.DefaultOptions(), sqlite.RequireExistingVolume, sqlite.DurableStartup{
@@ -98,14 +98,13 @@ func TestHistoricalLeaseMigrationPreservesAcceptedDurableProof(t *testing.T) {
 		}
 	})
 	assertHistoricalLeaseVolume(t, store, "A")
-	assertHistoricalLeaseRows(t, path, before)
 	accepted, visible := witness.accepts()
 	want := historicalLeaseDurableState
 	want.Generation++
 	if len(accepted) != 1 || len(visible) != 1 || accepted[0] != want || visible[0] != want {
 		t.Fatalf("migration witness acceptance = %+v, visible = %+v; want %+v", accepted, visible, want)
 	}
-	assertHistoricalLeaseSchemaVersion(t, path, 5)
+	assertHistoricalLeaseSchemaVersion(t, path, 6)
 }
 
 func TestHistoricalLeaseMigrationRefusesRollbackBeforeChangingSchema(t *testing.T) {
@@ -155,7 +154,6 @@ func TestHistoricalLeaseMigrationRefusesRollbackBeforeChangingSchema(t *testing.
 
 func TestHistoricalLeaseMigrationProtectsEveryVolumeAcrossReopen(t *testing.T) {
 	path := writeHistoricalLeaseDatabase(t, false)
-	before := historicalLeaseRows(t, path)
 	config := sqlite.LockingConfig{
 		Database: path, Volume: "A", Allowance: 1024, SQLite: sqlite.DefaultOptions(),
 		Locks: locking.DefaultOptions(), Initialize: true,
@@ -170,8 +168,7 @@ func TestHistoricalLeaseMigrationProtectsEveryVolumeAcrossReopen(t *testing.T) {
 		}
 	})
 	assertHistoricalLeaseVolume(t, first.Store, "A")
-	assertHistoricalLeaseRows(t, path, before)
-	assertHistoricalLeaseSchemaVersion(t, path, 5)
+	assertHistoricalLeaseSchemaVersion(t, path, 6)
 	acquireHistoricalLease(t, first.LockService(), "alpha.txt")
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
@@ -209,7 +206,6 @@ func TestHistoricalLeaseMigrationProtectsEveryVolumeAcrossReopen(t *testing.T) {
 			t.Fatalf("volume %s lost historical protection: recovering=%v, remaining_ms=%d, err=%v",
 				volume, status.Recovering, status.RecoveryRemainingMillis, err)
 		}
-		assertHistoricalLeaseRows(t, path, before)
 		state, err := reopened.DurableState(t.Context())
 		if err != nil || state.DatabaseID != historicalLeaseDurableState.DatabaseID ||
 			state.Generation <= historicalLeaseDurableState.Generation || state.NodeHighWater != 4 || state.ChangeHighWater != 4 {
@@ -249,20 +245,20 @@ func acquireHistoricalLease(t *testing.T, service locking.Service, path string) 
 
 func assertHistoricalLeaseVolume(t *testing.T, store *sqlite.Store, volume string) {
 	t.Helper()
-	name, id, root, size, mode := "alpha.txt", int64(2), int64(1), int64(5), os.FileMode(0o640)
+	name, id, root, size := "alpha.txt", int64(2), int64(1), int64(5)
 	content := metastore.Key("historical-alpha-object")
 	seconds, accessNanos, modifiedNanos := int64(1700000100), int64(201), int64(202)
 	incarnation := metastore.Incarnation("11111111111111111111111111111111")
 	positions := []metastore.Position{1, 3}
 	if volume == "B" {
-		name, id, root, size, mode = "bravo.txt", 4, 3, 7, 0o600
+		name, id, root, size = "bravo.txt", 4, 3, 7
 		content = "historical-bravo-object"
 		seconds, accessNanos, modifiedNanos = 1700000300, 401, 402
 		incarnation = "22222222222222222222222222222222"
 		positions = []metastore.Position{2, 4}
 	}
 	node, err := store.Stat(t.Context(), name)
-	if err != nil || node.ID != id || node.Size != size || node.Mode != mode || node.Content != content ||
+	if err != nil || node.ID != id || node.Size != size || node.Kind != storage.NodeRegular || node.Content != content ||
 		!node.AccessTime.Equal(time.Unix(seconds, accessNanos)) || !node.ModTime.Equal(time.Unix(seconds, modifiedNanos)) {
 		t.Fatalf("volume %s historical node changed: %+v, %v", volume, node, err)
 	}
@@ -308,9 +304,13 @@ func historicalLeaseRows(t *testing.T, path string) map[string][][]any {
 	t.Helper()
 	db := historicalLeaseReadOnly(t, path)
 	result := make(map[string][][]any)
-	for table, query := range map[string]string{
+	var version int
+	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	queries := map[string]string{
 		"backing_store": `SELECT * FROM backing_store ORDER BY singleton`,
-		"volumes":       `SELECT * FROM volumes ORDER BY id`,
+		"volumes":       `SELECT id,name,root,used FROM volumes ORDER BY id`,
 		"nodes": `SELECT id, volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content
 			FROM nodes ORDER BY id`,
 		"entries":         `SELECT * FROM entries ORDER BY volume, parent, name`,
@@ -318,7 +318,12 @@ func historicalLeaseRows(t *testing.T, path string) map[string][][]any {
 		"logs":            `SELECT * FROM logs ORDER BY volume`,
 		"changes":         `SELECT * FROM changes ORDER BY position`,
 		"sqlite_sequence": `SELECT * FROM sqlite_sequence ORDER BY name`,
-	} {
+	}
+	if version >= 6 {
+		queries["nodes"] = `SELECT id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,metadata FROM nodes ORDER BY id`
+		queries["changes"] = `SELECT position,previous_position,volume,kind,parent,name,from_parent,from_name,node,node_kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,recorded_sec,recorded_nsec,metadata FROM changes ORDER BY position`
+	}
+	for table, query := range queries {
 		result[table] = nil
 		rows, err := db.QueryContext(t.Context(), query)
 		if err != nil {

@@ -41,11 +41,11 @@ func TestLegacyObjectsCannotInventDeletionAuthority(t *testing.T) {
 			db := testDatabase(t, 0)
 			id, root := testVolume(t, db, "workspace")
 			testFile(t, db, id, root, "file", 3, false)
-			if err := validateLegacyObjectIntegrity(t.Context(), db, 2); err != nil {
+			if err := validateLegacyObjectIntegrity(t.Context(), db, schema.Version()); err != nil {
 				t.Fatal(err)
 			}
 			execute(t, db, test.mutation)
-			err := validateLegacyObjectIntegrity(t.Context(), db, 2)
+			err := validateLegacyObjectIntegrity(t.Context(), db, schema.Version())
 			if !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), test.diagnostic) {
 				t.Fatalf("got %v, want EIO describing %q", err, test.diagnostic)
 			}

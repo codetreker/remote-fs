@@ -25,7 +25,6 @@ package metastore
 
 import (
 	"context"
-	"io/fs"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -212,9 +211,10 @@ type Node struct {
 	// the shape that would not have it is the one that makes it expensive to add later.
 	ID int64
 
-	// Mode carries the type bits and the permission bits, in io/fs's layout rather than a
-	// kernel's. The type bits say what kind of node this is.
-	Mode fs.FileMode
+	Kind       storage.NodeKind
+	BirthTime  *time.Time
+	ChangeTime *time.Time
+	Metadata   map[string]storage.OpaquePayload
 
 	// Size is the length of a file's contents. It is zero for a directory, which the storage
 	// contract leaves unspecified.
@@ -229,13 +229,24 @@ type Node struct {
 }
 
 // IsDir reports whether the node is a directory.
-func (n Node) IsDir() bool { return n.Mode.IsDir() }
+func (n Node) IsDir() bool { return n.Kind == storage.NodeDirectory }
 
 // Attr renders the node as the storage contract describes it.
 func (n Node) Attr() storage.Attr {
-	return storage.Attr{
-		ID: uint64(n.ID), Mode: n.Mode, Size: n.Size, AccessTime: n.AccessTime, ModTime: n.ModTime,
-	}
+	return (storage.Attr{
+		ID: uint64(n.ID), Kind: n.Kind, Size: n.Size, AccessTime: n.AccessTime, ModTime: n.ModTime,
+		BirthTime: n.BirthTime, ChangeTime: n.ChangeTime, Metadata: n.Metadata,
+	}).Clone()
+}
+
+func (n Node) Clone() Node {
+	attr := n.Attr()
+	n.BirthTime = attr.BirthTime
+	n.ChangeTime = attr.ChangeTime
+	n.AccessTime = attr.AccessTime
+	n.ModTime = attr.ModTime
+	n.Metadata = attr.Metadata
+	return n
 }
 
 // Child is one member of a directory listing. The name is a byte sequence rather than a

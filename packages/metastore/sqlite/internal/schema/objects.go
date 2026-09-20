@@ -51,7 +51,7 @@ func validateLegacyObjectIntegrity(
 		return fmt.Errorf("schema version %d holds %d referenced objects with an invalid size: %w",
 			version, invalidSizes, syscall.EIO)
 	}
-	if err := validateObjectRelationships(ctx, db, nil); err != nil {
+	if err := validateObjectRelationshipsVersion(ctx, db, nil, version); err != nil {
 		return err
 	}
 	return nil
@@ -65,6 +65,10 @@ func validateObjectRelationships(
 	db sqlvalue.Queryer,
 	volume *int64,
 ) error {
+	return validateObjectRelationshipsVersion(ctx, db, volume, schema.Version())
+}
+
+func validateObjectRelationshipsVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, version int) error {
 	nodeWhere := ""
 	objectWhere := ""
 	var scopeArgs []any
@@ -74,17 +78,25 @@ func validateObjectRelationships(
 		scopeArgs = []any{*volume}
 	}
 	var invalidNodes int64
-	nodeArgs := append([]any{int64(fs.ModeType), StateReferenced}, scopeArgs...)
+	kindColumn := "mode"
+	invalidKind := "(n.mode & ?) != 0"
+	kindArgs := []any{int64(fs.ModeType), StateReferenced}
+	if version >= firstNeutralMetadataSchemaVersion {
+		kindColumn = "kind"
+		invalidKind = "n.kind != 1"
+		kindArgs = []any{StateReferenced}
+	}
+	nodeArgs := append(kindArgs, scopeArgs...)
 	if err := db.QueryRowContext(ctx, `
 		SELECT coalesce(sum(CASE
 			WHEN n.content IS NULL THEN
 				CASE WHEN typeof(n.size) != 'integer' OR n.size != 0 THEN 1 ELSE 0 END
 			WHEN typeof(n.content) != 'text'
 				OR n.content = ''
-				OR typeof(n.mode) != 'integer'
+				OR typeof(n.`+kindColumn+`) != 'integer'
 				OR typeof(n.size) != 'integer'
 				OR n.size < 0
-				OR (n.mode & ?) != 0
+				OR `+invalidKind+`
 				OR o.key IS NULL
 				OR o.volume != n.volume
 				OR o.state != ?

@@ -3,7 +3,6 @@ package integration_test
 import (
 	"errors"
 	"fmt"
-	"io/fs"
 	"path/filepath"
 	"sync"
 	"syscall"
@@ -413,7 +412,7 @@ func TestAVolumeOutlivesTheStoreThatMadeIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := commit(t, first, "d/f", 700)
-	if err := first.SetAttr(t.Context(), "d/f", storage.AttrChange{Mode: mode(0o640), ModTime: &changed}); err != nil {
+	if err := first.SetAttr(t.Context(), "d/f", storage.AttrChange{ModTime: &changed}); err != nil {
 		t.Fatal(err)
 	}
 	if err := first.Close(); err != nil {
@@ -428,9 +427,9 @@ func TestAVolumeOutlivesTheStoreThatMadeIt(t *testing.T) {
 	if node.Content != key || node.Size != 700 {
 		t.Fatalf("the file references %q and holds %d bytes, want %q and 700", node.Content, node.Size, key)
 	}
-	if node.Mode.Perm() != 0o640 || !node.ModTime.Equal(changed) {
-		t.Fatalf("the file has mode %v and modification time %v, want 0640 at %v",
-			node.Mode, node.ModTime.UTC(), changed)
+	if node.Kind != storage.NodeRegular || !node.ModTime.Equal(changed) {
+		t.Fatalf("the file has kind %v and modification time %v, want regular at %v",
+			node.Kind, node.ModTime.UTC(), changed)
 	}
 	space, err := second.Space(t.Context())
 	if err != nil {
@@ -440,8 +439,6 @@ func TestAVolumeOutlivesTheStoreThatMadeIt(t *testing.T) {
 		t.Fatalf("the reopened volume reports %d bytes used, want 700", space.Used)
 	}
 }
-
-func mode(m fs.FileMode) *fs.FileMode { return &m }
 
 // commit writes an object of the given length at path.
 func commit(t *testing.T, s metastore.Store, path string, size int64) metastore.Key {

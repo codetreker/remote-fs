@@ -35,6 +35,8 @@ type FileState struct {
 // materialization and upload operations before Close releases physical retention.
 // Calls are concurrent-safe. A retired reference returns ESTALE for further work.
 type File interface {
+	storage.ScopedReference
+	storage.ReferenceMetadataAccess
 	Node(context.Context) (FileState, error)
 	Reserve(context.Context, int64) (Key, error)
 	// Commit checks logical liveness and expected revision under final publication
@@ -45,6 +47,9 @@ type File interface {
 	// Retire fences publication before an external caller starts draining I/O.
 	// The physical pin and quota survive until Close has a known durable result.
 	Retire(context.Context) error
+	// DropUse releases the reference's native Uses/Deny claim after admitted I/O drains.
+	// It is idempotent and leaves the physical retention pin for Close.
+	DropUse(context.Context) error
 	// Close is idempotent and retires the reference before releasing its pin.
 	// Last-close accounting uses its context and the actual remaining file size.
 	Close(context.Context) error

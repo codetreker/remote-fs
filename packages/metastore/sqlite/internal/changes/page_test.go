@@ -77,7 +77,7 @@ func TestPageAnchorsRejectBrokenRetainedChains(t *testing.T) {
 		{"wrong oldest predecessor", `UPDATE changes SET previous_position=1 WHERE position=1`, "invalid position/predecessor"},
 		{"wrong trim anchor", `UPDATE logs SET trimmed_through=1 WHERE volume=1`, "trim anchor"},
 		{"untrimmed empty", `DELETE FROM changes`, "empty retained log"},
-		{"invalid metadata", `UPDATE changes SET mode=-1 WHERE position=2`, "invalid node metadata"},
+		{"invalid metadata", `UPDATE changes SET node_kind=0 WHERE position=2`, "invalid node metadata"},
 		{"invalid payload", `UPDATE changes SET name=x'2e2e' WHERE position=2`, "invalid destination"},
 	} {
 		t.Run(test.name, func(t *testing.T) {

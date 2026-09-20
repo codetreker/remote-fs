@@ -90,7 +90,7 @@ func (n sqliteNative) Discover(ctx context.Context, path string, adopt func(lock
 		if err != nil {
 			return err
 		}
-		if !node.Mode.IsRegular() {
+		if node.Kind != storage.NodeRegular {
 			return locking.Wrap(locking.UnsupportedTarget, "only an existing regular file can be locked", nil)
 		}
 		key = n.store.backendKey(node.ID)
@@ -115,7 +115,7 @@ func (n sqliteNative) Guard(ctx context.Context, key locking.BackendKey, transit
 		if err != nil {
 			return err
 		}
-		if !node.Mode.IsRegular() {
+		if node.Kind != storage.NodeRegular {
 			return locking.Wrap(locking.UnsupportedTarget, "the resolved node is not a regular file", nil)
 		}
 		return nil
@@ -156,6 +156,7 @@ type volumeIntent struct {
 	kind    locking.MutationKind
 	paths   []string
 	node    int64
+	scope   storage.UseScope
 	cleanup bool
 }
 
@@ -164,6 +165,7 @@ type volumePublication struct {
 	targets  []locking.BackendKey
 	nodes    []int64
 	retired  []locking.BackendKey
+	access   []metastore.FileState
 	previous int64
 	next     int64
 }
@@ -179,7 +181,8 @@ func (s *Store) prepareVolumePublication(ctx context.Context, tx *sql.Tx, intent
 		if err != nil {
 			return nil, err
 		}
-		if state.Mode.IsRegular() && !state.Detached {
+		publication.access = []metastore.FileState{state}
+		if state.Kind == storage.NodeRegular && !state.Detached {
 			publication.nodes = []int64{state.ID}
 			publication.targets = []locking.BackendKey{s.backendKey(state.ID)}
 		}
@@ -189,6 +192,7 @@ func (s *Store) prepareVolumePublication(ctx context.Context, tx *sql.Tx, intent
 		return publication, nil
 	}
 	nodes := make([]metastore.Node, len(intent.paths))
+	publication.access = make([]metastore.FileState, len(intent.paths))
 	seen := make(map[int64]bool, len(intent.paths))
 	for i, path := range intent.paths {
 		node, err := s.resolve(ctx, tx, path)
@@ -199,7 +203,8 @@ func (s *Store) prepareVolumePublication(ctx context.Context, tx *sql.Tx, intent
 			return nil, err
 		}
 		nodes[i] = node
-		if node.Mode.IsRegular() && !seen[node.ID] {
+		publication.access[i] = metastore.FileState{Node: node}
+		if node.Kind == storage.NodeRegular && !seen[node.ID] {
 			seen[node.ID] = true
 			publication.nodes = append(publication.nodes, node.ID)
 			publication.targets = append(publication.targets, s.backendKey(node.ID))
@@ -207,11 +212,11 @@ func (s *Store) prepareVolumePublication(ctx context.Context, tx *sql.Tx, intent
 	}
 	switch intent.kind {
 	case locking.WriteMutation, locking.RemoveMutation:
-		if nodes[0].ID != 0 && nodes[0].Mode.IsRegular() {
+		if nodes[0].ID != 0 && nodes[0].Kind == storage.NodeRegular {
 			publication.previous = nodes[0].Size
 		}
 	case locking.RenameMutation:
-		if nodes[1].ID != 0 && nodes[1].ID != nodes[0].ID && nodes[1].Mode.IsRegular() {
+		if nodes[1].ID != 0 && nodes[1].ID != nodes[0].ID && nodes[1].Kind == storage.NodeRegular {
 			publication.previous = nodes[1].Size
 		}
 	}
@@ -230,7 +235,25 @@ func (s *Store) finishVolumePublication(ctx context.Context, tx *sql.Tx, publica
 		if err != nil {
 			return err
 		}
+		before := metastore.FileState{Node: metastore.Node{ID: node.ID, Kind: node.Kind}}
+		if len(publication.access) != 0 && publication.access[0].ID != 0 {
+			before = publication.access[0]
+		}
+		if err := s.checkContentPublication(ctx, before, node.Size, publication.intent.scope); err != nil {
+			return err
+		}
 		publication.next = node.Size
+	}
+	if !publication.intent.cleanup &&
+		(publication.intent.kind == locking.RemoveMutation || publication.intent.kind == locking.RenameMutation) {
+		for _, node := range publication.access {
+			if node.ID == 0 {
+				continue
+			}
+			if err := s.fileDomain.coordinator.CheckUse(ctx, uint64(node.ID), publication.intent.scope, storage.DeleteName); err != nil {
+				return err
+			}
+		}
 	}
 	for i, id := range publication.nodes {
 		var present bool

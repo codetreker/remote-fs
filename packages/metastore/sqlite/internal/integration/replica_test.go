@@ -1,9 +1,10 @@
 package integration_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"io/fs"
+	"maps"
 	"path"
 	"syscall"
 	"testing"
@@ -145,8 +146,10 @@ func requireSame(t *testing.T, from *sqlite.Store, into *sqlite.Replica) {
 		}
 		// The content key is the one thing a copy does not hold: it never reaches an object
 		// store, so a key here would name bytes nothing has.
-		if mirrored.ID != node.ID || mirrored.Mode != node.Mode || mirrored.Size != node.Size ||
-			!mirrored.ModTime.Equal(node.ModTime) || !mirrored.AccessTime.Equal(node.AccessTime) {
+		if mirrored.ID != node.ID || mirrored.Kind != node.Kind || mirrored.Size != node.Size ||
+			!mirrored.ModTime.Equal(node.ModTime) || !mirrored.AccessTime.Equal(node.AccessTime) ||
+			!sameInstant(mirrored.BirthTime, node.BirthTime) || !sameInstant(mirrored.ChangeTime, node.ChangeTime) ||
+			!sameOpaqueMetadata(mirrored.Metadata, node.Metadata) {
 			t.Fatalf("the copy holds %q as %+v, the volume holds it as %+v", at, mirrored, node)
 		}
 		if mirrored.Content != "" {
@@ -180,8 +183,8 @@ func TestReplicaListBoundedPreservesCompleteResultsAndFailures(t *testing.T) {
 	fill(t, from, into, 1024)
 
 	newResult := func() *storage.ListResult {
-		result, err := storage.NewListResult(1<<20, 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
-			return 64 + nameBytes, nil
+		result, err := storage.NewListResult(1<<20, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+			return 64 + nameBytes + metadataBytes, nil
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -242,12 +245,12 @@ func TestEveryKindOfChangeIsAppliedAsTheVolumeRecordedIt(t *testing.T) {
 	fill(t, from, into, 1024)
 
 	build(t, from)
-	mode := fs.FileMode(0o600)
+	stamp := time.Date(1902, 1, 2, 3, 4, 5, 6, time.UTC)
 	for _, done := range []struct {
 		what string
 		run  func() error
 	}{
-		{"changing a mode", func() error { return from.SetAttr(t.Context(), "d/f", storage.AttrChange{Mode: &mode}) }},
+		{"changing birth time", func() error { return from.SetAttr(t.Context(), "d/f", storage.AttrChange{BirthTime: &stamp}) }},
 		{"removing a file", func() error { return from.Remove(t.Context(), "g") }},
 		{"renaming a file", func() error { return from.Rename(t.Context(), "d/f", "d/moved") }},
 		{"renaming a directory", func() error { return from.Rename(t.Context(), "d", "e") }},
@@ -277,7 +280,7 @@ func TestReplicaRefusesAReusedNodeIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	node := metastore.Node{
-		ID: root.ID + 1, Mode: 0o644,
+		ID: root.ID + 1, Kind: storage.NodeRegular,
 		AccessTime: time.Unix(1, 0), ModTime: time.Unix(1, 0),
 	}
 	created := metastore.Change{
@@ -355,7 +358,7 @@ func TestAChangeThatDoesNotFindWhatItDescribesIsRefused(t *testing.T) {
 		t.Fatalf("reading the root of the copy: %v", err)
 	}
 	filled := into.Position()
-	absent := metastore.Node{ID: 9999, Mode: 0o644, ModTime: time.Now(), AccessTime: time.Now()}
+	absent := metastore.Node{ID: 9999, Kind: storage.NodeRegular, ModTime: time.Now(), AccessTime: time.Now()}
 
 	// Each case carries a position of its own. A copy that wrongly applied one of them would
 	// stand at that position afterwards, and every later case would then be discarded as
@@ -483,7 +486,7 @@ func TestAFillingThatWasNotCompletedLeavesTheCopyAsItWas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("emptying the copy: %v", err)
 	}
-	if err := seeding.Add(t.Context(), []metastore.Row{{Node: metastore.Node{ID: 4242, Mode: fs.ModeDir | 0o755}}}); err != nil {
+	if err := seeding.Add(t.Context(), []metastore.Row{{Node: metastore.Node{ID: 4242, Kind: storage.NodeDirectory}}}); err != nil {
 		t.Fatalf("filling the copy: %v", err)
 	}
 	if err := seeding.Close(); err != nil {
@@ -549,4 +552,17 @@ func build(t *testing.T, store *sqlite.Store) {
 			t.Fatalf("making %s: %v", made.what, err)
 		}
 	}
+}
+
+func sameInstant(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Equal(*b)
+}
+
+func sameOpaqueMetadata(a, b map[string]storage.OpaquePayload) bool {
+	return maps.EqualFunc(a, b, func(x, y storage.OpaquePayload) bool {
+		return bytes.Equal(x.Version, y.Version) && bytes.Equal(x.Data, y.Data)
+	})
 }

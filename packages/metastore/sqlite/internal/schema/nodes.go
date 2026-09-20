@@ -16,6 +16,9 @@ func validateNodeValues(ctx context.Context, db sqlvalue.Queryer, volume *int64)
 }
 
 func validateNodeValuesVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, version int) error {
+	if version >= firstNeutralMetadataSchemaVersion {
+		return validateNeutralNodeValues(ctx, db, volume)
+	}
 	where := ""
 	var args []any
 	if volume != nil {
@@ -151,6 +154,9 @@ func validateNodeRelationshipsVersion(
 	volume *int64,
 	version int,
 ) error {
+	if version >= firstNeutralMetadataSchemaVersion {
+		return validateNeutralNodeRelationships(ctx, db, volume)
+	}
 	volumeWhere := ""
 	nodeWhere := ""
 	entryWhere := ""
@@ -301,6 +307,19 @@ func validateUsedAccounting(
 	db sqlvalue.Queryer,
 	volume *int64,
 ) error {
+	return validateUsedAccountingVersion(ctx, db, volume, schema.Version())
+}
+
+func validateUsedAccountingVersion(
+	ctx context.Context,
+	db sqlvalue.Queryer,
+	volume *int64,
+	version int,
+) error {
+	kindColumn := "mode"
+	if version >= firstNeutralMetadataSchemaVersion {
+		kindColumn = "kind"
+	}
 	where := ""
 	var args []any
 	if volume != nil {
@@ -310,7 +329,7 @@ func validateUsedAccounting(
 	rows, err := db.QueryContext(ctx, `
 		SELECT
 			ns.id, ns.used, typeof(ns.used),
-			n.id, n.mode, typeof(n.mode), n.size, typeof(n.size)
+			n.id, n.`+kindColumn+`, typeof(n.`+kindColumn+`), n.size, typeof(n.size)
 		FROM volumes ns
 		LEFT JOIN nodes n ON n.volume = ns.id
 		`+where+`
@@ -383,7 +402,17 @@ func validateUsedAccounting(
 			invalidNodeValues++
 			continue
 		}
-		if fs.FileMode(mode).Type() != 0 || calculatedOverflow {
+		hasBytes := false
+		if version < firstNeutralMetadataSchemaVersion {
+			hasBytes = fs.FileMode(mode).Type() == 0
+		} else {
+			if mode < 1 || mode > 3 {
+				invalidNodeValues++
+				continue
+			}
+			hasBytes = mode != 2
+		}
+		if !hasBytes || calculatedOverflow {
 			continue
 		}
 		if size > math.MaxInt64-calculatedUsed {

@@ -17,7 +17,7 @@ func validateVersionTwoLogIntegrity(ctx context.Context, db sqlvalue.Queryer, vo
 	if err := validateVersionTwoLogStorageClasses(ctx, db, volume); err != nil {
 		return err
 	}
-	return validateLogIntegrityVersion(ctx, db, volume, false)
+	return validateLogIntegrityVersion(ctx, db, volume, 2, false)
 }
 
 func validateVersionTwoLogStorageClasses(ctx context.Context, db sqlvalue.Queryer, volume *int64) error {
@@ -59,10 +59,10 @@ func validateVersionTwoLogStorageClasses(ctx context.Context, db sqlvalue.Querye
 // validateLogIntegrity checks the durable tail, predecessor chain, and operation-dependent
 // shape of every retained change before Snapshot or Since may expose it as history.
 func validateLogIntegrity(ctx context.Context, db sqlvalue.Queryer, volume *int64) error {
-	return validateLogIntegrityVersion(ctx, db, volume, true)
+	return validateLogIntegrityVersion(ctx, db, volume, schema.Version(), true)
 }
 
-func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, predecessors bool) error {
+func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, version int, predecessors bool) error {
 	volumeWhere := ""
 	changeWhere := ""
 	var args []any
@@ -95,6 +95,22 @@ func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volum
 				END
 			)`
 	}
+	nodeKindColumn := "c.mode"
+	removedExtra, requiredExtra := "", ""
+	nodeSpecific := `c.mode < 0 OR c.mode > ? OR (c.mode & ?) NOT IN (0,?) OR
+		((c.mode & ?) = ? AND (c.size != 0 OR c.content IS NOT NULL)) OR
+		((c.mode & ?) = 0 AND c.content IS NULL AND c.size != 0)`
+	if version >= firstNeutralMetadataSchemaVersion {
+		nodeKindColumn = "c.node_kind"
+		removedExtra = ` OR c.birth_sec IS NOT NULL OR c.birth_nsec IS NOT NULL OR
+			c.change_sec IS NOT NULL OR c.change_nsec IS NOT NULL OR c.metadata IS NOT NULL`
+		requiredExtra = ` OR c.metadata IS NULL`
+		nodeSpecific = `c.node_kind NOT IN (1,2) OR
+			(c.node_kind=2 AND (c.size!=0 OR c.content IS NOT NULL)) OR
+			(c.node_kind!=2 AND c.content IS NULL AND c.size!=0) OR
+			(c.birth_sec IS NULL)!=(c.birth_nsec IS NULL) OR (c.change_sec IS NULL)!=(c.change_nsec IS NULL) OR
+			c.birth_nsec NOT BETWEEN 0 AND 999999999 OR c.change_nsec NOT BETWEEN 0 AND 999999999`
+	}
 	var invalidLogs int64
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*)
@@ -126,9 +142,11 @@ func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volum
 		changes.KindCreated, changes.KindRemoved, changes.KindRenamed, changes.KindModified,
 		changes.KindRenamed, changes.KindRenamed,
 		changes.KindRemoved, changes.KindRemoved,
-		int64(math.MaxUint32), int64(fs.ModeType), int64(fs.ModeDir),
-		int64(fs.ModeType), int64(fs.ModeDir), int64(fs.ModeType),
 	)
+	if version < firstNeutralMetadataSchemaVersion {
+		changeArgs = append(changeArgs, int64(math.MaxUint32), int64(fs.ModeType), int64(fs.ModeDir),
+			int64(fs.ModeType), int64(fs.ModeDir), int64(fs.ModeType))
+	}
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*)
 		FROM changes c
@@ -153,20 +171,17 @@ func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volum
 				c.from_name IN (X'2e', X'2e2e') OR
 				instr(c.from_name, X'2f') != 0 OR instr(c.from_name, X'00') != 0
 			)) OR
-			(c.kind = ? AND (c.node IS NOT NULL OR c.mode IS NOT NULL OR c.size IS NOT NULL OR
+			(c.kind = ? AND (c.node IS NOT NULL OR `+nodeKindColumn+` IS NOT NULL OR c.size IS NOT NULL OR
 				c.atime_sec IS NOT NULL OR c.atime_nsec IS NOT NULL OR c.mtime_sec IS NOT NULL OR
-				c.mtime_nsec IS NOT NULL OR c.content IS NOT NULL)) OR
-			(c.kind != ? AND (c.node IS NULL OR c.mode IS NULL OR c.size IS NULL OR
+				c.mtime_nsec IS NOT NULL OR c.content IS NOT NULL`+removedExtra+`)) OR
+			(c.kind != ? AND (c.node IS NULL OR `+nodeKindColumn+` IS NULL OR c.size IS NULL OR
 				c.atime_sec IS NULL OR c.atime_nsec IS NULL OR c.mtime_sec IS NULL OR
-				c.mtime_nsec IS NULL)) OR
+				c.mtime_nsec IS NULL`+requiredExtra+`)) OR
 			(c.node IS NOT NULL AND (
-				c.node <= 0 OR c.mode < 0 OR c.mode > ? OR c.size < 0 OR
+				c.node <= 0 OR c.size < 0 OR
 				c.atime_nsec < 0 OR c.atime_nsec >= 1000000000 OR
 				c.mtime_nsec < 0 OR c.mtime_nsec >= 1000000000 OR
-				(c.mode & ?) NOT IN (0, ?) OR
-				((c.mode & ?) = ? AND (c.size != 0 OR c.content IS NOT NULL)) OR
-				((c.mode & ?) = 0 AND c.content IS NULL AND c.size != 0) OR
-				(c.content IS NOT NULL AND c.content = '')
+				(c.content IS NOT NULL AND c.content = '') OR `+nodeSpecific+`
 			)) OR
 			(current_node.id IS NOT NULL AND current_node.volume != c.volume) OR
 			(current_parent.id IS NOT NULL AND c.parent != 0 AND current_parent.volume != c.volume) OR
