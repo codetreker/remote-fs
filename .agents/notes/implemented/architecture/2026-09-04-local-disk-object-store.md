@@ -21,7 +21,7 @@ Status: implemented
 
 `cmd/remote-fs-server -listen ADDR -local-store DIR -volume NAME -quota SIZE` 打开这份组合实现。`DIR` 必须已经存在，是服务进程拥有的 `0700` 目录，并且路径上的祖先目录不能允许信任边界之外的主体替换下一级路径。一个进程在整个服务期内独占该 root；第二个 opener 以 `EBUSY` 失败。server 的文件占有状态首次建立需要 `-initialize-lock-state`，之后按持久 binding 重开。`-http-max-write-bytes` 单独限制 file-content request；省略时继承 `-http-max-body-bytes`。local-store 形态在接触 root 之前要求有效 write 上限不大于 `-local-max-object-bytes`，避免 server 先保留一份 backend 必定以 `EFBIG` 拒绝的 request body。
 
-[显式文件占有](./2026-09-07-file-locks.md)把运行期 authority 与 SQLite 最终发布绑定，并在这个私有 root 中保存重启保护证据。[持续文件句柄](./2026-09-08-live-file-handles.md)在同一节点上增加保留引用、范围修改与最后关闭回收。两项决定沿用本 note 的对象／metastore 分工、独占所有权与失败关闭规则；本 note 继续拥有对象格式、组合初始化与磁盘持久性的理由。
+[显式文件占有](./2026-09-07-file-locks.md)把运行期 authority 与 SQLite 最终发布绑定，并在这个私有 root 中保存重启保护证据。[持续文件句柄](./2026-09-08-live-file-handles.md)在同一节点上增加保留引用、范围修改与最后关闭回收。[持久节点身份与原子文件操作](./2026-09-20-durable-identity-and-atomic-file-operations.md)再增加 identity namespace、schema v7、durable delete intent 与恢复期 maintenance accounting。它们沿用本 note 的对象／metastore 分工、独占所有权与失败关闭规则；本 note 继续拥有对象格式、组合初始化与磁盘持久性的理由。
 
 ### 范围切分
 
@@ -227,7 +227,7 @@ HTTP server 与 client 的 non-streaming body 同样有 1 GiB 默认单体上限
 
 买到的：
 
-- 单机部署可以沿用 object-store volume 的事务、节点身份、持久变更日志与 metadata replication，不依赖 Azure 服务。
+- 单机部署可以沿用 object-store volume 的事务、节点身份、持久变更日志、durable delete intent 与 metadata replication，不依赖 Azure 服务。
 - 每一份持久状态都有可核对的格式、store/database ID 与初始化完成条件；错误的 metastore/object pairing、丢失 volume、WAL 回退、损坏或不完整 root 在服务流量之前被拒绝。
 - shard identity、对象 publication 与 deletion 有逐步落盘顺序和重启恢复记录；同 shard 的首次使用安全串行，不同 shard 与 payload I/O 保持并行。一次无法判定持久性的失败会毒化当前实例，不继续返回未经证明的成功。
 - WAL 外部见证把已确认提交与已 checkpoint 提交分开记录；已返回成功的 metadata 不能因 WAL 消失静默回退，checkpoint failure 可查询并重试。
@@ -253,4 +253,4 @@ HTTP server 与 client 的 non-streaming body 同样有 1 GiB 默认单体上限
 - 打开时恢复工作被 `MaxRecoveryEntries` 硬性限制。超过上限会以 `EOVERFLOW` 停止服务，运维必须先诊断异常积累，系统不会为了可用性无界扫描或丢弃未知记录。
 - store root 是本系统拥有的格式，不是可用文件管理器直接编辑的目录。旁路修改任何对象、marker、SQLite 文件或权限都可能使下一次访问或打开失败；这是 fail-closed 的结果。
 
-仍存在的 Azure 与通用 object-store 缺口由[对象存储后端已知没做的事](../../proposed/architecture/2026-08-22-gaps-in-the-object-store-backend.md)继续跟踪。对象发布错误的归属规则由[未证实对象发布进入 unresolved](./2026-09-04-unresolved-object-publication.md)拥有。[显式文件占有](./2026-09-07-file-locks.md)拥有原生发布权限与重启保护；[持续文件句柄](./2026-09-08-live-file-handles.md)拥有普通打开、当前状态访问与 detached 生命周期；[打开文件的身份与过期写入](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)继续保留显式内容版本校验的独立问题，[在途读者 pinning](../../proposed/architecture/2026-08-21-readers-in-flight-and-the-sweeper.md)和[按内容合并对象](../../proposed/architecture/2026-08-21-merge-duplicate-objects.md)也各自独立。
+仍存在的 Azure 与通用 object-store 缺口由[对象存储后端已知没做的事](../../proposed/architecture/2026-08-22-gaps-in-the-object-store-backend.md)继续跟踪。对象发布错误的归属规则由[未证实对象发布进入 unresolved](./2026-09-04-unresolved-object-publication.md)拥有。[显式文件占有](./2026-09-07-file-locks.md)拥有原生发布权限与重启保护；[持续文件句柄](./2026-09-08-live-file-handles.md)拥有普通打开、当前状态访问与 detached 生命周期；[持久节点身份与原子文件操作](./2026-09-20-durable-identity-and-atomic-file-operations.md)拥有身份 namespace、删除义务与恢复记账；[打开文件的身份与过期写入](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)继续保留显式内容版本校验的独立问题，[在途读者 pinning](../../proposed/architecture/2026-08-21-readers-in-flight-and-the-sweeper.md)和[按内容合并对象](../../proposed/architecture/2026-08-21-merge-duplicate-objects.md)也各自独立。

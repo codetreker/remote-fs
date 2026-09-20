@@ -10,7 +10,7 @@ Status: implemented
 
 ## 决定
 
-`packages/storage` 定义覆盖 volume 服务的 Operation 与统一 Op 前缀常量；路径、文件会话、复制和锁控制共用这份语义词汇。`packages/authz` 定义 Authorizer、AccessRequest 和 ErrDenied，AccessRequest 复用 storage.Operation 与 storage.OpenAccess。FileOpenOptions 嵌入同一类型，打开验证与策略输入不维护两份布尔字段。handler 将可信配置的 volume 与完整语义意图交给业务 callback；身份由业务 context 提供，用户、角色、凭据签发和验证不进入文件系统。配置缺省保持已有嵌入方式；启用时 Authorizer 与 volume 必须同时提供，不能让远端字段选择策略资源。
+`packages/storage` 定义覆盖 volume 服务的 Operation 与统一 Op 前缀常量；路径、文件会话、identity namespace、durable delete intent、复制和锁控制共用这份语义词汇。`packages/authz` 定义 Authorizer、AccessRequest 和 ErrDenied，AccessRequest 复用 storage.Operation 与 storage.OpenAccess。旧 FileOpenOptions 嵌入同一类型；OpenAt 与 NodeReference 打开把 metadata 权限、Use 和实际效果投影成 OpenAccess。复合动作按固定顺序授权基础 operation 及其 remove、set-attr、set-metadata、set-pending 等效果，全部允许后才进入 native action。身份由业务 context 提供，NodeID、Scope、action ID 与 durable intent ID 不选择策略资源。
 
 文件 wire 的 op 与授权输入直接共用 storage.Operation；metadata CAS、UseOwner 和 range 的申请、核对、取消与清理分别使用规范操作。普通与 Strong URL 在路由规格中声明语义操作，传输名称不承担角色含义。每个请求一次入口回调，具体操作由业务方归组为角色。共享的 OpenAccess 同时表达读、写、创建、截断、排他创建，避免把复合打开拆成多个时刻的策略决定；InitialMetadata 与 Use 是获准之后仍由 native open 验证的参数，不扩展业务策略值。Use 或 range mode 不充当内容权限；清理仍是独立可控的操作。volume.write 自身可能创建文件，不能只拒绝 create 就宣称禁止创建。
 

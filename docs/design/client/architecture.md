@@ -11,7 +11,7 @@ volume 的使用者。持有一份 remote storage，把 volume 呈现为本地�
 | **remote storage** `packages/transport/httprest` | 基础 storage 操作逐次转换为 HTTP 请求，不缓存内容。复制的订阅与快照使用独立长连接；`DialOptions` 限制 stream silence、body 与 admission，超时由调用方配置。 | R-INT-3、R-INT-5、R-INT-9 |
 | **显式锁控制** | HTTP client 实现锁 Service，调用方保留 Session / Owner 与原动作身份，以 `WithScope` 构造独立、不可变的修改 proof 集合。控制请求具有独立预算。 | R-CC-3、R-CC-6 至 R-CC-11、R-INT-3 |
 | **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：按路径 `Stat` 走本地 SQLite，公开 `List` / `ListBounded` 回源 authority，其余操作也走远端。副本由变更流喂着。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
-| **挂载呈现层** `packages/fuse` | 把一份 storage 呈现为本地目录。持有 FileSession、File、UseOwner 与内核 owner 的映射；投影 POSIX metadata，文件以 direct I/O 逐次读写。仅 Linux。 | R-FS-1、R-CON-1~3、R-ERR-1、R-ERR-2、R-CC-12、R-CC-13、R-WS-5、R-INT-3、R-INT-8 |
+| **挂载呈现层** `packages/fuse` | 把一份 storage 呈现为本地目录。持有 FileSession、已打开目录的 NodeReference、普通 File、UseOwner 与内核 owner 的映射；以父 NodeID 执行子项操作，目录 handle 额外携带 Scope，文件以 direct I/O 逐次读写。仅 Linux。 | R-FS-1、R-FS-5、R-FS-6、R-FS-8、R-CON-1~3、R-ERR-1、R-ERR-2、R-CC-12、R-CC-13、R-WS-5、R-INT-3、R-INT-8 |
 | **生命周期** | 挂载的建立与拆除。 | R-WS-2 |
 
 ```
@@ -46,7 +46,7 @@ SSE 不把整个 stream 保存在内存里，但每一帧仍有独立的 `DialOp
 
 每个基础数据调用都要先取得 client 自己的 response admission。默认同时保留 64 份响应、允许 64 个等待者，aggregate 上限为 8 GiB；每份都按 `4 * MaxBodyBytes` 预留，覆盖 raw body、decoded listing 与转换过程的同时保留。默认 1 GiB body 使每个 List 预留 4 GiB，因此 aggregate byte bound 会先把并发压到 2 个活跃 List，另有至多 64 个调用等待。Subscribe、Resubscribe 与 Snapshot 在发出 HTTP 前也取得同一名额，用来约束 stream 尚未成功建立时可能返回的普通 error body；确认 `200 text/event-stream` 后立即释放，后续 frame 由 `MaxFrameBytes` 约束。等待者已满时，`Stat`、`Write`、`Create` 或 stream setup 都会在发出 HTTP 请求前以 `EAGAIN` 失败；context cancellation 会移除等待计数。non-stream admission 一直持有到 response 解码、mutation response/barrier 验证完成。`ReadBounded` 取 client 与调用方 byte bound 中较小者；`ListBounded` 把解码后的 entry 逐项交给调用方的 `ListResult`。普通 `Read` 与 `List` 仍返回完整 materialized value，但整个 HTTP body 及其同时表示都在上述单体与 aggregate 边界内。server 侧的 backend 预算与 response admission 见 [`../server/architecture.md`](../server/architecture.md#六请求与响应的内存边界)。
 
-**FUSE 到这一层为止。** 挂载层把内核请求翻译为基础 volume、FileStorage 和中立 metadata/range 调用。按名字查询与目录操作仍使用路径；普通 fd 使用 File，无 fd 的身份属性使用 StatNode、SetNodeAttr。FileSession 拥有服务端保留对象，挂载层拥有内核编号、POSIX metadata codec 与 owner 映射，两者不依赖旧路径重新绑定。
+**FUSE 到这一层为止。** 挂载层把内核请求翻译为基础 volume、FileStorage 和中立 identity/metadata/range 调用。Opendir 与 Readlink 通过 OpenNodeRef 保留目录或符号链接身份，普通 create/open 使用 OpenAt，Lookup 与名字修改使用 LookupAt/MutateName。普通 node 操作携带稳定父 NodeID；只有已打开的 directory handle Lookup 再附带活 Scope。OpenChildRef 是编程入口可用的原子子项引用能力，FUSE 不需要借它重复 OpenAt 的职责。普通 fd 使用 File，无 fd 的身份属性使用 NodeReference 或 StatNode/SetNodeAttr。
 
 ### 业务身份与授权结果
 
@@ -70,9 +70,11 @@ GrantStatus 的剩余时间由服务端对未取整的 deadline 与 now 求差�
 
 Strong 控制请求与响应固定至多 16 KiB；文件 metadata/range 控制使用独立的 256 KiB envelope。容量检查不占用数据 response 或复制 stream 的名额。state-changing control 进入 dispatch 后丢失响应时保持结果未知；只读核对遵循自己的取消边界。缺少 v4 marker、非法 scope 或不一致 receipt 都明确失败。服务端 Strong callback／native 生命周期的失败响应保持 native Unavailable／EIO、recorded=false 且无动作回执；该 wire 协议没有 EINTR code。SDK 本地在 HTTP Do 前接受的取消，以及只读控制在 client 侧接受的取消，仍可返回 EINTR，不经过 native wire 编码。业务策略拒绝另走普通 EACCES／EIO envelope。
 
-## 二、路径属性来自副本，目录读取来自权威
+## 二、路径起点来自副本，子项操作到达权威
 
-内核的目录项超时、属性超时、负项超时都是 0。按路径 Lookup/Stat 由本地 SQLite 答复；公开 List/ListBounded 先要求副本可用，再回源 authority，使当前 `ReadEntries` Deny 与枚举共享同一顺序。已取得的节点身份或 fd 属性同样走服务端身份接口。挂载呈现层不向内核发送失效通知；副本不可用时，普通 volume 与文件 I/O 返回 EIO，文件会话的核对、续期和清理仍可联系服务端。遍历已复制的树仍消除具名 Stat 与负查找回源，但每个实际目录读取产生一次 authority 请求。
+内核的目录项超时、属性超时、负项超时都是 0。挂载根与路径起点可由本地 SQLite 副本定位；子项 Lookup 与 mutation 使用稳定父 NodeID 到达 authority。Opendir 建立的 directory handle 另持有 NodeReference/Scope，其 handle Lookup 同时验证活引用。公开 List/ListBounded 先要求副本可用，再按路径回源，使当前 `ReadEntries` Deny 与枚举共享同一顺序。Readdir 还没有 identity-bound directory observation，因此不从 NodeReference 推导一份不存在的完整目录快照。
+
+挂载呈现层不向内核发送失效通知；副本不可用时，普通 volume 与文件 I/O 返回 EIO，文件会话的 action query、delete-intent query、续期和清理仍可联系服务端。副本仍消除初始路径 Stat 与负查找回源，但它不再决定已经取得的父 inode 后续修改落在哪个目录。
 
 普通文件的 Open 与 Create 返回 `FOPEN_DIRECT_IO`。文件读取经过挂载层的健康检查与 `File.ReadAt`，不让同一 inode 的页缓存把旧 handle 内容交给新 handle。属性与返回区间来自同一次权威读取；direct I/O 不承诺共享 mmap 的完整行为。
 
@@ -98,21 +100,21 @@ mutation 成功后，replicated client 从严格验证过的 response 取得 `(i
 
 副本的建立、作废与恢复规则，以及写入方等待 mutation barrier 的原因，见[元数据复制](../../../.agents/notes/implemented/architecture/2026-08-27-metadata-replication.md)。
 
-文件能力与 scoped 视图共同转发原 FileSession；保留文件的属性、字节、metadata 与 range 控制不从名字副本重建。修改使用同一远端 authority，并通过现有 confirmation barrier 核对 volume 进度；失去名字的文件不制造路径事件。
+文件能力与 scoped 视图共同转发原 FileSession；File、NodeReference、action receipt、delete intent、metadata 与 range 控制不从名字副本重建。名字或属性修改使用同一远端 authority，并通过现有 confirmation barrier 核对 volume 进度；detached 对象修改不制造路径事件。
 
 ## 三、打开的是对象引用
 
-一个 handle 保存 `storage.File`、访问方式和对应 Use scope。Open 使用节点 ID，Create 把创建、排他条件、POSIX 初始 metadata、Use claim 和截断交给一次权威打开；文件已存在时，非排他创建保留已有 metadata。`O_TRUNC` 在 open 返回前完成，即使之后没有任何 write。
+一个打开的目录 handle 保存 `storage.NodeReference` 及其 Scope，一个普通文件 handle 保存 `storage.File`、访问方式和 Scope。OpenAt、OpenNodeRef 与 OpenChildRef 从 FileSession action epoch 生成 `FileActionID`；旧 OpenNode 保留原有打开协议。已有普通文件按 NodeID 打开，目录和符号链接按 NodeID 取得 NodeReference；依父 inode 的普通文件 create/open 使用 OpenAt，把存在性、身份/metadata 条件、创建或清空、POSIX 初始 metadata、Use claim、关闭删除义务和返回对象交给一次权威动作。`O_TRUNC` 在 open 返回前完成，即使之后没有任何 write。
 
 ```
-打开   ──▶ OpenNode / OpenFile，取得对象引用，不取内容
+打开   ──▶ OpenAt / OpenNode，取得对象引用，不取内容
 读取   ──▶ File.ReadAt，返回同一状态的属性与区间字节
 写入   ──▶ File.WriteAt，同步确认指定区间的修改
 截断   ──▶ File.Truncate，同步确认长度与内容
 关闭   ──▶ 清理 owner 与引用
 ```
 
-既有 fd 看到同一对象的后续修改。rename、unlink 或同名替换后，它继续指向原对象；新打开的名字可指向另一个对象。`Getattr` 从 File 或 `StatNode` 取得当前身份属性；`Setattr` 对已有 File 或 `SetNodeAttr` 操作。没有 fd 的 truncate 先按节点身份取得短期引用，再截断与清理，不能通过旧路径修改替换者。
+既有 fd 看到同一对象的后续修改。rename、unlink 或同名替换后，它继续指向原对象；新打开的名字可指向另一个对象。普通子项操作以父 NodeID 定位，已打开 directory handle 的 Lookup 还验证原目录 Scope，二者都不从旧父路径选择替代目录。`Getattr` 与 `Setattr` 优先使用已有 File/NodeReference；没有 fd 的 truncate 先按节点身份取得短期引用，再截断与清理。
 
 普通 fd 写入按实际顺序组合，重叠区间以较后生效的操作为准。Open 注册读写所隐含的 Uses，但不自动获取 advisory range 或 Strong 权限；scope 只标识该引用。内部内容 revision 用于构造当前对象的补丁，不代表调用方携带了显式内容版本依据。
 
@@ -136,7 +138,7 @@ FUSE 不保存全文件缓冲区，objectstore 仍可能完整读取、重建不
 
 挂载层通过 `storage.ErrnoOf` 分类错误，`nil` 为成功。已接受的请求取消返回 `EINTR`；deadline、未知错误与无法证明修改结果的失败返回 `EIO`。go-fuse 的请求 context 被取消后，原 FUSE 请求仍得到回复。
 
-文件创建使用原子的 open/create 结果；Mkdir 和同时修改大小、POSIX metadata 或时间的 Setattr 仍可能含多个阶段。某阶段已经产生效果后，后续取消通过拥有最终分类的 `EIO` 保留原始原因，不能把整个操作报告成未发生。效果开始前接受的取消仍为 `EINTR`。
+文件／目录／symlink 创建、unlink、rmdir 与 rename 使用原子 identity operation。每个动作的随机 ID 在调用开始前固定；同 ID 重投不能重复产生引用、名字或删除义务。组合 Setattr 仍按 resize、共同时间、POSIX metadata CAS 分阶段执行；前段已经产生效果后，后续取消或失败以 `EIO` 保留部分效果，不能报告成未发生。只有 action receipt 明确 not-executed 时才可安全发起新的逻辑动作。
 
 remote storage 在 HTTP `Do` 前接受取消时返回 `EINTR`，已发出的只读操作也可放弃读取。修改进入 dispatch 后，请求取消不能证明未执行；文件动作通过有界历史核对，仍不能确定的结果以 `EIO` 报告。打开的响应与确认失败必须清理或退役相应引用，不能留下调用方未知的无限引用。没有 Create／Truncate 的已有文件打开，在 ACK 为带 context.Canceled 的规范 EINTR、且同一能力的 Close 清理原始结果为 nil 时，返回无 File 的 EINTR；其余 ACK 失败保持 EIO，完整条件见[文件确认协议](../server/file-handles.md#五http复制与资源)。这不把任意打开变成可重试操作，也不改变丢失 ACK 的既有核对。成功修改未取得副本 barrier 确认时同样为 `EIO`。网络 errno 不进入 volume 错误链。
 
@@ -152,7 +154,6 @@ storage 契约有 NodeKind、共同时间与 opaque metadata，也有整个 volu
 | 契约之外的其它属性 | EPERM |
 | 扩展属性 | EOPNOTSUPP |
 | `renameat2` 的 `RENAME_EXCHANGE`、`RENAME_NOREPLACE` | EINVAL |
-| 符号链接指向哪里 | EOPNOTSUPP |
 | 硬链接 | 不提供（R-FS-4） |
 | 类型无法命名的节点 | EIO |
 
@@ -162,17 +163,17 @@ storage 契约有 NodeKind、共同时间与 opaque metadata，也有整个 volu
 
 ### 符号链接
 
-基础 volume 不创建符号链接，也不提供 readlink。第三方实现可以报告已有链接，挂载层按属性如实呈现：
+FUSE 通过 MutateName 创建符号链接，并以短期 NodeReference 的 State 读取原始 link target。底层按 NodeKind 保存链接自身，不跟随目标：
 
 | 对一个符号链接做 | 结果 |
 |---|---|
 | `lstat`、列目录 | 报告为符号链接，模式与长度都是链接自己的 |
-| `readlink` | EOPNOTSUPP |
-| `stat`、`open`、读、写 | EOPNOTSUPP —— 内核解析这些路径时先 `readlink` |
+| `readlink` | 返回引用同次 State 捕获的 link target |
+| `stat`、`open`、读、写 | 内核先通过 `readlink` 解析；底层普通文件打开仍拒绝链接 |
 | `rm` | 删掉链接本身，它指向的文件不动 |
 | 改名 | 搬动链接本身 |
 
-于是**不存在「以链接的名字拿到它指向的那个文件」这条路径**。答不出指向哪里就报 EOPNOTSUPP，不报 EINVAL —— 后者的意思是「这不是一个链接」。
+链接目标、Attr.Kind 与 Attr.Size 必须来自相容状态；目标缺失或无法验证时明确失败，不返回空目标。
 
 ## 七、容量
 
@@ -209,13 +210,13 @@ volume 报出自己的容量，挂载呈现层把它换算成内核要的块数�
 
 挂载仍保留一棵名字成员树，用于同名查询复用、删除、改名和 List 结果清理。节点内的本地 serial 只区分本次 listing 开始前已知的成员与期间新发现的成员，不是对外 inode。相同名字返回不同 ID 或类型时替换成员记录；被覆盖的旧 inode 可以继续被 fd 引用，失去名字不使它变成新对象。
 
-名字树随挂载结束清理，节点身份由 volume 保持。其它 client 的删除或替换在后续 Lookup/List 中被观察到；这套记录不替代目录父身份的权威检查。已有目录 inode 的路径竞争见第十节。
+名字树随挂载结束清理，节点身份由 volume 保持。其它 client 的删除或替换在后续 Lookup/List 中被观察到；普通子项操作的父 NodeID 与已打开目录 handle 的 NodeReference/Scope 决定权威父对象，本地父路径只用于内核呈现和仍按路径执行的 Readdir。
 
 两个随附 backend 都使用 SQLite 的持久节点身份。[宿主目录后端已移除](../../../.agents/notes/implemented/simplification/2026-09-08-remove-the-host-directory-backend.md)；第三方实现仍须满足 R-FS-5 与 R-INT-11，不能直接报告可能被复用的宿主 inode。
 
 ## 九、生命周期
 
-一次挂载拥有一个 FileSession。`Options.FileSession` 未提供时使用默认 options，显式 options 在建立前验证；实际 MaxFileSize 与挂载大小界限一致。后台续期在上一份已确认 lease 内完成，成功状态只以保守的请求起点更新 deadline。authority 重启、会话退役或期限耗尽使 File、UseOwner、range 与动作历史全部失效；挂载不按路径重开文件，也不自动重新取得 range。节点事实和 opaque metadata 可由新会话再次读取，旧持有者连续性不能由这些持久事实推导。
+一次挂载拥有一个 FileSession。`Options.FileSession` 未提供时使用默认 options，显式 options 在建立前验证；实际 MaxFileSize 与挂载大小界限一致。后台续期在上一份已确认 lease 内完成，成功状态只以保守的请求起点更新 deadline。authority 重启、会话退役或期限耗尽使 File、NodeReference、UseOwner、range 与有限 FileAction history 全部失效；挂载不按路径重开引用，也不自动重新取得 range。durable DeleteIntent 由新 session 按 ID 查询和继续清理，但不恢复旧 handle。节点事实和 opaque metadata 可由新会话再次读取，旧持有者连续性不能由这些持久事实推导。
 
 `Unmount` 失败，例如仍有使用者而返回 `EBUSY` 时，会话继续续期。内核连接退出后，挂载停止续期并尝试排空全部引用；个别 Release 缺失也由会话清理覆盖。`Mount.Done()` 在这次清理尝试结束后关闭，`Mount.Wait()` 返回它的错误，Done 关闭不意味着清理成功。独立 client 等待 Done 后才释放 replica，释放失败保留其目录与错误。
 
@@ -227,9 +228,9 @@ volume 报出自己的容量，挂载呈现层把它换算成内核要的块数�
 
 同步写入不在离线时返回成功，不把未知失败重试为新写入。原生补丁实现可在已知未提交的 revision 竞争后有界重试；这与应用重做一个结果未知的修改不同。普通 fd 没有隐含的内容版本前置条件，显式版本工作流仍独立。
 
-目录上的名字操作仍使用路径。跨客户端改名与延迟 Lookup 的交错可能让已有目录 inode 的父路径过时；身份属性和普通文件引用不依赖该路径，但目录遍历及相对目录修改的权威父身份问题仍由[打开文件身份提案](../../../.agents/notes/proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)拥有。
+目录子项 Lookup 与 mutation 已使用 NodeReference/Scope；Readdir 仍使用公开 List/ListBounded 的路径入口。当前没有 reference current-name、完整有界 directory metadata observation 或 directory revision/guard，因此不能据此实现需要一次完整目录快照或当前绑定证明的平台功能。这项边界由[持久节点身份与原子文件操作](../../../.agents/notes/implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)记录。
 
-标准 advisory 通过中立 range 表达 flock 与传统 POSIX 范围锁，完整 `F_OFD_*` 和 mmap 行为不由此推出。enforced range 为其它平台保留，当前 Linux 不把它冒充 advisory。显式 S/X 仍单独取得，挂载不自动选择 Strong 策略。
+标准 advisory 通过中立 range 表达 flock 与传统 POSIX 范围锁，完整 `F_OFD_*` 和 mmap 行为不由此推出。enforced range 为其它平台保留，当前 Linux 不把它冒充 advisory。显式 S/X 仍单独取得，挂载不自动选择 Strong 策略。中立原语没有交付 SMB endpoint、Windows create/share/disposition 映射或 Windows cache 验收，不能据此宣称 Windows 支持完成。
 
 ## 十一、部署形态
 

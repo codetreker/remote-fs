@@ -53,8 +53,17 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `file.set-node-attr` | `/v4/file`，`file.set-node-attr` | 按节点身份修改属性 |
 | `file.open` | `/v4/file`，`file.open` | 按路径打开，携带 OpenAccess |
 | `file.open-node` | `/v4/file`，`file.open-node` | 按节点身份打开，携带 OpenAccess |
+| `file.open-at` | `/v4/file`，`file.open-at` | 按父身份原子打开／创建／清空／替换普通文件 |
+| `file.lookup-at` | `/v4/file`，`file.lookup-at` | 按父身份查询一个原始叶名 |
+| `file.mutate-name` | `/v4/file`，`file.mutate-name` | 按父身份创建、删除或改名子项 |
+| `file.open-node-ref` | `/v4/file`，`file.open-node-ref` | 按 NodeID 打开 metadata-only 引用 |
+| `file.open-child-ref` | `/v4/file`，`file.open-child-ref` | 按父身份打开或创建节点引用 |
+| `file.query-action` | `/v4/file-control`，`file.query-action` | 核对 FileSession 内的有限动作回执 |
+| `file.query-delete-intent` | `/v4/file-control`，`file.query-delete-intent` | 查询 durable 删除义务状态 |
+| `file.acknowledge-delete-intent` | `/v4/file-control`，同名动作 | 幂等确认并释放 durable 删除终态记录 |
 | `file.ack` | `/v4/file-control`，`file.ack` | 确认已交付的打开引用 |
 | `file.stat` | `/v4/file`，`file.stat` | 查询保留引用的属性 |
+| `file.state` | `/v4/file-control`，`file.state` | 原子读取引用属性、link target 与 pending 状态 |
 | `file.read` | `/v4/file`，`file.read` | 按保留引用读取范围 |
 | `file.write` | `/v4/file`，`file.write` | 按保留引用修改范围 |
 | `file.truncate` | `/v4/file`，`file.truncate` | 改变保留文件长度 |
@@ -69,6 +78,9 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `file.range-apply` | `/v4/file-control`，`file.range-apply` | 接纳一批中立 range 编辑 |
 | `file.range-query`、`file.range-cancel` | `/v4/file-control`，同名动作 | 核对或取消原 range 动作 |
 | `file.range-drop` | `/v4/file-control`，`file.range-drop` | 清理 owner 在指定 domain 的状态 |
+| `file.set-pending-unlink` | `/v4/file-control`，同名动作 | 原子建立节点 pending deletion |
+| `file.clear-pending-unlink` | `/v4/file-control`，同名动作 | 按 generation 清除当前 pending 状态 |
+| `file.mutate` | `/v4/file`，`file.mutate` | 按 size/metadata 条件修改引用 |
 | `file.close` | `/v4/file-control`，`file.close` | 关闭一个保留文件引用 |
 | `lock.session-enrollment` | `/v4/session-enrollment` | 申请强占有会话 enrollment ticket |
 | `lock.session-open` | `/v4/session-open` | 使用 ticket 建立强占有会话 |
@@ -87,7 +99,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 
 副本构建还需要 replication.checkpoint 的明确许可；允许订阅或快照不隐含这项权限。Checkpoint 是一次普通读取，遵循入口授权、通用传输预算和安全错误规则，不建立持续输出。
 
-`FileOpenOptions` 嵌入共享的 `storage.OpenAccess`，其 Read、Write、Create、Truncate、Exclusive 与 AccessRequest.Open 是同一类型。FileOpenOptions.Check／CheckNode 还验证 InitialMetadata、Use 与节点身份；这些参数不加入业务策略值。AccessRequest.Open 仅在 file.open／file.open-node 携带已验证的 OpenAccess，其它操作为零值；open-node 不接受 Create／Exclusive。带 Create 的打开即使最终打开已有文件，也报告创建意图。一次入口 callback 决定全部 OpenAccess，允许之后 native open 才创建、截断、登记 Use 或分配文件引用。
+`FileOpenOptions` 嵌入共享的 `storage.OpenAccess`；file.open／file.open-node 继续把这五项意图放入 `AccessRequest.Open`。OpenAt、OpenNodeRef 与 OpenChildRef 也携带由 metadata 权限、Use 与打开效果导出的 OpenAccess。一个复杂动作按固定顺序产生基础 Operation 及它实际包含的 remove、set-attr、set-metadata 或 set-pending 等补充 Operation；每项分别调用同一 Authorizer，任一拒绝都发生在 native action 前。NodeID、Scope、metadata token、action ID 和 delete-intent ID 不作为业务身份。带 Create 的打开即使最终选择已有对象，也报告创建意图。
 
 `volume.write` 可以创建缺失文件，单独拒绝 volume.create 不能禁止创建。metadata、range apply 与 range drop 分别授权；查询、取消或已有 owner 不能绕过本次策略。range mode 不代替内容读写权限，后续数据访问仍检查 file.read / file.write。FUSE 的 flock/POSIX 解释不进入 AccessRequest。
 
@@ -100,7 +112,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 3. handler 从已解码语义构造一个 AccessRequest，执行一次入口 Authorize。
 4. 允许后才读取或触碰 capability、分配引用或动作、重放回执、读取 Log、取得订阅／snapshot／page 资源或访问 backend。存储权限、配额、锁与原有取消分类继续生效。
 
-格式合法但不存在的 capability、无 Log（包括 publisher 为 nil）或错误续订游标，在拒绝时只返回授权错误；允许后才返回原有 ESTALE／ENOSYS 等结果。旧 RequestID、成功过的动作与已有 capability 均不能省略检查。ack、renew、status、metadata、query、cancel、drop、release、retire 与 close 各自可被拒绝。
+格式合法但不存在的 capability、action receipt、delete intent、无 Log（包括 publisher 为 nil）或错误续订游标，在拒绝时只返回授权错误；允许后才返回原有 ESTALE／ENOSYS 等结果。旧 action ID、成功过的动作、durable intent ID 与已有 capability 均不能省略检查。ack、renew、status、metadata、query、cancel、drop、release、retire 与 close 各自可被拒绝。已经接受的 CloseIntent 后续触发是原动作固定效果，不因原会话消失或权限撤销而重新授权；对其状态的新查询仍独立授权。
 
 拒绝只说明本次尝试未获准，不能证明此前超时的动作未执行。client 无法获准核对时保留原来的未知结果，不合成 Cancelled、Released、NotApplied 或已记录的 rejection。请求 cleanup 被拒绝仍报告拒绝；服务器自主 lease 到期、退休、shutdown 与资源回收由原拥有者执行，不重新请求该访问身份的权限。
 
@@ -172,7 +184,9 @@ func newAuthorizedHandler(
         access, err := lookup(ctx, identity, r.Volume)
         if err != nil { return err }
         if !access.Allowed[r.Operation] { return authz.ErrDenied }
-        if r.Operation == storage.OpFileOpen || r.Operation == storage.OpFileOpenNode {
+        switch r.Operation {
+        case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileOpenAt,
+            storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
             if r.Open.Read && !access.CanRead { return authz.ErrDenied }
             if (r.Open.Write || r.Open.Create || r.Open.Truncate) && !access.CanWrite {
                 return authz.ErrDenied

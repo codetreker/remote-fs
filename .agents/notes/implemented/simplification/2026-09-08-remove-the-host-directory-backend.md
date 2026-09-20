@@ -22,7 +22,7 @@ Status: implemented
 
 [元数据复制](../architecture/2026-08-27-metadata-replication.md)与[有界读取](../architecture/2026-09-04-bounded-read-and-list-responses.md)保持原契约；[读取可能输给写者](../architecture/2026-09-01-a-read-may-lose-to-a-writer.md)、[名字与身份](../bug-fix/2026-09-01-a-name-is-not-an-identity.md)、[标准库错误](../bug-fix/2026-08-21-the-standard-library-answers-for-the-kernel.md)和[请求中断](../bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)中的旧宿主目录证据保留为历史，当前测试使用保留的组合与接口装饰。已完成的[缩短结算](../bug-fix/2026-09-07-release-shrunk-quota-after-commit.md)继续约束 `limited`。
 
-[观察源与通道](../../proposed/architecture/2026-08-19-observation-source-and-channels.md)、[volume 契约](../../proposed/architecture/2026-08-19-volume-in-the-contract.md)、[打开文件的内容依据](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)和[对象存储缺口](../../proposed/architecture/2026-08-22-gaps-in-the-object-store-backend.md)仍包含不依赖宿主目录后端的未完成内容，保持 proposed。
+[观察源与通道](../../proposed/architecture/2026-08-19-observation-source-and-channels.md)、[volume 契约](../../proposed/architecture/2026-08-19-volume-in-the-contract.md)、[打开文件的显式内容依据](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)和[对象存储缺口](../../proposed/architecture/2026-08-22-gaps-in-the-object-store-backend.md)仍包含不依赖宿主目录后端的未完成内容，保持 proposed；目录父身份已经由[原子身份操作](../architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)交付。
 
 ## 备选方案
 

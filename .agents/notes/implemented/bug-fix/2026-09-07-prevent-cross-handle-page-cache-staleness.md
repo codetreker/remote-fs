@@ -24,4 +24,4 @@ Status: implemented
 
 普通文件读请求经过权威对象访问，不由共享旧页直接答复。[真实双 HTTP 挂载用例](../../../../packages/fuse/live_files_test.go)的 `TestOldDescriptorCannotRefillFreshDescriptorWithStalePages` 固定 1 MiB 的 `A` 到 `B`、等待 1200 毫秒、新开 fd、旧 fd 先读的顺序，随后按 64 KiB 交错读取旧、新 fd，断言均为 `B` 且大小与 EOF 正确。其它 live 用例还验证旧 fd 立即看到等长及变长的新内容，身份不因覆写改变。
 
-代价是失去内核内容页缓存命中，每次读取都进入 FUSE 与 File 接口；backend 仍可能物化完整对象。direct I/O 不交付完整 mmap 语义，三个元数据超时仍为 0。[元数据复制](../architecture/2026-08-27-metadata-replication.md)的连续性与重建缺口、未来非零缓存、[显式内容依据与目录父身份](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)继续有独立边界，不能从内容缓存修复推断它们已经完成。
+代价是失去内核内容页缓存命中，每次读取都进入 FUSE 与 File 接口；backend 仍可能物化完整对象。direct I/O 不交付完整 mmap 语义，三个元数据超时仍为 0。[元数据复制](../architecture/2026-08-27-metadata-replication.md)的连续性与重建缺口、未来非零缓存和[显式内容依据](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)继续有独立边界；目录父身份由[原子身份操作](../architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)接续，不能从内容缓存修复推断这些能力。

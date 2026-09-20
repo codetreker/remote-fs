@@ -54,7 +54,7 @@ flock 按 open file description 归属，dup/fork 共享，最后一个共享描
 
 fd 的身份、读入的属性和字节来自同一保留对象；配额、网络与持久化失败直接落到同步修改。旧的[内容与长度混用](../bug-fix/2026-09-07-bind-buffered-reads-to-their-size.md)与[跨句柄页缓存](../bug-fix/2026-09-07-prevent-cross-handle-page-cache-staleness.md)分别保留具体触发、证据和修复边界。direct I/O 付出内核页缓存命中率，逐次写入付出往返和完整对象重新物化的成本。objectstore 的每次区间读仍可获取完整对象，顺序读大文件会重复承担这份传输与分配；区间接口本身没有交付对象后端的范围传输。多个普通写者可能都成功，不再把所有普通 fd 修改解释为显式版本比较。
 
-保留身份不等于保留每一份历史内容，也不自动修复目录操作的父身份竞争。[中立元数据与访问控制](2026-09-16-neutral-metadata-and-access-controls.md)接续 NodeKind、metadata、Use claim 与 range；[打开文件身份提案](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)继续拥有目录父身份与显式内容依据；[读取与清扫](../../proposed/architecture/2026-08-21-readers-in-flight-and-the-sweeper.md)保留旧内容键在读取前被回收的协调问题。文件 direct I/O 也不交付[非零元数据缓存与失效策略](../../proposed/architecture/2026-08-19-kernel-cache-and-unreachable.md)。
+保留身份不等于保留每一份历史内容。[中立元数据与访问控制](2026-09-16-neutral-metadata-and-access-controls.md)接续 NodeKind、metadata、Use claim 与 range；[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)接续目录父身份、NodeReference、原子子项操作与删除义务；[文件目标提案](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)仍拥有显式内容依据；[读取与清扫](../../proposed/architecture/2026-08-21-readers-in-flight-and-the-sweeper.md)保留旧内容键在读取前被回收的协调问题。文件 direct I/O 也不交付[非零元数据缓存与失效策略](../../proposed/architecture/2026-08-19-kernel-cache-and-unreachable.md)。
 
 同机 mmap 的完整行为没有由 direct I/O 自动得到保证，跨客户端 mmap 一致性继续在 R-FS-4 之外；恢复共享映射能力必须单独定义写入确认与缓存交互。完整 `F_OFD_*` 语义同样没有承诺，且 FUSE 归一化后的请求不足以可靠逐条识别它们。
 
