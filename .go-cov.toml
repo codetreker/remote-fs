@@ -28,6 +28,7 @@ files = [
   "cmd/remote-fs/main.go",
   "cmd/remote-fs-server/main.go",
   "packages/storage/storagetest/storagetest.go",
+  "packages/storage/storagetest/metadata.go",
   "packages/metastore/metastoretest/metastoretest.go",
   "packages/metastore/metastoretest/log.go",
 ]
