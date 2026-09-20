@@ -841,7 +841,7 @@ func TestSQLitePublicationOrdersFreshReadsAfterAdmission(t *testing.T) {
 		}
 		runtime.Gosched()
 	}
-	previous, err := f.store.resolve(t.Context(), old, "file")
+	previous, err := f.store.resolve(t.Context(), old.Tx, "file")
 	if err != nil || previous.Size != 3 {
 		t.Fatalf("previously captured view lost its old version: size=%d error=%v", previous.Size, err)
 	}

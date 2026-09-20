@@ -10,6 +10,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
@@ -83,37 +84,39 @@ func TestLabeledReadCancellationSurvivesTransactionCleanup(t *testing.T) {
 }
 
 func TestReadContextAutomaticRollbackPreservesTheOperationResult(t *testing.T) {
-	store, err := Open(t.Context(), t.TempDir()+"/metastore.db", "workspace", 4096, DefaultWindow())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Errorf("closing store: %v", err)
-		}
-	})
 	for _, successful := range []bool{false, true} {
 		t.Run(fmt.Sprintf("successful callback %t", successful), func(t *testing.T) {
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-			err := store.inspect(ctx, func(tx *sql.Tx) error {
-				var one int
-				if err := tx.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil {
-					return err
+			synctest.Test(t, func(t *testing.T) {
+				store, err := Open(t.Context(), t.TempDir()+"/metastore.db", "workspace", 4096, DefaultWindow())
+				if err != nil {
+					t.Fatal(err)
 				}
-				cancel()
-				waitForReadRollback(t, store.read)
-				if successful {
-					return nil
+				t.Cleanup(func() {
+					if err := store.Close(); err != nil {
+						t.Errorf("closing store: %v", err)
+					}
+				})
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				err = store.inspect(ctx, func(tx *sql.Tx) error {
+					var one int
+					if err := tx.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil {
+						return err
+					}
+					cancel()
+					synctest.Wait()
+					if successful {
+						return nil
+					}
+					return ctx.Err()
+				})
+				if storage.ErrnoOf(err) != syscall.EINTR || !errors.Is(err, context.Canceled) || errors.Is(err, syscall.EIO) {
+					t.Fatalf("read after database/sql automatic rollback = %v, want cancellation without EIO", err)
 				}
-				return ctx.Err()
+				if _, err := store.Stat(t.Context(), "."); err != nil {
+					t.Fatalf("canceled read poisoned subsequent reads: %v", err)
+				}
 			})
-			if storage.ErrnoOf(err) != syscall.EINTR || !errors.Is(err, context.Canceled) || errors.Is(err, syscall.EIO) {
-				t.Fatalf("read after database/sql automatic rollback = %v, want cancellation without EIO", err)
-			}
-			if _, err := store.Stat(t.Context(), "."); err != nil {
-				t.Fatalf("canceled read poisoned subsequent reads: %v", err)
-			}
 		})
 	}
 }
@@ -148,20 +151,6 @@ func TestCanceledReadOperationsReturnInterruption(t *testing.T) {
 				t.Fatalf("canceled %s = %v, want interruption without EIO", operation.name, err)
 			}
 		})
-	}
-}
-
-func waitForReadRollback(t *testing.T, pool *sql.DB) {
-	t.Helper()
-	deadline := time.NewTimer(time.Second)
-	defer deadline.Stop()
-	for pool.Stats().InUse != 0 {
-		select {
-		case <-deadline.C:
-			t.Fatal("database/sql did not release the canceled transaction's connection")
-		default:
-			runtime.Gosched()
-		}
 	}
 }
 

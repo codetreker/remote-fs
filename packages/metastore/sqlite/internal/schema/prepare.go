@@ -90,11 +90,17 @@ func PrepareConfigured(
 	maxIntegrityRecords, maxIntegrityBytes int64,
 	durable *DurableOpen,
 ) (id, root int64, state dbstate.State, err error) {
-	tx, err := db.BeginTx(ctx, nil)
+	conn, err := db.Conn(ctx)
 	if err != nil {
 		return 0, 0, dbstate.State{}, err
 	}
-	defer tx.Rollback()
+	var rollback preparationRollbacker
+	defer func() { err = finishPreparation(rollback, conn.Close, err) }()
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, dbstate.State{}, err
+	}
+	rollback = tx
 
 	version, recorded, err := recordedSchemaVersion(ctx, tx)
 	if err != nil {
@@ -223,6 +229,23 @@ func PrepareConfigured(
 		return 0, 0, dbstate.State{}, sqlerr.NewUncertainCommit(err)
 	}
 	return id, root, state, nil
+}
+
+type preparationRollbacker interface{ Rollback() error }
+
+func finishPreparation(tx preparationRollbacker, closeConnection func() error, primary error) error {
+	var rollbackErr error
+	if tx != nil {
+		rollbackErr = tx.Rollback()
+	}
+	closeErr := closeConnection()
+	if rollbackErr == sql.ErrTxDone && closeErr == nil {
+		rollbackErr = nil
+	}
+	if cleanupErr := errors.Join(rollbackErr, closeErr); cleanupErr != nil {
+		return errors.Join(primary, fmt.Errorf("releasing the SQLite preparation transaction: %w", sqlerr.NewDurabilityFailure(cleanupErr)))
+	}
+	return primary
 }
 
 // recordedSchemaVersion reads enough migration state for package-specific preflight checks.

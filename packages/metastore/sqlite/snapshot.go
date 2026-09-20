@@ -51,7 +51,7 @@ func (s *Store) Snapshot(ctx context.Context) (metastore.Snap, metastore.Positio
 		return nil, 0, finishReadTransaction(ctx, "snapshot transaction", tx, primary)
 	}
 	if err := schema.ValidateVolumeIntegrity(
-		ctx, tx, s.volume, s.maxIntegrityRecords, s.maxIntegrityBytes,
+		ctx, tx.Tx, s.volume, s.maxIntegrityRecords, s.maxIntegrityBytes,
 	); err != nil {
 		primary := fmt.Errorf("validating the picture of the tree: %w", sqlerr.ReadFailure(ctx, err))
 		return nil, 0, finishReadTransaction(ctx, "snapshot transaction", tx, primary)
@@ -72,7 +72,7 @@ type snapshot struct {
 	ctx   context.Context
 
 	// tx is the read transaction the picture is taken in, and nil once it is closed.
-	tx *sql.Tx
+	tx *ownedTransaction
 
 	// The root has no name and no parent, so it is not an entry and is delivered on its own.
 	sentRoot bool
@@ -109,7 +109,7 @@ func (p *snapshot) Next(ctx context.Context, limit int, result *metastore.RowRes
 
 	produced := 0
 	if !p.sentRoot {
-		root, contentBytes, err := p.store.rootMetadata(ctx, p.tx)
+		root, contentBytes, err := p.store.rootMetadata(ctx, p.tx.Tx)
 		if err != nil {
 			return false, result.Fail(fmt.Errorf("reading the root of the picture: %w", p.readFailure(ctx, err)))
 		}
@@ -122,7 +122,7 @@ func (p *snapshot) Next(ctx context.Context, limit int, result *metastore.RowRes
 		if !fits {
 			return false, result.Fail(fmt.Errorf("the root did not fit an empty snapshot page: %w", syscall.EIO))
 		}
-		content, err := p.store.nodeContent(ctx, p.tx, root.ID)
+		content, err := p.store.nodeContent(ctx, p.tx.Tx, root.ID)
 		if err != nil {
 			return false, result.Fail(fmt.Errorf("reading the root content key: %w", p.readFailure(ctx, err)))
 		}
