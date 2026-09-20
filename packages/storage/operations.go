@@ -31,6 +31,8 @@ const (
 	OpFileOpenNode                Operation = "file.open-node"
 	OpFileOpenAt                  Operation = "file.open-at"
 	OpFileLookupAt                Operation = "file.lookup-at"
+	OpFileReadDirNode             Operation = "file.read-dir-node"
+	OpFileObserveName             Operation = "file.observe-name"
 	OpFileMutateName              Operation = "file.mutate-name"
 	OpFileOpenNodeRef             Operation = "file.open-node-ref"
 	OpFileOpenChildRef            Operation = "file.open-child-ref"
@@ -73,3 +75,5 @@ const (
 	OpLockQueryGrant              Operation = "lock.query-grant"
 	OpLockStatus                  Operation = "lock.status"
 )
+
+const OpFileObserveDirectoryMetadata Operation = "file.observe-directory-metadata"
