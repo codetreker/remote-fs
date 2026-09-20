@@ -101,6 +101,16 @@ func (h *Handler) attrResultBudget(req fileRequest) storage.AttrResultBudget {
 		if int64(len(encoded))+extra+metadataCharge > limit {
 			return fmt.Errorf("file result exceeds its %d-byte response bound: %w", limit, syscall.EFBIG)
 		}
+		if partialFileResult(req, response) != nil {
+			failure, err := json.Marshal(ErrorResponse{Errno: "EIO", Message: boundedErrorDetail, FileResult: &response})
+			if err != nil {
+				return fmt.Errorf("cannot size partial file result: %w", err)
+			}
+			errorLimit := fileOperationLimit(req.Op, h.maxBodyBytes)
+			if int64(len(failure))+extra+metadataCharge > errorLimit {
+				return fmt.Errorf("partial file result exceeds its %d-byte response bound: %w", errorLimit, syscall.EFBIG)
+			}
+		}
 		return nil
 	}
 }
