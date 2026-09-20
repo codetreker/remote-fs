@@ -19,7 +19,6 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/replicated"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 	"io"
-	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -517,7 +516,7 @@ func (s *symlinkFileSession) OpenFile(ctx context.Context, name string, options 
 
 func (s *symlinkMetadata) describe(attr storage.Attr) storage.Attr {
 	if attr.ID == s.linkID {
-		attr.Mode = fs.ModeSymlink | 0o777
+		attr.Kind = storage.NodeSymlink
 	}
 	return attr
 }
@@ -546,8 +545,12 @@ func (s *symlinkMetadata) ListBounded(ctx context.Context, name string, result *
 		return s.Storage.ListBounded(ctx, name, result)
 	}
 	// Native enumeration remains bounded; the destination charges the transformed mode.
-	captured, err := storage.NewListResult(result.MaxBytes(), 0, func(_ int, nameBytes int64, _ storage.Attr) (int64, error) {
-		return nameBytes + int64(unsafe.Sizeof(storage.Entry{})), nil
+	captured, err := storage.NewListResult(result.MaxBytes(), 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		metadataRetention, err := storage.MetadataRetentionBytes(metadataBytes)
+		if err != nil {
+			return 0, err
+		}
+		return nameBytes + metadataRetention + int64(unsafe.Sizeof(storage.Entry{})), nil
 	})
 	if err != nil {
 		return result.Fail(err)
