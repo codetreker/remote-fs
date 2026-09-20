@@ -54,6 +54,43 @@ func (*nodeAuthorityWithoutName) CloseWithBarrier(context.Context) (*httprest.Mu
 
 type nameObserverContextKey struct{}
 
+type substitutedDirectoryAuthority struct {
+	*fileSessionStub
+	httprest.NamespaceAccessWithBarrier
+}
+
+func (*substitutedDirectoryAuthority) CheckNamespaceAccess() error { return nil }
+func (*substitutedDirectoryAuthority) ReadDirNode(_ context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	return storage.ObservedDirectory{Observation: storage.DirectoryObservation{ParentID: target.NodeID + 1, Revision: []byte{1}}}, nil
+}
+func (*substitutedDirectoryAuthority) ReadDirNodeBounded(_ context.Context, target storage.DirectoryTarget, result *storage.ListResult) (storage.DirectoryObservation, error) {
+	if err := result.Add(storage.Entry{Name: "entry", Attr: storage.Attr{ID: target.NodeID + 2, Kind: storage.NodeRegular}}); err != nil {
+		return storage.DirectoryObservation{}, err
+	}
+	return storage.DirectoryObservation{ParentID: target.NodeID + 1, Revision: []byte{1}}, nil
+}
+
+func TestReplicatedNamespaceRejectsSubstitutedAuthorityDirectory(t *testing.T) {
+	remote := &substitutedDirectoryAuthority{fileSessionStub: &fileSessionStub{}}
+	session := retainedTestSession(t, remote)
+	target := storage.DirectoryTarget{NodeID: 9}
+	if observed, err := session.ReadDirNode(t.Context(), target); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observed, storage.ObservedDirectory{}) {
+		t.Fatalf("substituted directory = %+v, %v", observed, err)
+	}
+	result, err := storage.NewListResult(4096, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		return nameBytes + metadataBytes + 64, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed, err := session.ReadDirNodeBounded(t.Context(), target, result); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observed, storage.DirectoryObservation{}) {
+		t.Fatalf("substituted bounded directory = %+v, %v", observed, err)
+	}
+	if entries, err := result.Entries(); entries != nil || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("substituted bounded directory exposed %+v, %v", entries, err)
+	}
+}
+
 func TestReplicatedDirectoryMetadataUsesOrdinaryAdmissionAndOnePrefix(t *testing.T) {
 	for _, scenario := range []string{"plain", "named", "budget refusal", "capture failure", "malformed", "check failure", "unsupported", "unhealthy replica", "retired session"} {
 		t.Run(scenario, func(t *testing.T) {

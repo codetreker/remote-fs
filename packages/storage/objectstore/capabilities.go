@@ -198,6 +198,9 @@ func (fs *fileSession) ReadDirNode(ctx context.Context, target storage.Directory
 	if err := observed.Check(); err != nil {
 		return storage.ObservedDirectory{}, err
 	}
+	if observed.Observation.ParentID != target.NodeID {
+		return storage.ObservedDirectory{}, syscall.EIO
+	}
 	return observed.Clone(), nil
 }
 
@@ -227,6 +230,9 @@ func (fs *fileSession) ReadDirNodeBounded(ctx context.Context, target storage.Di
 	}
 	if err := observation.Check(); err != nil {
 		return observation, err
+	}
+	if observation.ParentID != target.NodeID {
+		return observation, syscall.EIO
 	}
 	return observation.Clone(), nil
 }

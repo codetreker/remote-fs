@@ -282,6 +282,59 @@ type objectDirectoryObservationProbe struct {
 	seenResult           *storage.ListResult
 }
 
+type objectNamespaceSubstitutionProbe struct {
+	*sqlite.LockingStore
+}
+
+func (p *objectNamespaceSubstitutionProbe) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	observed, err := p.LockingStore.ReadDirNode(ctx, target)
+	if err == nil {
+		observed.Observation.ParentID++
+	}
+	return observed, err
+}
+
+func (p *objectNamespaceSubstitutionProbe) ReadDirNodeBounded(ctx context.Context, target storage.DirectoryTarget, result *storage.ListResult) (storage.DirectoryObservation, error) {
+	observation, err := p.LockingStore.ReadDirNodeBounded(ctx, target, result)
+	if err == nil {
+		observation.ParentID++
+	}
+	return observation, err
+}
+
+func TestObjectNamespaceRejectsSubstitutedDirectoryIdentity(t *testing.T) {
+	native, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
+		Database: filepath.Join(t.TempDir(), "namespace.db"), Volume: "namespace", SQLite: sqlite.DefaultOptions(),
+		Locks: locking.DefaultOptions(), Initialize: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	volume := objectstore.New(memory.New(), &objectNamespaceSubstitutionProbe{LockingStore: native})
+	t.Cleanup(func() {
+		if err := volume.Close(); err != nil {
+			t.Errorf("close namespace substitution volume: %v", err)
+		}
+	})
+	root, err := volume.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
+	namespace := objectCapability[storage.NamespaceAccess](t, session)
+	target := storage.DirectoryTarget{NodeID: root.ID}
+	if observed, err := namespace.ReadDirNode(t.Context(), target); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observed, storage.ObservedDirectory{}) {
+		t.Fatalf("substituted directory = %+v, %v", observed, err)
+	}
+	result := objectMetadataList(t)
+	if observed, err := namespace.ReadDirNodeBounded(t.Context(), target, result); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observed, storage.DirectoryObservation{}) {
+		t.Fatalf("substituted bounded directory = %+v, %v", observed, err)
+	}
+	if entries, err := result.Entries(); entries != nil || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("substituted bounded directory exposed %+v, %v", entries, err)
+	}
+}
+
 func (p *objectDirectoryObservationProbe) CheckDirectoryMetadataObservation() error {
 	return p.checkErr
 }

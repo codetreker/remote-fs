@@ -65,6 +65,28 @@ func (p *capabilitySessionProbe) Drop(ctx context.Context, _ storage.UseOwner, _
 	p.capture(ctx)
 	return p.failure
 }
+
+func TestNamespaceWrapperRejectsSubstitutedDirectoryIdentity(t *testing.T) {
+	probe := &capabilitySessionProbe{}
+	view := &Storage{}
+	wrapper := &fileSession{FileSession: probe, storage: view}
+	target := storage.DirectoryTarget{NodeID: 9}
+	if observed, err := wrapper.ReadDirNode(t.Context(), target); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observed, storage.ObservedDirectory{}) {
+		t.Fatalf("substituted directory = %+v, %v", observed, err)
+	}
+	result, err := storage.NewListResult(4096, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		return nameBytes + metadataBytes + 64, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed, err := wrapper.ReadDirNodeBounded(t.Context(), target, result); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observed, storage.DirectoryObservation{}) {
+		t.Fatalf("substituted bounded directory = %+v, %v", observed, err)
+	}
+	if entries, err := result.Entries(); entries != nil || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("substituted bounded directory exposed %+v, %v", entries, err)
+	}
+}
 func (p *capabilitySessionProbe) CheckAtomicFileOpen() error { return p.checkErr }
 func (p *capabilitySessionProbe) OpenAt(ctx context.Context, _ storage.ChildName, _ storage.OpenAtOptions) (storage.OpenResult, error) {
 	p.capture(ctx)

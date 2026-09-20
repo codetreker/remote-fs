@@ -56,6 +56,9 @@ func (s *fileSession) ReadDirNode(ctx context.Context, target storage.DirectoryT
 	if err := observed.Check(); err != nil {
 		return storage.ObservedDirectory{}, err
 	}
+	if observed.Observation.ParentID != target.NodeID {
+		return storage.ObservedDirectory{}, syscall.EIO
+	}
 	return observed, nil
 }
 
@@ -76,6 +79,9 @@ func (s *fileSession) ReadDirNodeBounded(ctx context.Context, target storage.Dir
 	observation, returned = backend.ReadDirNodeBounded(readContext(ctx), target, result)
 	if returned == nil {
 		returned = observation.Check()
+	}
+	if returned == nil && observation.ParentID != target.NodeID {
+		returned = syscall.EIO
 	}
 	return observation, returned
 }

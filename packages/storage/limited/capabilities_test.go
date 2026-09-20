@@ -87,6 +87,27 @@ func (p *capabilityProbe) Drop(context.Context, storage.UseOwner, storage.Confli
 	return p.callErr
 }
 
+func TestNamespaceWrapperRejectsSubstitutedDirectoryIdentity(t *testing.T) {
+	probe := &capabilityProbe{}
+	wrapper := &fileSession{FileSession: probe, storage: &Storage{limit: MinLimit}}
+	target := storage.DirectoryTarget{NodeID: 9}
+	if observed, err := wrapper.ReadDirNode(t.Context(), target); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observed, storage.ObservedDirectory{}) {
+		t.Fatalf("substituted directory = %+v, %v", observed, err)
+	}
+	result, err := storage.NewListResult(4096, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		return nameBytes + metadataBytes + 64, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed, err := wrapper.ReadDirNodeBounded(t.Context(), target, result); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observed, storage.DirectoryObservation{}) {
+		t.Fatalf("substituted bounded directory = %+v, %v", observed, err)
+	}
+	if entries, err := result.Entries(); entries != nil || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("substituted bounded directory exposed %+v, %v", entries, err)
+	}
+}
+
 type referenceProbe struct {
 	storage.File
 	checkErr error
