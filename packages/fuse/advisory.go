@@ -103,7 +103,7 @@ func (h *handle) Getlk(ctx context.Context, kernel uint64, lk *gofuse.FileLock, 
 	}
 	out.Start, out.End = other.Start, other.Start+other.Length-1
 	if command.Domain == storage.DomainRecord {
-		if conflict.Owner == 0 || conflict.Owner > math.MaxUint32 {
+		if conflict.Owner == 0 || conflict.Owner > math.MaxInt32 {
 			return syscall.EIO
 		}
 		out.Pid = uint32(conflict.Owner)

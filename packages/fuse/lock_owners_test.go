@@ -275,16 +275,25 @@ func TestKernelOwnersUseOpaqueGroupsAndReclaimAfterClose(t *testing.T) {
 	}
 }
 
-func TestGetlkRejectsMissingOrOversizedConflictPID(t *testing.T) {
-	for _, diagnostic := range []storage.OwnerDiagnostic{0, storage.OwnerDiagnostic(math.MaxUint32) + 1} {
-		t.Run(fmt.Sprintf("diagnostic=%d", diagnostic), func(t *testing.T) {
+func TestGetlkValidatesSignedPIDRange(t *testing.T) {
+	for _, test := range []struct {
+		diagnostic storage.OwnerDiagnostic
+		wantErrno  syscall.Errno
+		wantPID    uint32
+	}{
+		{diagnostic: 0, wantErrno: syscall.EIO},
+		{diagnostic: math.MaxInt32, wantPID: math.MaxInt32},
+		{diagnostic: math.MaxInt32 + 1, wantErrno: syscall.EIO},
+		{diagnostic: math.MaxUint32, wantErrno: syscall.EIO},
+	} {
+		t.Run(fmt.Sprintf("diagnostic=%d", test.diagnostic), func(t *testing.T) {
 			v, session := localRangeFixture(t, 4)
-			session.conflict = &storage.RangeConflict{Found: true, Owner: diagnostic, Range: storage.Range{Kind: storage.Bytes, Length: 1}, Mode: storage.RangeExclusive}
+			session.conflict = &storage.RangeConflict{Found: true, Owner: test.diagnostic, Range: storage.Range{Kind: storage.Bytes, Length: 1}, Mode: storage.RangeExclusive}
 			h := localRangeHandle(v, 1, "scope")
 			lk := gofuse.FileLock{Start: 0, End: 0, Typ: syscall.F_WRLCK, Pid: 10}
 			var out gofuse.FileLock
-			if errno := h.Getlk(t.Context(), 1, &lk, 0, &out); errno != syscall.EIO {
-				t.Fatalf("Getlk returned %v with output %+v", errno, out)
+			if errno := h.Getlk(t.Context(), 1, &lk, 0, &out); errno != test.wantErrno || errno == 0 && out.Pid != test.wantPID {
+				t.Fatalf("Getlk returned %v with PID %d, want %v and %d", errno, out.Pid, test.wantErrno, test.wantPID)
 			}
 		})
 	}
