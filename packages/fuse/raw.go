@@ -6,8 +6,6 @@ import (
 	"syscall"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
-
-	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 type rawRequestKind uint8
@@ -18,9 +16,8 @@ const (
 )
 
 type rawRequest struct {
-	kind        rawRequestKind
-	owner       storage.LockOwner
-	flockUnlock bool
+	kind  rawRequestKind
+	owner uint64
 }
 
 // The high-level bridge keeps only the caller and cancel channel. A unique channel
@@ -80,7 +77,7 @@ func newRawFilesystem(raw gofuse.RawFileSystem, v *volume) gofuse.RawFileSystem 
 }
 
 func (r *rawFilesystem) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.Status {
-	forwarded, done, ok := r.volume.raw.begin(cancel, rawRequest{kind: rawFlush, owner: storage.LockOwner(input.LockOwner)})
+	forwarded, done, ok := r.volume.raw.begin(cancel, rawRequest{kind: rawFlush, owner: uint64(input.LockOwner)})
 	if !ok {
 		r.volume.fence(fmt.Errorf("flush owner metadata capacity exhausted: %w", syscall.EIO))
 		return gofuse.EIO
@@ -90,10 +87,7 @@ func (r *rawFilesystem) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gof
 }
 
 func (r *rawFilesystem) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
-	forwarded, done, ok := r.volume.raw.begin(cancel, rawRequest{
-		kind: rawRelease, owner: storage.LockOwner(input.LockOwner),
-		flockUnlock: input.ReleaseFlags&gofuse.FUSE_RELEASE_FLOCK_UNLOCK != 0,
-	})
+	forwarded, done, ok := r.volume.raw.begin(cancel, rawRequest{kind: rawRelease, owner: uint64(input.LockOwner)})
 	if !ok {
 		r.volume.fence(fmt.Errorf("release owner metadata capacity exhausted: %w", syscall.EIO))
 		// Release must still retire the retained file if owner cleanup cannot be

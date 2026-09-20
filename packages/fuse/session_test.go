@@ -23,7 +23,9 @@ func (s sessionLifecycleStorage) NewFileSession(ctx context.Context, opts storag
 	if err != nil {
 		return nil, err
 	}
-	return s.wrap(fileSession), nil
+	capabilities := testSessionCapabilities(fileSession)
+	capabilities.FileSession = s.wrap(fileSession)
+	return &capabilities, nil
 }
 
 type sessionLifecycleProbe struct {

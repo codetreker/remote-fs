@@ -8,6 +8,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/codetreker/remote-fs/packages/fuse/posix"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -23,7 +24,7 @@ func (n *node) checkAttr(attr storage.Attr) error {
 	if attr.ID == 0 || attr.ID != n.id.node || !attr.IsDir() && attr.Size < 0 {
 		return syscall.EIO
 	}
-	mode, errno := systemMode(attr.Mode)
+	mode, errno := attributeMode(attr)
 	if errno != 0 || mode&syscall.S_IFMT != n.id.kind {
 		return syscall.EIO
 	}
@@ -85,7 +86,7 @@ func (n *node) getattr(ctx context.Context, f fs.FileHandle, out *gofuse.AttrOut
 	}
 	var attr storage.Attr
 	var err error
-	if h, ok := f.(*handle); ok {
+	if h, ok := f.(attributeHandle); ok {
 		attr, err = h.stat(ctx)
 	} else {
 		attr, err = n.volume.files.StatNode(ctx, n.id.node)
@@ -130,22 +131,31 @@ func (n *node) setattr(ctx context.Context, f fs.FileHandle, in *gofuse.SetAttrI
 		}
 		changed = true
 	}
-	if !change.Empty() {
+	if !change.AttrChange.Empty() {
 		if err := ctx.Err(); err != nil {
 			return afterMutation(changed, err)
 		}
 		var attr storage.Attr
 		var err error
-		if h, ok := f.(*handle); ok {
-			attr, err = h.setAttr(ctx, change)
+		if h, ok := f.(attributeHandle); ok {
+			attr, err = h.setAttr(ctx, change.AttrChange)
 		} else {
-			attr, err = n.volume.files.SetNodeAttr(ctx, n.id.node, change)
+			attr, err = n.volume.files.SetNodeAttr(ctx, n.id.node, change.AttrChange)
 		}
 		if err != nil {
 			return afterMutation(true, err)
 		}
 		if err := n.checkAttr(attr); err != nil {
 			return err
+		}
+		changed = true
+	}
+	if change.Mode != nil {
+		if err := ctx.Err(); err != nil {
+			return afterMutation(changed, err)
+		}
+		if err := n.setPermissions(ctx, f, *change.Mode); err != nil {
+			return afterMutation(changed, err)
 		}
 		changed = true
 	}
@@ -166,7 +176,7 @@ func (n *node) setattr(ctx context.Context, f fs.FileHandle, in *gofuse.SetAttrI
 // FATTR_CTIME does too: no system call sets a change time, and a kernel that attaches one
 // is stating what follows from the change it is already asking for. Size is the caller's
 // to apply, so it is not part of the change reported here.
-func (v *volume) requestedChange(in *gofuse.SetAttrIn) (storage.AttrChange, syscall.Errno) {
+func (v *volume) requestedChange(in *gofuse.SetAttrIn) (attributeChange, syscall.Errno) {
 	// Everything this filesystem knows what to do with. FATTR_KILL_SUIDGID is deliberately
 	// outside it: it asks for the setuid and setgid bits to be cleared, which is a change,
 	// and dropping it would leave those bits on a file the kernel had decided should lose
@@ -177,7 +187,7 @@ func (v *volume) requestedChange(in *gofuse.SetAttrIn) (storage.AttrChange, sysc
 		gofuse.FATTR_ATIME | gofuse.FATTR_MTIME | gofuse.FATTR_ATIME_NOW | gofuse.FATTR_MTIME_NOW |
 		gofuse.FATTR_CTIME | gofuse.FATTR_FH | gofuse.FATTR_LOCKOWNER
 
-	var change storage.AttrChange
+	var change attributeChange
 	if in.Valid&^understood != 0 {
 		return change, syscall.EPERM
 	}
@@ -198,10 +208,10 @@ func (v *volume) requestedChange(in *gofuse.SetAttrIn) (storage.AttrChange, sysc
 		change.Mode = &requested
 	}
 	if accessed, ok := in.GetATime(); ok {
-		change.AccessTime = &accessed
+		change.AttrChange.AccessTime = &accessed
 	}
 	if changed, ok := in.GetMTime(); ok {
-		change.ModTime = &changed
+		change.AttrChange.ModTime = &changed
 	}
 	return change, 0
 }
@@ -249,7 +259,7 @@ func (n *node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		if e.Attr.ID == 0 || !e.Attr.IsDir() && e.Attr.Size < 0 {
 			return nil, syscall.EIO
 		}
-		mode, errno := systemMode(e.Attr.Mode)
+		mode, errno := attributeMode(e.Attr)
 		if errno != 0 {
 			return nil, errno
 		}
@@ -306,12 +316,14 @@ func (n *node) openFile(ctx context.Context, path string, options storage.FileOp
 	attr, err := file.Stat(ctx)
 	if err == nil {
 		switch {
-		case attr.ID == 0 || attr.Size < 0 || attr.Mode.Type() != 0:
+		case attr.ID == 0 || attr.Size < 0 || attr.Kind != storage.NodeRegular:
 			err = syscall.EIO
 		case options.ExpectedID != 0 && attr.ID != options.ExpectedID:
 			err = syscall.EIO
 		case !n.volume.holds(attr.Size):
 			err = syscall.EFBIG
+		default:
+			_, err = permissions(attr)
 		}
 	}
 	if err != nil {
@@ -332,7 +344,11 @@ func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	}
 	options.Create = true
 	options.Exclusive = flags&syscall.O_EXCL != 0
-	options.Mode = storageMode(mode)
+	var err error
+	options.InitialMetadata, err = initialPermissions(storageMode(mode))
+	if err != nil {
+		return nil, nil, 0, errnoOf(err)
+	}
 	file, attr, err := n.openFile(ctx, n.childPath(name), options)
 	if err != nil {
 		return nil, nil, 0, errnoOf(err)
@@ -370,8 +386,39 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *gofuse.
 // Directory creation and its requested permissions are separate volume operations.
 // A failure after Mkdir therefore reports the partial mutation to the caller.
 func (v *volume) wearMode(ctx context.Context, path string, mode uint32) error {
-	requested := storageMode(mode)
-	return v.storage.SetAttr(ctx, path, storage.AttrChange{Mode: &requested})
+	metadata, err := initialPermissions(storageMode(mode))
+	if err != nil {
+		return err
+	}
+	attr, err := v.storage.Stat(ctx, path)
+	if err != nil {
+		return err
+	}
+	if attr.ID == 0 || attr.Kind != storage.NodeDirectory {
+		return syscall.EIO
+	}
+	access, ok := v.files.(storage.MetadataAccess)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	if err := access.CheckMetadataAccess(); err != nil {
+		return err
+	}
+	payload, err := access.SetMetadata(ctx, attr.ID, posix.Namespace, attr.Metadata[posix.Namespace].Version, metadata[posix.Namespace])
+	if err != nil {
+		return err
+	}
+	if len(payload.Version) == 0 {
+		return syscall.EIO
+	}
+	got, err := posix.Decode(payload.Data)
+	if err != nil {
+		return err
+	}
+	if got != storageMode(mode) {
+		return syscall.EIO
+	}
+	return nil
 }
 
 func (n *node) Unlink(ctx context.Context, name string) syscall.Errno {
@@ -439,7 +486,7 @@ func (v *volume) fillAttr(out *gofuse.Attr, attr storage.Attr) syscall.Errno {
 	if attr.ID == 0 || !attr.IsDir() && attr.Size < 0 {
 		return syscall.EIO
 	}
-	mode, errno := systemMode(attr.Mode)
+	mode, errno := attributeMode(attr)
 	if errno != 0 {
 		return errno
 	}
@@ -449,11 +496,14 @@ func (v *volume) fillAttr(out *gofuse.Attr, attr storage.Attr) syscall.Errno {
 	}
 	accessed, changed := attr.AccessTime, attr.ModTime
 	out.Atime, out.Atimensec = uint64(accessed.Unix()), uint32(accessed.Nanosecond())
-	// The volume has no change time. The modification time is reported in its place
-	// rather than an invented one, and it is the closest true thing there is: every change
-	// the volume can record is a change to the contents.
-	out.Mtime, out.Ctime = uint64(changed.Unix()), uint64(changed.Unix())
-	out.Mtimensec, out.Ctimensec = uint32(changed.Nanosecond()), uint32(changed.Nanosecond())
+	out.Mtime, out.Mtimensec = uint64(changed.Unix()), uint32(changed.Nanosecond())
+	// Historical nodes may not have an authoritative change time. Linux still
+	// requires one, so present ModTime without writing that fallback to storage.
+	changeTime := changed
+	if attr.ChangeTime != nil {
+		changeTime = *attr.ChangeTime
+	}
+	out.Ctime, out.Ctimensec = uint64(changeTime.Unix()), uint32(changeTime.Nanosecond())
 	out.Owner = v.owner
 	// Hard links do not exist here (R-FS-4). One is the honest count, and it is also the
 	// count that keeps tools which walk a tree from concluding, from a directory's link
@@ -490,7 +540,7 @@ func systemMode(mode iofs.FileMode) (uint32, syscall.Errno) {
 //
 // The kernel keeps a node's kind in the same word, and it is dropped rather than
 // translated: what comes back is a mode to set, and a node's kind is not something a
-// caller sets. storage.SettableMode is the set this produces.
+// caller sets. The result is the payload accepted by the POSIX metadata codec.
 func storageMode(mode uint32) iofs.FileMode {
 	requested := iofs.FileMode(mode) & iofs.ModePerm
 	for _, bit := range specialModeBits {

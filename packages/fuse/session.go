@@ -23,6 +23,11 @@ type volume struct {
 	logger         *log.Logger
 	raw            *rawMetadata
 
+	ownerMu       sync.Mutex
+	lockOwners    map[lockOwnerKey]*localLockOwner
+	lockGroups    map[uint64]*lockGroup
+	nextLockGroup uint64
+
 	mu           sync.Mutex
 	status       storage.FileSessionStatus
 	deadline     time.Time
@@ -188,6 +193,11 @@ func newVolume(ctx context.Context, s storage.Storage, opts Options, logger *log
 		flushTimeout: timeout, sessionOptions: limits, logger: logger,
 		stop: make(chan struct{}), done: make(chan struct{}),
 	}
+	if err := checkSessionCapabilities(files); err != nil {
+		cleanup, finish := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+		defer finish()
+		return nil, errors.Join(err, files.Close(cleanup))
+	}
 	start := time.Now()
 	status, err := files.Status(ask)
 	if err == nil {
@@ -250,6 +260,12 @@ retire:
 	cleanup, cancel := context.WithTimeout(context.Background(), v.flushTimeout)
 	err := v.files.Close(cleanup)
 	cancel()
+	if err == nil {
+		v.ownerMu.Lock()
+		clear(v.lockOwners)
+		clear(v.lockGroups)
+		v.ownerMu.Unlock()
+	}
 	v.mu.Lock()
 	v.closeErr = errors.Join(v.fault, err)
 	result := v.closeErr
@@ -257,6 +273,28 @@ retire:
 	if result != nil && v.logger != nil {
 		v.logger.Printf("file session retirement: %v", result)
 	}
+}
+
+func checkSessionCapabilities(files storage.FileSession) error {
+	metadata, ok := files.(storage.MetadataAccess)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	if err := metadata.CheckMetadataAccess(); err != nil {
+		return err
+	}
+	owners, ok := files.(storage.UseOwners)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	if err := owners.CheckUseOwners(); err != nil {
+		return err
+	}
+	ranges, ok := files.(storage.RangeControl)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	return ranges.CheckRangeControl()
 }
 
 func minTime(a, b time.Time) time.Time {

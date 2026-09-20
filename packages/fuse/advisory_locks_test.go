@@ -288,59 +288,41 @@ func (s *observedFlockStorage) NewFileSession(ctx context.Context, options stora
 	if err != nil {
 		return nil, err
 	}
-	return &observedFlockSession{FileSession: session, gate: s.gate}, nil
+	return &observedFlockSession{capableTestSession: testSessionCapabilities(session), gate: s.gate}, nil
 }
 
 type observedFlockSession struct {
-	storage.FileSession
+	capableTestSession
 	gate *flockReleaseGate
 }
 
-func (s *observedFlockSession) OpenFile(ctx context.Context, name string, options storage.FileOpenOptions) (storage.File, error) {
-	file, err := s.FileSession.OpenFile(ctx, name, options)
-	if err != nil {
-		return nil, err
-	}
-	return &observedFlockFile{File: file, gate: s.gate}, nil
-}
-
-func (s *observedFlockSession) OpenNode(ctx context.Context, id uint64, options storage.FileOpenOptions) (storage.File, error) {
-	file, err := s.FileSession.OpenNode(ctx, id, options)
-	if err != nil {
-		return nil, err
-	}
-	return &observedFlockFile{File: file, gate: s.gate}, nil
-}
-
-type observedFlockFile struct {
-	storage.File
-	gate *flockReleaseGate
-}
-
-func (f *observedFlockFile) SetLock(ctx context.Context, owner storage.LockOwner, lock storage.FileLock, request storage.LockRequestID) (storage.LockAttempt, error) {
-	attempt, err := f.File.SetLock(ctx, owner, lock, request)
-	if err == nil && lock.Family == storage.Flock && lock.Wait && attempt.State == storage.LockPending {
-		select {
-		case f.gate.pending <- struct{}{}:
-		default:
+func (s *observedFlockSession) Apply(ctx context.Context, owner storage.UseOwner, commands []storage.RangeCommand, request storage.LockRequestID) (storage.RangeAttempt, error) {
+	attempt, err := s.RangeControl.Apply(ctx, owner, commands, request)
+	if err == nil && attempt.State == storage.Pending {
+		for _, command := range commands {
+			if command.Domain == storage.DomainWholeFile && command.Wait {
+				select {
+				case s.gate.pending <- struct{}{}:
+				default:
+				}
+				break
+			}
 		}
 	}
 	return attempt, err
 }
 
-func (f *observedFlockFile) DropLocks(ctx context.Context, owner storage.LockOwner, family storage.LockFamily) error {
-	if family == storage.Flock {
-		select {
-		case f.gate.entered <- struct{}{}:
-		default:
-		}
-		select {
-		case <-f.gate.release:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+func (s *observedFlockSession) RetireUseOwner(ctx context.Context, owner storage.UseOwner) error {
+	select {
+	case s.gate.entered <- struct{}{}:
+	default:
 	}
-	return f.File.DropLocks(ctx, owner, family)
+	select {
+	case <-s.gate.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.UseOwners.RetireUseOwner(ctx, owner)
 }
 
 func TestAdvisoryFlockLastDuplicateAcrossForkControlsRelease(t *testing.T) {
