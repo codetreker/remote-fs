@@ -274,7 +274,7 @@ R-CON-4 要求写入方自己以及同机其它进程**立即**看到已写入�
 
 只要 handler 持有非空 `Log`，每个 mutation-shaped operation 成功后都先唤醒 publisher，再从 `Log.Barrier` 原子读取 `(incarnation, committed position)` 放进 response。这也包括语义上不改变状态的 operation：它们得到的是当前 barrier，position 可以为 0。对真正产生变更的 mutation，barrier position 可以是本次提交的尾位置，也可以因并发提交而更晚，但到达它必然已经应用本次 mutation。barrier 查询或编码失败发生在 operation 已成功之后，因此 response 以 `EIO` 失败，不把已执行的 mutation 说成未发生。没有日志的 handler 可以省略 barrier；replicated client 的普通 mutation 方法会解码并忽略可选 barrier，`*WithBarrier` 方法则要求它存在且格式有效。
 
-引入这个 response 形状时，HTTP protocol 升为 v2：prefix 是 `/v2/`，header 是 `Remote-Fs-Protocol: 2`。v1 的 mutation success 是空 body，无法被 v2 的严格 `MutationResponse` decoder 接受，因此当时拒绝旧 route 与双版本 fallback。当前[文件锁协议](../../../../docs/design/server/file-locks.md#http-v3-编码)使用 `/v3/` 与 `Remote-Fs-Protocol: 3`，保留 mutation barrier body 并增加锁控制和显式 scope。v2 不能作为不检查权限的兼容路径，陌生或空的成功 body 仍是协议失败。
+引入这个 response 形状时，HTTP protocol 升为 v2：prefix 是 `/v2/`，header 是 `Remote-Fs-Protocol: 2`。v1 的 mutation success 是空 body，无法被 v2 的严格 `MutationResponse` decoder 接受，因此当时拒绝旧 route 与双版本 fallback。v3 随后增加 Strong 控制与 mutation scope；当前[文件锁协议](../../../../docs/design/server/file-locks.md#http-v4-编码)使用 `/v4/` 与 `Remote-Fs-Protocol: 4`，保留 mutation barrier body，并采用中立 Attr、metadata 与 range DTO。旧版本不能作为省略检查的兼容路径，陌生或空的成功 body 仍是协议失败。
 
 replicated storage 在发送 request 前只 admission 一条 fixed-size confirmation record，不保留目标 path、direction 或 touched-name history。`replicated.Options` 默认 `ConfirmationGrace = 10s`、`MaxActiveConfirmations = 64`、`MaxWaitingConfirmations = 64`；active/waiter 的 `math.MaxInt` sentinel 被拒绝。active 名额不足时有限等待；纯调用方取消为 `EINTR`，deadline 为 `EIO`，实际容量饱和或 storage 开始关闭时为 `EAGAIN`，这些拒绝都保留原始原因且不发送 request。该分类与 [FUSE 请求中断](../bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)共用操作阶段规则。`cmd/remote-fs` 以 `-confirmation-grace`、`-max-active-mutation-confirmations` 与 `-max-waiting-mutation-confirmations` 暴露三项配置，并在连接 server 或创建 replica directory 之前验证。
 
@@ -311,7 +311,7 @@ type Storage struct {
 }
 ```
 
-路径 `Stat` 与 `List` 走本地；`Read`、`Write`、`Create`、`Mkdir`、`Remove`、`RemoveDir`、`Rename`、`SetAttr`、`Space` 走远端。FileStorage capability 也传播到权威服务：FileSession.OpenNode、StatNode、SetNodeAttr 与 File 的内容、属性操作都不按副本里的名字重新寻址，已经 detached 的对象不要求本地树仍有对应 entry。普通身份 I/O 仍检查副本可用状态；续期、动作核对、取消和清理不依赖具名副本存在，失去观察不能阻止释放资源。
+路径 `Stat` 与 `List` 走本地；`Read`、`Write`、`Create`、`Mkdir`、`Remove`、`RemoveDir`、`Rename`、`SetAttr`、`Space` 走远端。副本保存 authority 给出的 NodeKind、共同时间与 opaque metadata，不生成未知 BirthTime/ChangeTime，也不解释平台 namespace。FileStorage capability 传播到权威服务：FileSession.OpenNode、StatNode、SetNodeAttr、metadata CAS、scope/range 与 File 的内容和属性操作都不按副本里的名字重新寻址，已经 detached 的对象不要求本地树仍有对应 entry。普通身份 I/O 仍检查副本可用状态；续期、动作核对、取消和清理不依赖具名副本存在，失去观察不能阻止释放资源。
 
 具名节点修改沿用 mutation barrier，成功后确认本地可见性；detached 内容修改不生成具名树事件，不能等待一个永远不存在的节点事件。文件引用的退役、续期和 advisory 连续性由独立 FileSession 管理，不从日志位置或 SSE 心跳推导。
 
@@ -386,7 +386,7 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **最后一个迁移文件例外，而且是暂时的。** 当时最后一个文件是 `0002_replication.sql`；实测把其中的 `entries.name` 改成 `TEXT`、删掉两个索引之一、或把 `logs.trimmed_by_age` 改成 `TEXT`，两条结构比对**一条都不响**，只有可重新生成的 golden 响。最后一个文件在新库与迁移库两条路上都会运行，所以两边一起变化；它成为历史时必须取得独立见证。
 
-`0003_durable_state.sql` 落地时，[v2 fixture](../../../../packages/metastore/sqlite/internal/integration/testdata/version2.sql) 与 `TestTheSecondMigrationDescribesTheVersionTwoDatabasesThatExist` 钉住了 v2，上述义务已经成为测试。`0004_lease_recovery.sql` 使 `0003` 成为历史，v3 结构也须用独立见证固定，不能只比较两条都运行 `0004` 的路径。
+`0003_durable_state.sql` 落地时，[v2 fixture](../../../../packages/metastore/sqlite/internal/integration/testdata/version2.sql) 与 `TestTheSecondMigrationDescribesTheVersionTwoDatabasesThatExist` 钉住了 v2，上述义务已经成为测试。`0004_lease_recovery.sql` 使 `0003` 成为历史，v3 结构也须用独立见证固定，不能只比较两条都运行 `0004` 的路径。后续 `0005_retained_files.sql` 增加 detached 与内容 revision；`0006_neutral_metadata.sql` 将合法旧 mode 转成 NodeKind 与 `posix.permissions.v1`，并增加可选 BirthTime/ChangeTime、metadata 及其持久计量。每个已落地文件继续冻结。
 
 （顺带记下一个实测意外：`entries.name` 在 `0002` 里改成 `TEXT` 之后，**没有任何行为测试变红**。原因是 SQLite 的 TEXT 亲和性不会把 BLOB 值转成文本，存进去的字节仍按字节比较。所以那一处是 golden 独自兜住的，不是被行为测试兜住的。）
 
