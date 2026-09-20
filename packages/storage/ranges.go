@@ -128,12 +128,15 @@ type RangeConflict struct {
 	Mode  RangeMode
 }
 type RangeAttempt struct {
-	Request          LockRequestID
-	State            AttemptState
-	Commands         []RangeCommand `json:",omitempty"`
-	Claims           []ClaimID      `json:",omitempty"`
-	Conflict         RangeConflict
-	Rejection        RejectionCode
+	Request   LockRequestID
+	State     AttemptState
+	Commands  []RangeCommand `json:",omitempty"`
+	Claims    []ClaimID      `json:",omitempty"`
+	Conflict  RangeConflict
+	Rejection RejectionCode
+	// Effects records every effect that survives the attempt. A rejected batch
+	// may retain successful release effects from before the failing command;
+	// acquisitions rolled back by that failure are absent.
 	Effects          []RangeEffect `json:",omitempty"`
 	EverGranted      bool
 	HistoryRemaining time.Duration

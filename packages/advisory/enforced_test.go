@@ -76,7 +76,7 @@ func TestExactMultiplicityAndHolderIOPolicy(t *testing.T) {
 	}
 }
 
-func TestExactBatchFailureHasNoPartialEffect(t *testing.T) {
+func TestExactBatchFailureRollsBackAcquisitionsAndKeepsReleases(t *testing.T) {
 	c := fixture(t, DefaultConfig())
 	a, b := session(t, c), session(t, c)
 	ao, bo := owner(t, a, 1, 0), owner(t, b, 1, 0)
@@ -97,9 +97,13 @@ func TestExactBatchFailureHasNoPartialEffect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantState(t, apply(t, b, 1, bo, removal(first, one.Claims[0]), removal(first, missing)), storage.Rejected, storage.RangeNotHeld)
-	if c.ranges != before+1 {
-		t.Fatal("failed removal batch changed live claims")
+	rejectedRemoval := apply(t, b, 1, bo, removal(first, one.Claims[0]), removal(first, missing))
+	wantState(t, rejectedRemoval, storage.Rejected, storage.RangeNotHeld)
+	if len(rejectedRemoval.Effects) != 1 || !rejectedRemoval.Effects[0].Released || rejectedRemoval.Effects[0].Claim != one.Claims[0] {
+		t.Fatalf("failed removal batch lost successful prefix: %+v", rejectedRemoval)
+	}
+	if c.ranges != before {
+		t.Fatal("failed removal batch restored a released claim")
 	}
 }
 

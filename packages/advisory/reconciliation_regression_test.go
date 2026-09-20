@@ -200,3 +200,100 @@ func TestConversionRejectsOversizedReceiptBeforeReleasingRanges(t *testing.T) {
 		t.Fatalf("maximum funded receipt has %d effects", len(fit.Effects))
 	}
 }
+
+func TestRejectedBatchPreservesSuccessfulReleasePrefix(t *testing.T) {
+	c := fixture(t, DefaultConfig())
+	releaser, blocker := session(t, c), session(t, c)
+	releaseOwner := owner(t, releaser, 1, 0)
+	blockOwner := owner(t, blocker, 1, 0)
+	held := record(storage.RangeShared, 0, 10)
+	provisional := record(storage.RangeExclusive, 40, 10)
+	blocked := record(storage.RangeExclusive, 20, 10)
+	wantState(t, apply(t, releaser, 1, releaseOwner, held), storage.Granted, "")
+	wantState(t, apply(t, blocker, 1, blockOwner, blocked), storage.Granted, "")
+
+	release := subtract(held)
+	id := requestID(t, releaser)
+	commands := []storage.RangeCommand{release, provisional, blocked}
+	result, err := releaser.Apply(background, 1, releaseOwner, commands, id, ordered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantState(t, result, storage.Rejected, storage.RangeBlocked)
+	if len(result.Effects) != 1 || result.Effects[0].Command != release || !result.Effects[0].Released || result.EverGranted {
+		t.Fatalf("rejected batch lost release prefix: %+v", result)
+	}
+	if c.ranges != 1 {
+		t.Fatalf("rejected acquisition restored released range: %d ranges", c.ranges)
+	}
+
+	assertSame := func(name string, got storage.RangeAttempt, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		got.HistoryRemaining, result.HistoryRemaining = 0, 0
+		if !reflect.DeepEqual(got, result) {
+			t.Fatalf("%s changed receipt: %+v want %+v", name, got, result)
+		}
+	}
+	replayed, replayErr := releaser.Apply(background, 1, releaseOwner, commands, id, ordered)
+	assertSame("replay", replayed, replayErr)
+	queried, queryErr := releaser.Query(background, 1, releaseOwner, id)
+	assertSame("query", queried, queryErr)
+	cancelled, cancelErr := releaser.Cancel(background, 1, releaseOwner, id)
+	assertSame("cancel", cancelled, cancelErr)
+
+	if err := blocker.Drop(background, 1, blockOwner, storage.DomainRecord); err != nil {
+		t.Fatal(err)
+	}
+	replayed, replayErr = releaser.Apply(background, 1, releaseOwner, commands, id, ordered)
+	assertSame("replay after conflict removal", replayed, replayErr)
+	if c.ranges != 0 {
+		t.Fatal("terminal replay reacquired the rejected range")
+	}
+}
+
+func TestRejectedMaximumBatchRetainsBoundedReleaseReceipt(t *testing.T) {
+	c := fixture(t, DefaultConfig())
+	releaser, blocker := session(t, c), session(t, c)
+	releaseOwner := owner(t, releaser, 1, 0)
+	blockOwner := owner(t, blocker, 1, 0)
+
+	held := make([]storage.RangeCommand, storage.MaxRangeCommands-1)
+	releases := make([]storage.RangeCommand, len(held))
+	for i := range held {
+		held[i] = record(storage.RangeShared, uint64(2*i), 1)
+		releases[i] = subtract(held[i])
+	}
+	wantState(t, apply(t, releaser, 1, releaseOwner, held...), storage.Granted, "")
+	blocked := record(storage.RangeExclusive, 1000, 1)
+	wantState(t, apply(t, blocker, 1, blockOwner, blocked), storage.Granted, "")
+
+	commands := append(append([]storage.RangeCommand(nil), releases...), blocked)
+	id := requestID(t, releaser)
+	result, err := releaser.Apply(background, 1, releaseOwner, commands, id, ordered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantState(t, result, storage.Rejected, storage.RangeBlocked)
+	if len(result.Commands) != storage.MaxRangeCommands || len(result.Effects) != storage.MaxRangeEffects-1 || len(result.Claims) != 0 {
+		t.Fatalf("maximum rejected receipt was truncated or over-retained: commands=%d effects=%d claims=%d", len(result.Commands), len(result.Effects), len(result.Claims))
+	}
+	for index, effect := range result.Effects {
+		if !effect.Released || effect.Command != releases[index] {
+			t.Fatalf("release effect %d changed: %+v", index, effect)
+		}
+	}
+	if c.ranges != 1 {
+		t.Fatalf("maximum rejected batch retained rolled-back acquisitions: %d ranges", c.ranges)
+	}
+	queried, err := releaser.Query(background, 1, releaseOwner, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queried.HistoryRemaining, result.HistoryRemaining = 0, 0
+	if !reflect.DeepEqual(queried, result) {
+		t.Fatalf("maximum receipt changed on query: %+v", queried)
+	}
+}

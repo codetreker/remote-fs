@@ -122,7 +122,8 @@ func (s *Session) Apply(ctx context.Context, node uint64, owner storage.UseOwner
 			commands[i].Claim = storage.ClaimID(strings.Clone(string(commands[i].Claim)))
 		}
 		action := &request{key: key, id: id, epoch: epoch, commands: commands, order: order,
-			result: storage.RangeAttempt{Request: id, Commands: slices.Clone(commands), State: storage.Pending}}
+			result:   storage.RangeAttempt{Request: id, Commands: slices.Clone(commands), State: storage.Pending},
+			released: make([]bool, len(commands))}
 		s.actions[id] = action
 		current = action
 		c.requests++

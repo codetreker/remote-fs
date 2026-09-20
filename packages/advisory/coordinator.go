@@ -115,6 +115,7 @@ type request struct {
 	pending    bool
 	prepared   bool
 	converting bool
+	released   []bool
 }
 
 func New(config Config) (*Coordinator, error) {
@@ -165,12 +166,17 @@ func (c *Coordinator) pruneOwnerLocked(key ownerKey) {
 }
 
 func (c *Coordinator) replaceLocked(key ownerKey, ranges []rangeClaim) error {
+	if !c.replacementFitsLocked(key, len(ranges)) {
+		return syscall.ENOLCK
+	}
+	c.installRangesLocked(key, ranges)
+	return nil
+}
+
+func (c *Coordinator) installRangesLocked(key ownerKey, ranges []rangeClaim) {
 	o := c.owners[key]
 	s := c.sessions[key.session]
 	delta := len(ranges) - len(o.ranges)
-	if delta > c.config.MaxRanges-c.ranges || delta > s.options.MaxLockRanges-s.ranges {
-		return syscall.ENOLCK
-	}
 	// Refunded fragments must not remain reachable through spare slice capacity.
 	if len(ranges) == 0 {
 		o.ranges = nil
@@ -180,7 +186,13 @@ func (c *Coordinator) replaceLocked(key ownerKey, ranges []rangeClaim) error {
 	}
 	c.ranges += delta
 	s.ranges += delta
-	return nil
+}
+
+func (c *Coordinator) replacementFitsLocked(key ownerKey, count int) bool {
+	o := c.owners[key]
+	s := c.sessions[key.session]
+	delta := count - len(o.ranges)
+	return delta <= c.config.MaxRanges-c.ranges && delta <= s.options.MaxLockRanges-s.ranges
 }
 
 func checkCall(ctx context.Context, node uint64) error {
