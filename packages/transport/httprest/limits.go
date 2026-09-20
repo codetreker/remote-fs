@@ -43,7 +43,7 @@ const (
 	retainedFrameMultiplier    int64 = 3
 
 	DefaultMaxConcurrentResponses         = 64
-	DefaultMaxWaitingResponses            = 64
+	DefaultMaxWaitingResponses            = 128
 	DefaultMaxInFlightResponseBytes int64 = retainedResponseMultiplier * 2 * DefaultMaxBodyBytes
 
 	// DefaultMaxFrameBytes is the largest encoded replication frame a handler produces

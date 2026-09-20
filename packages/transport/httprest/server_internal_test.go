@@ -176,6 +176,72 @@ func TestClientAdmissionCoversFixedResponsesAndLastsThroughDecoding(t *testing.T
 	}
 }
 
+func TestDefaultResponseAdmissionCarriesFullLoadReaders(t *testing.T) {
+	if DefaultMaxWaitingResponses != 128 {
+		t.Fatalf("default response waiters=%d, want 128", DefaultMaxWaitingResponses)
+	}
+	meta, backend := memoryfixture.New(t, "default-response-admission", 1<<20, locking.DefaultOptions())
+	handler, err := NewHandler(backend, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := handler.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	client, err := Dial("http://server.invalid", &http.Client{Transport: internalRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("not reached")
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, admission := range map[string]*bodyAdmission{"client": client.responses, "handler": handler.responses} {
+		t.Run(name, func(t *testing.T) {
+			reservation := retainedResponseMultiplier * DefaultMaxBodyBytes
+			active := make([]func(), 0, 2)
+			for range 2 {
+				release, err := admission.acquire(t.Context(), reservation)
+				if err != nil {
+					t.Fatal(err)
+				}
+				active = append(active, release)
+			}
+			cancels := make([]context.CancelFunc, 0, DefaultMaxWaitingResponses)
+			results := make(chan error, DefaultMaxWaitingResponses)
+			for range DefaultMaxWaitingResponses {
+				ctx, cancel := context.WithCancel(t.Context())
+				cancels = append(cancels, cancel)
+				go func() {
+					_, err := admission.acquire(ctx, reservation)
+					results <- err
+				}()
+			}
+			waitForAdmissionWaiters(t, admission, DefaultMaxWaitingResponses)
+			if _, err := admission.acquire(t.Context(), reservation); !errors.Is(err, syscall.EAGAIN) {
+				t.Fatalf("request beyond %d waiters returned %v", DefaultMaxWaitingResponses, err)
+			}
+			for _, cancel := range cancels {
+				cancel()
+			}
+			for range cancels {
+				if err := <-results; !errors.Is(err, context.Canceled) {
+					t.Fatalf("cancelled waiter returned %v", err)
+				}
+			}
+			for _, release := range active {
+				release()
+			}
+			admission.mu.Lock()
+			operations, bytes, waiters := admission.operations, admission.bytes, admission.waiters
+			admission.mu.Unlock()
+			if operations != 0 || bytes != 0 || waiters != 0 {
+				t.Fatalf("admission did not drain: operations=%d bytes=%d waiters=%d", operations, bytes, waiters)
+			}
+		})
+	}
+}
+
 func TestStreamSetupErrorsUseClientResponseAdmission(t *testing.T) {
 	blocked := &internalBlockingReader{entered: make(chan struct{}, 1), release: make(chan struct{})}
 	var calls atomic.Int64
