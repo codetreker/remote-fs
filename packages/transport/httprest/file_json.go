@@ -309,9 +309,6 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if !validFileCapability(r.Session) || r.Status == nil || r.Capabilities == nil {
 			return errors.New("file session response has no valid capability or status")
 		}
-		if r.Capabilities.DirectoryMetadata && !r.Capabilities.Namespace {
-			return errors.New("directory observation capability lacks namespace support")
-		}
 	case storage.OpFileStatus, storage.OpFileRenew:
 		if r.Status == nil {
 			return errors.New("file response carries no status")

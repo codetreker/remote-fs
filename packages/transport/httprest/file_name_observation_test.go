@@ -433,6 +433,13 @@ func TestIdentityDirectoryReadRequiresObservationProtocolCapability(t *testing.T
 	if !errors.Is(err, syscall.EOPNOTSUPP) || observation.ParentID != 0 || resultErr == nil || entries != nil {
 		t.Fatalf("legacy bounded read escaped: observation=%+v entries=%+v err=%v/%v", observation, entries, err, resultErr)
 	}
+	bundled := &remoteFileSession{capabilities: fileCapabilities{DirectoryMetadata: true}}
+	if err := bundled.CheckDirectoryRead(); err != nil {
+		t.Fatalf("directory bundle depended on namespace access: %v", err)
+	}
+	if err := bundled.CheckNamespaceAccess(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("directory bundle invented namespace access: %v", err)
+	}
 }
 
 type namespaceOnlySession struct{ storage.FileSession }
@@ -441,13 +448,17 @@ func (namespaceOnlySession) CheckNamespaceAccess() error { return nil }
 func (namespaceOnlySession) LookupAt(context.Context, storage.ChildName) (storage.Attr, error) {
 	panic("not called")
 }
-func (namespaceOnlySession) ReadDirNode(context.Context, storage.DirectoryTarget) (storage.ObservedDirectory, error) {
-	panic("not called")
-}
-func (namespaceOnlySession) ReadDirNodeBounded(context.Context, storage.DirectoryTarget, *storage.ListResult) (storage.DirectoryObservation, error) {
-	panic("not called")
-}
 func (namespaceOnlySession) MutateName(context.Context, storage.NameCommand) (storage.NameResult, error) {
+	panic("not called")
+}
+
+type directoryReaderOnlySession struct{ storage.FileSession }
+
+func (directoryReaderOnlySession) CheckDirectoryRead() error { return nil }
+func (directoryReaderOnlySession) ReadDirNode(context.Context, storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	panic("not called")
+}
+func (directoryReaderOnlySession) ReadDirNodeBounded(context.Context, storage.DirectoryTarget, *storage.ListResult) (storage.DirectoryObservation, error) {
 	panic("not called")
 }
 
@@ -459,10 +470,9 @@ func (directoryOnlySession) ObserveDirectoryMetadata(context.Context, storage.Di
 }
 
 type directoryBundleSession struct {
-	namespaceOnlySession
+	directoryReaderOnlySession
 }
 
-func (directoryBundleSession) CheckDirectoryRead() error                { return nil }
 func (directoryBundleSession) CheckDirectoryMetadataObservation() error { return nil }
 func (directoryBundleSession) ObserveDirectoryMetadata(context.Context, storage.DirectoryTarget, storage.DirectoryMetadataOptions, *storage.ListResult) (storage.DirectoryMetadataObservation, error) {
 	panic("not called")
@@ -474,8 +484,9 @@ func TestHTTPAdvertisesDirectoryObservationOnlyAsCompleteBundle(t *testing.T) {
 		ns, dir bool
 	}{
 		"namespace only":  {session: namespaceOnlySession{}, ns: true},
-		"directory only":  {session: directoryOnlySession{}},
-		"complete bundle": {session: directoryBundleSession{}, ns: true, dir: true},
+		"reader only":     {session: directoryReaderOnlySession{}},
+		"observer only":   {session: directoryOnlySession{}},
+		"complete bundle": {session: directoryBundleSession{}, dir: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			capabilities, err := sessionCapabilitiesOf(test.session)

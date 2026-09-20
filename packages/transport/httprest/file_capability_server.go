@@ -69,7 +69,7 @@ func sessionCapabilitiesOf(value storage.FileSession) (*fileCapabilities, error)
 	caps, err := capabilitiesOf(value)
 	reader, hasReader := value.(storage.DirectoryReader)
 	observer, hasObserver := value.(storage.DirectoryMetadataObserver)
-	if caps.Namespace && hasReader && hasObserver {
+	if hasReader && hasObserver {
 		readErr := reader.CheckDirectoryRead()
 		observeErr := observer.CheckDirectoryMetadataObservation()
 		if readErr == nil && observeErr == nil {
