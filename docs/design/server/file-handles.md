@@ -78,7 +78,7 @@ File 与 NodeReference 的 `ReferenceNameObserver` 复用既有 session、引用
 
 `NamespaceGuards` 携带最多 256 个目录 revision、256 条确切 `(ParentID, RawLeaf, ChildID)` 边和可选 RootID，合计驻留最多 64 KiB。重复目录、重复 child、重复父／叶槽、cycle 或无法到达 RootID 的关系在访问 storage 前拒绝；每个 revision 最多 64 字节，叶名继续受 4096 字节上限约束。有效 guards 与目标 observation 在同一次读取中比较，不符返回 `ErrConditionConflict` 且无部分结果。guards 只进入 ObserveDirectoryMetadata 与 ObserveName；OpenAt、OpenChildRef、NameCommand、FileMutation 和 delete intent 不接受它们。
 
-通用契约允许一份目录捕获最多 65,536 个 entries，native retention charge 最多 8 MiB；SQLite 的 `MaxDirectoryEntries` 与 `MaxDirectoryBytes` 可配置为不超过硬上限的更紧值，零值选择默认硬上限。名字观察按固定状态与真实叶名长度收费。directory revision 随当前 Node、新 change、snapshot 与 replica 传播并计入 `metadata_used`；迁移前 retained history 的 revision 保持 unknown nil。revision 不是通知游标或 change-log position，观察接口不建立 watcher，也不提供缓存恢复。
+通用契约允许一份目录捕获最多 65,536 个 entries，native retention charge 最多 8 MiB；SQLite 的 `MaxDirectoryEntries` 与 `MaxDirectoryBytes` 可配置为不超过硬上限的更紧值，零值选择默认硬上限。名字观察按固定状态与真实叶名长度收费。directory revision 随当前 Node、新 change、snapshot 与 replica 传播并计入 `metadata_used`。v8 迁移清空没有可信 revision 的旧 retained history，同时切换 log incarnation 并把窗口位置归零，使持有旧游标的 replica 明确 reseed。revision 不是通知游标或 change-log position，观察接口不建立 watcher，也不提供缓存恢复。
 
 ### 文件动作与结果核对
 

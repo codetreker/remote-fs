@@ -122,9 +122,9 @@ checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race 
 
 ### 名字与目录观察
 
-[SQLite 名字观察用例](../packages/metastore/sqlite/name_observation_test.go)核对 Root、Linked、rename 后的新绑定、unlink 后的 Detached、stale directory guard 不暴露部分 entries，以及收紧后的 directory entry／byte limit。它还用八个并发 create 验证成功名字修改推进 root revision，并在重开后核对 token 与完整 entries 保持。
+[SQLite 名字观察用例](../packages/metastore/sqlite/name_observation_test.go)核对 Root、Linked、rename 后的新绑定、unlink 后的 Detached、stale directory guard 不暴露部分 entries，以及收紧后的 directory entry／byte limit。它还验证并发 create 和每类成功名字 mutation 都使受影响目录的 opaque revision 单调改变，失败与 no-op 保持 token，跨目录 rename 推进两端，revision 耗尽使 mutation 整体回滚，并在重开后核对 token 与完整 entries 保持。
 
-[objectstore 目录观察用例](../packages/storage/objectstore/directory_observation_test.go)核对独立权限面、实际 prefix 预算、guards、Scope、取消、身份替换和畸形 backend；[reference name 用例](../packages/storage/objectstore/reference_name_test.go)在 rename、旧名字复用与 unlink 后持续核对原 NodeID，拒绝 stale guard，并证明名字观察不读取内容。revision 是不透明等值 token；测试不能用增量大小推导一次高层操作发生了多少内部名字集合变化。
+[objectstore 目录观察用例](../packages/storage/objectstore/directory_observation_test.go)核对独立权限面、实际 prefix 预算、guards、Scope、取消、身份替换和畸形 backend；[reference name 用例](../packages/storage/objectstore/reference_name_test.go)在 rename、旧名字复用与 unlink 后持续核对原 NodeID，拒绝 stale guard，并证明名字观察不读取内容。[replica revision 用例](../packages/metastore/sqlite/replica_test.go)核对 snapshot、change、apply 与 reopen 保留 token。revision 是不透明等值 token；测试不能用增量大小推导一次高层操作发生了多少内部名字集合变化。
 
 结果预算分别卡在 65,536 entries、8 MiB native retention、名字观察 prefix、4096-byte leaf、64-byte revision、每类 256 项 guards 和 64 KiB guard retention 的精确边界。SQLite 另以更小的 `MaxDirectoryEntries`／`MaxDirectoryBytes` 验证实际 serving limit，负值或硬上限以上配置在接触数据库前拒绝。生产方必须在载入叶名或 metadata 前 reserve，任何单项超限、中途错误、取消、错误 identity 或 wrapper 验证失败都使整个 ListResult 与 observation 不可读取；不能留下成功前缀。limited、locked、objectstore、localstore、replicated 与 HTTP 用例分别验证能力 preflight、读取 context、session/reference drain、深拷贝和副本失效后不回源猜测。
 
@@ -137,6 +137,8 @@ HTTP 用例把 `file.read-dir-node`、`file.observe-directory-metadata` 与 `fil
 schema 迁移从真实 v5 fixture 前滚，核对 mode 到 NodeKind / `posix.permissions.v1` 的转换、旧 BirthTime/ChangeTime 保持 unknown、当前节点与 retained change 各自保留历史事实，以及 migration 1 至 5 未被改写。metadata accounting 用精确边界、超限、detached 节点、retained history、复制写入、日志裁剪和物理删除核对 `metadata_used`；缺失或改变 trigger、错误 storage class、畸形 envelope 与计数不符必须在打开或读取时失败。
 
 schema v7 用例从真实 v6 fixture 前滚，核对 link target、pending generation、delete-intent 表与更新后的 metadata accounting；NodeID、高水位、名字、内容、日志及 accepted witness 不得改变。损坏的 intent ID、请求摘要、状态、failure 组合、node/entry 关联或 link target 必须在 serving 前失败，不能先执行恢复清理。
+
+[schema v8 用例](../packages/metastore/sqlite/internal/schema/directory_revision_test.go)从独立构造的 v7 数据库前滚，为每个现有目录建立初始 revision，清空无法携带可信 revision 的旧 changes，更换 log incarnation，把 committed／trimmed 位置归零，并核对更新后的 metadata accounting；重开不再次切换边界。空、零、越界、错误 storage class 及非目录携带 revision 都在 serving 前失败。新的 incarnation 是旧游标进入既有 replica reseed 路径的明确边界，旧 history 不再可续读。
 
 范围写的交错用例暂停一份不可变对象上传，让另一描述符先完成修改，再恢复原 WriteAt；最终内容必须包含两次已完成范围修改。SQLite 的每节点 content revision 与 CAS 用于重新读取当前版本并重算本次范围，不能据此拒绝较早打开的普通描述符。另测零填充、截断、空对象 ABA、revision 耗尽与原状态保留。读取遇到已经收集的旧 revision 可以重取当前对象；当前 metadata 所指对象缺失必须 `EIO`，不能返回空内容。
 

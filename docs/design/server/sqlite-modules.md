@@ -39,7 +39,7 @@ SQL lease recovery 与 `LeaseRecovery` 留在根 package，原生 evidence I/O �
 
 ## 资源与测试归属
 
-当前 schema 版本为 8。[`internal/schema/migrations`](../../../packages/metastore/sqlite/internal/schema/migrations) 的 `0001` 至 `0008` 按序嵌入并重放；6 把 mode 转为 NodeKind 与 `posix.permissions.v1` 并增加共同时间、规范 metadata 与持久计量，7 增加 link target、pending generation 与 durable delete-intent 表，8 为现有目录建立初始 revision，并把 directory revision 纳入 nodes、新 changes、trigger 与持久计量；迁移前 retained changes 保持 unknown nil。迁移保留 NodeID、高水位、名字、内容、用量与日志事实，并继续由外部见证确认。可读 schema golden 与历史布局 fixture 位于 [`internal/integration/testdata`](../../../packages/metastore/sqlite/internal/integration/testdata)；测试数据不参与运行时初始化。
+当前 schema 版本为 8。[`internal/schema/migrations`](../../../packages/metastore/sqlite/internal/schema/migrations) 的 `0001` 至 `0008` 按序嵌入并重放；6 把 mode 转为 NodeKind 与 `posix.permissions.v1` 并增加共同时间、规范 metadata 与持久计量，7 增加 link target、pending generation 与 durable delete-intent 表，8 为现有目录建立初始 revision，并把 directory revision 纳入 nodes、新 changes、trigger 与持久计量。旧 retained changes 没有可信 revision，v8 因此在同一迁移事务中清空它们、切换每个 log incarnation 并把 committed／trimmed 位置归零；当前树、NodeID、高水位、名字、内容与用量保持，旧 replica 通过 incarnation mismatch 进入 reseed。迁移提交继续由外部见证确认。可读 schema golden 与历史布局 fixture 位于 [`internal/integration/testdata`](../../../packages/metastore/sqlite/internal/integration/testdata)；测试数据不参与运行时初始化。
 
 节点与 retained changes 的 metadata envelope、link target 及 directory revision 长度由 SQL triggers 同步计入 `volumes.metadata_used`，覆盖 detached/pending 节点与历史副本。完整性检查验证 trigger 定义、storage class、规范 envelope、目录／非目录 revision 组合、pending generation、intent 关联、计数与实际合计。`Options.MaxMetadataBytes` 默认每 volume 64 MiB，独立于内容 quota、单节点上限和 integrity 工作预算；载入 payload 前先核对大小，增长越界失败，replica ingest、日志裁剪和物理删除使用同一记账。
 

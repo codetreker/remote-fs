@@ -82,6 +82,8 @@ Strong 控制请求与响应固定至多 16 KiB；文件 metadata/range 控制�
 
 构建先保留原订阅，再逐页写入快照。客户端读到 snapshot 的语义 EOF 后，先关闭该 HTTP 响应释放连接，再调用 Checkpoint 取得新鲜的 `(incarnation, committed position)`。快照位置不得早于原订阅的 opening tail；checkpoint 不得早于快照，且其 incarnation 必须与原订阅一致。snapshot 只报告捕获位置；incarnation 一致性由 checkpoint 与原订阅核对。
 
+SQLite schema v8 为目录增加持久 revision 时，authority 原子清空无法携带该事实的旧 retained changes、切换 log incarnation 并把窗口位置归零。持有旧 incarnation／position 的 replica 不能续读这段已删除 history，沿既有 mismatch 分支重新取得包含当前 directory revision 的完整快照。
+
 本地 Seeding.Complete 成功后记录已安装的快照位置，唯一的 reader 随后沿原订阅丢弃已包含的事件、应用快照之后的事件，直到达到或超过固定 checkpoint。位置允许跳跃，不要求逐整数相邻；零位置且已达到目标时不等待一条不存在的事件。Complete 与每次 Apply 的成功位置都会在内部推进，即使副本仍以 EIO 拒绝查询；中途失败后的续订以已提交树的位置继续，而不是沿用更早的公开状态。最终追平前不清除失败状态。
 
 `Options.ReplayTimeout` 必须为正，DefaultOptions 取十秒，从客户端观察到 snapshot EOF 时起覆盖响应关闭、Checkpoint、Complete 和目标回放。订阅握手与快照传输在这段预算之前，仍受各自 context 与既有边界约束。独立 CLI 继承此默认值；mutation 的 ConfirmationGrace 保持独立。超时、取消、流错误、化身不符或位置不相容使 gate 以 EIO 失败并保留原因；Checkpoint 的 ENOSYS 也不能被当作“不提供复制”而降级为直接模式。

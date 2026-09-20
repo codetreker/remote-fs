@@ -40,7 +40,7 @@ guards 只进入 ObserveDirectoryMetadata 与 ObserveName。OpenAt、OpenChildRe
 
 SQLite schema v8 为每个当前目录保存八字节、非零的 `directory_revision`；非目录必须保存空值。新目录从 1 开始，成功增加、移除或移动名字时在修改名字的同一事务中推进受影响父目录，跨目录 rename 分别推进两个父目录。失败、回滚和不改变名字集合的 no-op 不推进；达到可表示上限时修改以 `EOVERFLOW` 失败。
 
-revision 进入 Node、新产生的 retained change、snapshot、replica、启动完整性检查和每 volume 的 `metadata_used`。旧 schema 迁移为每个现有目录建立初始 revision；迁移前的 retained history 保持未知 nil，不从历史提交次数猜测版本。token 只证明一次捕获与后续 guard 是否相同，不表达顺序、通知位置或 change-log position。
+revision 进入 Node、新产生的 retained change、snapshot、replica、启动完整性检查和每 volume 的 `metadata_used`。v8 迁移为每个现有目录建立初始 revision；迁移前 retained changes 没有可信 revision，因此迁移在同一事务中清空这些记录、为每个 log 生成新 incarnation，并把 committed、trimmed 与 age-trim position 归零。当前树、NodeID、高水位和内容保持，持有旧 incarnation／position 的 replica 必须 reseed。token 只证明一次捕获与后续 guard 是否相同，不表达顺序、通知位置或 change-log position。
 
 ### 每一层在载入前接受预算
 
