@@ -23,9 +23,6 @@ func capabilitiesOf(value any) (*fileCapabilities, error) {
 			failure = errors.Join(failure, err)
 		}
 	}
-	if capability, ok := value.(storage.DirectoryMetadataObserver); ok {
-		check(&caps.DirectoryMetadata, capability.CheckDirectoryMetadataObservation)
-	}
 	if capability, ok := value.(storage.ReferenceNameObserver); ok {
 		check(&caps.ReferenceName, func() error {
 			if err := capability.CheckReferenceNameObservation(); err != nil {
@@ -70,6 +67,14 @@ func capabilitiesOf(value any) (*fileCapabilities, error) {
 
 func sessionCapabilitiesOf(value storage.FileSession) (*fileCapabilities, error) {
 	caps, err := capabilitiesOf(value)
+	if capability, ok := value.(storage.DirectoryMetadataObserver); ok && caps.Namespace {
+		checkErr := capability.CheckDirectoryMetadataObservation()
+		if checkErr == nil {
+			caps.DirectoryMetadata = true
+		} else if storage.ErrnoOf(checkErr) != syscall.EOPNOTSUPP {
+			err = errors.Join(err, checkErr)
+		}
+	}
 	if capability, ok := value.(storage.MetadataAccess); ok {
 		checkErr := capability.CheckMetadataAccess()
 		if checkErr == nil {
@@ -213,6 +218,16 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 				if response.Attr == nil || response.Attr.ID != node || node != request.Node {
 					identityInvalid = true
 					openErr = errors.Join(openErr, errors.New("opened node reference substituted its requested identity"), syscall.EIO)
+				}
+			case storage.OpFileOpenChildRef:
+				if response.Attr == nil || response.Attr.ID != node || request.NodeRef.Target.State == storage.SameNode && node != request.NodeRef.Target.NodeID {
+					identityInvalid = true
+					openErr = errors.Join(openErr, errors.New("opened child reference substituted its requested identity"), syscall.EIO)
+				}
+			case storage.OpFileOpenAt:
+				if response.Attr == nil || response.Attr.ID != node || request.OpenAt.Target.State == storage.SameNode && request.OpenAt.Existing != storage.ReplaceNode && node != request.OpenAt.Target.NodeID {
+					identityInvalid = true
+					openErr = errors.Join(openErr, errors.New("atomic open substituted its requested identity"), syscall.EIO)
 				}
 			default:
 				if response.Attr == nil || response.Attr.ID != node {

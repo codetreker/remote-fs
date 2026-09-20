@@ -166,6 +166,10 @@ func (s *Storage) fileCall(ctx context.Context, req fileRequest) (fileResponse, 
 		err = decodeFileJSON(answer.content, &response)
 	}
 	if err != nil {
+		var budgetFailure *observationBudgetError
+		if errors.As(err, &budgetFailure) {
+			return fileResponse{}, budgetFailure.cause
+		}
 		return fileResponse{}, unreachable(Request{Op: OpFile}, err)
 	}
 	if err := validateFileResponse(req, response); err != nil {

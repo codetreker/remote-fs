@@ -344,6 +344,12 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if req.Op == storage.OpFileOpenNodeRef && r.Attr.ID != req.Node {
 			return errors.New("node reference open substituted its target")
 		}
+		if req.Op == storage.OpFileOpenChildRef && req.NodeRef.Target.State == storage.SameNode && r.Attr.ID != req.NodeRef.Target.NodeID {
+			return errors.New("child reference open substituted its target")
+		}
+		if req.Op == storage.OpFileOpenAt && req.OpenAt.Target.State == storage.SameNode && req.OpenAt.Existing != storage.ReplaceNode && r.Attr.ID != req.OpenAt.Target.NodeID {
+			return errors.New("atomic open substituted its target")
+		}
 	case storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetNodeAttr, storage.OpFileMutate:
 		if r.Attr == nil {
 			return errors.New("file response carries no attributes")

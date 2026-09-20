@@ -3,8 +3,10 @@ package httprest
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -274,12 +276,14 @@ func TestNameObservationWireBudgetChargesExactEncodingBeforeLeafLoad(t *testing.
 
 func TestObservationDecoderBudgetsBeforeDecodingVariableBytes(t *testing.T) {
 	refused := errors.New("budget refused before decode")
+	var budgetCalls atomic.Int32
 	attr, err := json.Marshal(AttrOf(storage.Attr{ID: 3, Kind: storage.NodeRegular}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	directoryBody := []byte(`{"epoch":1,"data":"","directory":{"observation":{"parentId":2,"revision":"AQ=="},"entries":[{"rawLeaf":"!!!!","attr":` + string(attr) + `}]}}`)
 	result, err := storage.NewListResult(1<<20, 0, func(int, int64, int64, storage.Attr) (int64, error) {
+		budgetCalls.Add(1)
 		return 0, refused
 	})
 	if err != nil {
@@ -288,8 +292,21 @@ func TestObservationDecoderBudgetsBeforeDecodingVariableBytes(t *testing.T) {
 	target := storage.DirectoryTarget{NodeID: 2}
 	ctx := withDirectoryResponseCollector(t.Context(), result, false)
 	_, err = decodeObservedFileResponse(ctx, fileRequest{Op: storage.OpFileReadDirNode, Directory: &target}, directoryBody)
-	if !errors.Is(err, refused) {
-		t.Fatalf("entry payload was decoded before caller budget: %v", err)
+	if err == nil || errors.Is(err, refused) || budgetCalls.Load() != 0 {
+		t.Fatalf("malformed entry reached caller budget: err=%v calls=%d", err, budgetCalls.Load())
+	}
+	directoryBody = bytes.Replace(directoryBody, []byte(`"!!!!"`), []byte(`"YQ=="`), 1)
+	result, err = storage.NewListResult(1<<20, 0, func(int, int64, int64, storage.Attr) (int64, error) {
+		budgetCalls.Add(1)
+		return 0, refused
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx = withDirectoryResponseCollector(t.Context(), result, false)
+	_, err = decodeObservedFileResponse(ctx, fileRequest{Op: storage.OpFileReadDirNode, Directory: &target}, directoryBody)
+	if !errors.Is(err, refused) || budgetCalls.Load() != 1 {
+		t.Fatalf("valid entry did not reach caller budget before retention: err=%v calls=%d", err, budgetCalls.Load())
 	}
 	metadataAttr, err := json.Marshal(AttrOf(storage.Attr{ID: 3, Kind: storage.NodeRegular, Metadata: map[string]storage.OpaquePayload{
 		"test.value": {Version: []byte{1}},
@@ -300,6 +317,7 @@ func TestObservationDecoderBudgetsBeforeDecodingVariableBytes(t *testing.T) {
 	metadataAttr = bytes.Replace(metadataAttr, []byte(`"data":""`), []byte(`"data":"!!!!"`), 1)
 	metadataBody := []byte(`{"epoch":1,"data":"","directory":{"observation":{"parentId":2,"revision":"AQ=="},"entries":[{"rawLeaf":"YQ==","attr":` + string(metadataAttr) + `}]}}`)
 	result, err = storage.NewListResult(1<<20, 0, func(int, int64, int64, storage.Attr) (int64, error) {
+		budgetCalls.Add(1)
 		return 0, refused
 	})
 	if err != nil {
@@ -307,17 +325,48 @@ func TestObservationDecoderBudgetsBeforeDecodingVariableBytes(t *testing.T) {
 	}
 	ctx = withDirectoryResponseCollector(t.Context(), result, false)
 	_, err = decodeObservedFileResponse(ctx, fileRequest{Op: storage.OpFileReadDirNode, Directory: &target}, metadataBody)
-	if !errors.Is(err, refused) {
-		t.Fatalf("metadata payload was decoded before caller budget: %v", err)
+	if err == nil || errors.Is(err, refused) || budgetCalls.Load() != 1 {
+		t.Fatalf("malformed metadata reached caller budget: err=%v calls=%d", err, budgetCalls.Load())
 	}
 
 	nameBody := []byte(`{"epoch":1,"data":"","nameObservation":{"nodeId":2,"state":2,"parentId":1,"rawLeaf":"!!!!"}}`)
 	ctx = storage.WithNameObservationBudget(t.Context(), func(storage.NameObservation, int64) (int64, error) {
+		budgetCalls.Add(1)
 		return 0, refused
 	})
 	_, err = decodeObservedFileResponse(ctx, fileRequest{Op: storage.OpFileObserveName}, nameBody)
-	if !errors.Is(err, refused) {
-		t.Fatalf("name payload was decoded before caller budget: %v", err)
+	if err == nil || errors.Is(err, refused) || budgetCalls.Load() != 1 {
+		t.Fatalf("malformed name reached caller budget: err=%v calls=%d", err, budgetCalls.Load())
+	}
+	nameBody = bytes.Replace(nameBody, []byte(`"!!!!"`), []byte(`"YQ=="`), 1)
+	_, err = decodeObservedFileResponse(ctx, fileRequest{Op: storage.OpFileObserveName}, nameBody)
+	if !errors.Is(err, refused) || budgetCalls.Load() != 2 {
+		t.Fatalf("valid name did not reach caller budget before retention: err=%v calls=%d", err, budgetCalls.Load())
+	}
+}
+
+func TestObservationDecoderRejectsInvalidRawLeavesBeforeCallerBudget(t *testing.T) {
+	attr, err := json.Marshal(AttrOf(storage.Attr{ID: 3, Kind: storage.NodeRegular}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leaf := range [][]byte{[]byte("."), []byte(".."), []byte("a/b"), {0}} {
+		t.Run(fmt.Sprintf("%x", leaf), func(t *testing.T) {
+			var calls atomic.Int32
+			result, err := storage.NewListResult(1<<20, 0, func(int, int64, int64, storage.Attr) (int64, error) {
+				calls.Add(1)
+				return 1, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := []byte(`{"epoch":1,"data":"","directory":{"observation":{"parentId":2,"revision":"AQ=="},"entries":[{"rawLeaf":"` + base64.StdEncoding.EncodeToString(leaf) + `","attr":` + string(attr) + `}]}}`)
+			target := storage.DirectoryTarget{NodeID: 2}
+			_, err = decodeObservedFileResponse(withDirectoryResponseCollector(t.Context(), result, false), fileRequest{Op: storage.OpFileReadDirNode, Directory: &target}, body)
+			if err == nil || calls.Load() != 0 {
+				t.Fatalf("invalid leaf reached caller budget: err=%v calls=%d", err, calls.Load())
+			}
+		})
 	}
 }
 
@@ -386,6 +435,56 @@ func TestIdentityDirectoryReadRequiresObservationProtocolCapability(t *testing.T
 	}
 }
 
+type namespaceOnlySession struct{ storage.FileSession }
+
+func (namespaceOnlySession) CheckNamespaceAccess() error { return nil }
+func (namespaceOnlySession) LookupAt(context.Context, storage.ChildName) (storage.Attr, error) {
+	panic("not called")
+}
+func (namespaceOnlySession) ReadDirNode(context.Context, storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	panic("not called")
+}
+func (namespaceOnlySession) ReadDirNodeBounded(context.Context, storage.DirectoryTarget, *storage.ListResult) (storage.DirectoryObservation, error) {
+	panic("not called")
+}
+func (namespaceOnlySession) MutateName(context.Context, storage.NameCommand) (storage.NameResult, error) {
+	panic("not called")
+}
+
+type directoryOnlySession struct{ storage.FileSession }
+
+func (directoryOnlySession) CheckDirectoryMetadataObservation() error { return nil }
+func (directoryOnlySession) ObserveDirectoryMetadata(context.Context, storage.DirectoryTarget, storage.DirectoryMetadataOptions, *storage.ListResult) (storage.DirectoryMetadataObservation, error) {
+	panic("not called")
+}
+
+type directoryBundleSession struct {
+	namespaceOnlySession
+}
+
+func (directoryBundleSession) CheckDirectoryMetadataObservation() error { return nil }
+func (directoryBundleSession) ObserveDirectoryMetadata(context.Context, storage.DirectoryTarget, storage.DirectoryMetadataOptions, *storage.ListResult) (storage.DirectoryMetadataObservation, error) {
+	panic("not called")
+}
+
+func TestHTTPAdvertisesDirectoryObservationOnlyAsCompleteBundle(t *testing.T) {
+	for name, test := range map[string]struct {
+		session storage.FileSession
+		ns, dir bool
+	}{
+		"namespace only":  {session: namespaceOnlySession{}, ns: true},
+		"directory only":  {session: directoryOnlySession{}},
+		"complete bundle": {session: directoryBundleSession{}, ns: true, dir: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			capabilities, err := sessionCapabilitiesOf(test.session)
+			if err != nil || capabilities.Namespace != test.ns || capabilities.DirectoryMetadata != test.dir {
+				t.Fatalf("capabilities=%+v err=%v", capabilities, err)
+			}
+		})
+	}
+}
+
 func TestAuthoritativeNameObservationsRoundTripOverHTTP(t *testing.T) {
 	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
 	if err := backend.Mkdir(t.Context(), "directory"); err != nil {
@@ -447,6 +546,17 @@ func TestAuthoritativeNameObservationsRoundTripOverHTTP(t *testing.T) {
 	client.http.Transport = boundedTransport
 	if len(requestedLimits) != 2 || requestedLimits[0] != 4096 || requestedLimits[1] != 4096 {
 		t.Fatalf("outer listing limits were not propagated: %v", requestedLimits)
+	}
+	refusing, err := storage.NewListResult(1<<20, 0, func(int, int64, int64, storage.Attr) (int64, error) {
+		return 0, syscall.ENOSPC
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedObservation, err := session.ReadDirNodeBounded(t.Context(), target, refusing)
+	refusedEntries, resultErr := refusing.Entries()
+	if !errors.Is(err, syscall.ENOSPC) || failedObservation.ParentID != 0 || !errors.Is(resultErr, syscall.ENOSPC) || refusedEntries != nil {
+		t.Fatalf("caller budget error changed across HTTP: observation=%+v entries=%+v err=%v/%v", failedObservation, refusedEntries, err, resultErr)
 	}
 	originalTransport := client.http.Transport
 	client.http.Transport = fileRoundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -606,6 +716,32 @@ func (*substitutedOpenNodeSession) OpenNodeRef(context.Context, uint64, storage.
 	return storage.NodeOpenResult{Reference: &mismatchedIdentityReference{}, Attr: storage.Attr{ID: 3, Kind: storage.NodeDirectory}, Outcome: storage.Opened}, nil
 }
 
+type substitutedChildSession struct{ mismatchedIdentitySession }
+
+func (*substitutedChildSession) OpenChildRef(context.Context, storage.ChildName, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	return storage.NodeOpenResult{Reference: &mismatchedIdentityReference{}, Attr: storage.Attr{ID: 3, Kind: storage.NodeDirectory}, Outcome: storage.Opened}, nil
+}
+
+type mismatchedIdentityFile struct{ mismatchedIdentityReference }
+
+func (*mismatchedIdentityFile) ReadAt(context.Context, int64, int) (storage.FileRead, error) {
+	panic("not called")
+}
+func (*mismatchedIdentityFile) WriteAt(context.Context, int64, []byte) (storage.Attr, error) {
+	panic("not called")
+}
+func (*mismatchedIdentityFile) Truncate(context.Context, int64) (storage.Attr, error) {
+	panic("not called")
+}
+func (*mismatchedIdentityFile) Sync(context.Context) error { panic("not called") }
+
+type substitutedAtomicSession struct{ storage.FileSession }
+
+func (*substitutedAtomicSession) CheckAtomicFileOpen() error { return nil }
+func (*substitutedAtomicSession) OpenAt(context.Context, storage.ChildName, storage.OpenAtOptions) (storage.OpenResult, error) {
+	return storage.OpenResult{File: &mismatchedIdentityFile{}, Attr: storage.Attr{ID: 3, Kind: storage.NodeRegular}, Outcome: storage.Opened}, nil
+}
+
 func TestOpenRejectsMismatchedReferenceIdentityWithoutLosingCleanupOwnership(t *testing.T) {
 	handler := &Handler{files: &fileRegistry{limits: DefaultFileLimits()}}
 	served := &servedFileSession{
@@ -630,17 +766,26 @@ func TestOpenRejectsMismatchedReferenceIdentityWithoutLosingCleanupOwnership(t *
 }
 
 func TestOpenNodeReferenceResponseCannotSubstituteRequestedNode(t *testing.T) {
-	request := fileRequest{Op: storage.OpFileOpenNodeRef, Node: 2}
 	response := fileResponse{
 		Epoch:        1,
 		File:         strings.Repeat("a", 64),
 		Data:         []byte{},
-		Attr:         AttrOf(storage.Attr{ID: 3, Kind: storage.NodeDirectory}),
+		Attr:         AttrOf(storage.Attr{ID: 3, Kind: storage.NodeRegular}),
 		Outcome:      storage.Opened,
 		Capabilities: &fileCapabilities{Scope: true, State: true, ReferenceName: true},
 	}
-	if err := validateFileResponse(request, response); err == nil {
-		t.Fatal("node reference response substituted the requested node")
+	for _, request := range []fileRequest{
+		{Op: storage.OpFileOpenNodeRef, Node: 2},
+		{Op: storage.OpFileOpenChildRef, NodeRef: nodeRefOptionsOf(storage.NodeRefOptions{Target: storage.ChildCondition{State: storage.SameNode, NodeID: 2}})},
+		{Op: storage.OpFileOpenAt, OpenAt: openAtOptionsOf(storage.OpenAtOptions{Target: storage.ChildCondition{State: storage.SameNode, NodeID: 2}, Existing: storage.Keep})},
+	} {
+		if err := validateFileResponse(request, response); err == nil {
+			t.Fatalf("%s response substituted the requested node", request.Op)
+		}
+	}
+	replacement := fileRequest{Op: storage.OpFileOpenAt, OpenAt: openAtOptionsOf(storage.OpenAtOptions{Target: storage.ChildCondition{State: storage.SameNode, NodeID: 2}, Existing: storage.ReplaceNode})}
+	if err := validateFileResponse(replacement, response); err != nil {
+		t.Fatalf("replacement open rejected its new node identity: %v", err)
 	}
 }
 
@@ -659,6 +804,40 @@ func TestServerRejectsOpenNodeReferenceTargetSubstitution(t *testing.T) {
 	defer served.mu.Unlock()
 	if len(served.files) != 1 {
 		t.Fatalf("substituted reference lost cleanup ownership: files=%d", len(served.files))
+	}
+}
+
+func TestServerRejectsSameNodeChildAndAtomicSubstitution(t *testing.T) {
+	child := storage.ChildName{Parent: storage.DirectoryTarget{NodeID: 1}, RawLeaf: []byte("file")}
+	for _, test := range []struct {
+		name    string
+		session storage.FileSession
+		request fileRequest
+	}{
+		{
+			name:    "child reference",
+			session: &substitutedChildSession{},
+			request: fileRequest{Op: storage.OpFileOpenChildRef, Child: childNameOf(child), NodeRef: nodeRefOptionsOf(storage.NodeRefOptions{Target: storage.ChildCondition{State: storage.SameNode, NodeID: 2}})},
+		},
+		{
+			name:    "atomic open",
+			session: &substitutedAtomicSession{},
+			request: fileRequest{Op: storage.OpFileOpenAt, Child: childNameOf(child), OpenAt: openAtOptionsOf(storage.OpenAtOptions{Target: storage.ChildCondition{State: storage.SameNode, NodeID: 2}, Existing: storage.Keep})},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := &Handler{files: &fileRegistry{limits: DefaultFileLimits()}}
+			served := &servedFileSession{native: test.session, files: make(map[string]*servedFile), options: storage.DefaultFileSessionOptions()}
+			response, err := handler.openReference(t.Context(), served, test.request)
+			if storage.ErrnoOf(err) != syscall.EIO || response.File != "" || response.Capabilities != nil {
+				t.Fatalf("substituted open response=%+v err=%v", response, err)
+			}
+			served.mu.Lock()
+			defer served.mu.Unlock()
+			if len(served.files) != 1 {
+				t.Fatalf("substituted open lost cleanup ownership: files=%d", len(served.files))
+			}
+		})
 	}
 }
 
