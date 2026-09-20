@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,20 +17,49 @@ import (
 )
 
 func TestRemoteChangeReachesReplicaDuringContinuousListings(t *testing.T) {
-	s := serve(t, httprest.DefaultLimits())
+	const (
+		readers             = 128
+		responseConcurrency = readers + 1
+		responseWaiters     = 64
+		maxBodyBytes        = int64(2 << 20)
+		responsePeak        = 4 * responseConcurrency * maxBodyBytes
+	)
+	handlerOptions := httprest.DefaultHandlerOptions()
+	handlerOptions.MaxBodyBytes = maxBodyBytes
+	handlerOptions.MaxConcurrentResponses = responseConcurrency
+	handlerOptions.MaxInFlightResponseBytes = responsePeak
+	handlerOptions.MaxWaitingResponses = responseWaiters
+	s := serveWithTransportOptions(t, &http.Client{Timeout: 30 * time.Second}, handlerOptions)
 	for i := range 4096 {
 		if err := s.storage.Create(t.Context(), fmt.Sprintf("file-%02d", i)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	mounted, _ := mount(t, s)
+	dialOptions := httprest.DefaultDialOptions()
+	dialOptions.Silence = s.silence
+	dialOptions.MaxBodyBytes = maxBodyBytes
+	dialOptions.MaxConcurrentResponses = responseConcurrency
+	dialOptions.MaxInFlightResponseBytes = responsePeak
+	dialOptions.MaxWaitingResponses = responseWaiters
+	if handlerOptions.MaxConcurrentResponses < readers+1 || dialOptions.MaxConcurrentResponses < readers+1 {
+		t.Fatal("acceptance transport cannot admit every reader and the authority operation together")
+	}
+	requiredResponseBytes := int64(4 * (readers + 1) * maxBodyBytes)
+	if handlerOptions.MaxInFlightResponseBytes < requiredResponseBytes || dialOptions.MaxInFlightResponseBytes < requiredResponseBytes {
+		t.Fatal("acceptance transport cannot retain every admitted response")
+	}
+	mounted, _ := mountWithHTTPOptions(t, s, &http.Client{Timeout: 30 * time.Second}, dialOptions)
 	var stopped atomic.Bool
 	stopReaders := func() { stopped.Store(true) }
 	var group sync.WaitGroup
 	var completed atomic.Int64
-	failures := make(chan error, 128)
-	startedReaders := make(chan struct{}, 128)
-	for range 128 {
+	failures := make(chan error, readers)
+	startedReaders := make(chan struct{}, readers)
+	listingProgress := make(chan struct{}, 1)
+	startLoad := make(chan struct{})
+	var releaseLoadOnce sync.Once
+	releaseLoad := func() { releaseLoadOnce.Do(func() { close(startLoad) }) }
+	for range readers {
 		group.Go(func() {
 			first := true
 			for !stopped.Load() {
@@ -46,22 +76,33 @@ func TestRemoteChangeReachesReplicaDuringContinuousListings(t *testing.T) {
 				if first {
 					startedReaders <- struct{}{}
 					first = false
+					select {
+					case <-startLoad:
+					case <-t.Context().Done():
+						return
+					}
+				}
+				select {
+				case listingProgress <- struct{}{}:
+				default:
 				}
 			}
 		})
 	}
-	defer func() { stopReaders(); group.Wait() }()
-	for range 128 {
+	defer func() { releaseLoad(); stopReaders(); group.Wait() }()
+	for range readers {
 		select {
 		case <-startedReaders:
 		case err := <-failures:
 			t.Fatalf("initial directory listing: %v", err)
 		}
 	}
+	before := completed.Load()
+	releaseLoad()
 	write(t, s, "arrived", "new content")
 	written := time.Now()
-	before := completed.Load()
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	postWrite := completed.Load()
+	ctx, cancel := context.WithDeadline(t.Context(), written.Add(time.Second))
 	defer cancel()
 	for {
 		attr, err := mounted.Stat(ctx, "arrived")
@@ -74,8 +115,22 @@ func TestRemoteChangeReachesReplicaDuringContinuousListings(t *testing.T) {
 		if !errors.Is(err, fs.ErrNotExist) {
 			t.Fatalf("remote change did not become visible: %v", err)
 		}
+		select {
+		case err := <-failures:
+			t.Fatalf("concurrent listing before visibility: %v", err)
+		default:
+		}
 	}
 	visible := time.Since(written)
+	for completed.Load() == postWrite {
+		select {
+		case <-listingProgress:
+		case err := <-failures:
+			t.Fatalf("concurrent listing after visibility: %v", err)
+		case <-ctx.Done():
+			t.Fatal("no directory listing completed during the one-second visibility window")
+		}
+	}
 	during := completed.Load() - before
 	if during == 0 {
 		t.Fatal("no directory listing completed while the remote change became visible")

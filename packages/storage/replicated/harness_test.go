@@ -80,8 +80,20 @@ func serveWithAllowance(t *testing.T, limits httprest.Limits, allowance int64) *
 
 func serveWithLockOptions(t *testing.T, limits httprest.Limits, allowance int64, options locking.Options) *served {
 	t.Helper()
-	meta, backing := memoryfixture.New(t, "ws", allowance, options)
-	handler, err := httprest.NewHandlerWithLimits(backing, meta, limits)
+	handlerOptions := httprest.DefaultHandlerOptions()
+	handlerOptions.Replication = limits
+	return serveWithHTTPOptions(t, allowance, options, &http.Client{Timeout: 10 * time.Second}, handlerOptions)
+}
+
+func serveWithTransportOptions(t *testing.T, client *http.Client, options httprest.HandlerOptions) *served {
+	t.Helper()
+	return serveWithHTTPOptions(t, 0, locking.DefaultOptions(), client, options)
+}
+
+func serveWithHTTPOptions(t *testing.T, allowance int64, lockOptions locking.Options, client *http.Client, handlerOptions httprest.HandlerOptions) *served {
+	t.Helper()
+	meta, backing := memoryfixture.New(t, "ws", allowance, lockOptions)
+	handler, err := httprest.NewHandlerWithOptions(backing, meta, handlerOptions)
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
 	}
@@ -91,7 +103,7 @@ func serveWithLockOptions(t *testing.T, limits httprest.Limits, allowance int64,
 	server := httptest.NewServer(counted)
 	t.Cleanup(server.Close)
 
-	elsewhere, err := httprest.Dial(server.URL, &http.Client{Timeout: 10 * time.Second})
+	elsewhere, err := httprest.Dial(server.URL, client)
 	if err != nil {
 		t.Fatalf("dialling the volume: %v", err)
 	}
@@ -114,12 +126,19 @@ func (s *served) sever() { s.server.CloseClientConnections() }
 // copy itself so that a test may compare it against the source node for node.
 func mount(t *testing.T, s *served) (*replicated.Storage, *sqlite.Replica) {
 	t.Helper()
+	options := httprest.DefaultDialOptions()
+	options.Silence = s.silence
+	return mountWithHTTPOptions(t, s, &http.Client{Timeout: 10 * time.Second}, options)
+}
+
+func mountWithHTTPOptions(t *testing.T, s *served, client *http.Client, options httprest.DialOptions) (*replicated.Storage, *sqlite.Replica) {
+	t.Helper()
 
 	replica, err := sqlite.OpenReplica(t.Context(), path.Join(t.TempDir(), "replica.db"))
 	if err != nil {
 		t.Fatalf("opening the copy: %v", err)
 	}
-	remote, err := httprest.DialWithSilence(s.url, &http.Client{Timeout: 10 * time.Second}, s.silence)
+	remote, err := httprest.DialWithOptions(s.url, client, options)
 	if err != nil {
 		t.Fatalf("dialling the volume: %v", err)
 	}
