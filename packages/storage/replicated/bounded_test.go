@@ -15,6 +15,7 @@ func TestBoundedEntrypointsPreserveReplicaAndDependencyFailures(t *testing.T) {
 	write(t, s, "small", "small")
 	write(t, s, "larger", "larger")
 	mkdir(t, s, "directory")
+	mkdir(t, s, "empty")
 	mounted, _ := mount(t, s)
 
 	if err := mounted.CheckBounded(); err != nil {
@@ -38,8 +39,15 @@ func TestBoundedEntrypointsPreserveReplicaAndDependencyFailures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the bounded listing: %v", err)
 	}
-	if len(entries) != 3 || entries[0].Name != "directory" || entries[1].Name != "larger" || entries[2].Name != "small" {
+	if len(entries) != 4 || entries[0].Name != "directory" || entries[1].Name != "empty" || entries[2].Name != "larger" || entries[3].Name != "small" {
 		t.Fatalf("bounded listing returned %+v", entries)
+	}
+	empty := listResult(t, 0)
+	if err := mounted.ListBounded(t.Context(), "empty", empty); err != nil {
+		t.Fatalf("empty listing under a zero retained-byte budget: %v", err)
+	}
+	if entries, err := empty.Entries(); err != nil || len(entries) != 0 {
+		t.Fatalf("empty bounded listing = %+v,%v", entries, err)
 	}
 
 	notDirectory := listResult(t, 4096)

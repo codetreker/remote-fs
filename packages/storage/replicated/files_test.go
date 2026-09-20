@@ -262,3 +262,23 @@ func TestMetadataContract(t *testing.T) {
 		return mounted
 	})
 }
+
+func TestAttributeResultBoundReachesAuthorityBeforeRetainedMutation(t *testing.T) {
+	s := serve(t, httprest.DefaultLimits())
+	mounted, _ := mount(t, s)
+	session := retainedSession(t, mounted)
+	file := retainedOpen(t, session, "file", true)
+	if _, err := file.WriteAt(t.Context(), 0, []byte("before")); err != nil {
+		t.Fatal(err)
+	}
+	bounded := storage.WithBoundedAttrResult(t.Context(), 1, func(storage.Attr, int64) error {
+		return syscall.EFBIG
+	})
+	if _, err := file.WriteAt(bounded, 0, []byte("after")); !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("bounded mutation = %v, want EFBIG", err)
+	}
+	read, err := file.ReadAt(t.Context(), 0, 16)
+	if err != nil || string(read.Data) != "before" {
+		t.Fatalf("refused mutation changed authority content: %q,%v", read.Data, err)
+	}
+}
