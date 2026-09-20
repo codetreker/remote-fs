@@ -92,6 +92,10 @@ func TestKnownFutureCapabilityBitsAreAccepted(t *testing.T) {
 	if err := validateFileResponse(fileRequest{Op: storage.OpFileSessionOpen}, response); err != nil {
 		t.Fatalf("known future capability bits were rejected: %v", err)
 	}
+	response.Capabilities.Namespace = false
+	if err := validateFileResponse(fileRequest{Op: storage.OpFileSessionOpen}, response); err == nil {
+		t.Fatal("directory observation capability was accepted without namespace support")
+	}
 }
 
 type advertisedSession struct {

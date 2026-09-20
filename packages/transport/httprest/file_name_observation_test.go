@@ -151,7 +151,7 @@ func TestServerPropagatesObservationResultBounds(t *testing.T) {
 
 type substitutedDirectorySession struct{ storage.FileSession }
 
-func (*substitutedDirectorySession) CheckNamespaceAccess() error { return nil }
+func (*substitutedDirectorySession) CheckDirectoryRead() error { return nil }
 func (*substitutedDirectorySession) LookupAt(context.Context, storage.ChildName) (storage.Attr, error) {
 	panic("not called")
 }
@@ -462,6 +462,7 @@ type directoryBundleSession struct {
 	namespaceOnlySession
 }
 
+func (directoryBundleSession) CheckDirectoryRead() error                { return nil }
 func (directoryBundleSession) CheckDirectoryMetadataObservation() error { return nil }
 func (directoryBundleSession) ObserveDirectoryMetadata(context.Context, storage.DirectoryTarget, storage.DirectoryMetadataOptions, *storage.ListResult) (storage.DirectoryMetadataObservation, error) {
 	panic("not called")
@@ -742,6 +743,28 @@ func (*substitutedAtomicSession) OpenAt(context.Context, storage.ChildName, stor
 	return storage.OpenResult{File: &mismatchedIdentityFile{}, Attr: storage.Attr{ID: 3, Kind: storage.NodeRegular}, Outcome: storage.Opened}, nil
 }
 
+type replacementIdentityFile struct {
+	mismatchedIdentityFile
+	id uint64
+}
+
+func (file *replacementIdentityFile) ReferenceNodeID() (uint64, error) { return file.id, nil }
+
+type replacementAtomicSession struct {
+	storage.FileSession
+	id      uint64
+	outcome storage.OpenOutcome
+}
+
+func (*replacementAtomicSession) CheckAtomicFileOpen() error { return nil }
+func (session *replacementAtomicSession) OpenAt(context.Context, storage.ChildName, storage.OpenAtOptions) (storage.OpenResult, error) {
+	return storage.OpenResult{
+		File:    &replacementIdentityFile{id: session.id},
+		Attr:    storage.Attr{ID: session.id, Kind: storage.NodeRegular},
+		Outcome: session.outcome,
+	}, nil
+}
+
 func TestOpenRejectsMismatchedReferenceIdentityWithoutLosingCleanupOwnership(t *testing.T) {
 	handler := &Handler{files: &fileRegistry{limits: DefaultFileLimits()}}
 	served := &servedFileSession{
@@ -784,8 +807,16 @@ func TestOpenNodeReferenceResponseCannotSubstituteRequestedNode(t *testing.T) {
 		}
 	}
 	replacement := fileRequest{Op: storage.OpFileOpenAt, OpenAt: openAtOptionsOf(storage.OpenAtOptions{Target: storage.ChildCondition{State: storage.SameNode, NodeID: 2}, Existing: storage.ReplaceNode})}
+	if err := validateFileResponse(replacement, response); err == nil {
+		t.Fatal("replacement open accepted an ordinary opened outcome")
+	}
+	response.Outcome = storage.Replaced
 	if err := validateFileResponse(replacement, response); err != nil {
 		t.Fatalf("replacement open rejected its new node identity: %v", err)
+	}
+	response.Attr = AttrOf(storage.Attr{ID: 2, Kind: storage.NodeRegular})
+	if err := validateFileResponse(replacement, response); err == nil {
+		t.Fatal("replacement open reused the replaced node identity")
 	}
 }
 
@@ -836,6 +867,42 @@ func TestServerRejectsSameNodeChildAndAtomicSubstitution(t *testing.T) {
 			defer served.mu.Unlock()
 			if len(served.files) != 1 {
 				t.Fatalf("substituted open lost cleanup ownership: files=%d", len(served.files))
+			}
+		})
+	}
+}
+
+func TestServerRequiresReplacementIdentityAndOutcome(t *testing.T) {
+	child := storage.ChildName{Parent: storage.DirectoryTarget{NodeID: 1}, RawLeaf: []byte("file")}
+	request := fileRequest{Op: storage.OpFileOpenAt, Child: childNameOf(child), OpenAt: openAtOptionsOf(storage.OpenAtOptions{
+		Target: storage.ChildCondition{State: storage.SameNode, NodeID: 2}, Existing: storage.ReplaceNode,
+	})}
+	for _, test := range []struct {
+		name    string
+		id      uint64
+		outcome storage.OpenOutcome
+		valid   bool
+	}{
+		{name: "reused identity", id: 2, outcome: storage.Replaced},
+		{name: "wrong outcome", id: 3, outcome: storage.Opened},
+		{name: "distinct replacement", id: 3, outcome: storage.Replaced, valid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := &Handler{files: &fileRegistry{limits: DefaultFileLimits()}}
+			served := &servedFileSession{
+				native:  &replacementAtomicSession{id: test.id, outcome: test.outcome},
+				files:   make(map[string]*servedFile),
+				options: storage.DefaultFileSessionOptions(),
+			}
+			response, err := handler.openReference(t.Context(), served, request)
+			if test.valid {
+				if err != nil || response.File == "" || response.Attr == nil || response.Attr.ID != 3 || response.Outcome != storage.Replaced {
+					t.Fatalf("valid replacement response=%+v err=%v", response, err)
+				}
+				return
+			}
+			if storage.ErrnoOf(err) != syscall.EIO || response.File != "" || response.Capabilities != nil {
+				t.Fatalf("invalid replacement response=%+v err=%v", response, err)
 			}
 		})
 	}

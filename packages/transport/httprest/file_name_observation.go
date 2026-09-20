@@ -360,6 +360,10 @@ func (session *remoteFileSession) CheckDirectoryMetadataObservation() error {
 	return checkFileCapability(session.capabilities.DirectoryMetadata)
 }
 
+func (session *remoteFileSession) CheckDirectoryRead() error {
+	return checkFileCapability(session.capabilities.DirectoryMetadata)
+}
+
 func (session *remoteFileSession) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
 	result, err := storage.NewListResult(storage.MaxDirectoryBytes, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
 		return storage.ObservedEntryBytes(nameBytes, metadataBytes)
@@ -395,10 +399,7 @@ func (session *remoteFileSession) readDirNodeBounded(ctx context.Context, target
 			result.Fail(returned)
 		}
 	}()
-	if err := session.CheckNamespaceAccess(); err != nil {
-		return observation, err
-	}
-	if err := session.CheckDirectoryMetadataObservation(); err != nil {
+	if err := session.CheckDirectoryRead(); err != nil {
 		return observation, err
 	}
 	if err := target.Check(); err != nil {
@@ -503,6 +504,7 @@ func (reference *remoteNodeReference) ReferenceNodeID() (uint64, error) {
 }
 
 var _ storage.DirectoryMetadataObserver = (*remoteFileSession)(nil)
+var _ storage.DirectoryReader = (*remoteFileSession)(nil)
 var _ storage.ReferenceNameObserver = (*remoteFile)(nil)
 var _ storage.ReferenceNameObserver = (*remoteNodeReference)(nil)
 var _ storage.ReferenceIdentity = (*remoteFile)(nil)

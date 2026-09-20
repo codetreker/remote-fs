@@ -309,6 +309,9 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if !validFileCapability(r.Session) || r.Status == nil || r.Capabilities == nil {
 			return errors.New("file session response has no valid capability or status")
 		}
+		if r.Capabilities.DirectoryMetadata && !r.Capabilities.Namespace {
+			return errors.New("directory observation capability lacks namespace support")
+		}
 	case storage.OpFileStatus, storage.OpFileRenew:
 		if r.Status == nil {
 			return errors.New("file response carries no status")
@@ -347,8 +350,14 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if req.Op == storage.OpFileOpenChildRef && req.NodeRef.Target.State == storage.SameNode && r.Attr.ID != req.NodeRef.Target.NodeID {
 			return errors.New("child reference open substituted its target")
 		}
-		if req.Op == storage.OpFileOpenAt && req.OpenAt.Target.State == storage.SameNode && req.OpenAt.Existing != storage.ReplaceNode && r.Attr.ID != req.OpenAt.Target.NodeID {
-			return errors.New("atomic open substituted its target")
+		if req.Op == storage.OpFileOpenAt && req.OpenAt.Target.State == storage.SameNode {
+			if req.OpenAt.Existing == storage.ReplaceNode {
+				if r.Attr.ID == req.OpenAt.Target.NodeID || r.Outcome != storage.Replaced {
+					return errors.New("replacement open did not replace its target identity")
+				}
+			} else if r.Attr.ID != req.OpenAt.Target.NodeID {
+				return errors.New("atomic open substituted its target")
+			}
 		}
 	case storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetNodeAttr, storage.OpFileMutate:
 		if r.Attr == nil {
