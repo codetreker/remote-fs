@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,14 +24,9 @@ import (
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
-// TestAWalkOfACopiedTreeAsksTheServerNothing is what the whole feature is for, and it is a
-// count rather than an impression.
-//
-// A mount that keeps no metadata turns every one of these calls into a request: one per
-// listing, one per stat, and one for every name a path search asks about and does not find.
-// That is what makes a toolchain unusable over a 20 ms link, and the number below is the
-// evidence that it is no longer what happens.
-func TestAWalkOfACopiedTreeAsksTheServerNothing(t *testing.T) {
+// Directory reads consult current use exclusions; attribute and negative-name
+// lookups retain the replica's local metadata benefit.
+func TestTreeWalkUsesAuthorityOnlyForDirectoryReads(t *testing.T) {
 	s := serve(t, httprest.DefaultLimits())
 	mkdir(t, s, "src")
 	mkdir(t, s, "src/inner")
@@ -54,15 +49,22 @@ func TestAWalkOfACopiedTreeAsksTheServerNothing(t *testing.T) {
 		}
 	}
 
-	if arrived := s.calls.since(before); arrived != "" {
-		t.Fatalf("walking a copied tree sent %s to the server, and the point of the copy is that it sends nothing", arrived)
+	after := s.calls.snapshot()
+	for op, count := range after {
+		want := 0
+		if op == string(httprest.OpList) {
+			want = 3
+		}
+		if count-before[op] != want {
+			t.Fatalf("tree walk sent %s requests=%d,want %d", op, count-before[op], want)
+		}
 	}
-	t.Logf("walked %d nodes and asked about 3 absent names: %d requests", len(walked), s.calls.total()-total(before))
+	if after[string(httprest.OpList)]-before[string(httprest.OpList)] != 3 {
+		t.Fatal("tree walk omitted an authoritative directory read")
+	}
 }
 
-// TestTheCopyIsTheVolumeNodeForNode. A walk that asks nothing is worth nothing unless what
-// it answers is what the volume holds, read from the volume's own metastore rather than
-// from anything under test.
+// The replica and authoritative directory view describe the same file tree.
 func TestTheCopyIsTheVolumeNodeForNode(t *testing.T) {
 	s := serve(t, httprest.DefaultLimits())
 	mkdir(t, s, "d")
@@ -306,8 +308,8 @@ func TestAnEventChannelThatBrokeMakesEveryOperationFailRatherThanAnswer(t *testi
 		{"removing a directory", func() error { return mounted.RemoveDir(t.Context(), "existing") }},
 		{"renaming", func() error { return mounted.Rename(t.Context(), "a.txt", "b.txt") }},
 		{"changing attributes", func() error {
-			mode := os.FileMode(0o600)
-			return mounted.SetAttr(t.Context(), "a.txt", storage.AttrChange{Mode: &mode})
+			moment := time.Unix(1000, 123)
+			return mounted.SetAttr(t.Context(), "a.txt", storage.AttrChange{ModTime: &moment})
 		}},
 		{"asking how much room there is", func() error { _, err := mounted.Space(t.Context()); return err }},
 	} {
@@ -893,33 +895,33 @@ func TestACopyIsNotAnsweredFromWhileItIsCatchingUp(t *testing.T) {
 // to it arrives under parent zero and no name, while every other node arrives under the id of
 // the directory holding it. A caller that named the root the way it names everything else
 // would wait for an event that had already arrived, give up after its whole grace, and report
-// EIO for a chmod of the mountpoint — an ordinary thing to do to a mountpoint.
+// EIO for an attribute change on the mountpoint.
 func TestAChangeToTheRootIsConfirmedLikeAnyOther(t *testing.T) {
 	const grace = 2 * time.Second
 
 	s := serve(t, httprest.DefaultLimits())
 	mounted, _ := mountWithGrace(t, s, grace)
 
-	mode := fs.FileMode(0o711)
+	moment := time.Unix(1000, 123)
 	started := time.Now()
-	if err := mounted.SetAttr(t.Context(), "", storage.AttrChange{Mode: &mode}); err != nil {
-		t.Fatalf("changing the root's mode: %v", err)
+	if err := mounted.SetAttr(t.Context(), "", storage.AttrChange{ModTime: &moment}); err != nil {
+		t.Fatalf("changing the root's modification time: %v", err)
 	}
 	took := time.Since(started)
 
 	// It has to be confirmed by the event, not by the grace running out — and the grace here
 	// is long enough that waiting it out is unmistakable.
 	if took >= grace {
-		t.Fatalf("changing the root's mode took %v, which is the whole grace: its barrier was not reached", took)
+		t.Fatalf("changing the root's modification time took %v, which is the whole grace: its barrier was not reached", took)
 	}
 	attr, err := mounted.Stat(t.Context(), "")
 	if err != nil {
-		t.Fatalf("stat of the root straight after changing its mode: %v", err)
+		t.Fatalf("stat of the root straight after changing its modification time: %v", err)
 	}
-	if attr.Mode.Perm() != mode.Perm() {
-		t.Fatalf("the copy reports the root as %v straight after it was set to %v", attr.Mode, mode)
+	if !attr.ModTime.Equal(moment) {
+		t.Fatalf("the copy reports the root as %v straight after it was set to %v", attr.ModTime, moment)
 	}
-	t.Logf("the root's mode was changed and confirmed in %v", took)
+	t.Logf("the root's modification time was changed and confirmed in %v", took)
 }
 
 // TestSameTargetReplayCannotConfirmBeforeTheMutationBarrier.
@@ -1070,7 +1072,7 @@ func TestAMutationThatRecordsNothingIsNotWaitedFor(t *testing.T) {
 		t.Fatalf("renaming a name that is not there onto itself gave %v, want ENOENT: it is sent for exactly this answer", err)
 	}
 
-	if after, err := mounted.Stat(t.Context(), "a.txt"); err != nil || after != before {
+	if after, err := mounted.Stat(t.Context(), "a.txt"); err != nil || !reflect.DeepEqual(after, before) {
 		t.Fatalf("a.txt is now %+v (%v), and nothing here changed it from %+v", after, err, before)
 	}
 	requireCaughtUp(t, s, replica)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"sync"
 	"syscall"
@@ -397,6 +398,7 @@ func (s *Storage) ReadBounded(ctx context.Context, path string, maxBytes int64) 
 }
 
 func (s *Storage) read(ctx context.Context, path string, maxBytes *int64) ([]byte, error) {
+	ctx = metastore.WithFileAccess(ctx, metastore.FileAccess{Uses: storage.ReadData, Length: math.MaxInt64})
 	cleaned, err := storage.CleanPath(path)
 	if err != nil {
 		return nil, &os.PathError{Op: "read", Path: path, Err: err}

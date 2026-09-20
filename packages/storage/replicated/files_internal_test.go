@@ -3,6 +3,7 @@ package replicated
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -74,7 +75,7 @@ func TestRetainedFileRequiresAnAtomicReplicationBarrier(t *testing.T) {
 				return storage.Attr{ID: 5, Size: 1}, test.barrier, test.failure
 			}}}
 			attr, err := file.WriteAt(t.Context(), 0, []byte{'x'})
-			if !errors.Is(err, syscall.EIO) || attr != (storage.Attr{}) || calls != 1 {
+			if !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(attr, storage.Attr{}) || calls != 1 {
 				t.Fatalf("unconfirmed publication returned %+v, %v after %d dispatches", attr, err, calls)
 			}
 			if session.base.activeConfirmations != 0 {

@@ -6,11 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/codetreker/remote-fs/packages/locking"
@@ -40,6 +40,12 @@ func TestContract(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestMetadataContract(t *testing.T) {
+	storagetest.RunMetadata(t, func(t *testing.T) storage.Storage {
+		return newStorage(t, 1<<30)
+	})
 }
 
 func TestBoundedContract(t *testing.T) {
@@ -135,8 +141,8 @@ func TestTheOperationsThatCarryNoBytesChargeNothing(t *testing.T) {
 	if err := s.Mkdir(t.Context(), "d"); err != nil {
 		t.Fatal(err)
 	}
-	mode := os.FileMode(0o600)
-	if err := s.SetAttr(t.Context(), "f", storage.AttrChange{Mode: &mode}); err != nil {
+	modified := time.Unix(1_700_000_000, 17)
+	if err := s.SetAttr(t.Context(), "f", storage.AttrChange{ModTime: &modified}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.RemoveDir(t.Context(), "d"); err != nil {
@@ -320,7 +326,11 @@ func TestDirectoryMeasurementBoundIncludesEntryAndNameRetention(t *testing.T) {
 	if err := backing.Write(t.Context(), "f", content(7)); err != nil {
 		t.Fatal(err)
 	}
-	entryBytes := int64(unsafe.Sizeof(storage.Entry{})) + 1
+	metadataBytes, err := storage.MetadataRetentionBytes(6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entryBytes := int64(unsafe.Sizeof(storage.Entry{})) + metadataBytes + 1
 	for _, c := range []struct {
 		name  string
 		bound int64
@@ -838,7 +848,7 @@ type symlinkListing struct {
 }
 
 func (s symlinkListing) link() storage.Entry {
-	return storage.Entry{Name: "link", Attr: storage.Attr{Mode: os.ModeSymlink, Size: int64(len(s.target))}}
+	return storage.Entry{Name: "link", Attr: storage.Attr{Kind: storage.NodeSymlink, Size: int64(len(s.target))}}
 }
 
 func (s symlinkListing) Stat(ctx context.Context, name string) (storage.Attr, error) {

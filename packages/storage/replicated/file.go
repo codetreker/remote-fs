@@ -78,37 +78,6 @@ func (f *retainedFile) Sync(ctx context.Context) error {
 	return err
 }
 
-func (f *retainedFile) GetLock(ctx context.Context, owner storage.LockOwner, lock storage.FileLock) (storage.LockConflict, error) {
-	return fileCall(ctx, f.session, false, func(ctx context.Context) (storage.LockConflict, error) {
-		return f.remote.GetLock(ctx, owner, lock)
-	})
-}
-
-func (f *retainedFile) SetLock(ctx context.Context, owner storage.LockOwner, lock storage.FileLock, request storage.LockRequestID) (storage.LockAttempt, error) {
-	return fileCall(ctx, f.session, false, func(ctx context.Context) (storage.LockAttempt, error) {
-		return f.remote.SetLock(ctx, owner, lock, request)
-	})
-}
-
-func (f *retainedFile) QueryLock(ctx context.Context, owner storage.LockOwner, request storage.LockRequestID) (storage.LockAttempt, error) {
-	return fileCall(ctx, f.session, false, func(ctx context.Context) (storage.LockAttempt, error) {
-		return f.remote.QueryLock(ctx, owner, request)
-	})
-}
-
-func (f *retainedFile) CancelLock(ctx context.Context, owner storage.LockOwner, request storage.LockRequestID) (storage.LockAttempt, error) {
-	return fileCall(ctx, f.session, false, func(ctx context.Context) (storage.LockAttempt, error) {
-		return f.remote.CancelLock(ctx, owner, request)
-	})
-}
-
-func (f *retainedFile) DropLocks(ctx context.Context, owner storage.LockOwner, family storage.LockFamily) error {
-	_, err := fileCall(ctx, f.session, false, func(ctx context.Context) (struct{}, error) {
-		return struct{}{}, f.remote.DropLocks(ctx, owner, family)
-	})
-	return err
-}
-
 func (f *retainedFile) Close(ctx context.Context) error {
 	f.mu.Lock()
 	closed := f.closed

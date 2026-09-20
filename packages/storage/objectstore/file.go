@@ -15,10 +15,10 @@ import (
 type openFile struct {
 	session    *fileSession
 	native     metastore.File
+	uses       referenceUses
 	options    storage.FileOpenOptions
 	active     bool
 	operations sync.WaitGroup
-	flock      map[storage.LockOwner]uint64
 	retireMu   sync.Mutex
 	retired    bool
 	closeMu    sync.Mutex
@@ -75,6 +75,7 @@ func (f *openFile) ReadAt(ctx context.Context, offset int64, length int) (storag
 	if offset < 0 || length < 0 {
 		return storage.FileRead{}, syscall.EINVAL
 	}
+	ctx = metastore.WithFileAccess(ctx, metastore.FileAccess{Uses: storage.ReadData, Offset: offset, Length: int64(length)})
 	if !f.options.Read {
 		return storage.FileRead{}, syscall.EBADF
 	}
@@ -155,6 +156,7 @@ func (f *openFile) WriteAt(ctx context.Context, offset int64, data []byte) (stor
 	if int64(len(data)) > math.MaxInt64-offset {
 		return storage.Attr{}, syscall.EFBIG
 	}
+	ctx = metastore.WithFileAccess(ctx, metastore.FileAccess{Uses: storage.WriteData, Offset: offset, Length: int64(len(data))})
 	if !f.options.Write {
 		return storage.Attr{}, syscall.EBADF
 	}
@@ -177,6 +179,7 @@ func (f *openFile) Truncate(ctx context.Context, size int64) (storage.Attr, erro
 	if size < 0 {
 		return storage.Attr{}, syscall.EINVAL
 	}
+	ctx = metastore.WithFileAccess(ctx, metastore.FileAccess{Uses: storage.WriteData, Truncate: true, Size: size})
 	return f.mutate(ctx, func(int64) int64 { return size }, func([]byte) {})
 }
 
@@ -343,6 +346,7 @@ func (f *openFile) Sync(ctx context.Context) error {
 func (f *openFile) retire() error {
 	f.session.mu.Lock()
 	f.active = false
+	f.uses.retiring = true
 	f.session.mu.Unlock()
 	f.retireMu.Lock()
 	defer f.retireMu.Unlock()
@@ -356,6 +360,16 @@ func (f *openFile) retire() error {
 	}
 	f.retired = true
 	return nil
+}
+
+func (f *openFile) drainAndRelease() error {
+	f.operations.Wait()
+	ctx, cancel := f.session.operationContext(f.session.cleanup)
+	defer cancel()
+	if err := f.native.DropUse(ctx); err != nil {
+		return err
+	}
+	return f.session.retireReferenceOwners(&f.uses)
 }
 
 func (f *openFile) startClose() <-chan struct{} {
@@ -379,16 +393,9 @@ func (f *openFile) startClose() <-chan struct{} {
 func (f *openFile) finishClose() {
 	err := f.retire()
 	if err == nil {
-		f.operations.Wait()
-		f.session.mu.Lock()
-		owners := make(map[storage.LockOwner]uint64, len(f.flock))
-		for owner, node := range f.flock {
-			owners[owner] = node
-		}
-		f.session.mu.Unlock()
-		for owner, node := range owners {
-			err = errors.Join(err, f.dropClosedFlock(node, owner))
-		}
+		err = f.drainAndRelease()
+	}
+	if err == nil {
 		// Cleanup keeps the creation-time accounting hooks. Attaching Close's
 		// context again would reserve and settle the same outer quota twice.
 		ctx, cancel := f.session.operationContext(f.session.cleanup)

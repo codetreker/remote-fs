@@ -58,6 +58,8 @@ var metastoreAuxiliaryFilenames = [...]string{
 // uses sqlite.DefaultMaxIntegrityRecords.
 // MaxIntegrityBytes bounds the variable-length names examined by SQLite integrity checks;
 // zero uses sqlite.DefaultMaxIntegrityBytes.
+// MaxMetadataBytes bounds canonical opaque metadata retained by SQLite; zero uses
+// sqlite.DefaultMaxMetadataBytes.
 // The backing filesystem remains the hard physical ceiling for all bytes.
 // LocalDisk.MaintenanceReserveBytes keeps deletion and SQLite maintenance possible when that
 // ceiling is reached; removal remains available while new object publication is refused.
@@ -74,6 +76,7 @@ type Config struct {
 	MaxSnapshotReaderConnections int
 	MaxIntegrityRecords          int64
 	MaxIntegrityBytes            int64
+	MaxMetadataBytes             int64
 	// Retained-file and advisory limits use SQLite defaults when omitted.
 	MaxRetainedFiles int
 	Advisory         advisory.Config
@@ -93,6 +96,7 @@ type Status struct {
 	MaxSnapshotReaderConnections int
 	MaxIntegrityRecords          int64
 	MaxIntegrityBytes            int64
+	MaxMetadataBytes             int64
 	LocalDisk                    localdisk.Status
 	Maintenance                  objectstore.MaintenanceStatus
 	Checkpoint                   CheckpointStatus
@@ -119,6 +123,7 @@ type Store struct {
 	maxSnapshotReaderConnections int
 	maxIntegrityRecords          int64
 	maxIntegrityBytes            int64
+	maxMetadataBytes             int64
 	volumeName                   string
 	closeMu                      sync.Mutex
 	closeRunning                 *closeAttempt
@@ -389,6 +394,7 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 		maxSnapshotReaderConnections: sqliteOptions.MaxSnapshotReaderConnections,
 		maxIntegrityRecords:          sqliteOptions.MaxIntegrityRecords,
 		maxIntegrityBytes:            sqliteOptions.MaxIntegrityBytes,
+		maxMetadataBytes:             sqliteOptions.MaxMetadataBytes,
 	}, nil
 }
 
@@ -402,6 +408,7 @@ func (config Config) sqliteOptions() (sqlite.Options, error) {
 		MaxSnapshotReaderConnections: config.MaxSnapshotReaderConnections,
 		MaxIntegrityRecords:          config.MaxIntegrityRecords,
 		MaxIntegrityBytes:            config.MaxIntegrityBytes,
+		MaxMetadataBytes:             config.MaxMetadataBytes,
 	}).Effective()
 }
 
@@ -797,24 +804,25 @@ func (s *Store) Status(ctx context.Context) (Status, error) {
 	objects, objectsErr := s.meta.ObjectStatus(ctx)
 	checkpoint := s.durable.status()
 	return Status{
-			Volume:                       s.volumeName,
-			Space:                        space,
-			Objects:                      objects,
-			ObjectLimits:                 s.objectLimits,
-			MaxReaderConnections:         s.maxReaderConnections,
-			MaxSnapshotReaderConnections: s.maxSnapshotReaderConnections,
-			MaxIntegrityRecords:          s.maxIntegrityRecords,
-			MaxIntegrityBytes:            s.maxIntegrityBytes,
-			LocalDisk:                    localDisk,
-			Maintenance:                  s.MaintenanceStatus(),
-			Checkpoint:                   checkpoint,
-		}, errors.Join(
-			statusFailure("logical space", spaceErr),
-			statusFailure("combined space", spaceStatusErr),
-			statusFailure("object records", objectsErr),
-			statusFailure("local object store", localDiskErr),
-			statusFailure("SQLite checkpoint", checkpoint.LastError),
-		)
+		Volume:                       s.volumeName,
+		Space:                        space,
+		Objects:                      objects,
+		ObjectLimits:                 s.objectLimits,
+		MaxReaderConnections:         s.maxReaderConnections,
+		MaxSnapshotReaderConnections: s.maxSnapshotReaderConnections,
+		MaxIntegrityRecords:          s.maxIntegrityRecords,
+		MaxIntegrityBytes:            s.maxIntegrityBytes,
+		MaxMetadataBytes:             s.maxMetadataBytes,
+		LocalDisk:                    localDisk,
+		Maintenance:                  s.MaintenanceStatus(),
+		Checkpoint:                   checkpoint,
+	}, errors.Join(
+		statusFailure("logical space", spaceErr),
+		statusFailure("combined space", spaceStatusErr),
+		statusFailure("object records", objectsErr),
+		statusFailure("local object store", localDiskErr),
+		statusFailure("SQLite checkpoint", checkpoint.LastError),
+	)
 }
 
 func clampStatusSpace(

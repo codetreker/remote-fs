@@ -38,6 +38,14 @@ func TestStorageContract(t *testing.T) {
 	})
 }
 
+func TestMetadataContract(t *testing.T) {
+	storagetest.RunMetadata(t, func(t *testing.T) storage.Storage {
+		store := open(t, testConfig(privateRoot(t)))
+		t.Cleanup(func() { closeStore(t, store) })
+		return store
+	})
+}
+
 func TestBoundedStorageContract(t *testing.T) {
 	storagetest.RunBounded(t, func(t *testing.T) storage.BoundedStorage {
 		store := open(t, testConfig(privateRoot(t)))
@@ -503,6 +511,12 @@ func TestConfigurationIsValidatedBeforeTheRootIsTouched(t *testing.T) {
 		"unbounded integrity bytes": func(config *localstore.Config) {
 			config.MaxIntegrityBytes = math.MaxInt64
 		},
+		"metadata byte limit": func(config *localstore.Config) {
+			config.MaxMetadataBytes = -1
+		},
+		"unbounded metadata bytes": func(config *localstore.Config) {
+			config.MaxMetadataBytes = math.MaxInt64
+		},
 	}
 	for name, invalidate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -565,6 +579,7 @@ func TestStatusCombinesLogicalObjectAndPhysicalState(t *testing.T) {
 	config.MaxSnapshotReaderConnections = 7
 	config.MaxIntegrityRecords = 100
 	config.MaxIntegrityBytes = 1 << 20
+	config.MaxMetadataBytes = 2 << 20
 	store := open(t, config)
 	t.Cleanup(func() { closeStore(t, store) })
 
@@ -597,6 +612,9 @@ func TestStatusCombinesLogicalObjectAndPhysicalState(t *testing.T) {
 	}
 	if status.MaxIntegrityBytes != config.MaxIntegrityBytes {
 		t.Fatalf("Status.MaxIntegrityBytes = %d, want %d", status.MaxIntegrityBytes, config.MaxIntegrityBytes)
+	}
+	if status.MaxMetadataBytes != config.MaxMetadataBytes {
+		t.Fatalf("Status.MaxMetadataBytes = %d, want %d", status.MaxMetadataBytes, config.MaxMetadataBytes)
 	}
 	if status.MaxSnapshotReaderConnections != config.MaxSnapshotReaderConnections {
 		t.Fatalf("Status.MaxSnapshotReaderConnections = %d, want %d",
@@ -753,6 +771,10 @@ func TestStatusReportsEffectiveDefaultObjectLimits(t *testing.T) {
 		t.Fatalf("Status.MaxIntegrityBytes = %d, want default %d",
 			status.MaxIntegrityBytes, sqlite.DefaultMaxIntegrityBytes)
 	}
+	if status.MaxMetadataBytes != sqlite.DefaultMaxMetadataBytes {
+		t.Fatalf("Status.MaxMetadataBytes = %d, want default %d",
+			status.MaxMetadataBytes, sqlite.DefaultMaxMetadataBytes)
+	}
 	if status.MaxSnapshotReaderConnections != sqlite.DefaultMaxSnapshotReaderConnections {
 		t.Fatalf("Status.MaxSnapshotReaderConnections = %d, want default %d",
 			status.MaxSnapshotReaderConnections, sqlite.DefaultMaxSnapshotReaderConnections)
@@ -765,6 +787,7 @@ func TestConfiguredReaderConnectionLimitIsReported(t *testing.T) {
 	config.MaxSnapshotReaderConnections = 5
 	config.MaxIntegrityRecords = 101
 	config.MaxIntegrityBytes = 202
+	config.MaxMetadataBytes = 303
 	store := open(t, config)
 	t.Cleanup(func() { closeStore(t, store) })
 	status, err := store.Status(t.Context())
@@ -782,6 +805,10 @@ func TestConfiguredReaderConnectionLimitIsReported(t *testing.T) {
 	if status.MaxIntegrityBytes != config.MaxIntegrityBytes {
 		t.Fatalf("Status.MaxIntegrityBytes = %d, want %d",
 			status.MaxIntegrityBytes, config.MaxIntegrityBytes)
+	}
+	if status.MaxMetadataBytes != config.MaxMetadataBytes {
+		t.Fatalf("Status.MaxMetadataBytes = %d, want %d",
+			status.MaxMetadataBytes, config.MaxMetadataBytes)
 	}
 	if status.MaxSnapshotReaderConnections != config.MaxSnapshotReaderConnections {
 		t.Fatalf("Status.MaxSnapshotReaderConnections = %d, want %d",

@@ -432,7 +432,7 @@ func TestInitialBuildUsesOneFixedCheckpointOnOriginalStream(t *testing.T) {
 	if _, err := build.mounted.Stat(t.Context(), "late.txt"); err != nil {
 		t.Fatalf("checkpoint change missing at handoff: %v", err)
 	}
-	if entries, err := build.mounted.List(t.Context(), ""); err != nil || len(entries) != 1 || entries[0].Name != "late.txt" {
+	if entries, err := build.local.List(t.Context(), ""); err != nil || len(entries) != 1 || string(entries[0].Name) != "late.txt" {
 		t.Fatalf("tree at fixed checkpoint: %v, %v", entries, err)
 	}
 	if got := build.served.calls.of(httprest.OpCheckpoint); got != 1 {
