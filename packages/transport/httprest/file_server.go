@@ -340,9 +340,7 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 	if fileAttrResult(req.Op) {
 		r = r.WithContext(storage.WithBoundedAttrResult(r.Context(), req.ResultBytes, h.attrResultBudget(req)))
 	}
-	if req.Op == storage.OpFileObserveName || (req.Op == storage.OpFileObserveDirectoryMetadata && req.DirectoryMetadata.IncludeName) {
-		r = r.WithContext(storage.WithNameObservationBudget(r.Context(), nameObservationWireBudget(min(req.ResultBytes, h.maxBodyBytes), req.Op == storage.OpFileObserveDirectoryMetadata)))
-	}
+	r = r.WithContext(h.observationResultContext(r.Context(), req))
 	digest := sha256.Sum256(append(body, []byte(r.Header.Get(HeaderMutationScope))...))
 	response, err := h.fileCall(r.Context(), req, digest)
 	if err != nil {

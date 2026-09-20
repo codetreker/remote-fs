@@ -160,7 +160,12 @@ func (s *Storage) fileCall(ctx context.Context, req fileRequest) (fileResponse, 
 	}
 	defer answer.release()
 	var response fileResponse
-	if err := decodeFileJSON(answer.content, &response); err != nil {
+	if req.Op == storage.OpFileReadDirNode || req.Op == storage.OpFileObserveDirectoryMetadata || req.Op == storage.OpFileObserveName {
+		response, err = decodeObservedFileResponse(ctx, req, answer.content)
+	} else {
+		err = decodeFileJSON(answer.content, &response)
+	}
+	if err != nil {
 		return fileResponse{}, unreachable(Request{Op: OpFile}, err)
 	}
 	if err := validateFileResponse(req, response); err != nil {

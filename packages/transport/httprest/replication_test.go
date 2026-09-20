@@ -2,7 +2,6 @@ package httprest_test
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -808,11 +807,10 @@ func row(parent int64, name string, node metastore.Node) metastore.Row {
 // seconds and the nanoseconds are printed apart because that is how they travel, and a
 // comparison that folded them back together would not notice one of the two going missing.
 func describe(r metastore.Row) string {
-	return fmt.Sprintf("parent=%d name=%q id=%d kind=%v size=%d accessed=%d.%09d changed=%d.%09d content=%q target=%q directory-revision=%x birth=%v change=%v metadata=%v",
+	return fmt.Sprintf("parent=%d name=%q id=%d kind=%v size=%d accessed=%d.%09d changed=%d.%09d content=%q target=%q birth=%v change=%v metadata=%v",
 		r.Parent, r.Name, r.Node.ID, r.Node.Kind, r.Node.Size,
 		r.Node.AccessTime.Unix(), r.Node.AccessTime.Nanosecond(),
 		r.Node.ModTime.Unix(), r.Node.ModTime.Nanosecond(), r.Node.Content, r.Node.LinkTarget,
-		r.Node.DirectoryRevision,
 		wireOptionalInstant(r.Node.BirthTime), wireOptionalInstant(r.Node.ChangeTime), r.Node.Metadata)
 }
 
@@ -1387,44 +1385,26 @@ func TestReplicationNodesRejectInvalidSymbolicLinkPayloads(t *testing.T) {
 	}
 }
 
-func TestReplicationDirectoryRevisionRoundTripsAndRejectsInvalidShapes(t *testing.T) {
-	original := metastore.Node{ID: 7, Kind: storage.NodeDirectory, DirectoryRevision: []byte{0xff, 1}}
-	wire := httprest.NodeOf(original)
-	original.DirectoryRevision[0] = 0
-	if got := wire.Metastore(); !bytes.Equal(got.DirectoryRevision, []byte{0xff, 1}) {
-		t.Fatalf("directory revision changed before round trip: %x", got.DirectoryRevision)
+func TestV4ReplicationKeepsDirectoryRevisionOutOfTheWire(t *testing.T) {
+	wire := httprest.NodeOf(metastore.Node{ID: 2, Kind: storage.NodeDirectory, DirectoryRevision: []byte{1}})
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
 	}
-	got := wire.Metastore()
-	wire.DirectoryRevision[0] = 2
-	if !bytes.Equal(got.DirectoryRevision, []byte{0xff, 1}) {
-		t.Fatalf("metastore node retained wire bytes: %x", got.DirectoryRevision)
+	if strings.Contains(string(encoded), "directory_revision") {
+		t.Fatalf("v4 node exposed a local directory revision: %s", encoded)
 	}
-
-	base := func(kind storage.NodeKind, revision []byte) map[string]any {
-		return map[string]any{
-			"id": 2, "kind": kind, "size": 0,
-			"access_time":        map[string]any{"unix_sec": 0, "nanos": 0},
-			"mod_time":           map[string]any{"unix_sec": 0, "nanos": 0},
-			"content":            []byte{},
-			"directory_revision": revision,
-		}
+	var legacy httprest.Node
+	if err := json.Unmarshal(encoded, &legacy); err != nil {
+		t.Fatalf("v4 node without a directory revision was rejected: %v", err)
 	}
-	for name, node := range map[string]map[string]any{
-		"directory missing revision":   base(storage.NodeDirectory, nil),
-		"directory oversized revision": base(storage.NodeDirectory, make([]byte, storage.MaxObservationTokenBytes+1)),
-		"regular with revision":        base(storage.NodeRegular, []byte{1}),
-	} {
-		t.Run(name, func(t *testing.T) {
-			var decoded httprest.Node
-			if err := decodesInto(t, node, &decoded); err == nil {
-				t.Fatalf("accepted invalid directory revision: %+v", node)
-			}
-		})
+	var extended map[string]any
+	if err := json.Unmarshal(encoded, &extended); err != nil {
+		t.Fatal(err)
 	}
-	valid := base(storage.NodeDirectory, []byte{1})
-	var decoded httprest.Node
-	if err := decodesInto(t, valid, &decoded); err != nil {
-		t.Fatalf("refused valid directory revision: %v", err)
+	extended["directory_revision"] = []byte{1}
+	if err := decodesInto(t, extended, &legacy); err == nil {
+		t.Fatal("v4 decoder accepted a directory revision extension")
 	}
 }
 

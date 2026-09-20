@@ -341,6 +341,9 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if !validFileCapability(r.File) || r.Attr == nil || r.Capabilities == nil || r.Outcome < storage.Opened || r.Outcome > storage.Replaced {
 			return errors.New("atomic open response is incomplete")
 		}
+		if req.Op == storage.OpFileOpenNodeRef && r.Attr.ID != req.Node {
+			return errors.New("node reference open substituted its target")
+		}
 	case storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetNodeAttr, storage.OpFileMutate:
 		if r.Attr == nil {
 			return errors.New("file response carries no attributes")

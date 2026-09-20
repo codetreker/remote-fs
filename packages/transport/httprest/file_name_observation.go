@@ -124,13 +124,37 @@ func (value directoryMetadataOptions) storage() storage.DirectoryMetadataOptions
 
 type observedDirectory struct {
 	Observation directoryObservation `json:"observation"`
-	Entries     []observedEntry      `json:"entries"`
 	Name        *nameObservation     `json:"name,omitempty"`
+	Entries     []observedEntry      `json:"entries"`
 }
 
 type observedEntry struct {
 	RawLeaf canonicalBytes `json:"rawLeaf"`
 	Attr    *Attr          `json:"attr"`
+}
+
+type directoryResponseCollectorKey struct{}
+
+type directoryResponseCollector struct {
+	result  *storage.ListResult
+	retain  bool
+	rawUsed int64
+	names   map[string]struct{}
+	ids     map[uint64]struct{}
+}
+
+func withDirectoryResponseCollector(ctx context.Context, result *storage.ListResult, retain bool) context.Context {
+	return context.WithValue(ctx, directoryResponseCollectorKey{}, &directoryResponseCollector{
+		result: result,
+		retain: retain,
+		names:  make(map[string]struct{}),
+		ids:    make(map[uint64]struct{}),
+	})
+}
+
+func directoryResponseCollectorFrom(ctx context.Context) *directoryResponseCollector {
+	collector, _ := ctx.Value(directoryResponseCollectorKey{}).(*directoryResponseCollector)
+	return collector
 }
 
 func observedDirectoryOf(value storage.ObservedDirectory) *observedDirectory {
@@ -196,7 +220,25 @@ func nameObservationWireBudget(limit int64, directory bool) storage.NameObservat
 	}
 }
 
+func (h *Handler) observationResultContext(ctx context.Context, request fileRequest) context.Context {
+	limit := min(request.ResultBytes, h.maxBodyBytes)
+	if request.Op == storage.OpFileObserveName || (request.Op == storage.OpFileObserveDirectoryMetadata && request.DirectoryMetadata.IncludeName) {
+		ctx = storage.WithNameObservationBudget(ctx, nameObservationWireBudget(limit, request.Op == storage.OpFileObserveDirectoryMetadata))
+	}
+	if request.Op == storage.OpFileReadDirNode || request.Op == storage.OpFileObserveDirectoryMetadata {
+		ctx = storage.WithBoundedListResult(ctx, limit)
+	}
+	return ctx
+}
+
 func newObservedDirectoryResult(limit int64) (*storage.ListResult, error) {
+	return newObservedDirectoryResultWithRawLimit(limit, storage.MaxDirectoryBytes)
+}
+
+func newObservedDirectoryResultWithRawLimit(limit, rawLimit int64) (*storage.ListResult, error) {
+	if rawLimit <= 0 {
+		return nil, syscall.EINVAL
+	}
 	maximum := fileResponse{
 		Epoch: math.MaxUint64,
 		Data:  []byte{},
@@ -209,6 +251,7 @@ func newObservedDirectoryResult(limit int64) (*storage.ListResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	rawUsed := int64(0)
 	return storage.NewListResult(limit, int64(len(encoded)), func(index int, nameBytes, metadataBytes int64, attr storage.Attr) (int64, error) {
 		if index >= storage.MaxDirectoryEntries {
 			return 0, syscall.EFBIG
@@ -216,6 +259,14 @@ func newObservedDirectoryResult(limit int64) (*storage.ListResult, error) {
 		if nameBytes > storage.MaxLeafBytes {
 			return 0, syscall.ENAMETOOLONG
 		}
+		rawBytes, err := storage.ObservedEntryBytes(nameBytes, metadataBytes)
+		if err != nil {
+			return 0, err
+		}
+		if rawBytes > rawLimit-rawUsed {
+			return 0, syscall.EFBIG
+		}
+		rawUsed += rawBytes
 		encodedAttr, err := json.Marshal(AttrOf(attr))
 		if err != nil {
 			return 0, err
@@ -310,23 +361,35 @@ func (session *remoteFileSession) CheckDirectoryMetadataObservation() error {
 }
 
 func (session *remoteFileSession) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
-	if err := session.CheckNamespaceAccess(); err != nil {
-		return storage.ObservedDirectory{}, err
-	}
-	if err := target.Check(); err != nil {
-		return storage.ObservedDirectory{}, err
-	}
-	response, err := session.call(ctx, fileRequest{Op: storage.OpFileReadDirNode, Directory: &target, ResultBytes: session.storage.maxBodyBytes})
+	result, err := storage.NewListResult(storage.MaxDirectoryBytes, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		return storage.ObservedEntryBytes(nameBytes, metadataBytes)
+	})
 	if err != nil {
 		return storage.ObservedDirectory{}, err
 	}
-	return response.Directory.storage(), nil
+	observation, err := session.readDirNodeBounded(ctx, target, result)
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	entries, err := result.Entries()
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	observed := storage.ObservedDirectory{Observation: observation, Entries: make([]storage.ObservedEntry, 0, len(entries))}
+	for _, entry := range entries {
+		observed.Entries = append(observed.Entries, storage.ObservedEntry{RawLeaf: []byte(entry.Name), Attr: entry.Attr})
+	}
+	return observed, nil
 }
 
 func (session *remoteFileSession) ReadDirNodeBounded(ctx context.Context, target storage.DirectoryTarget, result *storage.ListResult) (observation storage.DirectoryObservation, returned error) {
 	if result == nil {
 		return observation, syscall.EINVAL
 	}
+	return session.readDirNodeBounded(ctx, target, result)
+}
+
+func (session *remoteFileSession) readDirNodeBounded(ctx context.Context, target storage.DirectoryTarget, result *storage.ListResult) (observation storage.DirectoryObservation, returned error) {
 	defer func() {
 		if returned != nil {
 			result.Fail(returned)
@@ -335,21 +398,23 @@ func (session *remoteFileSession) ReadDirNodeBounded(ctx context.Context, target
 	if err := session.CheckNamespaceAccess(); err != nil {
 		return observation, err
 	}
+	if err := session.CheckDirectoryMetadataObservation(); err != nil {
+		return observation, err
+	}
 	if err := target.Check(); err != nil {
 		return observation, err
 	}
 	limit := min(session.storage.maxBodyBytes, result.MaxBytes())
+	if outer, ok := storage.ListResultByteLimit(ctx); ok {
+		limit = min(limit, outer)
+	}
 	if limit <= 0 {
 		return observation, syscall.EFBIG
 	}
+	ctx = withDirectoryResponseCollector(ctx, result, false)
 	response, err := session.call(ctx, fileRequest{Op: storage.OpFileReadDirNode, Directory: &target, ResultBytes: limit})
 	if err != nil {
 		return observation, err
-	}
-	for _, entry := range response.Directory.Entries {
-		if err := result.Add(storage.Entry{Name: string(entry.RawLeaf), Attr: entry.Attr.Storage()}); err != nil {
-			return observation, err
-		}
 	}
 	return response.Directory.Observation.storage(), nil
 }
@@ -373,30 +438,20 @@ func (session *remoteFileSession) ObserveDirectoryMetadata(ctx context.Context, 
 		return observation, err
 	}
 	limit := min(session.storage.maxBodyBytes, result.MaxBytes())
+	if outer, ok := storage.ListResultByteLimit(ctx); ok {
+		limit = min(limit, outer)
+	}
 	if limit <= 0 {
 		return observation, syscall.EFBIG
 	}
+	ctx = withDirectoryResponseCollector(ctx, result, false)
 	response, err := session.call(ctx, fileRequest{Op: storage.OpFileObserveDirectoryMetadata, Directory: &target, DirectoryMetadata: directoryMetadataOptionsOf(options), ResultBytes: limit})
 	if err != nil {
 		return observation, err
 	}
 	if response.Directory.Name != nil {
 		name := response.Directory.Name.storage()
-		scalar := name
-		scalar.RawLeaf = nil
-		charge, err := storage.CheckNameObservationBudget(ctx, scalar, int64(len(name.RawLeaf)))
-		if err != nil {
-			return observation, err
-		}
-		if err := result.ReservePrefix(charge); err != nil {
-			return observation, err
-		}
 		observation.Name = &name
-	}
-	for _, entry := range response.Directory.Entries {
-		if err := result.Add(storage.Entry{Name: string(entry.RawLeaf), Attr: entry.Attr.Storage()}); err != nil {
-			return storage.DirectoryMetadataObservation{}, err
-		}
 	}
 	observation.Observation = response.Directory.Observation.storage()
 	return observation, nil
@@ -424,11 +479,6 @@ func (file *remoteFile) ObserveName(ctx context.Context, guards *storage.Namespa
 	observation := response.NameObservation.storage()
 	if observation.NodeID != file.node {
 		return storage.NameObservation{}, unreachable(Request{Op: OpFile}, errors.New("name observation substituted reference identity"))
-	}
-	scalar := observation
-	scalar.RawLeaf = nil
-	if _, err := storage.CheckNameObservationBudget(ctx, scalar, int64(len(observation.RawLeaf))); err != nil {
-		return storage.NameObservation{}, err
 	}
 	return observation, nil
 }

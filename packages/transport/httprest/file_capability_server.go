@@ -209,6 +209,11 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 					identityInvalid = true
 					openErr = errors.Join(openErr, errors.New("opened reference substituted its requested node identity"), syscall.EIO)
 				}
+			case storage.OpFileOpenNodeRef:
+				if response.Attr == nil || response.Attr.ID != node || node != request.Node {
+					identityInvalid = true
+					openErr = errors.Join(openErr, errors.New("opened node reference substituted its requested identity"), syscall.EIO)
+				}
 			default:
 				if response.Attr == nil || response.Attr.ID != node {
 					identityInvalid = true
@@ -281,6 +286,11 @@ func (h *Handler) performSessionCapability(ctx context.Context, session storage.
 			}
 			observation, err := capability.ReadDirNodeBounded(ctx, *req.Directory, result)
 			if err != nil {
+				result.Fail(err)
+				return response, err
+			}
+			if observation.ParentID != req.Directory.NodeID {
+				err := errors.Join(errors.New("directory observation substituted its target identity"), syscall.EIO)
 				result.Fail(err)
 				return response, err
 			}

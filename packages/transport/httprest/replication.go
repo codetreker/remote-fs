@@ -98,14 +98,8 @@ func (n Node) check() error {
 	} else if len(n.LinkTarget) != 0 {
 		return fmt.Errorf("node %d carries a symbolic-link target for kind %d", n.ID, n.Kind)
 	}
-	if len(n.DirectoryRevision) > storage.MaxObservationTokenBytes {
-		return fmt.Errorf("node %d carries an oversized directory revision", n.ID)
-	}
-	if n.Kind == storage.NodeDirectory && len(n.DirectoryRevision) == 0 {
-		return fmt.Errorf("directory node %d carries no directory revision", n.ID)
-	}
-	if n.Kind != storage.NodeDirectory && len(n.DirectoryRevision) != 0 {
-		return fmt.Errorf("non-directory node %d carries a directory revision", n.ID)
+	if len(n.DirectoryRevision) != 0 {
+		return errors.New("node carries unsupported directory revision")
 	}
 	return nil
 }
@@ -120,34 +114,32 @@ func checkWireTime(name string, instant Time) error {
 // NodeOf renders n for the wire.
 func NodeOf(n metastore.Node) *Node {
 	return &Node{
-		ID:                n.ID,
-		Kind:              n.Kind,
-		BirthTime:         optionalTimeOf(n.BirthTime),
-		ChangeTime:        optionalTimeOf(n.ChangeTime),
-		Metadata:          metadataOf(n.Metadata),
-		Size:              n.Size,
-		AccessTime:        TimeOf(n.AccessTime),
-		ModTime:           TimeOf(n.ModTime),
-		Content:           append([]byte{}, n.Content...),
-		LinkTarget:        append([]byte{}, n.LinkTarget...),
-		DirectoryRevision: append([]byte{}, n.DirectoryRevision...),
+		ID:         n.ID,
+		Kind:       n.Kind,
+		BirthTime:  optionalTimeOf(n.BirthTime),
+		ChangeTime: optionalTimeOf(n.ChangeTime),
+		Metadata:   metadataOf(n.Metadata),
+		Size:       n.Size,
+		AccessTime: TimeOf(n.AccessTime),
+		ModTime:    TimeOf(n.ModTime),
+		Content:    append([]byte{}, n.Content...),
+		LinkTarget: append([]byte{}, n.LinkTarget...),
 	}
 }
 
 // Metastore returns the node n carries.
 func (n Node) Metastore() metastore.Node {
 	return metastore.Node{
-		ID:                n.ID,
-		Kind:              n.Kind,
-		BirthTime:         optionalTimeStorage(n.BirthTime),
-		ChangeTime:        optionalTimeStorage(n.ChangeTime),
-		Metadata:          metadataStorage(n.Metadata),
-		Size:              n.Size,
-		AccessTime:        n.AccessTime.Time(),
-		ModTime:           n.ModTime.Time(),
-		Content:           metastore.Key(n.Content),
-		LinkTarget:        append([]byte{}, n.LinkTarget...),
-		DirectoryRevision: append([]byte{}, n.DirectoryRevision...),
+		ID:         n.ID,
+		Kind:       n.Kind,
+		BirthTime:  optionalTimeStorage(n.BirthTime),
+		ChangeTime: optionalTimeStorage(n.ChangeTime),
+		Metadata:   metadataStorage(n.Metadata),
+		Size:       n.Size,
+		AccessTime: n.AccessTime.Time(),
+		ModTime:    n.ModTime.Time(),
+		Content:    metastore.Key(n.Content),
+		LinkTarget: append([]byte{}, n.LinkTarget...),
 	}
 }
 
