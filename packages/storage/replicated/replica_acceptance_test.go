@@ -54,12 +54,15 @@ func TestRemoteChangeReachesReplicaDuringContinuousListings(t *testing.T) {
 	stopReaders := func() { stopped.Store(true) }
 	var group sync.WaitGroup
 	var completed atomic.Int64
+	var firstCompleted atomic.Int64
 	failures := make(chan error, readers)
-	startedReaders := make(chan struct{}, readers)
 	listingProgress := make(chan struct{}, 1)
-	startLoad := make(chan struct{})
-	var releaseLoadOnce sync.Once
-	releaseLoad := func() { releaseLoadOnce.Do(func() { close(startLoad) }) }
+	rendezvous := s.authorityGate.rendezvousAtBackend(readers)
+	defer func() {
+		rendezvous.Release()
+		stopReaders()
+		group.Wait()
+	}()
 	for range readers {
 		group.Go(func() {
 			first := true
@@ -75,13 +78,8 @@ func TestRemoteChangeReachesReplicaDuringContinuousListings(t *testing.T) {
 				}
 				completed.Add(1)
 				if first {
-					startedReaders <- struct{}{}
+					firstCompleted.Add(1)
 					first = false
-					select {
-					case <-startLoad:
-					case <-t.Context().Done():
-						return
-					}
 				}
 				select {
 				case listingProgress <- struct{}{}:
@@ -90,46 +88,43 @@ func TestRemoteChangeReachesReplicaDuringContinuousListings(t *testing.T) {
 			}
 		})
 	}
-	defer func() { releaseLoad(); stopReaders(); group.Wait() }()
-	for range readers {
-		select {
-		case <-startedReaders:
-		case err := <-failures:
-			t.Fatalf("initial directory listing: %v", err)
-		}
-	}
-	rendezvous := s.authorityGate.rendezvousAtBackend(readers)
-	defer rendezvous.Release()
-	before := completed.Load()
-	releaseLoad()
 	select {
 	case <-rendezvous.listsArrived:
 	case err := <-failures:
-		t.Fatalf("arming continuous directory load: %v", err)
+		t.Fatalf("initial directory listing before backend rendezvous: %v", err)
 	case <-t.Context().Done():
 		t.Fatal(context.Cause(t.Context()))
 	}
-	writeDone := make(chan error, 1)
-	group.Go(func() { writeDone <- s.elsewhere.Write(t.Context(), "arrived", []byte("new content")) })
+	type writeResult struct {
+		completed time.Time
+		err       error
+	}
+	writeDone := make(chan writeResult, 1)
+	group.Go(func() {
+		err := s.elsewhere.Write(t.Context(), "arrived", []byte("new content"))
+		writeDone <- writeResult{completed: time.Now(), err: err}
+	})
 	select {
 	case <-rendezvous.writeArrived:
-	case err := <-writeDone:
-		t.Fatalf("authority write ended before reaching the backend rendezvous: %v", err)
+	case result := <-writeDone:
+		t.Fatalf("authority write ended before reaching the backend rendezvous: %v", result.err)
 	case <-t.Context().Done():
 		t.Fatal(context.Cause(t.Context()))
 	}
+	before := completed.Load()
 	rendezvous.Release()
+	var written time.Time
 	select {
-	case err := <-writeDone:
-		if err != nil {
-			t.Fatalf("writing %q into the volume: %v", "arrived", err)
+	case result := <-writeDone:
+		if result.err != nil {
+			t.Fatalf("writing %q into the volume: %v", "arrived", result.err)
 		}
+		written = result.completed
 	case err := <-failures:
 		t.Fatalf("concurrent listing during the remote write: %v", err)
 	case <-t.Context().Done():
 		t.Fatal(context.Cause(t.Context()))
 	}
-	written := time.Now()
 	postWrite := completed.Load()
 	ctx, cancel := context.WithDeadline(t.Context(), written.Add(time.Second))
 	defer cancel()
@@ -172,6 +167,9 @@ func TestRemoteChangeReachesReplicaDuringContinuousListings(t *testing.T) {
 	close(failures)
 	for err := range failures {
 		t.Errorf("concurrent listing: %v", err)
+	}
+	if got := firstCompleted.Load(); got != readers {
+		t.Errorf("completed %d initial directory listings, want %d", got, readers)
 	}
 	t.Logf("remote change visible in %v; 128 readers completed %d listings of 4096 files during that interval", visible, during)
 }
