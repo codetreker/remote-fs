@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"syscall"
 	"unicode/utf8"
 )
@@ -435,11 +437,19 @@ type FileActionReceipt struct {
 	Outcome   FileActionOutcome
 }
 
-const MaxDeleteIntentIDBytes = 128
+const DeleteIntentIDBytes = 32
 
 // DeleteIntentID identifies one accepted close-time deletion obligation across
 // process and authority restart. It is opaque and caller-generated.
 type DeleteIntentID string
+
+func NewDeleteIntentID() (DeleteIntentID, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return DeleteIntentID(hex.EncodeToString(nonce[:])), nil
+}
 
 type DeleteIntentOutcome uint8
 

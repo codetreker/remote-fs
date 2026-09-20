@@ -17,7 +17,7 @@ func validFileAction(t *testing.T) FileActionID {
 	return action
 }
 
-const validDeleteIntent DeleteIntentID = "delete-intent"
+const validDeleteIntent DeleteIntentID = "0123456789abcdef0123456789abcdef"
 
 func TestFileActionAndDurableDeleteIdentitiesAreBounded(t *testing.T) {
 	action := validFileAction(t)
@@ -29,12 +29,16 @@ func TestFileActionAndDurableDeleteIdentitiesAreBounded(t *testing.T) {
 			t.Fatalf("invalid file action accepted: %q", invalid)
 		}
 	}
-	for _, intent := range []DeleteIntentID{validDeleteIntent, DeleteIntentID(strings.Repeat("x", MaxDeleteIntentIDBytes))} {
+	generated, err := NewDeleteIntentID()
+	if err != nil || generated.Check() != nil || generated == validDeleteIntent {
+		t.Fatalf("generated delete intent = %q, %v", generated, err)
+	}
+	for _, intent := range []DeleteIntentID{validDeleteIntent, generated} {
 		if err := intent.Check(); err != nil {
 			t.Fatalf("valid delete intent %q: %v", intent, err)
 		}
 	}
-	for _, invalid := range []DeleteIntentID{"", "bad\x00intent", DeleteIntentID(string([]byte{0xff})), DeleteIntentID(strings.Repeat("x", MaxDeleteIntentIDBytes+1))} {
+	for _, invalid := range []DeleteIntentID{"", "0123456789ABCDEF0123456789ABCDEF", "0123456789abcdef0123456789abcdeg", DeleteIntentID(strings.Repeat("x", DeleteIntentIDBytes+1))} {
 		if !errors.Is(invalid.Check(), syscall.EINVAL) {
 			t.Fatalf("invalid delete intent accepted: %q", invalid)
 		}
@@ -104,7 +108,7 @@ func TestIdentityParentedValuesRejectMalformedInputs(t *testing.T) {
 
 func TestAtomicOpenAndNodeReferenceValidateEffects(t *testing.T) {
 	base := OpenAtOptions{
-		Read: true, Target: ChildCondition{State: Any}, Existing: Keep,
+		Read: true, Target: ChildCondition{State: Any}, Existing: Keep, Action: validFileAction(t),
 		Use: UseClaim{Uses: ReadData},
 	}
 	create := base
@@ -156,7 +160,7 @@ func TestAtomicOpenAndNodeReferenceValidateEffects(t *testing.T) {
 
 	directory := NodeRefOptions{
 		Kind: NodeDirectory, Target: ChildCondition{State: Any},
-		Use: UseClaim{Uses: ReadEntries}, MetadataAccess: ReadMetadata,
+		Action: validFileAction(t), Use: UseClaim{Uses: ReadEntries}, MetadataAccess: ReadMetadata,
 	}
 	symlink := NodeRefOptions{
 		Kind: NodeSymlink, Target: ChildCondition{State: Absent}, Create: true, Action: validFileAction(t),
@@ -200,6 +204,7 @@ func TestAtomicOpenAndNodeReferenceValidateEffects(t *testing.T) {
 		t.Fatalf("metadata-only reference refused compatibility data claims: %v", err)
 	}
 	for _, options := range []OpenAtOptions{
+		{Read: true, Target: ChildCondition{State: Any}, Existing: Keep, Use: UseClaim{Uses: ReadData}},
 		{Read: true, Create: true, Target: ChildCondition{State: Any}, Existing: Keep, Use: UseClaim{Uses: ReadData}},
 		{Read: true, Write: true, Target: ChildCondition{State: Any}, Existing: ResetContent, Use: UseClaim{Uses: ReadData | WriteData}},
 	} {
@@ -207,8 +212,13 @@ func TestAtomicOpenAndNodeReferenceValidateEffects(t *testing.T) {
 			t.Fatalf("effectful open without action accepted: %+v", options)
 		}
 	}
-	if !errors.Is((NodeRefOptions{Kind: NodeDirectory, Target: ChildCondition{State: Absent}, Create: true}).Check(), syscall.EINVAL) {
-		t.Fatal("effectful child reference without action accepted")
+	for _, options := range []NodeRefOptions{
+		{Kind: NodeDirectory, Target: ChildCondition{State: Any}},
+		{Kind: NodeDirectory, Target: ChildCondition{State: Absent}, Create: true},
+	} {
+		if !errors.Is(options.Check(), syscall.EINVAL) {
+			t.Fatalf("node reference without action accepted: %+v", options)
+		}
 	}
 }
 
@@ -357,8 +367,8 @@ func TestExpectedMetadataRequiresSameNodeAndBoundsEveryAdmission(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			target := ChildCondition{State: SameNode, NodeID: 7, ExpectedMetadata: test.expected}
-			open := OpenAtOptions{Read: true, Existing: Keep, Target: target, Use: UseClaim{Uses: ReadData}}
-			node := NodeRefOptions{Kind: NodeRegular, Target: target}
+			open := OpenAtOptions{Read: true, Existing: Keep, Target: target, Action: action, Use: UseClaim{Uses: ReadData}}
+			node := NodeRefOptions{Kind: NodeRegular, Target: target, Action: action}
 			mutation := FileMutation{Action: action, Kind: MutateAttributes, ExpectedMetadata: test.expected}
 			for kind, err := range map[string]error{"open": open.Check(), "node": node.Check(), "mutation": mutation.Check()} {
 				if !errors.Is(err, test.want) {

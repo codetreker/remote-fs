@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"math"
 	"syscall"
-	"unicode/utf8"
 )
 
 const (
@@ -91,7 +90,7 @@ func (o OpenAtOptions) Check() error {
 	if err := o.Target.Check(); err != nil {
 		return err
 	}
-	if err := checkFileAction(o.Action, o.Create || o.Existing != Keep || o.CloseIntent != nil); err != nil {
+	if err := o.Action.Check(); err != nil {
 		return err
 	}
 	if err := o.Use.Check(); err != nil {
@@ -122,7 +121,7 @@ func (o NodeRefOptions) Check() error {
 	if err := o.Target.Check(); err != nil {
 		return err
 	}
-	if err := checkFileAction(o.Action, o.Create || o.CloseIntent != nil); err != nil {
+	if err := o.Action.Check(); err != nil {
 		return err
 	}
 	if err := o.Use.Check(); err != nil {
@@ -326,16 +325,6 @@ func (c FileMutation) CheckDataLimit(maxBytes int64) error {
 	return c.Check()
 }
 
-func checkFileAction(action FileActionID, required bool) error {
-	if action == "" {
-		if required {
-			return syscall.EINVAL
-		}
-		return nil
-	}
-	return action.Check()
-}
-
 func (r FileActionReceipt) Check() error {
 	if err := r.Action.Check(); err != nil {
 		return err
@@ -359,11 +348,11 @@ func (r FileActionReceipt) Check() error {
 }
 
 func (id DeleteIntentID) Check() error {
-	if len(id) == 0 || len(id) > MaxDeleteIntentIDBytes || !utf8.ValidString(string(id)) {
+	if len(id) != DeleteIntentIDBytes {
 		return syscall.EINVAL
 	}
 	for i := range id {
-		if id[i] == 0 {
+		if id[i] < '0' || id[i] > '9' && id[i] < 'a' || id[i] > 'f' {
 			return syscall.EINVAL
 		}
 	}
