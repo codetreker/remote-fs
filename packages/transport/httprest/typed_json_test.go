@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -137,5 +140,60 @@ func TestV4ErrorEnvelopeRejectsAmbiguousMembers(t *testing.T) {
 		if !errors.As(err, &operation) || !operation.unknown || !errors.Is(err, syscall.EIO) {
 			t.Fatalf("ambiguous error %s decoded as %v", body, err)
 		}
+	}
+}
+
+func TestListingRequiredValuesRejectNull(t *testing.T) {
+	attr := AttrOf(storage.Attr{
+		ID: 1, Kind: storage.NodeRegular, Size: 1,
+		AccessTime: time.Unix(1, 2), ModTime: time.Unix(3, 4),
+		Metadata: map[string]storage.OpaquePayload{"client.v1": {Version: []byte{1}, Data: []byte("a")}},
+	})
+	encoded, err := json.Marshal(ListResponse{Entries: []Entry{{Name: []byte("a"), Attr: attr}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := string(encoded)
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{"name", strings.Replace(valid, `"name":"YQ=="`, `"name":null`, 1)},
+		{"id", strings.Replace(valid, `"id":1`, `"id":null`, 1)},
+		{"kind", strings.Replace(valid, `"kind":1`, `"kind":null`, 1)},
+		{"size", strings.Replace(valid, `"size":1`, `"size":null`, 1)},
+		{"seconds", strings.Replace(valid, `"unix_sec":1`, `"unix_sec":null`, 1)},
+		{"nanoseconds", strings.Replace(valid, `"nanos":2`, `"nanos":null`, 1)},
+		{"metadata version", strings.Replace(valid, `"version":"AQ=="`, `"version":null`, 1)},
+		{"metadata data", strings.Replace(valid, `"data":"YQ=="`, `"data":null`, 1)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var response ListResponse
+			if err := json.Unmarshal([]byte(test.body), &response); err == nil {
+				t.Fatal("ListResponse accepted null required value")
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set(HeaderProtocol, Version)
+				w.Header().Set("Content-Type", contentJSON)
+				w.Header().Set("Content-Length", strconv.Itoa(len(test.body)))
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(test.body))
+			}))
+			defer server.Close()
+			client, err := Dial(server.URL, server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := storage.NewListResult(1<<20, 0, func(int, int64, int64, storage.Attr) (int64, error) { return 1, nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := client.ListBounded(t.Context(), "", result); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("ListBounded null error=%v", err)
+			}
+			if _, err := result.Entries(); err == nil {
+				t.Fatal("ListBounded exposed a partial result after null")
+			}
+		})
 	}
 }

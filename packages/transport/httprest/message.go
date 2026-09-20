@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"strconv"
 	"time"
 	"unicode/utf8"
 
@@ -269,6 +271,7 @@ func (e *Entry) UnmarshalJSON(data []byte) error {
 		return errors.New("listing entry JSON must be UTF-8")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
 	decoded, err := decodeEntry(decoder)
 	if err != nil {
 		return err
@@ -298,8 +301,8 @@ func decodeEntry(decoder *json.Decoder) (Entry, error) {
 				return Entry{}, errors.New("the listing entry repeats its name")
 			}
 			hasName = true
-			var encoded string
-			if err := decoder.Decode(&encoded); err != nil {
+			encoded, err := decodeListingString(decoder)
+			if err != nil {
 				return Entry{}, errors.New("the listing entry name is not base64 text")
 			}
 			result.Name, err = base64.StdEncoding.Strict().DecodeString(encoded)
@@ -351,11 +354,17 @@ func decodeListingAttr(decoder *json.Decoder) (Attr, error) {
 		seen[name] = true
 		switch name {
 		case "id":
-			err = decoder.Decode(&result.ID)
+			result.ID, err = decodeListingUint64(decoder)
 		case "kind":
-			err = decoder.Decode(&result.Kind)
+			var value uint64
+			value, err = decodeListingUint64(decoder)
+			if value > 255 {
+				err = errors.New("listing node kind exceeds its wire range")
+			} else {
+				result.Kind = storage.NodeKind(value)
+			}
 		case "size":
-			err = decoder.Decode(&result.Size)
+			result.Size, err = decodeListingInt64(decoder)
 		case "access_time":
 			result.AccessTime, err = decodeListingTime(decoder)
 		case "mod_time":
@@ -407,13 +416,19 @@ func decodeListingTime(decoder *json.Decoder) (Time, error) {
 				return Time{}, errors.New("listing time repeats its seconds")
 			}
 			hasSeconds = true
-			err = decoder.Decode(&result.UnixSec)
+			result.UnixSec, err = decodeListingInt64(decoder)
 		case "nanos":
 			if hasNanos {
 				return Time{}, errors.New("listing time repeats its nanoseconds")
 			}
 			hasNanos = true
-			err = decoder.Decode(&result.Nanos)
+			var value int64
+			value, err = decodeListingInt64(decoder)
+			if value < math.MinInt32 || value > math.MaxInt32 {
+				err = errors.New("listing time nanoseconds exceed their wire range")
+			} else {
+				result.Nanos = int32(value)
+			}
 		default:
 			return Time{}, fmt.Errorf("listing time carries unknown field %q", field)
 		}
@@ -505,8 +520,8 @@ func decodeListingPayload(decoder *json.Decoder) (OpaquePayload, error) {
 }
 
 func decodeListingBytes(decoder *json.Decoder, field string, maximum int, nonempty bool) ([]byte, error) {
-	var encoded string
-	if err := decoder.Decode(&encoded); err != nil {
+	encoded, err := decodeListingString(decoder)
+	if err != nil {
 		return nil, errors.New("listing bytes are not base64 text")
 	}
 	if len(encoded) > base64.StdEncoding.EncodedLen(maximum) {
@@ -520,6 +535,50 @@ func decodeListingBytes(decoder *json.Decoder, field string, maximum int, nonemp
 		return nil, fmt.Errorf("listing metadata %s is empty", field)
 	}
 	return decoded, nil
+}
+
+func decodeListingString(decoder *json.Decoder) (string, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return "", err
+	}
+	value, ok := token.(string)
+	if !ok {
+		return "", errors.New("required listing text is not a string")
+	}
+	return value, nil
+}
+
+func decodeListingInt64(decoder *json.Decoder) (int64, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return 0, err
+	}
+	number, ok := token.(json.Number)
+	if !ok {
+		return 0, errors.New("required listing number is not an integer")
+	}
+	value, err := strconv.ParseInt(string(number), 10, 64)
+	if err != nil {
+		return 0, errors.New("required listing number is outside its integer range")
+	}
+	return value, nil
+}
+
+func decodeListingUint64(decoder *json.Decoder) (uint64, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return 0, err
+	}
+	number, ok := token.(json.Number)
+	if !ok {
+		return 0, errors.New("required listing number is not an integer")
+	}
+	value, err := strconv.ParseUint(string(number), 10, 64)
+	if err != nil {
+		return 0, errors.New("required listing number is outside its integer range")
+	}
+	return value, nil
 }
 
 // EntriesOf renders a listing for the wire. The result is never nil, so that an empty
@@ -575,6 +634,7 @@ func decodeListResponse(data []byte, add func(Entry) error) error {
 		return errors.New("listing response JSON must be UTF-8")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
 	token, err := decoder.Token()
 	if err != nil || token != json.Delim('{') {
 		return errors.New("the listing response is not an object")
