@@ -35,7 +35,7 @@ Status: implemented
 
 [有界的 Read 与 List response](./2026-09-04-bounded-read-and-list-responses.md)同样是 **Guarantee**：server 的成对 volume 必须实现 `storage.BoundedStorage`，调用时把预算传到产生结果的一侧，并以独立的 response operation、waiter 与 aggregate byte admission 约束 handler 持有的结果。localdisk 在 envelope 已验证、payload allocation 和 read admission 之前执行 read 上限；SQLite 按序逐项填充有界 listing result，不先建立完整中间 slice。
 
-压缩、加密、按内容去重、pack/compaction、远程文件系统上的 root、多个 active owner，以及 active-active 共享同一份本地 store 都是 **Feature**。它们可以各自增加；当前没有对应能力，已知远程文件系统类型与第二个 owner 在打开时明确失败，未知文件系统仍须承担未被探针证明的 crash semantics。跨平台实现同样不在范围内，系统当前只承诺 Linux（R-INT-8）。
+压缩、加密、按内容去重、pack/compaction、远程文件系统上的 root、多个 active owner，以及 active-active 共享同一份本地 store 都是 **Feature**。它们可以各自增加；当前没有对应能力，已知远程文件系统类型与第二个 owner 在打开时明确失败，未知文件系统仍须承担未被探针证明的 crash semantics。local-store 的跨平台实现同样不在范围内；R-INT-13 的本地持久 server 形态只承诺 Linux，客户端平台范围由 R-INT-8 独立定义。
 
 下列延期属于 **Shape**，因此当前格式受这些禁令约束：
 
