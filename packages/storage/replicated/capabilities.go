@@ -57,6 +57,9 @@ func (s *fileSession) CheckMetadataAccess() error {
 
 func (s *fileSession) SetMetadata(ctx context.Context, node uint64, namespace string, version, data []byte) (storage.OpaquePayload, error) {
 	return sessionCapability(ctx, s, true, func(ctx context.Context, c httprest.MetadataAccessWithBarrier) (storage.OpaquePayload, error) {
+		if err := c.CheckMetadataAccess(); err != nil {
+			return storage.OpaquePayload{}, err
+		}
 		return capabilityMutation(ctx, s, "set-node-metadata", func(ctx context.Context) (storage.OpaquePayload, *httprest.MutationBarrier, error) {
 			return c.SetMetadataWithBarrier(ctx, node, namespace, version, data)
 		})
@@ -69,12 +72,18 @@ func (s *fileSession) CheckUseOwners() error {
 
 func (s *fileSession) NewUseOwner(ctx context.Context, node uint64, scope storage.UseScope, options storage.OwnerOptions) (storage.UseOwner, error) {
 	return sessionCapability(ctx, s, false, func(ctx context.Context, c storage.UseOwners) (storage.UseOwner, error) {
+		if err := c.CheckUseOwners(); err != nil {
+			return 0, err
+		}
 		return c.NewUseOwner(ctx, node, scope, options)
 	})
 }
 
 func (s *fileSession) RetireUseOwner(ctx context.Context, owner storage.UseOwner) error {
 	_, err := sessionCapability(ctx, s, false, func(ctx context.Context, c storage.UseOwners) (struct{}, error) {
+		if err := c.CheckUseOwners(); err != nil {
+			return struct{}{}, err
+		}
 		return struct{}{}, c.RetireUseOwner(ctx, owner)
 	})
 	return err
@@ -86,30 +95,45 @@ func (s *fileSession) CheckRangeControl() error {
 
 func (s *fileSession) GetConflict(ctx context.Context, owner storage.UseOwner, command storage.RangeCommand) (storage.RangeConflict, error) {
 	return sessionCapability(ctx, s, false, func(ctx context.Context, c storage.RangeControl) (storage.RangeConflict, error) {
+		if err := c.CheckRangeControl(); err != nil {
+			return storage.RangeConflict{}, err
+		}
 		return c.GetConflict(ctx, owner, command)
 	})
 }
 
 func (s *fileSession) Apply(ctx context.Context, owner storage.UseOwner, commands []storage.RangeCommand, request storage.LockRequestID) (storage.RangeAttempt, error) {
 	return sessionCapability(ctx, s, false, func(ctx context.Context, c storage.RangeControl) (storage.RangeAttempt, error) {
+		if err := c.CheckRangeControl(); err != nil {
+			return storage.RangeAttempt{}, err
+		}
 		return c.Apply(ctx, owner, commands, request)
 	})
 }
 
 func (s *fileSession) Query(ctx context.Context, owner storage.UseOwner, request storage.LockRequestID) (storage.RangeAttempt, error) {
 	return sessionCapability(ctx, s, false, func(ctx context.Context, c storage.RangeControl) (storage.RangeAttempt, error) {
+		if err := c.CheckRangeControl(); err != nil {
+			return storage.RangeAttempt{}, err
+		}
 		return c.Query(ctx, owner, request)
 	})
 }
 
 func (s *fileSession) Cancel(ctx context.Context, owner storage.UseOwner, request storage.LockRequestID) (storage.RangeAttempt, error) {
 	return sessionCapability(ctx, s, false, func(ctx context.Context, c storage.RangeControl) (storage.RangeAttempt, error) {
+		if err := c.CheckRangeControl(); err != nil {
+			return storage.RangeAttempt{}, err
+		}
 		return c.Cancel(ctx, owner, request)
 	})
 }
 
 func (s *fileSession) Drop(ctx context.Context, owner storage.UseOwner, domain storage.ConflictDomain) error {
 	_, err := sessionCapability(ctx, s, false, func(ctx context.Context, c storage.RangeControl) (struct{}, error) {
+		if err := c.CheckRangeControl(); err != nil {
+			return struct{}{}, err
+		}
 		return struct{}{}, c.Drop(ctx, owner, domain)
 	})
 	return err
@@ -138,6 +162,9 @@ func (f *retainedFile) CheckScopedReference() error {
 
 func (f *retainedFile) Scope(ctx context.Context) (storage.UseScope, error) {
 	return referenceCapability(ctx, f, func(ctx context.Context, c storage.ScopedReference) (storage.UseScope, error) {
+		if err := c.CheckScopedReference(); err != nil {
+			return storage.UseScope{}, err
+		}
 		return c.Scope(ctx)
 	})
 }
@@ -148,6 +175,9 @@ func (f *retainedFile) CheckMetadataAccess() error {
 
 func (f *retainedFile) SetMetadata(ctx context.Context, namespace string, version, data []byte) (storage.OpaquePayload, error) {
 	return referenceCapability(ctx, f, func(ctx context.Context, c httprest.ReferenceMetadataAccessWithBarrier) (storage.OpaquePayload, error) {
+		if err := c.CheckMetadataAccess(); err != nil {
+			return storage.OpaquePayload{}, err
+		}
 		return capabilityMutation(ctx, f.session, "set-reference-metadata", func(ctx context.Context) (storage.OpaquePayload, *httprest.MutationBarrier, error) {
 			return c.SetMetadataWithBarrier(ctx, namespace, version, data)
 		})

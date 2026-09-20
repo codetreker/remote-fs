@@ -15,9 +15,12 @@ var (
 )
 
 func (fs *fileSession) CheckMetadataAccess() error {
-	native, ok := fs.native.(storage.MetadataAccess)
+	native, ok := fs.native.(metadataAuthority)
 	if !ok {
 		return syscall.EOPNOTSUPP
+	}
+	if err := native.CheckFileStore(); err != nil {
+		return err
 	}
 	return native.CheckMetadataAccess()
 }
@@ -34,7 +37,7 @@ func (fs *fileSession) SetMetadata(ctx context.Context, id uint64, namespace str
 		return storage.OpaquePayload{}, err
 	}
 	defer done()
-	return fs.native.(storage.MetadataAccess).SetMetadata(ctx, id, namespace, expected, data)
+	return fs.native.(metadataAuthority).SetMetadata(ctx, id, namespace, expected, data)
 }
 
 func (f *openFile) CheckScopedReference() error { return f.native.CheckScopedReference() }

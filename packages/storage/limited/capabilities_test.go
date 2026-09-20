@@ -3,6 +3,7 @@ package limited
 import (
 	"context"
 	"errors"
+	"syscall"
 	"testing"
 
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -73,8 +74,14 @@ func TestCapabilityWrappersPreserveChecksAndPartialResults(t *testing.T) {
 	if payload, err := wrapper.SetMetadata(t.Context(), 3, "test.value", nil, []byte("value")); !errors.Is(err, failure) || string(payload.Data) != "value" {
 		t.Fatalf("metadata=%+v,%v", payload, err)
 	}
+	if err := wrapper.CheckUseOwners(); err != nil {
+		t.Fatal(err)
+	}
 	if owner, err := wrapper.NewUseOwner(t.Context(), 3, storage.UseScope{Token: "scope"}, storage.OwnerOptions{Lifetime: storage.OwnerExplicit}); !errors.Is(err, failure) || owner != 17 {
 		t.Fatalf("owner=%d,%v", owner, err)
+	}
+	if err := wrapper.RetireUseOwner(t.Context(), 17); !errors.Is(err, failure) {
+		t.Fatalf("retire owner=%v", err)
 	}
 	if conflict, err := wrapper.GetConflict(t.Context(), 17, storage.RangeCommand{}); !errors.Is(err, failure) || !conflict.Found || conflict.Owner != 9 {
 		t.Fatalf("conflict=%+v,%v", conflict, err)
@@ -82,16 +89,74 @@ func TestCapabilityWrappersPreserveChecksAndPartialResults(t *testing.T) {
 	if attempt, err := wrapper.Apply(t.Context(), 17, nil, request); !errors.Is(err, failure) || attempt.Request != request || !attempt.EverGranted {
 		t.Fatalf("attempt=%+v,%v", attempt, err)
 	}
+	if attempt, err := wrapper.Query(t.Context(), 17, request); !errors.Is(err, failure) || attempt.Request != request || !attempt.EverGranted {
+		t.Fatalf("query=%+v,%v", attempt, err)
+	}
+	if attempt, err := wrapper.Cancel(t.Context(), 17, request); !errors.Is(err, failure) || attempt.Request != request || !attempt.EverGranted {
+		t.Fatalf("cancel=%+v,%v", attempt, err)
+	}
+	if err := wrapper.Drop(t.Context(), 17, storage.DomainEnforced); !errors.Is(err, failure) {
+		t.Fatalf("drop=%v", err)
+	}
 	reference := &referenceProbe{callErr: failure, metadata: probe.metadata}
 	file := wrapFile(wrapper.storage, reference)
+	if err := file.(storage.ScopedReference).CheckScopedReference(); err != nil {
+		t.Fatal(err)
+	}
 	if scope, err := file.(storage.ScopedReference).Scope(t.Context()); !errors.Is(err, failure) || scope.Token != "scope" {
 		t.Fatalf("scope=%+v,%v", scope, err)
 	}
 	if payload, err := file.(storage.ReferenceMetadataAccess).SetMetadata(t.Context(), "test.value", nil, nil); !errors.Is(err, failure) || string(payload.Data) != "value" {
 		t.Fatalf("reference metadata=%+v,%v", payload, err)
 	}
+	if err := file.(storage.ReferenceMetadataAccess).CheckMetadataAccess(); err != nil {
+		t.Fatal(err)
+	}
 	probe.checkErr = failure
+	probe.callErr = errors.New("dispatch should not occur")
 	if err := wrapper.CheckRangeControl(); !errors.Is(err, failure) {
 		t.Fatalf("check=%v", err)
+	}
+	for name, call := range map[string]func() error{
+		"retire owner": func() error { return wrapper.RetireUseOwner(t.Context(), 17) },
+		"query": func() error {
+			_, err := wrapper.Query(t.Context(), 17, request)
+			return err
+		},
+		"cancel": func() error {
+			_, err := wrapper.Cancel(t.Context(), 17, request)
+			return err
+		},
+		"drop": func() error { return wrapper.Drop(t.Context(), 17, storage.DomainEnforced) },
+	} {
+		if err := call(); !errors.Is(err, failure) {
+			t.Fatalf("refused %s=%v", name, err)
+		}
+	}
+	reference.checkErr = failure
+	reference.callErr = errors.New("reference dispatch should not occur")
+	if _, err := file.(storage.ScopedReference).Scope(t.Context()); !errors.Is(err, failure) {
+		t.Fatalf("refused scope=%v", err)
+	}
+	if _, err := file.(storage.ReferenceMetadataAccess).SetMetadata(t.Context(), "test.value", nil, nil); !errors.Is(err, failure) {
+		t.Fatalf("refused reference metadata=%v", err)
+	}
+
+	missingSession := &fileSession{FileSession: struct{ storage.FileSession }{}, storage: wrapper.storage}
+	for name, check := range map[string]func() error{
+		"metadata": missingSession.CheckMetadataAccess,
+		"owners":   missingSession.CheckUseOwners,
+		"ranges":   missingSession.CheckRangeControl,
+	} {
+		if err := check(); !errors.Is(err, syscall.EOPNOTSUPP) {
+			t.Fatalf("missing %s check=%v", name, err)
+		}
+	}
+	missingFile := wrapFile(wrapper.storage, struct{ storage.File }{})
+	if err := missingFile.(storage.ScopedReference).CheckScopedReference(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("missing scope check=%v", err)
+	}
+	if err := missingFile.(storage.ReferenceMetadataAccess).CheckMetadataAccess(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("missing reference metadata check=%v", err)
 	}
 }

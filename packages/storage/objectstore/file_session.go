@@ -19,6 +19,21 @@ type fileAuthority interface {
 	metastore.FileStore
 }
 
+type metadataAuthority interface {
+	fileAuthority
+	storage.MetadataAccess
+}
+
+type useOwnerAuthority interface {
+	fileAuthority
+	CheckUseOwners() error
+}
+
+type rangeAuthority interface {
+	fileAuthority
+	CheckRangeControl() error
+}
+
 // Heartbeats, lock acquisition, and lock reconciliation have independent capacity.
 // Staged data and new acquisitions cannot consume release or renewal admission.
 const (

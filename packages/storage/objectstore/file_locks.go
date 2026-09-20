@@ -10,10 +10,6 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-type orderedReference interface {
-	Order(context.Context, func() error) error
-}
-
 type referenceUses struct {
 	retiring bool
 	nodeID   uint64
@@ -27,17 +23,23 @@ var (
 )
 
 func (fs *fileSession) CheckUseOwners() error {
-	native, ok := fs.native.(interface{ CheckUseOwners() error })
+	native, ok := fs.native.(useOwnerAuthority)
 	if !ok {
 		return syscall.EOPNOTSUPP
+	}
+	if err := native.CheckFileStore(); err != nil {
+		return err
 	}
 	return native.CheckUseOwners()
 }
 
 func (fs *fileSession) CheckRangeControl() error {
-	native, ok := fs.native.(interface{ CheckRangeControl() error })
+	native, ok := fs.native.(rangeAuthority)
 	if !ok {
 		return syscall.EOPNOTSUPP
+	}
+	if err := native.CheckFileStore(); err != nil {
+		return err
 	}
 	return native.CheckRangeControl()
 }
@@ -56,14 +58,10 @@ func (fs *fileSession) scopedReference(scope storage.UseScope) (*openFile, error
 	return nil, storage.ErrInvalidScope
 }
 
-func (fs *fileSession) referenceOrder(ref *openFile) (advisory.Order, error) {
-	native, ok := ref.native.(orderedReference)
-	if !ok {
-		return nil, syscall.EOPNOTSUPP
-	}
+func (fs *fileSession) referenceOrder(ref *openFile) advisory.Order {
 	return func(ctx context.Context, transition func() error) error {
-		return native.Order(metastore.WithFilePublicationGuard(ctx, fs.publicationAllowed), transition)
-	}, nil
+		return ref.native.Order(metastore.WithFilePublicationGuard(ctx, fs.publicationAllowed), transition)
+	}
 }
 
 func (fs *fileSession) NewUseOwner(ctx context.Context, node uint64, scope storage.UseScope, options storage.OwnerOptions) (storage.UseOwner, error) {
@@ -88,10 +86,7 @@ func (fs *fileSession) NewUseOwner(ctx context.Context, node uint64, scope stora
 	if nodeID != node {
 		return 0, storage.ErrInvalidScope
 	}
-	order, err := fs.referenceOrder(ref)
-	if err != nil {
-		return 0, err
-	}
+	order := fs.referenceOrder(ref)
 	var owner storage.UseOwner
 	err = order(ctx, func() error {
 		var err error
@@ -153,8 +148,7 @@ func (fs *fileSession) ownerOrder(ctx context.Context, owner storage.UseOwner) (
 	if err != nil {
 		return 0, nil, err
 	}
-	order, err := fs.referenceOrder(ref)
-	return node, order, err
+	return node, fs.referenceOrder(ref), nil
 }
 
 func (fs *fileSession) GetConflict(ctx context.Context, owner storage.UseOwner, command storage.RangeCommand) (storage.RangeConflict, error) {
