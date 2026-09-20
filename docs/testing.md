@@ -138,7 +138,7 @@ schema 迁移从真实 v5 fixture 前滚，核对 mode 到 NodeKind / `posix.per
 
 ### 中立 range 与 POSIX 映射
 
-[advisory 状态机用例](../packages/advisory/coordinator_test.go)逐步核对 Use/Deny 双向冲突、三个 domain、共享/排他冲突、范围替换、拆分、合并、精确 claim 与部分解除。`DropBeforeAcquire` 的已完成释放进入 Effects；enforced policy 约束实际 ReadData/WriteData，advisory domain 不阻止未参与者。owner scope、Group 与诊断身份分别核对，跨文件等待检测 `EDEADLK`；有界搜索无法确定时明确拒绝，不能把未知当成无冲突。
+[advisory 状态机用例](../packages/advisory/coordinator_test.go)逐步核对 Use/Deny 双向冲突、三个 domain、共享/排他冲突、范围替换、拆分、合并、精确 claim 与部分解除。Rejected batch 的 `FailedAt` 必须是原 Commands 中失败项的零基下标；request-wide admission 拒绝保持 nil。它保留此前完成的 release Effects，并回滚本批 acquisition；`DropBeforeAcquire` 不能把部分效果包装成完全未执行。enforced policy 约束实际 ReadData/WriteData，advisory domain 不阻止未参与者。owner scope、Group 与诊断身份分别核对，跨文件等待检测 `EDEADLK`；有界搜索无法确定时明确拒绝，不能把未知当成无冲突。
 
 [advisory 上限用例](../packages/advisory/bounds_test.go)分别耗尽 Session、Owner、range、pending 与 action history，核对拒绝不会丢弃旧状态、拆分失败不改变原范围、取消及历史到期能回收对应名额。Commands、Claims、Effects 的完整回执在任何效果前验证容量。阻塞申请可以在有效且持续续租的 Session 内等待，不继承 Strong 的有限 Wait。只有 Cancelled/Released 证明没有遗留 grant 时才能返回可重试的 `EINTR`，结果未知保持 `EIO` 和 I/O 隔离；Drop 只清理指定 owner 与 domain。
 
@@ -238,7 +238,7 @@ authority 的[发布交错用例](../packages/locking/contract_concurrency_test.
 
 [server 用例](../packages/transport/httprest/lock_server_test.go)验证 `/v4/` 协议标记和旧版本拒绝，以及匿名与 scoped 调用都抵达同一个执行保护的 volume。Scope header 的空值、重复值、错误 base64url、缺失或重复成员、未知字段、超长值和错误使用位置必须在修改前拒绝，随后 Stat 证实目标未创建；读取与控制操作不接受 mutation scope。能力值只在 body/header 中传递，URL 与错误诊断不能泄漏它们。[Scope 用例](../packages/transport/httprest/lock_scope_test.go)逐一验证所有 mutation、WithBarrier 与无效果 mutation 保留复制后的 proof，读取不发送它，匿名 handler 不继承被包装客户端的权限。
 
-[文件能力 HTTP 用例](../packages/transport/httprest/file_capabilities_test.go)验证当前 server 的 session 只宣告 Metadata/Owners/Ranges，File 只宣告 Metadata/Scope，并把其它已命名 bool 明确编码为 false。兼容性用例让这些预留 bool 为 true，要求未实现对应 facet 的 v4 client 忽略它们，同时继续拒绝任意未知字段；Open 的可选 node 与 Close/SessionClose 的可选 barrier 也不得改变当前调用结果。metadata request 的空 version 与 response 的非空 authority version 使用不同 decoder，canonical base64、字段上限、ResultBytes、barrier 和引用清理分别核对。[range receipt 用例](../packages/transport/httprest/file_range_receipt_test.go)在进入 coordinator 前验证完整 Commands/Claims/Effects 能装入 256 KiB 文件控制 envelope；截断、矛盾 state、错误 request identity 或缺失 effect 都不能变成成功。
+[文件能力 HTTP 用例](../packages/transport/httprest/file_capabilities_test.go)验证当前 server 的 session 只宣告 Metadata/Owners/Ranges，File 只宣告 Metadata/Scope，并把其它已命名 bool 明确编码为 false。兼容性用例让这些预留 bool 为 true，要求未实现对应 facet 的 v4 client 忽略它们，同时继续拒绝任意未知字段；Open 的可选 node 与 Close/SessionClose 的可选 barrier 也不得改变当前调用结果。metadata request 的空 version 与 response 的非空 authority version 使用不同 decoder，canonical base64、字段上限、ResultBytes、barrier 和引用清理分别核对。[range receipt 用例](../packages/transport/httprest/file_range_receipt_test.go)在进入 coordinator 前验证完整 Commands/Claims/Effects 能装入 256 KiB 文件控制 envelope，并核对 Rejected 的 `FailedAt`、nil 的 request-wide failure 位置及 Effects；截断、矛盾 state、错误 request identity 或缺失 effect 都不能变成成功。
 
 [副本转发用例](../packages/storage/replicated/lock_service_test.go)分别把基础 replica 和 scoped 视图交给真实 HTTP handler。代理查询须找到原授权方的 grant，匿名修改被拒绝，显式 proof 修改成功后本地 replica 立即可见；经代理 Release 后，再从原授权方确认 Released。随后匿名写与普通读仍可用，关闭代理 HTTP 服务后底层 replica 仍能写入，内容由原服务端重新读取核对。
 

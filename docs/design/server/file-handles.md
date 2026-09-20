@@ -88,7 +88,7 @@ metadata 返回值与 Attr 载入前先经过 `AttrResultBudget`。每 volume �
 
 `UseScope` 绑定一个确切 File 引用。`UseOwners.NewUseOwner` 同时核对 NodeID、scope、session 和引用存活；任意数值 owner 不授予权限。`OwnerReference` 随引用结束，`OwnerExplicit` 由调用方明确退役。Group 只合并同一 session 内的死锁参与者，不共享 claim、range 或 scope 豁免。
 
-`RangeControl.GetConflict` 只查询一个实际冲突。`Apply` 一次接纳最多 64 条命令，返回的 Claims 与 Effects 也分别最多 64 项；完整回执在任何释放或授予前完成容量验证。`DropBeforeAcquire` 已释放的旧范围会记录在 Effects 中，即使随后的获取 Pending 或 Rejected，也不能把结果说成完全未执行。
+`RangeControl.GetConflict` 只查询一个实际冲突。`Apply` 一次接纳最多 64 条命令，返回的 Claims 与 Effects 也分别最多 64 项；完整回执在任何释放或授予前完成容量验证。Rejected 结果的 `FailedAt` 是原 Commands 中失败项的零基下标；request-wide admission 拒绝没有这个位置。此前成功的 release 保留在 Effects 中，本批 acquisition 回滚。`DropBeforeAcquire` 已释放的旧范围即使随后获取 Pending 或 Rejected，也不能被隐藏成完全未执行。
 
 `Apply`、`Query` 与 `Cancel` 使用原有 `LockRequestID` epoch 和 nonce。相同 ID 的不同 intent 以 `EINVAL` 拒绝；旧 epoch 中未见过的 ID 不重新执行。取消只有在结果证明没有遗留 grant 时才能成为安全的中断；授予已经获胜时返回该事实，结果未知时相关访问持续失败。
 
