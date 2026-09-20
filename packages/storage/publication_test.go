@@ -314,6 +314,60 @@ func TestPublicationConcurrentSettlementConsumesOnce(t *testing.T) {
 	}
 }
 
+func TestMaintenanceAccountingChainIsImmutableAndStripsContextValues(t *testing.T) {
+	type secretKey struct{}
+	source := context.WithValue(t.Context(), secretKey{}, "source credential")
+	var calls []string
+	hook := func(name string) storage.PublicationAccounting {
+		return func(before, after int64) (storage.PublicationSettlement, error) {
+			if before != 7 || after != 0 {
+				t.Fatalf("actual usage = %d -> %d", before, after)
+			}
+			calls = append(calls, "prepare "+name)
+			return func(result storage.PublicationResult) error {
+				if result != storage.PublicationApplied {
+					t.Fatalf("settlement = %v", result)
+				}
+				calls = append(calls, "settle "+name)
+				return nil
+			}, nil
+		}
+	}
+	source = storage.WithPublicationAccounting(source, hook("inner"))
+	chain := storage.PublicationAccountingFrom(source).With(hook("outer"))
+
+	cleanupBase, cancel := context.WithCancel(context.WithValue(t.Context(), secretKey{}, "cleanup credential"))
+	cleanupBase = storage.WithPublicationAccounting(cleanupBase, hook("obsolete"))
+	cleanup := storage.WithPublicationAccountingChain(cleanupBase, chain)
+	if cleanup.Value(secretKey{}) != nil || chain.Empty() {
+		t.Fatal("accounting chain retained a non-accounting context value or lost its hooks")
+	}
+	settle, err := storage.PreparePublication(cleanup, 7, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := settle(storage.PublicationApplied); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"prepare inner", "prepare outer", "settle outer", "settle inner"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("chain calls = %v, want %v", calls, want)
+	}
+	cancel()
+	if !errors.Is(cleanup.Err(), context.Canceled) {
+		t.Fatalf("cleanup cancellation = %v", cleanup.Err())
+	}
+	if !(storage.PublicationAccountingChain{}).Empty() || !storage.PublicationAccountingFrom(context.Background()).Empty() {
+		t.Fatal("an empty context produced accounting hooks")
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("nil accounting hook accepted")
+		}
+	}()
+	_ = chain.With(nil)
+}
+
 func TestPublicationContextCompositionIsImmutable(t *testing.T) {
 	calls := 0
 	base := storage.WithPublicationAccounting(context.Background(), func(_, _ int64) (storage.PublicationSettlement, error) {
