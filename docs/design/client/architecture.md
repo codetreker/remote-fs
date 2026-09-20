@@ -46,7 +46,7 @@ SSE 不把整个 stream 保存在内存里，但每一帧仍有独立的 `DialOp
 
 每个基础数据调用都要先取得 client 自己的 response admission。默认同时保留 64 份响应、允许 64 个等待者，aggregate 上限为 8 GiB；每份都按 `4 * MaxBodyBytes` 预留，覆盖 raw body、decoded listing 与转换过程的同时保留。默认 1 GiB body 使每个 List 预留 4 GiB，因此 aggregate byte bound 会先把并发压到 2 个活跃 List，另有至多 64 个调用等待。Subscribe、Resubscribe 与 Snapshot 在发出 HTTP 前也取得同一名额，用来约束 stream 尚未成功建立时可能返回的普通 error body；确认 `200 text/event-stream` 后立即释放，后续 frame 由 `MaxFrameBytes` 约束。等待者已满时，`Stat`、`Write`、`Create` 或 stream setup 都会在发出 HTTP 请求前以 `EAGAIN` 失败；context cancellation 会移除等待计数。non-stream admission 一直持有到 response 解码、mutation response/barrier 验证完成。`ReadBounded` 取 client 与调用方 byte bound 中较小者；`ListBounded` 把解码后的 entry 逐项交给调用方的 `ListResult`。普通 `Read` 与 `List` 仍返回完整 materialized value，但整个 HTTP body 及其同时表示都在上述单体与 aggregate 边界内。server 侧的 backend 预算与 response admission 见 [`../server/architecture.md`](../server/architecture.md#六请求与响应的内存边界)。
 
-**FUSE 到这一层为止。** 挂载层把内核请求翻译为基础 volume、FileStorage 和中立 identity/metadata/range 调用。Opendir 与 Readlink 通过 OpenNodeRef 保留目录或符号链接身份，普通 create/open 使用 OpenAt，Lookup 与名字修改使用 LookupAt/MutateName。普通 node 操作携带稳定父 NodeID；只有已打开的 directory handle Lookup 再附带活 Scope。OpenChildRef 是编程入口可用的原子子项引用能力，FUSE 不需要借它重复 OpenAt 的职责。普通 fd 使用 File，无 fd 的身份属性使用 NodeReference 或 StatNode/SetNodeAttr。
+**FUSE 到这一层为止。** 挂载层把内核请求翻译为基础 volume、FileStorage 和中立 identity/metadata/range 调用。已有 inode 的 Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 Readlink 使用 OpenNodeRef，Lookup 与名字修改使用 LookupAt/MutateName。普通 node 操作携带稳定父 NodeID；只有已打开的 directory handle Lookup 再附带活 Scope。OpenChildRef 是编程入口可用的原子子项引用能力。普通 fd 使用 File，无 fd 的身份属性使用 NodeReference 或 StatNode/SetNodeAttr。
 
 ### 业务身份与授权结果
 
@@ -104,7 +104,7 @@ mutation 成功后，replicated client 从严格验证过的 response 取得 `(i
 
 ## 三、打开的是对象引用
 
-一个打开的目录 handle 保存 `storage.NodeReference` 及其 Scope，一个普通文件 handle 保存 `storage.File`、访问方式和 Scope。OpenAt、OpenNodeRef 与 OpenChildRef 从 FileSession action epoch 生成 `FileActionID`；旧 OpenNode 保留原有打开协议。已有普通文件按 NodeID 打开，目录和符号链接按 NodeID 取得 NodeReference；依父 inode 的普通文件 create/open 使用 OpenAt，把存在性、身份/metadata 条件、创建或清空、POSIX 初始 metadata、Use claim、关闭删除义务和返回对象交给一次权威动作。`O_TRUNC` 在 open 返回前完成，即使之后没有任何 write。
+一个打开的目录 handle 保存 `storage.NodeReference` 及其 Scope，一个普通文件 handle 保存 `storage.File`、访问方式和 Scope。Create 的 OpenAt 及 Opendir/Readlink 的 OpenNodeRef 从 FileSession action epoch 生成 `FileActionID`；已有 inode 的 Open 使用旧 OpenNode 协议。OpenAt 把存在性、身份/metadata 条件、创建、POSIX 初始 metadata、Use claim 和返回对象交给一次权威动作；已有文件的 `O_TRUNC` 由 OpenNode 在返回前完成，即使之后没有任何 write。OpenChildRef 保留给编程入口。
 
 ```
 打开   ──▶ OpenAt / OpenNode，取得对象引用，不取内容

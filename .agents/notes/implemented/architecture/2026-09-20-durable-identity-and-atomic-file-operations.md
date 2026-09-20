@@ -40,7 +40,7 @@ Status: implemented
 
 节点 pending 状态与每个 armed intent 分开保存。显式 `SetPendingUnlink` 原子核对节点、metadata、Use/share、种类与目录为空条件后推进 generation；`ClearPendingUnlink` 必须给出当前 generation，只清除节点当前 pending 状态，不删除其它引用尚未触发的义务。pending 节点拒绝冲突的新打开与名字修改。
 
-删除 intent 的持久状态区分 armed、pending、completed、明确未执行与 cleanup failed；失败状态保存封闭 errno 分类。查询不到或已经退休的记录分别返回 unknown/retired，不能编造 NodeID。`QueryDeleteIntent` 以 durable ID 查询，新的 FileSession 在 authority 重启后仍可取得原义务。终态记录继续占用有界历史，只有带独立 `FileActionID` 的 `AcknowledgeDeleteIntent` 可以幂等释放；ACK 自己进入普通 action replay/query，之后重用旧 intent ID 是调用方错误或 unknown，不会创建新义务。名字已与原对象分离或目录触发时非空会成为明确未执行，绝不删除后来占据同名位置的对象。可重试清理失败继续由 authority 持有。
+删除 intent 的持久状态区分 armed、pending、completed、明确未执行与 cleanup failed；失败状态保存封闭 errno 分类。`QueryDeleteIntent` 以 durable ID 查询，新的 FileSession 在 authority 重启后仍可取得原义务。终态记录继续占用有界历史，只有带独立 `FileActionID` 的 `AcknowledgeDeleteIntent` 可以幂等删除记录并释放容量；ACK 自己进入普通 action replay/query。成功 ACK 后 authority 不保留 tombstone，也不再承诺拒绝该 ID 的重用，后续查询返回 unknown；调用方必须永久不复用已经 ACK 的 DeleteIntentID。名字已与原对象分离或目录触发时非空会成为明确未执行，绝不删除后来占据同名位置的对象。可重试清理失败继续由 authority 持有。
 
 ### schema v7 与组合边界
 
@@ -48,7 +48,7 @@ SQLite migration 7 为节点和 change 增加符号链接目标与 pending gener
 
 `metastore/sqlite` 持有身份解析、条件比较、名字事务、pending 状态与恢复扫描；`storage/objectstore` 持有内容 staging、引用 drain 和条件内容重建；limited、locked、replicated 与 HTTP 包装器逐层转发能力、action、scope、部分打开结果和清理所有权。恢复 orphan/pending cleanup 时，`PublicationAccountingChain` 只复制不可变配额 hook；新 cleanup context 保留自己的 deadline/cancel cause，不暴露原请求的授权、scope、proof 或其它值。`MaintenanceAccounting` 在恢复前绑定当前完整计费链。HTTP v4 使用原 file session registry 与 action epoch，不另建只属于 transport 的正确性来源。
 
-FUSE 的 Opendir 与 Readlink 使用 OpenNodeRef 保留目录或符号链接身份，普通 create/open 使用 OpenAt，Lookup 与 create/mkdir/symlink/unlink/rmdir/rename 使用父目录 NodeID 到达 authority；只有已打开 directory handle 的 Lookup 再附带活 Scope。OpenChildRef 保留给需要原子取得任意子节点引用的编程入口。普通文件 fd 继续持有 File；Readdir 暂时仍使用既有公开 List 路径，不被描述为 identity-bound directory observation。组合 Setattr 仍由多个调用组成，ConditionalFileMutation 没有被 FUSE 冒充为整项事务。
+FUSE 的已有 inode Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 Readlink 使用 OpenNodeRef；Lookup 与 create/mkdir/symlink/unlink/rmdir/rename 使用父目录 NodeID 到达 authority，只有已打开 directory handle 的 Lookup 再附带活 Scope。OpenChildRef 保留给需要原子取得任意子节点引用的编程入口。普通文件 fd 继续持有 File；Readdir 暂时仍使用既有公开 List 路径，不被描述为 identity-bound directory observation。组合 Setattr 仍由多个调用组成，ConditionalFileMutation 没有被 FUSE 冒充为整项事务。
 
 ## 备选方案
 

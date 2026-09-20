@@ -1,14 +1,14 @@
-# Agent Note: 文件目标、显式内容依据与目录父身份
+# Agent Note: 文件目标与显式内容依据
 
 Status: proposed
 
-本提案的目录父身份部分已由[持久节点身份与原子文件操作](../../implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)实现。本文继续拥有 R-CC-1 的调用方显式内容版本依据；内部 revision CAS、metadata/size 条件与 action replay 都不替代它。
+目录父身份已由[持久节点身份与原子文件操作](../../implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)实现。本文只保留 R-CC-1 的调用方显式内容版本依据；内部 revision CAS、metadata/size 条件与 action replay 都不替代它。
 
 ## 问题
 
-按名字操作、持有对象和验证内容依据是三件事。一个稳定的节点身份能阻止请求落到同名替代物上，却不说明调用方此前读到的内容仍然有效；目录子项操作即使已经知道父节点身份，也可能在执行时重新解析一个指向其它目录的路径。
+持有对象与验证内容依据是两件事。一个稳定的节点身份能阻止请求落到同名替代物上，却不说明调用方此前读到的内容仍然有效。
 
-[实时文件句柄](../../implemented/architecture/2026-09-08-live-file-handles.md)已经接续本提案的普通文件目标绑定：File 保留同一对象，rename、unlink 和同名替换不把已有引用转到替代物。ReadAt 逐次读取该对象当前的一个内容修订，WriteAt 和 Truncate 同步修改当前状态；普通重叠写按执行顺序生效。本文保留 R-CC-1 的显式版本工作流，以及目录子项访问的父身份约束。
+[实时文件句柄](../../implemented/architecture/2026-09-08-live-file-handles.md)已经接续本提案的普通文件目标绑定：File 保留同一对象，rename、unlink 和同名替换不把已有引用转到替代物。ReadAt 逐次读取该对象当前的一个内容修订，WriteAt 和 Truncate 同步修改当前状态；普通重叠写按执行顺序生效。本文保留 R-CC-1 的显式版本工作流。
 
 ### 原来的路径提交为什么会落错对象
 
@@ -32,14 +32,6 @@ A 读取节点 X，B 修改同一节点 X，A 再以此前的内容计算一份�
 
 R-CC-1 另外要求调用方能够显式选择内容版本前置条件。内部 revision CAS 用于合并范围修改时保留未改区域，竞争后会重新取字节并重试；它不接收调用方的旧内容依据，不能充当上述公开工作流。强 S/X 与 advisory 锁也不追溯证明加锁之前读取的字节仍然有效。
 
-### 目录父身份已经由原子子项操作接续
-
-本提案提出时，一次较早的 Lookup(old) 可以取得目录 D，随后 D 被改名到 new，old 处出现替代目录 R；旧目录 inode 再从路径执行 Mkdir 等子项操作时可能落到 R。
-
-[持久节点身份与原子文件操作](../../implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)让普通子项操作使用父 NodeID，并让已打开 directory handle 的 Lookup 额外携带 NodeReference Scope；FUSE 的普通 create/open 使用 OpenAt，名字修改使用 MutateName。检查和效果在 authority 的同一原生顺序内完成，不再从旧路径重建父对象。
-
-Readdir 与完整目录 metadata observation 尚未迁入这套身份操作；它们由后续只读观察能力承接，不影响本提案剩余的显式内容版本问题。
-
 ## 提案
 
 ### 显式版本化提交同时指定目标与内容依据
@@ -60,7 +52,7 @@ Readdir 与完整目录 metadata observation 尚未迁入这套身份操作；�
 
 **只增加不透明节点身份。** 它能把同名替换从静默写错变成失效错误，却既不保留已 unlink 对象，也不识别同一对象上的旧内容依据。原来的这两项缺口分别由对象保留与显式版本工作流承担。
 
-**修改前再 Stat 一次，比较大小、时间或父节点身份。** 不增加原生原子操作，但检查与发布之间仍有窗口；同一时间粒度内的修改也可能无法区分。目录父身份预检与旧内容预检共享这项限制。
+**修改前再 Stat 一次，比较大小或时间。** 不增加原生原子操作，但检查与发布之间仍有窗口；同一时间粒度内的修改也可能无法区分。
 
 **依赖本地名字视图与变更通知。** 通知可以减少落后窗口，但正确性不能取决于通知及时抵达；客户端落后、断线或没有事件源时，它不能阻止错误提交。[观察源与通道](2026-08-19-observation-source-and-channels.md)继续拥有观察职责。
 
@@ -74,7 +66,7 @@ Readdir 与完整目录 metadata observation 尚未迁入这套身份操作；�
 - 两个以同一基准版本发出的冲突提交只能有一个成功；旧版本拒绝不改变目标内容。普通 File 范围写不套用这项断言。
 - 同名替换成内容相同的另一对象也不能骗过目标检查；版本比较与实际发布在同一原子边界内完成。
 - 显式版本、内部 revision CAS、强 S/X、advisory 锁与普通 File 引用的职责在文档和契约用例中分别表达。
-- 方案与[操作词汇](2026-08-19-storage-operation-vocabulary.md)、定序与版本、新文件句柄决定及已实现的目录父身份能力互相链接，已交付与待实现的范围不重叠。
+- 方案与[操作词汇](2026-08-19-storage-operation-vocabulary.md)、定序与版本及新文件句柄决定互相链接，已交付与待实现的范围不重叠。
 
 ## 风险
 

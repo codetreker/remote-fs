@@ -80,7 +80,7 @@ SQLite schema v7 在 v6 的 NodeKind、metadata、`detached` 与内容 revision 
 
 `SetPendingUnlink` 立即在同一事务中核对引用、metadata、Use/share、节点种类与目录为空条件，再推进非零 pending generation。`ClearPendingUnlink` 必须给出当前 generation；竞争或旧 generation 返回 `ErrConditionConflict`，且清除一个节点状态不会删除其它 armed intent。pending 节点拒绝冲突的新打开和名字操作，已有相容引用继续按其权限访问。
 
-delete intent 持久记录 armed、pending、completed、not-executed 或 cleanup-failed；失败记录携带封闭 errno 分类。查询不存在或已退休记录时分别返回 unknown/retired，不附会 NodeID。终态记录继续占用有界历史，直到 `AcknowledgeDeleteIntent` 以自己的 FileActionID 幂等释放；ACK 也可通过 QueryFileAction 核对。新 session 可在 authority 重启后查询原义务；普通 File、NodeReference、Scope、Use owner 与 range 不随这份持久记录恢复。
+delete intent 持久记录 armed、pending、completed、not-executed 或 cleanup-failed；失败记录携带封闭 errno 分类。终态记录继续占用有界历史，直到 `AcknowledgeDeleteIntent` 以自己的 FileActionID 幂等删除记录并释放容量；ACK 也可通过 QueryFileAction 核对。成功 ACK 后不保留 tombstone，后续 QueryDeleteIntent 返回 unknown，authority 不再承担该 ID 的非复用保证；调用方必须永久不复用已经 ACK 的 ID。新 session 可在 authority 重启后查询尚未 ACK 的原义务；普通 File、NodeReference、Scope、Use owner 与 range 不随这份持久记录恢复。
 
 `SQLiteOptions.MaxDeleteIntents` 默认每 volume 65536 条，计入 armed、pending、失败及尚未 ACK 的终态。达到上限时，新 CloseIntent 在产生打开或名字效果前以 `EAGAIN` 拒绝；清理、查询和 ACK 保持可用，使已接受责任能够终结并释放名额。
 

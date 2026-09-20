@@ -142,7 +142,7 @@ schema v7 用例从真实 v6 fixture 前滚，核对 link target、pending gener
 
 [local store 关闭用例](../packages/storage/localstore/files_test.go)在关闭 durable storage 前退役 retained 引用，重开后核对无名字对象已清理、Used 已释放且旧名字没有重建。最后引用的记账拒绝必须使 Close 保留原错误，第二个 opener 仍以 `EBUSY` 失败；移除故障后重新 Close 才能释放物理所有权。
 
-[pending deletion 用例](../packages/metastore/sqlite/identity_capabilities_test.go)覆盖 armed、pending、completed、明确未执行与带 errno 的 cleanup-failed，rename 后随原关联、unlink/replacement 后不碰同名替代物、目录非空、generation 清除竞争、多个 intent、最后 pin 与重启恢复。终态在显式 acknowledge 前持续占用有界历史；ACK 带自己的 FileActionID，可重放且不重复释放，之后查询返回 retired/unknown。localstore crash 用例在接受 intent 后终止子进程，重开后从 durable ID 查询并继续清理；恢复使用 maintenance accounting，既不重复返还配额，也不携带原授权、Scope 或 Strong proof。
+[pending deletion 用例](../packages/metastore/sqlite/identity_capabilities_test.go)覆盖 armed、pending、completed、明确未执行与带 errno 的 cleanup-failed，rename 后随原关联、unlink/replacement 后不碰同名替代物、目录非空、generation 清除竞争、多个 intent、最后 pin 与重启恢复。终态在显式 acknowledge 前持续占用有界历史；ACK 带自己的 FileActionID，可重放且不重复释放，成功后删除记录、回收容量，后续查询为 unknown。用例还须证明 authority 不保留 tombstone，调用方不会复用已 ACK 的 ID。localstore crash 用例在接受 intent 后终止子进程，重开后从 durable ID 查询并继续清理；恢复使用 maintenance accounting，既不重复返还配额，也不携带原授权、Scope 或 Strong proof。
 
 [retained integrity 用例](../packages/metastore/sqlite/internal/integration/integrity_test.go)将可见 rooted tree 与 detached regular file 分开验证：后者不进入目录快照，仍引用合法对象并计入 quota 与 integrity work；detached directory/root、非法标记、revision 或错误用量均失败。[恢复用例](../packages/metastore/sqlite/internal/integration/files_test.go)在独占打开时清理数据库内每个 volume 的遗留 detached 对象，即使 pending admission 已满仍完成必要清理并报告实际 OverLimit；损坏图在清理前拒绝，失败事务保持节点、对象、用量和 durable generation。[迁移用例](../packages/metastore/sqlite/internal/integration/schema_test.go)从受见证保护的旧 schema 前滚，核对已有节点与 accepted state，并在旧 schema 损坏或预算不足时保持原数据。
 
