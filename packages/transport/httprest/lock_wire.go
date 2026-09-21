@@ -275,8 +275,27 @@ func checkLockJSON(decoder *json.Decoder, typ reflect.Type) error {
 }
 
 func checkTypedJSON(decoder *json.Decoder, typ reflect.Type, maxElements int) error {
+	return checkTypedJSONValue(decoder, typ, maxElements, nil)
+}
+
+type namespaceGuardJSONBudget struct {
+	used int64
+}
+
+func (budget *namespaceGuardJSONBudget) add(amount int64) error {
+	if amount < 0 || amount > storage.MaxNamespaceGuardBytes-budget.used {
+		return errors.New("namespace guards exceed their byte bound")
+	}
+	budget.used += amount
+	return nil
+}
+
+func checkTypedJSONValue(decoder *json.Decoder, typ reflect.Type, maxElements int, guardBudget *namespaceGuardJSONBudget) error {
 	for typ.Kind() == reflect.Pointer {
 		typ = typ.Elem()
+	}
+	if typ == reflect.TypeOf(namespaceGuards{}) && guardBudget == nil {
+		guardBudget = &namespaceGuardJSONBudget{}
 	}
 	token, err := decoder.Token()
 	if err != nil {
@@ -315,7 +334,7 @@ func checkTypedJSON(decoder *json.Decoder, typ reflect.Type, maxElements int) er
 				return errors.New("lock JSON contains an unknown or duplicate member")
 			}
 			seen[name] = true
-			if err := checkTypedJSON(decoder, field.Type, maxElements); err != nil {
+			if err := checkTypedJSONValue(decoder, field.Type, maxElements, guardBudget); err != nil {
 				return err
 			}
 		}
@@ -349,7 +368,7 @@ func checkTypedJSON(decoder *json.Decoder, typ reflect.Type, maxElements int) er
 				return errors.New("JSON map exceeds its element limit")
 			}
 			seen[name] = struct{}{}
-			if err := checkTypedJSON(decoder, typ.Elem(), maxElements); err != nil {
+			if err := checkTypedJSONValue(decoder, typ.Elem(), maxElements, guardBudget); err != nil {
 				return err
 			}
 		}
@@ -363,6 +382,24 @@ func checkTypedJSON(decoder *json.Decoder, typ reflect.Type, maxElements int) er
 			if !ok {
 				return errors.New("lock JSON byte strings require base64 text")
 			}
+			if guardBudget != nil {
+				maximum := 0
+				switch typ {
+				case reflect.TypeOf(metadataVersion{}):
+					maximum = storage.MaxObservationTokenBytes
+				case reflect.TypeOf(canonicalBytes{}):
+					maximum = storage.MaxLeafBytes
+				}
+				if maximum != 0 {
+					decoded, err := validateCanonicalBase64([]byte(encoded), maximum, false)
+					if err != nil {
+						return err
+					}
+					if err := guardBudget.add(decoded); err != nil {
+						return err
+					}
+				}
+			}
 			decoded, err := base64.StdEncoding.Strict().DecodeString(encoded)
 			if err != nil || base64.StdEncoding.EncodeToString(decoded) != encoded {
 				return errors.New("JSON byte strings require canonical base64")
@@ -373,12 +410,29 @@ func checkTypedJSON(decoder *json.Decoder, typ reflect.Type, maxElements int) er
 			return errors.New("lock JSON requires an array")
 		}
 		count := 0
+		limit := maxElements
+		fixedBytes := int64(0)
+		if guardBudget != nil {
+			switch typ {
+			case reflect.TypeOf([]directoryObservation{}):
+				limit = min(limit, storage.MaxNamespaceGuards)
+				fixedBytes = 8
+			case reflect.TypeOf([]observedEdge{}):
+				limit = min(limit, storage.MaxNamespaceGuards)
+				fixedBytes = 16
+			}
+		}
 		for decoder.More() {
 			count++
-			if count > maxElements {
+			if count > limit {
 				return errors.New("lock JSON array exceeds its element limit")
 			}
-			if err := checkTypedJSON(decoder, typ.Elem(), maxElements); err != nil {
+			if fixedBytes != 0 {
+				if err := guardBudget.add(fixedBytes); err != nil {
+					return err
+				}
+			}
+			if err := checkTypedJSONValue(decoder, typ.Elem(), maxElements, guardBudget); err != nil {
 				return err
 			}
 		}

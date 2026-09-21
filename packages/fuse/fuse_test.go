@@ -525,25 +525,25 @@ var differentialSteps = []step{
 	}},
 
 	{"remove a directory that still has entries", func(root string) (string, error) {
-		return "", syscall.Rmdir(filepath.Join(root, "sub"))
+		return "", comparisonRmdir(filepath.Join(root, "sub"))
 	}},
 	{"remove a file", func(root string) (string, error) {
-		return "", syscall.Unlink(filepath.Join(root, "sub", "deep.txt"))
+		return "", comparisonUnlink(filepath.Join(root, "sub", "deep.txt"))
 	}},
 	{"remove the now empty directory", func(root string) (string, error) {
-		return "", syscall.Rmdir(filepath.Join(root, "sub"))
+		return "", comparisonRmdir(filepath.Join(root, "sub"))
 	}},
 	{"remove a directory with unlink", func(root string) (string, error) {
-		return "", syscall.Unlink(filepath.Join(root, "d"))
+		return "", comparisonUnlink(filepath.Join(root, "d"))
 	}},
 	{"remove a file with rmdir", func(root string) (string, error) {
-		return "", syscall.Rmdir(filepath.Join(root, "fresh.txt"))
+		return "", comparisonRmdir(filepath.Join(root, "fresh.txt"))
 	}},
 	{"remove a missing file", func(root string) (string, error) {
-		return "", syscall.Unlink(filepath.Join(root, "absent.txt"))
+		return "", comparisonUnlink(filepath.Join(root, "absent.txt"))
 	}},
 	{"remove a missing directory", func(root string) (string, error) {
-		return "", syscall.Rmdir(filepath.Join(root, "absent"))
+		return "", comparisonRmdir(filepath.Join(root, "absent"))
 	}},
 
 	{"list what is left", func(root string) (string, error) {
@@ -659,19 +659,58 @@ var differentialSteps = []step{
 	}},
 }
 
-// Runtime preemption can interrupt FUSE requests, and Chtimes does not retry EINTR.
-// Repeating the exact timestamps preserves the atime/mtime values compared here;
-// ctime is outside this comparison.
+// Some FUSE-facing calls do not retry interruption. Differential steps retry only
+// errors classified solely as EINTR with identical arguments; every other result
+// remains the operation's answer.
 // https://github.com/hanwen/go-fuse/blob/423b377e1452ab7b3522229185a3047f72e3f966/fs/api.go#L129-L135
-func comparisonChtimes(path string, accessed, changed time.Time) error {
+func retryComparisonInterruption(call func() error) error {
 	var err error
 	for range 8 {
-		err = os.Chtimes(path, accessed, changed)
-		if !errors.Is(err, syscall.EINTR) {
+		err = call()
+		if storage.ErrnoOf(err) != syscall.EINTR {
 			return err
 		}
 	}
 	return err
+}
+
+func comparisonChtimes(path string, accessed, changed time.Time) error {
+	return retryComparisonInterruption(func() error { return os.Chtimes(path, accessed, changed) })
+}
+
+func comparisonUnlink(path string) error {
+	return retryComparisonInterruption(func() error { return syscall.Unlink(path) })
+}
+
+func comparisonRmdir(path string) error {
+	return retryComparisonInterruption(func() error { return syscall.Rmdir(path) })
+}
+
+func TestComparisonInterruptionRetriesOnlyEINTRWithinTheBound(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		results      []error
+		want         error
+		wantAttempts int
+	}{
+		{name: "success after interruption", results: []error{syscall.EINTR, nil}, wantAttempts: 2},
+		{name: "wrapped interruption", results: []error{&os.PathError{Op: "unlink", Path: "x", Err: syscall.EINTR}, nil}, wantAttempts: 2},
+		{name: "other failure", results: []error{syscall.EINTR, syscall.EIO, nil}, want: syscall.EIO, wantAttempts: 2},
+		{name: "interruption joined with failure", results: []error{errors.Join(syscall.EINTR, syscall.EIO), nil}, want: syscall.EIO, wantAttempts: 1},
+		{name: "bounded interruption", results: []error{syscall.EINTR}, want: syscall.EINTR, wantAttempts: 8},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			attempts := 0
+			err := retryComparisonInterruption(func() error {
+				index := min(attempts, len(test.results)-1)
+				attempts++
+				return test.results[index]
+			})
+			if !errors.Is(err, test.want) || attempts != test.wantAttempts {
+				t.Fatalf("result=%v attempts=%d, want %v after %d", err, attempts, test.want, test.wantAttempts)
+			}
+		})
+	}
 }
 
 // describeTimes reports both of a node's times, to the nanosecond. Set explicitly, they
@@ -1395,7 +1434,7 @@ func TestEveryLookAtTheVolumeReachesIt(t *testing.T) {
 		act       func() error
 	}{
 		{"a stat", "Stat", func() error { _, err := os.Stat(path); return err }},
-		{"a listing", "List", func() error { _, err := os.ReadDir(mountpoint); return err }},
+		{"a listing", "ReadDirNode", func() error { _, err := os.ReadDir(mountpoint); return err }},
 		{"a read", "Read", func() error { _, err := os.ReadFile(path); return err }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -1599,6 +1638,51 @@ func (s *decoratedSession) LookupAt(ctx context.Context, name storage.ChildName)
 	}
 	s.paths.Store(attr.ID, path)
 	return s.hooks.describe(path, attr), nil
+}
+
+func (s *decoratedSession) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	path := s.pathFor(target.NodeID)
+	if err := s.hooks.check("ReadDirNode", path); err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	observed, err := s.DirectoryReader.ReadDirNode(ctx, target)
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	for i := range observed.Entries {
+		entryPath := s.listedPath(path, observed.Entries[i].RawLeaf)
+		s.paths.Store(observed.Entries[i].Attr.ID, entryPath)
+		observed.Entries[i].Attr = s.hooks.describe(entryPath, observed.Entries[i].Attr)
+	}
+	return observed, nil
+}
+
+func (s *decoratedSession) ReadDirNodeBounded(ctx context.Context, target storage.DirectoryTarget, result *storage.ListResult) (storage.DirectoryObservation, error) {
+	path := s.pathFor(target.NodeID)
+	if err := s.hooks.check("ReadDirNode", path); err != nil {
+		return storage.DirectoryObservation{}, result.Fail(err)
+	}
+	observation, err := s.DirectoryReader.ReadDirNodeBounded(ctx, target, result)
+	if err != nil {
+		return storage.DirectoryObservation{}, err
+	}
+	entries, err := result.Entries()
+	if err != nil {
+		return storage.DirectoryObservation{}, err
+	}
+	for i := range entries {
+		entryPath := s.listedPath(path, []byte(entries[i].Name))
+		s.paths.Store(entries[i].Attr.ID, entryPath)
+		entries[i].Attr = s.hooks.describe(entryPath, entries[i].Attr)
+	}
+	return observation, nil
+}
+
+func (s *decoratedSession) listedPath(parent string, leaf []byte) string {
+	if parent == "" {
+		return string(leaf)
+	}
+	return parent + "/" + string(leaf)
 }
 
 func (s *decoratedSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
@@ -1943,7 +2027,7 @@ func TestAnUnreachableVolumeIsNotFileNotFound(t *testing.T) {
 // The same for a directory listing: an empty listing reads as established fact, and
 // acting on it deletes things.
 func TestAnUnreachableVolumeIsNotAnEmptyDirectory(t *testing.T) {
-	mountpoint := mountFaulty(t, failing("List", unreachable), func(backing storage.Storage) {
+	mountpoint := mountFaulty(t, failing("ReadDirNode", unreachable), func(backing storage.Storage) {
 		if err := backing.Write(t.Context(), "f", []byte("payload")); err != nil {
 			t.Fatal(err)
 		}
@@ -3335,6 +3419,7 @@ func setBackingMode(t *testing.T, backing storage.Storage, path string, mode fs.
 type capableTestSession struct {
 	storage.FileSession
 	storage.NamespaceAccess
+	storage.DirectoryReader
 	storage.AtomicFileOpener
 	storage.MetadataAccess
 	storage.UseOwners
@@ -3347,6 +3432,7 @@ func testSessionCapabilities(session storage.FileSession) capableTestSession {
 	return capableTestSession{
 		FileSession:      session,
 		NamespaceAccess:  session.(storage.NamespaceAccess),
+		DirectoryReader:  session.(storage.DirectoryReader),
 		AtomicFileOpener: session.(storage.AtomicFileOpener),
 		MetadataAccess:   session.(storage.MetadataAccess),
 		UseOwners:        session.(storage.UseOwners),

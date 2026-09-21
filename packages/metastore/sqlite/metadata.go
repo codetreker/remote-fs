@@ -80,16 +80,21 @@ func (s *Store) insertNode(
 	birthSec, birthNsec := sqlvalue.StoredTime(birth)
 	changeSec, changeNsec := sqlvalue.StoredTime(changed)
 	target := append([]byte{}, initial.LinkTarget...)
+	directoryRevision := []byte{}
+	if kind == storage.NodeDirectory {
+		directoryRevision = initialDirectoryRevision()
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO nodes
 		(id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,
-		 birth_sec,birth_nsec,change_sec,change_nsec,metadata,link_target)
-		VALUES(?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?)`,
+		 birth_sec,birth_nsec,change_sec,change_nsec,metadata,link_target,directory_revision)
+		VALUES(?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)`,
 		id, s.volume, int64(kind), len(initial.LinkTarget), accessSec, accessNsec, modifiedSec, modifiedNsec,
-		birthSec, birthNsec, changeSec, changeNsec, encoded, target); err != nil {
+		birthSec, birthNsec, changeSec, changeNsec, encoded, target, directoryRevision); err != nil {
 		return metastore.Node{}, err
 	}
 	return metastore.Node{ID: id, Kind: kind, Size: int64(len(initial.LinkTarget)), AccessTime: access, ModTime: modified,
-		BirthTime: &birth, ChangeTime: &changed, Metadata: metadata, LinkTarget: bytes.Clone(initial.LinkTarget)}, nil
+		BirthTime: &birth, ChangeTime: &changed, Metadata: metadata, LinkTarget: bytes.Clone(initial.LinkTarget),
+		DirectoryRevision: bytes.Clone(directoryRevision)}, nil
 }
 
 func (s *Store) setNodeChangeTime(ctx context.Context, tx *sql.Tx, id int64, at time.Time) error {

@@ -139,6 +139,8 @@ func TestEveryFileOperationAuthorizesBeforeCapabilityLookup(t *testing.T) {
 		{Op: storage.OpFileStatNode, Node: 71},
 		{Op: storage.OpFileSetNodeAttr, Node: 71, Change: &AttrChange{}},
 		{Op: storage.OpFileSetNodeMetadata, Node: 71, Namespace: "client.v1", Payload: metadataPayload("value")},
+		{Op: storage.OpFileReadDirNode, Directory: &storage.DirectoryTarget{NodeID: 71}},
+		{Op: storage.OpFileObserveDirectoryMetadata, Directory: &storage.DirectoryTarget{NodeID: 71}, DirectoryMetadata: directoryMetadataOptionsOf(storage.DirectoryMetadataOptions{})},
 		{Op: storage.OpFileOpen, Path: []byte("file"), Open: fullOpen},
 		{Op: storage.OpFileOpenNode, Node: 71, Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Truncate: true}}},
 		{Op: storage.OpFileAck},
@@ -150,6 +152,7 @@ func TestEveryFileOperationAuthorizesBeforeCapabilityLookup(t *testing.T) {
 		{Op: storage.OpFileSetMetadata, Namespace: "client.v1", Payload: metadataPayload("value")},
 		{Op: storage.OpFileSync},
 		{Op: storage.OpFileScope},
+		{Op: storage.OpFileObserveName},
 		{Op: storage.OpFileNewUseOwner, Node: 71, Scope: &storage.UseScope{Token: strings.Repeat("c", 64)}, OwnerOptions: storage.OwnerOptions{Lifetime: storage.OwnerExplicit}},
 		{Op: storage.OpFileRetireUseOwner, Owner: 13},
 		{Op: storage.OpFileRangeGetConflict, Owner: 13, Commands: []storage.RangeCommand{lock}},
@@ -169,7 +172,7 @@ func TestEveryFileOperationAuthorizesBeforeCapabilityLookup(t *testing.T) {
 				req.Action = action
 			}
 			switch req.Op {
-			case storage.OpFileStat, storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetMetadata, storage.OpFileSync, storage.OpFileAck, storage.OpFileClose, storage.OpFileScope:
+			case storage.OpFileStat, storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetMetadata, storage.OpFileSync, storage.OpFileAck, storage.OpFileClose, storage.OpFileScope, storage.OpFileObserveName:
 				req.File = strings.Repeat("b", 64)
 			}
 			fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, req), "EACCES", "access denied")
@@ -214,6 +217,9 @@ func TestInvalidFileArgumentsDoNotReachAuthorization(t *testing.T) {
 		{Op: storage.OpFileSetAttr, Change: &AttrChange{ModTime: &Time{Nanos: -1}}},
 		{Op: storage.OpFileSetNodeMetadata, Node: 1, Namespace: "INVALID"},
 		{Op: storage.OpFileSetMetadata, Namespace: "client.v1", Version: metadataVersion(make([]byte, storage.MaxObservationTokenBytes+1))},
+		{Op: storage.OpFileReadDirNode, Directory: &storage.DirectoryTarget{}},
+		{Op: storage.OpFileObserveDirectoryMetadata, Directory: &storage.DirectoryTarget{NodeID: 1}},
+		{Op: storage.OpFileObserveName, Guards: namespaceGuardsOf(&storage.NamespaceGuards{Directories: []storage.DirectoryObservation{{ParentID: 1}}})},
 		{Op: storage.OpFileRangeGetConflict, Owner: 13, Commands: []storage.RangeCommand{{Domain: storage.DomainWholeFile, Edit: storage.Subtract, Wait: true, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}}},
 		{Op: storage.OpFileRangeApply, Owner: 13, Commands: []storage.RangeCommand{{Domain: storage.DomainWholeFile, Edit: storage.Replace, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}}, LockID: "invalid"},
 		{Op: storage.OpFileRangeApply, Owner: 13, Commands: []storage.RangeCommand{{Domain: storage.DomainWholeFile, Edit: storage.Subtract, Wait: true, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}}, LockID: action},
@@ -230,7 +236,7 @@ func TestInvalidFileArgumentsDoNotReachAuthorization(t *testing.T) {
 			req.Action = action
 		}
 		switch req.Op {
-		case storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetMetadata:
+		case storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetMetadata, storage.OpFileObserveName:
 			req.File = strings.Repeat("b", 64)
 		}
 		answer := fileAuthorizationRequest(t, h, req)

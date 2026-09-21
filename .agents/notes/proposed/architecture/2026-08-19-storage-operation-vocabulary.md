@@ -6,7 +6,7 @@ Status: proposed
 
 `storage` 是 client、server 与第三方存储接入共同依赖的 volume 契约（R-INT-6）。本提案提出时，它只有四条义务，没有操作清单；路径还是节点身份、整文件还是区间、提交是否携带版本，都没有答案。
 
-当前[中心契约](../../../../docs/design/architecture.md)保留按路径寻址的基础操作、节点属性中的身份、内联属性的完整列目录、整文件读写及错误分类。[实时文件句柄](../../implemented/architecture/2026-09-08-live-file-handles.md)以 FileSession / File 提供身份打开、属性访问、范围读写与截断；[持久节点身份与原子文件操作](../../implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)交付按父身份的 Lookup/open/name mutation、NodeReference 与 size/metadata 条件；[显式文件锁](../../implemented/architecture/2026-09-07-file-locks.md)继续提供独立的强 S/X。本文仍保留调用方内容版本工作流、分页及完整通用词汇中尚未交付的部分。
+当前[中心契约](../../../../docs/design/architecture.md)保留按路径寻址的基础操作、节点属性中的身份、内联属性的完整列目录、整文件读写及错误分类。[实时文件句柄](../../implemented/architecture/2026-09-08-live-file-handles.md)以 FileSession / File 提供身份打开、属性访问、范围读写与截断；[持久节点身份与原子文件操作](../../implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)交付按父身份的 Lookup/open/name mutation、NodeReference 与 size/metadata 条件；[有界权威名字观察](../../implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)交付身份目录枚举、完整目录 metadata、目录 revision 与 reference current-name；[显式文件锁](../../implemented/architecture/2026-09-07-file-locks.md)继续提供独立的强 S/X。本文仍保留调用方内容版本工作流、分页及完整通用词汇中尚未交付的部分。
 
 操作词汇必须明确，理由有三个：
 
@@ -45,7 +45,7 @@ Status: proposed
 
 代价：客户端需要一份「(父节点, 名字) → 子节点」的反向索引，因为内核的目录项失效是按名字寻址的。
 
-FileSession.OpenNode、StatNode 与 SetNodeAttr 按身份访问，File 持有同一普通文件并跨越改名、同名替换与 unlink；OpenAt/OpenChildRef、LookupAt/MutateName 和 NodeReference 已补齐父身份与链接创建。强锁资源另行限定一次授予保护哪个仍具名字的文件，同名替换或 unlink 可退休其资源。分页、完整目录 metadata observation、current-name 与调用方内容版本 token 仍不因这些能力自动成立。
+FileSession.OpenNode、StatNode 与 SetNodeAttr 按身份访问，File 持有同一普通文件并跨越改名、同名替换与 unlink；OpenAt/OpenChildRef、LookupAt/MutateName 和 NodeReference 已补齐父身份与链接创建。identity-bound Readdir、完整目录 metadata observation、current-name 与 directory revision 另由[有界权威名字观察](../../implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)交付。强锁资源另行限定一次授予保护哪个仍具名字的文件，同名替换或 unlink 可退休其资源。分页与调用方内容版本 token 仍不因这些能力自动成立。
 
 ### 版本
 

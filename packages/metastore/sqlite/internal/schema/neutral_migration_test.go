@@ -31,7 +31,7 @@ func historicalMetadataDatabase(t *testing.T) *sql.DB {
 	return db
 }
 
-func TestNeutralMetadataMigrationPreservesHistoricalAttributesAndLineage(t *testing.T) {
+func TestNeutralMetadataMigrationPreservesCurrentAttributesAndLineage(t *testing.T) {
 	db := historicalMetadataDatabase(t)
 	_, _, state, err := PrepareConfigured(t.Context(), db, "legacy", "", changes.DefaultWindow(), 1000, 1<<20, nil)
 	if err != nil {
@@ -41,35 +41,29 @@ func TestNeutralMetadataMigrationPreservesHistoricalAttributesAndLineage(t *test
 		t.Fatalf("migration changed identity lineage: %+v", state)
 	}
 	var used int64
-	if err := db.QueryRow(`SELECT metadata_used FROM volumes WHERE id=1`).Scan(&used); err != nil || used != 138 {
-		t.Fatalf("migrated metadata charge = %d, %v; want 138", used, err)
+	if err := db.QueryRow(`SELECT metadata_used FROM volumes WHERE id=1`).Scan(&used); err != nil || used != 100 {
+		t.Fatalf("migrated metadata charge = %d, %v; want 100", used, err)
 	}
-	for _, row := range []struct {
-		table, kindColumn, where string
-		mode                     uint32
-		access, modified         int64
-		version                  uint64
-	}{
-		{"nodes", "kind", "id=2", 0o7640, 30, 40, 2},
-		{"changes", "node_kind", "position=7", 0o2600, 50, 60, 1},
-	} {
-		var kind, access, modified int64
-		var birth, changed sql.NullInt64
-		var metadata []byte
-		if err := db.QueryRow(`SELECT `+row.kindColumn+`,atime_sec,mtime_sec,birth_sec,change_sec,metadata FROM `+row.table+` WHERE `+row.where).
-			Scan(&kind, &access, &modified, &birth, &changed, &metadata); err != nil {
-			t.Fatal(err)
-		}
-		values, err := storage.DecodeMetadata(metadata)
-		if err != nil {
-			t.Fatal(err)
-		}
-		permissions, found := values["posix.permissions.v1"]
-		if kind != int64(storage.NodeRegular) || access != row.access || modified != row.modified || birth.Valid || changed.Valid ||
-			!found || len(values) != 1 || len(permissions.Data) != 4 || binary.LittleEndian.Uint32(permissions.Data) != row.mode ||
-			len(permissions.Version) != 8 || binary.BigEndian.Uint64(permissions.Version) != row.version {
-			t.Fatalf("%s attributes changed: kind=%d times=%d/%d known=%t/%t metadata=%+v", row.table, kind, access, modified, birth.Valid, changed.Valid, values)
-		}
+	var kind, access, modified int64
+	var birth, changed sql.NullInt64
+	var metadata []byte
+	if err := db.QueryRow(`SELECT kind,atime_sec,mtime_sec,birth_sec,change_sec,metadata FROM nodes WHERE id=2`).
+		Scan(&kind, &access, &modified, &birth, &changed, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	values, err := storage.DecodeMetadata(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permissions, found := values["posix.permissions.v1"]
+	if kind != int64(storage.NodeRegular) || access != 30 || modified != 40 || birth.Valid || changed.Valid ||
+		!found || len(values) != 1 || len(permissions.Data) != 4 || binary.LittleEndian.Uint32(permissions.Data) != 0o7640 ||
+		len(permissions.Version) != 8 || binary.BigEndian.Uint64(permissions.Version) != 2 {
+		t.Fatalf("current attributes changed: kind=%d times=%d/%d known=%t/%t metadata=%+v", kind, access, modified, birth.Valid, changed.Valid, values)
+	}
+	var retained int
+	if err := db.QueryRow(`SELECT count(*) FROM changes`).Scan(&retained); err != nil || retained != 0 {
+		t.Fatalf("pre-revision history remains replayable: count=%d error=%v", retained, err)
 	}
 	if _, _, _, err := PrepareConfigured(t.Context(), db, "legacy", "", changes.DefaultWindow(), 1000, 1<<20, nil); err != nil {
 		t.Fatalf("reopen after migration: %v", err)
@@ -82,8 +76,8 @@ func TestNeutralMetadataMigrationFailureRollsBackSchemaAndRows(t *testing.T) {
 		limit        int64
 		want         error
 	}{
-		{"postflight metadata limit", "", 137, syscall.EFBIG},
-		{"mid-migration write", `CREATE TRIGGER reject_migration BEFORE UPDATE ON nodes BEGIN SELECT RAISE(ABORT,'migration write failed'); END`, 138, nil},
+		{"postflight metadata limit", "", 99, syscall.EFBIG},
+		{"mid-migration write", `CREATE TRIGGER reject_migration BEFORE UPDATE ON nodes BEGIN SELECT RAISE(ABORT,'migration write failed'); END`, 100, nil},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			db := historicalMetadataDatabase(t)

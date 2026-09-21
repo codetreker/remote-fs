@@ -17,7 +17,7 @@ func validateVersionTwoLogIntegrity(ctx context.Context, db sqlvalue.Queryer, vo
 	if err := validateVersionTwoLogStorageClasses(ctx, db, volume); err != nil {
 		return err
 	}
-	return validateLogIntegrityVersion(ctx, db, volume, 2, false)
+	return validateLogIntegrityVersion(ctx, db, volume, 2, false, false)
 }
 
 func validateVersionTwoLogStorageClasses(ctx context.Context, db sqlvalue.Queryer, volume *int64) error {
@@ -59,10 +59,10 @@ func validateVersionTwoLogStorageClasses(ctx context.Context, db sqlvalue.Querye
 // validateLogIntegrity checks the durable tail, predecessor chain, and operation-dependent
 // shape of every retained change before Snapshot or Since may expose it as history.
 func validateLogIntegrity(ctx context.Context, db sqlvalue.Queryer, volume *int64) error {
-	return validateLogIntegrityVersion(ctx, db, volume, schema.Version(), true)
+	return validateLogIntegrityVersion(ctx, db, volume, schema.Version(), true, false)
 }
 
-func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, version int, predecessors bool) error {
+func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, version int, predecessors, opaqueDirectoryRevisions bool) error {
 	volumeWhere := ""
 	changeWhere := ""
 	var args []any
@@ -119,13 +119,33 @@ func validateLogIntegrityVersion(ctx context.Context, db sqlvalue.Queryer, volum
 			(c.node_kind=3 AND (length(c.link_target)=0 OR c.size!=length(c.link_target))) OR
 			(c.node_kind!=3 AND length(c.link_target)!=0)`
 	}
+	if version >= firstDirectoryRevisionSchemaVersion {
+		removedExtra += ` OR c.directory_revision IS NOT NULL`
+		requiredExtra += ` OR c.directory_revision IS NULL`
+		if opaqueDirectoryRevisions {
+			nodeSpecific += ` OR (c.node_kind=2 AND length(c.directory_revision)=0) OR
+				(c.node_kind!=2 AND length(c.directory_revision)!=0) OR length(c.directory_revision)>64`
+		} else {
+			nodeSpecific += ` OR
+				(c.node_kind=2 AND (
+					length(c.directory_revision)!=8 OR c.directory_revision<X'0000000000000001' OR c.directory_revision>X'7fffffffffffffff')) OR
+				(c.node_kind!=2 AND length(c.directory_revision)!=0) OR length(c.directory_revision)>64`
+		}
+	}
+	incarnationPredicate := `l.incarnation = ''`
+	if version >= firstOwnershipAwareSchemaVersion {
+		incarnationPredicate = `(
+			l.incarnation = '' OR length(CAST(l.incarnation AS BLOB)) != 32 OR
+			l.incarnation GLOB '*[^0-9a-f]*'
+		)`
+	}
 	var invalidLogs int64
 	if err := db.QueryRowContext(ctx, `
 		SELECT count(*)
 		FROM volumes ns
 		LEFT JOIN logs l ON l.volume = ns.id
 		`+volumeWhere+`(
-			l.volume IS NULL OR l.incarnation = '' OR
+			l.volume IS NULL OR `+incarnationPredicate+` OR
 			l.committed_position < 0 OR l.trimmed_through < 0 OR
 			l.trimmed_by_age NOT IN (0, 1) OR l.trimmed_through > l.committed_position OR
 			`+tailPredicate+` OR

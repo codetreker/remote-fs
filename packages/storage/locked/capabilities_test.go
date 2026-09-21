@@ -24,6 +24,52 @@ type capabilitySessionProbe struct {
 	deleted  storage.DeleteIntentStatus
 }
 
+type directoryReaderOnlyProbe struct{ storage.FileSession }
+
+type namespaceOnlyProbe struct{ storage.FileSession }
+
+func (namespaceOnlyProbe) CheckNamespaceAccess() error { return nil }
+func (namespaceOnlyProbe) LookupAt(context.Context, storage.ChildName) (storage.Attr, error) {
+	return storage.Attr{ID: 11, Kind: storage.NodeRegular}, nil
+}
+func (namespaceOnlyProbe) MutateName(context.Context, storage.NameCommand) (storage.NameResult, error) {
+	return storage.NameResult{}, nil
+}
+
+func (directoryReaderOnlyProbe) CheckDirectoryRead() error { return nil }
+func (directoryReaderOnlyProbe) ReadDirNode(_ context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	return storage.ObservedDirectory{Observation: storage.DirectoryObservation{ParentID: target.NodeID, Revision: []byte{1}}}, nil
+}
+func (directoryReaderOnlyProbe) ReadDirNodeBounded(_ context.Context, target storage.DirectoryTarget, _ *storage.ListResult) (storage.DirectoryObservation, error) {
+	return storage.DirectoryObservation{ParentID: target.NodeID, Revision: []byte{1}}, nil
+}
+
+func TestDirectoryReadCapabilityIsIndependentOfNamespaceMutation(t *testing.T) {
+	wrapper := &fileSession{FileSession: directoryReaderOnlyProbe{}, storage: &Storage{}}
+	if err := wrapper.CheckDirectoryRead(); err != nil {
+		t.Fatal(err)
+	}
+	if err := wrapper.CheckNamespaceAccess(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("directory-only backend exposed namespace mutation: %v", err)
+	}
+	if observed, err := wrapper.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: 7}); err != nil || observed.Observation.ParentID != 7 {
+		t.Fatalf("directory-only read = %+v, %v", observed, err)
+	}
+}
+
+func TestNamespaceCapabilityIsIndependentOfDirectoryRead(t *testing.T) {
+	wrapper := &fileSession{FileSession: namespaceOnlyProbe{}, storage: &Storage{}}
+	if err := wrapper.CheckNamespaceAccess(); err != nil {
+		t.Fatal(err)
+	}
+	if err := wrapper.CheckDirectoryRead(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("namespace-only backend exposed directory read: %v", err)
+	}
+	if attr, err := wrapper.LookupAt(t.Context(), storage.ChildName{}); err != nil || attr.ID != 11 {
+		t.Fatalf("namespace-only lookup = %+v, %v", attr, err)
+	}
+}
+
 func (p *capabilitySessionProbe) capture(ctx context.Context) {
 	p.observed = locking.ScopeFromContext(ctx)
 }
@@ -65,15 +111,49 @@ func (p *capabilitySessionProbe) Drop(ctx context.Context, _ storage.UseOwner, _
 	p.capture(ctx)
 	return p.failure
 }
+
+func TestNamespaceWrapperRejectsSubstitutedDirectoryIdentity(t *testing.T) {
+	probe := &capabilitySessionProbe{}
+	view := &Storage{}
+	wrapper := &fileSession{FileSession: probe, storage: view}
+	target := storage.DirectoryTarget{NodeID: 9}
+	if observed, err := wrapper.ReadDirNode(t.Context(), target); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observed, storage.ObservedDirectory{}) {
+		t.Fatalf("substituted directory = %+v, %v", observed, err)
+	}
+	result, err := storage.NewListResult(4096, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		return nameBytes + metadataBytes + 64, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed, err := wrapper.ReadDirNodeBounded(t.Context(), target, result); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(observed, storage.DirectoryObservation{}) {
+		t.Fatalf("substituted bounded directory = %+v, %v", observed, err)
+	}
+	if entries, err := result.Entries(); entries != nil || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("substituted bounded directory exposed %+v, %v", entries, err)
+	}
+}
 func (p *capabilitySessionProbe) CheckAtomicFileOpen() error { return p.checkErr }
 func (p *capabilitySessionProbe) OpenAt(ctx context.Context, _ storage.ChildName, _ storage.OpenAtOptions) (storage.OpenResult, error) {
 	p.capture(ctx)
 	return p.open, p.failure
 }
 func (p *capabilitySessionProbe) CheckNamespaceAccess() error { return p.checkErr }
+func (p *capabilitySessionProbe) CheckDirectoryRead() error   { return p.checkErr }
 func (p *capabilitySessionProbe) LookupAt(ctx context.Context, _ storage.ChildName) (storage.Attr, error) {
 	p.capture(ctx)
 	return storage.Attr{ID: 3, Kind: storage.NodeRegular}, p.failure
+}
+func (p *capabilitySessionProbe) ReadDirNode(ctx context.Context, _ storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	p.capture(ctx)
+	return storage.ObservedDirectory{Observation: storage.DirectoryObservation{ParentID: 3, Revision: []byte{1}}}, p.failure
+}
+func (p *capabilitySessionProbe) ReadDirNodeBounded(ctx context.Context, _ storage.DirectoryTarget, result *storage.ListResult) (storage.DirectoryObservation, error) {
+	p.capture(ctx)
+	if p.failure == nil && result != nil {
+		_ = result.Add(storage.Entry{Name: "entry", Attr: storage.Attr{ID: 4, Kind: storage.NodeRegular}})
+	}
+	return storage.DirectoryObservation{ParentID: 3, Revision: []byte{1}}, p.failure
 }
 func (p *capabilitySessionProbe) MutateName(ctx context.Context, _ storage.NameCommand) (storage.NameResult, error) {
 	p.capture(ctx)
@@ -269,6 +349,7 @@ func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
 	for name, check := range map[string]func() error{
 		"atomic open": session.CheckAtomicFileOpen,
 		"namespace":   session.CheckNamespaceAccess,
+		"directory":   session.CheckDirectoryRead,
 		"node refs":   session.CheckNodeReferences,
 		"actions":     session.CheckFileActions,
 	} {
@@ -282,6 +363,21 @@ func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
 	}
 	if _, err := session.LookupAt(locking.WithScope(t.Context(), proof), storage.ChildName{}); !errors.Is(err, failure) || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
 		t.Fatalf("lookup error=%v scope=%+v", err, probe.observed)
+	}
+	if observed, err := session.ReadDirNode(locking.WithScope(t.Context(), proof), storage.DirectoryTarget{NodeID: attr.ID}); !errors.Is(err, failure) || !reflect.DeepEqual(observed, storage.ObservedDirectory{}) || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
+		t.Fatalf("directory=%+v error=%v scope=%+v", observed, err, probe.observed)
+	}
+	bounded, err := storage.NewListResult(4096, 0, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		return nameBytes + metadataBytes + 64, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed, err := session.ReadDirNodeBounded(locking.WithScope(t.Context(), proof), storage.DirectoryTarget{NodeID: attr.ID}, bounded); !errors.Is(err, failure) || !reflect.DeepEqual(observed, storage.DirectoryObservation{}) || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
+		t.Fatalf("bounded directory=%+v error=%v scope=%+v", observed, err, probe.observed)
+	}
+	if entries, err := bounded.Entries(); entries != nil || !errors.Is(err, failure) {
+		t.Fatalf("failed bounded directory exposed %+v, %v", entries, err)
 	}
 	if result, err := session.MutateName(t.Context(), storage.NameCommand{}); !errors.Is(err, failure) || result.Attr == nil || result.Attr.ID != attr.ID || !reflect.DeepEqual(probe.observed, proof) {
 		t.Fatalf("name mutation=%+v error=%v scope=%+v", result, err, probe.observed)

@@ -7,8 +7,12 @@ import (
 )
 
 const (
-	MaxLeafBytes  = 4096
-	MaxTargetUses = 16
+	MaxLeafBytes           = 4096
+	MaxNamespaceGuards     = 256
+	MaxNamespaceGuardBytes = 64 << 10
+	MaxTargetUses          = 16
+	MaxDirectoryEntries    = 65536
+	MaxDirectoryBytes      = 8 << 20
 )
 
 func (c ChildCondition) Check() error {
@@ -46,6 +50,100 @@ func (n ChildName) Check() error {
 		return err
 	}
 	return CheckLeaf(n.RawLeaf)
+}
+
+func (d DirectoryObservation) Check() error {
+	if d.ParentID == 0 || len(d.Revision) == 0 || len(d.Revision) > MaxObservationTokenBytes {
+		return syscall.EINVAL
+	}
+	return nil
+}
+
+func (e ObservedEdge) Check() error {
+	if e.ParentID == 0 || e.ChildID == 0 || e.ParentID == e.ChildID {
+		return syscall.EINVAL
+	}
+	return CheckLeaf(e.RawLeaf)
+}
+
+func (g *NamespaceGuards) Check() error {
+	if g == nil {
+		return nil
+	}
+	if len(g.Directories) > MaxNamespaceGuards || len(g.Edges) > MaxNamespaceGuards {
+		return syscall.EFBIG
+	}
+	total := 0
+	directories := make(map[uint64]struct{}, len(g.Directories))
+	children := make(map[uint64]uint64, len(g.Edges))
+	type slot struct {
+		parent uint64
+		leaf   string
+	}
+	slots := make(map[slot]struct{}, len(g.Edges))
+	for _, directory := range g.Directories {
+		if err := directory.Check(); err != nil {
+			return err
+		}
+		if _, exists := directories[directory.ParentID]; exists {
+			return syscall.EINVAL
+		}
+		directories[directory.ParentID] = struct{}{}
+		total += len(directory.Revision) + 8
+	}
+	for _, edge := range g.Edges {
+		if err := edge.Check(); err != nil {
+			return err
+		}
+		if _, exists := children[edge.ChildID]; exists {
+			return syscall.EINVAL
+		}
+		key := slot{parent: edge.ParentID, leaf: string(edge.RawLeaf)}
+		if _, exists := slots[key]; exists {
+			return syscall.EINVAL
+		}
+		slots[key] = struct{}{}
+		children[edge.ChildID] = edge.ParentID
+		total += len(edge.RawLeaf) + 16
+	}
+	if total > MaxNamespaceGuardBytes {
+		return syscall.EFBIG
+	}
+	for child := range children {
+		seen := make(map[uint64]struct{}, len(children))
+		id := child
+		for {
+			if _, exists := seen[id]; exists {
+				return syscall.EINVAL
+			}
+			seen[id] = struct{}{}
+			parent, exists := children[id]
+			if !exists {
+				if g.RootID != 0 && id != g.RootID {
+					return syscall.EINVAL
+				}
+				break
+			}
+			id = parent
+		}
+	}
+	if g.RootID != 0 {
+		for directory := range directories {
+			seen := make(map[uint64]struct{}, len(children))
+			for directory != g.RootID {
+				if _, exists := seen[directory]; exists {
+					return syscall.EINVAL
+				}
+				seen[directory] = struct{}{}
+				parent, exists := children[directory]
+				if !exists {
+					return syscall.EINVAL
+				}
+				directory = parent
+			}
+		}
+	}
+	return nil
 }
 
 func (f InitialFields) Check() error {
@@ -323,6 +421,61 @@ func (c FileMutation) CheckDataLimit(maxBytes int64) error {
 		return syscall.EFBIG
 	}
 	return c.Check()
+}
+
+// ObservedEntryBytes bounds the retained in-memory representation before a
+// producer loads a raw name or metadata envelope.
+func ObservedEntryBytes(nameBytes, metadataBytes int64) (int64, error) {
+	if nameBytes <= 0 || nameBytes > MaxLeafBytes {
+		return 0, syscall.EFBIG
+	}
+	retained, err := MetadataRetentionBytes(metadataBytes)
+	if err != nil {
+		return 0, err
+	}
+	return 256 + 4*nameBytes + retained, nil
+}
+
+func (d ObservedDirectory) Check() error {
+	if err := d.Observation.Check(); err != nil {
+		return err
+	}
+	if len(d.Entries) > MaxDirectoryEntries {
+		return syscall.EFBIG
+	}
+	used := int64(0)
+	names := make(map[string]struct{}, len(d.Entries))
+	ids := make(map[uint64]struct{}, len(d.Entries))
+	for _, entry := range d.Entries {
+		if err := CheckLeaf(entry.RawLeaf); err != nil {
+			return err
+		}
+		if entry.Attr.ID == 0 || entry.Attr.ID == d.Observation.ParentID || entry.Attr.Kind.Check() != nil || entry.Attr.Size < 0 {
+			return syscall.EIO
+		}
+		name := string(entry.RawLeaf)
+		if _, exists := names[name]; exists {
+			return syscall.EIO
+		}
+		if _, exists := ids[entry.Attr.ID]; exists {
+			return syscall.EIO
+		}
+		names[name] = struct{}{}
+		ids[entry.Attr.ID] = struct{}{}
+		metadataBytes, err := metadataSize(entry.Attr.Metadata)
+		if err != nil {
+			return err
+		}
+		charge, err := ObservedEntryBytes(int64(len(entry.RawLeaf)), int64(metadataBytes))
+		if err != nil {
+			return err
+		}
+		if charge > MaxDirectoryBytes-used {
+			return syscall.EFBIG
+		}
+		used += charge
+	}
+	return nil
 }
 
 func (r FileActionReceipt) Check() error {

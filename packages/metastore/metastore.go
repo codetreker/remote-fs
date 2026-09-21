@@ -217,6 +217,9 @@ type Node struct {
 	ChangeTime *time.Time
 	Metadata   map[string]storage.OpaquePayload
 	LinkTarget []byte
+	// DirectoryRevision is the opaque, nonzero revision of a directory's complete
+	// child-name set. It is empty for non-directories.
+	DirectoryRevision []byte
 
 	// Size is the length of a file's contents. It is zero for a directory, which the storage
 	// contract leaves unspecified.
@@ -249,6 +252,7 @@ func (n Node) Clone() Node {
 	n.ModTime = attr.ModTime
 	n.Metadata = attr.Metadata
 	n.LinkTarget = bytes.Clone(n.LinkTarget)
+	n.DirectoryRevision = bytes.Clone(n.DirectoryRevision)
 	return n
 }
 

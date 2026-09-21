@@ -25,6 +25,18 @@ type NamespaceAccess interface {
 	MutateName(context.Context, NameCommand) (NameResult, error)
 }
 
+// DirectoryReader is the optional identity-addressed directory enumeration
+// capability. ReadDirNode requires ReadEntries and returns one complete
+// authoritative capture. Its bounded form reserves names and metadata before
+// loading them and invalidates the collector on any failure; a partial directory
+// is never a successful result. CheckDirectoryRead verifies this complete chain
+// independently of NamespaceAccess so either capability can be offered alone.
+type DirectoryReader interface {
+	CheckDirectoryRead() error
+	ReadDirNode(context.Context, DirectoryTarget) (ObservedDirectory, error)
+	ReadDirNodeBounded(context.Context, DirectoryTarget, *ListResult) (DirectoryObservation, error)
+}
+
 // NodeReference retains a node identity without granting file byte methods. It
 // always exposes the exact live-reference scope and an authoritative state
 // capture, so a caller that passed NodeReferences preflight cannot discover
@@ -216,6 +228,43 @@ type DirectoryTarget struct {
 type ChildName struct {
 	Parent  DirectoryTarget
 	RawLeaf []byte
+}
+
+// DirectoryObservation identifies one complete authoritative capture of a
+// directory. Revision is opaque and can only be compared for byte equality.
+type DirectoryObservation struct {
+	ParentID uint64
+	Revision []byte
+}
+
+// ObservedEdge records one exact raw name binding. RawLeaf remains
+// platform-neutral and is not required to be UTF-8.
+type ObservedEdge struct {
+	ParentID uint64
+	RawLeaf  []byte
+	ChildID  uint64
+}
+
+// NamespaceGuards require directory revisions and exact name bindings to
+// remain current when an operation reaches the authority. RootID, when set,
+// requires every guarded directory and edge to form one ancestry rooted there.
+type NamespaceGuards struct {
+	Directories []DirectoryObservation `json:",omitempty"`
+	Edges       []ObservedEdge         `json:",omitempty"`
+	RootID      uint64
+}
+
+// ObservedEntry owns one raw child name and its captured attributes.
+type ObservedEntry struct {
+	RawLeaf []byte
+	Attr    Attr
+}
+
+// ObservedDirectory is one complete directory capture. Observation and every
+// entry belong to the same authoritative state.
+type ObservedDirectory struct {
+	Observation DirectoryObservation
+	Entries     []ObservedEntry `json:",omitempty"`
 }
 
 // RenameTarget separates the slot observed by the caller from the output leaf.

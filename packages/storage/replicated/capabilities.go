@@ -62,6 +62,10 @@ func (s *fileSession) CheckNamespaceAccess() error {
 	return capabilityCheck(s.remote, func(c httprest.NamespaceAccessWithBarrier) error { return c.CheckNamespaceAccess() })
 }
 
+func (s *fileSession) CheckDirectoryRead() error {
+	return capabilityCheck(s.remote, storage.DirectoryReader.CheckDirectoryRead)
+}
+
 func (s *fileSession) CheckNodeReferences() error {
 	return capabilityCheck(s.remote, func(c httprest.NodeReferencesWithBarrier) error { return c.CheckNodeReferences() })
 }
@@ -157,6 +161,44 @@ func (s *fileSession) LookupAt(ctx context.Context, name storage.ChildName) (sto
 	return sessionCapability(ctx, s, true, func(ctx context.Context, capability httprest.NamespaceAccessWithBarrier) (storage.Attr, error) {
 		return capability.LookupAt(ctx, name)
 	})
+}
+
+func (s *fileSession) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	observed, err := sessionCapability(ctx, s, true, func(ctx context.Context, capability storage.DirectoryReader) (storage.ObservedDirectory, error) {
+		return capability.ReadDirNode(ctx, target)
+	})
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	if err := observed.Check(); err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	if observed.Observation.ParentID != target.NodeID {
+		return storage.ObservedDirectory{}, syscall.EIO
+	}
+	return observed, nil
+}
+
+func (s *fileSession) ReadDirNodeBounded(ctx context.Context, target storage.DirectoryTarget, result *storage.ListResult) (observation storage.DirectoryObservation, returned error) {
+	if result == nil {
+		return observation, syscall.EINVAL
+	}
+	defer func() {
+		if returned != nil {
+			result.Fail(returned)
+			observation = storage.DirectoryObservation{}
+		}
+	}()
+	observation, returned = sessionCapability(ctx, s, true, func(ctx context.Context, capability storage.DirectoryReader) (storage.DirectoryObservation, error) {
+		return capability.ReadDirNodeBounded(ctx, target, result)
+	})
+	if returned == nil {
+		returned = observation.Check()
+	}
+	if returned == nil && observation.ParentID != target.NodeID {
+		returned = syscall.EIO
+	}
+	return observation, returned
 }
 
 func (s *fileSession) MutateName(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
@@ -324,6 +366,7 @@ func (s *fileSession) Drop(ctx context.Context, owner storage.UseOwner, domain s
 var (
 	_ storage.AtomicFileOpener = (*fileSession)(nil)
 	_ storage.NamespaceAccess  = (*fileSession)(nil)
+	_ storage.DirectoryReader  = (*fileSession)(nil)
 	_ storage.NodeReferences   = (*fileSession)(nil)
 	_ storage.FileActions      = (*fileSession)(nil)
 	_ storage.MetadataAccess   = (*fileSession)(nil)

@@ -21,38 +21,41 @@ func fileControl(op storage.Operation) bool {
 }
 
 type fileRequest struct {
-	Op           storage.Operation               `json:"op"`
-	Session      string                          `json:"session"`
-	File         string                          `json:"file"`
-	Action       storage.LockRequestID           `json:"action"`
-	Path         []byte                          `json:"path"`
-	Node         uint64                          `json:"node"`
-	Options      storage.FileSessionOptions      `json:"options"`
-	Open         storage.FileOpenOptions         `json:"open"`
-	Child        *childName                      `json:"child,omitempty"`
-	OpenAt       *openAtOptions                  `json:"openAt,omitempty"`
-	NodeRef      *nodeRefOptions                 `json:"nodeRef,omitempty"`
-	Name         *nameCommand                    `json:"name,omitempty"`
-	Offset       int64                           `json:"offset"`
-	ResultBytes  int64                           `json:"resultBytes"`
-	Length       int                             `json:"length"`
-	Data         []byte                          `json:"data"`
-	Change       *AttrChange                     `json:"change,omitempty"`
-	Scope        *storage.UseScope               `json:"scope,omitempty"`
-	OwnerOptions storage.OwnerOptions            `json:"ownerOptions"`
-	Owner        storage.UseOwner                `json:"owner"`
-	LockID       storage.LockRequestID           `json:"lockId"`
-	Domain       storage.ConflictDomain          `json:"domain"`
-	Commands     []storage.RangeCommand          `json:"commands,omitempty"`
-	Namespace    string                          `json:"namespace"`
-	Version      metadataVersion                 `json:"version"`
-	Payload      metadataPayload                 `json:"payload"`
-	Pending      *pendingUnlinkCommand           `json:"pending,omitempty"`
-	ClearPending *clearPendingUnlinkCommand      `json:"clearPending,omitempty"`
-	Mutation     *fileMutationOptions            `json:"mutation,omitempty"`
-	FileAction   storage.FileActionID            `json:"fileAction"`
-	DeleteIntent storage.DeleteIntentID          `json:"deleteIntent"`
-	Acknowledge  *acknowledgeDeleteIntentCommand `json:"acknowledge,omitempty"`
+	Op                storage.Operation               `json:"op"`
+	Session           string                          `json:"session"`
+	File              string                          `json:"file"`
+	Action            storage.LockRequestID           `json:"action"`
+	Path              []byte                          `json:"path"`
+	Node              uint64                          `json:"node"`
+	Options           storage.FileSessionOptions      `json:"options"`
+	Open              storage.FileOpenOptions         `json:"open"`
+	Child             *childName                      `json:"child,omitempty"`
+	OpenAt            *openAtOptions                  `json:"openAt,omitempty"`
+	NodeRef           *nodeRefOptions                 `json:"nodeRef,omitempty"`
+	Name              *nameCommand                    `json:"name,omitempty"`
+	Offset            int64                           `json:"offset"`
+	ResultBytes       int64                           `json:"resultBytes"`
+	Length            int                             `json:"length"`
+	Data              []byte                          `json:"data"`
+	Change            *AttrChange                     `json:"change,omitempty"`
+	Scope             *storage.UseScope               `json:"scope,omitempty"`
+	OwnerOptions      storage.OwnerOptions            `json:"ownerOptions"`
+	Owner             storage.UseOwner                `json:"owner"`
+	LockID            storage.LockRequestID           `json:"lockId"`
+	Domain            storage.ConflictDomain          `json:"domain"`
+	Commands          []storage.RangeCommand          `json:"commands,omitempty"`
+	Namespace         string                          `json:"namespace"`
+	Version           metadataVersion                 `json:"version"`
+	Payload           metadataPayload                 `json:"payload"`
+	Pending           *pendingUnlinkCommand           `json:"pending,omitempty"`
+	ClearPending      *clearPendingUnlinkCommand      `json:"clearPending,omitempty"`
+	Mutation          *fileMutationOptions            `json:"mutation,omitempty"`
+	FileAction        storage.FileActionID            `json:"fileAction"`
+	DeleteIntent      storage.DeleteIntentID          `json:"deleteIntent"`
+	Acknowledge       *acknowledgeDeleteIntentCommand `json:"acknowledge,omitempty"`
+	Directory         *storage.DirectoryTarget        `json:"directory,omitempty"`
+	DirectoryMetadata *directoryMetadataOptions       `json:"directoryMetadata,omitempty"`
+	Guards            *namespaceGuards                `json:"guards,omitempty"`
 }
 
 func (r fileRequest) MarshalJSON() ([]byte, error) {
@@ -85,25 +88,27 @@ func (r fileRequest) MarshalJSON() ([]byte, error) {
 }
 
 type fileResponse struct {
-	Node          uint64                     `json:"node,omitempty"`
-	Session       string                     `json:"session,omitempty"`
-	File          string                     `json:"file,omitempty"`
-	Retry         bool                       `json:"retry,omitempty"`
-	Epoch         uint64                     `json:"epoch"`
-	Status        *storage.FileSessionStatus `json:"status,omitempty"`
-	Attr          *Attr                      `json:"attr,omitempty"`
-	Data          []byte                     `json:"data"`
-	Conflict      *storage.RangeConflict     `json:"conflict,omitempty"`
-	Attempt       *storage.RangeAttempt      `json:"attempt,omitempty"`
-	Barrier       *MutationBarrier           `json:"barrier,omitempty"`
-	Capabilities  *fileCapabilities          `json:"capabilities,omitempty"`
-	Scope         *storage.UseScope          `json:"scope,omitempty"`
-	Owner         storage.UseOwner           `json:"owner,omitempty"`
-	Metadata      *OpaquePayload             `json:"metadata,omitempty"`
-	Outcome       storage.OpenOutcome        `json:"outcome,omitempty"`
-	State         *referenceState            `json:"state,omitempty"`
-	ActionReceipt *storage.FileActionReceipt `json:"actionReceipt,omitempty"`
-	DeleteStatus  *deleteIntentStatus        `json:"deleteStatus,omitempty"`
+	Node            uint64                     `json:"node,omitempty"`
+	Session         string                     `json:"session,omitempty"`
+	File            string                     `json:"file,omitempty"`
+	Retry           bool                       `json:"retry,omitempty"`
+	Epoch           uint64                     `json:"epoch"`
+	Status          *storage.FileSessionStatus `json:"status,omitempty"`
+	Attr            *Attr                      `json:"attr,omitempty"`
+	Data            []byte                     `json:"data"`
+	Conflict        *storage.RangeConflict     `json:"conflict,omitempty"`
+	Attempt         *storage.RangeAttempt      `json:"attempt,omitempty"`
+	Barrier         *MutationBarrier           `json:"barrier,omitempty"`
+	Capabilities    *fileCapabilities          `json:"capabilities,omitempty"`
+	Scope           *storage.UseScope          `json:"scope,omitempty"`
+	Owner           storage.UseOwner           `json:"owner,omitempty"`
+	Metadata        *OpaquePayload             `json:"metadata,omitempty"`
+	Outcome         storage.OpenOutcome        `json:"outcome,omitempty"`
+	State           *referenceState            `json:"state,omitempty"`
+	ActionReceipt   *storage.FileActionReceipt `json:"actionReceipt,omitempty"`
+	DeleteStatus    *deleteIntentStatus        `json:"deleteStatus,omitempty"`
+	Directory       *observedDirectory         `json:"directory,omitempty"`
+	NameObservation *nameObservation           `json:"nameObservation,omitempty"`
 }
 
 func fileMutation(op storage.Operation) bool {

@@ -17,7 +17,9 @@ func TestReaderConnectionOptionsAreBoundedAndValidatedBeforeOpening(t *testing.T
 		defaults.MaxSnapshotReaderConnections < 1 ||
 		defaults.MaxIntegrityRecords != DefaultMaxIntegrityRecords || defaults.MaxIntegrityRecords < 1 ||
 		defaults.MaxIntegrityBytes != DefaultMaxIntegrityBytes || defaults.MaxIntegrityBytes < 1 ||
-		defaults.MaxMetadataBytes != DefaultMaxMetadataBytes || defaults.MaxMetadataBytes < 1 {
+		defaults.MaxMetadataBytes != DefaultMaxMetadataBytes || defaults.MaxMetadataBytes < 1 ||
+		defaults.MaxDirectoryEntries != DefaultMaxDirectoryEntries || defaults.MaxDirectoryEntries < 1 ||
+		defaults.MaxDirectoryBytes != DefaultMaxDirectoryBytes || defaults.MaxDirectoryBytes < 1 {
 		t.Fatalf("default SQLite options are %+v", defaults)
 	}
 	effective, err := (Options{Window: DefaultWindow()}).Effective()
@@ -54,6 +56,11 @@ func TestReaderConnectionOptionsAreBoundedAndValidatedBeforeOpening(t *testing.T
 		store.Close()
 		t.Fatalf("Open configured a metadata byte limit of %d, want default %d",
 			store.maxMetadataBytes, DefaultMaxMetadataBytes)
+	}
+	if store.maxDirectoryEntries != DefaultMaxDirectoryEntries || store.maxDirectoryBytes != DefaultMaxDirectoryBytes {
+		store.Close()
+		t.Fatalf("Open configured directory limits %d/%d, want %d/%d",
+			store.maxDirectoryEntries, store.maxDirectoryBytes, DefaultMaxDirectoryEntries, DefaultMaxDirectoryBytes)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -181,6 +188,33 @@ func TestReaderConnectionOptionsAreBoundedAndValidatedBeforeOpening(t *testing.T
 		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
 			t.Fatalf("invalid metadata byte limit touched the database path: %v", statErr)
 		}
+	}
+	for _, test := range []struct {
+		name    string
+		entries int
+		bytes   int64
+	}{
+		{"negative directory entries", -1, 0},
+		{"excess directory entries", DefaultMaxDirectoryEntries + 1, 0},
+		{"negative directory bytes", 0, -1},
+		{"excess directory bytes", 0, DefaultMaxDirectoryBytes + 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := t.TempDir() + "/nested/metastore.db"
+			store, err := OpenWithOptions(t.Context(), path, "workspace", 0, Options{
+				Window: DefaultWindow(), MaxDirectoryEntries: test.entries, MaxDirectoryBytes: test.bytes,
+			})
+			if err == nil {
+				store.Close()
+				t.Fatal("opening with invalid directory limits succeeded")
+			}
+			if !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("opening with directory limits %d/%d: %v, want EINVAL", test.entries, test.bytes, err)
+			}
+			if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("invalid directory limits touched the database path: %v", statErr)
+			}
+		})
 	}
 }
 

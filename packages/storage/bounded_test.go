@@ -2,6 +2,7 @@ package storage_test
 
 import (
 	"errors"
+	"math"
 	"strings"
 	"syscall"
 	"testing"
@@ -94,5 +95,68 @@ func TestListResultOwnsOnlyTheChargedNameAndTimeInstants(t *testing.T) {
 	}
 	if !entries[0].Attr.AccessTime.Equal(access) || !entries[0].Attr.ModTime.Equal(modified) {
 		t.Fatalf("UTC normalization changed the instants: %+v", entries[0].Attr)
+	}
+}
+
+func TestListPrefixChargesCompleteNonEntryOutput(t *testing.T) {
+	result, err := storage.NewListResult(20, 2, func(index int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+		if index != 0 {
+			t.Fatalf("prefix consumed an entry index: %d", index)
+		}
+		return nameBytes + metadataBytes, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := result.ReservePrefix(9); err != nil {
+		t.Fatal(err)
+	}
+	if err := result.Add(storage.Entry{Name: "one", Attr: storage.Attr{ID: 2, Kind: storage.NodeRegular}}); err != nil {
+		t.Fatalf("entry did not fit exact combined bound: %v", err)
+	}
+	entries, err := result.Entries()
+	if err != nil || len(entries) != 1 || entries[0].Name != "one" {
+		t.Fatalf("prefix changed entries: %+v %v", entries, err)
+	}
+}
+
+func TestListPrefixRejectsLateRepeatedAndOverflowCharges(t *testing.T) {
+	makeResult := func(maxBytes, fixedBytes int64) *storage.ListResult {
+		t.Helper()
+		result, err := storage.NewListResult(maxBytes, fixedBytes, func(_ int, nameBytes, metadataBytes int64, _ storage.Attr) (int64, error) {
+			return nameBytes + metadataBytes, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	var missing *storage.ListResult
+	if err := missing.ReservePrefix(0); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("nil prefix receiver = %v", err)
+	}
+	for _, test := range []struct {
+		max, fixed, charge int64
+		want               syscall.Errno
+	}{
+		{10, 0, -1, syscall.EINVAL},
+		{10, 3, 8, syscall.EFBIG},
+		{math.MaxInt64, 1, math.MaxInt64, syscall.EFBIG},
+	} {
+		result := makeResult(test.max, test.fixed)
+		failure := result.ReservePrefix(test.charge)
+		if !errors.Is(failure, test.want) {
+			t.Fatalf("prefix %d returned %v, want %v", test.charge, failure, test.want)
+		}
+		if entries, err := result.Entries(); entries != nil || err != failure {
+			t.Fatalf("failed prefix exposed entries = %+v, %v", entries, err)
+		}
+	}
+	result := makeResult(100, 0)
+	if err := result.Add(storage.Entry{Name: "x", Attr: storage.Attr{ID: 2, Kind: storage.NodeRegular}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := result.ReservePrefix(1); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("late prefix = %v", err)
 	}
 }

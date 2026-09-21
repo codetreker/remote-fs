@@ -340,6 +340,7 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 	if fileAttrResult(req.Op) {
 		r = r.WithContext(storage.WithBoundedAttrResult(r.Context(), req.ResultBytes, h.attrResultBudget(req)))
 	}
+	r = r.WithContext(h.observationResultContext(r.Context(), req))
 	digest := sha256.Sum256(append(body, []byte(r.Header.Get(HeaderMutationScope))...))
 	response, err := h.fileCall(r.Context(), req, digest)
 	if err != nil {
@@ -421,7 +422,7 @@ func validateFileArguments(req fileRequest, maximum storage.FileSessionOptions) 
 		return err
 	case storage.OpFileOpenNode:
 		return req.Open.CheckNode(req.Node)
-	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef, storage.OpFileLookupAt, storage.OpFileMutateName:
+	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileObserveName, storage.OpFileMutateName:
 		return validateCapabilityArguments(req)
 	case storage.OpFileRead:
 		if req.Offset < 0 || req.Length < 0 {
@@ -666,7 +667,7 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		err = e
 		wire := AttrOf(attr)
 		response.Attr = wire
-	case storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileAcknowledgeDeleteIntent, storage.OpFileLookupAt, storage.OpFileMutateName, storage.OpFileSetNodeMetadata, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop:
+	case storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileAcknowledgeDeleteIntent, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileMutateName, storage.OpFileSetNodeMetadata, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop:
 		response, err = h.performSessionCapability(ctx, s.native, req)
 	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
 		return h.openReference(ctx, s, req)
@@ -737,7 +738,7 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 				return response, syscall.EBADF
 			}
 			err = data.Sync(ctx)
-		case storage.OpFileState, storage.OpFileScope, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink, storage.OpFileMutate:
+		case storage.OpFileObserveName, storage.OpFileState, storage.OpFileScope, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink, storage.OpFileMutate:
 			response, err = performReferenceCapability(ctx, file.native, req)
 		case storage.OpFileClose:
 			err = file.native.Close(ctx)

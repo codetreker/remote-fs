@@ -15,11 +15,11 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-func validateMetadataIntegrity(ctx context.Context, db sqlvalue.Queryer, volume *int64, limit int64, opaqueVersions bool) error {
+func validateMetadataIntegrity(ctx context.Context, db sqlvalue.Queryer, volume *int64, limit int64, opaqueVersions bool, version int) error {
 	if err := validateMetadataPayloads(ctx, db, volume, opaqueVersions); err != nil {
 		return err
 	}
-	if err := validateMetadataAccounting(ctx, db); err != nil {
+	if err := validateMetadataAccounting(ctx, db, version); err != nil {
 		return err
 	}
 	where := ""
@@ -28,10 +28,20 @@ func validateMetadataIntegrity(ctx context.Context, db sqlvalue.Queryer, volume 
 		where = "WHERE v.id=?"
 		args = []any{*volume}
 	}
+	nodeBytes := "length(metadata)"
+	historyBytes := "coalesce(length(metadata),0)"
+	if version >= firstDurableIdentitySchemaVersion {
+		nodeBytes += " + length(link_target)"
+		historyBytes += " + coalesce(length(link_target),0)"
+	}
+	if version >= firstDirectoryRevisionSchemaVersion {
+		nodeBytes += " + length(directory_revision)"
+		historyBytes += " + coalesce(length(directory_revision),0)"
+	}
 	rows, err := db.QueryContext(ctx, `SELECT v.id,
 		CASE WHEN typeof(v.metadata_used)='integer' THEN v.metadata_used END,typeof(v.metadata_used),
-		coalesce((SELECT sum(length(metadata) + length(link_target)) FROM nodes n WHERE n.volume=v.id),0),
-		coalesce((SELECT sum(coalesce(length(metadata),0) + coalesce(length(link_target),0)) FROM changes c WHERE c.volume=v.id),0)
+		coalesce((SELECT sum(`+nodeBytes+`) FROM nodes n WHERE n.volume=v.id),0),
+		coalesce((SELECT sum(`+historyBytes+`) FROM changes c WHERE c.volume=v.id),0)
 		FROM volumes v `+where, args...)
 	if err != nil {
 		return err
@@ -134,8 +144,14 @@ func validateMetadataPayloads(ctx context.Context, db sqlvalue.Queryer, volume *
 	return rows.Err()
 }
 
-func validateMetadataAccounting(ctx context.Context, db sqlvalue.Queryer) error {
-	nodeBody, err := migrationFiles.ReadFile("migrations/0007_durable_identity.sql")
+func validateMetadataAccounting(ctx context.Context, db sqlvalue.Queryer, version int) error {
+	migration := "migrations/0006_neutral_metadata.sql"
+	if version >= firstDirectoryRevisionSchemaVersion {
+		migration = "migrations/0008_directory_revisions.sql"
+	} else if version >= firstDurableIdentitySchemaVersion {
+		migration = "migrations/0007_durable_identity.sql"
+	}
+	nodeBody, err := migrationFiles.ReadFile(migration)
 	if err != nil {
 		return err
 	}

@@ -559,7 +559,7 @@ func TestBoundedFrameSizersMatchTheEncodedChangeAndSnapshotPage(t *testing.T) {
 	}
 
 	rows := []metastore.Row{
-		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory}},
+		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory, DirectoryRevision: []byte{1}}},
 		{Parent: 1, Name: []byte{0xff, 'x'}, Node: metastore.Node{ID: 2, Kind: storage.NodeRegular, Content: "key"}},
 		{Parent: 1, Name: []byte("link"), Node: metastore.Node{ID: 3, Kind: storage.NodeSymlink, Size: 3, LinkTarget: []byte{0xff, 0, 'x'}}},
 	}

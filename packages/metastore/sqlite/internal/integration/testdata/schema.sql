@@ -82,7 +82,7 @@ CREATE TABLE changes (
 	content           TEXT,
 	recorded_sec      INTEGER NOT NULL,
 	recorded_nsec     INTEGER NOT NULL
-	, node_kind INTEGER, birth_sec INTEGER, birth_nsec INTEGER, change_sec INTEGER, change_nsec INTEGER, metadata BLOB, link_target BLOB);
+	, node_kind INTEGER, birth_sec INTEGER, birth_nsec INTEGER, change_sec INTEGER, change_nsec INTEGER, metadata BLOB, link_target BLOB, directory_revision BLOB);
 
 CREATE TABLE database_state (
 	singleton         INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -152,7 +152,7 @@ CREATE TABLE nodes (
 	content    TEXT REFERENCES objects(key)
 	, detached INTEGER NOT NULL DEFAULT 0, content_revision INTEGER NOT NULL DEFAULT 1, kind INTEGER NOT NULL DEFAULT 1, birth_sec INTEGER, birth_nsec INTEGER, change_sec INTEGER, change_nsec INTEGER, metadata BLOB NOT NULL DEFAULT X'52464d010000', link_target BLOB NOT NULL DEFAULT X'', pending_unlink INTEGER NOT NULL DEFAULT 0
 	CHECK (pending_unlink IN (0, 1)), pending_generation INTEGER NOT NULL DEFAULT 0
-	CHECK (pending_generation >= 0));
+	CHECK (pending_generation >= 0), directory_revision BLOB NOT NULL DEFAULT X'');
 
 CREATE TABLE objects (
 	key          TEXT PRIMARY KEY,
@@ -177,36 +177,36 @@ CREATE TABLE volumes (
 	CHECK (typeof(metadata_used) = 'integer' AND metadata_used >= 0));
 
 CREATE TRIGGER changes_metadata_delete AFTER DELETE ON changes BEGIN
-	UPDATE volumes SET metadata_used = metadata_used - coalesce(length(OLD.metadata), 0) - coalesce(length(OLD.link_target), 0)
+	UPDATE volumes SET metadata_used = metadata_used - coalesce(length(OLD.metadata),0) - coalesce(length(OLD.link_target),0) - coalesce(length(OLD.directory_revision),0)
 	WHERE id = OLD.volume;
 	END;
 
 CREATE TRIGGER changes_metadata_insert AFTER INSERT ON changes BEGIN
-	UPDATE volumes SET metadata_used = metadata_used + coalesce(length(NEW.metadata), 0) + coalesce(length(NEW.link_target), 0)
+	UPDATE volumes SET metadata_used = metadata_used + coalesce(length(NEW.metadata),0) + coalesce(length(NEW.link_target),0) + coalesce(length(NEW.directory_revision),0)
 	WHERE id = NEW.volume;
 	END;
 
-CREATE TRIGGER changes_metadata_update AFTER UPDATE OF metadata, link_target, volume ON changes BEGIN
-	UPDATE volumes SET metadata_used = metadata_used - coalesce(length(OLD.metadata), 0) - coalesce(length(OLD.link_target), 0)
+CREATE TRIGGER changes_metadata_update AFTER UPDATE OF metadata, link_target, directory_revision, volume ON changes BEGIN
+	UPDATE volumes SET metadata_used = metadata_used - coalesce(length(OLD.metadata),0) - coalesce(length(OLD.link_target),0) - coalesce(length(OLD.directory_revision),0)
 	WHERE id = OLD.volume;
-	UPDATE volumes SET metadata_used = metadata_used + coalesce(length(NEW.metadata), 0) + coalesce(length(NEW.link_target), 0)
+	UPDATE volumes SET metadata_used = metadata_used + coalesce(length(NEW.metadata),0) + coalesce(length(NEW.link_target),0) + coalesce(length(NEW.directory_revision),0)
 	WHERE id = NEW.volume;
 	END;
 
 CREATE TRIGGER nodes_metadata_delete AFTER DELETE ON nodes BEGIN
-	UPDATE volumes SET metadata_used = metadata_used - length(OLD.metadata) - length(OLD.link_target)
+	UPDATE volumes SET metadata_used = metadata_used - length(OLD.metadata) - length(OLD.link_target) - length(OLD.directory_revision)
 	WHERE id = OLD.volume;
 	END;
 
 CREATE TRIGGER nodes_metadata_insert AFTER INSERT ON nodes BEGIN
-	UPDATE volumes SET metadata_used = metadata_used + length(NEW.metadata) + length(NEW.link_target)
+	UPDATE volumes SET metadata_used = metadata_used + length(NEW.metadata) + length(NEW.link_target) + length(NEW.directory_revision)
 	WHERE id = NEW.volume;
 	END;
 
-CREATE TRIGGER nodes_metadata_update AFTER UPDATE OF metadata, link_target, volume ON nodes BEGIN
-	UPDATE volumes SET metadata_used = metadata_used - length(OLD.metadata) - length(OLD.link_target)
+CREATE TRIGGER nodes_metadata_update AFTER UPDATE OF metadata, link_target, directory_revision, volume ON nodes BEGIN
+	UPDATE volumes SET metadata_used = metadata_used - length(OLD.metadata) - length(OLD.link_target) - length(OLD.directory_revision)
 	WHERE id = OLD.volume;
-	UPDATE volumes SET metadata_used = metadata_used + length(NEW.metadata) + length(NEW.link_target)
+	UPDATE volumes SET metadata_used = metadata_used + length(NEW.metadata) + length(NEW.link_target) + length(NEW.directory_revision)
 	WHERE id = NEW.volume;
 	END;
 

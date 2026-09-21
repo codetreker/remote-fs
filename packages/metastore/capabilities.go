@@ -55,6 +55,12 @@ type NamespaceAccess interface {
 	MutateName(context.Context, storage.NameCommand) (storage.NameResult, error)
 }
 
+type DirectoryReader interface {
+	CheckDirectoryRead() error
+	ReadDirNode(context.Context, storage.DirectoryTarget) (storage.ObservedDirectory, error)
+	ReadDirNodeBounded(context.Context, storage.DirectoryTarget, *storage.ListResult) (storage.DirectoryObservation, error)
+}
+
 type ReferenceState struct {
 	State             FileState
 	LinkTarget        []byte

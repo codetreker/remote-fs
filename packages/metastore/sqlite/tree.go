@@ -19,12 +19,12 @@ import (
 // rootNode reads the directory the volume starts from. It is a node nobody made, and
 // nothing removes or replaces it.
 func (s *Store) rootNode(ctx context.Context, tx *sql.Tx) (metastore.Node, error) {
-	return scanNode(tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes n WHERE n.id = ?`, s.root))
+	return s.scanNode(tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes n WHERE n.id = ?`, s.root))
 }
 
 // lookup finds the child of parent called name, byte for byte.
 func (s *Store) lookup(ctx context.Context, tx *sql.Tx, parent int64, name []byte) (metastore.Node, bool, error) {
-	node, err := scanNode(tx.QueryRowContext(ctx,
+	node, err := s.scanNode(tx.QueryRowContext(ctx,
 		`SELECT `+nodeColumns+` FROM entries e JOIN nodes n ON n.id = e.node
 		 WHERE e.volume = ? AND e.parent = ? AND e.name = ?`,
 		s.volume, parent, name))
@@ -212,7 +212,16 @@ type reservedChild struct {
 	reservation   *storage.ListReservation
 }
 
+type childReservationCheck func(index int, nameBytes, metadataBytes int64, attr storage.Attr) error
+
 func (s *Store) listChildrenBounded(ctx context.Context, tx *sql.Tx, parent int64, result *storage.ListResult) error {
+	return s.listChildrenBoundedChecked(ctx, tx, parent, result, nil)
+}
+
+func (s *Store) listChildrenBoundedChecked(ctx context.Context, tx *sql.Tx, parent int64, result *storage.ListResult, check childReservationCheck) error {
+	if err := s.validateListedChildren(ctx, tx, parent); err != nil {
+		return err
+	}
 	rows, err := tx.QueryContext(ctx,
 		`SELECT length(CAST(e.name AS BLOB)), `+nodeAttrColumns+` FROM entries e JOIN nodes n ON n.id = e.node
 		 WHERE e.volume = ? AND e.parent = ? ORDER BY e.name`,
@@ -230,10 +239,21 @@ func (s *Store) listChildrenBounded(ctx context.Context, tx *sql.Tx, parent int6
 			rows.Close()
 			return err
 		}
-		attr, err := node.attr()
+		value, err := node.node()
 		if err != nil {
 			rows.Close()
 			return err
+		}
+		if err := s.validateLoadedNode(value); err != nil {
+			rows.Close()
+			return err
+		}
+		attr := value.Attr()
+		if check != nil {
+			if err := check(len(reserved), nameBytes, node.metadataBytes, attr); err != nil {
+				rows.Close()
+				return err
+			}
 		}
 		reservation, err := result.Reserve(nameBytes, node.metadataBytes, attr)
 		if err != nil {
@@ -313,6 +333,9 @@ func (s *Store) listChildren(ctx context.Context, tx *sql.Tx, parent int64) ([]m
 }
 
 func (s *Store) visitChildren(ctx context.Context, tx *sql.Tx, parent int64, add func(metastore.Child) error) error {
+	if err := s.validateListedChildren(ctx, tx, parent); err != nil {
+		return err
+	}
 	rows, err := tx.QueryContext(ctx,
 		`SELECT e.name, `+nodeColumns+` FROM entries e JOIN nodes n ON n.id = e.node
 		 WHERE e.volume = ? AND e.parent = ? ORDER BY e.name`,
@@ -330,8 +353,14 @@ func (s *Store) visitChildren(ctx context.Context, tx *sql.Tx, parent int64, add
 		if err := rows.Scan(append([]any{&name}, node.fields()...)...); err != nil {
 			return err
 		}
+		if err := storage.CheckLeaf(name); err != nil {
+			return fmt.Errorf("directory %d contains an invalid name: %w", parent, errors.Join(syscall.EIO, err))
+		}
 		value, err := node.node()
 		if err != nil {
+			return err
+		}
+		if err := s.validateLoadedNode(value); err != nil {
 			return err
 		}
 		if err := add(metastore.Child{Name: name, Node: value}); err != nil {
@@ -339,6 +368,25 @@ func (s *Store) visitChildren(ctx context.Context, tx *sql.Tx, parent int64, add
 		}
 	}
 	return rows.Err()
+}
+
+func (s *Store) validateListedChildren(ctx context.Context, tx *sql.Tx, parent int64) error {
+	var invalid int64
+	if err := tx.QueryRowContext(ctx, `SELECT count(*)
+		FROM entries e LEFT JOIN nodes n ON n.id=e.node
+		WHERE e.volume=? AND e.parent=? AND (
+			typeof(e.volume)!='integer' OR typeof(e.parent)!='integer' OR typeof(e.node)!='integer' OR
+			n.id IS NULL OR typeof(n.volume)!='integer' OR n.volume!=e.volume OR
+			typeof(n.detached)!='integer' OR n.detached!=0 OR n.id=e.parent OR n.id=? OR
+			EXISTS (SELECT 1 FROM entries alias WHERE alias.node=e.node AND
+				(alias.volume!=e.volume OR alias.parent!=e.parent OR alias.name!=e.name))
+		)`, s.volume, parent, s.root).Scan(&invalid); err != nil {
+		return err
+	}
+	if invalid != 0 {
+		return fmt.Errorf("directory %d has %d invalid child bindings: %w", parent, invalid, syscall.EIO)
+	}
+	return nil
 }
 
 // SetAttr applies the attributes a change names and leaves the rest alone.
@@ -471,13 +519,19 @@ func (s *Store) link(ctx context.Context, tx *sql.Tx, parent int64, name []byte,
 		}
 		return err
 	}
-	return nil
+	return s.advanceDirectoryRevision(ctx, tx, parent)
 }
 
 func (s *Store) unlink(ctx context.Context, tx *sql.Tx, parent int64, name []byte) error {
-	_, err := tx.ExecContext(ctx, `DELETE FROM entries WHERE volume = ? AND parent = ? AND name = ?`,
+	result, err := tx.ExecContext(ctx, `DELETE FROM entries WHERE volume = ? AND parent = ? AND name = ?`,
 		s.volume, parent, name)
-	return err
+	if err != nil {
+		return err
+	}
+	if err := sqlvalue.ExactlyOne(result, "unlinking a directory entry"); err != nil {
+		return err
+	}
+	return s.advanceDirectoryRevision(ctx, tx, parent)
 }
 
 // touch records that a directory's contents changed. A directory's modification time is the
@@ -765,6 +819,14 @@ func (s *Store) rename(ctx context.Context, tx *sql.Tx, cleanFrom, cleanTo strin
 		`UPDATE entries SET parent = ?, name = ? WHERE volume = ? AND parent = ? AND name = ?`,
 		toParent.ID, toName, s.volume, fromParent.ID, fromName); err != nil {
 		return err
+	}
+	if err := s.advanceDirectoryRevision(ctx, tx, fromParent.ID); err != nil {
+		return err
+	}
+	if toParent.ID != fromParent.ID {
+		if err := s.advanceDirectoryRevision(ctx, tx, toParent.ID); err != nil {
+			return err
+		}
 	}
 	now := time.Now()
 	if err := s.setNodeChangeTime(ctx, tx, moving.ID, now); err != nil {

@@ -40,7 +40,7 @@ Status: implemented
 
 本地副本的直觉用法是把超时调上去、让内核自己作答。那样买到的是**零次调用**，代价是[内核缓存与不可达](../../proposed/architecture/2026-08-19-kernel-cache-and-unreachable.md)整份 note 立刻进入关键路径：缓存时长必须绑到失活探测窗口、负项时长是挂载级常量、客户端必须自己记住答过哪些名字不存在并在驱逐前先向内核发失效、转入断裂时要主动令内核失效、关掉内核自动失效之后不再自愈、失效队列溢出要升级而不是丢弃。六条各自都能单独出错，而**内核不发请求给我们就直接作答**——出错的表现是我们看不见的那一侧在替我们撒谎。
 
-三个超时保持为 0，把路径 Stat 与负查找的一次网络往返换成本地 SQLite 查询。缓存边界按操作划分：路径 Stat/Lookup 使用副本；公开 List/ListBounded、File.Stat 与 StatNode 向 authority 核对，FileSession 还独立续期。目录读取回源使当前 `ReadEntries` Deny 与枚举在同一 authority 顺序中成立；遍历仍不为每个具名 Stat 或缺失名字回源。副本不可用时，公开 List 也先失败，不能绕过本地连续性状态直接使用远端结果。
+三个超时保持为 0，把路径 Stat 与负查找的一次网络往返换成本地 SQLite 查询。缓存边界按操作划分：路径 Stat/Lookup 使用副本；公开 List/ListBounded、identity-bound ReadDirNode、完整目录 metadata、reference current-name、File.Stat 与 StatNode 向 authority 核对，FileSession 还独立续期。目录读取回源使当前 `ReadEntries` Deny 与应用枚举在同一 authority 顺序中成立；privileged observation 使用独立授权。遍历仍不为每个具名 Stat 或缺失名字回源。副本不可用时，这些观察先失败，不能绕过本地连续性状态直接使用远端结果。
 
 三个元数据超时不决定内容页缓存。原来 Open 使用默认缓存标志、各 handle 保存内容，旧 handle 可以填入新 open 随后读到的页；[跨句柄页缓存陈旧](../bug-fix/2026-09-07-prevent-cross-handle-page-cache-staleness.md)保留该缺陷记录。[实时文件句柄](./2026-09-08-live-file-handles.md)改用 directIO 与权威对象读取，元数据超时仍为 0，不能因内容路径改变就顺带提高它们。
 
@@ -311,7 +311,9 @@ type Storage struct {
 }
 ```
 
-路径 `Stat` 走本地；`List`、`ListBounded`、`Read`、`Write`、`Create`、`Mkdir`、`Remove`、`RemoveDir`、`Rename`、`SetAttr` 与 `Space` 走远端。公开目录读取仍先检查副本可用性，再由 authority 执行当前用途限制与完整枚举。副本保存 authority 给出的 NodeKind、共同时间与 opaque metadata，不生成未知 BirthTime/ChangeTime，也不解释平台 namespace。FileStorage capability 传播到权威服务：FileSession.OpenNode、StatNode、SetNodeAttr、metadata CAS、scope/range 与 File 的内容和属性操作都不按副本里的名字重新寻址，已经 detached 的对象不要求本地树仍有对应 entry。普通身份 I/O 仍检查副本可用状态；续期、动作核对、取消和清理不依赖具名副本存在，失去观察不能阻止释放资源。
+路径 `Stat` 走本地；`List`、`ListBounded`、`Read`、`Write`、`Create`、`Mkdir`、`Remove`、`RemoveDir`、`Rename`、`SetAttr` 与 `Space` 走远端。公开目录读取仍先检查副本可用性，再由 authority 执行当前用途限制与完整枚举。副本保存 authority 给出的 NodeKind、共同时间与 opaque metadata，不生成未知 BirthTime/ChangeTime，也不解释平台 namespace。HTTP v4 replication 的 Node wire 不携带 DirectoryRevision；SQLite replica 接受该缺席，为本地目录生成 opaque token，并在 replay 名字变化时替换它。这份 token 只保护本地实现内部，不作为 authority guard 或 observation 返回。
+
+FileStorage capability 传播到权威服务：FileSession.OpenNode、StatNode、SetNodeAttr、ReadDirNode、DirectoryMetadataObserver、metadata CAS、scope/range 与 File／NodeReference 的内容、属性和 current-name 操作都不按副本里的名字重新寻址，已经 detached 的对象不要求本地树仍有对应 entry。ReadDirNode、完整目录 metadata 与 current-name 在检查副本可用状态后直接查询 remote authority，绝不返回本地 revision。普通身份 I/O 与名字观察仍检查副本可用状态；续期、动作核对、取消和清理不依赖具名副本存在，失去观察不能阻止释放资源。
 
 具名节点与 opaque metadata 修改沿用 mutation barrier，成功后确认本地可见性；detached 修改不生成具名树事件，不能等待一个永远不存在的节点事件。File、Use claim、owner 和 range 的退役、续期与连续性由当前 FileSession/authority 管理，不写入副本，也不从日志位置或 SSE 心跳推导；authority incarnation 改变后旧状态失效。
 
@@ -386,7 +388,7 @@ CommittedPosition(ctx context.Context) (Position, error)
 
 **最后一个迁移文件例外，而且是暂时的。** 当时最后一个文件是 `0002_replication.sql`；实测把其中的 `entries.name` 改成 `TEXT`、删掉两个索引之一、或把 `logs.trimmed_by_age` 改成 `TEXT`，两条结构比对**一条都不响**，只有可重新生成的 golden 响。最后一个文件在新库与迁移库两条路上都会运行，所以两边一起变化；它成为历史时必须取得独立见证。
 
-`0003_durable_state.sql` 落地时，[v2 fixture](../../../../packages/metastore/sqlite/internal/integration/testdata/version2.sql) 与 `TestTheSecondMigrationDescribesTheVersionTwoDatabasesThatExist` 钉住了 v2，上述义务已经成为测试。`0004_lease_recovery.sql` 使 `0003` 成为历史，v3 结构也须用独立见证固定，不能只比较两条都运行 `0004` 的路径。后续 `0005_retained_files.sql` 增加 detached 与内容 revision；`0006_neutral_metadata.sql` 将合法旧 mode 转成 NodeKind 与 `posix.permissions.v1`，并增加可选 BirthTime/ChangeTime、metadata 及其持久计量；`0007_durable_identity.sql` 增加 link target、pending generation 与 durable delete intents。每个已落地文件继续冻结。
+`0003_durable_state.sql` 落地时，[v2 fixture](../../../../packages/metastore/sqlite/internal/integration/testdata/version2.sql) 与 `TestTheSecondMigrationDescribesTheVersionTwoDatabasesThatExist` 钉住了 v2，上述义务已经成为测试。`0004_lease_recovery.sql` 使 `0003` 成为历史，v3 结构也须用独立见证固定，不能只比较两条都运行 `0004` 的路径。后续 `0005_retained_files.sql` 增加 detached 与内容 revision；`0006_neutral_metadata.sql` 将合法旧 mode 转成 NodeKind 与 `posix.permissions.v1`，并增加可选 BirthTime/ChangeTime、metadata 及其持久计量；`0007_durable_identity.sql` 增加 link target、pending generation 与 durable delete intents；`0008_directory_revisions.sql` 为当前目录及新 retained changes 增加持久 revision。旧 retained history 无法补出可信 revision，因此 v8 原子清空它、切换 log incarnation 并把窗口位置归零，让旧 replica 通过既有 mismatch 路径重建。每个已落地文件继续冻结。
 
 （顺带记下一个实测意外：`entries.name` 在 `0002` 里改成 `TEXT` 之后，**没有任何行为测试变红**。原因是 SQLite 的 TEXT 亲和性不会把 BLOB 值转成文本，存进去的字节仍按字节比较。所以那一处是 golden 独自兜住的，不是被行为测试兜住的。）
 

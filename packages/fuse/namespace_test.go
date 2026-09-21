@@ -16,15 +16,31 @@ import (
 
 type namespaceFixture struct {
 	storage.FileSession
-	lookup func(storage.ChildName) (storage.Attr, error)
-	open   func(storage.ChildName, storage.OpenAtOptions) (storage.OpenResult, error)
-	mutate func(storage.NameCommand) (storage.NameResult, error)
+	lookup         func(storage.ChildName) (storage.Attr, error)
+	readDir        func(storage.DirectoryTarget) (storage.ObservedDirectory, error)
+	readDirBounded func(storage.DirectoryTarget, *storage.ListResult) (storage.DirectoryObservation, error)
+	directoryErr   error
+	open           func(storage.ChildName, storage.OpenAtOptions) (storage.OpenResult, error)
+	mutate         func(storage.NameCommand) (storage.NameResult, error)
 }
 
 func (s *namespaceFixture) CheckNamespaceAccess() error { return nil }
+func (s *namespaceFixture) CheckDirectoryRead() error   { return s.directoryErr }
 func (s *namespaceFixture) CheckAtomicFileOpen() error  { return nil }
 func (s *namespaceFixture) LookupAt(_ context.Context, name storage.ChildName) (storage.Attr, error) {
 	return s.lookup(name)
+}
+func (s *namespaceFixture) ReadDirNode(_ context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	if s.readDir == nil {
+		panic("unexpected unbounded directory observation")
+	}
+	return s.readDir(target)
+}
+func (s *namespaceFixture) ReadDirNodeBounded(_ context.Context, target storage.DirectoryTarget, result *storage.ListResult) (storage.DirectoryObservation, error) {
+	if s.readDirBounded == nil {
+		panic("unexpected bounded directory observation")
+	}
+	return s.readDirBounded(target, result)
 }
 func (s *namespaceFixture) OpenAt(_ context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
 	return s.open(name, options)

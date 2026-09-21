@@ -10,8 +10,8 @@ volume 的使用者。持有一份 remote storage，把 volume 呈现为本地�
 |---|---|---|
 | **remote storage** `packages/transport/httprest` | 基础 storage 操作逐次转换为 HTTP 请求，不缓存内容。复制的订阅与快照使用独立长连接；`DialOptions` 限制 stream silence、body 与 admission，超时由调用方配置。 | R-INT-3、R-INT-5、R-INT-9 |
 | **显式锁控制** | HTTP client 实现锁 Service，调用方保留 Session / Owner 与原动作身份，以 `WithScope` 构造独立、不可变的修改 proof 集合。控制请求具有独立预算。 | R-CC-3、R-CC-6 至 R-CC-11、R-INT-3 |
-| **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：按路径 `Stat` 走本地 SQLite，公开 `List` / `ListBounded` 回源 authority，其余操作也走远端。副本由变更流喂着。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
-| **挂载呈现层** `packages/fuse` | 把一份 storage 呈现为本地目录。持有 FileSession、已打开目录的 NodeReference、普通 File、UseOwner 与内核 owner 的映射；以父 NodeID 执行子项操作，目录 handle 额外携带 Scope，文件以 direct I/O 逐次读写。仅 Linux。 | R-FS-1、R-FS-5、R-FS-6、R-FS-8、R-CON-1~3、R-ERR-1、R-ERR-2、R-CC-12、R-CC-13、R-WS-5、R-INT-3、R-INT-8 |
+| **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：按路径 `Stat` 走本地 SQLite，公开 `List` / `ListBounded` 与身份目录／名字观察在确认副本健康后回源 authority，其余操作也走远端。副本由 v4 变更流喂着，并为自己的目录树维护不可作为 authority 证据的本地 revision。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
+| **挂载呈现层** `packages/fuse` | 把一份 storage 呈现为本地目录。持有 FileSession、已打开目录的 NodeReference、普通 File、UseOwner 与内核 owner 的映射；以父 NodeID 执行子项操作，目录 handle 以 Scope 捕获一次完整 Readdir，文件以 direct I/O 逐次读写。仅 Linux。 | R-FS-1、R-FS-5、R-FS-6、R-FS-8、R-CON-1~3、R-ERR-1、R-ERR-2、R-CC-12、R-CC-13、R-WS-5、R-INT-3、R-INT-8 |
 | **生命周期** | 挂载的建立与拆除。 | R-WS-2 |
 
 ```
@@ -46,7 +46,7 @@ SSE 不把整个 stream 保存在内存里，但每一帧仍有独立的 `DialOp
 
 每个基础数据调用都要先取得 client 自己的 response admission。默认同时保留 64 份响应、允许 64 个等待者，aggregate 上限为 8 GiB；每份都按 `4 * MaxBodyBytes` 预留，覆盖 raw body、decoded listing 与转换过程的同时保留。默认 1 GiB body 使每个 List 预留 4 GiB，因此 aggregate byte bound 会先把并发压到 2 个活跃 List，另有至多 64 个调用等待。Subscribe、Resubscribe 与 Snapshot 在发出 HTTP 前也取得同一名额，用来约束 stream 尚未成功建立时可能返回的普通 error body；确认 `200 text/event-stream` 后立即释放，后续 frame 由 `MaxFrameBytes` 约束。等待者已满时，`Stat`、`Write`、`Create` 或 stream setup 都会在发出 HTTP 请求前以 `EAGAIN` 失败；context cancellation 会移除等待计数。non-stream admission 一直持有到 response 解码、mutation response/barrier 验证完成。`ReadBounded` 取 client 与调用方 byte bound 中较小者；`ListBounded` 把解码后的 entry 逐项交给调用方的 `ListResult`。普通 `Read` 与 `List` 仍返回完整 materialized value，但整个 HTTP body 及其同时表示都在上述单体与 aggregate 边界内。server 侧的 backend 预算与 response admission 见 [`../server/architecture.md`](../server/architecture.md#六请求与响应的内存边界)。
 
-**FUSE 到这一层为止。** 挂载层把内核请求翻译为基础 volume、FileStorage 和中立 identity/metadata/range 调用。已有 inode 的 Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 Readlink 使用 OpenNodeRef，Lookup 与名字修改使用 LookupAt/MutateName。普通 node 操作携带稳定父 NodeID；只有已打开的 directory handle Lookup 再附带活 Scope。OpenChildRef 是编程入口可用的原子子项引用能力。普通 fd 使用 File，无 fd 的身份属性使用 NodeReference 或 StatNode/SetNodeAttr。
+**FUSE 到这一层为止。** 挂载层把内核请求翻译为基础 volume、FileStorage 和中立 identity/metadata/range 调用。已有 inode 的 Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 Readlink 使用 OpenNodeRef，Lookup 与名字修改使用 LookupAt/MutateName。挂载 preflight 分别要求 NamespaceAccess 与 DirectoryReader；普通 node 操作携带稳定父 NodeID，已打开的 directory handle Lookup 与 Readdir 再附带活 Scope，后者使用 ReadDirNodeBounded。远端会话只有在 v4 DirectoryMetadata bundle bit 为 true 时暴露 DirectoryReader；in-process DirectoryReader 不依赖 DirectoryMetadataObserver。OpenChildRef 是编程入口可用的原子子项引用能力。普通 fd 使用 File，无 fd 的身份属性使用 NodeReference 或 StatNode/SetNodeAttr。
 
 ### 业务身份与授权结果
 
@@ -72,7 +72,7 @@ Strong 控制请求与响应固定至多 16 KiB；文件 metadata/range 控制�
 
 ## 二、路径起点来自副本，子项操作到达权威
 
-内核的目录项超时、属性超时、负项超时都是 0。挂载根与路径起点可由本地 SQLite 副本定位；子项 Lookup 与 mutation 使用稳定父 NodeID 到达 authority。Opendir 建立的 directory handle 另持有 NodeReference/Scope，其 handle Lookup 同时验证活引用。公开 List/ListBounded 先要求副本可用，再按路径回源，使当前 `ReadEntries` Deny 与枚举共享同一顺序。Readdir 还没有 identity-bound directory observation，因此不从 NodeReference 推导一份不存在的完整目录快照。
+内核的目录项超时、属性超时、负项超时都是 0。挂载根与路径起点可由本地 SQLite 副本定位；子项 Lookup 与 mutation 使用稳定父 NodeID 到达 authority。Opendir 建立的 directory handle 另持有 NodeReference/Scope，其 handle Lookup 与 Readdir 同时验证活引用。第一次 Readdir 通过 DirectoryReader.ReadDirNodeBounded 取得一次完整权威捕获并保存 stream，seekdir 与后续读取复用该捕获；普通应用枚举在 authority 的最终顺序执行 `ReadEntries` 检查。目录名字被删除后，exact scoped Readdir 仍访问原 detached 空目录；裸 NodeID 与 metadata observation 拒绝它。公开 List/ListBounded 继续先要求副本可用，再按路径回源。
 
 挂载呈现层不向内核发送失效通知；副本不可用时，普通 volume 与文件 I/O 返回 EIO，文件会话的 action query、delete-intent query、续期和清理仍可联系服务端。副本仍消除初始路径 Stat 与负查找回源，但它不再决定已经取得的父 inode 后续修改落在哪个目录。
 
@@ -81,6 +81,8 @@ Strong 控制请求与响应固定至多 16 KiB；文件 metadata/range 控制�
 副本以变更流的连续观察状态决定是否作答：流被观测为断开时作废，需要连续副本视图的操作以 EIO 失败（R-ERR-1、R-ERR-2）。没有过期时间或逐查询回源校验。普通续订在追到 opening tail 后恢复可用；首次构建与全量重建使用[快照后的固定回放目标](../../../.agents/notes/implemented/bug-fix/2026-09-07-gate-rebuilt-replicas-on-replay.md)。
 
 构建先保留原订阅，再逐页写入快照。客户端读到 snapshot 的语义 EOF 后，先关闭该 HTTP 响应释放连接，再调用 Checkpoint 取得新鲜的 `(incarnation, committed position)`。快照位置不得早于原订阅的 opening tail；checkpoint 不得早于快照，且其 incarnation 必须与原订阅一致。snapshot 只报告捕获位置；incarnation 一致性由 checkpoint 与原订阅核对。
+
+SQLite schema v8 为目录增加持久 revision 时，authority 原子清空无法携带该事实的旧 retained changes、切换 log incarnation 并把窗口位置归零。持有旧 incarnation／position 的 replica 不能续读这段已删除 history，沿既有 mismatch 分支重新取得当前树。HTTP v4 snapshot 与 change 不携带 authority DirectoryRevision；SQLite replica 为 revisionless 输入生成本地 opaque token，并在 replay create、remove 或 rename 时替换相应父目录 token。
 
 本地 Seeding.Complete 成功后记录已安装的快照位置，唯一的 reader 随后沿原订阅丢弃已包含的事件、应用快照之后的事件，直到达到或超过固定 checkpoint。位置允许跳跃，不要求逐整数相邻；零位置且已达到目标时不等待一条不存在的事件。Complete 与每次 Apply 的成功位置都会在内部推进，即使副本仍以 EIO 拒绝查询；中途失败后的续订以已提交树的位置继续，而不是沿用更早的公开状态。最终追平前不清除失败状态。
 
@@ -100,7 +102,7 @@ mutation 成功后，replicated client 从严格验证过的 response 取得 `(i
 
 副本的建立、作废与恢复规则，以及写入方等待 mutation barrier 的原因，见[元数据复制](../../../.agents/notes/implemented/architecture/2026-08-27-metadata-replication.md)。
 
-文件能力与 scoped 视图共同转发原 FileSession；File、NodeReference、action receipt、delete intent、metadata 与 range 控制不从名字副本重建。名字或属性修改使用同一远端 authority，并通过现有 confirmation barrier 核对 volume 进度；detached 对象修改不制造路径事件。
+文件能力与 scoped 视图共同转发原 FileSession；File、NodeReference、目录捕获、current-name、action receipt、delete intent、metadata 与 range 控制不从名字副本重建。名字观察与目录捕获在确认副本健康后回源 authority；名字或属性修改使用同一远端 authority，并通过现有 confirmation barrier 核对 volume 进度。detached 对象修改不制造路径事件。
 
 ## 三、打开的是对象引用
 
@@ -208,9 +210,9 @@ volume 报出自己的容量，挂载呈现层把它换算成内核要的块数�
 
 `storage.Attr.ID` 是不透明、非零且不会被复用为另一对象的 volume 内节点身份。挂载把它直接报告为 inode number；同一对象被其它挂载移动到此前未见过的名字时，也保持原编号。节点 ID 不由路径或宿主 inode 推算，不使用局部新编号补救下层错误复用。
 
-挂载仍保留一棵名字成员树，用于同名查询复用、删除、改名和 List 结果清理。节点内的本地 serial 只区分本次 listing 开始前已知的成员与期间新发现的成员，不是对外 inode。相同名字返回不同 ID 或类型时替换成员记录；被覆盖的旧 inode 可以继续被 fd 引用，失去名字不使它变成新对象。
+挂载仍保留一棵名字成员树，用于同名查询复用、删除、改名和目录捕获结果清理。节点内的本地 serial 只区分本次 capture 开始前已知的成员与期间新发现的成员，不是对外 inode，也不由持久 directory revision 代替。相同名字返回不同 ID 或类型时替换成员记录；被覆盖的旧 inode 可以继续被 fd 引用，失去名字不使它变成新对象。
 
-名字树随挂载结束清理，节点身份由 volume 保持。其它 client 的删除或替换在后续 Lookup/List 中被观察到；普通子项操作的父 NodeID 与已打开目录 handle 的 NodeReference/Scope 决定权威父对象，本地父路径只用于内核呈现和仍按路径执行的 Readdir。
+名字树随挂载结束清理，节点身份由 volume 保持。其它 client 的删除或替换在后续 Lookup/List 或 identity-bound Readdir 中被观察到；普通子项操作的父 NodeID 与已打开目录 handle 的 NodeReference/Scope 决定权威父对象，本地父路径只用于内核呈现。
 
 两个随附 backend 都使用 SQLite 的持久节点身份。[宿主目录后端已移除](../../../.agents/notes/implemented/simplification/2026-09-08-remove-the-host-directory-backend.md)；第三方实现仍须满足 R-FS-5 与 R-INT-11，不能直接报告可能被复用的宿主 inode。
 
@@ -228,7 +230,7 @@ volume 报出自己的容量，挂载呈现层把它换算成内核要的块数�
 
 同步写入不在离线时返回成功，不把未知失败重试为新写入。原生补丁实现可在已知未提交的 revision 竞争后有界重试；这与应用重做一个结果未知的修改不同。普通 fd 没有隐含的内容版本前置条件，显式版本工作流仍独立。
 
-目录子项 Lookup 与 mutation 已使用 NodeReference/Scope；Readdir 仍使用公开 List/ListBounded 的路径入口。当前没有 reference current-name、完整有界 directory metadata observation 或 directory revision/guard，因此不能据此实现需要一次完整目录快照或当前绑定证明的平台功能。这项边界由[持久节点身份与原子文件操作](../../../.agents/notes/implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)记录。
+目录子项 Lookup、mutation 与 Readdir 使用 NodeID 和可选 NodeReference Scope；reference current-name、完整有界 directory metadata observation 与持久 authority directory revision/guard 由[有界权威名字观察](../../../.agents/notes/implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)提供。guards 只约束回源的只读观察，不与 SQLite replica 的本地 revision 比较，也不进入名字 mutation 或当前路径遍历。目录 revision 不是通知游标，挂载层不据此实现缓存失效或恢复。
 
 标准 advisory 通过中立 range 表达 flock 与传统 POSIX 范围锁，完整 `F_OFD_*` 和 mmap 行为不由此推出。enforced range 为其它平台保留，当前 Linux 不把它冒充 advisory。显式 S/X 仍单独取得，挂载不自动选择 Strong 策略。中立原语没有交付 SMB endpoint、Windows create/share/disposition 映射或 Windows cache 验收，不能据此宣称 Windows 支持完成。
 

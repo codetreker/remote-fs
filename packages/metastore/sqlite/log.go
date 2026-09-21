@@ -11,6 +11,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/changes"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 // Window is how much of a volume's change log is kept.
@@ -130,7 +131,14 @@ func (s *Store) locate(ctx context.Context, tx *sql.Tx, id int64) (metastore.Loc
 // nodeByID reads one node by its id, which is how a change reports what a name holds after
 // the statement that changed it.
 func nodeByID(ctx context.Context, tx *sql.Tx, id int64) (metastore.Node, error) {
-	return scanNode(tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes n WHERE n.id = ?`, id))
+	node, err := scanNode(tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes n WHERE n.id = ?`, id))
+	if err != nil {
+		return metastore.Node{}, err
+	}
+	if node.Kind == storage.NodeDirectory && !validDirectoryRevision(node.DirectoryRevision) {
+		return metastore.Node{}, syscall.EIO
+	}
+	return node, nil
 }
 
 // --- retention -------------------------------------------------------------------------

@@ -229,7 +229,10 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 		if err := insertNode(ctx, tx, r.store.volume, *change.Node); err != nil {
 			return err
 		}
-		return insertEntry(ctx, tx, r.store.volume, change.Parent, change.Name, change.Node.ID)
+		if err := insertEntry(ctx, tx, r.store.volume, change.Parent, change.Name, change.Node.ID); err != nil {
+			return err
+		}
+		return r.store.advanceReplicaDirectoryRevision(ctx, tx, change.Parent, int64(change.Position))
 
 	case metastore.Modified:
 		return updateNode(ctx, tx, *change.Node)
@@ -240,6 +243,9 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 			return err
 		}
 		if err := removeEntry(ctx, tx, r.store.volume, change.Parent, change.Name); err != nil {
+			return err
+		}
+		if err := r.store.advanceReplicaDirectoryRevision(ctx, tx, change.Parent, int64(change.Position)); err != nil {
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, id)
@@ -256,6 +262,14 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 		}
 		if err := insertEntry(ctx, tx, r.store.volume, change.Parent, change.Name, change.Node.ID); err != nil {
 			return err
+		}
+		if err := r.store.advanceReplicaDirectoryRevision(ctx, tx, change.From.Parent, int64(change.Position)); err != nil {
+			return err
+		}
+		if change.Parent != change.From.Parent {
+			if err := r.store.advanceReplicaDirectoryRevision(ctx, tx, change.Parent, int64(change.Position)); err != nil {
+				return err
+			}
 		}
 		return updateNode(ctx, tx, *change.Node)
 	}
@@ -279,12 +293,16 @@ func insertNode(ctx context.Context, tx *sql.Tx, volume int64, node metastore.No
 	if err != nil {
 		return err
 	}
+	directoryRevision := append([]byte{}, node.DirectoryRevision...)
+	if node.Kind == storage.NodeDirectory && len(directoryRevision) == 0 {
+		directoryRevision = initialDirectoryRevision()
+	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO nodes (id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,
-		                   birth_sec,birth_nsec,change_sec,change_nsec,metadata,link_target)
-		VALUES (?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?)`,
+		                   birth_sec,birth_nsec,change_sec,change_nsec,metadata,link_target,directory_revision)
+		VALUES (?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)`,
 		node.ID, volume, int64(node.Kind), node.Size, accessSec, accessNsec, modifiedSec, modifiedNsec,
-		birthSec, birthNsec, changeSec, changeNsec, metadata, append([]byte{}, node.LinkTarget...))
+		birthSec, birthNsec, changeSec, changeNsec, metadata, append([]byte{}, node.LinkTarget...), directoryRevision)
 	return err
 }
 
@@ -302,12 +320,17 @@ func updateNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
 	if err != nil {
 		return err
 	}
-	result, err := tx.ExecContext(ctx, `
-		UPDATE nodes SET kind=?,size=?,atime_sec=?,atime_nsec=?,mtime_sec=?,mtime_nsec=?,
-		                 birth_sec=?,birth_nsec=?,change_sec=?,change_nsec=?,metadata=?,link_target=?
-		WHERE id = ?`,
-		int64(node.Kind), node.Size, accessSec, accessNsec, modifiedSec, modifiedNsec,
-		birthSec, birthNsec, changeSec, changeNsec, metadata, append([]byte{}, node.LinkTarget...), node.ID)
+	query := `UPDATE nodes SET kind=?,size=?,atime_sec=?,atime_nsec=?,mtime_sec=?,mtime_nsec=?,
+		birth_sec=?,birth_nsec=?,change_sec=?,change_nsec=?,metadata=?,link_target=?`
+	args := []any{int64(node.Kind), node.Size, accessSec, accessNsec, modifiedSec, modifiedNsec,
+		birthSec, birthNsec, changeSec, changeNsec, metadata, append([]byte{}, node.LinkTarget...)}
+	if len(node.DirectoryRevision) != 0 || node.Kind != storage.NodeDirectory {
+		query += `,directory_revision=?`
+		args = append(args, append([]byte{}, node.DirectoryRevision...))
+	}
+	query += ` WHERE id=?`
+	args = append(args, node.ID)
+	result, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -315,10 +338,13 @@ func updateNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
 }
 
 func validateReplicaNode(node metastore.Node) error {
-	if node.ID <= 0 || node.Kind.Check() != nil || node.Size < 0 || len(node.LinkTarget) > storage.MaxLinkTargetBytes {
+	if node.ID <= 0 || node.Kind.Check() != nil || node.Size < 0 || len(node.LinkTarget) > storage.MaxLinkTargetBytes || len(node.DirectoryRevision) > storage.MaxObservationTokenBytes {
 		return syscall.EIO
 	}
 	if node.Kind == storage.NodeDirectory && (node.Size != 0 || node.Content != "") {
+		return syscall.EIO
+	}
+	if node.Kind != storage.NodeDirectory && len(node.DirectoryRevision) != 0 {
 		return syscall.EIO
 	}
 	if node.Kind == storage.NodeSymlink {

@@ -450,7 +450,7 @@ func TestOversizedSnapshotRowInvalidatesTheWholeProducedPage(t *testing.T) {
 	log := newFakeLog()
 	log.closeErr = errors.New("snapshot release also failed")
 	log.pages = [][]metastore.Row{{
-		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory}},
+		{Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory, DirectoryRevision: []byte{1}}},
 		{Parent: 1, Name: []byte(strings.Repeat("x", 1024)), Node: metastore.Node{ID: 2, Kind: storage.NodeRegular}},
 	}}
 	handlerOptions := httprest.DefaultHandlerOptions()
@@ -831,7 +831,7 @@ func TestASnapshotDeliversItsPositionAndItsRowsUnaltered(t *testing.T) {
 	}
 	want := []metastore.Row{
 		// The root: no parent and no name.
-		{Parent: 0, Name: nil, Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory}},
+		{Parent: 0, Name: nil, Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory, DirectoryRevision: []byte{1}}},
 		row(1, "plain", metastore.Node{
 			ID: 2, Kind: storage.NodeRegular, Size: 7,
 			AccessTime: time.Unix(1755000000, 123456789),
@@ -853,7 +853,7 @@ func TestASnapshotDeliversItsPositionAndItsRowsUnaltered(t *testing.T) {
 			ModTime:    time.Date(2400, 9, 10, 11, 12, 13, 14, time.UTC),
 		}),
 		// A directory, which must not come back as a file of length zero.
-		row(1, "sub", metastore.Node{ID: 5, Kind: storage.NodeDirectory}),
+		row(1, "sub", metastore.Node{ID: 5, Kind: storage.NodeDirectory, DirectoryRevision: []byte{2}}),
 	}
 	// Delivered in more than one page, because a picture that fits in one frame never
 	// exercises the assembly of one that does not.
@@ -913,7 +913,7 @@ func stalledSnapshot(t *testing.T, s *httprest.Storage, log *fakeLog) *httprest.
 // is whatever the test does.
 func twoStalledPages(log *fakeLog) {
 	log.pages = [][]metastore.Row{
-		{row(0, "", metastore.Node{ID: 1, Kind: storage.NodeDirectory})},
+		{row(0, "", metastore.Node{ID: 1, Kind: storage.NodeDirectory, DirectoryRevision: []byte{1}})},
 		{row(1, "never sent", metastore.Node{ID: 2, Kind: storage.NodeRegular})},
 	}
 	log.stall = true
@@ -1385,6 +1385,29 @@ func TestReplicationNodesRejectInvalidSymbolicLinkPayloads(t *testing.T) {
 	}
 }
 
+func TestV4ReplicationKeepsDirectoryRevisionOutOfTheWire(t *testing.T) {
+	wire := httprest.NodeOf(metastore.Node{ID: 2, Kind: storage.NodeDirectory, DirectoryRevision: []byte{1}})
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "directory_revision") {
+		t.Fatalf("v4 node exposed a local directory revision: %s", encoded)
+	}
+	var legacy httprest.Node
+	if err := json.Unmarshal(encoded, &legacy); err != nil {
+		t.Fatalf("v4 node without a directory revision was rejected: %v", err)
+	}
+	var extended map[string]any
+	if err := json.Unmarshal(encoded, &extended); err != nil {
+		t.Fatal(err)
+	}
+	extended["directory_revision"] = []byte{1}
+	if err := decodesInto(t, extended, &legacy); err == nil {
+		t.Fatal("v4 decoder accepted a directory revision extension")
+	}
+}
+
 // A change that does not say what happened must not be applied, because a replica applies
 // what arrives without asking anything back: there is no revalidation behind these messages
 // and no timeout that repairs one that was wrong. A creation that lost its node decodes into
@@ -1656,7 +1679,7 @@ func TestAChangeOfAnUnnameableKindIsNotSent(t *testing.T) {
 func TestAPictureThatYieldsNothingAndIsNotDoneFails(t *testing.T) {
 	log := newFakeLog()
 	log.pages = [][]metastore.Row{
-		{row(0, "", metastore.Node{ID: 1, Kind: storage.NodeDirectory})},
+		{row(0, "", metastore.Node{ID: 1, Kind: storage.NodeDirectory, DirectoryRevision: []byte{1}})},
 		nil,
 		{row(1, "never reached", metastore.Node{ID: 2, Kind: storage.NodeRegular})},
 	}
@@ -1681,7 +1704,7 @@ func TestAPictureThatYieldsNothingAndIsNotDoneFails(t *testing.T) {
 // hand the caller a fresh verdict about a stream that is over.
 func TestAFinishedStreamKeepsItsVerdict(t *testing.T) {
 	log := newFakeLog()
-	log.pages = [][]metastore.Row{{row(0, "", metastore.Node{ID: 1, Kind: storage.NodeDirectory})}}
+	log.pages = [][]metastore.Row{{row(0, "", metastore.Node{ID: 1, Kind: storage.NodeDirectory, DirectoryRevision: []byte{1}})}}
 	s := serveLog(t, log, httprest.DefaultLimits())
 
 	snap, err := s.Snapshot(t.Context())
@@ -2028,7 +2051,7 @@ func TestAFrameAChangeStreamCannotUseEndsIt(t *testing.T) {
 // before anything is taken.
 func TestAServerThatCannotBoundItsWritesRefusesToTakeAPicture(t *testing.T) {
 	log := newFakeLog()
-	log.pages = [][]metastore.Row{{row(0, "", metastore.Node{ID: 1, Kind: storage.NodeDirectory})}}
+	log.pages = [][]metastore.Row{{row(0, "", metastore.Node{ID: 1, Kind: storage.NodeDirectory, DirectoryRevision: []byte{1}})}}
 	backing := volumeFixture(t)
 	h, err := httprest.NewHandler(backing, log)
 	if err != nil {
@@ -2453,7 +2476,7 @@ func TestAStreamSaysHowFarTheLogHadGot(t *testing.T) {
 func TestAPictureSlowToProduceIsNotJudgedDead(t *testing.T) {
 	log := newFakeLog()
 	want := []metastore.Row{
-		{Parent: 0, Name: nil, Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory}},
+		{Parent: 0, Name: nil, Node: metastore.Node{ID: 1, Kind: storage.NodeDirectory, DirectoryRevision: []byte{1}}},
 		row(1, "first", metastore.Node{ID: 2, Kind: storage.NodeRegular}),
 		row(1, "second", metastore.Node{ID: 3, Kind: storage.NodeRegular}),
 	}

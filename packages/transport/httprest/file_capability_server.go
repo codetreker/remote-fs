@@ -23,6 +23,15 @@ func capabilitiesOf(value any) (*fileCapabilities, error) {
 			failure = errors.Join(failure, err)
 		}
 	}
+	if capability, ok := value.(storage.ReferenceNameObserver); ok {
+		check(&caps.ReferenceName, func() error {
+			if err := capability.CheckReferenceNameObservation(); err != nil {
+				return err
+			}
+			_, err := storage.ReferenceNodeID(value)
+			return err
+		})
+	}
 	if capability, ok := value.(storage.AtomicFileOpener); ok {
 		check(&caps.AtomicOpen, capability.CheckAtomicFileOpen)
 	}
@@ -58,6 +67,20 @@ func capabilitiesOf(value any) (*fileCapabilities, error) {
 
 func sessionCapabilitiesOf(value storage.FileSession) (*fileCapabilities, error) {
 	caps, err := capabilitiesOf(value)
+	reader, hasReader := value.(storage.DirectoryReader)
+	observer, hasObserver := value.(storage.DirectoryMetadataObserver)
+	if hasReader && hasObserver {
+		readErr := reader.CheckDirectoryRead()
+		observeErr := observer.CheckDirectoryMetadataObservation()
+		if readErr == nil && observeErr == nil {
+			caps.DirectoryMetadata = true
+		}
+		for _, checkErr := range []error{readErr, observeErr} {
+			if checkErr != nil && storage.ErrnoOf(checkErr) != syscall.EOPNOTSUPP {
+				err = errors.Join(err, checkErr)
+			}
+		}
+	}
 	if capability, ok := value.(storage.MetadataAccess); ok {
 		checkErr := capability.CheckMetadataAccess()
 		if checkErr == nil {
@@ -177,8 +200,64 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 	if (request.Op == storage.OpFileOpenNodeRef || request.Op == storage.OpFileOpenChildRef) && (!response.Capabilities.Scope || !response.Capabilities.State) {
 		openErr = errors.Join(openErr, errors.New("node reference lacks mandatory scope or state capability"), syscall.EIO)
 	}
+	identityInvalid := false
+	if response.Capabilities.ReferenceName {
+		node, identityErr := storage.ReferenceNodeID(reference)
+		if identityErr != nil {
+			identityInvalid = true
+			openErr = errors.Join(openErr, identityErr, syscall.EIO)
+		} else {
+			switch request.Op {
+			case storage.OpFileOpen:
+				response.Node = node
+				if request.Open.ExpectedID != 0 && node != request.Open.ExpectedID {
+					identityInvalid = true
+					openErr = errors.Join(openErr, errors.New("opened reference substituted its expected node identity"), syscall.EIO)
+				}
+			case storage.OpFileOpenNode:
+				response.Node = node
+				if node != request.Node {
+					identityInvalid = true
+					openErr = errors.Join(openErr, errors.New("opened reference substituted its requested node identity"), syscall.EIO)
+				}
+			case storage.OpFileOpenNodeRef:
+				if response.Attr == nil || response.Attr.ID != node || node != request.Node {
+					identityInvalid = true
+					openErr = errors.Join(openErr, errors.New("opened node reference substituted its requested identity"), syscall.EIO)
+				}
+			case storage.OpFileOpenChildRef:
+				if response.Attr == nil || response.Attr.ID != node || request.NodeRef.Target.State == storage.SameNode && node != request.NodeRef.Target.NodeID {
+					identityInvalid = true
+					openErr = errors.Join(openErr, errors.New("opened child reference substituted its requested identity"), syscall.EIO)
+				}
+			case storage.OpFileOpenAt:
+				invalidTarget := response.Attr == nil || response.Attr.ID != node
+				if request.OpenAt.Target.State == storage.SameNode {
+					if request.OpenAt.Existing == storage.ReplaceNode {
+						invalidTarget = invalidTarget || node == request.OpenAt.Target.NodeID || response.Outcome != storage.Replaced
+					} else {
+						invalidTarget = invalidTarget || node != request.OpenAt.Target.NodeID
+					}
+				}
+				if invalidTarget {
+					identityInvalid = true
+					openErr = errors.Join(openErr, errors.New("atomic open returned an invalid target identity or outcome"), syscall.EIO)
+				}
+			default:
+				if response.Attr == nil || response.Attr.ID != node {
+					identityInvalid = true
+					openErr = errors.Join(openErr, errors.New("opened reference disagrees with its captured attributes"), syscall.EIO)
+				}
+			}
+		}
+	}
 	if openErr != nil {
 		response, barrierErr := h.finishFileMutation(ctx, response)
+		if identityInvalid {
+			response.File = ""
+			response.Node = 0
+			response.Capabilities = nil
+		}
 		return response, errors.Join(openErr, barrierErr)
 	}
 	return h.finishFileMutation(ctx, response)
@@ -187,6 +266,8 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 func (h *Handler) performSessionCapability(ctx context.Context, session storage.FileSession, req fileRequest) (fileResponse, error) {
 	response := fileResponse{}
 	switch req.Op {
+	case storage.OpFileObserveDirectoryMetadata:
+		return h.observeDirectoryMetadata(ctx, session, req)
 	case storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileAcknowledgeDeleteIntent:
 		capability, ok := session.(storage.FileActions)
 		if !ok {
@@ -212,6 +293,42 @@ func (h *Handler) performSessionCapability(ctx context.Context, session storage.
 			err = errors.Join(err, wireErr)
 		}
 		return response, err
+	case storage.OpFileReadDirNode:
+		capability, ok := session.(storage.DirectoryReader)
+		if !ok {
+			return response, syscall.EOPNOTSUPP
+		}
+		if err := capability.CheckDirectoryRead(); err != nil {
+			return response, err
+		}
+		result, err := newObservedDirectoryResult(min(h.maxBodyBytes, req.ResultBytes))
+		if err != nil {
+			return response, err
+		}
+		observation, err := capability.ReadDirNodeBounded(ctx, *req.Directory, result)
+		if err != nil {
+			result.Fail(err)
+			return response, err
+		}
+		if observation.ParentID != req.Directory.NodeID {
+			err := errors.Join(errors.New("directory observation substituted its target identity"), syscall.EIO)
+			result.Fail(err)
+			return response, err
+		}
+		entries, err := result.Entries()
+		if err != nil {
+			return response, err
+		}
+		directory := storage.ObservedDirectory{Observation: observation, Entries: make([]storage.ObservedEntry, 0, len(entries))}
+		for _, entry := range entries {
+			directory.Entries = append(directory.Entries, storage.ObservedEntry{RawLeaf: []byte(entry.Name), Attr: entry.Attr})
+		}
+		if err := directory.Check(); err != nil {
+			result.Fail(err)
+			return response, err
+		}
+		response.Directory = observedDirectoryOf(directory)
+		return response, nil
 	case storage.OpFileLookupAt, storage.OpFileMutateName:
 		capability, ok := session.(storage.NamespaceAccess)
 		if !ok {
@@ -297,6 +414,8 @@ func (h *Handler) performSessionCapability(ctx context.Context, session storage.
 func performReferenceCapability(ctx context.Context, file retainedReference, req fileRequest) (fileResponse, error) {
 	response := fileResponse{}
 	switch req.Op {
+	case storage.OpFileObserveName:
+		return observeReferenceName(ctx, file, req)
 	case storage.OpFileState:
 		capability, ok := file.(storage.ReferenceStateAccess)
 		if !ok {

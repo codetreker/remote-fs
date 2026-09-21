@@ -13,6 +13,7 @@ import (
 type capableTestSession struct {
 	storage.FileSession
 	storage.NamespaceAccess
+	storage.DirectoryReader
 	storage.AtomicFileOpener
 	storage.MetadataAccess
 	storage.UseOwners
@@ -25,6 +26,7 @@ func testSessionCapabilities(session storage.FileSession) capableTestSession {
 	return capableTestSession{
 		FileSession:      session,
 		NamespaceAccess:  session.(storage.NamespaceAccess),
+		DirectoryReader:  session.(storage.DirectoryReader),
 		AtomicFileOpener: session.(storage.AtomicFileOpener),
 		MetadataAccess:   session.(storage.MetadataAccess),
 		UseOwners:        session.(storage.UseOwners),
@@ -37,6 +39,7 @@ func testSessionCapabilities(session storage.FileSession) capableTestSession {
 type facetSession struct {
 	storage.FileSession
 	storage.NamespaceAccess
+	storage.DirectoryReader
 	storage.AtomicFileOpener
 	storage.MetadataAccess
 	storage.UseOwners
@@ -57,6 +60,7 @@ func (s *facetSession) check(name string) error {
 }
 
 func (s *facetSession) CheckNamespaceAccess() error { return s.check("namespace") }
+func (s *facetSession) CheckDirectoryRead() error   { return s.check("directory") }
 func (s *facetSession) CheckAtomicFileOpen() error  { return s.check("open") }
 func (s *facetSession) CheckMetadataAccess() error  { return s.check("metadata") }
 func (s *facetSession) CheckUseOwners() error       { return s.check("owners") }
@@ -85,7 +89,7 @@ func (s facetStorage) NewFileSession(context.Context, storage.FileSessionOptions
 }
 
 func TestMountAdmissionRejectsMissingRequiredSessionCapabilities(t *testing.T) {
-	for _, missing := range []string{"namespace", "open", "metadata", "owners", "ranges", "references", "actions"} {
+	for _, missing := range []string{"namespace", "directory", "open", "metadata", "owners", "ranges", "references", "actions"} {
 		t.Run(missing, func(t *testing.T) {
 			full := &facetSession{}
 			var session storage.FileSession
@@ -93,73 +97,91 @@ func TestMountAdmissionRejectsMissingRequiredSessionCapabilities(t *testing.T) {
 			case "namespace":
 				session = &struct {
 					storage.FileSession
+					storage.DirectoryReader
 					storage.AtomicFileOpener
 					storage.MetadataAccess
 					storage.UseOwners
 					storage.RangeControl
 					storage.NodeReferences
 					storage.FileActions
-				}{full, full, full, full, full, full, full}
+				}{full, full, full, full, full, full, full, full}
+			case "directory":
+				session = &struct {
+					storage.FileSession
+					storage.NamespaceAccess
+					storage.AtomicFileOpener
+					storage.MetadataAccess
+					storage.UseOwners
+					storage.RangeControl
+					storage.NodeReferences
+					storage.FileActions
+				}{full, full, full, full, full, full, full, full}
 			case "open":
 				session = &struct {
 					storage.FileSession
 					storage.NamespaceAccess
+					storage.DirectoryReader
 					storage.MetadataAccess
 					storage.UseOwners
 					storage.RangeControl
 					storage.NodeReferences
 					storage.FileActions
-				}{full, full, full, full, full, full, full}
+				}{full, full, full, full, full, full, full, full}
 			case "metadata":
 				session = &struct {
 					storage.FileSession
 					storage.NamespaceAccess
+					storage.DirectoryReader
 					storage.AtomicFileOpener
 					storage.UseOwners
 					storage.RangeControl
 					storage.NodeReferences
 					storage.FileActions
-				}{full, full, full, full, full, full, full}
+				}{full, full, full, full, full, full, full, full}
 			case "owners":
 				session = &struct {
 					storage.FileSession
 					storage.NamespaceAccess
+					storage.DirectoryReader
 					storage.AtomicFileOpener
 					storage.MetadataAccess
 					storage.RangeControl
 					storage.NodeReferences
 					storage.FileActions
-				}{full, full, full, full, full, full, full}
+				}{full, full, full, full, full, full, full, full}
 			case "ranges":
 				session = &struct {
 					storage.FileSession
 					storage.NamespaceAccess
+					storage.DirectoryReader
 					storage.AtomicFileOpener
 					storage.MetadataAccess
 					storage.UseOwners
 					storage.NodeReferences
 					storage.FileActions
-				}{full, full, full, full, full, full, full}
+				}{full, full, full, full, full, full, full, full}
 			case "references":
 				session = &struct {
 					storage.FileSession
 					storage.NamespaceAccess
+					storage.DirectoryReader
 					storage.AtomicFileOpener
 					storage.MetadataAccess
 					storage.UseOwners
 					storage.RangeControl
 					storage.FileActions
-				}{full, full, full, full, full, full, full}
+				}{full, full, full, full, full, full, full, full}
 			case "actions":
 				session = &struct {
 					storage.FileSession
 					storage.NamespaceAccess
+					storage.DirectoryReader
 					storage.AtomicFileOpener
 					storage.MetadataAccess
 					storage.UseOwners
 					storage.RangeControl
 					storage.NodeReferences
-				}{full, full, full, full, full, full, full}
+				}{full, full, full, full, full, full, full, full}
 			}
 			volume, err := newVolume(t.Context(), facetStorage{session: session}, Options{FlushTimeout: time.Second}, nil)
 			if volume != nil || !errors.Is(err, syscall.EOPNOTSUPP) || full.closes != 1 || !full.clean || full.statuses != 0 {
@@ -171,7 +193,7 @@ func TestMountAdmissionRejectsMissingRequiredSessionCapabilities(t *testing.T) {
 
 func TestMountAdmissionPreservesCapabilityFailure(t *testing.T) {
 	cause := errors.New("backing authority cannot provide capability")
-	for _, capability := range []string{"namespace", "open", "metadata", "owners", "ranges", "references", "actions"} {
+	for _, capability := range []string{"namespace", "directory", "open", "metadata", "owners", "ranges", "references", "actions"} {
 		t.Run(capability, func(t *testing.T) {
 			session := &facetSession{fail: capability, failure: cause}
 			volume, err := newVolume(t.Context(), facetStorage{session: session}, Options{FlushTimeout: time.Second}, nil)

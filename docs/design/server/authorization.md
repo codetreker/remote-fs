@@ -55,6 +55,9 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `file.open-node` | `/v4/file`，`file.open-node` | 按节点身份打开，携带 OpenAccess |
 | `file.open-at` | `/v4/file`，`file.open-at` | 按父身份原子打开／创建／清空／替换普通文件 |
 | `file.lookup-at` | `/v4/file`，`file.lookup-at` | 按父身份查询一个原始叶名 |
+| `file.read-dir-node` | `/v4/file`，`file.read-dir-node` | 按目录身份执行应用枚举并检查 `ReadEntries` |
+| `file.observe-directory-metadata` | `/v4/file`，同名动作 | 取得完整目录 entries、revision 与可选目录当前名字 |
+| `file.observe-name` | `/v4/file`，`file.observe-name` | 取得一个保留引用的 Root／Linked／Detached 当前绑定 |
 | `file.mutate-name` | `/v4/file`，`file.mutate-name` | 按父身份创建、删除或改名子项 |
 | `file.open-node-ref` | `/v4/file`，`file.open-node-ref` | 按 NodeID 打开 metadata-only 引用 |
 | `file.open-child-ref` | `/v4/file`，`file.open-child-ref` | 按父身份打开或创建节点引用 |
@@ -101,7 +104,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 
 `FileOpenOptions` 嵌入共享的 `storage.OpenAccess`；file.open／file.open-node 继续把这五项意图放入 `AccessRequest.Open`。OpenAt、OpenNodeRef 与 OpenChildRef 也携带由 metadata 权限、Use 与打开效果导出的 OpenAccess。一个复杂动作按固定顺序产生基础 Operation 及它实际包含的 remove、set-attr、set-metadata 或 set-pending 等补充 Operation；每项分别调用同一 Authorizer，任一拒绝都发生在 native action 前。NodeID、Scope、metadata token、action ID 和 delete-intent ID 不作为业务身份。带 Create 的打开即使最终选择已有对象，也报告创建意图。
 
-`volume.write` 可以创建缺失文件，单独拒绝 volume.create 不能禁止创建。metadata、range apply 与 range drop 分别授权；查询、取消或已有 owner 不能绕过本次策略。range mode 不代替内容读写权限，后续数据访问仍检查 file.read / file.write。FUSE 的 flock/POSIX 解释不进入 AccessRequest。
+`volume.write` 可以创建缺失文件，单独拒绝 volume.create 不能禁止创建。应用枚举、完整目录 metadata 与 reference current-name 分别授权；允许 `file.read-dir-node` 不授予另两项，DirectoryMetadataObserver 也不从 `ReadEntries` 或 `ReadMetadata` 推导权限。metadata、range apply 与 range drop 同样分别授权；查询、取消或已有 owner 不能绕过本次策略。range mode 不代替内容读写权限，后续数据访问仍检查 file.read / file.write。FUSE 的 flock/POSIX 解释不进入 AccessRequest。
 
 ## 三、请求、capability 与关闭
 

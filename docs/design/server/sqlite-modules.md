@@ -6,8 +6,8 @@
 
 | 位置 | 拥有的职责 |
 |---|---|
-| `sqlite` 根 package | 公开类型与构造器、Store/Replica/Seeding、数据库 coordinator、事务发布与结果、文件/节点 pin、identity namespace、atomic open、conditional mutation、delete intent、metadata CAS、snapshot 与 reseed 生命周期、Close/Abort |
-| [`internal/schema`](../../../packages/metastore/sqlite/internal/schema) | 迁移资源、schema 准备和绑定、volume/metadata/link-target/delete-intent 完整性与 detached/pending 恢复 SQL |
+| `sqlite` 根 package | 公开类型与构造器、Store/Replica/Seeding、数据库 coordinator、事务发布与结果、文件/节点 pin、identity namespace、directory revision/observation、atomic open、conditional mutation、delete intent、metadata CAS、snapshot 与 reseed 生命周期、Close/Abort |
+| [`internal/schema`](../../../packages/metastore/sqlite/internal/schema) | 迁移资源、schema 准备和绑定、volume/metadata/link-target/directory-revision/delete-intent 完整性与 detached/pending 恢复 SQL |
 | [`internal/dbstate`](../../../packages/metastore/sqlite/internal/dbstate) | 数据库持久状态与启动证据、generation 和身份高水位的分配、校验及对账 |
 | [`internal/nativelease`](../../../packages/metastore/sqlite/internal/nativelease) | 原生文件所有权、lease anchor、持久证据编码和文件系统操作 |
 | [`internal/changes`](../../../packages/metastore/sqlite/internal/changes) | 日志窗口、记录、裁剪，以及有界 page/row 解码 |
@@ -23,7 +23,7 @@
 
 `schema.Prepare` 的 schema 迁移、绑定、验证与恢复继续使用原来的一个事务。根 package 把 `durableOpen` 投影成普通准备数据，包含是否存在见证；`CommitWitness` 本身不进入 schema 组件，见证发布仍由根 package 在提交后执行。
 
-中立节点事实与 metadata 位于根 package 的原发布顺序中。`namespace.go` 解析 DirectoryTarget 和 ChildCondition；`namespace_mutations.go` 原子执行名字效果；`atomic_open.go` 组合选择、初始状态、Use、delete intent 与引用保留；`node_references.go` 提供无字节方法的保留节点；`conditional_file.go` 在最终发布处比较 size/metadata 条件；`pending_unlink.go` 持有 durable intent、generation 与恢复清理。`metadata.go`、`file_access.go`、`reference_scope.go` 与 `reference_order.go` 继续把 metadata、Use、scope 和最终访问绑定同一个 native gate。它们复用 databaseCoordinator、retainedFile 和 change log，不建立第二套事务所有者。
+中立节点事实与 metadata 位于根 package 的原发布顺序中。`namespace.go` 与 `namespace_identity.go` 分别支撑 NamespaceAccess 和 DirectoryReader：前者处理 LookupAt／MutateName，后者允许 exact scoped read 继续枚举 detached 空目录，同时拒绝裸身份和损坏 child binding；`directory_metadata.go` 只观察具名目录。`namespace_mutations.go` 原子执行名字效果；`namespace_revision.go` 分配并推进目录名字集合 revision；目录 metadata 与 reference name 查询在同一 read transaction 核对 scope、guards、entries、revision 和绑定。`atomic_open.go` 组合选择、初始状态、Use、delete intent 与引用保留；`node_references.go` 提供无字节方法的保留节点；`conditional_file.go` 在最终发布处比较 size/metadata 条件；`pending_unlink.go` 持有 durable intent、generation 与恢复清理。`metadata.go`、`file_access.go`、`reference_scope.go` 与 `reference_order.go` 继续把 metadata、Use、scope 和最终访问绑定同一个 native gate。它们复用 databaseCoordinator、retainedFile 和 change log，不建立第二套事务所有者。
 
 根 `log.go` 用节点查询组装完整的 `metastore.Change`，再交给 `changes.Record`。日志组件不回调 Store 来补充身份。snapshot 的取得、事务结果与资源释放仍由根 package 拥有；`Seeding` 在原有生命周期内持有 commit admission，不因目录拆分提前释放。
 
@@ -39,9 +39,9 @@ SQL lease recovery 与 `LeaseRecovery` 留在根 package，原生 evidence I/O �
 
 ## 资源与测试归属
 
-当前 schema 版本为 7。[`internal/schema/migrations`](../../../packages/metastore/sqlite/internal/schema/migrations) 的 `0001` 至 `0007` 按序嵌入并重放；6 把 mode 转为 NodeKind 与 `posix.permissions.v1` 并增加共同时间、规范 metadata 与持久计量，7 增加 link target、pending generation 与 durable delete-intent 表。迁移保留 NodeID、高水位、名字、内容、用量与日志事实，并继续由外部见证确认。可读 schema golden 与历史布局 fixture 位于 [`internal/integration/testdata`](../../../packages/metastore/sqlite/internal/integration/testdata)；测试数据不参与运行时初始化。
+当前 schema 版本为 8。[`internal/schema/migrations`](../../../packages/metastore/sqlite/internal/schema/migrations) 的 `0001` 至 `0008` 按序嵌入并重放；6 把 mode 转为 NodeKind 与 `posix.permissions.v1` 并增加共同时间、规范 metadata 与持久计量，7 增加 link target、pending generation 与 durable delete-intent 表，8 为现有目录建立初始 revision，并把 directory revision 纳入 nodes、新 changes、trigger 与持久计量。旧 retained changes 没有可信 revision，v8 因此在同一迁移事务中清空它们、切换每个 log incarnation 并把 committed／trimmed 位置归零；当前树、NodeID、高水位、名字、内容与用量保持，旧 replica 通过 incarnation mismatch 进入 reseed。迁移提交继续由外部见证确认。可读 schema golden 与历史布局 fixture 位于 [`internal/integration/testdata`](../../../packages/metastore/sqlite/internal/integration/testdata)；测试数据不参与运行时初始化。
 
-节点与 retained changes 的 metadata envelope 及 link target 长度由 SQL triggers 同步计入 `volumes.metadata_used`，覆盖 detached/pending 节点与历史副本。完整性检查验证 trigger 定义、storage class、规范 envelope、pending generation、intent 关联、计数与实际合计。`Options.MaxMetadataBytes` 默认每 volume 64 MiB，独立于内容 quota、单节点上限和 integrity 工作预算；载入 payload 前先核对大小，增长越界失败，replica ingest、日志裁剪和物理删除使用同一记账。
+节点与 retained changes 的 metadata envelope、link target 及 directory revision 长度由 SQL triggers 同步计入 `volumes.metadata_used`，覆盖 detached/pending 节点与历史副本。完整性检查验证 trigger 定义、storage class、规范 envelope、目录／非目录 revision 组合、pending generation、intent 关联、计数与实际合计。`Options.MaxMetadataBytes` 默认每 volume 64 MiB，独立于内容 quota、单节点上限和 integrity 工作预算；载入 payload 前先核对大小，增长越界失败，replica ingest、日志裁剪和物理删除使用同一记账。
 
 当前 schema 的两个损坏矩阵在所属顶层测试中持有私有、不可变的健康数据库种子，每个子用例获得独立文件和连接。种子复制不是生产 schema 或恢复入口；完整 checkpoint、关闭与隔离检查由[测试准备规则](../../testing.md#sqlite-测试准备与隔离)约束。
 

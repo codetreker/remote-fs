@@ -21,3 +21,13 @@ func TestNodeAttrPreservesIdentityTypeAndTimes(t *testing.T) {
 		}
 	}
 }
+
+func TestNodeCloneOwnsDirectoryRevision(t *testing.T) {
+	revision := []byte{0, 0, 0, 0, 0, 0, 0, 1}
+	node := metastore.Node{ID: 1, Kind: storage.NodeDirectory, DirectoryRevision: revision}
+	clone := node.Clone()
+	revision[7] = 2
+	if !reflect.DeepEqual(clone.DirectoryRevision, []byte{0, 0, 0, 0, 0, 0, 0, 1}) {
+		t.Fatalf("clone aliases directory revision: %x", clone.DirectoryRevision)
+	}
+}

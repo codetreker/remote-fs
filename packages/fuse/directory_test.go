@@ -421,6 +421,216 @@ func TestDirectoryHandleSeekUsesTheOpenedStream(t *testing.T) {
 	}
 }
 
+func addObservedEntry(t *testing.T, result *storage.ListResult, name string, attr storage.Attr) {
+	t.Helper()
+	if err := result.Add(storage.Entry{Name: name, Attr: attr}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDirectoryHandleEnumerationUsesOneBoundedExactScopeCapture(t *testing.T) {
+	reference := &nodeReferenceFixture{
+		attr:  storage.Attr{ID: 7, Kind: storage.NodeDirectory},
+		scope: storage.UseScope{Token: "opened-directory"},
+	}
+	session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, reference: reference}
+	captures := 0
+	session.readDirBounded = func(target storage.DirectoryTarget, result *storage.ListResult) (storage.DirectoryObservation, error) {
+		captures++
+		if target.NodeID != reference.attr.ID || target.Scope == nil || *target.Scope != reference.scope {
+			t.Fatalf("directory target = %+v", target)
+		}
+		addObservedEntry(t, result, "first", storage.Attr{ID: 8, Kind: storage.NodeRegular})
+		addObservedEntry(t, result, "second", storage.Attr{ID: 9, Kind: storage.NodeDirectory})
+		return storage.DirectoryObservation{ParentID: 7, Revision: []byte("capture-1")}, nil
+	}
+	root := namespaceRoot(session)
+	root.id.child("stale", syscall.S_IFREG|0600, 10)
+	opened, _, errno := root.OpendirHandle(t.Context(), syscall.O_RDONLY)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	handle := opened.(*directoryHandle)
+	t.Cleanup(func() { handle.Releasedir(context.Background(), 0) })
+
+	entry, errno := handle.Readdirent(t.Context())
+	if errno != 0 || entry == nil || entry.Name != "first" {
+		t.Fatalf("first entry=%+v errno=%v", entry, errno)
+	}
+	if errno := handle.Seekdir(t.Context(), 0); errno != 0 {
+		t.Fatalf("seek to capture start: %v", errno)
+	}
+	entry, errno = handle.Readdirent(t.Context())
+	if errno != 0 || entry == nil || entry.Name != "first" {
+		t.Fatalf("entry after seek=%+v errno=%v", entry, errno)
+	}
+	if captures != 1 || reference.stats != 0 || root.id.children["stale"] != nil {
+		t.Fatalf("captures=%d reference stats=%d identities=%+v", captures, reference.stats, root.id.children)
+	}
+}
+
+func TestDirectoryHandleEnumerationRequiresDirectoryReaderPreflight(t *testing.T) {
+	namespace := &namespaceFixture{}
+	namespaceOnly := &struct {
+		storage.FileSession
+		storage.NamespaceAccess
+	}{namespace, namespace}
+	handle := &directoryHandle{
+		node: namespaceRoot(namespaceOnly), scope: storage.UseScope{Token: "directory"},
+	}
+	if err := handle.load(t.Context()); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("missing directory reader = %v", err)
+	}
+
+	cause := errors.New("directory reader dependency unavailable")
+	namespace.directoryErr = cause
+	dispatched := 0
+	namespace.readDirBounded = func(storage.DirectoryTarget, *storage.ListResult) (storage.DirectoryObservation, error) {
+		dispatched++
+		return storage.DirectoryObservation{}, nil
+	}
+	handle = &directoryHandle{
+		node: namespaceRoot(namespace), scope: storage.UseScope{Token: "directory"},
+	}
+	if err := handle.load(t.Context()); !errors.Is(err, cause) || dispatched != 0 {
+		t.Fatalf("failed preflight error=%v dispatched=%d", err, dispatched)
+	}
+}
+
+func TestDirectoryHandleRejectsFailedPartialAndMalformedCapturesBeforeChangingIdentities(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		capture   func(*storage.ListResult) (storage.DirectoryObservation, error)
+		wantErrno syscall.Errno
+	}{
+		{
+			name: "failed partial result",
+			capture: func(result *storage.ListResult) (storage.DirectoryObservation, error) {
+				addObservedEntry(t, result, "uncommitted", storage.Attr{ID: 9, Kind: storage.NodeRegular})
+				return storage.DirectoryObservation{}, syscall.ESTALE
+			},
+			wantErrno: syscall.ESTALE,
+		},
+		{
+			name: "unfinished reservation",
+			capture: func(result *storage.ListResult) (storage.DirectoryObservation, error) {
+				if _, err := result.Reserve(9, 6, storage.Attr{ID: 9, Kind: storage.NodeRegular}); err != nil {
+					t.Fatal(err)
+				}
+				return storage.DirectoryObservation{ParentID: 7, Revision: []byte("capture")}, nil
+			},
+			wantErrno: syscall.EIO,
+		},
+		{
+			name: "wrong parent",
+			capture: func(result *storage.ListResult) (storage.DirectoryObservation, error) {
+				addObservedEntry(t, result, "replacement", storage.Attr{ID: 9, Kind: storage.NodeRegular})
+				return storage.DirectoryObservation{ParentID: 70, Revision: []byte("capture")}, nil
+			},
+			wantErrno: syscall.EIO,
+		},
+		{
+			name: "malformed entry",
+			capture: func(result *storage.ListResult) (storage.DirectoryObservation, error) {
+				addObservedEntry(t, result, "replacement", storage.Attr{Kind: storage.NodeRegular})
+				return storage.DirectoryObservation{ParentID: 7, Revision: []byte("capture")}, nil
+			},
+			wantErrno: syscall.EIO,
+		},
+		{
+			name: "malformed projected metadata after a valid entry",
+			capture: func(result *storage.ListResult) (storage.DirectoryObservation, error) {
+				addObservedEntry(t, result, "first-new", storage.Attr{ID: 9, Kind: storage.NodeRegular})
+				addObservedEntry(t, result, "bad-mode", storage.Attr{
+					ID: 10, Kind: storage.NodeRegular,
+					Metadata: map[string]storage.OpaquePayload{
+						posix.Namespace: {Version: []byte{1}, Data: []byte{1}},
+					},
+				})
+				return storage.DirectoryObservation{ParentID: 7, Revision: []byte("capture")}, nil
+			},
+			wantErrno: syscall.EIO,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reference := &nodeReferenceFixture{
+				attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "directory"},
+			}
+			session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, reference: reference}
+			session.readDirBounded = func(target storage.DirectoryTarget, result *storage.ListResult) (storage.DirectoryObservation, error) {
+				if target.NodeID != 7 || target.Scope == nil || *target.Scope != reference.scope {
+					t.Fatalf("directory target = %+v", target)
+				}
+				return test.capture(result)
+			}
+			root := namespaceRoot(session)
+			known := root.id.child("known", syscall.S_IFREG|0600, 8)
+			handle := &directoryHandle{node: root, reference: reference, scope: reference.scope}
+			entry, errno := handle.Readdirent(t.Context())
+			if entry != nil || errno != test.wantErrno {
+				t.Fatalf("entry=%+v errno=%v, want %v", entry, errno, test.wantErrno)
+			}
+			if root.id.children["known"] != known || root.id.children["replacement"] != nil || root.id.children["uncommitted"] != nil ||
+				root.id.children["first-new"] != nil || root.id.children["bad-mode"] != nil {
+				t.Fatalf("failed capture changed identities: %+v", root.id.children)
+			}
+		})
+	}
+}
+
+func TestReleasedDirectoryHandleDoesNotStartAnObservation(t *testing.T) {
+	reference := &nodeReferenceFixture{
+		attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "directory"},
+	}
+	session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, reference: reference}
+	captures := 0
+	session.readDirBounded = func(storage.DirectoryTarget, *storage.ListResult) (storage.DirectoryObservation, error) {
+		captures++
+		return storage.DirectoryObservation{}, nil
+	}
+	handle := &directoryHandle{node: namespaceRoot(session), reference: reference, scope: reference.scope}
+	handle.Releasedir(t.Context(), 0)
+	if entry, errno := handle.Readdirent(t.Context()); entry != nil || errno != syscall.EBADF || captures != 0 {
+		t.Fatalf("released read entry=%+v errno=%v captures=%d", entry, errno, captures)
+	}
+}
+
+func TestDirectoryReleaseDiscardsAnInFlightObservationBeforeIdentityChanges(t *testing.T) {
+	reference := &nodeReferenceFixture{
+		attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "directory"},
+	}
+	session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, reference: reference}
+	started := make(chan struct{})
+	proceed := make(chan struct{})
+	session.readDirBounded = func(storage.DirectoryTarget, *storage.ListResult) (storage.DirectoryObservation, error) {
+		close(started)
+		<-proceed
+		return storage.DirectoryObservation{ParentID: 7, Revision: []byte("capture")}, nil
+	}
+	root := namespaceRoot(session)
+	known := root.id.child("known", syscall.S_IFREG|0600, 8)
+	handle := &directoryHandle{node: root, reference: reference, scope: reference.scope}
+	type readResult struct {
+		entry *gofuse.DirEntry
+		errno syscall.Errno
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		entry, errno := handle.Readdirent(t.Context())
+		done <- readResult{entry: entry, errno: errno}
+	}()
+	<-started
+	handle.Releasedir(t.Context(), 0)
+	close(proceed)
+	result := <-done
+	if result.entry != nil || result.errno != syscall.EBADF {
+		t.Fatalf("released in-flight read entry=%+v errno=%v", result.entry, result.errno)
+	}
+	if handle.stream != nil || root.id.children["known"] != known || reference.closes != 1 {
+		t.Fatalf("stream=%v identities=%+v closes=%d", handle.stream, root.id.children, reference.closes)
+	}
+}
+
 func TestDirectoryReleaseClosesEveryResourceOnceAndFencesUnknownCleanup(t *testing.T) {
 	closeErr := errors.New("reference cleanup result unavailable")
 	reference := &nodeReferenceFixture{
@@ -520,9 +730,7 @@ func TestDirectoryHandleLookupKeepsScopeAfterParentRenameAndNameReuse(t *testing
 	}
 }
 
-// A retained directory protects descriptor operations, but the path-based listing can
-// observe a replacement directory. The test keeps that boundary explicit.
-func TestDirectoryEnumerationRemainsPathBasedAcrossExternalParentReplacement(t *testing.T) {
+func TestDirectoryEnumerationKeepsOpenedIdentityAcrossExternalRenameAndOldNameReuse(t *testing.T) {
 	_, backing := memoryfixture.New(t, "directory-path-list", 0, locking.DefaultOptions())
 	if err := backing.Mkdir(t.Context(), "parent"); err != nil {
 		t.Fatal(err)
@@ -572,7 +780,7 @@ func TestDirectoryEnumerationRemainsPathBasedAcrossExternalParentReplacement(t *
 		t.Fatal(err)
 	}
 	entry, errno := directory.Readdirent(t.Context())
-	if errno != 0 || entry == nil || entry.Name != "replacement" {
-		t.Fatalf("path-based enumeration = %+v, %v", entry, errno)
+	if errno != 0 || entry == nil || entry.Name != "original" {
+		t.Fatalf("identity-bound enumeration = %+v, %v", entry, errno)
 	}
 }

@@ -208,7 +208,7 @@ func TestPrepareMigratesPopulatedHistoricalVolumes(t *testing.T) {
 			} else {
 				execute(t, db, `INSERT INTO entries (volume,parent,name,node) VALUES (1,1,X'66696c65',2)`)
 				execute(t, db, `INSERT INTO logs (volume,incarnation,committed_position,trimmed_through,trimmed_by_age)
-					VALUES (1,'historical',0,0,0)`)
+					VALUES (1,'0123456789abcdef0123456789abcdef',0,0,0)`)
 			}
 			if version >= 3 {
 				execute(t, db, `UPDATE database_state SET node_high_water=2`)
@@ -254,7 +254,7 @@ func TestVersionSixSymlinkWithoutTargetIsRefusedBeforeMigration(t *testing.T) {
 	}
 }
 
-func TestVersionSixRemovedHistoryKeepsNoLinkTarget(t *testing.T) {
+func TestVersionSixHistoryIsRetiredBeforeDirectoryRevisionsAreServed(t *testing.T) {
 	db := testDatabase(t, firstNeutralMetadataSchemaVersion)
 	execute(t, db, `INSERT INTO volumes(id,name,root,used) VALUES(1,'legacy',1,0)`)
 	execute(t, db, `INSERT INTO nodes(id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content)
@@ -267,12 +267,15 @@ func TestVersionSixRemovedHistoryKeepsNoLinkTarget(t *testing.T) {
 	if _, _, err := Prepare(t.Context(), db, "legacy", "", changes.DefaultWindow(), 1000, 1<<20); err != nil {
 		t.Fatal(err)
 	}
-	var target any
-	if err := db.QueryRow(`SELECT link_target FROM changes WHERE position=1`).Scan(&target); err != nil {
+	var retained, tail, trimmed int
+	if err := db.QueryRow(`SELECT count(*) FROM changes`).Scan(&retained); err != nil {
 		t.Fatal(err)
 	}
-	if target != nil {
-		t.Fatalf("removed history gained link target %#v", target)
+	if err := db.QueryRow(`SELECT committed_position,trimmed_through FROM logs WHERE volume=1`).Scan(&tail, &trimmed); err != nil {
+		t.Fatal(err)
+	}
+	if retained != 0 || tail != 0 || trimmed != 0 {
+		t.Fatalf("pre-revision history remains replayable: count=%d tail=%d trimmed=%d", retained, tail, trimmed)
 	}
 }
 

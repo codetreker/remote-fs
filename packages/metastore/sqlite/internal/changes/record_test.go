@@ -40,8 +40,8 @@ func logFixture(t *testing.T) (*sql.DB, *sql.Tx) {
 		t.Fatal(err)
 	}
 	execLogSQL(t, tx, `INSERT INTO volumes(id,name,root,used) VALUES(1,'one',1,0),(2,'two',3,0)`)
-	execLogSQL(t, tx, `INSERT INTO nodes(id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec)
-		VALUES(1,1,2,0,0,0,0,0),(2,1,1,0,0,0,0,0),(3,2,2,0,0,0,0,0),(4,2,1,0,0,0,0,0)`)
+	execLogSQL(t, tx, `INSERT INTO nodes(id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,directory_revision)
+		VALUES(1,1,2,0,0,0,0,0,X'0000000000000001'),(2,1,1,0,0,0,0,0,X''),(3,2,2,0,0,0,0,0,X'0000000000000001'),(4,2,1,0,0,0,0,0,X'')`)
 	execLogSQL(t, tx, `INSERT INTO entries(volume,parent,name,node) VALUES(1,1,x'66696c65',2),(2,3,x'66696c65',4)`)
 	execLogSQL(t, tx, `UPDATE database_state SET node_high_water=4`)
 	for _, volume := range []int64{1, 2} {

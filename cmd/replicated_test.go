@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// Names are resolved by parent identity at the authority. Each directory read also holds
-// a scoped directory reference while the path-based enumeration is in progress.
+// Names are resolved by parent identity at the authority. Each directory read uses the
+// scoped directory reference, so enumeration remains bound to the opened object.
 func TestWalkingAMountedTreeUsesIdentityLookupsAndRetainedDirectories(t *testing.T) {
 	s := serveVolume(t)
 	a := mountpointOn(t, s)
@@ -61,7 +61,7 @@ func TestWalkingAMountedTreeUsesIdentityLookupsAndRetainedDirectories(t *testing
 	}
 
 	s.calls.waitFileCloses(t, 9)
-	wantCalls := "file-control:file.ack×4 file-control:file.close×4 file-control:file.scope×4 file-control:file.status×4 file:file.lookup-at×26 file:file.open-node-ref×4 file:file.stat×4 list×4"
+	wantCalls := "file-control:file.ack×4 file-control:file.close×4 file-control:file.scope×4 file-control:file.status×4 file:file.lookup-at×26 file:file.open-node-ref×4 file:file.read-dir-node×4"
 	if arrived := s.calls.sinceExcept(before, fileStatNodeCall, fileRenewCall); arrived != wantCalls {
 		t.Fatalf("walking the tree sent %q, want %q", arrived, wantCalls)
 	}
@@ -122,9 +122,9 @@ func TestADirectoryRenameKeepsTheIdentitiesBeneathIt(t *testing.T) {
 	}
 
 	// The rename is one identity-conditioned mutation. Reading the moved directory opens,
-	// scopes, stats, enumerates, and closes one retained directory reference.
+	// scopes, enumerates by identity, and closes one retained directory reference.
 	s.calls.waitFileCloses(t, 3)
-	wantCalls := "file-control:file.ack×1 file-control:file.close×1 file-control:file.scope×1 file-control:file.status×2 file:file.lookup-at×14 file:file.mutate-name×1 file:file.open-node-ref×1 file:file.stat×1 list×1"
+	wantCalls := "file-control:file.ack×1 file-control:file.close×1 file-control:file.scope×1 file-control:file.status×2 file:file.lookup-at×14 file:file.mutate-name×1 file:file.open-node-ref×1 file:file.read-dir-node×1"
 	if arrived := s.calls.sinceExcept(before, fileStatNodeCall, fileRenewCall); arrived != wantCalls {
 		t.Fatalf("renaming and inspecting the subtree sent %q, want %q", arrived, wantCalls)
 	}

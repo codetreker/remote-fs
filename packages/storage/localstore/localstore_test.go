@@ -517,6 +517,18 @@ func TestConfigurationIsValidatedBeforeTheRootIsTouched(t *testing.T) {
 		"unbounded metadata bytes": func(config *localstore.Config) {
 			config.MaxMetadataBytes = math.MaxInt64
 		},
+		"directory entry limit": func(config *localstore.Config) {
+			config.MaxDirectoryEntries = -1
+		},
+		"unbounded directory entries": func(config *localstore.Config) {
+			config.MaxDirectoryEntries = math.MaxInt
+		},
+		"directory byte limit": func(config *localstore.Config) {
+			config.MaxDirectoryBytes = -1
+		},
+		"unbounded directory bytes": func(config *localstore.Config) {
+			config.MaxDirectoryBytes = math.MaxInt64
+		},
 		"delete intent limit": func(config *localstore.Config) {
 			config.MaxDeleteIntents = -1
 		},
@@ -586,6 +598,8 @@ func TestStatusCombinesLogicalObjectAndPhysicalState(t *testing.T) {
 	config.MaxIntegrityRecords = 100
 	config.MaxIntegrityBytes = 1 << 20
 	config.MaxMetadataBytes = 2 << 20
+	config.MaxDirectoryEntries = 211
+	config.MaxDirectoryBytes = 3 << 20
 	config.MaxDeleteIntents = 17
 	store := open(t, config)
 	t.Cleanup(func() { closeStore(t, store) })
@@ -622,6 +636,12 @@ func TestStatusCombinesLogicalObjectAndPhysicalState(t *testing.T) {
 	}
 	if status.MaxMetadataBytes != config.MaxMetadataBytes {
 		t.Fatalf("Status.MaxMetadataBytes = %d, want %d", status.MaxMetadataBytes, config.MaxMetadataBytes)
+	}
+	if status.MaxDirectoryEntries != config.MaxDirectoryEntries {
+		t.Fatalf("Status.MaxDirectoryEntries = %d, want %d", status.MaxDirectoryEntries, config.MaxDirectoryEntries)
+	}
+	if status.MaxDirectoryBytes != config.MaxDirectoryBytes {
+		t.Fatalf("Status.MaxDirectoryBytes = %d, want %d", status.MaxDirectoryBytes, config.MaxDirectoryBytes)
 	}
 	if status.MaxDeleteIntents != config.MaxDeleteIntents {
 		t.Fatalf("Status.MaxDeleteIntents = %d, want %d", status.MaxDeleteIntents, config.MaxDeleteIntents)
@@ -785,6 +805,14 @@ func TestStatusReportsEffectiveDefaultObjectLimits(t *testing.T) {
 		t.Fatalf("Status.MaxMetadataBytes = %d, want default %d",
 			status.MaxMetadataBytes, sqlite.DefaultMaxMetadataBytes)
 	}
+	if status.MaxDirectoryEntries != sqlite.DefaultMaxDirectoryEntries {
+		t.Fatalf("Status.MaxDirectoryEntries = %d, want default %d",
+			status.MaxDirectoryEntries, sqlite.DefaultMaxDirectoryEntries)
+	}
+	if status.MaxDirectoryBytes != sqlite.DefaultMaxDirectoryBytes {
+		t.Fatalf("Status.MaxDirectoryBytes = %d, want default %d",
+			status.MaxDirectoryBytes, sqlite.DefaultMaxDirectoryBytes)
+	}
 	if status.MaxDeleteIntents != sqlite.DefaultMaxDeleteIntents {
 		t.Fatalf("Status.MaxDeleteIntents = %d, want default %d",
 			status.MaxDeleteIntents, sqlite.DefaultMaxDeleteIntents)
@@ -795,13 +823,15 @@ func TestStatusReportsEffectiveDefaultObjectLimits(t *testing.T) {
 	}
 }
 
-func TestConfiguredReaderConnectionLimitIsReported(t *testing.T) {
+func TestConfiguredSQLiteServingLimitsAreReported(t *testing.T) {
 	config := testConfig(privateRoot(t))
 	config.MaxReaderConnections = 3
 	config.MaxSnapshotReaderConnections = 5
 	config.MaxIntegrityRecords = 101
 	config.MaxIntegrityBytes = 202
 	config.MaxMetadataBytes = 303
+	config.MaxDirectoryEntries = 404
+	config.MaxDirectoryBytes = 505
 	config.MaxDeleteIntents = 17
 	store := open(t, config)
 	t.Cleanup(func() { closeStore(t, store) })
@@ -824,6 +854,14 @@ func TestConfiguredReaderConnectionLimitIsReported(t *testing.T) {
 	if status.MaxMetadataBytes != config.MaxMetadataBytes {
 		t.Fatalf("Status.MaxMetadataBytes = %d, want %d",
 			status.MaxMetadataBytes, config.MaxMetadataBytes)
+	}
+	if status.MaxDirectoryEntries != config.MaxDirectoryEntries {
+		t.Fatalf("Status.MaxDirectoryEntries = %d, want %d",
+			status.MaxDirectoryEntries, config.MaxDirectoryEntries)
+	}
+	if status.MaxDirectoryBytes != config.MaxDirectoryBytes {
+		t.Fatalf("Status.MaxDirectoryBytes = %d, want %d",
+			status.MaxDirectoryBytes, config.MaxDirectoryBytes)
 	}
 	if status.MaxDeleteIntents != config.MaxDeleteIntents {
 		t.Fatalf("Status.MaxDeleteIntents = %d, want %d",

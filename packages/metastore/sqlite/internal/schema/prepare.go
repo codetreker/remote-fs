@@ -26,7 +26,8 @@ import (
 // 0005_retained_files.sql records unnamed retained files and their content revisions;
 // 0006_neutral_metadata.sql separates node kind and adds common times, canonical opaque
 // metadata, and exact retained-metadata accounting; 0007_durable_identity.sql adds
-// symbolic-link data and durable, restart-queryable deletion obligations.
+// symbolic-link data and durable, restart-queryable deletion obligations;
+// 0008_directory_revisions.sql adds persistent directory name-set revisions.
 //
 // packages/sqliteschema documents what a numbered set of files buys and what rule they are kept
 // under: a file that has landed is never edited, and a schema change is a new file.
@@ -45,6 +46,8 @@ const firstRetainedFileSchemaVersion = 5
 const firstNeutralMetadataSchemaVersion = 6
 
 const firstDurableIdentitySchemaVersion = 7
+
+const firstDirectoryRevisionSchemaVersion = 8
 
 // VolumeOpenMode decides whether preparation may create the named volume.
 type VolumeOpenMode uint8
@@ -163,7 +166,7 @@ func PrepareConfiguredWithMetadataPolicy(
 			version, syscall.EIO)
 	}
 	legacy := recorded && version > 0 && version < firstOwnershipAwareSchemaVersion
-	if recorded && version >= firstOwnershipAwareSchemaVersion && version < firstNeutralMetadataSchemaVersion {
+	if recorded && version >= firstOwnershipAwareSchemaVersion && version < schema.Version() {
 		if err := validateIntegrityWithMetadataPolicy(ctx, tx, nil, maxIntegrityRecords, maxIntegrityBytes,
 			version, maxMetadataBytes, opaqueMetadataVersions); err != nil {
 			return 0, 0, dbstate.State{}, err
@@ -400,8 +403,8 @@ func createVolume(ctx context.Context, tx *sql.Tx, volume string) (id, root int6
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO nodes (id, volume, kind, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec,
-		                   content, birth_sec, birth_nsec, change_sec, change_nsec)
-		VALUES (?, ?, 2, 0, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
+		                   content, birth_sec, birth_nsec, change_sec, change_nsec, directory_revision)
+		VALUES (?, ?, 2, 0, ?, ?, ?, ?, NULL, ?, ?, ?, ?, X'0000000000000001')`,
 		root, id, sec, nsec, sec, nsec, sec, nsec, sec, nsec)
 	if err != nil {
 		return 0, 0, err

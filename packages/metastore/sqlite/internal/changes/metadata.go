@@ -39,7 +39,9 @@ const changeMetadataColumns = `
 	CASE WHEN typeof(change_sec) IN ('integer','null') THEN change_sec END, typeof(change_sec),
 	CASE WHEN typeof(change_nsec) IN ('integer','null') THEN change_nsec END, typeof(change_nsec),
 	COALESCE(length(CAST(metadata AS BLOB)),0),typeof(metadata),
-	COALESCE(length(CAST(link_target AS BLOB)),0),typeof(link_target)`
+	COALESCE(length(CAST(link_target AS BLOB)),0),typeof(link_target),
+	COALESCE(length(CAST(directory_revision AS BLOB)),0),typeof(directory_revision),
+	CASE WHEN typeof(directory_revision)='blob' AND length(directory_revision)<=64 THEN directory_revision END`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -75,6 +77,7 @@ func scanChangeMetadata(
 		&extra.birthSec, &extra.birthSecType, &extra.birthNsec, &extra.birthNsecType,
 		&extra.changeSec, &extra.changeSecType, &extra.changeNsec, &extra.changeNsecType,
 		&lengths.Metadata, &extra.metadataType, &lengths.Target, &extra.targetType,
+		&extra.revisionLength, &extra.revisionType, &extra.revision,
 	); err != nil {
 		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, err
 	}
@@ -302,7 +305,9 @@ func validStoredComponent(name []byte) bool {
 type changeExtraMetadata struct {
 	birthSec, birthNsec, changeSec, changeNsec                 any
 	birthSecType, birthNsecType, changeSecType, changeNsecType string
-	metadataType, targetType                                   string
+	metadataType, targetType, revisionType                     string
+	revisionLength                                             int64
+	revision                                                   []byte
 }
 
 func optionalChangeTime(secRaw any, secType string, nsecRaw any, nsecType string) (*time.Time, error) {
@@ -328,7 +333,7 @@ func (extra changeExtraMetadata) apply(node *metastore.Node, lengths metastore.C
 		return err
 	}
 	if node == nil {
-		if birth != nil || changed != nil || extra.metadataType != "null" || extra.targetType != "null" || lengths.Metadata != 0 || lengths.Target != 0 {
+		if birth != nil || changed != nil || extra.metadataType != "null" || extra.targetType != "null" || extra.revisionType != "null" || lengths.Metadata != 0 || lengths.Target != 0 || extra.revisionLength != 0 {
 			return fmt.Errorf("removed change carries node metadata: %w", syscall.EIO)
 		}
 		return nil
@@ -337,6 +342,21 @@ func (extra changeExtraMetadata) apply(node *metastore.Node, lengths metastore.C
 		extra.targetType != "blob" || lengths.Target > storage.MaxLinkTargetBytes {
 		return fmt.Errorf("invalid event metadata representation: %w", syscall.EIO)
 	}
+	if extra.revisionType != "blob" || extra.revisionLength < 0 ||
+		extra.revisionLength > storage.MaxObservationTokenBytes || int64(len(extra.revision)) != extra.revisionLength ||
+		node.Kind != storage.NodeDirectory && extra.revisionLength != 0 ||
+		node.Kind == storage.NodeDirectory && !validStoredDirectoryRevision(extra.revision) {
+		return fmt.Errorf("invalid event directory revision: %w", syscall.EIO)
+	}
 	node.BirthTime, node.ChangeTime = birth, changed
+	node.DirectoryRevision = bytes.Clone(extra.revision)
 	return nil
+}
+
+func validStoredDirectoryRevision(token []byte) bool {
+	return validNativeDirectoryRevision(token)
+}
+
+func validNativeDirectoryRevision(token []byte) bool {
+	return len(token) == 8 && token[0]&0x80 == 0 && !bytes.Equal(token, make([]byte, 8))
 }

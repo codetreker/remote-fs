@@ -21,7 +21,7 @@ Status: implemented
 
 `cmd/remote-fs-server -listen ADDR -local-store DIR -volume NAME -quota SIZE` 打开这份组合实现。`DIR` 必须已经存在，是服务进程拥有的 `0700` 目录，并且路径上的祖先目录不能允许信任边界之外的主体替换下一级路径。一个进程在整个服务期内独占该 root；第二个 opener 以 `EBUSY` 失败。server 的文件占有状态首次建立需要 `-initialize-lock-state`，之后按持久 binding 重开。`-http-max-write-bytes` 单独限制 file-content request；省略时继承 `-http-max-body-bytes`。local-store 形态在接触 root 之前要求有效 write 上限不大于 `-local-max-object-bytes`，避免 server 先保留一份 backend 必定以 `EFBIG` 拒绝的 request body。
 
-[显式文件占有](./2026-09-07-file-locks.md)把运行期 authority 与 SQLite 最终发布绑定，并在这个私有 root 中保存重启保护证据。[持续文件句柄](./2026-09-08-live-file-handles.md)在同一节点上增加保留引用、范围修改与最后关闭回收。[持久节点身份与原子文件操作](./2026-09-20-durable-identity-and-atomic-file-operations.md)再增加 identity namespace、schema v7、durable delete intent 与恢复期 maintenance accounting。它们沿用本 note 的对象／metastore 分工、独占所有权与失败关闭规则；本 note 继续拥有对象格式、组合初始化与磁盘持久性的理由。
+[显式文件占有](./2026-09-07-file-locks.md)把运行期 authority 与 SQLite 最终发布绑定，并在这个私有 root 中保存重启保护证据。[持续文件句柄](./2026-09-08-live-file-handles.md)在同一节点上增加保留引用、范围修改与最后关闭回收。[持久节点身份与原子文件操作](./2026-09-20-durable-identity-and-atomic-file-operations.md)再增加 identity namespace、schema v7、durable delete intent 与恢复期 maintenance accounting；[有界权威名字观察](./2026-09-20-bounded-authoritative-name-observations.md)增加 schema v8、directory revision 与有界目录观察。它们沿用本 note 的对象／metastore 分工、独占所有权与失败关闭规则；本 note 继续拥有对象格式、组合初始化与磁盘持久性的理由。
 
 ### 范围切分
 
@@ -155,7 +155,7 @@ metastore 使用 WAL，writer connection 明确设置 `synchronous=FULL`、`fore
 
 schema 的 `0003_durable_state.sql` 从 v2 前滚到 v3，建立 backing-store binding、database identity/generation、高水位、全局 identity type/max expression indexes 与带 predecessor 的 change 表。v1/v2 migration 先在同一 transaction 内验证全库结构、对象归属、序列、树与日志 tail；v2 的 retained rows 没有 predecessor，不能被宣称为已验证的连续历史，因此迁移保留全局 node/change 高水位、清空 retained changes，并为每个 volume 生成新 incarnation、把 tail／trim 归零。迁移后的新身份与位置仍严格高于旧高水位。v2 的最终形状由[独立 v2 fixture](../../../../packages/metastore/sqlite/internal/integration/testdata/version2.sql)钉住，已落地 migration 不随当前 DDL 改写。这补上了[元数据复制](./2026-08-27-metadata-replication.md)留下的「下一个迁移必须为 v2 建历史见证」义务。`0004_lease_recovery.sql` 另增占有恢复证据，generation 与租期数值不充当 node version 或 change position。
 
-`0005_retained_files.sql` 在 v5 增加 detached 标记与 content revision；既有节点迁移为 named、revision 从 1 开始。detached 只能是无 entry 的非 root 普通文件，named 节点继续构成根树；两者都参与对象关系、类型和用量检查。unlink 或 rename 覆盖仍有 pin 的节点时，只删除名字并标记 detached，内容保持 referenced；其后修改不进入 named change log，snapshot 只遍历名字树。最后物理关闭才在事务中删除节点、按当前大小释放配额并授权垃圾回收。独占 opener 的启动事务先验证所有 volume，再回收旧 epoch 的 detached 节点；旧引用明确失效，另一有效 owner 被 EX ownership 排除。恢复不能因某一个 volume 打开成功而跳过其它 volume 的损坏。
+`0005_retained_files.sql` 在 v5 增加 detached 标记与 content revision；既有节点迁移为 named、revision 从 1 开始。当时只有无 entry 的非 root 普通文件可以 detached；named 节点继续构成根树，两者都参与对象关系、类型和用量检查。[持久节点身份与原子文件操作](./2026-09-20-durable-identity-and-atomic-file-operations.md)把保留引用扩展到目录与符号链接，[有界权威名字观察](./2026-09-20-bounded-authoritative-name-observations.md)允许 exact scoped directory read 继续访问 detached 空目录；任何 detached 节点仍不得参与 entry 关系。unlink 或 rename 覆盖仍有 pin 的节点时，只删除名字并标记 detached，内容保持 referenced；其后修改不进入 named change log，snapshot 只遍历名字树。最后物理关闭才在事务中删除节点、按当前大小释放配额并授权垃圾回收。独占 opener 的启动事务先验证所有 volume，再回收旧 epoch 的 detached 节点；旧引用明确失效，另一有效 owner 被 EX ownership 排除。恢复不能因某一个 volume 打开成功而跳过其它 volume 的损坏。
 
 ### 逻辑配额与物理容量
 

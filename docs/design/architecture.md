@@ -50,7 +50,7 @@ flowchart LR
 
 ## 三、同一个接口，两个模块
 
-client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storage.Storage` 基础接口**，并提供有界结果扩展 `storage.BoundedStorage`。`FileStorage` 提供有限 FileSession 与保留 File；原子子项打开、NodeReference、身份 namespace、action receipt、metadata、scope、pending deletion、条件 mutation、use owner 与 range 是可选能力。强 S/X 控制与 mutation scope 是另外的成对能力。
+client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storage.Storage` 基础接口**，并提供有界结果扩展 `storage.BoundedStorage`。`FileStorage` 提供有限 FileSession 与保留 File；原子子项打开、NodeReference、身份 namespace、DirectoryReader 的 identity-bound enumeration、完整目录 metadata、reference current-name、action receipt、metadata、scope、pending deletion、条件 mutation、use owner 与 range 是可选能力。强 S/X 控制与 mutation scope 是另外的成对能力。
 
 它们**不是同一个模块**，也不在同一个角色里：server 侧的那个真正持有数据；client 侧的那个不保存权威内容，它把调用翻译为 HTTP 交换，并保存完成核对所需的有限能力与动作状态。
 
@@ -63,7 +63,7 @@ client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storag
 
 基础 storage 描述 volume 操作，锁控制描述跨请求的占有与核对，HTTP 同时承载它们和复制。各自的义务不能由另一层猜测补齐。
 
-**平台解释到客户端为止。** 底层提供按路径寻址的基础 volume、FileStorage 的保留 File/NodeReference、按父身份寻址的原子子项操作，以及以 NodeKind、opaque metadata、Uses、pending deletion 和 range 表达的中立能力。FUSE 解释 POSIX 权限、kernel owner、flock 与 record lock；远端不解释平台 mode、名字规则或锁协议。对象在 rename、unlink 或覆盖后的存活由服务端保留引用保证，不由旧路径重建。
+**平台解释到客户端为止。** 底层提供按路径寻址的基础 volume、FileStorage 的保留 File/NodeReference、按父身份寻址的原子子项操作与完整目录观察，以及以 NodeKind、opaque metadata、目录 revision、原始名字、Uses、pending deletion 和 range 表达的中立能力。FUSE 解释 POSIX 权限、kernel owner、flock 与 record lock；远端不解释平台 mode、名字规则或锁协议。对象在 rename、unlink 或覆盖后的存活由服务端保留引用保证，不由旧路径重建。
 
 **节点身份在契约里**（R-FS-5）。属性带一个 `ID`，说的是「这个名字后面是哪个节点」，与它此刻叫什么无关。挂载呈现层分不出这件事就会把两个活着的节点报成一个：一个描述符会读到别人的字节，而 mmap 了它的程序拿到 SIGBUS。而挂载点只直接观测到自己执行的操作，别的客户端做的改名不经过它的任何一条路径，所以这个答案只能由 volume 给。
 
@@ -116,9 +116,11 @@ metadata 每节点最多 16 个 namespace、规范编码总长最多 64 KiB；�
 
 **保留文件接口**：`FileStorage.NewFileSession` 建立有限会话，`OpenFile` 按路径打开，`OpenNode` 按身份打开；`OpenAt`、`OpenNodeRef` 与 `OpenChildRef` 使用父或节点身份返回原子捕获的对象引用。`File` 提供当前属性、区间读取、同步补丁、截断、Sync 与 Close；`NodeReference` 提供属性、Scope、State 与 Close，没有字节方法。身份 namespace、条件 mutation、pending deletion 与 session action query 都在相同 authority 顺序中执行。失去名字的对象仍存活并收费，直到引用退役、操作排空和最后释放完成。完整契约见[打开的文件](server/file-handles.md)。
 
+`DirectoryReader.ReadDirNode` 以 DirectoryTarget 的 NodeID 和可选 Scope 返回一次完整、有界的目录捕获，并执行 `ReadEntries` Use 检查；只有 exact scoped read 能继续枚举 detached 空目录，裸 NodeID 与 DirectoryMetadataObserver 都拒绝该目标。`DirectoryMetadataObserver` 在独立授权操作下返回同一捕获的 entries、opaque directory revision 与可选目录自身名字；NamespaceAccess、DirectoryReader 和 DirectoryMetadataObserver 三个 Go capability 可以独立实现。HTTP v4 的预留 DirectoryMetadata bit 只在两个目录 facet 的完整 backing chain 都可用时宣告，避免只支持旧 Namespace 子集的 peer 误通过目录读取 preflight；Namespace bit 仍只表示 LookupAt 与 MutateName。File 和 NodeReference 的 `ReferenceNameObserver` 返回 Root、Linked 或 Detached。可选 NamespaceGuards 在观察的同一权威读取中核对目录 revision、确切名字边和根关系，不进入 mutation 输入。完整契约见[打开的文件](server/file-handles.md#名字与目录观察)。
+
 **强 S/X 控制接口**：显式创建 Session / Owner，解析现有普通文件，取得、续期、解除与核对 S/X 授予。修改只使用调用方给出的有界不可变 proof 集合，普通读取不声称 grant 有效。所有修改，包括匿名调用，都在原生最终转换处遵守占有顺序；重启通过持久最大时长证据与恢复屏障保留已确认保护。身份、动作结果、当前 grant 状态与内容版本分别定义，完整契约见 [文件锁设计](server/file-locks.md)。
 
-**HTTP 接口**：跨角色的实际边界。v4 转发中立 Attr、基础 storage、保留文件、metadata/range 与显式 S/X 控制，以及复制的订阅、续订、快照和 checkpoint。v3 不作为兼容旁路，并必须满足：
+**HTTP 接口**：跨角色的实际边界。v4 转发中立 Attr、基础 storage、保留文件、身份目录枚举、名字观察、metadata/range 与显式 S/X 控制，以及复制的订阅、续订、快照和 checkpoint。v3 不作为兼容旁路，并必须满足：
 
 | 义务 | 违反的后果 |
 |---|---|
@@ -143,9 +145,9 @@ client 侧的 remote storage 实现 storage 接口，凡是不满足上述任何
 
 ### 元数据有副本，内容没有
 
-**内核查名字与修改子项到达 storage**：目录项、属性与负项超时都是 0。首次路径定位可由 client 的 SQLite 副本答复；FUSE 的子项 Lookup、打开、创建、删除与 rename 使用父 NodeID 到达 authority，已 Opendir 的目录 handle 还能附带其 NodeReference Scope。公开 List/ListBounded 仍在确认副本可用后按路径回源，以执行当前 `ReadEntries` 限制；identity-bound Readdir 与完整目录 metadata observation 尚未交付。普通文件使用 direct I/O，每次读取返回服务端保留对象的当前状态。
+**内核查名字与修改子项到达 storage**：目录项、属性与负项超时都是 0。首次路径定位可由 client 的 SQLite 副本答复；FUSE 的子项 Lookup、打开、创建、删除与 rename 使用父 NodeID 到达 authority，已 Opendir 的目录 handle 还附带其 NodeReference Scope。Readdir 以该身份取得一次完整、有界的权威目录捕获；公开路径 List/ListBounded 继续在确认副本可用后回源。普通文件使用 direct I/O，每次读取返回服务端保留对象的当前状态。
 
-副本保存名字、NodeKind、共同时间、opaque metadata 和大小，不复制文件内容。打开只取得对象引用，字节在每次 ReadAt 时读取。
+副本保存名字、NodeKind、共同时间、opaque metadata 和大小，不复制文件内容。HTTP v4 replication 不携带 authority DirectoryRevision；SQLite replica 为本地目录树维护不可导出的 opaque revision，并在 replay 名字变化时使相应 token 失效。所有公开目录／名字观察回源 authority。打开只取得对象引用，字节在每次 ReadAt 时读取。
 
 server 每个 volume 记一条有序的变更日志，位置与树的改动在同一个事务里分配；client 先订阅、再取一次一致性快照，此后由流喂着。副本在观测到流断开时整份作废，到达 replicated storage 的操作以 EIO 失败，没有过期时间或基于间隔的刷新。本地副本在读写阶段之间交接，持续查询不能让已登记的更新一直等待读者空闲；首次构建与重建在快照 EOF 后读取固定 checkpoint，并用原订阅回放到该位置才恢复作答，见 [client 设计](client/architecture.md#二路径起点来自副本子项操作到达权威)。
 

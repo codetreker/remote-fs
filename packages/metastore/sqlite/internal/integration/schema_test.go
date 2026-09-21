@@ -114,7 +114,7 @@ func TestWitnessedRetainedMigrationPreservesNodesAndAcceptedState(t *testing.T) 
 				}
 			})
 			assertHistoricalLeaseVolume(t, store, "A")
-			assertHistoricalLeaseSchemaVersion(t, path, 7)
+			assertHistoricalLeaseSchemaVersion(t, path, 8)
 			db := raw(t, path)
 			defer db.Close()
 			var total, initialized int
@@ -125,23 +125,20 @@ func TestWitnessedRetainedMigrationPreservesNodesAndAcceptedState(t *testing.T) 
 			if total != 4 || initialized != total {
 				t.Fatalf("migrated nodes = %d, valid linked revisions = %d", total, initialized)
 			}
-			var currentEnvelope, historicalEnvelope []byte
+			var currentEnvelope []byte
 			if err := db.QueryRow(`SELECT metadata FROM nodes WHERE id=2`).Scan(&currentEnvelope); err != nil {
-				t.Fatal(err)
-			}
-			if err := db.QueryRow(`SELECT metadata FROM changes WHERE node=2 ORDER BY position LIMIT 1`).Scan(&historicalEnvelope); err != nil {
 				t.Fatal(err)
 			}
 			currentMetadata, err := storage.DecodeMetadata(currentEnvelope)
 			if err != nil {
 				t.Fatal(err)
 			}
-			historicalMetadata, err := storage.DecodeMetadata(historicalEnvelope)
-			if err != nil {
-				t.Fatal(err)
+			if len(currentMetadata["posix.permissions.v1"].Version) == 0 {
+				t.Fatal("migrated current POSIX metadata has no CAS version")
 			}
-			if bytes.Equal(currentMetadata["posix.permissions.v1"].Version, historicalMetadata["posix.permissions.v1"].Version) {
-				t.Fatal("migrated current and historical POSIX metadata share a CAS version")
+			var retainedChanges int
+			if err := db.QueryRow(`SELECT count(*) FROM changes`).Scan(&retainedChanges); err != nil || retainedChanges != 0 {
+				t.Fatalf("pre-revision history remains replayable: count=%d error=%v", retainedChanges, err)
 			}
 			accepted, visible := witness.accepts()
 			want := historicalLeaseDurableState
@@ -237,7 +234,7 @@ func TestNeutralMetadataMigrationWitnessFailurePreservesRecoveryState(t *testing
 	if !errors.Is(err, failure) || !errors.Is(err, syscall.EIO) {
 		t.Fatalf("unaccepted migration = %v; want original witness failure and EIO", err)
 	}
-	assertHistoricalLeaseSchemaVersion(t, path, 7)
+	assertHistoricalLeaseSchemaVersion(t, path, 8)
 	want := historicalLeaseDurableState
 	want.Generation++
 	accepted, visible := witness.accepts()

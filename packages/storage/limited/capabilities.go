@@ -38,12 +38,59 @@ func (s *fileSession) CheckNamespaceAccess() error {
 	return err
 }
 
+func (s *fileSession) CheckDirectoryRead() error {
+	_, err := capability(s.FileSession, storage.DirectoryReader.CheckDirectoryRead)
+	return err
+}
+
 func (s *fileSession) LookupAt(ctx context.Context, name storage.ChildName) (storage.Attr, error) {
 	backing, err := capability(s.FileSession, storage.NamespaceAccess.CheckNamespaceAccess)
 	if err != nil {
 		return storage.Attr{}, err
 	}
 	return backing.LookupAt(ctx, name)
+}
+
+func (s *fileSession) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	backing, err := capability(s.FileSession, storage.DirectoryReader.CheckDirectoryRead)
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	observed, err := backing.ReadDirNode(ctx, target)
+	if err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	if err := observed.Check(); err != nil {
+		return storage.ObservedDirectory{}, err
+	}
+	if observed.Observation.ParentID != target.NodeID {
+		return storage.ObservedDirectory{}, syscall.EIO
+	}
+	return observed, nil
+}
+
+func (s *fileSession) ReadDirNodeBounded(ctx context.Context, target storage.DirectoryTarget, result *storage.ListResult) (observation storage.DirectoryObservation, returned error) {
+	if result == nil {
+		return observation, syscall.EINVAL
+	}
+	defer func() {
+		if returned != nil {
+			observation = storage.DirectoryObservation{}
+			result.Fail(returned)
+		}
+	}()
+	backing, err := capability(s.FileSession, storage.DirectoryReader.CheckDirectoryRead)
+	if err != nil {
+		return storage.DirectoryObservation{}, err
+	}
+	observation, returned = backing.ReadDirNodeBounded(ctx, target, result)
+	if returned == nil {
+		returned = observation.Check()
+	}
+	if returned == nil && observation.ParentID != target.NodeID {
+		returned = syscall.EIO
+	}
+	return observation, returned
 }
 
 func (s *fileSession) MutateName(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
@@ -287,6 +334,7 @@ func (r *referenceCapabilities) MutateFile(ctx context.Context, command storage.
 var (
 	_ storage.AtomicFileOpener        = (*fileSession)(nil)
 	_ storage.NamespaceAccess         = (*fileSession)(nil)
+	_ storage.DirectoryReader         = (*fileSession)(nil)
 	_ storage.NodeReferences          = (*fileSession)(nil)
 	_ storage.FileActions             = (*fileSession)(nil)
 	_ storage.MetadataAccess          = (*fileSession)(nil)
