@@ -831,6 +831,72 @@ func TestRequestLimitRejectsMaxPlusOneAndRecovers(t *testing.T) {
 	}
 }
 
+func TestRequestLimitPreservesRelatedCompoundResponses(t *testing.T) {
+	limits := DefaultLimits()
+	limits.MaxRequests = 2
+	limits.MaxCompound = 2
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	config := Config{
+		Authenticator:     &protocolAuthenticator{},
+		AuthorizeIdentity: IdentityAuthorizerFunc(func(context.Context, Principal) error { return nil }),
+		Authorize: authz.AuthorizerFunc(func(ctx context.Context, request authz.AccessRequest) error {
+			if request.Operation == storage.OpFileSessionOpen {
+				close(entered)
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return nil
+		}),
+		Limits: limits,
+	}
+	server, _, connection := startConfiguredProtocolServer(t, config)
+	sessionID, key := authenticateProtocol(t, connection)
+	connect := treeConnectPacket(3, sessionID, `\\localhost\data`)
+	if err := key.Sign(connect); err != nil {
+		t.Fatal(err)
+	}
+	sendFrame(t, connection, connect)
+	<-entered
+	frame := compoundRequest(t, key, []wire.Header{
+		{Command: wire.Echo, MessageID: 4, SessionID: sessionID, Credits: 1},
+		{Command: wire.Echo, MessageID: 5, Credits: 1},
+	}, [][]byte{wire.EmptyResponseBody(), wire.EmptyResponseBody()}, true)
+	sendFrame(t, connection, frame)
+	response := readFrame(t, connection)
+	first, err := wire.ParseHeader(response)
+	if err != nil || first.Status != statusResources || first.Flags&wire.FlagRelated != 0 || first.NextCommand == 0 {
+		t.Fatalf("first rejection = %+v, %v", first, err)
+	}
+	offset := int(first.NextCommand)
+	second, err := wire.ParseHeader(response[offset:])
+	if err != nil || second.Status != statusResources || second.Flags&wire.FlagRelated == 0 {
+		t.Fatalf("related rejection = %+v, %v", second, err)
+	}
+	if key.Verify(response[:offset]) != nil || key.Verify(response[offset:]) != nil {
+		t.Fatal("resource rejection signatures failed")
+	}
+	if state := server.Status(); state.PendingRequests != 1 {
+		t.Fatalf("rejected compound changed pending ownership: %+v", state)
+	}
+	close(release)
+	response = readFrame(t, connection)
+	accepted, err := wire.ParseHeader(response)
+	if err != nil || accepted.MessageID != 3 || accepted.Status != statusOK || key.Verify(response) != nil {
+		t.Fatalf("admitted response = %+v, %v", accepted, err)
+	}
+	echo := signedRequest(t, key, wire.Header{Command: wire.Echo, MessageID: 6, SessionID: sessionID, Credits: 1}, wire.EmptyResponseBody())
+	sendFrame(t, connection, echo)
+	response = readFrame(t, connection)
+	recovered, err := wire.ParseHeader(response)
+	if err != nil || recovered.Status != statusOK || key.Verify(response) != nil {
+		t.Fatalf("recovered capacity = %+v, %v", recovered, err)
+	}
+}
+
 func TestCancelIsNotImplementedByTheEndpointSlice(t *testing.T) {
 	_, _, connection := startProtocolServer(t, DefaultLimits())
 	sessionID, key := authenticateProtocol(t, connection)

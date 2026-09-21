@@ -506,6 +506,9 @@ func (c *connection) rejectRequests(requests []wire.Request) error {
 		}
 		header.Status = statusResources
 		header.Flags = 0
+		if request.Header.Flags&wire.FlagRelated != 0 {
+			header.Flags |= wire.FlagRelated
+		}
 		header.Signature = [16]byte{}
 		header.NextCommand = 0
 		header.Credits = c.grantCredits(header.Credits)
