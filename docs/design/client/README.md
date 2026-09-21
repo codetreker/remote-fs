@@ -2,13 +2,13 @@
 
 本目录承载 **client 角色**的内部设计。
 
-client 是 volume 的使用者：持有一份 remote storage，以父节点身份和保留引用把 volume 呈现为本地目录，并维持这一呈现所需的全部本地状态。角色边界与两条跨角色契约由 [`../architecture.md`](../architecture.md) 定义。
+client 是 volume 的使用者：持有一份 remote storage，以父节点身份和保留引用把 volume 呈现为 Linux 本地目录，并提供 Windows 本机 SMB 的安全会话端点；Windows 文件命令不在该端点的支持面。角色边界与两条跨角色契约由 [`../architecture.md`](../architecture.md) 定义。
 
 ## 本目录的规则
 
 - **只写 client 内部。** 不重讲系统全貌；那是顶层设计的事。
 - **不假设 server 的内部构造。** 引用 server 只能通过顶层设计定义的契约——server 内部怎么组织、它的 storage 底下是什么，与本目录无关。一旦这里出现「因为 server 会……」这样的推断，就意味着契约没写清楚，应当去补契约而不是在这里迁就。
-- **平台相关的内容集中在挂载呈现层。** client 侧不挂载的那条路径不依赖任何平台特性；写作时不要把二者混在一处，否则将来增加平台会牵动无关部分。
+- **平台相关的内容集中在各自的呈现层。** FUSE 与 SMB 不把 POSIX／Windows 解释带入 remote storage；client 侧不挂载的路径不依赖任何平台特性。
 - **不写需求、不写调研、不写思考过程。** 依 [`../README.md`](../README.md)。
 
 ## 文档
@@ -16,5 +16,6 @@ client 是 volume 的使用者：持有一份 remote storage，以父节点身�
 | 文件 | 内容 |
 |---|---|
 | `architecture.md` | client 的内部构成、组件职责、内部数据流 |
+| `smb-endpoint.md` | Windows 本机 SMB 端点、认证、签名、share 与 session 生命周期 |
 
 client 内部若需进一步展开，在本目录增加文档，不影响 server 目录。

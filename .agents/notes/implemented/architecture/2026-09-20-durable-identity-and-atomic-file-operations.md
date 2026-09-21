@@ -66,4 +66,4 @@ FUSE 的已有 inode Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 R
 
 本决定部分取代[文件目标、显式内容依据与目录父身份](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)中的目录父身份部分。该提案关于 R-CC-1 调用方显式内容版本依据的部分仍是 proposed；这里的 metadata/size 条件和内部 content revision 都不宣称完成那项工作流。
 
-[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)另行交付目录 metadata observation、reference current-name 和只读 guard；这些能力不进入本决定的 mutation 输入。guarded mutation、SMB endpoint 与 Windows 请求映射仍未交付，系统不因此宣称 Windows 支持已经完成。
+[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)另行交付目录 metadata observation、reference current-name 和只读 guard；这些能力不进入本决定的 mutation 输入。[安全且有界的本机 SMB 端点](2026-09-21-secure-bounded-smb-endpoint.md)另行交付协议、安全会话与 share 生命周期。guarded mutation 与 Windows 文件／名字映射仍未交付，系统不因此宣称 Windows 支持已经完成。

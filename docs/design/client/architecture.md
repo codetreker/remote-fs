@@ -1,6 +1,6 @@
 # client 角色
 
-volume 的使用者。持有一份 remote storage，把 volume 呈现为本地目录，并维持这一呈现所需的全部本地状态。
+volume 的使用者。持有一份 remote storage，把 volume 呈现为 Linux 本地目录，并提供 Windows 本机 SMB 的安全会话端点；Windows 文件命令不在该端点的支持面。
 
 本文只写 client 内部。基础 storage、保留文件、锁控制与 RPC 的边界见 [`../architecture.md`](../architecture.md)。
 
@@ -12,7 +12,10 @@ volume 的使用者。持有一份 remote storage，把 volume 呈现为本地�
 | **显式锁控制** | HTTP client 实现锁 Service，调用方保留 Session / Owner 与原动作身份，以 `WithScope` 构造独立、不可变的修改 proof 集合。控制请求具有独立预算。 | R-CC-3、R-CC-6 至 R-CC-11、R-INT-3 |
 | **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：按路径 `Stat` 走本地 SQLite，公开 `List` / `ListBounded` 与身份目录／名字观察在确认副本健康后回源 authority，其余操作也走远端。副本由 v4 变更流喂着，并为自己的目录树维护不可作为 authority 证据的本地 revision。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
 | **挂载呈现层** `packages/fuse` | 把一份 storage 呈现为本地目录。持有 FileSession、已打开目录的 NodeReference、普通 File、UseOwner 与内核 owner 的映射；以父 NodeID 执行子项操作，目录 handle 以 Scope 捕获一次完整 Readdir，文件以 direct I/O 逐次读写。仅 Linux。 | R-FS-1、R-FS-5、R-FS-6、R-FS-8、R-CON-1~3、R-ERR-1、R-ERR-2、R-CC-12、R-CC-13、R-WS-5、R-INT-3、R-INT-8 |
-| **生命周期** | 挂载的建立与拆除。 | R-WS-2 |
+| **本机 SMB 端点** `packages/smb`、`packages/smb/windows` | 接受 loopback 上的 Windows SMB client，执行 SMB 3.1.1 协商、SSPI 身份验证、强制消息签名以及 connection/session/tree/export 生命周期；每个 authenticated session 与 export 共享一份 FileSession。文件与目录命令返回不支持。 | R-INT-1~3、R-INT-10、R-SEC-1、R-SEC-4、R-WIN-1、R-WIN-9、R-WIN-10 |
+| **生命周期** | Linux mount 与 SMB Server／Export 的建立、停止和清理重试。 | R-WS-2、R-WIN-10 |
+
+Linux mount 的数据路径如下；Windows endpoint 的内部层次见[本机 SMB 端点](smb-endpoint.md)。
 
 ```
    程序 ──▶ 内核 VFS
@@ -46,7 +49,9 @@ SSE 不把整个 stream 保存在内存里，但每一帧仍有独立的 `DialOp
 
 每个基础数据调用都要先取得 client 自己的 response admission。默认同时保留 64 份响应、允许 64 个等待者，aggregate 上限为 8 GiB；每份都按 `4 * MaxBodyBytes` 预留，覆盖 raw body、decoded listing 与转换过程的同时保留。默认 1 GiB body 使每个 List 预留 4 GiB，因此 aggregate byte bound 会先把并发压到 2 个活跃 List，另有至多 64 个调用等待。Subscribe、Resubscribe 与 Snapshot 在发出 HTTP 前也取得同一名额，用来约束 stream 尚未成功建立时可能返回的普通 error body；确认 `200 text/event-stream` 后立即释放，后续 frame 由 `MaxFrameBytes` 约束。等待者已满时，`Stat`、`Write`、`Create` 或 stream setup 都会在发出 HTTP 请求前以 `EAGAIN` 失败；context cancellation 会移除等待计数。non-stream admission 一直持有到 response 解码、mutation response/barrier 验证完成。`ReadBounded` 取 client 与调用方 byte bound 中较小者；`ListBounded` 把解码后的 entry 逐项交给调用方的 `ListResult`。普通 `Read` 与 `List` 仍返回完整 materialized value，但整个 HTTP body 及其同时表示都在上述单体与 aggregate 边界内。server 侧的 backend 预算与 response admission 见 [`../server/architecture.md`](../server/architecture.md#六请求与响应的内存边界)。
 
-**FUSE 到这一层为止。** 挂载层把内核请求翻译为基础 volume、FileStorage 和中立 identity/metadata/range 调用。已有 inode 的 Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 Readlink 使用 OpenNodeRef，Lookup 与名字修改使用 LookupAt/MutateName。挂载 preflight 分别要求 NamespaceAccess 与 DirectoryReader；普通 node 操作携带稳定父 NodeID，已打开的 directory handle Lookup 与 Readdir 再附带活 Scope，后者使用 ReadDirNodeBounded。远端会话只有在 v4 DirectoryMetadata bundle bit 为 true 时暴露 DirectoryReader；in-process DirectoryReader 不依赖 DirectoryMetadataObserver。OpenChildRef 是编程入口可用的原子子项引用能力。普通 fd 使用 File，无 fd 的身份属性使用 NodeReference 或 StatNode/SetNodeAttr。
+**平台呈现到这一层为止。** FUSE 把 Linux 内核请求翻译为基础 volume、FileStorage 和中立 identity/metadata/range 调用。已有 inode 的 Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 Readlink 使用 OpenNodeRef，Lookup 与名字修改使用 LookupAt/MutateName。挂载 preflight 分别要求 NamespaceAccess 与 DirectoryReader；普通 node 操作携带稳定父 NodeID，已打开的 directory handle Lookup 与 Readdir 再附带活 Scope，后者使用 ReadDirNodeBounded。远端会话只有在 v4 DirectoryMetadata bundle bit 为 true 时暴露 DirectoryReader；in-process DirectoryReader 不依赖 DirectoryMetadataObserver。OpenChildRef 是编程入口可用的原子子项引用能力。普通 fd 使用 File，无 fd 的身份属性使用 NodeReference 或 StatNode/SetNodeAttr。
+
+Windows 的本机 SMB endpoint 与 FUSE 平行，不经过 Linux 副本或 inode 层。它只把一个受信配置的 share 绑定到 FileStorage，并把 SSPI 验证的本地 SID／登录会话放入授权 context；远端身份与 credential 仍由 backing remote storage 持有。协议、安全、资源和清理契约见[本机 SMB 端点](smb-endpoint.md)。文件命令、名字解析、Windows metadata、共享／范围语义、通知与 cache recovery 不在该 endpoint 的支持面。
 
 ### 业务身份与授权结果
 
@@ -232,11 +237,11 @@ volume 报出自己的容量，挂载呈现层把它换算成内核要的块数�
 
 目录子项 Lookup、mutation 与 Readdir 使用 NodeID 和可选 NodeReference Scope；reference current-name、完整有界 directory metadata observation 与持久 authority directory revision/guard 由[有界权威名字观察](../../../.agents/notes/implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)提供。guards 只约束回源的只读观察，不与 SQLite replica 的本地 revision 比较，也不进入名字 mutation 或当前路径遍历。目录 revision 不是通知游标，挂载层不据此实现缓存失效或恢复。
 
-标准 advisory 通过中立 range 表达 flock 与传统 POSIX 范围锁，完整 `F_OFD_*` 和 mmap 行为不由此推出。enforced range 为其它平台保留，当前 Linux 不把它冒充 advisory。显式 S/X 仍单独取得，挂载不自动选择 Strong 策略。中立原语没有交付 SMB endpoint、Windows create/share/disposition 映射或 Windows cache 验收，不能据此宣称 Windows 支持完成。
+标准 advisory 通过中立 range 表达 flock 与传统 POSIX 范围锁，完整 `F_OFD_*` 和 mmap 行为不由此推出。enforced range 为其它平台保留，当前 Linux 不把它冒充 advisory。显式 S/X 仍单独取得，挂载不自动选择 Strong 策略。SMB endpoint 提供协议、安全会话与 share 生命周期；Windows create/share/disposition 映射、文件与目录命令、通知、WNet 发布和 cache 验收不在其支持面，不能据此宣称 Windows 支持完成。
 
 ## 十一、部署形态
 
-作为库嵌入集成方既有的 daemon service，或作为独立二进制运行（R-INT-1、R-INT-4）。作为库时不注册信号处理、不写标准输出、不调用进程退出、不修改进程级设置、包加载时不产生副作用（R-INT-2）；日志只写入调用方给定的目的地，未给定则丢弃。
+Linux client 可作为库嵌入既有 daemon service，或作为独立二进制运行（R-INT-1、R-INT-4）。Windows SMB endpoint 只作为 package 嵌入调用方进程。两者作为库时都不注册信号处理、不写标准输出、不调用进程退出、不修改进程级设置、包加载时不产生副作用（R-INT-2）；日志只写入调用方给定的目的地，未给定则丢弃。
 
 独立 client 用 `-max-file-size`、`-file-session-lease` 与 `-file-session-history` 配置文件会话，默认分别为 1 GiB、30 秒与 1 分钟。`-timeout` 默认 30 秒，约束单次远端交换或文件清理尝试；健康会话中的阻塞 range 等待可以跨多次交换。
 
