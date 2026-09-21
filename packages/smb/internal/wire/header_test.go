@@ -98,6 +98,11 @@ func TestCompoundFrame(t *testing.T) {
 	if _, err := ParseFrame(response, testLimits); err == nil {
 		t.Fatal("response accepted as request")
 	}
+	unknownCommand := bytes.Clone(packet)
+	le.PutUint16(unknownCommand[12:14], OplockBreak+1)
+	if _, err := ParseFrame(unknownCommand, testLimits); err == nil {
+		t.Fatal("unknown command accepted")
+	}
 	if _, err := ParseFrame(packet[:65], testLimits); err == nil {
 		t.Fatal("short body accepted")
 	}

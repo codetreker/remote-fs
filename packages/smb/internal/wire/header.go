@@ -145,7 +145,7 @@ func ParseFrame(packet []byte, limits Limits) ([]Request, error) {
 		}
 		header, err := ParseHeader(remaining)
 		related := header.Flags&FlagRelated != 0
-		if err != nil || header.Flags&FlagResponse != 0 || len(requests) == 0 && related {
+		if err != nil || header.Command > OplockBreak || header.Flags&FlagResponse != 0 || len(requests) == 0 && related {
 			return nil, ErrMalformed
 		}
 		if len(requests) == 1 {
