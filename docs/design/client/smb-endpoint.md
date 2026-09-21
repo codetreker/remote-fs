@@ -60,7 +60,7 @@ authentication exchange 受 `HandshakeTimeout` 约束，完成后的 identity �
 
 `TREE_DISCONNECT` 取消已经登记到该 tree 的 pending request，再关闭它持有的 authority ref；同一 export 的最后一个 tree 关闭共享 FileSession。这份清理只覆盖现有 control request 和 authority ownership，不构成文件工作的 per-tree admission fence。`LOGOFF` 先发布 session retirement，取消除当前 LOGOFF 外的请求，关闭 authentication、全部 tree 和 orphan authority session，最后等待 response frame 释放。连接断开执行相同的无授权清理路径，不能把断线理解为资源已经释放。
 
-`Export.Unpublish` 对任何 live tree 或正在取得该 export 的 connect／request 返回 busy，原 mapping、tree 与 FileSession 保持有效；只有没有使用者时才进入清理并移除 export。export cleanup 在加入 connection 或 authority 的清理序列前先核对该 owner 是否持有目标 export；必须等待同一 owner 时服从调用方 context，不能被其它 export 的清理越过 deadline。`Server.Shutdown` 另行永久停止 listener 和新工作，等待 connection 退出，强制清理 tree／FileSession，移除已经静止并确认释放的 export，并保留失败者供重试。调用方提供的 backend 始终由调用方拥有，server 只关闭自己建立的 FileSession。
+`Export.Unpublish` 对任何 live tree 或正在取得该 export 的 connect／request 返回 busy，原 mapping、tree 与 FileSession 保持有效；只有没有使用者时才进入清理并移除 export。export cleanup 在加入 connection、session 或 authority 的清理序列前先核对该 owner 是否持有目标 export；session retirement bookkeeping 只检查已经退休的目标 owner。必须等待同一 owner 的 authentication 或 cleanup 时服从调用方 context，不能被无关 session 或其它 export 的工作越过 deadline。`Server.Shutdown` 另行永久停止 listener 和新工作，等待 connection 退出，强制清理 tree／FileSession，移除已经静止并确认释放的 export，并保留失败者供重试。调用方提供的 backend 始终由调用方拥有，server 只关闭自己建立的 FileSession。
 
 `Status` 报告 serving/stopping/stopped、仍发布或正在停止的 export、活跃及 cleanup-only connection、session、identity-expired session、tree、pending request、fenced authority session 与累计 cleanup failure。identity expiry 表示本机认证需要重新建立；fenced authority 表示它已拒绝新用途但仍被 owner 保留，可能正在排空、等待 cleanup，也可能 native FileSession 已关闭而其它引用尚未释放。两者不能互相代替。状态报告实际仍被拥有的资源，不以协议表项已经删除代替 native cleanup 完成。
 

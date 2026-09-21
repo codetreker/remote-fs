@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"sync"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -82,6 +83,47 @@ func (a *immediateIdentityAuthentication) Step(context.Context, []byte) (Authent
 }
 
 func (*immediateIdentityAuthentication) Close() error { return nil }
+
+type blockedBeginAuthenticator struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (a *blockedBeginAuthenticator) Begin(ctx context.Context) (Authentication, error) {
+	close(a.entered)
+	select {
+	case <-a.release:
+		return nil, errors.New("authentication released")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func startBlockedReauthentication(
+	t *testing.T,
+	server *Server,
+	connection *connection,
+	s *session,
+) (release func(), done <-chan uint32) {
+	t.Helper()
+	blocked := &blockedBeginAuthenticator{entered: make(chan struct{}), release: make(chan struct{})}
+	server.config.Authenticator = blocked
+	s.identityMu.RLock()
+	key := s.signer
+	s.identityMu.RUnlock()
+	request := signedParsedRequest(t, key, setupPacket(1, s.id, "proof"))
+	result := make(chan uint32, 1)
+	go func() {
+		header := request.Header
+		_, status, _ := connection.sessionSetup(context.Background(), request, &header)
+		result <- status
+	}()
+	<-blocked.entered
+	var once sync.Once
+	release = func() { once.Do(func() { close(blocked.release) }) }
+	t.Cleanup(release)
+	return release, result
+}
 
 func TestReauthenticationRejectsSameSIDFromDifferentLogonSession(t *testing.T) {
 	server, connection := testConnection(t, DefaultLimits())
@@ -785,6 +827,130 @@ func TestUnpublishUnusedExportDoesNotJoinUnrelatedConnectionCleanup(t *testing.T
 	close(closeRelease)
 	if err := <-cleanupDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestUnpublishOwnedExportDoesNotWaitForUnrelatedAuthentication(t *testing.T) {
+	server, connection := testConnection(t, DefaultLimits())
+	export, err := server.Publish(Share{Name: "target", Volume: "target", Backend: &endpointStorage{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan struct{})
+	close(ready)
+	done := make(chan struct{})
+	close(done)
+	authority := &authoritySession{
+		export: export, principal: testPrincipal("0123456789abcdef"), orphan: true,
+		ready: ready, done: done,
+	}
+	owner := &session{
+		trees:       make(map[uint32]*tree),
+		authorities: map[*Export]*authoritySession{export: authority},
+	}
+	registerSession(t, server, connection, owner)
+	server.mu.Lock()
+	export.refs++
+	server.mu.Unlock()
+
+	key, err := signing.NewSession([64]byte{}, []byte("0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelated := &session{
+		signer: key, principal: testPrincipal("0123456789abcdef"),
+		trees: make(map[uint32]*tree), identityDeadline: time.Now().Add(time.Hour),
+	}
+	registerSession(t, server, connection, unrelated)
+	release, authenticationDone := startBlockedReauthentication(t, server, connection, unrelated)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	unpublishDone := make(chan error, 1)
+	go func() { unpublishDone <- export.Unpublish(ctx) }()
+	select {
+	case err := <-unpublishDone:
+		if err != nil {
+			release()
+			t.Fatalf("unpublish with unrelated authentication = %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		release()
+		<-authenticationDone
+		t.Fatal("unpublish waited for unrelated authentication")
+	}
+	if state := server.Status(); state.Exports != 0 || state.StoppingExports != 0 {
+		release()
+		t.Fatalf("unpublish retained target export: %+v", state)
+	}
+	release()
+	if status := <-authenticationDone; status != statusDenied {
+		t.Fatalf("released authentication = %#x", status)
+	}
+}
+
+func TestUnpublishRetiredOwnerAuthenticationWaitHonorsContext(t *testing.T) {
+	server, connection := testConnection(t, DefaultLimits())
+	export, err := server.Publish(Share{Name: "target", Volume: "target", Backend: &endpointStorage{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan struct{})
+	close(ready)
+	done := make(chan struct{})
+	close(done)
+	authority := &authoritySession{
+		export: export, principal: testPrincipal("0123456789abcdef"), orphan: true,
+		ready: ready, done: done,
+	}
+	key, err := signing.NewSession([64]byte{}, []byte("0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &session{
+		signer: key, principal: testPrincipal("0123456789abcdef"),
+		trees: map[uint32]*tree{}, authorities: map[*Export]*authoritySession{export: authority},
+		identityDeadline: time.Now().Add(time.Hour),
+	}
+	registerSession(t, server, connection, s)
+	server.mu.Lock()
+	export.refs++
+	server.mu.Unlock()
+	release, authenticationDone := startBlockedReauthentication(t, server, connection, s)
+	connection.retireSessionRequests(s, requestFrame{})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	unpublishDone := make(chan error, 1)
+	go func() { unpublishDone <- export.Unpublish(ctx) }()
+	select {
+	case err := <-unpublishDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			release()
+			t.Fatalf("unpublish authentication wait = %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		release()
+		<-authenticationDone
+		t.Fatal("unpublish exceeded its authentication wait deadline")
+	}
+	if state := server.Status(); state.Exports != 1 || state.StoppingExports != 1 {
+		release()
+		t.Fatalf("timed-out authentication wait lost export ownership: %+v", state)
+	}
+
+	release()
+	if status := <-authenticationDone; status != statusDenied {
+		t.Fatalf("released authentication = %#x", status)
+	}
+	if err := export.Unpublish(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if owner := server.sessions.get(s.id); owner.session != nil {
+		t.Fatal("completed authentication retained retired session capacity")
+	}
+	if state := server.Status(); state.Exports != 0 || state.StoppingExports != 0 || state.Sessions != 0 {
+		t.Fatalf("retry retained retired ownership: %+v", state)
 	}
 }
 

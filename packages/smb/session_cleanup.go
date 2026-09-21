@@ -344,11 +344,20 @@ func (c *connection) ownsExport(export *Export) bool {
 
 func (c *connection) closeOwnedExport(ctx context.Context, export *Export) error {
 	c.mu.Lock()
-	sessions := make([]*session, 0, len(c.sessions))
+	allSessions := make([]*session, 0, len(c.sessions))
 	for _, session := range c.sessions {
-		sessions = append(sessions, session)
+		allSessions = append(allSessions, session)
 	}
 	c.mu.Unlock()
+	sessions := make([]*session, 0, len(allSessions))
+	for _, session := range allSessions {
+		session.mu.Lock()
+		_, owns := session.authorities[export]
+		session.mu.Unlock()
+		if owns {
+			sessions = append(sessions, session)
+		}
+	}
 	var errs []error
 	for _, session := range sessions {
 		session.mu.Lock()
@@ -375,14 +384,28 @@ func (c *connection) closeOwnedExport(ctx context.Context, export *Export) error
 			errs = append(errs, err)
 		}
 		session.mu.Unlock()
-		c.finishSessionRetirement(session)
+		if err := c.finishSessionRetirementContext(ctx, session); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
 }
 
 // Completion only records already-known cleanup. It never retries native work.
 func (c *connection) finishSessionRetirement(s *session) {
-	s.authMu.Lock()
+	_ = c.finishSessionRetirementContext(context.Background(), s)
+}
+
+func (c *connection) finishSessionRetirementContext(ctx context.Context, s *session) error {
+	s.mu.Lock()
+	retired := s.retired
+	s.mu.Unlock()
+	if !retired {
+		return nil
+	}
+	if err := s.authMu.lock(ctx); err != nil {
+		return err
+	}
 	watcherDone := s.authDone == nil
 	if !watcherDone {
 		select {
@@ -403,9 +426,9 @@ func (c *connection) finishSessionRetirement(s *session) {
 		}
 	}
 	s.mu.Unlock()
-	s.authMu.Unlock()
+	s.authMu.unlock()
 	if !complete {
-		return
+		return nil
 	}
 	s.retirementMu.Lock()
 	s.resourcesClosed = true
@@ -414,6 +437,7 @@ func (c *connection) finishSessionRetirement(s *session) {
 	c.pruneRetiredSessionsLocked()
 	c.mu.Unlock()
 	c.releaseDisconnected()
+	return nil
 }
 
 func (c *connection) retireSessionRequests(s *session, except requestFrame) {

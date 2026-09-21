@@ -20,6 +20,12 @@ type contextLock struct {
 	token chan struct{}
 }
 
+func (l *contextLock) Lock() {
+	_ = l.lock(context.Background())
+}
+
+func (l *contextLock) Unlock() { l.unlock() }
+
 func (l *contextLock) lock(ctx context.Context) error {
 	l.once.Do(func() {
 		l.token = make(chan struct{}, 1)

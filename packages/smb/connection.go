@@ -94,7 +94,7 @@ type session struct {
 	cleanedDone                  chan struct{}
 	mu                           sync.Mutex
 	identityMu                   sync.RWMutex
-	authMu                       sync.Mutex
+	authMu                       contextLock
 	id                           uint64
 	principal                    Principal
 	auth                         Authentication
