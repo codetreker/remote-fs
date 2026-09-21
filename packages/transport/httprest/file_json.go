@@ -16,6 +16,11 @@ func decodeFileJSON(data []byte, target any) error {
 	if !utf8.Valid(data) {
 		return errors.New("file JSON must be UTF-8")
 	}
+	if _, request := target.(*fileRequest); request {
+		if err := checkObservationRequestBounds(data); err != nil {
+			return err
+		}
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
 	if err := checkTypedJSON(decoder, reflect.TypeOf(target).Elem(), len(data)); err != nil {
