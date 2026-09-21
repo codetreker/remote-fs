@@ -62,6 +62,46 @@ func TestPrincipalComparisonIncludesLogonSession(t *testing.T) {
 	}
 }
 
+type immediateIdentityAuthenticator struct{ principal Principal }
+
+func (a immediateIdentityAuthenticator) Begin(context.Context) (Authentication, error) {
+	return &immediateIdentityAuthentication{principal: a.principal}, nil
+}
+
+type immediateIdentityAuthentication struct{ principal Principal }
+
+func (a *immediateIdentityAuthentication) Step(context.Context, []byte) (AuthenticationResult, error) {
+	return AuthenticationResult{
+		Principal: a.principal, SessionKey: []byte("0123456789abcdef"),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}, nil
+}
+
+func (*immediateIdentityAuthentication) Close() error { return nil }
+
+func TestReauthenticationRejectsSameSIDFromDifferentLogonSession(t *testing.T) {
+	server, connection := testConnection(t, DefaultLimits())
+	key, err := signing.NewSession([64]byte{}, []byte("0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := testPrincipal("0123456789abcdef")
+	s := &session{signer: key, principal: original, trees: make(map[uint32]*tree), identityDeadline: time.Now().Add(time.Hour)}
+	registerSession(t, server, connection, s)
+	server.config.Authenticator = immediateIdentityAuthenticator{principal: testPrincipal("fedcba9876543210")}
+	request := signedParsedRequest(t, key, setupPacket(1, s.id, "proof"))
+	header := request.Header
+	if _, status, signer := connection.sessionSetup(t.Context(), request, &header); status != statusDenied || signer != key {
+		t.Fatalf("cross-logon reauthentication = %#x signer=%p", status, signer)
+	}
+	s.identityMu.RLock()
+	principal := s.principal
+	s.identityMu.RUnlock()
+	if !principal.SameIdentity(original) {
+		t.Fatalf("rejected authentication changed identity: %+v", principal)
+	}
+}
+
 func TestPreviousSessionRetirementRequiresExactIdentity(t *testing.T) {
 	server, currentConnection := testConnection(t, DefaultLimits())
 	left, right := net.Pipe()
